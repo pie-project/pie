@@ -48,6 +48,14 @@ pub enum PlannerError {
         held: RsUnits,
         total: RsUnits,
     },
+    /// Parked short of room only the policy can make (`tier-pressure`), and
+    /// none came by the seat deadline: no discard, no new retention keys,
+    /// no growth.
+    Short {
+        tier: crate::policy::pressure::Tier,
+        bytes: u64,
+        waited: std::time::Duration,
+    },
     Cancelled,
 }
 
@@ -84,7 +92,18 @@ impl std::fmt::Display for PlannerError {
             PlannerError::RsHog { need, held, total } => write!(
                 f,
                 "recurrent pools exhausted by this process alone: it holds {held} and asks \
-                 {need} more of {total} — raise `[engine] max_state_slots`"
+                 {need} more of {total}, and no move of others can cover it"
+            ),
+            PlannerError::Short {
+                tier,
+                bytes,
+                waited,
+            } => write!(
+                f,
+                "{} memory short by {bytes} bytes for {waited:?}: the runtime drops no state \
+                 on its own, and no policy discard, retention change or memory growth made \
+                 room in time",
+                tier.name()
             ),
             PlannerError::Cancelled => f.write_str("planner request cancelled"),
         }

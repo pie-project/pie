@@ -11,7 +11,7 @@ use super::{ProcessId, ResidencyPlanner};
 
 impl ResidencyPlanner {
     pub(super) fn check_rs_starvation(self: &Arc<Self>, key: EntryKey) {
-        if !self.is_wedged() {
+        if !self.is_wedged() || self.waits_on_policy() {
             return;
         }
         let Some((pid, need)) = self.with_inner(|inner| {
@@ -77,7 +77,7 @@ impl ResidencyPlanner {
     }
 
     pub(super) fn check_starvation(self: &Arc<Self>, cause: StarveCause) {
-        if !self.is_wedged() {
+        if !self.is_wedged() || self.waits_on_policy() {
             return;
         }
         // Idle cache on its way to the host is neither dropped nor swept

@@ -139,9 +139,10 @@ impl ResidencyPlanner {
                 };
                 return Err(PlannerError::Impossible { need, total });
             }
-            // A cache entry never makes live work wait: short of state, a
-            // resident process quotes again once the idle cache is dropped,
-            // or else the snapshots sharing its own state, instead of parking.
+            // Short of state, a resident process quotes again once the idle
+            // cache its keys let go is dropped, or else the snapshots sharing
+            // its own state that may go, instead of parking. What a policy
+            // keeps stays: the waiter parks and asks for room.
             let resident = self.with_inner(|inner| {
                 inner.procs.get(&pid).is_some_and(|proc| {
                     proc.state == Residency::Resident && !inner.killing.contains(&pid)
@@ -153,7 +154,7 @@ impl ResidencyPlanner {
                     self.pages_freed();
                     return Ok(Acquired::Requote);
                 }
-                if self.yield_own_checkpoints(pid) {
+                if self.reclaim_own_sharing(pid) {
                     self.pages_freed();
                     return Ok(Acquired::Requote);
                 }
@@ -201,9 +202,29 @@ impl ResidencyPlanner {
                     tokio::pin!(notified);
                     notified.as_mut().enable();
                     let acquired = match self.collect_outcome(key) {
+                        // Short of room only the policy can make, it says so
+                        // again while it waits (the gauge keeps a band only
+                        // while it is told), up to the seat deadline.
                         Collect::Wait => {
-                            notified.await;
-                            continue;
+                            let again = crate::policy::pressure::AGAIN;
+                            if crate::rt::time::timeout(again, notified).await.is_ok() {
+                                continue;
+                            }
+                            self.report_short();
+                            let Some(error) = self.short_expired(key) else {
+                                continue;
+                            };
+                            match self.collect_outcome(key) {
+                                Collect::Wait => {
+                                    tracing::warn!(%pid, %error, "planner: a short waiter gives up");
+                                    self.stats.cancelled_waits.fetch_add(1, Ordering::Relaxed);
+                                    // The registration's drop takes it off the queue.
+                                    Err(error)
+                                }
+                                Collect::Ready(outcome) => outcome.map(Acquired::Granted),
+                                Collect::Yield => Ok(Acquired::Yield),
+                                Collect::Requote => Ok(Acquired::Requote),
+                            }
                         }
                         Collect::Ready(outcome) => {
                             ptrace!("collect key={:?} ok={}", key, outcome.is_ok());
@@ -215,7 +236,9 @@ impl ResidencyPlanner {
                         Collect::Yield => Ok(Acquired::Yield),
                         Collect::Requote => Ok(Acquired::Requote),
                     };
-                    registration.disarm();
+                    if !matches!(acquired, Err(PlannerError::Short { .. })) {
+                        registration.disarm();
+                    }
                     self.poke();
                     return acquired;
                 }
@@ -236,7 +259,14 @@ impl ResidencyPlanner {
         if settled() {
             return;
         }
-        notified.await;
+        // A restore short of room the policy must make says so again while
+        // it waits, as a parked allocation does.
+        if crate::rt::time::timeout(crate::policy::pressure::AGAIN, notified)
+            .await
+            .is_err()
+        {
+            self.report_short();
+        }
     }
 
     fn collect_outcome(&self, key: EntryKey) -> Collect {

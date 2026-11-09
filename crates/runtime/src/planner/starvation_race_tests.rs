@@ -135,8 +135,8 @@ impl PoolPort for RacePool {
     fn release_rs(&self, grant: crate::store::rs::RsGrant) {
         self.with_rs(|rs| rs.release_reservation(grant));
     }
-    fn yield_checkpoints(&self, working_sets: &[crate::store::rs::RsWorkingSetId]) -> usize {
-        self.with_rs(|rs| rs.yield_checkpoints(working_sets))
+    fn reclaim_sharing(&self, working_sets: &[crate::store::rs::RsWorkingSetId]) -> usize {
+        self.with_rs(|rs| rs.reclaim_sharing(working_sets, crate::policy::retention::Installed))
             .unwrap_or(0)
     }
     fn prepare_sweep(
@@ -1251,7 +1251,7 @@ impl PoolPort for RingPool {
             .map(|_| Default::default())
     }
     fn release_rs(&self, _grant: crate::store::rs::RsGrant) {}
-    fn yield_checkpoints(&self, _working_sets: &[crate::store::rs::RsWorkingSetId]) -> usize {
+    fn reclaim_sharing(&self, _working_sets: &[crate::store::rs::RsWorkingSetId]) -> usize {
         0
     }
     fn prepare_sweep(

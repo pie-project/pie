@@ -504,8 +504,9 @@ const STORES: Cache = Cache {
             .iter()
             .map(|stores| stores.rs.lock().unwrap().host_capacity().slots)
             .sum();
-        let room: u32 = (0..stores.len())
-            .filter_map(|engine| crate::handle::state_room(Some(engine)))
+        let room: u32 = stores
+            .iter()
+            .map(|stores| stores.rs.lock().unwrap().host_available().slots)
             .sum();
         (u64::from(capacity), u64::from(room))
     },

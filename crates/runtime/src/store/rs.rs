@@ -434,16 +434,32 @@ impl RsStore {
         )
     }
 
-    /// Drops the checkpoints reading a number past the limit.
-    pub fn reclaim_tail(&mut self) -> usize {
+    /// Drops the checkpoints reading a number past the limit, where their
+    /// key lets the runtime drop them unasked (`pressure::may_drop`).
+    /// Answers how many went, and the slots past the limit those that stay
+    /// read: room for them is the policy's to make.
+    pub fn reclaim_tail(&mut self, keys: impl crate::policy::retention::Keys) -> (usize, u32) {
         let limit = self.limit();
         let past = |id: RsSlotId, store: &Self| store.engine_id(id) >= limit && !store.is_host(id);
-        self.drop_checkpoints(|store, snapshot| {
-            store
-                .working_sets
-                .get(snapshot)
-                .is_some_and(|entry| Self::slots(entry).any(|id| past(id, store)))
-        })
+        let mut kept: HashSet<RsSlotId> = HashSet::new();
+        let mut droppable: HashSet<RsWorkingSetId> = HashSet::new();
+        for entry in self.checkpoints.values() {
+            let Some(ws) = self.working_sets.get(entry.snapshot) else {
+                continue;
+            };
+            let tail: Vec<RsSlotId> = Self::slots(ws).filter(|&id| past(id, self)).collect();
+            if tail.is_empty() {
+                continue;
+            }
+            let at = u64::from(ws.frozen).saturating_sub(1);
+            if crate::policy::pressure::may_drop(keys.key_at(entry.owner, at)) {
+                droppable.insert(entry.snapshot);
+            } else {
+                kept.extend(tail);
+            }
+        }
+        let dropped = self.drop_checkpoints(|_, snapshot| droppable.contains(&snapshot));
+        (dropped, kept.len() as u32)
     }
 
     /// The state is a window ring of kv pages, drawn from the buffer pages.
@@ -619,12 +635,6 @@ impl RsStore {
             .is_ok_and(|entry| Self::slots(entry).any(|id| self.moving.contains(&id)))
     }
 
-    /// Whether `ws` shares a slot with a fork: its next write takes its own.
-    pub fn shares_state(&self, ws: RsWorkingSetId) -> bool {
-        self.entry(ws)
-            .is_ok_and(|entry| Self::slots(entry).any(|id| self.ref_count(id) > 1))
-    }
-
     /// Releases `ws`, returning how many slots it was the last holder of.
     pub fn release_working_set(&mut self, ws: RsWorkingSetId) -> usize {
         let Some(entry) = self.working_sets.remove(ws) else {
@@ -662,16 +672,50 @@ impl RsStore {
         freed
     }
 
-    /// Drops the snapshots sharing a slot with `working_sets`, so their next
-    /// write lands in place instead of copying to a slot the pool lacks: a
-    /// cache entry never makes live work wait. Returns how many were dropped.
-    pub fn yield_checkpoints(&mut self, working_sets: &[RsWorkingSetId]) -> usize {
+    /// Drops the snapshots sharing a slot with `working_sets` whose retention
+    /// key lets the runtime drop them unasked (`pressure::may_drop`), so the
+    /// sets' next write lands in place instead of copying to a slot the pool
+    /// lacks. One a policy keyed higher stays: room for it is asked for with
+    /// tier pressure. Returns how many were dropped.
+    pub fn reclaim_sharing(
+        &mut self,
+        working_sets: &[RsWorkingSetId],
+        keys: impl crate::policy::retention::Keys,
+    ) -> usize {
         let sharing = self.sharing_checkpoints(&working_sets.iter().copied().collect());
-        self.drop_checkpoints(|_, snapshot| sharing.contains(&snapshot))
+        let droppable: HashSet<RsWorkingSetId> = self
+            .checkpoints
+            .values()
+            .filter(|entry| sharing.contains(&entry.snapshot))
+            .filter(|entry| {
+                self.working_sets.get(entry.snapshot).is_some_and(|ws| {
+                    let at = u64::from(ws.frozen).saturating_sub(1);
+                    crate::policy::pressure::may_drop(keys.key_at(entry.owner, at))
+                })
+            })
+            .map(|entry| entry.snapshot)
+            .collect();
+        self.drop_checkpoints(|_, snapshot| droppable.contains(&snapshot))
     }
 
-    /// The rs half of idle reclaim, in the kv half's order.
+    /// The rs half of idle reclaim, in the kv half's order. The runtime runs
+    /// it only as [`Self::reclaim_droppable`].
+    #[cfg(test)]
     pub fn reclaim_cache(&mut self, keys: impl crate::policy::retention::Keys) -> usize {
+        self.reclaim_cache_where(keys, |_| true)
+    }
+
+    /// [`Self::reclaim_cache`] as the runtime may run it unasked: only
+    /// checkpoints whose key says they may go (`pressure::may_drop`).
+    pub fn reclaim_droppable(&mut self, keys: impl crate::policy::retention::Keys) -> usize {
+        self.reclaim_cache_where(keys, crate::policy::pressure::may_drop)
+    }
+
+    fn reclaim_cache_where(
+        &mut self,
+        keys: impl crate::policy::retention::Keys,
+        drops: fn(i64) -> bool,
+    ) -> usize {
         if self.checkpoints.is_empty() {
             return 0;
         }
@@ -702,6 +746,7 @@ impl RsStore {
         }
         let mut order: Vec<_> = groups
             .into_iter()
+            .filter(|((_, key), _)| drops(*key))
             .map(|((_, key), (keys, last_use))| ((key, last_use), keys))
             .collect();
         order.sort_unstable_by_key(|(order, _)| *order);
@@ -769,10 +814,20 @@ impl RsStore {
         }
     }
 
+    /// Whether any checkpoint is kept: cache a policy could let go.
+    pub fn holds_checkpoints(&self) -> bool {
+        !self.checkpoints.is_empty()
+    }
+
+    /// Not one parked on the host with the set it shares state with, or on
+    /// its way there or back: it is read from the device only.
     pub fn has_checkpoint(&self, key: &Hash256) -> bool {
-        self.checkpoints
-            .get(key)
-            .is_some_and(|entry| !self.unsettled(entry.snapshot))
+        self.checkpoints.get(key).is_some_and(|entry| {
+            !self.unsettled(entry.snapshot)
+                && self.working_sets.get(entry.snapshot).is_some_and(|ws| {
+                    !self.holds_host(ws) && Self::slots(ws).all(|id| !self.moving.contains(&id))
+                })
+        })
     }
 
     /// Sharing its slots until a write copies them.
@@ -785,7 +840,7 @@ impl RsStore {
             .checkpoints
             .get(key)
             .map(|entry| entry.snapshot)
-            .filter(|&snapshot| fresh && !self.unsettled(snapshot))
+            .filter(|_| fresh && self.has_checkpoint(key))
         else {
             return Ok(false);
         };
@@ -1429,8 +1484,9 @@ impl RsStore {
     }
 
     /// The device slots of `working_sets` held by no working set outside
-    /// them but checkpoints, which a suspend drops: a checkpoint is cache,
-    /// and left holding a parked set's slot it would pin it on the device.
+    /// them but checkpoints, which a suspend takes along: left holding a
+    /// parked set's slot a checkpoint would pin it on the device, and the
+    /// runtime does not drop one on its own.
     fn private(&self, working_sets: &HashSet<RsWorkingSetId>) -> Vec<RsSlotId> {
         let mut scope = self.sharing_checkpoints(working_sets);
         scope.extend(working_sets.iter().copied());
@@ -1471,8 +1527,9 @@ impl RsStore {
     }
 
     /// Parks the sets' private, settled slots in host rows, when rows for
-    /// all of them are free; otherwise they stay on the device, and `None`
-    /// says so.
+    /// all of them are free, and the checkpoints sharing them with them;
+    /// otherwise they stay on the device, nothing is dropped, and `None`
+    /// says so ([`Self::suspend_short`] tells what the host lacks).
     pub fn prepare_suspend(
         &mut self,
         working_sets: &HashSet<RsWorkingSetId>,
@@ -1495,15 +1552,29 @@ impl RsStore {
         };
         let slots: Vec<RsSlotId> = slots.into_iter().chain(pages).collect();
         let host: Vec<RsSlotId> = host_slots.into_iter().chain(host_pages).collect();
-        let moving: HashSet<RsSlotId> = slots.iter().copied().collect();
-        self.drop_checkpoints(|store, snapshot| {
-            store
-                .working_sets
-                .get(snapshot)
-                .is_some_and(|entry| Self::slots(entry).any(|id| moving.contains(&id)))
-        });
         self.moving.extend(slots.iter().copied());
-        Some(self.txn(working_sets, slots.into_iter().zip(host).collect()))
+        let scope = self.with_sharing(working_sets);
+        Some(self.txn(&scope, slots.into_iter().zip(host).collect()))
+    }
+
+    /// The host rows a suspend of `working_sets` would take beyond those
+    /// free: what keeps its state on the device. Zero when it fits.
+    pub fn suspend_short(&self, working_sets: &HashSet<RsWorkingSetId>) -> RsUnits {
+        let busy = self.busy_slots();
+        let need = self.units(
+            self.private(working_sets)
+                .into_iter()
+                .filter(|id| !busy.contains(id)),
+        );
+        need.sub(self.host_available())
+    }
+
+    /// `working_sets` and the checkpoints sharing a slot with them: a move
+    /// takes them as one, so a checkpoint reads where its slot went.
+    fn with_sharing(&self, working_sets: &HashSet<RsWorkingSetId>) -> HashSet<RsWorkingSetId> {
+        let mut scope = self.sharing_checkpoints(working_sets);
+        scope.extend(working_sets.iter().copied());
+        scope
     }
 
     fn txn(
@@ -1588,6 +1659,7 @@ impl RsStore {
         let mut slots = granted.slots.drain(..need.slots as usize);
         let mut pages = granted.pages.drain(..need.pages as usize);
         self.moving.extend(swapped.iter().copied());
+        let scope = self.with_sharing(working_sets);
         let moves = swapped
             .into_iter()
             .map(|host| {
@@ -1600,7 +1672,7 @@ impl RsStore {
             })
             .collect();
         drop((slots, pages));
-        Ok(self.txn(working_sets, moves))
+        Ok(self.txn(&scope, moves))
     }
 
     /// Swaps each host slot back for its device copy, returning the slots restored.

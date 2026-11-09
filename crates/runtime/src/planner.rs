@@ -19,12 +19,15 @@ mod rank;
 mod reclaim;
 mod report;
 mod residency_planner;
+mod short;
 mod starvation;
 mod stats;
 mod to_end;
 mod victim;
 mod wait;
 
+#[cfg(test)]
+mod pressure_tests;
 #[cfg(test)]
 mod service_order_tests;
 #[cfg(test)]

@@ -576,8 +576,26 @@ impl KvStore {
     /// Only what no live working set reads, lowest key first, then least
     /// recently used.
     /// Pages the disk tier keeps a copy of settle there instead, at no cost,
-    /// and their entries stay.
+    /// and their entries stay. The runtime runs it only as
+    /// [`Self::reclaim_droppable`]; this drops whatever the keys order.
+    #[cfg(test)]
     pub fn reclaim_cache(&mut self, epoch: u64, keys: impl Keys) -> usize {
+        self.reclaim_cache_where(epoch, keys, |_| true)
+    }
+
+    /// [`Self::reclaim_cache`] as the runtime may run it unasked: it drops
+    /// only entries whose key says they may go (`pressure::may_drop`). One
+    /// keyed higher may still settle on its disk copy, which drops nothing.
+    pub fn reclaim_droppable(&mut self, epoch: u64, keys: impl Keys) -> usize {
+        self.reclaim_cache_where(epoch, keys, crate::policy::pressure::may_drop)
+    }
+
+    fn reclaim_cache_where(
+        &mut self,
+        epoch: u64,
+        keys: impl Keys,
+        drops: fn(i64) -> bool,
+    ) -> usize {
         self.split_at_steps(&keys);
         self.split_persisted();
         let mut freed = 0;
@@ -597,7 +615,7 @@ impl KvStore {
                 }
                 let before = freed;
                 freed += self.settle_on_disk(&ids, key, &keys, epoch);
-                if freed == before {
+                if freed == before && drops(key) {
                     let ids = ids
                         .into_iter()
                         .filter(|id| !self.cache.get(id).is_some_and(|e| self.persisted_whole(e)))
@@ -2498,16 +2516,23 @@ impl KvStore {
         self.pool.high_end()
     }
 
-    /// Drops what the idle cache keeps past the limit. Answers pages freed.
-    pub fn reclaim_tail(&mut self, epoch: u64) -> usize {
+    /// Drops what the idle cache keeps past the limit, where its key lets
+    /// the runtime drop it unasked (`pressure::may_drop`). Answers pages
+    /// freed, and how many entries past the limit stay: room for those is
+    /// the policy's to make.
+    pub fn reclaim_tail(&mut self, epoch: u64, keys: impl Keys) -> (usize, usize) {
         let limit = self.pool.limit();
-        let keys: Vec<u64> = self
+        let (drop, kept): (Vec<u64>, Vec<u64>) = self
             .cache
             .iter()
             .filter(|(_, entry)| self.table.holds_past(entry.path.terminal, limit))
-            .map(|(&key, _)| key)
-            .collect();
-        self.drop_entries(keys, By::Host, epoch)
+            .map(|(&id, _)| id)
+            .partition(|id| {
+                let entry = &self.cache[id];
+                let key = keys.key_at(entry.owner, self.key_token(entry.path.pages));
+                crate::policy::pressure::may_drop(key)
+            });
+        (self.drop_entries(drop, By::Host, epoch), kept.len())
     }
 
     /// The working sets that read a page past the limit.

@@ -14,11 +14,17 @@ use super::pool::PoolPort;
 use super::proc::{Proc, Residency};
 use super::rank::Rank;
 use super::reclaim::Reclaim;
+use super::short::{Shortfall, Sink};
 use super::stats::PlannerStats;
 use super::wait::{EntryKey, WaitKind, Waiter};
 use super::{ProcessId, exec};
 
 pub(super) const HOST_RESERVE_DIVISOR: u32 = 8;
+
+/// The fixed state sets a running working set takes: the one it holds and
+/// the one a write copies into while a snapshot or fork still reads the
+/// first (`state-chunk` decision 4). Derived, not configured.
+pub(super) const SETS_PER_WORKING_SET: u32 = 2;
 
 /// It suspends no process of its own.
 const SWEEP: ProcessId = ProcessId::nil();
@@ -45,10 +51,17 @@ pub struct ResidencyPlanner {
     /// `PoolFacts::seat_to_end`: see [`super::to_end::ToEnd`].
     seat_to_end: bool,
     to_end_notify: Notify,
+    /// Told when a process charged against the state pool leaves.
+    uncharged: Notify,
+    /// What its waiters lack that only the policy can free.
+    pub(super) short: parking_lot::Mutex<Shortfall>,
+    /// Where that is said (`pressure::raise`, for this planner's engine).
+    sink: Sink,
 }
 
 impl ResidencyPlanner {
     pub fn new(port: Arc<dyn PoolPort>) -> Self {
+        let sink = super::short::sink(port.locus().1);
         Self {
             inner: parking_lot::Mutex::new(Inner::default()),
             pause_due: AtomicBool::new(false),
@@ -65,7 +78,142 @@ impl ResidencyPlanner {
             seating: parking_lot::Mutex::new(()),
             seat_to_end: false,
             to_end_notify: Notify::new(),
+            uncharged: Notify::new(),
+            short: parking_lot::Mutex::new(Shortfall::default()),
+            sink,
         }
+    }
+
+    /// Says tier pressure through `sink` instead of the policy's gauge.
+    #[cfg(test)]
+    #[must_use]
+    pub(super) fn pressure_sink(mut self, sink: Sink) -> Self {
+        self.sink = sink;
+        self
+    }
+
+    /// What `units` take, in bytes, at this engine's scale; a unit of
+    /// unknown size counts as a byte, so a shortfall never reads as none.
+    pub(super) fn bytes_of(&self, units: Reclaim) -> u64 {
+        let scale = crate::policy::pressure::scale_of(self.port.locus().1);
+        let page = scale.kv_page_bytes.max(1);
+        let slot = scale.state_slot_bytes.max(1);
+        u64::from(units.pages)
+            .saturating_add(u64::from(units.rs.pages))
+            .saturating_mul(page)
+            .saturating_add(u64::from(units.rs.slots).saturating_mul(slot))
+    }
+
+    /// Waiter `key` lacks `device` bytes on the device and `host` on the
+    /// host that the planner's own moves cannot give it; both 0 once it
+    /// lacks nothing the policy must free.
+    pub(super) fn note_short(&self, key: EntryKey, device: u64, host: u64) {
+        self.short.lock().note(key.1, [device, host]);
+    }
+
+    /// The head is short of room only the policy can make, and there is
+    /// something the policy could let go: idle cache, a checkpoint, or a
+    /// handle at rest on the device. A starved fleet then waits on the
+    /// policy, up to the head's deadline, instead of restarting anyone.
+    pub(super) fn waits_on_policy(&self) -> bool {
+        let Some((head, resting)) = self.with_inner(|inner| {
+            let (head, _) = inner.unmet_head()?;
+            let resting = inner
+                .procs
+                .values()
+                .any(|proc| proc.holder && proc.state == Residency::Resident);
+            Some((head, resting))
+        }) else {
+            return false;
+        };
+        if self.short.lock().since(head.1).is_none() {
+            return false;
+        }
+        let (model, engine) = self.port.locus();
+        resting
+            || self.port.reclaimable_idle() > 0
+            || crate::store::registry::try_get(model, engine)
+                .is_some_and(|stores| stores.rs.lock().unwrap().holds_checkpoints())
+    }
+
+    /// A suspend for the head found no host rows for the state it would
+    /// move: it moved and dropped nothing, and the host is short of `rows`.
+    pub(super) fn note_host_short(&self, rows: RsUnits) {
+        let Some(head) = self.with_inner(|inner| inner.unmet_head().map(|(key, _)| key)) else {
+            return;
+        };
+        let bytes = self.bytes_of(Reclaim { pages: 0, rs: rows });
+        self.short.lock().note_host(head.1, bytes);
+        self.report_short();
+    }
+
+    /// Says how short each tier is now, for the waiters still waiting:
+    /// again while a shortfall stands (the gauge tells the policy again
+    /// only when it has stood a while), and once as it clears.
+    pub fn report_short(&self) {
+        if self.short.lock().quiet() {
+            return;
+        }
+        let waiting: HashSet<u64> = self.with_inner(|inner| {
+            inner
+                .queue
+                .iter()
+                .filter(|(_, waiter)| waiter.is_unmet())
+                .map(|(key, _)| key.1)
+                .collect()
+        });
+        let said = {
+            let mut short = self.short.lock();
+            short.retain(|id| waiting.contains(&id));
+            short.take_said()
+        };
+        for (tier, bytes) in said {
+            (self.sink)(tier, bytes);
+        }
+    }
+
+    /// The error waiter `key` fails with when it has stood short of what
+    /// only the policy can free past the seat deadline, rather than wait on.
+    pub(super) fn short_expired(&self, key: EntryKey) -> Option<super::PlannerError> {
+        let short = self.short.lock();
+        let waited = short.since(key.1)?.elapsed();
+        if waited < crate::pipeline::fire::SEAT_WAIT {
+            return None;
+        }
+        let (tier, bytes) = short.worst(key.1)?;
+        Some(super::PlannerError::Short {
+            tier,
+            bytes,
+            waited,
+        })
+    }
+
+    /// What idle cache keeps past the pools' limits goes only as its keys
+    /// let the runtime drop it; for the rest, the device is short and the
+    /// policy is asked. A falling limit waits on that, as on the processes
+    /// it moves out ([`Self::vacate_tail`]).
+    pub fn reclaim_tail(&self) {
+        use crate::policy::retention::Installed;
+        let (model, engine) = self.port.locus();
+        let Some(stores) = crate::store::registry::try_get(model, engine) else {
+            return;
+        };
+        let kv = crate::store::registry::with_kv_lock(&stores.kv, "planner-tail", |kv| {
+            if kv.mapped_pages() <= kv.committed_pages() {
+                return 0;
+            }
+            let epoch = kv.current_epoch();
+            let (_, kept) = kv.reclaim_tail(epoch, Installed);
+            if kept == 0 { 0 } else { kv.tail_held() as u32 }
+        });
+        let (_, slots) = stores.rs.lock().unwrap().reclaim_tail(Installed);
+        let bytes = self.bytes_of(Reclaim {
+            pages: kv,
+            rs: RsUnits { slots, pages: 0 },
+        });
+        let tail = if kv == 0 && slots == 0 { 0 } else { bytes };
+        self.short.lock().note_tail(tail);
+        self.report_short();
     }
 
     /// With `PoolFacts::seat_to_end`, a process starts only while the pools
@@ -297,29 +445,6 @@ impl ResidencyPlanner {
         })
     }
 
-    /// The recurrent slots holders keep on the device, a slot forks share
-    /// counted once: each would need the host if it went there.
-    pub fn resting_rs_slots(&self) -> u32 {
-        let (model, engine) = self.port.locus();
-        let holders: Vec<ProcessId> = self.with_inner(|inner| {
-            inner
-                .procs
-                .iter()
-                .filter(|(_, proc)| proc.holder && proc.state == Residency::Resident)
-                .map(|(pid, _)| *pid)
-                .collect()
-        });
-        let resting: HashSet<_> = holders
-            .into_iter()
-            .flat_map(|pid| {
-                crate::inferlet::process::residency::rs_working_set_ids(pid, model, engine)
-            })
-            .collect();
-        crate::store::registry::try_get(model, engine).map_or(0, |stores| {
-            stores.rs.lock().unwrap().suspendable(&resting).slots
-        })
-    }
-
     /// A launch is taking this holder's set: no one's victim from here.
     pub fn claim_holder(&self, pid: ProcessId) {
         self.with_inner(|inner| {
@@ -395,8 +520,47 @@ impl ResidencyPlanner {
                 None => break,
             }
         }
+        self.admit_state(pid).await;
         if self.seat_to_end {
             self.admit_to_end(pid).await;
+        }
+    }
+
+    /// The processes the state pool runs at once: each takes
+    /// [`SETS_PER_WORKING_SET`] fixed sets, and at least one runs. `None`
+    /// where the model keeps no fixed state.
+    pub(super) fn state_seats(&self) -> Option<usize> {
+        let (_, total) = self.port.rs_stats();
+        (total.slots > 0).then(|| (total.slots / SETS_PER_WORKING_SET).max(1) as usize)
+    }
+
+    /// Holds `pid` back until the state pool has the fixed sets it takes
+    /// free of those already charged, so a pool of fixed state never runs
+    /// more working sets than it can write: the runtime frees no state on
+    /// its own to make room for one admitted past it.
+    async fn admit_state(&self, pid: ProcessId) {
+        let Some(seats) = self.state_seats() else {
+            return;
+        };
+        loop {
+            let notified = self.uncharged.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+            let passed = self.with_inner(|inner| {
+                let charged = inner.procs.values().filter(|proc| proc.charged).count();
+                let Some(proc) = inner.procs.get_mut(&pid) else {
+                    return true;
+                };
+                if proc.charged || charged < seats {
+                    proc.charged = true;
+                    return true;
+                }
+                false
+            });
+            if passed {
+                return;
+            }
+            notified.await;
         }
     }
 
@@ -746,8 +910,9 @@ impl ResidencyPlanner {
         let held = held_page_count(pid, model, engine);
         // A seat taken again after the process ended goes back.
         crate::inferlet::process::vacate_seat(pid);
-        let (signal, removed) = self.with_inner(|inner| {
+        let (signal, removed, charged) = self.with_inner(|inner| {
             let departed = inner.procs.remove(&pid);
+            let charged = departed.as_ref().is_some_and(|proc| proc.charged);
             if departed.is_some() {
                 inner.admitting.retain(|(_, waiting), _| *waiting != pid);
             }
@@ -799,8 +964,11 @@ impl ResidencyPlanner {
                 .iter()
                 .filter_map(|key| inner.queue.remove(key))
                 .collect();
-            (signal, removed)
+            (signal, removed, charged)
         });
+        if charged {
+            self.uncharged.notify_waiters();
+        }
         for waiter in &removed {
             if let WaitKind::Allocation { notify, .. } = &waiter.kind {
                 notify.notify_waiters();

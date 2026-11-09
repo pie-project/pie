@@ -595,7 +595,6 @@ mod tests {
                 client_api::Handles::from([("ws".to_string(), 1)]),
                 client_api::Handles::new(),
                 None,
-                |_| None,
             )
             .unwrap();
         std::mem::forget(lease);

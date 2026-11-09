@@ -135,8 +135,15 @@ impl ResidencyPlanner {
             return;
         };
         let (swap_free, swap_total) = self.swap_stats();
+        let deficit = self.bytes_of(victims.deficit);
+        // The host is short where it is the move's way out: its kv swap is
+        // full, or its rows cannot take the state the head lacks.
+        let host_short = self.port.suspend_capable()
+            && ((victims.deficit.pages > 0 && swap_free == 0)
+                || !self.swap_room().rs.covers(victims.deficit.rs));
         if victims.deficit.pages > 0 {
             if !self.port.suspend_capable() || swap_free == 0 {
+                self.note_short(victims.head, deficit, if host_short { deficit } else { 0 });
                 self.check_starvation(StarveCause::NoSwapRoom);
                 return;
             }
@@ -166,6 +173,15 @@ impl ResidencyPlanner {
             self.record_host_swap_exhaustion();
         }
         if picks.is_empty() {
+            // Nothing the planner may move covers the head: it parks, and
+            // the policy is asked for room (`tier-pressure`). The host is
+            // short too where a victim's move found no room there.
+            let host = if host_short || !unhostable.is_empty() {
+                deficit
+            } else {
+                0
+            };
+            self.note_short(victims.head, deficit, host);
             if victims.deficit.pages == 0 {
                 self.check_rs_starvation(victims.head);
             } else if !unhostable.is_empty() {
@@ -175,7 +191,10 @@ impl ResidencyPlanner {
             }
             return;
         }
-        self.commit_evictions(victims.head, picks, false);
+        if self.commit_evictions(victims.head, picks, false) {
+            // Moves on their way fund it: nothing for the policy yet.
+            self.note_short(victims.head, 0, 0);
+        }
     }
 
     pub(super) fn victim_set(&self) -> Option<VictimSet> {
@@ -277,19 +296,22 @@ impl ResidencyPlanner {
         any
     }
 
-    pub(super) fn yield_own_checkpoints(&self, pid: ProcessId) -> bool {
+    /// Drops the checkpoints sharing `pid`'s state that their keys let the
+    /// runtime drop unasked; whether any went.
+    pub(super) fn reclaim_own_sharing(&self, pid: ProcessId) -> bool {
         let (model, engine) = self.port.locus();
         let working_sets: Vec<_> =
             crate::inferlet::process::residency::rs_working_set_ids(pid, model, engine)
                 .into_iter()
                 .collect();
-        !working_sets.is_empty() && self.port.yield_checkpoints(&working_sets) > 0
+        !working_sets.is_empty() && self.port.reclaim_sharing(&working_sets) > 0
     }
 
-    /// A cache entry never makes live work wait: when the head's ask is
-    /// short of state, the snapshots sharing its state are dropped so its
-    /// write lands in place, and the head re-quotes as a yielded waiter.
-    pub(super) fn yield_head_checkpoints(self: &Arc<Self>) -> bool {
+    /// When the head's ask is short of state, the snapshots sharing its
+    /// state that their keys let go are dropped so its write lands in place,
+    /// and the head re-quotes as a yielded waiter. One a policy keeps stays:
+    /// the head asks for room with tier pressure instead.
+    pub(super) fn reclaim_head_sharing(self: &Arc<Self>) -> bool {
         let Some((key, pid)) = self.with_inner(|inner| {
             inner
                 .unmet_head()
@@ -300,7 +322,7 @@ impl ResidencyPlanner {
         }) else {
             return false;
         };
-        if !self.yield_own_checkpoints(pid) {
+        if !self.reclaim_own_sharing(pid) {
             return false;
         }
         let wake = self.with_inner(|inner| {
