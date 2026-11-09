@@ -148,7 +148,9 @@ impl Shell {
                 // lanes pad to 32 or 64 (v6e gpt-oss c256 at 4096-row fires:
                 // 27 prompts and a decode compiled mid-run, twice, 48 s).
                 if b >= widest {
-                    for n in [17u32, 33] {
+                    // (17 prompts from 4096-row fires, 33 from 8192: what a
+                    // narrower fire's short prompts take compiles on demand.)
+                    for n in [17u32, 33].into_iter().filter(|&n| widest >= 256 * (n - 1)) {
                         let each = rows / n;
                         if each >= 2 && d + 2 * n <= self.budgets.tokens.max_lanes {
                             let mut lanes = vec![fresh(decode, 1); d as usize];
