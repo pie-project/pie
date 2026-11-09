@@ -138,7 +138,7 @@ pub struct SsmChunk(pub u32);
 
 /// The GDN chunk once a fire's lanes average at least this many rows.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Decision)]
-#[decision(id = "kernel.ssm.long_chunk", constant(set(64, 128, 256)), default = 128, tune = search)]
+#[decision(id = "kernel.ssm.long_chunk", constant(set(32, 64, 128, 256)), default = 128, tune = search)]
 pub struct SsmLongChunk(pub u32);
 
 /// Tokens per chunk of the per-channel-decay (KDA) chunked scan, whose

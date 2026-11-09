@@ -8,5 +8,10 @@ assumes = { generation = 5, hbm_gib = 16 }
 [engine]
 pad.row_steps = 4
 
+# a prompt's GDN scan in 32-token chunks: v6e's 128 ran Qwen3.6-35B-A3B's 557-token Raw prefill fire in
+# 75.2 ms here, 64 in 68.4, 32 in 66.2 (Raw prefill 7.1k -> 8.0k tok/s)
+[kernel]
+ssm.long_chunk = 32
+
 [provenance]
-measured = ["engine.pad.row_steps"]
+measured = ["engine.pad.row_steps", "kernel.ssm.long_chunk"]
