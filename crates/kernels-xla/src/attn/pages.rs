@@ -264,7 +264,7 @@ fn kernel(s: &Shape, vmem_cap: i64) -> Built<Compiled> {
                 None => q,
             };
             let reps: Vec<V> = (0..kvh).map(|_| q).collect();
-            let qt = b.concat(&reps, 1)?;
+            let qt = if kvh == 1 { q } else { b.concat(&reps, 1)? };
             let qbd = b.select(diag, qt, zq)?;
             let sidx = b.as_index(slot)?;
             b.vstore(ninf1, m_sc, &[i0, i0])?;
