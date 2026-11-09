@@ -1947,6 +1947,7 @@ pub fn attend(
             if rule.rel.is_none()
                 && rule.bits.is_none()
                 && rule.rbias.is_none()
+                && r <= super::pages::MAX_ROWS
                 && super::pages::fits(geom.span, &heads, tuning.vmem_cap()) =>
         {
             // A decode's rows copy their own pages into VMEM; a fire whose

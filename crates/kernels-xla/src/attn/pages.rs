@@ -42,6 +42,11 @@ struct Shape {
     scale: f64,
 }
 
+/// The most rows a fire hands the kernel: it walks rows one at a time, which
+/// beats the batched walk for a few decoding lanes (v6e Qwen3-0.6B Raw
+/// decode 695 -> 807 tok/s) and loses at a batch (c256 10.9k -> 5.4k).
+pub(crate) const MAX_ROWS: i64 = 8;
+
 /// Keys a row reads a turn (its range only, in chunks).
 const CHUNK: i64 = 128;
 
