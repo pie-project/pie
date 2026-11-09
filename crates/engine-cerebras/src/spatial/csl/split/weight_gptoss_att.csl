@@ -233,6 +233,8 @@ var kc = @zeros([NLA * KCW + NLS * Dc + 1]u16);
 var vc = @zeros([NLA * VCW + NLS * (Dc + 1) + 1]u16);
 var spos = @zeros([if (NLS > 0) NLS else 1]u16);   // sliding: 1 + the position its entry holds (0: none)
 var mref = @zeros([K * Qh]f32);
+var vf = @zeros([Dc + 1]f32);        // one entry's value row widened (the values' scaled adds)
+const vf_d = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{Dc + 1} -> vf[i] });
 var qt = @zeros([Dc * Qh]@fp16());   // q transposed [d][h] (the scores' matrix: one matvec a live entry)
 const qt_d = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{Dc * Qh} -> qt[i] });
 const kc_d = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{Dc} -> kc[i] });
@@ -351,9 +353,24 @@ fn att_mix(l: u16, full: bool, a: u16, s: u16) void {
       @fnegs(sp, sp);
       @fs2h(@set_dsd_length(xh_d, nsl), sp);
       h = 0;
-      while (h < Qh) : (h += 1) {
-        const xp = @set_dsd_stride(@set_dsd_length(@increment_dsd_offset(xh_d, @as(i16, h), @fp16()), nel), Qh);
-        mvx(@ptrcast([*]u16, &vc[1 + vb]), nel, Dc + 1, xp, h * (Dc + 1));
+      if (nel <= 4) {
+        // few live entries: a head's values as nel scaled adds of the entry's (f32-widened, exact) value row,
+        // in entry order: the matvec's products and sums, without its per-call cost
+        @fmovs(yv(0, Qh * (Dc + 1)), 0.0);
+        var e2: u16 = 0;
+        while (e2 < nel) : (e2 += 1) {
+          @fh2s(vf_d, @set_dsd_base_addr(@get_dsd(mem1d_dsd, .{ .tensor_access = |i|{Dc + 1} -> xh[i] }), @ptrcast([*]@fp16(), &vc[1 + vb + e2 * (Dc + 1)])));
+          h = 0;
+          while (h < Qh) : (h += 1) {
+            const pv = @as(f32, xh[e2 * Qh + h]);
+            @fmacs(yv(h * (Dc + 1), Dc + 1), yv(h * (Dc + 1), Dc + 1), vf_d, pv);
+          }
+        }
+      } else {
+        while (h < Qh) : (h += 1) {
+          const xp = @set_dsd_stride(@set_dsd_length(@increment_dsd_offset(xh_d, @as(i16, h), @fp16()), nel), Qh);
+          mvx(@ptrcast([*]u16, &vc[1 + vb]), nel, Dc + 1, xp, h * (Dc + 1));
+        }
       }
     } else {
       @fmovs(yv(0, Qh * (Dc + 1)), 0.0);
