@@ -14,8 +14,11 @@ fn nonzero(op: &'static str, what: &str, v: u32) -> Result<u32, Error> {
     Ok(v)
 }
 
-/// `x / rms(x)` over each `axis`-wide run of an f32 `[rows, width]`; the mean
-/// square is taken in f32, as the GPU kernels take it.
+/// `x / rms(x)` over each `axis`-wide run of a `[rows, width]` (bf16 or
+/// f32); the mean square is taken in f32, as the GPU kernels take it. The
+/// rows split into heads before they widen, so a bf16 input's convert and
+/// square fuse into the reduction instead of landing an f32 copy of the rows
+/// (DeepSeek-V4's 32768-wide q at 640 rows: 84 MB a layer).
 pub(crate) fn inv_rms_rows(
     f: &mut Func,
     op: &'static str,
@@ -34,6 +37,7 @@ pub(crate) fn inv_rms_rows(
     }
     let heads = width / axis;
     let x3 = f.reshape(x, &[rows, heads, axis])?;
+    let x3 = f.convert(x3, Elem::F32);
     let sq = f.mul(x3, x3)?;
     let sum = f.reduce(sq, &[2], Fold::Sum)?;
     let mean = f.scale(sum, 1.0 / axis as f64)?;
@@ -75,8 +79,7 @@ fn rms_row(
             ),
         ));
     }
-    let xv = x.f32(f);
-    let n = inv_rms_rows(f, op, xv, axis, eps)?;
+    let n = inv_rms_rows(f, op, x.val, axis, eps)?;
     let g = gain(
         f,
         weight.val,
@@ -136,8 +139,7 @@ pub fn rmsnorm_grouped_plus_one(
             ),
         ));
     }
-    let xv = x.f32(f);
-    let n = inv_rms_rows(f, OP, xv, group, eps)?;
+    let n = inv_rms_rows(f, OP, x.val, group, eps)?;
     let g = gain(f, weight.val, i64::from(x.rows), i64::from(x.width), true)?;
     Ok(f.mul(n, g)?)
 }
@@ -145,8 +147,7 @@ pub fn rmsnorm_grouped_plus_one(
 pub fn rmsnorm_no_scale(f: &mut Func, x: Operand, head_dim: u32, eps: f32) -> Result<Val, Error> {
     const OP: &str = "elemwise.rmsnorm";
     expect(OP, x, &[Dtype::Bf16])?;
-    let xv = x.f32(f);
-    inv_rms_rows(f, OP, xv, head_dim, eps)
+    inv_rms_rows(f, OP, x.val, head_dim, eps)
 }
 
 /// `rms(x) * w * gate(z)` per `vd`-wide head of an f32 accumulator, with a
@@ -169,8 +170,7 @@ fn gated_rms(
             "the gate and the landing ride the normed rectangle",
         ));
     }
-    let xv = x.f32(f);
-    let n = inv_rms_rows(f, op, xv, vd, eps)?;
+    let n = inv_rms_rows(f, op, x.val, vd, eps)?;
     let n = match weight {
         Some(weight) => {
             let g = gain(f, weight.val, i64::from(x.rows), i64::from(x.width), false)?;
