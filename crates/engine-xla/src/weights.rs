@@ -239,7 +239,11 @@ impl Weights {
         // `gather_only`.
         let mut folded: BTreeMap<usize, (u64, u64)> = BTreeMap::new();
         for at in gather_only(trace, &codes_planes, engine) {
-            let pairing = pairings[trace.params[at].name.as_str()];
+            let Some(&pairing) = pairings.get(trace.params[at].name.as_str()) else {
+                let (rows, width) = rectangle(&trace.params[at].shape);
+                folded.insert(at, fold_of(rows, width));
+                continue;
+            };
             for plane in [Some(at), Some(pairing.scales), pairing.biases]
                 .into_iter()
                 .flatten()
@@ -813,26 +817,28 @@ fn gather_only(
         _ => None,
     };
     let mut other = std::collections::BTreeSet::new();
+    let mut concat = std::collections::BTreeSet::new();
     let mut inputs = Vec::new();
     for node in &trace.nodes {
         inputs.clear();
         node.op.inputs(&mut inputs);
         let table = match &node.op {
-            Operation::Gather(
-                Gather::Embed {
-                    table,
-                    weights: None,
-                    scales: None,
-                    concat: false,
-                    ..
-                }
-                | Gather::Embed {
-                    table,
-                    weights: None,
-                    concat: true,
-                    ..
-                },
-            ) => Some(*table),
+            Operation::Gather(Gather::Embed {
+                table,
+                weights: None,
+                scales: None,
+                concat: false,
+                ..
+            }) => Some(*table),
+            Operation::Gather(Gather::Embed {
+                table,
+                weights: None,
+                concat: true,
+                ..
+            }) => {
+                concat.extend(param_of(*table));
+                Some(*table)
+            }
             _ => None,
         };
         for &v in &inputs {
@@ -851,11 +857,21 @@ fn gather_only(
     }
     out.retain(|&p| {
         let param = &trace.params[p];
+        // a dense table a concat gather reads (the n-gram table) whose rows
+        // do not tile 128 lanes: `[V, 160]` bf16 landed column-major, every
+        // fire relayouted all of it (9.4 GiB of temporaries for the 6 GiB
+        // Qwen3.8-Flash-Next mini's)
+        let dense = !codes.contains(&p)
+            && concat.contains(&p)
+            && param.shape.len() == 2
+            && !param.shape[1].is_multiple_of(128)
+            && matches!(param.dtype, Dtype::Bf16 | Dtype::F16 | Dtype::F32);
         !other.contains(&p)
-            && codes.contains(&p)
             && param.source != ParamSource::Registered
-            && matches!(kernels_xla::pack::code_bits(param.dtype), Some(2 | 4))
-            && param.dtype != Dtype::Mxfp4
+            && (dense
+                || codes.contains(&p)
+                    && matches!(kernels_xla::pack::code_bits(param.dtype), Some(2 | 4))
+                    && param.dtype != Dtype::Mxfp4)
     });
     out
 }
@@ -1137,7 +1153,11 @@ impl Weights {
         let codes_planes: std::collections::BTreeSet<usize> = pairings.keys().copied().collect();
         let mut folded: BTreeMap<usize, (u64, u64)> = BTreeMap::new();
         for at in gather_only(trace, &codes_planes, engine) {
-            let pairing = pairings[&at];
+            let Some(&pairing) = pairings.get(&at) else {
+                let (rows, width) = rectangle(&trace.params[at].shape);
+                folded.insert(at, fold_of(rows, width));
+                continue;
+            };
             for plane in [Some(at), Some(pairing.scales), pairing.biases]
                 .into_iter()
                 .flatten()
