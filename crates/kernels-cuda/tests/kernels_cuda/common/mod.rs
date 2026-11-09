@@ -697,6 +697,7 @@ pub fn close(got: f32, want: f32) -> bool {
 }
 
 pub mod attn_ref;
+pub mod expert_pool;
 pub mod host;
 pub mod linear_ref;
 pub mod segments;

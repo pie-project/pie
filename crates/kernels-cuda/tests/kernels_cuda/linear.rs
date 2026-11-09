@@ -8,4 +8,5 @@ mod moe_mega;
 mod moe_route;
 mod moe_select;
 mod moe_select_mlxu4;
+mod moe_table;
 mod skeleton;
