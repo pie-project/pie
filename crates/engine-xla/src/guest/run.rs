@@ -135,6 +135,18 @@ impl Stages {
         // it reached compiled in its own turn (v6e gpt-oss c256 on a fresh
         // VM: 26 stage programs at 1.4 s each, 35 s of a 70 s run).
         let top = padded(self.top as usize).max(batch.lanes);
+        tracing::info!(
+            at,
+            lanes = batch.lanes,
+            top,
+            reads = ?batch
+                .reads
+                .iter()
+                .map(|r| (r.lane, r.rows, r.layers, r.width))
+                .collect::<Vec<_>>(),
+            carried = carried.len(),
+            "xla guest stage not warm"
+        );
         let mut rungs: Vec<u32> =
             std::iter::successors(Some(1u32), |&r| (r < top).then(|| r.saturating_mul(2)))
                 .collect();
