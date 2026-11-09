@@ -1786,13 +1786,19 @@ fn routed(
                 } else {
                     Elem::F32
                 };
+                let down32 = x_tiled.is_some()
+                    && bias.is_none()
+                    && std::env::var_os("PIE_XLA_DOWN32").is_some();
+                if down32 {
+                    spec.out = Elem::F32;
+                }
                 let inside = if spec.bias { bias.take() } else { None };
                 let (y, t) = gmm(
                     f, spec, fan, &bank, scales, inside, x, r, valid, ids, x_tiled,
                 )?;
                 // Rows that round as the select's own do, its bias inside
                 // (mxfp4 banks: the tile-order chain is measured on gpt-oss).
-                if mxfp4 && spec.out == Elem::Bf16 && bias.is_none() {
+                if mxfp4 && (spec.out == Elem::Bf16 || down32) && bias.is_none() {
                     tiled = Some(t);
                 }
                 y
