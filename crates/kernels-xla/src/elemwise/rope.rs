@@ -167,6 +167,13 @@ pub(crate) fn turn(f: &mut Func, x: Val, pos: Val, t: &Turn) -> Result<Val, Erro
             return Ok(f.reshape(out, &[rows, width])?);
         }
     }
+    if unit < 128
+        && width % 128 == 0
+        && std::env::var_os("PIE_XLA_ROPE_FLAT").is_some()
+        && let Some(v) = turn_flat(f, x, pos, t)?
+    {
+        return Ok(v);
+    }
     let mut ang: Option<Val> = None;
     for (axis, freq) in t.freq.iter().enumerate() {
         if freq.iter().all(|&f| f == 0.0) {
@@ -222,6 +229,109 @@ pub(crate) fn turn(f: &mut Func, x: Val, pos: Val, t: &Turn) -> Result<Val, Erro
         turned
     };
     Ok(f.reshape(out, &[rows, width])?)
+}
+
+/// [`turn`] over the row as it lies, every table tiled across its heads: a
+/// head narrower than a lane tile never lays out `[rows, heads, unit]`.
+/// `None` where a partner sits more than two offsets away.
+fn turn_flat(f: &mut Func, x: Val, pos: Val, t: &Turn) -> Result<Option<Val>, Error> {
+    let dims = f.dims(x).to_vec();
+    let (rows, width) = (dims[0], dims[1]);
+    let unit = t.unit;
+    let w = usize::try_from(width).unwrap_or(0);
+    let col = |c: usize| c % unit;
+    let mut shifts: Vec<i64> = Vec::new();
+    for c in 0..unit {
+        let d = t.partner[c] - c as i64;
+        if t.sign[c] != 0.0 && !shifts.contains(&d) {
+            shifts.push(d);
+        }
+    }
+    if shifts.len() > 2 {
+        return Ok(None);
+    }
+    let mut ang: Option<Val> = None;
+    for (axis, freq) in t.freq.iter().enumerate() {
+        if freq.iter().all(|&f| f == 0.0) {
+            continue;
+        }
+        let p = f.slice_axis(pos, 1, axis as i64, axis as i64 + 1)?;
+        let p = f.reshape(p, &[rows])?;
+        let p = f.broadcast(p, &[rows, width], &[0])?;
+        let fs: Vec<f64> = (0..w).map(|c| f64::from(freq[col(c)])).collect();
+        let fq = f.const_floats(Elem::F32, &fs, &[width])?;
+        let fq = f.broadcast(fq, &[rows, width], &[1])?;
+        let a = f.mul(p, fq)?;
+        ang = Some(match ang {
+            Some(prev) => f.add(prev, a)?,
+            None => a,
+        });
+    }
+    let Some(ang) = ang else {
+        return Ok(Some(x));
+    };
+    let mut c = f.cos(ang);
+    let mut s = f.sin(ang);
+    if t.mscale != 1.0 {
+        let m: Vec<f64> = (0..w)
+            .map(|i| {
+                if t.sign[col(i)] == 0.0 {
+                    1.0
+                } else {
+                    f64::from(t.mscale)
+                }
+            })
+            .collect();
+        let m = f.const_floats(Elem::F32, &m, &[width])?;
+        let m = f.broadcast(m, &[rows, width], &[1])?;
+        c = f.mul(c, m)?;
+        s = f.mul(s, m)?;
+    }
+    let sign: Vec<f64> = (0..w).map(|i| f64::from(t.sign[col(i)])).collect();
+    let sign = f.const_floats(Elem::F32, &sign, &[width])?;
+    let sign = f.broadcast(sign, &[rows, width], &[1])?;
+    let s = f.mul(s, sign)?;
+    // Each partner `d` lanes on: the row rolled by `d`, picked where it is.
+    let mut xp: Option<Val> = None;
+    for &d in &shifts {
+        let k = d.rem_euclid(width);
+        let rolled = if k == 0 {
+            x
+        } else {
+            let hi = f.slice_axis(x, 1, k, width)?;
+            let lo = f.slice_axis(x, 1, 0, k)?;
+            f.concat(&[hi, lo], 1)?
+        };
+        xp = Some(match xp {
+            None => rolled,
+            Some(prev) => {
+                let here: Vec<i64> = (0..w)
+                    .map(|i| i64::from(t.partner[col(i)] - col(i) as i64 == d))
+                    .collect();
+                let here = f.const_ints(Elem::I32, &here, &[width])?;
+                let zero = f.const_i(Elem::I32, 0, &[width]);
+                let here = f.compare(Cmp::Ne, here, zero)?;
+                let here = f.broadcast(here, &[rows, width], &[1])?;
+                f.select(here, rolled, prev)?
+            }
+        });
+    }
+    let Some(xp) = xp else {
+        return Ok(Some(x));
+    };
+    let a = f.mul(x, c)?;
+    let b = f.mul(xp, s)?;
+    let turned = f.add(a, b)?;
+    Ok(Some(if t.sign.contains(&0.0) {
+        let moved: Vec<i64> = (0..w).map(|i| i64::from(t.sign[col(i)] != 0.0)).collect();
+        let moved = f.const_ints(Elem::I32, &moved, &[width])?;
+        let zero = f.const_i(Elem::I32, 0, &[width]);
+        let moved = f.compare(Cmp::Ne, moved, zero)?;
+        let moved = f.broadcast(moved, &[rows, width], &[1])?;
+        f.select(moved, turned, x)?
+    } else {
+        turned
+    }))
 }
 
 /// The position stream as f32 `[rows, axes]`: the first `rows · axes` entries
