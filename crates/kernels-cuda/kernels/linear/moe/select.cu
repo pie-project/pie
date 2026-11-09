@@ -9,6 +9,7 @@
 #include <mma.h>
 #endif
 #include "linear/moe_w4.cuh"
+#include "linear/moe/table.cuh"
 #include "linear/w8a16.cuh"
 #include "linear/quant.cuh"
 
@@ -17,18 +18,6 @@ namespace pie::linear {
 [[maybe_unused]] constexpr int kMoeVecWidth = 8;
 
 constexpr int kGemvWarps = 4;
-
-template <class T>
-__device__ __forceinline__ const T* moe_expert_base(
-    const T* __restrict__ weight_base,
-    const T* const* __restrict__ expert_table,
-    int expert,
-    long long expert_stride)
-{
-    return expert_table != nullptr
-        ? expert_table[expert]
-        : weight_base + static_cast<long long>(expert) * expert_stride;
-}
 
 __device__ __forceinline__ void moe_note_expert(
     unsigned int* __restrict__ expert_hits, int expert)
@@ -49,7 +38,7 @@ __device__ __forceinline__ void moe_matmul_select_gemv_body(
     const T* __restrict__ weight_base,
     T* __restrict__ out,
     int top_k, int K, int N, long long expert_stride,
-    const T* const* __restrict__ expert_table,
+    const u64* __restrict__ expert_table,
     unsigned int* __restrict__ expert_hits,
     const u32* __restrict__ win,
     int route_count)
@@ -76,7 +65,8 @@ __device__ __forceinline__ void moe_matmul_select_gemv_body(
     if (blockIdx.x == 0 && threadIdx.y == 0 && lane == 0) {
         moe_note_expert(expert_hits, expert);
     }
-    const T* w = moe_expert_base(weight_base, expert_table, expert, expert_stride);
+    // The expert table (one plane an expert), resolved once a route.
+    const T* w = expert_plane(weight_base, expert_stride, expert_table, 1, 0, expert);
     const float4* w4[kRows];
 #pragma unroll
     for (int r = 0; r < kRows; ++r)
@@ -122,7 +112,7 @@ __global__ void moe_matmul_select_gemv_by_token(
     const T* __restrict__ weight_base,
     T* __restrict__ out,
     int top_k, int K, int N, long long expert_stride,
-    const T* const* __restrict__ expert_table,
+    const u64* __restrict__ expert_table,
     unsigned int* __restrict__ expert_hits,
     int route_count,
     const u32* __restrict__ win)
@@ -143,7 +133,7 @@ __global__ void moe_matmul_select_gemv_by_route(
     const T* __restrict__ weight_base,
     T* __restrict__ out,
     int top_k, int K, int N, long long expert_stride,
-    const T* const* __restrict__ expert_table,
+    const u64* __restrict__ expert_table,
     unsigned int* __restrict__ expert_hits,
     int route_count,
     const u32* __restrict__ win)

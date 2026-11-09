@@ -2161,6 +2161,7 @@ impl<'c> Run<'c> {
                 ExpertTable {
                     table,
                     hits: counts,
+                    ..ExpertTable::RESIDENT
                 },
             ),
             Some(WeightRow::Planes { .. }) => panic!(

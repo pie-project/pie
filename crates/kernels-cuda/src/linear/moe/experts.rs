@@ -141,7 +141,7 @@ pub fn select_glu(
         bias,
     } = bank
         && mxfp4_mma_spans(ctx, fan.route_count, codes.rows)
-        && !experts.streams()
+        && !experts.tabled()
         && x.dtype == Dtype::Bf16
         && x.width > 0
         && x.width.is_multiple_of(32)

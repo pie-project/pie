@@ -49,7 +49,7 @@ pub(crate) fn nvfp4_mma_worth(
     fan: &Selected,
 ) -> bool {
     nvfp4_mma_spans(ctx, fan.route_count)
-        && !experts.streams()
+        && !experts.tabled()
         && x.dtype == Dtype::Bf16
         && y.dtype == Dtype::Bf16
         && x.width > 0

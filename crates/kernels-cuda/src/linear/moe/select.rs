@@ -59,21 +59,6 @@ pub(crate) fn selected(
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub struct ExpertTable {
-    pub table: u64,
-    pub hits: u64,
-}
-
-impl ExpertTable {
-    pub const RESIDENT: ExpertTable = ExpertTable { table: 0, hits: 0 };
-
-    #[must_use]
-    pub const fn streams(&self) -> bool {
-        self.table != 0
-    }
-}
-
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct GroupSeat {
     pub cell: u64,
     pub hits: u64,
@@ -136,7 +121,7 @@ pub fn matmul_select(
         if !crate::linear::gemm_sm100::supported()
             && tiled
             && bank.dtype == Dtype::Bf16
-            && !experts.streams()
+            && !experts.tabled()
             && select_bf16_held(ctx, OP, x, bank.ptr, bank.rows, routes, y, None)?
         {
             return Ok(());
@@ -152,7 +137,7 @@ pub fn matmul_select(
             && fan.route_count > fan.top_k.unsigned_abs()
             && x.dtype == Dtype::Bf16
             && bank.dtype == Dtype::Bf16
-            && !experts.streams()
+            && !experts.tabled()
             && x.width.is_multiple_of(64)
             && y.width.is_multiple_of(8)
             && bank.rows >= 1
@@ -193,7 +178,7 @@ pub(crate) fn tc5_worth(
         && (tokens >= ctx.tuning().moe_tc5_from || routes >= 2 * count || routes > MAX_GRID_Y)
         && x.dtype == Dtype::Bf16
         && bank == Dtype::Bf16
-        && !experts.streams()
+        && !experts.tabled()
         && x.width.is_multiple_of(64)
         && y.width.is_multiple_of(64)
         && crate::linear::gemm_sm100::supported()
@@ -278,7 +263,7 @@ pub(super) fn grouped_worth(
     if !ctx.tuning().moe_grouped {
         return None;
     }
-    if experts.streams() || !matches!(ctx.stage(), ArgValue::Ptr(0)) {
+    if experts.tabled() || !matches!(ctx.stage(), ArgValue::Ptr(0)) {
         return None;
     }
     if !matches!(x.dtype, Dtype::Bf16 | Dtype::F16) || bank.dtype != x.dtype {
