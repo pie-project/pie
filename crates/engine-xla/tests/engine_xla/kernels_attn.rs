@@ -650,6 +650,78 @@ fn long_decode_in(qh: usize, kvh: usize, d: usize, window: Option<u32>) {
 }
 
 #[test]
+fn tmp_paired_emulation() {
+    let mut rng = Rng(5);
+    let ps = 16;
+    let lanes: Vec<Vec<i32>> = (0..64)
+        .map(|l| (0..1 + (l * 37) % 80).map(|p| (p * 13 + l) % 90).collect())
+        .collect();
+    let (qh, kvh, d) = (8usize, 2usize, 64usize);
+    let g = qh / kvh;
+    let pool = Pool::new(&mut rng, ps, kvh, d, 90, lanes.clone(), 80);
+    let mut pool2 = Pool::new(&mut Rng(9), ps, 1, 128, 90, lanes, 80);
+    pool2.keys = pool.keys.clone();
+    pool2.values = pool.values.clone();
+    let rows: Vec<(i32, i32)> = (0..64)
+        .map(|l| (l as i32, (pool.capacity(l) as i32) - 1 - (l as i32 % 5)))
+        .collect();
+    let fire = Fire::plain(&rows);
+    let n = rows.len();
+    let q = rng.bf16s(n * qh * d, 1.0);
+    let slot = |h: usize| -> (usize, usize) {
+        let kv = h / g;
+        let half = kv % 2;
+        ((kv / 2) * 2 * g + half * g + h % g, half)
+    };
+    let mut q2 = vec![0f32; n * qh * 128];
+    for row in 0..n {
+        for h in 0..qh {
+            let (r2, half) = slot(h);
+            for i in 0..d {
+                q2[(row * qh + r2) * 128 + half * 64 + i] = q[(row * qh + h) * d + i];
+            }
+        }
+    }
+    let scale = 0.125;
+    let mut b = Bench::new();
+    let kv = pool2.bind(&mut b);
+    let plan = fire.decode(&mut b);
+    let qt = b.bf16(n as u32, (qh * 128) as u32, &q2);
+    let o = b.zeros(Dtype::Bf16, n as u32, (qh * 128) as u32);
+    if !b
+        .run(|ctx| low::attend(ctx, attn::decode(qt, &plan, None, 128, scale, o)?, kv))
+        .unwrap()
+    {
+        return;
+    }
+    let out = b.read_f32(o);
+    let mut got = vec![0f32; n * qh * d];
+    for row in 0..n {
+        for h in 0..qh {
+            let (r2, half) = slot(h);
+            for i in 0..d {
+                got[(row * qh + h) * d + i] = out[(row * qh + r2) * 128 + half * 64 + i];
+            }
+        }
+    }
+    let (want, _) = sdpa(
+        &q,
+        n,
+        qh,
+        kvh,
+        d,
+        d,
+        &pool.keys,
+        &pool.values,
+        f64::from(scale),
+        &|r| fire.admitted(&pool, r, 0, true),
+        &no_bias,
+        &unit,
+    );
+    check_rows(&got, &want, qh * d, n, 1e-3);
+}
+
+#[test]
 fn a_custom_mask_gates_causal_wide_and_bidirectional_rows() {
     custom_mask(3);
 }
