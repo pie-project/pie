@@ -2346,9 +2346,14 @@ pub(crate) fn scatter_slots(
     let page = read_rows_i32(f, op, write_page, n)?;
     let off = read_rows_i32(f, op, write_offset, n)?;
     // Keys and values into two planes of as many slots: one scatter for both.
+    // (A variadic scatter takes planes of one shape: MLA's latent and rope
+    // planes keep their own.)
     if let [(k, keys), (v, values)] = *pairs
         && keys.val != values.val
         && keys.rows == values.rows
+        && keys.width == values.width
+        && keys.dtype == values.dtype
+        && k.width == v.width
     {
         let slot = slot_of(f, page, off, page_size, keys.rows, n)?;
         let kr = f.convert(k.val, f.elem(keys.val));
