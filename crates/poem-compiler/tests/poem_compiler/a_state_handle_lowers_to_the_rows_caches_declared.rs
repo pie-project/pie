@@ -17,10 +17,11 @@ use poem_ir::{CacheRow, Platform, Trace};
 
 const DIGESTS: &str = "tests/poem_compiler/state_handles.caches";
 
-/// The packages moved to handles, and each one's renaming: a row's name by
-/// its layout path, back to the name its `caches()` gave it.
-const MOVED: &[(&str, fn(&str) -> String)] =
-    &[("qwen3_dense", qwen3_dense), ("nemotron_h", nemotron_h)];
+/// A row's name by its layout path, back to the name `caches()` gave it.
+type Renaming = fn(&str) -> String;
+
+/// The packages moved to handles, and each one's renaming.
+const MOVED: &[(&str, Renaming)] = &[("qwen3_dense", qwen3_dense), ("nemotron_h", nemotron_h)];
 
 fn qwen3_dense(path: &str) -> String {
     match path.split('.').collect::<Vec<_>>()[..] {
