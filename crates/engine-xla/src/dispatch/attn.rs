@@ -25,6 +25,24 @@ impl Run<'_> {
     }
 
     fn attention(&mut self, op: &Attn) -> Result<(), kernels_xla::Error> {
+        // A latent attention through a selection of every key its rows see
+        // reads their causal range: the unselected walk (blocked for a
+        // prompt), not a gather of each row's list.
+        if let Attn::MlaDecode {
+            selection: Some(s), ..
+        }
+        | Attn::MlaPrefill {
+            selection: Some(s), ..
+        } = op
+            && self.full_selections.contains(s)
+        {
+            let mut op = op.clone();
+            if let Attn::MlaDecode { selection, .. } | Attn::MlaPrefill { selection, .. } = &mut op
+            {
+                *selection = None;
+            }
+            return self.attention(&op);
+        }
         match op {
             Attn::ScoreCapture {
                 q,
@@ -1071,6 +1089,13 @@ impl Run<'_> {
                 score: score @ (IndexScore::Pooled | IndexScore::PooledTokens),
                 selection,
             } => {
+                let pool = self.pool(*keys);
+                if *score == IndexScore::Pooled
+                    && *ratio <= 1
+                    && i64::from(pool.max_pages) * i64::from(pool.page_size) <= i64::from(*top_k)
+                {
+                    self.full_selections.push(*selection);
+                }
                 let fire = self.bindings();
                 let (positions, request_of_token) = (fire.cache_rows, fire.tables.request_of_token);
                 crate::lower::attn::index::topk(

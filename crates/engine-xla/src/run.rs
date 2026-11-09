@@ -171,6 +171,11 @@ pub struct Run<'c> {
     /// Token-declared values on a readout-rowed path, cut to the readout
     /// rows (`crate::rows`), and a readout-rowed value telling them.
     readout_rowed: (std::sync::Arc<Vec<bool>>, Option<ValueId>),
+
+    /// Index selections that list every key their rows see: the index pool's
+    /// page bound holds no more keys than the budget, so `attn.index_topk`
+    /// answers each row all of them, in order.
+    pub(crate) full_selections: Vec<ValueId>,
 }
 
 impl<'c> Run<'c> {
@@ -204,6 +209,7 @@ impl<'c> Run<'c> {
             probes: Vec::new(),
             probed: std::cell::RefCell::new(Vec::new()),
             readout_rowed: (std::sync::Arc::new(Vec::new()), None),
+            full_selections: Vec::new(),
         }
     }
 
