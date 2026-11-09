@@ -1473,7 +1473,6 @@ fn delta(
                 )?;
                 return Ok((yv, slab));
             }
-            let orig_slab = slab;
             let mut slab = slab;
             let mut ys = Vec::new();
             let mut lo = 0;
@@ -1495,7 +1494,10 @@ fn delta(
                         cut(fq, lanes.write)?,
                     )
                 };
-                let s = take_slots(fq, orig_slab, slot, per)?;
+                // From the slab as the rounds before left it: a lane's slot
+                // is its own, and reading the bank as it came in would keep
+                // it whole beside the one landed into (a copy of every slot).
+                let s = take_slots(fq, slab, slot, per)?;
                 let s = fq.reshape(s, &[hi - lo, hh, dk, dv])?;
                 let (yv, s) = delta_step(fq, &part, s, input.rule())?;
                 let s = fq.reshape(s, &[hi - lo, stride])?;
