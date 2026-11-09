@@ -17,6 +17,7 @@
 //! chunk count, two matmuls a step), and the outputs are formed batched
 //! after it.
 
+mod chunk;
 pub mod dyn_conv;
 
 use dtype::Dtype;
@@ -33,6 +34,24 @@ use crate::tensor::{Landing, Operand, RaggedTensor, Stored};
 
 /// The GDN's q/k l2-norm epsilon, as the GPU kernels state it.
 const GDN_EPS: f64 = 1e-6;
+
+/// Whether a ragged GDN fire's chunks run as the fused Mosaic kernel
+/// (`chunk`): 2 leaves it to `PIE_GDN_CHUNK_KERNEL` (on unless `0`).
+static FUSED_CHUNKS: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(2);
+
+/// Turns the fused chunk kernel on or off for this process (`None`: as the
+/// environment says), for tests that run both forms.
+pub fn fused_chunks(on: Option<bool>) {
+    let v = on.map_or(2, u8::from);
+    FUSED_CHUNKS.store(v, std::sync::atomic::Ordering::Relaxed);
+}
+
+fn fused_chunks_on() -> bool {
+    match FUSED_CHUNKS.load(std::sync::atomic::Ordering::Relaxed) {
+        2 => !std::env::var("PIE_GDN_CHUNK_KERNEL").is_ok_and(|v| v == "0"),
+        v => v == 1,
+    }
+}
 
 // --------------------------------------------------------------------- conv
 
@@ -1466,6 +1485,7 @@ fn delta(
     let chunk = chunk.min(i64::from(rows.next_power_of_two().max(8)));
     let raw = input.raw(f)?;
     let slab = state.val;
+    let ragged = matches!(lanes, LaneTables::Ragged { .. });
     let (yv, slab) = match lanes {
         LaneTables::Decode { slots } => {
             let slots = flat_i32(f, slots)?;
@@ -1557,9 +1577,17 @@ fn delta(
             };
             let fq = &mut *f;
             let l = lanes.count(fq);
+            let kernel = ragged && t > chunk && fused_chunks_on();
+            let fused = if kernel {
+                chunk::gdn_chunks(fq, &input, &raw, &segs, &lanes, slab, per, chunk)?
+            } else {
+                None
+            };
             // every lane fits one chunk only when the whole fire does: an average under `chunk` lets a
             // prompt beside decodes (or a padding lane) lose its rows past the first chunk
-            if t <= chunk {
+            if let Some(out) = fused {
+                out
+            } else if t <= chunk {
                 delta_single_chunk(fq, &input, &raw, &lanes, slab, per, stride, chunk)?
             } else {
                 let init = take_slots(fq, slab, lanes.slot, per)?;
