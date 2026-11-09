@@ -1830,12 +1830,12 @@ pub fn attend_fresh(
     };
     let hi = f.max(hi, lo)?;
     // The fire's own keys: each row reads its segment's rows `[first, r]`
-    // fresh, and the pool only below the segment's first position. Rows
-    // the append did not file at their own lane and position turn it off.
+    // fresh, and the pool only below the segment's first position. A row
+    // the append did not file at its own lane and position, or one under a
+    // custom mask, turns it off.
     let appended = appended.filter(|kv| {
         walk == Walk::Blocked
             && call.causal
-            && enabled.is_none()
             && call.selection.is_none()
             && call.rel.is_none()
             && call.lse.is_none()
@@ -1858,6 +1858,13 @@ pub fn attend_fresh(
             let same_off = f.compare(Cmp::Eq, off, wo)?;
             let filed = f.and(same_page, same_off)?;
             let filed = f.or(filed, alone)?;
+            let filed = match enabled {
+                Some(en) => {
+                    let plain = cmp_i(f, Cmp::Eq, en, 0)?;
+                    f.and(filed, plain)?
+                }
+                None => filed,
+            };
             let all = f.reduce(filed, &[0], Fold::And)?;
             let all = f.broadcast(all, &[r], &[])?;
             let (start, p0) = super::fresh::segments(f, req, qpos, alone)?;

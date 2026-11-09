@@ -1301,7 +1301,8 @@ fn kv_append_writes_a_prefill_by_pages() {
 /// A prefill that appended its rows first reads its own segment's keys
 /// through the fresh kernel and the older ones from the pool: a lane with
 /// 100 positions before the fire, a fresh lane, a lone row, two pads; with
-/// and without a window.
+/// and without a window. The fresh rows it is handed are another append's
+/// (to a twin pool), so only a fresh read matches.
 #[test]
 fn a_prefill_reads_the_rows_it_appended_fresh() {
     let mut rng = Rng(31);
@@ -1315,6 +1316,8 @@ fn a_prefill_reads_the_rows_it_appended_fresh() {
     let q = rng.bf16s(rows * qh * d, 1.0);
     let k = rng.bf16s(rows * w, 1.0);
     let v = rng.bf16s(rows * w, 1.0);
+    let k2 = rng.bf16s(rows * w, 1.0);
+    let v2 = rng.bf16s(rows * w, 1.0);
     let (mut page, mut off) = (Vec::new(), Vec::new());
     for (&lane, &kp) in fire.req.iter().zip(&fire.positions) {
         if kp < 0 {
@@ -1329,11 +1332,14 @@ fn a_prefill_reads_the_rows_it_appended_fresh() {
     let scale = 0.1;
     let mut b = Bench::new();
     let kv = pool.bind(&mut b);
+    let twin = pool.bind(&mut b);
     let plan = fire.prefill(&mut b);
     let qt = b.bf16(rows as u32, (qh * d) as u32, &q);
     let qr = ragged(&mut b, &runs, qt);
     let kt = b.bf16(rows as u32, w as u32, &k);
     let vt = b.bf16(rows as u32, w as u32, &v);
+    let kt2 = b.bf16(rows as u32, w as u32, &k2);
+    let vt2 = b.bf16(rows as u32, w as u32, &v2);
     let pt = b.i32(rows as u32, 1, &page);
     let ot = b.i32(rows as u32, 1, &off);
     let wq = (qh * d) as u32;
@@ -1341,7 +1347,8 @@ fn a_prefill_reads_the_rows_it_appended_fresh() {
     let o_win = b.zeros(Dtype::Bf16, rows as u32, wq);
     if !b
         .run(|ctx| {
-            let read = low::kv_append(ctx, kt, vt, &kv, pt, ot)?;
+            low::kv_append(ctx, kt, vt, &kv, pt, ot)?;
+            let read = low::kv_append(ctx, kt2, vt2, &twin, pt, ot)?;
             for (window, o) in [(None, o_fresh), (Some(100), o_win)] {
                 let call =
                     arbiter::prefill(qr, &plan, &kv, window, d as u32, kvh as u32, scale, o, 1000)?;
@@ -1356,8 +1363,8 @@ fn a_prefill_reads_the_rows_it_appended_fresh() {
     for (i, &p) in page.iter().enumerate() {
         if p != i32::MAX {
             let slot = p as usize * ps + off[i] as usize;
-            pool.keys[slot * w..(slot + 1) * w].copy_from_slice(&k[i * w..(i + 1) * w]);
-            pool.values[slot * w..(slot + 1) * w].copy_from_slice(&v[i * w..(i + 1) * w]);
+            pool.keys[slot * w..(slot + 1) * w].copy_from_slice(&k2[i * w..(i + 1) * w]);
+            pool.values[slot * w..(slot + 1) * w].copy_from_slice(&v2[i * w..(i + 1) * w]);
         }
     }
     let live = rows - 2;
