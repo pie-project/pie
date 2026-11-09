@@ -1323,14 +1323,10 @@ fn routed(
     let grouped = gmm_spec(fan, &bank, f.elem(bank.codes.val()), mxfp4, tuning);
     let path = match tuning.moe_path {
         MoePath::Gmm if grouped.is_none() => MoePath::All,
-        // mxfp4 codes: the kernel reads only the routed experts' codes and
-        // exponents, where every other path copies or decodes them (a slice
-        // copies an expert's codes at ~180 GB/s on v5e; the ragged dot
-        // decodes the whole bank to bf16 in every layer).
-        MoePath::Auto { .. } if grouped.is_some_and(|g| g.scaled) => MoePath::Gmm,
-        // A pre-scaled mxfp4 bank past the slice case: the kernel at every
-        // fire size, where the ragged dot would convert the whole bank to
-        // bf16 first (twice its bytes, in every layer).
+        // An mxfp4 bank (its codes, or pre-scaled) past the slice case: the
+        // kernel at every fire size, reading only the routed experts, where
+        // the ragged dot would decode the whole bank to bf16 first (in every
+        // layer: v5e gpt-oss 12-layer cut, 330 of a 340 ms 512-token prefill).
         MoePath::Auto { .. }
             if mxfp4
                 && grouped.is_some()
