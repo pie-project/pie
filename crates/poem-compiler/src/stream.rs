@@ -395,21 +395,22 @@ fn candidates(regions: &[Region], ordered: &Ordered, a: usize, b: usize) -> bool
 struct Touches {
     reads: Vec<Vec<ValueId>>,
     writes: Vec<Vec<ValueId>>,
-    spaces: Vec<Vec<u32>>,
+    /// The cache rows (`Def::Cache`) each region reads or writes.
+    rows: Vec<Vec<u32>>,
     barrier: Vec<bool>,
     exclusive: Vec<bool>,
 }
 
 impl Touches {
     fn of(trace: &Trace, regions: &[Region], profile: &DeviceProfile) -> Touches {
-        let spaces_of: Vec<Option<u32>> = trace
+        // A cache or state row is ordered by its own bytes: two regions meet
+        // there only where they touch the same row. Its page table and write
+        // positions are read-only fire inputs, so rows sharing them never wait.
+        let rows_of: Vec<Option<u32>> = trace
             .values
             .iter()
             .map(|value| match value.def {
-                Def::Cache(row) => Some(match trace.caches.get(row as usize) {
-                    Some(poem_ir::CacheRow::Kv { space, .. }) => *space,
-                    _ => u32::MAX - row,
-                }),
+                Def::Cache(row) => Some(row_key(trace, row)),
                 _ => None,
             })
             .collect();
@@ -422,13 +423,13 @@ impl Touches {
         let mut touches = Touches {
             reads: Vec::with_capacity(regions.len()),
             writes: Vec::with_capacity(regions.len()),
-            spaces: Vec::with_capacity(regions.len()),
+            rows: Vec::with_capacity(regions.len()),
             barrier: Vec::with_capacity(regions.len()),
             exclusive: Vec::with_capacity(regions.len()),
         };
         let mut scratch = Vec::new();
         for region in regions {
-            let (mut reads, mut writes, mut spaces) = (Vec::new(), Vec::new(), Vec::new());
+            let (mut reads, mut writes, mut rows) = (Vec::new(), Vec::new(), Vec::new());
             let mut barrier = false;
             let mut exclusive = false;
             for node in region.nodes.clone() {
@@ -444,8 +445,8 @@ impl Touches {
                 node.op.inputs(&mut scratch);
                 for &named in &scratch {
                     for &value in arms(&through, named) {
-                        match spaces_of.get(value.0 as usize).copied().flatten() {
-                            Some(space) => spaces.push(space),
+                        match rows_of.get(value.0 as usize).copied().flatten() {
+                            Some(row) => rows.push(row),
                             None => reads.push(value),
                         }
                     }
@@ -453,8 +454,8 @@ impl Touches {
                 scratch.clear();
                 node.op.outputs(&mut scratch);
                 for &value in &scratch {
-                    match spaces_of.get(value.0 as usize).copied().flatten() {
-                        Some(space) => spaces.push(space),
+                    match rows_of.get(value.0 as usize).copied().flatten() {
+                        Some(row) => rows.push(row),
                         None => writes.push(value),
                     }
                 }
@@ -463,11 +464,11 @@ impl Touches {
             reads.dedup();
             writes.sort_unstable();
             writes.dedup();
-            spaces.sort_unstable();
-            spaces.dedup();
+            rows.sort_unstable();
+            rows.dedup();
             touches.reads.push(reads);
             touches.writes.push(writes);
-            touches.spaces.push(spaces);
+            touches.rows.push(rows);
             touches.barrier.push(barrier);
             touches.exclusive.push(exclusive);
         }
@@ -487,8 +488,21 @@ impl Touches {
         {
             return true;
         }
-        meets(&self.spaces[a], &self.spaces[b]) && !regions[a].mask.disjoint(&regions[b].mask)
+        meets(&self.rows[a], &self.rows[b]) && !regions[a].mask.disjoint(&regions[b].mask)
     }
+}
+
+/// The key a cache row is ordered by: the row itself.
+#[cfg(not(test))]
+fn row_key(_: &Trace, row: u32) -> u32 {
+    row
+}
+
+#[cfg(test)]
+fn row_key(trace: &Trace, row: u32) -> u32 {
+    tests::KEY
+        .with(core::cell::Cell::get)
+        .map_or(row, |key| key(trace, row))
 }
 
 fn resolve(trace: &Trace, through: &mut Vec<Option<Vec<ValueId>>>, value: ValueId) {
@@ -563,4 +577,245 @@ fn closure(regions: &[Region], touches: &Touches) -> Ordered {
         }
     }
     Ordered { after }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{
+        Budget, Budgets, PATCH_LATTICE_FLOOR, PatchLadder, VoxelLadder, compile_axes, region,
+    };
+    use core::cell::Cell;
+    use poem::Platform;
+    use poem_ir::{ParamSource, RowAxis, Ty, resolve_classes};
+
+    type Key = fn(&Trace, u32) -> u32;
+
+    thread_local! {
+        /// The key [`row_key`] orders a cache row by in place of the row.
+        pub(super) static KEY: Cell<Option<Key>> = const { Cell::new(None) };
+    }
+
+    /// The order before rows: a kv row by the space it shares with the
+    /// space's other rows, any other row by itself. Verification scaffolding:
+    /// it and the test below go when kv spaces leave the IR.
+    fn by_space(trace: &Trace, row: u32) -> u32 {
+        match trace.caches.get(row as usize) {
+            Some(poem_ir::CacheRow::Kv { space, .. }) => *space,
+            _ => u32::MAX - row,
+        }
+    }
+
+    fn under<T>(key: Option<Key>, run: impl FnOnce() -> T) -> T {
+        KEY.with(|held| held.set(key));
+        let out = run();
+        KEY.with(|held| held.set(None));
+        out
+    }
+
+    fn budgets_of(trace: &Trace) -> Budgets {
+        let states = |axis: RowAxis| {
+            trace.values.iter().any(|decl| {
+                matches!(&decl.ty, Ty::Tensor { shape, .. }
+                    if shape.first().and_then(|dim| dim.axis()) == Some(axis))
+            })
+        };
+        let seats = trace
+            .params
+            .iter()
+            .filter(|param| param.source == ParamSource::Registered)
+            .map(|param| param.shape.first().copied().unwrap_or(0))
+            .min()
+            .unwrap_or(0);
+        let budget = Budget {
+            max_adapters: u32::try_from(seats).unwrap_or(u32::MAX),
+            ..Budget::default()
+        };
+        let mut budgets = Budgets::of(budget.clone());
+        if states(RowAxis::Patches) {
+            let max_patches = budget.max_tokens.clamp(PATCH_LATTICE_FLOOR, 4096);
+            let mut buckets = Vec::new();
+            let mut rung = PATCH_LATTICE_FLOOR;
+            while rung < max_patches {
+                buckets.push(rung);
+                rung = rung.saturating_mul(2);
+            }
+            buckets.push(max_patches);
+            budgets = budgets.with_patches(PatchLadder {
+                max_images: (max_patches / PATCH_LATTICE_FLOOR).max(1),
+                max_patches,
+                buckets,
+            });
+        }
+        if states(RowAxis::Voxels) {
+            budgets = budgets.with_voxels(VoxelLadder::new(4096, 4));
+        }
+        budgets
+    }
+
+    /// Over one region list: an edge ordering by row adds that ordering by
+    /// space lacked, or one it drops between regions sharing a row, is
+    /// wrong. Returns how many it drops.
+    fn compare(
+        trace: &Trace,
+        regions: &[Region],
+        profile: &DeviceProfile,
+        at: &str,
+        wrong: &mut Vec<String>,
+    ) -> usize {
+        let rows = under(None, || Touches::of(trace, regions, profile));
+        let spaces = under(Some(by_space), || Touches::of(trace, regions, profile));
+        let mut dropped = 0;
+        for a in 0..regions.len() {
+            for b in a + 1..regions.len() {
+                match (rows.edge(regions, a, b), spaces.edge(regions, a, b)) {
+                    (true, false) => wrong.push(format!("{at}: new edge {a}->{b}")),
+                    (false, true) => {
+                        dropped += 1;
+                        if meets(&rows.rows[a], &rows.rows[b]) {
+                            wrong.push(format!("{at}: dropped {a}->{b} shares a row"));
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+        dropped
+    }
+
+    /// Every catalog deployment on every platform, under the default
+    /// profile and one scheduled by dependencies: ordering by cache row
+    /// keeps a subset of the edges ordering by kv space did, each one it
+    /// drops joins regions that share no row, and the plans it changes are
+    /// listed with their concurrent pairs before and after.
+    ///
+    /// `cargo test --release -p pie-poem-compiler --lib rows_order -- --ignored --nocapture`
+    #[test]
+    #[ignore = "compiles every catalog deployment twice per profile"]
+    fn rows_order_a_subset_of_what_spaces_did() {
+        let dag = DeviceProfile {
+            dag_streams: true,
+            ..DeviceProfile::default()
+        };
+        let profiles = [("default", DeviceProfile::default()), ("dag_streams", dag)];
+        let platforms = [
+            Platform::Cuda,
+            Platform::Metal,
+            Platform::Wgpu,
+            Platform::Vulkan,
+        ];
+        let jobs: Vec<(&crate::catalog::Deployment, Platform)> = crate::catalog::deployments()
+            .flat_map(|row| platforms.map(|platform| (row, platform)))
+            .collect();
+        let next = std::sync::atomic::AtomicUsize::new(0);
+        let tally = std::sync::Mutex::new(Tally::default());
+        let threads = std::thread::available_parallelism().map_or(1, usize::from);
+        std::thread::scope(|scope| {
+            for _ in 0..threads {
+                scope.spawn(|| {
+                    loop {
+                        let at = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        let Some(&(row, platform)) = jobs.get(at) else {
+                            break;
+                        };
+                        let mut mine = Tally::default();
+                        one(row, platform, &profiles, &mut mine);
+                        tally.lock().expect("no job panics").add(mine);
+                    }
+                });
+            }
+        });
+        let tally = tally.into_inner().expect("no job panics");
+        let mut lines = tally.lines;
+        lines.sort();
+        for line in &lines {
+            println!("{line}");
+        }
+        println!(
+            "{} plans ({} refused): {} identical, {} differ ({} more concurrent, {} less); \
+             {} edges dropped",
+            tally.plans,
+            tally.refused,
+            tally.same,
+            tally.plans - tally.same,
+            tally.gained,
+            tally.lost,
+            tally.dropped,
+        );
+        assert!(
+            tally.wrong.is_empty(),
+            "{} violations:\n{}",
+            tally.wrong.len(),
+            tally.wrong.join("\n")
+        );
+    }
+
+    #[derive(Default)]
+    struct Tally {
+        plans: usize,
+        same: usize,
+        refused: usize,
+        dropped: usize,
+        gained: usize,
+        lost: usize,
+        lines: Vec<String>,
+        wrong: Vec<String>,
+    }
+
+    impl Tally {
+        fn add(&mut self, other: Tally) {
+            self.plans += other.plans;
+            self.same += other.same;
+            self.refused += other.refused;
+            self.dropped += other.dropped;
+            self.gained += other.gained;
+            self.lost += other.lost;
+            self.lines.extend(other.lines);
+            self.wrong.extend(other.wrong);
+        }
+    }
+
+    fn one(
+        row: &crate::catalog::Deployment,
+        platform: Platform,
+        profiles: &[(&str, DeviceProfile)],
+        tally: &mut Tally,
+    ) {
+        let Ok(trace) = row.try_trace(platform) else {
+            tally.refused += 1;
+            return;
+        };
+        let budgets = budgets_of(&trace);
+        let classes = resolve_classes(&trace).expect("classes resolve");
+        let every: std::collections::BTreeSet<u32> = (0..trace.nodes.len() as u32).collect();
+        let mut fine =
+            region::coalesce_breaking(&trace, &classes, &every).expect("one region an op");
+        region::hoist(&trace, &mut fine).expect("hoists");
+        for (name, profile) in profiles {
+            let at = format!("{} on {platform:?} under {name}", row.name);
+            let new = under(None, || compile_axes(&trace, &budgets, profile));
+            let old = under(Some(by_space), || compile_axes(&trace, &budgets, profile));
+            let (Ok(new), Ok(old)) = (new, old) else {
+                tally.refused += 1;
+                continue;
+            };
+            tally.plans += 1;
+            for regions in [&fine, &new.regions, &old.regions] {
+                tally.dropped += compare(&trace, regions, profile, &at, &mut tally.wrong);
+            }
+            if new == old {
+                tally.same += 1;
+                continue;
+            }
+            let (before, after) = (old.streams.pairs.len(), new.streams.pairs.len());
+            if after > before {
+                tally.gained += 1;
+            } else if after < before {
+                tally.lost += 1;
+            }
+            tally
+                .lines
+                .push(format!("{at}: {before} -> {after} concurrent pairs"));
+        }
+    }
 }
