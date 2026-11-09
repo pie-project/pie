@@ -22,6 +22,7 @@ Modes: `ref` (f32 everywhere, the reference arithmetic), or `+`-joined kernel sw
            steps in f32, glu = max(g, g e) r
   cyv      the attention CY's 1 / (l + exp(sink - mref)) as ctl_cy_gptoss_att CYV 1: the exponent split, 1 / m by the
            quadratic and two Newton steps in f32, x 2^-e (then o = num x that, not num / it)
+  cyx      with cyv: the sink term's exp by the kernel's vexp (exp_fast form, ~3e-6 relative)
   att32    attention matvecs (qkv, o) with f32 accumulation
 Router report: per (position, layer) the 4th / 5th gap of our logits and our logits' error against
 an f64 router on the same x2 (the kernel's router error); counts of gaps below that error."""
@@ -182,7 +183,17 @@ class Emu:
                     num = np.einsum("kgt,ktd->kgd", p.reshape(NKV, NH // NKV, -1), Vc).reshape(NH, HD)
                     l_ = p.sum(-1)
                     bad = np.any((l_ < 2 ** -8) | (l_ >= 32768))
-                    lt = l_ + np.exp(np.minimum(sink - mref, 88))
+                    if "cyx" in o:   # the kernel's vexp (exp_fast form) for the sink term
+                        xx = np.clip((sink - mref).astype(f32), f32(-87), f32(88))
+                        kk = (xx * f32(1.4426950408889634)).astype(f32); kk = (kk + f32(12582912.0)).astype(f32); kk = (kk - f32(12582912.0)).astype(f32)
+                        rr_ = (xx.astype(np.float64) - kk.astype(np.float64) * 0.6931471805599453).astype(f32)
+                        qq = (rr_ * f32(0.041458580642938614)).astype(f32)
+                        for ci, cc in enumerate([0.16790908575057983, 0.5000435709953308, 0.9999634027481079, 0.9999992847442627]):
+                            if ci > 0: qq = (qq * rr_).astype(f32)
+                            qq = (qq + f32(cc)).astype(f32)
+                        lt = (l_ + np.ldexp(qq, kk.astype(np.int32)).astype(f32)).astype(f32)
+                    else:
+                        lt = l_ + np.exp(np.minimum(sink - mref, 88))
                     if "cyv" in o:
                         mf, ex = np.frexp(lt.astype(f32)); mm_ = (mf * 2).astype(f32)
                         r = (mm_ * f32(0.323112507040746)).astype(f32); r = (r + f32(-1.4540415401729079)).astype(f32)

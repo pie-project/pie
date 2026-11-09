@@ -28,7 +28,7 @@ param NLV: u16 = 5;
 param QSC: f32 = 0.125;   // 1 / sqrt(head dim)
 param TSTAMP: u16 = 0;
 param FIFOW: u16 = 32;
-param CYV: u16 = 0;   // 1: a pass's per-head 1 / (l + exp(sink - mref)) as Qh-word vector ops (exp_fast's form; the reciprocal
+param CYV: u16 = 0;   // (2: the vector exp, the scalar recip; 3: the scalar exp1, the vector reciprocal: bisection) 1: a pass's per-head 1 / (l + exp(sink - mref)) as Qh-word vector ops (exp_fast's form; the reciprocal
                       // by exponent split, the quadratic and two Newton steps); 0: exp1 and recip a head (scalar)
 
 const sys_mod = @import_module("<memcpy/memcpy>", memcpy_params);
@@ -328,12 +328,12 @@ fn att(l: u16, pos: u32) void {
   while (pass < 8) : (pass += 1) {
     reduce(NV);
     var bad: f32 = 0.0;
-    if (CYV == 1) {
+    if (CYV != 0) {
       @fmovs(lh_d, lst_d);
       @fsubs(ve_d, @increment_dsd_offset(snk_d, @as(i16, l * Qh), f32), @increment_dsd_offset(mref_d, @as(i16, l * Qh), f32));
-      vexpq();
+      if (CYV == 3) { h = 0; while (h < Qh) : (h += 1) { ve[h] = exp1(ve[h]); } } else { vexpq(); }
       @fadds(ve_d, lh_d, ve_d);
-      vrecipq();
+      if (CYV == 2) { h = 0; while (h < Qh) : (h += 1) { ilh[h] = recip(ve[h]); } } else { vrecipq(); }
       h = 0;
       while (h < Qh) : (h += 1) {
         const lv = lh[h];
