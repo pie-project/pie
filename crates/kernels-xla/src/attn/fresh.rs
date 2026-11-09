@@ -48,10 +48,10 @@ struct Shape {
 
 impl Shape {
     fn of(r: i64, h: &Heads, scale: f64) -> Self {
-        let bk = BK.min(round_up(r, 128));
+        let bk = if r <= BR { BR } else { BK };
         Self {
             rp: round_up(r, bk),
-            br: BR.min(bk),
+            br: BR,
             bk,
             h: *h,
             scale,

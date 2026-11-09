@@ -1278,7 +1278,7 @@ fn kv_append_writes_a_prefill_by_pages() {
         let pt = bench.i32(n as u32, 1, &page);
         let ot = bench.i32(n as u32, 1, &off);
         if !bench
-            .run(|ctx| low::kv_append(ctx, kt, vt, &kv, pt, ot))
+            .run(|ctx| low::kv_append(ctx, kt, vt, &kv, pt, ot).map(|_| ()))
             .unwrap()
         {
             return;
@@ -1295,6 +1295,88 @@ fn kv_append_writes_a_prefill_by_pages() {
         }
         assert_close(&bench.read_f32(kv.keys), &want_k, 0.0, 0.0);
         assert_close(&bench.read_f32(kv.values), &want_v, 0.0, 0.0);
+    }
+}
+
+/// A prefill that appended its rows first reads its own segment's keys
+/// through the fresh kernel and the older ones from the pool: a lane with
+/// 100 positions before the fire, a fresh lane, a lone row, two pads; with
+/// and without a window.
+#[test]
+fn a_prefill_reads_the_rows_it_appended_fresh() {
+    let mut rng = Rng(31);
+    let (qh, kvh, d, ps) = (4usize, 2usize, 128usize, 16usize);
+    let lanes = vec![(0..40).collect(), (40..44).collect(), (44..48).collect()];
+    let mut pool = Pool::new(&mut rng, ps, kvh, d, 50, lanes, 40);
+    let runs = [(0, 100, 300), (1, 0, 40), (2, 20, 1)];
+    let fire = Fire::plain(&prefill_rows(&runs, 2));
+    let rows = fire.positions.len();
+    let w = kvh * d;
+    let q = rng.bf16s(rows * qh * d, 1.0);
+    let k = rng.bf16s(rows * w, 1.0);
+    let v = rng.bf16s(rows * w, 1.0);
+    let (mut page, mut off) = (Vec::new(), Vec::new());
+    for (&lane, &kp) in fire.req.iter().zip(&fire.positions) {
+        if kp < 0 {
+            page.push(i32::MAX);
+            off.push(0);
+        } else {
+            let slot = pool.slot(lane as usize, kp as usize);
+            page.push((slot / ps) as i32);
+            off.push((slot % ps) as i32);
+        }
+    }
+    let scale = 0.1;
+    let mut b = Bench::new();
+    let kv = pool.bind(&mut b);
+    let plan = fire.prefill(&mut b);
+    let qt = b.bf16(rows as u32, (qh * d) as u32, &q);
+    let qr = ragged(&mut b, &runs, qt);
+    let kt = b.bf16(rows as u32, w as u32, &k);
+    let vt = b.bf16(rows as u32, w as u32, &v);
+    let pt = b.i32(rows as u32, 1, &page);
+    let ot = b.i32(rows as u32, 1, &off);
+    let wq = (qh * d) as u32;
+    let o_fresh = b.zeros(Dtype::Bf16, rows as u32, wq);
+    let o_win = b.zeros(Dtype::Bf16, rows as u32, wq);
+    if !b
+        .run(|ctx| {
+            let read = low::kv_append(ctx, kt, vt, &kv, pt, ot)?;
+            for (window, o) in [(None, o_fresh), (Some(100), o_win)] {
+                let call =
+                    arbiter::prefill(qr, &plan, &kv, window, d as u32, kvh as u32, scale, o, 1000)?;
+                low::attend_fresh(ctx, call, kv, Some(read))?;
+            }
+            Ok(())
+        })
+        .unwrap()
+    {
+        return;
+    }
+    for (i, &p) in page.iter().enumerate() {
+        if p != i32::MAX {
+            let slot = p as usize * ps + off[i] as usize;
+            pool.keys[slot * w..(slot + 1) * w].copy_from_slice(&k[i * w..(i + 1) * w]);
+            pool.values[slot * w..(slot + 1) * w].copy_from_slice(&v[i * w..(i + 1) * w]);
+        }
+    }
+    let live = rows - 2;
+    for (window, o) in [(0, o_fresh), (100, o_win)] {
+        let (want, _) = sdpa(
+            &q,
+            rows,
+            qh,
+            kvh,
+            d,
+            d,
+            &pool.keys,
+            &pool.values,
+            f64::from(scale),
+            &|r| fire.admitted(&pool, r, window, true),
+            &no_bias,
+            &unit,
+        );
+        check_rows(&b.read_f32(o), &want, qh * d, live, 2e-3);
     }
 }
 
