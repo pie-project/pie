@@ -261,6 +261,41 @@ mod tests {
         the_cerebras_block_states_only_keys_the_engine_declares();
         a_binary_with_an_engine_writes_a_config_that_parses();
         it_names_the_engine_this_binary_actually_has();
+        no_block_names_a_removed_key();
+    }
+
+    /// Not even commented out: an operator who uncomments a line the
+    /// template offers gets a file that parses.
+    fn no_block_names_a_removed_key() {
+        #[allow(unused_mut)]
+        let mut blocks = vec![
+            HEADER,
+            DEFAULT_MODEL_BLOCK,
+            CUDA_ENGINE_BLOCK,
+            VULKAN_ENGINE_BLOCK,
+            WGPU_ENGINE_BLOCK,
+            XLA_ENGINE_BLOCK,
+            CEREBRAS_ENGINE_BLOCK,
+            RUNTIME,
+            DEFAULT_FRAMES,
+            CEREBRAS_FRAMES,
+            TAIL,
+        ];
+        #[cfg(all(feature = "metal", target_vendor = "apple"))]
+        blocks.push(METAL_ENGINE_BLOCK);
+        for block in blocks {
+            for line in block.lines() {
+                let stated = line.trim_start_matches(['#', ' ']);
+                let Some((key, _)) = stated.split_once('=') else {
+                    continue;
+                };
+                let key = key.trim();
+                assert!(
+                    worker::config::removed::refusal_for(key).is_none(),
+                    "the template offers the removed key {key}: {line}"
+                );
+            }
+        }
     }
 
     fn default_config_is_parseable() {

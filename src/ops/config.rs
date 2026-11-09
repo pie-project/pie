@@ -208,6 +208,9 @@ fn schema_field(file: &toml::Value, key: &str) -> Result<worker::config::schema:
     if let Some(found) = fields.iter().find(|f| f.key == key) {
         return Ok(found.clone());
     }
+    if let Some(refusal) = worker::config::removed::refusal_for(key) {
+        bail!("{refusal}");
+    }
     let leaf = key.rsplit('.').next().unwrap_or(key);
     let near: Vec<&str> = fields
         .iter()
