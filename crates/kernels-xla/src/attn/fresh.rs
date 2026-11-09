@@ -406,3 +406,27 @@ pub(crate) fn segments(f: &mut Func, req: Val, qpos: Val, alone: Val) -> Built<(
     let p0 = f.sub(qpos, back)?;
     Ok((start, p0))
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_kernel_walks_key_blocks_with_every_head() {
+        let h = Heads {
+            kvh: 2,
+            g: 2,
+            d: 128,
+            dv: 128,
+        };
+        let s = Shape::of(1000, &h, 0.1);
+        assert_eq!((s.rp, s.br, s.bk), (1024, 256, 512));
+        let c = kernel(&s, 100 << 20).unwrap();
+        assert!(c.module.contains("iteration_bounds = array<i64: 4, 2>"));
+        assert!(c.module.contains("scratch_operands = 3 : i64"));
+        assert_eq!(c.operands.len(), 6);
+        if let Some(p) = std::env::var_os("FRESH_DUMP") {
+            std::fs::write(p, &c.module).unwrap();
+        }
+    }
+}
