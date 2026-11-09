@@ -1510,7 +1510,16 @@ impl Shell {
             })
             .max(pad.page_floor);
         let _ = canonical;
-        let max_pages = pad.rung(max_pages).min(cap);
+        // A fire that prefills lays its tables to the cap: its walks stop at
+        // the rows' own bounds, and its program is then keyed by its rows and
+        // lanes, the shapes the warm ladder compiles, not by how long the
+        // prompts happened to be (v6e Qwen3-0.6B pf256-512: 1792 rows over
+        // 64 lanes at 64 pages compiled for 14 s inside the measured rounds).
+        let max_pages = if rows == lane_count {
+            pad.rung(max_pages).min(cap)
+        } else {
+            cap
+        };
 
         let mut windows = Windows::of(
             &self.compiled,
