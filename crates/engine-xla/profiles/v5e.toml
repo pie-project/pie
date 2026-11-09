@@ -1,0 +1,12 @@
+api = 1
+
+[target]
+assumes = { generation = 5, hbm_gib = 16 }
+
+# as on v6e: on the powers-of-two ladder a 512-token prompt (and its template) ran a 1024-row fire;
+# 128-row rungs from 512 run it at 640
+[engine]
+pad.row_steps = 4
+
+[provenance]
+measured = ["engine.pad.row_steps"]
