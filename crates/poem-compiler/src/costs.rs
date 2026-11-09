@@ -171,6 +171,7 @@ impl DeviceProfile {
             },
             exclusive: exclusive.iter().map(|s| (*s).to_string()).collect(),
             grouped: grouped.iter().map(|s| (*s).to_string()).collect(),
+            chunk: crate::chunk::ChunkProfile::default(),
         }
     }
 }
