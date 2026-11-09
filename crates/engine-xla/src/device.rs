@@ -336,7 +336,7 @@ impl Device {
         let exe = program.exe.as_ref().ok_or(Fault::Deviceless)?;
         let at = profile::before(self.api());
         let (outs, done) = exe.execute(self.device()?, args)?;
-        if wait || at.is_some() {
+        if wait || at.is_some_and(profile::last) {
             done.wait()?;
         }
         if let Some(at) = at {
@@ -423,6 +423,16 @@ mod profile {
             }
         }
         state.live.as_ref().map(|_| at)
+    }
+
+    /// Whether run `at` closes the traced window (only it waits, so the
+    /// trace shows the runs as they overlap untraced).
+    pub(super) fn last(at: u64) -> bool {
+        STATE
+            .lock()
+            .ok()
+            .and_then(|g| g.as_ref().and_then(|s| s.live.as_ref().map(|l| l.1 == at + 1)))
+            .unwrap_or(true)
     }
 
     pub(super) fn after(at: u64, text_bytes: usize) {
