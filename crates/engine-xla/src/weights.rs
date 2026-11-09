@@ -148,7 +148,25 @@ impl Weights {
             .enumerate()
             .map(|(at, param)| (param.name.as_str(), at))
             .collect();
-        let pairings = pairings(&landing, &index)?;
+        let mut pairings = pairings(&landing, &index)?;
+        // A block-FP8 release lands its e4m3 codes and f32 block factors as
+        // two plain planes, with no attachment between them: they pair by
+        // name, as the trace declares them.
+        for param in &trace.params {
+            if param.dtype != Dtype::E4m3 {
+                continue;
+            }
+            if let Some(&scales) = index.get(poem_scales(&param.name).as_str())
+                && trace.params[scales].dtype == Dtype::F32
+            {
+                pairings.entry(param.name.as_str()).or_insert(Pairing {
+                    scales,
+                    biases: None,
+                    group: 128,
+                    bits: 8,
+                });
+            }
+        }
         tracing::debug!(
             pairings = pairings.len(),
             attachments = landing.attachments.len(),
