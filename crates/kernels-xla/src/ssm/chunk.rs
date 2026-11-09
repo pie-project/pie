@@ -297,9 +297,7 @@ fn kernel(
         let diag = b.cmpi(ICmp::Eq, ri, cj)?;
         let zero_sq = b.splat_f(&sq, Elem::F32, 0.0)?;
         let one_sq = b.splat_f(&sq, Elem::F32, 1.0)?;
-        let two_sq = b.splat_f(&sq, Elem::F32, 2.0)?;
         let eye = b.select(diag, one_sq, zero_sq)?;
-        let two_eye = b.select(diag, two_sq, zero_sq)?;
 
         // Decay from row `j` to row `i` of the chunk, `exp(g_i − g_j)`.
         let gc = b.broadcast(gcol, &sq)?;
@@ -310,29 +308,20 @@ fn kernel(
         let e = b.exp(gb)?;
         let beta = bb;
 
-        // `(I + β · dm ∘ k kᵀ)⁻¹` by Newton–Schulz in f32: the lower part is
-        // nilpotent, so the series is exact once the doubling passes `c`.
+        // `T = I + β · dm ∘ k kᵀ`, unit lower-triangular, and `T⁻¹ [β v | β e k]`
+        // by block forward substitution, as the XLA form solves it.
         let kb = b.mulf(k, beta)?;
         let kk = b.matmul_g(kb, k, zero_sq, 2, 2, false)?;
         let a = b.mulf(dm, kk)?;
         let a = b.select(strict, a, zero_sq)?;
         let tm = b.addf(a, eye)?;
-        let mut inv = b.subf(two_eye, tm)?;
-        let mut reach = 2;
-        while reach < c {
-            let tx = b.matmul_g(tm, inv, zero_sq, 2, 1, true)?;
-            let corr = b.subf(two_eye, tx)?;
-            inv = b.matmul_g(inv, corr, zero_sq, 2, 1, true)?;
-            reach *= 2;
-        }
-
-        // `u = T⁻¹ (β v)`, `w = T⁻¹ (β e k)`; then the state's part.
-        let zero_cv = b.splat_f(&[hv, c, dv], Elem::F32, 0.0)?;
-        let zero_ck = b.splat_f(&[hv, c, dk], Elem::F32, 0.0)?;
         let vb = b.mulf(v, beta)?;
-        let u = b.matmul_g(inv, vb, zero_cv, 2, 1, false)?;
         let kbe = b.mulf(kb, e)?;
-        let w = b.matmul_g(inv, kbe, zero_ck, 2, 1, false)?;
+        let rhs = b.concat(&[vb, kbe], 2)?;
+        let uw = solve_unit_lower(b, tm, rhs, hv, c)?;
+        let u = b.slice(uw, &[0, 0, 0], &[hv, c, dv])?;
+        let w = b.slice(uw, &[0, 0, dv], &[hv, c, dk])?;
+        let zero_cv = b.splat_f(&[hv, c, dv], Elem::F32, 0.0)?;
         let ws = b.matmul_g(w, s0, zero_cv, 2, 1, false)?;
         let u = b.subf(u, ws)?;
         let qe = b.mulf(q, e)?;
@@ -370,4 +359,58 @@ fn kernel(
         })?;
         Ok(())
     })
+}
+
+/// `X = T⁻¹ R` for a unit lower-triangular `T` `[H, C, C]` and `R` `[H, C, N]`
+/// (f32): forward substitution over 16-row blocks, each block's rows one
+/// at a time on the VPU and the blocks before it taken off through the MXU
+/// at full precision (the XLA form's `unit_lower_inverse`, applied).
+fn solve_unit_lower(
+    b: &mut crate::mosaic::Body,
+    t: crate::mosaic::V,
+    r: crate::mosaic::V,
+    h: i64,
+    c: i64,
+) -> Built<crate::mosaic::V> {
+    let n = match b.ty(r) {
+        MTy::Vector(d, _) => d[2],
+        _ => unreachable!("a vector"),
+    };
+    let bs = c.min(16);
+    let mut blocks: Vec<crate::mosaic::V> = Vec::with_capacity((c / bs) as usize);
+    for i in 0..c / bs {
+        let lo = i * bs;
+        // This block's rows of `R`, less what the solved blocks above
+        // contribute through `T`'s off-diagonal part.
+        let mut target = b.slice(r, &[0, lo, 0], &[h, bs, n])?;
+        if i > 0 {
+            let above = b.concat(&blocks, 1)?;
+            let coupling = b.slice(t, &[0, lo, 0], &[h, bs, lo])?;
+            let zero = b.splat_f(&[h, bs, n], Elem::F32, 0.0)?;
+            let carried = b.matmul_g(coupling, above, zero, 2, 1, true)?;
+            target = b.subf(target, carried)?;
+        }
+        let lt = b.slice(t, &[0, lo, lo], &[h, bs, bs])?;
+        let mut rows: Vec<crate::mosaic::V> = Vec::with_capacity(bs as usize);
+        for q in 0..bs {
+            let mut row = b.slice(target, &[0, q, 0], &[h, 1, n])?;
+            if q > 0 {
+                let solved = b.concat(&rows, 1)?;
+                let coef = b.slice(lt, &[0, q, 0], &[h, 1, q])?;
+                let coef = b.shape_cast(coef, &[h, q, 1])?;
+                let coef = b.broadcast(coef, &[h, q, n])?;
+                let prod = b.mulf(coef, solved)?;
+                let sum = b.reduce_sum(prod, 1)?;
+                let sum = b.shape_cast(sum, &[h, 1, n])?;
+                row = b.subf(row, sum)?;
+            }
+            rows.push(row);
+        }
+        blocks.push(b.concat(&rows, 1)?);
+    }
+    if blocks.len() == 1 {
+        Ok(blocks[0])
+    } else {
+        b.concat(&blocks, 1)
+    }
 }

@@ -375,8 +375,29 @@ impl Body {
         ))
     }
 
-    /// `xs` joined along `axis` (`tpu.concatenate`).
+    /// The sum of a 3-d f32 vector over `axis` 1 or 2, that axis dropped
+    /// (`vector.multi_reduction`).
+    pub fn reduce_sum(&mut self, v: V, axis: usize) -> Built<V> {
+        let (d, e) = self.vec_of(v)?;
+        if d.len() != 3 || e != Elem::F32 || !(1..=2).contains(&axis) {
+            return bad(format!("a sum over axis {axis} of {}", self.ty(v)));
+        }
+        let mut out = d.clone();
+        out.remove(axis);
+        let init = self.splat_f(&out, e, 0.0)?;
+        Ok(self.op1(
+            "vector.multi_reduction",
+            &[v, init],
+            &format!("kind = #vector.kind<add>, reduction_dims = array<i64: {axis}>"),
+            MTy::Vector(out, e),
+        ))
+    }
+
+    /// `xs` joined along `axis` (`tpu.concatenate`; one piece is itself).
     pub fn concat(&mut self, xs: &[V], axis: usize) -> Built<V> {
+        if xs.len() == 1 {
+            return Ok(xs[0]);
+        }
         let (mut d, e) = self.vec_of(xs[0])?;
         let mut n = 0;
         for &x in xs {
