@@ -203,7 +203,7 @@ fn main() -> Result<(), String> {
     println!(
         "{}",
         serde_json::json!({
-            "program": args[1], "w4": m.design().weights_u4(), "cap": cap, "load_s": load_s,
+            "program": args[1], "cap": cap, "load_s": load_s,
             "prompt_len": prompt.len(), "new": new, "runs": runs,
             "teacher": {"tokens": want.len(), "mismatches": mismatches},
             "profile": profile,

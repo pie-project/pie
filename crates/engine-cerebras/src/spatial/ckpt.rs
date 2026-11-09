@@ -21,8 +21,7 @@ enum Dtype {
     F16,
     F32,
     /// Bytes as stored (gpt-oss's MXFP4 codes and E8M0 scales): read raw
-    /// by [`Ckpt::hf_u8`]; widened, each byte's value. Also packed u4g64
-    /// codes (`Ckpt::u4g64`).
+    /// by [`Ckpt::hf_u8`]; widened, each byte's value.
     U8,
 }
 
@@ -49,17 +48,6 @@ impl Entry {
     fn elems(&self) -> usize {
         self.shape.iter().product()
     }
-}
-
-/// A matrix landed in u4g64 ([`Ckpt::u4g64`]): `rows` x `cols`, two codes a
-/// byte (low nibble first), a bf16 scale and bias a row and 64 columns.
-#[derive(Debug, Clone)]
-pub struct U4Landed {
-    pub rows: usize,
-    pub cols: usize,
-    pub codes: Vec<u8>,
-    pub scales: Vec<u16>,
-    pub biases: Vec<u16>,
 }
 
 /// A tensor widened to `f32`, row-major.
@@ -483,64 +471,6 @@ impl Ckpt {
             _ => widen(dtype, &raw).iter().map(|&x| bf16_bits(x)).collect(),
         };
         Ok((shape, bits))
-    }
-
-    /// `name` landed in u4g64 (MLX's affine 4-bit codes, groups of 64
-    /// along a row), as Pie's u4g64 deployments keep it: beside no
-    /// `<base>.weight`, `<base>.codes` (U8, `[rows, cols / 2]`, two codes a
-    /// byte, the low nibble first), `<base>.scales` and `<base>.biases`
-    /// (BF16, `[rows, cols / 64]`); `<base>` its transformers name less
-    /// `.weight`. `None`: not landed so.
-    pub fn u4g64(&self, name: &str) -> R<Option<U4Landed>> {
-        let Inner::Files { paths, entries } = &self.inner else {
-            return Ok(None);
-        };
-        let Some(base) =
-            transformers_name(name).and_then(|n| n.strip_suffix(".weight").map(String::from))
-        else {
-            return Ok(None);
-        };
-        let read = |suffix: &str, dtype: Dtype| -> R<Option<(Vec<usize>, Vec<u8>)>> {
-            let Some(e) = entries.get(&format!("{base}.{suffix}")) else {
-                return Ok(None);
-            };
-            if e.dtype != dtype || e.shape.len() != 2 {
-                return Err(format!(
-                    "{base}.{suffix}: {:?} {:?} (want 2-d {dtype:?})",
-                    e.dtype, e.shape
-                ));
-            }
-            let raw = read_pieces(&paths[e.file], e.offset, e.elems() * e.dtype.bytes())?;
-            Ok(Some((e.shape.clone(), raw)))
-        };
-        let Some((cs, codes)) = read("codes", Dtype::U8)? else {
-            return Ok(None);
-        };
-        let (Some((ss, s)), Some((bs, b))) =
-            (read("scales", Dtype::Bf16)?, read("biases", Dtype::Bf16)?)
-        else {
-            return Err(format!("{base}.codes without its scales and biases"));
-        };
-        let (rows, cols) = (cs[0], 2 * cs[1]);
-        if ss != [rows, cols / 64] || bs != ss {
-            return Err(format!(
-                "{base}: codes {cs:?}, scales {ss:?}, biases {bs:?}"
-            ));
-        }
-        let words = |raw: Vec<u8>| -> Vec<u16> {
-            raw.as_chunks::<2>()
-                .0
-                .iter()
-                .map(|c| u16::from_le_bytes([c[0], c[1]]))
-                .collect()
-        };
-        Ok(Some(U4Landed {
-            rows,
-            cols,
-            codes,
-            scales: words(s),
-            biases: words(b),
-        }))
     }
 
     pub fn get(&self, name: &str) -> R<Tensor> {

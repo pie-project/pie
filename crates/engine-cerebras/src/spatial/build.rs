@@ -777,34 +777,17 @@ struct Placement {
     hh: usize,
     vr: usize,
     vmc: usize,
-    /// The head and embedding strip hold u4g64 (`W4H` 1): a u4 plan whose
-    /// bf16 head or strip PE does not fit.
-    head4: bool,
     /// The search's cost estimate (lower is faster; see `unit_cost`).
     cost: usize,
 }
 
 /// A unit layer's estimated cycles: a fixed part (norms, attention,
-/// collectives), the matvecs by the PE's tile elements (u4 decode costs
-/// about 2 cycles an element on the simulator, bf16 about 0.6) and the
-/// collectives' hops. Only for ranking placements.
-/// On u4 units, each tile's groups add their epilogue (a few short f32
-/// ops of N, about 120 cycles of overhead and 2 a column) and each
-/// segment its scalar setup: group-aligned hidden tiles (`64 % Hc == 0`,
-/// one group) cost less than a tile straddling two.
+/// collectives), the matvecs by the PE's tile elements (bf16 about 0.6
+/// cycles an element on the simulator) and the collectives' hops. Only for
+/// ranking placements.
 fn unit_cost(g: &super::plan::Grid) -> usize {
     let elems = g.hc * ((2 * g.qh + 2) * g.dc + 3 * g.ic);
-    let per = if g.w4 { 20 } else { 6 };
-    let groups = if g.w4 {
-        super::u4::tiles(g.hc, g.dc, g.gs, g.qh, g.ic, g.lanes == 1)
-            .iter()
-            .filter(|t| t.r > 0)
-            .map(|t| t.g * (120 + 2 * t.n) + 60 * t.segs())
-            .sum()
-    } else {
-        0
-    };
-    8000 + elems * per / 10 + 20 * (g.px + g.py) + groups
+    8000 + elems * 6 / 10 + 20 * (g.px + g.py)
 }
 
 /// A unit PE's image must end this far below the top of its memory (the
@@ -923,19 +906,14 @@ fn place_at(
     };
     // The head's PEs (no VM block): their rows at CAP 1 (serve8b_region then
     // picks the CAP the final root holds, `plan::final_root_bytes`) and the
-    // embedding strip's; bf16, or u4g64 on a u4 plan when bf16 does not fit.
-    let head_fits = |u4: bool| {
-        super::plan::final_root_bytes(vr, g.hc, g.lanes, g.lanes.min(4), ring.then_some(12), 1, u4)
+    // embedding strip's.
+    let head_fits =
+        super::plan::final_root_bytes(vr, g.hc, g.lanes, g.lanes.min(4), ring.then_some(12), 1)
             <= most
-            && super::plan::embed_bytes(vr, g.hc, g.lanes, u4) <= most
-    };
-    let head4 = if !check_bytes || vm || head_fits(false) {
-        false
-    } else if g.w4 && head_fits(true) {
-        true
-    } else {
+            && super::plan::embed_bytes(vr, g.hc, g.lanes) <= most;
+    if check_bytes && !vm && !head_fits {
         return None;
-    };
+    }
     let (g, region) = if check_bytes {
         let nb = (1..=g.blocks).rev().find(|&nb| fits(nb))?;
         (
@@ -961,102 +939,19 @@ fn place_at(
         hh,
         vr,
         vmc,
-        head4,
         cost,
     })
 }
 
 /// serve8b_region's placement for `plan`: option A (`RC` 2, `RNL` 3, `RR`
 /// 4, `RPY` 240, regions twice the grid's width; the shape built and run
-/// for Qwen3-8B) when it takes the plan's bf16 grid; else (and for u4g64
-/// units, whose bytes a layer differ) the cheapest
+/// for Qwen3-8B) when it takes the plan's grid; else the cheapest
 /// placement (`unit_cost`) that fits, over grids of the plan's columns and
 /// at least its rows (16-row steps), regions one or two grids wide of
 /// 16-row steps, 1 to 4 layers a region, up to 4 x 8 regions.
-/// Why no placement fits (feasibility studies): over the search's shapes
-/// that fit the wafer's geometry, the one whose worse unit kind (grid or
-/// region PE) overshoots least, at one KV block: its shape, the grid and
-/// region bytes and its head's final root at CAP 1, against the PE's room.
-#[cfg(test)]
-pub(crate) fn placement_report(plan: &SpatialPlan, ring: bool) -> String {
-    let g = plan.grid;
-    let wafer = super::plan::WaferDims::CS3;
-    let most = wafer.pe_bytes - STACK_MARGIN;
-    let mut best: Option<(isize, String)> = None;
-    for py in (g.py..=wafer.height / 2).step_by(16) {
-        let grid = super::plan::Grid {
-            py,
-            hc: g.hidden.div_ceil(py),
-            blocks: 1,
-            ..g
-        };
-        for wide in [1, 2] {
-            for rpy in (64..=wafer.height - py).step_by(16) {
-                for rnl in 1..=4 {
-                    for rc in 1..=4 {
-                        for rr in 1..=8 {
-                            let at = (wide * g.px, rpy, rnl, rc, rr);
-                            let Some(p) = place_at(plan, grid, at, false, ring, false, false)
-                            else {
-                                continue;
-                            };
-                            let r = super::plan::Grid {
-                                px: p.rpx,
-                                py: p.rpy,
-                                hc: g.hidden.div_ceil(p.rpy),
-                                dc: g.dc * g.px / p.rpx,
-                                gs: g.gs * p.rpx / g.px,
-                                ic: g.ic * g.px / p.rpx,
-                                ..p.grid
-                            };
-                            let gb = p.grid.bytes(ring);
-                            let rb = r.region_bytes(rnl, ring);
-                            let hb = super::plan::final_root_bytes(
-                                p.vr,
-                                p.grid.hc,
-                                g.lanes,
-                                g.lanes.min(4),
-                                ring.then_some(12),
-                                1,
-                                g.w4,
-                            );
-                            let eb = super::plan::embed_bytes(p.vr, p.grid.hc, g.lanes, g.w4);
-                            // The units only: the head is reported, not ranked.
-                            let over = [gb, rb]
-                                .iter()
-                                .map(|&b| b as isize - most as isize)
-                                .max()
-                                .unwrap_or(0);
-                            if best.as_ref().is_none_or(|(o, _)| over < *o) {
-                                best = Some((
-                                    over,
-                                    format!(
-                                        "grid {}x{} Hc {} Ic {} {gb} B; regions {}x{} RNL {rnl} {rc}x{rr} {rb} B; NCOL {}; head Vr {} {hb} B, strip {eb} B{}; room {most} B (worst over {over})",
-                                        p.grid.px,
-                                        p.grid.py,
-                                        p.grid.hc,
-                                        p.grid.ic,
-                                        p.rpx,
-                                        p.rpy,
-                                        p.ncol,
-                                        p.vr,
-                                        if g.w4 { " (u4)" } else { "" }
-                                    ),
-                                ));
-                            }
-                        }
-                    }
-                }
-            }
-        }
-    }
-    best.map_or_else(|| "no shape fits the wafer's geometry".into(), |(_, s)| s)
-}
-
 fn placement(plan: &SpatialPlan, vm: bool, ring: bool) -> R<Placement> {
     let g = plan.grid;
-    if !g.w4
-        && g.dc.is_multiple_of(4)
+    if g.dc.is_multiple_of(4)
         && g.ic.is_multiple_of(2)
         && let Some(p) = place_at(plan, g, (2 * g.px, 240, 3, 2, 4), vm, ring, false, true)
     {
@@ -1167,13 +1062,10 @@ fn serve8b_region(plan: &SpatialPlan, cfg: &ServeConfig, design: Design) -> R<Dr
         return Err("serve8b_region's HV (`hv`) needs `lse` (and `speed`)".into());
     }
     // Lever D (`lever_d`): its fixed all-region layout; else the placement
-    // (option A for bf16 plans, the search for u4).
-    let (gv, rpx, rpy, rnl, rc, rr, band, ncol, hh, vr, vmc, head4, rgy, yd) = if cfg.lever_d {
+    // (option A, or the search when option A does not fit).
+    let (gv, rpx, rpy, rnl, rc, rr, band, ncol, hh, vr, vmc, rgy, yd) = if cfg.lever_d {
         let g = &plan.grid;
         let wafer = super::plan::WaferDims::CS3;
-        if g.w4 {
-            return Err("serve8b_region's lever D (`lever_d`) takes bf16 units only".into());
-        }
         // Lever D: layer 0's grid, RC x RR regions of RNL layers from row 0 at
         // RPY 208 (RGY 16 divides it; RR 5 is the most the wafer's rows hold),
         // the remaining NCOL layers' grids down the column.
@@ -1289,9 +1181,7 @@ fn serve8b_region(plan: &SpatialPlan, cfg: &ServeConfig, design: Design) -> R<Dr
                 plan.spec.name, g.py
             ));
         }
-        (
-            *g, rpx, rpy, rnl, rc, rr, band, ncol, hh, vr, vmc, false, rgy, yd,
-        )
+        (*g, rpx, rpy, rnl, rc, rr, band, ncol, hh, vr, vmc, rgy, yd)
     } else {
         let pl = placement(plan, cfg.vm.is_some(), pipe.is_some())?;
         let Placement {
@@ -1305,12 +1195,11 @@ fn serve8b_region(plan: &SpatialPlan, cfg: &ServeConfig, design: Design) -> R<Dr
             hh,
             vr,
             vmc,
-            head4,
             ..
         } = pl;
         let rgy = RGY;
         (
-            pl.grid, rpx, rpy, rnl, rc, rr, band, ncol, hh, vr, vmc, head4, rgy, 0,
+            pl.grid, rpx, rpy, rnl, rc, rr, band, ncol, hh, vr, vmc, rgy, 0,
         )
     };
     let g = &gv;
@@ -1359,9 +1248,8 @@ fn serve8b_region(plan: &SpatialPlan, cfg: &ServeConfig, design: Design) -> R<Dr
         let hlb = g.lanes.min(4);
         let mmax = pipe.map(|(m, _)| m);
         let most = super::plan::WaferDims::CS3.pe_bytes - STACK_MARGIN;
-        let fits = |c: usize| {
-            super::plan::final_root_bytes(vr, g.hc, g.lanes, hlb, mmax, c, head4) <= most
-        };
+        let fits =
+            |c: usize| super::plan::final_root_bytes(vr, g.hc, g.lanes, hlb, mmax, c) <= most;
         let mut c = cap;
         while c > 1 && !fits(c) {
             c /= 2;
@@ -1659,15 +1547,8 @@ fn serve8b_region(plan: &SpatialPlan, cfg: &ServeConfig, design: Design) -> R<Dr
         Typed("CAP"),
         Knob("iters", 1),
         Typed("B"),
-        // u4g64 units take x as one bf16 part, as MLX's bf16 activations.
-        Knob("NP", if pipe.is_some() || g.w4 { 1 } else { 3 }),
+        Knob("NP", if pipe.is_some() { 1 } else { 3 }),
     ]);
-    if g.w4 {
-        st.push(Knob("W4", 1));
-    }
-    if head4 {
-        st.push(Knob("W4H", 1));
-    }
     Ok(Draft { spec, stated: st })
 }
 
@@ -2064,7 +1945,7 @@ pub fn program(plan: &SpatialPlan, cfg: &ServeConfig) -> R<ProgramSpec> {
         let b = cfg.vm_b.map(|(img, _)| limits(&img));
         draft.spec.sampler = draft.spec.head_sampler(limits(&vm), b, false);
     }
-    let files = d.files_w4(plan.grid.w4)?;
+    let files = d.files()?;
     let layout = &files
         .iter()
         .find(|f| f.0 == "layout.csl")

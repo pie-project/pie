@@ -219,7 +219,6 @@ impl G4Plan {
                         w16: true,
                         kv16: false,
                         host_copy: goals.host_copy,
-                        w4: false,
                     },
                     reading: spec.readings[l],
                     rot,

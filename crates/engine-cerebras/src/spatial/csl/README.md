@@ -53,8 +53,6 @@ SDK's `cslc` at load time, cached by a hash of sources and parameters.
     (`codegen::gptoss_moe`).
   - `qwen35w_gdn.csl`, `qwen35w_attn.csl`: Qwen3.5's two units with bf16
     weights (`W16` 1): serve_q35w, the planner's build past 0.8B.
-  - `u4mv.csl`: the u4g64 matvec spliced into the paged8b units and the
-    head and strip of a `W4` (u4g64 checkpoint) build.
   - `qwen2d_region.csl`: several bf16 layers on one region (x stays in
     place between them): serve8b_region's regions.
   - `softmax_s123.json`, `softmax_s13_06b.json`: the fast-softmax levers

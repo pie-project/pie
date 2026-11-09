@@ -721,20 +721,6 @@ impl ProgramSpec {
         self.knobs.get(k).map(String::as_str)
     }
 
-    /// The units hold u4g64 weights (`W4 1`: codegen's W4 variant of
-    /// serve8b_region, placed by `spatial::u4`).
-    #[must_use]
-    pub fn weights_u4(&self) -> bool {
-        self.knobs.get("W4").is_some_and(|v| v.trim() == "1")
-    }
-
-    /// The head's lm_head tiles and the embedding strip hold u4g64 too
-    /// (`W4H 1`, on a `W4 1` build: `spatial::u4::place_head`/`place_embed`).
-    #[must_use]
-    pub fn head_u4(&self) -> bool {
-        self.weights_u4() && self.knobs.get("W4H").is_some_and(|v| v.trim() == "1")
-    }
-
     /// The typed parameter `k`, from the component that holds it (`None`:
     /// a knob, or a parameter this design's components do not hold).
     #[must_use]
@@ -973,17 +959,14 @@ impl ProgramSpec {
     }
 
     /// The program's build directory: its design's files for the model's
-    /// variant and, at `W4 1`, its u4g64 units ([`Design::files_for`]);
-    /// serve_q35w's for a W16 serve_q35 (serve_q35 itself stays #1412's f32
-    /// program); serve_gptoss's levered units with its `MOE` knob
-    /// ([`super::codegen::serve_gptoss_with`]).
+    /// variant ([`Design::files_with`]); serve_q35w's for a W16 serve_q35
+    /// (serve_q35 itself stays #1412's f32 program); serve_gptoss's levered
+    /// units with its `MOE` knob ([`super::codegen::serve_gptoss_with`]).
     pub fn files(&self) -> Result<Vec<super::codegen::File>, String> {
-        let (variant, u4) = (self.model.variant(), self.weights_u4());
+        let variant = self.model.variant();
         if self.design == Design::ServeQ35 && self.w16() {
-            if variant != super::codegen::Variant::default() || u4 {
-                return Err(format!(
-                    "serve_q35w: no model variant ({variant:?}) or u4g64 (W4) units"
-                ));
+            if variant != super::codegen::Variant::default() {
+                return Err(format!("serve_q35w: no model variant ({variant:?})"));
             }
             return super::codegen::serve_q35w();
         }
@@ -995,7 +978,7 @@ impl ProgramSpec {
                 .map_err(|e| format!("MOE: {e}"))?;
             return super::codegen::serve_gptoss_with(variant, moe);
         }
-        self.design.files_for(variant, u4)
+        self.design.files_with(variant)
     }
 
     /// serve_q35's layer mix (`None`: every layer attends).
@@ -1667,6 +1650,11 @@ fn serve8b(get: &Get) -> R<ProgramSpec> {
 /// embedding strip as serve8b's.
 fn serve8b_region(design: Design, get: &Get) -> R<ProgramSpec> {
     headmode(get, "serve8b_region")?;
+    if get.opt("W4").unwrap_or(0) != 0 || get.opt("W4H").unwrap_or(0) != 0 {
+        return Err(
+            "serve8b_region holds bf16 weights; u4g64 (W4) programs are not supported".into(),
+        );
+    }
     if get.req("W16")? != 1 || get.req("KV16")? != 1 || get.opt("KVCP").unwrap_or(0) != 0 {
         return Err("serve8b_region keeps weights and KV in bf16 and copies pages by the host (W16 1, KV16 1, KVCP 0)".into());
     }
@@ -1946,6 +1934,23 @@ mod tests {
         assert_eq!(get(&out, "VMCONC"), None);
         assert_eq!(get(&out, "PASSES"), get(&params, "PASSES"));
         assert_eq!(out.len(), params.len());
+    }
+
+    /// A u4g64 (`W4`) program is refused by name: serve8b_region holds bf16
+    /// weights only.
+    #[test]
+    fn u4g64_programs_are_refused() {
+        let (_, design, params) = crate::spatial::golden::scenario_params()
+            .into_iter()
+            .find(|s| s.0 == "serve8b_region")
+            .expect("the scenario");
+        assert!(ProgramSpec::from_params(design, &params).is_ok());
+        for k in ["W4", "W4H"] {
+            let mut p = params.clone();
+            p.push((k.to_string(), "1".to_string()));
+            let err = ProgramSpec::from_params(design, &p).expect_err(k);
+            assert!(err.contains("u4g64"), "{k}: {err}");
+        }
     }
 
     /// The spec's VM ABI is the generated sources': `vmlane`'s words a

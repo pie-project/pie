@@ -168,7 +168,6 @@ impl AttnUnit {
                 w16: true,
                 kv16: true,
                 host_copy: true,
-                w4: false,
             },
         }
     }

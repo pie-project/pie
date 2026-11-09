@@ -597,11 +597,10 @@ impl ModelSpec {
             }
         }
         let weights = weights.ok_or_else(|| Refused(format!("{name}: no projection weights")))?;
-        // u4g64: the serve8b_region units' W4 variant (`spatial::u4`).
-        if !matches!(weights, Dtype::Bf16 | Dtype::F32 | Dtype::U4g64) {
+        if !matches!(weights, Dtype::Bf16 | Dtype::F32) {
             return refuse(format!(
-                "{name}: {weights:?} projections (the kernels hold f32, bf16 or u4g64 weights; \
-                 plan the model's bf16 or u4g64 deployment)"
+                "{name}: {weights:?} projections (the kernels hold f32 or bf16 weights; plan the \
+                 model's bf16 deployment)"
             ));
         }
         let kv = match trace.caches.first() {

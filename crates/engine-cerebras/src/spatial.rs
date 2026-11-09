@@ -73,7 +73,6 @@ pub mod serve_gptoss;
 pub mod serve_q35;
 pub mod shapes;
 pub mod split;
-pub mod u4;
 pub mod wafer;
 
 pub use config::SpatialBoot;
