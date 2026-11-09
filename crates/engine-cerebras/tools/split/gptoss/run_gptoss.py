@@ -163,8 +163,9 @@ for rep in range(a.reps):
         put("nforce", *ROOT, 1, 1, np.array([len(fl)], np.uint32))
         tw = time.time()
         runner.launch("compute", np.uint32(S_), np.uint32(t), nonblock=False)
-        walls += [(time.time() - tw) / S_] * S_
+        # (a launch returns before the PEs finish it: the ring's read waits for the root's last step)
         runner.memcpy_d2h(ring, sym("ring"), *ROOT, 1, 1, CAP, **k32)
+        walls += [(time.time() - tw) / S_] * S_
         if a.hostck:
             rr = get("res", 0, yc, HVC, 1, 4).reshape(HVC, 4)
             best = int(rr[np.argmax(rr[:, 0]), 1])
@@ -201,6 +202,6 @@ if dumps:
     json.dump(dumps, open(a.report.replace(".json", "_dump.json"), "w"))
 rep = {"diverged": diverged[:4], "force": a.force, "greedy": a.greedy, "wloop": WLS, "ntok": ntok, "reps": reps, "ring_bad": ring_bad[:20],
        "load_s": round(t_load, 1), "place_s": round(t_place, 1), "times": times,
-       "wall_ms_median": reps[-1]["wall_ms_median"], "tok_s_wall": round(1e3 / reps[-1]["wall_ms_median"], 1)}
+       "wall_ms_median": reps[-1]["wall_ms_median"], "tok_s_wall": round(1e3 / max(reps[-1]["wall_ms_median"], 1e-6), 1)}
 json.dump(rep, open(a.report, "w"), indent=1)
 print("SPLIT " + json.dumps({k: v for k, v in rep.items() if k != "reps"}), flush=True)
