@@ -121,13 +121,13 @@ pub fn matmul_select(
         if !crate::linear::gemm_sm100::supported()
             && tiled
             && bank.dtype == Dtype::Bf16
-            && !experts.tabled()
-            && select_bf16_held(ctx, OP, x, bank.ptr, bank.rows, routes, y, None)?
+            && !experts.streams()
+            && select_bf16_held(ctx, OP, x, bank.ptr, bank.rows, routes, y, None, experts)?
         {
             return Ok(());
         }
         if let Some(count) = grouped_worth(ctx, x, bank, y, &fan, experts) {
-            return select_grouped(ctx, OP, x, bank, routes, y, count);
+            return select_grouped(ctx, OP, x, bank, routes, y, count, experts);
         }
         // Bf16 experts under a captured graph have no grouped path (tcgen05 is
         // Blackwell's, cuBLAS is not graph-capturable); the per-route GEMV
@@ -137,7 +137,7 @@ pub fn matmul_select(
             && fan.route_count > fan.top_k.unsigned_abs()
             && x.dtype == Dtype::Bf16
             && bank.dtype == Dtype::Bf16
-            && !experts.tabled()
+            && !experts.streams()
             && x.width.is_multiple_of(64)
             && y.width.is_multiple_of(8)
             && bank.rows >= 1
@@ -145,9 +145,9 @@ pub fn matmul_select(
         {
             // On Hopper, wgmma over the same staging (sm_90a).
             if hopper_wgmma() && y.width.is_multiple_of(128) {
-                return select_bf16_wgmma(ctx, OP, x, bank, routes, y, &fan, bank.rows);
+                return select_bf16_wgmma(ctx, OP, x, bank, routes, y, &fan, bank.rows, experts);
             }
-            return select_bf16_mma(ctx, OP, x, bank, routes, y, &fan, bank.rows);
+            return select_bf16_mma(ctx, OP, x, bank, routes, y, &fan, bank.rows, experts);
         }
     }
     select_gemv(ctx, OP, x, bank, routes, y, experts)
@@ -263,7 +263,7 @@ pub(super) fn grouped_worth(
     if !ctx.tuning().moe_grouped {
         return None;
     }
-    if experts.tabled() || !matches!(ctx.stage(), ArgValue::Ptr(0)) {
+    if experts.streams() || !matches!(ctx.stage(), ArgValue::Ptr(0)) {
         return None;
     }
     if !matches!(x.dtype, Dtype::Bf16 | Dtype::F16) || bank.dtype != x.dtype {
@@ -290,6 +290,7 @@ pub(super) fn grouped_worth(
 }
 
 #[cfg(feature = "cuda")]
+#[allow(clippy::too_many_arguments)]
 pub(super) fn select_grouped(
     ctx: &Ctx,
     op: &'static str,
@@ -298,6 +299,7 @@ pub(super) fn select_grouped(
     routes: Tensor,
     y: &mut Tensor,
     experts: u32,
+    table: ExpertTable,
 ) -> Result<(), Error> {
     use cudarc::cublas::sys::{
         cublasComputeType_t, cublasContext, cublasGemmAlgo_t, cublasGemmBatchedEx, cublasHandle_t,
@@ -424,6 +426,7 @@ pub(super) fn select_grouped(
             block_size.arg(),
             k.arg(),
             n.arg(),
+            ArgValue::Ptr(table.at()),
         ],
     )?;
 

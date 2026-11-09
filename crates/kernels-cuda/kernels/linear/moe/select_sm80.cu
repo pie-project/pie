@@ -193,7 +193,8 @@ __global__ void __launch_bounds__(128) moe_select_bf16_mma(
     const bf16* __restrict__ weight,
     const bf16* __restrict__ bias,
     bf16* __restrict__ out,
-    int act_div, int n, int k, int num_experts)
+    int act_div, int n, int k, int num_experts,
+    const u64* __restrict__ expert_table)
 {
     constexpr int kTiles = 2;
     constexpr int kRowsWarp = kTiles * 16;
@@ -224,7 +225,8 @@ __global__ void __launch_bounds__(128) moe_select_bf16_mma(
     const int cta_row0 = static_cast<int>(blockIdx.y) * kRowsCta;
     const int row_base = cta_row0 + warp * kRowsWarp;
 
-    const bf16* w_e = weight + static_cast<long long>(expert) * n * k;
+    // The expert table (one plane an expert), resolved once a tile.
+    const bf16* w_e = expert_plane(weight, static_cast<long long>(n) * k, expert_table, 1, 0, expert);
     const bf16* b_e = bias != nullptr ? bias + static_cast<long long>(expert) * n : nullptr;
 
     // `kStages` stages, each 128 weight rows then the slice's route rows.
@@ -374,7 +376,8 @@ __global__ void __launch_bounds__(128 * kKSplit) moe_select_fp8_mma(
     int num_experts,
     int inter,
     float limit,
-    float galpha)
+    float galpha,
+    const u64* __restrict__ expert_table)
 {
     static_assert(kGran == 32 || kGran == 128, "a block is 32 or 128 columns of K");
     static_assert(kGlu == 0 || kTiles == 2, "a GLU warp is a gate tile and its up tile");
@@ -403,7 +406,9 @@ __global__ void __launch_bounds__(128 * kKSplit) moe_select_fp8_mma(
 
     const int chunks = k >> 6;
     const int kblocks = k / kGran;
-    const u8* w_e = codes + static_cast<long long>(expert) * n * k;
+    // The expert table ([codes, atoms] an expert), resolved once a tile.
+    const u8* w_e = expert_plane(codes, static_cast<long long>(n) * k, expert_table, 2, 0, expert);
+    const ExpertAtoms ea = expert_atoms(atoms, expert_table, expert, n);
 
     const u8* wrow[kTiles][2];
     int arow[kTiles][2];
@@ -413,7 +418,7 @@ __global__ void __launch_bounds__(128 * kKSplit) moe_select_fp8_mma(
         for (int h = 0; h < 2; ++h) {
             const int r = min(tile_row(t) + 8 * h + g, n - 1);
             wrow[t][h] = w_e + static_cast<long long>(r) * k + c * 16;
-            arow[t][h] = expert * n + r;
+            arow[t][h] = ea.row0 + r;
         }
     const bf16* xrow[kNb];
 #pragma unroll
@@ -432,7 +437,7 @@ __global__ void __launch_bounds__(128 * kKSplit) moe_select_fp8_mma(
 #pragma unroll
             for (int h = 0; h < 2; ++h) {
                 cc.w[t][h] = ld_stream(wrow[t][h] + ch * 64);
-                cc.f[t][h] = w8mma::factor2(atoms[w8mma::atom_offset(arow[t][h], kb, kblocks)]);
+                cc.f[t][h] = w8mma::factor2(ea.at[w8mma::atom_offset(arow[t][h], kb, kblocks)]);
             }
 #pragma unroll
         for (int b = 0; b < kNb; ++b)
@@ -495,7 +500,8 @@ __global__ void __launch_bounds__(kBM * kWN) moe_select_bf16_gemm(
     int num_experts,
     int inter,
     float limit,
-    float galpha)
+    float galpha,
+    const u64* __restrict__ expert_table)
 {
     constexpr int kBN = 128;
     constexpr int kABytes = kBM * 128;
@@ -538,7 +544,8 @@ __global__ void __launch_bounds__(kBM * kWN) moe_select_bf16_gemm(
         }
     };
 
-    const bf16* w_e = codes + static_cast<long long>(expert) * n * k;
+    // The expert table (one plane an expert), resolved once a tile.
+    const bf16* w_e = expert_plane(codes, static_cast<long long>(n) * k, expert_table, 1, 0, expert);
     const int steps = k >> 6;
 
     extern __shared__ __align__(16) unsigned char bf16_gemm_smem[];
@@ -723,7 +730,8 @@ __global__ void __launch_bounds__(256, 1) moe_select_bf16_gemm_wide(
     int num_experts,
     int inter,
     float limit,
-    float galpha)
+    float galpha,
+    const u64* __restrict__ expert_table)
 {
     constexpr int kStages = 2;
     constexpr int kBM = 128;
@@ -766,7 +774,8 @@ __global__ void __launch_bounds__(256, 1) moe_select_bf16_gemm_wide(
         }
     };
 
-    const bf16* w_e = codes + static_cast<long long>(expert) * n * k;
+    // The expert table (one plane an expert), resolved once a tile.
+    const bf16* w_e = expert_plane(codes, static_cast<long long>(n) * k, expert_table, 1, 0, expert);
     const int steps = k >> 6;
 
     extern __shared__ __align__(16) unsigned char bf16_gemm_smem[];
@@ -910,7 +919,8 @@ __global__ void __launch_bounds__(64 * kWN) moe_select_fp8_gemm(
     int num_experts,
     int inter,
     float limit,
-    float galpha)
+    float galpha,
+    const u64* __restrict__ expert_table)
 {
     static_assert(kGran == 32 || kGran == 128, "a block is 32 or 128 columns of K");
     constexpr int kBM = 64;
@@ -949,7 +959,9 @@ __global__ void __launch_bounds__(64 * kWN) moe_select_fp8_gemm(
         }
     };
 
-    const u8* w_e = codes + static_cast<long long>(expert) * n * k;
+    // The expert table ([codes, atoms] an expert), resolved once a tile.
+    const u8* w_e = expert_plane(codes, static_cast<long long>(n) * k, expert_table, 2, 0, expert);
+    const ExpertAtoms ea = expert_atoms(atoms, expert_table, expert, n);
     const int steps = k >> 6;
     const int kblocks = k / kGran;
 
@@ -984,7 +996,7 @@ __global__ void __launch_bounds__(64 * kWN) moe_select_fp8_gemm(
         const int c = i & 3;
         b_src[j] = w_e + static_cast<long long>(bank_row(r)) * k + c * 16;
         b_dst[j] = kABytes + r * 64 + c * 16;
-        b_atoms_row[j] = expert * n + bank_row(r);
+        b_atoms_row[j] = ea.row0 + bank_row(r);
         b_wide[j] = (r * 64 + (((2 * c) ^ (r & 7)) * 8)) * 2;
     }
     int issued = 0;
@@ -1045,7 +1057,7 @@ __global__ void __launch_bounds__(64 * kWN) moe_select_fp8_gemm(
         for (int j = 0; j < kBCopies; ++j) {
             const int c = (tid + kThreads * j) & 3;
             const int kb = kGran == 128 ? (step >> 1) : ((step * 64 + 16 * c) >> 5);
-            const unsigned f = w8mma::factor2(__ldg(atoms + w8mma::atom_offset(b_atoms_row[j], kb, kblocks)));
+            const unsigned f = w8mma::factor2(__ldg(ea.at + w8mma::atom_offset(b_atoms_row[j], kb, kblocks)));
             const uint4 w = *reinterpret_cast<const uint4*>(stage + b_dst[j]);
             uint4 lo, hi;
             lo.x = w8mma::widen2(w.x, 0x9180u, f);
@@ -1147,7 +1159,8 @@ __global__ void __launch_bounds__(128 * kWN) moe_select_fp8a8_mma(
     const u8* __restrict__ atoms,
     bf16* __restrict__ out,
     float* __restrict__ part,
-    int act_div, int n, int k, int num_experts, int rows)
+    int act_div, int n, int k, int num_experts, int rows,
+    const u64* __restrict__ expert_table)
 {
     constexpr int kTiles = 2;
     constexpr int kRowsWarp = kTiles * 16;
@@ -1191,8 +1204,10 @@ __global__ void __launch_bounds__(128 * kWN) moe_select_fp8a8_mma(
     const int s_lo = min(blocks, static_cast<int>(blockIdx.z) * per);
     const int s_hi = min(blocks, s_lo + per);
 
-    const u8* w_e = weight + static_cast<long long>(expert) * n * k;
-    const u8* atoms_at = atoms + atom_offset(expert * n + cta_row0, 0, blocks);
+    // The expert table ([codes, atoms] an expert), resolved once a tile.
+    const u8* w_e = expert_plane(weight, static_cast<long long>(n) * k, expert_table, 2, 0, expert);
+    const ExpertAtoms ea = expert_atoms(atoms, expert_table, expert, n);
+    const u8* atoms_at = ea.at + atom_offset(ea.row0 + cta_row0, 0, blocks);
 
     extern __shared__ uint4 fp8a8_smem[];
     u8* smem = reinterpret_cast<u8*>(fp8a8_smem);
@@ -1347,7 +1362,8 @@ __global__ void __launch_bounds__(256) moe_select_fp8a8_wide(
     const u8* __restrict__ weight,
     const u8* __restrict__ atoms,
     bf16* __restrict__ out,
-    int act_div, int n, int k, int num_experts, float limit, float galpha)
+    int act_div, int n, int k, int num_experts, float limit, float galpha,
+    const u64* __restrict__ expert_table)
 {
     constexpr int kRowsCta = 256;
     constexpr int kSlice = 128;
@@ -1381,8 +1397,10 @@ __global__ void __launch_bounds__(256) moe_select_fp8a8_wide(
     };
     const int row_base = wrow(wm * 64);
 
-    const u8* w_e = weight + static_cast<long long>(expert) * n * k;
-    const u8* atoms_at = atoms + atom_offset(expert * n + (row_base & ~127), 0, blocks);
+    // The expert table ([codes, atoms] an expert), resolved once a tile.
+    const u8* w_e = expert_plane(weight, static_cast<long long>(n) * k, expert_table, 2, 0, expert);
+    const ExpertAtoms ea = expert_atoms(atoms, expert_table, expert, n);
+    const u8* atoms_at = ea.at + atom_offset(ea.row0 + (row_base & ~127), 0, blocks);
 
     auto off = [](int row, int chunk) { return row * kBK + (chunk ^ (row & 7)) * 16; };
 
