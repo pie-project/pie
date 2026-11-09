@@ -1082,7 +1082,7 @@ fn gmm_spec(
     let tm = if elem == Elem::Bf16 {
         gmm_rows(p, e, tuning.moe_gmm_tm)
     } else {
-        gmm_rows_whole(p, e, tuning.moe_gmm_tm)
+        gmm_rows_whole(p, e, tuning.moe_gmm_tm, if mxfp4 { 128 } else { 256 })
     };
     let spec = Gmm {
         // Every active expert's rows round up to whole tiles.
@@ -1119,18 +1119,18 @@ fn gmm_rows(p: i64, e: i64, base: i64) -> i64 {
 
 /// The rows of one tile over a bank the kernel converts in VMEM (f8, e2m1
 /// codes): an expert's average rows, rounded up to a power of two (up to
-/// 128: 256-row tiles padded a 1792-row prefill's 7168 pairs to 15360 rows,
-/// whose MXU passes and plumbing cost v5e 9% of its fire), so an expert's
-/// run is one step or two. A second tile on the same block
+/// `cap`; an mxfp4 bank's 128: 256-row tiles padded gpt-oss's 1792-row
+/// prefill's 7168 pairs to 15360 rows, whose MXU passes and plumbing cost
+/// v5e 9% of its fire), so an expert's run is a step or two. A second tile on the same block
 /// issues no DMA, and the next expert's block starts loading only a step
 /// ahead: at a 640-row prefill of gpt-oss (80 rows an expert, two tiles of
 /// 64) the bank streamed at 1.0 TB/s on v6e. No slack past the average: on
 /// v5e the padded rows' MXU passes cost more than the bubble.
-fn gmm_rows_whole(p: i64, e: i64, base: i64) -> i64 {
+fn gmm_rows_whole(p: i64, e: i64, base: i64, cap: i64) -> i64 {
     let active = e.min(p).max(1);
     let per = (p + active - 1) / active;
     let mut tm = base.max(16);
-    while tm < 128 && tm < per {
+    while tm < cap && tm < per {
         tm *= 2;
     }
     tm
