@@ -1043,6 +1043,7 @@ fn gmm_spec(
     bank: &Read,
     elem: Elem,
     tuning: Tuning,
+    out: Elem,
 ) -> Option<crate::linear::moe_gmm::Gmm> {
     use crate::linear::moe_gmm::{Gmm, Orient};
     let off = !tuning.moe_gmm();
@@ -1066,6 +1067,7 @@ fn gmm_spec(
         experts: e,
         w: elem,
         orient: Orient::of(e * fan.n, fan.k),
+        out,
     };
     spec.out_width().ok().map(|_| spec)
 }
@@ -1089,7 +1091,7 @@ fn gmm_rows(p: i64, e: i64, base: i64) -> i64 {
 /// expert (unrouted last), each expert's run of rows padded to whole tiles
 /// of `tm` rows, one tile per grid step against its expert's weights, and
 /// each pair's row picked back out. Only the routed experts' weights move.
-/// f32 `[P, N]`.
+/// `[P, N]`, f32 or bf16 as the kernel lands it.
 fn gmm(
     f: &mut Func,
     spec: crate::linear::moe_gmm::Gmm,
@@ -1268,7 +1270,14 @@ fn routed(
         (expert_bytes / c.slice_bytes_per_ns.max(1)).max(c.loop_tile_ns + tile * c.loop_row_ns);
     let worth = whole_ns / tile_ns;
     // A forced `gmm` falls back to `all` for a bank the kernel does not read.
-    let grouped = gmm_spec(fan, &bank, f.elem(bank.codes.val()), tuning);
+    // Without an expert bias the sums only round to bf16 after the kernel:
+    // it lands them bf16, half the bytes to write and to pick rows from.
+    let out = if bias.is_some() {
+        Elem::F32
+    } else {
+        Elem::Bf16
+    };
+    let grouped = gmm_spec(fan, &bank, f.elem(bank.codes.val()), tuning, out);
     let path = match tuning.moe_path {
         MoePath::Gmm if grouped.is_none() => MoePath::All,
         MoePath::Auto { .. }
@@ -1276,10 +1285,10 @@ fn routed(
         {
             MoePath::Slice
         }
-        MoePath::Auto { .. } if r8 * e * n * fold > c.dense_all => MoePath::Ragged,
         // Past a token or two: each routed expert read once, at the DMA
         // rate, with no per-expert launch (see `gmm_spec`).
         MoePath::Auto { .. } if grouped.is_some() => MoePath::Gmm,
+        MoePath::Auto { .. } if r8 * e * n * fold > c.dense_all => MoePath::Ragged,
         MoePath::Auto { .. } if worth < 2 => MoePath::All,
         MoePath::Auto { .. } if worth >= p => MoePath::Loop,
         MoePath::Auto { .. } => MoePath::Active,

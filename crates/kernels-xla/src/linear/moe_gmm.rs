@@ -8,7 +8,7 @@
 //! Operands (in order): `se` i32 `[tiles]`, the expert of each row tile
 //! (entries past the tile count are ignored); `nt` i32 `[1]`, the tile
 //! count; `xs` bf16 `[tiles·tm, K]`, the rows tile by tile; the bank. The
-//! result is f32 `[tiles·tm, out_width]`: row `r` of tile `t` against
+//! result is `[tiles·tm, out_width]` (f32, or bf16): row `r` of tile `t` against
 //! expert `se[t]`, its `N` outputs starting at column `offsets()[se[t]]`.
 //! Rows of tiles past the count are left unwritten.
 //!
@@ -66,6 +66,8 @@ pub struct Gmm {
     /// The bank's element type (bf16, or f8 converted in VMEM).
     pub w: Elem,
     pub orient: Orient,
+    /// The result's element type: f32, or bf16 (the f32 sums rounded).
+    pub out: Elem,
 }
 
 /// How the weights are cut into blocks.
@@ -246,9 +248,10 @@ impl Gmm {
             },
             (Orient::NMajor, Cut::Element { .. }) => return bad("an element window over rows"),
         };
+        let out_elem = self.out;
         let out = Operand {
             array: vec![rows, out_width],
-            elem: Elem::F32,
+            elem: out_elem,
             block: vec![tm, cols],
             window: Window::Blocked,
             index: Box::new(|b: &mut Body, g: &Grid| Ok(vec![last(b, g)?, g.ids[0]])),
@@ -283,6 +286,7 @@ impl Gmm {
                 let w = b.convert_f(w, Elem::Bf16)?;
                 let acc = b.splat_f(&[tm, cols], Elem::F32, 0.0)?;
                 let y = b.matmul(x, w, acc, orient == Orient::NMajor)?;
+                let y = b.convert_f(y, out_elem)?;
                 b.vstore_all(y, blk.outs[0])
             })
         })
@@ -304,6 +308,7 @@ mod tests {
             experts: 32,
             w: Elem::F8E5m2,
             orient,
+            out: Elem::F32,
         }
     }
 
