@@ -1157,14 +1157,15 @@ fn gmm_spec(
 
 /// `x [m, K] · wᵀ` for block-FP8 codes `codes [N, K]` (landed `[K, N]`)
 /// with their f32 factors a row `factor [N, K/128]`: the grouped-matmul
-/// kernel over one expert, f32 `[m, N]`. `None` when no block of the
-/// weight fits the kernel.
+/// kernel over one expert, `[m, N]` in `out` (f32, or rounded to bf16).
+/// `None` when no block of the weight fits the kernel.
 pub(crate) fn tile_projection(
     f: &mut Func,
     x: Val,
     codes: Val,
     factor: Val,
     tuning: Tuning,
+    out: Elem,
 ) -> Result<Option<Val>, Error> {
     use crate::linear::moe_gmm::{Gmm, Orient};
     let (m, k) = (f.dims(x)[0], f.dims(x)[1]);
@@ -1194,7 +1195,7 @@ pub(crate) fn tile_projection(
         scaled: false,
         tile: true,
         bias: false,
-        out: Elem::F32,
+        out,
         prefetch: false,
     };
     if spec.out_width().ok() != Some(n) {

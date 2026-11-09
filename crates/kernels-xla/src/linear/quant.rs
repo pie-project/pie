@@ -640,8 +640,15 @@ pub(crate) fn planes<T: Stored>(
     })
 }
 
-/// `x · wᵀ` for the bank, f32 `[m, n]`; `x` is `[m, k]` bf16 or f32.
-pub(crate) fn contract(f: &mut Func, x: Val, p: &Planes, tuning: Tuning) -> Result<Val, Error> {
+/// `x · wᵀ` for the bank, f32 `[m, n]` (or `out`, where a kernel can land
+/// it so); `x` is `[m, k]` bf16 or f32.
+pub(crate) fn contract(
+    f: &mut Func,
+    x: Val,
+    p: &Planes,
+    tuning: Tuning,
+    out: Elem,
+) -> Result<Val, Error> {
     let g = i64::from(p.groups);
     let n = i64::from(p.codes.rows);
     let k = f.dims(x)[1];
@@ -712,7 +719,7 @@ pub(crate) fn contract(f: &mut Func, x: Val, p: &Planes, tuning: Tuning) -> Resu
             // The grouped-matmul kernel streams the codes and widens them in
             // VMEM, where a block of the weight fits it.
             if let Codes::Int(c) = codes
-                && let Some(y) = crate::linear::moe::tile_projection(f, x, c, s, tuning)?
+                && let Some(y) = crate::linear::moe::tile_projection(f, x, c, s, tuning, out)?
             {
                 return Ok(y);
             }
@@ -772,6 +779,14 @@ pub fn act_x_wt(
     } else {
         x
     };
-    let out = contract(f, x, &p, tuning)?;
+    // A bf16 landing takes the kernel's rows rounded as it stores them: an
+    // f32 result is written, read and rounded again (DeepSeek-V4's 32768-wide
+    // q_up at a 544-row prompt: 71 MB a layer).
+    let elem = if y.dtype == Dtype::Bf16 {
+        Elem::Bf16
+    } else {
+        Elem::F32
+    };
+    let out = contract(f, x, &p, tuning, elem)?;
     Ok(Some(out))
 }
