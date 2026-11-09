@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 """prep_q35.py <model dir> <outdir> <golden json> PX PY UNX UNY K HR VR NE [prefix] [nunits]: any Qwen3.5
+or Qwen3 (dense: every layer attention, no output gate, plain norm weights, full RoPE)
 checkpoint (bf16 or f32 safetensors, the VL layout "model.language_model." or text-only "model.") in
 the role-split prep format (the files PIE_CEREBRAS_SPLIT=<outdir>:<prefix> names; spatial/split/place.rs
 copies them onto the wafer). At the 9B's dims it writes the same arrays as `split_prep` (Rust, 9B only). Units of PX x PY weight PEs, K layers each (the model's layer kinds, GDN / attention by
@@ -11,6 +12,8 @@ Column mapping (per weight column c of PX):
   attention: kv head c // (PX / nkv), Dc = hd / (PX / nkv) dims: the first rd / Dc columns hold
   Dc / 2 rotated pairs (i, i + rd / 2) side by side, the others Dc unrotated dims; Qh = nq / nkv
   q heads (with their gates) a column.
+When PY does not divide the hidden size, Hc = ceil(H / PY) and the padded dims carry zero weights,
+gammas and embedding (x stays 0 there; the norms divide by H).
 Writes w<u>.npy, gam, cw, gpar, gnw, qkw, rot, hw, hg, embed, hemb, embrows, golden.json, meta.json
 (each with the optional prefix)."""
 import glob, json, os, shutil, struct, sys
@@ -47,40 +50,48 @@ def bf16bits(name):
     return (a.view(np.uint32) >> 16).astype(np.uint16)        # (f32 checkpoints: truncation; tiny tests store bf16)
 
 H, I, NL = tc["hidden_size"], tc["intermediate_size"], tc["num_hidden_layers"]
-nk, nv, hk, hv = tc["linear_num_key_heads"], tc["linear_num_value_heads"], tc["linear_key_head_dim"], tc["linear_value_head_dim"]
+Q3 = "linear_num_key_heads" not in tc      # Qwen3 (dense): no GDN, no output gate, norm weights w (not 1 + w)
+GATE = 0 if Q3 else 1
 nq, nkv, hd = tc["num_attention_heads"], tc["num_key_value_heads"], tc["head_dim"]
+if Q3:
+    nk, nv, hk, hv = nkv, nkv, hd, nq // nkv * hd     # (GDN's fields only shape unused buffers: DV = Qh Dc)
+else:
+    nk, nv, hk, hv = tc["linear_num_key_heads"], tc["linear_num_value_heads"], tc["linear_key_head_dim"], tc["linear_value_head_dim"]
+nw = (lambda w: w) if Q3 else (lambda w: 1 + w)   # a norm's weight as applied
 rp = tc.get("rope_parameters") or {}
 theta = float(rp.get("rope_theta", tc.get("rope_theta", 1e7)))
-prf = float(rp.get("partial_rotary_factor", tc.get("partial_rotary_factor", 0.25)))
+prf = 1.0 if Q3 else float(rp.get("partial_rotary_factor", tc.get("partial_rotary_factor", 0.25)))
 rd = int(hd * prf)
 CONV = tc.get("linear_conv_kernel_dim", 4)
 tied = bool(cfg.get("tie_word_embeddings", tc.get("tie_word_embeddings", False)))
-kinds = ["A" if t == "full_attention" else "G" for t in tc["layer_types"]]
+kinds = ["A" if t == "full_attention" else "G" for t in tc.get("layer_types", ["full_attention"] * NL)]
 NU = NUN
 assert NL == NU * K, (NL, NU, K)
 pat = kinds[:K]
 assert all(kinds[u * K:(u + 1) * K] == pat for u in range(NU)), "every unit the same layer kinds"
 KM = sum(1 << l for l, k in enumerate(pat) if k == "A")
 NLG = pat.count("G")
-assert H % PY == 0 and I % PX == 0
-Hc, Ic = H // PY, I // PX
+assert I % PX == 0
+Hc, Ic = -(-H // PY), I // PX
+Hp = Hc * PY                       # (padded hidden: zero weights past H)
 cpk, cpv, cpa = PX // nk, PX // nv, PX // nkv
 assert nk * cpk == PX and nv * cpv == PX and nkv * cpa == PX
 DK, DV, Dc, Qh = hk // cpk, hv // cpv, hd // cpa, nq // nkv
 assert DK * cpk == hk and DV * cpv == hv and Dc * cpa == hd and Dc % 2 == 0
 assert Qh * Dc == DV, "the weight PE's o tile has QO = Qh Dc rows for both kinds (GDN's DV)"
-assert hk <= PY, "GDN state row k = weight row r < hk"
+assert Q3 or hk <= PY, "GDN state row k = weight row r < hk"
 assert rd % Dc == 0 and rd // Dc <= cpa
 assert all((PX // 2) % w == 0 for w in (cpa, cpk, cpv)), "a segment (a head's columns) must not span the control column"
 assert PY <= PX, "vertical handoffs turn row r at weight column r"
 NROT = Dc // 2
 nrc = rd // Dc                     # rotated columns a kv head
 HC, HDc = PY // 2, 2 * Hc
+assert PY % 4 == 0, "the head's CX row pairs must not straddle the CY row (PY / 2 even)"
 KD, VD = nk * hk, nv * hv
 V = tc["vocab_size"]
 assert HR * VR >= V, (HR, VR, V)
 NQG = 2 * DK + 2 * DV + 2
-NQA = 2 * Qh * Dc + 2 * Dc
+NQA = (1 + GATE) * Qh * Dc + 2 * Dc
 c = np.arange(PX)
 kh, pk = c // cpk, c % cpk
 vh, pv = c // cpv, c % cpv
@@ -99,12 +110,18 @@ inv = 1.0 / (theta ** (np.arange(0, rd, 2) / rd))         # rd / 2 frequencies (
 def tile_in(W, idx):
     """W [out][H], idx [PX cols][N] -> [r][c][Hc][N] (row i = input dim r Hc + i)."""
     N = idx.shape[1]
-    S = f16(W[idx.reshape(-1)]).reshape(PX, N, PY, Hc)
+    S = f16(W[idx.reshape(-1)])
+    if Hp > H:
+        S = np.pad(S, ((0, 0), (0, Hp - H)))
+    S = S.reshape(PX, N, PY, Hc)
     return S.transpose(2, 0, 3, 1)
 def tile_out(W, idx):
     """W [H out][in], idx [PX cols][N] (the column's inputs) -> [r][c][N][Hc]."""
     N = idx.shape[1]
-    S = f16(W[:, idx.reshape(-1)]).reshape(PY, Hc, PX, N)
+    S = f16(W[:, idx.reshape(-1)])
+    if Hp > H:
+        S = np.pad(S, ((0, Hp - H), (0, 0)))
+    S = S.reshape(PY, Hc, PX, N)
     return S.transpose(0, 2, 3, 1)
 
 NCH = 2 * DK + DV
@@ -121,7 +138,7 @@ for u in range(ULIM):
     g = a = 0
     for l in range(K * u, K * u + K):
         L = P + f"layers.{l}."
-        ln1 = 1 + get(L + "input_layernorm.weight"); ln2 = 1 + get(L + "post_attention_layernorm.weight")
+        ln1 = np.pad(nw(get(L + "input_layernorm.weight")), (0, Hp - H)); ln2 = np.pad(nw(get(L + "post_attention_layernorm.weight")), (0, Hp - H))
         gam[u, :, (l % K) * 2 * Hc:(l % K) * 2 * Hc + Hc] = f16(ln1.reshape(PY, Hc))
         gam[u, :, (l % K) * 2 * Hc + Hc:(l % K + 1) * 2 * Hc] = f16(ln2.reshape(PY, Hc))
         if kinds[l] == "G":
@@ -141,17 +158,18 @@ for u in range(ULIM):
             g += 1
         else:
             A = L + "self_attn."
-            Wq = get(A + "q_proj.weight").reshape(nq, 2 * hd, H)
+            Wq = get(A + "q_proj.weight").reshape(nq, (1 + GATE) * hd, H)
             qh = (Qh * kvh)[:, None] + np.arange(Qh)             # [PX][Qh] the column's q heads
-            qrows = (qh[:, :, None] * 2 * hd + pd[:, None, :]).reshape(PX, Qh * Dc)
+            qrows = (qh[:, :, None] * (1 + GATE) * hd + pd[:, None, :]).reshape(PX, Qh * Dc)
             grows = (qh[:, :, None] * 2 * hd + hd + pd[:, None, :]).reshape(PX, Qh * Dc)
             krows = kvh[:, None] * hd + pd
             Win = np.concatenate([Wq.reshape(-1, H), get(A + "k_proj.weight"), get(A + "v_proj.weight")], 0)
-            idx = np.concatenate([qrows, grows, nq * 2 * hd + krows, nq * 2 * hd + nkv * hd + krows], 1)
+            QR = nq * (1 + GATE) * hd
+            idx = np.concatenate([qrows] + ([grows] if GATE else []) + [QR + krows, QR + nkv * hd + krows], 1)
             parts.append(tile_in(Win, idx).reshape(PY, PX, -1))
             oidx = (qh[:, :, None] * hd + pd[:, None, :]).reshape(PX, Qh * Dc)
             parts.append(tile_out(get(A + "o_proj.weight"), oidx).reshape(PY, PX, -1))
-            qn, kn = 1 + get(A + "q_norm.weight"), 1 + get(A + "k_norm.weight")
+            qn, kn = nw(get(A + "q_norm.weight")), nw(get(A + "k_norm.weight"))
             qkw[u, :, a * (Qh * Dc + Dc):a * (Qh * Dc + Dc) + Qh * Dc] = np.tile(qn[pd] / np.sqrt(hd), (1, Qh))
             qkw[u, :, a * (Qh * Dc + Dc) + Qh * Dc:(a + 1) * (Qh * Dc + Dc)] = kn[pd]
             a += 1
@@ -188,18 +206,20 @@ for R in range(HR):
     blk = np.repeat(np.asarray(Wh[V - 1:V], np.float32), VR, axis=0)
     if hi > lo:
         blk[:hi - lo] = Wh[lo:hi]
+    if Hp > H:
+        blk = np.pad(blk, ((0, 0), (0, Hp - H)))
     hw[R] = f16(blk.reshape(VR, HC, HDc).transpose(1, 2, 0)).reshape(HC, -1)
 hw.flush()
-np.save(os.path.join(out, PRE + "hg.npy"), (1 + get(P + "norm.weight")).reshape(HC, HDc).astype(np.float32))
+np.save(os.path.join(out, PRE + "hg.npy"), np.pad(nw(get(P + "norm.weight")), (0, Hp - H)).reshape(HC, HDc).astype(np.float32))
 eb = bf16bits(P + "embed_tokens.weight")
 e = np.lib.format.open_memmap(os.path.join(out, PRE + "embed.npy"), "w+", np.uint16, tuple(eb.shape))
 e[:] = eb; e.flush()
 # the head's embedding tiles (hemb: [HR][HC][VR HDc] bf16 bits, a head PE's [vocab row][dim])
 he = np.lib.format.open_memmap(os.path.join(out, PRE + "hemb.npy"), "w+", np.uint16, (HR, HC, VR * HDc))
 for R in range(HR):
-    blk = np.zeros((VR, H), np.uint16)
+    blk = np.zeros((VR, Hp), np.uint16)
     rows = np.asarray(eb[R * VR:min((R + 1) * VR, V)])
-    blk[:rows.shape[0]] = rows
+    blk[:rows.shape[0], :H] = rows
     he[R] = blk.reshape(VR, HC, HDc).transpose(1, 0, 2).reshape(HC, VR * HDc)
 he.flush()
 gold = json.load(open(GOLD))
@@ -208,10 +228,12 @@ np.save(os.path.join(out, PRE + "embrows.npy"), np.asarray(eb)[ids])
 shutil.copy(GOLD, os.path.join(out, PRE + "golden.json"))
 meta = dict(PX=PX, PY=PY, UNX=UNX, UNY=UNY, HC=HC, HR=HR, VR=VR, Hc=Hc, SWA=cpa, SWG=cpk, SWV=cpv, DKG=DK, DKH=hk,
             has_att=KM != 0, has_gdn=NLG > 0, K=K, KM=KM, Ic=Ic, NQA=NQA, NQG=NQG, Qh=Qh, Dc=Dc, DK=DK, DV=DV, NE=NE, HD=hd,
-            NROT=NROT, HK=hk, HV=hv, H=H, EPS=tc.get("rms_norm_eps", 1e-6), V=V, model=os.path.basename(MD.rstrip("/")))
+            NROT=NROT, HK=hk, HV=hv, H=H, GATE=GATE, EPS=tc.get("rms_norm_eps", 1e-6), V=V, model=os.path.basename(MD.rstrip("/")))
 json.dump(meta, open(os.path.join(out, PRE + "meta.json"), "w"))
 # the compile params (mkfull.py's layout params) for this prep
 cp = dict(PX=PX, PY=PY, UNX=UNX, UNY=UNY, HC=HC, HR=HR, VR=VR, K=K, KM=KM, Hc=Hc, Ic=Ic, NQA=NQA, NQG=NQG, Qh=Qh, Dc=Dc,
           DK=DK, DV=DV, NE=NE, HR_=H, HD=hd, NROT=NROT, HK=hk, HV=hv)
+if Q3:
+    cp["GATE"] = 0
 open(os.path.join(out, PRE + "params.txt"), "w").write(",".join(f"{k}:{v}" for k, v in cp.items()) + "\n")
 print("prepared", out, json.dumps(meta))

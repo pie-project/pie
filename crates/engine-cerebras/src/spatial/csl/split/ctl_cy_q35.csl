@@ -29,7 +29,7 @@
 //
 // Params. Shape: K, KM, NQA, NQG, Qh, Dc, DK, DV, Ic, HR (hidden), CONV, NROT, HK, HV. Levers
 // (default = the shipped 9B build): CONVQK 1, ATTV 1, GDEC 1, ROPEP 1, SILU16 1, SILUQ 1, ATTL 2
-// (0: the steps ride with o). Diagnostics (default off): TSTAMP, DIAG (as weight_q35.csl).
+// (0: the steps ride with o), SLW 0. Model: GATE (1 Qwen3.5's gated attention; 0 Qwen3). Diagnostics (default off): TSTAMP, DIAG (as weight_q35.csl).
 param memcpy_params;
 param DIAG: u16 = 0;   // 1 (diagnostics): no layers (handoffs, head and I/O only)
 param K: u16;
@@ -55,6 +55,8 @@ param SILUQ: u16 = 1;  // 1: the lean f32 SiLU for GDN's q / k and v | z (same r
 param ATTL: u16 = 2;   // 2: the log-sum-exp steps in a second multicast after o (off the path); 0: with o
 param TSTAMP: u16 = 0; // 1 (diagnostics): phase stamps into tdbg (on the critical path)
 param FIFOW: u16 = 32; // the reduction's FIFO depth (words)
+param GATE: u16 = 1;   // 1: attention's q_proj carries the output gate (Qwen3.5); 0: none (Qwen3: NQA = Qh Dc q | Dc k | Dc v)
+param SLW: u16 = 0;    // 1: silu16 without the f16 subnormal flush (the tail to 2^-24; serve8b_region's SLW)
 
 const sys_mod = @import_module("<memcpy/memcpy>", memcpy_params);
 const tile_config = @import_module("<tile_config>");
@@ -73,6 +75,7 @@ const NLA: u16 = nla();
 const NLG: u16 = K - NLA;
 const NCH: u16 = 2 * DK + DV;              // conv channels a column
 const TN: u16 = mx(mx(mx(NQA + 1, NQG + 1), mx(2 * Ic + 1, 2 * DV + 3)), Qh * Dc + 2 * Dc + 2 + Qh);
+const KO: u16 = (1 + GATE) * Qh * Dc;      // attention: k's offset in the reduction (after q and the gate)
 const EPS: f32 = 1.0e-6;
 const HID: f32 = @as(f32, HR);
 
@@ -96,7 +99,7 @@ var gsc = @zeros([4]f32);                  // beta, decay, then the norms' scala
 // the gate kept between the reductions, the LSE reference a head.
 var qkw = @zeros([if (NLA > 0) NLA * (Qh * Dc + Dc) else 1]f32);
 var rot = @zeros([if (NLA > 0) 4 * 8 * 2 * NROT else 1]f32);
-var gate = @zeros([if (NLA > 0) Qh * Dc else 1]f32);
+var gate = @zeros([if (NLA > 0 and GATE == 1) Qh * Dc else 1]f32);
 var rc = @zeros([mx(NROT, 1)]f32);
 var rs = @zeros([mx(NROT, 1)]f32);
 var tab = @zeros([4]u32);                  // the host: [position, slot word, 0, 0] a pass
@@ -552,24 +555,24 @@ fn att(a: u16) void {
   }
   var ks: f32 = 0.0;
   var d: u16 = 0;
-  while (d < Dc) : (d += 1) { const v = t[2 * QD + d]; ks += v * v; }
+  while (d < Dc) : (d += 1) { const v = t[KO + d]; ks += v * v; }
   u[QD + 2 * Dc + 1 + Qh] = ks;
   const qw = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{QD} -> qkw[i] });
   @fmuls(tv(0, QD), tv(0, QD), @set_dsd_length(@increment_dsd_offset(qw, @as(i16, qkb), f32), QD));
-  @fmuls(tv(2 * QD, Dc), tv(2 * QD, Dc), @set_dsd_length(@increment_dsd_offset(qw, @as(i16, qkb + QD), f32), Dc));
+  @fmuls(tv(KO, Dc), tv(KO, Dc), @set_dsd_length(@increment_dsd_offset(qw, @as(i16, qkb + QD), f32), Dc));
   rope_tables();
   h = 0;
   while (h < Qh) : (h += 1) { rope(h * Dc); }
-  rope(2 * QD);
-  @fmovs(@set_dsd_length(@get_dsd(mem1d_dsd, .{ .tensor_access = |i|{QD} -> gate[i] }), QD), tv(QD, QD));
+  rope(KO);
+  if (GATE == 1) { @fmovs(@set_dsd_length(@get_dsd(mem1d_dsd, .{ .tensor_access = |i|{QD} -> gate[i] }), QD), tv(QD, QD)); }
   @fmovs(uv(0, QD), tv(0, QD));
-  @fmovs(uv(QD, 2 * Dc), tv(2 * QD, 2 * Dc));
+  @fmovs(uv(QD, 2 * Dc), tv(KO, 2 * Dc));
   u[QD + 2 * Dc] = @as(f32, tab[0]);
   mcast(QD + 2 * Dc + 2 + Qh);
   stamp(1 + 6 * cl + 1);
   if (ROPEP == 1 and NLA == 1) { rope_tables_at(tab[0] + 1); }   // (one attention layer a unit: the next pass's tables)
   var gi: u16 = 0;   // the output gate's sigmoid while the weight PEs run the scores
-  while (gi < QD) : (gi += 1) { gate[gi] = sigm(gate[gi]); }
+  while (GATE == 1 and gi < QD) : (gi += 1) { gate[gi] = sigm(gate[gi]); }
   var pass: u16 = 0;
   while (pass < 8) : (pass += 1) {
     reduce(Qh * (Dc + 1));
@@ -581,7 +584,7 @@ fn att(a: u16) void {
       ilh[h] = recip(l);
       if (ATTV == 0) {
         var d: u16 = 0;
-        while (d < Dc) : (d += 1) { u[h * Dc + d] = t[h * (Dc + 1) + d] * ilh[h] * gate[h * Dc + d]; }
+        while (d < Dc) : (d += 1) { u[h * Dc + d] = t[h * (Dc + 1) + d] * ilh[h] * (if (GATE == 1) gate[h * Dc + d] else 1.0); }
       }
     }
     if (ATTV == 1) {
@@ -590,7 +593,7 @@ fn att(a: u16) void {
       var hh: u16 = 0;
       while (hh < Qh) : (hh += 1) {
         @fmuls(uv(hh * Dc, Dc), tv(hh * (Dc + 1), Dc), ilh[hh]);
-        @fmuls(uv(hh * Dc, Dc), uv(hh * Dc, Dc), @increment_dsd_offset(gd, @as(i16, hh * Dc), f32));
+        if (GATE == 1) { @fmuls(uv(hh * Dc, Dc), uv(hh * Dc, Dc), @increment_dsd_offset(gd, @as(i16, hh * Dc), f32)); }
       }
     }
     h = 0;
@@ -634,7 +637,7 @@ fn silu16(rr: f32) void {
   @fmuls(tv(Ic, Ic), tv(Ic, Ic), rr * 0.6931471805599453);
   @fs2h(h_d, tv(0, 2 * Ic));
   @or16(hb(&ht), hb(&hg), 0x8000);            // t = -|a'|
-  @fmaxh(HT, HT, @as(@fp16(), -15.0));
+  @fmaxh(HT, HT, @as(@fp16(), if (SLW == 1) -24.0 else -15.0));
   @faddh(HM, HT, @as(@fp16(), 1536.0));       // m = t + 1536: round(t) in its low bits
   @faddh(HP, HM, @as(@fp16(), -1536.0));      // n
   @fsubh(HQ, HT, HP);                         // r = t - n in [-0.5, 0.5]
@@ -644,10 +647,15 @@ fn silu16(rr: f32) void {
   @faddh(HP, HP, @as(@fp16(), 0.6932608957863087));
   @fmulh(HP, HP, HQ);
   @faddh(HP, HP, @as(@fp16(), 0.9999283788785166));   // 2^r
-  @add16(hb(&hm), hb(&hm), 0x9a0f);           // n + 15 (1536's bits 0x6600)
-  @sll16(hb(&hm), hb(&hm), 10);               // 2^n
-  @fmulh(HP, HP, HM);                         // e = exp(-|a|)
-  @faddh(HW, HP, @as(@fp16(), 1.0));          // d = 1 + e in (1, 2]
+  @add16(hb(&hm), hb(&hm), if (SLW == 1) 0x9a18 else 0x9a0f);   // n + 15 (1536's bits 0x6600); SLW: n + 24
+  @sll16(hb(&hm), hb(&hm), 10);               // 2^n (SLW: 2^(n + 9), normal for n >= -23)
+  @fmulh(HP, HP, HM);                         // e = exp(-|a|) (SLW: e' = e 2^9)
+  if (SLW == 1) {
+    @fmulh(HW, HP, @as(@fp16(), 0.001953125));
+    @faddh(HW, HW, @as(@fp16(), 1.0));
+  } else {
+    @faddh(HW, HP, @as(@fp16(), 1.0));        // d = 1 + e in (1, 2]
+  }
   @fmulh(HQ, HW, @as(@fp16(), 0.323112507040746));
   @faddh(HQ, HQ, @as(@fp16(), -1.4540415401729079));
   @fmulh(HQ, HQ, HW);
@@ -656,6 +664,7 @@ fn silu16(rr: f32) void {
   @fsubh(HW, @as(@fp16(), 2.0), HW);
   @fmulh(HQ, HQ, HW);                         // 1/d to 1e-4
   @fmulh(HP, HP, HG);                         // a' e
+  if (SLW == 1) { @fmulh(HP, HP, @as(@fp16(), 0.001953125)); }   // (e' a') 2^-9
   @fmaxh(HP, HP, HG);                         // a' (a >= 0) or a' e (a < 0)
   @fmulh(HP, HP, HU);
   @fmulh(HP, HP, HQ);
