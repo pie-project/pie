@@ -391,7 +391,7 @@ impl Engine for Vulkan {
 
         let pools = shell.pool_facts(disk_kv_pages);
         let chunks = shell.chunk_facts(&pools);
-        shell.log_chunk_recipe();
+        shell.log_chunk_recipe(&chunks);
 
         let caps = Capabilities {
             device: DeviceFacts {

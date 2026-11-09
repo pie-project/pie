@@ -45,9 +45,9 @@ impl Shell {
         Ok(with_sinks(ChunkFacts::degenerate(pools, &bytes), sinks))
     }
 
-    /// Logs, at debug, the chunk recipe `poem_compiler::chunk::plan` packs
-    /// this trace into on a TPU.
-    pub fn log_chunk_recipe(&self) {
+    /// Logs, at debug, beside the degenerate `facts`, the chunk recipe
+    /// `poem_compiler::chunk::plan` packs this trace into on a TPU.
+    pub fn log_chunk_recipe(&self, facts: &ChunkFacts) {
         if !tracing::enabled!(tracing::Level::DEBUG) {
             return;
         }
@@ -61,6 +61,8 @@ impl Shell {
                 backend = "xla",
                 profile = "tpu",
                 chunk = %human(recipe.chunk_bytes),
+                degenerate_chunks = facts.total_chunks,
+                degenerate_chunk = %human(facts.chunk_bytes),
                 shapes = %recipe.shapes(),
                 chunks_per_working_set = recipe.chunks_per_ws(),
                 waste_percent = recipe.waste.percent(),
@@ -69,6 +71,8 @@ impl Shell {
             Err(error) => tracing::debug!(
                 backend = "xla",
                 %error,
+                degenerate_chunks = facts.total_chunks,
+                degenerate_chunk = %human(facts.chunk_bytes),
                 "this trace packs into no chunk recipe"
             ),
         }

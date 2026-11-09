@@ -538,7 +538,7 @@ impl Engine for Metal {
         let paging = shell.paging();
         let pools = shell.pool_facts(disk_kv_pages);
         let chunks = shell.chunk_facts(&pools).map_err(fault)?;
-        shell.log_chunk_recipe();
+        shell.log_chunk_recipe(&chunks);
 
         let caps = Capabilities {
             device: DeviceFacts {

@@ -369,7 +369,7 @@ impl Engine for Spatial {
             bytes.kv_page = page as u64;
         }
         let chunks = engine::chunk::ChunkFacts::degenerate(&pools, &bytes);
-        shell.log_chunk_recipe();
+        shell.log_chunk_recipe(&chunks);
         let caps = Capabilities {
             device: DeviceFacts {
                 backend: "cerebras".to_string(),

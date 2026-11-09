@@ -66,9 +66,9 @@ impl Shell {
         Ok(grown(facts, pools, self.committed_slots()))
     }
 
-    /// Logs, at debug, the chunk recipe `poem_compiler::chunk::plan` packs
-    /// this trace into on an on-device Metal GPU.
-    pub fn log_chunk_recipe(&self) {
+    /// Logs, at debug, beside the degenerate `facts`, the chunk recipe
+    /// `poem_compiler::chunk::plan` packs this trace into on an on-device Metal GPU.
+    pub fn log_chunk_recipe(&self, facts: &ChunkFacts) {
         if !tracing::enabled!(tracing::Level::DEBUG) {
             return;
         }
@@ -82,6 +82,8 @@ impl Shell {
                 backend = "metal",
                 profile = "on-device-metal",
                 chunk = %human(recipe.chunk_bytes),
+                degenerate_chunks = facts.total_chunks,
+                degenerate_chunk = %human(facts.chunk_bytes),
                 shapes = %recipe.shapes(),
                 chunks_per_working_set = recipe.chunks_per_ws(),
                 waste_percent = recipe.waste.percent(),
@@ -90,6 +92,8 @@ impl Shell {
             Err(error) => tracing::debug!(
                 backend = "metal",
                 %error,
+                degenerate_chunks = facts.total_chunks,
+                degenerate_chunk = %human(facts.chunk_bytes),
                 "this trace packs into no chunk recipe"
             ),
         }

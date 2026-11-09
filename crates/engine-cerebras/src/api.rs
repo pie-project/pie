@@ -388,7 +388,7 @@ impl Engine for Cerebras {
         let drafter = shell.trace().drafter;
         let pools = shell.pool_facts();
         let chunks = shell.chunk_facts(&pools).map_err(fault)?;
-        shell.log_chunk_recipe();
+        shell.log_chunk_recipe(&chunks);
         let caps = Capabilities {
             device: DeviceFacts {
                 backend: "cerebras".to_string(),
