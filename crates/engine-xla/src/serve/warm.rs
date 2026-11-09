@@ -245,7 +245,6 @@ impl Shell {
         }) as usize;
         let running = std::sync::atomic::AtomicUsize::new(0);
         let admit = std::sync::Mutex::new(());
-        let stop = std::sync::atomic::AtomicBool::new(false);
         let threads = std::thread::available_parallelism()
             .map_or(1, |n| n.get())
             .min(8)
@@ -259,6 +258,36 @@ impl Shell {
             (0..texts.len())
                 .map(|_| std::sync::Mutex::new(None))
                 .collect();
+        use std::sync::atomic::Ordering::SeqCst;
+        // Each compiled program also stays in host memory (v5e, Qwen3.6-35B-
+        // A3B's pf256 ladder: ~0.5 GB each, 65 of them 42 GB of the host's
+        // 47). Where one more compile would not fit beside them, the latest
+        // compiled are parked: dropped from memory, their compiled bytes in
+        // the disk cache, loaded (~1 s, not compiled) by the first fire that
+        // takes their shape.
+        let parked = std::sync::atomic::AtomicUsize::new(0);
+        let make_room = || {
+            let mut at = texts.len();
+            while available_memory().is_some_and(|b| b < need) && at > 0 {
+                at -= 1;
+                let Ok(mut slot) = slots[at].lock() else {
+                    continue;
+                };
+                if !matches!(slot.as_ref(), Some(Ok(_))) {
+                    continue;
+                }
+                let held = slot.take();
+                drop(slot);
+                device.forget(texts[at].0);
+                drop(held);
+                parked.fetch_add(1, SeqCst);
+                #[cfg(target_os = "linux")]
+                // SAFETY: `malloc_trim` only releases free heap pages.
+                unsafe {
+                    libc::malloc_trim(0);
+                }
+            }
+        };
         std::thread::scope(|scope| {
             for _ in 0..threads {
                 scope.spawn(|| {
@@ -267,34 +296,23 @@ impl Shell {
                         let Some((text, sig)) = texts.get(at) else {
                             break;
                         };
-                        use std::sync::atomic::Ordering::SeqCst;
                         // Admitted one at a time: a compile in flight may
                         // not have taken its memory yet, so each counts as
-                        // still to come.
-                        let admitted = loop {
+                        // still to come. Alone, a compile makes its room.
+                        loop {
                             let turn = admit.lock().expect("the warm admission lock poisoned");
                             let busy = running.load(SeqCst) as u64;
-                            let free = available_memory();
-                            // Each compiled program also stays in host memory
-                            // (v5e, Qwen3.6-35B-A3B's pf256 ladder: ~0.43 GB
-                            // each, past the host's 47 GB by ~100): once one
-                            // more compile no longer fits, the rest wait for a
-                            // fire to meet them.
-                            if free.is_some_and(|b| b < need) {
-                                stop.store(true, SeqCst);
+                            if busy == 0 {
+                                make_room();
                             }
-                            if stop.load(SeqCst) {
-                                break false;
-                            }
-                            if busy == 0 || free.is_none_or(|b| b >= need * (busy + 1)) {
+                            if busy == 0
+                                || available_memory().is_none_or(|b| b >= need * (busy + 1))
+                            {
                                 running.fetch_add(1, SeqCst);
-                                break true;
+                                break;
                             }
                             drop(turn);
                             std::thread::sleep(std::time::Duration::from_millis(200));
-                        };
-                        if !admitted {
-                            break;
                         }
                         let program = device.program(text, (*sig).clone());
                         running.fetch_sub(1, SeqCst);
@@ -310,14 +328,16 @@ impl Shell {
                 });
             }
         });
+        // The room a fire's own compile takes stays free.
+        make_room();
         for (at, slot) in slots.into_iter().enumerate() {
             programs[at] = slot.into_inner().ok().flatten();
         }
-        let waiting = programs.iter().filter(|p| p.is_none()).count();
-        if waiting > 0 {
+        let parked = parked.load(SeqCst);
+        if parked > 0 {
             tracing::warn!(
-                waiting,
-                "xla warm ladder stopped: the host's free memory holds no more compiles"
+                parked,
+                "xla warm ladder parked programs on disk: the host's memory holds no more"
             );
         }
         // The compiles' scratch is freed by now: hand it back rather than

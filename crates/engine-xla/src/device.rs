@@ -323,6 +323,14 @@ impl Device {
         Ok(program)
     }
 
+    /// Drops the program compiled from `text` from the cache: a program held
+    /// nowhere else frees its host memory, and the next `program` of the
+    /// text loads it from the disk cache.
+    pub fn forget(&self, text: &str) {
+        let key = *blake3::hash(text.as_bytes()).as_bytes();
+        self.cache.lock().expect("cache lock poisoned").remove(&key);
+    }
+
     #[must_use]
     pub fn compiled(&self) -> usize {
         self.cache.lock().expect("cache lock poisoned").len()
