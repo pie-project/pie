@@ -20,6 +20,9 @@ pub trait PoolPort: Send + Sync + 'static {
     fn disk_stats(&self) -> (u32, u32);
     fn rs_stats(&self) -> (RsUnits, RsUnits);
     fn rs_host_stats(&self) -> (RsUnits, RsUnits);
+    /// Drops idle cache, but only what its retention key lets the runtime
+    /// drop unasked (`pressure::may_drop`); room past that is asked of the
+    /// policy with tier pressure.
     fn reclaim_idle(&self) -> u32;
     /// Called until it frees nothing, without freeing them.
     fn reclaimable_idle(&self) -> u32;
@@ -57,9 +60,10 @@ pub trait PoolPort: Send + Sync + 'static {
     fn release_device(&self, pages: Vec<crate::store::kv::page_table::PhysicalKvPageId>);
     fn reserve_rs(&self, need: RsUnits) -> Option<crate::store::rs::RsGrant>;
     fn release_rs(&self, grant: crate::store::rs::RsGrant);
-    /// Drops the checkpoints sharing state with `working_sets`, so
-    /// their next write lands in place; returns how many were dropped.
-    fn yield_checkpoints(&self, working_sets: &[crate::store::rs::RsWorkingSetId]) -> usize;
+    /// Drops the checkpoints sharing state with `working_sets` that their
+    /// retention keys let go unasked, so the sets' next write lands in
+    /// place; returns how many were dropped.
+    fn reclaim_sharing(&self, working_sets: &[crate::store::rs::RsWorkingSetId]) -> usize;
     fn prepare_sweep(
         &self,
         keep: &HashSet<crate::store::kv::page_table::WorkingSetId>,
@@ -162,9 +166,9 @@ impl PoolPort for RegistryPool {
     fn reclaim_idle(&self) -> u32 {
         let pages = self.with_kv_tagged("planner-reclaim-idle", |kv| {
             let epoch = kv.current_epoch();
-            kv.reclaim_cache(epoch, crate::policy::retention::Installed)
+            kv.reclaim_droppable(epoch, crate::policy::retention::Installed)
         });
-        let slots = self.with_rs(|rs| rs.reclaim_cache(crate::policy::retention::Installed));
+        let slots = self.with_rs(|rs| rs.reclaim_droppable(crate::policy::retention::Installed));
         (pages + slots) as u32
     }
 
@@ -278,8 +282,8 @@ impl PoolPort for RegistryPool {
         self.with_rs(|rs| rs.release_reservation(grant));
     }
 
-    fn yield_checkpoints(&self, working_sets: &[crate::store::rs::RsWorkingSetId]) -> usize {
-        self.with_rs(|rs| rs.yield_checkpoints(working_sets))
+    fn reclaim_sharing(&self, working_sets: &[crate::store::rs::RsWorkingSetId]) -> usize {
+        self.with_rs(|rs| rs.reclaim_sharing(working_sets, crate::policy::retention::Installed))
     }
 
     fn prepare_sweep(

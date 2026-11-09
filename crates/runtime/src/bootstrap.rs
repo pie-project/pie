@@ -275,40 +275,11 @@ async fn bootstrap_inner(config: Config) -> Result<BootstrapHandle> {
     } = config.model;
 
     crate::scheduler::set_dispatch_depth(scheduler.frame_dispatch_depth as usize);
-    // A running recurrent sequence holds one state slot, so the pool seats
-    // as many as it has slots; what it buffers unfolded is in pages of
-    // their own.
-    let rs_seat_cap = engine_configs
-        .iter()
-        .map(|d| d.rs_cache_slots)
-        .filter(|&slots| slots > 0)
-        .min();
-    // Each posted frame buffers what it leaves unfolded: where every engine asks
-    // and the slots seat fewer lanes than they batch at the configured depth, post
-    // one frame a lane.
-    let lanes = engine_configs
-        .iter()
-        .map(|d| d.limits.max_forward_requests)
-        .min()
-        .unwrap_or(0);
-    let depth = crate::scheduler::configured_dispatch_depth().max(1);
-    if let Some(slots) = rs_seat_cap
-        && depth > 1
-        && slots / depth < lanes
-        && engine_configs
-            .iter()
-            .all(|d| d.rs_cache_slots == 0 || d.one_frame_when_short)
-    {
-        tracing::info!(
-            lanes,
-            state_slots = slots,
-            seated_at_depth = slots / depth,
-            seated_at_one = slots.min(lanes),
-            "admission: the state slots seat fewer lanes than the engine batches; posting one \
-             frame a lane, as the engine's profile asks"
-        );
-        crate::scheduler::set_dispatch_depth(1);
-    }
+    // A model with fixed recurrent state is admitted by its planner, which
+    // charges each process the fixed set its working set holds against the
+    // state pool, beside a copy-on-write set per lane a fire runs
+    // (`ResidencyPlanner::admit`): no cap here.
+    let has_state = engine_configs.iter().any(|d| d.rs_cache_slots > 0);
     let admission_cap = config
         .max_concurrent_processes
         .or_else(|| {
@@ -317,19 +288,6 @@ async fn bootstrap_inner(config: Config) -> Result<BootstrapHandle> {
                 .map(|d| d.limits.max_forward_requests)
                 .min()
                 .filter(|&r| r > 0)
-        })
-        .map(|cap| match rs_seat_cap {
-            Some(seats) if cap > seats => {
-                tracing::warn!(
-                    requested = cap,
-                    seated = seats,
-                    "admission: more lanes than the state pool seats; capping, because each \
-                     running sequence holds one recurrent-state slot. Raise `[engine] \
-                     max_state_slots` to seat more"
-                );
-                seats
-            }
-            _ => cap,
         })
         .map(|cap| {
             // A seated-first pool of kv pages alone seats no more than five
@@ -344,7 +302,7 @@ async fn bootstrap_inner(config: Config) -> Result<BootstrapHandle> {
                 .map(|d| 5 * d.total_pages * kv_page_size / d.limits.max_context)
                 .min();
             match seats {
-                Some(seats) if rs_seat_cap.is_none() && cap > seats.max(1) => {
+                Some(seats) if !has_state && cap > seats.max(1) => {
                     tracing::info!(
                         requested = cap,
                         seated = seats,
@@ -474,6 +432,12 @@ async fn bootstrap_inner(config: Config) -> Result<BootstrapHandle> {
     let kv_swap_capable = engine_configs
         .first()
         .is_some_and(|d| d.cpu_pages > 0 || d.disk_pages > 0);
+    // The lanes one fire runs on each engine: the copy-on-write sets its
+    // state pool keeps back from admission.
+    let fire_lanes: Vec<u32> = engine_configs
+        .iter()
+        .map(|d| d.limits.max_forward_requests as u32)
+        .collect();
     let seated_first = !engine_configs.is_empty() && engine_configs.iter().all(|d| d.seated_first);
     let seat_to_end = !engine_configs.is_empty() && engine_configs.iter().all(|d| d.seat_to_end);
     let seat_spread = seat_to_end && engine_configs.iter().all(|d| d.seat_spread);
@@ -555,6 +519,7 @@ async fn bootstrap_inner(config: Config) -> Result<BootstrapHandle> {
             engine,
             crate::planner::ResidencyPlanner::new(std::sync::Arc::new(pool))
                 .seated_first(seated_first)
+                .cow_lanes(fire_lanes.get(engine).copied().unwrap_or(1))
                 .seat_to_end(seat_to_end)
                 .seat_spread(seat_spread),
         );

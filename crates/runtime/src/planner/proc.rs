@@ -47,6 +47,9 @@ pub(super) struct Proc {
     pub(super) first: (u32, crate::store::rs::RsUnits),
     /// Its holds past its exit; see [`Departure`].
     pub(super) departure: Weak<Departure>,
+    /// Admitted against the state pool: it counts for the fixed sets a
+    /// running working set takes until it leaves.
+    pub(super) charged: bool,
 }
 
 impl Proc {
@@ -83,6 +86,7 @@ impl Proc {
             peak: Default::default(),
             first: Default::default(),
             departure: Weak::new(),
+            charged: false,
         }
     }
 }

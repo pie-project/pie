@@ -328,12 +328,14 @@ impl Extent {
     }
 
     /// Hands back the state past the highest slot out. Those a running
-    /// process holds go when it ends: nothing here moves them.
+    /// process holds go when it ends: nothing here moves them. What idle
+    /// cache keeps past the limits the planner lets go or asks the policy
+    /// for ([`crate::planner::ResidencyPlanner::reclaim_tail`]).
     async fn release_state(&self) {
-        let (end, mapped) = self.rs(|rs| {
-            rs.reclaim_tail();
-            (rs.held_end(), rs.mapped())
-        });
+        if let Some(planner) = crate::planner::planner_for(self.model, self.engine) {
+            planner.reclaim_tail();
+        }
+        let (end, mapped) = self.rs(|rs| (rs.held_end(), rs.mapped()));
         if mapped > end && mapped - end >= self.state_step {
             match crate::scheduler::pool(self.engine, PoolOp::ReleaseState(end)).await {
                 Ok(()) => self.rs(|rs| rs.note_released(end)),
@@ -351,8 +353,6 @@ impl Extent {
             self.release_state().await;
             let tail = self.kv(|kv| {
                 (kv.mapped_pages() > kv.committed_pages()).then(|| {
-                    let epoch = kv.current_epoch();
-                    kv.reclaim_tail(epoch);
                     (
                         kv.committed_pages(),
                         kv.tail_held(),

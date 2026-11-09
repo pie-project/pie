@@ -67,6 +67,7 @@ fn tests_every_case() {
     an_unused_cache_lease_counts_the_pages_dropping_it_frees();
     a_dropped_entry_leaves_its_readers_whole();
     store_reclaims_cache_lowest_rank_first_and_spares_what_live_ones_read();
+    the_runtime_drops_unasked_only_cache_whose_key_may_drop();
     reclaim_spares_the_prefixes_a_live_working_set_kept();
     a_suspend_past_host_swap_spills_to_disk_and_restores_whole();
     a_suspend_takes_shared_pages_to_the_host_in_place();
@@ -371,6 +372,23 @@ fn on_device(store: &mut KvStore, tokens: &[u32]) -> usize {
     store.release_working_set(probe, store.current_epoch());
     let run = store.cached_run(&keys);
     store.table.resident_run(&run)
+}
+
+fn the_runtime_drops_unasked_only_cache_whose_key_may_drop() {
+    let mut store = KvStore::new(8, h(7));
+    let (free, kept) = (ProcessId::from_u128(1), ProcessId::from_u128(2));
+    kept_and_gone(&mut store, 1, 2, free);
+    kept_and_gone(&mut store, 2, 2, kept);
+    let keys = |owner: Option<ProcessId>| i64::from(owner == Some(kept));
+    assert_eq!(store.reclaim_droppable(store.current_epoch(), keys), 2);
+    assert!(!store.owns_cache(free) && store.owns_cache(kept));
+    assert_eq!(
+        store.reclaim_droppable(store.current_epoch(), keys),
+        0,
+        "a key above 0 is the policy's to let go"
+    );
+    assert!(store.owns_cache(kept));
+    assert_eq!(store.reclaim_cache(store.current_epoch(), keys), 2);
 }
 
 fn store_reclaims_cache_lowest_rank_first_and_spares_what_live_ones_read() {

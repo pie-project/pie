@@ -357,8 +357,25 @@ async fn evict(planner: Arc<ResidencyPlanner>, pid: ProcessId) {
             return;
         }
     };
-    let rs = stores.rs.lock().unwrap().prepare_suspend(&rs_working_sets);
+    let (rs, rs_short) = {
+        let mut store = stores.rs.lock().unwrap();
+        let rs = store.prepare_suspend(&rs_working_sets);
+        let short = if rs.is_none() {
+            store.suspend_short(&rs_working_sets)
+        } else {
+            Default::default()
+        };
+        (rs, short)
+    };
     if kv.is_none() && rs.is_none() {
+        if !rs_short.is_zero() {
+            // The host lacks rows for its state: nothing moves and nothing
+            // is dropped; the head stays parked and the host is short.
+            tracing::debug!(pid = %pid, %rs_short, "planner: eviction short of host rows");
+            planner.note_host_short(rs_short);
+            planner.eviction_failed_host_swap_full(pid);
+            return;
+        }
         tracing::debug!(pid = %pid, "planner: eviction found nothing reclaimable");
         planner.eviction_found_nothing(pid);
         return;

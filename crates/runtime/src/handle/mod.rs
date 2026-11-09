@@ -16,7 +16,7 @@ pub(crate) mod snapshot;
 mod table;
 
 pub(crate) use lease::{Bag, Kind, Lease, Moved, enter};
-pub(crate) use table::{Landing, Table, state_room};
+pub(crate) use table::{Landing, Table};
 
 use client_api::{HandleErrorCode, HandleName};
 

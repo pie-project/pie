@@ -138,14 +138,6 @@ impl Held {
         }
     }
 
-    /// Whether its next write takes state it does not hold yet.
-    pub(super) fn shares_state(&self) -> bool {
-        self.parts().rs.as_ref().is_some_and(|rs| {
-            let stores = store_registry::get(rs.model, rs.engine);
-            stores.rs.lock().unwrap().shares_state(rs.id)
-        })
-    }
-
     fn leave_planner(&self) {
         self.residency.lock().unwrap().kv_working_sets.clear();
         self.residency.lock().unwrap().rs_working_sets.clear();

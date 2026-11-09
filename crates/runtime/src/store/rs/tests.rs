@@ -44,6 +44,7 @@ fn tests_every_case() {
     idle_snapshots_go_in_retention_order();
     a_checkpoint_past_a_step_goes_first();
     a_suspend_parks_private_slots_on_host_and_restore_brings_them_back();
+    a_suspend_short_of_host_rows_moves_and_drops_nothing();
     a_window_is_a_ring_of_pages_anchored_at_its_commit();
     a_checkpoint_resumes_a_fresh_working_set();
     a_snapshot_resumes_at_its_row();
@@ -247,9 +248,42 @@ fn a_suspend_parks_private_slots_on_host_and_restore_brings_them_back() {
         slots(1),
         "a checkpoint is no sharer"
     );
-    let txn = s.prepare_suspend(&set(ws)).expect("the checkpoint yields");
-    assert!(!s.has_checkpoint(&[1; 32]));
+    let txn = s
+        .prepare_suspend(&set(ws))
+        .expect("the checkpoint goes along");
+    assert!(!s.has_checkpoint(&[1; 32]), "not read while it moves");
     assert_eq!(s.commit_suspend(txn), slots(1));
+    assert!(
+        !s.has_checkpoint(&[1; 32]),
+        "parked with its set: kept, but not read from the host"
+    );
+    assert_eq!(s.reclaim_cache(|_| 0), 0, "it frees nothing on the device");
+    let mut granted = s.reserve(slots(1)).unwrap();
+    let txn = s.prepare_restore(&set(ws), &mut granted).unwrap();
+    assert_eq!(s.commit_restore(txn), 1);
+    assert!(s.has_checkpoint(&[1; 32]), "back with its set");
+    assert_eq!(
+        s.host_available(),
+        RsUnits { slots: 2, pages: 2 },
+        "one slot came back for both"
+    );
+}
+
+fn a_suspend_short_of_host_rows_moves_and_drops_nothing() {
+    let mut s = RsStore::new(10, 0, 0, 0);
+    let set = |ws| HashSet::from([ws]);
+    let ws = s.create_working_set(geom());
+    write_state(&mut s, ws);
+    assert!(s.checkpoint(ws, [7; 32], None).unwrap());
+    let before = s.available();
+    assert!(s.prepare_suspend(&set(ws)).is_none());
+    assert_eq!(
+        s.suspend_short(&set(ws)),
+        slots(1),
+        "a host row for its slot"
+    );
+    assert!(s.has_checkpoint(&[7; 32]), "nothing dropped");
+    assert_eq!(s.available(), before, "nothing moved");
 }
 
 fn idle_snapshots_go_in_retention_order() {
@@ -269,6 +303,12 @@ fn idle_snapshots_go_in_retention_order() {
         "the lower-ranked, though newer"
     );
     assert!(s.has_checkpoint(&[1; 32]), "the higher-ranked stays");
+    assert_eq!(
+        s.reclaim_droppable(rank),
+        0,
+        "the runtime leaves what a policy keyed above 0"
+    );
+    assert!(s.has_checkpoint(&[1; 32]));
     assert_eq!(s.discard_cache(high), 1);
     assert_eq!(s.reclaim_cache(rank), 0);
 }
@@ -323,7 +363,14 @@ fn a_checkpoint_is_cache_and_goes_when_idle() {
     write_state(&mut s, other);
     assert!(s.checkpoint(other, o, None).unwrap());
     assert_eq!(s.group_demand(other, true, false, None), Ok(slots(1)));
-    assert_eq!(s.yield_checkpoints(&[other]), 1);
+    let kept = |_: Option<crate::inferlet::process::ProcessId>| 1;
+    assert_eq!(
+        s.reclaim_sharing(&[other], kept),
+        0,
+        "a checkpoint a policy keeps is not the runtime's to drop"
+    );
+    assert!(s.has_checkpoint(&o));
+    assert_eq!(s.reclaim_sharing(&[other], |_| 0), 1);
     assert_eq!(
         s.group_demand(other, true, false, None),
         Ok(slots(0)),

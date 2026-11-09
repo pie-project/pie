@@ -1723,7 +1723,9 @@ pub(crate) fn stamp_lane_slots(
     Ok(())
 }
 
-const SEAT_WAIT: std::time::Duration = std::time::Duration::from_secs(10);
+/// Also how long a planner waiter stands short of room only the policy can
+/// make before it fails.
+pub(crate) const SEAT_WAIT: std::time::Duration = std::time::Duration::from_secs(10);
 
 pub(crate) async fn seat_lane_slots(
     req: &mut crate::engine::FireRequest,

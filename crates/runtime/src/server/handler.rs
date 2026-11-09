@@ -488,10 +488,9 @@ impl Session {
             return;
         }
 
-        let room = crate::handle::state_room;
         let lease = match self
             .handles
-            .lend(self.id, handles, returns, session.as_deref(), room)
+            .lend(self.id, handles, returns, session.as_deref())
         {
             Ok(lease) => lease,
             Err(why) => {

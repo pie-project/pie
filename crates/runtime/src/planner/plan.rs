@@ -46,6 +46,12 @@ enum Board {
 
 impl ResidencyPlanner {
     pub fn plan(self: &Arc<Self>) {
+        self.plan_once();
+        // A waiter served or gone lacks nothing now.
+        self.report_short();
+    }
+
+    fn plan_once(self: &Arc<Self>) {
         if self.pause_due.swap(false, Ordering::AcqRel) {
             self.pause_held();
         }
@@ -129,7 +135,7 @@ impl ResidencyPlanner {
                     if self.port.grow_rs(need) {
                         return;
                     }
-                    if self.reclaim_idle_once() || self.yield_head_checkpoints() {
+                    if self.reclaim_idle_once() || self.reclaim_head_sharing() {
                         continue;
                     }
                     fund_by_eviction
