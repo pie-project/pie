@@ -1164,7 +1164,9 @@ pub(crate) fn tile_projection(
     use crate::linear::moe_gmm::{Gmm, Orient};
     let (m, k) = (f.dims(x)[0], f.dims(x)[1]);
     let n = f.dims(codes)[0];
-    if !tuning.moe_gmm() || k % TILE != 0 {
+    // Past a few hundred rows the kernel's 128-deep dots leave the MXU half
+    // idle: a prompt's rows read the weight decoded once instead.
+    if !tuning.moe_gmm() || k % TILE != 0 || m > 512 {
         return Ok(None);
     }
     let tm = (((m + 15) / 16) * 16).min(tuning.moe_gmm_tm.max(16) * 16).max(16);

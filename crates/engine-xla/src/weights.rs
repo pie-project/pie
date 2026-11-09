@@ -687,6 +687,14 @@ fn gemm_only(
     };
     let mut other = std::collections::BTreeSet::new();
     let mut inputs = Vec::new();
+    let fp8_bank = |op: &Linear| match op {
+        Linear::MoeSelect {
+            bank,
+            quantized: true,
+            ..
+        } if param_of(*bank).is_some_and(|p| trace.params[p].dtype == Dtype::E4m3) => Some(*bank),
+        _ => None,
+    };
     for node in &trace.nodes {
         inputs.clear();
         node.op.inputs(&mut inputs);
@@ -705,21 +713,19 @@ fn gemm_only(
                     logits: true,
                     ..
                 },
-            ) => Some(*w),
+            ) => vec![*w],
             // A routed block-FP8 bank: its codes land `[K, E·N]` like a gemm
-            // weight's (below).
-            Operation::Linear(Linear::MoeSelect {
-                bank,
-                quantized: true,
-                ..
-            }) if param_of(*bank).is_some_and(|p| trace.params[p].dtype == Dtype::E4m3) => {
-                Some(*bank)
-            }
-            _ => None,
+            // weight's (below), as the grouped-matmul kernel reads them.
+            Operation::Linear(op @ Linear::MoeSelect { .. }) => fp8_bank(op).into_iter().collect(),
+            Operation::Fused(poem_ir::Fused::MoeExperts { select, down, .. }) => [select, down]
+                .into_iter()
+                .filter_map(|op| fp8_bank(op))
+                .collect(),
+            _ => Vec::new(),
         };
         for &v in &inputs {
             let Some(p) = param_of(v) else { continue };
-            if Some(v) == w {
+            if w.contains(&v) {
                 out.insert(p);
             } else {
                 other.insert(p);

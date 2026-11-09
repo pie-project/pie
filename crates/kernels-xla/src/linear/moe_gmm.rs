@@ -115,8 +115,8 @@ impl Gmm {
     fn cut(&self) -> Built<Cut> {
         let (k, n, e) = (self.k, self.n, self.experts);
         // An e2m1 block counts a byte a code: its bf16 copy in VMEM is what
-        // bounds it; a block-FP8 one its f32 widening.
-        let per = if self.tile { 4 } else { self.wbytes().max(1) };
+        // bounds it; a block-FP8 one its bf16 slices.
+        let per = if self.tile { 2 } else { self.wbytes().max(1) };
         let fits = |cols: i64| k * cols * per <= self.block_bytes;
         let blocked = (1..=n / 128)
             .rev()
@@ -350,7 +350,7 @@ impl Gmm {
         let scaling = if self.scaled {
             2 * groups * cols + 4 * k * cols
         } else if self.tile {
-            2 * 4 * groups * cols + 4 * k * cols
+            2 * 4 * groups * cols + 4 * tm * cols
         } else {
             0
         };
@@ -376,19 +376,20 @@ impl Gmm {
             let nt = b.load(blk.grid.prefetch[1], &[zero])?;
             let live = b.cmpi(ICmp::Slt, blk.grid.ids[1], nt)?;
             b.when(live, |b| {
-                let x = b.vload_all(blk.ins[0])?;
-                let w = b.vload_all(blk.ins[1])?;
-                let w = if self.scaled {
-                    let s = b.vload_all(blk.ins[2])?;
-                    scale_codes(b, w, s, groups, cols)?
-                } else if self.tile {
-                    let s = b.vload_all(blk.ins[2])?;
-                    tile_codes(b, w, s, groups, cols)?
+                let y = if self.tile {
+                    tile_dot(b, &blk, tm, groups, cols)?
                 } else {
-                    b.convert_f(w, Elem::Bf16)?
+                    let x = b.vload_all(blk.ins[0])?;
+                    let w = b.vload_all(blk.ins[1])?;
+                    let w = if self.scaled {
+                        let s = b.vload_all(blk.ins[2])?;
+                        scale_codes(b, w, s, groups, cols)?
+                    } else {
+                        b.convert_f(w, Elem::Bf16)?
+                    };
+                    let acc = b.splat_f(&[tm, cols], Elem::F32, 0.0)?;
+                    b.matmul(x, w, acc, orient == Orient::NMajor)?
                 };
-                let acc = b.splat_f(&[tm, cols], Elem::F32, 0.0)?;
-                let y = b.matmul(x, w, acc, orient == Orient::NMajor)?;
                 let y = if self.bias {
                     use crate::mosaic::MTy;
                     let r = blk.ins[blk.ins.len() - 1];
@@ -417,19 +418,35 @@ impl Gmm {
     }
 }
 
-/// e4m3 codes `w` (`[K, cols]`) as bf16, each times its 128-code block's
-/// f32 factor (`s`: `[K / 128, cols]`), the product rounded once.
-fn tile_codes(b: &mut Body, w: V, s: V, groups: i64, cols: i64) -> Built<V> {
+/// A tile's rows against block-FP8 codes (`ins[1]`, `[K, cols]` e4m3) under
+/// f32 factors a 128 of K (`ins[2]`, `[K / 128, cols]`): a dot a 128-code
+/// block of K over the codes as bf16 (exact), its f32 partial scaled by the
+/// block's factors and summed, f32 `[tm, cols]`. Only a convert widens the
+/// weight; the VPU scales the partials, not every weight (widening each to
+/// f32 under its factor ran the kernel at 0.6 TB/s on v6e).
+fn tile_dot(b: &mut Body, blk: &crate::mosaic::Blocks, tm: i64, groups: i64, cols: i64) -> Built<V> {
     use crate::mosaic::MTy;
-    let k = groups * 128;
-    let f32s = |d: &[i64]| MTy::Vector(d.to_vec(), Elem::F32);
-    let w = b.convert_f(w, Elem::Bf16)?;
-    let w = b.convert_f(w, Elem::F32)?;
-    let s = b.op("vector.shape_cast", &[s], "", &[f32s(&[groups, 1, cols])])[0];
-    let s = b.op("vector.broadcast", &[s], "", &[f32s(&[groups, 128, cols])])[0];
-    let s = b.op("vector.shape_cast", &[s], "", &[f32s(&[k, cols])])[0];
-    let w = b.mulf(w, s)?;
-    b.convert_f(w, Elem::Bf16)
+    let zero = b.index(0);
+    let mut acc = b.splat_f(&[tm, cols], Elem::F32, 0.0)?;
+    for g in 0..groups {
+        let at = b.index(g * 128);
+        let x = b.vload(blk.ins[0], &[zero, at], &[tm, 128])?;
+        let w = b.vload(blk.ins[1], &[at, zero], &[128, cols])?;
+        let w = b.convert_f(w, Elem::Bf16)?;
+        let z = b.splat_f(&[tm, cols], Elem::F32, 0.0)?;
+        let p = b.matmul(x, w, z, false)?;
+        let row = b.index(g);
+        let s = b.vload(blk.ins[2], &[row, zero], &[1, cols])?;
+        let s = b.op(
+            "vector.broadcast",
+            &[s],
+            "",
+            &[MTy::Vector(vec![tm, cols], Elem::F32)],
+        )[0];
+        let p = b.mulf(p, s)?;
+        acc = b.addf(acc, p)?;
+    }
+    Ok(acc)
 }
 
 /// e2m1 codes `w` (`[K, cols]`, as `u4`) as bf16, each times
