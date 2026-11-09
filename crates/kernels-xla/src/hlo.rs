@@ -1640,6 +1640,34 @@ impl Func {
         self.put_rows_hinted(table, ids, rows, combine, false)
     }
 
+    /// Rows set into two tables of as many rows under one set of indices: one
+    /// variadic scatter, so the per-index work is done once for both (the
+    /// two-table form of `put_rows_hinted`).
+    pub fn put_rows_pair(
+        &mut self,
+        tables: [Val; 2],
+        ids: Val,
+        rows: [Val; 2],
+        unique: bool,
+    ) -> Built<[Val; 2]> {
+        let n = self.dims(ids)[0];
+        let ids = self.reshape(ids, &[n, 1])?;
+        let (ta, tb) = (self.ty(tables[0]).clone(), self.ty(tables[1]).clone());
+        let (sa, sb) = (Ty::scalar(ta.elem), Ty::scalar(tb.elem));
+        let attrs = format!(
+            "scatter_dimension_numbers = #stablehlo.scatter<update_window_dims = [1], inserted_window_dims = [0], input_batching_dims = [], scatter_indices_batching_dims = [], scatter_dims_to_operand_dims = [0], index_vector_dim = 1>, indices_are_sorted = false, unique_indices = {unique}"
+        );
+        let out = self.op_region(
+            "scatter",
+            &[tables[0], tables[1], ids, rows[0], rows[1]],
+            &[sa.clone(), sb.clone(), sa, sb],
+            |_, b| Ok(vec![b[2], b[3]]),
+            &attrs,
+            vec![ta, tb],
+        )?;
+        Ok([out[0], out[1]])
+    }
+
     /// `put_rows` with the distinct-indices hint (see `scatter_hinted`).
     pub fn put_rows_hinted(
         &mut self,

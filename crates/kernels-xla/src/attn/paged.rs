@@ -2299,6 +2299,34 @@ pub fn logit_softcap(f: &mut Func, x: Operand, cap: f32) -> Result<Val, Error> {
     Ok(f.scale(v, f64::from(cap))?)
 }
 
+/// Each row's slot in a plane of `slots` rows (`page · page_size + off`), or
+/// a distinct slot past the plane (dropped) for a row outside it.
+fn slot_of(
+    f: &mut Func,
+    page: Val,
+    off: Val,
+    page_size: i32,
+    slots: u32,
+    n: u32,
+) -> Result<Val, Error> {
+    let ps = i64::from(page_size);
+    let slots = i64::from(slots);
+    let pages = slots / ps;
+    let a = cmp_i(f, Cmp::Ge, page, 0)?;
+    let b = cmp_i(f, Cmp::Lt, page, pages)?;
+    let c = cmp_i(f, Cmp::Ge, off, 0)?;
+    let d = cmp_i(f, Cmp::Lt, off, ps)?;
+    let ok = f.and(a, b)?;
+    let ok = f.and(ok, c)?;
+    let ok = f.and(ok, d)?;
+    let s = with_i(f, page, ps, Func::mul)?;
+    let s = f.add(s, off)?;
+    let f0 = f.like_i(s, slots);
+    let io = f.iota(Elem::I32, &[i64::from(n)], 0);
+    let far = f.add(f0, io)?;
+    Ok(f.select(ok, s, far)?)
+}
+
 /// Scatters `src` rows into `plane` at `write_page · page_size +
 /// write_offset`, for each `(src, plane)`; a row whose page or offset is out
 /// of range (a padded row) is dropped. The new planes, in order; a plane
@@ -2317,6 +2345,17 @@ pub(crate) fn scatter_slots(
     let n = first.rows;
     let page = read_rows_i32(f, op, write_page, n)?;
     let off = read_rows_i32(f, op, write_offset, n)?;
+    // Keys and values into two planes of as many slots: one scatter for both.
+    if let [(k, keys), (v, values)] = *pairs
+        && keys.val != values.val
+        && keys.rows == values.rows
+    {
+        let slot = slot_of(f, page, off, page_size, keys.rows, n)?;
+        let kr = f.convert(k.val, f.elem(keys.val));
+        let vr = f.convert(v.val, f.elem(values.val));
+        let [a, b] = f.put_rows_pair([keys.val, values.val], slot, [kr, vr], true)?;
+        return Ok(vec![a, b]);
+    }
     let mut out: Vec<Val> = Vec::with_capacity(pairs.len());
     for (at, &(src, plane)) in pairs.iter().enumerate() {
         let ps = i64::from(page_size);
