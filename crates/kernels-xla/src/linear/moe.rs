@@ -2443,11 +2443,22 @@ pub fn experts(
     let hidden = f.mul(hidden, wb)?;
     let hidden = f.convert(hidden, Elem::Bf16);
     let down_rows = tiles_of(f, dn, &down_bank, &sorted, hidden)?;
+    let n = i64::from(routed.width);
+    if rows * t > tuning.moe_costs.onehot_cells {
+        // Each pair's (weighted) row picked back out and summed per token.
+        let dest = dest(f, &sorted, p)?;
+        let pairs = f.take_rows(down_rows, dest)?;
+        let keep = f.broadcast(valid, &[p, n], &[0])?;
+        let none = f.const_f(Elem::Bf16, 0.0, &[p, n]);
+        let pairs = f.select(keep, pairs, none)?;
+        let v = f.convert(pairs, Elem::F32);
+        let v = f.reshape(v, &[t, up_fan.top_k, n])?;
+        return Ok(Some(f.reduce(v, &[1], Fold::Sum)?));
+    }
     // Each token's rows summed by one dot against the rows' tokens, one-hot:
     // picking each pair's row back out was a row gather (v6e, Gemma-4-26B's
     // 32-expert cut, 1792 tokens: 0.44 ms a layer, and 0.1 ms to sum them).
     // Rows of tiles past the count are unwritten: zeroed, not read.
-    let n = i64::from(routed.width);
     let live = {
         let tt = f.const_i(Elem::I32, up.tm, &[1]);
         let end = f.mul(sorted.nt, tt)?;

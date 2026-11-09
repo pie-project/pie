@@ -86,6 +86,8 @@ moe_costs! {
         "The rate one dot over the whole bank streams at, in bytes a ns.";
     MoeWholePartialFs = "kernel.moe.cost.whole_partial_fs", 0..=1_000_000, 5_500,
         "What each picked partial of that dot adds, in fs.";
+    MoeOnehotMi = "kernel.moe.cost.onehot_mi", 0..=4096, 64,
+        "Up to this many Mi cells of sorted rows by tokens, a routed MLP sums each token's rows by one dot against them, one-hot; past it, it picks them out.";
 }
 
 /// How a quantized projection's rows meet its group factors.
@@ -162,6 +164,7 @@ pub fn register(registry: &mut Registry) {
         .add::<MoeSliceBytesPerNs>()
         .add::<MoeWholeBytesPerNs>()
         .add::<MoeWholePartialFs>()
+        .add::<MoeOnehotMi>()
         .add::<QuantDecode>()
         .add::<AttnPerRowMax>()
         .add::<AttnBudgetMi>()
@@ -182,6 +185,7 @@ pub struct MoeCosts {
     pub slice_bytes_per_ns: i64,
     pub whole_bytes_per_ns: i64,
     pub whole_partial_fs: i64,
+    pub onehot_cells: i64,
 }
 
 /// The most `rows · groups` of a packed bank and the most rows of a native
@@ -247,6 +251,7 @@ impl Tuning {
             slice_bytes_per_ns: 1_200,
             whole_bytes_per_ns: 1_450,
             whole_partial_fs: 5_500,
+            onehot_cells: 64 << 20,
         },
         grouped: Grouped {
             max_cells: 2048,
@@ -285,6 +290,7 @@ impl Tuning {
                 slice_bytes_per_ns: n(profile.get::<MoeSliceBytesPerNs>().0),
                 whole_bytes_per_ns: n(profile.get::<MoeWholeBytesPerNs>().0),
                 whole_partial_fs: n(profile.get::<MoeWholePartialFs>().0),
+                onehot_cells: n(profile.get::<MoeOnehotMi>().0) << 20,
             },
             grouped: match *profile.get::<QuantDecode>() {
                 QuantDecode::Grouped {
