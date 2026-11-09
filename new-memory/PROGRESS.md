@@ -58,3 +58,23 @@ The `new-memory/` directory is bookkeeping and is removed before anything lands 
 - Accepted decisions: reserved chunks carry explicit positions; degenerate `chunk_bytes` is nominal (use per-shape
   `slot_bytes` for byte accounting there); `ChunkTable::apply` swaps (runtime must only move onto physical chunks of
   free logical chunks); `commit_segments(n)` means "back the first n segments".
+
+### M4 — 2026-11-09: P6 Metal degenerate kernels merged
+- `sc/p6-metal-degenerate` (741a6ebd6, 07335a451, 719cd4c13), verified on the Mac Studio (M1 Max, macOS 27;
+  shaders compile at runtime from source, so the missing `xcrun metal` is not a blocker).
+- KV: `kernels/prim/kv_page.h`; every paged kernel takes `k_page_stride, v_page_stride, k_offset, v_offset`;
+  `KvPool{page_stride, plane_offset}`, `paged_densely()` = today. State: `kernels/prim/state_map.h`, a u64 table
+  (slot_stride, chunk_slots, chunk_stride, seg_chunks, piece_atoms, pieces, segment bases) passed to every state
+  kernel; pieces along heads (GDN/KDA/Mamba-2), channels (conv, multiple of 4 on the 4-channel path) or frames
+  (frame cache); `StateMap::whole(stride)` = today. Names align with `engine::chunk` (E1).
+- Bitwise: new `a_scattered_kv_pool_is_the_dense_one` (bf16 d64-512, 8-bit, packed 4-bit; decode, lse, tiled, MPP,
+  prompt arbitration, split; 256B poison) and `a_scattered_state_bank_is_the_slab` (GDN, KDA, Mamba-2, conv, frame
+  cache; pieces 2-4, reversed segments, NaN poison) — all identical. Suites equal to base: kernels-metal 1 pre-existing
+  failure (ANE service over ssh), engine-metal 64 pass / 3 pre-existing failures.
+- Not covered by scattered tests yet (default layout only): MLA, indexer, compressor, score capture, verify kernels,
+  n-gram window.
+- Metal segment/governor design for the pool switch: segment = run of one placement-sparse buffer (multiple of the
+  16MiB heap, 256KiB tiles); commit via `elastic::map_all` on the Metal 4 mapping queue one segment ahead; return =
+  evacuate the top segment then `shrink_all` after frames drain; target bytes -> segment count (round down on fall,
+  one segment per calm tick up); Critical / refused map -> evacuate+release top segment; floor pinned in segment 0.
+- Linux check: `cargo check` kernels-metal, engine-metal, runtime on new-memory.
