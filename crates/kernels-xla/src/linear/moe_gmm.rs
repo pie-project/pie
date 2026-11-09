@@ -164,19 +164,6 @@ impl Gmm {
         })
     }
 
-    /// Where expert `e`'s outputs start in its window: the kernel turns each
-    /// row's lanes by it, so every row's outputs start at column 0.
-    fn lags(&self, width: i64) -> Vec<i64> {
-        (0..self.experts)
-            .map(|e| e * self.n - self.window_start(e, width))
-            .collect()
-    }
-
-    /// The first column of expert `e`'s window.
-    fn window_start(&self, e: i64, width: i64) -> i64 {
-        (e * self.n / 128 * 128).min(self.experts * self.n - width)
-    }
-
     /// The bank operand's shape as the kernel takes it.
     #[must_use]
     pub fn bank_dims(&self) -> [i64; 2] {
@@ -558,9 +545,6 @@ impl Gmm {
                 // The expert's outputs turned to column 0 in VMEM (gathering
                 // the rows at a per-row column offset afterwards relays every
                 // row out: v6e gpt-oss, 0.2 ms a layer at 4096 tokens).
-                let mut lags = self.lags(width);
-                lags.sort_unstable();
-                lags.dedup();
                 let ex = expert(b, &blk.grid)?;
                 let nn = b.i32(n);
                 let col = b.muli(ex, nn)?;
@@ -570,24 +554,17 @@ impl Gmm {
                 let top = b.i32(e * n - width);
                 let start = b.minsi(start, top)?;
                 let lag = b.subi(col, start)?;
-                for o in lags {
-                    let at = b.i32(o);
-                    let here = b.cmpi(ICmp::Eq, lag, at)?;
-                    b.when(here, |b| {
-                        let y = if o == 0 {
-                            y
-                        } else {
-                            b.op(
-                                "tpu.rotate",
-                                &[y],
-                                &format!("amount = {} : si32, dimension = 1 : si32", width - o),
-                                &[MTy::Vector(vec![tm, width], Elem::F32)],
-                            )[0]
-                        };
-                        let y = b.convert_f(y, self.out)?;
-                        b.vstore_all(y, blk.outs[0])
-                    })?;
-                }
+                let wide = b.i32(width);
+                let by = b.subi(wide, lag)?;
+                let by = b.remsi(by, wide)?;
+                let y = b.op(
+                    "tpu.dynamic_rotate",
+                    &[y, by],
+                    "dimension = 1 : si32",
+                    &[MTy::Vector(vec![tm, width], Elem::F32)],
+                )[0];
+                let y = b.convert_f(y, self.out)?;
+                b.vstore_all(y, blk.outs[0])?;
                 Ok(())
             })
         })
@@ -699,9 +676,8 @@ mod tests {
         // down: 22.5 lane tiles an expert, one 23-tile window each.
         let d = gmm(2880, Orient::KMajor);
         assert_eq!(d.cut().unwrap(), Cut::Element { width: 2944 });
-        let lags = d.lags(2944);
-        assert_eq!(&lags[..3], &[0, 64, 0]);
-        assert_eq!(lags[31], 64);
-        assert!(d.kernel().unwrap().module.contains("element_window"));
+        // Each window's row turned by its lag (0 or 64 lanes) to column 0.
+        let module = d.kernel().unwrap().module;
+        assert!(module.contains("element_window") && module.contains("dynamic_rotate"));
     }
 }
