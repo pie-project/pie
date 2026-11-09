@@ -180,12 +180,29 @@ impl Run<'_> {
                 }
                 None => {
                     let plane = self.tensor(*table);
-                    let guard = plane.rows.min(*vocab);
+                    let ids = self.tensor(*ids);
+                    let width = self.tensor(*y).width / ids.width.max(1);
+                    // a gather-only table whose rows do not tile 128 lanes lands
+                    // folded, `[V/f, f·row]` (`crate::weights::gather_only`)
+                    let fold =
+                        if width > 0 && plane.width > width && plane.width.is_multiple_of(width) {
+                            plane.width / width
+                        } else {
+                            1
+                        };
+                    let guard = plane.rows.saturating_mul(fold).min(*vocab);
                     crate::lower::lower(self.ctx(), |l| {
-                        let ids_v = l.read(self.tensor(*ids))?;
+                        let ids_v = l.read(ids)?;
                         let table_v = l.read(plane)?;
                         let o_y = self.tensor(*y);
-                        let v = gather::embed_concat(l.f(), ids_v, table_v, guard, o_y.landing())?;
+                        let v = gather::embed_concat(
+                            l.f(),
+                            ids_v,
+                            table_v,
+                            guard,
+                            fold,
+                            o_y.landing(),
+                        )?;
                         l.land(o_y, v)
                     })
                 }

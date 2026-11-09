@@ -426,6 +426,7 @@ impl Engine for Vulkan {
                 one_frame_when_short: false,
                 seated_first: false,
                 seat_to_end: false,
+                seat_spread: false,
                 buffer_pages: shell.buffer_pages(),
                 host_state_slots: shell.parked_state_slots(),
                 host_buffer_pages: shell.parked_buffer_pages(),

@@ -1102,7 +1102,13 @@ impl Shell {
             pad.mixed_host_rung
         };
         let want_host = pad.rung(by[host].2 + 1).max(row_lanes);
+        // A recurrent layer's chunked scan lays out a chunk for every lane,
+        // padding lanes too: a prefill there keeps its lanes at their rung
+        // (v6e, Qwen3.6-35B-A3B's 557-token Raw prompt: 16 lanes laid out 26
+        // chunks of 64 rows, 2 lanes 7 of 128; 8.3k -> 10.3k tok/s).
+        let lean = self.has_state();
         let can_wide = !mixed
+            && !lean
             && top >= 64
             && self.budgets.tokens.max_lanes >= want_host
             && real_rows + (want_host - by[host].2) <= top;
@@ -1126,7 +1132,8 @@ impl Shell {
         let raw_bucket = poem_exec::fire::rung_of(buckets, (real_rows + 1).max(pad.prefill_floor));
         let host_floor = if can_wide {
             want_host
-        } else if mixed || real_rows + pad.mixed_host_rung.saturating_sub(by[host].2) <= raw_bucket
+        } else if mixed
+            || (!lean && real_rows + pad.mixed_host_rung.saturating_sub(by[host].2) <= raw_bucket)
         {
             pad.mixed_host_rung
         } else {

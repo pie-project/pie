@@ -239,7 +239,7 @@ impl Weights {
         // `gather_only`.
         let mut folded: BTreeMap<usize, (u64, u64)> = BTreeMap::new();
         for at in gather_only(trace, &codes_planes, engine) {
-            let Some(pairing) = pairings.get(trace.params[at].name.as_str()) else {
+            let Some(&pairing) = pairings.get(trace.params[at].name.as_str()) else {
                 let (rows, width) = rectangle(&trace.params[at].shape);
                 folded.insert(at, fold_of(rows, width));
                 continue;
@@ -342,9 +342,12 @@ impl Weights {
                     });
                 }
                 let (rows, width) = shape_of(at);
-                // A pre-scaled mxfp4 bank is one e5m2 weight per code.
+                // A pre-scaled mxfp4 bank is one e5m2 weight per code; an i64
+                // table two u32 words per value.
                 let width = if stored[at] == p.dtype {
                     width
+                } else if p.dtype == Dtype::I64 {
+                    width * 2
                 } else {
                     kernels_xla::pack::codes_per_row(p.dtype, width).unwrap_or(width)
                 };
@@ -833,35 +836,24 @@ fn gather_only(
         _ => None,
     };
     let mut other = std::collections::BTreeSet::new();
-    let mut joined = std::collections::BTreeSet::new();
     let mut inputs = Vec::new();
     for node in &trace.nodes {
         inputs.clear();
         node.op.inputs(&mut inputs);
-        if let Operation::Gather(Gather::Embed {
-            table,
-            concat: true,
-            ..
-        }) = &node.op
-        {
-            joined.extend(param_of(*table));
-        }
         let table = match &node.op {
-            Operation::Gather(
-                Gather::Embed {
-                    table,
-                    weights: None,
-                    scales: None,
-                    concat: false,
-                    ..
-                }
-                | Gather::Embed {
-                    table,
-                    weights: None,
-                    concat: true,
-                    ..
-                },
-            ) => Some(*table),
+            Operation::Gather(Gather::Embed {
+                table,
+                weights: None,
+                scales: None,
+                concat: false,
+                ..
+            }) => Some(*table),
+            Operation::Gather(Gather::Embed {
+                table,
+                weights: None,
+                concat: true,
+                ..
+            }) => Some(*table),
             _ => None,
         };
         for &v in &inputs {
@@ -880,19 +872,20 @@ fn gather_only(
     }
     out.retain(|&p| {
         let param = &trace.params[p];
-        // A bf16 table whose rows are not whole lane tiles lands column-major
-        // too (gpt-oss's 2880-wide embedding: a 1.9 ms relayout a fire).
-        let dense = param.dtype == Dtype::Bf16
-            && !codes.contains(&p)
-            && !joined.contains(&p)
+        // a dense table only gathers read whose rows do not tile 128 lanes:
+        // `[V, 160]` bf16 landed column-major, every fire relayouted all of it
+        // (9.4 GiB of temporaries for the 6 GiB Qwen3.8-Flash-Next mini's
+        // n-gram table; gpt-oss's 2880-wide embedding, 1.9 ms a fire)
+        let dense = !codes.contains(&p)
             && param.shape.len() == 2
-            && !param.shape[1].is_multiple_of(128);
+            && !param.shape[1].is_multiple_of(128)
+            && matches!(param.dtype, Dtype::Bf16 | Dtype::F16 | Dtype::F32);
         !other.contains(&p)
             && param.source != ParamSource::Registered
             && (dense
-                || (codes.contains(&p)
+                || codes.contains(&p)
                     && matches!(kernels_xla::pack::code_bits(param.dtype), Some(2 | 4))
-                    && param.dtype != Dtype::Mxfp4))
+                    && param.dtype != Dtype::Mxfp4)
     });
     out
 }
@@ -975,6 +968,12 @@ impl Landing<'_> {
     fn plain(&mut self, at: usize, bytes: &[u8]) -> Result<()> {
         let dtype = self.trace.params[at].dtype;
         let (rows, width) = (self.shape_of)(at);
+        if dtype == Dtype::I64 {
+            // An i64 table lands as its u32 words: a TPU splits every s64
+            // array a program reads into its halves, the whole table every
+            // fire (DeepSeek-V4's hash routes: 1.6 ms of a 20 ms v6e step).
+            return self.upload(at, Dtype::U32, width * 2, bytes);
+        }
         if self.tied_gemm.contains(&at) {
             let t = transpose_2byte(bytes, rows as usize, width as usize);
             self.gemm_buffers.insert(
@@ -1174,7 +1173,7 @@ impl Weights {
         let codes_planes: std::collections::BTreeSet<usize> = pairings.keys().copied().collect();
         let mut folded: BTreeMap<usize, (u64, u64)> = BTreeMap::new();
         for at in gather_only(trace, &codes_planes, engine) {
-            let Some(pairing) = pairings.get(&at) else {
+            let Some(&pairing) = pairings.get(&at) else {
                 let (rows, width) = rectangle(&trace.params[at].shape);
                 folded.insert(at, fold_of(rows, width));
                 continue;
@@ -1189,7 +1188,17 @@ impl Weights {
                 folded.insert(plane, fold_of(rows, row));
             }
         }
-        let mut stored: Vec<Dtype> = trace.params.iter().map(|p| p.dtype).collect();
+        let mut stored: Vec<Dtype> = trace
+            .params
+            .iter()
+            .map(|p| {
+                if p.dtype == Dtype::I64 {
+                    Dtype::U32
+                } else {
+                    p.dtype
+                }
+            })
+            .collect();
         for (&at, pairing) in &pairings {
             if prescale && trace.params[at].dtype == Dtype::Mxfp4 && pairing.biases.is_none() {
                 stored[at] = Dtype::E5m2;
@@ -1233,6 +1242,8 @@ impl Weights {
                         let (rows, width) = shape_of(at);
                         let width = if stored[at] == p.dtype || folded.contains_key(&at) {
                             width
+                        } else if p.dtype == Dtype::I64 {
+                            width * 2
                         } else {
                             kernels_xla::pack::codes_per_row(p.dtype, width).unwrap_or(width)
                         };

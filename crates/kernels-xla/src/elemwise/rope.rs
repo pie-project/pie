@@ -75,6 +75,23 @@ impl Turn {
 pub(crate) fn take_cols(f: &mut Func, x: Val, idx: &[i64]) -> Result<Val, Error> {
     let dims = f.dims(x).to_vec();
     let last = dims.len() - 1;
+    // Adjacent pairs swapped (an interleaved rotation's partners): the two
+    // halves of each pair crossed, not a gather along the lanes.
+    let n = idx.len();
+    if n >= 2
+        && n.is_multiple_of(2)
+        && i64::try_from(n).ok() == dims.last().copied()
+        && idx.iter().enumerate().all(|(i, &p)| p == (i ^ 1) as i64)
+    {
+        let mut pairs = dims.clone();
+        pairs[last] = n as i64 / 2;
+        pairs.push(2);
+        let x2 = f.reshape(x, &pairs)?;
+        let lo = f.slice_axis(x2, last + 1, 0, 1)?;
+        let hi = f.slice_axis(x2, last + 1, 1, 2)?;
+        let swapped = f.concat(&[hi, lo], (last + 1) as i64)?;
+        return Ok(f.reshape(swapped, &dims)?);
+    }
     let mut runs: Vec<(i64, i64)> = Vec::new();
     for &i in idx {
         match runs.last_mut() {
@@ -114,6 +131,42 @@ pub(crate) fn turn(f: &mut Func, x: Val, pos: Val, t: &Turn) -> Result<Val, Erro
     let unit = t.unit as i64;
     let groups = width / unit;
     let x3 = f.reshape(x, &[rows, groups, unit])?;
+    // Only the columns the table turns go through it (a 64-wide rope tail
+    // of a 512-wide head: a lane gather and the sines over every column
+    // otherwise, 24.6 of a 171 ms DeepSeek-V4 prompt fire on a v5e).
+    let moved = |i: usize| t.sign[i] != 0.0;
+    if let (Some(a), Some(b)) = (
+        (0..t.unit).find(|&i| moved(i)),
+        (0..t.unit).rfind(|&i| moved(i)),
+    ) {
+        let b = b + 1;
+        let inside = t.partner[a..b]
+            .iter()
+            .all(|&p| (a as i64..b as i64).contains(&p));
+        if (a > 0 || b < t.unit) && inside {
+            let sub = Turn {
+                unit: b - a,
+                partner: t.partner[a..b].iter().map(|&p| p - a as i64).collect(),
+                sign: t.sign[a..b].to_vec(),
+                freq: t.freq.iter().map(|fq| fq[a..b].to_vec()).collect(),
+                mscale: t.mscale,
+            };
+            let mid = f.slice_axis(x3, 2, a as i64, b as i64)?;
+            let mid = f.reshape(mid, &[rows, groups * (b - a) as i64])?;
+            let mid = turn(f, mid, pos, &sub)?;
+            let mid = f.reshape(mid, &[rows, groups, (b - a) as i64])?;
+            let mut parts = Vec::with_capacity(3);
+            if a > 0 {
+                parts.push(f.slice_axis(x3, 2, 0, a as i64)?);
+            }
+            parts.push(mid);
+            if b < t.unit {
+                parts.push(f.slice_axis(x3, 2, b as i64, unit)?);
+            }
+            let out = f.concat(&parts, 2)?;
+            return Ok(f.reshape(out, &[rows, width])?);
+        }
+    }
     let mut ang: Option<Val> = None;
     for (axis, freq) in t.freq.iter().enumerate() {
         if freq.iter().all(|&f| f == 0.0) {

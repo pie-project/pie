@@ -110,6 +110,11 @@ pub struct PoolFacts {
     /// once and evict lanes the pools then run short for.
     #[serde(default)]
     pub seat_to_end: bool,
+    /// With `seat_to_end`, the engine would rather the starts the pools do
+    /// not hold to the end at once be spread over a life, so they finish
+    /// apart, than a wave start together and run to its end together.
+    #[serde(default)]
+    pub seat_spread: bool,
 }
 
 impl PoolFacts {

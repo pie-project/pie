@@ -172,10 +172,11 @@ pub struct Run<'c> {
     /// rows (`crate::rows`), and a readout-rowed value telling them.
     readout_rowed: (std::sync::Arc<Vec<bool>>, Option<ValueId>),
 
-    /// Index selections that list every key their rows see: the index pool's
-    /// page bound holds no more keys than the budget, so `attn.index_topk`
-    /// answers each row all of them, in order.
-    pub(crate) full_selections: Vec<ValueId>,
+    /// Index selections that list every key their rows see, and the ratio
+    /// they were ranked at: the index pool's page bound holds no more keys
+    /// than the budget, so `attn.index_topk` answers each row all of them,
+    /// in order.
+    pub(crate) full_selections: Vec<(ValueId, u32)>,
     /// Routed results the grouped-matmul kernel left in its tile order, by
     /// value, with the routes value and the span they were cut on: the next
     /// routed op on the same routes reads them as they are.
