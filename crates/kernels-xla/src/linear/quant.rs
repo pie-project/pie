@@ -492,7 +492,9 @@ pub(crate) fn contract_native(
 /// What a bank's planes decode as.
 #[derive(Clone, Copy)]
 pub(crate) enum Form<T = Operand> {
-    Affine { biases: T },
+    Affine {
+        biases: T,
+    },
     Mxfp4,
     /// e4m3 codes under one f32 factor a 128x128 block (a block-FP8
     /// release's weights as released): the scales plane is `[⌈n/128⌉, k/128]`.
@@ -566,7 +568,9 @@ pub(crate) fn planes<T: Stored>(
     let form = match w.biases {
         Some(b) => Form::Affine { biases: b },
         None if bits == 4 && group == 32 => Form::Mxfp4,
-        None if bits == 8 && i64::from(group) == TILE && w.codes.dtype() == Dtype::E4m3 => Form::Tile,
+        None if bits == 8 && i64::from(group) == TILE && w.codes.dtype() == Dtype::E4m3 => {
+            Form::Tile
+        }
         None => {
             return Err(refuse(
                 op,

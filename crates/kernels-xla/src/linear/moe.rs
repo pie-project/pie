@@ -54,7 +54,6 @@ use crate::tuning::{MoePath, Tuning};
 
 const MXFP4_BLOCK: u32 = 32;
 
-
 fn nonzero(op: &'static str, what: &str, v: u32) -> Result<u32, Error> {
     if v == 0 {
         return Err(refuse(op, format!("`{what}` is zero")));
@@ -1110,7 +1109,8 @@ fn gmm_spec(
     let scaled = mxfp4 && matches!(bank.codes, Codes::E2m1(_)) && elem == Elem::F4E2m1fn;
     // Block-FP8 codes, their f32 block factors beside them (the codes land
     // `[K, E·N]`: see engine-xla's `gemm_only`).
-    let tile = elem == Elem::F8E4m3fn && bank.factor.is_some() && matches!(bank.codes, Codes::Int(_));
+    let tile =
+        elem == Elem::F8E4m3fn && bank.factor.is_some() && matches!(bank.codes, Codes::Int(_));
     if off
         || (bank.factor.is_some() && !scaled && !tile)
         || !(matches!(bank.codes, Codes::Weights(_)) || scaled || tile)
@@ -1171,7 +1171,7 @@ pub(crate) fn tile_projection(
     if !tuning.moe_gmm() || k % TILE != 0 {
         return Ok(None);
     }
-    let tm = (((m + 15) / 16) * 16).min(512).max(16);
+    let tm = (((m + 15) / 16) * 16).clamp(16, 512);
     let tiles = (m + tm - 1) / tm;
     let spec = Gmm {
         tiles,
@@ -1843,6 +1843,8 @@ fn routed(
         // Qwen3.6-35B-A3B's 4 MiB experts: Raw decode 133 -> 176 tok/s).
         MoePath::Auto { .. }
             if p <= c.slice_pairs
+                // (a block-FP8 bank's pairs run the kernel: sliced, they
+                // would contract in XLA's group-batched dot)
                 && !grouped.is_some_and(|g| g.tile)
                 && ((fan.tokens == 1 && grouped.is_some())
                     || p * expert_bytes.max(c.slice_bytes) < bank_bytes) =>

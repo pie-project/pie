@@ -660,6 +660,11 @@ fn block_fp8_at(n: usize) {
     // The kernel's and the group-batched rows scale exact partials; the
     // decoded weight rounds to bf16, as the bf16 deployment holds it.
     eprintln!("block fp8, {n} rows");
-    assert_close(&b.read_f32(y), &gemm_at(&xs, &w, m, n, k, false), 1e-3, 1e-3);
+    assert_close(
+        &b.read_f32(y),
+        &gemm_at(&xs, &w, m, n, k, false),
+        1e-3,
+        1e-3,
+    );
     assert_close(&b.read_f32(yb), &gemm_ref(&xb, &w, big, n, k), 1e-2, 1e-2);
 }

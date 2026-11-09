@@ -73,9 +73,8 @@ pub struct Gmm {
     pub scaled: bool,
     /// An f32 factor per 128 codes of K follows the bank, as `[K / 128,
     /// E·N]` (`E·N`-minor e4m3 bank only, the factors of its 128x128 blocks
-    /// laid a column each): the codes widen to f32 in VMEM, take their
-    /// block's factor and round once to bf16, as the bf16 deployment holds
-    /// the weight.
+    /// laid a column each): each 128 codes of K contract on their own and
+    /// their partial takes its block's factors (`tile_dot`).
     pub tile: bool,
     /// A bf16 bias row per expert follows (`[E, 1, N]`, a blocked cut
     /// only), added to the f32 product before it rounds.
@@ -114,7 +113,6 @@ impl Gmm {
 
     fn cut(&self) -> Built<Cut> {
         let (k, n, e) = (self.k, self.n, self.experts);
-
         // An e2m1 block counts a byte a code: its bf16 copy in VMEM is what
         // bounds it; a block-FP8 one its bf16 slices.
         let per = if self.tile { 2 } else { self.wbytes().max(1) };
@@ -378,7 +376,7 @@ impl Gmm {
             let live = b.cmpi(ICmp::Slt, blk.grid.ids[1], nt)?;
             b.when(live, |b| {
                 let y = if self.tile {
-                    tile_dot(b, &blk, tm, groups, cols)?
+                    tile_dot(b, blk, tm, groups, cols)?
                 } else {
                     let x = b.vload_all(blk.ins[0])?;
                     let w = b.vload_all(blk.ins[1])?;
@@ -426,7 +424,13 @@ impl Gmm {
 /// code exact): widening them to bf16 on the VPU first holds a v6e to 0.87
 /// TB/s of codes, against 1.43 as they are; widening each to f32 under its
 /// factor, to 0.6.
-fn tile_dot(b: &mut Body, blk: &crate::mosaic::Blocks, tm: i64, groups: i64, cols: i64) -> Built<V> {
+fn tile_dot(
+    b: &mut Body,
+    blk: &crate::mosaic::Blocks,
+    tm: i64,
+    groups: i64,
+    cols: i64,
+) -> Built<V> {
     use crate::mosaic::MTy;
     let zero = b.index(0);
     let mut acc = b.splat_f(&[tm, cols], Elem::F32, 0.0)?;

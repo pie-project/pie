@@ -755,9 +755,10 @@ fn gemm_only(
             // 45 us a layer). It lands `[K, N]` with N padded to whole
             // 128-lane tiles (`crate::trace` slices the padding off).
             let (n, k) = bank_rectangle(param.dtype, &param.shape);
-            // Block-FP8 codes `[N, K]` land `[K, N]` too: the grouped dot over
-            // their 128-code blocks reads K-major codes at the DMA rate, and
-            // K-minor ones at half of it (v5e, a 6144x24576 projection).
+            // Block-FP8 codes `[N, K]` land `[K, N]` too, as the
+            // grouped-matmul kernel reads them (and XLA's group-batched dot
+            // over their 128-code blocks streams K-major codes at the DMA
+            // rate, K-minor ones at half of it: v5e, 6144x24576).
             if param.dtype == Dtype::E4m3 {
                 return true;
             }
