@@ -2561,7 +2561,6 @@ fn page_writes(
     let tile = with_i(f, from, ps, Func::div)?;
     let lead = with_i(f, from, ps, Func::rem)?;
     let tile = f.reshape(tile, &[m, 1])?;
-    let next = with_i(f, tile, 1, Func::add)?;
     let lead = f.broadcast(lead, &[m, ps], &[0])?;
     let want = f.add(lead, r)?;
     let none = f.like_i(want, -1);
@@ -2574,6 +2573,13 @@ fn page_writes(
     let whole = GatherDims {
         offset_dims: vec![1, 2],
         collapsed_slice_dims: vec![0],
+        start_index_map: vec![0],
+        index_vector_dim: 1,
+        ..GatherDims::default()
+    };
+    // both tiles a run's rows lie in, as one window
+    let pair = GatherDims {
+        offset_dims: vec![1, 2, 3],
         start_index_map: vec![0],
         index_vector_dim: 1,
         ..GatherDims::default()
@@ -2592,9 +2598,8 @@ fn page_writes(
         let zero = f.const_f(Elem::Bf16, 0.0, &[]);
         let rows = f.pad(rows, zero, &[ps, 0], &[2 * ps, 0], &[0, 0])?;
         let rows = f.reshape(rows, &[tiles, ps, w])?;
-        let lo = f.gather(rows, tile, &whole, &[1, ps, w])?;
-        let hi = f.gather(rows, next, &whole, &[1, ps, w])?;
-        let both = f.concat(&[lo, hi], 1)?;
+        let both = f.gather(rows, tile, &pair, &[2, ps, w])?;
+        let both = f.reshape(both, &[m, 2 * ps, w])?;
         let new = f.dot_general(pick, both, &[0], &[0], &[2], &[1], Elem::F32)?;
         let new = f.convert(new, elem);
         let mask = f.broadcast(laid, &[m, ps, w], &[0, 1])?;
