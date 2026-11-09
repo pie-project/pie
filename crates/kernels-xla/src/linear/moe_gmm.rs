@@ -319,7 +319,7 @@ impl Gmm {
             0
         };
         let vmem =
-            2 * tm * k * 2 + 2 * self.block_dma(cols) + convert + scaling + 2 * tm * cols * 4;
+            2 * tm * k * 2 + 2 * self.block_dma(cols) + 2 * convert + scaling + 2 * tm * cols * 4;
         // At least the compiler's own scoped default, where the device has it.
         let floor = (32 << 20).min(self.vmem_cap);
         let limit = (vmem * 2 + (8 << 20)).clamp(floor, self.vmem_cap);
@@ -333,6 +333,13 @@ impl Gmm {
                 .flatten()
                 .collect(),
             outs: vec![out],
+            // The block as bf16, converted once for a run of tiles on one
+            // expert (a converted bank only).
+            scratch: if self.w == Elem::Bf16 {
+                vec![]
+            } else {
+                vec![(vec![k, cols], Elem::Bf16)]
+            },
             vmem_limit: Some(limit as u64),
         };
         kernel.build(|b, blk| {
@@ -341,12 +348,33 @@ impl Gmm {
             let live = b.cmpi(ICmp::Slt, blk.grid.ids[1], nt)?;
             b.when(live, |b| {
                 let x = b.vload_all(blk.ins[0])?;
-                let w = b.vload_all(blk.ins[1])?;
-                let w = if self.scaled {
-                    let s = b.vload_all(blk.ins[2])?;
-                    scale_codes(b, w, s, groups, cols)?
+                let w = if self.w == Elem::Bf16 {
+                    b.vload_all(blk.ins[1])?
                 } else {
-                    b.convert_f(w, Elem::Bf16)?
+                    // A tile on the expert the step before had (in this
+                    // block of outputs) finds its weights converted already.
+                    let t = blk.grid.ids[1];
+                    let zero = b.i32(0);
+                    let one = b.i32(1);
+                    let prev = b.subi(t, one)?;
+                    let prev = b.maxsi(prev, zero)?;
+                    let here = b.load(blk.grid.prefetch[0], &[t])?;
+                    let before = b.load(blk.grid.prefetch[0], &[prev])?;
+                    let first = b.cmpi(ICmp::Eq, t, zero)?;
+                    let moved = b.cmpi(ICmp::Ne, here, before)?;
+                    let fresh = b.select(first, first, moved)?;
+                    let scratch = blk.scratch[0];
+                    b.when(fresh, |b| {
+                        let w = b.vload_all(blk.ins[1])?;
+                        let w = if self.scaled {
+                            let s = b.vload_all(blk.ins[2])?;
+                            scale_codes(b, w, s, groups, cols)?
+                        } else {
+                            b.convert_f(w, Elem::Bf16)?
+                        };
+                        b.vstore_all(w, scratch)
+                    })?;
+                    b.vload_all(scratch)?
                 };
                 let acc = b.splat_f(&[tm, cols], Elem::F32, 0.0)?;
                 let y = b.matmul(x, w, acc, orient == Orient::NMajor)?;
