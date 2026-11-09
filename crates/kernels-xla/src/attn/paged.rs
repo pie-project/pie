@@ -650,7 +650,20 @@ enum Layout {
     Blocked,
 }
 
-/// `p · v` in f32 from bf16 values.
+/// `x` as `hi + lo`, both bf16: `hi` is `x` with its low 16 mantissa bits
+/// cleared (exact in bf16), `lo` the rest rounded (`|lo| < 2⁻⁷|x|`), so
+/// `hi + lo` holds `x` to ~2⁻¹⁶. The split is by bits, not by an f32→bf16→f32
+/// round trip, which XLA's excess-precision rewrite folds back to `x`.
+pub(crate) fn split_bf16(f: &mut Func, x: Val) -> Built<(Val, Val)> {
+    let bits = f.bitcast(x, Elem::U32)?;
+    let keep = f.like_i(bits, 0xFFFF_0000);
+    let bits = f.and(bits, keep)?;
+    let hi32 = f.bitcast(bits, Elem::F32)?;
+    let lo = f.sub(x, hi32)?;
+    Ok((f.convert(hi32, Elem::Bf16), f.convert(lo, Elem::Bf16)))
+}
+
+/// `p · v` in f32 from bf16 values: `p` split as `hi + lo`, two bf16 passes.
 fn pv(f: &mut Func, lay: Layout, p: Val, v: Val) -> Built<Val> {
     let split = f.ty(v).rank() == 3;
     let dot = |f: &mut Func, x: Val| match lay {
@@ -658,11 +671,14 @@ fn pv(f: &mut Func, lay: Layout, p: Val, v: Val) -> Built<Val> {
         Layout::PerRow => f.dot_general_at(x, v, &[0, 1], &[0, 2], &[3], &[1], Elem::F32, false),
         Layout::Blocked => f.dot_general_at(x, v, &[0], &[1], &[3], &[0], Elem::F32, false),
     };
-    // The weights as bf16, as flash attention and the per-row walk take them:
-    // a block's f32 weights split in two dots wrote and read twice the bytes
-    // (v6e gpt-oss 1792-row prefill: 3.5 of 11 ms a fire in attention).
-    let pb = f.convert(p, Elem::Bf16);
-    dot(f, pb)
+    if lay == Layout::PerRow {
+        let pb = f.convert(p, Elem::Bf16);
+        return dot(f, pb);
+    }
+    let (hi, lo) = split_bf16(f, p)?;
+    let a = dot(f, hi)?;
+    let b = dot(f, lo)?;
+    f.add(a, b)
 }
 
 /// Whether the per-row walk reads kv heads as 128-aligned column slices of
@@ -837,10 +853,6 @@ fn finish(f: &mut Func, lay: Layout, st: &[Val]) -> Built<Flashed> {
     let ad = f.dims(acc).to_vec();
     let ib = f.broadcast(inv, &ad, &[0, 1, 2])?;
     let o = f.mul(acc, ib)?;
-    // A row nothing admitted answers zeros, whatever its sums held.
-    let some = f.broadcast(pos, &ad, &[0, 1, 2])?;
-    let none = f.like_f(o, 0.0);
-    let o = f.select(some, o, none)?;
     if lay == Layout::Blocked {
         Ok(Flashed {
             o: f.transpose(o, &[1, 0, 2, 3])?,
