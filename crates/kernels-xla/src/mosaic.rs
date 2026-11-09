@@ -609,7 +609,12 @@ impl Body {
     /// An i32 vector of `x` everywhere.
     pub fn splat_i(&mut self, dims: &[i64], x: i64) -> Built<V> {
         let t = MTy::Vector(dims.to_vec(), Elem::I32);
-        Ok(self.op1("arith.constant", &[], &format!("value = dense<{x}> : {t}"), t))
+        Ok(self.op1(
+            "arith.constant",
+            &[],
+            &format!("value = dense<{x}> : {t}"),
+            t,
+        ))
     }
 
     /// An i32 scalar everywhere in a `dims` vector (`vector.broadcast`).
