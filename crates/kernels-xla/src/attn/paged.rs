@@ -2347,141 +2347,6 @@ pub(crate) fn scatter_slots(
     Ok(out)
 }
 
-/// [`scatter_slots`] a page at a time, for a fire of many rows: the rows
-/// that land in one page in order (a run) are merged into that page's
-/// current contents and the whole page written back, one scatter index a
-/// page where `scatter_slots` takes one a row (a scatter index costs ~0.13
-/// us however small its row: v6e gpt-oss's 640-row prefill spent 4 ms
-/// filing its keys and values). `runs` bounds the runs the fire's rows make
-/// (its whole pages, and a partial page at each end of a lane).
-fn scatter_pages(
-    f: &mut Func,
-    op: &'static str,
-    pairs: &[(Operand, Operand)],
-    page_size: i32,
-    write_page: Operand,
-    write_offset: Operand,
-    runs: i64,
-) -> Result<Vec<Val>, Error> {
-    let Some(&(first, _)) = pairs.first() else {
-        return Ok(Vec::new());
-    };
-    let n = i64::from(first.rows);
-    let ps = i64::from(page_size);
-    let page = read_rows_i32(f, op, write_page, first.rows)?;
-    let off = read_rows_i32(f, op, write_offset, first.rows)?;
-    // The plane's last page is the sink padding rows write: nothing reads
-    // what lands there, so its rows make no run.
-    let pages = i64::from(pairs[0].1.rows) / ps - 1;
-    let a = cmp_i(f, Cmp::Ge, page, 0)?;
-    let b = cmp_i(f, Cmp::Lt, page, pages)?;
-    let c = cmp_i(f, Cmp::Ge, off, 0)?;
-    let d = cmp_i(f, Cmp::Lt, off, ps)?;
-    let ok = f.and(a, b)?;
-    let ok = f.and(ok, c)?;
-    let ok = f.and(ok, d)?;
-    // A run starts at a valid row that does not follow the row before it in
-    // the same page; an invalid row after a valid one ends the run (a dead
-    // run from there on).
-    let shift = |f: &mut Func, v: Val, fill: i64| -> Built<Val> {
-        let head = f.like_i(v, fill);
-        let head = f.slice(head, &[0], &[1], &[1])?;
-        let body = f.slice(v, &[0], &[n - 1], &[1])?;
-        f.concat(&[head, body], 0)
-    };
-    let pp = shift(f, page, -1)?;
-    let po = shift(f, off, -2)?;
-    let po = with_i(f, po, 1, Func::add)?;
-    let same_page = f.compare(Cmp::Eq, page, pp)?;
-    let next_slot = f.compare(Cmp::Eq, off, po)?;
-    let follows = f.and(same_page, next_slot)?;
-    let okv = f.convert(ok, Elem::I32);
-    let prev_ok = shift(f, okv, 0)?;
-    let prev_ok = cmp_i(f, Cmp::Ne, prev_ok, 0)?;
-    let follows = f.and(follows, prev_ok)?;
-    let breaks = f.not(follows);
-    let start = f.and(ok, breaks)?;
-    let ends = f.not(ok);
-    let ends = f.and(ends, prev_ok)?;
-    let edge = f.or(start, ends)?;
-    let io = f.iota(Elem::I32, &[n], 0);
-    let late = with_i(f, io, n, Func::add)?;
-    let key = f.select(edge, io, late)?;
-    let sorted = f.sort(&[key], 0, false, |fq, x, y| fq.compare(Cmp::Lt, x[0], y[0]))?[0];
-    let cap = f.like_i(sorted, n);
-    let sorted = f.min(sorted, cap)?;
-    let head = f.slice(sorted, &[0], &[runs], &[1])?;
-    let next = f.slice(sorted, &[1], &[runs + 1], &[1])?;
-    let row0 = clamp_i(f, head, 0, n - 1)?;
-    let lane_ok = f.convert(ok, Elem::I32);
-    let live = take(f, lane_ok, row0)?;
-    let live = cmp_i(f, Cmp::Ne, live, 0)?;
-    let inn = cmp_i(f, Cmp::Lt, head, n)?;
-    let live = f.and(live, inn)?;
-    let p_r = take(f, page, row0)?;
-    let o_r = take(f, off, row0)?;
-    let len = f.sub(next, head)?;
-    // Slot `q` of run `r` holds row `row0 + q - o_r` for `o_r <= q < o_r + len`.
-    let q = f.iota(Elem::I32, &[runs, ps], 1);
-    let r0 = f.broadcast(row0, &[runs, ps], &[0])?;
-    let o0 = f.broadcast(o_r, &[runs, ps], &[0])?;
-    let l0 = f.broadcast(len, &[runs, ps], &[0])?;
-    let src = f.add(r0, q)?;
-    let src = f.sub(src, o0)?;
-    let from = f.compare(Cmp::Ge, q, o0)?;
-    let top = f.add(o0, l0)?;
-    let upto = f.compare(Cmp::Lt, q, top)?;
-    let lv = f.broadcast(live, &[runs, ps], &[0])?;
-    let fill = f.and(from, upto)?;
-    let fill = f.and(fill, lv)?;
-    let srcc = clamp_i(f, src, 0, n - 1)?;
-    let flat_src = f.reshape(srcc, &[runs * ps])?;
-    // A dead run writes past the plane (dropped).
-    let base = with_i(f, p_r, ps, Func::mul)?;
-    let far = f.like_i(base, i64::from(pairs[0].1.rows));
-    let base = f.select(live, base, far)?;
-    let starts = f.reshape(base, &[runs, 1])?;
-    let mut out: Vec<Val> = Vec::with_capacity(pairs.len());
-    for (k, &(src_rows, plane)) in pairs.iter().enumerate() {
-        let table = match k.checked_sub(1) {
-            Some(prev) if pairs[prev].1.val == plane.val => out[prev],
-            _ => plane.val,
-        };
-        let w = i64::from(plane.width);
-        let elem = f.elem(table);
-        let rows = f.convert(src_rows.val, elem);
-        let new = f.take_rows(rows, flat_src)?;
-        let new = f.reshape(new, &[runs, ps, w])?;
-        let safe = clamp_i(f, starts, 0, i64::from(plane.rows) - ps)?;
-        let old = f.gather(
-            table,
-            safe,
-            &GatherDims {
-                offset_dims: vec![1, 2],
-                start_index_map: vec![0],
-                index_vector_dim: 1,
-                ..GatherDims::default()
-            },
-            &[ps, w],
-        )?;
-        let keep = f.broadcast(fill, &[runs, ps, w], &[0, 1])?;
-        let merged = f.select(keep, new, old)?;
-        out.push(f.scatter(
-            table,
-            starts,
-            merged,
-            &crate::hlo::ScatterDims {
-                update_window_dims: vec![1, 2],
-                scatter_dims_to_operand_dims: vec![0],
-                index_vector_dim: 1,
-                ..crate::hlo::ScatterDims::default()
-            },
-            crate::hlo::Combine::Set,
-        )?);
-    }
-    Ok(out)
-}
-
 fn head_split(op: &'static str, seq_stride: u64, head_stride: u64, row: u32) -> Result<(), Error> {
     let hd = u32::try_from(head_stride)
         .ok()
@@ -2526,7 +2391,6 @@ fn append(
     head_stride: u64,
     write_page: Operand,
     write_offset: Operand,
-    lanes: u32,
 ) -> Result<(Val, Val), Error> {
     expect(op, k, &[Dtype::Bf16])?;
     if page_size <= 0 {
@@ -2545,30 +2409,14 @@ fn append(
             "the appended rows are not as wide as the pool planes",
         ));
     }
-    // A fire of many rows files a page at a time where its runs (whole
-    // pages, and a part page at each end of a lane) are fewer than half its
-    // rows.
-    let runs = i64::from(k.rows) / i64::from(page_size) + 2 * i64::from(lanes) + 1;
-    let planes = if 2 * runs < i64::from(k.rows) && keys.rows % (page_size as u32) == 0 {
-        scatter_pages(
-            f,
-            op,
-            &[(k, keys), (v, values)],
-            page_size,
-            write_page,
-            write_offset,
-            runs,
-        )?
-    } else {
-        scatter_slots(
-            f,
-            op,
-            &[(k, keys), (v, values)],
-            page_size,
-            write_page,
-            write_offset,
-        )?
-    };
+    let planes = scatter_slots(
+        f,
+        op,
+        &[(k, keys), (v, values)],
+        page_size,
+        write_page,
+        write_offset,
+    )?;
     Ok((planes[0], planes[1]))
 }
 
@@ -2597,7 +2445,6 @@ pub fn kv_append(
         pool.head_stride,
         write_page,
         write_offset,
-        lanes_of(pool),
     )
 }
 
@@ -2624,11 +2471,5 @@ pub fn kv_append_shared(
         pool.head_stride,
         write_page,
         write_offset,
-        lanes_of(pool),
     )
-}
-
-/// The lanes a pool's page table states (its CSR holds one more entry).
-fn lanes_of(pool: &KvPool<impl Stored>) -> u32 {
-    u32::try_from(pool.page_indptr.elements().saturating_sub(1)).unwrap_or(u32::MAX)
 }
