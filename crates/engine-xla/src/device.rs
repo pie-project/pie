@@ -264,14 +264,7 @@ impl Device {
         }
         let client = self.client()?;
         let started = std::time::Instant::now();
-        let file = self.disk.as_ref().map(|dir| {
-            let mut h = blake3::Hasher::new();
-            h.update(text.as_bytes());
-            h.update(client.api().path().to_string_lossy().as_bytes());
-            let (major, minor) = client.api().version();
-            h.update(format!("{major}.{minor}|{}", self.kind).as_bytes());
-            dir.join(format!("{}.pjrt", h.finalize().to_hex()))
-        });
+        let file = self.cache_file(client, text);
         let cached = file
             .as_ref()
             .and_then(|f| std::fs::read(f).ok())
@@ -323,9 +316,30 @@ impl Device {
         Ok(program)
     }
 
-    /// Drops the program compiled from `text` from the cache: a program held
-    /// nowhere else frees its host memory, and the next `program` of the
-    /// text loads it from the disk cache.
+    /// Where the disk cache keeps the program compiled from `text` for this
+    /// client's PJRT plugin and chip, if it keeps one.
+    fn cache_file(&self, client: &Client, text: &str) -> Option<PathBuf> {
+        let dir = self.disk.as_ref()?;
+        let mut h = blake3::Hasher::new();
+        h.update(text.as_bytes());
+        h.update(client.api().path().to_string_lossy().as_bytes());
+        let (major, minor) = client.api().version();
+        h.update(format!("{major}.{minor}|{}", self.kind).as_bytes());
+        Some(dir.join(format!("{}.pjrt", h.finalize().to_hex())))
+    }
+
+    /// Whether the disk cache holds the program compiled from `text`.
+    #[must_use]
+    pub fn on_disk(&self, text: &str) -> bool {
+        self.client()
+            .ok()
+            .and_then(|client| self.cache_file(client, text))
+            .is_some_and(|file| file.exists())
+    }
+
+    /// Drops the program compiled from `text` from the cache: held nowhere
+    /// else, it frees its host memory, and the next `program` of the text
+    /// loads it from the disk cache.
     pub fn forget(&self, text: &str) {
         let key = *blake3::hash(text.as_bytes()).as_bytes();
         self.cache.lock().expect("cache lock poisoned").remove(&key);
