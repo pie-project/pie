@@ -203,12 +203,12 @@ template <typename T, int D, int V = D>
     const device uint &attention_mask_stride [[buffer(13)]],
     const device uchar *attention_mask_enabled [[buffer(14)]],
     const constant int &window [[buffer(15)]], const device T *sinks [[buffer(16)]],
-    device float *lse [[buffer(17)]], uint3 tid [[threadgroup_position_in_grid]],
+    device float *lse [[buffer(17)]],
     const constant ulong& k_page_stride [[buffer(18)]],
     const constant ulong& v_page_stride [[buffer(19)]],
     const constant ulong& k_offset [[buffer(20)]],
     const constant ulong& v_offset [[buffer(21)]],
-    uint3 tpg [[threadgroups_per_grid]], uint simd_gid [[simdgroup_index_in_threadgroup]],
+    uint3 tid [[threadgroup_position_in_grid]], uint3 tpg [[threadgroups_per_grid]], uint simd_gid [[simdgroup_index_in_threadgroup]],
     uint simd_lid [[thread_index_in_simdgroup]]) {
   constexpr int BN = 32;
   threadgroup float outputs[sdpa_decode_outputs<BN>()];
