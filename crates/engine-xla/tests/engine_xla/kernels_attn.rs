@@ -1238,6 +1238,70 @@ fn kv_append_lands_each_row_in_its_slot_and_drops_the_padded_ones() {
     assert_close(&b.read_f32(shared_keys), &want_s, 0.0, 0.0);
 }
 
+/// A fire of many rows files its keys and values a page at a time
+/// (`kernels_xla::attn::paged`'s page runs): lanes that start and end inside
+/// pages keep what those pages held around them, and the padding rows bound
+/// for the sink page (the plane's last) land nowhere that is read.
+#[test]
+fn kv_append_files_a_prefill_a_page_at_a_time() {
+    let mut rng = Rng(19);
+    let (ps, kvh, d, pages) = (4usize, 2usize, 8usize, 13usize);
+    let lanes = vec![vec![3, 7, 1, 10], vec![5, 0, 11], vec![8, 2]];
+    let pool = Pool::new(&mut rng, ps, kvh, d, pages, lanes, 4);
+    let w = kvh * d;
+    // (page, first offset, rows) per lane run, in row order; then padding.
+    let runs: [(i32, i32, usize); 9] = [
+        (3, 2, 2),
+        (7, 0, 4),
+        (1, 0, 4),
+        (10, 0, 3),
+        (5, 0, 4),
+        (0, 0, 4),
+        (11, 0, 1),
+        (8, 1, 3),
+        (2, 0, 3),
+    ];
+    let (mut page, mut off) = (Vec::new(), Vec::new());
+    for (p, o, n) in runs {
+        for i in 0..n {
+            page.push(p);
+            off.push(o + i as i32);
+        }
+    }
+    while page.len() < 40 {
+        page.push((pages - 1) as i32);
+        off.push(0);
+    }
+    let n = page.len();
+    let k = rng.bf16s(n * w, 1.0);
+    let v = rng.bf16s(n * w, 1.0);
+    let mut b = Bench::new();
+    let kv = pool.bind(&mut b);
+    let kt = b.bf16(n as u32, w as u32, &k);
+    let vt = b.bf16(n as u32, w as u32, &v);
+    let pt = b.i32(n as u32, 1, &page);
+    let ot = b.i32(n as u32, 1, &off);
+    if !b
+        .run(|ctx| low::kv_append(ctx, kt, vt, &kv, pt, ot))
+        .unwrap()
+    {
+        return;
+    }
+    let mut want_k = pool.keys.clone();
+    let mut want_v = pool.values.clone();
+    for i in 0..n {
+        if page[i] as usize >= pages - 1 {
+            continue;
+        }
+        let slot = page[i] as usize * ps + off[i] as usize;
+        want_k[slot * w..(slot + 1) * w].copy_from_slice(&k[i * w..(i + 1) * w]);
+        want_v[slot * w..(slot + 1) * w].copy_from_slice(&v[i * w..(i + 1) * w]);
+    }
+    let read = (pages - 1) * ps * w;
+    assert_close(&b.read_f32(kv.keys)[..read], &want_k[..read], 0.0, 0.0);
+    assert_close(&b.read_f32(kv.values)[..read], &want_v[..read], 0.0, 0.0);
+}
+
 #[test]
 fn dense_attends_within_each_image_segment() {
     let mut rng = Rng(12);
