@@ -24,7 +24,7 @@
 //! group, the tile's rows masked by the caller.
 
 use crate::hlo::{Built, Elem, Malformed};
-use crate::mosaic::{Body, Compiled, Grid, ICmp, Kernel, Operand, Sem, V, Window};
+use crate::mosaic::{Body, Compiled, Grid, ICmp, Kernel, MTy, Operand, Sem, Space, V, Window};
 
 /// How the bank `[E·N, K]` sits in HBM.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -177,7 +177,145 @@ impl Gmm {
         }
     }
 
+    /// Whether the kernel fetches each expert's weights itself, the next
+    /// expert's while the current one's tiles run (`kernel` then takes each
+    /// tile's run and the next run's expert after `se` and `nt`).
+    #[must_use]
+    pub fn prefetching(&self) -> bool {
+        std::env::var("PIE_XLA_GMM_PREFETCH").is_ok_and(|v| v == "1")
+            && matches!(self.cut(), Ok(Cut::Blocked { tn }) if tn == self.n)
+    }
+
+    fn kernel_prefetching(&self) -> Built<Compiled> {
+        let (k, n, tm) = (self.k, self.n, self.tm);
+        let rows = self.tiles * tm;
+        let orient = self.orient;
+        let (rb, cb) = match orient {
+            Orient::NMajor => (n, k),
+            Orient::KMajor => (k, n),
+        };
+        fn last(b: &mut Body, g: &Grid) -> Built<V> {
+            let zero = b.index(0);
+            let nt = b.load(g.prefetch[1], &[zero])?;
+            let one = b.i32(1);
+            let top = b.subi(nt, one)?;
+            let z = b.i32(0);
+            let top = b.maxsi(top, z)?;
+            b.minsi(g.ids[1], top)
+        }
+        let xs = Operand {
+            array: vec![rows, k],
+            elem: Elem::Bf16,
+            block: vec![tm, k],
+            window: Window::Blocked,
+            index: Box::new(|b: &mut Body, g: &Grid| Ok(vec![last(b, g)?, b.i32(0)])),
+        };
+        let bank = Operand {
+            array: self.bank_dims().to_vec(),
+            elem: self.w,
+            block: self.bank_dims().to_vec(),
+            window: Window::Any,
+            index: Box::new(|b: &mut Body, _: &Grid| Ok(vec![b.i32(0), b.i32(0)])),
+        };
+        let out_elem = self.out;
+        let out = Operand {
+            array: vec![rows, n],
+            elem: out_elem,
+            block: vec![tm, n],
+            window: Window::Blocked,
+            index: Box::new(|b: &mut Body, g: &Grid| Ok(vec![last(b, g)?, b.i32(0)])),
+        };
+        let wb = self.wbytes();
+        let convert = if self.w == Elem::Bf16 { 0 } else { k * n * 2 };
+        let vmem = 2 * tm * k * 2 + 2 * k * n * wb + convert + 2 * tm * n * 4;
+        let floor = (32 << 20).min(self.vmem_cap);
+        let limit = (vmem * 2 + (8 << 20)).clamp(floor, self.vmem_cap);
+        let kernel = Kernel {
+            name: "gmm".into(),
+            grid: vec![1, self.tiles],
+            semantics: vec![Sem::Arbitrary, Sem::Arbitrary],
+            prefetch: vec![vec![self.tiles], vec![1], vec![self.tiles], vec![self.tiles]],
+            ins: vec![xs, bank],
+            outs: vec![out],
+            vmem_limit: Some(limit as u64),
+            scratch: vec![
+                MTy::Ref(vec![2, rb, cb], self.w, Space::Vmem),
+                MTy::Sem(vec![2]),
+            ],
+        };
+        kernel.build(|b, blk| {
+            let (wbuf, sems) = (blk.scratch[0], blk.scratch[1]);
+            let bank = blk.ins[1];
+            let pre = &blk.grid.prefetch;
+            let t = blk.grid.ids[1];
+            // The copy of expert `ex`'s weights into slot `s`.
+            let copy = |b: &mut Body, ex: V, s: V| -> Built<(V, V, V)> {
+                let z = b.i32(0);
+                let nn = b.i32(n);
+                let at = b.muli(ex, nn)?;
+                let src = match orient {
+                    Orient::NMajor => b.ref_slice(bank, &[at, z], &[n, k])?,
+                    Orient::KMajor => b.ref_slice(bank, &[z, at], &[k, n])?,
+                };
+                let dst = b.ref_slice(wbuf, &[s, z, z], &[1, rb, cb])?;
+                let dst = b.ref_squeeze(dst)?;
+                let sem = b.ref_slice(sems, &[s], &[1])?;
+                let sem = b.ref_squeeze(sem)?;
+                Ok((src, dst, sem))
+            };
+            let zero = b.index(0);
+            let nt = b.load(pre[1], &[zero])?;
+            let live = b.cmpi(ICmp::Slt, t, nt)?;
+            b.when(live, |b| {
+                let ti = b.as_index(t)?;
+                let r = b.load(pre[2], &[ti])?;
+                let two = b.i32(2);
+                let slot = b.remsi(r, two)?;
+                let z = b.i32(0);
+                let one = b.i32(1);
+                let before = b.subi(t, one)?;
+                let before = b.maxsi(before, z)?;
+                let bi = b.as_index(before)?;
+                let rp = b.load(pre[2], &[bi])?;
+                let at0 = b.cmpi(ICmp::Eq, t, z)?;
+                let moved = b.cmpi(ICmp::Ne, rp, r)?;
+                let first = b.select(at0, at0, moved)?;
+                b.when(at0, |b| {
+                    let ex = b.load(pre[0], &[ti])?;
+                    let (src, dst, sem) = copy(b, ex, slot)?;
+                    b.dma_start(src, dst, sem)
+                })?;
+                b.when(first, |b| {
+                    let z = b.i32(0);
+                    let (src, dst, sem) = copy(b, z, slot)?;
+                    b.dma_wait(sem, src, dst)?;
+                    let nx = b.load(pre[3], &[ti])?;
+                    let has = b.cmpi(ICmp::Sge, nx, z)?;
+                    b.when(has, |b| {
+                        let one = b.i32(1);
+                        let other = b.subi(one, slot)?;
+                        let (src, dst, sem) = copy(b, nx, other)?;
+                        b.dma_start(src, dst, sem)
+                    })
+                })?;
+                let z = b.i32(0);
+                let held = b.ref_slice(wbuf, &[slot, z, z], &[1, rb, cb])?;
+                let held = b.ref_squeeze(held)?;
+                let x = b.vload_all(blk.ins[0])?;
+                let w = b.vload_all(held)?;
+                let w = b.convert_f(w, Elem::Bf16)?;
+                let acc = b.splat_f(&[tm, n], Elem::F32, 0.0)?;
+                let y = b.matmul(x, w, acc, orient == Orient::NMajor)?;
+                let y = b.convert_f(y, out_elem)?;
+                b.vstore_all(y, blk.outs[0])
+            })
+        })
+    }
+
     pub fn kernel(&self) -> Built<Compiled> {
+        if self.prefetching() {
+            return self.kernel_prefetching();
+        }
         if self.tm % 16 != 0 || self.tiles < 1 || self.k < 1 || self.n < 1 || self.experts < 1 {
             return bad(format!("{self:?}"));
         }
@@ -359,6 +497,7 @@ impl Gmm {
                 .collect(),
             outs: vec![out],
             vmem_limit: Some(limit as u64),
+            scratch: vec![],
         };
         kernel.build(|b, blk| {
             let zero = b.index(0);
