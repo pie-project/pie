@@ -1305,8 +1305,6 @@ impl Compiled {
     }
 }
 
-/// Standard base64 with padding.
-#[must_use]
 /// A float literal MLIR parses: an infinity as its bits.
 fn float_lit(x: f64, elem: Elem) -> Built<String> {
     if x.is_finite() {
@@ -1322,6 +1320,8 @@ fn float_lit(x: f64, elem: Elem) -> Built<String> {
     })
 }
 
+/// Standard base64 with padding.
+#[must_use]
 pub fn base64(bytes: &[u8]) -> String {
     const A: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
     let mut s = String::with_capacity(bytes.len().div_ceil(3) * 4);
