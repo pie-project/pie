@@ -9,6 +9,11 @@
 //! else wanting it. The loop answers in bytes alone; which pages go is the
 //! planner's to decide.
 //!
+//! The loop decides how much, never what: the pool behind [`PoolTarget`]
+//! decides how its segments move, and what stays is the policy's. Short of
+//! room to give a segment back, the pool keeps it and the loop raises
+//! [`Signal::TierPressure`]; nothing here drops state.
+//!
 //! A platform supplies two things and no policy: the hard limit, and whether
 //! the system is congested ([`Pressure`]). A platform that cannot tell reads
 //! as calm, so demand alone moves the target there. Every threshold here was
@@ -100,8 +105,103 @@ pub struct Limits {
     /// The most one calm tick adds.
     pub step: u64,
     /// The least one idle cut takes: a pool that moves by copying pays for
-    /// every cut, so small ones are not worth making.
+    /// every cut, so small ones are not worth making. Never less than a
+    /// segment, since a cut smaller than one gives nothing back.
     pub shrink_step: u64,
+    /// The pool's grow and shrink unit.
+    pub segment_bytes: u64,
+}
+
+impl Limits {
+    /// The limits `pool` puts on a loop that adds at most `step` a tick. A
+    /// fixed pool never cuts.
+    #[must_use]
+    pub fn of(pool: &impl PoolTarget, step: u64) -> Self {
+        let segment_bytes = pool.segment_bytes().max(1);
+        Self {
+            floor: pool.floor(),
+            hard_limit: pool.hard_limit(),
+            step,
+            shrink_step: match pool.growth() {
+                Growth::Fixed => u64::MAX,
+                Growth::Elastic { least_cut } => least_cut.max(segment_bytes),
+            },
+            segment_bytes,
+        }
+    }
+
+    /// The segments `target` bytes come to: rounded up, and never fewer than
+    /// the floor takes.
+    #[must_use]
+    pub const fn segments(&self, target: u64) -> u64 {
+        let target = if target > self.floor {
+            target
+        } else {
+            self.floor
+        };
+        target.div_ceil(self.segment_bytes)
+    }
+}
+
+/// How a pool's memory can move.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Growth {
+    /// All of it is there from load and stays: the process is dedicated.
+    Fixed,
+    /// Segments commit and release; a cut takes at least `least_cut` bytes,
+    /// and at least a segment whatever this says.
+    Elastic { least_cut: u64 },
+}
+
+/// What a pool made of a retarget.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Retarget {
+    /// It holds the segments asked for, or is on its way there.
+    Reached,
+    /// A shrink found no room to evacuate its emptiest segment into: it
+    /// keeps `held` segments, and nothing it holds was dropped.
+    NoRoom { held: u64 },
+}
+
+/// The pool a governor steers: it says how much is asked of it and takes a
+/// number of segments; how they move is its own. It offers no way to drop
+/// state, and the governor asks for none.
+pub trait PoolTarget {
+    /// What is asked of the pool now, in bytes.
+    fn demand(&mut self) -> Demand;
+    /// The pool's grow and shrink unit, in bytes.
+    fn segment_bytes(&self) -> u64;
+    /// Bytes below which one lane cannot run: one working set at the
+    /// declared context, and the activation of the smallest rung.
+    fn floor(&self) -> u64;
+    /// The whole of what the pool can take, in bytes.
+    fn hard_limit(&self) -> u64;
+    /// What the pool holds now, in bytes.
+    fn held(&self) -> u64;
+    fn growth(&self) -> Growth;
+    /// Moves the pool toward `segments`. A shrink evacuates the emptiest
+    /// segment and then releases it, and stops where there is no room.
+    fn retarget(&mut self, segments: u64) -> Retarget;
+    /// Whether the system refused memory since this last asked: the system
+    /// pushing back, read as [`Pressure::Critical`].
+    fn take_refused(&mut self) -> bool {
+        false
+    }
+    /// The system is critical: fires take the next smaller activation rung.
+    fn shrink_rung(&mut self);
+    /// The system has settled: fires may take their full rung again.
+    fn restore_rung(&mut self);
+}
+
+/// What the loop tells the runtime, which maps it to the policy's
+/// `tier-pressure`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Signal {
+    /// The pool holds `held_bytes` against a target of `target_bytes` and
+    /// has no room to give the difference back.
+    TierPressure { held_bytes: u64, target_bytes: u64 },
+    /// The pool reached its target again.
+    Eased,
 }
 
 /// What the process could use right now, in bytes.
@@ -152,7 +252,17 @@ impl Governor {
     /// `held` is what the process has now: a pool that starts whole starts
     /// the target there, and one that starts empty at the floor.
     #[must_use]
+    ///
+    /// # Panics
+    ///
+    /// If a cut can be smaller than a segment.
     pub fn new(limits: Limits, tolerance: Tolerance, held: u64) -> Self {
+        assert!(
+            limits.shrink_step >= limits.segment_bytes && limits.segment_bytes > 0,
+            "a cut of {} bytes is smaller than a segment of {}",
+            limits.shrink_step,
+            limits.segment_bytes,
+        );
         let target = match tolerance {
             Tolerance::Dedicated => limits.hard_limit,
             _ => held.clamp(limits.floor, limits.hard_limit),
@@ -174,6 +284,16 @@ impl Governor {
     #[must_use]
     pub const fn target(&self) -> u64 {
         self.target
+    }
+
+    #[must_use]
+    pub const fn limits(&self) -> &Limits {
+        &self.limits
+    }
+
+    #[must_use]
+    pub const fn tolerance(&self) -> Tolerance {
+        self.tolerance
     }
 
     /// Whether the system has pushed back and not yet stayed calm. While it
@@ -321,6 +441,7 @@ mod tests {
         hard_limit: 1000 * MIB,
         step: 50 * MIB,
         shrink_step: 10 * MIB,
+        segment_bytes: MIB,
     };
 
     const fn all(bytes: u64) -> Demand {
@@ -554,6 +675,29 @@ mod tests {
     fn a_dedicated_process_gives_nothing_back_however_idle() {
         let mut governor = Governor::new(LIMITS, Tolerance::Dedicated, 0);
         assert_eq!(kept(&mut governor, 2000, 0, 0), LIMITS.hard_limit);
+    }
+
+    #[test]
+    #[should_panic(expected = "smaller than a segment")]
+    fn a_cut_smaller_than_a_segment_is_refused_at_construction() {
+        let limits = Limits {
+            segment_bytes: 64 * MIB,
+            ..LIMITS
+        };
+        let _ = Governor::new(limits, Tolerance::Balanced, 0);
+    }
+
+    #[test]
+    fn a_target_comes_to_whole_segments_and_never_under_the_floor() {
+        let limits = Limits {
+            segment_bytes: 64 * MIB,
+            shrink_step: 64 * MIB,
+            ..LIMITS
+        };
+        assert_eq!(limits.segments(0), 2, "the floor's 100 MiB takes two");
+        assert_eq!(limits.segments(128 * MIB), 2);
+        assert_eq!(limits.segments(128 * MIB + 1), 3);
+        assert_eq!(limits.segments(LIMITS.hard_limit), 16);
     }
 
     #[test]
