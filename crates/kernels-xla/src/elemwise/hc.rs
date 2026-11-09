@@ -51,12 +51,22 @@ fn streams3(f: &mut Func, t: Operand, m: u32) -> Result<Val, Error> {
     )?)
 }
 
+/// Rows from which the streams mix as cuts of the row: fewer (a decode
+/// fire's) take one `[rows, M, H]` view, the one fusion their few rows want.
+const CUT_ROWS: i64 = 64;
+
 /// `Σ_s w[:, s] · streams[:, s·H .. (s+1)·H]` of an f32 `[rows, M·H]` row,
 /// `w` an f32 `[rows, M]`, in stream order: each stream a cut of the row
 /// itself, where a `[rows, M, H]` view lays `M` on the sublanes (4 of 8 for
 /// DeepSeek-V4) and relays the row out first.
 fn weighted(f: &mut Func, v: Val, w: Val, m: i64, h: i64) -> Result<Val, Error> {
     let rows = f.dims(v)[0];
+    if rows < CUT_ROWS {
+        let v = f.reshape(v, &[rows, m, h])?;
+        let w = f.broadcast(w, &[rows, m, h], &[0, 1])?;
+        let v = f.mul(v, w)?;
+        return Ok(f.reduce(v, &[1], Fold::Sum)?);
+    }
     let mut acc: Option<Val> = None;
     for s in 0..m {
         let x = f.slice_axis(v, 1, s * h, (s + 1) * h)?;
@@ -302,6 +312,15 @@ pub fn fold(
     let post = post_mix.f32(f);
     let comb = comb_mix.f32(f);
     let comb = f.reshape(comb, &[rows, m, m])?;
+    if rows < CUT_ROWS {
+        let r = f.reshape(r, &[rows, m, h])?;
+        // [rows, i, j] · [rows, i, h] over i → [rows, j, h].
+        let mixed = f.dot_general(comb, r, &[0], &[0], &[1], &[1], Elem::F32)?;
+        let px = f.broadcast(post, &[rows, m, h], &[0, 1])?;
+        let xb = f.broadcast(xv, &[rows, m, h], &[0, 2])?;
+        let px = f.mul(px, xb)?;
+        return Ok(f.add(px, mixed)?);
+    }
     // Stream `j` of the result, `post[:, j] · x + Σ_i comb[:, i, j] · r_i`,
     // a cut of the row each (see `weighted`).
     let mut out = Vec::with_capacity(m as usize);
