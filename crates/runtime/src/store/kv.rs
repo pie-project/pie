@@ -23,7 +23,9 @@ use crate::inferlet::process::ProcessId;
 use crate::policy::retention::Keys;
 use crate::policy::{By, Event};
 use crate::rt::Instant;
+use crate::store::chunks::{ShapePool, ShapeRun};
 use crate::store::pool::Pool;
+use crate::store::slots::ShapeKind;
 
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
 pub enum KvStoreError {
@@ -102,8 +104,9 @@ impl KvResidencyTxn {
 
 pub struct KvStore {
     table: KvPageTable,
-    /// Its limit is what is committed: no id past it has memory yet.
-    pool: Pool<PhysicalKvPageId>,
+    /// The list shape's slots, one a page. Its limit is what is committed:
+    /// no id past it has memory yet.
+    pool: ShapePool<PhysicalKvPageId>,
     /// How far the limit may rise; see [`crate::store::extent`].
     target_pages: u32,
     /// Pages a waiter found short, past what is committed.
@@ -290,15 +293,35 @@ impl KvStore {
         Self::new_with_swap(capacity, 0, 0, seed)
     }
 
+    #[cfg(test)]
     pub fn new_with_swap(
         capacity: u32,
         host_capacity: u32,
         disk_capacity: u32,
         seed: Hash256,
     ) -> Self {
+        Self::with_pages(
+            ShapeRun {
+                device: capacity,
+                ..ShapeRun::default()
+            },
+            host_capacity,
+            disk_capacity,
+            seed,
+        )
+    }
+
+    /// A store whose device pages are the list shape `pages` states.
+    pub fn with_pages(
+        pages: ShapeRun,
+        host_capacity: u32,
+        disk_capacity: u32,
+        seed: Hash256,
+    ) -> Self {
+        let capacity = pages.device;
         Self {
             table: KvPageTable::new(),
-            pool: Pool::new(capacity),
+            pool: ShapePool::new(ShapeKind::List, pages.slot_bytes, pages.ids_from, capacity),
             target_pages: capacity,
             short_pages: 0,
             mapped_pages: capacity,
@@ -2431,6 +2454,7 @@ impl KvStore {
 
     pub fn note_short(&mut self, pages: u32) {
         self.short_pages = self.short_pages.max(pages);
+        self.pool.wait(u64::from(self.short_pages));
     }
 
     /// Whether committing further would add a page.
@@ -2468,6 +2492,7 @@ impl KvStore {
         self.pool.set_limit(limit);
         self.mapped_pages = self.mapped_pages.max(pages);
         self.short_pages = self.short_pages.saturating_sub(gained);
+        self.pool.wait(u64::from(self.short_pages));
     }
 
     /// Moves the target; past it, nothing further is handed out and what
@@ -2548,10 +2573,16 @@ impl KvStore {
     pub fn hold_extent(&mut self) {
         self.target_pages = self.pool.limit();
         self.short_pages = 0;
+        self.pool.wait(0);
     }
 
     pub fn capacity_pages(&self) -> u32 {
         self.pool.capacity()
+    }
+
+    /// The device pages' slot pool: what is held and wanted of it.
+    pub fn page_pool(&self) -> &ShapePool<PhysicalKvPageId> {
+        &self.pool
     }
 
     pub fn host_swap_available(&self) -> usize {

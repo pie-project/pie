@@ -9,9 +9,11 @@ use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use crate::inferlet::process::ProcessId;
 use crate::rt::Instant;
 
+use crate::store::chunks::{ShapePool, StorePools};
 use crate::store::genmap::{GenKey, GenMap};
 use crate::store::kv::hash::Hash256;
-use crate::store::pool::{Pool, PoolId};
+use crate::store::pool::PoolId;
+use crate::store::slots::{Demand, Holder, ShapeKind};
 use write::{
     RsBufferTarget, RsPendingFold, RsPendingFolds, RsPreparedWrite, RsPublished, RsSnapshot,
     RsStateTarget,
@@ -219,10 +221,10 @@ struct Touch {
 /// buffer pages, then host slots and pages. An engine numbers each kind from 0
 /// ([`RsStore::engine_id`]).
 pub struct RsStore {
-    slots: Pool<RsSlotId>,
-    pages: Pool<RsSlotId>,
-    host_slots: Pool<RsSlotId>,
-    host_pages: Pool<RsSlotId>,
+    slots: ShapePool<RsSlotId>,
+    pages: ShapePool<RsSlotId>,
+    host_slots: ShapePool<RsSlotId>,
+    host_pages: ShapePool<RsSlotId>,
     pages_at: u32,
     /// Page 0 is the engine's null page, and there are no slots.
     ring: Option<RingGeometry>,
@@ -260,13 +262,27 @@ struct RsCheckpoint {
 }
 
 impl RsStore {
+    #[cfg(test)]
     pub fn new(slots: u32, pages: u32, host_slots: u32, host_pages: u32) -> Self {
+        Self::fixed(0, slots, 0, pages, host_slots, host_pages)
+    }
+
+    /// The fixed shapes' pools: state slots of `slot_bytes` and buffer
+    /// pages of `page_bytes`, on the device and the host.
+    fn fixed(
+        slot_bytes: u64,
+        slots: u32,
+        page_bytes: u64,
+        pages: u32,
+        host_slots: u32,
+        host_pages: u32,
+    ) -> Self {
         let host = slots + pages;
         Self::build(
-            Pool::new(slots),
-            Pool::new_range(slots, pages),
-            Pool::new_range(host, host_slots),
-            Pool::new_range(host + host_slots, host_pages),
+            ShapePool::new(ShapeKind::Fixed, slot_bytes, 0, slots),
+            ShapePool::new(ShapeKind::Fixed, page_bytes, slots, pages),
+            ShapePool::new(ShapeKind::Fixed, slot_bytes, host, host_slots),
+            ShapePool::new(ShapeKind::Fixed, page_bytes, host + host_slots, host_pages),
             slots,
             None,
         )
@@ -275,23 +291,53 @@ impl RsStore {
     /// A store for a model whose state is a window of `geom`: `pages`
     /// ring pages (0 the null page every page behind a window reads) and
     /// `host_pages` host ones a suspended ring parks on.
+    #[cfg(test)]
     pub fn new_ring(geom: RingGeometry, pages: u32, host_pages: u32) -> Self {
+        Self::ring(geom, 0, pages, host_pages)
+    }
+
+    fn ring(geom: RingGeometry, page_bytes: u64, pages: u32, host_pages: u32) -> Self {
         let host = pages.max(1);
         Self::build(
-            Pool::new(0),
-            Pool::new_range(1, pages.saturating_sub(1)),
-            Pool::new_range(host, 0),
-            Pool::new_range(host, host_pages),
+            ShapePool::new(ShapeKind::Fixed, 0, 0, 0),
+            ShapePool::new(ShapeKind::Ring, page_bytes, 1, pages.saturating_sub(1)),
+            ShapePool::new(ShapeKind::Fixed, 0, host, 0),
+            ShapePool::new(ShapeKind::Ring, page_bytes, host, host_pages),
             0,
             Some(geom),
         )
     }
 
+    /// The store `pools` states: a window ring where there is a window,
+    /// else the state slots and buffer pages.
+    pub fn of(pools: &StorePools) -> Self {
+        if pools.window_tokens > 0 {
+            Self::ring(
+                RingGeometry {
+                    tokens: pools.window_tokens,
+                    page_size: pools.page_size,
+                },
+                pools.window.slot_bytes,
+                pools.window_pages(),
+                pools.window.host,
+            )
+        } else {
+            Self::fixed(
+                pools.state.slot_bytes,
+                pools.state.device,
+                pools.buffer.slot_bytes,
+                pools.buffer.device,
+                pools.state.host,
+                pools.buffer.host,
+            )
+        }
+    }
+
     fn build(
-        slots: Pool<RsSlotId>,
-        pages: Pool<RsSlotId>,
-        host_slots: Pool<RsSlotId>,
-        host_pages: Pool<RsSlotId>,
+        slots: ShapePool<RsSlotId>,
+        pages: ShapePool<RsSlotId>,
+        host_slots: ShapePool<RsSlotId>,
+        host_pages: ShapePool<RsSlotId>,
         pages_at: u32,
         ring: Option<RingGeometry>,
     ) -> Self {
@@ -418,7 +464,7 @@ impl RsStore {
     pub fn demand(&self) -> (u32, u32) {
         let extent = self.extent.unwrap_or_default();
         let reach = self.slots.high_end().max(self.pages.high_end());
-        let out = |pool: &Pool<RsSlotId>| pool.limit() - pool.available() as u32;
+        let out = |pool: &ShapePool<RsSlotId>| pool.limit() - pool.available() as u32;
         let wanted = out(&self.slots).max(out(&self.pages));
         let kept: HashSet<RsSlotId> = self
             .checkpoints
@@ -467,6 +513,21 @@ impl RsStore {
         self.ring.is_some()
     }
 
+    /// What is held and wanted of the device's state slots and buffer (or
+    /// ring) pages, in bytes.
+    pub fn device_demand(&self) -> Demand {
+        let (slots, pages) = (self.slots.demand(), self.pages.demand());
+        Demand {
+            live: slots.live + pages.live,
+            wanted: slots.wanted + pages.wanted,
+        }
+    }
+
+    /// The bytes of a state slot and of a buffer (or ring) page.
+    pub fn unit_bytes(&self) -> (u64, u64) {
+        (self.slots.slot_bytes(), self.pages.slot_bytes())
+    }
+
     pub fn retire_idle(&mut self) {
         let completed = match self.inflight.keys().next() {
             Some(&oldest) => oldest.saturating_sub(1),
@@ -510,7 +571,7 @@ impl RsStore {
         units
     }
 
-    fn device_pool(&mut self, id: RsSlotId) -> &mut Pool<RsSlotId> {
+    fn device_pool(&mut self, id: RsSlotId) -> &mut ShapePool<RsSlotId> {
         if self.is_page(id) {
             &mut self.pages
         } else {
@@ -518,7 +579,7 @@ impl RsStore {
         }
     }
 
-    fn host_pool(&mut self, id: RsSlotId) -> &mut Pool<RsSlotId> {
+    fn host_pool(&mut self, id: RsSlotId) -> &mut ShapePool<RsSlotId> {
         if self.is_page(id) {
             &mut self.host_pages
         } else {
@@ -666,6 +727,7 @@ impl RsStore {
         let mut freed = 0;
         for key in keys {
             if let Some(entry) = self.checkpoints.remove(key) {
+                self.cache_holds(*key, entry.snapshot, false);
                 freed += self.release_working_set(entry.snapshot);
             }
         }
@@ -810,8 +872,48 @@ impl RsStore {
             last_use: Instant::now(),
         };
         if let Some(old) = self.checkpoints.insert(key, kept) {
+            self.cache_holds(key, old.snapshot, false);
             self.release_working_set(old.snapshot);
         }
+        self.cache_holds(key, snapshot, true);
+    }
+
+    /// The checkpoint `key` takes (`hold`) or lets go its cache entry's
+    /// hold on the device rows of `snapshot`.
+    fn cache_holds(&mut self, key: Hash256, snapshot: RsWorkingSetId, hold: bool) {
+        let Some(entry) = self.working_sets.get(snapshot) else {
+            return;
+        };
+        let ids: BTreeSet<RsSlotId> = Self::slots(entry).filter(|&id| !self.is_host(id)).collect();
+        let (pages, slots): (Vec<RsSlotId>, Vec<RsSlotId>) =
+            ids.into_iter().partition(|&id| self.is_page(id));
+        let holder = Holder::CacheEntry(key);
+        for (pool, ids) in [(&mut self.slots, slots), (&mut self.pages, pages)] {
+            if hold {
+                pool.share(holder, &ids);
+            } else {
+                pool.unshare(holder, &ids);
+            }
+        }
+    }
+
+    /// Device rows only checkpoints hold: every reference the store
+    /// counts on them is a checkpoint's cache entry's.
+    pub fn cache_only(&self) -> RsUnits {
+        let mut ids = BTreeSet::new();
+        for entry in self.checkpoints.values() {
+            if let Some(snapshot) = self.working_sets.get(entry.snapshot) {
+                ids.extend(Self::slots(snapshot).filter(|&id| !self.is_host(id)));
+            }
+        }
+        self.units(ids.into_iter().filter(|&id| {
+            let pool = if self.is_page(id) {
+                &self.pages
+            } else {
+                &self.slots
+            };
+            pool.cache_refs(id) == self.ref_count(id)
+        }))
     }
 
     /// Whether any checkpoint is kept: cache a policy could let go.

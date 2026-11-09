@@ -1,6 +1,7 @@
 use std::sync::atomic::Ordering;
 use std::sync::{Arc, LazyLock, Mutex, RwLock};
 
+use super::chunks::StorePools;
 use super::kv::KvStore;
 use super::rs::RsStore;
 use super::seat::SeatBook;
@@ -72,6 +73,7 @@ pub fn register_model(kv_page_size: u32, num_kv_pages: &[usize], num_slots: &[us
 
 /// For a model with a window: the window and its ring's device and host pages
 /// instead.
+#[cfg(test)]
 #[derive(Clone, Copy, Debug, Default)]
 pub struct StatePool {
     pub slots: u32,
@@ -83,6 +85,8 @@ pub struct StatePool {
     pub host_window_pages: u32,
 }
 
+/// Today's pool counts as the pinned shapes the degenerate mode states.
+#[cfg(test)]
 pub fn register_model_with_swap(
     kv_page_size: u32,
     num_kv_pages: &[usize],
@@ -91,36 +95,72 @@ pub fn register_model_with_swap(
     state: &[StatePool],
     max_context: &[usize],
 ) -> usize {
-    let stores: Vec<Option<Stores>> = (0..num_kv_pages.len())
+    use super::chunks::ShapeRun;
+    let engines: Vec<EngineStores> = (0..num_kv_pages.len())
         .map(|d| {
-            let mut kv = KvStore::new_with_swap(
-                num_kv_pages[d] as u32,
-                num_host_pages.get(d).copied().unwrap_or(0) as u32,
-                num_disk_pages.get(d).copied().unwrap_or(0),
+            let pool = state.get(d).copied().unwrap_or_default();
+            let run = |device: u32, host: u32| ShapeRun {
+                device,
+                host,
+                ..ShapeRun::default()
+            };
+            EngineStores {
+                pools: StorePools {
+                    page_size: kv_page_size,
+                    kv: ShapeRun {
+                        disk: num_disk_pages.get(d).copied().unwrap_or(0),
+                        ..run(
+                            num_kv_pages[d] as u32,
+                            num_host_pages.get(d).copied().unwrap_or(0) as u32,
+                        )
+                    },
+                    window: ShapeRun {
+                        ids_from: 1,
+                        ..run(pool.window_pages.saturating_sub(1), pool.host_window_pages)
+                    },
+                    window_tokens: pool.window_tokens,
+                    state: run(pool.slots, pool.host_slots),
+                    buffer: run(pool.pages, pool.host_pages),
+                },
+                max_context: max_context.get(d).copied().unwrap_or(0),
+            }
+        })
+        .collect();
+    register_model_with_chunks(kv_page_size, &engines)
+}
+
+/// One engine's stores: its pools as chunks, and its longest context.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct EngineStores {
+    pub pools: StorePools,
+    pub max_context: usize,
+}
+
+/// Registers a model whose engines state their pools as `engines` say.
+pub fn register_model_with_chunks(kv_page_size: u32, engines: &[EngineStores]) -> usize {
+    let stores: Vec<Option<Stores>> = engines
+        .iter()
+        .map(|engine| {
+            let pools = &engine.pools;
+            let mut kv = KvStore::with_pages(
+                pools.kv,
+                pools.kv.host,
+                pools.kv.disk,
                 rand::random::<[u8; 32]>(),
             );
             if let Some(identity) = crate::model::identity() {
                 kv.set_domain(identity.domain());
             }
-            let pool = state.get(d).copied().unwrap_or_default();
             // KV alone resumes a model only when it has no recurrent state.
-            kv.set_keeps(kv_sharing() && pool.slots == 0 && pool.window_tokens == 0);
+            kv.set_keeps(kv_sharing() && pools.state.device == 0 && pools.window_tokens == 0);
             kv.set_page_size(kv_page_size);
             let kv = Arc::new(parking_lot::Mutex::new(kv));
-            let slots = pool.slots;
-            let max_context = max_context.get(d).copied().unwrap_or(0);
-            let rs = if pool.window_tokens > 0 {
-                RsStore::new_ring(
-                    crate::store::rs::RingGeometry {
-                        tokens: pool.window_tokens,
-                        page_size: kv_page_size,
-                    },
-                    pool.window_pages,
-                    pool.host_window_pages,
-                )
-            } else {
-                RsStore::new(slots, pool.pages, pool.host_slots, pool.host_pages)
-            };
+            let slots = pools.state.device;
+            let max_context = engine.max_context;
+            let rs = RsStore::of(&StorePools {
+                page_size: kv_page_size,
+                ..*pools
+            });
             Some(Stores {
                 kv,
                 rs: Arc::new(Mutex::new(rs)),

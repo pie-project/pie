@@ -1,3 +1,4 @@
+pub mod chunks;
 pub mod extent;
 pub(crate) mod genmap;
 pub(crate) mod kv;

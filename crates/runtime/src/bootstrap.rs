@@ -136,6 +136,10 @@ pub struct EngineConfig {
     /// reads.
     pub weights_fit: bool,
     pub total_pages: usize,
+    /// The pools as chunks: what the engine states
+    /// ([`::engine::Capabilities::chunks`]), else today's pools as the
+    /// degenerate mode's pinned shapes.
+    pub chunks: ::engine::chunk::ChunkFacts,
     /// Bytes a kv page takes where the pool can change size; zero: it cannot.
     pub resizable_kv_page_bytes: u64,
     /// The pool starts whole rather than growing on demand.
@@ -399,7 +403,6 @@ async fn bootstrap_inner(config: Config) -> Result<BootstrapHandle> {
         &metadata,
     )?;
 
-    let arena_kv_pages: Vec<usize> = engine_configs.iter().map(|d| d.total_pages).collect();
     let resizable: Vec<(u64, bool, u64)> = engine_configs
         .iter()
         .map(|d| {
@@ -417,26 +420,25 @@ async fn bootstrap_inner(config: Config) -> Result<BootstrapHandle> {
             state_slot_bytes: d.rs_cache_slot_bytes,
         })
         .collect();
-    let arena_cpu_pages: Vec<usize> = engine_configs.iter().map(|d| d.cpu_pages).collect();
-    let arena_disk_pages: Vec<u32> = engine_configs.iter().map(|d| d.disk_pages).collect();
     let arena_disk_kept: Vec<Option<KeptDisk>> =
         engine_configs.iter().map(|d| d.disk_kept.clone()).collect();
-    let arena_state: Vec<crate::store::registry::StatePool> = engine_configs
+    // Each engine's pools as chunks: what it states, else today's pools as
+    // the degenerate mode's pinned shapes.
+    let arena_stores = engine_configs
         .iter()
-        .map(|d| crate::store::registry::StatePool {
-            slots: d.rs_cache_slots as u32,
-            host_slots: d.rs_host_slots as u32,
-            pages: d.rs_buffer_pages,
-            host_pages: d.rs_host_buffer_pages,
-            window_tokens: d.window_tokens,
-            window_pages: d.window_pages,
-            host_window_pages: d.cpu_window_pages,
+        .map(|d| {
+            let mut pools = crate::store::chunks::StorePools::of(&d.chunks)
+                .map_err(|error| anyhow::anyhow!("engine pools: {error}"))?;
+            // A window the engine holds no pages for is still a window.
+            if pools.window_tokens == 0 {
+                pools.window_tokens = d.window_tokens;
+            }
+            Ok(crate::store::registry::EngineStores {
+                pools,
+                max_context: d.limits.max_context,
+            })
         })
-        .collect();
-    let arena_max_context: Vec<usize> = engine_configs
-        .iter()
-        .map(|d| d.limits.max_context)
-        .collect();
+        .collect::<Result<Vec<_>>>()?;
     let kv_swap_capable = engine_configs
         .first()
         .is_some_and(|d| d.cpu_pages > 0 || d.disk_pages > 0);
@@ -492,14 +494,12 @@ async fn bootstrap_inner(config: Config) -> Result<BootstrapHandle> {
         .collect();
 
     let _ = engine_count;
-    let arena_model_idx = crate::store::registry::register_model_with_swap(
-        kv_page_size as u32,
-        &arena_kv_pages,
-        &arena_cpu_pages,
-        &arena_disk_pages,
-        &arena_state,
-        &arena_max_context,
-    );
+    let arena_model_idx =
+        crate::store::registry::register_model_with_chunks(kv_page_size as u32, &arena_stores);
+    // The worker policy reads tier bytes off the stores' slot pools.
+    crate::policy::pressure::install_meter(Some(std::sync::Arc::new(
+        crate::store::chunks::SlotMeter,
+    )));
     for (d, kept) in arena_disk_kept.iter().enumerate() {
         let Some(kept) = kept else { continue };
         let stores = crate::store::registry::get(arena_model_idx, d);
