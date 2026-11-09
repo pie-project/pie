@@ -261,6 +261,7 @@ pub(super) fn bake(boot: &mut Boot<'_>) -> Result<Baked> {
         budget
     };
     let asked_tokens = boot.budget.max_tokens;
+    let asked = boot.budget.clone();
     let floor = boot.budget.max_lanes.max(TOKENS_FLOOR).min(asked_tokens);
     let window = crate::store::window_of(&boot.trace)?;
     let working = |tokens: u32, voxels: &Option<poem_compiler::VoxelLadder>| -> u64 {
@@ -436,6 +437,7 @@ pub(super) fn bake(boot: &mut Boot<'_>) -> Result<Baked> {
         regions,
         anchored,
         kept_slots,
+        asked,
     })
 }
 
@@ -448,8 +450,9 @@ pub(super) fn bake(boot: &mut Boot<'_>) -> Result<Baked> {
 /// leaves one sequence and the bodies' floor beside it. The tile yields
 /// first, held to the widest plane fired at token rows (a plane past it is
 /// served by the fused-dequant arm), then the token budget halves toward its
-/// floor, then the lanes halve toward one; `Pools::fit_the_card` still
-/// refuses past that.
+/// floor, then the lanes halve toward one, and what their cut frees grows the
+/// token budget back toward `asked`'s, the budget before `bake` cut it at the
+/// asked lanes; `Pools::fit_the_card` still refuses past that.
 #[allow(clippy::too_many_arguments)]
 fn refit(
     boot: &mut Boot<'_>,
@@ -460,6 +463,7 @@ fn refit(
     paging: Paging,
     table: &crate::run::WeightTable,
     engine: crate::chip::Engine,
+    asked: &Budget,
 ) -> Result<(CompiledModel, Budgets, Vec<u64>)> {
     let (free, total) = crate::store::device_memory()?;
     let live = crate::device::elastic::budget_bytes(free, total, boot.memory_share);
@@ -471,7 +475,7 @@ fn refit(
         let mut budget = boot.budget.clone();
         budget.max_lanes = lanes.min(tokens);
         budget.max_tokens = tokens;
-        let mut buckets: Vec<u32> = budget
+        let mut buckets: Vec<u32> = asked
             .buckets
             .iter()
             .copied()
@@ -563,6 +567,19 @@ fn refit(
         let lanes = crate::store::tokens_within(asked_lanes.min(tokens), 1, room, |lanes| {
             working_at(lanes, tokens, scoped)
         });
+        // A 1024-lane boot of MiniMax-M3.1-Flash mini60 on an H100 cut its fires to
+        // 1024 rows at 1024 lanes, then the lanes to 512: one 717-token prompt a fire.
+        // Back at 8192 rows: pf64-512 7.05k -> 10.35k tok/s (vLLM 9.03k at 1024
+        // sequences), pf1024-512 7.92k -> 10.37k (9.00k), c1024 2.69k -> 2.71k (2.72k).
+        let mut tokens = tokens;
+        while lanes < asked_lanes && tokens < asked.max_tokens {
+            let wider = tokens.saturating_mul(2).min(asked.max_tokens);
+            if working_at(lanes, wider, scoped) > room_at(wider, owed)? {
+                break;
+            }
+            tokens = wider;
+        }
+        let room = room_at(tokens, owed)?;
         Ok((working_at(lanes, tokens, scoped) <= room).then_some((tokens, lanes)))
     };
     let planes = decoded_weight_planes(&boot.trace, &compiled, table);
@@ -596,13 +613,14 @@ fn refit(
         return Ok((compiled, budgets, tiles_of(&planes, scoped)));
     }
     eprintln!(
-        "engine-cuda: [engine] max_forward_tokens {asked_tokens} and max_forward_requests \
+        "engine-cuda: [engine] max_forward_tokens {} and max_forward_requests \
          {asked_lanes} are served at {tokens} and {lanes}: at the asked budgets a fire's \
          working set (activation arena, attention workspaces, decoded-weight tiles, guest \
          programs) takes {} MiB of the {} MiB this card has after the weight tier under \
          [model] device_memory_share, past the half the cache rows are owed and what one \
          sequence at the declared context and the bodies' floor need. State smaller budgets \
          to choose them, or a larger device_memory_share.",
+        asked.max_tokens,
         working_at(asked_lanes, asked_tokens, scoped) >> 20,
         live >> 20,
     );
@@ -633,6 +651,7 @@ impl Shell {
             regions: folded,
             anchored,
             kept_slots,
+            asked,
         } = bake(&mut boot)?;
         // Every generated kernel compiled and loaded now, before a fire can
         // ask for one.
@@ -759,6 +778,7 @@ impl Shell {
             paging,
             weights.table(),
             engine,
+            &asked,
         )?;
         let paging = paging
             .windowed(
@@ -1675,6 +1695,8 @@ pub(super) struct Baked {
     pub(super) anchored: std::collections::BTreeMap<u64, kernels_ir::Anchored>,
     /// The state slots `Pools::keep_slots` keeps, before the lanes cap them.
     pub(super) kept_slots: u32,
+    /// The budget asked before the card cut its tokens at the asked lanes.
+    pub(super) asked: Budget,
 }
 
 /// The widest fire whose lanes of `rows` prompt rows put no more (lane,
