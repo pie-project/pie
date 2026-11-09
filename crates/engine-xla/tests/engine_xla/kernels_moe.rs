@@ -1064,8 +1064,8 @@ fn the_grouped_matmul_kernel_answers_the_host() {
 
 /// The routed MLP on one sort (`moe::experts`) lands, for every token, the
 /// sum the gate-up select, its GLU, the down select and the weighted sum
-/// land one by one: bit for bit, under either GLU, at a prefill's pairs and
-/// at a batch's.
+/// land one by one, under either GLU, at a prefill's pairs and at a batch's:
+/// to bf16 rounding (it weighs each row before the down leg, not after).
 #[test]
 fn the_routed_mlp_on_one_sort_answers_its_parts() {
     let (e, h, i) = (8usize, 256usize, 128usize);
@@ -1167,6 +1167,7 @@ fn the_routed_mlp_on_one_sort_answers_its_parts() {
         let (Some(fused), Some(parts)) = (run(true), run(false)) else {
             return;
         };
-        assert_eq!(fused, parts, "{t} tokens at fan-out {tk}, {glu:?}");
+        let scale = parts.iter().fold(0f32, |m, v| m.max(v.abs()));
+        assert_close(&fused, &parts, 0.01 * scale.max(1.0), 1e-2);
     }
 }
