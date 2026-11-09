@@ -1035,12 +1035,10 @@ pub fn lse(
     let lanes = f.dims(indptr)[0] - 1;
     if sel.is_none() && div > 1 && n > tuning.attn_per_row_max * lanes {
         use super::paged::{Heads, Planes, Rows, Rule, blocked, geometry, with_i};
-        let (cells, w) = (f.dims(table)[0], f.dims(table)[1]);
-        let view = f.reshape(table, &[cells / div, div * w])?;
         let geom = geometry(f, indptr, indices, ps, i64::from(entries.max_pages))?;
         let planes = Planes::Paged {
-            keys: view,
-            values: view,
+            keys: table,
+            values: table,
             geom,
             latent: true,
         };
