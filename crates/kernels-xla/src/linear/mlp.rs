@@ -8,7 +8,7 @@ use dtype::Dtype;
 
 use crate::check::expect;
 use crate::error::{Error, refuse};
-use crate::hlo::{Func, Val};
+use crate::hlo::{Elem, Func, Val};
 use crate::tensor::{Landing, Operand, Stored};
 
 /// The gate and up halves of a packed `[rows, 2 · intermediate]` row, in f32.
@@ -39,11 +39,12 @@ fn halves(
 }
 
 fn read_halves(f: &mut Func, packed: Operand, intermediate: u32) -> Result<(Val, Val), Error> {
-    let p = packed.f32(f);
+    // Each half cut before it widens: one f32 plane read by two slices landed
+    // whole (v6e gpt-oss 1792-row prefill: f32[7168, 5760] every layer).
     let i = i64::from(intermediate);
-    let g = f.slice_axis(p, 1, 0, i)?;
-    let u = f.slice_axis(p, 1, i, 2 * i)?;
-    Ok((g, u))
+    let g = f.slice_axis(packed.val, 1, 0, i)?;
+    let u = f.slice_axis(packed.val, 1, i, 2 * i)?;
+    Ok((f.convert(g, Elem::F32), f.convert(u, Elem::F32)))
 }
 
 fn split(

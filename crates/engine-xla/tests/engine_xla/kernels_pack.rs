@@ -46,6 +46,8 @@ fn bf16s(xs: &[f32]) -> Vec<u8> {
 struct Native {
     planes: Vec<(Dtype, u32, u32, Vec<u8>)>,
     tuning: Tuning,
+    /// The last module run.
+    module: String,
 }
 
 impl Native {
@@ -89,6 +91,7 @@ impl Native {
         let written: Vec<u32> = env.written.iter().copied().collect();
         let results: Vec<Val> = written.iter().map(|b| env.current[b]).collect();
         let text = func.module("pack", &results);
+        self.module = text.clone();
         let client = client.lock().unwrap();
         let dev = client.device(0).expect("a device");
         let exe = client
@@ -513,6 +516,80 @@ fn routed_banks_read_native_codes_and_prescaled_weights_every_way() {
             let b = (i % 2 == 1).then_some(&bias[..]);
             let want = select_ref(&bank.w, e, n, k, &x, &routes, tk, b, 7.0);
             check(&nat.read(*y), &want);
+        }
+    }
+}
+
+/// mxfp4 codes as landed (`f4E2M1FN`, their exponent bytes beside them) run
+/// the grouped-matmul kernel under the default profile, the codes converted
+/// and scaled in VMEM: an `E·N`-minor bank in whole lane blocks and in
+/// per-expert element windows (N not whole lane tiles, as gpt-oss's down
+/// bank); more than one token, and a crowded expert (one token, a decode,
+/// slices its experts out); unrouted pairs; with and without a bias.
+#[test]
+fn mxfp4_codes_run_the_grouped_matmul_kernel() {
+    for (e, n, k) in [(4usize, 256usize, 160usize), (4, 192, 160)] {
+        let bank = mxfp4(e * n, k, 60 + n as u32);
+        let bias = data(e * n, 61);
+        for (t, tk, crowded) in [(1usize, 4usize, false), (9, 3, false), (20, 4, true)] {
+            let x = data(t * k, 62 + t as u32);
+            let mut routes: Vec<i32> = (0..t * tk)
+                .map(|i| (hash(i, 63 + t as u32) % e as u32) as i32)
+                .collect();
+            if crowded {
+                for (i, r) in routes.iter_mut().enumerate() {
+                    if i % 5 != 0 {
+                        *r = 2;
+                    }
+                }
+            }
+            routes[1] = -1;
+            let mut nat = Native::default();
+            let xt = nat.bf16(t as u32, k as u32, &x);
+            let rt = nat.add(
+                Dtype::I32,
+                t as u32,
+                tk as u32,
+                routes.iter().flat_map(|r| r.to_le_bytes()).collect(),
+            );
+            let bt = nat.bf16(e as u32, n as u32, &bias);
+            let landed = bank.land(&mut nat, e as u32, false);
+            let plain = nat.bf16((t * tk) as u32, n as u32, &vec![7.0; t * tk * n]);
+            let biased = nat.bf16((t * tk) as u32, n as u32, &vec![7.0; t * tk * n]);
+            let ran = nat.run(|ctx| {
+                engine_xla::lower::lower(ctx, |l| {
+                    let x_v = l.read(xt)?;
+                    let routes_v = l.read(rt)?;
+                    let y_v = l.read(plain)?;
+                    let bank_v = l.bank(landed)?;
+                    let tuning = l.tuning();
+                    let v = moe::matmul_select_quant(l.f(), x_v, bank_v, routes_v, y_v, tuning)?;
+                    l.land(plain, v)
+                })?;
+                engine_xla::lower::lower(ctx, |l| {
+                    let x_v = l.read(xt)?;
+                    let routes_v = l.read(rt)?;
+                    let bias_v = l.read(bt)?;
+                    let y_v = l.read(biased)?;
+                    let bank_v = l.bank(landed)?;
+                    let tuning = l.tuning();
+                    let v =
+                        moe::matmul_select_bias(l.f(), x_v, bank_v, bias_v, routes_v, y_v, tuning)?;
+                    l.land(biased, v)
+                })
+            });
+            if !ran {
+                return;
+            }
+            // (One token's pairs are each sliced out of the bank instead.)
+            assert!(
+                t == 1 || nat.module.contains("tpu_custom_call"),
+                "the kernel ran for {e}x{n}x{k}"
+            );
+            for (y, b) in [(plain, None), (biased, Some(&bias[..]))] {
+                let want = select_ref(&bank.w, e, n, k, &x, &routes, tk, b, 7.0);
+                check(&nat.read(y), &want);
+            }
         }
     }
 }

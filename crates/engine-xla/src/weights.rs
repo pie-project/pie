@@ -620,6 +620,22 @@ pub(crate) fn serves_this_deployment(path: &Path, backend: &str, deployment: &st
         .map_err(|mismatch| Fault::Recipe(mismatch.refuse(&path.display().to_string())))
 }
 
+/// The bytes landing every mxfp4 bank pre-scaled (e5m2, `Mxfp4Prescale`)
+/// adds to its e2m1 codes: the codes once more. Zero when the profile never
+/// pre-scales.
+pub(crate) fn prescale_bytes(trace: &Trace, engine: &Engine) -> Result<u64> {
+    if engine.prescale != Mxfp4Prescale::Fits {
+        return Ok(0);
+    }
+    trace
+        .params
+        .iter()
+        .filter(|p| p.dtype == Dtype::Mxfp4)
+        .try_fold(0u64, |sum, p| {
+            plane_bytes(&p.name, p.dtype, &p.shape).map(|b| sum + b)
+        })
+}
+
 /// The dense bf16 params every reader of which is a gemm taking it as its
 /// weight (`y = act · wᵀ`). They land transposed, `[K, N]` with the output
 /// axis minor: XLA's TPU gemm streams a `[N, K]` weight at ~1.2-1.4 TB/s
@@ -826,7 +842,6 @@ fn gather_only(
         _ => None,
     };
     let mut other = std::collections::BTreeSet::new();
-    let mut concat = std::collections::BTreeSet::new();
     let mut inputs = Vec::new();
     for node in &trace.nodes {
         inputs.clear();
@@ -844,10 +859,7 @@ fn gather_only(
                 weights: None,
                 concat: true,
                 ..
-            }) => {
-                concat.extend(param_of(*table));
-                Some(*table)
-            }
+            }) => Some(*table),
             _ => None,
         };
         for &v in &inputs {
@@ -866,12 +878,11 @@ fn gather_only(
     }
     out.retain(|&p| {
         let param = &trace.params[p];
-        // a dense table a concat gather reads (the n-gram table) whose rows
-        // do not tile 128 lanes: `[V, 160]` bf16 landed column-major, every
-        // fire relayouted all of it (9.4 GiB of temporaries for the 6 GiB
-        // Qwen3.8-Flash-Next mini's)
+        // a dense table only gathers read whose rows do not tile 128 lanes:
+        // `[V, 160]` bf16 landed column-major, every fire relayouted all of it
+        // (9.4 GiB of temporaries for the 6 GiB Qwen3.8-Flash-Next mini's
+        // n-gram table; gpt-oss's 2880-wide embedding, 1.9 ms a fire)
         let dense = !codes.contains(&p)
-            && concat.contains(&p)
             && param.shape.len() == 2
             && !param.shape[1].is_multiple_of(128)
             && matches!(param.dtype, Dtype::Bf16 | Dtype::F16 | Dtype::F32);

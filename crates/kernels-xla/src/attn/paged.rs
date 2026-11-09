@@ -535,6 +535,15 @@ fn logits(
         let lt = cmp_i(f, Cmp::Lt, kp, rule.bound.min(pitch))?;
         let inb = f.and(ge, lt)?;
         let cell = match kbase {
+            // A one-byte plane (no lane states a mask) reads its row's byte
+            // at every key (only key 0 is in bounds): a broadcast, where a
+            // gather of a byte a cell took 0.1-0.3 ms a layer at 256 decode
+            // lanes (v6e gpt-oss), and the window below, which XLA rewrites
+            // to one too (0.1 ms a layer).
+            _ if pitch == 1 => {
+                let col = f.reshape(plane, &[rb])?;
+                f.broadcast(col, &dims, &[0])?
+            }
             // Every row reads columns `base .. base + c`: one window of the
             // plane (zero past its pitch) instead of a gather per cell.
             Some(base) => {
@@ -1161,7 +1170,15 @@ pub(crate) fn blocked(
 ) -> Built<Flashed> {
     let r = f.dims(rows.q)[0];
     let qh = h.qh().max(1);
-    let br = ch.block_rows.min(round_up(r, 8));
+    // A sliding window at most half a block of rows: blocks a window wide,
+    // so a block's chunks cover its rows and the window behind them, not a
+    // whole block's keys past it (gpt-oss's 128-key layers: 128-row blocks
+    // over 256-key chunks, against 512 rows over 1024 keys).
+    let narrow = rule
+        .window
+        .map(|w| round_up(w.max(1), 128))
+        .filter(|&w| 2 * w <= ch.block_rows);
+    let br = narrow.unwrap_or(ch.block_rows).min(round_up(r, 8));
     let nb = cdiv(r, br);
     let rp = nb * br;
     let rows_p = if rp > r {
@@ -1172,6 +1189,7 @@ pub(crate) fn blocked(
     let width = (h.kvh * (h.d + h.dv)).max(1);
     let fit = pow2_floor((ch.budget / (br * qh)).min(ch.budget / width).max(8));
     let c = ch.block_keys.min(fit).min(round_up(keys.max(1), 8));
+    let c = narrow.map_or(c, |w| c.min(2 * w));
     // Lanes narrower than a chunk: walk them a span at a time, so no chunk
     // straddles two lanes (the mask is then read as a window, below).
     let c = match rule.kp_span {
