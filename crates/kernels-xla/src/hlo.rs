@@ -683,10 +683,26 @@ impl Func {
             }
             let _ = write!(s, "{}: {}", self.name(*v), self.ty(*v));
             if let Some(out) = alias {
-                let _ = write!(s, " {{tf.aliasing_output = {out} : i32}}");
+                let _ = write!(
+                    s,
+                    " {{mhlo.layout_mode = \"default\", tf.aliasing_output = {out} : i32}}"
+                );
             }
         }
-        let _ = writeln!(s, ") -> ({}) {{", self.tys_of(results));
+        // An aliased result keeps its parameter's (the device's default)
+        // layout: a result laid out otherwise is a copy of the whole pool
+        // plane every fire (a 64-wide rope plane is column-major on a TPU).
+        let mut outs = String::new();
+        for (i, v) in results.iter().enumerate() {
+            if i > 0 {
+                outs.push_str(", ");
+            }
+            let _ = write!(outs, "{}", self.ty(*v));
+            if self.params.iter().any(|(_, a)| *a == Some(i as u32)) {
+                outs.push_str(" {mhlo.layout_mode = \"default\"}");
+            }
+        }
+        let _ = writeln!(s, ") -> ({outs}) {{");
         s.push_str(&self.body);
         let _ = writeln!(
             s,
@@ -1961,7 +1977,7 @@ mod tests {
         let c = f.add(a, b).unwrap();
         let s = f.reduce(c, &[1], Fold::Sum).unwrap();
         let text = f.module("m", &[c, s]);
-        assert!(text.contains("func.func public @main(%arg0: tensor<2x3xf32>, %arg1: tensor<2x3xf32> {tf.aliasing_output = 0 : i32}) -> (tensor<2x3xf32>, tensor<2xf32>)"));
+        assert!(text.contains("func.func public @main(%arg0: tensor<2x3xf32>, %arg1: tensor<2x3xf32> {mhlo.layout_mode = \"default\", tf.aliasing_output = 0 : i32}) -> (tensor<2x3xf32> {mhlo.layout_mode = \"default\"}, tensor<2xf32>)"));
         assert!(text.contains("\"stablehlo.add\"(%arg0, %arg1)"));
         assert!(text.contains("\"stablehlo.reduce\""));
     }
