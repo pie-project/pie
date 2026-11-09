@@ -180,7 +180,7 @@ pub struct Run<'c> {
     /// Routes `linear.group_routes` built (every row's slot `g` routed to
     /// group `g`), with their group count.
     pub(crate) group_routes: Vec<(ValueId, u32)>,
-    /// Boundary positions `attn.pool_boundary` marked, with the ratio their
+    /// Boundary positions a compressor gathered at, with the ratio their
     /// blocks close at.
     pub(crate) boundaries: Vec<(ValueId, u32)>,
     /// Routed results the grouped-matmul kernel left in its tile order, by
