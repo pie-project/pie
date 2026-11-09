@@ -1337,6 +1337,49 @@ fn routed(
         forced => forced,
     };
     let y = match path {
+        MoePath::Slice if matches!((form, bank.codes), (Form::Mxfp4 { .. }, Codes::E2m1(_))) => {
+            // e2m1 codes as landed: each pair's expert read straight from the
+            // bank by an elementwise product and reduce, which XLA fuses with
+            // the slice (a dot over the grouped codes copies the slice first,
+            // at ~180 GB/s on v5e), its exponents sliced before they widen.
+            let Form::Mxfp4 { scales, .. } = form else {
+                unreachable!()
+            };
+            let s = scales.val;
+            let s = if f.elem(s) == Elem::U8 {
+                s
+            } else {
+                f.bitcast(s, Elem::U8)?
+            };
+            let s = f.reshape(s, &[e * n, groups])?;
+            let codes = bank.codes.val();
+            let g = k / groups;
+            let x = f.convert(x, Elem::F32);
+            let nn = f.const_i(Elem::I32, n, &[]);
+            let zero = f.const_i(Elem::I32, 0, &[]);
+            let mut ys = Vec::with_capacity(p as usize);
+            for i in 0..p {
+                let id = f.slice(ids, &[i], &[i + 1], &[1])?;
+                let id = f.reshape(id, &[])?;
+                let at = f.mul(id, nn)?;
+                let c = f.dynamic_slice(codes, &[at, zero], &[n, k])?;
+                let c = f.convert(c, Elem::F32);
+                let c = f.reshape(c, &[n, groups, g])?;
+                let row = if fan.per_token { i / fan.top_k } else { i };
+                let xr = f.slice(x, &[row, 0], &[row + 1, k], &[1, 1])?;
+                let xr = f.reshape(xr, &[groups, g])?;
+                let xr = f.broadcast(xr, &[n, groups, g], &[1, 2])?;
+                let part = f.mul(c, xr)?;
+                let part = f.reduce(part, &[2], Fold::Sum)?;
+                let sc = f.dynamic_slice(s, &[at, zero], &[n, groups])?;
+                let sc = f.convert(sc, Elem::U32);
+                let sc = e8m0(f, sc)?;
+                let y = f.mul(part, sc)?;
+                let y = f.reduce(y, &[1], Fold::Sum)?;
+                ys.push(f.reshape(y, &[1, n])?);
+            }
+            f.concat(&ys, 0)?
+        }
         MoePath::Slice => {
             // Each pair's expert sliced out of the bank and multiplied by its
             // row alone: independent dots XLA overlaps, no join.
