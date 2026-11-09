@@ -24,7 +24,7 @@ cargo clippy $(pkgs "${NATIVE_CRATES[@]}") --features runtime/wgpu,engine-wgpu/w
 cargo test -q $(pkgs "${NATIVE_CRATES[@]}") --features runtime/wgpu,engine-wgpu/wgpu
 
 echo "== javascript"
-for f in packages/javascript/server-web/src/*.mjs tests/browser/*.mjs tests/browser/tools/*.mjs scripts/bench/browser/*.mjs; do
+for f in packages/javascript/server-web/src/*.mjs tests/browser/*.mjs tests/browser/tools/*.mjs; do
   node --check "$f"
 done
 for f in tests/browser/*.html crates/kernels-slang/tools/*.html; do

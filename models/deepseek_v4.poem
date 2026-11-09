@@ -1021,7 +1021,7 @@ def v41(m, reads, mlx):
     reads.read(m.final_norm, "model.norm.weight" if mlx else "norm.weight")
     if m.token_map != None:
         if not has("engram.token_map"):
-            fail("`{}`: Engram hashes tokenizer-compressed ids, and this checkpoint carries no `engram.token_map`; write it beside the weights with `scripts/bench/engram_token_map.py` first".format(m.token_map.name))
+            fail("`{}`: Engram hashes tokenizer-compressed ids, and this checkpoint carries no `engram.token_map`; write it beside the weights first (bench/engram_token_map.py in pie-project/benchmarks builds it)".format(m.token_map.name))
         reads.read(m.token_map, "engram.token_map")
 
     for l, w in enumerate(m.layers):

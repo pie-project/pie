@@ -239,5 +239,4 @@ tests/browser/inferlets/
 tests/browser/languages/
 tests/browser/tools/package*.json
 crates/kernels-slang/tools/wgsl/
-scripts/bench/browser/results/*.raw
 .rocprofv3/
