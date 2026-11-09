@@ -47,7 +47,7 @@ use crate::check::expect;
 use crate::error::{Error, refuse};
 use crate::hlo::{Cmp, Elem, Fold, Func, GatherDims, Ty, Val};
 use crate::linear::quant::{
-    Codes, code_values, e8m0, grouped_dot, materialize, offset_dot, read_codes,
+    Codes, TILE, code_values, e8m0, grouped_dot, materialize, offset_dot, read_codes, tile_factor,
 };
 use crate::tensor::{Bank, Landing, Operand, Stored};
 use crate::tuning::{MoePath, Tuning};
@@ -732,6 +732,9 @@ enum Form<T = Operand> {
     },
     /// e2m1 codes, one e8m0 exponent byte per 32 (or pre-scaled weights).
     Mxfp4 { codes: T, scales: T },
+    /// e4m3 codes, one f32 factor a 128x128 block of each expert's `[N, K]`
+    /// (`[E·⌈N/128⌉, K/128]`): a block-FP8 release's experts as released.
+    Tile { codes: T, scales: T },
 }
 
 impl<T> Form<T> {
@@ -740,6 +743,7 @@ impl<T> Form<T> {
             Self::Dense(_) => 16,
             Self::Affine { bits, .. } => bits,
             Self::Mxfp4 { .. } => 4,
+            Self::Tile { .. } => 8,
         }
     }
 
@@ -748,6 +752,7 @@ impl<T> Form<T> {
             Self::Dense(_) => 1,
             Self::Affine { group, .. } => group,
             Self::Mxfp4 { .. } => MXFP4_BLOCK,
+            Self::Tile { .. } => TILE as u32,
         }
     }
 }
@@ -768,6 +773,13 @@ fn form_of<T: Stored>(op: &'static str, bank: Bank<T>) -> Result<Form<T>, Error>
         (None, MXFP4_BLOCK, 4) => {
             expect(op, bank.scales, &[Dtype::U8, Dtype::E8m0])?;
             Ok(Form::Mxfp4 {
+                codes: bank.codes,
+                scales: bank.scales,
+            })
+        }
+        (None, group, 8) if i64::from(group) == TILE && bank.codes.dtype() == Dtype::E4m3 => {
+            expect(op, bank.scales, &[Dtype::F32])?;
+            Ok(Form::Tile {
                 codes: bank.codes,
                 scales: bank.scales,
             })
@@ -807,7 +819,7 @@ impl Fan {
 
 /// Codes a codes plane stores, counted in `bits`-wide codes.
 fn stored_codes(op: &'static str, codes: impl Stored, bits: u32) -> Result<u64, Error> {
-    if codes.dtype() == Dtype::E5m2 {
+    if matches!(codes.dtype(), Dtype::E5m2 | Dtype::E4m3) {
         return Ok(codes.elements());
     }
     if let Some(per) = crate::pack::codes_per_row(codes.dtype(), u64::from(codes.width())) {
@@ -871,7 +883,9 @@ fn fan_of(
             }
             bank.elements() / per
         }
-        Form::Affine { codes, scales, .. } | Form::Mxfp4 { codes, scales } => {
+        Form::Affine { codes, scales, .. }
+        | Form::Mxfp4 { codes, scales }
+        | Form::Tile { codes, scales } => {
             let group = u64::from(form.group());
             if !k64.is_multiple_of(group) {
                 return Err(refuse(
@@ -887,7 +901,13 @@ fn fan_of(
                 ));
             }
             let experts = stored / per;
-            let factors = experts * n64 * (k64 / group);
+            // A block-FP8 factor covers 128 rows as well as 128 codes.
+            let rows = if matches!(form, Form::Tile { .. }) {
+                n64.div_ceil(group)
+            } else {
+                n64
+            };
+            let factors = experts * rows * (k64 / group);
             let planes = match form {
                 Form::Affine { biases, .. } => vec![scales, biases],
                 _ => vec![scales],
@@ -955,6 +975,26 @@ fn read_bank(f: &mut Func, form: Form, fan: Fan) -> Result<Read, Error> {
                 codes: c,
                 factor: Some(f.reshape(s, &[rows, groups])?),
                 bias: Some(f.reshape(b, &[rows, groups])?),
+            }
+        }
+        Form::Tile { codes, scales } => {
+            let c = read_codes(f, codes, 8, false, rows, fan.k)?;
+            // Each expert's block rows repeat over its rows.
+            let nb = (fan.n + TILE - 1) / TILE;
+            let s = f.reshape(scales.val, &[fan.experts, nb * groups])?;
+            let s = f.reshape(s, &[fan.experts * nb, groups])?;
+            let s = tile_factor(f, s, fan.experts * nb * TILE)?;
+            let s = if nb * TILE == fan.n {
+                s
+            } else {
+                let s = f.reshape(s, &[fan.experts, nb * TILE, groups])?;
+                let s = f.slice_axis(s, 1, 0, fan.n)?;
+                f.reshape(s, &[rows, groups])?
+            };
+            Read {
+                codes: c,
+                factor: Some(s),
+                bias: None,
             }
         }
         Form::Mxfp4 { codes, scales } => {
@@ -1067,9 +1107,13 @@ fn gmm_spec(
     let off = !tuning.moe_gmm();
     // mxfp4 codes as landed (`f4E2M1FN`), their exponents beside them.
     let scaled = mxfp4 && matches!(bank.codes, Codes::E2m1(_)) && elem == Elem::F4E2m1fn;
+    // Block-FP8 codes, their f32 block factors beside them (the codes land
+    // `[K, E·N]`: see engine-xla's `gemm_only`).
+    let tile =
+        elem == Elem::F8E4m3fn && bank.factor.is_some() && matches!(bank.codes, Codes::Int(_));
     if off
-        || (bank.factor.is_some() && !scaled)
-        || !(matches!(bank.codes, Codes::Weights(_)) || scaled)
+        || (bank.factor.is_some() && !scaled && !tile)
+        || !(matches!(bank.codes, Codes::Weights(_)) || scaled || tile)
         || !matches!(
             elem,
             Elem::Bf16 | Elem::F8E5m2 | Elem::F8E4m3fn | Elem::F4E2m1fn
@@ -1094,13 +1138,83 @@ fn gmm_spec(
         n: fan.n,
         experts: e,
         w: elem,
-        orient: Orient::of(e * fan.n, fan.k),
+        orient: if tile {
+            Orient::KMajor
+        } else {
+            Orient::of(e * fan.n, fan.k)
+        },
         scaled,
+        tile,
         bias: false,
         out: Elem::F32,
         prefetch: !mxfp4,
     };
     spec.out_width().ok().map(|_| spec)
+}
+
+/// `x [m, K] · wᵀ` for block-FP8 codes `codes [N, K]` (landed `[K, N]`)
+/// with their f32 factors a row `factor [N, K/128]`: the grouped-matmul
+/// kernel over one expert, f32 `[m, N]`. `None` when no block of the
+/// weight fits the kernel.
+pub(crate) fn tile_projection(
+    f: &mut Func,
+    x: Val,
+    codes: Val,
+    factor: Val,
+    tuning: Tuning,
+) -> Result<Option<Val>, Error> {
+    use crate::linear::moe_gmm::{Gmm, Orient};
+    let (m, k) = (f.dims(x)[0], f.dims(x)[1]);
+    let n = f.dims(codes)[0];
+    if !tuning.moe_gmm() || k % TILE != 0 {
+        return Ok(None);
+    }
+    // The rows in one tile where their double-buffered block fits 64 MiB:
+    // a prompt's tile widens each block of codes once for all its rows
+    // (`moe_gmm::Gmm::widens`; v6e, 24576x6144 at 2048 rows: 0.73 ms in one
+    // tile, as bf16's 0.72, against 1.34 widened in two). Rows past one tile
+    // take the 128-deep dots in 512-row tiles instead.
+    let most = (64 << 20) / (4 * k) / 16 * 16;
+    let rows = ((m + 15) / 16) * 16;
+    let tm = if rows <= most.max(512) { rows } else { 512 };
+    let tiles = (m + tm - 1) / tm;
+    let spec = Gmm {
+        tiles,
+        tm,
+        block_bytes: tuning.moe_gmm_block_bytes,
+        vmem_cap: tuning.vmem_cap(),
+        k,
+        n,
+        experts: 1,
+        w: Elem::F8E4m3fn,
+        orient: Orient::KMajor,
+        scaled: false,
+        tile: true,
+        bias: false,
+        out: Elem::F32,
+    };
+    if spec.out_width().ok() != Some(n) {
+        return Ok(None);
+    }
+    let kernel = spec.kernel()?;
+    let se = f.const_i(Elem::I32, 0, &[tiles]);
+    let nt = f.const_i(Elem::I32, tiles, &[1]);
+    let x = f.convert(x, Elem::Bf16);
+    let xs = if tiles * tm > m {
+        let z = f.const_f(Elem::Bf16, 0.0, &[]);
+        f.pad(x, z, &[0, 0], &[tiles * tm - m, 0], &[0, 0])?
+    } else {
+        x
+    };
+    // The device's layouts: free transposes.
+    let w = f.transpose(codes, &[1, 0])?;
+    let s = f.transpose(factor, &[1, 0])?;
+    let y = kernel.call(f, &[se, nt, xs, w, s])?[0];
+    Ok(Some(if tiles * tm > m {
+        f.slice_axis(y, 0, 0, m)?
+    } else {
+        y
+    }))
 }
 
 /// A kernel spec landing its rows in bf16 (no bias follows).
@@ -1328,6 +1442,13 @@ fn tile_kernel(
             f.bitcast(s, Elem::U8)?
         };
         let s = f.reshape(s, &[e * n, fan.k / 32])?;
+        let s = f.transpose(s, &[1, 0])?;
+        let ops: Vec<Val> = [se, nt, xs, w, s].into_iter().chain(bias).collect();
+        kernel.call(f, &ops)?[0]
+    } else if spec.tile {
+        // The factors a row (`[E·N, K/128]`), read `[K/128, E·N]` as the
+        // codes are.
+        let s = scales.ok_or_else(|| refuse("linear.moe", "block-FP8 codes with no factors"))?;
         let s = f.transpose(s, &[1, 0])?;
         let ops: Vec<Val> = [se, nt, xs, w, s].into_iter().chain(bias).collect();
         kernel.call(f, &ops)?[0]
@@ -1746,6 +1867,9 @@ fn routed(
         // Qwen3.6-35B-A3B's 4 MiB experts: Raw decode 133 -> 176 tok/s).
         MoePath::Auto { .. }
             if p <= c.slice_pairs
+                // (a block-FP8 bank's pairs run the kernel: sliced, they
+                // would contract in XLA's group-batched dot)
+                && !grouped.is_some_and(|g| g.tile)
                 && ((fan.tokens == 1 && grouped.is_some())
                     || p * expert_bytes.max(c.slice_bytes) < bank_bytes) =>
         {
@@ -1779,7 +1903,7 @@ fn routed(
         MoePath::Gmm => match grouped {
             // A dense bank: without an expert bias the sums only round to
             // bf16 after the kernel, which lands them bf16.
-            Some(mut spec) if !mxfp4 => {
+            Some(mut spec) if !mxfp4 && !spec.tile => {
                 spec.out = if bias.is_some() {
                     Elem::F32
                 } else {
@@ -1790,6 +1914,7 @@ fn routed(
             Some(mut spec) => {
                 let scales = match form {
                     Form::Mxfp4 { scales, .. } => Some(scales.val),
+                    Form::Tile { .. } => bank.factor,
                     _ => None,
                 };
                 // The bias joins the product inside the kernel where its cut
