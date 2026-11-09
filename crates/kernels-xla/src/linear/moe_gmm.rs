@@ -215,10 +215,12 @@ impl Gmm {
             window: Window::Blocked,
             index: Box::new(|b: &mut Body, g: &Grid| Ok(vec![last(b, g)?, b.i32(0)])),
         };
+        // e2m1 codes enter as their bits (`u4`): Mosaic here has no f4 vector.
+        let welem = if self.scaled { Elem::U4 } else { self.w };
         let bank = match (orient, cut) {
             (Orient::KMajor, Cut::Blocked { tn }) => Operand {
                 array: self.bank_dims().to_vec(),
-                elem: self.w,
+                elem: welem,
                 block: vec![k, tn],
                 window: Window::Blocked,
                 index: Box::new(move |b: &mut Body, g: &Grid| {
@@ -231,7 +233,7 @@ impl Gmm {
             },
             (Orient::KMajor, Cut::Element { width }) => Operand {
                 array: self.bank_dims().to_vec(),
-                elem: self.w,
+                elem: welem,
                 block: vec![k, width],
                 window: Window::Element,
                 index: Box::new(move |b: &mut Body, g: &Grid| {
@@ -354,53 +356,73 @@ impl Gmm {
     }
 }
 
-/// e2m1 codes `w` (`[K, cols]`) as bf16, each times `2^(s - 127)` of its
-/// 32-code block's exponent byte (`s`: `[K / 32, cols]`): an exact product,
-/// the codes holding two significant bits.
+/// e2m1 codes `w` (`[K, cols]`, as `u4`) as bf16, each times
+/// `2^(s - 127)` of its 32-code block's exponent byte (`s`: `[K / 32, cols]`),
+/// built as f32 bits: an exact product, the codes holding two significant
+/// bits. A magnitude code `m >= 2` is `2^((m >> 1) - 1) · (1 + (m & 1) / 2)`,
+/// so its bits are `m << 22` with the exponent `s - 1` added; `m = 1` (0.5) is
+/// that exponent alone and `m = 0` is zero.
 fn scale_codes(b: &mut Body, w: V, s: V, groups: i64, cols: i64) -> Built<V> {
     use crate::mosaic::MTy;
     let k = groups * 32;
-    let w = b.convert_f(w, Elem::F32)?;
-    let wide = MTy::Vector(vec![groups, cols], Elem::I32);
-    let s = b.op("arith.extui", &[s], "", &[wide.clone()])[0];
-    let shift = b.op(
-        "arith.constant",
-        &[],
-        &format!("value = dense<23> : {wide}"),
-        &[wide.clone()],
+    let int = |d: &[i64]| MTy::Vector(d.to_vec(), Elem::I32);
+    let full = int(&[k, cols]);
+    let splat = |b: &mut Body, x: i64, t: &MTy| {
+        b.op(
+            "arith.constant",
+            &[],
+            &format!("value = dense<{x}> : {t}"),
+            &[t.clone()],
+        )[0]
+    };
+    let bin = |b: &mut Body, op: &str, x: V, y: V| {
+        let t = b.ty(x).clone();
+        let attrs = if matches!(op, "arith.shli" | "arith.addi" | "arith.subi") {
+            "overflowFlags = #arith.overflow<none>"
+        } else {
+            ""
+        };
+        b.op(op, &[x, y], attrs, &[t])[0]
+    };
+    // The block's exponent, less one, in an f32 exponent field, every code's.
+    let g = int(&[groups, cols]);
+    let e = b.op("arith.extui", &[s], "", &[g.clone()])[0];
+    let one = splat(b, 1, &g);
+    let e = bin(b, "arith.subi", e, one);
+    let at = splat(b, 23, &g);
+    let e = bin(b, "arith.shli", e, at);
+    let e = b.op("vector.shape_cast", &[e], "", &[int(&[groups, 1, cols])])[0];
+    let e = b.op("vector.broadcast", &[e], "", &[int(&[groups, 32, cols])])[0];
+    let e = b.op("vector.shape_cast", &[e], "", &[full.clone()])[0];
+    let c = b.op("arith.extui", &[w], "", &[full.clone()])[0];
+    let seven = splat(b, 7, &full);
+    let m = bin(b, "arith.andi", c, seven);
+    let eight = splat(b, 8, &full);
+    let sign = bin(b, "arith.andi", c, eight);
+    let at = splat(b, 28, &full);
+    let sign = bin(b, "arith.shli", sign, at);
+    let at = splat(b, 22, &full);
+    let big = bin(b, "arith.shli", m, at);
+    let big = bin(b, "arith.addi", big, e);
+    let zero = splat(b, 0, &full);
+    let neg = bin(b, "arith.subi", zero, m);
+    let small = bin(b, "arith.andi", e, neg);
+    let two = splat(b, 2, &full);
+    let low = b.op(
+        "arith.cmpi",
+        &[m, two],
+        "predicate = 6 : i64",
+        &[MTy::Vector(vec![k, cols], Elem::Pred)],
     )[0];
-    let s = b.op(
-        "arith.shli",
-        &[s, shift],
-        "overflowFlags = #arith.overflow<none>",
-        &[wide],
-    )[0];
-    let s = b.op(
+    let t = b.op("arith.select", &[low, small, big], "", &[full.clone()])[0];
+    let bits = bin(b, "arith.ori", t, sign);
+    let f = b.op(
         "arith.bitcast",
-        &[s],
-        "",
-        &[MTy::Vector(vec![groups, cols], Elem::F32)],
-    )[0];
-    let s = b.op(
-        "vector.shape_cast",
-        &[s],
-        "",
-        &[MTy::Vector(vec![groups, 1, cols], Elem::F32)],
-    )[0];
-    let s = b.op(
-        "vector.broadcast",
-        &[s],
-        "",
-        &[MTy::Vector(vec![groups, 32, cols], Elem::F32)],
-    )[0];
-    let s = b.op(
-        "vector.shape_cast",
-        &[s],
+        &[bits],
         "",
         &[MTy::Vector(vec![k, cols], Elem::F32)],
     )[0];
-    let w = b.mulf(w, s)?;
-    b.convert_f(w, Elem::Bf16)
+    b.convert_f(f, Elem::Bf16)
 }
 
 #[cfg(test)]
