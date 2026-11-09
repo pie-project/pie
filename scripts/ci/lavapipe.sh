@@ -68,10 +68,8 @@ for _ in $(seq 1 300); do
 done
 grep -q "Server ready" "$work/serve.log" || { echo "the server did not come up"; tail -20 "$work/serve.log"; exit 1; }
 
-what=corners
-if [ "${PIE_LAVAPIPE_BENCH:-0}" = "1" ]; then what=both; fi
-echo "== $what"
-PIE_BENCH_FIXTURE=1 node scripts/bench/browser/native.mjs "$ws" "$what" | grep -v "^RESULT" | cut -c1-160
+echo "== corners"
+PIE_CORNERS_FIXTURE=1 node tests/browser/tools/native.mjs "$ws" | grep -v "^RESULT" | cut -c1-160
 echo "== compat API: one chat completion through the built-in inferlet"
 curl -fsS -X POST "$http/v1/chat/completions" -H 'content-type: application/json' \
   -d '{"messages":[{"role":"user","content":"hi"}],"max_tokens":4,"chat_template_kwargs":{"enable_thinking":false}}' \

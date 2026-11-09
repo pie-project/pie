@@ -44,8 +44,8 @@ fn default_window_size() -> u32 {
 
 /// The report every KV-policy program here answers with (`tova-attention`,
 /// `snapkv-eviction`, ...): the text, the counts, and what the policy did.
-/// `scripts/bench/pie_bench.py` reads `count`; a bare string is not a reply
-/// it can parse.
+/// A benchmark client (pie-project/benchmarks' `pie_bench.py`) reads `count`; a
+/// bare string is not a reply it can parse.
 #[derive(Serialize)]
 struct Output {
     sampler: &'static str,
