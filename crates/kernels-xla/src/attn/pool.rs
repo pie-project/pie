@@ -898,6 +898,7 @@ pub fn lse(
     call: PoolLse<Operand, Landing>,
     planes: Entries,
     entries: &KvPool<impl Stored>,
+    tuning: crate::tuning::Tuning,
 ) -> Result<(Val, Val), Error> {
     let nk = call.walked(entries);
     let (n, hh, dd, rt) = (
@@ -942,6 +943,56 @@ pub fn lse(
     let rv = f.like_i(pos, rt);
     let vis = f.add(pos, one)?;
     let vis = f.div(vis, rv)?;
+    // A prompt reading every closed entry of a compact pool: rows in
+    // blocks against whole pages of entries, a dense product a chunk, as a
+    // paged prefill walks its keys, not a gather of every row's entries
+    // (DeepSeek-V4's CSA, 1792 rows against 256 entries each: 35 of a
+    // 165 ms v6e fire).
+    let lanes = f.dims(indptr)[0] - 1;
+    if sel.is_none() && div > 1 && n > tuning.attn_per_row_max * lanes {
+        use super::paged::{Heads, Planes, Rows, Rule, blocked, geometry, with_i};
+        let (cells, w) = (f.dims(table)[0], f.dims(table)[1]);
+        let view = f.reshape(table, &[cells / div, div * w])?;
+        let geom = geometry(f, indptr, indices, ps, i64::from(entries.max_pages))?;
+        let planes = Planes::Paged {
+            keys: view,
+            values: view,
+            geom,
+            latent: true,
+        };
+        let h = Heads {
+            kvh: 1,
+            g: hh,
+            d: dd,
+            dv: dd,
+        };
+        let lane = geom.lane_of(f, req)?;
+        let cap = geom.capacity(f, lane)?;
+        let hi = f.min(vis, cap)?;
+        let zero = f.like_i(hi, 0);
+        let hi = f.max(hi, zero)?;
+        let base = with_i(f, lane, geom.span, Func::mul)?;
+        let hi = f.add(base, hi)?;
+        let q4 = f.reshape(qv, &[n, 1, hh, dd])?;
+        let rows_v = Rows::new(q4, base, hi);
+        let rule = Rule {
+            kp_span: Some(geom.span),
+            ..Rule::default()
+        };
+        let fl = blocked(
+            f,
+            &planes,
+            &h,
+            &rule,
+            &rows_v,
+            geom.lanes * geom.span,
+            f64::from(call.sm_scale),
+            tuning.chunks,
+        )?;
+        let lv = fl.lse2(f)?;
+        let ov = f.reshape(fl.o, &[n, hh, dd])?;
+        return Ok((ov, lv));
+    }
     let keys = match sel {
         Some(s) => Keys::Selected(s),
         None => Keys::All,
