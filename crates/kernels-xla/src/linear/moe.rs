@@ -1238,7 +1238,8 @@ fn bf16_rows(spec: Option<crate::linear::moe_gmm::Gmm>) -> Option<crate::linear:
 fn gmm_rows(p: i64, e: i64, base: i64) -> i64 {
     let per = p / e.min(p).max(1);
     let mut tm = base.max(16);
-    while tm < 128 && tm * 2 <= per {
+    let cap: i64 = std::env::var("PIE_XLA_GMM_TM_MAX").ok().and_then(|v| v.parse().ok()).unwrap_or(128);
+    while tm < cap && tm * 2 <= per {
         tm *= 2;
     }
     tm
@@ -2423,7 +2424,8 @@ pub fn experts(
     let hidden = f.convert(hidden, Elem::Bf16);
     let down_rows = tiles_of(f, dn, &down_bank, &sorted, hidden)?;
     let n = i64::from(routed.width);
-    if rows * t > tuning.moe_costs.onehot_cells {
+    let onehot_cells = std::env::var("PIE_XLA_ONEHOT_MI").ok().and_then(|v| v.parse::<i64>().ok()).map_or(tuning.moe_costs.onehot_cells, |mi| mi << 20);
+    if rows * t > onehot_cells {
         // Each pair's (weighted) row picked back out and summed per token.
         let dest = dest(f, &sorted, p)?;
         let pairs = f.take_rows(down_rows, dest)?;
