@@ -127,6 +127,46 @@ pub fn embed(
     Ok(rows)
 }
 
+/// [`embed`] over a table landed folded, `[V/F, F·row]` (a bf16 row that is
+/// not whole lane tiles: `engine_xla::weights::gather_only`): row `id` is
+/// part `id % F` of stored row `id / F`.
+pub fn embed_folded(
+    f: &mut Func,
+    ids: Operand,
+    table: Operand,
+    vocab: u32,
+    y: Landing,
+) -> Result<Val, Error> {
+    const OP: &str = "gather.embed";
+    i32_ids(OP, "token ids", ids)?;
+    same_dtype(OP, table, y)?;
+    nonzero(OP, "the row count this embedding table states", vocab)?;
+    let w = nonzero(OP, "the landing's width", y.width)?;
+    if !table.width.is_multiple_of(w) || table.width == w {
+        return Err(refuse(
+            OP,
+            format!("the {}-wide table rows fold no {w}-wide row", table.width),
+        ));
+    }
+    let fold = table.width / w;
+    let ids = index_vec(f, OP, ids, y.rows)?;
+    let (ids, _) = guarded(f, ids, vocab.min(table.rows.saturating_mul(fold)))?;
+    let ff = f.like_i(ids, i64::from(fold));
+    let at = f.div(ids, ff)?;
+    let part = f.rem(ids, ff)?;
+    let rows = f.take_rows(table.val, at)?;
+    let (n, w) = (i64::from(y.rows), i64::from(w));
+    let mut out = f.slice(rows, &[0, 0], &[n, w], &[1, 1])?;
+    for j in 1..i64::from(fold) {
+        let cut = f.slice(rows, &[0, j * w], &[n, (j + 1) * w], &[1, 1])?;
+        let here = f.like_i(part, j);
+        let here = f.compare(Cmp::Eq, part, here)?;
+        let here = f.broadcast(here, &[n, w], &[0])?;
+        out = f.select(here, cut, out)?;
+    }
+    Ok(out)
+}
+
 /// The vocab-parallel embed: this rank holds table rows `[rank * local,
 /// (rank + 1) * local)`, answers them, and zeroes every other id so an
 /// all-reduce sums the shards. Read from kernels-cuda
