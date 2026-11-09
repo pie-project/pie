@@ -1171,9 +1171,11 @@ pub(crate) fn tile_projection(
     // The rows in one tile where their double-buffered block fits 64 MiB:
     // a prompt's tile widens each block of codes once for all its rows
     // (`moe_gmm::Gmm::widens`; v6e, 24576x6144 at 2048 rows: 0.73 ms in one
-    // tile, as bf16's 0.72, against 1.34 in two).
-    let most = ((64 << 20) / (4 * k) / 16 * 16).max(16);
-    let tm = (((m + 15) / 16) * 16).clamp(16, most);
+    // tile, as bf16's 0.72, against 1.34 widened in two). Rows past one tile
+    // take the 128-deep dots in 256-row tiles instead.
+    let most = (64 << 20) / (4 * k) / 16 * 16;
+    let rows = ((m + 15) / 16) * 16;
+    let tm = if rows <= most.max(256) { rows } else { 256 };
     let tiles = (m + tm - 1) / tm;
     let spec = Gmm {
         tiles,
