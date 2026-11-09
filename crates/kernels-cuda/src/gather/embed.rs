@@ -3,6 +3,7 @@ use crate::error::Error;
 use crate::jit::{
     Arg, Ctx, Fire, Launch, aligned16, dtype_dispatch, kernel, nonzero, refuse, stated,
 };
+use crate::linear::moe::RowTable;
 use crate::tensor::Tensor;
 use dtype::Dtype;
 
@@ -115,11 +116,14 @@ pub(crate) fn comm_rank(ctx: &Ctx, op: &'static str) -> Result<u32, Error> {
 
 const BLOCK: u32 = 256;
 
-pub fn embed_concat(
+/// `y[r, h * width ..]` is the table's row `ids[r, h]`, read where `rows_at`
+/// says it lies (the contiguous table under [`RowTable::RESIDENT`]).
+pub fn embed_concat_at(
     ctx: &Ctx,
     ids: Tensor,
     table: Tensor,
     vocab: u32,
+    rows_at: RowTable,
     y: &mut Tensor,
 ) -> Result<(), Error> {
     const OP: &str = "gather.embed";
@@ -162,13 +166,15 @@ pub fn embed_concat(
             stated(OP, vocab)?.arg(),
             stated(OP, held)?.arg(),
             stated(OP, base)?.arg(),
+            crate::jit::ArgValue::Ptr(rows_at.table),
+            stated(OP, rows_at.block_rows.max(1))?.arg(),
             ctx.stage(),
         ],
     )
 }
 
 #[allow(clippy::too_many_arguments)]
-pub fn embed_concat_mlxu4(
+pub fn embed_concat_mlxu4_at(
     ctx: &Ctx,
     ids: Tensor,
     codes: Tensor,
@@ -176,6 +182,7 @@ pub fn embed_concat_mlxu4(
     biases: Option<Tensor>,
     vocab: u32,
     seat: crate::linear::moe::GroupSeat,
+    rows_at: RowTable,
     y: &mut Tensor,
 ) -> Result<(), Error> {
     const OP: &str = "gather.embed";
@@ -241,13 +248,15 @@ pub fn embed_concat_mlxu4(
             stated(OP, 0u32)?.arg(),
             crate::jit::ArgValue::Ptr(seat.cell),
             crate::jit::ArgValue::Ptr(seat.hits),
+            crate::jit::ArgValue::Ptr(rows_at.table),
+            stated(OP, rows_at.block_rows.max(1))?.arg(),
             ctx.stage(),
         ],
     )
 }
 
 #[allow(clippy::too_many_arguments)]
-pub fn embed_mlx_affine(
+pub fn embed_mlx_affine_at(
     ctx: &Ctx,
     ids: Tensor,
     codes: Tensor,
@@ -255,6 +264,7 @@ pub fn embed_mlx_affine(
     biases: Option<Tensor>,
     vocab: u32,
     seat: crate::linear::moe::GroupSeat,
+    rows_at: RowTable,
     y: &mut Tensor,
 ) -> Result<(), Error> {
     const OP: &str = "gather.embed";
@@ -327,6 +337,8 @@ pub fn embed_mlx_affine(
             stated(OP, offset)?.arg(),
             crate::jit::ArgValue::Ptr(seat.cell),
             crate::jit::ArgValue::Ptr(seat.hits),
+            crate::jit::ArgValue::Ptr(rows_at.table),
+            stated(OP, rows_at.block_rows.max(1))?.arg(),
             ctx.stage(),
         ],
     )
@@ -370,6 +382,7 @@ fn gather(
     scale: Tensor,
     vocab: u32,
     (heads, width, per): (u32, u32, u32),
+    rows_at: RowTable,
     y: &mut Tensor,
 ) -> Result<(), Error> {
     let t = dtype_dispatch!(op, y.dtype, { Bf16 => "::pie::bf16", F16 => "::pie::f16" });
@@ -395,6 +408,8 @@ fn gather(
             stated(op, heads)?.arg(),
             stated(op, width)?.arg(),
             stated(op, vocab)?.arg(),
+            crate::jit::ArgValue::Ptr(rows_at.table),
+            stated(op, rows_at.block_rows.max(1))?.arg(),
             ctx.stage(),
         ],
     )
@@ -402,12 +417,13 @@ fn gather(
 
 /// `y[r, h * width ..]` is `codes[ids[r, h]] · scale`: `codes` the `[vocab,
 /// width]` table bound as bytes, `scale` its one f32 bound as four bytes.
-pub fn embed_concat_e4m3(
+pub fn embed_concat_e4m3_at(
     ctx: &Ctx,
     ids: Tensor,
     codes: Tensor,
     scale: Tensor,
     vocab: u32,
+    rows_at: RowTable,
     y: &mut Tensor,
 ) -> Result<(), Error> {
     const OP: &str = "gather.embed";
@@ -425,6 +441,7 @@ pub fn embed_concat_e4m3(
     }
     // Sixteen codes a thread where every row is whole 16-byte runs of an
     // aligned table: the same widening in a sixteenth of the requests.
+    // (A row table's entries keep that alignment.)
     let (entry, per) = if width.is_multiple_of(16) && codes.ptr.is_multiple_of(16) {
         ("embed_concat_e4m3_vec16<T, false>", width / 16)
     } else {
@@ -439,6 +456,7 @@ pub fn embed_concat_e4m3(
         scale,
         vocab,
         (heads, width, per),
+        rows_at,
         y,
     )
 }
@@ -446,12 +464,13 @@ pub fn embed_concat_e4m3(
 /// `y[r, h * width ..]` is `codes[ids[r, h]]` under its row's exponents:
 /// `codes` the `[vocab, width]` MXFP8 table's e4m3 codes, `exps` its
 /// `[vocab, width / 32]` ue8m0 exponents.
-pub fn embed_concat_mxfp8(
+pub fn embed_concat_mxfp8_at(
     ctx: &Ctx,
     ids: Tensor,
     codes: Tensor,
     exps: Tensor,
     vocab: u32,
+    rows_at: RowTable,
     y: &mut Tensor,
 ) -> Result<(), Error> {
     const OP: &str = "gather.embed";
@@ -482,6 +501,7 @@ pub fn embed_concat_mxfp8(
         exps,
         vocab,
         (heads, width, width / 16),
+        rows_at,
         y,
     )
 }
@@ -567,6 +587,91 @@ pub fn embed_weighted(
             ctx.stage(),
         ],
     )
+}
+
+/// [`embed_concat_at`] over the contiguous table.
+pub fn embed_concat(
+    ctx: &Ctx,
+    ids: Tensor,
+    table: Tensor,
+    vocab: u32,
+    y: &mut Tensor,
+) -> Result<(), Error> {
+    embed_concat_at(ctx, ids, table, vocab, RowTable::RESIDENT, y)
+}
+
+/// [`embed_concat_mlxu4_at`] over the contiguous table.
+#[allow(clippy::too_many_arguments)]
+pub fn embed_concat_mlxu4(
+    ctx: &Ctx,
+    ids: Tensor,
+    codes: Tensor,
+    scales: Tensor,
+    biases: Option<Tensor>,
+    vocab: u32,
+    seat: crate::linear::moe::GroupSeat,
+    y: &mut Tensor,
+) -> Result<(), Error> {
+    embed_concat_mlxu4_at(
+        ctx,
+        ids,
+        codes,
+        scales,
+        biases,
+        vocab,
+        seat,
+        RowTable::RESIDENT,
+        y,
+    )
+}
+
+/// [`embed_mlx_affine_at`] over the contiguous table.
+#[allow(clippy::too_many_arguments)]
+pub fn embed_mlx_affine(
+    ctx: &Ctx,
+    ids: Tensor,
+    codes: Tensor,
+    scales: Tensor,
+    biases: Option<Tensor>,
+    vocab: u32,
+    seat: crate::linear::moe::GroupSeat,
+    y: &mut Tensor,
+) -> Result<(), Error> {
+    embed_mlx_affine_at(
+        ctx,
+        ids,
+        codes,
+        scales,
+        biases,
+        vocab,
+        seat,
+        RowTable::RESIDENT,
+        y,
+    )
+}
+
+/// [`embed_concat_e4m3_at`] over the contiguous table.
+pub fn embed_concat_e4m3(
+    ctx: &Ctx,
+    ids: Tensor,
+    codes: Tensor,
+    scale: Tensor,
+    vocab: u32,
+    y: &mut Tensor,
+) -> Result<(), Error> {
+    embed_concat_e4m3_at(ctx, ids, codes, scale, vocab, RowTable::RESIDENT, y)
+}
+
+/// [`embed_concat_mxfp8_at`] over the contiguous table.
+pub fn embed_concat_mxfp8(
+    ctx: &Ctx,
+    ids: Tensor,
+    codes: Tensor,
+    exps: Tensor,
+    vocab: u32,
+    y: &mut Tensor,
+) -> Result<(), Error> {
+    embed_concat_mxfp8_at(ctx, ids, codes, exps, vocab, RowTable::RESIDENT, y)
 }
 
 #[cfg(test)]

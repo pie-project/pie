@@ -1,9 +1,12 @@
 #include "prim/device.cuh"
+#include "linear/moe/table.cuh"
 
 namespace pie::gather {
 
 template <class T>
 using Elem = ::pie::Elem<T>;
+
+using ::pie::linear::table_row;
 
 template <bool VEC>
 __global__ void embed(
@@ -70,6 +73,8 @@ __global__ void embed_concat(
     int vocab,
     int held,
     int base,
+    const u64* __restrict__ row_table,
+    int block_rows,
     const u32* __restrict__ win)
 {
     const long long i =
@@ -92,7 +97,7 @@ __global__ void embed_concat(
     const int local = id - base;
     y[at] = (id < 0 || id >= vocab || local < 0 || local >= held)
         ? Elem<T>::from_f32(0.f)
-        : table[(long long)local * width + w];
+        : table_row(table, width, row_table, 1, 0, block_rows, local)[w];
 }
 
 struct alignas(16) EmbedTableBases {
@@ -117,6 +122,8 @@ __global__ void embed_concat_mlxu4(
     int offset,
     const EmbedTableBases* __restrict__ bases,
     unsigned int* __restrict__ hits,
+    const u64* __restrict__ row_table,
+    int block_rows,
     const u32* __restrict__ win)
 {
     const long long i =
@@ -152,11 +159,14 @@ __global__ void embed_concat_mlxu4(
         return;
     }
 
-    const u8 byte = codes_at[(long long)id * (width / 2) + w / 2];
+    // The row's planes, `[codes, scales, biases]` a row block.
+    const u8 byte = table_row(codes_at, width / 2, row_table, 3, 0, block_rows, id)[w / 2];
     const float code = (float)((w & 1) ? (byte >> 4) : (byte & 0xF));
-    const long long fx = (long long)id * (width / group) + w / group;
-    const bf16* s16 = reinterpret_cast<const bf16*>(scales_at);
-    const bf16* b16 = reinterpret_cast<const bf16*>(biases_at);
+    const long long fx = w / group;
+    const bf16* s16 = table_row(
+        reinterpret_cast<const bf16*>(scales_at), width / group, row_table, 3, 1, block_rows, id);
+    const bf16* b16 = table_row(
+        reinterpret_cast<const bf16*>(biases_at), width / group, row_table, 3, 2, block_rows, id);
     const float v = code * Elem<bf16>::to_f32(s16[fx]) + Elem<bf16>::to_f32(b16[fx]);
     y[at] = Elem<T>::from_f32(v);
 }
@@ -176,6 +186,8 @@ __global__ void embed_concat_mlxu8(
     int offset,
     const EmbedTableBases* __restrict__ bases,
     unsigned int* __restrict__ hits,
+    const u64* __restrict__ row_table,
+    int block_rows,
     const u32* __restrict__ win)
 {
     const long long i =
@@ -211,10 +223,13 @@ __global__ void embed_concat_mlxu8(
         return;
     }
 
-    const float code = (float)codes_at[(long long)id * width + w];
-    const long long fx = (long long)id * (width / group) + w / group;
-    const bf16* s16 = reinterpret_cast<const bf16*>(scales_at);
-    const bf16* b16 = reinterpret_cast<const bf16*>(biases_at);
+    // The row's planes, `[codes, scales, biases]` a row block.
+    const float code = (float)table_row(codes_at, width, row_table, 3, 0, block_rows, id)[w];
+    const long long fx = w / group;
+    const bf16* s16 = table_row(
+        reinterpret_cast<const bf16*>(scales_at), width / group, row_table, 3, 1, block_rows, id);
+    const bf16* b16 = table_row(
+        reinterpret_cast<const bf16*>(biases_at), width / group, row_table, 3, 2, block_rows, id);
     const float v = code * Elem<bf16>::to_f32(s16[fx]) + Elem<bf16>::to_f32(b16[fx]);
     y[at] = Elem<T>::from_f32(v);
 }
@@ -242,6 +257,8 @@ __global__ void embed_concat_e4m3(
     int heads,
     int width,
     int vocab,
+    const u64* __restrict__ row_table,
+    int block_rows,
     const u32* __restrict__ win)
 {
     const long long i = (long long)blockIdx.x * blockDim.x + threadIdx.x;
@@ -261,7 +278,8 @@ __global__ void embed_concat_e4m3(
     const int id = ids[row * heads + h];
     y[at] = (id < 0 || id >= vocab)
         ? Elem<T>::from_f32(0.f)
-        : Elem<T>::from_f32(e4m3_value(codes[(long long)id * width + w]) * scale[0]);
+        : Elem<T>::from_f32(
+              e4m3_value(table_row(codes, width, row_table, 1, 0, block_rows, id)[w]) * scale[0]);
 }
 
 // embed_concat_e4m3 sixteen codes a thread: `width` a multiple of 16 and the
@@ -279,6 +297,8 @@ __global__ void embed_concat_e4m3_vec16(
     int heads,
     int width,
     int vocab,
+    const u64* __restrict__ row_table,
+    int block_rows,
     const u32* __restrict__ win)
 {
     const int runs = width / 16;
@@ -302,11 +322,16 @@ __global__ void embed_concat_e4m3_vec16(
         for (int k = 0; k < 16; ++k) out[k] = Elem<T>::from_f32(0.f);
         return;
     }
-    const uint4 run = *reinterpret_cast<const uint4*>(codes + (long long)id * width + c * 16);
+    // The row's planes, `[codes]` a row block (`[codes, exponents]` under
+    // kMx), entries on 16 bytes.
+    constexpr int kPlanes = kMx ? 2 : 1;
+    const uint4 run = *reinterpret_cast<const uint4*>(
+        table_row(codes, width, row_table, kPlanes, 0, block_rows, id) + c * 16);
     const u8* b = reinterpret_cast<const u8*>(&run);
     float s;
     if constexpr (kMx) {
-        const unsigned e = static_cast<const u8*>(scale)[(long long)id * (width / 32) + c / 2];
+        const unsigned e = table_row(
+            static_cast<const u8*>(scale), width / 32, row_table, kPlanes, 1, block_rows, id)[c / 2];
         // 2^(e - 127) as a float's bits; e 0 (2^-127) is a subnormal's.
         s = e != 0u ? __uint_as_float(e << 23) : __uint_as_float(0x00400000u);
     } else {

@@ -33,6 +33,7 @@ impl Plane {
     }
 
     /// The same plane, its pool copies aligned to `align` bytes.
+    #[allow(dead_code)]
     #[must_use]
     pub const fn aligned(self, align: u64) -> Plane {
         Plane { align, ..self }
