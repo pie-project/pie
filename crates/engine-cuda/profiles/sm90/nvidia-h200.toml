@@ -39,6 +39,10 @@ moe.fp8_mma_depth = 2
 sdpa.mla_wgmma = true
 # from 64 rows: a decode's few rows split wider on the 16-head kernel (GLM-5.3 raw decode 54.1 -> 55.3 tok/s)
 sdpa.mla_wgmma_rows = 64
+# the block-FP8 select's warp-specialized GEMM persistent, its weight rows landed by TMA and its jobs
+# taken off a ticket: GLM-5.3 mini78-e12 c256 3.14k -> 3.84k, c512 3.57k -> 4.36k, GLM-5.3-Flash mini8 c256
+# 21.5k -> 23.7k tok/s, the same sums bit for bit (parity KL unchanged)
+moe.fp8a8_tma = true
 # NVFP4 experts on the register-dequant wgmma select past 16 routes (as the H100), two warpgroups on
 # 128-route slices from 128 routes an expert, and a fire's working set up to 70% of the memory past the
 # weights (at the default half MiniMax's fires were cut to 1024 tokens and 256 lanes):
