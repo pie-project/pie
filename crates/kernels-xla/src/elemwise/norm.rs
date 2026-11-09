@@ -33,6 +33,23 @@ pub(crate) fn inv_rms_rows(
         ));
     }
     let heads = width / axis;
+    // Heads of whole lane tiles over rows of whole sublane tiles: viewed as
+    // the row lays out on a TPU, `[rows / 8, heads, 8, axis]`, so the norm
+    // reads it in place rather than through a relayout to `[rows, heads,
+    // axis]`.
+    if heads > 1 && rows % 8 == 0 && axis % 128 == 0 {
+        let x4 = f.reshape(x, &[rows / 8, 8, heads, axis])?;
+        let x4 = f.transpose(x4, &[0, 2, 1, 3])?;
+        let sq = f.mul(x4, x4)?;
+        let sum = f.reduce(sq, &[3], Fold::Sum)?;
+        let mean = f.scale(sum, 1.0 / axis as f64)?;
+        let mean = f.offset(mean, f64::from(eps))?;
+        let inv = f.rsqrt(mean);
+        let inv = f.broadcast(inv, &[rows / 8, heads, 8, axis], &[0, 1, 2])?;
+        let y = f.mul(x4, inv)?;
+        let y = f.transpose(y, &[0, 2, 1, 3])?;
+        return Ok(f.reshape(y, &[rows, width])?);
+    }
     let x3 = f.reshape(x, &[rows, heads, axis])?;
     let sq = f.mul(x3, x3)?;
     let sum = f.reduce(sq, &[2], Fold::Sum)?;
