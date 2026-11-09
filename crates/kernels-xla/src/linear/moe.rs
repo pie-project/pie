@@ -1098,7 +1098,9 @@ fn gmm_spec(
         scaled,
         bias: false,
         out: Elem::F32,
-        prefetch: !mxfp4,
+        // mxfp4 banks (pre-scaled) at decode widths, an expert a tile or less:
+        // a prompt's runs of tiles widen their block once instead.
+        prefetch: !mxfp4 || p <= e * tm,
     };
     spec.out_width().ok().map(|_| spec)
 }
@@ -1318,6 +1320,32 @@ fn tile_kernel(
         _ => None,
     };
     let (se, nt) = (t.se, t.nt);
+    if spec.prefetching() {
+        // Each tile's run (its expert's rank among the routed ones) and the
+        // next run's expert (-1 after the last), as `sorted` gives them.
+        let more = f.const_i(Elem::I32, t.tm - 1, &[e]);
+        let per = f.add(t.counts, more)?;
+        let tt = f.const_i(Elem::I32, t.tm, &[e]);
+        let per = f.div(per, tt)?;
+        let tend = f.add(t.tstart, per)?;
+        let zero = f.const_i(Elem::I32, 0, &[e]);
+        let one = f.const_i(Elem::I32, 1, &[e]);
+        let busy = f.compare(Cmp::Gt, t.counts, zero)?;
+        let busy = f.select(busy, one, zero)?;
+        let upto = f.scan(busy, 0, Fold::Sum)?;
+        let rank = f.sub(upto, busy)?;
+        let run = pick_small(f, rank, se)?;
+        let tend_t = pick_small(f, tend, se)?;
+        let end = f.const_i(Elem::I32, t.tiles - 1, &[t.tiles]);
+        let at = f.min(tend_t, end)?;
+        let nx = pick_small(f, se, at)?;
+        let ntb = f.broadcast(nt, &[t.tiles], &[0])?;
+        let next = f.compare(Cmp::Lt, tend_t, ntb)?;
+        let none = f.const_i(Elem::I32, -1, &[t.tiles]);
+        let nxt = f.select(next, nx, none)?;
+        let ops: Vec<Val> = [se, nt, run, nxt, xs, w].into_iter().chain(bias).collect();
+        return Ok(kernel.call(f, &ops)?[0]);
+    }
     Ok(if spec.scaled {
         // The exponent bytes `[E·N, K/32]`, read `[K/32, E·N]` as the codes
         // are (the TPU lays them `E·N`-minor too).
