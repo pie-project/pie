@@ -513,6 +513,9 @@ pub(crate) struct Rule {
     /// The most keys one row admits (a sliding window), when bounded: the
     /// per-row walk then reads chunks no wider than it.
     pub window: Option<i64>,
+    /// Whether the blocked walk's row blocks may run in line (see
+    /// [`blocked`]); a narrow window's blocks always may.
+    pub inline: bool,
 }
 
 struct Logits {
@@ -1299,7 +1302,7 @@ pub(crate) fn blocked(
     };
     let whole = if nb == 1 {
         block(f, &rows_p)?
-    } else if nb <= ch.unrolled {
+    } else if nb <= ch.unrolled && (narrow.is_some() || rule.inline) {
         // A few blocks run one after another in line, each on a static cut
         // of the rows, and join at the end: as a loop, each block's result
         // is written into a copy of the whole carried output (DeepSeek-V4's
