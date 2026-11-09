@@ -442,6 +442,90 @@ pub fn gather(
     let (indices, indptr, ps) = paging(f, OP, page_indices, page_indptr, pages.page_size)?;
     let bpos = flat_i32(f, boundary_pos)?;
     let breq = flat_i32(f, boundary_req)?;
+    let bpos = first(f, bpos, n)?;
+    let breq = first(f, breq, n)?;
+    // A lane of k rows closes at most k / ratio + 1 blocks: only those rows
+    // gather their window, the rest land zeros (a prompt of 2048 rows at
+    // ratio 128 closed 16 blocks and gathered 128 state rows for each of the
+    // 2048: 35 of a 165 ms v6e fire).
+    let lanes = i64::try_from(page_indptr.elements())
+        .unwrap_or(1)
+        .saturating_sub(1)
+        .max(1);
+    let most = (n / r + lanes).min(n);
+    if most < n {
+        let has = cmp_i(f, Cmp::Ge, bpos, 0)?;
+        let ti = f.convert(has, Elem::I32);
+        let rank = f.scan(ti, 0, Fold::Sum)?;
+        let one = f.like_i(rank, 1);
+        let rank = f.sub(rank, one)?;
+        let drop = f.like_i(rank, DROP);
+        let at = f.select(has, rank, drop)?;
+        let row = f.iota(Elem::I32, &[n, 1], 0);
+        let none = f.const_i(Elem::I32, -1, &[most, 1]);
+        let pick = f.put_rows(none, at, row, Combine::Set)?;
+        let pick = f.reshape(pick, &[most])?;
+        let live = cmp_i(f, Cmp::Ge, pick, 0)?;
+        let neg = f.like_i(pick, -1);
+        let bp = take(f, bpos, pick)?;
+        let bp = f.select(live, bp, neg)?;
+        let br = take(f, breq, pick)?;
+        let got = gather_rows(
+            f,
+            bp,
+            br,
+            most,
+            indices,
+            indptr,
+            ps,
+            hd,
+            r,
+            coff,
+            window,
+            state_kv,
+            state_score,
+            ape,
+        )?;
+        let zero = f.const_f(Elem::F32, 0.0, &[n, hd]);
+        let gone = f.like_i(pick, DROP);
+        let back = f.select(live, pick, gone)?;
+        return Ok(f.put_rows(zero, back, got, Combine::Set)?);
+    }
+    gather_rows(
+        f,
+        bpos,
+        breq,
+        n,
+        indices,
+        indptr,
+        ps,
+        hd,
+        r,
+        coff,
+        window,
+        state_kv,
+        state_score,
+        ape,
+    )
+}
+
+/// [`gather`] for the rows whose boundaries are `bpos`/`breq` (`[n]`).
+fn gather_rows(
+    f: &mut Func,
+    bpos: Val,
+    breq: Val,
+    n: i64,
+    indices: Val,
+    indptr: Val,
+    ps: i64,
+    hd: i64,
+    r: i64,
+    coff: i64,
+    window: i64,
+    state_kv: Operand,
+    state_score: Operand,
+    ape: Option<Operand>,
+) -> Result<Val, Error> {
     let sk = state_kv.val;
     let ss = state_score.val;
     let ape = ape.map(|a| a.f32(f));
