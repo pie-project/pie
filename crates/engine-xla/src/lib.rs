@@ -34,6 +34,8 @@ pub use boot::open;
 pub use error::{Fault, Result, kernel};
 pub use serve::{Boot, FireCost, Fired, Lane, Media, Seated, Shell};
 
-/// The fusions this backend implements: none, so the compiler forms no
-/// fused op here.
-pub static FUSIONS: [poem_compiler::fuse::Rule; 0] = [];
+/// The fusions this backend implements: the routed MLP on one sort
+/// (`kernels_xla::linear::moe::experts`), its parts run one by one where the
+/// kernel declines it.
+pub static FUSIONS: std::sync::LazyLock<Vec<poem_compiler::fuse::Rule>> =
+    std::sync::LazyLock::new(|| vec![poem_compiler::fuse::rules::moe_experts()]);
