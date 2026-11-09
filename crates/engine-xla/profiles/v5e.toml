@@ -14,7 +14,8 @@ pad.row_steps = 4
 # cost what the pick does at 640-row fires and more past them
 [kernel]
 attn.unrolled_blocks = 1
+attn.decode_pages = 64
 moe.cost.onehot_mi = 8
 
 [provenance]
-measured = ["engine.pad.row_steps", "kernel.attn.unrolled_blocks", "kernel.moe.cost.onehot_mi"]
+measured = ["engine.pad.row_steps", "kernel.attn.decode_pages", "kernel.attn.unrolled_blocks", "kernel.moe.cost.onehot_mi"]
