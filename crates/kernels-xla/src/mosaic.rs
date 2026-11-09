@@ -591,6 +591,32 @@ impl Body {
 
     // ------------------------------------------------------------ control
 
+    /// `for i in lb..ub step st { body(i) }` over i32 bounds (`scf.for`, no
+    /// carried values).
+    pub fn for_range(
+        &mut self,
+        lb: V,
+        ub: V,
+        st: V,
+        body: impl FnOnce(&mut Self, V) -> Built<()>,
+    ) -> Built<()> {
+        if [lb, ub, st].iter().any(|&v| self.ty(v) != &MTy::I32) {
+            return bad("scf.for over non-i32 bounds");
+        }
+        let names = self.list(&[lb, ub, st], |b, v| b.names[v.0 as usize].clone());
+        let iv = self.fresh(format!("%iv{}", self.next), MTy::I32);
+        self.next += 1;
+        let ivn = self.names[iv.0 as usize].clone();
+        self.line(&format!("\"stable_mosaic.scf.for\"({names}) ({{"));
+        self.line(&format!("^bb0({ivn}: i32):"));
+        self.depth += 1;
+        body(self, iv)?;
+        self.line("\"stable_mosaic.scf.yield\"() : () -> ()");
+        self.depth -= 1;
+        self.line("}) : (i32, i32, i32) -> ()");
+        Ok(())
+    }
+
     /// `scf.if cond { then }` (no results).
     pub fn when(&mut self, cond: V, then: impl FnOnce(&mut Self) -> Built<()>) -> Built<()> {
         if self.ty(cond) != &MTy::I1 {
