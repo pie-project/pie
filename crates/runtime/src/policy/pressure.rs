@@ -162,7 +162,7 @@ impl Gauge {
 
 /// A shortfall that stands unchanged is reported again this often, so the
 /// default responder looks again when its last discard freed too little.
-const AGAIN: Duration = Duration::from_millis(100);
+pub const AGAIN: Duration = Duration::from_millis(100);
 
 static GAUGES: Mutex<[Gauge; 2]> = Mutex::new([Gauge::new(), Gauge::new()]);
 static METER: RwLock<Option<Arc<dyn Meter>>> = RwLock::new(None);
@@ -237,6 +237,16 @@ pub fn scale(engine: usize, scale: Scale) {
         scales.resize(engine + 1, Scale::default());
     }
     scales[engine] = scale;
+}
+
+/// What `engine`'s pages and slots take, as [`scale`] last said.
+pub fn scale_of(engine: usize) -> Scale {
+    SCALES
+        .read()
+        .unwrap()
+        .get(engine)
+        .copied()
+        .unwrap_or_default()
 }
 
 /// The scale every engine shares, if known: they run one model.
@@ -328,6 +338,11 @@ pub fn stores(tier: Tier) -> Option<Bytes> {
     Some(sum)
 }
 
+/// The retention key that pins a working set: the default responder never
+/// discards it, however short a tier is. Only a policy that answers
+/// `tier-pressure` itself may let it go.
+pub const PINNED: i64 = i64::MAX;
+
 /// A working set the default responder may discard.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Candidate {
@@ -342,11 +357,12 @@ pub struct Candidate {
 /// The default responder: which working sets to discard so that `short`
 /// bytes come free. Lowest retention key first, so whatever a key `<= 0`
 /// lets go goes before anything a policy keyed higher; then least recently
-/// used. One that frees nothing on the tier is passed over. It stops once
+/// used. One that frees nothing on the tier, or one [`PINNED`], is passed
+/// over. It stops once
 /// what it chose covers `short`, or after one whose size is unknown: the
 /// waiter's next [`raise`] says whether that was enough.
 pub fn choose(mut candidates: Vec<Candidate>, short: u64) -> Vec<String> {
-    candidates.retain(|c| c.bytes != Some(0));
+    candidates.retain(|c| c.bytes != Some(0) && c.key != PINNED);
     candidates.sort_by(|a, b| (a.key, a.last_use_ms, &a.id).cmp(&(b.key, b.last_use_ms, &b.id)));
     let mut chosen = Vec::new();
     let mut freed: u64 = 0;
@@ -471,6 +487,15 @@ mod tests {
             "a waiter is never left with no one to answer it"
         );
         assert!(choose(sets, 0).is_empty());
+        let pinned = vec![
+            candidate("pinned", PINNED, 0, Some(100)),
+            candidate("kept", PINNED - 1, 5, Some(10)),
+        ];
+        assert_eq!(
+            choose(pinned, 1000),
+            ["kept"],
+            "a pinned set is never discarded, not even to serve a waiter"
+        );
         let unknown = vec![candidate("a", 0, 0, None), candidate("b", 0, 1, Some(10))];
         assert_eq!(
             choose(unknown, 5),
