@@ -235,19 +235,24 @@ pub fn gates_with(
     let comb = part(f, 2 * m, m * m, 2)?;
     let comb = f.reshape(comb, &[rows, m, m])?;
     let comb = f.softmax(comb, 2)?;
-    let mut comb = f.offset(comb, f64::from(gate_eps))?;
+    let comb = f.offset(comb, f64::from(gate_eps))?;
+    // The Sinkhorn rounds run over `[M, M, rows]`, the rows minor: an `M × M`
+    // matrix a row laid out minor is a whole tile each (a v5e prompt fire's
+    // 40 rounds of 5 layers: 6 ms).
+    let mut comb = f.transpose(comb, &[1, 2, 0])?;
     let norm = |f: &mut Func, c: Val, axis: i64| -> Result<Val, Error> {
         let s = f.reduce(c, &[axis], Fold::Sum)?;
         let s = f.offset(s, f64::from(gate_eps))?;
-        let keep = if axis == 2 { [0, 1] } else { [0, 2] };
-        let s = f.broadcast(s, &[rows, m, m], &keep)?;
+        let keep = if axis == 1 { [0, 2] } else { [1, 2] };
+        let s = f.broadcast(s, &[m, m, rows], &keep)?;
         Ok(f.div(c, s)?)
     };
-    comb = norm(f, comb, 1)?;
+    comb = norm(f, comb, 0)?;
     for _ in 1..sinkhorn.max(1) {
-        comb = norm(f, comb, 2)?;
         comb = norm(f, comb, 1)?;
+        comb = norm(f, comb, 0)?;
     }
+    let comb = f.transpose(comb, &[2, 0, 1])?;
 
     let r = streams3(f, streams, fan)?;
     let p = f.broadcast(pre, &[rows, m, h], &[0, 1])?;
