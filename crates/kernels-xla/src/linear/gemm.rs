@@ -176,7 +176,7 @@ const MXU_ROWS: i64 = 8;
 
 /// A weight this big is read from HBM by its product, not staged in VMEM
 /// ahead of it.
-const WIDE_WEIGHT_BYTES: i64 = 64 << 20;
+const WIDE_WEIGHT_BYTES: i64 = 8 << 20;
 
 /// `act · wᵀ` in f32, `[y.rows, w.rows]`.
 ///
