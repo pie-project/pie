@@ -275,6 +275,7 @@ impl Device {
         let cached = file
             .as_ref()
             .and_then(|f| std::fs::read(f).ok())
+            .and_then(unpacked)
             .and_then(|bytes| client.deserialize(&bytes).ok());
         let exe = match cached {
             Some(exe) => {
@@ -300,7 +301,7 @@ impl Device {
                 if let (Some(file), Ok(bytes)) = (&file, exe.serialize()) {
                     let _ = std::fs::create_dir_all(file.parent().unwrap_or(file));
                     let tmp = file.with_extension("tmp");
-                    if std::fs::write(&tmp, bytes).is_ok() {
+                    if std::fs::write(&tmp, packed(&bytes)).is_ok() {
                         let _ = std::fs::rename(&tmp, file);
                     }
                     if let Some(dir) = file.parent() {
@@ -534,6 +535,24 @@ fn disk_cache() -> Option<PathBuf> {
             .map(PathBuf::from)
             .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".cache")))
             .map(|base| base.join("pie").join("xla")),
+    }
+}
+
+/// A serialized program as the disk cache keeps it: zstd at level 1. A
+/// program is a few hundred MB and about two fifths zeros (v6e Qwen3-0.6B:
+/// 289 MB, ~80 MB packed), so the cache holds a model's whole warm ladder
+/// rather than evicting half of it on every load.
+fn packed(bytes: &[u8]) -> Vec<u8> {
+    zstd::bulk::compress(bytes, 1).unwrap_or_else(|_| bytes.to_vec())
+}
+
+/// A cached program's bytes, unpacked when `packed` wrote them (a zstd
+/// frame); an older raw file is read as it is.
+fn unpacked(bytes: Vec<u8>) -> Option<Vec<u8>> {
+    if bytes.starts_with(&[0x28, 0xb5, 0x2f, 0xfd]) {
+        zstd::stream::decode_all(bytes.as_slice()).ok()
+    } else {
+        Some(bytes)
     }
 }
 
