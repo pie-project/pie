@@ -1532,8 +1532,9 @@ fn routed(
                 let (y, t) = gmm(
                     f, spec, fan, &bank, scales, inside, x, r, valid, ids, x_tiled,
                 )?;
-                // Rows that round as the select's own do, its bias inside.
-                if spec.out == Elem::Bf16 && bias.is_none() {
+                // Rows that round as the select's own do, its bias inside
+                // (mxfp4 banks: the tile-order chain is measured on gpt-oss).
+                if mxfp4 && spec.out == Elem::Bf16 && bias.is_none() {
                     tiled = Some(t);
                 }
                 y
