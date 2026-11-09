@@ -1,0 +1,219 @@
+// split/ctl_cx_gptoss.csl: the role-split row control PE (CX_r) of a gpt-oss unit. Design: spatial/split/README.md
+// (gpt-oss).
+//
+// Role. One a unit row, between the unit's attention columns (west) and MoE columns (east): the row's x
+// chunk (Hc f32, the residual), the RMSNorm gammas, the o_proj and down-projection biases, the root of both
+// halves' row reductions, and the unit handoff. A layer:
+//   [x g1 2^-S | 2^S | ssq] row multicast (both halves; the MoE PEs drop it); S = the exponent of the
+//   chunk's largest |x g| less 7, so the weight PEs' f16 copy cannot overflow (the residual reaches 4e4)
+//   o_proj reduction in from the west -> x += o + bo
+//   [x g2 2^-S | 2^S | ssq] row multicast (the attention PEs drop it)
+//   down reduction in from the east, Hc words + [e | w] -> x += d + sum_k w_k bd[e_k]
+// The pass ends with x sent on. In the wafer token loop, unit 0's CX rows take the next token's embedding
+// chunk (iq6) instead of the host's x after the first step.
+//
+// Interface. Exports x (f32 [Hc]), gam (f32 [layer][g1 | g2][Hc]), bo (f32 [layer][Hc]), bd (f32 [layer]
+// [expert][Hc]), xdbg / xred (XKEEP 1), rcfg, tdbg, init, compute(steps, start_pos).
+// rcfg (split_geo_gptoss.py rcfg_cx): [0] routes n, [1..1+2n); from RQ: [0..4) iq2..iq5 (iq2 the west half's
+// stream, iq3 the east half's, iq4 unused, iq5 the handoff in), [4..7) oq2..oq4 (oq3 the multicast, oq4 the
+// handoff out), [7] flags (bit 0 the first unit, bit 1 no handoff out, bit 2 the embedding return), [8]
+// the spare colour, [9] iq6.
+//
+// Params. Shape: K, Hc, NEX, TK. Diagnostics: XKEEP, DIAG, HOSTX.
+param memcpy_params;
+param DIAG: u16 = 0;
+param K: u16;
+param Hc: u16;
+param NEX: u16 = 32;
+param TK: u16 = 4;
+param HOSTX: u16 = 0;
+param XKEEP: u16 = 0;
+
+const sys_mod = @import_module("<memcpy/memcpy>", memcpy_params);
+const tile_config = @import_module("<tile_config>");
+const color_config = tile_config.color_config;
+const tgt = tile_config.target;
+const timestamp = @import_module("<time>");
+var tdbg = @zeros([K + 2]u32);
+var tdbg_ptr: [*]u32 = &tdbg;
+var tsc = @zeros([3]u16);
+fn stamp(i: u16) void { timestamp.get_timestamp(&tsc); tdbg[i] = @as(u32, tsc[0]) | (@as(u32, tsc[1]) << 16); }
+
+var x = @zeros([Hc]f32);
+var x_ptr: [*]f32 = &x;
+var xdbg = @zeros([if (XKEEP == 1) K * Hc else 1]f32);
+var xdbg_ptr: [*]f32 = &xdbg;
+var xred = @zeros([if (XKEEP == 1) 2 * K * Hc else 1]f32);
+var xred_ptr: [*]f32 = &xred;
+var gam = @zeros([2 * K * Hc]f32);
+var gam_ptr: [*]f32 = &gam;
+var bo = @zeros([K * Hc]f32);
+var bo_ptr: [*]f32 = &bo;
+var bd = @zeros([K * NEX * Hc]f32);
+var bd_ptr: [*]f32 = &bd;
+var t = @zeros([Hc + 2 * TK]f32);
+var u = @zeros([Hc + 2]f32);
+const x_d = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{Hc} -> x[i] });
+const t_d = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{Hc} -> t[i] });
+const t2_d = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{Hc + 2 * TK} -> t[i] });
+const u_d = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{Hc} -> u[i] });
+const u2_d = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{Hc + 2} -> u[i] });
+const f_d = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{Hc} -> gam[i] });
+fn fv(p: [*]f32) mem1d_dsd { return @set_dsd_base_addr(f_d, p); }
+fn keep_red(i: u16) void { if (XKEEP == 0) { return; } @fmovs(@set_dsd_length(@increment_dsd_offset(@get_dsd(mem1d_dsd, .{ .tensor_access = |j|{if (XKEEP == 1) 2 * K * Hc else 1} -> xred[j] }), @as(i16, i * Hc), f32), Hc), t_d); }
+
+const q_w = @get_input_queue(2);
+const q_e = @get_input_queue(3);
+const q_lb = @get_input_queue(4);
+const q_hi = @get_input_queue(5);
+const q_em = @get_input_queue(6);
+const q_lo = @get_output_queue(2);
+const q_mc = @get_output_queue(3);
+const q_ho = @get_output_queue(4);
+const C_PARK: color = @get_color(16);
+fn fout(comptime q: output_queue, n: u16) fabout_dsd {
+  return @set_dsd_length(@get_dsd(fabout_dsd, .{ .extent = 1, .output_queue = q }), n);
+}
+fn fin(comptime q: input_queue, n: u16) fabin_dsd {
+  return @set_dsd_length(@get_dsd(fabin_dsd, .{ .extent = 1, .input_queue = q }), n);
+}
+const NR: u16 = 12;
+const RQ: u16 = 1 + 2 * NR;
+var rcfg = @zeros([RQ + 10]u32);
+var rcfg_ptr: [*]u32 = &rcfg;
+fn iqc(comptime qid: u16, c: u32) void {
+  const addr = tile_config.input_queue_config.get_input_queue_config_addr(qid);
+  const v: u16 = @get_config(addr, tile_config.input_queue_config.in_queue_addr_range);
+  @set_config(addr, (v & 0xffe0) | @as(u16, c), tile_config.input_queue_config.in_queue_addr_range);
+}
+fn oqc(comptime qid: u16, c: u32) void {
+  const addr = tile_config.output_queue_config.get_output_queue_config_addr(qid);
+  const v: u16 = @get_config(addr, tile_config.output_queue_config.out_queue_addr_range);
+  @set_config(addr, (v & 0xfe0f) | (@as(u16, c) << 4), tile_config.output_queue_config.out_queue_addr_range);
+}
+var qcur = [5]u16 { 13, 14, 17, 18, 19 };
+fn iq_any(q: u16, c: u16) void {
+  if (q == 0) { iqc(2, c); }
+  else if (q == 1) { iqc(3, c); }
+  else if (q == 2) { iqc(4, c); }
+  else if (q == 3) { iqc(5, c); }
+  else if (q == 4) { iqc(6, c); }
+}
+fn bind_iqs(fq: *[5]u16, tmp: u16) void {
+  var done = @zeros([5]u16);
+  var left: u16 = 5;
+  var guard: u16 = 0;
+  while (left > 0 and guard < 32) : (guard += 1) {
+    var prog = false;
+    var i: u16 = 0;
+    while (i < 5) : (i += 1) {
+      if (done[i] != 0) { continue; }
+      var clash = false;
+      var j: u16 = 0;
+      while (j < 5) : (j += 1) { if (j != i and done[j] == 0 and qcur[j] == fq.*[i]) { clash = true; } }
+      if (!clash) { iq_any(i, fq.*[i]); qcur[i] = fq.*[i]; done[i] = 1; left -= 1; prog = true; }
+    }
+    if (!prog) {
+      i = 0;
+      while (i < 5 and done[i] != 0) : (i += 1) {}
+      iq_any(i, tmp); qcur[i] = tmp;
+    }
+  }
+}
+fn init() void {
+  const cc0 = color_config.get_color_config_addr(@get_color(0));
+  var k: u16 = 0;
+  while (k < @as(u16, rcfg[0])) : (k += 1) {
+    const addr = cc0 + @as(u16, rcfg[1 + 2 * k]);
+    const r = @get_config(addr, tgt.color_addr_range) & 0xff00;
+    @set_config(addr, r | @as(u16, rcfg[2 + 2 * k]), tgt.color_addr_range);
+  }
+  var fq = [5]u16 { @as(u16, rcfg[RQ]), @as(u16, rcfg[RQ + 1]), @as(u16, rcfg[RQ + 2]), @as(u16, rcfg[RQ + 3]), @as(u16, rcfg[RQ + 9]) };
+  bind_iqs(&fq, @as(u16, rcfg[RQ + 8]));
+  oqc(2, rcfg[RQ + 4]); oqc(3, rcfg[RQ + 5]); oqc(4, rcfg[RQ + 6]);
+  timestamp.enable_tsc();
+  sys_mod.unblock_cmd_stream();
+}
+
+// [x g 2^-S | 2^S | ssq] on the row multicast
+fn norm_send(g: [*]f32) void {
+  @fmuls(u_d, x_d, fv(g));
+  var mb: u32 = 0;
+  var ss: f32 = 0.0;
+  var i: u16 = 0;
+  while (i < Hc) : (i += 1) {
+    const b = @bitcast(u32, u[i]) & 0x7fffffff;
+    if (b > mb) { mb = b; }
+    ss += x[i] * x[i];
+  }
+  // S = exponent(max) - 7 (0 for an all-zero chunk); 2^-S and 2^S exactly as f32 exponent fields
+  var e: i16 = if (mb == 0) 0 else @as(i16, @as(u16, mb >> 23)) - 127 - 7;
+  if (e < -100) { e = -100; }
+  const down = @bitcast(f32, @as(u32, @as(u16, 127 - e)) << 23);
+  @fmuls(u_d, u_d, down);
+  u[Hc] = @bitcast(f32, @as(u32, @as(u16, 127 + e)) << 23);
+  u[Hc + 1] = ss;
+  @fmovs(fout(q_mc, Hc + 2), u2_d);
+}
+
+var n_steps: u32 = 0;
+const pass_id: local_task_id = @get_local_task_id(8);
+task pass_task() void {
+  var s: u32 = 0;
+  while (s < n_steps) : (s += 1) {
+    if (HOSTX == 0 and (rcfg[RQ + 7] & 1) == 0) { @fmovs(x_d, fin(q_hi, Hc)); }
+    else if (s > 0 and (rcfg[RQ + 7] & 4) != 0) { @fmovs(x_d, fin(q_em, Hc)); }
+    stamp(0);
+    var l: u16 = 0;
+    while ((DIAG & 1) == 0 and l < (if ((DIAG & 2) != 0) 1 else K)) : (l += 1) {
+      norm_send(@ptrcast([*]f32, &gam[2 * l * Hc]));
+      @fmovs(t_d, fin(q_w, Hc));
+      keep_red(2 * l);
+      @fadds(x_d, x_d, t_d);
+      @fadds(x_d, x_d, fv(@ptrcast([*]f32, &bo[l * Hc])));
+      if ((DIAG & 4) == 0) {
+        norm_send(@ptrcast([*]f32, &gam[(2 * l + 1) * Hc]));
+        @fmovs(t2_d, fin(q_e, Hc + 2 * TK));
+        keep_red(2 * l + 1);
+        @fadds(x_d, x_d, t_d);
+        var k: u16 = 0;
+        while (k < TK) : (k += 1) {
+          const e = @as(u16, t[Hc + k]);
+          @fmacs(x_d, x_d, fv(@ptrcast([*]f32, &bd[(l * NEX + e) * Hc])), t[Hc + TK + k]);
+        }
+      }
+      if (XKEEP == 1) { @fmovs(@set_dsd_length(@increment_dsd_offset(@get_dsd(mem1d_dsd, .{ .tensor_access = |i|{if (XKEEP == 1) K * Hc else 1} -> xdbg[i] }), @as(i16, l * Hc), f32), Hc), x_d); }
+      stamp(l + 1);
+    }
+    if (HOSTX == 0 and (rcfg[RQ + 7] & 2) == 0) { @fmovs(fout(q_ho, Hc), x_d); }
+    stamp(K + 1);
+  }
+  sys_mod.unblock_cmd_stream();
+}
+fn compute(steps: u32, start_pos: u32) void {
+  n_steps = steps;
+  @activate(pass_id);
+}
+
+comptime {
+  @bind_local_task(pass_task, pass_id);
+  @initialize_queue(q_w, .{ .color = @get_color(13) });
+  @initialize_queue(q_e, .{ .color = @get_color(14) });
+  @initialize_queue(q_lb, .{ .color = @get_color(17) });
+  @initialize_queue(q_hi, .{ .color = @get_color(18) });
+  @initialize_queue(q_em, .{ .color = @get_color(19) });
+  @initialize_queue(q_lo, .{ .color = C_PARK });
+  @initialize_queue(q_mc, .{ .color = C_PARK });
+  @initialize_queue(q_ho, .{ .color = C_PARK });
+  @export_symbol(x_ptr, "x");
+  @export_symbol(xdbg_ptr, "xdbg");
+  @export_symbol(xred_ptr, "xred");
+  @export_symbol(tdbg_ptr, "tdbg");
+  @export_symbol(gam_ptr, "gam");
+  @export_symbol(bo_ptr, "bo");
+  @export_symbol(bd_ptr, "bd");
+  @export_symbol(rcfg_ptr, "rcfg");
+  @export_symbol(init);
+  @export_symbol(compute);
+}
+//@@ dummies
