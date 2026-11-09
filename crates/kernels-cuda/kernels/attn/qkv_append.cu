@@ -63,6 +63,7 @@ __global__ void qkv_decode_qk_norm_rope_vnorm_write_kv(
     int num_kv_heads,
     int head_dim,
     int page_size,
+    long long stride_page,
     bool hnd_layout,
     float theta,
     float eps,
@@ -139,14 +140,14 @@ __global__ void qkv_decode_qk_norm_rope_vnorm_write_kv(
         }
         if (hnd_layout) {
             const long long page_row =
-                ((static_cast<long long>(actual_page) * num_kv_heads +
-                  local_head) * page_size + offset_in_page) * head_dim;
+                static_cast<long long>(actual_page) * stride_page +
+                  (static_cast<long long>(local_head) * page_size + offset_in_page) * head_dim;
             dst.kv = k_pages + page_row;
             v_dst.kv = v_pages + page_row;
         } else {
             const long long page_row =
-                ((static_cast<long long>(actual_page) * page_size) +
-                 offset_in_page) * kv_dim;
+                static_cast<long long>(actual_page) * stride_page +
+                 static_cast<long long>(offset_in_page) * kv_dim;
             dst.kv = k_pages + page_row + local_head * head_dim;
             v_dst.kv = v_pages + page_row + local_head * head_dim;
         }
@@ -216,6 +217,7 @@ __global__ void qkv_decode_qk_norm_rope_vnorm_write_kv_warp(
     int num_q_heads,
     int num_kv_heads,
     int page_size,
+    long long stride_page,
     bool hnd_layout,
     float theta,
     float eps,
@@ -357,14 +359,14 @@ __global__ void qkv_decode_qk_norm_rope_vnorm_write_kv_warp(
         }
         if (hnd_layout) {
             const long long page_row =
-                ((static_cast<long long>(actual_page) * num_kv_heads +
-                  local_head) * page_size + offset_in_page) * HEAD_DIM;
+                static_cast<long long>(actual_page) * stride_page +
+                  (static_cast<long long>(local_head) * page_size + offset_in_page) * HEAD_DIM;
             dst.kv = k_pages + page_row;
             v_dst.kv = v_pages + page_row;
         } else {
             const long long page_row =
-                ((static_cast<long long>(actual_page) * page_size) +
-                 offset_in_page) * kv_dim;
+                static_cast<long long>(actual_page) * stride_page +
+                 static_cast<long long>(offset_in_page) * kv_dim;
             dst.kv = k_pages + page_row + local_head * HEAD_DIM;
             v_dst.kv = v_pages + page_row + local_head * HEAD_DIM;
         }
@@ -469,6 +471,7 @@ __global__ void qkv_qk_norm_rope_vnorm_write_kv_rows(
     int num_q_heads,
     int num_kv_heads,
     int page_size,
+    long long stride_page,
     bool hnd_layout,
     float theta,
     float eps,
@@ -658,9 +661,9 @@ __global__ void qkv_qk_norm_rope_vnorm_write_kv_rows(
                     continue;
                 }
                 const long long page_row = hnd_layout
-                    ? ((static_cast<long long>(actual_page) * num_kv_heads + local_head) * page_size +
+                    ? static_cast<long long>(actual_page) * stride_page + (static_cast<long long>(local_head) * page_size +
                        offset_in_page) * HEAD_DIM
-                    : ((static_cast<long long>(actual_page) * page_size) + offset_in_page) * kv_dim +
+                    : static_cast<long long>(actual_page) * stride_page + static_cast<long long>(offset_in_page) * kv_dim +
                           local_head * HEAD_DIM;
                 st8(k_pages + page_row, x);
                 const float inv_v = (v_norm ? rsqrtf(v_sum / static_cast<float>(HEAD_DIM) + eps) : 1.f) * v_scale;
@@ -732,9 +735,9 @@ __global__ void qkv_qk_norm_rope_vnorm_write_kv_rows(
                     dst.q = q_out + (static_cast<long long>(row) * num_q_heads + local_head) * HEAD_DIM;
                 } else {
                     const long long page_row = hnd_layout
-                        ? ((static_cast<long long>(actual_page) * num_kv_heads + local_head) * page_size +
+                        ? static_cast<long long>(actual_page) * stride_page + (static_cast<long long>(local_head) * page_size +
                            offset_in_page) * HEAD_DIM
-                        : ((static_cast<long long>(actual_page) * page_size) + offset_in_page) * kv_dim +
+                        : static_cast<long long>(actual_page) * stride_page + static_cast<long long>(offset_in_page) * kv_dim +
                               local_head * HEAD_DIM;
                     dst.kv = k_pages + page_row;
                     v_dst.kv = v_pages + page_row;
@@ -819,14 +822,14 @@ __global__ void qkv_qk_norm_rope_vnorm_write_kv_rows(
             dst.q = q_out + (static_cast<long long>(row) * num_q_heads + local_head) * HEAD_DIM;
         } else if (hnd_layout) {
             const long long page_row =
-                ((static_cast<long long>(actual_page) * num_kv_heads +
-                  local_head) * page_size + offset_in_page) * HEAD_DIM;
+                static_cast<long long>(actual_page) * stride_page +
+                  (static_cast<long long>(local_head) * page_size + offset_in_page) * HEAD_DIM;
             dst.kv = k_pages + page_row;
             v_dst.kv = v_pages + page_row;
         } else {
             const long long page_row =
-                ((static_cast<long long>(actual_page) * page_size) +
-                 offset_in_page) * kv_dim;
+                static_cast<long long>(actual_page) * stride_page +
+                 static_cast<long long>(offset_in_page) * kv_dim;
             dst.kv = k_pages + page_row + local_head * HEAD_DIM;
             v_dst.kv = v_pages + page_row + local_head * HEAD_DIM;
         }

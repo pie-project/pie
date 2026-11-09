@@ -106,6 +106,7 @@ pub fn qkv_fused_qknorm_rope_vnorm_write(
     let rows = count(OP, "rows", packed.rows)?;
 
     let hnd_layout = pool.layout != 0;
+    let stride_page = i64::from(crate::attn::kv::shared_page_elems(OP, pool)?);
     // The pages it writes: bf16, or e4m3 under a unit scale.
     let pages = if crate::attn::kv::native_e4m3(pool) {
         ", __nv_fp8_e4m3"
@@ -169,6 +170,7 @@ pub fn qkv_fused_qknorm_rope_vnorm_write(
                 num_q_heads.arg(),
                 kv_heads.arg(),
                 pool.page_size.arg(),
+                stride_page.arg(),
                 hnd_layout.arg(),
                 theta.arg(),
                 eps.arg(),
@@ -214,6 +216,7 @@ pub fn qkv_fused_qknorm_rope_vnorm_write(
                 num_q_heads.arg(),
                 kv_heads.arg(),
                 pool.page_size.arg(),
+                stride_page.arg(),
                 hnd_layout.arg(),
                 theta.arg(),
                 eps.arg(),
@@ -267,6 +270,7 @@ pub fn qkv_fused_qknorm_rope_vnorm_write(
             kv_heads.arg(),
             head_dim.arg(),
             pool.page_size.arg(),
+            stride_page.arg(),
             hnd_layout.arg(),
             theta.arg(),
             eps.arg(),

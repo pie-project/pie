@@ -52,7 +52,9 @@ fn pool(keys: u64, values: u64, tables: [u64; 3]) -> KvPool {
         max_pages_per_request: 5,
         pages_in_batch: PAGE_INDICES.len() as i32,
         live: [0, 0],
+        page_stride: [0; 2],
     }
+    .with_packed_stride()
 }
 
 #[test]
@@ -229,7 +231,8 @@ fn a_clusters_slices_fold_into_what_one_block_walks() {
         max_pages_per_request: pages as i32,
         pages_in_batch: pages as i32,
         ..pool(0, 0, [0; 3])
-    };
+    }
+    .with_packed_stride();
     let q = RaggedTensor {
         data: Tensor::new(gpu.up(&q_raw), 1, (KVH * G * D) as u32, Dtype::Bf16),
         indptr: Tensor::new(gpu.up(&[0i32, 1]), 2, 1, Dtype::I32),

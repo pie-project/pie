@@ -96,6 +96,41 @@ pub struct KvPool {
     /// Where heads are zero-padded to `head_stride`: the widths a key head
     /// and a value head carry (`[0, 0]`: the whole stride).
     pub live: [u32; 2],
+
+    /// Bytes from a page's rows to the next page's in the key plane and in
+    /// the value plane: page `p`'s rows start at `keys.ptr + p * page_stride[0]`
+    /// (the plane's pointer carries its own offset inside a page). A plane
+    /// packed page after page strides [`KvPool::packed_stride`].
+    pub page_stride: [u64; 2],
+}
+
+impl KvPool {
+    /// The page strides of key and value planes laid page after page, each
+    /// page `page_size` rows of the plane's width.
+    #[must_use]
+    pub const fn packed_stride(page_size: i32, keys: &Tensor, values: &Tensor) -> [u64; 2] {
+        const fn page_bytes(page: u64, t: &Tensor) -> u64 {
+            page * (t.width as u64 * t.dtype.bits()).div_ceil(8)
+        }
+        let page = if page_size > 0 { page_size as u64 } else { 0 };
+        [page_bytes(page, keys), page_bytes(page, values)]
+    }
+
+    /// This pool with its planes stated page after page.
+    #[must_use]
+    pub const fn with_packed_stride(self) -> Self {
+        Self {
+            page_stride: Self::packed_stride(self.page_size, &self.keys, &self.values),
+            ..self
+        }
+    }
+
+    /// Whether both planes lie page after page.
+    #[must_use]
+    pub const fn packed(&self) -> bool {
+        let packed = Self::packed_stride(self.page_size, &self.keys, &self.values);
+        self.page_stride[0] == packed[0] && self.page_stride[1] == packed[1]
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

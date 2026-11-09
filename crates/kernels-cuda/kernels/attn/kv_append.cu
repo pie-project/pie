@@ -27,6 +27,8 @@ __global__ void kv_append_explicit(
     int page_size,
     int h_kv,
     int d,
+    long long k_stride_page,
+    long long v_stride_page,
     const u32* __restrict__ win)
 {
     const int b = blockIdx.x;
@@ -42,23 +44,24 @@ __global__ void kv_append_explicit(
 
     const long long row = static_cast<long long>(h_kv) * d;
     const long long src = static_cast<long long>(b_row) * row;
+    // The row within its page; each plane steps to the page by its own stride.
+    const long long k_page = static_cast<long long>(actual_page) * k_stride_page;
+    const long long v_page = static_cast<long long>(actual_page) * v_stride_page;
     for (int i = threadIdx.x; i < row; i += blockDim.x) {
         long long dst;
         if constexpr (HND_LAYOUT) {
             const int h = i / d;
             const int j = i - h * d;
-            dst = ((static_cast<long long>(actual_page) * h_kv + h) *
-                   page_size + offset_in_page) * d + j;
+            dst = (static_cast<long long>(h) * page_size + offset_in_page) * d + j;
         } else {
-            dst = ((static_cast<long long>(actual_page) * page_size) +
-                   offset_in_page) * row + i;
+            dst = static_cast<long long>(offset_in_page) * row + i;
         }
         if constexpr (is_same<KV, bf16>::value) {
-            k_pages[dst] = k_curr[src + i];
-            v_pages[dst] = v_curr[src + i];
+            k_pages[k_page + dst] = k_curr[src + i];
+            v_pages[v_page + dst] = v_curr[src + i];
         } else {
-            k_pages[dst] = KV(bf16_to_f32(k_curr[src + i]));
-            v_pages[dst] = KV(bf16_to_f32(v_curr[src + i]));
+            k_pages[k_page + dst] = KV(bf16_to_f32(k_curr[src + i]));
+            v_pages[v_page + dst] = KV(bf16_to_f32(v_curr[src + i]));
         }
     }
 }

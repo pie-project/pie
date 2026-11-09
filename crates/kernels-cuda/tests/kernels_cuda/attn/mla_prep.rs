@@ -53,7 +53,9 @@ fn pool(keys: Tensor, values: Tensor, gpu: &mut Gpu) -> KvPool {
         max_pages_per_request: 2,
         pages_in_batch: PAGES.len() as i32,
         live: [0, 0],
+        page_stride: [0; 2],
     }
+    .with_packed_stride()
 }
 
 /// The pool cell token `t` (of request `r`, its `i`th new row) lands at.

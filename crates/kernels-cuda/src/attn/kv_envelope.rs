@@ -48,6 +48,7 @@ pub(crate) fn envelope_update_appended(
             pool.page_size.arg(),
             kv_heads.arg(),
             head_dim.arg(),
+            crate::attn::kv::page_elems(op, pool, 0)?.arg(),
             ctx.stage(),
         ],
     )

@@ -184,6 +184,8 @@ __global__ void mla_kv_append(
     int page_size,
     int kv_lora_rank,
     int qk_rope_head_dim,
+    long long ckv_stride,
+    long long kpe_stride,
     const u32* __restrict__ win)
 {
     const int t = blockIdx.x;
@@ -201,17 +203,15 @@ __global__ void mla_kv_append(
                     offset_in_page);
 
     const long long ckv_src = static_cast<long long>(t_row) * kv_lora_rank;
-    const long long ckv_dst =
-        (static_cast<long long>(actual_page) * page_size + offset_in_page) *
-        kv_lora_rank;
+    const long long ckv_dst = static_cast<long long>(actual_page) * ckv_stride +
+                              static_cast<long long>(offset_in_page) * kv_lora_rank;
     for (int i = threadIdx.x; i < kv_lora_rank; i += blockDim.x) {
         ckv_pages[ckv_dst + i] = ckv_curr[ckv_src + i];
     }
 
     const long long kpe_src = static_cast<long long>(t_row) * qk_rope_head_dim;
-    const long long kpe_dst =
-        (static_cast<long long>(actual_page) * page_size + offset_in_page) *
-        qk_rope_head_dim;
+    const long long kpe_dst = static_cast<long long>(actual_page) * kpe_stride +
+                              static_cast<long long>(offset_in_page) * qk_rope_head_dim;
     for (int i = threadIdx.x; i < qk_rope_head_dim; i += blockDim.x) {
         kpe_pages[kpe_dst + i] = kpe_curr[kpe_src + i];
     }
@@ -234,6 +234,7 @@ __global__ __launch_bounds__(160) void mla_kv_append_fp8(
     int R,
     int page_size,
     int rope,
+    long long stride,
     const u32* __restrict__ win)
 {
     const int t = blockIdx.x;
@@ -250,7 +251,8 @@ __global__ __launch_bounds__(160) void mla_kv_append_fp8(
                     kv_last_page_lens, R, page_size, t, actual_page,
                     offset_in_page);
     const int width = 512 + rope;
-    u8* row = rows + (static_cast<long long>(actual_page) * page_size + offset_in_page) * width;
+    u8* row = rows + static_cast<long long>(actual_page) * stride +
+              static_cast<long long>(offset_in_page) * width;
     const int i = static_cast<int>(threadIdx.x);
     if (i >= width / 4) return;
     const bf16* src = i < 128 ? ckv_curr + static_cast<long long>(t_row) * 512 + 4 * i

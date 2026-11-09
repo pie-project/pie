@@ -227,6 +227,8 @@ pub struct Buffers {
     pub q: DevicePtr,
     pub k_pages: DevicePtr,
     pub v_pages: DevicePtr,
+    /// Elements from a page's rows to the next page's, in both planes.
+    pub kv_stride_page: u32,
     pub o: DevicePtr,
     pub kv_page_indices: DevicePtr,
     pub kv_page_indptr: DevicePtr,
@@ -282,6 +284,7 @@ pub fn make_paged_kv(
     head_dim: u32,
     batch_size: u32,
     hnd_layout: bool,
+    stride_page: u32,
     k_data: DevicePtr,
     v_data: DevicePtr,
     indices: DevicePtr,
@@ -293,7 +296,7 @@ pub fn make_paged_kv(
         num_heads,
         head_dim,
         batch_size,
-        stride_page: num_heads.wrapping_mul(page_size).wrapping_mul(head_dim),
+        stride_page,
         stride_n: if hnd_layout {
             head_dim
         } else {
@@ -333,6 +336,7 @@ pub fn make_decode_params(
             shape.head_dim,
             shape.lane_offset + shape.num_requests,
             shape.hnd_layout,
+            bufs.kv_stride_page,
             bufs.k_pages,
             bufs.v_pages,
             bufs.kv_page_indices,
@@ -408,6 +412,7 @@ pub fn make_prefill_params(
             shape.head_dim,
             shape.lane_offset + shape.num_requests,
             shape.hnd_layout,
+            bufs.kv_stride_page,
             bufs.k_pages,
             bufs.v_pages,
             bufs.kv_page_indices,

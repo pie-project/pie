@@ -30,6 +30,7 @@ __global__ void rope_full(
     const u8* __restrict__ row_valid,
     int R,
     int page_size,
+    long long stride_page,
     const u32* __restrict__ win)
 {
     const int n = blockIdx.x;
@@ -107,9 +108,9 @@ __global__ void rope_full(
                                 head_dim;
                     const int base = kv_h * head_dim;
                     const long long d0 = kv_dst_index<kHnd>(
-                        slot, base + j0, page_size, num_kv_heads, head_dim);
+                        slot, base + j0, page_size, num_kv_heads, head_dim, stride_page);
                     const long long d1 = kv_dst_index<kHnd>(
-                        slot, base + j1, page_size, num_kv_heads, head_dim);
+                        slot, base + j1, page_size, num_kv_heads, head_dim, stride_page);
                     k_pages[d0] = kp[j0];
                     k_pages[d1] = kp[j1];
                     v_pages[d0] = vp[j0];

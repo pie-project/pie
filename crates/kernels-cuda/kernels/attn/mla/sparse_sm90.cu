@@ -118,7 +118,8 @@ __global__ __launch_bounds__(kThreads, 1) void mla_wgmma_paged_kernel(
     __nv_bfloat16* __restrict__ part_o,
     float* __restrict__ part_lse,
     const std::int32_t* __restrict__ selection, int top_k, int dense,
-    int R, int H, int page_size, float sm_scale, bool causal,
+    int R, int H, int page_size, long long ckv_stride, long long kpe_stride,
+    float sm_scale, bool causal,
     const std::uint32_t* __restrict__ win)
 {
     extern __shared__ __align__(16) unsigned char wg_smem_raw[];
@@ -192,7 +193,8 @@ __global__ __launch_bounds__(kThreads, 1) void mla_wgmma_paged_kernel(
     }
 
     // A tile's slots (and which hold a key), read a tile ahead into the
-    // first 64 threads' registers under the scores' MMAs, then published.
+    // first 64 threads' registers under the scores' MMAs, then published:
+    // a key's page above its 16 low bits, its cell in the page below them.
     long long nslot = -1;
     bool nok = false;
     auto fetch = [&](int j0) {
@@ -202,7 +204,7 @@ __global__ __launch_bounds__(kThreads, 1) void mla_wgmma_paged_kernel(
             if (srow != nullptr) j = n < j_hi ? srow[n] : -1;
             nok = n < j_hi && j >= 0 && j < j_end;
             nslot = nok
-                ? static_cast<long long>(kv_page_indices[pages_first + j / page_size]) * page_size + (j % page_size)
+                ? (static_cast<long long>(kv_page_indices[pages_first + j / page_size]) << 16) | (j % page_size)
                 : -1;
         }
     };
@@ -223,10 +225,11 @@ __global__ __launch_bounds__(kThreads, 1) void mla_wgmma_paged_kernel(
             const int ch = i % (kD / 8);
             const long long slot = slots[row];
             const bool live = slot >= 0;
-            const long long at = live ? slot : 0;
+            const long long page = live ? slot >> 16 : 0;
+            const long long cell = live ? slot & 0xffff : 0;
             const void* src = ch < kCkv / 8
-                ? static_cast<const void*>(ckv_pages + at * kCkv + ch * 8)
-                : static_cast<const void*>(kpe_pages + at * kKpe + (ch - kCkv / 8) * 8);
+                ? static_cast<const void*>(ckv_pages + page * ckv_stride + cell * kCkv + ch * 8)
+                : static_cast<const void*>(kpe_pages + page * kpe_stride + cell * kKpe + (ch - kCkv / 8) * 8);
             cp16(dst + at_of(row, ch), src, live);
         }
         asm volatile("cp.async.commit_group;\n" ::);

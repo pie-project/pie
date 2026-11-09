@@ -4,7 +4,7 @@
 use crate::error::Error;
 
 use super::rms;
-use crate::attn::kv::lanes_of;
+use crate::attn::kv::{lanes_of, page_elems};
 use crate::jit::{Arg, ArgValue, Ctx, Fire, Launch, count, dtype_dispatch, kernel, refuse, stated};
 use crate::tensor::{KvPool, Tensor};
 
@@ -163,6 +163,7 @@ pub(crate) fn write_mla_fp8_rows(
             num_requests.arg(),
             pool.page_size.arg(),
             i32::try_from(rope).unwrap_or(0).arg(),
+            page_elems(op, pool, 0)?.arg(),
             ctx.stage(),
         ],
     )
@@ -201,6 +202,8 @@ pub(crate) fn write_mla_to_pages(
             pool.page_size.arg(),
             kv_lora_rank.arg(),
             rope_dim.arg(),
+            page_elems(op, pool, 0)?.arg(),
+            page_elems(op, pool, 1)?.arg(),
             ctx.stage(),
         ],
     )

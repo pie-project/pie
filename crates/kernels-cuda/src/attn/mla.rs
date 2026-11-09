@@ -25,6 +25,9 @@ pub(crate) struct Layer {
     ckv_pages: u64,
     kpe_pages: u64,
     page_size: i32,
+    /// Elements from a page's latent (rotated) rows to the next page's.
+    ckv_stride: u32,
+    kpe_stride: u32,
     kv_lora_rank: i32,
     rope_dim: i32,
 }
@@ -40,6 +43,8 @@ impl Layer {
             ckv_pages: pool.keys.ptr,
             kpe_pages: pool.values.ptr,
             page_size: pool.page_size,
+            ckv_stride: kv::page_elems_u32(op, pool, 0)?,
+            kpe_stride: kv::page_elems_u32(op, pool, 1)?,
             kv_lora_rank: stated(op, kv_lora_rank)?,
             rope_dim,
         })
@@ -427,6 +432,8 @@ fn dispatch_dense(
                 kv_lora_rank: layer.kv_lora_rank,
                 rope_dim: layer.rope_dim,
                 page_size: layer.page_size,
+                ckv_stride: i64::from(layer.ckv_stride),
+                kpe_stride: i64::from(layer.kpe_stride),
                 total_tokens: stated(op, o.rows)?,
                 num_requests,
                 num_heads,
@@ -620,6 +627,8 @@ fn selected(
             kv_lora_rank: layer.kv_lora_rank,
             rope_dim: layer.rope_dim,
             page_size: layer.page_size,
+            ckv_stride: i64::from(layer.ckv_stride),
+            kpe_stride: i64::from(layer.kpe_stride),
             total_tokens: stated(op, o.rows)?,
             num_requests,
             num_heads: heads,

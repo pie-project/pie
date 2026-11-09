@@ -48,15 +48,23 @@ __device__ __forceinline__ int owned(const u32* indptr, int req, int page) {
 // 32 bytes of e2m1 pairs under four e4m3 scales; V4's rows: 64 codes under
 // one ue8m0 scale, or at the last atom the rotated dims' 128 bytes of bf16,
 // read as they are when the atom is stored).
+// A packed plane's page stride in format F, `ps` rows a page.
+template <int F>
+__device__ __forceinline__ long long packed_stride(int ps) {
+    return static_cast<long long>(ps) * (kv_rows::Rows<F>::kData + kv_rows::Rows<F>::kScale);
+}
+
 struct AtomBytes {
     uint4 d[4];
     std::uint32_t sc;
 };
 
+// (The pass reads its planes page after page, cell by cell: its launcher
+// takes packed pools alone.)
 template <int F>
 __device__ __forceinline__ void load_atom(const std::uint8_t* plane, u32 cell, int ps, int a, AtomBytes& b) {
     const kv_rows::DsRow r = kv_rows::rows_at<F>(const_cast<std::uint8_t*>(plane), cell / ps,
-                                           static_cast<int>(cell % ps), ps);
+                                           static_cast<int>(cell % ps), ps, packed_stride<F>(ps));
     if constexpr (F == kv_rows::kMx8) {
 #pragma unroll
         for (int i = 0; i < 4; ++i) b.d[i] = reinterpret_cast<const uint4*>(r.data + a * 64)[i];
@@ -161,7 +169,7 @@ __device__ __forceinline__ void widen_atom(const AtomBytes& b, uint4 (&v)[8]) {
 // V4's rotated dims (its last atom), bf16 as the row holds them.
 __device__ __forceinline__ void rope_atom(const std::uint8_t* plane, u32 cell, int ps, uint4 (&v)[8]) {
     const kv_rows::DsRow r = kv_rows::rows_at<kv_rows::kV4>(const_cast<std::uint8_t*>(plane), cell / ps,
-                                                   static_cast<int>(cell % ps), ps);
+                                                   static_cast<int>(cell % ps), ps, packed_stride<kv_rows::kV4>(ps));
 #pragma unroll
     for (int c = 0; c < 8; ++c) v[c] = reinterpret_cast<const uint4*>(r.data + kv_rows::kDsNope)[c];
 }
@@ -627,7 +635,8 @@ __global__ __launch_bounds__(256) void stage_pages(
     const u32* __restrict__ indices,
     u32* __restrict__ out_indices,
     int n,
-    int page)
+    int page,
+    long long page_stride)
 {
     const int i = static_cast<int>(blockIdx.x);
     if (i >= n) return;
@@ -635,7 +644,7 @@ __global__ __launch_bounds__(256) void stage_pages(
     const long long src = indices[i];
     const int warp = static_cast<int>(threadIdx.x) / 32, lane = static_cast<int>(threadIdx.x) % 32;
     for (int r = warp; r < page; r += 8) {
-        const kv_rows::DsRow row = kv_rows::rows_at<F>(const_cast<std::uint8_t*>(fp8), src, r, page);
+        const kv_rows::DsRow row = kv_rows::rows_at<F>(const_cast<std::uint8_t*>(fp8), src, r, page, page_stride);
         bf16* dst = out + (static_cast<long long>(i) * page + r) * kD;
 #pragma unroll
         for (int c = lane; c < kD / 8; c += 32) {

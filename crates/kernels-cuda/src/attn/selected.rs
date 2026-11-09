@@ -179,6 +179,7 @@ fn selected(
     if total_tokens <= 0 {
         return Err(refuse(op, "the query this attention was handed is empty"));
     }
+    let stride = i64::from(kv::shared_page_elems(op, pool)?);
     let num_requests = kv::lanes_of(op, q.indptr)?;
     // Rows that share their keys, where a fire's requests run eight rows or
     // more and every block a row can see fits the tile's maps.
@@ -222,6 +223,7 @@ fn selected(
                 q_heads.arg(),
                 kv_heads.arg(),
                 pool.page_size.arg(),
+                stride.arg(),
                 sm_scale.arg(),
                 top_k.arg(),
                 ratio.arg(),
@@ -278,6 +280,7 @@ fn selected(
                 q_heads.arg(),
                 kv_heads.arg(),
                 pool.page_size.arg(),
+                stride.arg(),
                 sm_scale.arg(),
                 top_k.arg(),
                 ratio.arg(),
@@ -316,6 +319,7 @@ fn selected(
             kv_heads.arg(),
             head_dim.arg(),
             pool.page_size.arg(),
+            stride.arg(),
             sm_scale.arg(),
             top_k.arg(),
             ratio.arg(),

@@ -5,12 +5,11 @@ namespace pie::attn::index {
 
 namespace index_fp4 {
 
-// Eight dims of a key from its page plane: `slot` its page * ps + offset,
-// `run` which 8 of its 128.
-__device__ __forceinline__ uint4 load8(const std::uint8_t* plane, long long slot, int ps, int run) {
-    const long long page = slot / ps;
-    const int off = static_cast<int>(slot % ps);
-    const std::uint8_t* base = plane + page * ps * kRow;
+// Eight dims of a key from its page plane, its pages `stride` bytes apart:
+// row `off` of page `page`, `run` which 8 of its 128.
+__device__ __forceinline__ uint4 load8(const std::uint8_t* plane, long long page, int off, int ps,
+                                      long long stride, int run) {
+    const std::uint8_t* base = plane + page * stride;
     const std::uint32_t nib = *reinterpret_cast<const std::uint32_t*>(base + off * kData + run * 4);
     const float s = pow2_of(base[ps * kData + off * kScale + run / 4]);
     uint4 out;
@@ -41,7 +40,8 @@ __global__ __launch_bounds__(128) void index_store_fp4(
     const u32* __restrict__ page_indptr,
     int n,
     int page_size,
-    int div)
+    int div,
+    long long stride)
 {
     using namespace index_fp4;
     const int c = static_cast<int>(blockIdx.x) * 4 + static_cast<int>(threadIdx.x >> 5);
@@ -72,7 +72,7 @@ __global__ __launch_bounds__(128) void index_store_fp4(
     unsigned code[4];
 #pragma unroll
     for (int i = 0; i < 4; ++i) code[i] = kv_rows::e2m1_code(fminf(fmaxf(v[i] * inv, -6.f), 6.f));
-    std::uint8_t* base = pages + page * page_size * kRow;
+    std::uint8_t* base = pages + page * stride;
     *reinterpret_cast<std::uint16_t*>(base + off * kData + lane * 2) =
         static_cast<std::uint16_t>(code[0] | (code[1] << 4) | (code[2] << 8) | (code[3] << 12));
     if ((lane & 7) == 0) base[page_size * kData + off * kScale + lane / 8] = static_cast<std::uint8_t>(e);
@@ -131,7 +131,8 @@ __global__ __launch_bounds__(256) void index_stage_fp4(
     const u32* __restrict__ indices,
     u32* __restrict__ out_indices,
     int n,
-    int page_size)
+    int page_size,
+    long long stride)
 {
     using namespace index_fp4;
     const int i = static_cast<int>(blockIdx.x);
@@ -142,7 +143,7 @@ __global__ __launch_bounds__(256) void index_stage_fp4(
         const int r = c / (kD / 8);
         const int run = c % (kD / 8);
         *reinterpret_cast<uint4*>(out + (static_cast<long long>(i) * page_size + r) * kD + run * 8) =
-            load8(plane, src * page_size + r, page_size, run);
+            load8(plane, src, r, page_size, stride, run);
     }
 }
 
@@ -357,7 +358,7 @@ __global__ void index_topk_paged(
     const u32* __restrict__ kv_last_page_lens,
     float* __restrict__ scores,
     i32* __restrict__ selection,
-    i32 R, i32 H, i32 D, i32 page_size, i32 score_stride, i32 topk,
+    i32 R, i32 H, i32 D, i32 page_size, i64 key_stride, i32 score_stride, i32 topk,
     i32 ratio,
     i32 compact,
     const u32* __restrict__ win)
@@ -417,7 +418,7 @@ __global__ void index_topk_paged(
             static_cast<int>(kv_page_indices[pages_first + cell / kps]);
         const int off = cell % kps;
         const T* kj =
-            key_pages + (static_cast<long long>(page) * kps + off) * D;
+            key_pages + static_cast<long long>(page) * key_stride + static_cast<long long>(off) * D;
         float acc = 0.f;
         for (int h = 0; h < H; ++h) {
             const T* qh = qi + static_cast<long long>(h) * D;
@@ -468,7 +469,7 @@ __global__ void index_topk_paged_mma(
     const u32* __restrict__ kv_last_page_lens,
     float* __restrict__ scores,
     i32* __restrict__ selection,
-    i32 R, i32 H, i32 D, i32 page_size, i32 score_stride, i32 topk,
+    i32 R, i32 H, i32 D, i32 page_size, i64 key_stride, i32 score_stride, i32 topk,
     i32 ratio,
     i32 compact,
     const i32* __restrict__ turn_pos,
@@ -572,7 +573,8 @@ __global__ void index_topk_paged_mma(
             long long slot = -1;
             if (j < nkeys) {
                 const int cell = compact ? j : (j + 1) * stride - 1;
-                slot = static_cast<long long>(kv_page_indices[pages_first + cell / kps]) * kps + cell % kps;
+                // The key's page above 16 bits, its row in the page below.
+                slot = (static_cast<long long>(kv_page_indices[pages_first + cell / kps]) << 16) | (cell % kps);
             }
             slot_s[warp][buf][lane] = slot;
         }
@@ -586,7 +588,7 @@ __global__ void index_topk_paged_mma(
                 const int run = c % (kD / 8);
                 const long long slot = slot_s[warp][buf][key];
                 uint4 v = make_uint4(0, 0, 0, 0);
-                if (slot >= 0) v = index_fp4::load8(plane, slot, kps, run);
+                if (slot >= 0) v = index_fp4::load8(plane, slot >> 16, static_cast<int>(slot & 0xffff), kps, key_stride, run);
                 *reinterpret_cast<uint4*>(kb + key * kLd + run * 8) = v;
             }
             asm volatile("cp.async.commit_group;\n" ::: "memory");
@@ -596,7 +598,7 @@ __global__ void index_topk_paged_mma(
             const int key = c / (kD / 8);
             const int d = (c % (kD / 8)) * 8;
             const long long slot = slot_s[warp][buf][key];
-            const T* src = key_pages + (slot >= 0 ? slot : 0) * kD + d;
+            const T* src = key_pages + (slot >= 0 ? (slot >> 16) * key_stride + (slot & 0xffff) * kD : 0) + d;
             asm volatile("cp.async.cg.shared.global [%0], [%1], 16, %2;\n" ::"r"(smem_addr(kb + key * kLd + d)),
                          "l"(src), "r"(slot >= 0 ? 16 : 0)
                          : "memory");
@@ -681,7 +683,7 @@ __global__ void index_topk_block_max(
     const u32* __restrict__ kv_last_page_lens,
     float* __restrict__ scores,
     i32* __restrict__ selection,
-    i32 R, i32 H, i32 D, i32 page_size, i32 score_stride, i32 topk,
+    i32 R, i32 H, i32 D, i32 page_size, i64 key_stride, i32 score_stride, i32 topk,
     i32 block,
     const u32* __restrict__ win)
 {
@@ -742,8 +744,8 @@ __global__ void index_topk_block_max(
         for (int j = lo; j < hi; ++j) {
             const int page =
                 static_cast<int>(kv_page_indices[pages_first + j / page_size]);
-            const T* kj = key_pages +
-                (static_cast<long long>(page) * page_size + j % page_size) * D;
+            const T* kj = key_pages + static_cast<long long>(page) * key_stride +
+                static_cast<long long>(j % page_size) * D;
             float kv[kMaxIndexPer];
             for (int i = 0; i < per; ++i) kv[i] = Elem<T>::to_f32(kj[lane + i * 32]);
             for (int h = 0; h < H; ++h) {

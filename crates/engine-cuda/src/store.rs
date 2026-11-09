@@ -496,6 +496,26 @@ enum Shape {
     },
 }
 
+impl Shape {
+    /// The bytes from one page's rows to the next in a kv row's plane
+    /// `plane` (0 keys, else values), the stride its kernels step pages by:
+    /// each plane its own arena, page after page.
+    fn page_stride(&self, plane: usize, page_size: u32) -> u64 {
+        match *self {
+            Shape::Kv {
+                dtype,
+                keys_width,
+                values_width,
+                ..
+            } => {
+                let width = if plane == 0 { keys_width } else { values_width };
+                u64::from(page_size) * width * u64::from(elem_size(dtype))
+            }
+            Shape::State { .. } => 0,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy)]
 pub struct SpaceSeat {
     pub page_indptr: Tensor,
@@ -1516,6 +1536,10 @@ impl Pools {
                             max_pages_per_request: narrow(u64::from(self.paging.pages_per_slot)),
                             pages_in_batch: narrow(u64::from(seats.pages)),
                             live: live.unwrap_or([0, 0]),
+                            page_stride: [
+                                shape.page_stride(0, self.paging.page_size),
+                                shape.page_stride(1, self.paging.page_size),
+                            ],
                         },
                     }
                 }
@@ -1653,15 +1677,14 @@ impl Pools {
             for (at, arena) in planes.iter().enumerate() {
                 let width = if at == 0 { keys_width } else { values_width };
                 let cell = width * element;
+                let stride = shape.page_stride(at, self.paging.page_size);
                 for span in moves {
                     if span.tokens == 0 {
                         continue;
                     }
                     let bytes = u64::from(span.tokens) * cell;
-                    let src =
-                        (u64::from(span.src_page) * page_size + u64::from(span.src_token)) * cell;
-                    let dst =
-                        (u64::from(span.dst_page) * page_size + u64::from(span.dst_token)) * cell;
+                    let src = u64::from(span.src_page) * stride + u64::from(span.src_token) * cell;
+                    let dst = u64::from(span.dst_page) * stride + u64::from(span.dst_token) * cell;
                     if src == dst {
                         continue;
                     }
@@ -1711,14 +1734,10 @@ impl Pools {
     /// The planes of the kv rows that are (or are not) `windowed`, and the
     /// bytes a page holds in each.
     fn kv_planes(&self, windowed: bool) -> Vec<(&Arena, u64)> {
-        let page_size = u64::from(self.paging.page_size);
         let mut planes = Vec::new();
         for (arenas, shape) in self.rows.iter().zip(&self.shapes) {
             let Shape::Kv {
                 windowed: in_window,
-                dtype,
-                keys_width,
-                values_width,
                 ..
             } = *shape
             else {
@@ -1727,9 +1746,10 @@ impl Pools {
             if in_window != windowed {
                 continue;
             }
+            // A plane's pages lie page after page, so a page holds its
+            // stride's bytes.
             for (at, arena) in arenas.iter().enumerate() {
-                let width = if at == 0 { keys_width } else { values_width };
-                planes.push((arena, page_size * width * u64::from(elem_size(dtype))));
+                planes.push((arena, shape.page_stride(at, self.paging.page_size)));
             }
         }
         planes

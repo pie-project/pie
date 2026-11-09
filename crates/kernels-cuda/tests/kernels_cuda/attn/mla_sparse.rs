@@ -279,7 +279,9 @@ fn score(
         max_pages_per_request: 10,
         pages_in_batch: PAGE_INDICES.len() as i32,
         live: [0, 0],
-    };
+        page_stride: [0; 2],
+    }
+    .with_packed_stride();
     let q = RaggedTensor {
         data: Tensor::new(
             gpu.up(&q_nope_raw),
@@ -496,7 +498,9 @@ fn decode_rows(reqs: usize, tc: bool) -> Vec<u16> {
         max_pages_per_request: *pages_per.iter().max().unwrap() as i32,
         pages_in_batch: total as i32,
         live: [0, 0],
-    };
+        page_stride: [0; 2],
+    }
+    .with_packed_stride();
     let q_at = gpu.up(&q_raw);
     let qpe_at = gpu.up(&qpe_raw);
     let qo_at = gpu.up(&qo);
@@ -678,7 +682,9 @@ fn decode_heads(
         max_pages_per_request: pages_per as i32,
         pages_in_batch: total as i32,
         live: [0, 0],
-    };
+        page_stride: [0; 2],
+    }
+    .with_packed_stride();
     let q_at = gpu.up(&q_raw);
     let qpe_at = gpu.up(&qpe_raw);
     let qo_at = gpu.up(&qo);

@@ -121,11 +121,27 @@ fn kv_width(pool: &KvPool) -> fa2::KvWidth {
     }
 }
 
-fn pool_buffers(q_ptr: u64, pool: &KvPool, plan_ws: plan::Workspace, o_ptr: u64) -> Buffers {
-    Buffers {
+/// The FA2 buffers over `pool`. A quantized scheme's pages are read through
+/// their packed bf16 widening, `packed` elements a page.
+fn pool_buffers(
+    op: &'static str,
+    q_ptr: u64,
+    pool: &KvPool,
+    plan_ws: plan::Workspace,
+    o_ptr: u64,
+    packed: u32,
+) -> Result<Buffers, Error> {
+    let kv_stride_page = if kv::native_bf16(pool) || kv::native_e4m3(pool) {
+        kv::shared_page_elems(op, pool)?
+    } else {
+        kv::packed_only(op, pool, "a quantized scheme's attention")?;
+        packed
+    };
+    Ok(Buffers {
         q: q_ptr,
         k_pages: pool.keys.ptr,
         v_pages: pool.values.ptr,
+        kv_stride_page,
         o: o_ptr,
         kv_page_indices: pool.page_indices.ptr,
         kv_page_indptr: pool.page_indptr.ptr,
@@ -134,7 +150,7 @@ fn pool_buffers(q_ptr: u64, pool: &KvPool, plan_ws: plan::Workspace, o_ptr: u64)
         lse: 0,
         int_buffer: plan_ws.int_ptr,
         float_buffer: plan_ws.float_ptr,
-    }
+    })
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -194,7 +210,17 @@ fn fa2_decode_with(
         stated(op, head_dim)?,
     )?;
 
-    let mut bufs = pool_buffers(q.data.ptr, pool, plan.workspace, o.ptr);
+    let mut bufs = pool_buffers(
+        op,
+        q.data.ptr,
+        pool,
+        plan.workspace,
+        o.ptr,
+        plan.shape
+            .num_kv_heads
+            .wrapping_mul(plan.shape.page_size)
+            .wrapping_mul(plan.shape.head_dim),
+    )?;
     bufs.qo_indptr = q.indptr.ptr;
     if let Some(lse) = &lse {
         lse_plane(op, lse, q.data.rows, plan.shape.num_q_heads);
@@ -352,7 +378,17 @@ fn fa2_prefill_with(
             return Ok(sunk.is_some());
         }
     }
-    let mut bufs = pool_buffers(q.data.ptr, pool, plan.workspace, o.ptr);
+    let mut bufs = pool_buffers(
+        op,
+        q.data.ptr,
+        pool,
+        plan.workspace,
+        o.ptr,
+        plan.shape
+            .num_kv_heads
+            .wrapping_mul(plan.shape.page_size)
+            .wrapping_mul(plan.shape.head_dim),
+    )?;
     bufs.qo_indptr = q.indptr.ptr;
     if let Some(lse) = &lse {
         lse_plane(op, lse, q.data.rows, plan.shape.num_q_heads);

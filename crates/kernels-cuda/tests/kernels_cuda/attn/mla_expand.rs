@@ -115,7 +115,9 @@ fn the_expanded_mla_prefill_lands_what_the_absorbed_one_does() {
         max_pages_per_request: 10,
         pages_in_batch: PAGE_INDICES.len() as i32,
         live: [0, 0],
-    };
+        page_stride: [0; 2],
+    }
+    .with_packed_stride();
 
     // Absorbed: split, absorb the queries, score the latents, absorb out.
     let mut q_nope = Tensor::new(

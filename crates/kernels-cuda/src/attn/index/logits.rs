@@ -80,6 +80,8 @@ pub(crate) fn ranked_tc5(
         || !matches!(per, 4 | 8 | 16 | 32 | 64 | 128)
         || !cells.is_multiple_of(ratio.unsigned_abs())
         || keys.seq_stride * if compact { i64::from(ratio) } else { 1 } != 128
+        // It reads the keys cell by cell, page after page.
+        || !keys.packed()
         || !keys.keys.ptr.is_multiple_of(16)
         || !q.data.ptr.is_multiple_of(16)
     {

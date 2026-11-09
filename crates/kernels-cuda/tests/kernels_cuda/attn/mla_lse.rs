@@ -221,7 +221,9 @@ fn pool(raw: &Raw) -> KvPool {
         max_pages_per_request: 5,
         pages_in_batch: PAGE_INDICES.len() as i32,
         live: [0, 0],
+        page_stride: [0; 2],
     }
+    .with_packed_stride()
 }
 
 /// The scores and the log-sum-exp one arm lands: the selected naive arm, or
