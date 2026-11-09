@@ -84,13 +84,37 @@ pub(crate) fn head(f: &mut Func, v: Val, n: i64) -> Built<Val> {
     f.slice(v, &[0], &[n], &[1])
 }
 
+/// A table this short is read by a one-hot select and sum, not a gather:
+/// XLA lowers a gather from it to a chain of selects, one a table entry
+/// (v6e, Gemma-4-26B-A4B at 64 decode lanes: a 64-entry lane table read at
+/// 4096 indices took 225 us in each of its 25 sliding layers).
+const SHORT_TABLE: i64 = 256;
+
 /// `table[idx]` elementwise for a flat `table`; `idx` any shape (clamped).
 pub(crate) fn take(f: &mut Func, table: Val, idx: Val) -> Built<Val> {
     let dims = f.dims(idx).to_vec();
     let n = f.dims(table)[0];
-    let t = f.reshape(table, &[n, 1])?;
     let m: i64 = dims.iter().product();
     let i = f.reshape(idx, &[m])?;
+    if n <= SHORT_TABLE && f.elem(table) != Elem::Pred {
+        let lo = f.like_i(i, 0);
+        let i = f.max(i, lo)?;
+        let hi = f.like_i(i, n - 1);
+        let i = f.min(i, hi)?;
+        let is = f.broadcast(i, &[m, n], &[0])?;
+        let es = f.iota(Elem::I32, &[m, n], 1);
+        let hit = f.compare(Cmp::Eq, is, es)?;
+        let ts = f.broadcast(table, &[m, n], &[1])?;
+        let zero = if f.elem(ts).is_float() {
+            f.like_f(ts, 0.0)
+        } else {
+            f.like_i(ts, 0)
+        };
+        let g = f.select(hit, ts, zero)?;
+        let g = f.reduce(g, &[1], Fold::Sum)?;
+        return f.reshape(g, &dims);
+    }
+    let t = f.reshape(table, &[n, 1])?;
     let g = f.take_rows(t, i)?;
     f.reshape(g, &dims)
 }
