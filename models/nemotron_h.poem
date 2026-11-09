@@ -121,6 +121,111 @@ DIMS = {
     "nemotron3-nano-mini": nano(6, 16),
 }
 
+# A Nemotron-3 checkpoint this package lists no model of (Nemotron 3.5
+# Lightning, a fine-tune at another depth, width or expert count): the same
+# mixers at the widths, layer pattern, experts, fan-out, scaling and norm
+# epsilon its config.json states, its experts on a latent width where it
+# states one (Super's and Ultra's shape) or on the residual (Nano's).
+# Refused where it states what the forward does not run: a dense MLP layer
+# (`-`, Nemotron-H and Nemotron Nano 2), grouped routing, biases. Offered as
+# released (bf16); Nano's shape also with keys and values e4m3 and as
+# modelopt's NVFP4 export; Super's and Ultra's also as mlx_lm quantizes them,
+# and Super's own pattern as its modelopt export, whose precision layer by
+# layer is Super's.
+
+KINDS = {"mamba": "M", "attention": "*", "moe": "E", "mlp": "-"}
+
+def adopt(id, config, special):
+    if config.get("model_type", "nemotron_h") != "nemotron_h":
+        fail("the config's model_type is {}; this family is nemotron_h".format(config.get("model_type")))
+    pattern = config.get("hybrid_override_pattern")
+    if pattern == None:
+        kinds = config.get("layers_block_type")
+        if kinds == None:
+            fail("its config states neither hybrid_override_pattern nor layers_block_type")
+        unknown = [k for k in kinds if k not in KINDS]
+        if unknown:
+            fail("its layers_block_type names {}; this family runs mamba, attention and moe layers".format(unknown[0]))
+        pattern = "".join([KINDS[k] for k in kinds])
+    if config.get("num_hidden_layers", len(pattern)) != len(pattern):
+        fail("its pattern names {} layers, its num_hidden_layers {}".format(len(pattern), config["num_hidden_layers"]))
+    stray = [c for c in pattern.elems() if c not in ["M", "*", "E"]]
+    if stray:
+        fail("its pattern holds `{}` layers ({}); this family runs Mamba-2 (M), attention (*) and MoE (E) layers only".format(stray[0], "a dense MLP" if stray[0] == "-" else "unknown"))
+    if config.get("mlp_hidden_act", "relu2") != "relu2":
+        fail("its experts activate by {}; this family's by relu2".format(config["mlp_hidden_act"]))
+    if config.get("mamba_hidden_act", "silu") != "silu":
+        fail("its Mamba-2 gates by {}; this family's by silu".format(config["mamba_hidden_act"]))
+    for key in ["attention_bias", "mlp_bias", "use_bias", "mamba_proj_bias"]:
+        if config.get(key, False):
+            fail("its projections carry biases ({}), which this family's do not".format(key))
+    if not config.get("use_conv_bias", True):
+        fail("its convolution carries no bias; this family reads one")
+    if config.get("residual_in_fp32", False):
+        fail("it keeps its residual in f32; this family keeps it at the compute dtype")
+    if config.get("sliding_window") != None:
+        fail("it attends through a sliding window; this family attends in full")
+    if config.get("tie_word_embeddings", False):
+        fail("it reads out through its embedding; this family reads a head of its own")
+    if config.get("n_group", 1) != 1 or config.get("topk_group", 1) != 1:
+        fail("it routes within groups of experts; this family routes over them all")
+    if not config.get("norm_topk_prob", True):
+        fail("it leaves its picked experts' weights unnormalized; this family renormalizes them")
+    if config.get("n_shared_experts", 1) != 1:
+        fail("it carries {} shared experts; this family one".format(config["n_shared_experts"]))
+    limit = config.get("time_step_limit")
+    if limit != None and (limit[0] > 0 or limit[1] < 1e300):
+        fail("it clamps its Mamba-2 step to {}; this family does not".format(limit))
+    experts = config["n_routed_experts"]
+    d = struct(
+        layers = len(pattern),
+        pattern = pattern,
+        hidden = config["hidden_size"],
+        vocab = config["vocab_size"],
+        heads = config["num_attention_heads"],
+        kv_heads = config["num_key_value_heads"],
+        head_dim = config.get("head_dim", config["hidden_size"] // config["num_attention_heads"]),
+        mamba_heads = config["mamba_num_heads"],
+        mamba_head_dim = config["mamba_head_dim"],
+        groups = config["n_groups"],
+        state_dim = config["ssm_state_size"],
+        conv_kernel = config["conv_kernel"],
+        experts = experts,
+        top_k = config["num_experts_per_tok"],
+        latent = config.get("moe_latent_size"),
+        moe_inter = config["moe_intermediate_size"],
+        shared_inter = config["moe_shared_expert_intermediate_size"],
+        scaling = float(config.get("routed_scaling_factor", 1.0)),
+        eps = float(config.get("layer_norm_epsilon", config.get("norm_eps", 1e-5))),
+    )
+    if special.get("eos_token", STOP[0]) == STOP[0]:
+        spoken = struct(template = CHATML, tokenizer = TOKENIZER)
+    else:
+        eos = special["eos_token"]
+        spoken = struct(template = template("raw", stop = [eos]), tokenizer = tokenizer(markers = [[eos]]))
+    if d.latent == None:
+        rows = [
+            deployment(id, weights = dtype.bf16, kv = dtype.bf16),
+            deployment(id, weights = dtype.bf16, kv = dtype.e4m3),
+            deployment(id, weights = [dtype.nvfp4, dtype.nvfp4], kv = dtype.e4m3),
+        ]
+    elif pattern == SUPER:
+        rows = [
+            deployment(id, weights = dtype.bf16, kv = dtype.bf16),
+            deployment(id, weights = RELEASE, kv = dtype.e4m3),
+            deployment(id, weights = RELEASE, kv = dtype.bf16),
+        ]
+    else:
+        rows = [
+            deployment(id, weights = dtype.bf16, kv = dtype.bf16),
+            deployment(id, weights = dtype.u4g64, kv = dtype.bf16),
+        ]
+    return struct(
+        MODELS = [model(id, template = spoken.template, tokenizer = spoken.tokenizer, arch = "nemotron_h", layers = d.layers, vocab = d.vocab)],
+        DIMS = {id: d},
+        DEPLOYMENTS = rows,
+    )
+
 # The release's own precision a projection, as modelopt chose it layer by
 # layer: the layers each projection is kept bf16 at where most are FP8, or
 # FP8 at where most are bf16; and the one shared expert stored NVFP4, read
@@ -151,6 +256,9 @@ def layout(id, deploy):
         fail("{} ships as released, every weight bf16, or as mlx_lm quantizes it (u4g64); not {}".format(id, deploy))
     if d.pattern == SUPER and not plain and deploy.weights != [dtype.bf16, dtype.nvfp4a4, dtype.e4m3tile128a8]:
         fail("{} ships as released: bf16, NVFP4 experts against NVFP4 activations and its FP8 projections; not {}".format(id, deploy))
+    # An adopted pattern's: the precisions below are Super's export's, layer by layer.
+    if d.pattern not in [SUPER, ULTRA] and not plain and not mlx4:
+        fail("{} is read as released, every weight bf16, or as mlx_lm quantizes it (u4g64); not {}".format(id, deploy))
     w, experts, f8 = (dtype.bf16, dtype.bf16, dtype.bf16) if plain else (dtype.u4g64, dtype.u4g64, dtype.u4g64) if mlx4 else deploy.weights
     # what mlx_lm leaves unquantized: a weight no Linear or Embedding holds (the router, the conv)
     dense = dtype.bf16 if mlx4 else w

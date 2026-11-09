@@ -44,6 +44,7 @@ def dims(layers = 60, experts = 128):
         hidden = 6144,
         layers = layers,
         dense_layers = 3,
+        index_from = 3,
         q_heads = 64,
         kv_heads = 4,
         head_dim = 128,
@@ -66,6 +67,111 @@ DIMS = {
     "minimax-m3": dims(),
     "minimax-m3-mini": dims(layers = 6, experts = 8),
 }
+
+def leading_zeros(flags, what, n):
+    """How many of `flags` (one a layer, `n` of them) lead as 0 before only
+    1s, as this family's layers run: dense first, then sparse."""
+    if type(flags) != "list" or len(flags) != n:
+        fail("its {} is not one flag a layer".format(what))
+    k = 0
+    for f in flags:
+        if f != 0:
+            break
+        k += 1
+    if [f for f in flags[k:] if f != 1]:
+        fail("its {} interleaves dense and sparse layers; this family's run dense layers first, then sparse".format(what))
+    return k
+
+# A MiniMax-M3 checkpoint this package lists no model of (MiniMax-M3.1-Flash,
+# whose every layer reads through its indexer and whose rope turns at another
+# base; a fine-tune at another depth or expert count): the same forward at
+# the widths, depth, experts, fan-out, rope, indexer and clamp its config's
+# text_config states, refused where it states what the forward does not run.
+# Offered as the family reads a release: bf16, MXFP8 as it ships, MXFP8 with
+# NVFP4 experts, and the four-bit row.
+
+def adopt(id, config, special):
+    if config.get("model_type", "minimax_m3_vl") != "minimax_m3_vl":
+        fail("the config's model_type is {}; this family is minimax_m3_vl".format(config.get("model_type")))
+    t = config.get("text_config")
+    if t == None:
+        fail("its config states no text_config; this family reads a MiniMax-M3 language model under a vision tower")
+    if t.get("hidden_act", "swigluoai") != "swigluoai":
+        fail("its MLPs gate by {}; this family's by a clamped SwiGLU-OAI".format(t["hidden_act"]))
+    if t.get("attention_output_gate", False):
+        fail("it gates its attention's output, which this family does not")
+    if not t.get("use_gemma_norm", True):
+        fail("its RMS norms scale by their gain alone; this family's by one plus it")
+    if not t.get("use_qk_norm", True) or t.get("qk_norm_type", "per_head") != "per_head":
+        fail("it norms q and k {}; this family norms them head by head".format(t.get("qk_norm_type", "not at all")))
+    if t.get("scoring_func", "sigmoid") != "sigmoid" or not t.get("use_routing_bias", True):
+        fail("it routes by {} {} a score bias; this family routes by a biased sigmoid".format(t.get("scoring_func"), "with" if t.get("use_routing_bias", True) else "without"))
+    if t.get("n_shared_experts", 1) != 1:
+        fail("it carries {} shared experts; this family one".format(t["n_shared_experts"]))
+    if t.get("tie_word_embeddings", False):
+        fail("it reads out through its embedding; this family reads a head of its own")
+    if t.get("rope_scaling") != None:
+        fail("its config scales its rope ({}); this family turns it unscaled".format(t["rope_scaling"]))
+    if t.get("sliding_window") != None:
+        fail("it attends through a sliding window; this family does not")
+    layers = t["num_hidden_layers"]
+    head_dim = t.get("head_dim", t["hidden_size"] // t["num_attention_heads"])
+    rotary_dim = t.get("rotary_dim", int(head_dim * t.get("partial_rotary_factor", 1.0)))
+    if t.get("partial_rotary_factor") != None and int(head_dim * t["partial_rotary_factor"]) != rotary_dim:
+        fail("its rotary_dim {} is not its partial_rotary_factor {} of a {}-wide head".format(rotary_dim, t["partial_rotary_factor"], head_dim))
+    kv_heads = t["num_key_value_heads"]
+    dense_layers = leading_zeros(t["moe_layer_freq"], "moe_layer_freq", layers)
+    s = t.get("sparse_attention_config", {})
+    if s.get("use_sparse_attention", False):
+        index_from = leading_zeros(s["sparse_attention_freq"], "sparse_attention_freq", layers)
+        if [v for v in s.get("sparse_disable_index_value", [])[index_from:] if v != 1]:
+            fail("its indexer reads values in some layers; this family's ranks blocks by keys alone")
+        if s.get("sparse_score_type", "max") != "max":
+            fail("its indexer scores a block by {}; this family's by its best key".format(s["sparse_score_type"]))
+        if s.get("sparse_init_block", 0) != 0 or s.get("sparse_local_block", 1) != 1:
+            fail("its indexer always keeps {} leading and {} local blocks; this family keeps none and the row's own".format(s.get("sparse_init_block", 0), s.get("sparse_local_block", 1)))
+        if s["sparse_num_index_heads"] != kv_heads:
+            fail("its indexer has {} heads over {} kv heads; this family's one a kv head".format(s["sparse_num_index_heads"], kv_heads))
+        ix = struct(heads = s["sparse_num_index_heads"], head_dim = s["sparse_index_dim"], block = s["sparse_block_size"], top_k = s["sparse_topk_blocks"])
+    else:
+        index_from = layers
+        ix = struct(heads = kv_heads, head_dim = head_dim, block = 128, top_k = 16)
+    experts = t["num_local_experts"]
+    d = struct(
+        hidden = t["hidden_size"],
+        layers = layers,
+        dense_layers = dense_layers,
+        index_from = index_from,
+        q_heads = t["num_attention_heads"],
+        kv_heads = kv_heads,
+        head_dim = head_dim,
+        rotary_dim = rotary_dim,
+        theta = float(t["rope_theta"]),
+        dense_inter = t["dense_intermediate_size"],
+        experts = experts,
+        top_k = t["num_experts_per_tok"],
+        inter = t["intermediate_size"],
+        shared_inter = t["shared_intermediate_size"],
+        routed_scaling = float(t.get("routed_scaling_factor", 1.0)),
+        swiglu_limit = float(t["swiglu_limit"]),
+        swiglu_alpha = float(t["swiglu_alpha"]),
+        indexer = ix,
+        vocab = t["vocab_size"],
+        norm_eps = float(t.get("rms_norm_eps", 1e-6)),
+    )
+    eos = special.get("eos_token", "[e~[")
+    if eos != "[e~[":
+        fail("its tokenizer ends a turn at {}; this family's template ends it at [e~[".format(eos))
+    return struct(
+        MODELS = [model(id, template = MINIMAX, tokenizer = TOKENIZER, arch = "minimax_m3_vl", vocab = d.vocab, layers = layers)],
+        DIMS = {id: d},
+        DEPLOYMENTS = [
+            deployment(id, weights = BF, kv = BF),
+            deployment(id, weights = MX8, kv = BF),
+            deployment(id, weights = [MX8, dtype.nvfp4a4], kv = BF),
+            deployment(id, weights = U4, kv = BF),
+        ],
+    )
 
 NV4 = dtype.nvfp4a4
 
@@ -164,7 +270,7 @@ def layout(id, deploy):
         return struct(
             attn_norm = weight([d.hidden]),
             attn = attention(n, d, mix.proj, dense, "kv.{}".format(l)),
-            indexer = indexer(n, d, dense, "index.{}".format(l), mix.index) if sparse else None,
+            indexer = indexer(n, d, dense, "index.{}".format(l), mix.index) if l >= d.index_from else None,
             mlp_norm = weight([d.hidden]),
             mlp = routed(n, d, mix, dense) if sparse else None,
             dense = None if sparse else mlp(d, d.dense_inter, mix.proj),

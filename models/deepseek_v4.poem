@@ -191,7 +191,7 @@ def flash_dims(layers, pool, hash, experts = 256, draft = False, **over):
         index_heads = 64, index_head_dim = 128, index_top_k = 512, index_window = 128,
         streams = 4, gate_eps = 1e-6, alpha = 2.0, sinkhorn = 20, experts = experts, top_k = 6,
         moe_inter = 2048, shared_inter = 2048, renorm = True, scaling = 1.5,
-        swiglu_limit = 10.0, vocab = 129280, norm_eps = 1e-6,
+        swiglu_limit = 10.0, vocab = 129280, norm_eps = 1e-6, yarn = YARN,
     )
     d.update(over)
     return struct(**d)
@@ -288,7 +288,7 @@ def flash(w, r, kv, d, quant = None):
                 top_k = d.index_top_k,
                 rope_dim = d.rope_dim,
                 theta = d.compress_theta,
-                yarn = YARN,
+                yarn = d.yarn,
                 window = d.index_window,
                 wq_b = weight([idx_w, d.q_lora], q),
                 weights_proj = weight([d.index_heads, hidden], weights),
@@ -309,7 +309,7 @@ def flash(w, r, kv, d, quant = None):
             attn = struct(
                 rope_dim = d.rope_dim,
                 theta = d.compress_theta if ratio != None else d.theta,
-                yarn = YARN if ratio != None else None,
+                yarn = d.yarn if ratio != None else None,
                 sm_scale = f32(1.0 / f32(sqrt(d.head_dim))),
                 q_down = weight([d.q_lora, hidden], q),
                 q_norm = norm("q_norm", d.q_lora),
@@ -435,14 +435,16 @@ V41_TRUNC8_PLAN = struct(
     dspark_targets = [],
 )
 
-def dims41(plan, experts = 384, base_vocab = 16000000):
-    return struct(
+def dims41(plan, experts = 384, base_vocab = 16000000, **over):
+    """`over` sets what the listed V4.1 models share, as an adopted release
+    states it."""
+    d = dict(
         hidden = 5120, plan = plan, heads = 64, head_dim = 512, q_lora = 1280, kv_latent = 512,
         o_groups = 8, o_lora = 1024, rope_dim = 64, theta = 10000.0, compress_theta = 160000.0,
         window = 128, index_heads = 32, index_head_dim = 128, index_top_k = 512, streams = 4,
         gate_eps = 1e-6, alpha = 2.0, sinkhorn = 20, experts = experts, top_k = 6,
         moe_inter = 2304, shared_inter = 2304, renorm = True, scaling = 1.5, swiglu_limit = 10.0,
-        vocab = 129280, norm_eps = 1e-20,
+        vocab = 129280, norm_eps = 1e-20, yarn = YARN,
         engram = struct(ngram = 4, heads = 8, head_dim = 256, base_vocab = base_vocab,
                         compressed_vocab = 99092, pad = 2),
         # DSpark: three draft stages over a block of five rows (an anchor and
@@ -451,6 +453,8 @@ def dims41(plan, experts = 384, base_vocab = 16000000):
         dspark = struct(stages = 3, block = 5, noise = 128799, experts = min(128, experts),
                         top_k = 3, rank = 256),
     )
+    d.update(over)
+    return struct(**d)
 
 def csa_of(plan, layer):
     if plan.ratios[layer] == 0:
@@ -543,7 +547,7 @@ def flash41(w, r, kv, d, quant = None, dspark = False):
                 top_k = d.index_top_k,
                 rope_dim = d.rope_dim,
                 theta = d.compress_theta,
-                yarn = YARN,
+                yarn = d.yarn,
                 window = d.window,
                 wq_b = weight([idx_w, d.q_lora], q),
                 weights_proj = weight([d.index_heads, hidden]),
@@ -601,7 +605,7 @@ def flash41(w, r, kv, d, quant = None, dspark = False):
             attn = struct(
                 rope_dim = d.rope_dim,
                 theta = d.compress_theta if ratio > 0 else d.theta,
-                yarn = YARN if ratio > 0 else None,
+                yarn = d.yarn if ratio > 0 else None,
                 sm_scale = f32(1.0 / f32(sqrt(d.head_dim))),
                 q_down = weight([d.q_lora, hidden], q),
                 q_norm = norm("q_norm", d.q_lora),
@@ -728,6 +732,149 @@ SHIPS = [
 ]
 
 DEPLOYMENTS = [deployment(id, weights = w, kv = kv, drafter = drafter) for id, w, kv, drafter, _ in SHIPS]
+
+# A DeepSeek-V4 or V4.1 release this package lists no model of, read from
+# its `config.json` (V4.1's text model under `text_config`):
+# `compress_ratios` gives each layer's pool (0: the window alone), its tail
+# past the trunk the draft layers' (window-only); V4.1 names its KV and index
+# sources, its Engram layers and its decoder's first layer
+# (`candidate_source_layer_id`). Served without its draft head, at the
+# formats the listed releases are: V4 at bf16 with its MXFP4 experts, its
+# fp8 release, MLX's 2-bit recipe (the last layer's gate at group 64) and
+# bf16; V4.1 at its MXFP8 release, bf16 with MXFP4 experts and MLX's 4-bit.
+# Refused: another router, activation or rope scaling, more than the one
+# shared latent kv head, attention biases, pools at ratios the family does
+# not lay out (V4: 4 and 128; V4.1: 1 and 2), experts stored other than
+# MXFP4, fp8 blocks other than the release's, and an Engram table other
+# than its hashing sizes.
+
+YARN_KEYS = ["type", "rope_type", "factor", "beta_fast", "beta_slow", "original_max_position_embeddings"]
+
+def adopted_dims(t):
+    """What V4 and V4.1 configurations state alike, as `flash_dims` and
+    `dims41` name it."""
+    if t.get("hidden_act", "silu") != "silu":
+        fail("its MLPs gate by {}; this family's SwiGLU gates by silu".format(t["hidden_act"]))
+    if t.get("attention_bias", False):
+        fail("its attention projections carry biases, which this family's do not")
+    if t.get("tie_word_embeddings", False):
+        fail("it ties its head to its embedding; this family reads a head of its own")
+    if t.get("scoring_func") != "sqrtsoftplus" or t.get("topk_method", "noaux_tc") != "noaux_tc":
+        fail("its router scores by {} ({}); this family's by sqrt(softplus) with bias-corrected choice".format(t.get("scoring_func"), t.get("topk_method")))
+    if t.get("num_key_value_heads", 1) != 1:
+        fail("it caches {} kv heads; this family one latent row a position".format(t["num_key_value_heads"]))
+    if not t.get("n_shared_experts"):
+        fail("it has no shared expert; this family's MoE has one")
+    if t.get("swiglu_limit") == None:
+        fail("its SwiGLU is unclamped; this family's clamps it")
+    yarn = None
+    rope = t.get("rope_scaling")
+    if rope != None:
+        if rope.get("rope_type", rope.get("type")) != "yarn" or [k for k in rope if k not in YARN_KEYS]:
+            fail("its config scales its rope ({}); this family stretches its pools' rope by YaRN alone".format(rope))
+        yarn = struct(
+            factor = float(rope["factor"]),
+            beta_fast = float(rope["beta_fast"]),
+            beta_slow = float(rope["beta_slow"]),
+            original_max_position = rope["original_max_position_embeddings"],
+        )
+    inter = t["moe_intermediate_size"]
+    return dict(
+        hidden = t["hidden_size"], heads = t["num_attention_heads"], head_dim = t["head_dim"],
+        q_lora = t["q_lora_rank"], kv_latent = t["head_dim"], o_groups = t["o_groups"],
+        o_lora = t["o_lora_rank"], rope_dim = t["qk_rope_head_dim"], theta = float(t["rope_theta"]),
+        compress_theta = float(t["compress_rope_theta"]), window = t["sliding_window"],
+        index_heads = t["index_n_heads"], index_head_dim = t["index_head_dim"],
+        index_top_k = t["index_topk"], streams = t["hc_mult"], gate_eps = float(t["hc_eps"]),
+        sinkhorn = t["hc_sinkhorn_iters"], experts = t["n_routed_experts"],
+        top_k = t["num_experts_per_tok"], moe_inter = inter,
+        shared_inter = t["n_shared_experts"] * inter, renorm = t.get("norm_topk_prob", True),
+        scaling = float(t["routed_scaling_factor"]), swiglu_limit = float(t["swiglu_limit"]),
+        vocab = t["vocab_size"], norm_eps = float(t["rms_norm_eps"]), yarn = yarn,
+    )
+
+def trunk_ratios(t, allowed):
+    """The trunk's compress ratios, its draft layers' tail checked window-only."""
+    layers = t["num_hidden_layers"]
+    ratios = t["compress_ratios"]
+    if len(ratios) < layers or [r for r in ratios[layers:] if r != 0]:
+        fail("its compress_ratios {} do not give its {} layers theirs and its draft layers none".format(ratios, layers))
+    ratios = ratios[:layers]
+    stray = [r for r in ratios if r != 0 and r not in allowed]
+    if stray:
+        fail("it pools at ratios {}; this family lays pools out at {}".format(stray, allowed))
+    return ratios
+
+def adopt(id, config, special):
+    kind = config.get("model_type")
+    t = config.get("text_config", config)
+    quant = config.get("quantization_config") or t.get("quantization_config")
+    experts = (quant or {}).get("expert_dtype", config.get("expert_dtype", t.get("expert_dtype")))
+    if experts != "fp4":
+        fail("its routed experts are stored {}; this family reads them as MXFP4".format(experts or "unquantized"))
+    blocks = (quant or {}).get("weight_block_size")
+    shared = adopted_dims(t)
+    layers = t["num_hidden_layers"]
+    if kind == "deepseek_v4":
+        if blocks not in [None, [128, 128]]:
+            fail("its fp8 projections are in {} blocks; V4 reads them in 128-square ones".format(blocks))
+        ratios = trunk_ratios(t, [4, 128])
+        shared.update(index_window = t["sliding_window"])
+        d = flash_dims(layers, [r if r != 0 else None for r in ratios], t["num_hash_layers"], **shared)
+        dims = lambda draft: d
+        ships = [(id, [BF, FP4], BF, None, v4(dims, BF, uniform(FP4)))]
+        if blocks != None:
+            ships += [
+                (id, W8A8, BF, None, v4(dims, BF, uniform(W8A8[1]), W8A8[0])),
+                (id, W8A8, dtype.e4m3, None, v4(dims, BF, uniform(W8A8[1]), W8A8[0])),
+            ]
+        ships += [
+            (id, [U4, U2], BF, None, v4(dims, U4, routed(dtype.u2g32, dtype.u2g64, dtype.u2g64, [(layers - 1, dtype.u2g64)]))),
+            (id, BF, BF, None, v4(dims, BF, uniform(BF))),
+        ]
+    elif kind == "deepseek_v41":
+        if t.get("model_type") != "deepseek_v41_text":
+            fail("its text model's model_type is {}; this family's is deepseek_v41_text".format(t.get("model_type")))
+        if blocks != [32, 32]:
+            fail("its fp8 projections are in {} blocks; V4.1 reads them in 32-square ones".format(blocks))
+        engram_layers = t.get("engram_layer_ids", [])
+        plan = struct(
+            layers = layers,
+            ratios = trunk_ratios(t, [1, 2]),
+            kv_sources = t["kv_source_layer_ids"],
+            index_sources = t["index_source_layer_ids"],
+            engram_layers = engram_layers,
+            decoder = t.get("candidate_source_layer_id"),
+            dspark_targets = t.get("dspark_target_layer_ids", []),
+        )
+        e = struct(
+            ngram = t["engram_max_ngram_size"], heads = t["engram_n_heads"], head_dim = t["engram_head_dim"],
+            base_vocab = t["engram_vocab_size"], compressed_vocab = t["engram_compressed_vocab_size"],
+            pad = t["engram_pad_token_id"],
+        ) if engram_layers else None
+        for which in range(len(engram_layers)):
+            _, primes, _ = engram_hash_constants(e, engram_layers, which)
+            rows = 0
+            for p in primes:
+                rows += p
+            if rows != t["engram_num_embeddings"][which]:
+                fail("its Engram table at layer {} holds {} rows, and this family's hashing lays out {}".format(engram_layers[which], t["engram_num_embeddings"][which], rows))
+        shared.update(engram = e, dspark = None)
+        d = dims41(plan, **shared)
+        build = lambda w, r, quant = None: lambda kv, drafter: flash41(w, r, kv, d, quant = quant)
+        ships = [
+            (id, MX8, BF, None, build(BF, uniform(MX8[1]), MX8[0])),
+            (id, MX8, dtype.nvfp4, None, build(BF, uniform(MX8[1]), MX8[0])),
+            (id, [BF, FP4], BF, None, build(BF, uniform(FP4))),
+            (id, U4, BF, None, build(U4, uniform(U4))),
+        ]
+    else:
+        fail("the config's model_type is {}; this family is deepseek_v4 or deepseek_v41".format(kind))
+    return struct(
+        MODELS = [model(id, template = R1, tokenizer = TOKENIZER, arch = "deepseek_v4", layers = layers, vocab = shared["vocab"])],
+        SHIPS = ships,
+        DEPLOYMENTS = [deployment(id, weights = w, kv = kv, drafter = drafter) for id, w, kv, drafter, _ in ships],
+    )
 
 def layout(id, deploy):
     for at, w, _, drafter, build in SHIPS:

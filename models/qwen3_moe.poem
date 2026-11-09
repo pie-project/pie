@@ -107,6 +107,56 @@ DIMS = {
     "qwen3-coder-480b-a35b-mini": dims(layers = 4, experts = 16, theta = 10000000.0, **A35B),
 }
 
+# A Qwen 3 MoE checkpoint this package lists no model of (a Thinking-2507
+# release, a fine-tune at another depth, width or count of experts): the same
+# forward at the widths, depth, experts, pick, vocabulary, rope base and norm
+# epsilon its config.json states, refused where the config states what the
+# forward does not run. A checkpoint whose id names a coder speaks
+# Qwen3-Coder's template; any other, ChatML.
+
+def adopt(id, config, special):
+    if config.get("model_type", "qwen3_moe") != "qwen3_moe":
+        fail("the config's model_type is {}; this family is qwen3_moe".format(config.get("model_type")))
+    if config.get("hidden_act", "silu") != "silu":
+        fail("its experts gate by {}; this family's SwiGLU gates by silu".format(config["hidden_act"]))
+    if config.get("attention_bias", False) or config.get("qkv_bias", False):
+        fail("its attention projections carry biases, which this family's do not")
+    if not config.get("use_qk_norm", True):
+        fail("it norms no q and k per head, which this family's attention does")
+    if config.get("use_sliding_window", False):
+        fail("it attends through a sliding window in some layers; this family attends in full")
+    if config.get("rope_scaling") != None:
+        fail("its config scales its rope ({}); this family turns its rope unscaled".format(config["rope_scaling"]))
+    if config.get("decoder_sparse_step", 1) != 1 or config.get("mlp_only_layers", []):
+        fail("some of its layers run a dense MLP; this family routes every layer to experts")
+    if config.get("shared_expert_intermediate_size", 0):
+        fail("it runs a shared expert beside the routed ones, which this family does not")
+    if not config.get("norm_topk_prob", False):
+        fail("it weighs its picked experts by the whole softmax; this family renormalizes over the pick")
+    if config.get("tie_word_embeddings", False):
+        fail("it reads out through its embedding (tied); this family reads a head of its own")
+    hidden = config["hidden_size"]
+    q_heads = config["num_attention_heads"]
+    d = struct(
+        hidden = hidden,
+        layers = config["num_hidden_layers"],
+        q_heads = q_heads,
+        kv_heads = config.get("num_key_value_heads", q_heads),
+        head_dim = config.get("head_dim", hidden // q_heads),
+        experts = config["num_experts"],
+        top_k = config["num_experts_per_tok"],
+        inter = config["moe_intermediate_size"],
+        vocab = config["vocab_size"],
+        theta = float(config.get("rope_theta", 1000000.0)),
+        norm_eps = float(config.get("rms_norm_eps", 1e-6)),
+    )
+    spoken = CODER if "coder" in id else CHATML
+    return struct(
+        MODELS = [model(id, template = spoken, tokenizer = TOKENIZER, arch = "qwen3_moe", layers = d.layers, vocab = d.vocab)],
+        DIMS = {id: d},
+        DEPLOYMENTS = rows(id),
+    )
+
 # A release whose planes a deployment keeps as released, its tables bf16.
 RELEASED = [dtype.e4m3tile128a8, dtype.nvfp4, dtype.nvfp4a4]
 

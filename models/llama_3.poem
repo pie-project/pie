@@ -81,7 +81,8 @@ DIMS = {
 }
 
 # A Llama-shaped checkpoint this package lists no model of (Llama 3.2 1B and
-# 3B, a Llama 3 at another width or depth, a fine-tune): the same forward at
+# 3B, a Llama 3 at another width or depth, a fine-tune, a Mistral attending
+# in full such as Mistral 7B v0.3 or Mistral Nemo): the same forward at
 # the widths, depth, vocabulary, rope and norm epsilon its config.json states,
 # its head tied or not, its rope llama3-scaled or unscaled; refused where the
 # config states what the forward does not run. A checkpoint with Llama 3's
@@ -89,8 +90,12 @@ DIMS = {
 # at the end-of-sequence token its tokenizer_config.json names.
 
 def adopt(id, config, special):
-    if config.get("model_type", "llama") != "llama":
-        fail("the config's model_type is {}; this family is llama".format(config.get("model_type")))
+    kind = config.get("model_type", "llama")
+    if kind not in ["llama", "mistral"]:
+        fail("the config's model_type is {}; this family is llama (and mistral, which is llama-shaped)".format(kind))
+    window = config.get("sliding_window")
+    if window != None and window < config.get("max_position_embeddings", 0):
+        fail("it attends through a {}-token sliding window; this family attends in full".format(window))
     if config.get("hidden_act", "silu") != "silu":
         fail("its MLP gates by {}; this family's SwiGLU gates by silu".format(config["hidden_act"]))
     if config.get("attention_bias", False) or config.get("mlp_bias", False):

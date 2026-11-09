@@ -113,6 +113,94 @@ DIMS = {
     "dots3-note-mini": note(layers = 6, experts = 16, full_layers = [0, 1, 5]),
 }
 
+# A Dots3 NOTE checkpoint this package lists no model of (a fine-tune, a
+# release at another width, depth or expert count): the same forward at the
+# widths, latent ranks, rope bases, window, indexer and expert bank its
+# config.json states, its full and sliding layers where its `layer_types`
+# puts them; refused where the config states what the forward does not run.
+# The indexer's own norm epsilon is not in the config: Dots3 NOTE's 1e-6.
+
+def adopt(id, config, special):
+    if config.get("model_type") != "dots3_note":
+        fail("the config's model_type is {}; this family is dots3_note".format(config.get("model_type")))
+    if config.get("quantization_config") != None:
+        fail("it is released quantized ({}); this family reads a bf16 release".format(config["quantization_config"].get("quant_method")))
+    if config.get("hidden_act", "silu") != "silu":
+        fail("its MLP gates by {}; this family's SwiGLU gates by silu".format(config["hidden_act"]))
+    if config.get("attention_bias", False):
+        fail("its attention projections carry biases, which this family's do not")
+    if not config.get("apply_mla_qkv_lora_rescale", False):
+        fail("it does not rescale its q and kv latents, which this family's reader folds into their norms")
+    for key in ["attention_gate_type", "swa_attention_gate_type"]:
+        if config.get(key, "headwise") != "headwise":
+            fail("its {} is {}; this family gates each head".format(key, config[key]))
+    if config.get("rope_scaling") != None:
+        fail("it scales its rope ({}); this family turns it unscaled".format(config["rope_scaling"]))
+    if config.get("tie_word_embeddings", False):
+        fail("it ties its head to its embedding; this family reads a head of its own")
+    if config.get("scoring_func", "sigmoid") != "sigmoid" or config.get("topk_method", "noaux_tc") != "noaux_tc":
+        fail("its router picks by {} ({}); this family's by sigmoid with a bias (noaux_tc)".format(config.get("scoring_func"), config.get("topk_method")))
+    if not config.get("norm_topk_prob", True):
+        fail("its router does not renormalize the experts it picks; this family's does")
+    if config.get("n_group", 1) != 1 or config.get("topk_group", 1) != 1:
+        fail("its router picks experts within groups; this family's picks over the whole bank")
+    if config.get("n_shared_experts", 1) < 1:
+        fail("it has no shared expert; this family's routed layers add one")
+    if config.get("moe_layer_freq", 1) != 1:
+        fail("its routed layers come every {}; this family's every layer past the dense ones routes".format(config["moe_layer_freq"]))
+    layers = config["num_hidden_layers"]
+    kinds = config["layer_types"]
+    if len(kinds) != layers or any([k not in ["full_attention", "sliding_attention"] for k in kinds]):
+        fail("its layer_types ({}) are not a full or sliding attention a layer".format(kinds))
+    experts = config["n_routed_experts"]
+    moe_inter = config["moe_intermediate_size"]
+    d = struct(
+        hidden = config["hidden_size"],
+        layers = layers,
+        dense_layers = config.get("first_k_dense_replace", 1),
+        full = struct(
+            heads = config["num_attention_heads"],
+            q_lora_rank = config["q_lora_rank"],
+            kv_lora_rank = config["kv_lora_rank"],
+            qk_nope_head_dim = config["qk_nope_head_dim"],
+            qk_rope_head_dim = config["qk_rope_head_dim"],
+            v_head_dim = config["v_head_dim"],
+            theta = float(config["rope_theta"]),
+        ),
+        sliding = struct(
+            heads = config["swa_num_attention_heads"],
+            q_lora_rank = config["swa_q_lora_rank"],
+            kv_lora_rank = config["swa_kv_lora_rank"],
+            qk_nope_head_dim = config["swa_qk_nope_head_dim"],
+            qk_rope_head_dim = config["swa_qk_rope_head_dim"],
+            v_head_dim = config["swa_v_head_dim"],
+            theta = float(config["swa_rope_theta"]),
+        ),
+        full_layers = [l for l, k in enumerate(kinds) if k == "full_attention"],
+        window = config["sliding_window_size"],
+        index_heads = config["index_n_heads"],
+        index_head_dim = config["index_head_dim"],
+        index_top_k = config["index_topk"],
+        index_norm_eps = 1e-6,
+        dense_inter = config["intermediate_size"],
+        experts = experts,
+        top_k = config["num_experts_per_tok"],
+        moe_inter = moe_inter,
+        shared_inter = moe_inter * config.get("n_shared_experts", 1),
+        scaling = float(config.get("routed_scaling_factor", 1.0)),
+        vocab = config["vocab_size"],
+        norm_eps = float(config.get("rms_norm_eps", 1e-5)),
+    )
+    return struct(
+        MODELS = [model(id, template = DOTS, tokenizer = TOKENIZER, arch = "dots3_note", layers = layers, vocab = d.vocab)],
+        DIMS = {id: d},
+        DEPLOYMENTS = [
+            deployment(id, weights = BF, kv = BF),
+            deployment(id, weights = U4, kv = BF),
+            deployment(id, weights = [U4, U2], kv = BF),
+        ],
+    )
+
 def layout(id, deploy):
     r = roles(deploy, "weights", "experts")
     weights, experts = r.weights, r.experts
@@ -221,7 +309,11 @@ def layout(id, deploy):
 # (`apply_mla_qkv_lora_rescale`) is folded into their norms.
 
 def formats(m):
-    return [format("huggingface", read = lambda reads: huggingface(m, reads))]
+    return [format(
+        "huggingface",
+        recognizes = lambda checkpoint: has("model.layers.0.self_attn.k_rope_only_layernorm.weight"),
+        read = lambda reads: huggingface(m, reads),
+    )]
 
 def read_attention(reads, a, at):
     reads.read(a.q_a_proj, at("self_attn.q_a_proj.weight"))

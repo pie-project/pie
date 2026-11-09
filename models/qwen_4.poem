@@ -10,7 +10,7 @@
 load("//pie/codec.poem", "nvfp4_bank", read_fused = "fused")
 load("//lib/media.poem", "smart_resize")
 load("//lib/mla.poem", "boundaries")
-load("//lib/qwen.poem", "LARGE", "PATCH", "MERGE", "tower", "read_tower", "run_tower", "scatter", "positions", "rope", "routed", "draft_attn", "norm_of")
+load("//lib/qwen.poem", "LARGE", "PATCH", "MERGE", "TEMPORAL", "GRID_SIDE", "MROPE_SECTIONS", "tower", "read_tower", "run_tower", "scatter", "positions", "rope", "routed", "draft_attn", "norm_of")
 load("//lib/reads.poem", "product", "squeezed")
 load("//lib/rope.poem", "yarn")
 load("//lib/spoken.poem", "QWEN_STOP", "QWEN_VISION", "QWEN_AUDIO")
@@ -109,16 +109,16 @@ def media(id, deploy):
         frame = lambda h, w, budget: smart_resize(h, w, PATCH * MERGE, 65536, 16777216),
     ))
 
-def ple_dims(layer, heads_per_ngram, base_vocab, split_parts):
+def ple_dims(layer, heads_per_ngram, base_vocab, split_parts, ngram = 3, divisible_by = 128, seed = 1234, conv_kernel = 4):
     return struct(
         layer = layer,
         heads_per_ngram = heads_per_ngram,
-        ngram = 3,
+        ngram = ngram,
         base_vocab = base_vocab,
-        divisible_by = 128,
+        divisible_by = divisible_by,
         split_parts = split_parts,
-        seed = 1234,
-        conv_kernel = 4,
+        seed = seed,
+        conv_kernel = conv_kernel,
     )
 
 def dims(
@@ -129,18 +129,24 @@ def dims(
         kv_heads = 2,
         head_dim = 256,
         rotary_dim = 64,
+        theta = 10000000.0,
         k_heads = 16,
         v_heads = 48,
         k_dim = 128,
         v_dim = 128,
+        conv_kernel = 4,
+        streams = 4,
         lowrank = 320,
         experts = 512,
         top_k = 10,
         inter = 640,
+        shared_inter = None,
         ple = ple_dims(1, 8, 20000000, 128),
         indexer = struct(heads = 4, head_dim = 128, budget = 2048, ratio = 4),
         vocab = 248320,
-        eos = 248044):
+        eos = 248044,
+        norm_eps = 1e-6,
+        context = 262144):
     return struct(
         hidden = hidden,
         layers = layers,
@@ -149,23 +155,24 @@ def dims(
         kv_heads = kv_heads,
         head_dim = head_dim,
         rotary_dim = rotary_dim,
-        theta = 10000000.0,
+        theta = theta,
         k_heads = k_heads,
         v_heads = v_heads,
         k_dim = k_dim,
         v_dim = v_dim,
-        conv_kernel = 4,
-        streams = 4,
+        conv_kernel = conv_kernel,
+        streams = streams,
         lowrank = lowrank,
         experts = experts,
         top_k = top_k,
         inter = inter,
-        shared_inter = inter,
+        shared_inter = inter if shared_inter == None else shared_inter,
         ple = ple,
         indexer = indexer,
         vocab = vocab,
         eos = eos,
-        norm_eps = 1e-6,
+        norm_eps = norm_eps,
+        context = context,
     )
 
 FLASH = dims()
@@ -243,11 +250,13 @@ def hash_constants(p, vocab):
         total += prime
     return struct(mults = mults, primes = primes, offsets = offsets, total = total)
 
-HASHES = {
-    "flash": hash_constants(FLASH.ple, FLASH.vocab),
-    "mini": hash_constants(MINI.ple, MINI.vocab),
-    "micro": hash_constants(MICRO.ple, MICRO.vocab),
+DIMS = {
+    "qwen38-flash-next": FLASH,
+    "qwen38-flash-next-mini": MINI,
+    "qwen38-flash-next-micro": MICRO,
 }
+
+HASHES = {id: hash_constants(d.ple, d.vocab) for id, d in DIMS.items()}
 
 def mix_of(w):
     proj = dtype.u8g64 if w == dtype.u4g64 else compute(w)
@@ -285,6 +294,153 @@ def nvfp4_mix(experts):
         table = dtype.e4m3tensor,
     )
 
+# A Qwen 3.8 Flash Next checkpoint this package lists no model of (its
+# experts pruned, as REAP's and the E384 cuts are, or fewer picked, a wider
+# shared expert, another depth): the same forward at the widths, depth,
+# experts, n-gram table, indexer and rope its config.json's `text_config`
+# states, its vision tower and draft head where the checkpoint has them;
+# refused where the config states what the forward does not run. Its
+# `ple_layer_ids` count from one: the release's `[2]` is its `layers.1`.
+
+def adopt(id, config, special):
+    t = config.get("text_config", config)
+    if config.get("model_type") not in ["qwen4_exp", "qwen4_exp_text"] or t.get("model_type", "qwen4_exp_text") not in ["qwen4_exp", "qwen4_exp_text"]:
+        fail("the config's model_type is {}; this family is qwen4_exp".format(config.get("model_type")))
+    if t.get("hidden_act", "silu") != "silu":
+        fail("its experts gate by {}; this family's SwiGLU gates by silu".format(t["hidden_act"]))
+    if t.get("attention_bias", False):
+        fail("its attention projections carry biases, which this family's do not")
+    if t.get("output_gate_type", "sigmoid") != "sigmoid":
+        fail("it gates its attention's output by {}; this family gates by sigmoid".format(t["output_gate_type"]))
+    if t.get("rope_scaling") != None:
+        fail("its config scales its rope ({}); this family stretches its rope only by a deployment's -yarn".format(t["rope_scaling"]))
+    rp = t.get("rope_parameters") or {}
+    if rp.get("rope_type", "default") != "default":
+        fail("it scales its rope as {}; this family turns it unscaled".format(rp["rope_type"]))
+    if rp.get("mrope_section", MROPE_SECTIONS) != MROPE_SECTIONS or not rp.get("mrope_interleaved", True):
+        fail("its multimodal rope is cut {} (interleaved: {}); this family's is {}, interleaved".format(rp.get("mrope_section"), rp.get("mrope_interleaved"), MROPE_SECTIONS))
+    if t.get("tie_word_embeddings", False) or config.get("tie_word_embeddings", False):
+        fail("it reads out through its embedding (tied); this family reads a head of its own")
+    if not t.get("norm_topk_prob", True):
+        fail("it weighs its picked experts by the whole softmax; this family renormalizes over the pick")
+    shared = t.get("shared_expert_intermediate_size", 0)
+    if not shared:
+        fail("it runs no shared expert, which this family's every layer has")
+    hidden = t["hidden_size"]
+    q_heads = t["num_attention_heads"]
+    head_dim = t.get("head_dim", hidden // q_heads)
+    theta = float(rp.get("rope_theta", t.get("rope_theta", 10000000.0)))
+    rotary = head_dim * float(rp.get("partial_rotary_factor", t.get("partial_rotary_factor", 0.25)))
+    if rotary != int(rotary) or int(rotary) % 2:
+        fail("its partial rotary factor turns {} of a head's {} dims; this family turns an even count".format(rotary, head_dim))
+    layers = t["num_hidden_layers"]
+    every = t.get("full_attention_interval", 4)
+    kinds = t.get("layer_types", ["full_attention" if l % every == every - 1 else "linear_attention" for l in range(layers)])
+    if len(kinds) != layers:
+        fail("its layer_types name {} layers of its {}".format(len(kinds), layers))
+    for l, kind in enumerate(kinds):
+        if kind != ("full_attention" if l % every == every - 1 else "linear_attention"):
+            fail("its layer {} is {}; this family attends in full every {}th layer and runs a gated delta-net in the others".format(l, kind, every))
+    if t.get("indexer_kv_heads", 1) != 1:
+        fail("its indexer scores {} key heads; this family's scores one".format(t["indexer_kv_heads"]))
+    indexer = struct(
+        heads = t["indexer_n_heads"],
+        head_dim = t["indexer_head_dim"],
+        budget = t["indexer_budget"],
+        ratio = t["indexer_compress_ratio"],
+    )
+    if indexer.budget % indexer.ratio:
+        fail("its indexer's budget ({}) is no whole count of {}-token blocks".format(indexer.budget, indexer.ratio))
+    ids = t.get("ple_layer_ids", [])
+    if len(ids) != 1:
+        fail("it enriches the stream with n-grams at layers {}; this family does so at one".format(ids))
+    ngram = t.get("ngram_size", 3)
+    per = t["heads_per_ngram"]
+    if t.get("ple_embed_dim", hidden) != hidden or hidden % ((ngram - 1) * per):
+        fail("its n-gram embedding is {} wide in {} heads; this family's is the width ({}), split evenly".format(t.get("ple_embed_dim"), (ngram - 1) * per, hidden))
+    if t.get("ple_embedding_dtype") not in [None, "bfloat16", "float8_e4m3fn"]:
+        fail("its n-gram table is stored {}; this family reads it bf16 or e4m3".format(t["ple_embedding_dtype"]))
+    ple = ple_dims(
+        ids[0] - 1,
+        per,
+        t["ngram_vocab_size_base"],
+        t["split_ngram_parts"],
+        ngram = ngram,
+        divisible_by = t.get("make_ngram_vocab_size_divisible_by", 128),
+        seed = t.get("seed", 1234),
+        conv_kernel = t.get("ple_conv_kernel_size", 4),
+    )
+    if ple.layer < 0 or ple.layer >= layers:
+        fail("its n-gram layer {} is none of its {}".format(ids[0], layers))
+    eos = t.get("eos_token_id")
+    if type(eos) != "int":
+        fail("its text_config names {} as its end of text; this family's n-grams reset at one token".format(eos))
+    drafts = t.get("mtp_num_hidden_layers", 0)
+    if drafts > 1:
+        fail("its draft head is {} layers deep; this family's is one".format(drafts))
+    if drafts:
+        mtp = t.get("mtp", {})
+        if t.get("mtp_use_dedicated_embeddings", False):
+            fail("its draft head embeds by a table of its own; this family's reads the trunk's")
+        if mtp.get("layer_types", ["full_attention"]) != ["full_attention"] or not mtp.get("hybrid", True) or mtp.get("mtp_use_hidden_state_from_layer") != None:
+            fail("its draft head ({}) is not the one full-attention layer over the trunk's last stream this family drafts by".format(mtp))
+        if float(mtp.get("rope_theta", theta)) != theta:
+            fail("its draft head rotates at theta {}, the trunk at {}; this family turns both alike".format(mtp["rope_theta"], theta))
+    v = config.get("vision_config")
+    vision = v != None and not config.get("language_model_only", False)
+    if vision:
+        tower_says = [v.get(k) for k in ["depth", "hidden_size", "num_heads", "intermediate_size", "patch_size", "spatial_merge_size", "temporal_patch_size", "num_position_embeddings", "out_hidden_size", "in_channels", "hidden_act"]]
+        tower_is = [LARGE.depth, LARGE.hidden, LARGE.heads, LARGE.inter, PATCH, MERGE, TEMPORAL, GRID_SIDE * GRID_SIDE, hidden, 3, "gelu_pytorch_tanh"]
+        if tower_says != tower_is or v.get("deepstack_visual_indexes", []):
+            fail("its vision tower ({}) is not the one this family runs".format(v))
+    d = dims(
+        hidden = hidden,
+        layers = layers,
+        attn_every = every,
+        q_heads = q_heads,
+        kv_heads = t.get("num_key_value_heads", q_heads),
+        head_dim = head_dim,
+        rotary_dim = int(rotary),
+        theta = theta,
+        k_heads = t["linear_num_key_heads"],
+        v_heads = t["linear_num_value_heads"],
+        k_dim = t["linear_key_head_dim"],
+        v_dim = t["linear_value_head_dim"],
+        conv_kernel = t.get("linear_conv_kernel_dim", 4),
+        streams = t["hc_count"],
+        lowrank = t["hc_lowrank"],
+        experts = t["num_experts"],
+        top_k = t["num_experts_per_tok"],
+        inter = t["moe_intermediate_size"],
+        shared_inter = shared,
+        ple = ple,
+        indexer = indexer,
+        vocab = t["vocab_size"],
+        eos = eos,
+        norm_eps = float(t.get("rms_norm_eps", 1e-6)),
+        context = t.get("max_position_embeddings", 262144),
+    )
+    parts = ["vision"] if vision else []
+    drafters = ["mtp"] if drafts else []
+    rows = [deployment(id, weights = dtype.u4g64, kv = dtype.bf16)]
+    rows += [deployment(id, weights = MIXED, kv = dtype.bf16, drafter = "mtp") for _ in drafters]
+    rows += [
+        deployment(id, weights = MIXED, kv = dtype.bf16),
+        deployment(id, weights = dtype.bf16, kv = dtype.bf16),
+    ]
+    rows += [deployment(id, weights = MIXED, kv = dtype.bf16, parts = ["vision"], drafter = "mtp") for _ in parts if drafts]
+    rows += [deployment(id, weights = MIXED, kv = dtype.bf16, parts = ["vision"]) for _ in parts]
+    rows += [
+        deployment(id, weights = NVFP4, kv = dtype.bf16),
+        deployment(id, weights = NVFP4_A4, kv = dtype.bf16),
+    ]
+    return struct(
+        MODELS = [flash(id, parts = parts, drafters = drafters, arch = "qwen4_exp", layers = layers, vocab = d.vocab)],
+        DIMS = {id: d},
+        HASHES = {id: hash_constants(d.ple, d.vocab)},
+        DEPLOYMENTS = rows,
+    )
+
 def layout(id, deploy):
     vision = "vision" in deploy.parts
     mtp = deploy.drafter == "mtp"
@@ -293,30 +449,31 @@ def layout(id, deploy):
     if deploy.weights in [[dtype.bf16, dtype.nvfp4], [dtype.bf16, dtype.nvfp4a4]]:
         nvfp4 = nvfp4_mix(deploy.weights[1])
     refused = "{} does not ship {}".format(id, deploy)
-    # The native 262144 tokens a deployment's YaRN stretches.
-    rope = yarn(deploy, 262144)
+    d, hashes = DIMS[id], HASHES[id]
+    # The native context (262144 tokens) a deployment's YaRN stretches.
+    rope = yarn(deploy, d.context)
     if id == "qwen38-flash-next-micro":
         if len(deploy.weights) != 1:
             fail(refused)
-        return build(mix_of(deploy.weights[0]), deploy.kv, rope, MICRO, HASHES["micro"], False, False)
+        return build(mix_of(deploy.weights[0]), deploy.kv, rope, d, hashes, False, False)
     if id == "qwen38-flash-next-mini":
-        mini = MINI
+        mini = d
         if deploy.layers or deploy.experts:
             experts = deploy.experts or MINI.experts
             mini = dims(layers = deploy.layers or MINI.layers, experts = experts, top_k = min(MINI.top_k, experts), ple = MINI.ple)
         if mixed:
-            return build(MIXED_2BIT, deploy.kv, rope, mini, HASHES["mini"], False, False)
+            return build(MIXED_2BIT, deploy.kv, rope, mini, hashes, False, False)
         if nvfp4 != None:
-            return build(nvfp4, deploy.kv, rope, mini, HASHES["mini"], False, False)
+            return build(nvfp4, deploy.kv, rope, mini, hashes, False, False)
         if len(deploy.weights) != 1:
             fail(refused)
-        return build(mix_of(deploy.weights[0]), deploy.kv, rope, mini, HASHES["mini"], False, False)
+        return build(mix_of(deploy.weights[0]), deploy.kv, rope, mini, hashes, False, False)
     if len(deploy.weights) == 1 and not vision and deploy.drafter == None:
-        return build(mix_of(deploy.weights[0]), deploy.kv, rope, FLASH, HASHES["flash"], False, False)
+        return build(mix_of(deploy.weights[0]), deploy.kv, rope, d, hashes, False, False)
     if mixed and (mtp or deploy.drafter == None):
-        return build(MIXED_2BIT, deploy.kv, rope, FLASH, HASHES["flash"], mtp, vision)
+        return build(MIXED_2BIT, deploy.kv, rope, d, hashes, mtp, vision)
     if nvfp4 != None and not vision and deploy.drafter == None:
-        return build(nvfp4, deploy.kv, rope, FLASH, HASHES["flash"], False, False)
+        return build(nvfp4, deploy.kv, rope, d, hashes, False, False)
     fail(refused)
 
 def build(mix, kv, rope, d, hashes, draft, vision):

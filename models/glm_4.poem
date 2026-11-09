@@ -111,6 +111,75 @@ DIMS = {
     "glm47-mini": big(layers = 5, experts = 16),
 }
 
+# A GLM-4.5 / 4.6 / 4.7 checkpoint this package lists no model of (a
+# fine-tune, a pruned release with fewer experts or layers): the same forward
+# at the widths, depth, experts, dense layers, routing scale and rope its
+# config.json states, spoken through 4.7's template where it states 4.6's and
+# 4.7's 198K context and through 4.5's otherwise, and refused where the config
+# states what the forward does not run. Its draft layer is not read.
+
+def adopt(id, config, special):
+    if config.get("model_type") != "glm4_moe":
+        fail("the config's model_type is {}; this family is glm4_moe".format(config.get("model_type")))
+    if config.get("hidden_act", "silu") != "silu":
+        fail("its MLPs gate by {}; this family's SwiGLU gates by silu".format(config["hidden_act"]))
+    if not config.get("attention_bias", False):
+        fail("its q, k and v carry no biases; this family's attention adds them")
+    if config.get("tie_word_embeddings", False):
+        fail("it reads out through its embedding (tied); this family reads a head of its own")
+    rope = config.get("rope_parameters") or {}
+    if config.get("rope_scaling") != None or rope.get("rope_type", "default") != "default":
+        fail("its config scales its rope ({}); this family turns it unscaled".format(config.get("rope_scaling") or rope))
+    if config.get("partial_rotary_factor", 0.5) != 0.5:
+        fail("it rotates {} of each head; this family rotates its first half".format(config["partial_rotary_factor"]))
+    if config.get("scoring_func", "sigmoid") != "sigmoid" or config.get("topk_method", "noaux_tc") != "noaux_tc":
+        fail("its router scores by {} ({}); this family's by a biased sigmoid".format(config.get("scoring_func"), config.get("topk_method")))
+    if not config.get("norm_topk_prob", True):
+        fail("it does not renormalize its routed weights; this family does")
+    if config.get("n_group", 1) != config.get("topk_group", 1):
+        fail("it routes within {} of {} expert groups; this family routes over all its experts".format(config.get("topk_group"), config.get("n_group")))
+    if config.get("moe_layer_freq", 1) != 1:
+        fail("its routed layers come one in {}; this family routes every layer after its dense ones".format(config["moe_layer_freq"]))
+    shared = config.get("n_shared_experts", 1)
+    if shared < 1:
+        fail("it has no shared expert; this family runs one beside its routed experts")
+    vocab = config["vocab_size"]
+    if vocab != 151552:
+        fail("its vocabulary is {} tokens; this family speaks GLM-4's 151552".format(vocab))
+    layers = config["num_hidden_layers"]
+    dense_layers = config.get("first_k_dense_replace", 0)
+    if dense_layers >= layers:
+        fail("its {} layers are all dense; this family routes its last".format(layers))
+    q_heads = config["num_attention_heads"]
+    head_dim = config.get("head_dim", config["hidden_size"] // q_heads)
+    inter = config["moe_intermediate_size"]
+    d = struct(
+        hidden = config["hidden_size"],
+        layers = layers,
+        q_heads = q_heads,
+        kv_heads = config.get("num_key_value_heads", q_heads),
+        head_dim = head_dim,
+        rotary_dim = head_dim // 2,
+        qk_norm = config.get("use_qk_norm", False),
+        experts = config["n_routed_experts"],
+        top_k = config["num_experts_per_tok"],
+        inter = inter,
+        shared_inter = inter * shared,
+        dense_layers = dense_layers,
+        dense_inter = config["intermediate_size"],
+        scaling = float(config.get("routed_scaling_factor", 1.0)),
+        vocab = vocab,
+        theta = float(config.get("rope_theta", rope.get("rope_theta", 10000.0))),
+        norm_eps = float(config.get("rms_norm_eps", 1e-5)),
+        max_position = config["max_position_embeddings"],
+    )
+    spoken = GLM47 if d.max_position == 202752 else GLM45
+    return struct(
+        MODELS = [model(id, template = spoken, tokenizer = TOKENIZER, arch = "glm4_moe", layers = layers, vocab = vocab)],
+        DIMS = {id: d},
+        DEPLOYMENTS = rows(id),
+    )
+
 # A release whose planes a deployment keeps as released, its tables bf16.
 RELEASED = [dtype.e4m3tile128a8, dtype.e4m3g128a8, dtype.nvfp4, dtype.nvfp4a4]
 

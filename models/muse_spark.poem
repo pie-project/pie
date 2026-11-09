@@ -45,8 +45,8 @@ DEPLOYMENTS = [
 # fourth), residual gates on both sublayers, and a mixture of experts at a
 # pooled width (the row pooled and normed, each expert's output normed).
 
-def dims(layers = 62, experts = 256):
-    return struct(
+def dims(layers = 62, experts = 256, **over):
+    d = dict(
         hidden = 8192,
         layers = layers,
         q_heads = 128,
@@ -69,6 +69,16 @@ def dims(layers = 62, experts = 256):
         # NVFP4 export's `exclude_modules`); a miniature's first.
         dense_experts = [0, 61],
     )
+    d.update(over)
+    return struct(**d)
+
+def cut(d, layers, experts):
+    """The dims `d` cut to a miniature `layers` deep with `experts` routed
+    experts."""
+    fields = {k: getattr(d, k) for k in dir(d)}
+    fields["layers"] = layers
+    fields["experts"] = experts
+    return struct(**fields)
 
 DIMS = {
     "muse-spark-open": dims(),
@@ -80,13 +90,115 @@ def full(l):
     """The full-attention (and NoPE) layers: every fourth, from the second."""
     return l % 4 == 1
 
+# A Muse Spark Open checkpoint this package lists no model of (a fine-tune,
+# a release at another width, depth or expert count): the same forward at
+# the widths, heads, window, rope base, query scale, logit cap, multipliers,
+# gate temperature and expert bank its config.json's `text_config` states;
+# refused where the config states what the forward does not run. The layers
+# whose experts a quantized release keeps bf16 are those its
+# `quantization_config` excludes (modelopt's `exclude_modules`, Quark's
+# `exclude`); with none stated, the first and last, as the release's.
+
+def kept_layers(config, layers):
+    """The layers whose experts `config`'s quantization keeps bf16."""
+    q = config.get("quantization_config")
+    if q == None:
+        return [0, layers - 1]
+    kept = []
+    if q.get("quant_method") == "modelopt":
+        algo = q.get("quant_algo", (q.get("quantization") or {}).get("quant_algo"))
+        if algo != "NVFP4":
+            fail("modelopt quantized it as {}; this family reads modelopt's NVFP4".format(algo))
+        excluded = q.get("exclude_modules", (q.get("quantization") or {}).get("exclude_modules", []))
+        if "self_attn" not in excluded:
+            fail("its NVFP4 export quantizes its attention, which this family reads bf16")
+        for x in excluded:
+            if x.startswith("layers.") and x.endswith(".") and x[len("layers."):-1].isdigit():
+                kept.append(int(x[len("layers."):-1]))
+    elif q.get("quant_method") == "quark":
+        weight = (q.get("global_quant_config") or {}).get("weight") or {}
+        if weight.get("dtype") != "fp4" or weight.get("group_size") != 32 or weight.get("scale_format") != "e8m0":
+            fail("Quark quantized it as {}; this family reads Quark's MXFP4".format(weight))
+        prefix = TRUNK + "layers."
+        for x in q.get("exclude", []):
+            if x.startswith(prefix) and ".mlp.experts." in x:
+                l = int(x[len(prefix):].split(".")[0])
+                if l not in kept:
+                    kept.append(l)
+    else:
+        fail("it is quantized by {}; this family reads modelopt's NVFP4 and Quark's MXFP4".format(q.get("quant_method")))
+    return sorted(kept)
+
+def adopt(id, config, special):
+    if config.get("model_type") != "muse_spark":
+        fail("the config's model_type is {}; this family is muse_spark".format(config.get("model_type")))
+    t = config["text_config"]
+    if t.get("model_type", "muse_spark_text") != "muse_spark_text":
+        fail("its text model is {}; this family's is muse_spark_text".format(t["model_type"]))
+    if t.get("attention_bias", False):
+        fail("its attention projections carry biases, which this family's do not")
+    if t.get("hidden_act", "silu") != "silu":
+        fail("its experts gate by {}; this family's SwiGLU gates by silu".format(t["hidden_act"]))
+    if t.get("tie_word_embeddings", False):
+        fail("it ties its head to its embedding; this family reads a head of its own")
+    if t.get("final_logit_softcapping") == None:
+        fail("it does not cap its logits; this family caps them")
+    if t.get("num_shared_experts", 0) != 0:
+        fail("it has {} shared experts; this family has none".format(t["num_shared_experts"]))
+    if float(t.get("routed_scaling_factor", 1.0)) != 1.0:
+        fail("it scales its routed experts by {}; this family by one".format(t["routed_scaling_factor"]))
+    rope = t.get("rope_parameters") or {}
+    if rope.get("rope_type", "default") != "default" or t.get("rope_scaling") != None:
+        fail("it scales its rope ({}); this family turns it unscaled".format(rope.get("rope_type") or t.get("rope_scaling")))
+    theta = float(rope.get("rope_theta", t.get("rope_theta", 500000.0)))
+    layers = t["num_hidden_layers"]
+    kinds = [("full_attention" if full(l) else "sliding_attention") for l in range(layers)]
+    if t["layer_types"] != kinds:
+        fail("its full-attention layers are not every fourth from the second, as this family's")
+    if t.get("layer_rope_theta", [0 if full(l) else theta for l in range(layers)]) != [0 if full(l) else theta for l in range(layers)]:
+        fail("its layers' rope bases are not {} on its sliding layers and none on its full ones".format(theta))
+    if any([k != "sparse" for k in t.get("mlp_layer_types", [])]):
+        fail("some of its layers' MLPs are dense; this family's every layer routes")
+    d = dims(
+        layers,
+        t["num_local_experts"],
+        hidden = t["hidden_size"],
+        q_heads = t["num_attention_heads"],
+        kv_heads = t["num_key_value_heads"],
+        head_dim = t["head_dim"],
+        vocab = t["vocab_size"],
+        window = t["sliding_window"],
+        theta = theta,
+        qk_scale = float(t["qk_scale_factor"]),
+        softcap = float(t["final_logit_softcapping"]),
+        output_multiplier = float(t["output_multiplier"]),
+        norm_eps = float(t.get("rms_norm_eps", 1e-5)),
+        post_norm_eps = float(t.get("post_norm_eps", 1e-8)),
+        gate_temperature = float(t["residual_gate_temperature"]),
+        pooled = t["moe_hidden_size"],
+        inter = t["moe_intermediate_size"],
+        top_k = t["num_experts_per_tok"],
+        dense_experts = kept_layers(config, layers),
+    )
+    return struct(
+        MODELS = [model(id, template = ATEM, tokenizer = TOKENIZER, arch = "muse_spark", layers = layers, vocab = d.vocab)],
+        DIMS = {id: d},
+        DEPLOYMENTS = [
+            deployment(id, weights = dtype.bf16, kv = dtype.bf16),
+            deployment(id, weights = NVFP4_A4, kv = dtype.bf16),
+            deployment(id, weights = NVFP4_A4, kv = dtype.e4m3),
+            deployment(id, weights = NVFP4, kv = dtype.bf16),
+            deployment(id, weights = MXFP4, kv = dtype.bf16),
+        ],
+    )
+
 def layout(id, deploy):
     mlx4 = deploy.weights == [dtype.u4g64]
     if deploy.weights not in [[dtype.bf16, dtype.nvfp4], [dtype.bf16, dtype.nvfp4a4], [dtype.bf16, dtype.mxfp4], [dtype.bf16]] and not mlx4:
         fail("{} stores its weights bf16 with NVFP4 or MXFP4 experts, or every weight mlx's 4-bit, not {}".format(id, deploy.weights))
     d = DIMS[id]
     if id != "muse-spark-open" and (deploy.layers or deploy.experts):
-        d = dims(layers = deploy.layers or d.layers, experts = deploy.experts or d.experts)
+        d = cut(d, deploy.layers or d.layers, deploy.experts or d.experts)
     w = dtype.u4g64 if mlx4 else dtype.bf16
     routed = deploy.weights[1] if len(deploy.weights) > 1 else w
     hidden = d.hidden
@@ -165,7 +277,11 @@ def layout(id, deploy):
 TRUNK = "model.language_model."
 
 def formats(m):
-    return [format("huggingface", read = lambda reads: huggingface(m, reads))]
+    return [format(
+        "huggingface",
+        recognizes = lambda checkpoint: has(TRUNK + "layers.0.mlp.pre_expert_proj.weight"),
+        read = lambda reads: huggingface(m, reads),
+    )]
 
 def huggingface(m, reads):
     at = lambda leaf: TRUNK + leaf

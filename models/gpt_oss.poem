@@ -39,27 +39,32 @@ PUBLISHED = [
 # sliding window, YaRN rope, and routed experts with biases, their banks
 # stored as the second dtype of a deployment's weights.
 
-def dims(layers = 24, experts = 32):
+def dims(layers = 24, experts = 32, hidden = 2880, q_heads = 64, kv_heads = 8, head_dim = 64, theta = 150000.0,
+         yarn_factor = 32.0, yarn_beta_fast = 32.0, yarn_beta_slow = 1.0, yarn_attention_factor = 1.3465736,
+         yarn_original_max_position = 4096, window = 128, top_k = 4, inter = 2880, swiglu_limit = 7.0,
+         vocab = 201088, norm_eps = 1e-5):
+    """20B's numbers but where stated; 120B and the miniatures differ in
+    depth and experts only, an adopted checkpoint in whatever it states."""
     return struct(
-        hidden = 2880,
+        hidden = hidden,
         layers = layers,
-        q_heads = 64,
-        kv_heads = 8,
-        head_dim = 64,
-        theta = 150000.0,
-        yarn_factor = 32.0,
-        yarn_beta_fast = 32.0,
-        yarn_beta_slow = 1.0,
-        yarn_attention_factor = 1.3465736,
-        yarn_original_max_position = 4096,
-        window = 128,
+        q_heads = q_heads,
+        kv_heads = kv_heads,
+        head_dim = head_dim,
+        theta = theta,
+        yarn_factor = yarn_factor,
+        yarn_beta_fast = yarn_beta_fast,
+        yarn_beta_slow = yarn_beta_slow,
+        yarn_attention_factor = yarn_attention_factor,
+        yarn_original_max_position = yarn_original_max_position,
+        window = window,
         experts = experts,
-        top_k = 4,
-        inter = 2880,
-        swiglu_limit = 7.0,
+        top_k = top_k,
+        inter = inter,
+        swiglu_limit = swiglu_limit,
         swiglu_alpha = 1.702,
-        vocab = 201088,
-        norm_eps = 1e-5,
+        vocab = vocab,
+        norm_eps = norm_eps,
     )
 
 DIMS = {
@@ -68,6 +73,79 @@ DIMS = {
     "gptoss-120b-mini-e64": dims(layers = 36, experts = 64),
     "gptoss-120b": dims(layers = 36, experts = 128),
 }
+
+# A gpt-oss checkpoint the family lists no model of (another depth, width or
+# expert count, a fine-tune's) is read from its `config.json`: every number
+# the forward is built with, as `configured` maps them, and refused where it
+# states what the forward does not run. Its sigmoid's alpha (1.702) is not
+# stated: transformers fixes it, as this family does. It ships no drafter.
+
+def ln(x):
+    """The natural logarithm, by Newton's steps on `exp`."""
+    y = 1.0
+    for _ in range(100):
+        y = y - 1.0 + x / exp(y)
+    return y
+
+def adopt(id, config, special):
+    if config.get("model_type") != "gpt_oss":
+        fail("the config's model_type is {}; this family is gpt_oss".format(config.get("model_type")))
+    if not config.get("attention_bias", True):
+        fail("its attention projections carry no biases, which this family's do")
+    if config.get("tie_word_embeddings", False):
+        fail("it ties its head to its embedding; this family reads `lm_head.weight` apart")
+    vocab = config["vocab_size"]
+    if vocab != 201088:
+        fail("its vocabulary is {} tokens; this family speaks harmony over o200k_harmony's 201088".format(vocab))
+    layers = config["num_hidden_layers"]
+    alternating = ["sliding_attention" if l % 2 == 0 else "full_attention" for l in range(layers)]
+    if config.get("layer_types", alternating) != alternating:
+        fail("its layers do not alternate a windowed one and a full one, the windowed first, as this family's do")
+    window = config.get("sliding_window")
+    if window == None:
+        fail("it states no sliding_window, over which this family's every other layer attends")
+    scaling = config.get("rope_scaling") or {}
+    kind = scaling.get("rope_type", scaling.get("type"))
+    if kind != "yarn":
+        fail("it scales its rope as {}; this family turns it YaRN-scaled".format(kind))
+    for key in ["mscale", "mscale_all_dim"]:
+        if scaling.get(key) != None:
+            fail("its YaRN states `{}`, which this family's rope does not scale by".format(key))
+    factor = float(scaling["factor"])
+    attention_factor = scaling.get("attention_factor")
+    if attention_factor == None:
+        attention_factor = 1.0 if factor <= 1.0 else 0.1 * ln(factor) + 1.0
+    q_heads = config["num_attention_heads"]
+    d = dims(
+        layers = layers,
+        experts = config["num_local_experts"],
+        hidden = config["hidden_size"],
+        q_heads = q_heads,
+        kv_heads = config.get("num_key_value_heads", q_heads),
+        head_dim = config.get("head_dim", config["hidden_size"] // q_heads),
+        theta = float(config["rope_theta"]),
+        yarn_factor = factor,
+        yarn_beta_fast = float(scaling.get("beta_fast", 32.0)),
+        yarn_beta_slow = float(scaling.get("beta_slow", 1.0)),
+        yarn_attention_factor = float(attention_factor),
+        yarn_original_max_position = scaling["original_max_position_embeddings"],
+        window = window,
+        top_k = config.get("num_experts_per_tok") or config["experts_per_token"],
+        inter = config["intermediate_size"],
+        swiglu_limit = float(config.get("swiglu_limit", 7.0)),
+        vocab = vocab,
+        norm_eps = float(config.get("rms_norm_eps", 1e-5)),
+    )
+    return struct(
+        MODELS = [model(id, template = HARMONY, tokenizer = TOKENIZER, arch = "gptoss", layers = layers, vocab = vocab)],
+        DIMS = {id: d},
+        DEPLOYMENTS = [
+            deployment(id, weights = [dtype.bf16, dtype.mxfp4], kv = dtype.bf16),
+            deployment(id, weights = [dtype.bf16, dtype.mxfp4], kv = dtype.e4m3),
+            deployment(id, weights = [dtype.u4g64, dtype.mxfp4], kv = dtype.bf16),
+            deployment(id, weights = [dtype.u4g32, dtype.mxfp4], kv = dtype.bf16),
+        ],
+    )
 
 DFLASH_20B = dflash_head(
     taps = [1, 6, 11, 16, 21],
