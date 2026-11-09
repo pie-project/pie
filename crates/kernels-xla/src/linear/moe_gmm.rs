@@ -95,9 +95,10 @@ pub struct Gmm {
     /// only: see [`Gmm::prefetching`]).
     pub prefetch: bool,
     /// A second f32 output beside the rows: each `sums`-wide head's sum of
-    /// squares of the f32 product, as the 128 lane-wise partial sums of its
-    /// lanes (`[rows, N / sums * 128]`), for the per-head norm that follows a
-    /// block-FP8 projection (`tile`, one expert, whole heads a block).
+    /// squares of the rows as stored, as the 128 lane-wise partial sums of
+    /// its lanes (`[rows, N / sums * 128]`), for the per-head norm that
+    /// follows a block-FP8 projection (`tile`, one expert, whole heads a
+    /// block).
     pub sums: Option<i64>,
 }
 
@@ -634,9 +635,7 @@ impl Gmm {
             + convert
             + scaling
             + 2 * tm * cols * 4
-            + self
-                .sums
-                .map_or(0, |h| tm * cols * 4 + 2 * tm * (cols / h * 128) * 4);
+            + self.sums.map_or(0, |h| 2 * tm * (cols / h * 128) * 4);
         // At least the compiler's own scoped default, where the device has it.
         let floor = (32 << 20).min(self.vmem_cap);
         let limit = (vmem * 2 + (8 << 20)).clamp(floor, self.vmem_cap);
@@ -651,9 +650,7 @@ impl Gmm {
                 .collect(),
             outs: [Some(out), sums].into_iter().flatten().collect(),
             vmem_limit: Some(limit as u64),
-            scratch: self.sums.map_or_else(Vec::new, |_| {
-                vec![MTy::Ref(vec![tm, cols], Elem::F32, Space::Vmem)]
-            }),
+            scratch: vec![],
         };
         kernel.build(|b, blk| {
             let zero = b.index(0);
@@ -697,12 +694,13 @@ impl Gmm {
                 } else {
                     y
                 };
-                if let Some(h) = self.sums {
-                    head_sums(b, y, blk.scratch[0], blk.outs[1], tm, cols, h)?;
-                }
                 let Cut::Element { width } = cut else {
                     let y = b.convert_f(y, self.out)?;
-                    return b.vstore_all(y, blk.outs[0]);
+                    b.vstore_all(y, blk.outs[0])?;
+                    if let Some(h) = self.sums {
+                        head_sums(b, blk.outs[0], blk.outs[1], tm, cols, h)?;
+                    }
+                    return Ok(());
                 };
                 // The expert's outputs turned to column 0 in VMEM (gathering
                 // the rows at a per-row column offset afterwards relays every
@@ -733,22 +731,27 @@ impl Gmm {
     }
 }
 
-/// Each `h`-wide head's lane-wise partial sums of squares of the f32 rows
-/// `y` (`[tm, cols]`, parked in `park`): the head's `h / 128` lane tiles
-/// squared and summed into one, stored as the head's tile of `out`.
-fn head_sums(b: &mut Body, y: V, park: V, out: V, tm: i64, cols: i64, h: i64) -> Built<()> {
-    b.vstore_all(y, park)?;
-    let zero = b.index(0);
-    for head in 0..cols / h {
-        let mut acc = b.splat_f(&[tm, 128], Elem::F32, 0.0)?;
-        for t in 0..h / 128 {
-            let at = b.index(head * h + t * 128);
-            let v = b.vload(park, &[zero, at], &[tm, 128])?;
-            let sq = b.mulf(v, v)?;
-            acc = b.addf(acc, sq)?;
+/// Each `h`-wide head's lane-wise partial sums of squares of the rows just
+/// stored in `rows` (`[tm, cols]`, as the norm reads them): a slab of 256
+/// rows at a time, the head's `h / 128` lane tiles widened to f32, squared
+/// and summed into one, stored as the head's tile of `out`.
+fn head_sums(b: &mut Body, rows: V, out: V, tm: i64, cols: i64, h: i64) -> Built<()> {
+    let slab = tm.min(256);
+    for r in (0..tm).step_by(slab as usize) {
+        let n = slab.min(tm - r);
+        let row = b.index(r);
+        for head in 0..cols / h {
+            let mut acc = b.splat_f(&[n, 128], Elem::F32, 0.0)?;
+            for t in 0..h / 128 {
+                let at = b.index(head * h + t * 128);
+                let v = b.vload(rows, &[row, at], &[n, 128])?;
+                let v = b.convert_f(v, Elem::F32)?;
+                let sq = b.mulf(v, v)?;
+                acc = b.addf(acc, sq)?;
+            }
+            let at = b.index(head * 128);
+            b.vstore(acc, out, &[row, at])?;
         }
-        let at = b.index(head * 128);
-        b.vstore(acc, out, &[zero, at])?;
     }
     Ok(())
 }
