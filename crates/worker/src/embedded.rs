@@ -181,3 +181,32 @@ pub async fn recv_frames(session: u32, max_wait_ms: u64, max: usize) -> Result<V
         .map(|message| rmp_serde::to_vec_named(message).map_err(anyhow::Error::from))
         .collect()
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The options an app's settings lay onto the engine name no removed
+    /// key, on any engine this build might pick.
+    #[test]
+    fn settings_write_no_removed_key() {
+        let settings = Settings::default();
+        for kind in [
+            EngineKind::Cuda,
+            EngineKind::Metal,
+            EngineKind::Vulkan,
+            EngineKind::Wgpu,
+            EngineKind::Xla,
+            EngineKind::Cerebras,
+        ] {
+            let options = settings.engine_options(kind, Path::new("/home"));
+            for key in options.keys() {
+                assert!(
+                    crate::config::removed::refusal_for(key).is_none(),
+                    "{}: the settings write the removed key {key}",
+                    kind.as_str()
+                );
+            }
+        }
+    }
+}

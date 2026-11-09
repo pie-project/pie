@@ -510,6 +510,19 @@ fn has_extension(exts: &[vk::ExtensionProperties], name: &CStr) -> bool {
         .any(|e| e.extension_name_as_c_str().is_ok_and(|s| s == name))
 }
 
+/// The largest buffer a load makes: one a single storage descriptor binds
+/// whole (`maxStorageBufferRange`), that one allocation backs
+/// (`maxMemoryAllocationSize`, core 1.1) and that the device creates
+/// (`maxBufferSize`, core 1.3; absent before it). A limit reported as zero
+/// states nothing.
+pub(crate) fn buffer_ceiling(storage_range: u32, allocation: u64, buffer: Option<u64>) -> u64 {
+    [Some(allocation), buffer]
+        .into_iter()
+        .flatten()
+        .filter(|&limit| limit > 0)
+        .fold(u64::from(storage_range), u64::min)
+}
+
 impl Context {
     /// Binds the device `boot` names for a load that may take `share` of
     /// its device-local heap.
@@ -663,15 +676,25 @@ impl Context {
         let mut subgroup = vk::PhysicalDeviceSubgroupProperties::default();
         let mut sizes = vk::PhysicalDeviceSubgroupSizeControlProperties::default();
         let sized = props.api_version >= vk::API_VERSION_1_3;
+        let mut maintenance3 = vk::PhysicalDeviceMaintenance3Properties::default();
+        let mut maintenance4 = vk::PhysicalDeviceMaintenance4Properties::default();
         {
-            let mut p2 = vk::PhysicalDeviceProperties2::default().push_next(&mut subgroup);
+            let mut p2 = vk::PhysicalDeviceProperties2::default()
+                .push_next(&mut subgroup)
+                .push_next(&mut maintenance3);
             if sized {
-                p2 = p2.push_next(&mut sizes);
+                p2 = p2.push_next(&mut sizes).push_next(&mut maintenance4);
             }
-            // SAFETY: the chain holds the 1.1 subgroup struct and, only on a
-            // 1.3 device, the size-control struct; both outlive the call.
+            // SAFETY: the chain holds the 1.1 subgroup and maintenance3
+            // structs and, only on a 1.3 device, the size-control and
+            // maintenance4 structs; all outlive the call.
             unsafe { instance.get_physical_device_properties2(physical, &mut p2) };
         }
+        let max_buffer = buffer_ceiling(
+            props.limits.max_storage_buffer_range,
+            maintenance3.max_memory_allocation_size,
+            sized.then_some(maintenance4.max_buffer_size),
+        );
         // The narrowest subgroup a pipeline may be compiled at: a driver
         // that varies the width (Intel: 8 to 32) reports its default as
         // `subgroupSize`, which a kernel folding 32 lanes cannot rely on.
@@ -921,7 +944,6 @@ impl Context {
         // other processes'.
         let working_set = ((device_local as f64 * share) as u64).saturating_sub(core.held());
         let dummy = Raw::new(&core, DUMMY_BYTES, Memory::Device).map_err(|fault| (fault, None))?;
-        let max_buffer = u64::from(core.limits.max_storage_buffer_range).max(1 << 30);
         let pipeline_cache = Arc::new(
             PipelineCache::open(&core, boot.pipeline_cache.clone())
                 .map_err(|fault| (fault, None))?,
@@ -1786,5 +1808,29 @@ impl Inner {
             let ns = (span as f64 * period) as u64;
             crate::encode::credit(name, ns);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::buffer_ceiling;
+
+    #[test]
+    fn the_buffer_ceiling_is_the_least_of_the_three_limits() {
+        const GIB: u64 = 1 << 30;
+        // A descriptor's range is the floor even past a 1 GiB buffer: the
+        // spec's least, 128 MiB, is never raised.
+        assert_eq!(buffer_ceiling(1 << 27, 4 * GIB, Some(4 * GIB)), 1 << 27);
+        // NVIDIA-like: 4 GiB less one range, 4 GiB allocations.
+        assert_eq!(
+            buffer_ceiling(u32::MAX, 4 * GIB, Some(u64::MAX)),
+            u64::from(u32::MAX)
+        );
+        // An allocation smaller than the range bounds it.
+        assert_eq!(buffer_ceiling(u32::MAX, 2 * GIB, None), 2 * GIB);
+        // maxBufferSize bounds it on a 1.3 device.
+        assert_eq!(buffer_ceiling(u32::MAX, 4 * GIB, Some(GIB)), GIB);
+        // A limit reported as zero states nothing.
+        assert_eq!(buffer_ceiling(u32::MAX, 0, Some(0)), u64::from(u32::MAX));
     }
 }

@@ -348,6 +348,9 @@ impl Sink<'_> {
                             format!("argument {} binds an empty view", infos.len()),
                         ));
                     }
+                    let range = u64::from(self.device.core.limits.max_storage_buffer_range);
+                    storage_view_fits(infos.len(), remaining, range)
+                        .map_err(|detail| Sink::backend(fire, detail))?;
                     infos.push(
                         vk::DescriptorBufferInfo::default()
                             .buffer(binding.slab().buffer)
@@ -621,4 +624,39 @@ pub(crate) fn qmm_ladder(
             Qmm::Qmv { vecs } => Rung::Qmv { vecs },
         })
         .collect()
+}
+
+/// Whether argument `at`'s view of `bytes` fits one storage descriptor. A
+/// range past `maxStorageBufferRange` is invalid usage that drivers answer
+/// by binding a truncated view, so it is refused here.
+#[cfg_attr(not(feature = "vulkan"), allow(dead_code))]
+fn storage_view_fits(at: usize, bytes: u64, limit: u64) -> Result<(), String> {
+    if bytes <= limit {
+        return Ok(());
+    }
+    Err(format!(
+        "argument {at} binds a {bytes}-byte view, past this device's \
+         maxStorageBufferRange of {limit} bytes; a view is never clamped, so \
+         the slab must be split to fit the binding"
+    ))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::storage_view_fits;
+
+    #[test]
+    fn a_view_past_the_storage_range_is_refused_with_its_sizes() {
+        const LIMIT: u64 = 128 << 20;
+        assert_eq!(storage_view_fits(0, 4, LIMIT), Ok(()));
+        assert_eq!(storage_view_fits(1, LIMIT, LIMIT), Ok(()));
+        let why = storage_view_fits(5, LIMIT + 1, LIMIT).unwrap_err();
+        assert!(why.contains("argument 5"), "got: {why}");
+        assert!(
+            why.contains(&format!("{}-byte view", LIMIT + 1)),
+            "got: {why}"
+        );
+        assert!(why.contains(&format!("of {LIMIT} bytes")), "got: {why}");
+        assert!(why.contains("maxStorageBufferRange"), "got: {why}");
+    }
 }

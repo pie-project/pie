@@ -513,6 +513,9 @@ pub(crate) struct Rule {
     /// The most keys one row admits (a sliding window), when bounded: the
     /// per-row walk then reads chunks no wider than it.
     pub window: Option<i64>,
+    /// Whether the blocked walk's row blocks may run in line (see
+    /// [`blocked`]); a narrow window's blocks always may.
+    pub inline: bool,
 }
 
 struct Logits {
@@ -1299,7 +1302,7 @@ pub(crate) fn blocked(
     };
     let whole = if nb == 1 {
         block(f, &rows_p)?
-    } else if nb <= ch.unrolled {
+    } else if nb <= ch.unrolled && (narrow.is_some() || rule.inline) {
         // A few blocks run one after another in line, each on a static cut
         // of the rows, and join at the end: as a loop, each block's result
         // is written into a copy of the whole carried output (DeepSeek-V4's
@@ -2372,11 +2375,20 @@ pub(crate) fn scatter_slots(
         .map(|(_, plane)| f.ty(plane.val).clone())
         .collect();
     let runs = page_runs(f, i64::from(n), ps, slots / ps, page, off)?;
+    // A page a run fills whole needs no reading first: when few runs are
+    // partial (two a lane at most), only theirs are read.
+    let few = (i64::from(n) / ps + 64) / 4;
+    let skip = cmp_i(f, Cmp::Le, runs.partial, few)?;
+    let skip = f.convert(skip, Elem::I32);
+    let which = with_i(f, skip, 1, Func::add)?;
+    let which = f.mul(which, runs.ok)?;
     let rows: crate::hlo::Branch<'_> =
         Box::new(move |f: &mut Func| slot_rows(f, pairs, ps, page, off));
     let pages: crate::hlo::Branch<'_> =
-        Box::new(move |f: &mut Func| page_writes(f, pairs, ps, slots / ps, &runs));
-    Ok(f.case(runs.ok, &outs, vec![rows, pages])?)
+        Box::new(move |f: &mut Func| page_writes(f, pairs, ps, slots / ps, &runs, None));
+    let fresh: crate::hlo::Branch<'_> =
+        Box::new(move |f: &mut Func| page_writes(f, pairs, ps, slots / ps, &runs, Some(few)));
+    Ok(f.case(which, &outs, vec![rows, pages, fresh])?)
 }
 
 /// Rows from which `scatter_slots` writes whole pages: a fire this tall is a
@@ -2436,6 +2448,8 @@ struct Runs {
     len: Val,
     page: Val,
     ok: Val,
+    /// How many live runs lay less than a whole page (i32 scalar).
+    partial: Val,
 }
 
 fn page_runs(f: &mut Func, n: i64, ps: i64, pages: i64, page: Val, off: Val) -> Built<Runs> {
@@ -2504,12 +2518,20 @@ fn page_runs(f: &mut Func, n: i64, ps: i64, pages: i64, page: Val, off: Val) -> 
     let clean = cmp_i(f, Cmp::Eq, clean, 0)?;
     let ok = f.and(fits, clean)?;
     let ok = f.convert(ok, Elem::I32);
+    let at_zero = cmp_i(f, Cmp::Eq, first, 0)?;
+    let full = cmp_i(f, Cmp::Eq, len, ps)?;
+    let whole = f.and(at_zero, full)?;
+    let part = f.not(whole);
+    let part = f.and(part, used)?;
+    let part = f.convert(part, Elem::I32);
+    let partial = f.reduce(part, &[0], Fold::Sum)?;
     Ok(Runs {
         start,
         first,
         len,
         page: keyed,
         ok,
+        partial,
     })
 }
 
@@ -2541,27 +2563,50 @@ fn page_writes(
     ps: i64,
     pages: i64,
     runs: &Runs,
+    partial_cap: Option<i64>,
 ) -> Built<Vec<Val>> {
     let m = f.dims(runs.page)[0];
     let n = i64::from(pairs[0].0.rows);
-    let at = f.reshape(runs.page, &[m, 1])?;
-    let read = clamp_i(f, runs.page, 0, pages - 1)?;
-    let read = f.reshape(read, &[m, 1])?;
+    let (start, first, len, page) = match partial_cap {
+        // the runs laying less than a whole page sorted first: those are
+        // the pages read before they are written
+        Some(_) => {
+            let used = cmp_i(f, Cmp::Lt, runs.page, pages)?;
+            let at_zero = cmp_i(f, Cmp::Eq, runs.first, 0)?;
+            let full = cmp_i(f, Cmp::Eq, runs.len, ps)?;
+            let whole = f.and(at_zero, full)?;
+            let unused = f.not(used);
+            let whole = f.or(whole, unused)?;
+            let key = f.convert(whole, Elem::I32);
+            let sorted = f.sort(
+                &[key, runs.start, runs.first, runs.len, runs.page],
+                0,
+                true,
+                |f, a, b| f.compare(Cmp::Lt, a[0], b[0]),
+            )?;
+            (sorted[1], sorted[2], sorted[3], sorted[4])
+        }
+        None => (runs.start, runs.first, runs.len, runs.page),
+    };
+    let few = partial_cap.unwrap_or(m).min(m);
+    let at = f.reshape(page, &[m, 1])?;
+    let read = clamp_i(f, page, 0, pages - 1)?;
+    let read = f.slice_axis(read, 0, 0, few)?;
+    let read = f.reshape(read, &[few, 1])?;
     let r = f.iota(Elem::I32, &[m, ps], 1);
-    let lo = f.broadcast(runs.first, &[m, ps], &[0])?;
-    let end = f.add(runs.first, runs.len)?;
+    let lo = f.broadcast(first, &[m, ps], &[0])?;
+    let end = f.add(first, len)?;
     let hi = f.broadcast(end, &[m, ps], &[0])?;
     let ge = f.compare(Cmp::Ge, r, lo)?;
     let lt = f.compare(Cmp::Lt, r, hi)?;
     let laid = f.and(ge, lt)?;
     // a run's rows start `first` rows before its source row `start`; the
     // source padded by a tile in front, they lie in tiles `tile` and `tile + 1`
-    let from = f.sub(runs.start, runs.first)?;
+    let from = f.sub(start, first)?;
     let from = with_i(f, from, ps, Func::add)?;
     let tile = with_i(f, from, ps, Func::div)?;
     let lead = with_i(f, from, ps, Func::rem)?;
     let tile = f.reshape(tile, &[m, 1])?;
-    let next = with_i(f, tile, 1, Func::add)?;
     let lead = f.broadcast(lead, &[m, ps], &[0])?;
     let want = f.add(lead, r)?;
     let none = f.like_i(want, -1);
@@ -2574,6 +2619,13 @@ fn page_writes(
     let whole = GatherDims {
         offset_dims: vec![1, 2],
         collapsed_slice_dims: vec![0],
+        start_index_map: vec![0],
+        index_vector_dim: 1,
+        ..GatherDims::default()
+    };
+    // both tiles a run's rows lie in, as one window
+    let pair = GatherDims {
+        offset_dims: vec![1, 2, 3],
         start_index_map: vec![0],
         index_vector_dim: 1,
         ..GatherDims::default()
@@ -2592,13 +2644,20 @@ fn page_writes(
         let zero = f.const_f(Elem::Bf16, 0.0, &[]);
         let rows = f.pad(rows, zero, &[ps, 0], &[2 * ps, 0], &[0, 0])?;
         let rows = f.reshape(rows, &[tiles, ps, w])?;
-        let lo = f.gather(rows, tile, &whole, &[1, ps, w])?;
-        let hi = f.gather(rows, next, &whole, &[1, ps, w])?;
-        let both = f.concat(&[lo, hi], 1)?;
+        let both = f.gather(rows, tile, &pair, &[2, ps, w])?;
+        let both = f.reshape(both, &[m, 2 * ps, w])?;
         let new = f.dot_general(pick, both, &[0], &[0], &[2], &[1], Elem::F32)?;
         let new = f.convert(new, elem);
-        let mask = f.broadcast(laid, &[m, ps, w], &[0, 1])?;
-        let merged = f.select(mask, new, old)?;
+        let head = f.slice_axis(laid, 0, 0, few)?;
+        let mask = f.broadcast(head, &[few, ps, w], &[0, 1])?;
+        let merged = if few == m {
+            f.select(mask, new, old)?
+        } else {
+            let top = f.slice_axis(new, 0, 0, few)?;
+            let top = f.select(mask, top, old)?;
+            let rest = f.slice_axis(new, 0, few, m)?;
+            f.concat(&[top, rest], 0)?
+        };
         let written = f.scatter_hinted(
             p3,
             at,

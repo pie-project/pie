@@ -7,6 +7,8 @@ use serde::{Deserialize, Serialize};
 
 /// Backend-specific option structs (typed views over `EngineConfig::options`).
 pub mod backend;
+/// Keys that are gone: each refuses a file that still states it, saying why.
+pub mod removed;
 /// The dotted-path schema `pie config set`/`get` walk.
 pub mod schema;
 
@@ -14,6 +16,7 @@ pub use backend::{
     CerebrasEngineOptions, CudaEngineOptions, MetalEngineOptions, VulkanEngineOptions,
     WgpuEngineOptions, XlaEngineOptions,
 };
+pub use removed::{Gone, Removed};
 pub use units::{ByteSize, Duration};
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -1024,7 +1027,16 @@ impl EngineConfig {
                 })?;
                 opts.validate()?;
             }
-            EngineKind::Metal => {}
+            EngineKind::Metal => {
+                let _: MetalEngineOptions = toml::Value::Table(self.options.clone())
+                    .try_into()
+                    .map_err(|e| {
+                        anyhow::anyhow!(
+                            "invalid [engine] options for engine type {:?}: {e}",
+                            self.kind,
+                        )
+                    })?;
+            }
             EngineKind::Vulkan => {
                 let opts: VulkanEngineOptions = toml::Value::Table(self.options.clone())
                     .try_into()

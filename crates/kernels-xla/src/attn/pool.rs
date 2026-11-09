@@ -1126,6 +1126,7 @@ pub fn lse(
         let rows_v = Rows::new(q4, base, hi);
         let rule = Rule {
             kp_span: Some(geom.span),
+            inline: true,
             ..Rule::default()
         };
         let fl = blocked(
