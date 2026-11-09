@@ -239,7 +239,11 @@ impl Weights {
         // `gather_only`.
         let mut folded: BTreeMap<usize, (u64, u64)> = BTreeMap::new();
         for at in gather_only(trace, &codes_planes, engine) {
-            let pairing = pairings[trace.params[at].name.as_str()];
+            let Some(pairing) = pairings.get(trace.params[at].name.as_str()) else {
+                let (rows, width) = rectangle(&trace.params[at].shape);
+                folded.insert(at, fold_of(rows, width));
+                continue;
+            };
             for plane in [Some(at), Some(pairing.scales), pairing.biases]
                 .into_iter()
                 .flatten()
@@ -832,10 +836,19 @@ fn gather_only(
         _ => None,
     };
     let mut other = std::collections::BTreeSet::new();
+    let mut joined = std::collections::BTreeSet::new();
     let mut inputs = Vec::new();
     for node in &trace.nodes {
         inputs.clear();
         node.op.inputs(&mut inputs);
+        if let Operation::Gather(Gather::Embed {
+            table,
+            concat: true,
+            ..
+        }) = &node.op
+        {
+            joined.extend(param_of(*table));
+        }
         let table = match &node.op {
             Operation::Gather(
                 Gather::Embed {
@@ -870,11 +883,19 @@ fn gather_only(
     }
     out.retain(|&p| {
         let param = &trace.params[p];
+        // A bf16 table whose rows are not whole lane tiles lands column-major
+        // too (gpt-oss's 2880-wide embedding: a 1.9 ms relayout a fire).
+        let dense = param.dtype == Dtype::Bf16
+            && !codes.contains(&p)
+            && !joined.contains(&p)
+            && param.shape.len() == 2
+            && !param.shape[1].is_multiple_of(128);
         !other.contains(&p)
-            && codes.contains(&p)
             && param.source != ParamSource::Registered
-            && matches!(kernels_xla::pack::code_bits(param.dtype), Some(2 | 4))
-            && param.dtype != Dtype::Mxfp4
+            && (dense
+                || (codes.contains(&p)
+                    && matches!(kernels_xla::pack::code_bits(param.dtype), Some(2 | 4))
+                    && param.dtype != Dtype::Mxfp4))
     });
     out
 }
@@ -1162,7 +1183,11 @@ impl Weights {
         let codes_planes: std::collections::BTreeSet<usize> = pairings.keys().copied().collect();
         let mut folded: BTreeMap<usize, (u64, u64)> = BTreeMap::new();
         for at in gather_only(trace, &codes_planes, engine) {
-            let pairing = pairings[&at];
+            let Some(pairing) = pairings.get(&at) else {
+                let (rows, width) = rectangle(&trace.params[at].shape);
+                folded.insert(at, fold_of(rows, width));
+                continue;
+            };
             for plane in [Some(at), Some(pairing.scales), pairing.biases]
                 .into_iter()
                 .flatten()

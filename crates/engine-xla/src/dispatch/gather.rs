@@ -106,6 +106,21 @@ impl Run<'_> {
                         gather::embed_gather_mb_4bit(l.f(), ids_v, table_v, *vocab, o_y.landing())?;
                     l.land(o_y, v)
                 }),
+                // Landed folded (`weights::gather_only`): whole rows of
+                // several table rows.
+                None if {
+                    let (t, w) = (self.tensor(*table), self.tensor(*y).width);
+                    t.width != w && w > 0 && t.width.is_multiple_of(w)
+                } =>
+                {
+                    crate::lower::lower(self.ctx(), |l| {
+                        let ids_v = l.read(self.tensor(*ids))?;
+                        let table_v = l.read(self.tensor(*table))?;
+                        let o_y = self.tensor(*y);
+                        let v = gather::embed_folded(l.f(), ids_v, table_v, *vocab, o_y.landing())?;
+                        l.land(o_y, v)
+                    })
+                }
                 None if self.tensor(*table).rows < *vocab => crate::lower::lower(self.ctx(), |l| {
                     let ids_v = l.read(self.tensor(*ids))?;
                     let table_v = l.read(self.tensor(*table))?;
