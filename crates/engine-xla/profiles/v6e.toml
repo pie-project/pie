@@ -8,6 +8,12 @@ assumes = { generation = 6 }
 [engine]
 pad.row_steps = 4
 
+# 256-row blocks of the blocked prefill walk against its 512-key chunks: a block spans fewer lanes
+# and fewer of their chunks (Qwen3-0.6B pf256-512 103.6k -> 109.2k tok/s, Raw prefill 54.0k -> 55.5k;
+# Gemma-4-E4B Raw prefill 25.2k -> 26.2k; c256 decode no slower)
+[kernel]
+attn.block_rows = 256
+
 [provenance]
 measured = [
   "engine.pad.row_steps",
