@@ -1098,6 +1098,7 @@ fn gmm_spec(
         scaled,
         bias: false,
         out: Elem::F32,
+        prefetch: !mxfp4,
     };
     spec.out_width().ok().map(|_| spec)
 }

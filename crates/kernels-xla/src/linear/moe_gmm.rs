@@ -77,6 +77,10 @@ pub struct Gmm {
     /// The result's element: f32, or the product (and its bias) rounded to
     /// bf16 as the select's result is.
     pub out: Elem,
+    /// Whether the kernel copies each expert's weights itself, the next
+    /// run's while a run's tiles go (a plain bank under a whole-`N` block
+    /// only: see [`Gmm::prefetching`]).
+    pub prefetch: bool,
 }
 
 /// How the weights are cut into blocks.
@@ -182,7 +186,8 @@ impl Gmm {
     /// tile's run and the next run's expert after `se` and `nt`).
     #[must_use]
     pub fn prefetching(&self) -> bool {
-        !self.scaled
+        self.prefetch
+            && !self.scaled
             && !self.bias
             && matches!(self.cut(), Ok(Cut::Blocked { tn }) if tn == self.n)
     }
@@ -314,11 +319,11 @@ impl Gmm {
     }
 
     pub fn kernel(&self) -> Built<Compiled> {
-        if self.prefetching() {
-            return self.kernel_prefetching();
-        }
         if self.tm % 16 != 0 || self.tiles < 1 || self.k < 1 || self.n < 1 || self.experts < 1 {
             return bad(format!("{self:?}"));
+        }
+        if self.prefetching() {
+            return self.kernel_prefetching();
         }
         if !matches!(
             self.w,
@@ -635,6 +640,7 @@ mod tests {
             scaled: false,
             bias: false,
             out: Elem::F32,
+            prefetch: false,
         }
     }
 
