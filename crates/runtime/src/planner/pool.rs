@@ -1,6 +1,6 @@
 use std::collections::HashSet;
 
-use crate::store::extent::Extent;
+use crate::store::grow::Grow;
 use crate::store::rs::RsUnits;
 
 /// The window-ring pages a seated lane past its window holds beyond its
@@ -80,7 +80,7 @@ pub struct RegistryPool {
     suspend_capable: bool,
     /// The last count of reclaimable idle pages and when it was taken.
     reclaimable: parking_lot::Mutex<Option<(crate::rt::Instant, u32)>>,
-    extent: Option<Extent>,
+    grow: Option<Grow>,
 }
 
 /// How long a count of reclaimable idle pages stands: counting walks every
@@ -95,13 +95,13 @@ impl RegistryPool {
             engine,
             suspend_capable,
             reclaimable: parking_lot::Mutex::new(None),
-            extent: None,
+            grow: None,
         }
     }
 
     /// Commits the pool's pages on demand rather than holding them whole.
-    pub fn with_extent(mut self, extent: Extent) -> Self {
-        self.extent = Some(extent);
+    pub fn with_grow(mut self, grow: Grow) -> Self {
+        self.grow = Some(grow);
         self
     }
 
@@ -200,16 +200,16 @@ impl PoolPort for RegistryPool {
     ) -> Option<Vec<crate::store::kv::page_table::PhysicalKvPageId>> {
         let (pages, due) = self.with_kv_tagged("planner-reserve", |kv| {
             let pages = kv.reserve_device_pages(count as usize);
-            let due = self.extent.as_ref().is_some_and(|extent| {
+            let due = self.grow.as_ref().is_some_and(|grow| {
                 if pages.is_none() {
                     kv.note_short(count);
                 }
-                pages.is_none() || kv.commit_due(extent.step())
+                pages.is_none() || kv.commit_due(grow.step())
             });
             (pages, due)
         });
-        if due && let Some(extent) = &self.extent {
-            extent.wake();
+        if due && let Some(grow) = &self.grow {
+            grow.wake();
         }
         pages
     }
@@ -219,7 +219,7 @@ impl PoolPort for RegistryPool {
     }
 
     fn grow(&self, count: u32) -> bool {
-        let Some(extent) = &self.extent else {
+        let Some(grow) = &self.grow else {
             return false;
         };
         let growing = self.with_kv_tagged("planner-grow", |kv| {
@@ -227,21 +227,21 @@ impl PoolPort for RegistryPool {
             kv.can_commit()
         });
         if growing {
-            extent.wake();
+            grow.wake();
             return true;
         }
-        extent.ask()
+        grow.ask()
     }
 
     fn grow_rs(&self, need: RsUnits) -> bool {
-        let Some(extent) = &self.extent else {
+        let Some(grow) = &self.grow else {
             return false;
         };
         if self.with_rs(|rs| rs.note_short(need)) {
-            extent.wake();
+            grow.wake();
             return true;
         }
-        extent.state_on_demand() && extent.ask()
+        grow.state_on_demand() && grow.ask()
     }
 
     fn reserve_device_up_to(
@@ -267,13 +267,13 @@ impl PoolPort for RegistryPool {
         let (grant, due) = self.with_rs(|rs| {
             let grant = rs.reserve(need);
             let due = self
-                .extent
+                .grow
                 .as_ref()
-                .is_some_and(|extent| rs.next_extent(extent.state_step()).is_some());
+                .is_some_and(|grow| rs.next_extent(grow.state_step()).is_some());
             (grant, due)
         });
-        if due && let Some(extent) = &self.extent {
-            extent.wake();
+        if due && let Some(grow) = &self.grow {
+            grow.wake();
         }
         grant
     }

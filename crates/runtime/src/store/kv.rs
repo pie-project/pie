@@ -107,7 +107,7 @@ pub struct KvStore {
     /// The list shape's slots, one a page. Its limit is what is committed:
     /// no id past it has memory yet.
     pool: ShapePool<PhysicalKvPageId>,
-    /// How far the limit may rise; see [`crate::store::extent`].
+    /// How far the limit may rise; see [`crate::store::grow`].
     target_pages: u32,
     /// Pages a waiter found short, past what is committed.
     short_pages: u32,
@@ -2534,11 +2534,6 @@ impl KvStore {
     /// Where memory can stop now: past the highest page still out.
     pub fn held_end(&self) -> u32 {
         self.pool.held_end()
-    }
-
-    /// How far the limit reaches without cutting off anything out.
-    pub fn high_end(&self) -> u32 {
-        self.pool.high_end()
     }
 
     /// Drops what the idle cache keeps past the limit, where its key lets

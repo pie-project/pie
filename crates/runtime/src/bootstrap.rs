@@ -522,7 +522,7 @@ async fn bootstrap_inner(config: Config) -> Result<BootstrapHandle> {
         if let Some(&(page_bytes, whole, slot_bytes)) =
             resizable.get(engine).filter(|(bytes, ..)| *bytes > 0)
         {
-            let extent = crate::store::extent::Extent::new(
+            let extent = crate::store::grow::Grow::new(
                 arena_model_idx,
                 engine,
                 page_bytes,
@@ -530,7 +530,7 @@ async fn bootstrap_inner(config: Config) -> Result<BootstrapHandle> {
                 slot_bytes,
             );
             extents.push(extent.clone());
-            pool = pool.with_extent(extent);
+            pool = pool.with_grow(extent);
         }
         crate::planner::init_planner(
             arena_model_idx,

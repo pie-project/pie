@@ -385,7 +385,16 @@ impl RsStore {
             return false;
         };
         extent.short = extent.short.max(need.slots.max(need.pages));
-        limit < extent.target
+        let can = limit < extent.target;
+        self.slots.wait(u64::from(need.slots));
+        self.pages.wait(u64::from(need.pages));
+        can
+    }
+
+    /// No waiter is short any more.
+    fn unwait(&mut self) {
+        self.slots.wait(0);
+        self.pages.wait(0);
     }
 
     /// The numbers to commit up to next, keeping `step` free and covering
@@ -407,6 +416,9 @@ impl RsStore {
         if let Some(extent) = &mut self.extent {
             extent.mapped = extent.mapped.max(committed);
             extent.short = extent.short.saturating_sub(gained);
+            if extent.short == 0 {
+                self.unwait();
+            }
         }
     }
 
@@ -416,6 +428,7 @@ impl RsStore {
         if let Some(extent) = &mut self.extent {
             extent.target = limit;
             extent.short = 0;
+            self.unwait();
         }
     }
 
