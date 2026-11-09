@@ -2572,7 +2572,8 @@ fn page_writes(
             let at_zero = cmp_i(f, Cmp::Eq, runs.first, 0)?;
             let full = cmp_i(f, Cmp::Eq, runs.len, ps)?;
             let whole = f.and(at_zero, full)?;
-            let whole = f.or(whole, f.not(used))?;
+            let unused = f.not(used);
+            let whole = f.or(whole, unused)?;
             let key = f.convert(whole, Elem::I32);
             let sorted = f.sort(
                 &[key, runs.start, runs.first, runs.len, runs.page],
