@@ -217,6 +217,8 @@ pub struct FireCost {
 pub struct Shell {
     tuning: kernels_xla::tuning::Tuning,
     pad: crate::chip::Pad,
+    /// `chip::Engine::seats`.
+    seats: [bool; 3],
     tpu: crate::chip::Tpu,
     handles: Handles,
     trace: Trace,
@@ -324,6 +326,12 @@ impl Shell {
     #[must_use]
     pub fn readouts(&self) -> Vec<u32> {
         self.readouts.iter().copied().collect()
+    }
+
+    /// `engine.seated_first`, `engine.seat_to_end`, `engine.seat_spread`.
+    #[must_use]
+    pub fn seats(&self) -> [bool; 3] {
+        self.seats
     }
 
     /// Loads with the voxel ladder derived from the plan (engine-cuda's
@@ -691,6 +699,7 @@ impl Shell {
         Ok(Shell {
             tuning,
             pad,
+            seats: engine.seats,
             tpu,
             device,
             handles,
