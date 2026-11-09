@@ -24,6 +24,7 @@ fn globals() -> &'static Globals {
         base()
             .with(crate::star::manifest::manifest)
             .with(crate::star::layout::layout)
+            .with(crate::star::state::globals)
             .with(crate::star::generative::generative)
             .with(crate::star::forward::forward)
             .with(crate::star::forward::ops)

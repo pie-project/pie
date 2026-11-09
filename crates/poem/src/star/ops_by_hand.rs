@@ -3,15 +3,50 @@
 //! optional pairs, `conv3d`'s shape, `split_qkv_padded`'s arrays, the
 //! `bool`-valued input methods), or whose packages' spelling keeps an order
 //! or a default its signature does not (the causal convolutions take
-//! `state` and `conv_width` before their optional `bias`). Each is named in
+//! `state` and `conv_width` before their optional `bias`; `kv_append` finds
+//! a state's write positions itself). Each is named in
 //! the generator's `BY_HAND`, so it is generated nowhere else.
 
 use crate::ops;
 use crate::star::bind::spelled::*;
-use crate::star::bind::{Op, result};
-use crate::star::forward::dsl;
+use crate::star::bind::{Op, Row, result};
+use crate::star::forward::{dsl, root_input};
 
 pub(crate) static OPS: &[Op] = &[
+    Op {
+        module: "attn",
+        name: "kv_append",
+        params: &["k", "v", "pages", "write_page", "write_offset"],
+        call: |a, heap| {
+            let k: Value = a.next()?;
+            let v: Option<Value> = a.next()?;
+            let pages: Row = a.next()?;
+            let write_page: Option<Value> = a.next()?;
+            let write_offset: Option<Value> = a.next()?;
+            // A row named, or a state, is written where the forward's rows
+            // land in it, unless the call says where.
+            let (write_page, write_offset) = match (write_page, write_offset, pages.name) {
+                (Some(page), Some(offset), _) => (page, offset),
+                (None, None, Some(name)) => {
+                    let input = root_input()?;
+                    dsl("attn.kv_append", || {
+                        (input.write_page(&name), input.write_offset(&name))
+                    })?
+                }
+                _ => anyhow::bail!(
+                    "`ops.attn.kv_append` writes a cache at the `write_page` and \
+                     `write_offset` it is given, both, and a state or a named row where \
+                     its rows land"
+                ),
+            };
+            result(
+                heap,
+                dsl("attn.kv_append", || {
+                    ops::attn::kv_append(&k, v.as_ref(), pages.id, &write_page, &write_offset)
+                })?,
+            )
+        },
+    },
     Op {
         module: "ssm",
         name: "causal_conv1d",

@@ -174,6 +174,12 @@ pub(crate) fn input_of(handle: InputHandle) -> Input {
     with(|t| t.inputs[handle.0 as usize].clone())
 }
 
+/// The rows the forward being traced was called on: every row.
+pub(crate) fn root_input() -> anyhow::Result<Input> {
+    with(|t| t.inputs.first().cloned())
+        .ok_or_else(|| anyhow::anyhow!("a state is read while `forward` runs"))
+}
+
 #[starlark_value(type = "inputs")]
 impl<'v> StarlarkValue<'v> for InputHandle {
     fn get_methods() -> Option<&'static Methods> {
