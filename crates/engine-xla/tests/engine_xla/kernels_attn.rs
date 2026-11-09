@@ -1261,8 +1261,11 @@ fn kv_append_writes_a_prefill_by_pages() {
             page.push(b[kp / ps]);
             off.push((kp % ps) as i32);
         }
-        page.push(i32::MAX);
-        off.push(0);
+        // padded rows to a whole page of rows (144)
+        while page.len() % ps != 0 {
+            page.push(i32::MAX);
+            off.push(0);
+        }
         let n = page.len();
         let k = rng.bf16s(n * w, 1.0);
         let v = rng.bf16s(n * w, 1.0);

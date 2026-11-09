@@ -2306,6 +2306,7 @@ pub(crate) fn scatter_slots(
     let paged = i64::from(n) >= PAGE_WRITE_ROWS
         && ps >= 8
         && slots % ps == 0
+        && i64::from(n) % ps == 0
         && pairs.iter().all(|(src, plane)| {
             plane.rows == pairs[0].1.rows && src.rows == n && f.elem(src.val) == Elem::Bf16
         });
@@ -2476,9 +2477,10 @@ fn pick(f: &mut Func, v: Val, at: Val) -> Built<Val> {
 }
 
 /// The runs' pages written whole: each page's old rows read back, its run's
-/// rows laid over them, the page scattered as one block. A run's rows are
-/// picked by a one-hot product (`[m·ps, n] · [n, w]`, exact: one term a row),
-/// as a row gather lowers to a loop of row slices on a TPU.
+/// rows laid over them, the page scattered as one block. A run's rows lie in
+/// two whole source tiles, read as blocks and picked by a one-hot product
+/// (`[ps, 2·ps] · [2·ps, w]` a run, exact: one term a row), as a gather of
+/// rows at an offset lowers to a loop of row slices on a TPU.
 fn page_writes(
     f: &mut Func,
     pairs: &[(Operand, Operand)],
@@ -2498,17 +2500,30 @@ fn page_writes(
     let ge = f.compare(Cmp::Ge, r, lo)?;
     let lt = f.compare(Cmp::Lt, r, hi)?;
     let laid = f.and(ge, lt)?;
-    // the source row of each laid slot: its run's start, then its place in the run
+    // a run's rows start `first` rows before its source row `start`; the
+    // source padded by a tile in front, they lie in tiles `tile` and `tile + 1`
     let from = f.sub(runs.start, runs.first)?;
-    let from = f.broadcast(from, &[m, ps], &[0])?;
-    let from = f.add(from, r)?;
-    let none = f.like_i(from, -1);
-    let from = f.select(laid, from, none)?;
-    let from = f.reshape(from, &[m * ps])?;
-    let from = f.broadcast(from, &[m * ps, n], &[0])?;
-    let io = f.iota(Elem::I32, &[m * ps, n], 1);
-    let pick = f.compare(Cmp::Eq, from, io)?;
+    let from = with_i(f, from, ps, Func::add)?;
+    let tile = with_i(f, from, ps, Func::div)?;
+    let lead = with_i(f, from, ps, Func::rem)?;
+    let tile = f.reshape(tile, &[m, 1])?;
+    let next = with_i(f, tile, 1, Func::add)?;
+    let lead = f.broadcast(lead, &[m, ps], &[0])?;
+    let want = f.add(lead, r)?;
+    let none = f.like_i(want, -1);
+    let want = f.select(laid, want, none)?;
+    let want = f.broadcast(want, &[m, ps, 2 * ps], &[0, 1])?;
+    let k = f.iota(Elem::I32, &[m, ps, 2 * ps], 2);
+    let pick = f.compare(Cmp::Eq, want, k)?;
     let pick = f.convert(pick, Elem::Bf16);
+    let tiles = (n + 3 * ps) / ps;
+    let whole = GatherDims {
+        offset_dims: vec![1, 2],
+        collapsed_slice_dims: vec![0],
+        start_index_map: vec![0],
+        index_vector_dim: 1,
+        ..GatherDims::default()
+    };
     let mut out: Vec<Val> = Vec::with_capacity(pairs.len());
     for (at_pair, &(src, plane)) in pairs.iter().enumerate() {
         let table = match at_pair.checked_sub(1) {
@@ -2518,22 +2533,16 @@ fn page_writes(
         let w = i64::from(plane.width);
         let elem = f.elem(table);
         let p3 = f.reshape(table, &[pages, ps, w])?;
-        let old = f.gather(
-            p3,
-            read,
-            &GatherDims {
-                offset_dims: vec![1, 2],
-                collapsed_slice_dims: vec![0],
-                start_index_map: vec![0],
-                index_vector_dim: 1,
-                ..GatherDims::default()
-            },
-            &[1, ps, w],
-        )?;
+        let old = f.gather(p3, read, &whole, &[1, ps, w])?;
         let rows = f.convert(src.val, Elem::Bf16);
-        let new = f.dot_general(pick, rows, &[], &[], &[1], &[0], Elem::F32)?;
+        let zero = f.const_f(Elem::Bf16, 0.0, &[]);
+        let rows = f.pad(rows, zero, &[ps, 0], &[2 * ps, 0], &[0, 0])?;
+        let rows = f.reshape(rows, &[tiles, ps, w])?;
+        let lo = f.gather(rows, tile, &whole, &[1, ps, w])?;
+        let hi = f.gather(rows, next, &whole, &[1, ps, w])?;
+        let both = f.concat(&[lo, hi], 1)?;
+        let new = f.dot_general(pick, both, &[0], &[0], &[2], &[1], Elem::F32)?;
         let new = f.convert(new, elem);
-        let new = f.reshape(new, &[m, ps, w])?;
         let mask = f.broadcast(laid, &[m, ps, w], &[0, 1])?;
         let merged = f.select(mask, new, old)?;
         let written = f.scatter_hinted(
