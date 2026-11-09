@@ -204,10 +204,16 @@ impl Shell {
             index.push(at);
         }
         // Each compile holds its program's whole HLO and compile state in
-        // host memory: at most 8 at once.
+        // host memory: at most 8 at once, and no more than the host's free
+        // memory holds at ~1 GiB a MiB of the longest text (v6e,
+        // Qwen3.6-35B-A3B's 12 MiB fires: 108 GB for eight; a v5e host's 47
+        // GB stopped answering).
+        let longest = texts.iter().map(|(t, _)| t.len() as u64).max().unwrap_or(0);
+        let room = available_memory().map_or(8, |b| b / (longest << 10).max(1)) as usize;
         let threads = std::thread::available_parallelism()
             .map_or(1, |n| n.get())
             .min(8)
+            .min(room)
             .clamp(1, texts.len().max(1));
         let next = std::sync::atomic::AtomicUsize::new(0);
         let device = &self.device;
@@ -331,4 +337,13 @@ impl Shell {
 /// token lands in the last slot of its `p`-th page; a fresh lane holds none.
 fn held_of(want: &Want, page_size: u32) -> u32 {
     (want.held_pages * page_size).saturating_sub(want.rows.min(1))
+}
+
+/// The host memory free for new allocations (`MemAvailable`), where the host
+/// says.
+fn available_memory() -> Option<u64> {
+    let info = std::fs::read_to_string("/proc/meminfo").ok()?;
+    let line = info.lines().find(|l| l.starts_with("MemAvailable:"))?;
+    let kib: u64 = line.split_whitespace().nth(1)?.parse().ok()?;
+    Some(kib << 10)
 }
