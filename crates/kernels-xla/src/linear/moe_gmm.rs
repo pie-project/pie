@@ -22,6 +22,14 @@
 //! Tiling follows tpu-inference's megablox/`gmm_v2` (tokamax): a group-to-
 //! tile schedule in scalar prefetch, the rhs block indexed by the tile's
 //! group, the tile's rows masked by the caller.
+//!
+//! A plain bank under one whole-`N` block (`Gmm::prefetching`) is instead
+//! copied by the kernel itself into two VMEM slots: a run's first tile
+//! waits for its expert's copy and starts the next run's, so an expert's
+//! weights stream in while the run before it computes (the pipeline
+//! fetches a block one step ahead, one tile at most). Two more i32
+//! `[tiles]` operands follow `nt`: each tile's run and the next run's
+//! expert (-1 after the last).
 
 use crate::hlo::{Built, Elem, Malformed};
 use crate::mosaic::{Body, Compiled, Grid, ICmp, Kernel, MTy, Operand, Sem, Space, V, Window};
@@ -240,7 +248,12 @@ impl Gmm {
             name: "gmm".into(),
             grid: vec![1, self.tiles],
             semantics: vec![Sem::Arbitrary, Sem::Arbitrary],
-            prefetch: vec![vec![self.tiles], vec![1], vec![self.tiles], vec![self.tiles]],
+            prefetch: vec![
+                vec![self.tiles],
+                vec![1],
+                vec![self.tiles],
+                vec![self.tiles],
+            ],
             ins: vec![xs, bank],
             outs: vec![out],
             vmem_limit: Some(limit as u64),

@@ -418,7 +418,9 @@ impl Body {
             MTy::Ref(rd, e, sp) if rd.len() == at.len() && dims.len() == rd.len() => {
                 MTy::Ref(dims.to_vec(), e, sp)
             }
-            MTy::Sem(rd) if rd.len() == at.len() && dims.len() == rd.len() => MTy::Sem(dims.to_vec()),
+            MTy::Sem(rd) if rd.len() == at.len() && dims.len() == rd.len() => {
+                MTy::Sem(dims.to_vec())
+            }
             t => return bad(format!("a {dims:?} slice of {t}")),
         };
         let mut ops = vec![r];
