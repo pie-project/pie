@@ -55,7 +55,7 @@ use crate::tuning::{MoePath, Tuning};
 const MXFP4_BLOCK: u32 = 32;
 
 /// Pairs past which a block-FP8 bank decodes to bf16 for the fire.
-const TILE_PAIRS: i64 = 4096;
+const TILE_PAIRS: i64 = 2048;
 
 fn nonzero(op: &'static str, what: &str, v: u32) -> Result<u32, Error> {
     if v == 0 {
@@ -1170,7 +1170,7 @@ pub(crate) fn tile_projection(
     let n = f.dims(codes)[0];
     // Past a few hundred rows the kernel's 128-deep dots leave the MXU half
     // idle: a prompt's rows read the weight decoded once instead.
-    if !tuning.moe_gmm() || k % TILE != 0 || m > 512 {
+    if !tuning.moe_gmm() || k % TILE != 0 || m > 256 {
         return Ok(None);
     }
     let tm = (((m + 15) / 16) * 16).min(tuning.moe_gmm_tm.max(16) * 16).max(16);
