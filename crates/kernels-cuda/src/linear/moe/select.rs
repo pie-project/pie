@@ -679,9 +679,21 @@ pub fn matmul_select_bias(
     routes: Tensor,
     y: &mut Tensor,
     seat: GroupSeat,
+    experts: ExpertTable,
 ) -> Result<(), Error> {
     const OP: &str = "linear.moe_select";
-    matmul_select_mxfp4(ctx, OP, x, codes, scales, Some(bias), routes, y, seat)
+    matmul_select_mxfp4(
+        ctx,
+        OP,
+        x,
+        codes,
+        scales,
+        Some(bias),
+        routes,
+        y,
+        seat,
+        experts,
+    )
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -694,10 +706,13 @@ pub fn matmul_select_quant(
     routes: Tensor,
     y: &mut Tensor,
     seat: GroupSeat,
+    experts: ExpertTable,
 ) -> Result<(), Error> {
     const OP: &str = "linear.moe_select";
     match biases {
-        None => matmul_select_mxfp4(ctx, OP, x, codes, scales, None, routes, y, seat),
-        Some(biases) => matmul_select_mlxu4(ctx, OP, x, codes, scales, biases, routes, y, seat),
+        None => matmul_select_mxfp4(ctx, OP, x, codes, scales, None, routes, y, seat, experts),
+        Some(biases) => {
+            matmul_select_mlxu4(ctx, OP, x, codes, scales, biases, routes, y, seat, experts)
+        }
     }
 }

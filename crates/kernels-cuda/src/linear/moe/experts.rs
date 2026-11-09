@@ -141,7 +141,7 @@ pub fn select_glu(
         bias,
     } = bank
         && mxfp4_mma_spans(ctx, fan.route_count, codes.rows)
-        && !experts.tabled()
+        && !experts.streams()
         && x.dtype == Dtype::Bf16
         && x.width > 0
         && x.width.is_multiple_of(32)
@@ -159,6 +159,7 @@ pub fn select_glu(
             Some(glu),
             None,
             false,
+            experts,
         )?;
         return Ok(true);
     }
@@ -183,6 +184,7 @@ pub fn select_glu(
             Some(glu),
             Some(tensor_scales),
             false,
+            experts,
         )?;
         return Ok(true);
     }

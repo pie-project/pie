@@ -1,6 +1,7 @@
 #include "linear/codec.cuh"
 #include "linear/act_quant.cuh"
 #include "linear/moe_w4.cuh"
+#include "linear/moe/table.cuh"
 
 namespace pie::linear {
 
@@ -90,7 +91,8 @@ __global__ void __launch_bounds__(256 * kGroups, 1) moe_select_mxfp4_w4a8(
     int num_experts,
     int inter,
     float limit,
-    float galpha)
+    float galpha,
+    const u64* __restrict__ expert_table)
 {
     constexpr int kNb = 8;
     constexpr int kTiles = 2;
@@ -133,8 +135,8 @@ __global__ void __launch_bounds__(256 * kGroups, 1) moe_select_mxfp4_w4a8(
     const int chunks = k >> 7;
     const long long row_bytes = k >> 1;
     const int sf_row = k >> 5;
-    const u8* w_e = codes + static_cast<long long>(expert) * n * row_bytes;
-    const u8* s_e = scales + static_cast<long long>(expert) * n * sf_row;
+    const u8* w_e = expert_plane(codes, 1LL * n * row_bytes, expert_table, 3, 0, expert);
+    const u8* s_e = expert_plane(scales, 1LL * n * sf_row, expert_table, 3, 1, expert);
 
     // The stage row this thread copies: warp tid / 32's tile (tid / 16) % 2,
     // half (tid / 8) % 2, row tid % 8, as the warp's lanes read it.
@@ -243,7 +245,7 @@ __global__ void __launch_bounds__(256 * kGroups, 1) moe_select_mxfp4_w4a8(
     asm volatile("cp.async.wait_group 0;\n" ::);
     if (!rows_live || count <= 64 * group) return;
 
-    const bf16* b_e = bias != nullptr ? bias + static_cast<long long>(expert) * n : nullptr;
+    const bf16* b_e = bias != nullptr ? expert_plane(bias, 1LL * n, expert_table, 3, 2, expert) : nullptr;
     auto factor = [](int) { return 1.f; };
     w4mma::w4_land<kGlu, kTiles, kNb>(acc, factor, b_e, order, begin + 64 * group, count - 64 * group, out, n, inter,
                                       row_base, g, c, limit, galpha);
@@ -363,7 +365,9 @@ __global__ void __launch_bounds__(512, 1) moe_select_mxfp4_w4a8_tma(
     int num_experts,
     int inter,
     float limit,
-    float galpha)
+    float galpha,
+    const u64* __restrict__ expert_table,
+    u64 expert_window)
 {
     constexpr int kNb = 8;
     constexpr int kTiles = 2;
@@ -399,10 +403,13 @@ __global__ void __launch_bounds__(512, 1) moe_select_mxfp4_w4a8_tma(
 
     const int chunks = k >> 7;
     const int sf_row = k >> 5;
-    const u8* s_e = scales + static_cast<long long>(expert) * n * sf_row;
+    const u8* s_e = expert_plane(scales, 1LL * n * sf_row, expert_table, 3, 1, expert);
     // The bank rows of the two boxes: 256 in order, or the GLU's gate and up.
-    const int w_y0 = expert * n + cta_row;
-    const int w_y1 = kGlu != 0 ? expert * n + inter + cta_row : w_y0 + 128;
+    // `map_w` spans the bank, or the table's window: the expert's first row in it.
+    const int w_e = static_cast<int>(
+        expert_row(expert_table, 3, 0, expert, n, expert_window, k >> 1));
+    const int w_y0 = w_e + cta_row;
+    const int w_y1 = kGlu != 0 ? w_e + inter + cta_row : w_y0 + 128;
 
     // Stages 1024-aligned for the 128B swizzle; the barriers past them.
     extern __shared__ __align__(1024) unsigned char w4a8_tma_smem[];
@@ -511,7 +518,7 @@ __global__ void __launch_bounds__(512, 1) moe_select_mxfp4_w4a8_tma(
     }
     if (!rows_live || count <= 8 * kNb * group) return;
 
-    const bf16* b_e = bias != nullptr ? bias + static_cast<long long>(expert) * n : nullptr;
+    const bf16* b_e = bias != nullptr ? expert_plane(bias, 1LL * n, expert_table, 3, 2, expert) : nullptr;
     auto factor = [](int) { return 1.f; };
     w4mma::w4_land<kGlu, kTiles, kNb>(acc, factor, b_e, order, begin + 8 * kNb * group,
                                       count - 8 * kNb * group, out, n, inter, row_base, g, c, limit, galpha);
@@ -584,7 +591,9 @@ __global__ void __launch_bounds__(384, 1) moe_select_mxfp4_w4a8_ws(
     int num_experts,
     int inter,
     float limit,
-    float galpha)
+    float galpha,
+    const u64* __restrict__ expert_table,
+    u64 expert_window)
 {
     constexpr int kNb = 8;
     constexpr int kTiles = 4;
@@ -625,7 +634,9 @@ __global__ void __launch_bounds__(384, 1) moe_select_mxfp4_w4a8_ws(
             const int expert = item >> 16;
             const int begin = offsets[expert] + (item & 0xFFFF) * 128;
             if (offsets[expert + 1] - begin <= 0) continue;
-            const int w_y = expert * n + (job % tiles) * 256;
+            const int w_y = static_cast<int>(
+                expert_row(expert_table, 3, 0, expert, n, expert_window, k >> 1))
+                + (job % tiles) * 256;
             for (int ch = 0; ch < chunks; ++ch) {
                 w4a8::bar_wait(empty + s, ph ^ 1);
                 unsigned char* st = ring + s * kStage;
@@ -674,7 +685,7 @@ __global__ void __launch_bounds__(384, 1) moe_select_mxfp4_w4a8_ws(
         const int cta_row = (job % tiles) * 256;
         const int row_base = cta_row + wr * 64;
         const int live = row_base < n ? min(max(count - wc * 64, 0), 64) : 0;
-        const u8* s_e = scales + static_cast<long long>(expert) * n * sf_row;
+        const u8* s_e = expert_plane(scales, 1LL * n * sf_row, expert_table, 3, 1, expert);
         // The rows' scales four chunks a load: lane c's row (g, or g + 8 at
         // odd c) at chunks 4q + 2 (c / 2).., a chunk's word shuffled from
         // its lane; the routes' a chunk (chunk-major, a block one sector).
@@ -772,7 +783,7 @@ __global__ void __launch_bounds__(384, 1) moe_select_mxfp4_w4a8_ws(
         // Land each 8-route block's routes 2c, 2c + 1 (a bf16 pair a row
         // 8m + g) transposed over the quad's eight g: lane g then holds
         // rows 8g..8g+7 of both, a 16-byte store each.
-        const bf16* b_e = bias != nullptr ? bias + static_cast<long long>(expert) * n : nullptr;
+        const bf16* b_e = bias != nullptr ? expert_plane(bias, 1LL * n, expert_table, 3, 2, expert) : nullptr;
         const int rows8 = row_base + 8 * g;
 #pragma unroll
         for (int b = 0; b < kNb; ++b) {
@@ -888,7 +899,8 @@ __global__ void __launch_bounds__(256 * kGroups, 1) moe_select_nvfp4_w4a4(
     int act_div,
     int n,
     int k,
-    int num_experts)
+    int num_experts,
+    const u64* __restrict__ expert_table)
 {
     constexpr int kNb = 8;
     constexpr int kTiles = 2;
@@ -929,8 +941,8 @@ __global__ void __launch_bounds__(256 * kGroups, 1) moe_select_nvfp4_w4a4(
     const int chunks = k >> 7;
     const long long row_bytes = k >> 1;
     const int sf_row = k >> 4;
-    const u8* w_e = codes + static_cast<long long>(expert) * n * row_bytes;
-    const u8* s_e = scales + static_cast<long long>(expert) * n * sf_row;
+    const u8* w_e = expert_plane(codes, 1LL * n * row_bytes, expert_table, 4, 0, expert);
+    const u8* s_e = expert_plane(scales, 1LL * n * sf_row, expert_table, 4, 1, expert);
 
     const int own = tid % 256;
     const int own_half = tid / 256;
@@ -1032,8 +1044,8 @@ __global__ void __launch_bounds__(256 * kGroups, 1) moe_select_nvfp4_w4a4(
     asm volatile("cp.async.wait_group 0;\n" ::);
     if (!rows_live || count <= 64 * group) return;
 
-    const float* ts_e = tensor_scales + static_cast<long long>(expert) * n;
-    const float in_scale = input_scales[expert];
+    const float* ts_e = expert_plane(tensor_scales, 1LL * n, expert_table, 4, 2, expert);
+    const float in_scale = *expert_plane(input_scales, 1LL, expert_table, 4, 3, expert);
     auto factor = [&](int row) { return ts_e[row] * in_scale; };
     w4mma::w4_land<0, kTiles, kNb>(acc, factor, nullptr, order, begin + 64 * group, count - 64 * group, out, n, n,
                                    row_base, g, c, 0.f, 0.f);

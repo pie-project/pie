@@ -2,6 +2,7 @@
 #include "linear/wgmma.cuh"
 #include "linear/grouped_fp8.cuh"
 #include "linear/moe_w4.cuh"
+#include "linear/moe/table.cuh"
 #include "linear/w8a16.cuh"
 
 namespace pie::linear {
@@ -308,7 +309,8 @@ __global__ void __launch_bounds__(128 * kWg, kWg == 2 ? 1 : kSlice == 64 ? 3 : 2
     const bf16* __restrict__ act, const i32* __restrict__ order, const i32* __restrict__ offsets,
     const i32* __restrict__ work, const u8* __restrict__ codes, const u8* __restrict__ scales,
     const bf16* __restrict__ bias, bf16* __restrict__ out, int act_div, int n, int k,
-    int num_experts, int inter, float limit, float galpha, const float* __restrict__ tscale) {
+    int num_experts, int inter, float limit, float galpha, const float* __restrict__ tscale,
+    const u64* __restrict__ expert_table) {
     constexpr int kT = 2;
     constexpr int kThreads = 128 * kWg;
     // A stage: the routes' two K-major atoms (128 codes), then the CTA's
@@ -357,9 +359,9 @@ __global__ void __launch_bounds__(128 * kWg, kWg == 2 ? 1 : kSlice == 64 ? 3 : 2
     // A last chunk of 64 codes: the K steps it holds.
     const int tail_steps = (k & 127) != 0 ? (k & 127) >> 4 : 8;
     const long long row_bytes = k >> 1;
-    const u8* w_e = codes + static_cast<long long>(expert) * n * row_bytes;
+    const u8* w_e = expert_plane(codes, 1LL * n * row_bytes, expert_table, 3, 0, expert);
     const int sf_row = kNv ? k >> 4 : k >> 5;
-    const u8* s_e = scales + static_cast<long long>(expert) * n * sf_row;
+    const u8* s_e = expert_plane(scales, 1LL * n * sf_row, expert_table, 3, 1, expert);
 
     // This thread's route runs' rows (-1 past the slice), and its code and
     // scale runs' bank rows, clamped into the bank (a row past it lands
@@ -557,8 +559,8 @@ __global__ void __launch_bounds__(128 * kWg, kWg == 2 ? 1 : kSlice == 64 ? 3 : 2
     }
     asm volatile("cp.async.wait_group 0;\n" ::);
 
-    const bf16* b_e = bias != nullptr ? bias + static_cast<long long>(expert) * n : nullptr;
-    const float* t_e = kNv ? tscale + static_cast<long long>(expert) * n : nullptr;
+    const bf16* b_e = bias != nullptr ? expert_plane(bias, 1LL * n, expert_table, 3, 2, expert) : nullptr;
+    const float* t_e = kNv ? expert_plane(tscale, 1LL * n, expert_table, 3, 2, expert) : nullptr;
     auto factor = [&](int row) { return kNv ? t_e[row] * 256.f : 1.f; };
     if (row_base >= span) return;
     w4mma::w4_land<kGlu, kT, kSlice / 8, 64>(acc, factor, b_e, order, begin, count, out, n, inter, row_base,

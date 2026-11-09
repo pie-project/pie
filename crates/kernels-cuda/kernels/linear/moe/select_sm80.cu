@@ -10,6 +10,7 @@
 #include <mma.h>
 #endif
 #include "linear/moe_w4.cuh"
+#include "linear/moe/table.cuh"
 #include "linear/w8a16.cuh"
 #include "linear/quant.cuh"
 
@@ -1596,7 +1597,8 @@ __global__ void moe_matmul_select_mxfp4_wmma(
     int k,
     int num_experts,
     const MoeGroupBases* __restrict__ bases,
-    unsigned int* __restrict__ group_hits)
+    unsigned int* __restrict__ group_hits,
+    const u64* __restrict__ expert_table)
 {
     namespace wmma = ::nvcuda::wmma;
     constexpr int kTileN = 128;
@@ -1633,11 +1635,11 @@ __global__ void moe_matmul_select_mxfp4_wmma(
         scales_at = seat.scales;
     }
     const unsigned* w32 = reinterpret_cast<const unsigned*>(
-        codes_at + static_cast<long long>(expert) * n * (k / 2));
-    const u8* s8 = scales_at + static_cast<long long>(expert) * n * groups_per_row;
+        expert_plane(codes_at, 1LL * n * (k / 2), expert_table, 3, 0, expert));
+    const u8* s8 = expert_plane(scales_at, 1LL * n * groups_per_row, expert_table, 3, 1, expert);
 
     const bf16* b_row =
-        bias != nullptr ? bias + static_cast<long long>(expert) * n : nullptr;
+        bias != nullptr ? expert_plane(bias, 1LL * n, expert_table, 3, 2, expert) : nullptr;
 
     __shared__ __align__(32) bf16 w_tile[kTileN][kLd];
     __shared__ __align__(32) bf16 x_tile[kRoutes][kLd];
@@ -1857,7 +1859,8 @@ __global__ void moe_matmul_select_mlxu4_wmma(
     int k,
     int num_experts,
     const MoeGroupBases* __restrict__ bases,
-    unsigned int* __restrict__ group_hits)
+    unsigned int* __restrict__ group_hits,
+    const u64* __restrict__ expert_table)
 {
     namespace wmma = ::nvcuda::wmma;
     constexpr int kTileN = 128;
@@ -1895,11 +1898,11 @@ __global__ void moe_matmul_select_mlxu4_wmma(
         biases_at = seat.biases;
     }
     const unsigned* w32 = reinterpret_cast<const unsigned*>(
-        codes_at + static_cast<long long>(expert) * n * words_per_row * 4);
+        expert_plane(codes_at, 1LL * n * words_per_row * 4, expert_table, 3, 0, expert));
     const bf16* s16 = reinterpret_cast<const bf16*>(
-        scales_at + static_cast<long long>(expert) * n * groups_per_row * 2);
+        expert_plane(scales_at, 1LL * n * groups_per_row * 2, expert_table, 3, 1, expert));
     const bf16* b16 = reinterpret_cast<const bf16*>(
-        biases_at + static_cast<long long>(expert) * n * groups_per_row * 2);
+        expert_plane(biases_at, 1LL * n * groups_per_row * 2, expert_table, 3, 2, expert));
 
     __shared__ __align__(32) bf16 w_tile[kTileN][kLd];
     __shared__ __align__(32) bf16 x_tile[kRoutes][kLd];
