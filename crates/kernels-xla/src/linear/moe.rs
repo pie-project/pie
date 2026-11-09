@@ -2163,25 +2163,21 @@ pub fn bias_sum(
     let xv = x.f32(f);
     let b = bias.val;
     let b = f.reshape(b, &[experts, w])?;
-    let r = routes.val;
-    let r = f.reshape(r, &[t * k])?;
-    let zero = f.const_i(Elem::I32, 0, &[t * k]);
-    let routed = f.compare(Cmp::Ge, r, zero)?;
-    let lo = f.const_i(Elem::I32, 0, &[]);
-    let hi = f.const_i(Elem::I32, experts - 1, &[]);
-    let ids = f.clamp(lo, r, hi)?;
-    let rows = f.take_rows(b, ids)?;
-    // Folded while bf16, as `weighted_sum` folds its rows.
-    let rows = f.reshape(rows, &[t, k, w])?;
-    let rows = f.convert(rows, Elem::F32);
-    let g = weights.val;
-    let g = f.reshape(g, &[t * k])?;
-    let zf = f.const_f(Elem::F32, 0.0, &[t * k]);
-    let g = f.select(routed, g, zf)?;
-    let g = f.reshape(g, &[t, k])?;
-    let g = f.broadcast(g, &[t, k, w], &[0, 1])?;
-    let v = f.mul(rows, g)?;
-    let v = f.reduce(v, &[1], Fold::Sum)?;
+    // Each row's weights spread over the experts (`[T, E]`, nothing where a
+    // slot is unrouted) against the bias table in one f32 product, where a
+    // bias row gathered a pair and folded cost ~0.2 ms a layer (v5e gpt-oss
+    // 1792-row prefill).
+    let r = f.reshape(routes.val, &[t, k])?;
+    let r = f.broadcast(r, &[t, k, experts], &[0, 1])?;
+    let at = f.iota(Elem::I32, &[t, k, experts], 2);
+    let hit = f.compare(Cmp::Eq, r, at)?;
+    let g = f.reshape(weights.val, &[t, k])?;
+    let g = f.broadcast(g, &[t, k, experts], &[0, 1])?;
+    let zf = f.const_f(Elem::F32, 0.0, &[t, k, experts]);
+    let g = f.select(hit, g, zf)?;
+    let g = f.reduce(g, &[1], Fold::Sum)?;
+    let b = f.convert(b, Elem::F32);
+    let v = f.dot_general(g, b, &[], &[], &[1], &[0], Elem::F32)?;
     let v = f.add(xv, v)?;
     Ok(v)
 }
