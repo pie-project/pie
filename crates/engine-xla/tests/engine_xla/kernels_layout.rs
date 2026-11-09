@@ -71,7 +71,7 @@ fn embeds_and_select_answer_the_host() {
                 let ids_v = l.read(ci)?;
                 let table_v = l.read(t)?;
                 let o_y = cy;
-                let v = gather::embed_concat(l.f(), ids_v, table_v, vocab, o_y.landing())?;
+                let v = gather::embed_concat(l.f(), ids_v, table_v, vocab, 1, o_y.landing())?;
                 l.land(o_y, v)
             })?;
             engine_xla::lower::lower(ctx, |l| {
