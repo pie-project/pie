@@ -1810,9 +1810,10 @@ pub enum ExpertGlu {
 /// A routed MLP over dense banks on one sort: the gate-up select, its GLU
 /// and the down select on the same routes run tile by tile in the
 /// grouped-matmul kernel's sorted layout, so the rows between the legs are
-/// never put back in pair order and gathered again; then each token's routed
-/// rows, weighted, summed in f32. Each valid pair's rows are the ones the
-/// three ops land apart. `None` (nothing landed) where the kernel does not
+/// never put back in pair order and gathered again; each row weighted
+/// before the down leg, and each token's rows summed in f32. Each valid
+/// pair's rows are the ones the three ops land apart, to bf16 rounding.
+/// `None` (nothing landed) where the kernel does not
 /// take both banks in one layout, or the fire is a slice's (`routed`).
 #[allow(clippy::too_many_arguments)]
 pub fn experts(
