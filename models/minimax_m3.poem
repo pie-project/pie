@@ -45,11 +45,13 @@ DEPLOYMENTS = [
 # their indexer picks per kv head, with routed experts and one shared. Every
 # MLP is a clamped SwiGLU-OAI.
 
-def dims(layers = 60, experts = 128, theta = 5000000.0):
+def dims(layers = 60, experts = 128, theta = 5000000.0, indexed_from = 3):
     return struct(
         hidden = 6144,
         layers = layers,
         dense_layers = 3,
+        # the first layer with an indexer: M3 dense attention before it, M3.1-Flash none
+        indexed_from = indexed_from,
         q_heads = 64,
         kv_heads = 4,
         head_dim = 128,
@@ -71,8 +73,8 @@ def dims(layers = 60, experts = 128, theta = 5000000.0):
 DIMS = {
     "minimax-m3": dims(),
     "minimax-m3-mini": dims(layers = 6, experts = 8),
-    "minimax-m31-flash": dims(theta = 10000000.0),
-    "minimax-m31-flash-mini": dims(layers = 6, experts = 8, theta = 10000000.0),
+    "minimax-m31-flash": dims(theta = 10000000.0, indexed_from = 0),
+    "minimax-m31-flash-mini": dims(layers = 6, experts = 8, theta = 10000000.0, indexed_from = 0),
 }
 
 NV4 = dtype.nvfp4a4
@@ -163,7 +165,8 @@ def layout(id, deploy):
     d = DIMS[id]
     if deploy.layers or deploy.experts or mixed:
         # MiniMax-M3.1-Flash (the mixed release) states rope_theta 1e7, M3 5e6
-        d = dims(layers = deploy.layers or d.layers, experts = deploy.experts or d.experts, theta = 10000000.0 if mixed else d.theta)
+        d = dims(layers = deploy.layers or d.layers, experts = deploy.experts or d.experts, theta = 10000000.0 if mixed else d.theta,
+                 indexed_from = 0 if mixed else d.indexed_from)
     mix = mix_of(deploy.weights if mixed else deploy.weights[0])
     dense = compute(mix.proj)
 
@@ -173,7 +176,7 @@ def layout(id, deploy):
         return struct(
             attn_norm = weight([d.hidden]),
             attn = attention(n, d, mix.proj, dense, "kv.{}".format(l)),
-            indexer = indexer(n, d, dense, "index.{}".format(l), mix.index) if sparse else None,
+            indexer = indexer(n, d, dense, "index.{}".format(l), mix.index) if l >= d.indexed_from else None,
             mlp_norm = weight([d.hidden]),
             mlp = routed(n, d, mix, dense) if sparse else None,
             dense = None if sparse else mlp(d, d.dense_inter, mix.proj),
