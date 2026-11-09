@@ -28,11 +28,17 @@ impl Run<'_> {
         // A latent attention through a selection of every key its rows see
         // reads their causal range: the unselected walk (blocked for a
         // prompt), not a gather of each row's list.
-        if let Attn::MlaDecode { selection: Some(s), .. } | Attn::MlaPrefill { selection: Some(s), .. } = op
+        if let Attn::MlaDecode {
+            selection: Some(s), ..
+        }
+        | Attn::MlaPrefill {
+            selection: Some(s), ..
+        } = op
             && self.full_selections.contains(s)
         {
             let mut op = op.clone();
-            if let Attn::MlaDecode { selection, .. } | Attn::MlaPrefill { selection, .. } = &mut op {
+            if let Attn::MlaDecode { selection, .. } | Attn::MlaPrefill { selection, .. } = &mut op
+            {
                 *selection = None;
             }
             return self.attention(&op);
