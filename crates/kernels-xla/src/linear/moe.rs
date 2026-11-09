@@ -54,6 +54,9 @@ use crate::tuning::{MoePath, Tuning};
 
 const MXFP4_BLOCK: u32 = 32;
 
+/// Pairs past which a block-FP8 bank decodes to bf16 for the fire.
+const TILE_PAIRS: i64 = 4096;
+
 fn nonzero(op: &'static str, what: &str, v: u32) -> Result<u32, Error> {
     if v == 0 {
         return Err(refuse(op, format!("`{what}` is zero")));
@@ -1811,6 +1814,17 @@ fn routed(
     let hi = f.const_i(Elem::I32, e - 1, &[]);
     let ids = f.clamp(lo, r, hi)?;
     let bank = read_bank(f, form, fan)?;
+    // A prompt's pairs: a block-FP8 bank decodes to bf16 once and runs as a
+    // bf16 bank (the FP8 kernel's 128-deep dots leave the MXU half idle).
+    let bank = if matches!(form, Form::Tile { .. }) && p > TILE_PAIRS {
+        Read {
+            codes: Codes::Weights(decode(f, &bank, groups)?),
+            factor: None,
+            bias: None,
+        }
+    } else {
+        bank
+    };
     let x = f.convert(x, Elem::Bf16);
     let rows = f.dims(x)[0];
     let r8 = (rows + 7) / 8 * 8;
