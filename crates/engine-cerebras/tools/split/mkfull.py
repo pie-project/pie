@@ -42,7 +42,8 @@ DEF = [("NPX", 1),                                          # head: x in one f16
        ("SILU16", 1), ("CONVQK", 1), ("ATTV", 1), ("GDEC", 1), ("ATTL", 2),   # CY / weight levers
        ("FIFOW", 32),
        ("GATE", 1), ("SLW", 0),                                 # CY: attention's output gate (Qwen3: 0), silu16's tail
-       ("GAPX", 255), ("GAPY", 255),                            # the unit slot left out of the snake (relay PEs)
+       ("GAPX", 255), ("GAPY", 255),
+       ("RLV", 4), ("RBITS", 3),                                # CY RoPE tables: positions < 2^(RBITS RLV) (the prep's)                            # the unit slot left out of the snake (relay PEs)
        ("DIAG", 0), ("TSTAMP", 0), ("XKEEP", 0), ("HACC16", 0), ("WFORCE", 0)]  # diagnostics / measurement
 L = [f"param {p}: u16;" for p in P] + [f"param {p}: u16 = {v};" for p, v in DEF]
 L += ["param kernel_rows: u16 = 0;", "param kernel_cols: u16 = 0;", "param iters: u16 = 0;"]
@@ -81,7 +82,7 @@ L.append('''layout {
         @set_tile_code(x, y, "cx.csl", .{ .memcpy_params = mp, .K = K, .Hc = Hc, .HOSTX = 0, .XG16 = 0, .DIAG = DIAG, .FIFOW = FIFOW, .XKEEP = XKEEP });
       } else if (ly == YC) {
         @set_tile_code(x, y, "cy.csl", .{ .memcpy_params = mp, .K = K, .KM = KM, .NQA = NQA, .NQG = NQG, .Qh = Qh, .Dc = Dc,
-          .DK = DK, .DV = DV, .Ic = Ic, .HR = HR_, .CONV = 4, .NROT = NROT, .HK = HK, .HV = HV, .DIAG = DIAG, .FIFOW = FIFOW, .SILU16 = SILU16, .CONVQK = CONVQK, .ATTV = ATTV, .GDEC = GDEC, .ATTL = ATTL, .TSTAMP = TSTAMP, .GATE = GATE, .SLW = SLW });
+          .DK = DK, .DV = DV, .Ic = Ic, .HR = HR_, .CONV = 4, .NROT = NROT, .HK = HK, .HV = HV, .DIAG = DIAG, .FIFOW = FIFOW, .SILU16 = SILU16, .CONVQK = CONVQK, .ATTV = ATTV, .GDEC = GDEC, .ATTL = ATTL, .TSTAMP = TSTAMP, .GATE = GATE, .SLW = SLW, .RLV = RLV, .RBITS = RBITS });
       } else {
         @set_tile_code(x, y, "weight.csl", .{ .memcpy_params = mp, .K = K, .Hc = Hc, .QO = QO, .Ic = Ic, .MV = 1, .KM = KM,
           .NQA = NQA, .NQG = NQG, .GDN = GDNF, .ATT = ATTF, .DV = DV, .DK = DK, .Qh = Qh, .Dc = Dc, .NE = NE, .PYW = PY, .HD = HD, .DIAG = DIAG, .FIFOW = FIFOW, .GDEC = GDEC, .ATTL = ATTL, .TSTAMP = TSTAMP });

@@ -213,7 +213,10 @@ impl SplitModel {
             vocab: spec.int("V").map_or(vocab, |v| vocab.min(v as usize)),
             hidden: spec.need("H")? as usize,
             cap: spec.int("CAP").unwrap_or(256) as usize,
-            positions: (spec.need("NE")? * g.p.py) as usize,
+            // (bounded by the CY's RoPE tables: RLV digits of RBITS bits, the prep's; 4 x 3 before them)
+            positions: (spec.need("NE")? * g.p.py)
+                .min(1 << (spec.int("RBITS").unwrap_or(3) * spec.int("RLV").unwrap_or(4)).min(31))
+                as usize,
             fed: Vec::new(),
             launches: 0,
             steps: 0,

@@ -455,7 +455,9 @@ pub fn small(ckpt: &Ckpt) -> R<Arrays> {
     let inv: Vec<f64> = (0..32)
         .map(|k| 1.0 / theta.powf((2 * k) as f64 / 64.0))
         .collect();
-    let mut rot = vec![0f32; PX * 128];
+    // RoPE tables: 5 levels of 8 positions (32,768 >= the context NE 64 x PY 256)
+    const RLV: usize = 5;
+    let mut rot = vec![0f32; PX * RLV * 32];
     for p in 0..PX {
         for j in 0..2 {
             let fr = if p % 64 < 16 {
@@ -463,17 +465,17 @@ pub fn small(ckpt: &Ckpt) -> R<Arrays> {
             } else {
                 0.0
             };
-            for lv in 0..4 {
+            for lv in 0..RLV {
                 for d in 0..8 {
-                    let ang = (d * 8usize.pow(3 - lv as u32)) as f64 * fr;
-                    let at = p * 128 + ((lv * 8 + d) * 2) * 2;
+                    let ang = (d * 8usize.pow((RLV - 1 - lv) as u32)) as f64 * fr;
+                    let at = p * RLV * 32 + ((lv * 8 + d) * 2) * 2;
                     rot[at + j] = ang.cos() as f32;
                     rot[at + 2 + j] = ang.sin() as f32;
                 }
             }
         }
     }
-    items.push(("rot".into(), vec![PX, 128], f(rot), false));
+    items.push(("rot".into(), vec![PX, RLV * 32], f(rot), false));
     let nw = vecf(ckpt, &format!("{P}norm.weight"))?;
     items.push((
         "hg".into(),
@@ -596,6 +598,6 @@ pub fn write(ckpt: &Ckpt, dir: &Path, prefix: &str) -> R<()> {
     let meta = serde_json::json!({"PX": 256, "PY": 256, "UNX": 2, "UNY": 4, "HC": 128, "HR": 1153, "VR": 216, "Hc": 16,
         "SWA": 64, "SWG": 16, "SWV": 8, "DKG": 8, "DKH": 128, "has_att": true, "has_gdn": true, "K": 4, "KM": 8,
         "Ic": 48, "NQA": 40, "NQG": 50, "Qh": 4, "Dc": 4, "DK": 8, "DV": 16, "NE": 64, "HD": 256, "NROT": 2,
-        "HK": 128, "HV": 128, "H": H});
+        "HK": 128, "HV": 128, "H": H, "RLV": 5, "RBITS": 3});
     std::fs::write(p("meta.json"), meta.to_string()).map_err(|e| e.to_string())
 }

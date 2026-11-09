@@ -17,8 +17,8 @@
 // - MLP: rms scale, SiLU(g) u (SILU16 1: in f16, streamed into the multicast), multicast act.
 //
 // Interface. Exports cw (conv weights [layer][CONV][channel]), gpar ([A, dt] a GDN layer), gnw
-// (the gated norm's weights), qkw (q / k norm weights), rot (RoPE tables [4 levels][8][cos | sin]
-// [NROT]), tab (host: [position, ...]), rcfg, tdbg, init, compute(steps, start_pos).
+// (the gated norm's weights), qkw (q / k norm weights), rot (RoPE tables [RLV levels][2^RBITS][cos | sin]
+// [NROT]: positions < 2^(RBITS RLV)), tab (host: [position, ...]), rcfg, tdbg, init, compute(steps, start_pos).
 // rcfg (geo.rs rcfg_cy): [0] routes n, [1..1+2n) (colour, low route byte); from RQ: [0..4) iq2..iq5,
 // [4..7) oq2..oq4, [7] the segment role, [8] iq6, [9] iq7, [10] the spare colour.
 // Queues: iq2 / iq3 the column reduction's two halves, oq2 their merge on the loop-back colour,
@@ -56,6 +56,8 @@ param ATTL: u16 = 2;   // 2: the log-sum-exp steps in a second multicast after o
 param TSTAMP: u16 = 0; // 1 (diagnostics): phase stamps into tdbg (on the critical path)
 param FIFOW: u16 = 32; // the reduction's FIFO depth (words)
 param GATE: u16 = 1;   // 1: attention's q_proj carries the output gate (Qwen3.5); 0: none (Qwen3: NQA = Qh Dc q | Dc k | Dc v)
+param RLV: u16 = 4;    // RoPE table levels: a position is RLV digits of RBITS bits (4 x 3: 4,096 positions; 5: 32,768)
+param RBITS: u16 = 3;
 param SLW: u16 = 0;    // 1: silu16 without the f16 subnormal flush (the tail to 2^-24; serve8b_region's SLW)
 
 const sys_mod = @import_module("<memcpy/memcpy>", memcpy_params);
@@ -95,10 +97,11 @@ var gnw = @zeros([if (NLG > 0) NLG * DV else 1]f32);
 var vz = @zeros([2 * mx(DV, 1)]f32);     // v | z (one SiLU pass over both)
 const vz_d = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{2 * mx(DV, 1)} -> vz[i] });
 var gsc = @zeros([4]f32);                  // beta, decay, then the norms' scalars
-// attention per layer: q / k norm weights (Qh Dc, Dc), RoPE tables [4][8][NROT] cos | sin,
+// attention per layer: q / k norm weights (Qh Dc, Dc), RoPE tables [RLV][RB][NROT] cos | sin,
 // the gate kept between the reductions, the LSE reference a head.
 var qkw = @zeros([if (NLA > 0) NLA * (Qh * Dc + Dc) else 1]f32);
-var rot = @zeros([if (NLA > 0) 4 * 8 * 2 * NROT else 1]f32);
+const RB: u16 = 1 << RBITS;
+var rot = @zeros([if (NLA > 0) RLV * RB * 2 * NROT else 1]f32);
 var gate = @zeros([if (NLA > 0 and GATE == 1) Qh * Dc else 1]f32);
 var rc = @zeros([mx(NROT, 1)]f32);
 var rs = @zeros([mx(NROT, 1)]f32);
@@ -505,7 +508,7 @@ fn gdn_post(g: u16, bt: f32) void {
 var rope_at: u32 = 0xffffffff;   // the position rc / rs hold
 fn rope_tables() void { rope_tables_at(tab[0]); }
 fn rope_tables_at(p: u32) void {
-  // cos / sin of position p for each rotated pair: products of 4 table levels
+  // cos / sin of position p for each rotated pair: products of RLV table levels (its RBITS-bit digits)
   if (rope_at == p) { return; }
   rope_at = p;
   var j: u16 = 0;
@@ -513,9 +516,9 @@ fn rope_tables_at(p: u32) void {
     var c: f32 = 1.0;
     var s: f32 = 0.0;
     var lv: u16 = 0;
-    while (lv < 4) : (lv += 1) {
-      const d = @as(u16, (p >> @as(u16, 3 * (3 - lv))) & 7);
-      const o = ((lv * 8 + d) * 2) * NROT + j;
+    while (lv < RLV) : (lv += 1) {
+      const d = @as(u16, (p >> @as(u16, RBITS * (RLV - 1 - lv))) & @as(u32, RB - 1));
+      const o = ((lv * RB + d) * 2) * NROT + j;
       const c2 = rot[o];
       const s2 = rot[o + NROT];
       const cn = c * c2 - s * s2;

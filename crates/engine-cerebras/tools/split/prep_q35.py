@@ -191,13 +191,18 @@ for u in range(ULIM):
 np.save(os.path.join(out, PRE + "gam.npy"), gam)
 for n, arr in (("cw", cw), ("gpar", gpar), ("gnw", gnw), ("qkw", qkw)):
     np.save(os.path.join(out, PRE + n + ".npy"), arr)
-rot = np.zeros((PX, 4, 8, 2, NROT), np.float32)
+# RoPE tables: a position is RLV digits of RBITS bits; RLV covers the context NE PY (at least 4, the 9B's earlier
+# builds); PREP_RBITS / PREP_RLV override (tiny tests put the level boundary at a few positions)
+RBITS = int(os.environ.get("PREP_RBITS", "3"))
+RLV = int(os.environ.get("PREP_RLV", "0")) or max(4, -(-(NE * PY - 1).bit_length() // RBITS))
+RB = 1 << RBITS
+rot = np.zeros((PX, RLV, RB, 2, NROT), np.float32)
 for p in range(PX):
     for j in range(NROT):
         f = inv[(p % cpa) * NROT + j] if p % cpa < nrc else 0.0
-        for lv in range(4):
-            for d in range(8):
-                ang = d * 8 ** (3 - lv) * f
+        for lv in range(RLV):
+            for d in range(RB):
+                ang = d * RB ** (RLV - 1 - lv) * f
                 rot[p, lv, d, 0, j] = np.cos(ang); rot[p, lv, d, 1, j] = np.sin(ang)
 np.save(os.path.join(out, PRE + "rot.npy"), rot.reshape(PX, -1))
 if os.environ.get("PREP_NOHEAD"):
@@ -234,7 +239,7 @@ np.save(os.path.join(out, PRE + "embrows.npy"), np.asarray(eb)[ids])
 shutil.copy(GOLD, os.path.join(out, PRE + "golden.json"))
 meta = dict(PX=PX, PY=PY, UNX=UNX, UNY=UNY, HC=HC, HR=HR, VR=VR, Hc=Hc, SWA=cpa, SWG=cpk, SWV=cpv, DKG=DK, DKH=hk,
             has_att=KM != 0, has_gdn=NLG > 0, K=K, KM=KM, Ic=Ic, NQA=NQA, NQG=NQG, Qh=Qh, Dc=Dc, DK=DK, DV=DV, NE=NE, HD=hd,
-            NROT=NROT, HK=hk, HV=hv, H=H, GATE=GATE, **({"GAPX": GAP[0], "GAPY": GAP[1]} if GAP else {}), EPS=tc.get("rms_norm_eps", 1e-6), V=V, model=os.path.basename(MD.rstrip("/")))
+            NROT=NROT, HK=hk, HV=hv, H=H, GATE=GATE, RLV=RLV, RBITS=RBITS, **({"GAPX": GAP[0], "GAPY": GAP[1]} if GAP else {}), EPS=tc.get("rms_norm_eps", 1e-6), V=V, model=os.path.basename(MD.rstrip("/")))
 json.dump(meta, open(os.path.join(out, PRE + "meta.json"), "w"))
 # the compile params (mkfull.py's layout params) for this prep
 cp = dict(PX=PX, PY=PY, UNX=UNX, UNY=UNY, HC=HC, HR=HR, VR=VR, K=K, KM=KM, Hc=Hc, Ic=Ic, NQA=NQA, NQG=NQG, Qh=Qh, Dc=Dc,
@@ -243,5 +248,7 @@ if Q3:
     cp["GATE"] = 0
 if GAP:
     cp["GAPX"], cp["GAPY"] = GAP
+if (RLV, RBITS) != (4, 3):
+    cp["RLV"], cp["RBITS"] = RLV, RBITS
 open(os.path.join(out, PRE + "params.txt"), "w").write(",".join(f"{k}:{v}" for k, v in cp.items()) + "\n")
 print("prepared", out, json.dumps(meta))
