@@ -1098,9 +1098,10 @@ fn gmm_spec(
         scaled,
         bias: false,
         out: Elem::F32,
-        // mxfp4 banks (pre-scaled) at decode widths, an expert a tile or less:
-        // a prompt's runs of tiles widen their block once instead.
-        prefetch: !mxfp4 || p <= e * tm,
+        // mxfp4 banks (pre-scaled) at decode widths that route every expert
+        // a tile or less (v6e gpt-oss, 256 lanes: 33.8 -> 31.8 ms a step; at
+        // 4 lanes, 16 pairs, 8.4 -> 8.7 ms, so not there).
+        prefetch: !mxfp4 || (16 * e <= p && p <= e * tm),
     };
     spec.out_width().ok().map(|_| spec)
 }
