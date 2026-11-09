@@ -1133,7 +1133,14 @@ pub fn lse(
             &rows_v,
             geom.lanes * geom.span,
             f64::from(call.sm_scale),
-            tuning.chunks,
+            // Blocks of at most 256 rows, most of them inside one lane: a
+            // block's online-softmax state, 64 heads of 512, is read and
+            // written once a chunk, and a 512-row block straddling lanes
+            // walks each lane's chunks.
+            crate::tuning::Chunks {
+                block_rows: tuning.chunks.block_rows.min(256),
+                ..tuning.chunks
+            },
         )?;
         let lv = fl.lse2(f)?;
         let ov = f.reshape(fl.o, &[n, hh, dd])?;
