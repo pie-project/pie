@@ -60,7 +60,7 @@ for (a, b, y) in runs:
     else:
         rects.append([a, b, y, y + 1])
 P = ["K", "KM", "Hc", "Qh", "DcS", "DcG", "NES", "NEG", "HDS", "HDG", "HR_", "Ic0", "Ic1", "NO", "VR", "NTW", "NPX"]
-PD = {"WIN": 0, "WFIFO": 32, "PLOG": 0, "WSPEC": 0, "DIAG": 0, "TSTAMP": 0, "XKEEP": 0, "ATTL": 2, "HACC16": 0, "WFORCE": 0, "DLY": 1500, "FIFOW": 32}
+PD = {"WIN": 0, "WFIFO": 32, "PLOG": 0, "WSPEC": 0, "DIAG": 0, "TSTAMP": 0, "XKEEP": 0, "ATTL": 2, "HACC16": 0, "WFORCE": 0, "DLY": 1500, "FIFOW": 32, "PYW": 0}
 L = [f"param {p}: u16;" for p in P] + [f"param {p}: u16 = {v};" for p, v in PD.items()]
 L += ["param kernel_rows: u16 = 0;", "param kernel_cols: u16 = 0;", "param iters: u16 = 0;"]
 L.append(f"const W: u16 = {g.W};\nconst HH: u16 = {g.H};\nconst PX: u16 = {g.PX};\nconst PY: u16 = {g.PY};\nconst XC: u16 = {g.XC};\nconst YC: u16 = {g.YC};")
@@ -79,7 +79,7 @@ for u, (X0, Y0) in enumerate(g.origins):
              f"        if (lx == XC and ly == YC) {{ @set_tile_code(x, y, \"filler.csl\", .{{ .memcpy_params = mp }}); }}\n"
              f"        else if (lx == XC) {{ @set_tile_code(x, y, \"cx.csl\", .{{ .memcpy_params = mp, .K = K, .Hc = Hc, .DIAG = DIAG, .FIFOW = FIFOW, .XKEEP = XKEEP }}); }}\n"
              f"        else if (ly == YC) {{ @set_tile_code(x, y, \"cy.csl\", .{{ .memcpy_params = mp, .K = K, .KM = KM, .SH = {sh}, .Qh = Qh, .DcS = DcS, .DcG = DcG, .Ic = {ic}, .HR = HR_, .DIAG = DIAG, .FIFOW = FIFOW, .ATTL = ATTL, .TSTAMP = TSTAMP, .HDS = HDS, .HDG = HDG, .PLOG = PLOG }}); }}\n"
-             f"        else {{ @set_tile_code(x, y, \"weight.csl\", .{{ .memcpy_params = mp, .K = K, .Hc = Hc, .Ic = {ic}, .MV = 1, .KM = KM, .SH = {sh}, .Qh = Qh, .DcS = DcS, .DcG = DcG, .NES = NES, .NEG = NEG, .PYW = PY, .HDS = HDS, .HDG = HDG, .WIN = WIN, .WSPEC = WSPEC, .PLOG = PLOG, .DIAG = DIAG, .FIFOW = WFIFO, .ATTL = ATTL, .TSTAMP = TSTAMP }}); }}\n      }}")
+             f"        else {{ @set_tile_code(x, y, \"weight.csl\", .{{ .memcpy_params = mp, .K = K, .Hc = Hc, .Ic = {ic}, .MV = 1, .KM = KM, .SH = {sh}, .Qh = Qh, .DcS = DcS, .DcG = DcG, .NES = NES, .NEG = NEG, .PYW = (if (PYW == 0) PY else PYW), .HDS = HDS, .HDG = HDG, .WIN = WIN, .WSPEC = WSPEC, .PLOG = PLOG, .DIAG = DIAG, .FIFOW = WFIFO, .ATTL = ATTL, .TSTAMP = TSTAMP }}); }}\n      }}")
 for (x0, y0, w, h, st) in S.ple_rects(g):
     L.append(f"      if (!done and x >= {x0} and x < {x0 + w} and y >= {y0} and y < {y0 + h}) {{ done = true; @set_tile_code(x, y, \"ple.csl\", .{{ .memcpy_params = mp, .NTW = NTW, .DLY = DLY }}); }}")
 for (a, b, y0, y1) in rects:

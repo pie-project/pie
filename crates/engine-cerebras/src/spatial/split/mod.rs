@@ -318,7 +318,7 @@ impl SplitModel {
             vocab,
             hidden: spec.need("H")? as usize,
             cap: spec.int("CAP").unwrap_or(256) as usize,
-            positions: (spec.need("NEG")? * g.p.py) as usize,
+            positions: (spec.need("NEG")? * spec.int("PYW").unwrap_or(g.p.py)) as usize,
             fed: Vec::new(),
             launches: 0,
             steps: 0,

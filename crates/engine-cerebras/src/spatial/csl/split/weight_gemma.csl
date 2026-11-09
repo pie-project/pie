@@ -9,7 +9,9 @@
 // the source unit's CY row on the KVS colour (17 words a pass: k, v, |k|^2, |v|^2 partials of the source's sliding
 // then global layer, and a sequence word): taken by an async receive posted at the end of every pass (and at init),
 // so the source's sends never wait on a unit that has not started. A sliding cache is a ring of NES entries a row
-// (position p on row p % PYW, entry (p / PYW) % NES); a global one has NEG entries (context NEG PYW).
+// (position p on row p % PYW, entry (p / PYW) % NES); a global one has NEG entries (context NEG PYW). PYW may be
+// fewer than the unit's rows (E4B: 128 of 160, so the 512 window is an exact ring of 4 x 128): a row at or past
+// PYW never takes an entry, its empty caches score zeros (v and its count column 0) into every pass's reductions.
 // v is stored normalised: |v|^2 rides the scores segment with |k|^2; the entry is finalised (1 / |k|, v / |v|) by
 // the first layer that uses it in the pass.
 param memcpy_params;

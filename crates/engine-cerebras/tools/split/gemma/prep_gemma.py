@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""prep_gemma.py <model dir> <outdir> <golden json> <geo: tiny | e2b> NEG [prefix]: a Gemma 4 checkpoint (bf16
+"""prep_gemma.py <model dir> <outdir> <golden json> <geo: tiny | e2b | e4b> NEG [prefix] (NEG: global entries a KV row; context NEG PYW): a Gemma 4 checkpoint (bf16
 safetensors, "model.language_model." or "model.") in run_gemma.py's prep format (src/spatial/split/README.md, "Gemma 4").
 Units of K layers (S .. S G), unit u = layers K u .. K u + K - 1; units below NO (= first shared layer / K) own their
 KV, the rest are shared-KV units. Weight column c (of PX): kv copy c // (PX / 2) (its Qh = nq / 2 q heads), within
@@ -222,14 +222,18 @@ for a in mm.values():
     a.flush()
 SW = tc["sliding_window"]
 NES = -(-SW // PY)
-WIN = 0 if NES * PY == SW else SW                 # a longer ring: the kernel masks entries out of the window
-meta = dict(geo=GEO, PX=PX, PY=PY, Hc=Hc, H=H, V=V, K=K, KM=KM, NO=NO, NU=NU, Qh=Qh, DcS=DcS, DcG=DcG, NES=NES, WIN=WIN,
+# the KV rows: the first PYW of the PY a unit; a window NES PYW exactly where SW / NES fits (E4B: 4 x 128 of 160 rows,
+# the rest hold no entries), else every row and a longer ring whose older entries the kernel masks
+PYW = SW // NES if SW % NES == 0 else PY
+WIN = 0 if NES * PYW == SW else SW
+KVR = dict(PYW=PYW) if PYW != PY else {}
+meta = dict(geo=GEO, PX=PX, PY=PY, **KVR, Hc=Hc, H=H, V=V, K=K, KM=KM, NO=NO, NU=NU, Qh=Qh, DcS=DcS, DcG=DcG, NES=NES, WIN=WIN,
             NEG=NEG, HDS=hdS, HDG=hdG, Ic0=IcO, Ic1=IcS, HC=HC, HR=HR, VR=VR, LW=LWS, cols=cols, EPS=tc.get("rms_norm_eps", 1e-6),
             model=os.path.basename(MD.rstrip("/")),
             LOOP=64)   # Pie's posted-loop length (0846 / 0848: 64 beat 32 and 48)
 json.dump(meta, open(os.path.join(out, PRE + "meta.json"), "w"))
 NTW = max(c_["nt"] * c_["lv"] for c_ in cols)
-cp = dict(K=K, KM=KM, Hc=Hc, Qh=Qh, DcS=DcS, DcG=DcG, NES=NES, WIN=WIN, NEG=NEG, HDS=hdS, HDG=hdG, HR_=H, Ic0=IcO, Ic1=IcS,
+cp = dict(K=K, KM=KM, Hc=Hc, Qh=Qh, DcS=DcS, DcG=DcG, NES=NES, WIN=WIN, NEG=NEG, **KVR, HDS=hdS, HDG=hdG, HR_=H, Ic0=IcO, Ic1=IcS,
           NO=NO, VR=VR, NTW=NTW, NPX=1)
 open(os.path.join(out, PRE + "params.txt"), "w").write(",".join(f"{k}:{v}" for k, v in cp.items()) + "\n")
 print("prepared", out, json.dumps({k: v for k, v in meta.items() if k != "cols"}))
