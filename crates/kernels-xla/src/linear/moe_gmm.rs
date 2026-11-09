@@ -114,12 +114,13 @@ impl Gmm {
         self.k * cols * i64::from(self.w.bits()) / 8
     }
 
-    /// A block-FP8 tile of prompt rows widens its block of codes under their
+    /// A block-FP8 prompt in one tile widens its block of codes under their
     /// factors to bf16 once and contracts it a whole K deep: the 128-deep
     /// dots leave half of a v6e MXU idle, and the widening's VPU work is
-    /// shared by the tile's rows.
+    /// shared by the tile's rows (widened again for each of several tiles,
+    /// it costs more than it saves).
     fn widens(&self) -> bool {
-        self.tile && self.tm >= WIDEN_ROWS
+        self.tile && self.tiles == 1 && self.tm >= WIDEN_ROWS
     }
 
     fn cut(&self) -> Built<Cut> {
