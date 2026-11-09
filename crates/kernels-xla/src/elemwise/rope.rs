@@ -344,8 +344,24 @@ pub(crate) fn rotate_all(
             let mid = turn(f, mid, pos, &sub)?;
             let mid = f.convert(mid, elem);
             let mid = f.reshape(mid, &[r, g, run])?;
+            // Written back over whole 128-lane tiles of the head (the run's
+            // untouched neighbours with it), so the update lands in place.
+            let (lo, hi) = if t.unit % 128 == 0 {
+                (a / 128 * 128, b.div_ceil(128) * 128)
+            } else {
+                (a, b)
+            };
+            let mut parts = Vec::with_capacity(3);
+            if lo < a {
+                parts.push(f.slice_axis(x3, 2, lo as i64, a as i64)?);
+            }
+            parts.push(mid);
+            if b < hi {
+                parts.push(f.slice_axis(x3, 2, b as i64, hi as i64)?);
+            }
+            let mid = f.concat(&parts, 2)?;
             let zero = ci(f, 0);
-            let at = ci(f, a as i64);
+            let at = ci(f, lo as i64);
             let x3 = f.dynamic_update_slice(x3, mid, &[zero, zero, at])?;
             out.push(Some(f.reshape(x3, &[r, w])?));
             continue;
