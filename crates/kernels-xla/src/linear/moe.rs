@@ -1379,7 +1379,9 @@ fn routed(
         Elem::Bf16
     };
     let grouped = gmm_spec(fan, &bank, f.elem(bank.codes.val()), tuning, out);
+    let ragged_min: Option<i64> = std::env::var("PIE_XLA_MOE_RAGGED_MIN").ok().and_then(|v| v.parse().ok());
     let path = match tuning.moe_path {
+        MoePath::Auto { .. } if ragged_min.is_some_and(|m| p >= m) => MoePath::Ragged,
         MoePath::Gmm if grouped.is_none() => MoePath::All,
         MoePath::Auto { .. }
             if p <= c.slice_pairs && p * expert_bytes.max(c.slice_bytes) < bank_bytes =>
@@ -1849,6 +1851,10 @@ pub fn experts(
         Form::Dense(down),
     )?;
     let p = up_fan.pairs();
+    let ragged_min: Option<i64> = std::env::var("PIE_XLA_MOE_RAGGED_MIN").ok().and_then(|v| v.parse().ok());
+    if ragged_min.is_some_and(|m| p >= m) {
+        return Ok(None);
+    }
     if !matches!(tuning.moe_path, MoePath::Auto { gmm: true })
         || p <= tuning.moe_costs.slice_pairs
         || i64::from(packed.rows) != p
