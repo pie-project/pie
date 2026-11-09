@@ -265,6 +265,9 @@ pub struct Func {
     /// result is.
     row_major: Vec<usize>,
     row_major_results: bool,
+    /// From this many rows a narrow-head rope turns the row as it lies
+    /// (`tuning::RopeFlatRows`; 0 never).
+    rope_flat_rows: i64,
 }
 
 fn list<T: fmt::Display>(xs: &[T]) -> String {
@@ -365,7 +368,18 @@ impl Func {
             scope: None,
             row_major: Vec::new(),
             row_major_results: false,
+            rope_flat_rows: 0,
         }
+    }
+
+    /// Sets the row count from which a narrow-head rope turns the row flat.
+    pub fn set_rope_flat_rows(&mut self, rows: i64) {
+        self.rope_flat_rows = rows;
+    }
+
+    #[must_use]
+    pub fn rope_flat_rows(&self) -> i64 {
+        self.rope_flat_rows
     }
 
     #[must_use]

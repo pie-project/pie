@@ -112,6 +112,14 @@ pub enum QuantDecode {
     Dense,
 }
 
+/// From this many rows, a rope over heads narrower than a lane tile turns the
+/// row as it lies (`elemwise::rope::turn_flat`); 0 never does. A v6e gains
+/// (gpt-oss 4096-row prefill: 125.5 -> 123.4 ms a fire); a v5e loses
+/// (1792 rows: 65.5 -> 67.6 ms).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Decision)]
+#[decision(id = "kernel.rope.flat_rows", constant(set(0, 1024, 2048, 4096)), default = 0, tune = search)]
+pub struct RopeFlatRows(pub u32);
+
 /// Up to this many rows per lane, an `auto` attention walk gathers each
 /// row's keys; past it, row blocks walk the key axis. 0 always blocks.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Decision)]
@@ -177,6 +185,7 @@ pub fn register(registry: &mut Registry) {
         .add::<AttnPerRowMax>()
         .add::<AttnBudgetMi>()
         .add::<AttnBlockRows>()
+        .add::<RopeFlatRows>()
         .add::<AttnBlockKeys>()
         .add::<AttnUnrolledBlocks>()
         .add::<SsmChunk>()
@@ -238,6 +247,7 @@ pub struct Tuning {
     pub moe_costs: MoeCosts,
     pub grouped: Grouped,
     pub attn_per_row_max: i64,
+    pub rope_flat_rows: i64,
     pub chunks: Chunks,
     pub ssm: SsmChunks,
     pub vmem_bytes: i64,
@@ -269,6 +279,7 @@ impl Tuning {
             max_rows: 64,
         },
         attn_per_row_max: 2,
+        rope_flat_rows: 0,
         chunks: Chunks {
             budget: 1 << 24,
             block_rows: 512,
@@ -318,6 +329,7 @@ impl Tuning {
                 },
             },
             attn_per_row_max: n(profile.get::<AttnPerRowMax>().0),
+            rope_flat_rows: n(profile.get::<RopeFlatRows>().0),
             chunks: Chunks {
                 budget: n(profile.get::<AttnBudgetMi>().0) << 20,
                 block_rows: n(profile.get::<AttnBlockRows>().0),

@@ -13,6 +13,9 @@ pad.row_steps = 4
 # Gemma-4-E4B Raw prefill 25.2k -> 26.2k; c256 decode no slower)
 [kernel]
 attn.block_rows = 256
+# a prompt's narrow-head rope turns the row as it lies, no `[rows, heads, 64]` relayouts (gpt-oss-20b
+# 4096-row pf256 fire 125.5 -> 123.4 ms; a v5e loses by as much, so it stays off there)
+rope.flat_rows = 1024
 
 [provenance]
 measured = [
@@ -35,6 +38,7 @@ measured = [
   "kernel.moe.loop_unroll",
   "kernel.moe.path",
   "kernel.quant.decode",
+  "kernel.rope.flat_rows",
   "gather.embed_fold",
   "gather.gemm_transpose",
   "layout.mxfp4_prescale",

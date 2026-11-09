@@ -172,14 +172,17 @@ pub(crate) fn turn(f: &mut Func, x: Val, pos: Val, t: &Turn) -> Result<Val, Erro
         let out = f.concat(&parts, 2)?;
         return Ok(f.reshape(out, &[rows, width])?);
     }
-    // A prompt's heads narrower than a lane tile turn as the row lies:
-    // `[rows, heads, unit]` relays every head out to a lane tile and back
-    // (v6e gpt-oss 4096-row prefill: 10.8 of a 127 ms fire; 123.4 ms against
-    // 125.5). A decode's few rows keep the narrow tables (256 lanes: 32.5 ms
-    // a step turned flat, 31.8 not).
+    // A prompt's heads narrower than a lane tile turn as the row lies where
+    // the chip's profile says so (`RopeFlatRows`): `[rows, heads, unit]`
+    // relays every head out to a lane tile and back (v6e gpt-oss 4096-row
+    // prefill: 10.8 of a 127 ms fire; 123.4 ms against 125.5). A decode's few
+    // rows keep the narrow tables (256 lanes: 32.5 ms a step turned flat,
+    // 31.8 not), and a v5e every row (1792 rows: 67.6 flat against 65.5).
+    let flat = f.rope_flat_rows();
     if unit < 128
         && width % 128 == 0
-        && rows >= 1024
+        && flat > 0
+        && rows >= flat
         && let Some(v) = turn_flat(f, x, pos, t)?
     {
         return Ok(v);

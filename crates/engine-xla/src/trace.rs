@@ -246,6 +246,10 @@ impl<'h> Tracer<'h> {
     #[must_use]
     pub fn with_tuning(mut self, tuning: kernels_xla::tuning::Tuning) -> Self {
         self.tuning = tuning;
+        self.state
+            .borrow_mut()
+            .func
+            .set_rope_flat_rows(tuning.rope_flat_rows);
         self
     }
 
