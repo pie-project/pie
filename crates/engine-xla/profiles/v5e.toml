@@ -8,5 +8,10 @@ assumes = { generation = 5, hbm_gib = 16 }
 [engine]
 pad.row_steps = 4
 
+# a blocked attention's row blocks as a loop: in line, DeepSeek-V4's 1792-row prompt programs ran a v5e
+# host's 47 GiB out compiling them
+[kernel]
+attn.unrolled_blocks = 1
+
 [provenance]
-measured = ["engine.pad.row_steps"]
+measured = ["engine.pad.row_steps", "kernel.attn.unrolled_blocks"]
