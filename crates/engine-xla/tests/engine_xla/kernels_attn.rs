@@ -520,6 +520,7 @@ fn a_long_decode_walks_its_keys_in_chunks() {
 /// Wide heads take the per-kv-head column-slice contraction.
 #[test]
 fn a_long_decode_with_wide_heads_slices_each_kv_head() {
+    long_decode(8, 1, 128);
     long_decode(8, 2, 128);
     long_decode(8, 4, 256);
 }
@@ -613,7 +614,20 @@ fn long_decode_in(qh: usize, kvh: usize, d: usize, window: Option<u32>) {
         .collect();
     let fire = Fire::plain(&rows);
     let n = rows.len();
-    let q = rng.bf16s(n * qh * d, 1.0);
+    let mut q = rng.bf16s(n * qh * d, 1.0);
+    if std::env::var_os("HALF_ZERO_PROBE").is_some() && d == 128 {
+        // rows 0..qh/2 keep lanes 0..63, rows qh/2.. lanes 64..127
+        for row in 0..n {
+            for h in 0..qh {
+                for i in 0..d {
+                    let keep = if h < qh / 2 { i < 64 } else { i >= 64 };
+                    if !keep {
+                        q[(row * qh + h) * d + i] = 0.0;
+                    }
+                }
+            }
+        }
+    }
     let scale = 0.125;
     let mut b = Bench::new();
     let kv = pool.bind(&mut b);
