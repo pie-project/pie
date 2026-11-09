@@ -9,7 +9,7 @@ use dtype::Dtype;
 use engine_xla::bench::{Bench, assert_close, round_bf16};
 use engine_xla::handle::{Bank, Tensor};
 use kernels_xla::hlo::f16_bits;
-use kernels_xla::linear::kquant;
+use kernels_xla::linear::{kquant, quant};
 
 fn hash(i: usize, seed: u32) -> u32 {
     (i as u32)
@@ -648,10 +648,27 @@ fn block_fp8_at(n: usize) {
     };
     let y = b.zeros(Dtype::F32, m as u32, n as u32);
     let yb = b.zeros(Dtype::F32, big as u32, n as u32);
+    // The prompt's rows with their 128-wide heads' sums of squares beside
+    // them, where the kernel's blocks hold whole heads.
+    let heads = n / 128;
+    let sums = b.zeros(Dtype::F32, big as u32, (heads * 128) as u32);
+    let landed = std::cell::Cell::new(false);
     if !b
         .run(|ctx| {
             engine_xla::lower::linear::quant(ctx, false, x, bank, y)?;
-            engine_xla::lower::linear::quant(ctx, false, xbig, bank, yb)
+            engine_xla::lower::lower(ctx, |l| {
+                let a = l.read(xbig)?;
+                let w = l.bank(quant::bank_view(bank))?;
+                let tuning = l.tuning();
+                let (v, s) = quant::matmul_sums(l.f(), a, w, yb.landing(), Some(128), tuning)?
+                    .expect("rows");
+                l.land(yb, v)?;
+                if let Some(s) = s {
+                    landed.set(true);
+                    l.land(sums, s)?;
+                }
+                Ok(())
+            })
         })
         .unwrap()
     {
@@ -666,5 +683,30 @@ fn block_fp8_at(n: usize) {
         1e-3,
         1e-3,
     );
-    assert_close(&b.read_f32(yb), &gemm_ref(&xb, &w, big, n, k), 1e-2, 1e-2);
+    let want = gemm_ref(&xb, &w, big, n, k);
+    assert_close(&b.read_f32(yb), &want, 1e-2, 1e-2);
+    assert_eq!(
+        landed.get(),
+        n.is_multiple_of(128),
+        "head sums ride a whole-head block cut"
+    );
+    if landed.get() {
+        let got = b.read_f32(sums);
+        let (mut have, mut need) = (Vec::new(), Vec::new());
+        for r in 0..big {
+            for h in 0..heads {
+                have.push(
+                    (0..128)
+                        .map(|l| got[r * heads * 128 + h * 128 + l])
+                        .sum::<f32>(),
+                );
+                need.push(
+                    (0..128)
+                        .map(|d| want[r * n + h * 128 + d].powi(2))
+                        .sum::<f32>(),
+                );
+            }
+        }
+        assert_close(&have, &need, 2e-2, 1e-2);
+    }
 }

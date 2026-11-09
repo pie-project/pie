@@ -225,6 +225,8 @@ struct State {
     current: BTreeMap<u32, Val>,
     params: Vec<(u32, Source)>,
     written: BTreeMap<u32, ()>,
+    /// A root's per-head sums of squares, landed with its current value.
+    sums: BTreeMap<u32, Val>,
 }
 
 impl<'h> Tracer<'h> {
@@ -239,6 +241,7 @@ impl<'h> Tracer<'h> {
                 current: BTreeMap::new(),
                 params: Vec::new(),
                 written: BTreeMap::new(),
+                sums: BTreeMap::new(),
             }),
         }
     }
@@ -409,6 +412,15 @@ struct Lens<'a> {
     current: &'a mut BTreeMap<u32, Val>,
     params: &'a mut Vec<(u32, Source)>,
     written: &'a mut BTreeMap<u32, ()>,
+    sums: &'a mut BTreeMap<u32, Val>,
+}
+
+impl Lens<'_> {
+    /// The root `t` is the whole of.
+    fn whole(&self, t: Tensor) -> Option<u32> {
+        let (root, offset) = self.handles.locate(t.buf)?;
+        (offset == 0 && t.rows == self.handles.root_of(root).rows).then_some(root)
+    }
 }
 
 impl Env for Lens<'_> {
@@ -471,7 +483,18 @@ impl Env for Lens<'_> {
         };
         self.current.insert(root, next);
         self.written.insert(root, ());
+        self.sums.remove(&root);
         Ok(())
+    }
+
+    fn sums(&mut self, t: Tensor) -> Option<Val> {
+        self.sums.get(&self.whole(t)?).copied()
+    }
+
+    fn keep_sums(&mut self, t: Tensor, v: Val) {
+        if let Some(root) = self.whole(t) {
+            self.sums.insert(root, v);
+        }
     }
 }
 
@@ -524,6 +547,7 @@ impl Emit for Tracer<'_> {
             params,
             written,
             pack_len,
+            sums,
         } = &mut *state;
         let mut lens = Lens {
             handles: self.handles,
@@ -531,6 +555,7 @@ impl Emit for Tracer<'_> {
             current,
             params,
             written,
+            sums,
         };
         let mut cx = Cx::new(func, &mut lens).with_tuning(self.tuning);
         body(&mut cx)

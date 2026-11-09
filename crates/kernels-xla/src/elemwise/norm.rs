@@ -36,12 +36,50 @@ pub(crate) fn inv_rms_rows(
     let x3 = f.reshape(x, &[rows, heads, axis])?;
     let sq = f.mul(x3, x3)?;
     let sum = f.reduce(sq, &[2], Fold::Sum)?;
+    rows_by_sums(f, x3, sum, eps)
+}
+
+/// `x3 / rms` for `[rows, heads, axis]` under each head's f32 sum of squares
+/// (`sum`, `[rows, heads]`), back as `[rows, width]`.
+fn rows_by_sums(f: &mut Func, x3: Val, sum: Val, eps: f32) -> Result<Val, Error> {
+    let (rows, heads, axis) = (f.dims(x3)[0], f.dims(x3)[1], f.dims(x3)[2]);
     let mean = f.scale(sum, 1.0 / axis as f64)?;
     let mean = f.offset(mean, f64::from(eps))?;
     let inv = f.rsqrt(mean);
     let inv = f.broadcast(inv, &[rows, heads, axis], &[0, 1])?;
     let y = f.mul(x3, inv)?;
-    Ok(f.reshape(y, &[rows, width])?)
+    Ok(f.reshape(y, &[rows, heads * axis])?)
+}
+
+/// [`rmsnorm_no_scale`] with the heads' sums of squares from the projection
+/// that made `x`: `sums` is `[rows, heads * 128]` f32, a head's 128 lane-wise
+/// partial sums (`linear::quant::matmul_sums`), so the rows are read once.
+pub fn rmsnorm_no_scale_from_sums(
+    f: &mut Func,
+    x: Operand,
+    sums: Val,
+    head_dim: u32,
+    eps: f32,
+) -> Result<Val, Error> {
+    const OP: &str = "elemwise.rmsnorm";
+    expect(OP, x, &[Dtype::Bf16])?;
+    let (rows, width) = (i64::from(x.rows), i64::from(x.width));
+    let axis = i64::from(nonzero(OP, "the normed axis", head_dim)?);
+    if width % axis != 0 || f.dims(sums) != [rows, width / axis * 128] {
+        return Err(refuse(
+            OP,
+            format!(
+                "{:?} head sums for a {width}-wide row of {axis}-wide heads",
+                f.dims(sums)
+            ),
+        ));
+    }
+    let heads = width / axis;
+    let s3 = f.reshape(sums, &[rows, heads, 128])?;
+    let sum = f.reduce(s3, &[2], Fold::Sum)?;
+    let xv = x.f32(f);
+    let x3 = f.reshape(xv, &[rows, heads, axis])?;
+    rows_by_sums(f, x3, sum, eps)
 }
 
 /// A `[axis]` gain row broadcast over `[rows, width]` (`width / axis` heads

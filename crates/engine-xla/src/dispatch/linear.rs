@@ -62,12 +62,12 @@ impl Run<'_> {
                 logits: false,
                 ..
             } => match self.banked(*w) {
-                Some(bank) => crate::lower::linear::quant(
+                Some(bank) => crate::lower::linear::quant_sums(
                     self.ctx(),
-                    false,
                     self.tensor(*act),
                     bank,
                     self.tensor(*y),
+                    self.head_norm_of(*y),
                 ),
 
                 None => match self.maybe_stored(*w) {

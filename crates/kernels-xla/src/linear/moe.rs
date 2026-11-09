@@ -1151,21 +1151,24 @@ fn gmm_spec(
         // a tile or less (v6e gpt-oss, 256 lanes: 33.8 -> 31.8 ms a step; at
         // 4 lanes, 16 pairs, 8.4 -> 8.7 ms, so not there).
         prefetch: !mxfp4 || (16 * e <= p && p <= e * tm),
+        sums: None,
     };
     spec.out_width().ok().map(|_| spec)
 }
 
 /// `x [m, K] · wᵀ` for block-FP8 codes `codes [N, K]` (landed `[K, N]`)
 /// with their f32 factors a row `factor [N, K/128]`: the grouped-matmul
-/// kernel over one expert, f32 `[m, N]`. `None` when no block of the
-/// weight fits the kernel.
+/// kernel over one expert, `[m, N]` in `out` (f32, or rounded to bf16).
+/// `None` when no block of the weight fits the kernel.
 pub(crate) fn tile_projection(
     f: &mut Func,
     x: Val,
     codes: Val,
     factor: Val,
     tuning: Tuning,
-) -> Result<Option<Val>, Error> {
+    out: Elem,
+    sums: Option<i64>,
+) -> Result<Option<(Val, Option<Val>)>, Error> {
     use crate::linear::moe_gmm::{Gmm, Orient};
     let (m, k) = (f.dims(x)[0], f.dims(x)[1]);
     let n = f.dims(codes)[0];
@@ -1181,7 +1184,7 @@ pub(crate) fn tile_projection(
     let rows = ((m + 15) / 16) * 16;
     let tm = if rows <= most.max(512) { rows } else { 512 };
     let tiles = (m + tm - 1) / tm;
-    let spec = Gmm {
+    let mut spec = Gmm {
         tiles,
         tm,
         block_bytes: tuning.moe_gmm_block_bytes,
@@ -1194,13 +1197,22 @@ pub(crate) fn tile_projection(
         scaled: false,
         tile: true,
         bias: false,
-        out: Elem::F32,
+        out,
         prefetch: false,
+        sums,
     };
     if spec.out_width().ok() != Some(n) {
         return Ok(None);
     }
-    let kernel = spec.kernel()?;
+    // The head sums ride along where the blocks hold whole heads.
+    let kernel = match spec.kernel() {
+        Ok(kernel) => kernel,
+        Err(_) if spec.sums.is_some() => {
+            spec.sums = None;
+            spec.kernel()?
+        }
+        Err(e) => return Err(e.into()),
+    };
     let se = f.const_i(Elem::I32, 0, &[tiles]);
     let nt = f.const_i(Elem::I32, tiles, &[1]);
     let x = f.convert(x, Elem::Bf16);
@@ -1213,12 +1225,17 @@ pub(crate) fn tile_projection(
     // The device's layouts: free transposes.
     let w = f.transpose(codes, &[1, 0])?;
     let s = f.transpose(factor, &[1, 0])?;
-    let y = kernel.call(f, &[se, nt, xs, w, s])?[0];
-    Ok(Some(if tiles * tm > m {
-        f.slice_axis(y, 0, 0, m)?
-    } else {
-        y
-    }))
+    let outs = kernel.call(f, &[se, nt, xs, w, s])?;
+    let rows = |f: &mut Func, v: Val| -> Result<Val, Error> {
+        Ok(if tiles * tm > m {
+            f.slice_axis(v, 0, 0, m)?
+        } else {
+            v
+        })
+    };
+    let y = rows(f, outs[0])?;
+    let sums = spec.sums.map(|_| rows(f, outs[1])).transpose()?;
+    Ok(Some((y, sums)))
 }
 
 /// A kernel spec landing its rows in bf16 (no bias follows).
