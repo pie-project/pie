@@ -188,15 +188,12 @@ impl Gmm {
         })
     }
 
-    /// Where expert `e`'s outputs start in its rows of the result.
-    pub fn offsets(&self) -> Built<Vec<i64>> {
-        let cut = self.cut()?;
-        Ok((0..self.experts)
-            .map(|e| match cut {
-                Cut::Blocked { .. } => 0,
-                Cut::Element { width } => e * self.n - self.window_start(e, width),
-            })
-            .collect())
+    /// Where expert `e`'s outputs start in its window: the kernel turns each
+    /// row's lanes by it, so every row's outputs start at column 0.
+    fn lags(&self, width: i64) -> Vec<i64> {
+        (0..self.experts)
+            .map(|e| e * self.n - self.window_start(e, width))
+            .collect()
     }
 
     /// The first column of expert `e`'s window.
@@ -596,8 +593,44 @@ impl Gmm {
                 } else {
                     y
                 };
-                let y = b.convert_f(y, self.out)?;
-                b.vstore_all(y, blk.outs[0])
+                let Cut::Element { width } = cut else {
+                    let y = b.convert_f(y, self.out)?;
+                    return b.vstore_all(y, blk.outs[0]);
+                };
+                // The expert's outputs turned to column 0 in VMEM (gathering
+                // the rows at a per-row column offset afterwards relays every
+                // row out: v6e gpt-oss, 0.2 ms a layer at 4096 tokens).
+                let mut lags = self.lags(width);
+                lags.sort_unstable();
+                lags.dedup();
+                let ex = expert(b, &blk.grid)?;
+                let nn = b.i32(n);
+                let col = b.muli(ex, nn)?;
+                let lane = b.i32(128);
+                let start = b.divsi(col, lane)?;
+                let start = b.muli(start, lane)?;
+                let top = b.i32(e * n - width);
+                let start = b.minsi(start, top)?;
+                let lag = b.subi(col, start)?;
+                for o in lags {
+                    let at = b.i32(o);
+                    let here = b.cmpi(ICmp::Eq, lag, at)?;
+                    b.when(here, |b| {
+                        let y = if o == 0 {
+                            y
+                        } else {
+                            b.op(
+                                "tpu.rotate",
+                                &[y],
+                                &format!("amount = {} : si32, dimension = 1 : si32", width - o),
+                                &[MTy::Vector(vec![tm, width], Elem::F32)],
+                            )[0]
+                        };
+                        let y = b.convert_f(y, self.out)?;
+                        b.vstore_all(y, blk.outs[0])
+                    })?;
+                }
+                Ok(())
             })
         })
     }
@@ -761,9 +794,9 @@ mod tests {
         // down: 22.5 lane tiles an expert, one 23-tile window each.
         let d = gmm(2880, Orient::KMajor);
         assert_eq!(d.cut().unwrap(), Cut::Element { width: 2944 });
-        let off = d.offsets().unwrap();
-        assert_eq!(&off[..3], &[0, 64, 0]);
-        assert_eq!(off[31], 64);
+        let lags = d.lags(2944);
+        assert_eq!(&lags[..3], &[0, 64, 0]);
+        assert_eq!(lags[31], 64);
         assert!(d.kernel().unwrap().module.contains("element_window"));
     }
 }
