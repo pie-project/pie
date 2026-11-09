@@ -1879,6 +1879,8 @@ pub fn attend_fresh(
             let first = f.select(all, first, none)?;
             let below = f.min(hi, p0)?;
             let below = f.max(below, lo)?;
+            // a padding row (written to the sink) reads nothing
+            let below = f.select(alone, lo, below)?;
             let hi = f.select(all, below, hi)?;
             let wants = f.compare(Cmp::Gt, hi, lo)?;
             let pooled = f.reduce(wants, &[0], Fold::Or)?;
