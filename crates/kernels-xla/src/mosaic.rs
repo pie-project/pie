@@ -44,6 +44,8 @@ fn bad<T>(detail: impl Into<String>) -> Built<T> {
 pub enum Space {
     Vmem,
     Smem,
+    /// HBM, read only by the kernel's own DMAs.
+    Any,
 }
 
 impl Space {
@@ -51,6 +53,7 @@ impl Space {
         match self {
             Self::Vmem => "#tpu.memory_space<vmem>",
             Self::Smem => "#tpu.memory_space<smem>",
+            Self::Any => "#tpu.memory_space<any>",
         }
     }
 }
@@ -63,6 +66,8 @@ pub enum MTy {
     Index,
     Vector(Vec<i64>, Elem),
     Ref(Vec<i64>, Elem, Space),
+    /// DMA semaphores (`dims` empty: one).
+    Sem(Vec<i64>),
 }
 
 /// Mosaic spells integers signless.
@@ -99,6 +104,16 @@ impl fmt::Display for MTy {
             Self::Index => f.write_str("index"),
             Self::Vector(d, e) => write!(f, "vector<{}>", shape(d, *e)),
             Self::Ref(d, e, s) => write!(f, "memref<{}, {}>", shape(d, *e), s.mlir()),
+            Self::Sem(d) => {
+                let mut dims = String::new();
+                for x in d {
+                    let _ = write!(dims, "{x}x");
+                }
+                write!(
+                    f,
+                    "memref<{dims}!tpu.dma_semaphore, #tpu.memory_space<semaphore_mem>>"
+                )
+            }
         }
     }
 }
@@ -397,6 +412,67 @@ impl Body {
         self.vstore(v, r, &zeros)
     }
 
+    /// `r[at ..]` as a reference of `dims` (same rank, same space).
+    pub fn ref_slice(&mut self, r: V, at: &[V], dims: &[i64]) -> Built<V> {
+        let out = match self.ty(r).clone() {
+            MTy::Ref(rd, e, sp) if rd.len() == at.len() && dims.len() == rd.len() => {
+                MTy::Ref(dims.to_vec(), e, sp)
+            }
+            MTy::Sem(rd) if rd.len() == at.len() && dims.len() == rd.len() => {
+                MTy::Sem(dims.to_vec())
+            }
+            t => return bad(format!("a {dims:?} slice of {t}")),
+        };
+        let mut ops = vec![r];
+        for &i in at {
+            if self.ty(i) != &MTy::I32 {
+                return bad("a slice index is i32");
+            }
+            ops.push(i);
+        }
+        let n = at.len();
+        Ok(self.op1(
+            "tpu.memref_slice",
+            &ops,
+            &format!("operandSegmentSizes = array<i32: 1, {n}, 0>"),
+            out,
+        ))
+    }
+
+    /// `r` without its leading unit axis.
+    pub fn ref_squeeze(&mut self, r: V) -> Built<V> {
+        let out = match self.ty(r).clone() {
+            MTy::Ref(rd, e, sp) if rd.first() == Some(&1) => MTy::Ref(rd[1..].to_vec(), e, sp),
+            MTy::Sem(rd) if rd.first() == Some(&1) => MTy::Sem(rd[1..].to_vec()),
+            t => return bad(format!("a squeeze of {t}")),
+        };
+        Ok(self.op1("tpu.memref_squeeze", &[r], "", out))
+    }
+
+    /// Starts copying `src` into `dst`, signalling `sem`.
+    pub fn dma_start(&mut self, src: V, dst: V, sem: V) -> Built<()> {
+        // source, source semaphore, target, target semaphore, device, core,
+        // subcore: libtpu 0.0.48 parses the seven-segment form.
+        self.op(
+            "tpu.enqueue_dma",
+            &[src, dst, sem],
+            "operandSegmentSizes = array<i32: 1, 0, 1, 1, 0, 0, 0>",
+            &[],
+        );
+        Ok(())
+    }
+
+    /// Waits for the copy of `src` into `dst` that signals `sem`.
+    pub fn dma_wait(&mut self, sem: V, src: V, dst: V) -> Built<()> {
+        self.op(
+            "tpu.wait_dma2",
+            &[sem, src, dst],
+            "operandSegmentSizes = array<i32: 1, 1, 1, 0, 0>",
+            &[],
+        );
+        Ok(())
+    }
+
     /// A float vector of `x` everywhere.
     pub fn splat_f(&mut self, dims: &[i64], elem: Elem, x: f64) -> Built<V> {
         let t = MTy::Vector(dims.to_vec(), elem);
@@ -525,6 +601,8 @@ pub enum Window {
     /// The index is an element offset along each axis (it need not be a
     /// multiple of the block; the DMA wants it tile-aligned).
     Element,
+    /// No window: the whole array stays in HBM for the kernel's own DMAs.
+    Any,
 }
 
 /// The grid ids and the prefetched scalars' references, as a transform or
@@ -559,6 +637,8 @@ pub struct Kernel {
     /// The scoped VMEM the kernel may use (the compiler's default is
     /// 32 MiB on v6e).
     pub vmem_limit: Option<u64>,
+    /// VMEM buffers and semaphores the body keeps across grid steps.
+    pub scratch: Vec<MTy>,
 }
 
 /// What the kernel body gets: the grid and one VMEM block per operand and
@@ -567,6 +647,7 @@ pub struct Blocks {
     pub grid: Grid,
     pub ins: Vec<V>,
     pub outs: Vec<V>,
+    pub scratch: Vec<V>,
 }
 
 /// A kernel ready to call from StableHLO.
@@ -587,6 +668,9 @@ impl Kernel {
             return bad("a grid needs one semantics per axis");
         }
         for o in self.ins.iter().chain(&self.outs) {
+            if o.window == Window::Any {
+                continue;
+            }
             if o.block.len() != o.array.len() {
                 return bad(format!("a {:?} block of a {:?} array", o.block, o.array));
             }
@@ -622,7 +706,10 @@ impl Kernel {
             .ins
             .iter()
             .chain(&self.outs)
-            .map(|o| MTy::Ref(o.block.clone(), o.elem, Space::Vmem))
+            .map(|o| match o.window {
+                Window::Any => MTy::Ref(o.array.clone(), o.elem, Space::Any),
+                _ => MTy::Ref(o.block.clone(), o.elem, Space::Vmem),
+            })
             .collect();
 
         let mut s = String::new();
@@ -635,10 +722,12 @@ impl Kernel {
         let mut args = grid_tys.clone();
         args.extend(pre_tys.iter().cloned());
         args.extend(block_tys.iter().cloned());
+        args.extend(self.scratch.iter().cloned());
         let (mut b, vs) = Body::new(&args);
         let (g, rest) = vs.split_at(grid_tys.len());
         let (p, rest) = rest.split_at(pre_tys.len());
-        let (ins, outs) = rest.split_at(self.ins.len());
+        let (ins, rest) = rest.split_at(self.ins.len());
+        let (outs, scratch) = rest.split_at(self.outs.len());
         let blocks = Blocks {
             grid: Grid {
                 ids: g.to_vec(),
@@ -646,6 +735,7 @@ impl Kernel {
             },
             ins: ins.to_vec(),
             outs: outs.to_vec(),
+            scratch: scratch.to_vec(),
         };
         body(&mut b, &blocks)?;
         b.ret(&[]);
@@ -664,9 +754,12 @@ impl Kernel {
             .chain(&self.outs)
             .enumerate()
             .map(|(i, o)| {
+                if o.window == Window::Any {
+                    return "{}".to_string();
+                }
                 let bounds = o.block.iter().map(ToString::to_string).collect::<Vec<_>>().join(", ");
                 let kind = match o.window {
-                    Window::Blocked => String::new(),
+                    Window::Blocked | Window::Any => String::new(),
                     Window::Element => {
                         let z = vec!["0"; o.block.len()].join(", ");
                         format!(", window_kind = #tpu.element_window<[{z}], [{z}]>")
@@ -701,10 +794,11 @@ impl Kernel {
         let _ = writeln!(
             s,
             "  }}) {{dimension_semantics = [{sems}], function_type = {}, iteration_bounds = \
-             array<i64: {bounds}>, scalar_prefetch = {} : i64, scratch_operands = 0 : i64, sym_name \
+             array<i64: {bounds}>, scalar_prefetch = {} : i64, scratch_operands = {} : i64, sym_name \
              = \"{}\", tpu.core_type = #tpu.core_type<tc>, window_params = [{windows}]}} : () -> ()",
             fty(&args, &[]),
             self.prefetch.len(),
+            self.scratch.len(),
             self.name
         );
 
@@ -712,6 +806,9 @@ impl Kernel {
         let mut targs = grid_tys.clone();
         targs.extend(pre_tys.iter().cloned());
         for (i, o) in self.ins.iter().chain(&self.outs).enumerate() {
+            if o.window == Window::Any {
+                continue;
+            }
             let (mut b, vs) = Body::new(&targs);
             let (g, p) = vs.split_at(grid_tys.len());
             let grid = Grid {
@@ -877,6 +974,7 @@ mod tests {
                 index: Box::new(|b: &mut Body, g: &Grid| Ok(vec![g.ids[0], b.i32(0)])),
             }],
             vmem_limit: None,
+            scratch: vec![],
         };
         let c = k
             .build(|b, blk| {
