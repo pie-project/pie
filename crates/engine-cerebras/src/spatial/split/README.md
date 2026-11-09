@@ -1,7 +1,7 @@
 # The role-split wafer program (Cerebras CS-3)
 
 The role-split program runs one bf16 model on a CS-3 wafer at batch 1. It is a second wafer layout
-next to `serve8b_region`. It is built for Qwen3.5 (9B, 4B and 0.8B), Gemma 4 (E2B, E4B) and gpt-oss-20b
+next to `serve8b_region`. It is built for Qwen3.5 (9B, 4B and 0.8B), Qwen3-8B, Gemma 4 (E2B, E4B) and gpt-oss-20b
 (section 7). This file covers its design, results, build and run, the parameters and environment variables, the
 metrics, and open items.
 Serving is Rust only: `SplitModel` in this module behind the engine's `Wafer`. The Python under
@@ -87,7 +87,7 @@ and Qwen3-8B.
 | Qwen3.5-9B | role-split (wl11: 8 units 256 x 256, K 4) | 1,961 | 1,908 (0.5241 ms/step, 97.3%) | loop 381.7k cycles; GDN 11.1k / attention 11.45k a layer |
 | Qwen3.5-4B | role-split, the 9B geometry (Hc 10, Ic 36) | 2,057 | 1,998 (0.5005 ms/step, 97.1%) | GDN 10.6k / attention 10.96k |
 | Qwen3.5-0.8B | role-split, 6 units of 256 x 128 (Hc 8, Ic 14, NE 128) | 3,390 | 3,286 (0.3043 ms/step, 96.9%) | GDN 8.2k / attention 9.2k |
-| Qwen3-8B | serve8b_region, Llama levers + SLW (qw1) | 1,642 | ~1,640 decode (1,637-1,661) | 5 of 6 Pie reps golden; see the open items |
+| Qwen3-8B | role-split (9 units 256 x 228, Hc 18, K 4, gap slot; GATE 0, SLW 1) | 1,825 (0.548 ms, G2 12) | 1,811 (0.5521 ms, 99.3%, L64, G2 12) | greedy 512 and TF 512 golden; Pie 12 of 12 reps golden (G2 16 and 12). `PIE_CEREBRAS_SPLIT=<prep>:q84_:G2=12,WL=1`. serve8b_region (qw1): 1,642 |
 | Gemma 4 E2B | role-split Gemma (7 units 256 x 128, Hc 12, K 5; WSPEC 2) | 1,431 (0.6986 ms) | 1,418 (0.7053 ms, 99.0%) | greedy 720 golden; TF 256 0 mismatches |
 | Gemma 4 E4B | role-split Gemma (7 units 256 x 160, Hc 16, K 6) | 1,072 (0.9327 ms) | 1,063 (0.9404 ms, 99.2%) | global context 2,560 positions (NEG 16 x 160) |
 | gpt-oss-20b | role-split gpt-oss (12 units, K 2; CYV 2, GLUV 1) | 1,555 (0.643 ms) | 1,522 (0.6569 ms, 97.9%) | MXFP4 experts as E5M2, lossless; Pie text = bare greedy |
@@ -98,6 +98,11 @@ Notes on the table:
 - Pie runs 32-step loops (`PIE_CEREBRAS_SPLIT_LOOP=32`). Longer loops lower the per-step cost but
   lose wall time at the tail.
 - Pie's own cost is about 0.45 ms per posted launch, so Pie reaches 97% of bare.
+- Qwen3-8B: 36 dense attention layers in 9 K4 units on a 2 x 5 grid. The slot (1, 1) stays out of the snake so
+  the last unit ends on row 0 (the wafer loop's return); its PEs (`relay.csl`) only carry the vertical handoff
+  past it (`GAPX` / `GAPY`, prep meta). The hidden size is padded to PY Hc (4,104): zero weights, gammas and
+  embedding past 4,096, the norms divide by H. A 12-unit K3 layout (PY 188, Hc 22) ran at 0.559 ms and flipped the
+  golden's token 389, an exact bf16 tie (1424 and 97613 both 32.0 in HF bf16); the K4 build keeps it.
 - Gemma 4 and gpt-oss-20b serve with 64-step loops, their prep meta's `LOOP`. gpt-oss at a fixed L32 / L64 posted
   0.6634 / 0.6619 ms (1,511 tok/s); with the meta's doubling loops up to 64, 0.6569 ms. Pie's overhead in ms equals
   the previous gpt-oss build's (gpo6: 0.6779 / 0.6723 ms against 0.661 bare): the ratio fell because bare got faster.
@@ -162,7 +167,10 @@ default is the shipped build. Each kernel's header describes its own params and 
 | `force` / `nforce` | head_ctl (symbols) | - | the host forces the first `nforce` steps' tokens: a whole prompt through the loop in one launch (`PIE_CEREBRAS_SPLIT_FORCE`), and teacher-forced checks |
 | `HACC16` | head_pe | 0 | measurement: f16 head accumulation, about -1.7k cycles. It halves the 9B golden's tightest margin and, stacked with other levers, flipped it. |
 | `FIFOW` | all | 32 | the reductions' FIFO depth |
-| `SLW` | serve8b_region regions | 0 | with TRM 1024: the f16 SiLU without its subnormal flush. Planner key `silu16w`; Qwen3-8B needs it (`tools/emu/silu16.py`). |
+| `SLW` | serve8b_region regions; role-split CY | 0 | the f16 SiLU without its subnormal flush (the tail to 2^-24). Planner key `silu16w`; Qwen3-8B needs it on both layouts (`tools/emu/silu16.py`): the flush costs 2 golden tokens in emulation. |
+| `GATE` | CY | 1 | attention's q_proj carries the output gate (Qwen3.5). Qwen3 (dense): 0, NQA = Qh Dc + 2 Dc. |
+| `GAPX`, `GAPY` | layout | 255 | the unit slot left out of the snake (relay PEs); from the prep meta |
+| `RLV`, `RBITS` | CY | 4, 3 | RoPE tables: a position is RLV digits of RBITS bits, cos / sin composed from one table entry a digit; positions < 2^(RBITS RLV). The prep takes the levels its context needs (9B / 4B / 0.8B: 5) and writes them to the meta; `SplitModel` bounds its positions there. |
 
 `head_ctl`, `head_pe` and `CX` always write a few `tdbg` stamps. These are off the critical path:
 `head_ctl`'s `tdbg[2 + s]` is the token loop's clock.
@@ -214,10 +222,8 @@ They match HF f32 logprobs to within 0.004 on the chosen token.
 - **Qwen3-8B qw2 mismatch on chip.** qw2 is the Llama levers without the f16 SiLU (TRM 29695). On
   the CS-3 it gave 15 teacher-forced mismatches, with margins up to 2.77, although host emulation
   gives 0. It is a real bug, not yet found. qw1, which ships, is exact.
-- **Rep-2 near-tie flip.** On Qwen3-8B in Pie, 1 of 6 reps leaves the golden at token ~389, the
-  golden's tightest margin (0.0043). This happens at both depths. Bare is exact.
-- **Qwen3-8B on the role-split layout.** Forecast 1.66-1.75k tok/s. It needs a Qwen3 CY attention
-  kernel (q/k RMSNorm over HD 128, full RoPE, no gate).
+- **Rep-2 near-tie flip** (serve8b_region). On Qwen3-8B in Pie, 1 of 6 reps leaves the golden at token ~389, the
+  golden's tightest margin (0.0043, an exact bf16 tie). The role-split build serves Qwen3-8B now: 6 of 6 reps golden.
 
 **Experimental.** `csl/split/weight_g12.csl` and `head_g12.csl` hold Gemma 4 12B (bf16) kinds for
 the fit study. They link on a 4 x 4 harness; the attention-row kind is 47,056 B at 4k context and
