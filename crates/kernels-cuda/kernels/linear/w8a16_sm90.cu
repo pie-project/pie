@@ -8,9 +8,9 @@ namespace pie::linear {
 
 /// A block-FP8 projection (`n x k` e4m3 codes under ue8m0 exponents a row a
 /// `kGran`, 32 or 128, columns, laid in tcgen05's atoms) against a batch's
-/// bf16 rows (W8A16, at most 64 of them) on Hopper's wgmma (sm_90a), the
-/// weights as A: a CTA, one warpgroup, takes two m64 tiles of the plane's
-/// rows, the batch's rows the MMAs' n64 B. Each 128-code K chunk's batch
+/// bf16 rows (W8A16, at most `kN`, 64 or 128, of them) on Hopper's wgmma
+/// (sm_90a), the weights as A: a CTA, one warpgroup, takes two m64 tiles of
+/// the plane's rows, the batch's rows the MMAs' `kN`-wide B. Each 128-code K chunk's batch
 /// rows (two K-major 128-byte-swizzled atoms), the tiles' codes (128 bytes a
 /// row, its 16-byte runs swizzled by row) and their four exponent bytes
 /// stage through a `kStages` cp.async ring; a lane widens the A fragment
@@ -19,21 +19,23 @@ namespace pie::linear {
 /// exponent, each code once. `k` whole 128s. With `splits` > 1 a CTA sums
 /// the `blockIdx.z`-th run of chunks into `part` (`[splits, m, n]` f32) for
 /// `fp8_w8a16_fold`. Grid `[n / 128, 1, splits]`, 128 threads,
-/// `kStages * 33792 + 1024` bytes of shared memory.
-template <int kGran, int kStages>
+/// `kStages * 33792 + 1024` bytes of shared memory at 64 rows, `kStages *
+/// 50176 + 1024` at 128.
+template <int kGran, int kStages, int kN = 64>
 __global__ void __launch_bounds__(128) fp8_w8a16_wgmma(
     const bf16* __restrict__ x, int x_stride, const u8* __restrict__ codes,
     const u8* __restrict__ atoms, bf16* __restrict__ y, int y_stride, int m, int n, int k,
     const u32* __restrict__ win, float* __restrict__ part, int splits) {
     static_assert(kGran == 32 || kGran == 128, "a block is 32 or 128 columns of K");
+    static_assert(kN == 64 || kN == 128, "the batch's rows are an n64 or an n128 B");
     constexpr int kT = 2;
     constexpr int kThreads = 128;
-    constexpr int kAtom = 64 * 128;
+    constexpr int kAtom = kN * 128;
     constexpr int kRows = 64 * kT;
     constexpr int kB = 2 * kAtom;
     constexpr int kCodes = kRows * 128;
     constexpr int kStage = (kB + kCodes + kRows * 4 + 1023) / 1024 * 1024;
-    constexpr int kRuns = 64 * 16 / kThreads;
+    constexpr int kRuns = kN * 16 / kThreads;
     constexpr int kSegs = kRows * 8 / kThreads;
 
     int rows = m;
@@ -88,11 +90,11 @@ __global__ void __launch_bounds__(128) fp8_w8a16_wgmma(
         asm volatile("cp.async.commit_group;\n" ::);
     };
 
-    float acc[kT][8][4];
+    float acc[kT][kN / 8][4];
 #pragma unroll
     for (int t = 0; t < kT; ++t)
 #pragma unroll
-        for (int b = 0; b < 8; ++b)
+        for (int b = 0; b < kN / 8; ++b)
 #pragma unroll
             for (int e = 0; e < 4; ++e) acc[t][b][e] = 0.f;
 
@@ -142,7 +144,7 @@ __global__ void __launch_bounds__(128) fp8_w8a16_wgmma(
             const unsigned long long db = wgfp8::desc(st + (s >> 2) * kAtom + (s & 3) * 32);
             asm volatile("wgmma.fence.sync.aligned;\n" ::: "memory");
 #pragma unroll
-            for (int t = 0; t < kT; ++t) wgfp4::mma(reinterpret_cast<float(&)[32]>(acc[t]), as[t], db);
+            for (int t = 0; t < kT; ++t) wgfp4::mma(reinterpret_cast<float(&)[kN / 2]>(acc[t]), as[t], db);
             asm volatile("wgmma.commit_group.sync.aligned;\n" ::: "memory");
             asm volatile("wgmma.wait_group.sync.aligned 1;\n" ::: "memory");
 #pragma unroll
@@ -155,7 +157,7 @@ __global__ void __launch_bounds__(128) fp8_w8a16_wgmma(
 #pragma unroll
     for (int t = 0; t < kT; ++t)
 #pragma unroll
-        for (int j = 0; j < 8; ++j)
+        for (int j = 0; j < kN / 8; ++j)
 #pragma unroll
             for (int q = 0; q < 4; ++q) {
                 const int tok = 8 * j + 2 * c + (q & 1);
