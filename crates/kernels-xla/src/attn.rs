@@ -3,6 +3,7 @@ pub mod dense;
 pub mod index;
 pub mod merge;
 pub mod mla;
+pub mod pages;
 pub mod paged;
 pub mod pool;
 pub mod ragged;

@@ -595,11 +595,32 @@ fn a_window_walk_bounded_by_its_rows_reach_answers_the_same_bits() {
     }
 }
 
+/// A batched decode through the page-copy kernel (`kernel.attn.decode_pages`)
+/// answers the reference as the walk does.
+#[test]
+fn a_batched_decode_through_the_page_copy_kernel_answers_the_reference() {
+    let mut tuning = kernels_xla::tuning::Tuning::DEFAULT;
+    tuning.chunks.decode_pages = 8;
+    for (qh, kvh, d) in [(16usize, 8usize, 128usize), (8, 2, 128), (8, 2, 256)] {
+        long_decode_with(qh, kvh, d, None, tuning);
+    }
+}
+
 fn long_decode(qh: usize, kvh: usize, d: usize) {
     long_decode_in(qh, kvh, d, None);
 }
 
 fn long_decode_in(qh: usize, kvh: usize, d: usize, window: Option<u32>) {
+    long_decode_with(qh, kvh, d, window, kernels_xla::tuning::Tuning::DEFAULT);
+}
+
+fn long_decode_with(
+    qh: usize,
+    kvh: usize,
+    d: usize,
+    window: Option<u32>,
+    tuning: kernels_xla::tuning::Tuning,
+) {
     let mut rng = Rng(5);
     let ps = 16;
     // 64 lanes over 90 pages; lane l holds 1 + (l * 37) % 80 pages of a
@@ -615,7 +636,7 @@ fn long_decode_in(qh: usize, kvh: usize, d: usize, window: Option<u32>) {
     let n = rows.len();
     let q = rng.bf16s(n * qh * d, 1.0);
     let scale = 0.125;
-    let mut b = Bench::new();
+    let mut b = Bench::new().with_tuning(tuning);
     let kv = pool.bind(&mut b);
     let plan = fire.decode(&mut b);
     let qt = b.bf16(n as u32, (qh * d) as u32, &q);
