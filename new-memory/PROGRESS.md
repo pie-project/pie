@@ -78,3 +78,39 @@ The `new-memory/` directory is bookkeeping and is removed before anything lands 
   evacuate the top segment then `shrink_all` after frames drain; target bytes -> segment count (round down on fall,
   one segment per calm tick up); Critical / refused map -> evacuate+release top segment; floor pinned in segment 0.
 - Linux check: `cargo check` kernels-metal, engine-metal, runtime on new-memory.
+
+### M5 — 2026-11-09: BWk-prep, R1, R4, P2, P3 merged
+- **BWk-prep** (b37de3e4e, d7d729ce3): `Removed<G>` + `removed_keys!` — a removed config key refuses the file with
+  "`key` was removed: <why>; delete the key" (TOML/JSON, `pie config set/get`, templates can't emit it). wgpu: a
+  storage view past `max_storage_buffer_binding_size` is an error (was silently clamped) and `max_buffer` is capped
+  at the binding limit; Vulkan: `max_buffer = min(maxStorageBufferRange, maxMemoryAllocationSize, maxBufferSize)`,
+  over-range views refused (1GiB floor gone). Caveat: small-limit devices now refuse what used to load truncated.
+  No real GPU run.
+- **R1** (bbb669d1b): `runtime::store::{slots, segments}` — `SlotPool` with refcounted slots, holders
+  (WorkingSet/CacheEntry/Snapshot), epoch-gated reuse, logical vs physical chunks, budget
+  `reserved + state + act(rung) <= committed`, `demand()` in bytes, segments with `plan_evacuation` (whole chunks
+  into lower segments), `commit_ahead`. 24 seeds x 3000-step property run. Perf vs store/pool.rs: one-at-a-time
+  1.5x, batch of 1M chunks 11.7x slower (follow-up; real pools have far fewer chunks).
+- **R4** (5b3fd0aab): `policy::pressure::{raise, relieve}`, bands clear/short/critical with hysteresis,
+  `Edge::TierPressure` once per crossing, byte attrs `{device,host}-{total,state,live,wanted,act,short}-bytes`,
+  per-working-set kv/state bytes, `may_drop(key) = key <= 0`, `on_tier_pressure` in the policy SDK, and a default
+  responder (policy layer) used when no policy subscribes: discards lowest retention key first. Policy thread always
+  runs. Follow-ups for R3: wire `may_drop` into reclaim_idle/reclaim_cache; waiters keep raising while parked.
+  Decision: keys at `i64::MAX` are pinned and never discarded by the default responder (to implement in R3).
+- **P2** (a190590c6): the stream scheduler orders regions by the cache/state row they touch, not by kv space.
+  Proof over every deployment x {Cuda, Metal, Wgpu, Vulkan} x {default, dag_streams}: new edges are a subset of the
+  old, 0 violations (132.9M dropped edges checked). 3640 plans: 3560 identical; under dag_streams 56 gain concurrency
+  (gpt-oss-20b 72->1194, gpt-oss-120b 108->2709), 24 lose some (greedy lane assignment, e.g. qwen35-d9b-dflash
+  452->383). Remaining `space` readers: IR fields (`CacheRow::Kv.space`, `Mask/Geometry{space}`), fixtures and three
+  bake tests.
+- **P3** (a754736ca): `poem_compiler::chunk::plan(trace, budgets, profile) -> ChunkRecipe` with List/Ring/Fixed
+  layouts, atoms (Heads/Channels/Frames/Tokens/Whole), rs buffer derived as fixed `[16, width]` rows, waste
+  breakdown, `per_rank(tp)`; `DeviceProfile.chunk` presets SERVER_CUDA / ON_DEVICE_METAL / TPU. All 455 deployments
+  plan under both presets with invariants holding; worst waste on a real model ~0.9% server, ~5.9% Metal.
+  Examples (server): qwen3-next C=17.2M, L16x384K + F36x1.3M (fixed 95.5MiB/ws incl. 2 sets); nemotron-super
+  C=12.2M, F40x4.1M; gemma4-31b C=25M, L16x1.2M + R1024:16x12.5M*67; dsv4-pro C=25.2M, one list for all ~90 spaces;
+  wan22 F447x9.1M (4GiB/clip). To review later: ring cap uses fire_rows=16 (bigger prefill borrows activation
+  pages); both fixed sets include the rs buffer; server C lands 8-32MiB; preset numbers are placeholders.
+- Verified on new-memory after merges: runtime lib 186/186 (builtins now build: nightly-2026-10-18 got its cargo
+  component), worker 12/12, poem-compiler lib 28/28, `cargo check` engine-cuda/metal/xla/wgpu/vulkan, poem-exec.
+- Still running: P1 (poem state() API), P4 (CUDA kv stride), P5 (CUDA state segments), P8 (golden baseline).
