@@ -33,3 +33,15 @@ The `new-memory/` directory is bookkeeping and is removed before anything lands 
 - Batch A in flight: E1 engine chunk API, R1 runtime SlotPool, G1-core governor on segments,
   R4 tier-pressure plumbing + default responder, BWk-prep (`Removed` config keys, wgpu/vulkan binding limits).
 - Batch 1 still running: P1, P2, P3, P4, P5, P6, P8.
+
+### M2 — 2026-11-09: G1-core merged
+- `sc/g1-governor-core` (d8ce7ce9c): the governor drives the pool only through a `PoolTarget` trait
+  (demand, segment_bytes, floor, growth Fixed|Elastic, retarget -> Reached|NoRoom, shrink_rung/restore_rung)
+  and moves in whole segments. No method can drop state. Shrink without room keeps the segment and raises
+  `TierPressure` once (then `Eased`); Critical drops to the floor and a smaller rung; Fixed pools never shrink.
+  Today's `Extent` implements the trait (1-byte segments), so behavior is unchanged.
+- Verified: `PIE_BUILTINS=skip cargo test -p runtime --lib governor` 34/34, clippy clean; `cargo check -p runtime` on new-memory.
+- Environment note: the builtins build script needs nightly-2026-10-18 with the cargo component, missing here;
+  runtime tests run with `PIE_BUILTINS=skip`.
+- Remaining for G1-wire: PoolTarget on R1's SlotPool, Signal -> R4 tier-pressure, real rung selection
+  (then delete yield_scratch/narrow/NARROW_WAVE), replace ExtentPool/extent.rs after R2.
