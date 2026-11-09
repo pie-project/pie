@@ -136,7 +136,7 @@ pub struct AttnBlockKeys(pub u32);
 /// written into a copy of the whole carried output, at a larger program
 /// (more host memory to compile).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Decision)]
-#[decision(id = "kernel.attn.unrolled_blocks", constant(range(1..=16)), default = 16, tune = search)]
+#[decision(id = "kernel.attn.unrolled_blocks", constant(range(1..=16)), default = 1, tune = search)]
 pub struct AttnUnrolledBlocks(pub u32);
 
 /// Tokens per chunk of the scalar-decay (GDN) chunked scan.
@@ -268,7 +268,7 @@ impl Tuning {
             budget: 1 << 24,
             block_rows: 512,
             block_keys: 512,
-            unrolled: 16,
+            unrolled: 1,
             window_reach: true,
         },
         ssm: SsmChunks {
