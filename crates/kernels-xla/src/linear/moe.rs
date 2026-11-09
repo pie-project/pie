@@ -1384,8 +1384,13 @@ fn routed(
     let grouped = gmm_spec(fan, &bank, f.elem(bank.codes.val()), tuning, out);
     let path = match tuning.moe_path {
         MoePath::Gmm if grouped.is_none() => MoePath::All,
+        // One token's pairs route to as many experts: sliced out, they read
+        // what the grouped matmul would, without its sort (v6e,
+        // Qwen3.6-35B-A3B's 4 MiB experts: Raw decode 133 -> 176 tok/s).
         MoePath::Auto { .. }
-            if p <= c.slice_pairs && p * expert_bytes.max(c.slice_bytes) < bank_bytes =>
+            if p <= c.slice_pairs
+                && ((fan.tokens == 1 && grouped.is_some())
+                    || p * expert_bytes.max(c.slice_bytes) < bank_bytes) =>
         {
             MoePath::Slice
         }
