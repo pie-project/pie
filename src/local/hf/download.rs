@@ -468,6 +468,116 @@ fn link_into_snapshot(snapshot_dir: &Path, blobs_dir: &Path, entry: &Entry) -> R
     Ok(())
 }
 
+/// What a hollow snapshot fetches whole: the configuration, tokenizer and
+/// template files at the repository's top, each under this size.
+const HOLLOW_WHOLE: [&str; 5] = ["*.json", "*.jinja", "*.model", "*.txt", "*.tiktoken"];
+const HOLLOW_WHOLE_LIMIT: u64 = 64 << 20;
+
+/// A safetensors header larger than this is no header.
+const HEADER_LIMIT: u64 = 256 << 20;
+
+/// `repo_id` as a snapshot under `root` that holds its configuration and
+/// tokenizer whole and each `model*.safetensors` as its header and a hole
+/// the size of its data: what reading a checkpoint's names, shapes and
+/// configuration needs, at the cost of its headers. Every byte of the
+/// weights reads as zero, so it is for inspecting, never for importing.
+pub async fn hollow_snapshot(repo_id: &str, root: &Path) -> Result<PathBuf> {
+    let client = client()?;
+    let token = token();
+    let sha = revision_sha(&client, repo_id, "main", token.as_deref()).await?;
+    let files = list_files(&client, repo_id, &sha, token.as_deref()).await?;
+    let dir = root.join(&sha);
+    std::fs::create_dir_all(&dir).with_context(|| format!("creating {}", dir.display()))?;
+    let mut weights = 0usize;
+    for entry in files {
+        if entry.path.contains('/') {
+            continue;
+        }
+        let url = format!("{}/{repo_id}/resolve/{sha}/{}", endpoint(), entry.path);
+        let target = dir.join(&entry.path);
+        if glob_match("model*.safetensors", &entry.path) {
+            if std::fs::metadata(&target).is_ok_and(|m| m.len() == entry.size) {
+                weights += 1;
+                continue;
+            }
+            let length = ranged(&client, &url, 0, 8, token.as_deref()).await?;
+            let header_len = u64::from_le_bytes(
+                length
+                    .as_slice()
+                    .try_into()
+                    .map_err(|_| anyhow!("{}: no safetensors header", entry.path))?,
+            );
+            if header_len > HEADER_LIMIT || 8 + header_len > entry.size {
+                bail!(
+                    "{}: a header of {header_len} bytes is no safetensors header",
+                    entry.path
+                );
+            }
+            let header = ranged(&client, &url, 8, header_len, token.as_deref()).await?;
+            let fresh = target.with_extension("safetensors.hollow");
+            {
+                use std::io::Write;
+                let mut file = std::fs::File::create(&fresh)
+                    .with_context(|| format!("creating {}", fresh.display()))?;
+                file.write_all(&length)?;
+                file.write_all(&header)?;
+                file.set_len(entry.size)?;
+            }
+            std::fs::rename(&fresh, &target)?;
+            weights += 1;
+        } else if HOLLOW_WHOLE.iter().any(|p| glob_match(p, &entry.path))
+            && entry.size <= HOLLOW_WHOLE_LIMIT
+        {
+            if std::fs::metadata(&target).is_ok_and(|m| m.len() == entry.size) {
+                continue;
+            }
+            let response = authorized(client.get(&url), token.as_deref())
+                .send()
+                .await
+                .with_context(|| format!("fetching {}", entry.path))?;
+            if !response.status().is_success() {
+                return Err(hub_error(repo_id, response.status()));
+            }
+            let bytes = response.bytes().await?;
+            std::fs::write(&target, &bytes)
+                .with_context(|| format!("writing {}", target.display()))?;
+        }
+    }
+    if weights == 0 {
+        bail!("{repo_id}@{sha} holds no model*.safetensors at its top; pie reads no other");
+    }
+    Ok(dir)
+}
+
+/// `len` bytes of `url` from `start`.
+async fn ranged(
+    client: &reqwest::Client,
+    url: &str,
+    start: u64,
+    len: u64,
+    token: Option<&str>,
+) -> Result<Vec<u8>> {
+    let response = authorized(client.get(url), token)
+        .header(
+            reqwest::header::RANGE,
+            format!("bytes={start}-{}", start + len - 1),
+        )
+        .send()
+        .await
+        .with_context(|| format!("reading {url}"))?;
+    if response.status() != reqwest::StatusCode::PARTIAL_CONTENT {
+        bail!(
+            "{url}: asked for a range, the hub returned {}",
+            response.status()
+        );
+    }
+    let bytes = response.bytes().await?;
+    if bytes.len() as u64 != len {
+        bail!("{url}: asked for {len} bytes, got {}", bytes.len());
+    }
+    Ok(bytes.to_vec())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

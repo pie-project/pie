@@ -1,6 +1,6 @@
 pub mod download;
 
-pub use download::{Progress, snapshot_download};
+pub use download::{Progress, hollow_snapshot, snapshot_download};
 
 pub fn resolve_cache_dir() -> std::path::PathBuf {
     use std::path::PathBuf;

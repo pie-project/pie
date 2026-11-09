@@ -40,6 +40,16 @@ pie config init
 pie model import Qwen/Qwen3.5-0.8B
 ```
 
+A checkpoint of a family Pie knows at a size it does not list (Qwen3-4B, a
+Llama 3.2, a fine-tune) is adopted first: `pie model adopt` reads its
+configuration and weight headers, explains what the model is, and writes the
+package that serves it.
+
+```bash
+pie model adopt Qwen/Qwen3-4B      # --dry-run to see what it would write
+pie model import Qwen/Qwen3-4B
+```
+
 See the [install guide](https://pie-project.org/docs/install) for manual
 archives and GPU flavors, or run Pie in your browser on the [Playground].
 
