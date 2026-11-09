@@ -95,7 +95,7 @@ pub fn matmul_select(
             routes.rows,
             fan.route_count,
         ) {
-            return select_tc5(
+            return select_tc5_with(
                 ctx,
                 OP,
                 x,
@@ -107,6 +107,7 @@ pub fn matmul_select(
                 routes,
                 y,
                 crate::linear::gemm_sm100::Epilogue::STORE,
+                (experts, Planes::Dense),
             );
         }
         // Where there are no tcgen05 GEMMs, a batch whose experts fill their
@@ -178,7 +179,7 @@ pub(crate) fn tc5_worth(
         && (tokens >= ctx.tuning().moe_tc5_from || routes >= 2 * count || routes > MAX_GRID_Y)
         && x.dtype == Dtype::Bf16
         && bank == Dtype::Bf16
-        && !experts.tabled()
+        && !experts.streams()
         && x.width.is_multiple_of(64)
         && y.width.is_multiple_of(64)
         && crate::linear::gemm_sm100::supported()
@@ -198,6 +199,33 @@ pub(crate) fn select_tc5(
     routes: Tensor,
     y: &mut Tensor,
     epi: crate::linear::gemm_sm100::Epilogue,
+) -> Result<(), Error> {
+    select_tc5_with(
+        ctx,
+        op,
+        x,
+        w,
+        experts,
+        routes,
+        y,
+        epi,
+        (ExpertTable::RESIDENT, Planes::Dense),
+    )
+}
+
+/// [`select_tc5`] over the experts `table` places, a bank of `planes`.
+#[cfg(feature = "cuda")]
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn select_tc5_with(
+    ctx: &Ctx,
+    op: &'static str,
+    x: Tensor,
+    w: crate::linear::gemm_sm100::Operand,
+    experts: u32,
+    routes: Tensor,
+    y: &mut Tensor,
+    epi: crate::linear::gemm_sm100::Epilogue,
+    (table, planes): (ExpertTable, Planes),
 ) -> Result<(), Error> {
     use crate::linear::{act_quant, gemm_sm100};
     const GROUPED_X: &str = "linear.moe_tc5_x";
@@ -219,11 +247,7 @@ pub(crate) fn select_tc5(
         gemm_sm100::Operand::plain(xs, gemm_sm100::Elem::Bf16),
         w,
         ys,
-        gemm_sm100::Grouped {
-            experts,
-            groups: layout.groups,
-            alpha_e: 0,
-        },
+        gemm_sm100::Grouped::contiguous(experts, layout.groups, 0).tabled(table, planes),
         [n, k],
         1.0,
         // An expert's padding rows land nowhere.

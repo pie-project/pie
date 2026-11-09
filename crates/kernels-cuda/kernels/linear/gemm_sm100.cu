@@ -2,6 +2,7 @@
 #include "prim/device.cuh"
 #include "prim/mma_sm100.cuh"
 #include "prim/act.cuh"
+#include "linear/moe/table.cuh"
 
 namespace pie::linear {
 
@@ -62,6 +63,18 @@ struct Epi {
     // The routing entries shared memory holds (a grouped launch's experts and
     // one, at most 1028; `kernel.moe.routes_sized`), or 0 for 1028.
     int route_cap;
+    // A grouped launch's expert table (`linear/moe/table.cuh`), or null for
+    // the contiguous bank: `wplanes` entries an expert, plane 0 the weight's
+    // codes (its TMA rows), 1 its scales (atom-laid: a 128-row block a row
+    // here; a W4A16 weight's row-major ones, a weight row a row), 2 its bias,
+    // f32 row scale or affine zeros. Plane p's rows lie `wrow_bytes[p]` bytes
+    // apart from `wbase[p]` on, where its map and the epilogue's pointer are
+    // based; an expert's rows are resolved once a unit.
+    const u64* wtable;
+    int wplanes;
+    int wpad;
+    u64 wbase[3];
+    long long wrow_bytes[3];
 };
 
 namespace tc5k {
@@ -523,6 +536,23 @@ __global__ __launch_bounds__(kMix != 0 ? 224 + 32 * tc5k::kXWarps : 224, 1) void
         int out_p, out_q, lim_p, lim_q, s_row;
         int e;     // the expert (grouped), else 0
         int ks;  // which of its tile's K splits
+        // Tabled: the expert's first bank row (e * n_per) and each weight
+        // plane's first row where the table puts it.
+        int w0;
+        int wr[3];
+    };
+    // A tabled launch's weight side: P swapped, Q contiguous unswapped.
+    constexpr bool kWP = kGroup != 0 && kSwap;
+    constexpr bool kWQ = kGroup == 1 && !kSwap;
+    const bool tabled = kGroup != 0 && epi.wtable != nullptr;
+    // Bank row `row` of the unit's expert in weight plane `plane`'s rows
+    // (the contiguous bank: itself).
+    auto wphys = [&](const Unit& x, int plane, int row) -> int {
+        return tabled ? x.wr[plane] + (row - x.w0) : row;
+    };
+    // Its 128-row scale block (atom-laid scales).
+    auto wblock = [&](const Unit& x, int row) -> int {
+        return tabled ? x.wr[1] + (row - x.w0) / 128 : row / 128;
     };
     // Every role walks the same units and skips the same empty ones (a
     // contiguous tile past the routed rows, a masked tile past its count).
@@ -644,6 +674,22 @@ __global__ __launch_bounds__(kMix != 0 ? 224 + 32 * tc5k::kXWarps : 224, 1) void
         x.quarter = static_cast<u32>(q_scale_row % 128) / 32;
         // The scale row a quantized store gives y's first row of this tile.
         x.s_row = kSwap ? (kGroup == 2 ? e * epi.pad + qt * kBN : x.out_q) : x.out_p;
+        // The expert's planes, once a unit, before any reduction step.
+        x.w0 = e * n_per;
+        if (tabled) {
+#pragma unroll
+            for (int pl = 0; pl < 3; ++pl) {
+                x.wr[pl] = pl < epi.wplanes && epi.wrow_bytes[pl] > 0
+                    ? static_cast<int>(expert_row(epi.wtable, epi.wplanes, pl, e, n_per,
+                                                  epi.wbase[pl], epi.wrow_bytes[pl]))
+                    : 0;
+            }
+            if constexpr (kWP) {
+                x.p_block = wblock(x, x.p_row);
+            } else if constexpr (kWQ) {
+                x.q_block = wblock(x, x.q_row);
+            }
+        }
         if (kGroup != 0 && alpha_e != nullptr) {
             x.alpha *= __ldg(&alpha_e[e]);
         }
@@ -674,8 +720,11 @@ __global__ __launch_bounds__(kMix != 0 ? 224 + 32 * tc5k::kXWarps : 224, 1) void
                 if (!unit_of(t, x)) {
                     continue;
                 }
-                const int p0 = x.p_row + static_cast<int>(rank) * 128;
-                const int q0 = x.q_row + static_cast<int>(rank * kQRows);
+                // The weight side's rows where the table puts them.
+                const int p_at = kWP ? wphys(x, 0, x.p_row) : x.p_row;
+                const int q_at = kWQ ? wphys(x, 0, x.q_row) : x.q_row;
+                const int p0 = p_at + static_cast<int>(rank) * 128;
+                const int q0 = q_at + static_cast<int>(rank * kQRows);
                 for (int kb = x.kb0; kb < x.kb1; ++kb) {
                     bar_wait(&empty[s], phase ^ 1);
                     if (leader) {
@@ -721,15 +770,15 @@ __global__ __launch_bounds__(kMix != 0 ? 224 + 32 * tc5k::kXWarps : 224, 1) void
                     if (ahead) {
                         // The activations: lane 1's.
                     } else if constexpr (kMixQ && kFused) {
-                        load_raw(raw_s, &map_q, x.q_row);
-                        load_raw(raw_s + 128 * 32, &map_q, x.q_row + inter);
+                        load_raw(raw_s, &map_q, q_at);
+                        load_raw(raw_s + 128 * 32, &map_q, q_at + inter);
                     } else if constexpr (kMixQ) {
                         load_raw(raw_s, &map_q, q0);
                     } else if constexpr (kFused && !kSwap && kPair == 1) {
-                        load2(tile_q, &map_q, x.q_row, kBoxQ);
-                        load2(tile_q + 128 * 128, &map_q, x.q_row + inter, kBoxQ);
+                        load2(tile_q, &map_q, q_at, kBoxQ);
+                        load2(tile_q + 128 * 128, &map_q, q_at + inter, kBoxQ);
                     } else if constexpr (kFused && !kSwap) {
-                        load2(tile_q, &map_q, x.q_row + static_cast<int>(rank) * inter, kBoxQ);
+                        load2(tile_q, &map_q, q_at + static_cast<int>(rank) * inter, kBoxQ);
                     } else {
                         load2(tile_q, &map_q, q0, kBoxQ);
                     }
@@ -747,7 +796,8 @@ __global__ __launch_bounds__(kMix != 0 ? 224 + 32 * tc5k::kXWarps : 224, 1) void
                         } else if constexpr (kFused && !kSwap) {
                             for (int h = 0; h < 2; ++h) {
                                 load3(sf_q + h * kAtomsQ * 512, &map_sfq, atom_q,
-                                      (x.q_row + h * inter) / 128);
+                                      kWQ ? wblock(x, x.q_row + h * inter)
+                                          : (x.q_row + h * inter) / 128);
                             }
                         } else {
                             load3(sf_q, &map_sfq, atom_q, x.q_block);
@@ -1016,16 +1066,19 @@ __global__ __launch_bounds__(kMix != 0 ? 224 + 32 * tc5k::kXWarps : 224, 1) void
 #pragma unroll
                 for (u32 i = 0; i < kIters; ++i) {
                     const int g = wrow(t / 8 + kRowStep * i);
+                    // Its scale row and (affine) zero row where the table puts them.
+                    const int gs = wphys(x, 1, g);
                     if constexpr (kAffine) {
-                        const size_t at = static_cast<size_t>(g) * sf_cols + col;
+                        const size_t at = static_cast<size_t>(gs) * sf_cols + col;
+                        const size_t az = static_cast<size_t>(wphys(x, 2, g)) * sf_cols + col;
                         const unsigned char* zeros = reinterpret_cast<const unsigned char*>(epi.wzero);
                         sb[i] = g < weight_rows
                                     ? tc5k::ld_nc_u16(epi.wsf + 2 * at) |
-                                          (tc5k::ld_nc_u16(zeros + 2 * at) << 16)
+                                          (tc5k::ld_nc_u16(zeros + 2 * az) << 16)
                                     : 0u;
                     } else {
                         sb[i] = g < weight_rows
-                                    ? tc5k::ld_nc_u8(epi.wsf + static_cast<size_t>(g) * sf_cols + col)
+                                    ? tc5k::ld_nc_u8(epi.wsf + static_cast<size_t>(gs) * sf_cols + col)
                                     : 0u;
                     }
                 }
@@ -1050,22 +1103,26 @@ __global__ __launch_bounds__(kMix != 0 ? 224 + 32 * tc5k::kXWarps : 224, 1) void
 #pragma unroll
                     for (u32 h = 0; h < kPT; ++h) {
                         const int g = wrow(h * 128 + r);
+                        const int gs = wphys(x, 1, g);
                         if constexpr (kAffine) {
+                            const int gz = wphys(x, 2, g);
                             sc[h] = 0;
                             const unsigned char* zeros =
                                 reinterpret_cast<const unsigned char*>(epi.wzero);
 #pragma unroll
                             for (int q = 0; q < kGroups; ++q) {
-                                const size_t at = static_cast<size_t>(g) * sf_cols +
+                                const size_t at = static_cast<size_t>(gs) * sf_cols +
                                                   (kb * 64 + q * 32) / kWGran;
+                                const size_t atz = static_cast<size_t>(gz) * sf_cols +
+                                                   (kb * 64 + q * 32) / kWGran;
                                 az[h][q] = g >= weight_rows
                                                ? 0u
                                                : tc5k::ld_nc_u16(epi.wsf + 2 * at) |
-                                                     (tc5k::ld_nc_u16(zeros + 2 * at) << 16);
+                                                     (tc5k::ld_nc_u16(zeros + 2 * atz) << 16);
                             }
                         } else {
                             const unsigned char* at =
-                                epi.wsf + static_cast<size_t>(g) * sf_cols + kb * kSfStage;
+                                epi.wsf + static_cast<size_t>(gs) * sf_cols + kb * kSfStage;
                             sc[h] = g >= weight_rows ? 0u
                                     : kSfStage == 2  ? tc5k::ld_nc_u16(at)
                                                      : tc5k::ld_nc_u32(at);
@@ -1200,9 +1257,9 @@ __global__ __launch_bounds__(kMix != 0 ? 224 + 32 * tc5k::kXWarps : 224, 1) void
             // the GLU: a swapped thread's row holds one, an unswapped chunk a
             // column each. Of a tile's K splits, the first adds it.
             const bool biased = epi.bias != nullptr && x.kb0 == 0;  // one split adds it
-            const float bias_row = kSwap && biased && live ? bf16_to_f32(epi.bias[x.p_row + i]) : 0.f;
+            const float bias_row = kSwap && biased && live ? bf16_to_f32(epi.bias[wphys(x, 2, x.p_row) + i]) : 0.f;
             const float bias_row_up =
-                kSwap && kFused && biased && live ? bf16_to_f32(epi.bias[x.p_row + inter + i]) : 0.f;
+                kSwap && kFused && biased && live ? bf16_to_f32(epi.bias[wphys(x, 2, x.p_row) + inter + i]) : 0.f;
             // An unswapped chunk's column factors, a lane each column: the
             // chunk's values take them by shuffle (one load a lane, not 32
             // a thread).
@@ -1214,7 +1271,7 @@ __global__ __launch_bounds__(kMix != 0 ? 224 + 32 * tc5k::kXWarps : 224, 1) void
                 if constexpr (!kSwap) {
                     const int c = static_cast<int>(c0 + lane);
                     if (c < x.lim_q) {
-                        const int at = x.q_row + c;
+                        const int at = wphys(x, 2, x.q_row) + c;
                         if (epi.wscale != nullptr) {
                             f.ws = epi.wscale[at];
                             if constexpr (kFused) {
@@ -1244,9 +1301,9 @@ __global__ __launch_bounds__(kMix != 0 ? 224 + 32 * tc5k::kXWarps : 224, 1) void
             // An f32 scale each weight row (NVFP4's tensor scale), on the
             // product before the bias.
             const bool wscaled = epi.wscale != nullptr;
-            const float ws_row = kSwap && wscaled && live ? epi.wscale[x.p_row + i] : 1.f;
+            const float ws_row = kSwap && wscaled && live ? epi.wscale[wphys(x, 2, x.p_row) + i] : 1.f;
             const float ws_row_up =
-                kSwap && kFused && wscaled && live ? epi.wscale[x.p_row + inter + i] : 1.f;
+                kSwap && kFused && wscaled && live ? epi.wscale[wphys(x, 2, x.p_row) + inter + i] : 1.f;
             auto ws_col = [&](const Cols& f, int j, bool up) -> float {
                 if (!wscaled) {
                     return 1.f;
