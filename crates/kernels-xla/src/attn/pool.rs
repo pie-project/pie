@@ -453,28 +453,12 @@ pub fn gather(
         .saturating_sub(1)
         .max(1);
     let most = (n / r + lanes).min(n);
-    if most < n {
-        let has = cmp_i(f, Cmp::Ge, bpos, 0)?;
-        let ti = f.convert(has, Elem::I32);
-        let rank = f.scan(ti, 0, Fold::Sum)?;
-        let one = f.like_i(rank, 1);
-        let rank = f.sub(rank, one)?;
-        let drop = f.like_i(rank, DROP);
-        let at = f.select(has, rank, drop)?;
-        let row = f.iota(Elem::I32, &[n, 1], 0);
-        let none = f.const_i(Elem::I32, -1, &[most, 1]);
-        let pick = f.put_rows(none, at, row, Combine::Set)?;
-        let pick = f.reshape(pick, &[most])?;
-        let live = cmp_i(f, Cmp::Ge, pick, 0)?;
-        let neg = f.like_i(pick, -1);
-        let bp = take(f, bpos, pick)?;
-        let bp = f.select(live, bp, neg)?;
-        let br = take(f, breq, pick)?;
-        let got = gather_rows(
+    let every = move |f: &mut Func| -> Built<Val> {
+        gather_rows(
             f,
-            bp,
-            br,
-            most,
+            bpos,
+            breq,
+            n,
             indices,
             indptr,
             ps,
@@ -485,28 +469,71 @@ pub fn gather(
             state_kv,
             state_score,
             ape,
+        )
+    };
+    if most < n {
+        let (pick, live, over) = closing(f, bpos, n, most)?;
+        let few = move |f: &mut Func| -> Built<Val> {
+            let neg = f.like_i(pick, -1);
+            let bp = take(f, bpos, pick)?;
+            let bp = f.select(live, bp, neg)?;
+            let br = take(f, breq, pick)?;
+            let got = gather_rows(
+                f,
+                bp,
+                br,
+                most,
+                indices,
+                indptr,
+                ps,
+                hd,
+                r,
+                coff,
+                window,
+                state_kv,
+                state_score,
+                ape,
+            )?;
+            let zero = f.const_f(Elem::F32, 0.0, &[n, hd]);
+            let gone = f.like_i(pick, DROP);
+            let back = f.select(live, pick, gone)?;
+            f.put_rows(zero, back, got, Combine::Set)
+        };
+        let ty = crate::hlo::Ty::new(Elem::F32, &[n, hd]);
+        let out = f.case(
+            over,
+            &[ty],
+            vec![
+                Box::new(move |f| Ok(vec![few(f)?])),
+                Box::new(move |f| Ok(vec![every(f)?])),
+            ],
         )?;
-        let zero = f.const_f(Elem::F32, 0.0, &[n, hd]);
-        let gone = f.like_i(pick, DROP);
-        let back = f.select(live, pick, gone)?;
-        return Ok(f.put_rows(zero, back, got, Combine::Set)?);
+        return Ok(out[0]);
     }
-    gather_rows(
-        f,
-        bpos,
-        breq,
-        n,
-        indices,
-        indptr,
-        ps,
-        hd,
-        r,
-        coff,
-        window,
-        state_kv,
-        state_score,
-        ape,
-    )
+    Ok(every(f)?)
+}
+
+/// The first `most` of the `n` rows that close a block (`bpos >= 0`), in row
+/// order: their rows (`[most]`, -1 past the count), which are live, and an
+/// i32 flag set when more rows close than `most` holds (rows not each a
+/// lane's run of positions), when the caller reads every row instead.
+fn closing(f: &mut Func, bpos: Val, n: i64, most: i64) -> Built<(Val, Val, Val)> {
+    let has = cmp_i(f, Cmp::Ge, bpos, 0)?;
+    let ti = f.convert(has, Elem::I32);
+    let count = f.reduce(ti, &[0], Fold::Sum)?;
+    let over = cmp_i(f, Cmp::Gt, count, most)?;
+    let over = f.convert(over, Elem::I32);
+    let rank = f.scan(ti, 0, Fold::Sum)?;
+    let one = f.like_i(rank, 1);
+    let rank = f.sub(rank, one)?;
+    let drop = f.like_i(rank, DROP);
+    let at = f.select(has, rank, drop)?;
+    let row = f.iota(Elem::I32, &[n, 1], 0);
+    let none = f.const_i(Elem::I32, -1, &[most, 1]);
+    let pick = f.put_rows(none, at, row, Combine::Set)?;
+    let pick = f.reshape(pick, &[most])?;
+    let live = cmp_i(f, Cmp::Ge, pick, 0)?;
+    Ok((pick, live, over))
 }
 
 /// [`gather`] for the rows whose boundaries are `bpos`/`breq` (`[n]`).
@@ -525,7 +552,7 @@ fn gather_rows(
     state_kv: Operand,
     state_score: Operand,
     ape: Option<Operand>,
-) -> Result<Val, Error> {
+) -> Built<Val> {
     let sk = state_kv.val;
     let ss = state_score.val;
     let ape = ape.map(|a| a.f32(f));
@@ -620,6 +647,7 @@ pub fn kv_append(
     page_indptr: Operand,
     keys: Operand,
     pool: &KvPool<impl Stored>,
+    ratio: Option<u32>,
 ) -> Result<Val, Error> {
     const OP: &str = "attn.pool_kv_append";
     expect(OP, entries, &[Dtype::Bf16])?;
@@ -630,26 +658,62 @@ pub fn kv_append(
     let (indices, indptr, ps) = paging(f, OP, page_indices, page_indptr, pool.page_size)?;
     let bpos = flat_i32(f, boundary_pos)?;
     let breq = flat_i32(f, boundary_req)?;
+    let bpos = first(f, bpos, n)?;
+    let breq = first(f, breq, n)?;
     // A compact pool files the entry at its index, `page_size / div` a page.
-    if let Some((table, ps, div)) =
-        compact_view(f, OP, keys.val, keys.width, entries.width, pool.page_size)?
-    {
-        let dv = f.like_i(bpos, div);
-        let c = f.div(bpos, dv)?;
-        let neg = cmp_i(f, Cmp::Lt, bpos, 0)?;
-        let none = f.like_i(bpos, -1);
-        let c = f.select(neg, none, c)?;
-        let at = boundary_cell(f, indices, indptr, c, breq, n, ps)?;
-        return Ok(put_entries(f, table, at, entries.val, div)?);
-    }
-    if keys.width < entries.width {
+    let view = compact_view(f, OP, keys.val, keys.width, entries.width, pool.page_size)?;
+    if view.is_none() && keys.width < entries.width {
         return Err(refuse(
             OP,
             "the compressed pool's row is narrower than the entry",
         ));
     }
-    let at = boundary_cell(f, indices, indptr, bpos, breq, n, ps)?;
-    Ok(put_cols(f, keys.val, at, entries.val)?)
+    let (table, rows_v) = (keys.val, f.slice_axis(entries.val, 0, 0, n)?);
+    let file = move |f: &mut Func, bpos: Val, breq: Val, rows_v: Val, n: i64| -> Built<Val> {
+        if let Some((table, ps, div)) = view {
+            let dv = f.like_i(bpos, div);
+            let c = f.div(bpos, dv)?;
+            let neg = cmp_i(f, Cmp::Lt, bpos, 0)?;
+            let none = f.like_i(bpos, -1);
+            let c = f.select(neg, none, c)?;
+            let at = boundary_cell(f, indices, indptr, c, breq, n, ps)?;
+            return put_entries(f, table, at, rows_v, div);
+        }
+        let at = boundary_cell(f, indices, indptr, bpos, breq, n, ps)?;
+        put_cols(f, table, at, rows_v)
+    };
+    // A lane of k rows closes at most k / ratio + 1 blocks: only those rows
+    // are filed, not a dropped write for every row of the fire (a prompt of
+    // 1792 rows at ratio 4: 7168 row writes a layer, 0.8 ms on a v6e).
+    let lanes = i64::try_from(page_indptr.elements())
+        .unwrap_or(1)
+        .saturating_sub(1)
+        .max(1);
+    let most = ratio.map_or(n, |r| (n / i64::from(r.max(1)) + lanes).min(n));
+    if most < n {
+        let (pick, live, over) = closing(f, bpos, n, most)?;
+        let few = move |f: &mut Func| -> Built<Val> {
+            let neg = f.like_i(pick, -1);
+            let bp = take(f, bpos, pick)?;
+            let bp = f.select(live, bp, neg)?;
+            let zero = f.like_i(pick, 0);
+            let row = f.select(live, pick, zero)?;
+            let br = take(f, breq, row)?;
+            let got = f.take_rows(rows_v, row)?;
+            file(f, bp, br, got, most)
+        };
+        let ty = f.ty(table).clone();
+        let out = f.case(
+            over,
+            &[ty],
+            vec![
+                Box::new(move |f| Ok(vec![few(f)?])),
+                Box::new(move |f| Ok(vec![file(f, bpos, breq, rows_v, n)?])),
+            ],
+        )?;
+        return Ok(out[0]);
+    }
+    Ok(file(f, bpos, breq, rows_v, n)?)
 }
 
 /// The pool cell of each boundary row, [`DROP`] for a row closing no block.

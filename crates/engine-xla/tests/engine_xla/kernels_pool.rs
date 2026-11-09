@@ -225,7 +225,8 @@ fn pooled_readers_attend_over_closed_blocks() {
     let _wp = b.u32(4, 1, &[0; 4]);
     let pages = kv_pool(&mut b, keys);
     if !b
-        .run(|ctx| pool::kv_append(ctx, et, bp, br, &pages))
+        // A bound of 4 rows a block: three of the four rows filed, compacted.
+        .run(|ctx| pool::kv_append(ctx, et, bp, br, &pages, Some(4)))
         .unwrap()
     {
         return;
@@ -371,7 +372,8 @@ fn a_compact_pool_files_and_reads_an_entry_a_row() {
     let lse = b.zeros(Dtype::F32, 2, heads as u32);
     if !b
         .run(|ctx| {
-            pool::kv_append(ctx, et, bp, br, &pages)?;
+            // A bound tighter than the rows that close: every row is filed.
+            pool::kv_append(ctx, et, bp, br, &pages, Some(8))?;
             let c = kernels_xla::attn::pool::attention_lse(
                 qt,
                 pt,

@@ -1199,7 +1199,9 @@ impl Run<'_> {
                 boundary_req,
                 boundary_rope,
                 decode: true,
-            } => crate::lower::attn::pool::boundary_decode(
+            } => {
+                self.boundaries.push((*boundary_pos, *ratio));
+                crate::lower::attn::pool::boundary_decode(
                 self.ctx(),
                 self.tensor(*positions),
                 self.cut_rows(self.bindings().tables.request_of_token),
@@ -1208,7 +1210,8 @@ impl Run<'_> {
                 self.tensor(*boundary_pos),
                 self.tensor(*boundary_req),
                 self.tensor(*boundary_rope),
-            ),
+                )
+            }
             Attn::PoolBoundary {
                 positions,
                 row_valid,
@@ -1217,7 +1220,9 @@ impl Run<'_> {
                 boundary_req,
                 boundary_rope,
                 decode: false,
-            } => crate::lower::attn::pool::boundary_prefill(
+            } => {
+                self.boundaries.push((*boundary_pos, *ratio));
+                crate::lower::attn::pool::boundary_prefill(
                 self.ctx(),
                 self.ragged(*positions),
                 self.cut_rows(self.bindings().tables.request_of_token),
@@ -1226,7 +1231,8 @@ impl Run<'_> {
                 self.tensor(*boundary_pos),
                 self.tensor(*boundary_req),
                 self.tensor(*boundary_rope),
-            ),
+                )
+            }
 
             Attn::PoolGather {
                 boundary_pos,
@@ -1296,6 +1302,10 @@ impl Run<'_> {
                 self.tensor(*boundary_pos),
                 self.tensor(*boundary_req),
                 self.pool(*into),
+                self.boundaries
+                    .iter()
+                    .find(|(v, _)| v == boundary_pos)
+                    .map(|&(_, r)| r),
             ),
             Attn::PoolLse {
                 q,
