@@ -2004,6 +2004,8 @@ pub fn attend(
                 && rule.window.is_none()
                 && rs.enabled.is_none()
                 && !matches!(planes, Planes::Paged { latent: true, .. })
+                && f.elem(keys) == Elem::Bf16
+                && f.elem(values) == Elem::Bf16
                 && super::pages::fits(geom.span, &heads, tuning.vmem_cap()) =>
         {
             super::pages::attend(
