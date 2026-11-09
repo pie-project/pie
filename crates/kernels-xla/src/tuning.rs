@@ -72,7 +72,7 @@ macro_rules! moe_costs {
 moe_costs! {
     MoeDenseAllMi = "kernel.moe.cost.dense_all_mi", 1..=4096, 128,
         "Up to this many Mi f32 partials, every row runs against every expert.";
-    MoeSliceMib = "kernel.moe.cost.slice_mib", 1..=1024, 18,
+    MoeSliceMib = "kernel.moe.cost.slice_mib", 1..=1024, 1,
         "What a dot over one sliced expert costs at least, in MiB of bank streamed.";
     MoeSlicePairs = "kernel.moe.cost.slice_pairs", 1..=64, 8,
         "Up to this many routed pairs, each pair's expert is sliced out.";
@@ -240,7 +240,7 @@ impl Tuning {
         moe_gmm_block_bytes: 12 << 20,
         moe_costs: MoeCosts {
             dense_all: 1 << 27,
-            slice_bytes: 18 << 20,
+            slice_bytes: 1 << 20,
             slice_pairs: 8,
             loop_tile_ns: 14_000,
             loop_row_ns: 10,
