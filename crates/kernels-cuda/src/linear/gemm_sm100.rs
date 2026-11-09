@@ -16,6 +16,7 @@ use cudarc::driver::sys as dr;
 
 use crate::error::Error;
 use crate::jit::{ArgValue, Ctx, Fire, Launch, kernel, refuse};
+use crate::linear::moe::{ExpertTable, Planes};
 
 const GEMM_SM100: &str = "linear/gemm_sm100.cu";
 
@@ -581,6 +582,11 @@ impl Epilogue {
             tickets: 0,
             even_waves: 0,
             route_cap: 0,
+            wtable: 0,
+            wplanes: 0,
+            wpad: 0,
+            wbase: [0; 3],
+            wrow_bytes: [0; 3],
         }
     }
 }
@@ -609,6 +615,11 @@ struct EpiArgs {
     weights_ahead: i32,
     even_waves: i32,
     route_cap: i32,
+    wtable: u64,
+    wplanes: i32,
+    wpad: i32,
+    wbase: [u64; 3],
+    wrow_bytes: [i64; 3],
 }
 
 /// `y = epilogue(alpha * act . w^T)` for `[m, n, k]`, `n` the output's columns, under a stated plan.
@@ -656,6 +667,7 @@ pub fn gemm_epi_with(
             group: Group::NONE,
             epi,
             pad: 0,
+            table: WTable::default(),
         },
         y,
         [n, k],
@@ -698,6 +710,169 @@ pub struct Grouped {
     /// A device `f32[experts]` scaling each expert's product besides
     /// `alpha` (NVFP4's per-expert global scale), or 0.
     pub alpha_e: u64,
+    /// Where the weight's experts lie, in `planes`' order (plane 0 the
+    /// weight's codes, 1 its scales, 2 its bias, f32 row scale or affine
+    /// zeros); [`ExpertTable::RESIDENT`] for the contiguous bank. A located
+    /// table with a window maps the weight's planes over the window (each
+    /// entry a whole number of its plane's rows past the window's base:
+    /// codes rows, 128-row scale blocks, scale or bias rows); without one,
+    /// over the operand's own planes, as the contiguous bank. The per-expert
+    /// scalars (`alpha_e`, an NVFP4 store's input scales, live rows) stay
+    /// contiguous.
+    pub table: ExpertTable,
+    pub planes: Planes,
+}
+
+impl Grouped {
+    /// The contiguous bank's grouping.
+    #[must_use]
+    pub const fn contiguous(experts: u32, groups: Groups, alpha_e: u64) -> Self {
+        Self {
+            experts,
+            groups,
+            alpha_e,
+            table: ExpertTable::RESIDENT,
+            planes: Planes::Dense,
+        }
+    }
+
+    /// The same grouping over the experts `table` places, a bank of `planes`.
+    #[must_use]
+    pub const fn tabled(self, table: ExpertTable, planes: Planes) -> Self {
+        Self {
+            table,
+            planes,
+            ..self
+        }
+    }
+}
+
+/// A grouped launch's expert table as the kernel takes it (`Epi::wtable`
+/// on): each weight plane's base and row bytes.
+#[derive(Clone, Copy, Default)]
+struct WTable {
+    table: u64,
+    planes: i32,
+    base: [u64; 3],
+    row_bytes: [i64; 3],
+}
+
+/// The bytes of one row of a weight's codes as its map reads them.
+fn code_row_bytes(kind: Kind, o: Operand, k: u32) -> u64 {
+    let k = u64::from(k);
+    match (kind, o.elem) {
+        (_, Elem::Bf16 | Elem::F16) => 2 * k,
+        (_, Elem::E4m3) => k,
+        (_, Elem::E2m1 | Elem::U4) => k / 2,
+    }
+}
+
+/// A tabled weight `w` (and the epilogue's weight-row pointers) rebased on
+/// the table's window, with the rows its maps then take (codes, scale
+/// rows), and the kernel's table. Untabled: all as given.
+#[allow(clippy::type_complexity)]
+fn tabled_weight(
+    g: &Grouped,
+    kind: Kind,
+    w: Operand,
+    epi: Epilogue,
+    n_per: u32,
+    k: u32,
+) -> Result<(Operand, Epilogue, Option<(u32, u32)>, WTable), Error> {
+    let table = g.table;
+    if !table.tabled() {
+        return Ok((w, epi, None, WTable::default()));
+    }
+    if !table.located {
+        return Err(refuse(
+            OP,
+            "a grouped tcgen05 launch maps its experts with TMA: a table naming mapped host              memory is the per-route GEMV's",
+        ));
+    }
+    let mixed = matches!(kind, Kind::Mixed(_));
+    if w.scales.is_some() && !mixed && !n_per.is_multiple_of(128) {
+        return Err(refuse(
+            OP,
+            "a tabled bank's atom-laid scales start each expert on a whole 128-row block",
+        ));
+    }
+    let wrong = |what: &str| refuse(OP, format!("a tabled weight's {what}"));
+    // Plane 2: a bias, an f32 row scale or affine zeros, one of them.
+    let zeros = w.scales.map_or(0, |s| s.zeros);
+    let third = [(zeros, 0u8), (epi.bias, 1), (epi.weight_scale, 2)];
+    let mut held = third.iter().filter(|(ptr, _)| *ptr != 0);
+    let plane2 = held.next().copied();
+    if held.next().is_some() {
+        return Err(wrong("plane 2 is two of bias, row scale and zeros"));
+    }
+    let k64 = u64::from(k);
+    let sf_bytes = |gran: u32, two: bool| (k64 / u64::from(gran)) * if two { 2 } else { 1 };
+    let row_bytes = [
+        code_row_bytes(kind, w, k),
+        match w.scales {
+            None => 0,
+            Some(s) if mixed => sf_bytes(s.gran, w.elem == Elem::U4),
+            Some(s) => u64::from(k.div_ceil(s.gran).div_ceil(4)) * 512,
+        },
+        match plane2 {
+            None => 0,
+            Some((_, 0)) => w.scales.map_or(0, |s| sf_bytes(s.gran, true)),
+            Some((_, 1)) => 2,
+            Some(_) => 4,
+        },
+    ];
+    let own = [
+        w.ptr,
+        w.scales.map_or(0, |s| s.ptr),
+        plane2.map_or(0, |p| p.0),
+    ];
+    let planes = g.planes.count();
+    if planes < 2 && row_bytes[1] != 0 || planes < 3 && row_bytes[2] != 0 {
+        return Err(wrong("planes are more than its table's kind lists"));
+    }
+    let (window, bytes) = table.window;
+    let int = |rows: u64| {
+        u32::try_from(rows)
+            .ok()
+            .filter(|r| i32::try_from(*r).is_ok())
+            .ok_or_else(|| wrong("window holds more rows than a launch indexes"))
+    };
+    let (w, epi, rows, base) = if bytes == 0 {
+        (w, epi, None, own)
+    } else {
+        if !window.is_multiple_of(16) {
+            return Err(wrong("window is not 16-byte aligned, as TMA reads it"));
+        }
+        let rebase = |ptr: u64| if ptr == 0 { 0 } else { window };
+        let w = Operand {
+            ptr: window,
+            scales: w.scales.map(|s| Scales {
+                ptr: window,
+                zeros: rebase(s.zeros),
+                ..s
+            }),
+            ..w
+        };
+        let epi = Epilogue {
+            bias: rebase(epi.bias),
+            weight_scale: rebase(epi.weight_scale),
+            ..epi
+        };
+        let codes = int(bytes / row_bytes[0])?;
+        let scale_rows = if row_bytes[1] == 0 || mixed {
+            0
+        } else {
+            int(bytes / row_bytes[1] * 128)?
+        };
+        (w, epi, Some((codes, scale_rows)), [window; 3])
+    };
+    let wt = WTable {
+        table: table.at(),
+        planes: i32::try_from(planes).unwrap_or(4),
+        base,
+        row_bytes: row_bytes.map(|b| i64::try_from(b).unwrap_or(i64::MAX)),
+    };
+    Ok((w, epi, rows, wt))
 }
 
 /// The byte of scale `(row, col)` of expert `e`'s activation in the masked
@@ -856,6 +1031,11 @@ pub fn grouped_gemm_epi_with(
     }
     let bank = g.experts * n_per;
     let q_step = if glu { 128 } else { plan.bn };
+    // A tabled weight: rebased on its window, mapped over the window's rows.
+    let (w, epi, window_rows, table) = tabled_weight(&g, kind, w, epi, n_per, k)?;
+    let weight_rows = |rows: u32| window_rows.map_or(rows, |(codes, _)| codes);
+    let weight_scale_rows =
+        |rows: u32| window_rows.map_or(rows, |(_, scales)| if scales == 0 { rows } else { scales });
     let job = match g.groups {
         Groups::Contiguous { offsets, rows, cap } => {
             let swap = plan.swap;
@@ -888,10 +1068,22 @@ pub fn grouped_gemm_epi_with(
                 return Ok(());
             }
             // Swapped (W4A16): the bank on P, the rows on Q.
-            let (p, q, extents) = if swap {
-                (w, act, [bank, rows])
+            let (p, q, extents, maps, scales) = if swap {
+                (
+                    w,
+                    act,
+                    [bank, rows],
+                    [weight_rows(bank), rows],
+                    [weight_scale_rows(bank), rows],
+                )
             } else {
-                (act, w, [rows, bank])
+                (
+                    act,
+                    w,
+                    [rows, bank],
+                    [rows, weight_rows(bank)],
+                    [rows, weight_scale_rows(bank)],
+                )
             };
             Job {
                 kind,
@@ -899,8 +1091,8 @@ pub fn grouped_gemm_epi_with(
                 p,
                 q,
                 rows: extents,
-                map_rows: extents,
-                scale_rows: extents,
+                map_rows: maps,
+                scale_rows: scales,
                 y_rows: rows,
                 tiles: if swap {
                     (rows.div_ceil(plan.bn) + g.experts) * n.div_ceil(128)
@@ -917,6 +1109,7 @@ pub fn grouped_gemm_epi_with(
                 },
                 epi,
                 pad: 0,
+                table,
             }
         }
         Groups::Masked { counts, m_max } => {
@@ -935,8 +1128,11 @@ pub fn grouped_gemm_epi_with(
                 p: w,
                 q: act,
                 rows: [bank, g.experts * m_max],
-                map_rows: [bank, g.experts * m_max],
-                scale_rows: [bank, g.experts * m_max.div_ceil(128) * 128],
+                map_rows: [weight_rows(bank), g.experts * m_max],
+                scale_rows: [
+                    weight_scale_rows(bank),
+                    g.experts * m_max.div_ceil(128) * 128,
+                ],
                 y_rows: g.experts * m_max,
                 tiles: g.experts * n.div_ceil(128) * m_max.div_ceil(plan.bn),
                 group: Group {
@@ -949,6 +1145,7 @@ pub fn grouped_gemm_epi_with(
                 },
                 epi,
                 pad: m_max.div_ceil(128) * 128,
+                table,
             }
         }
     };
@@ -1060,6 +1257,8 @@ struct Job {
     epi: Epilogue,
     /// A masked group's scale rows an expert.
     pad: u32,
+    /// A grouped launch's expert table, or none.
+    table: WTable,
 }
 
 fn launch(ctx: &Ctx, job: Job, y: u64, [n, k]: [u32; 2], alpha: f32) -> Result<(), Error> {
@@ -1187,6 +1386,10 @@ fn launch(ctx: &Ctx, job: Job, y: u64, [n, k]: [u32; 2], alpha: f32) -> Result<(
     let epi_args = EpiArgs {
         slab: i64::try_from(slab).unwrap_or(i64::MAX),
         tickets,
+        wtable: job.table.table,
+        wplanes: job.table.planes,
+        wbase: job.table.base,
+        wrow_bytes: job.table.row_bytes,
         ..epi_args
     };
     let units = job.tiles * splits;

@@ -55,6 +55,21 @@ pub enum GluBank {
     },
 }
 
+impl GluBank {
+    /// The planes an expert's table entries list for this bank.
+    #[must_use]
+    pub const fn planes(&self) -> Planes {
+        match self {
+            GluBank::Bf16(_) => Planes::Dense,
+            GluBank::Mxfp4 { .. } => Planes::Mxfp4,
+            GluBank::Nvfp4 { .. } => Planes::Nvfp4,
+            GluBank::Affine { .. } => Planes::Affine,
+            GluBank::Nvfp4A4 { .. } => Planes::Nvfp4A4,
+            GluBank::Mxfp4A8 { .. } | GluBank::Fp8A8 { .. } => Planes::Scaled,
+        }
+    }
+}
+
 /// A bank's tcgen05 operand, its experts, its bias and weight-scale planes
 /// and the dtype `tc5_worth` reads, for a product `n` wide of `x`; `None`
 /// for an affine bank whose group the GEMM does not take.
@@ -202,7 +217,7 @@ pub fn select_glu(
     ) {
         return Ok(false);
     }
-    select_tc5(
+    select_tc5_with(
         ctx,
         OP,
         x,
@@ -216,6 +231,7 @@ pub fn select_glu(
             weight_scale,
             ..gemm_sm100::Epilogue::STORE
         },
+        (experts, bank.planes()),
     )?;
     Ok(true)
 }
@@ -276,8 +292,13 @@ pub fn experts(
     const GROUPED_H: &str = "linear.moe_tc5_h";
     const GROUPED_Y: &str = "linear.moe_tc5_y";
     let count = routes.rows * routes.width;
+    let tables = [up_experts, down_experts];
+    if tables.iter().any(ExpertTable::streams) {
+        // Mapped host memory: the per-route selects' alone.
+        return Ok(false);
+    }
     if let (GluBank::Nvfp4A4 { .. }, GluBank::Nvfp4A4 { .. }) = (up, down) {
-        return experts_w4a4(ctx, m, y, gate, norm);
+        return experts_w4a4(ctx, m, y, gate, norm, tables);
     }
     if let (GluBank::Mxfp4A8 { .. }, GluBank::Mxfp4A8 { .. })
     | (GluBank::Fp8A8 { .. }, GluBank::Fp8A8 { .. }) = (up, down)
@@ -285,7 +306,7 @@ pub fn experts(
         if norm.is_some() {
             return Ok(false);
         }
-        return experts_w4a8_as(ctx, m, y, W4a8Sum::Weighted(gate));
+        return experts_w4a8_as(ctx, m, y, W4a8Sum::Weighted(gate), tables);
     }
     let hidden = Tensor::new(0, count, inter, Dtype::Bf16);
     let routed = Tensor::new(0, count, y.width, Dtype::Bf16);
@@ -333,11 +354,11 @@ pub fn experts(
         let k = x.width;
         let rows = layout.rows as usize;
         let hs = ctx.scratch_stream(OP, GROUPED_H, rows * inter as usize * 2)? as u64;
-        let grouped = gemm_sm100::Grouped {
-            experts,
-            groups: layout.groups,
-            alpha_e: 0,
-        };
+        let grouped = gemm_sm100::Grouped::contiguous(experts, layout.groups, 0);
+        let (grouped_up, grouped_down) = (
+            grouped.tabled(up_experts, up.planes()),
+            grouped.tabled(down_experts, down.planes()),
+        );
         let up_epi = gemm_sm100::Epilogue {
             glu: Some(glu),
             bias: u.2,
@@ -364,7 +385,7 @@ pub fn experts(
             gemm_sm100::Operand::plain(xs, act),
             u.0,
             hs,
-            grouped,
+            grouped_up,
             [inter, k],
             1.0,
             up_epi,
@@ -376,7 +397,7 @@ pub fn experts(
             gemm_sm100::Operand::plain(hs, act),
             d.0,
             ys,
-            grouped,
+            grouped_down,
             [y.width, inter],
             1.0,
             gemm_sm100::Epilogue {
@@ -414,6 +435,7 @@ pub(super) fn experts_w4a4(
     y: &mut Tensor,
     gate: Option<(Tensor, Tensor)>,
     norm: Option<(Tensor, f32)>,
+    [up_table, down_table]: [ExpertTable; 2],
 ) -> Result<bool, Error> {
     let RoutedMlp {
         x,
@@ -554,11 +576,8 @@ pub(super) fn experts_w4a4(
             W4A4_HS,
             gemm_sm100::atom_bytes(rows, inter as usize, 16),
         )? as u64;
-        let grouped_up = gemm_sm100::Grouped {
-            experts,
-            groups: layout.groups,
-            alpha_e: up_alpha,
-        };
+        let grouped_up = gemm_sm100::Grouped::contiguous(experts, layout.groups, up_alpha)
+            .tabled(up_table, Planes::Nvfp4A4);
         // A decode's few rows an expert run the gate-up swapped: a thread
         // a weight row, its epilogue over the expert's rows alone (unswapped,
         // a thread a row, the whole 128-row block's).
@@ -599,11 +618,8 @@ pub(super) fn experts_w4a4(
             plan,
         )?;
         let ys = ctx.scratch_stream(OP, W4A4_Y, rows * n as usize * 2)? as u64;
-        let grouped_down = gemm_sm100::Grouped {
-            experts,
-            groups: layout.groups,
-            alpha_e: down_alpha,
-        };
+        let grouped_down = gemm_sm100::Grouped::contiguous(experts, layout.groups, down_alpha)
+            .tabled(down_table, Planes::Nvfp4A4);
         let down_plan = if count <= SWAPPED_UP_ROUTES * experts {
             swapped
         } else {
@@ -652,11 +668,16 @@ pub fn experts_weighted_first(
     m: RoutedMlp,
     shared: Tensor,
     y: &mut Tensor,
+    tables: [ExpertTable; 2],
 ) -> Result<bool, Error> {
-    if shared.dtype != Dtype::Bf16 || shared.rows != y.rows || shared.width != y.width {
+    if shared.dtype != Dtype::Bf16
+        || shared.rows != y.rows
+        || shared.width != y.width
+        || tables.iter().any(ExpertTable::streams)
+    {
         return Ok(false);
     }
-    experts_w4a8_as(ctx, m, y, W4a8Sum::WeightedFirst(shared))
+    experts_w4a8_as(ctx, m, y, W4a8Sum::WeightedFirst(shared), tables)
 }
 
 /// [`experts`] on two W4A8 banks (or two block-FP8 ones) (MXFP4 codes against e4m3 activations in
@@ -671,6 +692,7 @@ pub(super) fn experts_w4a8_as(
     m: RoutedMlp,
     y: &mut Tensor,
     sum: W4a8Sum,
+    [up_table, down_table]: [ExpertTable; 2],
 ) -> Result<bool, Error> {
     let RoutedMlp {
         x,
@@ -823,11 +845,9 @@ pub(super) fn experts_w4a8_as(
                 at
             }
         };
-        let grouped = gemm_sm100::Grouped {
-            experts,
-            groups: layout.groups,
-            alpha_e: 0,
-        };
+        let grouped = gemm_sm100::Grouped::contiguous(experts, layout.groups, 0);
+        let grouped_up = grouped.tabled(up_table, Planes::Scaled);
+        let grouped_down = grouped.tabled(down_table, Planes::Scaled);
         if masked {
             const W4A8_U: &str = "linear.moe_tc5_u";
             let us = ctx.scratch_stream(OP, W4A8_U, rows * 2 * inter as usize * 2)? as u64;
@@ -836,7 +856,7 @@ pub(super) fn experts_w4a8_as(
                 gemm_sm100::Operand::scaled(xq, gemm_sm100::Elem::E4m3, xs, GRAN),
                 gemm_sm100::Operand::scaled(up_codes.ptr, w_elem, up_atoms.ptr, w_gran),
                 us,
-                grouped,
+                grouped_up,
                 [2 * inter, k],
                 1.0,
                 gemm_sm100::Epilogue::STORE,
@@ -863,7 +883,7 @@ pub(super) fn experts_w4a8_as(
                 gemm_sm100::Operand::scaled(xq, gemm_sm100::Elem::E4m3, xs, GRAN),
                 gemm_sm100::Operand::scaled(up_codes.ptr, w_elem, up_atoms.ptr, w_gran),
                 hq,
-                grouped,
+                grouped_up,
                 [inter, k],
                 1.0,
                 gemm_sm100::Epilogue {
@@ -885,7 +905,7 @@ pub(super) fn experts_w4a8_as(
             gemm_sm100::Operand::scaled(hq, gemm_sm100::Elem::E4m3, hs, GRAN),
             gemm_sm100::Operand::scaled(down_codes.ptr, w_elem, down_atoms.ptr, w_gran),
             ys,
-            grouped,
+            grouped_down,
             [n, inter],
             1.0,
             gemm_sm100::Epilogue {
