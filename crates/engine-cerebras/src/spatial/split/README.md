@@ -88,8 +88,8 @@ and Qwen3-8B.
 | Qwen3.5-4B | role-split, the 9B geometry (Hc 10, Ic 36) | 2,057 | 1,998 (0.5005 ms/step, 97.1%) | GDN 10.6k / attention 10.96k |
 | Qwen3.5-0.8B | role-split, 6 units of 256 x 128 (Hc 8, Ic 14, NE 128) | 3,390 | 3,286 (0.3043 ms/step, 96.9%) | GDN 8.2k / attention 9.2k |
 | Qwen3-8B | role-split (9 units 256 x 228, Hc 18, K 4, gap slot; GATE 0, SLW 1) | 1,825 (0.548 ms, G2 12) | 1,811 (0.5521 ms, 99.3%, L64, G2 12) | greedy 512 and TF 512 golden; Pie 12 of 12 reps golden (G2 16 and 12). `PIE_CEREBRAS_SPLIT=<prep>:q84_:G2=12,WL=1`. serve8b_region (qw1): 1,642 |
-| Gemma 4 E2B | role-split Gemma (7 units 256 x 128, Hc 12, K 5; WSPEC 2) | 1,431 (0.6986 ms) | 1,418 (0.7053 ms, 99.0%) | greedy 720 golden; TF 256 0 mismatches |
-| Gemma 4 E4B | role-split Gemma (7 units 256 x 160, Hc 16, K 6) | 1,072 (0.9327 ms) | 1,063 (0.9404 ms, 99.2%) | global context 2,560 positions (NEG 16 x 160) |
+| Gemma 4 E2B | role-split Gemma (7 units 256 x 128, Hc 12, K 5; WSPEC 2) | 1,451 (0.6894 ms) | 1,436 (0.6962 ms, 99.0%) | greedy 720 golden; TF 256 0 mismatches |
+| Gemma 4 E4B | role-split Gemma (7 units 256 x 160, Hc 16, K 6) | 1,097 (0.9119 ms) | 1,089 (0.9183 ms, 99.3%) | TF 165 and 640 (past the 512 window) 0 mismatches; global context 2,560 positions (NEG 16 x 160) |
 | Gemma 4 12B | role-split 12B (8 units 344 x 283: 128 attention rows Hc 12, plain rows Hc 15; K 6; RING 1) | 1,057 (0.9462 ms) | 1,055 (0.9483 ms, 99.8%) | TF 212 0 mismatches, greedy golden; TF 1,600 past the window: 3 bf16 near-ties (below); global context 4,096 |
 | gpt-oss-20b | role-split gpt-oss (12 units, K 2; CYV 2, GLUV 1) | 1,555 (0.643 ms) | 1,522 (0.6569 ms, 97.9%) | MXFP4 experts as E5M2, lossless; Pie text = bare greedy |
 
@@ -256,7 +256,10 @@ on), `tools/emu/tf_gemma.py` and `tf_gptoss.py` (teacher-forced emulation of the
   reduction; the next phase multicasts both with four partial sums, CY combines them (deferred scalars).
 - Sliding caches are rings of `window / PY` entries a row (`WIN` masks a longer ring); `WSPEC 1` specializes the
   attention code per layer kind and `WSPEC 2` also keeps the sliding ring whole (E2B; E4B has no room). GELU stays
-  f32 (an f16 GELU flipped the long golden); the final softcap is applied on the host (greedy-invariant).
+  f32 (an f16 GELU flipped the long golden; `GELUT 2` is the f32 form with fewer f32 multiplies, which cost a cycle a
+  word an operand); the final softcap is applied on the host (greedy-invariant).
+- The weight PE works out the step's position row and entry once a step (a u32 divide by E4B's 160 rows is a ~270-cycle
+  helper) and keeps the cache offsets in comptime tables.
 - Diagnostics: `DIAG 1` (no layers: handoffs, head, PLE and KVS words checked at every consumer), `PLOG 1` (the full
   model logs each step's PLE / KVS words: the hang-localizing probe).
 
