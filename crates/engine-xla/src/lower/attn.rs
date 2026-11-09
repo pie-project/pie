@@ -720,7 +720,10 @@ pub mod pool {
     pub fn lse(ctx: &Ctx<'_>, call: PoolLse, entries: KvPool) -> Result<(), Error> {
         lower(ctx, |l| {
             let (o, lse) = match call.try_map(&entries, |t| l.read(t))? {
-                Some((call_v, planes)) => pool::lse(l.f(), call_v, planes, &entries)?,
+                Some((call_v, planes)) => {
+                    let tuning = l.tuning();
+                    pool::lse(l.f(), call_v, planes, &entries, tuning)?
+                }
                 None => pool::nothing(l.f(), call.o.landing(), call.lse.landing()),
             };
             l.land(call.o, o)?;
