@@ -1,7 +1,8 @@
 //! The role-split model (`SplitModel`) on a compiled program, against the
 //! prep's golden: greedy sequences through the wafer token loop (two from
 //! position 0 on one load: the state resets), a rollback (replayed from 0),
-//! and a logits row (`lgt`).
+//! and a logits row (`lgt`; on a Qwen3.5 prep also against a host reference).
+//! Qwen3.5 and Gemma 4 preps; gpt-oss has `split_sim_gptoss`.
 //!
 //! `split_sim <program out dir> <prep dir> <prefix> <overrides> <steps a launch> [cmaddr]`
 //! (no cmaddr: the simulator).
@@ -103,57 +104,63 @@ fn main() {
     let best = argmax(&l).unwrap();
     ok &= best == want[0];
     println!("LOGITS argmax {best} want {}", want[0]);
-    let g = spec.geo().unwrap();
-    let (lx, ly) = g.unit_origin(g.units() - 1);
-    let hc = spec.int("Hc").unwrap() as usize;
-    let py = spec.int("PY").unwrap();
-    let mut x = Vec::new();
-    for (r0, r1) in [(0, g.yc), (g.yc, py)] {
-        let y0 = ly + r0 + u32::from(r0 >= g.yc);
-        let r = engine_cerebras::sdk::Rect {
-            x: (lx + g.xc) as i32,
-            y: y0 as i32,
-            w: 1,
-            h: (r1 - r0) as i32,
-        };
-        x.extend(
-            m.dev
-                .get("x", r, hc)
-                .unwrap()
-                .into_iter()
-                .map(f32::from_bits),
+    if spec.meta.get("geo").is_some() {
+        // Gemma's tied head has its own tile layout: the argmax check above is the test
+        println!("LOGITS host reference: Qwen3.5 preps only");
+    } else {
+        let g = spec.geo().unwrap();
+        let (lx, ly) = g.unit_origin(g.units() - 1);
+        let hc = spec.int("Hc").unwrap() as usize;
+        let py = spec.int("PY").unwrap();
+        let mut x = Vec::new();
+        for (r0, r1) in [(0, g.yc), (g.yc, py)] {
+            let y0 = ly + r0 + u32::from(r0 >= g.yc);
+            let r = engine_cerebras::sdk::Rect {
+                x: (lx + g.xc) as i32,
+                y: y0 as i32,
+                w: 1,
+                h: (r1 - r0) as i32,
+            };
+            x.extend(
+                m.dev
+                    .get("x", r, hc)
+                    .unwrap()
+                    .into_iter()
+                    .map(f32::from_bits),
+            );
+        }
+        let rms =
+            (x.iter().map(|v| (*v as f64).powi(2)).sum::<f64>() / x.len() as f64 + 1e-6).sqrt();
+        let hw = spec.npy("hw").unwrap();
+        let hg = spec.npy("hg").unwrap();
+        let (hr, hcn, per) = (hw.shape[0], hw.shape[1], hw.shape[2]);
+        let vr = spec.int("VR").unwrap() as usize;
+        let hdc = per / vr;
+        let mut w = Vec::new();
+        hw.words(0, hr * hcn * per, &mut w).unwrap();
+        let mut gv = Vec::new();
+        hg.words(0, hcn * hdc, &mut gv).unwrap();
+        let mut worst = 0f64;
+        let mut big = 0f64;
+        for (v, &lv) in l.iter().enumerate() {
+            let (rr, j) = (v / vr, v % vr);
+            let mut acc = 0f64;
+            for c in 0..hcn {
+                for d in 0..hdc {
+                    let h = f16(w[(rr * hcn + c) * per + d * vr + j] as u16) as f64;
+                    acc += h * f32::from_bits(gv[c * hdc + d]) as f64 * x[c * hdc + d] as f64;
+                }
+            }
+            let rf = acc / rms;
+            worst = worst.max((rf - lv as f64).abs());
+            big = big.max(rf.abs());
+        }
+        let rel = worst / big.max(1e-30);
+        ok &= rel < 2e-2;
+        println!(
+            "LOGITS scaled vs host reference: max |diff| {worst:.5} of max |logit| {big:.4} (rel {rel:.2e}), rms {rms:.4}"
         );
     }
-    let rms = (x.iter().map(|v| (*v as f64).powi(2)).sum::<f64>() / x.len() as f64 + 1e-6).sqrt();
-    let hw = spec.npy("hw").unwrap();
-    let hg = spec.npy("hg").unwrap();
-    let (hr, hcn, per) = (hw.shape[0], hw.shape[1], hw.shape[2]);
-    let vr = spec.int("VR").unwrap() as usize;
-    let hdc = per / vr;
-    let mut w = Vec::new();
-    hw.words(0, hr * hcn * per, &mut w).unwrap();
-    let mut gv = Vec::new();
-    hg.words(0, hcn * hdc, &mut gv).unwrap();
-    let mut worst = 0f64;
-    let mut big = 0f64;
-    for (v, &lv) in l.iter().enumerate() {
-        let (rr, j) = (v / vr, v % vr);
-        let mut acc = 0f64;
-        for c in 0..hcn {
-            for d in 0..hdc {
-                let h = f16(w[(rr * hcn + c) * per + d * vr + j] as u16) as f64;
-                acc += h * f32::from_bits(gv[c * hdc + d]) as f64 * x[c * hdc + d] as f64;
-            }
-        }
-        let rf = acc / rms;
-        worst = worst.max((rf - lv as f64).abs());
-        big = big.max(rf.abs());
-    }
-    let rel = worst / big.max(1e-30);
-    ok &= rel < 2e-2;
-    println!(
-        "LOGITS scaled vs host reference: max |diff| {worst:.5} of max |logit| {big:.4} (rel {rel:.2e}), rms {rms:.4}"
-    );
     println!(
         "{}",
         if ok {

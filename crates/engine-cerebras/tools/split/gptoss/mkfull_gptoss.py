@@ -71,7 +71,6 @@ open(os.path.join(out, "layout.csl"), "w").write("\n".join(L) + "\n")
 params = open(ptxt).read().strip()
 extra = ",".join(f"{k}:{v}" for k, v in kw.items() if k not in ("NE", "WIN"))
 open(os.path.join(out, "params.txt"), "w").write(params + (("," + extra) if extra else "") + "\n")
-for f in ("split_geo.py", "split_geo_gptoss.py", "run_gptoss.py"):
-    if os.path.exists(os.path.join(H, f)):
-        shutil.copy(os.path.join(H, f), os.path.join(out, f))
+for f in ("../split_geo.py", "split_geo_gptoss.py", "run_gptoss.py"):
+    shutil.copy(os.path.join(H, f), os.path.join(out, os.path.basename(f)))
 print("ok", out, "W", g.W, "H", g.H, "params", open(os.path.join(out, "params.txt")).read().strip())

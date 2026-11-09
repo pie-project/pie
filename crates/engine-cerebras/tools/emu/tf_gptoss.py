@@ -31,7 +31,8 @@ import numpy as np
 import torch
 torch.set_num_threads(8)
 
-sys.path.insert(0, "/cra-1900/ing-cloud/pie-bringup-20261027/scratch/gptoss")
+import os
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import gptoss_ref as R   # checkpoint reader, YaRN, MXFP4 decode (exact in f32)
 
 f16, f32 = np.float16, np.float32

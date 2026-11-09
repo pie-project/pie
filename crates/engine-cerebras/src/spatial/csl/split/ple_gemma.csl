@@ -1,4 +1,4 @@
-// split/ple_gemma.csl: a PE outside the units and the head (scratch/split/gemma/README.md 1): routes only, or a
+// split/ple_gemma.csl: a PE outside the units and the head (spatial/split/README.md 7): routes only, or a
 // PLE storage PE. Storage: the per-layer-input values (f16 bits) of a range of NT token ids [t0, t0 + NT), LV values a
 // token (the values of its weight column for every unit below it, top unit first), token-major. Every step it takes
 // the winning id from its row's TB (the head control row's word: the id, or -1 on a launch's last step); the owner

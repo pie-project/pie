@@ -1,4 +1,4 @@
-//! Gemma 4's role-split placement (`scratch/split/host/run_gemma.py`'s copies): the units (weights,
+//! Gemma 4's role-split placement (`tools/split/gemma/run_gemma.py`'s copies): the units (weights,
 //! rcfg, CX gammas, CY q / k norm weights and RoPE tables), the PLE storage tiles and the route-only
 //! PEs, the head (hw, hg, hemb) and its control column.
 

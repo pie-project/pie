@@ -245,7 +245,7 @@ impl SplitModel {
         })
     }
 
-    /// Gemma 4 (`scratch/split/gemma/README.md`): the geometry the meta names (geo/gemma.rs), placed.
+    /// Gemma 4 (`split/README.md` 7): the geometry the meta names (geo/gemma.rs), placed.
     fn open_gemma(
         mut dev: Box<dyn Device>,
         spec: &SplitSpec,

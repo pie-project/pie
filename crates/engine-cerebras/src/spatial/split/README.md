@@ -1,8 +1,9 @@
 # The role-split wafer program (Cerebras CS-3)
 
 The role-split program runs one bf16 model on a CS-3 wafer at batch 1. It is a second wafer layout
-next to `serve8b_region`. It is built for Qwen3.5 (9B, 4B and 0.8B). This file covers its design,
-results, build and run, the parameters and environment variables, the metrics, and open items.
+next to `serve8b_region`. It is built for Qwen3.5 (9B, 4B and 0.8B), Gemma 4 (E2B, E4B) and gpt-oss-20b
+(section 7). This file covers its design, results, build and run, the parameters and environment variables, the
+metrics, and open items.
 Serving is Rust only: `SplitModel` in this module behind the engine's `Wafer`. The Python under
 `crates/engine-cerebras/tools/` runs at build time only.
 
@@ -87,6 +88,9 @@ and Qwen3-8B.
 | Qwen3.5-4B | role-split, the 9B geometry (Hc 10, Ic 36) | 2,057 | 1,998 (0.5005 ms/step, 97.1%) | GDN 10.6k / attention 10.96k |
 | Qwen3.5-0.8B | role-split, 6 units of 256 x 128 (Hc 8, Ic 14, NE 128) | 3,390 | 3,286 (0.3043 ms/step, 96.9%) | GDN 8.2k / attention 9.2k |
 | Qwen3-8B | serve8b_region, Llama levers + SLW (qw1) | 1,642 | ~1,640 decode (1,637-1,661) | 5 of 6 Pie reps golden; see the open items |
+| Gemma 4 E2B | role-split Gemma (7 units 256 x 128, Hc 12, K 5; WSPEC 2) | 1,431 (0.6986 ms) | 1,418 (0.7053 ms, 99.0%) | greedy 720 golden; TF 256 0 mismatches |
+| Gemma 4 E4B | role-split Gemma (7 units 256 x 160, Hc 16, K 6) | 1,072 (0.9327 ms) | 1,063 (0.9404 ms, 99.2%) | global context 2,560 positions (NEG 16 x 160) |
+| gpt-oss-20b | role-split gpt-oss (12 units, K 2; CYV 2, GLUV 1) | 1,555 (0.643 ms) | 1,522 (0.6569 ms, 97.9%) | MXFP4 experts as E5M2, lossless; Pie text = bare greedy |
 
 Notes on the table:
 
@@ -94,10 +98,9 @@ Notes on the table:
 - Pie runs 32-step loops (`PIE_CEREBRAS_SPLIT_LOOP=32`). Longer loops lower the per-step cost but
   lose wall time at the tail.
 - Pie's own cost is about 0.45 ms per posted launch, so Pie reaches 97% of bare.
-- gpt-oss-20b (`tools/split/gptoss`, built with GLUV 1 and CYV 2, the mkfull defaults) serves with 64-step loops (its
-  prep meta's `LOOP`). Bare 0.643-0.644 ms (1,555 tok/s); Pie posted 0.6634 ms at L32 (96.9-97.1% of bare) and
-  0.6619 ms at L64 (97.1-97.3%, 1,511 tok/s); Pie text = bare greedy. Pie's overhead in ms equals the previous
-  build's (gpo6: 0.6779 / 0.6723 ms against 0.661 bare, 97.5% / 98.3%): the ratio fell because bare got faster.
+- Gemma 4 and gpt-oss-20b serve with 64-step loops, their prep meta's `LOOP`. gpt-oss at a fixed L32 / L64 posted
+  0.6634 / 0.6619 ms (1,511 tok/s); with the meta's doubling loops up to 64, 0.6569 ms. Pie's overhead in ms equals
+  the previous gpt-oss build's (gpo6: 0.6779 / 0.6723 ms against 0.661 bare): the ratio fell because bare got faster.
 - Llama stays on `serve8b_region`: the role-split layout forecasts 2,029-2,057 for it, which is no
   gain.
 
@@ -198,6 +201,12 @@ They match HF f32 logprobs to within 0.004 on the chosen token.
 
 ## 6. Open items
 
+- **gpt-oss CYV 1** (the attention CY's exp and reciprocal both as vector ops, 0.632 ms) flips teacher-forced
+  position 35 of the 256 golden, a bf16 near tie where the chip agrees with the f32 argmax. It stays off (CYV 2:
+  vector exp only, bit-identical) until the pass criterion is decided.
+- **gpt-oss units 0-2 stall.** On the last profiled step only, data-dependent, ~0.75% of a typical step. `PFTZ`
+  and the other diagnostics are off by default.
+
 - **Seed divergence.** Sampled requests with different seeds (7 and 11; T 0.8 and 1.0) return
   identical text on the split program. The seed path was traced through the interpreter's
   RngKeyed and engine-cerebras's per-bind channel seeds, and no loss was found. It needs an A/B on
@@ -214,3 +223,40 @@ They match HF f32 logprobs to within 0.004 on the chosen token.
 the fit study. They link on a 4 x 4 harness; the attention-row kind is 47,056 B at 4k context and
 the plain row is 44,160 B. Nothing simulates them, there is no CY or head-control kernel or host
 placement for them, and `mkfull.py` does not build them.
+
+## 7. Gemma 4 and gpt-oss-20b
+
+Both reuse the role-split machinery (`geo.rs`'s chains, segments, handoffs, head and token loop; `head_ctl.csl`)
+with their own kernels, geometry (`geo/gemma.rs`, `geo/gptoss.rs`: rcfg words identical to the Python tools on
+every PE), placement (`place_gemma.rs`, `place_gptoss.rs`) and `SplitModel` paths. The prep meta selects the path:
+`NEX` is gpt-oss, `geo` without it is Gemma. Tools: `tools/split/gemma`, `tools/split/gptoss` (prep, mkfull,
+`run_*.py` bare runner, `gotiny.sh` tiny simulation), `tools/split/split_geo.py` (the Python geometry both build
+on), `tools/emu/tf_gemma.py` and `tf_gptoss.py` (teacher-forced emulation of the kernels' number formats).
+
+**Gemma 4** (`*_gemma.csl`, E2B and E4B; 12B has no PLE or shared KV and is the experimental kind below).
+- Units at explicit origins: 7 units (E2B 256 x 128, Hc 12, K 5; E4B 256 x 160, Hc 16, K 6) placed around the
+  per-layer-embedding (PLE) storage, which fills the PEs outside the units and the head.
+- PLE: the host precomputes every token's per-layer input (f16, 4.7 GB for E2B) into storage PEs above each unit
+  column. The head control rows send the winning id west (TB); the storage owner sends its words down the weight
+  column on a bus (PB) that the CY PEs read with pre-posted receives, step 0 included. One more round a layer.
+- Shared KV (E2B layers 15-34, E4B 24-41): the source unit's CY row sends k and raw v north on a static colour (KVS)
+  through the consumer units, which store the entries of their rows.
+- Sandwich norms without a new collective: CX keeps x and a pending term p whose scale is only known after the next
+  reduction; the next phase multicasts both with four partial sums, CY combines them (deferred scalars).
+- Sliding caches are rings of `window / PY` entries a row (`WIN` masks a longer ring); `WSPEC 1` specializes the
+  attention code per layer kind and `WSPEC 2` also keeps the sliding ring whole (E2B; E4B has no room). GELU stays
+  f32 (an f16 GELU flipped the long golden); the final softcap is applied on the host (greedy-invariant).
+- Diagnostics: `DIAG 1` (no layers: handoffs, head, PLE and KVS words checked at every consumer), `PLOG 1` (the full
+  model logs each step's PLE / KVS words: the hang-localizing probe).
+
+**gpt-oss-20b** (`*_gptoss*.csl`).
+- Experts: the released MXFP4 values re-encoded losslessly as FP8 E5M2 (the high byte of an f16) with one power of
+  two per (layer, expert, matrix); `prep_gptoss.py` checks every value. All 32 experts are resident on every MoE PE.
+- Unit: attention columns | CX | MoE columns (12 units, K 2: a sliding and a full layer), PY 160, Hc 18. Attention
+  64 columns (kv head h on 8 columns, Dc 8), with sinks and YaRN RoPE on its CY; MoE 288 columns (Ic 10) with a
+  vector top-4 router in f32 on its CY (a max tree, only the taken leaf's path redone).
+- Head: 201,088 untied rows in a band below the units; logits are prescaled (`HSCALE`, 2^15) and the host divides.
+- Pass criterion: the bf16 golden, with mismatches classified by `tools/emu/classify_tf.py` (bf16 top-1 tie, router
+  tie at the step or before it); the f32 reference is secondary.
+- Serving build (the mkfull defaults): `GLUV 1` (SwiGLU as vector ops), `CYV 2` (the attention CY's exp as a vector
+  op, bit-identical). `CYV 1` / `3` and the stamps (`TSTAMP`) are opt-in.

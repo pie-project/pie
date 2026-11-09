@@ -1,5 +1,5 @@
 // split/ctl_cy_gemma.csl: the role-split column control PE for Gemma 4 (ctl_cy_q35.csl's attention without GDN;
-// scratch/split/gemma/README.md 1). A layer:
+// spatial/split/README.md 7). A layer:
 // - attention: the reduction [W a | W b | |r|^2, |x|^2, x.p, |p|^2] (deferred norm: s = rsqrt(mean r^2 + eps), the
 //   input's rms from |x + s p|^2), t = rr (W a + s W b) = [q (Qh Dc) | k Dc | v Dc]; the raw |q_h|^2, |k|^2, |v|^2
 //   partials; q / k norm weights; RoPE (sliding: theta 1e4 over the head; global: proportional, 25%); multicast

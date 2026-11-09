@@ -1,4 +1,4 @@
-// split/weight_gemma.csl: the role-split weight PE for Gemma 4 (scratch/split/gemma/README.md 1; weight_q35.csl
+// split/weight_gemma.csl: the role-split weight PE for Gemma 4 (spatial/split/README.md 7; weight_q35.csl
 // without GDN). Every layer is attention (KM bit l: global, else sliding), then the MLP, then the per-layer
 // embedding (PLE) round. Per layer, its tiles: [qkv Hc x NQ][o QO x Hc][gate|up Hc x 2Ic][down Ic x Hc]
 // [PLE gate Hc x 1][PLE projection 1 x Hc] (f16 bits; NQ = Qh Dc q (+ Dc k + Dc v unless SH), QO = Qh Dc, Dc by kind).

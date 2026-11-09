@@ -1,4 +1,4 @@
-//! Gemma 4's role-split geometry (`scratch/split/host/split_geo_gemma.py`, word for word):
+//! Gemma 4's role-split geometry (`tools/split/gemma/split_geo_gemma.py`, word for word):
 //! explicit unit origins, the PLE storage PEs above each unit column with their token word (TB)
 //! and bus (PB), the shared-KV line (KVS) and the Gemma rcfg words of every PE kind.
 

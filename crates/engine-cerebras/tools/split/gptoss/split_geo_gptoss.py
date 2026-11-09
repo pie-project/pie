@@ -18,6 +18,7 @@ UNY, visited as a snake from the bottom of column 0 up, then down column 1, ... 
   it east and north (V1) up unit 0's MoE column i to unit 0's row i, whose relay sends it west (W2) to CX."""
 import os, sys
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."))  # split_geo.py (tools/split)
 from split_geo import Geo, RX, TX, OPP, XA, XB, MX, YA, YB, MY, LB, SA, SB, SM, CS, CS2, CM, HA, HB, HX, HV, X2, Y2, HM, HR3, WA, WB, WC2, WM, ALL
 
 HV2, HE, V1, W2 = 9, 10, 8, 13
