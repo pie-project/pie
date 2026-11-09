@@ -476,6 +476,7 @@ impl Engine for Wgpu {
                 host_buffer_pages: shell.parked_buffer_pages(),
                 ..PoolFacts::default()
             },
+            chunks: None,
             limits: FireLimits {
                 max_lanes: budgets.max_lanes,
                 max_tokens: budgets.max_tokens,

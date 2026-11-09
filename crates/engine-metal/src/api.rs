@@ -582,6 +582,7 @@ impl Engine for Metal {
                 window_tokens: poem_exec::store::kv::declared_window(shell.trace()).unwrap_or(0),
                 ..PoolFacts::default()
             },
+            chunks: None,
             limits: FireLimits {
                 max_lanes: budgets.max_lanes,
                 max_tokens: budgets.max_tokens,

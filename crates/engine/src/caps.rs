@@ -1,6 +1,7 @@
 use eta_ir::registry::{GeometryClass, PortMask};
 use serde::{Deserialize, Serialize};
 
+use crate::chunk::ChunkFacts;
 use crate::transfer::{KvHandle, MemoryDomain};
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -137,6 +138,11 @@ impl PoolFacts {
 pub struct Capabilities {
     pub device: DeviceFacts,
     pub pools: PoolFacts,
+    /// The pools as chunks, where the engine states them; `None` keeps
+    /// `pools` the only word. Beside `pools` until every backend reports
+    /// chunks.
+    #[serde(default)]
+    pub chunks: Option<ChunkFacts>,
     pub limits: FireLimits,
     pub ports: PortMask,
     pub geometry: GeometryClass,

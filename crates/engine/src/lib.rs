@@ -10,6 +10,7 @@
 pub mod adapter;
 pub mod caps;
 pub mod channel;
+pub mod chunk;
 #[cfg(any(unix, windows, target_arch = "wasm32"))]
 pub mod disk;
 pub mod engine;
@@ -29,6 +30,10 @@ pub use adapter::{AdapterPlane, AdapterRegistration};
 pub use caps::{Capabilities, DeviceFacts, FireLimits, KvCopyDomains, PoolFacts};
 pub use channel::{
     ChannelId, ChannelRegistration, ChannelSeed, HostMirror, RegisteredChannel, Ticket,
+};
+pub use chunk::{
+    ChunkFacts, ChunkRun, ChunkTable, Evacuation, Growth, Pinned, Reserved, ReservedRun,
+    SegmentFacts, ShapeId, SlotCopy, SlotKind, SlotRun, SlotShape,
 };
 pub use engine::{
     CompletionSink, Engine, KvWrites, StepDone, StepOutcome, TapGroups, TapSink, Tapped,
