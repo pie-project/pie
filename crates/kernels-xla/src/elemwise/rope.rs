@@ -167,6 +167,27 @@ pub(crate) fn turn(f: &mut Func, x: Val, pos: Val, t: &Turn) -> Result<Val, Erro
             return Ok(f.reshape(out, &[rows, width])?);
         }
     }
+    // Heads narrower than a lane tile turn a tile's worth at a time: a
+    // `[rows, heads, 64]` plane lays each head across a whole 128-lane tile,
+    // and every step of the turn relayouts it (v6e gpt-oss 4096-row prefill:
+    // 10.8 of a 131 ms fire).
+    if unit < 128 && 128 % unit == 0 && width % 128 == 0 {
+        let u = t.unit;
+        let wide = Turn {
+            unit: 128,
+            partner: (0..128usize)
+                .map(|c| t.partner[c % u] + (c / u * u) as i64)
+                .collect(),
+            sign: (0..128usize).map(|c| t.sign[c % u]).collect(),
+            freq: t
+                .freq
+                .iter()
+                .map(|fq| (0..128usize).map(|c| fq[c % u]).collect())
+                .collect(),
+            mscale: t.mscale,
+        };
+        return turn(f, x, pos, &wide);
+    }
     let mut ang: Option<Val> = None;
     for (axis, freq) in t.freq.iter().enumerate() {
         if freq.iter().all(|&f| f == 0.0) {
