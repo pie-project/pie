@@ -397,13 +397,22 @@ def run_streaming(args: argparse.Namespace):
     # would silently do nothing.
     if getattr(args, "moe_backend", None):
         engine_kwargs["kernel_config"] = {"moe_backend": args.moe_backend}
+    # An engine built here takes the engine context's 2048-token scheduler budget on
+    # every card; `vllm serve` takes vLLM's own per-device default (16384 on a B200,
+    # 8192 on an H100). That default, never under 2048.
+    max_num_batched_tokens = args.max_num_batched_tokens
+    if max_num_batched_tokens is None and hasattr(AsyncEngineArgs, "get_batch_defaults"):
+        from vllm.usage.usage_lib import UsageContext
+
+        serve = AsyncEngineArgs.get_batch_defaults(args.tp_size)[0].get(UsageContext.OPENAI_API_SERVER)
+        max_num_batched_tokens = max(serve or 0, 2048)
     engine = AsyncLLM.from_engine_args(
         AsyncEngineArgs(
             model=args.model,
             trust_remote_code=True,
             gpu_memory_utilization=args.gpu_mem_util,
             max_num_seqs=max_num_seqs,
-            max_num_batched_tokens=args.max_num_batched_tokens,
+            max_num_batched_tokens=max_num_batched_tokens,
             tensor_parallel_size=args.tp_size,
             max_model_len=args.max_model_len,
             enable_prefix_caching=args.prefix_caching,
@@ -622,7 +631,7 @@ def run_streaming(args: argparse.Namespace):
             "client timing epoch monotonic ns": epoch_monotonic_ns,
             "enable_prefix_caching": args.prefix_caching,
             "max_num_seqs": max_num_seqs,
-            "max_num_batched_tokens": args.max_num_batched_tokens,
+            "max_num_batched_tokens": max_num_batched_tokens,
             "enforce_eager": args.enforce_eager,
             "temperature": args.temperature,
             "top_p": args.top_p,
