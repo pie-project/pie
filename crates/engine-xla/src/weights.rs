@@ -338,9 +338,12 @@ impl Weights {
                     });
                 }
                 let (rows, width) = shape_of(at);
-                // A pre-scaled mxfp4 bank is one e5m2 weight per code.
+                // A pre-scaled mxfp4 bank is one e5m2 weight per code; an i64
+                // table two u32 words per value.
                 let width = if stored[at] == p.dtype {
                     width
+                } else if p.dtype == Dtype::I64 {
+                    width * 2
                 } else {
                     kernels_xla::pack::codes_per_row(p.dtype, width).unwrap_or(width)
                 };
@@ -954,6 +957,12 @@ impl Landing<'_> {
     fn plain(&mut self, at: usize, bytes: &[u8]) -> Result<()> {
         let dtype = self.trace.params[at].dtype;
         let (rows, width) = (self.shape_of)(at);
+        if dtype == Dtype::I64 {
+            // An i64 table lands as its u32 words: a TPU splits every s64
+            // array a program reads into its halves, the whole table every
+            // fire (DeepSeek-V4's hash routes: 1.6 ms of a 20 ms v6e step).
+            return self.upload(at, Dtype::U32, width * 2, bytes);
+        }
         if self.tied_gemm.contains(&at) {
             let t = transpose_2byte(bytes, rows as usize, width as usize);
             self.gemm_buffers.insert(
@@ -1164,7 +1173,17 @@ impl Weights {
                 folded.insert(plane, fold_of(rows, row));
             }
         }
-        let mut stored: Vec<Dtype> = trace.params.iter().map(|p| p.dtype).collect();
+        let mut stored: Vec<Dtype> = trace
+            .params
+            .iter()
+            .map(|p| {
+                if p.dtype == Dtype::I64 {
+                    Dtype::U32
+                } else {
+                    p.dtype
+                }
+            })
+            .collect();
         for (&at, pairing) in &pairings {
             if prescale && trace.params[at].dtype == Dtype::Mxfp4 && pairing.biases.is_none() {
                 stored[at] = Dtype::E5m2;
@@ -1208,6 +1227,8 @@ impl Weights {
                         let (rows, width) = shape_of(at);
                         let width = if stored[at] == p.dtype || folded.contains_key(&at) {
                             width
+                        } else if p.dtype == Dtype::I64 {
+                            width * 2
                         } else {
                             kernels_xla::pack::codes_per_row(p.dtype, width).unwrap_or(width)
                         };

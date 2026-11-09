@@ -615,7 +615,9 @@ pub fn hash_route(
 ) -> Result<(Val, Val), Error> {
     const OP: &str = "linear.moe_route";
     expect(OP, ids, &[Dtype::U32, Dtype::I32])?;
-    expect(OP, tid2eid, &[Dtype::I64])?;
+    expect(OP, tid2eid, &[Dtype::I64, Dtype::U32])?;
+    // An i64 table may land as its u32 words, two a value.
+    let words = if tid2eid.dtype == Dtype::U32 { 2 } else { 1 };
     expect(OP, logits, &[Dtype::Bf16])?;
     nonzero(OP, "the fan-out", top_k)?;
     nonzero(OP, "the vocabulary", vocab)?;
@@ -627,7 +629,7 @@ pub fn hash_route(
             format!("{} token ids for {} rows", ids.elements(), routes.rows),
         ));
     }
-    if tid2eid.elements() < u64::from(vocab) * u64::from(top_k) {
+    if tid2eid.elements() < u64::from(vocab) * u64::from(top_k) * words {
         return Err(refuse(OP, "the hash table is smaller than vocab x top_k"));
     }
     let (rows, n, k, v) = (
@@ -653,8 +655,24 @@ pub fn hash_route(
     let tid = f.convert(tid, Elem::I32);
     let table = tid2eid.val;
     let total = f.ty(table).elements();
-    let table = f.reshape(table, &[total / k, k])?;
-    let eid = f.take_rows(table, tid)?; // [rows, k] i64
+    let w = k * words as i64;
+    let table = f.reshape(table, &[total / w, w])?;
+    let eid = f.take_rows(table, tid)?; // [rows, k] i64, or its words
+    let eid = if words == 2 {
+        // Each value from its (low, high) words, little-endian.
+        let eid = f.reshape(eid, &[rows, k, 2])?;
+        let lo = f.slice_axis(eid, 2, 0, 1)?;
+        let hi = f.slice_axis(eid, 2, 1, 2)?;
+        let lo = f.reshape(lo, &[rows, k])?;
+        let hi = f.reshape(hi, &[rows, k])?;
+        let lo = f.convert(lo, Elem::I64);
+        let hi = f.convert(hi, Elem::I64);
+        let s = f.const_i(Elem::I64, 32, &[rows, k]);
+        let hi = f.shl(hi, s)?;
+        f.or(hi, lo)?
+    } else {
+        eid
+    };
     let lo = f.const_i(Elem::I64, 0, &[rows, k]);
     let hi = f.const_i(Elem::I64, n, &[rows, k]);
     let ge = f.compare(Cmp::Ge, eid, lo)?;
