@@ -1,7 +1,7 @@
 # State Chunk redesign — shared spec for implementation agents
 
 Design doc (human-facing): https://claude.ai/artifact/3QFaEVRYHGJrZMquXdsG2H
-Integration branch: `state-chunk` on origin (git@github.com:pie-project/pie.git), cut from main f2f1353df.
+Integration branch: `new-memory` on origin (state-chunk is its base) (git@github.com:pie-project/pie.git), cut from main f2f1353df.
 
 ## North star
 The model says only WHAT it remembers (`state(shape, dtype)` handles). The compiler decides how that is packed
@@ -62,6 +62,6 @@ must need one poem line and no engine change.
 - Work only on your own branch in your worktree. Commit with plain messages: NO `Co-Authored-By`, NO
   `Claude-Session`, NO "Generated with" lines. Author is the repo's configured user.
 - Push your branch to origin as `sc/<your-package>` (`git push origin HEAD:sc/<name>`; the push URL is SSH).
-  Never push to `main` or `state-chunk`; the coordinator merges.
-- Before starting, make sure your branch is based on `origin/state-chunk` (run `git fetch origin` and rebase if not).
+  Never push to `main`, `state-chunk` or `new-memory`; the coordinator merges.
+- Before starting, make sure your branch is based on `origin/state-chunk` or later `origin/new-memory` (run `git fetch origin` and rebase if not).
 - Follow CONTRIBUTING.md and the repo's existing style; run clippy/rustfmt on crates you touch.
