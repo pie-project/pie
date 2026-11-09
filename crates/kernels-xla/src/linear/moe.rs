@@ -1147,7 +1147,10 @@ fn gmm_spec(
         tile,
         bias: false,
         out: Elem::F32,
-        prefetch: !mxfp4,
+        // mxfp4 banks (pre-scaled) at decode widths that route every expert
+        // a tile or less (v6e gpt-oss, 256 lanes: 33.8 -> 31.8 ms a step; at
+        // 4 lanes, 16 pairs, 8.4 -> 8.7 ms, so not there).
+        prefetch: !mxfp4 || (16 * e <= p && p <= e * tm),
     };
     spec.out_width().ok().map(|_| spec)
 }
@@ -1254,7 +1257,10 @@ fn gmm_rows_whole(p: i64, e: i64, base: i64) -> i64 {
     let active = e.min(p).max(1);
     let per = (p + active - 1) / active;
     let mut tm = base.max(16);
-    while tm < 128 && tm < per {
+    // A fire past 4096 tokens' pairs fills 256-row tiles nearly whole (v6e
+    // gpt-oss 4096-row prefill: pf256 32.3k tok/s against 31.6k at 128).
+    let cap = if p >= 16384 { 256 } else { 128 };
+    while tm < cap && tm < per {
         tm *= 2;
     }
     // An expert holding two 256-row tiles or more takes them: each step
@@ -1440,6 +1446,32 @@ fn tile_kernel(
         _ => None,
     };
     let (se, nt) = (t.se, t.nt);
+    if spec.prefetching() {
+        // Each tile's run (its expert's rank among the routed ones) and the
+        // next run's expert (-1 after the last), as `sorted` gives them.
+        let more = f.const_i(Elem::I32, t.tm - 1, &[e]);
+        let per = f.add(t.counts, more)?;
+        let tt = f.const_i(Elem::I32, t.tm, &[e]);
+        let per = f.div(per, tt)?;
+        let tend = f.add(t.tstart, per)?;
+        let zero = f.const_i(Elem::I32, 0, &[e]);
+        let one = f.const_i(Elem::I32, 1, &[e]);
+        let busy = f.compare(Cmp::Gt, t.counts, zero)?;
+        let busy = f.select(busy, one, zero)?;
+        let upto = f.scan(busy, 0, Fold::Sum)?;
+        let rank = f.sub(upto, busy)?;
+        let run = pick_small(f, rank, se)?;
+        let tend_t = pick_small(f, tend, se)?;
+        let end = f.const_i(Elem::I32, t.tiles - 1, &[t.tiles]);
+        let at = f.min(tend_t, end)?;
+        let nx = pick_small(f, se, at)?;
+        let ntb = f.broadcast(nt, &[t.tiles], &[0])?;
+        let next = f.compare(Cmp::Lt, tend_t, ntb)?;
+        let none = f.const_i(Elem::I32, -1, &[t.tiles]);
+        let nxt = f.select(next, nx, none)?;
+        let ops: Vec<Val> = [se, nt, run, nxt, xs, w].into_iter().chain(bias).collect();
+        return Ok(kernel.call(f, &ops)?[0]);
+    }
     Ok(if spec.scaled {
         // The exponent bytes `[E·N, K/32]`, read `[K/32, E·N]` as the codes
         // are (the TPU lays them `E·N`-minor too).
@@ -1481,46 +1513,15 @@ fn tile_dest(f: &mut Func, t: &TilePlan) -> Result<Val, Error> {
 }
 
 /// The rows `dest` names of a tile-ordered result, each cut to its expert's
-/// `n` columns (`ids` its expert): `[len(dest), n]`.
-fn untile(
-    f: &mut Func,
-    spec: crate::linear::moe_gmm::Gmm,
-    n: i64,
-    e: i64,
-    out: Val,
-    dest: Val,
-    ids: Val,
-) -> Result<Val, Error> {
-    let p = f.dims(dest)[0];
-    let offsets = spec.offsets()?;
-    if offsets.iter().all(|&o| o == 0) {
-        return Ok(f.take_rows(out, dest)?);
+/// `n` columns (the kernel lands every row's outputs from column 0):
+/// `[len(dest), n]`.
+fn untile(f: &mut Func, n: i64, out: Val, dest: Val) -> Result<Val, Error> {
+    let y = f.take_rows(out, dest)?;
+    let p = f.dims(y)[0];
+    if f.dims(y)[1] == n {
+        return Ok(y);
     }
-    // Whole rows, then each row's columns from among the few distinct
-    // (static) offsets: a gather at a per-row column offset lowers to one
-    // dynamic slice per pair (v6e: 256 of them, 0.3 ms a layer at 64 tokens).
-    let whole = f.take_rows(out, dest)?;
-    let width = f.dims(whole)[1];
-    let table = f.const_ints(Elem::I32, &offsets, &[e])?;
-    let off = pick_small(f, table, ids)?;
-    let off = f.broadcast(off, &[p, n], &[0])?;
-    let mut distinct = offsets.clone();
-    distinct.sort_unstable();
-    distinct.dedup();
-    let mut y: Option<Val> = None;
-    for &o in &distinct {
-        let cut = f.slice(whole, &[0, o], &[p, o + n], &[1, 1])?;
-        debug_assert!(o + n <= width);
-        y = Some(match y {
-            None => cut,
-            Some(prev) => {
-                let at = f.const_i(Elem::I32, o, &[p, n]);
-                let here = f.compare(Cmp::Eq, off, at)?;
-                f.select(here, cut, prev)?
-            }
-        });
-    }
-    y.ok_or_else(|| refuse("linear.moe", "no expert"))
+    Ok(f.slice(y, &[0, 0], &[p, n], &[1, 1])?)
 }
 
 /// The routed matmul through the grouped-matmul kernel: the pairs sorted by
@@ -1562,7 +1563,7 @@ fn gmm(
     };
     let out = tile_kernel(f, spec, fan, bank, scales, bias, &plan, xs)?;
     let dest = tile_dest(f, &plan)?;
-    let y = untile(f, spec, fan.n, fan.experts, out, dest, plan.ids)?;
+    let y = untile(f, fan.n, out, dest)?;
     let width = spec.out_width()?;
     Ok((
         y,
@@ -1589,41 +1590,12 @@ fn gmm_sorted(
     x: Val,
     r: Val,
     valid: Val,
-    ids: Val,
 ) -> Result<Val, Error> {
-    let (p, e, n) = (fan.pairs(), fan.experts, fan.n);
+    let (p, n) = (fan.pairs(), fan.n);
     let sorted = sorted(f, spec, fan, x, r, valid, None)?;
     let out = tiles_of(f, spec, bank, &sorted, sorted.xs)?;
     let dest = dest(f, &sorted, p)?;
-    let offsets = spec.offsets()?;
-    if offsets.iter().all(|&o| o == 0) {
-        return Ok(f.take_rows(out, dest)?);
-    }
-    // Whole rows, then each row's columns from among the few distinct
-    // (static) offsets: a gather at a per-row column offset lowers to one
-    // dynamic slice per pair (v6e: 256 of them, 0.3 ms a layer at 64 tokens).
-    let whole = f.take_rows(out, dest)?;
-    let width = f.dims(whole)[1];
-    let table = f.const_ints(Elem::I32, &offsets, &[e])?;
-    let off = pick_small(f, table, ids)?;
-    let off = f.broadcast(off, &[p, n], &[0])?;
-    let mut distinct = offsets.clone();
-    distinct.sort_unstable();
-    distinct.dedup();
-    let mut y: Option<Val> = None;
-    for &o in &distinct {
-        let cut = f.slice(whole, &[0, o], &[p, o + n], &[1, 1])?;
-        debug_assert!(o + n <= width);
-        y = Some(match y {
-            None => cut,
-            Some(prev) => {
-                let at = f.const_i(Elem::I32, o, &[p, n]);
-                let here = f.compare(Cmp::Eq, off, at)?;
-                f.select(here, cut, prev)?
-            }
-        });
-    }
-    y.ok_or_else(|| refuse("linear.moe", "no expert"))
+    untile(f, n, out, dest)
 }
 
 /// A fire's pairs sorted by expert into the grouped-matmul kernel's tiles.
@@ -1917,7 +1889,7 @@ fn routed(
                 } else {
                     Elem::Bf16
                 };
-                gmm_sorted(f, spec, fan, &bank, x, r, valid, ids)?
+                gmm_sorted(f, spec, fan, &bank, x, r, valid)?
             }
             Some(mut spec) => {
                 let scales = match form {
@@ -2407,7 +2379,7 @@ pub fn experts(
     ) else {
         return Ok(None);
     };
-    let flat = |s: crate::linear::moe_gmm::Gmm| s.offsets().map(|o| o.iter().all(|&v| v == 0));
+    let flat = |s: crate::linear::moe_gmm::Gmm| s.out_width().map(|w| w == s.n);
     if up.tm != dn.tm || up.tiles != dn.tiles || !flat(up)? || !flat(dn)? {
         return Ok(None);
     }
@@ -2595,8 +2567,7 @@ pub fn weighted_sum_tiled(
     };
     let dest = tile_dest(f, &plan)?;
     let dest = slot_major(f, dest)?;
-    let ids = slot_major(f, plan.ids)?;
-    let rows = untile(f, t.spec, w, plan.experts, t.rows, dest, ids)?;
+    let rows = untile(f, w, t.rows, dest)?;
     let r = f.reshape(rows, &[k, tok, w])?;
     let r = f.convert(r, Elem::F32);
     let zero = f.const_f(Elem::F32, 0.0, &[tok, k]);

@@ -188,22 +188,6 @@ impl Gmm {
         })
     }
 
-    /// Where expert `e`'s outputs start in its rows of the result.
-    pub fn offsets(&self) -> Built<Vec<i64>> {
-        let cut = self.cut()?;
-        Ok((0..self.experts)
-            .map(|e| match cut {
-                Cut::Blocked { .. } => 0,
-                Cut::Element { width } => e * self.n - self.window_start(e, width),
-            })
-            .collect())
-    }
-
-    /// The first column of expert `e`'s window.
-    fn window_start(&self, e: i64, width: i64) -> i64 {
-        (e * self.n / 128 * 128).min(self.experts * self.n - width)
-    }
-
     /// The bank operand's shape as the kernel takes it.
     #[must_use]
     pub fn bank_dims(&self) -> [i64; 2] {
@@ -218,20 +202,56 @@ impl Gmm {
     /// tile's run and the next run's expert after `se` and `nt`).
     #[must_use]
     pub fn prefetching(&self) -> bool {
+        // Two whole `E·N`-minor experts and the widened one beside the rows,
+        // in VMEM: gpt-oss's 16.6 MB e5m2 gate/up experts at decode widths.
+        let whole = || {
+            let cols = self.out_width().unwrap_or(i64::MAX / 8);
+            let convert = if self.w == Elem::Bf16 {
+                0
+            } else {
+                self.k * cols * 2
+            };
+            2 * self.tm * self.k * 2
+                + 2 * self.k * cols * self.wbytes()
+                + convert
+                + 2 * self.tm * cols * 4
+                <= self.vmem_cap
+        };
         self.prefetch
             && !self.scaled
             && !self.tile
-            && !self.bias
-            && matches!(self.cut(), Ok(Cut::Blocked { tn }) if tn == self.n)
+            && match (self.orient, self.cut()) {
+                (_, Ok(Cut::Blocked { tn })) if tn == self.n => !self.bias,
+                (Orient::KMajor, Ok(Cut::Blocked { .. })) => whole(),
+                (Orient::KMajor, Ok(Cut::Element { .. })) => !self.bias && whole(),
+                _ => false,
+            }
     }
 
     fn kernel_prefetching(&self) -> Built<Compiled> {
-        let (k, n, tm) = (self.k, self.n, self.tm);
+        let (k, n, tm, e) = (self.k, self.n, self.tm, self.experts);
         let rows = self.tiles * tm;
         let orient = self.orient;
+        // An element window's row turns by its lag after the product.
+        let cols = self.out_width()?;
+        let element = matches!(self.cut()?, Cut::Element { .. });
         let (rb, cb) = match orient {
             Orient::NMajor => (n, k),
-            Orient::KMajor => (k, n),
+            Orient::KMajor => (k, cols),
+        };
+        // Expert `ex`'s first column (an element window's lane tile).
+        let start = move |b: &mut Body, ex: V| -> Built<V> {
+            let nn = b.i32(n);
+            let at = b.muli(ex, nn)?;
+            if !element {
+                return Ok(at);
+            }
+            let lane = b.i32(128);
+            let at = b.divsi(at, lane)?;
+            let at = b.muli(at, lane)?;
+            let top = b.i32(e * n - cols);
+            let at = b.minsi(at, top)?;
+            b.assume_multiple(at, 128)
         };
         fn last(b: &mut Body, g: &Grid) -> Built<V> {
             let zero = b.index(0);
@@ -258,15 +278,33 @@ impl Gmm {
         };
         let out_elem = self.out;
         let out = Operand {
-            array: vec![rows, n],
+            array: vec![rows, cols],
             elem: out_elem,
-            block: vec![tm, n],
+            block: vec![tm, cols],
             window: Window::Blocked,
             index: Box::new(|b: &mut Body, g: &Grid| Ok(vec![last(b, g)?, b.i32(0)])),
         };
+        let bias = self.bias.then(|| Operand {
+            array: vec![e, 1, n],
+            elem: Elem::Bf16,
+            block: vec![1, 1, n],
+            window: Window::Blocked,
+            index: Box::new(|b: &mut Body, g: &Grid| {
+                let t = last(b, g)?;
+                let ex = b.load(g.prefetch[0], &[t])?;
+                Ok(vec![ex, b.i32(0), b.i32(0)])
+            }),
+        });
+        if self.bias && out_elem != Elem::Bf16 {
+            return bad(format!("a {out_elem:?} result beside a bias"));
+        }
         let wb = self.wbytes();
-        let convert = if self.w == Elem::Bf16 { 0 } else { k * n * 2 };
-        let vmem = 2 * tm * k * 2 + 2 * k * n * wb + convert + 2 * tm * n * 4;
+        let convert = if self.w == Elem::Bf16 {
+            0
+        } else {
+            k * cols * 2
+        };
+        let vmem = 2 * tm * k * 2 + 2 * k * cols * wb + convert + 2 * tm * cols * 4;
         let floor = (32 << 20).min(self.vmem_cap);
         let limit = (vmem * 2 + (8 << 20)).clamp(floor, self.vmem_cap);
         let kernel = Kernel {
@@ -279,7 +317,7 @@ impl Gmm {
                 vec![self.tiles],
                 vec![self.tiles],
             ],
-            ins: vec![xs, bank],
+            ins: [Some(xs), Some(bank), bias].into_iter().flatten().collect(),
             outs: vec![out],
             vmem_limit: Some(limit as u64),
             scratch: vec![
@@ -295,11 +333,10 @@ impl Gmm {
             // The copy of expert `ex`'s weights into slot `s`.
             let copy = |b: &mut Body, ex: V, s: V| -> Built<(V, V, V)> {
                 let z = b.i32(0);
-                let nn = b.i32(n);
-                let at = b.muli(ex, nn)?;
+                let at = start(b, ex)?;
                 let src = match orient {
                     Orient::NMajor => b.ref_slice(bank, &[at, z], &[n, k])?,
-                    Orient::KMajor => b.ref_slice(bank, &[z, at], &[k, n])?,
+                    Orient::KMajor => b.ref_slice(bank, &[z, at], &[k, cols])?,
                 };
                 let dst = b.ref_slice(wbuf, &[s, z, z], &[1, rb, cb])?;
                 let dst = b.ref_squeeze(dst)?;
@@ -348,8 +385,45 @@ impl Gmm {
                 let x = b.vload_all(blk.ins[0])?;
                 let w = b.vload_all(held)?;
                 let w = b.convert_f(w, Elem::Bf16)?;
-                let acc = b.splat_f(&[tm, n], Elem::F32, 0.0)?;
+                let acc = b.splat_f(&[tm, cols], Elem::F32, 0.0)?;
                 let y = b.matmul(x, w, acc, orient == Orient::NMajor)?;
+                let y = if self.bias {
+                    let row = b.vload_all(blk.ins[2])?;
+                    let row = b.op(
+                        "vector.shape_cast",
+                        &[row],
+                        "",
+                        &[MTy::Vector(vec![1, n], Elem::Bf16)],
+                    )[0];
+                    let row = b.convert_f(row, Elem::F32)?;
+                    let row = b.op(
+                        "vector.broadcast",
+                        &[row],
+                        "",
+                        &[MTy::Vector(vec![tm, n], Elem::F32)],
+                    )[0];
+                    b.addf(y, row)?
+                } else {
+                    y
+                };
+                let y = if element {
+                    let ex = b.load(pre[0], &[ti])?;
+                    let nn = b.i32(n);
+                    let col = b.muli(ex, nn)?;
+                    let at = start(b, ex)?;
+                    let lag = b.subi(col, at)?;
+                    let wide = b.i32(cols);
+                    let by = b.subi(wide, lag)?;
+                    let by = b.remsi(by, wide)?;
+                    b.op(
+                        "tpu.dynamic_rotate",
+                        &[y, by],
+                        "dimension = 1 : si32",
+                        &[MTy::Vector(vec![tm, cols], Elem::F32)],
+                    )[0]
+                } else {
+                    y
+                };
                 let y = b.convert_f(y, out_elem)?;
                 b.vstore_all(y, blk.outs[0])
             })
@@ -596,8 +670,34 @@ impl Gmm {
                 } else {
                     y
                 };
+                let Cut::Element { width } = cut else {
+                    let y = b.convert_f(y, self.out)?;
+                    return b.vstore_all(y, blk.outs[0]);
+                };
+                // The expert's outputs turned to column 0 in VMEM (gathering
+                // the rows at a per-row column offset afterwards relays every
+                // row out: v6e gpt-oss, 0.2 ms a layer at 4096 tokens).
+                let ex = expert(b, &blk.grid)?;
+                let nn = b.i32(n);
+                let col = b.muli(ex, nn)?;
+                let lane = b.i32(128);
+                let start = b.divsi(col, lane)?;
+                let start = b.muli(start, lane)?;
+                let top = b.i32(e * n - width);
+                let start = b.minsi(start, top)?;
+                let lag = b.subi(col, start)?;
+                let wide = b.i32(width);
+                let by = b.subi(wide, lag)?;
+                let by = b.remsi(by, wide)?;
+                let y = b.op(
+                    "tpu.dynamic_rotate",
+                    &[y, by],
+                    "dimension = 1 : si32",
+                    &[MTy::Vector(vec![tm, width], Elem::F32)],
+                )[0];
                 let y = b.convert_f(y, self.out)?;
-                b.vstore_all(y, blk.outs[0])
+                b.vstore_all(y, blk.outs[0])?;
+                Ok(())
             })
         })
     }
@@ -761,9 +861,8 @@ mod tests {
         // down: 22.5 lane tiles an expert, one 23-tile window each.
         let d = gmm(2880, Orient::KMajor);
         assert_eq!(d.cut().unwrap(), Cut::Element { width: 2944 });
-        let off = d.offsets().unwrap();
-        assert_eq!(&off[..3], &[0, 64, 0]);
-        assert_eq!(off[31], 64);
-        assert!(d.kernel().unwrap().module.contains("element_window"));
+        // Each window's row turned by its lag (0 or 64 lanes) to column 0.
+        let module = d.kernel().unwrap().module;
+        assert!(module.contains("element_window") && module.contains("dynamic_rotate"));
     }
 }
