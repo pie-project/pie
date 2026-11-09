@@ -185,34 +185,6 @@ impl Run<'_> {
                     *alpha,
                     o_y.landing(),
                 )?;
-                // The same unit over the rows in tile order, for the routed
-                // select that reads it next (the pair rows above then go
-                // unread, and XLA drops them).
-                if let Some(routes) = self.tiled_routes(*packed)
-                    && let Some(t) = self.tiled(*packed, routes)
-                {
-                    let rows = kernels_xla::tensor::Operand {
-                        val: t.rows,
-                        rows: u32::try_from(t.plan.rows()).unwrap_or(u32::MAX),
-                        width: u32::try_from(t.width).unwrap_or(u32::MAX),
-                        dtype: dtype::Dtype::Bf16,
-                    };
-                    let unit = linear::mlp::swiglu_clamp_alpha(
-                        l.f(),
-                        rows,
-                        *intermediate,
-                        limit.unwrap_or(f32::MAX),
-                        *alpha,
-                        kernels_xla::tensor::Landing {
-                            rows: rows.rows,
-                            width: *intermediate,
-                            dtype: dtype::Dtype::Bf16,
-                        },
-                    )?;
-                    let unit = l.f().convert(unit, kernels_xla::hlo::Elem::Bf16);
-                    let kept = linear::moe::retile(t, unit, i64::from(*intermediate));
-                    self.keep_tiled(*y, routes, kept);
-                }
                 l.land(o_y, v)
             }),
 

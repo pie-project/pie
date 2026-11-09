@@ -1995,21 +1995,6 @@ pub fn matmul_select_tiled(
     select_entry(f, OP, x, form, bias, routes, y, tuning, x_tiled)
 }
 
-/// A tile-ordered result's rows mapped through `rows` (a row-wise op on
-/// them, a GLU), the same plan ordering them.
-#[must_use]
-pub fn retile(t: Tiled, rows: Val, width: i64) -> Tiled {
-    Tiled {
-        rows,
-        width,
-        spec: crate::linear::moe_gmm::Gmm {
-            out: Elem::Bf16,
-            ..t.spec
-        },
-        ..t
-    }
-}
-
 /// [`weighted_sum`] of a routed result held in tile order: each slot's rows
 /// gathered slot-major (`[top_k, T, N]`, a free fold) where the pair-major
 /// fold relays every row out. An unrouted slot adds nothing (its weight is
