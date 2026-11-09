@@ -38,7 +38,7 @@ for k in OWN:
     open(os.path.join(out, f"{k}.csl"), "w").write(body + "\n" + "\n".join(d) + "\n")
 
 P = ["K", "KM", "HcA", "HcW", "Qh", "DcS", "DcG", "NES", "NEG", "HDS", "HDG", "HR_", "Ic", "VR", "HDc", "NPX"]
-PD = {"WIN": 0, "WFIFO": 32, "WSPEC": 0, "DIAG": 0, "TSTAMP": 0, "XKEEP": 0, "ATTL": 2, "HACC16": 0, "WFORCE": 0, "FIFOW": 32}
+PD = {"WIN": 0, "WFIFO": 32, "WSPEC": 0, "DIAG": 0, "TSTAMP": 0, "XKEEP": 0, "ATTL": 2, "HACC16": 0, "WFORCE": 0, "FIFOW": 32, "RING": 0}
 L = [f"param {p}: u16;" for p in P] + [f"param {p}: u16 = {v};" for p, v in PD.items()]
 L += ["param kernel_rows: u16 = 0;", "param kernel_cols: u16 = 0;", "param iters: u16 = 0;"]
 L.append(f"const W: u16 = {g.W};\nconst HH: u16 = {g.H};\nconst PX: u16 = {g.PX};\nconst PY: u16 = {g.PY};\nconst XC: u16 = {g.XC};\nconst YC: u16 = {g.YC};\nconst RA: u16 = {g.RA};")
@@ -57,7 +57,7 @@ for u, (X0, Y0) in enumerate(g.origins):
              f"        if (lx == XC and ly == YC) {{ @set_tile_code(x, y, \"filler.csl\", .{{ .memcpy_params = mp }}); }}\n"
              f"        else if (lx == XC) {{ @set_tile_code(x, y, \"cx.csl\", .{{ .memcpy_params = mp, .K = K, .Hc = hc, .DIAG = DIAG, .FIFOW = FIFOW, .XKEEP = XKEEP }}); }}\n"
              f"        else if (ly == YC) {{ @set_tile_code(x, y, \"cy.csl\", .{{ .memcpy_params = mp, .K = K, .KM = KM, .Qh = Qh, .DcS = DcS, .DcG = DcG, .Ic = Ic, .HR = HR_, .DIAG = DIAG, .FIFOW = FIFOW, .ATTL = ATTL, .TSTAMP = TSTAMP, .HDS = HDS, .HDG = HDG }}); }}\n"
-             f"        else {{ @set_tile_code(x, y, \"weight.csl\", .{{ .memcpy_params = mp, .K = K, .Hc = hc, .Ic = Ic, .MV = 1, .KM = KM, .ATT = att, .Qh = Qh, .DcS = DcS, .DcG = DcG, .NES = NES, .NEG = NEG, .PYW = RA, .HDS = HDS, .HDG = HDG, .WIN = WIN, .WSPEC = WSPEC, .DIAG = DIAG, .FIFOW = WFIFO, .TSTAMP = TSTAMP }}); }}\n      }}")
+             f"        else {{ @set_tile_code(x, y, \"weight.csl\", .{{ .memcpy_params = mp, .K = K, .Hc = hc, .Ic = Ic, .MV = 1, .KM = KM, .ATT = att, .Qh = Qh, .DcS = DcS, .DcG = DcG, .NES = NES, .NEG = NEG, .PYW = RA, .HDS = HDS, .HDG = HDG, .WIN = WIN, .WSPEC = WSPEC, .RING = RING, .DIAG = DIAG, .FIFOW = WFIFO, .TSTAMP = TSTAMP }}); }}\n      }}")
 L.append("      if (!done) { @set_tile_code(x, y, \"filler.csl\", .{ .memcpy_params = mp }); }")
 L.append("    }\n  }")
 for n, t in NAMES:

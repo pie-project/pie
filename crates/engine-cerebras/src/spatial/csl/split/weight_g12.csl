@@ -30,6 +30,7 @@ param PYW: u16 = 128;  // the attention rows
 param HDS: u16 = 256;
 param HDG: u16 = 512;
 param WSPEC: u16 = 0;  // 1: the attention mixer specialized a layer kind (larger code)
+param RING: u16 = 0;   // 1 (WIN 0): a sliding layer's mixer over its whole ring every step (fixed-length views)
 param WIN: u16 = 0;    // > 0: the sliding window (the ring of NES PYW entries is longer: older entries are masked)
 param TSTAMP: u16 = 0;
 param FIFOW: u16 = 32;
@@ -203,6 +204,7 @@ fn init() void {
   wfl = @as(u16, rcfg[RQ + 11]);
   myrow = @as(u16, rcfg[RQ + 17]);
   timestamp.enable_tsc();
+  if (RING == 1 and ATT == 1) { fr_init(); }
   sys_mod.unblock_cmd_stream();
 }
 
@@ -335,6 +337,46 @@ fn exp_v(buf: mem1d_dsd, n: u16) void {
   @add16(ph, ph, kk);
   @fmovs(buf, p);
 }
+// (RING 1) exp_v on the whole sliding ring's scores (Qh NES): fixed-length views, the u16 ones built once at init
+const NFR: u16 = if (ATT == 1) Qh * NES else 1;
+const fS = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{NFR} -> sx[i] });
+const fP = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{NFR} -> y[i] });
+const fH = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{NFR} -> xh[i] });
+var fK = y16_d;
+var fPL = y16_d;
+var fPH = y16_d;
+fn fr_init() void {
+  fK = @set_dsd_length(@set_dsd_base_addr(@get_dsd(mem1d_dsd, .{ .tensor_access = |i|{YN} -> w[i] }), @ptrcast([*]u16, &y16)), NFR);
+  fPL = @set_dsd_length(@set_dsd_stride(@set_dsd_base_addr(fK, @ptrcast([*]u16, &y)), 2), NFR);
+  fPH = @increment_dsd_offset(fPL, 1, u16);
+}
+// exp_v(fS) then the clamp and the f16 copy into xh (the same ops as the runtime path)
+fn exp_fr() void {
+  @fmaxs(fS, fS, -87.0);
+  @fnegs(fS, fS);
+  @fmaxs(fS, fS, -88.0);
+  @fnegs(fS, fS);
+  @fmuls(fP, fS, 1.4426950408889634);
+  @fadds(fP, fP, ex_a[0]);
+  @fadds(fP, fP, ex_a[1]);
+  @fmacs(fS, fS, fP, -0.6931471805599453);
+  @fadds(fP, fP, ex_a[2]);
+  @sll16(fK, fPL, 7);
+  @fmuls(fP, fS, 0.041458580642938614);
+  @fadds(fP, fP, ex_c[0]);
+  @fmuls(fP, fP, fS);
+  @fadds(fP, fP, ex_c[1]);
+  @fmuls(fP, fP, fS);
+  @fadds(fP, fP, ex_c[2]);
+  @fmuls(fP, fP, fS);
+  @fadds(fP, fP, ex_c[3]);
+  @add16(fPH, fPH, fK);
+  @fmovs(fS, fP);
+  @fnegs(fS, fS);
+  @fmaxs(fS, fS, -65504.0);
+  @fnegs(fS, fS);
+  @fs2h(fH, fS);
+}
 const IHDS: f32 = 1.0 / @as(f32, HDS);
 const IHDG: f32 = 1.0 / @as(f32, HDG);
 fn rsq(v: f32) f32 {
@@ -434,7 +476,10 @@ fn attm(l: u16, comptime g: u16) void {
   }
   @fs2h(@set_dsd_length(xh_d, QD), @set_dsd_length(ab_d, QD));
   const eseen = pos / @as(u32, PYW) + 1;
-  const NEl: u16 = if (eseen < @as(u32, ne)) @as(u16, eseen) else ne;
+  // RING, a sliding layer: the whole ring every step (NEl a constant), the entries not yet written masked below
+  const FR: bool = (RING == 1 and WIN == 0 and !isg(l));   // (one mixer copy: a runtime choice)
+  const nseen: u16 = if (eseen < @as(u32, ne)) @as(u16, eseen) else ne;
+  const NEl: u16 = if (FR) ne else nseen;
   const nsl: u16 = Qh * NEl + Qh + 2;
   const kb = koff(c);
   const vb = voff(c);
@@ -444,10 +489,13 @@ fn attm(l: u16, comptime g: u16) void {
     var h: u16 = 0;
     while (h < Qh) : (h += 1) {
       kvmv(@ptrcast([*]u16, &kc[1 + kb]), dc, ne, h * dc, h * ne);
-      @fmovs(@set_dsd_length(@increment_dsd_offset(sx_d, @as(i16, h * NEl), f32), NEl),
-             @set_dsd_length(@increment_dsd_offset(y_d, @as(i16, h * ne), f32), NEl));
+      if (!FR) {
+        @fmovs(@set_dsd_length(@increment_dsd_offset(sx_d, @as(i16, h * NEl), f32), NEl),
+               @set_dsd_length(@increment_dsd_offset(y_d, @as(i16, h * ne), f32), NEl));
+      }
       sx[Qh * NEl + h] = ab[QD + 2 * dc + 1 + h];
     }
+    if (FR) { @fmovs(fS, fP); }   // (the whole ring: y's layout is sx's)
     const pm = mine and pend[c] != 0;
     sx[Qh * NEl + Qh] = if (pm) pks[c] else 0.0;
     sx[Qh * NEl + Qh + 1] = if (pm) pvs[c] else 0.0;
@@ -460,6 +508,9 @@ fn attm(l: u16, comptime g: u16) void {
       @fmuls(sh, sh, @set_dsd_length(@increment_dsd_offset(ki, @as(i16, e0), f32), NEl));
       @fmuls(sh, sh, rsq(sx[Qh * NEl + h] * ihd + 1.0e-6));
       @fsubs(sh, sh, mref[l * Qh + h]);
+      if (FR and nseen < ne) {   // entries not yet written score -1e30: exp -> 0, f16 0: they add exact zeros
+        @fmovs(@set_dsd_length(@increment_dsd_offset(sx_d, @as(i16, h * NEl + nseen), f32), ne - nseen), -1.0e30);
+      }
       if (WIN > 0 and !cg(c)) {   // entries out of the window (or never written) score -1e30: exp -> 0
         var e: u16 = 0;
         while (e < NEl) : (e += 1) {
@@ -468,12 +519,14 @@ fn attm(l: u16, comptime g: u16) void {
         }
       }
     }
-    exp_v(@set_dsd_length(sx_d, Qh * NEl), Qh * NEl);
-    const sp = @set_dsd_length(sx_d, Qh * NEl);
-    @fnegs(sp, sp);
-    @fmaxs(sp, sp, -65504.0);
-    @fnegs(sp, sp);
-    @fs2h(@set_dsd_length(xh_d, Qh * NEl), sp);
+    if (FR) { exp_fr(); } else {
+      exp_v(@set_dsd_length(sx_d, Qh * NEl), Qh * NEl);
+      const sp = @set_dsd_length(sx_d, Qh * NEl);
+      @fnegs(sp, sp);
+      @fmaxs(sp, sp, -65504.0);
+      @fnegs(sp, sp);
+      @fs2h(@set_dsd_length(xh_d, Qh * NEl), sp);
+    }
     h = 0;
     while (h < Qh) : (h += 1) { kvmv(@ptrcast([*]u16, &vc[1 + vb]), NEl, dc + 1, h * NEl, h * (dc + 1)); }
     send_y(Qh * (dc + 1));

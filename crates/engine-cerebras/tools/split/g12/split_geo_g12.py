@@ -273,7 +273,7 @@ def groups_split(PY, YC, RA, ga, gw):
 
 
 def tiny_geo(**kw):
-    """The tiny simulation: units 8 x 8 (A rows 0-2 Hc 2, W rows 3-7 Hc 3; YC 4), SWA 4, 2 x 2 units (unit 0 at the
+    """The tiny simulation (window 9: an exact ring of 3 x 3): units 8 x 8 (A rows 0-2 Hc 2, W rows 3-7 Hc 3; YC 4), SWA 4, 2 x 2 units (unit 0 at the
     origin, down column 0, up column 1: the last unit on unit 0's rows), head groups [0-2] [3] [4-5] [6-7]."""
     PX, PY, RA = 8, 8, 3
     origins = [(0, 0), (0, 9), (9, 9), (9, 0)]
@@ -282,10 +282,10 @@ def tiny_geo(**kw):
 
 
 def g12_geo(**kw):
-    """12B: units 344 x 283 (A rows 0-131 Hc 12, W rows 132-282 Hc 15), SWA 43, K 6; column 0 (x 0) units 0-3 top
-    to bottom, column 1 (x 345) units 4-7 bottom to top (unit 7 on unit 0's rows); the head 53 + 1 columns at x 690
-    (groups: the A rows in sixes, the W rows in fives)."""
-    PX, PY, RA = 344, 283, 132
+    """12B: units 344 x 283 (A rows 0-127 Hc 12, W rows 128-282 Hc 15: the 1024 window an exact ring of 8 x 128),
+    SWA 43, K 6; column 0 (x 0) units 0-3 top to bottom, column 1 (x 345) units 4-7 bottom to top (unit 7 on unit 0's
+    rows); the head 54 + 1 columns at x 690 (groups: the A rows in sixes, the W rows in fives)."""
+    PX, PY, RA = 344, 283, 128
     UH = PY + 1
     origins = [(0, UH * u) for u in range(4)] + [(345, UH * (7 - u)) for u in range(4, 8)]
     grp = groups_split(PY, PY // 2, RA, 6, 5)

@@ -75,6 +75,7 @@ pub fn layout(
         )),
         "g12" => {
             let uh = 284;
+            // attention rows 0-127: the 1024 window an exact ring of 8 x 128
             let mut o: Vec<(u32, u32)> = (0..4).map(|u| (0, uh * u)).collect();
             o.extend((4..8).map(|u| (345, uh * (7 - u))));
             Ok((
@@ -83,10 +84,10 @@ pub fn layout(
                 1153,
                 12,
                 15,
-                132,
+                128,
                 43,
                 o,
-                groups_split(283, 141, 132, 6, 5),
+                groups_split(283, 141, 128, 6, 5),
                 6,
             ))
         }

@@ -222,7 +222,7 @@ meta = dict(geo=GEO, PX=PX, PY=PY, RA=RA, HcA=HcA, HcW=HcW, H=H, HP=HP, V=V, K=K
             EPS=tc.get("rms_norm_eps", 1e-6), SOFTCAP=tc.get("final_logit_softcapping"), model=os.path.basename(MD.rstrip("/")),
             LOOP=64)
 json.dump(meta, open(os.path.join(out, PRE + "meta.json"), "w"))
-cp = dict(K=K, KM=KM, HcA=HcA, HcW=HcW, Qh=Qh, DcS=DcS, DcG=DcG, NES=NES, WIN=WIN, NEG=NEG, HDS=hdS, HDG=hdG, HR_=H, Ic=Ic,
+cp = dict(K=K, KM=KM, HcA=HcA, HcW=HcW, Qh=Qh, DcS=DcS, DcG=DcG, NES=NES, WIN=WIN, RING=1 if WIN == 0 else 0, NEG=NEG, HDS=hdS, HDG=hdG, HR_=H, Ic=Ic,
           VR=VR, HDc=HDc, NPX=1)
 open(os.path.join(out, PRE + "params.txt"), "w").write(",".join(f"{k}:{v}" for k, v in cp.items()) + "\n")
 print("prepared", out, json.dumps(meta))
