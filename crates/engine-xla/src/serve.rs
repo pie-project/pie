@@ -1078,8 +1078,16 @@ impl Shell {
                 None => by.push((class, word, 1, rows)),
             }
         }
-        // The class that takes the rest of the rows: the one with the most.
-        let host = by.iter().enumerate().max_by_key(|(_, e)| e.3)?.0;
+        // The class that takes the rest of the rows: the one with the most, a
+        // prefill's before a decode's (a row a lane), so a fire's decodes pad
+        // to their own rung as the warm ladder's do (v6e gpt-oss c256: 256
+        // decodes beside a 240-row prefill padded to 511 lanes, past the
+        // budget, and compiled mid-run, 21 s).
+        let host = by
+            .iter()
+            .enumerate()
+            .max_by_key(|(_, e)| (e.3 > e.2, e.3))?
+            .0;
         let pad = self.pad;
         let buckets = &self.budgets.tokens.buckets;
         // A fire that decodes beside its prefill: the prefill's lanes at
