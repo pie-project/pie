@@ -690,7 +690,10 @@ pub fn kv_append(
         .saturating_sub(1)
         .max(1);
     let most = ratio.map_or(n, |r| (n / i64::from(r.max(1)) + lanes).min(n));
-    if most < n {
+    // A plane narrower than a lane tile files every row: under the branch
+    // XLA lays it column-major and relays the whole plane in and out (a
+    // 32-wide index pool on a v6e: 1.4 ms a layer).
+    if most < n && f.dims(table)[1] >= 128 {
         let (pick, live, over) = closing(f, bpos, n, most)?;
         let few = move |f: &mut Func| -> Built<Val> {
             let neg = f.like_i(pick, -1);
