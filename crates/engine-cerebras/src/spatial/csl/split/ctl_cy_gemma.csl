@@ -298,7 +298,7 @@ fn vgelu0(dst: mem1d_dsd, src: mem1d_dsd, n: u16) void {
 // dst = gelu_tanh(src) = max(x, x e) / (1 + e), e = exp(-|y|), y = 1.5958 x (1 + 0.044715 x^2) (dst != src).
 // The trimmed form (GELUT 1, bit-identical to vexp-based GELUT 0: -|y| by setting the sign bit, one clamp for a
 // value <= 0, exp's result used in place of a copy)
-param GELUT: u16 = 1;
+param GELUT: u16 = 2;   // 2: vgeluc's cheaper form (below)
 var vd: [TN]f32 align(16) = @zeros([TN]f32);
 const vd_d = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{TN} -> vd[i] });
 var vah = vk_d;
@@ -315,10 +315,61 @@ const gO = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{Ic} -> u[i] });
 var gPL = vk_d;
 var gPH = vk_d;
 var gAH = vk_d;
+var gH = vk_d;
+var gA = vk_d;
 fn vinit3() void {
   gPL = @set_dsd_length(vpl, Ic);
   gPH = @increment_dsd_offset(gPL, 1, u16);
   gAH = @set_dsd_length(vah, Ic);
+  gH = @set_dsd_length(@set_dsd_base_addr(vk_d, @ptrcast([*]@fp16(), &vk)), Ic);   // (GELUT 2: f16, after the exp)
+  gA = @set_dsd_length(@set_dsd_base_addr(vk_d, @ptrcast([*]@fp16(), &va)), Ic);
+}
+// GELUT 2: the same function with fewer f32 multiplies (an f32 multiply costs a cycle a word an operand; f16 and
+// adds are cheap): y = x (c + c a x^2); t = -|y| log2 e, k = round(t), f = t - k (exact), 2^f a degree-4 minimax
+// (relative error 2.6e-6, as the exp's above); d = 1 + e; 1 / d from an f16 quartic in d - 1.5 (relative error
+// 3e-4 with the f16 rounding) and one f32 Newton step; out = max(x e, x) / d. Relative error against the exact
+// gelu_tanh 4.5e-6 (GELUT 1: 5.0e-6); 18-20% fewer cycles at Ic 24-48.
+const e2c = [5]f32 { 0.9999992847442627, 0.6931217908859253, 0.240247443318367, 0.05591786280274391, 0.009570096619427204 };
+const rqc = [5]f16 { 0.66650390625, -0.4423828125, 0.294921875, -0.2283935546875, 0.1522216796875 };
+fn vgeluc2() void {
+  @fmuls(gE, gS, gS);
+  @fmuls(gE, gE, 0.07135481627159043);
+  @fadds(gE, gE, 1.5957691216057308);
+  @fmuls(gE, gE, gS);                   // y
+  @or16(gAH, gAH, 0x8000);              // -|y|
+  @fmuls(gR, gE, 1.4426950408889634);   // t
+  @fmaxs(gR, gR, -126.0);
+  @fadds(gP, gR, ex_a[0]);              // k in the low mantissa bits
+  @sll16(gK, gPL, 7);
+  @fadds(gP, gP, ex_a[1]);              // k
+  @fsubs(gR, gR, gP);                   // f
+  @fmuls(gP, gR, e2c[4]);
+  @fadds(gP, gP, e2c[3]);
+  @fmuls(gP, gP, gR);
+  @fadds(gP, gP, e2c[2]);
+  @fmuls(gP, gP, gR);
+  @fadds(gP, gP, e2c[1]);
+  @fmuls(gP, gP, gR);
+  @fadds(gP, gP, e2c[0]);
+  @add16(gPH, gPH, gK);                 // p = e = exp(-|y|)
+  @fadds(gD, gP, 1.0);                  // d
+  @fadds(gR, gP, -0.5);                 // d - 1.5
+  @fs2h(gH, gR);
+  @fmulh(gA, gH, rqc[4]);
+  @faddh(gA, gA, rqc[3]);
+  @fmulh(gA, gA, gH);
+  @faddh(gA, gA, rqc[2]);
+  @fmulh(gA, gA, gH);
+  @faddh(gA, gA, rqc[1]);
+  @fmulh(gA, gA, gH);
+  @faddh(gA, gA, rqc[0]);
+  @fh2s(gR, gA);
+  @fmuls(gO, gD, gR);
+  @fsubs(gO, 2.0, gO);
+  @fmuls(gR, gR, gO);                   // 1 / d
+  @fmuls(gO, gS, gP);
+  @fmaxs(gO, gO, gS);
+  @fmuls(gO, gO, gR);
 }
 fn vgeluc() void {
   @fmuls(gE, gS, gS);
@@ -545,7 +596,7 @@ fn mlp() void {
   reduce(4 * Ic + 4);
   stamp(1 + 6 * cl + 4);
   const s1 = combinec(2 * Ic);
-  if (GELUT == 0) { vgelu0(uv(0, Ic), tv(0, Ic), Ic); } else { vgeluc(); }
+  if (GELUT == 0) { vgelu0(uv(0, Ic), tv(0, Ic), Ic); } else if (GELUT == 2) { vgeluc2(); } else { vgeluc(); }
   @fmuls(uc(0, Ic), uc(0, Ic), tc(Ic, Ic));
   u[Ic] = s1;
   @fmovs(fout(q_mc, Ic + 1), uc(0, Ic + 1));
