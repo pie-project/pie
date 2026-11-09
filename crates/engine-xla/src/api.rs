@@ -401,6 +401,9 @@ impl Engine for Xla {
                     u32::try_from(paging.window_pages()).unwrap_or(u32::MAX)
                 }),
                 window_tokens: paging.window.map_or(0, |window| window.tokens),
+                seated_first: shell.seats()[0],
+                seat_to_end: shell.seats()[1],
+                seat_spread: shell.seats()[2],
                 ..PoolFacts::default()
             },
             limits: FireLimits {

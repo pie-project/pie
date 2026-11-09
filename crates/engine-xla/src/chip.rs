@@ -185,6 +185,27 @@ pub struct PrefillFloor(pub u32);
 #[decision(id = "engine.pad.row_steps", constant(set(1, 2, 4)), default = 1, tune = search)]
 pub struct PadRowSteps(pub u32);
 
+/// Whether a decoding lane's next pages come before seating a waiting
+/// prompt, and a prompt waits rather than suspending a lane
+/// (`PoolFacts::seated_first`). Off keeps arrival order.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Decision)]
+#[decision(id = "engine.seated_first", flag, default = false, tune = engine)]
+pub struct SeatedFirst;
+
+/// Whether a process starts only while the pools hold the started ones to
+/// the pages a finished one held (`PoolFacts::seat_to_end`): the engine
+/// keeps no kv on the host, so a lane the pool runs short for restarts its
+/// process. Off starts each at once.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Decision)]
+#[decision(id = "engine.seat_to_end", flag, default = false, tune = engine)]
+pub struct SeatToEnd;
+
+/// With `engine.seat_to_end`, whether the starts the pools do not hold to
+/// the end at once go spread over a life (`PoolFacts::seat_spread`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Decision)]
+#[decision(id = "engine.seat_spread", flag, default = false, tune = engine)]
+pub struct SeatSpread;
+
 static REGISTRY: LazyLock<Registry> = LazyLock::new(|| {
     let mut r = Registry::new("xla", FACTS, &["rows"]);
     kernels_xla::tuning::register(&mut r);
@@ -196,7 +217,10 @@ static REGISTRY: LazyLock<Registry> = LazyLock::new(|| {
         .add::<MixedHostRung>()
         .add::<PageFloor>()
         .add::<PrefillFloor>()
-        .add::<PadRowSteps>();
+        .add::<PadRowSteps>()
+        .add::<SeatedFirst>()
+        .add::<SeatToEnd>()
+        .add::<SeatSpread>();
     poem_compiler::fuse::flags::register(&mut r, &crate::FUSIONS);
     poem_compiler::costs::register(&mut r, 2);
     r
@@ -220,6 +244,8 @@ pub struct Engine {
     pub gemm_transpose: bool,
     pub embed_fold: bool,
     pub pad: Pad,
+    /// `engine.seated_first`, `engine.seat_to_end`, `engine.seat_spread`.
+    pub seats: [bool; 3],
 }
 
 /// How fires are padded to canonical shapes.
@@ -298,6 +324,11 @@ impl Engine {
                 prefill_floor: profile.get::<PrefillFloor>().0,
                 row_steps: profile.get::<PadRowSteps>().0,
             },
+            seats: [
+                profile.on::<SeatedFirst>(any),
+                profile.on::<SeatToEnd>(any),
+                profile.on::<SeatSpread>(any),
+            ],
         }
     }
 }
