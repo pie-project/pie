@@ -1,6 +1,9 @@
 use kernels_xla::conv;
-use poem_exec::{DispatchConv, DispatchFused, DispatchProbe, KernelError};
-use poem_ir::{Conv, Fused, GridRule, TimePad};
+use kernels_xla::linear::moe::ExpertGlu;
+use poem_exec::{
+    DispatchConv, DispatchElemwise, DispatchFused, DispatchLinear, DispatchProbe, KernelError,
+};
+use poem_ir::{Conv, Fused, GluAct, GridRule, Linear, TimePad};
 
 use poem_ir::Operands;
 
@@ -9,7 +12,136 @@ use crate::run::Run;
 impl DispatchFused for Run<'_> {
     fn dispatch(&mut self, op: &Fused) -> Result<(), KernelError> {
         self.ctx().scope(op.name());
-        Err(KernelError::Unsupported { op: op.name() })
+        let Fused::MoeExperts {
+            select,
+            glu,
+            down,
+            norm,
+            sum,
+            gate_add,
+        } = op
+        else {
+            return Err(KernelError::Unsupported { op: op.name() });
+        };
+        // The routed MLP on one sort where the kernel takes it, else its
+        // parts as the trace states them.
+        let fused = norm.is_none() && self.moe_experts(select, glu, down, sum)?;
+        if !fused {
+            DispatchLinear::dispatch(self, select)?;
+            DispatchLinear::dispatch(self, glu)?;
+            DispatchLinear::dispatch(self, down)?;
+            if let Some(norm) = norm {
+                DispatchElemwise::dispatch(self, norm)?;
+            }
+            DispatchLinear::dispatch(self, sum)?;
+        }
+        match gate_add {
+            Some(gate_add) => DispatchLinear::dispatch(self, gate_add),
+            None => Ok(()),
+        }
+    }
+}
+
+impl Run<'_> {
+    /// `kernels_xla::linear::moe::experts` over a plain gate-up select, its
+    /// packed SwiGLU or GeGLU, a plain down select on the same routes and
+    /// their weighted sum; `false` (nothing lowered) for any other form, or
+    /// where the kernel declines the fire.
+    fn moe_experts(
+        &mut self,
+        select: &Linear,
+        glu: &Linear,
+        down: &Linear,
+        sum: &Linear,
+    ) -> Result<bool, KernelError> {
+        let plain = |op: &Linear| match op {
+            Linear::MoeSelect {
+                x,
+                bank,
+                bias: None,
+                routes,
+                input_scales: None,
+                quantized: false,
+                quant: None,
+                y,
+            } => Some((*x, *bank, *routes, *y)),
+            _ => None,
+        };
+        let (Some((x, up_bank, routes, packed)), Some((hidden, down_bank, down_routes, routed))) =
+            (plain(select), plain(down))
+        else {
+            return Ok(false);
+        };
+        let Linear::Glu {
+            packed: Some(glu_in),
+            gate: None,
+            up: None,
+            weights: None,
+            intermediate,
+            act,
+            limit: None,
+            y: glu_out,
+        } = glu
+        else {
+            return Ok(false);
+        };
+        let act = match act {
+            GluAct::Swiglu => ExpertGlu::Swiglu,
+            GluAct::GegluTanh => ExpertGlu::GegluTanh,
+            _ => return Ok(false),
+        };
+        let Linear::MoeCombine {
+            routed: summed,
+            weights: Some(weights),
+            shared: None,
+            y,
+        } = sum
+        else {
+            return Ok(false);
+        };
+        if *glu_in != packed || *glu_out != hidden || down_routes != routes || *summed != routed {
+            return Ok(false);
+        }
+        if self.maybe_stored(up_bank).is_some()
+            || self.maybe_stored(down_bank).is_some()
+            || self.banked(up_bank).is_some()
+            || self.banked(down_bank).is_some()
+        {
+            return Ok(false);
+        }
+        let mut fused = false;
+        crate::lower::lower(self.ctx(), |l| {
+            let x_v = l.read(self.tensor(x))?;
+            let up_v = l.read(self.tensor(up_bank))?;
+            let routes_v = l.read(self.tensor(routes))?;
+            let down_v = l.read(self.tensor(down_bank))?;
+            let weights_v = l.read(self.tensor(*weights))?;
+            let o_y = self.tensor(*y);
+            let tuning = l.tuning();
+            let v = kernels_xla::linear::moe::experts(
+                l.f(),
+                x_v,
+                up_v,
+                routes_v,
+                self.tensor(packed).landing(),
+                act,
+                *intermediate,
+                down_v,
+                self.tensor(routed).landing(),
+                weights_v,
+                o_y.landing(),
+                tuning,
+            )?;
+            match v {
+                Some(v) => {
+                    fused = true;
+                    l.land(o_y, v)
+                }
+                None => Ok(()),
+            }
+        })
+        .map_err(crate::error::kernel)?;
+        Ok(fused)
     }
 }
 
