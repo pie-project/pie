@@ -1272,9 +1272,32 @@ fn tile_rows(f: &mut Func, t: &TilePlan, per_token: bool, x: Val) -> Result<Val,
     let live = f.compare(Cmp::Lt, tile, ntb)?;
     let within = f.compare(Cmp::Lt, rank, count)?;
     let ok = f.and(live, within)?;
-    let at = pick_small(f, t.first, ex)?;
-    let at = f.add(at, rank)?;
-    let pair = take_flat(f, t.perm, at)?;
+    // A tile's rows are one run of the sorted pairs: a window of `tm` a
+    // tile, not a pick a row (v6e gpt-oss 4096-row prefill: 0.14 ms a layer).
+    let pair = {
+        let ti = f.iota(Elem::I32, &[t.tiles], 0);
+        let tb = pick_small(f, t.tstart, t.se)?;
+        let run = f.sub(ti, tb)?;
+        let tt = f.const_i(Elem::I32, tm, &[t.tiles]);
+        let run = f.mul(run, tt)?;
+        let at = pick_small(f, t.first, t.se)?;
+        let at = f.add(at, run)?;
+        let at = f.reshape(at, &[t.tiles, 1])?;
+        let tail = f.const_i(Elem::I32, 0, &[tm]);
+        let perm = f.concat(&[t.perm, tail], 0)?;
+        let win = f.gather(
+            perm,
+            at,
+            &GatherDims {
+                offset_dims: vec![1],
+                start_index_map: vec![0],
+                index_vector_dim: 1,
+                ..GatherDims::default()
+            },
+            &[tm],
+        )?;
+        f.reshape(win, &[rows])?
+    };
     let src = if per_token {
         let kk = f.const_i(Elem::I32, t.top_k, &[rows]);
         f.div(pair, kk)?
