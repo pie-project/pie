@@ -171,6 +171,18 @@ pub struct Run<'c> {
     /// Token-declared values on a readout-rowed path, cut to the readout
     /// rows (`crate::rows`), and a readout-rowed value telling them.
     readout_rowed: (std::sync::Arc<Vec<bool>>, Option<ValueId>),
+
+    /// Routed results the grouped-matmul kernel left in its tile order, by
+    /// value, with the routes value and the span they were cut on: the next
+    /// routed op on the same routes reads them as they are.
+    tiled: std::cell::RefCell<
+        Vec<(
+            ValueId,
+            ValueId,
+            (u32, u32),
+            kernels_xla::linear::moe::Tiled,
+        )>,
+    >,
 }
 
 impl<'c> Run<'c> {
@@ -204,7 +216,48 @@ impl<'c> Run<'c> {
             probes: Vec::new(),
             probed: std::cell::RefCell::new(Vec::new()),
             readout_rowed: (std::sync::Arc::new(Vec::new()), None),
+            tiled: std::cell::RefCell::new(Vec::new()),
         }
+    }
+
+    /// The tile-ordered rows of `value` on `routes`, cut on this span.
+    pub(crate) fn tiled(
+        &self,
+        value: ValueId,
+        routes: ValueId,
+    ) -> Option<kernels_xla::linear::moe::Tiled> {
+        let span = self.window().span;
+        let key = (span.lane_offset, span.lanes);
+        self.tiled
+            .borrow()
+            .iter()
+            .rev()
+            .find(|(v, r, s, _)| *v == value && *r == routes && *s == key)
+            .map(|e| e.3)
+    }
+
+    pub(crate) fn keep_tiled(
+        &self,
+        value: ValueId,
+        routes: ValueId,
+        tiled: kernels_xla::linear::moe::Tiled,
+    ) {
+        let span = self.window().span;
+        self.tiled
+            .borrow_mut()
+            .push((value, routes, (span.lane_offset, span.lanes), tiled));
+    }
+
+    /// The routes the tile-ordered `value` was sorted on, if any.
+    pub(crate) fn tiled_routes(&self, value: ValueId) -> Option<ValueId> {
+        let span = self.window().span;
+        let key = (span.lane_offset, span.lanes);
+        self.tiled
+            .borrow()
+            .iter()
+            .rev()
+            .find(|(v, _, s, _)| *v == value && *s == key)
+            .map(|e| e.1)
     }
 
     /// Cuts the token-declared values of a readout-rowed path to the

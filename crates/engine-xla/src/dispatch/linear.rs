@@ -185,6 +185,34 @@ impl Run<'_> {
                     *alpha,
                     o_y.landing(),
                 )?;
+                // The same unit over the rows in tile order, for the routed
+                // select that reads it next (the pair rows above then go
+                // unread, and XLA drops them).
+                if let Some(routes) = self.tiled_routes(*packed)
+                    && let Some(t) = self.tiled(*packed, routes)
+                {
+                    let rows = kernels_xla::tensor::Operand {
+                        val: t.rows,
+                        rows: u32::try_from(t.plan.rows()).unwrap_or(u32::MAX),
+                        width: u32::try_from(t.width).unwrap_or(u32::MAX),
+                        dtype: dtype::Dtype::Bf16,
+                    };
+                    let unit = linear::mlp::swiglu_clamp_alpha(
+                        l.f(),
+                        rows,
+                        *intermediate,
+                        limit.unwrap_or(f32::MAX),
+                        *alpha,
+                        kernels_xla::tensor::Landing {
+                            rows: rows.rows,
+                            width: *intermediate,
+                            dtype: dtype::Dtype::Bf16,
+                        },
+                    )?;
+                    let unit = l.f().convert(unit, kernels_xla::hlo::Elem::Bf16);
+                    let kept = linear::moe::retile(t, unit, i64::from(*intermediate));
+                    self.keep_tiled(*y, routes, kept);
+                }
                 l.land(o_y, v)
             }),
 
@@ -679,15 +707,19 @@ impl Run<'_> {
                 let bank_v = l.bank(self.planes(*bank))?;
                 let o_y = self.tensor(*y);
                 let tuning = l.tuning();
-                let v = linear::moe::matmul_select_bias(
+                let (v, tiled) = linear::moe::matmul_select_tiled(
                     l.f(),
                     x_v,
                     bank_v,
-                    bias_v,
+                    Some(bias_v),
                     routes_v,
                     y_v,
                     tuning,
+                    self.tiled(*x, *routes),
                 )?;
+                if let Some(t) = tiled {
+                    self.keep_tiled(*y, *routes, t);
+                }
                 l.land(o_y, v)
             }),
             Linear::MoeSelect {
@@ -706,8 +738,19 @@ impl Run<'_> {
                 let bank_v = l.bank(self.planes(*bank))?;
                 let o_y = self.tensor(*y);
                 let tuning = l.tuning();
-                let v =
-                    linear::moe::matmul_select_quant(l.f(), x_v, bank_v, routes_v, y_v, tuning)?;
+                let (v, tiled) = linear::moe::matmul_select_tiled(
+                    l.f(),
+                    x_v,
+                    bank_v,
+                    None,
+                    routes_v,
+                    y_v,
+                    tuning,
+                    self.tiled(*x, *routes),
+                )?;
+                if let Some(t) = tiled {
+                    self.keep_tiled(*y, *routes, t);
+                }
                 l.land(o_y, v)
             }),
             // The forms no builder makes.
@@ -722,7 +765,19 @@ impl Run<'_> {
                 let routed_v = l.read(self.tensor(*routed))?;
                 let weights_v = l.read(self.tensor(*weights))?;
                 let o_y = self.tensor(*y);
-                let v = linear::moe::weighted_sum(l.f(), routed_v, weights_v, o_y.landing())?;
+                let tiled = self
+                    .tiled_routes(*routed)
+                    .and_then(|routes| self.tiled(*routed, routes));
+                let v = match tiled {
+                    Some(t) => linear::moe::weighted_sum_tiled(
+                        l.f(),
+                        t,
+                        routed_v.width,
+                        weights_v,
+                        o_y.landing(),
+                    )?,
+                    None => linear::moe::weighted_sum(l.f(), routed_v, weights_v, o_y.landing())?,
+                };
                 l.land(o_y, v)
             }),
             // The forms no builder makes.
