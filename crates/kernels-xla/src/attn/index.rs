@@ -15,7 +15,7 @@ use super::pool::{
 use crate::check::expect;
 use crate::error::{Error, refuse};
 use crate::hlo::{Built, Cmp, Combine, Elem, Fold, Func, ScatterDims, Val};
-use crate::lanes::{DROP, ci, clamp_i, cmp_i, flat_i32, loop_upto, nonzero};
+use crate::lanes::{DROP, ci, clamp_i, cmp_i, flat_i32, loop_at_most, loop_upto, nonzero};
 use crate::tensor::{KvPool, Landing, Operand, Stored};
 
 /// Keys per step of the scoring loop.
@@ -678,9 +678,10 @@ fn index_scores(
     let count = f.div(mx, kbv)?;
     let count = clamp_i(f, count, 0, nb)?;
     let s0 = f.const_f(Elem::F32, 0.0, &[n, nb * kb]);
-    let out = loop_upto(
+    let out = loop_at_most(
         f,
         count,
+        nb,
         &[s0],
         &[q, w, table, indices, indptr, req],
         |f, b, cr, inv| {

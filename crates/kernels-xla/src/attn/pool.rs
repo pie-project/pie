@@ -11,7 +11,7 @@ use dtype::Dtype;
 use crate::check::expect;
 use crate::error::{Error, refuse};
 use crate::hlo::{Built, Cmp, Combine, Elem, Fold, Func, ScatterDims, Val};
-use crate::lanes::{DROP, ci, clamp_i, cmp_i, flat_i32, loop_upto, nonzero, take};
+use crate::lanes::{DROP, ci, clamp_i, cmp_i, flat_i32, loop_at_most, nonzero, take};
 use crate::tensor::{KvPool, Landing, Operand, Stored};
 
 /// Keys per step of the pooled readers' flash loop.
@@ -133,7 +133,13 @@ pub(crate) fn entry_rows(f: &mut Func, table: Val, cell: Val, div: i64) -> Built
         return f.take_rows(table, cell);
     }
     let m = f.dims(cell)[0];
-    let w = f.dims(table)[1];
+    let (cells, w) = (f.dims(table)[0], f.dims(table)[1]);
+    if m * div > cells / 4 {
+        // A prompt's reading touches most of the plane: one relayout to the
+        // entry's width costs less than four times the row gathers.
+        let t = f.reshape(table, &[cells / div, div * w])?;
+        return f.take_rows(t, cell);
+    }
     let c = f.broadcast(cell, &[m, div], &[0])?;
     let dv = f.like_i(c, div);
     let c = f.mul(c, dv)?;
@@ -636,9 +642,10 @@ fn pooled_flash(
     let m0 = f.const_f(Elem::F32, f64::NEG_INFINITY, &[r, h]);
     let l0 = f.const_f(Elem::F32, 0.0, &[r, h]);
     let a0 = f.const_f(Elem::F32, 0.0, &[r, h, d]);
-    let out = loop_upto(
+    let out = loop_at_most(
         f,
         count,
+        nb,
         &[m0, l0, a0],
         &[q, table, indices, indptr, req, visible, sel],
         |f, b, cr, inv| {
