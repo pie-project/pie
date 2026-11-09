@@ -136,3 +136,21 @@ The `new-memory/` directory is bookkeeping and is removed before anything lands 
 - Verified on new-memory: runtime lib 191/191 (1 ignored); `cargo check` xla, cerebras, metal, vulkan, wgpu, runtime;
   XLA lib 8/8.
 - Still running: P1 (poem state() API), P4/P5 (CUDA degenerate kernels), P8 (golden baseline), R2 (stores on SlotPool).
+
+### M7 — 2026-11-09: P1 poem state() handles merged
+- `sc/p1-poem-state` (abb08e8d7, 01f3bb712, 06895046c, 375739065): `state(shape, dtype)` declared in the layout like
+  `weight()`; first axis `tokens` (or `tokens // r`) = per-token, else fixed. Rows are named by model-tree path
+  (`layers.9.attn.kv`, `layers.0.mamba.conv_state`, `mtp.kv`). Window/head_dim come from the reading attention op,
+  head split for GQA readers, conv split on channels, GDN/KDA/mamba2 on heads. Lowers to today's `CacheRow` (one kv
+  space per (dtype, window, rate)), so compiler/engines are untouched. `kv_append` binds write positions itself.
+  `caches()` still works for unmigrated models (a package may not mix both).
+- Pilot: `qwen3_dense` (dense attention; `qwen_3.poem` is GDN+gated attention+dflash, not migrated yet) and
+  `nemotron_h`. 123 deployment x tp traces: lowered caches identical except names; whole-trace canon diff identical
+  for 255 traces (and 116 traces of other models sharing lib/blocks.poem).
+- Costs/compromises: handle models trace twice (+1% .. +26% total trace time); an unread per-token state copies the
+  layout of a read state with the same shape/dtype.
+- Open for the remaining migration: unequal-width planes (MLA latent+rope), deepseek `packed()` / deployment-dependent
+  split / `rows=` and `live=`, window inference for WindowSink and MLA ops, inkling k/v_state and engram/replay splits,
+  lib/dflash.poem and pattern.rs drafter rows.
+- Verified on new-memory: pie-poem 14+30 tests; `cargo check` poem-compiler, runtime, engine-cuda.
+- Still running: P4/P5 (CUDA degenerate kernels), P8 (golden baseline), R2 (stores on SlotPool).
