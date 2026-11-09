@@ -64,6 +64,8 @@ pub fn expanded_takes(h: &Heads) -> bool {
 /// rope part, and a causal prefill of one key head a query head at the
 /// key width `nope + rope` and the value width `v` landing `o` (`[rows]
 /// [heads * v]`). The same sums the absorbed form takes, in another order.
+/// `pool`'s page table starts at entry `first` of the one its `page_indptr`
+/// counts in (a window of a fire's lanes holds its own pages alone).
 /// `Ok(false)` where it does not take the fire: the caller runs the three.
 #[allow(clippy::too_many_arguments)]
 pub fn prefill_expanded(
@@ -71,6 +73,7 @@ pub fn prefill_expanded(
     q: ExpandedQ,
     qo_indptr: Tensor,
     pool: &KvPool,
+    first: u32,
     kv_b: Tensor,
     h: Heads,
     sm_scale: f32,
@@ -135,7 +138,7 @@ pub fn prefill_expanded(
         };
         let lat = ctx.scratch_stream(OP, LAT, bytes(cells * u64::from(h.kv_lora_rank)))? as u64;
         let kpe = ctx.scratch_stream(OP, KPE, bytes(cells * u64::from(h.rope)))? as u64;
-        let ident = ctx.scratch_stream(OP, IDENT, pages as usize * 4)? as u64;
+        let ident = ctx.scratch_stream(OP, IDENT, (first + pages) as usize * 4)? as u64;
         let live = ctx.scratch_stream(OP, LIVE, 8)? as u64;
         let runs = cells * u64::from((h.kv_lora_rank + h.rope) / 8);
         let threads = u32::try_from(runs.max(u64::from(pages)))
@@ -155,7 +158,7 @@ pub fn prefill_expanded(
                 int(h.rope),
                 ArgValue::Ptr(lat),
                 ArgValue::Ptr(kpe),
-                ArgValue::Ptr(ident),
+                ArgValue::Ptr(ident + u64::from(first) * 4),
                 ArgValue::Ptr(live),
                 int(requests),
             ],
@@ -253,7 +256,7 @@ pub fn prefill_expanded(
     }
     #[cfg(not(feature = "cuda"))]
     {
-        let _ = (ctx, q, qo_indptr, pool, kv_b, h, sm_scale, o);
+        let _ = (ctx, q, qo_indptr, pool, first, kv_b, h, sm_scale, o);
         Ok(false)
     }
 }
