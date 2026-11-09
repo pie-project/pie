@@ -229,13 +229,28 @@ impl Shell {
             });
             index.push(at);
         }
-        // Each compile holds its program's whole HLO and compile state in
-        // host memory: at most 8 at once, and no more than the host's free
-        // memory holds at ~1 GiB a MiB of the longest text (v6e,
-        // Qwen3.6-35B-A3B's 12 MiB fires: 108 GB for eight; a v5e host's 47
-        // GB stopped answering).
+        // A compile's scratch is ~0.55 GiB a MiB of its text (v5e, Qwen3.6-
+        // 35B-A3B's 9 MiB pf256 programs: 5 GB each; eight v6e ones 108 GB
+        // at once): one is admitted while the host's free memory holds 0.75
+        // GiB a MiB for it and for every compile still running (one that
+        // started may not have taken its memory yet). A v5e host's 47 GB
+        // stopped answering at four started together.
         let longest = texts.iter().map(|(t, _)| t.len() as u64).max().unwrap_or(0);
-        let room = available_memory().map_or(8, |b| b / (longest << 10).max(1)) as usize;
+        let need = (longest * 3) << 8;
+        // A compiled program held in host memory costs ~64 bytes a byte of its
+        // text (0.5 GB a 9 MiB program; 65 of them 42 GB of a v5e host's 47),
+        // and libtpu's allocator keeps what a dropped one freed for its own
+        // next use, giving the host none back: what the ladder holds is
+        // budgeted up front, the free memory less two compiles' room, in
+        // ladder order. The rest are parked: compiled onto the disk cache (not
+        // held) where they are not there yet, loaded (~1 s, never compiled) by
+        // the first fire that takes their shape.
+        let budget = available_memory().map_or(u64::MAX, |b| b.saturating_sub(2 * need));
+        let held = std::sync::atomic::AtomicU64::new(0);
+        let parked = std::sync::atomic::AtomicUsize::new(0);
+        let running = std::sync::atomic::AtomicUsize::new(0);
+        let admit = std::sync::Mutex::new(());
+        let room = available_memory().map_or(8, |b| b / need.max(1)) as usize;
         let threads = std::thread::available_parallelism()
             .map_or(1, |n| n.get())
             .min(8)
@@ -249,6 +264,7 @@ impl Shell {
             (0..texts.len())
                 .map(|_| std::sync::Mutex::new(None))
                 .collect();
+        use std::sync::atomic::Ordering::SeqCst;
         std::thread::scope(|scope| {
             for _ in 0..threads {
                 scope.spawn(|| {
@@ -257,9 +273,47 @@ impl Shell {
                         let Some((text, sig)) = texts.get(at) else {
                             break;
                         };
+                        let hold = (text.len() as u64) << 6;
+                        let kept = held
+                            .fetch_update(SeqCst, SeqCst, |h| {
+                                (h + hold <= budget).then_some(h + hold)
+                            })
+                            .is_ok();
+                        if !kept {
+                            parked.fetch_add(1, SeqCst);
+                            if device.on_disk(text) {
+                                continue;
+                            }
+                        }
+                        // Admitted one at a time: a compile in flight may
+                        // not have taken its memory yet, so each counts as
+                        // still to come.
+                        loop {
+                            let turn = admit.lock().expect("the warm admission lock poisoned");
+                            let busy = running.load(SeqCst) as u64;
+                            if busy == 0
+                                || available_memory().is_none_or(|b| b >= need * (busy + 1))
+                            {
+                                running.fetch_add(1, SeqCst);
+                                break;
+                            }
+                            drop(turn);
+                            std::thread::sleep(std::time::Duration::from_millis(200));
+                        }
                         let program = device.program(text, (*sig).clone());
-                        if let Ok(mut slot) = slots[at].lock() {
-                            *slot = Some(program);
+                        running.fetch_sub(1, SeqCst);
+                        if kept {
+                            if let Ok(mut slot) = slots[at].lock() {
+                                *slot = Some(program);
+                            }
+                        } else {
+                            drop(program);
+                            device.forget(text);
+                        }
+                        #[cfg(target_os = "linux")]
+                        // SAFETY: `malloc_trim` only releases free heap pages.
+                        unsafe {
+                            libc::malloc_trim(0);
                         }
                     }
                 });
@@ -267,6 +321,14 @@ impl Shell {
         });
         for (at, slot) in slots.into_iter().enumerate() {
             programs[at] = slot.into_inner().ok().flatten();
+        }
+        let parked = parked.load(SeqCst);
+        if parked > 0 {
+            tracing::warn!(
+                parked,
+                held_gib = held.load(SeqCst) >> 30,
+                "xla warm ladder parked programs on disk: the host's memory holds no more"
+            );
         }
         // The compiles' scratch is freed by now: hand it back rather than
         // keep it in the allocator's arenas. glibc's call; the other libcs
