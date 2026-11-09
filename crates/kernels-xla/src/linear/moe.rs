@@ -1060,14 +1060,21 @@ fn gmm_spec(
     fan: Fan,
     bank: &Read,
     elem: Elem,
+    mxfp4: bool,
     tuning: Tuning,
 ) -> Option<crate::linear::moe_gmm::Gmm> {
     use crate::linear::moe_gmm::{Gmm, Orient};
     let off = !tuning.moe_gmm();
+    // mxfp4 codes as landed (`f4E2M1FN`), their exponents beside them.
+    let scaled = mxfp4 && matches!(bank.codes, Codes::E2m1(_)) && elem == Elem::F4E2m1fn;
     if off
-        || bank.factor.is_some()
-        || !matches!(bank.codes, Codes::Weights(_))
-        || !matches!(elem, Elem::Bf16 | Elem::F8E5m2 | Elem::F8E4m3fn)
+        || (bank.factor.is_some() && !scaled)
+        || !(matches!(bank.codes, Codes::Weights(_)) || scaled)
+        || !matches!(
+            elem,
+            Elem::Bf16 | Elem::F8E5m2 | Elem::F8E4m3fn | Elem::F4E2m1fn
+        )
+        || (scaled && (Orient::of(fan.experts * fan.n, fan.k) != Orient::KMajor || fan.k % 32 != 0))
     {
         return None;
     }
@@ -1084,6 +1091,7 @@ fn gmm_spec(
         experts: e,
         w: elem,
         orient: Orient::of(e * fan.n, fan.k),
+        scaled,
     };
     spec.out_width().ok().map(|_| spec)
 }
@@ -1113,6 +1121,7 @@ fn gmm(
     spec: crate::linear::moe_gmm::Gmm,
     fan: Fan,
     bank: &Read,
+    scales: Option<Val>,
     x: Val,
     r: Val,
     valid: Val,
@@ -1197,7 +1206,21 @@ fn gmm(
         Orient::NMajor => w,
     };
     let kernel = spec.kernel()?;
-    let out = kernel.call(f, &[se, nt, xs, w])?[0];
+    let out = if spec.scaled {
+        // The exponent bytes `[E·N, K/32]`, read `[K/32, E·N]` as the codes
+        // are (the TPU lays them `E·N`-minor too).
+        let s = scales.ok_or_else(|| refuse("linear.moe", "scaled codes with no exponents"))?;
+        let s = if f.elem(s) == Elem::U8 {
+            s
+        } else {
+            f.bitcast(s, Elem::U8)?
+        };
+        let s = f.reshape(s, &[e * n, fan.k / 32])?;
+        let s = f.transpose(s, &[1, 0])?;
+        kernel.call(f, &[se, nt, xs, w, s])?[0]
+    } else {
+        kernel.call(f, &[se, nt, xs, w])?[0]
+    };
     // Pair `i`'s row: its sorted position's rank within its expert's run.
     let back = f.sort(&[perm, iota], 0, true, |fq, a, b| {
         fq.compare(Cmp::Lt, a[0], b[0])
@@ -1286,9 +1309,25 @@ fn routed(
         (expert_bytes / c.slice_bytes_per_ns.max(1)).max(c.loop_tile_ns + tile * c.loop_row_ns);
     let worth = whole_ns / tile_ns;
     // A forced `gmm` falls back to `all` for a bank the kernel does not read.
-    let grouped = gmm_spec(fan, &bank, f.elem(bank.codes.val()), tuning);
+    let mxfp4 = matches!(form, Form::Mxfp4 { .. });
+    let grouped = gmm_spec(fan, &bank, f.elem(bank.codes.val()), mxfp4, tuning);
     let path = match tuning.moe_path {
         MoePath::Gmm if grouped.is_none() => MoePath::All,
+        // mxfp4 codes: the kernel reads only the routed experts' codes and
+        // exponents, where every other path copies or decodes them (a slice
+        // copies an expert's codes at ~180 GB/s on v5e; the ragged dot
+        // decodes the whole bank to bf16 in every layer).
+        MoePath::Auto { .. } if grouped.is_some_and(|g| g.scaled) => MoePath::Gmm,
+        // A pre-scaled mxfp4 bank past the slice case: the kernel at every
+        // fire size, where the ragged dot would convert the whole bank to
+        // bf16 first (twice its bytes, in every layer).
+        MoePath::Auto { .. }
+            if mxfp4
+                && grouped.is_some()
+                && !(p <= c.slice_pairs && p * expert_bytes.max(c.slice_bytes) < bank_bytes) =>
+        {
+            MoePath::Gmm
+        }
         MoePath::Auto { .. }
             if p <= c.slice_pairs && p * expert_bytes.max(c.slice_bytes) < bank_bytes =>
         {
@@ -1320,7 +1359,13 @@ fn routed(
         }
         MoePath::All => every_expert(f, &bank, fan, x, ids, groups)?,
         MoePath::Gmm => match grouped {
-            Some(spec) => gmm(f, spec, fan, &bank, x, r, valid, ids)?,
+            Some(spec) => {
+                let scales = match form {
+                    Form::Mxfp4 { scales, .. } => Some(scales.val),
+                    _ => None,
+                };
+                gmm(f, spec, fan, &bank, scales, x, r, valid, ids)?
+            }
             None => every_expert(f, &bank, fan, x, ids, groups)?,
         },
         MoePath::Loop => {
