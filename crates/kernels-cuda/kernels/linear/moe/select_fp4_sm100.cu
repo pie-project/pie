@@ -1,5 +1,6 @@
 #include "linear/codec.cuh"
 #include "linear/moe_w4.cuh"
+#include "linear/moe/table.cuh"
 #include "linear/quant.cuh"
 #include "prim/mma.cuh"
 
@@ -160,7 +161,8 @@ __global__ void __launch_bounds__(128, kMinBlocks) moe_select_mxfp4_cvt(
     int inter,
     float limit,
     float galpha,
-    int scale_atoms)
+    int scale_atoms,
+    const u64* __restrict__ expert_table)
 {
     constexpr int kTiles = 2;
     constexpr int kRowsWarp = kGlu != 0 ? 16 : kTiles * 16;
@@ -211,8 +213,8 @@ __global__ void __launch_bounds__(128, kMinBlocks) moe_select_mxfp4_cvt(
     const int groups = g_all - cb * 4;
     const int windows = (chunks + kWin - 1) / kWin;
     const long long row_bytes = k >> 1;
-    const u8* w_e = codes + static_cast<long long>(expert) * n * row_bytes;
-    const u8* s_e = scales + static_cast<long long>(expert) * n * g_all;
+    const u8* w_e = expert_plane(codes, 1LL * n * row_bytes, expert_table, 3, 0, expert);
+    const u8* s_e = expert_plane(scales, 1LL * n * g_all, expert_table, 3, 1, expert);
     // A chunk's scales: the next 4 bytes of a row-major plane, or the next
     // 512-byte atom column of the tcgen05 layout (`scale_atoms`, the bank's
     // rows counted across its experts).
@@ -227,8 +229,13 @@ __global__ void __launch_bounds__(128, kMinBlocks) moe_select_mxfp4_cvt(
             const int r = min(tile_row(t) + 8 * h + g, n - 1);
             wrow[t][h] = w_e + r * row_bytes + c * 16;
             if (scale_atoms != 0) {
-                const long long at = static_cast<long long>(expert) * n + r;
-                srow[t][h] = scales + (at / 128) * ((g_all + 3) / 4) * 512 + (at % 32) * 16
+                // Atoms over the bank's rows; a table's entry is the expert's
+                // first atom (its rows a whole number of 128).
+                const long long at = expert_table != nullptr
+                    ? static_cast<long long>(r)
+                    : static_cast<long long>(expert) * n + r;
+                srow[t][h] = (expert_table != nullptr ? s_e : scales)
+                    + (at / 128) * ((g_all + 3) / 4) * 512 + (at % 32) * 16
                     + ((at / 32) % 4) * 4 + c;
             } else {
                 srow[t][h] = s_e + static_cast<long long>(r) * g_all + c;
@@ -416,7 +423,7 @@ __global__ void __launch_bounds__(128, kMinBlocks) moe_select_mxfp4_cvt(
     }
     if (!rows) return;
 
-    const bf16* b_e = bias != nullptr ? bias + static_cast<long long>(expert) * n : nullptr;
+    const bf16* b_e = bias != nullptr ? expert_plane(bias, 1LL * n, expert_table, 3, 2, expert) : nullptr;
     w4mma::w4_land<kGlu, kTiles, kNb>(acc, [](int) { return 1.f; }, b_e, order, begin, count, out,
                                       n, inter, row_base, g, c, limit, galpha);
 }
@@ -440,7 +447,8 @@ __global__ void moe_matmul_select_mxfp4_cvt(
     int k,
     const MoeGroupBases* __restrict__ bases,
     unsigned int* __restrict__ group_hits,
-    const u32* __restrict__ win)
+    const u32* __restrict__ win,
+    const u64* __restrict__ expert_table)
 {
     const int route = blockIdx.x;
 
@@ -465,8 +473,8 @@ __global__ void moe_matmul_select_mxfp4_cvt(
         scales_at = seat.scales;
     }
 
-    const u8* w = codes_at + static_cast<long long>(expert) * n * (k / 2);
-    const u8* s = scales_at + static_cast<long long>(expert) * n * groups_per_row;
+    const u8* w = expert_plane(codes_at, 1LL * n * (k / 2), expert_table, 3, 0, expert);
+    const u8* s = expert_plane(scales_at, 1LL * n * groups_per_row, expert_table, 3, 1, expert);
 
     const T* x = act + static_cast<long long>(plane_route / act_div) * k;
 
@@ -534,7 +542,7 @@ __global__ void moe_matmul_select_mxfp4_cvt(
     }
     if (lane_id == 0) {
         const T* b = bias != nullptr
-            ? bias + static_cast<long long>(expert) * n
+            ? expert_plane(bias, 1LL * n, expert_table, 3, 2, expert)
             : nullptr;
 #pragma unroll
         for (int r = 0; r < kRows; ++r) {
@@ -564,7 +572,8 @@ __global__ void moe_matmul_select_nvfp4_cvt(
     int k,
     const MoeGroupBases* __restrict__ bases,
     unsigned int* __restrict__ group_hits,
-    const u32* __restrict__ win)
+    const u32* __restrict__ win,
+    const u64* __restrict__ expert_table)
 {
     constexpr int kRows = kRowsT;
     const int route = blockIdx.x;
@@ -604,10 +613,10 @@ __global__ void moe_matmul_select_nvfp4_cvt(
     }
 
     const uint4* wq = reinterpret_cast<const uint4*>(
-        codes_at + static_cast<long long>(expert) * n * (k / 2));
+        expert_plane(codes_at, 1LL * n * (k / 2), expert_table, 3, 0, expert));
     const unsigned short* s2 = reinterpret_cast<const unsigned short*>(
-        scales_at + static_cast<long long>(expert) * n * groups);
-    const float* g = tensor_at + static_cast<long long>(expert) * n;
+        expert_plane(scales_at, 1LL * n * groups, expert_table, 3, 1, expert));
+    const float* g = expert_plane(tensor_at, 1LL * n, expert_table, 3, 2, expert);
 
     const T* x = act + static_cast<long long>(plane_route / act_div) * k;
     const uint4* x4 = reinterpret_cast<const uint4*>(x);

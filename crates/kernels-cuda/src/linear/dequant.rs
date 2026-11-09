@@ -454,6 +454,7 @@ pub fn nvfp4_matmul(
         tensor_scales,
         y,
         seat,
+        crate::linear::moe::ExpertTable::RESIDENT,
         act.rows,
         1,
         1,

@@ -1,5 +1,6 @@
 #include "linear/codec.cuh"
 #include "linear/moe_w4.cuh"
+#include "linear/moe/table.cuh"
 #include "linear/quant.cuh"
 
 namespace pie::linear {
@@ -27,7 +28,8 @@ __global__ void __launch_bounds__(128 * kKSplit) moe_select_mxfp4_mma(
     int inter,
     float limit,
     float galpha,
-    const float* __restrict__ tscale)
+    const float* __restrict__ tscale,
+    const u64* __restrict__ expert_table)
 {
     constexpr int kTiles = 2;
     constexpr int kRowsWarp = kGlu != 0 ? 16 : kTiles * 16;
@@ -58,10 +60,10 @@ __global__ void __launch_bounds__(128 * kKSplit) moe_select_mxfp4_mma(
     const int groups = k >> 5;
     const int chunks = (groups + 3) >> 2;
     const long long row_bytes = k >> 1;
-    const u8* w_e = codes + static_cast<long long>(expert) * n * row_bytes;
+    const u8* w_e = expert_plane(codes, 1LL * n * row_bytes, expert_table, 3, 0, expert);
     // A row's scales: one a 32-code group (mxfp4), two (NVFP4).
     const int sf_row = kNv ? 2 * groups : groups;
-    const u8* s_e = scales + static_cast<long long>(expert) * n * sf_row;
+    const u8* s_e = expert_plane(scales, 1LL * n * sf_row, expert_table, 3, 1, expert);
 
     const u8* wrow[kTiles][2];
     const u8* srow[kTiles][2];
@@ -142,9 +144,9 @@ __global__ void __launch_bounds__(128 * kKSplit) moe_select_mxfp4_mma(
     }
     if (!w4mma::fold_ksplit<kKSplit>(acc, part, warp, lane, rows_live)) return;
 
-    const bf16* b_e = bias != nullptr ? bias + static_cast<long long>(expert) * n : nullptr;
+    const bf16* b_e = bias != nullptr ? expert_plane(bias, 1LL * n, expert_table, 3, 2, expert) : nullptr;
     // NVFP4: a weight row's tensor scale, and the 2^8 the scales held back.
-    const float* t_e = kNv ? tscale + static_cast<long long>(expert) * n : nullptr;
+    const float* t_e = kNv ? expert_plane(tscale, 1LL * n, expert_table, 3, 2, expert) : nullptr;
     auto factor = [&](int row) { return kNv ? t_e[row] * 256.f : 1.f; };
     w4mma::w4_land<kGlu, kTiles, kNb>(acc, factor, b_e, order, begin, count, out, n, inter,
                                       row_base, g, c, limit, galpha);
@@ -172,7 +174,8 @@ __global__ void __launch_bounds__(32 * kWarps) moe_select_mxfp4_mma_staged(
     int inter,
     float limit,
     float galpha,
-    const float* __restrict__ tscale)
+    const float* __restrict__ tscale,
+    const u64* __restrict__ expert_table)
 {
     // Four warps a CTA, each two m16 tiles of weight rows (a GLU's gate tile
     // and its up tile).
@@ -210,9 +213,9 @@ __global__ void __launch_bounds__(32 * kWarps) moe_select_mxfp4_mma_staged(
     const int groups = k >> 5;
     const int chunks = (groups + 3) >> 2;
     const long long row_bytes = k >> 1;
-    const u8* w_e = codes + static_cast<long long>(expert) * n * row_bytes;
+    const u8* w_e = expert_plane(codes, 1LL * n * row_bytes, expert_table, 3, 0, expert);
     const int sf_row = kNv ? 2 * groups : groups;
-    const u8* s_e = scales + static_cast<long long>(expert) * n * sf_row;
+    const u8* s_e = expert_plane(scales, 1LL * n * sf_row, expert_table, 3, 1, expert);
 
     const u8* wrow[kTiles][2];
     const u8* srow[kTiles][2];
@@ -315,8 +318,8 @@ __global__ void __launch_bounds__(32 * kWarps) moe_select_mxfp4_mma_staged(
     asm volatile("cp.async.wait_group 0;\n" ::);
     if (!rows_live) return;
 
-    const bf16* b_e = bias != nullptr ? bias + static_cast<long long>(expert) * n : nullptr;
-    const float* t_e = kNv ? tscale + static_cast<long long>(expert) * n : nullptr;
+    const bf16* b_e = bias != nullptr ? expert_plane(bias, 1LL * n, expert_table, 3, 2, expert) : nullptr;
+    const float* t_e = kNv ? expert_plane(tscale, 1LL * n, expert_table, 3, 2, expert) : nullptr;
     auto factor = [&](int row) { return kNv ? t_e[row] * 256.f : 1.f; };
     w4mma::w4_land<kGlu, kTiles, kNb>(acc, factor, b_e, order, begin, count, out, n, inter,
                                       row_base, g, c, limit, galpha);
@@ -348,7 +351,8 @@ __global__ void __launch_bounds__(32 * kWarps, 384 / (32 * kWarps)) moe_select_m
     int inter,
     float limit,
     float galpha,
-    const float* __restrict__)
+    const float* __restrict__,
+    const u64* __restrict__ expert_table)
 {
     constexpr int kTiles = 2;
     constexpr int kRowsWarp = kGlu != 0 ? 16 : kTiles * 16;
@@ -384,8 +388,8 @@ __global__ void __launch_bounds__(32 * kWarps, 384 / (32 * kWarps)) moe_select_m
     const int groups = k >> 5;
     const int runs = (groups + 15) >> 4;
     const long long row_bytes = k >> 1;
-    const u8* w_e = codes + static_cast<long long>(expert) * n * row_bytes;
-    const u8* s_e = scales + static_cast<long long>(expert) * n * groups;
+    const u8* w_e = expert_plane(codes, 1LL * n * row_bytes, expert_table, 3, 0, expert);
+    const u8* s_e = expert_plane(scales, 1LL * n * groups, expert_table, 3, 1, expert);
 
     // This lane's 64 bytes of a run, and its four groups' scales.
     const u8* wrow[kTiles][2];
@@ -511,7 +515,7 @@ __global__ void __launch_bounds__(32 * kWarps, 384 / (32 * kWarps)) moe_select_m
     asm volatile("cp.async.wait_group 0;\n" ::);
     if (!rows_live) return;
 
-    const bf16* b_e = bias != nullptr ? bias + static_cast<long long>(expert) * n : nullptr;
+    const bf16* b_e = bias != nullptr ? expert_plane(bias, 1LL * n, expert_table, 3, 2, expert) : nullptr;
     auto factor = [](int) { return 1.f; };
     w4mma::w4_land<kGlu, kTiles, kNb>(acc, factor, b_e, order, begin, count, out, n, inter,
                                       row_base, g, c, limit, galpha);
@@ -539,7 +543,8 @@ __global__ void __launch_bounds__(256, 1) moe_select_mxfp4_mma_pipe(
     int inter,
     float limit,
     float galpha,
-    const float* __restrict__ tscale)
+    const float* __restrict__ tscale,
+    const u64* __restrict__ expert_table)
 {
     constexpr int kNb = 8;
     constexpr int kTiles = 2;
@@ -578,8 +583,8 @@ __global__ void __launch_bounds__(256, 1) moe_select_mxfp4_mma_pipe(
     const int chunks = k >> 7;
     const long long row_bytes = k >> 1;
     const int sf_row = k >> 5;
-    const u8* w_e = codes + static_cast<long long>(expert) * n * row_bytes;
-    const u8* s_e = scales + static_cast<long long>(expert) * n * sf_row;
+    const u8* w_e = expert_plane(codes, 1LL * n * row_bytes, expert_table, 3, 0, expert);
+    const u8* s_e = expert_plane(scales, 1LL * n * sf_row, expert_table, 3, 1, expert);
 
     // This lane's rows: its code runs (group `c` a chunk) and, at `c` 0,
     // their four scales a chunk, kept as bank rows (not pointers).
@@ -670,7 +675,7 @@ __global__ void __launch_bounds__(256, 1) moe_select_mxfp4_mma_pipe(
     asm volatile("cp.async.wait_group 0;\n" ::);
     if (!rows_live) return;
 
-    const bf16* b_e = bias != nullptr ? bias + static_cast<long long>(expert) * n : nullptr;
+    const bf16* b_e = bias != nullptr ? expert_plane(bias, 1LL * n, expert_table, 3, 2, expert) : nullptr;
     auto factor = [](int) { return 1.f; };
     w4mma::w4_land<kGlu, kTiles, kNb>(acc, factor, b_e, order, begin, count, out, n, inter,
                                       row_base, g, c, limit, galpha);
@@ -694,7 +699,8 @@ __global__ void moe_matmul_select_nvfp4_mma(
     int k,
     int num_experts,
     const MoeGroupBases* __restrict__ bases,
-    unsigned int* __restrict__ group_hits)
+    unsigned int* __restrict__ group_hits,
+    const u64* __restrict__ expert_table)
 {
     constexpr int kTileN = 128;
     constexpr int kTileK = 128;
@@ -736,10 +742,10 @@ __global__ void moe_matmul_select_nvfp4_mma(
         tensor_at = reinterpret_cast<const float*>(seat.biases);
     }
     const uint4* wq = reinterpret_cast<const uint4*>(
-        codes_at + static_cast<long long>(expert) * n * (k / 2));
+        expert_plane(codes_at, 1LL * n * (k / 2), expert_table, 3, 0, expert));
     const unsigned short* s2 = reinterpret_cast<const unsigned short*>(
-        scales_at + static_cast<long long>(expert) * n * groups);
-    const float* g = tensor_at + static_cast<long long>(expert) * n;
+        expert_plane(scales_at, 1LL * n * groups, expert_table, 3, 1, expert));
+    const float* g = expert_plane(tensor_at, 1LL * n, expert_table, 3, 2, expert);
 
     __shared__ __align__(32) bf16 w_tile[kTileN][kLd];
     __shared__ __align__(32) bf16 x_tile[kRoutes][kLd];

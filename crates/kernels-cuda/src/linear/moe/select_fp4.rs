@@ -49,7 +49,7 @@ pub(crate) fn nvfp4_mma_worth(
     fan: &Selected,
 ) -> bool {
     nvfp4_mma_spans(ctx, fan.route_count)
-        && !experts.tabled()
+        && !experts.streams()
         && x.dtype == Dtype::Bf16
         && y.dtype == Dtype::Bf16
         && x.width > 0
@@ -88,6 +88,7 @@ pub(crate) fn select_nvfp4_mma(
         None,
         Some(tensor_scales),
         false,
+        experts,
     )?;
     Ok(true)
 }
@@ -103,9 +104,11 @@ pub(crate) fn mxfp4_mma_worth(
     seat: GroupSeat,
     fan: &Selected,
     experts: u32,
+    table: ExpertTable,
 ) -> bool {
     mxfp4_mma_spans(ctx, fan.route_count, experts)
         && !seat.streams()
+        && !table.streams()
         && x.dtype == Dtype::Bf16
         && y.dtype == Dtype::Bf16
         && x.width > 0
@@ -166,6 +169,7 @@ pub(super) fn select_mxfp4_mma(
     glu: Option<crate::linear::gemm_sm100::Glu>,
     tensor_scales: Option<Tensor>,
     scale_atoms: bool,
+    table: ExpertTable,
 ) -> Result<(), Error> {
     const THREADS: u32 = 128;
     // The converts read e8m0 scales a 32 codes and no tensor scale, so an
@@ -404,6 +408,8 @@ pub(super) fn select_mxfp4_mma(
     } else {
         args.push(tensor_scales.map_or(ArgValue::ABSENT, |t| t.arg()));
     }
+    // Where each expert's planes lie (`Planes::Mxfp4`, or `Planes::Nvfp4`).
+    args.push(ArgValue::Ptr(table.at()));
     ctx.fire(op, fire, &args)
 }
 
@@ -437,6 +443,7 @@ const W4A8_STAGE: u32 = W4A8_GROUPS * 64 * (128 + 4) + 256 * 64;
 /// then `moe_select_mxfp4_w4a8` over each expert's 64-route slices.
 /// `Ok(false)` where the kernel does not take the fire.
 #[cfg(feature = "cuda")]
+#[allow(clippy::too_many_arguments)]
 pub fn select_mxfp4_w4a8(
     ctx: &Ctx,
     x: Tensor,
@@ -445,15 +452,20 @@ pub fn select_mxfp4_w4a8(
     routes: Tensor,
     y: &mut Tensor,
     gran: u32,
+    table: ExpertTable,
 ) -> Result<bool, Error> {
     const OP: &str = "linear.moe_select_mxfp4_w4a8";
-    if !(matches!(gran, 32 | 128) && y.dtype == Dtype::Bf16 && w4a8_takes(ctx, x, routes)) {
+    if !(matches!(gran, 32 | 128)
+        && y.dtype == Dtype::Bf16
+        && !table.streams()
+        && w4a8_takes(ctx, x, routes))
+    {
         return Ok(false);
     }
     let (op, glu, bias, (code, limit, alpha)) = (OP, false, None::<Tensor>, (0, 0.0f32, 0.0f32));
     let fan = &selected(OP, x, routes, y)?;
     if ctx.tuning().mxfp4_w4a8_tma && codes.ptr.is_multiple_of(16) && ctx.smem_fits(W4A8_TMA_SMEM) {
-        return select_mxfp4_w4a8_tma(ctx, x, codes, scales, routes, y, gran, fan);
+        return select_mxfp4_w4a8_tma(ctx, x, codes, scales, routes, y, gran, fan, table);
     }
     let (rows, kw) = (x.rows as usize, x.width as usize);
     let xq = ctx.scratch_stream(op, "linear.mxfp4_w4a8_x", rows * kw)? as u64;
@@ -532,6 +544,7 @@ pub fn select_mxfp4_w4a8(
         inter.arg(),
         limit.arg(),
         alpha.arg(),
+        ArgValue::Ptr(table.at()),
     ];
     ctx.fire(op, fire, &args)?;
     Ok(true)
@@ -564,10 +577,12 @@ pub fn select_nvfp4_w4a4(
     input_scales: Tensor,
     routes: Tensor,
     y: &mut Tensor,
+    table: ExpertTable,
 ) -> Result<bool, Error> {
     const OP: &str = "linear.moe_select_nvfp4_w4a4";
     let from = ctx.tuning().nvfp4_w4a4_from;
     if from == 0
+        || table.streams()
         || routes.rows * routes.width < from
         || x.dtype != Dtype::Bf16
         || y.dtype != Dtype::Bf16
@@ -653,6 +668,7 @@ pub fn select_nvfp4_w4a4(
         n.arg(),
         k.arg(),
         stated(OP, experts)?.arg(),
+        ArgValue::Ptr(table.at()),
     ];
     ctx.fire(OP, fire, &args)?;
     Ok(true)
@@ -677,6 +693,7 @@ fn select_mxfp4_w4a8_tma(
     y: &mut Tensor,
     gran: u32,
     fan: &Selected,
+    table: ExpertTable,
 ) -> Result<bool, Error> {
     use crate::linear::gemm_sm100::{Map, encode};
     use cudarc::driver::sys as dr;
@@ -739,10 +756,25 @@ fn select_mxfp4_w4a8_tma(
         boxes: [128, 128, 1],
         swizzle: dr::CUtensorMapSwizzle::CU_TENSOR_MAP_SWIZZLE_128B,
     })?;
+    // The codes map spans the bank, or a table's window (its entries whole
+    // code rows past its base).
+    let (w_base, w_rows) = if table.tabled() && table.window != (0, 0) {
+        let rows = table.window.1 / u64::from(x.width / 2);
+        let rows =
+            u32::try_from(rows).map_err(|_| refuse(OP, format!("a window of {rows} code rows")))?;
+        (table.window.0, rows)
+    } else if table.tabled() {
+        return Err(refuse(
+            OP,
+            "the TMA select maps its experts' codes through the table's window, and it has none",
+        ));
+    } else {
+        (codes.ptr, experts * y.width)
+    };
     let map_w = encode(Map {
-        ptr: codes.ptr,
+        ptr: w_base,
         ty: dr::CUtensorMapDataType::CU_TENSOR_MAP_DATA_TYPE_UINT8,
-        dims: [x.width / 2, experts * y.width, 0],
+        dims: [x.width / 2, w_rows, 0],
         strides: [u64::from(x.width / 2), 0],
         boxes: [64, 128, 1],
         swizzle: dr::CUtensorMapSwizzle::CU_TENSOR_MAP_SWIZZLE_64B,
@@ -781,6 +813,8 @@ fn select_mxfp4_w4a8_tma(
         n.arg(),
         0.0f32.arg(),
         0.0f32.arg(),
+        ArgValue::Ptr(table.at()),
+        w_base.arg(),
     ];
     ctx.fire(OP, fire, &args)?;
     Ok(true)
@@ -812,15 +846,16 @@ pub fn select_mxfp4_atoms(
     atoms: u64,
     routes: Tensor,
     y: &mut Tensor,
+    table: ExpertTable,
 ) -> Result<bool, Error> {
     const OP: &str = "linear.moe_select_mxfp4_atoms";
     let fan = selected(OP, x, routes, y)?;
-    if !(select_mxfp4_atoms_takes(ctx, routes, x) && y.dtype == Dtype::Bf16) {
+    if !(select_mxfp4_atoms_takes(ctx, routes, x) && y.dtype == Dtype::Bf16 && !table.streams()) {
         return Ok(false);
     }
     let scales = Tensor::new(atoms, codes.rows, 0, Dtype::U8);
     select_mxfp4_mma(
-        ctx, OP, x, codes, scales, None, routes, y, &fan, None, None, true,
+        ctx, OP, x, codes, scales, None, routes, y, &fan, None, None, true, table,
     )?;
     Ok(true)
 }
@@ -836,6 +871,7 @@ pub(super) fn matmul_select_mxfp4(
     routes: Tensor,
     y: &mut Tensor,
     seat: GroupSeat,
+    table: ExpertTable,
 ) -> Result<(), Error> {
     const MXFP4_BLOCK: u32 = 32;
 
@@ -852,13 +888,15 @@ pub(super) fn matmul_select_mxfp4(
     );
     let fan = selected(op, x, routes, y)?;
     #[cfg(feature = "cuda")]
-    if mxfp4_mma_worth(ctx, x, y, seat, &fan, codes.rows) {
+    if mxfp4_mma_worth(ctx, x, y, seat, &fan, codes.rows, table) {
         return select_mxfp4_mma(
-            ctx, op, x, codes, scales, bias, routes, y, &fan, None, None, false,
+            ctx, op, x, codes, scales, bias, routes, y, &fan, None, None, false, table,
         );
     }
+    // The grouped tcgen05 GEMM reads no table yet.
     #[cfg(feature = "cuda")]
     if !seat.streams()
+        && !table.tabled()
         && tc5_worth(
             ctx,
             x,
@@ -932,6 +970,7 @@ pub(super) fn matmul_select_mxfp4(
             stated(op, experts)?.arg(),
             ArgValue::Ptr(seat.cell),
             ArgValue::Ptr(seat.hits),
+            ArgValue::Ptr(table.at()),
         ]);
         return ctx.fire(
             op,
@@ -987,6 +1026,7 @@ pub(super) fn matmul_select_mxfp4(
             ArgValue::Ptr(seat.cell),
             ArgValue::Ptr(seat.hits),
             ctx.stage(),
+            ArgValue::Ptr(table.at()),
         ],
     )
 }
@@ -1002,6 +1042,7 @@ pub(super) fn matmul_select_mlxu4(
     routes: Tensor,
     y: &mut Tensor,
     seat: GroupSeat,
+    table: ExpertTable,
 ) -> Result<(), Error> {
     const ROWS_PER_WARP: u32 = 4;
 
@@ -1028,6 +1069,7 @@ pub(super) fn matmul_select_mlxu4(
     #[cfg(feature = "cuda")]
     if let Some(group) = affine_u4_group(x, codes, scales, y.width)
         && !seat.streams()
+        && !table.tabled()
         && tc5_worth(
             ctx,
             x,
@@ -1127,6 +1169,7 @@ pub(super) fn matmul_select_mlxu4(
             stated(op, experts)?.arg(),
             ArgValue::Ptr(seat.cell),
             ArgValue::Ptr(seat.hits),
+            ArgValue::Ptr(table.at()),
         ]);
         return ctx.fire(
             op,
@@ -1165,6 +1208,7 @@ pub(super) fn matmul_select_mlxu4(
             ArgValue::Ptr(seat.cell),
             ArgValue::Ptr(seat.hits),
             ctx.stage(),
+            ArgValue::Ptr(table.at()),
         ],
     )
 }
@@ -1192,6 +1236,7 @@ pub fn select_nvfp4(
     routes: Tensor,
     y: &mut Tensor,
     seat: GroupSeat,
+    table: ExpertTable,
 ) -> Result<(), Error> {
     const OP: &str = "linear.moe_select";
     let t = dtype_dispatch!(OP, x.dtype, { Bf16 => "::pie::bf16", F16 => "::pie::f16" });
@@ -1211,7 +1256,7 @@ pub fn select_nvfp4(
                 tensor_scales,
                 routes,
                 y,
-                crate::linear::moe::ExpertTable::RESIDENT,
+                table,
             ),
             Ok(true)
         )
@@ -1222,6 +1267,7 @@ pub fn select_nvfp4(
     // epilogue.
     #[cfg(feature = "cuda")]
     if !seat.streams()
+        && !table.tabled()
         && k.is_multiple_of(64)
         && crate::linear::moe::tc5_worth(
             ctx,
@@ -1273,6 +1319,7 @@ pub fn select_nvfp4(
             routes,
             y,
             seat,
+            table,
             &fan,
             experts,
         );
@@ -1288,6 +1335,7 @@ pub fn select_nvfp4(
         tensor_scales,
         y,
         seat,
+        table,
         fan.route_count,
         fan.top_k,
         act_div,
@@ -1305,6 +1353,7 @@ pub(crate) fn select_nvfp4_grouped(
     routes: Tensor,
     y: &mut Tensor,
     seat: GroupSeat,
+    table: ExpertTable,
     fan: &Selected,
     experts: u32,
 ) -> Result<(), Error> {
@@ -1340,6 +1389,7 @@ pub(crate) fn select_nvfp4_grouped(
             stated(op, experts)?.arg(),
             ArgValue::Ptr(seat.cell),
             ArgValue::Ptr(seat.hits),
+            ArgValue::Ptr(table.at()),
         ],
     )
 }
@@ -1356,6 +1406,7 @@ pub(crate) fn select_nvfp4_routed(
     tensor_scales: Tensor,
     y: &mut Tensor,
     seat: GroupSeat,
+    table: ExpertTable,
     route_count: u32,
     top_k: i32,
     act_div: i32,
@@ -1416,6 +1467,7 @@ pub(crate) fn select_nvfp4_routed(
             } else {
                 ArgValue::ABSENT
             },
+            ArgValue::Ptr(table.at()),
         ],
     )
 }

@@ -141,7 +141,9 @@ fn select_w4a8(
             act_quant::read_back(ctx, "test", fmt, Source::rows(x, None), back).expect("reads")
         };
         let c = Tensor::new(codes, experts, n * k / 2, U8);
-        let took = moe::select_mxfp4_atoms(ctx, back, c, atoms, routes, y).expect("fires");
+        let took =
+            moe::select_mxfp4_atoms(ctx, back, c, atoms, routes, y, moe::ExpertTable::RESIDENT)
+                .expect("fires");
         assert!(took, "the register-dequant select takes the fire");
         return;
     }

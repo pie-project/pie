@@ -1248,6 +1248,7 @@ impl Run<'_> {
                     self.tensor(*routes),
                     &mut self.tensor(*y),
                     seat,
+                    linear::moe::ExpertTable::RESIDENT,
                 )
             }
             Linear::MoeSelect {
@@ -2001,6 +2002,7 @@ impl Run<'_> {
                 routes,
                 &mut self.tensor(y),
                 seat,
+                linear::moe::ExpertTable::RESIDENT,
             );
         }
         let (codes, scales, biases, routes, seat) =
@@ -2019,6 +2021,7 @@ impl Run<'_> {
             routes,
             &mut self.tensor(y),
             seat,
+            linear::moe::ExpertTable::RESIDENT,
         )
     }
 
@@ -2078,6 +2081,7 @@ impl Run<'_> {
                     self.tensor(routes),
                     &mut self.tensor(y),
                     gran,
+                    linear::moe::ExpertTable::RESIDENT,
                 )?
             {
                 return Ok(());
@@ -2098,6 +2102,7 @@ impl Run<'_> {
                     self.tensor(input_scales),
                     self.tensor(routes),
                     &mut self.tensor(y),
+                    linear::moe::ExpertTable::RESIDENT,
                 )?
             {
                 return Ok(());
@@ -2214,6 +2219,7 @@ impl Run<'_> {
                 atoms,
                 route_t,
                 &mut out,
+                linear::moe::ExpertTable::RESIDENT,
             )? {
                 return Ok(());
             }
