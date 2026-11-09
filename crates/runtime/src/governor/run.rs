@@ -1,73 +1,458 @@
 //! The loop, on a pool: read the system, move the target.
 
-use super::{Demand, Governor, Limits, Pressure, System, TICK, Tolerance};
-use crate::store::extent::Extent;
+use super::{
+    Demand, Governor, Growth, Limits, PoolTarget, Pressure, Retarget, Signal, System, TICK,
+    Tolerance,
+};
+use crate::store::extent::{Asked, Extent, Split};
 
 /// A dedicated process's whole pool stands: there is nothing to answer.
 pub fn start(extent: Extent, tolerance: Tolerance) {
-    if tolerance == Tolerance::Dedicated {
+    let pool = ExtentPool::new(extent);
+    if tolerance == Tolerance::Dedicated || pool.growth() == Growth::Fixed {
         return;
     }
-    crate::rt::spawn(watch(extent, tolerance, super::system()));
+    crate::rt::spawn(watch(pool, tolerance, super::system()));
 }
 
 /// What one calm tick may add. A unified memory machine has no budget to
 /// stop a burst but this: the system's complaint arrives after the damage.
 const GROWTH_STEP: u64 = 512 * 1024 * 1024;
 
-async fn watch(extent: Extent, tolerance: Tolerance, mut system: Box<dyn System>) {
-    let mut governor = Governor::new(
-        Limits {
-            // One context's pages and its state, so one lane can always run.
-            floor: extent.floor(),
-            hard_limit: extent.hard_limit(),
-            step: GROWTH_STEP,
-            shrink_step: if extent.moves_by_copy() {
-                u64::MAX
-            } else {
-                u64::from(extent.step()).saturating_mul(extent.page_bytes())
-            },
-        },
-        tolerance,
-        extent.held(),
-    );
+/// One governor on one pool, a turn at a time: the loop without its clock,
+/// so a test can drive it.
+pub struct Steer {
+    governor: Governor,
+    /// The segments held short of the target, while a shrink has no room.
+    short: Option<u64>,
+    yielded: bool,
+    idled: bool,
+}
+
+/// What one turn leaves the caller to do.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Turn {
+    pub target: u64,
+    /// The governor started (`true`) or stopped yielding.
+    pub yielding: Option<bool>,
+    /// The process just went idle.
+    pub idled: bool,
+}
+
+impl Steer {
+    /// A fixed pool has nothing to give back, so it is steered as dedicated
+    /// whatever the deployment asked.
+    #[must_use]
+    pub fn new(pool: &impl PoolTarget, tolerance: Tolerance, step: u64) -> Self {
+        let tolerance = if pool.growth() == Growth::Fixed {
+            Tolerance::Dedicated
+        } else {
+            tolerance
+        };
+        Self {
+            governor: Governor::new(Limits::of(pool, step), tolerance, pool.held()),
+            short: None,
+            yielded: false,
+            idled: false,
+        }
+    }
+
+    #[must_use]
+    pub const fn governor(&self) -> &Governor {
+        &self.governor
+    }
+
+    /// One turn: `read` is the system's state on a tick, or `None` when a
+    /// waiter asked between ticks. A dedicated pool is left as it is.
+    pub fn turn(
+        &mut self,
+        pool: &mut impl PoolTarget,
+        read: Option<Pressure>,
+        signal: &mut impl FnMut(Signal),
+    ) -> Turn {
+        if self.governor.tolerance() == Tolerance::Dedicated {
+            return Turn {
+                target: self.governor.target(),
+                yielding: None,
+                idled: false,
+            };
+        }
+        let demand = pool.demand();
+        let target = match read {
+            None => self.governor.asked(demand),
+            Some(read) => {
+                let pressure = if pool.take_refused() {
+                    Pressure::Critical
+                } else {
+                    read
+                };
+                let target = self.governor.tick(pressure, demand);
+                if pressure == Pressure::Critical {
+                    pool.shrink_rung();
+                }
+                target
+            }
+        };
+        let limits = *self.governor.limits();
+        let segments = limits.segments(target);
+        match pool.retarget(segments) {
+            Retarget::Reached => {
+                if self.short.take().is_some() {
+                    signal(Signal::Eased);
+                }
+            }
+            Retarget::NoRoom { held } => {
+                if self.short != Some(held) {
+                    self.short = Some(held);
+                    signal(Signal::TierPressure {
+                        held_bytes: held.saturating_mul(limits.segment_bytes),
+                        target_bytes: segments.saturating_mul(limits.segment_bytes),
+                    });
+                }
+            }
+        }
+        let mut turn = Turn {
+            target,
+            yielding: None,
+            idled: false,
+        };
+        if self.governor.yielding() != self.yielded {
+            self.yielded = self.governor.yielding();
+            if !self.yielded {
+                pool.restore_rung();
+            }
+            turn.yielding = Some(self.yielded);
+        }
+        if self.governor.idle() != self.idled {
+            self.idled = self.governor.idle();
+            turn.idled = self.idled;
+        }
+        turn
+    }
+}
+
+async fn watch(mut pool: ExtentPool, tolerance: Tolerance, mut system: Box<dyn System>) {
+    let mut steer = Steer::new(&pool, tolerance, GROWTH_STEP);
+    let extent = pool.extent.clone();
     let mut interval = crate::rt::time::interval(TICK);
-    let mut last = None;
-    let mut yielded = false;
-    let mut idled = false;
     loop {
         let waiter = tokio::select! {
             _ = interval.tick() => false,
             () = extent.waiter() => true,
         };
-        let asked = extent.asked();
-        let demand = Demand {
+        let read = (!waiter).then(|| system.read());
+        let turn = steer.turn(&mut pool, read, &mut |signal| {
+            tracing::warn!(?signal, "pool short of its target");
+        });
+        extent.set_can_rise(steer.governor().can_rise());
+        if let Some(yielding) = turn.yielding {
+            extent.yield_scratch(yielding).await;
+        }
+        if turn.idled {
+            extent.release_scratch().await;
+        }
+    }
+}
+
+/// Today's pools as one target: kv pages and state slots split a byte
+/// target by what each is asked, so a segment here is one byte. Their tails
+/// empty on the extent's own task; a retarget only moves the targets.
+struct ExtentPool {
+    extent: Extent,
+    asked: Option<Asked>,
+    last: Option<Split>,
+}
+
+impl ExtentPool {
+    const fn new(extent: Extent) -> Self {
+        Self {
+            extent,
+            asked: None,
+            last: None,
+        }
+    }
+}
+
+impl PoolTarget for ExtentPool {
+    fn demand(&mut self) -> Demand {
+        let asked = self.extent.asked();
+        self.asked = Some(asked);
+        Demand {
             wanted: asked.wanted,
             live: asked.live,
-        };
-        let target = if waiter {
-            governor.asked(demand)
-        } else {
-            let read = system.read();
-            let refused = extent.take_refused();
-            governor.tick(if refused { Pressure::Critical } else { read }, demand)
-        };
-        let split = extent.split(target, asked);
-        if last != Some(split) {
-            tracing::debug!(waiter, target, ?split, "pool target");
-            extent.retarget(split);
-            last = Some(split);
         }
-        extent.set_can_rise(governor.can_rise());
-        if governor.yielding() != yielded {
-            yielded = governor.yielding();
-            extent.yield_scratch(yielded).await;
+    }
+
+    fn segment_bytes(&self) -> u64 {
+        1
+    }
+
+    fn floor(&self) -> u64 {
+        // One context's pages and its state, so one lane can always run.
+        self.extent.floor()
+    }
+
+    fn hard_limit(&self) -> u64 {
+        self.extent.hard_limit()
+    }
+
+    fn held(&self) -> u64 {
+        self.extent.held()
+    }
+
+    fn growth(&self) -> Growth {
+        Growth::Elastic {
+            least_cut: if self.extent.moves_by_copy() {
+                u64::MAX
+            } else {
+                u64::from(self.extent.step()).saturating_mul(self.extent.page_bytes())
+            },
         }
-        if governor.idle() != idled {
-            idled = governor.idle();
-            if idled {
-                extent.release_scratch().await;
+    }
+
+    fn retarget(&mut self, segments: u64) -> Retarget {
+        let asked = self.asked.unwrap_or_else(|| self.extent.asked());
+        let split = self.extent.split(segments, asked);
+        if self.last != Some(split) {
+            tracing::debug!(target = segments, ?split, "pool target");
+            self.extent.retarget(split);
+            self.last = Some(split);
+        }
+        Retarget::Reached
+    }
+
+    fn take_refused(&mut self) -> bool {
+        self.extent.take_refused()
+    }
+
+    /// Narrowing rides the yield: a critical tick yields, and the loop
+    /// narrows the waves as it does.
+    fn shrink_rung(&mut self) {}
+
+    fn restore_rung(&mut self) {}
+}
+
+#[cfg(test)]
+mod tests {
+    use super::super::{CUT_EVERY, IDLE_AFTER, KEEP_CACHE, SETTLED};
+    use super::*;
+
+    const MIB: u64 = 1 << 20;
+    const SEGMENT: u64 = 64 * MIB;
+
+    /// A pool of `SEGMENT`s that records what it was asked and holds a
+    /// count of slots in use that only its holders could change.
+    struct Fake {
+        growth: Growth,
+        held: u64,
+        demand: u64,
+        room: bool,
+        rung: u32,
+        slots_in_use: u32,
+        retargets: Vec<u64>,
+    }
+
+    impl Fake {
+        fn new(growth: Growth, held: u64) -> Self {
+            Self {
+                growth,
+                held,
+                demand: 0,
+                room: true,
+                rung: 3,
+                slots_in_use: 40,
+                retargets: Vec::new(),
             }
         }
+    }
+
+    impl PoolTarget for Fake {
+        fn demand(&mut self) -> Demand {
+            Demand {
+                wanted: self.demand,
+                live: self.demand,
+            }
+        }
+
+        fn segment_bytes(&self) -> u64 {
+            SEGMENT
+        }
+
+        fn floor(&self) -> u64 {
+            100 * MIB
+        }
+
+        fn hard_limit(&self) -> u64 {
+            16 * SEGMENT
+        }
+
+        fn held(&self) -> u64 {
+            self.held * SEGMENT
+        }
+
+        fn growth(&self) -> Growth {
+            self.growth
+        }
+
+        fn retarget(&mut self, segments: u64) -> Retarget {
+            self.retargets.push(segments);
+            if segments < self.held && !self.room {
+                return Retarget::NoRoom { held: self.held };
+            }
+            self.held = segments;
+            Retarget::Reached
+        }
+
+        fn shrink_rung(&mut self) {
+            self.rung = self.rung.saturating_sub(1);
+        }
+
+        fn restore_rung(&mut self) {
+            self.rung = 3;
+        }
+    }
+
+    const ELASTIC: Growth = Growth::Elastic { least_cut: 0 };
+
+    fn turns(steer: &mut Steer, pool: &mut Fake, read: Pressure, n: u32) -> Vec<Signal> {
+        let mut signals = Vec::new();
+        for _ in 0..n {
+            steer.turn(pool, Some(read), &mut |signal| signals.push(signal));
+        }
+        signals
+    }
+
+    #[test]
+    fn a_cut_is_never_less_than_a_segment() {
+        let pool = Fake::new(ELASTIC, 16);
+        let steer = Steer::new(&pool, Tolerance::Balanced, 512 * MIB);
+        assert_eq!(steer.governor().limits().shrink_step, SEGMENT);
+    }
+
+    #[test]
+    fn an_idle_pool_shrinks_by_whole_segments_down_to_the_floor_and_no_further() {
+        let mut pool = Fake::new(ELASTIC, 16);
+        let mut steer = Steer::new(&pool, Tolerance::Balanced, 512 * MIB);
+        turns(&mut steer, &mut pool, Pressure::Calm, KEEP_CACHE + 400);
+        let floor = steer.governor().limits().segments(0);
+        assert_eq!(floor, 2);
+        assert!(pool.retargets.iter().all(|&segments| segments >= floor));
+        assert!(pool.retargets.windows(2).all(|pair| pair[1] <= pair[0]));
+        let first_cut = pool.retargets.iter().position(|&s| s < 16).unwrap();
+        assert_eq!(
+            u32::try_from(first_cut).unwrap(),
+            IDLE_AFTER - 1,
+            "nothing goes before the idle"
+        );
+        assert_eq!(pool.held, floor);
+        assert_eq!(pool.slots_in_use, 40);
+    }
+
+    #[test]
+    fn critical_takes_the_floor_and_a_smaller_rung_then_calm_restores_the_rung() {
+        let mut pool = Fake::new(ELASTIC, 16);
+        let mut steer = Steer::new(&pool, Tolerance::Balanced, 512 * MIB);
+        let turn = steer.turn(&mut pool, Some(Pressure::Critical), &mut |_| {});
+        assert_eq!(turn.yielding, Some(true));
+        assert_eq!(pool.rung, 2);
+        assert_eq!(pool.held, 2, "the floor's segments");
+        steer.turn(&mut pool, Some(Pressure::Critical), &mut |_| {});
+        assert_eq!(pool.rung, 1, "each critical tick takes one rung more");
+        turns(&mut steer, &mut pool, Pressure::Calm, SETTLED);
+        assert_eq!(pool.rung, 3);
+    }
+
+    #[test]
+    fn a_refused_commit_reads_as_critical() {
+        struct Refusing(Fake);
+        impl PoolTarget for Refusing {
+            fn demand(&mut self) -> Demand {
+                self.0.demand()
+            }
+            fn segment_bytes(&self) -> u64 {
+                self.0.segment_bytes()
+            }
+            fn floor(&self) -> u64 {
+                self.0.floor()
+            }
+            fn hard_limit(&self) -> u64 {
+                self.0.hard_limit()
+            }
+            fn held(&self) -> u64 {
+                self.0.held()
+            }
+            fn growth(&self) -> Growth {
+                self.0.growth()
+            }
+            fn retarget(&mut self, segments: u64) -> Retarget {
+                self.0.retarget(segments)
+            }
+            fn take_refused(&mut self) -> bool {
+                true
+            }
+            fn shrink_rung(&mut self) {
+                self.0.shrink_rung();
+            }
+            fn restore_rung(&mut self) {
+                self.0.restore_rung();
+            }
+        }
+        let mut pool = Refusing(Fake::new(ELASTIC, 16));
+        let mut steer = Steer::new(&pool, Tolerance::Aggressive, 512 * MIB);
+        steer.turn(&mut pool, Some(Pressure::Calm), &mut |_| {});
+        assert_eq!(pool.0.rung, 2);
+        assert_eq!(pool.0.held, 2);
+    }
+
+    #[test]
+    fn a_shrink_without_room_keeps_the_segment_and_signals_pressure_once() {
+        let mut pool = Fake::new(ELASTIC, 16);
+        pool.room = false;
+        let mut steer = Steer::new(&pool, Tolerance::Balanced, 512 * MIB);
+        let signals = turns(&mut steer, &mut pool, Pressure::Critical, 8);
+        assert_eq!(
+            signals,
+            [Signal::TierPressure {
+                held_bytes: 16 * SEGMENT,
+                target_bytes: 2 * SEGMENT,
+            }]
+        );
+        assert_eq!(pool.held, 16, "the segments stay");
+        assert_eq!(pool.slots_in_use, 40, "nothing was dropped");
+        assert!(pool.retargets.len() >= 8, "the shrink is tried again");
+
+        pool.room = true;
+        let signals = turns(&mut steer, &mut pool, Pressure::Critical, 1);
+        assert_eq!(signals, [Signal::Eased]);
+        assert_eq!(pool.held, 2);
+    }
+
+    #[test]
+    fn a_fixed_pool_never_shrinks() {
+        let mut pool = Fake::new(Growth::Fixed, 16);
+        let mut steer = Steer::new(&pool, Tolerance::Polite, 512 * MIB);
+        assert_eq!(steer.governor().tolerance(), Tolerance::Dedicated);
+        assert_eq!(steer.governor().limits().shrink_step, u64::MAX);
+        turns(&mut steer, &mut pool, Pressure::Critical, 4);
+        turns(&mut steer, &mut pool, Pressure::Congested, 16);
+        turns(
+            &mut steer,
+            &mut pool,
+            Pressure::Calm,
+            IDLE_AFTER + 64 * CUT_EVERY,
+        );
+        assert!(pool.retargets.is_empty());
+        assert_eq!(pool.held, 16);
+        assert_eq!(pool.rung, 3);
+    }
+
+    #[test]
+    fn a_waiter_turn_rises_without_reading_the_system() {
+        let mut pool = Fake::new(ELASTIC, 2);
+        pool.demand = 6 * SEGMENT;
+        let mut steer = Steer::new(&pool, Tolerance::Balanced, 512 * MIB);
+        let turn = steer.turn(&mut pool, None, &mut |_| {});
+        assert_eq!(turn.target, 6 * SEGMENT);
+        assert_eq!(pool.held, 6);
     }
 }
