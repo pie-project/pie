@@ -485,7 +485,7 @@ impl Gmm {
             0
         };
         let vmem =
-            2 * tm * k * 2 + 2 * self.block_dma(cols) + convert + scaling + 2 * tm * cols * 4;
+            2 * tm * k * 2 + 2 * self.block_dma(cols) + 2 * convert + scaling + 2 * tm * cols * 4;
         // At least the compiler's own scoped default, where the device has it.
         let floor = (32 << 20).min(self.vmem_cap);
         let limit = (vmem * 2 + (8 << 20)).clamp(floor, self.vmem_cap);
@@ -500,20 +500,51 @@ impl Gmm {
                 .collect(),
             outs: vec![out],
             vmem_limit: Some(limit as u64),
-            scratch: vec![],
+            // The block as bf16, kept across its expert's run of tiles.
+            scratch: if convert > 0 {
+                vec![MTy::Ref(vec![k, cols], Elem::Bf16, Space::Vmem)]
+            } else {
+                vec![]
+            },
         };
         kernel.build(|b, blk| {
             let zero = b.index(0);
             let nt = b.load(blk.grid.prefetch[1], &[zero])?;
-            let live = b.cmpi(ICmp::Slt, blk.grid.ids[1], nt)?;
+            let t = blk.grid.ids[1];
+            let live = b.cmpi(ICmp::Slt, t, nt)?;
             b.when(live, |b| {
                 let x = b.vload_all(blk.ins[0])?;
-                let w = b.vload_all(blk.ins[1])?;
-                let w = if self.scaled {
-                    let s = b.vload_all(blk.ins[2])?;
-                    scale_codes(b, w, s, groups, cols)?
+                let widen = |b: &mut Body| -> Built<V> {
+                    let w = b.vload_all(blk.ins[1])?;
+                    if self.scaled {
+                        let s = b.vload_all(blk.ins[2])?;
+                        scale_codes(b, w, s, groups, cols)
+                    } else {
+                        b.convert_f(w, Elem::Bf16)
+                    }
+                };
+                // A run's first tile widens its expert's block; the rest of
+                // the run reads it back (v6e gpt-oss 4096-row prefill: every
+                // tile widened its block again, 5.5 MB of e5m2 a tile).
+                let w = if let Some(&held) = blk.scratch.first() {
+                    let z = b.i32(0);
+                    let one = b.i32(1);
+                    let before = b.subi(t, one)?;
+                    let before = b.maxsi(before, z)?;
+                    let ti = b.as_index(t)?;
+                    let bi = b.as_index(before)?;
+                    let ex = b.load(blk.grid.prefetch[0], &[ti])?;
+                    let prev = b.load(blk.grid.prefetch[0], &[bi])?;
+                    let at0 = b.cmpi(ICmp::Eq, t, z)?;
+                    let moved = b.cmpi(ICmp::Ne, prev, ex)?;
+                    let first = b.select(at0, at0, moved)?;
+                    b.when(first, |b| {
+                        let w = widen(b)?;
+                        b.vstore_all(w, held)
+                    })?;
+                    b.vload_all(held)?
                 } else {
-                    b.convert_f(w, Elem::Bf16)?
+                    widen(b)?
                 };
                 let acc = b.splat_f(&[tm, cols], Elem::F32, 0.0)?;
                 let y = b.matmul(x, w, acc, orient == Orient::NMajor)?;
