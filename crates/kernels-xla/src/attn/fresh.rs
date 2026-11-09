@@ -19,14 +19,14 @@
 #![allow(clippy::too_many_arguments)]
 
 use crate::hlo::{Built, Cmp, Elem, Fold, Func, Malformed, Val};
-use crate::mosaic::{Body, Compiled, Grid, ICmp, Kernel, Operand, Sem, V, Window};
+use crate::mosaic::{Body, Compiled, Grid, ICmp, Kernel, MTy, Operand, Sem, Space, V, Window};
 
 use super::paged::{Flashed, Heads, with_i};
 
 /// Query rows per block.
 const BR: i64 = 256;
-/// Key rows per block.
-const BK: i64 = 512;
+/// Key rows per block (as many as a row block: rows pad to fewer).
+const BK: i64 = 256;
 
 fn bad<T>(detail: impl Into<String>) -> Built<T> {
     Err(Malformed {
@@ -48,7 +48,7 @@ struct Shape {
 
 impl Shape {
     fn of(r: i64, h: &Heads, scale: f64) -> Self {
-        let bk = if r <= BR { BR } else { BK };
+        let bk = BK;
         Self {
             rp: round_up(r, bk),
             br: BR,
@@ -151,9 +151,9 @@ fn kernel(s: &Shape, vmem_cap: i64) -> Built<Compiled> {
         ],
         vmem_limit: Some(u64::try_from(s.vmem().min(vmem_cap)).unwrap_or(0)),
         scratch: vec![
-            (vec![qh, br, 1], Elem::F32),
-            (vec![qh, br, 1], Elem::F32),
-            (vec![qh, br, dv], Elem::F32),
+            MTy::Ref(vec![qh, br, 1], Elem::F32, Space::Vmem),
+            MTy::Ref(vec![qh, br, 1], Elem::F32, Space::Vmem),
+            MTy::Ref(vec![qh, br, dv], Elem::F32, Space::Vmem),
         ],
     };
     k.build(|b, blk| {
@@ -198,14 +198,12 @@ fn kernel(s: &Shape, vmem_cap: i64) -> Built<Compiled> {
             let ninf1 = b.splat_f(&[br, 1], Elem::F32, f64::NEG_INFINITY)?;
             let z1 = b.splat_f(&[br, 1], Elem::F32, 0.0)?;
             let i0 = b.index(0);
-            // One query head a turn (a loop, not unrolled: the module stays
-            // small, and so does its compile).
-            let (lb, ub, one) = (b.i32(0), b.i32(qh), b.i32(1));
-            b.for_range(lb, ub, one, |b, qi| {
-                let gv = b.i32(g);
-                let kh = b.divsi(qi, gv)?;
-                let dvv = b.i32(d);
-                let col = b.muli(kh, dvv)?;
+            // A kv head a turn, then each of its query heads (loops, not
+            // unrolled: the module stays small, and so does its compile).
+            let (lb, ub, one) = (b.i32(0), b.i32(kvh), b.i32(1));
+            b.for_range(lb, ub, one, |b, kh| {
+                let dkv = b.i32(d);
+                let col = b.muli(kh, dkv)?;
                 let col = b.assume_multiple(col, 128)?;
                 let col = b.as_index(col)?;
                 let kb = b.vload(k_ref, &[i0, col], &[bk, d])?;
@@ -214,44 +212,50 @@ fn kernel(s: &Shape, vmem_cap: i64) -> Built<Compiled> {
                 let col = b.assume_multiple(col, 128)?;
                 let col = b.as_index(col)?;
                 let vb = b.vload(v_ref, &[i0, col], &[bk, dv])?;
-                let dq = b.i32(d);
-                let col = b.muli(qi, dq)?;
-                let col = b.assume_multiple(col, 128)?;
-                let col = b.as_index(col)?;
-                let qb = b.vload(q_ref, &[i0, col], &[br, d])?;
-                let s = b.matmul(qb, kb, zs, true)?;
-                let s = b.mulf(s, sc)?;
-                let s = b.select(ok, s, ninf)?;
-                let at = b.as_index(qi)?;
-                let m0 = b.vload(m_ref, &[at, i0, i0], &[1, br, 1])?;
-                let m0 = b.shape_cast(m0, &[br, 1])?;
-                let mx = b.reduce_rows(s, true)?;
-                let mn = b.maxf(m0, mx)?;
-                let alive = b.gtf(mn, ninf1)?;
-                let ms = b.select(alive, mn, z1)?;
-                let msb = b.broadcast(ms, &[br, bk])?;
-                let z = b.subf(s, msb)?;
-                let p = b.exp(z)?;
-                let dm = b.subf(m0, ms)?;
-                let c = b.exp(dm)?;
-                let l0 = b.vload(l_ref, &[at, i0, i0], &[1, br, 1])?;
-                let l0 = b.shape_cast(l0, &[br, 1])?;
-                let l = b.mulf(l0, c)?;
-                let ps = b.reduce_rows(p, false)?;
-                let l = b.addf(l, ps)?;
-                let l = b.shape_cast(l, &[1, br, 1])?;
-                b.vstore(l, l_ref, &[at, i0, i0])?;
-                let a0 = b.vload(acc_ref, &[at, i0, i0], &[1, br, dv])?;
-                let a0 = b.shape_cast(a0, &[br, dv])?;
-                let pb = b.convert_f(p, Elem::Bf16)?;
-                let pv = b.matmul(pb, vb, zo, false)?;
-                let cb = b.broadcast(c, &[br, dv])?;
-                let a = b.mulf(a0, cb)?;
-                let a = b.addf(a, pv)?;
-                let a = b.shape_cast(a, &[1, br, dv])?;
-                b.vstore(a, acc_ref, &[at, i0, i0])?;
-                let mn = b.shape_cast(mn, &[1, br, 1])?;
-                b.vstore(mn, m_ref, &[at, i0, i0])
+                let (glb, gub, gone) = (b.i32(0), b.i32(g), b.i32(1));
+                b.for_range(glb, gub, gone, |b, gi| {
+                    let gv = b.i32(g);
+                    let qi = b.muli(kh, gv)?;
+                    let qi = b.addi(qi, gi)?;
+                    let dq = b.i32(d);
+                    let col = b.muli(qi, dq)?;
+                    let col = b.assume_multiple(col, 128)?;
+                    let col = b.as_index(col)?;
+                    let qb = b.vload(q_ref, &[i0, col], &[br, d])?;
+                    let s = b.matmul(qb, kb, zs, true)?;
+                    let s = b.mulf(s, sc)?;
+                    let s = b.select(ok, s, ninf)?;
+                    let at = b.as_index(qi)?;
+                    let m0 = b.vload(m_ref, &[at, i0, i0], &[1, br, 1])?;
+                    let m0 = b.shape_cast(m0, &[br, 1])?;
+                    let mx = b.reduce_rows(s, true)?;
+                    let mn = b.maxf(m0, mx)?;
+                    let alive = b.gtf(mn, ninf1)?;
+                    let ms = b.select(alive, mn, z1)?;
+                    let msb = b.broadcast(ms, &[br, bk])?;
+                    let z = b.subf(s, msb)?;
+                    let p = b.exp(z)?;
+                    let dm = b.subf(m0, ms)?;
+                    let c = b.exp(dm)?;
+                    let l0 = b.vload(l_ref, &[at, i0, i0], &[1, br, 1])?;
+                    let l0 = b.shape_cast(l0, &[br, 1])?;
+                    let l = b.mulf(l0, c)?;
+                    let ps = b.reduce_rows(p, false)?;
+                    let l = b.addf(l, ps)?;
+                    let l = b.shape_cast(l, &[1, br, 1])?;
+                    b.vstore(l, l_ref, &[at, i0, i0])?;
+                    let a0 = b.vload(acc_ref, &[at, i0, i0], &[1, br, dv])?;
+                    let a0 = b.shape_cast(a0, &[br, dv])?;
+                    let pb = b.convert_f(p, Elem::Bf16)?;
+                    let pv = b.matmul(pb, vb, zo, false)?;
+                    let cb = b.broadcast(c, &[br, dv])?;
+                    let a = b.mulf(a0, cb)?;
+                    let a = b.addf(a, pv)?;
+                    let a = b.shape_cast(a, &[1, br, dv])?;
+                    b.vstore(a, acc_ref, &[at, i0, i0])?;
+                    let mn = b.shape_cast(mn, &[1, br, 1])?;
+                    b.vstore(mn, m_ref, &[at, i0, i0])
+                })
             })
         })?;
         let lastj = b.i32(nj - 1);
@@ -435,9 +439,9 @@ mod tests {
             dv: 128,
         };
         let s = Shape::of(1000, &h, 0.1);
-        assert_eq!((s.rp, s.br, s.bk), (1024, 256, 512));
+        assert_eq!((s.rp, s.br, s.bk), (1024, 256, 256));
         let c = kernel(&s, 100 << 20).unwrap();
-        assert!(c.module.contains("iteration_bounds = array<i64: 4, 2>"));
+        assert!(c.module.contains("iteration_bounds = array<i64: 4, 4>"));
         assert!(c.module.contains("scratch_operands = 3 : i64"));
         assert_eq!(c.operands.len(), 6);
         if let Some(p) = std::env::var_os("FRESH_DUMP") {
