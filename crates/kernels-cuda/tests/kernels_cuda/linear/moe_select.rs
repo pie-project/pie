@@ -507,7 +507,7 @@ fn the_routed_mlp_kept_by_expert_answers_the_host() {
             };
             #[rustfmt::skip]
             let took = match gate {
-                Some(true) => moe::experts_weighted_first(&ctx, m, st, &mut y),
+                Some(true) => moe::experts_weighted_first(&ctx, m, st, &mut y, [RES; 2]),
                 _ => moe::experts(&ctx, m, &mut y, RES, RES, gate.map(|_| (st, gt)), norm),
             };
             assert!(took.expect("fires"), "{what}: the grouped GEMM takes it");

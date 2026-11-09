@@ -6,7 +6,7 @@
 //! either fold. A fire the kernel does not take answers `Ok(false)`; the
 //! caller runs the four apart.
 
-use super::{GluBank, RoutedMlp, Selected, Share, route_order_sliced};
+use super::{ExpertTable, GluBank, RoutedMlp, Selected, Share, route_order_sliced};
 use crate::error::Error;
 use crate::jit::{ArgValue, Ctx, Fire, Launch, kernel, refuse};
 use crate::linear::gemm_sm100::{self, Glu, Map, encode};
@@ -50,6 +50,13 @@ struct Params {
     hidden: i32,
     inter: i32,
     limit: f32,
+    up_table: u64,
+    down_table: u64,
+    up_base: u64,
+    down_base: u64,
+    up_row_bytes: i64,
+    down_row_bytes: i64,
+    planes: i32,
 }
 
 /// `pie::linear::mega` bounds: experts, routes a fire, 128-column output
@@ -195,9 +202,30 @@ pub fn mega_takes(ctx: &Ctx, routes: Tensor) -> bool {
         && count <= ctx.tuning().moe_mega_until.min(MAX_WIDE_ROUTES)
 }
 
+/// A bank's codes as its map takes them under `table`: its base and rows
+/// (a located table with a window: the window's, its entries whole rows past
+/// it; else the bank's own).
+fn mapped(codes: Tensor, rows: u32, row_bytes: u64, table: ExpertTable) -> Option<(u64, u32)> {
+    match table.window {
+        (base, bytes) if table.tabled() && bytes > 0 => {
+            let rows = u32::try_from(bytes / row_bytes).ok()?;
+            (base.is_multiple_of(16) && i32::try_from(rows).is_ok()).then_some((base, rows))
+        }
+        _ => Some((codes.ptr, rows)),
+    }
+}
+
 /// `y[t] = fold over t's routes r of down_e(glu(up_e . x[t]))`, the routed
-/// MLP in one launch. `Ok(false)` where the kernel does not take the fire.
-pub fn mega(ctx: &Ctx, m: RoutedMlp, fold: Fold, y: &mut Tensor) -> Result<bool, Error> {
+/// MLP in one launch, over the experts `[up, down]` tables place (each
+/// `[codes]`, or W4A8's `[codes, atoms]`, an expert). `Ok(false)` where the
+/// kernel does not take the fire.
+pub fn mega(
+    ctx: &Ctx,
+    m: RoutedMlp,
+    fold: Fold,
+    y: &mut Tensor,
+    [up_table, down_table]: [ExpertTable; 2],
+) -> Result<bool, Error> {
     let RoutedMlp {
         x,
         up,
@@ -265,9 +293,20 @@ pub fn mega(ctx: &Ctx, m: RoutedMlp, fold: Fold, y: &mut Tensor) -> Result<bool,
         || elements(up_codes) != 2 * i * h
         || elements(down_codes) != h * i
         || (!w4 && (up_codes.dtype != Dtype::Bf16 || down_codes.dtype != Dtype::Bf16))
+        || up_table.streams()
+        || down_table.streams()
     {
         return Ok(false);
     }
+    // A code row's bytes: e2m1 two a byte, bf16 two bytes an element.
+    let row_bytes = |k: u64| if w4 { k / 2 } else { 2 * k };
+    let (up_row, down_row) = (row_bytes(h), row_bytes(i));
+    let (Some((up_base, up_rows)), Some((down_base, down_rows))) = (
+        mapped(up_codes, experts * 2 * inter, up_row, up_table),
+        mapped(down_codes, experts * hidden, down_row, down_table),
+    ) else {
+        return Ok(false);
+    };
     // W4A8 lands its GLU rows as the apart e4m3 GLU does: clamped, each
     // under its route's weight.
     let (code, limit) = match glu {
@@ -312,23 +351,15 @@ pub fn mega(ctx: &Ctx, m: RoutedMlp, fold: Fold, y: &mut Tensor) -> Result<bool,
     let routed = ctx.scratch_stream(OP, ROUTED, count as usize * hidden as usize * 2)? as u64;
     let sync = ctx.scratch_stream_zeroed(OP, SYNC, SYNC_WORDS * 4)? as u64;
     let map_up = operand_map(
-        up_codes.ptr,
+        up_base,
         w4,
         false,
-        experts * 2 * inter,
+        up_rows / inter * inter,
         hidden,
         128,
         View::Halves { inter },
     )?;
-    let map_down = operand_map(
-        down_codes.ptr,
-        w4,
-        false,
-        experts * hidden,
-        inter,
-        128,
-        View::Chunks,
-    )?;
+    let map_down = operand_map(down_base, w4, false, down_rows, inter, 128, View::Chunks)?;
     let map_x = operand_map(xpool, false, w4, pool, hidden, bn, View::Plain)?;
     let map_h = operand_map(hpool, false, w4, pool, inter, bn, View::Chunks)?;
     let int = |v: u32| i32::try_from(v).map_err(|_| refuse(OP, "a shape past i32"));
@@ -371,6 +402,13 @@ pub fn mega(ctx: &Ctx, m: RoutedMlp, fold: Fold, y: &mut Tensor) -> Result<bool,
         hidden: int(hidden)?,
         inter: int(inter)?,
         limit,
+        up_table: up_table.at(),
+        down_table: down_table.at(),
+        up_base,
+        down_base,
+        up_row_bytes: i64::try_from(up_row).unwrap_or(i64::MAX),
+        down_row_bytes: i64::try_from(down_row).unwrap_or(i64::MAX),
+        planes: if w4 { 2 } else { 1 },
     };
     let kind = u32::from(w4);
     let first = u32::from(first);
