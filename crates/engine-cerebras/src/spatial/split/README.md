@@ -90,7 +90,7 @@ and Qwen3-8B.
 | Qwen3-8B | role-split (9 units 256 x 228, Hc 18, K 4, gap slot; GATE 0, SLW 1) | 1,825 (0.548 ms, G2 12) | 1,811 (0.5521 ms, 99.3%, L64, G2 12) | greedy 512 and TF 512 golden; Pie 12 of 12 reps golden (G2 16 and 12). `PIE_CEREBRAS_SPLIT=<prep>:q84_:G2=12,WL=1`. serve8b_region (qw1): 1,642 |
 | Gemma 4 E2B | role-split Gemma (7 units 256 x 128, Hc 12, K 5; WSPEC 2) | 1,431 (0.6986 ms) | 1,418 (0.7053 ms, 99.0%) | greedy 720 golden; TF 256 0 mismatches |
 | Gemma 4 E4B | role-split Gemma (7 units 256 x 160, Hc 16, K 6) | 1,072 (0.9327 ms) | 1,063 (0.9404 ms, 99.2%) | global context 2,560 positions (NEG 16 x 160) |
-| Gemma 4 12B | role-split 12B (8 units 344 x 283: attention rows Hc 12, plain rows Hc 15; K 6) | 1,018 (0.9822 ms) | 1,013 (0.9869 ms, 99.5%) | TF 212 0 mismatches, greedy golden; global context 4,092 |
+| Gemma 4 12B | role-split 12B (8 units 344 x 283: 128 attention rows Hc 12, plain rows Hc 15; K 6; RING 1) | 1,057 (0.9462 ms) | 1,055 (0.9483 ms, 99.8%) | TF 212 0 mismatches, greedy golden; TF 1,600 past the window: 3 bf16 near-ties (below); global context 4,096 |
 | gpt-oss-20b | role-split gpt-oss (12 units, K 2; CYV 2, GLUV 1) | 1,555 (0.643 ms) | 1,522 (0.6569 ms, 97.9%) | MXFP4 experts as E5M2, lossless; Pie text = bare greedy |
 
 Notes on the table:
@@ -226,11 +226,14 @@ They match HF f32 logprobs to within 0.004 on the chosen token.
 - **Rep-2 near-tie flip** (serve8b_region). On Qwen3-8B in Pie, 1 of 6 reps leaves the golden at token ~389, the
   golden's tightest margin (0.0043, an exact bf16 tie). The role-split build serves Qwen3-8B now: 6 of 6 reps golden.
 
-- **Gemma 4 12B speed.** 0.982 ms against a ~0.86 ms forecast. A sliding layer is ~14.1k cycles
-  (attention 5.5k, CY GELU phase 4.1k); the attention-row PE has 1,760 B of stack room, too little
-  for `WSPEC 1`. Splitting the act into chunks so the down matvec overlaps the GELU was slower
-  (0.995 ms). Next: a 128-row attention block (the 1024 window an exact ring, `WIN` 0) for the
-  whole-ring mixer, and fine stamps of the attention pass.
+- **Gemma 4 12B speed.** 0.946 ms against a ~0.86 ms forecast. A sliding layer is ~13.3k cycles
+  (0.982 ms and 14.1k before the exact ring). The attention-row PE has 1,776 B of stack room, too
+  little for `WSPEC 1`. Splitting the act into chunks, so the down matvec overlaps the GELU, was
+  slower (0.995 ms). Next: fine stamps of the attention pass and of the CY GELU phase.
+- **Gemma 4 12B long context.** Teacher-forced over 1,600 tokens (1,660 positions), 3 of 1,600 differ
+  from the HF f32 golden, at i 372, 925 and 1301 (f32 gaps 0.042, 0.0034 and 0.0053). At each, the
+  chip's pick is f32's runner-up. At 372 and 1301 HF bf16 picks the chip's token. At 925 the gap is
+  far below a bf16 step at that logit (0.125).
 
 ## 7. Gemma 4 and gpt-oss-20b
 
@@ -259,14 +262,15 @@ on), `tools/emu/tf_gemma.py` and `tf_gptoss.py` (teacher-forced emulation of the
 
 **Gemma 4 12B** (`*_g12.csl`, bf16; no PLE or shared KV, `attention_k_eq_v` on the global layers). 21.9 GB of
 layers and a 2 GB tied head fill 98% of the wafer, which only fits with a row-role split.
-- Units: 8 of 344 x 283 weight PEs, K 6 (S S S S S G). The first 132 rows of a unit are attention rows (Hc 12; the KV,
-  position p on row p % 132; the scores segments). The other 151 are plain rows (Hc 15, no attention code: they send
-  zeros into the values reduction). Hidden 3,849 slots for 3,840; padded dims carry zero weights and gammas.
+- Units: 8 of 344 x 283 weight PEs, K 6 (S S S S S G). The first 128 rows of a unit are attention rows (Hc 12; the KV,
+  position p on row p % 128; the scores segments). The other 155 are plain rows (Hc 15, no attention code: they send
+  zeros into the values reduction). Hidden 3,861 slots for 3,840; padded dims carry zero weights and gammas.
 - Attention: every segment is 43 columns, so sliding has 8 kv heads x 43 columns (Dc 6) and global has the one kv head
   replicated 8 times (Dc 12), with Qh 2 on both kinds. A global projection is q | raw k, and CY makes v = the raw k
-  (the weight PE stores it v-normalised). The sliding ring is 8 x 132 entries, masked to the 1024 window. The global
-  context is 31 x 132 = 4,092.
-- Head: 53 columns + control, tied (`head_g12.csl` reads the winner's embedding from its f16 lm_head tile). A head
+  (the weight PE stores it v-normalised). The sliding ring is 8 x 128 entries, exactly the 1024 window, so `RING 1`
+  runs a sliding layer's mixer over the whole ring with fixed-length vector ops (no window mask). The
+  global context is 32 x 128 = 4,096.
+- Head: 54 columns + control (its tiles in two files, `hw0` / `hw1`: one is over the 2 GiB a staged file may take), tied (`head_g12.csl` reads the winner's embedding from its f16 lm_head tile). A head
   column takes a group of CX rows: attention rows in sixes, plain rows in fives, no group across the CY row. The
   group's CX PEs chain their x to the group's root on the last unit's CX column, and the root sends it east. The
   wafer loop's embedding returns to unit 0's root row and down the same chain.
