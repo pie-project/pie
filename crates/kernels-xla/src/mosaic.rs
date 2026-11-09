@@ -627,6 +627,25 @@ impl Body {
         }
     }
 
+    /// An i32 vector of `x` everywhere.
+    pub fn splat_i(&mut self, dims: &[i64], x: i64) -> Built<V> {
+        let t = MTy::Vector(dims.to_vec(), Elem::I32);
+        Ok(self.op1("arith.constant", &[], &format!("value = dense<{x}> : {t}"), t))
+    }
+
+    /// An i32 scalar everywhere in a `dims` vector (`vector.broadcast`).
+    pub fn broadcast_i(&mut self, v: V, dims: &[i64]) -> Built<V> {
+        if self.ty(v) != &MTy::I32 {
+            return bad(format!("broadcast of {} as an i32", self.ty(v)));
+        }
+        Ok(self.op1(
+            "vector.broadcast",
+            &[v],
+            "",
+            MTy::Vector(dims.to_vec(), Elem::I32),
+        ))
+    }
+
     /// A float vector widened (`arith.extf`) or narrowed (`arith.truncf`).
     pub fn convert_f(&mut self, v: V, to: Elem) -> Built<V> {
         let (d, e) = self.vec_of(v)?;

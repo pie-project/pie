@@ -1995,6 +1995,33 @@ pub fn attend(
             scale,
             ch,
         )?,
+        (Walk::PerRow, None)
+            if ch.decode_pages > 0
+                && r >= ch.decode_pages
+                && rule.rel.is_none()
+                && rule.bits.is_none()
+                && rule.rbias.is_none()
+                && rule.window.is_none()
+                && rs.enabled.is_none()
+                && !matches!(planes, Planes::Paged { latent: true, .. })
+                && super::pages::fits(geom.span, &heads, tuning.vmem_cap()) =>
+        {
+            super::pages::attend(
+                f,
+                rs.q,
+                keys,
+                values,
+                geom.pt,
+                lane,
+                rs.lo,
+                rs.hi,
+                geom.pages,
+                geom.ps,
+                &heads,
+                scale,
+                tuning.vmem_cap(),
+            )?
+        }
         _ => per_row(f, &planes, &heads, &rule, &rs, KeyList::Range, scale, ch)?,
     };
     let lse = match call.lse {
