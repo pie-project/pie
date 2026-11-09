@@ -1165,13 +1165,15 @@ pub(crate) fn tile_projection(
     use crate::linear::moe_gmm::{Gmm, Orient};
     let (m, k) = (f.dims(x)[0], f.dims(x)[1]);
     let n = f.dims(codes)[0];
-    // A prompt's rows too: the kernel's 128-deep dots leave half of a v6e
-    // MXU idle, and still beat the weight decoded to bf16 for the fire
-    // (24576x6144, 2048 rows: 1.4 ms against 1.7).
     if !tuning.moe_gmm() || k % TILE != 0 {
         return Ok(None);
     }
-    let tm = (((m + 15) / 16) * 16).clamp(16, 512);
+    // The rows in one tile where their double-buffered block fits 64 MiB:
+    // a prompt's tile widens each block of codes once for all its rows
+    // (`moe_gmm::Gmm::widens`; v6e, 24576x6144 at 2048 rows: 0.73 ms in one
+    // tile, as bf16's 0.72, against 1.34 in two).
+    let most = ((64 << 20) / (4 * k) / 16 * 16).max(16);
+    let tm = (((m + 15) / 16) * 16).clamp(16, most);
     let tiles = (m + tm - 1) / tm;
     let spec = Gmm {
         tiles,

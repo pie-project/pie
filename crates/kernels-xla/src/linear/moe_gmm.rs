@@ -94,6 +94,9 @@ enum Cut {
     Element { width: i64 },
 }
 
+/// Rows from which a block-FP8 tile widens its codes (`Gmm::widens`).
+pub const WIDEN_ROWS: i64 = 512;
+
 fn bad<T>(detail: impl Into<String>) -> Built<T> {
     Err(Malformed {
         op: "mosaic.gmm",
@@ -111,11 +114,25 @@ impl Gmm {
         self.k * cols * i64::from(self.w.bits()) / 8
     }
 
+    /// A block-FP8 tile of prompt rows widens its block of codes under their
+    /// factors to bf16 once and contracts it a whole K deep: the 128-deep
+    /// dots leave half of a v6e MXU idle, and the widening's VPU work is
+    /// shared by the tile's rows.
+    fn widens(&self) -> bool {
+        self.tile && self.tm >= WIDEN_ROWS
+    }
+
     fn cut(&self) -> Built<Cut> {
         let (k, n, e) = (self.k, self.n, self.experts);
         // An e2m1 block counts a byte a code: its bf16 copy in VMEM is what
-        // bounds it; a block-FP8 one its bf16 slices.
-        let per = if self.tile { 2 } else { self.wbytes().max(1) };
+        // bounds it; a block-FP8 one its bf16 slices, or its f32 widening.
+        let per = if self.widens() {
+            4
+        } else if self.tile {
+            2
+        } else {
+            self.wbytes().max(1)
+        };
         let fits = |cols: i64| k * cols * per <= self.block_bytes;
         let blocked = (1..=n / 128)
             .rev()
@@ -348,6 +365,8 @@ impl Gmm {
         // The scaled codes' exponents widen to f32 beside them.
         let scaling = if self.scaled {
             2 * groups * cols + 4 * k * cols
+        } else if self.widens() {
+            2 * 4 * groups * cols + 4 * k * cols + 4 * groups * 128 * cols
         } else if self.tile {
             2 * 4 * groups * cols + 4 * tm * cols
         } else {
@@ -375,7 +394,14 @@ impl Gmm {
             let nt = b.load(blk.grid.prefetch[1], &[zero])?;
             let live = b.cmpi(ICmp::Slt, blk.grid.ids[1], nt)?;
             b.when(live, |b| {
-                let y = if self.tile {
+                let y = if self.widens() {
+                    let x = b.vload_all(blk.ins[0])?;
+                    let w = b.vload_all(blk.ins[1])?;
+                    let s = b.vload_all(blk.ins[2])?;
+                    let w = widen_codes(b, w, s, groups, cols)?;
+                    let acc = b.splat_f(&[tm, cols], Elem::F32, 0.0)?;
+                    b.matmul(x, w, acc, false)?
+                } else if self.tile {
                     tile_dot(b, blk, tm, groups, cols)?
                 } else {
                     let x = b.vload_all(blk.ins[0])?;
@@ -415,6 +441,21 @@ impl Gmm {
             })
         })
     }
+}
+
+/// e4m3 codes `w` (`[K, cols]`) as bf16, each times its 128-code block's
+/// f32 factor (`s`: `[K / 128, cols]`), the product rounded once, as the
+/// bf16 deployment holds the weight.
+fn widen_codes(b: &mut Body, w: V, s: V, groups: i64, cols: i64) -> Built<V> {
+    use crate::mosaic::MTy;
+    let k = groups * 128;
+    let f32s = |d: &[i64]| MTy::Vector(d.to_vec(), Elem::F32);
+    let w = b.convert_f(w, Elem::F32)?;
+    let s = b.op("vector.shape_cast", &[s], "", &[f32s(&[groups, 1, cols])])[0];
+    let s = b.op("vector.broadcast", &[s], "", &[f32s(&[groups, 128, cols])])[0];
+    let s = b.op("vector.shape_cast", &[s], "", &[f32s(&[k, cols])])[0];
+    let w = b.mulf(w, s)?;
+    b.convert_f(w, Elem::Bf16)
 }
 
 /// A tile's rows against block-FP8 codes (`ins[1]`, `[K, cols]` e4m3) under
