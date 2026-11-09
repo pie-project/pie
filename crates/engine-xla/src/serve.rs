@@ -1033,6 +1033,50 @@ impl Shell {
         {
             return self.fire_padded(lanes, clips, &pads, true);
         }
+        // A batched decode's lanes go longest context first: the attention
+        // walk reads its rows in groups, each group up to its longest
+        // context (`kernel.attn.row_group`), and lanes of like contexts
+        // share a group. The outputs come back in the lanes' own order.
+        if decode && clips.is_empty() && self.tuning.chunks.row_group > 0 {
+            let held = |s: &Seated<'_>| {
+                s.held
+                    .or_else(|| self.held.get(s.lane.slot as usize).copied())
+                    .unwrap_or(0)
+            };
+            let mut order: Vec<usize> = (0..lanes.len()).collect();
+            order.sort_by_key(|&at| std::cmp::Reverse(held(&lanes[at])));
+            if order.iter().enumerate().any(|(k, &at)| k != at) {
+                let sorted: Vec<Seated<'_>> = order.iter().map(|&at| lanes[at]).collect();
+                let mut place = vec![0; lanes.len()];
+                for (k, &at) in order.iter().enumerate() {
+                    place[at] = k;
+                }
+                for feed in &mut self.token_feeds {
+                    feed.lane = place[feed.lane];
+                }
+                let mut fired = self.fire_inner(&sorted, clips)?;
+                if fired.rows.len() == lanes.len() {
+                    let rows = std::mem::take(&mut fired.rows);
+                    fired.rows = vec![Vec::new(); lanes.len()];
+                    for (k, row) in rows.into_iter().enumerate() {
+                        fired.rows[order[k]] = row;
+                    }
+                }
+                if let Some(kept) = fired.kept.as_mut().and_then(std::sync::Arc::get_mut) {
+                    let seats = std::mem::take(&mut kept.seats);
+                    let readback = std::mem::take(&mut kept.readback);
+                    kept.seats = vec![Vec::new(); seats.len()];
+                    kept.readback = vec![None; readback.len()];
+                    for (k, seat) in seats.into_iter().enumerate() {
+                        kept.seats[order[k]] = seat;
+                    }
+                    for (k, back) in readback.into_iter().enumerate() {
+                        kept.readback[order[k]] = back;
+                    }
+                }
+                return Ok(fired);
+            }
+        }
         let bucket = poem_exec::fire::rung_of(&self.budgets.tokens.buckets, real_rows);
         let pad = bucket.saturating_sub(real_rows);
         let pad_word = lanes[lanes.len() - 1].lane.word;
