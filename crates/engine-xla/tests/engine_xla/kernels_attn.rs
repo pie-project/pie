@@ -520,6 +520,7 @@ fn a_long_decode_walks_its_keys_in_chunks() {
 /// Wide heads take the per-kv-head column-slice contraction.
 #[test]
 fn a_long_decode_with_wide_heads_slices_each_kv_head() {
+    long_decode(8, 1, 128);
     long_decode(8, 2, 128);
     long_decode(8, 4, 256);
 }
