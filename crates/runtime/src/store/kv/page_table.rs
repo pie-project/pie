@@ -870,11 +870,15 @@ impl KvPageTable {
         keys
     }
 
-    /// Every sealed page's key, repeats kept: a copy taken under the kv lock
-    /// that the caller hashes after letting it go.
-    pub fn sealed_key_list(&self) -> Vec<Hash256> {
+    pub fn node_ids(&self) -> Vec<NodeId> {
+        self.nodes.iter().map(|(id, _)| id).collect()
+    }
+
+    /// Every sealed page's key in the nodes of `ids`, repeats kept: a copy
+    /// taken under the kv lock that the caller hashes after letting it go.
+    pub fn sealed_key_list(&self, ids: &[NodeId]) -> Vec<Hash256> {
         let mut keys = Vec::new();
-        for (_, node) in self.nodes.iter() {
+        for node in ids.iter().filter_map(|&id| self.nodes.get(id)) {
             if let Pages::Owned { page_hashes, .. } = &node.pages {
                 keys.extend(page_hashes.iter().flatten().copied());
             }
@@ -983,6 +987,28 @@ impl KvPageTable {
             && self.descends_from(location.node, owner)
             && (owner != location.node || last <= location.local + 1)
             && self.path_prefix_len(owner, last - 1) <= len
+    }
+
+    /// The node `root`'s last pages are in: itself, or the one a selection
+    /// takes them from. [`Self::within`] asks it to be `location`'s own or
+    /// above it.
+    pub fn path_owner(&self, root: NodeId) -> Option<NodeId> {
+        let node = self.nodes.get(root)?;
+        match &node.pages {
+            Pages::Owned { .. } => Some(root),
+            Pages::ParentSelection { .. } => node.parent,
+        }
+    }
+
+    /// `node` and every node above it.
+    pub fn lineage(&self, node: NodeId) -> Vec<NodeId> {
+        let mut out = Vec::new();
+        let mut cursor = Some(node);
+        while let Some(current) = cursor {
+            out.push(current);
+            cursor = self.nodes.get(current).and_then(|n| n.parent);
+        }
+        out
     }
 
     pub fn descends_from(&self, node: NodeId, ancestor: NodeId) -> bool {

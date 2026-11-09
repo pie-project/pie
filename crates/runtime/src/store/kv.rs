@@ -116,6 +116,9 @@ pub struct KvStore {
     flat: HashMap<WorkingSetId, Option<Vec<PhysicalKvPageId>>>,
     domain: Hash256,
     cache: HashMap<u64, KeptEntry>,
+    /// The cache's entries by the node their last pages are in: an attach
+    /// ages the entries on its own path, not every entry.
+    by_owner: HashMap<NodeId, Vec<u64>>,
     /// Entries already split at a step, by the entry and the pages kept.
     splits: HashSet<(u64, u64)>,
     owners: HashMap<ProcessId, usize>,
@@ -301,6 +304,7 @@ impl KvStore {
             flat: HashMap::new(),
             domain: hash::cache_domain(&seed),
             cache: HashMap::new(),
+            by_owner: HashMap::new(),
             splits: HashSet::new(),
             owners: HashMap::new(),
             keeps: false,
@@ -555,6 +559,7 @@ impl KvStore {
         let mut freed = 0;
         for key in keys {
             if let Some(entry) = self.cache.remove(&key) {
+                self.unlist(key, entry.path.terminal);
                 self.splits.retain(|&(split, _)| split != key);
                 self.disown(&entry, by);
                 freed += self.release_entry(entry, epoch);
@@ -719,6 +724,7 @@ impl KvStore {
                 *self.owners.entry(owner).or_insert(0) += 1;
             }
             self.kept += 1;
+            self.list(self.kept, path.terminal);
             self.cache.insert(self.kept, KeptEntry { path, ..entry });
         }
     }
@@ -872,10 +878,20 @@ impl KvStore {
 
     /// Each cache entry's pages by key, from token 0: the runs this worker
     /// can give whole.
+    #[cfg(test)]
     pub fn cached_runs(&self) -> Vec<Vec<Hash256>> {
-        self.cache
-            .values()
-            .filter_map(|entry| {
+        self.cached_runs_of(&self.cache_ids())
+    }
+
+    pub fn cache_ids(&self) -> Vec<u64> {
+        self.cache.keys().copied().collect()
+    }
+
+    /// [`Self::cached_runs`] of the entries of `ids` still here.
+    pub fn cached_runs_of(&self, ids: &[u64]) -> Vec<Vec<Hash256>> {
+        ids.iter()
+            .filter_map(|id| {
+                let entry = self.cache.get(id)?;
                 let mut keys = self.table.path_keys(entry.path.terminal)?;
                 keys.truncate(entry.path.pages as usize);
                 (!keys.is_empty()).then_some(keys)
@@ -883,9 +899,13 @@ impl KvStore {
             .collect()
     }
 
-    /// Every sealed page's key here, on any tier.
-    pub fn sealed_key_list(&self) -> Vec<Hash256> {
-        self.table.sealed_key_list()
+    pub fn node_ids(&self) -> Vec<NodeId> {
+        self.table.node_ids()
+    }
+
+    /// Every sealed page's key in the nodes of `ids` still here, on any tier.
+    pub fn sealed_key_list(&self, ids: &[NodeId]) -> Vec<Hash256> {
+        self.table.sealed_key_list(ids)
     }
 
     /// Host slots to land pages in that come from another worker; given
@@ -971,6 +991,7 @@ impl KvStore {
         // grafted below as well as its own.
         let pages = self.table.path_len(node);
         self.kept += 1;
+        self.list(self.kept, node);
         tracing::debug!(target: "pie::kv", pages, "imported");
         self.cache.insert(
             self.kept,
@@ -1172,6 +1193,7 @@ impl KvStore {
             *self.owners.entry(owner).or_insert(0) += 1;
         }
         self.kept += 1;
+        self.list(self.kept, path.terminal);
         tracing::debug!(target: "pie::kv", pages, decoded, "kept");
         if let Some(owner) = owner {
             crate::policy::report(Event::Kept(owner, pages * u64::from(self.page_size)));
@@ -1325,15 +1347,36 @@ impl KvStore {
         // The cache's entries that were used whole go last; one that holds
         // more than was used ages by what it holds alone.
         let now = Instant::now();
-        for entry in self.cache.values_mut() {
-            if self
-                .table
-                .within(entry.path.terminal, last, run.len() as u64)
-            {
-                entry.last_use = now;
+        for node in self.table.lineage(last.node) {
+            for id in self.by_owner.get(&node).into_iter().flatten() {
+                if let Some(entry) = self.cache.get_mut(id)
+                    && self
+                        .table
+                        .within(entry.path.terminal, last, run.len() as u64)
+                {
+                    entry.last_use = now;
+                }
             }
         }
         Ok(pages)
+    }
+
+    fn list(&mut self, id: u64, terminal: NodeId) {
+        if let Some(owner) = self.table.path_owner(terminal) {
+            self.by_owner.entry(owner).or_default().push(id);
+        }
+    }
+
+    fn unlist(&mut self, id: u64, terminal: NodeId) {
+        let Some(owner) = self.table.path_owner(terminal) else {
+            return;
+        };
+        if let Some(ids) = self.by_owner.get_mut(&owner) {
+            ids.retain(|listed| *listed != id);
+            if ids.is_empty() {
+                self.by_owner.remove(&owner);
+            }
+        }
     }
 
     fn recycle_backings(&mut self, backings: Vec<KvPageBacking>, epoch: u64) {
