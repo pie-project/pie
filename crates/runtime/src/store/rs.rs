@@ -98,7 +98,9 @@ pub enum RsError {
 
 pub const RS_TRANSLATION_UNMAPPED: u32 = u32::MAX;
 
-/// A count in each recurrent pool: state slots and buffer pages.
+/// A count in each recurrent pool: state slots and buffer pages. Each is
+/// a fixed slot shape's slots, and in the degenerate mode a slot is a chunk,
+/// so this is the chunks the two shapes ask for.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct RsUnits {
     pub slots: u32,

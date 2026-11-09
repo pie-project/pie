@@ -75,18 +75,19 @@ impl RacePool {
 }
 
 impl PoolPort for RacePool {
-    fn device_stats(&self) -> (u32, u32) {
-        (self.free.lock().len() as u32, self.total)
+    fn chunk_stats(&self) -> ChunkStats {
+        ChunkStats {
+            pages: (self.free.lock().len() as u32, self.total),
+            rs: self
+                .with_rs(|rs| (rs.available(), rs.capacity()))
+                .unwrap_or_default(),
+        }
     }
     fn host_stats(&self) -> (u32, u32) {
         (self.host, self.host_total)
     }
     fn disk_stats(&self) -> (u32, u32) {
         (0, 0)
-    }
-    fn rs_stats(&self) -> (RsUnits, RsUnits) {
-        self.with_rs(|rs| (rs.available(), rs.capacity()))
-            .unwrap_or_default()
     }
     fn rs_host_stats(&self) -> (RsUnits, RsUnits) {
         Default::default()
@@ -1194,8 +1195,11 @@ struct RingPool {
 }
 
 impl PoolPort for RingPool {
-    fn device_stats(&self) -> (u32, u32) {
-        (0, 0)
+    fn chunk_stats(&self) -> ChunkStats {
+        ChunkStats {
+            pages: (0, 0),
+            rs: self.rs_stats(),
+        }
     }
     fn host_stats(&self) -> (u32, u32) {
         (0, 0)

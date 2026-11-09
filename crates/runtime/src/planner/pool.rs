@@ -8,8 +8,23 @@ use crate::store::rs::RsUnits;
 /// the oldest is let go.
 const RING_GROWTH: u32 = 2;
 
+/// The device's chunks by slot shape, each free and in all. In the
+/// degenerate mode a chunk is one slot of a pinned shape: a kv page (the list
+/// shape), a state slot, a buffer or window-ring page.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ChunkStats {
+    /// The kv pages', `(free, total)`.
+    pub pages: (u32, u32),
+    /// The state slots' and buffer (or ring) pages', `(free, total)`.
+    pub rs: (RsUnits, RsUnits),
+}
+
 pub trait PoolPort: Send + Sync + 'static {
-    fn device_stats(&self) -> (u32, u32);
+    /// The device's chunks by shape.
+    fn chunk_stats(&self) -> ChunkStats;
+    fn device_stats(&self) -> (u32, u32) {
+        self.chunk_stats().pages
+    }
     /// Device pages handed out. A target below the pool is room the target
     /// can rise into, so this is not `device_stats`' complement there.
     fn device_out(&self) -> u32 {
@@ -18,7 +33,9 @@ pub trait PoolPort: Send + Sync + 'static {
     }
     fn host_stats(&self) -> (u32, u32);
     fn disk_stats(&self) -> (u32, u32);
-    fn rs_stats(&self) -> (RsUnits, RsUnits);
+    fn rs_stats(&self) -> (RsUnits, RsUnits) {
+        self.chunk_stats().rs
+    }
     fn rs_host_stats(&self) -> (RsUnits, RsUnits);
     /// Drops idle cache, but only what its retention key lets the runtime
     /// drop unasked (`pressure::may_drop`); room past that is asked of the
@@ -34,16 +51,23 @@ pub trait PoolPort: Send + Sync + 'static {
     fn rs_growth(&self) -> RsUnits {
         RsUnits::default()
     }
-    /// Asks for `count` pages more than stand free now; true when memory
-    /// is on its way, and `pages_freed` follows it.
-    fn grow(&self, count: u32) -> bool {
-        let _ = count;
-        false
-    }
-    /// Asks for `need` more state than stands free; as [`Self::grow`].
-    fn grow_rs(&self, need: RsUnits) -> bool {
+    /// Asks for `need` more of each shape than stands free now; true when
+    /// memory is on its way, and `pages_freed` follows it.
+    fn grow(&self, need: super::Demand) -> bool {
         let _ = need;
         false
+    }
+    fn grow_pages(&self, count: u32) -> bool {
+        self.grow(super::Demand {
+            kv_pages: count,
+            rs: RsUnits::default(),
+        })
+    }
+    fn grow_rs(&self, need: RsUnits) -> bool {
+        self.grow(super::Demand {
+            kv_pages: 0,
+            rs: need,
+        })
     }
     /// The working sets reading pages past the pool's limit.
     fn working_sets_past_limit(&self) -> HashSet<crate::store::kv::page_table::WorkingSetId> {
@@ -122,6 +146,15 @@ impl RegistryPool {
 }
 
 impl PoolPort for RegistryPool {
+    fn chunk_stats(&self) -> ChunkStats {
+        ChunkStats {
+            pages: self.with_kv_tagged("planner-device-stats", |kv| {
+                (kv.available_pages() as u32, kv.capacity_pages())
+            }),
+            rs: self.with_rs(|rs| (rs.free(), rs.capacity())),
+        }
+    }
+
     fn device_stats(&self) -> (u32, u32) {
         self.with_kv_tagged("planner-device-stats", |kv| {
             (kv.available_pages() as u32, kv.capacity_pages())
@@ -218,30 +251,25 @@ impl PoolPort for RegistryPool {
         self.with_kv_tagged("planner-tail", |kv| kv.working_sets_past_limit())
     }
 
-    fn grow(&self, count: u32) -> bool {
+    fn grow(&self, need: super::Demand) -> bool {
         let Some(grow) = &self.grow else {
             return false;
         };
-        let growing = self.with_kv_tagged("planner-grow", |kv| {
-            kv.note_short(count);
-            kv.can_commit()
-        });
+        let mut growing = false;
+        if need.kv_pages > 0 {
+            growing |= self.with_kv_tagged("planner-grow", |kv| {
+                kv.note_short(need.kv_pages);
+                kv.can_commit()
+            });
+        }
+        if !need.rs.is_zero() {
+            growing |= self.with_rs(|rs| rs.note_short(need.rs));
+        }
         if growing {
             grow.wake();
             return true;
         }
-        grow.ask()
-    }
-
-    fn grow_rs(&self, need: RsUnits) -> bool {
-        let Some(grow) = &self.grow else {
-            return false;
-        };
-        if self.with_rs(|rs| rs.note_short(need)) {
-            grow.wake();
-            return true;
-        }
-        grow.state_on_demand() && grow.ask()
+        (need.rs.is_zero() || grow.state_on_demand()) && grow.ask()
     }
 
     fn reserve_device_up_to(

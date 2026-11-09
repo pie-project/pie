@@ -117,7 +117,7 @@ impl ResidencyPlanner {
                     if self.absorb_free(count) {
                         continue;
                     }
-                    if self.port.grow(count) {
+                    if self.port.grow_pages(count) {
                         return;
                     }
                     if self.reclaim_idle_once() {
