@@ -449,7 +449,7 @@ impl Body {
 
     /// Starts copying `src` into `dst`, signalling `sem`.
     pub fn dma_start(&mut self, src: V, dst: V, sem: V) -> Built<()> {
-        let segs = std::env::var("PIE_XLA_DMA_SEGS").unwrap_or_else(|_| "1, 0, 1, 1, 0, 0".into());
+        let segs = std::env::var("PIE_XLA_DMA_SEGS").unwrap_or_else(|_| "1, 0, 1, 1, 0, 0, 0".into());
         self.op(
             "tpu.enqueue_dma",
             &[src, dst, sem],
