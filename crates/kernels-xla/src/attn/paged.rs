@@ -512,6 +512,15 @@ fn logits(
         let lt = cmp_i(f, Cmp::Lt, kp, rule.bound.min(pitch))?;
         let inb = f.and(ge, lt)?;
         let cell = match kbase {
+            // A one-byte plane (no lane states a mask) reads its row's byte
+            // at every key (only key 0 is in bounds): a broadcast, where a
+            // gather of a byte a cell took 0.1-0.3 ms a layer at 256 decode
+            // lanes (v6e gpt-oss), and the window below, which XLA rewrites
+            // to one too (0.1 ms a layer).
+            _ if pitch == 1 => {
+                let col = f.reshape(plane, &[rb])?;
+                f.broadcast(col, &dims, &[0])?
+            }
             // Every row reads columns `base .. base + c`: one window of the
             // plane (zero past its pitch) instead of a gather per cell.
             Some(base) => {
@@ -520,13 +529,6 @@ fn logits(
                 let start = clamp_i(f, base, 0, pitch)?;
                 let top = scalar_i(f, 0);
                 f.dynamic_slice(wide, &[top, start], &[rb, c])?
-            }
-            // A one-byte plane (no lane states a mask) reads its row's byte
-            // at every key: a broadcast, where a gather of a byte a cell
-            // took 0.1-0.3 ms a layer at 256 decode lanes (v6e gpt-oss).
-            None if pitch == 1 => {
-                let col = f.reshape(plane, &[rb])?;
-                f.broadcast(col, &dims, &[0])?
             }
             None => {
                 let col = clamp_i(f, kp, 0, pitch - 1)?;
