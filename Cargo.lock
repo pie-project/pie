@@ -1731,6 +1731,7 @@ dependencies = [
  "pie-poem-ir",
  "rustix",
  "serde",
+ "serde_json",
  "state",
  "thiserror 2.0.21",
  "web-std",

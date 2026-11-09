@@ -374,6 +374,7 @@ impl Engine for Spatial {
                 host_kv_pages: self.kv.host_pages,
                 ..PoolFacts::default()
             },
+            chunks: None,
             limits: FireLimits {
                 // The model holds one sequence's cache; a fire's lanes run one
                 // after another, each cache brought back from its tokens.

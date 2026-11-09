@@ -715,6 +715,7 @@ impl Engine for Cuda {
                 seat_to_end: shell.seat_to_end(),
                 seat_spread: shell.seat_spread(),
             },
+            chunks: None,
             limits: FireLimits {
                 max_lanes: shell.budget().max_lanes,
                 max_tokens: shell.budget().max_tokens,

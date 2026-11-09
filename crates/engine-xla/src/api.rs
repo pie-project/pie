@@ -403,6 +403,7 @@ impl Engine for Xla {
                 window_tokens: paging.window.map_or(0, |window| window.tokens),
                 ..PoolFacts::default()
             },
+            chunks: None,
             limits: FireLimits {
                 max_lanes: budgets.max_lanes,
                 max_tokens: budgets.max_tokens,

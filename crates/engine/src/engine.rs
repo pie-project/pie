@@ -3,6 +3,7 @@ use serde::{Deserialize, Serialize};
 use crate::adapter::AdapterRegistration;
 use crate::caps::DeviceFacts;
 use crate::channel::{ChannelId, ChannelRegistration, RegisteredChannel};
+use crate::chunk::{Evacuation, SlotCopy};
 use crate::error::{Error, Result};
 use crate::fire::{FrameId, FrameSubmission, FrameTicket, MediaEncode, Step};
 use crate::load::{LoadRequest, Loaded};
@@ -145,6 +146,38 @@ pub trait Engine: Send {
     fn release_state(&mut self, slots: u32) -> Result<()> {
         let _ = slots;
         Ok(())
+    }
+
+    /// Backs the pool's first `segments` segments
+    /// ([`crate::chunk::ChunkFacts::segments`]), ahead of the runtime
+    /// handing out any of their chunks; never on a fire's path. A refusal
+    /// leaves what was committed standing.
+    fn commit_segments(&mut self, segments: u32) -> Result<()> {
+        let _ = segments;
+        Err(self.unsupported("commit_segments"))
+    }
+
+    /// Gives back every segment at and past `segments`. The runtime has
+    /// evacuated their chunks and waited out every frame that named them.
+    fn release_segments(&mut self, segments: u32) -> Result<()> {
+        let _ = segments;
+        Err(self.unsupported("release_segments"))
+    }
+
+    /// Copies each moved chunk's bytes onto its new physical chunk and
+    /// updates the engine's [`crate::chunk::ChunkTable`], stream-ordered
+    /// before the next fire; the slot refs the runtime holds stand.
+    fn evacuate(&mut self, evacuation: &Evacuation) -> Result<()> {
+        let _ = evacuation;
+        Err(self.unsupported("evacuate"))
+    }
+
+    /// Copies slots of one shape between tiers or within one; replaces
+    /// [`Engine::copy_kv`] and [`Engine::copy_state`] once every backend
+    /// serves it.
+    fn copy_slots(&mut self, copy: &SlotCopy) -> Result<()> {
+        let _ = copy;
+        Err(self.unsupported("copy_slots"))
     }
 
     /// Gives back what fires have touched of the scratch, waiting out the
