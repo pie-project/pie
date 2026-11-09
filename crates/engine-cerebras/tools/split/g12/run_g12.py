@@ -90,14 +90,15 @@ for u in range(NU):
         put("rot", x0, Y0 + YC, c1 - c0, 1, np.asarray(rot[c0:c1])[None])
 # head
 HX0, HXC, HC, HR = g.HX0, g.HXC, g.HC, g.HR
-hw, hg = npy("hw"), npy("hg")
-for (c0, c1) in ((0, HXC), (HXC, HC)):
+hg = npy("hg")
+for i, (c0, c1) in enumerate(((0, HXC), (HXC, HC))):
+    hw = npy(f"hw{i}")
     x0 = g.hx(c0)
     for rb in range(0, HR, 64):
         re = min(rb + 64, HR)
         rc = np.array([[g.rcfg_head(g.hx(c), y) for c in range(c0, c1)] for y in range(rb, re)], np.uint32)
         put("rcfg", x0, rb, c1 - c0, re - rb, rc)
-        put("hw", x0, rb, c1 - c0, re - rb, np.asarray(hw[rb:re, c0:c1]), b16=True)
+        put("hw", x0, rb, c1 - c0, re - rb, np.asarray(hw[rb:re]), b16=True)
         put("hg", x0, rb, c1 - c0, re - rb, np.broadcast_to(np.asarray(hg[c0:c1])[None], (re - rb, c1 - c0, hg.shape[1])).copy())
 put("rcfg", HX0 + HXC, 0, 1, HR, np.array([[g.rcfg_hctl_g(HX0 + HXC, y, M["VR"])] for y in range(HR)], np.uint32))
 t_place = time.time() - t0

@@ -10,7 +10,7 @@ Units of K layers (S .. S G), unit u = layers K u .. K u + K - 1.
 - MLP: column c holds intermediate dims c Ic .. (>= I: padding).
 - Head: column c = the dims of its row group (geo.groups), HDc slots (padding past nx); tied (embed_tokens), f16.
 Writes w<u>a / w<u>w (f16 bits, A / W rows), gama / gamw (f32: a layer's input / post-attention / pre-FFN / post-FFN
-gammas, the layer scalar; + the embedding scale), qkw, rot, hw, hg, embed, embrows, golden.json, meta.json, params.txt."""
+gammas, the layer scalar; + the embedding scale), qkw, rot, hw0 / hw1 (the head's halves), hg, embed, embrows, golden.json, meta.json, params.txt."""
 import glob, json, os, shutil, struct, sys
 import numpy as np
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -206,6 +206,16 @@ for R in range(HR):
     if R % 128 == 0:
         print("head row", R, flush=True)
 hw.flush()
+# the head tiles in its two halves' files (hw0: columns < HXC, hw1: the rest): one file is over the 2 GiB a staged file
+# may take
+HXC = HC // 2
+for i, (c0, c1) in enumerate(((0, HXC), (HXC, HC))):
+    hp = np.lib.format.open_memmap(os.path.join(out, PRE + f"hw{i}.npy"), "w+", np.uint16, (HR, c1 - c0, HDc * VR))
+    for R in range(0, HR, 64):
+        hp[R:R + 64] = hw[R:R + 64, c0:c1]
+    hp.flush()
+del hw
+os.remove(os.path.join(out, PRE + "hw.npy"))
 nw = np.concatenate([get(P + "norm.weight"), [0]]).astype(np.float32)
 np.save(os.path.join(out, PRE + "hg.npy"), nw[np.where(hdims < 0, H, hdims)].astype(np.float32))
 e = np.lib.format.open_memmap(os.path.join(out, PRE + "embed.npy"), "w+", np.uint16, tuple(eb.shape))

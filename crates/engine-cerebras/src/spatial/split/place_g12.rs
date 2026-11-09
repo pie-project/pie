@@ -1,5 +1,5 @@
 //! Gemma 4 12B's role-split placement (`tools/split/g12/run_g12.py`'s copies): the units (weights of the
-//! attention / plain rows, rcfg, CX gammas, CY q / k norm weights and RoPE tables), the head (hw, hg) and its
+//! attention / plain rows, rcfg, CX gammas, CY q / k norm weights and RoPE tables), the head (hw0 / hw1, hg) and its
 //! control column.
 
 use super::SplitSpec;
@@ -100,18 +100,20 @@ pub fn place(d: &mut dyn Device, gg: &G12Geo, spec: &SplitSpec) -> R<()> {
     }
     // the head
     let (hx0, hxc, hc, hr) = (g.hx0, g.hxc, g.p.hc, g.p.hr);
-    let (hw, hg) = (spec.npy("hw")?, spec.npy("hg")?);
-    for (c0, c1) in [(0, hxc), (hxc, hc)] {
+    let hg = spec.npy("hg")?;
+    // the head tiles in its two halves' files (one is over the 2 GiB a staged file may take)
+    for (i, (c0, c1)) in [(0, hxc), (hxc, hc)].into_iter().enumerate() {
         if c1 <= c0 {
             continue;
         }
+        let hw = spec.npy(&format!("hw{i}"))?;
         let x0 = g.hx(c0);
         let mut rb = 0;
         while rb < hr {
             let re = (rb + 64).min(hr);
             let rc = cfgs((rb..re).flat_map(|y| (c0..c1).map(move |c| gg.rcfg_head(g.hx(c), y))))?;
             put(d, "rcfg", [x0, rb, c1 - c0, re - rb], &rc, false)?;
-            let blk = hw.block(None, (rb as usize, re as usize), (c0 as usize, c1 as usize))?;
+            let blk = hw.block(None, (rb as usize, re as usize), (0, (c1 - c0) as usize))?;
             put(d, "hw", [x0, rb, c1 - c0, re - rb], &blk, true)?;
             let n = hg.shape[1];
             let mut one = Vec::new();
