@@ -1199,9 +1199,7 @@ impl Run<'_> {
                 boundary_req,
                 boundary_rope,
                 decode: true,
-            } => {
-                self.boundaries.push((*boundary_pos, *ratio));
-                crate::lower::attn::pool::boundary_decode(
+            } => crate::lower::attn::pool::boundary_decode(
                 self.ctx(),
                 self.tensor(*positions),
                 self.cut_rows(self.bindings().tables.request_of_token),
@@ -1210,8 +1208,7 @@ impl Run<'_> {
                 self.tensor(*boundary_pos),
                 self.tensor(*boundary_req),
                 self.tensor(*boundary_rope),
-                )
-            }
+            ),
             Attn::PoolBoundary {
                 positions,
                 row_valid,
@@ -1220,9 +1217,7 @@ impl Run<'_> {
                 boundary_req,
                 boundary_rope,
                 decode: false,
-            } => {
-                self.boundaries.push((*boundary_pos, *ratio));
-                crate::lower::attn::pool::boundary_prefill(
+            } => crate::lower::attn::pool::boundary_prefill(
                 self.ctx(),
                 self.ragged(*positions),
                 self.cut_rows(self.bindings().tables.request_of_token),
@@ -1231,8 +1226,7 @@ impl Run<'_> {
                 self.tensor(*boundary_pos),
                 self.tensor(*boundary_req),
                 self.tensor(*boundary_rope),
-                )
-            }
+            ),
 
             Attn::PoolGather {
                 boundary_pos,
@@ -1243,6 +1237,9 @@ impl Run<'_> {
                 ratio,
                 entries,
             } => {
+                // The pool append that files these entries bounds its rows
+                // by the ratio they closed at.
+                self.boundaries.push((*boundary_pos, *ratio));
                 let Some([state_kv, state_score]) = self.pool_state(*pages) else {
                     return Err(kernels_xla::Error::Unsupported {
                         op: "attn.pool_gather",
