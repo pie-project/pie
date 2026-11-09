@@ -183,6 +183,8 @@ impl Gmm {
     #[must_use]
     pub fn prefetching(&self) -> bool {
         std::env::var("PIE_XLA_GMM_PREFETCH").is_ok_and(|v| v == "1")
+            && !self.scaled
+            && !self.bias
             && matches!(self.cut(), Ok(Cut::Blocked { tn }) if tn == self.n)
     }
 
