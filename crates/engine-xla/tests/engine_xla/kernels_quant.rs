@@ -640,6 +640,7 @@ fn block_fp8_at(n: usize) {
     let mut b = Bench::new();
     let x = b.bf16(m as u32, k as u32, &xs);
     let xbig = b.bf16(big as u32, k as u32, &xb);
+    let codes_of = codes.clone();
     let bank = Bank {
         codes: b.raw(Dtype::E4m3, n as u32, k as u32, codes),
         scales: b.f32(nb as u32, g as u32, &factors),
@@ -658,9 +659,27 @@ fn block_fp8_at(n: usize) {
     {
         return;
     }
-    // Group-batched rows scale exact partials; the decoded weight rounds to
-    // bf16, as the bf16 deployment holds it (and as the kernel rounds it).
+    // Group-batched rows scale exact partials; a decode tile of the kernel
+    // (whole 1024-column blocks) rounds each row times its block's factor
+    // to bf16 before the codes; the decoded weight rounds to bf16, as the
+    // bf16 deployment holds it.
     eprintln!("block fp8, {n} rows");
-    assert_close(&b.read_f32(y), &gemm_at(&xs, &w, m, n, k, false), 1e-3, 1e-2);
-    assert_close(&b.read_f32(yb), &gemm_ref(&xb, &w, big, n, k), 1e-3, 1e-2);
+    let want = if n % 1024 == 0 {
+        let mut y = vec![0.0f32; m * n];
+        for r in 0..m {
+            for c in 0..n {
+                let mut acc = 0.0f64;
+                for i in 0..k {
+                    let s = factors[(c / 128) * g + i / 128];
+                    acc += f64::from(round_bf16(xs[r * k + i] * s)) * f64::from(e4m3_value(codes_of[c * k + i]));
+                }
+                y[r * n + c] = acc as f32;
+            }
+        }
+        y
+    } else {
+        gemm_at(&xs, &w, m, n, k, false)
+    };
+    assert_close(&b.read_f32(y), &want, 1e-3, 1e-3);
+    assert_close(&b.read_f32(yb), &gemm_ref(&xb, &w, big, n, k), 1e-2, 1e-2);
 }
