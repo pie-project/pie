@@ -442,6 +442,90 @@ pub fn gather(
     let (indices, indptr, ps) = paging(f, OP, page_indices, page_indptr, pages.page_size)?;
     let bpos = flat_i32(f, boundary_pos)?;
     let breq = flat_i32(f, boundary_req)?;
+    let bpos = first(f, bpos, n)?;
+    let breq = first(f, breq, n)?;
+    // A lane of k rows closes at most k / ratio + 1 blocks: only those rows
+    // gather their window, the rest land zeros (a prompt of 2048 rows at
+    // ratio 128 closed 16 blocks and gathered 128 state rows for each of the
+    // 2048: 35 of a 165 ms v6e fire).
+    let lanes = i64::try_from(page_indptr.elements())
+        .unwrap_or(1)
+        .saturating_sub(1)
+        .max(1);
+    let most = (n / r + lanes).min(n);
+    if most < n {
+        let has = cmp_i(f, Cmp::Ge, bpos, 0)?;
+        let ti = f.convert(has, Elem::I32);
+        let rank = f.scan(ti, 0, Fold::Sum)?;
+        let one = f.like_i(rank, 1);
+        let rank = f.sub(rank, one)?;
+        let drop = f.like_i(rank, DROP);
+        let at = f.select(has, rank, drop)?;
+        let row = f.iota(Elem::I32, &[n, 1], 0);
+        let none = f.const_i(Elem::I32, -1, &[most, 1]);
+        let pick = f.put_rows(none, at, row, Combine::Set)?;
+        let pick = f.reshape(pick, &[most])?;
+        let live = cmp_i(f, Cmp::Ge, pick, 0)?;
+        let neg = f.like_i(pick, -1);
+        let bp = take(f, bpos, pick)?;
+        let bp = f.select(live, bp, neg)?;
+        let br = take(f, breq, pick)?;
+        let got = gather_rows(
+            f,
+            bp,
+            br,
+            most,
+            indices,
+            indptr,
+            ps,
+            hd,
+            r,
+            coff,
+            window,
+            state_kv,
+            state_score,
+            ape,
+        )?;
+        let zero = f.const_f(Elem::F32, 0.0, &[n, hd]);
+        let gone = f.like_i(pick, DROP);
+        let back = f.select(live, pick, gone)?;
+        return Ok(f.put_rows(zero, back, got, Combine::Set)?);
+    }
+    gather_rows(
+        f,
+        bpos,
+        breq,
+        n,
+        indices,
+        indptr,
+        ps,
+        hd,
+        r,
+        coff,
+        window,
+        state_kv,
+        state_score,
+        ape,
+    )
+}
+
+/// [`gather`] for the rows whose boundaries are `bpos`/`breq` (`[n]`).
+fn gather_rows(
+    f: &mut Func,
+    bpos: Val,
+    breq: Val,
+    n: i64,
+    indices: Val,
+    indptr: Val,
+    ps: i64,
+    hd: i64,
+    r: i64,
+    coff: i64,
+    window: i64,
+    state_kv: Operand,
+    state_score: Operand,
+    ape: Option<Operand>,
+) -> Result<Val, Error> {
     let sk = state_kv.val;
     let ss = state_score.val;
     let ape = ape.map(|a| a.f32(f));
@@ -898,6 +982,7 @@ pub fn lse(
     call: PoolLse<Operand, Landing>,
     planes: Entries,
     entries: &KvPool<impl Stored>,
+    tuning: crate::tuning::Tuning,
 ) -> Result<(Val, Val), Error> {
     let nk = call.walked(entries);
     let (n, hh, dd, rt) = (
@@ -942,6 +1027,56 @@ pub fn lse(
     let rv = f.like_i(pos, rt);
     let vis = f.add(pos, one)?;
     let vis = f.div(vis, rv)?;
+    // A prompt reading every closed entry of a compact pool: rows in
+    // blocks against whole pages of entries, a dense product a chunk, as a
+    // paged prefill walks its keys, not a gather of every row's entries
+    // (DeepSeek-V4's CSA, 1792 rows against 256 entries each: 35 of a
+    // 165 ms v6e fire).
+    let lanes = f.dims(indptr)[0] - 1;
+    if sel.is_none() && div > 1 && n > tuning.attn_per_row_max * lanes {
+        use super::paged::{Heads, Planes, Rows, Rule, blocked, geometry, with_i};
+        let (cells, w) = (f.dims(table)[0], f.dims(table)[1]);
+        let view = f.reshape(table, &[cells / div, div * w])?;
+        let geom = geometry(f, indptr, indices, ps, i64::from(entries.max_pages))?;
+        let planes = Planes::Paged {
+            keys: view,
+            values: view,
+            geom,
+            latent: true,
+        };
+        let h = Heads {
+            kvh: 1,
+            g: hh,
+            d: dd,
+            dv: dd,
+        };
+        let lane = geom.lane_of(f, req)?;
+        let cap = geom.capacity(f, lane)?;
+        let hi = f.min(vis, cap)?;
+        let zero = f.like_i(hi, 0);
+        let hi = f.max(hi, zero)?;
+        let base = with_i(f, lane, geom.span, Func::mul)?;
+        let hi = f.add(base, hi)?;
+        let q4 = f.reshape(qv, &[n, 1, hh, dd])?;
+        let rows_v = Rows::new(q4, base, hi);
+        let rule = Rule {
+            kp_span: Some(geom.span),
+            ..Rule::default()
+        };
+        let fl = blocked(
+            f,
+            &planes,
+            &h,
+            &rule,
+            &rows_v,
+            geom.lanes * geom.span,
+            f64::from(call.sm_scale),
+            tuning.chunks,
+        )?;
+        let lv = fl.lse2(f)?;
+        let ov = f.reshape(fl.o, &[n, hh, dd])?;
+        return Ok((ov, lv));
+    }
     let keys = match sel {
         Some(s) => Keys::Selected(s),
         None => Keys::All,

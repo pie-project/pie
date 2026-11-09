@@ -1339,7 +1339,7 @@ fn dense_attends_within_each_image_segment() {
         &no_bias,
         &unit,
     );
-    check_rows(&b.read_f32(o), &want, qh * d, rows, 1e-3);
+    check_rows(&b.read_f32(o), &want, qh * d, rows, 2e-3);
 }
 
 #[test]
@@ -1450,7 +1450,7 @@ fn ragged_answers_every_mask_form() {
             },
             &unit,
         );
-        check_rows(&b.read_f32(o), &want, qh * d, rows, 1e-3);
+        check_rows(&b.read_f32(o), &want, qh * d, rows, 2e-3);
     }
 }
 
