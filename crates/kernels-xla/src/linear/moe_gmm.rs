@@ -77,6 +77,14 @@ pub struct Gmm {
     /// block's factor and round once to bf16, as the bf16 deployment holds
     /// the weight.
     pub tile: bool,
+    /// A decode tile (16 rows) of a `tile` bank read a whole K deep: the
+    /// rows are laid once per 128 outputs of the block, each copy scaled by
+    /// that 128-column group's block factors (`[E·N/128, K]` f32 follows the
+    /// bank in place of the `[K/128, E·N]` factors), and one dot takes them
+    /// all. The factors of a 128x128 block are one per column group, so they
+    /// fold into the rows; 128-deep dots per block leave half of a v6e MXU's
+    /// 256-deep weight load idle (0.8 TB/s of e4m3 codes).
+    pub rows: bool,
     /// A bf16 bias row per expert follows (`[E, 1, N]`, a blocked cut
     /// only), added to the f32 product before it rounds.
     pub bias: bool,
@@ -94,6 +102,9 @@ enum Cut {
     /// the 128-lane tile holding the expert's first column.
     Element { width: i64 },
 }
+
+/// Columns a `rows` block holds.
+pub const ROWS_TN: i64 = 1024;
 
 fn bad<T>(detail: impl Into<String>) -> Built<T> {
     Err(Malformed {
@@ -114,6 +125,15 @@ impl Gmm {
 
     fn cut(&self) -> Built<Cut> {
         let (k, n, e) = (self.k, self.n, self.experts);
+        if self.rows {
+            // Eight 128-column groups a block: the factor rows' block is a
+            // whole f32 sublane tile.
+            return if self.orient == Orient::KMajor && n % ROWS_TN == 0 {
+                Ok(Cut::Blocked { tn: ROWS_TN })
+            } else {
+                bad(format!("no {ROWS_TN}-column block of a [{k}, {e}x{n}] bank"))
+            };
+        }
         // An e2m1 block counts a byte a code: its bf16 copy in VMEM is what
         // bounds it; a block-FP8 one its bf16 slices.
         let per = if self.tile { 2 } else { self.wbytes().max(1) };
@@ -195,6 +215,7 @@ impl Gmm {
             || (self.scaled && (self.orient != Orient::KMajor || self.k % 32 != 0))
             || (self.tile
                 && (self.w != Elem::F8E4m3fn || self.orient != Orient::KMajor || self.k % 128 != 0))
+            || (self.rows && (!self.tile || self.tm != 16 || self.bias))
         {
             return bad(format!("{:?} weights (scaled {})", self.w, self.scaled));
         }
@@ -306,6 +327,22 @@ impl Gmm {
                     Ok(vec![b.i32(0), col])
                 }),
             };
+            if self.rows {
+                let rows_index: crate::mosaic::IndexMap = Box::new(move |b: &mut Body, g: &Grid| {
+                    let ex = expert(b, g)?;
+                    let per = b.i32(n / ROWS_TN);
+                    let at = b.muli(ex, per)?;
+                    let at = b.addi(at, g.ids[0])?;
+                    Ok(vec![at, b.i32(0)])
+                });
+                return Operand {
+                    array: vec![e * n / 128, k],
+                    elem: Elem::F32,
+                    block: vec![ROWS_TN / 128, k],
+                    window: Window::Blocked,
+                    index: rows_index,
+                };
+            }
             Operand {
                 array: vec![groups, e * n],
                 elem: if self.tile { Elem::F32 } else { Elem::U8 },
@@ -349,6 +386,9 @@ impl Gmm {
         // The scaled codes' exponents widen to f32 beside them.
         let scaling = if self.scaled {
             2 * groups * cols + 4 * k * cols
+        } else if self.rows {
+            let j = cols / 128;
+            2 * 4 * j * k + 6 * j * tm * k + 4 * j * tm * cols
         } else if self.tile {
             2 * 4 * groups * cols + 4 * tm * cols
         } else {
@@ -376,6 +416,9 @@ impl Gmm {
             let nt = b.load(blk.grid.prefetch[1], &[zero])?;
             let live = b.cmpi(ICmp::Slt, blk.grid.ids[1], nt)?;
             b.when(live, |b| {
+                if self.rows {
+                    return tile_rows(b, &blk, tm, k, cols, self.out);
+                }
                 let y = if self.tile {
                     tile_dot(b, &blk, tm, groups, cols)?
                 } else {
@@ -416,6 +459,55 @@ impl Gmm {
             })
         })
     }
+}
+
+/// A decode tile's rows against block-FP8 codes (`ins[1]`, `[K, cols]` e4m3):
+/// the rows laid once per 128-column group, each copy times its group's
+/// factors along K (`ins[2]`, `[cols / 128, K]` f32) and rounded to bf16,
+/// one K-deep dot over the codes as bf16, and each copy's own 128 columns
+/// stored.
+fn tile_rows(
+    b: &mut Body,
+    blk: &crate::mosaic::Blocks,
+    tm: i64,
+    k: i64,
+    cols: i64,
+    out: Elem,
+) -> Built<()> {
+    use crate::mosaic::MTy;
+    let j = cols / 128;
+    let f32s = |d: &[i64]| MTy::Vector(d.to_vec(), Elem::F32);
+    let x = b.vload_all(blk.ins[0])?;
+    let x = b.convert_f(x, Elem::F32)?;
+    let x = b.op("vector.shape_cast", &[x], "", &[f32s(&[1, tm, k])])[0];
+    let x = b.op("vector.broadcast", &[x], "", &[f32s(&[j, tm, k])])[0];
+    let s = b.vload_all(blk.ins[2])?;
+    let s = b.op("vector.shape_cast", &[s], "", &[f32s(&[j, 1, k])])[0];
+    let s = b.op("vector.broadcast", &[s], "", &[f32s(&[j, tm, k])])[0];
+    let xs = b.mulf(x, s)?;
+    let xs = b.op("vector.shape_cast", &[xs], "", &[f32s(&[j * tm, k])])[0];
+    let xs = b.convert_f(xs, Elem::Bf16)?;
+    let w = b.vload_all(blk.ins[1])?;
+    let w = b.convert_f(w, Elem::Bf16)?;
+    let acc = b.splat_f(&[j * tm, cols], Elem::F32, 0.0)?;
+    let y = b.matmul(xs, w, acc, false)?;
+    let zero = b.index(0);
+    for g in 0..j {
+        let part = b.op(
+            "vector.extract_strided_slice",
+            &[y],
+            &format!(
+                "offsets = [{}, {}], sizes = [{tm}, 128], strides = [1, 1]",
+                g * tm,
+                g * 128
+            ),
+            &[f32s(&[tm, 128])],
+        )[0];
+        let part = b.convert_f(part, out)?;
+        let at = b.index(g * 128);
+        b.vstore(part, blk.outs[0], &[zero, at])?;
+    }
+    Ok(())
 }
 
 /// A tile's rows against block-FP8 codes (`ins[1]`, `[K, cols]` e4m3) under
@@ -540,6 +632,7 @@ mod tests {
             orient,
             scaled: false,
             tile: false,
+            rows: false,
             bias: false,
             out: Elem::F32,
         }

@@ -611,10 +611,11 @@ fn e4m3_value(b: u8) -> f32 {
 
 #[test]
 fn block_fp8_banks_answer_the_host() {
-    // e4m3 codes under one f32 factor a 128x128 block, 384 codes a row: 256
-    // rows through the grouped-matmul kernel; 200 (a partial block row) in
-    // XLA, `m` rows group-batched, `big` rows through the weight decoded
-    // once.
+    // e4m3 codes under one f32 factor a 128x128 block, 384 codes a row:
+    // 1024 rows through the grouped-matmul kernel's decode rows, 256 through
+    // its 128-deep dots; 200 (a partial block row) in XLA, `m` rows
+    // group-batched, `big` rows through the weight decoded once.
+    block_fp8_at(1024);
     block_fp8_at(256);
     block_fp8_at(200);
 }
