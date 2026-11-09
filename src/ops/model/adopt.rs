@@ -48,15 +48,10 @@ const PLATFORMS: [Platform; 6] = [
 
 pub fn run(args: AdoptArgs) -> Result<crate::ui::Answer> {
     let (dir, origin, hollow) = resolve(&args.source)?;
-    let config_path = dir.join("config.json");
-    let config: serde_json::Value = serde_json::from_str(
-        &std::fs::read_to_string(&config_path)
-            .with_context(|| format!("{} states no config.json", crate::ui::short_path(&dir)))?,
-    )
-    .with_context(|| format!("parsing {}", config_path.display()))?;
+    let config = configuration(&dir)?;
     let src = runtime::engine::load::open_source(&dir)?;
     let metadata = runtime::engine::load::checkpoint_metadata(&dir)?;
-    let card = Card::of(&origin, &config, &metadata);
+    let card = Card::of(&origin, &card_view(&config), &metadata);
     let platform = runtime::engine::load::this_box().unwrap_or(Platform::Cuda);
 
     let catalog = runtime::catalog::catalog();
@@ -68,6 +63,7 @@ pub fn run(args: AdoptArgs) -> Result<crate::ui::Answer> {
         served: None,
         adoption: None,
         refused: None,
+        passed_over: Vec::new(),
         unknown: None,
     };
 
@@ -82,14 +78,14 @@ pub fn run(args: AdoptArgs) -> Result<crate::ui::Answer> {
         report.served = Some(name);
         return Ok(crate::ui::Answer::report(report));
     }
-    let Some(family) = kin.iter().find(|k| k.adopts) else {
+    if !kin.iter().any(|k| k.adopts) {
         report.refused = Some(format!(
             "`{}` recognizes it but lists its models by hand: it states no `adopt` to read \
              another's numbers from config.json",
             kin[0].package.name()
         ));
         return Ok(crate::ui::Answer::report(report).with_code(std::process::ExitCode::from(2)));
-    };
+    }
 
     let id = match &args.id {
         Some(id) => id.clone(),
@@ -107,11 +103,6 @@ pub fn run(args: AdoptArgs) -> Result<crate::ui::Answer> {
         None
     };
     let catalog = catalog_for_adoption.as_ref().unwrap_or(catalog);
-    let family = catalog
-        .kin(&src, platform)
-        .into_iter()
-        .find(|k| k.package.name() == family.package.name())
-        .ok_or_else(|| anyhow!("`{}` no longer recognizes it", family.package.name()))?;
     let special = special_tokens(&dir);
     let checkpoint = runtime::catalog::Checkpoint {
         src: &src,
@@ -119,13 +110,24 @@ pub fn run(args: AdoptArgs) -> Result<crate::ui::Answer> {
         special: &special,
         origin: &origin,
     };
-    let adopted = match catalog.adopt(&family, &name, &id, &checkpoint, platform) {
-        Ok(adopted) => adopted,
-        Err(why) => {
-            report.refused = Some(why.to_string());
-            return Ok(crate::ui::Answer::report(report).with_code(std::process::ExitCode::from(2)));
+    // Each family that adopts, nearest first, until one does: a family
+    // recognizing the names but refusing the numbers hands it to the next.
+    let mut refusals = Vec::new();
+    let mut chosen = None;
+    for family in catalog.kin(&src, platform).into_iter().filter(|k| k.adopts) {
+        match catalog.adopt(&family, &name, &id, &checkpoint, platform) {
+            Ok(adopted) => {
+                chosen = Some((family, adopted));
+                break;
+            }
+            Err(why) => refusals.push(why.to_string()),
         }
+    }
+    let Some((family, adopted)) = chosen else {
+        report.refused = Some(refusals.join("; and "));
+        return Ok(crate::ui::Answer::report(report).with_code(std::process::ExitCode::from(2)));
     };
+    report.passed_over = refusals;
 
     let mut deployments = Vec::new();
     let mut first: Option<runtime::catalog::Deployment> = None;
@@ -210,7 +212,10 @@ fn resolve(source: &str) -> Result<(PathBuf, String, bool)> {
         return Ok((path.to_path_buf(), origin, false));
     }
     if path.exists() {
-        bail!("{source}: a checkpoint is a directory holding config.json beside its weights");
+        bail!(
+            "{source}: a checkpoint is a directory holding config.json (or a pipeline's \
+             model_index.json) beside its weights"
+        );
     }
     let (owner, name) = source
         .split_once('/')
@@ -222,12 +227,13 @@ fn resolve(source: &str) -> Result<(PathBuf, String, bool)> {
     if let Some(snapshot) = std::fs::read_dir(repo_dir.join("snapshots"))
         .ok()
         .and_then(|entries| {
-            entries
-                .filter_map(|e| e.ok())
-                .map(|e| e.path())
-                .find(|p| p.join("config.json").is_file())
+            entries.filter_map(|e| e.ok()).map(|e| e.path()).find(|p| {
+                p.join("config.json").is_file() || checkpoint::file::diffusers::is_pipeline(p)
+            })
         })
-        && checkpoint::file::read::discover_safetensors_files(&snapshot).is_ok()
+        && (checkpoint::file::read::discover_safetensors_files(&snapshot).is_ok()
+            || checkpoint::file::diffusers::components(&snapshot)
+                .is_ok_and(|components| !components.is_empty()))
     {
         return Ok((snapshot, source.to_string(), false));
     }
@@ -284,11 +290,107 @@ fn write_package(models: &Path, files: &[(String, String)]) -> Result<()> {
     Ok(())
 }
 
+fn json_file(path: &Path) -> Result<serde_json::Value> {
+    let text =
+        std::fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?;
+    serde_json::from_str(&finite(&text)).with_context(|| format!("parsing {}", path.display()))
+}
+
+/// `text` with the `Infinity`, `-Infinity` and `NaN` Python's json writes
+/// (and JSON does not) spelled as JSON can read them: the largest finite
+/// double either way, and null.
+fn finite(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut in_string = false;
+    let mut escaped = false;
+    let mut rest = text;
+    while let Some(c) = rest.chars().next() {
+        if in_string {
+            in_string = !(c == '"' && !escaped);
+            escaped = c == '\\' && !escaped;
+        } else if c == '"' {
+            in_string = true;
+        } else {
+            let spelled = [
+                ("-Infinity", "-1.7976931348623157e308"),
+                ("Infinity", "1.7976931348623157e308"),
+                ("NaN", "null"),
+            ]
+            .into_iter()
+            .find(|(word, _)| rest.starts_with(word));
+            if let Some((word, json)) = spelled {
+                out.push_str(json);
+                rest = &rest[word.len()..];
+                continue;
+            }
+        }
+        out.push(c);
+        rest = &rest[c.len_utf8()..];
+    }
+    out
+}
+
+/// What a family's `adopt` is handed as the checkpoint's configuration: its
+/// `config.json`, or for a diffusers pipeline each component's under the
+/// role its tensors are prefixed by (`dit`, `te`, `vae`, …), beside the
+/// pipeline's own index as `pipeline` and its scheduler's as `scheduler`.
+fn configuration(dir: &Path) -> Result<serde_json::Value> {
+    if checkpoint::file::diffusers::is_pipeline(dir) {
+        let mut map = serde_json::Map::new();
+        map.insert(
+            "pipeline".to_string(),
+            json_file(&dir.join(checkpoint::file::diffusers::PIPELINE_INDEX))?,
+        );
+        // The schedule is the scheduler's, which holds no weights: a
+        // distilled release and its base can differ in nothing else.
+        let scheduler = dir.join("scheduler").join("scheduler_config.json");
+        if scheduler.is_file() {
+            map.insert("scheduler".to_string(), json_file(&scheduler)?);
+        }
+        for component in checkpoint::file::diffusers::components(dir)? {
+            if let Some(config) = &component.config {
+                map.insert(
+                    component.prefix.trim_end_matches('.').to_string(),
+                    json_file(config)?,
+                );
+            }
+        }
+        return Ok(serde_json::Value::Object(map));
+    }
+    let path = dir.join("config.json");
+    if !path.is_file() {
+        bail!("{} states no config.json", crate::ui::short_path(dir));
+    }
+    json_file(&path)
+}
+
+/// The configuration a model card reads: a pipeline's denoiser's, named by
+/// the pipeline's class.
+fn card_view(config: &serde_json::Value) -> serde_json::Value {
+    let Some(dit) = config.get("pipeline").and(config.get("dit")) else {
+        return config.clone();
+    };
+    let mut view = dit.clone();
+    if let (Some(view), Some(class)) = (
+        view.as_object_mut(),
+        config["pipeline"].get("_class_name").cloned(),
+    ) {
+        view.insert(
+            "architectures".to_string(),
+            serde_json::Value::Array(vec![class]),
+        );
+        view.insert("model_type".to_string(), "diffusers pipeline".into());
+    }
+    view
+}
+
 /// The special tokens `tokenizer_config.json` names, as text: what a family
-/// adopting a checkpoint with a vocabulary of its own stops at.
+/// adopting a checkpoint with a vocabulary of its own stops at. A pipeline
+/// keeps its tokenizer in `tokenizer/`.
 fn special_tokens(dir: &Path) -> serde_json::Value {
-    let config: serde_json::Value = std::fs::read_to_string(dir.join("tokenizer_config.json"))
-        .ok()
+    let config: serde_json::Value = ["tokenizer_config.json", "tokenizer/tokenizer_config.json"]
+        .iter()
+        .find_map(|file| std::fs::read_to_string(dir.join(file)).ok())
         .and_then(|text| serde_json::from_str(&text).ok())
         .unwrap_or(serde_json::Value::Null);
     let mut special = serde_json::Map::new();
@@ -347,6 +449,8 @@ struct Report {
     served: Option<String>,
     adoption: Option<Adoption>,
     refused: Option<String>,
+    /// What each nearer family that refused it said.
+    passed_over: Vec<String>,
     unknown: Option<Unknown>,
 }
 
@@ -875,6 +979,9 @@ impl crate::ui::Report for Report {
         let Some(a) = &self.adoption else { return };
         println!();
         println!("{}", p.bold("How Pie adjusted to it"));
+        for why in &self.passed_over {
+            println!("  {} passed over: {why}", Mark::Absent.render(p));
+        }
         println!(
             "  {} {}'s adopt() read config.json as the model {}, rebinding {}",
             Mark::Did.render(p),
@@ -985,6 +1092,18 @@ mod tests {
             "adopted_llama_3_2_1b_instruct"
         );
         assert_eq!(package_name("qwen3-4b"), "adopted_qwen3_4b");
+    }
+
+    #[test]
+    fn a_configuration_python_wrote_reads() {
+        let read: serde_json::Value = serde_json::from_str(&finite(
+            r#"{"a": [0.0, Infinity, -Infinity, NaN], "b": "NaN \"Infinity"}"#,
+        ))
+        .unwrap();
+        assert_eq!(read["a"][1], serde_json::json!(f64::MAX));
+        assert_eq!(read["a"][2], serde_json::json!(-f64::MAX));
+        assert!(read["a"][3].is_null());
+        assert_eq!(read["b"], "NaN \"Infinity");
     }
 
     #[test]

@@ -469,7 +469,8 @@ fn link_into_snapshot(snapshot_dir: &Path, blobs_dir: &Path, entry: &Entry) -> R
 }
 
 /// What a hollow snapshot fetches whole: the configuration, tokenizer and
-/// template files at the repository's top, each under this size.
+/// template files at the repository's top and in a pipeline's component
+/// folders, each under this size.
 const HOLLOW_WHOLE: [&str; 5] = ["*.json", "*.jinja", "*.model", "*.txt", "*.tiktoken"];
 const HOLLOW_WHOLE_LIMIT: u64 = 64 << 20;
 
@@ -490,12 +491,27 @@ pub async fn hollow_snapshot(repo_id: &str, root: &Path) -> Result<PathBuf> {
     std::fs::create_dir_all(&dir).with_context(|| format!("creating {}", dir.display()))?;
     let mut weights = 0usize;
     for entry in files {
-        if entry.path.contains('/') {
+        // The top, and one folder down: a diffusers pipeline's components.
+        let depth = entry.path.matches('/').count();
+        if depth > 1 {
             continue;
         }
+        let file = entry.path.rsplit('/').next().unwrap_or(&entry.path);
         let url = format!("{}/{repo_id}/resolve/{sha}/{}", endpoint(), entry.path);
         let target = dir.join(&entry.path);
-        if glob_match("model*.safetensors", &entry.path) {
+        if let Some(parent) = target.parent() {
+            std::fs::create_dir_all(parent)
+                .with_context(|| format!("creating {}", parent.display()))?;
+        }
+        // Every weight file at the top (an index may name an `mtp.safetensors`
+        // beside the shards); a component's own, one folder down.
+        let weights_file = if depth == 0 {
+            glob_match("*.safetensors", file)
+        } else {
+            glob_match("model*.safetensors", file)
+                || glob_match("diffusion_pytorch_model*.safetensors", file)
+        };
+        if weights_file {
             if std::fs::metadata(&target).is_ok_and(|m| m.len() == entry.size) {
                 weights += 1;
                 continue;
@@ -525,7 +541,7 @@ pub async fn hollow_snapshot(repo_id: &str, root: &Path) -> Result<PathBuf> {
             }
             std::fs::rename(&fresh, &target)?;
             weights += 1;
-        } else if HOLLOW_WHOLE.iter().any(|p| glob_match(p, &entry.path))
+        } else if HOLLOW_WHOLE.iter().any(|p| glob_match(p, file))
             && entry.size <= HOLLOW_WHOLE_LIMIT
         {
             if std::fs::metadata(&target).is_ok_and(|m| m.len() == entry.size) {
@@ -544,7 +560,10 @@ pub async fn hollow_snapshot(repo_id: &str, root: &Path) -> Result<PathBuf> {
         }
     }
     if weights == 0 {
-        bail!("{repo_id}@{sha} holds no model*.safetensors at its top; pie reads no other");
+        bail!(
+            "{repo_id}@{sha} holds no model*.safetensors at its top or in a component folder; \
+             pie reads no other"
+        );
     }
     Ok(dir)
 }

@@ -6,7 +6,8 @@
 writes crates/poem-compiler/tests/poem_compiler/adopted/<id>.json, which
 `every_adopting_family_reproduces_its_listed_models` adopts and compares,
 trace for trace, with the model the catalog lists under that id. Reads
-HF_TOKEN for gated repositories; fetches nothing but two small JSON files.
+HF_TOKEN for gated repositories; fetches nothing but small JSON files (for a
+diffusers pipeline, model_index.json and each component's config.json).
 """
 
 import json
@@ -18,6 +19,38 @@ import urllib.request
 
 FIXTURES = pathlib.Path(__file__).resolve().parents[2] / "crates/poem-compiler/tests/poem_compiler/adopted"
 SPECIAL = ("bos_token", "eos_token", "pad_token", "unk_token")
+
+# A diffusers component's tensors are prefixed by its role, as
+# crates/checkpoint/src/file/diffusers.rs `prefix_of` names it.
+ROLES = {
+    "transformer": "dit",
+    "transformer_2": "dit2",
+    "text_encoder": "te",
+    "text_encoder_2": "te2",
+    "vae": "vae",
+    "video_vae": "vae",
+    "image_encoder": "ie",
+    "audio_vae": "avae",
+    "vocoder": "voc",
+}
+
+
+def pipeline_config(repo: str, index: dict) -> dict:
+    """A pipeline's configuration as `pie model adopt` hands it to a hook:
+    each weighted component's config.json under its role, beside the index."""
+    out = {"pipeline": index}
+    scheduler = fetch(repo, "scheduler/scheduler_config.json")
+    if scheduler is not None:
+        out["scheduler"] = scheduler
+    for folder, entry in index.items():
+        if folder.startswith("_") or not isinstance(entry, list) or folder == "scheduler":
+            continue
+        if folder.startswith("tokenizer") or folder.startswith("feature_"):
+            continue
+        config = fetch(repo, f"{folder}/config.json")
+        if config is not None:
+            out[ROLES.get(folder, folder)] = config
+    return out
 
 
 def fetch(repo: str, file: str):
@@ -46,21 +79,43 @@ def special_tokens(tokenizer_config) -> dict:
     return out
 
 
+def finite(value):
+    """`value` as JSON can hold it: Python's Infinity as the largest double,
+    NaN as null, as `pie model adopt` reads them."""
+    if isinstance(value, float):
+        if value != value:
+            return None
+        if value in (float("inf"), float("-inf")):
+            return 1.7976931348623157e308 if value > 0 else -1.7976931348623157e308
+        return value
+    if isinstance(value, dict):
+        return {k: finite(v) for k, v in value.items()}
+    if isinstance(value, list):
+        return [finite(v) for v in value]
+    return value
+
+
 def main() -> None:
     if len(sys.argv) != 3:
         sys.exit(__doc__)
     repo, model_id = sys.argv[1:]
-    config = fetch(repo, "config.json")
+    index = fetch(repo, "model_index.json")
+    if index is not None:
+        config = pipeline_config(repo, index)
+        tokenizer = fetch(repo, "tokenizer/tokenizer_config.json")
+    else:
+        config = fetch(repo, "config.json")
+        tokenizer = fetch(repo, "tokenizer_config.json")
     if config is None:
         sys.exit(f"{repo} has no config.json")
     fixture = {
         "source": repo,
         "config": config,
-        "special": special_tokens(fetch(repo, "tokenizer_config.json")),
+        "special": special_tokens(tokenizer),
     }
     FIXTURES.mkdir(parents=True, exist_ok=True)
     path = FIXTURES / f"{model_id}.json"
-    path.write_text(json.dumps(fixture, indent=2, sort_keys=True) + "\n")
+    path.write_text(json.dumps(finite(fixture), indent=2, sort_keys=True, allow_nan=False) + "\n")
     print(path)
 
 
