@@ -239,7 +239,11 @@ impl Body {
 
     fn int_binary(&mut self, op: &str, a: V, b: V, flags: bool) -> Built<V> {
         let t = self.ty(a).clone();
-        if &t != self.ty(b) || !matches!(t, MTy::I32 | MTy::Index | MTy::I1) {
+        let int = match &t {
+            MTy::Vector(_, e) => matches!(e, Elem::I32 | Elem::Pred),
+            t => matches!(t, MTy::I32 | MTy::Index | MTy::I1),
+        };
+        if &t != self.ty(b) || !int {
             return bad(format!("{op} over {t} and {}", self.ty(b)));
         }
         let attrs = if flags {
@@ -280,16 +284,25 @@ impl Body {
         if self.ty(a) != self.ty(b) {
             return bad(format!("cmpi over {} and {}", self.ty(a), self.ty(b)));
         }
+        let out = self.mask_of(a);
         Ok(self.op1(
             "arith.cmpi",
             &[a, b],
             &format!("predicate = {} : i64", p as i64),
-            MTy::I1,
+            out,
         ))
     }
 
+    /// The i1 type shaped like `v`.
+    fn mask_of(&self, v: V) -> MTy {
+        match self.ty(v) {
+            MTy::Vector(d, _) => MTy::Vector(d.clone(), Elem::Pred),
+            _ => MTy::I1,
+        }
+    }
+
     pub fn select(&mut self, c: V, a: V, b: V) -> Built<V> {
-        if self.ty(a) != self.ty(b) || self.ty(c) != &MTy::I1 {
+        if self.ty(a) != self.ty(b) || self.ty(c) != &self.mask_of(a) {
             return bad("select over mismatched operands");
         }
         let t = self.ty(a).clone();
@@ -399,8 +412,93 @@ impl Body {
     /// A float vector of `x` everywhere.
     pub fn splat_f(&mut self, dims: &[i64], elem: Elem, x: f64) -> Built<V> {
         let t = MTy::Vector(dims.to_vec(), elem);
-        let lit = format!("dense<{x:.9e}> : {t}");
+        let lit = format!("dense<{}> : {t}", float_lit(x, elem)?);
         Ok(self.op1("arith.constant", &[], &format!("value = {lit}"), t))
+    }
+
+    /// `v` (a scalar or a vector) broadcast to `dims` (`vector.broadcast`:
+    /// a vector's unit axes stretch).
+    pub fn broadcast(&mut self, v: V, dims: &[i64]) -> Built<V> {
+        let elem = match self.ty(v) {
+            MTy::I32 => Elem::I32,
+            MTy::Vector(d, e) if d.len() == dims.len() => *e,
+            t => return bad(format!("broadcast of {t} to {dims:?}")),
+        };
+        Ok(self.op1(
+            "vector.broadcast",
+            &[v],
+            "",
+            MTy::Vector(dims.to_vec(), elem),
+        ))
+    }
+
+    /// The i32 index along `axis` of a `dims` vector (`tpu.iota`).
+    pub fn iota(&mut self, dims: &[i64], axis: usize) -> V {
+        self.op1(
+            "tpu.iota",
+            &[],
+            &format!("dimensions = array<i32: {axis}>"),
+            MTy::Vector(dims.to_vec(), Elem::I32),
+        )
+    }
+
+    /// `v` reshaped to `dims`, its elements in order (`vector.shape_cast`).
+    pub fn shape_cast(&mut self, v: V, dims: &[i64]) -> Built<V> {
+        let (d, e) = self.vec_of(v)?;
+        if d.iter().product::<i64>() != dims.iter().product::<i64>() {
+            return bad(format!("shape_cast of {d:?} to {dims:?}"));
+        }
+        Ok(self.op1("vector.shape_cast", &[v], "", MTy::Vector(dims.to_vec(), e)))
+    }
+
+    /// The maximum (`max`) or sum of a 2-d f32 vector along axis 1, kept as
+    /// `[rows, 1]` (`vector.multi_reduction`).
+    pub fn reduce_rows(&mut self, v: V, max: bool) -> Built<V> {
+        let (d, e) = self.vec_of(v)?;
+        if d.len() != 2 || e != Elem::F32 {
+            return bad(format!("a row reduction of {}", self.ty(v)));
+        }
+        let init = self.splat_f(&[d[0]], e, if max { f64::NEG_INFINITY } else { 0.0 })?;
+        let kind = if max { "maximumf" } else { "add" };
+        let r = self.op1(
+            "vector.multi_reduction",
+            &[v, init],
+            &format!("kind = #vector.kind<{kind}>, reduction_dims = array<i64: 1>"),
+            MTy::Vector(vec![d[0]], e),
+        );
+        self.shape_cast(r, &[d[0], 1])
+    }
+
+    /// `e^v` elementwise.
+    pub fn exp(&mut self, v: V) -> Built<V> {
+        let t = self.ty(v).clone();
+        if !matches!(&t, MTy::Vector(_, e) if e.is_float()) {
+            return bad(format!("exp of {t}"));
+        }
+        Ok(self.op1("math.exp", &[v], "fastmath = #arith.fastmath<none>", t))
+    }
+
+    /// `ln v` elementwise.
+    pub fn log(&mut self, v: V) -> Built<V> {
+        let t = self.ty(v).clone();
+        if !matches!(&t, MTy::Vector(_, e) if e.is_float()) {
+            return bad(format!("log of {t}"));
+        }
+        Ok(self.op1("math.log", &[v], "fastmath = #arith.fastmath<none>", t))
+    }
+
+    /// `a > b` elementwise (ordered).
+    pub fn gtf(&mut self, a: V, b: V) -> Built<V> {
+        if self.ty(a) != self.ty(b) {
+            return bad(format!("cmpf over {} and {}", self.ty(a), self.ty(b)));
+        }
+        let out = self.mask_of(a);
+        Ok(self.op1(
+            "arith.cmpf",
+            &[a, b],
+            "fastmath = #arith.fastmath<none>, predicate = 2 : i64",
+            out,
+        ))
     }
 
     fn vec_of(&self, v: V) -> Built<(Vec<i64>, Elem)> {
@@ -441,6 +539,18 @@ impl Body {
 
     pub fn mulf(&mut self, a: V, b: V) -> Built<V> {
         self.float_binary("arith.mulf", a, b)
+    }
+
+    pub fn subf(&mut self, a: V, b: V) -> Built<V> {
+        self.float_binary("arith.subf", a, b)
+    }
+
+    pub fn maxf(&mut self, a: V, b: V) -> Built<V> {
+        self.float_binary("arith.maximumf", a, b)
+    }
+
+    pub fn divf(&mut self, a: V, b: V) -> Built<V> {
+        self.float_binary("arith.divf", a, b)
     }
 
     /// `acc + lhs · rhs` over 2-d vectors, contracting `lhs`'s axis 1 with
@@ -558,6 +668,8 @@ pub struct Kernel {
     /// The scoped VMEM the kernel may use (the compiler's default is
     /// 32 MiB on v6e).
     pub vmem_limit: Option<u64>,
+    /// VMEM buffers that live across the grid's steps (Pallas's scratch).
+    pub scratch: Vec<(Vec<i64>, Elem)>,
 }
 
 /// What the kernel body gets: the grid and one VMEM block per operand and
@@ -566,6 +678,7 @@ pub struct Blocks {
     pub grid: Grid,
     pub ins: Vec<V>,
     pub outs: Vec<V>,
+    pub scratch: Vec<V>,
 }
 
 /// A kernel ready to call from StableHLO.
@@ -634,10 +747,16 @@ impl Kernel {
         let mut args = grid_tys.clone();
         args.extend(pre_tys.iter().cloned());
         args.extend(block_tys.iter().cloned());
+        args.extend(
+            self.scratch
+                .iter()
+                .map(|(d, e)| MTy::Ref(d.clone(), *e, Space::Vmem)),
+        );
         let (mut b, vs) = Body::new(&args);
         let (g, rest) = vs.split_at(grid_tys.len());
         let (p, rest) = rest.split_at(pre_tys.len());
-        let (ins, outs) = rest.split_at(self.ins.len());
+        let (ins, rest) = rest.split_at(self.ins.len());
+        let (outs, scratch) = rest.split_at(self.outs.len());
         let blocks = Blocks {
             grid: Grid {
                 ids: g.to_vec(),
@@ -645,6 +764,7 @@ impl Kernel {
             },
             ins: ins.to_vec(),
             outs: outs.to_vec(),
+            scratch: scratch.to_vec(),
         };
         body(&mut b, &blocks)?;
         b.ret(&[]);
@@ -700,10 +820,11 @@ impl Kernel {
         let _ = writeln!(
             s,
             "  }}) {{dimension_semantics = [{sems}], function_type = {}, iteration_bounds = \
-             array<i64: {bounds}>, scalar_prefetch = {} : i64, scratch_operands = 0 : i64, sym_name \
+             array<i64: {bounds}>, scalar_prefetch = {} : i64, scratch_operands = {} : i64, sym_name \
              = \"{}\", tpu.core_type = #tpu.core_type<tc>, window_params = [{windows}]}} : () -> ()",
             fty(&args, &[]),
             self.prefetch.len(),
+            self.scratch.len(),
             self.name
         );
 
@@ -767,6 +888,21 @@ impl Kernel {
             results,
         })
     }
+}
+
+/// A float literal as MLIR spells it (infinities by their bits).
+fn float_lit(x: f64, elem: Elem) -> Built<String> {
+    if x.is_finite() {
+        return Ok(format!("{x:.9e}"));
+    }
+    let neg = x < 0.0;
+    Ok(match elem {
+        Elem::F32 if neg => "0xFF800000".into(),
+        Elem::F32 => "0x7F800000".into(),
+        Elem::Bf16 if neg => "0xFF80".into(),
+        Elem::Bf16 => "0x7F80".into(),
+        e => return bad(format!("an infinity of {e:?}")),
+    })
 }
 
 fn write_func(s: &mut String, args: &[MTy], body: &str) {
@@ -876,6 +1012,7 @@ mod tests {
                 index: Box::new(|b: &mut Body, g: &Grid| Ok(vec![g.ids[0], b.i32(0)])),
             }],
             vmem_limit: None,
+            scratch: vec![],
         };
         let c = k
             .build(|b, blk| {

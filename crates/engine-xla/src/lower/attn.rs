@@ -11,15 +11,27 @@ use crate::emit::Ctx;
 use crate::handle::Paged;
 use crate::handle::{KvPool, Tensor};
 use kernels_xla::Error;
+use kernels_xla::hlo::Val;
 
 use super::lower;
 
 /// A paged attention over `pool`: `o`, and the `lse` when it has one.
 pub fn attend(ctx: &Ctx<'_>, call: Paged, pool: KvPool) -> Result<(), Error> {
+    attend_fresh(ctx, call, pool, None)
+}
+
+/// [`attend`], given what this fire appended to the pool
+/// (`paged::attend_fresh`).
+pub fn attend_fresh(
+    ctx: &Ctx<'_>,
+    call: Paged,
+    pool: KvPool,
+    appended: Option<[Val; 4]>,
+) -> Result<(), Error> {
     lower(ctx, |l| {
         let (call_v, pool_v) = call.try_map(&pool, |t| l.read(t))?;
         let tuning = l.tuning();
-        let (o, lse) = paged::attend(l.f(), call_v, pool_v, tuning)?;
+        let (o, lse) = paged::attend_fresh(l.f(), call_v, pool_v, tuning, appended)?;
         l.land(call.o, o)?;
         if let (Some(t), Some(v)) = (call.lse, lse) {
             l.land(t, v)?;
@@ -165,7 +177,8 @@ pub fn kv_append(
     pool: &KvPool,
     write_page: Tensor,
     write_offset: Tensor,
-) -> Result<(), Error> {
+) -> Result<[Val; 4], Error> {
+    let mut read = None;
     lower(ctx, |l| {
         let wp = l.read(write_page)?;
         let wo = l.read(write_offset)?;
@@ -173,9 +186,13 @@ pub fn kv_append(
         let keys = l.read(pool.keys)?;
         let vv = l.read(v)?;
         let values = l.read(pool.values)?;
+        read = Some([kv.val, vv.val, wp.val, wo.val]);
         let (keys, values) = paged::kv_append(l.f(), kv, vv, keys, values, pool, wp, wo)?;
         l.land(pool.keys, keys)?;
         l.land(pool.values, values)
+    })?;
+    read.ok_or(Error::Unsupported {
+        op: "attn.kv_append",
     })
 }
 

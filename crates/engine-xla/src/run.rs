@@ -177,6 +177,11 @@ pub struct Run<'c> {
     /// than the budget, so `attn.index_topk` answers each row all of them,
     /// in order.
     pub(crate) full_selections: Vec<(ValueId, u32)>,
+
+    /// What this fire appended to each kv cache, as the append read it:
+    /// `[k, v, write_page, write_offset]` (a prefill reads its own keys
+    /// from them, `attn::paged::attend_fresh`).
+    pub(crate) appended: Vec<(ValueId, [kernels_xla::hlo::Val; 4])>,
 }
 
 impl<'c> Run<'c> {
@@ -211,6 +216,7 @@ impl<'c> Run<'c> {
             probed: std::cell::RefCell::new(Vec::new()),
             readout_rowed: (std::sync::Arc::new(Vec::new()), None),
             full_selections: Vec::new(),
+            appended: Vec::new(),
         }
     }
 

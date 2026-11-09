@@ -298,7 +298,12 @@ impl Run<'_> {
                     self.tensor(*o),
                     self.requests(),
                 )?;
-                crate::lower::attn::attend(self.ctx(), call, pool)
+                let appended = self
+                    .appended
+                    .iter()
+                    .find(|(c, _)| c == cache)
+                    .map(|&(_, read)| read);
+                crate::lower::attn::attend_fresh(self.ctx(), call, pool, appended)
             }
 
             Attn::ReplayFloor {
@@ -739,14 +744,19 @@ impl Run<'_> {
                 cache,
                 write_page,
                 write_offset,
-            } => crate::lower::attn::kv_append(
-                self.ctx(),
-                self.tensor(*k),
-                self.tensor(*v),
-                self.pool(*cache),
-                self.tensor(*write_page),
-                self.tensor(*write_offset),
-            ),
+            } => {
+                let read = crate::lower::attn::kv_append(
+                    self.ctx(),
+                    self.tensor(*k),
+                    self.tensor(*v),
+                    self.pool(*cache),
+                    self.tensor(*write_page),
+                    self.tensor(*write_offset),
+                )?;
+                self.appended.retain(|(c, _)| c != cache);
+                self.appended.push((*cache, read));
+                Ok(())
+            }
             Attn::KvAppend {
                 k: plane,
                 v: None,

@@ -1660,6 +1660,20 @@ pub fn attend(
     pool: KvPool<Operand>,
     tuning: Tuning,
 ) -> Result<(Val, Option<Val>), Error> {
+    attend_fresh(f, call, pool, tuning, None)
+}
+
+/// [`attend`], given what this fire appended to the pool before it:
+/// `[k, v, write_page, write_offset]` as the append read them. A plain
+/// causal prefill then reads its own segment's keys from those rows
+/// (`fresh`) and only the older keys from the pool.
+pub fn attend_fresh(
+    f: &mut Func,
+    call: Paged<Operand, Landing>,
+    pool: KvPool<Operand>,
+    tuning: Tuning,
+    appended: Option<[Val; 4]>,
+) -> Result<(Val, Option<Val>), Error> {
     let pool = &pool;
     let op = call.op;
     expect(op, call.q, &[Dtype::Bf16])?;
@@ -1815,6 +1829,54 @@ pub fn attend(
         (true, None) => causal_hi,
     };
     let hi = f.max(hi, lo)?;
+    // The fire's own keys: each row reads its segment's rows `[first, r]`
+    // fresh, and the pool only below the segment's first position. Rows
+    // the append did not file at their own lane and position turn it off.
+    let appended = appended.filter(|kv| {
+        walk == Walk::Blocked
+            && call.causal
+            && enabled.is_none()
+            && call.selection.is_none()
+            && call.rel.is_none()
+            && call.lse.is_none()
+            && kv.iter().all(|&x| f.dims(x)[0] == r)
+            && super::fresh::fits(r, &heads, tuning.vmem_cap())
+    });
+    let (hi, fresh) = match appended {
+        Some([k, v, wp, wo]) => {
+            let wp = flat_i32(f, wp)?;
+            let wo = flat_i32(f, wo)?;
+            let sink = f.dims(keys)[0] / geom.ps - 1;
+            let alone = cmp_i(f, Cmp::Ge, wp, sink)?;
+            let lane_at = with_i(f, lane, geom.pages, Func::mul)?;
+            let pix = with_i(f, qpos, geom.ps, Func::div)?;
+            let pix = clamp_i(f, pix, 0, geom.pages - 1)?;
+            let at = f.add(lane_at, pix)?;
+            let page = take(f, geom.pt, at)?;
+            let off = with_i(f, qpos, geom.ps, Func::rem)?;
+            let same_page = f.compare(Cmp::Eq, page, wp)?;
+            let same_off = f.compare(Cmp::Eq, off, wo)?;
+            let filed = f.and(same_page, same_off)?;
+            let filed = f.or(filed, alone)?;
+            let all = f.reduce(filed, &[0], Fold::And)?;
+            let all = f.broadcast(all, &[r], &[])?;
+            let (start, p0) = super::fresh::segments(f, req, qpos, alone)?;
+            let own = f.iota(Elem::I32, &[r], 0);
+            let first = if window > 0 {
+                let w = with_i(f, own, window - 1, Func::sub)?;
+                f.max(start, w)?
+            } else {
+                start
+            };
+            let none = with_i(f, own, 1, Func::add)?;
+            let first = f.select(all, first, none)?;
+            let below = f.min(hi, p0)?;
+            let below = f.max(below, lo)?;
+            let hi = f.select(all, below, hi)?;
+            (hi, Some((k, v, first)))
+        }
+        None => (hi, None),
+    };
     let mut rule = Rule {
         bound: i64::from(t.mask_stride),
         window: (window > 0).then_some(window),
@@ -1920,6 +1982,15 @@ pub fn attend(
             ch,
         )?,
         _ => per_row(f, &planes, &heads, &rule, &rs, KeyList::Range, scale, ch)?,
+    };
+    let flashed = match fresh {
+        Some((k, v, first)) => {
+            let qb = f.convert(q4, Elem::Bf16);
+            let (o, lse) =
+                super::fresh::attend(f, qb, k, v, first, &heads, scale, tuning.vmem_cap())?;
+            super::fresh::fold(f, flashed, o, lse)?
+        }
+        None => flashed,
     };
     let lse = match call.lse {
         Some(_) => Some(flashed.lse2(f)?),

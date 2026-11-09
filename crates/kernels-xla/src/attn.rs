@@ -1,5 +1,6 @@
 pub mod arbiter;
 pub mod dense;
+pub(crate) mod fresh;
 pub mod index;
 pub mod merge;
 pub mod mla;
