@@ -72,6 +72,7 @@ impl Shell {
             rows,
             held_pages: 0,
         };
+        let hybrid = self.has_state();
         let mut shapes: Vec<Vec<Want>> = Vec::new();
         let mut pages = pad.rung(pad.page_floor).min(cap);
         while pages <= cap {
@@ -117,8 +118,15 @@ impl Shell {
         {
             shapes.push(vec![fresh(prefill, b)]);
             shapes.push(vec![fresh(prefill, b - 1)]);
-            for n in [4u32, 8] {
-                if b >= 64 && n <= lanes_cap {
+            for n in [4u32, 8, 16, 32, 64] {
+                // A hybrid's prompts, cut at their last whole page, fire many
+                // and short.
+                let shown = if hybrid {
+                    b / n >= 2
+                } else {
+                    n <= 8 && b >= 64
+                };
+                if shown && n <= lanes_cap {
                     // `n - 1` lanes and the padding lane the rest takes (two
                     // or three lanes pad to four).
                     shapes.push(vec![fresh(prefill, b / n); (n - 1) as usize]);
@@ -130,8 +138,11 @@ impl Shell {
         // padding rung, which a full fire's decode pads overflow into.
         let host = pad.mixed_host_rung;
         let top = *buckets.last().unwrap_or(&widest);
+        // A hybrid fires a prompt's tail behind its last whole page beside
+        // the decodes: its mixed fires take every row rung.
+        let least = if hybrid { pad.prefill_floor } else { 256 };
         for &d in buckets.iter().filter(|&&d| d <= lanes_cap) {
-            for &b in buckets.iter().filter(|&&b| b >= 256 && b >= 2 * d) {
+            for &b in buckets.iter().filter(|&&b| b >= least && b >= 2 * d) {
                 let rows = if b == top {
                     // A full fire: the runtime's widest rows, decodes and all.
                     widest.saturating_sub(d)
