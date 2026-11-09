@@ -75,6 +75,45 @@ pub struct Stages {
     /// Stage executions and lanes they carried, for the tally.
     pub runs: u64,
     pub lanes: u64,
+    /// The most lanes a fire seats: a stage first seen compiles for every
+    /// lane rung up to it, side by side.
+    pub top: u32,
+}
+
+/// A rung's stage as a compile thread leaves it.
+type Built = std::sync::Mutex<Option<Result<Arc<Staged>, String>>>;
+
+/// Stage `at` of `package` lowered for `batch` and compiled.
+fn stage(
+    device: &Device,
+    package: &LaunchPackage,
+    at: usize,
+    batch: Batch,
+    carried: &[u32],
+) -> Result<Arc<Staged>, String> {
+    let lowered = lower::lower(package, at, batch, carried).map_err(|why| why.to_string())?;
+    if !lowered.text.is_empty()
+        && let Some(path) = std::env::var_os("PIE_XLA_DUMP_GUEST")
+    {
+        let _ = std::fs::write(path, &lowered.text);
+    }
+    let program = if !lowered.layout.runs() {
+        None
+    } else {
+        let sig = crate::trace::Signature {
+            params: Vec::new(),
+            results: Vec::new(),
+        };
+        Some(
+            device
+                .program(&lowered.text, sig)
+                .map_err(|e| format!("stage {at} did not compile: {e}"))?,
+        )
+    };
+    Ok(Arc::new(Staged {
+        program,
+        layout: lowered.layout,
+    }))
 }
 
 impl Stages {
@@ -91,31 +130,62 @@ impl Stages {
         if let Some(hit) = self.map.get(&slot) {
             return Ok(Arc::clone(hit));
         }
-        let lowered = lower::lower(package, at, batch, carried).map_err(|why| why.to_string())?;
-        if !lowered.text.is_empty()
-            && let Some(path) = std::env::var_os("PIE_XLA_DUMP_GUEST")
-        {
-            let _ = std::fs::write(path, &lowered.text);
+        // A stage first seen compiles for every lane rung up to the fire's
+        // widest, side by side: a group grows a lane at a time, and each rung
+        // it reached compiled in its own turn (v6e gpt-oss c256 on a fresh
+        // VM: 26 stage programs at 1.4 s each, 35 s of a 70 s run).
+        let top = padded(self.top as usize).max(batch.lanes);
+        let mut rungs: Vec<u32> =
+            std::iter::successors(Some(1u32), |&r| (r < top).then(|| r.saturating_mul(2)))
+                .collect();
+        if !rungs.contains(&batch.lanes) {
+            rungs.push(batch.lanes);
         }
-        let program = if !lowered.layout.runs() {
-            None
-        } else {
-            let sig = crate::trace::Signature {
-                params: Vec::new(),
-                results: Vec::new(),
-            };
-            Some(
-                device
-                    .program(&lowered.text, sig)
-                    .map_err(|e| format!("stage {at} did not compile: {e}"))?,
-            )
-        };
-        let staged = Arc::new(Staged {
-            program,
-            layout: lowered.layout,
+        let threads = std::thread::available_parallelism()
+            .map_or(1, |n| n.get())
+            .clamp(1, rungs.len().min(8));
+        let next = std::sync::atomic::AtomicUsize::new(0);
+        let built: Vec<Built> = rungs.iter().map(|_| std::sync::Mutex::new(None)).collect();
+        std::thread::scope(|scope| {
+            for _ in 0..threads {
+                scope.spawn(|| {
+                    loop {
+                        let i = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        let Some(&lanes) = rungs.get(i) else {
+                            break;
+                        };
+                        let rung = Batch {
+                            lanes,
+                            reads: batch.reads.clone(),
+                        };
+                        let staged = stage(device, package, at, rung, carried);
+                        if let Ok(mut slot) = built[i].lock() {
+                            *slot = Some(staged);
+                        }
+                    }
+                });
+            }
         });
-        self.map.insert(slot, Arc::clone(&staged));
-        Ok(staged)
+        let mut asked = None;
+        for (lanes, built) in rungs.into_iter().zip(built) {
+            let Ok(staged) = built.into_inner().expect("a built rung").ok_or(()) else {
+                continue;
+            };
+            let staged = match staged {
+                Ok(staged) => staged,
+                Err(why) if lanes == batch.lanes => return Err(why),
+                Err(_) => continue,
+            };
+            let rung = Batch {
+                lanes,
+                reads: batch.reads.clone(),
+            };
+            if lanes == batch.lanes {
+                asked = Some(Arc::clone(&staged));
+            }
+            self.map.insert((key, at, rung, carried.to_vec()), staged);
+        }
+        asked.ok_or_else(|| format!("stage {at} did not compile for {} lanes", batch.lanes))
     }
 
     #[must_use]
