@@ -21,7 +21,13 @@ fn rect(x: u32, y: u32, w: u32, h: u32) -> Rect {
 
 /// A copy of `words` (n a PE) into `sym` over the rectangle `[x, y, w, h]`
 /// (none if empty).
-pub(super) fn put(d: &mut dyn Device, sym: &str, [x, y, w, h]: [u32; 4], words: &[u32], b16: bool) -> R<()> {
+pub(super) fn put(
+    d: &mut dyn Device,
+    sym: &str,
+    [x, y, w, h]: [u32; 4],
+    words: &[u32],
+    b16: bool,
+) -> R<()> {
     if w * h == 0 {
         return Ok(());
     }

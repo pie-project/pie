@@ -150,8 +150,13 @@ pub struct SplitModel {
     eps: f32,
     /// Prompt rows forced through the token loop (`PIE_CEREBRAS_SPLIT_FORCE=1`).
     force: bool,
-    /// Unit 0's top row (Gemma's units sit off the origin).
+    /// The head control root (ring, force, nforce).
+    root: (u32, u32),
+    /// Unit 0's top row (Gemma's and gpt-oss's units sit off the origin).
     x_y0: u32,
+    /// gpt-oss: the head band (its control row's x0, y, count) and lm_head's prescale (`lgt` = 2^15 logits).
+    band: Option<(u32, u32, u32)>,
+    hscale: f32,
     /// Gemma 4: the per-layer-input words of a launch's first token, its softcap.
     gemma: Option<GemmaPle>,
 }
@@ -230,6 +235,9 @@ fn f16_to_f32(h: u16) -> f32 {
 impl SplitModel {
     /// Places the prep on `dev` (a loaded, running program) and runs init.
     pub fn open(mut dev: Box<dyn Device>, spec: &SplitSpec, vocab: usize) -> R<SplitModel> {
+        if spec.int("NEX").is_some() {
+            return SplitModel::open_gptoss(dev, spec, vocab);
+        }
         if let Some(name) = spec.meta.get("geo").and_then(|v| v.as_str()) {
             return SplitModel::open_gemma(dev, spec, vocab, &name.to_string());
         }
@@ -294,8 +302,11 @@ impl SplitModel {
                 .and_then(|v| v.as_f64())
                 .unwrap_or(1e-6) as f32,
             hctl: g.hx0 + g.hxc,
-            hemb,
+            root: (g.hx0 + g.hxc, g.p.hr / 2),
             x_y0: 0,
+            band: None,
+            hscale: 1.0,
+            hemb,
             gemma: None,
         })
     }
@@ -408,9 +419,89 @@ impl SplitModel {
                 .and_then(|v| v.as_f64())
                 .unwrap_or(1e-6) as f32,
             hctl: g.hx0 + g.hxc,
+            root: (g.hx0 + g.hxc, g.p.hr / 2),
+            band: None,
+            hscale: 1.0,
             hemb,
             x_y0: u0.1,
             gemma: Some(gemma),
+            dev,
+        })
+    }
+
+    /// gpt-oss (`tools/split/gptoss`, the README's gpt-oss section): the geometry the meta names
+    /// (geo/gptoss.rs), placed (place_gptoss.rs).
+    fn open_gptoss(mut dev: Box<dyn Device>, spec: &SplitSpec, vocab: usize) -> R<SplitModel> {
+        let name = spec
+            .meta
+            .get("geo")
+            .and_then(|v| v.as_str())
+            .ok_or("split gpt-oss meta: no geo")?
+            .to_string();
+        let tiny = name == "tiny";
+        let t0 = std::time::Instant::now();
+        let mut gg = geo::gptoss::GptossGeo::new(
+            &name,
+            spec.int("G2").unwrap_or(if tiny { 2 } else { 16 }),
+            spec.int("G2W").unwrap_or(if tiny { 2 } else { 24 }),
+            true,
+        )?;
+        gg.build()?;
+        tracing::info!(
+            ms = t0.elapsed().as_millis() as u64,
+            w = gg.w,
+            h = gg.h,
+            "split gpt-oss: geometry built"
+        );
+        let t1 = std::time::Instant::now();
+        place_gptoss::place(dev.as_mut(), &gg, spec)?;
+        tracing::info!(s = t1.elapsed().as_secs_f64(), "split gpt-oss: placed");
+        dev.call("init", &[]).map_err(|e| format!("init: {e}"))?;
+        dev.get(
+            "rcfg",
+            Rect {
+                x: 0,
+                y: 0,
+                w: gg.w as i32,
+                h: gg.h as i32,
+            },
+            1,
+        )?;
+        let g = &gg.g;
+        let u0 = g.unit_origin(0);
+        let ul = g.unit_origin(g.units() - 1);
+        let yc = gg.hb0 + gg.hxc;
+        Ok(SplitModel {
+            vocab: spec.int("V").map_or(vocab, |v| vocab.min(v as usize)),
+            hidden: spec.need("HR")? as usize,
+            cap: spec.int("CAP").unwrap_or(256) as usize,
+            positions: (spec.int("NE").unwrap_or(128) * g.p.py) as usize,
+            fed: Vec::new(),
+            launches: 0,
+            steps: 0,
+            wl: true,
+            hr: g.p.py,
+            hc: gg.hvc,
+            vr: spec.need("VR")?,
+            hdc: g.p.hcc,
+            hcc: g.p.hcc,
+            py: g.p.py,
+            yc: g.yc,
+            x_cx: u0.0 + g.xc,
+            last_cx: (ul.0 + g.xc, ul.1),
+            force: std::env::var("PIE_CEREBRAS_SPLIT_FORCE").is_ok_and(|v| v == "1"),
+            eps: 1e-5,
+            hctl: gg.hvc / 2,
+            root: (gg.hvc / 2, yc),
+            x_y0: u0.1,
+            band: Some((0, yc, gg.hvc)),
+            hscale: spec
+                .meta
+                .get("HSCALE")
+                .and_then(|v| v.as_f64())
+                .unwrap_or(32768.0) as f32,
+            hemb: spec.npy("hemb")?,
+            gemma: None,
             dev,
         })
     }
@@ -422,11 +513,35 @@ impl SplitModel {
             return Ok(());
         }
         let words = vec![v; self.hr as usize];
-        self.dev.put("tin", Rect { x: self.hctl as i32, y: 0, w: 1, h: self.hr as i32 }, 1, &words)
+        self.dev.put(
+            "tin",
+            Rect {
+                x: self.hctl as i32,
+                y: 0,
+                w: 1,
+                h: self.hr as i32,
+            },
+            1,
+            &words,
+        )
     }
 
     /// Token `v`'s embedding row (bf16 bits), from the head's tiles.
     pub fn embedding(&self, v: u32) -> R<Vec<u32>> {
+        if let Some((_, _, hvc)) = self.band {
+            // gpt-oss: [dims-row][vocab column][VR][Hc]
+            let (j, k) = (v / self.vr, v % self.vr);
+            let mut out = Vec::with_capacity((self.py * self.hcc) as usize);
+            for i in 0..self.py as usize {
+                self.hemb.words(
+                    ((i * hvc as usize + j as usize) * self.vr as usize + k as usize)
+                        * self.hcc as usize,
+                    self.hcc as usize,
+                    &mut out,
+                )?;
+            }
+            return Ok(out);
+        }
         let (r, j) = (v / self.vr, v % self.vr);
         let per = (self.vr * self.hdc) as usize;
         let mut out = Vec::with_capacity((self.hc * self.hdc) as usize);
@@ -517,8 +632,8 @@ impl SplitModel {
     fn forced(&mut self, tokens: &[u32], start: usize, extra: usize, read: bool) -> R<Vec<u32>> {
         let n = tokens.len();
         let root = Rect {
-            x: self.hctl as i32,
-            y: (self.hr / 2) as i32,
+            x: self.root.0 as i32,
+            y: self.root.1 as i32,
             w: 1,
             h: 1,
         };
@@ -548,8 +663,8 @@ impl SplitModel {
         let ring = self.dev.get(
             "ring",
             Rect {
-                x: self.hctl as i32,
-                y: (self.hr / 2) as i32,
+                x: self.root.0 as i32,
+                y: self.root.1 as i32,
                 w: 1,
                 h: 1,
             },
@@ -613,16 +728,22 @@ impl SplitModel {
         if !logits {
             return Ok((vec![0; tokens.len()], None));
         }
-        let w = self.dev.get(
-            "lgt",
-            Rect {
+        let lr = match self.band {
+            // gpt-oss: the control row, one vocabulary column a PE
+            Some((x0, y, n)) => Rect {
+                x: x0 as i32,
+                y: y as i32,
+                w: n as i32,
+                h: 1,
+            },
+            None => Rect {
                 x: self.hctl as i32,
                 y: 0,
                 w: 1,
                 h: self.hr as i32,
             },
-            self.vr as usize,
-        )?;
+        };
+        let w = self.dev.get("lgt", lr, self.vr as usize)?;
         // `lgt` leaves out the final norm's 1/rms (argmax needs no scale):
         // the rms of the head's input, the last unit's x.
         let hc = self.hcc as usize;
@@ -645,7 +766,7 @@ impl SplitModel {
                 .sum::<f64>();
         }
         let n = (self.py as usize * hc) as f64;
-        let scale = (1.0 / (ss / n + f64::from(self.eps)).sqrt()) as f32;
+        let scale = (1.0 / (ss / n + f64::from(self.eps)).sqrt()) as f32 / self.hscale;
         let mut l: Vec<f32> = w.into_iter().map(|b| f32::from_bits(b) * scale).collect();
         // the head's padded rows (ids >= vocab) never reach sampling or the argmax
         l.truncate(self.vocab);
@@ -682,5 +803,6 @@ pub fn is_split(program: &Path) -> bool {
         && std::fs::read_to_string(program.join("out.json")).is_ok_and(|s| {
             (s.contains("\"UNX\"") && s.contains("\"UNY\""))
                 || (s.contains("\"NTW\"") && s.contains("\"Ic1\"")) // Gemma's layout (mkfull_gemma.py)
+                || (s.contains("\"NEX\"") && s.contains("\"QO\"")) // gpt-oss's (mkfull_gptoss.py)
         })
 }

@@ -36,7 +36,13 @@ pub fn place(d: &mut dyn Device, gg: &GemmaGeo, spec: &SplitSpec) -> R<()> {
             while rb < r1 {
                 let re = (rb + 16).min(r1);
                 let blk = wu.block(None, (rb as usize, re as usize), (c0 as usize, c1 as usize))?;
-                put(d, "w", [x0, y0u + g.wl(rb, yc), c1 - c0, re - rb], &blk, true)?;
+                put(
+                    d,
+                    "w",
+                    [x0, y0u + g.wl(rb, yc), c1 - c0, re - rb],
+                    &blk,
+                    true,
+                )?;
                 rb = re;
             }
         }
