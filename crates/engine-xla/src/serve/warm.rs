@@ -272,6 +272,16 @@ impl Shell {
                         }
                         let program = device.program(text, (*sig).clone());
                         running.fetch_sub(1, SeqCst);
+                        if std::env::var("PIE_XLA_WARM_DROP").is_ok_and(|v| v == "1") {
+                            drop(program);
+                            device.forget(text);
+                            #[cfg(target_os = "linux")]
+                            // SAFETY: `malloc_trim` only releases free heap pages.
+                            unsafe {
+                                libc::malloc_trim(0);
+                            }
+                            continue;
+                        }
                         #[cfg(target_os = "linux")]
                         // SAFETY: `malloc_trim` only releases free heap pages.
                         unsafe {
