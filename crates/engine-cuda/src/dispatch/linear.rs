@@ -1739,7 +1739,10 @@ impl Run<'_> {
             if gate_add.is_some() || normed.is_some() {
                 return Ok(false);
             }
-            let (Some((x, routes, up_y, up, _)), Some((down_x, down_routes, down_y, down, _))) =
+            let (
+                Some((x, routes, up_y, up, up_experts)),
+                Some((down_x, down_routes, down_y, down, down_experts)),
+            ) =
                 (self.routed_bank(select), self.routed_bank(down))
             else {
                 return Ok(false);
@@ -1755,7 +1758,8 @@ impl Run<'_> {
             let glu = Glu::SwigluClamp { limit };
             #[rustfmt::skip]
             let m = linear::moe::RoutedMlp { x, up, glu, down, routes, weights, inter: intermediate };
-            return linear::moe::experts_weighted_first(self.ctx(), m, shared, &mut out);
+            let tables = [up_experts, down_experts];
+            return linear::moe::experts_weighted_first(self.ctx(), m, shared, &mut out, tables);
         }
         let (packed, hidden, intermediate, glu) = match *glu {
             Linear::Glu {
@@ -1956,7 +1960,7 @@ impl Run<'_> {
         let mut out = self.tensor(y);
         #[rustfmt::skip]
         let m = linear::moe::RoutedMlp { x, up, glu, down, routes, weights, inter: intermediate };
-        linear::moe::mega(self.ctx(), m, fold, &mut out)
+        linear::moe::mega(self.ctx(), m, fold, &mut out, [up_experts, down_experts])
     }
 
     /// A quantized bank's select of `x`.
