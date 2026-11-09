@@ -705,6 +705,13 @@ pub(crate) fn contract(f: &mut Func, x: Val, p: &Planes, tuning: Tuning) -> Resu
         }
         Form::Tile => {
             let s = tile_factor(f, p.scales.val, n)?;
+            // The grouped-matmul kernel streams the codes and widens them in
+            // VMEM, where a block of the weight fits it.
+            if let Codes::Int(c) = codes
+                && let Some(y) = crate::linear::moe::tile_projection(f, x, c, s, tuning)?
+            {
+                return Ok(y);
+            }
             // The `[G, m, n]` partials of a group-batched dot outgrow the
             // weight past a few rows: then the weight decodes once, each
             // rounded to bf16 as the bf16 deployment holds it.

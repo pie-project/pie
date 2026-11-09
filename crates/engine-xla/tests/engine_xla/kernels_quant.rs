@@ -611,10 +611,16 @@ fn e4m3_value(b: u8) -> f32 {
 
 #[test]
 fn block_fp8_banks_answer_the_host() {
-    // e4m3 codes under one f32 factor a 128x128 block, 200 rows (a partial
-    // block row) of 384 codes: `m` rows group-batched, `big` rows through
-    // the weight decoded once.
-    let (m, big, n, k) = (5usize, 1400usize, 200usize, 384usize);
+    // e4m3 codes under one f32 factor a 128x128 block, 384 codes a row: 256
+    // rows through the grouped-matmul kernel; 200 (a partial block row) in
+    // XLA, `m` rows group-batched, `big` rows through the weight decoded
+    // once.
+    block_fp8_at(256);
+    block_fp8_at(200);
+}
+
+fn block_fp8_at(n: usize) {
+    let (m, big, k) = (5usize, 1400usize, 384usize);
     let (nb, g) = (n.div_ceil(128), k / 128);
     let codes: Vec<u8> = (0..n * k)
         .map(|i| {
@@ -652,7 +658,8 @@ fn block_fp8_banks_answer_the_host() {
         return;
     }
     // Group-batched rows scale exact partials; the decoded weight rounds to
-    // bf16, as the bf16 deployment holds it.
+    // bf16, as the bf16 deployment holds it (and as the kernel rounds it).
+    eprintln!("block fp8, {n} rows");
     assert_close(&b.read_f32(y), &gemm_at(&xs, &w, m, n, k, false), 1e-3, 1e-2);
     assert_close(&b.read_f32(yb), &gemm_ref(&xb, &w, big, n, k), 1e-3, 1e-2);
 }

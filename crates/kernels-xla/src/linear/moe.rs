@@ -1107,9 +1107,12 @@ fn gmm_spec(
     let off = !tuning.moe_gmm();
     // mxfp4 codes as landed (`f4E2M1FN`), their exponents beside them.
     let scaled = mxfp4 && matches!(bank.codes, Codes::E2m1(_)) && elem == Elem::F4E2m1fn;
+    // Block-FP8 codes, their f32 block factors beside them (the codes land
+    // `[K, E·N]`: see engine-xla's `gemm_only`).
+    let tile = elem == Elem::F8E4m3fn && bank.factor.is_some() && matches!(bank.codes, Codes::Int(_));
     if off
-        || (bank.factor.is_some() && !scaled)
-        || !(matches!(bank.codes, Codes::Weights(_)) || scaled)
+        || (bank.factor.is_some() && !scaled && !tile)
+        || !(matches!(bank.codes, Codes::Weights(_)) || scaled || tile)
         || !matches!(
             elem,
             Elem::Bf16 | Elem::F8E5m2 | Elem::F8E4m3fn | Elem::F4E2m1fn
@@ -1134,12 +1137,75 @@ fn gmm_spec(
         n: fan.n,
         experts: e,
         w: elem,
-        orient: Orient::of(e * fan.n, fan.k),
+        orient: if tile {
+            Orient::KMajor
+        } else {
+            Orient::of(e * fan.n, fan.k)
+        },
         scaled,
+        tile,
         bias: false,
         out: Elem::F32,
     };
     spec.out_width().ok().map(|_| spec)
+}
+
+/// `x [m, K] · wᵀ` for block-FP8 codes `codes [N, K]` (landed `[K, N]`)
+/// with their f32 factors a row `factor [N, K/128]`: the grouped-matmul
+/// kernel over one expert, f32 `[m, N]`. `None` when no block of the
+/// weight fits the kernel.
+pub(crate) fn tile_projection(
+    f: &mut Func,
+    x: Val,
+    codes: Val,
+    factor: Val,
+    tuning: Tuning,
+) -> Result<Option<Val>, Error> {
+    use crate::linear::moe_gmm::{Gmm, Orient};
+    let (m, k) = (f.dims(x)[0], f.dims(x)[1]);
+    let n = f.dims(codes)[0];
+    if !tuning.moe_gmm() || k % TILE != 0 {
+        return Ok(None);
+    }
+    let tm = (((m + 15) / 16) * 16).min(tuning.moe_gmm_tm.max(16) * 16).max(16);
+    let tiles = (m + tm - 1) / tm;
+    let spec = Gmm {
+        tiles,
+        tm,
+        block_bytes: tuning.moe_gmm_block_bytes,
+        vmem_cap: tuning.vmem_cap(),
+        k,
+        n,
+        experts: 1,
+        w: Elem::F8E4m3fn,
+        orient: Orient::KMajor,
+        scaled: false,
+        tile: true,
+        bias: false,
+        out: Elem::F32,
+    };
+    if spec.out_width().ok() != Some(n) {
+        return Ok(None);
+    }
+    let kernel = spec.kernel()?;
+    let se = f.const_i(Elem::I32, 0, &[tiles]);
+    let nt = f.const_i(Elem::I32, tiles, &[1]);
+    let x = f.convert(x, Elem::Bf16);
+    let xs = if tiles * tm > m {
+        let z = f.const_f(Elem::Bf16, 0.0, &[]);
+        f.pad(x, z, &[0, 0], &[tiles * tm - m, 0], &[0, 0])?
+    } else {
+        x
+    };
+    // The device's layouts: free transposes.
+    let w = f.transpose(codes, &[1, 0])?;
+    let s = f.transpose(factor, &[1, 0])?;
+    let y = kernel.call(f, &[se, nt, xs, w, s])?[0];
+    Ok(Some(if tiles * tm > m {
+        f.slice_axis(y, 0, 0, m)?
+    } else {
+        y
+    }))
 }
 
 /// A kernel spec landing its rows in bf16 (no bias follows).
@@ -1367,6 +1433,13 @@ fn tile_kernel(
             f.bitcast(s, Elem::U8)?
         };
         let s = f.reshape(s, &[e * n, fan.k / 32])?;
+        let s = f.transpose(s, &[1, 0])?;
+        let ops: Vec<Val> = [se, nt, xs, w, s].into_iter().chain(bias).collect();
+        kernel.call(f, &ops)?[0]
+    } else if spec.tile {
+        // The factors a row (`[E·N, K/128]`), read `[K/128, E·N]` as the
+        // codes are.
+        let s = scales.ok_or_else(|| refuse("linear.moe", "block-FP8 codes with no factors"))?;
         let s = f.transpose(s, &[1, 0])?;
         let ops: Vec<Val> = [se, nt, xs, w, s].into_iter().chain(bias).collect();
         kernel.call(f, &ops)?[0]
@@ -1766,6 +1839,7 @@ fn routed(
         // Qwen3.6-35B-A3B's 4 MiB experts: Raw decode 133 -> 176 tok/s).
         MoePath::Auto { .. }
             if p <= c.slice_pairs
+                && !grouped.is_some_and(|g| g.tile)
                 && ((fan.tokens == 1 && grouped.is_some())
                     || p * expert_bytes.max(c.slice_bytes) < bank_bytes) =>
         {
@@ -1799,7 +1873,7 @@ fn routed(
         MoePath::Gmm => match grouped {
             // A dense bank: without an expert bias the sums only round to
             // bf16 after the kernel, which lands them bf16.
-            Some(mut spec) if !mxfp4 => {
+            Some(mut spec) if !mxfp4 && !spec.tile => {
                 spec.out = if bias.is_some() {
                     Elem::F32
                 } else {
@@ -1810,6 +1884,7 @@ fn routed(
             Some(mut spec) => {
                 let scales = match form {
                     Form::Mxfp4 { scales, .. } => Some(scales.val),
+                    Form::Tile { .. } => bank.factor,
                     _ => None,
                 };
                 // The bias joins the product inside the kernel where its cut

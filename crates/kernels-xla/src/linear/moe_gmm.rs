@@ -71,6 +71,12 @@ pub struct Gmm {
     /// `[K / 32, E·N]` bytes (`E·N`-minor bank only): the codes convert to
     /// bf16 in VMEM and take their block's power of two, exactly.
     pub scaled: bool,
+    /// An f32 factor per 128 codes of K follows the bank, as `[K / 128,
+    /// E·N]` (`E·N`-minor e4m3 bank only, the factors of its 128x128 blocks
+    /// laid a column each): the codes widen to f32 in VMEM, take their
+    /// block's factor and round once to bf16, as the bf16 deployment holds
+    /// the weight.
+    pub tile: bool,
     /// A bf16 bias row per expert follows (`[E, 1, N]`, a blocked cut
     /// only), added to the f32 product before it rounds.
     pub bias: bool,
@@ -109,8 +115,9 @@ impl Gmm {
     fn cut(&self) -> Built<Cut> {
         let (k, n, e) = (self.k, self.n, self.experts);
         // An e2m1 block counts a byte a code: its bf16 copy in VMEM is what
-        // bounds it.
-        let fits = |cols: i64| k * cols * self.wbytes().max(1) <= self.block_bytes;
+        // bounds it; a block-FP8 one its f32 widening.
+        let per = if self.tile { 4 } else { self.wbytes().max(1) };
+        let fits = |cols: i64| k * cols * per <= self.block_bytes;
         let blocked = (1..=n / 128)
             .rev()
             .map(|d| d * 128)
@@ -186,6 +193,8 @@ impl Gmm {
             Elem::Bf16 | Elem::F8E5m2 | Elem::F8E4m3fn | Elem::F4E2m1fn
         ) || (self.w == Elem::F4E2m1fn) != self.scaled
             || (self.scaled && (self.orient != Orient::KMajor || self.k % 32 != 0))
+            || (self.tile
+                && (self.w != Elem::F8E4m3fn || self.orient != Orient::KMajor || self.k % 128 != 0))
         {
             return bad(format!("{:?} weights (scaled {})", self.w, self.scaled));
         }
@@ -273,8 +282,8 @@ impl Gmm {
         };
         // The exponent bytes of the block's codes: the bank's columns, a row
         // per 32 codes of K.
-        let groups = k / 32;
-        let scales = self.scaled.then(|| {
+        let groups = if self.tile { k / 128 } else { k / 32 };
+        let scales = (self.scaled || self.tile).then(|| {
             let window = bank.window;
             let index: crate::mosaic::IndexMap = match cut {
                 Cut::Blocked { tn } => Box::new(move |b: &mut Body, g: &Grid| {
@@ -299,7 +308,7 @@ impl Gmm {
             };
             Operand {
                 array: vec![groups, e * n],
-                elem: Elem::U8,
+                elem: if self.tile { Elem::F32 } else { Elem::U8 },
                 block: vec![groups, cols],
                 window,
                 index,
@@ -340,6 +349,8 @@ impl Gmm {
         // The scaled codes' exponents widen to f32 beside them.
         let scaling = if self.scaled {
             2 * groups * cols + 4 * k * cols
+        } else if self.tile {
+            2 * 4 * groups * cols + 4 * k * cols
         } else {
             0
         };
@@ -370,6 +381,9 @@ impl Gmm {
                 let w = if self.scaled {
                     let s = b.vload_all(blk.ins[2])?;
                     scale_codes(b, w, s, groups, cols)?
+                } else if self.tile {
+                    let s = b.vload_all(blk.ins[2])?;
+                    tile_codes(b, w, s, groups, cols)?
                 } else {
                     b.convert_f(w, Elem::Bf16)?
                 };
@@ -401,6 +415,21 @@ impl Gmm {
             })
         })
     }
+}
+
+/// e4m3 codes `w` (`[K, cols]`) as bf16, each times its 128-code block's
+/// f32 factor (`s`: `[K / 128, cols]`), the product rounded once.
+fn tile_codes(b: &mut Body, w: V, s: V, groups: i64, cols: i64) -> Built<V> {
+    use crate::mosaic::MTy;
+    let k = groups * 128;
+    let f32s = |d: &[i64]| MTy::Vector(d.to_vec(), Elem::F32);
+    let w = b.convert_f(w, Elem::Bf16)?;
+    let w = b.convert_f(w, Elem::F32)?;
+    let s = b.op("vector.shape_cast", &[s], "", &[f32s(&[groups, 1, cols])])[0];
+    let s = b.op("vector.broadcast", &[s], "", &[f32s(&[groups, 128, cols])])[0];
+    let s = b.op("vector.shape_cast", &[s], "", &[f32s(&[k, cols])])[0];
+    let w = b.mulf(w, s)?;
+    b.convert_f(w, Elem::Bf16)
 }
 
 /// e2m1 codes `w` (`[K, cols]`, as `u4`) as bf16, each times
@@ -493,6 +522,7 @@ mod tests {
             w: Elem::F8E5m2,
             orient,
             scaled: false,
+            tile: false,
             bias: false,
             out: Elem::F32,
         }
