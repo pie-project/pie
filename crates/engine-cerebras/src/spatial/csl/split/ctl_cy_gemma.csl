@@ -27,6 +27,7 @@ param TSTAMP: u16 = 0;
 param FIFOW: u16 = 32;
 param HDS: u16 = 256;
 param HDG: u16 = 512;
+param PLOG: u16 = 0;     // 1: the full model logs each step's PLE words too (plog: the hang-localizing probe with real ordering)
 
 const sys_mod = @import_module("<memcpy/memcpy>", memcpy_params);
 const tile_config = @import_module("<tile_config>");
@@ -499,6 +500,7 @@ task pass_task() void {
     tab[0] = pos0 + s;
     stamp(0);
     if ((cfl & 1) != 0 and (DIAG & 32) == 0) { pl_wait(tab[0]); }   // (DIAG 32: no PLE words; DIAG 64: no KVS)
+    if (PLOG == 1 and (cfl & 1) != 0 and s < 64) { plog[2 * @as(u16, s)] = pl[K * pui]; plog[2 * @as(u16, s) + 1] = pl[plv]; }
     if ((DIAG & 1) != 0) {
       if ((cfl & 1) != 0 and s < 64) { plog[2 * @as(u16, s)] = pl[K * pui]; plog[2 * @as(u16, s) + 1] = pl[plv]; }
       if ((cfl & 2) != 0 and (DIAG & 64) == 0) {

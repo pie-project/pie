@@ -30,6 +30,7 @@ param HDS: u16 = 256;
 param HDG: u16 = 512;
 param ATTL: u16 = 2;
 param WIN: u16 = 0;    // > 0: the sliding window (the ring of NES PYW entries is longer: older entries are masked)
+param PLOG: u16 = 0;   // 1: the full model logs each step's KVS words too (kvlog, as DIAG 1)
 param TSTAMP: u16 = 0;
 param FIFOW: u16 = 32;
 
@@ -391,7 +392,7 @@ fn cache_fin(c: u16, pos: u32, kss: f32, vss: f32, ihd: f32) void {
 // KVS (shared units): the async receive and the pass start's entries
 var kvb = @zeros([17]f32);
 const kvb_d = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{17} -> kvb[i] });
-var kvlog = @zeros([if (DIAG != 0) 2 * 64 else 1]f32);   // (DIAG 1) a step's KVS words' sum and sequence word
+var kvlog = @zeros([if (DIAG != 0 or PLOG == 1) 2 * 64 else 1]f32);   // (DIAG 1) a step's KVS words' sum and sequence word
 var kvlog_ptr: [*]f32 = &kvlog;
 fn kv_post() void {
   kvb[16] = -1.0;
@@ -406,12 +407,12 @@ fn kv_take(pos: u32, s: u32) void {
   @fmovs(cd, sd);
   while (chk[0] != want) { @fmovs(cd, sd); }   // (a DSD read each turn: the async receive writes kvb)
   iqc(7, rcfg[RQ + 5]);
-  if (DIAG != 0) {
+  if (DIAG != 0 or PLOG == 1) {
     var t: f32 = 0.0;
     var i: u16 = 0;
     while (i < 16) : (i += 1) { t += kvb[i]; }
     if (s < 64) { kvlog[2 * @as(u16, s)] = t; kvlog[2 * @as(u16, s) + 1] = kvb[16]; }
-    return;
+    if (DIAG != 0) { return; }
   }
   if (pos == 0) { cache_reset(0); cache_reset(1); }
   if (pos % @as(u32, PYW) == @as(u32, myrow)) {
