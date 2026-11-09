@@ -331,7 +331,7 @@ impl Tuning {
     /// round stays on chip.
     #[must_use]
     pub fn decode_round_bytes(&self) -> i64 {
-        self.vmem_bytes / 4
+        std::env::var("PIE_XLA_GDN_ROUND_MIB").ok().and_then(|v| v.parse::<i64>().ok()).map_or(self.vmem_bytes / 4, |m| m << 20)
     }
 }
 

@@ -1327,7 +1327,7 @@ impl DeltaIn {
     fn chunk(&self, rows: i64, lanes: i64, c: crate::tuning::SsmChunks) -> i64 {
         match self {
             Self::Gdn { .. } | Self::Mamba2 { .. } if rows >= c.long_chunk * lanes.max(1) => {
-                c.long_chunk
+                std::env::var("PIE_XLA_SSM_LONG").ok().and_then(|v| v.parse().ok()).unwrap_or(c.long_chunk)
             }
             Self::Gdn { .. } | Self::Mamba2 { .. } => c.chunk,
             Self::Kda { .. } => c.kda_chunk,
