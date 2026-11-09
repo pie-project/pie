@@ -271,6 +271,7 @@ impl Gmm {
             },
             (Orient::NMajor, Cut::Element { .. }) => return bad("an element window over rows"),
         };
+        let bank_block = bank.block.clone();
         // The exponent bytes of the block's codes: the bank's columns, a row
         // per 32 codes of K.
         let groups = k / 32;
@@ -343,8 +344,13 @@ impl Gmm {
         } else {
             0
         };
-        let vmem =
-            2 * tm * k * 2 + 2 * self.block_dma(cols) + convert + scaling + 2 * tm * cols * 4;
+        // A converted block stays in VMEM for the next tile on the same
+        // expert (`cached` below).
+        let vmem = 2 * tm * k * 2
+            + 2 * self.block_dma(cols)
+            + 2 * convert
+            + scaling
+            + 2 * tm * cols * 4;
         // At least the compiler's own scoped default, where the device has it.
         let floor = (32 << 20).min(self.vmem_cap);
         let limit = (vmem * 2 + (8 << 20)).clamp(floor, self.vmem_cap);
@@ -359,6 +365,11 @@ impl Gmm {
                 .collect(),
             outs: vec![out],
             vmem_limit: Some(limit as u64),
+            scratch: if convert > 0 {
+                vec![(bank_block.clone(), Elem::Bf16)]
+            } else {
+                vec![]
+            },
         };
         kernel.build(|b, blk| {
             let zero = b.index(0);
@@ -366,12 +377,36 @@ impl Gmm {
             let live = b.cmpi(ICmp::Slt, blk.grid.ids[1], nt)?;
             b.when(live, |b| {
                 let x = b.vload_all(blk.ins[0])?;
-                let w = b.vload_all(blk.ins[1])?;
-                let w = if self.scaled {
-                    let s = b.vload_all(blk.ins[2])?;
-                    scale_codes(b, w, s, groups, cols)?
+                let w = if self.w == Elem::Bf16 {
+                    b.vload_all(blk.ins[1])?
                 } else {
-                    b.convert_f(w, Elem::Bf16)?
+                    // A tile on the same block as the step before (the next
+                    // of one expert's run: the tile axis is innermost) reads
+                    // the bf16 copy that step converted, not the codes again
+                    // (DeepSeek-V4's prompt, three tiles an expert: the VPU
+                    // conversion took half of each step on v6e).
+                    let cached = blk.scratch[0];
+                    let t = blk.grid.ids[1];
+                    let zero = b.i32(0);
+                    let one = b.i32(1);
+                    let first = b.cmpi(ICmp::Eq, t, zero)?;
+                    let prev = b.subi(t, one)?;
+                    let prev = b.maxsi(prev, zero)?;
+                    let here = b.load(blk.grid.prefetch[0], &[t])?;
+                    let before = b.load(blk.grid.prefetch[0], &[prev])?;
+                    let moved = b.cmpi(ICmp::Ne, here, before)?;
+                    let fresh = b.ori(first, moved)?;
+                    b.when(fresh, |b| {
+                        let w = b.vload_all(blk.ins[1])?;
+                        let w = if self.scaled {
+                            let s = b.vload_all(blk.ins[2])?;
+                            scale_codes(b, w, s, groups, cols)?
+                        } else {
+                            b.convert_f(w, Elem::Bf16)?
+                        };
+                        b.vstore_all(w, cached)
+                    })?;
+                    b.vload_all(cached)?
                 };
                 let acc = b.splat_f(&[tm, cols], Elem::F32, 0.0)?;
                 let y = b.matmul(x, w, acc, orient == Orient::NMajor)?;
