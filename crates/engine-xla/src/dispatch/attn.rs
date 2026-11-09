@@ -1237,6 +1237,9 @@ impl Run<'_> {
                 ratio,
                 entries,
             } => {
+                // The pool append that files these entries bounds its rows
+                // by the ratio they closed at.
+                self.boundaries.push((*boundary_pos, *ratio));
                 let Some([state_kv, state_score]) = self.pool_state(*pages) else {
                     return Err(kernels_xla::Error::Unsupported {
                         op: "attn.pool_gather",
@@ -1296,6 +1299,10 @@ impl Run<'_> {
                 self.tensor(*boundary_pos),
                 self.tensor(*boundary_req),
                 self.pool(*into),
+                self.boundaries
+                    .iter()
+                    .find(|(v, _)| v == boundary_pos)
+                    .map(|&(_, r)| r),
             ),
             Attn::PoolLse {
                 q,

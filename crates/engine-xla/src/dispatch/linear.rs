@@ -620,11 +620,14 @@ impl Run<'_> {
             }),
             // The forms no builder makes.
             Linear::MoeRoute { .. } => Err(kernels_xla::Error::Unsupported { op: op.name() }),
-            Linear::GroupRoutes { groups, routes } => crate::lower::lower(self.ctx(), |l| {
-                let o_routes = self.tensor(*routes);
-                let v = linear::moe::group_routes(l.f(), *groups, o_routes.landing())?;
-                l.land(o_routes, v)
-            }),
+            Linear::GroupRoutes { groups, routes } => {
+                self.group_routes.push((*routes, *groups));
+                crate::lower::lower(self.ctx(), |l| {
+                    let o_routes = self.tensor(*routes);
+                    let v = linear::moe::group_routes(l.f(), *groups, o_routes.landing())?;
+                    l.land(o_routes, v)
+                })
+            }
 
             Linear::LoraCorrect {
                 x,
@@ -656,8 +659,20 @@ impl Run<'_> {
             } => {
                 // A readout-rowed `x` (an MTP head) against token-rowed
                 // routes and result: the GPU kernel counts rows off `x`.
+                let fixed = self.group_routes.contains(&(*routes, *groups));
                 let routes = self.first_rows(self.tensor(*routes), *x);
                 let y = self.first_rows(self.tensor(*y), *x);
+                // Routes that send each row's slot `g` to group `g`: one dot
+                // batched over the groups, with no sort and no row gathers.
+                if fixed && self.banked(*w).is_none() {
+                    return crate::lower::lower(self.ctx(), |l| {
+                        let xv = l.read(self.tensor(*x))?;
+                        let wv = l.read(self.tensor(*w))?;
+                        let v =
+                            linear::moe::matmul_grouped_fixed(l.f(), xv, wv, *groups, y.landing())?;
+                        l.land(y, v)
+                    });
+                }
                 crate::lower::lower(self.ctx(), |l| {
                     let xv = l.read(self.tensor(*x))?;
                     let rv = l.read(routes)?;

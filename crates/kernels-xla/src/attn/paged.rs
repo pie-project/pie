@@ -270,7 +270,13 @@ pub(crate) fn fetch(f: &mut Func, planes: &Planes, h: &Heads, x: Val) -> Built<(
             let page = take(f, geom.pt, at)?;
             let slot = with_i(f, page, geom.ps, Func::mul)?;
             let slot = f.add(slot, off)?;
-            let kr = f.take_rows(keys, slot)?;
+            let w = f.dims(keys)[1];
+            let row = if latent { h.dv } else { h.kvh * h.d };
+            let kr = if w < row && row % w == 0 {
+                super::pool::entry_rows(f, keys, slot, row / w)?
+            } else {
+                f.take_rows(keys, slot)?
+            };
             if latent {
                 let v = f.reshape(kr, &[n, 1, h.dv])?;
                 let k = if h.d > h.dv {
@@ -322,11 +328,17 @@ pub(crate) fn fetch_pages(
     let m = f.dims(page)[0];
     let n = m * geom.ps;
     let page = f.reshape(page, &[m, 1])?;
-    let blocks = |f: &mut Func, plane: Val| -> Built<Val> {
+    let blocks = |f: &mut Func, plane: Val, row: i64| -> Built<Val> {
         let (slots, w) = (f.dims(plane)[0], f.dims(plane)[1]);
+        // A compact plane (an entry `row / w` rows of its `[cells, w]`)
+        // pages as it is laid, and only the chunk takes the entry's width:
+        // viewing the whole plane at that width relays all of it, every
+        // layer, every fire (a CSA pool on a v6e: 0.67 ms a layer).
+        let div = if w < row && row % w == 0 { row / w } else { 1 };
+        let ps = geom.ps * div;
         // `[slots, w]` as `[pages, ps, w]`: whole pages along the major
         // axis, so the gather moves full `ps · w` slabs.
-        let paged = f.reshape(plane, &[slots / geom.ps, geom.ps, w])?;
+        let paged = f.reshape(plane, &[slots / ps, ps, w])?;
         let b = f.gather(
             paged,
             page,
@@ -337,15 +349,15 @@ pub(crate) fn fetch_pages(
                 index_vector_dim: 1,
                 ..GatherDims::default()
             },
-            &[1, geom.ps, w],
+            &[1, ps, w],
         )?;
-        f.reshape(b, &[n, w])
+        f.reshape(b, &[n, w * div])
     };
-    let kr = blocks(f, keys)?;
+    let kr = blocks(f, keys, if latent { h.dv } else { h.kvh * h.d })?;
     if latent {
         let v = f.reshape(kr, &[n, 1, h.dv])?;
         let k = if h.d > h.dv {
-            let pe = blocks(f, values)?;
+            let pe = blocks(f, values, h.d - h.dv)?;
             f.concat(&[kr, pe], 1)?
         } else {
             kr
@@ -353,7 +365,7 @@ pub(crate) fn fetch_pages(
         let k = f.reshape(k, &[n, 1, h.d])?;
         Ok(Some((k, v)))
     } else {
-        let vr = blocks(f, values)?;
+        let vr = blocks(f, values, h.kvh * h.dv)?;
         let k = f.reshape(kr, &[n, h.kvh, h.d])?;
         let v = f.reshape(vr, &[n, h.kvh, h.dv])?;
         Ok(Some((k, v)))
@@ -1287,6 +1299,25 @@ pub(crate) fn blocked(
     };
     let whole = if nb == 1 {
         block(f, &rows_p)?
+    } else if nb <= ch.unrolled {
+        // A few blocks run one after another in line, each on a static cut
+        // of the rows, and join at the end: as a loop, each block's result
+        // is written into a copy of the whole carried output (DeepSeek-V4's
+        // window blocks, 14 of 128 rows a layer: 1.4 of a 56 ms v6e fire).
+        let mut parts = Vec::with_capacity(nb as usize);
+        for bi in 0..nb {
+            let rb = rows_p.map(f, &mut |f, v| f.slice_axis(v, 0, bi * br, (bi + 1) * br))?;
+            parts.push(block(f, &rb)?);
+        }
+        let join = |f: &mut Func, pick: fn(&Flashed) -> Val| -> Built<Val> {
+            let vs: Vec<Val> = parts.iter().map(pick).collect();
+            f.concat(&vs, 0)
+        };
+        Flashed {
+            o: join(f, |x| x.o)?,
+            m: join(f, |x| x.m)?,
+            l: join(f, |x| x.l)?,
+        }
     } else {
         let st0 = [
             f.const_f(Elem::F32, 0.0, &[rp, h.kvh, h.g, h.dv]),

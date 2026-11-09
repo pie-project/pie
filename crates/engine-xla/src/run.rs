@@ -177,6 +177,12 @@ pub struct Run<'c> {
     /// than the budget, so `attn.index_topk` answers each row all of them,
     /// in order.
     pub(crate) full_selections: Vec<(ValueId, u32)>,
+    /// Routes `linear.group_routes` built (every row's slot `g` routed to
+    /// group `g`), with their group count.
+    pub(crate) group_routes: Vec<(ValueId, u32)>,
+    /// Boundary positions a compressor gathered at, with the ratio their
+    /// blocks close at.
+    pub(crate) boundaries: Vec<(ValueId, u32)>,
     /// Routed results the grouped-matmul kernel left in its tile order, by
     /// value, with the routes value and the span they were cut on: the next
     /// routed op on the same routes reads them as they are.
@@ -224,6 +230,8 @@ impl<'c> Run<'c> {
             probed: std::cell::RefCell::new(Vec::new()),
             readout_rowed: (std::sync::Arc::new(Vec::new()), None),
             full_selections: Vec::new(),
+            group_routes: Vec::new(),
+            boundaries: Vec::new(),
             tiled: std::cell::RefCell::new(Vec::new()),
         }
     }
