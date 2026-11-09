@@ -66,8 +66,21 @@ impl Shape {
     }
 }
 
+/// Heads 64 wide read as pairs, one 128-lane head a pair: the pool's
+/// `[slots, kvh·64]` planes are `[slots, kvh/2·128]` as they lie, and each
+/// query row keeps its own half (gpt-oss: 8 kv heads of 64).
+fn paired(h: &Heads) -> Option<Heads> {
+    (h.d == 64 && h.dv == 64 && h.kvh % 2 == 0).then(|| Heads {
+        kvh: h.kvh / 2,
+        g: 2 * h.g,
+        d: 128,
+        dv: 128,
+    })
+}
+
 /// Whether the kernel takes rows of these heads reading `span` keys.
 pub(crate) fn fits(span: i64, h: &Heads, vmem_cap: i64) -> bool {
+    let h = &paired(h).unwrap_or(*h);
     let g = Shape::rows_a_step(span, h);
     h.d % 128 == 0 && h.dv % 128 == 0 && g >= 1 && {
         let s = Shape {
@@ -423,6 +436,11 @@ pub(crate) fn attend(
     scale: f64,
     vmem_cap: i64,
 ) -> Built<Flashed> {
+    if let Some(h2) = paired(h) {
+        return attend_paired(
+            f, q, keys, values, pt, lane, lo, hi, pages, ps, h, &h2, scale, vmem_cap,
+        );
+    }
     let r = f.dims(q)[0];
     let span = pages * ps;
     if !fits(span, h, vmem_cap) {
@@ -476,6 +494,71 @@ pub(crate) fn attend(
         o: cut(f, out[0], &[h.dv])?,
         m: cut(f, out[1], &[])?,
         l: cut(f, out[2], &[])?,
+    })
+}
+
+/// [`attend`] over heads 64 wide, as [`paired`] reads them: each query row
+/// sits in its kv head's half of the pair's 128 lanes (zeros in the other),
+/// so it scores its own head's keys only; its values come back in that half.
+fn attend_paired(
+    f: &mut Func,
+    q: Val,
+    keys: Val,
+    values: Val,
+    pt: Val,
+    lane: Val,
+    lo: Val,
+    hi: Val,
+    pages: i64,
+    ps: i64,
+    h: &Heads,
+    h2: &Heads,
+    scale: f64,
+    vmem_cap: i64,
+) -> Built<Flashed> {
+    let r = f.dims(q)[0];
+    let (pairs, g, d) = (h2.kvh, h.g, h.d);
+    let q = f.convert(q, Elem::Bf16);
+    let q = f.reshape(q, &[r, pairs, 2, g, d])?;
+    let z = f.const_f(Elem::Bf16, 0.0, &[]);
+    let half = |f: &mut Func, at: i64| -> Built<Val> {
+        let x = f.slice(
+            q,
+            &[0, 0, at, 0, 0],
+            &[r, pairs, at + 1, g, d],
+            &[1, 1, 1, 1, 1],
+        )?;
+        let x = f.reshape(x, &[r, pairs, g, d])?;
+        f.pad(
+            x,
+            z,
+            &[0, 0, 0, at * d],
+            &[0, 0, 0, (1 - at) * d],
+            &[0, 0, 0, 0],
+        )
+    };
+    let (even, odd) = (half(f, 0)?, half(f, 1)?);
+    let q2 = f.concat(&[even, odd], 2)?;
+    let fl = attend(
+        f, q2, keys, values, pt, lane, lo, hi, pages, ps, h2, scale, vmem_cap,
+    )?;
+    let o = f.reshape(fl.o, &[r, pairs, 2, g, 2 * d])?;
+    let pick = |f: &mut Func, at: i64| -> Built<Val> {
+        f.slice(
+            o,
+            &[0, 0, at, 0, at * d],
+            &[r, pairs, at + 1, g, (at + 1) * d],
+            &[1, 1, 1, 1, 1],
+        )
+    };
+    let (oe, oo) = (pick(f, 0)?, pick(f, 1)?);
+    let o = f.concat(&[oe, oo], 2)?;
+    let o = f.reshape(o, &[r, h.kvh, g, d])?;
+    let stat = |f: &mut Func, x: Val| -> Built<Val> { f.reshape(x, &[r, h.kvh, g]) };
+    Ok(Flashed {
+        o,
+        m: stat(f, fl.m)?,
+        l: stat(f, fl.l)?,
     })
 }
 
