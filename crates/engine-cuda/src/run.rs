@@ -2212,6 +2212,7 @@ impl<'c> Run<'c> {
     /// pages, and the entry of the fire's table they start at: a lane
     /// interval's `page_indptr` indexes the whole fire's table, whose other
     /// lanes' pages it never reads.
+    #[cfg(feature = "cuda")]
     pub(crate) fn pool_own(&self, id: ValueId) -> (KvPool, u32) {
         let pool = self.pool(id);
         let window = self.window();
