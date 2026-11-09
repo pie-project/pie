@@ -616,7 +616,7 @@ impl Body {
     /// A float vector of `x` everywhere.
     pub fn splat_f(&mut self, dims: &[i64], elem: Elem, x: f64) -> Built<V> {
         let t = MTy::Vector(dims.to_vec(), elem);
-        let lit = format!("dense<{x:.9e}> : {t}");
+        let lit = format!("dense<{}> : {t}", float_lit(x, elem)?);
         Ok(self.op1("arith.constant", &[], &format!("value = {lit}"), t))
     }
 
@@ -625,6 +625,30 @@ impl Body {
             MTy::Vector(d, e) => Ok((d.clone(), *e)),
             t => bad(format!("{t} is not a vector")),
         }
+    }
+
+    /// An i32 vector of `x` everywhere.
+    pub fn splat_i(&mut self, dims: &[i64], x: i64) -> Built<V> {
+        let t = MTy::Vector(dims.to_vec(), Elem::I32);
+        Ok(self.op1(
+            "arith.constant",
+            &[],
+            &format!("value = dense<{x}> : {t}"),
+            t,
+        ))
+    }
+
+    /// An i32 scalar everywhere in a `dims` vector (`vector.broadcast`).
+    pub fn broadcast_i(&mut self, v: V, dims: &[i64]) -> Built<V> {
+        if self.ty(v) != &MTy::I32 {
+            return bad(format!("broadcast of {} as an i32", self.ty(v)));
+        }
+        Ok(self.op1(
+            "vector.broadcast",
+            &[v],
+            "",
+            MTy::Vector(dims.to_vec(), Elem::I32),
+        ))
     }
 
     /// A float vector widened (`arith.extf`) or narrowed (`arith.truncf`).
@@ -662,6 +686,14 @@ impl Body {
 
     pub fn subf(&mut self, a: V, b: V) -> Built<V> {
         self.float_binary("arith.subf", a, b)
+    }
+
+    pub fn divf(&mut self, a: V, b: V) -> Built<V> {
+        self.float_binary("arith.divf", a, b)
+    }
+
+    pub fn maxf(&mut self, a: V, b: V) -> Built<V> {
+        self.float_binary("arith.maximumf", a, b)
     }
 
     /// `v` stretched along its unit axes to `dims` (`vector.broadcast`).
@@ -857,6 +889,23 @@ impl Body {
             "vector.multi_reduction",
             &[v, init],
             "kind = #vector.kind<add>, reduction_dims = array<i64: 0>",
+            MTy::Vector(vec![d[1]], e),
+        );
+        self.shape_cast(r, &[1, d[1]])
+    }
+
+    /// The largest of a 2-d f32 vector's rows, kept as `[1, cols]`
+    /// (`vector.multi_reduction` over axis 0).
+    pub fn max_rows(&mut self, v: V) -> Built<V> {
+        let (d, e) = self.vec_of(v)?;
+        if d.len() != 2 || e != Elem::F32 {
+            return bad(format!("a column max of {}", self.ty(v)));
+        }
+        let init = self.splat_f(&[d[1]], e, f64::NEG_INFINITY)?;
+        let r = self.op1(
+            "vector.multi_reduction",
+            &[v, init],
+            "kind = #vector.kind<maximumf>, reduction_dims = array<i64: 0>",
             MTy::Vector(vec![d[1]], e),
         );
         self.shape_cast(r, &[1, d[1]])
@@ -1254,6 +1303,21 @@ impl Compiled {
             aliases,
         ))
     }
+}
+
+/// A float literal MLIR parses: an infinity as its bits.
+fn float_lit(x: f64, elem: Elem) -> Built<String> {
+    if x.is_finite() {
+        return Ok(format!("{x:.9e}"));
+    }
+    let neg = x < 0.0;
+    Ok(match elem {
+        Elem::F32 if neg => "0xFF800000".into(),
+        Elem::F32 => "0x7F800000".into(),
+        Elem::Bf16 if neg => "0xFF80".into(),
+        Elem::Bf16 => "0x7F80".into(),
+        e => return bad(format!("an infinity of {e:?}")),
+    })
 }
 
 /// Standard base64 with padding.

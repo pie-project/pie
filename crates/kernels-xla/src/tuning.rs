@@ -131,6 +131,12 @@ pub struct AttnPerRowMax(pub u32);
 #[decision(id = "kernel.attn.budget_mi", constant(range(1..=256)), default = 16, tune = search)]
 pub struct AttnBudgetMi(pub u32);
 
+/// From this many rows a decode reads its keys through the page-copy kernel
+/// (`attn::pages`) rather than the per-row walk. 0 never does.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Decision)]
+#[decision(id = "kernel.attn.decode_pages", constant(set(0, 1, 8, 16, 32, 64, 128)), default = 0, tune = search)]
+pub struct AttnDecodePages(pub u32);
+
 /// Query rows per block of the blocked attention walk.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Decision)]
 #[decision(id = "kernel.attn.block_rows", constant(set(128, 256, 512, 1024, 2048)), default = 512, tune = search)]
@@ -184,6 +190,7 @@ pub fn register(registry: &mut Registry) {
         .add::<QuantDecode>()
         .add::<AttnPerRowMax>()
         .add::<AttnBudgetMi>()
+        .add::<AttnDecodePages>()
         .add::<AttnBlockRows>()
         .add::<RopeFlatRows>()
         .add::<AttnBlockKeys>()
@@ -227,6 +234,9 @@ pub struct Chunks {
     /// profile; off walks every chunk of the window, as the walk did before
     /// the bound, which a test sets to check the bound changes no bit.
     pub window_reach: bool,
+    /// Rows from which a decode takes the page-copy kernel (see
+    /// [`AttnDecodePages`]).
+    pub decode_pages: i64,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -286,6 +296,7 @@ impl Tuning {
             block_keys: 512,
             unrolled: 16,
             window_reach: true,
+            decode_pages: 0,
         },
         ssm: SsmChunks {
             chunk: 64,
@@ -336,6 +347,7 @@ impl Tuning {
                 block_keys: n(profile.get::<AttnBlockKeys>().0),
                 unrolled: n(profile.get::<AttnUnrolledBlocks>().0),
                 window_reach: true,
+                decode_pages: n(profile.get::<AttnDecodePages>().0),
             },
             ssm: SsmChunks {
                 chunk: n(profile.get::<SsmChunk>().0),
