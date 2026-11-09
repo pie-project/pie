@@ -262,6 +262,9 @@ pub struct Shell {
     /// While the warm ladder traces (`warm.rs`): fires whose program is new
     /// are traced, kept here and not run, and compiled together after.
     deferred: Option<Vec<Deferred>>,
+    /// The readout rows of every fire shape traced, the rows a guest stage's
+    /// readout plane comes in (`Shell::readouts`).
+    readouts: std::collections::BTreeSet<u32>,
     /// Token-declared values on a readout-rowed path (`crate::rows`), and
     /// a readout-rowed value that tells their rows.
     readout_rowed: (std::sync::Arc<Vec<bool>>, Option<ValueId>),
@@ -313,6 +316,14 @@ impl Shell {
     #[must_use]
     pub fn tpu(&self) -> crate::chip::Tpu {
         self.tpu
+    }
+
+    /// The readout rows of every fire shape traced so far (the warm
+    /// ladder's, after `prewarm`): a guest stage reading a readout plane
+    /// meets each of them.
+    #[must_use]
+    pub fn readouts(&self) -> Vec<u32> {
+        self.readouts.iter().copied().collect()
     }
 
     /// Loads with the voxel ladder derived from the plan (engine-cuda's
@@ -713,6 +724,7 @@ impl Shell {
             traced: std::collections::HashMap::new(),
             shaped: std::collections::HashMap::new(),
             deferred: None,
+            readouts: std::collections::BTreeSet::new(),
             readout_rowed,
         })
     }
@@ -1581,6 +1593,7 @@ impl Shell {
         let mask_enabled = inputs.raw(handles, Dtype::U8, rows, 1, enabled_bytes);
 
         let (readout_rows, readout_layout) = readout_table(&composition, lanes, real)?;
+        self.readouts.insert(readout_rows.len() as u32);
         let tokens_at = inputs.pack_offset();
         let tokens_t = inputs.i32s(handles, &tokens, 1);
         for feed in &token_feeds {
