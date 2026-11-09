@@ -529,13 +529,12 @@ fn attend_paired(
             &[1, 1, 1, 1, 1],
         )?;
         let x = f.reshape(x, &[r, pairs, g, d])?;
-        f.pad(
-            x,
-            z,
-            &[0, 0, 0, at * d],
-            &[0, 0, 0, (1 - at) * d],
-            &[0, 0, 0, 0],
-        )
+        let zeros = f.broadcast(z, &[r, pairs, g, d], &[])?;
+        if at == 0 {
+            f.concat(&[x, zeros], 3)
+        } else {
+            f.concat(&[zeros, x], 3)
+        }
     };
     let (even, odd) = (half(f, 0)?, half(f, 1)?);
     let q2 = f.concat(&[even, odd], 2)?;
