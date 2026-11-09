@@ -117,6 +117,7 @@ impl G12Geo {
             g2h: g2,
             wl: true,
             g2w,
+            gap: None,
         };
         let mut g = Geo::new(p);
         g.hx0 = origins.iter().map(|o| o.0).max().unwrap() + g.uw;
