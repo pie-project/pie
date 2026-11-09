@@ -2201,7 +2201,7 @@ fn the_fused_chunk_kernel_matches_the_xla_form() {
     // Lanes of 70 (two chunks), 0, 5, 1 and 130 rows, then 3 padded rows.
     let indptr = vec![0i32, 70, 70, 75, 76, 206];
     let rows = 209usize;
-    let lane_slot = vec![3i32, 0, 1, 4, 2];
+    let lane_slot = [3i32, 0, 1, 4, 2];
     let lanes = indptr.len() - 1;
     let slots = 6usize;
     let mut slot_of_row = vec![DROP; rows];
@@ -2261,16 +2261,35 @@ fn the_fused_chunk_kernel_matches_the_xla_form() {
     for l in 0..lanes {
         let s = lane_slot[l] as usize;
         for t in indptr[l] as usize..indptr[l + 1] as usize {
-            let yr = g.token(&qkv, &gates, t, &mut want[s * g.stride()..(s + 1) * g.stride()]);
-            for ((a, b), r) in y_xla[t * w..(t + 1) * w].iter().zip(&y_k[t * w..(t + 1) * w]).zip(&yr) {
+            let yr = g.token(
+                &qkv,
+                &gates,
+                t,
+                &mut want[s * g.stride()..(s + 1) * g.stride()],
+            );
+            for ((a, b), r) in y_xla[t * w..(t + 1) * w]
+                .iter()
+                .zip(&y_k[t * w..(t + 1) * w])
+                .zip(&yr)
+            {
                 worst_x = worst_x.max((a - r).abs());
                 worst_k = worst_k.max((b - r).abs());
             }
         }
     }
-    eprintln!("against the token walk: xla form worst |err| {worst_x:.3e}, fused kernel {worst_k:.3e}");
-    let y_err = y_xla.iter().zip(&y_k).map(|(a, b)| (a - b).abs()).fold(0f32, f32::max);
-    let bank_err = bank_xla.iter().zip(&bank_k).map(|(a, b)| (a - b).abs()).fold(0f32, f32::max);
+    eprintln!(
+        "against the token walk: xla form worst |err| {worst_x:.3e}, fused kernel {worst_k:.3e}"
+    );
+    let y_err = y_xla
+        .iter()
+        .zip(&y_k)
+        .map(|(a, b)| (a - b).abs())
+        .fold(0f32, f32::max);
+    let bank_err = bank_xla
+        .iter()
+        .zip(&bank_k)
+        .map(|(a, b)| (a - b).abs())
+        .fold(0f32, f32::max);
     eprintln!("fused kernel against the xla form: y max |err| {y_err:.3e}, bank {bank_err:.3e}");
     assert_close(&y_k, &y_xla, 2e-3, 1e-2);
     assert_close(&bank_k, &bank_xla, 4e-3, 1e-2);
