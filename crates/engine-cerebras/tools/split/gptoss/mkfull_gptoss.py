@@ -2,7 +2,7 @@
 """mkfull_gptoss.py <outdir> <geo: tiny | full> <params.txt> [k=v,...]: the gpt-oss role-split payload: layout.csl
 (the geometry of split_geo_gptoss.py) and one source a PE kind (attention / MoE weight, CX, attention / MoE CY,
 head, head control, filler) with every program's exported names (one-word dummies for the names a kind does not
-own). Shape params from the prep's params.txt; diagnostics (DIAG, TSTAMP, XKEEP) default off. Kernel sources:
+own). Shape params from the prep's params.txt; diagnostics (DIAG, TSTAMP, XKEEP) default off; the serving build's numerics GLUV 1, CYV 2 (the README's 8.2). Kernel sources:
 $SPLIT_SRC, else this branch's src/spatial/csl/split."""
 import os, shutil, sys
 H = os.path.dirname(os.path.abspath(__file__))
@@ -40,7 +40,7 @@ for k in OWN:
     d.append("}")
     open(os.path.join(out, f"{k}.csl"), "w").write(body + "\n" + "\n".join(d) + "\n")
 P = ["K", "KM", "Hc", "NQA", "QO", "Qh", "Dc", "NROT", "Ic", "NEX", "TK", "HR", "NLV", "VR"]
-PD = {"DIAG": 0, "GLUV": 0, "CYV": 0, "XDLY": 0, "PFTZ": 0, "TSTAMP": 0, "XKEEP": 0, "FIFOW": 32, "WFORCE": 0, "NE": int(kw.get("NE", 128)), "WIN": int(kw.get("WIN", 128))}
+PD = {"DIAG": 0, "GLUV": 1, "CYV": 2, "XDLY": 0, "PFTZ": 0, "TSTAMP": 0, "XKEEP": 0, "FIFOW": 32, "WFORCE": 0, "NE": int(kw.get("NE", 128)), "WIN": int(kw.get("WIN", 128))}
 L = [f"param {p}: u16;" for p in P] + [f"param {p}: u16 = {v};" for p, v in PD.items()]
 import json as _j, math as _mt
 _m = _j.load(open(os.path.join(os.path.dirname(os.path.abspath(ptxt)), os.path.basename(ptxt).replace("params.txt", "meta.json"))))

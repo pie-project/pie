@@ -1457,6 +1457,8 @@ pub struct Wafer {
     pub row_order: Option<super::paged::RowOrder>,
     /// The role-split program ([`super::split`]).
     pub split: bool,
+    /// The prep's posted-loop length (its meta's `LOOP`; `PIE_CEREBRAS_SPLIT_LOOP` overrides it).
+    pub split_loop: Option<usize>,
     /// Posted token loops' answers (the role-split program).
     posted: mpsc::Receiver<Answer>,
 }
@@ -1566,6 +1568,7 @@ impl Wafer {
                                 }
                             },
                             split: false,
+            split_loop: None,
                             posted: mpsc::channel().1,
                         }));
                         m
@@ -1757,6 +1760,7 @@ impl Wafer {
     /// sequence, greedy rows by the wafer token loop, logits rows by `lgt`.
     fn open_split(program: PathBuf, ckpt: &Ckpt, platform: Platform) -> R<Wafer> {
         let spec = super::split::SplitSpec::from_env()?.ok_or("PIE_CEREBRAS_SPLIT is unset")?;
+        let split_loop = spec.int("LOOP").map(|v| v as usize);
         let cfg = ckpt.config();
         let vocab = cfg["text_config"]["vocab_size"]
             .as_u64()
@@ -1882,6 +1886,7 @@ impl Wafer {
             group: 1,
             row_order: None,
             split: true,
+            split_loop,
             posted: post_rx,
         })
     }
@@ -2299,6 +2304,7 @@ mod tests {
             group: 1,
             row_order: None,
             split: false,
+            split_loop: None,
             posted: mpsc::channel().1,
         };
         let kernel = w.paged.unwrap();

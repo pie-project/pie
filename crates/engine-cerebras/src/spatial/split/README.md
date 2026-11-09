@@ -94,6 +94,10 @@ Notes on the table:
 - Pie runs 32-step loops (`PIE_CEREBRAS_SPLIT_LOOP=32`). Longer loops lower the per-step cost but
   lose wall time at the tail.
 - Pie's own cost is about 0.45 ms per posted launch, so Pie reaches 97% of bare.
+- gpt-oss-20b (`tools/split/gptoss`, built with GLUV 1 and CYV 2, the mkfull defaults) serves with 64-step loops (its
+  prep meta's `LOOP`). Bare 0.643-0.644 ms (1,555 tok/s); Pie posted 0.6634 ms at L32 (96.9-97.1% of bare) and
+  0.6619 ms at L64 (97.1-97.3%, 1,511 tok/s); Pie text = bare greedy. Pie's overhead in ms equals the previous
+  build's (gpo6: 0.6779 / 0.6723 ms against 0.661 bare, 97.5% / 98.3%): the ratio fell because bare got faster.
 - Llama stays on `serve8b_region`: the role-split layout forecasts 2,029-2,057 for it, which is no
   gain.
 
@@ -171,7 +175,7 @@ These variants were removed after they failed:
 | variable | meaning |
 |---|---|
 | `PIE_CEREBRAS_SPLIT=<prep dir>:<prefix>[:k=v,...]` | selects the split program. Overrides: `G2` (`G2X` / `G2Y` / `G2H`) chain groups, `WL` the token loop, `G2W` the max-reduce groups, `CAP`, `EPS`. |
-| `PIE_CEREBRAS_SPLIT_LOOP` | steps a posted loop runs past its row (default 32). Loops double from 8 up to this value. |
+| `PIE_CEREBRAS_SPLIT_LOOP` | steps a posted loop runs past its row (default: the prep meta's `LOOP`, else 32; gpt-oss preps say 64). Loops double from 8 up to this value. |
 | `PIE_CEREBRAS_SPLIT_POST=0` | one loop at a time (synchronous, bounded by the lane's pages) |
 | `PIE_CEREBRAS_LOOP_ROOM=off` | synchronous mode with no page bound |
 | `PIE_CEREBRAS_SPLIT_FORCE=1` | the prompt is forced through the token loop (one launch: prefill and the first token). Needs `force` / `nforce`. |

@@ -428,10 +428,14 @@ impl Spatial {
         let start = c.tokens.len();
         // A loop's rows come back when it ends: the request's last rows wait
         // for its whole loop, so posted loops stay short
-        // (`PIE_CEREBRAS_SPLIT_LOOP`, default 32 steps past the row).
+        // (`PIE_CEREBRAS_SPLIT_LOOP`, else the prep meta's `LOOP`, else 32
+        // steps past the row).
+        let prep_loop = self.model()?.split_loop;
+        let c = &mut self.kv.cached;
         let most = std::env::var("PIE_CEREBRAS_SPLIT_LOOP")
             .ok()
             .and_then(|v| v.parse::<usize>().ok())
+            .or(prep_loop)
             .unwrap_or(32);
         c.next_loop = (c.next_loop.max(FIRST_LOOP) * 2)
             .min(lookahead)

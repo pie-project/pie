@@ -245,7 +245,8 @@ def main():
         stats["head_f16_inexact"] = inexact
     json.dump(gold, open(f"{out}/{pre}golden.json", "w"))
     meta = dict(geo=geo, HD=HD, K=K, KM=KM, Hc=Hc, NQA=NQA, QO=QO, Qh=Qh, Dc=Dc, NROT=NROT, Ic=Ic, NEX=NEX, TK=TK, HR=H, NLV=NLV,
-                VR=VR, HVC=HVC, V=V, PY=PY, AX=AX, MX=MXc, NU=NU, WIN=cfg["sliding_window"], HSCALE=2.0 ** 15)
+                VR=VR, HVC=HVC, V=V, PY=PY, AX=AX, MX=MXc, NU=NU, WIN=cfg["sliding_window"], HSCALE=2.0 ** 15,
+                LOOP=64)   # Pie's posted-loop length (0886: L64 the faster)
     json.dump(meta, open(f"{out}/{pre}meta.json", "w"), indent=1)
     json.dump(stats, open(f"{out}/{pre}stats.json", "w"))
     open(f"{out}/{pre}params.txt", "w").write(",".join(f"{k}:{meta[k]}" for k in ("K", "KM", "Hc", "NQA", "QO", "Qh", "Dc", "NROT", "Ic", "NEX", "TK", "HR", "NLV", "VR")) + "\n")
