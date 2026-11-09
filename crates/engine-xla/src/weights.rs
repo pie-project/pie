@@ -677,8 +677,7 @@ fn gemm_only(
         inputs.clear();
         node.op.inputs(&mut inputs);
         let w = match &node.op {
-            // XLA ships no fused kernels (`crate::FUSIONS` is empty), so no
-            // `Fused` op reaches a trace this reads.
+            // The one fused op XLA forms (`crate::FUSIONS`) holds no matmul.
             Operation::Linear(
                 Linear::Matmul {
                     w,
@@ -760,13 +759,20 @@ fn routed_dense(
         inputs.clear();
         node.op.inputs(&mut inputs);
         let bank = match &node.op {
-            Operation::Linear(Linear::MoeSelect { bank, .. }) => Some(*bank),
-            Operation::Linear(Linear::MatmulGrouped { w, .. }) => Some(*w),
-            _ => None,
+            Operation::Linear(Linear::MoeSelect { bank, .. }) => vec![*bank],
+            Operation::Linear(Linear::MatmulGrouped { w, .. }) => vec![*w],
+            Operation::Fused(poem_ir::Fused::MoeExperts { select, down, .. }) => [select, down]
+                .into_iter()
+                .filter_map(|op| match op.as_ref() {
+                    Linear::MoeSelect { bank, .. } => Some(*bank),
+                    _ => None,
+                })
+                .collect(),
+            _ => Vec::new(),
         };
         for &v in &inputs {
             let Some(p) = param_of(v) else { continue };
-            if Some(v) == bank {
+            if bank.contains(&v) {
                 out.insert(p);
             } else {
                 other.insert(p);
