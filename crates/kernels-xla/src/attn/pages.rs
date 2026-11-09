@@ -60,7 +60,7 @@ impl Shape {
         // a chunk's temporaries
         2 * span * (w + wv) * 2
             + wv * QP * 4
-            + 2 * G * (qh * h.d * 2 + h.dv * QP * 4 + 2 * QP * 4)
+            + 2 * G * (qh * h.d * 4 + h.dv * QP * 4 + 2 * QP * 4)
             + 8 * CHUNK * (w + wv) * 4
     }
 }
@@ -69,7 +69,8 @@ impl Shape {
 pub(crate) fn fits(span: i64, h: &Heads, vmem_cap: i64) -> bool {
     h.d % 128 == 0
         && h.dv % 128 == 0
-        && h.qh() <= 128
+        && h.qh() <= QP
+        && h.qh() % 8 == 0
         && span % CHUNK == 0
         && Shape::vmem(span, h) <= vmem_cap
 }
@@ -112,7 +113,7 @@ fn kernel(s: &Shape, vmem_cap: i64) -> Built<Compiled> {
         semantics: vec![Sem::Arbitrary],
         prefetch: vec![vec![table], vec![rp], vec![rp], vec![rp]],
         ins: vec![
-            block(vec![rp * qh, d], Elem::Bf16, vec![G * qh, d]),
+            block(vec![rp * qh, d], Elem::F32, vec![G * qh, d]),
             whole(vec![slots, w]),
             whole(vec![slots, wv]),
         ],
@@ -253,7 +254,10 @@ fn kernel(s: &Shape, vmem_cap: i64) -> Built<Compiled> {
             let at = b.muli(r, qhv)?;
             let at = b.as_index(at)?;
             let i0 = b.index(0);
+            // f32 in the block: a row's `qh` heads start on an f32 tile
+            // row for any `qh` a multiple of 8
             let q = b.vload(q_ref, &[at, i0], &[qh, d])?;
+            let q = b.convert_f(q, Elem::Bf16)?;
             let q = match qpad {
                 Some(z) => b.concat(&[q, z], 0)?,
                 None => q,
@@ -400,12 +404,12 @@ pub(crate) fn attend(
     let lane = pad_i(f, lane)?;
     let lo = pad_i(f, lo)?;
     let hi = pad_i(f, hi)?;
-    let q = f.convert(q, Elem::Bf16);
+    let q = f.convert(q, Elem::F32);
     let q = f.reshape(q, &[r * qh, h.d])?;
     let q = if rp == r {
         q
     } else {
-        let z = f.const_f(Elem::Bf16, 0.0, &[]);
+        let z = f.const_f(Elem::F32, 0.0, &[]);
         f.pad(q, z, &[0, 0], &[(rp - r) * qh, 0], &[0, 0])?
     };
     let keys = f.convert(keys, Elem::Bf16);
