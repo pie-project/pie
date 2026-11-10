@@ -391,3 +391,11 @@ The `new-memory/` directory is bookkeeping and is removed before anything lands 
   refused by the 16-row rs limit (degenerate mode serves it) — design decision pending (proposed: overflow rows
   beyond 16 borrow shared-pool slots). (3) no mamba/Nemotron mini importable for e2e.
 - BC + RW merge stays on hold until (1) and (2) are resolved.
+
+### M27 — 2026-11-10: sliding-window kv is a trimmed list (contract 19)
+- Decision (user): window kv uses the list shape kind (one window list per distinct window), slots freed by refcount
+  + per-fire epoch once wholly below `committed_end - window`; trimmed table entries are ref 0. Ring shape, ring caps
+  (W + draft + fire rows), wrap CoW, gcd addressing and `kv.window_copies` are removed. Reason: reuses the kv list's
+  allocation / sharing / fork / prefix-cache / evacuation; prefill > W and spec rollback need no extra rules; Metal
+  needs only trimming. Cost: one alloc/free per T tokens (O(1)), epoch fencing already exists (17).
+- Work: compiler recipe (window list shapes), runtime trim, CUDA (BC) ring path -> list, Metal (BM) trim.

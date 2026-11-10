@@ -15,8 +15,9 @@ must need one poem line and no engine change.
 3. Chunk size C and slot sizes are chosen by the compiler as `f(model, DeviceProfile)`: large on server CUDA
    (~16MB), small on on-device Metal. C is a load-time constant for the engine.
 4. Slot shapes: **fixed** (GDN/mamba/conv state, VAE frame cache, engram/replay ids, snapshots), **list** (full-attention kv, compressed pools via `tokens // r`,
-   drafter kv: T tokens x all rows, layer-major inside the slot), **ring** (sliding-window kv only).
-   A ring with a small static cap folds into fixed. Fixed records larger than C split into equal pieces that never
+   drafter kv: T tokens x all rows, layer-major inside the slot; sliding-window kv is a **window list**: the same
+   list shape kind, one shape per distinct window, whose slots are freed once wholly outside the window — no ring).
+   Fixed records larger than C split into equal pieces that never
    cross an op's atom (GDN/KDA/mamba: head axis; conv: channel; conv3d frame cache: frame-position axis 0;
    attention: token; n-gram ids: uncuttable). Do not cut pieces below 1MiB until prefill GDN is measured.
    Fixed sets: ONE per working set (resting or running) plus ONE copy-on-write set per lane that runs in a fire
@@ -32,7 +33,7 @@ must need one poem line and no engine change.
    through evacuation (batched D2D copy + logical->physical chunk table update on the stream). Never map/commit on
    the fire path; commit a segment ahead of need.
 9. poem: `state(shape, dtype)` declared at model construction like `weight()`; first axis `tokens` (or
-   `tokens // r`) means per-token (list/ring), otherwise fixed. Names come from the model-tree path
+   `tokens // r`) means per-token (list), otherwise fixed. Names come from the model-tree path
    (`layers.9.delta`). `caches()`, `HybridSpec`, `kv_space`, string lookups, `write_page/offset` go away.
    Retention (window) is inferred from the reading op's window; TP split from shard inference; head_dim/live from
    the attention op. kv space disappears from IR; stream scheduler orders per state row, not per space; mask and

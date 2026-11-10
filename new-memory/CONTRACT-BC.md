@@ -13,7 +13,7 @@ Proposed by the L40S session (branch `sc/l40s-bc`), accepted by New Pie. Runtime
    model the top `act_chunks_max` span as segments committed from load.
 3. **kv addressing.** Kernels get `addr = plane_base + q * G`, G = gcd(C, slot_bytes) per token shape,
    q = (physical_chunk*C + index*slot_bytes)/G computed by the engine from the lane's slot refs. List shapes:
-   C is a multiple of the slot, so G = slot_bytes and q = chunk*slots_per_chunk + index. Ring shapes use the gcd form.
+   C is a multiple of the slot, so G = slot_bytes and q = chunk*slots_per_chunk + index. Ring shapes use the gcd form (removed by 19).
 4. **Lane inputs.** `Lane.tables`: list/ring slot refs in token order (ring ref 0 = null chunk).
    `Lane.fixed: Vec<(ShapeId, Vec<[u32; 2]>)>` — one `[run, cow]` per piece, in piece order.
    `cow == run` is legal and means write in place (the normal decode case); `cow != run` means the engine copies
@@ -71,3 +71,14 @@ Proposed by the L40S session (branch `sc/l40s-bc`), accepted by New Pie. Runtime
     Fixed records hold state only. Forks share rs-list slots by refcount; a write into a shared, partially filled tail
     slot is preceded by a slot copy (runtime asks via `copy_slots`, or the engine copies a `(src, dst)` pair stated in
     the fire). Contract 15 (group CoW of the state record when a lane folds) still applies to the state record.
+19. **Sliding-window kv is a trimmed list, not a ring (supersedes every ring rule; amends 3, 4, 11, 12).**
+    Facts state window lists as `SlotKind::List` shapes with a `window` (rows retained); one shape per distinct
+    window, layers of that window layer-major inside the slot; T = the kv page size. `Lane.tables` for a window list
+    has the same token-order length as the full table; slots the runtime has trimmed are ref 0 (null chunk) — today's
+    window kernels already skip pages outside the window, so they read it unchanged. The runtime drops a slot from a
+    working set once its last row is below `committed_end - window` (rows of a fire still being decided — spec drafts —
+    are never counted as committed); freeing goes through refcount and the per-fire epoch (17). Prefill longer than the
+    window simply holds more slots until the next trim. Forks / prefix-cache entries share window slots by refcount
+    like the kv list; a write into a shared partially filled tail slot follows the kv list's tail rule. No ring cap,
+    ring addressing, gcd form or `kv.window_copies` remain; a backend's ring path is deleted, not kept.
+
