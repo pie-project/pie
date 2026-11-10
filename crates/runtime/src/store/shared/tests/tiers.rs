@@ -73,7 +73,7 @@ impl Bytes {
 fn tiered(mut facts: ChunkFacts, disk: u32) -> (Shared, Tiers, crate::store::registry::Stores) {
     facts.host_chunks = HOST_CHUNKS;
     facts.disk_chunks = disk;
-    let shared: Shared = Arc::new(Mutex::new(SharedPool::new(&facts, 2, 256).unwrap()));
+    let shared: Shared = Arc::new(Mutex::new(SharedPool::new(&facts, 256).unwrap()));
     let tiers = Tiers::of(&facts).unwrap();
     let stores = crate::store::registry::shared_stores(&shared, &tiers, 16, 256);
     (shared, tiers, stores)
@@ -516,7 +516,7 @@ fn every_window_list_parks_in_its_own_shape_and_comes_back() {
     use crate::pipeline::fire::rs::settle;
     let mut facts = window_facts();
     facts.host_chunks = HOST_CHUNKS;
-    let shared: Shared = Arc::new(Mutex::new(SharedPool::new(&facts, 2, 256).unwrap()));
+    let shared: Shared = Arc::new(Mutex::new(SharedPool::new(&facts, 256).unwrap()));
     let tiers = Tiers::of(&facts).unwrap();
     let stores = crate::store::registry::shared_stores(&shared, &tiers, 16, 256);
     let mut rs = stores.rs.lock().unwrap();
@@ -604,7 +604,7 @@ fn a_kv_list_run_persists_to_disk_and_a_restart_brings_it_back() {
     };
     let mut bytes = Bytes::default();
 
-    let shared: Shared = Arc::new(Mutex::new(SharedPool::new(&facts, 2, 256).unwrap()));
+    let shared: Shared = Arc::new(Mutex::new(SharedPool::new(&facts, 256).unwrap()));
     let mut kv = store_for(&shared);
     assert_eq!(kv.keep_disk(&journal, true).unwrap(), 0);
     let pages = kv.reserve_device_pages(3).unwrap();
@@ -642,7 +642,7 @@ fn a_kv_list_run_persists_to_disk_and_a_restart_brings_it_back() {
     bytes.clobber_device();
 
     // The next run: a fresh pool and store, the journal and the slot file.
-    let shared: Shared = Arc::new(Mutex::new(SharedPool::new(&facts, 2, 256).unwrap()));
+    let shared: Shared = Arc::new(Mutex::new(SharedPool::new(&facts, 256).unwrap()));
     let mut kv = store_for(&shared);
     assert_eq!(
         kv.keep_disk(&journal, true).unwrap(),
@@ -714,7 +714,7 @@ fn host_cache_goes_on_down_to_disk_and_a_restart_brings_it_back_bitwise() {
     };
     let mut bytes = Bytes::default();
 
-    let shared: Shared = Arc::new(Mutex::new(SharedPool::new(&facts, 2, 256).unwrap()));
+    let shared: Shared = Arc::new(Mutex::new(SharedPool::new(&facts, 256).unwrap()));
     let mut kv = store_for(&shared);
     assert_eq!(kv.keep_disk(&journal, true).unwrap(), 0);
     let host_free = kv.host_swap_available();
@@ -775,7 +775,7 @@ fn host_cache_goes_on_down_to_disk_and_a_restart_brings_it_back_bitwise() {
         .0
         .retain(|(domain, ..), _| *domain == MemoryDomain::LocalDisk);
 
-    let shared: Shared = Arc::new(Mutex::new(SharedPool::new(&facts, 2, 256).unwrap()));
+    let shared: Shared = Arc::new(Mutex::new(SharedPool::new(&facts, 256).unwrap()));
     let mut kv = store_for(&shared);
     assert_eq!(kv.keep_disk(&journal, true).unwrap(), 3, "taken back");
     let run = kv.cached_run_any_tier(&keys);

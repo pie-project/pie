@@ -438,7 +438,6 @@ async fn bootstrap_inner(config: Config) -> Result<BootstrapHandle> {
                 );
                 let pool = crate::store::shared::SharedPool::new(
                     &d.chunks,
-                    d.limits.max_forward_requests as u32,
                     u32::try_from(d.limits.max_context).unwrap_or(u32::MAX),
                 )
                 .map_err(|error| anyhow::anyhow!("engine pools: {error}"))?;

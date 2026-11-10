@@ -95,7 +95,7 @@ fn facts() -> ChunkFacts {
 }
 
 fn pool() -> SharedPool {
-    SharedPool::new(&facts(), 2, 256).unwrap()
+    SharedPool::new(&facts(), 256).unwrap()
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -492,7 +492,7 @@ fn governor_bytes_count_the_top_span_as_committed_from_the_load() {
         max: 8,
         growth: SegmentGrowth::Fixed,
     };
-    let fixed = SharedPool::new(&fixed, 2, 256).unwrap();
+    let fixed = SharedPool::new(&fixed, 256).unwrap();
     assert_eq!(fixed.growth(), Growth::Fixed);
     assert_eq!(fixed.held(), u64::from(TOTAL) * CHUNK);
 }
@@ -512,7 +512,7 @@ fn pinned_or_unready_facts_are_refused() {
     );
     assert!(!SharedPool::states_shared(&degenerate));
     assert!(matches!(
-        SharedPool::new(&degenerate, 1, 16),
+        SharedPool::new(&degenerate, 16),
         Err(SharedError::Pinned(0))
     ));
     assert!(SharedPool::states_shared(&facts()));
@@ -527,7 +527,7 @@ fn pinned_or_unready_facts_are_refused() {
         MIB,
     ));
     assert!(matches!(
-        SharedPool::new(&two_lists, 1, 16),
+        SharedPool::new(&two_lists, 16),
         Err(SharedError::Shapes {
             kind: "kv list",
             ..
@@ -549,13 +549,13 @@ fn pinned_or_unready_facts_are_refused() {
     };
     let mut kv_and_rs = facts();
     kv_and_rs.shapes.push(rs_list(EngineShape(5)));
-    let pool = SharedPool::new(&kv_and_rs, 1, 16).unwrap();
+    let pool = SharedPool::new(&kv_and_rs, 16).unwrap();
     assert_eq!(pool.list().map(|list| list.id), Some(LIST));
     assert_eq!(pool.rs_list().map(|list| list.id), Some(EngineShape(5)));
     let mut two_rs = kv_and_rs;
     two_rs.shapes.push(rs_list(EngineShape(6)));
     assert!(matches!(
-        SharedPool::new(&two_rs, 1, 16),
+        SharedPool::new(&two_rs, 16),
         Err(SharedError::Shapes {
             kind: "rs list",
             ..
@@ -592,7 +592,7 @@ const RS_POOL: ShapeId = 3;
 #[test]
 fn state_short_counts_as_the_kv_list_slots_whose_chunks_it_takes() {
     use crate::store::rs::RsUnits;
-    let pool = SharedPool::new(&fixed_facts(), 2, 256).unwrap();
+    let pool = SharedPool::new(&fixed_facts(), 256).unwrap();
     let spc = |shape: ShapeId| u64::from(pool.pool().shape(shape).unwrap().slots_per_chunk);
     let list = spc(LIST_POOL);
     let rs = spc(RS_POOL);
@@ -613,7 +613,7 @@ fn state_short_counts_as_the_kv_list_slots_whose_chunks_it_takes() {
 
     // A model whose only state is its windows (gemma): window list slots,
     // each list by its own chunks, narrowest first.
-    let windowed = SharedPool::new(&window_facts(), 2, 256).unwrap();
+    let windowed = SharedPool::new(&window_facts(), 256).unwrap();
     let spc = |pool: &SharedPool, shape: ShapeId| {
         u64::from(pool.pool().shape(shape).unwrap().slots_per_chunk)
     };
@@ -636,7 +636,7 @@ fn the_stores_take_list_refs_and_records_and_a_fork_names_its_cow() {
     use crate::store::rs::RsGeometry;
 
     let facts = fixed_facts();
-    let shared: Shared = Arc::new(Mutex::new(SharedPool::new(&facts, 2, 256).unwrap()));
+    let shared: Shared = Arc::new(Mutex::new(SharedPool::new(&facts, 256).unwrap()));
     let stores = crate::store::registry::shared_stores(&shared, &Tiers::default(), 16, 256);
     assert!(stores.shared.is_some());
     // kv pages are the list shape's slot refs, from the one pool.
@@ -756,7 +756,7 @@ fn every_lane_of_a_group_names_the_record_the_group_writes() {
     use crate::store::rs::RsGeometry;
 
     let facts = fixed_facts();
-    let shared: Shared = Arc::new(Mutex::new(SharedPool::new(&facts, 2, 256).unwrap()));
+    let shared: Shared = Arc::new(Mutex::new(SharedPool::new(&facts, 256).unwrap()));
     let stores = crate::store::registry::shared_stores(&shared, &Tiers::default(), 16, 256);
     let geom = RsGeometry {
         state_size: 1024,
@@ -873,7 +873,7 @@ fn a_snapshot_names_every_piece_of_its_record() {
     use crate::store::rs::RsGeometry;
 
     let facts = fixed_facts();
-    let shared: Shared = Arc::new(Mutex::new(SharedPool::new(&facts, 2, 256).unwrap()));
+    let shared: Shared = Arc::new(Mutex::new(SharedPool::new(&facts, 256).unwrap()));
     let stores = crate::store::registry::shared_stores(&shared, &Tiers::default(), 16, 256);
     let mut rs = stores.rs.lock().unwrap();
     let ws = rs.create_working_set(RsGeometry {
@@ -910,7 +910,7 @@ fn a_snapshot_names_every_piece_of_its_record() {
     // A record of one piece is named by its slot alone.
     let mut one = fixed_facts();
     one.shapes.retain(|shape| shape.id != GDN);
-    let mut pool = SharedPool::new(&one, 2, 256).unwrap();
+    let mut pool = SharedPool::new(&one, 256).unwrap();
     let [record] = pool.take_records(1).unwrap()[..] else {
         panic!("one record");
     };
@@ -972,7 +972,7 @@ fn a_drained_segment_goes_once_the_next_fire_retires() {
 /// nothing (before, it went back at once).
 #[test]
 fn a_freed_slot_waits_for_the_fire_that_read_it() {
-    let shared: Shared = Arc::new(Mutex::new(SharedPool::new(&fixed_facts(), 2, 256).unwrap()));
+    let shared: Shared = Arc::new(Mutex::new(SharedPool::new(&fixed_facts(), 256).unwrap()));
     let stores = crate::store::registry::shared_stores(&shared, &Tiers::default(), 16, 256);
     let available = || shared.lock().unwrap().pool().available(LIST_POOL);
     crate::store::registry::with_kv_lock(&stores.kv, "test", |kv| {
@@ -1040,7 +1040,7 @@ fn metal_like_facts() -> ChunkFacts {
 #[test]
 fn uncommitted_segments_are_not_pages_out() {
     let facts = metal_like_facts();
-    let shared: Shared = Arc::new(Mutex::new(SharedPool::new(&facts, 1, 4096).unwrap()));
+    let shared: Shared = Arc::new(Mutex::new(SharedPool::new(&facts, 4096).unwrap()));
     let stores = crate::store::registry::shared_stores(&shared, &Tiers::default(), 16, 4096);
     let counts = || {
         crate::store::registry::with_kv_lock(&stores.kv, "test", |kv| {
@@ -1108,7 +1108,7 @@ fn beam_lanes_leave_their_rows_unfolded_in_rs_list_slots() {
     use crate::store::rs::{RsGeometry, RsUnits};
 
     let facts = fixed_facts();
-    let shared: Shared = Arc::new(Mutex::new(SharedPool::new(&facts, 3, 256).unwrap()));
+    let shared: Shared = Arc::new(Mutex::new(SharedPool::new(&facts, 256).unwrap()));
     let stores = crate::store::registry::shared_stores(&shared, &Tiers::default(), 16, 256);
     let mut rs = stores.rs.lock().unwrap();
     // The geometry's page is not the rs list's: the list's slot holds 4.
@@ -1186,7 +1186,7 @@ fn a_fork_shares_rs_slots_and_copies_a_shared_tail_before_writing() {
     use crate::store::rs::{RsGeometry, RsUnits};
 
     let facts = fixed_facts();
-    let shared: Shared = Arc::new(Mutex::new(SharedPool::new(&facts, 2, 256).unwrap()));
+    let shared: Shared = Arc::new(Mutex::new(SharedPool::new(&facts, 256).unwrap()));
     let stores = crate::store::registry::shared_stores(&shared, &Tiers::default(), 16, 256);
     let mut rs = stores.rs.lock().unwrap();
     let ws = rs.create_working_set(RsGeometry {
@@ -1351,7 +1351,7 @@ fn window_live(shared: &Shared) -> (u64, u64) {
 
 fn windowed_stores() -> (ChunkFacts, Shared, crate::store::registry::Stores) {
     let facts = window_facts();
-    let shared: Shared = Arc::new(Mutex::new(SharedPool::new(&facts, 2, 256).unwrap()));
+    let shared: Shared = Arc::new(Mutex::new(SharedPool::new(&facts, 256).unwrap()));
     let stores = crate::store::registry::shared_stores(&shared, &Tiers::default(), 16, 256);
     (facts, shared, stores)
 }
@@ -1666,7 +1666,7 @@ fn boot_metal(
     anyhow::Result<crate::store::weights::WeightCache>,
 ) {
     crate::store::weights::set_streaming(engine, mode.streams(true));
-    let mut shared = SharedPool::new(facts, 1, 4096).unwrap();
+    let mut shared = SharedPool::new(facts, 4096).unwrap();
     let first = shared.weights_first();
     let cache =
         crate::store::weights::boot_cache(engine, mode, &facts.weights, first, shared.pool_mut());
