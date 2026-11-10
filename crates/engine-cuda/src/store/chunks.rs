@@ -390,6 +390,22 @@ impl Chunks {
         self.range.span(self.slot_at(kind, id)? + offset, len)
     }
 
+    /// The address of weight slot `slot` (a slot ref) of the row-streamed
+    /// table `rows`, where its chunk is backed.
+    pub fn row_slot(&self, rows: &crate::store::layout::RowsShape, slot: u32) -> Result<u64> {
+        let logical = slot / rows.per_chunk;
+        let physical = self.table.physical(logical).ok_or(Fault::Ceiling {
+            what: "chunks of the state pool",
+            need: u64::from(logical) + 1,
+            have: u64::from(self.total),
+        })?;
+        self.range.span(
+            u64::from(physical) * self.layout.chunk_bytes
+                + u64::from(slot % rows.per_chunk) * rows.slot_bytes,
+            rows.slot_bytes,
+        )
+    }
+
     /// The id a paged kernel reads page `id`'s slot by.
     pub fn page_id(&self, kind: Kind, id: u32) -> Result<i32> {
         let (chunk, index) = self.place(kind, id)?;
@@ -547,7 +563,19 @@ impl Chunks {
             disk_chunks: 0,
             disk_persistent: false,
             disk_kept: false,
-            weights: Vec::new(),
+            weights: layout
+                .rows
+                .iter()
+                .map(|rows| engine::chunk::WeightShape {
+                    id: rows.id,
+                    kind: engine::chunk::WeightKind::Rows,
+                    slot_bytes: rows.slot_bytes,
+                    slots_per_chunk: rows.per_chunk,
+                    count: rows.blocks,
+                    floor_slots: rows.floor.min(rows.blocks),
+                    name: format!("param {}", rows.param),
+                })
+                .collect(),
         }
     }
 }

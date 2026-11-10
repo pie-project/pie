@@ -108,6 +108,12 @@ pub(super) fn bake(boot: &mut Boot<'_>) -> Result<Baked> {
             );
         }
     }
+    // The tables the weight cache streams by their rows keep their copy on
+    // the pinned host tier: a row not cached is read from it in place.
+    let streamed = crate::store::layout::streamed_rows(&boot.trace);
+    if boot.residency.host_rows(&boot.trace, &streamed)? > 0 {
+        boot.deferred_tier = false;
+    }
     boot.slots = poem_compiler::state_slots(boot.slots, &boot.trace, DEFAULT_STATE_SLOTS);
 
     kernels_cuda::disk::install(boot.cache_dir);
@@ -886,6 +892,16 @@ impl Shell {
         }
         let buffers = Buffers::reserve(&boot.trace, paging, budgets.tokens.max_tokens, &pools)?;
         let mut pools = pools;
+        // Each row-streamed table's cache opens over its host copy.
+        let hosts: Vec<(u32, u64)> = pools
+            .row_params()
+            .into_iter()
+            .filter_map(|param| match weights.table().0.get(param as usize) {
+                Some(Some(crate::run::WeightRow::Dense(table))) => Some((param, table.ptr)),
+                _ => None,
+            })
+            .collect();
+        pools.seat_rows(&hosts)?;
         // Committed whole: a fire reading out past one row a lane (a verify
         // reads every row) would otherwise grow it outside the fit.
         let mut arena = Arena::reserve(arena_bytes);

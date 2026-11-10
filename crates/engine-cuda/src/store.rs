@@ -562,6 +562,8 @@ pub struct Pools {
     /// The state pool: the kv rows' pages and the working sets' recurrent
     /// records, a slot each.
     chunks: chunks::Chunks,
+    /// The row-streamed tables' caches, a shape each ([`Pools::seat_rows`]).
+    row_caches: Vec<RowCache>,
     /// Each record a lane named by slot refs, by its first piece's ref: the
     /// refs of all its pieces.
     records: std::collections::HashMap<u32, Vec<u32>>,
@@ -898,6 +900,7 @@ impl Pools {
         Ok(Pools {
             pool,
             chunks,
+            row_caches: Vec::new(),
             records: std::collections::HashMap::new(),
             id_lanes: 1,
             snap_entries: 1,
@@ -1914,7 +1917,168 @@ impl Pools {
         evacuation: &engine::chunk::Evacuation,
     ) -> Result<()> {
         self.fence_all_swaps(stream)?;
-        self.chunks.evacuate(stream, evacuation)
+        self.chunks.evacuate(stream, evacuation)?;
+        // A cached block's chunk may have moved: its table entry with it.
+        self.stage_row_tables(stream)
+    }
+
+    /// Opens the cache of each row-streamed table: `hosts` gives each
+    /// table's mapped host copy by its param. Every block starts where that
+    /// copy has it, read in place until the runtime names a slot for it.
+    pub fn seat_rows(&mut self, hosts: &[(u32, u64)]) -> Result<()> {
+        self.row_caches.clear();
+        for shape in &self.chunks.layout().rows {
+            let Some(&(_, host)) = hosts.iter().find(|(param, _)| *param == shape.param) else {
+                return Err(Fault::program(
+                    "store::rows",
+                    format!(
+                        "param {} streams by its rows and has no host copy",
+                        shape.param
+                    ),
+                ));
+            };
+            let blocks = shape.blocks as usize;
+            let cache = RowCache {
+                shape: shape.clone(),
+                host,
+                table: crate::device::Buffer::zeroed(blocks * 8)?,
+                hits: crate::device::Buffer::zeroed(blocks * 4)?,
+                slots: vec![None; blocks],
+            };
+            self.row_caches.push(cache);
+        }
+        self.stage_row_tables(core::ptr::null_mut())
+    }
+
+    /// Each cache's table as its blocks now lie, written behind what
+    /// `stream` holds (a null stream: at once, before any fire).
+    fn stage_row_tables(&mut self, stream: *mut core::ffi::c_void) -> Result<()> {
+        for at in 0..self.row_caches.len() {
+            let cache = &self.row_caches[at];
+            let block = u64::from(cache.shape.block_rows) * cache.shape.row_bytes;
+            let mut entries = Vec::with_capacity(cache.slots.len() * 8);
+            for (atom, slot) in cache.slots.iter().enumerate() {
+                let address = match slot {
+                    Some(slot) => self.chunks.row_slot(&cache.shape, *slot)?,
+                    None => cache.host + atom as u64 * block,
+                };
+                entries.extend_from_slice(&address.to_le_bytes());
+            }
+            let cache = &mut self.row_caches[at];
+            if stream.is_null() {
+                cache.table.write(0, &entries)?;
+            } else {
+                cache.table.stage(stream, 0, &entries)?;
+            }
+        }
+        Ok(())
+    }
+
+    /// The params of the tables streamed by their rows.
+    #[must_use]
+    pub fn row_params(&self) -> Vec<u32> {
+        self.chunks
+            .layout()
+            .rows
+            .iter()
+            .map(|rows| rows.param)
+            .collect()
+    }
+
+    /// The row table of each streamed table, by its param: what its gather
+    /// reads its rows through, counting each block's reads.
+    #[must_use]
+    pub fn row_tables(&self) -> Vec<(u32, kernels_cuda::linear::moe::RowTable)> {
+        self.row_caches
+            .iter()
+            .map(|cache| {
+                (
+                    cache.shape.param,
+                    kernels_cuda::linear::moe::RowTable::located(
+                        cache.table.ptr(),
+                        cache.shape.block_rows,
+                    )
+                    .counting(cache.hits.ptr()),
+                )
+            })
+            .collect()
+    }
+
+    /// See `Engine::weight_residency`: the blocks newly named a slot are
+    /// filled from the host copy and every table rewritten, on `stream`
+    /// behind the fires it holds and before the next. A block no longer
+    /// named is read from the host copy again.
+    pub fn weight_residency(
+        &mut self,
+        stream: *mut core::ffi::c_void,
+        residency: &engine::chunk::WeightResidency,
+    ) -> Result<()> {
+        for at in 0..self.row_caches.len() {
+            let shape = self.row_caches[at].shape.clone();
+            let mut named: Vec<Option<u32>> = vec![None; shape.blocks as usize];
+            for resident in residency
+                .resident
+                .iter()
+                .filter(|resident| resident.atom.shape == shape.id)
+            {
+                let Some(seat) = named.get_mut(resident.atom.atom as usize) else {
+                    return Err(Fault::Ceiling {
+                        what: "row blocks of a streamed table",
+                        need: u64::from(resident.atom.atom) + 1,
+                        have: u64::from(shape.blocks),
+                    });
+                };
+                *seat = Some(resident.slot);
+            }
+            let block = u64::from(shape.block_rows) * shape.row_bytes;
+            let table_bytes = shape.rows * shape.row_bytes;
+            let host = self.row_caches[at].host;
+            let mut fills = Vec::new();
+            for (atom, slot) in named.iter().enumerate() {
+                let Some(slot) = *slot else { continue };
+                if self.row_caches[at].slots[atom] == Some(slot) {
+                    continue;
+                }
+                let from = atom as u64 * block;
+                let bytes = block.min(table_bytes.saturating_sub(from));
+                fills.push((
+                    self.chunks.row_slot(&shape, slot)?,
+                    host + from,
+                    usize::try_from(bytes).unwrap_or(0),
+                ));
+            }
+            crate::device::copy_batch(stream, false, &fills)?;
+            self.row_caches[at].slots = named;
+        }
+        self.stage_row_tables(stream)
+    }
+
+    /// See `Engine::weight_uses`: each block's reads since the last call,
+    /// read on `stream` behind the fires that counted them, and zeroed.
+    pub fn weight_uses(
+        &mut self,
+        stream: *mut core::ffi::c_void,
+    ) -> Result<engine::chunk::WeightUses> {
+        let mut uses = Vec::new();
+        for cache in &mut self.row_caches {
+            let blocks = cache.slots.len();
+            let mut counted = vec![0u8; blocks * 4];
+            cache.hits.read_on(stream, 0, &mut counted)?;
+            cache.hits.zero_span_on(stream, 0, blocks * 4)?;
+            for (atom, reads) in counted.as_chunks::<4>().0.iter().enumerate() {
+                let reads = u32::from_le_bytes(*reads);
+                if reads > 0 {
+                    uses.push((
+                        engine::chunk::WeightAtom {
+                            shape: cache.shape.id,
+                            atom: atom as u32,
+                        },
+                        reads,
+                    ));
+                }
+            }
+        }
+        Ok(engine::chunk::WeightUses { uses })
     }
 
     /// The state pool as the runtime counts it, for fires of up to
@@ -2752,7 +2916,7 @@ fn lay(
         poem_compiler::chunk::plan(trace, budgets, &profile).map_err(|why| Fault::Unbound {
             what: format!("a chunk recipe for this load's cache rows: {why}"),
         })?;
-    layout::Layout::of(&recipe)
+    layout::Layout::of(&recipe, &layout::streamed_rows(trace))
 }
 
 /// The chunks a pool of `pages` kv pages takes: the null chunk, the pages'
@@ -2770,6 +2934,22 @@ fn chunks_at(layout: &layout::Layout, paging: &Paging, pages: u64, slots: u32) -
                     .map_or(1, |fixed| u64::from(fixed.pieces)),
         );
     u32::try_from(chunks).unwrap_or(u32::MAX)
+}
+
+/// A row-streamed table's cache: where each block of its rows lies (a pool
+/// slot the runtime named, or the mapped host copy), the device table its
+/// gather reads them through, and each block's reads since last asked.
+#[derive(Debug)]
+struct RowCache {
+    shape: layout::RowsShape,
+    /// The table's mapped host copy.
+    host: u64,
+    /// A u64 address a block.
+    table: crate::device::Buffer,
+    /// A u32 counter a block.
+    hits: crate::device::Buffer,
+    /// The slot ref each block is cached in.
+    slots: Vec<Option<u32>>,
 }
 
 /// One plane a page holds bytes in: `offset` into the page's slot of the

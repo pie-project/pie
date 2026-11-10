@@ -691,6 +691,7 @@ impl FireCtx<'_> {
             tables: FireTables {
                 mask_indptr: handles.mask_indptr,
                 pool_state: self.pools.pool_slabs(),
+                row_tables: self.pools.row_tables(),
             },
             device: self.device.device(),
             toggles: self.device.toggles(),

@@ -816,6 +816,16 @@ impl Engine for Cuda {
         self.loaded_mut()?.release_segments(segments).map_err(fault)
     }
 
+    fn weight_residency(&mut self, residency: &engine::chunk::WeightResidency) -> EngineResult<()> {
+        self.loaded_mut()?
+            .weight_residency(residency)
+            .map_err(fault)
+    }
+
+    fn weight_uses(&mut self) -> EngineResult<engine::chunk::WeightUses> {
+        self.loaded_mut()?.weight_uses().map_err(fault)
+    }
+
     fn evacuate(&mut self, evacuation: &engine::chunk::Evacuation) -> EngineResult<()> {
         self.loaded_mut()?.evacuate(evacuation).map_err(fault)
     }
