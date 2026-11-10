@@ -427,8 +427,12 @@ fn kernel(s: &Shape, vmem_cap: i64, mo: i64) -> Built<Compiled> {
                 };
                 let zs = b.splat_f(&[bk, n], Elem::F32, 0.0)?;
                 let st = b.matmul(kv, qf, zs, true)?;
-                let sc = b.splat_f(&[bk, n], Elem::F32, scale)?;
-                let st = b.mulf(st, sc)?;
+                let st = if scale == 1.0 {
+                    st
+                } else {
+                    let sc = b.splat_f(&[bk, n], Elem::F32, scale)?;
+                    b.mulf(st, sc)?
+                };
                 let bias = b.vload_all(bias_ref)?;
                 let bias = if gf == 1 {
                     bias
@@ -789,6 +793,14 @@ fn run(
     } = *s;
     let nb = rp / bq;
     let q2 = f.reshape(q4, &[r, h.qh() * h.d])?;
+    // A power-of-two scale (1/16 at d = 256) turns `q` exactly, before the
+    // kernel: its score tiles then take no multiply.
+    let unit = Shape { scale: 1.0, ..*s };
+    let (q2, s) = if s.scale != 1.0 && s.scale.log2().fract() == 0.0 {
+        (f.scale(q2, s.scale)?, &unit)
+    } else {
+        (q2, s)
+    };
     let pad_rows = |f: &mut Func, x: Val, fill: i64| -> Built<Val> {
         if rp == r {
             return Ok(x);
