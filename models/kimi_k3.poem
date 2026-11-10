@@ -430,11 +430,14 @@ LAYOUTS = [
 
 def configured(m, at):
     """The shape a configuration states of this model, its text model's keys
-    under `at`: AttnRes's block stride is a model's own, never a reading's."""
+    under `at`: AttnRes's block stride is a model's own, never a reading's.
+    Its MLA layers attend every cached key, no DSA indexer selecting them
+    (`dsa_config`, as K3.1 adds): no indexer heads."""
     return [
         config(at + "hidden_size", m.hidden),
         config(at + "num_hidden_layers", len(m.layers), or_deeper = True),
         config(at + "attn_res_block_size", m.res_block),
+        config(at + "dsa_config.index_num_heads", 0),
     ]
 
 def safetensors_format(m, layout):
