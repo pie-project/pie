@@ -134,17 +134,6 @@ pub fn qmm_point(
 }
 
 #[must_use]
-pub fn bm_rung(rows: i32) -> i32 {
-    let mut best = BM_RUNGS[0];
-    for &rung in &BM_RUNGS[1..] {
-        if rows >= rung {
-            best = rung;
-        }
-    }
-    best
-}
-
-#[must_use]
 pub fn mb_block(rows: i32, capacity: i32) -> Option<(i32, i32)> {
     let rows = rows.max(1);
     let capacity = capacity.max(1);

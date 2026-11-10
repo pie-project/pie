@@ -1831,40 +1831,6 @@ pub mod mla {
         )
     }
 
-    #[must_use]
-    pub fn selected_sweep(selection: &[i32], j_end: i32) -> Vec<i32> {
-        let mut keys = Vec::with_capacity(selection.len());
-        for &j in selection {
-            if j < 0 || j >= j_end {
-                continue;
-            }
-            keys.push(j);
-        }
-        keys
-    }
-
-    #[must_use]
-    pub fn flash_reading(scores: &[f32], values: &[f32], width: usize) -> Vec<f32> {
-        let mut acc = vec![0.0f32; width];
-        let mut m = -3.0e38f32;
-        let mut lsum = 0.0f32;
-        for (n, &score) in scores.iter().enumerate() {
-            let m_new = m.max(score);
-            let corr = (m - m_new).exp();
-            let p = (score - m_new).exp();
-            lsum = lsum * corr + p;
-            for (i, a) in acc.iter_mut().enumerate() {
-                *a = *a * corr + p * values[n * width + i];
-            }
-            m = m_new;
-        }
-        let inv = if lsum > 0.0 { 1.0 / lsum } else { 0.0 };
-        for a in &mut acc {
-            *a *= inv;
-        }
-        acc
-    }
-
     #[cfg(test)]
     mod tests {
         use super::*;
@@ -3449,19 +3415,5 @@ pub mod pool {
                 entries.plane_offset[1].arg(),
             ],
         )
-    }
-
-    #[must_use]
-    pub fn selected_cells(selection: &[i32], num_visible: i32, ratio: i32) -> Vec<i32> {
-        selection
-            .iter()
-            .filter(|c| **c >= 0 && **c < num_visible)
-            .map(|c| (c + 1) * ratio - 1)
-            .collect()
-    }
-
-    #[must_use]
-    pub fn compressed_rope_pos(closing_pos: i32, ratio: i32) -> i32 {
-        (closing_pos / ratio) * ratio
     }
 }
