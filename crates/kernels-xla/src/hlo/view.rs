@@ -350,7 +350,36 @@ impl Func {
             let per = self.like_i(row, nr);
             let at = self.div(row, per)?;
             let got = crate::blocks::gather(self, view.pool, at, nr, view.elem)?;
-            return Ok(Some(self.reshape(got, &[batch, nr * e])?));
+            let got = self.reshape(got, &[batch, nr * e])?;
+            let check = std::env::var("PIE_XLA_POOL_DMA_CHECK").ok();
+            if let Some(mode @ ("1" | "2")) = check.as_deref() {
+                // Debugging: the same rows by XLA's gather, bit for bit;
+                // any difference turns the whole read into NaN (`2`: against
+                // the next rows, which must differ: the check's own test).
+                let start = if mode == "2" {
+                    let one = self.like_i(row, 1);
+                    let r = self.add(row, one)?;
+                    let top = self.like_i(r, rows_total - nr);
+                    self.min(r, top)?
+                } else {
+                    row
+                };
+                let ids = self.rows_of(start, batch, nr)?;
+                let x = self.take_rows(view.pool, ids)?;
+                let x = self.reshape(x, &[batch, nr, LANES])?;
+                let x = self.unpack(x, view.elem)?;
+                let ub = uint(view.elem.bits());
+                let (a, b) = (self.bitcast(got, ub)?, self.bitcast(x, ub)?);
+                let ne = self.compare(Cmp::Ne, a, b)?;
+                let ne = self.convert(ne, Elem::I32);
+                let any = self.reduce(ne, &[0, 1], super::Fold::Max)?;
+                let zero = self.like_i(any, 0);
+                let same = self.compare(Cmp::Eq, any, zero)?;
+                let same = self.broadcast(same, &[batch, nr * e], &[])?;
+                let nan = self.const_f(view.elem, f64::NAN, &[batch, nr * e]);
+                return Ok(Some(self.select(same, got, nan)?));
+            }
+            return Ok(Some(got));
         }
         let got = if aligned && g % len == 0 && self.blocked(rows_total, nr) {
             // Whole blocks at multiples of their own rows: the pool as
