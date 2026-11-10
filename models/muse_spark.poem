@@ -109,7 +109,7 @@ def layout(id, deploy):
             v = weight([kv_w, hidden], w),
             g = weight([q_w, hidden], w),
             o_proj = weight([hidden, q_w], w),
-            kv = "kv.{}".format(l),
+            kv = state([tokens, 2, d.kv_heads, hd], deploy.kv),
             attn_norm = norm("attn_norm", hidden),
             attn_gate = weight([hidden], dtype.f32),
             pre_ffw_norm = norm("pre_ffw_norm", hidden),
@@ -141,7 +141,6 @@ def layout(id, deploy):
         norm_eps = d.norm_eps,
         post_norm_eps = d.post_norm_eps,
         gate_temperature = d.gate_temperature,
-        kv = deploy.kv,
         softcap = d.softcap,
         output_multiplier = d.output_multiplier,
         experts = d.experts,
@@ -238,12 +237,6 @@ def quark_bank(reads, w, planes):
 
 WINDOWED = 0
 FULL = 1
-
-def caches(m, c):
-    kv = c.kv_space(m.kv)
-    plane = m.kv_heads * m.head_dim
-    for w in m.layers:
-        c.kv(kv, w.kv, [plane, plane], m.head_dim, heads = True)
 
 def moe(m, w, x):
     """The routed experts at the pooled width: routed on the row, the row

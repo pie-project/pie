@@ -142,6 +142,49 @@ fn qwen3_moe(path: &str, _row: &CacheRow) -> String {
     layer_kv(path)
 }
 
+fn mimo_v2(path: &str, _row: &CacheRow) -> String {
+    match parts(path)[..] {
+        ["layers", l, "attn", "kv"] => format!("kv.{l}"),
+        _ => path.to_string(),
+    }
+}
+
+fn muse_glimmer(path: &str, _row: &CacheRow) -> String {
+    match parts(path)[..] {
+        ["layers", l, "kv"] => format!("kv.{l}"),
+        _ => path.to_string(),
+    }
+}
+
+fn muse_spark(path: &str, _row: &CacheRow) -> String {
+    match parts(path)[..] {
+        ["layers", l, "kv"] => format!("kv.{l}"),
+        _ => path.to_string(),
+    }
+}
+
+fn qwen3_asr(path: &str, _row: &CacheRow) -> String {
+    match parts(path)[..] {
+        ["text", "layers", l, "kv"] => format!("kv.{l}"),
+        _ => path.to_string(),
+    }
+}
+
+fn qwen3_tts(path: &str, _row: &CacheRow) -> String {
+    match parts(path)[..] {
+        [stack, "layers", l, "kv"] => format!("{stack}.kv.{l}"),
+        _ => path.to_string(),
+    }
+}
+
+fn gpt_oss(path: &str, _row: &CacheRow) -> String {
+    match parts(path)[..] {
+        ["layers", l, "attn", "kv"] => format!("kv.{l}"),
+        ["dflash", "blocks", b, "attn", "kv"] => format!("kv.dflash.{b}"),
+        _ => path.to_string(),
+    }
+}
+
 /// Every listed deployment of `package`, at one rank and at each count of
 /// [`RANKS`] it traces at.
 fn deployments(package: &str) -> Vec<Deployment> {
@@ -175,6 +218,12 @@ fn kept_whole(package: &str, name: &str) -> bool {
     match (package, &parts(name)[..]) {
         // Inkling's local layers read their kv through the local window.
         ("inkling", ["kv", _]) => true,
+        // Muse Glimmer's, Muse Spark's and gpt-oss's sliding layers read
+        // their kv through their window.
+        ("muse_glimmer" | "muse_spark" | "gpt_oss", ["kv", _]) => true,
+        // Qwen3-TTS's codec prenet attends through a window its row was
+        // never declared with: the handle's row is kept through it.
+        ("qwen3_tts", ["codec", "kv", _]) => true,
         // A DFlash block read through a window.
         ("qwen_3" | "gemma_4", ["kv", "dflash", _]) => true,
         _ => false,
@@ -189,8 +238,26 @@ fn left_space_zero_empty(deployment: &str) -> bool {
     deployment.starts_with("gemma4-e4b-mini-l1-")
 }
 
+/// Whether `caches()` declared `package`'s windowed space before its
+/// whole-sequence one: MiMo-V2's, space 0 its windowed layers' and space 1
+/// its full layers'. Spaces are now numbered whole-sequence first.
+fn window_space_first(package: &str) -> bool {
+    package == "mimo_v2"
+}
+
 fn renamed(package: &str, deployment: &str, trace: &Trace, rename: Renaming) -> Vec<CacheRow> {
     let mut rows = trace.caches.clone();
+    if window_space_first(package) {
+        for row in &mut rows {
+            if let CacheRow::Kv { space, .. } = row {
+                *space = match *space {
+                    0 => 1,
+                    1 => 0,
+                    other => other,
+                };
+            }
+        }
+    }
     if left_space_zero_empty(deployment) {
         for row in &mut rows {
             if let CacheRow::Kv { space, .. } = row {
@@ -291,5 +358,11 @@ mod moved {
         glm_4,
         minimax_m2,
         qwen3_moe,
+        mimo_v2,
+        muse_glimmer,
+        muse_spark,
+        qwen3_asr,
+        qwen3_tts,
+        gpt_oss,
     );
 }

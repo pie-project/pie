@@ -72,7 +72,7 @@ def layout(id, deploy):
             v = weight([kv_w, hidden], proj),
             gate = weight([q_w, hidden], proj),
             o_proj = weight([hidden, q_w], proj),
-            kv = "kv.{}".format(l),
+            kv = state([tokens, 2, d.kv_heads, hd], deploy.kv),
             attn_norm = norm("attn_norm"),
             attn_norm_eps = d.norm_eps,
             post_attn_norm = norm("post_attn_norm"),
@@ -102,7 +102,6 @@ def layout(id, deploy):
         theta = d.theta,
         sm_scale = f32(f32(d.qk_scale) / f32(sqrt(hd))),
         norm_eps = d.norm_eps,
-        kv = deploy.kv,
         softcap = d.softcap,
         output_multiplier = d.output_multiplier,
         embed = weight([d.vocab, hidden], w),
@@ -159,12 +158,6 @@ def rows(layout):
 
 WINDOWED = 0
 FULL = 1
-
-def caches(m, c):
-    kv = c.kv_space(m.kv)
-    plane = m.kv_heads * m.head_dim
-    for w in m.layers:
-        c.kv(kv, w.kv, [plane, plane], m.head_dim, heads = True)
 
 def forward(m, inputs):
     d = m.head_dim

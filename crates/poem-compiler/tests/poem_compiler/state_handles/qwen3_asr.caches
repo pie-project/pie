@@ -1,0 +1,8 @@
+qwen3-asr-0.6b-bf16-kv-bf16 84ae9c3a65f4e29f
+qwen3-asr-0.6b-bf16-kv-bf16-tp2 d497cc8cab06ba77
+qwen3-asr-0.6b-bf16-kv-bf16-tp4 373a61a13bc6ea27
+qwen3-asr-0.6b-bf16-kv-bf16-tp8 0dcfbed77c331d87
+qwen3-asr-0.6b-u8g64-kv-bf16 84ae9c3a65f4e29f
+qwen3-asr-0.6b-u8g64-kv-bf16-tp2 d497cc8cab06ba77
+qwen3-asr-0.6b-u8g64-kv-bf16-tp4 373a61a13bc6ea27
+qwen3-asr-0.6b-u8g64-kv-bf16-tp8 0dcfbed77c331d87
