@@ -53,15 +53,25 @@ fn a_plan_whose_cache_takes_the_banks_seats_no_expert() {
     let mut plan =
         Plan::cut(&ranking(), Budgets::device(full - bank_bytes)).expect("the dense planes fit");
     assert!(plan.banks().is_empty() && !plan.streams());
-    assert_eq!(plan.device_demand(), full);
+    // The banks are the pool's from the cut on: the weight tier is never
+    // charged for them, before the load moves them or after.
+    assert_eq!(plan.device_demand(), full - bank_bytes);
     plan.host_experts(&trace, &cached).expect("the banks pin");
     assert_eq!(plan.device_demand(), full - bank_bytes);
     assert_eq!(plan.cached_experts(), cached.as_slice());
+    // So is a load with no budget at all.
+    let plan = Plan::cut(&ranking(), Budgets::uncapped()).expect("uncapped plans");
+    assert_eq!(plan.device_demand(), full - bank_bytes);
     // A tighter one spills dense planes, and still seats no expert.
     let tight = (full - bank_bytes) * 3 / 4;
     let mut plan = Plan::cut(&ranking(), Budgets::device(tight)).expect("dense planes spill");
     assert!(plan.banks().is_empty(), "no expert is the plan's to seat");
     assert!(plan.streams(), "a dense plane left the device");
+    assert!(
+        plan.device_demand() <= tight,
+        "{} on the device under a budget of {tight}, before the banks move",
+        plan.device_demand()
+    );
     plan.host_experts(&trace, &cached).expect("the banks pin");
     assert!(
         plan.device_demand() <= tight,

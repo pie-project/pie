@@ -468,6 +468,27 @@ impl Scratch {
     }
 }
 
+/// Lets go of the resident pages of `plane`, a span of a read-only file
+/// mapping whose bytes were copied elsewhere: a later read faults them back
+/// in from the page cache.
+pub(crate) fn release_pages(plane: &[u8]) {
+    const PAGE: usize = 4096;
+    let at = plane.as_ptr() as usize;
+    let first = at.next_multiple_of(PAGE);
+    let end = (at + plane.len()) / PAGE * PAGE;
+    if end > first {
+        // SAFETY: whole pages inside a live read-only file mapping; the
+        // advice drops their resident copies and changes no contents.
+        unsafe {
+            libc::madvise(
+                first as *mut core::ffi::c_void,
+                end - first,
+                libc::MADV_DONTNEED,
+            );
+        }
+    }
+}
+
 pub(crate) fn available_memory() -> u64 {
     let read = |path: &str| std::fs::read_to_string(path).ok();
     // cgroup v2 names the limit `memory.max`; a v1 hierarchy (many docker
@@ -894,6 +915,21 @@ impl Weights {
         if let Some(tier) = experts.as_mut().filter(|tier| tier.deferring()) {
             crate::experts::count_deferred();
             arm_refill(tier);
+        }
+
+        // A boot that read its image out of the serving file copied each
+        // plane out of the file's mapping, which stays mapped for the planes
+        // read from it later: the pages of the ones copied are let go.
+        if from_cache && let Some(serving) = serving.as_ref() {
+            crate::device::ctx::sync(stream)?;
+            for at in 0..trace.params.len() {
+                if plan.mapped(at) {
+                    continue;
+                }
+                if let Some(plane) = u32::try_from(at).ok().and_then(|id| serving.plane(id)) {
+                    release_pages(plane);
+                }
+            }
         }
 
         let pairings = pairings(&landing, trace, &index)?;
