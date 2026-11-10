@@ -1,7 +1,7 @@
 # Tencent Hy4-preview, with its multi-token draft head or without, and its
 # six-layer, sixteen-expert miniature.
 
-load("//pie/codec.poem", "kept", "stacked_bank", read_weight = "weight")
+load("//pie/codec.poem", "kept", "land", "mx_widened", "stacked_bank", read_weight = "weight")
 load("//lib/adapters.poem", "banks", "corrected")
 load("//lib/hyper.poem", "collapse")
 load("//lib/mla.poem", "fp8_rows", "cache")
@@ -500,7 +500,7 @@ def read_attention(reads, a, at):
         quantized = "read",
     )
     reads.read(a.kv_a_norm, at("self_attn.kv_a_layernorm.weight"))
-    read_weight(reads, a.kv_b_proj, at("self_attn.kv_b_proj.weight"), quantized = "widen")
+    latent_up(reads, a.kv_b_proj, at("self_attn.kv_b_proj.weight"))
     reads.read(a.gate, at("self_attn.linear_gate.weight"))
     read_weight(reads, a.o_proj, [at("self_attn.o_proj.weight")], quantized = "read")
     reads.read(a.sink, at("self_attn.learnable_sink_param"))
@@ -519,6 +519,18 @@ def read_attention(reads, a, at):
     reads.read(ix.weights_proj, at("self_attn.indexer.weights_proj.weight"))
     reads.read_expr(ix.k_norm, src(at("self_attn.indexer.k_norm.weight")).gather(0, one))
     reads.read_expr(ix.k_norm_bias, src(at("self_attn.indexer.k_norm.bias")).gather(0, one))
+
+def latent_up(reads, w, name):
+    """The latent up-projection `w` at bf16, which the absorbs read. The FP8
+    release stores it MXFP8: e4m3 codes beside a u8 `.weight_scale`, one e8m0
+    exponent a 1x32 block of each row, which the codec's test for modelopt's
+    one-scale FP8 would take for a per-tensor f32 scale; it is widened by its
+    exponents here. Any other leg is widened as the codec reads it."""
+    scale = name[:-len(".weight")] + ".weight_scale"
+    if stored(name) == raw(dtype.e4m3) and has(scale) and stored(scale) == raw(dtype.u8):
+        land(reads, w, mx_widened(reads, name))
+    else:
+        read_weight(reads, w, name, quantized = "widen")
 
 def moe(reads, f, at):
     reads.read(f.router, at("mlp.gate.weight"))
