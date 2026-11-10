@@ -293,6 +293,9 @@ fn the_block_max_ranking_answers_the_reference() {
         &outs,
         |_, pools, _| fire(&pools[0]),
     );
+    // The selection the attention below reads, landed again off the packed keys.
+    fire(&ikeys);
+    gpu.sync();
     let scale = 1.0 / (hd as f32).sqrt();
     let (want_o, _) = attend([&q, &k, &v], [qh, kvh, hd, hd], scale, None, |t, h| {
         let (run, (r, p)) = (&want[(t * kvh + h / 2) * top_k..][..top_k], owner[t]);
