@@ -132,6 +132,18 @@ impl Gmm {
         i64::from(self.w.bits()) / 8
     }
 
+    /// The copies an expert's `rows`-row block of weights is fetched in, each
+    /// whole sublane tiles of its rows: one DMA streams an expert at about
+    /// half the HBM's rate (v6e, Gemma-4-26B's 7.9 MB gate-up experts).
+    fn parts(&self, rows: i64) -> i64 {
+        let tile = 8 * 32 / i64::from(self.w.bits()).clamp(4, 32);
+        let most = std::env::var("PIE_GMM_PARTS").ok().and_then(|v| v.parse().ok()).unwrap_or(4);
+        [8, 4, 2]
+            .into_iter()
+            .find(|&p| p <= most && rows % (p * tile) == 0)
+            .unwrap_or(1)
+    }
+
     /// A block's bytes in HBM.
     fn block_dma(&self, cols: i64) -> i64 {
         self.k * cols * i64::from(self.w.bits()) / 8
@@ -322,6 +334,7 @@ impl Gmm {
         let floor = (32 << 20).min(self.vmem_cap);
         let limit = (vmem * 2 + (8 << 20)).clamp(floor, self.vmem_cap);
         let steps = self.steps();
+        let parts = self.parts(rb);
         let kernel = Kernel {
             name: "gmm".into(),
             grid: vec![1, steps],
@@ -339,7 +352,7 @@ impl Gmm {
             vmem_limit: Some(limit as u64),
             scratch: vec![
                 MTy::Ref(vec![2, rb, cb], self.w, Space::Vmem),
-                MTy::Sem(vec![2]),
+                MTy::Sem(vec![2, parts]),
                 MTy::Ref(vec![2, j * tm, n], out_elem, Space::Vmem),
                 MTy::Sem(vec![2]),
             ],
@@ -355,20 +368,32 @@ impl Gmm {
             let outr = blk.outs[0];
             let pre = &blk.grid.prefetch;
             let s = blk.grid.ids[1];
-            // The copy of expert `ex`'s weights into slot `slot`.
-            let wcopy = |b: &mut Body, ex: V, slot: V| -> Built<(V, V, V)> {
+            // The copies of expert `ex`'s weights into slot `slot`, `parts`
+            // of its block's rows each.
+            let wcopy = |b: &mut Body, ex: V, slot: V| -> Built<Vec<(V, V, V)>> {
                 let z = b.i32(0);
                 let nn = b.i32(n);
                 let at = b.muli(ex, nn)?;
-                let src = match orient {
-                    Orient::NMajor => b.ref_slice(bank, &[at, z], &[n, k])?,
-                    Orient::KMajor => b.ref_slice(bank, &[z, at], &[k, n])?,
-                };
-                let dst = b.ref_slice(wbuf, &[slot, z, z], &[1, rb, cb])?;
-                let dst = b.ref_squeeze(dst)?;
-                let sem = b.ref_slice(wsems, &[slot], &[1])?;
-                let sem = b.ref_squeeze(sem)?;
-                Ok((src, dst, sem))
+                let rows = rb / parts;
+                let mut copies = Vec::with_capacity(parts as usize);
+                for p in 0..parts {
+                    let off = b.i32(p * rows);
+                    let src = match orient {
+                        Orient::NMajor => {
+                            let row = b.addi(at, off)?;
+                            b.ref_slice(bank, &[row, z], &[rows, k])?
+                        }
+                        Orient::KMajor => b.ref_slice(bank, &[off, at], &[rows, n])?,
+                    };
+                    let dst = b.ref_slice(wbuf, &[slot, off, z], &[1, rows, cb])?;
+                    let dst = b.ref_squeeze(dst)?;
+                    let pi = b.i32(p);
+                    let sem = b.ref_slice(wsems, &[slot, pi], &[1, 1])?;
+                    let sem = b.ref_squeeze(sem)?;
+                    let sem = b.ref_squeeze(sem)?;
+                    copies.push((src, dst, sem));
+                }
+                Ok(copies)
             };
             // The copy of step `st`'s `c` tiles of result rows out of slot
             // `slot`.
@@ -421,20 +446,25 @@ impl Gmm {
                 let first = b.select(at0, at0, moved)?;
                 b.when(at0, |b| {
                     let ex = b.load(pre[0], &[si])?;
-                    let (src, dst, sem) = wcopy(b, ex, wslot)?;
-                    b.dma_start(src, dst, sem)
+                    for (src, dst, sem) in wcopy(b, ex, wslot)? {
+                        b.dma_start(src, dst, sem)?;
+                    }
+                    Ok(())
                 })?;
                 b.when(first, |b| {
                     let z = b.i32(0);
-                    let (src, dst, sem) = wcopy(b, z, wslot)?;
-                    b.dma_wait(sem, src, dst)?;
+                    for (src, dst, sem) in wcopy(b, z, wslot)? {
+                        b.dma_wait(sem, src, dst)?;
+                    }
                     let nx = b.load(pre[3], &[si])?;
                     let has = b.cmpi(ICmp::Sge, nx, z)?;
                     b.when(has, |b| {
                         let one = b.i32(1);
                         let other = b.subi(one, wslot)?;
-                        let (src, dst, sem) = wcopy(b, nx, other)?;
-                        b.dma_start(src, dst, sem)
+                        for (src, dst, sem) in wcopy(b, nx, other)? {
+                            b.dma_start(src, dst, sem)?;
+                        }
+                        Ok(())
                     })
                 })?;
                 // The slot this step lands in was last copied out two steps
