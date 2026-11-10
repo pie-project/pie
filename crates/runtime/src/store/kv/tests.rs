@@ -1549,6 +1549,210 @@ fn demoted_cache_past_the_host_lands_on_disk_journaled_and_outlives_a_restart() 
     store.abort_suspend(txn);
 }
 
+/// A run of `pages` sealed pages from `first`, its tokens and keys.
+fn sealed_run(seed: Hash256, first: u32, pages: u32) -> (Vec<Vec<Option<Hash256>>>, Vec<Hash256>) {
+    use super::hash::{chain_slots, page_hash};
+    let tokens: Vec<Vec<Option<Hash256>>> = chain_slots(
+        &seed,
+        None,
+        0,
+        &(first..first + 4 * pages).collect::<Vec<_>>(),
+    )
+    .chunks(4)
+    .map(|page| page.iter().map(|h| Some(*h)).collect())
+    .collect();
+    let keys = tokens.iter().map(|page| page_hash(page)).collect();
+    (tokens, keys)
+}
+
+/// Imports the run idle on the device and demotes it to the host.
+fn parked_on_host(store: &mut KvStore, run: &(Vec<Vec<Option<Hash256>>>, Vec<Hash256>)) {
+    use ::engine::transfer::MemoryDomain::HostPinned;
+    let gpu = store.pool.try_alloc_n(run.1.len()).unwrap();
+    assert!(store.import_cached_at(
+        &[],
+        run.0.clone(),
+        run.1.clone(),
+        gpu.into_iter().map(KvPageBacking::Resident).collect(),
+    ));
+    let txn = store.prepare_demote(8, |_| 0).unwrap().expect("a demote");
+    let tiers: Vec<_> = txn.copy_plans().iter().map(|(tier, ..)| *tier).collect();
+    assert_eq!(tiers, [HostPinned], "the host holds it whole");
+    assert_eq!(store.commit_suspend(txn).unwrap(), run.1.len());
+    store.retire_idle();
+}
+
+#[test]
+/// Idle cache parked on a host short of room goes on down to disk rather
+/// than being lost: the oldest group first and whole on a persistent tier
+/// (more than was wanted), journaled, its host slots back; a restart takes
+/// it back from the journal, where what stayed on the host is gone.
+fn host_cache_goes_on_down_to_disk_oldest_whole_journaled_and_outlives_a_restart() {
+    let seed = h(61);
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("g0.journal");
+    // A shared pool's list (only it moves host -> disk): six host slots,
+    // eight on disk.
+    let store_for = || {
+        let mut store = KvStore::new_with_swap(8, 5, 0, seed);
+        store.set_tiers(::engine::chunk::ShapeId(0), None, 8);
+        store.set_page_size(4);
+        store.set_keeps(true);
+        store
+    };
+    let (old, new) = (sealed_run(seed, 400, 3), sealed_run(seed, 600, 2));
+    // The shorter, newer run keyed higher: the older goes first.
+    struct ByLength;
+    impl Keys for ByLength {
+        fn key_at(&self, _: Option<ProcessId>, at: u64) -> i64 {
+            i64::from(at < 8)
+        }
+    }
+
+    let mut store = store_for();
+    assert_eq!(store.keep_disk(&path, true).unwrap(), 0);
+    parked_on_host(&mut store, &old);
+    parked_on_host(&mut store, &new);
+    assert_eq!(store.host_swap_available(), 0, "the host is full");
+    assert_eq!(store.host_cache_pages(), 5, "of idle cache");
+    assert_eq!(store.persisted_pages(), 0, "nothing on disk yet");
+
+    let txn = store.prepare_spill(1, ByLength).expect("a spill");
+    assert_eq!(txn.page_count(), 3, "one group, whole");
+    let (host, disk) = txn.copy_plan();
+    assert_eq!((host.len(), disk.len()), (3, 3));
+    assert_eq!(store.disk_swap_available(), 5, "its disk slots are taken");
+    assert_eq!(store.commit_spill(txn), 3);
+    assert_eq!(store.host_swap_available(), 3, "its host slots are back");
+    assert_eq!(store.persisted_pages(), 3, "journaled");
+    let on = |store: &KvStore, keys: &[Hash256]| -> Vec<&'static str> {
+        store
+            .cached_run_any_tier(keys)
+            .iter()
+            .map(|at| match store.table.backing_at(at).unwrap() {
+                KvPageBacking::Resident(_) => "device",
+                KvPageBacking::Swapped(_) => "host",
+                KvPageBacking::OnDisk(_) => "disk",
+            })
+            .collect()
+    };
+    assert_eq!(on(&store, &old.1), ["disk"; 3], "the older went down");
+    assert_eq!(on(&store, &new.1), ["host"; 2], "the newer stays");
+    assert_eq!(store.host_cache_pages(), 2);
+
+    // A hit brings it up from disk.
+    let run = store.cached_run_any_tier(&old.1);
+    let mut granted = store.pool.try_alloc_n(3).unwrap();
+    let txn = store
+        .prepare_promote(&run, &mut granted)
+        .unwrap()
+        .expect("a promotion");
+    let tiers: Vec<_> = txn.copy_plans().iter().map(|(tier, ..)| *tier).collect();
+    assert_eq!(tiers, [::engine::transfer::MemoryDomain::LocalDisk]);
+    let pin = store.commit_promote(txn).unwrap();
+    store.release_reader(pin);
+    assert_eq!(on(&store, &old.1), ["device"; 3]);
+    assert_eq!(store.persisted_pages(), 3, "its copies stay");
+    drop(store);
+
+    // The next run takes back what went to disk; the host's is gone.
+    let mut store = store_for();
+    assert_eq!(store.keep_disk(&path, true).unwrap(), 3);
+    assert_eq!(on(&store, &old.1), ["disk"; 3]);
+    assert!(on(&store, &new.1).is_empty());
+}
+
+#[test]
+/// A group a persistent tier cannot hold whole stays on the host; without
+/// one, what fits goes. And no shared pool, no spill: the engine moves no
+/// legacy pages between host and disk.
+fn a_spill_keeps_groups_whole_on_a_persistent_tier_and_needs_a_shared_list() {
+    let seed = h(62);
+    let dir = tempfile::tempdir().unwrap();
+    let store_for = |disk: u32| {
+        let mut store = KvStore::new_with_swap(8, 3, 0, seed);
+        store.set_tiers(::engine::chunk::ShapeId(0), None, disk);
+        store.set_page_size(4);
+        store.set_keeps(true);
+        store
+    };
+    let run = sealed_run(seed, 400, 3);
+    let mut store = store_for(2);
+    assert_eq!(
+        store
+            .keep_disk(&dir.path().join("g0.journal"), true)
+            .unwrap(),
+        0
+    );
+    parked_on_host(&mut store, &run);
+    assert!(
+        store.prepare_spill(3, |_| 0).is_none(),
+        "three do not fit two"
+    );
+    assert_eq!(store.host_swap_available(), 0);
+
+    let mut store = store_for(2);
+    parked_on_host(&mut store, &run);
+    let txn = store.prepare_spill(3, |_| 0).expect("what fits goes");
+    assert_eq!(txn.page_count(), 2);
+    store.abort_spill(txn);
+    assert_eq!(
+        store.disk_swap_available(),
+        2,
+        "an abort gives its slots back"
+    );
+    assert_eq!(
+        store.host_swap_available(),
+        0,
+        "and leaves the host as it was"
+    );
+
+    let mut store = KvStore::new_with_swap(8, 3, 8, seed);
+    store.set_page_size(4);
+    store.set_keeps(true);
+    parked_on_host(&mut store, &run);
+    assert!(store.prepare_spill(3, |_| 0).is_none());
+}
+
+#[test]
+/// A suspend short of host room first sends the host's idle cache on down
+/// to disk, so the suspend finds its room and the cache is kept, not
+/// dropped.
+fn a_suspend_short_of_host_room_spills_idle_cache_rather_than_dropping_it() {
+    let seed = h(63);
+    let mut store = KvStore::new_with_swap(8, 3, 0, seed);
+    store.set_tiers(::engine::chunk::ShapeId(0), None, 8);
+    store.set_page_size(4);
+    store.set_keeps(true);
+    let run = sealed_run(seed, 400, 3);
+    parked_on_host(&mut store, &run);
+    let ws = store.create_working_set();
+    commit_fresh(&mut store, ws, 2, 1);
+    let sets = HashSet::from([ws]);
+
+    let txn = store
+        .prepare_suspend_spill(&sets, |_| 0)
+        .expect("the host is short two");
+    assert_eq!(txn.page_count(), 2, "only what the suspend lacks");
+    assert_eq!(store.commit_spill(txn), 2);
+    assert_eq!(store.host_swap_available(), 2);
+    assert!(store.prepare_suspend_spill(&sets, |_| 0).is_none());
+
+    let txn = store.prepare_suspend(&sets).unwrap().expect("a suspend");
+    let tiers: Vec<_> = txn
+        .copy_plans()
+        .iter()
+        .map(|(tier, gpu, _)| (*tier, gpu.len()))
+        .collect();
+    assert_eq!(tiers, [(::engine::transfer::MemoryDomain::HostPinned, 2)]);
+    assert_eq!(store.commit_suspend(txn).unwrap(), 2);
+    assert_eq!(
+        store.cached_run_any_tier(&run.1).len(),
+        3,
+        "the cache is kept, below the device"
+    );
+}
+
 #[test]
 /// An owner's ask to keep a prefix on disk goes out with the runs it left,
 /// a prefix persisted is a run of its own, and the ask goes with the last

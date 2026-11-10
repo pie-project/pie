@@ -106,6 +106,9 @@ pub(crate) fn close_channels(engine_idx: EngineId, ids: Vec<::engine::ChannelId>
 
 /// One engine copy of a residency move: whole kv pages or rs slots between
 /// the device and the tier below it, out of the device or back into it.
+/// With a `source`, the upper side is that tier instead of the device: a
+/// shared pool's kv list slots going on down from the host to disk
+/// (CONTRACT-BC 22), `device` then naming the host slots.
 #[derive(Debug, Clone)]
 pub(crate) struct TierMove {
     pub kind: TierKind,
@@ -113,6 +116,7 @@ pub(crate) struct TierMove {
     pub out: bool,
     pub device: Vec<u32>,
     pub slots: Vec<u32>,
+    pub source: Option<MemoryDomain>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -149,16 +153,20 @@ impl TierMove {
             TierKind::Window => "window",
         };
         let way = if self.out { "to" } else { "from" };
-        format!("{kind} {way} {:?}", self.tier)
+        match self.source {
+            Some(source) => format!("{kind} {way} {:?} from {source:?}", self.tier),
+            None => format!("{kind} {way} {:?}", self.tier),
+        }
     }
 
     /// A shared pool's move as the engine's [`SlotCopy`] (CONTRACT-BC 22):
-    /// whole slots `(src, dst)` between `device` and the tier; `None` for
-    /// today's pages and slots.
+    /// whole slots `(src, dst)` between `device` (or the move's source
+    /// tier) and the tier; `None` for today's pages and slots.
     pub(crate) fn slot_copy(&self, device: MemoryDomain) -> Option<SlotCopy> {
         let (TierKind::KvSlots(shape) | TierKind::RsSlots(shape)) = self.kind else {
             return None;
         };
+        let device = self.source.unwrap_or(device);
         let (src, dst) = if self.out {
             (device, self.tier)
         } else {
@@ -183,6 +191,11 @@ pub(crate) fn copy_tier_tracked(
     engine_idx: EngineId,
     copy: &TierMove,
 ) -> Result<super::ControlCompletion> {
+    // Only a shared pool's kv list moves between two tiers below the
+    // device (CONTRACT-BC 22).
+    if copy.source.is_some() && !matches!(copy.kind, TierKind::KvSlots(_)) {
+        anyhow::bail!("{}: only kv list slots move between tiers", copy.label());
+    }
     let plan = match copy.kind {
         TierKind::KvSlots(_) | TierKind::RsSlots(_) => PreLaunchCopy::Slots(
             copy.slot_copy(super::device_domain(engine_idx))

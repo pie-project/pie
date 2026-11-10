@@ -40,6 +40,9 @@ pub struct ResidencyPlanner {
     pub(super) sweeping: AtomicBool,
     sweep_exhausted: AtomicBool,
     pub(super) demoting: AtomicBool,
+    /// A host -> disk spill failed: the engine moves no slots between
+    /// tiers below the device, and none is tried again.
+    spill_failed: AtomicBool,
     pub(super) port: Arc<dyn PoolPort>,
     pub(super) stats: PlannerStats,
     /// `PoolFacts::seated_first`: a seated lane's growth before a prompt
@@ -79,6 +82,7 @@ impl ResidencyPlanner {
             sweeping: AtomicBool::new(false),
             sweep_exhausted: AtomicBool::new(false),
             demoting: AtomicBool::new(false),
+            spill_failed: AtomicBool::new(false),
             port,
             stats: PlannerStats::default(),
             seated_first: false,
@@ -340,9 +344,27 @@ impl ResidencyPlanner {
         if self.demoting.swap(true, Ordering::AcqRel) {
             return true;
         }
-        let (host_free, host_total) = self.port.host_stats();
+        let (mut host_free, host_total) = self.port.host_stats();
         let (disk_free, _) = self.port.disk_stats();
-        let room = host_free.saturating_sub(host_total / HOST_RESERVE_DIVISOR) + disk_free;
+        let reserve = host_total / HOST_RESERVE_DIVISOR;
+        // A host with no room past its reserve is under pressure too: its
+        // own idle cache, lowest key first, goes on down to disk before the
+        // device's lands there, so the tiers keep the newer above the older
+        // and nothing on the host is dropped for want of room.
+        if host_total > 0
+            && host_free <= reserve
+            && disk_free > 0
+            && !self.spill_failed.load(Ordering::Acquire)
+        {
+            if let Some(txn) = self.port.prepare_spill(reserve.max(1) as usize) {
+                exec::spawn_spill(self.clone(), txn, Self::spill_done);
+                return true;
+            }
+            // Settling pages on their disk copies may have freed some.
+            host_free = self.port.host_stats().0;
+        }
+        let (disk_free, _) = self.port.disk_stats();
+        let room = host_free.saturating_sub(reserve) + disk_free;
         let txn = (room > 0)
             .then(|| self.port.prepare_demote(room as usize))
             .flatten();
@@ -352,6 +374,15 @@ impl ResidencyPlanner {
         };
         exec::spawn_move_out(self.clone(), txn, "demote", Self::demote_done);
         true
+    }
+
+    /// A spill that failed is not tried again: the host's cache stays where
+    /// it is and the device's goes to disk past it, as before spilling.
+    fn spill_done(self: &Arc<Self>, moved: bool) {
+        if !moved {
+            self.spill_failed.store(true, Ordering::Release);
+        }
+        self.demote_done(moved);
     }
 
     fn demote_done(self: &Arc<Self>, moved: bool) {

@@ -1015,6 +1015,7 @@ async fn promote<C: FireContext>(
             out: false,
             device,
             slots,
+            source: None,
         };
         let completion = crate::scheduler::copy_tier_tracked(engine, &copy)
             .map_err(|error| format!("{error:#}"))?;

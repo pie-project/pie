@@ -8,7 +8,7 @@ use super::{ProcessId, ResidencyPlanner};
 use crate::scheduler::{TierKind, TierMove};
 use crate::store::kv::page_table::WorkingSetId;
 use crate::store::kv::working_set::KvSuspendHandle;
-use crate::store::kv::{KvResidencyTxn, KvStoreError};
+use crate::store::kv::{KvResidencyTxn, KvSpillTxn, KvStoreError};
 use crate::store::rs::RsResidencyTxn;
 use ::engine::transfer::MemoryDomain;
 
@@ -70,6 +70,128 @@ pub(super) fn spawn_move_out(
     );
     if !spawned {
         done(&planner, false);
+    }
+}
+
+/// Idle cache on the host goes on down to disk; a failure only leaves it
+/// on the host.
+pub(super) fn spawn_spill(
+    planner: Arc<ResidencyPlanner>,
+    txn: KvSpillTxn,
+    done: fn(&Arc<ResidencyPlanner>, bool),
+) {
+    let (model, engine) = planner.locus();
+    // The guard owns the move from here: a task that never runs drops it,
+    // and that gives back what the move took.
+    let guard = SpillGuard {
+        model,
+        engine,
+        txn: Some(txn),
+        in_flight: None,
+    };
+    let task = {
+        let planner = planner.clone();
+        async move {
+            let moved = spill(&planner, guard).await;
+            if let Err(error) = &moved {
+                tracing::warn!(%error, "planner: host to disk spill failed");
+            }
+            done(&planner, moved.is_ok());
+        }
+    };
+    let spawned = spawn_watched(
+        planner.clone(),
+        ProcessId::nil(),
+        "spill",
+        task,
+        move |planner, _| done(planner, false),
+    );
+    if !spawned {
+        done(&planner, false);
+    }
+}
+
+/// Copies a spill's host slots to its disk slots (`copy_slots`, HostPinned
+/// -> LocalDisk) and commits it: answers the pages moved.
+pub(super) async fn spill(
+    planner: &ResidencyPlanner,
+    mut guard: SpillGuard,
+) -> Result<usize, String> {
+    let txn = guard.txn.as_ref().expect("spill present");
+    let (host, disk) = txn.copy_plan();
+    let copy = TierMove {
+        kind: TierKind::KvSlots(txn.shape()),
+        tier: MemoryDomain::LocalDisk,
+        out: true,
+        device: host,
+        slots: disk,
+        source: Some(MemoryDomain::HostPinned),
+    };
+    tracing::debug!(copy = %copy.label(), count = copy.device.len(), "planner: spill copy");
+    let started = Instant::now();
+    let completion = crate::scheduler::copy_tier_tracked(guard.engine, &copy)
+        .map_err(|error| format!("{} submit: {error:#}", copy.label()))?;
+    guard.in_flight = Some(completion.clone());
+    let copied = completion.wait().await;
+    guard.in_flight = None;
+    planner.record_tier_copy(&copy, started.elapsed());
+    copied.map_err(|error| format!("{} copy: {error}", copy.label()))?;
+    let txn = guard.txn.take().expect("spill present");
+    let stores = crate::store::registry::get(guard.model, guard.engine);
+    Ok(crate::store::registry::with_kv_lock(
+        &stores.kv,
+        "planner-spill",
+        |kv| kv.commit_spill(txn),
+    ))
+}
+
+/// Gives back a spill's disk slots when it is dropped before it commits,
+/// after any copy in flight.
+pub(super) struct SpillGuard {
+    model: usize,
+    engine: usize,
+    txn: Option<KvSpillTxn>,
+    in_flight: Option<crate::scheduler::ControlCompletion>,
+}
+
+impl SpillGuard {
+    pub(super) fn new(model: usize, engine: usize, txn: KvSpillTxn) -> Self {
+        Self {
+            model,
+            engine,
+            txn: Some(txn),
+            in_flight: None,
+        }
+    }
+}
+
+impl Drop for SpillGuard {
+    fn drop(&mut self) {
+        let Some(txn) = self.txn.take() else {
+            return;
+        };
+        let (model, engine) = (self.model, self.engine);
+        let abort = move || {
+            let stores = crate::store::registry::get(model, engine);
+            crate::store::registry::with_kv_lock(&stores.kv, "spill-abort", |kv| {
+                kv.abort_spill(txn)
+            });
+        };
+        match self.in_flight.take() {
+            None => abort(),
+            Some(completion) if crate::rt::has_runtime() => {
+                crate::rt::spawn(async move {
+                    let _ = completion.wait().await;
+                    abort();
+                });
+            }
+            Some(_) => tracing::error!(
+                model,
+                engine,
+                "spill dropped with an engine copy in flight and no runtime; \
+                 keeping its slots to avoid reuse during the copy"
+            ),
+        }
     }
 }
 
@@ -170,6 +292,7 @@ impl Move {
                         out,
                         device,
                         slots,
+                        source: None,
                     })
             })
             .collect();
@@ -184,6 +307,7 @@ impl Move {
                     out,
                     device,
                     slots,
+                    source: None,
                 });
             }
             let pages = if rs.is_window() {
@@ -202,6 +326,7 @@ impl Move {
                     out,
                     device,
                     slots,
+                    source: None,
                 });
             }
         }
@@ -356,6 +481,16 @@ async fn evict(planner: Arc<ResidencyPlanner>, pid: ProcessId) {
         handle.quiesce().await;
     }
     let stores = crate::store::registry::get(model, engine);
+    // Host room is for what is paused before what is cached: idle cache on
+    // a host short of room goes on down to disk first, not dropped.
+    let spilling = crate::store::registry::with_kv_lock(&stores.kv, "planner-evict", |kv| {
+        kv.prepare_suspend_spill(&working_sets, crate::policy::retention::Installed)
+    });
+    if let Some(txn) = spilling
+        && let Err(error) = spill(&planner, SpillGuard::new(model, engine, txn)).await
+    {
+        tracing::warn!(pid = %pid, %error, "planner: host to disk spill failed");
+    }
     let prepared = crate::store::registry::with_kv_lock(&stores.kv, "planner-evict", |kv| {
         kv.prepare_suspend(&working_sets)
     });
@@ -578,6 +713,7 @@ pub(super) async fn persist(
         out: true,
         device,
         slots,
+        source: None,
     };
     let mut guard = PersistGuard {
         model,

@@ -104,6 +104,12 @@ pub trait PoolPort: Send + Sync + 'static {
         wanted: usize,
     ) -> Option<crate::store::kv::KvResidencyTxn>;
     fn prepare_demote(&self, room: usize) -> Option<crate::store::kv::KvResidencyTxn>;
+    /// Idle cache parked on the host, up to `room` pages, going on down to
+    /// disk, lowest key first. `None` where nothing goes.
+    fn prepare_spill(&self, room: usize) -> Option<crate::store::kv::KvSpillTxn> {
+        let _ = room;
+        None
+    }
 }
 
 pub struct RegistryPool {
@@ -403,5 +409,14 @@ impl PoolPort for RegistryPool {
         .inspect_err(|error| tracing::warn!(%error, "planner: demote prepare failed"))
         .ok()
         .flatten()
+    }
+
+    fn prepare_spill(&self, room: usize) -> Option<crate::store::kv::KvSpillTxn> {
+        if !self.suspend_capable {
+            return None;
+        }
+        self.with_kv_tagged("planner-spill", |kv| {
+            kv.prepare_spill(room, crate::policy::retention::Installed)
+        })
     }
 }

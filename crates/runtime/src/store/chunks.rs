@@ -839,22 +839,29 @@ pub struct SlotMeter;
 
 impl SlotMeter {
     fn engine(stores: &registry::Stores, tier: Tier) -> Option<Bytes> {
+        // Idle cache parked on the host is cache there too, not live: what
+        // a host short of room sends on down to disk.
+        let host_cached = |kv: &super::kv::KvStore| {
+            u64::from(kv.host_cache_pages()) * kv.page_pool().slot_bytes()
+        };
         // A shared pool's host tier is one pool of chunks every shape
         // shares (CONTRACT-BC 22): its bytes are its chunks'.
         if tier == Tier::Host && stores.shared.is_some() {
             let Some(host) = &stores.host else {
                 return Some(Bytes::default());
             };
+            let cached =
+                registry::with_kv_lock(&stores.kv, "policy-pressure", |kv| host_cached(kv));
             let (total, opened, live) = host.lock().unwrap().tier_bytes();
             return Some(Bytes {
                 total,
                 state: opened,
-                live,
+                live: live.saturating_sub(cached),
                 wanted: opened,
                 act: 0,
             });
         }
-        let (kv, kv_page_bytes, capacity, cached, host_free, host_capacity) =
+        let (kv, kv_page_bytes, capacity, cached, host_free, host_capacity, host_cache) =
             registry::with_kv_lock(&stores.kv, "policy-pressure", |kv| {
                 let pool = kv.page_pool();
                 (
@@ -864,6 +871,7 @@ impl SlotMeter {
                     u64::from(kv.reclaimable_cache_pages()),
                     kv.host_swap_available() as u64,
                     u64::from(kv.host_swap_capacity()),
+                    host_cached(kv),
                 )
             });
         // A page of unknown size leaves the tier unread.
@@ -896,7 +904,7 @@ impl SlotMeter {
                 Bytes {
                     total,
                     state: held,
-                    live: held,
+                    live: held.saturating_sub(host_cache),
                     wanted: held,
                     act: 0,
                 }
