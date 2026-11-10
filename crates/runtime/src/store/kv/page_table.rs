@@ -82,6 +82,7 @@ pub struct TriePageLocation {
 type Runs = SmallVec<[Range<u32>; 2]>;
 
 /// A page as a snapshot keeps it.
+#[cfg_attr(target_arch = "wasm32", allow(dead_code))]
 #[derive(Debug, Clone)]
 pub struct ExportedPage {
     pub backing: KvPageBacking,
@@ -89,6 +90,7 @@ pub struct ExportedPage {
     pub token_hashes: Vec<Option<Hash256>>,
 }
 
+#[cfg_attr(target_arch = "wasm32", allow(dead_code))]
 #[derive(Debug, Clone)]
 pub struct ExportedSet {
     pub pages: Vec<ExportedPage>,
@@ -1827,6 +1829,7 @@ impl KvPageTable {
     }
 
     /// Every page of `ws`, first to last, and what the table knows of it.
+    #[cfg_attr(target_arch = "wasm32", allow(dead_code))]
     pub fn exported(&self, ws: WorkingSetId) -> Result<ExportedSet, KvTableError> {
         let entry = self.entry(ws)?;
         let mut locations = Vec::with_capacity(entry.mapped_len as usize);
@@ -1851,6 +1854,7 @@ impl KvPageTable {
 
     /// A working set of `pages`' own, as [`Self::exported`] said one stood,
     /// with every page at `backings`.
+    #[cfg_attr(target_arch = "wasm32", allow(dead_code))]
     pub fn imported(
         &mut self,
         set: ExportedSet,
