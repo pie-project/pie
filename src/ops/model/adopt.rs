@@ -898,344 +898,504 @@ fn count(n: u64) -> String {
     }
 }
 
+/// Each backend's name in a trace, and as its users name it.
+const BACKENDS: [(&str, &str); 6] = [
+    ("cuda", "CUDA"),
+    ("metal", "Metal"),
+    ("vulkan", "Vulkan"),
+    ("wgpu", "WebGPU"),
+    ("xla", "XLA"),
+    ("cerebras", "Cerebras"),
+];
+
 /// A backend as its users name it.
 fn backend(name: &str) -> &str {
-    match name {
-        "cuda" => "CUDA",
-        "metal" => "Metal",
-        "vulkan" => "Vulkan",
-        "wgpu" => "WebGPU",
-        "xla" => "XLA",
-        "cerebras" => "Cerebras",
-        other => other,
+    BACKENDS
+        .iter()
+        .find(|(word, _)| *word == name)
+        .map_or(name, |(_, said)| said)
+}
+
+/// A report laid out as data: a title, lines about it, and titled sections
+/// of lines, which [`Sheet::print`] lays out once for every command that
+/// builds one. A new section, or a line in one, is an entry here, not new
+/// printing code, and the same sheet can be printed plain, coloured or into
+/// a test.
+struct Sheet {
+    title: String,
+    about: Vec<Vec<Span>>,
+    sections: Vec<Section>,
+}
+
+struct Section {
+    title: &'static str,
+    aside: Option<String>,
+    lines: Vec<Line>,
+}
+
+enum Line {
+    /// `key  value`; an empty key continues the field above it.
+    Field(String, Vec<Span>),
+    /// A marked row whose columns align with the other rows of its section.
+    Item(Mark, Vec<Vec<Span>>),
+    /// Text printed as it is (a package's source).
+    Verbatim(String),
+}
+
+#[derive(Clone, Copy)]
+enum Style {
+    Plain,
+    Dim,
+    Bold,
+    Mark(Mark),
+}
+
+struct Span(Style, String);
+
+fn plain(text: impl Into<String>) -> Span {
+    Span(Style::Plain, text.into())
+}
+
+fn dim(text: impl Into<String>) -> Span {
+    Span(Style::Dim, text.into())
+}
+
+fn bold(text: impl Into<String>) -> Span {
+    Span(Style::Bold, text.into())
+}
+
+fn mark(mark: Mark) -> Span {
+    Span(Style::Mark(mark), mark.glyph().to_string())
+}
+
+/// A status: its mark, then what it says.
+fn status(m: Mark, text: impl Into<String>) -> Vec<Span> {
+    vec![mark(m), plain(" "), plain(text)]
+}
+
+impl Section {
+    fn new(title: &'static str) -> Section {
+        Section {
+            title,
+            aside: None,
+            lines: Vec::new(),
+        }
+    }
+
+    fn field(&mut self, key: &str, value: Vec<Span>) {
+        self.lines.push(Line::Field(key.to_string(), value));
+    }
+
+    /// `values` as one field, each after the first on a line of its own.
+    fn fields(&mut self, key: &str, values: Vec<Vec<Span>>) {
+        for (i, value) in values.into_iter().enumerate() {
+            self.field(if i == 0 { key } else { "" }, value);
+        }
+    }
+
+    fn item(&mut self, m: Mark, columns: Vec<Vec<Span>>) {
+        self.lines.push(Line::Item(m, columns));
     }
 }
 
-/// Key–value rows under a section, the keys in one column.
+/// Width of the key column.
 const KEY: usize = 18;
+/// What separates aligned columns.
+const GAP: &str = "  ";
 
-fn section(p: &Palette, title: &str) {
-    println!();
-    println!("{}", p.bold(title));
+impl Span {
+    fn width(&self) -> usize {
+        self.1.chars().count()
+    }
+
+    fn paint(&self, p: &Palette) -> String {
+        match self.0 {
+            Style::Plain => self.1.clone(),
+            Style::Dim => p.dim(&self.1).to_string(),
+            Style::Bold => p.bold(&self.1).to_string(),
+            Style::Mark(m) => m.render(p),
+        }
+    }
 }
 
-fn row(p: &Palette, key: &str, value: impl std::fmt::Display) {
-    println!("  {}{value}", p.dim(format!("{key:<KEY$}")));
+fn paint(spans: &[Span], p: &Palette) -> String {
+    spans.iter().map(|s| s.paint(p)).collect()
 }
 
-fn more(p: &Palette, value: impl std::fmt::Display) {
-    println!("  {}{value}", " ".repeat(KEY));
-    let _ = p;
+fn width(spans: &[Span]) -> usize {
+    spans.iter().map(Span::width).sum()
+}
+
+impl Sheet {
+    fn print(&self, out: &mut dyn std::io::Write, p: &Palette) -> std::io::Result<()> {
+        writeln!(out, "{}", p.bold(&self.title))?;
+        for line in &self.about {
+            writeln!(out, "  {}", paint(line, p))?;
+        }
+        for section in &self.sections {
+            writeln!(out)?;
+            match &section.aside {
+                Some(aside) => writeln!(out, "{}  {}", p.bold(section.title), p.dim(aside))?,
+                None => writeln!(out, "{}", p.bold(section.title))?,
+            }
+            // Each column of the section's items as wide as its widest cell.
+            let mut widths: Vec<usize> = Vec::new();
+            for line in &section.lines {
+                if let Line::Item(_, columns) = line {
+                    // A row's last cell runs on, so it widens no column.
+                    let aligned = columns.len().saturating_sub(1);
+                    for (i, cell) in columns.iter().take(aligned).enumerate() {
+                        if widths.len() <= i {
+                            widths.push(0);
+                        }
+                        widths[i] = widths[i].max(width(cell));
+                    }
+                }
+            }
+            for line in &section.lines {
+                match line {
+                    Line::Field(key, value) => {
+                        let key = format!("{key:<KEY$}");
+                        writeln!(out, "  {}{}", p.dim(key), paint(value, p))?;
+                    }
+                    Line::Item(m, columns) => {
+                        let mut said = format!("  {} ", m.render(p));
+                        for (i, cell) in columns.iter().enumerate() {
+                            said.push_str(&paint(cell, p));
+                            if i + 1 < columns.len() {
+                                said.push_str(&" ".repeat(widths[i] - width(cell)));
+                                said.push_str(GAP);
+                            }
+                        }
+                        writeln!(out, "{}", said.trim_end())?;
+                    }
+                    Line::Verbatim(text) => writeln!(out, "{text}")?,
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
+impl Report {
+    /// The report as a sheet: what was read, what it is, which family knows
+    /// it, what it serves as, what was checked, and one result.
+    fn sheet(&self) -> Sheet {
+        let c = &self.card;
+        let stored = c.stored();
+        let mut summary: Vec<String> = c.architecture.iter().cloned().collect();
+        summary.push(format!("{} parameters", count(c.parameters)));
+        summary.push(size(c.stored_bytes));
+        if !stored.is_empty() {
+            summary.push(stored.join(" + "));
+        }
+        let mut about = vec![vec![plain(summary.join(" · "))]];
+        if self.hollow {
+            about.push(vec![dim("Metadata only: no weights were downloaded.")]);
+        }
+        let mut sections = Vec::new();
+        if !c.facts.is_empty() {
+            let mut model = Section::new("MODEL");
+            for (key, value) in &c.facts {
+                model.field(key, vec![plain(value)]);
+            }
+            sections.push(model);
+        }
+        sections.push(self.compatibility());
+        if let Some(unknown) = &self.unknown {
+            if self.verbose {
+                let mut layer = Section::new("LAYER 0 TENSORS");
+                for (name, shape) in &unknown.layer {
+                    layer.item(
+                        Mark::Plain,
+                        vec![vec![plain(name)], vec![dim(format!("{shape:?}"))]],
+                    );
+                }
+                sections.push(layer);
+            }
+        } else if let Some(a) = self.adoption.as_ref().filter(|_| self.refused.is_none()) {
+            sections.push(self.deployments(a, &stored));
+            sections.push(self.validation(a));
+            if let Some(text) = &a.text {
+                let mut package = Section::new("PACKAGE");
+                package.aside = Some(format!(
+                    "{}.poem{}",
+                    a.package,
+                    if a.whole {
+                        ""
+                    } else {
+                        ", adoption block (--show prints the whole file)"
+                    }
+                ));
+                package.lines.push(Line::Verbatim(text.clone()));
+                sections.push(package);
+            }
+        }
+        sections.push(self.result());
+        Sheet {
+            title: c.origin.clone(),
+            about,
+            sections,
+        }
+    }
+
+    fn compatibility(&self) -> Section {
+        let mut s = Section::new("COMPATIBILITY");
+        let Some(f) = self.kin.first() else {
+            s.field(
+                "Family",
+                status(
+                    Mark::Blocked,
+                    "no installed family matches these tensor names",
+                ),
+            );
+            return s;
+        };
+        if self.refused.is_some() {
+            s.field(
+                "Family",
+                status(Mark::Blocked, "no installed family runs this architecture"),
+            );
+            let names: Vec<&str> = self.kin.iter().map(|k| k.package.as_str()).collect();
+            s.field(
+                "Considered",
+                vec![dim(format!("{} (tensor names match)", names.join(", ")))],
+            );
+            return s;
+        }
+        s.field("Family", status(Mark::Did, &f.package));
+        let total = f.agreeing.len() + f.departing.len();
+        if total > 0 {
+            s.field(
+                "Closest model",
+                vec![
+                    plain(&f.nearest),
+                    plain(GAP),
+                    dim(format!("{} of {total} settings match", f.agreeing.len())),
+                ],
+            );
+        }
+        let width = f.departing.iter().map(|v| v.key.len()).max().unwrap_or(0);
+        let said = |v: &Value| v.stated.map_or("unstated".to_string(), number);
+        let mut differences: Vec<Vec<Span>> = f
+            .departing
+            .iter()
+            .map(|v| {
+                vec![plain(format!(
+                    "{:<width$}{GAP}{} → {}",
+                    v.key,
+                    number(v.built),
+                    said(v)
+                ))]
+            })
+            .collect();
+        if self.verbose {
+            differences.extend(
+                f.agreeing
+                    .iter()
+                    .map(|v| vec![dim(format!("{:<width$}{GAP}{} (same)", v.key, said(v)))]),
+            );
+        }
+        s.fields("Differences", differences);
+        if self.verbose {
+            s.fields(
+                "Also matches",
+                self.kin
+                    .iter()
+                    .skip(1)
+                    .map(|k| vec![dim(format!("{} (by tensor names)", k.package))])
+                    .collect(),
+            );
+            s.fields(
+                "Passed over",
+                self.passed_over.iter().map(|why| vec![dim(why)]).collect(),
+            );
+        }
+        s
+    }
+
+    fn deployments(&self, a: &Adoption, stored: &[String]) -> Section {
+        let mut s = Section::new("DEPLOYMENTS");
+        for d in a.deployments.iter().filter(|d| d.reads) {
+            let mut said = d.precision();
+            for extra in &d.extras {
+                said.push_str(&format!(" · {extra}"));
+            }
+            s.item(Mark::Did, vec![vec![plain(said)], vec![dim(&d.name)]]);
+        }
+        let unreadable: Vec<&Landing> = a.deployments.iter().filter(|d| !d.reads).collect();
+        if self.verbose {
+            for d in &unreadable {
+                let why = d.why.clone().unwrap_or_default();
+                s.item(
+                    Mark::Absent,
+                    vec![vec![plain(d.precision())], vec![dim(why)]],
+                );
+            }
+        } else if !unreadable.is_empty() {
+            let mut wanted: Vec<&str> = Vec::new();
+            for w in unreadable.iter().flat_map(|d| &d.weights) {
+                if !stored.contains(w) && !wanted.contains(&w.as_str()) {
+                    wanted.push(w);
+                }
+            }
+            let said = if wanted.is_empty() {
+                format!(
+                    "{} more not readable from this checkpoint",
+                    unreadable.len()
+                )
+            } else {
+                format!(
+                    "{} weights need a checkpoint stored that way (this one is {})",
+                    wanted.join(" / "),
+                    stored.first().map_or("?", String::as_str)
+                )
+            };
+            s.item(Mark::Absent, vec![vec![dim(said)]]);
+        }
+        s
+    }
+
+    fn validation(&self, a: &Adoption) -> Section {
+        let mut s = Section::new("VALIDATION");
+        s.field(
+            "Weights",
+            if a.deployments.iter().any(|d| d.reads) {
+                status(Mark::Did, "all required tensors present, shapes match")
+            } else {
+                status(Mark::Blocked, "no deployment can read this checkpoint")
+            },
+        );
+        s.field(
+            "Tokenizer",
+            match &a.tokenizer {
+                None => status(Mark::Did, "compiles"),
+                Some(why) => status(Mark::Blocked, reason(why)),
+            },
+        );
+        if !a.traces.is_empty() {
+            let mut graph = Vec::new();
+            for (i, (name, traced)) in a.traces.iter().enumerate() {
+                if i > 0 {
+                    graph.push(plain(GAP));
+                }
+                graph.extend(status(
+                    if *traced { Mark::Did } else { Mark::Blocked },
+                    backend(name),
+                ));
+            }
+            s.fields(
+                "Graph",
+                vec![
+                    graph,
+                    vec![dim(
+                        "checks the model program per backend; kernels are verified at first run",
+                    )],
+                ],
+            );
+        }
+        if self.verbose {
+            s.field(
+                "Family hook",
+                vec![dim(format!(
+                    "{}.adopt() set {}",
+                    a.family,
+                    a.rebinds.join(", ")
+                ))],
+            );
+        }
+        s
+    }
+
+    /// One verdict, and what to run next.
+    fn result(&self) -> Section {
+        let mut s = Section::new("RESULT");
+        let origin = &self.card.origin;
+        if self.unknown.is_some() {
+            s.field("Status", status(Mark::Blocked, "Unknown architecture"));
+            let mut next = vec![vec![plain(
+                "Support needs a new model package (see models/README.md).",
+            )]];
+            if !self.verbose {
+                next.push(vec![dim("Run with --verbose to list its layer-0 tensors.")]);
+            }
+            s.fields("Next", next);
+        } else if let Some(served) = &self.served {
+            s.field(
+                "Status",
+                vec![
+                    mark(Mark::Did),
+                    plain(" Already supported as "),
+                    bold(served),
+                ],
+            );
+            s.field("Next", vec![plain(format!("pie model import {origin}"))]);
+        } else if let Some(why) = &self.refused {
+            s.field("Status", status(Mark::Blocked, "Not supported"));
+            let refusals: Vec<(String, String)> = why.split("; and ").map(refusal).collect();
+            let width = refusals.iter().map(|(f, _)| f.len()).max().unwrap_or(0);
+            s.fields(
+                "Why",
+                refusals
+                    .into_iter()
+                    .map(|(family, why)| {
+                        if family.is_empty() {
+                            vec![plain(why)]
+                        } else {
+                            vec![dim(format!("{family:<width$}{GAP}")), plain(why)]
+                        }
+                    })
+                    .collect(),
+            );
+        } else if let Some(a) = &self.adoption {
+            let import = vec![plain(format!("pie model import {}", a.source))];
+            if a.tokenizer.is_some() {
+                s.field(
+                    "Status",
+                    status(
+                        Mark::Blocked,
+                        "Not adoptable: its tokenizer is not supported",
+                    ),
+                );
+            } else if !a.deployments.iter().any(|d| d.reads) {
+                s.field(
+                    "Status",
+                    status(
+                        Mark::Blocked,
+                        "Not adoptable: no deployment reads this checkpoint",
+                    ),
+                );
+            } else if let Some(written) = &a.written {
+                s.field(
+                    "Status",
+                    vec![mark(Mark::Did), plain(" Adopted as "), bold(&a.id)],
+                );
+                s.field("Package", vec![plain(crate::ui::short_path(written))]);
+                s.field("Next", import);
+            } else if a.dry_run {
+                s.field(
+                    "Status",
+                    vec![
+                        mark(Mark::Did),
+                        plain(" Ready to adopt as "),
+                        bold(&a.id),
+                        plain(GAP),
+                        dim("(dry run: nothing written)"),
+                    ],
+                );
+                s.fields(
+                    "Next",
+                    vec![vec![plain(format!("pie model adopt {}", a.source))], import],
+                );
+            }
+        }
+        s
+    }
 }
 
 impl crate::ui::Report for Report {
     fn render(&self, p: &Palette) {
-        let ok = Mark::Did.render(p);
-        let no = Mark::Blocked.render(p);
-        let c = &self.card;
-
-        // Header: what was read.
-        println!("{}", p.bold(&c.origin));
-        let mut said = Vec::new();
-        if let Some(a) = &c.architecture {
-            said.push(a.clone());
-        }
-        said.push(format!("{} parameters", count(c.parameters)));
-        said.push(size(c.stored_bytes));
-        let stored = c.stored();
-        if !stored.is_empty() {
-            said.push(stored.join(" + "));
-        }
-        println!("  {}", said.join(" · "));
-        if self.hollow {
-            println!("  {}", p.dim("Metadata only: no weights were downloaded."));
-        }
-
-        // MODEL: the architecture, as config.json states it.
-        if !c.facts.is_empty() {
-            section(p, "MODEL");
-            for (key, value) in &c.facts {
-                row(p, key, value);
-            }
-        }
-
-        // COMPATIBILITY: which family it is, and where it departs.
-        section(p, "COMPATIBILITY");
-        match self.kin.first() {
-            None => row(
-                p,
-                "Family",
-                format!("{no} no installed family matches these tensor names"),
-            ),
-            Some(_) if self.refused.is_some() => {
-                row(
-                    p,
-                    "Family",
-                    format!("{no} no installed family runs this architecture"),
-                );
-                row(
-                    p,
-                    "Considered",
-                    p.dim(format!(
-                        "{} (tensor names match)",
-                        self.kin
-                            .iter()
-                            .map(|k| k.package.as_str())
-                            .collect::<Vec<_>>()
-                            .join(", ")
-                    )),
-                );
-            }
-            Some(f) => {
-                row(p, "Family", format!("{} {}", ok, f.package));
-                let total = f.agreeing.len() + f.departing.len();
-                if total > 0 {
-                    row(
-                        p,
-                        "Closest model",
-                        format!(
-                            "{}  {}",
-                            f.nearest,
-                            p.dim(format!("{} of {total} settings match", f.agreeing.len()))
-                        ),
-                    );
-                }
-                let width = f.departing.iter().map(|v| v.key.len()).max().unwrap_or(0);
-                for (i, v) in f.departing.iter().enumerate() {
-                    let change = format!(
-                        "{:<width$}  {} → {}",
-                        v.key,
-                        number(v.built),
-                        v.stated.map_or("unstated".to_string(), number)
-                    );
-                    if i == 0 {
-                        row(p, "Differences", change);
-                    } else {
-                        more(p, change);
-                    }
-                }
-                if self.verbose {
-                    for v in &f.agreeing {
-                        more(
-                            p,
-                            p.dim(format!(
-                                "{:<width$}  {} (same)",
-                                v.key,
-                                v.stated.map_or("unstated".to_string(), number)
-                            )),
-                        );
-                    }
-                    for other in self.kin.iter().skip(1) {
-                        row(
-                            p,
-                            "Also matches",
-                            p.dim(format!("{} (by tensor names)", other.package)),
-                        );
-                    }
-                    for why in &self.passed_over {
-                        row(p, "Passed over", p.dim(why));
-                    }
-                }
-            }
-        }
-
-        if let Some(unknown) = &self.unknown {
-            if self.verbose {
-                section(p, "LAYER 0 TENSORS");
-                for (name, shape) in &unknown.layer {
-                    row(p, name, p.dim(format!("{shape:?}")));
-                }
-            }
-            section(p, "RESULT");
-            row(p, "Status", format!("{no} Unknown architecture"));
-            row(
-                p,
-                "Next",
-                "Support needs a new model package (see models/README.md).",
-            );
-            if !self.verbose {
-                more(p, p.dim("Run with --verbose to list its layer-0 tensors."));
-            }
-            return;
-        }
-        if let Some(served) = &self.served {
-            section(p, "RESULT");
-            row(
-                p,
-                "Status",
-                format!("{ok} Already supported as {}", p.bold(served)),
-            );
-            row(p, "Next", format!("pie model import {}", c.origin));
-            return;
-        }
-        if let Some(why) = &self.refused {
-            section(p, "RESULT");
-            row(p, "Status", format!("{no} Not supported"));
-            let refusals: Vec<(String, String)> = why.split("; and ").map(refusal).collect();
-            let width = refusals.iter().map(|(f, _)| f.len()).max().unwrap_or(0);
-            for (i, (family, why)) in refusals.iter().enumerate() {
-                let said = if family.is_empty() {
-                    why.clone()
-                } else {
-                    format!("{}  {why}", p.dim(format!("{family:<width$}")))
-                };
-                if i == 0 {
-                    row(p, "Why", said);
-                } else {
-                    more(p, said);
-                }
-            }
-            return;
-        }
-        let Some(a) = &self.adoption else { return };
-
-        // DEPLOYMENTS: what it can be served as.
-        section(p, "DEPLOYMENTS");
-        let readable: Vec<&Landing> = a.deployments.iter().filter(|d| d.reads).collect();
-        let width = readable
-            .iter()
-            .map(|d| d.precision().chars().count())
-            .max()
-            .unwrap_or(0);
-        for d in &readable {
-            let extras = if d.extras.is_empty() {
-                String::new()
-            } else {
-                format!(" · {}", d.extras.join(" · "))
-            };
-            println!(
-                "  {ok} {:<width$}{extras}  {}",
-                d.precision(),
-                p.dim(&d.name)
-            );
-        }
-        let unreadable: Vec<&Landing> = a.deployments.iter().filter(|d| !d.reads).collect();
-        if !unreadable.is_empty() {
-            if self.verbose {
-                for d in &unreadable {
-                    println!(
-                        "  {} {}  {}",
-                        Mark::Absent.render(p),
-                        d.precision(),
-                        p.dim(d.why.as_deref().unwrap_or_default())
-                    );
-                }
-            } else {
-                let mut wanted: Vec<String> = Vec::new();
-                for d in &unreadable {
-                    for w in &d.weights {
-                        if !stored.contains(w) && !wanted.contains(w) {
-                            wanted.push(w.clone());
-                        }
-                    }
-                }
-                let said = if wanted.is_empty() {
-                    format!(
-                        "{} more not readable from this checkpoint",
-                        unreadable.len()
-                    )
-                } else {
-                    format!(
-                        "{} weights need a checkpoint stored that way (this one is {})",
-                        wanted.join(" / "),
-                        stored.first().map_or("?", String::as_str)
-                    )
-                };
-                println!("  {} {}", Mark::Absent.render(p), p.dim(said));
-            }
-        }
-
-        // VALIDATION: what was checked before anything is written.
-        section(p, "VALIDATION");
-        if readable.is_empty() {
-            row(
-                p,
-                "Weights",
-                format!("{no} no deployment can read this checkpoint"),
-            );
-        } else {
-            row(
-                p,
-                "Weights",
-                format!("{ok} all required tensors present, shapes match"),
-            );
-        }
-        match &a.tokenizer {
-            None => row(p, "Tokenizer", format!("{ok} compiles")),
-            Some(why) => row(p, "Tokenizer", format!("{no} {}", reason(why))),
-        }
-        if !a.traces.is_empty() {
-            let traced = a
-                .traces
-                .iter()
-                .map(|(b, traced)| format!("{} {}", if *traced { &ok } else { &no }, backend(b)))
-                .collect::<Vec<_>>()
-                .join("  ");
-            row(p, "Graph", traced);
-            more(
-                p,
-                p.dim("checks the model program per backend; kernels are verified at first run"),
-            );
-        }
-        if self.verbose {
-            row(
-                p,
-                "Family hook",
-                p.dim(format!("{}.adopt() set {}", a.family, a.rebinds.join(", "))),
-            );
-        }
-
-        if let Some(text) = &a.text {
-            section(
-                p,
-                &format!(
-                    "PACKAGE  {}",
-                    p.dim(format!(
-                        "{}.poem{}",
-                        a.package,
-                        if a.whole {
-                            ""
-                        } else {
-                            ", adoption block (--show prints the whole file)"
-                        }
-                    ))
-                ),
-            );
-            println!("{text}");
-        }
-
-        // RESULT: one verdict, and what to run next.
-        section(p, "RESULT");
-        let next_import = format!("pie model import {}", a.source);
-        if a.tokenizer.is_some() {
-            row(
-                p,
-                "Status",
-                format!("{no} Not adoptable: its tokenizer is not supported"),
-            );
-        } else if readable.is_empty() {
-            row(
-                p,
-                "Status",
-                format!("{no} Not adoptable: no deployment reads this checkpoint"),
-            );
-        } else if let Some(written) = &a.written {
-            row(p, "Status", format!("{ok} Adopted as {}", p.bold(&a.id)));
-            row(p, "Package", crate::ui::short_path(written));
-            row(p, "Next", next_import);
-        } else if a.dry_run {
-            row(
-                p,
-                "Status",
-                format!(
-                    "{ok} Ready to adopt as {}  {}",
-                    p.bold(&a.id),
-                    p.dim("(dry run: nothing written)")
-                ),
-            );
-            row(p, "Next", format!("pie model adopt {}", a.source));
-            more(p, next_import);
-        }
+        let _ = self.sheet().print(&mut std::io::stdout().lock(), p);
     }
 }
 
@@ -1280,6 +1440,39 @@ mod tests {
             )
         );
         assert_eq!(refusal("plain").0, "");
+    }
+
+    #[test]
+    fn a_sheet_aligns_its_columns_and_keys() {
+        let mut deployments = Section::new("DEPLOYMENTS");
+        deployments.item(Mark::Did, vec![vec![plain("bf16 weights")], vec![dim("a")]]);
+        deployments.item(Mark::Did, vec![vec![plain("int4")], vec![dim("b")]]);
+        let mut result = Section::new("RESULT");
+        result.fields("Next", vec![vec![plain("one")], vec![plain("two")]]);
+        let sheet = Sheet {
+            title: "org/model".into(),
+            about: vec![vec![plain("about")]],
+            sections: vec![deployments, result],
+        };
+        let mut out = Vec::new();
+        sheet.print(&mut out, &Palette::forced(false)).unwrap();
+        assert_eq!(
+            String::from_utf8(out).unwrap(),
+            [
+                "org/model",
+                "  about",
+                "",
+                "DEPLOYMENTS",
+                "  ✓ bf16 weights  a",
+                "  ✓ int4          b",
+                "",
+                "RESULT",
+                "  Next              one",
+                "                    two",
+                "",
+            ]
+            .join("\n")
+        );
     }
 
     #[test]
