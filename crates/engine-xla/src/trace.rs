@@ -518,6 +518,16 @@ impl Env for Lens<'_> {
                     ),
                 });
             }
+            if is_pool(r)
+                && let Some((pool, _)) = f.view_parts(v)
+                && self.current.get(&root) == Some(&pool)
+            {
+                // The pool as it stands: nothing lands (a lowering that
+                // wrote several planes of the pool in turn lands each on the
+                // pool the last write left).
+                self.view_reads.insert(t.buf, pool);
+                return Ok(());
+            }
             self.stale(root, t)?;
             let next = unview(f, v, r)?;
             self.current.insert(root, next);
@@ -740,13 +750,21 @@ mod tests {
             .emit(&mut |cx| {
                 let v = cx.read(keys)?;
                 assert_eq!(cx.dims(v), &[64, 256]);
+                // a row changed (an unchanged view lands nothing)
+                let f = cx.func();
+                let row = f.slice(v, &[1, 0], &[2, 256], &[1, 1])?;
+                let zero = f.const_i(Elem::I32, 0, &[]);
+                let v = f.dynamic_update_slice(v, row, &[zero, zero])?;
                 cx.write(keys, v)
             })
             .expect("a whole view lands");
         let (text, sig) = tracer.finish(&[]);
         assert_eq!(sig.results.len(), 1, "the pool is the one result");
-        // A lazy view: nothing of the whole pool is reinterpreted.
-        assert!(!text.contains("bitcast_convert"), "{text}");
+        // A lazy view: the pool is never reinterpreted whole.
+        assert!(
+            !text.contains("tensor<64x128x2xbf16>") && !text.contains("tensor<64x256xbf16>"),
+            "{text}"
+        );
     }
 
     #[test]
