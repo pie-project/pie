@@ -14,8 +14,8 @@ Legend: ✅ verified on hardware · 🟡 in progress / compile-only · 🔴 not 
 | Window lists (own T_w, trimmed) | 🟡 one list, T_w=page (L40S: tables per list) | ✅ goldens (one list) | 🟡 one list (BM) | 🟡 VK | 🟡 VK | 🟡 XLA | 🟡 one list, T_w=page |
 | Multi-piece records end to end | ✅ engine (L40S) · 🟡 runtime boot (IT r5) | ✅ records in pieces (chunk goldens); rows cut across pieces kernel-tested | 🔴 on device (BM) | 🟡 VK | 🟡 VK | 🟡 XLA | 🟡 host sim |
 | Weight streaming: PLE rows | ✅ M35/M36/M41 | ✅ M43 golden_rows | 🔴 BM | 🔴 VK | 🔴 VK | 🟡 XLA | — weights on host |
-| Weight streaming: experts | 🟡 dense bf16 M40; quantized next | 🟡 kernels read tables; engine next | 🔴 BM | 🔴 VK | 🔴 VK | 🟡 XLA | — weights on host |
-| Host/disk tiers of shared shapes (copy_slots) | ✅ engine probe M43 · 🟡 e2e | 🔴 AMD | 🟡 M43 compile (BM) | 🔴 VK | 🔴 VK | 🔴 XLA | 🟡 CB (host sim) |
+| Weight streaming: experts | 🟡 dense bf16 M40; quantized next | ✅ dense M47; quantized after CUDA | 🔴 BM | 🔴 VK | 🔴 VK | 🟡 XLA | — weights on host |
+| Host/disk tiers of shared shapes (copy_slots) | ✅ engine probe M43 · 🟡 e2e | ✅ golden_offload 8/8 (MI300X) | 🟡 M43 compile (BM) | 🔴 VK | 🔴 VK | 🔴 XLA | 🟡 CB (host sim) |
 | K2 (no kv spaces) | ✅ M39 | ✅ | ✅ M42 | compile | compile | compile | compile |
 
 Cerebras realization (CB, `sc/cb-chunk-pool`): the column is the host-traced `Cerebras` engine. State lives in

@@ -662,3 +662,7 @@ The `new-memory/` directory is bookkeeping and is removed before anything lands 
   (MI300X): cached+held = baseline on nemotron/minimax/mimo/dots3/dsv4; host/mixed = per-route stream arm (max diff
   0.03-0.34; dsv4 flips a near tie at step 9). Quantized ROCm selects still RESIDENT (follow CUDA's next step).
 - GOLDEN-LOGITS-ROCM.txt rewritten in probe format (usable as PIE_GOLDEN_CHECK); notes moved to .md.
+
+### Note — 2026-11-10: ROCm tiers verified (MI300X)
+- golden_offload 8/8 models (incl. mamba, dsv4, dots3, minimax, mimo), 12/12 steps bitwise vs never-offloaded,
+  host + disk chunks exercised. No ROCm-only legacy tier code left (sc/tier-shared deleted the shared verbs).
