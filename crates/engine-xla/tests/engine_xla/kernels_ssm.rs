@@ -2430,8 +2430,9 @@ fn zz_gdn_step_timing() {
             let mut rng = Rng(77);
             let (qkv, gates) = gdn_inputs(&mut rng, &g, rows);
             let bank0: Vec<f32> = rng.f32s(slots * g.stride(), -0.5, 0.5).into_iter().map(round_bf16).collect();
-            for (heads, nb) in [(false, 2u8), (false, 3), (true, 2), (true, 3)] {
+            for (heads, nb, mxu) in [(false, 3u8, false), (true, 3, false), (false, 3, true)] {
                 let kernel = true;
+                kernels_xla::ssm::step_mxu(Some(mxu));
                 kernels_xla::ssm::step_heads(Some(heads));
                 kernels_xla::ssm::step_bufs(Some(nb));
                 kernels_xla::ssm::step_kernel(Some(kernel));
@@ -2451,7 +2452,7 @@ fn zz_gdn_step_timing() {
                 if let Some(t) = t {
                     let bytes = (rows * g.stride() * 2 * 2) as f64;
                     eprintln!(
-                        "gdn step timing: hv {hv} rows {rows} slots {slots} kernel {kernel} heads {heads} bufs {nb}: {:.1} us a layer ({:.0} GB/s of state in and out)",
+                        "gdn step timing: hv {hv} rows {rows} slots {slots} kernel {kernel} heads {heads} mxu {mxu} bufs {nb}: {:.1} us a layer ({:.0} GB/s of state in and out)",
                         t * 1e6,
                         bytes / t / 1e9
                     );
@@ -2460,6 +2461,7 @@ fn zz_gdn_step_timing() {
             kernels_xla::ssm::step_kernel(None);
             kernels_xla::ssm::step_bufs(None);
             kernels_xla::ssm::step_heads(None);
+            kernels_xla::ssm::step_mxu(None);
         }
     }
 }
@@ -2467,11 +2469,11 @@ fn zz_gdn_step_timing() {
 #[test]
 fn zz_the_decode_step_kernel_on_three_buffers_matches_the_xla_form() {
     kernels_xla::ssm::step_bufs(Some(3));
-    kernels_xla::ssm::step_heads(Some(true));
+    kernels_xla::ssm::step_mxu(Some(true));
     let gdn = |hv| Gdn { hk: 16, hv, dk: 128, dv: 128 };
     for (hv, rows, seed) in [(16, 1usize, 51u64), (16, 2, 52), (16, 4, 53), (16, 8, 54), (16, 40, 55), (48, 16, 56)] {
         step_against_xla(&gdn(hv), rows, seed);
     }
     kernels_xla::ssm::step_bufs(None);
-    kernels_xla::ssm::step_heads(None);
+    kernels_xla::ssm::step_mxu(None);
 }

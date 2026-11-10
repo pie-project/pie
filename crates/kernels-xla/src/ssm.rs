@@ -94,6 +94,20 @@ pub(crate) fn step_heads_on() -> bool {
     }
 }
 
+static STEP_MXU: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(2);
+
+/// Scratch: the step kernel's products through the MXU (`None`: `PIE_GDN_STEP_MXU=1`).
+pub fn step_mxu(on: Option<bool>) {
+    STEP_MXU.store(on.map_or(2, u8::from), std::sync::atomic::Ordering::Relaxed);
+}
+
+pub(crate) fn step_mxu_on() -> bool {
+    match STEP_MXU.load(std::sync::atomic::Ordering::Relaxed) {
+        2 => std::env::var("PIE_GDN_STEP_MXU").is_ok_and(|v| v == "1"),
+        v => v == 1,
+    }
+}
+
 fn step_kernel_on() -> bool {
     match STEP_KERNEL.load(std::sync::atomic::Ordering::Relaxed) {
         2 => !std::env::var("PIE_GDN_STEP_KERNEL").is_ok_and(|v| v == "0"),

@@ -81,6 +81,7 @@ fn kernel(t: i64, g: i64, hv: i64, rows: i64, per: i64) -> Built<crate::mosaic::
     // the two state buffers and a few f32 copies of a state as it steps
     let nb: i64 = super::step_bufs_n();
     let heads = super::step_heads_on();
+    let mxu = super::step_mxu_on();
     let vmem = nb * state * 2 + 6 * state * 4 + 2 * 6 * g * hv * 128 * 4 + (8 << 20);
     let k = Kernel {
         name: "gdn_step".into(),
@@ -169,7 +170,75 @@ fn kernel(t: i64, g: i64, hv: i64, rows: i64, per: i64) -> Built<crate::mosaic::
                 let x = b.vload(x, &[ri, i0, i0], &[1, hv, w])?;
                 b.shape_cast(x, &[hv, w])
             };
-            if heads {
+            if mxu {
+                // a head at a time through the MXU: the state is bf16, so one
+                // bf16 pass over q and k split into high and low halves reads
+                // `q·S` and `k·S` near f32, and `k ⊗ delta` comes as a
+                // transposed product of their halves
+                let a = at(b, a_r, dv)?;
+                let q = at(b, q_r, dk)?;
+                let k = at(b, k_r, dk)?;
+                let v = at(b, v_r, dv)?;
+                let beta = at(b, b_r, dv)?;
+                let qk = at(b, qk_r, dv)?;
+                let split = |b: &mut Body, x: V| -> Built<(V, V)> {
+                    let hi = b.convert_f(x, Elem::Bf16)?;
+                    let hi = b.convert_f(hi, Elem::F32)?;
+                    let lo = b.subf(x, hi)?;
+                    Ok((hi, lo))
+                };
+                let (qh, ql) = split(b, q)?;
+                let (kh, kl) = split(b, k)?;
+                let zk = b.splat_f(&[12, dk], Elem::F32, 0.0)?;
+                let zk5 = b.splat_f(&[13, dk], Elem::F32, 0.0)?;
+                let zv5 = b.splat_f(&[13, dv], Elem::F32, 0.0)?;
+                let acc8 = b.splat_f(&[16, dv], Elem::F32, 0.0)?;
+                let acc_s = b.splat_f(&[dk, dv], Elem::F32, 0.0)?;
+                for h in 0..hv {
+                    let off = b.index(h * dk);
+                    let st = b.vload(buf, &[si, off, i0], &[1, dk, dv])?;
+                    let st = b.shape_cast(st, &[dk, dv])?;
+                    let row = |b: &mut Body, x: V, w: i64| b.slice(x, &[h, 0], &[1, w]);
+                    let pieces = [row(b, qh, dk)?, row(b, ql, dk)?, row(b, kh, dk)?, row(b, kl, dk)?, zk];
+                    let lhs = b.concat(&pieces, 0)?;
+                    let lhs = b.convert_f(lhs, Elem::Bf16)?;
+                    let p = b.matmul(lhs, st, acc8, false)?;
+                    let p0 = b.rows(p, 0, 1)?;
+                    let p1 = b.rows(p, 1, 1)?;
+                    let p2 = b.rows(p, 2, 1)?;
+                    let p3 = b.rows(p, 3, 1)?;
+                    let ah = row(b, a, dv)?;
+                    let sq = b.addf(p0, p1)?;
+                    let sq = b.mulf(sq, ah)?;
+                    let mem = b.addf(p2, p3)?;
+                    let mem = b.mulf(mem, ah)?;
+                    let vh = row(b, v, dv)?;
+                    let bh = row(b, beta, dv)?;
+                    let qkh = row(b, qk, dv)?;
+                    let delta = b.subf(vh, mem)?;
+                    let delta = b.mulf(bh, delta)?;
+                    let dy = b.mulf(delta, qkh)?;
+                    let y = b.addf(sq, dy)?;
+                    let y = b.shape_cast(y, &[1, 1, dv])?;
+                    let hi = b.index(h);
+                    b.vstore(y, y_r, &[ri, hi, i0])?;
+                    let (dh, dl) = split(b, delta)?;
+                    let kh1 = row(b, kh, dk)?;
+                    let kl1 = row(b, kl, dk)?;
+                    let lk = b.concat(&[kh1, kh1, kl1, zk5], 0)?;
+                    let lk = b.convert_f(lk, Elem::Bf16)?;
+                    let rd = b.concat(&[dh, dl, dh, zv5], 0)?;
+                    let rd = b.convert_f(rd, Elem::Bf16)?;
+                    let upd = b.matmul_tl(lk, rd, acc_s)?;
+                    let st32 = b.convert_f(st, Elem::F32)?;
+                    let a2 = b.broadcast(ah, &[dk, dv])?;
+                    let s1 = b.mulf(st32, a2)?;
+                    let s2 = b.addf(s1, upd)?;
+                    let s2 = b.convert_f(s2, Elem::Bf16)?;
+                    let s2 = b.shape_cast(s2, &[1, dk, dv])?;
+                    b.vstore(s2, buf, &[si, off, i0])?;
+                }
+            } else if heads {
                 // a head at a time: each head's state, its columns of q and
                 // k and its products stay a few vregs, not whole-state
                 // temporaries in VMEM
