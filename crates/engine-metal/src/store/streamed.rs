@@ -420,6 +420,39 @@ struct Host {
     binding: Binding,
     /// The handle the load bound the weight at (released with the copy).
     handle: u32,
+    /// Where the weight lies in the serving file, where the load reads it
+    /// through a window of its own: a slot is then filled from the file on
+    /// the host, which leaves the mapping's pages untouched.
+    file: Option<(std::sync::Arc<crate::mapping::Mapping>, u64)>,
+    /// Whether `binding` is the weight's own memory (a file weight's is a
+    /// placeholder until [`Cache::open_files`]).
+    opened: bool,
+}
+
+/// A slot filled on the host from the serving file: `bytes` at `from` in
+/// the file, to `to` bytes into the pool.
+#[derive(Debug, Clone)]
+pub struct FileFill {
+    pub file: std::sync::Arc<crate::mapping::Mapping>,
+    pub from: u64,
+    pub to: u64,
+    pub bytes: u64,
+}
+
+impl FileFill {
+    /// The bytes, read from the file (not through its mapping).
+    pub fn read(&self, into: &mut Vec<u8>) -> Result<()> {
+        use std::os::unix::fs::FileExt;
+        into.resize(usize::try_from(self.bytes).unwrap_or(usize::MAX), 0);
+        self.file
+            .file()
+            .read_exact_at(into, self.from)
+            .map_err(|why| Fault::Mapped {
+                step: "read",
+                what: self.file.path().display().to_string(),
+                why: why.to_string(),
+            })
+    }
 }
 
 /// One weight shape's cache: its address tables, its hit counters and
@@ -437,6 +470,12 @@ pub struct Cache {
     hit_handles: Vec<Option<u32>>,
     /// The slot ref each atom is named, if any.
     slots: Vec<Option<u32>>,
+    /// The load seated every atom itself (`WeightShape::seated`), until the
+    /// runtime's first residency.
+    preseated: bool,
+    /// Whether the weights' own copies are in the queue's residency set
+    /// (they are read in place by a miss).
+    hosts_resident: bool,
 }
 
 impl Cache {
@@ -448,6 +487,7 @@ impl Cache {
         handles: &Handles,
         shape: Shape,
         handle_of: impl Fn(usize) -> Option<u32>,
+        file_of: impl Fn(usize) -> Option<(std::sync::Arc<crate::mapping::Mapping>, u64)>,
     ) -> Result<Cache> {
         let mut hosts = Vec::with_capacity(shape.planes.len());
         let mut tables = Vec::with_capacity(shape.planes.len());
@@ -465,7 +505,12 @@ impl Cache {
                 .ok_or_else(|| Fault::Unbound {
                     what: format!("handle {handle} of streamed param {param}"),
                 })?;
-            hosts.push(Some(Host { binding, handle }));
+            hosts.push(Some(Host {
+                binding,
+                handle,
+                opened: false,
+                file: file_of(param),
+            }));
             let entries = u64::from(plane.entries);
             let table = Buffer::zeroed(device, entries * 8)?;
             let bound = handles.bind(&table, 0, entries * 8)?;
@@ -484,6 +529,8 @@ impl Cache {
             tables,
             hits,
             hit_handles,
+            preseated: false,
+            hosts_resident: false,
         };
         cache.stage(None)?;
         Ok(cache)
@@ -562,13 +609,17 @@ impl Cache {
     /// blitted from their weights into `frame` (the pool `into`, a slot
     /// ref's byte offset by `offset`). The tables are rewritten by
     /// [`Cache::restage`] once `frame` is committed.
+    ///
+    /// A weight read from the serving file is not blitted: its fills are
+    /// answered, for the caller to write on the host.
     pub fn take(
         &mut self,
         frame: &mut Frame,
         named: Vec<Option<u32>>,
         into: &Buffer,
         offset: SlotAt<'_>,
-    ) -> Result<()> {
+    ) -> Result<Vec<FileFill>> {
+        let mut fills = Vec::new();
         for (atom, slot) in named.iter().enumerate() {
             let Some(slot) = *slot else { continue };
             if self.slots[atom] == Some(slot) {
@@ -594,6 +645,15 @@ impl Cache {
                 if bytes == 0 {
                     continue;
                 }
+                if let Some((file, at)) = &host.file {
+                    fills.push(FileFill {
+                        file: std::sync::Arc::clone(file),
+                        from: at + plane.entry_at(entry),
+                        to: to + plane.at,
+                        bytes,
+                    });
+                    continue;
+                }
                 frame.copy(
                     host.binding.slab(),
                     host.binding.offset() + plane.entry_at(entry),
@@ -604,13 +664,69 @@ impl Cache {
             }
         }
         self.slots = named;
-        Ok(())
+        Ok(fills)
     }
 
     /// Rewrites the address tables for the slots the atoms are named now,
     /// through the pool at `base` (see [`Cache::stage`]).
     pub fn restage(&mut self, base: u64, offset: SlotAt<'_>) -> Result<()> {
         self.stage(Some((base, offset)))
+    }
+
+    /// The shape's facts, stating where the load seated it while it holds
+    /// its own seating.
+    #[must_use]
+    pub fn facts(&self) -> WeightShape {
+        WeightShape {
+            seated: if self.preseated {
+                self.slots.first().copied().flatten()
+            } else {
+                None
+            },
+            ..self.shape.facts()
+        }
+    }
+
+    /// Marks the slots named as the load's own seating (or not).
+    pub fn set_preseated(&mut self, preseated: bool) {
+        self.preseated = preseated;
+    }
+
+    #[must_use]
+    pub fn preseated(&self) -> bool {
+        self.preseated
+    }
+
+    /// Whether the weights' own copies are held in the queue's residency
+    /// set; marked so by the caller who put them there.
+    #[must_use]
+    pub fn hosts_resident(&self) -> bool {
+        self.hosts_resident
+    }
+
+    pub fn set_hosts_resident(&mut self, resident: bool) {
+        self.hosts_resident = resident;
+    }
+
+    /// Gives each weight read from the serving file, and bound to no
+    /// memory yet, the binding `open` answers for it (a window over the
+    /// file a miss reads in place), by param and handle. The caller
+    /// restages the tables after.
+    pub fn open_files(
+        &mut self,
+        mut open: impl FnMut(usize, u32) -> Result<Option<Binding>>,
+    ) -> Result<()> {
+        for (host, plane) in self.hosts.iter_mut().zip(&self.shape.planes) {
+            let Some(host) = host else { continue };
+            if host.file.is_none() || host.opened {
+                continue;
+            }
+            if let Some(binding) = open(plane.param, host.handle)? {
+                host.binding = binding;
+            }
+            host.opened = true;
+        }
+        Ok(())
     }
 
     /// Whether every atom is named a slot.

@@ -36,6 +36,37 @@ fn fnv(name: &str) -> u64 {
 /// rest small.
 fn write_checkpoint(path: &Path, trace: &Trace) {
     let mut writer = ztensor::Writer::create(path).expect("the fixture writes");
+    for (name, shape, leaf, bytes) in seeded(trace) {
+        writer
+            .add(name.as_str(), shape, leaf, &bytes)
+            .unwrap_or_else(|why| panic!("`{name}`: {why}"));
+    }
+    writer.finish().expect("the fixture finishes");
+}
+
+/// The same planes as a serving artifact stamped for `trace`'s Metal
+/// deployment: the file a deployed model loads warm, out of its mapping.
+pub(super) fn write_serving(path: &Path, trace: &Trace) {
+    use checkpoint::file::emit::{self, Object};
+    let planes = seeded(trace);
+    let objects: Vec<Object<'_>> = planes
+        .iter()
+        .map(|(name, shape, leaf, bytes)| Object::leaf(name, shape.clone(), *leaf, bytes))
+        .collect();
+    emit::write(
+        path,
+        &checkpoint::serving::Stamp::of(trace.platform.backend(), &trace.name),
+        &std::collections::BTreeMap::new(),
+        16384,
+        &objects,
+        |object, plane, _| panic!("{object}/{plane} is not streamed here"),
+    )
+    .unwrap_or_else(|why| panic!("{}: {why}", path.display()));
+}
+
+/// `trace`'s checkpoint planes seeded by name, by name.
+fn seeded(trace: &Trace) -> Vec<(String, Vec<u64>, ztensor::Leaf, Vec<u8>)> {
+    let mut out = Vec::new();
     let mut planes: Vec<_> = trace
         .params
         .iter()
@@ -86,11 +117,9 @@ fn write_checkpoint(path: &Path, trace: &Trace) {
                 param.name
             ),
         };
-        writer
-            .add(param.name.as_str(), param.shape.clone(), leaf, &bytes)
-            .unwrap_or_else(|why| panic!("`{}`: {why}", param.name));
+        out.push((param.name.clone(), param.shape.clone(), leaf, bytes));
     }
-    writer.finish().expect("the fixture finishes");
+    out
 }
 
 pub(super) struct Fixture {
@@ -118,7 +147,11 @@ pub(super) fn fixture_of(model: &str, layers: Option<u32>) -> Fixture {
 
 /// The fixture of `trace`, its checkpoint written under `name`.
 pub(super) fn fixture_from(trace: Trace, name: &str) -> Fixture {
-    let dir = std::env::temp_dir().join(format!("pie-bm-pool-{}", std::process::id()));
+    // `PIE_FIXTURE_DIR` keeps the fixtures across processes (a probe).
+    let dir = std::env::var_os("PIE_FIXTURE_DIR").map_or_else(
+        || std::env::temp_dir().join(format!("pie-bm-pool-{}", std::process::id())),
+        std::path::PathBuf::from,
+    );
     std::fs::create_dir_all(&dir).expect("the fixture dir");
     let container = dir.join(format!("{name}.zt"));
     if !container.exists() {

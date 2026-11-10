@@ -154,6 +154,20 @@ impl Cut {
         }
     }
 
+    /// The whole pages of `map` around its `length` bytes at `offset`.
+    #[must_use]
+    pub fn around(map: &Mapping, offset: u64, length: u64) -> Cut {
+        let page = page();
+        let lo = usize::try_from(offset).unwrap_or(usize::MAX) / page * page;
+        let end = usize::try_from(offset.saturating_add(length)).unwrap_or(usize::MAX);
+        let hi = end.next_multiple_of(page).min(map.span()).max(lo);
+        Cut {
+            base: lo,
+            span: hi - lo,
+            bytes: (map.len().saturating_sub(lo as u64)).min((hi - lo) as u64),
+        }
+    }
+
     #[must_use]
     pub fn base(&self) -> usize {
         self.base
@@ -190,7 +204,16 @@ pub fn ceiling(device: u64) -> u64 {
         .map_or(device, |stated| stated.min(device))
 }
 
-pub fn cut(map: &Mapping, ceiling: u64, bound: &[(&str, u64, u64)]) -> Result<Vec<Cut>> {
+/// The windows `bound`'s planes are read through: the whole mapping where
+/// it fits one buffer and no plane is kept `apart`, else windows around the
+/// planes. A window spans no byte of an `apart` span (`(offset, length)`):
+/// those are read only through windows of their own.
+pub fn cut(
+    map: &Mapping,
+    ceiling: u64,
+    bound: &[(&str, u64, u64)],
+    apart: &[(u64, u64)],
+) -> Result<Vec<Cut>> {
     let page = page();
     let what = || map.path().display().to_string();
     let refuse = |why: String| Fault::Mapped {
@@ -206,7 +229,7 @@ pub fn cut(map: &Mapping, ceiling: u64, bound: &[(&str, u64, u64)]) -> Result<Ve
     }
     let span = map.span();
     let len = map.len();
-    if span <= ceiling {
+    if span <= ceiling && apart.is_empty() {
         return Ok(vec![Cut::whole(map)]);
     }
     if bound.is_empty() {
@@ -248,9 +271,18 @@ pub fn cut(map: &Mapping, ceiling: u64, bound: &[(&str, u64, u64)]) -> Result<Ve
                  device mints"
             )));
         }
+        // Whether `[from, to)` holds a byte of an apart span.
+        let parts = |from: usize, to: usize| {
+            apart.iter().any(|&(offset, length)| {
+                let (a, b) = (offset as usize, (offset + length) as usize);
+                a < to && b > from
+            })
+        };
         match open {
             Some((base, cover))
-                if lo.saturating_sub(cover) as u64 <= SLACK && hi - base <= ceiling =>
+                if lo.saturating_sub(cover) as u64 <= SLACK
+                    && hi - base <= ceiling
+                    && !parts(cover.min(lo), lo.max(cover)) =>
             {
                 open = Some((base, cover.max(hi)));
             }
@@ -415,7 +447,7 @@ mod tests {
             ("small".to_string(), 0u64, 4 * page as u64),
             ("the-whale".to_string(), 8 * page as u64, 10 * page as u64),
         ];
-        let fault = cut(&map, 8 * page as u64, &borrow(&held))
+        let fault = cut(&map, 8 * page as u64, &borrow(&held), &[])
             .expect_err("a plane past the ceiling is not a view of anything");
         let said = fault.to_string();
         assert!(
@@ -433,7 +465,7 @@ mod tests {
         let path = sparse("nothing-bound", 64 * page as u64);
         let map = Mapping::of(&path).expect("the sparse artifact maps");
         let _ = std::fs::remove_file(&path);
-        let fault = cut(&map, 8 * page as u64, &[]).expect_err("no plane, no window");
+        let fault = cut(&map, 8 * page as u64, &[], &[]).expect_err("no plane, no window");
         assert!(
             fault.to_string().contains("binds no plane"),
             "the refusal says what is missing: {fault}"
@@ -444,7 +476,7 @@ mod tests {
         let path = scratch("tiny-ceiling", 5000);
         let map = Mapping::of(&path).expect("the artifact maps");
         let _ = std::fs::remove_file(&path);
-        let fault = cut(&map, 8, &[]).expect_err("a sub-page ceiling binds nothing");
+        let fault = cut(&map, 8, &[], &[]).expect_err("a sub-page ceiling binds nothing");
         assert!(
             fault.to_string().contains("fewer than one"),
             "the refusal names the device's own number: {fault}"
@@ -461,7 +493,7 @@ mod tests {
             60 * page as u64,
             16 * page as u64,
         )];
-        let fault = cut(&map, 8 * page as u64, &borrow(&held))
+        let fault = cut(&map, 8 * page as u64, &borrow(&held), &[])
             .expect_err("a blob past the end does not cut");
         let said = fault.to_string();
         assert!(
