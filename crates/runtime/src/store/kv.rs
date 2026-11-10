@@ -73,9 +73,17 @@ pub struct KvResidencyTxn {
     working_sets: HashSet<WorkingSetId>,
     pages: Vec<SwapPage>,
     pinned: Vec<NodeId>,
+    /// The list shape the pages are slots of, where they are a shared
+    /// pool's (CONTRACT-BC 22): the copy is the engine's `copy_slots`.
+    shape: Option<::engine::chunk::ShapeId>,
 }
 
 impl KvResidencyTxn {
+    /// The list shape the pages are slots of, on a shared pool.
+    pub fn shape(&self) -> Option<::engine::chunk::ShapeId> {
+        self.shape
+    }
+
     pub fn copy_plans(&self) -> Vec<(MemoryDomain, Vec<u32>, Vec<u32>)> {
         let mut plans: Vec<(MemoryDomain, Vec<u32>, Vec<u32>)> = Vec::new();
         for page in &self.pages {
@@ -113,8 +121,13 @@ pub struct KvStore {
     short_pages: u32,
     /// What the engine has memory under; past the limit while a tail empties.
     mapped_pages: u32,
-    host_pool: Pool<HostKvSlotId>,
+    /// Host slots: a pinned run's, or the slot refs of the list shape of
+    /// an engine's host tier (CONTRACT-BC 22).
+    host_pool: ShapePool<HostKvSlotId>,
     disk_pool: Pool<DiskKvSlotId>,
+    /// The list shape the pages are slots of, where they are a shared
+    /// pool's: tier moves name it.
+    shape: Option<::engine::chunk::ShapeId>,
     /// `None` while some are off the device.
     flat: HashMap<WorkingSetId, Option<Vec<PhysicalKvPageId>>>,
     domain: Hash256,
@@ -192,9 +205,15 @@ pub struct KvPersistTxn {
         journal::PageRecord,
     )>,
     pinned: NodeId,
+    shape: Option<::engine::chunk::ShapeId>,
 }
 
 impl KvPersistTxn {
+    /// The list shape the pages are slots of, on a shared pool.
+    pub fn shape(&self) -> Option<::engine::chunk::ShapeId> {
+        self.shape
+    }
+
     /// The device pages to copy, and the disk slots they go to.
     pub fn copy_plan(&self) -> (Vec<u32>, Vec<u32>) {
         self.pages
@@ -340,14 +359,16 @@ impl KvStore {
         seed: Hash256,
     ) -> Self {
         let capacity = pool.capacity();
+        let slot_bytes = pool.slot_bytes();
         Self {
             table: KvPageTable::new(),
             pool,
             target_pages: capacity,
             short_pages: 0,
             mapped_pages: capacity,
-            host_pool: Pool::new(host_capacity),
+            host_pool: ShapePool::new(ShapeKind::List, slot_bytes, 0, host_capacity),
             disk_pool: Pool::new(disk_capacity),
+            shape: None,
             flat: HashMap::new(),
             domain: hash::cache_domain(&seed),
             cache: HashMap::new(),
@@ -365,6 +386,23 @@ impl KvStore {
             hints: HashMap::new(),
             reclaimable: std::cell::Cell::new(None),
         }
+    }
+
+    /// The pages are slot refs of the shared pool's list shape `shape`;
+    /// `host` (slot refs of the host tier's list shape) is where they are
+    /// suspended and demoted to, and `disk_slots` slots of the engine's
+    /// kv slot file below it (CONTRACT-BC 22).
+    pub fn set_tiers(
+        &mut self,
+        shape: ::engine::chunk::ShapeId,
+        host: Option<ShapePool<HostKvSlotId>>,
+        disk_slots: u32,
+    ) {
+        self.shape = Some(shape);
+        if let Some(host) = host {
+            self.host_pool = host;
+        }
+        self.disk_pool = Pool::new(disk_slots);
     }
 
     pub fn set_domain(&mut self, domain: Hash256) {
@@ -950,6 +988,7 @@ impl KvStore {
             working_sets: HashSet::new(),
             pages,
             pinned: vec![last.node],
+            shape: self.shape,
         }))
     }
 
@@ -1003,7 +1042,14 @@ impl KvStore {
         Ok(self.table.logged(ws)?)
     }
 
+    ///
+    /// None on a shared pool: its host slots are slot refs of the host
+    /// tier, which the engine's byte reads and writes (`read_host_kv`) do
+    /// not name.
     pub fn alloc_host_slots(&mut self, n: usize) -> Option<Vec<HostKvSlotId>> {
+        if self.shape.is_some() {
+            return None;
+        }
         self.host_pool.try_alloc_n(n)
     }
 
@@ -2114,6 +2160,7 @@ impl KvStore {
                 .map(|((location, gpu, record), slot)| (location, gpu, slot, record))
                 .collect(),
             pinned,
+            shape: self.shape,
         })
     }
 
@@ -2322,6 +2369,7 @@ impl KvStore {
             working_sets: working_sets.clone(),
             pages,
             pinned,
+            shape: self.shape,
         })
     }
 
@@ -2422,6 +2470,7 @@ impl KvStore {
             working_sets: working_sets.clone(),
             pages,
             pinned,
+            shape: self.shape,
         })
     }
 

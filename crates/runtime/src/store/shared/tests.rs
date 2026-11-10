@@ -593,7 +593,7 @@ fn the_stores_take_list_refs_and_records_and_a_fork_names_its_cow() {
 
     let facts = fixed_facts();
     let shared: Shared = Arc::new(Mutex::new(SharedPool::new(&facts, 2, 256).unwrap()));
-    let stores = crate::store::registry::shared_stores(&shared, 16, 256);
+    let stores = crate::store::registry::shared_stores(&shared, &Tiers::default(), 16, 256);
     assert!(stores.shared.is_some());
     // kv pages are the list shape's slot refs, from the one pool.
     let pages = crate::store::registry::with_kv_lock(&stores.kv, "test", |kv| {
@@ -713,7 +713,7 @@ fn every_lane_of_a_group_names_the_record_the_group_writes() {
 
     let facts = fixed_facts();
     let shared: Shared = Arc::new(Mutex::new(SharedPool::new(&facts, 2, 256).unwrap()));
-    let stores = crate::store::registry::shared_stores(&shared, 16, 256);
+    let stores = crate::store::registry::shared_stores(&shared, &Tiers::default(), 16, 256);
     let geom = RsGeometry {
         state_size: 1024,
         buffer_page_tokens: 4,
@@ -830,7 +830,7 @@ fn a_snapshot_names_every_piece_of_its_record() {
 
     let facts = fixed_facts();
     let shared: Shared = Arc::new(Mutex::new(SharedPool::new(&facts, 2, 256).unwrap()));
-    let stores = crate::store::registry::shared_stores(&shared, 16, 256);
+    let stores = crate::store::registry::shared_stores(&shared, &Tiers::default(), 16, 256);
     let mut rs = stores.rs.lock().unwrap();
     let ws = rs.create_working_set(RsGeometry {
         state_size: 1024,
@@ -929,7 +929,7 @@ fn a_drained_segment_goes_once_the_next_fire_retires() {
 #[test]
 fn a_freed_slot_waits_for_the_fire_that_read_it() {
     let shared: Shared = Arc::new(Mutex::new(SharedPool::new(&fixed_facts(), 2, 256).unwrap()));
-    let stores = crate::store::registry::shared_stores(&shared, 16, 256);
+    let stores = crate::store::registry::shared_stores(&shared, &Tiers::default(), 16, 256);
     let available = || shared.lock().unwrap().pool().available(LIST_POOL);
     crate::store::registry::with_kv_lock(&stores.kv, "test", |kv| {
         let ws = kv.create_working_set();
@@ -997,7 +997,7 @@ fn metal_like_facts() -> ChunkFacts {
 fn uncommitted_segments_are_not_pages_out() {
     let facts = metal_like_facts();
     let shared: Shared = Arc::new(Mutex::new(SharedPool::new(&facts, 1, 4096).unwrap()));
-    let stores = crate::store::registry::shared_stores(&shared, 16, 4096);
+    let stores = crate::store::registry::shared_stores(&shared, &Tiers::default(), 16, 4096);
     let counts = || {
         crate::store::registry::with_kv_lock(&stores.kv, "test", |kv| {
             (kv.capacity_pages(), kv.pages_out())
@@ -1065,7 +1065,7 @@ fn beam_lanes_leave_their_rows_unfolded_in_rs_list_slots() {
 
     let facts = fixed_facts();
     let shared: Shared = Arc::new(Mutex::new(SharedPool::new(&facts, 3, 256).unwrap()));
-    let stores = crate::store::registry::shared_stores(&shared, 16, 256);
+    let stores = crate::store::registry::shared_stores(&shared, &Tiers::default(), 16, 256);
     let mut rs = stores.rs.lock().unwrap();
     // The geometry's page is not the rs list's: the list's slot holds 4.
     let ws = rs.create_working_set(RsGeometry {
@@ -1143,7 +1143,7 @@ fn a_fork_shares_rs_slots_and_copies_a_shared_tail_before_writing() {
 
     let facts = fixed_facts();
     let shared: Shared = Arc::new(Mutex::new(SharedPool::new(&facts, 2, 256).unwrap()));
-    let stores = crate::store::registry::shared_stores(&shared, 16, 256);
+    let stores = crate::store::registry::shared_stores(&shared, &Tiers::default(), 16, 256);
     let mut rs = stores.rs.lock().unwrap();
     let ws = rs.create_working_set(RsGeometry {
         state_size: 1024,
@@ -1308,7 +1308,7 @@ fn window_live(shared: &Shared) -> (u64, u64) {
 fn windowed_stores() -> (ChunkFacts, Shared, crate::store::registry::Stores) {
     let facts = window_facts();
     let shared: Shared = Arc::new(Mutex::new(SharedPool::new(&facts, 2, 256).unwrap()));
-    let stores = crate::store::registry::shared_stores(&shared, 16, 256);
+    let stores = crate::store::registry::shared_stores(&shared, &Tiers::default(), 16, 256);
     (facts, shared, stores)
 }
 
@@ -1567,3 +1567,5 @@ fn two_window_lists_trim_each_by_its_own_window() {
     rs.retire_idle();
     assert_eq!(window_live(&shared), (0, 0));
 }
+
+mod tiers;

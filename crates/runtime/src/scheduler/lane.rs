@@ -644,6 +644,7 @@ impl Lane {
                     crate::engine::verbs::settled(match plan {
                         PreLaunchCopy::Kv(plan) => engine.copy_kv(&plan),
                         PreLaunchCopy::State(plan) => engine.copy_state(&plan),
+                        PreLaunchCopy::Slots(plan) => engine.copy_slots(&plan),
                     })
                 });
                 match submitted {
@@ -781,6 +782,7 @@ impl Lane {
                     crate::engine::verbs::settled(match plan {
                         PreLaunchCopy::Kv(plan) => engine.copy_kv(&plan),
                         PreLaunchCopy::State(plan) => engine.copy_state(&plan),
+                        PreLaunchCopy::Slots(plan) => engine.copy_slots(&plan),
                     })
                 }) {
                     Ok(native_completion) => LaneCommit::AsyncControl {

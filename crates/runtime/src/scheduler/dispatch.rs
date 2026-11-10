@@ -4,6 +4,7 @@ use ::engine::transfer::{MemoryDomain, StateDirection, StateMove};
 use anyhow::Result;
 use eta_ir::registry::GeometryClass;
 
+use ::engine::chunk::SlotCopy;
 use ::engine::program::BindExtents;
 use ::engine::{ChannelRegistration, KvCopy, ProgramRegistration, StateCopy};
 
@@ -117,6 +118,12 @@ pub(crate) struct TierMove {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum TierKind {
     Kv,
+    /// A shared pool's kv list slots of this shape (CONTRACT-BC 22): moved
+    /// by `copy_slots`, the slots the tier's slot refs.
+    KvSlots(::engine::chunk::ShapeId),
+    /// A shared pool's recurrent slots of this shape: record pieces, rs
+    /// list or window list slots, moved by `copy_slots`.
+    RsSlots(::engine::chunk::ShapeId),
     /// Recurrent state slots.
     Rs,
     /// Recurrent buffer pages.
@@ -125,16 +132,50 @@ pub(crate) enum TierKind {
     Window,
 }
 
+impl TierKind {
+    /// A kv move: of a shared pool's list shape `shape`, or today's pages.
+    pub(crate) fn kv(shape: Option<::engine::chunk::ShapeId>) -> TierKind {
+        shape.map_or(TierKind::Kv, TierKind::KvSlots)
+    }
+}
+
 impl TierMove {
     pub(crate) fn label(&self) -> String {
         let kind = match self.kind {
-            TierKind::Kv => "kv",
+            TierKind::Kv | TierKind::KvSlots(_) => "kv",
+            TierKind::RsSlots(_) => "rs-slots",
             TierKind::Rs => "rs",
             TierKind::RsPages => "rs-pages",
             TierKind::Window => "window",
         };
         let way = if self.out { "to" } else { "from" };
         format!("{kind} {way} {:?}", self.tier)
+    }
+
+    /// A shared pool's move as the engine's [`SlotCopy`] (CONTRACT-BC 22):
+    /// whole slots `(src, dst)` between `device` and the tier; `None` for
+    /// today's pages and slots.
+    pub(crate) fn slot_copy(&self, device: MemoryDomain) -> Option<SlotCopy> {
+        let (TierKind::KvSlots(shape) | TierKind::RsSlots(shape)) = self.kind else {
+            return None;
+        };
+        let (src, dst) = if self.out {
+            (device, self.tier)
+        } else {
+            (self.tier, device)
+        };
+        let pairs = self.device.iter().copied().zip(self.slots.iter().copied());
+        Some(SlotCopy {
+            shape,
+            src,
+            dst,
+            slots: if self.out {
+                pairs.collect()
+            } else {
+                pairs.map(|(device, tier)| (tier, device)).collect()
+            },
+            runs: Vec::new(),
+        })
     }
 }
 
@@ -143,6 +184,10 @@ pub(crate) fn copy_tier_tracked(
     copy: &TierMove,
 ) -> Result<super::ControlCompletion> {
     let plan = match copy.kind {
+        TierKind::KvSlots(_) | TierKind::RsSlots(_) => PreLaunchCopy::Slots(
+            copy.slot_copy(super::device_domain(engine_idx))
+                .expect("a slot kind states a slot copy"),
+        ),
         TierKind::Kv => {
             let device = super::device_domain(engine_idx);
             let (src, dst, src_page_ids, dst_page_ids) = if copy.out {

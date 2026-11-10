@@ -603,6 +603,11 @@ impl Shell {
         let (rows, pages, window_pages) =
             crate::store::host_pool(budget, rows, row, pages, page, window_pages, window_page);
         self.pools.seat_host(pages, window_pages, rows, row)?;
+        // The shared pool's host tier from the same budget: what a runtime
+        // naming slot refs parks state in (CONTRACT-BC 22). Pinned as it is
+        // first touched, so the shelves a load does not move through cost
+        // nothing.
+        self.pools.seat_tier(budget);
         Ok(self.pools.host_pages())
     }
 

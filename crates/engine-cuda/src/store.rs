@@ -589,6 +589,10 @@ pub struct Pools {
     committed_state_slots: u32,
     host: Option<HostKv>,
     disk: Option<DiskKv>,
+    /// The shared pool's host tier (CONTRACT-BC 22): chunks of the state
+    /// pool's size, a slot of any shape at the place its host ref names,
+    /// each pinned as a copy first touches it.
+    tier: Option<Shelf>,
     /// Every declared page and slot is backed ([`Pools::back_whole`]), and
     /// never trimmed since.
     whole: bool,
@@ -596,6 +600,14 @@ pub struct Pools {
     /// the read-outs on the tap stream, each with the device pages and the
     /// host slots it holds.
     swaps: Vec<Swap>,
+}
+
+/// A tier a slot copy reads or writes (CONTRACT-BC 22).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Tier {
+    Device,
+    Host,
+    Disk,
 }
 
 /// A move between the device and the host tier, on the swap stream, or a
@@ -923,6 +935,7 @@ impl Pools {
             committed_state_slots: 0,
             host: None,
             disk: None,
+            tier: None,
             whole: false,
             swaps: Vec::new(),
         })
@@ -1639,18 +1652,7 @@ impl Pools {
         shape: engine::chunk::ShapeId,
         pairs: &[[u32; 2]],
     ) -> Result<()> {
-        let kind = match shape {
-            layout::LIST => Kind::List,
-            layout::WINDOW => Kind::Window,
-            layout::FIXED => Kind::Fixed,
-            layout::RS => Kind::Rs,
-            other => {
-                return Err(Fault::program(
-                    "store::chunks",
-                    format!("a slot copy names shape {other}, which this load does not state"),
-                ));
-            }
-        };
+        let kind = Self::kind_of(shape)?;
         let bytes = self
             .chunks
             .layout()
@@ -2106,9 +2108,13 @@ impl Pools {
             Commit::Committed => {}
             refusal => return Err(refuse(&self.pool, refusal)),
         }
-        Ok(self
+        let mut facts = self
             .chunks
-            .facts(max_tokens, spare, !elastic::mapped_on_demand()))
+            .facts(max_tokens, spare, !elastic::mapped_on_demand());
+        facts.host_chunks = self.tier_chunks();
+        facts.disk_chunks = self.disk_chunks();
+        facts.disk_kept = self.disk_kept();
+        Ok(facts)
     }
 
     /// Refuses a page count past the pool's.
@@ -2229,6 +2235,217 @@ impl Pools {
         self.paged_planes().iter().map(|&(_, bytes)| bytes).sum()
     }
 
+    /// Seats the host tier of `budget` bytes: as many whole chunks of the
+    /// state pool's size, pinned a [`SHELF_CHUNK`] at a time as copies first
+    /// touch them.
+    pub fn seat_tier(&mut self, budget: u64) {
+        let chunk = self.chunks.layout().chunk_bytes;
+        let chunks = u32::try_from(budget.checked_div(chunk).unwrap_or(0)).unwrap_or(u32::MAX);
+        self.tier = (chunks > 0).then(|| Shelf::new(vec![chunk], chunks));
+    }
+
+    /// The host tier's chunks.
+    #[must_use]
+    pub fn tier_chunks(&self) -> u32 {
+        self.tier.as_ref().map_or(0, |tier| tier.slots)
+    }
+
+    /// The kv list's slots the slot file holds, in whole chunks of them.
+    #[must_use]
+    pub fn disk_chunks(&self) -> u32 {
+        let per_chunk = self
+            .chunks
+            .layout()
+            .shape(Kind::List)
+            .map_or(0, |list| list.per_chunk);
+        self.disk_pages().checked_div(per_chunk).unwrap_or(0)
+    }
+
+    /// The load's shape `shape` names.
+    fn kind_of(shape: engine::chunk::ShapeId) -> Result<Kind> {
+        Ok(match shape {
+            layout::LIST => Kind::List,
+            layout::WINDOW => Kind::Window,
+            layout::FIXED => Kind::Fixed,
+            layout::RS => Kind::Rs,
+            other => {
+                return Err(Fault::program(
+                    "store::chunks",
+                    format!("a slot copy names shape {other}, which this load does not state"),
+                ));
+            }
+        })
+    }
+
+    /// The address of host ref `slot` of `kind` in the host tier, its chunk
+    /// pinned first.
+    fn tier_slot(&mut self, kind: Kind, slot: u32) -> Result<u64> {
+        let shape = self.chunks.layout().shape(kind).ok_or_else(|| {
+            Fault::program(
+                "store::chunks",
+                format!("a host slot of a {} in a load that lays none", kind.name()),
+            )
+        })?;
+        let (per_chunk, bytes) = (shape.per_chunk.max(1), shape.slot_bytes);
+        let Some(tier) = self.tier.as_mut() else {
+            return Err(Fault::Ceiling {
+                what: "chunks of the host tier",
+                need: u64::from(slot / per_chunk) + 1,
+                have: 0,
+            });
+        };
+        let chunk = slot / per_chunk;
+        tier.back([chunk], "chunks of the host tier")?;
+        Ok(tier.at(chunk, 0)? + u64::from(slot % per_chunk) * bytes)
+    }
+
+    /// Copies whole slots of `shape`, `(src, dst)`, from tier `from` to tier
+    /// `to` (CONTRACT-BC 22), on `stream` behind every fire enqueued on it
+    /// and ahead of every one after: a device ref is the runtime's (through
+    /// the chunk table), a host ref a place in the host tier, a disk ref a
+    /// kv list slot of the slot file. A slot is laid the same on every
+    /// tier, so each moves as one span. What goes to disk is written once
+    /// the stream has it; what comes from disk is read first.
+    pub fn copy_tier_slots(
+        &mut self,
+        stream: *mut core::ffi::c_void,
+        shape: engine::chunk::ShapeId,
+        from: Tier,
+        to: Tier,
+        pairs: &[(u32, u32)],
+    ) -> Result<()> {
+        if pairs.is_empty() || from == to {
+            return Ok(());
+        }
+        let kind = Self::kind_of(shape)?;
+        let bytes = self
+            .chunks
+            .layout()
+            .shape(kind)
+            .map(|shape| shape.slot_bytes)
+            .ok_or_else(|| {
+                Fault::program(
+                    "store::chunks",
+                    format!("a slot copy of a {} in a load that lays none", kind.name()),
+                )
+            })?;
+        let len = usize::try_from(bytes).unwrap_or(usize::MAX);
+        if (from == Tier::Disk || to == Tier::Disk) && kind != Kind::List {
+            return Err(Fault::Unbound {
+                what: format!(
+                    "a {} to or from disk: the slot file holds kv list slots only",
+                    kind.name()
+                ),
+            });
+        }
+        let device: Vec<u64> = pairs
+            .iter()
+            .filter_map(|&(src, dst)| match (from, to) {
+                (Tier::Device, _) => Some(u64::from(src)),
+                (_, Tier::Device) => Some(u64::from(dst)),
+                _ => None,
+            })
+            .collect();
+        self.seat_pages(kind, device)?;
+        self.fence_all_swaps(stream)?;
+        match (from, to) {
+            (Tier::Device, Tier::Host) | (Tier::Host, Tier::Device) => {
+                let to_host = to == Tier::Host;
+                let mut spans = Vec::with_capacity(pairs.len());
+                for &(src, dst) in pairs {
+                    let (on_device, on_host) = if to_host { (src, dst) } else { (dst, src) };
+                    let on_host = self.tier_slot(kind, on_host)?;
+                    let on_device = self.chunks.span(kind, on_device, 0, bytes)?;
+                    spans.push(if to_host {
+                        (on_host, on_device, len)
+                    } else {
+                        (on_device, on_host, len)
+                    });
+                }
+                crate::device::copy_batch(stream, to_host, &spans)
+            }
+            (Tier::Device, Tier::Disk) | (Tier::Disk, Tier::Device) => {
+                let to_disk = to == Tier::Disk;
+                let (device, disk): (Vec<u32>, Vec<u32>) = pairs
+                    .iter()
+                    .map(|&(src, dst)| if to_disk { (src, dst) } else { (dst, src) })
+                    .unzip();
+                self.through_disk(stream, to_disk, &disk, |pools, at| {
+                    pools.chunks.span(kind, device[at], 0, bytes)
+                })
+            }
+            (Tier::Host, Tier::Disk) | (Tier::Disk, Tier::Host) => {
+                let to_disk = to == Tier::Disk;
+                // A copy still on the stream may read or write a host slot.
+                crate::device::ctx::sync(stream)?;
+                let (host, disk): (Vec<u32>, Vec<u32>) = pairs
+                    .iter()
+                    .map(|&(src, dst)| if to_disk { (src, dst) } else { (dst, src) })
+                    .unzip();
+                let host = host
+                    .into_iter()
+                    .map(|slot| self.tier_slot(kind, slot))
+                    .collect::<Result<Vec<u64>>>()?;
+                self.through_disk(stream, to_disk, &disk, |_, at| Ok(host[at]))
+            }
+            _ => Ok(()),
+        }
+    }
+
+    /// Moves kv list slots between the slot file's slots `disk` and the
+    /// addresses `at(i)` (device or pinned host) through the stage, one slot
+    /// at a time.
+    fn through_disk(
+        &mut self,
+        stream: *mut core::ffi::c_void,
+        to_disk: bool,
+        disk: &[u32],
+        at: impl Fn(&Self, usize) -> Result<u64>,
+    ) -> Result<()> {
+        let have = u64::from(self.disk_pages());
+        if let Some(&slot) = disk.iter().find(|&&slot| u64::from(slot) >= have) {
+            return Err(Fault::Ceiling {
+                what: "disk kv pages",
+                need: u64::from(slot) + 1,
+                have,
+            });
+        }
+        let bytes = self
+            .chunks
+            .layout()
+            .shape(Kind::List)
+            .map_or(0, |list| list.slot_bytes);
+        let Some(mut spill) = self.disk.take() else {
+            return Ok(());
+        };
+        let moved = (|| {
+            let (stage, stride) = (spill.stage.host(), spill.file.stride());
+            // SAFETY: the stage is this load's pinned page, and every copy on
+            // the stream that touches it is waited for before the host reads
+            // or writes it.
+            let staged = || unsafe { std::slice::from_raw_parts_mut(stage, stride) };
+            for (i, &slot) in disk.iter().enumerate() {
+                if spill.landing {
+                    crate::device::ctx::sync(stream)?;
+                    spill.landing = false;
+                }
+                let place = at(self, i)?;
+                if to_disk {
+                    crate::device::copy_any(stream, stage as u64, place, bytes as usize)?;
+                    crate::device::ctx::sync(stream)?;
+                    spill.file.write(slot, staged()).map_err(slot_file)?;
+                } else {
+                    spill.file.read(slot, staged()).map_err(slot_file)?;
+                    crate::device::copy_any(stream, place, stage as u64, bytes as usize)?;
+                    spill.landing = true;
+                }
+            }
+            Ok(())
+        })();
+        self.disk = Some(spill);
+        moved
+    }
+
     /// Seats `pages` host kv pages, `window_pages` host windowed pages and
     /// `rows` host rs rows of `row_bytes`, each pinned a chunk at a time as a
     /// copy first touches it ([`Shelf`]), on reserved huge pages where the
@@ -2298,21 +2515,23 @@ impl Pools {
         keep: Option<&str>,
     ) -> Result<()> {
         let name = format!("r{rank}.kv");
+        // A slot holds a kv page as the planes lay it, or a kv list slot of
+        // the shared pool (CONTRACT-BC 22), whichever is larger.
+        let list = self
+            .chunks
+            .layout()
+            .shape(Kind::List)
+            .map_or(0, |list| list.slot_bytes);
+        let slot_bytes = self.paged_page_bytes().max(list);
         let file = match keep {
-            None => engine::disk::SlotFile::open(dir, &name, self.paged_page_bytes(), budget),
+            None => engine::disk::SlotFile::open(dir, &name, slot_bytes, budget),
             Some(load) => {
                 let planes: Vec<u64> = self.paged_planes().iter().map(|&(_, b)| b).collect();
                 let layout = format!(
-                    "cuda {load} page {} planes {planes:?}",
+                    "cuda {load} page {} planes {planes:?} list slot {list}",
                     self.paging.page_size
                 );
-                engine::disk::SlotFile::open_kept(
-                    dir,
-                    &name,
-                    self.paged_page_bytes(),
-                    budget,
-                    &layout,
-                )
+                engine::disk::SlotFile::open_kept(dir, &name, slot_bytes, budget, &layout)
             }
         }
         .map_err(slot_file)?;

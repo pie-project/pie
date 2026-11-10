@@ -821,6 +821,10 @@ impl Engine for Rank {
         self.with(|cuda| cuda.copy_state(copy))
     }
 
+    fn copy_slots(&mut self, copy: &engine::chunk::SlotCopy) -> EngineResult<()> {
+        self.with(|cuda| cuda.copy_slots(copy))
+    }
+
     fn host_kv_layout(&self) -> Option<state::PageLayout> {
         self.group.ranks[self.rank]
             .try_lock()

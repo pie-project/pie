@@ -175,6 +175,21 @@ pub trait Engine: Send {
     /// Copies slots of one shape between tiers or within one; replaces
     /// [`Engine::copy_kv`] and [`Engine::copy_state`] once every backend
     /// serves it.
+    ///
+    /// Tiers (CONTRACT-BC 22): an engine that states
+    /// [`crate::chunk::ChunkFacts::host_chunks`] moves whole slots of every
+    /// state shape between its device domain and
+    /// [`crate::transfer::MemoryDomain::HostPinned`], a host ref `r` of
+    /// shape `s` at [`crate::chunk::SlotShape::tier_offset`] of its host
+    /// chunks, laid out as the device slot (one span a slot); one that
+    /// states [`crate::chunk::ChunkFacts::disk_chunks`] moves kv list slots
+    /// between the device (or the host tier) and
+    /// [`crate::transfer::MemoryDomain::LocalDisk`], disk ref `r` slot `r`
+    /// of its kv slot file. Token runs are device to device only. Each copy
+    /// is ordered after every fire submitted before it and before every one
+    /// after (a stream-ordered copy, or a drain), and copies in submission
+    /// order: the runtime reuses a source slot and names a destination
+    /// again as soon as the call returns.
     fn copy_slots(&mut self, copy: &SlotCopy) -> Result<()> {
         let _ = copy;
         Err(self.unsupported("copy_slots"))

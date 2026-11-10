@@ -173,6 +173,23 @@ impl<I: PoolId> ShapePool<I> {
         }
     }
 
+    /// The engine's slot refs id `id` names, by the engine's shape: one
+    /// ref of a list shape, every piece of a record; none in a pinned
+    /// pool, whose ids are the engine's own.
+    pub fn slot_refs(&self, id: I) -> Vec<(::engine::chunk::ShapeId, Vec<u32>)> {
+        let at = id.index() - self.base;
+        match &self.slots {
+            Backing::Own(_) => Vec::new(),
+            Backing::Shape(shared, shape) => shared
+                .lock()
+                .unwrap()
+                .engine_shape(*shape)
+                .map(|engine| vec![(engine, vec![at])])
+                .unwrap_or_default(),
+            Backing::Records(shared) => shared.lock().unwrap().record_refs(at),
+        }
+    }
+
     /// One past the highest id the pool may hand out.
     pub fn ids_end(&self) -> u32 {
         self.ids_end
@@ -822,6 +839,21 @@ pub struct SlotMeter;
 
 impl SlotMeter {
     fn engine(stores: &registry::Stores, tier: Tier) -> Option<Bytes> {
+        // A shared pool's host tier is one pool of chunks every shape
+        // shares (CONTRACT-BC 22): its bytes are its chunks'.
+        if tier == Tier::Host && stores.shared.is_some() {
+            let Some(host) = &stores.host else {
+                return Some(Bytes::default());
+            };
+            let (total, opened, live) = host.lock().unwrap().tier_bytes();
+            return Some(Bytes {
+                total,
+                state: opened,
+                live,
+                wanted: opened,
+                act: 0,
+            });
+        }
         let (kv, kv_page_bytes, capacity, cached, host_free, host_capacity) =
             registry::with_kv_lock(&stores.kv, "policy-pressure", |kv| {
                 let pool = kv.page_pool();

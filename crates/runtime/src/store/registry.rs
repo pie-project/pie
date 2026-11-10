@@ -4,7 +4,7 @@ use std::sync::{Arc, LazyLock, Mutex, RwLock};
 use super::chunks::{Seats, ShapePool, StorePools};
 use super::kv::KvStore;
 use super::rs::RsStore;
-use super::shared::Shared;
+use super::shared::{Shared, Tiers};
 use super::slots::ShapeKind;
 
 static KV_TAINTED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
@@ -47,6 +47,9 @@ pub struct Stores {
     /// The engine's shared chunk pool, where it states one: the stores
     /// draw their ids from it, and lanes name their slots by its shapes.
     pub shared: Option<Shared>,
+    /// The shared pool's host tier, where the engine states one
+    /// (CONTRACT-BC 22): what suspended and demoted state parks in.
+    pub host: Option<Shared>,
 }
 
 fn context_pages(max_context: usize, kv_page_size: u32) -> u64 {
@@ -128,6 +131,7 @@ pub fn register_model_with_swap(
                 },
                 max_context: max_context.get(d).copied().unwrap_or(0),
                 shared: None,
+                tiers: Tiers::default(),
             }
         })
         .collect();
@@ -141,6 +145,8 @@ pub struct EngineStores {
     pub pools: StorePools,
     pub max_context: usize,
     pub shared: Option<Shared>,
+    /// The tiers below the shared pool.
+    pub tiers: Tiers,
 }
 
 /// Registers a model whose engines state their pools as `engines` say.
@@ -150,7 +156,12 @@ pub fn register_model_with_chunks(kv_page_size: u32, engines: &[EngineStores]) -
         .map(|engine| {
             let pools = &engine.pools;
             if let Some(shared) = &engine.shared {
-                return Some(shared_stores(shared, kv_page_size, engine.max_context));
+                return Some(shared_stores(
+                    shared,
+                    &engine.tiers,
+                    kv_page_size,
+                    engine.max_context,
+                ));
             }
             let mut kv = KvStore::with_pages(
                 pools.kv,
@@ -178,6 +189,7 @@ pub fn register_model_with_chunks(kv_page_size: u32, engines: &[EngineStores]) -
                 kv_page_size,
                 context_pages: context_pages(max_context, kv_page_size),
                 shared: None,
+                host: None,
             })
         })
         .collect();
@@ -185,10 +197,17 @@ pub fn register_model_with_chunks(kv_page_size: u32, engines: &[EngineStores]) -
 }
 
 /// The stores of an engine whose pool is `shared`: kv pages are the list
-/// shape's slot refs, the rs store's state slots its records (or its ring
-/// pages the ring shape's refs), as many seats as records. No host or disk
-/// tier yet: those move by `copy_slots`, which no store speaks yet.
-pub fn shared_stores(shared: &Shared, kv_page_size: u32, max_context: usize) -> Stores {
+/// shape's slot refs, the rs store's state slots its records (or its
+/// window lists' pages each list's refs), as many seats as records. Below
+/// it `tiers`: the host tier's slots of the same shapes, and kv list slots
+/// on disk, every move between them the engine's `copy_slots`
+/// (CONTRACT-BC 22).
+pub fn shared_stores(
+    shared: &Shared,
+    tiers: &Tiers,
+    kv_page_size: u32,
+    max_context: usize,
+) -> Stores {
     let (list, records) = {
         let pool = shared.lock().unwrap();
         (pool.list(), pool.records_capacity())
@@ -198,10 +217,17 @@ pub fn shared_stores(shared: &Shared, kv_page_size: u32, max_context: usize) -> 
         |list| ShapePool::shared(shared, list),
     );
     let mut kv = KvStore::with_pool(pages, 0, 0, rand::random::<[u8; 32]>());
+    if let Some(list) = list {
+        let host = tiers
+            .host
+            .as_ref()
+            .map(|host| ShapePool::shared(host, list));
+        kv.set_tiers(list.id, host, tiers.disk_slots);
+    }
     if let Some(identity) = crate::model::identity() {
         kv.set_domain(identity.domain());
     }
-    let rs = RsStore::shared(shared);
+    let rs = RsStore::shared(shared, tiers.host.as_ref());
     kv.set_keeps(kv_sharing() && records == 0 && !rs.is_window());
     kv.set_page_size(kv_page_size);
     Stores {
@@ -211,6 +237,7 @@ pub fn shared_stores(shared: &Shared, kv_page_size: u32, max_context: usize) -> 
         kv_page_size,
         context_pages: context_pages(max_context, kv_page_size),
         shared: Some(Arc::clone(shared)),
+        host: tiers.host.clone(),
     }
 }
 
@@ -292,6 +319,7 @@ mod tests {
             kv_page_size,
             context_pages: context_pages(max_context, kv_page_size),
             shared: None,
+            host: None,
         });
         Ok(())
     }

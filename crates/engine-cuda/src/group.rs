@@ -525,6 +525,13 @@ impl Engine for Group {
         self.lead(move |rank| rank.copy_state(&copy))
     }
 
+    /// Each rank moves its band of every slot to and from its own tiers
+    /// (CONTRACT-BC 22).
+    fn copy_slots(&mut self, copy: &engine::chunk::SlotCopy) -> EngineResult<()> {
+        let copy = copy.clone();
+        self.lead(move |rank| rank.copy_slots(&copy))
+    }
+
     fn host_kv_layout(&self) -> Option<state::PageLayout> {
         let ranks = u32::try_from(self.ranks.len()).ok()?;
         let rank = self.ranks.first()?.try_lock().ok()?;

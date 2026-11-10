@@ -457,16 +457,31 @@ async fn bootstrap_inner(config: Config) -> Result<BootstrapHandle> {
             } else {
                 None
             };
+            // Below a shared pool: the host chunks and the kv list's disk
+            // slots the engine states (CONTRACT-BC 22).
+            let tiers = if pools.shared {
+                crate::store::shared::Tiers::of(&d.chunks)
+                    .map_err(|error| anyhow::anyhow!("engine tiers: {error}"))?
+            } else {
+                crate::store::shared::Tiers::default()
+            };
             Ok(crate::store::registry::EngineStores {
                 pools,
                 max_context: d.limits.max_context,
                 shared,
+                tiers,
             })
         })
         .collect::<Result<Vec<_>>>()?;
-    let kv_swap_capable = engine_configs
-        .first()
-        .is_some_and(|d| d.cpu_pages > 0 || d.disk_pages > 0);
+    // A shared pool's tiers are its host chunks and disk slots; today's
+    // pools state theirs in pages.
+    let kv_swap_capable = engine_configs.first().is_some_and(|d| {
+        if crate::store::shared::SharedPool::states_shared(&d.chunks) {
+            d.chunks.host_chunks > 0 || d.chunks.disk_chunks > 0
+        } else {
+            d.cpu_pages > 0 || d.disk_pages > 0
+        }
+    });
     // The lanes one fire runs on each engine: the copy-on-write sets its
     // state pool keeps back from admission.
     let fire_lanes: Vec<u32> = engine_configs

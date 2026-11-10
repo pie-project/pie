@@ -656,7 +656,8 @@ impl Engine for Cuda {
             )
             .map_err(fault)?;
 
-        let chunk_facts = shell.chunk_facts().map_err(fault)?;
+        let mut chunk_facts = shell.chunk_facts().map_err(fault)?;
+        chunk_facts.disk_persistent = residency.disk_kv_persistent && chunk_facts.disk_chunks > 0;
         let trace_name = shell.trace().name.clone();
         let (weight_bytes, arena_bytes, pool_bytes, input_bytes) = shell.footprint();
         let (pool_committed_bytes, pool_high_water_bytes, elastic_page_bytes, elastic_budget_pages) =
@@ -831,17 +832,34 @@ impl Engine for Cuda {
     }
 
     fn copy_slots(&mut self, copy: &engine::chunk::SlotCopy) -> EngineResult<()> {
+        use crate::store::Tier;
         use crate::store::layout::{FIXED, LIST, WINDOW};
-        let device = |domain| matches!(domain, MemoryDomain::CudaDevice(_));
-        if !device(copy.src) || !device(copy.dst) {
-            return Err(Error::unsupported(
-                "cuda",
-                "copy_slots between tiers: the host and disk tiers of the shared shapes still \
-                 move through copy_kv and copy_state",
-            ));
-        }
+        let tier = |domain| match domain {
+            MemoryDomain::CudaDevice(_) => Some(Tier::Device),
+            MemoryDomain::HostPinned => Some(Tier::Host),
+            MemoryDomain::LocalDisk => Some(Tier::Disk),
+            _ => None,
+        };
+        let (Some(from), Some(to)) = (tier(copy.src), tier(copy.dst)) else {
+            return Err(Error::Unsupported {
+                verb: "copy_slots to or from a domain other than the device, the host tier \
+                       and the slot file",
+                engine: "cuda",
+            });
+        };
         let shell = self.loaded_mut()?;
         shell.take_refs();
+        if from != Tier::Device || to != Tier::Device {
+            // Between tiers (CONTRACT-BC 22): whole slots, each laid alike.
+            if !copy.runs.is_empty() {
+                return Err(Error::Invalid(
+                    "token runs move within the device; between tiers a slot moves whole".into(),
+                ));
+            }
+            return shell
+                .copy_tier_slots(copy.shape, from, to, &copy.slots)
+                .map_err(fault);
+        }
         if copy.shape == FIXED {
             if !copy.runs.is_empty() {
                 return Err(Error::Invalid(

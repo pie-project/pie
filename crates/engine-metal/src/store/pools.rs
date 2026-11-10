@@ -513,6 +513,38 @@ pub struct Pools {
     tables: Vec<TablePaging>,
     disk: Option<Spill>,
     parked: Option<Spill>,
+    /// The shared pool's host tier (CONTRACT-BC 22), where one is stated.
+    tier: Option<HostTier>,
+}
+
+/// The host tier: chunks of the pool's size in host memory apart from the
+/// pool, a slot of any shape at the place its host ref names, each chunk
+/// allocated as a copy first touches it. On unified memory it is the same
+/// DRAM, so a load seats one only where its budget is stated: what it buys
+/// is room in the pool's heap, not in memory.
+#[derive(Debug)]
+struct HostTier {
+    chunk_bytes: u64,
+    chunks: Vec<Option<Box<[u8]>>>,
+}
+
+impl HostTier {
+    /// The bytes of host ref `slot` of `shape`, its chunk allocated first.
+    fn slot(&mut self, shape: &Slots, slot: u32) -> Result<&mut [u8]> {
+        let per_chunk = shape.per_chunk.max(1);
+        let chunk = (slot / per_chunk) as usize;
+        let have = self.chunks.len();
+        let held = self.chunks.get_mut(chunk).ok_or(Fault::Ceiling {
+            what: "chunks of the host tier",
+            need: chunk as u64 + 1,
+            have: have as u64,
+        })?;
+        let bytes = usize::try_from(self.chunk_bytes).unwrap_or(usize::MAX);
+        let held = held.get_or_insert_with(|| vec![0u8; bytes].into_boxed_slice());
+        let at = usize::try_from(u64::from(slot % per_chunk) * shape.slot_bytes).unwrap_or(0);
+        let len = usize::try_from(shape.slot_bytes).unwrap_or(0);
+        Ok(&mut held[at..at + len])
+    }
 }
 
 /// The first byte of physical slot `slot` of `shape`.
@@ -564,6 +596,7 @@ impl Pools {
             side,
             disk: None,
             parked: None,
+            tier: None,
         };
         pools.write_maps(device)?;
         Ok(pools)
@@ -674,11 +707,58 @@ impl Pools {
     /// The pool as the runtime counts it.
     #[must_use]
     pub fn chunk_facts(&self) -> ChunkFacts {
-        self.layout.facts(
+        let mut facts = self.layout.facts(
             self.pool.growth(),
             self.pool.committed_segments(),
             &self.shape_rows,
-        )
+        );
+        facts.host_chunks = self.tier.as_ref().map_or(0, |tier| {
+            u32::try_from(tier.chunks.len()).unwrap_or(u32::MAX)
+        });
+        facts.disk_chunks = self.layout.list.map_or(0, |list| {
+            Spill::slots(self.disk.as_ref())
+                .checked_div(list.per_chunk)
+                .unwrap_or(0)
+        });
+        facts
+    }
+
+    /// Seats a host tier of `budget` bytes, in whole chunks (CONTRACT-BC
+    /// 22).
+    pub fn seat_tier(&mut self, budget: u64) {
+        let chunk_bytes = self.layout.chunk_bytes;
+        let chunks = budget.checked_div(chunk_bytes).unwrap_or(0);
+        self.tier = (chunks > 0).then(|| HostTier {
+            chunk_bytes,
+            chunks: (0..chunks).map(|_| None).collect(),
+        });
+    }
+
+    /// Copies whole slots of `id` between the pool (slot refs) and the host
+    /// tier (host refs), `(src, dst)` the way `to_host` says. The caller has
+    /// drained every frame.
+    fn park(&mut self, id: ShapeId, to_host: bool, pairs: &[(u32, u32)]) -> Result<()> {
+        let shape = *self.shape(id)?;
+        for &(src, dst) in pairs {
+            let (device, host) = if to_host { (src, dst) } else { (dst, src) };
+            let at = self.slot_offset(id, device)?;
+            self.pool
+                .admit(u32::try_from(at / self.layout.chunk_bytes).unwrap_or(u32::MAX))?;
+            let Some(tier) = self.tier.as_mut() else {
+                return Err(Fault::Ceiling {
+                    what: "chunks of the host tier",
+                    need: u64::from(host / shape.per_chunk.max(1)) + 1,
+                    have: 0,
+                });
+            };
+            let slot = tier.slot(&shape, host)?;
+            if to_host {
+                self.pool.read(at, slot)?;
+            } else {
+                self.pool.write(at, slot)?;
+            }
+        }
+        Ok(())
     }
 
     fn shape(&self, id: ShapeId) -> Result<&Slots> {
@@ -1267,6 +1347,17 @@ impl Pools {
                 }
                 Ok(())
             }
+            (src, dst) if !copy.runs.is_empty() => Err(Fault::Unbound {
+                what: format!(
+                    "token runs from {src:?} to {dst:?}: between tiers a slot moves whole"
+                ),
+            }),
+            (src, MemoryDomain::HostPinned) if src == device => {
+                self.park(copy.shape, true, &copy.slots)
+            }
+            (MemoryDomain::HostPinned, dst) if dst == device => {
+                self.park(copy.shape, false, &copy.slots)
+            }
             (src, MemoryDomain::LocalDisk) if src == device => {
                 let (ids, slots): (Vec<u32>, Vec<u32>) = copy.slots.iter().copied().unzip();
                 self.spill(copy.shape, true, &ids, &slots)
@@ -1277,8 +1368,8 @@ impl Pools {
             }
             (src, dst) => Err(Fault::Unbound {
                 what: format!(
-                    "a slot copy from {src:?} to {dst:?}: this pool is host memory, and moves \
-                     only within itself and to its slot files"
+                    "a slot copy from {src:?} to {dst:?}: this pool moves within itself, to \
+                     its host tier and to its slot files"
                 ),
             }),
         }

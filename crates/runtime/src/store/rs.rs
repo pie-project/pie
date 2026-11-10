@@ -220,11 +220,15 @@ impl RsGrant {
     }
 }
 
-/// In the engine's numbering: each kind from 0.
+/// In the engine's numbering: each kind from 0. A shared pool's move is
+/// stated by slot shape instead (CONTRACT-BC 22): `shared` holds, for each
+/// shape, the `(device, host)` slot refs it moves, a record's every piece
+/// of every fixed shape, and `slots`/`pages` are empty.
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct RsCopyPlan {
     pub slots: Vec<(u32, u32)>,
     pub pages: Vec<(u32, u32)>,
+    pub shared: Vec<(::engine::chunk::ShapeId, Vec<(u32, u32)>)>,
 }
 
 /// What a set holds, in its own numbering: see [`RsEntry`].
@@ -287,6 +291,9 @@ pub struct RsStore {
     pages: ShapePool<RsSlotId>,
     host_slots: ShapePool<RsSlotId>,
     host_pages: ShapePool<RsSlotId>,
+    /// Host slots of window lists 1.. (list 0 parks in `host_pages`), each
+    /// numbered past the one before.
+    host_windows: Vec<ShapePool<RsSlotId>>,
     pages_at: u32,
     /// The window lists, where the state is windows (no state slots, id 0 of
     /// each the engine's null page): list 0's slots are `pages`, list
@@ -413,7 +420,11 @@ impl RsStore {
     /// and the rs list's slot refs as buffer pages (ids from past the
     /// records', an engine id the slot ref; CONTRACT-BC 18). A pool with no
     /// rs list buffers nothing.
-    pub fn shared(shared: &Shared) -> Self {
+    ///
+    /// `host`, the engine's host tier (CONTRACT-BC 22), backs the host rows
+    /// a suspend parks state in: records, rs list slots and every window
+    /// list's slots, each of its own shape, past the device's ids.
+    pub fn shared(shared: &Shared, host: Option<&Shared>) -> Self {
         let (windows, fixed, rs_list) = {
             let pool = shared.lock().unwrap();
             (
@@ -433,12 +444,24 @@ impl RsStore {
                     pool
                 })
                 .collect();
-            let host = end.max(1);
-            return Self::build(
+            let base = end.max(1);
+            let mut host_lists: Vec<ShapePool<RsSlotId>> = windows
+                .iter()
+                .scan(base, |at, list| {
+                    let pool = host.map_or_else(
+                        || ShapePool::new(ShapeKind::List, list.slot_bytes, *at, 0),
+                        |host| ShapePool::shared_from(host, *list, *at),
+                    );
+                    *at = pool.ids_end();
+                    Some(pool)
+                })
+                .collect();
+            let host_pages = host_lists.remove(0);
+            let mut store = Self::build(
                 ShapePool::new(ShapeKind::Fixed, 0, 0, 0),
                 pages,
-                ShapePool::new(ShapeKind::Fixed, 0, host, 0),
-                ShapePool::new(ShapeKind::List, first.slot_bytes, host, 0),
+                ShapePool::new(ShapeKind::Fixed, 0, base, 0),
+                host_pages,
                 0,
                 windows
                     .iter()
@@ -449,6 +472,8 @@ impl RsStore {
                     .collect(),
                 more,
             );
+            store.host_windows = host_lists;
+            return store;
         }
         let slots = if fixed {
             ShapePool::records(shared, 0)
@@ -460,12 +485,21 @@ impl RsStore {
             || ShapePool::new(ShapeKind::List, 0, records, 0),
             |list| ShapePool::shared_from(shared, list, records),
         );
-        let host = pages.ids_end();
+        let base = pages.ids_end();
+        let host_slots = match host {
+            Some(host) if fixed => ShapePool::records(host, base),
+            _ => ShapePool::new(ShapeKind::Fixed, 0, base, 0),
+        };
+        let at = host_slots.ids_end();
+        let host_pages = match (host, rs_list) {
+            (Some(host), Some(list)) => ShapePool::shared_from(host, list, at),
+            _ => ShapePool::new(ShapeKind::List, 0, at, 0),
+        };
         let mut store = Self::build(
             slots,
             pages,
-            ShapePool::new(ShapeKind::Fixed, 0, host, 0),
-            ShapePool::new(ShapeKind::List, 0, host, 0),
+            host_slots,
+            host_pages,
             records,
             Vec::new(),
             Vec::new(),
@@ -493,6 +527,7 @@ impl RsStore {
             pages,
             host_slots,
             host_pages,
+            host_windows: Vec::new(),
             pages_at,
             window,
             window_pools,
@@ -741,7 +776,13 @@ impl RsStore {
         self.window_pools
             .iter()
             .position(|pool| pool.owns(id))
+            .or_else(|| self.host_windows.iter().position(|pool| pool.contains(id)))
             .map(|at| at + 1)
+    }
+
+    /// The host pool of window list `list > 0`'s slot `id`, where it is one.
+    fn host_window(&self, id: RsSlotId) -> Option<&ShapePool<RsSlotId>> {
+        self.host_windows.iter().find(|pool| pool.contains(id))
     }
 
     fn list_pool(&mut self, list: usize) -> &mut ShapePool<RsSlotId> {
@@ -756,6 +797,8 @@ impl RsStore {
     pub fn engine_id(&self, id: RsSlotId) -> u32 {
         if self.host_pages.contains(id) {
             id.0 - self.host_pages.base()
+        } else if let Some(pool) = self.host_window(id) {
+            id.0 - pool.base()
         } else if self.host_slots.contains(id) {
             id.0 - self.host_slots.base()
         } else if let Some(list) = self.list_of(id).filter(|&list| list > 0) {
@@ -782,7 +825,9 @@ impl RsStore {
     }
 
     fn is_page(&self, id: RsSlotId) -> bool {
-        (id.0 >= self.pages_at && id.0 < self.host_slots.base()) || self.host_pages.contains(id)
+        (id.0 >= self.pages_at && id.0 < self.host_slots.base())
+            || self.host_pages.contains(id)
+            || self.host_window(id).is_some()
     }
 
     fn units(&self, ids: impl IntoIterator<Item = RsSlotId>) -> RsUnits {
@@ -811,10 +856,22 @@ impl RsStore {
     }
 
     fn host_pool(&mut self, id: RsSlotId) -> &mut ShapePool<RsSlotId> {
-        if self.is_page(id) {
+        if let Some(at) = self.host_windows.iter().position(|pool| pool.contains(id)) {
+            &mut self.host_windows[at]
+        } else if self.is_page(id) {
             &mut self.host_pages
         } else {
             &mut self.host_slots
+        }
+    }
+
+    /// The host pool a device slot `id` parks in: its window list's, the
+    /// pages' (the rs list, or window list 0), or the records'.
+    fn host_pool_for(&mut self, id: RsSlotId) -> &mut ShapePool<RsSlotId> {
+        match self.list_of(id) {
+            Some(list) if list > 0 => &mut self.host_windows[list - 1],
+            _ if self.is_page(id) => &mut self.host_pages,
+            _ => &mut self.host_slots,
         }
     }
 
@@ -891,7 +948,14 @@ impl RsStore {
 
     /// Host rows for a read or a write that is none of the planner's: state
     /// slots first, then buffer pages. `None` if the host lacks either.
+    ///
+    /// A shared pool's host rows are slot refs of its host tier, which the
+    /// engine's byte reads (`read_host_state`) do not name: none are given
+    /// out for those.
     pub fn take_host(&mut self, slots: usize, pages: usize) -> Option<Vec<RsSlotId>> {
+        if self.is_shared() {
+            return None;
+        }
         let mut rows = self.host_slots.try_alloc_n(slots)?;
         let Some(buffer) = self.host_pages.try_alloc_n(pages) else {
             self.host_slots.release_reserved(rows);
@@ -1166,6 +1230,17 @@ impl RsStore {
             } else {
                 pool.unshare(holder, &ids);
             }
+        }
+    }
+
+    /// The host pool `id` is one of.
+    fn host_pool_of(&self, id: RsSlotId) -> &ShapePool<RsSlotId> {
+        if let Some(pool) = self.host_window(id) {
+            pool
+        } else if self.host_pages.contains(id) {
+            &self.host_pages
+        } else {
+            &self.host_slots
         }
     }
 
@@ -2050,22 +2125,43 @@ impl RsStore {
     /// Host rows: state slots and buffer pages, or a windowed store's list
     /// 0 pages (only a store of one window list parks on the host).
     pub fn host_available(&self) -> RsUnits {
-        self.host_units(
-            self.host_slots.available() as u32,
-            self.host_pages.available() as u32,
-        )
+        self.host_units(|pool| pool.available() as u32)
     }
 
     pub fn host_capacity(&self) -> RsUnits {
-        self.host_units(self.host_slots.capacity(), self.host_pages.capacity())
+        self.host_units(ShapePool::capacity)
     }
 
-    fn host_units(&self, slots: u32, pages: u32) -> RsUnits {
-        let mut units = RsUnits::of(slots, pages);
+    /// `count` of the host pools: the records', and the pages' or, of a
+    /// windowed store, each window list's.
+    fn host_units(&self, count: impl Fn(&ShapePool<RsSlotId>) -> u32) -> RsUnits {
         if self.is_window() {
-            units.windows[0] = pages;
+            let mut windows = [0; MAX_WINDOW_LISTS];
+            for (out, pool) in windows
+                .iter_mut()
+                .zip(std::iter::once(&self.host_pages).chain(&self.host_windows))
+            {
+                *out = count(pool);
+            }
+            return RsUnits::of_windows(windows);
         }
-        units
+        RsUnits::of(count(&self.host_slots), count(&self.host_pages))
+    }
+
+    /// Host rows for each of `ids`, in order, each of its own pool; none
+    /// unless all fit.
+    fn take_host_rows(&mut self, ids: &[RsSlotId]) -> Option<Vec<RsSlotId>> {
+        let mut taken: Vec<RsSlotId> = Vec::with_capacity(ids.len());
+        for &id in ids {
+            match self.host_pool_for(id).try_alloc_n(1) {
+                Some(row) => taken.extend(row),
+                None => {
+                    self.release_host(taken);
+                    return None;
+                }
+            }
+        }
+        Some(taken)
     }
 
     /// Parks the sets' private, settled slots in host rows, when rows for
@@ -2085,15 +2181,7 @@ impl RsStore {
         if slots.is_empty() {
             return None;
         }
-        let (pages, slots): (Vec<RsSlotId>, Vec<RsSlotId>) =
-            slots.into_iter().partition(|&id| self.is_page(id));
-        let host_slots = self.host_slots.try_alloc_n(slots.len())?;
-        let Some(host_pages) = self.host_pages.try_alloc_n(pages.len()) else {
-            self.host_slots.release_reserved(host_slots);
-            return None;
-        };
-        let slots: Vec<RsSlotId> = slots.into_iter().chain(pages).collect();
-        let host: Vec<RsSlotId> = host_slots.into_iter().chain(host_pages).collect();
+        let host = self.take_host_rows(&slots)?;
         self.moving.extend(slots.iter().copied());
         let scope = self.with_sharing(working_sets);
         Some(self.txn(&scope, slots.into_iter().zip(host).collect()))
@@ -2131,6 +2219,22 @@ impl RsStore {
             } else {
                 (from, to)
             };
+            if self.is_shared() {
+                let host_refs = self.host_pool_of(host).slot_refs(host);
+                for ((shape, device), (_, host)) in self
+                    .pool_of(device)
+                    .slot_refs(device)
+                    .into_iter()
+                    .zip(host_refs)
+                {
+                    let pairs: Vec<(u32, u32)> = device.into_iter().zip(host).collect();
+                    match plan.shared.iter_mut().find(|(at, _)| *at == shape) {
+                        Some((_, all)) => all.extend(pairs),
+                        None => plan.shared.push((shape, pairs)),
+                    }
+                }
+                continue;
+            }
             let pair = (self.engine_id(device), self.engine_id(host));
             if self.is_page(device) {
                 plan.pages.push(pair);
@@ -2200,27 +2304,40 @@ impl RsStore {
                 granted: granted.units(),
             });
         }
-        let mut slots = granted.slots.drain(..need.slots as usize);
-        // A windowed store parks list 0 only: its pages come back as it.
-        let pages = match granted.windows.first_mut() {
-            Some(list) if self.window.len() == 1 => list,
-            _ => &mut granted.pages,
+        // Each host row comes back as a slot of its own pool: a window
+        // list's from that list's grant.
+        let windowed = self.is_window();
+        let mut slots: std::vec::IntoIter<RsSlotId> = granted
+            .slots
+            .drain(..need.slots as usize)
+            .collect::<Vec<_>>()
+            .into_iter();
+        let mut pages: std::vec::IntoIter<RsSlotId> = if windowed {
+            Vec::new().into_iter()
+        } else {
+            granted
+                .pages
+                .drain(..need.pages as usize)
+                .collect::<Vec<_>>()
+                .into_iter()
         };
-        let mut pages = pages.drain(..need.pages as usize);
+        let mut lists: Vec<std::vec::IntoIter<RsSlotId>> = granted
+            .windows
+            .iter_mut()
+            .zip(need.windows)
+            .map(|(list, n)| list.drain(..n as usize).collect::<Vec<_>>().into_iter())
+            .collect();
+        let mut moves = Vec::with_capacity(swapped.len());
+        for &host in &swapped {
+            let device = match self.list_of(host) {
+                Some(list) if windowed => lists.get_mut(list).and_then(Iterator::next),
+                _ if self.is_page(host) => pages.next(),
+                _ => slots.next(),
+            };
+            moves.push((host, device.expect("the grant covers what was swapped")));
+        }
         self.moving.extend(swapped.iter().copied());
         let scope = self.with_sharing(working_sets);
-        let moves = swapped
-            .into_iter()
-            .map(|host| {
-                let device = if self.is_page(host) {
-                    pages.next()
-                } else {
-                    slots.next()
-                };
-                (host, device.expect("the grant covers what was swapped"))
-            })
-            .collect();
-        drop((slots, pages));
         Ok(self.txn(&scope, moves))
     }
 

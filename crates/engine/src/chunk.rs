@@ -67,10 +67,16 @@ pub struct ChunkFacts {
     /// Empty where activation lives in a buffer of its own.
     #[serde(default)]
     pub act_chunks: Vec<(u32, u32)>,
-    /// Host chunks state can be parked in, one id space beside the device's.
+    /// Host chunks state can be parked in, one id space beside the device's
+    /// (CONTRACT-BC 22): chunks of `chunk_bytes`, ids from 0, none reserved,
+    /// no table (a host ref names its place), any state shape taking any
+    /// chunk. A slot lies at [`SlotShape::tier_offset`] of the host tier,
+    /// laid out as the same slot on the device, so a slot moves whole.
     #[serde(default)]
     pub host_chunks: u32,
-    /// Slot-file chunks below host memory.
+    /// Slot-file chunks below host memory: chunks of the kv list's slots
+    /// (refs `0..disk_chunks * slots_per_chunk`), each ref a slot of the
+    /// engine's kv slot file. Other shapes do not go to disk.
     #[serde(default)]
     pub disk_chunks: u32,
     /// The slot files are kept across runs.
@@ -269,6 +275,15 @@ impl SlotShape {
     #[must_use]
     pub fn chunk_of(&self, slot: u32) -> u32 {
         slot / self.slots_per_chunk.max(1)
+    }
+
+    /// Where slot ref `slot` lies in a tier of chunks of `chunk_bytes`
+    /// whose chunk ids are its places (the host tier, CONTRACT-BC 22):
+    /// `chunk * chunk_bytes + index * slot_bytes`.
+    #[must_use]
+    pub fn tier_offset(&self, chunk_bytes: u64, slot: u32) -> u64 {
+        let per_chunk = self.slots_per_chunk.max(1);
+        u64::from(slot / per_chunk) * chunk_bytes + u64::from(slot % per_chunk) * self.slot_bytes
     }
 
     /// The slots this shape has on the device: its pinned run's, or every
@@ -830,6 +845,17 @@ pub struct Evacuation {
 
 /// Slots of one shape copied between tiers or within one: whole slots
 /// `(src, dst)`, and for list shapes token runs inside slots.
+///
+/// Tiers (CONTRACT-BC 22): `src`/`dst` each the engine's device domain,
+/// [`MemoryDomain::HostPinned`] (refs of [`ChunkFacts::host_chunks`]) or
+/// [`MemoryDomain::LocalDisk`] (kv list refs of
+/// [`ChunkFacts::disk_chunks`]). Device refs are logical, through the
+/// [`ChunkTable`]; host and disk refs name their place. Token runs are
+/// device to device only. The copy is ordered on the engine's stream after
+/// every fire submitted before it and before every fire after it, and
+/// copies among themselves in submission order, so the runtime may reuse a
+/// source slot, or name a destination slot again, as soon as the call
+/// returns.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SlotCopy {
     pub shape: ShapeId,

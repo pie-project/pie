@@ -405,6 +405,9 @@ impl std::future::Future for ReplyWait {
 pub(crate) enum PreLaunchCopy {
     Kv(::engine::KvCopy),
     State(StateCopy),
+    /// Slots of one shape between the device and a tier below it
+    /// (CONTRACT-BC 22).
+    Slots(::engine::chunk::SlotCopy),
 }
 
 impl PreLaunchCopy {
@@ -412,6 +415,7 @@ impl PreLaunchCopy {
         match self {
             Self::Kv(_) => "KV copy",
             Self::State(_) => "recurrent-state copy",
+            Self::Slots(_) => "slot copy",
         }
     }
 }
