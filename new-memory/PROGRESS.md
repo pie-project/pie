@@ -592,3 +592,13 @@ The `new-memory/` directory is bookkeeping and is removed before anything lands 
   logged). Probes now lay weight slots from chunk 1.
 - Follow-up (design): engine self-seating and the runtime allocator share one pool; warm-up lanes should not use
   runtime-owned chunks at all (e.g. a reserved scratch chunk) — revisit when degenerate mode is deleted.
+
+### M42 — 2026-11-10: BM4 merged (K2 on Metal)
+- Engine tests + e2e (Qwen3, Qwen3.5 incl. MTP, gemma long prompt / window probe) M38 vs M39 equal.
+- Fix 93379cd54: a Metal score capture reads its own list's last-page lengths (window list T_w), not the plan's kv
+  list's (latent since before K2; no catalog model captures over a windowed row). Kernel test 3b1f2fae0.
+- OPEN BUG (pre-K2, Metal): dsv4-flash-mini's window list read BY SLOT REF gives wrong logits from the first fire
+  (compressed side planes, Row::Compressed via pool_gather / pool_state_write); seat-addressed is correct. Test
+  ignored at eddd0d2c7. Shared mode uses slot refs -> must fix before more Metal features (BM5a).
+- OPEN: Metal gemma run-to-run nondeterminism already at M38 (1 of 3 runs differs). Source unknown.
+- Metal MTP on Qwen3.5-0.8B accepts 0/127 drafts in every build (pre-existing).
