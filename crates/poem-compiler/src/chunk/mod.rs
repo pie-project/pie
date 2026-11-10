@@ -40,9 +40,26 @@ pub const MIN_RUN: u64 = 32 << 10;
 /// Every token slot holds a multiple of this many tokens.
 pub const TOKEN_GRAIN: u32 = 16;
 
-/// The fixed records a working set holds: the running one and the copy a
-/// fire writes beside it when another holder still reads the first.
-pub const FIXED_SETS: u32 = 2;
+/// The fixed records a working set holds, resting or running: the one its
+/// fires read.
+pub const FIXED_SETS_PER_WS: u32 = 1;
+
+/// The copy-on-write fixed records a lane that runs in a fire takes beside its
+/// working set's (a fork, or a snapshot restored, within the fire). The pool
+/// keeps one reserve of these for its most lanes, not one a working set.
+pub const COW_SETS_PER_LANE: u32 = 1;
+
+/// The copy-on-write fixed records a pool reserves under `budgets`:
+/// [`COW_SETS_PER_LANE`] for each of the most lanes a fire runs. Derived, not
+/// configured.
+#[must_use]
+pub fn cow_sets(budgets: &Budgets) -> u32 {
+    budgets
+        .tokens
+        .max_lanes
+        .max(1)
+        .saturating_mul(COW_SETS_PER_LANE)
+}
 
 /// The least bytes a fixed slot takes: a record of a few bytes shares a chunk
 /// with a thousand-odd others.
@@ -148,7 +165,7 @@ impl SlotLayout {
             SlotLayout::List { tokens, .. } => u64::from(context.div_ceil(*tokens)),
             SlotLayout::Ring { cap_slots, .. } => u64::from(*cap_slots),
             SlotLayout::Fixed { pieces_per_ws, .. } => {
-                u64::from(FIXED_SETS) * u64::from(*pieces_per_ws)
+                u64::from(FIXED_SETS_PER_WS) * u64::from(*pieces_per_ws)
             }
         }
     }
@@ -172,11 +189,13 @@ impl SlotLayout {
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct Waste {
     /// What the states hold: list tokens at the context, the rings' slots,
-    /// both fixed records.
+    /// the working set's fixed record and its share of the pool's
+    /// copy-on-write records.
     pub state: u64,
     /// The list's last slot past the context, and alignment inside slots.
     pub list_tail: u64,
-    /// Fixed pieces' room past the record, both sets.
+    /// Fixed pieces' room past the record: the working set's, and its share
+    /// of the copy-on-write reserve's.
     pub fixed_pad: u64,
     /// The working set's share of each chunk's room past its last whole slot.
     pub chunk_tail: u64,
@@ -218,15 +237,44 @@ pub struct ChunkRecipe {
     /// Layers of a token slot whose run is under [`MIN_RUN`] because a slot
     /// long enough would not fit a chunk.
     pub short_runs: Vec<RowId>,
+    /// The copy-on-write fixed records the pool reserves once, beside every
+    /// working set's own: [`cow_sets`] of the budgets planned for.
+    pub cow_sets: u32,
     pub waste: Waste,
     pub profile: ChunkProfile,
 }
 
 impl ChunkRecipe {
-    /// The fixed records a working set holds: [`FIXED_SETS`], derived.
+    /// The fixed records a working set holds: [`FIXED_SETS_PER_WS`].
     #[must_use]
-    pub fn fixed_sets(&self) -> u32 {
-        FIXED_SETS
+    pub fn fixed_sets_per_ws(&self) -> u32 {
+        FIXED_SETS_PER_WS
+    }
+
+    /// The copy-on-write fixed records the pool reserves once.
+    #[must_use]
+    pub fn cow_sets(&self) -> u32 {
+        self.cow_sets
+    }
+
+    /// The fixed slots the copy-on-write reserve takes in the pool.
+    #[must_use]
+    pub fn cow_slots(&self) -> u64 {
+        match self.fixed() {
+            Some(SlotLayout::Fixed { pieces_per_ws, .. }) => {
+                u64::from(self.cow_sets) * u64::from(*pieces_per_ws)
+            }
+            _ => 0,
+        }
+    }
+
+    /// The chunks the copy-on-write reserve takes in the pool, counted once.
+    #[must_use]
+    #[allow(clippy::cast_precision_loss)]
+    pub fn cow_chunks(&self) -> f64 {
+        self.fixed().map_or(0.0, |fixed| {
+            self.cow_slots() as f64 / fixed.per_chunk(self.chunk_bytes).max(1) as f64
+        })
     }
 
     #[must_use]
@@ -250,7 +298,8 @@ impl ChunkRecipe {
     }
 
     /// The chunks a working set takes at the profile's context, its share of
-    /// chunks it shares with others counted in part.
+    /// chunks it shares with others counted in part; the copy-on-write
+    /// reserve is the pool's ([`ChunkRecipe::cow_chunks`]), not counted here.
     #[must_use]
     #[allow(clippy::cast_precision_loss)]
     pub fn chunks_per_ws(&self) -> f64 {
@@ -377,6 +426,7 @@ pub fn plan(
     let align = device.align();
     let (lo, hi) = device.range();
     let census = census::census(trace)?;
+    let cow = cow_sets(budgets);
 
     let draft = crate::arena::readouts_per_lane(trace)
         .min(budgets.tokens.readouts_per_lane.max(1))
@@ -516,7 +566,7 @@ pub fn plan(
                 None => continue,
             }
         };
-        let waste = weigh(&token_shapes, pick.as_ref(), record, chunk, &device);
+        let waste = weigh(&token_shapes, pick.as_ref(), record, cow, chunk, &device);
         let better = match &best {
             None => true,
             Some((was, worse, _)) => {
@@ -552,6 +602,7 @@ pub fn plan(
         atoms,
         shards,
         short_runs,
+        cow_sets: cow,
         waste,
         profile: device,
     })
@@ -668,11 +719,13 @@ fn pick_fixed(rows: &[FixedRow], record: u64, chunk: u64, align: u64) -> Option<
 }
 
 /// What a working set takes at the profile's context with chunks of `chunk`
-/// bytes, and what of that holds nothing.
+/// bytes, and what of that holds nothing: its own fixed record, and its share
+/// of the pool's `cow` copy-on-write records over the profile's concurrency.
 fn weigh(
     tokens: &[SlotLayout],
     fixed: Option<&FixedPick>,
     record: u64,
+    cow: u32,
     chunk: u64,
     device: &ChunkProfile,
 ) -> Waste {
@@ -699,11 +752,13 @@ fn weigh(
     }
     if let Some(pick) = fixed {
         shapes += 1;
-        let sets = u64::from(FIXED_SETS);
+        // The pool's fixed records: a set a working set, and the reserve once.
+        let working = u64::from(device.concurrency.max(1));
+        let sets = working * u64::from(FIXED_SETS_PER_WS) + u64::from(cow);
         let held = u64::from(pick.pieces) * pick.slot;
-        waste.state += sets * record;
-        waste.fixed_pad += sets * held.saturating_sub(record);
-        waste.chunk_tail += tail(sets * u64::from(pick.pieces), pick.slot);
+        waste.state += sets * record / working;
+        waste.fixed_pad += sets * held.saturating_sub(record) / working;
+        waste.chunk_tail += tail(sets * u64::from(pick.pieces), pick.slot) / working;
     }
     waste.open_chunks = shapes * chunk / 2 / u64::from(device.concurrency.max(1));
     let (segment, chunks) = device.segment(chunk);

@@ -203,7 +203,10 @@ fn a_few_bytes_of_ids_share_a_chunk_with_a_thousand_others() {
     let fixed = recipe.fixed().unwrap();
     assert_eq!(fixed.bytes(), FIXED_SLOT_FLOOR);
     assert!(fixed.per_chunk(recipe.chunk_bytes) >= 1024);
-    assert_eq!(recipe.fixed_sets(), 2);
+    assert_eq!(recipe.fixed_sets_per_ws(), 1);
+    // The copy-on-write reserve is one record a lane, once for the pool.
+    assert_eq!(recipe.cow_sets(), budgets().tokens.max_lanes);
+    assert_eq!(recipe.cow_slots(), u64::from(budgets().tokens.max_lanes));
 }
 
 #[test]
