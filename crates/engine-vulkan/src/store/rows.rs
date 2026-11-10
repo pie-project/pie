@@ -11,9 +11,12 @@
 //! row through its block's entry ([`kernels_slang::gather::embed::RowTable`]);
 //! a row of a block not resident is staged for that fire from the host,
 //! never cached: where the gather reads the fire's own token ids (the host
-//! wrote them) the rows go into the stage in the frame's order and nothing
-//! waits; else the ids are read back after the frame so far lands. Each
-//! read counts a use of its block, which [`RowCaches::uses`] reports.
+//! wrote them) the host lays the rows of every token of the fire in the
+//! stage of the fire's arm before it is submitted ([`RowCaches::prestage`]),
+//! a ring of stages an arm each, so the fire binds only buffers that stand
+//! across fires and records like any other; else the ids are read back
+//! after the frame so far lands. Each read counts a use of its block, which
+//! [`RowCaches::uses`] reports.
 
 use std::collections::BTreeMap;
 
@@ -203,9 +206,13 @@ struct Cache {
     blocks: Buffer,
     /// A use a row read, a block each (the first table's reads).
     hits: Buffer,
-    /// Each table's rows staged for this fire, and each row's stage row.
+    /// Each table's rows staged for a fire whose ids are read back, and
+    /// each row's stage row.
     stage: Vec<Buffer>,
     staged: Vec<Buffer>,
+    /// The same an arm each, laid by the host before the arm's fire by the
+    /// fire's own token ids ([`RowCaches::prestage`]): `[arm][table]`.
+    ring: Vec<(Vec<Buffer>, Vec<Buffer>)>,
     /// The set is the load's for life.
     held: bool,
     /// The bytes a pool unit of this shape counts: `gcd(chunk, slot)`.
@@ -227,16 +234,20 @@ pub struct RowCaches {
     /// Where a table that counts no use lands its counts.
     spare_hits: Buffer,
     rows: u32,
+    /// Every gather of a streamed table reads the fire's token ids.
+    by_tokens: bool,
 }
 
 impl RowCaches {
-    /// The caches of `shapes`, nothing resident; a fire stages up to `rows`
-    /// rows a table.
+    /// The caches of `shapes` of `trace`, nothing resident; a fire stages up
+    /// to `rows` rows a table, in a stage of each of `arms` fire arms.
     pub fn new(
         device: &Context,
+        trace: &Trace,
         shapes: Vec<RowsShape>,
         rows: u32,
         chunk_bytes: u64,
+        arms: usize,
     ) -> Result<RowCaches> {
         let mut caches = Vec::with_capacity(shapes.len());
         let mut by_param = BTreeMap::new();
@@ -263,17 +274,125 @@ impl RowCaches {
                     .iter()
                     .map(|_| Buffer::host(device, u64::from(rows.max(1)) * 4))
                     .collect::<Result<_>>()?,
+                ring: (0..arms)
+                    .map(|_| {
+                        let stage = shape
+                            .tables
+                            .iter()
+                            .map(|t| Buffer::host(device, u64::from(rows.max(1)) * t.row_bytes))
+                            .collect::<Result<_>>()?;
+                        let staged = shape
+                            .tables
+                            .iter()
+                            .map(|_| Buffer::host(device, u64::from(rows.max(1)) * 4))
+                            .collect::<Result<_>>()?;
+                        Ok((stage, staged))
+                    })
+                    .collect::<Result<_>>()?,
                 held: false,
                 unit: crate::store::layout::gcd(chunk_bytes, shape.slot_bytes),
                 shape,
             });
         }
+        let by_tokens = trace.nodes.iter().all(|node| match &node.op {
+            Operation::Gather(Gather::Embed { table, ids, .. }) => {
+                let streamed = matches!(trace.values.get(table.0 as usize).map(|d| &d.def),
+                    Some(Def::Weight(w)) if by_param.contains_key(&(*w as usize)));
+                !streamed
+                    || matches!(
+                        trace.values.get(ids.0 as usize).map(|d| &d.def),
+                        Some(Def::Input(poem_ir::RuntimeInput::Tokens))
+                    )
+            }
+            _ => true,
+        });
         Ok(RowCaches {
             caches,
             by_param,
             spare_hits: Buffer::host(device, u64::from(widest.max(1)) * 4)?,
             rows,
+            by_tokens,
         })
+    }
+
+    /// Whether every gather of a streamed table reads the fire's own token
+    /// ids, which the host stages a fire's misses by ([`RowCaches::prestage`]).
+    #[must_use]
+    pub fn by_tokens(&self) -> bool {
+        self.by_tokens
+    }
+
+    /// Lays in arm `arm`'s stage the rows of every token of a fire (`tokens`,
+    /// its rows in order) whose block no slot holds, each at its row, and
+    /// each row's stage row (`NOT_HELD` where resident): what that fire's
+    /// gathers of its token ids read for a block not resident. The arm's
+    /// last fire has landed (its inputs are written now too).
+    pub fn prestage(
+        &self,
+        arm: usize,
+        host: &HostTier,
+        planes: &BTreeMap<usize, &HostPlane>,
+        tokens: &[i32],
+    ) -> Result<()> {
+        if tokens.len() > self.rows as usize {
+            return Err(Fault::Ceiling {
+                what: "rows a fire stages of a row table",
+                need: tokens.len() as u64,
+                have: u64::from(self.rows),
+            });
+        }
+        for cache in &self.caches {
+            if !cache.slots.contains(&NOT_HELD) {
+                continue;
+            }
+            let (stage, staged) = cache.ring.get(arm).ok_or(Fault::Ceiling {
+                what: "fire arms a row table stages for",
+                need: arm as u64 + 1,
+                have: cache.ring.len() as u64,
+            })?;
+            let mut rows = vec![NOT_HELD; tokens.len()];
+            let mut last = 0usize;
+            let ids: Vec<u64> = tokens
+                .iter()
+                .map(|&raw| {
+                    if raw >= 0 && u64::from(raw.unsigned_abs()) < cache.shape.rows {
+                        u64::from(raw.unsigned_abs())
+                    } else {
+                        0
+                    }
+                })
+                .collect();
+            for (n, &id) in ids.iter().enumerate() {
+                let block = id / u64::from(cache.shape.block_rows.max(1));
+                if cache.slots[block as usize] == NOT_HELD {
+                    rows[n] = u32::try_from(n).unwrap_or(NOT_HELD);
+                    last = n + 1;
+                }
+            }
+            for (k, table) in cache.shape.tables.iter().enumerate() {
+                let plane = planes.get(&table.param).ok_or_else(|| Fault::Unbound {
+                    what: format!(
+                        "row table param {}, which the host tier does not hold",
+                        table.param
+                    ),
+                })?;
+                let row_bytes = usize::try_from(table.row_bytes).unwrap_or(0);
+                let mut image = vec![0u8; last * row_bytes];
+                for (n, &id) in ids[..last].iter().enumerate() {
+                    if rows[n] != NOT_HELD {
+                        plane.row_into(
+                            host.map(),
+                            id,
+                            &mut image[n * row_bytes..(n + 1) * row_bytes],
+                        )?;
+                    }
+                }
+                stage[k].write_shared(0, &image)?;
+                let bytes: Vec<u8> = rows.iter().flat_map(|r| r.to_le_bytes()).collect();
+                staged[k].write_shared(0, &bytes)?;
+            }
+        }
+        Ok(())
     }
 
     #[must_use]
@@ -313,7 +432,7 @@ impl RowCaches {
     /// each slot newly named from
     /// the host (`host`, the tables' planes by param in `planes`) through
     /// `frame`s of its own, and rewrites the blocks' entries. The caller has
-    /// drained every fire.
+    /// drained every fire. The slots it filled.
     pub fn residency(
         &mut self,
         device: &Context,
@@ -321,7 +440,7 @@ impl RowCaches {
         host: &HostTier,
         planes: &BTreeMap<usize, &HostPlane>,
         residency: &WeightResidency,
-    ) -> Result<()> {
+    ) -> Result<usize> {
         let mut named: Vec<Vec<u32>> = self
             .caches
             .iter()
@@ -370,11 +489,13 @@ impl RowCaches {
             }
         }
         self.fill(device, pools, host, planes, &mut fills)?;
+        let filled = fills.len();
         for (cache, named) in self.caches.iter_mut().zip(named) {
             cache.slots = named;
             cache.held = residency.held;
         }
-        self.restage(pools)
+        self.restage(pools)?;
+        Ok(filled)
     }
 
     /// Fills the slots `fills` names (virtual byte, cache, block) with their
@@ -519,11 +640,12 @@ impl RowCaches {
 
     /// Table `param`'s row table for a fire gathering `ids`, the pool as
     /// `pool` binds it: rows of blocks not resident staged from the host
-    /// (`host`, the table's plane `plane`) for this fire. Where the host
-    /// holds the ids (`known`: the fire's tokens) the rows land in the stage
-    /// in the frame's order (`Frame::update`), behind every fire before it;
-    /// else after the frame recorded so far lands (`ids` may be written by
-    /// it), the ids read back. `None` where `param` is not streamed.
+    /// (`host`, the table's plane `plane`) for this fire. Where the ids are
+    /// the fire's tokens from row `first` (`ring`: `(arm, first)`), the host
+    /// staged them in the arm's stage before the fire
+    /// ([`RowCaches::prestage`]); else after the frame recorded so far lands
+    /// (`ids` may be written by it), the ids are read back and staged. `None`
+    /// where `param` is not streamed.
     #[allow(clippy::too_many_arguments)]
     pub fn table(
         &self,
@@ -532,7 +654,7 @@ impl RowCaches {
         plane: &HostPlane,
         param: usize,
         ids: Tensor,
-        known: Option<&[i32]>,
+        ring: Option<(usize, u32)>,
         read: &std::cell::RefCell<Option<(u32, Vec<i32>)>>,
         pool: kernels_slang::Segments,
     ) -> Result<Option<kernels_slang::gather::embed::RowTable>> {
@@ -550,27 +672,22 @@ impl RowCaches {
             });
         }
         let missing = cache.slots.contains(&NOT_HELD);
-        if missing {
+        if missing && ring.is_none() {
             let mut held = read.borrow_mut();
-            let ids_host: &[i32] = match known {
-                Some(known) if known.len() == rows as usize => known,
-                _ => {
-                    if held.as_ref().is_none_or(|(buf, _)| *buf != ids.buf) {
-                        crate::probe::with_frame(Frame::flush_settled).ok_or_else(|| {
-                            Fault::Residency("no frame is recording on this thread".into())
-                        })??;
-                        let raw = handles.read(ids.buf, u64::from(rows) * 4)?;
-                        let got = raw
-                            .as_chunks::<4>()
-                            .0
-                            .iter()
-                            .map(|w| i32::from_le_bytes(*w))
-                            .collect();
-                        *held = Some((ids.buf, got));
-                    }
-                    &held.as_ref().expect("read above").1
-                }
-            };
+            if held.as_ref().is_none_or(|(buf, _)| *buf != ids.buf) {
+                crate::probe::with_frame(Frame::flush_settled).ok_or_else(|| {
+                    Fault::Residency("no frame is recording on this thread".into())
+                })??;
+                let raw = handles.read(ids.buf, u64::from(rows) * 4)?;
+                let got = raw
+                    .as_chunks::<4>()
+                    .0
+                    .iter()
+                    .map(|w| i32::from_le_bytes(*w))
+                    .collect();
+                *held = Some((ids.buf, got));
+            }
+            let ids_host: &[i32] = &held.as_ref().expect("read above").1;
             let row_bytes = usize::try_from(table.row_bytes).unwrap_or(0);
             let mut stage_rows = vec![NOT_HELD; rows as usize];
             let mut image = vec![0u8; ids_host.len() * row_bytes];
@@ -593,21 +710,21 @@ impl RowCaches {
                 stage_rows[n] = u32::try_from(n).unwrap_or(NOT_HELD);
                 last = n + 1;
             }
-            let (stage, staged) = (&cache.stage[k], &cache.staged[k]);
             let bytes: Vec<u8> = stage_rows.iter().flat_map(|r| r.to_le_bytes()).collect();
-            let image = &image[..last * row_bytes];
-            if known.is_some_and(|known| known.len() == rows as usize) {
-                // In the frame's order: no fire in flight reads it changed.
-                crate::probe::with_frame(|frame| {
-                    frame.update(stage, 0, image)?;
-                    frame.update(staged, 0, &bytes)
-                })
-                .ok_or_else(|| Fault::Residency("no frame is recording on this thread".into()))??;
-            } else {
-                stage.write_shared(0, image)?;
-                staged.write_shared(0, &bytes)?;
-            }
+            cache.stage[k].write_shared(0, &image[..last * row_bytes])?;
+            cache.staged[k].write_shared(0, &bytes)?;
         }
+        let (stage, staged, first) = match ring {
+            Some((arm, first)) => {
+                let (stage, staged) = cache.ring.get(arm).ok_or(Fault::Ceiling {
+                    what: "fire arms a row table stages for",
+                    need: arm as u64 + 1,
+                    have: cache.ring.len() as u64,
+                })?;
+                (&stage[k], &staged[k], first)
+            }
+            None => (&cache.stage[k], &cache.staged[k], 0),
+        };
         let bind = |buffer: &Buffer, len: u64, width: u32, dtype: Dtype| -> Result<Tensor> {
             let handle = handles.bind(buffer, 0, len.max(4))?;
             Ok(Tensor::new(
@@ -625,9 +742,9 @@ impl RowCaches {
                 1,
                 Dtype::U32,
             )?,
-            staged: bind(&cache.staged[k], u64::from(self.rows) * 4, 1, Dtype::U32)?,
+            staged: bind(staged, u64::from(self.rows) * 4, 1, Dtype::U32)?,
             stage: bind(
-                &cache.stage[k],
+                stage,
                 u64::from(self.rows) * table.row_bytes,
                 words,
                 Dtype::U32,
@@ -647,6 +764,7 @@ impl RowCaches {
             unit_words: u32::try_from(cache.unit / 4).unwrap_or(u32::MAX),
             origin: u32::try_from(table.origin / 4).unwrap_or(u32::MAX),
             atom_words: u32::try_from(cache.shape.atom_bytes / 4).unwrap_or(u32::MAX),
+            first,
         }))
     }
 }

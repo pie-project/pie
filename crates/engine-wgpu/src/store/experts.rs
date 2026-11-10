@@ -406,7 +406,8 @@ impl ExpertCaches {
     /// Takes `residency` as the whole set (its atoms of these shapes): fills
     /// each slot newly named from the host (`host`, the planes by param in
     /// `planes`), rewrites the atoms' entries, and gives the stage back once
-    /// every atom is resident. The caller has drained every fire.
+    /// every atom is resident. The caller has drained every fire. The slots
+    /// it filled.
     pub fn residency(
         &mut self,
         device: &Context,
@@ -414,7 +415,7 @@ impl ExpertCaches {
         host: &HostTier,
         planes: &BTreeMap<usize, &HostPlane>,
         residency: &WeightResidency,
-    ) -> Result<()> {
+    ) -> Result<usize> {
         let mut named: Vec<Vec<u32>> = self
             .caches
             .iter()
@@ -464,6 +465,7 @@ impl ExpertCaches {
             }
         }
         self.fill(device, pools, host, planes, &mut fills)?;
+        let filled = fills.len();
         for (cache, named) in self.caches.iter_mut().zip(named) {
             cache.slots = named;
             cache.held = residency.held;
@@ -475,7 +477,8 @@ impl ExpertCaches {
                 cache.stage = Some(Buffer::host(device, cache.stage_bytes().max(4))?);
             }
         }
-        self.restage(pools)
+        self.restage(pools)?;
+        Ok(filled)
     }
 
     /// Atom `atom` of `shape` laid as its slot holds it: each plane's

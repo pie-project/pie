@@ -313,7 +313,7 @@ impl RowCaches {
     /// each slot newly named from
     /// the host (`host`, the tables' planes by param in `planes`) through
     /// `frame`s of its own, and rewrites the blocks' entries. The caller has
-    /// drained every fire.
+    /// drained every fire. The slots it filled.
     pub fn residency(
         &mut self,
         device: &Context,
@@ -321,7 +321,7 @@ impl RowCaches {
         host: &HostTier,
         planes: &BTreeMap<usize, &HostPlane>,
         residency: &WeightResidency,
-    ) -> Result<()> {
+    ) -> Result<usize> {
         let mut named: Vec<Vec<u32>> = self
             .caches
             .iter()
@@ -370,11 +370,13 @@ impl RowCaches {
             }
         }
         self.fill(device, pools, host, planes, &mut fills)?;
+        let filled = fills.len();
         for (cache, named) in self.caches.iter_mut().zip(named) {
             cache.slots = named;
             cache.held = residency.held;
         }
-        self.restage(pools)
+        self.restage(pools)?;
+        Ok(filled)
     }
 
     /// Fills the slots `fills` names (virtual byte, cache, block) with their
@@ -651,6 +653,8 @@ impl RowCaches {
             unit_words: u32::try_from(cache.unit / 4).unwrap_or(u32::MAX),
             origin: u32::try_from(table.origin / 4).unwrap_or(u32::MAX),
             atom_words: u32::try_from(cache.shape.atom_bytes / 4).unwrap_or(u32::MAX),
+            // Staged a gather at a time, from its first row.
+            first: 0,
         }))
     }
 }

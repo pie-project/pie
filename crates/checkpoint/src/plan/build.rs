@@ -921,7 +921,7 @@ impl Builder<'_> {
                 "quant_metadata_outputs on a non-quantized declaration".to_string(),
             ));
         };
-        let layout = ScaleLayout::for_encode(spec.scheme, &decl.shape)
+        let layout = ScaleLayout::for_encode(spec, &decl.shape)
             .map_err(|err| annotate(err, &decl.name))?;
         let scales = self.generated_metadata_decl(decl, &layout, layout.suffix)?;
         let zero_point = match layout.zero_point_suffix {
@@ -1240,7 +1240,8 @@ impl MetaNaming {
 }
 
 impl ScaleLayout {
-    fn for_encode(scheme: QuantScheme, shape: &[i64]) -> Result<Self> {
+    fn for_encode(spec: &crate::types::QuantSpec, shape: &[i64]) -> Result<Self> {
+        let scheme = spec.scheme;
         let Some((_rows, cols)) = crate::types::rectangle(shape) else {
             return Err(Error::Contract(format!(
                 "encoding to {scheme:?} scales a [rows, cols] rectangle, so it \
@@ -1282,9 +1283,12 @@ impl ScaleLayout {
                 })
             }
             QuantScheme::MlxAffineU4 => {
-                if cols % 64 != 0 {
+                // The group the destination states (32, 64 or 128 columns):
+                // the encode scales by it, and the scales are laid by it.
+                let group = spec.normalized_group_size();
+                if group == 0 || cols % i64::from(group) != 0 {
                     return Err(Error::Contract(format!(
-                        "encoding to MLX affine U4 groups 64 columns under one \
+                        "encoding to MLX affine groups {group} columns under one \
                          scale, but the output has {cols}"
                     )));
                 }
@@ -1292,10 +1296,10 @@ impl ScaleLayout {
                     suffix: ".scales",
                     zero_point_suffix: Some(".biases"),
                     naming: MetaNaming::ReplaceWeight,
-                    shape: crate::types::grouped_shape(lead, cols / 64),
+                    shape: crate::types::grouped_shape(lead, cols / i64::from(group)),
                     encoding: Encoding::Raw(DType::Bf16),
                     granularity: QuantGranularity::PerGroup,
-                    group_size: 64,
+                    group_size: group,
                     channel_axis: axis(lead.len()),
                     scale_form: ScaleForm::Bf16AffineFactors,
                 })

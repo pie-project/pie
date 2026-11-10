@@ -25,8 +25,28 @@ fn fnv(name: &str) -> u64 {
     })
 }
 
+/// The packed formats: codes the import makes, with their scales (and zero
+/// points), from the floats a checkpoint stores.
+fn packed(dtype: Dtype) -> bool {
+    matches!(
+        dtype,
+        Dtype::Mxfp4
+            | Dtype::Nvfp4
+            | Dtype::E4m3tensor
+            | Dtype::U4g64
+            | Dtype::U8g64
+            | Dtype::U4g32
+            | Dtype::U4g64tiled
+            | Dtype::U2g32
+            | Dtype::U2g64
+            | Dtype::U2g128
+    )
+}
+
 /// A checkpoint of `trace`'s own planes seeded by name: norms near one, the
-/// rest small.
+/// rest small. A packed plane is stored as the bf16 it is quantized from, at
+/// its unpacked shape (its scales are made by the import, so none is
+/// stored); a plain fp8, block-exponent or byte plane as the bytes served.
 fn write_checkpoint(path: &Path, trace: &Trace) {
     let mut writer = ztensor::Writer::create(path).expect("the fixture writes");
     let mut planes: Vec<_> = trace
@@ -34,9 +54,23 @@ fn write_checkpoint(path: &Path, trace: &Trace) {
         .iter()
         .filter(|param| param.source == ParamSource::Checkpoint)
         .collect();
+    let made: std::collections::BTreeSet<String> = planes
+        .iter()
+        .filter(|param| packed(param.dtype))
+        .flat_map(|param| {
+            [
+                poem::scales_name(&param.name),
+                poem::biases_name(&param.name),
+                poem::global_scales_name(&param.name),
+                poem::input_scales_name(&param.name),
+            ]
+        })
+        .collect();
+    planes.retain(|param| !made.contains(&param.name));
     planes.sort_by(|a, b| a.name.cmp(&b.name));
     for param in planes {
-        let count = param.shape.iter().product::<u64>() as usize;
+        let shape = poem::Weight::of_plane(param).shape;
+        let count = shape.iter().product::<u64>() as usize;
         let norm = param.name.ends_with("norm");
         let mut seed = fnv(&param.name);
         let mut next = || {
@@ -68,13 +102,38 @@ fn write_checkpoint(path: &Path, trace: &Trace) {
             // every table holds.
             Dtype::I64 => (ztensor::Leaf::I(64), vec![0u8; 8 * count]),
             Dtype::I32 => (ztensor::Leaf::I(32), vec![0u8; 4 * count]),
+            // e4m3 codes of a small magnitude, each finite.
+            Dtype::E4m3 => (
+                ztensor::Leaf::E4M3,
+                (0..count)
+                    .map(|_| {
+                        let bits = next();
+                        ((bits & 0x80) | (0x18 + (bits >> 8) % 0x28)) as u8
+                    })
+                    .collect(),
+            ),
+            // Block exponents near one.
+            Dtype::E8m0 => (
+                ztensor::Leaf::E8M0,
+                (0..count).map(|_| (118 + next() % 6) as u8).collect(),
+            ),
+            Dtype::U8 => (
+                ztensor::Leaf::U8,
+                (0..count).map(|_| next() as u8).collect(),
+            ),
+            dtype if packed(dtype) => (
+                ztensor::Leaf::BF16,
+                (0..count)
+                    .flat_map(|_| ((value(next()).to_bits() >> 16) as u16).to_le_bytes())
+                    .collect(),
+            ),
             other => panic!(
                 "`{}` is {other:?}, not a dtype the fixture seeds",
                 param.name
             ),
         };
         writer
-            .add(param.name.as_str(), param.shape.clone(), leaf, &bytes)
+            .add(param.name.as_str(), shape, leaf, &bytes)
             .unwrap_or_else(|why| panic!("`{}`: {why}", param.name));
     }
     writer.finish().expect("the fixture finishes");
@@ -104,8 +163,37 @@ pub fn fixture_in(
         layers,
         ..poem_compiler::catalog::one_rank(Dtype::Bf16, Dtype::Bf16)
     };
+    fixture_deployed(package, model, &deploy, variant)
+}
+
+/// `model` deployed with `weights` (a dtype a component, as a deployment
+/// states them; a packed one quantized by the import).
+pub fn fixture_weighed(model: &str, weights: &[Dtype]) -> Fixture {
+    let package = poem_compiler::catalog::package_of(model).expect("the model is listed");
+    let deploy = poem::star::Deploy {
+        weights: weights.iter().map(|&dtype| dtype.into()).collect(),
+        ..poem_compiler::catalog::one_rank(Dtype::Bf16, Dtype::Bf16)
+    };
+    let variant: String = weights
+        .iter()
+        .map(|dtype| format!("-{dtype:?}").to_lowercase())
+        .collect();
+    fixture_deployed(package, model, &deploy, &variant)
+}
+
+/// [`fixture_in`] under `deploy`. A deployment serving a plane in another
+/// form than the floats it is stored as (packed codes, fp8) loads from a
+/// serving artifact only (a load converts nothing): the seeded floats are
+/// imported into one (`checkpoint::testkit::artifact::import`) for this
+/// platform.
+pub fn fixture_deployed(
+    package: &poem::star::Package,
+    model: &str,
+    deploy: &poem::star::Deploy,
+    variant: &str,
+) -> Fixture {
     let trace = package
-        .trace(model, &deploy, model, Platform::Vulkan)
+        .trace(model, deploy, model, Platform::Vulkan)
         .unwrap_or_else(|why| panic!("`{model}` traces: {why:#}"));
     // `$PIE_VK_FIXTURES` keeps the written checkpoints across runs (they
     // are written from the trace alone, the same bits every time).
@@ -114,12 +202,52 @@ pub fn fixture_in(
         PathBuf::from,
     );
     std::fs::create_dir_all(&dir).expect("the fixture dir");
-    let container = dir.join(format!("{model}{variant}-{}.zt", layers.unwrap_or(0)));
+    let encoded = trace.params.iter().any(|param| {
+        param.source == ParamSource::Checkpoint
+            && !matches!(
+                param.dtype,
+                Dtype::Bf16 | Dtype::F32 | Dtype::I64 | Dtype::I32
+            )
+    });
+    let stem = format!("{model}{variant}-{}", deploy.layers.unwrap_or(0));
+    let container = dir.join(if encoded {
+        format!("{stem}.serving.zt")
+    } else {
+        format!("{stem}.zt")
+    });
     if !container.exists() {
         // Written aside and renamed in: tests running at once may each
         // write it, and none opens a file half written.
-        let aside = container.with_extension(format!("{:?}.part", std::thread::current().id()));
-        write_checkpoint(&aside, &trace);
+        let aside = dir.join(format!("{stem}.{:?}.part", std::thread::current().id()));
+        if encoded {
+            let floats = dir.join(format!("{stem}.floats.zt"));
+            if !floats.exists() {
+                let seeded =
+                    dir.join(format!("{stem}.floats.{:?}.part", std::thread::current().id()));
+                write_checkpoint(&seeded, &trace);
+                std::fs::rename(&seeded, &floats).expect("the floats land");
+            }
+            let source = ztensor::Source::open(&floats).expect("the floats open");
+            let contract = poem::import::own_contract(&source, &trace.params, 1, Platform::Vulkan)
+                .expect("the floats are read by the plan's own names");
+            drop(source);
+            let tiled: Vec<&str> = trace
+                .params
+                .iter()
+                .filter(|param| param.dtype == Dtype::U4g64tiled)
+                .map(|param| param.name.as_str())
+                .collect();
+            checkpoint::testkit::artifact::import(
+                &floats,
+                &contract,
+                &checkpoint::serving::Stamp::of("vulkan", model),
+                &tiled,
+                &aside,
+            )
+            .unwrap_or_else(|why| panic!("`{model}` imports: {why}"));
+        } else {
+            write_checkpoint(&aside, &trace);
+        }
         std::fs::rename(&aside, &container).expect("the fixture lands");
     }
     let source = ztensor::Source::open(&container).expect("the fixture opens");
@@ -165,9 +293,16 @@ pub fn load_with(
         chunk_bytes: chunk,
         ..engine_vulkan::api::DeviceBoot::default()
     };
-    if let Err(why) = engine_vulkan::Context::bind(&device, 0.25) {
-        eprintln!("skipping: no Vulkan device ({why})");
-        return None;
+    // The device is shared: a driver that fails to come up is asked again
+    // before the test is skipped.
+    let mut tries = 0;
+    while let Err(why) = engine_vulkan::Context::bind(&device, 0.25) {
+        tries += 1;
+        if tries == 5 {
+            eprintln!("skipping: no Vulkan device ({why})");
+            return None;
+        }
+        std::thread::sleep(std::time::Duration::from_secs(2));
     }
     Some(
         Shell::load(Boot {

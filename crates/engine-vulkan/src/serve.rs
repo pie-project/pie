@@ -351,6 +351,10 @@ struct LandedSeat {
 }
 
 pub struct Shell {
+    /// Where a load told its weights are held seated each weight shape's
+    /// atoms itself (`WeightShape::seated`: its first slot ref), until the
+    /// runtime's first residency names its own.
+    preseated: Vec<(engine::chunk::ShapeId, u32)>,
     tuning: crate::tuning::Tuning,
     device: Context,
 
@@ -457,6 +461,7 @@ impl Shell {
             ),
             ..boot
         };
+        let weights_held = boot.residency.weights_held;
         let kv_budget = boot.residency.device_kv_budget;
         let host_kv_budget = boot.residency.host_kv_budget;
 
@@ -959,7 +964,14 @@ impl Shell {
         let rs_at = rows.rs.clone();
         let mut pools = Pools::reserve(&device, rows, layout, paging, host_chunks)?;
         let row_caches =
-            crate::store::rows::RowCaches::new(&device, row_shapes, boot.budget.max_tokens, chunk)?;
+            crate::store::rows::RowCaches::new(
+                &device,
+                &boot.trace,
+                row_shapes,
+                boot.budget.max_tokens,
+                chunk,
+                arms,
+            )?;
         let expert_caches =
             crate::store::experts::ExpertCaches::new(&device, expert_shapes, chunk)?;
         // The null chunk's segment stands from the load on.
@@ -972,12 +984,14 @@ impl Shell {
 
         let weights_stream =
             weights.streams() || weights.gathered().is_some() || weights.pump().is_some();
-        // Recorded fires replay no staging: the weight cache records once
-        // every row block and expert of it is resident
-        // ([`Shell::weight_residency`]).
-        let rows_stream = !row_caches.is_empty() || !expert_caches.is_empty();
+        // A recorded fire replays no expert staging: the weight cache records
+        // once every expert is resident ([`Shell::weight_residency`]). A row
+        // table's misses are staged by the host before the fire, so it
+        // records whatever is resident.
+        let rows_stream = !expert_caches.is_empty();
 
-        Ok(Shell {
+        let mut shell = Shell {
+            preseated: Vec::new(),
             tuning,
             device,
             pipelines: Pipelines::new(),
@@ -1046,7 +1060,13 @@ impl Shell {
             } else {
                 crate::record::Recorder::new()
             },
-        })
+        };
+        // A held load seats its weights in the pool itself: they are read
+        // from slots from the first fire on, and the runtime adopts where.
+        if weights_held {
+            shell.preseat_weights()?;
+        }
+        Ok(shell)
     }
 
     /// Opens seat `slot` for a direct fire: its record zeroed, nothing held.
@@ -1171,14 +1191,104 @@ impl Shell {
                 .facts()
                 .into_iter()
                 .chain(self.expert_caches.facts())
+                .map(|shape| engine::chunk::WeightShape {
+                    seated: self
+                        .preseated
+                        .iter()
+                        .find(|(id, _)| *id == shape.id)
+                        .map(|&(_, first)| first),
+                    ..shape
+                })
                 .collect(),
             ..self.pools.chunk_facts()
         }
     }
 
+    /// Seats every atom of every weight shape in slots of the load's own
+    /// choosing, each shape's in chunks of its own past the seats' runs,
+    /// filled from the serving file's mapping (whose pages are then let
+    /// go): a load told its weights are held reads them from the pool from
+    /// the first fire on and keeps no host copy resident. Left to the
+    /// runtime where the pool cannot hold them all.
+    fn preseat_weights(&mut self) -> Result<()> {
+        let shapes: Vec<engine::chunk::WeightShape> = self
+            .row_caches
+            .facts()
+            .into_iter()
+            .chain(self.expert_caches.facts())
+            .collect();
+        if shapes.is_empty() {
+            return Ok(());
+        }
+        let layout = *self.pools.layout();
+        let mut first = 1 + layout.seat_chunks();
+        let mut resident = Vec::new();
+        let mut seated = Vec::with_capacity(shapes.len());
+        for shape in &shapes {
+            let per = shape.slots_per_chunk.max(1);
+            seated.push((shape.id, first * per));
+            resident.extend((0..shape.count).map(|atom| engine::chunk::ResidentWeight {
+                atom: engine::chunk::WeightAtom {
+                    shape: shape.id,
+                    atom,
+                },
+                slot: first * per + atom,
+            }));
+            first += shape.count.div_ceil(per);
+        }
+        if first > layout.total_chunks {
+            tracing::warn!(
+                chunks = first,
+                total = layout.total_chunks,
+                "a held load's weights do not fit its pool: the runtime places them"
+            );
+            return Ok(());
+        }
+        let segment = layout.segment_chunks.max(1);
+        self.commit_segments(first.div_ceil(segment))?;
+        self.apply_residency(&engine::chunk::WeightResidency {
+            staging: Vec::new(),
+            resident,
+            held: false,
+        })?;
+        self.preseated = seated;
+        Ok(())
+    }
+
     /// See `Engine::weight_residency`: every slot newly named filled from
-    /// the host before the next fire, every block's entry rewritten.
+    /// the host before the next fire, every block's entry rewritten. The
+    /// first after a load that seated its weights says how many atoms it
+    /// names elsewhere (each filled again there).
     pub fn weight_residency(&mut self, residency: &engine::chunk::WeightResidency) -> Result<()> {
+        if !self.preseated.is_empty() {
+            let facts = self.pool_chunk_facts();
+            let moved = residency
+                .resident
+                .iter()
+                .filter(|r| {
+                    facts
+                        .weights
+                        .iter()
+                        .find(|shape| shape.id == r.atom.shape)
+                        .and_then(|shape| shape.seated)
+                        .is_none_or(|first| first + r.atom.atom != r.slot)
+                })
+                .count();
+            if moved > 0 {
+                tracing::warn!(
+                    moved,
+                    named = residency.resident.len(),
+                    "the first weight residency names atoms other slots than the load seated \
+                     them in (`WeightShape::seated`); each is filled again from the serving file"
+                );
+            }
+            self.preseated.clear();
+        }
+        self.apply_residency(residency)
+    }
+
+    /// Takes `residency` as the whole set.
+    fn apply_residency(&mut self, residency: &engine::chunk::WeightResidency) -> Result<()> {
         self.drain()?;
         if self.row_caches.is_empty() && self.expert_caches.is_empty() {
             return Ok(());
@@ -1208,17 +1318,30 @@ impl Shell {
         let planes = self
             .weights
             .cached_planes(|at| self.row_caches.streams(at) || self.expert_caches.streams(at));
-        self.row_caches
-            .residency(&self.device, &self.pools, host, &planes, residency)?;
-        self.expert_caches
-            .residency(&self.device, &self.pools, host, &planes, residency)?;
-        self.recorder = if self.own_stream {
-            crate::record::Recorder::refusing("the weights plane streams")
-        } else if self.row_caches.whole() && self.expert_caches.whole() {
-            crate::record::Recorder::new()
-        } else {
-            crate::record::Recorder::refusing("the weight cache is not wholly resident")
-        };
+        let filled = self
+            .row_caches
+            .residency(&self.device, &self.pools, host, &planes, residency)?
+            + self
+                .expert_caches
+                .residency(&self.device, &self.pools, host, &planes, residency)?;
+        // The fills have landed: the pages they read are let go.
+        if filled > 0 {
+            host.map().release();
+        }
+        // Recordings stand while the cache stays wholly resident: a slot
+        // moved is an entry rewritten in a table they bind, not a binding.
+        // A row table's misses are staged by the host before a fire of its
+        // token ids, in the arm's stage: such a fire records too.
+        let records = !self.own_stream && self.expert_caches.whole();
+        if records != self.recorder.records() {
+            self.recorder = if self.own_stream {
+                crate::record::Recorder::refusing("the weights plane streams")
+            } else if records {
+                crate::record::Recorder::new()
+            } else {
+                crate::record::Recorder::refusing("the weight cache is not wholly resident")
+            };
+        }
         Ok(())
     }
 
@@ -1230,6 +1353,13 @@ impl Shell {
         uses.extend(more);
         held.extend(also);
         Ok(engine::chunk::WeightUses { uses, held })
+    }
+
+    /// The fires recorded and the fires replayed by the current recorder
+    /// (a weight residency that stops or starts recording begins another).
+    #[must_use]
+    pub fn recordings(&self) -> (u64, u64) {
+        self.recorder.counts()
     }
 
     #[must_use]
@@ -3055,8 +3185,24 @@ impl Shell {
             None
         };
         let patch_seats = bound.patches;
+        // The rows a gather of the fire's token ids reads of a block no slot
+        // holds are laid in the arm's stage now: the fire binds buffers that
+        // stand across fires, and records.
+        let row_ring = (feeds.is_empty()
+            && !self.row_caches.is_empty()
+            && self.row_caches.by_tokens()
+            && !windows.gathers())
+        .then_some(arm);
+        if row_ring.is_some() && !self.row_caches.whole() {
+            let host = self.weights.host().ok_or_else(|| Fault::Unbound {
+                what: "the host copy of the weight cache's tables".to_string(),
+            })?;
+            let planes = self.weights.cached_planes(|at| self.row_caches.streams(at));
+            self.row_caches.prestage(arm, host, &planes, &tokens)?;
+        }
         let bindings = FireBindings {
             rs_snaps,
+            row_ring,
             tokens_host: feeds
                 .is_empty()
                 .then(|| std::sync::Arc::from(tokens.as_slice())),
@@ -3528,7 +3674,8 @@ impl engine::frame::Shell for Shell {
         // A fire landing snapshots binds a table of its own: not recorded.
         let key = (self.recorder.records()
             && prepared.bindings.group_masks.is_empty()
-            && prepared.bindings.rs_snaps.is_none())
+            && prepared.bindings.rs_snaps.is_none()
+            && (prepared.bindings.row_ring.is_some() || self.row_caches.whole()))
         .then(|| self.record_key(&prepared));
 
         let replayable = key
