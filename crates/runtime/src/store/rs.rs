@@ -169,6 +169,7 @@ pub struct RsCopyPlan {
 }
 
 /// What a set holds, in its own numbering: see [`RsEntry`].
+#[cfg_attr(target_arch = "wasm32", allow(dead_code))]
 #[derive(Debug, Clone)]
 pub struct RsExport {
     pub folded: Option<RsSlotId>,
@@ -561,6 +562,7 @@ impl RsStore {
     }
 
     /// What a snapshot keeps of `ws`, on the rows it stands on now.
+    #[cfg_attr(target_arch = "wasm32", allow(dead_code))]
     pub fn export(&self, ws: RsWorkingSetId) -> Result<RsExport, RsError> {
         let entry = self.entry(ws)?;
         Ok(RsExport {
@@ -573,12 +575,14 @@ impl RsStore {
     }
 
     /// Whether `id` is a host row already.
+    #[cfg_attr(target_arch = "wasm32", allow(dead_code))]
     pub fn on_host(&self, id: RsSlotId) -> bool {
         self.is_host(id)
     }
 
     /// Host rows for a read or a write that is none of the planner's: state
     /// slots first, then buffer pages. `None` if the host lacks either.
+    #[cfg_attr(target_arch = "wasm32", allow(dead_code))]
     pub fn take_host(&mut self, slots: usize, pages: usize) -> Option<Vec<RsSlotId>> {
         let mut rows = self.host_slots.try_alloc_n(slots)?;
         let Some(buffer) = self.host_pages.try_alloc_n(pages) else {
@@ -589,11 +593,13 @@ impl RsStore {
         Some(rows)
     }
 
+    #[cfg_attr(target_arch = "wasm32", allow(dead_code))]
     pub fn give_host(&mut self, rows: Vec<RsSlotId>) {
         self.release_host(rows);
     }
 
     /// A set of its own on host rows, as `export` said one stood.
+    #[cfg_attr(target_arch = "wasm32", allow(dead_code))]
     pub fn import(&mut self, geom: RsGeometry, set: RsExport) -> RsWorkingSetId {
         self.working_sets.insert(RsEntry {
             geom,

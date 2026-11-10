@@ -310,9 +310,12 @@ pub(crate) enum HostKvOp {
     /// one item on the lane, with no completion to settle between.
     CopyRead(::engine::KvCopy, Vec<u32>),
     /// The bytes of host kv slots.
+    #[cfg_attr(target_arch = "wasm32", allow(dead_code))]
     Read(Vec<u32>),
     /// The bytes of host rs rows: state slots, then buffer pages.
+    #[cfg_attr(target_arch = "wasm32", allow(dead_code))]
     ReadState(Vec<u32>, Vec<u32>),
+    #[cfg_attr(target_arch = "wasm32", allow(dead_code))]
     WriteState(Vec<u32>, Vec<u32>, Vec<u8>),
     /// The engine's tap groups (`Engine::tap_groups`), as JSON.
     TapGroups,
