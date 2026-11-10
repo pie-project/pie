@@ -1,0 +1,20 @@
+api = 1
+
+[target]
+assumes = { generation = 5, hbm_gib = 16 }
+
+# as on v6e: on the powers-of-two ladder a 512-token prompt (and its template) ran a 1024-row fire;
+# 128-row rungs from 512 run it at 640
+[engine]
+pad.row_steps = 4
+
+# a blocked attention's row blocks as a loop: in line, DeepSeek-V4's 1792-row prompt programs ran a v5e
+# host's 47 GiB out compiling them
+# a routed MLP picks each token's rows out past 8 Mi rows x tokens: a v5e's MXU makes the one-hot dot
+# cost what the pick does at 640-row fires and more past them
+[kernel]
+attn.unrolled_blocks = 1
+moe.cost.onehot_mi = 8
+
+[provenance]
+measured = ["engine.pad.row_steps", "kernel.attn.unrolled_blocks", "kernel.moe.cost.onehot_mi"]

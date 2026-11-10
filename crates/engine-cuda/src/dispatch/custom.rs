@@ -617,12 +617,13 @@ impl Run<'_> {
                     *kv_lora_rank,
                 )?;
                 let qo_indptr = self.ragged(*q).indptr;
-                let pool = self.pool(*cache);
+                let (pool, first) = self.pool_own(*cache);
                 if mla::expand::prefill_expanded(
                     self.ctx(),
                     queries,
                     qo_indptr,
                     &pool,
+                    first,
                     kv_b,
                     h,
                     *sm_scale,

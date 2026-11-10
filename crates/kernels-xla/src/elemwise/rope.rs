@@ -14,6 +14,7 @@ use crate::check::expect;
 use crate::error::{Error, refuse};
 use crate::hlo::Func;
 use crate::hlo::{Cmp, Elem, GatherDims, Val};
+use crate::lanes::ci;
 use crate::tensor::{Operand, Stored};
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -75,6 +76,23 @@ impl Turn {
 pub(crate) fn take_cols(f: &mut Func, x: Val, idx: &[i64]) -> Result<Val, Error> {
     let dims = f.dims(x).to_vec();
     let last = dims.len() - 1;
+    // Adjacent pairs swapped (an interleaved rotation's partners): the two
+    // halves of each pair crossed, not a gather along the lanes.
+    let n = idx.len();
+    if n >= 2
+        && n.is_multiple_of(2)
+        && i64::try_from(n).ok() == dims.last().copied()
+        && idx.iter().enumerate().all(|(i, &p)| p == (i ^ 1) as i64)
+    {
+        let mut pairs = dims.clone();
+        pairs[last] = n as i64 / 2;
+        pairs.push(2);
+        let x2 = f.reshape(x, &pairs)?;
+        let lo = f.slice_axis(x2, last + 1, 0, 1)?;
+        let hi = f.slice_axis(x2, last + 1, 1, 2)?;
+        let swapped = f.concat(&[hi, lo], (last + 1) as i64)?;
+        return Ok(f.reshape(swapped, &dims)?);
+    }
     let mut runs: Vec<(i64, i64)> = Vec::new();
     for &i in idx {
         match runs.last_mut() {
@@ -107,6 +125,27 @@ pub(crate) fn take_cols(f: &mut Func, x: Val, idx: &[i64]) -> Result<Val, Error>
     )?)
 }
 
+/// The run `[a, b)` of a head's columns `t` turns, as a table of its own,
+/// when that run is not the whole head and pairs only within itself.
+fn span(t: &Turn) -> Option<(usize, usize, Turn)> {
+    let moved = |i: usize| t.sign[i] != 0.0;
+    let a = (0..t.unit).find(|&i| moved(i))?;
+    let b = (0..t.unit).rfind(|&i| moved(i))? + 1;
+    let inside = t.partner[a..b]
+        .iter()
+        .all(|&p| (a as i64..b as i64).contains(&p));
+    ((a > 0 || b < t.unit) && inside).then(|| {
+        let sub = Turn {
+            unit: b - a,
+            partner: t.partner[a..b].iter().map(|&p| p - a as i64).collect(),
+            sign: t.sign[a..b].to_vec(),
+            freq: t.freq.iter().map(|fq| fq[a..b].to_vec()).collect(),
+            mscale: t.mscale,
+        };
+        (a, b, sub)
+    })
+}
+
 /// Applies `t` to an f32 `[rows, width]`, `pos` an f32 `[rows, axes]`.
 pub(crate) fn turn(f: &mut Func, x: Val, pos: Val, t: &Turn) -> Result<Val, Error> {
     let dims = f.dims(x).to_vec();
@@ -114,6 +153,40 @@ pub(crate) fn turn(f: &mut Func, x: Val, pos: Val, t: &Turn) -> Result<Val, Erro
     let unit = t.unit as i64;
     let groups = width / unit;
     let x3 = f.reshape(x, &[rows, groups, unit])?;
+    // Only the columns the table turns go through it (a 64-wide rope tail
+    // of a 512-wide head: a lane gather and the sines over every column
+    // otherwise, 24.6 of a 171 ms DeepSeek-V4 prompt fire on a v5e).
+    if let Some((a, b, sub)) = span(t) {
+        let mid = f.slice_axis(x3, 2, a as i64, b as i64)?;
+        let mid = f.reshape(mid, &[rows, groups * (b - a) as i64])?;
+        let mid = turn(f, mid, pos, &sub)?;
+        let mid = f.reshape(mid, &[rows, groups, (b - a) as i64])?;
+        let mut parts = Vec::with_capacity(3);
+        if a > 0 {
+            parts.push(f.slice_axis(x3, 2, 0, a as i64)?);
+        }
+        parts.push(mid);
+        if b < t.unit {
+            parts.push(f.slice_axis(x3, 2, b as i64, unit)?);
+        }
+        let out = f.concat(&parts, 2)?;
+        return Ok(f.reshape(out, &[rows, width])?);
+    }
+    // A prompt's heads narrower than a lane tile turn as the row lies where
+    // the chip's profile says so (`RopeFlatRows`): `[rows, heads, unit]`
+    // relays every head out to a lane tile and back (v6e gpt-oss 4096-row
+    // prefill: 10.8 of a 127 ms fire; 123.4 ms against 125.5). A decode's few
+    // rows keep the narrow tables (256 lanes: 32.5 ms a step turned flat,
+    // 31.8 not), and a v5e every row (1792 rows: 67.6 flat against 65.5).
+    let flat = f.rope_flat_rows();
+    if unit < 128
+        && width % 128 == 0
+        && flat > 0
+        && rows >= flat
+        && let Some(v) = turn_flat(f, x, pos, t)?
+    {
+        return Ok(v);
+    }
     let mut ang: Option<Val> = None;
     for (axis, freq) in t.freq.iter().enumerate() {
         if freq.iter().all(|&f| f == 0.0) {
@@ -169,6 +242,109 @@ pub(crate) fn turn(f: &mut Func, x: Val, pos: Val, t: &Turn) -> Result<Val, Erro
         turned
     };
     Ok(f.reshape(out, &[rows, width])?)
+}
+
+/// [`turn`] over the row as it lies, every table tiled across its heads: a
+/// head narrower than a lane tile never lays out `[rows, heads, unit]`.
+/// `None` where a partner sits more than two offsets away.
+fn turn_flat(f: &mut Func, x: Val, pos: Val, t: &Turn) -> Result<Option<Val>, Error> {
+    let dims = f.dims(x).to_vec();
+    let (rows, width) = (dims[0], dims[1]);
+    let unit = t.unit;
+    let w = usize::try_from(width).unwrap_or(0);
+    let col = |c: usize| c % unit;
+    let mut shifts: Vec<i64> = Vec::new();
+    for c in 0..unit {
+        let d = t.partner[c] - c as i64;
+        if t.sign[c] != 0.0 && !shifts.contains(&d) {
+            shifts.push(d);
+        }
+    }
+    if shifts.len() > 2 {
+        return Ok(None);
+    }
+    let mut ang: Option<Val> = None;
+    for (axis, freq) in t.freq.iter().enumerate() {
+        if freq.iter().all(|&f| f == 0.0) {
+            continue;
+        }
+        let p = f.slice_axis(pos, 1, axis as i64, axis as i64 + 1)?;
+        let p = f.reshape(p, &[rows])?;
+        let p = f.broadcast(p, &[rows, width], &[0])?;
+        let fs: Vec<f64> = (0..w).map(|c| f64::from(freq[col(c)])).collect();
+        let fq = f.const_floats(Elem::F32, &fs, &[width])?;
+        let fq = f.broadcast(fq, &[rows, width], &[1])?;
+        let a = f.mul(p, fq)?;
+        ang = Some(match ang {
+            Some(prev) => f.add(prev, a)?,
+            None => a,
+        });
+    }
+    let Some(ang) = ang else {
+        return Ok(Some(x));
+    };
+    let mut c = f.cos(ang);
+    let mut s = f.sin(ang);
+    if t.mscale != 1.0 {
+        let m: Vec<f64> = (0..w)
+            .map(|i| {
+                if t.sign[col(i)] == 0.0 {
+                    1.0
+                } else {
+                    f64::from(t.mscale)
+                }
+            })
+            .collect();
+        let m = f.const_floats(Elem::F32, &m, &[width])?;
+        let m = f.broadcast(m, &[rows, width], &[1])?;
+        c = f.mul(c, m)?;
+        s = f.mul(s, m)?;
+    }
+    let sign: Vec<f64> = (0..w).map(|i| f64::from(t.sign[col(i)])).collect();
+    let sign = f.const_floats(Elem::F32, &sign, &[width])?;
+    let sign = f.broadcast(sign, &[rows, width], &[1])?;
+    let s = f.mul(s, sign)?;
+    // Each partner `d` lanes on: the row rolled by `d`, picked where it is.
+    let mut xp: Option<Val> = None;
+    for &d in &shifts {
+        let k = d.rem_euclid(width);
+        let rolled = if k == 0 {
+            x
+        } else {
+            let hi = f.slice_axis(x, 1, k, width)?;
+            let lo = f.slice_axis(x, 1, 0, k)?;
+            f.concat(&[hi, lo], 1)?
+        };
+        xp = Some(match xp {
+            None => rolled,
+            Some(prev) => {
+                let here: Vec<i64> = (0..w)
+                    .map(|i| i64::from(t.partner[col(i)] - col(i) as i64 == d))
+                    .collect();
+                let here = f.const_ints(Elem::I32, &here, &[width])?;
+                let zero = f.const_i(Elem::I32, 0, &[width]);
+                let here = f.compare(Cmp::Ne, here, zero)?;
+                let here = f.broadcast(here, &[rows, width], &[1])?;
+                f.select(here, rolled, prev)?
+            }
+        });
+    }
+    let Some(xp) = xp else {
+        return Ok(Some(x));
+    };
+    let a = f.mul(x, c)?;
+    let b = f.mul(xp, s)?;
+    let turned = f.add(a, b)?;
+    Ok(Some(if t.sign.contains(&0.0) {
+        let moved: Vec<i64> = (0..w).map(|i| i64::from(t.sign[col(i)] != 0.0)).collect();
+        let moved = f.const_ints(Elem::I32, &moved, &[width])?;
+        let zero = f.const_i(Elem::I32, 0, &[width]);
+        let moved = f.compare(Cmp::Ne, moved, zero)?;
+        let moved = f.broadcast(moved, &[rows, width], &[1])?;
+        f.select(moved, turned, x)?
+    } else {
+        turned
+    }))
 }
 
 /// The position stream as f32 `[rows, axes]`: the first `rows · axes` entries
@@ -269,6 +445,43 @@ pub(crate) fn rotate_all(
     for x in xs {
         if x.width == 0 {
             out.push(None);
+            continue;
+        }
+        // A run of each head's columns turns: only that run widens to f32,
+        // and it is written back over the stored row in place, not the
+        // whole row widened and joined again (DeepSeek-V4's 64-wide tail of
+        // 64 512-wide heads, a 1792-row prompt on a v6e: 5.9 of a 68 ms fire).
+        if let Some((a, b, sub)) = span(t) {
+            let (r, w) = (f.dims(x.val)[0], f.dims(x.val)[1]);
+            let (g, run) = (w / t.unit as i64, (b - a) as i64);
+            let elem = f.elem(x.val);
+            let x3 = f.reshape(x.val, &[r, g, t.unit as i64])?;
+            let mid = f.slice_axis(x3, 2, a as i64, b as i64)?;
+            let mid = f.reshape(mid, &[r, g * run])?;
+            let mid = f.convert(mid, Elem::F32);
+            let mid = turn(f, mid, pos, &sub)?;
+            let mid = f.convert(mid, elem);
+            let mid = f.reshape(mid, &[r, g, run])?;
+            // Written back over whole 128-lane tiles of the head (the run's
+            // untouched neighbours with it), so the update lands in place.
+            let (lo, hi) = if t.unit.is_multiple_of(128) {
+                (a / 128 * 128, b.div_ceil(128) * 128)
+            } else {
+                (a, b)
+            };
+            let mut parts = Vec::with_capacity(3);
+            if lo < a {
+                parts.push(f.slice_axis(x3, 2, lo as i64, a as i64)?);
+            }
+            parts.push(mid);
+            if b < hi {
+                parts.push(f.slice_axis(x3, 2, b as i64, hi as i64)?);
+            }
+            let mid = f.concat(&parts, 2)?;
+            let zero = ci(f, 0);
+            let at = ci(f, lo as i64);
+            let x3 = f.dynamic_update_slice(x3, mid, &[zero, zero, at])?;
+            out.push(Some(f.reshape(x3, &[r, w])?));
             continue;
         }
         let v = x.f32(f);

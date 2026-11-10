@@ -25,6 +25,42 @@ impl Run<'_> {
     }
 
     fn attention(&mut self, op: &Attn) -> Result<(), kernels_xla::Error> {
+        // A latent attention through a selection of every key its rows see
+        // reads their causal range: the unselected walk (blocked for a
+        // prompt), not a gather of each row's list.
+        if let Attn::MlaDecode {
+            selection: Some(s), ..
+        }
+        | Attn::MlaPrefill {
+            selection: Some(s), ..
+        } = op
+            && self.full_selections.contains(&(*s, 1))
+        {
+            let mut op = op.clone();
+            if let Attn::MlaDecode { selection, .. } | Attn::MlaPrefill { selection, .. } = &mut op
+            {
+                *selection = None;
+            }
+            return self.attention(&op);
+        }
+        // So does a pooled reading through a selection of every closed entry.
+        if let Attn::PoolLse {
+            selection: Some(s),
+            ratio,
+            ..
+        } = op
+            && self.full_selections.contains(&(*s, *ratio))
+        {
+            let mut op = op.clone();
+            if let Attn::PoolLse {
+                selection, top_k, ..
+            } = &mut op
+            {
+                *selection = None;
+                *top_k = None;
+            }
+            return self.attention(&op);
+        }
         match op {
             Attn::ScoreCapture {
                 q,
@@ -1071,6 +1107,14 @@ impl Run<'_> {
                 score: score @ (IndexScore::Pooled | IndexScore::PooledTokens),
                 selection,
             } => {
+                let pool = self.pool(*keys);
+                if *score == IndexScore::Pooled
+                    && i64::from(pool.max_pages) * i64::from(pool.page_size)
+                        / i64::from((*ratio).max(1))
+                        <= i64::from(*top_k)
+                {
+                    self.full_selections.push((*selection, (*ratio).max(1)));
+                }
                 let fire = self.bindings();
                 let (positions, request_of_token) = (fire.cache_rows, fire.tables.request_of_token);
                 crate::lower::attn::index::topk(
@@ -1193,6 +1237,9 @@ impl Run<'_> {
                 ratio,
                 entries,
             } => {
+                // The pool append that files these entries bounds its rows
+                // by the ratio they closed at.
+                self.boundaries.push((*boundary_pos, *ratio));
                 let Some([state_kv, state_score]) = self.pool_state(*pages) else {
                     return Err(kernels_xla::Error::Unsupported {
                         op: "attn.pool_gather",
@@ -1252,6 +1299,10 @@ impl Run<'_> {
                 self.tensor(*boundary_pos),
                 self.tensor(*boundary_req),
                 self.pool(*into),
+                self.boundaries
+                    .iter()
+                    .find(|(v, _)| v == boundary_pos)
+                    .map(|&(_, r)| r),
             ),
             Attn::PoolLse {
                 q,

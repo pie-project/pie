@@ -17,6 +17,7 @@
 //! chunk count, two matmuls a step), and the outputs are formed batched
 //! after it.
 
+mod chunk;
 pub mod dyn_conv;
 
 use dtype::Dtype;
@@ -34,6 +35,24 @@ use crate::tensor::{Landing, Operand, RaggedTensor, Stored};
 /// The GDN's q/k l2-norm epsilon, as the GPU kernels state it.
 const GDN_EPS: f64 = 1e-6;
 
+/// Whether a ragged GDN fire's chunks run as the fused Mosaic kernel
+/// (`chunk`): 2 leaves it to `PIE_GDN_CHUNK_KERNEL` (on unless `0`).
+static FUSED_CHUNKS: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(2);
+
+/// Turns the fused chunk kernel on or off for this process (`None`: as the
+/// environment says), for tests that run both forms.
+pub fn fused_chunks(on: Option<bool>) {
+    let v = on.map_or(2, u8::from);
+    FUSED_CHUNKS.store(v, std::sync::atomic::Ordering::Relaxed);
+}
+
+fn fused_chunks_on() -> bool {
+    match FUSED_CHUNKS.load(std::sync::atomic::Ordering::Relaxed) {
+        2 => !std::env::var("PIE_GDN_CHUNK_KERNEL").is_ok_and(|v| v == "0"),
+        v => v == 1,
+    }
+}
+
 // --------------------------------------------------------------------- conv
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -44,8 +63,9 @@ enum ConvOut {
     Residual,
 }
 
-/// The depthwise causal conv over lanes. `x` `[T, C]` f32, `w` `[C, W]` f32,
-/// `past` `[L, hist * C]` f32 (each lane's kept rows, oldest first). Returns
+/// The depthwise causal conv over lanes. `x` `[T, C]` and `past`
+/// `[L, hist * C]` (each lane's kept rows, oldest first) in one element, bf16
+/// or f32 (the taps move in it and are weighed in f32), `w` `[C, W]` f32. Returns
 /// `y` `[T, C]` and each lane's next kept rows `[L, hist * C]`: the last
 /// `hist` of `past ++ x[begin .. begin + keep]`.
 fn conv_lanes(
@@ -66,17 +86,18 @@ fn conv_lanes(
     // Every row a lane's next window can hold: its kept rows, then x.
     let table = f.concat(&[p, x], 0)?;
     let base = l * hist;
+    let e = f.elem(x);
 
     // Tap k reads x shifted down by its offset; the first rows of each lane
     // (which would read the previous lane) are patched from its kept rows.
-    let zero = f.const_f(Elem::F32, 0.0, &[]);
+    let zero = f.const_f(e, 0.0, &[]);
     let mut acc: Option<Val> = None;
     for k in 0..taps {
         let off = (taps - 1 - k) * dil;
         let shifted = if off == 0 {
             x
         } else if off >= t {
-            f.const_f(Elem::F32, 0.0, &[t, c])
+            f.const_f(e, 0.0, &[t, c])
         } else {
             let xs = f.pad(x, zero, &[off, 0], &[0, 0], &[0, 0])?;
             f.slice_axis(xs, 0, 0, t)?
@@ -110,6 +131,7 @@ fn conv_lanes(
             let patched = f.put_rows(padded, row, kept, crate::hlo::Combine::Set)?;
             f.slice_axis(patched, 0, 0, t)?
         };
+        let tap = f.convert(tap, Elem::F32);
         let wk = f.slice_axis(w, 1, k, k + 1)?;
         let wk = f.reshape(wk, &[c])?;
         let wk = f.broadcast(wk, &[t, c], &[1])?;
@@ -129,7 +151,10 @@ fn conv_lanes(
     };
     let y = match out {
         ConvOut::Silu => f.silu(acc)?,
-        ConvOut::Residual => f.add(acc, x)?,
+        ConvOut::Residual => {
+            let x = f.convert(x, Elem::F32);
+            f.add(acc, x)?
+        }
     };
 
     // The kept rows after `keep` tokens.
@@ -181,6 +206,8 @@ fn conv_step(
         } else {
             x_bf16
         };
+        // An f32 bank (the tests') keeps the row as f32.
+        let x_part = f.convert(x_part, f.elem(past));
         f.concat(&[kept, x_part], 1)?
     } else if blocked {
         let width = f.dims(past)[2];
@@ -291,8 +318,16 @@ fn conv(
             bias,
         )?
     } else {
-        let past = f.convert(past, Elem::F32);
-        conv_lanes(f, xv, w, past, &lanes, i64::from(dil), out, bias)?
+        // A bf16 slab's taps move in bf16 (they are x's own rows): f32
+        // only where they are weighed.
+        let e = if f.elem(past) == Elem::Bf16 {
+            Elem::Bf16
+        } else {
+            Elem::F32
+        };
+        let past = f.convert(past, e);
+        let xs = f.convert(x.val, e);
+        conv_lanes(f, xs, w, past, &lanes, i64::from(dil), out, bias)?
     };
     let slab = land_slots(f, slab, lanes.slot, lanes.write, next, per)?;
     Ok((yv, slab))
@@ -1325,12 +1360,21 @@ impl DeltaIn {
     }
 
     fn chunk(&self, rows: i64, lanes: i64, c: crate::tuning::SsmChunks) -> i64 {
-        match self {
-            Self::Gdn { .. } | Self::Mamba2 { .. } if rows >= c.long_chunk * lanes.max(1) => {
-                c.long_chunk
-            }
-            Self::Gdn { .. } | Self::Mamba2 { .. } => c.chunk,
-            Self::Kda { .. } => c.kda_chunk,
+        let (short, long) = match *self {
+            // A chunk's `[C, C]` planes (and their inverse) come once per
+            // value head: with many heads they cost more than the carry's
+            // extra steps short chunks take (v6e: a 1792-row fire of
+            // Qwen3.8-27B's 48 heads 100 ms at 128 rows, 91 at 32; a 640-row
+            // fire of Qwen3.6-35B-A3B's 32 heads 40.5 ms at 128, 34.9 at 32;
+            // Qwen3.5-0.8B's 16 heads lose 19% at 32 and keep 128).
+            Self::Gdn { hv, .. } if hv >= 32 => (c.chunk.min(32), c.long_chunk.min(32)),
+            Self::Gdn { .. } | Self::Mamba2 { .. } => (c.chunk, c.long_chunk),
+            Self::Kda { .. } => return c.kda_chunk,
+        };
+        if rows >= long * lanes.max(1) {
+            long
+        } else {
+            short
         }
     }
 
@@ -1441,6 +1485,7 @@ fn delta(
     let chunk = chunk.min(i64::from(rows.next_power_of_two().max(8)));
     let raw = input.raw(f)?;
     let slab = state.val;
+    let ragged = matches!(lanes, LaneTables::Ragged { .. });
     let (yv, slab) = match lanes {
         LaneTables::Decode { slots } => {
             let slots = flat_i32(f, slots)?;
@@ -1473,7 +1518,6 @@ fn delta(
                 )?;
                 return Ok((yv, slab));
             }
-            let orig_slab = slab;
             let mut slab = slab;
             let mut ys = Vec::new();
             let mut lo = 0;
@@ -1495,7 +1539,10 @@ fn delta(
                         cut(fq, lanes.write)?,
                     )
                 };
-                let s = take_slots(fq, orig_slab, slot, per)?;
+                // From the slab as the rounds before left it: a lane's slot
+                // is its own, and reading the bank as it came in would keep
+                // it whole beside the one landed into (a copy of every slot).
+                let s = take_slots(fq, slab, slot, per)?;
                 let s = fq.reshape(s, &[hi - lo, hh, dk, dv])?;
                 let (yv, s) = delta_step(fq, &part, s, input.rule())?;
                 let s = fq.reshape(s, &[hi - lo, stride])?;
@@ -1530,9 +1577,17 @@ fn delta(
             };
             let fq = &mut *f;
             let l = lanes.count(fq);
+            let kernel = ragged && t > chunk && fused_chunks_on();
+            let fused = if kernel {
+                chunk::gdn_chunks(fq, &input, &raw, &segs, &lanes, slab, per, chunk)?
+            } else {
+                None
+            };
             // every lane fits one chunk only when the whole fire does: an average under `chunk` lets a
             // prompt beside decodes (or a padding lane) lose its rows past the first chunk
-            if t <= chunk {
+            if let Some(out) = fused {
+                out
+            } else if t <= chunk {
                 delta_single_chunk(fq, &input, &raw, &lanes, slab, per, stride, chunk)?
             } else {
                 let init = take_slots(fq, slab, lanes.slot, per)?;

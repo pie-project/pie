@@ -346,7 +346,7 @@ pub(crate) fn codes_shape(
 ) -> Result<(), Error> {
     let ok = t.rows() == rows
         && match t.dtype() {
-            Dtype::E5m2 => u64::from(t.width()) == k,
+            Dtype::E5m2 | Dtype::E4m3 => u64::from(t.width()) == k,
             // The stored width is the read value's to tell (a packed dtype's
             // handle may view one code per element, or its raw bytes).
             d if crate::pack::code_elem(d).is_some() => crate::pack::code_bits(d) == Some(bits),
@@ -492,9 +492,31 @@ pub(crate) fn contract_native(
 /// What a bank's planes decode as.
 #[derive(Clone, Copy)]
 pub(crate) enum Form<T = Operand> {
-    Affine { biases: T },
+    Affine {
+        biases: T,
+    },
     Mxfp4,
+    /// e4m3 codes under one f32 factor a 128x128 block (a block-FP8
+    /// release's weights as released): the scales plane is `[⌈n/128⌉, k/128]`.
+    Tile,
 }
+
+/// A block-FP8 bank's `[⌈n/128⌉, G]` f32 factors (`scales`) as one a row,
+/// f32 `[n, G]`: each block row's factors repeated over its 128 rows.
+pub(crate) fn tile_factor(f: &mut Func, scales: Val, n: i64) -> Result<Val, Error> {
+    let (nb, g) = (f.dims(scales)[0], f.dims(scales)[1]);
+    let s = f.convert(scales, Elem::F32);
+    let s = f.broadcast(s, &[nb, TILE, g], &[0, 2])?;
+    let s = f.reshape(s, &[nb * TILE, g])?;
+    Ok(if nb * TILE == n {
+        s
+    } else {
+        f.slice_axis(s, 0, 0, n)?
+    })
+}
+
+/// The rows and columns one block-FP8 factor covers.
+pub(crate) const TILE: i64 = 128;
 
 /// A bank checked against an `[n, k]` projection, its planes as plain views.
 #[derive(Clone, Copy)]
@@ -546,12 +568,16 @@ pub(crate) fn planes<T: Stored>(
     let form = match w.biases {
         Some(b) => Form::Affine { biases: b },
         None if bits == 4 && group == 32 => Form::Mxfp4,
+        None if bits == 8 && i64::from(group) == TILE && w.codes.dtype() == Dtype::E4m3 => {
+            Form::Tile
+        }
         None => {
             return Err(refuse(
                 op,
                 format!(
-                    "the weight is a symmetric {bits}-bit bank in groups of {group}; the only \
-                     symmetric bank read is mxfp4 (4 bits, groups of 32, e8m0 scales)"
+                    "the weight is a symmetric {bits}-bit bank in groups of {group}; the \
+                     symmetric banks read are mxfp4 (4 bits, groups of 32, e8m0 scales) and \
+                     block FP8 (e4m3 codes, an f32 factor a 128x128 block)"
                 ),
             ));
         }
@@ -587,6 +613,23 @@ pub(crate) fn planes<T: Stored>(
             let s = factor("scale", w.scales, &[Dtype::E8m0, Dtype::U8])?;
             (s.with_dtype(Dtype::U8), Form::Mxfp4)
         }
+        Form::Tile => {
+            let s = w.scales;
+            if s.dtype() != Dtype::F32 || s.rows() != n.div_ceil(128) || s.width() != groups {
+                return Err(refuse(
+                    op,
+                    format!(
+                        "the factor plane is {}x{} {:?}, and a {n}x{k} block-FP8 bank has one \
+                         f32 factor a 128x128 block, {}x{groups}",
+                        s.rows(),
+                        s.width(),
+                        s.dtype(),
+                        n.div_ceil(128)
+                    ),
+                ));
+            }
+            (s, Form::Tile)
+        }
     };
     Ok(Planes {
         codes,
@@ -597,8 +640,18 @@ pub(crate) fn planes<T: Stored>(
     })
 }
 
-/// `x · wᵀ` for the bank, f32 `[m, n]`; `x` is `[m, k]` bf16 or f32.
-pub(crate) fn contract(f: &mut Func, x: Val, p: &Planes, tuning: Tuning) -> Result<Val, Error> {
+/// `x · wᵀ` for the bank, f32 `[m, n]` (or `out`, where a kernel can land
+/// it so); `x` is `[m, k]` bf16 or f32. With `sums`, the block-FP8 kernel
+/// lands each `sums`-wide head's sum of squares beside the rows
+/// (`moe_gmm::Gmm::sums`); no other path does.
+pub(crate) fn contract(
+    f: &mut Func,
+    x: Val,
+    p: &Planes,
+    tuning: Tuning,
+    out: Elem,
+    sums: Option<i64>,
+) -> Result<(Val, Option<Val>), Error> {
     let g = i64::from(p.groups);
     let n = i64::from(p.codes.rows);
     let k = f.dims(x)[1];
@@ -641,14 +694,19 @@ pub(crate) fn contract(f: &mut Func, x: Val, p: &Planes, tuning: Tuning) -> Resu
                     tuning,
                 )
             }
-        };
+            Form::Tile => Err(refuse(
+                "linear.matmul",
+                "block-FP8 codes land one e4m3 a weight, not packed in bytes",
+            )),
+        }
+        .map(|y| (y, None));
     }
     let mxfp4 = matches!(p.form, Form::Mxfp4);
     let codes = read_codes(f, p.codes, p.bits, mxfp4, n, k)?;
     if let Codes::Weights(_) = codes {
-        return contract_native(f, x, codes, g, None, None, tuning);
+        return contract_native(f, x, codes, g, None, None, tuning).map(|y| (y, None));
     }
-    match p.form {
+    let y = match p.form {
         Form::Affine { biases } => {
             let s = p.scales.f32(f);
             let b = biases.f32(f);
@@ -660,7 +718,28 @@ pub(crate) fn contract(f: &mut Func, x: Val, p: &Planes, tuning: Tuning) -> Resu
             let s = e8m0(f, e)?;
             contract_native(f, x, codes, g, Some(s), None, tuning)
         }
-    }
+        Form::Tile => {
+            let s = tile_factor(f, p.scales.val, n)?;
+            // The grouped-matmul kernel streams the codes and widens them in
+            // VMEM, where a block of the weight fits it.
+            if let Codes::Int(c) = codes
+                && let Some(y) = crate::linear::moe::tile_projection(f, x, c, s, tuning, out, sums)?
+            {
+                return Ok(y);
+            }
+            // The `[G, m, n]` partials of a group-batched dot outgrow the
+            // weight past a few rows: then the weight decodes once, each
+            // rounded to bf16 as the bf16 deployment holds it.
+            if grouped(tuning, f.dims(x)[0], g) {
+                return contract_native(f, x, codes, g, Some(s), None, tuning).map(|y| (y, None));
+            }
+            let q = code_values(f, codes, Elem::Bf16)?;
+            let q = f.reshape(q, &[n, g, k / g])?;
+            let w = materialize(f, q, s, None)?;
+            project(f, x, w, true)
+        }
+    }?;
+    Ok((y, None))
 }
 
 /// `y = act · wᵀ` for a quantized bank, its planes read as [`bank_view`]
@@ -672,7 +751,22 @@ pub fn matmul(
     y: Landing,
     tuning: Tuning,
 ) -> Result<Option<Val>, Error> {
-    act_x_wt(f, "linear.matmul", act, w, y, tuning)
+    Ok(act_x_wt(f, "linear.matmul", act, w, y, tuning, None)?.map(|(y, _)| y))
+}
+
+/// [`matmul`], and with `sums` each `sums`-wide head's f32 sum of squares of
+/// the rows where the kernel lands them (`[m, n / sums * 128]`, the 128
+/// lane-wise partials of a head; see `moe_gmm::Gmm::sums`), for the per-head
+/// norm that follows.
+pub fn matmul_sums(
+    f: &mut Func,
+    act: Operand,
+    w: Bank<Operand>,
+    y: Landing,
+    sums: Option<i64>,
+    tuning: Tuning,
+) -> Result<Option<(Val, Option<Val>)>, Error> {
+    act_x_wt(f, "linear.matmul", act, w, y, tuning, sums)
 }
 
 pub fn lm_head(
@@ -682,7 +776,7 @@ pub fn lm_head(
     y: Landing,
     tuning: Tuning,
 ) -> Result<Option<Val>, Error> {
-    act_x_wt(f, "linear.matmul", act, w, y, tuning)
+    Ok(act_x_wt(f, "linear.matmul", act, w, y, tuning, None)?.map(|(y, _)| y))
 }
 
 pub fn act_x_wt(
@@ -692,7 +786,8 @@ pub fn act_x_wt(
     w: Bank<Operand>,
     y: Landing,
     tuning: Tuning,
-) -> Result<Option<Val>, Error> {
+    sums: Option<i64>,
+) -> Result<Option<(Val, Option<Val>)>, Error> {
     let (m, n, k) = extent(op, act, y)?;
     let p = planes(op, &w, n, k)?;
     if m == 0 {
@@ -705,6 +800,13 @@ pub fn act_x_wt(
     } else {
         x
     };
-    let out = contract(f, x, &p, tuning)?;
-    Ok(Some(out))
+    // A bf16 landing takes the kernel's rows rounded as it stores them: an
+    // f32 result is written, read and rounded again (DeepSeek-V4's 32768-wide
+    // q_up at a 544-row prompt: 71 MB a layer).
+    let elem = if y.dtype == Dtype::Bf16 {
+        Elem::Bf16
+    } else {
+        Elem::F32
+    };
+    Ok(Some(contract(f, x, &p, tuning, elem, sums)?))
 }

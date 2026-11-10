@@ -202,7 +202,8 @@ fn the_fp8_block_projections_answer_the_dot() {
     // (narrow planes K split, wide ones whole); 5, a row's groups as its
     // routes on the W8A8 select; 6, cuBLASLt's block-scaled FP8 GEMM (rows
     // padded to fours); 7, the W8A8 select on Hopper's warp-specialized GEMM;
-    // 8, the W8A8 matmul on the wide tiles (an Ada's prefill rows, ragged).
+    // 8, the W8A8 matmul on the wide tiles (an Ada's prefill rows, ragged);
+    // 9, the W8A8 select on Hopper's persistent TMA GEMM.
     #[rustfmt::skip]
     let cases = [(8, 300, 1, 512, 1024), (8, 1000, 1, 768, 512), (0, 2, 1, 4096, 2048), (0, 4, 1, 8192, 1024), (0, 4, 1, 32768, 1024),
         (0, 8, 1, 1024, 4096), (1, 3, 8, 256, 1024), (2, 37, 4, 256, 1024), (3, 1, 1, 640, 6144),
@@ -212,7 +213,8 @@ fn the_fp8_block_projections_answer_the_dot() {
         (6, 5, 1, 384, 512), (6, 64, 1, 640, 1536),
         (6, 37, 1, 16384, 512), (6, 130, 1, 256, 2048),
         (7, 37, 4, 256, 1024), (7, 200, 3, 512, 1024), (7, 130, 2, 768, 512),
-        (7, 1000, 2, 2048, 512), (7, 130, 2, 384, 512)];
+        (7, 1000, 2, 2048, 512), (7, 130, 2, 384, 512),
+        (9, 37, 4, 256, 1024), (9, 200, 3, 512, 1024), (9, 1000, 2, 2048, 512)];
     // The mma.sync fp8 kernels (arms 0, 1, 4 and 5) are sm_89's: an Ada's e4m3 MMA.
     let fp8_mma = kernels_cuda::jit::cache::arch()
         .and_then(|a| {
@@ -228,7 +230,7 @@ fn the_fp8_block_projections_answer_the_dot() {
     for (arm, rows, groups, n, k) in cases {
         if (!supported() && arm == 2)
             || (!fp8_mma && matches!(arm, 0 | 1 | 4 | 5))
-            || (!hopper && matches!(arm, 6 | 7))
+            || (!hopper && matches!(arm, 6 | 7 | 9))
             || (arm == 8 && kernels_cuda::jit::cache::arch() != Some("sm_89"))
         {
             continue;
@@ -243,9 +245,10 @@ fn the_fp8_block_projections_answer_the_dot() {
         };
         let (codes, atoms, wv) = fp8_bank(&mut b, groups * n, k, per, 0x51 + n as u64);
         let (mut y, back) = (b.out(rows, groups * n), b.zeros(rows * groups * k * 2));
-        let ws = if arm == 7 { 1 } else { 0 };
+        let ws = if matches!(arm, 7 | 9) { 1 } else { 0 };
         let ctx = b.ctx().with_tuning(Tuning {
             fp8a8_ws_from: ws,
+            fp8a8_tma: arm == 9,
             ..GEMV
         });
         let (xt, fmt) = (t(x, rows, groups * k, Bf16), Format::E4m3 { gran: 128 });
@@ -348,12 +351,14 @@ fn the_quantizing_products_answer_the_read_back_dot() {
 fn the_w8a16_projections_answer_the_dot() {
     use kernels_cuda::linear::w8a16;
     // (block, m, n, k): the mma.sync kernel at each CTA shape (16, 32 and 64
-    // rows, a part tile of each), and wider fires on the widened plane.
+    // rows, a part tile of each), Hopper's wgmma at 65 to 128 rows, and wider
+    // fires on the widened plane.
     #[rustfmt::skip]
     let cases = [(128, 1, 384, 1024), (128, 5, 200, 640), (128, 16, 512, 2048), (128, 23, 256, 768),
         (128, 64, 136, 512), (128, 100, 256, 1024), (32, 1, 256, 1024), (32, 37, 200, 512),
         (32, 130, 200, 1024), (32, 64, 1280, 5120), (32, 50, 256, 1152), (32, 64, 520, 1536),
-        (128, 48, 384, 2048), (32, 24, 640, 1024), (128, 20, 384, 2048), (128, 256, 384, 1024), (128, 300, 136, 512), (32, 1024, 256, 2048), (128, 777, 520, 640)];
+        (128, 48, 384, 2048), (32, 24, 640, 1024), (128, 20, 384, 2048), (128, 256, 384, 1024), (128, 300, 136, 512), (32, 1024, 256, 2048), (128, 777, 520, 640),
+        (32, 128, 1280, 3072), (128, 65, 384, 2048), (32, 97, 520, 1536)];
     for (gran, m, n, k) in cases {
         let mut b = Bench::new(0xa16 ^ (m * n + k) as u64);
         let (x, xv) = b.bf16(m * k);

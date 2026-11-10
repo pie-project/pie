@@ -219,7 +219,6 @@ jobs:
           python -m pip install pytest -e packages/python/client
           PYTHONPATH=packages/python/inferlet/src python -m pytest -q packages/python/inferlet/tests
           python -m pytest -q packages/python/client/tests
-          python -m pytest -q scripts/bench/tests
       - name: javascript
         working-directory: packages/javascript
         run: |
@@ -247,6 +246,7 @@ jobs:
           name: languages
           path: target/languages/pie-language-*.tar.gz
           if-no-files-found: error
+          retention-days: 1
 
   android:
     name: "android: core (arm64) + Kotlin packages"

@@ -51,6 +51,10 @@ moe.fp8_mma_fill = 16
 moe.fp8_mma_depth = 2
 sdpa.mla_wgmma = true
 sdpa.mla_wgmma_rows = 64
+# the block-FP8 select's warp-specialized GEMM persistent, its weight rows landed by TMA and its jobs
+# taken off a ticket: GLM-5.3 mini78-e12 c256 2.55k -> 3.30k, c512 2.69k -> 3.49k, GLM-5.3-Flash mini8
+# c256 19.4k -> 20.8k, c512 22.1k -> 24.0k tok/s, the same sums bit for bit (parity KL unchanged)
+moe.fp8a8_tma = true
 
 [engine]
 working_set_percent = 90  # 1.9% faster end to end

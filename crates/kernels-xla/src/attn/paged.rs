@@ -15,10 +15,9 @@
 //!   one dense `dot_general` per chunk (the prefill shape).
 //!
 //! Scores are `q · k` with bf16 operands and f32 accumulation (every product
-//! exact), then scaled; probabilities meet values as a two-term bf16 split
-//! (`p = hi + lo`), which keeps the value reduction f32-accurate at two MXU
-//! passes. A row with no admitted key answers zeros (and a `-inf` log-sum-exp),
-//! never NaN.
+//! exact), then scaled; probabilities meet values in bf16, one MXU pass, as
+//! FlashAttention's do. A row with no admitted key answers zeros (and a `-inf`
+//! log-sum-exp), never NaN.
 
 #![allow(clippy::too_many_arguments)]
 
@@ -27,7 +26,7 @@ use dtype::Dtype;
 use super::{DecodePlan, PrefillPlan};
 use crate::check::expect;
 use crate::error::{Error, refuse};
-use crate::hlo::{Built, Cmp, Elem, Fold, Func, GatherDims, Malformed, Val};
+use crate::hlo::{Built, Cmp, Elem, Fold, Func, GatherDims, Malformed, Ty, Val};
 use crate::tensor::{KvPool, Landing, Operand, RaggedTensor, Stored};
 use crate::tuning::Chunks;
 use crate::tuning::Tuning;
@@ -84,13 +83,37 @@ pub(crate) fn head(f: &mut Func, v: Val, n: i64) -> Built<Val> {
     f.slice(v, &[0], &[n], &[1])
 }
 
+/// A table this short is read by a one-hot select and sum, not a gather:
+/// XLA lowers a gather from it to a chain of selects, one a table entry
+/// (v6e, Gemma-4-26B-A4B at 64 decode lanes: a 64-entry lane table read at
+/// 4096 indices took 225 us in each of its 25 sliding layers).
+const SHORT_TABLE: i64 = 256;
+
 /// `table[idx]` elementwise for a flat `table`; `idx` any shape (clamped).
 pub(crate) fn take(f: &mut Func, table: Val, idx: Val) -> Built<Val> {
     let dims = f.dims(idx).to_vec();
     let n = f.dims(table)[0];
-    let t = f.reshape(table, &[n, 1])?;
     let m: i64 = dims.iter().product();
     let i = f.reshape(idx, &[m])?;
+    if n <= SHORT_TABLE && f.elem(table) != Elem::Pred {
+        let lo = f.like_i(i, 0);
+        let i = f.max(i, lo)?;
+        let hi = f.like_i(i, n - 1);
+        let i = f.min(i, hi)?;
+        let is = f.broadcast(i, &[m, n], &[0])?;
+        let es = f.iota(Elem::I32, &[m, n], 1);
+        let hit = f.compare(Cmp::Eq, is, es)?;
+        let ts = f.broadcast(table, &[m, n], &[1])?;
+        let zero = if f.elem(ts).is_float() {
+            f.like_f(ts, 0.0)
+        } else {
+            f.like_i(ts, 0)
+        };
+        let g = f.select(hit, ts, zero)?;
+        let g = f.reduce(g, &[1], Fold::Sum)?;
+        return f.reshape(g, &dims);
+    }
+    let t = f.reshape(table, &[n, 1])?;
     let g = f.take_rows(t, i)?;
     f.reshape(g, &dims)
 }
@@ -247,7 +270,13 @@ pub(crate) fn fetch(f: &mut Func, planes: &Planes, h: &Heads, x: Val) -> Built<(
             let page = take(f, geom.pt, at)?;
             let slot = with_i(f, page, geom.ps, Func::mul)?;
             let slot = f.add(slot, off)?;
-            let kr = f.take_rows(keys, slot)?;
+            let w = f.dims(keys)[1];
+            let row = if latent { h.dv } else { h.kvh * h.d };
+            let kr = if w < row && row % w == 0 {
+                super::pool::entry_rows(f, keys, slot, row / w)?
+            } else {
+                f.take_rows(keys, slot)?
+            };
             if latent {
                 let v = f.reshape(kr, &[n, 1, h.dv])?;
                 let k = if h.d > h.dv {
@@ -299,11 +328,17 @@ pub(crate) fn fetch_pages(
     let m = f.dims(page)[0];
     let n = m * geom.ps;
     let page = f.reshape(page, &[m, 1])?;
-    let blocks = |f: &mut Func, plane: Val| -> Built<Val> {
+    let blocks = |f: &mut Func, plane: Val, row: i64| -> Built<Val> {
         let (slots, w) = (f.dims(plane)[0], f.dims(plane)[1]);
+        // A compact plane (an entry `row / w` rows of its `[cells, w]`)
+        // pages as it is laid, and only the chunk takes the entry's width:
+        // viewing the whole plane at that width relays all of it, every
+        // layer, every fire (a CSA pool on a v6e: 0.67 ms a layer).
+        let div = if w < row && row % w == 0 { row / w } else { 1 };
+        let ps = geom.ps * div;
         // `[slots, w]` as `[pages, ps, w]`: whole pages along the major
         // axis, so the gather moves full `ps · w` slabs.
-        let paged = f.reshape(plane, &[slots / geom.ps, geom.ps, w])?;
+        let paged = f.reshape(plane, &[slots / ps, ps, w])?;
         let b = f.gather(
             paged,
             page,
@@ -314,15 +349,15 @@ pub(crate) fn fetch_pages(
                 index_vector_dim: 1,
                 ..GatherDims::default()
             },
-            &[1, geom.ps, w],
+            &[1, ps, w],
         )?;
-        f.reshape(b, &[n, w])
+        f.reshape(b, &[n, w * div])
     };
-    let kr = blocks(f, keys)?;
+    let kr = blocks(f, keys, if latent { h.dv } else { h.kvh * h.d })?;
     if latent {
         let v = f.reshape(kr, &[n, 1, h.dv])?;
         let k = if h.d > h.dv {
-            let pe = blocks(f, values)?;
+            let pe = blocks(f, values, h.d - h.dv)?;
             f.concat(&[kr, pe], 1)?
         } else {
             kr
@@ -330,7 +365,7 @@ pub(crate) fn fetch_pages(
         let k = f.reshape(k, &[n, 1, h.d])?;
         Ok(Some((k, v)))
     } else {
-        let vr = blocks(f, values)?;
+        let vr = blocks(f, values, h.kvh * h.dv)?;
         let k = f.reshape(kr, &[n, h.kvh, h.d])?;
         let v = f.reshape(vr, &[n, h.kvh, h.dv])?;
         Ok(Some((k, v)))
@@ -478,6 +513,9 @@ pub(crate) struct Rule {
     /// The most keys one row admits (a sliding window), when bounded: the
     /// per-row walk then reads chunks no wider than it.
     pub window: Option<i64>,
+    /// Whether the blocked walk's row blocks may run in line (see
+    /// [`blocked`]); a narrow window's blocks always may.
+    pub inline: bool,
 }
 
 struct Logits {
@@ -512,6 +550,15 @@ fn logits(
         let lt = cmp_i(f, Cmp::Lt, kp, rule.bound.min(pitch))?;
         let inb = f.and(ge, lt)?;
         let cell = match kbase {
+            // A one-byte plane (no lane states a mask) reads its row's byte
+            // at every key (only key 0 is in bounds): a broadcast, where a
+            // gather of a byte a cell took 0.1-0.3 ms a layer at 256 decode
+            // lanes (v6e gpt-oss), and the window below, which XLA rewrites
+            // to one too (0.1 ms a layer).
+            _ if pitch == 1 => {
+                let col = f.reshape(plane, &[rb])?;
+                f.broadcast(col, &dims, &[0])?
+            }
             // Every row reads columns `base .. base + c`: one window of the
             // plane (zero past its pitch) instead of a gather per cell.
             Some(base) => {
@@ -617,35 +664,17 @@ enum Layout {
     Blocked,
 }
 
-/// `x` as `hi + lo`, both bf16: `hi` is `x` with its low 16 mantissa bits
-/// cleared (exact in bf16), `lo` the rest rounded (`|lo| < 2⁻⁷|x|`), so
-/// `hi + lo` holds `x` to ~2⁻¹⁶. The split is by bits, not by an f32→bf16→f32
-/// round trip, which XLA's excess-precision rewrite folds back to `x`.
-pub(crate) fn split_bf16(f: &mut Func, x: Val) -> Built<(Val, Val)> {
-    let bits = f.bitcast(x, Elem::U32)?;
-    let keep = f.like_i(bits, 0xFFFF_0000);
-    let bits = f.and(bits, keep)?;
-    let hi32 = f.bitcast(bits, Elem::F32)?;
-    let lo = f.sub(x, hi32)?;
-    Ok((f.convert(hi32, Elem::Bf16), f.convert(lo, Elem::Bf16)))
-}
-
-/// `p · v` in f32 from bf16 values: `p` split as `hi + lo`, two bf16 passes.
+/// `p · v` in f32 from bf16 values, `p` in bf16: one MXU pass (a prefill's
+/// blocks took two, `p` split as `hi + lo`: v5e Qwen3-0.6B pf256-512 44.0k
+/// against 48.5k tok/s, Raw prefill 36.5k against 40.2k).
 fn pv(f: &mut Func, lay: Layout, p: Val, v: Val) -> Built<Val> {
     let split = f.ty(v).rank() == 3;
-    let dot = |f: &mut Func, x: Val| match lay {
-        Layout::PerRow if split => by_head(f, x, v, 1),
-        Layout::PerRow => f.dot_general_at(x, v, &[0, 1], &[0, 2], &[3], &[1], Elem::F32, false),
-        Layout::Blocked => f.dot_general_at(x, v, &[0], &[1], &[3], &[0], Elem::F32, false),
-    };
-    if lay == Layout::PerRow {
-        let pb = f.convert(p, Elem::Bf16);
-        return dot(f, pb);
+    let pb = f.convert(p, Elem::Bf16);
+    match lay {
+        Layout::PerRow if split => by_head(f, pb, v, 1),
+        Layout::PerRow => f.dot_general_at(pb, v, &[0, 1], &[0, 2], &[3], &[1], Elem::F32, false),
+        Layout::Blocked => f.dot_general_at(pb, v, &[0], &[1], &[3], &[0], Elem::F32, false),
     }
-    let (hi, lo) = split_bf16(f, p)?;
-    let a = dot(f, hi)?;
-    let b = dot(f, lo)?;
-    f.add(a, b)
 }
 
 /// Whether the per-row walk reads kv heads as 128-aligned column slices of
@@ -1156,7 +1185,15 @@ pub(crate) fn blocked(
 ) -> Built<Flashed> {
     let r = f.dims(rows.q)[0];
     let qh = h.qh().max(1);
-    let br = ch.block_rows.min(round_up(r, 8));
+    // A sliding window at most half a block of rows: blocks a window wide,
+    // so a block's chunks cover its rows and the window behind them, not a
+    // whole block's keys past it (gpt-oss's 128-key layers: 128-row blocks
+    // over 256-key chunks, against 512 rows over 1024 keys).
+    let narrow = rule
+        .window
+        .map(|w| round_up(w.max(1), 128))
+        .filter(|&w| 2 * w <= ch.block_rows);
+    let br = narrow.unwrap_or(ch.block_rows).min(round_up(r, 8));
     let nb = cdiv(r, br);
     let rp = nb * br;
     let rows_p = if rp > r {
@@ -1167,6 +1204,7 @@ pub(crate) fn blocked(
     let width = (h.kvh * (h.d + h.dv)).max(1);
     let fit = pow2_floor((ch.budget / (br * qh)).min(ch.budget / width).max(8));
     let c = ch.block_keys.min(fit).min(round_up(keys.max(1), 8));
+    let c = narrow.map_or(c, |w| c.min(2 * w));
     // Lanes narrower than a chunk: walk them a span at a time, so no chunk
     // straddles two lanes (the mask is then read as a window, below).
     let c = match rule.kp_span {
@@ -1264,6 +1302,25 @@ pub(crate) fn blocked(
     };
     let whole = if nb == 1 {
         block(f, &rows_p)?
+    } else if nb <= ch.unrolled && (narrow.is_some() || rule.inline) {
+        // A few blocks run one after another in line, each on a static cut
+        // of the rows, and join at the end: as a loop, each block's result
+        // is written into a copy of the whole carried output (DeepSeek-V4's
+        // window blocks, 14 of 128 rows a layer: 1.4 of a 56 ms v6e fire).
+        let mut parts = Vec::with_capacity(nb as usize);
+        for bi in 0..nb {
+            let rb = rows_p.map(f, &mut |f, v| f.slice_axis(v, 0, bi * br, (bi + 1) * br))?;
+            parts.push(block(f, &rb)?);
+        }
+        let join = |f: &mut Func, pick: fn(&Flashed) -> Val| -> Built<Val> {
+            let vs: Vec<Val> = parts.iter().map(pick).collect();
+            f.concat(&vs, 0)
+        };
+        Flashed {
+            o: join(f, |x| x.o)?,
+            m: join(f, |x| x.m)?,
+            l: join(f, |x| x.l)?,
+        }
     } else {
         let st0 = [
             f.const_f(Elem::F32, 0.0, &[rp, h.kvh, h.g, h.dv]),
@@ -1938,6 +1995,60 @@ pub fn attend(
             scale,
             ch,
         )?,
+        (Walk::PerRow, None)
+            if ch.decode_pages > 0
+                && r >= ch.decode_pages
+                // narrow kv heads read so little a row that the kernel's
+                // per-row work costs more than the walk's reads (v6e
+                // gemma-4-E2B c256, one 256-wide kv head: 13.8k -> 9.2k tok/s)
+                && heads.kvh * heads.d >= 1024
+                && rule.rel.is_none()
+                && rule.rbias.is_none()
+                && !matches!(planes, Planes::Paged { latent: true, .. })
+                && f.elem(keys) == Elem::Bf16
+                && f.elem(values) == Elem::Bf16
+                && super::pages::fits(geom.span, &heads, tuning.vmem_cap()) =>
+        {
+            // A decode's rows copy their own pages; a fire whose rows carry
+            // a custom mask walks them as before.
+            let vmem = tuning.vmem_cap();
+            let copied = move |f: &mut Func| -> Built<Flashed> {
+                super::pages::attend(
+                    f, rs.q, keys, values, geom.pt, lane, rs.lo, rs.hi, geom.pages, geom.ps,
+                    &heads, scale, vmem,
+                )
+            };
+            match rs.enabled {
+                None => copied(f)?,
+                Some(en) => {
+                    let on = cmp_i(f, Cmp::Ne, en, 0)?;
+                    let any = f.reduce(on, &[0], Fold::Or)?;
+                    let at = f.convert(any, Elem::I32);
+                    let o = f.dims(rs.q).to_vec();
+                    let stat = Ty::new(Elem::F32, &o[..3]);
+                    let outs = [
+                        Ty::new(Elem::F32, &[o[0], o[1], o[2], heads.dv]),
+                        stat.clone(),
+                        stat,
+                    ];
+                    let plain: crate::hlo::Branch<'_> = Box::new(move |f: &mut Func| {
+                        let fl = copied(f)?;
+                        Ok(vec![fl.o, fl.m, fl.l])
+                    });
+                    let walked: crate::hlo::Branch<'_> = Box::new(move |f: &mut Func| {
+                        let fl =
+                            per_row(f, &planes, &heads, &rule, &rs, KeyList::Range, scale, ch)?;
+                        Ok(vec![fl.o, fl.m, fl.l])
+                    });
+                    let out = f.case(at, &outs, vec![plain, walked])?;
+                    Flashed {
+                        o: out[0],
+                        m: out[1],
+                        l: out[2],
+                    }
+                }
+            }
+        }
         _ => per_row(f, &planes, &heads, &rule, &rs, KeyList::Range, scale, ch)?,
     };
     let lse = match call.lse {
@@ -2301,9 +2412,56 @@ pub(crate) fn scatter_slots(
     let n = first.rows;
     let page = read_rows_i32(f, op, write_page, n)?;
     let off = read_rows_i32(f, op, write_offset, n)?;
+    let ps = i64::from(page_size);
+    let slots = i64::from(pairs[0].1.rows);
+    let paged = i64::from(n) >= PAGE_WRITE_ROWS
+        && ps >= 8
+        && slots % ps == 0
+        && i64::from(n) % ps == 0
+        && pairs.iter().all(|(src, plane)| {
+            plane.rows == pairs[0].1.rows && src.rows == n && f.elem(src.val) == Elem::Bf16
+        });
+    if !paged {
+        return Ok(slot_rows(f, pairs, ps, page, off)?);
+    }
+    let outs: Vec<crate::hlo::Ty> = pairs
+        .iter()
+        .map(|(_, plane)| f.ty(plane.val).clone())
+        .collect();
+    let runs = page_runs(f, i64::from(n), ps, slots / ps, page, off)?;
+    // A page a run fills whole needs no reading first: when few runs are
+    // partial (two a lane at most), only theirs are read.
+    let few = (i64::from(n) / ps + 64) / 4;
+    let skip = cmp_i(f, Cmp::Le, runs.partial, few)?;
+    let skip = f.convert(skip, Elem::I32);
+    let which = with_i(f, skip, 1, Func::add)?;
+    let which = f.mul(which, runs.ok)?;
+    let rows: crate::hlo::Branch<'_> =
+        Box::new(move |f: &mut Func| slot_rows(f, pairs, ps, page, off));
+    let pages: crate::hlo::Branch<'_> =
+        Box::new(move |f: &mut Func| page_writes(f, pairs, ps, slots / ps, &runs, None));
+    let fresh: crate::hlo::Branch<'_> =
+        Box::new(move |f: &mut Func| page_writes(f, pairs, ps, slots / ps, &runs, Some(few)));
+    Ok(f.case(which, &outs, vec![rows, pages, fresh])?)
+}
+
+/// Rows from which `scatter_slots` writes whole pages: a fire this tall is a
+/// prefill's, whose rows fill a lane's pages in runs, and a TPU row scatter
+/// pays for every row it is handed, landing or not (v6e: ~0.12 us a row, a
+/// 1792-row prefill's plane 0.22 ms; its pages written whole, 0.02 ms).
+const PAGE_WRITE_ROWS: i64 = 128;
+
+/// Each row of `src` written to its own slot, one row scatter a plane.
+fn slot_rows(
+    f: &mut Func,
+    pairs: &[(Operand, Operand)],
+    ps: i64,
+    page: Val,
+    off: Val,
+) -> Built<Vec<Val>> {
     let mut out: Vec<Val> = Vec::with_capacity(pairs.len());
     for (at, &(src, plane)) in pairs.iter().enumerate() {
-        let ps = i64::from(page_size);
+        let n = i64::from(src.rows);
         let slots = i64::from(plane.rows);
         let pages = slots / ps;
         let a = cmp_i(f, Cmp::Ge, page, 0)?;
@@ -2316,7 +2474,7 @@ pub(crate) fn scatter_slots(
         let s = with_i(f, page, ps, Func::mul)?;
         let s = f.add(s, off)?;
         let f0 = f.like_i(s, slots);
-        let io = f.iota(Elem::I32, &[i64::from(n)], 0);
+        let io = f.iota(Elem::I32, &[n], 0);
         let far = f.add(f0, io)?;
         let slot = f.select(ok, s, far)?;
         let rows = src.val;
@@ -2327,6 +2485,248 @@ pub(crate) fn scatter_slots(
         let elem = f.elem(table);
         let rows = f.convert(rows, elem);
         out.push(f.put_rows_hinted(table, slot, rows, crate::hlo::Combine::Set, true)?);
+    }
+    Ok(out)
+}
+
+/// A fire's rows read as runs of one page each: run `j` starts at row
+/// `start[j]`, lands at offset `first[j]` of page `page[j]` and is `len[j]`
+/// rows long. `ok` (an i32 0 or 1) says the runs cover every row bound for a
+/// live page, each page in one run, consecutive offsets: then the pages can
+/// be written whole. Rows bound for the sink page (the plane's last, which
+/// padding lanes write and nothing reads back) are left out.
+#[derive(Clone, Copy)]
+struct Runs {
+    start: Val,
+    first: Val,
+    len: Val,
+    page: Val,
+    ok: Val,
+    /// How many live runs lay less than a whole page (i32 scalar).
+    partial: Val,
+}
+
+fn page_runs(f: &mut Func, n: i64, ps: i64, pages: i64, page: Val, off: Val) -> Built<Runs> {
+    let m = n / ps + 64;
+    let a = cmp_i(f, Cmp::Ge, page, 0)?;
+    let b = cmp_i(f, Cmp::Lt, page, pages - 1)?;
+    let c = cmp_i(f, Cmp::Ge, off, 0)?;
+    let d = cmp_i(f, Cmp::Lt, off, ps)?;
+    let live = f.and(a, b)?;
+    let live = f.and(live, c)?;
+    let live = f.and(live, d)?;
+    let none = f.like_i(page, -1);
+    let key = f.select(live, page, none)?;
+    let before = f.slice_axis(key, 0, 0, n - 1)?;
+    let lead = f.const_i(Elem::I32, -1, &[]);
+    let before = f.pad(before, lead, &[1], &[0], &[0])?;
+    let new = f.compare(Cmp::Ne, key, before)?;
+    let opens = f.and(live, new)?;
+    let opens = f.convert(opens, Elem::I32);
+    let count = f.scan_steps(opens, 0, Fold::Sum)?;
+    let total = f.reduce(opens, &[0], Fold::Sum)?;
+    // run j starts where the running count passes j; it holds the live rows
+    // whose count is j + 1
+    let grid = [m, n];
+    let cg = f.broadcast(count, &grid, &[1])?;
+    let jg = f.iota(Elem::I32, &grid, 0);
+    let before_j = f.compare(Cmp::Le, cg, jg)?;
+    let before_j = f.convert(before_j, Elem::I32);
+    let start = f.reduce(before_j, &[1], Fold::Sum)?;
+    let j1 = with_i(f, jg, 1, Func::add)?;
+    let mine = f.compare(Cmp::Eq, cg, j1)?;
+    let lg = f.broadcast(live, &grid, &[1])?;
+    let mine = f.and(mine, lg)?;
+    let mine = f.convert(mine, Elem::I32);
+    let len = f.reduce(mine, &[1], Fold::Sum)?;
+    let at = clamp_i(f, start, 0, n - 1)?;
+    let first = pick(f, off, at)?;
+    let page_j = pick(f, page, at)?;
+    // every live row sits at its run's first offset plus its place in the run
+    let run = with_i(f, count, 1, Func::sub)?;
+    let run = clamp_i(f, run, 0, m - 1)?;
+    let run_first = pick(f, first, run)?;
+    let run_start = pick(f, start, run)?;
+    let io = f.iota(Elem::I32, &[n], 0);
+    let want = f.sub(io, run_start)?;
+    let want = f.add(want, run_first)?;
+    let off_ok = f.compare(Cmp::Eq, off, want)?;
+    let stray = f.not(off_ok);
+    let stray = f.and(stray, live)?;
+    let stray = f.convert(stray, Elem::I32);
+    let strays = f.reduce(stray, &[0], Fold::Sum)?;
+    // no page in two runs: the live runs' pages, sorted, differ pairwise
+    let jm = f.iota(Elem::I32, &[m], 0);
+    let tb = f.broadcast(total, &[m], &[])?;
+    let used = f.compare(Cmp::Lt, jm, tb)?;
+    let spare = with_i(f, jm, pages, Func::add)?;
+    let keyed = f.select(used, page_j, spare)?;
+    let sorted = f.sort(&[keyed], 0, false, |f, a, b| f.compare(Cmp::Lt, a[0], b[0]))?;
+    let lo = f.slice_axis(sorted[0], 0, 0, m - 1)?;
+    let hi = f.slice_axis(sorted[0], 0, 1, m)?;
+    let twice = f.compare(Cmp::Eq, lo, hi)?;
+    let twice = f.convert(twice, Elem::I32);
+    let twice = f.reduce(twice, &[0], Fold::Sum)?;
+    let fits = cmp_i(f, Cmp::Le, total, m)?;
+    let clean = f.add(strays, twice)?;
+    let clean = cmp_i(f, Cmp::Eq, clean, 0)?;
+    let ok = f.and(fits, clean)?;
+    let ok = f.convert(ok, Elem::I32);
+    let at_zero = cmp_i(f, Cmp::Eq, first, 0)?;
+    let full = cmp_i(f, Cmp::Eq, len, ps)?;
+    let whole = f.and(at_zero, full)?;
+    let part = f.not(whole);
+    let part = f.and(part, used)?;
+    let part = f.convert(part, Elem::I32);
+    let partial = f.reduce(part, &[0], Fold::Sum)?;
+    Ok(Runs {
+        start,
+        first,
+        len,
+        page: keyed,
+        ok,
+        partial,
+    })
+}
+
+/// `v[at]` for an i32 vector `v` and an i32 index vector `at`.
+fn pick(f: &mut Func, v: Val, at: Val) -> Built<Val> {
+    let k = f.dims(at)[0];
+    let at = f.reshape(at, &[k, 1])?;
+    f.gather(
+        v,
+        at,
+        &GatherDims {
+            collapsed_slice_dims: vec![0],
+            start_index_map: vec![0],
+            index_vector_dim: 1,
+            ..GatherDims::default()
+        },
+        &[1],
+    )
+}
+
+/// The runs' pages written whole: each page's old rows read back, its run's
+/// rows laid over them, the page scattered as one block. A run's rows lie in
+/// two whole source tiles, read as blocks and picked by a one-hot product
+/// (`[ps, 2·ps] · [2·ps, w]` a run, exact: one term a row), as a gather of
+/// rows at an offset lowers to a loop of row slices on a TPU.
+fn page_writes(
+    f: &mut Func,
+    pairs: &[(Operand, Operand)],
+    ps: i64,
+    pages: i64,
+    runs: &Runs,
+    partial_cap: Option<i64>,
+) -> Built<Vec<Val>> {
+    let m = f.dims(runs.page)[0];
+    let n = i64::from(pairs[0].0.rows);
+    let (start, first, len, page) = match partial_cap {
+        // the runs laying less than a whole page sorted first: those are
+        // the pages read before they are written
+        Some(_) => {
+            let used = cmp_i(f, Cmp::Lt, runs.page, pages)?;
+            let at_zero = cmp_i(f, Cmp::Eq, runs.first, 0)?;
+            let full = cmp_i(f, Cmp::Eq, runs.len, ps)?;
+            let whole = f.and(at_zero, full)?;
+            let unused = f.not(used);
+            let whole = f.or(whole, unused)?;
+            let key = f.convert(whole, Elem::I32);
+            let sorted = f.sort(
+                &[key, runs.start, runs.first, runs.len, runs.page],
+                0,
+                true,
+                |f, a, b| f.compare(Cmp::Lt, a[0], b[0]),
+            )?;
+            (sorted[1], sorted[2], sorted[3], sorted[4])
+        }
+        None => (runs.start, runs.first, runs.len, runs.page),
+    };
+    let few = partial_cap.unwrap_or(m).min(m);
+    let at = f.reshape(page, &[m, 1])?;
+    let read = clamp_i(f, page, 0, pages - 1)?;
+    let read = f.slice_axis(read, 0, 0, few)?;
+    let read = f.reshape(read, &[few, 1])?;
+    let r = f.iota(Elem::I32, &[m, ps], 1);
+    let lo = f.broadcast(first, &[m, ps], &[0])?;
+    let end = f.add(first, len)?;
+    let hi = f.broadcast(end, &[m, ps], &[0])?;
+    let ge = f.compare(Cmp::Ge, r, lo)?;
+    let lt = f.compare(Cmp::Lt, r, hi)?;
+    let laid = f.and(ge, lt)?;
+    // a run's rows start `first` rows before its source row `start`; the
+    // source padded by a tile in front, they lie in tiles `tile` and `tile + 1`
+    let from = f.sub(start, first)?;
+    let from = with_i(f, from, ps, Func::add)?;
+    let tile = with_i(f, from, ps, Func::div)?;
+    let lead = with_i(f, from, ps, Func::rem)?;
+    let tile = f.reshape(tile, &[m, 1])?;
+    let lead = f.broadcast(lead, &[m, ps], &[0])?;
+    let want = f.add(lead, r)?;
+    let none = f.like_i(want, -1);
+    let want = f.select(laid, want, none)?;
+    let want = f.broadcast(want, &[m, ps, 2 * ps], &[0, 1])?;
+    let k = f.iota(Elem::I32, &[m, ps, 2 * ps], 2);
+    let pick = f.compare(Cmp::Eq, want, k)?;
+    let pick = f.convert(pick, Elem::Bf16);
+    let tiles = (n + 3 * ps) / ps;
+    let whole = GatherDims {
+        offset_dims: vec![1, 2],
+        collapsed_slice_dims: vec![0],
+        start_index_map: vec![0],
+        index_vector_dim: 1,
+        ..GatherDims::default()
+    };
+    // both tiles a run's rows lie in, as one window
+    let pair = GatherDims {
+        offset_dims: vec![1, 2, 3],
+        start_index_map: vec![0],
+        index_vector_dim: 1,
+        ..GatherDims::default()
+    };
+    let mut out: Vec<Val> = Vec::with_capacity(pairs.len());
+    for (at_pair, &(src, plane)) in pairs.iter().enumerate() {
+        let table = match at_pair.checked_sub(1) {
+            Some(prev) if pairs[prev].1.val == plane.val => out[prev],
+            _ => plane.val,
+        };
+        let w = i64::from(plane.width);
+        let elem = f.elem(table);
+        let p3 = f.reshape(table, &[pages, ps, w])?;
+        let old = f.gather(p3, read, &whole, &[1, ps, w])?;
+        let rows = f.convert(src.val, Elem::Bf16);
+        let zero = f.const_f(Elem::Bf16, 0.0, &[]);
+        let rows = f.pad(rows, zero, &[ps, 0], &[2 * ps, 0], &[0, 0])?;
+        let rows = f.reshape(rows, &[tiles, ps, w])?;
+        let both = f.gather(rows, tile, &pair, &[2, ps, w])?;
+        let both = f.reshape(both, &[m, 2 * ps, w])?;
+        let new = f.dot_general(pick, both, &[0], &[0], &[2], &[1], Elem::F32)?;
+        let new = f.convert(new, elem);
+        let head = f.slice_axis(laid, 0, 0, few)?;
+        let mask = f.broadcast(head, &[few, ps, w], &[0, 1])?;
+        let merged = if few == m {
+            f.select(mask, new, old)?
+        } else {
+            let top = f.slice_axis(new, 0, 0, few)?;
+            let top = f.select(mask, top, old)?;
+            let rest = f.slice_axis(new, 0, few, m)?;
+            f.concat(&[top, rest], 0)?
+        };
+        let written = f.scatter_hinted(
+            p3,
+            at,
+            merged,
+            &crate::hlo::ScatterDims {
+                update_window_dims: vec![1, 2],
+                inserted_window_dims: vec![0],
+                scatter_dims_to_operand_dims: vec![0],
+                index_vector_dim: 1,
+                ..crate::hlo::ScatterDims::default()
+            },
+            crate::hlo::Combine::Set,
+            true,
+        )?;
+        out.push(f.reshape(written, &[pages * ps, w])?);
     }
     Ok(out)
 }

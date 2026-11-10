@@ -34,6 +34,14 @@ pub trait Env {
 
     /// Makes `v` (shaped `[t.rows, t.width]`) what `t` holds from here on.
     fn write(&mut self, f: &mut Func, t: Tensor, v: Val) -> Result<(), Error>;
+
+    /// The per-head sums of squares a kernel landed beside `t`'s current
+    /// value (`keep_sums`), while `t` holds that value.
+    fn sums(&mut self, _t: Tensor) -> Option<Val> {
+        None
+    }
+
+    fn keep_sums(&mut self, _t: Tensor, _v: Val) {}
 }
 
 /// A lowering's view: the function under construction plus the handle
@@ -91,6 +99,17 @@ impl<'a> Cx<'a> {
             .f
             .reshape(v, &[i64::from(t.rows), i64::from(t.width)])?;
         self.env.write(self.f, t, v)
+    }
+
+    /// The per-head sums of squares landed beside `t`'s current value.
+    pub fn sums(&mut self, t: Tensor) -> Option<Val> {
+        self.env.sums(t)
+    }
+
+    /// Keeps `v`, the per-head sums of squares of what `t` holds now, for the
+    /// norm that reads them.
+    pub fn keep_sums(&mut self, t: Tensor, v: Val) {
+        self.env.keep_sums(t, v);
     }
 
     #[must_use]

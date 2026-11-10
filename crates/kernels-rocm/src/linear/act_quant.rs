@@ -524,8 +524,8 @@ pub fn matmul_fp8_quantized(
 /// DeepSeek's recipe quantizes it (`act_quant_e4m3_e8m0`: e4m3 under a
 /// ue8m0 scale a 1x32 block), on the FP8 matrix core: each 32-code step's
 /// products sum in f32 there, then fold under the weight's exponent and the
-/// row's (and the four of reading both as fnuz) into the row's sum, the
-/// W8A8 GEMM's sum in its order up to f32 rounding.
+/// row's (and, on gfx942, the four of reading both as fnuz) into the row's
+/// sum, the W8A8 GEMM's sum in its order up to f32 rounding.
 pub fn matmul_fp8b32_lanes(
     ctx: &Ctx,
     op: &'static str,

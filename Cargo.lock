@@ -1909,6 +1909,7 @@ dependencies = [
  "serde_json",
  "toml",
  "tracing",
+ "zstd 0.14.3",
  "ztensor",
  "ztensor-compat",
 ]

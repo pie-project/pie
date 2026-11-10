@@ -52,15 +52,23 @@ pub(crate) fn remote() -> Option<Arc<dyn Remote>> {
     REMOTE.read().unwrap().clone()
 }
 
+/// The nodes or cache entries a report reads under the lock every guest's
+/// fire waits on before it lets go: a full cache read in one go held it tens
+/// of ms each second.
+const REPORT_SLICE: usize = 1024;
+
 /// Every sealed page this worker holds, by key: what it reports to the
 /// directory.
 pub fn sealed_keys() -> HashSet<Hash256> {
     let mut keys = HashSet::new();
     for stores in crate::store::registry::all_for_model(0) {
         // copied under the lock every guest's fire waits on, hashed after
-        keys.extend(with_kv_lock(&stores.kv, "offload-report", |kv| {
-            kv.sealed_key_list()
-        }));
+        let nodes = with_kv_lock(&stores.kv, "offload-report", |kv| kv.node_ids());
+        for slice in nodes.chunks(REPORT_SLICE) {
+            keys.extend(with_kv_lock(&stores.kv, "offload-report", |kv| {
+                kv.sealed_key_list(slice)
+            }));
+        }
     }
     keys
 }
@@ -69,9 +77,12 @@ pub fn sealed_keys() -> HashSet<Hash256> {
 pub fn cached_runs() -> Vec<Vec<Hash256>> {
     let mut runs = Vec::new();
     for stores in crate::store::registry::all_for_model(0) {
-        runs.extend(with_kv_lock(&stores.kv, "offload-report", |kv| {
-            kv.cached_runs()
-        }));
+        let entries = with_kv_lock(&stores.kv, "offload-report", |kv| kv.cache_ids());
+        for slice in entries.chunks(REPORT_SLICE) {
+            runs.extend(with_kv_lock(&stores.kv, "offload-report", |kv| {
+                kv.cached_runs_of(slice)
+            }));
+        }
     }
     runs
 }

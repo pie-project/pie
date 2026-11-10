@@ -72,6 +72,7 @@ impl Shell {
             rows,
             held_pages: 0,
         };
+        let hybrid = self.has_state();
         let mut shapes: Vec<Vec<Want>> = Vec::new();
         let mut pages = pad.rung(pad.page_floor).min(cap);
         while pages <= cap {
@@ -88,14 +89,44 @@ impl Shell {
             }
             pages = pad.next(pages);
         }
+        // A prefill pads its lanes to 16, 32 or 64 by its rows (`canonical_pads`),
+        // or to 16 where the load holds fewer lanes than that: one lane at
+        // every rung and every lane count its rows can take there.
+        let max_lanes = self.budgets.tokens.max_lanes;
+        let mut prev = 0;
+        for &b in buckets.iter().filter(|&&b| b <= widest) {
+            for (w, lo, hi) in [
+                (pad.mixed_host_rung, 2, 480),
+                (32, 481, 960),
+                (64, 961, u32::MAX),
+            ] {
+                let w = if w <= max_lanes {
+                    w
+                } else {
+                    pad.mixed_host_rung
+                };
+                let rows = (b + 1).saturating_sub(w).min(hi);
+                if b >= 64 && w <= max_lanes && rows >= lo && rows + w > prev + 1 {
+                    shapes.push(vec![fresh(prefill, rows)]);
+                }
+            }
+            prev = b;
+        }
         for &b in buckets
             .iter()
             .filter(|&&b| (pad.prefill_floor.max(2)..=widest).contains(&b))
         {
             shapes.push(vec![fresh(prefill, b)]);
             shapes.push(vec![fresh(prefill, b - 1)]);
-            for n in [4u32, 8] {
-                if b >= 64 && n <= lanes_cap {
+            for n in [4u32, 8, 16, 32, 64] {
+                // A hybrid's prompts, cut at their last whole page, fire many
+                // and short.
+                let shown = if hybrid {
+                    b / n >= 2
+                } else {
+                    n <= 8 && b >= 64
+                };
+                if shown && n <= lanes_cap {
                     // `n - 1` lanes and the padding lane the rest takes (two
                     // or three lanes pad to four).
                     shapes.push(vec![fresh(prefill, b / n); (n - 1) as usize]);
@@ -107,8 +138,11 @@ impl Shell {
         // padding rung, which a full fire's decode pads overflow into.
         let host = pad.mixed_host_rung;
         let top = *buckets.last().unwrap_or(&widest);
+        // A hybrid fires a prompt's tail behind its last whole page beside
+        // the decodes: its mixed fires take every row rung.
+        let least = if hybrid { pad.prefill_floor } else { 256 };
         for &d in buckets.iter().filter(|&&d| d <= lanes_cap) {
-            for &b in buckets.iter().filter(|&&b| b >= 256 && b >= 2 * d) {
+            for &b in buckets.iter().filter(|&&b| b >= least && b >= 2 * d) {
                 let rows = if b == top {
                     // A full fire: the runtime's widest rows, decodes and all.
                     widest.saturating_sub(d)
@@ -121,6 +155,21 @@ impl Shell {
                 let mut lanes = vec![fresh(decode, 1); d as usize];
                 lanes.push(fresh(prefill, rows));
                 shapes.push(lanes);
+                // A fire this wide holds many prompts beside its decodes: their
+                // lanes pad to 32 or 64 (v6e gpt-oss c256 at 4096-row fires:
+                // 27 prompts and a decode compiled mid-run, twice, 48 s).
+                // (From 4096-row fires: what a narrower fire's short prompts
+                // take compiles on demand.)
+                if b >= widest && widest >= 4096 {
+                    for n in [17u32, 33] {
+                        let each = rows / n;
+                        if each >= 2 && d + 2 * n <= self.budgets.tokens.max_lanes {
+                            let mut lanes = vec![fresh(decode, 1); d as usize];
+                            lanes.extend(std::iter::repeat_n(fresh(prefill, each), n as usize));
+                            shapes.push(lanes);
+                        }
+                    }
+                }
             }
         }
         let started = std::time::Instant::now();
@@ -180,11 +229,32 @@ impl Shell {
             });
             index.push(at);
         }
-        // Each compile holds its program's whole HLO and compile state in
-        // host memory: at most 8 at once.
+        // A compile's scratch is ~0.55 GiB a MiB of its text (v5e, Qwen3.6-
+        // 35B-A3B's 9 MiB pf256 programs: 5 GB each; eight v6e ones 108 GB
+        // at once): one is admitted while the host's free memory holds 0.75
+        // GiB a MiB for it and for every compile still running (one that
+        // started may not have taken its memory yet). A v5e host's 47 GB
+        // stopped answering at four started together.
+        let longest = texts.iter().map(|(t, _)| t.len() as u64).max().unwrap_or(0);
+        let need = (longest * 3) << 8;
+        // A compiled program held in host memory costs ~64 bytes a byte of its
+        // text (0.5 GB a 9 MiB program; 65 of them 42 GB of a v5e host's 47),
+        // and libtpu's allocator keeps what a dropped one freed for its own
+        // next use, giving the host none back: what the ladder holds is
+        // budgeted up front, the free memory less two compiles' room, in
+        // ladder order. The rest are parked: compiled onto the disk cache (not
+        // held) where they are not there yet, loaded (~1 s, never compiled) by
+        // the first fire that takes their shape.
+        let budget = available_memory().map_or(u64::MAX, |b| b.saturating_sub(2 * need));
+        let held = std::sync::atomic::AtomicU64::new(0);
+        let parked = std::sync::atomic::AtomicUsize::new(0);
+        let running = std::sync::atomic::AtomicUsize::new(0);
+        let admit = std::sync::Mutex::new(());
+        let room = available_memory().map_or(8, |b| b / need.max(1)) as usize;
         let threads = std::thread::available_parallelism()
             .map_or(1, |n| n.get())
             .min(8)
+            .min(room)
             .clamp(1, texts.len().max(1));
         let next = std::sync::atomic::AtomicUsize::new(0);
         let device = &self.device;
@@ -194,6 +264,7 @@ impl Shell {
             (0..texts.len())
                 .map(|_| std::sync::Mutex::new(None))
                 .collect();
+        use std::sync::atomic::Ordering::SeqCst;
         std::thread::scope(|scope| {
             for _ in 0..threads {
                 scope.spawn(|| {
@@ -202,9 +273,47 @@ impl Shell {
                         let Some((text, sig)) = texts.get(at) else {
                             break;
                         };
+                        let hold = (text.len() as u64) << 6;
+                        let kept = held
+                            .fetch_update(SeqCst, SeqCst, |h| {
+                                (h + hold <= budget).then_some(h + hold)
+                            })
+                            .is_ok();
+                        if !kept {
+                            parked.fetch_add(1, SeqCst);
+                            if device.on_disk(text) {
+                                continue;
+                            }
+                        }
+                        // Admitted one at a time: a compile in flight may
+                        // not have taken its memory yet, so each counts as
+                        // still to come.
+                        loop {
+                            let turn = admit.lock().expect("the warm admission lock poisoned");
+                            let busy = running.load(SeqCst) as u64;
+                            if busy == 0
+                                || available_memory().is_none_or(|b| b >= need * (busy + 1))
+                            {
+                                running.fetch_add(1, SeqCst);
+                                break;
+                            }
+                            drop(turn);
+                            std::thread::sleep(std::time::Duration::from_millis(200));
+                        }
                         let program = device.program(text, (*sig).clone());
-                        if let Ok(mut slot) = slots[at].lock() {
-                            *slot = Some(program);
+                        running.fetch_sub(1, SeqCst);
+                        if kept {
+                            if let Ok(mut slot) = slots[at].lock() {
+                                *slot = Some(program);
+                            }
+                        } else {
+                            drop(program);
+                            device.forget(text);
+                        }
+                        #[cfg(target_os = "linux")]
+                        // SAFETY: `malloc_trim` only releases free heap pages.
+                        unsafe {
+                            libc::malloc_trim(0);
                         }
                     }
                 });
@@ -212,6 +321,14 @@ impl Shell {
         });
         for (at, slot) in slots.into_iter().enumerate() {
             programs[at] = slot.into_inner().ok().flatten();
+        }
+        let parked = parked.load(SeqCst);
+        if parked > 0 {
+            tracing::warn!(
+                parked,
+                held_gib = held.load(SeqCst) >> 30,
+                "xla warm ladder parked programs on disk: the host's memory holds no more"
+            );
         }
         // The compiles' scratch is freed by now: hand it back rather than
         // keep it in the allocator's arenas. glibc's call; the other libcs
@@ -308,4 +425,13 @@ impl Shell {
 /// token lands in the last slot of its `p`-th page; a fresh lane holds none.
 fn held_of(want: &Want, page_size: u32) -> u32 {
     (want.held_pages * page_size).saturating_sub(want.rows.min(1))
+}
+
+/// The host memory free for new allocations (`MemAvailable`), where the host
+/// says.
+fn available_memory() -> Option<u64> {
+    let info = std::fs::read_to_string("/proc/meminfo").ok()?;
+    let line = info.lines().find(|l| l.starts_with("MemAvailable:"))?;
+    let kib: u64 = line.split_whitespace().nth(1)?.parse().ok()?;
+    Some(kib << 10)
 }

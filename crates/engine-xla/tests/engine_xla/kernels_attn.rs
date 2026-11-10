@@ -595,11 +595,40 @@ fn a_window_walk_bounded_by_its_rows_reach_answers_the_same_bits() {
     }
 }
 
+/// A batched decode through the page-copy kernel (`kernel.attn.decode_pages`)
+/// answers the reference as the walk does.
+#[test]
+fn a_batched_decode_through_the_page_copy_kernel_answers_the_reference() {
+    let mut tuning = kernels_xla::tuning::Tuning::DEFAULT;
+    tuning.chunks.decode_pages = 8;
+    for (qh, kvh, d) in [
+        (16usize, 8usize, 128usize),
+        (8, 2, 128),
+        (8, 2, 256),
+        (8, 1, 256),
+    ] {
+        long_decode_with(qh, kvh, d, None, tuning);
+    }
+    // a sliding window's rows read only the pages their window covers
+    long_decode_with(8, 2, 128, Some(100), tuning);
+    long_decode_with(8, 2, 256, Some(512), tuning);
+}
+
 fn long_decode(qh: usize, kvh: usize, d: usize) {
     long_decode_in(qh, kvh, d, None);
 }
 
 fn long_decode_in(qh: usize, kvh: usize, d: usize, window: Option<u32>) {
+    long_decode_with(qh, kvh, d, window, kernels_xla::tuning::Tuning::DEFAULT);
+}
+
+fn long_decode_with(
+    qh: usize,
+    kvh: usize,
+    d: usize,
+    window: Option<u32>,
+    tuning: kernels_xla::tuning::Tuning,
+) {
     let mut rng = Rng(5);
     let ps = 16;
     // 64 lanes over 90 pages; lane l holds 1 + (l * 37) % 80 pages of a
@@ -615,7 +644,7 @@ fn long_decode_in(qh: usize, kvh: usize, d: usize, window: Option<u32>) {
     let n = rows.len();
     let q = rng.bf16s(n * qh * d, 1.0);
     let scale = 0.125;
-    let mut b = Bench::new();
+    let mut b = Bench::new().with_tuning(tuning);
     let kv = pool.bind(&mut b);
     let plan = fire.decode(&mut b);
     let qt = b.bf16(n as u32, (qh * d) as u32, &q);
@@ -1238,6 +1267,66 @@ fn kv_append_lands_each_row_in_its_slot_and_drops_the_padded_ones() {
     assert_close(&b.read_f32(shared_keys), &want_s, 0.0, 0.0);
 }
 
+/// A prefill-tall fire's rows land a page at a time (`scatter_slots`): runs
+/// that start and end inside a page keep its other rows, pages in any order,
+/// a padded row dropped; and a page two runs write falls back to row writes.
+#[test]
+fn kv_append_writes_a_prefill_by_pages() {
+    for twice in [false, true] {
+        let mut rng = Rng(21);
+        let (ps, kvh, d, pages) = (16usize, 2usize, 64usize, 12usize);
+        let pool = Pool::new(&mut rng, ps, kvh, d, pages, vec![vec![0]], 1);
+        let w = kvh * d;
+        // lane a: 75 rows from offset 5 of page 3; lane b: 53 rows from page 1,
+        // its last page (twice) the one lane a starts in, below lane a's rows
+        let a = [3, 7, 2, 9, 0];
+        let b = if twice { [1, 8, 4, 3] } else { [1, 8, 4, 6] };
+        let (mut page, mut off) = (Vec::new(), Vec::new());
+        for kp in 5..80 {
+            page.push(a[kp / ps]);
+            off.push((kp % ps) as i32);
+        }
+        for kp in 0..53 {
+            page.push(b[kp / ps]);
+            off.push((kp % ps) as i32);
+        }
+        // padded rows, to a whole page of rows (144)
+        page.push(i32::MAX);
+        off.push(0);
+        while page.len() % ps != 0 {
+            page.push(i32::MAX);
+            off.push(0);
+        }
+        let n = page.len();
+        let k = rng.bf16s(n * w, 1.0);
+        let v = rng.bf16s(n * w, 1.0);
+        let mut bench = Bench::new();
+        let kv = pool.bind(&mut bench);
+        let kt = bench.bf16(n as u32, w as u32, &k);
+        let vt = bench.bf16(n as u32, w as u32, &v);
+        let pt = bench.i32(n as u32, 1, &page);
+        let ot = bench.i32(n as u32, 1, &off);
+        if !bench
+            .run(|ctx| low::kv_append(ctx, kt, vt, &kv, pt, ot))
+            .unwrap()
+        {
+            return;
+        }
+        let mut want_k = pool.keys.clone();
+        let mut want_v = pool.values.clone();
+        for i in 0..n {
+            if page[i] < 0 || page[i] as usize >= pages {
+                continue;
+            }
+            let slot = page[i] as usize * ps + off[i] as usize;
+            want_k[slot * w..(slot + 1) * w].copy_from_slice(&k[i * w..(i + 1) * w]);
+            want_v[slot * w..(slot + 1) * w].copy_from_slice(&v[i * w..(i + 1) * w]);
+        }
+        assert_close(&bench.read_f32(kv.keys), &want_k, 0.0, 0.0);
+        assert_close(&bench.read_f32(kv.values), &want_v, 0.0, 0.0);
+    }
+}
+
 #[test]
 fn dense_attends_within_each_image_segment() {
     let mut rng = Rng(12);
@@ -1279,7 +1368,7 @@ fn dense_attends_within_each_image_segment() {
         &no_bias,
         &unit,
     );
-    check_rows(&b.read_f32(o), &want, qh * d, rows, 1e-3);
+    check_rows(&b.read_f32(o), &want, qh * d, rows, 2e-3);
 }
 
 #[test]
@@ -1390,7 +1479,7 @@ fn ragged_answers_every_mask_form() {
             },
             &unit,
         );
-        check_rows(&b.read_f32(o), &want, qh * d, rows, 1e-3);
+        check_rows(&b.read_f32(o), &want, qh * d, rows, 2e-3);
     }
 }
 

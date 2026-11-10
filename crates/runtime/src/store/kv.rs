@@ -116,6 +116,9 @@ pub struct KvStore {
     flat: HashMap<WorkingSetId, Option<Vec<PhysicalKvPageId>>>,
     domain: Hash256,
     cache: HashMap<u64, KeptEntry>,
+    /// The cache's entries by the node their last pages are in: an attach
+    /// ages the entries on its own path, not every entry.
+    by_owner: HashMap<NodeId, Vec<u64>>,
     /// Entries already split at a step, by the entry and the pages kept.
     splits: HashSet<(u64, u64)>,
     owners: HashMap<ProcessId, usize>,
@@ -133,6 +136,9 @@ pub struct KvStore {
     /// (`persist-prefix-tokens`, `persist-system`): told to the cluster with
     /// the runs it leaves, until it owns none.
     hints: HashMap<ProcessId, u64>,
+    /// The last count of reclaimable cache pages, when it was taken and what
+    /// the walk took: see [`Self::reclaimable_cache_pages`].
+    reclaimable: std::cell::Cell<Option<(Instant, std::time::Duration, u32)>>,
 }
 
 /// A persistent disk tier: a copy on disk of sealed pages, by key. A page
@@ -301,6 +307,7 @@ impl KvStore {
             flat: HashMap::new(),
             domain: hash::cache_domain(&seed),
             cache: HashMap::new(),
+            by_owner: HashMap::new(),
             splits: HashSet::new(),
             owners: HashMap::new(),
             keeps: false,
@@ -312,6 +319,7 @@ impl KvStore {
             moved: Arc::new(tokio::sync::Notify::new()),
             persisted: None,
             hints: HashMap::new(),
+            reclaimable: std::cell::Cell::new(None),
         }
     }
 
@@ -555,6 +563,7 @@ impl KvStore {
         let mut freed = 0;
         for key in keys {
             if let Some(entry) = self.cache.remove(&key) {
+                self.unlist(key, entry.path.terminal);
                 self.splits.retain(|&(split, _)| split != key);
                 self.disown(&entry, by);
                 freed += self.release_entry(entry, epoch);
@@ -572,7 +581,13 @@ impl KvStore {
         self.split_at_steps(&keys);
         self.split_persisted();
         let mut freed = 0;
+        let ordering = Instant::now();
         let mut groups = self.reclaim_order(&keys);
+        // The order walks every cached entry under the lock every guest's
+        // fire waits on: one that took long frees more for what it took, up
+        // to eight times the step.
+        let steps = (ordering.elapsed().as_micros() / 4_000).clamp(1, 8) as usize;
+        let want = (self.pool.capacity() as usize / 64).max(1) * steps;
         'passes: for last in [false, true] {
             let mut later = Vec::new();
             for (key, ids) in std::mem::take(&mut groups) {
@@ -589,7 +604,7 @@ impl KvStore {
                         .collect();
                     freed += self.drop_entries(ids, By::Host, epoch);
                 }
-                if freed >= (self.pool.capacity() as usize / 64).max(1) {
+                if freed >= want {
                     break 'passes;
                 }
             }
@@ -719,6 +734,7 @@ impl KvStore {
                 *self.owners.entry(owner).or_insert(0) += 1;
             }
             self.kept += 1;
+            self.list(self.kept, path.terminal);
             self.cache.insert(self.kept, KeptEntry { path, ..entry });
         }
     }
@@ -872,10 +888,20 @@ impl KvStore {
 
     /// Each cache entry's pages by key, from token 0: the runs this worker
     /// can give whole.
+    #[cfg(test)]
     pub fn cached_runs(&self) -> Vec<Vec<Hash256>> {
-        self.cache
-            .values()
-            .filter_map(|entry| {
+        self.cached_runs_of(&self.cache_ids())
+    }
+
+    pub fn cache_ids(&self) -> Vec<u64> {
+        self.cache.keys().copied().collect()
+    }
+
+    /// [`Self::cached_runs`] of the entries of `ids` still here.
+    pub fn cached_runs_of(&self, ids: &[u64]) -> Vec<Vec<Hash256>> {
+        ids.iter()
+            .filter_map(|id| {
+                let entry = self.cache.get(id)?;
                 let mut keys = self.table.path_keys(entry.path.terminal)?;
                 keys.truncate(entry.path.pages as usize);
                 (!keys.is_empty()).then_some(keys)
@@ -883,9 +909,13 @@ impl KvStore {
             .collect()
     }
 
-    /// Every sealed page's key here, on any tier.
-    pub fn sealed_key_list(&self) -> Vec<Hash256> {
-        self.table.sealed_key_list()
+    pub fn node_ids(&self) -> Vec<NodeId> {
+        self.table.node_ids()
+    }
+
+    /// Every sealed page's key in the nodes of `ids` still here, on any tier.
+    pub fn sealed_key_list(&self, ids: &[NodeId]) -> Vec<Hash256> {
+        self.table.sealed_key_list(ids)
     }
 
     /// Host slots to land pages in that come from another worker; given
@@ -971,6 +1001,7 @@ impl KvStore {
         // grafted below as well as its own.
         let pages = self.table.path_len(node);
         self.kept += 1;
+        self.list(self.kept, node);
         tracing::debug!(target: "pie::kv", pages, "imported");
         self.cache.insert(
             self.kept,
@@ -1172,6 +1203,7 @@ impl KvStore {
             *self.owners.entry(owner).or_insert(0) += 1;
         }
         self.kept += 1;
+        self.list(self.kept, path.terminal);
         tracing::debug!(target: "pie::kv", pages, decoded, "kept");
         if let Some(owner) = owner {
             crate::policy::report(Event::Kept(owner, pages * u64::from(self.page_size)));
@@ -1325,15 +1357,36 @@ impl KvStore {
         // The cache's entries that were used whole go last; one that holds
         // more than was used ages by what it holds alone.
         let now = Instant::now();
-        for entry in self.cache.values_mut() {
-            if self
-                .table
-                .within(entry.path.terminal, last, run.len() as u64)
-            {
-                entry.last_use = now;
+        for node in self.table.lineage(last.node) {
+            for id in self.by_owner.get(&node).into_iter().flatten() {
+                if let Some(entry) = self.cache.get_mut(id)
+                    && self
+                        .table
+                        .within(entry.path.terminal, last, run.len() as u64)
+                {
+                    entry.last_use = now;
+                }
             }
         }
         Ok(pages)
+    }
+
+    fn list(&mut self, id: u64, terminal: NodeId) {
+        if let Some(owner) = self.table.path_owner(terminal) {
+            self.by_owner.entry(owner).or_default().push(id);
+        }
+    }
+
+    fn unlist(&mut self, id: u64, terminal: NodeId) {
+        let Some(owner) = self.table.path_owner(terminal) else {
+            return;
+        };
+        if let Some(ids) = self.by_owner.get_mut(&owner) {
+            ids.retain(|listed| *listed != id);
+            if ids.is_empty() {
+                self.by_owner.remove(&owner);
+            }
+        }
     }
 
     fn recycle_backings(&mut self, backings: Vec<KvPageBacking>, epoch: u64) {
@@ -1763,8 +1816,20 @@ impl KvStore {
         Ok(self.table.page_token_hashes(ws, index)?)
     }
 
+    /// Counting walks every cache root and every live reader under the lock
+    /// every guest's fire waits on, and the planner, the governor's tick and
+    /// the census each ask: a count stands a second, or fifty times what its
+    /// walk took when that is longer.
     pub fn reclaimable_cache_pages(&self) -> u32 {
-        self.table.unused_cache_lease_pages()
+        if let Some((at, took, pages)) = self.reclaimable.get()
+            && at.elapsed() < std::time::Duration::from_secs(1).max(took * 50)
+        {
+            return pages;
+        }
+        let began = Instant::now();
+        let pages = self.table.unused_cache_lease_pages();
+        self.reclaimable.set(Some((began, began.elapsed(), pages)));
+        pages
     }
 
     pub fn reclaim_quotes(

@@ -225,6 +225,8 @@ struct State {
     current: BTreeMap<u32, Val>,
     params: Vec<(u32, Source)>,
     written: BTreeMap<u32, ()>,
+    /// A root's per-head sums of squares, landed with its current value.
+    sums: BTreeMap<u32, Val>,
 }
 
 impl<'h> Tracer<'h> {
@@ -239,6 +241,7 @@ impl<'h> Tracer<'h> {
                 current: BTreeMap::new(),
                 params: Vec::new(),
                 written: BTreeMap::new(),
+                sums: BTreeMap::new(),
             }),
         }
     }
@@ -246,6 +249,10 @@ impl<'h> Tracer<'h> {
     #[must_use]
     pub fn with_tuning(mut self, tuning: kernels_xla::tuning::Tuning) -> Self {
         self.tuning = tuning;
+        self.state
+            .borrow_mut()
+            .func
+            .set_rope_flat_rows(tuning.rope_flat_rows);
         self
     }
 
@@ -385,7 +392,11 @@ fn root_value(
         }
     } else if r.source.on_device() {
         params.push((root, r.source));
-        func.param(ty, None)
+        let p = func.param(ty, None);
+        if r.source.persistent() {
+            func.pin_row_major(p);
+        }
+        p
     } else {
         func.const_i(ty.elem, 0, &ty.dims)
     };
@@ -401,6 +412,15 @@ struct Lens<'a> {
     current: &'a mut BTreeMap<u32, Val>,
     params: &'a mut Vec<(u32, Source)>,
     written: &'a mut BTreeMap<u32, ()>,
+    sums: &'a mut BTreeMap<u32, Val>,
+}
+
+impl Lens<'_> {
+    /// The root `t` is the whole of.
+    fn whole(&self, t: Tensor) -> Option<u32> {
+        let (root, offset) = self.handles.locate(t.buf)?;
+        (offset == 0 && t.rows == self.handles.root_of(root).rows).then_some(root)
+    }
 }
 
 impl Env for Lens<'_> {
@@ -463,7 +483,18 @@ impl Env for Lens<'_> {
         };
         self.current.insert(root, next);
         self.written.insert(root, ());
+        self.sums.remove(&root);
         Ok(())
+    }
+
+    fn sums(&mut self, t: Tensor) -> Option<Val> {
+        self.sums.get(&self.whole(t)?).copied()
+    }
+
+    fn keep_sums(&mut self, t: Tensor, v: Val) {
+        if let Some(root) = self.whole(t) {
+            self.sums.insert(root, v);
+        }
     }
 }
 
@@ -516,6 +547,7 @@ impl Emit for Tracer<'_> {
             params,
             written,
             pack_len,
+            sums,
         } = &mut *state;
         let mut lens = Lens {
             handles: self.handles,
@@ -523,6 +555,7 @@ impl Emit for Tracer<'_> {
             current,
             params,
             written,
+            sums,
         };
         let mut cx = Cx::new(func, &mut lens).with_tuning(self.tuning);
         body(&mut cx)

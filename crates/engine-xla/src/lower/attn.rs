@@ -720,7 +720,10 @@ pub mod pool {
     pub fn lse(ctx: &Ctx<'_>, call: PoolLse, entries: KvPool) -> Result<(), Error> {
         lower(ctx, |l| {
             let (o, lse) = match call.try_map(&entries, |t| l.read(t))? {
-                Some((call_v, planes)) => pool::lse(l.f(), call_v, planes, &entries)?,
+                Some((call_v, planes)) => {
+                    let tuning = l.tuning();
+                    pool::lse(l.f(), call_v, planes, &entries, tuning)?
+                }
                 None => pool::nothing(l.f(), call.o.landing(), call.lse.landing()),
             };
             l.land(call.o, o)?;
@@ -884,6 +887,7 @@ pub mod pool {
         boundary_pos: Tensor,
         boundary_req: Tensor,
         into: &KvPool,
+        ratio: Option<u32>,
     ) -> Result<(), Error> {
         lower(ctx, |l| {
             let page_indices = l.read(into.page_indices)?;
@@ -892,7 +896,17 @@ pub mod pool {
             let breq = l.read(boundary_req)?;
             let e = l.read(entries)?;
             let keys = l.read(into.keys)?;
-            let y = pool::kv_append(l.f(), e, bpos, breq, page_indices, page_indptr, keys, into)?;
+            let y = pool::kv_append(
+                l.f(),
+                e,
+                bpos,
+                breq,
+                page_indices,
+                page_indptr,
+                keys,
+                into,
+                ratio,
+            )?;
             l.land(into.keys, y)
         })
     }

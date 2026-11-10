@@ -219,28 +219,55 @@ fn the_expanded_mla_prefill_lands_what_the_absorbed_one_does() {
     gpu.sync();
     let want: Vec<u16> = gpu.down(absorbed.ptr, tokens * HEADS * V);
 
-    for packed in [true, false] {
+    // The second request alone too, as a window of a fire's lanes holds it:
+    // its own pages of the table, counted from the entry they start at.
+    for (packed, lane) in [(true, 0), (false, 0), (true, 1), (false, 1)] {
+        let row0 = qo_indptr[lane] as usize;
+        let page0 = PAGE_INDPTR[lane] as u32;
+        let wide = |t: Tensor, at: usize| {
+            Tensor::new(
+                t.ptr + (at * t.width as usize * 2) as u64,
+                t.rows - at as u32,
+                t.width,
+                t.dtype,
+            )
+        };
+        let ints =
+            |t: Tensor, at: u32| Tensor::new(t.ptr + u64::from(at) * 4, t.rows - at, 1, Dtype::I32);
+        let bounds: Vec<i32> = qo_indptr[lane..].iter().map(|b| b - row0 as i32).collect();
+        let qo = Tensor::new(gpu.up(&bounds), bounds.len() as u32, 1, Dtype::I32);
+        let pool = KvPool {
+            page_indices: ints(pool.page_indices, page0),
+            page_indptr: ints(pool.page_indptr, lane as u32),
+            last_page_lens: ints(pool.last_page_lens, lane as u32),
+            ..pool
+        };
         let mut o = Tensor::new(
-            gpu.zeros(tokens * HEADS * V * 2),
-            rows,
+            gpu.zeros((tokens - row0) * HEADS * V * 2),
+            rows - row0 as u32,
             (HEADS * V) as u32,
             Dtype::Bf16,
         );
         let q = if packed {
-            ExpandedQ::Packed(q_b_t)
+            ExpandedQ::Packed(wide(q_b_t, row0))
         } else {
-            ExpandedQ::Split { q_nope, q_pe }
+            ExpandedQ::Split {
+                q_nope: wide(q_nope, row0),
+                q_pe: wide(q_pe, row0),
+            }
         };
-        let took = mla::expand::prefill_expanded(&ctx, q, qo, &pool, kv_b_t, h, sm_scale, &mut o)
-            .expect("fires");
+        let took =
+            mla::expand::prefill_expanded(&ctx, q, qo, &pool, page0, kv_b_t, h, sm_scale, &mut o)
+                .expect("fires");
         assert!(took, "the expanded prefill takes the fire");
         gpu.sync();
-        let got: Vec<u16> = gpu.down(o.ptr, tokens * HEADS * V);
+        let got: Vec<u16> = gpu.down(o.ptr, (tokens - row0) * HEADS * V);
+        let want = &want[row0 * HEADS * V..];
         let scale = want.iter().map(|w| from_bf16(*w).abs()).sum::<f32>() / want.len() as f32;
         let mut worst = 0f32;
         let mut total = 0f32;
         let mut at = 0usize;
-        for (i, (g, w)) in got.iter().zip(&want).enumerate() {
+        for (i, (g, w)) in got.iter().zip(want).enumerate() {
             let (g, w) = (from_bf16(*g), from_bf16(*w));
             let err = (g - w).abs();
             total += err;
@@ -251,7 +278,7 @@ fn the_expanded_mla_prefill_lands_what_the_absorbed_one_does() {
         }
         let mean = total / want.len() as f32;
         eprintln!(
-            "packed {packed}: mean error {mean}, worst {worst} at row {} head {}, mean magnitude {scale}",
+            "packed {packed} from lane {lane}: mean error {mean}, worst {worst} at row {} head {}, mean magnitude {scale}",
             at / (HEADS * V),
             (at / V) % HEADS
         );
@@ -260,7 +287,7 @@ fn the_expanded_mla_prefill_lands_what_the_absorbed_one_does() {
         // lands that key's value row nearly whole.
         assert!(
             mean <= 0.01 * scale && worst <= 0.15 * scale,
-            "packed {packed}: the expanded prefill sits {mean} on average and {worst} at worst \
+            "packed {packed} from lane {lane}: the expanded prefill sits {mean} on average and {worst} at worst \
              from the absorbed one (mean magnitude {scale})"
         );
     }

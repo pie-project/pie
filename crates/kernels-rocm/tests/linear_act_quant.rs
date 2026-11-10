@@ -191,12 +191,21 @@ fn run_fp8b_on(m: usize, n: usize, k: usize, tile_holds: bool, side: usize, lane
             )
             .unwrap();
         }
+        let (cdna4, weight) = (mfma_truncates(), &w);
         for (i, (g, w)) in gpu.read(&y).iter().zip(&want).enumerate() {
+            let (r, c) = (i / n, i % n);
+            let (err, strict) = ((g - w).abs(), w.abs() * 2f32.powi(-8) + 1e-5 * big);
             assert!(
-                (g - w).abs() <= w.abs() * 2f32.powi(-8) + 1e-5 * big,
-                "fp8b32 lanes m{m} n{n} k{k}: [{}, {}] is {g}, the quantized dot {w}",
-                i / n,
-                i % n
+                err <= strict
+                    || (cdna4
+                        && f64::from(err)
+                            <= f64::from(strict)
+                                + mfma_slack(
+                                    k,
+                                    |j| f64::from(xq[r * k + j]),
+                                    |j| f64::from(weight(c, j)),
+                                )),
+                "fp8b32 lanes m{m} n{n} k{k}: [{r}, {c}] is {g}, the quantized dot {w}",
             );
         }
         return;
@@ -282,6 +291,61 @@ fn tile_planes(count: usize, blocks: usize, seed: u32) -> (Vec<u8>, Vec<f32>) {
         .map(|_| 1e-3 + (next() % 10_000) as f32 * 7.31e-7)
         .collect();
     (codes, factors)
+}
+
+/// Whether the device's FP8 matrix core is CDNA4's (gfx950), which does not
+/// sum its products exactly. A probe on an MI350X, B all 1.0 and a row of A
+/// one large code beside 31 small ones (v_mfma_f32_16x16x32_fp8_fp8 and
+/// v_mfma_scale_f32_16x16x128_f8f6f4 alike): 448 + 31 x 2^-9 came back
+/// 448.046875 (-0.0137, 7 x 2^-9 lost) and 448 + 31 x 2^-6 448.375 (-0.109,
+/// 7 x 2^-6), the seven small products in the large one's run of eight k
+/// codes (one lane's operand) truncated toward zero and the other 24 kept;
+/// 448 + 31 x 2^-4, 1 ± 31 x 2^-9 and C = 1000 ± 31 x 2^-9 came back exact.
+/// gfx942 sums exactly, and its tolerances stay strict.
+fn mfma_truncates() -> bool {
+    kernels_rocm::jit::cache::arch(0).is_some_and(|arch| arch.starts_with("gfx95"))
+}
+
+/// What CDNA4's FP8 matrix core may drop from one output's dot: each run of
+/// eight k codes from 0 (every FP8 tile hands the core one lane's eight)
+/// sums aligned to its largest, a product's bits under 2^-12 of that gone (13
+/// kept: 2^-4 survives beside 448, 2^-6 does not). Taken over the run's
+/// largest `x` times its largest `w` (the alignment may follow the operands'
+/// exponents rather than the largest product), each of the eight products
+/// loses under 2^-12 of it, so a run under 2^-9 of it. `x(j)` and `w(j)` as
+/// scaled when summed (a run lies under one scale).
+fn mfma_slack(k: usize, x: impl Fn(usize) -> f64, w: impl Fn(usize) -> f64) -> f64 {
+    (0..k)
+        .step_by(8)
+        .map(|j0| {
+            let run = j0..(j0 + 8).min(k);
+            let mx = run.clone().map(|j| x(j).abs()).fold(0f64, f64::max);
+            let mw = run.map(|j| w(j).abs()).fold(0f64, f64::max);
+            mx * mw
+        })
+        .sum::<f64>()
+        * 2f64.powi(-9)
+}
+
+/// `mfma_slack` of `tile_dot`'s products.
+fn tile_slack(
+    codes: &[u8],
+    factors: &[f32],
+    k: usize,
+    xq: &[f32],
+    xs: Option<&[f32]>,
+    r: usize,
+    tall: usize,
+) -> f64 {
+    let kb = k.div_ceil(128);
+    let scale = |j: usize| {
+        f64::from(factors[(r / tall) * kb + j / 128]) * xs.map_or(1.0, |xs| f64::from(xs[j / 128]))
+    };
+    mfma_slack(
+        k,
+        |j| f64::from(xq[j]) * scale(j),
+        |j| f64::from(e4m3_value(codes[r * k + j])),
+    )
 }
 
 /// Row `r` of a `[n, k]` e4m3tile128 weight's block-summed dot with `xq`'s
@@ -402,12 +466,25 @@ fn run_fp8_mfma_tuned(m: usize, n: usize, k: usize, edge_codes: bool, tall: usiz
     .unwrap();
     let got = gpu.read(&y);
     let big = want.iter().fold(0f32, |a, v| a.max(v.abs()));
+    let cdna4 = mfma_truncates();
     for (i, (g, w)) in got.iter().zip(&want).enumerate() {
+        let (r, c) = (i / n, i % n);
+        let (err, strict) = ((g - w).abs(), w.abs() * 2f32.powi(-8) + 1e-5 * big);
         assert!(
-            (g - w).abs() <= w.abs() * 2f32.powi(-8) + 1e-5 * big,
-            "fp8 mfma m{m} n{n} k{k}: [{}, {}] is {g}, the block-summed dot {w}",
-            i / n,
-            i % n
+            err <= strict
+                || (cdna4
+                    && f64::from(err)
+                        <= f64::from(strict)
+                            + tile_slack(
+                                &codes,
+                                &factors,
+                                k,
+                                &xq[r * k..(r + 1) * k],
+                                Some(&xs[r * kb..(r + 1) * kb]),
+                                c,
+                                tall,
+                            )),
+            "fp8 mfma m{m} n{n} k{k}: [{r}, {c}] is {g}, the block-summed dot {w}",
         );
     }
 }
@@ -509,12 +586,26 @@ fn an_fp8_bank_on_the_matrix_core_folds_each_route() {
                 v
             })
             .collect();
+        let cdna4 = mfma_truncates();
         for (i, (g, w)) in got.iter().zip(&want).enumerate() {
+            let (route, c) = (i / n, i % n);
+            let (e, t) = (routes[route] as usize, route / top_k);
+            let (err, strict) = ((g - w).abs(), w.abs() * 2f32.powi(-8) + 1e-5 * big);
             assert!(
-                (g - w).abs() <= w.abs() * 2f32.powi(-8) + 1e-5 * big,
-                "fp8 mfma bank t{tokens} k{top_k} {n}x{k}: route {} column {} is {g}, the block-summed dot {w}",
-                i / n,
-                i % n
+                err <= strict
+                    || (cdna4
+                        && f64::from(err)
+                            <= f64::from(strict)
+                                + tile_slack(
+                                    &codes[e * n * k..(e + 1) * n * k],
+                                    &factors[e * nb * kb..(e + 1) * nb * kb],
+                                    k,
+                                    &host[t * k..(t + 1) * k],
+                                    Some(&host_s[t * kb..(t + 1) * kb]),
+                                    c,
+                                    128,
+                                )),
+                "fp8 mfma bank t{tokens} k{top_k} {n}x{k}: route {route} column {c} is {g}, the block-summed dot {w}",
             );
         }
     }

@@ -50,6 +50,17 @@ pub struct MoeLoopTileMax(pub u32);
 #[decision(id = "kernel.moe.gmm_tm", constant(set(16, 32, 64, 128)), default = 16, tune = search)]
 pub struct MoeGmmTm(pub u32);
 
+/// Row tiles one grid step of the grouped-matmul kernel takes, all of one
+/// expert's run, through one dot (a dense bank's routed MLP): the MXU loads
+/// each weight tile once for them all, and the steps' overhead is paid once
+/// (v6e, a 2048-token fire of Qwen3.6-35B-A3B's 32-expert cut: its gate-up
+/// 213 -> 147 us, its down 139 -> 89). 1 takes a step a tile (a v5e's
+/// 128-wide MXU loses by it: Gemma-4-26B-A4B's 1792-row routed MLP 2.7 ->
+/// 3.3 ms).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Decision)]
+#[decision(id = "kernel.moe.gmm_run", constant(set(1, 2, 4, 8)), default = 1, tune = search)]
+pub struct MoeGmmRun(pub u32);
+
 /// Weight bytes one block of the grouped-matmul kernel holds, in MiB (two
 /// are in flight, plus a bf16 copy): bigger blocks take fewer DMA steps and
 /// more VMEM.
@@ -86,6 +97,8 @@ moe_costs! {
         "The rate one dot over the whole bank streams at, in bytes a ns.";
     MoeWholePartialFs = "kernel.moe.cost.whole_partial_fs", 0..=1_000_000, 5_500,
         "What each picked partial of that dot adds, in fs.";
+    MoeOnehotMi = "kernel.moe.cost.onehot_mi", 0..=4096, 64,
+        "Up to this many Mi cells of sorted rows by tokens, a routed MLP sums each token's rows by one dot against them, one-hot; past it, it picks them out.";
 }
 
 /// How a quantized projection's rows meet its group factors.
@@ -110,6 +123,14 @@ pub enum QuantDecode {
     Dense,
 }
 
+/// From this many rows, a rope over heads narrower than a lane tile turns the
+/// row as it lies (`elemwise::rope::turn_flat`); 0 never does. A v6e gains
+/// (gpt-oss 4096-row prefill: 125.5 -> 123.4 ms a fire); a v5e loses
+/// (1792 rows: 65.5 -> 67.6 ms).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Decision)]
+#[decision(id = "kernel.rope.flat_rows", constant(set(0, 1024, 2048, 4096)), default = 0, tune = search)]
+pub struct RopeFlatRows(pub u32);
+
 /// Up to this many rows per lane, an `auto` attention walk gathers each
 /// row's keys; past it, row blocks walk the key axis. 0 always blocks.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Decision)]
@@ -121,6 +142,12 @@ pub struct AttnPerRowMax(pub u32);
 #[decision(id = "kernel.attn.budget_mi", constant(range(1..=256)), default = 16, tune = search)]
 pub struct AttnBudgetMi(pub u32);
 
+/// From this many rows a decode reads its keys through the page-copy kernel
+/// (`attn::pages`) rather than the per-row walk. 0 never does.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Decision)]
+#[decision(id = "kernel.attn.decode_pages", constant(set(0, 1, 8, 16, 32, 64, 128)), default = 0, tune = search)]
+pub struct AttnDecodePages(pub u32);
+
 /// Query rows per block of the blocked attention walk.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Decision)]
 #[decision(id = "kernel.attn.block_rows", constant(set(128, 256, 512, 1024, 2048)), default = 512, tune = search)]
@@ -130,6 +157,14 @@ pub struct AttnBlockRows(pub u32);
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Decision)]
 #[decision(id = "kernel.attn.block_keys", constant(set(128, 256, 512, 1024, 2048)), default = 512, tune = search)]
 pub struct AttnBlockKeys(pub u32);
+
+/// The most row blocks of the blocked attention walk that run one after
+/// another in line rather than as a loop: in line, no block's result is
+/// written into a copy of the whole carried output, at a larger program
+/// (more host memory to compile).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Decision)]
+#[decision(id = "kernel.attn.unrolled_blocks", constant(range(1..=16)), default = 16, tune = search)]
+pub struct AttnUnrolledBlocks(pub u32);
 
 /// Tokens per chunk of the scalar-decay (GDN) chunked scan.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Decision)]
@@ -153,6 +188,7 @@ pub fn register(registry: &mut Registry) {
         .add::<MoeLoopUnroll>()
         .add::<MoeLoopTileMax>()
         .add::<MoeGmmTm>()
+        .add::<MoeGmmRun>()
         .add::<MoeGmmBlockMib>()
         .add::<MoeDenseAllMi>()
         .add::<MoeSliceMib>()
@@ -162,11 +198,15 @@ pub fn register(registry: &mut Registry) {
         .add::<MoeSliceBytesPerNs>()
         .add::<MoeWholeBytesPerNs>()
         .add::<MoeWholePartialFs>()
+        .add::<MoeOnehotMi>()
         .add::<QuantDecode>()
         .add::<AttnPerRowMax>()
         .add::<AttnBudgetMi>()
+        .add::<AttnDecodePages>()
         .add::<AttnBlockRows>()
+        .add::<RopeFlatRows>()
         .add::<AttnBlockKeys>()
+        .add::<AttnUnrolledBlocks>()
         .add::<SsmChunk>()
         .add::<SsmLongChunk>()
         .add::<SsmKdaChunk>();
@@ -182,6 +222,7 @@ pub struct MoeCosts {
     pub slice_bytes_per_ns: i64,
     pub whole_bytes_per_ns: i64,
     pub whole_partial_fs: i64,
+    pub onehot_cells: i64,
 }
 
 /// The most `rows · groups` of a packed bank and the most rows of a native
@@ -198,11 +239,16 @@ pub struct Chunks {
     pub budget: i64,
     pub block_rows: i64,
     pub block_keys: i64,
+    /// Row blocks run in line (see [`AttnUnrolledBlocks`]).
+    pub unrolled: i64,
     /// Whether a sliding-window decode walk stops after the last chunk any
     /// row admits a key in (`attn::paged`'s window walk). Always on from a
     /// profile; off walks every chunk of the window, as the walk did before
     /// the bound, which a test sets to check the bound changes no bit.
     pub window_reach: bool,
+    /// Rows from which a decode takes the page-copy kernel (see
+    /// [`AttnDecodePages`]).
+    pub decode_pages: i64,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -219,10 +265,12 @@ pub struct Tuning {
     pub moe_loop_unroll: i64,
     pub moe_loop_tile_max: i64,
     pub moe_gmm_tm: i64,
+    pub moe_gmm_run: i64,
     pub moe_gmm_block_bytes: i64,
     pub moe_costs: MoeCosts,
     pub grouped: Grouped,
     pub attn_per_row_max: i64,
+    pub rope_flat_rows: i64,
     pub chunks: Chunks,
     pub ssm: SsmChunks,
     pub vmem_bytes: i64,
@@ -237,6 +285,7 @@ impl Tuning {
         moe_loop_unroll: 2,
         moe_loop_tile_max: 128,
         moe_gmm_tm: 16,
+        moe_gmm_run: 1,
         moe_gmm_block_bytes: 12 << 20,
         moe_costs: MoeCosts {
             dense_all: 1 << 27,
@@ -247,17 +296,21 @@ impl Tuning {
             slice_bytes_per_ns: 1_200,
             whole_bytes_per_ns: 1_450,
             whole_partial_fs: 5_500,
+            onehot_cells: 64 << 20,
         },
         grouped: Grouped {
             max_cells: 2048,
             max_rows: 64,
         },
         attn_per_row_max: 2,
+        rope_flat_rows: 0,
         chunks: Chunks {
             budget: 1 << 24,
             block_rows: 512,
             block_keys: 512,
+            unrolled: 16,
             window_reach: true,
+            decode_pages: 0,
         },
         ssm: SsmChunks {
             chunk: 64,
@@ -275,6 +328,7 @@ impl Tuning {
             moe_loop_unroll: n(profile.get::<MoeLoopUnroll>().0),
             moe_loop_tile_max: n(profile.get::<MoeLoopTileMax>().0),
             moe_gmm_tm: n(profile.get::<MoeGmmTm>().0),
+            moe_gmm_run: n(profile.get::<MoeGmmRun>().0),
             moe_gmm_block_bytes: n(profile.get::<MoeGmmBlockMib>().0) << 20,
             moe_costs: MoeCosts {
                 dense_all: n(profile.get::<MoeDenseAllMi>().0) << 20,
@@ -285,6 +339,7 @@ impl Tuning {
                 slice_bytes_per_ns: n(profile.get::<MoeSliceBytesPerNs>().0),
                 whole_bytes_per_ns: n(profile.get::<MoeWholeBytesPerNs>().0),
                 whole_partial_fs: n(profile.get::<MoeWholePartialFs>().0),
+                onehot_cells: n(profile.get::<MoeOnehotMi>().0) << 20,
             },
             grouped: match *profile.get::<QuantDecode>() {
                 QuantDecode::Grouped {
@@ -300,11 +355,14 @@ impl Tuning {
                 },
             },
             attn_per_row_max: n(profile.get::<AttnPerRowMax>().0),
+            rope_flat_rows: n(profile.get::<RopeFlatRows>().0),
             chunks: Chunks {
                 budget: n(profile.get::<AttnBudgetMi>().0) << 20,
                 block_rows: n(profile.get::<AttnBlockRows>().0),
                 block_keys: n(profile.get::<AttnBlockKeys>().0),
+                unrolled: n(profile.get::<AttnUnrolledBlocks>().0),
                 window_reach: true,
+                decode_pages: n(profile.get::<AttnDecodePages>().0),
             },
             ssm: SsmChunks {
                 chunk: n(profile.get::<SsmChunk>().0),

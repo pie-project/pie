@@ -201,12 +201,31 @@ impl Device {
         self.zeros(dtype, rows, width).map(Some)
     }
 
+    /// A pool plane of zeros, row-major as every program that reads a pool
+    /// lays it (`Func::pin_row_major`); an upload lands a narrow plane
+    /// column-major.
     pub fn zeros(&self, dtype: Dtype, rows: u32, width: u32) -> Result<Buffer> {
         let ty = storage(dtype, rows, width).ok_or_else(|| Fault::Unbound {
             what: format!("a {dtype:?} plane, which has no storage form on this device"),
         })?;
-        let bytes = element_type(ty.elem).bytes(usize::try_from(ty.elements()).unwrap_or(0));
-        self.upload(dtype, rows, width, &vec![0u8; bytes])
+        let mut f = kernels_xla::hlo::Func::new("main");
+        let z = if ty.elem.is_float() {
+            f.const_f(ty.elem, 0.0, &ty.dims)
+        } else {
+            f.const_i(ty.elem, 0, &ty.dims)
+        };
+        f.pin_results_row_major();
+        let program = self.program(
+            &f.module("zeros", &[z]),
+            Signature {
+                params: Vec::new(),
+                results: vec![None],
+            },
+        )?;
+        let mut outs = self.run(&program, Vec::new(), true)?;
+        outs.pop().ok_or_else(|| Fault::Unbound {
+            what: "the zeros program's plane".into(),
+        })
     }
 
     /// The compiled form of `text`, from the cache or freshly built.
@@ -245,17 +264,11 @@ impl Device {
         }
         let client = self.client()?;
         let started = std::time::Instant::now();
-        let file = self.disk.as_ref().map(|dir| {
-            let mut h = blake3::Hasher::new();
-            h.update(text.as_bytes());
-            h.update(client.api().path().to_string_lossy().as_bytes());
-            let (major, minor) = client.api().version();
-            h.update(format!("{major}.{minor}|{}", self.kind).as_bytes());
-            dir.join(format!("{}.pjrt", h.finalize().to_hex()))
-        });
+        let file = self.cache_file(client, text);
         let cached = file
             .as_ref()
             .and_then(|f| std::fs::read(f).ok())
+            .and_then(unpacked)
             .and_then(|bytes| client.deserialize(&bytes).ok());
         let exe = match cached {
             Some(exe) => {
@@ -281,7 +294,7 @@ impl Device {
                 if let (Some(file), Ok(bytes)) = (&file, exe.serialize()) {
                     let _ = std::fs::create_dir_all(file.parent().unwrap_or(file));
                     let tmp = file.with_extension("tmp");
-                    if std::fs::write(&tmp, bytes).is_ok() {
+                    if std::fs::write(&tmp, packed(&bytes)).is_ok() {
                         let _ = std::fs::rename(&tmp, file);
                     }
                     if let Some(dir) = file.parent() {
@@ -301,6 +314,45 @@ impl Device {
             .expect("cache lock poisoned")
             .insert(key, Arc::clone(&program));
         Ok(program)
+    }
+
+    /// Where the disk cache keeps the program compiled from `text` for this
+    /// client's PJRT plugin and chip, if it keeps one.
+    fn cache_file(&self, client: &Client, text: &str) -> Option<PathBuf> {
+        let dir = self.disk.as_ref()?;
+        let mut h = blake3::Hasher::new();
+        h.update(text.as_bytes());
+        h.update(client.api().path().to_string_lossy().as_bytes());
+        let (major, minor) = client.api().version();
+        h.update(format!("{major}.{minor}|{}", self.kind).as_bytes());
+        Some(dir.join(format!("{}.pjrt", h.finalize().to_hex())))
+    }
+
+    /// Whether the disk cache holds the program compiled from `text`.
+    #[must_use]
+    pub fn on_disk(&self, text: &str) -> bool {
+        self.client()
+            .ok()
+            .and_then(|client| self.cache_file(client, text))
+            .is_some_and(|file| file.exists())
+    }
+
+    /// Drops the program compiled from `text` from the cache: held nowhere
+    /// else, it frees its host memory, and the next `program` of the text
+    /// loads it from the disk cache.
+    pub fn forget(&self, text: &str) {
+        let key = *blake3::hash(text.as_bytes()).as_bytes();
+        self.cache.lock().expect("cache lock poisoned").remove(&key);
+    }
+
+    /// Whether the program of `text` is held compiled.
+    #[must_use]
+    pub fn holds(&self, text: &str) -> bool {
+        let key = *blake3::hash(text.as_bytes()).as_bytes();
+        self.cache
+            .lock()
+            .expect("cache lock poisoned")
+            .contains_key(&key)
     }
 
     #[must_use]
@@ -515,6 +567,24 @@ fn disk_cache() -> Option<PathBuf> {
             .map(PathBuf::from)
             .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".cache")))
             .map(|base| base.join("pie").join("xla")),
+    }
+}
+
+/// A serialized program as the disk cache keeps it: zstd at level 1. A
+/// program is a few hundred MB and about two fifths zeros (v6e Qwen3-0.6B:
+/// 289 MB, ~80 MB packed), so the cache holds a model's whole warm ladder
+/// rather than evicting half of it on every load.
+fn packed(bytes: &[u8]) -> Vec<u8> {
+    zstd::bulk::compress(bytes, 1).unwrap_or_else(|_| bytes.to_vec())
+}
+
+/// A cached program's bytes, unpacked when `packed` wrote them (a zstd
+/// frame); an older raw file is read as it is.
+fn unpacked(bytes: Vec<u8>) -> Option<Vec<u8>> {
+    if bytes.starts_with(&[0x28, 0xb5, 0x2f, 0xfd]) {
+        zstd::stream::decode_all(bytes.as_slice()).ok()
+    } else {
+        Some(bytes)
     }
 }
 

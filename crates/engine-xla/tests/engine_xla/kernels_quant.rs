@@ -9,7 +9,7 @@ use dtype::Dtype;
 use engine_xla::bench::{Bench, assert_close, round_bf16};
 use engine_xla::handle::{Bank, Tensor};
 use kernels_xla::hlo::f16_bits;
-use kernels_xla::linear::kquant;
+use kernels_xla::linear::{kquant, quant};
 
 fn hash(i: usize, seed: u32) -> u32 {
     (i as u32)
@@ -594,4 +594,119 @@ fn nvfp4_answers_the_host() {
         .collect();
     let scale = want.iter().fold(0.0f32, |a, v| a.max(v.abs()));
     assert_close(&b.read_f32(yb), &want, 1e-2 * scale, 1e-2);
+}
+
+// -------------------------------------------------------------- block FP8
+
+/// An e4m3fn byte's value (no NaN among the codes drawn).
+fn e4m3_value(b: u8) -> f32 {
+    let sign = if b & 0x80 != 0 { -1.0 } else { 1.0 };
+    let (e, m) = (i32::from((b >> 3) & 15), f32::from(b & 7));
+    sign * if e == 0 {
+        m / 8.0 * 2f32.powi(-6)
+    } else {
+        (1.0 + m / 8.0) * 2f32.powi(e - 7)
+    }
+}
+
+#[test]
+fn block_fp8_banks_answer_the_host() {
+    // e4m3 codes under one f32 factor a 128x128 block, 384 codes a row: 256
+    // rows through the grouped-matmul kernel; 200 (a partial block row) in
+    // XLA, `m` rows group-batched, `big` rows through the weight decoded
+    // once.
+    block_fp8_at(256);
+    block_fp8_at(200);
+}
+
+fn block_fp8_at(n: usize) {
+    let (m, big, k) = (5usize, 1400usize, 384usize);
+    let (nb, g) = (n.div_ceil(128), k / 128);
+    let codes: Vec<u8> = (0..n * k)
+        .map(|i| {
+            let c = (hash(i, 950) >> 9) as u8;
+            if c & 0x7f == 0x7f { c ^ 1 } else { c }
+        })
+        .collect();
+    let factors: Vec<f32> = (0..nb * g)
+        .map(|i| 0.001 + (hash(i, 951) % 1000) as f32 / 1e4)
+        .collect();
+    let w: Vec<f32> = (0..n * k)
+        .map(|i| e4m3_value(codes[i]) * factors[(i / k / 128) * g + (i % k) / 128])
+        .collect();
+    let xs = data(m * k, 952);
+    let xb = data(big * k, 953);
+    let mut b = Bench::new();
+    let x = b.bf16(m as u32, k as u32, &xs);
+    let xbig = b.bf16(big as u32, k as u32, &xb);
+    let bank = Bank {
+        codes: b.raw(Dtype::E4m3, n as u32, k as u32, codes),
+        scales: b.f32(nb as u32, g as u32, &factors),
+        biases: None,
+        group: 128,
+        bits: 8,
+    };
+    let y = b.zeros(Dtype::F32, m as u32, n as u32);
+    let yb = b.zeros(Dtype::F32, big as u32, n as u32);
+    // The prompt's rows with their 128-wide heads' sums of squares beside
+    // them, where the kernel's blocks hold whole heads.
+    let heads = n / 128;
+    let sums = b.zeros(Dtype::F32, big as u32, (heads * 128) as u32);
+    let landed = std::cell::Cell::new(false);
+    if !b
+        .run(|ctx| {
+            engine_xla::lower::linear::quant(ctx, false, x, bank, y)?;
+            engine_xla::lower::lower(ctx, |l| {
+                let a = l.read(xbig)?;
+                let w = l.bank(quant::bank_view(bank))?;
+                let tuning = l.tuning();
+                let (v, s) = quant::matmul_sums(l.f(), a, w, yb.landing(), Some(128), tuning)?
+                    .expect("rows");
+                l.land(yb, v)?;
+                if let Some(s) = s {
+                    landed.set(true);
+                    l.land(sums, s)?;
+                }
+                Ok(())
+            })
+        })
+        .unwrap()
+    {
+        return;
+    }
+    // The kernel's and the group-batched rows scale exact partials; the
+    // decoded weight rounds to bf16, as the bf16 deployment holds it.
+    eprintln!("block fp8, {n} rows");
+    assert_close(
+        &b.read_f32(y),
+        &gemm_at(&xs, &w, m, n, k, false),
+        1e-3,
+        1e-3,
+    );
+    let want = gemm_ref(&xb, &w, big, n, k);
+    assert_close(&b.read_f32(yb), &want, 1e-2, 1e-2);
+    assert_eq!(
+        landed.get(),
+        n.is_multiple_of(128),
+        "head sums ride a whole-head block cut"
+    );
+    if landed.get() {
+        let got = b.read_f32(sums);
+        let (mut have, mut need) = (Vec::new(), Vec::new());
+        for r in 0..big {
+            for h in 0..heads {
+                have.push(
+                    (0..128)
+                        .map(|l| got[r * heads * 128 + h * 128 + l])
+                        .sum::<f32>(),
+                );
+                need.push(
+                    (0..128)
+                        .map(|d| want[r * n + h * 128 + d].powi(2))
+                        .sum::<f32>(),
+                );
+            }
+        }
+        assert_close(&have, &need, 2e-2, 1e-2);
+    }
 }

@@ -409,6 +409,17 @@ pub struct Plane {
 }
 
 impl Plane {
+    /// The most lanes a fire seats, which a stage first seen compiles up to.
+    pub fn seat(&mut self, lanes: u32) {
+        self.stages.top = lanes;
+    }
+
+    /// The readout rows a fire's planes come in, which a stage first seen
+    /// compiles for too.
+    pub fn seat_readouts(&mut self, rows: Vec<u32>) {
+        self.stages.readouts = rows;
+    }
+
     pub fn register(&mut self, registration: &ProgramRegistration) -> Result<ProgramId, Refusal> {
         let plan = eta_exec::adopt_launch_package(registration.launch.clone())
             .map_err(|error| Refusal::Program(error.to_string()))?;

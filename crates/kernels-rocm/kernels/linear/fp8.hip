@@ -3,10 +3,12 @@
 // FP8 (W8A8) products on gfx942's FP8 matrix core: `e4m3tile128` weights
 // (f32 factor a 128x128 block) and `fp8b32` ones (ue8m0 a 32x32 block)
 // against activations quantized a 1x128 (or 1x32) block, as dense
-// projections and routed selects. The core reads e4m3fnuz: the OCP codes
-// hold half their value there but for 0x80 (fnuz NaN) and 0x7f / 0xff (OCP
-// NaN), so weights are reordered and made canonical once at load
-// (`e4m3fn_shuffle`), and the factor of four folds into each block's scale.
+// projections and routed selects. Weights and activations are OCP e4m3fn
+// codes. gfx942's core reads e4m3fnuz: the OCP codes hold half their value
+// there but for 0x80 (fnuz NaN) and 0x7f / 0xff (OCP NaN), so weights are
+// reordered and made canonical once at load (`e4m3fn_shuffle`), and the
+// factor of four (`kFp8Fold`) folds into each block's scale. gfx950's
+// (CDNA4) core reads OCP e4m3fn itself, so there the factor is one.
 // A stage is one 128-code block of K; a lane's D cells are four weight rows
 // of one activation row.
 
@@ -15,6 +17,16 @@
 namespace pie::linear {
 
 typedef float fp8_f4 __attribute__((ext_vector_type(4)));
+
+// What a product of two OCP e4m3fn codes on the FP8 matrix core is short
+// of its value by: gfx94x reads both as e4m3fnuz (bias 8, each code half
+// its OCP value), a quarter; gfx950 reads OCP e4m3fn, as HIP's own
+// `HIP_FP8_TYPE_OCP` has it.
+#if defined(__gfx940__) || defined(__gfx941__) || defined(__gfx942__)
+constexpr float kFp8Fold = 4.f;
+#else
+constexpr float kFp8Fold = 1.f;
+#endif
 
 // The matrix core's order for a weight (n x k e4m3 codes, n a multiple of 16,
 // k of 64), which its products read straight into the A operand: each strip
@@ -211,7 +223,7 @@ __device__ __forceinline__ void fp8_tile(const u8* __restrict__ act, const float
                 float f[4];
 #pragma unroll
                 for (int kk = 0; kk < 4; ++kk)
-                    f[kk] = 4.f * fp8_e8m0((we >> (8 * kk)) & 0xFFu) * fp8_e8m0((ae >> (8 * kk)) & 0xFFu);
+                    f[kk] = kFp8Fold * fp8_e8m0((we >> (8 * kk)) & 0xFFu) * fp8_e8m0((ae >> (8 * kk)) & 0xFFu);
 #pragma unroll
                 for (int nb = 0; nb < NB; ++nb)
 #pragma unroll
@@ -224,7 +236,7 @@ __device__ __forceinline__ void fp8_tile(const u8* __restrict__ act, const float
                     }
                 continue;
             }
-            const float f = 4.f * __int_as_float(ws[S][0]) * xsc[buf][16 * mb + r16];
+            const float f = kFp8Fold * __int_as_float(ws[S][0]) * xsc[buf][16 * mb + r16];
 #pragma unroll
             for (int nb = 0; nb < NB; ++nb) {
                 fp8_f4 p = fp8_f4{0.f, 0.f, 0.f, 0.f};
@@ -554,10 +566,10 @@ __device__ __forceinline__ void fp8_prefill_tile(const u8* __restrict__ act, con
 #pragma unroll
         for (int ms = 0; ms < MS; ++ms) ae[ms] = sl[b][wm * MS * 16 + ms * 16 + r16];
         if constexpr (SB == 32) {
-            // Each sum in units of its last step's scale, 4·2^(E − 254), E
-            // the step's two biased exponents: a step's products chain onto
-            // the sum once it moves to the new step's units, a power of two
-            // and so exact.
+            // Each sum in units of its last step's scale, kFp8Fold·2^(E −
+            // 254), E the step's two biased exponents: a step's products
+            // chain onto the sum once it moves to the new step's units, a
+            // power of two and so exact.
 #pragma unroll
             for (int kk = 0; kk < 4; ++kk) {
                 moe_u2 bv[MS];
@@ -610,7 +622,7 @@ __device__ __forceinline__ void fp8_prefill_tile(const u8* __restrict__ act, con
                                             bv[ms][0], bv[ms][1], p[ns][ms]);
                 }
             }
-            const float wsc = 4.f * __int_as_float(wf[b][0][0]);
+            const float wsc = kFp8Fold * __int_as_float(wf[b][0][0]);
 #pragma unroll
             for (int ms = 0; ms < MS; ++ms) {
                 const float f = wsc * __uint_as_float(ae[ms]);
@@ -657,7 +669,7 @@ __device__ __forceinline__ void fp8_prefill_tile(const u8* __restrict__ act, con
         for (int ms = 0; ms < MS; ++ms)
 #pragma unroll
             for (int ns = 0; ns < NS; ++ns) {
-                const float f = SB == 32 ? __builtin_ldexpf(4.f, units[ns * FW / NS][ms] - 254) : 1.f;
+                const float f = SB == 32 ? __builtin_ldexpf(kFp8Fold, units[ns * FW / NS][ms] - 254) : 1.f;
                 const int r = wm * MS * 16 + ms * 16 + r16, c = wn * NS * 16 + ns * 16 + 4 * g;
                 store_shared16(sr, 4 * (r * (WN * NS * 16) + c), acc[ns][ms] * fp8_f4{f, f, f, f});
             }
@@ -672,7 +684,7 @@ __device__ __forceinline__ void fp8_prefill_tile(const u8* __restrict__ act, con
         for (int ns = 0; ns < NS; ++ns) {
             const int c = n0 + ns * 16 + 4 * g;
             if (c >= n) continue;
-            const float f = SB == 32 ? __builtin_ldexpf(4.f, units[ns * FW / NS][ms] - 254) : 1.f;
+            const float f = SB == 32 ? __builtin_ldexpf(kFp8Fold, units[ns * FW / NS][ms] - 254) : 1.f;
             bf16 v[4];
 #pragma unroll
             for (int t = 0; t < 4; ++t) v[t] = from_f32<bf16>(acc[ns][ms][t] * f);

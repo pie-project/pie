@@ -168,10 +168,39 @@ pub struct Run<'c> {
     probes: Vec<ValueId>,
     probed: std::cell::RefCell<Vec<(ValueId, kernels_xla::hlo::Val)>>,
 
+    /// The values an unweighted per-head rms norm reads, with the head width:
+    /// the projection landing one keeps the heads' sums of squares for it.
+    head_norms: Vec<(ValueId, u32)>,
+
     /// Token-declared values on a readout-rowed path, cut to the readout
     /// rows (`crate::rows`), and a readout-rowed value telling them.
     readout_rowed: (std::sync::Arc<Vec<bool>>, Option<ValueId>),
+
+    /// Index selections that list every key their rows see, and the ratio
+    /// they were ranked at: the index pool's page bound holds no more keys
+    /// than the budget, so `attn.index_topk` answers each row all of them,
+    /// in order.
+    pub(crate) full_selections: Vec<(ValueId, u32)>,
+    /// Routes `linear.group_routes` built (every row's slot `g` routed to
+    /// group `g`), with their group count.
+    pub(crate) group_routes: Vec<(ValueId, u32)>,
+    /// Boundary positions a compressor gathered at, with the ratio their
+    /// blocks close at.
+    pub(crate) boundaries: Vec<(ValueId, u32)>,
+    /// Routed results the grouped-matmul kernel left in its tile order, by
+    /// value, with the routes value and the span they were cut on: the next
+    /// routed op on the same routes reads them as they are.
+    tiled: std::cell::RefCell<Vec<TiledEntry>>,
 }
+
+/// A tile-ordered routed result: its value, the routes value it was sorted
+/// on, the span `(lane_offset, lanes)` it was cut on, and its rows.
+type TiledEntry = (
+    ValueId,
+    ValueId,
+    (u32, u32),
+    kernels_xla::linear::moe::Tiled,
+);
 
 impl<'c> Run<'c> {
     #[must_use]
@@ -203,8 +232,53 @@ impl<'c> Run<'c> {
             rs: None,
             probes: Vec::new(),
             probed: std::cell::RefCell::new(Vec::new()),
+            head_norms: Vec::new(),
             readout_rowed: (std::sync::Arc::new(Vec::new()), None),
+            full_selections: Vec::new(),
+            group_routes: Vec::new(),
+            boundaries: Vec::new(),
+            tiled: std::cell::RefCell::new(Vec::new()),
         }
+    }
+
+    /// The tile-ordered rows of `value` on `routes`, cut on this span.
+    pub(crate) fn tiled(
+        &self,
+        value: ValueId,
+        routes: ValueId,
+    ) -> Option<kernels_xla::linear::moe::Tiled> {
+        let span = self.window().span;
+        let key = (span.lane_offset, span.lanes);
+        self.tiled
+            .borrow()
+            .iter()
+            .rev()
+            .find(|(v, r, s, _)| *v == value && *r == routes && *s == key)
+            .map(|e| e.3)
+    }
+
+    pub(crate) fn keep_tiled(
+        &self,
+        value: ValueId,
+        routes: ValueId,
+        tiled: kernels_xla::linear::moe::Tiled,
+    ) {
+        let span = self.window().span;
+        self.tiled
+            .borrow_mut()
+            .push((value, routes, (span.lane_offset, span.lanes), tiled));
+    }
+
+    /// The routes the tile-ordered `value` was sorted on, if any.
+    pub(crate) fn tiled_routes(&self, value: ValueId) -> Option<ValueId> {
+        let span = self.window().span;
+        let key = (span.lane_offset, span.lanes);
+        self.tiled
+            .borrow()
+            .iter()
+            .rev()
+            .find(|(v, _, s, _)| *v == value && *s == key)
+            .map(|e| e.1)
     }
 
     /// Cuts the token-declared values of a readout-rowed path to the
@@ -230,6 +304,19 @@ impl<'c> Run<'c> {
     pub fn with_probes(mut self, probes: Vec<ValueId>) -> Self {
         self.probes = probes;
         self
+    }
+
+    pub fn with_head_norms(mut self, head_norms: Vec<(ValueId, u32)>) -> Self {
+        self.head_norms = head_norms;
+        self
+    }
+
+    /// The head width an unweighted per-head rms norm reads `y` at.
+    pub(crate) fn head_norm_of(&self, y: ValueId) -> Option<i64> {
+        self.head_norms
+            .iter()
+            .find(|(v, _)| *v == y)
+            .map(|(_, d)| i64::from(*d))
     }
 
     pub(crate) fn probes(&self) -> &[ValueId] {

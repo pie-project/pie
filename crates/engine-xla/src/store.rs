@@ -196,7 +196,7 @@ pub fn pool_demand(trace: &Trace, paging: Paging) -> Result<u64> {
                 } else {
                     planes.values
                 };
-                cells * (planes.keys + values) * elem_bytes(name, *dtype)?
+                cells * (lanes(planes.keys) + lanes(values)) * elem_bytes(name, *dtype)?
             }
             CacheRow::State {
                 name, slab, dtype, ..
@@ -209,12 +209,21 @@ pub fn pool_demand(trace: &Trace, paging: Paging) -> Result<u64> {
     let cells = plane_pages(paging, false) * u64::from(paging.page_size);
     for (_, width) in compressor_spaces(trace) {
         // Its `[kv, score]` pair, both bf16.
-        total += 2 * cells * width * 2;
+        total += 2 * cells * lanes(width) * 2;
     }
     if let Some(layout) = crate::rs::Layout::read(trace)? {
         total += rs_rows(paging) * layout.token_bytes;
     }
     Ok(total)
+}
+
+/// A row-major plane's row as the TPU lays it: whole 128-lane tiles.
+fn lanes(width: u64) -> u64 {
+    if width == 0 {
+        0
+    } else {
+        width.div_ceil(128) * 128
+    }
 }
 
 /// The rows of a recurrent-verb buffer plane: a page of rows per slot.

@@ -9,11 +9,13 @@
 use dtype::Dtype;
 
 use super::paged::with_i;
-use super::pool::{Entries, cell_of, compact_view, first, paging, put_cols, write_cell};
+use super::pool::{
+    Entries, cell_of, compact_view, entry_rows, first, paging, put_cols, write_cell,
+};
 use crate::check::expect;
 use crate::error::{Error, refuse};
 use crate::hlo::{Built, Cmp, Combine, Elem, Fold, Func, ScatterDims, Val};
-use crate::lanes::{DROP, ci, clamp_i, cmp_i, flat_i32, loop_upto, nonzero};
+use crate::lanes::{DROP, ci, clamp_i, cmp_i, flat_i32, loop_at_most, loop_upto, nonzero};
 use crate::tensor::{KvPool, Landing, Operand, Stored};
 
 /// Keys per step of the scoring loop.
@@ -350,10 +352,10 @@ pub fn topk(
         let w = weights.map(|w| w.f32(f));
         let pos = flat_i32(f, positions)?;
         let req = flat_i32(f, request_of_token)?;
-        let (table, ps, compact) =
+        let (table, ps, div) =
             match compact_view(f, OP, planes.keys.val, planes.keys.width, d, keys.page_size)? {
-                Some((t, ps)) => (t, ps, true),
-                None => (planes.keys.val, ps, false),
+                Some((t, ps, div)) => (t, ps, div),
+                None => (planes.keys.val, ps, 1),
             };
         let qv = f.slice_axis(qv, 0, 0, n)?;
         let qv = f.reshape(qv, &[n, hh, dd])?;
@@ -372,7 +374,7 @@ pub fn topk(
         let nkeys = f.select(pos_t, nkeys, zero)?;
         let nkeys = clamp_i(f, nkeys, 0, nk)?;
         let scores = index_scores(
-            f, qv, w, table, indices, indptr, req, nkeys, nk, stride, ps, compact,
+            f, qv, w, table, indices, indptr, req, nkeys, nk, stride, ps, div,
         )?;
         Ok(bisect_select(f, scores, nkeys, kk)?)
     }
@@ -662,8 +664,9 @@ fn index_scores(
     nk: i64,
     stride: i64,
     ps: i64,
-    compact: bool,
+    div: i64,
 ) -> Built<Val> {
+    let compact = div > 1;
     let qd = f.dims(q).to_vec();
     let (n, hh, dd) = (qd[0], qd[1], qd[2]);
     let kb = KEY_BLOCK.min(nk);
@@ -675,9 +678,10 @@ fn index_scores(
     let count = f.div(mx, kbv)?;
     let count = clamp_i(f, count, 0, nb)?;
     let s0 = f.const_f(Elem::F32, 0.0, &[n, nb * kb]);
-    let out = loop_upto(
+    let out = loop_at_most(
         f,
         count,
+        nb,
         &[s0],
         &[q, w, table, indices, indptr, req],
         |f, b, cr, inv| {
@@ -703,7 +707,7 @@ fn index_scores(
             let rq = f.broadcast(req, &[n, kb], &[0])?;
             let cell = cell_of(f, indices, indptr, rq, p, ps)?;
             let cell = f.reshape(cell, &[n * kb])?;
-            let k = f.take_rows(table, cell)?;
+            let k = entry_rows(f, table, cell, div)?;
             let k = f.slice_axis(k, 1, 0, dd)?;
             let k = f.reshape(k, &[n, kb, dd])?;
             let dot = f.dot_general(q, k, &[0], &[0], &[2], &[2], Elem::F32)?;

@@ -262,6 +262,9 @@ pub struct Shell {
     /// While the warm ladder traces (`warm.rs`): fires whose program is new
     /// are traced, kept here and not run, and compiled together after.
     deferred: Option<Vec<Deferred>>,
+    /// The readout rows of every fire shape traced, the rows a guest stage's
+    /// readout plane comes in (`Shell::readouts`).
+    readouts: std::collections::BTreeSet<u32>,
     /// Token-declared values on a readout-rowed path (`crate::rows`), and
     /// a readout-rowed value that tells their rows.
     readout_rowed: (std::sync::Arc<Vec<bool>>, Option<ValueId>),
@@ -313,6 +316,14 @@ impl Shell {
     #[must_use]
     pub fn tpu(&self) -> crate::chip::Tpu {
         self.tpu
+    }
+
+    /// The readout rows of every fire shape traced so far (the warm
+    /// ladder's, after `prewarm`): a guest stage reading a readout plane
+    /// meets each of them.
+    #[must_use]
+    pub fn readouts(&self) -> Vec<u32> {
+        self.readouts.iter().copied().collect()
     }
 
     /// Loads with the voxel ladder derived from the plan (engine-cuda's
@@ -506,11 +517,22 @@ impl Shell {
         } else {
             weight_floor
         };
-        let room = working.map_or(u64::MAX, |working| {
-            working
-                .saturating_sub(weight_floor)
-                .saturating_sub(tpu.headroom())
-        });
+        let room_at = |floor: u64| {
+            working.map_or(u64::MAX, |working| {
+                working.saturating_sub(floor).saturating_sub(tpu.headroom())
+            })
+        };
+        let room = room_at(weight_floor);
+        // An mxfp4 bank lands pre-scaled where the weights leave room for it
+        // (under 5/8 of the HBM, as a dry device of this size decides), but
+        // the pool sized first took that room: every bank landed as codes,
+        // and a fire past a few rows decoded the whole bank to bf16 in every
+        // layer (v6e gpt-oss mini24-e32 at 256 lanes: 290 of a 338 ms step).
+        // Its doubled codes are held back from the pool when the pool keeps
+        // a whole context of pages beside them.
+        let prescale = crate::weights::prescale_bytes(&boot.trace, &engine)?;
+        let held_back = (prescale > 0 && weight_floor < tpu.hbm_bytes() / 8 * 5)
+            .then(|| room_at(weight_floor.saturating_add(prescale)));
         let least = u64::from(boot.context.div_ceil(boot.page_size.max(1)));
         // A plane's cells are addressed by a 32-bit word, and a device with
         // no limit fills to `FILL_PAGES` when no budget is stated.
@@ -526,6 +548,10 @@ impl Shell {
             paging_at(pages, slots)
                 .and_then(|paging| crate::store::pool_demand(&boot.trace, paging))
                 .unwrap_or(u64::MAX)
+        };
+        let room = match held_back {
+            Some(rest) if boot.kv_budget.is_none() && demand(least, boot.slots) <= rest => rest,
+            _ => room,
         };
         let (fit, slots) = engine::fit::pool_for(boot.kv_budget, boot.slots, least, room, demand)
             .map_err(|short| Fault::Residency(short.to_string()))?;
@@ -698,6 +724,7 @@ impl Shell {
             traced: std::collections::HashMap::new(),
             shaped: std::collections::HashMap::new(),
             deferred: None,
+            readouts: std::collections::BTreeSet::new(),
             readout_rowed,
         })
     }
@@ -1063,8 +1090,16 @@ impl Shell {
                 None => by.push((class, word, 1, rows)),
             }
         }
-        // The class that takes the rest of the rows: the one with the most.
-        let host = by.iter().enumerate().max_by_key(|(_, e)| e.3)?.0;
+        // The class that takes the rest of the rows: the one with the most, a
+        // prefill's before a decode's (a row a lane), so a fire's decodes pad
+        // to their own rung as the warm ladder's do (v6e gpt-oss c256: 256
+        // decodes beside a 240-row prefill padded to 511 lanes, past the
+        // budget, and compiled mid-run, 21 s).
+        let host = by
+            .iter()
+            .enumerate()
+            .max_by_key(|(_, e)| (e.3 > e.2, e.3))?
+            .0;
         let pad = self.pad;
         let buckets = &self.budgets.tokens.buckets;
         // A fire that decodes beside its prefill: the prefill's lanes at
@@ -1079,7 +1114,13 @@ impl Shell {
             pad.mixed_host_rung
         };
         let want_host = pad.rung(by[host].2 + 1).max(row_lanes);
+        // A recurrent layer's chunked scan lays out a chunk for every lane,
+        // padding lanes too: a prefill there keeps its lanes at their rung
+        // (v6e, Qwen3.6-35B-A3B's 557-token Raw prompt: 16 lanes laid out 26
+        // chunks of 64 rows, 2 lanes 7 of 128; 8.3k -> 10.3k tok/s).
+        let lean = self.has_state();
         let can_wide = !mixed
+            && !lean
             && top >= 64
             && self.budgets.tokens.max_lanes >= want_host
             && real_rows + (want_host - by[host].2) <= top;
@@ -1103,7 +1144,8 @@ impl Shell {
         let raw_bucket = poem_exec::fire::rung_of(buckets, (real_rows + 1).max(pad.prefill_floor));
         let host_floor = if can_wide {
             want_host
-        } else if mixed || real_rows + pad.mixed_host_rung.saturating_sub(by[host].2) <= raw_bucket
+        } else if mixed
+            || (!lean && real_rows + pad.mixed_host_rung.saturating_sub(by[host].2) <= raw_bucket)
         {
             pad.mixed_host_rung
         } else {
@@ -1510,7 +1552,16 @@ impl Shell {
             })
             .max(pad.page_floor);
         let _ = canonical;
-        let max_pages = pad.rung(max_pages).min(cap);
+        // A fire that prefills lays its tables to the cap: its walks stop at
+        // the rows' own bounds, and its program is then keyed by its rows and
+        // lanes, the shapes the warm ladder compiles, not by how long the
+        // prompts happened to be (v6e Qwen3-0.6B pf256-512: 1792 rows over
+        // 64 lanes at 64 pages compiled for 14 s inside the measured rounds).
+        let max_pages = if rows == lane_count {
+            pad.rung(max_pages).min(cap)
+        } else {
+            cap
+        };
 
         let mut windows = Windows::of(
             &self.compiled,
@@ -1542,6 +1593,7 @@ impl Shell {
         let mask_enabled = inputs.raw(handles, Dtype::U8, rows, 1, enabled_bytes);
 
         let (readout_rows, readout_layout) = readout_table(&composition, lanes, real)?;
+        self.readouts.insert(readout_rows.len() as u32);
         let tokens_at = inputs.pack_offset();
         let tokens_t = inputs.i32s(handles, &tokens, 1);
         for feed in &token_feeds {
@@ -2144,6 +2196,24 @@ impl Shell {
         Ok((self.device.program(&text, sig)?, probed))
     }
 
+    /// The values a trace's unweighted per-head rms norms read, with their head
+    /// widths.
+    fn head_norms(trace: &Trace) -> Vec<(ValueId, u32)> {
+        trace
+            .nodes
+            .iter()
+            .filter_map(|n| match &n.op {
+                poem_ir::Operation::Elemwise(poem_ir::Elemwise::Rmsnorm {
+                    x,
+                    weight: poem_ir::NormWeight::None,
+                    axis: poem_ir::NormAxis::Head(d),
+                    ..
+                }) => Some((*x, *d)),
+                _ => None,
+            })
+            .collect()
+    }
+
     /// The program text of one fire's walk, and the values it probes.
     #[allow(clippy::too_many_arguments)]
     fn trace_text(
@@ -2181,7 +2251,8 @@ impl Shell {
             .with_compressor(self.pools.compressors())
             .with_rs(rs)
             .with_readout_rowed(&self.readout_rowed)
-            .with_probes(self.probes.clone());
+            .with_probes(self.probes.clone())
+            .with_head_norms(Self::head_norms(&self.trace));
             walk(
                 &self.trace,
                 &self.compiled,

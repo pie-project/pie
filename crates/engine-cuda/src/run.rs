@@ -2208,6 +2208,38 @@ impl<'c> Run<'c> {
         }
     }
 
+    /// [`Run::pool`] with its page table held to this window's own lanes'
+    /// pages, and the entry of the fire's table they start at: a lane
+    /// interval's `page_indptr` indexes the whole fire's table, whose other
+    /// lanes' pages it never reads.
+    #[cfg(feature = "cuda")]
+    pub(crate) fn pool_own(&self, id: ValueId) -> (KvPool, u32) {
+        let pool = self.pool(id);
+        let window = self.window();
+        let span = window.span();
+        let at = |lane: u32| -> Option<u32> {
+            let CachePool::Kv { space, .. } = self.cache(id) else {
+                return None;
+            };
+            let seat = self.fire.geometry.get(*space as usize)?.planning.as_ref()?;
+            u32::try_from(*seat.kv_indptr.get(lane as usize)?).ok()
+        };
+        let pages = window
+            .is_interval()
+            .then(|| Some((at(span.lane_offset)?, at(span.lane_offset + span.lanes)?)))
+            .flatten();
+        match pages {
+            Some((first, end)) if first <= end && end <= pool.page_indices.rows => (
+                KvPool {
+                    page_indices: skip(pool.page_indices, first, end - first),
+                    ..pool
+                },
+                first,
+            ),
+            _ => (pool, 0),
+        }
+    }
+
     pub(crate) fn pool_absolute(&self, id: ValueId) -> KvPool {
         let pool = self.pool(id);
         if !self.plane_base() {

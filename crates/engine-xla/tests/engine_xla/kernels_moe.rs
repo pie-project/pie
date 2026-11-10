@@ -1061,3 +1061,119 @@ fn the_grouped_matmul_kernel_answers_the_host() {
         }
     }
 }
+
+/// The routed MLP on one sort (`moe::experts`) lands, for every token, the
+/// sum the gate-up select, its GLU, the down select and the weighted sum
+/// land one by one, under either GLU, at a prefill's pairs and at a batch's:
+/// to bf16 rounding (it weighs each row before the down leg, not after).
+#[test]
+fn the_routed_mlp_on_one_sort_answers_its_parts() {
+    let (e, h, i) = (8usize, 256usize, 128usize);
+    for (t, tk, glu) in [
+        (40usize, 4usize, moe::ExpertGlu::Swiglu),
+        (9, 2, moe::ExpertGlu::GegluTanh),
+    ] {
+        let x = data(t * h, 61);
+        let wu: Vec<f32> = data(e * 2 * i * h, 62)
+            .iter()
+            .map(|v| round_bf16(v * 0.125))
+            .collect();
+        let wd: Vec<f32> = data(e * h * i, 63)
+            .iter()
+            .map(|v| round_bf16(v * 0.125))
+            .collect();
+        let routes: Vec<i32> = (0..t * tk)
+            .map(|p| ((hash(p / tk, 64) as usize + p % tk) % e) as i32)
+            .collect();
+        let weights: Vec<f32> = data(t * tk, 65).iter().map(|v| v.abs()).collect();
+        let run = |fused: bool, steps: i64| {
+            let mut b = Bench::new().with_tuning(kernels_xla::tuning::Tuning {
+                moe_gmm_run: steps,
+                ..kernels_xla::tuning::Tuning::DEFAULT
+            });
+            let xt = b.bf16(t as u32, h as u32, &x);
+            let ut = b.bf16(e as u32, (2 * i * h) as u32, &wu);
+            let dt = b.bf16(e as u32, (h * i) as u32, &wd);
+            let rt = b.i32(t as u32, tk as u32, &routes);
+            let gt = b.f32(t as u32, tk as u32, &weights);
+            let packed = b.zeros(Dtype::Bf16, (t * tk) as u32, (2 * i) as u32);
+            let hidden = b.zeros(Dtype::Bf16, (t * tk) as u32, i as u32);
+            let routed = b.zeros(Dtype::Bf16, (t * tk) as u32, h as u32);
+            let y = b.zeros(Dtype::Bf16, t as u32, h as u32);
+            let ran = b.run(|ctx| {
+                if fused {
+                    return engine_xla::lower::lower(ctx, |l| {
+                        let (x_v, u_v, r_v) = (l.read(xt)?, l.read(ut)?, l.read(rt)?);
+                        let (d_v, g_v) = (l.read(dt)?, l.read(gt)?);
+                        let tuning = l.tuning();
+                        let v = moe::experts(
+                            l.f(),
+                            x_v,
+                            u_v,
+                            r_v,
+                            packed.landing(),
+                            glu,
+                            i as u32,
+                            d_v,
+                            routed.landing(),
+                            g_v,
+                            y.landing(),
+                            tuning,
+                        )?
+                        .expect("the kernel takes both banks");
+                        l.land(y, v)
+                    });
+                }
+                engine_xla::lower::lower(ctx, |l| {
+                    let (x_v, u_v, r_v, p_v) =
+                        (l.read(xt)?, l.read(ut)?, l.read(rt)?, l.read(packed)?);
+                    let tuning = l.tuning();
+                    let v = moe::matmul_select(l.f(), x_v, u_v, r_v, p_v, tuning)?;
+                    l.land(packed, v)
+                })?;
+                engine_xla::lower::lower(ctx, |l| {
+                    let p_v = l.read(packed)?;
+                    let v = match glu {
+                        moe::ExpertGlu::Swiglu => kernels_xla::linear::mlp::swiglu(
+                            l.f(),
+                            p_v,
+                            i as u32,
+                            hidden.landing(),
+                        )?,
+                        moe::ExpertGlu::GegluTanh => kernels_xla::linear::mlp::geglu_tanh_packed(
+                            l.f(),
+                            p_v,
+                            i as u32,
+                            hidden.landing(),
+                        )?,
+                    };
+                    l.land(hidden, v)
+                })?;
+                engine_xla::lower::lower(ctx, |l| {
+                    let (h_v, d_v, r_v, o_v) =
+                        (l.read(hidden)?, l.read(dt)?, l.read(rt)?, l.read(routed)?);
+                    let tuning = l.tuning();
+                    let v = moe::matmul_select(l.f(), h_v, d_v, r_v, o_v, tuning)?;
+                    l.land(routed, v)
+                })?;
+                engine_xla::lower::lower(ctx, |l| {
+                    let (o_v, g_v) = (l.read(routed)?, l.read(gt)?);
+                    let v = moe::weighted_sum(l.f(), o_v, g_v, y.landing())?;
+                    l.land(y, v)
+                })
+            });
+            if !ran.unwrap_or_else(|err| panic!("{err}\n{}", b.last_module)) {
+                return None;
+            }
+            Some(b.read_f32(y))
+        };
+        let (Some(fused), Some(parts), Some(stepped)) = (run(true, 1), run(false, 1), run(true, 4))
+        else {
+            return;
+        };
+        let scale = parts.iter().fold(0f32, |m, v| m.max(v.abs()));
+        assert_close(&fused, &parts, 0.01 * scale.max(1.0), 1e-2);
+        // Four of an expert's tiles a step land what a step a tile does.
+        assert_eq!(stepped, fused);
+    }
+}
