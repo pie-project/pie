@@ -8,10 +8,12 @@
 //!
 //! Row `r` reads key rows `[klo[r], khi[r])` of the rectangle: its segment
 //! (its lane's consecutive positions in this fire) up to itself, cut by the
-//! window. The kernel stands in for the paged walk only when every live row
-//! reads fresh keys alone (no position before the fire's first, no custom
-//! mask, every row filed in its lane's slot): the fire decides at run time
-//! (`stablehlo.case`), the walk being the other branch.
+//! window. Keys a lane holds from before the fire (a cached prefix) are read
+//! too, from a rectangle of their pool pages gathered whole (at most
+//! `OLD_PAGES`), walked before the fresh blocks. The kernel stands in for
+//! the paged walk only when the fire's older keys fit that rectangle and no
+//! row carries a custom mask, every row filed in its lane's slot: the fire
+//! decides at run time (`stablehlo.case`), the walk being the other branch.
 //!
 //! Grid: one step per row block, its key blocks walked by a loop with the
 //! next block's `k`/`v` copying in (two buffers) while the current one is
@@ -41,11 +43,10 @@ const BQ: i64 = 256;
 /// The most stacked rows one score tile holds.
 const STACK: i64 = 1024;
 /// The most pool pages of older keys (a lane's cached prefix) a fire's rows
-/// may read beside their own: whole pages, gathered into one rectangle.
-const OLD_PAGES: i64 = 64;
-/// The rectangle a few pages take (a shared first page a lane, say): its
-/// gather a quarter of the whole one.
-const FEW_OLD_PAGES: i64 = 16;
+/// may read beside their own: whole pages, gathered into one rectangle (a
+/// fire that reads more walks the pool). One size, so a layer carries one
+/// kernel: every variant is a copy of its code in each program.
+const OLD_PAGES: i64 = 16;
 
 fn bad<T>(detail: impl Into<String>) -> Built<T> {
     Err(Malformed {
@@ -181,10 +182,11 @@ pub(crate) fn fits(f: &Func, ap: &Appended, r: i64, h: &Heads, vmem_cap: i64) ->
         && shape(r, h, 1.0, vmem_cap).is_some()
 }
 
-/// With `old` (its rows), the kernel also reads an older-keys rectangle
-/// first: operands 5 and 6 its keys and values, 7 and 8 each row's range in
-/// it, prefetched 2 and 3 each row block's blocks of it.
-fn kernel(s: &Shape, vmem_cap: i64, old: Option<i64>) -> Built<Compiled> {
+/// The kernel over a fire's own key rows and an older-keys rectangle of
+/// `mo` rows (operands 5 and 6 its keys and values, 7 and 8 each row's range
+/// in it, prefetched 2 and 3 each row block's blocks of it): one walk over
+/// the older blocks and then the fresh ones, one copy of the arithmetic.
+fn kernel(s: &Shape, vmem_cap: i64, mo: i64) -> Built<Compiled> {
     let Shape {
         r,
         rp,
@@ -224,33 +226,27 @@ fn kernel(s: &Shape, vmem_cap: i64, old: Option<i64>) -> Built<Compiled> {
         window: Window::Any,
         index: Box::new(|_: &mut Body, _: &Grid| Ok(vec![])),
     };
-    let mut ins = vec![
-        blocked(
-            vec![r, qh * d],
-            Elem::Bf16,
-            vec![bq, qh * d],
-            Box::new(rows),
-        ),
-        any(vec![r, wk]),
-        any(vec![r, wv]),
-        blocked(vec![1, r], Elem::I32, vec![1, bq], Box::new(cols)),
-        blocked(vec![1, r], Elem::I32, vec![1, bq], Box::new(cols)),
-    ];
-    let mut prefetch = vec![vec![nb], vec![nb]];
-    if let Some(mo) = old {
-        ins.push(any(vec![mo, wk]));
-        ins.push(any(vec![mo, wv]));
-        ins.push(blocked(vec![1, r], Elem::I32, vec![1, bq], Box::new(cols)));
-        ins.push(blocked(vec![1, r], Elem::I32, vec![1, bq], Box::new(cols)));
-        prefetch.push(vec![nb]);
-        prefetch.push(vec![nb]);
-    }
     let k = Kernel {
         name: "flash_prefill".into(),
         grid: vec![nb],
         semantics: vec![Sem::Arbitrary],
-        prefetch,
-        ins,
+        prefetch: vec![vec![nb], vec![nb], vec![nb], vec![nb]],
+        ins: vec![
+            blocked(
+                vec![r, qh * d],
+                Elem::Bf16,
+                vec![bq, qh * d],
+                Box::new(rows),
+            ),
+            any(vec![r, wk]),
+            any(vec![r, wv]),
+            blocked(vec![1, r], Elem::I32, vec![1, bq], Box::new(cols)),
+            blocked(vec![1, r], Elem::I32, vec![1, bq], Box::new(cols)),
+            any(vec![mo, wk]),
+            any(vec![mo, wv]),
+            blocked(vec![1, r], Elem::I32, vec![1, bq], Box::new(cols)),
+            blocked(vec![1, r], Elem::I32, vec![1, bq], Box::new(cols)),
+        ],
         outs: vec![
             blocked(
                 vec![r, qh * dv],
@@ -274,8 +270,9 @@ fn kernel(s: &Shape, vmem_cap: i64, old: Option<i64>) -> Built<Compiled> {
     };
     k.build(|b, blk| {
         let i = blk.grid.ids[0];
-        let (q_ref, k_any, v_any, klo_ref, khi_ref) =
-            (blk.ins[0], blk.ins[1], blk.ins[2], blk.ins[3], blk.ins[4]);
+        let q_ref = blk.ins[0];
+        let (fresh_k, fresh_v, klo_ref, khi_ref) = (blk.ins[1], blk.ins[2], blk.ins[3], blk.ins[4]);
+        let (old_k, old_v, okl_ref, okh_ref) = (blk.ins[5], blk.ins[6], blk.ins[7], blk.ins[8]);
         let (o_ref, mo_ref, lo_ref) = (blk.outs[0], blk.outs[1], blk.outs[2]);
         let (kbuf, vbuf, sems, bias_ref, m_s, l_s, acc_s) = (
             blk.scratch[0],
@@ -286,9 +283,14 @@ fn kernel(s: &Shape, vmem_cap: i64, old: Option<i64>) -> Built<Compiled> {
             blk.scratch[5],
             blk.scratch[6],
         );
-        let lo = b.load(blk.grid.prefetch[0], &[i])?;
-        let hi = b.load(blk.grid.prefetch[1], &[i])?;
+        let pre = &blk.grid.prefetch;
+        let lo = b.load(pre[0], &[i])?;
+        let hi = b.load(pre[1], &[i])?;
+        let olo = b.load(pre[2], &[i])?;
+        let ohi = b.load(pre[3], &[i])?;
         let i0 = b.index(0);
+        let zero = b.i32(0);
+        let one = b.i32(1);
 
         // Every turn's state starts empty.
         for t in 0..turns {
@@ -301,179 +303,176 @@ fn kernel(s: &Shape, vmem_cap: i64, old: Option<i64>) -> Built<Compiled> {
             b.vstore(z, acc_s, &[at, i0, i0])?;
         }
 
-        // One pass over key blocks `lo ..= hi` of a `rows`-row rectangle
-        // (`src_k`, `src_v` in HBM), each row admitting the key rows of its
-        // `[klo, khi)`: the next block copies in while this one is read.
-        let pass = |b: &mut Body,
-                    src_k: V,
-                    src_v: V,
-                    rows: i64,
-                    lo: V,
-                    hi: V,
-                    klo_ref: V,
-                    khi_ref: V|
-         -> Built<()> {
-            // The copy of key block `j` into buffer `slot`: the block's
-            // first row, clamped so the block stays inside the rectangle
-            // (the mask below skips the rows a clamped block repeats).
-            let block_row = |b: &mut Body, j: V| -> Built<V> {
-                let bkv = b.i32(bk);
-                let at = b.muli(j, bkv)?;
-                let top = b.i32(rows - bk);
-                b.minsi(at, top)
-            };
-            let copies = |b: &mut Body, j: V, slot: V| -> Built<[(V, V, V); 2]> {
-                let z = b.i32(0);
-                let kb = block_row(b, j)?;
-                let two = b.i32(2);
-                let vslot = b.addi(slot, two)?;
-                let mut out = Vec::with_capacity(2);
-                for (src, buf, w, sidx) in [(src_k, kbuf, wk, slot), (src_v, vbuf, wv, vslot)] {
-                    let s = b.ref_slice(src, &[kb, z], &[bk, w])?;
-                    let d = b.ref_slice(buf, &[slot, z, z], &[1, bk, w])?;
-                    let d = b.ref_squeeze(d)?;
-                    let sem = b.ref_slice(sems, &[sidx], &[1])?;
-                    let sem = b.ref_squeeze(sem)?;
-                    out.push((s, d, sem));
-                }
-                Ok([out[0], out[1]])
-            };
-            let has = b.cmpi(ICmp::Sle, lo, hi)?;
-            b.when(has, |b| {
-                let z = b.i32(0);
-                for (src, dst, sem) in copies(b, lo, z)? {
-                    b.dma_start(src, dst, sem)?;
-                }
-                Ok(())
-            })?;
-            let one = b.i32(1);
-            let count = b.subi(hi, lo)?;
-            let count = b.addi(count, one)?;
-            let zero = b.i32(0);
-            b.for_range(zero, count, one, |b, t| {
-                let j = b.addi(lo, t)?;
-                let two = b.i32(2);
-                let slot = b.remsi(t, two)?;
-                let one = b.i32(1);
-                let other = b.subi(one, slot)?;
-                let more = b.cmpi(ICmp::Slt, j, hi)?;
-                b.when(more, |b| {
-                    let next = b.addi(j, one)?;
-                    for (src, dst, sem) in copies(b, next, other)? {
-                        b.dma_start(src, dst, sem)?;
+        // Step `t` reads older block `olo + t` while `t` is below their
+        // count, then fresh block `lo + t - count`.
+        let count = |b: &mut Body, lo: V, hi: V| -> Built<V> {
+            let c = b.subi(hi, lo)?;
+            let c = b.addi(c, one)?;
+            b.maxsi(c, zero)
+        };
+        let nold = count(b, olo, ohi)?;
+        let nfresh = count(b, lo, hi)?;
+        let steps = b.addi(nold, nfresh)?;
+        let older = |b: &mut Body, t: V| -> Built<V> { b.cmpi(ICmp::Slt, t, nold) };
+        let block_of = |b: &mut Body, t: V| -> Built<V> {
+            let o = b.addi(olo, t)?;
+            let f0 = b.subi(t, nold)?;
+            let f0 = b.addi(lo, f0)?;
+            let is_old = b.cmpi(ICmp::Slt, t, nold)?;
+            b.select(is_old, o, f0)
+        };
+        // A block's first row in its rectangle: a fresh block clamped so it
+        // stays inside the fire's rows (the mask skips the rows a clamped
+        // block repeats); the older rectangle is whole blocks.
+        let block_row = |b: &mut Body, t: V| -> Built<V> {
+            let j = block_of(b, t)?;
+            let bkv = b.i32(bk);
+            let at = b.muli(j, bkv)?;
+            let top = b.i32(r - bk);
+            let clamped = b.minsi(at, top)?;
+            let is_old = b.cmpi(ICmp::Slt, t, nold)?;
+            b.select(is_old, at, clamped)
+        };
+        // Starts (`wait` false) or waits for the copies of step `t` into
+        // buffer `slot`, from whichever rectangle the step reads.
+        let copies = |b: &mut Body, t: V, slot: V, wait: bool| -> Built<()> {
+            let kb = block_row(b, t)?;
+            let is_old = older(b, t)?;
+            let is_fresh = b.cmpi(ICmp::Sge, t, nold)?;
+            for (cond, src_k, src_v) in [(is_old, old_k, old_v), (is_fresh, fresh_k, fresh_v)] {
+                b.when(cond, |b| {
+                    let z = b.i32(0);
+                    let two = b.i32(2);
+                    let vslot = b.addi(slot, two)?;
+                    for (src, buf, w, sidx) in [(src_k, kbuf, wk, slot), (src_v, vbuf, wv, vslot)] {
+                        let s = b.ref_slice(src, &[kb, z], &[bk, w])?;
+                        let d = b.ref_slice(buf, &[slot, z, z], &[1, bk, w])?;
+                        let d = b.ref_squeeze(d)?;
+                        let sem = b.ref_slice(sems, &[sidx], &[1])?;
+                        let sem = b.ref_squeeze(sem)?;
+                        if wait {
+                            b.dma_wait(sem, s, d)?;
+                        } else {
+                            b.dma_start(s, d, sem)?;
+                        }
                     }
                     Ok(())
                 })?;
-                for (src, dst, sem) in copies(b, j, slot)? {
-                    b.dma_wait(sem, src, dst)?;
-                }
-
-                // The block's admission, a bias of 0 or -inf per (key,
-                // row): a row admits the key rows of its range, from the
-                // block's own start.
-                let kb = block_row(b, j)?;
-                let sq = [bk, bq];
-                let kr = b.broadcast_i(kb, &sq)?;
-                let io = b.iota(&sq, 0);
-                let kr = b.addi(kr, io)?;
-                let bkv = b.i32(bk);
-                let start = b.muli(j, bkv)?;
-                let start = b.broadcast_i(start, &sq)?;
-                let klo = b.vload_all(klo_ref)?;
-                let klo = b.broadcast(klo, &sq)?;
-                let klo = b.maxsi(klo, start)?;
-                let khi = b.vload_all(khi_ref)?;
-                let khi = b.broadcast(khi, &sq)?;
-                let ge = b.cmpi(ICmp::Sge, kr, klo)?;
-                let lt = b.cmpi(ICmp::Slt, kr, khi)?;
-                let ok = b.andi(ge, lt)?;
-                let zs = b.splat_f(&sq, Elem::F32, 0.0)?;
-                let ninf = b.splat_f(&sq, Elem::F32, f64::NEG_INFINITY)?;
-                let bias = b.select(ok, zs, ninf)?;
-                b.vstore_all(bias, bias_ref)?;
-
-                let z = b.i32(0);
-                let kslab = b.ref_slice(kbuf, &[slot, z, z], &[1, bk, wk])?;
-                let kslab = b.ref_squeeze(kslab)?;
-                let vslab = b.ref_slice(vbuf, &[slot, z, z], &[1, bk, wv])?;
-                let vslab = b.ref_squeeze(vslab)?;
-                for t2 in 0..turns {
-                    let (kh, gi) = (t2 / gc, t2 % gc);
-                    let col = b.index(kh * d);
-                    let kv = b.vload(kslab, &[i0, col], &[bk, d])?;
-                    let col = b.index(kh * dv);
-                    let vv = b.vload(vslab, &[i0, col], &[bk, dv])?;
-                    // The turn's `gf` query heads, stacked along the rows.
-                    let mut parts = Vec::with_capacity(gf as usize);
-                    for x in 0..gf {
-                        let qi = kh * g + gi * gf + x;
-                        let col = b.index(qi * d);
-                        parts.push(b.vload(q_ref, &[i0, col], &[bq, d])?);
-                    }
-                    let qf = if gf == 1 {
-                        parts[0]
-                    } else {
-                        b.concat(&parts, 0)?
-                    };
-                    let zs = b.splat_f(&[bk, n], Elem::F32, 0.0)?;
-                    let st = b.matmul(kv, qf, zs, true)?;
-                    let sc = b.splat_f(&[bk, n], Elem::F32, scale)?;
-                    let st = b.mulf(st, sc)?;
-                    let bias = b.vload_all(bias_ref)?;
-                    let bias = if gf == 1 {
-                        bias
-                    } else {
-                        let copies = vec![bias; gf as usize];
-                        b.concat(&copies, 1)?
-                    };
-                    let st = b.addf(st, bias)?;
-                    let at = b.index(t2);
-                    let m0 = b.vload(m_s, &[at, i0, i0], &[1, 1, n])?;
-                    let m0 = b.shape_cast(m0, &[1, n])?;
-                    let l0 = b.vload(l_s, &[at, i0, i0], &[1, 1, n])?;
-                    let l0 = b.shape_cast(l0, &[1, n])?;
-                    let mc = b.reduce_cols(st, true)?;
-                    let mn = b.maxf(m0, mc)?;
-                    let ninf1 = b.splat_f(&[1, n], Elem::F32, f64::NEG_INFINITY)?;
-                    let alive = b.cmpf(true, mn, ninf1)?;
-                    let z1 = b.splat_f(&[1, n], Elem::F32, 0.0)?;
-                    let ms = b.select(alive, mn, z1)?;
-                    let msb = b.broadcast(ms, &[bk, n])?;
-                    let e = b.subf(st, msb)?;
-                    let p = b.exp(e)?;
-                    let ps = b.reduce_cols(p, false)?;
-                    let dm = b.subf(m0, ms)?;
-                    let al = b.exp(dm)?;
-                    let l = b.mulf(l0, al)?;
-                    let l = b.addf(l, ps)?;
-                    let mn3 = b.shape_cast(mn, &[1, 1, n])?;
-                    b.vstore(mn3, m_s, &[at, i0, i0])?;
-                    let l3 = b.shape_cast(l, &[1, 1, n])?;
-                    b.vstore(l3, l_s, &[at, i0, i0])?;
-                    let a0 = b.vload(acc_s, &[at, i0, i0], &[1, dv, n])?;
-                    let a0 = b.shape_cast(a0, &[dv, n])?;
-                    let ab = b.broadcast(al, &[dv, n])?;
-                    let a = b.mulf(a0, ab)?;
-                    let pb = b.convert_f(p, Elem::Bf16)?;
-                    let zo = b.splat_f(&[dv, n], Elem::F32, 0.0)?;
-                    let pv = b.matmul_tl(vv, pb, zo)?;
-                    let a = b.addf(a, pv)?;
-                    let a3 = b.shape_cast(a, &[1, dv, n])?;
-                    b.vstore(a3, acc_s, &[at, i0, i0])?;
-                }
-                Ok(())
-            })
+            }
+            Ok(())
         };
-        // The lanes' older keys first (the pool pages gathered whole), then
-        // the fire's own rows.
-        if let Some(mo) = old {
-            let olo = b.load(blk.grid.prefetch[2], &[i])?;
-            let ohi = b.load(blk.grid.prefetch[3], &[i])?;
-            pass(
-                b, blk.ins[5], blk.ins[6], mo, olo, ohi, blk.ins[7], blk.ins[8],
-            )?;
-        }
-        pass(b, k_any, v_any, r, lo, hi, klo_ref, khi_ref)?;
+        let any_steps = b.cmpi(ICmp::Sgt, steps, zero)?;
+        b.when(any_steps, |b| copies(b, zero, zero, false))?;
+        b.for_range(zero, steps, one, |b, t| {
+            let two = b.i32(2);
+            let slot = b.remsi(t, two)?;
+            let other = b.subi(one, slot)?;
+            let next = b.addi(t, one)?;
+            let more = b.cmpi(ICmp::Slt, next, steps)?;
+            b.when(more, |b| copies(b, next, other, false))?;
+            copies(b, t, slot, true)?;
+
+            // The block's admission, a bias of 0 or -inf per (key, row): a
+            // row admits the key rows of its range in the block's
+            // rectangle, from the block's own start.
+            let kb = block_row(b, t)?;
+            let j = block_of(b, t)?;
+            let is_old = older(b, t)?;
+            let sq = [bk, bq];
+            let kr = b.broadcast_i(kb, &sq)?;
+            let io = b.iota(&sq, 0);
+            let kr = b.addi(kr, io)?;
+            let bkv = b.i32(bk);
+            let start = b.muli(j, bkv)?;
+            let start = b.broadcast_i(start, &sq)?;
+            let flo = b.vload_all(klo_ref)?;
+            let olo_v = b.vload_all(okl_ref)?;
+            let klo = b.select(is_old, olo_v, flo)?;
+            let klo = b.broadcast(klo, &sq)?;
+            let klo = b.maxsi(klo, start)?;
+            let fhi = b.vload_all(khi_ref)?;
+            let ohi_v = b.vload_all(okh_ref)?;
+            let khi = b.select(is_old, ohi_v, fhi)?;
+            let khi = b.broadcast(khi, &sq)?;
+            let ge = b.cmpi(ICmp::Sge, kr, klo)?;
+            let lt = b.cmpi(ICmp::Slt, kr, khi)?;
+            let ok = b.andi(ge, lt)?;
+            let zs = b.splat_f(&sq, Elem::F32, 0.0)?;
+            let ninf = b.splat_f(&sq, Elem::F32, f64::NEG_INFINITY)?;
+            let bias = b.select(ok, zs, ninf)?;
+            b.vstore_all(bias, bias_ref)?;
+
+            let z = b.i32(0);
+            let kslab = b.ref_slice(kbuf, &[slot, z, z], &[1, bk, wk])?;
+            let kslab = b.ref_squeeze(kslab)?;
+            let vslab = b.ref_slice(vbuf, &[slot, z, z], &[1, bk, wv])?;
+            let vslab = b.ref_squeeze(vslab)?;
+            for t2 in 0..turns {
+                let (kh, gi) = (t2 / gc, t2 % gc);
+                let col = b.index(kh * d);
+                let kv = b.vload(kslab, &[i0, col], &[bk, d])?;
+                let col = b.index(kh * dv);
+                let vv = b.vload(vslab, &[i0, col], &[bk, dv])?;
+                // The turn's `gf` query heads, stacked along the rows.
+                let mut parts = Vec::with_capacity(gf as usize);
+                for x in 0..gf {
+                    let qi = kh * g + gi * gf + x;
+                    let col = b.index(qi * d);
+                    parts.push(b.vload(q_ref, &[i0, col], &[bq, d])?);
+                }
+                let qf = if gf == 1 {
+                    parts[0]
+                } else {
+                    b.concat(&parts, 0)?
+                };
+                let zs = b.splat_f(&[bk, n], Elem::F32, 0.0)?;
+                let st = b.matmul(kv, qf, zs, true)?;
+                let sc = b.splat_f(&[bk, n], Elem::F32, scale)?;
+                let st = b.mulf(st, sc)?;
+                let bias = b.vload_all(bias_ref)?;
+                let bias = if gf == 1 {
+                    bias
+                } else {
+                    let copies = vec![bias; gf as usize];
+                    b.concat(&copies, 1)?
+                };
+                let st = b.addf(st, bias)?;
+                let at = b.index(t2);
+                let m0 = b.vload(m_s, &[at, i0, i0], &[1, 1, n])?;
+                let m0 = b.shape_cast(m0, &[1, n])?;
+                let l0 = b.vload(l_s, &[at, i0, i0], &[1, 1, n])?;
+                let l0 = b.shape_cast(l0, &[1, n])?;
+                let mc = b.reduce_cols(st, true)?;
+                let mn = b.maxf(m0, mc)?;
+                let ninf1 = b.splat_f(&[1, n], Elem::F32, f64::NEG_INFINITY)?;
+                let alive = b.cmpf(true, mn, ninf1)?;
+                let z1 = b.splat_f(&[1, n], Elem::F32, 0.0)?;
+                let ms = b.select(alive, mn, z1)?;
+                let msb = b.broadcast(ms, &[bk, n])?;
+                let e = b.subf(st, msb)?;
+                let p = b.exp(e)?;
+                let ps = b.reduce_cols(p, false)?;
+                let dm = b.subf(m0, ms)?;
+                let al = b.exp(dm)?;
+                let l = b.mulf(l0, al)?;
+                let l = b.addf(l, ps)?;
+                let mn3 = b.shape_cast(mn, &[1, 1, n])?;
+                b.vstore(mn3, m_s, &[at, i0, i0])?;
+                let l3 = b.shape_cast(l, &[1, 1, n])?;
+                b.vstore(l3, l_s, &[at, i0, i0])?;
+                let a0 = b.vload(acc_s, &[at, i0, i0], &[1, dv, n])?;
+                let a0 = b.shape_cast(a0, &[dv, n])?;
+                let ab = b.broadcast(al, &[dv, n])?;
+                let a = b.mulf(a0, ab)?;
+                let pb = b.convert_f(p, Elem::Bf16)?;
+                let zo = b.splat_f(&[dv, n], Elem::F32, 0.0)?;
+                let pv = b.matmul_tl(vv, pb, zo)?;
+                let a = b.addf(a, pv)?;
+                let a3 = b.shape_cast(a, &[1, dv, n])?;
+                b.vstore(a3, acc_s, &[at, i0, i0])?;
+            }
+            Ok(())
+        })?;
 
         // Each head's rows normalized and turned into their columns; the
         // max and sum a row per head.
@@ -574,11 +573,6 @@ pub(crate) fn attend(
     };
     let (start, p0) = segments(f, lane, qpos)?;
     let live = cmp_i(f, Cmp::Ge, qpos, 0)?;
-    // Fresh keys alone: nothing before the segment's first position.
-    let fresh = f.compare(Cmp::Ge, lo, p0)?;
-    let dead = f.not(live);
-    let fresh_live = f.or(fresh, dead)?;
-    let fresh_all = f.reduce(fresh_live, &[0], Fold::And)?;
     let old = older(
         f, geom, slots, planes, lane, qpos, lo, p0, start, live, window,
     )?;
@@ -608,21 +602,11 @@ pub(crate) fn attend(
     let dead = f.not(live);
     let ok = f.or(ok, dead)?;
     let all = f.reduce(ok, &[0], Fold::And)?;
-    // 0: the walk; 1: fresh keys alone; 2 and 3: older keys too, a few
-    // pages of them or as many as the rectangle holds.
-    let one_more = f.not(fresh_all);
+    // 0: the walk; 1: the kernel, the older keys a rectangle holds (none
+    // where every row's keys are fresh).
     let fits_old = cmp_i(f, Cmp::Le, old.total, OLD_PAGES)?;
-    let with_old = f.and(one_more, fits_old)?;
-    let many = cmp_i(f, Cmp::Gt, old.total, FEW_OLD_PAGES)?;
-    let many = f.and(with_old, many)?;
-    let usable = f.or(fresh_all, with_old)?;
-    let all = f.and(all, usable)?;
-    let all = f.convert(all, Elem::I32);
-    let more = f.convert(with_old, Elem::I32);
-    let many = f.convert(many, Elem::I32);
-    let which = f.add(all, more)?;
-    let which = f.add(which, many)?;
-    let which = f.mul(which, all)?;
+    let all = f.and(all, fits_old)?;
+    let which = f.convert(all, Elem::I32);
 
     // Each row's key rows `[klo, khi)` of the rectangle: its segment's,
     // from its window's start (the older keys are the other rectangle's).
@@ -645,28 +629,11 @@ pub(crate) fn attend(
         let o = f.convert(fl.o, Elem::Bf16);
         Ok(vec![o, fl.m, fl.l])
     });
-    let fresh: Branch<'_> = Box::new(move |f: &mut Func| {
-        let (o, m, l) = run(f, &s, ap, q4, klo, khi, vmem_cap, None)?;
+    let flashed: Branch<'_> = Box::new(move |f: &mut Func| {
+        let (o, m, l) = run(f, &s, ap, q4, klo, khi, vmem_cap, &old)?;
         Ok(vec![o, m, l])
     });
-    let few: Branch<'_> = Box::new(move |f: &mut Func| {
-        let (o, m, l) = run(
-            f,
-            &s,
-            ap,
-            q4,
-            klo,
-            khi,
-            vmem_cap,
-            Some((&old, FEW_OLD_PAGES)),
-        )?;
-        Ok(vec![o, m, l])
-    });
-    let older: Branch<'_> = Box::new(move |f: &mut Func| {
-        let (o, m, l) = run(f, &s, ap, q4, klo, khi, vmem_cap, Some((&old, OLD_PAGES)))?;
-        Ok(vec![o, m, l])
-    });
-    let out = f.case(which, &outs, vec![walked, fresh, few, older])?;
+    let out = f.case(which, &outs, vec![walked, flashed])?;
     Ok(Flashed {
         o: out[0],
         m: out[1],
@@ -690,11 +657,10 @@ struct Older {
 }
 
 impl Older {
-    /// The rectangle's first `n` pages of keys and values, `[n · ps, w]`
-    /// each.
-    fn gather(&self, f: &mut Func, n: i64) -> Built<(Val, Val)> {
-        let at = f.slice_axis(self.pages, 0, 0, n)?;
-        let at = f.reshape(at, &[n, 1])?;
+    /// The rectangle's keys and values, `[OLD_PAGES · ps, w]` each.
+    fn gather(&self, f: &mut Func) -> Built<(Val, Val)> {
+        let n = OLD_PAGES;
+        let at = f.reshape(self.pages, &[n, 1])?;
         let dims = crate::hlo::GatherDims {
             offset_dims: vec![1, 2],
             collapsed_slice_dims: vec![0],
@@ -816,7 +782,7 @@ fn run(
     klo: Val,
     khi: Val,
     vmem_cap: i64,
-    old: Option<(&Older, i64)>,
+    old: &Older,
 ) -> Built<(Val, Val, Val)> {
     let Shape {
         r, rp, bq, bk, h, ..
@@ -864,25 +830,17 @@ fn run(
     // one, its rows past the fire never written back.
     let klo = f.reshape(klo, &[1, r])?;
     let khi = f.reshape(khi, &[1, r])?;
-    let out = match old {
-        None => {
-            let kern = kernel(s, vmem_cap, None)?;
-            kern.call(f, &[lo_blk, hi_blk, q2, ap.k, ap.v, klo, khi])?
-        }
-        Some((o, pages)) => {
-            let (olo, ohi) = blocks(f, o.klo, o.khi)?;
-            let okl = f.reshape(o.klo, &[1, r])?;
-            let okh = f.reshape(o.khi, &[1, r])?;
-            let (ok, ov) = o.gather(f, pages)?;
-            let kern = kernel(s, vmem_cap, Some(pages * o.ps))?;
-            kern.call(
-                f,
-                &[
-                    lo_blk, hi_blk, olo, ohi, q2, ap.k, ap.v, klo, khi, ok, ov, okl, okh,
-                ],
-            )?
-        }
-    };
+    let (olo, ohi) = blocks(f, old.klo, old.khi)?;
+    let okl = f.reshape(old.klo, &[1, r])?;
+    let okh = f.reshape(old.khi, &[1, r])?;
+    let (ok, ov) = old.gather(f)?;
+    let kern = kernel(s, vmem_cap, OLD_PAGES * old.ps)?;
+    let out = kern.call(
+        f,
+        &[
+            lo_blk, hi_blk, olo, ohi, q2, ap.k, ap.v, klo, khi, ok, ov, okl, okh,
+        ],
+    )?;
     let o = f.reshape(out[0], &[r, h.kvh, h.g, h.dv])?;
     // The max and sum come a row per head.
     let heads = |f: &mut Func, x: Val| -> Built<Val> {
@@ -908,15 +866,19 @@ mod tests {
         };
         let s = shape(1616, &h, 0.1, 110 << 20).unwrap();
         assert_eq!((s.rp, s.bq, s.bk, s.gf, s.gc), (1792, 256, 256, 2, 1));
-        let c = kernel(&s, 110 << 20, None).unwrap();
-        assert!(kernel(&s, 110 << 20, Some(1024)).is_ok());
+        let c = kernel(&s, 110 << 20, 256).unwrap();
         assert!(c.module.contains("iteration_bounds = array<i64: 7>"));
+        assert_eq!(
+            c.module.matches("tpu.matmul").count(),
+            2 * 8,
+            "one copy of each turn"
+        );
         assert!(c.module.contains("scratch_operands = 7 : i64"));
         assert!(
             c.module.contains("vector<256x512xf32>"),
             "scores keyed on the sublanes"
         );
-        assert_eq!(c.operands.len(), 7);
+        assert_eq!(c.operands.len(), 13);
         assert_eq!(c.results.len(), 3);
         if let Some(p) = std::env::var_os("FLASH_DUMP") {
             std::fs::write(p, &c.module).unwrap();
