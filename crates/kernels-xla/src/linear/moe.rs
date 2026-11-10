@@ -1153,6 +1153,7 @@ fn gmm_spec(
         prefetch: !mxfp4 || (16 * e <= p && p <= e * tm),
         sums: None,
         run: 1,
+        glu: None,
     };
     spec.out_width().ok().map(|_| spec)
 }
@@ -1202,6 +1203,7 @@ pub(crate) fn tile_projection(
         prefetch: false,
         sums,
         run: 1,
+        glu: None,
     };
     if spec.out_width().ok() != Some(n) {
         return Ok(None);
@@ -2491,30 +2493,51 @@ pub fn experts(
     let w = f.select(valid, w, none)?;
     let sorted = sorted(f, up, up_fan, x.val, r, valid, Some(w))?;
     let rows = up.tiles * up.tm;
-    let up_rows = tiles_of(f, up, &up_bank, &sorted, sorted.xs)?;
-    let held = Operand {
-        val: up_rows,
-        rows: rows as u32,
-        width: packed.width,
-        dtype: Dtype::Bf16,
-    };
-    let into = Landing {
-        rows: rows as u32,
-        width: intermediate,
-        dtype: Dtype::Bf16,
-    };
-    let hidden = match glu {
-        ExpertGlu::Swiglu => crate::linear::mlp::swiglu(f, held, intermediate, into)?,
-        ExpertGlu::GegluTanh => crate::linear::mlp::geglu_tanh_packed(f, held, intermediate, into)?,
-    };
     // The down leg is linear: a row weighted before it lands weighted (the
     // f32 GLU rounds to bf16 once, as before).
     let ws = sorted
         .ws
         .ok_or_else(|| refuse(OP, "the sort carried no weights"))?;
-    let wb = f.broadcast(ws, &[rows, i64::from(intermediate)], &[0])?;
-    let hidden = f.mul(hidden, wb)?;
-    let hidden = f.convert(hidden, Elem::Bf16);
+    // The GLU and the weight in the gate-up kernel, its rows half as wide.
+    let inside = crate::linear::moe_gmm::Gmm {
+        glu: Some(glu),
+        ..up
+    };
+    let hidden = if tuning.moe_gmm_glu
+        && up.stepping()
+        && up.orient == crate::linear::moe_gmm::Orient::NMajor
+        && inside.kernel().is_ok()
+    {
+        let wl = f.broadcast(ws, &[rows, 128], &[0])?;
+        let st = steps(f, inside, &sorted)?;
+        let w = up_bank.codes.val();
+        inside.kernel()?.call(
+            f,
+            &[st[0], st[1], st[2], st[3], st[4], st[5], sorted.xs, w, wl],
+        )?[0]
+    } else {
+        let up_rows = tiles_of(f, up, &up_bank, &sorted, sorted.xs)?;
+        let held = Operand {
+            val: up_rows,
+            rows: rows as u32,
+            width: packed.width,
+            dtype: Dtype::Bf16,
+        };
+        let into = Landing {
+            rows: rows as u32,
+            width: intermediate,
+            dtype: Dtype::Bf16,
+        };
+        let hidden = match glu {
+            ExpertGlu::Swiglu => crate::linear::mlp::swiglu(f, held, intermediate, into)?,
+            ExpertGlu::GegluTanh => {
+                crate::linear::mlp::geglu_tanh_packed(f, held, intermediate, into)?
+            }
+        };
+        let wb = f.broadcast(ws, &[rows, i64::from(intermediate)], &[0])?;
+        let hidden = f.mul(hidden, wb)?;
+        f.convert(hidden, Elem::Bf16)
+    };
     let down_rows = tiles_of(f, dn, &down_bank, &sorted, hidden)?;
     let n = i64::from(routed.width);
     // (A prompt's fire: a decode's lanes sum by the one-hot dot.)
