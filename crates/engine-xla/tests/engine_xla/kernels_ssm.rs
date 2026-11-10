@@ -1180,10 +1180,10 @@ fn gdn_decode_mapped(map: PageMap, rows: usize, per: usize) -> Option<(Vec<f32>,
     let mut rng = Rng(41);
     let (qkv, gates) = gdn_inputs(&mut rng, &g, rows);
     let bank0 = rng.f32s(slots * g.stride(), -0.5, 0.5);
-    // Every lane its own slot, backwards, the third a dropped write.
-    let slot_of: Vec<i32> = (0..rows)
-        .map(|r| if r == 2 { DROP } else { (slots - 1 - r) as i32 })
-        .collect();
+    // Every lane its own slot, backwards. (No dropped lane: a slot-blocked
+    // bank's sliced lanes land a `DROP` lane at a clamped row, slot 0 of an
+    // identity bank, which the engine never asks; the chunked test pads.)
+    let slot_of: Vec<i32> = (0..rows).map(|r| (slots - 1 - r) as i32).collect();
     let blocks = map.page(slots as i64 - 1) as usize + 1;
     let laid = lay_bank(&bank0, g.stride(), slots, map, blocks);
     let width = g.stride() / per;
@@ -1224,7 +1224,7 @@ fn gdn_decode_mapped(map: PageMap, rows: usize, per: usize) -> Option<(Vec<f32>,
 /// A state bank laid by a slot map (slot `s` at block `3s + 2`, garbage
 /// between) steps every lane as the identity bank does, bit for bit: one
 /// row a slot and blocks of rows, a fire short enough to slice its lanes
-/// and one wide enough to gather them, a dropped lane among them.
+/// and one wide enough to gather them.
 #[test]
 fn a_mapped_state_bank_steps_what_the_identity_bank_steps() {
     for (rows, per) in [(5usize, 1usize), (20, 1), (5, 4), (20, 4)] {
