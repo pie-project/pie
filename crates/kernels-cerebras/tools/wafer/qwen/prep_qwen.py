@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """qwen/prep_qwen.py <model dir> <outdir> <golden json> <plan dir> [prefix]
-Any Qwen3.5
-or Qwen3 (dense: every layer attention, no output gate, plain norm weights, full RoPE)
+Any Qwen3.5, or dense (every layer attention, no output gate, plain norm weights, full RoPE: Qwen3, Llama 3; q / k
+norms where the checkpoint has them, a scaled rotation's frequencies from the plan's FREQS)
 checkpoint (bf16 or f32 safetensors, the VL layout "model.language_model." or text-only "model.") in
 the wafer program prep format (the files PIE_CEREBRAS_WEIGHTS=<outdir>:<prefix> names; kernels-cerebras src/spatial/weights.rs
 copies them onto the wafer), cut as the plan in <plan dir> says (`wafer-compile plan`'s tiling.json). Units of PX x PY weight PEs, K layers each (the model's layer kinds, GDN / attention by
@@ -54,9 +54,10 @@ def bf16bits(name):
     return (a.view(np.uint32) >> 16).astype(np.uint16)        # (f32 checkpoints: truncation; tiny tests store bf16)
 
 H, I, NL = tc["hidden_size"], tc["intermediate_size"], tc["num_hidden_layers"]
-Q3 = "linear_num_key_heads" not in tc      # Qwen3 (dense): no GDN, no output gate, norm weights w (not 1 + w)
+Q3 = "linear_num_key_heads" not in tc      # dense (Qwen3, Llama 3): no GDN, no output gate, norm weights w (not 1 + w)
 GATE = 0 if Q3 else 1
-nq, nkv, hd = tc["num_attention_heads"], tc["num_key_value_heads"], tc["head_dim"]
+nq, nkv = tc["num_attention_heads"], tc["num_key_value_heads"]
+hd = tc.get("head_dim") or H // nq
 if Q3:
     nk, nv, hk, hv = nkv, nkv, hd, nq // nkv * hd     # (GDN's fields only shape unused buffers: DV = Qh Dc)
 else:
@@ -115,6 +116,9 @@ def perm(p):
 pd = np.array([perm(p) for p in pa])                       # [PX][Dc] head dims of each column
 assert sorted(set(pd[:cpa].reshape(-1).tolist())) == list(range(hd))
 inv = 1.0 / (theta ** (np.arange(0, rd, 2) / rd))         # rd / 2 frequencies (pairs i, i + rd / 2)
+if hasattr(g, "FREQS"):                                    # a scaled rotation: the trace's frequencies
+    inv = np.asarray(g.FREQS, np.float64)
+    assert inv.shape == (rd // 2,), (inv.shape, rd)
 
 def tile_in(W, idx):
     """W [out][H], idx [PX cols][N] -> [r][c][Hc][N] (row i = input dim r Hc + i)."""
@@ -178,7 +182,10 @@ for u in range(ULIM):
             parts.append(tile_in(Win, idx).reshape(PY, PX, -1))
             oidx = (qh[:, :, None] * hd + pd[:, None, :]).reshape(PX, Qh * Dc)
             parts.append(tile_out(get(A + "o_proj.weight"), oidx).reshape(PY, PX, -1))
-            qn, kn = nw(get(A + "q_norm.weight")), nw(get(A + "k_norm.weight"))
+            if A + "q_norm.weight" in T:
+                qn, kn = nw(get(A + "q_norm.weight")), nw(get(A + "k_norm.weight"))
+            else:                                                # no q / k norm (QKN 0): q's scale alone
+                qn, kn = np.ones(hd, np.float32), np.ones(hd, np.float32)
             qkw[u, :, a * (Qh * Dc + Dc):a * (Qh * Dc + Dc) + Qh * Dc] = np.tile(qn[pd] / np.sqrt(hd), (1, Qh))
             qkw[u, :, a * (Qh * Dc + Dc) + Qh * Dc:(a + 1) * (Qh * Dc + Dc)] = kn[pd]
             a += 1

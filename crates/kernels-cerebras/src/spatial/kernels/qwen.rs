@@ -1,9 +1,9 @@
-//! Qwen3.5 (GDN layers + gated full attention) and Qwen3 (dense attention, no output gate):
+//! Qwen3.5 (GDN layers + gated full attention), Qwen3 and Llama 3 (dense attention, no output gate):
 //! `weight_qwen.csl`, `ctl_cx.csl`, `ctl_cy_qwen.csl`, with the head's and the relay's
 //! ([`super::head`], [`super::common::RELAY`]). Their params from the plan ([`kernels`]) and
 //! their rcfg writers.
 
-use crate::spatial::abi::{FILLER, Kernel, KernelBuild, Kernels, Params, params};
+use crate::spatial::abi::{FILLER, Kernel, KernelBuild, Kernels, Lit, Params, params};
 use crate::spatial::block::gdn::{GDN, Gdn, SOURCE_NONE};
 use crate::spatial::block::segments::{ONORM, ONORM_CAST};
 use crate::spatial::block::token_loop::EMB_IN;
@@ -46,11 +46,12 @@ pub const SYMBOLS: &[(&str, &str)] = &[
 
 params! {
     /// `weight_qwen.csl`: layers a unit and the attention layers' mask, x's dims a row, the q /
-    /// MLP / GDN / KV shapes a column, the KV rows and entries, the levers' defaults.
+    /// MLP / GDN / KV shapes a column, the KV rows and entries, the levers' defaults, whether
+    /// the q / k heads are normed (`QKN`).
     pub struct WeightQwen {
         K: u32, Hc: u32, QO: u32, Ic: u32, MV: u32, KM: u32, NQA: u32, NQG: u32, GDN: u32,
         ATT: u32, DV: u32, DK: u32, Qh: u32, Dc: u32, NE: u32, PYW: u32, HD: u32, DIAG: u32,
-        FIFOW: u32, GDEC: u32, ATTL: u32, TSTAMP: u32,
+        FIFOW: u32, GDEC: u32, ATTL: u32, TSTAMP: u32, QKN: u32,
     }
 }
 
@@ -61,12 +62,13 @@ params! {
 
 params! {
     /// `ctl_cy_qwen.csl`: the layer mask and shapes as the weight kernel's, the hidden size
-    /// (`HR`), the conv width, the RoPE pairs and table levels, the levers' defaults.
+    /// (`HR`), the conv width, the RoPE pairs and table levels, the levers' defaults, the norms'
+    /// eps.
     pub struct CtlCyQwen {
         K: u32, KM: u32, NQA: u32, NQG: u32, Qh: u32, Dc: u32, DK: u32, DV: u32, Ic: u32,
         HR: u32, CONV: u32, NROT: u32, HK: u32, HV: u32, DIAG: u32, FIFOW: u32, SILU16: u32,
         CONVQK: u32, ATTV: u32, GDEC: u32, ATTL: u32, TSTAMP: u32, GATE: u32, SLW: u32,
-        RLV: u32, RBITS: u32,
+        RLV: u32, RBITS: u32, EPS: Lit,
     }
 }
 
@@ -190,6 +192,7 @@ pub fn kernels(prog: &Program) -> R<Kernels> {
                 GDEC: 1,
                 ATTL: 2,
                 TSTAMP: 0,
+                QKN: u32::from(s.attn.qk_norm),
             },
         )?,
     );
@@ -239,6 +242,7 @@ pub fn kernels(prog: &Program) -> R<Kernels> {
                 SLW: 0,
                 RLV: plan.contract.rope_levels,
                 RBITS: plan.contract.rope_bits,
+                EPS: Lit::f32(s.norm.eps),
             },
         )?,
     );

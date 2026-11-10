@@ -11,7 +11,8 @@ use serde::{Deserialize, Serialize};
 /// Which program family a plan builds (each is one [`super::family::Family`]).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum FamilyId {
-    /// Qwen3.5 (GDN + gated attention) and Qwen3 (dense attention, no output gate): `family/qwen.rs`.
+    /// Qwen3.5 (GDN + gated attention), Qwen3 and Llama 3 (dense attention, no output gate):
+    /// `family/qwen.rs`.
     Qwen,
     /// gpt-oss (attention / MoE column split, banded head): `family/gptoss.rs`.
     GptOss,
@@ -89,6 +90,7 @@ pub struct AttnSpec {
     pub global_head_dim: Option<u32>,
     /// Qwen3.5's sigmoid output gate.
     pub output_gate: bool,
+    /// RMSNorm over each q / k head before RoPE.
     pub qk_norm: bool,
     /// gpt-oss's attention sinks.
     pub sinks: bool,
@@ -151,11 +153,15 @@ pub struct HeadSpec {
     pub final_softcap: Option<f32>,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct RopeSpec {
     pub theta: f32,
     /// Rotated dims of a head (partial RoPE < head_dim).
     pub rotary_dims: u32,
+    /// Each rotated pair's inverse frequency where it is not `theta`'s own (a scaled rotation:
+    /// Llama 3's long waves stretched); `None`: `theta ^ (-2 i / rotary_dims)`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub freqs: Option<Vec<f32>>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize, Default)]

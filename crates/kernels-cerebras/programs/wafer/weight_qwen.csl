@@ -1,5 +1,5 @@
-// wafer/weight_qwen.csl: the wafer program weight PE for Qwen3.5 (Gated DeltaNet and gated attention
-// layers). Design and build: src/spatial/README.md.
+// wafer/weight_qwen.csl: the wafer program weight PE of the unit snake (Gated DeltaNet and attention
+// layers: Qwen3.5, Qwen3, Llama 3). Design and build: src/spatial/README.md.
 //
 // Role. A unit is PX x PY weight PEs plus a control column (CX, ctl_cx.csl: one PE a row, the
 // root of the row reductions) and a control row (CY, ctl_cy_qwen.csl: one PE a column, the root of
@@ -44,7 +44,7 @@
 // - >= 768 B between the image's used memory and 0xC000 (the stack, which the linker does not
 //   count; tools/wafer/chk_stack.py). At the 9B's GGGA kind this PE is the tight one.
 //
-// Params. Shape: K, Hc, QO, Ic, KM, NQA, NQG, GDN, ATT, DV, DK, Qh, Dc, NE, PYW, HD. Levers
+// Params. Shape: K, Hc, QO, Ic, KM, NQA, NQG, GDN, ATT, DV, DK, Qh, Dc, NE, PYW, HD, QKN. Levers
 // (default = the shipped 9B build): MV 1, GDEC 1, ATTL 2, SSQL 1. Diagnostics (default off):
 // TSTAMP (phase stamps), DIAG (bisection bits: 1 no layers, 2 one layer, 4 no MLP, 8 the column
 // reduction only, 16 the row reduction only). FIFOW: the FIFO depth.
@@ -67,6 +67,7 @@ param Dc: u16;         // attention kv dims a column
 param NE: u16;         // KV entries a row a layer (context = NE x rows)
 param PYW: u16 = 208;  // weight rows a unit (position p lives on row p % PYW, entry p / PYW)
 param HD: u16 = 256;   // attention head dim (the q/k RMSNorm's mean)
+param QKN: u16 = 1;    // 1: the q / k heads are RMS-normed (their rms scales the scores); 0: no q / k norm
 param GDEC: u16 = 1;   // 1: S^T k / S^T q of the undecayed state (CY scales them); the state decays at the update
 param ATTL: u16 = 2;   // 2: CY sends the heads' log-sum-exp steps in a second multicast, read after the o_proj send; 0: with o
 param SSQL: u16 = 1;   // 1: x's sum of squares arrives after x (ctl_cx.csl): taken after the matvec
@@ -461,13 +462,15 @@ fn att_mix(a: u16) void {
     }
     sx[Qh * NEl + Qh] = if (mine) ab[QD + 2 * Dc + 1 + Qh] else 0.0;
     if (role_s != 5) { seg_ar(nsl); }
-    if (mine) { kinv[a * NE + e0] = rsq(sx[Qh * NEl + Qh] / HDF + 1.0e-6); }
+    if (QKN == 1 and mine) { kinv[a * NE + e0] = rsq(sx[Qh * NEl + Qh] / HDF + 1.0e-6); }
     const ki = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{NE} -> kinv[i] });
     h = 0;
     while (h < Qh) : (h += 1) {
       const sh = @set_dsd_length(@increment_dsd_offset(sx_d, @as(i16, h * NEl), f32), NEl);
-      @fmuls(sh, sh, @increment_dsd_offset(ki, @as(i16, a * NE), f32));
-      @fmuls(sh, sh, rsq(sx[Qh * NEl + h] / HDF + 1.0e-6));
+      if (QKN == 1) {
+        @fmuls(sh, sh, @increment_dsd_offset(ki, @as(i16, a * NE), f32));
+        @fmuls(sh, sh, rsq(sx[Qh * NEl + h] / HDF + 1.0e-6));
+      }
       @fsubs(sh, sh, mref[a * Qh + h]);
     }
     exp_v(@set_dsd_length(sx_d, Qh * NEl), Qh * NEl);

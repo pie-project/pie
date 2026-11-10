@@ -1,5 +1,5 @@
-//! Qwen3.5 (GDN layers + gated full attention: 9B / 4B / 0.8B) and Qwen3 (dense attention, no
-//! output gate: Qwen3-8B): a snake of PX x PY units (at most one gap slot, whose PEs relay), the
+//! Qwen3.5 (GDN layers + gated full attention: 9B / 4B / 0.8B), Qwen3 and Llama 3 (dense
+//! attention, no output gate: Qwen3-8B, Llama 3.1 8B): a snake of PX x PY units (at most one gap slot, whose PEs relay), the
 //! scores segments on every weight row, GDN's (k, q) multicast and the o-norm segments where
 //! there are GDN layers, the head east of the units, the token loop. Kernels: [`qwen`].
 
@@ -160,17 +160,21 @@ impl Family for Qwen {
         })
     }
 
-    /// `qwen/prep_qwen.py`'s cut: PX, PY, UNX, UNY, K, HR, VR, NE, the units (NU) and the RoPE tables'
-    /// levels and digit bits (RLV, RBITS).
+    /// `qwen/prep_qwen.py`'s cut: PX, PY, UNX, UNY, K, HR, VR, NE, the units (NU), the RoPE tables'
+    /// levels and digit bits (RLV, RBITS) and, for a scaled rotation, its frequencies (FREQS).
     fn tiling(&self, plan: &Plan) -> R<serde_json::Value> {
         let p = &plan.partition;
         let (unx, uny) = p.unit_grid.ok_or("qwen: no unit grid")?;
-        Ok(serde_json::json!({
+        let mut t = serde_json::json!({
             "PX": p.cols, "PY": p.rows, "UNX": unx, "UNY": uny, "NU": p.units,
             "K": p.layers_per_unit, "HR": p.head.rows, "VR": p.head.vocab_rows,
             "NE": p.kv_entries.per_row, "RLV": plan.contract.rope_levels,
             "RBITS": plan.contract.rope_bits,
-        }))
+        });
+        if let Some(f) = &plan.shape.rope.freqs {
+            t["FREQS"] = serde_json::json!(f);
+        }
+        Ok(t)
     }
 
     fn blocks(&self, plan: &Plan) -> R<Vec<Box<dyn Block>>> {

@@ -263,7 +263,7 @@ pub fn kernels(prog: &Program) -> R<Kernels> {
         NROT: d.nrot,
         HR: hr,
         NLV: d.nlv,
-        QSC: Lit(py_float(qsc)),
+        QSC: Lit::f64(qsc),
         CYV: 2,
         DIAG: 0,
         TSTAMP: 0,
@@ -293,17 +293,6 @@ pub fn kernels(prog: &Program) -> R<Kernels> {
     out.insert(Kind::HEAD_CTL, KernelBuild::of(&HEAD_CTL_BAND, hc)?);
     out.insert(Kind::IDLE, KernelBuild::of(&FILLER, Params::default())?);
     Ok(out)
-}
-
-/// Python's `repr(float)` for the layout's `QSC` literal (shortest round-trip, at least one
-/// decimal: `0.125`, `0.25`).
-fn py_float(v: f64) -> String {
-    let s = format!("{v:?}");
-    if s.contains('.') || s.contains('e') {
-        s
-    } else {
-        format!("{s}.0")
-    }
 }
 
 /// `pe` as a band PE sees it: the bus colour reserved.

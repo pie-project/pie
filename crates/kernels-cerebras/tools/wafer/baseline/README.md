@@ -12,7 +12,8 @@ refactor that must not change behaviour can be checked file for file against the
   - Gemma 4 E2B, E4B (as on chip: PYW 128, NES 4, NEG 20; and at its staged params: PYW 160, NEG 16), 12B (exact
     ring);
   - gpt-oss-20b (CYV 2, GLUV 1);
-  - tiny: Qwen3.5 t08 and t4, Qwen3 dense with and without a gap slot, Gemma, Gemma 12B, gpt-oss.
+  - tiny: Qwen3.5 t08 and t4, Qwen3 dense with and without a gap slot, Llama 3 (no q / k norm, eps 1e-5, its scaled
+    rotation: `qwen/mk_tiny_llama.py`), Gemma, Gemma 12B, gpt-oss.
 - `capture.py <out> [names]`: per config (see its docstring for the files):
   - `plan/`: `wafer-compile plan`'s `plan.json` and `tiling.json`;
   - `prep/` (tiny only): the prep's files;

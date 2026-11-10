@@ -179,8 +179,10 @@ default is the shipped build. Each kernel's header describes its own params and 
 | `FIFOW` | all | 32 | the reductions' FIFO depth |
 | `SLW` | serve8b_region regions; wafer program CY | 0 | the f16 SiLU without its subnormal flush (the tail to 2^-24). Planner key `silu16w`; Qwen3-8B needs it on both layouts (`tools/emu/silu16.py`): the flush costs 2 golden tokens in emulation. |
 | `GATE` | CY | 1 | attention's q_proj carries the output gate (Qwen3.5). Qwen3 (dense): 0, NQA = Qh Dc + 2 Dc. |
+| `QKN` | weight | 1 | the q / k heads are RMS-normed (Qwen3.5, Qwen3): their rms scales the scores. 0 (Llama 3): no q / k norm; `qkw` holds q's 1/sqrt(head dim) alone. From the shape (`qk_norm`). |
+| `EPS` | CY | 1e-6 | the RMSNorms' eps (hidden and GDN's gated norm; Llama 3: 1e-5). From the shape (`norm.eps`). GDN's q / k l2 norms keep 1e-6. |
 | `GAPX`, `GAPY` | layout | 255 | the unit slot left out of the snake (relay PEs); from the plan (units one short of the slots) |
-| `RLV`, `RBITS` | CY | 4, 3 | RoPE tables: a position is RLV digits of RBITS bits, cos / sin composed from one table entry a digit; positions < 2^(RBITS RLV). The plan takes the levels its context needs (9B / 4B / 0.8B: 5) unless set (`RLV`); the prep writes the tables, `ArtifactModel` bounds its positions there. |
+| `RLV`, `RBITS` | CY | 4, 3 | RoPE tables: a position is RLV digits of RBITS bits, cos / sin composed from one table entry a digit; positions < 2^(RBITS RLV). The plan takes the levels its context needs (9B / 4B / 0.8B: 5) unless set (`RLV`); the prep writes the tables, `ArtifactModel` bounds its positions there. | A scaled rotation (Llama 3's) turns at the trace's frequencies: the plan's `rope.freqs`, the prep's `FREQS`.
 
 `head_ctl`, `head_pe` and `CX` always write a few `tdbg` stamps. These are off the critical path:
 `head_ctl`'s `tdbg[2 + s]` is the token loop's clock.

@@ -29,7 +29,7 @@
 //
 // Params. Shape: K, KM, NQA, NQG, Qh, Dc, DK, DV, Ic, HR (hidden), CONV, NROT, HK, HV. Levers
 // (default = the shipped 9B build): CONVQK 1, ATTV 1, GDEC 1, ROPEP 1, SILU16 1, SILUQ 1, ATTL 2
-// (0: the steps ride with o), SLW 0. Model: GATE (1 Qwen3.5's gated attention; 0 Qwen3). Diagnostics (default off): TSTAMP, DIAG (as weight_qwen.csl).
+// (0: the steps ride with o), SLW 0. Model: GATE (1: gated attention), EPS (the norms' eps). Diagnostics (default off): TSTAMP, DIAG (as weight_qwen.csl).
 param memcpy_params;
 param DIAG: u16 = 0;   // 1 (diagnostics): no layers (handoffs, head and I/O only)
 param K: u16;
@@ -58,7 +58,8 @@ param FIFOW: u16 = 32; // the reduction's FIFO depth (words)
 param GATE: u16 = 1;   // 1: attention's q_proj carries the output gate (Qwen3.5); 0: none (Qwen3: NQA = Qh Dc q | Dc k | Dc v)
 param RLV: u16 = 4;    // RoPE table levels: a position is RLV digits of RBITS bits (4 x 3: 4,096 positions; 5: 32,768)
 param RBITS: u16 = 3;
-param SLW: u16 = 0;    // 1: silu16 without the f16 subnormal flush (the tail to 2^-24; serve8b_region's SLW)
+param SLW: u16 = 0;    // 1: silu16 without the f16 subnormal flush (the tail to 2^-24)
+param EPS: f32 = 1.0e-6; // the RMSNorms' eps (the hidden norms and GDN's gated norm)
 
 const sys_mod = @import_module("<memcpy/memcpy>", memcpy_params);
 const tile_config = @import_module("<tile_config>");
@@ -78,7 +79,7 @@ const NLG: u16 = K - NLA;
 const NCH: u16 = 2 * DK + DV;              // conv channels a column
 const TN: u16 = mx(mx(mx(NQA + 1, NQG + 1), mx(2 * Ic + 1, 2 * DV + 3)), Qh * Dc + 2 * Dc + 2 + Qh);
 const KO: u16 = (1 + GATE) * Qh * Dc;      // attention: k's offset in the reduction (after q and the gate)
-const EPS: f32 = 1.0e-6;
+const L2EPS: f32 = 1.0e-6;               // GDN's q / k l2 norms
 const HID: f32 = @as(f32, HR);
 
 var t = @zeros([TN]f32);                   // a reduction's sum
@@ -478,8 +479,8 @@ fn gdn_post(g: u16, bt: f32) void {
   reduce(2 * DV + 3);
   stamp(1 + 6 * cl + 2);
   if (GDEC == 1) { @fmuls(tv(0, 2 * DV), tv(0, 2 * DV), gdec); }
-  const ik = rsqrt(t[2 * DV] + EPS);
-  const iq0 = rsqrt(t[2 * DV + 1] + EPS);
+  const ik = rsqrt(t[2 * DV] + L2EPS);
+  const iq0 = rsqrt(t[2 * DV + 1] + L2EPS);
   const kq = t[2 * DV + 2] * ik * iq0;
   const iq = iq0 * rsqrt(@as(f32, HK));
   const vsd = @set_dsd_length(@get_dsd(mem1d_dsd, .{ .tensor_access = |i|{DV} -> vz[i] }), DV);

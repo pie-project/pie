@@ -198,6 +198,25 @@
    "source": ""
   },
   {
+   "name": "tiny_llama",
+   "kind": "tiny",
+   "shape": "shapes/tiny_llama.json",
+   "preset": "tiny-q3",
+   "set": "G2=2,WL=1,G2W=2",
+   "ckpt": "llama/tiny/hf",
+   "prep": [
+    "qwen/prep_qwen.py",
+    "{ckpt}",
+    "{out}",
+    "{ckpt}/golden.json",
+    "{plan}"
+   ],
+   "prefix": "",
+   "vocab": 80,
+   "levers": "",
+   "source": "tools/wafer/qwen/mk_tiny_llama.py (SEED 5)"
+  },
+  {
    "name": "tiny_gemma",
    "kind": "tiny",
    "shape": "shapes/tiny_gemma.json",

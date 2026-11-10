@@ -7,8 +7,8 @@
 
 use poem_compiler::spatial::{BlockKind, SpatialGraph, SpatialTarget};
 use poem_ir::{
-    Attn, Def, Elemwise, Gather, GluAct, Linear, NormAxis, NormWeight, Operation, Ssm, Trace, Turn,
-    ValueId,
+    Attn, Def, Elemwise, Gather, GluAct, Linear, NormAxis, NormWeight, Operation, RopeFreqs, Ssm,
+    Trace, Turn, ValueId,
 };
 
 use super::family;
@@ -37,7 +37,7 @@ struct Layer {
     plus_one: bool,
     gate: bool,
     sink: bool,
-    rope: Option<(f32, u32)>,
+    rope: Option<RopeSpec>,
 }
 
 /// The node that makes `v`, if an op does.
@@ -55,6 +55,35 @@ fn act(a: &GluAct) -> R<Act> {
         GluAct::SwigluAlpha { .. } => Ok(Act::SwigluOai),
         a => Err(format!("wafer: no kernel runs the MLP activation {a:?}")),
     }
+}
+
+/// A rotation as the CY's RoPE tables take it: the trace's frequencies kept only where they are
+/// not `theta`'s own (a scaled rotation), and no cos / sin scale.
+fn rope(theta: f32, rotary_dims: u32, freqs: Option<&RopeFreqs>) -> R<RopeSpec> {
+    let freqs = match freqs {
+        None => None,
+        Some(f) if f.mscale != 1.0 => {
+            return Err(format!(
+                "wafer: no kernel scales RoPE's cos / sin (mscale {})",
+                f.mscale
+            ));
+        }
+        Some(f) => {
+            let own = (0..rotary_dims / 2)
+                .map(|i| 1.0 / f64::from(theta).powf(f64::from(2 * i) / f64::from(rotary_dims)));
+            let same = f.inv_freq.len() == (rotary_dims / 2) as usize
+                && f.inv_freq
+                    .iter()
+                    .zip(own)
+                    .all(|(&a, b)| (f64::from(a) - b).abs() <= 1e-6 * b);
+            (!same).then(|| f.inv_freq.clone())
+        }
+    };
+    Ok(RopeSpec {
+        theta,
+        rotary_dims,
+        freqs,
+    })
 }
 
 /// The model's [`Shape`], read off its trace: the layers (GDN, attention over the whole sequence
@@ -155,13 +184,14 @@ pub fn shape(trace: &Trace) -> R<Shape> {
                 theta,
                 turn,
                 head_dim,
+                freqs,
                 ..
             }) if y.rope.is_none() => {
-                let rotary = match turn {
+                let rotary_dims = match turn {
                     Turn::Partial { rotary_dim, .. } => *rotary_dim,
                     _ => *head_dim,
                 };
-                y.rope = Some((*theta, rotary));
+                y.rope = Some(rope(*theta, rotary_dims, freqs.as_ref())?);
             }
             Operation::Gather(Gather::Select { width, .. }) => ple = Some(*width),
             _ => {}
@@ -210,10 +240,14 @@ pub fn shape(trace: &Trace) -> R<Shape> {
         top_k,
         expert_intermediate: intermediate,
     });
-    let (theta, rotary_dims) = layers
+    let rope = layers
         .iter()
-        .find_map(|y| y.rope)
-        .unwrap_or((0.0, head_dim));
+        .find_map(|y| y.rope.clone())
+        .unwrap_or(RopeSpec {
+            theta: 0.0,
+            rotary_dims: head_dim,
+            freqs: None,
+        });
     Ok(Shape {
         hidden,
         vocab,
@@ -241,7 +275,7 @@ pub fn shape(trace: &Trace) -> R<Shape> {
             tied,
             final_softcap: softcap,
         },
-        rope: RopeSpec { theta, rotary_dims },
+        rope,
         norm: NormSpec {
             eps: eps.unwrap_or(1e-6),
             unit_offset: layers.iter().any(|y| y.plus_one),
@@ -444,6 +478,11 @@ mod tests {
                 "full",
                 (FamilyId::GptOss, 12, 2, 352, 160, 18, 272),
             ),
+            (
+                "llama31-8b-bf16-kv-bf16",
+                "9b",
+                (FamilyId::Qwen, 8, 4, 256, 256, 16, 216),
+            ),
         ] {
             let p = plan(&trace(name), Some(preset), "").unwrap().plan;
             let q = &p.partition;
@@ -458,6 +497,27 @@ mod tests {
             );
             assert_eq!(got, want, "{name}");
         }
+    }
+
+    /// Llama 3.1 8B: dense attention with no q / k norm, its rotation Llama 3's (the long waves
+    /// stretched: frequencies of their own), eps 1e-5; with no preset named, the first that fits.
+    #[test]
+    fn llama_plans_from_its_trace() {
+        let p = plan(&trace("llama31-8b-bf16-kv-bf16"), None, "")
+            .unwrap()
+            .plan;
+        let s = &p.shape;
+        assert_eq!(p.family, FamilyId::Qwen);
+        assert!(!s.attn.qk_norm && !s.attn.output_gate && s.gdn.is_none());
+        assert_eq!(
+            (s.attn.q_heads, s.attn.kv_heads, s.attn.head_dim),
+            (32, 8, 128)
+        );
+        assert_eq!(s.norm.eps, 1e-5);
+        let f = s.rope.freqs.as_ref().expect("llama3's frequencies");
+        assert_eq!(f.len(), 64);
+        assert_eq!(f[0], 1.0);
+        assert!(f[63] < 500_000f32.powf(-126.0 / 128.0) / 7.0);
     }
 
     /// With no preset named, the pass keeps the first of the family's that builds: Qwen3.5-0.8B's

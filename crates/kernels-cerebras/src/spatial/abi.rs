@@ -50,6 +50,28 @@ impl From<bool> for Value {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Lit(pub String);
 
+impl Lit {
+    /// The shortest literal that reads back as `v`, its mantissa with a decimal point (`0.125`,
+    /// `1.0e-6`).
+    pub fn f64(v: f64) -> Lit {
+        Lit::decimal(format!("{v:?}"))
+    }
+
+    /// As [`Lit::f64`], shortest at f32 (`1.0e-5`, not the f64 widening's digits).
+    pub fn f32(v: f32) -> Lit {
+        Lit::decimal(format!("{v:?}"))
+    }
+
+    fn decimal(s: String) -> Lit {
+        let (m, e) = s.split_at(s.find('e').unwrap_or(s.len()));
+        Lit(if m.contains('.') {
+            s
+        } else {
+            format!("{m}.0{e}")
+        })
+    }
+}
+
 impl From<Lit> for Value {
     fn from(v: Lit) -> Value {
         Value::Float(v.0)
