@@ -9,7 +9,6 @@
 
 use std::collections::HashSet;
 use std::io::Write;
-use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 
@@ -18,6 +17,34 @@ use serde_json::{Value, json};
 use uuid::Uuid;
 
 use super::HandleError;
+
+trait Links {
+    fn nlink(&self) -> u64;
+    fn ino(&self) -> u64;
+}
+
+#[cfg(unix)]
+impl Links for std::fs::Metadata {
+    fn nlink(&self) -> u64 {
+        std::os::unix::fs::MetadataExt::nlink(self)
+    }
+
+    fn ino(&self) -> u64 {
+        std::os::unix::fs::MetadataExt::ino(self)
+    }
+}
+
+#[cfg(not(unix))]
+impl Links for std::fs::Metadata {
+    fn nlink(&self) -> u64 {
+        2
+    }
+
+    fn ino(&self) -> u64 {
+        static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+    }
+}
 use super::held::{Held, Parts};
 use crate::inferlet::ProcessId;
 use crate::inferlet::host::working_set::Cursor;
