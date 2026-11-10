@@ -443,3 +443,15 @@ The `new-memory/` directory is bookkeeping and is removed before anything lands 
 - Verified sm_120: moe_table / moe_table_fp8 / moe_table_fp4 bitwise vs contiguous under scattered pools; the timing
   test failed once under a concurrent IT run (247 vs 74 us), passes alone (table 27 us vs contiguous 44 us).
 - Next: L40S builds PLE streaming on RowTable (`sc/l40s-wc-ple`).
+
+### M32 — 2026-11-10: WL merged (window kv = trimmed list, ring deleted; contract 21)
+- `sc/wl-window-list` (7fde8f1d7): `SlotKind::List { window }`, ring layout/RingCap/RING_FIRE_ROWS/small-window fold
+  and `KvDelta::window_copies` deleted; runtime "window set" (one slot of every window list per kv page, refcounted,
+  forks + prefix-cache checkpoints share, trims by widest window, epoch-fenced); window models may now checkpoint.
+  Metal states the new form; CUDA/XLA/Cerebras read window copies from the pre-launch copy (CUDA ring kernels -> BC).
+- Verified: cargo check --tests compiler/engine/runtime(+metal)/worker/cuda/xla/cerebras/metal/vulkan/wgpu; chunk
+  lib+golden; engine chunk; runtime store:: + pipeline::fire::rs 92 pass incl. trim boundary, long prefill, fork /
+  checkpoint sharing, draft rows.
+- Waste regression (T forced to the kv page): models with windows CUDA 0.36 -> 1.19%, Metal 2.43 -> 4.47%;
+  dsv41-flash-dspark 1.33 -> 19.3 / 5.9 -> 45.7, dsv4-base 0.48 -> 16.6 / 7.1 -> 22.8. -> WL2: per-window T_w and
+  independent trimming.

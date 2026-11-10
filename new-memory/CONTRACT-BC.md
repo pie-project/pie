@@ -90,3 +90,13 @@ Proposed by the L40S session (branch `sc/l40s-bc`), accepted by New Pie. Runtime
     before any lane of the fire reads or writes (after earlier fires); no two copies share a dst; `pages` already
     names dst; `validate_chunks` checks them like table refs. A buffered write no longer forces record CoW. A model
     that buffers rs rows must state an rs-list shape.
+21. **Window-list fields (fills in 19).** `SlotKind::List { tokens, rate, window: Option<u32> }` (serde default
+    None); `window: Some(w)` retains w rows, role State. `ChunkFacts::validate` refuses two window lists with the same
+    w, `Some(0)`, and an RsBuffer with a window. `Lane.tables` holds the kv list's table and one table per window list
+    in token order; ref 0 (null chunk) = trimmed or never written; `validate_chunks` accepts ref 0 only in a window
+    list's table, never in `slot_copies`. Trimmed once the slot's last row < `committed_end - window` (settled
+    commits only; draft rows never count), freed through the per-fire epoch. A write into a shared window slot is
+    preceded by a whole-slot copy in `Lane.slot_copies` under that window list's shape id. `KvDelta::window_copies` is
+    removed. INTERIM (until WL2): every window list's tokens equal the kv list's, its table is indexed by kv page, and
+    one slot of every window list per kv page is taken/trimmed as a unit (trimmed by the widest window).
+    WL2 target: each window list has its own T_w and its own table length, trimmed independently.
