@@ -105,6 +105,11 @@ pub struct Gmm {
     /// a step a tile). The step's rows go through one dot, so the MXU loads
     /// each weight tile once for up to `run · tm` rows.
     pub run: i64,
+    /// The GLU a stepping kernel over a row-major bank of packed gate and
+    /// up halves takes before its rows land: each row lands its halves'
+    /// GLU times its weight (`ins[2]`, f32 `[rows, 128]`, the weight in
+    /// every lane), `N / 2` wide, in bf16.
+    pub glu: Option<crate::linear::moe::ExpertGlu>,
 }
 
 /// How the weights are cut into blocks.
@@ -194,6 +199,7 @@ impl Gmm {
     /// Columns of a result row.
     pub fn out_width(&self) -> Built<i64> {
         Ok(match self.cut()? {
+            Cut::Blocked { .. } if self.glu.is_some() => self.n / 2,
             Cut::Blocked { .. } => self.n,
             Cut::Element { width } => width,
         })
@@ -307,18 +313,40 @@ impl Gmm {
             window: Window::Any,
             index: Box::new(|b: &mut Body, _: &Grid| Ok(vec![b.i32(0), b.i32(0)])),
         };
+        let glu = self.glu;
+        if glu.is_some() && (orient != Orient::NMajor || out_elem != Elem::Bf16 || n % 32 != 0) {
+            return bad(format!("a GLU over {self:?}"));
+        }
+        // The rows' width as they land: half a packed GLU's.
+        let wo = self.out_width()?;
         let out = Operand {
-            array: vec![rows, n],
+            array: vec![rows, wo],
             elem: out_elem,
-            block: vec![rows, n],
+            block: vec![rows, wo],
             window: Window::Any,
             index: Box::new(|b: &mut Body, _: &Grid| Ok(vec![b.i32(0), b.i32(0)])),
         };
+        // Each row's weight, read as the rows are.
+        let weights = glu.map(|_| Operand {
+            array: vec![rows, 128],
+            elem: Elem::F32,
+            block: vec![j * tm, 128],
+            window: Window::Element,
+            index: Box::new(move |b: &mut Body, g: &Grid| {
+                let s = last(b, g)?;
+                let si = b.as_index(s)?;
+                let t = b.load(g.prefetch[4], &[si])?;
+                let tt = b.i32(tm);
+                let at = b.muli(t, tt)?;
+                let at = b.assume_multiple(at, tm)?;
+                Ok(vec![at, b.i32(0)])
+            }),
+        });
         let wb = self.wbytes();
         let convert = if self.w == Elem::Bf16 { 0 } else { k * n * 2 };
         let ob = i64::from(out_elem.bits()) / 8;
         let vmem =
-            2 * j * tm * k * 2 + 2 * k * n * wb + convert + j * tm * n * 4 + 2 * j * tm * n * ob;
+            2 * j * tm * k * 2 + 2 * k * n * wb + convert + j * tm * n * 4 + 2 * j * tm * wo * ob;
         let floor = (32 << 20).min(self.vmem_cap);
         let limit = (vmem * 2 + (8 << 20)).clamp(floor, self.vmem_cap);
         let steps = self.steps();
@@ -334,13 +362,16 @@ impl Gmm {
                 vec![steps],
                 vec![steps],
             ],
-            ins: vec![xs, bank],
+            ins: [Some(xs), Some(bank), weights]
+                .into_iter()
+                .flatten()
+                .collect(),
             outs: vec![out],
             vmem_limit: Some(limit as u64),
             scratch: vec![
                 MTy::Ref(vec![2, rb, cb], self.w, Space::Vmem),
                 MTy::Sem(vec![2]),
-                MTy::Ref(vec![2, j * tm, n], out_elem, Space::Vmem),
+                MTy::Ref(vec![2, j * tm, wo], out_elem, Space::Vmem),
                 MTy::Sem(vec![2]),
             ],
         };
@@ -379,9 +410,9 @@ impl Gmm {
                 let tt = b.i32(tm);
                 let at = b.muli(t, tt)?;
                 let at = b.assume_multiple(at, tm)?;
-                let src = b.ref_slice(obuf, &[slot, z, z], &[1, c * tm, n])?;
+                let src = b.ref_slice(obuf, &[slot, z, z], &[1, c * tm, wo])?;
                 let src = b.ref_squeeze(src)?;
-                let dst = b.ref_slice(outr, &[at, z], &[c * tm, n])?;
+                let dst = b.ref_slice(outr, &[at, z], &[c * tm, wo])?;
                 let sem = b.ref_slice(osems, &[slot], &[1])?;
                 let sem = b.ref_squeeze(sem)?;
                 Ok((src, dst, sem))
@@ -454,13 +485,42 @@ impl Gmm {
                     b.when(is, |b| {
                         let zi = b.index(0);
                         let x = b.vload(blk.ins[0], &[zi, zi], &[c * tm, k])?;
-                        let w = b.vload_all(held)?;
-                        let w = b.convert_f(w, Elem::Bf16)?;
-                        let acc = b.splat_f(&[c * tm, n], Elem::F32, 0.0)?;
-                        let y = b.matmul(x, w, acc, orient == Orient::NMajor)?;
-                        let y = b.convert_f(y, out_elem)?;
+                        let y = match glu {
+                            Some(act) => {
+                                // Each half's dot over its rows of the
+                                // expert's block, rounded to bf16 as the
+                                // select's rows land, then the GLU and the
+                                // weight in f32, rounded once.
+                                let h = n / 2;
+                                let half = |b: &mut Body, at: i64| -> Built<V> {
+                                    let zi = b.index(0);
+                                    let ri = b.index(at);
+                                    let w = b.vload(held, &[ri, zi], &[h, k])?;
+                                    let w = b.convert_f(w, Elem::Bf16)?;
+                                    let acc = b.splat_f(&[c * tm, h], Elem::F32, 0.0)?;
+                                    let y = b.matmul(x, w, acc, true)?;
+                                    let y = b.convert_f(y, Elem::Bf16)?;
+                                    b.convert_f(y, Elem::F32)
+                                };
+                                let g = half(b, 0)?;
+                                let u = half(b, h)?;
+                                let a = glu_of(b, act, g, u, &[c * tm, h])?;
+                                let wv = b.vload(blk.ins[2], &[zi, zi], &[c * tm, 128])?;
+                                let wv = b.slice(wv, &[0, 0], &[c * tm, 1])?;
+                                let wv = b.broadcast(wv, &[c * tm, h])?;
+                                let a = b.mulf(a, wv)?;
+                                b.convert_f(a, out_elem)?
+                            }
+                            None => {
+                                let w = b.vload_all(held)?;
+                                let w = b.convert_f(w, Elem::Bf16)?;
+                                let acc = b.splat_f(&[c * tm, n], Elem::F32, 0.0)?;
+                                let y = b.matmul(x, w, acc, orient == Orient::NMajor)?;
+                                b.convert_f(y, out_elem)?
+                            }
+                        };
                         let z = b.i32(0);
-                        let dst = b.ref_slice(obuf, &[oslot, z, z], &[1, c * tm, n])?;
+                        let dst = b.ref_slice(obuf, &[oslot, z, z], &[1, c * tm, wo])?;
                         let dst = b.ref_squeeze(dst)?;
                         b.vstore_all(y, dst)?;
                         let (src, dst, sem) = ocopy(b, s, oslot, c)?;
@@ -983,6 +1043,45 @@ impl Gmm {
     }
 }
 
+/// `act(g) · u` over f32 `dims` vectors, as `linear::mlp`'s GLUs take it:
+/// SwiGLU `g · σ(g) · u`, GeGLU `0.5 g (1 + tanh(√(2/π) (g + 0.044715 g³))) u`.
+fn glu_of(b: &mut Body, act: crate::linear::moe::ExpertGlu, g: V, u: V, dims: &[i64]) -> Built<V> {
+    let k = |b: &mut Body, x: f64| b.splat_f(dims, Elem::F32, x);
+    let a = match act {
+        crate::linear::moe::ExpertGlu::Swiglu => {
+            let m = k(b, -1.0)?;
+            let ng = b.mulf(g, m)?;
+            let e = b.exp(ng)?;
+            let one = k(b, 1.0)?;
+            let d = b.addf(e, one)?;
+            let one = k(b, 1.0)?;
+            let s = b.divf(one, d)?;
+            b.mulf(g, s)?
+        }
+        crate::linear::moe::ExpertGlu::GegluTanh => {
+            let x2 = b.mulf(g, g)?;
+            let x3 = b.mulf(x2, g)?;
+            let c = k(b, 0.044715)?;
+            let x3 = b.mulf(x3, c)?;
+            let inner = b.addf(g, x3)?;
+            let c = k(b, (2.0 / std::f64::consts::PI).sqrt())?;
+            let inner = b.mulf(inner, c)?;
+            let t = b.op(
+                "math.tanh",
+                &[inner],
+                "fastmath = #arith.fastmath<none>",
+                &[MTy::Vector(dims.to_vec(), Elem::F32)],
+            )[0];
+            let one = k(b, 1.0)?;
+            let t = b.addf(t, one)?;
+            let half = k(b, 0.5)?;
+            let hx = b.mulf(g, half)?;
+            b.mulf(hx, t)?
+        }
+    };
+    b.mulf(a, u)
+}
+
 /// Each `h`-wide head's lane-wise partial sums of squares of the rows just
 /// stored in `rows` (`[tm, cols]`, as the norm reads them): a slab of 256
 /// rows at a time, the head's `h / 128` lane tiles widened to f32, squared
@@ -1383,6 +1482,7 @@ mod tests {
             prefetch: false,
             sums: None,
             run: 1,
+            glu: None,
         }
     }
 
