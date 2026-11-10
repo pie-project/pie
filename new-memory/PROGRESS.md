@@ -815,3 +815,13 @@ The `new-memory/` directory is bookkeeping and is removed before anything lands 
   and serve (dense planes on the pinned host tier, experts in the pool), max 0.125 vs unbudgeted, no top-token change.
 - Known (pre-existing): a budgeted load arms a dense rotor and walks every fire eagerly (no recorded bodies) -> perf
   follow-up. RSS re-check pending (IT).
+
+### M61 — 2026-11-10: CUDA tier copies on the swap stream
+- `sc/l40s-tier-swap` (28aa8371b): device<->host copy_slots run on the swap stream behind compute with an event; fires
+  naming a moving kv slot wait for it; window / record / rs-list moves are "wide" (every fire waits); slot-touching
+  ops without names wait for all moves. `tier-inline` diagnostic restores the old path. golden_offload with a 0.5 GB
+  bulk move beside a step: all steps same.
+- Gain small (step beside the move 26.8 -> 22.5 ms dsv4 mini). Real cost found: copy_slots blocks 265-430 ms pinning
+  host-tier chunks on first use -> pre-pin the host tier (assigned).
+- Rotor (budgeted loads walk eagerly) scoped: recordable in principle (static per-fire copy plan; copy stream joins the
+  capture via events); medium, risk in aligning body cuts with rotor regions. Scheduled after quantized banks.
