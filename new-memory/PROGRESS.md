@@ -1021,3 +1021,11 @@ The `new-memory/` directory is bookkeeping and is removed before anything lands 
   Optimized HLO diff +0 vs +1040: same ops / kernels, different memory-space assignment (VMEM vs HBM) and fusion
   grouping around the opaque DMA custom calls -> moved bf16 roundings in routed MLP / attention. Accepted under the
   kernel-arm rule (max 0.03, no top-token change). TPU now on the perf-parity gaps.
+
+### M78 — 2026-11-10: engine-cuda legacy expert tier deleted
+- `sc/l40s-legacy-tier` (745055eb4, -1,564 / +195): Plan.banks/seated, Tier seats/berths/votes/promote/cells,
+  deferred fill and T2 counters, WeightRow::Streamed, the hosts_experts recording gate, Residency/Boot.deferred_tier
+  ([model] host_weight_deferred refused). Tier keeps only pinned images of plan-pinned planes and file-mapped planes.
+  Goldens / rows / held_small / experts = base; build matrix clean.
+- Left: kernels-cuda / kernels-rocm still take a GroupSeat argument always passed RESIDENT -> remove (CUDA side L40S,
+  HIP side AMD) before the quantized formats.
