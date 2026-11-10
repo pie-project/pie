@@ -33,10 +33,14 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::sync::RwLock;
 
-use ::engine::chunk::{ResidentWeight, WeightAtom, WeightResidency, WeightShape, WeightUses};
+use ::engine::chunk::{
+    ChunkFacts, ResidentWeight, WeightAtom, WeightResidency, WeightShape, WeightUses,
+};
 use serde::{Deserialize, Serialize};
 
-use super::slots::{Holder, ShapeId, ShapeKind, Slot, SlotError, SlotPool, SlotShape};
+use super::slots::{
+    Holder, ShapeId, ShapeKind, Slot, SlotError, SlotPool, SlotPoolFacts, SlotShape,
+};
 use crate::governor::{Demand, Growth, PoolTarget, Retarget};
 
 /// Whether streamable weights may be evicted from the device
@@ -101,6 +105,38 @@ pub fn pool_shapes(weights: &[WeightShape]) -> Vec<SlotShape> {
             slots_per_chunk: weight.slots_per_chunk,
         })
         .collect()
+}
+
+/// The pool the weight shapes take their slots from until the pool switch
+/// sets them beside kv and state: the device's chunks above every reserved
+/// and pinned run, short of the activation at the top, in the engine's
+/// chunk ids; [`pool_shapes`] of `facts.weights` from shape 0. The
+/// degenerate mode's pinned runs take every chunk, so it has none.
+#[must_use]
+pub fn slot_pool(facts: &ChunkFacts) -> SlotPool {
+    let total = facts.total_chunks.saturating_sub(facts.act_chunks_max());
+    let below = facts
+        .reserved
+        .iter()
+        .map(|run| u64::from(run.first) + u64::from(run.chunks))
+        .chain(
+            facts
+                .shapes
+                .iter()
+                .filter_map(|shape| shape.pinned.map(|pinned| pinned.device.end())),
+        )
+        .max()
+        .unwrap_or(0);
+    let reserved = u32::try_from(below).unwrap_or(u32::MAX).min(total);
+    SlotPool::new(SlotPoolFacts {
+        chunk_bytes: facts.chunk_bytes,
+        total_chunks: total,
+        segment_chunks: 1,
+        committed_segments: total,
+        reserved_chunks: reserved,
+        shapes: pool_shapes(&facts.weights),
+        act_chunks: Vec::new(),
+    })
 }
 
 /// Window length in governor ticks: membership changes once a window.
@@ -211,6 +247,12 @@ impl WeightCache {
     #[must_use]
     pub const fn streaming(&self) -> bool {
         self.streaming
+    }
+
+    /// The weight shapes it holds.
+    #[must_use]
+    pub fn shapes(&self) -> usize {
+        self.shapes.len()
     }
 
     /// Whether `shape` is one of the pool shapes the weights take.
@@ -499,8 +541,10 @@ impl<P: PoolTarget + SlotAccess, W: WeightPort> WeightFirst<P, W> {
         self.inner.with_slots(&mut |pool, epoch| {
             shed = cache.shed(pool, epoch);
         });
+        // Asked at all, a waiter is short: the next tick does not refill,
+        // whether or not anything was above the floor.
+        self.shed |= self.cache.streaming();
         if shed > 0 {
-            self.shed = true;
             self.publish();
         }
         shed
@@ -603,6 +647,8 @@ impl<P: PoolTarget + SlotAccess, W: WeightPort> PoolTarget for WeightFirst<P, W>
         self.inner.ticked();
     }
 }
+
+pub mod port;
 
 #[cfg(test)]
 mod tests;

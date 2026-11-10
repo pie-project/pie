@@ -316,6 +316,12 @@ pub(crate) enum HostKvOp {
     WriteState(Vec<u32>, Vec<u32>, Vec<u8>),
     /// The engine's tap groups (`Engine::tap_groups`), as JSON.
     TapGroups,
+    /// The weight cache's resident set (`Engine::weight_residency`), ahead
+    /// of every fire queued after it.
+    WeightResidency(::engine::chunk::WeightResidency),
+    /// The engine's weight use record since it last answered
+    /// (`Engine::weight_uses`), as JSON.
+    WeightUses,
 }
 
 type SchedTx = tokio::sync::mpsc::UnboundedSender<SchedulerItem>;
@@ -884,6 +890,17 @@ impl SchedulerHandle {
     pub(crate) async fn host_kv(&self, op: HostKvOp) -> Result<Vec<u8>> {
         self.request(|response| SchedulerItem::HostKv { op, response })
             .await?
+    }
+
+    /// Queues `op` on the lane without waiting on it: what the lane answers
+    /// arrives on the receiver.
+    pub(crate) fn host_kv_queued(
+        &self,
+        op: HostKvOp,
+    ) -> Result<tokio::sync::oneshot::Receiver<Result<Vec<u8>>>> {
+        let (response, receiver) = tokio::sync::oneshot::channel();
+        self.send(SchedulerItem::HostKv { op, response })?;
+        Ok(receiver)
     }
 
     /// Keeps waves to [`::engine::frame::NARROW_WAVE`], or stops.

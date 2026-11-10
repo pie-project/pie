@@ -7,6 +7,10 @@
 //! [`crate::policy::pressure::raise`], how short each tier is. The waiter is
 //! released by a discard or new retention keys, by the governor's growth, or,
 //! at its deadline, by an explicit error. Nothing here drops anything.
+//!
+//! Streamed weights go before any kv or state: a device shortfall first
+//! sheds the weight cache to its floor ([`WeightShed`]), and the policy
+//! hears of it only once a report finds nothing left to shed.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -16,6 +20,10 @@ use crate::rt::Instant;
 
 /// Says that `tier` is short of `bytes` in all now (0 once it is not).
 pub type Sink = Arc<dyn Fn(Tier, u64) + Send + Sync>;
+
+/// Sheds the engine's weight cache to its floor; the slots it gave back
+/// (0 when nothing was above the floor, or the weights do not stream).
+pub type WeightShed = Arc<dyn Fn() -> u64 + Send + Sync>;
 
 /// The sink a planner on `engine` raises tier pressure through.
 pub fn sink(engine: usize) -> Sink {

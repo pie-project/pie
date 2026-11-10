@@ -14,7 +14,7 @@ use super::pool::PoolPort;
 use super::proc::{Proc, Residency};
 use super::rank::Rank;
 use super::reclaim::Reclaim;
-use super::short::{Shortfall, Sink};
+use super::short::{Shortfall, Sink, WeightShed};
 use super::stats::PlannerStats;
 use super::wait::{EntryKey, WaitKind, Waiter};
 use super::{ProcessId, exec};
@@ -61,6 +61,9 @@ pub struct ResidencyPlanner {
     pub(super) short: parking_lot::Mutex<Shortfall>,
     /// Where that is said (`pressure::raise`, for this planner's engine).
     sink: Sink,
+    /// The engine's weight cache, shed before the device's shortfall is
+    /// said; `None` where no cache stands in front of the pool.
+    weight_shed: Option<WeightShed>,
 }
 
 impl ResidencyPlanner {
@@ -86,7 +89,17 @@ impl ResidencyPlanner {
             cow_lanes: 1,
             short: parking_lot::Mutex::new(Shortfall::default()),
             sink,
+            weight_shed: None,
         }
+    }
+
+    /// Sheds `shed` (the engine's weight cache) before a device shortfall
+    /// is said, so the policy lets no kv or state go while streamed weights
+    /// above their floor could go instead.
+    #[must_use]
+    pub fn weight_shed(mut self, shed: WeightShed) -> Self {
+        self.weight_shed = Some(shed);
+        self
     }
 
     /// Says tier pressure through `sink` instead of the policy's gauge.
@@ -173,6 +186,18 @@ impl ResidencyPlanner {
             short.take_said()
         };
         for (tier, bytes) in said {
+            // What the weight cache gave back comes free as the fires
+            // reading it retire; the next report says what is still short.
+            if tier == crate::policy::pressure::Tier::Device
+                && bytes > 0
+                && self.weight_shed.as_ref().is_some_and(|shed| shed() > 0)
+            {
+                tracing::debug!(
+                    bytes,
+                    "planner: the weight cache sheds before tier pressure"
+                );
+                continue;
+            }
             (self.sink)(tier, bytes);
         }
     }

@@ -513,3 +513,39 @@ fn unmet_reads_are_wanted_demand() {
     pool.ticked();
     assert_eq!(pool.demand().wanted, wanted + MIB);
 }
+
+#[test]
+fn the_weight_slots_lie_above_the_reserved_runs_and_below_the_activation() {
+    let facts = ChunkFacts {
+        chunk_bytes: MIB,
+        total_chunks: 32,
+        reserved: vec![::engine::chunk::ReservedRun {
+            what: ::engine::chunk::Reserved::Null,
+            first: 0,
+            chunks: 2,
+        }],
+        act_chunks: vec![(16, 4)],
+        weights: vec![experts(8, 2)],
+        ..ChunkFacts::default()
+    };
+    let mut slots = slot_pool(&facts);
+    assert_eq!(
+        slots.total_chunks(),
+        28,
+        "the activation's top four are not the weights'"
+    );
+    assert_eq!(slots.available(0), 26, "nor the reserved two at the bottom");
+    let cache = WeightCache::new(&facts.weights, 0, false, &mut slots).unwrap();
+    assert_eq!(cache.shapes(), 1);
+    assert_eq!(
+        slots.available(0),
+        26 - 2 - 8,
+        "not streaming: the floor and every atom"
+    );
+    let none = slot_pool(&ChunkFacts::default());
+    assert_eq!(
+        none.total_chunks(),
+        0,
+        "no chunks past today's pinned pools"
+    );
+}
