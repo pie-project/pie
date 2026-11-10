@@ -157,6 +157,116 @@ DIMS = {
     "kimik3": fixture(),
 }
 
+def resized(d, layers, experts):
+    """`d` at `layers` layers and `experts` routed experts, each row still
+    taken to at most its `top_k`."""
+    fields = {k: getattr(d, k) for k in dir(d)}
+    moe = {k: getattr(d.moe, k) for k in dir(d.moe)}
+    moe.update(experts = experts, top_k = min(d.moe.top_k, experts))
+    fields.update(layers = layers, moe = struct(**moe))
+    return struct(**fields)
+
+def adopt(id, config, special):
+    t = config.get("text_config", config)
+    if t.get("model_type") != "kimi_linear":
+        fail("the text model's model_type is {}; this family is kimi_linear".format(t.get("model_type")))
+    if t.get("dsa_config") != None:
+        fail("its MLA layers attend the keys an indexer selects (dsa_config); this family's attend every cached key")
+    if config.get("model_type", "kimi_linear") not in ["kimi_k3", "kimi_linear"]:
+        fail("the config's model_type is {}; this family is kimi_k3".format(config.get("model_type")))
+    la = t.get("linear_attn_config")
+    if la == None:
+        fail("it states no linear_attn_config; this family mixes KDA layers with MLA ones")
+    layers = t["num_hidden_layers"]
+    full = sorted(la["full_attn_layers"])
+    if sorted(full + la["kda_layers"]) != list(range(1, layers + 1)):
+        fail("its full_attn_layers and kda_layers do not name each of its {} layers once".format(layers))
+    every = full[0]
+    last_full = layers in full
+    planned = [l + 1 for l in range(layers) if closes_a_block(l, every) or (last_full and l == layers - 1)]
+    if full != planned:
+        fail("its MLA layers {} are not one every {} layers; this family places them so".format(full, every))
+    if t.get("hidden_act") != "situ":
+        fail("its MLPs gate by {}; this family's by SiTU".format(t.get("hidden_act")))
+    if not t.get("mla_use_nope", False):
+        fail("its MLA layers rotate their rope part; this family's leave it as it is")
+    if not t.get("mla_use_output_gate", False):
+        fail("its MLA layers have no output gate; this family's gate their output")
+    if t.get("q_lora_rank") == None:
+        fail("its MLA projects queries in full rank; this family's through a q LoRA")
+    if t.get("num_key_value_heads", t["num_attention_heads"]) != t["num_attention_heads"]:
+        fail("its MLA layers share kv heads; this family's latent kv has one a query head")
+    if not la.get("use_full_rank_gate", False):
+        fail("its KDA layers gate their output through a low-rank pair; this family's through one projection")
+    if la.get("gate_lower_bound") == None:
+        fail("its KDA gate is unbounded; this family's is bounded below")
+    if t.get("moe_router_activation_func", "sigmoid") != "sigmoid":
+        fail("its router scores by {}; this family's by a sigmoid".format(t["moe_router_activation_func"]))
+    if t.get("num_expert_group", 1) > max(1, t.get("topk_group", 1)):
+        fail("it routes its experts within groups; this family over all of them")
+    if t.get("moe_layer_freq", 1) != 1:
+        fail("it places experts on every {}th layer; this family on every layer past the dense ones".format(t["moe_layer_freq"]))
+    if not t.get("num_shared_experts"):
+        fail("it has no shared expert; this family's MoE has one")
+    if t.get("attn_res_block_size") == None:
+        fail("it carries its residual stream plainly; this family blends it as AttnRes blocks")
+    if t.get("tie_word_embeddings", False) or config.get("tie_word_embeddings", False):
+        fail("it ties its head to its embedding; this family reads a head of its own")
+    experts = t["num_experts"]
+    top_k = t["num_experts_per_token"]
+    inter = t["moe_intermediate_size"]
+    beta = t.get("activation_situ_beta")
+    cap = t.get("activation_situ_linear_beta")
+    d = struct(
+        hidden = t["hidden_size"],
+        layers = layers,
+        dense_layers = t.get("first_k_dense_replace", 0),
+        full_attn_every = every,
+        last_full = last_full,
+        res_block = t["attn_res_block_size"],
+        attn_res = EVERY,
+        gate_floor = float(la["gate_lower_bound"]),
+        mla = struct(
+            heads = t["num_attention_heads"],
+            q_lora_rank = t["q_lora_rank"],
+            kv_lora_rank = t["kv_lora_rank"],
+            qk_nope_head_dim = t["qk_nope_head_dim"],
+            qk_rope_head_dim = t["qk_rope_head_dim"],
+            v_head_dim = t["v_head_dim"],
+        ),
+        kda = struct(
+            heads = la["num_heads"],
+            head_dim = la["head_dim"],
+            f_rank = la["head_dim"],
+            conv_kernel = la["short_conv_kernel_size"],
+            norm_eps = float(t["rms_norm_eps"]),
+        ),
+        moe = struct(
+            experts = experts,
+            top_k = top_k,
+            routed_scaling = float(t.get("routed_scaling_factor", 1.0)),
+            inter = inter,
+            shared_inter = t["num_shared_experts"] * inter,
+            latent = t.get("routed_expert_hidden_size"),
+            latent_norm = t.get("latent_moe_use_norm", False),
+            bias = True,
+            renorm = t.get("moe_renormalize", True) and top_k > 1,
+        ),
+        dense_inter = t["intermediate_size"],
+        situ_beta = float(beta) if beta else 1.0,
+        situ_cap = float(cap) if cap != None else None,
+        vocab = t["vocab_size"],
+        norm_eps = float(t["rms_norm_eps"]),
+    )
+    return struct(
+        MODELS = [model(id, template = XTML, tokenizer = TOKENIZER3, arch = "kimi_k3", layers = layers, vocab = d.vocab)],
+        DIMS = {id: d},
+        DEPLOYMENTS = [
+            deployment(id, weights = [dtype.bf16, dtype.mxfp4], kv = dtype.bf16),
+            deployment(id, weights = [dtype.bf16, dtype.mxfp4a8], kv = dtype.bf16),
+        ],
+    )
+
 def closes_a_block(l, every):
     return (l + 1) % every == 0
 
@@ -167,7 +277,7 @@ def layout(id, deploy):
         fail("{} stores its weights at bf16, not {}".format(id, weights))
     d = DIMS[id]
     if id != "kimik3" and (deploy.layers or deploy.experts):
-        d = released(deploy.layers or d.layers, deploy.experts or d.moe.experts, d.res_block)
+        d = resized(d, deploy.layers or d.layers, deploy.experts or d.moe.experts)
     hidden = d.hidden
     moe_in = d.moe.latent if d.moe.latent != None else hidden
     a = d.mla
@@ -309,11 +419,14 @@ LAYOUTS = [
 
 def configured(m, at):
     """The shape a configuration states of this model, its text model's keys
-    under `at`: AttnRes's block stride is a model's own, never a reading's."""
+    under `at`: AttnRes's block stride is a model's own, never a reading's.
+    Its MLA layers attend every cached key, no DSA indexer selecting them
+    (`dsa_config`, as K3.1 adds): no indexer heads."""
     return [
         config(at + "hidden_size", m.hidden),
         config(at + "num_hidden_layers", len(m.layers), or_deeper = True),
         config(at + "attn_res_block_size", m.res_block),
+        config(at + "dsa_config.index_num_heads", 0),
     ]
 
 def safetensors_format(m, layout):

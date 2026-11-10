@@ -134,6 +134,8 @@ def flash(layers = 45, experts = 288):
         theta = 10000.0,
         vocab = 154880,
         norm_eps = 1e-5,
+        head_layer = 45,
+        vision = True,
     )
 
 DIMS = {
@@ -142,6 +144,148 @@ DIMS = {
     # three dense KDA, DSA + MoE, three KDA + MoE, DSA.
     "glm53-flash-mini": flash(layers = 8, experts = 32),
 }
+
+def resized(d, layers, experts):
+    """`d` cut to its first `layers` layers and `experts` routed experts."""
+    fields = {k: getattr(d, k) for k in dir(d)}
+    moe = {k: getattr(d.moe, k) for k in dir(d.moe)}
+    moe.update(experts = experts, top_k = min(d.moe.top_k, experts))
+    fields.update(layers = layers, moe = struct(**moe))
+    return struct(**fields)
+
+VISION = struct(
+    hidden_size = 1024,
+    num_heads = 16,
+    depth = 24,
+    intermediate_size = 4096,
+    projection_intermediate_size = 10240,
+    patch_size = 14,
+    temporal_patch_size = 2,
+    spatial_merge_size = 2,
+    in_channels = 3,
+    hidden_act = "silu",
+    attention_bias = True,
+)
+
+def adopt(id, config, special):
+    if config.get("model_type") != "glm5_next":
+        fail("the config's model_type is {}; this family is glm5_next".format(config.get("model_type")))
+    text = config.get("text_config")
+    if type(text) != "dict" or text.get("model_type") != "glm5_next_text":
+        fail("its config states no glm5_next_text language model (`text_config`)")
+    for key in ["vocab_size", "num_hidden_layers", "hidden_size", "linear_attn_config"]:
+        if key not in text:
+            fail("its text_config states no {}".format(key))
+    if text.get("hidden_act", "silu") != "silu":
+        fail("its MLPs gate by {}; this family's SwiGLU gates by silu".format(text["hidden_act"]))
+    if text.get("attention_bias", False):
+        fail("its attention projections carry biases, which this family's do not")
+    if config.get("tie_word_embeddings", text.get("tie_word_embeddings", False)):
+        fail("it reads out through its embedding (tied); this family reads a head of its own")
+    if text.get("qk_rope_head_dim", 0) != 0 or not text.get("mla_use_nope", True):
+        fail("its latent attention rotates {} dims of each head; this family's rotates none".format(text.get("qk_rope_head_dim")))
+    if not text.get("mhc", True):
+        fail("it carries one residual stream; this family hyper-connects several")
+    if text.get("scoring_func", "sigmoid") != "sigmoid" or text.get("topk_method", "noaux_tc") != "noaux_tc":
+        fail("its router scores by {} ({}); this family's by a biased sigmoid".format(text.get("scoring_func"), text.get("topk_method")))
+    if text.get("moe_router_dtype", "float32") != "float32":
+        fail("it routes at {}; this family routes at f32".format(text["moe_router_dtype"]))
+    if text.get("n_group", 1) != text.get("topk_group", 1):
+        fail("it routes within {} of {} expert groups; this family routes over all its experts".format(text.get("topk_group"), text.get("n_group")))
+    if text.get("n_shared_experts", 1) != 1:
+        fail("it has {} shared experts; this family runs one".format(text.get("n_shared_experts")))
+    if not text.get("index_kpool_compress", True) or not text.get("index_kpool_always_select_tail", True):
+        fail("its indexer does not pool its keys as this family's does (compressed, its open block always selected)")
+    if any([t != "full" for t in text.get("indexer_types", [])]):
+        fail("some of its indexers share another layer's selection; this family's every DSA layer ranks its own")
+    vocab = text["vocab_size"]
+    if vocab != 154880:
+        fail("its vocabulary is {} tokens; this family speaks GLM-5's 154880".format(vocab))
+    layers = text["num_hidden_layers"]
+    dense_layers = text.get("first_k_dense_replace", 0)
+    mlps = text.get("mlp_layer_types")
+    if mlps != None and mlps != ["dense" if l < dense_layers else "sparse" for l in range(layers)]:
+        fail("its dense and routed layers ({}) are not its first {} and then the rest".format(mlps, dense_layers))
+    kinds = text.get("layer_types", [])
+    every = 4
+    if kinds != ["deepseek_sparse_attention" if (l + 1) % every == 0 else "linear_attention" for l in range(layers)]:
+        fail("its layers ({}) are not three KDA layers to every DSA one".format(kinds))
+    lin = text["linear_attn_config"]
+    if lin.get("gate_lower_bound", -5.0) != -5.0:
+        fail("its KDA gates floor at {}; this family's at -5".format(lin["gate_lower_bound"]))
+    drafts = text.get("num_nextn_predict_layers", 0)
+    if drafts > 1:
+        fail("it stores {} draft layers; this family drafts through one".format(drafts))
+    vision = config.get("vision_config")
+    if vision != None:
+        for k in dir(VISION):
+            if vision.get(k) != getattr(VISION, k):
+                fail("its vision tower's {} is {}; this family's tower's is {}".format(k, vision.get(k), getattr(VISION, k)))
+        if vision.get("out_hidden_size") != text["hidden_size"] or vision.get("rms_norm_eps") != text.get("rms_norm_eps") or vision.get("swiglu_limit") != text.get("swiglu_limit"):
+            fail("its vision tower's output width, norm epsilon or SwiGLU limit is not its language model's")
+    experts = text["n_routed_experts"]
+    d = struct(
+        hidden = text["hidden_size"],
+        layers = layers,
+        dense_layers = dense_layers,
+        full_attn_every = every,
+        mla = struct(
+            heads = text["num_attention_heads"],
+            q_lora_rank = text["q_lora_rank"],
+            kv_lora_rank = text["kv_lora_rank"],
+            qk_nope_head_dim = text["qk_nope_head_dim"],
+            qk_rope_head_dim = 0,
+            v_head_dim = text["v_head_dim"],
+        ),
+        kda = struct(heads = lin["num_heads"], head_dim = lin["head_dim"], f_rank = lin["head_dim"], conv_kernel = lin["short_conv_kernel_size"]),
+        index_heads = text["index_n_heads"],
+        index_head_dim = text["index_head_dim"],
+        index_top_k = text["index_topk"],
+        index_kpool = text["index_kpool"],
+        streams = text["hc_mult"],
+        gate_eps = float(text["hc_eps"]),
+        alpha = 2.0,
+        sinkhorn = text["hc_sinkhorn_iters"],
+        dense_inter = text["intermediate_size"],
+        moe = struct(
+            experts = experts,
+            top_k = text["num_experts_per_tok"],
+            inter = text["moe_intermediate_size"],
+            shared_inter = text["moe_intermediate_size"],
+            renorm = text.get("norm_topk_prob", True),
+            scaling = float(text.get("routed_scaling_factor", 1.0)),
+        ),
+        swiglu_limit = float(text["swiglu_limit"]),
+        theta = 10000.0,
+        vocab = vocab,
+        norm_eps = float(text.get("rms_norm_eps", 1e-5)),
+        head_layer = layers,
+        vision = vision != None,
+    )
+    parts = ["vision"] if d.vision else []
+    rows = []
+    for w in [[dtype.bf16, dtype.bf16], [F8, F8], [dtype.u4g64, dtype.u4g64]]:
+        rows.append(deployment(id, weights = w, kv = dtype.bf16))
+        if d.vision:
+            rows.append(deployment(id, weights = w, kv = dtype.bf16, parts = ["vision"]))
+    rows.append(deployment(id, weights = [F8, F8], kv = dtype.e4m3))
+    if drafts == 1:
+        rows.append(deployment(id, weights = [dtype.bf16, dtype.bf16, dtype.bf16], kv = dtype.bf16, drafter = "mtp"))
+        rows.append(deployment(id, weights = [dtype.u4g64, dtype.u4g64, dtype.u4g64], kv = dtype.bf16, drafter = "mtp"))
+    return struct(
+        MODELS = [model(
+            id,
+            template = GLM,
+            tokenizer = TOKENIZER,
+            parts = parts,
+            drafters = ["mtp"] if drafts == 1 else [],
+            arch = "glm5_next",
+            layers = layers,
+            vocab = vocab,
+        )],
+        DIMS = {id: d},
+        DEPLOYMENTS = rows,
+    )
 
 def layout(id, deploy):
     vision = "vision" in deploy.parts
@@ -159,8 +303,10 @@ def layout(id, deploy):
         weights, experts = deploy.weights
         draft = None
     d = DIMS[id]
+    if vision and not d.vision:
+        fail("{} stores no vision tower".format(id))
     if id != "glm53-flash" and (deploy.layers or deploy.experts):
-        d = flash(layers = deploy.layers or d.layers, experts = deploy.experts or d.moe.experts)
+        d = resized(d, deploy.layers or d.layers, deploy.experts or d.moe.experts)
     dense = compute(weights)
     # The release's FP8 keeps its KDA, kv_b and indexer projections, table
     # and head bf16; mlx stores them at its own width.
@@ -290,6 +436,7 @@ def layout(id, deploy):
             mlp = routed_at("mtp", draft),
             norm = weight([hidden]),
             norm_eps = d.norm_eps,
+            at = "model.language_model.layers.{}.".format(d.head_layer),
         )
 
     return struct(
@@ -384,8 +531,8 @@ def tower(d):
 
 BF = raw(dtype.bf16)
 
-HEAD = "model.language_model.layers.45."
 VISUAL = "model.visual."
+EMBED = "model.language_model.embed_tokens.weight"
 
 def formats(m):
     return [
@@ -396,23 +543,24 @@ def formats(m):
         ),
         format(
             "huggingface",
-            recognizes = lambda c: not overlaid(m) and released(),
+            recognizes = lambda c: not overlaid(m) and has(EMBED) and released(),
             read = lambda reads: land(m, reads, False, "", hf = True),
         ),
         format(
             "mlx",
-            recognizes = lambda c: not overlaid(m) and not released(),
+            recognizes = lambda c: not overlaid(m) and has(EMBED) and not released(),
             read = lambda reads: land(m, reads, False, ""),
         ),
     ]
 
 def released():
     """Whether the checkpoint is the release's: its projections FP8 beside
-    their block factors, not mlx's codes beside `.scales`."""
-    return has("model.language_model.layers.0.mlp.gate_proj.weight_scale_inv")
+    their block factors, or bf16 as its -BF16 stores them; not mlx's codes
+    beside `.scales`."""
+    return has("model.language_model.layers.0.mlp.gate_proj.weight_scale_inv") or not has("model.language_model.layers.0.mlp.gate_proj.scales")
 
 def overlaid(m):
-    return (m.mtp != None and has("aux." + HEAD + "enorm.weight")) or (
+    return (m.mtp != None and has("aux." + m.mtp.at + "enorm.weight")) or (
         m.tower != None and has("aux." + VISUAL + "post_layernorm.weight")
     )
 
@@ -487,7 +635,7 @@ def read_expr(reads, own, w, expr):
         reads.read_expr(w, expr())
 
 def land(m, reads, own, new, hf = False):
-    read(reads, own, m.embed, "model.language_model.embed_tokens.weight")
+    read(reads, own, m.embed, EMBED)
     read(reads, own, m.final_norm, "model.language_model.norm.weight")
     read(reads, own, m.head, "lm_head.weight")
     for l, w in enumerate(m.layers):
@@ -517,7 +665,7 @@ def land(m, reads, own, new, hf = False):
     if mtp == None:
         return
     own = held("mtp.enorm")
-    n = lambda s: new + HEAD + s
+    n = lambda s: new + mtp.at + s
     read(reads, own, mtp.enorm, n("enorm.weight"))
     read(reads, own, mtp.hnorm, n("hnorm.weight"))
     read_expr(reads, own, mtp.e_proj, lambda: src(n("eh_proj.weight")).slice(1, 0, m.hidden))
@@ -525,7 +673,7 @@ def land(m, reads, own, new, hf = False):
     read(reads, own, mtp.mixer_norm, n("input_layernorm.weight"))
     read(reads, own, mtp.mlp_norm, n("post_attention_layernorm.weight"))
     mla(reads, own, n, mtp.attn)
-    moe(reads, own, n, mtp.mlp)
+    moe(reads, own, n, mtp.mlp, hf)
     read(reads, own, mtp.norm, n("shared_head.norm.weight"))
 
 def read_tower(reads, own, v, t):

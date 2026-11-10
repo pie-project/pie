@@ -68,6 +68,21 @@ impl<'a, T> Format<'a, T> {
         self.states.extend(states);
         self
     }
+
+    #[must_use]
+    pub fn name(&self) -> &str {
+        &self.name
+    }
+
+    #[must_use]
+    pub fn recognizes(&self, src: &ztensor::Source) -> Option<bool> {
+        self.recognizes.as_ref().map(|recognizes| recognizes(src))
+    }
+
+    #[must_use]
+    pub fn states(&self) -> &[Stated] {
+        &self.states
+    }
 }
 
 /// A configuration value a checkpoint states, and the value the model is
@@ -77,6 +92,7 @@ pub struct Stated {
     pub key: Key,
     pub want: f64,
     pub at_least: bool,
+    pub required: bool,
 }
 
 /// Where a checkpoint states a value.
@@ -95,6 +111,7 @@ pub fn config(path: impl Into<String>, want: impl Into<f64>) -> Stated {
         key: Key::Config(path.into()),
         want: want.into(),
         at_least: false,
+        required: false,
     }
 }
 
@@ -104,6 +121,7 @@ pub fn attribute(key: impl Into<String>, want: impl Into<f64>) -> Stated {
         key: Key::Attribute(key.into()),
         want: want.into(),
         at_least: false,
+        required: false,
     }
 }
 
@@ -114,6 +132,12 @@ impl Stated {
     #[must_use]
     pub fn or_deeper(mut self) -> Stated {
         self.at_least = true;
+        self
+    }
+
+    #[must_use]
+    pub fn required(mut self) -> Stated {
+        self.required = true;
         self
     }
 }
@@ -217,6 +241,12 @@ fn agrees(src: &ztensor::Source, states: &[Stated]) -> Result<(), String> {
             ),
         };
         let Some(found) = found.and_then(number) else {
+            if stated.required {
+                return Err(format!(
+                    "the checkpoint does not state {spelled}, and this model is built for {}",
+                    stated.want
+                ));
+            }
             continue;
         };
         let fits = if stated.at_least {
@@ -327,6 +357,25 @@ mod tests {
 
         let both = source(&dir.path().join("both"), &["a.embed", "b.embed"], 24);
         assert!(refusal(read_one("f", &both, formats(24))).contains("a and b all recognize"));
+    }
+
+    #[test]
+    fn a_checkpoint_not_stating_a_required_value_is_refused() {
+        let dir = tempfile::tempdir().expect("a scratch directory");
+        let src = source(dir.path(), &["a.embed"], 24);
+        let formats = |required: bool| {
+            let stated = config("is_distilled", 1);
+            vec![
+                Format::new("a", |src| has(src, "a.embed"), || Ok("read as a"))
+                    .stating([if required { stated.required() } else { stated }]),
+            ]
+        };
+        assert_eq!(read_one("f", &src, formats(false)).unwrap(), "read as a");
+        let why = refusal(read_one("f", &src, formats(true)));
+        assert!(
+            why.contains("does not state its configuration's `is_distilled`"),
+            "{why}"
+        );
     }
 
     #[test]

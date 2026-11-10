@@ -895,10 +895,16 @@ pub(crate) fn formats(builder: &mut GlobalsBuilder) {
         #[starlark(require = pos)] path: &str,
         #[starlark(require = pos)] want: UnpackFloat,
         #[starlark(require = named, default = false)] or_deeper: bool,
+        #[starlark(require = named, default = false)] required: bool,
     ) -> anyhow::Result<StatedValue> {
         let stated = config(path, want.0);
-        Ok(StatedValue(if or_deeper {
+        let stated = if or_deeper {
             stated.or_deeper()
+        } else {
+            stated
+        };
+        Ok(StatedValue(if required {
+            stated.required()
         } else {
             stated
         }))

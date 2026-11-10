@@ -135,6 +135,20 @@ impl Package {
         )
     }
 
+    pub(crate) fn defining_file(&self, name: &str) -> anyhow::Result<Option<String>> {
+        Ok(defining(&self.name, &self.modules, &self.loaded, name)?.map(str::to_string))
+    }
+
+    pub(crate) fn binds(&self, file: &str, name: &str) -> bool {
+        self.modules
+            .get(file)
+            .is_some_and(|module| module.names().any(|n| n.as_str() == name))
+            && !self
+                .loaded
+                .get(file)
+                .is_some_and(|names| names.contains(name))
+    }
+
     /// The entry `name`, which the package must define.
     pub(crate) fn required(&self, name: &str) -> anyhow::Result<OwnedFrozenValue> {
         self.entry(name)?

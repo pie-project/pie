@@ -1,0 +1,295 @@
+{
+  "config": {
+    "avae": {
+      "_class_name": "MiniMaxH3AudioVAE",
+      "_diffusers_version": "0.32.2",
+      "auto_map": {
+        "AutoModel": "minimax_h3_audio_vae.MiniMaxH3AudioVAE"
+      },
+      "latent_channels": 32,
+      "latents_mean": [
+        -0.020211687488382354,
+        0.3876466479950502,
+        -0.04398279799186767,
+        -0.28591514936373,
+        0.08179686214561671,
+        -0.35782641352446604,
+        0.040623809960919084,
+        -0.01552534501956604,
+        -0.223362481667332,
+        0.1821006842509091,
+        0.2941778783780663,
+        -0.07901167601970885,
+        -0.056815072777201,
+        -0.3699028221860095,
+        -0.31616315591624855,
+        0.5905951377425391,
+        -0.052139568068853864,
+        0.013673160263486295,
+        -0.03691647864630577,
+        0.09732660653298163,
+        -0.3394662328788498,
+        -0.30685677538541667,
+        -0.24504598907458763,
+        -0.034698524462007344,
+        0.02868032184767538,
+        -0.21217779266454084,
+        -0.1678263169941987,
+        0.3221287889040614,
+        -0.1223055851554907,
+        0.4356604928128464,
+        -0.0502599202236253,
+        0.3979258376211797
+      ],
+      "latents_std": [
+        1.6895524230479284,
+        2.76263727217653,
+        1.7945344281264435,
+        1.6801681847309828,
+        1.6390226546605453,
+        2.7788298348882177,
+        1.7659090095747236,
+        1.6199757612137327,
+        2.6336525640336896,
+        1.8539356672817833,
+        2.5056497896915633,
+        1.811019237886178,
+        1.9579657790720237,
+        1.6685498243529284,
+        1.4922469314453364,
+        3.298670198067373,
+        1.9491804496832168,
+        1.8720003270431442,
+        1.8334080103291832,
+        1.6488070416529093,
+        1.6176957696319716,
+        1.9131449234774398,
+        1.5695245398428617,
+        1.6943659940415912,
+        1.8318420762504692,
+        1.5540637421583379,
+        1.9344930328968526,
+        1.599198216109855,
+        1.718045989838149,
+        1.6307219190837705,
+        1.8661226051202384,
+        1.5613768203168363
+      ],
+      "output_channel": 2,
+      "sample_rate": 32000,
+      "source_config_path": "config.yaml",
+      "source_metadata_path": "metadata.json",
+      "source_safetensors_path": "model.safetensors"
+    },
+    "dit": {
+      "_class_name": "MiniMaxH3DiTModel",
+      "_diffusers_version": "0.32.2",
+      "adaln_out_features": 96768,
+      "attention_head_dim": 128,
+      "audio_latents_dim": 32,
+      "ffn_hidden_size": 14336,
+      "final_adaln_out_features": 10752,
+      "final_norm_eps": 1e-05,
+      "hidden_size": 5376,
+      "latents_dim": 24,
+      "norm_eps": 1e-05,
+      "num_attention_heads": 56,
+      "num_layers": 50,
+      "patch_size": [
+        1,
+        2,
+        2
+      ],
+      "qk_norm_eps": 1e-05,
+      "rope_inv_freq_len": 16,
+      "text_dim": 5120,
+      "time_embed_dim": 2688,
+      "time_embed_hidden_size": 5376,
+      "timestep_input_dim": 256,
+      "token_refiner_num_layers": 2
+    },
+    "pipeline": {
+      "_class_name": "MiniMaxH3Pipeline",
+      "_diffusers_version": "0.32.2",
+      "_minimax_h3": {
+        "partition": "fl2va",
+        "schema_version": 1,
+        "sigma_shift_scales": {
+          "audio": 3.0,
+          "video": 12.0
+        },
+        "task_aliases": {},
+        "tasks": [
+          "t2va",
+          "fl2va"
+        ]
+      },
+      "audio_vae": [
+        "diffusers",
+        "MiniMaxH3AudioVAE"
+      ],
+      "processor": [
+        "transformers",
+        "Qwen3VLProcessor"
+      ],
+      "scheduler": null,
+      "text_encoder": [
+        "transformers",
+        "MiniMaxH3Qwen3VLHFEncoder"
+      ],
+      "tokenizer": [
+        "transformers",
+        "Qwen2TokenizerFast"
+      ],
+      "transformer": [
+        "diffusers",
+        "MiniMaxH3DiTModel"
+      ],
+      "video_vae": [
+        "diffusers",
+        "MiniMaxH3VideoVAE"
+      ]
+    },
+    "te": {
+      "architectures": [
+        "Qwen3VLForConditionalGeneration"
+      ],
+      "image_token_id": 151655,
+      "model_type": "qwen3_vl",
+      "text_config": {
+        "attention_bias": false,
+        "attention_dropout": 0.0,
+        "bos_token_id": 151643,
+        "dtype": "bfloat16",
+        "eos_token_id": 151645,
+        "head_dim": 128,
+        "hidden_act": "silu",
+        "hidden_size": 5120,
+        "initializer_range": 0.02,
+        "intermediate_size": 25600,
+        "max_position_embeddings": 262144,
+        "model_type": "qwen3_vl_text",
+        "num_attention_heads": 64,
+        "num_hidden_layers": 64,
+        "num_key_value_heads": 8,
+        "rms_norm_eps": 1e-06,
+        "rope_scaling": {
+          "mrope_interleaved": true,
+          "mrope_section": [
+            24,
+            20,
+            20
+          ],
+          "rope_type": "default"
+        },
+        "rope_theta": 5000000,
+        "use_cache": true,
+        "vocab_size": 151936
+      },
+      "tie_word_embeddings": false,
+      "transformers_version": "4.57.0.dev0",
+      "video_token_id": 151656,
+      "vision_config": {
+        "deepstack_visual_indexes": [
+          8,
+          16,
+          24
+        ],
+        "depth": 27,
+        "hidden_act": "gelu_pytorch_tanh",
+        "hidden_size": 1152,
+        "in_channels": 3,
+        "initializer_range": 0.02,
+        "intermediate_size": 4304,
+        "model_type": "qwen3_vl",
+        "num_heads": 16,
+        "num_position_embeddings": 2304,
+        "out_hidden_size": 5120,
+        "patch_size": 16,
+        "spatial_merge_size": 2,
+        "temporal_patch_size": 2
+      },
+      "vision_end_token_id": 151653,
+      "vision_start_token_id": 151652
+    },
+    "vae": {
+      "_class_name": "MiniMaxH3VideoVAE",
+      "_diffusers_version": "0.32.2",
+      "auto_map": {
+        "AutoModel": "minimax_h3_video_vae.MiniMaxH3VideoVAE"
+      },
+      "latent_channels": 24,
+      "latents_mean": [
+        0.858090341091156,
+        -0.9606591463088989,
+        1.0661640167236328,
+        -0.5090325474739075,
+        -0.2727581858634949,
+        -1.3675414323806763,
+        -0.2553254961967468,
+        -0.26907554268836975,
+        -0.5376840829849243,
+        -0.0464097298681736,
+        0.6657370328903198,
+        0.19690127670764923,
+        -0.5460608005523682,
+        -0.4035342037677765,
+        -0.23683024942874908,
+        0.25928452610969543,
+        -0.30133944749832153,
+        0.211341992020607,
+        -1.1206848621368408,
+        0.3581933379173279,
+        -0.04225143790245056,
+        0.2604829967021942,
+        0.22864092886447906,
+        0.7056031823158264
+      ],
+      "latents_std": [
+        1.2223774194717407,
+        1.2767263650894165,
+        1.6831774711608887,
+        1.7549455165863037,
+        1.5636216402053833,
+        2.194143533706665,
+        0.9653137922286987,
+        1.0569885969161987,
+        0.841948926448822,
+        0.7729952931404114,
+        1.8955937623977661,
+        0.946841835975647,
+        0.7996809482574463,
+        0.44988900423049927,
+        0.7197399735450745,
+        0.6936293244361877,
+        2.961095094680786,
+        2.7694199085235596,
+        3.0496184825897217,
+        2.1088054180145264,
+        3.276226282119751,
+        3.1627357006073,
+        2.2816812992095947,
+        2.6127843856811523
+      ],
+      "mode": "standalone",
+      "source_class_name": "AutoencoderKLLegacy",
+      "source_path": "source",
+      "source_safetensors_path": "model.safetensors",
+      "vae_chunk_dim": -1,
+      "vae_clip_length": 17,
+      "vae_decoder_parallel": 0,
+      "vae_decoder_tiling": 1,
+      "vae_encoder_parallel": 0,
+      "vae_encoder_tiling": 1,
+      "vae_parallel_tiling": 1,
+      "vae_tile_overlap_min": 64,
+      "vae_tile_size": 256,
+      "vae_token_drop": 3
+    }
+  },
+  "source": "MiniMaxAI/MiniMax-H3/FL2VA",
+  "special": {
+    "eos_token": "<|im_end|>",
+    "pad_token": "<|endoftext|>"
+  }
+}

@@ -214,6 +214,73 @@ def route(codes):
         values += [1.0 if j == b else 0.0 for j in range(HEADS)]
     return values
 
+def adopt(id, config, special):
+    if config.get("model_type") != "qwen3_tts":
+        fail("the config's model_type is {}; this family is qwen3_tts".format(config.get("model_type")))
+    if config.get("tokenizer_type") != "qwen3_tts_tokenizer_12hz":
+        fail("it speaks through {}; this family's codec decoder is the 12 Hz tokenizer's".format(config.get("tokenizer_type")))
+    if config.get("tts_model_type") != "custom_voice":
+        fail("it is a {} model; this family speaks a custom voice's named speakers, and runs no speaker encoder".format(config.get("tts_model_type")))
+    c = config["talker_config"]
+    p = c["code_predictor_config"]
+    for name, s in [("talker", c), ("predictor", p)]:
+        if s.get("hidden_act", "silu") != "silu":
+            fail("its {}'s MLP gates by {}; this family's SwiGLU gates by silu".format(name, s["hidden_act"]))
+        if s.get("attention_bias", False):
+            fail("its {}'s attention projections carry biases, which this family's do not".format(name))
+        if s.get("use_sliding_window", False) or s.get("sliding_window") != None:
+            fail("its {} attends through a sliding window; this family's attends in full".format(name))
+        if [k for k in s.get("layer_types", []) if k != "full_attention"]:
+            fail("its {} has layers that do not attend in full".format(name))
+        rope = s.get("rope_scaling")
+        if rope != None and rope.get("rope_type", rope.get("type")) != "default":
+            fail("its {} scales its rope ({}); this family turns its rope unscaled".format(name, rope))
+    if c["hidden_size"] != p["hidden_size"]:
+        fail("its predictor is {} wide and its talker {}; this family's predictor reads the talker's rows as they are".format(p["hidden_size"], c["hidden_size"]))
+    books = CODES.books + 1
+    for key, got, want in [
+        ("talker_config.num_code_groups", c.get("num_code_groups"), books),
+        ("code_predictor_config.num_code_groups", p.get("num_code_groups"), books),
+        ("talker_config.vocab_size", c.get("vocab_size"), CODES.talker),
+        ("code_predictor_config.vocab_size", p.get("vocab_size"), CODES.book),
+        ("codec_pad_id", c.get("codec_pad_id"), 2148),
+        ("codec_bos_id", c.get("codec_bos_id"), 2149),
+        ("codec_eos_token_id", c.get("codec_eos_token_id"), 2150),
+        ("codec_think_id", c.get("codec_think_id"), 2154),
+        ("codec_nothink_id", c.get("codec_nothink_id"), 2155),
+        ("codec_think_bos_id", c.get("codec_think_bos_id"), 2156),
+        ("codec_think_eos_id", c.get("codec_think_eos_id"), 2157),
+    ]:
+        if got != want:
+            fail("its {} is {}; this family's codes and the host's are {}".format(key, got, want))
+
+    def dense(s):
+        hidden, q_heads = s["hidden_size"], s["num_attention_heads"]
+        return struct(
+            hidden = hidden,
+            q_heads = q_heads,
+            kv_heads = s.get("num_key_value_heads", q_heads),
+            head_dim = s.get("head_dim", hidden // q_heads),
+            inter = s["intermediate_size"],
+            theta = float(s.get("rope_theta", 1000000.0)),
+            eps = float(s.get("rms_norm_eps", 1e-6)),
+            layers = s["num_hidden_layers"],
+        )
+
+    talker = dense(c)
+    text = struct(vocab = c["text_vocab_size"], width = c["text_hidden_size"])
+    return struct(
+        MODELS = [model(id, template = CHATML, tokenizer = TOKENIZER, arch = "qwen3_tts", layers = talker.layers, vocab = text.vocab)],
+        TALKER = talker,
+        PREDICTOR = dense(p),
+        TEXT = text,
+        DEPLOYMENTS = [
+            deployment(id, weights = dtype.bf16, kv = dtype.bf16),
+            deployment(id, weights = dtype.u8g64, kv = dtype.bf16),
+            deployment(id, weights = [dtype.u8g64, dtype.u4g64], kv = dtype.bf16),
+        ],
+    )
+
 def layout(id, deploy):
     w = roles(deploy, "talker", "predictor")
     banks, per_book = w.talker, w.predictor

@@ -1057,6 +1057,7 @@ impl KvStore {
 
     /// `ws` as a snapshot reads it, pinned where it stands until the pin is
     /// released.
+    #[cfg_attr(target_arch = "wasm32", allow(dead_code))]
     pub fn export(
         &mut self,
         ws: WorkingSetId,
@@ -1067,6 +1068,7 @@ impl KvStore {
     }
 
     /// A working set of its own from what `slots` hold.
+    #[cfg_attr(target_arch = "wasm32", allow(dead_code))]
     pub fn import(
         &mut self,
         set: page_table::ExportedSet,

@@ -13,7 +13,8 @@ use crate::file::diffusers;
 
 /// The attribute a snapshot's configuration rides under: the snapshot's
 /// `config.json`, or for a diffusers pipeline a map from each component's
-/// name prefix (`dit`, `te`, `vae`, ...) to that component's `config.json`.
+/// name prefix (`dit`, `te`, `vae`, ...) to that component's `config.json`,
+/// with `pipeline` and `scheduler` beside them.
 pub const CONFIG: &str = "config";
 
 /// The checkpoint at `path` as one source, its configuration attached.
@@ -22,6 +23,17 @@ pub fn open(path: &Path) -> Result<ztensor::Source, Error> {
         let components = diffusers::components(path)?;
         let source = diffusers::open_from(&components, path)?;
         let mut configs = Vec::new();
+        for (key, file) in [
+            ("pipeline", path.join(diffusers::PIPELINE_INDEX)),
+            (
+                "scheduler",
+                path.join("scheduler").join("scheduler_config.json"),
+            ),
+        ] {
+            if file.is_file() {
+                configs.push((Value::Text(key.to_string()), json_file(&file)?));
+            }
+        }
         for component in &components {
             let Some(config) = &component.config else {
                 continue;
@@ -98,7 +110,7 @@ fn containers(path: &Path) -> Result<Vec<PathBuf>, Error> {
 fn json_file(path: &Path) -> Result<Value, Error> {
     let text = std::fs::read_to_string(path)
         .map_err(|why| Error::Checkpoint(format!("cannot read {}: {why}", path.display())))?;
-    let json: serde_json::Value = serde_json::from_str(&text)
+    let json: serde_json::Value = crate::file::json::parse(&text)
         .map_err(|why| Error::Checkpoint(format!("{} is not valid JSON: {why}", path.display())))?;
     Ok(cbor(&json))
 }

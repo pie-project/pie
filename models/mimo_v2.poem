@@ -50,10 +50,12 @@ DEPLOYMENTS = [
 
 PADDED = 256
 
-def dims(hidden, layers, full, dense, q_heads, full_kv_heads, window_kv_heads, experts, norm_eps, value_scale, shards):
+def dims(hidden, layers, full, dense, q_heads, full_kv_heads, window_kv_heads, experts, norm_eps, value_scale, shards, **over):
     """`full` lists the full-attention layers and `dense` the dense ones;
-    `shards` is the count the checkpoint's fused qkv is stored cut into."""
-    return struct(
+    `shards` is the count the checkpoint's fused qkv is stored cut into.
+    `over` sets what every listed release shares (head widths, rope, window,
+    expert widths), as an adopted one states it."""
+    d = dict(
         hidden = hidden,
         layers = layers,
         full = full,
@@ -76,6 +78,14 @@ def dims(hidden, layers, full, dense, q_heads, full_kv_heads, window_kv_heads, e
         norm_eps = norm_eps,
         shards = shards,
     )
+    d.update(over)
+    return struct(**d)
+
+def resized(d, **over):
+    """`d` with `over` in place of its own fields."""
+    fields = {k: getattr(d, k) for k in dir(d)}
+    fields.update(over)
+    return struct(**fields)
 
 def flash(layers = 48, full = [0, 5, 11, 17, 23, 29, 35, 41, 47], experts = 256):
     return dims(4096, layers, full, [0], 64, 4, 8, experts, 1e-6, 0.707, 4)
@@ -93,6 +103,85 @@ DIMS = {
     "mimo26-pro-mini": pro(layers = 4, full = [0, 3], experts = 8),
 }
 
+def adopt(id, config, special):
+    c = config
+    if c.get("model_type") != "mimo_v2":
+        fail("the config's model_type is {}; this family is mimo_v2".format(c.get("model_type")))
+    if c.get("attention_projection_layout", "split") != "fused_qkv":
+        fail("it stores q, k and v apart; this family reads one fused qkv_proj")
+    if c.get("hidden_act", "silu") != "silu":
+        fail("its MLPs gate by {}; this family's SwiGLU gates by silu".format(c["hidden_act"]))
+    if c.get("attention_bias", False):
+        fail("its attention projections carry biases, which this family's do not")
+    if c.get("tie_word_embeddings", False):
+        fail("it ties its head to its embedding; this family reads a head of its own")
+    rope = c.get("rope_scaling") or c.get("rope_parameters") or {}
+    if rope.get("rope_type", rope.get("type", "default")) != "default":
+        fail("its config scales its rope ({}); this family rotates unscaled".format(rope))
+    if c.get("add_full_attention_sink_bias", False) or not c.get("add_swa_attention_sink_bias", False):
+        fail("its sinks are not on the windowed layers alone, as this family reads them")
+    q_heads = c["num_attention_heads"]
+    qk = c.get("head_dim", c["hidden_size"] // q_heads)
+    vd = c.get("v_head_dim", qk)
+    for key, full in [("swa_num_attention_heads", q_heads), ("swa_head_dim", qk), ("swa_v_head_dim", vd)]:
+        if c.get(key, full) != full:
+            fail("its windowed layers' {} is {}, its full ones' {}; this family reads one".format(key, c[key], full))
+    if 2 * vd != PADDED or qk > PADDED:
+        fail("its heads are {} wide (values {}); this family lays them {} wide, values in the first half".format(qk, vd, PADDED))
+    rotary = int(qk * c.get("partial_rotary_factor", 1.0))
+    if c.get("scoring_func", "sigmoid") != "sigmoid" or not c.get("norm_topk_prob", True):
+        fail("its router scores by {} (renormalized: {}); this family's by a renormalized sigmoid".format(c.get("scoring_func"), c.get("norm_topk_prob")))
+    if c.get("routed_scaling_factor") not in [None, 1.0]:
+        fail("it scales its routed experts by {}; this family by 1".format(c["routed_scaling_factor"]))
+    if c.get("n_shared_experts") not in [None, 0]:
+        fail("it has {} shared experts; this family none".format(c["n_shared_experts"]))
+    if c.get("n_group", 1) != 1 or c.get("topk_group", 1) != 1:
+        fail("it routes its experts within groups; this family over all of them")
+    q = c.get("quantization_config") or {}
+    if q.get("store_dtype") != "mxfp4":
+        fail("its routed experts are stored {}; this family reads them as MXFP4".format(q.get("store_dtype", q.get("fmt", "unquantized"))))
+    layers = c["num_hidden_layers"]
+    pattern = c.get("hybrid_layer_pattern")
+    if pattern == None:
+        block = c.get("hybrid_block_size")
+        pattern = [0 if block == None or (l + 1) % block == 0 else 1 for l in range(layers)]
+    moe = c.get("moe_layer_freq")
+    if len(pattern) != layers or type(moe) != "list" or len(moe) != layers:
+        fail("its hybrid_layer_pattern and moe_layer_freq do not name each of its {} layers".format(layers))
+    full_kv = c.get("num_key_value_heads", q_heads)
+    d = dims(
+        c["hidden_size"],
+        layers,
+        [l for l in range(layers) if pattern[l] == 0],
+        [l for l in range(layers) if not moe[l]],
+        q_heads,
+        full_kv,
+        c.get("swa_num_key_value_heads", full_kv),
+        c["n_routed_experts"],
+        float(c["layernorm_epsilon"]),
+        float(c["attention_value_scale"]),
+        min(full_kv, c.get("swa_num_key_value_heads", full_kv)),
+        qk_head_dim = qk,
+        v_head_dim = vd,
+        rotary_dim = rotary,
+        full_theta = float(c["rope_theta"]),
+        window_theta = float(c.get("swa_rope_theta", c["rope_theta"])),
+        window = c["sliding_window"],
+        top_k = c["num_experts_per_tok"],
+        inter = c["moe_intermediate_size"],
+        dense_inter = c["intermediate_size"],
+        vocab = c["vocab_size"],
+    )
+    return struct(
+        MODELS = [model(id, template = MIMO, tokenizer = TOKENIZER, arch = "mimo_v2", layers = layers, vocab = d.vocab)],
+        DIMS = {id: d},
+        DEPLOYMENTS = [
+            deployment(id, weights = [BF, FP4], kv = BF),
+            deployment(id, weights = W8A8, kv = BF),
+            deployment(id, weights = [BF, dtype.mxfp4a8], kv = BF),
+        ],
+    )
+
 WINDOWED = 0
 FULL = 1
 
@@ -101,9 +190,10 @@ def layout(id, deploy):
         fail("{} drafts with nothing, not {}".format(id, deploy.drafter))
     d = DIMS[id]
     if deploy.layers or deploy.experts:
-        whole = DIMS[id.replace("-mini", "").replace("-l6", "")]
+        whole = DIMS.get(id.replace("-mini", "").replace("-l6", ""), d)
         full = [l for l in whole.full if l < deploy.layers] if deploy.layers else d.full
-        d = dims(d.hidden, deploy.layers or d.layers, full, d.dense, d.q_heads, d.full_kv_heads, d.window_kv_heads, deploy.experts or d.experts, d.norm_eps, d.value_scale, d.shards)
+        experts = deploy.experts or d.experts
+        d = resized(d, layers = deploy.layers or d.layers, full = full, experts = experts, top_k = min(d.top_k, experts))
     if PADDED != 2 * d.v_head_dim:
         fail("the output projection reads a padded head's first half, its values")
     r = roles(deploy, "weights", "experts", exact = True)

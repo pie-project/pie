@@ -136,6 +136,7 @@ pub(crate) async fn read_device_kv(
 }
 
 /// Pages on `tier` copied into host slots `slots`, and those slots' bytes.
+#[cfg_attr(target_arch = "wasm32", allow(dead_code))]
 pub(crate) async fn read_tier_kv(
     engine_id: usize,
     tier: ::engine::MemoryDomain,
@@ -155,12 +156,14 @@ pub(crate) async fn read_tier_kv(
         .await
 }
 
+#[cfg_attr(target_arch = "wasm32", allow(dead_code))]
 pub(crate) async fn read_host_kv(engine_id: usize, slots: Vec<u32>) -> Result<Vec<u8>> {
     scheduler_handle(engine_id)?
         .host_kv(worker::HostKvOp::Read(slots))
         .await
 }
 
+#[cfg_attr(target_arch = "wasm32", allow(dead_code))]
 pub(crate) async fn read_host_state(
     engine_id: usize,
     slots: Vec<u32>,
@@ -171,6 +174,7 @@ pub(crate) async fn read_host_state(
         .await
 }
 
+#[cfg_attr(target_arch = "wasm32", allow(dead_code))]
 pub(crate) async fn write_host_state(
     engine_id: usize,
     slots: Vec<u32>,

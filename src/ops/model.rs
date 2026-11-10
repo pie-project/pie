@@ -10,6 +10,7 @@ use clap::Subcommand;
 use crate::local::hf::runtime_snapshot_allow_patterns;
 use crate::ui::{Align, Answer, Mark, Palette, Row, Table};
 
+pub mod adopt;
 pub mod facts;
 pub mod import;
 
@@ -21,6 +22,7 @@ pub enum ModelCmd {
         name: String,
     },
     Import(import::ImportArgs),
+    Adopt(adopt::AdoptArgs),
     Remove {
         name: String,
         #[arg(long, short = 'y')]
@@ -33,6 +35,7 @@ pub fn run(cmd: ModelCmd, global: &crate::args::GlobalArgs) -> Result<Answer> {
         ModelCmd::List => list(),
         ModelCmd::Info { name } => info(name),
         ModelCmd::Import(args) => import::run(args, global),
+        ModelCmd::Adopt(args) => adopt::run(args),
         ModelCmd::Remove { name, yes } => remove(name, yes),
     }
 }

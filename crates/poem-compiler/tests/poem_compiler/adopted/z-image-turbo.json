@@ -1,0 +1,139 @@
+{
+  "config": {
+    "dit": {
+      "_class_name": "ZImageTransformer2DModel",
+      "_diffusers_version": "0.36.0.dev0",
+      "all_f_patch_size": [
+        1
+      ],
+      "all_patch_size": [
+        2
+      ],
+      "axes_dims": [
+        32,
+        48,
+        48
+      ],
+      "axes_lens": [
+        1536,
+        512,
+        512
+      ],
+      "cap_feat_dim": 2560,
+      "dim": 3840,
+      "in_channels": 16,
+      "n_heads": 30,
+      "n_kv_heads": 30,
+      "n_layers": 30,
+      "n_refiner_layers": 2,
+      "norm_eps": 1e-05,
+      "qk_norm": true,
+      "rope_theta": 256.0,
+      "t_scale": 1000.0
+    },
+    "pipeline": {
+      "_class_name": "ZImagePipeline",
+      "_diffusers_version": "0.36.0.dev0",
+      "scheduler": [
+        "diffusers",
+        "FlowMatchEulerDiscreteScheduler"
+      ],
+      "text_encoder": [
+        "transformers",
+        "Qwen3Model"
+      ],
+      "tokenizer": [
+        "transformers",
+        "Qwen2Tokenizer"
+      ],
+      "transformer": [
+        "diffusers",
+        "ZImageTransformer2DModel"
+      ],
+      "vae": [
+        "diffusers",
+        "AutoencoderKL"
+      ]
+    },
+    "scheduler": {
+      "_class_name": "FlowMatchEulerDiscreteScheduler",
+      "_diffusers_version": "0.36.0.dev0",
+      "num_train_timesteps": 1000,
+      "shift": 3.0,
+      "use_dynamic_shifting": false
+    },
+    "te": {
+      "architectures": [
+        "Qwen3ForCausalLM"
+      ],
+      "attention_bias": false,
+      "attention_dropout": 0.0,
+      "bos_token_id": 151643,
+      "eos_token_id": 151645,
+      "head_dim": 128,
+      "hidden_act": "silu",
+      "hidden_size": 2560,
+      "initializer_range": 0.02,
+      "intermediate_size": 9728,
+      "max_position_embeddings": 40960,
+      "max_window_layers": 36,
+      "model_type": "qwen3",
+      "num_attention_heads": 32,
+      "num_hidden_layers": 36,
+      "num_key_value_heads": 8,
+      "rms_norm_eps": 1e-06,
+      "rope_scaling": null,
+      "rope_theta": 1000000,
+      "sliding_window": null,
+      "tie_word_embeddings": true,
+      "torch_dtype": "bfloat16",
+      "transformers_version": "4.51.0",
+      "use_cache": true,
+      "use_sliding_window": false,
+      "vocab_size": 151936
+    },
+    "vae": {
+      "_class_name": "AutoencoderKL",
+      "_diffusers_version": "0.36.0.dev0",
+      "_name_or_path": "flux-dev",
+      "act_fn": "silu",
+      "block_out_channels": [
+        128,
+        256,
+        512,
+        512
+      ],
+      "down_block_types": [
+        "DownEncoderBlock2D",
+        "DownEncoderBlock2D",
+        "DownEncoderBlock2D",
+        "DownEncoderBlock2D"
+      ],
+      "force_upcast": true,
+      "in_channels": 3,
+      "latent_channels": 16,
+      "latents_mean": null,
+      "latents_std": null,
+      "layers_per_block": 2,
+      "mid_block_add_attention": true,
+      "norm_num_groups": 32,
+      "out_channels": 3,
+      "sample_size": 1024,
+      "scaling_factor": 0.3611,
+      "shift_factor": 0.1159,
+      "up_block_types": [
+        "UpDecoderBlock2D",
+        "UpDecoderBlock2D",
+        "UpDecoderBlock2D",
+        "UpDecoderBlock2D"
+      ],
+      "use_post_quant_conv": false,
+      "use_quant_conv": false
+    }
+  },
+  "source": "Tongyi-MAI/Z-Image-Turbo",
+  "special": {
+    "eos_token": "<|im_end|>",
+    "pad_token": "<|endoftext|>"
+  }
+}

@@ -22,6 +22,7 @@ CHATML_QWEN38 = template("chatml", thinking = True, preserve_thinking = True, re
 # Qwen3-Next's Instruct and Thinking releases share one configuration; its
 # Instruct template's cue opens no thinking block.
 CHATML_NEXT = template("chatml", thinking = True, tools = True, stop = QWEN_STOP)
+CODER = template("qwen3_coder")
 TOKENIZER = tokenizer(markers = [QWEN_STOP], parts = {"vision": [QWEN_VISION]})
 TOKENIZER_38 = tokenizer(markers = [QWEN_STOP], pinned = QWEN_AUDIO, parts = {"vision": [QWEN_VISION]})
 
@@ -306,7 +307,7 @@ HEADS = {
 
 def dims(**d):
     base = dict(theta = 10000000.0, conv_kernel = 4, norm_eps = 1e-6, tower = None, draft = None,
-                dflash_head = None, rotate_kv = False)
+                dflash_head = None, rotate_kv = False, native = 262144)
     base.update(d)
     return base
 
@@ -435,6 +436,9 @@ def drafting(id, draft):
 # The models that draft or carry a tower, by id and drafter: the dims they
 # build, the tower a vision deployment adds, and what they override.
 DRAFTED = {
+    ("qwen35-d0.8b", None): (d0_8b, SMALL, {}),
+    ("qwen35-d0.8b", "mtp"): (d0_8b, SMALL, {"draft": "mtp"}),
+    ("qwen35-d0.8b", "eagle"): (d0_8b, SMALL, {"draft": "eagle"}),
     ("qwen36-27b", None): (d27b, LARGE, {}),
     ("qwen38-27b", None): (d27b, LARGE, {}),
     ("qwen36-27b", "mtp"): (d27b, LARGE, {"draft": "mtp"}),
@@ -459,14 +463,118 @@ def drafted(id, deploy):
     """The dims `id` builds for `deploy`'s parts and drafter; a model
     `DRAFTED` names none of drafts with nothing and has no tower."""
     vision = "vision" in deploy.parts and not (deploy.drafter == "mtp" and id in ["qwen35-d0.8b", "qwen35-d4b", "qwen35-d9b"])
-    if id == "qwen35-d0.8b":
-        return d0_8b(tower = SMALL if vision else None, draft = deploy.drafter)
     build, tower, over = DRAFTED.get((id, deploy.drafter), (None, None, {}))
     if ("vision" in deploy.parts) and tower == None or build == None and deploy.drafter != None:
         fail("{} does not ship {}".format(id, deploy))
     if build == None:
         return dict(FIXED[id])
     return build(tower = tower if vision else None, **over)
+
+NEXT_TYPES = ["qwen3_next"]
+TEXT_TYPES = {"qwen3_5": "qwen3_5_text", "qwen3_5_moe": "qwen3_5_moe_text"}
+
+def adopt(id, config, special):
+    kind = config.get("model_type")
+    is_next = kind in NEXT_TYPES
+    if kind in TEXT_TYPES:
+        t = config.get("text_config")
+        if t == None or t.get("model_type", TEXT_TYPES[kind]) != TEXT_TYPES[kind]:
+            fail("its {} config states no {} text_config".format(kind, TEXT_TYPES[kind]))
+    elif is_next or kind in TEXT_TYPES.values():
+        t = config
+    else:
+        fail("the config's model_type is {}; this family is qwen3_5, qwen3_5_moe or qwen3_next".format(kind))
+    routed = is_next or t.get("model_type", kind) == "qwen3_5_moe_text"
+    if special.get("eos_token") not in [None, "<|im_end|>", "<|endoftext|>"]:
+        fail("it stops at {}, not Qwen's <|im_end|>".format(special["eos_token"]))
+    if t.get("hidden_act", "silu") != "silu":
+        fail("its MLP gates by {}; this family's SwiGLU gates by silu".format(t["hidden_act"]))
+    if t.get("attention_bias", False):
+        fail("its attention projections carry biases, which this family's do not")
+    if not t.get("attn_output_gate", True):
+        fail("its attention's output is ungated; this family's q projection carries the gate")
+    if t.get("output_gate_type", "swish") != "swish":
+        fail("its output gate is {}; this family's gated norm gates by silu".format(t["output_gate_type"]))
+    if t.get("use_sliding_window", False) or t.get("sliding_window") != None:
+        fail("it attends through a sliding window; this family's gated attention attends in full")
+    if t.get("rope_scaling") != None:
+        fail("its config scales its rope ({}); this family stretches its rope only by a deployment's -yarn".format(t["rope_scaling"]))
+    rope = t.get("rope_parameters") or {}
+    if rope.get("rope_type", "default") != "default":
+        fail("its rope is {}; this family stretches its rope only by a deployment's -yarn".format(rope["rope_type"]))
+    q = config.get("quantization_config") or config.get("quantization") or {}
+    method = q.get("quant_method", "mlx" if "bits" in q else None)
+    if method == "fp8" and (q.get("fmt", "e4m3") != "e4m3" or q.get("weight_block_size") != [128, 128]):
+        fail("its FP8 is not e4m3 in 128-square blocks, the only FP8 this family reads")
+    if method == "mlx" and (q.get("bits") != 4 or q.get("group_size") != 64):
+        fail("it is mlx's {}-bit in groups of {}; this family reads mlx's 4-bit in 64s".format(q.get("bits"), q.get("group_size")))
+    if method not in [None, "fp8", "modelopt", "mlx"]:
+        fail("it is quantized by {}, which this family does not read".format(method))
+    if t.get("mlp_only_layers", []) or t.get("decoder_sparse_step", 1) != 1:
+        fail("its layers do not all run one kind of MLP; this family's layers are all dense or all routed")
+    tied = t.get("tie_word_embeddings")
+    top = config.get("tie_word_embeddings")
+    if tied != None and top != None and tied != top:
+        fail("its config ties its head at the top ({}) and not in its text_config ({})".format(top, tied))
+    tied = top if tied == None else tied
+    hidden = t["hidden_size"]
+    q_heads = t["num_attention_heads"]
+    layers = t["num_hidden_layers"]
+    head_dim = t.get("head_dim", hidden // q_heads)
+    every = t.get("full_attention_interval", 4)
+    kinds = ["full_attention" if l % every == every - 1 else "linear_attention" for l in range(layers)]
+    if t.get("layer_types", kinds) != kinds:
+        fail("its layer_types do not put a full attention at every {}th layer, last of each run".format(every))
+    partial = rope.get("partial_rotary_factor", t.get("partial_rotary_factor", 0.25))
+    rotary = int(head_dim * partial)
+    if rotary != head_dim * partial or rotary % 2:
+        fail("it turns {} of a {}-wide head, not a whole even width".format(partial, head_dim))
+    if routed:
+        if t.get("norm_topk_prob", True) != True:
+            fail("it weighs its picked experts by the whole softmax; this family renormalizes over the pick")
+        if not t.get("shared_expert_intermediate_size", 0):
+            fail("it runs no shared expert; this family's routed MLP adds a gated one")
+        mlp = moe(t["num_experts"], t["num_experts_per_tok"], t["moe_intermediate_size"], t["shared_expert_intermediate_size"])
+    else:
+        mlp = dense(t["intermediate_size"])
+    d = dims(
+        hidden = hidden,
+        layers = layers,
+        attn_every = every,
+        q_heads = q_heads,
+        kv_heads = t.get("num_key_value_heads", q_heads),
+        head_dim = head_dim,
+        rotary_dim = rotary,
+        theta = float(rope.get("rope_theta", t.get("rope_theta", 10000000.0))),
+        k_heads = t["linear_num_key_heads"],
+        v_heads = t["linear_num_value_heads"],
+        k_dim = t["linear_key_head_dim"],
+        v_dim = t["linear_value_head_dim"],
+        conv_kernel = t.get("linear_conv_kernel_dim", 4),
+        norm_eps = float(t.get("rms_norm_eps", 1e-6)),
+        mlp = mlp,
+        vocab = t["vocab_size"],
+        tied = bool(tied),
+        native = t.get("max_position_embeddings", 262144),
+    )
+    if d["v_heads"] % d["k_heads"]:
+        fail("its {} GDN value heads do not group evenly over its {} key heads".format(d["v_heads"], d["k_heads"]))
+    rows = [(BF, BF), (BF, dtype.e4m3), (U4, BF), (U4, dtype.e4m3)]
+    if routed:
+        rows += [(F8, BF), (F8, dtype.e4m3)]
+    if not is_next:
+        rows += [(MODELOPT, dtype.e4m3), (MODELOPT, BF)]
+        if routed:
+            rows.append((MODELOPT_A4, dtype.e4m3))
+    spoken = CHATML
+    if is_next:
+        spoken = CODER if "coder" in id else CHATML_NEXT
+    return struct(
+        MODELS = [qwen(id, template = spoken, layers = layers, vocab = d["vocab"])],
+        FIXED = {id: d},
+        DRAFTED = {},
+        DEPLOYMENTS = [deployment(id, weights = w, kv = kv) for w, kv in rows],
+    )
 
 def dense_mlp(w, hidden, inter, prefix, t = UNTURNED):
     n = lambda s: "{}.{}".format(prefix, s)
@@ -609,7 +717,7 @@ def layout(id, deploy):
         kv = deploy.kv,
         # The native 262144 tokens a deployment's YaRN stretches (the cards:
         # factor 4 toward a million).
-        rope = yarn(deploy, 262144),
+        rope = yarn(deploy, d.native),
         embed = embed,
         head = head,
         layers = [layer(l) for l in range(d.layers)],
