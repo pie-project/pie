@@ -12,7 +12,7 @@ pad.row_steps = 4
 # keeps no kv on the host, and gemma-4-E4B's 548 pages restarted the processes they ran short for
 seated_first = true
 seat_to_end = true
-seat_spread = true
+seat_spread = false
 
 # a blocked attention's row blocks as a loop: in line, DeepSeek-V4's 1792-row prompt programs ran a v5e
 # host's 47 GiB out compiling them
