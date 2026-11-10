@@ -536,7 +536,7 @@ fn a_trimmed_window_list_of_smaller_slots_reads_as_the_whole_one() {
 /// 128-row window list of 16-token slots beside its 128-token kv pages,
 /// its plans reading the kv list's geometry. Its windowed rows are the ones
 /// a pool gather compresses: the compressor's state lies in their window
-/// slots, so it is read by slot ref as the rows are.
+/// slots, read by slot ref as the rows are. (Seven window slots a chunk.)
 #[test]
 fn a_trimmed_window_list_beside_a_compressed_kv_list_reads_as_the_whole_one() {
     trimmed_window("dsv4-flash-mini", None, 1024, 700);
@@ -589,8 +589,13 @@ fn trimmed_window(model: &str, layers: Option<u32>, context: u32, prompt: u32) {
         let list_chunks = list.map_or(0, |(t, per)| context.div_ceil(t).div_ceil(per));
         let commit = (first + window_chunks + list_chunks + 1).div_ceil(facts.segment_chunks);
         shell.commit_segments(commit).expect("the segments commit");
-        // Page k of the lane in chunk first + k / per, slots strided in it.
-        let slot_ref = |k: u32| (first + k / per) * per + (k * 7 + 3) % per;
+        // Page k of the lane in chunk first + k / per, slots strided in it
+        // by a step prime to `per`, so each page has a slot of its own.
+        let step = [7u32, 11, 13, 17]
+            .into_iter()
+            .find(|step| per % step != 0)
+            .expect("a step prime to the slots a chunk");
+        let slot_ref = |k: u32| (first + k / per) * per + (k * step + 3) % per;
         let list_ref = |k: u32| {
             let (_, per) = list.expect("a kv list");
             (first + window_chunks + k / per) * per + (k * 5 + 1) % per
