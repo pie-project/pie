@@ -121,10 +121,42 @@ fn a_state_is_named_by_its_path_and_laid_out_by_its_readers() {
 }
 
 #[test]
-fn a_layout_holding_state_declares_no_caches_too() {
+fn a_package_defining_caches_is_refused() {
     let source = format!("{MODEL}\ndef caches(m, c):\n    pass\n");
-    let why = format!("{:#}", traced(&source).expect_err("two declarations"));
-    assert!(why.contains("declares `caches` too"), "{why}");
+    let why = format!(
+        "{:#}",
+        traced(&source).expect_err("caches() is no longer read")
+    );
+    assert!(
+        why.contains("defines `caches()`, which poem no longer reads"),
+        "{why}"
+    );
+}
+
+#[test]
+fn a_row_named_by_text_is_refused() {
+    for (handle, text) in [
+        (
+            "ops.attn.kv_append(k, v, w.kv)",
+            "ops.attn.kv_append(k, v, \"layers.{}.kv\".format(l))",
+        ),
+        (
+            "ops.attn.attend(q, inputs, w.kv,",
+            "ops.attn.attend(q, inputs, \"layers.{}.kv\".format(l),",
+        ),
+        (
+            "ops.attn.kv_append(k, v, w.kv)",
+            "ops.attn.kv_append(k, v, inputs.kv(\"layers.{}.kv\".format(l)), \
+             inputs.write_page(w.kv), inputs.write_offset(w.kv))",
+        ),
+    ] {
+        let source = MODEL.replace(handle, text);
+        let why = format!("{:#}", traced(&source).expect_err("a row named by text"));
+        assert!(
+            why.contains("not the name \"layers.0.kv\": rows are no longer looked up by string"),
+            "{text}: {why}"
+        );
+    }
 }
 
 #[test]

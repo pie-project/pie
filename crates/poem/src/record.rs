@@ -225,7 +225,7 @@ impl Recorder {
             .caches
             .iter()
             .position(|row| cache_name(row) == name)
-            .unwrap_or_else(|| panic!("`{name}` is not a cache the model's caches() declares"))
+            .unwrap_or_else(|| panic!("`{name}` is not a cache the model declares"))
             as u32;
         if let Some(seen) = p.values.iter().position(|v| v.def == Def::Cache(index)) {
             return ValueId(seen as u32);

@@ -1,5 +1,5 @@
 //! A deployment of a package traced and read: its layout evaluated, then the
-//! caches and forward it runs recorded into a trace, or the formats
+//! forward it runs recorded into a trace over its states' rows, or the formats
 //! of `formats(m)` read into a contract.
 
 use std::cell::RefCell;
@@ -13,7 +13,7 @@ use starlark::values::ValueLike;
 use starlark::values::structs::AllocStruct;
 use starlark::values::{Heap, Value as Star};
 
-use crate::star::forward::{SpecHandle, TRAIL, Trail, hold_input};
+use crate::star::forward::{TRAIL, Trail, hold_input};
 use crate::star::package::Package;
 use crate::star::values::{DtypeValue, alloc_precision};
 
@@ -278,30 +278,16 @@ impl Package {
                 .access_owned_frozen_value(&self.required("forward")?);
             let states = crate::star::state::declared(m);
 
-            let caches = match self.entry("caches")? {
-                Some(caches) if states.is_empty() => Some(caches),
-                _ => None,
-            };
-            let trace = if let Some(caches) = caches {
-                let caches = module.heap().access_owned_frozen_value(&caches);
-                TRAIL.with(|t| *t.borrow_mut() = Trail::default());
-                let declared = eval
-                    .eval_function(caches, &[m, module.heap().alloc(SpecHandle)], &[])
-                    .map_err(error);
-                let spec = TRAIL
-                    .with(|t| t.borrow_mut().spec.take())
-                    .unwrap_or_default();
-                declared?;
-                traced(name, spec, &mut eval, run, m, platform)?
-            } else if states.is_empty() {
+            if self.entry("caches")?.is_some() {
+                anyhow::bail!(
+                    "`{id}`'s package defines `caches()`, which poem no longer reads: declare \
+                     each row as a `state(shape, dtype)` handle in the layout and pass the \
+                     handle where the forward reads or writes it"
+                );
+            }
+            let trace = if states.is_empty() {
                 traced(name, HybridSpec::default(), &mut eval, run, m, platform)?
             } else {
-                if self.entry("caches")?.is_some() {
-                    anyhow::bail!(
-                        "`{id}`'s layout holds its state as `state(...)`, and its package \
-                         declares `caches` too"
-                    );
-                }
                 let first = crate::star::state::provisional(&states)?;
                 let first = traced(name, first, &mut eval, run, m, platform)?;
                 let spec = crate::star::state::lowered(&states, &first)?;

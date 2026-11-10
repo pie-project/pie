@@ -528,7 +528,7 @@ impl Input {
                 .rows
                 .iter()
                 .any(|row| matches!(row, CacheRow::Kv { name: n, .. } if n == name)),
-            "`{name}` is not a kv row the model's caches() declares",
+            "`{name}` is not a kv row the model declares",
         );
         self.rec.cache(name)
     }
@@ -540,7 +540,7 @@ impl Input {
                 .rows
                 .iter()
                 .any(|row| matches!(row, CacheRow::State { name: n, .. } if n == name)),
-            "`{name}` is not a state row the model's caches() declares",
+            "`{name}` is not a state row the model declares",
         );
         self.rec.cache(name)
     }
@@ -582,7 +582,7 @@ impl Input {
     fn kv_space(&self) -> u32 {
         assert!(
             !self.caches.dtypes.is_empty(),
-            "the model's caches() declares no kv space",
+            "the model declares no kv space",
         );
         0
     }
@@ -595,6 +595,6 @@ impl Input {
                 CacheRow::Kv { name: n, space, .. } if n == name => Some(*space),
                 _ => None,
             })
-            .unwrap_or_else(|| panic!("`{name}` is not a kv row the model's caches() declares"))
+            .unwrap_or_else(|| panic!("`{name}` is not a kv row the model declares"))
     }
 }

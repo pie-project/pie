@@ -25,6 +25,7 @@ use spelled::*;
 
 /// The types an op's parameters are spelled in.
 pub(crate) mod spelled {
+    pub(crate) use super::StateName;
     pub(crate) use crate::fact::Predicate;
     pub(crate) use crate::ops::conv::ConvShape;
     pub(crate) use crate::ops::elemwise::{RopeScaling, Yarn};
@@ -126,9 +127,8 @@ fn read(s: &StateDecl) -> anyhow::Result<ValueId> {
     })
 }
 
-/// A kv row an op writes: a cache, a state the layout holds, or the name of
-/// a row `caches()` declares; the name a row's write positions are found
-/// by where it has one.
+/// A kv row an op writes: a cache, or a state the layout holds, whose
+/// name its write positions are found by.
 pub(crate) struct Row {
     pub(crate) id: ValueId,
     pub(crate) name: Option<String>,
@@ -143,18 +143,37 @@ impl<'v> Arg<'v> for Row {
                 name: Some(s.0.name.clone()),
             });
         }
-        if let Some(name) = v.unpack_str() {
-            let input = root_input()?;
-            let id = crate::star::forward::dsl("a kv row", || input.kv(name))?;
-            return Ok(Row {
-                id,
-                name: Some(name.to_string()),
-            });
-        }
+        refuse_a_named_row(v)?;
         Ok(Row {
             id: ValueId::arg(Some(v))?,
             name: None,
         })
+    }
+}
+
+/// The name of a state the layout holds, where an op or an input method
+/// finds a row by it.
+pub(crate) struct StateName(pub(crate) String);
+
+impl<'v> Arg<'v> for StateName {
+    fn arg(v: Option<Star<'v>>) -> anyhow::Result<Self> {
+        let v = given(v)?;
+        if let Some(s) = v.downcast_ref::<StateValue>() {
+            return Ok(StateName(s.0.name.clone()));
+        }
+        refuse_a_named_row(v)?;
+        wanted("a state", v)
+    }
+}
+
+/// A row is named by its `state(...)` handle, not by text.
+fn refuse_a_named_row(v: Star<'_>) -> anyhow::Result<()> {
+    match v.unpack_str() {
+        Some(name) => anyhow::bail!(
+            "a row is the `state(shape, dtype)` handle the layout holds, not the name \
+             {name:?}: rows are no longer looked up by string"
+        ),
+        None => Ok(()),
     }
 }
 
@@ -185,13 +204,10 @@ impl<'v> Arg<'v> for u8 {
     }
 }
 
-/// Text; a state the layout holds stands for its name.
+/// Text.
 impl<'v> Arg<'v> for String {
     fn arg(v: Option<Star<'v>>) -> anyhow::Result<Self> {
         let v = given(v)?;
-        if let Some(s) = v.downcast_ref::<StateValue>() {
-            return Ok(s.0.name.clone());
-        }
         match v.unpack_str() {
             Some(s) => Ok(s.to_string()),
             None => wanted("text", v),

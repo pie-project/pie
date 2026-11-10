@@ -23,8 +23,8 @@ pub(crate) static OPS: &[Op] = &[
             let pages: Row = a.next()?;
             let write_page: Option<Value> = a.next()?;
             let write_offset: Option<Value> = a.next()?;
-            // A row named, or a state, is written where the forward's rows
-            // land in it, unless the call says where.
+            // A state is written where the forward's rows land in it,
+            // unless the call says where.
             let (write_page, write_offset) = match (write_page, write_offset, pages.name) {
                 (Some(page), Some(offset), _) => (page, offset),
                 (None, None, Some(name)) => {
@@ -35,8 +35,7 @@ pub(crate) static OPS: &[Op] = &[
                 }
                 _ => anyhow::bail!(
                     "`ops.attn.kv_append` writes a cache at the `write_page` and \
-                     `write_offset` it is given, both, and a state or a named row where \
-                     its rows land"
+                     `write_offset` it is given, both, and a state where its rows land"
                 ),
             };
             result(
