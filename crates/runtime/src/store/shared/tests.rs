@@ -641,3 +641,95 @@ fn degenerate_facts_keep_their_own_pools() {
     mixed.shapes[0].pinned = Some(::engine::chunk::Pinned::default());
     assert!(crate::store::chunks::StorePools::of(&mixed).is_err());
 }
+
+#[test]
+fn every_lane_of_a_group_names_the_record_the_group_writes() {
+    use crate::pipeline::fire::rs::{
+        GroupFold, GroupPlan, PreparedRs, RsPlan, apply_shared, prepare, prepare_many, settle,
+    };
+    use crate::store::rs::{RsError, RsGeometry, UNFOLDED_ROWS};
+
+    let facts = fixed_facts();
+    let shared: Shared = Arc::new(Mutex::new(SharedPool::new(&facts, 2, 256).unwrap()));
+    let stores = crate::store::registry::shared_stores(&shared, 16, 256);
+    let geom = RsGeometry {
+        state_size: 1024,
+        buffer_page_tokens: 4,
+    };
+    let mut rs = stores.rs.lock().unwrap();
+    let ws = rs.create_working_set(geom);
+    let first = prepare(&mut rs, ws, 4).unwrap();
+    settle(&mut rs, first.txn);
+    let group = |writes: std::ops::Range<u32>, fold: GroupFold| {
+        RsPlan::Groups(vec![GroupPlan {
+            lanes: vec![0, 1, 2],
+            writes: Some(writes),
+            fold,
+            snapshots: Vec::new(),
+        }])
+    };
+    let fixed = |out: &PreparedRs| -> Vec<_> {
+        let mut req = crate::engine::FireRequest {
+            lanes: (0..3)
+                .map(|row| crate::engine::fire::lane_of(row, vec![1], 0, Vec::new()))
+                .collect(),
+            ..crate::engine::FireRequest::default()
+        };
+        out.apply_to(&mut req);
+        apply_shared(&mut req, Some(&shared), Some(out));
+        req.lanes.into_iter().map(|lane| lane.fixed).collect()
+    };
+
+    // One lane folds: the group writes a fresh record, and every lane's
+    // buffered rows land in it.
+    let held = rs.folded_slot(ws).unwrap().unwrap().0;
+    let out = prepare_many(&mut rs, &[ws; 3], &group(4..7, GroupFold::Host(1)), None).unwrap();
+    let cow = out.slot_ids[0];
+    assert_ne!(cow, held);
+    let want = shared.lock().unwrap().lane_fixed(held, cow);
+    assert_eq!(fixed(&out), vec![want.clone(), want.clone(), want]);
+    settle(&mut rs, out.txn);
+    assert_eq!(rs.folded_slot(ws).unwrap().map(|slot| slot.0), Some(cow));
+
+    // Nothing folds on its own record: every lane writes it in place.
+    let out = prepare_many(&mut rs, &[ws; 3], &group(5..8, GroupFold::None), None).unwrap();
+    let want = shared.lock().unwrap().lane_fixed(cow, cow);
+    assert_eq!(fixed(&out), vec![want.clone(), want.clone(), want]);
+    settle(&mut rs, out.txn);
+
+    // A fork shares the record: buffering onto it copies it, for every lane.
+    let fork = rs.fork(ws).unwrap();
+    let out = prepare_many(&mut rs, &[fork; 3], &group(5..9, GroupFold::None), None).unwrap();
+    let copy = out.slot_ids[0];
+    assert_ne!(copy, cow);
+    let want = shared.lock().unwrap().lane_fixed(cow, copy);
+    assert_eq!(fixed(&out), vec![want.clone(), want.clone(), want]);
+    settle(&mut rs, out.txn);
+
+    // A fire may leave at most UNFOLDED_ROWS rows past what the state holds.
+    let frozen = rs.frozen(ws).unwrap();
+    let most = frozen + UNFOLDED_ROWS;
+    let out = prepare_many(
+        &mut rs,
+        &[ws; 3],
+        &group(frozen..most, GroupFold::None),
+        None,
+    );
+    settle(&mut rs, out.unwrap().txn);
+    let past = group(frozen..most + 1, GroupFold::Host(1));
+    let error = RsError::Unfolded {
+        end: most + 1,
+        frozen,
+        most: UNFOLDED_ROWS,
+    }
+    .to_string();
+    assert_eq!(
+        crate::pipeline::fire::rs::demand(&rs, &[ws; 3], &past),
+        Err(error.clone())
+    );
+    let size = rs.buffer_size(ws);
+    let refused = prepare_many(&mut rs, &[ws; 3], &past, None).unwrap_err();
+    assert!(refused.ends_with(&error), "{refused}");
+    assert_eq!(rs.frozen(ws), Ok(frozen), "a refused fire folds nothing");
+    assert_eq!(rs.buffer_size(ws), size, "nor grows the buffer");
+}

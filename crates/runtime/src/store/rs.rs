@@ -86,6 +86,13 @@ pub enum RsError {
     UnknownWorkingSet,
     #[error("a fire writes slot {slot}, which its state already holds (it holds {frozen})")]
     BelowFrozen { slot: u32, frozen: u32 },
+    #[error(
+        "a fire writes buffered rows up to slot {end} of a state that holds {frozen}: {} rows \
+         unfolded, and a shared pool's record buffers at most {most}; fold what the state \
+         buffers before writing more past it, or write fewer rows a fire",
+        end - frozen
+    )]
+    Unfolded { end: u32, frozen: u32, most: u32 },
     #[error("rs batch contains the same working set more than once")]
     DuplicateWorkingSet,
     #[error("rs pools exhausted: requested {requested}, available {available}")]
@@ -102,7 +109,11 @@ pub const RS_TRANSLATION_UNMAPPED: u32 = u32::MAX;
 /// The buffer page ids a shared pool's store keeps a record: the most rows
 /// a fire leaves unfolded, a page each at the smallest page, and as many
 /// again for a copy-on-write.
-const BUFFER_PAGES_PER_RECORD: u32 = 32;
+const BUFFER_PAGES_PER_RECORD: u32 = 2 * UNFOLDED_ROWS;
+
+/// The most buffered rows a shared pool's record holds: a fire never leaves
+/// a working set's buffer writing past `frozen + UNFOLDED_ROWS`.
+pub use poem_compiler::chunk::UNFOLDED_ROWS;
 
 /// A count in each recurrent pool: state slots and buffer pages. Each is
 /// a fixed slot shape's slots, and in the degenerate mode a slot is a chunk,
@@ -1224,6 +1235,16 @@ impl RsStore {
                 frozen: entry.frozen,
             });
         }
+        // A shared pool's record holds the buffer as its `[UNFOLDED_ROWS,
+        // width]` rows, row `s` at `s % UNFOLDED_ROWS`: rows further past
+        // the state than that would land on each other.
+        if self.slots.is_shared() && writes.end - entry.frozen > UNFOLDED_ROWS {
+            return Err(RsError::Unfolded {
+                end: writes.end,
+                frozen: entry.frozen,
+                most: UNFOLDED_ROWS,
+            });
+        }
         let page = entry.geom.buffer_page_tokens.max(1);
         let base = if entry.buffer.is_empty() {
             entry.frozen
@@ -1246,6 +1267,9 @@ impl RsStore {
         writes: Option<std::ops::Range<u32>>,
         reserved: Option<&mut RsGrant>,
     ) -> Result<RsPreparedWrite, RsError> {
+        // Refused (below the state, or past what a record buffers) before
+        // the buffer grows.
+        self.buffer_targets(self.entry(ws)?, writes.clone())?;
         if let Some(writes) = writes.as_ref().filter(|writes| !writes.is_empty()) {
             let entry = self.entry_mut(ws)?;
             if entry.buffer.is_empty() {
