@@ -798,3 +798,11 @@ The `new-memory/` directory is bookkeeping and is removed before anything lands 
 - PLE misses staged in frame order without a flush (Vulkan 199.6 -> 209.6 tok/s all-resident; half 174 -> 185);
   remaining gap is fires with misses not being recorded (proposed: ring of stages selected by an input).
 - engine-wgpu / engine-vulkan build without features again.
+
+### Note — 2026-11-10: IT round 7 on M58 (sm_120, quiet GPU)
+- Decode: no regression (base 451/461, M54 off 484/476, M58 off 476/453, auto 471/484 tok/s); tokens + top-4 = base.
+- BUG (engine, M58): device_weight_budget below the whole model is refused at every size; the routed expert planes
+  (576 MiB) are still charged to the device weight tier, the refusal says "0 routed banks", and the stated demand grows
+  with the budget (608 MB at 16 MiB ... 2.0 GB at 1400 MiB). Serves only at >= 2 GiB. Assigned to L40S.
+- RSS: M58 2,552 MiB vs M54 2,779 vs base 1,810 (expert mapping pages released; ~0.75 GB above base, likely dense
+  planes read in place from the mapping — to break down).
