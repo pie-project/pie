@@ -133,11 +133,24 @@ impl Shell {
                 }
             }
         }
+        // A hybrid's full fire: its prompts fill the widest rows and the lanes
+        // they pad to push it onto the top rung (v6e Qwen3.8-27B mini20 c32:
+        // 12 prompts of 2045 rows compiled mid-run, 12.7 s).
+        let top = *buckets.last().unwrap_or(&widest);
+        if hybrid && top > widest {
+            for n in [4u32, 8, 16, 32, 64] {
+                let k = n / 2 + 1;
+                if n <= lanes_cap && widest / k >= 2 {
+                    let mut lanes = vec![fresh(prefill, widest / k); k as usize];
+                    lanes[0].rows += widest % k;
+                    shapes.push(lanes);
+                }
+            }
+        }
         // Prefills beside decodes (`MIXED_HOST_RUNG` prefill lanes): every
         // decode lane rung at every row rung from 256 it fits in, and at the
         // padding rung, which a full fire's decode pads overflow into.
         let host = pad.mixed_host_rung;
-        let top = *buckets.last().unwrap_or(&widest);
         // A hybrid fires a prompt's tail behind its last whole page beside
         // the decodes: its mixed fires take every row rung.
         let least = if hybrid { pad.prefill_floor } else { 256 };
