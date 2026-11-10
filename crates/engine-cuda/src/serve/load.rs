@@ -903,9 +903,6 @@ impl Shell {
         let buffers = Buffers::reserve(&boot.trace, paging, budgets.tokens.max_tokens, &pools)?;
         let mut pools = pools;
         pools.keep_slots(kept_slots.min(boot.budget.max_lanes));
-        if let Some(buffers) = &buffers {
-            pools.seat_buffered(buffers.slot_bytes(), buffers.map_unit());
-        }
         // Committed whole: a fire reading out past one row a lane (a verify
         // reads every row) would otherwise grow it outside the fit.
         let mut arena = Arena::reserve(arena_bytes);
@@ -929,7 +926,14 @@ impl Shell {
                     true
                 }
             }) > 0,
+            pools.ids_a_lane(),
         )?;
+        pools.seat_tables(
+            crate::window::lane_capacity(boot.budget.max_lanes),
+            boot.budget
+                .max_lanes
+                .saturating_mul(crate::store::rs::SNAPSHOTS),
+        );
         let spaces = boot
             .trace
             .caches
@@ -1019,6 +1023,7 @@ impl Shell {
             feeds.selections.len(),
             !masked.is_empty() || !wide.is_empty(),
             &schedule_streams(&boot.trace, &compiled),
+            pools.ids_a_lane(),
         )?;
 
         let exports = Exports::of(&boot.trace, &compiled)?;

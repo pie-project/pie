@@ -532,3 +532,149 @@ fn probe(served: fn(&Fixture, &Path) -> Vec<(u64, u32)>) {
         assert!(moved.is_empty(), "logits moved:\n  {}", moved.join("\n  "));
     }
 }
+
+/// The model the buffered probe serves: gated delta net state with a
+/// chunked recurrence, whose rows a lane may buffer unfolded.
+const BUFFERED: &str = "qwen35-tiny";
+
+/// A prefill folded as it lands, then decodes that buffer their rows past
+/// the state and fold them late (none, two, or all of them a step, never
+/// more than sixteen unfolded), then a prefill and a decode folded again.
+/// Each step's logits' hash and top token.
+fn served_buffered(fixture: &Fixture, cache: &Path) -> Vec<(u64, u32)> {
+    use engine::fire::{FoldLen, RsVerb};
+    let mut shell = Shell::load(Boot {
+        trace: fixture.trace.clone(),
+        contract: &fixture.contract,
+        checkpoint: &fixture.container,
+        budget: Budget::new(1, TOKENS),
+        patches: None,
+        voxels: None,
+        page_size: PAGE,
+        context: CONTEXT,
+        slots: 4,
+        kv_budget: None,
+        memory_share: engine::load::DEFAULT_DEVICE_MEMORY_SHARE,
+        ordinal: 0,
+        knobs: engine_cuda::Knobs::default(),
+        cache_dir: Some(cache),
+        runahead: engine::runahead::Runahead::F1,
+        residency: engine_cuda::experts::Plan::default(),
+        deferred_tier: false,
+        world: engine_cuda::World::default(),
+        expert: engine_cuda::World::default(),
+        comm: core::ptr::null_mut(),
+    })
+    .unwrap_or_else(|why| panic!("{} loads: {why}", fixture.model));
+    shell.open(0).expect("slot 0 opens");
+    let mut steps = Vec::new();
+    let mut fed = 0u32;
+    // The slots the state has folded.
+    let mut folded = 0u32;
+    let mut last = 0u32;
+    let mut step = |shell: &mut Shell, tokens: &[u32], rs: RsVerb| {
+        let word = fixture.trace.facts.word(&Request::new(
+            u32::try_from(tokens.len()).expect("a count"),
+            false,
+        ));
+        let seated = engine_cuda::Seated {
+            rs,
+            ..engine_cuda::Seated::of(Lane {
+                slot: 0,
+                word,
+                tokens,
+            })
+        };
+        let mut rows = shell
+            .fire_media(&[seated], &[], &[])
+            .expect("the step fires");
+        let logits = rows.swap_remove(0);
+        let top = argmax(&logits);
+        steps.push((hash_logits(&logits), top));
+        top
+    };
+    let prompt = |from: u32, rows: u32| -> Vec<u32> {
+        (from..from + rows).map(|t| (t * 7 + 11) % 1000).collect()
+    };
+    last = step(&mut shell, &prompt(fed, 37), RsVerb::Fold).max(last * 0);
+    fed += 37;
+    folded += 37;
+    for at in 0..40u32 {
+        // The buffer's pages from the page the state's last slot lies in.
+        let base = folded / PAGE * PAGE;
+        let end = fed + 1;
+        let pages: Vec<u32> = (base / PAGE..end.div_ceil(PAGE))
+            .map(|page| page % 4)
+            .collect();
+        let unfolded = end - folded;
+        let fold = match at % 7 {
+            _ if at == 39 || unfolded >= 14 => unfolded,
+            3 => 2.min(unfolded),
+            6 => unfolded,
+            _ => 0,
+        };
+        last = step(
+            &mut shell,
+            &[last],
+            RsVerb::Buffer {
+                pages,
+                base,
+                folded,
+                fold: FoldLen::Host(fold),
+            },
+        );
+        fed = end;
+        folded += fold;
+    }
+    assert_eq!(
+        folded, fed,
+        "every row is folded before the lane folds as it lands"
+    );
+    last = step(&mut shell, &prompt(fed, 50), RsVerb::Fold);
+    step(&mut shell, &[last], RsVerb::Fold);
+    steps
+}
+
+/// The buffered probe ([`served_buffered`]): `golden <model>-buffered ...`
+/// lines, written to `PIE_GOLDEN_OUT` and compared with `PIE_GOLDEN_CHECK`
+/// as the plain probe's are.
+#[test]
+#[ignore = "a probe run by hand: see the module's doc"]
+fn golden_buffered() {
+    if !engine_cuda::device::present() {
+        eprintln!("skipping: no CUDA device on this machine");
+        return;
+    }
+    let cache = cache_dir();
+    let fixture = fixture(BUFFERED, &cache);
+    let _ = served_buffered(&fixture, &cache);
+    let steps = served_buffered(&fixture, &cache);
+    let mut lines = Vec::new();
+    let mut all = FNV;
+    for (at, (hash, top)) in steps.iter().enumerate() {
+        all = fnv_bytes(all, &hash.to_le_bytes());
+        lines.push(format!("golden {BUFFERED}-buffered {at} {hash:016x} {top}"));
+    }
+    lines.push(format!("golden {BUFFERED}-buffered all {all:016x}"));
+    for line in &lines {
+        println!("{line}");
+    }
+    let text = lines.join("\n") + "\n";
+    if let Some(out) = std::env::var_os("PIE_GOLDEN_OUT") {
+        std::fs::write(&out, &text)
+            .unwrap_or_else(|why| panic!("{}: {why}", Path::new(&out).display()));
+    }
+    if let Some(want) = std::env::var_os("PIE_GOLDEN_CHECK") {
+        let want = std::fs::read_to_string(&want)
+            .unwrap_or_else(|why| panic!("{}: {why}", Path::new(&want).display()));
+        let held: Vec<&str> = want
+            .lines()
+            .filter(|line| line.contains("-buffered "))
+            .collect();
+        assert_eq!(
+            held,
+            lines.iter().map(String::as_str).collect::<Vec<_>>(),
+            "the buffered logits moved"
+        );
+    }
+}

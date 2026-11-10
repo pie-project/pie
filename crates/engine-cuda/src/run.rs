@@ -144,10 +144,13 @@ pub struct FireTables {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum RsMove<'a> {
+pub enum RsMove {
     None,
+    /// The lane's rows land in the rs rows of the record `key` names, from
+    /// sequence slot `base + at`.
     Scatter {
-        pages: &'a [u32],
+        key: u32,
+        base: u32,
         at: u32,
         fold: u32,
     },
@@ -208,7 +211,8 @@ impl RsScratch {
 #[derive(Debug, Clone, Copy)]
 pub struct RsSeat<'a> {
     pub buffers: &'a crate::store::rs::Buffers,
-    pub lanes: &'a [RsMove<'a>],
+    pub pools: &'a crate::store::Pools,
+    pub lanes: &'a [RsMove],
     pub reads: &'a [Vec<std::ops::Range<u32>>],
     pub scratch: Option<&'a RsScratch>,
 }
@@ -222,7 +226,7 @@ impl RsSeat<'_> {
         bounds: &[i32],
         rows: Tensor,
     ) -> crate::error::Result<()> {
-        let page_tokens = self.buffers.page_tokens();
+        let held = crate::store::rs::ROWS;
         let elem = poem_compiler::arena::elem_bytes(crate::store::rs::PLANE_DTYPE)
             .expect("the buffered planes are bf16, which has an element size");
         if u64::from(rows.width) != plane.width {
@@ -236,37 +240,20 @@ impl RsSeat<'_> {
         }
         for (at, pair) in bounds.windows(2).enumerate() {
             let Some(&RsMove::Scatter {
-                pages, at: from, ..
+                key,
+                base,
+                at: from,
+                ..
             }) = self.lanes.get(lane_offset as usize + at)
             else {
                 continue;
             };
             let count = (pair[1] - pair[0]) as u32;
-            if count == 0 {
-                continue;
-            }
-            let capacity = pages.len() as u64 * u64::from(page_tokens);
-            if u64::from(from) + u64::from(count) > capacity {
-                return Err(crate::error::Fault::Ceiling {
-                    what: "rs buffer tokens",
-                    need: u64::from(from) + u64::from(count),
-                    have: capacity,
-                });
-            }
             let mut done = 0u32;
             while done < count {
-                let token = from + done;
-                let page = token / page_tokens;
-                let in_page = token % page_tokens;
-                let take = (page_tokens - in_page).min(count - done);
-                let page_slot = *pages
-                    .get(page as usize)
-                    .ok_or(crate::error::Fault::Ceiling {
-                        what: "rs buffer pages",
-                        need: u64::from(page) + 1,
-                        have: pages.len() as u64,
-                    })?;
-                let slab = self.buffers.row(plane, page_slot, in_page)?;
+                let row = (base + from + done) % held;
+                let take = (held - row).min(count - done);
+                let slab = self.buffers.row(self.pools, key, plane, row, take)?;
                 let rows_at =
                     rows.ptr + (u64::from(pair[0] as u32) + u64::from(done)) * plane.width * elem;
                 let bytes =
@@ -282,28 +269,20 @@ impl RsSeat<'_> {
     fn push_page_runs(
         &self,
         plane: crate::store::rs::Plane,
-        pages: &[u32],
+        key: u32,
+        base: u32,
         from: u32,
         count: u32,
         dst_word_base: u32,
         row_words: u32,
         runs: &mut Vec<kernels_cuda::runtime::channel::WordRun>,
     ) -> crate::error::Result<()> {
-        let page_tokens = self.buffers.page_tokens();
+        let held = crate::store::rs::ROWS;
         let mut done = 0u32;
         while done < count {
-            let token = from + done;
-            let page = token / page_tokens;
-            let in_page = token % page_tokens;
-            let take = (page_tokens - in_page).min(count - done);
-            let page_slot = *pages
-                .get(page as usize)
-                .ok_or(crate::error::Fault::Ceiling {
-                    what: "rs buffer pages",
-                    need: u64::from(page) + 1,
-                    have: pages.len() as u64,
-                })?;
-            let slab = self.buffers.row(plane, page_slot, in_page)?;
+            let row = (base + from + done) % held;
+            let take = (held - row).min(count - done);
+            let slab = self.buffers.row(self.pools, key, plane, row, take)?;
             runs.push(kernels_cuda::runtime::channel::WordRun {
                 src: slab,
                 dst_word: dst_word_base + done * row_words,
@@ -1076,7 +1055,7 @@ impl<'c> Run<'c> {
         for (r, &(begin, replay, rows)) in lanes.iter().enumerate() {
             if replay > 0
                 && let Some(plane) = plane
-                && let Some(RsMove::Scatter { pages, .. }) = seat.lanes.get(lane0 + r)
+                && let Some(&RsMove::Scatter { key, base, .. }) = seat.lanes.get(lane0 + r)
             {
                 if plane.width != u64::from(own.width) {
                     return Err(kernels_cuda::Error::Backend {
@@ -1092,7 +1071,8 @@ impl<'c> Run<'c> {
                     let count = span.end - span.start;
                     seat.push_page_runs(
                         plane,
-                        pages,
+                        key,
+                        base,
                         span.start,
                         count,
                         (begin + done) * row_words,

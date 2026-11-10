@@ -792,6 +792,7 @@ impl FireCtx<'_> {
         {
             run = run.buffered(RsSeat {
                 buffers: pool,
+                pools: self.pools,
                 lanes: &p.rs.moves,
                 reads: &p.rs.reads,
                 scratch: rs_scratch.as_ref(),
