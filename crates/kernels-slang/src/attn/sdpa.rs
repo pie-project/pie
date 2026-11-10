@@ -179,10 +179,18 @@ fn args(
     o: Tensor,
     extra: &[ArgValue],
 ) -> Result<Vec<ArgValue>, Error> {
+    if pool.page_stride[0] != pool.page_stride[1] {
+        return Err(refuse(
+            op,
+            format!(
+                "the pool's key and value pages are {} and {} words apart, where one page \
+                 row addresses both",
+                pool.page_stride[0], pool.page_stride[1]
+            ),
+        ));
+    }
     let mut args = vec![
         q.arg(),
-        pool.keys.arg(),
-        pool.values.arg(),
         o.arg_mut(),
         tables.positions.arg(),
         tables.request_of_token.arg(),
@@ -192,7 +200,12 @@ fn args(
         tables.mask_enabled.arg(),
     ];
     args.extend_from_slice(extra);
+    args.extend(pool.pool.args(false));
     args.extend([
+        pool.pool.words.arg(),
+        pool.origin[0].arg(),
+        pool.origin[1].arg(),
+        pool.page_stride[0].arg(),
         stated(op, shape.q_heads / shape.kv_heads)?.arg(),
         pool.page_size.arg(),
         stated(op, shape.kv_heads)?.arg(),

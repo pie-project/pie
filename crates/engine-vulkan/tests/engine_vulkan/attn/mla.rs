@@ -176,14 +176,16 @@ fn mla_answers_the_reference() {
     let indptr = [0u32, 2, 3];
     let (pi, pp) = (gpu.up_u32(&pages), gpu.up_u32(&indptr));
     let u = |buf: u32, r: usize| Tensor::new(buf, r as u32, 1, Dtype::U32);
-    let pool = |ckv: u32, kpe: u32| KvPool {
-        keys: b(ckv, slots, RANK),
-        values: b(kpe, slots, ROPE),
-        page_indices: u(pi, 3),
-        page_indptr: u(pp, 3),
-        page_size: PAGE as i32,
-        seq_stride: RANK as u64,
-        head_stride: RANK as u64,
+    let pool = |ckv: u32, kpe: u32| {
+        KvPool::planes(
+            b(ckv, slots, RANK),
+            b(kpe, slots, ROPE),
+            u(pi, 3),
+            u(pp, 3),
+            PAGE as i32,
+            RANK as u64,
+            RANK as u64,
+        )
     };
 
     // the append: three latent rows into slots (page 2, 3), (0, 1), (1, 0).

@@ -1,5 +1,6 @@
 #include "prim/bf16.slang"
 #include "prim/params.slang"
+#include "prim/pool.slang"
 
 // Attention mass capture, one workgroup a (request, query head): each of the
 // request's last `observe` query rows takes a causal softmax over the keys
@@ -20,13 +21,17 @@
 
 [[vk::binding(0)]] StructuredBuffer<uint> q;
 [[vk::binding(1)]] StructuredBuffer<int> qo_indptr;
-[[vk::binding(2)]] StructuredBuffer<uint> k_pages;
-[[vk::binding(3)]] StructuredBuffer<uint> kv_page_indices;
-[[vk::binding(4)]] StructuredBuffer<uint> kv_page_indptr;
-[[vk::binding(5)]] StructuredBuffer<int> position_ids;
-[[vk::binding(6)]] RWStructuredBuffer<float> scores;
+[[vk::binding(2)]] StructuredBuffer<uint> kv_page_indices;
+[[vk::binding(3)]] StructuredBuffer<uint> kv_page_indptr;
+[[vk::binding(4)]] StructuredBuffer<int> position_ids;
+[[vk::binding(5)]] RWStructuredBuffer<float> scores;
+// The key pages, in the chunk pool's segments (`prim/pool.slang`).
+PIE_POOL_SEGMENTS(StructuredBuffer, uint, 6)
 
 struct Params {
+    uint seg_words;
+    uint k_origin;
+    uint page_stride;
     int page_size;
     int num_q_heads;
     int num_kv_heads;
@@ -36,7 +41,14 @@ struct Params {
     int lane_offset;
     int kv_max;
 };
-PIE_PARAMS(7, Params, params);
+PIE_PARAMS(10, Params, params);
+PIE_POOL_READ(uint, params.seg_words)
+PIE_POOL_VIEW_RO(k_pages, uint, params.k_origin)
+
+float k_bf16(uint i) {
+    uint word = k_pages[i >> 1];
+    return bf16_to_f32((i & 1u) != 0u ? (word >> 16) : (word & 0xffffu));
+}
 
 groupshared float score_q[PIE_HEAD_DIM_MAX];
 groupshared float score_fold[PIE_STRIPS][PIE_LANES];
@@ -66,13 +78,13 @@ float strip_sum(uint strip, uint lane, float v) {
 // Key `j` of the request's pages dotted with the staged query row.
 float key_dot(int j, uint kv_head, uint lane, int page_first, uint head_dim) {
     uint page = kv_page_indices[uint(page_first + j / params.page_size)];
-    uint slot = page * uint(params.page_size) + uint(j % params.page_size);
-    uint k_row = (slot * uint(params.num_kv_heads) + kv_head) * head_dim;
+    uint k_row = page * (2u * params.page_stride)
+        + (uint(j % params.page_size) * uint(params.num_kv_heads) + kv_head) * head_dim;
     float dot = 0.0;
     for (uint u = 0u; u < uint(PIE_VPT); u++) {
         uint d = lane + u * uint(PIE_LANES);
         if (d < head_dim) {
-            dot += score_q[d] * bf16_at(k_pages, k_row + d);
+            dot += score_q[d] * k_bf16(k_row + d);
         }
     }
     return dot;

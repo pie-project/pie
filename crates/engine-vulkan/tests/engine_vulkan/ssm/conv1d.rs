@@ -64,9 +64,11 @@ fn the_conv1d_answers_the_reference() {
         let slab = hist * C;
         let bank0: Vec<f32> = noise(2 + dil as u64, SLOTS * slab);
         let bank64: Vec<f64> = bank0.iter().map(|v| f64::from(*v)).collect();
-        let pool = |bank: u32, slots: u32, rows: usize| kernels_slang::ssm::StatePool {
-            bank: t(bank, SLOTS, slab, Dtype::F32),
-            slots: t(slots, rows, 1, Dtype::U32),
+        let pool = |bank: u32, slots: u32, rows: usize| {
+            kernels_slang::ssm::StatePool::bank(
+                t(bank, SLOTS, slab, Dtype::F32),
+                t(slots, rows, 1, Dtype::U32),
+            )
         };
         let bank0 = &bank0;
         let fresh = |rows: usize| {

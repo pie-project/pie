@@ -2,6 +2,7 @@
 #include "prim/params.slang"
 #include "prim/reduce.slang"
 #include "prim/ieee.slang"
+#include "prim/pool.slang"
 
 // The compressed KV pool, bf16 two a word. A row closes a block when its
 // position + 1 is a multiple of `ratio`; `PIE_BOUNDARY` lands each row's
@@ -86,20 +87,26 @@ void main(uint3 gid : SV_DispatchThreadID) {
 #elif defined(PIE_BLOCK_MEAN) || defined(PIE_GATHER) || defined(PIE_STORE)
 
 #if defined(PIE_BLOCK_MEAN)
-[[vk::binding(0)]] StructuredBuffer<uint> key_pages;
-[[vk::binding(1)]] RWStructuredBuffer<uint> o;
-[[vk::binding(2)]] StructuredBuffer<int> boundary_pos;
-[[vk::binding(3)]] StructuredBuffer<int> boundary_req;
-[[vk::binding(4)]] StructuredBuffer<uint> page_indices;
-[[vk::binding(5)]] StructuredBuffer<uint> page_indptr;
+[[vk::binding(0)]] RWStructuredBuffer<uint> o;
+[[vk::binding(1)]] StructuredBuffer<int> boundary_pos;
+[[vk::binding(2)]] StructuredBuffer<int> boundary_req;
+[[vk::binding(3)]] StructuredBuffer<uint> page_indices;
+[[vk::binding(4)]] StructuredBuffer<uint> page_indptr;
+// The index key pages, in the chunk pool's segments.
+PIE_POOL_SEGMENTS(StructuredBuffer, uint, 5)
 
 struct Params {
+    uint seg_words;
+    uint k_origin;
+    uint page_stride;
     int head_dim;
     int ratio;
     int page_size;
     int rows;
 };
-PIE_PARAMS(6, Params, params);
+PIE_PARAMS(9, Params, params);
+PIE_POOL_READ(uint, params.seg_words)
+PIE_POOL_VIEW_RO(key_pages, uint, params.k_origin)
 #elif defined(PIE_GATHER)
 [[vk::binding(0)]] StructuredBuffer<uint> state_kv;
 [[vk::binding(1)]] StructuredBuffer<uint> state_score;
@@ -122,18 +129,34 @@ struct Params {
 PIE_PARAMS(8, Params, params);
 #else
 [[vk::binding(0)]] StructuredBuffer<uint> entries;
-[[vk::binding(1)]] RWStructuredBuffer<uint> comp_kv_pages;
-[[vk::binding(2)]] StructuredBuffer<int> boundary_pos;
-[[vk::binding(3)]] StructuredBuffer<int> boundary_req;
-[[vk::binding(4)]] StructuredBuffer<uint> page_indices;
-[[vk::binding(5)]] StructuredBuffer<uint> page_indptr;
+[[vk::binding(1)]] StructuredBuffer<int> boundary_pos;
+[[vk::binding(2)]] StructuredBuffer<int> boundary_req;
+[[vk::binding(3)]] StructuredBuffer<uint> page_indices;
+[[vk::binding(4)]] StructuredBuffer<uint> page_indptr;
+// The compressed pages, in the chunk pool's segments.
+PIE_POOL_SEGMENTS(RWStructuredBuffer, uint, 5)
 
 struct Params {
+    uint seg_words;
+    uint k_origin;
+    uint page_stride;
     int head_dim;
     int page_size;
     int rows;
 };
-PIE_PARAMS(6, Params, params);
+PIE_PARAMS(9, Params, params);
+PIE_POOL_READ(uint, params.seg_words)
+PIE_POOL_WRITE(uint, params.seg_words)
+PIE_POOL_VIEW(comp_kv_pages, uint, params.k_origin)
+#endif
+
+#if defined(PIE_BLOCK_MEAN) || defined(PIE_STORE)
+// The bf16 element position `pos` of request `req`'s `width`-wide pool row
+// starts at: its page, `page_stride` words a page, then the row in it.
+uint pool_row(int req, int pos, uint width) {
+    uint page = page_indices[page_indptr[uint(req)] + uint(pos / params.page_size)];
+    return page * (2u * params.page_stride) + uint(pos % params.page_size) * width;
+}
 #endif
 
 // The page slot of position `pos` of request `req`.
@@ -148,7 +171,9 @@ float block_value(int d, int bpos, int req) {
     for (int i = 0; i < params.ratio; i++) {
         int pos = bpos + i - (params.ratio - 1);
         if (pos >= 0) {
-            acc += bf16_at(key_pages, pool_slot(req, pos) * uint(params.head_dim) + uint(d));
+            uint i = pool_row(req, pos, uint(params.head_dim)) + uint(d);
+            uint word = key_pages[i >> 1];
+            acc += bf16_to_f32((i & 1u) != 0u ? (word >> 16) : (word & 0xffffu));
         }
     }
     return acc / float(params.ratio);
@@ -211,7 +236,7 @@ void main(uint3 gid : SV_DispatchThreadID) {
     uint at = (c * uint(params.head_dim) + uint(d)) >> 1;
 #if defined(PIE_STORE)
     if (bpos >= 0) {
-        comp_kv_pages[(pool_slot(req, bpos) * uint(params.head_dim) + uint(d)) >> 1] = entries[at];
+        comp_kv_pages[(pool_row(req, bpos, uint(params.head_dim)) + uint(d)) >> 1] = entries[at];
     }
 #else
     o[at] = bpos < 0 ? 0u : pack_bf16(block_value(d, bpos, req), block_value(d + 1, bpos, req));
@@ -224,12 +249,11 @@ void main(uint3 gid : SV_DispatchThreadID) {
 #define PAIRS_PER_THREAD (POOL_HEAD_MAX / (2 * PIE_GROUP_X))
 
 [[vk::binding(0)]] StructuredBuffer<uint> q;
-[[vk::binding(1)]] StructuredBuffer<uint> comp_kv_pages;
 #if defined(PIE_SELECTED)
-[[vk::binding(2)]] StructuredBuffer<int> selection;
-#define PIE_AFTER 3
-#else
+[[vk::binding(1)]] StructuredBuffer<int> selection;
 #define PIE_AFTER 2
+#else
+#define PIE_AFTER 1
 #endif
 [[vk::binding(PIE_AFTER)]] RWStructuredBuffer<uint> o;
 [[vk::binding(PIE_AFTER + 1)]] RWStructuredBuffer<float> lse_out;
@@ -237,8 +261,13 @@ void main(uint3 gid : SV_DispatchThreadID) {
 [[vk::binding(PIE_AFTER + 3)]] StructuredBuffer<uint> page_indices;
 [[vk::binding(PIE_AFTER + 4)]] StructuredBuffer<uint> page_indptr;
 [[vk::binding(PIE_AFTER + 5)]] StructuredBuffer<int> req_of_token;
+// The compressed pages, in the chunk pool's segments.
+PIE_POOL_SEGMENTS(StructuredBuffer, uint, PIE_AFTER + 6)
 
 struct Params {
+    uint seg_words;
+    uint k_origin;
+    uint page_stride;
     int num_q_heads;
     int head_dim;
     int ratio;
@@ -248,14 +277,17 @@ struct Params {
     int page_size;
     float scale;
 };
-PIE_PARAMS(PIE_AFTER + 6, Params, params);
+PIE_PARAMS(PIE_AFTER + 10, Params, params);
+PIE_POOL_READ(uint, params.seg_words)
+PIE_POOL_VIEW_RO(comp_kv_pages, uint, params.k_origin)
 
 groupshared float pool_q[POOL_HEAD_MAX];
 groupshared int pool_visible;
 
-uint pool_slot(int req, int pos) {
+// The bf16 element position `pos` of request `req`'s pool row starts at.
+uint pool_row(int req, int pos, uint width) {
     uint page = page_indices[page_indptr[uint(req)] + uint(pos / params.page_size)];
-    return page * uint(params.page_size) + uint(pos % params.page_size);
+    return page * (2u * params.page_stride) + uint(pos % params.page_size) * width;
 }
 
 // The pooled entry step `n` reads, or -1.
@@ -301,7 +333,7 @@ void main(uint3 group : SV_GroupID, uint3 local : SV_GroupThreadID) {
     for (int n = tid; n < steps; n += PIE_GROUP_X) {
         int c = key_of(n, qi, num_visible);
         if (c >= 0) {
-            uint k_row = pool_slot(req, (c + 1) * params.ratio - 1) * head_dim;
+            uint k_row = pool_row(req, (c + 1) * params.ratio - 1, head_dim);
             float dot_ = 0.0;
             for (uint d = 0u; d < head_dim; d += 2u) {
                 uint word = comp_kv_pages[(k_row + d) >> 1];
@@ -325,7 +357,7 @@ void main(uint3 group : SV_GroupID, uint3 local : SV_GroupThreadID) {
         uint k_row = 0u;
         float dot_ = 0.0;
         if (live) {
-            k_row = pool_slot(req, (c + 1) * params.ratio - 1) * head_dim;
+            k_row = pool_row(req, (c + 1) * params.ratio - 1, head_dim);
             for (uint d = 2u * uint(tid); d < head_dim; d += 2u * lanes) {
                 uint word = comp_kv_pages[(k_row + d) >> 1];
                 dot_ += pool_q[d] * bf16_to_f32(word & 0xffffu) + pool_q[d + 1u] * bf16_to_f32(word >> 16);

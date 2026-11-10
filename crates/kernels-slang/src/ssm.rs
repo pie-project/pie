@@ -4,22 +4,63 @@
 
 use dtype::Dtype;
 
+use crate::encode::{Arg, ArgValue};
 use crate::encode::{nonzero, refuse};
 use crate::error::Error;
-use crate::tensor::{RaggedTensor, Tensor};
+use crate::tensor::{RaggedTensor, SEGMENTS, Segments, Tensor, words_of};
 
 pub mod conv1d;
 pub mod gdn_prep;
 pub mod gdn_recurrent;
 pub mod kda;
 
-/// A recurrent state pool: the f32 bank of slots and the u32 slot of each
-/// row.
+/// A recurrent state pool: the bank of slots and the slot of each row.
+/// `bank` carries the row's geometry (its width is one slot's elements);
+/// the slots lie in the chunk pool `pool`, slot `s`'s row at word `origin +
+/// s * slot_stride` (SPEC 10: `base + slot * stride + offset`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct StatePool {
     pub bank: Tensor,
 
     pub slots: Tensor,
+
+    pub pool: Segments,
+
+    pub origin: u32,
+
+    pub slot_stride: u32,
+}
+
+impl StatePool {
+    /// A bank of its own: `bank`'s rows are the slots, one segment.
+    #[must_use]
+    pub fn bank(bank: Tensor, slots: Tensor) -> Self {
+        let row = u64::from(bank.width) * bank.dtype.bits() / 32;
+        Self {
+            bank,
+            slots,
+            pool: Segments::one(bank.buf, words_of(bank).max(1)),
+            origin: 0,
+            slot_stride: u32::try_from(row).unwrap_or(u32::MAX),
+        }
+    }
+
+    /// The pool's four segment bindings, then its scalars (segment words,
+    /// origin, slot stride): what every state kernel takes after its own
+    /// buffers, its own scalars after.
+    #[must_use]
+    pub fn args(&self, mutable: bool) -> [ArgValue; SEGMENTS + 3] {
+        let [a, b, c, d] = self.pool.args(mutable);
+        [
+            a,
+            b,
+            c,
+            d,
+            self.pool.words.arg(),
+            self.origin.arg(),
+            self.slot_stride.arg(),
+        ]
+    }
 }
 
 /// A speculative window's bookkeeping, a lane a request from `lane0`: the

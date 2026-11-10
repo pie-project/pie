@@ -2,6 +2,7 @@
 #include "prim/bf16.slang"
 #include "prim/params.slang"
 #include "prim/reduce.slang"
+#include "prim/pool.slang"
 
 // The sparse-attention indexer, bf16 two a word. `PIE_KNORM`: each index
 // key row layer-normed in place, then its rotated prefix turned by its
@@ -116,15 +117,19 @@ void main(uint3 gid : SV_DispatchThreadID) {
 
 [[vk::binding(0)]] StructuredBuffer<uint> idx_q;
 [[vk::binding(1)]] StructuredBuffer<uint> idx_w;
-[[vk::binding(2)]] StructuredBuffer<uint> key_pages;
-[[vk::binding(3)]] StructuredBuffer<int> positions;
-[[vk::binding(4)]] StructuredBuffer<int> req_of_token;
-[[vk::binding(5)]] StructuredBuffer<uint> kv_page_indices;
-[[vk::binding(6)]] StructuredBuffer<uint> kv_page_indptr;
-[[vk::binding(7)]] RWStructuredBuffer<float> scores;
-[[vk::binding(8)]] RWStructuredBuffer<int> selection;
+[[vk::binding(2)]] StructuredBuffer<int> positions;
+[[vk::binding(3)]] StructuredBuffer<int> req_of_token;
+[[vk::binding(4)]] StructuredBuffer<uint> kv_page_indices;
+[[vk::binding(5)]] StructuredBuffer<uint> kv_page_indptr;
+[[vk::binding(6)]] RWStructuredBuffer<float> scores;
+[[vk::binding(7)]] RWStructuredBuffer<int> selection;
+// The index key pages, in the chunk pool's segments (`prim/pool.slang`).
+PIE_POOL_SEGMENTS(StructuredBuffer, uint, 8)
 
 struct Params {
+    uint seg_words;
+    uint k_origin;
+    uint page_stride;
     int heads;
     int head_dim;
     int page_size;
@@ -133,7 +138,9 @@ struct Params {
     int ratio;
     int has_weights;
 };
-PIE_PARAMS(9, Params, params);
+PIE_PARAMS(12, Params, params);
+PIE_POOL_READ(uint, params.seg_words)
+PIE_POOL_VIEW_RO(key_pages, uint, params.k_origin)
 
 groupshared float key_acc[PIE_GROUP_X];
 groupshared int key_total;
@@ -170,7 +177,7 @@ void main(uint3 group : SV_GroupID, uint3 local : SV_GroupThreadID) {
         if (j < nkeys) {
             int cell = (j + 1) * stride - 1;
             uint page = kv_page_indices[pages_first + uint(cell / params.page_size)];
-            uint kj = (page * uint(params.page_size) + uint(cell % params.page_size)) * hd;
+            uint kj = page * (2u * params.page_stride) + uint(cell % params.page_size) * hd;
             for (uint h = uint(hh); h < heads; h += uint(LANES_PER_KEY)) {
                 uint qh = qi + h * hd;
                 float d_ = 0.0;

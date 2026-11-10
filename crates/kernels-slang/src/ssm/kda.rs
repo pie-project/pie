@@ -116,19 +116,19 @@ pub fn kda(
             .tier(tier)
             .apply(gates.grid(rows(OP, mixed)?)),
         &[
-            mixed.arg(),
-            f,
-            b,
-            dt_bias,
-            a_log,
-            state.bank.arg_mut(),
-            state.slots.arg(),
-            y.arg_mut(),
-            heads,
-            head_dim,
-            eps,
-            floor,
-        ],
+            &[
+                mixed.arg(),
+                f,
+                b,
+                dt_bias,
+                a_log,
+                state.slots.arg(),
+                y.arg_mut(),
+            ][..],
+            &state.args(true),
+            &[heads, head_dim, eps, floor],
+        ]
+        .concat(),
     )
 }
 
@@ -151,20 +151,20 @@ pub fn kda_chunked(
             .tier(tier)
             .apply(gates.grid(requests(OP, mixed)?)),
         &[
-            mixed.data.arg(),
-            mixed.indptr.arg(),
-            f,
-            b,
-            dt_bias,
-            a_log,
-            state.bank.arg_mut(),
-            state.slots.arg(),
-            y.arg_mut(),
-            heads,
-            head_dim,
-            eps,
-            floor,
-        ],
+            &[
+                mixed.data.arg(),
+                mixed.indptr.arg(),
+                f,
+                b,
+                dt_bias,
+                a_log,
+                state.slots.arg(),
+                y.arg_mut(),
+            ][..],
+            &state.args(true),
+            &[heads, head_dim, eps, floor],
+        ]
+        .concat(),
     )
 }
 
@@ -192,23 +192,28 @@ pub fn kda_committed(
             .tier(tier)
             .apply(gates.grid(window_lanes(OP, indptr)?)),
         &[
-            mixed.arg(),
-            indptr.arg(),
-            committed.replay.arg(),
-            committed.commit.arg(),
-            committed.slots.arg(),
-            f,
-            b,
-            dt_bias,
-            a_log,
-            state.bank.arg_mut(),
-            work.arg_mut(),
-            y.arg_mut(),
-            stated(OP, committed.lane0)?.arg(),
-            heads,
-            head_dim,
-            eps,
-            floor,
-        ],
+            &[
+                mixed.arg(),
+                indptr.arg(),
+                committed.replay.arg(),
+                committed.commit.arg(),
+                committed.slots.arg(),
+                f,
+                b,
+                dt_bias,
+                a_log,
+                work.arg_mut(),
+                y.arg_mut(),
+            ][..],
+            &state.args(true),
+            &[
+                stated(OP, committed.lane0)?.arg(),
+                heads,
+                head_dim,
+                eps,
+                floor,
+            ],
+        ]
+        .concat(),
     )
 }

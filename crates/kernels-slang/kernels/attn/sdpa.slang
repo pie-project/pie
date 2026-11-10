@@ -2,6 +2,7 @@
 #include "prim/params.slang"
 #include "prim/shuffle.slang"
 #include "prim/ieee.slang"
+#include "prim/pool.slang"
 
 // Paged attention over a KV cache, bf16 two a word, causal (an optional
 // sliding window, an optional per-row byte mask). Decode reads one query row
@@ -129,23 +130,23 @@ void main(uint3 gid : SV_DispatchThreadID) {
 #endif
 
 #if defined(SDPA_NARROW_STORAGE)
+#define SDPA_KV uint16_t
+#define SDPA_KV_SCALE 2u
 [[vk::binding(0)]] StructuredBuffer<uint16_t> queries;
-[[vk::binding(1)]] StructuredBuffer<uint16_t> k_pages;
-[[vk::binding(2)]] StructuredBuffer<uint16_t> v_pages;
-[[vk::binding(3)]] RWStructuredBuffer<uint16_t> o;
+[[vk::binding(1)]] RWStructuredBuffer<uint16_t> o;
 #else
+#define SDPA_KV uint
+#define SDPA_KV_SCALE 1u
 [[vk::binding(0)]] StructuredBuffer<uint> queries;
-[[vk::binding(1)]] StructuredBuffer<uint> k_pages;
-[[vk::binding(2)]] StructuredBuffer<uint> v_pages;
-[[vk::binding(3)]] RWStructuredBuffer<uint> o;
+[[vk::binding(1)]] RWStructuredBuffer<uint> o;
 #endif
-[[vk::binding(4)]] StructuredBuffer<int> position_ids;
-[[vk::binding(5)]] StructuredBuffer<int> req_of_token;
-[[vk::binding(6)]] StructuredBuffer<uint> kv_page_indices;
-[[vk::binding(7)]] StructuredBuffer<uint> kv_page_indptr;
+[[vk::binding(2)]] StructuredBuffer<int> position_ids;
+[[vk::binding(3)]] StructuredBuffer<int> req_of_token;
+[[vk::binding(4)]] StructuredBuffer<uint> kv_page_indices;
+[[vk::binding(5)]] StructuredBuffer<uint> kv_page_indptr;
 #if defined(SDPA_NARROW_STORAGE)
-[[vk::binding(8)]] StructuredBuffer<uint8_t> attention_mask;
-[[vk::binding(9)]] StructuredBuffer<uint8_t> attention_mask_enabled;
+[[vk::binding(6)]] StructuredBuffer<uint8_t> attention_mask;
+[[vk::binding(7)]] StructuredBuffer<uint8_t> attention_mask_enabled;
 
 uint mask_byte(uint i) {
     return uint(attention_mask[i]);
@@ -155,8 +156,8 @@ uint mask_enabled_byte(uint row) {
     return uint(attention_mask_enabled[row]);
 }
 #else
-[[vk::binding(8)]] StructuredBuffer<uint> attention_mask;
-[[vk::binding(9)]] StructuredBuffer<uint> attention_mask_enabled;
+[[vk::binding(6)]] StructuredBuffer<uint> attention_mask;
+[[vk::binding(7)]] StructuredBuffer<uint> attention_mask_enabled;
 
 uint mask_byte(uint i) {
     return byte_at(attention_mask, i);
@@ -167,25 +168,32 @@ uint mask_enabled_byte(uint row) {
 }
 #endif
 #if defined(PIE_SPLIT)
-[[vk::binding(10)]] RWStructuredBuffer<float> part_out;
-[[vk::binding(11)]] RWStructuredBuffer<float> part_lse;
+[[vk::binding(8)]] RWStructuredBuffer<float> part_out;
+[[vk::binding(9)]] RWStructuredBuffer<float> part_lse;
 #if defined(PIE_SPLIT_LSE)
-[[vk::binding(12)]] RWStructuredBuffer<float> lse_out;
-#define PIE_PARAMS_AT 13
+[[vk::binding(10)]] RWStructuredBuffer<float> lse_out;
+#define SDPA_SEGMENTS_AT 11
 #else
-#define PIE_PARAMS_AT 12
+#define SDPA_SEGMENTS_AT 10
 #endif
 #elif defined(PIE_LSE)
-[[vk::binding(10)]] RWStructuredBuffer<float> lse_out;
-#define PIE_PARAMS_AT 11
+[[vk::binding(8)]] RWStructuredBuffer<float> lse_out;
+#define SDPA_SEGMENTS_AT 9
 #elif defined(PIE_SELECTED)
-[[vk::binding(10)]] StructuredBuffer<int> selection;
-#define PIE_PARAMS_AT 11
+[[vk::binding(8)]] StructuredBuffer<int> selection;
+#define SDPA_SEGMENTS_AT 9
 #else
-#define PIE_PARAMS_AT 10
+#define SDPA_SEGMENTS_AT 8
 #endif
+// The kv pages, in the chunk pool's segments (`prim/pool.slang`).
+PIE_POOL_SEGMENTS(StructuredBuffer, SDPA_KV, SDPA_SEGMENTS_AT)
+#define PIE_PARAMS_AT (SDPA_SEGMENTS_AT + 4)
 
 struct Params {
+    uint seg_words;
+    uint k_origin;
+    uint v_origin;
+    uint page_stride;
     int gqa_factor;
     int page_size;
     int n_kv_heads;
@@ -208,10 +216,16 @@ struct Params {
 #endif
 };
 PIE_PARAMS(PIE_PARAMS_AT, Params, params);
+PIE_POOL_READ(SDPA_KV, SDPA_KV_SCALE * params.seg_words)
+PIE_POOL_VIEW_RO(k_pages, SDPA_KV, SDPA_KV_SCALE * params.k_origin)
+PIE_POOL_VIEW_RO(v_pages, SDPA_KV, SDPA_KV_SCALE * params.v_origin)
 
-uint page_slot(int req, int kp) {
+// The bf16 element key `kp` of request `req` starts at in its plane: its
+// page, `page_stride` words a page, then the token's row in it.
+uint page_row(int req, int kp) {
     uint phys = kv_page_indices[kv_page_indptr[req] + uint(kp / params.page_size)];
-    return phys * uint(params.page_size) + uint(kp % params.page_size);
+    return phys * (2u * params.page_stride)
+        + uint(kp % params.page_size) * uint(params.n_kv_heads) * uint(PIE_HEAD_DIM);
 }
 
 bool keeps(uint row, int kp, int q_pos, int start) {
@@ -304,7 +318,7 @@ void main(uint3 group : SV_GroupID, uint3 local : SV_GroupThreadID) {
         uint base = 0u;
         float partial = 0.0;
         if (take) {
-            base = (page_slot(req, kp) * uint(params.n_kv_heads) + uint(kv_head)) * uint(PIE_HEAD_DIM);
+            base = page_row(req, kp) + uint(kv_head) * uint(PIE_HEAD_DIM);
             for (uint i = 0u; i < PAIRS_PER_LANE; i++) {
                 partial += dot(qv[i], word_pair(k_pages[(base + 2u * (lane + i * LANES_PER_ROW)) >> 1]));
             }
@@ -441,7 +455,7 @@ void decode_walk(uint row, uint q_head, uint tid, int k_lo, int k_hi, int q_pos,
             if (!keeps(row, kp, q_pos, start)) {
                 continue;
             }
-            uint base = (page_slot(req, kp) * uint(params.n_kv_heads) + uint(kv_head)) * uint(PIE_HEAD_DIM);
+            uint base = page_row(req, kp) + uint(kv_head) * uint(PIE_HEAD_DIM);
             float partial = 0.0;
             [ForceUnroll] for (uint j = 0u; j < uint(DPL); j++) {
                 uint dd = lane + j * width;
@@ -624,7 +638,7 @@ void decode_walk(uint row, uint q_head, uint tid, int k_lo, int k_hi, int q_pos,
         uint base = 0u;
         float partial = 0.0;
         if (take) {
-            base = (page_slot(req, kp) * uint(params.n_kv_heads) + uint(kv_head)) * uint(PIE_HEAD_DIM);
+            base = page_row(req, kp) + uint(kv_head) * uint(PIE_HEAD_DIM);
             [ForceUnroll] for (uint j = 0u; j < uint(PPL); j++) {
                 uint pp = lane + j * width;
                 if (j < per_lane && pp < pairs) {
