@@ -112,6 +112,12 @@ impl<I: PoolId> ShapePool<I> {
     /// capacity is what the state chunks would hold of it alone; its ids run
     /// to every ref the pool's chunks could name.
     pub fn shared(shared: &Shared, shape: TokenShape) -> Self {
+        Self::shared_from(shared, shape, 0)
+    }
+
+    /// [`Self::shared`] with id `base + r` naming slot ref `r`, for a store
+    /// that numbers another pool's ids below them.
+    pub fn shared_from(shared: &Shared, shape: TokenShape, base: u32) -> Self {
         let (kind, capacity, ids_end) = {
             let pool = shared.lock().unwrap();
             let slots = pool.pool();
@@ -126,13 +132,15 @@ impl<I: PoolId> ShapePool<I> {
                 .saturating_sub(slots.act_chunks(0));
             (kind, refs(state), refs(slots.total_chunks()))
         };
+        base.checked_add(ids_end)
+            .expect("pool id range overflows u32");
         Self {
             slots: Backing::Shape(Arc::clone(shared), shape.pool),
             kind,
             slot_bytes: shape.slot_bytes,
-            base: 0,
+            base,
             capacity,
-            ids_end,
+            ids_end: base + ids_end,
             limit: capacity,
             pending: Vec::new(),
             id: PhantomData,
@@ -192,7 +200,7 @@ impl<I: PoolId> ShapePool<I> {
         match &self.slots {
             Backing::Shape(_, shape) => ids
                 .iter()
-                .map(|&id| pool.slot(*shape, id.index()))
+                .map(|&id| pool.slot(*shape, id.index() - self.base))
                 .collect(),
             Backing::Records(_) => ids
                 .iter()
@@ -236,7 +244,11 @@ impl<I: PoolId> ShapePool<I> {
             }
             Backing::Shape(shared, shape) => {
                 let refs = shared.lock().unwrap().take_refs(*shape, n as u64)?;
-                Some(refs.into_iter().map(I::from_index).collect())
+                Some(
+                    refs.into_iter()
+                        .map(|r| I::from_index(self.base + r))
+                        .collect(),
+                )
             }
             Backing::Records(shared) => {
                 let records = shared.lock().unwrap().take_records(n)?;
@@ -291,7 +303,7 @@ impl<I: PoolId> ShapePool<I> {
                 self.release_past_limit(&slots);
             }
             Backing::Shape(shared, shape) => {
-                let refs: Vec<u32> = ids.iter().map(|id| id.index()).collect();
+                let refs: Vec<u32> = ids.iter().map(|id| id.index() - self.base).collect();
                 shared.lock().unwrap().give_refs(*shape, &refs);
             }
             Backing::Records(shared) => {
@@ -725,8 +737,8 @@ impl StorePools {
         Ok(pools)
     }
 
-    /// A shared pool's geometry: the list and ring shapes' tokens a slot
-    /// and the window.
+    /// A shared pool's geometry: the kv list and ring shapes' tokens a
+    /// slot and the window, and the rs list's slot bytes as the buffer's.
     fn shared(facts: &ChunkFacts) -> Self {
         let mut pools = Self {
             shared: true,
@@ -738,6 +750,11 @@ impl StorePools {
                 ..ShapeRun::default()
             };
             match shape.kind {
+                // The rs buffer's list (CONTRACT-BC 18): its tokens are
+                // the rs store's, not the kv page size.
+                SlotKind::List { .. } if shape.role == ::engine::chunk::SlotRole::RsBuffer => {
+                    pools.buffer = run;
+                }
                 SlotKind::List { tokens, .. } => {
                     pools.page_size = tokens;
                     pools.kv = run;

@@ -146,6 +146,10 @@ pub struct PreparedRs {
     pub copies: (Vec<u32>, Vec<u32>),
     /// In the engine's page numbering.
     pub page_copies: (Vec<u32>, Vec<u32>),
+    /// The lane each of `page_copies` is stated on in a shared pool: its
+    /// group's first ([`apply_shared`] lowers them to
+    /// `Lane::slot_copies` of the rs list).
+    pub page_copy_lanes: Vec<usize>,
     pub buffer_slot_ids: Vec<u32>,
     pub verbs: Vec<engine::fire::RsVerb>,
     /// A ring model's rows: each lane's windowed page ids, aligned with
@@ -184,8 +188,8 @@ impl PreparedRs {
 
     pub fn state_copy(&self) -> Option<engine::StateCopy> {
         if self.shared {
-            // The engine copies each lane's run onto its cow itself; the
-            // buffer pages ride inside the records.
+            // The engine copies each lane's run onto its cow itself, and
+            // the rs list slots a lane's `slot_copies` state.
             return None;
         }
         let moves = |(src, dst): &(Vec<u32>, Vec<u32>)| -> Vec<engine::transfer::StateMove> {
@@ -243,7 +247,9 @@ impl PreparedRs {
 }
 
 /// Names each lane's slots by the shared pool's shapes, for an engine that
-/// states one (`Lane::tables`, `Lane::fixed`); nothing where `shared` is
+/// states one (`Lane::tables`, `Lane::fixed`, and the rs list slots a
+/// group's first lane copies before the fire, `Lane::slot_copies`, where it
+/// writes buffered rows into a slot it shares); nothing where `shared` is
 /// `None`. The legacy fields stay as they are. A lane's list table is its
 /// translation where one is stated, else its pages (the list shape's slot
 /// refs either way), its ring table its window refs; its fixed records the
@@ -268,6 +274,22 @@ pub fn apply_shared(
         lane.tables = pool.lane_tables(list, &lane.kv.window);
         let records = rs.filter(|rs| rs.shared).and_then(|rs| rs.run_cow(row));
         lane.fixed = records.map_or_else(Vec::new, |(run, cow)| pool.lane_fixed(run, cow));
+        lane.slot_copies = rs
+            .filter(|rs| rs.shared)
+            .zip(pool.rs_list())
+            .map(|(rs, list)| {
+                let pairs: Vec<[u32; 2]> = rs
+                    .page_copy_lanes
+                    .iter()
+                    .zip(rs.page_copies.0.iter().zip(&rs.page_copies.1))
+                    .filter(|&(&at, _)| at == row)
+                    .map(|(_, (&src, &dst))| [src, dst])
+                    .collect();
+                (list.id, pairs)
+            })
+            .filter(|(_, pairs)| !pairs.is_empty())
+            .into_iter()
+            .collect();
         if records.is_some() {
             for snap in &mut lane.rs_snapshots {
                 snap.pieces = pool.snapshot_pieces(snap.slot);
@@ -420,10 +442,10 @@ pub fn prepare_many(
             }
         };
         // The first lane writes the state; the others read what it held, or
-        // the zeros it starts from. In a shared pool the buffer rows ride
-        // inside the record, and the group's lanes are rows of one working
-        // set in one fire whose buffered rows all land in the record it
-        // writes: each names that record, `[run, cow]` as the first does.
+        // the zeros it starts from. In a shared pool a group whose first
+        // lane folds writes a fresh record, and every lane names it,
+        // `[run, cow]` as the first does (CONTRACT-BC 15); the buffered rows
+        // are rs list slots apart from the record.
         for (at, &lane) in group.lanes.iter().enumerate() {
             out.bound[lane] = true;
             match (at, write.state(), held) {
@@ -453,6 +475,7 @@ pub fn prepare_many(
             if let crate::store::rs::write::RsBufferTarget::Cow { src, dst, .. } = *target {
                 out.page_copies.0.push(store.engine_id(src));
                 out.page_copies.1.push(store.engine_id(dst));
+                out.page_copy_lanes.push(group.lanes[0]);
             }
         }
         prepared.push(write);

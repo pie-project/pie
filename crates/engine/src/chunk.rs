@@ -157,8 +157,8 @@ impl ChunkRun {
 /// How the slots of one shape hold a working set's state.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum SlotKind {
-    /// A record a working set holds whole (recurrent and conv state, the rs
-    /// buffer as `[P, width]` rows, a frame cache, snapshots), cut into
+    /// A record a working set holds whole (recurrent and conv state, a
+    /// frame cache, snapshots), cut into
     /// `pieces` equal slots where it is larger than a chunk.
     Fixed { pieces: u32 },
     /// Per-token state that grows with the sequence (full-attention kv,
@@ -191,6 +191,24 @@ pub struct SlotShape {
     /// shape at load); `None` takes chunks from the shared pool.
     #[serde(default)]
     pub pinned: Option<Pinned>,
+    /// What the shape holds, where its kind alone does not say: a list
+    /// shape is the kv list or the rs list (CONTRACT-BC 18).
+    #[serde(default)]
+    pub role: SlotRole,
+}
+
+/// What a slot shape holds beside its kind.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum SlotRole {
+    /// The state its kind names: kv for a list, a window for a ring, a
+    /// record for a fixed shape.
+    #[default]
+    State,
+    /// The rs buffer (a list shape only): a slot holds `tokens` unfolded
+    /// rows of every recurrent layer's rs planes; buffered row `s` lies in
+    /// slot `(s - base) / tokens` of the lane's `RsVerb::Buffer::pages`, at
+    /// row `(s - base) % tokens`.
+    RsBuffer,
 }
 
 /// A shape's own chunks on each tier, and the id the engine numbers the
@@ -353,6 +371,7 @@ impl ChunkFacts {
                 sets_per_working_set: kind.sets_per_working_set(),
                 rows: Vec::new(),
                 pinned: Some(pinned),
+                role: SlotRole::State,
             });
         };
         let kv = pools.kv_pages > 0 || pools.host_kv_pages > 0;
@@ -533,6 +552,12 @@ impl ChunkFacts {
                     ));
                 }
                 _ => {}
+            }
+            if shape.role == SlotRole::RsBuffer && !matches!(shape.kind, SlotKind::List { .. }) {
+                return invalid(format!(
+                    "shape {} buffers rs rows as {:?}; the rs buffer is a list shape",
+                    shape.id, shape.kind
+                ));
             }
             if let Some(pinned) = shape.pinned {
                 if pinned.host.end() > u64::from(self.host_chunks)
