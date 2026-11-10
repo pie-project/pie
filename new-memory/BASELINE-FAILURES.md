@@ -66,5 +66,3 @@ Per the user's speed rule, full suites were stopped; everything marked NOT RUN s
 - poem-compiler: `the_dsv41_plan_is_the_published_one`, `the_dsv41_dspark_head_drafts_through_its_stages` (look up
   old row names like `pool.2`).
 - engine-cuda (sm_120): `a_conv_decoder_fires_over_a_voxel_input` ("reopened slot drifts").
-- engine-xla (from main #1579, identical code on origin/main c251a2914): `chip::tests::a_v6e_runs_its_file_and_the_file_is_what_it_ran_before`
-  expects `moe_gmm_run: 1`, v6e profile now gives 4.
