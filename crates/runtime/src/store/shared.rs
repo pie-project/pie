@@ -402,6 +402,37 @@ impl SharedPool {
         &self.fixed
     }
 
+    /// The kv list slots whose chunks, let go whole, hold `rs` of the state
+    /// shapes: the rs list's slots (`pages`), each window list's
+    /// (`windows`, a store of windows) and whole records (`slots`). Any
+    /// chunk opens for any shape, so kv that parks makes the room state
+    /// lacks; 0 without a kv list.
+    #[must_use]
+    pub fn list_slots_for(&self, rs: crate::store::rs::RsUnits) -> u64 {
+        let Some(list) = self.list else {
+            return 0;
+        };
+        let chunks = |shape: ShapeId, slots: u64| -> u64 {
+            let spc = self
+                .pool
+                .shape(shape)
+                .map_or(1, |shape| shape.slots_per_chunk.max(1));
+            slots.div_ceil(u64::from(spc))
+        };
+        let mut wanted = 0u64;
+        if rs.windows.iter().any(|&n| n > 0) {
+            for (window, &n) in self.windows.iter().zip(&rs.windows) {
+                wanted += chunks(window.pool, u64::from(n));
+            }
+        } else if let Some(rs_list) = self.rs_list {
+            wanted += chunks(rs_list.pool, u64::from(rs.pages));
+        }
+        for shape in &self.fixed {
+            wanted += chunks(shape.pool, u64::from(rs.slots) * u64::from(shape.pieces));
+        }
+        wanted * u64::from(list.slots_per_chunk)
+    }
+
     /// The engine's id of pool shape `pool`, a state shape's.
     #[must_use]
     pub fn engine_shape(&self, pool: ShapeId) -> Option<EngineShape> {
