@@ -3,7 +3,7 @@
 //! `PIE_XLA_SPEED_RUNS=decode:1,decode:64,prefill:512` (the default runs
 //! decode at 1, 64 and 256 lanes and prefill of 512 and 2048 tokens). Each
 //! run loads the model with the budgets it needs, warms its
-//! programs, and times fires with no readout but the last. The same file
+//! programs, and reports medians: of windows of decode steps fired back to back, of prompts each timed to its readout. The same file
 //! builds against the base build, so two builds compare on one device.
 
 use std::time::Instant;
@@ -57,17 +57,29 @@ fn decode(name: &str, lanes: u32, held: u32, steps: u32) -> f64 {
     for _ in 0..3 {
         step(&mut model, &mut refs, &mut seqs, true);
     }
-    let t = Instant::now();
-    for s in 0..steps {
-        step(&mut model, &mut refs, &mut seqs, s + 1 == steps);
+    // Windows of `steps` steps fired back to back (a readout only at the
+    // end, so the device stays fed): the median window's rate.
+    let mut rates = Vec::with_capacity(5);
+    for _ in 0..5 {
+        let t = Instant::now();
+        for s in 0..steps {
+            step(&mut model, &mut refs, &mut seqs, s + 1 == steps);
+        }
+        rates.push(f64::from(lanes * steps) / t.elapsed().as_secs_f64());
     }
-    f64::from(lanes * steps) / t.elapsed().as_secs_f64()
+    median(&mut rates)
+}
+
+fn median(xs: &mut [f64]) -> f64 {
+    xs.sort_by(f64::total_cmp);
+    xs[xs.len() / 2]
 }
 
 /// Prefill tok/s of one `len`-token prompt.
 fn prefill(name: &str, len: u32, runs: u32) -> f64 {
     let context = (len + 64).next_power_of_two();
     set("SLOTS", runs + 3);
+    // `runs` prompts after two warm ones, each a working set of its own
     set("LANES", 8);
     set("TOKENS", len);
     let mut model = Model::load(name, None, context, 7);
@@ -81,11 +93,13 @@ fn prefill(name: &str, len: u32, runs: u32) -> f64 {
     for slot in 0..2 {
         fire(&mut model, &mut refs, slot);
     }
-    let t = Instant::now();
+    let mut times = Vec::with_capacity(runs as usize);
     for r in 0..runs {
+        let t = Instant::now();
         fire(&mut model, &mut refs, 2 + r);
+        times.push(t.elapsed().as_secs_f64());
     }
-    f64::from(len * runs) / t.elapsed().as_secs_f64()
+    f64::from(len) / median(&mut times)
 }
 
 #[test]
@@ -103,7 +117,7 @@ fn speed() {
         let n: u32 = n.parse().expect("a count");
         let tps = match kind {
             "decode" => decode(&name, n, 64, 20),
-            "prefill" => prefill(&name, n, 3),
+            "prefill" => prefill(&name, n, 7),
             other => panic!("unknown run {other}"),
         };
         eprintln!("SPEED {name} {kind} {n}: {tps:.1} tok/s");
