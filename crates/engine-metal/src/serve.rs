@@ -326,7 +326,54 @@ pub struct Shell {
     rebound: crate::icb::Rebound,
 }
 
+/// The longest a load waits for the Neural Engine's programs.
+const ANE_COMPILE_LIMIT: std::time::Duration = std::time::Duration::from_secs(20 * 60);
+
 impl Shell {
+    /// Waits until every Neural Engine program this load would split work
+    /// with has compiled, and refuses the load if the compiler refused one
+    /// (after its retries): the Neural Engine's int8 share lands other bits
+    /// than the GPU alone, so a load that served without a refused program
+    /// would answer differently from one where it compiled. Every load that
+    /// serves therefore serves the split the device profile states, for
+    /// its whole life; a load the compiler will not take fails, to be
+    /// retried or loaded with the work kept on the GPU (`kernel.ane.mlp =
+    /// gpu`, `kernel.ane.projections = gpu` in the device profile).
+    fn settle_ane(&self) -> Result<()> {
+        let Some(ane) = &self.ane else {
+            return Ok(());
+        };
+        let began = std::time::Instant::now();
+        loop {
+            match ane.compiled() {
+                Some(Ok(())) => return Ok(()),
+                Some(Err(why)) => {
+                    return Err(Fault::Device {
+                        call: "the Neural Engine compile",
+                        why: format!(
+                            "{why}, on every try: this load would serve the work that program \
+                             takes on the GPU alone, which lands other bits than the split the \
+                             device profile states, so it is refused rather than served \
+                             differently. Load again, or keep the work on the GPU \
+                             (`kernel.ane.mlp = gpu`, `kernel.ane.projections = gpu`)"
+                        ),
+                    });
+                }
+                None if began.elapsed() > ANE_COMPILE_LIMIT => {
+                    return Err(Fault::Device {
+                        call: "the Neural Engine compile",
+                        why: format!(
+                            "no answer in {} s: the load is refused rather than served with \
+                             the split undecided",
+                            ANE_COMPILE_LIMIT.as_secs()
+                        ),
+                    });
+                }
+                None => std::thread::sleep(std::time::Duration::from_millis(20)),
+            }
+        }
+    }
+
     /// The weight cache (`store::streamed`): one cache a weight shape the
     /// recipe gives weights this engine streams (experts only where no
     /// other tier holds a bank), every atom read from its weight in place
@@ -997,7 +1044,7 @@ impl PreparedLoad<'_> {
             )?),
             false => None,
         };
-        Ok(Shell {
+        let shell = Shell {
             tuning,
             device,
             keepalive,
@@ -1055,7 +1102,9 @@ impl PreparedLoad<'_> {
             icb: None,
             #[cfg(target_vendor = "apple")]
             rebound: crate::icb::Rebound::default(),
-        })
+        };
+        shell.settle_ane()?;
+        Ok(shell)
     }
 }
 

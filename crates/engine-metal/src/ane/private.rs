@@ -349,8 +349,9 @@ enum Job {
 }
 
 /// How often a compile is tried: the compiler service can drop its
-/// connection, and a program it never compiles leaves its work to the GPU
-/// for the load's life, which lands other bits.
+/// connection. A program it never compiles fails the load
+/// (`Shell::settle_ane`): served, the GPU would keep that work, which lands
+/// other bits.
 const COMPILE_TRIES: u32 = 8;
 
 /// `compile`'s answer, tried again after a refusal up to [`COMPILE_TRIES`].
@@ -385,7 +386,7 @@ impl Job {
                         started.elapsed().as_secs_f64()
                     ),
                     Err(why) => eprintln!(
-                        "ane: the Neural Engine MLP program did not compile ({why}); the GPU runs the MLP alone"
+                        "ane: the Neural Engine MLP program did not compile ({why}); the load is refused"
                     ),
                 }
                 let _ = slot.set(result);
@@ -402,7 +403,7 @@ impl Job {
                         started.elapsed().as_secs_f64()
                     ),
                     Err(why) => eprintln!(
-                        "ane: the Neural Engine {} -> {} program did not compile ({why}); the GPU runs it alone",
+                        "ane: the Neural Engine {} -> {} program did not compile ({why}); the load is refused",
                         shape.k, shape.n
                     ),
                 }
