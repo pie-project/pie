@@ -145,7 +145,10 @@ fn ltx_2(path: &str, _row: &CacheRow) -> String {
 }
 
 fn flux_2(path: &str, _row: &CacheRow) -> String {
-    path.to_string()
+    match parts(path)[..] {
+        ["te", "layers", l, "kv"] => format!("te.kv.{l}"),
+        _ => path.to_string(),
+    }
 }
 
 fn z_image(path: &str, _row: &CacheRow) -> String {
