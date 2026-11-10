@@ -506,7 +506,8 @@ impl Shell {
         };
         let paging_at = |pages: u64, slots: u32| -> Result<Paging> {
             Ok(Paging::of(boot.page_size, boot.context, slots, pages)?
-                .windowed(window, boot.budget.max_tokens))
+                .windowed(window, boot.budget.max_tokens)
+                .seated(boot.budget.max_lanes))
         };
         // The pool buffers are program parameters, so the pages are fixed
         // before anything traces: what the budget buys, or with none what
