@@ -2,7 +2,7 @@ use std::collections::BTreeMap;
 
 use poem_compiler::catalog::{self, Deployment};
 use poem_compiler::chunk::{
-    self, ChunkProfile, ChunkRecipe, FIXED_SETS, MIN_PIECE, MIN_RUN, RowId, SlotLayout,
+    self, ChunkProfile, ChunkRecipe, FIXED_SETS_PER_WS, MIN_PIECE, MIN_RUN, RowId, SlotLayout,
     TOKEN_GRAIN, human,
 };
 use poem_compiler::{Budget, Budgets, DeviceProfile};
@@ -179,17 +179,18 @@ fn row(name: &str, recipe: &ChunkRecipe) -> String {
             bytes,
             pieces_per_ws,
             ..
-        } => u64::from(FIXED_SETS) * u64::from(*pieces_per_ws) * bytes,
+        } => u64::from(FIXED_SETS_PER_WS) * u64::from(*pieces_per_ws) * bytes,
         _ => 0,
     });
     #[allow(clippy::cast_precision_loss)]
     let fixed = fixed as f64 / f64::from(1u32 << 20);
     format!(
-        "| {name} | {} | {} | {} | {fixed:.1} | {:.1} | {:.2} |",
+        "| {name} | {} | {} | {} | {fixed:.1} | {:.1} | {:.1} | {:.2} |",
         human(recipe.chunk_bytes),
         recipe.shapes(),
         per.join("/"),
         recipe.chunks_per_ws(),
+        recipe.cow_chunks(),
         recipe.waste.percent()
     )
 }
@@ -207,8 +208,10 @@ fn every_deployment_packs_into_chunks_on_both_presets() {
         let profile = on(chunk);
         let mut worst: Option<(f64, String)> = None;
         println!("\n## {preset}\n");
-        println!("| model | C | shapes | slots/chunk | fixed MiB/ws | chunks/ws | waste % |");
-        println!("|---|---|---|---|---|---|---|");
+        println!(
+            "| model | C | shapes | slots/chunk | fixed MiB/ws | chunks/ws | CoW chunks/pool | waste % |"
+        );
+        println!("|---|---|---|---|---|---|---|---|");
         for (deployment, trace) in &traces {
             let recipe = match chunk::plan(trace, &budgets, &profile) {
                 Ok(recipe) => recipe,
@@ -254,12 +257,13 @@ fn name_of(trace: &Trace, row: RowId) -> &str {
     }
 }
 
-/// The fixed rows of a record by name prefix: how many, of how many bytes.
-fn fixed_rows(trace: &Trace, recipe: &ChunkRecipe, prefix: &str) -> (usize, Vec<u64>) {
+/// The fixed rows of a record whose name holds `part`: how many, of how many
+/// bytes.
+fn fixed_rows(trace: &Trace, recipe: &ChunkRecipe, part: &str) -> (usize, Vec<u64>) {
     let mut bytes: Vec<u64> = recipe
         .atoms
         .iter()
-        .filter(|(row, _)| name_of(trace, **row).starts_with(prefix))
+        .filter(|(row, _)| name_of(trace, **row).contains(part))
         .map(|(_, atom)| atom.bytes * atom.extent)
         .collect();
     bytes.dedup();
@@ -267,7 +271,7 @@ fn fixed_rows(trace: &Trace, recipe: &ChunkRecipe, prefix: &str) -> (usize, Vec<
         recipe
             .atoms
             .keys()
-            .filter(|row| name_of(trace, **row).starts_with(prefix))
+            .filter(|row| name_of(trace, **row).contains(part))
             .count(),
         bytes,
     )
@@ -301,8 +305,9 @@ fn qwen3_next_packs_36_delta_and_conv_states_with_next_to_no_waste() {
     assert!(overhead < 0.02, "{overhead}");
 }
 
-/// The fixed shape's bytes past both records, in its pieces and its share of
-/// the chunks they fill, over the records.
+/// The fixed shape's bytes past the pool's records (a set a working set and
+/// the copy-on-write reserve), in its pieces and the chunks they fill, over
+/// the records.
 #[allow(clippy::cast_precision_loss)]
 fn fixed_overhead(recipe: &ChunkRecipe) -> f64 {
     let Some(SlotLayout::Fixed {
@@ -314,7 +319,8 @@ fn fixed_overhead(recipe: &ChunkRecipe) -> f64 {
     else {
         panic!("no fixed record")
     };
-    let sets = u64::from(FIXED_SETS);
+    let sets = u64::from(recipe.profile.concurrency) * u64::from(FIXED_SETS_PER_WS)
+        + u64::from(recipe.cow_sets());
     let per = recipe.chunk_bytes / bytes;
     let slots = sets * u64::from(*pieces_per_ws);
     let held = slots as f64 * recipe.chunk_bytes as f64 / per as f64;
@@ -324,8 +330,14 @@ fn fixed_overhead(recipe: &ChunkRecipe) -> f64 {
 #[test]
 fn nemotron_super_holds_40_four_mib_states_and_their_convs() {
     let (trace, recipe) = planned("nemotron3-super-bf16-nvfp4a4-e4m3tile128a8-kv-e4m3");
-    assert_eq!(fixed_rows(&trace, &recipe, "ssm."), (40, vec![4 << 20]));
-    assert_eq!(fixed_rows(&trace, &recipe, "conv."), (40, vec![80 << 10]));
+    assert_eq!(
+        fixed_rows(&trace, &recipe, "mamba.ssm_state"),
+        (40, vec![4 << 20])
+    );
+    assert_eq!(
+        fixed_rows(&trace, &recipe, "mamba.conv_state"),
+        (40, vec![80 << 10])
+    );
     let overhead = fixed_overhead(&recipe);
     println!("nemotron-super fixed overhead {:.2}%", 100.0 * overhead);
     assert!(overhead < 0.02, "{overhead}");
