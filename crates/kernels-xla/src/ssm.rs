@@ -1511,10 +1511,12 @@ fn delta(
             let fq = &mut *f;
             let lanes = decode_lanes(fq, slots, t)?;
             let heads = input.heads_from(fq, &raw.rows, &raw.fixed)?;
-            if matches!(input, DeltaIn::Gdn { .. }) && input.rule() && step_kernel_on() {
-                if let Some(out) = step::gdn_step(fq, &heads, lanes.slot, slab, per)? {
-                    return Ok(out);
-                }
+            if matches!(input, DeltaIn::Gdn { .. })
+                && input.rule()
+                && step_kernel_on()
+                && let Some(out) = step::gdn_step(fq, &heads, lanes.slot, slab, per)?
+            {
+                return Ok(out);
             }
             // One round of `t` lanes holds `[t, H, dk, dv]` in VMEM (32 MiB at
             // t = 64 for a 32×128×128 bf16 state). When a slot is blocked over
