@@ -14,7 +14,7 @@ Legend: ✅ verified on hardware · 🟡 in progress / compile-only · 🔴 not 
 | Window lists (own T_w, trimmed) | ✅ tables per list M51 (T_w = page; 2-window untested) | ✅ goldens (one list) | ✅ up to 4 lists M50 | ✅ up to 4 lists, own T_w M53 | ✅ M53 | 🟡 M63 (one list, T_w = page) | 🟡 one list, T_w=page |
 | Multi-piece records end to end | ✅ engine (L40S) · ✅ runtime boot (IT r5, 18 pieces) | ✅ records in pieces (chunk goldens); rows cut across pieces kernel-tested | ✅ M50 | ✅ M48 (4 pieces bitwise) | ✅ M48 | 🟡 M63 | 🟡 host sim |
 | Weight streaming: PLE rows | ✅ M35/M36/M41 | ✅ M43 golden_rows | ✅ M50 | ✅ M53 (rows, grouped tables) | ✅ M53 | 🔴 design only | — weights on host |
-| Weight streaming: experts | 🟡 dense bf16 M40; quantized next | ✅ dense M47; quantized after CUDA | ✅ dense M50; quantized next | ✅ VK3 dense + affine + MXFP4, every arm (engine tier deleted) | ✅ VK3 | 🔴 design only | — weights on host |
+| Weight streaming: experts | 🟡 dense bf16 M40; quantized next | ✅ dense M47; quantized after CUDA | ✅ dense M50 + quantized M72 | ✅ VK3 dense + affine + MXFP4, every arm (engine tier deleted) | ✅ VK3 | 🔴 design only | — weights on host |
 | Host/disk tiers of shared shapes (copy_slots) | ✅ engine probe M43 · ✅ e2e M52 | ✅ golden_offload 8/8 (MI300X) | ✅ M50 offload probe | ✅ M53 offload (dense, hybrid, window) | ✅ M53 | 🟡 M63 (CUDA PJRT bitwise; TPU by team) | 🟡 M44 (host sim) |
 | Snapshots (rs_snapshots) | ✅ | ✅ | ✅ | ✅ VK3 (4 a lane, per piece; conv, GDN, KDA) | ✅ VK3 | 🔴 XLA | — |
 | K2 (no kv spaces) | ✅ M39 | ✅ | ✅ M42 | compile | compile | compile | compile |

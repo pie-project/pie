@@ -934,3 +934,19 @@ The `new-memory/` directory is bookkeeping and is removed before anything lands 
   fire HBM at a 24 GiB pool = pool in place + < 300 MB. engine-xla 14 + kernels-xla 18 lib tests pass.
 - Next (TPU): Mosaic decode page copy, flash fresh rows, kv append on the pool; speed vs main. CUDA-plugin chunk-count
   re-check pending here.
+
+### M72 — 2026-11-10: Metal held weights, quantized weight streaming, mamba conv fix (BMX)
+- `sc/bmx-metal` (c16362372, f42e97dd9, a1466b196, 6d6e93226), all on the Mac Studio:
+  - Held weights: the load seats atoms (after the seats' runs, else from chunk 1), states `seated`, warm loads pread
+    streamed weights out of the mapped windows; runtime adopts. Bitwise in 3 new + 5 old modes on 5 minis.
+  - Quantized streaming: every quantized expert kernel path (affine 64/{2,4,8}, 32/2, 128/2, MXFP4 +/- bias; qmv,
+    batched, MPP, register tiles) and 4/8-bit embedding gathers read through tables; compiler: Metal expert pieces
+    hold multiples of 128 output rows. Kernel-level and e2e bitwise (u4 experts, MXFP4 in 9 pieces, 4-bit PLE).
+  - Real models via `pie run`: tokens = base. Qwen3.6-35B-A3B-4bit boot 32-37 s -> 10.8-12.2 s (off); gemma held
+    +0.5 GB vs base (copies all PLE rows).
+  - Fix: Metal buffered every conv input in the rs list; non-recurrence convs (mamba2) now commit as they run ->
+    nemotron3-nano-mini and qwen38-flash-next-mini load and match.
+  - kv page 16 vs 32 on Metal measured: equal or 16 slightly better -> stays 16.
+- Open: runtime boot fit check counts only committed segments (Metal: one ~65 MB) -> must count growable segments
+  (engine works around by backing weights + floors at load). Writer refuses qwen38 u2 (ple.table 160 not a multiple
+  of 64). Affine 2-bit / biased MXFP4 untested on real models.
