@@ -8,7 +8,6 @@
     )
 )]
 
-pub mod abi;
 pub mod adapter;
 pub mod ane;
 pub mod api;
@@ -33,7 +32,6 @@ mod legs;
 pub mod mapping;
 pub mod mask;
 pub mod program;
-pub mod record;
 pub mod rs;
 pub mod run;
 mod scratch;
@@ -44,7 +42,6 @@ pub mod tune;
 pub mod weights;
 pub mod window;
 
-pub use abi::{Armed, At as AbiAt, Axis, DescriptorAbi, Law, SlotAbi, Survey};
 pub use adapter::{
     Binding as AdapterBinding, Key as AdapterKey, Role as AdapterRole, Site,
     Source as AdapterSource,
@@ -60,7 +57,6 @@ pub use error::{Fault, Result};
 pub use experts::Plan as ResidencyPlan;
 pub use inputs::Inputs;
 pub use program::{Fired, Launched, Plane as ProgramPlane, Session as ProgramSession};
-pub use record::{Arg, Point, Recording, Slot, Tape};
 pub use run::{
     CacheGeometry, CachePool, CacheTable, FireBindings, FireTables, PoolSlabs, Run, SlotTable,
     StructSlot, WeightRow, WeightTable,

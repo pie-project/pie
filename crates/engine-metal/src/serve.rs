@@ -18,7 +18,6 @@ use crate::encode::Sink;
 use crate::error::{Fault, Result};
 use crate::experts::Plan;
 use crate::inputs::Inputs;
-use crate::record::{Recording, Tape};
 use crate::run::{CacheGeometry, CacheTable, FireBindings, FireTables, Run, SlotTable};
 use crate::scratch::Scratch;
 use crate::settle::{Airborne, Arms, Done};
@@ -2460,27 +2459,6 @@ impl Shell {
         Ok(())
     }
 
-    pub fn record(&mut self, lanes: &[Lane<'_>]) -> Result<Recording> {
-        let seated: Vec<Seated<'_>> = lanes.iter().copied().map(Seated::of).collect();
-        self.record_seated(&seated)
-    }
-
-    pub fn record_seated(&mut self, lanes: &[Seated<'_>]) -> Result<Recording> {
-        self.drain()?;
-        let p = self.stage(StepView {
-            lanes,
-            attachments: &[],
-            media: &[],
-            clips: &[],
-            done: None,
-        })?;
-        let walked = self.walk_once(&p, Mode::Record)?;
-        self.handles.rewind();
-        walked.tape.ok_or_else(|| Fault::Unbound {
-            what: "a recording, from a walk that was asked for one".to_string(),
-        })
-    }
-
     #[allow(clippy::arc_with_non_send_sync)]
     fn stage<'a>(&mut self, step: StepView<'a>) -> Result<Prepared<'a>> {
         let StepView {
@@ -3884,6 +3862,11 @@ impl Shell {
                     &sink,
                     kernels_metal::Tensor::new(source, values, 1, Dtype::F32),
                     kernels_metal::Tensor::new(into, values, 1, Dtype::Bf16),
+            let sink = Sink::new(&self.device, &frame, &self.pipelines, &self.handles);
+            #[cfg(target_vendor = "apple")]
+            let sink = sink
+                .with_handoff(self.ane.as_ref().map(crate::ane::Ane::handoff))
+                .flushing_after(HEAD_LAUNCHES);
                 )
                 .map_err(crate::error::kernel)?;
             }
@@ -3942,37 +3925,16 @@ impl Shell {
         Ok(())
     }
 
-    fn walk_once(&self, p: &Prepared<'_>, mode: Mode) -> Result<Walked> {
+    fn walk_once(&self, p: &Prepared<'_>) -> Result<Walked> {
         let place = At::new();
-        let mut frame = match mode {
-            Mode::Encode => Some(self.device.frame()?),
-            Mode::Record => None,
-        };
-        if let Some(frame) = frame.as_mut() {
-            if let Some(plane) = self.nan_flags.as_ref() {
-                frame.fill_zero(plane.slab(), 0, plane.bytes())?;
-                #[cfg(target_vendor = "apple")]
-                frame.next_pass()?;
-            }
-            self.feed_inputs(frame, p)?;
-            self.land_merges(frame, p)?;
+        let mut frame = self.device.frame()?;
+        if let Some(plane) = self.nan_flags.as_ref() {
+            frame.fill_zero(plane.slab(), 0, plane.bytes())?;
+            #[cfg(target_vendor = "apple")]
+            frame.next_pass()?;
         }
-        let sink = match mode {
-            Mode::Encode => {
-                let sink = Sink::new(
-                    &self.device,
-                    frame.as_ref().expect("the encoding mode opened a frame"),
-                    &self.pipelines,
-                    &self.handles,
-                );
-                #[cfg(target_vendor = "apple")]
-                let sink = sink
-                    .with_handoff(self.ane.as_ref().map(crate::ane::Ane::handoff))
-                    .flushing_after(HEAD_LAUNCHES);
-                Encoded::Live(sink)
-            }
-            Mode::Record => Encoded::Taped(Tape::new(&self.handles, &place, &p.windows)),
-        };
+        self.feed_inputs(&mut frame, p)?;
+        self.land_merges(&mut frame, p)?;
         {
             let mut run = Run::new(
                 &sink,
@@ -3988,7 +3950,7 @@ impl Shell {
                 &self.scratch,
                 &self.tuning,
             )
-            .with_ane(self.ane.as_ref().filter(|_| matches!(mode, Mode::Encode)))
+            .with_ane(self.ane.as_ref())
             .with_regions(self.compiled.template());
             walk(
                 &self.trace,
@@ -4000,25 +3962,10 @@ impl Shell {
             )?;
         }
 
-        let classes: Vec<(u32, u32)> = p
-            .composition
-            .classes()
-            .as_slice()
-            .iter()
-            .map(|class| (class.rows, class.lanes))
-            .collect();
-        let taped = match sink {
-            Encoded::Live(_) => None,
-            Encoded::Taped(tape) => Some(tape.finish(classes)),
-        };
         let launches = (0..self.compiled.template().len() as u32)
             .map(|region| p.windows.runs(region).max(1))
             .sum();
-        Ok(Walked {
-            frame,
-            tape: taped,
-            launches,
-        })
+        Ok(Walked { frame, launches })
     }
 
     fn advance(&mut self, p: &Prepared<'_>) {
@@ -4034,15 +3981,8 @@ impl Shell {
 
 const SETTLED_RING: usize = 2 * Runahead::STEPS_MAX as usize;
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum Mode {
-    Encode,
-    Record,
-}
-
 struct Walked {
-    frame: Option<Frame>,
-    tape: Option<Recording>,
+    frame: Frame,
     launches: u32,
 }
 
@@ -4182,7 +4122,7 @@ impl engine::frame::Shell for Shell {
                 lanes.join(" ")
             )
         });
-        let walked = self.walk_once(&prepared, Mode::Encode)?;
+        let walked = self.walk_once(&prepared)?;
         fire_trace(|| "forward-encoded".to_string());
         let profile = crate::encode::kernel_profile();
         if !profile.is_empty() {
@@ -4202,7 +4142,7 @@ impl engine::frame::Shell for Shell {
             }
             crate::encode::reset_kernel_profile();
         }
-        let mut frame = walked.frame.expect("the encoding mode opened a frame");
+        let mut frame = walked.frame;
 
         let mut readbacks = vec![None; prepared.lanes.len()];
         if self.host_rows || self.rows_wanted {
@@ -4298,55 +4238,6 @@ impl engine::frame::Shell for Shell {
             lanes,
             launches,
         })
-    }
-}
-
-enum Encoded<'a> {
-    Live(Sink<'a>),
-    Taped(Tape<'a>),
-}
-
-impl kernels_metal::Encode for Encoded<'_> {
-    fn fire(
-        &self,
-        fire: kernels_metal::Fire,
-        args: &[kernels_metal::ArgValue],
-    ) -> std::result::Result<(), kernels_metal::Error> {
-        match self {
-            Encoded::Live(sink) => sink.fire(fire, args),
-            Encoded::Taped(tape) => tape.fire(fire, args),
-        }
-    }
-
-    fn absent(&self) -> std::result::Result<kernels_metal::ArgValue, kernels_metal::Error> {
-        match self {
-            Encoded::Live(sink) => sink.absent(),
-            Encoded::Taped(tape) => tape.absent(),
-        }
-    }
-
-    fn signal(&self, stamp: u64) -> std::result::Result<(), kernels_metal::Error> {
-        match self {
-            Encoded::Live(sink) => sink.signal(stamp),
-            Encoded::Taped(tape) => tape.signal(stamp),
-        }
-    }
-
-    fn wait(&self, stamp: u64) -> std::result::Result<(), kernels_metal::Error> {
-        match self {
-            Encoded::Live(sink) => sink.wait(stamp),
-            Encoded::Taped(tape) => tape.wait(stamp),
-        }
-    }
-
-    fn on_commit(
-        &self,
-        then: Box<dyn FnOnce() + Send>,
-    ) -> std::result::Result<(), kernels_metal::Error> {
-        match self {
-            Encoded::Live(sink) => sink.on_commit(then),
-            Encoded::Taped(tape) => tape.on_commit(then),
-        }
     }
 }
 
