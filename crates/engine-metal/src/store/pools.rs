@@ -989,17 +989,13 @@ impl Pools {
         }
         self.pool.evacuate(frame, evacuation)?;
         for (from, to, cells) in sides {
-            for (at, row) in self
-                .rows
-                .iter()
-                .filter_map(|row| match *row {
-                    Row::Compressed { width, kv, .. } => Some((kv, width)),
-                    _ => None,
-                })
-                .enumerate()
-            {
-                let _ = at;
-                let (plane, width) = row;
+            for row in &self.rows {
+                let Row::Compressed {
+                    width, kv: plane, ..
+                } = *row
+                else {
+                    continue;
+                };
                 let cell = width * u64::from(elem_size(Dtype::Bf16));
                 for buffer in [&self.side[plane], &self.side[plane + 1]] {
                     frame.copy_span(
