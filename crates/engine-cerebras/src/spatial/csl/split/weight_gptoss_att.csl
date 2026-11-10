@@ -20,7 +20,7 @@
 // compute(steps, start_pos). Queues and the hardware rules: as weight_q35.csl (own queue a flow; a route
 // rebound for a send is restored only after its output queue drains; no park on the PE's own send colour;
 // >= 768 B stack room).
-// rcfg (split_geo_gptoss.py rcfg_watt): [0] routes n, [1..1+2n); from RQ: [0..6) iq2..iq7, [6] oq5, [7] oq3,
+// rcfg: [0] routes n, [1..1+2n); from RQ: [0..6) iq2..iq7, [6] oq5, [7] oq3,
 // [8] row role, [9] column role, [10] the segment role, [11] -, [12..17) the segment colours, [17] the
 // weight row, [18..21) the pass-start relay, [21..24) the pass-end relay, [24] the spare colour, [25] flags (bit 0: the pass-start relay carries the
 // token loop's embedding: skipped at a launch's step 0).

@@ -9,8 +9,8 @@ scalar; + the embedding scale), qkw, rot, hw, hg, hemb, embed, embrows, pt<col>_
 precomputed for every vocab id: (RMSNorm(Wpm e) + 16 T) / sqrt 2), golden.json, meta.json, params.txt."""
 import glob, json, os, shutil, struct, sys
 import numpy as np
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-import split_geo_gemma as S
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."))
+import splitgeo
 
 MD, out, GOLD, GEO = sys.argv[1:5]
 NEG = int(sys.argv[5])
@@ -36,7 +36,7 @@ def bits(name):
 def f16(a):
     return np.asarray(a, np.float32).astype(np.float16).view(np.uint16)
 
-g = S.GEOS[GEO](G2=2, WL=1, G2W=2)
+g = splitgeo.geometry("gemma:" + GEO)
 PX, PY, XC = g.PX, g.PY, g.XC
 H, NL, I = tc["hidden_size"], tc["num_hidden_layers"], tc["intermediate_size"]
 nq, nkv = tc["num_attention_heads"], tc["num_key_value_heads"]

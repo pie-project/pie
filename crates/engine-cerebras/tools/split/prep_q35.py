@@ -2,7 +2,7 @@
 """prep_q35.py <model dir> <outdir> <golden json> PX PY UNX UNY K HR VR NE [prefix] [nunits]: any Qwen3.5
 or Qwen3 (dense: every layer attention, no output gate, plain norm weights, full RoPE)
 checkpoint (bf16 or f32 safetensors, the VL layout "model.language_model." or text-only "model.") in
-the role-split prep format (the files PIE_CEREBRAS_SPLIT=<outdir>:<prefix> names; spatial/split/place.rs
+the role-split prep format (the files PIE_CEREBRAS_SPLIT=<outdir>:<prefix> names; spatial/split/weights.rs
 copies them onto the wafer). At the 9B's dims it writes the same arrays as `split_prep` (Rust, 9B only). Units of PX x PY weight PEs, K layers each (the model's layer kinds, GDN / attention by
 `layer_types`, the same K-layer pattern in every unit), UNX x UNY units, the head PY / 2 columns of
 2 Hc dims by HR rows of VR vocabulary rows; lm_head = the embedding when tied. Weights as f16 bits.

@@ -8,7 +8,7 @@ import argparse, json, os, sys, time
 import numpy as np
 from cerebras.sdk.runtime.sdkruntimepybind import MemcpyDataType, MemcpyOrder, SdkRuntime  # pylint: disable=no-name-in-module
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-import split_geo_g12 as S
+import splitgeo
 
 ap = argparse.ArgumentParser()
 ap.add_argument("--name"); ap.add_argument("--cmaddr"); ap.add_argument("--report", default="g.json")
@@ -21,6 +21,7 @@ ap.add_argument("--tdbg", type=int, default=0)
 ap.add_argument("--fine", type=int, default=0)
 ap.add_argument("--golden", default="golden.json", help="the golden in the prep dir (after the prefix)")
 ap.add_argument("--placeonly", type=int, default=0, help="(checks) stop after the placement (the mock runtime's copy log)")
+ap.add_argument("--geo", default=os.path.join(os.path.dirname(os.path.abspath(__file__)), "geo"), help="split-geo's output for this prep (mkfull_g12.py writes it)")
 a = ap.parse_args()
 t00 = time.time()
 M = json.load(open(os.path.join(a.prep, a.prefix + "meta.json")))
@@ -28,9 +29,8 @@ for kv in filter(None, a.override.split(",")):
     k, v = kv.split("="); M[k] = int(v)
 def npy(n):
     return np.load(os.path.join(a.prep, a.prefix + n + ".npy"), mmap_mode="r")
-g = S.GEOS[M["geo"]](G2=M.get("G2", 16 if M["geo"] != "tiny" else 2), WL=1, G2W=M.get("G2W", 24 if M["geo"] != "tiny" else 2))
-g.build_g12()
-PX, PY, XC, YC, NU, K, RA = g.PX, g.PY, g.XC, g.YC, len(g.origins), M["K"], g.RA
+g = splitgeo.load(a.geo)
+PX, PY, XC, YC, NU, K, RA = g.PX, g.PY, g.XC, g.YC, g.units(), M["K"], g.RA
 OFF = np.concatenate([[0], np.cumsum([g.hc(r) for r in range(PY)])]).astype(int)
 LAST = NU - 1
 runner = SdkRuntime(a.name, cmaddr=a.cmaddr)
@@ -52,55 +52,9 @@ def get(s, x0, y0, w, h, n, dt=np.float32):
     b = np.zeros(w * h * n, dt)
     runner.memcpy_d2h(b, sym(s), x0, y0, w, h, n, **k32)
     return b.reshape(h, w, n)
-def quads():
-    for rs in ((0, YC), (YC, PY)):
-        for cs in ((0, XC), (XC, PX)):
-            yield rs, cs
 t0 = time.time()
-gama, gamw, qkw, rot = npy("gama"), npy("gamw"), npy("qkw"), npy("rot")
-def rowblocks():
-    """(r0, r1, kind) runs of rows of one kind on one side of the CY row"""
-    for (a_, b_) in ((0, YC), (YC, PY)):
-        for (k0, k1, kd) in ((0, RA, "a"), (RA, PY, "w")):
-            lo, hi = max(a_, k0), min(b_, k1)
-            if lo < hi:
-                yield lo, hi, kd
-for u in range(NU):
-    X0, Y0 = g.unit_origin(u)
-    wa, ww = npy(f"w{u}a"), npy(f"w{u}w")
-    for (r0, r1, kd) in rowblocks():
-        wu, rb0 = (wa, 0) if kd == "a" else (ww, RA)
-        for (c0, c1) in ((0, XC), (XC, PX)):
-            x0, y0 = X0 + g.wl(c0, XC), Y0 + g.wl(r0, YC)
-            rc = np.array([[g.rcfg_weight_g(X0 + g.wl(c, XC), Y0 + g.wl(r, YC), r, c, u == LAST) for c in range(c0, c1)] for r in range(r0, r1)], np.uint32)
-            put("rcfg", x0, y0, c1 - c0, r1 - r0, rc)
-            for rb in range(r0, r1, 16):
-                re = min(rb + 16, r1)
-                put("w", x0, Y0 + g.wl(rb, YC), c1 - c0, re - rb, np.asarray(wu[rb - rb0:re - rb0, c0:c1]), b16=True)
-        y0 = Y0 + g.wl(r0, YC)
-        rc = np.array([[g.rcfg_cx_g(X0 + XC, Y0 + g.wl(r, YC), u == 0, u == LAST)] for r in range(r0, r1)], np.uint32)
-        put("rcfg", X0 + XC, y0, 1, r1 - r0, rc)
-        gm = gama if kd == "a" else gamw
-        put("gam", X0 + XC, y0, 1, r1 - r0, np.asarray(gm[u, r0 - rb0:r1 - rb0])[:, None, :])
-    for (c0, c1) in ((0, XC), (XC, PX)):
-        x0 = X0 + g.wl(c0, XC)
-        rc = np.array([[g.rcfg_cy_g(X0 + g.wl(c, XC), Y0 + YC, u == LAST) for c in range(c0, c1)]], np.uint32)
-        put("rcfg", x0, Y0 + YC, c1 - c0, 1, rc)
-        put("qkw", x0, Y0 + YC, c1 - c0, 1, np.asarray(qkw[u, c0:c1])[None])
-        put("rot", x0, Y0 + YC, c1 - c0, 1, np.asarray(rot[c0:c1])[None])
-# head
-HX0, HXC, HC, HR = g.HX0, g.HXC, g.HC, g.HR
-hg = npy("hg")
-for i, (c0, c1) in enumerate(((0, HXC), (HXC, HC))):
-    hw = npy(f"hw{i}")
-    x0 = g.hx(c0)
-    for rb in range(0, HR, 64):
-        re = min(rb + 64, HR)
-        rc = np.array([[g.rcfg_head(g.hx(c), y) for c in range(c0, c1)] for y in range(rb, re)], np.uint32)
-        put("rcfg", x0, rb, c1 - c0, re - rb, rc)
-        put("hw", x0, rb, c1 - c0, re - rb, np.asarray(hw[rb:re]), b16=True)
-        put("hg", x0, rb, c1 - c0, re - rb, np.broadcast_to(np.asarray(hg[c0:c1])[None], (re - rb, c1 - c0, hg.shape[1])).copy())
-put("rcfg", HX0 + HXC, 0, 1, HR, np.array([[g.rcfg_hctl_g(HX0 + HXC, y, M["VR"])] for y in range(HR)], np.uint32))
+# every copy as split-geo's bindings state them (the Rust family's placement, in its order)
+splitgeo.place(put, npy, g, lambda n: os.path.exists(os.path.join(a.prep, a.prefix + n + ".npy")))
 t_place = time.time() - t0
 if a.placeonly:
     print(json.dumps({"placed_s": round(t_place, 1)}), flush=True)

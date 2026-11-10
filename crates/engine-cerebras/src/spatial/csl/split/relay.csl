@@ -1,6 +1,6 @@
 // split/relay.csl: a PE of the gap slot (spatial/split/README.md: an odd unit count on an even number of
 // unit columns leaves one slot out of the snake). It holds no tiles and runs nothing; init sets the routes the
-// host's rcfg names (geo.rs rcfg_relay: the vertical handoff passing through the slot), compute returns.
+// host's rcfg names, compute returns.
 param memcpy_params;
 const sys_mod = @import_module("<memcpy/memcpy>", memcpy_params);
 const tile_config = @import_module("<tile_config>");

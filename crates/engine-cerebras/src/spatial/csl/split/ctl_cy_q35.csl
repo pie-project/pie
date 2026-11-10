@@ -19,7 +19,7 @@
 // Interface. Exports cw (conv weights [layer][CONV][channel]), gpar ([A, dt] a GDN layer), gnw
 // (the gated norm's weights), qkw (q / k norm weights), rot (RoPE tables [RLV levels][2^RBITS][cos | sin]
 // [NROT]: positions < 2^(RBITS RLV)), tab (host: [position, ...]), rcfg, tdbg, init, compute(steps, start_pos).
-// rcfg (geo.rs rcfg_cy): [0] routes n, [1..1+2n) (colour, low route byte); from RQ: [0..4) iq2..iq5,
+// rcfg: [0] routes n, [1..1+2n) (colour, low route byte); from RQ: [0..4) iq2..iq5,
 // [4..7) oq2..oq4, [7] the segment role, [8] iq6, [9] iq7, [10] the spare colour.
 // Queues: iq2 / iq3 the column reduction's two halves, oq2 their merge on the loop-back colour,
 // iq4 its return; oq3 the column multicast; iq5 / oq4 the control row's segment all-reduce (the

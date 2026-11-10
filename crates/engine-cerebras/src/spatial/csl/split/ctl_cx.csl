@@ -12,7 +12,7 @@
 // Interface. Exports x (f32 [Hc]), gam (f16 [layer][g1 | g2][Hc], the host's 1 + w), xdbg / xred
 // (XKEEP 1: x after each layer, each reduction's sum), rcfg, tdbg (always on: the pass start, each
 // layer's end, after x out), init, compute(steps, start_pos).
-// rcfg (geo.rs rcfg_cx): [0] routes n, [1..1+2n); from RQ: [0..4) iq2..iq5, [4..7) oq2..oq4,
+// rcfg: [0] routes n, [1..1+2n); from RQ: [0..4) iq2..iq5, [4..7) oq2..oq4,
 // [7] flags (bit 0 the first unit: x from the host; bit 1 no handoff out; bit 2 the embedding
 // return of the token loop), [8] the spare colour, [9] iq6.
 // Queues: iq2 / iq3 the west / east halves' level-2 streams, oq2 their merge on the loop-back

@@ -21,7 +21,7 @@
 //
 // Interface. Exports hw (u16 lm_head tile), hg (f32 1 + w), hemb (u16 embedding tile), rcfg, tdbg
 // (always on: start, x in, matvec done, partial sent, loop phase done), init, compute.
-// rcfg (geo.rs rcfg_head): from RQ: [0..5) iq2..iq6, [5] oq2, [6] oq3, [7] the row role, [8] the x
+// rcfg: from RQ: [0..5) iq2..iq6, [5] oq2, [6] oq3, [7] the row role, [8] the x
 // role, [9] the spare colour, [10] iq7, [11] loop flags (bit 0 on, 1 the VA sink, 2 te, 3 to),
 // [12] the head row, [13..17) oq4..oq7.
 // Queues: iq2 / iq3 the row reduction's inputs (level 1 / FIFO end), iq4 HX, iq5 HN, iq6 HM, iq7 the

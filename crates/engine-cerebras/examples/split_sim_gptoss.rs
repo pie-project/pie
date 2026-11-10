@@ -2,6 +2,7 @@
 //! prep's golden: greedy sequences through the wafer token loop (two from position 0 on one load), a
 //! rollback (replayed from 0) and a logits row (`lgt`: its argmax is the first token).
 //!
+//!
 //! `split_sim_gptoss <program out dir> <prep dir> <prefix> <overrides> <steps a launch> [cmaddr]`
 //! (no cmaddr: the simulator; SPLIT_NTOK caps the tokens).
 

@@ -14,7 +14,7 @@
 //
 // Interface. Exports x (f32 [Hc]), gam (f32 [layer][g1 | g2][Hc]), bo (f32 [layer][Hc]), bd (f32 [layer]
 // [expert][Hc]), xdbg / xred (XKEEP 1), rcfg, tdbg, init, compute(steps, start_pos).
-// rcfg (split_geo_gptoss.py rcfg_cx): [0] routes n, [1..1+2n); from RQ: [0..4) iq2..iq5 (iq2 the west half's
+// rcfg: [0] routes n, [1..1+2n); from RQ: [0..4) iq2..iq5 (iq2 the west half's
 // stream, iq3 the east half's, iq4 unused, iq5 the handoff in), [4..7) oq2..oq4 (oq3 the multicast, oq4 the
 // handoff out), [7] flags (bit 0 the first unit, bit 1 no handoff out, bit 2 the embedding return), [8]
 // the spare colour, [9] iq6.

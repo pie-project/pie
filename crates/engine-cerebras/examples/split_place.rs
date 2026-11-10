@@ -8,8 +8,9 @@ use std::io::Write;
 
 use engine_cerebras::sdk::{self, DataType, Order, Rect};
 use engine_cerebras::spatial::device::Device;
-use engine_cerebras::spatial::split::geo::gemma::GemmaGeo;
-use engine_cerebras::spatial::split::{SplitSpec, place, place_gemma};
+use engine_cerebras::spatial::split::emit::meta::Meta;
+use engine_cerebras::spatial::split::program::Program;
+use engine_cerebras::spatial::split::{SplitSpec, weights};
 use sha2::{Digest, Sha256};
 
 struct Log(std::io::BufWriter<std::fs::File>);
@@ -95,28 +96,19 @@ fn main() {
     let a: Vec<String> = std::env::args().collect();
     let spec = SplitSpec::parse(&format!("{}:{}:{}", a[1], a[2], a[3])).unwrap();
     let t0 = std::time::Instant::now();
-    if let Some(name) = spec.meta.get("geo").and_then(|v| v.as_str()) {
-        // Gemma 4 (geo/gemma.rs, place_gemma.rs)
-        let (g2, g2w) = if name == "tiny" { (2, 2) } else { (16, 24) };
-        let mut gg = GemmaGeo::new(name, g2, g2w).unwrap();
-        gg.build().unwrap();
-        let mut log = Log(std::io::BufWriter::new(
-            std::fs::File::create(&a[4]).unwrap(),
-        ));
-        place_gemma::place(&mut log, &gg, &spec).unwrap();
-        eprintln!("placed {:.1} s", t0.elapsed().as_secs_f64());
-        return;
-    }
-    let g = spec.geo().unwrap();
+    let meta = Meta {
+        map: spec.meta.clone().into_iter().collect(),
+    };
+    let prog = Program::from_meta(&meta).unwrap();
     eprintln!(
-        "geometry {:.1} s ({} x {})",
+        "program {:.1} s ({} x {})",
         t0.elapsed().as_secs_f64(),
-        g.w,
-        g.h
+        prog.floor.w,
+        prog.floor.h
     );
     let mut log = Log(std::io::BufWriter::new(
         std::fs::File::create(&a[4]).unwrap(),
     ));
-    place::place(&mut log, &g, &spec).unwrap();
+    weights::place(&mut log, &prog, &spec.prep, &spec.prefix).unwrap();
     eprintln!("placed {:.1} s", t0.elapsed().as_secs_f64());
 }

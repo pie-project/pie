@@ -16,7 +16,7 @@
 // tdbg (always on: [0] pass start, [1] after the argmax, [2 + s] the root's winner of step s < 64
 // (consecutive differences = the token loop's cycles), [66..70) the last step's reduction in,
 // argmax, max-reduce done, row word out), rcfg, init, compute(steps, start_pos).
-// rcfg (geo.rs rcfg_hctl): from RQ: [0..3) iq2..iq4, [3] oq2, [4] this row's first vocabulary id,
+// rcfg: from RQ: [0..3) iq2..iq4, [3] oq2, [4] this row's first vocabulary id,
 // [5] the spare colour, [6..9) iq5..iq7, [9] oq3, [10] oq4, [11] the max-reduce role, [12] WL.
 // Queues: iq2 / iq3 the row reduction's halves, oq2 / iq4 the loop-back merge; iq5 / iq6 the
 // max-reduce's level-1 / level-2 inputs (a root: its low / high half), iq7 the winner multicast,

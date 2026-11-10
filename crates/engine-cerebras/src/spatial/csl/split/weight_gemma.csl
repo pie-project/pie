@@ -147,7 +147,7 @@ fn fin(comptime q: input_queue, n: u16) fabin_dsd {
   return @set_dsd_length(@get_dsd(fabin_dsd, .{ .extent = 1, .input_queue = q }), n);
 }
 
-// rcfg (host, split_geo_gemma.rcfg_weight_g): weight_q35's words; [RQ+11] flags (bit 0 column 0, bit 1 KVS
+// rcfg: weight_q35's words; [RQ+11] flags (bit 0 column 0, bit 1 KVS
 // consumer, bit 2 the flush unit), [RQ+12] the KVS colour
 const NR: u16 = 18;
 const RQ: u16 = 1 + 2 * NR;

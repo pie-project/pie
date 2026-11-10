@@ -1,8 +1,8 @@
-//! The role-split wafer program (`csl/split`: Qwen3.5-9B bf16, one
-//! sequence) in process: its geometry ([`geo`]: routes and queue roles of
-//! every PE), its placement from the prepared tiles ([`place`]) and the
-//! model the engine drives ([`SplitModel`]): tokens at positions, a launch
-//! of S passes, the wafer token loop's out-token ring.
+//! The role-split wafer program (`csl/split`: Qwen3.5, Qwen3, Gemma 4, gpt-oss; one sequence) in
+//! process: the layered build of its geometry and placement (`ARCHITECTURE.md`: [`plan`] ->
+//! [`floor`] -> [`wiring`] -> [`fabric`] -> [`emit`], one [`family`] a model, [`weights`]) and
+//! the model the engine drives ([`SplitModel`]): tokens at positions, a launch of S passes, the
+//! wafer token loop's out-token ring.
 //!
 //! The program keeps one sequence's KV and GDN state on the wafer, by
 //! position; a pass at position 0 starts a new sequence (the kernels zero
@@ -14,13 +14,17 @@
 //! the prep step from the checkpoint) and the geometry's overrides (the
 //! build's `G2`, `WL`, `CAP`).
 
-pub mod geo;
+pub mod emit;
+pub mod fabric;
+pub mod family;
+pub mod floor;
 pub mod npy;
-pub mod place;
-pub mod place_g12;
-pub mod place_gemma;
-pub mod place_gptoss;
+pub mod plan;
 pub mod prep;
+pub mod program;
+pub mod role;
+pub mod weights;
+pub mod wiring;
 
 use std::path::{Path, PathBuf};
 
@@ -76,10 +80,6 @@ impl SplitSpec {
         }
     }
 
-    fn need(&self, k: &str) -> R<u32> {
-        self.int(k).ok_or_else(|| format!("split meta: no {k}"))
-    }
-
     pub fn file(&self, name: &str) -> PathBuf {
         self.prep.join(format!("{}{name}", self.prefix))
     }
@@ -90,37 +90,6 @@ impl SplitSpec {
 
     pub fn has(&self, name: &str) -> bool {
         self.file(&format!("{name}.npy")).exists()
-    }
-
-    /// The geometry the meta (and overrides) states, built.
-    pub fn geo(&self) -> R<geo::Geo> {
-        let g2 = self.int("G2").unwrap_or(0);
-        let p = geo::Params {
-            px: self.need("PX")?,
-            py: self.need("PY")?,
-            unx: self.need("UNX")?,
-            uny: self.need("UNY")?,
-            hc: self.need("HC")?,
-            hr: self.need("HR")?,
-            hcc: self.need("Hc")?,
-            swa: self.need("SWA")?,
-            swg: self.need("SWG")?,
-            swv: self.need("SWV")?,
-            dkg: self.need("DKG")?,
-            dkh: self.need("DKH")?,
-            g2x: self.int("G2X").unwrap_or(g2),
-            g2y: self.int("G2Y").unwrap_or(g2),
-            g2h: self.int("G2H").unwrap_or(g2),
-            wl: self.int("WL").unwrap_or(0) != 0,
-            g2w: self.int("G2W").unwrap_or(24),
-            gap: self.int("GAPX").zip(self.int("GAPY")),
-        };
-        let mut g = geo::Geo::new(p);
-        g.build(
-            self.int("has_att").unwrap_or(0) != 0,
-            self.int("has_gdn").unwrap_or(0) != 0,
-        )?;
-        Ok(g)
     }
 }
 
@@ -182,27 +151,25 @@ pub struct GemmaPle {
 }
 
 impl SplitModel {
-    /// Places the prep on `dev` (a loaded, running program) and runs init.
+    /// Places the prep on `dev` (a loaded, running program) and runs init: the meta's
+    /// [`program::Program`] (any family, `ARCHITECTURE.md`), placed by its bindings
+    /// ([`weights::place`]), the host's map of it ([`emit::host::HostLayout`]).
     pub fn open(mut dev: Box<dyn Device>, spec: &SplitSpec, vocab: usize) -> R<SplitModel> {
-        if spec.int("NEX").is_some() {
-            return SplitModel::open_gptoss(dev, spec, vocab);
-        }
-        if let Some(name) = spec.meta.get("geo").and_then(|v| v.as_str()) {
-            if spec.meta.contains_key("RA") {
-                return SplitModel::open_g12(dev, spec, vocab, name);
-            }
-            return SplitModel::open_gemma(dev, spec, vocab, name);
-        }
         let t0 = std::time::Instant::now();
-        let g = spec.geo()?;
+        let meta = emit::meta::Meta {
+            map: spec.meta.clone().into_iter().collect(),
+        };
+        let prog = program::Program::from_meta(&meta)?;
+        let hl = emit::host::HostLayout::of(&prog)?;
         tracing::info!(
             ms = t0.elapsed().as_millis() as u64,
-            w = g.w,
-            h = g.h,
-            "split: geometry built"
+            w = hl.w,
+            h = hl.h,
+            family = emit::meta::family_name(prog.plan.shape.family),
+            "split: program built"
         );
         let t1 = std::time::Instant::now();
-        place::place(dev.as_mut(), &g, spec)?;
+        weights::place(dev.as_mut(), &prog, &spec.prep, &spec.prefix)?;
         tracing::info!(s = t1.elapsed().as_secs_f64(), "split: placed");
         dev.call("init", &[]).map_err(|e| format!("init: {e}"))?;
         // A launch can return before every PE ran it: a read from every PE
@@ -212,315 +179,73 @@ impl SplitModel {
             Rect {
                 x: 0,
                 y: 0,
-                w: g.w as i32,
-                h: g.h as i32,
+                w: hl.w as i32,
+                h: hl.h as i32,
             },
             1,
         )?;
-        let wl = g.p.wl;
-        let hemb = spec.npy("hemb")?;
-        let u0 = g.unit_origin(0);
-        if u0 != (0, 0) {
-            return Err("split: unit 0 off the origin".into());
-        }
-        let vr = spec.need("VR")?;
-        Ok(SplitModel {
-            dev,
-            // (the prep's vocabulary, when it states one, bounds the caller's)
-            vocab: spec.int("V").map_or(vocab, |v| vocab.min(v as usize)),
-            hidden: spec.need("H")? as usize,
-            cap: spec.int("CAP").unwrap_or(256) as usize,
-            // (bounded by the CY's RoPE tables: RLV digits of RBITS bits, the prep's; 4 x 3 before them)
-            positions: (spec.need("NE")? * g.p.py)
-                .min(1 << (spec.int("RBITS").unwrap_or(3) * spec.int("RLV").unwrap_or(4)).min(31))
-                as usize,
-            fed: Vec::new(),
-            launches: 0,
-            steps: 0,
-            wl,
-            hr: g.p.hr,
-            hc: g.p.hc,
-            vr,
-            hdc: hemb.shape[2] as u32 / vr,
-            hcc: g.p.hcc,
-            py: g.p.py,
-            yc: g.yc,
-            x_cx: u0.0 + g.xc,
-            last_cx: {
-                let (x, y) = g.unit_origin(g.units() - 1);
-                (x + g.xc, y)
-            },
-            force: std::env::var("PIE_CEREBRAS_SPLIT_FORCE").is_ok_and(|v| v == "1"),
-            eps: spec
-                .meta
-                .get("EPS")
-                .and_then(|v| v.as_f64())
-                .unwrap_or(1e-6) as f32,
-            hctl: g.hx0 + g.hxc,
-            root: (g.hx0 + g.hxc, g.p.hr / 2),
-            x_y0: 0,
-            band: None,
-            hscale: 1.0,
-            hemb: Some(hemb),
-            gemma: None,
-            g12: None,
-        })
-    }
-
-    /// Gemma 4 (`split/README.md` 7): the geometry the meta names (geo/gemma.rs), placed.
-    fn open_gemma(
-        mut dev: Box<dyn Device>,
-        spec: &SplitSpec,
-        vocab: usize,
-        name: &str,
-    ) -> R<SplitModel> {
-        let t0 = std::time::Instant::now();
-        let dflt = if name == "tiny" { 2 } else { 16 };
-        let mut gg = geo::gemma::GemmaGeo::new(
-            name,
-            spec.int("G2").unwrap_or(dflt),
-            spec.int("G2W")
-                .unwrap_or(if name == "tiny" { 2 } else { 24 }),
-        )?;
-        gg.build()?;
-        tracing::info!(
-            ms = t0.elapsed().as_millis() as u64,
-            w = gg.g.w,
-            h = gg.g.h,
-            "split gemma: geometry built"
-        );
-        let t1 = std::time::Instant::now();
-        place_gemma::place(dev.as_mut(), &gg, spec)?;
-        tracing::info!(s = t1.elapsed().as_secs_f64(), "split gemma: placed");
-        dev.call("init", &[]).map_err(|e| format!("init: {e}"))?;
-        let g = &gg.g;
-        dev.get(
-            "rcfg",
-            Rect {
-                x: 0,
-                y: 0,
-                w: g.w as i32,
-                h: g.h as i32,
-            },
-            1,
-        )?;
-        let hemb = spec.npy("hemb")?;
-        let u0 = g.unit_origin(0);
-        let vr = spec.need("VR")?;
-        let gemma = GemmaPle {
-            softcap: spec
-                .meta
-                .get("SOFTCAP")
-                .and_then(|v| v.as_f64())
-                .unwrap_or(30.0) as f32,
+        let shape = &prog.plan.shape;
+        let family = prog.plan.shape.family;
+        let softcap = shape.head.final_softcap;
+        // the head's embedding tiles, else (Gemma 12B's tied head) the embedding table read by
+        // CX row runs
+        let hemb = if spec.has("hemb") {
+            Some(spec.npy("hemb")?)
+        } else {
+            None
+        };
+        let g12 = if hemb.is_none() {
+            Some(G12Rows {
+                runs: hl.x_runs.clone(),
+                off: hl.x_offsets(),
+                embed: spec.npy("embed")?,
+                softcap: softcap.unwrap_or(30.0),
+            })
+        } else {
+            None
+        };
+        let gemma = (family == plan::FamilyId::Gemma).then(|| GemmaPle {
+            softcap: softcap.unwrap_or(30.0),
+        });
+        let hdc = match &hemb {
+            Some(h) if hl.band.is_none() && hl.vocab_rows > 0 => h.shape[2] as u32 / hl.vocab_rows,
+            _ => hl.hemb_words,
         };
         Ok(SplitModel {
-            vocab,
-            hidden: spec.need("H")? as usize,
-            cap: spec.int("CAP").unwrap_or(256) as usize,
-            positions: (spec.need("NEG")? * spec.int("PYW").unwrap_or(g.p.py)) as usize,
+            vocab: vocab.min(shape.vocab as usize),
+            hidden: shape.hidden as usize,
+            cap: hl.cap as usize,
+            positions: hl.positions as usize,
             fed: Vec::new(),
             launches: 0,
             steps: 0,
-            wl: true,
-            hr: g.p.hr,
-            hc: g.p.hc,
-            vr,
-            hdc: hemb.shape[2] as u32 / vr,
-            hcc: g.p.hcc,
-            py: g.p.py,
-            yc: g.yc,
-            x_cx: u0.0 + g.xc,
-            last_cx: {
-                let (x, y) = g.unit_origin(g.units() - 1);
-                (x + g.xc, y)
-            },
+            wl: hl.token_loop,
+            hr: hl.head_rows,
+            hc: hl.head_cols,
+            vr: hl.vocab_rows,
+            hdc,
+            hcc: hl.row_dims,
+            py: hl.rows,
+            yc: hl.cy_row,
+            x_cx: hl.first_cx.x,
+            last_cx: (hl.last_cx.x, hl.last_cx.y),
             force: std::env::var("PIE_CEREBRAS_SPLIT_FORCE").is_ok_and(|v| v == "1"),
-            eps: spec
-                .meta
-                .get("EPS")
-                .and_then(|v| v.as_f64())
-                .unwrap_or(1e-6) as f32,
-            hctl: g.hx0 + g.hxc,
-            root: (g.hx0 + g.hxc, g.p.hr / 2),
-            band: None,
-            hscale: 1.0,
-            hemb: Some(hemb),
-            x_y0: u0.1,
-            gemma: Some(gemma),
-            g12: None,
-            dev,
-        })
-    }
-
-    /// Gemma 4 12B (`spatial/split/README.md, Gemma 4 12B`): the geometry the meta names (geo/g12.rs), placed.
-    fn open_g12(
-        mut dev: Box<dyn Device>,
-        spec: &SplitSpec,
-        vocab: usize,
-        name: &str,
-    ) -> R<SplitModel> {
-        let t0 = std::time::Instant::now();
-        let tiny = name == "tiny";
-        let mut gg = geo::g12::G12Geo::new(
-            name,
-            spec.int("G2").unwrap_or(if tiny { 2 } else { 16 }),
-            spec.int("G2W").unwrap_or(if tiny { 2 } else { 24 }),
-        )?;
-        gg.build()?;
-        tracing::info!(
-            ms = t0.elapsed().as_millis() as u64,
-            w = gg.g.w,
-            h = gg.g.h,
-            "split g12: geometry built"
-        );
-        let t1 = std::time::Instant::now();
-        place_g12::place(dev.as_mut(), &gg, spec)?;
-        tracing::info!(s = t1.elapsed().as_secs_f64(), "split g12: placed");
-        dev.call("init", &[]).map_err(|e| format!("init: {e}"))?;
-        let g = &gg.g;
-        dev.get(
-            "rcfg",
-            Rect {
-                x: 0,
-                y: 0,
-                w: g.w as i32,
-                h: g.h as i32,
+            eps: shape.norm.eps,
+            hctl: hl.head_ctl.x,
+            root: (hl.root.x, hl.root.y),
+            x_y0: hl.first_cx.y,
+            band: hl.band,
+            hscale: if family == plan::FamilyId::GptOss {
+                spec.meta
+                    .get("HSCALE")
+                    .and_then(|v| v.as_f64())
+                    .unwrap_or(32768.0) as f32
+            } else {
+                1.0
             },
-            1,
-        )?;
-        let u0 = g.unit_origin(0);
-        let mut off = vec![0usize];
-        for r in 0..g.p.py {
-            off.push(off[r as usize] + gg.hc(r) as usize);
-        }
-        let runs = place_g12::rowblocks(g.p.py, g.yc, gg.ra)
-            .into_iter()
-            .map(|(r0, r1, _)| (r0, r1, gg.hc(r0), g.wl(r0, g.yc)))
-            .collect();
-        let g12 = G12Rows {
-            runs,
-            off,
-            embed: spec.npy("embed")?,
-            softcap: spec
-                .meta
-                .get("SOFTCAP")
-                .and_then(|v| v.as_f64())
-                .unwrap_or(30.0) as f32,
-        };
-        Ok(SplitModel {
-            vocab: spec.int("V").map_or(vocab, |v| vocab.min(v as usize)),
-            hidden: spec.need("H")? as usize,
-            cap: spec.int("CAP").unwrap_or(256) as usize,
-            positions: (spec.need("NEG")? * gg.ra) as usize,
-            fed: Vec::new(),
-            launches: 0,
-            steps: 0,
-            wl: true,
-            hr: g.p.hr,
-            hc: g.p.hc,
-            vr: spec.need("VR")?,
-            hdc: spec.need("HDc")?,
-            hcc: gg.hcw,
-            py: g.p.py,
-            yc: g.yc,
-            x_cx: u0.0 + g.xc,
-            last_cx: {
-                let (x, y) = g.unit_origin(g.units() - 1);
-                (x + g.xc, y)
-            },
-            force: std::env::var("PIE_CEREBRAS_SPLIT_FORCE").is_ok_and(|v| v == "1"),
-            eps: spec
-                .meta
-                .get("EPS")
-                .and_then(|v| v.as_f64())
-                .unwrap_or(1e-6) as f32,
-            hctl: g.hx0 + g.hxc,
-            root: (g.hx0 + g.hxc, g.p.hr / 2),
-            band: None,
-            hscale: 1.0,
-            hemb: None,
-            x_y0: u0.1,
-            gemma: None,
-            g12: Some(g12),
-            dev,
-        })
-    }
-
-    /// gpt-oss (`tools/split/gptoss`, the README's gpt-oss section): the geometry the meta names
-    /// (geo/gptoss.rs), placed (place_gptoss.rs).
-    fn open_gptoss(mut dev: Box<dyn Device>, spec: &SplitSpec, vocab: usize) -> R<SplitModel> {
-        let name = spec
-            .meta
-            .get("geo")
-            .and_then(|v| v.as_str())
-            .ok_or("split gpt-oss meta: no geo")?
-            .to_string();
-        let tiny = name == "tiny";
-        let t0 = std::time::Instant::now();
-        let mut gg = geo::gptoss::GptossGeo::new(
-            &name,
-            spec.int("G2").unwrap_or(if tiny { 2 } else { 16 }),
-            spec.int("G2W").unwrap_or(if tiny { 2 } else { 24 }),
-            true,
-        )?;
-        gg.build()?;
-        tracing::info!(
-            ms = t0.elapsed().as_millis() as u64,
-            w = gg.w,
-            h = gg.h,
-            "split gpt-oss: geometry built"
-        );
-        let t1 = std::time::Instant::now();
-        place_gptoss::place(dev.as_mut(), &gg, spec)?;
-        tracing::info!(s = t1.elapsed().as_secs_f64(), "split gpt-oss: placed");
-        dev.call("init", &[]).map_err(|e| format!("init: {e}"))?;
-        dev.get(
-            "rcfg",
-            Rect {
-                x: 0,
-                y: 0,
-                w: gg.w as i32,
-                h: gg.h as i32,
-            },
-            1,
-        )?;
-        let g = &gg.g;
-        let u0 = g.unit_origin(0);
-        let ul = g.unit_origin(g.units() - 1);
-        let yc = gg.hb0 + gg.hxc;
-        Ok(SplitModel {
-            vocab: spec.int("V").map_or(vocab, |v| vocab.min(v as usize)),
-            hidden: spec.need("HR")? as usize,
-            cap: spec.int("CAP").unwrap_or(256) as usize,
-            positions: (spec.int("NE").unwrap_or(128) * g.p.py) as usize,
-            fed: Vec::new(),
-            launches: 0,
-            steps: 0,
-            wl: true,
-            hr: g.p.py,
-            hc: gg.hvc,
-            vr: spec.need("VR")?,
-            hdc: g.p.hcc,
-            hcc: g.p.hcc,
-            py: g.p.py,
-            yc: g.yc,
-            x_cx: u0.0 + g.xc,
-            last_cx: (ul.0 + g.xc, ul.1),
-            force: std::env::var("PIE_CEREBRAS_SPLIT_FORCE").is_ok_and(|v| v == "1"),
-            eps: 1e-5,
-            hctl: gg.hvc / 2,
-            root: (gg.hvc / 2, yc),
-            x_y0: u0.1,
-            band: Some((0, yc, gg.hvc)),
-            hscale: spec
-                .meta
-                .get("HSCALE")
-                .and_then(|v| v.as_f64())
-                .unwrap_or(32768.0) as f32,
-            hemb: Some(spec.npy("hemb")?),
-            gemma: None,
-            g12: None,
+            hemb,
+            gemma,
+            g12,
             dev,
         })
     }
@@ -882,5 +607,6 @@ pub fn is_split(program: &Path) -> bool {
                 || (s.contains("\"NTW\"") && s.contains("\"Ic1\"")) // Gemma's layout (mkfull_gemma.py)
                 || (s.contains("\"NEX\"") && s.contains("\"QO\"")) // gpt-oss's (mkfull_gptoss.py)
                 || (s.contains("\"HcA\"") && s.contains("\"HcW\"")) // Gemma 12B's (mkfull_g12.py)
+                || s.contains("\"SPLIT_GEO\"") // the layered build's (emit::layout)
         })
 }

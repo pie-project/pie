@@ -10,7 +10,7 @@ import argparse, json, os, sys, time
 import numpy as np
 from cerebras.sdk.runtime.sdkruntimepybind import MemcpyDataType, MemcpyOrder, SdkRuntime  # pylint: disable=no-name-in-module
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-import split_geo_gemma as S
+import splitgeo
 
 ap = argparse.ArgumentParser()
 ap.add_argument("--name"); ap.add_argument("--cmaddr"); ap.add_argument("--report", default="g.json")
@@ -23,6 +23,7 @@ ap.add_argument("--tdbg", type=int, default=0)
 ap.add_argument("--fine", type=int, default=0)
 ap.add_argument("--notb", type=int, default=0, help="(bisect) the head control rows send no TB, the storage PEs read none")
 ap.add_argument("--golden", default="golden.json", help="the golden in the prep dir (after the prefix)")
+ap.add_argument("--geo", default=os.path.join(os.path.dirname(os.path.abspath(__file__)), "geo"), help="split-geo's output for this prep (mkfull_gemma.py writes it)")
 ap.add_argument("--placeonly", type=int, default=0, help="(checks) stop after the placement (the mock runtime's copy log)")
 a = ap.parse_args()
 t00 = time.time()
@@ -31,15 +32,10 @@ for kv in filter(None, a.override.split(",")):
     k, v = kv.split("="); M[k] = int(v)
 def npy(n):
     return np.load(os.path.join(a.prep, a.prefix + n + ".npy"), mmap_mode="r")
-g = S.GEOS[M["geo"]](G2=M.get("G2", 16 if M["geo"] != "tiny" else 2), WL=1, G2W=M.get("G2W", 24 if M["geo"] != "tiny" else 2))
-g.build_gemma()
+g = splitgeo.load(a.geo)
 if a.notb:
-    g.tbsend = set()
-    _rp = g.rcfg_ple
-    def _rp2(x, y):
-        w = _rp(x, y); w[1 + 2 * 8] &= ~2; return w
-    g.rcfg_ple = _rp2
-PX, PY, XC, YC, NU, Hc, K = g.PX, g.PY, g.XC, g.YC, len(g.origins), M["Hc"], M["K"]
+    sys.exit("--notb: rebuild the geometry with the head control rows' TB off (split-geo) instead")
+PX, PY, XC, YC, NU, Hc, K = g.PX, g.PY, g.XC, g.YC, g.units(), M["Hc"], M["K"]
 LAST = NU - 1
 runner = SdkRuntime(a.name, cmaddr=a.cmaddr)
 runner.load(); runner.run()
@@ -60,76 +56,9 @@ def get(s, x0, y0, w, h, n, dt=np.float32):
     b = np.zeros(w * h * n, dt)
     runner.memcpy_d2h(b, sym(s), x0, y0, w, h, n, **k32)
     return b.reshape(h, w, n)
-def quads():
-    for rs in ((0, YC), (YC, PY)):
-        for cs in ((0, XC), (XC, PX)):
-            yield rs, cs
 t0 = time.time()
-gam, qkw, rot = npy("gam"), npy("qkw"), npy("rot")
-for u in range(NU):
-    X0, Y0 = g.unit_origin(u)
-    wu = npy(f"w{u}")
-    for (r0, r1), (c0, c1) in quads():
-        x0, y0 = X0 + g.wl(c0, XC), Y0 + g.wl(r0, YC)
-        rc = np.array([[g.rcfg_weight_g(X0 + g.wl(c, XC), Y0 + g.wl(r, YC), r, c, u == LAST) for c in range(c0, c1)] for r in range(r0, r1)], np.uint32)
-        put("rcfg", x0, y0, c1 - c0, r1 - r0, rc)
-        for rb in range(r0, r1, 16):
-            re = min(rb + 16, r1)
-            put("w", x0, Y0 + g.wl(rb, YC), c1 - c0, re - rb, np.asarray(wu[rb:re, c0:c1]), b16=True)
-    for (r0, r1) in ((0, YC), (YC, PY)):
-        y0 = Y0 + g.wl(r0, YC)
-        rc = np.array([[g.rcfg_cx_g(X0 + XC, Y0 + g.wl(r, YC), u == 0, u == LAST)] for r in range(r0, r1)], np.uint32)
-        put("rcfg", X0 + XC, y0, 1, r1 - r0, rc)
-        put("gam", X0 + XC, y0, 1, r1 - r0, np.asarray(gam[u, r0:r1])[:, None, :])
-    for (c0, c1) in ((0, XC), (XC, PX)):
-        x0 = X0 + g.wl(c0, XC)
-        rc = np.array([[g.rcfg_cy_g(X0 + g.wl(c, XC), Y0 + YC, u == LAST) for c in range(c0, c1)]], np.uint32)
-        put("rcfg", x0, Y0 + YC, c1 - c0, 1, rc)
-        put("qkw", x0, Y0 + YC, c1 - c0, 1, np.asarray(qkw[u, c0:c1])[None])
-        put("rot", x0, Y0 + YC, c1 - c0, 1, np.asarray(rot[c0:c1])[None])
-# PLE storage and the route-only PEs
-PT = {}
-for ci, col in enumerate(M["cols"]):
-    for f in col["files"]:
-        PT[f["name"]] = npy(f["name"])
-NTW = max(c["nt"] * c["lv"] for c in M["cols"])
-for ci, col in enumerate(M["cols"]):
-    X0 = col["x"]
-    y0, y1 = col["srows"]
-    for f in col["files"]:
-        arr = PT[f["name"]]
-        for (c0, c1) in ((0, XC), (XC, PX)):
-            xs = X0 + g.wl(c0, XC)
-            for rb in range(f["r0"], f["r1"], 16):
-                re = min(rb + 16, f["r1"])
-                rc = np.array([[g.rcfg_ple(X0 + g.wl(c, XC), y0 + r) for c in range(c0, c1)] for r in range(rb, re)], np.uint32)
-                put("rcfg", xs, y0 + rb, c1 - c0, re - rb, rc)
-                blk = np.zeros((re - rb, c1 - c0, NTW), np.uint16)
-                blk[:, :, :arr.shape[2]] = arr[rb - f["r0"]:re - f["r0"], c0:c1]
-                put("ptab", xs, y0 + rb, c1 - c0, re - rb, blk, b16=True)
-passp = S.pass_pes(g) + [(col["x"] + XC, y) for col in g.cols for y in range(*col["srows"])]
-rows = {}
-for (x, y) in passp:
-    rows.setdefault(y, []).append(x)
-for y, xs in rows.items():
-    xs = sorted(xs); a0 = xs[0]
-    for i in range(1, len(xs) + 1):
-        if i == len(xs) or xs[i] != xs[i - 1] + 1:
-            put("rcfg", a0, y, xs[i - 1] + 1 - a0, 1, np.array([[g.rcfg_ple(x, y) for x in range(a0, xs[i - 1] + 1)]], np.uint32))
-            a0 = xs[i] if i < len(xs) else None
-# head
-HX0, HXC, HC, HR = g.HX0, g.HXC, g.HC, g.HR
-hw, hg, he = npy("hw"), npy("hg"), npy("hemb")
-for (c0, c1) in ((0, HXC), (HXC, HC)):
-    x0 = g.hx(c0)
-    for rb in range(0, HR, 64):
-        re = min(rb + 64, HR)
-        rc = np.array([[g.rcfg_head(g.hx(c), y) for c in range(c0, c1)] for y in range(rb, re)], np.uint32)
-        put("rcfg", x0, rb, c1 - c0, re - rb, rc)
-        put("hw", x0, rb, c1 - c0, re - rb, np.asarray(hw[rb:re, c0:c1]), b16=True)
-        put("hg", x0, rb, c1 - c0, re - rb, np.broadcast_to(np.asarray(hg[c0:c1])[None], (re - rb, c1 - c0, hg.shape[1])).copy())
-        put("hemb", x0, rb, c1 - c0, re - rb, np.asarray(he[rb:re, c0:c1]), b16=True)
-put("rcfg", HX0 + HXC, 0, 1, HR, np.array([[g.rcfg_hctl_g(HX0 + HXC, y, M["VR"])] for y in range(HR)], np.uint32))
+# every copy as split-geo's bindings state them (the Rust family's placement, in its order)
+splitgeo.place(put, npy, g, lambda n: os.path.exists(os.path.join(a.prep, a.prefix + n + ".npy")))
 t_place = time.time() - t0
 if a.placeonly:
     print(json.dumps({"placed_s": round(t_place, 1)}), flush=True)
@@ -187,7 +116,7 @@ if a.probe:
                         nchk += 1
                         if got != want[c] or seq != pos + s + 1:
                             if len(bad_p) < 20: bad_p.append(dict(L=L, s=s, u=u, c=c, got=float(got), want=float(want[c]), seq=float(seq), pos=pos + s))
-        for u in (g.kvdst or []):
+        for u in (getattr(g, "kvdst", None) or []):
             X0, Y0 = g.unit_origin(u)
             lg = get("kvlog", X0, Y0, g.UW, g.UH, 128)
             for s in range(ns):

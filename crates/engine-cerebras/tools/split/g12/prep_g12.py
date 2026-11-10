@@ -13,8 +13,8 @@ Writes w<u>a / w<u>w (f16 bits, A / W rows), gama / gamw (f32: a layer's input /
 gammas, the layer scalar; + the embedding scale), qkw, rot, hw0 / hw1 (the head's halves), hg, embed, embrows, golden.json, meta.json, params.txt."""
 import glob, json, os, shutil, struct, sys
 import numpy as np
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-import split_geo_g12 as S
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."))
+import splitgeo
 
 MD, out, GOLD, GEO = sys.argv[1:5]
 NEG = int(sys.argv[5])
@@ -40,7 +40,7 @@ def bits(name):
 def f16(a):
     return np.asarray(a, np.float32).astype(np.float16).view(np.uint16)
 
-g = S.GEOS[GEO](G2=2, WL=1, G2W=2)
+g = splitgeo.geometry("gemma12:" + GEO)
 PX, PY, RA, SWA = g.PX, g.PY, g.RA, g.SWA
 HcA, HcW = g.HcA, g.HcW
 H, NL, I = tc["hidden_size"], tc["num_hidden_layers"], tc["intermediate_size"]
@@ -49,7 +49,7 @@ hdS = tc["head_dim"]
 hdG = tc.get("global_head_dim") or next(v["head_dim"] for k, v in (tc.get("per_layer_config") or {}).items() if "head_dim" in v)
 assert tc.get("hidden_size_per_layer_input", 0) == 0 and tc.get("num_kv_shared_layers", 0) == 0 and tc["attention_k_eq_v"]
 V = tc["vocab_size"]
-NU = len(g.origins)
+NU = g.NU
 K = NL // NU
 assert NL == K * NU and K == g.K
 kinds = ["G" if t == "full_attention" else "S" for t in tc["layer_types"]]
@@ -63,7 +63,7 @@ def dcf(hd):
     return 2 * nr
 DcS, DcG = dcf(hdS), dcf(hdG)
 Ic = -(-I // PX)
-off = np.concatenate([[0], np.cumsum([g.hc(r) for r in range(PY)])])
+off = np.concatenate([[0], np.cumsum(g.hc)])
 HP = int(off[-1])
 assert HP >= H, (HP, H)
 print("Qh", Qh, "DcS", DcS, "DcG", DcG, "Ic", Ic, "hidden slots", HP, "of", H, flush=True)
@@ -183,7 +183,7 @@ for kd, (hd, Dc, key) in enumerate(((hdS, DcS, "sliding_attention"), (hdG, DcG, 
 np.save(os.path.join(out, PRE + "rot.npy"), rot.astype(np.float32).reshape(PX, -1))
 # head (tied): column c = its group's dims
 HC, HR = g.HC, g.HR
-HDc = max(g.nx(cc) for cc in range(HC))
+HDc = max(sum(g.hc[r] for r in grp) for grp in g.groups)
 VR = -(-V // HR)
 VR = -(-VR // 8) * 8
 assert HR * VR >= V

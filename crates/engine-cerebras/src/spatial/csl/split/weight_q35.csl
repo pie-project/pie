@@ -29,7 +29,7 @@
 // Interface. Exports w (u16: per layer [qkv Hc x NQ][o QO x Hc][gate|up Hc x 2Ic][down Ic x Hc],
 // row-major, f16 bits at MV 1), rcfg (u32, the host's routes and roles: below), tdbg (u32, phase
 // stamps), init, compute(steps, start_pos). One image serves every weight PE of every unit: roles
-// and colours are runtime words from the host (spatial/split/geo.rs `rcfg_weight`).
+// and colours are runtime words from the host.
 // Queues (each flow its own queue; an async op runs on its queue id's microthread, shared by
 // iq N and oq N): iq2 / iq3 the row reduction's level-1 / level-2 inputs, iq4 / iq5 the column's,
 // iq6 the row multicast (x; segment and relay inputs), iq7 the column multicast (o, act; the
@@ -145,7 +145,7 @@ fn fin(comptime q: input_queue, n: u16) fabin_dsd {
   return @set_dsd_length(@get_dsd(fabin_dsd, .{ .extent = 1, .input_queue = q }), n);
 }
 
-// rcfg (host, geo.rs rcfg_weight): [0] routes n, [1..1+2n) (colour, low route byte); then from RQ:
+// rcfg: [0] routes n, [1..1+2n) (colour, low route byte); then from RQ:
 // [0..6) the colours of iq2..iq7, [6] oq5's, [7] oq3's, [8] the row role, [9] the column role,
 // [10] the scores segment role, [11] gsrc (GDN's (k, q) source bits), [12..17) the segments'
 // colours ((k, q) multicast, scores level 1, level 2, output, multicast), [17] the PE's weight

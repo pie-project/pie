@@ -8,6 +8,9 @@
 //! (no cmaddr: the simulator).
 
 use engine_cerebras::sdk::{Platform, Runtime, Sdk, Simulator, Target};
+use engine_cerebras::spatial::split::emit::host::HostLayout;
+use engine_cerebras::spatial::split::emit::meta::Meta;
+use engine_cerebras::spatial::split::program::Program;
 use engine_cerebras::spatial::split::{SplitModel, SplitSpec, argmax};
 
 fn f16(h: u16) -> f32 {
@@ -108,15 +111,18 @@ fn main() {
         // Gemma's tied head has its own tile layout: the argmax check above is the test
         println!("LOGITS host reference: Qwen3.5 preps only");
     } else {
-        let g = spec.geo().unwrap();
-        let (lx, ly) = g.unit_origin(g.units() - 1);
+        let meta = Meta {
+            map: spec.meta.clone().into_iter().collect(),
+        };
+        let hl = HostLayout::of(&Program::from_meta(&meta).unwrap()).unwrap();
+        let (cx, ly) = (hl.last_cx.x, hl.last_cx.y);
         let hc = spec.int("Hc").unwrap() as usize;
-        let py = spec.int("PY").unwrap();
+        let (py, yc) = (hl.rows, hl.cy_row);
         let mut x = Vec::new();
-        for (r0, r1) in [(0, g.yc), (g.yc, py)] {
-            let y0 = ly + r0 + u32::from(r0 >= g.yc);
+        for (r0, r1) in [(0, yc), (yc, py)] {
+            let y0 = ly + r0 + u32::from(r0 >= yc);
             let r = engine_cerebras::sdk::Rect {
-                x: (lx + g.xc) as i32,
+                x: cx as i32,
                 y: y0 as i32,
                 w: 1,
                 h: (r1 - r0) as i32,

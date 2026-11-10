@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """prep_gptoss.py <model dir> <out dir> <geo: tiny | full> <golden.json> [prefix] [--units a,b] [--nohead]
 
-gpt-oss checkpoint (as released: MXFP4 experts, bf16 elsewhere) -> the role-split tiles (split_geo_gptoss.py's
+gpt-oss checkpoint (as released: MXFP4 experts, bf16 elsewhere) -> the role-split tiles (split-geo's
 geometry; unit u holds layers K u .. K u + K - 1, K = layers / units):
   wa{u}  u16 [PY][AX][K (Hc NQA + QO Hc)]   attention: per layer [qkv Hc x NQA][o QO x Hc], f16 bits (= bf16 exactly)
   wx{u}  u16 [PY][MX][K NEX XE]              experts, E5M2 pairs (gate|up rows i < Hc/2 high byte; down i < Ic/2)
@@ -18,8 +18,8 @@ dims (i, i + 32) side by side (q: per head h of the kv group, [pairs]; k; v the 
 intermediate dims c Ic .. c Ic + Ic; weight row r: hidden dims r Hc .. r Hc + Hc."""
 import json, math, os, struct, sys
 import numpy as np
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-import split_geo_gptoss as S
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."))
+import splitgeo
 
 FP4 = np.array([0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0, -0.0, -0.5, -1.0, -1.5, -2.0, -3.0, -4.0, -6.0], np.float32)
 f16, f32 = np.float16, np.float32
@@ -114,11 +114,11 @@ def main():
     os.makedirs(out, exist_ok=True)
     cfg = json.load(open(f"{model}/config.json"))
     ck = Ckpt(model)
-    g = S.GEOS[geo]()
+    g = splitgeo.geometry("gptoss:" + geo)
     PY, AX, MXc, Hc = g.PY, g.AX, g.MXc, g.Hc
     H, L, NEX, TK = cfg["hidden_size"], cfg["num_hidden_layers"], cfg["num_local_experts"], cfg["num_experts_per_tok"]
     NH, NKV, HD, I = cfg["num_attention_heads"], cfg["num_key_value_heads"], cfg["head_dim"], cfg["intermediate_size"]
-    NU = len(g.order)
+    NU = g.NU
     K = L // NU
     Qh, SWA = NH // NKV, g.SWA
     Dc = HD // SWA
