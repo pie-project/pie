@@ -63,3 +63,11 @@ Proposed by the L40S session (branch `sc/l40s-bc`), accepted by New Pie. Runtime
     `pieces` when a record has more than one piece.
 17. **Epochs.** Draining an evacuated segment and recycling freed slots are fenced by a per-fire epoch that advances
     on every fire (not only on copy-on-write / explicit writes).
+18. **rs buffer is an rs-list shape (supersedes 8's "rs buffer inside the record" and 13 entirely; amends 11).**
+    Facts may state two list shapes: the kv list and the rs list (`SlotKind::List` with its own tokens per slot T_rs).
+    `RsVerb::Buffer { pages, base, folded, fold }`: `pages` are real rs-list slot refs (logical, through the
+    ChunkTable) in token order starting at `base` (`base` aligned to T_rs); buffered row s lives in
+    `pages[(s - base) / T_rs]` at row `(s - base) % T_rs`. No unfolded-row cap beyond what the runtime can allocate.
+    Fixed records hold state only. Forks share rs-list slots by refcount; a write into a shared, partially filled tail
+    slot is preceded by a slot copy (runtime asks via `copy_slots`, or the engine copies a `(src, dst)` pair stated in
+    the fire). Contract 15 (group CoW of the state record when a lane folds) still applies to the state record.

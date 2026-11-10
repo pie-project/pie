@@ -14,8 +14,7 @@ must need one poem line and no engine change.
    shared by many working sets; **segment** = the backend's grow/shrink unit; a chunk never straddles a segment.
 3. Chunk size C and slot sizes are chosen by the compiler as `f(model, DeviceProfile)`: large on server CUDA
    (~16MB), small on on-device Metal. C is a load-time constant for the engine.
-4. Slot shapes: **fixed** (GDN/mamba/conv state, rs buffer as `[P, width]` rows with P = max unfolded tokens (16),
-   VAE frame cache, engram/replay ids, snapshots), **list** (full-attention kv, compressed pools via `tokens // r`,
+4. Slot shapes: **fixed** (GDN/mamba/conv state, VAE frame cache, engram/replay ids, snapshots), **list** (full-attention kv, compressed pools via `tokens // r`,
    drafter kv: T tokens x all rows, layer-major inside the slot), **ring** (sliding-window kv only).
    A ring with a small static cap folds into fixed. Fixed records larger than C split into equal pieces that never
    cross an op's atom (GDN/KDA/mamba: head axis; conv: channel; conv3d frame cache: frame-position axis 0;
@@ -89,3 +88,13 @@ must need one poem line and no engine change.
 - Kernels: MoE kernels take an expert -> (chunk, offset) table (degenerate = today's contiguous expert bank);
   inside CUDA graphs, missing experts are filled into staging by a zero-copy gather kernel reading pinned host memory.
   PLE is first (rows are known before the fire).
+
+## rs buffer is a list (decided 2026-11-10, supersedes "rs buffer as fixed [P, width] rows")
+- The rs buffer (unfolded recurrent inputs) is its own LIST slot shape ("rs list"), separate from the kv list:
+  one slot = T_rs tokens x every recurrent layer's rs planes, T_rs chosen by the compiler small enough that a slot fits
+  a chunk (e.g. 1 token for kimik3-2.8t at 6.8 MB/token; 4-16 for small models). It grows with unfolded tokens and
+  holds nothing when everything is folded. No 16-row limit.
+- Slots are refcounted like kv pages: forks / beam branches share their common unfolded prefix rows; a lane writes
+  new rows into its own slots (copy-on-write only for a partially filled shared tail slot).
+- The fixed record holds only state (no rs rows). Engines address buffered rows through the rs-list page table
+  (`RsVerb::Buffer.pages` are real slot refs again), as degenerate mode did with buffer pages.
