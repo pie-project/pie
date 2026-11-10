@@ -4,7 +4,7 @@ pub mod kv;
 pub mod layout;
 pub mod pool;
 mod pools;
-pub mod rows;
+pub mod streamed;
 
 pub use pools::{Pools, Rows, RsRows, TablePaging};
 

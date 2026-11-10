@@ -527,7 +527,7 @@ pub struct Pools {
     /// The shared pool's host tier (CONTRACT-BC 22), where one is stated.
     tier: Option<HostTier>,
     /// The weight cache's row-streamed tables, a shape each (`super::rows`).
-    rows_cache: Vec<super::rows::RowCache>,
+    weight_caches: Vec<super::streamed::Cache>,
     /// The runtime holds the weight set for the load's life.
     weights_held: bool,
 }
@@ -602,7 +602,7 @@ impl Pools {
             disk: None,
             parked: None,
             tier: None,
-            rows_cache: Vec::new(),
+            weight_caches: Vec::new(),
             weights_held: false,
         };
         pools.write_maps(device)?;
@@ -723,7 +723,7 @@ impl Pools {
             u32::try_from(tier.chunks.len()).unwrap_or(u32::MAX)
         });
         facts.weights = self
-            .rows_cache
+            .weight_caches
             .iter()
             .map(|cache| cache.shape.facts())
             .collect();
@@ -1560,13 +1560,13 @@ impl Pools {
     }
 
     /// Takes the weight cache's row-streamed tables (`super::rows`).
-    pub fn seat_rows(&mut self, caches: Vec<super::rows::RowCache>) {
-        self.rows_cache = caches;
+    pub fn seat_weights(&mut self, caches: Vec<super::streamed::Cache>) {
+        self.weight_caches = caches;
     }
 
     #[must_use]
-    pub fn row_caches(&self) -> &[super::rows::RowCache] {
-        &self.rows_cache
+    pub fn weight_caches(&self) -> &[super::streamed::Cache] {
+        &self.weight_caches
     }
 
     /// The byte offset in the pool of weight slot ref `slot` of a shape of
@@ -1603,7 +1603,7 @@ impl Pools {
         }
         if let Some(stray) = residency.resident.iter().find(|resident| {
             !self
-                .rows_cache
+                .weight_caches
                 .iter()
                 .any(|cache| cache.shape.id == resident.atom.shape)
         }) {
@@ -1615,11 +1615,11 @@ impl Pools {
             });
         }
         self.weights_held = residency.held;
-        let mut caches = std::mem::take(&mut self.rows_cache);
+        let mut caches = std::mem::take(&mut self.weight_caches);
         let taken = (|| -> Result<()> {
             for cache in &mut caches {
                 let shape = cache.shape.clone();
-                let mut named: Vec<Option<u32>> = vec![None; shape.blocks as usize];
+                let mut named: Vec<Option<u32>> = vec![None; shape.count as usize];
                 for resident in residency
                     .resident
                     .iter()
@@ -1627,9 +1627,9 @@ impl Pools {
                 {
                     let Some(seat) = named.get_mut(resident.atom.atom as usize) else {
                         return Err(Fault::Ceiling {
-                            what: "row blocks of a streamed table",
+                            what: "atoms of a weight shape",
                             need: u64::from(resident.atom.atom) + 1,
-                            have: u64::from(shape.blocks),
+                            have: u64::from(shape.count),
                         });
                     };
                     *seat = Some(resident.slot);
@@ -1639,7 +1639,7 @@ impl Pools {
             }
             Ok(())
         })();
-        self.rows_cache = caches;
+        self.weight_caches = caches;
         taken
     }
 
@@ -1647,12 +1647,12 @@ impl Pools {
     /// No frame is in flight.
     pub fn restage_weights(&mut self) -> Result<()> {
         let base = crate::device::alloc::slab_address(self.pool.view().slab());
-        let mut caches = std::mem::take(&mut self.rows_cache);
+        let mut caches = std::mem::take(&mut self.weight_caches);
         let staged = caches.iter_mut().try_for_each(|cache| {
             let (per_chunk, slot_bytes) = (cache.shape.per_chunk, cache.shape.slot_bytes);
             cache.restage(base, &|slot| self.weight_slot(per_chunk, slot_bytes, slot))
         });
-        self.rows_cache = caches;
+        self.weight_caches = caches;
         staged
     }
 
@@ -1661,33 +1661,33 @@ impl Pools {
     #[must_use]
     pub fn weights_whole(&self) -> bool {
         self.weights_held
-            && !self.rows_cache.is_empty()
-            && self.rows_cache.iter().all(super::rows::RowCache::whole)
+            && !self.weight_caches.is_empty()
+            && self.weight_caches.iter().all(super::streamed::Cache::whole)
     }
 
-    /// Gives back every table's own copy (see [`super::rows::RowCache::release`]).
+    /// Gives back every table's own copy (see [`super::streamed::Cache::release`]).
     pub fn release_weight_hosts(&mut self) -> Vec<(usize, u32, crate::device::alloc::Slab)> {
         if !self.weights_whole() {
             return Vec::new();
         }
-        self.rows_cache
+        self.weight_caches
             .iter_mut()
-            .flat_map(super::rows::RowCache::release)
+            .flat_map(super::streamed::Cache::release)
             .collect()
     }
 
     /// See `Engine::weight_uses`. No frame is in flight.
     pub fn weight_uses(&mut self) -> Result<engine::chunk::WeightUses> {
         let mut uses = Vec::new();
-        for cache in &mut self.rows_cache {
+        for cache in &mut self.weight_caches {
             cache.uses(&mut uses)?;
         }
         Ok(engine::chunk::WeightUses {
             uses,
             held: self
-                .rows_cache
+                .weight_caches
                 .iter()
-                .map(super::rows::RowCache::held)
+                .map(super::streamed::Cache::held)
                 .collect(),
         })
     }
@@ -1698,7 +1698,7 @@ impl Pools {
     #[must_use]
     pub fn weights_in_seats(&self) -> bool {
         let seats = 1..1 + self.layout.seat_chunks();
-        self.rows_cache.iter().any(|cache| {
+        self.weight_caches.iter().any(|cache| {
             cache
                 .slots()
                 .iter()

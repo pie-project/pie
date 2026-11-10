@@ -326,39 +326,39 @@ pub struct Shell {
 }
 
 impl Shell {
-    /// The weight cache's row-streamed tables (`store::rows`): one cache a
-    /// rows shape the recipe gives tables this engine streams, every block
-    /// read from its table in place until the runtime names slots. None on
-    /// a device whose queue keeps no residency set (the tables are then
-    /// read whole, as before).
-    fn row_caches(
+    /// The weight cache (`store::streamed`): one cache a weight shape the
+    /// recipe gives weights this engine streams (experts only where no
+    /// other tier holds a bank), every atom read from its weight in place
+    /// until the runtime names slots. None on a device whose queue keeps no
+    /// residency set (the weights are then read whole, as before).
+    fn weight_caches(
         device: &Context,
         handles: &Handles,
         weights: &mut Weights,
         trace: &Trace,
         recipe: &poem_compiler::chunk::ChunkRecipe,
-    ) -> Result<Vec<crate::store::rows::RowCache>> {
-        let streamed = crate::store::rows::streamed(trace);
-        let shapes = crate::store::rows::RowsShape::of(trace, recipe, &streamed);
+        experts: bool,
+    ) -> Result<Vec<crate::store::streamed::Cache>> {
+        let shapes = crate::store::streamed::Shape::of(trace, recipe, experts);
         if shapes.is_empty() || !device.hold_resident(std::iter::empty(), true)? {
             return Ok(Vec::new());
         }
         let mut caches = Vec::with_capacity(shapes.len());
         for shape in shapes {
             let cache =
-                crate::store::rows::RowCache::open(device, handles, shape, |param| match weights
+                crate::store::streamed::Cache::open(device, handles, shape, |param| match weights
                     .table()
                     .0
                     .get(param)
                     .copied()
                     .flatten()
                 {
-                    Some(crate::run::WeightRow::Dense(table)) => Some(table.buf),
+                    Some(crate::run::WeightRow::Dense(plane)) => Some(plane.buf),
                     _ => None,
                 })?;
             device.hold_resident(cache.host_slabs(), true)?;
-            for (param, rows) in cache.row_tables() {
-                weights.read_through(param, rows);
+            for (param, table) in cache.tables() {
+                weights.read_through(param, table);
             }
             caches.push(cache);
         }
@@ -672,10 +672,17 @@ impl PreparedLoad<'_> {
         // chunk, the list slot (its tokens are the kv page size), where
         // every fixed row's pieces lie in a record, and the weight slots.
         let recipe = crate::chunks::recipe(&boot.trace, &budgets)?;
-        let row_caches = if boot.residency.whole_weights() {
+        let weight_caches = if boot.residency.whole_weights() {
             Vec::new()
         } else {
-            Shell::row_caches(&device, &handles, &mut weights, &boot.trace, &recipe)?
+            Shell::weight_caches(
+                &device,
+                &handles,
+                &mut weights,
+                &boot.trace,
+                &recipe,
+                !boot.residency.streams(),
+            )?
         };
         handles.seal();
 
@@ -800,7 +807,7 @@ impl PreparedLoad<'_> {
         let arena_ladder = poem_compiler::arena_ladder(&boot.trace, &budgets, &compiled)?;
         let rs_at = rows.rs.clone();
         let mut pools = Pools::reserve(&device, rows, layout, paging)?;
-        pools.seat_rows(row_caches);
+        pools.seat_weights(weight_caches);
         // The null chunk and the floor stand from the load on.
         pools.commit_segments(1)?;
         let rs_buffers = rs_at.map(|at| {
@@ -1090,9 +1097,9 @@ impl Shell {
     /// See `Engine::weight_residency`: every frame drains, blocks newly
     /// named a slot land in it, and every address table is rewritten
     /// before the next fire. A held set naming every atom gives back the
-    /// tables' own copies (`store::rows`).
+    /// tables' own copies (`store::streamed`).
     pub fn weight_residency(&mut self, residency: &engine::chunk::WeightResidency) -> Result<()> {
-        if self.pools.row_caches().is_empty() && residency.resident.is_empty() {
+        if self.pools.weight_caches().is_empty() && residency.resident.is_empty() {
             return Ok(());
         }
         self.drain()?;
@@ -1120,27 +1127,27 @@ impl Shell {
         Ok(())
     }
 
-    /// See `Engine::weight_uses`: each block's reads since the last call.
+    /// See `Engine::weight_uses`: each atom's reads since the last call.
     pub fn weight_uses(&mut self) -> Result<engine::chunk::WeightUses> {
         self.drain()?;
         self.pools.weight_uses()
     }
 
-    /// Whether every row-streamed table's own copy was given back (a held
-    /// set naming every block).
+    /// Whether every streamed weight's own copy was given back (a held set
+    /// naming every atom).
     #[must_use]
-    pub fn row_tables_given_back(&self) -> bool {
-        let caches = self.pools.row_caches();
-        !caches.is_empty() && caches.iter().all(crate::store::rows::RowCache::released)
+    pub fn weights_given_back(&self) -> bool {
+        let caches = self.pools.weight_caches();
+        !caches.is_empty() && caches.iter().all(crate::store::streamed::Cache::released)
     }
 
-    /// The row-streamed tables' blocks named a slot, and all of them.
+    /// The streamed weights' atoms named a slot, and all of them.
     #[must_use]
-    pub fn row_blocks(&self) -> (u64, u64) {
+    pub fn weight_atoms(&self) -> (u64, u64) {
         self.pools
-            .row_caches()
+            .weight_caches()
             .iter()
-            .map(crate::store::rows::RowCache::blocks)
+            .map(crate::store::streamed::Cache::atoms)
             .fold((0, 0), |(a, b), (c, d)| (a + c, b + d))
     }
 

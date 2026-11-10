@@ -47,7 +47,7 @@ pub struct Weights {
     decoded: Vec<Buffer>,
     /// The tables the weight cache streams by their rows, each in an
     /// allocation of its own where the load lands them (the cold road), so
-    /// a held set can give them back (`store::rows`).
+    /// a held set can give them back (`store::streamed`).
     hosted: BTreeMap<usize, Buffer>,
 }
 
@@ -171,8 +171,9 @@ impl Weights {
 
         // The row-streamed tables land in allocations of their own, out of
         // the store, which packs the other planes as before.
-        let own: std::collections::BTreeSet<usize> =
-            crate::store::rows::streamed(trace).into_iter().collect();
+        let own: std::collections::BTreeSet<usize> = crate::store::streamed::streamed(trace)
+            .into_iter()
+            .collect();
         let places = {
             let mut packed = places;
             let mut at = 0u64;
@@ -403,7 +404,7 @@ impl Weights {
 
     /// Reads `param` through `rows` from the next fire on (the weight
     /// cache's row table).
-    pub fn read_through(&mut self, param: usize, rows: kernels_metal::gather::RowTable) {
+    pub fn read_through(&mut self, param: usize, rows: crate::store::streamed::Streamed) {
         let tables = &mut self.table.1;
         if tables.len() <= param {
             tables.resize(param + 1, None);
@@ -412,7 +413,7 @@ impl Weights {
     }
 
     /// Gives back `param`'s own allocation, where the load landed it in one
-    /// (`store::rows`): answers whether there was one. No fire reads it.
+    /// (`store::streamed`): answers whether there was one. No fire reads it.
     pub fn release_hosted(&mut self, param: usize) -> bool {
         self.hosted.remove(&param).is_some()
     }

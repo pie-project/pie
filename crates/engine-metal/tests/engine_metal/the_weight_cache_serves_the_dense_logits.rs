@@ -1,16 +1,17 @@
 #![cfg(target_vendor = "apple")]
 
-//! The weight cache's row-streamed tables (`engine_metal::store::rows`) land
-//! the same logits, bit for bit, wherever their blocks are read from: the
-//! table in place (nothing named), every block in a pool slot, every other
-//! block in one, the whole set held (the tables' own copies given back
-//! mid-script, the decode running on), and every block in a slot whose
+//! The weight cache's streamed weights (`engine_metal::store::streamed`:
+//! token-id-gathered table rows, routed experts) land the same logits, bit
+//! for bit, wherever their atoms are read from: the weight in place (nothing
+//! named), every atom in a pool slot, every other atom in one, the whole set
+//! held (the weights' own copies given back), and every atom in a slot whose
 //! chunks are evacuated mid-decode; each against the load that states no
-//! weight shape at all (the contiguous table, as before the cache). The
-//! use record counts one read a token, and a seat-addressed fire refuses to
-//! run over a weight slot in the seats' own chunks.
+//! weight shape at all (the contiguous weights, as before the cache). The
+//! use record counts one row read a token and whole routes of experts, and
+//! a seat-addressed fire refuses to run over a weight slot in the seats' own
+//! chunks.
 
-use engine::chunk::{Evacuation, ResidentWeight, WeightAtom, WeightResidency};
+use engine::chunk::{Evacuation, ResidentWeight, WeightAtom, WeightKind, WeightResidency};
 use engine_metal::serve::Seated;
 use engine_metal::{Boot, Lane, Shell};
 use poem_compiler::Budget;
@@ -139,9 +140,9 @@ fn serve(fixture: &Fixture, mode: Mode) -> (Vec<Vec<f32>>, u64) {
                 held,
             })
             .expect("the residency lands");
-        assert_eq!(shell.row_blocks().0, count, "{mode:?}: the blocks named");
+        assert_eq!(shell.weight_atoms().0, count, "{mode:?}: the blocks named");
         assert_eq!(
-            shell.row_tables_given_back(),
+            shell.weights_given_back(),
             mode == Mode::Held,
             "{mode:?}: the tables' own copies go only under a held set naming every block"
         );
@@ -176,15 +177,30 @@ fn serve(fixture: &Fixture, mode: Mode) -> (Vec<Vec<f32>>, u64) {
     }
     if mode != Mode::Whole {
         let uses = shell.weight_uses().expect("the use record reads");
-        let reads: u64 = uses.uses.iter().map(|(_, n)| u64::from(*n)).sum();
-        // One read a token at each shape's first table.
-        assert_eq!(
-            reads,
-            tokens * facts.weights.len() as u64,
-            "{mode:?}: the reads counted"
-        );
+        for shape in &facts.weights {
+            let reads: u64 = uses
+                .uses
+                .iter()
+                .filter(|(atom, _)| atom.shape == shape.id)
+                .map(|(_, n)| u64::from(*n))
+                .sum();
+            match shape.kind {
+                // One read a token, at the shape's first table.
+                WeightKind::Rows => assert_eq!(reads, tokens, "{mode:?}: the row reads counted"),
+                // Each route a token takes reads an expert of each layer.
+                WeightKind::Expert => {
+                    assert!(
+                        reads >= tokens && reads.is_multiple_of(tokens),
+                        "{mode:?}: {reads} expert reads over {tokens} tokens"
+                    );
+                    if mode == Mode::Host {
+                        eprintln!("weight shape {}: {reads} expert reads", shape.id);
+                    }
+                }
+            }
+        }
         let resident: u32 = uses.held.iter().map(|h| h.resident).sum();
-        assert_eq!(u64::from(resident), shell.row_blocks().0);
+        assert_eq!(u64::from(resident), shell.weight_atoms().0);
         let again = shell.weight_uses().expect("the use record reads");
         assert!(again.uses.is_empty(), "a read record is zeroed");
     }
@@ -277,4 +293,51 @@ fn a_row_streamed_embedding_serves_the_dense_logits() {
 #[test]
 fn row_streamed_tables_gathered_alike_serve_the_dense_logits() {
     check("gemma4-e4b-mini-l6");
+}
+
+/// A mixture's dense routed banks, an expert at a time.
+fn experts(model: &str) {
+    if !engine_metal::device::present() {
+        eprintln!("skipping: no Metal device");
+        return;
+    }
+    let fixture = fixture_of(model, None);
+    let shell = load(&fixture, false);
+    let facts = shell.pool_chunk_facts();
+    drop(shell);
+    assert!(
+        facts
+            .weights
+            .iter()
+            .any(|shape| shape.kind == WeightKind::Expert),
+        "{model} streams no routed bank an expert at a time: {:?}",
+        facts
+            .weights
+            .iter()
+            .map(|shape| (shape.id, shape.kind, &shape.name))
+            .collect::<Vec<_>>()
+    );
+    check(model);
+}
+
+// The other miniatures with dense routed banks do not serve on this engine
+// today, for reasons apart from the cache: nemotron3-nano-mini's recipe keeps
+// no rs row for a conv plane the shell buffers, dots3-note-mini needs MLA
+// prefill, and mimo26-flash-mini's layout reads an experts dtype the bf16
+// fixture does not state.
+
+#[test]
+fn a_mixtures_dense_experts_serve_the_dense_logits_minimax() {
+    experts("minimax-m3-mini");
+}
+
+#[test]
+fn a_mixtures_dense_experts_serve_the_dense_logits_qwen3() {
+    experts("qwen3-30b-a3b-mini");
+}
+
+/// Experts the recipe cuts into 27 pieces on their output axis.
+#[test]
+fn a_mixtures_dense_experts_serve_the_dense_logits_dsv4() {
+    experts("dsv4-flash-mini");
 }

@@ -19,12 +19,13 @@ pub enum WeightRow {
     Planes(Bank),
 }
 
-/// Each param's binding, and the row table each table the weight cache
-/// streams by its rows is read through (`None`: read whole, as bound).
+/// Each param's binding, and the address table each weight the weight
+/// cache streams is read through (`None`: read whole, as bound): a row
+/// table, or for a routed bank an expert table (one-row blocks).
 #[derive(Clone, Debug, Default)]
 pub struct WeightTable(
     pub Vec<Option<WeightRow>>,
-    pub Vec<Option<kernels_metal::gather::RowTable>>,
+    pub Vec<Option<crate::store::streamed::Streamed>>,
 );
 
 #[derive(Clone, Debug, Default)]
@@ -1674,9 +1675,28 @@ impl<'c> Run<'c> {
         })
     }
 
-    /// The row table weight `id` is read through, where the weight cache
-    /// streams it by its rows.
+    /// The address table weight `id` is read through, where the weight
+    /// cache streams it (by its rows, or an expert at a time).
     pub(crate) fn row_table(&self, id: ValueId) -> Option<kernels_metal::gather::RowTable> {
+        match self.streamed(id)? {
+            crate::store::streamed::Streamed::Rows(table) => Some(table),
+            crate::store::streamed::Streamed::Experts(_) => None,
+        }
+    }
+
+    /// The expert table routed bank `id` is read through, where the weight
+    /// cache streams it an expert at a time.
+    pub(crate) fn expert_table(
+        &self,
+        id: ValueId,
+    ) -> Option<kernels_metal::linear::moe::ExpertTable> {
+        match self.streamed(id)? {
+            crate::store::streamed::Streamed::Experts(table) => Some(table),
+            crate::store::streamed::Streamed::Rows(_) => None,
+        }
+    }
+
+    fn streamed(&self, id: ValueId) -> Option<crate::store::streamed::Streamed> {
         let Def::Weight(w) = &self.values[id.0 as usize].def else {
             return None;
         };

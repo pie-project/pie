@@ -513,6 +513,20 @@ fn routed_qmv_grid(
     Ok([x, out_width.div_ceil(4), top_k])
 }
 
+/// Where each expert's plane of a routed bank lies, for
+/// [`matmul_select_tabled`]: `at` holds one GPU address (`select.metal`'s
+/// `ExpertAt`) a piece of an expert, `pieces` an expert (entry
+/// `expert * pieces + piece`), a piece holding `piece_rows` of the plane's
+/// output rows from `piece * piece_rows` on, laid as in the bank; `hits`,
+/// where stated, a `u32` an expert that each route reading it adds one to.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ExpertTable {
+    pub at: Tensor,
+    pub pieces: u32,
+    pub piece_rows: u32,
+    pub hits: Option<Tensor>,
+}
+
 pub fn matmul_select(
     ctx: &Ctx<'_>,
     x: Tensor,
@@ -520,15 +534,44 @@ pub fn matmul_select(
     routes: Tensor,
     y: Tensor,
 ) -> Result<(), Error> {
+    matmul_select_tabled(ctx, x, bank, None, routes, y)
+}
+
+/// [`matmul_select`] reading each expert's plane where `experts` says (the
+/// weight cache's expert table: one address an expert, its first row, the
+/// plane laid as in the bank), or the contiguous `bank` where `experts` is
+/// `None`. One kernel either way; under a table `bank` is not bound, so a
+/// recording never holds it.
+pub fn matmul_select_tabled(
+    ctx: &Ctx<'_>,
+    x: Tensor,
+    bank: Tensor,
+    experts: Option<ExpertTable>,
+    routes: Tensor,
+    y: Tensor,
+) -> Result<(), Error> {
     const OP: &str = "linear.moe_select";
     let entry = dtype_dispatch!(OP, x.dtype, { Bf16 => "select_gemv" });
     debug_assert_eq!(bank.dtype, x.dtype, "the bank rides the activation's dtype");
     let fan = selected(OP, x, routes, y)?;
+    let (expert_at, pieces, piece_rows, hits, counting) = match experts {
+        None => (ctx.absent()?, 0i32, 0i32, ctx.absent()?, 0i32),
+        Some(table) => (
+            table.at.arg(),
+            stated(OP, nonzero(OP, "pieces an expert", table.pieces)?)?,
+            stated(OP, nonzero(OP, "rows a piece", table.piece_rows)?)?,
+            match table.hits {
+                Some(hits) => hits.arg_mut(),
+                None => ctx.absent()?,
+            },
+            i32::from(table.hits.is_some()),
+        ),
+    };
     ctx.fire(
         Fire::at("linear/moe/select.metal", entry).apply(select_gemv_grid(OP, y.width, y.rows)?),
         &[
             x.arg(),
-            bank.arg(),
+            experts.map_or(bank, |table| table.at).arg(),
             routes.arg(),
             y.arg_mut(),
             stated(OP, x.width)?.arg(),
@@ -536,6 +579,11 @@ pub fn matmul_select(
             stated(OP, fan.top_k)?.arg(),
             stated(OP, fan.x_row_stride)?.arg(),
             stated(OP, fan.x_slot_stride)?.arg(),
+            expert_at,
+            pieces.arg(),
+            piece_rows.arg(),
+            hits,
+            counting.arg(),
         ],
     )
 }
