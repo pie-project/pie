@@ -156,8 +156,8 @@ enum Placement {
     /// Seat-addressed: each lane's seat runs.
     Seats,
     /// Slot refs the runtime would name: pages strided over chunks
-    /// `first .. first + 3` from the top down, the records in chunk
-    /// `first + 3`.
+    /// `first .. first + 3` from the top down, lane `l`'s record in chunk
+    /// `first + 3 + l`.
     Refs {
         first: u32,
         per_list: u32,
@@ -184,7 +184,7 @@ impl Placement {
             Placement::Seats => unreachable!(),
             Placement::Refs {
                 first, per_fixed, ..
-            } => (first + 3) * per_fixed + (lane * 3 + 1) % per_fixed,
+            } => (first + 3 + lane) * per_fixed + (lane * 3 + 1) % per_fixed,
         }
     }
 }
@@ -275,10 +275,27 @@ fn serve(
     rows
 }
 
-fn bits(rows: &[Vec<f32>]) -> Vec<Vec<u32>> {
-    rows.iter()
-        .map(|row| row.iter().map(|v| v.to_bits()).collect())
-        .collect()
+/// The chunks the scattered placement holds: three of pages, two records.
+const HELD: u32 = 5;
+
+/// Panics at the first row whose logits differ in a bit.
+fn same(what: &str, got: &[Vec<f32>], want: &[Vec<f32>]) {
+    assert_eq!(got.len(), want.len(), "{what}: rows");
+    for (at, (got, want)) in got.iter().zip(want).enumerate() {
+        let differ = got
+            .iter()
+            .zip(want)
+            .filter(|(a, b)| a.to_bits() != b.to_bits())
+            .count();
+        assert!(
+            differ == 0 && got.len() == want.len(),
+            "{what}: row {at} of {} differs in {differ} of {} logits (argmax {} against {})",
+            want.len(),
+            want.len(),
+            argmax(got),
+            argmax(want)
+        );
+    }
 }
 
 fn check(model: &str, hybrid: bool) {
@@ -326,10 +343,10 @@ fn check(model: &str, hybrid: bool) {
         &mut |_| {},
     );
     drop(shell);
-    assert_eq!(
-        bits(&seats),
-        bits(&planes),
-        "{model}: the seats' runs serve the planes' logits"
+    same(
+        &format!("{model}: the seats' runs against the planes"),
+        &seats,
+        &planes,
     );
 
     // Scattered over a segment of their own above the seats' runs, then
@@ -339,9 +356,9 @@ fn check(model: &str, hybrid: bool) {
     let layout = shell.pool_layout().expect("a chunk pool");
     let segment = facts.segment_chunks;
     let low = 1 + layout.seat_chunks();
-    let kept = (low + 4).div_ceil(segment);
+    let kept = (low + HELD).div_ceil(segment);
     let first = kept * segment;
-    let commit = kept + 4u32.div_ceil(segment);
+    let commit = kept + HELD.div_ceil(segment);
     assert!(
         facts.segments.max >= commit,
         "{model}: the pool spans {commit} segments"
@@ -361,7 +378,7 @@ fn check(model: &str, hybrid: bool) {
         STEPS,
         STEPS / 2,
         &mut |shell| {
-            let moves = (0..4).map(|at| (first + at, low + at)).collect();
+            let moves = (0..HELD).map(|at| (first + at, low + at)).collect();
             shell
                 .evacuate(&Evacuation { moves })
                 .expect("the evacuation lands");
@@ -374,10 +391,10 @@ fn check(model: &str, hybrid: bool) {
             }
         },
     );
-    assert_eq!(
-        bits(&scattered),
-        bits(&planes),
-        "{model}: scattered and evacuated slots serve the planes' logits"
+    same(
+        &format!("{model}: scattered and evacuated slots against the planes"),
+        &scattered,
+        &planes,
     );
 }
 
