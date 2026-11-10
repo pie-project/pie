@@ -18,7 +18,7 @@ use crate::device::alloc::Memory;
 use crate::device::{Buffer, Context, Handles};
 use crate::error::{Fault, Result};
 use crate::experts::{
-    Gathered, HostPlane, HostTier, Layout, Mapping, Plan, Pump, Seats, Tier, identity_runs,
+    Gathered, HostPlane, HostTier, Layout, Mapping, Plan, Pump, Tier, identity_runs,
 };
 use crate::run::{WeightRow, WeightTable};
 use crate::weight_store::Store;
@@ -94,8 +94,6 @@ pub struct Weights {
 
     layout: Layout,
 
-    seats: Option<Seats>,
-
     pump: Option<Pump>,
 
     rows: Option<Gathered>,
@@ -105,9 +103,9 @@ pub struct Weights {
 
     decoded: Vec<Buffer>,
 
-    /// The host bytes of the tables the weight cache streams by their rows
-    /// (the runtime's to place, not this load's own tier).
-    row_bytes: u64,
+    /// The host bytes of the tables and routed banks the weight cache
+    /// streams (the runtime's to place, not this load's own tier).
+    cached_bytes: u64,
 }
 
 impl Weights {
@@ -265,30 +263,9 @@ impl Weights {
             }));
         }
 
-        let mut widest = [0u64; 4];
-        let mut capacity = 0u32;
-        for &at in plan.routed() {
-            if places[at].tier != Tier::Host {
-                continue;
-            }
-            let row = |place: &Place| crate::experts::row_bytes(place.dtype, place.width);
-            capacity = capacity.max(places[at].rows);
-            match pairings.get(trace.params[at].name.as_str()) {
-                Some(pairing) => {
-                    widest[0] = widest[0].max(row(&places[at]));
-                    widest[1] = widest[1].max(row(&places[pairing.scales]));
-                    if let Some(b) = pairing.biases {
-                        widest[2] = widest[2].max(row(&places[b]));
-                    }
-                }
-                None => widest[3] = widest[3].max(row(&places[at])),
-            }
-        }
-        let seats = Seats::reserve(device, handles, widest, capacity)?;
-
         let pump = Pump::reserve(device, handles, layout.slot, layout.ring)?;
 
-        let mut gathered_widest = [0u64; 4];
+        let mut gathered_widest = [0u64; 3];
         for at in plan.gathered() {
             if places[at].tier != Tier::Host {
                 continue;
@@ -323,24 +300,18 @@ impl Weights {
             store,
             host,
             layout,
-            seats,
             rows,
             pump,
             table: WeightTable(weight_table),
             banks: banks(trace, &places),
             decoded: Vec::new(),
-            row_bytes: streamed.iter().map(|&at| reserved[at]).sum(),
+            cached_bytes: streamed.iter().map(|&at| reserved[at]).sum(),
         })
     }
 
     #[must_use]
     pub fn gathered(&self) -> Option<&Gathered> {
         self.rows.as_ref()
-    }
-
-    #[must_use]
-    pub fn seats(&self) -> Option<&Seats> {
-        self.seats.as_ref()
     }
 
     #[must_use]
@@ -427,9 +398,9 @@ impl Weights {
 
     #[must_use]
     /// Whether this load streams weights by a tier of its own: planes on
-    /// the host besides the weight cache's row tables, or spilled.
+    /// the host besides the weight cache's, or spilled.
     pub fn streams(&self) -> bool {
-        self.layout.tiers.spilled > 0 || self.layout.tiers.host > self.row_bytes
+        self.layout.tiers.spilled > 0 || self.layout.tiers.host > self.cached_bytes
     }
 
     #[must_use]
@@ -554,7 +525,6 @@ impl Weights {
     pub fn bytes(&self) -> u64 {
         self.store.bytes()
             + self.decoded.iter().map(Buffer::bytes).sum::<u64>()
-            + self.seats.as_ref().map_or(0, Seats::device_bytes)
             + self.pump.as_ref().map_or(0, Pump::device_bytes)
             + self.rows.as_ref().map_or(0, Gathered::device_bytes)
     }
@@ -569,9 +539,10 @@ impl Weights {
         self.host.as_ref()
     }
 
-    /// The host planes of the tables `rows` streams, by param.
+    /// The host planes of the params `streams` names (the weight cache's
+    /// tables and routed banks), by param.
     #[must_use]
-    pub fn row_planes(&self, rows: &crate::store::rows::RowCaches) -> BTreeMap<usize, &HostPlane> {
+    pub fn cached_planes(&self, streams: impl Fn(usize) -> bool) -> BTreeMap<usize, &HostPlane> {
         let Some(host) = self.host.as_ref() else {
             return BTreeMap::new();
         };
@@ -579,10 +550,11 @@ impl Weights {
             .0
             .iter()
             .enumerate()
-            .filter(|(at, _)| rows.streams(*at))
+            .filter(|(at, _)| streams(*at))
             .filter_map(|(at, row)| match row {
                 Some(WeightRow::Dense(plane)) => host.plane(plane.buf).map(|p| (at, p)),
-                _ => None,
+                Some(WeightRow::Planes(bank)) => host.plane(bank.codes.buf).map(|p| (at, p)),
+                None => None,
             })
             .collect()
     }

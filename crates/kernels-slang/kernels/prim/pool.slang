@@ -68,6 +68,40 @@
         return int(slots[at * params.pieces]) < 0; \
     }
 
+// Snapshots (CONTRACT-BC 16): a lane folding its rows lands the state as
+// of up to `PIE_RS_SNAPSHOTS` rows inside it in records of their own.
+// `pie_snaps` holds, a lane (from `params.snap_lane0`; -1: no snapshots this
+// fire), `PIE_RS_SNAPSHOTS` rows into the lane (ascending, a row `<= 0`
+// ends them), then each snapshot's record as `params.pieces` units, as a
+// `slots` entry holds a record. Needs `pie_snaps` and `params` (`pieces`,
+// `piece_first`, `piece_atoms`, `slot_stride`, `snap_lane0`) declared
+// before.
+#define PIE_RS_SNAPSHOTS 4u
+#define PIE_STATE_SNAPSHOTS \
+    /* The snapshot lane of request `r`, or -1 where this fire lands none. */ \
+    int pie_snap_lane(uint r) { \
+        return params.snap_lane0 >= 0 ? params.snap_lane0 + int(r) : -1; \
+    } \
+    uint pie_snap_entry(uint lane) { \
+        return lane * PIE_RS_SNAPSHOTS * (1u + params.pieces); \
+    } \
+    /* Snapshot `n`'s row into lane `lane`, `<= 0` past its last. */ \
+    int pie_snap_row(int lane, uint n) { \
+        if (lane < 0 || n >= PIE_RS_SNAPSHOTS) { \
+            return 0; \
+        } \
+        return pie_snaps[pie_snap_entry(uint(lane)) + n]; \
+    } \
+    /* The unit of snapshot `n`'s record that holds atom `atom`. */ \
+    uint pie_snap_unit(uint lane, uint n, uint atom) { \
+        return uint(pie_snaps[pie_snap_entry(lane) + PIE_RS_SNAPSHOTS + n * params.pieces \
+            + params.piece_first + atom / params.piece_atoms]); \
+    } \
+    /* Atom `atom` (each `elems` long) of snapshot `n`'s record. */ \
+    uint pie_snap_atom(uint lane, uint n, uint atom, uint elems) { \
+        return pie_snap_unit(lane, n, atom) * params.slot_stride + (atom % params.piece_atoms) * elems; \
+    }
+
 // A read-only window on the pool from `origin_` on.
 #define PIE_POOL_VIEW_RO(name_, type_, origin_) \
     struct name_##_pool_view { \

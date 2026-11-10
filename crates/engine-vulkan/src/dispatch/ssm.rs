@@ -30,6 +30,7 @@ impl Run<'_> {
             pieces: pool.pieces,
             piece_first: pool.piece_first,
             piece_atoms: pool.piece_atoms,
+            snapshots: self.rs_snapshots(),
         }
     }
 

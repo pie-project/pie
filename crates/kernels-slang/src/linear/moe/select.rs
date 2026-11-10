@@ -11,7 +11,67 @@ use crate::encode::{
     Arg, ArgValue, Ctx, Fire, Target, Tier, dtype_dispatch, instantiated, nonzero, refuse, stated,
 };
 use crate::error::Error;
-use crate::tensor::{Bank, Tensor};
+use crate::tensor::{Bank, Segments, Tensor};
+
+/// A routed bank read through the weight cache's expert table
+/// (`kernels/prim/experts.slang`): an expert of a MoE layer is one atom of
+/// a weight shape, its plane of every bank of the layer back to back in one
+/// slot of the pool. `units[atom_first + e]` names the pool unit expert
+/// `e`'s slot starts at (`unit_words` words a unit) or `u32::MAX`; an
+/// expert no slot holds was staged for this fire, `staged[atom_first + e]`
+/// its seat of `stage` (`atom_words` words a seat). Each plane of the bank
+/// lies `origins` words into the atom, laid as one expert of the
+/// contiguous bank: `[codes or the dense plane, scales, zero points, the
+/// expert bias]`. A tabled kernel reads the elements the contiguous bank's
+/// kernel reads, in its order, so it lands the same bits. A route counts a
+/// use of its expert in `hits` where `count` is set (a layer's first bank).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ExpertTable {
+    pub units: Tensor,
+    pub staged: Tensor,
+    pub stage: Tensor,
+    pub hits: Tensor,
+    pub pool: Segments,
+    pub unit_words: u32,
+    pub atom_words: u32,
+    pub atom_first: u32,
+    pub origins: [u32; 4],
+    pub count: bool,
+}
+
+impl ExpertTable {
+    /// The table's bindings, in `PIE_EXPERT_TABLE`'s order.
+    pub(crate) fn buffers(&self) -> Vec<ArgValue> {
+        let mut out = vec![
+            self.units.arg(),
+            self.staged.arg(),
+            self.stage.arg(),
+            self.hits.arg_mut(),
+        ];
+        out.extend(self.pool.args(false));
+        out
+    }
+
+    /// The scalars after a kernel's own: where the pool's segments split,
+    /// a unit's and an atom's words, the layer's first atom.
+    pub(crate) fn place(&self) -> [ArgValue; 4] {
+        [
+            self.pool.words.arg(),
+            self.unit_words.arg(),
+            self.atom_words.arg(),
+            self.atom_first.arg(),
+        ]
+    }
+
+    /// [`ExpertTable::place`], then the four plane origins and whether
+    /// routes count uses.
+    fn params(&self) -> Vec<ArgValue> {
+        let mut out = self.place().to_vec();
+        out.extend(self.origins.map(Arg::arg));
+        out.push(u32::from(self.count).arg());
+        out
+    }
+}
 
 const SELECT: &str = "linear/moe/select.slang";
 
@@ -152,6 +212,70 @@ pub fn matmul_select(
             push[3],
             push[4],
         ],
+    )
+}
+
+/// [`matmul_select`] over a dense bf16 bank read through `table`.
+pub fn matmul_select_tabled(
+    ctx: &Ctx<'_>,
+    tier: Tier,
+    x: Tensor,
+    table: &ExpertTable,
+    routes: Tensor,
+    y: Tensor,
+) -> Result<(), Error> {
+    const OP: &str = "linear.moe_select";
+    let entry = dtype_dispatch!(OP, x.dtype, { Bf16 => "linear_moe_select_tabled_dense_bf16" });
+    let fan = fan(OP, x, routes, y)?;
+    if !x.width.is_multiple_of(4) {
+        return Err(refuse(
+            OP,
+            format!(
+                "K is {}, not a whole number of the four codes a lane walks",
+                x.width
+            ),
+        ));
+    }
+    let push = push(OP, x, y, &fan)?;
+    let mut args = vec![x.arg(), y.arg_mut(), routes.arg()];
+    args.extend(table.buffers());
+    args.extend(push);
+    args.extend(table.params());
+    ctx.fire(
+        fire_at(entry, tier_of(ctx, tier), grid(OP, &fan, y.width)?),
+        &args,
+    )
+}
+
+/// [`matmul_select_quant`] (`biased`: [`matmul_select_bias`]) over a
+/// quantized bank read through `table`; `bank` states its scheme (its
+/// planes are not read).
+pub fn matmul_select_quant_tabled(
+    ctx: &Ctx<'_>,
+    tier: Tier,
+    x: Tensor,
+    bank: Bank,
+    biased: bool,
+    table: &ExpertTable,
+    routes: Tensor,
+    y: Tensor,
+) -> Result<(), Error> {
+    const OP: &str = "linear.moe_select";
+    dtype_dispatch!(OP, x.dtype, { Bf16 => () });
+    let entry = instantiated(
+        OP,
+        point(OP, bank, biased)?.replacen("linear_moe_select_", "linear_moe_select_tabled_", 1),
+    )?;
+    let fan = fan(OP, x, routes, y)?;
+    check_bank(OP, x, bank)?;
+    let push = push(OP, x, y, &fan)?;
+    let mut args = vec![x.arg(), y.arg_mut(), routes.arg()];
+    args.extend(table.buffers());
+    args.extend(push);
+    args.extend(table.params());
+    ctx.fire(
+        fire_at(entry, tier_of(ctx, tier), grid(OP, &fan, y.width)?),
+        &args,
     )
 }
 
@@ -383,6 +507,67 @@ pub fn matmul_select_batched(
     y: Tensor,
     batch: Batch,
 ) -> Result<bool, Error> {
+    batched(
+        ctx,
+        op,
+        x,
+        bank,
+        bias.is_some(),
+        bias,
+        None,
+        routes,
+        experts,
+        scratch,
+        y,
+        batch,
+    )
+}
+
+/// [`matmul_select_batched`] over a bank read through `table` (`biased`:
+/// its expert bias too); `bank` states its scheme.
+pub fn matmul_select_batched_tabled(
+    ctx: &Ctx<'_>,
+    op: &'static str,
+    x: Tensor,
+    bank: Bank,
+    biased: bool,
+    table: &ExpertTable,
+    routes: Tensor,
+    experts: u32,
+    scratch: RoutedScratch,
+    y: Tensor,
+    batch: Batch,
+) -> Result<bool, Error> {
+    batched(
+        ctx,
+        op,
+        x,
+        bank,
+        biased,
+        None,
+        Some(table),
+        routes,
+        experts,
+        scratch,
+        y,
+        batch,
+    )
+}
+
+fn batched(
+    ctx: &Ctx<'_>,
+    op: &'static str,
+    x: Tensor,
+    bank: Bank,
+    biased: bool,
+    bias: Option<Tensor>,
+    table: Option<&ExpertTable>,
+    routes: Tensor,
+    experts: u32,
+    scratch: RoutedScratch,
+    y: Tensor,
+    batch: Batch,
+) -> Result<bool, Error> {
     dtype_dispatch!(op, x.dtype, { Bf16 => () });
     let fan = fan(op, x, routes, y)?;
     check_bank(op, x, bank)?;
@@ -417,8 +602,9 @@ pub fn matmul_select_batched(
     let tiled = instantiated(
         op,
         format!(
-            "linear_moe_select_tiled_{family}{}_bf16_gs_{}_b_{}_bm_{tile}_bn_{bn}",
-            if bias.is_some() { "_bias" } else { "" },
+            "linear_moe_select_tiled_{}{family}{}_bf16_gs_{}_b_{}_bm_{tile}_bn_{bn}",
+            if table.is_some() { "tabled_" } else { "" },
+            if biased { "_bias" } else { "" },
             bank.group,
             bank.bits
         ),
@@ -474,26 +660,41 @@ pub fn matmul_select_batched(
     } else {
         (Tier::Baseline, [32, 4, 1])
     };
-    ctx.fire(
-        Fire::at(TILED, tiled)
-            .tier(tier)
-            .groups([y.width.div_ceil(bn), padded / tile, 1])
-            .group(local),
-        &[
-            bank.codes.arg(),
-            bank.scales.arg(),
-            zero_points(ctx, bank)?,
-            scratch.x.arg(),
-            scratch.y.arg_mut(),
-            match bias {
-                Some(bias) => bias.arg(),
-                None => ctx.absent()?,
-            },
-            scratch.tile_expert.arg(),
-            stated(op, x.width)?.arg(),
-            stated(op, y.width)?.arg(),
-        ],
-    )?;
+    let tiles = Fire::at(TILED, tiled)
+        .tier(tier)
+        .groups([y.width.div_ceil(bn), padded / tile, 1])
+        .group(local);
+    match table {
+        Some(table) => {
+            let mut args = vec![
+                scratch.x.arg(),
+                scratch.y.arg_mut(),
+                scratch.tile_expert.arg(),
+            ];
+            args.extend(table.buffers());
+            args.push(stated(op, x.width)?.arg());
+            args.push(stated(op, y.width)?.arg());
+            args.extend(table.params());
+            ctx.fire(tiles, &args)?;
+        }
+        None => ctx.fire(
+            tiles,
+            &[
+                bank.codes.arg(),
+                bank.scales.arg(),
+                zero_points(ctx, bank)?,
+                scratch.x.arg(),
+                scratch.y.arg_mut(),
+                match bias {
+                    Some(bias) => bias.arg(),
+                    None => ctx.absent()?,
+                },
+                scratch.tile_expert.arg(),
+                stated(op, x.width)?.arg(),
+                stated(op, y.width)?.arg(),
+            ],
+        )?,
+    }
     ctx.fire(
         Fire::at(SORT, "linear_moe_route_sort_scatter")
             .groups(moved(op, wgsl, y.width, pairs)?)

@@ -490,92 +490,77 @@ impl Run<'_> {
                 quantized: false,
                 quant: None,
                 ..
-            } => kernels_slang::linear::moe::select::matmul_select(
-                self.ctx,
-                kernels_slang::Tier::Baseline,
-                self.tensor(*x),
-                self.tensor(*bank),
-                self.tensor(*routes),
-                self.tensor(*y),
-            ),
-
-            Linear::MoeSelect {
-                x,
-                bank,
-                bias: Some(bias),
-                routes,
-                y,
-                quantized: false,
-                quant: None,
-                ..
             } => {
                 const OP: &str = "linear.moe_select";
-
-                let (planes, bias_plane, routed, staged) = match self.staged(
-                    Some(self.planes(*bank)),
-                    Some(self.tensor(*bias)),
-                    self.tensor(*routes),
-                )? {
-                    Some((planes, bias_plane, routed)) => (
-                        planes.expect("a staged bank answers a bank"),
-                        bias_plane,
-                        routed,
-                        true,
-                    ),
-                    None => (self.planes(*bank), None, self.tensor(*routes), false),
-                };
-                let bias_plane = bias_plane.unwrap_or_else(|| self.tensor(*bias));
-                if !staged
-                    && let Some(scratch) = self.routed_scratch()
-                    && self.batched(
-                        OP,
+                let routes = self.tensor(*routes);
+                match self.expert_table(OP, Some(*bank), None, routes)? {
+                    Some(table) => kernels_slang::linear::moe::select::matmul_select_tabled(
+                        self.ctx,
+                        kernels_slang::Tier::Baseline,
                         self.tensor(*x),
-                        planes,
-                        Some(bias_plane),
-                        routed,
-                        self.experts(*routes),
-                        scratch,
+                        &table,
+                        routes,
                         self.tensor(*y),
-                    )?
-                {
-                    return Ok(());
+                    ),
+                    None => kernels_slang::linear::moe::select::matmul_select(
+                        self.ctx,
+                        kernels_slang::Tier::Baseline,
+                        self.tensor(*x),
+                        self.tensor(*bank),
+                        routes,
+                        self.tensor(*y),
+                    ),
                 }
-                kernels_slang::linear::moe::select::matmul_select_bias(
-                    self.ctx,
-                    kernels_slang::Tier::Baseline,
-                    self.tensor(*x),
-                    planes,
-                    bias_plane,
-                    routed,
-                    self.tensor(*y),
-                )
             }
 
             Linear::MoeSelect {
                 x,
                 bank,
+                bias,
                 routes,
                 y,
-                bias: None,
-                quantized: true,
+                quantized,
                 quant: None,
                 ..
-            } => {
+            } if bias.is_some() != *quantized => {
                 const OP: &str = "linear.moe_select";
-                let (planes, routed, staged) =
-                    match self.staged(Some(self.planes(*bank)), None, self.tensor(*routes))? {
-                        Some((planes, _, routed)) => {
-                            (planes.expect("a staged bank answers a bank"), routed, true)
-                        }
-                        None => (self.planes(*bank), self.tensor(*routes), false),
-                    };
-                if !staged
-                    && let Some(scratch) = self.routed_scratch()
+                let routed = self.tensor(*routes);
+                if let Some(table) = self.expert_table(OP, Some(*bank), *bias, routed)? {
+                    let scheme = self.scheme(*bank);
+                    if let Some(scratch) = self.routed_scratch()
+                        && self.batched_tabled(
+                            OP,
+                            self.tensor(*x),
+                            scheme,
+                            bias.is_some(),
+                            &table,
+                            routed,
+                            self.experts(*routes),
+                            scratch,
+                            self.tensor(*y),
+                        )?
+                    {
+                        return Ok(());
+                    }
+                    return kernels_slang::linear::moe::select::matmul_select_quant_tabled(
+                        self.ctx,
+                        kernels_slang::Tier::Baseline,
+                        self.tensor(*x),
+                        scheme,
+                        bias.is_some(),
+                        &table,
+                        routed,
+                        self.tensor(*y),
+                    );
+                }
+                let planes = self.planes(*bank);
+                let bias_plane = bias.map(|b| self.tensor(b));
+                if let Some(scratch) = self.routed_scratch()
                     && self.batched(
                         OP,
                         self.tensor(*x),
                         planes,
-                        None,
+                        bias_plane,
                         routed,
                         self.experts(*routes),
                         scratch,
@@ -584,14 +569,25 @@ impl Run<'_> {
                 {
                     return Ok(());
                 }
-                kernels_slang::linear::moe::select::matmul_select_quant(
-                    self.ctx,
-                    kernels_slang::Tier::Baseline,
-                    self.tensor(*x),
-                    planes,
-                    routed,
-                    self.tensor(*y),
-                )
+                match bias_plane {
+                    Some(bias_plane) => kernels_slang::linear::moe::select::matmul_select_bias(
+                        self.ctx,
+                        kernels_slang::Tier::Baseline,
+                        self.tensor(*x),
+                        planes,
+                        bias_plane,
+                        routed,
+                        self.tensor(*y),
+                    ),
+                    None => kernels_slang::linear::moe::select::matmul_select_quant(
+                        self.ctx,
+                        kernels_slang::Tier::Baseline,
+                        self.tensor(*x),
+                        planes,
+                        routed,
+                        self.tensor(*y),
+                    ),
+                }
             }
 
             // The forms no builder makes.
@@ -634,21 +630,25 @@ impl Run<'_> {
                 weights,
                 y,
             } => {
-                let (bias_plane, routed) =
-                    match self.staged(None, Some(self.tensor(*bias)), self.tensor(*routes))? {
-                        Some((_, bias_plane, routed)) => {
-                            (bias_plane.expect("a staged bias answers a plane"), routed)
-                        }
-                        None => (self.tensor(*bias), self.tensor(*routes)),
-                    };
-                kernels_slang::linear::moe::combine::bias_sum(
-                    self.ctx,
-                    self.tensor(*x),
-                    bias_plane,
-                    routed,
-                    self.tensor(*weights),
-                    self.tensor(*y),
-                )
+                let routes = self.tensor(*routes);
+                match self.expert_table("linear.moe_bias_sum", None, Some(*bias), routes)? {
+                    Some(table) => kernels_slang::linear::moe::combine::bias_sum_tabled(
+                        self.ctx,
+                        self.tensor(*x),
+                        &table,
+                        routes,
+                        self.tensor(*weights),
+                        self.tensor(*y),
+                    ),
+                    None => kernels_slang::linear::moe::combine::bias_sum(
+                        self.ctx,
+                        self.tensor(*x),
+                        self.tensor(*bias),
+                        routes,
+                        self.tensor(*weights),
+                        self.tensor(*y),
+                    ),
+                }
             }
             Linear::MoeSigmoidGateAdd {
                 routed,
@@ -696,6 +696,40 @@ impl Run<'_> {
 }
 
 impl Run<'_> {
+    /// The tiles and sort a batched route runs at on this device.
+    fn batch(&self, pairs: u32, experts: u32) -> kernels_slang::linear::moe::select::Batch {
+        kernels_slang::linear::moe::select::Batch {
+            tile: self.tuning().moe_tile_rows(pairs, experts),
+            padded: self.tuning().moe_sorted_rows(pairs, experts),
+            tier: if self.tuning().moe_coopmat() {
+                kernels_slang::Tier::Coopmat
+            } else {
+                kernels_slang::Tier::Baseline
+            },
+            sort_lanes: self.tuning().sort_lanes(),
+        }
+    }
+
+    /// [`Run::batched`] over a bank read through `table`.
+    #[allow(clippy::too_many_arguments)]
+    fn batched_tabled(
+        &self,
+        op: &'static str,
+        x: kernels_slang::Tensor,
+        scheme: kernels_slang::Bank,
+        biased: bool,
+        table: &kernels_slang::linear::moe::select::ExpertTable,
+        routes: kernels_slang::Tensor,
+        experts: u32,
+        scratch: kernels_slang::linear::moe::select::RoutedScratch,
+        y: kernels_slang::Tensor,
+    ) -> Result<bool, kernels_slang::Error> {
+        let batch = self.batch(y.rows, experts);
+        kernels_slang::linear::moe::select::matmul_select_batched_tabled(
+            self.ctx, op, x, scheme, biased, table, routes, experts, scratch, y, batch,
+        )
+    }
+
     /// The routed matmul over sorted expert tiles, at the device's tile
     /// rows, sort width and tier; `Ok(false)` where it declines.
     #[allow(clippy::too_many_arguments)]
@@ -711,16 +745,7 @@ impl Run<'_> {
         y: kernels_slang::Tensor,
     ) -> Result<bool, kernels_slang::Error> {
         let pairs = y.rows;
-        let batch = kernels_slang::linear::moe::select::Batch {
-            tile: self.tuning().moe_tile_rows(pairs, experts),
-            padded: self.tuning().moe_sorted_rows(pairs, experts),
-            tier: if self.tuning().moe_coopmat() {
-                kernels_slang::Tier::Coopmat
-            } else {
-                kernels_slang::Tier::Baseline
-            },
-            sort_lanes: self.tuning().sort_lanes(),
-        };
+        let batch = self.batch(pairs, experts);
         kernels_slang::linear::moe::select::matmul_select_batched(
             self.ctx, op, x, bank, bias, routes, experts, scratch, y, batch,
         )

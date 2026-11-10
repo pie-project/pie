@@ -8,12 +8,9 @@ use poem_exec::fire::At;
 use poem_ir::{Def, Dim, Dtype, GeomKind, Node, RuntimeInput, StructKind, Ty, ValueDecl, ValueId};
 
 use crate::device::Handles;
-use crate::device::ctx::Frame;
 use crate::dispatch::copy::CopyPlan;
 use crate::scratch::Scratch;
 use crate::window::{Window, Windows};
-
-type Seated = (Option<Bank>, Option<Tensor>, Tensor);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum WeightRow {
@@ -109,6 +106,14 @@ pub struct FireBindings {
 
     pub rs: Option<std::sync::Arc<crate::rs::Seat>>,
 
+    /// Where the prompt scans land the state as of rows inside a lane, when
+    /// a lane of the fire snapshots (CONTRACT-BC 16).
+    pub rs_snaps: Option<Tensor>,
+
+    /// The fire's token ids as the host wrote them, where no lane's token
+    /// is fed on the device: a gather of them reads its ids from here.
+    pub tokens_host: Option<std::sync::Arc<[i32]>>,
+
     pub group_of_lane: Option<Tensor>,
     pub packings: Vec<(poem_ir::Selection, crate::inputs::PackingHandles)>,
     pub group_masks: Vec<crate::inputs::GroupMaskHandles>,
@@ -136,22 +141,21 @@ pub struct Run<'c> {
 
     weights: &'c WeightTable,
 
-    seats: Option<&'c crate::experts::Seats>,
-
     rows: Option<&'c crate::experts::Gathered>,
 
     host: Option<&'c crate::experts::HostTier>,
 
     pump: Option<&'c crate::experts::Pump>,
 
-    stage: std::cell::RefCell<StageCache>,
-
-    /// The weight cache's row tables, their host copies by param, the pool
-    /// their slots lie in, and the ids a fire's gathers read back.
+    /// The weight cache's row tables and routed experts, their host copies
+    /// by param, the pool their slots lie in, the ids a fire's gathers read
+    /// back, and the layer whose routed experts were staged last.
     row_caches: Option<&'c crate::store::rows::RowCaches>,
-    row_planes: std::collections::BTreeMap<usize, &'c crate::experts::HostPlane>,
-    row_pool: Option<kernels_slang::Segments>,
+    expert_caches: Option<&'c crate::store::experts::ExpertCaches>,
+    cached_planes: std::collections::BTreeMap<usize, &'c crate::experts::HostPlane>,
+    cache_pool: Option<kernels_slang::Segments>,
     row_ids: std::cell::RefCell<Option<(u32, Vec<i32>)>>,
+    staged_layer: std::cell::RefCell<Option<crate::store::experts::StageKey>>,
 
     arena: &'c SlotTable,
 
@@ -178,12 +182,6 @@ pub struct Run<'c> {
     split: Option<Option<u32>>,
 }
 
-#[derive(Default)]
-pub(crate) struct StageCache {
-    key: Option<(u32, u32, u32)>,
-    unique: Vec<i32>,
-}
-
 impl<'c> Run<'c> {
     pub(crate) fn tuning(&self) -> &'c crate::tuning::Tuning {
         self.tuning
@@ -204,7 +202,6 @@ impl<'c> Run<'c> {
         place: &'c At,
         scratch: &'c Scratch,
         tuning: &'c crate::tuning::Tuning,
-        seats: Option<&'c crate::experts::Seats>,
         rows: Option<&'c crate::experts::Gathered>,
         host: Option<&'c crate::experts::HostTier>,
         pump: Option<&'c crate::experts::Pump>,
@@ -215,15 +212,15 @@ impl<'c> Run<'c> {
             values,
             nodes,
             weights,
-            seats,
             rows,
             host,
             pump,
-            stage: std::cell::RefCell::new(StageCache::default()),
             row_caches: None,
-            row_planes: std::collections::BTreeMap::new(),
-            row_pool: None,
+            expert_caches: None,
+            cached_planes: std::collections::BTreeMap::new(),
+            cache_pool: None,
             row_ids: std::cell::RefCell::new(None),
+            staged_layer: std::cell::RefCell::new(None),
             arena,
             caches,
             structs: vec![None; values.len() * windows.max_runs() as usize],
@@ -324,6 +321,17 @@ impl<'c> Run<'c> {
 
     pub(crate) fn rs_seat(&self) -> Option<std::sync::Arc<crate::rs::Seat>> {
         self.fire.rs.clone()
+    }
+
+    /// The snapshot table this window's scans read, when a lane of the fire
+    /// snapshots: its requests from the window's first lane.
+    pub(crate) fn rs_snapshots(&self) -> Option<kernels_slang::ssm::Snapshots> {
+        self.fire
+            .rs_snaps
+            .map(|table| kernels_slang::ssm::Snapshots {
+                table,
+                lane0: self.window().span.lane_offset,
+            })
     }
 
     pub(crate) fn handles(&self) -> &'c Handles {
@@ -778,6 +786,23 @@ impl<'c> Run<'c> {
         }
     }
 
+    /// Weight value `id`'s split-plane bank as the load bound it, its
+    /// planes not pumped: the scheme a tabled kernel reads it at.
+    pub(crate) fn scheme(&self, id: ValueId) -> Bank {
+        let at = id.0 as usize;
+        match &self.values[at].def {
+            Def::Weight(w) => match self.weights.0.get(*w as usize).copied().flatten() {
+                Some(WeightRow::Planes(bank)) => bank,
+                _ => {
+                    panic!("value {at} is not a split-plane bank, and a quantized select reads one")
+                }
+            },
+            _ => {
+                panic!("value {at} is not a weight, and split-plane banks live in the weight table")
+            }
+        }
+    }
+
     fn pumped(&self, plane: Tensor) -> Tensor {
         let (Some(pump), Some(host)) = (self.pump, self.host) else {
             return plane;
@@ -796,113 +821,69 @@ impl<'c> Run<'c> {
             .unwrap_or_else(|fault| panic!("weight plane {} does not pump: {fault}", plane.buf))
     }
 
-    pub(crate) fn staged(
-        &self,
-        bank: Option<Bank>,
-        bias: Option<Tensor>,
-        routes: Tensor,
-    ) -> Result<Option<Seated>, kernels_slang::Error> {
-        use crate::experts::Kind;
-        const OP: &str = "linear.expert_stage";
-        let (Some(seats), Some(host)) = (self.seats, self.host) else {
-            return Ok(None);
-        };
-        let codes = bank.and_then(|bank| host.plane(bank.codes.buf));
-        let bias_plane = bias.and_then(|b| host.plane(b.buf).map(|p| (b, p)));
-        if codes.is_none() && bias_plane.is_none() {
-            return Ok(None);
-        }
-        let fail = |detail: String| kernels_slang::Error::Backend { op: OP, detail };
-        let key = (routes.buf, routes.rows, routes.width);
-        if self.stage.borrow().key != Some(key) {
-            let n = u64::from(routes.rows) * u64::from(routes.width);
-
-            crate::probe::with_frame(Frame::flush)
-                .ok_or_else(|| fail("no frame is recording on this thread".into()))?
-                .map_err(|f| fail(f.to_string()))?;
-            let raw = self
-                .handles
-                .read(routes.buf, n * 4)
-                .map_err(|f| fail(f.to_string()))?;
-            let mut unique: Vec<i32> = Vec::new();
-            let mut seat_of: std::collections::HashMap<i32, i32> = std::collections::HashMap::new();
-            let mut seated = Vec::with_capacity(raw.len() / 4);
-            for word in raw.as_chunks::<4>().0 {
-                let e = i32::from_le_bytes([word[0], word[1], word[2], word[3]]);
-                if e < 0 {
-                    seated.push(-1);
-                    continue;
-                }
-                let seat = *seat_of.entry(e).or_insert_with(|| {
-                    unique.push(e);
-                    unique.len() as i32 - 1
-                });
-                seated.push(seat);
-            }
-            seats
-                .write_routes(&seated)
-                .map_err(|f| fail(f.to_string()))?;
-            *self.stage.borrow_mut() = StageCache {
-                key: Some(key),
-                unique,
-            };
-        }
-        let cache = self.stage.borrow();
-        let mut wanted: Vec<(Kind, Tensor, &crate::experts::HostPlane)> = Vec::with_capacity(4);
-        if let (Some(plane), Some(bank)) = (codes, bank) {
-            wanted.push((Kind::Codes, bank.codes, plane));
-            let scales = host
-                .plane(bank.scales.buf)
-                .ok_or_else(|| fail("a host-tier bank's scales are not on the host tier".into()))?;
-            wanted.push((Kind::Scales, bank.scales, scales));
-            if let Some(b) = bank.biases {
-                let biases = host.plane(b.buf).ok_or_else(|| {
-                    fail("a host-tier bank's zero points are not on the host tier".into())
-                })?;
-                wanted.push((Kind::Biases, b, biases));
-            }
-        }
-        if let Some((b, plane)) = bias_plane {
-            wanted.push((Kind::Dense, b, plane));
-        }
-        let seated = crate::probe::with_frame(|frame| {
-            seats.gather(frame, host.map(), &wanted, &cache.unique)
-        })
-        .ok_or_else(|| fail("no frame is recording on this thread".into()))?
-        .map_err(|f| fail(f.to_string()))?;
-        let mut seated = seated.into_iter();
-        let mut out_bank = bank;
-        if let (Some(out_bank), Some(bank)) = (out_bank.as_mut(), bank)
-            && codes.is_some()
-        {
-            out_bank.codes = seated.next().expect("the codes seat");
-            out_bank.scales = seated.next().expect("the scales seat");
-            if bank.biases.is_some() {
-                out_bank.biases = seated.next();
-            }
-        }
-        let out_bias = match bias_plane {
-            Some(_) => seated.next(),
-            None => bias,
-        };
-        Ok(Some((out_bank, out_bias, seats.routes(routes))))
-    }
-
-    /// This run with the weight cache's row tables: `planes` their host
-    /// copies by param, `pool` the pool their slots lie in.
+    /// This run with the weight cache's row tables and routed experts:
+    /// `planes` their host copies by param, `pool` the pool their slots
+    /// lie in.
     #[must_use]
-    pub fn with_rows(
+    pub fn with_cache(
         mut self,
         rows: &'c crate::store::rows::RowCaches,
+        experts: &'c crate::store::experts::ExpertCaches,
         planes: std::collections::BTreeMap<usize, &'c crate::experts::HostPlane>,
         pool: kernels_slang::Segments,
     ) -> Self {
         if !rows.is_empty() {
             self.row_caches = Some(rows);
-            self.row_planes = planes;
-            self.row_pool = Some(pool);
+        }
+        if !experts.is_empty() {
+            self.expert_caches = Some(experts);
+        }
+        if !rows.is_empty() || !experts.is_empty() {
+            self.cached_planes = planes;
+            self.cache_pool = Some(pool);
         }
         self
+    }
+
+    /// The expert table a routed op reading weight values `bank` and
+    /// `bias` through `routes` reads, where the weight cache streams them
+    /// (`op` names it in a fault).
+    pub(crate) fn expert_table(
+        &self,
+        op: &'static str,
+        bank: Option<ValueId>,
+        bias: Option<ValueId>,
+        routes: Tensor,
+    ) -> Result<Option<kernels_slang::linear::moe::select::ExpertTable>, kernels_slang::Error> {
+        let (Some(experts), Some(pool), Some(host)) =
+            (self.expert_caches, self.cache_pool, self.host)
+        else {
+            return Ok(None);
+        };
+        let param = |v: Option<ValueId>| {
+            v.and_then(|v| match &self.values[v.0 as usize].def {
+                Def::Weight(w) => Some(*w as usize),
+                _ => None,
+            })
+        };
+        let Some(planes) = experts.planes_of(param(bank), param(bias)) else {
+            return Ok(None);
+        };
+        experts
+            .table(
+                self.handles,
+                host,
+                &self.cached_planes,
+                planes,
+                routes,
+                (self.place.region.get(), self.place.run.get()),
+                &self.staged_layer,
+                pool,
+            )
+            .map_err(|why| kernels_slang::Error::Backend {
+                op,
+                detail: why.to_string(),
+            })
     }
 
     /// Weight value `table`'s row table where the weight cache streams it,
@@ -910,9 +891,21 @@ impl<'c> Run<'c> {
     pub(crate) fn row_table(
         &self,
         table: ValueId,
-        ids: Tensor,
+        ids_value: ValueId,
     ) -> Result<Option<kernels_slang::gather::embed::RowTable>, kernels_slang::Error> {
-        let (Some(rows), Some(pool), Some(host)) = (self.row_caches, self.row_pool, self.host)
+        let ids = self.tensor(ids_value);
+        // The fire's own token ids, this window's rows of them: the host
+        // knows them, so a miss stages without reading them back.
+        let known = match &self.values[ids_value.0 as usize].def {
+            Def::Input(RuntimeInput::Tokens) if self.window().gathered.is_none() => {
+                self.fire.tokens_host.as_deref().and_then(|tokens| {
+                    let span = self.window().span;
+                    tokens.get(span.row_offset as usize..(span.row_offset + span.rows) as usize)
+                })
+            }
+            _ => None,
+        };
+        let (Some(rows), Some(pool), Some(host)) = (self.row_caches, self.cache_pool, self.host)
         else {
             return Ok(None);
         };
@@ -920,14 +913,23 @@ impl<'c> Run<'c> {
             return Ok(None);
         };
         let param = *w as usize;
-        let Some(plane) = self.row_planes.get(&param) else {
+        let Some(plane) = self.cached_planes.get(&param) else {
             return Ok(None);
         };
-        rows.table(self.handles, host, plane, param, ids, &self.row_ids, pool)
-            .map_err(|why| kernels_slang::Error::Backend {
-                op: "gather.embed",
-                detail: why.to_string(),
-            })
+        rows.table(
+            self.handles,
+            host,
+            plane,
+            param,
+            ids,
+            known,
+            &self.row_ids,
+            pool,
+        )
+        .map_err(|why| kernels_slang::Error::Backend {
+            op: "gather.embed",
+            detail: why.to_string(),
+        })
     }
 
     pub(crate) fn gathered_table(

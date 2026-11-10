@@ -2,6 +2,7 @@
 //! row placed in the slot shapes of [`layout`], the slot refs the runtime
 //! hands out translated to the physical slots kernels address, and the
 //! copies, spills and evacuations that move slots.
+pub mod experts;
 pub mod kv;
 pub mod layout;
 pub mod pool;

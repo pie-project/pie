@@ -438,3 +438,46 @@ impl Seat {
         Ok((handle, at % span, self.page_tokens - in_page))
     }
 }
+
+/// The snapshot rows one lane lands in a fire (`Lane::rs_snapshots`):
+/// [`kernels_slang::ssm::RS_SNAPSHOTS`] where the trace holds state rows and
+/// every op that reads one is a causal conv, a gated delta or a KDA scan,
+/// whose chunked and committed arms land them; else none, and the runtime
+/// cuts a pass at each.
+#[must_use]
+pub fn snapshots(trace: &poem_ir::Trace) -> u32 {
+    use poem_ir::{Def, Operands, Operation, Ssm};
+    let state = |id: &poem_ir::ValueId| {
+        matches!(
+            trace.values.get(id.0 as usize).map(|value| &value.def),
+            Some(Def::Cache(row))
+                if matches!(trace.caches.get(*row as usize), Some(poem_ir::CacheRow::State { .. }))
+        )
+    };
+    let mut reads = Vec::new();
+    let mut any = false;
+    let lands = trace.nodes.iter().all(|node| {
+        reads.clear();
+        node.op.inputs(&mut reads);
+        if !reads.iter().any(state) {
+            return true;
+        }
+        any = true;
+        matches!(
+            &node.op,
+            Operation::Ssm(
+                Ssm::CausalConv1d { .. }
+                    | Ssm::CausalConv1dChunked { .. }
+                    | Ssm::GatedDelta { .. }
+                    | Ssm::GatedDeltaChunked { .. }
+                    | Ssm::Kda { .. }
+                    | Ssm::KdaChunked { .. },
+            )
+        )
+    });
+    if lands && any {
+        kernels_slang::ssm::RS_SNAPSHOTS
+    } else {
+        0
+    }
+}

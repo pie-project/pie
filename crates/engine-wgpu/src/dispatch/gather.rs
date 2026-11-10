@@ -43,6 +43,7 @@ impl Run<'_> {
                         pieces: pool.pieces,
                         piece_first: pool.piece_first,
                         piece_atoms: pool.piece_atoms,
+                        snapshots: None,
                     },
                     hash,
                     *eos,
@@ -86,6 +87,7 @@ impl Run<'_> {
                         pieces: pool.pieces,
                         piece_first: pool.piece_first,
                         piece_atoms: pool.piece_atoms,
+                        snapshots: None,
                     },
                     hash,
                     *eos,
@@ -114,7 +116,7 @@ impl Run<'_> {
                     self.tensor(*y),
                 ),
                 // A table the weight cache streams by its rows.
-                None if let Some(rows) = self.row_table(*table, self.tensor(*ids))? => {
+                None if let Some(rows) = self.row_table(*table, *ids)? => {
                     kernels_slang::gather::embed::embed_tabled(
                         self.ctx,
                         self.tensor(*ids),

@@ -107,7 +107,12 @@ pub fn fixture_in(
     let trace = package
         .trace(model, &deploy, model, Platform::Wgpu)
         .unwrap_or_else(|why| panic!("`{model}` traces: {why:#}"));
-    let dir = std::env::temp_dir().join(format!("pie-wgpu-pool-{}", std::process::id()));
+    // `$PIE_WGPU_FIXTURES` keeps the written checkpoints across runs (they
+    // are written from the trace alone, the same bits every time).
+    let dir = std::env::var_os("PIE_WGPU_FIXTURES").map_or_else(
+        || std::env::temp_dir().join(format!("pie-wgpu-pool-{}", std::process::id())),
+        PathBuf::from,
+    );
     std::fs::create_dir_all(&dir).expect("the fixture dir");
     let container = dir.join(format!("{model}{variant}-{}.zt", layers.unwrap_or(0)));
     if !container.exists() {

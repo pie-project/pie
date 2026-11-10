@@ -18,6 +18,10 @@
 // state in `work` (a lane's), and the slot takes the state as of row
 // `commit[lane0 + r]`.
 //
+// `PIE_SNAPS` (with either of the last two): a request's lane also lands
+// the state as of up to `PIE_RS_SNAPSHOTS` rows inside it in records of
+// their own (`prim/pool.slang`, CONTRACT-BC 16).
+//
 // `PIE_DK_REG` holds a lane's state row in registers, for `k_dim ==
 // PIE_DK_REG` and `v_dim <= PIE_GROUP_X`; without it the state is walked in
 // memory. The `subgroup` tier folds the norms through subgroups.
@@ -33,7 +37,12 @@
 [[vk::binding(5)]] StructuredBuffer<float> gates;
 [[vk::binding(6)]] RWStructuredBuffer<float> work;
 [[vk::binding(7)]] RWStructuredBuffer<float> y;
+#if defined(PIE_SNAPS)
+[[vk::binding(8)]] StructuredBuffer<int> pie_snaps;
+#define SEGMENTS_AT 9
+#else
 #define SEGMENTS_AT 8
+#endif
 #define STATE work
 #elif defined(PIE_CHUNKED)
 [[vk::binding(0)]] StructuredBuffer<uint> qkv;
@@ -41,7 +50,12 @@
 [[vk::binding(2)]] StructuredBuffer<float> gates;
 [[vk::binding(3)]] StructuredBuffer<uint> slots;
 [[vk::binding(4)]] RWStructuredBuffer<float> y;
+#if defined(PIE_SNAPS)
+[[vk::binding(5)]] StructuredBuffer<int> pie_snaps;
+#define SEGMENTS_AT 6
+#else
 #define SEGMENTS_AT 5
+#endif
 #define STATE rstate
 #else
 [[vk::binding(0)]] StructuredBuffer<uint> qkv;
@@ -69,6 +83,9 @@ struct Params {
     int v_heads;
     int k_dim;
     int v_dim;
+#if defined(PIE_SNAPS)
+    int snap_lane0;
+#endif
 };
 PIE_PARAMS(PARAMS_AT, Params, params);
 PIE_POOL_READ(float, params.seg_words)
@@ -76,6 +93,9 @@ PIE_POOL_WRITE(float, params.seg_words)
 PIE_POOL_VIEW(rstate, float, params.state_origin)
 
 PIE_STATE_PIECES
+#if defined(PIE_SNAPS)
+PIE_STATE_SNAPSHOTS
+#endif
 
 // Where value head `hv`'s state starts in the record of `slots` entry `at`.
 uint state_at(uint at, uint hv, uint head) {
@@ -183,6 +203,29 @@ void reg_store(uint tid, uint base) {
 }
 #endif
 
+#if defined(PIE_SNAPS)
+// The next snapshot of lane `snap` from `n` on: its row, 0 past the last.
+int snap_next(int snap, uint n) {
+    int at = pie_snap_row(snap, n);
+    return at > 0 ? at : 0;
+}
+
+#if !defined(PIE_DK_REG)
+// This lane's cells of the head state at `from` (in `STATE`) into the same
+// cells of snapshot `n` of lane `snap`: the cells it walks, so no other
+// lane's writes are read.
+void snap_cells(uint tid, uint from, int snap, uint n, uint hv, uint head) {
+    uint dk = uint(params.k_dim);
+    uint into = pie_snap_atom(uint(snap), n, hv, head);
+    for (uint c = tid; c < uint(params.v_dim); c += uint(PIE_GROUP_X)) {
+        for (uint i = 0; i < dk; i++) {
+            rstate[into + c * dk + i] = STATE[from + c * dk + i];
+        }
+    }
+}
+#endif
+#endif
+
 [shader("compute")]
 [numthreads(PIE_GROUP_X, 1, 1)]
 void main(uint3 group : SV_GroupID, uint3 local : SV_GroupThreadID) {
@@ -220,6 +263,11 @@ void main(uint3 group : SV_GroupID, uint3 local : SV_GroupThreadID) {
         return;
     }
     uint bank = state_at(lane, hv, head);
+#if defined(PIE_SNAPS)
+    int snap = pie_snap_lane(r);
+    uint snapped = 0u;
+    int snap_at = snap_next(snap, 0u);
+#endif
 #if defined(PIE_DK_REG)
     reg_load(tid, bank);
     for (int t = 0; t < span; t++) {
@@ -227,6 +275,13 @@ void main(uint3 group : SV_GroupID, uint3 local : SV_GroupThreadID) {
         if (t + 1 == keep) {
             reg_store(tid, bank);
         }
+#if defined(PIE_SNAPS)
+        if (t + 1 == snap_at) {
+            reg_store(tid, pie_snap_atom(uint(snap), snapped, hv, head));
+            snapped++;
+            snap_at = snap_next(snap, snapped);
+        }
+#endif
     }
 #else
     uint state_base = (lane * uint(params.v_heads) + hv) * head;
@@ -245,6 +300,13 @@ void main(uint3 group : SV_GroupID, uint3 local : SV_GroupThreadID) {
                 }
             }
         }
+#if defined(PIE_SNAPS)
+        if (t + 1 == snap_at) {
+            snap_cells(tid, state_base, snap, snapped, hv, head);
+            snapped++;
+            snap_at = snap_next(snap, snapped);
+        }
+#endif
     }
 #endif
 #elif defined(PIE_CHUNKED)
@@ -260,11 +322,27 @@ void main(uint3 group : SV_GroupID, uint3 local : SV_GroupThreadID) {
         return;
     }
     uint state_base = state_at(uint(begin), hv, head);
+#if defined(PIE_SNAPS)
+    int snap = pie_snap_lane(r);
+    uint snapped = 0u;
+    int snap_at = snap_next(snap, 0u);
+#endif
 #if defined(PIE_DK_REG)
     reg_load(tid, state_base);
 #endif
     for (int t = begin; t < end; t++) {
         token(tid, uint(t), hv, hk, state_base);
+#if defined(PIE_SNAPS)
+        if (t - begin + 1 == snap_at) {
+#if defined(PIE_DK_REG)
+            reg_store(tid, pie_snap_atom(uint(snap), snapped, hv, head));
+#else
+            snap_cells(tid, state_base, snap, snapped, hv, head);
+#endif
+            snapped++;
+            snap_at = snap_next(snap, snapped);
+        }
+#endif
     }
 #if defined(PIE_DK_REG)
     reg_store(tid, state_base);
@@ -293,3 +371,11 @@ void main(uint3 group : SV_GroupID, uint3 local : SV_GroupThreadID) {
 // pie:instantiate ssm_gdn_recurrent_r128_bf16 PIE_GROUP_X=128 PIE_DK_REG=128 PIE_TIER=subgroup PIE_TARGET=spirv
 // pie:instantiate ssm_gdn_recurrent_chunked_r128_bf16 PIE_GROUP_X=128 PIE_CHUNKED=1 PIE_DK_REG=128 PIE_TIER=subgroup PIE_TARGET=spirv
 // pie:instantiate ssm_gdn_recurrent_committed_r128_bf16 PIE_GROUP_X=128 PIE_COMMITTED=1 PIE_DK_REG=128 PIE_TIER=subgroup PIE_TARGET=spirv
+// pie:instantiate ssm_gdn_recurrent_chunked_snap_bf16 PIE_GROUP_X=128 PIE_CHUNKED=1 PIE_SNAPS=1
+// pie:instantiate ssm_gdn_recurrent_committed_snap_bf16 PIE_GROUP_X=128 PIE_COMMITTED=1 PIE_SNAPS=1
+// pie:instantiate ssm_gdn_recurrent_chunked_snap_r128_bf16 PIE_GROUP_X=128 PIE_CHUNKED=1 PIE_DK_REG=128 PIE_SNAPS=1
+// pie:instantiate ssm_gdn_recurrent_committed_snap_r128_bf16 PIE_GROUP_X=128 PIE_COMMITTED=1 PIE_DK_REG=128 PIE_SNAPS=1
+// pie:instantiate ssm_gdn_recurrent_chunked_snap_bf16 PIE_GROUP_X=128 PIE_CHUNKED=1 PIE_SNAPS=1 PIE_TIER=subgroup PIE_TARGET=spirv
+// pie:instantiate ssm_gdn_recurrent_committed_snap_bf16 PIE_GROUP_X=128 PIE_COMMITTED=1 PIE_SNAPS=1 PIE_TIER=subgroup PIE_TARGET=spirv
+// pie:instantiate ssm_gdn_recurrent_chunked_snap_r128_bf16 PIE_GROUP_X=128 PIE_CHUNKED=1 PIE_DK_REG=128 PIE_SNAPS=1 PIE_TIER=subgroup PIE_TARGET=spirv
+// pie:instantiate ssm_gdn_recurrent_committed_snap_r128_bf16 PIE_GROUP_X=128 PIE_COMMITTED=1 PIE_DK_REG=128 PIE_SNAPS=1 PIE_TIER=subgroup PIE_TARGET=spirv

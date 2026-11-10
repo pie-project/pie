@@ -154,3 +154,131 @@ fn a_row_table_serves_the_same_logits_whatever_is_resident() {
 fn row_tables_sharing_atoms_serve_the_same_logits_whatever_is_resident() {
     every_residency("gemma4-e4b-mini-l6", None);
 }
+
+/// The miss path's cost (not a check; `--ignored`, a release build): decode
+/// throughput of `lanes` lanes over `steps` fires with every block resident
+/// (no fire flushes or stages) against every other block and none
+/// (`$PIE_PLE_MODEL`, default gemma4-e4b-mini-l6; `$PIE_PLE_LANES`, 2).
+#[test]
+#[ignore = "a measurement: run it alone, in release"]
+fn the_miss_path_costs_this_much_decode_throughput() {
+    use crate::model_logits::{PAGE, argmax, load_with, word};
+    use engine_wgpu::Lane;
+    use engine_wgpu::serve::Seated;
+    let model = std::env::var("PIE_PLE_MODEL").unwrap_or_else(|_| "gemma4-e4b-mini-l6".into());
+    let lanes: usize = std::env::var("PIE_PLE_LANES").map_or(2, |n| n.parse().expect("a count"));
+    const STEPS: usize = 192;
+    let fixture = fixture(&model, None);
+    let rounds: usize = std::env::var("PIE_PLE_ROUNDS").map_or(3, |n| n.parse().expect("a count"));
+    let order = [Held::All, Held::Half, Held::None];
+    let mut best = [f64::MAX; 3];
+    for (at, held) in order.iter().copied().cycle().take(3 * rounds).enumerate() {
+        let Some(mut shell) = load_with(
+            &fixture,
+            PAGE,
+            512,
+            None,
+            engine::load::Residency::default(),
+        ) else {
+            return;
+        };
+        let facts = shell.pool_chunk_facts();
+        let segment = facts.segment_chunks;
+        let first = (1 + shell.pool_layout().seat_chunks()).div_ceil(segment) * segment;
+        let mut next = first;
+        let mut resident = Vec::new();
+        for shape in &facts.weights {
+            let per = shape.slots_per_chunk;
+            for atom in 0..shape.count {
+                let keep = match held {
+                    Held::None => false,
+                    Held::Half => atom % 2 == 0,
+                    Held::All => true,
+                };
+                if keep {
+                    resident.push(ResidentWeight {
+                        atom: WeightAtom {
+                            shape: shape.id,
+                            atom,
+                        },
+                        slot: (next + atom / per) * per + atom % per,
+                    });
+                }
+            }
+            next += shape.count.div_ceil(per);
+        }
+        shell
+            .commit_segments((next + 1).div_ceil(segment))
+            .expect("the segments commit");
+        shell
+            .weight_residency(&WeightResidency {
+                staging: Vec::new(),
+                resident,
+                held: held == Held::All,
+            })
+            .expect("the residency lands");
+        let trace = &fixture.trace;
+        let mut fed: Vec<Vec<u32>> = (0..lanes)
+            .map(|l| {
+                (0..64u32)
+                    .map(|at| (at * 37 + 11 + l as u32 * 7) % 256)
+                    .collect()
+            })
+            .collect();
+        let mut have = vec![0u32; lanes];
+        for lane in 0..lanes {
+            let got = shell
+                .fire_seated(&[Seated {
+                    held: Some(have[lane]),
+                    ..Seated::of(Lane {
+                        slot: lane as u32,
+                        word: word(trace, fed[lane].len() as u32),
+                        tokens: &fed[lane],
+                    })
+                }])
+                .expect("the prefill lands");
+            have[lane] += fed[lane].len() as u32;
+            fed[lane] = vec![argmax(&got[0])];
+        }
+        let fire =
+            |shell: &mut engine_wgpu::Shell, fed: &mut Vec<Vec<u32>>, have: &mut Vec<u32>| {
+                let seated: Vec<Seated<'_>> = (0..lanes)
+                    .map(|lane| Seated {
+                        held: Some(have[lane]),
+                        ..Seated::of(Lane {
+                            slot: lane as u32,
+                            word: word(trace, 1),
+                            tokens: &fed[lane],
+                        })
+                    })
+                    .collect();
+                let got = shell.fire_seated(&seated).expect("the decode lands");
+                for lane in 0..lanes {
+                    have[lane] += 1;
+                    fed[lane] = vec![argmax(&got[lane])];
+                }
+            };
+        for _ in 0..8 {
+            fire(&mut shell, &mut fed, &mut have);
+        }
+        let started = std::time::Instant::now();
+        for _ in 0..STEPS {
+            fire(&mut shell, &mut fed, &mut have);
+        }
+        let took = started.elapsed();
+        best[at % 3] = best[at % 3].min(took.as_secs_f64());
+        eprintln!(
+            "{model}: {held:?} resident, {lanes} lanes: {STEPS} decode fires in {took:?}: \
+             {:.1} tok/s, {:.2} ms a fire",
+            (STEPS * lanes) as f64 / took.as_secs_f64(),
+            took.as_secs_f64() * 1e3 / STEPS as f64
+        );
+    }
+    for (held, took) in order.iter().zip(best) {
+        eprintln!(
+            "{model}: {held:?} resident, {lanes} lanes, best of {rounds}: {:.1} tok/s, {:.3} ms a fire",
+            (STEPS * lanes) as f64 / took,
+            took * 1e3 / STEPS as f64
+        );
+    }
+}

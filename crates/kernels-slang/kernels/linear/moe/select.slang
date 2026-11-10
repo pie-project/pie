@@ -9,6 +9,9 @@
 #if !defined(PIE_WGSL)
 #include "prim/slot16.slang"
 #endif
+#if defined(PIE_TABLED)
+#include "prim/experts.slang"
+#endif
 
 // Routed matmuls one route at a time (`linear.moe_select`, its bias
 // and quantized forms): a workgroup lands eight output rows of one route,
@@ -20,6 +23,12 @@
 // scales a slot at a time and lands a value a 16-bit slot; WGSL reads words
 // and lands a value into its word with atomics, as neighbouring rows of a
 // word belong to different strips.
+//
+// `PIE_TABLED`: the bank is read through the weight cache's expert table
+// (`prim/experts.slang`): each plane of the expert from `origin_*` words
+// into its slot, the same elements in the same order as the contiguous
+// bank's, so the same bits land. A route counts a use of its expert where
+// `count` is set (a layer's first bank).
 
 #define PIE_LANES 32u
 #define PIE_ROWS 8u
@@ -30,6 +39,17 @@ struct Params {
     int x_slot_stride;
     int x_row_stride;
     int slots_per_row;
+#if defined(PIE_TABLED)
+    uint seg_words;
+    uint unit_words;
+    uint atom_words;
+    uint atom_first;
+    uint origin_w;
+    uint origin_s;
+    uint origin_b;
+    uint origin_bias;
+    uint count;
+#endif
 };
 
 #if !defined(PIE_WGSL)
@@ -42,7 +62,17 @@ struct Params {
 #define PIE_CHUNK (32u / uint(PIE_BITS))
 #endif
 
-#if defined(PIE_DENSE)
+#if defined(PIE_TABLED)
+#if defined(PIE_MXFP4)
+[[vk::binding(0)]] StructuredBuffer<uint> x2;
+#else
+PIE_SLOTS_RO(0, x);
+#endif
+PIE_SLOTS_RW(1, y);
+[[vk::binding(2)]] StructuredBuffer<int> expert_ids;
+PIE_EXPERT_TABLE(3)
+PIE_PARAMS(11, Params, params);
+#elif defined(PIE_DENSE)
 PIE_SLOTS_RO(0, bank);
 PIE_SLOTS_RO(1, x);
 PIE_SLOTS_RW(2, y);
@@ -71,7 +101,39 @@ float chunk_dot(uint e, uint out_row, uint k, uint x_base) {
     uint in_size = uint(params.in_vec_size);
     uint out_size = uint(params.out_vec_size);
     float acc = 0.0;
-#if defined(PIE_DENSE)
+#if defined(PIE_TABLED) && defined(PIE_DENSE)
+    uint at = out_row * in_size + k;
+    [ForceUnroll] for (uint j = 0u; j < PIE_CHUNK; j++) {
+        acc += slot_at(x, x_base + k + j) * pie_xt_bf16(params.origin_w, at + j);
+    }
+#elif defined(PIE_TABLED) && defined(PIE_MXFP4)
+    uint blocks_per_row = in_size / 32u;
+    uint at = out_row * blocks_per_row + k / 32u;
+    uint ws[4] = { pie_xt_word(params.origin_w + 4u * at), pie_xt_word(params.origin_w + 4u * at + 1u),
+                   pie_xt_word(params.origin_w + 4u * at + 2u), pie_xt_word(params.origin_w + 4u * at + 3u) };
+    float scale = mxfp4_block_scale(pie_xt_byte(params.origin_s, at));
+    uint xb = (x_base + k) / 2u;
+    [ForceUnroll] for (uint wi = 0u; wi < 4u; wi++) {
+        [ForceUnroll] for (uint p = 0u; p < 4u; p++) {
+            uint pair = x2[xb + wi * 4u + p];
+            acc += asfloat(pair << 16u) * mxfp4_code((ws[wi] >> (8u * p)) & 0xfu);
+            acc += asfloat(pair & 0xffff0000u) * mxfp4_code((ws[wi] >> (8u * p + 4u)) & 0xfu);
+        }
+    }
+    acc *= scale;
+#elif defined(PIE_TABLED)
+    uint words_per_row = in_size / PIE_CHUNK;
+    uint word = pie_xt_word(params.origin_w + out_row * words_per_row + k / PIE_CHUNK);
+    uint groups_per_row = in_size / uint(PIE_GROUP);
+    uint sg = out_row * groups_per_row + k / uint(PIE_GROUP);
+    float scale = pie_xt_bf16(params.origin_s, sg);
+    float zero = pie_xt_bf16(params.origin_b, sg);
+    float xs[32 / PIE_BITS];
+    [ForceUnroll] for (uint j = 0u; j < PIE_CHUNK; j++) {
+        xs[j] = slot_at(x, x_base + k + j);
+    }
+    acc = affine_word_dot(word, xs, scale, zero);
+#elif defined(PIE_DENSE)
     uint at = (e * out_size + out_row) * in_size + k;
     [ForceUnroll] for (uint j = 0u; j < PIE_CHUNK; j++) {
         acc += slot_at(x, x_base + k + j) * slot_at(bank, at + j);
@@ -125,6 +187,12 @@ void main(uint3 group: SV_GroupID, uint3 local: SV_GroupThreadID) {
     if (expert < 0) return;
     uint e = uint(expert);
     uint x_base = row * uint(params.x_row_stride) + slot * uint(params.x_slot_stride);
+#if defined(PIE_TABLED)
+    pie_xt_at(e, params.atom_first, params.seg_words, params.unit_words, params.atom_words);
+    if (params.count != 0u && block == 0u && lane == 0u && local_out == 0u) {
+        pie_xt_count(e, params.atom_first);
+    }
+#endif
 
     float acc = 0.0;
     if (active_out) {
@@ -141,7 +209,9 @@ void main(uint3 group: SV_GroupID, uint3 local: SV_GroupThreadID) {
     }
     if (lane == 0u && active_out) {
         acc = partial[local_out][0];
-#if defined(PIE_BIASED)
+#if defined(PIE_BIASED) && defined(PIE_TABLED)
+        acc += pie_xt_bf16(params.origin_bias, out_row);
+#elif defined(PIE_BIASED)
         acc += slot_at(bias, e * out_size + out_row);
 #endif
         slot_put(y, sel * out_size + out_row, acc);
@@ -158,7 +228,13 @@ void main(uint3 group: SV_GroupID, uint3 local: SV_GroupThreadID) {
 #define PIE_CHUNK (32u / uint(PIE_BITS))
 #endif
 
-#if defined(PIE_DENSE)
+#if defined(PIE_TABLED)
+[[vk::binding(0)]] StructuredBuffer<uint> x;
+[[vk::binding(1)]] RWStructuredBuffer<Atomic<uint>> y;
+[[vk::binding(2)]] StructuredBuffer<int> expert_ids;
+PIE_EXPERT_TABLE(3)
+PIE_PARAMS(11, Params, params);
+#elif defined(PIE_DENSE)
 [[vk::binding(0)]] StructuredBuffer<uint> bank;
 [[vk::binding(1)]] StructuredBuffer<uint> x;
 [[vk::binding(2)]] RWStructuredBuffer<Atomic<uint>> y;
@@ -212,7 +288,34 @@ float chunk_dot(uint e, uint out_row, uint k, uint x_base) {
     uint in_size = uint(params.in_vec_size);
     uint out_size = uint(params.out_vec_size);
     float acc = 0.0;
-#if defined(PIE_DENSE)
+#if defined(PIE_TABLED) && defined(PIE_DENSE)
+    uint at = out_row * in_size + k;
+    for (uint j = 0u; j < PIE_CHUNK; j++) {
+        acc += load_x(x_base, k + j) * pie_xt_bf16(params.origin_w, at + j);
+    }
+#elif defined(PIE_TABLED) && defined(PIE_MXFP4)
+    uint words_per_row = in_size / 8u;
+    uint word = pie_xt_word(params.origin_w + out_row * words_per_row + k / 8u);
+    uint groups_per_row = in_size / uint(PIE_MXFP4_BLOCK);
+    uint sg = out_row * groups_per_row + k / uint(PIE_MXFP4_BLOCK);
+    float scale = mxfp4_block_scale(pie_xt_byte(params.origin_s, sg));
+    for (uint j = 0u; j < 8u; j++) {
+        acc += load_x(x_base, k + j) * mxfp4_code_of(word, j);
+    }
+    acc *= scale;
+#elif defined(PIE_TABLED)
+    uint words_per_row = in_size / PIE_CHUNK;
+    uint word = pie_xt_word(params.origin_w + out_row * words_per_row + k / PIE_CHUNK);
+    uint groups_per_row = in_size / uint(PIE_GROUP);
+    uint sg = out_row * groups_per_row + k / uint(PIE_GROUP);
+    float scale = pie_xt_bf16(params.origin_s, sg);
+    float zero = pie_xt_bf16(params.origin_b, sg);
+    float xs[32 / PIE_BITS];
+    for (uint j = 0u; j < PIE_CHUNK; j++) {
+        xs[j] = load_x(x_base, k + j);
+    }
+    acc = affine_word_dot(word, xs, scale, zero);
+#elif defined(PIE_DENSE)
     uint at = (e * out_size + out_row) * in_size + k;
     for (uint j = 0u; j < PIE_CHUNK; j++) {
         acc += load_x(x_base, k + j) * bf16_at(bank, at + j);
@@ -261,6 +364,12 @@ void main(uint3 group: SV_GroupID, uint3 local: SV_GroupThreadID) {
     bool routed = expert >= 0;
     uint e = uint(max(expert, 0));
     uint x_base = row * uint(params.x_row_stride) + slot * uint(params.x_slot_stride);
+#if defined(PIE_TABLED)
+    pie_xt_at(e, params.atom_first, params.seg_words, params.unit_words, params.atom_words);
+    if (routed && params.count != 0u && block == 0u && lane == 0u && local_out == 0u) {
+        pie_xt_count(e, params.atom_first);
+    }
+#endif
 #if defined(PIE_SUBGROUP)
     uint x_words = (in_size + 1u) >> 1;
     bool staged = x_words <= PIE_XS_WORDS && (x_base & 1u) == 0u;
@@ -299,7 +408,9 @@ void main(uint3 group: SV_GroupID, uint3 local: SV_GroupThreadID) {
     float out = partial[local_out][0];
 #endif
     if (lane == 0u && active_out && routed) {
-#if defined(PIE_BIASED)
+#if defined(PIE_BIASED) && defined(PIE_TABLED)
+        out += pie_xt_bf16(params.origin_bias, out_row);
+#elif defined(PIE_BIASED)
         out += bf16_at(bias, e * out_size + out_row);
 #endif
         store_y(sel * out_size + out_row, out);
@@ -334,3 +445,29 @@ void main(uint3 group: SV_GroupID, uint3 local: SV_GroupThreadID) {
 // pie:instantiate linear_moe_select_affine_bf16_gs_128_b_2 PIE_GROUP=128 PIE_BITS=2 PIE_TIER=subgroup PIE_TARGET=wgsl
 // pie:instantiate linear_moe_select_affine_bias_bf16_gs_128_b_2 PIE_GROUP=128 PIE_BITS=2 PIE_BIASED=1 PIE_TIER=subgroup PIE_TARGET=wgsl
 // pie:instantiate linear_moe_select_dense_bf16 PIE_DENSE=1 PIE_TIER=subgroup PIE_TARGET=wgsl
+// pie:instantiate linear_moe_select_tabled_mxfp4_bf16_gs_32_b_4 PIE_MXFP4=1 PIE_TABLED=1
+// pie:instantiate linear_moe_select_tabled_mxfp4_bias_bf16_gs_32_b_4 PIE_MXFP4=1 PIE_TABLED=1 PIE_BIASED=1
+// pie:instantiate linear_moe_select_tabled_affine_bf16_gs_64_b_4 PIE_GROUP=64 PIE_TABLED=1 PIE_BITS=4
+// pie:instantiate linear_moe_select_tabled_affine_bias_bf16_gs_64_b_4 PIE_GROUP=64 PIE_TABLED=1 PIE_BITS=4 PIE_BIASED=1
+// pie:instantiate linear_moe_select_tabled_affine_bf16_gs_64_b_8 PIE_GROUP=64 PIE_TABLED=1 PIE_BITS=8
+// pie:instantiate linear_moe_select_tabled_affine_bias_bf16_gs_64_b_8 PIE_GROUP=64 PIE_TABLED=1 PIE_BITS=8 PIE_BIASED=1
+// pie:instantiate linear_moe_select_tabled_affine_bf16_gs_64_b_2 PIE_GROUP=64 PIE_TABLED=1 PIE_BITS=2
+// pie:instantiate linear_moe_select_tabled_affine_bias_bf16_gs_64_b_2 PIE_GROUP=64 PIE_TABLED=1 PIE_BITS=2 PIE_BIASED=1
+// pie:instantiate linear_moe_select_tabled_affine_bf16_gs_32_b_2 PIE_GROUP=32 PIE_TABLED=1 PIE_BITS=2
+// pie:instantiate linear_moe_select_tabled_affine_bias_bf16_gs_32_b_2 PIE_GROUP=32 PIE_TABLED=1 PIE_BITS=2 PIE_BIASED=1
+// pie:instantiate linear_moe_select_tabled_affine_bf16_gs_128_b_2 PIE_GROUP=128 PIE_TABLED=1 PIE_BITS=2
+// pie:instantiate linear_moe_select_tabled_affine_bias_bf16_gs_128_b_2 PIE_GROUP=128 PIE_TABLED=1 PIE_BITS=2 PIE_BIASED=1
+// pie:instantiate linear_moe_select_tabled_dense_bf16 PIE_DENSE=1 PIE_TABLED=1
+// pie:instantiate linear_moe_select_tabled_mxfp4_bf16_gs_32_b_4 PIE_MXFP4=1 PIE_TABLED=1 PIE_TIER=subgroup PIE_TARGET=wgsl
+// pie:instantiate linear_moe_select_tabled_mxfp4_bias_bf16_gs_32_b_4 PIE_MXFP4=1 PIE_TABLED=1 PIE_BIASED=1 PIE_TIER=subgroup PIE_TARGET=wgsl
+// pie:instantiate linear_moe_select_tabled_affine_bf16_gs_64_b_4 PIE_GROUP=64 PIE_TABLED=1 PIE_BITS=4 PIE_TIER=subgroup PIE_TARGET=wgsl
+// pie:instantiate linear_moe_select_tabled_affine_bias_bf16_gs_64_b_4 PIE_GROUP=64 PIE_TABLED=1 PIE_BITS=4 PIE_BIASED=1 PIE_TIER=subgroup PIE_TARGET=wgsl
+// pie:instantiate linear_moe_select_tabled_affine_bf16_gs_64_b_8 PIE_GROUP=64 PIE_TABLED=1 PIE_BITS=8 PIE_TIER=subgroup PIE_TARGET=wgsl
+// pie:instantiate linear_moe_select_tabled_affine_bias_bf16_gs_64_b_8 PIE_GROUP=64 PIE_TABLED=1 PIE_BITS=8 PIE_BIASED=1 PIE_TIER=subgroup PIE_TARGET=wgsl
+// pie:instantiate linear_moe_select_tabled_affine_bf16_gs_64_b_2 PIE_GROUP=64 PIE_TABLED=1 PIE_BITS=2 PIE_TIER=subgroup PIE_TARGET=wgsl
+// pie:instantiate linear_moe_select_tabled_affine_bias_bf16_gs_64_b_2 PIE_GROUP=64 PIE_TABLED=1 PIE_BITS=2 PIE_BIASED=1 PIE_TIER=subgroup PIE_TARGET=wgsl
+// pie:instantiate linear_moe_select_tabled_affine_bf16_gs_32_b_2 PIE_GROUP=32 PIE_TABLED=1 PIE_BITS=2 PIE_TIER=subgroup PIE_TARGET=wgsl
+// pie:instantiate linear_moe_select_tabled_affine_bias_bf16_gs_32_b_2 PIE_GROUP=32 PIE_TABLED=1 PIE_BITS=2 PIE_BIASED=1 PIE_TIER=subgroup PIE_TARGET=wgsl
+// pie:instantiate linear_moe_select_tabled_affine_bf16_gs_128_b_2 PIE_GROUP=128 PIE_TABLED=1 PIE_BITS=2 PIE_TIER=subgroup PIE_TARGET=wgsl
+// pie:instantiate linear_moe_select_tabled_affine_bias_bf16_gs_128_b_2 PIE_GROUP=128 PIE_TABLED=1 PIE_BITS=2 PIE_BIASED=1 PIE_TIER=subgroup PIE_TARGET=wgsl
+// pie:instantiate linear_moe_select_tabled_dense_bf16 PIE_DENSE=1 PIE_TABLED=1 PIE_TIER=subgroup PIE_TARGET=wgsl

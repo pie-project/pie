@@ -183,6 +183,10 @@ pub struct Seated<'a> {
 
     pub rs_slot: Option<u32>,
 
+    /// Rows inside the lane whose state the fire lands in records of their
+    /// own (CONTRACT-BC 16; `Lane::rs_snapshots`).
+    pub rs_snapshots: &'a [engine::fire::RsSnapshot],
+
     /// Whether `pages`, `record` and the rs verb's pages are slot refs the
     /// runtime names; otherwise the lane is seat-addressed (a direct fire):
     /// its seat's runs in the pool.
@@ -230,6 +234,7 @@ impl<'a> Seated<'a> {
             rs: &FOLD,
             rs_reset: engine::fire::RsReset::Inferred,
             rs_slot: None,
+            rs_snapshots: &[],
             refs: false,
             windows: &[],
             record: None,
@@ -361,6 +366,8 @@ pub struct Shell {
     pools: Pools,
     /// The weight cache's row tables (PLE), streamed through pool slots.
     row_caches: crate::store::rows::RowCaches,
+    /// The weight cache's routed experts, streamed through pool slots.
+    expert_caches: crate::store::experts::ExpertCaches,
 
     scratch: Scratch,
 
@@ -416,6 +423,8 @@ pub struct Shell {
     held: Vec<u32>,
 
     rs_layout: Option<std::sync::Arc<crate::rs::Layout>>,
+    /// The snapshot table a fire whose lanes snapshot binds (CONTRACT-BC 16).
+    snaps: Option<Buffer>,
 
     rs_buffers: Option<crate::rs::Buffers>,
 
@@ -552,9 +561,19 @@ impl Shell {
             &recipe,
             &crate::store::rows::streamed(&boot.trace),
         )?;
+        // Every routed bank streams an expert at a time through weight
+        // slots of the pool; the banks stay on the host.
+        let expert_shapes = crate::store::experts::ExpertShape::of(
+            &boot.trace,
+            &recipe,
+            &crate::store::experts::streamed(&boot.trace),
+            crate::store::rows::WEIGHTS + u32::try_from(row_shapes.len()).unwrap_or(u32::MAX),
+            boot.budget.max_tokens,
+        )?;
         let streamed: Vec<usize> = row_shapes
             .iter()
             .flat_map(|shape| shape.tables.iter().map(|table| table.param))
+            .chain(expert_shapes.iter().flat_map(|shape| shape.params()))
             .collect();
         let page_size = if rows.tokens > 0 {
             rows.tokens
@@ -941,6 +960,8 @@ impl Shell {
         let mut pools = Pools::reserve(&device, rows, layout, paging, host_chunks)?;
         let row_caches =
             crate::store::rows::RowCaches::new(&device, row_shapes, boot.budget.max_tokens, chunk)?;
+        let expert_caches =
+            crate::store::experts::ExpertCaches::new(&device, expert_shapes, chunk)?;
         // The null chunk's segment stands from the load on.
         pools.commit_segments(&device, 1)?;
         let rs_buffers =
@@ -949,13 +970,12 @@ impl Shell {
         let adapter_fact = adapter_fact(&compiled.classes, &corrected);
         let adapter_slots = crate::adapter::Slots::new(weights.adapter_seats());
 
-        let weights_stream = weights.streams()
-            || weights.seats().is_some()
-            || weights.gathered().is_some()
-            || weights.pump().is_some();
-        // Recorded fires replay no staging: a row table records once every
-        // block of it is resident ([`Shell::weight_residency`]).
-        let rows_stream = !row_caches.is_empty();
+        let weights_stream =
+            weights.streams() || weights.gathered().is_some() || weights.pump().is_some();
+        // Recorded fires replay no staging: the weight cache records once
+        // every row block and expert of it is resident
+        // ([`Shell::weight_residency`]).
+        let rows_stream = !row_caches.is_empty() || !expert_caches.is_empty();
 
         Ok(Shell {
             tuning,
@@ -969,6 +989,7 @@ impl Shell {
             arena,
             pools,
             row_caches,
+            expert_caches,
             scratch,
             inputs,
             readout,
@@ -998,6 +1019,7 @@ impl Shell {
             blobs: crate::blob::Store::new(),
             held: vec![0; slots as usize],
             rs_layout,
+            snaps: None,
             rs_buffers,
             rs_scratch: None,
             out,
@@ -1020,7 +1042,7 @@ impl Shell {
             recorder: if weights_stream {
                 crate::record::Recorder::refusing("the weights plane streams")
             } else if rows_stream {
-                crate::record::Recorder::refusing("a row table is not wholly resident")
+                crate::record::Recorder::refusing("the weight cache is not wholly resident")
             } else {
                 crate::record::Recorder::new()
             },
@@ -1144,7 +1166,12 @@ impl Shell {
     #[must_use]
     pub fn pool_chunk_facts(&self) -> engine::chunk::ChunkFacts {
         engine::chunk::ChunkFacts {
-            weights: self.row_caches.facts(),
+            weights: self
+                .row_caches
+                .facts()
+                .into_iter()
+                .chain(self.expert_caches.facts())
+                .collect(),
             ..self.pools.chunk_facts()
         }
     }
@@ -1153,21 +1180,44 @@ impl Shell {
     /// the host before the next fire, every block's entry rewritten.
     pub fn weight_residency(&mut self, residency: &engine::chunk::WeightResidency) -> Result<()> {
         self.drain()?;
-        if self.row_caches.is_empty() {
+        if self.row_caches.is_empty() && self.expert_caches.is_empty() {
             return Ok(());
         }
         let host = self.weights.host().ok_or_else(|| Fault::Unbound {
-            what: "the host copy of the row tables".to_string(),
+            what: "the host copy of the weight cache's tables and banks".to_string(),
         })?;
-        let planes = self.weights.row_planes(&self.row_caches);
+        let stated: Vec<engine::chunk::ShapeId> = self
+            .row_caches
+            .facts()
+            .iter()
+            .chain(&self.expert_caches.facts())
+            .map(|shape| shape.id)
+            .collect();
+        if let Some(stray) = residency
+            .resident
+            .iter()
+            .find(|r| !stated.contains(&r.atom.shape))
+        {
+            return Err(Fault::Unbound {
+                what: format!(
+                    "weight shape {}, which this load does not state",
+                    stray.atom.shape
+                ),
+            });
+        }
+        let planes = self
+            .weights
+            .cached_planes(|at| self.row_caches.streams(at) || self.expert_caches.streams(at));
         self.row_caches
+            .residency(&self.device, &self.pools, host, &planes, residency)?;
+        self.expert_caches
             .residency(&self.device, &self.pools, host, &planes, residency)?;
         self.recorder = if self.own_stream {
             crate::record::Recorder::refusing("the weights plane streams")
-        } else if self.row_caches.whole() {
+        } else if self.row_caches.whole() && self.expert_caches.whole() {
             crate::record::Recorder::new()
         } else {
-            crate::record::Recorder::refusing("a row table is not wholly resident")
+            crate::record::Recorder::refusing("the weight cache is not wholly resident")
         };
         Ok(())
     }
@@ -1175,7 +1225,10 @@ impl Shell {
     /// See `Engine::weight_uses`.
     pub fn weight_uses(&mut self) -> Result<engine::chunk::WeightUses> {
         self.drain()?;
-        let (uses, held) = self.row_caches.uses()?;
+        let (mut uses, mut held) = self.row_caches.uses()?;
+        let (more, also) = self.expert_caches.uses()?;
+        uses.extend(more);
+        held.extend(also);
         Ok(engine::chunk::WeightUses { uses, held })
     }
 
@@ -1214,12 +1267,13 @@ impl Shell {
         }
         let mut frame = self.device.frame()?;
         let (moved, pages) = self.pools.evacuate(&mut frame, evacuation)?;
-        // The row tables' entries name physical units: those in moved chunks
-        // are rewritten once every fire reading them has landed.
-        if !self.row_caches.is_empty() {
+        // The weight cache's entries name physical units: those in moved
+        // chunks are rewritten once every fire reading them has landed.
+        if !self.row_caches.is_empty() || !self.expert_caches.is_empty() {
             frame.commit()?;
             self.drain()?;
             self.row_caches.restage(&self.pools)?;
+            self.expert_caches.restage(&self.pools)?;
             frame = self.device.frame()?;
         }
         // The compressor side planes hold a cell a token of every physical
@@ -2193,9 +2247,12 @@ impl Shell {
         // A seat-addressed lane writes the seats' runs, which the weight
         // cache's slots must not share (they hold rows a fire reads).
         if lanes.iter().any(|seated| !seated.refs)
-            && self
+            && (self
                 .row_caches
                 .holds_in(1..1 + self.pools.layout().seat_chunks())
+                || self
+                    .expert_caches
+                    .holds_in(1..1 + self.pools.layout().seat_chunks()))
         {
             return Err(program(
                 "serve::stage",
@@ -2230,6 +2287,10 @@ impl Shell {
         }
 
         let mut beginning: Vec<Vec<u32>> = Vec::new();
+        // Each lane's snapshot entry (`kernels_slang::ssm::Snapshots`): its
+        // rows, then each snapshot's record as units.
+        let mut snap_entries: Vec<Vec<i32>> = Vec::with_capacity(lanes.len());
+        let mut snap_units = 0u32;
 
         let mut writes: Vec<Option<(i32, i32)>> = Vec::with_capacity(rows as usize);
         let mut feeds: Vec<(u32, &'a Buffer)> = Vec::new();
@@ -2420,6 +2481,65 @@ impl Shell {
             }
 
             slot_ids.extend(state.iter().map(|&unit| unit as i32));
+            {
+                const MAX: usize = kernels_slang::ssm::RS_SNAPSHOTS as usize;
+                let snaps = seated.rs_snapshots;
+                if snaps.len() > MAX
+                    || (!snaps.is_empty() && row.rows as usize != lane.tokens.len())
+                    || snaps
+                        .iter()
+                        .any(|snap| snap.row == 0 || snap.row >= row.rows)
+                {
+                    return Err(program(
+                        "serve::rs",
+                        format!(
+                            "lane {source} snapshots its recurrent state at rows {:?} and runs \
+                             {} of its {} rows in this fire; a fire lands at most {MAX} \
+                             interior rows of a lane it runs whole",
+                            snaps.iter().map(|snap| snap.row).collect::<Vec<_>>(),
+                            row.rows,
+                            lane.tokens.len()
+                        ),
+                    ));
+                }
+                let pieces = state.len();
+                let mut entry = vec![0i32; MAX * (1 + pieces)];
+                for (n, snap) in snaps.iter().enumerate() {
+                    // The snapshot's record: a slot ref a piece (its slot the
+                    // first), or a seat's record where the lane is
+                    // seat-addressed.
+                    let units = if !seated.refs {
+                        self.pools.record(None, snap.slot)?
+                    } else if snap.pieces.is_empty() {
+                        self.pools.record(Some(&[snap.slot]), seat_slot)?
+                    } else {
+                        self.pools.record(Some(&snap.pieces), seat_slot)?
+                    };
+                    if units.len() != pieces {
+                        return Err(program(
+                            "serve::rs",
+                            format!(
+                                "lane {source}'s snapshot at row {} names a record of {} \
+                                 pieces, where its own takes {pieces}",
+                                snap.row,
+                                units.len()
+                            ),
+                        ));
+                    }
+                    entry[n] = narrow(u64::from(snap.row));
+                    for (p, &unit) in units.iter().enumerate() {
+                        entry[MAX + n * pieces + p] = unit as i32;
+                        snap_units = snap_units.max(unit.saturating_add(1));
+                    }
+                }
+                if !snaps.is_empty() && !matches!(seated.rs, engine::fire::RsVerb::Fold) {
+                    return Err(program(
+                        "serve::rs",
+                        format!("lane {source} snapshots its state and does not fold every row"),
+                    ));
+                }
+                snap_entries.push(entry);
+            }
             let at_lane = (slot_ids.len() / state.len().max(1)) as i32 - 1;
 
             if !matches!(seated.rs, engine::fire::RsVerb::Fold) {
@@ -2512,6 +2632,7 @@ impl Shell {
             state_slots: slot_ids
                 .iter()
                 .map(|&row| (row as u32).saturating_add(1))
+                .chain(std::iter::once(snap_units))
                 .max()
                 .unwrap_or(0),
 
@@ -2905,8 +3026,40 @@ impl Shell {
                 write_offset: Some(seat.write_offset),
             });
         }
+        // The snapshot table, where a lane snapshots: in a buffer of the
+        // shell's, rewritten once every fire that might read it has landed.
+        let rs_snaps = if lanes.iter().any(|seated| !seated.rs_snapshots.is_empty()) {
+            let table: Vec<u8> = snap_entries
+                .iter()
+                .flatten()
+                .flat_map(|v| v.to_le_bytes())
+                .collect();
+            self.drain()?;
+            let bytes = table.len() as u64;
+            if self.snaps.as_ref().is_none_or(|held| held.bytes() < bytes) {
+                self.snaps = Some(Buffer::host(
+                    &self.device,
+                    bytes.next_power_of_two().max(256),
+                )?);
+            }
+            let held = self.snaps.as_mut().expect("just made");
+            held.write(0, &table)?;
+            let handle = self.handles.bind(held, 0, bytes)?;
+            Some(kernels_slang::Tensor::new(
+                handle,
+                u32::try_from(table.len() / 4).unwrap_or(u32::MAX),
+                1,
+                Dtype::I32,
+            ))
+        } else {
+            None
+        };
         let patch_seats = bound.patches;
         let bindings = FireBindings {
+            rs_snaps,
+            tokens_host: feeds
+                .is_empty()
+                .then(|| std::sync::Arc::from(tokens.as_slice())),
             group_masks,
             tokens: bound.tokens,
             positions: bound.positions,
@@ -3055,14 +3208,16 @@ impl Shell {
                 &place,
                 &self.scratch,
                 &self.tuning,
-                self.weights.seats(),
                 self.weights.gathered(),
                 self.weights.host(),
                 self.weights.pump(),
             )
-            .with_rows(
+            .with_cache(
                 &self.row_caches,
-                self.weights.row_planes(&self.row_caches),
+                &self.expert_caches,
+                self.weights.cached_planes(|at| {
+                    self.row_caches.streams(at) || self.expert_caches.streams(at)
+                }),
                 self.pools.segments(&self.handles)?,
             );
             if split {
@@ -3370,8 +3525,11 @@ impl engine::frame::Shell for Shell {
             self.readout[prepared.arm] = Buffer::host(&self.device, need)?;
         }
         // The custom-mask buffer grows: a recording would keep the one it outgrew.
-        let key = (self.recorder.records() && prepared.bindings.group_masks.is_empty())
-            .then(|| self.record_key(&prepared));
+        // A fire landing snapshots binds a table of its own: not recorded.
+        let key = (self.recorder.records()
+            && prepared.bindings.group_masks.is_empty()
+            && prepared.bindings.rs_snaps.is_none())
+        .then(|| self.record_key(&prepared));
 
         let replayable = key
             .and_then(|key| self.recorder.get(key))
