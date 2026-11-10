@@ -93,10 +93,10 @@ fn write_checkpoint(path: &Path, trace: &Trace) {
     writer.finish().expect("the fixture finishes");
 }
 
-struct Fixture {
-    trace: Trace,
-    contract: ModelContract,
-    container: PathBuf,
+pub(super) struct Fixture {
+    pub(super) trace: Trace,
+    pub(super) contract: ModelContract,
+    pub(super) container: PathBuf,
 }
 
 fn fixture(model: &str) -> Fixture {
@@ -104,7 +104,7 @@ fn fixture(model: &str) -> Fixture {
 }
 
 /// The model's fixture, cut to `layers` where stated.
-fn fixture_of(model: &str, layers: Option<u32>) -> Fixture {
+pub(super) fn fixture_of(model: &str, layers: Option<u32>) -> Fixture {
     let package = poem_compiler::catalog::package_of(model).expect("the model is listed");
     let deploy = poem::star::Deploy {
         layers,
@@ -154,11 +154,11 @@ fn load_with(fixture: &Fixture, context: u32) -> Shell {
     .unwrap_or_else(|why| panic!("the shell loads: {why}"))
 }
 
-fn word(trace: &Trace, rows: u32) -> u64 {
+pub(super) fn word(trace: &Trace, rows: u32) -> u64 {
     trace.facts.word(&Request::new(rows, false))
 }
 
-fn argmax(logits: &[f32]) -> u32 {
+pub(super) fn argmax(logits: &[f32]) -> u32 {
     (0..logits.len())
         .max_by(|&a, &b| logits[a].total_cmp(&logits[b]))
         .unwrap_or(0) as u32
@@ -303,7 +303,7 @@ fn serve(
 }
 
 /// Panics at the first row whose logits differ in a bit.
-fn same(what: &str, got: &[Vec<f32>], want: &[Vec<f32>]) {
+pub(super) fn same(what: &str, got: &[Vec<f32>], want: &[Vec<f32>]) {
     assert_eq!(got.len(), want.len(), "{what}: rows");
     for (at, (got, want)) in got.iter().zip(want).enumerate() {
         let differ = got

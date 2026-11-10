@@ -19,8 +19,13 @@ pub enum WeightRow {
     Planes(Bank),
 }
 
+/// Each param's binding, and the row table each table the weight cache
+/// streams by its rows is read through (`None`: read whole, as bound).
 #[derive(Clone, Debug, Default)]
-pub struct WeightTable(pub Vec<Option<WeightRow>>);
+pub struct WeightTable(
+    pub Vec<Option<WeightRow>>,
+    pub Vec<Option<kernels_metal::gather::RowTable>>,
+);
 
 #[derive(Clone, Debug, Default)]
 pub struct SlotTable(pub Vec<Option<Tensor>>);
@@ -1667,6 +1672,15 @@ impl<'c> Run<'c> {
                 id.0
             )
         })
+    }
+
+    /// The row table weight `id` is read through, where the weight cache
+    /// streams it by its rows.
+    pub(crate) fn row_table(&self, id: ValueId) -> Option<kernels_metal::gather::RowTable> {
+        let Def::Weight(w) = &self.values[id.0 as usize].def else {
+            return None;
+        };
+        self.weights.1.get(*w as usize).copied().flatten()
     }
 
     pub(crate) fn banked(&self, id: ValueId) -> Option<Bank> {

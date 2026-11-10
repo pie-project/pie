@@ -526,6 +526,10 @@ pub struct Pools {
     parked: Option<Spill>,
     /// The shared pool's host tier (CONTRACT-BC 22), where one is stated.
     tier: Option<HostTier>,
+    /// The weight cache's row-streamed tables, a shape each (`super::rows`).
+    rows_cache: Vec<super::rows::RowCache>,
+    /// The runtime holds the weight set for the load's life.
+    weights_held: bool,
 }
 
 /// The host tier: chunks of the pool's size in host memory apart from the
@@ -598,6 +602,8 @@ impl Pools {
             disk: None,
             parked: None,
             tier: None,
+            rows_cache: Vec::new(),
+            weights_held: false,
         };
         pools.write_maps(device)?;
         Ok(pools)
@@ -716,6 +722,11 @@ impl Pools {
         facts.host_chunks = self.tier.as_ref().map_or(0, |tier| {
             u32::try_from(tier.chunks.len()).unwrap_or(u32::MAX)
         });
+        facts.weights = self
+            .rows_cache
+            .iter()
+            .map(|cache| cache.shape.facts())
+            .collect();
         facts.disk_chunks = self.layout.list.map_or(0, |list| {
             Spill::slots(self.disk.as_ref())
                 .checked_div(list.per_chunk)
@@ -1541,10 +1552,159 @@ impl Pools {
     }
 
     /// Moves each evacuated chunk onto its new physical chunk in `frame`
-    /// and takes the moves into the chunk table.
+    /// and takes the moves into the chunk table; the weight cache's address
+    /// tables follow (no frame is in flight: the caller drained them).
     pub fn evacuate(&mut self, frame: &mut Frame, evacuation: &Evacuation) -> Result<()> {
         self.pool.evacuate(frame, evacuation)?;
-        Ok(())
+        self.restage_weights()
+    }
+
+    /// Takes the weight cache's row-streamed tables (`super::rows`).
+    pub fn seat_rows(&mut self, caches: Vec<super::rows::RowCache>) {
+        self.rows_cache = caches;
+    }
+
+    #[must_use]
+    pub fn row_caches(&self) -> &[super::rows::RowCache] {
+        &self.rows_cache
+    }
+
+    /// The byte offset in the pool of weight slot ref `slot` of a shape of
+    /// `per_chunk` slots of `slot_bytes`: refused on the null chunk, past
+    /// the pool, or on a chunk with no memory behind it.
+    fn weight_slot(&self, per_chunk: u32, slot_bytes: u64, slot: u32) -> Result<u64> {
+        let (chunk, index) = (slot / per_chunk.max(1), slot % per_chunk.max(1));
+        if chunk == 0 || chunk >= self.layout.total_chunks {
+            return Err(Fault::Ceiling {
+                what: "chunks a weight slot ref may name (past the null chunk)",
+                need: u64::from(chunk) + 1,
+                have: u64::from(self.layout.total_chunks),
+            });
+        }
+        let physical = self.pool.physical(chunk)?;
+        self.pool.admit(physical)?;
+        Ok(u64::from(physical) * self.layout.chunk_bytes + u64::from(index) * slot_bytes)
+    }
+
+    /// See `Engine::weight_residency`: blocks newly named a slot are copied
+    /// into it in `frame`. The caller has drained every frame, commits
+    /// `frame`, then calls [`Pools::restage_weights`].
+    pub fn weight_residency(
+        &mut self,
+        frame: &mut Frame,
+        residency: &engine::chunk::WeightResidency,
+    ) -> Result<()> {
+        if self.weights_held && !residency.held {
+            return Err(Fault::Unbound {
+                what: "a weight residency that is not held after one that was: a held set is \
+                       the load's for life"
+                    .to_string(),
+            });
+        }
+        if let Some(stray) = residency.resident.iter().find(|resident| {
+            !self
+                .rows_cache
+                .iter()
+                .any(|cache| cache.shape.id == resident.atom.shape)
+        }) {
+            return Err(Fault::Unbound {
+                what: format!(
+                    "weight shape {}, which this load does not state",
+                    stray.atom.shape
+                ),
+            });
+        }
+        self.weights_held = residency.held;
+        let mut caches = std::mem::take(&mut self.rows_cache);
+        let taken = (|| -> Result<()> {
+            for cache in &mut caches {
+                let shape = cache.shape.clone();
+                let mut named: Vec<Option<u32>> = vec![None; shape.blocks as usize];
+                for resident in residency
+                    .resident
+                    .iter()
+                    .filter(|resident| resident.atom.shape == shape.id)
+                {
+                    let Some(seat) = named.get_mut(resident.atom.atom as usize) else {
+                        return Err(Fault::Ceiling {
+                            what: "row blocks of a streamed table",
+                            need: u64::from(resident.atom.atom) + 1,
+                            have: u64::from(shape.blocks),
+                        });
+                    };
+                    *seat = Some(resident.slot);
+                }
+                let offset = |slot: u32| self.weight_slot(shape.per_chunk, shape.slot_bytes, slot);
+                cache.take(frame, named, self.pool.view(), &offset)?;
+            }
+            Ok(())
+        })();
+        self.rows_cache = caches;
+        taken
+    }
+
+    /// Rewrites every weight address table for where its blocks lie now.
+    /// No frame is in flight.
+    pub fn restage_weights(&mut self) -> Result<()> {
+        let base = crate::device::alloc::slab_address(self.pool.view().slab());
+        let mut caches = std::mem::take(&mut self.rows_cache);
+        let staged = caches.iter_mut().try_for_each(|cache| {
+            let (per_chunk, slot_bytes) = (cache.shape.per_chunk, cache.shape.slot_bytes);
+            cache.restage(base, &|slot| self.weight_slot(per_chunk, slot_bytes, slot))
+        });
+        self.rows_cache = caches;
+        staged
+    }
+
+    /// Whether the runtime holds the weight set for the load's life and
+    /// names every atom of every shape: the tables' own copies may go.
+    #[must_use]
+    pub fn weights_whole(&self) -> bool {
+        self.weights_held
+            && !self.rows_cache.is_empty()
+            && self.rows_cache.iter().all(super::rows::RowCache::whole)
+    }
+
+    /// Gives back every table's own copy (see [`super::rows::RowCache::release`]).
+    pub fn release_weight_hosts(&mut self) -> Vec<(usize, u32, crate::device::alloc::Slab)> {
+        if !self.weights_whole() {
+            return Vec::new();
+        }
+        self.rows_cache
+            .iter_mut()
+            .flat_map(super::rows::RowCache::release)
+            .collect()
+    }
+
+    /// See `Engine::weight_uses`. No frame is in flight.
+    pub fn weight_uses(&mut self) -> Result<engine::chunk::WeightUses> {
+        let mut uses = Vec::new();
+        for cache in &mut self.rows_cache {
+            cache.uses(&mut uses)?;
+        }
+        Ok(engine::chunk::WeightUses {
+            uses,
+            held: self
+                .rows_cache
+                .iter()
+                .map(super::rows::RowCache::held)
+                .collect(),
+        })
+    }
+
+    /// Whether a weight slot is named in a chunk the seat runs take, where a
+    /// seat-addressed lane (a caller firing directly) writes kv and state
+    /// the runtime does not see.
+    #[must_use]
+    pub fn weights_in_seats(&self) -> bool {
+        let seats = 1..1 + self.layout.seat_chunks();
+        self.rows_cache.iter().any(|cache| {
+            cache
+                .slots()
+                .iter()
+                .flatten()
+                .any(|slot| seats.contains(&(slot / cache.shape.per_chunk.max(1))))
+        })
     }
 }
 

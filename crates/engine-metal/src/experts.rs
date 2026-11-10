@@ -27,6 +27,9 @@ pub struct Plan {
     /// `(prefetch, copy threads)` from the profile's `engine.experts`;
     /// `None` keeps the built-in values.
     streaming: Option<(usize, usize)>,
+    /// The weight cache states no weight shape: every table and bank is
+    /// read whole, as before the cache (a diagnostic, for comparing).
+    whole_weights: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -183,6 +186,7 @@ impl Plan {
             host_bytes,
             gathered,
             streaming: None,
+            whole_weights: false,
         })
     }
 
@@ -192,6 +196,19 @@ impl Plan {
     pub fn with_streaming(mut self, prefetch: usize, threads: usize) -> Plan {
         self.streaming = Some((prefetch.max(1), threads.max(1)));
         self
+    }
+
+    /// This plan stating no weight shape to the runtime (see
+    /// `whole_weights`).
+    #[must_use]
+    pub fn with_whole_weights(mut self) -> Plan {
+        self.whole_weights = true;
+        self
+    }
+
+    #[must_use]
+    pub fn whole_weights(&self) -> bool {
+        self.whole_weights
     }
 
     #[must_use]

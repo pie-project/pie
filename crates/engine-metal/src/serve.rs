@@ -326,6 +326,45 @@ pub struct Shell {
 }
 
 impl Shell {
+    /// The weight cache's row-streamed tables (`store::rows`): one cache a
+    /// rows shape the recipe gives tables this engine streams, every block
+    /// read from its table in place until the runtime names slots. None on
+    /// a device whose queue keeps no residency set (the tables are then
+    /// read whole, as before).
+    fn row_caches(
+        device: &Context,
+        handles: &Handles,
+        weights: &mut Weights,
+        trace: &Trace,
+        recipe: &poem_compiler::chunk::ChunkRecipe,
+    ) -> Result<Vec<crate::store::rows::RowCache>> {
+        let streamed = crate::store::rows::streamed(trace);
+        let shapes = crate::store::rows::RowsShape::of(trace, recipe, &streamed);
+        if shapes.is_empty() || !device.hold_resident(std::iter::empty(), true)? {
+            return Ok(Vec::new());
+        }
+        let mut caches = Vec::with_capacity(shapes.len());
+        for shape in shapes {
+            let cache =
+                crate::store::rows::RowCache::open(device, handles, shape, |param| match weights
+                    .table()
+                    .0
+                    .get(param)
+                    .copied()
+                    .flatten()
+                {
+                    Some(crate::run::WeightRow::Dense(table)) => Some(table.buf),
+                    _ => None,
+                })?;
+            device.hold_resident(cache.host_slabs(), true)?;
+            for (param, rows) in cache.row_tables() {
+                weights.read_through(param, rows);
+            }
+            caches.push(cache);
+        }
+        Ok(caches)
+    }
+
     pub fn load(boot: Boot<'_>) -> Result<Shell> {
         Self::prepare(boot)?.load()
     }
@@ -629,6 +668,15 @@ impl PreparedLoad<'_> {
                 None
             },
         );
+        // The compiler's on-device Metal recipe is the one layout source: the
+        // chunk, the list slot (its tokens are the kv page size), where
+        // every fixed row's pieces lie in a record, and the weight slots.
+        let recipe = crate::chunks::recipe(&boot.trace, &budgets)?;
+        let row_caches = if boot.residency.whole_weights() {
+            Vec::new()
+        } else {
+            Shell::row_caches(&device, &handles, &mut weights, &boot.trace, &recipe)?
+        };
         handles.seal();
 
         // The kv pool and the recurrent-state buffers beside it: both are
@@ -637,10 +685,6 @@ impl PreparedLoad<'_> {
         // scratch and the driver's floor are placed. A stated `kv_budget` is
         // its bytes; none takes all of the room.
         let rs_layout = crate::rs::Layout::read(&boot.trace)?.map(std::sync::Arc::new);
-        // The compiler's on-device Metal recipe is the one layout source: the
-        // chunk, the list slot (its tokens are the kv page size) and where
-        // every fixed row's pieces lie in a record.
-        let recipe = crate::chunks::recipe(&boot.trace, &budgets)?;
         let rows = crate::store::Rows::plan(&boot.trace, &recipe, &facts, rs_layout.as_deref())?;
         let page_size = if rows.tokens > 0 {
             rows.tokens
@@ -671,6 +715,9 @@ impl PreparedLoad<'_> {
             });
             let least = Layout::least_chunks(chunk, bytes, rows.pieces, seated.pages_per_slot)
                 + window_chunks;
+            // The row-streamed tables' blocks come out of this room as the
+            // runtime names them; their own copies are counted in the
+            // weights until a held set gives them back.
             let room = boot.kv_budget.unwrap_or_else(|| accounting(0).pool);
             let total = engine::chunk::fit(room, chunk, 0, least)
                 .map_err(|short| Fault::Residency(short.to_string()))?;
@@ -753,6 +800,7 @@ impl PreparedLoad<'_> {
         let arena_ladder = poem_compiler::arena_ladder(&boot.trace, &budgets, &compiled)?;
         let rs_at = rows.rs.clone();
         let mut pools = Pools::reserve(&device, rows, layout, paging)?;
+        pools.seat_rows(row_caches);
         // The null chunk and the floor stand from the load on.
         pools.commit_segments(1)?;
         let rs_buffers = rs_at.map(|at| {
@@ -1037,6 +1085,63 @@ impl Shell {
     /// See `Engine::commit_segments`.
     pub fn commit_segments(&mut self, segments: u32) -> Result<()> {
         self.pools.commit_segments(segments)
+    }
+
+    /// See `Engine::weight_residency`: every frame drains, blocks newly
+    /// named a slot land in it, and every address table is rewritten
+    /// before the next fire. A held set naming every atom gives back the
+    /// tables' own copies (`store::rows`).
+    pub fn weight_residency(&mut self, residency: &engine::chunk::WeightResidency) -> Result<()> {
+        if self.pools.row_caches().is_empty() && residency.resident.is_empty() {
+            return Ok(());
+        }
+        self.drain()?;
+        let mut frame = self.device.frame()?;
+        self.pools.weight_residency(&mut frame, residency)?;
+        frame.commit()?;
+        self.pools.restage_weights()?;
+        let released = self.pools.release_weight_hosts();
+        if !released.is_empty() {
+            let empty = Buffer::zeroed(&self.device, 0)?;
+            self.device
+                .hold_resident(released.iter().map(|(_, _, slab)| slab), false)?;
+            let mut freed = 0;
+            for (param, handle, _) in &released {
+                self.handles.rebind(*handle, &empty)?;
+                freed += usize::from(self.weights.release_hosted(*param));
+            }
+            tracing::info!(
+                tables = released.len(),
+                own_allocations = freed,
+                "the held weight set names every block: the row-streamed tables' own copies \
+                 are given back"
+            );
+        }
+        Ok(())
+    }
+
+    /// See `Engine::weight_uses`: each block's reads since the last call.
+    pub fn weight_uses(&mut self) -> Result<engine::chunk::WeightUses> {
+        self.drain()?;
+        self.pools.weight_uses()
+    }
+
+    /// Whether every row-streamed table's own copy was given back (a held
+    /// set naming every block).
+    #[must_use]
+    pub fn row_tables_given_back(&self) -> bool {
+        let caches = self.pools.row_caches();
+        !caches.is_empty() && caches.iter().all(crate::store::rows::RowCache::released)
+    }
+
+    /// The row-streamed tables' blocks named a slot, and all of them.
+    #[must_use]
+    pub fn row_blocks(&self) -> (u64, u64) {
+        self.pools
+            .row_caches()
+            .iter()
+            .map(crate::store::rows::RowCache::blocks)
+            .fold((0, 0), |(a, b), (c, d)| (a + c, b + d))
     }
 
     /// See `Engine::release_segments`: every frame drains first.
@@ -2602,6 +2707,15 @@ impl Shell {
         let rows = composition.rows();
         let lane_count = composition.lane_count();
 
+        // A seat-addressed lane writes the seat runs' chunks; a weight slot
+        // named there would be overwritten under the cache's feet.
+        if lanes.iter().any(|seated| !seated.refs) && self.pools.weights_in_seats() {
+            return Err(Fault::Unbound {
+                what: "a seat-addressed lane while the weight cache holds a slot in a chunk \
+                       the seat runs take"
+                    .to_string(),
+            });
+        }
         let mut seats: Vec<Seat> = Vec::with_capacity(lanes.len());
         let mut kv_less: Vec<bool> = Vec::with_capacity(lanes.len());
         let mut tables: Vec<std::borrow::Cow<'_, [u32]>> = Vec::with_capacity(lanes.len());

@@ -45,6 +45,10 @@ pub struct Weights {
     banks: BTreeMap<String, Bank>,
     residue: (usize, u64),
     decoded: Vec<Buffer>,
+    /// The tables the weight cache streams by their rows, each in an
+    /// allocation of its own where the load lands them (the cold road), so
+    /// a held set can give them back (`store::rows`).
+    hosted: BTreeMap<usize, Buffer>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -165,6 +169,28 @@ impl Weights {
             }
         }
 
+        // The row-streamed tables land in allocations of their own, out of
+        // the store, which packs the other planes as before.
+        let own: std::collections::BTreeSet<usize> =
+            crate::store::rows::streamed(trace).into_iter().collect();
+        let places = {
+            let mut packed = places;
+            let mut at = 0u64;
+            for (index, place) in packed.iter_mut().enumerate() {
+                place.offset = at;
+                if own.contains(&index) && !place.streamed {
+                    place.reserved = 0;
+                }
+                at += place.reserved;
+            }
+            packed
+        };
+        let mut hosted = BTreeMap::new();
+        for &index in &own {
+            if !places[index].streamed {
+                hosted.insert(index, Buffer::zeroed(device, places[index].full)?);
+            }
+        }
         let spans: Vec<(u64, u64)> = places.iter().map(|p| (p.offset, p.reserved)).collect();
         let mut store = Store::zeroed(device, &spans, device.max_buffer())?;
 
@@ -172,6 +198,7 @@ impl Weights {
         let mut table = HostSource::open(gather.source_bytes())?;
         let mut sink = Landing {
             store: &mut store,
+            hosted: &mut hosted,
             host: &mut host,
             table: &mut table,
             plan,
@@ -207,20 +234,20 @@ impl Weights {
                     why: "is a plan param the load contract never published",
                 });
             }
-            let dense = |place: &Place| -> Result<Tensor> {
-                Ok(Tensor::new(
-                    store.bind(handles, place.offset, place.bytes)?,
-                    place.rows,
-                    place.width,
-                    place.dtype,
-                ))
+            let dense = |index: usize| -> Result<Tensor> {
+                let place = &places[index];
+                let handle = match hosted.get(&index) {
+                    Some(own) => handles.bind(own, 0, place.bytes)?,
+                    None => store.bind(handles, place.offset, place.bytes)?,
+                };
+                Ok(Tensor::new(handle, place.rows, place.width, place.dtype))
             };
             weight_table.push(Some(match pairings.get(trace.params[at].name.as_str()) {
                 Some(pairing) => WeightRow::Planes(kernels_metal::Bank {
                     mpp_codes: None,
-                    codes: dense(place)?,
-                    scales: dense(&places[pairing.scales])?,
-                    biases: pairing.biases.map(|at| dense(&places[at])).transpose()?,
+                    codes: dense(at)?,
+                    scales: dense(pairing.scales)?,
+                    biases: pairing.biases.map(dense).transpose()?,
                     group: pairing.group,
                     bits: pairing.bits,
                     ld: place.width,
@@ -233,15 +260,15 @@ impl Weights {
                 // and never touches `scales`/`group`/`bits`, so the codes plane
                 // doubles as the (unused) scales placeholder.
                 None if place.dtype == Dtype::Ptq1_0 => WeightRow::Planes(kernels_metal::Bank {
-                    codes: dense(place)?,
-                    scales: dense(place)?,
+                    codes: dense(at)?,
+                    scales: dense(at)?,
                     biases: None,
                     group: 128,
                     bits: 2,
                     mpp_codes: None,
                     ld: place.width,
                 }),
-                None => WeightRow::Dense(dense(place)?),
+                None => WeightRow::Dense(dense(at)?),
             }));
         }
         let offsets: Vec<u64> = places.iter().map(|place| place.offset).collect();
@@ -267,12 +294,13 @@ impl Weights {
             store,
             mapped: Vec::new(),
             bound: 0,
-            table: WeightTable(weight_table),
+            table: WeightTable(weight_table, Vec::new()),
             tier,
             rows,
             banks: banks(trace, &places, |at| places[at].offset),
             residue: (0, 0),
             decoded: Vec::new(),
+            hosted,
         })
     }
 
@@ -371,6 +399,22 @@ impl Weights {
             .map(|bank| bank.adapters)
             .min()
             .unwrap_or(0)
+    }
+
+    /// Reads `param` through `rows` from the next fire on (the weight
+    /// cache's row table).
+    pub fn read_through(&mut self, param: usize, rows: kernels_metal::gather::RowTable) {
+        let tables = &mut self.table.1;
+        if tables.len() <= param {
+            tables.resize(param + 1, None);
+        }
+        tables[param] = Some(rows);
+    }
+
+    /// Gives back `param`'s own allocation, where the load landed it in one
+    /// (`store::rows`): answers whether there was one. No fire reads it.
+    pub fn release_hosted(&mut self, param: usize) -> bool {
+        self.hosted.remove(&param).is_some()
     }
 
     #[must_use]
@@ -1179,12 +1223,13 @@ fn warm(
         store,
         mapped: files,
         bound,
-        table: WeightTable(table),
+        table: WeightTable(table, Vec::new()),
         tier,
         rows,
         banks: banks(trace, places, |at| seated[at]),
         residue: (residue_planes, residue_bytes),
         decoded: Vec::new(),
+        hosted: BTreeMap::new(),
     })
 }
 
@@ -1266,6 +1311,7 @@ fn rectangle(shape: &[u64]) -> (u64, u64) {
 
 struct Landing<'a> {
     store: &'a mut Store,
+    hosted: &'a mut BTreeMap<usize, Buffer>,
     host: &'a mut [u8],
     table: &'a mut [u8],
     plan: &'a Plan,
@@ -1315,6 +1361,9 @@ impl TensorSink for Landing<'_> {
                 ))
             })?;
             into.copy_from_slice(bytes);
+        } else if let Some(own) = self.hosted.get_mut(&at) {
+            own.write(0, bytes)
+                .map_err(|fault| LoadError::Internal(fault.to_string()))?;
         } else {
             self.store
                 .write(place.offset, bytes)

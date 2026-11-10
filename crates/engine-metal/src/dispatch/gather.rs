@@ -132,10 +132,11 @@ impl Run<'_> {
                     *vocab,
                     self.tensor(*y),
                 ),
-                None => gather::embed(
+                None => gather::embed_tabled(
                     self.ctx(),
                     self.tensor(*ids),
                     self.tensor(*table),
+                    self.row_table(*table),
                     *vocab,
                     self.tensor(*y),
                 ),

@@ -8,10 +8,36 @@ use crate::tensor::{Bank, Tensor};
 
 pub mod ngram;
 
+/// Where the blocks of a table's rows lie, for [`embed_tabled`]: `at` holds
+/// one GPU address a block (`kernels/gather/embed.metal`'s `RowAt`), the
+/// first of its `block_rows` rows, each laid as in the table; `hits`, where
+/// stated, a `u32` a block that each row read adds one to.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct RowTable {
+    pub at: Tensor,
+    pub block_rows: u32,
+    pub hits: Option<Tensor>,
+}
+
 pub fn embed(
     ctx: &Ctx<'_>,
     ids: Tensor,
     table: Tensor,
+    vocab: u32,
+    y: Tensor,
+) -> Result<(), Error> {
+    embed_tabled(ctx, ids, table, None, vocab, y)
+}
+
+/// [`embed`] reading `table`'s rows where `rows` says (the weight cache's
+/// row table: a block in a pool slot, or in the table's own copy), or the
+/// contiguous `table` where `rows` is `None`. One kernel either way; under a
+/// row table `table` is not bound, so a recording never holds it.
+pub fn embed_tabled(
+    ctx: &Ctx<'_>,
+    ids: Tensor,
+    table: Tensor,
+    rows: Option<RowTable>,
     vocab: u32,
     y: Tensor,
 ) -> Result<(), Error> {
@@ -23,6 +49,7 @@ pub fn embed(
         ids.rows, y.rows,
         "the token ids handed over are the rows this gather lands"
     );
+    let [rows_at, block_rows, hits, counting] = row_args(ctx, OP, rows)?;
     ctx.fire(
         Fire::at("gather/embed.metal", entry).apply(Grid::of(
             elementwise_rows(OP, y.width, y.rows)?,
@@ -30,12 +57,41 @@ pub fn embed(
         )),
         &[
             ids.arg(),
-            table.arg(),
+            rows.map_or(table, |rows| rows.at).arg(),
             y.arg_mut(),
             stated(OP, y.width)?.arg(),
             stated(OP, vocab)?.arg(),
+            rows_at,
+            block_rows,
+            hits,
+            counting,
         ],
     )
+}
+
+/// The row-table arguments of `embed.metal`: the address table, its rows a
+/// block (0: the contiguous table), the hit counters and whether to count.
+fn row_args(
+    ctx: &Ctx<'_>,
+    op: &'static str,
+    rows: Option<RowTable>,
+) -> Result<[crate::encode::ArgValue; 4], Error> {
+    Ok(match rows {
+        None => [ctx.absent()?, 0i32.arg(), ctx.absent()?, 0i32.arg()],
+        Some(rows) => [
+            rows.at.arg(),
+            stated(
+                op,
+                nonzero(op, "a row table's rows a block", rows.block_rows)?,
+            )?
+            .arg(),
+            match rows.hits {
+                Some(hits) => hits.arg_mut(),
+                None => ctx.absent()?,
+            },
+            i32::from(rows.hits.is_some()).arg(),
+        ],
+    })
 }
 
 fn concat_slices(op: &'static str, ids: Tensor, y: Tensor) -> Result<(u32, u32), Error> {
@@ -83,6 +139,10 @@ pub fn embed_concat(
             y.arg_mut(),
             stated(OP, width)?.arg(),
             stated(OP, vocab)?.arg(),
+            ctx.absent()?,
+            0i32.arg(),
+            ctx.absent()?,
+            0i32.arg(),
         ],
     )
 }
