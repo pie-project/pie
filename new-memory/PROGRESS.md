@@ -564,3 +564,16 @@ The `new-memory/` directory is bookkeeping and is removed before anything lands 
   poem-ir / poem-exec / compiler libs; chunk + bake tests; XLA, Cerebras libs; cargo check all engines incl. rocm.
 - Open: Metal not run on device (dsv4 plan now reads the kv list's geometry; Metal prefill score capture reads
   last_page_len — check when window T_w < kv page). Vulkan/wgpu compile-only. `CacheRow` rename deferred.
+
+### M40 — 2026-11-10: experts step 1 merged (dense bf16 routed experts in the weight cache)
+- `sc/l40s-wc-experts` (8ba74d1a4): dense bf16 banks of plain MoeSelect stated as Expert weight shapes, read
+  through ExpertTable; `WeightResidency.held` (runtime sets held = !streaming): a held set with every atom named makes
+  bank tables `located`, re-arms recorded bodies on the fast arm, frees the pinned host image (609 MiB on the
+  Nemotron mini); later re-seating / non-held after held refused. Fix: row streaming decided on the rewritten trace
+  (Nemotron embed stays dense). Diagnostics `dense-weights` / `dense-experts` for the older probes.
+  Write-up: new-memory/WEIGHT-CACHE-CUDA.md.
+- Verified L40S: golden_experts cached+held bitwise base on 5 MoE minis (same kernels as base); all-host / mixed
+  per-route GEMV, max |d| 0.05-0.61, no top-token change; golden_rows, golden_logits 8, by_refs, buffered, pair =
+  base; runtime store::weights 24; rocm check.
+- Open: quantized banks; engine per-expert tier (ROCm's only streaming today) is a second path for dense CUDA banks;
+  streaming off arms the lattice twice at boot; runtime boot with held untested e2e (IT).
