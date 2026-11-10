@@ -553,6 +553,15 @@ impl Lane {
             steps = submitted.steps.len(),
             "submitting a frame to the engine"
         );
+        // Temporary (IT divergence): PIE_DUMP_FRAME=<dir> writes each frame as JSON.
+        if let Some(dir) = std::env::var_os("PIE_DUMP_FRAME") {
+            static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+            let n = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            let path = std::path::Path::new(&dir).join(format!("frame-{n:06}.json"));
+            if let Ok(json) = serde_json::to_vec_pretty(&submitted) {
+                let _ = std::fs::write(path, json);
+            }
+        }
         let ticket = match engine.submit(&submitted) {
             Ok(ticket) => ticket,
             Err(error) if error.is_retryable() => {

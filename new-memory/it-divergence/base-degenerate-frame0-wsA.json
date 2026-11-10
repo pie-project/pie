@@ -1,0 +1,98 @@
+{
+  "steps": [
+    {
+      "lanes": [
+        {
+          "slot": 0,
+          "word": 0,
+          "tokens": [
+            9710,
+            9747,
+            9784,
+            9821,
+            9858,
+            9895,
+            9932,
+            9969,
+            10006,
+            10043,
+            10080,
+            10117,
+            10154,
+            10191,
+            10228,
+            10265,
+            10302,
+            10339,
+            10376,
+            10413,
+            10450,
+            10487,
+            10524,
+            10561,
+            10598,
+            10635,
+            10672,
+            10709,
+            10746,
+            10783,
+            10820,
+            10857,
+            10894,
+            10931,
+            10968,
+            11005,
+            11042,
+            11079,
+            11116,
+            11153,
+            11190,
+            11227,
+            11264,
+            11301,
+            11338,
+            11375,
+            11412,
+            11449
+          ],
+          "positions": [],
+          "kv": {
+            "held": 0,
+            "pages": [
+              0,
+              1,
+              2
+            ],
+            "translation": [],
+            "window": [],
+            "window_copies": []
+          },
+          "mask": null,
+          "adapter": null,
+          "rs": "Fold",
+          "rs_reset": "Fresh",
+          "rs_slot": 0,
+          "rs_snapshots": [],
+          "channels": [],
+          "readout": "Last",
+          "group": null,
+          "fires_after": 0,
+          "inputs": [],
+          "kv_less": false,
+          "reports": 0,
+          "tap": null,
+          "tables": [],
+          "fixed": []
+        }
+      ],
+      "attachments": [
+        {
+          "lane": 0,
+          "lanes": 1,
+          "instance": 1,
+          "adapter_only": false
+        }
+      ]
+    }
+  ]
+}
