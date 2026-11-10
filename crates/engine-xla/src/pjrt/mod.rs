@@ -355,6 +355,7 @@ unsafe impl Sync for Device<'_> {}
 pub struct MemoryStats {
     pub bytes_in_use: i64,
     pub bytes_limit: Option<i64>,
+    pub peak: Option<i64>,
 }
 
 pub struct Client {
@@ -445,6 +446,7 @@ impl Client {
         Ok(MemoryStats {
             bytes_in_use: a.bytes_in_use,
             bytes_limit: a.bytes_limit_is_set.then_some(a.bytes_limit),
+            peak: a.peak_bytes_in_use_is_set.then_some(a.peak_bytes_in_use),
         })
     }
 
