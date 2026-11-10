@@ -74,6 +74,75 @@ DIMS = {
     "minimax-m27": dims(layers = 62, experts = 256, max_position = 204800),
 }
 
+IDENTITIES = {
+    "minimax-m2": "You are MiniMax-M2, a helpful AI assistant built by MiniMax. Knowledge cutoff: 2025-06.",
+}
+NAMES = {
+    "minimax-m25": "MiniMax-M2.5",
+    "minimax-m27": "MiniMax-M2.7",
+    "minimax-m2.1": "MiniMax-M2.1",
+    "minimax-m2.5": "MiniMax-M2.5",
+    "minimax-m2.7": "MiniMax-M2.7",
+}
+
+def adopt(id, config, special):
+    if config.get("model_type", "minimax_m2") != "minimax_m2":
+        fail("the config's model_type is {}; this family is minimax_m2".format(config.get("model_type")))
+    if config.get("hidden_act", "silu") != "silu":
+        fail("its experts gate by {}; this family's gate by silu".format(config["hidden_act"]))
+    if [t for t in config.get("attn_type_list", []) if t != 1]:
+        fail("some of its layers attend linearly (attn_type_list); this family attends in full in every layer")
+    if config.get("sliding_window") != None:
+        fail("it attends through a sliding window; this family attends in full")
+    if config.get("rope_scaling") != None:
+        fail("its config scales its rope ({}); this family turns it unscaled".format(config["rope_scaling"]))
+    if not config.get("use_qk_norm", True) or config.get("qk_norm_type", "per_layer") != "per_layer":
+        fail("it norms q and k {}; this family norms them across all their heads".format(config.get("qk_norm_type", "not at all")))
+    if config.get("scoring_func", "sigmoid") != "sigmoid" or not config.get("use_routing_bias", True):
+        fail("it routes by {} {} a score bias; this family routes by a biased sigmoid".format(config.get("scoring_func"), "with" if config.get("use_routing_bias", True) else "without"))
+    if config.get("shared_intermediate_size", 0) != 0:
+        fail("it carries a shared expert, which this family does not")
+    if float(config.get("routed_scaling_factor", 1.0)) != 1.0:
+        fail("it scales its routed experts by {}; this family by one".format(config["routed_scaling_factor"]))
+    if config.get("tie_word_embeddings", False):
+        fail("it reads out through its embedding; this family reads a head of its own")
+    for key in ["attention_bias", "mlp_bias"]:
+        if config.get(key, False):
+            fail("its projections carry biases ({}), which this family's do not".format(key))
+    hidden = config["hidden_size"]
+    q_heads = config["num_attention_heads"]
+    head_dim = config.get("head_dim", hidden // q_heads)
+    experts = config["num_local_experts"]
+    d = struct(
+        hidden = hidden,
+        layers = config["num_hidden_layers"],
+        q_heads = q_heads,
+        kv_heads = config.get("num_key_value_heads", q_heads),
+        head_dim = head_dim,
+        rotary_dim = config.get("rotary_dim", head_dim),
+        experts = experts,
+        top_k = config["num_experts_per_tok"],
+        inter = config["intermediate_size"],
+        vocab = config["vocab_size"],
+        theta = float(config["rope_theta"]),
+        norm_eps = float(config.get("rms_norm_eps", 1e-6)),
+        max_position = config["max_position_embeddings"],
+    )
+    eos = special.get("eos_token", "[e~[")
+    if eos != "[e~[":
+        fail("its tokenizer ends a turn at {}; this family's template ends it at [e~[".format(eos))
+    if id in IDENTITIES:
+        spoken_as = template("minimax2", identity = IDENTITIES[id])
+    elif id in NAMES:
+        spoken_as = spoken(NAMES[id])
+    else:
+        spoken_as = template("minimax2", identity = "You are a helpful assistant.")
+    return struct(
+        MODELS = [model(id, template = spoken_as, tokenizer = TOKENIZER, arch = "minimax_m2", layers = d.layers, vocab = d.vocab)],
+        DIMS = {id: d},
+        DEPLOYMENTS = rows(id),
+    )
+
 def layout(id, deploy):
     r = roles(deploy, "proj", "experts")
     proj, experts = r.proj, r.experts
