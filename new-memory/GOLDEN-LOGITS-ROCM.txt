@@ -9,3 +9,4 @@ minimax-m3-mini       f0ad4baa073042df
 dsv4-flash-mini       00f3b51d95e16bb9
 dots3-note-mini       f328e534f77d6ef0
 mimo26-flash-mini     e23b713b673c0cb2   (shaped; differs from fully eager ad8b8d30 from fire 5 by split-kv arm, 1 ulp median)
+qwen35-tiny-buffered  6a4d99f3771d8ad7   (golden_buffered; submit_buffered equal; also at PIE_GOLDEN_CHUNK=1048576 / 262144)

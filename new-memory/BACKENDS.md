@@ -10,9 +10,9 @@ Legend: ✅ verified on hardware · 🟡 in progress / compile-only · 🔴 not 
 |---|---|---|---|---|---|---|---|
 | Real ChunkFacts, slot-ref lanes, fixed pieces | ✅ M34 | ✅ M43 (MI300X) | ✅ M30 · 🔴 dsv4 window by slot ref (BM5a) | 🟡 VK (kernels M43, pool next) | 🟡 VK | 🟡 XLA | 🟡 M43 host pool (no HW) |
 | Grow / shrink (segments, evacuation) | ✅ M34 | — flat by spec | ✅ M30 | 🟡 VK | 🟡 VK | — fixed at load | 🟡 M43 (host segments) |
-| rs list + slot_copies | ✅ M34 | 🟡 kernels, buffered goldens pending | ✅ M37 | 🟡 VK | 🟡 VK | 🟡 XLA | 🟡 M43 (host sim) |
+| rs list + slot_copies | ✅ M34 | ✅ golden_buffered (MI300X) | ✅ M37 | 🟡 VK | 🟡 VK | 🟡 XLA | 🟡 M43 (host sim) |
 | Window lists (own T_w, trimmed) | 🟡 one list, T_w=page (L40S: tables per list) | ✅ goldens (one list) | 🟡 one list (BM) | 🟡 VK | 🟡 VK | 🟡 XLA | 🟡 one list, T_w=page |
-| Multi-piece records end to end | ✅ engine (L40S) · 🟡 runtime boot (IT r5) | 🟡 kernels, chunk golden pending | 🔴 on device (BM) | 🟡 VK | 🟡 VK | 🟡 XLA | 🟡 host sim |
+| Multi-piece records end to end | ✅ engine (L40S) · 🟡 runtime boot (IT r5) | ✅ records in pieces (chunk goldens); rows cut across pieces kernel-tested | 🔴 on device (BM) | 🟡 VK | 🟡 VK | 🟡 XLA | 🟡 host sim |
 | Weight streaming: PLE rows | ✅ M35/M36/M41 | ✅ M43 golden_rows | 🔴 BM | 🔴 VK | 🔴 VK | 🟡 XLA | — weights on host |
 | Weight streaming: experts | 🟡 dense bf16 M40; quantized next | 🟡 kernels read tables; engine next | 🔴 BM | 🔴 VK | 🔴 VK | 🟡 XLA | — weights on host |
 | Host/disk tiers of shared shapes (copy_slots) | ✅ engine probe M43 · 🟡 e2e | 🔴 AMD | 🟡 M43 compile (BM) | 🔴 VK | 🔴 VK | 🔴 XLA | 🟡 CB (host sim) |
