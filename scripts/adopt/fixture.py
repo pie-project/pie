@@ -95,6 +95,31 @@ def finite(value):
     return value
 
 
+# A per-tensor table (modelopt's `quantized_layers`, compressed-tensors'
+# `config_groups` targets) can run to megabytes. No hook reads one that
+# large, so a fixture records where it was left out instead.
+TRIM_ABOVE = 64 << 10
+
+
+def trimmed(value, at="", dropped=None):
+    """`value` with every entry whose JSON exceeds TRIM_ABOVE left out, and
+    the dotted paths of what was."""
+    dropped = [] if dropped is None else dropped
+    if isinstance(value, dict):
+        out = {}
+        for key, item in value.items():
+            path = f"{at}.{key}" if at else key
+            if len(json.dumps(item)) > TRIM_ABOVE and not isinstance(item, (str, int, float)):
+                if isinstance(item, dict) and len(item) < 64:
+                    out[key] = trimmed(item, path, dropped)[0]
+                else:
+                    dropped.append(path)
+            else:
+                out[key] = item
+        return out, dropped
+    return value, dropped
+
+
 def main() -> None:
     if len(sys.argv) != 3:
         sys.exit(__doc__)
@@ -108,11 +133,14 @@ def main() -> None:
         tokenizer = fetch(repo, "tokenizer_config.json")
     if config is None:
         sys.exit(f"{repo} has no config.json")
+    config, dropped = trimmed(config)
     fixture = {
         "source": repo,
         "config": config,
         "special": special_tokens(tokenizer),
     }
+    if dropped:
+        fixture["trimmed"] = dropped
     FIXTURES.mkdir(parents=True, exist_ok=True)
     path = FIXTURES / f"{model_id}.json"
     path.write_text(json.dumps(finite(fixture), indent=2, sort_keys=True, allow_nan=False) + "\n")
