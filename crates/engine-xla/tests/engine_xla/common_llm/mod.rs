@@ -17,6 +17,40 @@ use crate::common_dit::contract_for;
 pub const PAGE: u32 = 16;
 pub const SLOTS: u32 = 4;
 
+/// Load budgets the speed probe sets for the loads it makes.
+static KNOBS: std::sync::Mutex<Vec<(String, u32)>> = std::sync::Mutex::new(Vec::new());
+
+/// Sets load budget `name` (`SLOTS`, `LANES`, `TOKENS`) for later loads.
+pub fn set_knob(name: &str, v: u32) {
+    let mut knobs = KNOBS
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    knobs.retain(|(n, _)| n != name);
+    knobs.push((name.to_string(), v));
+}
+
+/// A load budget: what [`set_knob`] set, else `PIE_XLA_TEST_<name>`, else
+/// `default`.
+fn knob(name: &str, default: u32) -> u32 {
+    let set = KNOBS
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .iter()
+        .find(|(n, _)| n == name)
+        .map(|&(_, v)| v);
+    set.or_else(|| {
+        std::env::var(format!("PIE_XLA_TEST_{name}"))
+            .ok()
+            .and_then(|v| v.parse().ok())
+    })
+    .unwrap_or(default)
+}
+
+/// Working sets a load seats.
+pub fn slots() -> u32 {
+    knob("SLOTS", SLOTS)
+}
+
 fn fnv(name: &str) -> u64 {
     name.bytes().fold(0xcbf2_9ce4_8422_2325, |hash, byte| {
         (hash ^ u64::from(byte)).wrapping_mul(0x0000_0100_0000_01b3)
@@ -138,8 +172,8 @@ impl Model {
             device_kv_budget: crate::common::kv_budget(
                 &trace,
                 context,
-                SLOTS,
-                SLOTS * context / PAGE,
+                slots(),
+                slots() * context / PAGE,
             )
             .map(|bytes| {
                 bytes
@@ -157,14 +191,14 @@ impl Model {
                 trace,
                 checkpoint: Checkpoint::Path(path),
                 budgets: Budgets {
-                    max_lanes: 8,
-                    max_tokens: 128,
+                    max_lanes: knob("LANES", 8),
+                    max_tokens: knob("TOKENS", 128),
                     buckets: Vec::new(),
                     max_adapters: 0,
                     page_size: PAGE,
                     max_context: context,
                     context_declared: false,
-                    slots: SLOTS,
+                    slots: slots(),
                     max_patches: None,
                     max_images: None,
                     max_voxels: None,

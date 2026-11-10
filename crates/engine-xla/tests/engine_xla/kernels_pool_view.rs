@@ -81,13 +81,7 @@ fn bits(f: &mut Func, x: Val) -> Built<Val> {
 /// Runs `case` twice over the same pool: once on a lazy view, once on the
 /// view built whole; the results (read values, and the pool after writes)
 /// must agree bit for bit.
-fn check(
-    name: &str,
-    elem: Elem,
-    dims: &[i64],
-    ints: &[Vec<i32>],
-    case: Case<'_>,
-) {
+fn check(name: &str, elem: Elem, dims: &[i64], ints: &[Vec<i32>], case: Case<'_>) {
     let Some(client) = client() else { return };
     let dev = client.device(0).expect("a device");
     let mut seed = 0x9E37_79B9_7F4A_7C15u64;

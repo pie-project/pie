@@ -36,4 +36,5 @@ mod kernels_spatial;
 mod kernels_ssm;
 mod nemotron_traces_on_a_dry_device;
 mod pjrt_runs_a_built_module;
+mod speed;
 mod the_pool_reads_as_shared_chunks;

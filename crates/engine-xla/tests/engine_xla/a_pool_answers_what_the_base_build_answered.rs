@@ -59,6 +59,11 @@ fn a_gated_delta_hybrid_answers_bit_for_bit() {
 }
 
 #[test]
+fn a_routed_model_answers_bit_for_bit() {
+    run("qwen3-30b-a3b-mini", None, 256, None);
+}
+
+#[test]
 fn a_windowed_model_answers_bit_for_bit_past_its_window() {
     run("gemma4-e4b-mini-l1", None, 1024, Some(700));
 }
