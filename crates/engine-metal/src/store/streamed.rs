@@ -244,6 +244,32 @@ pub fn streamed(trace: &Trace) -> Vec<usize> {
     all
 }
 
+/// What `trace`'s weights demand of the device however the runtime runs the
+/// weight cache, its params' stored bytes `plane_bytes` (aligned): every
+/// weight no shape of `recipe` streams, whole, and of the streamable ones
+/// only the floor each shape's slots keep; and the streamable weights'
+/// whole bytes, which a held set seats in pool slots and a streaming one
+/// reads a few atoms of at a time.
+#[must_use]
+pub fn resident_demand(trace: &Trace, recipe: &ChunkRecipe, plane_bytes: &[u64]) -> (u64, u64) {
+    let shapes = Shape::of(trace, recipe);
+    let streamed: std::collections::BTreeSet<usize> = shapes
+        .iter()
+        .flat_map(|shape| shape.planes.iter().map(|plane| plane.param))
+        .collect();
+    let aligned = |at: usize| plane_bytes[at].next_multiple_of(crate::weights::ALIGN);
+    let kept: u64 = (0..plane_bytes.len())
+        .filter(|at| !streamed.contains(at))
+        .map(aligned)
+        .sum();
+    let floor: u64 = shapes
+        .iter()
+        .map(|shape| u64::from(shape.floor) * shape.slot_bytes)
+        .sum();
+    let streamable: u64 = streamed.iter().map(|&at| aligned(at)).sum();
+    (kept + floor, streamable)
+}
+
 /// One weight's part of a shape. Its groups (row blocks, or a layer's
 /// experts) are `stride` bytes apart in the weight's own copy, each cut into
 /// `pieces` runs of `piece` bytes (an expert's rows on the output axis; a
@@ -305,12 +331,11 @@ pub struct Shape {
 impl Shape {
     /// The shapes of `recipe` this engine streams: rows shapes whose every
     /// table is in [`streamed_rows`], then expert shapes (one piece an
-    /// expert) whose every bank of every layer is in [`streamed_experts`];
-    /// experts only where `experts` (no other tier holds a bank). A slot
-    /// that holds a weight this engine does not stream is not stated, its
-    /// weights read whole.
+    /// expert) whose every bank of every layer is in [`streamed_experts`].
+    /// A slot that holds a weight this engine does not stream is not
+    /// stated, its weights read whole.
     #[must_use]
-    pub fn of(trace: &Trace, recipe: &ChunkRecipe, experts: bool) -> Vec<Shape> {
+    pub fn of(trace: &Trace, recipe: &ChunkRecipe) -> Vec<Shape> {
         let mut out = Vec::new();
         let rows = streamed_rows(trace);
         for slot in &recipe.weights {
@@ -321,15 +346,13 @@ impl Shape {
                 out.push(shape);
             }
         }
-        if experts {
-            let banks = streamed_experts(trace);
-            for slot in &recipe.weights {
-                if slot.kind != poem_compiler::chunk::WeightKind::Expert {
-                    continue;
-                }
-                if let Some(shape) = Shape::experts(trace, recipe, slot, &banks, out.len()) {
-                    out.push(shape);
-                }
+        let banks = streamed_experts(trace);
+        for slot in &recipe.weights {
+            if slot.kind != poem_compiler::chunk::WeightKind::Expert {
+                continue;
+            }
+            if let Some(shape) = Shape::experts(trace, recipe, slot, &banks, out.len()) {
+                out.push(shape);
             }
         }
         out

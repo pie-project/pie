@@ -1,48 +1,20 @@
 #![allow(unsafe_code)]
-use std::cell::RefCell;
 
-#[cfg(target_vendor = "apple")]
-use kernels_metal::Tensor;
 use kernels_metal::{ArgValue, Encode, Error, Fire};
-use poem_exec::fire::At;
-#[cfg(target_vendor = "apple")]
-use poem_exec::fire::MaskSpan;
-use poem_ir::ValueId;
 
 use crate::device::ctx::Frame;
-use crate::device::{Buffer, Context, Handles, Pipelines, handles::NIL};
+use crate::device::{Context, Handles, Pipelines, handles::NIL};
 use crate::error::Fault;
-use crate::experts::Tier;
-use crate::run::SlotTable;
-use crate::window::Windows;
 
 #[cfg(target_vendor = "apple")]
 use objc2_metal::{MTLComputeCommandEncoder, MTLSize};
 
-#[cfg(target_vendor = "apple")]
-#[allow(
-    dead_code,
-    reason = "the router's dispatch no longer cuts; kept as the name of the seam"
-)]
-const ROUTER_FILE: &str = "linear/moe/route.metal";
-
-#[cfg(target_vendor = "apple")]
-#[allow(dead_code, reason = "see ROUTER_FILE")]
-const ROUTER_POINTS: [&str; 2] = ["router_topk", "hash_route_gather"];
-
-#[cfg(target_vendor = "apple")]
-const HASHER_FILE: &str = "gather/ngram.metal";
-
-#[cfg(target_vendor = "apple")]
-const HASHER_POINT: &str = "ngram_ids";
-
 #[cfg_attr(not(target_vendor = "apple"), allow(dead_code))]
 pub struct Sink<'a> {
     device: &'a Context,
-    frame: Held<'a>,
+    frame: &'a Frame,
     pipelines: &'a Pipelines,
     handles: &'a Handles,
-    cuts: Option<Cuts<'a>>,
     /// The event a `signal` or `wait` fences the frame on; none unless this
     /// load hands work to the Neural Engine.
     #[cfg(target_vendor = "apple")]
@@ -50,54 +22,6 @@ pub struct Sink<'a> {
     /// Launches left before the borrowed frame commits its head and goes on
     /// in a fresh buffer; zero never.
     flush_in: std::cell::Cell<u32>,
-}
-
-#[cfg_attr(not(target_vendor = "apple"), allow(dead_code))]
-enum Held<'a> {
-    Borrowed(&'a Frame),
-    Owned(RefCell<Option<Frame>>),
-}
-
-#[cfg_attr(not(target_vendor = "apple"), allow(dead_code))]
-pub struct Cuts<'a> {
-    place: &'a At,
-    at: &'a [Option<ValueId>],
-    ngram: &'a [Option<ValueId>],
-    slots: &'a SlotTable,
-    windows: &'a Windows,
-    arena: RefCell<Buffer>,
-    tier: Option<&'a RefCell<Tier>>,
-    rows: Option<&'a RefCell<crate::gather::Slab>>,
-    seen: std::cell::Cell<(u32, u32)>,
-    groups: std::cell::Cell<u32>,
-}
-
-impl<'a> Cuts<'a> {
-    #[must_use]
-    #[allow(clippy::too_many_arguments)]
-    pub fn new(
-        place: &'a At,
-        at: &'a [Option<ValueId>],
-        ngram: &'a [Option<ValueId>],
-        slots: &'a SlotTable,
-        windows: &'a Windows,
-        arena: Buffer,
-        tier: Option<&'a RefCell<Tier>>,
-        rows: Option<&'a RefCell<crate::gather::Slab>>,
-    ) -> Cuts<'a> {
-        Cuts {
-            place,
-            at,
-            ngram,
-            slots,
-            windows,
-            arena: RefCell::new(arena),
-            tier,
-            rows,
-            seen: std::cell::Cell::new((u32::MAX, u32::MAX)),
-            groups: std::cell::Cell::new(1),
-        }
-    }
 }
 
 impl<'a> Sink<'a> {
@@ -110,168 +34,13 @@ impl<'a> Sink<'a> {
     ) -> Sink<'a> {
         Sink {
             device,
-            frame: Held::Borrowed(frame),
+            frame,
             pipelines,
             handles,
-            cuts: None,
             #[cfg(target_vendor = "apple")]
             handoff: None,
             flush_in: std::cell::Cell::new(0),
         }
-    }
-
-    #[must_use]
-    pub fn streaming(
-        device: &'a Context,
-        frame: Frame,
-        pipelines: &'a Pipelines,
-        handles: &'a Handles,
-        cuts: Cuts<'a>,
-    ) -> Sink<'a> {
-        Sink {
-            device,
-            frame: Held::Owned(RefCell::new(Some(frame))),
-            pipelines,
-            handles,
-            cuts: Some(cuts),
-            #[cfg(target_vendor = "apple")]
-            handoff: None,
-            flush_in: std::cell::Cell::new(0),
-        }
-    }
-
-    #[must_use]
-    pub fn into_frame(self) -> Option<Frame> {
-        match self.frame {
-            Held::Borrowed(_) => None,
-            Held::Owned(cell) => cell.into_inner(),
-        }
-    }
-
-    #[cfg(target_vendor = "apple")]
-    fn with_frame<T>(&self, body: impl FnOnce(&Frame) -> T) -> T {
-        match &self.frame {
-            Held::Borrowed(frame) => body(frame),
-            Held::Owned(cell) => body(
-                cell.borrow()
-                    .as_ref()
-                    .expect("a segment is open until its cut closes it"),
-            ),
-        }
-    }
-
-    #[cfg(target_vendor = "apple")]
-    fn cut(&self, fire: Fire, cuts: &Cuts<'_>) -> Result<(), Error> {
-        let Some(tier) = cuts.tier else {
-            return Ok(());
-        };
-        let region = cuts.place.region.get();
-        let Some(routes) = region
-            .checked_sub(1)
-            .and_then(|router| cuts.at.get(router as usize).copied().flatten())
-        else {
-            return Ok(());
-        };
-        let hint = tier
-            .borrow()
-            .hint_for(routes)
-            .and_then(|hint| cuts.slots.0.get(hint.0 as usize).copied().flatten());
-        self.across(
-            fire,
-            cuts,
-            routes,
-            "a routing vector",
-            |rect, span, pass, arena| {
-                tier.borrow_mut()
-                    .segment(arena, self.handles, routes, rect, hint, span, pass)
-            },
-        )
-    }
-
-    #[cfg(target_vendor = "apple")]
-    fn cut_rows(&self, fire: Fire, cuts: &Cuts<'_>) -> Result<(), Error> {
-        let Some(rows) = cuts.rows else {
-            return Ok(());
-        };
-        let region = cuts.place.region.get();
-        let Some(ids) = cuts.ngram.get(region as usize).copied().flatten() else {
-            return Ok(());
-        };
-        self.across(
-            fire,
-            cuts,
-            ids,
-            "an n-gram id vector",
-            |rect, span, _pass, arena| {
-                rows.borrow_mut()
-                    .segment(arena, self.handles, ids, rect, span)
-                    .map(|()| 1)
-            },
-        )
-    }
-
-    #[cfg(target_vendor = "apple")]
-    fn across(
-        &self,
-        fire: Fire,
-        cuts: &Cuts<'_>,
-        vector: ValueId,
-        what: &str,
-        seat: impl FnOnce(Tensor, MaskSpan, (u32, u32), &mut Buffer) -> crate::error::Result<u32>,
-    ) -> Result<(), Error> {
-        let Held::Owned(cell) = &self.frame else {
-            return Ok(());
-        };
-        let refuse = |fault: Fault| Sink::refuse(fire, fault);
-        let frame = cell
-            .borrow_mut()
-            .take()
-            .expect("a segment is open until its cut closes it");
-        let waited = std::time::Instant::now();
-        frame.commit().map_err(refuse)?;
-        let waited = waited.elapsed();
-        if let Some(tier) = cuts.tier {
-            tier.borrow_mut().note_wait(waited.as_nanos() as u64);
-        }
-        if crate::diag::on().cut_trace {
-            eprintln!("cut-wait: {:.1} ms", waited.as_secs_f64() * 1e3);
-        }
-
-        let region = cuts.place.region.get();
-        let rect = cuts
-            .slots
-            .0
-            .get(vector.0 as usize)
-            .copied()
-            .flatten()
-            .ok_or_else(|| {
-                refuse(Fault::Unbound {
-                    what: format!("value {}, {what} the carve gave no rectangle", vector.0),
-                })
-            })?;
-        let window = cuts.windows.at(region, cuts.place.run.get());
-        let span = window.span;
-        let pass = (window.pass, window.passes);
-        if crate::diag::on().cut_trace {
-            eprintln!(
-                "cut: region {region} run {}: rows {}..{} of value {} ({what}; rect {} x {}; pass {} of {})",
-                cuts.place.run.get(),
-                span.row_offset,
-                span.row_offset + span.rows,
-                vector.0,
-                rect.rows,
-                rect.width,
-                pass.0,
-                pass.1
-            );
-        }
-        let groups = seat(rect, span, pass, &mut cuts.arena.borrow_mut()).map_err(refuse)?;
-        if pass.0 == 0 {
-            cuts.groups.set(groups);
-        }
-
-        *cell.borrow_mut() = Some(self.device.frame().map_err(refuse)?);
-        Ok(())
     }
 
     fn refuse(fire: Fire, fault: Fault) -> Error {
@@ -338,30 +107,11 @@ impl Encode for Sink<'_> {
     fn fire(&self, fire: Fire, args: &[ArgValue]) -> Result<(), Error> {
         #[cfg(target_vendor = "apple")]
         {
-            if let Some(cuts) = &self.cuts {
-                let here = (cuts.place.region.get(), cuts.place.run.get());
-                if cuts.seen.get() != here {
-                    cuts.seen.set(here);
-                    self.cut(fire, cuts)?;
-                }
-                let window = cuts.windows.at(here.0, here.1);
-                if window.passes > 1 {
-                    let groups = cuts.groups.get().max(1);
-                    let in_tail = cuts.place.tail.get();
-                    let last = window.pass + 1 == groups;
-                    let empty = window.pass >= groups;
-                    if (in_tail && !last) || (!in_tail && empty) {
-                        return Ok(());
-                    }
-                }
-            }
             let pipeline = self
                 .pipelines
                 .at(self.device.device(), fire)
                 .map_err(|fault| Sink::refuse(fire, fault))?;
-            if profiling()
-                && let Held::Borrowed(_) = &self.frame
-            {
+            if profiling() {
                 let refuse = |fault: Fault| Sink::refuse(fire, fault);
                 let own = self.device.frame().map_err(refuse)?;
                 {
@@ -376,40 +126,22 @@ impl Encode for Sink<'_> {
                 record_kernel(&profile_key(fire.entrypoint, args), seconds);
                 return Ok(());
             }
-            self.with_frame(|frame| {
-                let encoder = frame.encoder();
+            {
+                let encoder = self.frame.encoder();
                 encoder.setComputePipelineState(&pipeline);
                 for (at, arg) in args.iter().enumerate() {
                     self.bind(&encoder, fire, at, *arg)?;
                 }
-                self.dispatch(&encoder, &pipeline, fire)
-            })?;
-            if let Held::Borrowed(frame) = &self.frame
-                && let left = self.flush_in.get()
-                && left > 0
-            {
+                self.dispatch(&encoder, &pipeline, fire)?;
+            }
+            let left = self.flush_in.get();
+            if left > 0 {
                 self.flush_in.set(left - 1);
                 if left == 1 {
-                    frame.flush().map_err(|fault| Sink::refuse(fire, fault))?;
+                    self.frame
+                        .flush()
+                        .map_err(|fault| Sink::refuse(fire, fault))?;
                 }
-            }
-            if profiling()
-                && let Held::Owned(cell) = &self.frame
-            {
-                let refuse = |fault: Fault| Sink::refuse(fire, fault);
-                let frame = cell
-                    .borrow_mut()
-                    .take()
-                    .expect("a segment is open until its cut closes it");
-                let seconds = frame.commit_timed().map_err(refuse)?;
-                record_kernel(&profile_key(fire.entrypoint, args), seconds);
-                *cell.borrow_mut() = Some(self.device.frame().map_err(refuse)?);
-            }
-            if let Some(cuts) = &self.cuts
-                && fire.file == HASHER_FILE
-                && fire.entrypoint.starts_with(HASHER_POINT)
-            {
-                self.cut_rows(fire, cuts)?;
             }
             Ok(())
         }
@@ -434,7 +166,7 @@ impl Encode for Sink<'_> {
 
     #[cfg(target_vendor = "apple")]
     fn on_commit(&self, then: Box<dyn FnOnce() + Send>) -> Result<(), Error> {
-        self.with_frame(|frame| frame.on_commit(then));
+        self.frame.on_commit(then);
         Ok(())
     }
 }
@@ -478,7 +210,7 @@ impl<'a> Sink<'a> {
             };
             let event =
                 objc2::runtime::ProtocolObject::<dyn objc2_metal::MTLEvent>::from_ref(&**event);
-            self.with_frame(|frame| frame.fence(event, stamp, signal))
+            self.frame.fence(event, stamp, signal)
                 .map_err(|fault| Error::Backend {
                     op,
                     detail: fault.to_string(),

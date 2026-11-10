@@ -348,10 +348,38 @@ impl Engine for Metal {
         };
         let contract = (self.contract_for)(&trace, &path).map_err(Error::Load)?;
 
-        let planes = crate::weights::attachments(&trace, &contract, &path).map_err(fault)?;
-        let (working_set, elsewhere) = {
+        let (working_set, elsewhere, caches) = {
             let device = crate::device::Context::bind().map_err(fault)?;
-            (device.working_set(), device.held_elsewhere())
+            (
+                device.working_set(),
+                device.held_elsewhere(),
+                // The weight cache runs where the queue keeps a residency set.
+                device
+                    .hold_resident(std::iter::empty(), true)
+                    .map_err(fault)?,
+            )
+        };
+        // Dense weights always live in device memory, and so does every
+        // weight the weight cache does not stream; of the streamable ones
+        // (routed experts, token-id tables) only the floor the cache keeps
+        // must: the rest leaves the device under streaming, and a held set
+        // seats it in the pool.
+        let planes = crate::weights::plane_bytes(&trace).map_err(fault)?;
+        let (weights, streamable) = if caches {
+            let recipe = crate::chunks::recipe(
+                &trace,
+                &poem_compiler::Budgets::of(bake_budgets(&budgets, &trace)),
+            )
+            .map_err(fault)?;
+            crate::store::streamed::resident_demand(&trace, &recipe, &planes)
+        } else {
+            (
+                planes
+                    .iter()
+                    .map(|plane| plane.next_multiple_of(crate::weights::ALIGN))
+                    .sum::<u64>(),
+                0,
+            )
         };
         let util = residency.device_memory_share;
         let slots = poem_compiler::state_slots(budgets.slots, &trace, DEFAULT_STATE_SLOTS);
@@ -374,6 +402,7 @@ impl Engine for Metal {
                 scratch,
                 kv_pool,
             )
+            .with_streamable(streamable)
         };
 
         // Compiled before the residency check, so the check prices the arena
@@ -382,18 +411,9 @@ impl Engine for Metal {
         // reserves pushes the load past the device (a 12B on a 16 GB Mac),
         // the width halves until it fits: a narrower prefill fire is slower,
         // a refused load serves nothing.
-        // `device_weight_budget` is gone from the load contract: dense
-        // weights always live in device memory. Metal's own budget plumbing
-        // still takes one, now always unstated, until it is removed here.
-        let device_weight_budget: Option<u64> = None;
         let mut budgets = budgets;
-        let (mut prepared, mut residency_plan) = loop {
-            let gathered =
-                crate::gather::Plan::of(&trace, &planes, device_weight_budget, budgets.max_tokens)
-                    .map_err(fault)?;
-            let plan = experts::Plan::beside(&trace, &planes, device_weight_budget, gathered)
-                .map_err(fault)?;
-            let room = accounting(plan.device_demand(), 0)
+        let mut prepared = loop {
+            let room = accounting(weights, 0)
                 .pool
                 .saturating_sub(kv_pool)
                 / 2;
@@ -437,21 +457,18 @@ impl Engine for Metal {
                 kv_budget: residency.device_kv_budget,
                 memory_share: residency.device_memory_share,
                 runahead: engine::runahead::Runahead::of(frames_in_flight),
-                residency: plan.clone(),
+                residency: experts::Plan::default(),
                 profiles: self.boot.profiles.clone(),
             })
             .map_err(fault)?;
-            let weights = plan.device_demand();
             let narrower = (budgets.max_tokens / 2).max(MIN_FITTED_FORWARD_TOKENS);
             if narrower >= budgets.max_tokens
                 || accounting(weights, prepared.arena_bytes())
-                    .admit(device_weight_budget, util)
+                    .admit(util)
                     .is_ok()
-                || accounting(weights, 0)
-                    .admit(device_weight_budget, util)
-                    .is_err()
+                || accounting(weights, 0).admit(util).is_err()
             {
-                break (prepared, plan);
+                break prepared;
             }
             eprintln!(
                 "the arena scratch for {} forward tokens ({} bytes) does not fit beside the \
@@ -464,47 +481,9 @@ impl Engine for Metal {
         };
         let scratch = prepared.arena_bytes();
 
-        {
-            let acct = accounting(residency_plan.device_demand(), scratch);
-            if acct.admit(device_weight_budget, util).is_err() {
-                let headroom = acct.weight_headroom();
-                let regathered =
-                    crate::gather::Plan::of(&trace, &planes, Some(headroom), budgets.max_tokens);
-                let regathered = match regathered {
-                    Ok(plan) => plan,
-                    Err(_) => {
-                        return Err(fault(
-                            acct.admit(device_weight_budget, util)
-                                .expect_err("admit errored above"),
-                        ));
-                    }
-                };
-                match experts::Plan::beside(&trace, &planes, Some(headroom), regathered) {
-                    Ok(shrunk) => {
-                        let re = crate::store::accounting::Accounting::with_scratch(
-                            working_set,
-                            elsewhere,
-                            util,
-                            shrunk.device_demand(),
-                            scratch,
-                            kv_pool,
-                        );
-                        re.admit(Some(headroom), util).map_err(fault)?;
-                        residency_plan = shrunk;
-                    }
-                    Err(_) => {
-                        return Err(fault(
-                            acct.admit(device_weight_budget, util)
-                                .expect_err("admit errored above"),
-                        ));
-                    }
-                }
-            }
-        }
+        accounting(weights, scratch).admit(util).map_err(fault)?;
 
-        let streams = residency_plan.streams();
-
-        prepared.set_residency(residency_plan.with_weights_held(residency.weights_held));
+        prepared.set_residency(experts::Plan::default().with_weights_held(residency.weights_held));
         let mut shell = prepared.load().map_err(fault)?;
 
         shell.mount_adapters(self.boot.adapter_dir.clone());
@@ -592,7 +571,7 @@ impl Engine for Metal {
             facts: LoadFacts {
                 trace_name,
                 weight_bytes,
-                weights_resident: !streams,
+                weights_resident: true,
                 weights_from_cache: weights_warm,
                 arena_bytes,
                 pool_bytes,

@@ -27,8 +27,6 @@ pub mod weight_store;
 
 pub mod decoded;
 pub(crate) mod feeds;
-pub mod gather;
-pub mod host_source;
 #[cfg(target_vendor = "apple")]
 pub mod icb;
 pub mod inputs;
@@ -62,7 +60,7 @@ pub use device::{Buffer, Context, Handles, Pipelines};
 pub use diag::Diagnostics;
 pub use encode::{Sink, kernel_profile, reset_kernel_profile};
 pub use error::{Fault, Result};
-pub use experts::{GroupResidency, PREDICTION_PREFIXES, Plan as ResidencyPlan, Prediction};
+pub use experts::Plan as ResidencyPlan;
 #[cfg(target_vendor = "apple")]
 pub use icb::{Icb, Rebound};
 pub use inputs::Inputs;

@@ -15,8 +15,6 @@ pub struct Window {
     pub indptr_host: Vec<i32>,
     pub indptr: Tensor,
     pub gathered: Option<Gathered>,
-    pub pass: u32,
-    pub passes: u32,
     pub patch: MaskSpan,
     pub voxel: MaskSpan,
 }
@@ -77,8 +75,6 @@ pub struct Windows {
 fn seat(windows: &mut Vec<Window>, window: Window) -> u32 {
     let same = |held: &Window| {
         held.span == window.span
-            && held.pass == window.pass
-            && held.passes == window.passes
             && held.gathered.as_ref().map(|g| &g.runs) == window.gathered.as_ref().map(|g| &g.runs)
     };
     let index = match windows.iter().position(same) {
@@ -170,8 +166,6 @@ fn gather_of(runs: &[MaskSpan], indptr_host: &[i32], copies: Copies<'_>) -> Wind
         }),
         patch: MaskSpan::default(),
         voxel: MaskSpan::default(),
-        pass: 0,
-        passes: 1,
     }
 }
 
@@ -185,8 +179,6 @@ impl Windows {
         voxels: &WindowTable,
         indptr_host: &[i32],
         copies: Copies<'_>,
-        run_caps: &[u32],
-        run_passes: &[u32],
     ) -> Result<Windows> {
         let mut windows: Vec<Window> = Vec::new();
         let mut runs: Vec<u32> = Vec::with_capacity(compiled.template().len());
@@ -247,26 +239,11 @@ impl Windows {
                 continue;
             }
 
-            let cap = run_caps.get(at).copied().unwrap_or(0);
-            let max_passes = run_passes.get(at).copied().unwrap_or(0);
-            let (capped, passes) = if cap > 0 && max_passes > 1 {
-                (
-                    false,
-                    poem_exec::fire::pass_spans(&mut spans, cap, max_passes),
-                )
-            } else {
-                let capped = cap > 0 && spans.iter().any(|span| span.rows > cap);
-                if capped {
-                    poem_exec::fire::chunk_spans(&mut spans, cap);
-                }
-                (capped, 1)
-            };
             of_region.push((runs.len() as u32, spans.len() as u32));
-            for (i, &span) in spans.iter().enumerate() {
+            for &span in &spans {
                 let window = Window {
                     span,
                     indptr_host: match axis {
-                        poem_ir::RowAxis::Tokens if capped => vec![0, span.rows as i32],
                         poem_ir::RowAxis::Tokens => rebase(indptr_host, span)?,
                         poem_ir::RowAxis::Patches | poem_ir::RowAxis::Voxels => Vec::new(),
                     },
@@ -274,8 +251,6 @@ impl Windows {
                     gathered: None,
                     patch,
                     voxel,
-                    pass: (i as u32) % passes,
-                    passes,
                 };
                 runs.push(seat(&mut windows, window));
             }

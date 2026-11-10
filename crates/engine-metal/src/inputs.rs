@@ -248,39 +248,14 @@ pub fn window_ints(
     paging: Paging,
     page_tables: usize,
     classes: usize,
-    max_runs: u32,
     gathered: usize,
-    run_caps: &[u32],
-    run_passes: &[u32],
 ) -> u64 {
     let rows = u64::from(budget.max_tokens);
     let lanes = u64::from(budget.max_lanes);
     let pages = u64::from(budget.max_lanes) * u64::from(paging.pages_per_slot);
     let intervals = (classes * (classes + 1) / 2) as u64;
     let per_gathered = 3 * rows + page_tables as u64 * (2 * lanes + (lanes + 1) + pages);
-    let runs = u64::from(max_runs);
-
-    let mut cut = 0u64;
-    let mut chunked: Vec<(u32, u64)> = Vec::new();
-    for (at, &cap) in run_caps.iter().enumerate() {
-        if cap == 0 {
-            continue;
-        }
-        let passes = run_passes.get(at).copied().unwrap_or(0);
-        if passes > 1 {
-            cut += intervals.min(runs) * u64::from(passes) * (lanes + 1);
-        } else {
-            match chunked.iter().position(|(held, _)| *held == cap) {
-                Some(group) => chunked[group].1 += 1,
-                None => chunked.push((cap, 1)),
-            }
-        }
-    }
-    for (cap, regions) in chunked {
-        cut += intervals.min(regions * runs) * rows.div_ceil(u64::from(cap)) * (lanes + 1);
-    }
-
-    (intervals + 1 + gathered as u64) * (lanes + 1) + cut + gathered as u64 * per_gathered
+    (intervals + 1 + gathered as u64) * (lanes + 1) + gathered as u64 * per_gathered
 }
 
 impl Inputs {
@@ -291,15 +266,12 @@ impl Inputs {
         paging: Paging,
         page_tables: usize,
         classes: usize,
-        max_runs: u32,
         gathered: usize,
         patch: Option<PatchSeat>,
         voxel: Option<VoxelSeat>,
         mrope: bool,
         seats: &[Seat],
         selections: usize,
-        run_caps: &[u32],
-        run_passes: &[u32],
         bands: &[u32],
         pages_per_lane: u32,
     ) -> Result<Inputs> {
@@ -319,10 +291,7 @@ impl Inputs {
             paged,
             page_tables,
             classes,
-            max_runs,
             gathered,
-            run_caps,
-            run_passes,
         );
 
         let mut at = 0u64;

@@ -2,7 +2,7 @@
 //! it before profiles existed, but what was measured on it since; the
 //! functions below are that table, frozen.
 
-use engine_metal::chip::{self, AneMlp, AneProjections, ExpertsThreads, StreamCut, WeightsLayout};
+use engine_metal::chip::{self, AneMlp, AneProjections, WeightsLayout};
 use kernels_metal::Tuning;
 use kernels_metal::tuning::{GdnScan, Qmm, QmmAt, fill};
 use profile::Source;
@@ -207,12 +207,6 @@ fn assert_old_tuning(
         *profile.get::<WeightsLayout>(),
         WeightsLayout::Plain,
         "{device}"
-    );
-    assert_eq!(*profile.get::<StreamCut>(), StreamCut::FanOut);
-    assert_eq!(
-        profile.get::<ExpertsThreads>().count(10),
-        8,
-        "{device}: on 10 performance cores"
     );
     assert_eq!(
         poem_compiler::DeviceProfile::of(&profile, chip::pricing_cores(&profile, cores), &[], &[]),
