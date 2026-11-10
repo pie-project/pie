@@ -65,6 +65,21 @@ pub fn step_kernel(on: Option<bool>) {
     STEP_KERNEL.store(v, std::sync::atomic::Ordering::Relaxed);
 }
 
+static STEP_BUFS: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
+
+/// Scratch: the step kernel's state buffers (2 or 3; `None`: `PIE_GDN_STEP_BUFS`, else 2).
+pub fn step_bufs(n: Option<u8>) {
+    STEP_BUFS.store(n.unwrap_or(0), std::sync::atomic::Ordering::Relaxed);
+}
+
+pub(crate) fn step_bufs_n() -> i64 {
+    match STEP_BUFS.load(std::sync::atomic::Ordering::Relaxed) {
+        0 => std::env::var("PIE_GDN_STEP_BUFS").ok().and_then(|v| v.parse().ok()).unwrap_or(2),
+        v => i64::from(v),
+    }
+    .clamp(2, 3)
+}
+
 fn step_kernel_on() -> bool {
     match STEP_KERNEL.load(std::sync::atomic::Ordering::Relaxed) {
         2 => !std::env::var("PIE_GDN_STEP_KERNEL").is_ok_and(|v| v == "0"),

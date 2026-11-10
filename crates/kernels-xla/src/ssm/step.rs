@@ -79,7 +79,7 @@ fn kernel(t: i64, g: i64, hv: i64, rows: i64, per: i64) -> Built<crate::mosaic::
     };
     let state = per * dv;
     // the two state buffers and a few f32 copies of a state as it steps
-    let nb: i64 = std::env::var("PIE_GDN_STEP_BUFS").ok().and_then(|v| v.parse().ok()).unwrap_or(2).clamp(2, 3);
+    let nb: i64 = super::step_bufs_n();
     let vmem = nb * state * 2 + 6 * state * 4 + 2 * 6 * g * hv * 128 * 4 + (8 << 20);
     let k = Kernel {
         name: "gdn_step".into(),
