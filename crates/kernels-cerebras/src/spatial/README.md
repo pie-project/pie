@@ -1,10 +1,10 @@
-# The role-split wafer program (Cerebras CS-3)
+# The wafer program (Cerebras CS-3)
 
-The role-split program runs one bf16 model on a CS-3 wafer at batch 1. It is a second wafer layout
+The wafer program runs one bf16 model on a CS-3 wafer at batch 1. It is a second wafer layout
 next to `serve8b_region`. It is built for Qwen3.5 (9B, 4B and 0.8B), Qwen3-8B, Gemma 4 (E2B, E4B) and gpt-oss-20b
 (section 7). This file covers its design, results, build and run, the parameters and environment variables, the
 metrics, and open items.
-Serving is Rust only: the engine's `spatial::split::SplitModel` behind its `Wafer` runs the build's
+Serving is Rust only: the engine's `spatial::artifact::ArtifactModel` behind its `Wafer` runs the build's
 artifact (`artifact.rs`; this module is the build). The Python under `crates/kernels-cerebras/tools/`
 and `crates/engine-cerebras/tools/emu` runs at build time only.
 
@@ -12,7 +12,7 @@ and `crates/engine-cerebras/tools/emu` runs at build time only.
 
 **Why a second layout.** In `serve8b_region`, every layer PE carries the whole layer unit's code and
 buffers: about 22 KB of each 48 KB PE is not weights. That is why the bf16 9B models do not fit
-there. The role-split layout gives PEs fixed roles. Most PEs hold only weights, plus a small matvec
+there. The wafer program layout gives PEs fixed roles. Most PEs hold only weights, plus a small matvec
 kernel of about 8 KB, so about 40 KB of each PE holds weights. The element-wise work and the roots
 of every collective move onto a few control PEs.
 
@@ -20,7 +20,7 @@ of every collective move onto a few control PEs.
 (PX + 1) x (PY + 1) PEs. Each unit runs K layers. The units are visited as a snake: down unit
 column 0, then up column 1, and so on.
 
-- **Weight PE** (`programs/split/weight_q35.csl`). Holds its K layers' four tiles: the row's x chunk
+- **Weight PE** (`programs/wafer/weight_qwen.csl`). Holds its K layers' four tiles: the row's x chunk
   (Hc dims) by the column's outputs, as f16 bits. A layer runs as:
   1. x from CX's row multicast
   2. the qkv partial goes into the column reduction to CY
@@ -33,7 +33,7 @@ column 0, then up column 1, and so on.
   - Attention: NE KV entries a row; position p lives on row p % PY.
 - **CX** (`ctl_cx.csl`). Holds x's chunk, the residuals and the norms' gammas. It is the root of the
   row reductions and does the unit handoff.
-- **CY** (`ctl_cy_q35.csl`). The root of the column reductions. It does the rms scale, the GDN conv,
+- **CY** (`ctl_cy_qwen.csl`). The root of the column reductions. It does the rms scale, the GDN conv,
   SiLU, gates, delta and the gated norm, RoPE and the q/k norms, the softmax's o / l with its redo
   flag and log-sum-exp steps, and the MLP SiLU.
 - **Head** (`head_pe.csl`, `head_ctl.csl`). HC columns of HDc dims by HR rows of VR vocabulary rows.
@@ -65,7 +65,7 @@ violations; the chip did not.
   send colour; that hung the row reductions. Never let two input queues share a colour, even
   briefly (`bind_iqs`).
 - **Keep at least 768 B of stack room in every image.** The linker does not count the stack, which
-  grows down from 0xC000. `tools/split/chk_stack.py` checks this after every link.
+  grows down from 0xC000. `tools/wafer/chk_stack.py` checks this after every link.
 - **Name chip payloads `*_ieee`.** The bench harness otherwise compiles with
   `--fp16-format=bf16`, which turns the f16 kernels into garbage.
 
@@ -85,19 +85,19 @@ and Qwen3-8B.
 | model | layout | bare tok/s | Pie tok/s | notes |
 |---|---|---|---|---|
 | Llama 3.1 8B | serve8b_region (t29, TRM 32767) | 2,044 | ~2,000 e2e (1,981-2,002; decode 2,058-2,080) | depth 127, `posted:127` |
-| Qwen3.5-9B | role-split (wl11: 8 units 256 x 256, K 4) | 1,961 | 1,908 (0.5241 ms/step, 97.3%) | loop 381.7k cycles; GDN 11.1k / attention 11.45k a layer |
-| Qwen3.5-4B | role-split, the 9B geometry (Hc 10, Ic 36) | 2,057 | 1,998 (0.5005 ms/step, 97.1%) | GDN 10.6k / attention 10.96k |
-| Qwen3.5-0.8B | role-split, 6 units of 256 x 128 (Hc 8, Ic 14, NE 128) | 3,390 | 3,286 (0.3043 ms/step, 96.9%) | GDN 8.2k / attention 9.2k |
-| Qwen3-8B | role-split (9 units 256 x 228, Hc 18, K 4, gap slot; GATE 0, SLW 1) | 1,825 (0.548 ms, G2 12) | 1,811 (0.5521 ms, 99.3%, L64, G2 12) | greedy 512 and TF 512 golden; Pie 12 of 12 reps golden (G2 16 and 12). `PIE_CEREBRAS_SPLIT=<prep>:q84_:G2=12,WL=1`. serve8b_region (qw1): 1,642 |
-| Gemma 4 E2B | role-split Gemma (7 units 256 x 128, Hc 12, K 5; WSPEC 2) | 1,451 (0.6894 ms) | 1,436 (0.6962 ms, 99.0%) | greedy 720 golden; TF 256 0 mismatches |
-| Gemma 4 E4B | role-split Gemma (7 units 256 x 160, Hc 16, K 6; KV on 128 rows) | 1,127 (0.8873 ms) | 1,118 (0.8944 ms, 99.2%) | TF 165 and 640 (past the 512 window) 0 mismatches, greedy x 2 golden, Pie 3 reps golden (0974); global context 2,560 positions (NEG 20 x 128) |
-| Gemma 4 12B | role-split 12B (8 units 344 x 283: 128 attention rows Hc 12, plain rows Hc 15; K 6; RING 1) | 1,057 (0.9462 ms) | 1,055 (0.9483 ms, 99.8%) | TF 212 0 mismatches, greedy golden; TF 1,600 past the window: 3 bf16 near-ties (below); global context 4,096 |
-| gpt-oss-20b | role-split gpt-oss (12 units, K 2; CYV 2, GLUV 1) | 1,555 (0.643 ms) | 1,522 (0.6569 ms, 97.9%) | MXFP4 experts as E5M2, lossless; Pie text = bare greedy |
+| Qwen3.5-9B | wafer program (wl11: 8 units 256 x 256, K 4) | 1,961 | 1,908 (0.5241 ms/step, 97.3%) | loop 381.7k cycles; GDN 11.1k / attention 11.45k a layer |
+| Qwen3.5-4B | wafer program, the 9B geometry (Hc 10, Ic 36) | 2,057 | 1,998 (0.5005 ms/step, 97.1%) | GDN 10.6k / attention 10.96k |
+| Qwen3.5-0.8B | wafer program, 6 units of 256 x 128 (Hc 8, Ic 14, NE 128) | 3,390 | 3,286 (0.3043 ms/step, 96.9%) | GDN 8.2k / attention 9.2k |
+| Qwen3-8B | wafer program (9 units 256 x 228, Hc 18, K 4, gap slot; GATE 0, SLW 1) | 1,825 (0.548 ms, G2 12) | 1,811 (0.5521 ms, 99.3%, L64, G2 12) | greedy 512 and TF 512 golden; Pie 12 of 12 reps golden (G2 16 and 12). `PIE_CEREBRAS_WEIGHTS=<prep>:q84_:G2=12,WL=1`. serve8b_region (qw1): 1,642 |
+| Gemma 4 E2B | wafer program Gemma (7 units 256 x 128, Hc 12, K 5; WSPEC 2) | 1,451 (0.6894 ms) | 1,436 (0.6962 ms, 99.0%) | greedy 720 golden; TF 256 0 mismatches |
+| Gemma 4 E4B | wafer program Gemma (7 units 256 x 160, Hc 16, K 6; KV on 128 rows) | 1,127 (0.8873 ms) | 1,118 (0.8944 ms, 99.2%) | TF 165 and 640 (past the 512 window) 0 mismatches, greedy x 2 golden, Pie 3 reps golden (0974); global context 2,560 positions (NEG 20 x 128) |
+| Gemma 4 12B | wafer program 12B (8 units 344 x 283: 128 attention rows Hc 12, plain rows Hc 15; K 6; RING 1) | 1,057 (0.9462 ms) | 1,055 (0.9483 ms, 99.8%) | TF 212 0 mismatches, greedy golden; TF 1,600 past the window: 3 bf16 near-ties (below); global context 4,096 |
+| gpt-oss-20b | wafer program gpt-oss (12 units, K 2; CYV 2, GLUV 1) | 1,555 (0.643 ms) | 1,522 (0.6569 ms, 97.9%) | MXFP4 experts as E5M2, lossless; Pie text = bare greedy |
 
 Notes on the table:
 
 - The 9B, 4B and 0.8B builds share kernel sources; only the params differ.
-- Pie runs 32-step loops (`PIE_CEREBRAS_SPLIT_LOOP=32`). Longer loops lower the per-step cost but
+- Pie runs 32-step loops (`PIE_CEREBRAS_POSTED_LOOP=32`). Longer loops lower the per-step cost but
   lose wall time at the tail.
 - Pie's own cost is about 0.45 ms per posted launch, so Pie reaches 97% of bare.
 - Qwen3-8B: 36 dense attention layers in 9 K4 units on a 2 x 5 grid. The slot (1, 1) stays out of the snake so
@@ -108,46 +108,46 @@ Notes on the table:
 - Gemma 4 and gpt-oss-20b serve with 64-step loops, their prep meta's `LOOP`. gpt-oss at a fixed L32 / L64 posted
   0.6634 / 0.6619 ms (1,511 tok/s); with the meta's doubling loops up to 64, 0.6569 ms. Pie's overhead in ms equals
   the previous gpt-oss build's (gpo6: 0.6779 / 0.6723 ms against 0.661 bare): the ratio fell because bare got faster.
-- Llama stays on `serve8b_region`: the role-split layout forecasts 2,029-2,057 for it, which is no
+- Llama stays on `serve8b_region`: the wafer program layout forecasts 2,029-2,057 for it, which is no
   gain.
 
 ## 3. Build and run
 
-The build tools are under `crates/kernels-cerebras/tools/` (`tools/split`), the numerics gates under
+The build tools are under `crates/kernels-cerebras/tools/` (`tools/wafer`), the numerics gates under
 `crates/engine-cerebras/tools/emu`. Set `CSL_SDK` to the SDK directory, which holds `cslc` and
 `cs_readelf`.
 
 1. **Prep** (checkpoint -> tiles): writes `<prefix>meta.json`, `w<u>.npy`, `hw`, `hemb`, ... (and
-   `params.txt`). The build reads the meta; the geometry is Rust's (`split-geo`, `ARCHITECTURE.md`).
-   - Any Qwen3.5 / Qwen3 size: `tools/split/prep_q35.py <model> <out> <golden.json> <geometry> [prefix]`,
-     the geometry one of `split-geo --geometry qwen:<name>`'s (`9b`, `4b`, `0.8b`, `q3-8b`; the
+   `params.txt`). The build reads the meta; the geometry is Rust's (`wafer-compile`, `ARCHITECTURE.md`).
+   - Any Qwen3.5 / Qwen3 size: `tools/wafer/qwen/prep_qwen.py <model> <out> <golden.json> <geometry> [prefix]`,
+     the geometry one of `wafer-compile --geometry qwen:<name>`'s (`9b`, `4b`, `0.8b`, `q3-8b`; the
      table in `family/qwen.rs`), or explicit `PX PY UNX UNY K HR VR NE [prefix] [units]`.
 2. **Numerics gate** (before any new lever): `tools/emu/tf_q35.py <model> <golden> <meta.json>
    ref,f16acc_s16_kv16 256 <out>`. This needs `torch` and `transformers` with Qwen3.5. For
    serve8b_region's levers on Qwen3-8B: `tools/emu/tf_qwen3_8b.py`.
-3. **Sources**: `tools/split/mkfull.py <build dir> <prep> <prefix> [overrides k=v,..] [levers K:V,..]`
+3. **Sources**: `tools/wafer/build.py <build dir> <prep> <prefix> [overrides k=v,..] [levers K:V,..]`
    writes `layout.csl` (every PE's kernel and params resolved), one source a PE kind and `geo/`
-   (`split-geo`'s files: rcfg, floor, host, bindings, and `program.json`: with the host, bindings
+   (`wafer-compile`'s files: rcfg, floor, host, bindings, and `program.json`: with the host, bindings
    and rcfg files it is the artifact the engine runs; copy `geo/` to `<prep>/<prefix>program/`, or
    point `PIE_CEREBRAS_SPLIT_ARTIFACT` at it). Overrides are the meta's (as
-   `PIE_CEREBRAS_SPLIT` takes them: `G2=16,WL=1`); levers set kernel params (`CYV:2`, `SLW:1`; a
-   `<kind>.` prefix scopes one: `w.FIFOW:16`). It reads `programs/split`, or `$SPLIT_SRC`.
-4. **Link and check**: `tools/split/link.sh <build dir>`. This is a full local link at the chip's
+   `PIE_CEREBRAS_WEIGHTS` takes them: `G2=16,WL=1`); levers set kernel params (`CYV:2`, `SLW:1`; a
+   `<kind>.` prefix scopes one: `w.FIFOW:16`). It reads `programs/wafer`, or `$WAFER_KERNELS`.
+4. **Link and check**: `tools/wafer/link.sh <build dir>`. This is a full local link at the chip's
    fabric dims, followed by the stack-room check. Run it on every build before a chip request. Name
    the chip payload `*_ieee`.
 5. **Tiny end-to-end on the simulator** (no chip):
-   1. `tools/split/mk_tinyhf.py <dir> t08` (or `t4`) builds a tiny HF checkpoint and its golden.
-   2. `prep_q35.py` on it, then `mkfull.py <build> <prep> "" G2=2,WL=1,G2W=2` and `link.sh`.
-   3. `split_sim <build>/out <prep> "" G2=2,WL=1,G2W=2 5` (engine-cerebras `--example split_sim`; `SPLIT_NTOK` caps
-      the tokens) runs `SplitModel` against the golden: two sequences, a rollback and a logits row.
+   1. `tools/wafer/qwen/mk_tiny_qwen.py <dir> t08` (or `t4`) builds a tiny HF checkpoint and its golden.
+   2. `qwen/prep_qwen.py` on it, then `build.py <build> <prep> "" G2=2,WL=1,G2W=2` and `link.sh`.
+   3. `artifact_sim <build>/out <prep> "" G2=2,WL=1,G2W=2 5` (engine-cerebras `--example artifact_sim`; `ARTIFACT_SIM_NTOK` caps
+      the tokens) runs `ArtifactModel` against the golden: two sequences, a rollback and a logits row.
       Run it where the SDK runtime libraries are: inside the SDK container, through the container's
       glibc loader for a host-built binary, or with `PIE_CEREBRAS_SDK_LIB`.
    4. engine-cerebras `examples/split_place.rs` dumps a placement copy by copy (sha256 each), so two hosts or
       builds can be compared.
-6. **Serve**: `pie serve` with the cerebras engine and `PIE_CEREBRAS_SPLIT=<prep dir>:<prefix>:G2=16,WL=1`.
+6. **Serve**: `pie serve` with the cerebras engine and `PIE_CEREBRAS_WEIGHTS=<prep dir>:<prefix>:G2=16,WL=1`.
    The 0.8B uses `G2=16,G2Y=8,WL=1`. Pie config: `frame_size 4`, `frame_dispatch_depth 63`,
    `spatial_lookahead 254`. The program is the linked build. `Wafer::open` sees a split program and
-   drives it through `SplitModel`.
+   drives it through `ArtifactModel`.
 
 ## 4. Parameters, levers and diagnostics (one place)
 
@@ -157,7 +157,7 @@ default is the shipped build. Each kernel's header describes its own params and 
 | param | where | default | meaning |
 |---|---|---|---|
 | `NPX` | head_pe | 1 | x in NPX f16 parts. 1 was emulated exact on all three goldens. |
-| `MV` | weight | 1 (mkfull) | f16 tiles with f16 accumulation (0: bf16 tiles, f32 accumulation) |
+| `MV` | weight | 1 (build.py) | f16 tiles with f16 accumulation (0: bf16 tiles, f32 accumulation) |
 | `SILU16`, `CONVQK`, `ATTV`, `GDEC`, `ROPEP`, `SILUQ` | CY (GDEC also weight) | 1 | the layer trims: f16 MLP SiLU; q/k conv first; vector gate; decay off the path; next position's RoPE tables early; lean f32 SiLU. The 0 forms are the earlier, slower code. |
 | `ATTL` | CY, weight | 2 | the log-sum-exp steps go in a second multicast after o (0: they ride with o) |
 | `SSQL` | CX, weight | 1 | x's sum of squares follows x |
@@ -169,13 +169,13 @@ default is the shipped build. Each kernel's header describes its own params and 
 | `DIAG` | weight, CX, CY | 0 | bisection bits: 1 no layers, 2 one layer, 4 no MLP, 8 column reduction only, 16 row reduction only |
 | `HOSTX` | CX | 0 | simulator tests: x is the host's, no handoff |
 | `WFORCE`, `WFN` | head_ctl | 0 | diagnostics: a forced winner sequence `(s WFORCE + 7) % (VR WFN)` that exercises every row's return path |
-| `force` / `nforce` | head_ctl (symbols) | - | the host forces the first `nforce` steps' tokens: a whole prompt through the loop in one launch (`PIE_CEREBRAS_SPLIT_FORCE`), and teacher-forced checks |
+| `force` / `nforce` | head_ctl (symbols) | - | the host forces the first `nforce` steps' tokens: a whole prompt through the loop in one launch (`PIE_CEREBRAS_FORCE_PROMPT`), and teacher-forced checks |
 | `HACC16` | head_pe | 0 | measurement: f16 head accumulation, about -1.7k cycles. It halves the 9B golden's tightest margin and, stacked with other levers, flipped it. |
 | `FIFOW` | all | 32 | the reductions' FIFO depth |
-| `SLW` | serve8b_region regions; role-split CY | 0 | the f16 SiLU without its subnormal flush (the tail to 2^-24). Planner key `silu16w`; Qwen3-8B needs it on both layouts (`tools/emu/silu16.py`): the flush costs 2 golden tokens in emulation. |
+| `SLW` | serve8b_region regions; wafer program CY | 0 | the f16 SiLU without its subnormal flush (the tail to 2^-24). Planner key `silu16w`; Qwen3-8B needs it on both layouts (`tools/emu/silu16.py`): the flush costs 2 golden tokens in emulation. |
 | `GATE` | CY | 1 | attention's q_proj carries the output gate (Qwen3.5). Qwen3 (dense): 0, NQA = Qh Dc + 2 Dc. |
 | `GAPX`, `GAPY` | layout | 255 | the unit slot left out of the snake (relay PEs); from the prep meta |
-| `RLV`, `RBITS` | CY | 4, 3 | RoPE tables: a position is RLV digits of RBITS bits, cos / sin composed from one table entry a digit; positions < 2^(RBITS RLV). The prep takes the levels its context needs (9B / 4B / 0.8B: 5) and writes them to the meta; `SplitModel` bounds its positions there. |
+| `RLV`, `RBITS` | CY | 4, 3 | RoPE tables: a position is RLV digits of RBITS bits, cos / sin composed from one table entry a digit; positions < 2^(RBITS RLV). The prep takes the levels its context needs (9B / 4B / 0.8B: 5) and writes them to the meta; `ArtifactModel` bounds its positions there. |
 
 `head_ctl`, `head_pe` and `CX` always write a few `tdbg` stamps. These are off the critical path:
 `head_ctl`'s `tdbg[2 + s]` is the token loop's clock.
@@ -190,11 +190,11 @@ These variants were removed after they failed:
 
 | variable | meaning |
 |---|---|
-| `PIE_CEREBRAS_SPLIT=<prep dir>:<prefix>[:k=v,...]` | selects the split program. Overrides: `G2` (`G2X` / `G2Y` / `G2H`) chain groups, `WL` the token loop, `G2W` the max-reduce groups, `CAP`, `EPS`. |
-| `PIE_CEREBRAS_SPLIT_LOOP` | steps a posted loop runs past its row (default: the prep meta's `LOOP`, else 32; gpt-oss preps say 64). Loops double from 8 up to this value. |
-| `PIE_CEREBRAS_SPLIT_POST=0` | one loop at a time (synchronous, bounded by the lane's pages) |
+| `PIE_CEREBRAS_WEIGHTS=<prep dir>:<prefix>[:k=v,...]` | selects the split program. Overrides: `G2` (`G2X` / `G2Y` / `G2H`) chain groups, `WL` the token loop, `G2W` the max-reduce groups, `CAP`, `EPS`. |
+| `PIE_CEREBRAS_POSTED_LOOP` | steps a posted loop runs past its row (default: the prep meta's `LOOP`, else 32; gpt-oss preps say 64). Loops double from 8 up to this value. |
+| `PIE_CEREBRAS_POSTED=0` | one loop at a time (synchronous, bounded by the lane's pages) |
 | `PIE_CEREBRAS_LOOP_ROOM=off` | synchronous mode with no page bound |
-| `PIE_CEREBRAS_SPLIT_FORCE=1` | the prompt is forced through the token loop (one launch: prefill and the first token). Needs `force` / `nforce`. |
+| `PIE_CEREBRAS_FORCE_PROMPT=1` | the prompt is forced through the token loop (one launch: prefill and the first token). Needs `force` / `nforce`. |
 | `PIE_CEREBRAS_CONTINUATION=posted:<n>` | serve8b_region (Llama, Qwen3-8B): posted continuations, with the matching `frame_dispatch_depth` |
 
 **Posted loops.** Greedy decoding runs as token loops posted back to back. The next loop goes onto
@@ -228,7 +228,7 @@ They match HF f32 logprobs to within 0.004 on the chosen token.
   the CS-3 it gave 15 teacher-forced mismatches, with margins up to 2.77, although host emulation
   gives 0. It is a real bug, not yet found. qw1, which ships, is exact.
 - **Rep-2 near-tie flip** (serve8b_region). On Qwen3-8B in Pie, 1 of 6 reps leaves the golden at token ~389, the
-  golden's tightest margin (0.0043, an exact bf16 tie). The role-split build serves Qwen3-8B now: 6 of 6 reps golden.
+  golden's tightest margin (0.0043, an exact bf16 tie). The wafer program build serves Qwen3-8B now: 6 of 6 reps golden.
 
 - **Gemma 4 12B speed.** 0.946 ms against a ~0.86 ms forecast. A sliding layer is ~13.3k cycles
   (0.982 ms and 14.1k before the exact ring). The attention-row PE has 1,776 B of stack room, too
@@ -241,10 +241,10 @@ They match HF f32 logprobs to within 0.004 on the chosen token.
 
 ## 7. Gemma 4 and gpt-oss-20b
 
-Both reuse the role-split machinery (the generic chains, segments, handoffs, head and token loop; `head_ctl.csl`)
+Both reuse the wafer program machinery (the generic chains, segments, handoffs, head and token loop; `head_ctl.csl`)
 with their own kernels and a family each (`family/gemma.rs`, `family/gptoss.rs`: floor, wiring, rcfg words,
-bindings). The prep meta selects the family: `NEX` is gpt-oss, `geo` without it is Gemma. Tools: `tools/split/gemma`,
-`tools/split/gptoss` (prep, `mkfull_*.py`, `run_*.py` bare runner, `gotiny.sh` tiny simulation), `tools/emu/tf_gemma.py`
+bindings). The prep meta selects the family: `NEX` is gpt-oss, `geo` without it is Gemma. Tools: `tools/wafer/gemma`,
+`tools/wafer/gptoss` (prep, `build_*.py`, `run_*.py` bare runner, `gotiny.sh` tiny simulation), `tools/emu/tf_gemma.py`
 and `tf_gptoss.py` (teacher-forced emulation of the kernels' number formats).
 
 **Gemma 4** (`*_gemma.csl`, E2B and E4B; 12B below).
@@ -264,14 +264,14 @@ and `tf_gptoss.py` (teacher-forced emulation of the kernels' number formats).
   a one-copy whole-ring mixer measured slower on E4B, 0.8927 against 0.8873 ms). GELU stays
   f32 (an f16 GELU flipped the long golden; `GELUT 2` is the f32 form with fewer f32 multiplies, which cost a cycle a
   word an operand); the final softcap is applied on the host (greedy-invariant).
-- Builds as on chip: E2B `mkfull.py <build> <prep> ge2_ "" WSPEC:2`; E4B (0974) `mkfull.py <build> <prep> ge4_
+- Builds as on chip: E2B `build.py <build> <prep> ge2_ "" WSPEC:2`; E4B (0974) `build.py <build> <prep> ge4_
   PYW=128,NEG=20,WIN=0 WSPEC:0,w.FIFOW:16` (its staged meta predates `PYW`; the weight PE's FIFO at 16 words).
 - The weight PE works out the step's position row and entry once a step (a u32 divide by a row count that is not a
   power of two is a ~270-cycle helper) and keeps the cache offsets in comptime tables.
 - Diagnostics: `DIAG 1` (no layers: handoffs, head, PLE and KVS words checked at every consumer), `PLOG 1` (the full
   model logs each step's PLE / KVS words: the hang-localizing probe).
 
-**Gemma 4 12B** (`*_g12.csl`, bf16; no PLE or shared KV, `attention_k_eq_v` on the global layers). 21.9 GB of
+**Gemma 4 12B** (`*_gemma12.csl`, bf16; no PLE or shared KV, `attention_k_eq_v` on the global layers). 21.9 GB of
 layers and a 2 GB tied head fill 98% of the wafer, which only fits with a row-role split.
 - Units: 8 of 344 x 283 weight PEs, K 6 (S S S S S G). The first 128 rows of a unit are attention rows (Hc 12; the KV,
   position p on row p % 128; the scores segments). The other 155 are plain rows (Hc 15, no attention code: they send
@@ -281,11 +281,11 @@ layers and a 2 GB tied head fill 98% of the wafer, which only fits with a row-ro
   (the weight PE stores it v-normalised). The sliding ring is 8 x 128 entries, exactly the 1024 window, so `RING 1`
   runs a sliding layer's mixer over the whole ring with fixed-length vector ops (no window mask). The
   global context is 32 x 128 = 4,096.
-- Head: 54 columns + control (its tiles in two files, `hw0` / `hw1`: one is over the 2 GiB a staged file may take), tied (`head_g12.csl` reads the winner's embedding from its f16 lm_head tile). A head
+- Head: 54 columns + control (its tiles in two files, `hw0` / `hw1`: one is over the 2 GiB a staged file may take), tied (`head_gemma12.csl` reads the winner's embedding from its f16 lm_head tile). A head
   column takes a group of CX rows: attention rows in sixes, plain rows in fives, no group across the CY row. The
   group's CX PEs chain their x to the group's root on the last unit's CX column, and the root sends it east. The
   wafer loop's embedding returns to unit 0's root row and down the same chain.
-- Tools: `tools/split/g12`; the family is `family/gemma12.rs`.
+- Tools: `tools/wafer/gemma12`; the family is `family/gemma12.rs`.
 
 **gpt-oss-20b** (`*_gptoss*.csl`).
 - Experts: the released MXFP4 values re-encoded losslessly as FP8 E5M2 (the high byte of an f16) with one power of
@@ -296,5 +296,5 @@ layers and a 2 GB tied head fill 98% of the wafer, which only fits with a row-ro
 - Head: 201,088 untied rows in a band below the units; logits are prescaled (`HSCALE`, 2^15) and the host divides.
 - Pass criterion: the bf16 golden, with mismatches classified by `tools/emu/classify_tf.py` (bf16 top-1 tie, router
   tie at the step or before it); the f32 reference is secondary.
-- Serving build (the mkfull defaults): `GLUV 1` (SwiGLU as vector ops), `CYV 2` (the attention CY's exp as a vector
+- Serving build (the build.py defaults): `GLUV 1` (SwiGLU as vector ops), `CYV 2` (the attention CY's exp as a vector
   op, bit-identical). `CYV 1` / `3` and the stamps (`TSTAMP`) are opt-in.

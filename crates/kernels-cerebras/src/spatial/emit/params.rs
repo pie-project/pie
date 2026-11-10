@@ -1,7 +1,7 @@
 //! Kernel comptime params: each kind's `K:V` list (its [`KernelBuild`] from the family, the
 //! build's levers on top), and each PE's own list (its kind's, then the blocks'
-//! [`super::super::abi::Overrides`] at that PE). Replaces the shape half of `mkfull.py`,
-//! `gemma/mkfull_gemma.py`, `g12/mkfull_g12.py`, `gptoss/mkfull_gptoss.py`.
+//! [`super::super::abi::Overrides`] at that PE). Replaces the shape half of `build.py`,
+//! `gemma/build_gemma.py`, `gemma12/build_gemma12.py`, `gptoss/build_gptoss.py`.
 
 use std::collections::BTreeMap;
 
@@ -21,7 +21,7 @@ pub struct Levers {
 }
 
 impl Levers {
-    /// `K:V,K:V` (or `K=V`), as `link.sh`'s extra params and `split-geo --levers` take them.
+    /// `K:V,K:V` (or `K=V`), as `link.sh`'s extra params and `wafer-compile --levers` take them.
     pub fn parse(s: &str) -> Result<Levers, String> {
         let mut items = BTreeMap::new();
         for kv in s.split(',').filter(|s| !s.is_empty()) {

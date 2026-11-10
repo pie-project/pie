@@ -191,9 +191,9 @@ fn what(name: &str) -> &'static str {
 }
 
 impl ModelSpec {
-    /// A role-split program's stand-in (split/: the program and its prep carry the model, so the trace's
+    /// A wafer program's stand-in (artifact/: the program and its prep carry the model, so the trace's
     /// structure is not the kernels' to check): the trace's name, every shape field 0.
-    pub fn for_split(trace: &Trace) -> ModelSpec {
+    pub fn for_artifact(trace: &Trace) -> ModelSpec {
         ModelSpec {
             name: trace.name.clone(),
             layers: 0,

@@ -1,4 +1,4 @@
-//! Blocks: the unit a role-split program is composed of. A block is one part of the model's
+//! Blocks: the unit a wafer program is composed of. A block is one part of the model's
 //! dataflow as it sits on the wafer (the units and their chains, a segment kind, the head, the
 //! token loop, a storage column ...): it places its PEs, lays its links, declares the colours of
 //! the classes it owns, states per-PE param differences and copies its data. A family is a list

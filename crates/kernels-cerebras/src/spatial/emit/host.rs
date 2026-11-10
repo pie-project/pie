@@ -1,6 +1,6 @@
 //! What the host driver needs to find on the wafer: the PEs it reads and writes, the shapes of
 //! what it moves and the host's share of the model's math (the logit softcap). Everything the
-//! engine's `SplitModel` does that depends on the program is read from here (through the
+//! engine's `ArtifactModel` does that depends on the program is read from here (through the
 //! [`super::super::artifact::Artifact`]): the host names no family.
 
 use serde::{Deserialize, Serialize};
@@ -68,8 +68,8 @@ fn cx_rect(u: &Unit) -> Rect {
 impl HostLayout {
     pub fn of(prog: &Program) -> Result<HostLayout, String> {
         let (f, p, c) = (&prog.floor, &prog.plan.partition, &prog.plan.contract);
-        let first = f.units.first().ok_or("split program: no units")?;
-        let last = f.units.last().ok_or("split program: no units")?;
+        let first = f.units.first().ok_or("program: no units")?;
+        let last = f.units.last().ok_or("program: no units")?;
         let cy_row = first.cy;
         // x runs: the plan's row runs, each cut at the CY row, which the CX column skips
         let runs: Vec<(u32, u32, u32)> = p

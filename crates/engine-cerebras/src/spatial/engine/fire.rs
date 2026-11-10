@@ -257,7 +257,7 @@ impl Spatial {
         let greedy = greedy && last_only && lookahead > 0;
         let width = self.readout.as_ref().map_or(0, |(_, w)| *w as usize);
         let fed: Vec<u32> = history.iter().chain(tokens).copied().collect();
-        // The role-split program runs its token loops back to back: the next
+        // The wafer program runs its token loops back to back: the next
         // is posted as one lands, so the wafer runs while rows are answered.
         let posting = self.split_posting();
         if posting {
@@ -313,21 +313,21 @@ impl Spatial {
                     .max(ahead.map_or(0, |fires| (fires as usize).min(lookahead)));
                 c.next_loop
             };
-            // A program whose loop runs far (the role-split's 256 passes) runs
+            // A program whose loop runs far (the wafer program's 256 passes) runs
             // no further than the lane's pages (`PIE_CEREBRAS_LOOP_ROOM=off`:
             // the lookahead alone): the rows past a sequence's end are waste.
             let room = (pages.len() as u32 * self.kv.page_size)
                 .saturating_sub(start + tokens.len() as u32) as usize;
-            let bounded = self.model.as_ref().is_some_and(|w| w.split)
+            let bounded = self.model.as_ref().is_some_and(|w| w.artifact)
                 && !posting
                 && std::env::var("PIE_CEREBRAS_LOOP_ROOM").map_or(true, |v| v != "off")
                 && !pages.is_empty();
             let steps = if bounded { steps.min(room) } else { steps };
-            // With the prompt forced through the loop (PIE_CEREBRAS_SPLIT_FORCE=1),
+            // With the prompt forced through the loop (PIE_CEREBRAS_FORCE_PROMPT=1),
             // the waited-for launch is the prompt alone: its first token right
             // after the prefill, every later loop posted.
             let steps =
-                if posting && std::env::var("PIE_CEREBRAS_SPLIT_FORCE").is_ok_and(|v| v == "1") {
+                if posting && std::env::var("PIE_CEREBRAS_FORCE_PROMPT").is_ok_and(|v| v == "1") {
                     0
                 } else {
                     steps
@@ -375,12 +375,12 @@ impl Spatial {
         ))
     }
 
-    /// Whether greedy loops are posted back to back (the role-split
-    /// program; `PIE_CEREBRAS_SPLIT_POST=0`: one loop at a time).
+    /// Whether greedy loops are posted back to back (the wafer program
+    /// program; `PIE_CEREBRAS_POSTED=0`: one loop at a time).
     fn split_posting(&self) -> bool {
-        self.model.as_ref().is_some_and(|w| w.split)
+        self.model.as_ref().is_some_and(|w| w.artifact)
             && self.lookahead() > 0
-            && std::env::var("PIE_CEREBRAS_SPLIT_POST").map_or(true, |v| v != "0")
+            && std::env::var("PIE_CEREBRAS_POSTED").map_or(true, |v| v != "0")
     }
 
     /// The posted loop's rows into the cache (waiting for it, or only if it
@@ -428,11 +428,11 @@ impl Spatial {
         let start = c.tokens.len();
         // A loop's rows come back when it ends: the request's last rows wait
         // for its whole loop, so posted loops stay short
-        // (`PIE_CEREBRAS_SPLIT_LOOP`, else the program plan's loop, else 32
+        // (`PIE_CEREBRAS_POSTED_LOOP`, else the program plan's loop, else 32
         // steps past the row).
-        let prep_loop = self.model()?.split_loop;
+        let prep_loop = self.model()?.posted_loop;
         let c = &mut self.kv.cached;
-        let most = std::env::var("PIE_CEREBRAS_SPLIT_LOOP")
+        let most = std::env::var("PIE_CEREBRAS_POSTED_LOOP")
             .ok()
             .and_then(|v| v.parse::<usize>().ok())
             .or(prep_loop)
@@ -448,7 +448,7 @@ impl Spatial {
         w.post_greedy(&[token], start, steps)
             .map_err(Error::Device)?;
         self.split_posted = Some((token, start));
-        tracing::info!(start, steps, "spatial: split token loop posted");
+        tracing::info!(start, steps, "spatial: artifact token loop posted");
         Ok(())
     }
 

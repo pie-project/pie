@@ -1,4 +1,4 @@
-//! A built role-split program: the plan, the blocks it composes, their floor, wiring, palette
+//! A built wafer program: the plan, the blocks it composes, their floor, wiring, palette
 //! and laid fabric, every kind's kernel and the per-PE param overrides. The one entry point the
 //! host, the tools and the tests use.
 

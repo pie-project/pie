@@ -12,9 +12,9 @@
 //! the backends' shared numerics rules: compute in f32, round at the write,
 //! refuse rather than approximate.
 //!
-//! [`spatial`] is the other half: the role-split wafer program's build (a plan
+//! [`spatial`] is the other half: the wafer program's build (a plan
 //! to the floor, links, kernels and weight bindings of a whole-wafer program,
-//! `programs/split`), written as an [`spatial::artifact::Artifact`] the engine
+//! `programs/wafer`), written as an [`spatial::artifact::Artifact`] the engine
 //! loads and runs.
 
 pub mod attn;

@@ -83,7 +83,7 @@ pub struct Spatial {
     refilled: u64,
     /// Greedy rows a token loop answered, and the loops run.
     ahead_hits: u64,
-    /// The role-split program's posted token loop: the token it was fed and
+    /// The wafer program's posted token loop: the token it was fed and
     /// its position.
     split_posted: Option<(u32, usize)>,
     ahead_runs: u64,
@@ -188,8 +188,8 @@ impl Spatial {
             .ok()
             .and_then(|text| serde_json::from_str(&text).ok())
             .ok_or_else(|| Error::Load(format!("{}: no readable out.json", out_json.display())))?;
-        // The role-split program carries its own model (the prep's tiles).
-        if !super::split::is_split(Path::new(&program)) {
+        // The wafer program carries its own model (the prep's tiles).
+        if !super::artifact::is_artifact_program(Path::new(&program)) {
             let get = model::out_json_params(&json);
             match spec {
                 Read::Dense(spec) => spec.check_program(get),
@@ -267,16 +267,16 @@ impl Engine for Spatial {
             poem_compiler::state_slots(budgets.slots, &trace, crate::api::DEFAULT_STATE_SLOTS);
         // The model as the spatial kernels see it: refused here unless its
         // structure is one they implement (spatial/plan.rs).
-        // (a role-split program carries its own model, its prep's tiles: a trace the kernels' reader
-        // refuses is still served by it; split/mod.rs)
-        let split = self
+        // (a wafer program carries its own model, its prep's tiles: a trace the kernels' reader
+        // refuses is still served by it; artifact/mod.rs)
+        let artifact = self
             .spatial
             .program
             .as_ref()
-            .is_some_and(|p| super::split::is_split(Path::new(p)));
+            .is_some_and(|p| super::artifact::is_artifact_program(Path::new(p)));
         let spec = match Read::of(&trace) {
             Ok(s) => s,
-            Err(_) if split => Read::Dense(model::ModelSpec::for_split(&trace)),
+            Err(_) if artifact => Read::Dense(model::ModelSpec::for_artifact(&trace)),
             Err(e) => return Err(Error::Load(e.to_string())),
         };
         // The weights land by the trace's params (the shell takes the trace).

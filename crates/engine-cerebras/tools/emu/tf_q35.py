@@ -1,4 +1,4 @@
-"""Teacher-forced check of the role-split kernels' number formats on any Qwen3.5 against an HF f32
+"""Teacher-forced check of the wafer program kernels' number formats on any Qwen3.5 against an HF f32
 golden (the numerics gate before a build goes to the chip: a lever ships only if it keeps 0
 mismatches). The f16 accumulation chunks are the prep's geometry, from its meta.json.
 

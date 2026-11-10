@@ -23,7 +23,7 @@ use super::{Pe, word};
 
 type R<T> = Result<T, String>;
 
-/// Every name the kernels export, in export order (`mkfull_gptoss.py`'s `NAMES`).
+/// Every name the kernels export, in export order (`build_gptoss.py`'s `NAMES`).
 pub const SYMBOLS: &[(&str, &str)] = &[
     ("w", "u16"),
     ("wx", "u16"),
@@ -207,7 +207,7 @@ impl Dims {
     }
 }
 
-/// Every kind's kernel of a gpt-oss program: `mkfull_gptoss.py`'s params with the serving
+/// Every kind's kernel of a gpt-oss program: `build_gptoss.py`'s params with the serving
 /// defaults (`DIAG` / `TSTAMP` / `XKEEP` / `XDLY` / `PFTZ` / `WFORCE` 0, `GLUV` 1, `CYV` 2,
 /// `FIFOW` 32).
 pub fn kernels(prog: &Program) -> R<Kernels> {

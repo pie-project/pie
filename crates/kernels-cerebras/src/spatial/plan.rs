@@ -276,7 +276,7 @@ impl Plan {
     /// `plan` / `floor`.
     pub fn validate(&self) -> Result<(), String> {
         let (sh, pa, co) = (&self.shape, &self.partition, &self.contract);
-        let bad = |m: String| Err(format!("split plan: {m}"));
+        let bad = |m: String| Err(format!("plan: {m}"));
         if sh.hidden == 0 || sh.vocab == 0 || sh.layers.is_empty() {
             return bad("an empty model".into());
         }

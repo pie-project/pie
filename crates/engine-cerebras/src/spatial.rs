@@ -44,6 +44,7 @@
 //!   driver;
 //! - `engine`: PIE's `Engine` over it ([`Spatial`]).
 
+pub mod artifact;
 pub mod build;
 pub mod ckpt;
 pub mod codegen;
@@ -72,7 +73,6 @@ pub mod serve_g4;
 pub mod serve_gptoss;
 pub mod serve_q35;
 pub mod shapes;
-pub mod split;
 pub mod wafer;
 
 pub use config::SpatialBoot;

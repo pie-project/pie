@@ -1,12 +1,12 @@
 //! The program's `layout.csl` and per-kind source files: the kind rectangles of the floor, each
 //! with its kernel source and params, the memcpy frame. Replaces the layout writers of
-//! `mkfull.py` and the family `mkfull_*.py` (their `layout.csl` and `<kind>.csl` outputs).
+//! `build.py` and the family `build_*.py` (their `layout.csl` and `<kind>.csl` outputs).
 //!
-//! The per-kind sources are the `mkfull*.py` ones byte for byte (the kernel source, then one-word
+//! The per-kind sources are the `build*.py` ones byte for byte (the kernel source, then one-word
 //! dummies for every exported name the kind does not own, in the family's export order). The
 //! layout is written from the floor instead of re-deriving it in CSL: every PE's kernel and
 //! resolved params ([`super::params::tile`]) grouped into maximal rectangles, one loop nest a
-//! rectangle, every param a literal. The levers are applied before (`split-geo build --levers`),
+//! rectangle, every param a literal. The levers are applied before (`wafer-compile build --levers`),
 //! so the link takes no params.
 
 use std::collections::HashMap;
@@ -29,7 +29,7 @@ comptime { @export_symbol(init); @export_symbol(compute); }
 ";
 
 /// A kind's source as the build directory holds it: `body`, then a one-word dummy for every
-/// exported name it does not own (`mkfull*.py`'s text, byte for byte).
+/// exported name it does not own (`build*.py`'s text, byte for byte).
 pub fn kind_source(body: &str, syms: &[(&str, &str)], owns: &[&str]) -> Result<String, String> {
     for o in owns {
         if !syms.iter().any(|(n, _)| n == o) {
@@ -170,8 +170,8 @@ pub fn layout_text(prog: &Program, kinds: &Kernels) -> Result<String, String> {
 }
 
 /// Writes `<out>/layout.csl` and one `<kind>.csl` a role kind (the kernel source with the other
-/// kinds' exported names as one-word dummies), as `mkfull*.py` do, plus what `link.sh` reads:
-/// `geo.env` (the rectangle and fabric dims).
+/// kinds' exported names as one-word dummies), as `build*.py` do, plus what `link.sh` reads:
+/// `dims.env` (the rectangle and fabric dims).
 pub fn write(
     prog: &Program,
     levers: &Levers,
@@ -204,7 +204,7 @@ pub fn write(
     wr("layout.csl", &layout_text(prog, &kinds)?)?;
     let (w, h) = (prog.floor.w, prog.floor.h);
     wr(
-        "geo.env",
+        "dims.env",
         &format!("FW={} FH={} PW={w} PH={h}\n", w + 7, h + 2),
     )?;
     Ok(())

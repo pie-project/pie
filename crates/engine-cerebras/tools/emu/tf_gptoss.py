@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """tf_gptoss.py <model> <golden.json> <modes,comma> <n> <out.json> [--layers L]
 
-Teacher-forced host emulation of the role-split gpt-oss program's arithmetic against a golden
+Teacher-forced host emulation of the wafer program gpt-oss program's arithmetic against a golden
 (hf_gptoss_golden.py's json: prompt_ids + tokens). Each mode runs the whole model one position at a
 time and reports greedy mismatches against the golden tokens, the gap (our top-1 minus the golden
 token's logit, negative = a flip) at the golden's tightest margins, and the router statistics.

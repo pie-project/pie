@@ -1,7 +1,7 @@
 //! Qwen3.5 (GDN layers + gated full attention: 9B / 4B / 0.8B) and Qwen3 (dense attention, no
 //! output gate: Qwen3-8B): a snake of PX x PY units (at most one gap slot, whose PEs relay), the
 //! scores segments on every weight row, GDN's (k, q) multicast and the o-norm segments where
-//! there are GDN layers, the head east of the units, the token loop. Kernels: [`q35`].
+//! there are GDN layers, the head east of the units, the token loop. Kernels: [`qwen`].
 
 use crate::spatial::abi::Kernels;
 use crate::spatial::block::Block;
@@ -12,7 +12,7 @@ use crate::spatial::block::token_loop::TokenLoop;
 use crate::spatial::block::units::{UnitCopies, Units};
 use crate::spatial::family::{Family, units_of};
 use crate::spatial::floor::{UnitGrid, UnitLayout};
-use crate::spatial::kernels::q35;
+use crate::spatial::kernels::qwen;
 use crate::spatial::plan::{
     Contract, FamilyId, HeadPartition, KvEntries, LayerKind, Partition, Plan, Preset, ReduceGroups,
     RowRun, Segments, Shape,
@@ -160,7 +160,7 @@ impl Family for Qwen {
         })
     }
 
-    /// `prep_q35.py`'s cut: PX, PY, UNX, UNY, K, HR, VR, NE, the units (NU) and the RoPE tables'
+    /// `qwen/prep_qwen.py`'s cut: PX, PY, UNX, UNY, K, HR, VR, NE, the units (NU) and the RoPE tables'
     /// levels and digit bits (RLV, RBITS).
     fn tiling(&self, plan: &Plan) -> R<serde_json::Value> {
         let p = &plan.partition;
@@ -275,10 +275,10 @@ impl Family for Qwen {
     }
 
     fn kernels(&self, prog: &Program) -> R<Kernels> {
-        q35::kernels(prog)
+        qwen::kernels(prog)
     }
 
     fn symbols(&self) -> &'static [(&'static str, &'static str)] {
-        q35::SYMBOLS
+        qwen::SYMBOLS
     }
 }

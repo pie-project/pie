@@ -19,7 +19,7 @@ use super::head::{HEAD_PE, HeadCtl, HeadPe};
 
 type R<T> = Result<T, String>;
 
-/// Every name the Gemma kernels export, in export order (`mkfull_gemma.py`'s `NAMES`).
+/// Every name the Gemma kernels export, in export order (`build_gemma.py`'s `NAMES`).
 pub const SYMBOLS: &[(&str, &str)] = &[
     ("w", "u16"),
     ("rcfg", "u32"),

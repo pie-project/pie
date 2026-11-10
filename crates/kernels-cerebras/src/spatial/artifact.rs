@@ -3,7 +3,7 @@
 //! and the model facts the host's math needs. Nothing here names a family: a program built from
 //! any plan is run the same way.
 //!
-//! On disk, a directory (what `split-geo` writes):
+//! On disk, a directory (what `wafer-compile` writes):
 //! - `program.json`: [`Header`] (the format, the model facts, the plan it was built from);
 //! - `host.json`: [`HostLayout`];
 //! - `bindings.json`: the [`Binding`]s;

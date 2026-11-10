@@ -1,6 +1,6 @@
-"""Bit-level emulations (torch half: one rounding an op) of serve8b_region's and the role-split
+"""Bit-level emulations (torch half: one rounding an op) of serve8b_region's and the wafer program
 CY's f16 SiLU, act = silu(g) u, as the kernels compute it (codegen's trm_silu.json / trm_silh.json /
-trm_slw.json; split/ctl_cy_q35.csl's silu16).
+trm_slw.json; split/ctl_cy_qwen.csl's silu16).
 
 - silu16  (TRM 1024): the f32-scaled form: s g log2e and s u ln2 in f32, rounded once to f16.
 - silu16h (TRM 2048): the f16-scaled form; returns (act, c), c the f32 correction of the scalars.

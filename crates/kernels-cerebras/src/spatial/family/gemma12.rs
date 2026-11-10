@@ -59,7 +59,7 @@ impl Gemma12 {
         let n = p.units;
         if n == 0 || !n.is_multiple_of(2) {
             return Err(format!(
-                "split g12: {n} units (two unit columns, unit 0 and the last on row 0)"
+                "gemma12: {n} units (two unit columns, unit 0 and the last on row 0)"
             ));
         }
         let (uw, uh, uny) = (p.cols + 1, p.rows + 1, n / 2);
@@ -113,7 +113,7 @@ impl Family for Gemma12 {
         let (hr, units, neg) = (pr.need("HR")?, pr.need("NU")?, pr.need("NEG")?);
         let n = s.layers.len() as u32;
         if units == 0 || !n.is_multiple_of(units) {
-            return Err(format!("split g12: {n} layers on {units} units"));
+            return Err(format!("gemma12: {n} layers on {units} units"));
         }
         let window = s
             .layers
@@ -122,7 +122,7 @@ impl Family for Gemma12 {
                 LayerKind::Sliding { window } => Some(*window),
                 _ => None,
             })
-            .ok_or("split g12: no sliding layer")?;
+            .ok_or("gemma12: no sliding layer")?;
         let groups = groups_split(py, py / 2, ra, pr.need("GA")?, pr.need("GW")?);
         let g2 = pr.need("G2")?;
         let plan = Plan {
@@ -185,7 +185,7 @@ impl Family for Gemma12 {
         Ok(plan)
     }
 
-    /// `prep_g12.py`'s cut: the unit shape and count, the attention rows and both row kinds'
+    /// `prep_gemma12.py`'s cut: the unit shape and count, the attention rows and both row kinds'
     /// dims, the scores segment width, the head (one column a row group; `hc`: every row's dims).
     fn tiling(&self, plan: &Plan) -> R<serde_json::Value> {
         let p = &plan.partition;

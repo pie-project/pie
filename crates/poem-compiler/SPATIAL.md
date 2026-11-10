@@ -37,7 +37,7 @@ The physical build then lowers `SpatialPlan<Partition>` to the device. That buil
   - weight PEs
   - control rows and columns that reduce
   - a head that holds the vocabulary rows
-- The partition is the unit grid, the rows and columns a unit's dims split over, segment widths, two-level reduction groups, and the head's cut. These are the `Partition` fields of a role-split plan.
+- The partition is the unit grid, the rows and columns a unit's dims split over, segment widths, two-level reduction groups, and the head's cut. These are the `Partition` fields of a wafer program plan.
 - The flows become handoffs between units.
 - The target's own build lays them onto the fabric: floor, wiring, colours and kernels.
 - Its existing `Plan` is today read off a prep's metadata. It becomes `SpatialPlan<Partition>`, with `Shape` read from the trace's parameters.

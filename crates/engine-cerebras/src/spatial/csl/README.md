@@ -114,8 +114,8 @@ SDK's `cslc` at load time, cached by a hash of sources and parameters.
   at CAP 32). The units drain output queue 2 before recoloring it.
 - `serve_g4/`, `serve_gptoss/`, `serve_q35w/`: those designs' layouts,
   routing helpers and base programs, as for the designs above.
-- The role-split program's PE kinds are in `crates/kernels-cerebras/programs/split`
-  (`kernels_cerebras::spatial` builds the programs, `spatial::split` places and drives them;
+- The wafer program's PE kinds are in `crates/kernels-cerebras/programs/wafer`
+  (`kernels_cerebras::spatial` builds the programs, `spatial::artifact` places and drives them;
   `crates/kernels-cerebras/src/spatial/README.md`).
 
 The generated `*_pe.csl` are the programs validated on CS-3, byte for byte;

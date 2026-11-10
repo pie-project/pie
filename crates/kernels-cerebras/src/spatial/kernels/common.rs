@@ -1,4 +1,4 @@
-//! The rcfg words the role-split kernels share: every family's weight, CX, CY, head and head
+//! The rcfg words the wafer program kernels share: every family's weight, CX, CY, head and head
 //! control kernel reads the same leading words (its route table, its reductions' and segment's
 //! queues, the spare colour) and appends its own. A kernel's writer calls these with what is its
 //! own (the weight kernel's two words, CX's flags and tail, ...).

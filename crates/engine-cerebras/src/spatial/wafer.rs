@@ -1300,7 +1300,7 @@ enum Job {
         start: usize,
         extra: usize,
     },
-    /// A token loop posted without waiting (the role-split program): its
+    /// A token loop posted without waiting (the wafer program): its
     /// answer on the posted channel.
     PostGreedy {
         tokens: Vec<u32>,
@@ -1451,11 +1451,11 @@ pub struct Wafer {
     /// onto the rows by all-reduce slack ([`super::paged::RowOrder`]),
     /// after the group expansion, on every page the handle passes on.
     pub row_order: Option<super::paged::RowOrder>,
-    /// The role-split program ([`super::split`]).
-    pub split: bool,
-    /// The program's posted-loop length (its plan's; `PIE_CEREBRAS_SPLIT_LOOP` overrides it).
-    pub split_loop: Option<usize>,
-    /// Posted token loops' answers (the role-split program).
+    /// The wafer program ([`super::artifact`]).
+    pub artifact: bool,
+    /// The program's posted-loop length (its plan's; `PIE_CEREBRAS_POSTED_LOOP` overrides it).
+    pub posted_loop: Option<usize>,
+    /// Posted token loops' answers (the wafer program).
     posted: mpsc::Receiver<Answer>,
 }
 
@@ -1521,8 +1521,8 @@ impl Wafer {
         platform: Platform,
         rope: Option<Rotary>,
     ) -> R<Wafer> {
-        if super::split::is_split(&program) {
-            return Wafer::open_split(program, &ckpt, platform);
+        if super::artifact::is_artifact_program(&program) {
+            return Wafer::open_artifact(program, &ckpt, platform);
         }
         let (job_tx, job_rx) = mpsc::channel::<Job>();
         let (ans_tx, ans_rx) = mpsc::channel::<Answer>();
@@ -1563,8 +1563,8 @@ impl Wafer {
                                     return;
                                 }
                             },
-                            split: false,
-                            split_loop: None,
+                            artifact: false,
+                            posted_loop: None,
                             posted: mpsc::channel().1,
                         }));
                         m
@@ -1721,7 +1721,7 @@ impl Wafer {
                             extra,
                         } => model.greedy(&tokens, start, extra).map(|a| (a, Vec::new())),
                         Job::PostGreedy { .. } => {
-                            Err("posted token loops are the role-split program's".into())
+                            Err("posted token loops are the wafer program's".into())
                         }
                     };
                     idle_from = std::time::Instant::now();
@@ -1752,12 +1752,12 @@ impl Wafer {
         })
     }
 
-    /// The role-split program ([`super::split`]) on its own thread: one
+    /// The wafer program ([`super::artifact`]) on its own thread: one
     /// sequence, greedy rows by the wafer token loop, logits rows by `lgt`.
-    fn open_split(program: PathBuf, ckpt: &Ckpt, platform: Platform) -> R<Wafer> {
-        let spec = super::split::SplitSpec::from_env()?;
-        let art = super::split::artifact(&program)?;
-        let split_loop = Some(art.host.loop_len as usize);
+    fn open_artifact(program: PathBuf, ckpt: &Ckpt, platform: Platform) -> R<Wafer> {
+        let spec = super::artifact::Weights::from_env()?;
+        let art = super::artifact::read(&program)?;
+        let posted_loop = Some(art.host.loop_len as usize);
         let cfg = ckpt.config();
         let vocab = cfg["text_config"]["vocab_size"]
             .as_u64()
@@ -1770,15 +1770,15 @@ impl Wafer {
         let thread = std::thread::Builder::new()
             .name("spatial-wafer".into())
             .spawn(move || {
-                let open = || -> R<super::split::SplitModel> {
+                let open = || -> R<super::artifact::ArtifactModel> {
                     let sdk = Sdk::open().map_err(|e| e.to_string())?;
-                    let mut rt =
-                        Runtime::new(sdk, &program, platform, "WARNING").map_err(|e| e.to_string())?;
+                    let mut rt = Runtime::new(sdk, &program, platform, "WARNING")
+                        .map_err(|e| e.to_string())?;
                     let t0 = Instant::now();
                     rt.load();
                     rt.run();
-                    tracing::info!(s = t0.elapsed().as_secs_f64(), "split: program loaded");
-                    super::split::SplitModel::open(Box::new(rt), &spec, &art, vocab)
+                    tracing::info!(s = t0.elapsed().as_secs_f64(), "artifact: program loaded");
+                    super::artifact::ArtifactModel::open(Box::new(rt), &spec, &art, vocab)
                 };
                 let mut m = match open() {
                     Ok(m) => {
@@ -1806,7 +1806,7 @@ impl Wafer {
                             pos = start,
                             idle_ms = (t0 - idle_from).as_secs_f64() * 1e3,
                             ms = t0.elapsed().as_secs_f64() * 1e3,
-                            "spatial wafer: split token loop launch (posted)"
+                            "spatial wafer: artifact token loop launch (posted)"
                         );
                         idle_from = Instant::now();
                         if post_tx.send(a).is_err() {
@@ -1827,7 +1827,7 @@ impl Wafer {
                                 pos = start,
                                 idle_ms = (t0 - idle_from).as_secs_f64() * 1e3,
                                 ms = t0.elapsed().as_secs_f64() * 1e3,
-                                "spatial wafer: split token loop launch"
+                                "spatial wafer: artifact token loop launch"
                             );
                             a
                         }
@@ -1836,7 +1836,9 @@ impl Wafer {
                             start,
                             which,
                         } => match which {
-                            Logits::None => m.forward(&tokens, start, false).map(|(a, _)| (a, Vec::new())),
+                            Logits::None => m
+                                .forward(&tokens, start, false)
+                                .map(|(a, _)| (a, Vec::new())),
                             Logits::Last => m
                                 .forward(&tokens, start, true)
                                 .map(|(a, l)| (a, l.into_iter().collect())),
@@ -1850,10 +1852,17 @@ impl Wafer {
                                 Ok((am, rows))
                             })(),
                         },
-                        _ => Err("the role-split program runs one sequence: no batched, paged or VM jobs".into()),
+                        _ => Err(
+                            "the wafer program runs one sequence: no batched, paged or VM jobs"
+                                .into(),
+                        ),
                     };
                     idle_from = Instant::now();
-                    tracing::info!(launches = m.launches, steps = m.steps, "spatial wafer: totals");
+                    tracing::info!(
+                        launches = m.launches,
+                        steps = m.steps,
+                        "spatial wafer: totals"
+                    );
                     if ans_tx.send(answer).is_err() {
                         break;
                     }
@@ -1882,8 +1891,8 @@ impl Wafer {
             recurrent: false,
             group: 1,
             row_order: None,
-            split: true,
-            split_loop,
+            artifact: true,
+            posted_loop,
             posted: post_rx,
         })
     }
@@ -2207,7 +2216,7 @@ impl Wafer {
             .map(|(argmax, _)| argmax)
     }
 
-    /// Posts a token loop (the role-split program): its answer comes from
+    /// Posts a token loop (the wafer program): its answer comes from
     /// [`Wafer::take_posted`], in order.
     pub fn post_greedy(&mut self, tokens: &[u32], start: usize, extra: usize) -> R<()> {
         self.jobs
@@ -2300,8 +2309,8 @@ mod tests {
             recurrent: false,
             group: 1,
             row_order: None,
-            split: false,
-            split_loop: None,
+            artifact: false,
+            posted_loop: None,
             posted: mpsc::channel().1,
         };
         let kernel = w.paged.unwrap();

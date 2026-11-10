@@ -131,7 +131,7 @@ impl Arrangement {
             .map(|(_, a)| a)
             .ok_or_else(|| {
                 format!(
-                    "split gemma: no arrangement for {} x {} units x {}",
+                    "gemma: no arrangement for {} x {} units x {}",
                     p.cols, p.rows, p.units
                 )
             })
@@ -150,12 +150,12 @@ impl Arrangement {
         for &(u, level) in self.b_units {
             let y = *ya
                 .get(&level)
-                .ok_or_else(|| format!("split gemma: unit {u} level with {level}, not in A"))?;
+                .ok_or_else(|| format!("gemma: unit {u} level with {level}, not in A"))?;
             o[u as usize] = Some((uw, y));
         }
         o.into_iter()
             .enumerate()
-            .map(|(u, v)| v.ok_or_else(|| format!("split gemma: unit {u} unplaced")))
+            .map(|(u, v)| v.ok_or_else(|| format!("gemma: unit {u} unplaced")))
             .collect()
     }
 

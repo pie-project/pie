@@ -1,6 +1,6 @@
 //! What each PE is: one [`PeRole`] a PE, set by the floor. A role is the kernel slot it fills
 //! ([`Kind`]: open, a block declares its own) and its static place in the program ([`Place`]: the
-//! role-split architecture's positions, no model in them); the queues and routes it uses are the
+//! wafer program architecture's positions, no model in them); the queues and routes it uses are the
 //! fabric's ([`super::fabric::PeIo`]).
 
 use serde::{Serialize, Serializer};
@@ -12,7 +12,7 @@ use serde::{Serialize, Serializer};
 pub struct Kind {
     /// The name in the rcfg dumps and the levers (`w.FIFOW:16`).
     pub name: &'static str,
-    /// The file stem of its source in the build directory (`mkfull*.py`'s names).
+    /// The file stem of its source in the build directory (`build*.py`'s names).
     pub stem: &'static str,
 }
 
@@ -43,7 +43,7 @@ impl Serialize for Kind {
     }
 }
 
-/// Where a PE sits in the role-split program.
+/// Where a PE sits in the wafer program.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
 pub enum Place {
     /// No place (a filler corner, the wafer's spare area, a route-only PE).

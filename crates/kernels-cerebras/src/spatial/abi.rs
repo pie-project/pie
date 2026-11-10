@@ -57,7 +57,7 @@ impl From<Lit> for Value {
 }
 
 /// A param's name (a `@set_tile_code` field). Each params struct declares its own as
-/// associated consts (`WeightQ35::ATT`).
+/// associated consts (`WeightQwen::ATT`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize)]
 pub struct Param(pub &'static str);
 
@@ -98,7 +98,7 @@ impl Params {
 /// A kernel's rcfg writer: the PE's full rcfg words (its route table first).
 pub type RcfgFn = fn(&Pe) -> Result<Vec<u32>, String>;
 
-/// One kernel source under `programs/split`.
+/// One kernel source under `programs/wafer`.
 pub struct Kernel {
     /// The source file (empty: the filler, written inline).
     pub source: &'static str,

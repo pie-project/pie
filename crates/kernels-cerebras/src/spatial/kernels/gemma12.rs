@@ -1,4 +1,4 @@
-//! Gemma 4 12B: `weight_g12.csl`, `ctl_cx_g12.csl`, `ctl_cy_g12.csl`, `head_g12.csl`, with the
+//! Gemma 4 12B: `weight_gemma12.csl`, `ctl_cx_gemma12.csl`, `ctl_cy_gemma12.csl`, `head_gemma12.csl`, with the
 //! shared head control ([`super::head::HEAD_CTL`]). Their params from the plan ([`kernels`]) and
 //! their rcfg writers.
 
@@ -18,7 +18,7 @@ use super::head::{HEAD_CTL, HeadCtl, HeadPe};
 
 type R<T> = Result<T, String>;
 
-/// Every name the kernels export, in export order (`mkfull_g12.py`'s `NAMES`).
+/// Every name the kernels export, in export order (`build_gemma12.py`'s `NAMES`).
 pub const SYMBOLS: &[(&str, &str)] = &[
     ("w", "u16"),
     ("rcfg", "u32"),
@@ -41,11 +41,11 @@ pub const SYMBOLS: &[(&str, &str)] = &[
 ];
 
 params! {
-    /// `weight_g12.csl`: layers a unit, x's dims a row (the plain rows'; the attention rows'
+    /// `weight_gemma12.csl`: layers a unit, x's dims a row (the plain rows'; the attention rows'
     /// by override), the MLP width a column, the global layers' mask, the row role (`ATT`), q
     /// heads a KV head, a head dim's columns a segment PE (sliding / global), the KV entries, the
     /// KV rows, the head dims, the window (0: the ring is exact), the levers' defaults.
-    pub struct WeightG12 {
+    pub struct WeightGemma12 {
         K: u32, Hc: u32, Ic: u32, MV: u32, KM: u32, ATT: u32, Qh: u32, DcS: u32, DcG: u32,
         NES: u32, NEG: u32, PYW: u32, HDS: u32, HDG: u32, WIN: u32, WSPEC: u32, RING: u32,
         DIAG: u32, FIFOW: u32, TSTAMP: u32,
@@ -53,44 +53,44 @@ params! {
 }
 
 params! {
-    /// `ctl_cx_g12.csl`: layers a unit, x's dims a row (by override per row run), the levers'.
-    pub struct CtlCxG12 { K: u32, Hc: u32, DIAG: u32, FIFOW: u32, XKEEP: u32 }
+    /// `ctl_cx_gemma12.csl`: layers a unit, x's dims a row (by override per row run), the levers'.
+    pub struct CtlCxGemma12 { K: u32, Hc: u32, DIAG: u32, FIFOW: u32, XKEEP: u32 }
 }
 
 params! {
-    /// `ctl_cy_g12.csl`: the weight kernel's shapes, the hidden size (`HR`), the levers'.
-    pub struct CtlCyG12 {
+    /// `ctl_cy_gemma12.csl`: the weight kernel's shapes, the hidden size (`HR`), the levers'.
+    pub struct CtlCyGemma12 {
         K: u32, KM: u32, Qh: u32, DcS: u32, DcG: u32, Ic: u32, HR: u32, DIAG: u32, FIFOW: u32,
         ATTL: u32, TSTAMP: u32, HDS: u32, HDG: u32,
     }
 }
 
-pub const WEIGHT_G12: Kernel = Kernel {
-    source: "weight_g12.csl",
+pub const WEIGHT_GEMMA12: Kernel = Kernel {
+    source: "weight_gemma12.csl",
     owns: &["w", "rcfg", "tdbg"],
-    params: WeightG12::NAMES,
+    params: WeightGemma12::NAMES,
     route_slots: 18,
     rcfg: Some(weight),
 };
 
-pub const CTL_CX_G12: Kernel = Kernel {
-    source: "ctl_cx_g12.csl",
+pub const CTL_CX_GEMMA12: Kernel = Kernel {
+    source: "ctl_cx_gemma12.csl",
     owns: &["x", "gam", "rcfg", "xdbg", "tdbg", "xred"],
-    params: CtlCxG12::NAMES,
+    params: CtlCxGemma12::NAMES,
     route_slots: 12,
     rcfg: Some(cx),
 };
 
-pub const CTL_CY_G12: Kernel = Kernel {
-    source: "ctl_cy_g12.csl",
+pub const CTL_CY_GEMMA12: Kernel = Kernel {
+    source: "ctl_cy_gemma12.csl",
     owns: &["qkw", "rot", "tab", "rcfg", "tdbg"],
-    params: CtlCyG12::NAMES,
+    params: CtlCyGemma12::NAMES,
     route_slots: 12,
     rcfg: Some(cy),
 };
 
-pub const HEAD_G12: Kernel = Kernel {
-    source: "head_g12.csl",
+pub const HEAD_GEMMA12: Kernel = Kernel {
+    source: "head_gemma12.csl",
     owns: &["hw", "hg", "rcfg", "hemb", "tdbg"],
     params: HeadPe::NAMES,
     route_slots: 12,
@@ -115,7 +115,7 @@ fn last_unit(pe: &Pe, unit: u32) -> bool {
 /// A weight PE: the shared words, its flags, its handoff turns of `2 Hc(r) + 1` words.
 fn weight(pe: &Pe) -> R<Vec<u32>> {
     let Place::Weight { unit, row, col } = pe.role().place else {
-        return Err(format!("{:?}: weight_g12 off a weight PE", pe.at));
+        return Err(format!("{:?}: weight_gemma12 off a weight PE", pe.at));
     };
     let fl = if col == 0 { W_COL0 } else { 0 } | if last_unit(pe, unit) { W_LAST } else { 0 };
     let hn = 2 * dims_of(&pe.prog.plan, row) + 1;
@@ -127,7 +127,7 @@ fn weight(pe: &Pe) -> R<Vec<u32>> {
 /// forwards along it.
 fn cx(pe: &Pe) -> R<Vec<u32>> {
     let Place::Cx { first, last, .. } = pe.role().place else {
-        return Err(format!("{:?}: ctl_cx_g12 off a CX PE", pe.at));
+        return Err(format!("{:?}: ctl_cx_gemma12 off a CX PE", pe.at));
     };
     let pk = pe.parks(4)?;
     let (cin, cout) = (pe.colour(CHAIN_IN), pe.colour(CHAIN_OUT));
@@ -160,7 +160,7 @@ fn cx(pe: &Pe) -> R<Vec<u32>> {
 /// A CY PE: the shared words (no segment), its flag, four unused words.
 fn cy(pe: &Pe) -> R<Vec<u32>> {
     let Place::Cy { unit, .. } = pe.role().place else {
-        return Err(format!("{:?}: ctl_cy_g12 off a CY PE", pe.at));
+        return Err(format!("{:?}: ctl_cy_gemma12 off a CY PE", pe.at));
     };
     let mut w = common::cy(pe, None)?;
     let fl = if last_unit(pe, unit) { CY_LAST } else { 0 };
@@ -172,7 +172,7 @@ fn cy(pe: &Pe) -> R<Vec<u32>> {
 /// north), then its group's dims.
 fn head(pe: &Pe) -> R<Vec<u32>> {
     let Place::Head { row, col } = pe.role().place else {
-        return Err(format!("{:?}: head_g12 off a head PE", pe.at));
+        return Err(format!("{:?}: head_gemma12 off a head PE", pe.at));
     };
     let h = HeadIo {
         row,
@@ -186,7 +186,7 @@ fn head(pe: &Pe) -> R<Vec<u32>> {
     Ok(w)
 }
 
-/// A head dim's columns a segment PE (rotated pairs side by side): `prep_g12.py::dcf`.
+/// A head dim's columns a segment PE (rotated pairs side by side): `prep_gemma12.py::dcf`.
 fn dcf(hd: u32, swa: u32) -> u32 {
     2 * (hd / 2).div_ceil(swa)
 }
@@ -215,7 +215,7 @@ impl Dims {
         let ra = match p.row_dims.as_slice() {
             [a, b] if a.attention && !b.attention && a.rows.0 == 0 => a.rows.1,
             _ => {
-                return Err("split g12: row runs want attention rows 0..RA then plain rows".into());
+                return Err("gemma12: row runs want attention rows 0..RA then plain rows".into());
             }
         };
         let kinds = |u: u32| -> Vec<bool> {
@@ -226,13 +226,13 @@ impl Dims {
         };
         if s.layers.len() < (p.units * k) as usize {
             return Err(format!(
-                "split g12: {} layers for {} units of {k}",
+                "gemma12: {} layers for {} units of {k}",
                 s.layers.len(),
                 p.units
             ));
         }
         if (1..p.units).any(|u| kinds(u) != kinds(0)) {
-            return Err("split g12: the units' layer kinds differ".into());
+            return Err("gemma12: the units' layer kinds differ".into());
         }
         let km = kinds(0)
             .iter()
@@ -246,12 +246,12 @@ impl Dims {
                 LayerKind::Sliding { window } => Some(*window),
                 _ => None,
             })
-            .ok_or("split g12: no sliding layer")?;
+            .ok_or("gemma12: no sliding layer")?;
         let swa = p.segments.scores;
         let nseg = p.cols / swa;
         if nseg == 0 || s.attn.kv_heads != nseg || !s.attn.q_heads.is_multiple_of(nseg) {
             return Err(format!(
-                "split g12: {} q / {} kv heads over {nseg} segments",
+                "gemma12: {} q / {} kv heads over {nseg} segments",
                 s.attn.q_heads, s.attn.kv_heads
             ));
         }
@@ -262,11 +262,11 @@ impl Dims {
         let nes = p
             .kv_entries
             .sliding
-            .ok_or("split g12: no sliding entries (NES)")?;
+            .ok_or("gemma12: no sliding entries (NES)")?;
         let neg = p
             .kv_entries
             .global
-            .ok_or("split g12: no global entries (NEG)")?;
+            .ok_or("gemma12: no global entries (NEG)")?;
         let hdc = (0..p.head.cols as usize)
             .map(|c| group_dims(plan, c))
             .max()
@@ -302,8 +302,8 @@ pub fn kernels(prog: &Program) -> R<Kernels> {
     out.insert(
         Kind::WEIGHT,
         KernelBuild::of(
-            &WEIGHT_G12,
-            WeightG12 {
+            &WEIGHT_GEMMA12,
+            WeightGemma12 {
                 K: d.k,
                 Hc: hcw,
                 Ic: d.ic,
@@ -330,8 +330,8 @@ pub fn kernels(prog: &Program) -> R<Kernels> {
     out.insert(
         Kind::CX,
         KernelBuild::of(
-            &CTL_CX_G12,
-            CtlCxG12 {
+            &CTL_CX_GEMMA12,
+            CtlCxGemma12 {
                 K: d.k,
                 Hc: hcw,
                 DIAG: 0,
@@ -343,8 +343,8 @@ pub fn kernels(prog: &Program) -> R<Kernels> {
     out.insert(
         Kind::CY,
         KernelBuild::of(
-            &CTL_CY_G12,
-            CtlCyG12 {
+            &CTL_CY_GEMMA12,
+            CtlCyGemma12 {
                 K: d.k,
                 KM: d.km,
                 Qh: d.qh,
@@ -364,7 +364,7 @@ pub fn kernels(prog: &Program) -> R<Kernels> {
     out.insert(
         Kind::HEAD,
         KernelBuild::of(
-            &HEAD_G12,
+            &HEAD_GEMMA12,
             HeadPe {
                 VR: vr,
                 HDc: d.hdc,
