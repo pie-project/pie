@@ -8,9 +8,8 @@
 //! which is then given back, the decode running on through the moved
 //! chunks. Two miniatures: a dense one and a gated-delta hybrid.
 //!
-//! While the switch is verified the same script also runs over the
-//! per-plane pools of before ([`engine_metal::store::set_legacy_planes`]),
-//! in the same process, and lands the same bits.
+//! (Before the per-plane pools were deleted this script also ran over them in
+//! the same process and landed the same bits.)
 
 use std::path::{Path, PathBuf};
 
@@ -112,15 +111,8 @@ fn fixture(model: &str) -> Fixture {
     }
 }
 
-fn load(fixture: &Fixture, legacy: bool) -> Shell {
-    engine_metal::store::set_legacy_planes(legacy);
-    let kv_budget = legacy.then(|| {
-        let pages = u64::from(SEATS * CONTEXT.div_ceil(PAGE));
-        let paging =
-            engine_metal::store::kv::Paging::of(PAGE, CONTEXT, SEATS, pages).expect("a paging");
-        engine_metal::store::pool_bytes(&fixture.trace, paging).expect("the pool sizes")
-    });
-    let shell = Shell::load(Boot {
+fn load(fixture: &Fixture) -> Shell {
+    Shell::load(Boot {
         trace: fixture.trace.clone(),
         contract: &fixture.contract,
         checkpoint: &fixture.container,
@@ -131,14 +123,13 @@ fn load(fixture: &Fixture, legacy: bool) -> Shell {
         page_size: PAGE,
         context: CONTEXT,
         slots: SEATS,
-        kv_budget,
+        kv_budget: None,
         memory_share: engine::load::DEFAULT_DEVICE_MEMORY_SHARE,
         runahead: engine::runahead::Runahead::F1,
         residency: engine_metal::ResidencyPlan::default(),
         profiles: None,
-    });
-    engine_metal::store::set_legacy_planes(false);
-    shell.unwrap_or_else(|why| panic!("the shell loads: {why}"))
+    })
+    .unwrap_or_else(|why| panic!("the shell loads: {why}"))
 }
 
 fn word(trace: &Trace, rows: u32) -> u64 {
@@ -306,19 +297,8 @@ fn check(model: &str, hybrid: bool) {
     let fixture = fixture(model);
     const STEPS: usize = 12;
 
-    let mut legacy = load(&fixture, true);
-    let planes = serve(
-        &mut legacy,
-        &fixture.trace,
-        &Placement::Seats,
-        STEPS,
-        usize::MAX,
-        &mut |_| {},
-    );
-    drop(legacy);
-
-    let mut shell = load(&fixture, false);
-    let facts = shell.pool_chunk_facts().expect("a chunk pool");
+    let mut shell = load(&fixture);
+    let facts = shell.pool_chunk_facts();
     facts.validate().expect("the facts hang together");
     eprintln!(
         "{model}: {} chunks of {} B, {} a segment, segments {:?}, shapes {:?}",
@@ -343,17 +323,12 @@ fn check(model: &str, hybrid: bool) {
         &mut |_| {},
     );
     drop(shell);
-    same(
-        &format!("{model}: the seats' runs against the planes"),
-        &seats,
-        &planes,
-    );
 
     // Scattered over a segment of their own above the seats' runs, then
     // evacuated below it and that segment given back, mid-decode.
-    let mut shell = load(&fixture, false);
-    let facts = shell.pool_chunk_facts().expect("a chunk pool");
-    let layout = shell.pool_layout().expect("a chunk pool");
+    let mut shell = load(&fixture);
+    let facts = shell.pool_chunk_facts();
+    let layout = shell.pool_layout();
     let segment = facts.segment_chunks;
     let low = 1 + layout.seat_chunks();
     let kept = (low + HELD).div_ceil(segment);
@@ -386,15 +361,15 @@ fn check(model: &str, hybrid: bool) {
                 shell
                     .release_segments(kept)
                     .expect("the top segments go back");
-                let after = shell.pool_chunk_facts().expect("a chunk pool");
+                let after = shell.pool_chunk_facts();
                 assert_eq!(after.segments.committed, kept);
             }
         },
     );
     same(
-        &format!("{model}: scattered and evacuated slots against the planes"),
+        &format!("{model}: scattered and evacuated slots against the seats' runs"),
         &scattered,
-        &planes,
+        &seats,
     );
 }
 
@@ -406,4 +381,68 @@ fn a_scattered_dense_pool_serves_the_same_logits() {
 #[test]
 fn a_scattered_hybrid_pool_serves_the_same_logits() {
     check("qwen35-tiny", true);
+}
+
+/// The pools a GDN hybrid's catalog trace lays on this device, no weights
+/// landed: one chunk space with a list, a record and an rs buffer shape, none
+/// pinned; segments commit from the bottom and go back.
+#[test]
+fn a_reserved_hybrid_pool_states_shared_chunks() {
+    use engine_metal::store::layout::{BUFFER, Layout};
+    use engine_metal::store::{Pools, Rows};
+
+    if !engine_metal::device::present() {
+        eprintln!("skipping: no Metal device");
+        return;
+    }
+    let name = "qwen38-flash-next-mini-bf16-kv-bf16";
+    let trace = poem_compiler::catalog::deployment(name)
+        .expect("the deployment is listed")
+        .trace(Platform::Metal);
+    let device = engine_metal::Context::bind().expect("the system device");
+    let facts = engine_metal::store::kv::probe(&trace).expect("the kv facts");
+    let rows = Rows::plan(&trace, PAGE, &facts).expect("the rows lay out");
+    let rs = engine_metal::rs::Layout::read(&trace).expect("the rs layout");
+    let buffer = rs
+        .as_ref()
+        .map_or(0, |rs| engine_metal::rs::Buffers::page_layout(rs, PAGE).1);
+    let bytes = [rows.list_bytes, rows.fixed_bytes, buffer];
+    let chunk = Layout::chunk_bytes(bytes[0], bytes[1], bytes[2], 2 << 20);
+    let segment = engine_metal::store::pool::segment_chunks(chunk);
+    let layout =
+        Layout::new(chunk, 3 * segment, segment, PAGE, bytes, SEATS, 16).expect("a layout");
+    let paging = engine_metal::store::kv::Paging::of(PAGE, 256, SEATS, 1).expect("a paging");
+    let mut pools = Pools::reserve(&device, rows, layout, paging, Vec::new()).expect("a pool");
+    let facts = pools.chunk_facts();
+    eprintln!(
+        "{name}: {} chunks of {} B, segments {:?}, shapes {:?}",
+        facts.total_chunks,
+        facts.chunk_bytes,
+        facts.segments,
+        facts
+            .shapes
+            .iter()
+            .map(|s| (s.id.0, s.kind, s.slot_bytes, s.slots_per_chunk))
+            .collect::<Vec<_>>()
+    );
+    facts.validate().expect("the facts hang together");
+    for id in [LIST, FIXED, BUFFER] {
+        let shape = facts.shape(id).expect("the shape stands");
+        assert!(shape.pinned.is_none());
+        assert!(shape.slot_bytes * u64::from(shape.slots_per_chunk) <= facts.chunk_bytes);
+    }
+    assert_eq!(facts.chunk_bytes % facts.shape(LIST).unwrap().slot_bytes, 0);
+    assert_eq!(facts.segments.max, 3);
+    assert!(facts.act_chunks.is_empty(), "activation lives in the arena");
+    if facts.segments.growth != Growth::Bottom {
+        assert_eq!(facts.segments.committed, 3);
+        return;
+    }
+    assert_eq!(facts.segments.committed, 0);
+    pools.commit_segments(2).expect("two segments");
+    assert_eq!(pools.chunk_facts().segments.committed, 2);
+    assert!(pools.committed_bytes() >= 2 * u64::from(segment) * chunk);
+    // SAFETY: nothing ran on this pool.
+    unsafe { pools.release_segments(1) }.expect("one goes back");
+    assert_eq!(pools.chunk_facts().segments.committed, 1);
 }

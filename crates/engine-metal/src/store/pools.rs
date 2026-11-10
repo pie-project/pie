@@ -2,9 +2,6 @@
 //! cache row placed in the slot shapes of [`super::layout`], the slot refs the
 //! runtime hands out translated to the physical slots kernels address, and
 //! the copies, spills and evacuations that move slots.
-//!
-//! [`Pools::legacy`] holds the per-plane pools of before ([`Planes`]) for the
-//! pool switch's verification only.
 
 use engine::chunk::{ChunkFacts, Evacuation, ShapeId, SlotCopy};
 use engine::transfer::{KvRun, MemoryDomain};
@@ -14,8 +11,8 @@ use poem_ir::{CacheRow, Dtype, Trace};
 use super::layout::{self, BUFFER, FIXED, LIST, Layout, Slots};
 use super::pool::Pool;
 use super::{
-    Planes, STATE_MAP_BYTES, Seats, SpaceSeat, Spill, compressed_spaces, elem_bytes, elem_size,
-    narrow, row_stride, split, state_dtype,
+    STATE_MAP_BYTES, Seats, SpaceSeat, Spill, compressed_spaces, elem_bytes, elem_size, narrow,
+    row_stride, split, state_dtype,
 };
 use crate::device::ctx::Frame;
 use crate::device::{Buffer, Context, Handles};
@@ -73,6 +70,36 @@ pub struct Rows {
 }
 
 impl Rows {
+    /// The bytes one token takes across every kv row, unaligned.
+    #[must_use]
+    pub fn token_bytes(&self) -> u64 {
+        self.rows
+            .iter()
+            .map(|row| match *row {
+                Row::Kv {
+                    keys,
+                    values,
+                    keys_cell,
+                    values_cell,
+                    ..
+                } => keys_cell + if values == keys { 0 } else { values_cell },
+                Row::State { .. } | Row::Compressed { .. } => 0,
+            })
+            .sum()
+    }
+
+    /// The bytes a working set's state rows take, unaligned.
+    #[must_use]
+    pub fn state_bytes(&self) -> u64 {
+        self.rows
+            .iter()
+            .map(|row| match *row {
+                Row::State { stride, dtype, .. } => stride * u64::from(elem_size(dtype)),
+                Row::Kv { .. } | Row::Compressed { .. } => 0,
+            })
+            .sum()
+    }
+
     /// Lays `trace`'s rows into slots of `page_size` tokens; `facts`
     /// restates kv rows' heads.
     pub fn plan(trace: &Trace, page_size: u32, facts: &Facts) -> Result<Rows> {
@@ -215,8 +242,6 @@ pub struct Pools {
     disk: Option<Spill>,
     parked: Option<Spill>,
     parked_pages: Option<Spill>,
-    /// The per-plane pools of before, while the switch is verified.
-    legacy: Option<Planes>,
 }
 
 /// The first byte of physical slot `slot` of `shape`.
@@ -266,34 +291,9 @@ impl Pools {
             disk: None,
             parked: None,
             parked_pages: None,
-            legacy: None,
         };
         pools.write_maps(device)?;
         Ok(pools)
-    }
-
-    /// The per-plane pools of before, for the pool switch's verification.
-    pub fn legacy(planes: Planes, device: &Context) -> Result<Pools> {
-        let paging = planes.paging;
-        let layout = Layout::new(256, 1, 1, paging.page_size, [0; 3], 0, 0)?;
-        Ok(Pools {
-            paging,
-            rows: Vec::new(),
-            pool: Pool::reserve(device, 256, 1, 1)?,
-            layout,
-            side: Vec::new(),
-            maps: None,
-            shape_rows: Default::default(),
-            disk: None,
-            parked: None,
-            parked_pages: None,
-            legacy: Some(planes),
-        })
-    }
-
-    #[must_use]
-    pub fn is_legacy(&self) -> bool {
-        self.legacy.is_some()
     }
 
     /// Writes each state row's segment table: the bank is the whole pool,
@@ -385,11 +385,8 @@ impl Pools {
 
     /// A lane's kv pages as kernels address them: `refs` (slot refs of the
     /// list shape) as physical pages, or, seat-addressed, seat `seat`'s
-    /// `pages` pages. The per-plane pools take both as they come.
+    /// `pages` pages.
     pub fn kv_pages(&self, refs: &[u32], seat: Option<(u32, u32)>) -> Result<Vec<u32>> {
-        if self.legacy.is_some() {
-            return Ok(refs.to_vec());
-        }
         if let Some((slot, pages)) = seat
             && refs.is_empty()
         {
@@ -407,16 +404,13 @@ impl Pools {
 
     /// The physical page explicit write descriptor page `page` names.
     pub fn kv_page(&self, page: u32) -> Result<u32> {
-        if self.legacy.is_some() {
-            return Ok(page);
-        }
         self.physical(LIST, page)
     }
 
     /// The physical fixed slot a lane's state id names: a slot ref, or a
     /// seat-addressed id.
     pub fn state_slot(&self, id: u32, seated: bool) -> Result<u32> {
-        if self.legacy.is_some() || !self.has_state() {
+        if !self.has_state() {
             return Ok(id);
         }
         let id = if seated {
@@ -430,9 +424,6 @@ impl Pools {
     /// The units rs buffer page ids count kernels address for `pages`
     /// (slot refs of the buffer shape, or seat-addressed ids).
     pub fn buffer_pages(&self, pages: &[u32], seated: bool) -> Result<Vec<u32>> {
-        if self.legacy.is_some() {
-            return Ok(pages.to_vec());
-        }
         let shape = *self.shape(BUFFER)?;
         let stride = self.layout.buffer_stride();
         pages
@@ -447,9 +438,6 @@ impl Pools {
 
     #[must_use]
     pub fn state_slot_bytes(&self) -> u64 {
-        if let Some(legacy) = &self.legacy {
-            return legacy.state_slot_bytes();
-        }
         self.rows
             .iter()
             .map(|row| match row {
@@ -459,11 +447,20 @@ impl Pools {
             .sum()
     }
 
+    /// Slot ref `slot` of shape `id`, read whole on the host. The caller
+    /// has drained every frame that writes it.
+    pub fn read_slot_bytes(&self, id: ShapeId, slot: u32) -> Result<Vec<u8>> {
+        let bytes = self.shape(id)?.slot_bytes;
+        let at = self.slot_offset(id, slot)?;
+        self.pool
+            .admit(u32::try_from(at / self.layout.chunk_bytes).unwrap_or(u32::MAX))?;
+        let mut out = vec![0u8; usize::try_from(bytes).unwrap_or(0)];
+        self.pool.read(at, &mut out)?;
+        Ok(out)
+    }
+
     /// Physical fixed slot `slot`'s state rows, one after another.
     pub fn read_slot(&self, slot: u32) -> Result<Vec<u8>> {
-        if let Some(legacy) = &self.legacy {
-            return legacy.read_slot(slot);
-        }
         let fixed = *self.shape(FIXED)?;
         let base = self.physical_slot_at(&fixed, slot)?;
         let mut out = Vec::new();
@@ -493,74 +490,39 @@ impl Pools {
 
     #[must_use]
     pub fn has_state(&self) -> bool {
-        if let Some(legacy) = &self.legacy {
-            return legacy.has_state();
-        }
         self.rows.iter().any(|row| matches!(row, Row::State { .. }))
     }
 
     #[must_use]
-    pub fn watermark(&self) -> engine::frame::Demand {
-        self.legacy
-            .as_ref()
-            .map_or(engine::frame::Demand::ZERO, Planes::watermark)
-    }
-
-    #[must_use]
     pub fn paging(&self) -> Paging {
-        self.legacy.as_ref().map_or(self.paging, Planes::paging)
+        self.paging
     }
 
     /// The pool's whole range and the side planes: what it takes with every
     /// segment committed.
     #[must_use]
     pub fn bytes(&self) -> u64 {
-        if let Some(legacy) = &self.legacy {
-            return legacy.bytes();
-        }
         self.pool.bytes() + self.side.iter().map(Buffer::bytes).sum::<u64>()
     }
 
     #[must_use]
     pub fn committed_bytes(&self) -> u64 {
-        if let Some(legacy) = &self.legacy {
-            return legacy.committed_bytes();
-        }
         self.pool.committed_bytes() + self.side.iter().map(Buffer::bytes).sum::<u64>()
     }
 
     #[must_use]
     pub fn high_water_bytes(&self) -> u64 {
-        if let Some(legacy) = &self.legacy {
-            return legacy.high_water_bytes();
-        }
         self.pool.high_water_bytes() + self.side.iter().map(Buffer::bytes).sum::<u64>()
     }
 
     #[must_use]
     pub fn is_elastic(&self) -> bool {
-        match &self.legacy {
-            Some(legacy) => legacy.is_elastic(),
-            None => self.pool.is_sparse(),
-        }
-    }
-
-    #[must_use]
-    pub fn elastic_page_bytes(&self) -> u64 {
-        self.legacy.as_ref().map_or(0, Planes::elastic_page_bytes)
-    }
-
-    #[must_use]
-    pub fn elastic_budget_pages(&self) -> u64 {
-        self.legacy.as_ref().map_or(0, Planes::elastic_budget_pages)
+        self.pool.is_sparse()
     }
 
     /// The cache table one fire binds; `q8` reads every kv pool through the
     /// 8-bit attention kernels.
     pub fn table(&self, handles: &Handles, seats: &Seats, q8: bool) -> Result<CacheTable> {
-        if let Some(legacy) = &self.legacy {
-            return legacy.table(handles, seats, q8);
-        }
         let view = self.pool.view();
         let cells = u32::try_from(self.paging.pages() * u64::from(self.paging.page_size))
             .unwrap_or(u32::MAX);
@@ -671,9 +633,6 @@ impl Pools {
 
     /// Zeroes physical fixed slot `slot`: a fresh lane's state.
     pub fn clear(&mut self, slot: u32) -> Result<()> {
-        if let Some(legacy) = &mut self.legacy {
-            return legacy.clear(slot);
-        }
         if !self.has_state() {
             return Ok(());
         }
@@ -706,9 +665,6 @@ impl Pools {
 
     /// Copies token runs between kv pages (slot refs of the list shape).
     pub fn copy_kv(&mut self, frame: &mut Frame, moves: &[KvRun]) -> Result<()> {
-        if let Some(legacy) = &mut self.legacy {
-            return legacy.copy_kv(frame, moves);
-        }
         let page_size = u64::from(self.paging.page_size);
         let mut placed = Vec::with_capacity(moves.len());
         for span in moves {
@@ -771,17 +727,11 @@ impl Pools {
 
     /// A kv page's bytes, as the slot file holds one: a list slot.
     pub fn page_bytes(&self) -> Result<u64> {
-        if let Some(legacy) = &self.legacy {
-            return legacy.page_bytes();
-        }
         Ok(self.layout.list.map_or(0, |list| list.slot_bytes))
     }
 
     /// Copies whole fixed slots (slot refs) `(src, dst)`.
     pub fn copy_state(&mut self, frame: &mut Frame, moves: &[(u32, u32)]) -> Result<()> {
-        if let Some(legacy) = &mut self.legacy {
-            return legacy.copy_state(frame, moves);
-        }
         if moves.is_empty() || !self.has_state() {
             return Ok(());
         }
@@ -910,15 +860,10 @@ impl Pools {
         Ok(())
     }
 
-    pub fn seat_disk(
-        &mut self,
-        dir: &std::path::Path,
-        budget: u64,
-        page_bytes: u64,
-    ) -> Result<u32> {
-        if let Some(legacy) = &mut self.legacy {
-            return legacy.seat_disk(dir, budget, page_bytes);
-        }
+    /// Opens the slot files under `dir` within `budget` bytes: parked
+    /// records and their buffer pages first, as many as there are seats,
+    /// then kv pages; the kv pages they hold.
+    pub fn seat_disk(&mut self, dir: &std::path::Path, budget: u64) -> Result<u32> {
         let stride = |bytes: u64| bytes.next_multiple_of(engine::disk::ALIGN as u64);
         let state = self.layout.fixed.map_or(0, |f| f.slot_bytes);
         let page = self.layout.buffer.map_or(0, |b| b.slot_bytes);
@@ -943,46 +888,25 @@ impl Pools {
 
     #[must_use]
     pub fn parked_slots(&self) -> u32 {
-        match &self.legacy {
-            Some(legacy) => legacy.parked_slots(),
-            None => Spill::slots(self.parked.as_ref()),
-        }
+        Spill::slots(self.parked.as_ref())
     }
 
     #[must_use]
     pub fn parked_pages(&self) -> u32 {
-        match &self.legacy {
-            Some(legacy) => legacy.parked_pages(),
-            None => Spill::slots(self.parked_pages.as_ref()),
-        }
+        Spill::slots(self.parked_pages.as_ref())
     }
 
     /// Copies whole kv pages (slot refs) between the pool and the slot
     /// file, `pages[i]` with `slots[i]`.
     pub fn spill_kv(&mut self, to_disk: bool, pages: &[u32], slots: &[u32]) -> Result<()> {
-        if let Some(legacy) = &mut self.legacy {
-            return legacy.spill_kv(to_disk, pages, slots);
-        }
         self.spill(LIST, to_disk, pages, slots)
     }
 
     pub fn park_state(&mut self, out: bool, device: &[u32], rows: &[u32]) -> Result<()> {
-        if let Some(legacy) = &mut self.legacy {
-            return legacy.park_state(out, device, rows);
-        }
         self.spill(FIXED, out, device, rows)
     }
 
-    pub fn park_pages(
-        &mut self,
-        out: bool,
-        pages: &[u32],
-        rows: &[u32],
-        buffer: (&mut Buffer, u64),
-    ) -> Result<()> {
-        if let Some(legacy) = &mut self.legacy {
-            return legacy.park_pages(out, pages, rows, buffer);
-        }
+    pub fn park_pages(&mut self, out: bool, pages: &[u32], rows: &[u32]) -> Result<()> {
         self.spill(BUFFER, out, pages, rows)
     }
 
@@ -990,9 +914,6 @@ impl Pools {
     /// state slots are one past the highest physical page and slot it
     /// names. An unmapped tile read by a kernel faults the whole queue.
     pub fn admit(&self, demand: engine::frame::Demand) -> Result<()> {
-        if let Some(legacy) = &self.legacy {
-            return legacy.admit(demand);
-        }
         if demand.workspace > 0 {
             return Err(Fault::Ceiling {
                 what: "pool workspace bytes",
@@ -1015,56 +936,14 @@ impl Pools {
         Ok(())
     }
 
-    /// The per-plane pools' watermark commit; the chunk pool commits
-    /// segments instead.
-    pub fn commit(&mut self, extent: engine::frame::Demand) -> Result<()> {
-        match &mut self.legacy {
-            Some(legacy) => legacy.commit(extent),
-            None => Ok(()),
-        }
-    }
-
-    pub fn trim(&mut self, hint: engine::frame::Demand) {
-        if let Some(legacy) = &mut self.legacy {
-            legacy.trim(hint);
-        }
-    }
-
-    pub fn release(&mut self) -> Result<()> {
-        match &mut self.legacy {
-            Some(legacy) => legacy.release(),
-            None => Ok(()),
-        }
-    }
-
     /// Backs the pool's first `segments` segments.
     pub fn commit_segments(&mut self, segments: u32) -> Result<()> {
-        if self.legacy.is_some() {
-            return Ok(());
-        }
         self.pool.commit_segments(segments)
-    }
-
-    /// Backs every segment: what a caller firing directly asks.
-    pub fn commit_all(&mut self) -> Result<()> {
-        if let Some(legacy) = &mut self.legacy {
-            let paging = legacy.paging();
-            return legacy.commit(engine::frame::Demand {
-                kv_pages: u32::try_from(paging.pages()).unwrap_or(u32::MAX),
-                state_slots: paging.slots,
-                workspace: 0,
-            });
-        }
-        let all = self.pool.segments();
-        self.pool.commit_segments(all)
     }
 
     /// Backs the segments the seat runs lie in: what a caller firing
     /// directly asks.
     pub fn commit_seats(&mut self) -> Result<()> {
-        if self.legacy.is_some() {
-            return self.commit_all();
-        }
         let chunks = 1 + self.layout.seat_chunks();
         let segments = chunks
             .div_ceil(self.layout.segment_chunks.max(1))
@@ -1079,9 +958,6 @@ impl Pools {
     /// No frame reads them: the caller drained every frame, and the
     /// runtime evacuated what they held.
     pub unsafe fn release_segments(&mut self, segments: u32) -> Result<()> {
-        if self.legacy.is_some() {
-            return Ok(());
-        }
         // SAFETY: the caller's contract above.
         unsafe { self.pool.release_segments(segments) }
     }
@@ -1089,11 +965,6 @@ impl Pools {
     /// Moves each evacuated chunk onto its new physical chunk in `frame`
     /// and takes the moves into the chunk table.
     pub fn evacuate(&mut self, frame: &mut Frame, evacuation: &Evacuation) -> Result<()> {
-        if self.legacy.is_some() {
-            return Err(Fault::Unbound {
-                what: "an evacuation, which the per-plane pools have no chunks for".to_string(),
-            });
-        }
         // The compressor side planes are indexed by physical page: each
         // moved chunk's pages move with it.
         let mut sides = Vec::new();

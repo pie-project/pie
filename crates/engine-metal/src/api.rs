@@ -355,16 +355,8 @@ impl Engine for Metal {
         };
         let util = residency.device_memory_share;
         let slots = poem_compiler::state_slots(budgets.slots, &trace, DEFAULT_STATE_SLOTS);
-        let paging = crate::store::kv::Paging::of(
-            budgets.page_size,
-            budgets.max_context,
-            match slots {
-                0 => engine::fit::least_state_slots(1),
-                slots => engine::fit::least_state_slots(1).min(slots),
-            },
-            1,
-        )
-        .map_err(|error| fault(Fault::from(error)))?;
+        let paging = crate::store::kv::Paging::of(budgets.page_size, budgets.max_context, 1, 1)
+            .map_err(|error| fault(Fault::from(error)))?;
         // The pool the weights must leave room for: the stated budget,
         // or one sequence when the pool fills what is left.
         let kv_pool = match residency.device_kv_budget {
@@ -537,7 +529,7 @@ impl Engine for Metal {
 
         let paging = shell.paging();
         let pools = shell.pool_facts(disk_kv_pages);
-        let chunks = shell.chunk_facts(&pools).map_err(fault)?;
+        let chunks = shell.chunk_facts().map_err(fault)?;
         shell.log_chunk_recipe(&chunks);
 
         let caps = Capabilities {
@@ -626,16 +618,8 @@ impl Engine for Metal {
             .map_err(fault)
     }
 
-    fn commit_pool(&mut self, kv_pages: u32) -> EngineResult<()> {
-        self.loaded_mut()?.commit_pool(kv_pages).map_err(fault)
-    }
-
     fn release_scratch(&mut self) -> EngineResult<()> {
         self.loaded_mut()?.release_scratch().map_err(fault)
-    }
-
-    fn release_pool(&mut self, kv_pages: u32) -> EngineResult<()> {
-        self.loaded_mut()?.release_pool(kv_pages).map_err(fault)
     }
 
     fn commit_segments(&mut self, segments: u32) -> EngineResult<()> {
@@ -652,14 +636,6 @@ impl Engine for Metal {
 
     fn copy_slots(&mut self, copy: &engine::chunk::SlotCopy) -> EngineResult<()> {
         self.loaded_mut()?.copy_slots(copy).map_err(fault)
-    }
-
-    fn commit_state(&mut self, slots: u32) -> EngineResult<()> {
-        self.loaded_mut()?.commit_state(slots).map_err(fault)
-    }
-
-    fn release_state(&mut self, slots: u32) -> EngineResult<()> {
-        self.loaded_mut()?.release_state(slots).map_err(fault)
     }
 
     fn submit(&mut self, frame: &FrameSubmission) -> EngineResult<FrameTicket> {

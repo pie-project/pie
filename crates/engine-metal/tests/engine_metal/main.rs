@@ -34,7 +34,6 @@ mod the_packed_kv_decode_reads;
 mod the_packed_kv_page_migrates;
 mod the_packed_kv_tiled_reads;
 mod the_partial_rope_turns_only_the_rotary_pairs;
-mod the_pools_read_as_degenerate_chunks;
 mod the_prompt_conv_matches_a_running_reference;
 mod the_ptq1_0_gguf_passes_through_ingest_and_serves_the_host_decoder;
 mod the_q8_kv_roundtrip;
@@ -47,12 +46,11 @@ mod the_staged_rows_match_affine_dots;
 mod the_tower_reads_pixels_as_the_host_cut_them;
 mod the_voxel_axis_answers_its_host_reference;
 
-/// The bytes a pool takes that holds `slots` sequences at `context`, the
-/// `device_kv_budget` a test states for its shell.
+/// The `device_kv_budget` a test states for its shell: none, so the chunk
+/// pool spans the room. A sparse pool maps only the segments a fire touches
+/// (a direct fire, its seats' runs), so the room costs address space alone.
 #[cfg_attr(not(target_vendor = "apple"), allow(dead_code))]
 fn full_pool(trace: &poem_ir::Trace, page_size: u32, context: u32, slots: u32) -> Option<u64> {
-    let pages = u64::from(slots * context.div_ceil(page_size));
-    let paging = engine_metal::store::kv::Paging::of(page_size, context, slots, pages)
-        .expect("a test's paging");
-    Some(engine_metal::store::pool_bytes(trace, paging).expect("the pool sizes"))
+    let _ = (trace, page_size, context, slots);
+    None
 }
