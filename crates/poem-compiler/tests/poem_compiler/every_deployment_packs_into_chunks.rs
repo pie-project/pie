@@ -344,6 +344,7 @@ fn name_of(trace: &Trace, row: RowId) -> &str {
             CacheRow::Kv { name, .. } | CacheRow::State { name, .. } => name,
         },
         RowId::Rs(_) => "rs",
+        RowId::Pool(_) => "pool",
     }
 }
 

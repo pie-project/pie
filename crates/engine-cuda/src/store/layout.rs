@@ -69,6 +69,9 @@ pub struct SlotShape {
     pub window: Option<u32>,
     /// Each cache row laid in the slot, and where its run starts.
     pub rows: Vec<(u32, u64)>,
+    /// Each compressor state laid in the slot, by the cache row its gather
+    /// keys it by, and where its two planes start.
+    pub pools: Vec<(u32, u64)>,
 }
 
 impl SlotShape {
@@ -111,10 +114,26 @@ impl SlotShape {
                 .iter()
                 .filter_map(|run| match run.row {
                     RowId::Cache(row) => Some((row, run.offset)),
-                    RowId::Rs(_) => None,
+                    RowId::Rs(_) | RowId::Pool(_) => None,
+                })
+                .collect(),
+            pools: runs
+                .iter()
+                .filter_map(|run| match run.row {
+                    RowId::Pool(row) => Some((row, run.offset)),
+                    RowId::Cache(_) | RowId::Rs(_) => None,
                 })
                 .collect(),
         })
+    }
+
+    /// Where the compressor state keyed by cache row `row` starts in a slot.
+    #[must_use]
+    pub fn pool_of(&self, row: u32) -> Option<u64> {
+        self.pools
+            .iter()
+            .find(|(held, _)| *held == row)
+            .map(|&(_, offset)| offset)
     }
 
     /// The fixed shape: a working set's record of the recurrent rows, each
@@ -153,9 +172,10 @@ impl SlotShape {
                 .iter()
                 .filter_map(|piece| match piece.row {
                     RowId::Cache(row) => Some((row, piece.offset)),
-                    RowId::Rs(_) => None,
+                    RowId::Rs(_) | RowId::Pool(_) => None,
                 })
                 .collect(),
+            pools: Vec::new(),
         })
     }
 
@@ -271,6 +291,7 @@ mod tests {
             grain: gcd(chunk, 12 * 256),
             window: None,
             rows: vec![(0, 0), (3, 1024)],
+            pools: Vec::new(),
         };
         assert_eq!(list.grain, list.slot_bytes);
         assert_eq!(list.page_id(chunk, 5, 3), u64::from(list.slot_ref(5, 3)));
@@ -286,6 +307,7 @@ mod tests {
             grain: gcd(chunk, 20 * 256),
             window: Some(64),
             rows: vec![(1, 0)],
+            pools: Vec::new(),
         };
         assert_eq!(ring.grain, 4 * 256);
         for (chunk_id, index) in [(0u32, 0u32), (1, 1), (7, 0), (7, 1)] {

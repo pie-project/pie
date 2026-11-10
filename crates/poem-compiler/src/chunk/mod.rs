@@ -111,6 +111,10 @@ const MOST_CANDIDATES: u64 = 128;
 pub enum RowId {
     Cache(u32),
     Rs(u32),
+    /// The compressor's state for the kv row a pool gather keys by its
+    /// pages (that cache row): a kv row's projection and its score, each
+    /// kept a token until its group closes.
+    Pool(u32),
 }
 
 /// Where a per-token row runs inside a token slot: `offset`, then
