@@ -138,7 +138,14 @@ fn load(fixture: &Fixture) -> Shell {
     load_with(fixture, CONTEXT)
 }
 
-fn load_with(fixture: &Fixture, context: u32) -> Shell {
+pub(super) fn load_with(fixture: &Fixture, context: u32) -> Shell {
+    load_near(fixture, context, None)
+}
+
+/// The shell, its pool's recipe aiming its chunk near `chunk` bytes where
+/// stated.
+fn load_near(fixture: &Fixture, context: u32, chunk: Option<u64>) -> Shell {
+    let residency = engine_metal::ResidencyPlan::default();
     Shell::load(Boot {
         trace: fixture.trace.clone(),
         contract: &fixture.contract,
@@ -153,7 +160,10 @@ fn load_with(fixture: &Fixture, context: u32) -> Shell {
         kv_budget: None,
         memory_share: engine::load::DEFAULT_DEVICE_MEMORY_SHARE,
         runahead: engine::runahead::Runahead::F1,
-        residency: engine_metal::ResidencyPlan::default(),
+        residency: match chunk {
+            Some(bytes) => residency.with_chunk_bytes(bytes),
+            None => residency,
+        },
         profiles: None,
     })
     .unwrap_or_else(|why| panic!("the shell loads: {why}"))
@@ -332,8 +342,15 @@ fn check(model: &str, hybrid: bool) {
         eprintln!("skipping: no Metal device");
         return;
     }
+    check_near(model, hybrid, None);
+}
+
+/// [`check`] over a pool whose chunk aims near `chunk` bytes where stated:
+/// the seats' logits.
+fn check_near(model: &str, hybrid: bool, chunk: Option<u64>) -> Vec<Vec<f32>> {
     let fixture = fixture(model);
     const STEPS: usize = 12;
+    let load = |fixture: &Fixture| load_near(fixture, CONTEXT, chunk);
 
     let mut shell = load(&fixture);
     let facts = shell.pool_chunk_facts();
@@ -417,6 +434,7 @@ fn check(model: &str, hybrid: bool) {
         &scattered,
         &seats,
     );
+    seats
 }
 
 #[test]
@@ -432,6 +450,36 @@ fn a_scattered_windowed_pool_serves_the_same_logits() {
 #[test]
 fn a_scattered_hybrid_pool_serves_the_same_logits() {
     check("qwen35-tiny", true);
+}
+
+/// A gated-delta hybrid's record cut into pieces on device: its chunk aimed
+/// at 256 KiB, the 1.6 MiB record lies in pieces of their own, each piece of
+/// each lane in a chunk of its own once scattered by slot ref (and evacuated
+/// mid-decode); the logits are the same bits as the seats' runs, and as the
+/// whole record's under the profile's own chunk.
+#[test]
+fn a_record_in_pieces_serves_the_whole_records_logits() {
+    if !engine_metal::device::present() {
+        eprintln!("skipping: no Metal device");
+        return;
+    }
+    let model = "qwen35-tiny";
+    const CHUNK: u64 = 256 << 10;
+    let pieces = load_near(&fixture(model), CONTEXT, Some(CHUNK))
+        .pool_layout()
+        .pieces;
+    assert!(
+        pieces > 1,
+        "{model}'s record is whole in a {CHUNK}-byte chunk"
+    );
+    eprintln!("{model}: the record in {pieces} pieces");
+    let cut = check_near(model, true, Some(CHUNK));
+    let whole = check_near(model, true, None);
+    same(
+        &format!("{model}: the record in {pieces} pieces against whole"),
+        &cut,
+        &whole,
+    );
 }
 
 /// The pools a GDN hybrid's catalog trace lays on this device, no weights

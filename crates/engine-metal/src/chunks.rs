@@ -99,8 +99,22 @@ pub fn recipe(
     trace: &poem_ir::Trace,
     budgets: &Budgets,
 ) -> Result<poem_compiler::chunk::ChunkRecipe> {
+    recipe_near(trace, budgets, None)
+}
+
+/// [`recipe`] aiming its chunk near `target` bytes where stated (a
+/// diagnostic: a miniature's records cut into pieces as a full model's are).
+pub fn recipe_near(
+    trace: &poem_ir::Trace,
+    budgets: &Budgets,
+    target: Option<u64>,
+) -> Result<poem_compiler::chunk::ChunkRecipe> {
+    let mut chunk = ChunkProfile::ON_DEVICE_METAL;
+    if let Some(target) = target {
+        chunk.target_chunk_bytes = target;
+    }
     let profile = DeviceProfile {
-        chunk: ChunkProfile::ON_DEVICE_METAL,
+        chunk,
         ..DeviceProfile::default()
     };
     poem_compiler::chunk::plan(trace, budgets, &profile).map_err(|why| {

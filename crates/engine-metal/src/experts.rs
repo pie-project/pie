@@ -30,6 +30,9 @@ pub struct Plan {
     /// The weight cache states no weight shape: every table and bank is
     /// read whole, as before the cache (a diagnostic, for comparing).
     whole_weights: bool,
+    /// The chunk the pool's recipe aims near, where not the on-device
+    /// Metal profile's (a diagnostic: records cut into pieces).
+    chunk_bytes: Option<u64>,
 }
 
 #[derive(Debug, Clone)]
@@ -187,6 +190,7 @@ impl Plan {
             gathered,
             streaming: None,
             whole_weights: false,
+            chunk_bytes: None,
         })
     }
 
@@ -209,6 +213,18 @@ impl Plan {
     #[must_use]
     pub fn whole_weights(&self) -> bool {
         self.whole_weights
+    }
+
+    /// This plan's pool aiming its chunk near `bytes` (see `chunk_bytes`).
+    #[must_use]
+    pub fn with_chunk_bytes(mut self, bytes: u64) -> Plan {
+        self.chunk_bytes = Some(bytes);
+        self
+    }
+
+    #[must_use]
+    pub fn chunk_bytes(&self) -> Option<u64> {
+        self.chunk_bytes
     }
 
     #[must_use]

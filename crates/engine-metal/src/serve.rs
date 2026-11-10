@@ -672,7 +672,8 @@ impl PreparedLoad<'_> {
         // The compiler's on-device Metal recipe is the one layout source: the
         // chunk, the list slot (its tokens are the kv page size), where
         // every fixed row's pieces lie in a record, and the weight slots.
-        let recipe = crate::chunks::recipe(&boot.trace, &budgets)?;
+        let recipe =
+            crate::chunks::recipe_near(&boot.trace, &budgets, boot.residency.chunk_bytes())?;
         let weight_caches = if boot.residency.whole_weights() {
             Vec::new()
         } else {
