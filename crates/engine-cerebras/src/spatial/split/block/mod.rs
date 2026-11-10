@@ -18,8 +18,10 @@ use super::role::{Kind, Place};
 use super::weights::{Binding, Copies};
 use super::wiring::{Class, Wiring};
 
+pub mod band;
 pub mod gdn;
 pub mod head;
+pub mod moe;
 pub mod segments;
 pub mod token_loop;
 pub mod units;
