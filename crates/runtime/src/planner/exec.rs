@@ -160,17 +160,32 @@ impl Move {
         };
         let mut copies: Vec<TierMove> = kv
             .iter()
-            .flat_map(KvResidencyTxn::copy_plans)
-            .map(|(tier, device, slots)| TierMove {
-                kind: TierKind::Kv,
-                tier,
-                out,
-                device,
-                slots,
+            .flat_map(|txn| {
+                let kind = TierKind::kv(txn.shape());
+                txn.copy_plans()
+                    .into_iter()
+                    .map(move |(tier, device, slots)| TierMove {
+                        kind,
+                        tier,
+                        out,
+                        device,
+                        slots,
+                    })
             })
             .collect();
         if let Some(rs) = rs.as_ref() {
             let plan = rs.copy_plan();
+            // A shared pool's state moves shape by shape (CONTRACT-BC 22).
+            for (shape, pairs) in &plan.shared {
+                let (device, slots) = pairs.iter().copied().unzip();
+                copies.push(TierMove {
+                    kind: TierKind::RsSlots(*shape),
+                    tier: MemoryDomain::HostPinned,
+                    out,
+                    device,
+                    slots,
+                });
+            }
             let pages = if rs.is_window() {
                 TierKind::Window
             } else {
@@ -558,7 +573,7 @@ pub(super) async fn persist(
     };
     let (device, slots) = txn.copy_plan();
     let copy = TierMove {
-        kind: TierKind::Kv,
+        kind: TierKind::kv(txn.shape()),
         tier: MemoryDomain::LocalDisk,
         out: true,
         device,

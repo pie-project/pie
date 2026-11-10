@@ -192,7 +192,7 @@ fn a_tapped_fire_reads_each_layer_out_as_the_pool_holds_it() {
 
     let moved: Vec<u32> = (8..8 + n as u32).collect();
     shell
-        .swap_kv(true, &pages, &moved, &[])
+        .swap_kv(true, &pages, &moved)
         .expect("the pages move to the host tier");
     let after = shell.read_host_kv(&moved).expect("the moved pages read");
     assert!(

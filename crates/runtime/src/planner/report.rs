@@ -190,16 +190,20 @@ impl ResidencyPlanner {
 
     /// Counts one engine copy of a residency move and, for kv, its time.
     pub(crate) fn record_tier_copy(&self, copy: &crate::scheduler::TierMove, elapsed: Duration) {
-        use crate::scheduler::TierKind::{Kv, Rs, RsPages, Window};
+        use crate::scheduler::TierKind::{Kv, KvSlots, Rs, RsPages, RsSlots, Window};
         use ::engine::transfer::MemoryDomain::LocalDisk;
         let stats = &self.stats;
         let (count, us) = match (copy.kind, copy.tier, copy.out) {
-            (Kv, LocalDisk, true) => (&stats.disk_write_pages, Some(&stats.disk_write_us)),
-            (Kv, LocalDisk, false) => (&stats.disk_read_pages, Some(&stats.disk_read_us)),
-            (Kv, _, true) => (&stats.d2h_pages, Some(&stats.d2h_copy_us)),
-            (Kv, _, false) => (&stats.h2d_pages, Some(&stats.h2d_copy_us)),
-            (Rs | RsPages | Window, _, true) => (&stats.d2h_rs_slots, None),
-            (Rs | RsPages | Window, _, false) => (&stats.h2d_rs_slots, None),
+            (Kv | KvSlots(_), LocalDisk, true) => {
+                (&stats.disk_write_pages, Some(&stats.disk_write_us))
+            }
+            (Kv | KvSlots(_), LocalDisk, false) => {
+                (&stats.disk_read_pages, Some(&stats.disk_read_us))
+            }
+            (Kv | KvSlots(_), _, true) => (&stats.d2h_pages, Some(&stats.d2h_copy_us)),
+            (Kv | KvSlots(_), _, false) => (&stats.h2d_pages, Some(&stats.h2d_copy_us)),
+            (Rs | RsPages | Window | RsSlots(_), _, true) => (&stats.d2h_rs_slots, None),
+            (Rs | RsPages | Window | RsSlots(_), _, false) => (&stats.h2d_rs_slots, None),
         };
         count.fetch_add(copy.device.len() as u64, Ordering::Relaxed);
         if let Some(us) = us {

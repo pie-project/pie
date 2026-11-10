@@ -511,8 +511,10 @@ impl Engine for Metal {
 
         shell.mount_adapters(self.boot.adapter_dir.clone());
         // The device pool already is host memory, so a host tier would only
-        // move kv and rs slots within the same DRAM; suspended ones go
-        // straight to disk.
+        // move kv and rs slots within the same DRAM: one is seated only
+        // where its budget is stated (it frees room in the pool's heap, not
+        // memory), and suspended slots otherwise go straight to disk.
+        shell.seat_tier(residency.host_kv_budget.unwrap_or(0));
         let disk_kv_pages = shell
             .seat_disk_kv(
                 residency.disk_kv_budget,

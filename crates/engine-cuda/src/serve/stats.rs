@@ -283,6 +283,19 @@ impl Shell {
             .copy_whole_slots(self.device.stream(), shape, pairs)
     }
 
+    /// Copies whole slots of `shape` between tiers (CONTRACT-BC 22), on
+    /// the stream behind the fires enqueued and ahead of the next.
+    pub fn copy_tier_slots(
+        &mut self,
+        shape: engine::chunk::ShapeId,
+        from: crate::store::Tier,
+        to: crate::store::Tier,
+        pairs: &[(u32, u32)],
+    ) -> crate::Result<()> {
+        self.pools
+            .copy_tier_slots(self.device.stream(), shape, from, to, pairs)
+    }
+
     /// Copies whole slots and token runs of a kv shape (`windowed`: the windowed
     /// rows') within the state pool.
     pub fn copy_token_slots(

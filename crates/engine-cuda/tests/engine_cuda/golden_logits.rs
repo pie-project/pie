@@ -561,6 +561,227 @@ fn golden_logits_by_refs() {
     probe(served_by_refs);
 }
 
+/// Host refs handed out as the runtime's host tier would (CONTRACT-BC 22):
+/// a fresh host chunk for a shape whose open one is full, host chunk ids
+/// their own places.
+struct HostRefs {
+    next: u32,
+    open: Vec<Option<(u32, u32)>>,
+}
+
+impl HostRefs {
+    fn take(&mut self, facts: &engine::chunk::ChunkFacts, shape: usize) -> u32 {
+        let per_chunk = facts.shapes[shape].slots_per_chunk;
+        let (chunk, index) = match self.open[shape] {
+            Some((chunk, index)) if index < per_chunk => (chunk, index),
+            _ => {
+                assert!(
+                    self.next < facts.host_chunks,
+                    "the host tier holds the lane"
+                );
+                self.next += 1;
+                (self.next - 1, 0)
+            }
+        };
+        self.open[shape] = Some((chunk, index + 1));
+        chunk * per_chunk + index
+    }
+}
+
+/// Every slot of `refs` (shape `shape`; ref 0, a trimmed window slot,
+/// stays) out to `tier` and back into fresh device slots, as a suspend and
+/// a restore move them: the refs the lane names from then on.
+fn park(
+    shell: &mut Shell,
+    refs: &mut Refs,
+    host: &mut HostRefs,
+    tier: engine_cuda::store::Tier,
+    shape: usize,
+    slots: &[u32],
+) -> Vec<u32> {
+    use engine_cuda::store::Tier;
+    let id = refs.facts.shapes[shape].id;
+    let facts = refs.facts.clone();
+    let mut disk = 0u32;
+    let out: Vec<(u32, u32)> = slots
+        .iter()
+        .filter(|&&slot| slot != 0)
+        .map(|&slot| {
+            let parked = match tier {
+                Tier::Disk => {
+                    disk += 1;
+                    disk - 1
+                }
+                _ => host.take(&facts, shape),
+            };
+            (slot, parked)
+        })
+        .collect();
+    shell
+        .copy_tier_slots(id, Tier::Device, tier, &out)
+        .expect("the slots park");
+    let mut back = Vec::with_capacity(out.len());
+    let fresh: Vec<u32> = slots
+        .iter()
+        .map(|&slot| if slot == 0 { 0 } else { refs.take(shape) })
+        .collect();
+    for (&(_, parked), &slot) in out.iter().zip(fresh.iter().filter(|&&slot| slot != 0)) {
+        back.push((parked, slot));
+    }
+    shell
+        .copy_tier_slots(id, tier, Tier::Device, &back)
+        .expect("the slots come back");
+    fresh
+}
+
+/// The model served over [`SCRIPT`] by slot refs as [`served_by_refs`]
+/// serves it but for evacuations; where `offload`, after steps 2 and 6
+/// every slot the lane holds (kv list pages, window list pages, the record's
+/// pieces) parks below the device and comes back to fresh slots in fresh
+/// chunks: the host tier the first time, the kv list pages through the slot
+/// file the second. The logits are the never-offloaded serving's, bit for
+/// bit.
+fn served_offloaded(fixture: &Fixture, cache: &Path, offload: bool) -> Vec<(u64, u32)> {
+    use engine::chunk::SlotKind;
+    use engine_cuda::store::Tier;
+    let mut shell = load(fixture, cache);
+    shell
+        .seat_host_kv(Some(1 << 30), 1, CONTEXT, 1)
+        .expect("the host tier seats");
+    let dir = tempfile::tempdir().expect("a disk tier's dir");
+    shell
+        .seat_disk_kv(
+            Some(256 << 20),
+            Some(dir.path()),
+            false,
+            engine_cuda::World::default(),
+        )
+        .expect("the disk tier seats");
+    let facts = shell.chunk_facts().expect("the pool states its chunks");
+    facts.validate().expect("the engine's chunk facts hold");
+    assert!(facts.host_chunks > 0, "a host tier is stated");
+    assert!(facts.disk_chunks > 0, "a disk tier is stated");
+    let mut refs = Refs::of(facts.clone(), 1);
+    let mut host = HostRefs {
+        next: 0,
+        open: vec![None; facts.shapes.len()],
+    };
+    let list = refs.shape(|kind| matches!(kind, SlotKind::List { window: None, .. }));
+    let window_list = refs.shape(|kind| kind.window().is_some());
+    let fixed = refs.shape(|kind| matches!(kind, SlotKind::Fixed { .. }));
+    shell.take_refs();
+    let segments = facts.segments.max.min(4);
+    shell
+        .commit_segments(segments)
+        .expect("the segments commit");
+    let mut pieces: Vec<u32> = fixed.map_or_else(Vec::new, |shape| {
+        let SlotKind::Fixed { pieces } = facts.shapes[shape].kind else {
+            unreachable!("the fixed shape")
+        };
+        (0..pieces).map(|_| refs.take(shape)).collect()
+    });
+    let mut record =
+        (!pieces.is_empty()).then(|| shell.name_record(&pieces).expect("the record is named"));
+    let (mut pages, mut window): (Vec<u32>, Vec<u32>) = (Vec::new(), Vec::new());
+    let mut fed = 0u32;
+    let mut last = None;
+    let mut steps = Vec::with_capacity(SCRIPT.len());
+    for (at, step) in SCRIPT.iter().enumerate() {
+        let tokens: Vec<u32> = match *step {
+            Step::Prefill(rows) => (fed..fed + rows).map(|t| (t * 7 + 11) % 1000).collect(),
+            Step::Decode => vec![last.expect("a decode follows a step")],
+        };
+        let after = fed + u32::try_from(tokens.len()).expect("a count");
+        while (pages.len() as u32) < after.div_ceil(PAGE) {
+            if let Some(shape) = list {
+                pages.push(refs.take(shape));
+            }
+            if let Some(shape) = window_list {
+                window.push(refs.take(shape));
+            }
+        }
+        assert!(
+            u64::from(refs.next) < u64::from(segments) * u64::from(facts.segment_chunks),
+            "the lane's chunks lie in the committed segments"
+        );
+        let word = fixture.trace.facts.word(&Request::new(
+            u32::try_from(tokens.len()).expect("a count"),
+            false,
+        ));
+        let seated = Seated {
+            pages: &pages,
+            held: Some(fed),
+            window: &window,
+            rs_slot: record,
+            ..Seated::of(Lane {
+                slot: 0,
+                word,
+                tokens: &tokens,
+            })
+        };
+        let mut rows = shell
+            .fire_media(&[seated], &[], &[])
+            .expect("the step fires");
+        let logits = rows.swap_remove(0);
+        fed = after;
+        if let Some(retained) = window_list.and_then(|shape| facts.shapes[shape].kind.window()) {
+            let behind = (fed.saturating_sub(retained) / PAGE) as usize;
+            for slot in window.iter_mut().take(behind) {
+                *slot = 0;
+            }
+        }
+        let top = argmax(&logits);
+        last = Some(top);
+        steps.push((hash_logits(&logits), top));
+        if offload && (at == 2 || at == 6) {
+            let kv_tier = if at == 2 { Tier::Host } else { Tier::Disk };
+            if let Some(shape) = list {
+                pages = park(&mut shell, &mut refs, &mut host, kv_tier, shape, &pages);
+            }
+            if let Some(shape) = window_list {
+                window = park(&mut shell, &mut refs, &mut host, Tier::Host, shape, &window);
+            }
+            if let Some(shape) = fixed {
+                pieces = park(&mut shell, &mut refs, &mut host, Tier::Host, shape, &pieces);
+                record = Some(shell.name_record(&pieces).expect("the record is named"));
+            }
+        }
+    }
+    steps
+}
+
+/// CONTRACT-BC 22: a lane offloaded mid-decode (every slot it holds to the
+/// host tier and back, then its kv pages through the slot file) serves the
+/// never-offloaded lane's logits bit for bit, in one process.
+#[test]
+#[ignore = "a probe run by hand: see the module's doc"]
+fn golden_offload() {
+    if !engine_cuda::device::present() {
+        eprintln!("skipping: no CUDA device on this machine");
+        return;
+    }
+    let cache = cache_dir();
+    let mut moved = Vec::new();
+    for model in models() {
+        let fixture = fixture(&model, &cache);
+        // The warming serving: every product's algorithm picked and kept.
+        let _ = served_offloaded(&fixture, &cache, false);
+        let kept = served_offloaded(&fixture, &cache, false);
+        let offloaded = served_offloaded(&fixture, &cache, true);
+        for (at, (kept, offloaded)) in kept.iter().zip(&offloaded).enumerate() {
+            let same = if kept == offloaded { "same" } else { "MOVED" };
+            println!(
+                "offload {model} {at} {:016x} {:016x} {same}",
+                kept.0, offloaded.0
+            );
+        }
+        if kept != offloaded {
+            moved.push(model);
+        }
+    }
+    assert!(moved.is_empty(), "offloaded logits moved: {moved:?}");
+}
+
 fn probe(served: fn(&Fixture, &Path) -> Vec<(u64, u32)>) {
     if !engine_cuda::device::present() {
         eprintln!("skipping: no CUDA device on this machine");

@@ -821,6 +821,10 @@ impl Engine for Rank {
         self.with(|cuda| cuda.copy_state(copy))
     }
 
+    fn copy_slots(&mut self, copy: &engine::chunk::SlotCopy) -> EngineResult<()> {
+        self.with(|cuda| cuda.copy_slots(copy))
+    }
+
     fn host_kv_layout(&self) -> Option<state::PageLayout> {
         self.group.ranks[self.rank]
             .try_lock()
@@ -834,14 +838,6 @@ impl Engine for Rank {
 
     fn write_host_kv(&mut self, slots: &[u32], bytes: &[u8]) -> EngineResult<()> {
         self.with(|cuda| cuda.write_host_kv(slots, bytes))
-    }
-
-    fn read_host_state(&mut self, slots: &[u32], pages: &[u32]) -> EngineResult<Vec<u8>> {
-        self.with(|cuda| cuda.read_host_state(slots, pages))
-    }
-
-    fn write_host_state(&mut self, slots: &[u32], pages: &[u32], bytes: &[u8]) -> EngineResult<()> {
-        self.with(|cuda| cuda.write_host_state(slots, pages, bytes))
     }
 
     fn disconnect(&self, message: &str) {

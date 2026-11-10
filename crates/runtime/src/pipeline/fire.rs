@@ -974,13 +974,18 @@ async fn promote<C: FireContext>(
         txn: Some(txn),
         in_flight: Vec::new(),
     };
-    let plans = guard
-        .txn
-        .as_ref()
-        .map_or_else(Vec::new, |txn| txn.copy_plans());
+    let (kind, plans) = guard.txn.as_ref().map_or_else(
+        || (crate::scheduler::TierKind::Kv, Vec::new()),
+        |txn| {
+            (
+                crate::scheduler::TierKind::kv(txn.shape()),
+                txn.copy_plans(),
+            )
+        },
+    );
     for (tier, device, slots) in plans {
         let copy = crate::scheduler::TierMove {
-            kind: crate::scheduler::TierKind::Kv,
+            kind,
             tier,
             out: false,
             device,

@@ -101,6 +101,35 @@ pub struct FixedShape {
     pub slot_bytes: u64,
 }
 
+/// The tiers below an engine's shared pool (CONTRACT-BC 22): its host
+/// chunks, a pool of every state shape of their own
+/// ([`SharedPool::tier`]), and the kv list's slots in the engine's slot
+/// file. Every move between them and the device is the engine's
+/// `copy_slots`.
+#[derive(Clone, Debug, Default)]
+pub struct Tiers {
+    pub host: Option<Shared>,
+    pub disk_slots: u32,
+}
+
+impl Tiers {
+    /// The tiers `facts` state: `host_chunks` host chunks, and
+    /// `disk_chunks` chunks of kv list slots on disk.
+    pub fn of(facts: &ChunkFacts) -> Result<Self, SharedError> {
+        let host =
+            SharedPool::tier(facts, facts.host_chunks)?.map(|pool| Arc::new(Mutex::new(pool)));
+        let list = facts.shapes.iter().find(|shape| {
+            shape.role == SlotRole::State
+                && matches!(shape.kind, SlotKind::List { window: None, .. })
+        });
+        let disk_slots = list.map_or(0, |list| {
+            u32::try_from(u64::from(facts.disk_chunks) * u64::from(list.slots_per_chunk))
+                .unwrap_or(u32::MAX)
+        });
+        Ok(Self { host, disk_slots })
+    }
+}
+
 /// One step toward a segment target, as [`SharedPool::next_move`] plans it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SegmentMove {
@@ -195,6 +224,45 @@ impl SharedPool {
             }
             reserved += run.chunks;
         }
+        Self::build(facts, reserved, cow_lanes, max_context)
+    }
+
+    /// A tier below the device (CONTRACT-BC 22): `chunks` chunks of the
+    /// device pool's size on the host, every slot shape of `facts` but the
+    /// weights', any shape taking any chunk. Whole from the load (one
+    /// committed segment, no activation, no reserved chunk: host refs are
+    /// physical, ref 0 a slot like any other). `None` for no chunks.
+    pub fn tier(facts: &ChunkFacts, chunks: u32) -> Result<Option<Self>, SharedError> {
+        if chunks == 0 || facts.shapes.is_empty() {
+            return Ok(None);
+        }
+        if let Some(shape) = facts.shapes.iter().find(|shape| shape.pinned.is_some()) {
+            return Err(SharedError::Pinned(shape.id.0));
+        }
+        let tier = ChunkFacts {
+            total_chunks: chunks,
+            segment_chunks: chunks,
+            segments: ::engine::chunk::SegmentFacts {
+                committed: 1,
+                max: 1,
+                growth: SegmentGrowth::Fixed,
+            },
+            reserved: Vec::new(),
+            act_chunks: Vec::new(),
+            host_chunks: 0,
+            disk_chunks: 0,
+            weights: Vec::new(),
+            ..facts.clone()
+        };
+        Self::build(&tier, 0, 0, 0).map(Some)
+    }
+
+    fn build(
+        facts: &ChunkFacts,
+        reserved: u32,
+        cow_lanes: u32,
+        max_context: u32,
+    ) -> Result<Self, SharedError> {
         let mut shapes = Vec::with_capacity(facts.shapes.len() + facts.weights.len());
         let (mut lists, mut rs_lists, mut windows, mut fixed) =
             (Vec::new(), Vec::new(), Vec::new(), Vec::new());
@@ -332,6 +400,33 @@ impl SharedPool {
     #[must_use]
     pub fn fixed(&self) -> &[FixedShape] {
         &self.fixed
+    }
+
+    /// The engine's id of pool shape `pool`, a state shape's.
+    #[must_use]
+    pub fn engine_shape(&self, pool: ShapeId) -> Option<EngineShape> {
+        self.list
+            .iter()
+            .chain(&self.rs_list)
+            .chain(&self.windows)
+            .find(|shape| shape.pool == pool)
+            .map(|shape| shape.id)
+            .or_else(|| {
+                self.fixed
+                    .iter()
+                    .find(|shape| shape.pool == pool)
+                    .map(|shape| shape.id)
+            })
+    }
+
+    /// A tier's bytes: every chunk but the reserved ones, the chunks opened
+    /// for a shape, and the slots held in them.
+    #[must_use]
+    pub fn tier_bytes(&self) -> (u64, u64, u64) {
+        let chunk = self.pool.chunk_bytes();
+        let total = u64::from(self.pool.total_chunks() - self.pool.reserved_chunks()) * chunk;
+        let opened = u64::from(self.pool.state_chunks()) * chunk;
+        (total, opened, self.pool.demand().live)
     }
 
     #[must_use]

@@ -1150,6 +1150,11 @@ impl Shell {
         self.pools.seat_disk(dir, budget)
     }
 
+    /// Seats the shared pool's host tier of `budget` bytes (CONTRACT-BC 22).
+    pub fn seat_tier(&mut self, budget: u64) {
+        self.pools.seat_tier(budget);
+    }
+
     #[must_use]
     pub fn parked_state_slots(&self) -> u32 {
         self.pools.parked_slots()
