@@ -28,7 +28,12 @@
 //! pool's tier-pressure, with no PLEX involvement, since weights are
 //! read-only and come back from the host copy. Recovery runs the other way:
 //! kv and state waiters are served first, and the cache refills only into
-//! room left once none is short.
+//! room left once none is short. Weights the pool cannot seat fail an `off`
+//! load; `auto` streams them instead ([`boot_cache`]).
+//!
+//! The engine hears the resident set it starts with at load, before any
+//! fire ([`WeightFirst::boot`]), and each change after at a governor tick
+//! or a shed.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::sync::RwLock;
@@ -89,6 +94,74 @@ pub fn streaming(engine: usize) -> bool {
         .get(&engine)
         .copied()
         .unwrap_or(false)
+}
+
+/// The weight cache engine `engine` loads with, its shapes from `first` in
+/// `pool` ([`pool_shapes`] of `weights`), in the mode resolved for it
+/// ([`set_streaming`]): not streaming, every atom pinned; streaming, the
+/// floor.
+///
+/// Weights that do not fit the pool: `auto` streams them instead (and
+/// records it for the engine), `off` fails the load. A floor that does not
+/// fit fails it in any mode: no fire could run.
+///
+/// # Errors
+///
+/// As above, naming the bytes the weights need and the pool has free.
+pub fn boot_cache(
+    engine: usize,
+    mode: WeightStreaming,
+    weights: &[WeightShape],
+    first: ShapeId,
+    pool: &mut SlotPool,
+) -> anyhow::Result<WeightCache> {
+    let needs = |all: bool| -> Vec<(ShapeId, u64)> {
+        weights
+            .iter()
+            .enumerate()
+            .map(|(at, facts)| {
+                let shape = first + ShapeId::try_from(at).expect("weight shapes fit a shape id");
+                let atoms = if all { facts.count } else { 0 };
+                (shape, u64::from(facts.floor_slots) + u64::from(atoms))
+            })
+            .collect()
+    };
+    let floor: u64 = weights.iter().map(WeightShape::floor_bytes).sum();
+    let all: u64 = weights.iter().map(WeightShape::all_bytes).sum();
+    let free = u64::from(pool.free_chunks()) * pool.chunk_bytes();
+    let mut streams = streaming(engine);
+    if !streams && !pool.fits(&needs(true)) {
+        anyhow::ensure!(
+            mode != WeightStreaming::Off,
+            "weight_streaming = \"off\": engine {engine}'s weights do not fit its pool: \
+             every weight resident needs {} bytes ({all} of weights over {} shapes, \
+             {floor} of staging), the pool has {free} bytes free ({} chunks of {} bytes); \
+             set weight_streaming = \"auto\" or \"on\" to stream them",
+            all.saturating_add(floor),
+            weights.len(),
+            pool.free_chunks(),
+            pool.chunk_bytes(),
+        );
+        tracing::info!(
+            engine,
+            need_bytes = all.saturating_add(floor),
+            free_bytes = free,
+            floor_bytes = floor,
+            "the weights do not fit the pool: they stream, the cache at its floor"
+        );
+        set_streaming(engine, true);
+        streams = true;
+    }
+    anyhow::ensure!(
+        pool.fits(&needs(!streams)),
+        "engine {engine}'s pool cannot seat the weight staging: it needs {floor} bytes \
+         over {} shapes, the pool has {free} bytes free ({} chunks of {} bytes)",
+        weights.len(),
+        pool.free_chunks(),
+        pool.chunk_bytes(),
+    );
+    WeightCache::new(weights, first, streams, pool)
+        .map_err(|error| anyhow::anyhow!("engine {engine}'s weight cache: {error}"))
 }
 
 /// The pool shapes the weight shapes take, in order: appended after the
@@ -548,6 +621,26 @@ impl<P: PoolTarget + SlotAccess, W: WeightPort> WeightFirst<P, W> {
             self.publish();
         }
         shed
+    }
+
+    /// Tells the engine the resident set it starts with: what the load
+    /// calls before any fire, so none reads a row the cache holds from the
+    /// host.
+    ///
+    /// # Errors
+    ///
+    /// The engine refused it. One that does not stream (it answers
+    /// unsupported) is no error: it reads its weights as it loaded them.
+    pub fn boot(&mut self) -> ::engine::Result<()> {
+        let mut residency = None;
+        let cache = &mut self.cache;
+        self.inner.with_slots(&mut |pool, _| {
+            residency = cache.take_changed(pool);
+        });
+        match residency.map(|residency| self.port.set_residency(&residency)) {
+            Some(Err(::engine::Error::Unsupported { .. })) | Some(Ok(())) | None => Ok(()),
+            Some(Err(error)) => Err(error),
+        }
     }
 
     fn publish(&mut self) {

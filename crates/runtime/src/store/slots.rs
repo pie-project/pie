@@ -759,12 +759,17 @@ impl SlotPool {
         (refs.live, refs.cache)
     }
 
+    /// Free chunks a shape could open now without breaking the budget.
+    pub fn free_chunks(&self) -> u32 {
+        self.open.count.min(self.headroom())
+    }
+
     /// Free slots `shape` could take now without breaking the budget.
     pub fn available(&self, shape: ShapeId) -> u64 {
         let Some(state) = self.shapes.get(shape as usize) else {
             return 0;
         };
-        let chunks = self.open.count.min(self.headroom());
+        let chunks = self.free_chunks();
         state.partial_free + u64::from(chunks) * u64::from(state.spc())
     }
 
@@ -772,7 +777,7 @@ impl SlotPool {
     /// each shape's partly filled chunks first, then free chunks, which the
     /// shapes share.
     pub fn fits(&self, needs: &[(ShapeId, u64)]) -> bool {
-        let room = u64::from(self.open.count.min(self.headroom()));
+        let room = u64::from(self.free_chunks());
         let mut chunks = 0u64;
         for &(shape, slots) in needs {
             let Some(state) = self.shapes.get(shape as usize) else {
@@ -839,7 +844,7 @@ impl SlotPool {
             .ok_or(SlotError::UnknownShape(shape))?;
         let spc = u64::from(state.spc());
         let fresh = n.saturating_sub(state.partial_free).div_ceil(spc);
-        let room = u64::from(self.open.count.min(self.headroom()));
+        let room = u64::from(self.free_chunks());
         if fresh > room {
             let short = fresh - room;
             return Err(SlotError::Short {
