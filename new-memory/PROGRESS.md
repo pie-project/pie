@@ -399,3 +399,10 @@ The `new-memory/` directory is bookkeeping and is removed before anything lands 
   allocation / sharing / fork / prefix-cache / evacuation; prefill > W and spec rollback need no extra rules; Metal
   needs only trimming. Cost: one alloc/free per T tokens (O(1)), epoch fencing already exists (17).
 - Work: compiler recipe (window list shapes), runtime trim, CUDA (BC) ring path -> list, Metal (BM) trim.
+
+### M28 — 2026-11-10: RW4 merged (runtime rs list, contract 20)
+- `sc/rw4-rs-list` (133c4f1be): shared-mode rs buffer pages are real rs-list slots (refcounted, CoW tail via new
+  `Lane.slot_copies`), 16-row cap removed (`RsError::Unfolded`, `UNFOLDED_ROWS` use, `BUFFER_PAGES_PER_RECORD`
+  gone), `SlotShape.role` marks the rs list, base aligned down to T_rs, pressure counts rs-list slots.
+  Beam 3x12 on one working set accepted (10 slots). Engines (BC, BM) must implement `slot_copies` + rs-list pages.
+- Verified: `cargo check` runtime/engine/worker; runtime `store::shared`, `store::rs`, `pipeline::fire::rs` (27).

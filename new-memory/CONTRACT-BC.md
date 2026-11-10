@@ -82,3 +82,11 @@ Proposed by the L40S session (branch `sc/l40s-bc`), accepted by New Pie. Runtime
     like the kv list; a write into a shared partially filled tail slot follows the kv list's tail rule. No ring cap,
     ring addressing, gcd form or `kv.window_copies` remain; a backend's ring path is deleted, not kept.
 
+20. **rs-list mechanics (fills in 18).** `SlotShape.role: SlotRole` (serde default `State`); the rs list is
+    `SlotKind::List { tokens: T_rs, rate: 1 }` with `role: RsBuffer` (refused on non-List). At most one kv list and
+    one rs list per load. rs-list refs appear only in `RsVerb::Buffer.pages` (same `pages` on every lane of a group),
+    not in `Lane.tables`. Tail copies: `Lane.slot_copies: Vec<(ShapeId, Vec<[u32; 2]>)>` (serde default), whole-slot
+    `[src, dst]`, stated on the first writing lane of the group; the engine runs every lane's copies on the stream
+    before any lane of the fire reads or writes (after earlier fires); no two copies share a dst; `pages` already
+    names dst; `validate_chunks` checks them like table refs. A buffered write no longer forces record CoW. A model
+    that buffers rs rows must state an rs-list shape.
