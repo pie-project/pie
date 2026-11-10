@@ -2089,7 +2089,19 @@ impl Pools {
                 }
             }
         }
-        Ok(engine::chunk::WeightUses { uses })
+        let held = self
+            .row_caches
+            .iter()
+            .map(|cache| {
+                let resident = cache.slots.iter().flatten().count() as u32;
+                engine::chunk::WeightHeld {
+                    shape: cache.shape.id,
+                    resident,
+                    host: cache.slots.len() as u32 - resident,
+                }
+            })
+            .collect();
+        Ok(engine::chunk::WeightUses { uses, held })
     }
 
     /// The state pool as the runtime counts it, for fires of up to

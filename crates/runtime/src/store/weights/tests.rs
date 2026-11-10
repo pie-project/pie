@@ -56,6 +56,7 @@ fn atom(atom: u32) -> WeightAtom {
 fn uses(reads: &[(u32, u32)]) -> WeightUses {
     WeightUses {
         uses: reads.iter().map(|&(a, n)| (atom(a), n)).collect(),
+        held: Vec::new(),
     }
 }
 
@@ -246,6 +247,7 @@ impl ::engine::Engine for FakeEngine {
                 .into_iter()
                 .flat_map(|uses| uses.uses)
                 .collect(),
+            held: Vec::new(),
         })
     }
 }
