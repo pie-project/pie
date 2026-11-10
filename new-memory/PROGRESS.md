@@ -852,3 +852,8 @@ The `new-memory/` directory is bookkeeping and is removed before anything lands 
   golden_logits_by_refs = base in both layouts on 4 single-window minis.
 - Two-window mini loads (2 window lists) but cannot fire on L40S (sm_89 kernel gap for its fp8 compressed rows) ->
   bitwise two-lists vs one-window comparison to run on sm_120.
+
+### M65 — 2026-11-10: host tier bounded at seat (CUDA)
+- `sc/l40s-tier-bounds` (7b544a593): seat_tier cuts host_kv_budget to the machine's available memory (MemAvailable +
+  cgroup limit; RLIMIT_MEMLOCK does not govern cudaHostAlloc) with a warning, so the stated host_chunks can be pinned;
+  the pin thread warns on a failed chunk (locked vs asked). golden_offload unchanged; cut / warning paths untested.
