@@ -31,8 +31,8 @@ Each backend shows decode (c1 / c8 / c64 / c256), prefill (512 / 2048) and boot 
 medians. Known gaps to close:
 - XLA/TPU v6e (M77): prefill 512 -19%, 2048 -12%; qwen35 c64 -13%; MoE c1 -9%, c256 -12%, prefill -10%.
 - ROCm synth: flip only at parity (in progress).
-- CUDA: gemma-4-E2B decode 123 vs 136 tok/s seen once (IT r9) -> re-measure; budgeted/streaming modes compared to
-  main's equivalent.
+- CUDA (L40S, Qwen3.5-0.8B, server-level): c1/c8 equal; c64 -2.6%, c256 -4.0%, prefill 512 -4.5%; first (cold)
+  boot 87.9 s vs 22.6 s, warm boot faster. Other models pending; gemma 123 vs 136 to re-check.
 - Vulkan/wgpu, Metal: full comparison vs main not yet run.
 
 ## C. PR mechanics
