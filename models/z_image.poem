@@ -288,7 +288,14 @@ BARE = "a bare transformer state_dict"
 
 def formats(m):
     pipeline = lambda checkpoint: has_prefix("dit.")
-    out = [format(DIFFUSERS, recognizes = pipeline, read = lambda reads: read(m, reads, "dit."))]
+    # Turbo's scheduler shifts by 3; the base release, the same transformer
+    # under a schedule this family does not run, by 6.
+    out = [format(
+        DIFFUSERS,
+        recognizes = pipeline,
+        read = lambda reads: read(m, reads, "dit."),
+        states = [config("scheduler.shift", TURBO_SHIFT)],
+    )]
     if m.te == None:
         out.append(format(
             BARE,

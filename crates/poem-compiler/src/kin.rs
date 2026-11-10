@@ -36,6 +36,8 @@ pub struct Agreement {
     pub key: String,
     pub built: f64,
     pub at_least: bool,
+    /// Whether the checkpoint must state it.
+    pub required: bool,
     pub stated: Option<f64>,
 }
 
@@ -48,6 +50,7 @@ impl Agreement {
             key: path.clone(),
             built: stated.want,
             at_least: stated.at_least,
+            required: stated.required,
             stated: poem::import::format::stated(src, path),
         })
     }
@@ -56,7 +59,7 @@ impl Agreement {
     #[must_use]
     pub fn departs(&self) -> bool {
         match self.stated {
-            None => false,
+            None => self.required,
             Some(found) if self.at_least => found < self.built,
             Some(found) => {
                 found != self.built
