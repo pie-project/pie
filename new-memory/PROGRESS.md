@@ -832,3 +832,13 @@ The `new-memory/` directory is bookkeeping and is removed before anything lands 
   copy_slots of 0.5 GB device->host: 265-430 ms -> 6.3-6.6 ms; golden_offload all same.
 - Behaviour change: the whole host_kv_budget is page-locked shortly after boot. Open: a budget larger than lockable
   memory surfaces at the first copy that needs it (to be reported at boot instead).
+
+### M63 — 2026-11-10: XLA chunk pool merged (TPU verification by the user's team)
+- `sc/xla-chunk-pool` (b067ca70e..c1794d466, rebased on main #1594-#1602 without conflicts): per-plane PageMap; one
+  u32 pool with bitcast views; Mosaic kv append only on unmapped planes (pool kv writes via HLO); slot-ref lanes,
+  rs list, slot_copies, one window list (T_w = page), tiers (contract 22).
+- CUDA PJRT plugin, Mosaic off: bitwise vs base 0596e5176 (qwen3-micro, qwen35-tiny, gemma past window, park/restore);
+  kernels_mla/index/pool/replay/ple all pass; kernels_attn 21/24 and kernels_ssm 10/22 (failures reported as matching
+  base on the plugin; ssm not re-run on base this round).
+- TPU: new-memory/XLA-TPU-CHECKLIST.md (bitwise gate commands, TPU-only kernel tests, v5e/v6e speed vs main incl.
+  Mosaic kv append and bitcast relayout cost). Weight streaming on XLA: design only.

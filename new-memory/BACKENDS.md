@@ -8,7 +8,7 @@ Legend: ✅ verified on hardware · 🟡 in progress / compile-only · 🔴 not 
 
 | Feature | CUDA | ROCm | Metal | Vulkan | wgpu | XLA/TPU | Cerebras |
 |---|---|---|---|---|---|---|---|
-| Real ChunkFacts, slot-ref lanes, fixed pieces | ✅ M34 | ✅ M43 (MI300X) | ✅ M30 · 🔴 dsv4 window by slot ref (BM5a) | ✅ M48 | ✅ M48 | 🟡 XLA | 🟡 M43 host pool (no HW) |
+| Real ChunkFacts, slot-ref lanes, fixed pieces | ✅ M34 | ✅ M43 (MI300X) | ✅ M30 · 🔴 dsv4 window by slot ref (BM5a) | ✅ M48 | ✅ M48 | 🟡 M63 (TPU check by team) | 🟡 M43 host pool (no HW) |
 | Grow / shrink (segments, evacuation) | ✅ M34 | — flat by spec | ✅ M30 | ✅ M48 | ✅ M48 | — fixed at load | 🟡 M43 (host segments) |
 | rs list + slot_copies | ✅ M34 | ✅ golden_buffered (MI300X) | ✅ M37 | ✅ M53 (rs tail fork, engine) | ✅ M53 | 🟡 XLA | 🟡 M43 (host sim) |
 | Window lists (own T_w, trimmed) | ✅ tables per list M51 (T_w = page; 2-window untested) | ✅ goldens (one list) | ✅ up to 4 lists M50 | ✅ up to 4 lists, own T_w M53 | ✅ M53 | 🟡 XLA | 🟡 one list, T_w=page |
