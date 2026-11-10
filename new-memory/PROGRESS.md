@@ -466,3 +466,15 @@ The `new-memory/` directory is bookkeeping and is removed before anything lands 
 - Engine bug (pre-existing): engine-cuda serve/prepare.rs `rs_ahead` not cleared on a plain Fold, so a new working set
   reusing an rs record after MTP is refused ("lands its rows at slot 29 ... below 92"). Fix assigned to L40S (BC).
 - Seen once: engine stall during MTP ("pending CloseInstance 19, frame k=2 lanes=1 pending_binds=1"), not reproduced.
+
+### M33 — 2026-11-10: WL2 merged (per-window T_w, independent trim; contract 21 final)
+- `sc/wl2-window-tw` (491557b6f): window list T_w chosen per chunk size by waste (power of two >= 16), own table in
+  its own token order, one pool per window list, trimmed by its own window; window-set unit deleted; planner grants
+  per shape; <= 4 window lists; Ring* names -> Window*. Metal addresses window lists with T_w (needs device check).
+- Waste mean (ring / WL / WL2): CUDA windowed 0.36 / 1.19 / 0.62, all 0.57 / 0.84 / 0.65; Metal windowed
+  2.43 / 4.47 / 3.01, all 2.67 / 3.26 / 2.71. dsv41-flash-dspark 19.3 -> 2.77 CUDA, 45.7 -> 11.9 Metal; dsv4-base
+  16.6 -> 1.08 / 22.8 -> 7.77. Remainder = retire-slot accounting + 16-token floor (kept: table length <= ctx/16).
+- Limits: host save of rs state handles one window list; old ring-format saves don't reload (clean break);
+  Metal loads one window list (gemma4-26b-a4b-dflash refused there, as before).
+- Verified: cargo check --tests all crates/backends; chunk lib+golden; engine chunk 13; runtime store/fire/planner
+  135 incl. two window lists trimming independently.
