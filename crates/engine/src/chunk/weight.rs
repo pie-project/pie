@@ -97,4 +97,18 @@ pub struct WeightResidency {
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct WeightUses {
     pub uses: Vec<(WeightAtom, u32)>,
+    /// Where each weight shape's atoms lie as this is answered, for an
+    /// engine that counts them: a statistic, which residency does not read.
+    #[serde(default)]
+    pub held: Vec<WeightHeld>,
+}
+
+/// A weight shape's atoms by where a fire reads them now.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WeightHeld {
+    pub shape: ShapeId,
+    /// Atoms in a slot of the pool.
+    pub resident: u32,
+    /// Atoms read from the host copy, or streamed through staging.
+    pub host: u32,
 }

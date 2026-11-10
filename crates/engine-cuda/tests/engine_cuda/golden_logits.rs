@@ -1567,6 +1567,20 @@ fn served_rows(fixture: &Fixture, cache: &Path, rows: Rows) -> (Vec<(u64, u32)>,
         u64::from(fed),
         "a read of the table a token the script fed"
     );
+    // The record counts the table's blocks by where they lie.
+    let cached = match rows {
+        Rows::Host => 0,
+        Rows::Cached => table.count,
+        Rows::Mixed => table.count.div_ceil(2),
+    };
+    assert_eq!(
+        uses.held,
+        vec![engine::chunk::WeightHeld {
+            shape: table.id,
+            resident: cached,
+            host: table.count - cached,
+        }]
+    );
     (steps, uses.uses.len())
 }
 

@@ -30,7 +30,7 @@ use crate::transfer::MemoryDomain;
 mod weight;
 
 pub use weight::{
-    ResidentWeight, WeightAtom, WeightKind, WeightResidency, WeightShape, WeightUses,
+    ResidentWeight, WeightAtom, WeightHeld, WeightKind, WeightResidency, WeightShape, WeightUses,
 };
 
 /// A slot shape, by its place in [`ChunkFacts::shapes`]' ids.
