@@ -7,6 +7,7 @@ pub mod guard;
 pub mod operands;
 pub mod ops;
 pub mod request;
+pub mod residency;
 pub mod trace;
 pub mod value;
 
