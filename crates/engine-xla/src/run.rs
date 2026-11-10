@@ -110,6 +110,11 @@ pub struct FireBindings {
 
     pub readout_rows: Tensor,
 
+    /// Where each lane's readouts start in `readout_rows`, a lane at a time
+    /// (the fire's lanes, then their end): a window's readouts are its
+    /// lanes'.
+    pub readout_indptr: Vec<u32>,
+
     pub adapter_routes: Option<Tensor>,
 
     pub mrope_positions: Option<Tensor>,
@@ -450,10 +455,12 @@ impl<'c> Run<'c> {
         if self.readout_rowed.0.get(at).copied().unwrap_or(false)
             && let Some(probe) = self.readout_rowed.1
         {
-            let readouts = self.whole(probe).rows;
+            let (first, readouts) = self.readout_span().unwrap_or((0, self.whole(probe).rows));
             match shape.first() {
-                Some(Dim::Tokens) => return self.slice(handle, 0, readouts),
-                Some(Dim::TokensTimes(k)) => return self.slice(handle, 0, readouts * k),
+                Some(Dim::Tokens) => return self.slice(handle, first, readouts),
+                Some(Dim::TokensTimes(k)) => {
+                    return self.slice(handle, first * k, readouts * k);
+                }
                 _ => {}
             }
         }
@@ -466,7 +473,10 @@ impl<'c> Run<'c> {
             Some(Dim::TokensTimes(k)) => (window.row_offset * k, window.rows * k),
             Some(Dim::Lanes) => (window.lane_offset, window.lanes),
             Some(Dim::LanesPlus(k)) => (window.lane_offset, window.lanes + k),
-            Some(Dim::Readouts) => return handle,
+            Some(Dim::Readouts) => match self.readout_span() {
+                Some(span) => span,
+                None => return handle,
+            },
             Some(Dim::Const(_)) | None => return handle,
             Some(Dim::Patches) => (patch.row_offset, patch.rows),
             Some(Dim::Images) => (patch.lane_offset, patch.lanes),
@@ -488,6 +498,38 @@ impl<'c> Run<'c> {
 
     pub(crate) fn tensor(&self, id: ValueId) -> Tensor {
         self.cut(id, self.whole(id))
+    }
+
+    /// This window's readouts, `(first, count)` in the fire's, when its
+    /// lanes hold fewer than all of them; `None` when they hold every one.
+    fn readout_span(&self) -> Option<(u32, u32)> {
+        let indptr = &self.fire.readout_indptr;
+        let span = self.window().span;
+        let at = |lane: u32| {
+            indptr
+                .get(lane as usize)
+                .or(indptr.last())
+                .copied()
+                .unwrap_or(0)
+        };
+        let (first, end) = (at(span.lane_offset), at(span.lane_offset + span.lanes));
+        let all = indptr.last().copied().unwrap_or(0);
+        (first > 0 || end < all).then_some((first, end - first))
+    }
+
+    /// The fire's readout rows this window's lanes read out.
+    pub(crate) fn readouts(&self) -> Tensor {
+        let rows = self.fire.readout_rows;
+        self.readout_span()
+            .map_or(rows, |(first, count)| self.slice(rows, first, count))
+    }
+
+    /// Whether `id`'s rows are the fire's readouts rather than its tokens.
+    pub(crate) fn reads_out(&self, id: ValueId) -> bool {
+        matches!(
+            &self.values[id.0 as usize].ty,
+            Ty::Tensor { shape, .. } if shape.first() == Some(&Dim::Readouts)
+        )
     }
 
     pub(crate) fn gemm_tensor(&self, id: ValueId) -> Tensor {
