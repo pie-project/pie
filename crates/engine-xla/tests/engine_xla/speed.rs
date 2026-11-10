@@ -37,7 +37,7 @@ fn decode(name: &str, lanes: u32, held: u32, steps: u32) -> f64 {
         model.fire(vec![lane]);
         seq.held += held;
     }
-    let mut step = |model: &mut Model, refs: &mut Refs, seqs: &mut [Seq], last: bool| {
+    let step = |model: &mut Model, refs: &mut Refs, seqs: &mut [Seq], last: bool| {
         let lanes: Vec<_> = seqs
             .iter_mut()
             .enumerate()
@@ -73,7 +73,7 @@ fn prefill(name: &str, len: u32, runs: u32) -> f64 {
     let mut model = Model::load(name, None, context, 7);
     let vocab = model.vocab;
     let mut refs = Refs::of(&model);
-    let mut fire = |model: &mut Model, refs: &mut Refs, slot: u32| {
+    let fire = |model: &mut Model, refs: &mut Refs, slot: u32| {
         let mut seq = Seq::new(slot);
         let lane = seq.lane(model, refs, tokens(u64::from(slot), len as usize, vocab));
         model.fire(vec![lane]);

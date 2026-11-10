@@ -24,7 +24,7 @@ static KNOBS: std::sync::Mutex<Vec<(String, u32)>> = std::sync::Mutex::new(Vec::
 pub fn set_knob(name: &str, v: u32) {
     let mut knobs = KNOBS
         .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
+        .expect("the knobs");
     knobs.retain(|(n, _)| n != name);
     knobs.push((name.to_string(), v));
 }
@@ -34,7 +34,7 @@ pub fn set_knob(name: &str, v: u32) {
 fn knob(name: &str, default: u32) -> u32 {
     let set = KNOBS
         .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .expect("the knobs")
         .iter()
         .find(|(n, _)| n == name)
         .map(|&(_, v)| v);
