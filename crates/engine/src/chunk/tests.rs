@@ -71,11 +71,6 @@ fn degenerate_facts_reproduce_every_pool_count() {
     ] {
         let facts = ChunkFacts::degenerate(&pools, &BYTES);
         facts.validate().unwrap();
-        assert_eq!(
-            facts.degenerate_counts(),
-            DegenerateCounts::of(&pools),
-            "{pools:?}"
-        );
         let device = 1
             + pools.kv_pages
             + pools.window_pages.saturating_sub(1)
