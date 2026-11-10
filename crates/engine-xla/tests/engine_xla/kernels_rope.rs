@@ -229,6 +229,57 @@ fn full_rope_turns_halves_and_interleaved_pairs() {
     );
 }
 
+/// A prompt's rows (600: two whole 256-row blocks and a part) turn by
+/// halves in one kernel, 128- and 256-wide heads alike.
+#[test]
+fn a_prompt_tall_rope_turns_by_halves_in_one_kernel() {
+    for (qh, kvh, hd) in [(16usize, 8usize, 128usize), (8, 1, 256)] {
+        let rows = 600usize;
+        let theta = 1e6f32;
+        let qs = data(rows * qh * hd, 5);
+        let ks = data(rows * kvh * hd, 6);
+        let pos: Vec<i32> = (0..rows as i32).map(|r| (r * 7) % 2000).collect();
+        let mut b = Bench::new();
+        let q = b.bf16(rows as u32, (qh * hd) as u32, &qs);
+        let k = b.bf16(rows as u32, (kvh * hd) as u32, &ks);
+        let p = b.i32(rows as u32, 1, &pos);
+        if !b
+            .run(|ctx| {
+                engine_xla::lower::lower(ctx, |l| {
+                    let q_v = l.read(q)?;
+                    let k_v = l.read(k)?;
+                    let positions_v = l.read(p)?;
+                    let vs = rope::full(l.f(), q_v, k_v, positions_v, hd as u32, theta, false)?;
+                    if let Some(v) = vs[0] {
+                        l.land(q, v)?;
+                    }
+                    if let Some(v) = vs[1] {
+                        l.land(k, v)?;
+                    }
+                    Ok(())
+                })
+            })
+            .unwrap()
+        {
+            return;
+        }
+        let pf: Vec<f32> = pos.iter().map(|&v| v as f32).collect();
+        let n = neox_pairs(hd, hd, theta, hd as u32, false, 0);
+        assert_close(
+            &b.read_f32(q),
+            &turn_ref(&qs, qh * hd, hd, &n, &pf, 1, 1.0),
+            1e-2,
+            1e-2,
+        );
+        assert_close(
+            &b.read_f32(k),
+            &turn_ref(&ks, kvh * hd, hd, &n, &pf, 1, 1.0),
+            1e-2,
+            1e-2,
+        );
+    }
+}
+
 fn ramp(head_dim: u32, theta: f32, fast: f32, slow: f32, orig: u32) -> (f32, f32) {
     let tau = std::f32::consts::TAU;
     let corr = |rot: f32| head_dim as f32 * (orig as f32 / (rot * tau)).ln() / (2.0 * theta.ln());

@@ -484,10 +484,108 @@ pub(crate) fn rotate_all(
             out.push(Some(f.reshape(x3, &[r, w])?));
             continue;
         }
+        if let Some(v) = turn_tall(f, x.val, pos, t)? {
+            out.push(Some(v));
+            continue;
+        }
         let v = x.f32(f);
         out.push(Some(turn(f, v, pos, t)?));
     }
     Ok(out)
+}
+
+/// Rows a prompt-tall rotation takes a block (`turn_tall`).
+const TALL_ROWS: i64 = 256;
+
+/// A prompt's bf16 rows turned by one Mosaic kernel, a block of rows a step
+/// and each head in place, when `t` turns whole heads a lane tile wide or
+/// more by their halves (`(i, i + d/2)`, one position axis): the sines and
+/// cosines are the table's, `[rows, d]` once a fire, each head's partner its
+/// halves crossed (a lane rotation). XLA lays the same rows out as `[rows,
+/// heads, d]` in f32, and back. `None` where it does not apply
+/// (`PIE_XLA_ROPE_KERNEL=0` turns it off).
+fn turn_tall(f: &mut Func, x: Val, pos: Val, t: &Turn) -> Result<Option<Val>, Error> {
+    use crate::mosaic::{Body, Grid, Kernel, Operand as Block, Sem, Window};
+    let dims = f.dims(x).to_vec();
+    let (rows, width) = (dims[0], dims[1]);
+    let unit = t.unit;
+    let half = unit / 2;
+    let halves = (0..half).all(|i| {
+        t.partner[i] == (i + half) as i64
+            && t.partner[i + half] == i as i64
+            && t.sign[i] == -1.0
+            && t.sign[i + half] == 1.0
+            && t.freq.iter().all(|fq| fq[i] == fq[i + half])
+    });
+    if std::env::var("PIE_XLA_ROPE_KERNEL").is_ok_and(|v| v == "0")
+        || f.elem(x) != Elem::Bf16
+        || rows < TALL_ROWS
+        || !unit.is_multiple_of(128)
+        || width % unit as i64 != 0
+        || t.freq.len() != 1
+        || t.mscale != 1.0
+        || !halves
+    {
+        return Ok(None);
+    }
+    let u = unit as i64;
+    // The table's cosines, and its sines signed, `[rows, d]` in f32.
+    let p = f.reshape(pos, &[rows])?;
+    let p = f.broadcast(p, &[rows, u], &[0])?;
+    let fs: Vec<f64> = t.freq[0].iter().map(|&x| f64::from(x)).collect();
+    let fq = f.const_floats(Elem::F32, &fs, &[u])?;
+    let fq = f.broadcast(fq, &[rows, u], &[1])?;
+    let ang = f.mul(p, fq)?;
+    let c = f.cos(ang);
+    let s = f.sin(ang);
+    let sign: Vec<f64> = t.sign.iter().map(|&g| f64::from(g)).collect();
+    let sign = f.const_floats(Elem::F32, &sign, &[u])?;
+    let sign = f.broadcast(sign, &[rows, u], &[1])?;
+    let s = f.mul(s, sign)?;
+    let heads = width / u;
+    let nb = (rows + TALL_ROWS - 1) / TALL_ROWS;
+    let block = |w: i64, elem: Elem| Block {
+        array: vec![rows, w],
+        elem,
+        block: vec![TALL_ROWS, w],
+        window: Window::Blocked,
+        index: Box::new(|b: &mut Body, g: &Grid| Ok(vec![g.ids[0], b.i32(0)])),
+    };
+    let k = Kernel {
+        name: "rope_tall".into(),
+        grid: vec![nb],
+        semantics: vec![Sem::Parallel],
+        prefetch: vec![],
+        ins: vec![
+            block(width, Elem::Bf16),
+            block(u, Elem::F32),
+            block(u, Elem::F32),
+        ],
+        outs: vec![block(width, Elem::Bf16)],
+        vmem_limit: None,
+        scratch: vec![],
+    };
+    let c_ = k
+        .build(|b, blk| {
+            let i0 = b.index(0);
+            let cs = b.vload_all(blk.ins[1])?;
+            let sn = b.vload_all(blk.ins[2])?;
+            let by = b.i32(u / 2);
+            for h in 0..heads {
+                let col = b.index(h * u);
+                let xh = b.vload(blk.ins[0], &[i0, col], &[TALL_ROWS, u])?;
+                let xh = b.convert_f(xh, Elem::F32)?;
+                let xp = b.rotate(xh, by, 1)?;
+                let a = b.mulf(xh, cs)?;
+                let c2 = b.mulf(xp, sn)?;
+                let y = b.addf(a, c2)?;
+                let y = b.convert_f(y, Elem::Bf16)?;
+                b.vstore(y, blk.outs[0], &[i0, col])?;
+            }
+            Ok(())
+        })
+        .map_err(Error::from)?;
+    Ok(Some(c_.call(f, &[x, c, s]).map_err(Error::from)?[0]))
 }
 
 /// The first `rotary/2` pairs turn at `theta^(-i/span)`; a halves pair sits
