@@ -61,3 +61,9 @@ Per the user's speed rule, full suites were stopped; everything marked NOT RUN s
   the outer form spends the timeout waiting for the lock.
 - A test binary inherits the flock fd from `flock ... cargo test`; if cargo dies, the orphaned test
   binary keeps the GPU lock until it exits (seen 20:02–21:35 with an orphaned engine-cuda lib run).
+
+## Added 2026-11-10 (found during K2, fail identically on the base commit)
+- poem-compiler: `the_dsv41_plan_is_the_published_one`, `the_dsv41_dspark_head_drafts_through_its_stages` (look up
+  old row names like `pool.2`).
+- engine-cuda (sm_120): `a_conv_decoder_fires_over_a_voxel_input` ("reopened slot drifts").
+- kernels-rocm (MI300X): `linear_act_quant::a_projection_under_64_row_factors_folds_each_block` (FP8 MFMA m33).

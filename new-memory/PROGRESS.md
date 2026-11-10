@@ -553,3 +553,14 @@ The `new-memory/` directory is bookkeeping and is removed before anything lands 
   Divergences are bf16 ties (margin 0 / 0.25 at logits ~25). Accepted under the kernel-arm rule.
 - Follow-up (perf, not correctness): measure Metal decode/prefill at 16 vs 32-token pages before fixing the
   recipe's Metal page size.
+
+### M39 — 2026-11-10: K2 merged (kv spaces leave the IR)
+- `sc/k2-kv-space-removal` (d32db03dd): `CacheRow::Kv.space`, `HybridSpec`, `KvSpace`, `kv_space`,
+  `windowed_kv_space`, space numbering and per-space scheduler scaffolding deleted; a row's list comes from its
+  `window`; mask/plan geometry read the All axis (engines map it to the kv list, or the window list if only windowed
+  rows); write-position inputs carry the row's window (rows with the same window share one input — 380 of 1819 traces
+  differ only by that); engines stage one page table per list. `caches()` packages still refused.
+- Verified: golden_logits + golden_logits_by_refs (sm_120) identical to GOLDEN-LOGITS-BASE for all 8 models; poem /
+  poem-ir / poem-exec / compiler libs; chunk + bake tests; XLA, Cerebras libs; cargo check all engines incl. rocm.
+- Open: Metal not run on device (dsv4 plan now reads the kv list's geometry; Metal prefill score capture reads
+  last_page_len — check when window T_w < kv page). Vulkan/wgpu compile-only. `CacheRow` rename deferred.
