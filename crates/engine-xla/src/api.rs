@@ -65,6 +65,10 @@ pub struct DeviceBoot {
     /// Device bytes the load leaves past its weights and pool for XLA's
     /// scratch; `None` takes the chip's (`chip::Tpu::headroom`).
     pub headroom: Option<u64>,
+
+    /// The tokens a hybrid's state slot is balanced against the kv pages
+    /// for (a sequence's expected prompt and output); `None`: the context.
+    pub seat_tokens: Option<u32>,
 }
 
 impl Default for DeviceBoot {
@@ -76,6 +80,7 @@ impl Default for DeviceBoot {
             prewarm: false,
             window_pool: true,
             headroom: None,
+            seat_tokens: None,
         }
     }
 }

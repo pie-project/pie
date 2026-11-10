@@ -161,6 +161,13 @@ pub struct XlaEngineOptions {
     /// Device memory the load leaves past its weights and kv pool for XLA's
     /// scratch. Omit for the chip's own (1/16 of its HBM).
     pub device_headroom: Option<ByteSize>,
+    /// The tokens one sequence is expected to hold, its prompt and output
+    /// budget: a hybrid's state slots are balanced against the kv pages a
+    /// seat of this many tokens takes rather than one at `max_model_len`.
+    /// The pool still holds one sequence at `max_model_len`, and one that
+    /// outgrows its seat meets kv pressure as any other. Omit for
+    /// `max_model_len`.
+    pub seat_tokens: Option<u32>,
 }
 
 impl XlaEngineOptions {
