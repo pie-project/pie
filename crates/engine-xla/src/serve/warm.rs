@@ -172,6 +172,31 @@ impl Shell {
                 }
             }
         }
+        if std::env::var_os("ZZ_SHAPES").is_some() {
+            for shape in &shapes {
+                let d = shape.iter().filter(|w| w.word == decode).count();
+                let p: Vec<u32> = shape
+                    .iter()
+                    .filter(|w| w.word != decode)
+                    .map(|w| w.rows)
+                    .collect();
+                let held = shape.first().map_or(0, |w| w.held_pages);
+                eprintln!(
+                    "ZZS decode={d} held={held} prefill_lanes={} rows={:?}",
+                    p.len(),
+                    p.first()
+                );
+            }
+            eprintln!(
+                "ZZP buckets={buckets:?} widest={widest} lanes_cap={lanes_cap} cap={cap} pool={pool} pad={:?}",
+                (
+                    pad.page_floor,
+                    pad.prefill_floor,
+                    pad.mixed_host_rung,
+                    pad.room
+                )
+            );
+        }
         let started = std::time::Instant::now();
         // Trace every shape (nothing runs), then compile the new programs
         // side by side: a compile is host work, one core each.
@@ -179,7 +204,26 @@ impl Shell {
         let mut fired = 0;
         let mut failed = None;
         for shape in &shapes {
-            match self.warm_fire(shape) {
+            let before = self.deferred.as_ref().map_or(0, Vec::len);
+            let r = self.warm_fire(shape);
+            if std::env::var_os("ZZ_SHAPES").is_some() {
+                let d = shape.iter().filter(|w| w.word == decode).count();
+                let p: Vec<u32> = shape
+                    .iter()
+                    .filter(|w| w.word != decode)
+                    .map(|w| w.rows)
+                    .collect();
+                let sizes: Vec<usize> = self.deferred.as_ref().map_or(Vec::new(), |v| {
+                    v[before..].iter().map(|x| x.text.len()).collect()
+                });
+                eprintln!(
+                    "ZZT decode={d} held={} prefill_lanes={} rows={:?} texts={sizes:?}",
+                    shape.first().map_or(0, |w| w.held_pages),
+                    p.len(),
+                    p.first()
+                );
+            }
+            match r {
                 Ok(()) => fired += 1,
                 Err(fault) => {
                     failed = Some(fault);
