@@ -1079,3 +1079,91 @@ fn golden_pair_by_refs() {
             .unwrap_or_else(|why| panic!("{}: {why}", Path::new(&out).display()));
     }
 }
+
+/// Whether a lane's logits depend on what shares its fire: two seats'
+/// prefills of `PIE_GOLDEN_ROWS` rows (48) fired as one fire of two lanes,
+/// and as two fires of one lane each, on `PIE_GOLDEN_MODELS`. Prints, a
+/// lane, whether the two servings agree bit for bit and the most they
+/// differ by; asserts nothing (a batched product may sum in another order).
+#[test]
+#[ignore = "a probe run by hand: see the module's doc"]
+fn golden_batching() {
+    if !engine_cuda::device::present() {
+        eprintln!("skipping: no CUDA device on this machine");
+        return;
+    }
+    let cache = cache_dir();
+    let rows: u32 = std::env::var("PIE_GOLDEN_ROWS")
+        .ok()
+        .and_then(|rows| rows.parse().ok())
+        .unwrap_or(48);
+    for model in models() {
+        let fixture = fixture(&model, &cache);
+        let prompts: [Vec<u32>; 2] = [
+            (0..rows).map(|t| (t * 7 + 11) % 1000).collect(),
+            (0..rows).map(|t| (t * 13 + 5) % 1000).collect(),
+        ];
+        let word = fixture.trace.facts.word(&Request::new(rows, false));
+        let load = || {
+            let mut shell = Shell::load(Boot {
+                trace: fixture.trace.clone(),
+                contract: &fixture.contract,
+                checkpoint: &fixture.container,
+                budget: Budget::new(2, TOKENS),
+                patches: None,
+                voxels: None,
+                page_size: PAGE,
+                context: CONTEXT,
+                slots: 2,
+                kv_budget: None,
+                memory_share: engine::load::DEFAULT_DEVICE_MEMORY_SHARE,
+                ordinal: 0,
+                knobs: knobs(),
+                cache_dir: Some(&cache),
+                runahead: engine::runahead::Runahead::F1,
+                residency: engine_cuda::experts::Plan::default(),
+                deferred_tier: false,
+                world: engine_cuda::World::default(),
+                expert: engine_cuda::World::default(),
+                comm: core::ptr::null_mut(),
+            })
+            .unwrap_or_else(|why| panic!("{} loads: {why}", fixture.model));
+            shell.open(0).expect("slot 0 opens");
+            shell.open(1).expect("slot 1 opens");
+            shell
+        };
+        let lane = |seat: usize| Lane {
+            slot: seat as u32,
+            word,
+            tokens: &prompts[seat],
+        };
+        // Each serving twice: the first warms the products' algorithms.
+        let together = || {
+            let mut shell = load();
+            shell.fire(&[lane(0), lane(1)]).expect("the pair fires")
+        };
+        let apart = || {
+            let mut shell = load();
+            let mut first = shell.fire(&[lane(0)]).expect("the first lane fires");
+            let mut second = shell.fire(&[lane(1)]).expect("the second lane fires");
+            vec![first.swap_remove(0), second.swap_remove(0)]
+        };
+        let _ = (together(), apart());
+        let (together, apart) = (together(), apart());
+        for seat in 0..2 {
+            let (a, b) = (&together[seat], &apart[seat]);
+            let same = a.iter().zip(b).all(|(x, y)| x.to_bits() == y.to_bits());
+            let most = a
+                .iter()
+                .zip(b)
+                .map(|(x, y)| (x - y).abs())
+                .fold(0f32, f32::max);
+            println!(
+                "batching {model} lane {seat}: {} (most {most:e}, argmax {} / {})",
+                if same { "identical" } else { "differs" },
+                argmax(a),
+                argmax(b)
+            );
+        }
+    }
+}

@@ -477,6 +477,7 @@ impl Chunks {
             sets_per_working_set: kind.sets_per_working_set(),
             rows: shape.rows.iter().map(|&(row, _)| row).collect(),
             pinned: None,
+            role: engine::chunk::SlotRole::State,
         };
         let mut shapes = Vec::new();
         if let Some(list) = &layout.list {
