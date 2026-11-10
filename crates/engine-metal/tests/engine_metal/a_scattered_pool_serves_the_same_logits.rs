@@ -533,13 +533,8 @@ fn a_reserved_hybrid_pool_states_shared_chunks() {
     let budgets = poem_compiler::Budgets::of(Budget::new(SEATS, 64));
     let recipe = engine_metal::chunks::recipe(&trace, &budgets).expect("a recipe");
     let rs = engine_metal::rs::Layout::read(&trace).expect("the rs layout");
-    let rows = match Rows::plan(&trace, &recipe, &facts, rs.as_ref()) {
-        Ok(rows) => rows,
-        Err(why) => {
-            eprintln!("{name}: the recipe and this shell disagree: {why}");
-            return;
-        }
-    };
+    let rows = Rows::plan(&trace, &recipe, &facts, rs.as_ref())
+        .unwrap_or_else(|why| panic!("{name}: the recipe and this shell disagree: {why}"));
     let chunk = rows.chunk_bytes;
     let segment = engine_metal::store::pool::segment_chunks(chunk);
     let layout = Layout::new(

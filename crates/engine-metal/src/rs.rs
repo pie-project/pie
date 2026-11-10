@@ -191,12 +191,29 @@ impl Layout {
                 Ok(())
             };
 
+        // A conv is buffered only where its output feeds a recurrence whose
+        // commit is deferred (a gated-delta scan's `qkv`, a KDA scan's
+        // `mixed`), as the compiler's rs rows read it: any other conv (a
+        // Mamba2 layer's) commits its state as it runs.
+        let deferred: std::collections::HashSet<u32> = trace
+            .nodes
+            .iter()
+            .filter_map(|node| match &node.op {
+                Operation::Ssm(Ssm::GatedDelta { qkv, .. } | Ssm::GatedDeltaChunked { qkv, .. }) => {
+                    Some(qkv.0)
+                }
+                Operation::Ssm(Ssm::Kda { mixed, .. } | Ssm::KdaChunked { mixed, .. }) => {
+                    Some(mixed.0)
+                }
+                _ => None,
+            })
+            .collect();
         for node in &trace.nodes {
             match &node.op {
                 Operation::Ssm(
                     Ssm::CausalConv1d { x, state, y, .. }
                     | Ssm::CausalConv1dChunked { x, state, y, .. },
-                ) => {
+                ) if deferred.contains(&y.0) => {
                     let cache = cache_of(trace, *state)?;
                     plane(&mut layout, cache, Role::ConvX, *x)?;
                     region(&mut layout, cache, "conv", *y)?;

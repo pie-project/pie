@@ -10,12 +10,19 @@ impl DispatchSsm for Run<'_> {
 }
 
 impl Run<'_> {
+    /// Whether this fire buffers `x`, a recurrence input, in the rs list:
+    /// a conv whose output no deferred recurrence reads commits as it runs.
+    fn rs_buffers(&self, x: poem_ir::ValueId) -> bool {
+        self.rs_seat()
+            .is_some_and(|seat| seat.layout.in_of.contains_key(&x.0))
+    }
+
     fn ssm(&mut self, op: &Ssm) -> Result<(), kernels_metal::Error> {
         match op {
             // The committed walk's conv takes no bias.
-            Ssm::CausalConv1d { bias: Some(_), .. }
-            | Ssm::CausalConv1dChunked { bias: Some(_), .. }
-                if self.rs_seat().is_some() =>
+            Ssm::CausalConv1d { bias: Some(_), x, .. }
+            | Ssm::CausalConv1dChunked { bias: Some(_), x, .. }
+                if self.rs_buffers(*x) =>
             {
                 Err(kernels_metal::Error::Unsupported { op: op.name() })
             }
@@ -103,7 +110,7 @@ impl Run<'_> {
                 dilation,
                 y,
                 ..
-            } if self.rs_seat().is_some() => {
+            } if self.rs_buffers(*x) => {
                 let seat = self.rs_seat().expect("guarded");
                 let conv = crate::rs::Convolved {
                     x: *x,

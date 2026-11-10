@@ -399,10 +399,22 @@ fn experts(model: &str) {
 }
 
 // The other miniatures with dense routed banks do not serve on this engine
-// today, for reasons apart from the cache: nemotron3-nano-mini's recipe keeps
-// no rs row for a conv plane the shell buffers, dots3-note-mini needs MLA
+// today, for reasons apart from the cache: dots3-note-mini needs MLA
 // prefill, and mimo26-flash-mini's layout reads an experts dtype the bf16
 // fixture does not state.
+
+/// A Mamba2 hybrid: its convs feed no deferred recurrence, so the shell
+/// buffers none in an rs list (as the recipe keeps none).
+#[test]
+fn a_mixtures_dense_experts_serve_the_dense_logits_nemotron() {
+    experts("nemotron3-nano-mini");
+}
+
+/// A gated-delta hybrid with a conv no deferred recurrence reads.
+#[test]
+fn a_mixtures_dense_experts_serve_the_dense_logits_qwen38_flash_next() {
+    experts("qwen38-flash-next-mini");
+}
 
 #[test]
 fn a_mixtures_dense_experts_serve_the_dense_logits_minimax() {
