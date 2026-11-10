@@ -2536,9 +2536,9 @@ pub(crate) fn scatter_slots_mapped(
     if let Some(&done) = out.last()
         && f.is_view(done)
     {
-        for i in 0..out.len() {
-            if f.is_view(out[i]) {
-                out[i] = rebase(f, out[i], done)?;
+        for v in &mut out {
+            if f.is_view(*v) {
+                *v = rebase(f, *v, done)?;
             }
         }
     }
