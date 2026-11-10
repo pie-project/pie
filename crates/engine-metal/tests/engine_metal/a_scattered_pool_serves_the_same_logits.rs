@@ -503,19 +503,38 @@ fn a_reserved_hybrid_pool_states_shared_chunks() {
 /// the runtime trims, each step.
 #[test]
 fn a_trimmed_window_list_reads_as_the_whole_one() {
+    trimmed_window("gemma4-e4b-mini-l1");
+}
+
+/// As [`a_trimmed_window_list_reads_as_the_whole_one`], a window list of
+/// `T_w` = 16-token slots beside 32-token kv pages (CONTRACT-BC 21).
+#[test]
+fn a_trimmed_window_list_of_smaller_slots_reads_as_the_whole_one() {
+    trimmed_window("dots3-note-mini");
+}
+
+fn trimmed_window(model: &str) {
     use engine_metal::store::layout::WINDOW;
 
     if !engine_metal::device::present() {
         eprintln!("skipping: no Metal device");
         return;
     }
-    let fixture = fixture("gemma4-e4b-mini-l1");
+    let fixture = fixture(model);
     let context = 1024;
     let prompt: Vec<u32> = (0..700u32).map(|at| (at * 37 + 11) % 256).collect();
     const STEPS: usize = 24;
     let run = |trimmed: bool| -> Vec<Vec<f32>> {
         let mut shell = load_with(&fixture, context);
         let facts = shell.pool_chunk_facts();
+        eprintln!(
+            "{model}: shapes {:?}",
+            facts
+                .shapes
+                .iter()
+                .map(|s| (s.id.0, s.kind, s.slot_bytes, s.slots_per_chunk))
+                .collect::<Vec<_>>()
+        );
         let layout = shell.pool_layout();
         let window = facts.shape(WINDOW).expect("a window list");
         let engine::chunk::SlotKind::List {
