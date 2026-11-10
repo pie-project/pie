@@ -255,3 +255,13 @@ The `new-memory/` directory is bookkeeping and is removed before anything lands 
   `PIE_RECORD_CACHES=1`, replace row names with states, share objects for shared rows, delete `caches()`, order
   fields as the old `caches()`, rename function, run `moved::<pkg>`).
 - Verified: `cargo check` poem + poem-compiler; `pie-poem` state tests.
+
+### M15 — 2026-11-10: MG-A merged; work split with the L40S session
+- `sc/mg-a` (4fcc1b542..5103abc56): llama_3 (52 traces), glm_4 (112), minimax_m2 (60), qwen3_moe (240) on state
+  handles, all identical except names, no exceptions; llama_3's mtp drafter has its own kv state. 12 models migrated.
+- Split: the "Pie L40S" session (one L40S GPU) takes the CUDA engine half — BC pool switch (one VA, segments,
+  commit-ahead, two-ended activation, evacuation, real ChunkFacts, delete CUDA slot fitting), CUDA weight cache engine
+  side (weight_residency/uses, PLE staging, expert staging), golden-probe verification on L40S incl. the M14 window
+  change and sm_89-only arms. Branches `sc/l40s-<package>`; New Pie merges.
+  New Pie keeps poem/compiler migration (MG-B..D), old caches() API removal, K2 IR kv-space removal, runtime wiring,
+  Metal. P4 and WC3 (CUDA kernels) still finishing here.
