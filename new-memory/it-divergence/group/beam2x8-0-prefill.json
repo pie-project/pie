@@ -1,0 +1,163 @@
+{
+  "steps": [
+    {
+      "lanes": [
+        {
+          "slot": 0,
+          "word": 0,
+          "tokens": [
+            1010,
+            1047,
+            1084,
+            1121,
+            1158,
+            1195,
+            1232,
+            1269,
+            1306,
+            1343,
+            1380,
+            1417,
+            1454,
+            1491,
+            1528,
+            1565,
+            1602,
+            1639,
+            1676,
+            1713,
+            1750,
+            1787,
+            1824,
+            1861,
+            1898,
+            1935,
+            1972,
+            2009,
+            2046,
+            2083,
+            2120,
+            2157,
+            2194,
+            2231,
+            2268,
+            2305,
+            2342,
+            2379,
+            2416,
+            2453,
+            2490,
+            2527,
+            2564,
+            2601,
+            2638,
+            2675,
+            2712,
+            2749,
+            2786,
+            2823,
+            2860,
+            2897,
+            2934,
+            2971,
+            3008,
+            3045,
+            3082,
+            3119,
+            3156,
+            3193
+          ],
+          "positions": [],
+          "kv": {
+            "held": 0,
+            "pages": [
+              45,
+              46,
+              47,
+              48
+            ],
+            "translation": [],
+            "window": [],
+            "window_copies": []
+          },
+          "mask": null,
+          "adapter": null,
+          "rs": "Fold",
+          "rs_reset": "Fresh",
+          "rs_slot": 0,
+          "rs_snapshots": [],
+          "channels": [
+            {
+              "channel": 1,
+              "expected_head": 0,
+              "expected_tail": 18446744073709551615
+            },
+            {
+              "channel": 2,
+              "expected_head": 18446744073709551615,
+              "expected_tail": 18446744073709551615
+            },
+            {
+              "channel": 4,
+              "expected_head": 18446744073709551615,
+              "expected_tail": 0
+            },
+            {
+              "channel": 5,
+              "expected_head": 18446744073709551615,
+              "expected_tail": 0
+            },
+            {
+              "channel": 6,
+              "expected_head": 18446744073709551615,
+              "expected_tail": 0
+            },
+            {
+              "channel": 3,
+              "expected_head": 18446744073709551615,
+              "expected_tail": 18446744073709551615
+            }
+          ],
+          "readout": "Last",
+          "group": null,
+          "fires_after": 0,
+          "inputs": [],
+          "kv_less": false,
+          "reports": 0,
+          "tap": null,
+          "tables": [
+            [
+              0,
+              [
+                45,
+                46,
+                47,
+                48
+              ]
+            ]
+          ],
+          "fixed": [
+            [
+              2,
+              [
+                [
+                  2,
+                  2
+                ]
+              ]
+            ]
+          ],
+          "slot_copies": []
+        }
+      ],
+      "attachments": [
+        {
+          "lane": 0,
+          "lanes": 1,
+          "instance": 1,
+          "adapter_only": false
+        }
+      ]
+    }
+  ]
+}

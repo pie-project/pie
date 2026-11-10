@@ -1,0 +1,308 @@
+{
+  "steps": [
+    {
+      "lanes": [
+        {
+          "slot": 0,
+          "word": 5,
+          "tokens": [
+            1639
+          ],
+          "positions": [],
+          "kv": {
+            "held": 60,
+            "pages": [
+              45,
+              46,
+              47,
+              48
+            ],
+            "translation": [],
+            "window": [],
+            "window_copies": []
+          },
+          "mask": null,
+          "adapter": null,
+          "rs": {
+            "Buffer": {
+              "pages": [
+                69
+              ],
+              "base": 60,
+              "folded": 60,
+              "fold": {
+                "Host": 0
+              }
+            }
+          },
+          "rs_reset": "Held",
+          "rs_slot": 0,
+          "rs_snapshots": [],
+          "channels": [],
+          "readout": "Last",
+          "group": null,
+          "fires_after": 1,
+          "inputs": [],
+          "kv_less": false,
+          "reports": 0,
+          "tap": null,
+          "tables": [
+            [
+              0,
+              [
+                45,
+                46,
+                47,
+                48
+              ]
+            ]
+          ],
+          "fixed": [
+            [
+              2,
+              [
+                [
+                  2,
+                  2
+                ]
+              ]
+            ]
+          ],
+          "slot_copies": []
+        },
+        {
+          "slot": 1,
+          "word": 5,
+          "tokens": [
+            59
+          ],
+          "positions": [
+            60
+          ],
+          "kv": {
+            "held": 61,
+            "pages": [
+              45,
+              46,
+              47,
+              48
+            ],
+            "translation": [],
+            "window": [],
+            "window_copies": []
+          },
+          "mask": null,
+          "adapter": null,
+          "rs": {
+            "Buffer": {
+              "pages": [
+                69
+              ],
+              "base": 60,
+              "folded": 60,
+              "fold": {
+                "Host": 0
+              }
+            }
+          },
+          "rs_reset": "Held",
+          "rs_slot": 0,
+          "rs_snapshots": [],
+          "channels": [],
+          "readout": "Last",
+          "group": null,
+          "fires_after": 1,
+          "inputs": [],
+          "kv_less": false,
+          "reports": 0,
+          "tap": null,
+          "tables": [
+            [
+              0,
+              [
+                45,
+                46,
+                47,
+                48
+              ]
+            ]
+          ],
+          "fixed": [
+            [
+              2,
+              [
+                [
+                  2,
+                  2
+                ]
+              ]
+            ]
+          ],
+          "slot_copies": []
+        }
+      ],
+      "attachments": [
+        {
+          "lane": 0,
+          "lanes": 2,
+          "instance": 2,
+          "adapter_only": false
+        }
+      ]
+    },
+    {
+      "lanes": [
+        {
+          "slot": 0,
+          "word": 5,
+          "tokens": [
+            0
+          ],
+          "positions": [
+            61
+          ],
+          "kv": {
+            "held": 62,
+            "pages": [
+              45,
+              46,
+              47,
+              48
+            ],
+            "translation": [],
+            "window": [],
+            "window_copies": []
+          },
+          "mask": null,
+          "adapter": null,
+          "rs": {
+            "Buffer": {
+              "pages": [
+                69,
+                70
+              ],
+              "base": 60,
+              "folded": 60,
+              "fold": {
+                "Host": 0
+              }
+            }
+          },
+          "rs_reset": "Held",
+          "rs_slot": 0,
+          "rs_snapshots": [],
+          "channels": [],
+          "readout": "Last",
+          "group": null,
+          "fires_after": 0,
+          "inputs": [],
+          "kv_less": false,
+          "reports": 0,
+          "tap": null,
+          "tables": [
+            [
+              0,
+              [
+                45,
+                46,
+                47,
+                48
+              ]
+            ]
+          ],
+          "fixed": [
+            [
+              2,
+              [
+                [
+                  2,
+                  2
+                ]
+              ]
+            ]
+          ],
+          "slot_copies": []
+        },
+        {
+          "slot": 1,
+          "word": 5,
+          "tokens": [
+            0
+          ],
+          "positions": [
+            61
+          ],
+          "kv": {
+            "held": 63,
+            "pages": [
+              45,
+              46,
+              47,
+              48
+            ],
+            "translation": [],
+            "window": [],
+            "window_copies": []
+          },
+          "mask": null,
+          "adapter": null,
+          "rs": {
+            "Buffer": {
+              "pages": [
+                69,
+                70
+              ],
+              "base": 60,
+              "folded": 60,
+              "fold": {
+                "Host": 0
+              }
+            }
+          },
+          "rs_reset": "Held",
+          "rs_slot": 0,
+          "rs_snapshots": [],
+          "channels": [],
+          "readout": "Last",
+          "group": null,
+          "fires_after": 0,
+          "inputs": [],
+          "kv_less": false,
+          "reports": 0,
+          "tap": null,
+          "tables": [
+            [
+              0,
+              [
+                45,
+                46,
+                47,
+                48
+              ]
+            ]
+          ],
+          "fixed": [
+            [
+              2,
+              [
+                [
+                  2,
+                  2
+                ]
+              ]
+            ]
+          ],
+          "slot_copies": []
+        }
+      ],
+      "attachments": [
+        {
+          "lane": 0,
+          "lanes": 2,
+          "instance": 2,
+          "adapter_only": false
+        }
+      ]
+    }
+  ]
+}

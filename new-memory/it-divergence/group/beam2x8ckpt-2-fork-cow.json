@@ -1,0 +1,94 @@
+{
+  "steps": [
+    {
+      "lanes": [
+        {
+          "slot": 2,
+          "word": 1,
+          "tokens": [
+            12
+          ],
+          "positions": [],
+          "kv": {
+            "held": 60,
+            "pages": [
+              64,
+              65,
+              66,
+              69
+            ],
+            "translation": [],
+            "window": [],
+            "window_copies": []
+          },
+          "mask": null,
+          "adapter": null,
+          "rs": "Fold",
+          "rs_reset": "Held",
+          "rs_slot": 1,
+          "rs_snapshots": [],
+          "channels": [
+            {
+              "channel": 69,
+              "expected_head": 0,
+              "expected_tail": 18446744073709551615
+            },
+            {
+              "channel": 70,
+              "expected_head": 18446744073709551615,
+              "expected_tail": 18446744073709551615
+            },
+            {
+              "channel": 72,
+              "expected_head": 18446744073709551615,
+              "expected_tail": 0
+            },
+            {
+              "channel": 71,
+              "expected_head": 18446744073709551615,
+              "expected_tail": 18446744073709551615
+            }
+          ],
+          "readout": "Last",
+          "group": null,
+          "fires_after": 0,
+          "inputs": [],
+          "kv_less": false,
+          "reports": 0,
+          "tap": null,
+          "tables": [
+            [
+              0,
+              [
+                64,
+                65,
+                66,
+                69
+              ]
+            ]
+          ],
+          "fixed": [
+            [
+              2,
+              [
+                [
+                  2,
+                  4
+                ]
+              ]
+            ]
+          ],
+          "slot_copies": []
+        }
+      ],
+      "attachments": [
+        {
+          "lane": 0,
+          "lanes": 1,
+          "instance": 9,
+          "adapter_only": false
+        }
+      ]
+    }
+  ]
+}
