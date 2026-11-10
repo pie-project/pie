@@ -1182,6 +1182,20 @@ impl Shell {
             pad.prefill_floor
         };
         let bucket = poem_exec::fire::rung_of(buckets, need.max(floor));
+        // Many prompts beside decodes, on a load whose fires reach 4096 rows:
+        // the widest rows, where the warm ladder holds such fires at every
+        // decode rung, not a narrower rung's program compiled mid-run (v6e
+        // gpt-oss c256: 18 prompts of 2857 rows and a decode).
+        let widest = match buckets.as_slice() {
+            [.., below, top] if pad.room > 0 && top - below == pad.room => *below,
+            _ => top,
+        };
+        let many = pad.rung(by[host].2 + 1).max(host_floor) >= 32;
+        let bucket = if mixed && many && widest >= 4096 && bucket < widest {
+            widest
+        } else {
+            bucket
+        };
         pads.push((bucket - real_rows - ones, by[host].1));
         if lanes.len() + pads.len() > self.budgets.tokens.max_lanes as usize {
             return None;
