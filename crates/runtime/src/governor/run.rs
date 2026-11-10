@@ -157,6 +157,15 @@ async fn watch(mut pool: Shared<Steered>, tolerance: Tolerance) {
             });
         }
     }
+    // A dedicated shared pool may take every segment its range holds: its
+    // walker commits them ahead of the waiters that need them, off the fire
+    // path, and never gives them back.
+    if shared && steer.governor().tolerance() == Tolerance::Dedicated {
+        use crate::governor::PoolTarget;
+        let segment = pool.segment_bytes().max(1);
+        let all = pool.hard_limit().div_ceil(segment);
+        let _ = pool.retarget(all);
+    }
     // A dedicated pool's size stands: the loop only ticks, reading nothing
     // and answering no waiter.
     let Some(grow) = grow.filter(|_| steer.governor().tolerance() != Tolerance::Dedicated) else {

@@ -527,6 +527,21 @@ impl RsStore {
         self.slots.limit().max(self.pages.limit())
     }
 
+    /// In a shared pool, records that waiters are short `need` of each of
+    /// this store's shapes (window lists each their own), so the pool's
+    /// segment walker commits for them; `RsUnits::default()` clears it.
+    pub fn note_short_shared(&mut self, need: RsUnits) {
+        self.slots.wait(u64::from(need.slots));
+        if self.is_window() {
+            self.pages.wait(u64::from(need.windows[0]));
+            for (at, pool) in self.window_pools.iter_mut().enumerate() {
+                pool.wait(u64::from(need.windows.get(at + 1).copied().unwrap_or(0)));
+            }
+        } else {
+            self.pages.wait(u64::from(need.pages));
+        }
+    }
+
     /// Asks for `need` more than stand free; whether committing can add any.
     pub fn note_short(&mut self, need: RsUnits) -> bool {
         let limit = self.limit();
