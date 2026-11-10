@@ -38,7 +38,7 @@ column 0, then up column 1, and so on.
 - **Head** (`head_pe.csl`, `head_ctl.csl`). HC columns of HDc dims by HR rows of VR vocabulary rows.
   The head holds lm_head and the embedding tiles of the same vocabulary slice. Each row's control
   PE reduces the logits and takes the row argmax. The head has HR x VR rows, more than the
-  vocabulary (9B / 4B / 0.8B: 249,048 over 248,320). The prep fills the lm_head rows past the
+  vocabulary (9B / 4B / 0.8B: 249,048 over 248,320). The cut fills the lm_head rows past the
   vocabulary with copies of its last row, so they tie with it and the first-maximum argmax keeps
   the real, lower id; zero rows would win whenever every real logit is negative. The host also
   truncates logits rows to the vocabulary and refuses a ring id past it.
@@ -145,9 +145,8 @@ A load plans the model's trace (the family its shape needs, the preset, the posi
 program, and cuts the checkpoint for it (`engine-cerebras` `spatial::prepare`). Both are kept in the engine cache
 (`<PIE_HOME>/.../cerebras/wafer`, `p-<model>-<key>` and `t-<model>-<key>`), keyed by everything they follow from,
 so a second load compiles and cuts nothing; a whole-wafer compile takes minutes. Pie config: `frame_size 4`,
-`frame_dispatch_depth 63`. The Dense family (Qwen3.5, Qwen3, Llama 3) cuts its checkpoint in Rust
-(`spatial::tiles`); Gemma, Gemma 12B and gpt-oss do not yet, so they serve tiles staged by their Python prep,
-named in `[engine.debug] weights`.
+`frame_dispatch_depth 63`. Every family's checkpoint is cut in Rust (`spatial::tiles`: the family states its
+layout, one tiler makes it); `[engine.debug] weights` serves tiles staged elsewhere instead.
 
 **Build by hand** (no SDK needed until the link):
 
@@ -164,18 +163,21 @@ named in `[engine.debug] weights`.
    SDK container): a full link at the chip's fabric dims, every PE image's stack room checked (>= 768 B), the
    artifact put in `out/artifact`.
 4. **Cut**: `wafer-stage --model <deployment> --checkpoint <dir> --out <dir> [--positions N]` (engine-cerebras):
-   the tiles a load cuts. The Python preps (`tools/wafer/<family>/prep_<family>.py <model> <out> <golden.json>
-   <plan dir> [prefix]`) cut the tiny fixtures and the families with no Rust cut yet.
+   the tiles a load cuts (`tiles::stage`: the family's [`tiles::spec`] statement of its layout, made by the one
+   tiler `tiles::cut`). `wafer-stage --plan <plan.json> --landed <params.safetensors> --out <dir>` cuts params
+   already landed under the trace's names (a tiny checkpoint's: `tools/wafer/baseline/landed.py`).
 5. **Numerics gate** (before any new lever): `tools/emu/tf_q35.py <model> <golden> <meta.json>
    ref,f16acc_s16_kv16 256 <out>`. This needs `torch` and `transformers` with Qwen3.5.
 6. **Tiny end-to-end on the simulator** (no chip):
    1. `tools/wafer/dense/mk_tiny_qwen.py <dir> t08` (or `t4`; `mk_tiny_llama.py <dir>` a tiny Llama 3) builds a
       tiny HF checkpoint and its golden.
-   2. `wafer-compile plan --shape <its shape.json> --preset tiny-t08 --out <plan>`, `dense/prep_dense.py` on
-      it, then `wafer-compile build` and `link`.
-   3. `artifact_sim <build>/out <prep> "" 5` (engine-cerebras `--example artifact_sim`; `ARTIFACT_SIM_NTOK`
-      caps the tokens) runs `ArtifactModel` against the golden: two sequences, a rollback and a logits
-      row, inside the SDK container (through its glibc loader for a host-built binary).
+   2. `wafer-compile plan --shape <its shape.json> --preset tiny-t08 --out <plan>`; `baseline/landed.py <ckpt>
+      <params.safetensors>` and `wafer-stage --plan <plan>/plan.json --landed <params.safetensors> --out <cut>`;
+      then `wafer-compile build` and `link`.
+   3. `wafer-bench --program <build>/out --weights <cut> --golden <ckpt>/golden.json --steps 5`
+      (engine-cerebras; `--tokens` caps the tokens, `--cmaddr` runs it on the chip) runs `ArtifactModel` against
+      the golden: two sequences, a rollback and a logits row, inside the SDK container (through its glibc loader
+      for a host-built binary).
 
 ## 4. Parameters, levers and diagnostics (one place)
 
@@ -205,7 +207,7 @@ default is the shipped build. Each kernel's header describes its own params and 
 | `QKN` | weight | 1 | the q / k heads are RMS-normed (Qwen3.5, Qwen3): their rms scales the scores. 0 (Llama 3): no q / k norm; `qkw` holds q's 1/sqrt(head dim) alone. From the shape (`qk_norm`). |
 | `EPS` | CY | 1e-6 | the RMSNorms' eps (hidden and GDN's gated norm; Llama 3: 1e-5). From the shape (`norm.eps`). GDN's q / k l2 norms keep 1e-6. |
 | `GAPX`, `GAPY` | layout | 255 | the unit slot left out of the snake (relay PEs); from the plan (units one short of the slots) |
-| `RLV`, `RBITS` | CY | 4, 3 | RoPE tables: a position is RLV digits of RBITS bits, cos / sin composed from one table entry a digit; positions < 2^(RBITS RLV). The plan takes the levels its context needs (9B / 4B / 0.8B: 5) unless set (`RLV`); the prep writes the tables, `ArtifactModel` bounds its positions there. | A scaled rotation (Llama 3's) turns at the trace's frequencies: the plan's `rope.freqs`, the prep's `FREQS`.
+| `RLV`, `RBITS` | CY | 4, 3 | RoPE tables: a position is RLV digits of RBITS bits, cos / sin composed from one table entry a digit; positions < 2^(RBITS RLV). The plan takes the levels its context needs (9B / 4B / 0.8B: 5) unless set (`RLV`); the cut writes the tables, `ArtifactModel` bounds its positions there. | A scaled rotation (Llama 3's) turns at the trace's frequencies: the plan's `rope.freqs`.
 
 `head_ctl`, `head_pe` and `CX` always write a few `tdbg` stamps. These are off the critical path:
 `head_ctl`'s `tdbg[2 + s]` is the token loop's clock.
@@ -251,8 +253,8 @@ They match HF f32 logprobs to within 0.004 on the chosen token.
   identical text on the wafer program. The seed path was traced through the interpreter's
   RngKeyed and engine-cerebras's per-bind channel seeds, and no loss was found. It needs an A/B on
   a CUDA or Metal Pie.
-- **Llama 3.1 8B on the chip.** It runs on the simulator (the tiny Llama's golden); its prep, a 256 / 512 golden run
-  and the speed on the CS-3 are still to do.
+- **Llama 3.1 8B on the chip.** It runs on the simulator (the tiny Llama's golden); its cut on the full checkpoint,
+  a 256 / 512 golden run and the speed on the CS-3 are still to do.
 
 - **Gemma 4 12B speed.** 0.946 ms against a ~0.86 ms forecast. A sliding layer is ~13.3k cycles
   (0.982 ms and 14.1k before the exact ring). The attention-row PE has 1,776 B of stack room, too
@@ -269,7 +271,7 @@ Both reuse the wafer program machinery (the generic chains, segments, handoffs, 
 with their own kernels and a family each (`family/gemma.rs`, `family/gptoss.rs`: presets, blocks, kernels). The
 model's shape selects the family (`family::serving`): experts take gpt-oss's, per-layer inputs or shared KV Gemma's,
 sliding layers otherwise the 12B's. Tools: `tools/wafer/gemma`,
-`tools/wafer/gptoss` (prep, tiny fixture), `tools/emu/tf_gemma.py`
+`tools/wafer/gptoss` (the tiny fixture), `tools/emu/tf_gemma.py`
 and `tf_gptoss.py` (teacher-forced emulation of the kernels' number formats).
 
 **Gemma 4** (`*_gemma.csl`, E2B and E4B; 12B below).
@@ -314,7 +316,7 @@ layers and a 2 GB tied head fill 98% of the wafer, which only fits with a row-ro
 
 **gpt-oss-20b** (`*_gptoss*.csl`).
 - Experts: the released MXFP4 values re-encoded losslessly as FP8 E5M2 (the high byte of an f16) with one power of
-  two per (layer, expert, matrix); `prep_gptoss.py` checks every value. All 32 experts are resident on every MoE PE.
+  two per (layer, expert, matrix); the cut checks every value (and fails on one that is not exact). All 32 experts are resident on every MoE PE.
 - Unit: attention columns | CX | MoE columns (12 units, K 2: a sliding and a full layer), PY 160, Hc 18. Attention
   64 columns (kv head h on 8 columns, Dc 8), with sinks and YaRN RoPE on its CY; MoE 288 columns (Ic 10) with a
   vector top-4 router in f32 on its CY (a max tree, only the taken leaf's path redone).

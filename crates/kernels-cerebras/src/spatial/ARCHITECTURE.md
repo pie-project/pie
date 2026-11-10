@@ -37,7 +37,7 @@ engine (`engine-cerebras`) runs its **artifact** and knows none of it (below).
 | Blocks | `block/` | the `Block` trait and the blocks (table below); each owns its classes, slots, notes, kinds and colours as consts | coordinates, its own vocabulary |
 | ABI | `abi.rs` | `Kernel` (source, owned symbols, params' names, route slots, rcfg writer), `params!` (a kernel's typed params struct), `words!` (an rcfg word layout), `KernelBuild`, `Kernels`, `Overrides` | the build's view of a kernel |
 | Kernels | `kernels/` | `Pe` (one PE as an rcfg writer sees it); `common` (the word layouts every family's weight / CX / CY / head / head control kernel shares, its codes named, the relay); `head` (`head_pe.csl`, `head_ctl.csl`); one module a family's own kernels: `dense`, `gptoss`, `gemma`, `gemma12` | the CSL kernels' ABI |
-| Families | `family/` | `serving` (the family a shape needs); `dense`, `gptoss`, `gemma`, `gemma12`: presets, the plan of a shape under a preset, the tiling a prep cuts by, the block list, the kernels | the model's shape |
+| Families | `family/` | `serving` (the family a shape needs); `dense`, `gptoss`, `gemma`, `gemma12`: presets, the plan of a shape under a preset, the block list, the kernels, the cut's statement | the model's shape |
 | Emit | `emit/` | rcfg, kernel params (levers, overrides) and `layout.csl`, `HostLayout` (everything the host driver reads and writes on the wafer) | kernel builds |
 | Weights | `weights.rs` | `Binding`s (symbol, rect, source, transforms), `Copies`, the placer | the device |
 | Program | `program.rs` | `Program { plan, blocks, floor, wiring, palette, fabric, kernels, overrides, family }`, `build`, `bindings` | all of the above |
@@ -182,7 +182,7 @@ symbols (`Family::symbols`, export order).
    the writer over `Pe` using `common::*` for the shared words. Values that differ by PE are
    `Block::overrides`.
 7. **Copies** in each block's `bindings`, in placement order (the host's device protocol); the
-   prep tiles the checkpoint for them by the family's `tiling`.
+   family's `tiles` states the arrays they copy (`family/<family>/cut.rs`).
 8. **Host.** Anything the driver must find goes in `HostLayout`, derived from the program.
 9. **Verify** with the baseline harness (below) and the tiny simulator run.
 
@@ -204,11 +204,26 @@ is. `poem-compiler/SPATIAL.md` has the target-neutral half.
 
 `Program::bindings` lists every copy, the blocks' in order: a symbol, a rectangle and a `Source`
 (`Staged` leading-range blocks, `Slice` for any sub-array: column ranges, per-PE padding, a row
-repeated down or across a rectangle, optional tables; `Rcfg`) with the `Transform`s the prep
+repeated down or across a rectangle, optional tables; `Rcfg`) with the `Transform`s the cut
 applied. The engine's placer (`engine-cerebras` `spatial::artifact::place`) executes an artifact's
-bindings on a `Device`; `tools/wafer/compiler.py` executes the same `bindings.json` on the appliance
-runners. The preps keep every staged file under the 2 GiB a
-transfer may take (split head tiles, `ple`'s 1,900 MiB storage files).
+bindings on a `Device`. The cut keeps every staged file under the 2 GiB a transfer may take (split
+head tiles, `ple`'s 1,900 MiB storage files).
+
+## The cut
+
+What the bindings place is cut from the model's params, named as the trace names them (the
+runtime's import contract lands them, so no checkpoint name appears in the crate). Each family
+states its layout as data (`family/<family>/cut.rs`: a `tiles::spec::Spec`, every staged array and
+how each element follows from the params): a weight PE grid's tiles (a matrix's rows or columns
+gathered a column, its hidden dims split a row), gathered vectors, constants, and the tables a block
+computes rather than copies (RoPE's cos / sin, the head's vocabulary tiles, Gemma's per-layer
+inputs, MXFP4 experts as E5M2 pairs, each checked exact). One tiler (`tiles::cut`) makes every
+family's arrays; rounding is numpy's (f16 to nearest even, bf16 truncated), so the arrays are the
+earlier Python preps' byte for byte, with one deliberate exception. Gemma's per-layer inputs are
+computed in f64 throughout and rounded once to f16, where the prep summed its projection in f32 in
+its BLAS build's own order (OpenBLAS's K blocks). The cut's tables are the reference: each value is
+the f64 result's nearest f16. About 0.1% of values differ from the prep's, nearly all by one f16
+step; the larger gaps sit near zero, where the prep's f32 sums were the ones off.
 
 ## The artifact (what the engine runs)
 
@@ -228,27 +243,29 @@ positions the serving context asks for), `build::emit` and `build::link` with th
 kernels embedded in the crate, `spatial::sources`), and `tiles::stage` over the checkpoint's params landed
 through the runtime's import contract. The program is cached by its `ProgramKey` (plan, levers, every kernel
 source, the build `FORMAT`, the compiler version, the toolchain and the architecture), the cut by the plan's
-tiling and the checkpoint; each model keeps one of each.
+shape, partition and contract and the checkpoint; each model keeps one of each.
 
 ## Tools
 
 - `wafer-compile plan (--model <deployment> | --shape <shape.json>) [--preset <name>] [--set
-  K=V,..] [--positions N] --out <dir>` writes `plan.json` and `tiling.json` (what a Python prep cuts the
-  checkpoint by, and the preset's name). `wafer-compile build --plan <plan.json> --out <dir> [--emit ..]
+  K=V,..] [--positions N] --out <dir>` writes `plan.json` and names the preset it took. `wafer-compile build --plan <plan.json> --out <dir> [--emit ..]
   [--levers ..] [--kernels <dir>]` writes `floor.json`, `rcfg.npy` / `rcfg_n.npy` / `rcfg.txt`,
   `kernels.json`, `layout/`, `host.json`, `plan.json`, `bindings.json` and `program.json`. `wafer-compile
   link --build <dir>` links it where the SDK toolchain is, checks the stack room and puts the artifact in
   `out/artifact`.
-- `wafer-stage` (engine-cerebras) cuts a catalog deployment's checkpoint for its plan as a load does.
-- The Python preps (`dense/prep_dense.py`, `gemma/prep_gemma.py`, `gemma12/prep_gemma12.py`,
-  `gptoss/prep_gptoss.py`) cut a checkpoint as a plan directory's `tiling.json` says: the tiny fixtures
-  (no catalog deployment) and the families with no Rust cut yet. `<family>/mk_tiny_*.py` make the tiny
-  checkpoints and their goldens.
+- `wafer-stage` (engine-cerebras) cuts a catalog deployment's checkpoint for its plan as a load does,
+  or a plan over params already landed (`--plan`, `--landed`).
+- `wafer-bench` (engine-cerebras) runs a linked program bare, on the host code Pie's engine runs
+  (`ArtifactModel`), against a golden, on the simulator or the chip (`--cmaddr`).
+- Python is left only where `transformers` is needed or no deployment exists: `<family>/mk_tiny_*.py`
+  make the tiny checkpoints and their goldens; `baseline/landed.py` reads a tiny checkpoint as the
+  import contract would (the tiny dims are no catalog model's, so the contract cannot); the baseline's
+  capture and compare scripts.
 
 ## Verification
 
 `tools/wafer/baseline` captures everything the build and the host produce for every shipping config
 and each family's tiny (the host's placement, calls and derived values on a recording device; the
-build's per-PE kernel and params, evaluated from `layout.csl` by `layout_eval.py`; the tiny preps),
+build's per-PE kernel and params, evaluated from `layout.csl` by `layout_eval.py`; the tiny cuts),
 and compares two captures. A change that must not change behaviour is checked against the capture
 of the tree before it (README there).
