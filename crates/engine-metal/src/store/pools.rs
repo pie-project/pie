@@ -1837,18 +1837,10 @@ impl Pools {
             })
             .max()
             .unwrap_or(0);
-        // Backed through the weights and as many chunks again as every
-        // shape's floor takes: the runtime seats a held set's staging beside
-        // the weights in what is backed at load.
-        let floor: u32 = self
-            .weight_caches
-            .iter()
-            .map(|cache| cache.shape.floor.div_ceil(cache.shape.per_chunk.max(1)))
-            .sum();
+        // Backed through the chunks the load seats the weights in (the
+        // runtime backs what else it seats beside them, `commit_segments`).
         let segment = self.layout.segment_chunks.max(1);
-        let segments = (last + 1 + floor)
-            .div_ceil(segment)
-            .min(self.pool.segments());
+        let segments = (last + 1).div_ceil(segment).min(self.pool.segments());
         self.pool.commit_segments(segments)?;
         self.weight_residency(frame, plan)?;
         for cache in &mut self.weight_caches {
