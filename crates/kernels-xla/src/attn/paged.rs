@@ -936,7 +936,7 @@ pub(crate) fn per_row(
             c,
             w,
             scale,
-            ch.window_reach,
+            ch.window_reach && !std::env::var("PIE_WINDOW_UNROLL").is_ok_and(|v| v == "1"),
         );
     }
     let n = cdiv(total, c);
@@ -1011,6 +1011,14 @@ pub(crate) fn per_row(
     let st = if n == 1 {
         let zero = scalar_i(f, 0);
         body(f, zero, &st0)?
+    } else if table.is_none() && std::env::var("PIE_ROW_UNROLL").is_ok_and(|v| v == "1") && n <= 16 {
+        // every chunk in line: the same gathers in every layer over this pool
+        let mut st = st0;
+        for ci in 0..n {
+            let at = scalar_i(f, ci);
+            st = body(f, at, &st)?;
+        }
+        st
     } else if table.is_none() {
         // Visit only the chunks between the lowest and the largest admitted
         // positions.
