@@ -8,6 +8,7 @@
 // prefills whose page tables are out of order, rows that select fewer blocks
 // than the budget, rows that name a block twice or none, and a decode.
 
+use crate::common::spread::agrees;
 use crate::common::{Gpu, Lcg, close, from_bf16};
 use dtype::Dtype;
 use kernels_cuda::attn::selected;
@@ -142,37 +143,46 @@ fn lands_alike(q_lens: [usize; 2]) {
                 selected_cluster: cluster,
                 ..Tuning::DEFAULT
             });
-            if decode {
-                selected::attention_decode_selected(
-                    &ctx,
-                    q,
-                    sel,
-                    &kv,
-                    None,
-                    HEAD_DIM as u32,
-                    sm_scale,
-                    RATIO as u32,
-                    false,
-                    &mut o,
-                )
-            } else {
-                selected::attention_prefill_selected(
-                    &ctx,
-                    q,
-                    sel,
-                    &kv,
-                    None,
-                    HEAD_DIM as u32,
-                    KV_HEADS as u32,
-                    sm_scale,
-                    RATIO as u32,
-                    false,
-                    &mut o,
-                )
-            }
-            .expect("the selected attention fires");
+            let mut fire = |kv: &KvPool| {
+                if decode {
+                    selected::attention_decode_selected(
+                        &ctx,
+                        q,
+                        sel,
+                        kv,
+                        None,
+                        HEAD_DIM as u32,
+                        sm_scale,
+                        RATIO as u32,
+                        false,
+                        &mut o,
+                    )
+                } else {
+                    selected::attention_prefill_selected(
+                        &ctx,
+                        q,
+                        sel,
+                        kv,
+                        None,
+                        HEAD_DIM as u32,
+                        KV_HEADS as u32,
+                        sm_scale,
+                        RATIO as u32,
+                        false,
+                        &mut o,
+                    )
+                }
+                .expect("the selected attention fires");
+            };
+            fire(&kv);
             gpu.sync();
             landed.push(gpu.down::<u16>(out, tokens * Q_HEADS * HEAD_DIM));
+            // The same over the pool's pages spread apart, byte for byte.
+            let what = format!("{q_lens:?} decode {decode} mma {mma} cluster {cluster}");
+            let outs = [(out, tokens * Q_HEADS * HEAD_DIM * 2)];
+            agrees(&mut gpu, &what, &[kv], &[], &outs, |_, pools, _| {
+                fire(&pools[0])
+            });
         }
         for (walk, mma) in landed.iter().enumerate().skip(1) {
             for (i, (&s, &m)) in landed[0].iter().zip(mma).enumerate() {

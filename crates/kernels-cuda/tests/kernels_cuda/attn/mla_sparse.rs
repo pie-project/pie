@@ -10,6 +10,7 @@
 //! selection, against the warp-a-key form over the same rows. Two passes
 //! land the same bits.
 
+use crate::common::spread::agrees;
 use crate::common::{Gpu, Lcg, close, from_bf16};
 use dtype::Dtype;
 use kernels_cuda::attn::mla;
@@ -697,7 +698,7 @@ fn decode_heads(
         mla_wgmma: WG.with(std::cell::Cell::get),
         ..Tuning::DEFAULT
     });
-    let fire = || {
+    let fire = |pool: &KvPool| {
         mla::attention_decode_selected(
             &ctx,
             RaggedTensor {
@@ -707,7 +708,7 @@ fn decode_heads(
             &plan,
             Tensor::new(qpe_at, reqs as u32, (heads * rope) as u32, Dtype::Bf16),
             Tensor::new(sel_at, reqs as u32, 2048, Dtype::I32),
-            &pool,
+            pool,
             heads as u32,
             RANK as u32,
             0.04,
@@ -721,12 +722,19 @@ fn decode_heads(
         )
         .expect("the decode's selected attention fires");
     };
-    fire();
+    fire(&pool);
     gpu.sync();
-    (
+    let landed = (
         gpu.down(out, reqs * heads * RANK),
         gpu.down(lse_at, reqs * heads),
-    )
+    );
+    // The same over the pool's pages spread apart, byte for byte.
+    let what = format!("{heads} heads, {reqs} rows of {kv}, rope {rope}, fp8 {fp8}, dense {dense}");
+    let outs = [(out, reqs * heads * RANK * 2), (lse_at, reqs * heads * 4)];
+    agrees(&mut gpu, &what, &[pool], &[], &outs, |_, pools, _| {
+        fire(&pools[0])
+    });
+    landed
 }
 
 /// The fp8 rows on e4m3 tensor cores (Q and P in e4m3 too) against the same

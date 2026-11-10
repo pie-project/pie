@@ -6,6 +6,7 @@
 // tensor-core and the naive arm (`kernel.mla.path = naive`), the naive arm
 // reading a selection, and the naive arm a window sends any read to.
 
+use crate::common::spread::agrees;
 use crate::common::{Gpu, Lcg, close, from_bf16};
 use dtype::Dtype;
 use kernels_cuda::attn::mla;
@@ -253,43 +254,56 @@ fn score(
     let lse_at = gpu.zeros(case.tokens() * HEADS * 4);
     let mut o = Tensor::new(out, tokens, (HEADS * RANK) as u32, Dtype::Bf16);
     let mut lse = Tensor::new(lse_at, tokens, HEADS as u32, Dtype::F32);
-    if selected {
-        let selection = Tensor::new(raw.selection, tokens, TOP_K as u32, Dtype::I32);
-        mla::attention_prefill_selected(
-            &ctx,
-            q,
-            &plan,
-            q_pe,
-            selection,
-            &pool,
-            HEADS as u32,
-            RANK as u32,
-            case.sm_scale,
-            &mut o,
-            Some(&mut lse),
-        )
-        .expect("attn.mla_prefill_selected enqueues");
-    } else {
-        mla::attention_prefill(
-            &ctx,
-            q,
-            &plan,
-            q_pe,
-            &pool,
-            HEADS as u32,
-            RANK as u32,
-            case.sm_scale,
-            window,
-            &mut o,
-            Some(&mut lse),
-        )
-        .expect("attn.mla_prefill enqueues");
-    }
+    let mut fire = |pool: &KvPool| {
+        if selected {
+            let selection = Tensor::new(raw.selection, tokens, TOP_K as u32, Dtype::I32);
+            mla::attention_prefill_selected(
+                &ctx,
+                q,
+                &plan,
+                q_pe,
+                selection,
+                pool,
+                HEADS as u32,
+                RANK as u32,
+                case.sm_scale,
+                &mut o,
+                Some(&mut lse),
+            )
+            .expect("attn.mla_prefill_selected enqueues");
+        } else {
+            mla::attention_prefill(
+                &ctx,
+                q,
+                &plan,
+                q_pe,
+                pool,
+                HEADS as u32,
+                RANK as u32,
+                case.sm_scale,
+                window,
+                &mut o,
+                Some(&mut lse),
+            )
+            .expect("attn.mla_prefill enqueues");
+        }
+    };
+    fire(&pool);
     gpu.sync();
-    (
+    let landed = (
         gpu.down::<u16>(out, case.tokens() * HEADS * RANK),
         gpu.down::<f32>(lse_at, case.tokens() * HEADS),
-    )
+    );
+    // The same over the pool's pages spread apart, byte for byte.
+    let what = format!("mla naive {naive} selected {selected} window {window:?}");
+    let outs = [
+        (out, case.tokens() * HEADS * RANK * 2),
+        (lse_at, case.tokens() * HEADS * 4),
+    ];
+    agrees(gpu, &what, &[pool], &[], &outs, |_, pools, _| {
+        fire(&pools[0])
+    });
+    landed
 }
 
 fn assert_landed(got: &(Vec<u16>, Vec<f32>), want: &(Vec<f32>, Vec<f32>), what: &str) {

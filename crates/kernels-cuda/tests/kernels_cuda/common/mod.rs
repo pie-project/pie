@@ -691,6 +691,7 @@ pub mod attn_ref;
 pub mod host;
 pub mod linear_ref;
 pub mod spatial;
+pub mod spread;
 pub mod tc5;
 
 /// With `PIE_KERNEL_ERR=1`, prints `KERR <what> max_abs=<x> max_rel=<y>`
