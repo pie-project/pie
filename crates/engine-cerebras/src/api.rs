@@ -40,6 +40,7 @@ use poem_ir::Trace;
 
 use crate::error::Fault;
 use crate::serve::{Boot, Lane, Seated, Shell};
+use crate::store::pool::{FIXED, LIST, WINDOW};
 
 pub type ContractFor = fn(&Trace, &Path) -> std::result::Result<ModelContract, String>;
 
@@ -387,8 +388,16 @@ impl Engine for Cerebras {
         let paging = shell.paging();
         let drafter = shell.trace().drafter;
         let pools = shell.pool_facts();
-        let chunks = shell.chunk_facts(&pools).map_err(fault)?;
+        let chunks = shell.chunk_facts().map_err(fault)?;
         shell.log_chunk_recipe(&chunks);
+        // A fire stages at most `capacity` of each: its lanes name no more
+        // kv pages, and a model with state runs no more lanes than records.
+        let capacity = shell.capacity();
+        let max_lanes = if shell.has_state() {
+            budgets.max_lanes.min(capacity.records.max(1))
+        } else {
+            budgets.max_lanes
+        };
         let caps = Capabilities {
             device: DeviceFacts {
                 backend: "cerebras".to_string(),
@@ -404,9 +413,12 @@ impl Engine for Cerebras {
             pools,
             chunks: Some(chunks),
             limits: FireLimits {
-                max_lanes: budgets.max_lanes,
+                max_lanes,
                 max_tokens: budgets.max_tokens,
-                max_page_refs: paging.pages_per_slot.saturating_mul(budgets.max_lanes),
+                max_page_refs: paging
+                    .pages_per_slot
+                    .saturating_mul(max_lanes)
+                    .min(capacity.kv_pages),
                 max_context: paging.context(),
                 prefill_rows: 0,
                 max_readouts: u32::try_from(poem_compiler::arena::readouts_ceiling(&bake_budgets(
@@ -634,47 +646,93 @@ impl Engine for Cerebras {
                 engine: "cerebras",
             });
         }
+        // Page ids are kv list slot refs; windowed pairs whole window list
+        // slots (a shared pool states them as `Lane::slot_copies`).
         let page_size = self.loaded_mut()?.paging().page_size;
         let moves = copy.runs(page_size)?;
-        // Windowed pages a write into a shared one copies first ride the
-        // pre-launch copy beside the kv list's (CONTRACT-BC 19).
-        let windowed: Vec<engine::transfer::KvRun> = copy
-            .windowed
-            .iter()
-            .map(|&(src, dst)| engine::transfer::KvRun {
-                src_page: src,
-                src_token: 0,
-                dst_page: dst,
-                dst_token: 0,
-                tokens: page_size,
-            })
-            .collect();
         self.loaded_mut()?
-            .copy_kv_with(&moves, &windowed)
+            .copy_kv_with(&moves, &copy.windowed)
             .map_err(fault)
     }
 
     fn copy_state(&mut self, copy: &StateCopy) -> EngineResult<()> {
-        copy.device_only("cerebras")?;
-        for (at, move_) in copy.moves.iter().enumerate() {
-            if move_.src_token_offset != 0 || move_.dst_token_offset != 0 {
-                return Err(Error::Invalid(format!(
-                    "state move {at} names a token offset; this engine moves whole slots"
-                )));
-            }
+        let _ = copy;
+        Err(Error::Unsupported {
+            verb: "`copy_state`: this engine's records are slot refs of its fixed shape, \
+                   copied as a lane's `[run, cow]` (`Lane::fixed`), and its rs rows an rs \
+                   list's slots (`Lane::slot_copies`)",
+            engine: "cerebras",
+        })
+    }
+
+    fn commit_segments(&mut self, segments: u32) -> EngineResult<()> {
+        self.loaded_mut()?
+            .pool_mut()
+            .commit(segments)
+            .map_err(fault)
+    }
+
+    fn release_segments(&mut self, segments: u32) -> EngineResult<()> {
+        self.loaded_mut()?.pool_mut().release(segments);
+        Ok(())
+    }
+
+    fn evacuate(&mut self, evacuation: &engine::chunk::Evacuation) -> EngineResult<()> {
+        self.loaded_mut()?
+            .pool_mut()
+            .evacuate(evacuation)
+            .map_err(fault)
+    }
+
+    fn copy_slots(&mut self, copy: &engine::chunk::SlotCopy) -> EngineResult<()> {
+        let device = self.caps.as_ref().map(|caps| caps.device.domain);
+        if device.is_none_or(|device| copy.src != device || copy.dst != device) {
+            // The host and disk tiers of the shared shapes (the tier work's
+            // `copy_slots` direction) land here: this pool is host memory
+            // already, so a host tier is a second pool beside it.
+            return Err(Error::Unsupported {
+                verb: "`copy_slots` between tiers: this load states no host or disk chunks",
+                engine: "cerebras",
+            });
         }
-        let shell = self.loaded_mut()?;
-        for move_ in &copy.moves {
-            shell
-                .copy_state(move_.src_slot_id, move_.dst_slot_id)
-                .map_err(fault)?;
+        let pool = self.loaded_mut()?.pool_mut();
+        let pairs: Vec<(u32, u32)> = copy.slots.clone();
+        pool.copy_slots(copy.shape, &pairs).map_err(fault)?;
+        for run in &copy.runs {
+            pool.copy_rows(
+                copy.shape,
+                (run.src, run.src_token),
+                (run.dst, run.dst_token),
+                run.tokens,
+            )
+            .map_err(fault)?;
         }
-        let pages: Vec<(u32, u32)> = copy
-            .pages
-            .iter()
-            .map(|m| (m.src_slot_id, m.dst_slot_id))
-            .collect();
-        shell.copy_pages(&pages).map_err(fault)
+        Ok(())
+    }
+
+    /// Weights live whole on the host, every fire uploading what its
+    /// program reads (or a resident fabric server keeping them): there is
+    /// no partial device copy to stream into, so this load states no
+    /// weight shapes and any residency it is told names none.
+    fn weight_residency(&mut self, residency: &engine::chunk::WeightResidency) -> EngineResult<()> {
+        if let Some(slot) = residency.resident.first() {
+            return Err(Error::Invalid(format!(
+                "a weight residency names atom {} of shape {}, and this load states no \
+                 streamable weights",
+                slot.atom.atom, slot.atom.shape
+            )));
+        }
+        if let Some((shape, _)) = residency.staging.first() {
+            return Err(Error::Invalid(format!(
+                "a weight residency stages shape {shape}, and this load states no streamable \
+                 weights"
+            )));
+        }
+        Ok(())
+    }
+
+    fn weight_uses(&mut self) -> EngineResult<engine::chunk::WeightUses> {
+        Ok(engine::chunk::WeightUses::default())
     }
 }
 
@@ -755,7 +813,10 @@ impl Cerebras {
                 }
                 let lane = &lanes[source];
                 let ports = envelope.lane(at, source).map_err(port_error)?;
-                let table = &lane.kv.translation;
+                // The working set's pages are its kv list table, in token
+                // order, as a guest's relative page indexes count them.
+                let table = table_of(lane, LIST);
+                let window_refs = table_of(lane, WINDOW);
                 let translate = |page: u32, port: &str| -> EngineResult<u32> {
                     table.get(page as usize).copied().ok_or_else(|| {
                         program(format!(
@@ -784,12 +845,10 @@ impl Cerebras {
                             .collect::<EngineResult<Vec<u32>>>()?;
                         // The windowed ids are aligned with the translation:
                         // the same relative index picks a page's windowed id.
-                        let window = (!lane.kv.window.is_empty()).then(|| {
+                        let window = (!window_refs.is_empty()).then(|| {
                             relative
                                 .iter()
-                                .map(|&page| {
-                                    lane.kv.window.get(page as usize).copied().unwrap_or(0)
-                                })
+                                .map(|&page| window_refs.get(page as usize).copied().unwrap_or(0))
                                 .collect::<Vec<u32>>()
                         });
                         let writes = (
@@ -834,7 +893,7 @@ impl Cerebras {
                         }
                         Some(after - rows as u32)
                     }
-                    () => (!lane.kv.pages.is_empty()).then_some(lane.kv.held),
+                    () => names_tables(lane).then_some(lane.kv.held),
                 };
                 if let Some(have) = have {
                     ports
@@ -1112,6 +1171,11 @@ impl Cerebras {
                 *slot = Some(bound.slot);
             }
         }
+        let facts = self
+            .caps
+            .as_ref()
+            .and_then(|caps| caps.chunks.clone())
+            .ok_or_else(|| Error::Load("the cerebras engine has no model loaded".into()))?;
         let shell = self.loaded_mut()?;
         let mut words: Vec<u64> = submission.lanes.iter().map(|lane| lane.word).collect();
         for (at, slot) in lane_adapters.iter().enumerate() {
@@ -1125,6 +1189,47 @@ impl Cerebras {
                     words[at]
                 ))
             })?;
+        }
+        // Each lane's record: `cow` it reads and writes, `run` where they
+        // differ. The pool copies each `run -> cow` and every lane's slot
+        // copies before any lane of the fire reads (CONTRACT-BC 4, 15, 20).
+        let mut records: Vec<(Vec<u32>, Option<Vec<u32>>)> =
+            Vec::with_capacity(submission.lanes.len());
+        let mut forks: Vec<(u32, u32)> = Vec::new();
+        let pieces = facts.shape(FIXED).map_or(0, |shape| match shape.kind {
+            engine::chunk::SlotKind::Fixed { pieces } => pieces as usize,
+            engine::chunk::SlotKind::List { .. } => 0,
+        });
+        for (at, lane) in submission.lanes.iter().enumerate() {
+            lane.validate_chunks(&facts)?;
+            let fixed = lane.fixed.iter().find(|(shape, _)| *shape == FIXED);
+            let Some((_, pairs)) = fixed else {
+                records.push((Vec::new(), None));
+                continue;
+            };
+            if pairs.len() != pieces {
+                return Err(Error::Invalid(format!(
+                    "lane {at} names {} piece(s) of the record, which has {pieces}",
+                    pairs.len()
+                )));
+            }
+            let cow: Vec<u32> = pairs.iter().map(|&[_, cow]| cow).collect();
+            let run: Vec<u32> = pairs.iter().map(|&[run, _]| run).collect();
+            for &[run, cow] in pairs {
+                if run != cow && !forks.contains(&(run, cow)) {
+                    forks.push((run, cow));
+                }
+            }
+            let run = (run != cow).then_some(run);
+            records.push((cow, run));
+        }
+        let pool = shell.pool_mut();
+        pool.copy_slots(FIXED, &forks).map_err(fault)?;
+        for lane in &submission.lanes {
+            for (shape, pairs) in &lane.slot_copies {
+                let pairs: Vec<(u32, u32)> = pairs.iter().map(|&[src, dst]| (src, dst)).collect();
+                pool.copy_slots(*shape, &pairs).map_err(fault)?;
+            }
         }
         let seated: Vec<Seated<'_>> = submission
             .lanes
@@ -1143,13 +1248,13 @@ impl Cerebras {
                     Some(DeviceLane {
                         pages: Some(pages), ..
                     }) => pages,
-                    _ => &lane.kv.pages,
+                    _ => table_of(lane, LIST),
                 },
                 held: match &device[at] {
                     Some(DeviceLane {
                         have: Some(have), ..
                     }) => Some(*have),
-                    _ => (!lane.kv.pages.is_empty()).then_some(lane.kv.held),
+                    _ => names_tables(lane).then_some(lane.kv.held),
                 },
                 mask: device[at]
                     .as_ref()
@@ -1169,7 +1274,8 @@ impl Cerebras {
                     Readout::Last | Readout::None => None,
                 },
                 rs_reset: lane.rs_reset,
-                rs_slot: lane.rs_slot,
+                record: &records[at].0,
+                record_run: records[at].1.as_deref(),
                 rs: &verbs[at],
                 media: media_of[at],
                 inputs: &input_cells[at],
@@ -1186,7 +1292,7 @@ impl Cerebras {
                         ..
                     }) => window,
                     Some(DeviceLane { pages: Some(_), .. }) => &[],
-                    _ => &lane.kv.window,
+                    _ => table_of(lane, WINDOW),
                 },
             })
             .collect();
@@ -1244,6 +1350,20 @@ impl Cerebras {
             settle,
         ))
     }
+}
+
+/// Lane `lane`'s slot refs of list shape `shape`, in token order; empty
+/// where it names none.
+fn table_of(lane: &engine::fire::Lane, shape: engine::chunk::ShapeId) -> &[u32] {
+    lane.tables
+        .iter()
+        .find(|(id, _)| *id == shape)
+        .map_or(&[][..], |(_, refs)| refs.as_slice())
+}
+
+/// Whether a lane names a table of any list (it pages kv).
+fn names_tables(lane: &engine::fire::Lane) -> bool {
+    !lane.kv_less && lane.tables.iter().any(|(_, refs)| !refs.is_empty())
 }
 
 /// A settled step's readouts: per lane, its pixels, or the rows of its

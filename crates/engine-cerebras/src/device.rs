@@ -354,6 +354,24 @@ impl Device {
         })
     }
 
+    /// A device whose buffers are real host words and which runs nothing:
+    /// for tests of what the host does around a fire.
+    #[cfg(test)]
+    pub(crate) fn host_only() -> Device {
+        Device {
+            cache: Mutex::new(HashMap::new()),
+            platform: Platform::Simulator {
+                target: Target::Wse3,
+            },
+            kind: "host".to_string(),
+            disk: disk_cache(),
+            dry: None,
+            dry_compiles: false,
+            servers: Mutex::new(Servers::default()),
+            moves: Mutex::new(Vec::new()),
+        }
+    }
+
     #[must_use]
     pub fn is_dry(&self) -> bool {
         self.dry.is_some()

@@ -226,6 +226,20 @@ impl Shell {
         let window_sink = self.pools.window_sink_page();
         let windowed = self.pools.has_windowed();
         let sink_slot = self.pools.sink_slot();
+        // The slots this fire's lanes name, staged under local ids.
+        let mut stage = self.pools.begin();
+        let paged = self.pools.tables().contains(&false);
+        let has_state = self.pools.has_state();
+        let window_tokens = paging.window.map_or(0, |window| window.tokens);
+        // The records some lane of this fire folds into: a lane that folds
+        // nothing reads its `run` beside one (CONTRACT-BC 15).
+        let folded: Vec<&[u32]> = lanes
+            .iter()
+            .filter(|s| folds(s.rs, s.lane.tokens.len()))
+            .map(|s| s.record)
+            .collect();
+        // Each real lane's local record, for the clips that read it.
+        let mut record_of: Vec<u32> = vec![sink_slot; real];
 
         let mut seats: Vec<Seat> = Vec::with_capacity(submitted.len());
         let mut tables: Vec<Vec<u32>> = Vec::with_capacity(submitted.len());
@@ -242,9 +256,7 @@ impl Shell {
         let mut masks: Vec<crate::mask::LaneMask<'_>> = Vec::with_capacity(submitted.len());
         let any_adapter = lanes.iter().any(|s| s.adapter.is_some());
         let mut adapter_routes: Vec<i32> = Vec::new();
-        let mut beginning: Vec<u32> = Vec::new();
-        let mut demand_pages = 0u64;
-        let mut demand_slots = 0u32;
+        let mut beginning: Vec<&[u32]> = Vec::new();
         let mut rs_plans: Vec<engine::rs::LanePlan> = Vec::with_capacity(submitted.len());
         let mut rs_active = false;
 
@@ -308,40 +320,83 @@ impl Shell {
                 engine::fire::RsReset::Fresh => true,
                 engine::fire::RsReset::Held => false,
             };
-            let state_slot = seated.rs_slot.unwrap_or(lane.slot);
-            if fresh {
-                beginning.push(state_slot);
-            }
+            // The lane's record (`cow`); or, where it folds nothing and
+            // another lane of the fire folds into that record, the one it
+            // held (`run`); or, for a lane that names none (a kv-less lane),
+            // a zeroed record of its own.
+            let state_slot = if !has_state {
+                sink_slot
+            } else if seated.record.is_empty() {
+                if !seated.kv_less {
+                    return Err(Fault::Program {
+                        at: "serve::stage",
+                        why: format!(
+                            "lane {} names no record of the fixed shape, and this model holds \
+                             recurrent state",
+                            row.source
+                        ),
+                    });
+                }
+                stage.records.scratch()?
+            } else {
+                match seated.record_run {
+                    Some(run)
+                        if !folds(seated.rs, lane.tokens.len())
+                            && folded.contains(&seated.record) =>
+                    {
+                        stage.records.of(run, false)?
+                    }
+                    _ => {
+                        if fresh {
+                            beginning.push(seated.record);
+                        }
+                        stage.records.of(seated.record, true)?
+                    }
+                }
+            };
+            record_of[source] = state_slot;
             let seat = Seat {
                 slot: lane.slot,
                 have,
                 rows: row.rows,
             };
             seats.push(seat);
-            tables.push(seated.pages.to_vec());
+            let after = u64::from(have) + u64::from(row.rows);
+            let pages = after.div_ceil(u64::from(paging.page_size)).max(1) as usize;
+            // A kv-less lane's rows land in scratch pages of its own, read
+            // by its own attention and kept nowhere.
+            tables.push(if !paged {
+                Vec::new()
+            } else if seated.kv_less {
+                (0..pages)
+                    .map(|_| stage.kv.scratch())
+                    .collect::<Result<_>>()?
+            } else {
+                let stated = seated.pages.get(..pages).ok_or(Fault::Ceiling {
+                    what: "kv list slots this lane stated",
+                    need: pages as u64,
+                    have: seated.pages.len() as u64,
+                })?;
+                stated
+                    .iter()
+                    .map(|&slot| stage.kv.of(slot))
+                    .collect::<Result<_>>()?
+            });
             if windowed {
                 window_tables.push(if seated.kv_less {
-                    seated.pages.to_vec()
+                    (0..pages)
+                        .map(|_| stage.window.scratch())
+                        .collect::<Result<_>>()?
                 } else {
-                    kv::window_table(&paging, &seat, seated.pages, seated.window)?
+                    window_table(
+                        &mut stage,
+                        row.source,
+                        seated.window,
+                        (have, pages),
+                        (window_tokens, paging.page_size),
+                    )?
                 });
             }
-            let after = u64::from(have) + u64::from(row.rows);
-            let pages = after.div_ceil(u64::from(paging.page_size)).max(1);
-            demand_pages = demand_pages.max(if self.pools.tables().is_empty() || seated.kv_less {
-                0
-            } else if seated.pages.is_empty() {
-                paging.base(lane.slot).saturating_add(pages)
-            } else {
-                seated
-                    .pages
-                    .iter()
-                    .take(pages as usize)
-                    .copied()
-                    .max()
-                    .map_or(0, |page| u64::from(page) + 1)
-            });
-            demand_slots = demand_slots.max(state_slot + 1);
 
             // A kv-less lane's mask is over its attention group's rows, for the group-packed attention.
             let kv_mask = seated.mask.filter(|_| !seated.kv_less);
@@ -386,9 +441,27 @@ impl Shell {
                 }
                 rs_active = true;
             }
+            // A buffer's pages, rs list slot refs, as local pages.
+            let verb = match seated.rs {
+                engine::fire::RsVerb::Buffer {
+                    pages,
+                    base,
+                    folded,
+                    fold,
+                } => engine::fire::RsVerb::Buffer {
+                    pages: pages
+                        .iter()
+                        .map(|&slot| stage.rs.of(slot))
+                        .collect::<Result<_>>()?,
+                    base: *base,
+                    folded: *folded,
+                    fold: *fold,
+                },
+                engine::fire::RsVerb::Fold => engine::fire::RsVerb::Fold,
+            };
             rs_plans.push(
                 engine::rs::LanePlan::of(
-                    seated.rs,
+                    &verb,
                     row.rows,
                     seated.first.unwrap_or(have),
                     kv_mask,
@@ -419,13 +492,11 @@ impl Shell {
             }
         }
 
-        self.pools.admit(Demand {
-            kv_pages: u32::try_from(demand_pages).unwrap_or(u32::MAX),
-            state_slots: demand_slots,
-            workspace: 0,
-        })?;
-        for slot in beginning {
-            self.pools.clear(&self.device, &self.handles, slot)?;
+        // A record a lane starts afresh reads zeros.
+        for record in beginning {
+            self.pools
+                .pool_mut()
+                .clear(crate::store::pool::FIXED, record)?;
         }
         let indptr_host = kv::indptr(&seats)?;
         let table_refs: Vec<&[u32]> = tables.iter().map(Vec::as_slice).collect();
@@ -461,6 +532,10 @@ impl Shell {
                     ),
                 });
             }
+            let pages: Vec<u32> = pages
+                .iter()
+                .map(|&slot| stage.kv.of(slot))
+                .collect::<Result<_>>()?;
             for (g, &in_window) in geometries.iter_mut().zip(&table_windowed) {
                 for (i, (&page, &offset)) in pages.iter().zip(offsets).enumerate() {
                     let at = row.row_offset as usize + i;
@@ -610,8 +685,9 @@ impl Shell {
         let feeds: Vec<crate::dit::Feed<'_>> = lanes
             .iter()
             .zip(&clips_of)
-            .map(|(s, shot)| crate::dit::Feed {
-                slot: s.rs_slot.unwrap_or(s.lane.slot),
+            .zip(&record_of)
+            .map(|((s, shot), &record)| crate::dit::Feed {
+                slot: record,
                 group: s.group,
                 inputs: s.inputs,
                 clips: *shot,
@@ -684,7 +760,7 @@ impl Shell {
                         &window.indptr_host,
                         span.lane_offset,
                         paging.page_size.max(1),
-                        paging.slots.max(1),
+                        self.pools.capacity().rs_pages.max(1),
                     )?;
                     maps.insert(
                         key,
@@ -860,6 +936,7 @@ impl Shell {
         }
         // The fire is enqueued, not awaited: whatever reads its outputs (a
         // guest stage, a download) is ordered behind it on the device.
+        self.pools.stage(&stage)?;
         let outs = crate::exec::run_program(
             &self.device,
             &program,
@@ -868,6 +945,7 @@ impl Shell {
             &inputs,
             timing(),
         )?;
+        self.pools.unstage(&stage)?;
         let t3 = std::time::Instant::now();
         let keep = self.keep_readout;
         // The program's outputs: each plane's layers, whole, then a
@@ -1500,4 +1578,53 @@ fn clips_by_lane<'a>(clips: &[Clips<'a>], lanes: &[Seated<'_>]) -> Result<Vec<Op
 
 fn narrow(n: u64) -> i32 {
     i32::try_from(n).unwrap_or(i32::MAX)
+}
+
+/// Whether a lane running `verb` over `rows` rows folds any of them into
+/// its state (a buffer whose fold the device states is taken to).
+fn folds(verb: &engine::fire::RsVerb, rows: usize) -> bool {
+    match verb {
+        engine::fire::RsVerb::Fold => rows > 0,
+        engine::fire::RsVerb::Buffer { fold, .. } => match fold {
+            engine::fire::FoldLen::Host(n) => *n > 0,
+            engine::fire::FoldLen::Device => true,
+        },
+    }
+}
+
+/// A lane's table in the window list, as long as its kv table (`pages`):
+/// a page wholly behind the window of the lane's first row reads the null
+/// page 0, the rest the local page of the window slot `refs` names there.
+/// A slot the runtime trimmed (ref 0) that the window still reads is
+/// refused.
+fn window_table(
+    stage: &mut crate::store::Stage,
+    lane: u32,
+    refs: &[u32],
+    (have, pages): (u32, usize),
+    (window, page_size): (u32, u32),
+) -> Result<Vec<u32>> {
+    let refused = |why: String| Fault::Program {
+        at: "serve::stage",
+        why: format!("lane {lane}: {why}"),
+    };
+    let first = (have.saturating_sub(window) / page_size.max(1)) as usize;
+    (0..pages)
+        .map(|page| {
+            if page < first {
+                return Ok(0);
+            }
+            match refs.get(page) {
+                None => Err(refused(format!(
+                    "its window list table names {} slot(s) and the window reads slot {page}",
+                    refs.len()
+                ))),
+                Some(0) => Err(refused(format!(
+                    "window list slot {page} of a lane holding {have} tokens, which its \
+                     window still reads and the runtime has trimmed"
+                ))),
+                Some(&slot) => stage.window.of(slot),
+            }
+        })
+        .collect()
 }
