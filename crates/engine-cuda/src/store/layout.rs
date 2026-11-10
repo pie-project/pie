@@ -43,6 +43,8 @@ pub enum Kind {
 }
 
 impl Kind {
+    pub const ALL: [Kind; 4] = [Kind::List, Kind::Window, Kind::Fixed, Kind::Rs];
+
     /// The shape a kv row's pages are slots of.
     #[must_use]
     pub const fn paged(windowed: bool) -> Kind {

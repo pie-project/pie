@@ -39,6 +39,9 @@ pub struct Chunks {
     null_zeroed: bool,
     /// Lanes name slot refs: nothing is seated here any more.
     refs: bool,
+    /// The chunks the runtime named weight slots in: no page is seated in
+    /// one ([`Chunks::keep_clear`]).
+    weights: std::collections::BTreeSet<u32>,
 }
 
 impl Chunks {
@@ -64,6 +67,7 @@ impl Chunks {
             next: 1,
             null_zeroed: false,
             refs: false,
+            weights: std::collections::BTreeSet::new(),
         })
     }
 
@@ -284,6 +288,33 @@ impl Chunks {
         }
     }
 
+    /// Whether a page this pool seated itself lies in one of `chunks`.
+    #[must_use]
+    pub fn seated_in(&self, chunks: &std::collections::BTreeSet<u32>) -> bool {
+        !self.refs
+            && Kind::ALL.iter().any(|kind| {
+                let Ok(shape) = self.shape(*kind) else {
+                    return false;
+                };
+                self.seated[*kind as usize]
+                    .refs
+                    .iter()
+                    .any(|&slot| slot != UNSEATED && chunks.contains(&(slot / shape.per_chunk)))
+            })
+    }
+
+    /// Keeps the pages this pool seats itself clear of `chunks`, the ones
+    /// the runtime named weight slots in. Where a seated page already lies
+    /// in one, every page is let go and seated again as it is next named:
+    /// what the pages held is lost, so the caller holds no lane's rows.
+    pub fn keep_clear(&mut self, chunks: std::collections::BTreeSet<u32>) {
+        if self.seated_in(&chunks) {
+            self.seated = Default::default();
+            self.next = 1;
+        }
+        self.weights = chunks;
+    }
+
     /// Whether lanes name slot refs.
     #[must_use]
     pub fn by_refs(&self) -> bool {
@@ -324,6 +355,18 @@ impl Chunks {
                 if self.next >= self.total {
                     return Err(Fault::Ceiling {
                         what: "chunks of the state pool",
+                        need: u64::from(self.next) + 1,
+                        have: u64::from(self.total),
+                    });
+                }
+                // A chunk the runtime laid weights in is not this pool's
+                // to open.
+                while self.weights.contains(&self.next) {
+                    self.next += 1;
+                }
+                if self.next >= self.total {
+                    return Err(Fault::Ceiling {
+                        what: "chunks of the state pool clear of the weights' slots",
                         need: u64::from(self.next) + 1,
                         have: u64::from(self.total),
                     });

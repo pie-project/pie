@@ -2239,6 +2239,42 @@ impl Pools {
         Ok(before != located(self))
     }
 
+    /// The chunks `residency` names weight slots in.
+    #[must_use]
+    pub fn weight_chunks(
+        &self,
+        residency: &engine::chunk::WeightResidency,
+    ) -> std::collections::BTreeSet<u32> {
+        let per_chunk = |shape: engine::chunk::ShapeId| {
+            self.row_caches
+                .iter()
+                .map(|cache| (cache.shape.id, cache.shape.per_chunk))
+                .chain(
+                    self.expert_caches
+                        .iter()
+                        .map(|cache| (cache.shape.id, cache.shape.per_chunk)),
+                )
+                .find(|(id, _)| *id == shape)
+                .map(|(_, per_chunk)| per_chunk.max(1))
+        };
+        residency
+            .resident
+            .iter()
+            .filter_map(|resident| Some(resident.slot / per_chunk(resident.atom.shape)?))
+            .collect()
+    }
+
+    /// Whether a page this pool seated for a lane lies in one of `chunks`.
+    #[must_use]
+    pub fn seated_in(&self, chunks: &std::collections::BTreeSet<u32>) -> bool {
+        self.chunks.seated_in(chunks)
+    }
+
+    /// See [`chunks::Chunks::keep_clear`].
+    pub fn keep_clear(&mut self, chunks: std::collections::BTreeSet<u32>) {
+        self.chunks.keep_clear(chunks);
+    }
+
     /// Fills weight slots from the host copies, `(slot, host, bytes)` each.
     fn fill_weights(
         &self,
