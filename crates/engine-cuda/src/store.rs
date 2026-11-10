@@ -2717,7 +2717,9 @@ impl Pools {
     /// The residency a load seats its weights by before the runtime names
     /// any slot: every atom of every shape, each shape's in chunks of its
     /// own from the pool's first on. `None` where the pool cannot hold them
-    /// all.
+    /// all with a chunk to spare: the load then keeps a copy its fires read
+    /// in place ([`Pools::pin_weight_hosts`]), and the runtime decides what
+    /// a pool that small may serve.
     #[must_use]
     pub fn preseat_plan(&self) -> Option<engine::chunk::WeightResidency> {
         let shapes = self
@@ -2739,7 +2741,16 @@ impl Pools {
             }));
             first = first.checked_add((atoms as u32).div_ceil(per_chunk))?;
         }
-        (first < self.chunks.total()).then_some(engine::chunk::WeightResidency {
+        // No more chunks than the pool will have once it is fitted: a stated
+        // `device_kv_budget` is all of it, and the fit limits the range to
+        // that, under whatever was seated past it.
+        let chunk = self.chunks.layout().chunk_bytes.max(1);
+        let most = self.budget.map_or(self.chunks.total(), |budget| {
+            u32::try_from(budget / chunk)
+                .unwrap_or(u32::MAX)
+                .min(self.chunks.total())
+        });
+        (first < most).then_some(engine::chunk::WeightResidency {
             staging: Vec::new(),
             resident,
             held: true,
@@ -2841,6 +2852,11 @@ impl Pools {
             total >> 20
         );
         self.miss_copy = Some(pinned);
+        // The tables name the copy from here on: at once, where no fire has
+        // read them yet (a load that seats none of its weights arms over
+        // the copy); a residency restages them behind its stream after.
+        self.stage_row_tables(core::ptr::null_mut())?;
+        self.stage_expert_tables(core::ptr::null_mut())?;
         Ok(())
     }
 

@@ -2178,6 +2178,8 @@ impl<'c> Run<'c> {
     /// The table a packed bank's select reads its experts through, where
     /// the weight cache streams the bank (an entry an expert its codes,
     /// scales and third plane); the contiguous bank's otherwise.
+    // Read by the CUDA dispatch, built featureless too; the HIP one reads none.
+    #[cfg(not(feature = "rocm"))]
     pub(crate) fn bank_table(&self, id: ValueId) -> ExpertTable {
         let Def::Weight(w) = &self.values[id.0 as usize].def else {
             return ExpertTable::RESIDENT;

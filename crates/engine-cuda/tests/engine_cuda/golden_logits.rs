@@ -397,6 +397,10 @@ fn load(fixture: &Fixture, cache: &Path) -> Shell {
     load_with(fixture, cache, knobs())
 }
 
+/// The `device_kv_budget` a load is given, in MiB; 0 for none
+/// ([`golden_held_small`]).
+static SMALL_POOL: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
 fn load_with(fixture: &Fixture, cache: &Path, knobs: engine_cuda::Knobs) -> Shell {
     Shell::load(Boot {
         trace: fixture.trace.clone(),
@@ -416,7 +420,13 @@ fn load_with(fixture: &Fixture, cache: &Path, knobs: engine_cuda::Knobs) -> Shel
         page_size: PAGE,
         context: CONTEXT,
         slots: 1,
-        kv_budget: None,
+        kv_budget: match SMALL_POOL.load(std::sync::atomic::Ordering::Relaxed) {
+            0 => std::env::var("PIE_GOLDEN_POOL_MIB")
+                .ok()
+                .and_then(|mib| mib.parse::<u64>().ok())
+                .map(|mib| mib << 20),
+            mib => Some(mib << 20),
+        },
         memory_share: engine::load::DEFAULT_DEVICE_MEMORY_SHARE,
         ordinal: 0,
         knobs,
@@ -2270,7 +2280,12 @@ fn served_experts_as(fixture: &Fixture, cache: &Path, rows: Rows, told: bool) ->
         let adopted = shape
             .seated
             .filter(|_| told && rows == Rows::Cached && !moved);
-        if told {
+        if told && SMALL_POOL.load(std::sync::atomic::Ordering::Relaxed) > 0 {
+            assert!(
+                shape.seated.is_none(),
+                "a load whose pool cannot hold its weights seats none of them"
+            );
+        } else if told {
             assert!(
                 shape.seated.is_some(),
                 "a load told its weights are held states where it seated them"
@@ -2358,6 +2373,51 @@ fn served_experts_as(fixture: &Fixture, cache: &Path, rows: Rows, told: bool) ->
         "the fires read no expert the record counted"
     );
     steps
+}
+
+/// A load told its weights are held whose pool (`device_kv_budget`,
+/// `PIE_GOLDEN_KV_MIB`, 256 by default) is smaller than them: it seats none
+/// in the pool, keeps a copy its fires read in place, and serves what a
+/// load that streams every expert from its host copy serves. (A runtime
+/// refuses such a deployment; the engine must leave it that choice.)
+#[test]
+#[ignore = "a probe run by hand: see the module's doc"]
+fn golden_held_small() {
+    if !engine_cuda::device::present() {
+        eprintln!("skipping: no CUDA device on this machine");
+        return;
+    }
+    let cache = cache_dir();
+    let models = std::env::var("PIE_GOLDEN_MODELS")
+        .map_or_else(|_| vec!["nemotron3-nano-mini".to_string()], |_| models());
+    let pool = std::env::var("PIE_GOLDEN_KV_MIB")
+        .ok()
+        .and_then(|mib| mib.parse::<u64>().ok())
+        .unwrap_or(256);
+    let hash = |steps: &[Vec<f32>]| {
+        steps.iter().fold(FNV, |all, logits| {
+            fnv_bytes(all, &hash_logits(logits).to_le_bytes())
+        })
+    };
+    for model in models {
+        let fixture = fixture(&model, &cache);
+        let _ = served_experts(&fixture, &cache, Rows::Host);
+        let host = served_experts(&fixture, &cache, Rows::Host);
+        let serving = fixture_as(&model, &cache, true);
+        SMALL_POOL.store(pool, std::sync::atomic::Ordering::Relaxed);
+        let small = served_experts_as(&serving, &cache, Rows::Host, true);
+        SMALL_POOL.store(0, std::sync::atomic::Ordering::Relaxed);
+        println!(
+            "golden {model} all {:016x} (Host) {:016x} (told held, a {pool} MiB pool)",
+            hash(&host),
+            hash(&small)
+        );
+        assert_eq!(
+            hash(&small),
+            hash(&host),
+            "{model} told its weights are held in a pool too small for them"
+        );
+    }
 }
 
 /// The expert-cache probe: `PIE_GOLDEN_MODELS` (the MoE miniatures whose
