@@ -185,6 +185,13 @@ pub struct PrefillFloor(pub u32);
 #[decision(id = "engine.pad.row_steps", constant(set(1, 2, 4)), default = 1, tune = search)]
 pub struct PadRowSteps(pub u32);
 
+/// The rung halfway between two from 16 up to this one (24 below 32, 48
+/// below 64, ...): a decode of 17 to 24 lanes runs a 24-lane fire, not a
+/// 32-lane one. 0 keeps the ladder as `growth` lays it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Decision)]
+#[decision(id = "engine.pad.half_rungs", constant(set(0, 32, 64, 128, 256, 512)), default = 0, tune = search)]
+pub struct PadHalfRungs(pub u32);
+
 /// Whether a decoding lane's next pages come before seating a waiting
 /// prompt, and a prompt waits rather than suspending a lane
 /// (`PoolFacts::seated_first`). Off keeps arrival order.
@@ -218,6 +225,7 @@ static REGISTRY: LazyLock<Registry> = LazyLock::new(|| {
         .add::<PageFloor>()
         .add::<PrefillFloor>()
         .add::<PadRowSteps>()
+        .add::<PadHalfRungs>()
         .add::<SeatedFirst>()
         .add::<SeatToEnd>()
         .add::<SeatSpread>();
@@ -260,6 +268,8 @@ pub struct Pad {
     pub prefill_floor: u32,
     /// Row rungs a step of the ladder holds from 512 rows up.
     pub row_steps: u32,
+    /// `engine.pad.half_rungs`: the half rungs from 16 up to it.
+    pub half_rungs: u32,
 }
 
 impl Pad {
@@ -293,6 +303,10 @@ impl Pad {
         while r < top {
             out.push(r);
             let next = self.next(r);
+            let half = r + (next - r) / 2;
+            if r >= 16 && next <= self.half_rungs && half > r && half < top {
+                out.push(half);
+            }
             if r >= 512 && self.row_steps > 1 {
                 for i in 1..self.row_steps {
                     let at = (r + (next - r) * i / self.row_steps).div_ceil(128) * 128;
@@ -323,6 +337,7 @@ impl Engine {
                 page_floor: profile.get::<PageFloor>().0,
                 prefill_floor: profile.get::<PrefillFloor>().0,
                 row_steps: profile.get::<PadRowSteps>().0,
+                half_rungs: profile.get::<PadHalfRungs>().0,
             },
             seats: [
                 profile.on::<SeatedFirst>(any),
@@ -397,6 +412,7 @@ mod tests {
                 page_floor: 16,
                 prefill_floor: 16,
                 row_steps: 4,
+                half_rungs: 0,
             }
         );
         assert_eq!(
@@ -492,5 +508,11 @@ mod tests {
                 2176
             ]
         );
+        let halves = Pad {
+            half_rungs: 32,
+            ..steps
+        };
+        assert_eq!(halves.ladder(2048)[..7], [1, 2, 4, 8, 16, 24, 32]);
+        assert_eq!(halves.ladder(2048).len(), steps.ladder(2048).len() + 1);
     }
 }
