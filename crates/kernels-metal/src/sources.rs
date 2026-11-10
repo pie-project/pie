@@ -297,10 +297,6 @@ pub const SOURCES: &[(&str, &str)] = &[
         include_str!(concat!(source_root!(), "/runtime/nan_check.metal")),
     ),
     (
-        "runtime/rebind.metal",
-        include_str!(concat!(source_root!(), "/runtime/rebind.metal")),
-    ),
-    (
         "sampling/argmax_rows.metal",
         include_str!(concat!(source_root!(), "/sampling/argmax_rows.metal")),
     ),
