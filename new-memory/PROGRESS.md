@@ -1002,3 +1002,15 @@ The `new-memory/` directory is bookkeeping and is removed before anything lands 
   host refs not stated, contract 22) -> must work before the PR.
 - GAP (policy): keep-handles `Retain::upto(head)` covers kv tokens only; the record keeps key -1 and goes first.
 - t_quota / t_close: launch-time state quota removed (4cb817555); host limit needs host_kv_budget in the script.
+
+### M77 — 2026-11-10: XLA pool blocks by Mosaic DMA; kv append onto the pool (TPU session)
+- `sc/xla-tpu` (4d40b8cd9..2975a122b): pool blocks move HBM->HBM by Mosaic DMA through tpu.memref_bitcast (PIE_XLA_POOL_DMA=0
+  off, for the CUDA plugin); token-row appends and per-lane state slices as DMA blocks; the Mosaic kv append writes a
+  pool plane directly.
+- v6e speed vs base (tok/s): qwen3-0.6b decode c1 615->711, c8 4981->4928, c64 17.4k->16.4-17.5k, prefill 512
+  124k->100k, 2048 169k->149k; qwen35 c64 15.2k->13.2k, c256 18.1k->17.4k; qwen3-30b-a3b mini c64 31.2k->31.5k,
+  c256 65k->57k, prefill 2048 262k->237k. Remaining: prefill (append = 2 calls + 2 cases vs main's one pass),
+  hybrid/MoE c64/c256.
+- OPEN: with DMA reads, MoE and gemma minis differ by up to 0.03 (3-7 of 16 readouts) at pools +64 MiB and larger;
+  dense/hybrid bitwise at every size; reads proven exact by unit tests; with DMA reads off, bitwise at every size but
+  c64 12.3k. Suspected XLA fusion change around DMA reads (unproven).
