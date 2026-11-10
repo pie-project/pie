@@ -278,10 +278,12 @@ impl Package {
                 .access_owned_frozen_value(&self.required("forward")?);
             let states = crate::star::state::declared(m);
 
-            let trace = if states.is_empty() {
-                let caches = module
-                    .heap()
-                    .access_owned_frozen_value(&self.required("caches")?);
+            let caches = match self.entry("caches")? {
+                Some(caches) if states.is_empty() => Some(caches),
+                _ => None,
+            };
+            let trace = if let Some(caches) = caches {
+                let caches = module.heap().access_owned_frozen_value(&caches);
                 TRAIL.with(|t| *t.borrow_mut() = Trail::default());
                 let declared = eval
                     .eval_function(caches, &[m, module.heap().alloc(SpecHandle)], &[])
@@ -291,6 +293,8 @@ impl Package {
                     .unwrap_or_default();
                 declared?;
                 traced(name, spec, &mut eval, run, m, platform)?
+            } else if states.is_empty() {
+                traced(name, HybridSpec::default(), &mut eval, run, m, platform)?
             } else {
                 if self.entry("caches")?.is_some() {
                     anyhow::bail!(
