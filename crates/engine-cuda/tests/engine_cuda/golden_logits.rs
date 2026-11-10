@@ -131,9 +131,41 @@ fn seeded_planes(trace: &Trace) -> Vec<Seeded> {
         .iter()
         .filter(|param| param.source == ParamSource::Checkpoint)
         .collect();
+    // A packed plane's scales, biases and tensor scales are made with it
+    // when the load quantizes it: the container holds none of their own.
+    let made: std::collections::BTreeSet<String> = planes
+        .iter()
+        .filter(|param| {
+            matches!(
+                param.dtype,
+                Dtype::Mxfp4
+                    | Dtype::Nvfp4
+                    | Dtype::E4m3tensor
+                    | Dtype::U4g64
+                    | Dtype::U8g64
+                    | Dtype::U4g32
+                    | Dtype::U4g64tiled
+                    | Dtype::U2g32
+                    | Dtype::U2g64
+                    | Dtype::U2g128
+            )
+        })
+        .flat_map(|param| {
+            [
+                poem::scales_name(&param.name),
+                poem::biases_name(&param.name),
+                poem::global_scales_name(&param.name),
+                poem::input_scales_name(&param.name),
+            ]
+        })
+        .collect();
+    planes.retain(|param| !made.contains(&param.name));
     planes.sort_by(|a, b| a.name.cmp(&b.name));
     for param in planes {
-        let count: usize = param.shape.iter().product::<u64>() as usize;
+        // The shape the weight has before the load packs it: a packed
+        // plane's codes are stored narrower than the values they hold.
+        let shape = poem::Weight::of_plane(param).shape;
+        let count: usize = shape.iter().product::<u64>() as usize;
         let norm = param.name.ends_with("norm");
         let mut seed = fnv(&param.name);
         let mut next = || {
@@ -179,8 +211,8 @@ fn seeded_planes(trace: &Trace) -> Vec<Seeded> {
                     )
                 }
             }
-            // A quantized plane's bytes, each kept finite: e4m3 codes of a
-            // small magnitude, e8m0 exponents near one, and 4-bit codes.
+            // A plain fp8 plane is stored as served (no host cast makes
+            // one): e4m3 codes of a small magnitude, each finite.
             Dtype::E4m3 => (
                 ztensor::Leaf::E4M3,
                 (0..count)
@@ -190,6 +222,7 @@ fn seeded_planes(trace: &Trace) -> Vec<Seeded> {
                     })
                     .collect(),
             ),
+            // So are a block scale's exponents (near one) and a byte plane.
             Dtype::E8m0 => (
                 ztensor::Leaf::E8M0,
                 (0..count).map(|_| (118 + next() % 6) as u8).collect(),
@@ -198,9 +231,16 @@ fn seeded_planes(trace: &Trace) -> Vec<Seeded> {
                 ztensor::Leaf::U8,
                 (0..count).map(|_| next() as u8).collect(),
             ),
-            other => panic!("`{}` is {other:?}, not a dtype the probe seeds", param.name),
+            // A packed plane is stored as the bf16 it is quantized from:
+            // the import encodes it, as it does a float checkpoint's.
+            _ => (
+                ztensor::Leaf::BF16,
+                (0..count)
+                    .flat_map(|_| ((value(next()).to_bits() >> 16) as u16).to_le_bytes())
+                    .collect(),
+            ),
         };
-        out.push((param.name.clone(), param.shape.clone(), leaf, bytes));
+        out.push((param.name.clone(), shape, leaf, bytes));
     }
     out
 }
@@ -285,11 +325,48 @@ fn fixture_as(model: &str, cache: &Path, serving: bool) -> Fixture {
     let trace = trace_of(model);
     let dir = cache.join("fixtures");
     std::fs::create_dir_all(&dir).unwrap_or_else(|why| panic!("{}: {why}", dir.display()));
+    // A deployment with a plane the load serves in another form than bf16
+    // (packed codes, fp8) loads from a serving artifact alone: a load
+    // converts nothing. Its artifact is imported from the seeded floats.
+    let encoded = trace.params.iter().any(|param| {
+        param.source == ParamSource::Checkpoint
+            && !matches!(
+                param.dtype,
+                Dtype::Bf16 | Dtype::F32 | Dtype::I64 | Dtype::I32
+            )
+    });
+    let serving = serving || encoded;
     let suffix = if serving { "serving.zt" } else { "zt" };
     let container = dir.join(format!("{model}.{suffix}"));
     if !container.exists() {
         let partial = dir.join(format!("{model}.{suffix}.{}", std::process::id()));
-        if serving {
+        if encoded {
+            let floats = dir.join(format!("{model}.floats.zt"));
+            if !floats.exists() {
+                let seeded = dir.join(format!("{model}.floats.zt.{}", std::process::id()));
+                write_checkpoint(&seeded, &trace);
+                std::fs::rename(&seeded, &floats)
+                    .unwrap_or_else(|why| panic!("{}: {why}", floats.display()));
+            }
+            let source = ztensor::Source::open(&floats).expect("the seeded floats open");
+            let contract = poem::import::own_contract(&source, &trace.params, 1, Platform::Cuda)
+                .expect("the seeded floats are read by the plan's own names");
+            drop(source);
+            let tiled: Vec<&str> = trace
+                .params
+                .iter()
+                .filter(|param| param.dtype == Dtype::U4g64tiled)
+                .map(|param| param.name.as_str())
+                .collect();
+            checkpoint::testkit::artifact::import(
+                &floats,
+                &contract,
+                &checkpoint::serving::Stamp::of("cuda", model),
+                &tiled,
+                &partial,
+            )
+            .unwrap_or_else(|why| panic!("{model} imports: {why}"));
+        } else if serving {
             write_serving(&partial, &trace, model);
         } else {
             write_checkpoint(&partial, &trace);
@@ -542,9 +619,18 @@ fn served_by_refs(fixture: &Fixture, cache: &Path) -> Vec<(u64, u32)> {
     let mut windows: Vec<Vec<u32>> = vec![Vec::new(); window_lists.len()];
     let mut low = false;
     let mut fed = 0u32;
-    let mut last = None;
-    let mut steps = Vec::with_capacity(SCRIPT.len());
-    for (at, step) in SCRIPT.iter().enumerate() {
+    // `PIE_GOLDEN_DECODES=<n>`: n one-token steps and no prefill, for a
+    // model whose kv rows this card's kernels read at a decode alone.
+    let decodes = std::env::var("PIE_GOLDEN_DECODES")
+        .ok()
+        .and_then(|steps| steps.parse::<usize>().ok());
+    let script: Vec<Step> = match decodes {
+        Some(steps) => vec![Step::Decode; steps],
+        None => SCRIPT.to_vec(),
+    };
+    let mut last = decodes.map(|_| 11u32);
+    let mut steps = Vec::with_capacity(script.len());
+    for (at, step) in script.iter().enumerate() {
         let tokens: Vec<u32> = match *step {
             Step::Prefill(rows) => (fed..fed + rows).map(|t| (t * 7 + 11) % 1000).collect(),
             Step::Decode => vec![last.expect("a decode follows a step")],

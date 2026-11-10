@@ -538,6 +538,9 @@ pub struct Pools {
     row_caches: Vec<RowCache>,
     /// The routed experts' caches, a shape each ([`Pools::seat_experts`]).
     expert_caches: Vec<ExpertCache>,
+    /// Each window a windowed kv row is declared with, and the list its
+    /// pages are slots of.
+    windows_of: Vec<(u32, u8)>,
     /// Whether the runtime holds the weights' resident set for the load's
     /// life (`WeightResidency::held`).
     weights_held: bool,
@@ -859,6 +862,7 @@ impl Pools {
             one_window,
         )?;
         let mut shapes = Vec::with_capacity(trace.caches.len());
+        let mut windows_of: Vec<(u32, u8)> = Vec::new();
 
         for (index, row) in trace.caches.iter().enumerate() {
             match row {
@@ -873,24 +877,30 @@ impl Pools {
                 } => {
                     let element = elem_bytes(name, *dtype)?;
                     let windowed = window.is_some() && paging.window.is_some();
-                    // A windowed row pages in the window list of its window.
+                    // A windowed row pages in the window list the recipe
+                    // lays it in: its own window's, or a wider one's where
+                    // the windows are merged.
                     let list = match window.filter(|_| windowed) {
                         None => 0u8,
                         Some(held) => layout
                             .windows
                             .iter()
-                            .position(|shape| shape.window == Some(held))
+                            .position(|shape| shape.offset_of(index as u32).is_some())
                             .map(|at| at as u8 + 1)
                             .ok_or_else(|| {
                                 Fault::program(
                                     "store::reserve",
                                     format!(
                                         "cache `{name}` is read through a window of {held} \
-                                         tokens, which the chunk recipe lays no list for"
+                                         tokens, and the chunk recipe lays it in no window \
+                                         list"
                                     ),
                                 )
                             })?,
                     };
+                    if let Some(held) = window.filter(|_| list != 0) {
+                        windows_of.push((held, list));
+                    }
                     let (keys_width, values_width, values_plane) = match planes.as_slice() {
                         [plane] => (*plane, *plane, 0),
                         [keys, values] => (*keys, *values, 1),
@@ -1022,6 +1032,7 @@ impl Pools {
             chunks,
             row_caches: Vec::new(),
             expert_caches: Vec::new(),
+            windows_of,
             weights_held: false,
             hosts_dropped: false,
             weights_filed: false,
@@ -1340,18 +1351,19 @@ impl Pools {
             .and_then(|shape| shape.window)
     }
 
-    /// Each window list's retention and the page table of a fire's its
-    /// rows read.
+    /// Each window a kv row is declared with and the page table of a
+    /// fire's that row's list reads: its own window's list's, or the wider
+    /// list's its rows are merged into.
     #[must_use]
     pub fn window_tables(&self) -> Vec<(u32, u32)> {
-        let layout = self.chunks.layout();
-        let first = usize::from(layout.list.is_some());
-        layout
-            .windows
-            .iter()
-            .enumerate()
-            .filter_map(|(at, shape)| Some((shape.window?, (first + at) as u32)))
-            .collect()
+        let mut tables: Vec<(u32, u32)> = Vec::new();
+        for &(window, list) in &self.windows_of {
+            let table = self.table_of(list) as u32;
+            if !tables.contains(&(window, table)) {
+                tables.push((window, table));
+            }
+        }
+        tables
     }
 
     /// The page table of a fire's that the kv rows paged in the window
