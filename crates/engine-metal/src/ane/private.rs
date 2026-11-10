@@ -351,7 +351,7 @@ enum Job {
 /// How often a compile is tried: the compiler service can drop its
 /// connection, and a program it never compiles leaves its work to the GPU
 /// for the load's life, which lands other bits.
-const COMPILE_TRIES: u32 = 3;
+const COMPILE_TRIES: u32 = 8;
 
 /// `compile`'s answer, tried again after a refusal up to [`COMPILE_TRIES`].
 fn tried<T>(
@@ -365,7 +365,7 @@ fn tried<T>(
                 eprintln!(
                     "ane: the Neural Engine {what} program did not compile ({why}); trying again"
                 );
-                std::thread::sleep(std::time::Duration::from_millis(250 * u64::from(attempt)));
+                std::thread::sleep(std::time::Duration::from_millis(500 * u64::from(attempt)));
                 attempt += 1;
             }
             answer => return answer,
