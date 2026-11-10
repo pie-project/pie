@@ -745,7 +745,8 @@ mod tests {
             .expect("a whole view lands");
         let (text, sig) = tracer.finish(&[]);
         assert_eq!(sig.results.len(), 1, "the pool is the one result");
-        assert!(text.contains("bitcast_convert"), "{text}");
+        // A lazy view: nothing of the whole pool is reinterpreted.
+        assert!(!text.contains("bitcast_convert"), "{text}");
     }
 
     #[test]
@@ -759,6 +760,11 @@ mod tests {
             let k = cx.read(keys)?;
             let v = cx.read(values)?;
             assert_eq!(k, v, "one view of one pool value is read once");
+            // keys change a row (a write of an unchanged view lands nothing)
+            let f = cx.func();
+            let row = f.slice(k, &[1, 0], &[2, 256], &[1, 1])?;
+            let zero = f.const_i(Elem::I32, 0, &[]);
+            let k = f.dynamic_update_slice(k, row, &[zero, zero])?;
             cx.write(keys, k)?;
             cx.write(values, v)
         });
