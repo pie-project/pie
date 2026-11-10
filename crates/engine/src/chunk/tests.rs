@@ -495,6 +495,7 @@ fn weight_shapes_round_trip_and_are_checked() {
         count: 48 * 128,
         floor_slots: 2 * 8,
         name: "layers.moe.experts".into(),
+        seated: None,
     };
     facts.weights.push(experts.clone());
     facts.validate().unwrap();

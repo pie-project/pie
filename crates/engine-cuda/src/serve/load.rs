@@ -1191,7 +1191,6 @@ impl Shell {
             tiers,
             landing,
             armed: None,
-            weights_awaited: false,
             media,
             shifted,
             lane_shifted,
@@ -1430,19 +1429,16 @@ impl Staged {
                 crate::device::free_bytes().unwrap_or(0) >> 20
             );
         }
-        // Weights left in the serving file are on no tier a fire can read
-        // until the first weight residency fills their slots: the lattice
-        // is armed there, once, over where they then lie.
+        // Weights left in the serving file are on no tier a fire can read:
+        // they are seated in the pool before the lattice is armed over them.
         if shell
             .weights
             .experts()
             .is_some_and(|tier| tier.plan().files())
         {
-            shell.weights_awaited = true;
-            shell.pools.file_weights();
-        } else {
-            shell.arm_bodies()?;
+            shell.preseat_weights()?;
         }
+        shell.arm_bodies()?;
         let resident = footprint(&shell, device_total, free_before);
         let fitted = shell.pools.fit_the_card(0, held_for_fires, &resident)?;
         if arm_trace {

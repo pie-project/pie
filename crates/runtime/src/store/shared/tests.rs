@@ -86,6 +86,7 @@ fn facts() -> ChunkFacts {
             count: 8,
             floor_slots: 2,
             name: "layers.moe.experts".into(),
+            seated: None,
         }],
         ..ChunkFacts::default()
     };

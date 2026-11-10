@@ -185,6 +185,7 @@ impl RowsShape {
             count: self.blocks,
             floor_slots: self.floor,
             name: self.name.clone(),
+            seated: None,
         }
     }
 }

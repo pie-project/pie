@@ -181,6 +181,25 @@ impl Shell {
         self.pools.name_record(pieces)
     }
 
+    /// Seats the weights a held load left in the serving file, before it
+    /// arms: in pool slots of the load's own choosing, filled from the file,
+    /// where the pool holds them all; else on a pinned copy the fires read
+    /// in place. The runtime's first residency then says where each lies.
+    pub(crate) fn preseat_weights(&mut self) -> crate::Result<()> {
+        self.pools.file_weights();
+        match self.pools.preseat_plan() {
+            Some(plan) => {
+                let chunks = self.pools.weight_chunks(&plan);
+                self.pools.keep_clear(chunks);
+                self.pools.preseat_weights(self.device.stream(), &plan)?;
+            }
+            None => self.pools.pin_weight_hosts()?,
+        }
+        self.device.synchronize()?;
+        self.pools.release_file_pages();
+        Ok(())
+    }
+
     /// See `Engine::weight_residency`: stream-ordered before the next fire.
     pub fn weight_residency(
         &mut self,
@@ -205,23 +224,28 @@ impl Shell {
         let flipped = self
             .pools
             .weight_residency(self.device.stream(), residency)?;
-        if self.weights_awaited {
-            // The slots are filled: the lattice is armed, this once.
-            self.device.synchronize()?;
-            self.weights_awaited = false;
-            self.cache.forget_bodies();
-            self.arm_bodies()?;
-        } else if flipped {
+        if flipped {
             if self.pools.by_refs() {
                 // The lattice fires lanes this shell seats itself, which a
-                // pool whose slots the runtime hands out no longer has: the
-                // recorded bodies keep the plain-load select they chose,
-                // which reads a located table as well.
-                eprintln!(
-                    "engine-cuda: a held weight set arrived after lanes named slot refs; \
-                     the recorded bodies keep the per-route select (send the set before \
-                     the first fire)"
-                );
+                // pool whose slots the runtime hands out no longer has.
+                if self.pools.weights_located() {
+                    // The recorded bodies keep the plain-load select they
+                    // chose, which reads a located table as well.
+                    eprintln!(
+                        "engine-cuda: a held weight set arrived after lanes named slot refs; \
+                         the recorded bodies keep the per-route select (send the set before \
+                         the first fire)"
+                    );
+                } else {
+                    // The bodies chose selects for experts that all lay on
+                    // the device, and one now lies on the host copy.
+                    return Err(crate::error::Fault::Unbound {
+                        what: "a weight residency that streams, after lanes named slot refs, \
+                               on a load whose bodies were recorded over held weights: send \
+                               the first residency before the first fire"
+                            .to_string(),
+                    });
+                }
             } else {
                 // A recorded body keeps the select it chose for where a
                 // bank's experts lay: the lattice is recorded again over
@@ -230,6 +254,10 @@ impl Shell {
                 self.cache.forget_bodies();
                 self.arm_bodies()?;
             }
+        }
+        if self.pools.copied_from_file() {
+            self.device.synchronize()?;
+            self.pools.release_file_pages();
         }
         // A set held whole for the load's life is read from the pool alone:
         // its pinned host copy goes.

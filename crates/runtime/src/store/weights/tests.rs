@@ -23,6 +23,7 @@ fn experts(count: u32, floor: u32) -> WeightShape {
         count,
         floor_slots: floor,
         name: "layers.moe.experts".into(),
+        seated: None,
     }
 }
 

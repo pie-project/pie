@@ -406,6 +406,7 @@ impl Shape {
             count: self.count,
             floor_slots: self.floor,
             name: self.name.clone(),
+            seated: None,
         }
     }
 }
