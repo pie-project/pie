@@ -294,7 +294,7 @@ impl Chunks {
     /// chunk for its shape where the one being filled is full. The windowed
     /// id 0 is the null slot. Returns the physical chunk the slot lies in.
     pub fn seat(&mut self, kind: Kind, id: u32) -> Result<u32> {
-        if kind == Kind::Ring && id == 0 {
+        if kind == Kind::Window && id == 0 {
             return Ok(0);
         }
         let per_chunk = self.shape(kind)?.per_chunk;
@@ -348,7 +348,7 @@ impl Chunks {
 
     /// The slot ref page `id` is seated on.
     pub fn slot_ref(&self, kind: Kind, id: u32) -> Result<u32> {
-        if (kind == Kind::Ring && id == 0) || self.refs {
+        if (kind == Kind::Window && id == 0) || self.refs {
             return Ok(id);
         }
         self.seated[kind as usize]
@@ -486,15 +486,17 @@ impl Chunks {
                 SlotKind::List {
                     tokens: list.tokens,
                     rate: 1,
+                    window: None,
                 },
             ));
         }
-        if let Some(ring) = &layout.ring {
+        if let Some(window) = &layout.window {
             shapes.push(shape(
-                ring,
-                SlotKind::Ring {
-                    window: ring.window.unwrap_or(0),
-                    tokens: ring.tokens,
+                window,
+                SlotKind::List {
+                    tokens: window.tokens,
+                    rate: 1,
+                    window: window.window,
                 },
             ));
         }
@@ -504,6 +506,7 @@ impl Chunks {
                 SlotKind::List {
                     tokens: rs.slot.tokens,
                     rate: 1,
+                    window: None,
                 },
             );
             stated.role = engine::chunk::SlotRole::RsBuffer;

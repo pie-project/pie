@@ -207,15 +207,15 @@ impl Shell {
             .copy_whole_slots(self.device.stream(), shape, pairs)
     }
 
-    /// Copies whole slots and token runs of a kv shape (`ring`: the windowed
+    /// Copies whole slots and token runs of a kv shape (`windowed`: the windowed
     /// rows') within the state pool.
     pub fn copy_token_slots(
         &mut self,
-        ring: bool,
+        windowed: bool,
         runs: &[engine::transfer::KvRun],
     ) -> crate::Result<()> {
         self.pools.fence_all_swaps(self.device.stream())?;
-        let (list, windowed): (&[_], &[_]) = if ring { (&[], runs) } else { (runs, &[]) };
+        let (list, windowed): (&[_], &[_]) = if windowed { (&[], runs) } else { (runs, &[]) };
         self.pools.copy_kv(self.device.stream(), list, windowed)
     }
 

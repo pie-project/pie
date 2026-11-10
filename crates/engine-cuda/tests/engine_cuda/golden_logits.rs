@@ -48,7 +48,7 @@ const PAGE: u32 = 16;
 const TOKENS: u32 = 256;
 
 /// Rows a slot holds: past every miniature's sliding window (Gemma 4's
-/// 512, MiMo's 128), so each ring wraps.
+/// 512, MiMo's 128), so each window list trims.
 const CONTEXT: u32 = 1024;
 
 /// The models probed, one per cache shape.
@@ -419,8 +419,8 @@ fn served_by_refs(fixture: &Fixture, cache: &Path) -> Vec<(u64, u32)> {
     // The places in the first segment the chunks move between.
     let spread = segment / 2;
     let mut refs = Refs::of(facts.clone(), segment);
-    let list = refs.shape(|kind| matches!(kind, SlotKind::List { .. }));
-    let ring = refs.shape(|kind| matches!(kind, SlotKind::Ring { .. }));
+    let list = refs.shape(|kind| matches!(kind, SlotKind::List { window: None, .. }));
+    let window_list = refs.shape(|kind| kind.window().is_some());
     let fixed = refs.shape(|kind| matches!(kind, SlotKind::Fixed { .. }));
     shell.take_refs();
     shell.commit_segments(2).expect("two segments commit");
@@ -447,7 +447,7 @@ fn served_by_refs(fixture: &Fixture, cache: &Path) -> Vec<(u64, u32)> {
             if let Some(shape) = list {
                 pages.push(refs.take(shape));
             }
-            if let Some(shape) = ring {
+            if let Some(shape) = window_list {
                 window.push(refs.take(shape));
             }
         }
@@ -475,6 +475,14 @@ fn served_by_refs(fixture: &Fixture, cache: &Path) -> Vec<(u64, u32)> {
             .expect("the step fires");
         let logits = rows.swap_remove(0);
         fed = after;
+        // What the runtime trims: a window list's slot whose last row lies
+        // behind the window of the rows held is the null ref from here on.
+        if let Some(retained) = window_list.and_then(|shape| facts.shapes[shape].kind.window()) {
+            let behind = (fed.saturating_sub(retained) / PAGE) as usize;
+            for slot in window.iter_mut().take(behind) {
+                *slot = 0;
+            }
+        }
         let top = argmax(&logits);
         last = Some(top);
         steps.push((hash_logits(&logits), top));
@@ -1013,8 +1021,8 @@ fn served_pair_by_refs(fixture: &Fixture, cache: &Path) -> Vec<(u64, u32)> {
     .unwrap_or_else(|why| panic!("{} loads: {why}", fixture.model));
     let facts = shell.chunk_facts().expect("the pool states its chunks");
     let mut refs = Refs::of(facts.clone(), 1);
-    let list = refs.shape(|kind| matches!(kind, SlotKind::List { .. }));
-    let ring = refs.shape(|kind| matches!(kind, SlotKind::Ring { .. }));
+    let list = refs.shape(|kind| matches!(kind, SlotKind::List { window: None, .. }));
+    let window_list = refs.shape(|kind| kind.window().is_some());
     let fixed = refs.shape(|kind| matches!(kind, SlotKind::Fixed { .. }));
     shell.take_refs();
     shell.commit_segments(1).expect("the first segment commits");
@@ -1048,7 +1056,7 @@ fn served_pair_by_refs(fixture: &Fixture, cache: &Path) -> Vec<(u64, u32)> {
                 if let Some(shape) = list {
                     pages[lane].push(refs.take(shape));
                 }
-                if let Some(shape) = ring {
+                if let Some(shape) = window_list {
                     window[lane].push(refs.take(shape));
                 }
             }

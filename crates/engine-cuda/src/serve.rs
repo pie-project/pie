@@ -451,13 +451,13 @@ impl Shell {
 
     /// The state is a window: its pages are host windowed pages, and it
     /// holds no slots.
-    fn ring(&self) -> bool {
+    fn windowed(&self) -> bool {
         self.pools.paging().window.is_some()
     }
 
     pub fn read_host_state(&mut self, slots: &[u32], pages: &[u32]) -> Result<Vec<u8>> {
         self.device.synchronize()?;
-        if self.ring() && slots.is_empty() {
+        if self.windowed() && slots.is_empty() {
             return self.pools.read_host_window(pages);
         }
         let spans = self.state_spans(slots, pages)?;
@@ -466,7 +466,7 @@ impl Shell {
 
     pub fn write_host_state(&mut self, slots: &[u32], pages: &[u32], bytes: &[u8]) -> Result<()> {
         self.device.synchronize()?;
-        if self.ring() && slots.is_empty() {
+        if self.windowed() && slots.is_empty() {
             return self.pools.write_host_window(pages, bytes);
         }
         let spans = self.state_spans(slots, pages)?;

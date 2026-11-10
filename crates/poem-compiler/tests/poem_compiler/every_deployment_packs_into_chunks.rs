@@ -461,14 +461,18 @@ fn dsv4_pro_lists_its_pools_as_one_shape_and_its_window_as_another() {
     let list = recipe.list().unwrap();
     // 30 pools of 256 B, 30 index keys of 64 B and 31 pools of 1 KiB a token:
     // every compressed space in one list, its slot a multiple of each ratio.
-    assert_eq!(per_token(list), 41_344);
+    // Beside them the compressor state the gathers key by those rows, 30 KiB
+    // a token.
+    assert_eq!(per_token(list), 41_344 + 30 * 1024);
     let SlotLayout::List { tokens, .. } = list else {
         unreachable!()
     };
     assert_eq!(tokens % 128, 0);
     let windows: Vec<&SlotLayout> = recipe.windows().collect();
     assert_eq!(windows.len(), 1);
-    assert_eq!(per_token(windows[0]), 61 << 10);
+    // The windowed rows, and the compressor state keyed by them (182 KiB a
+    // token), which lies in the pages of the row that keys it.
+    assert_eq!(per_token(windows[0]), (61 + 182) << 10);
 }
 
 #[test]

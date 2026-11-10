@@ -821,7 +821,7 @@ impl Engine for Cuda {
     }
 
     fn copy_slots(&mut self, copy: &engine::chunk::SlotCopy) -> EngineResult<()> {
-        use crate::store::layout::{FIXED, LIST, RING};
+        use crate::store::layout::{FIXED, LIST, WINDOW};
         let device = |domain| matches!(domain, MemoryDomain::CudaDevice(_));
         if !device(copy.src) || !device(copy.dst) {
             return Err(Error::unsupported(
@@ -843,7 +843,7 @@ impl Engine for Cuda {
             }
             return Ok(());
         }
-        if copy.shape != LIST && copy.shape != RING {
+        if copy.shape != LIST && copy.shape != WINDOW {
             // Any other shape this load states (the rs list): whole slots.
             if !copy.runs.is_empty() {
                 return Err(Error::Invalid(format!(
@@ -874,7 +874,7 @@ impl Engine for Cuda {
             }))
             .collect();
         shell
-            .copy_token_slots(copy.shape == RING, &runs)
+            .copy_token_slots(copy.shape == WINDOW, &runs)
             .map_err(fault)
     }
 
@@ -1323,11 +1323,11 @@ impl Cuda {
             })?;
         }
         // A lane that names slot refs (`Lane::tables`, `Lane::fixed`) is the
-        // runtime's shared pool speaking: its list and ring tables are its
+        // runtime's shared pool speaking: its kv and window list tables are its
         // kv refs, and its recurrent record is the pairs `fixed` names, a
         // piece each, copied onto the slots the fire writes where the two
         // differ.
-        use crate::store::layout::{FIXED, LIST, RING};
+        use crate::store::layout::{FIXED, LIST, WINDOW};
         let by_refs = submission.lanes.iter().any(|lane| {
             !lane.tables.is_empty() || !lane.fixed.is_empty() || !lane.slot_copies.is_empty()
         });
@@ -1412,7 +1412,7 @@ impl Cuda {
                         Some(refs) if by_refs && !lane.kv.translation.is_empty() => refs,
                         _ => &lane.kv.translation,
                     },
-                    window: match table(lane, RING) {
+                    window: match table(lane, WINDOW) {
                         Some(refs) if by_refs => refs,
                         _ => &lane.kv.window,
                     },

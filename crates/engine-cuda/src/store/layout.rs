@@ -4,7 +4,7 @@
 //! The pool is `total` chunks of `chunk_bytes`, chunk `p` at
 //! `base + p * chunk_bytes`. A chunk holds slots of one shape. A **list**
 //! slot is one kv page of every full-retention row, layer after layer, and a
-//! **ring** slot one page of every windowed row; a row's key plane and then
+//! **window list** slot one page of every windowed row; a row's key plane and then
 //! its value plane run where the recipe puts the row.
 //!
 //! A paged kernel reads page `q` of a plane at `plane base + q * grain`
@@ -21,8 +21,8 @@ use crate::error::{Fault, Result};
 
 /// The list shape's id in the facts this engine states.
 pub const LIST: ShapeId = ShapeId(0);
-/// The ring shape's.
-pub const RING: ShapeId = ShapeId(1);
+/// The window list's.
+pub const WINDOW: ShapeId = ShapeId(1);
 /// The fixed shape's.
 pub const FIXED: ShapeId = ShapeId(2);
 /// The rs list's.
@@ -34,7 +34,7 @@ pub enum Kind {
     /// A page of every full-retention kv row.
     List,
     /// A page of every windowed kv row.
-    Ring,
+    Window,
     /// A working set's record of every recurrent row.
     Fixed,
     /// A page of the rs buffer: the rows a lane lands past its state before
@@ -46,14 +46,14 @@ impl Kind {
     /// The shape a kv row's pages are slots of.
     #[must_use]
     pub const fn paged(windowed: bool) -> Kind {
-        if windowed { Kind::Ring } else { Kind::List }
+        if windowed { Kind::Window } else { Kind::List }
     }
 
     #[must_use]
     pub const fn name(self) -> &'static str {
         match self {
             Kind::List => "kv page",
-            Kind::Ring => "windowed page",
+            Kind::Window => "windowed page",
             Kind::Fixed => "state slot",
             Kind::Rs => "rs buffer page",
         }
@@ -87,14 +87,8 @@ impl SlotShape {
                 tokens,
                 bytes,
                 rows,
-            } => (*tokens, *bytes, None, rows),
-            SlotLayout::Ring {
-                tokens,
-                bytes,
-                cap,
-                rows,
-                ..
-            } => (*tokens, *bytes, Some(cap.window), rows),
+                window,
+            } => (*tokens, *bytes, *window, rows),
             SlotLayout::RsList {
                 tokens,
                 bytes,
@@ -181,7 +175,8 @@ pub struct Layout {
     /// Chunks a segment, by the recipe's device profile.
     pub segment_chunks: u32,
     pub list: Option<SlotShape>,
-    pub ring: Option<SlotShape>,
+    /// The window list: this engine pages every windowed row by one table.
+    pub window: Option<SlotShape>,
     pub fixed: Option<FixedShape>,
     pub rs: Option<RsShape>,
 }
@@ -325,19 +320,31 @@ impl FixedShape {
 
 impl Layout {
     /// The recipe's token shapes. This engine pages every windowed row by one
-    /// table, so a recipe with rings of two windows is refused.
+    /// table, so a recipe with two window lists is refused, and by its kv
+    /// page, so a window list of another page size is.
     pub fn of(recipe: &ChunkRecipe) -> Result<Layout> {
         let chunk_bytes = recipe.chunk_bytes;
         let list = recipe
             .list()
             .map(|layout| SlotShape::of(layout, chunk_bytes, LIST))
             .transpose()?;
-        let mut rings = recipe.rings();
-        let ring = rings
+        let mut windows = recipe.windows();
+        let window = windows
             .next()
-            .map(|layout| SlotShape::of(layout, chunk_bytes, RING))
+            .map(|layout| SlotShape::of(layout, chunk_bytes, WINDOW))
             .transpose()?;
-        if rings.next().is_some() {
+        if let (Some(list), Some(window)) = (&list, &window)
+            && list.tokens != window.tokens
+        {
+            return Err(Fault::Unbound {
+                what: format!(
+                    "a window list of {} tokens a slot beside kv pages of {}, which this \
+                     engine's kernels page alike",
+                    window.tokens, list.tokens
+                ),
+            });
+        }
+        if windows.next().is_some() {
             return Err(Fault::Unbound {
                 what: "kv rows read through windows of two widths, which this engine pages \
                        by one windowed table"
@@ -369,7 +376,7 @@ impl Layout {
             chunk_bytes,
             segment_chunks: u32::try_from(segment_chunks).unwrap_or(u32::MAX).max(1),
             list,
-            ring,
+            window,
             fixed,
             rs,
         })
@@ -379,7 +386,7 @@ impl Layout {
     pub fn shape(&self, kind: Kind) -> Option<&SlotShape> {
         match kind {
             Kind::List => self.list.as_ref(),
-            Kind::Ring => self.ring.as_ref(),
+            Kind::Window => self.window.as_ref(),
             Kind::Fixed => self.fixed.as_ref().map(|fixed| &fixed.slot),
             Kind::Rs => self.rs.as_ref().map(|rs| &rs.slot),
         }
@@ -405,7 +412,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn a_list_slot_is_read_by_its_slot_ref_and_a_ring_slot_by_its_grain() {
+    fn a_list_slot_is_read_by_its_slot_ref_and_a_window_slot_by_its_grain() {
         let chunk = 48 * 256;
         let list = SlotShape {
             id: LIST,
@@ -422,9 +429,9 @@ mod tests {
         assert_eq!(list.offset_of(3), Some(1024));
         assert_eq!(list.offset_of(1), None);
 
-        // A ring slot of 20 units in a chunk of 48: two a chunk, eight spare.
-        let ring = SlotShape {
-            id: RING,
+        // A window list slot of 20 units in a chunk of 48: two a chunk, eight spare.
+        let window = SlotShape {
+            id: WINDOW,
             tokens: 16,
             slot_bytes: 20 * 256,
             per_chunk: 2,
@@ -433,10 +440,10 @@ mod tests {
             rows: vec![(1, 0)],
             pools: Vec::new(),
         };
-        assert_eq!(ring.grain, 4 * 256);
+        assert_eq!(window.grain, 4 * 256);
         for (chunk_id, index) in [(0u32, 0u32), (1, 1), (7, 0), (7, 1)] {
-            let q = ring.page_id(chunk, chunk_id, index);
-            assert_eq!(q * ring.grain, ring.slot_at(chunk, chunk_id, index));
+            let q = window.page_id(chunk, chunk_id, index);
+            assert_eq!(q * window.grain, window.slot_at(chunk, chunk_id, index));
         }
     }
 }

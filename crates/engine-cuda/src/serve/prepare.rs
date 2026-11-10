@@ -1244,7 +1244,7 @@ impl FrameShell for Shell {
                     if kv_less {
                         Ok(table.to_vec())
                     } else if self.pools.by_refs() {
-                        ring_refs(&paging, seat, ids)
+                        window_refs(&paging, seat, ids)
                     } else {
                         kv::window_table(&paging, seat, table, ids)
                     }
@@ -1777,10 +1777,10 @@ fn stated_fold(len: FoldLen, lane: usize, port: Option<&[u32]>) -> Result<u32> {
     })
 }
 
-/// A lane's windowed table where it names ring slot refs: a page wholly
+/// A lane's windowed table where it names window list slot refs: a page wholly
 /// behind the window of the lane's first row reads the null slot, the rest
 /// the refs the lane was handed, one a page of its table.
-fn ring_refs(paging: &kv::Paging, seat: &kv::Seat, refs: &[u32]) -> Result<Vec<u32>> {
+fn window_refs(paging: &kv::Paging, seat: &kv::Seat, refs: &[u32]) -> Result<Vec<u32>> {
     let Some(window) = paging.window else {
         return Ok(refs.to_vec());
     };
@@ -1804,7 +1804,7 @@ fn ring_refs(paging: &kv::Paging, seat: &kv::Seat, refs: &[u32]) -> Result<Vec<u
                     ),
                 }),
                 None => Err(Fault::Ceiling {
-                    what: "ring slot refs this lane stated",
+                    what: "window list slot refs this lane stated",
                     need: page + 1,
                     have: refs.len() as u64,
                 }),

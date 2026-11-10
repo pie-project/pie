@@ -1181,18 +1181,18 @@ impl Pools {
     }
 
     /// The page tables a fire stages: one a kv shape, the list's and then
-    /// the ring's. Every kv row of a shape reads its shape's.
+    /// the window list's. Every kv row of a shape reads its shape's.
     #[must_use]
     pub fn geometries(&self) -> usize {
         let layout = self.chunks.layout();
-        usize::from(layout.list.is_some()) + usize::from(layout.ring.is_some())
+        usize::from(layout.list.is_some()) + usize::from(layout.window.is_some())
     }
 
-    /// Whether page table `at` of a fire's is the ring's.
+    /// Whether page table `at` of a fire's is the window list's.
     #[must_use]
     pub fn windowed_geometry(&self, at: usize) -> bool {
         let layout = self.chunks.layout();
-        layout.ring.is_some() && at == usize::from(layout.list.is_some())
+        layout.window.is_some() && at == usize::from(layout.list.is_some())
     }
 
     /// The page table of a fire's the kv rows of `space` read: their
@@ -1230,7 +1230,7 @@ impl Pools {
             .any(|shape| matches!(shape, Shape::Kv { windowed: true, .. }))
     }
 
-    /// Seats the kv pages `pages` (the windowed ones, `ring`) on slots of
+    /// Seats the kv pages `pages` (the windowed ones, a window list's) on slots of
     /// the state pool and backs the segments their chunks lie in.
     fn seat_pages(&mut self, kind: Kind, pages: impl IntoIterator<Item = u64>) -> Result<()> {
         // The physical chunks the pages lie in.
@@ -1293,7 +1293,7 @@ impl Pools {
                 have: capacity,
             });
         }
-        self.seat_pages(Kind::Ring, fresh.iter().copied())
+        self.seat_pages(Kind::Window, fresh.iter().copied())
     }
 
     #[must_use]
@@ -1649,7 +1649,7 @@ impl Pools {
     ) -> Result<()> {
         let kind = match shape {
             layout::LIST => Kind::List,
-            layout::RING => Kind::Ring,
+            layout::WINDOW => Kind::Window,
             layout::FIXED => Kind::Fixed,
             layout::RS => Kind::Rs,
             other => {
@@ -1861,11 +1861,11 @@ impl Pools {
         self.chunks.span(plane.kind, page, plane.offset, bytes)
     }
 
-    /// Rewrites the page ids of a fire's table (the windowed rows', `ring`)
+    /// Rewrites the page ids of a fire's table (the windowed rows', `windowed`)
     /// as the ids the paged kernels read their slots by; the fire's commit
     /// has seated them.
-    pub fn page_ids(&self, ring: bool, ids: &mut [i32]) -> Result<()> {
-        self.chunks.page_ids(Kind::paged(ring), ids)
+    pub fn page_ids(&self, windowed: bool, ids: &mut [i32]) -> Result<()> {
+        self.chunks.page_ids(Kind::paged(windowed), ids)
     }
 
     /// Whether the load keeps a recurrent record for state slot `slot`;
@@ -1972,12 +1972,12 @@ impl Pools {
 
     /// The kv planes as another worker reads them: every declared page, one
     /// region per paged plane, a page `p` at `base + p * page_stride`. A
-    /// windowed space is refused: its pages are named by its own ring, not by
+    /// windowed space is refused: its pages are named by its own window list, not by
     /// the kv pages a peer reads.
     pub fn export_kv(&mut self, ordinal: u32) -> Result<ExportedKv> {
         if !self.windowed_planes().is_empty() {
             return Err(Fault::Residency(
-                "a windowed kv space names its pages by its own ring, so it cannot be \
+                "a windowed kv space names its pages by its own window list, so it cannot be \
                  handed to another worker by the kv pages it reads"
                     .to_string(),
             ));
@@ -2541,7 +2541,7 @@ impl Pools {
         )
     }
 
-    /// Host windowed pages `pages`, a ring's on the host, laid out as
+    /// Host windowed pages `pages`, a window list's on the host, laid out as
     /// [`Self::read_host_kv`] lays out kv slots.
     pub fn read_host_window(&mut self, pages: &[u32]) -> Result<Vec<u8>> {
         Ok(read_shelf(self.host_shelf(true, pages)?, pages))
@@ -2760,7 +2760,7 @@ fn lay(
 fn chunks_at(layout: &layout::Layout, paging: &Paging, pages: u64, slots: u32) -> u32 {
     let chunks = 1
         + layout.chunks_for(Kind::List, pages)
-        + layout.chunks_for(Kind::Ring, paging.window_pages_at(pages))
+        + layout.chunks_for(Kind::Window, paging.window_pages_at(pages))
         + layout.chunks_for(
             Kind::Fixed,
             u64::from(slots)

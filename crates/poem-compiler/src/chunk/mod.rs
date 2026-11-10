@@ -713,6 +713,13 @@ pub fn plan(
             row.window = None;
         }
     }
+    if device.one_window
+        && let Some(widest) = token_rows.iter().filter_map(|r| r.window).max()
+    {
+        for row in token_rows.iter_mut().filter(|r| r.window.is_some()) {
+            row.window = Some(widest);
+        }
+    }
     let full: Vec<&TokenRow> = token_rows.iter().filter(|r| r.window.is_none()).collect();
     let mut windows: BTreeMap<u32, Vec<&TokenRow>> = BTreeMap::new();
     for row in &token_rows {
