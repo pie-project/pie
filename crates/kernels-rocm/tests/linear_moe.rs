@@ -622,6 +622,7 @@ fn moe_matmul_dense() {
     let streamed = moe::ExpertTable {
         table: table_t.ptr,
         hits: hits.ptr,
+        ..moe::ExpertTable::RESIDENT
     };
     moe::matmul_select(&ctx, xt, bt, rt, &mut y, streamed).unwrap();
     close_dot("expert table", &gpu.read(&y), &want, &mag, 1e-5);

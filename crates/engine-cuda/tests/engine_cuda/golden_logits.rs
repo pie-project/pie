@@ -246,6 +246,18 @@ fn cache_dir() -> PathBuf {
 }
 
 fn load(fixture: &Fixture, cache: &Path) -> Shell {
+    load_with(fixture, cache, knobs())
+}
+
+/// The model loaded with the weight cache's shapes stated: every atom read
+/// from the host copy until a residency names it a slot.
+fn load_cached(fixture: &Fixture, cache: &Path) -> Shell {
+    let mut knobs = knobs();
+    knobs.diagnostics.dense_weights = false;
+    load_with(fixture, cache, knobs)
+}
+
+fn load_with(fixture: &Fixture, cache: &Path, knobs: engine_cuda::Knobs) -> Shell {
     Shell::load(Boot {
         trace: fixture.trace.clone(),
         contract: &fixture.contract,
@@ -259,7 +271,7 @@ fn load(fixture: &Fixture, cache: &Path) -> Shell {
         kv_budget: None,
         memory_share: engine::load::DEFAULT_DEVICE_MEMORY_SHARE,
         ordinal: 0,
-        knobs: knobs(),
+        knobs,
         cache_dir: Some(cache),
         runahead: engine::runahead::Runahead::F1,
         residency: engine_cuda::experts::Plan::default(),
@@ -282,6 +294,10 @@ fn knobs() -> engine_cuda::Knobs {
         knobs.diagnostics.chunk_bytes = Some(bytes.parse().expect("PIE_GOLDEN_CHUNK is bytes"));
     }
     knobs.diagnostics.packed_pages = std::env::var_os("PIE_GOLDEN_PACKED").is_some();
+    // No weight shape stated: the tables and routed banks dense on the
+    // device, as the base engine seats them. The weight cache's own probes
+    // load with its shapes ([`load_cached`]).
+    knobs.diagnostics.dense_weights = true;
     knobs
 }
 
@@ -1509,7 +1525,12 @@ enum Rows {
 /// the engine's use record counts them.
 fn served_rows(fixture: &Fixture, cache: &Path, rows: Rows) -> (Vec<(u64, u32)>, usize) {
     use engine::chunk::{ResidentWeight, WeightAtom, WeightResidency};
-    let mut shell = load(fixture, cache);
+    // The table's rows alone: the model's routed experts dense, as the
+    // base engine seats them.
+    let mut knobs = knobs();
+    knobs.diagnostics.dense_weights = false;
+    knobs.diagnostics.dense_experts = true;
+    let mut shell = load_with(fixture, cache, knobs);
     let facts = shell.chunk_facts().expect("the pool states its chunks");
     facts.validate().expect("the engine's chunk facts hold");
     let table = facts
@@ -1565,7 +1586,14 @@ fn served_rows(fixture: &Fixture, cache: &Path, rows: Rows) -> (Vec<(u64, u32)>,
         steps.push((hash_logits(&logits), top));
     }
     let uses = shell.weight_uses().expect("the use record reads");
-    let read: u64 = uses.uses.iter().map(|(_, reads)| u64::from(*reads)).sum();
+    // The table's reads and its blocks, apart from any other weight shape's
+    // (a model's routed experts).
+    let of_table: Vec<_> = uses
+        .uses
+        .iter()
+        .filter(|(atom, _)| atom.shape == table.id)
+        .collect();
+    let read: u64 = of_table.iter().map(|(_, reads)| u64::from(*reads)).sum();
     assert_eq!(
         read,
         u64::from(fed),
@@ -1578,14 +1606,14 @@ fn served_rows(fixture: &Fixture, cache: &Path, rows: Rows) -> (Vec<(u64, u32)>,
         Rows::Mixed => table.count.div_ceil(2),
     };
     assert_eq!(
-        uses.held,
-        vec![engine::chunk::WeightHeld {
+        uses.held.iter().find(|held| held.shape == table.id),
+        Some(&engine::chunk::WeightHeld {
             shape: table.id,
             resident: cached,
             host: table.count - cached,
-        }]
+        })
     );
-    (steps, uses.uses.len())
+    (steps, of_table.len())
 }
 
 /// The row-cache probe: `PIE_GOLDEN_MODELS` (the models with a row-streamed
@@ -1667,7 +1695,10 @@ fn golden_rows_resident() {
     for model in models {
         let fixture = fixture(&model, &cache);
         for resident in [false, true, false, true] {
-            let mut shell = load(&fixture, &cache);
+            let mut knobs = knobs();
+            knobs.diagnostics.dense_weights = false;
+            knobs.diagnostics.dense_experts = true;
+            let mut shell = load_with(&fixture, &cache, knobs);
             let facts = shell.chunk_facts().expect("the pool states its chunks");
             let (_, blocks) = shell.row_blocks();
             assert!(blocks > 0, "{model} streams no table by its rows");
@@ -1719,7 +1750,7 @@ fn golden_rows_resident() {
 /// of where the experts lie.
 fn served_experts(fixture: &Fixture, cache: &Path, rows: Rows) -> Vec<Vec<f32>> {
     use engine::chunk::{ResidentWeight, WeightAtom, WeightKind, WeightResidency};
-    let mut shell = load(fixture, cache);
+    let mut shell = load_cached(fixture, cache);
     let facts = shell.chunk_facts().expect("the pool states its chunks");
     facts.validate().expect("the engine's chunk facts hold");
     let shapes: Vec<_> = facts

@@ -369,10 +369,21 @@ fn selected(op: &'static str, x: Tensor, routes: Tensor, y: &Tensor) -> Result<S
 pub struct ExpertTable {
     pub table: u64,
     pub hits: u64,
+    /// Whether every entry names device memory, as an engine states it for
+    /// the CUDA selects; the HIP selects do not read it.
+    pub located: bool,
+    /// The span every entry falls in, as an engine states it for the CUDA
+    /// selects that map one; the HIP selects do not read it.
+    pub window: (u64, u64),
 }
 
 impl ExpertTable {
-    pub const RESIDENT: ExpertTable = ExpertTable { table: 0, hits: 0 };
+    pub const RESIDENT: ExpertTable = ExpertTable {
+        table: 0,
+        hits: 0,
+        located: false,
+        window: (0, 0),
+    };
 
     #[must_use]
     pub const fn streams(&self) -> bool {

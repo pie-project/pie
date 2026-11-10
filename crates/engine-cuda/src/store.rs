@@ -766,10 +766,11 @@ impl Pools {
         chunk_bytes: Option<u64>,
         packed: bool,
         experts: &[usize],
+        rows: bool,
     ) -> Result<Pools> {
         let packed = packed || PACKED_KERNELS;
         let pool = PhysicalPool::open(device, utilization)?;
-        let mut layout = lay(trace, &paging, budgets, chunk_bytes, experts)?;
+        let mut layout = lay(trace, &paging, budgets, chunk_bytes, experts, rows)?;
         let mut shapes = Vec::with_capacity(trace.caches.len());
 
         for (index, row) in trace.caches.iter().enumerate() {
@@ -3179,6 +3180,7 @@ fn lay(
     budgets: &poem_compiler::Budgets,
     chunk_bytes: Option<u64>,
     experts: &[usize],
+    rows: bool,
 ) -> Result<layout::Layout> {
     let context = if paging.window.is_some() {
         paging.context()
@@ -3203,7 +3205,12 @@ fn lay(
         let bytes = crate::weights::plane_bytes(trace)?;
         experts.iter().map(|&param| (param, bytes[param])).collect()
     };
-    layout::Layout::of(&recipe, &layout::streamed_rows(trace), &banks)
+    let streamed = if rows {
+        layout::streamed_rows(trace)
+    } else {
+        Vec::new()
+    };
+    layout::Layout::of(&recipe, &streamed, &banks)
 }
 
 /// Whether this build's kernels step a plane's pages one right after another

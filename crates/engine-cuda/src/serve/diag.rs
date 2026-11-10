@@ -27,6 +27,13 @@ pub struct Diagnostics {
     /// (what a ROCm build always does): the same logits where the model can
     /// be laid so, a refused load where it cannot.
     pub packed_pages: bool,
+    /// States no weight shape: every table and routed bank the weight cache
+    /// would stream stays dense on the device, as a load that predates the
+    /// cache seats it.
+    pub dense_weights: bool,
+    /// States no expert shape: the routed banks stay dense on the device,
+    /// while the tables streamed by their rows are stated.
+    pub dense_experts: bool,
 }
 
 /// The sync guard's answer to a fire that waited for the device.
@@ -59,6 +66,8 @@ impl Default for Diagnostics {
             sync_guard: None,
             chunk_bytes: None,
             packed_pages: false,
+            dense_weights: false,
+            dense_experts: false,
         }
     }
 }
@@ -116,6 +125,12 @@ impl Diagnostics {
         if self.packed_pages {
             words.push("packed-pages".to_string());
         }
+        if self.dense_weights {
+            words.push("dense-weights".to_string());
+        }
+        if self.dense_experts {
+            words.push("dense-experts".to_string());
+        }
         (!words.is_empty()).then(|| words.join(","))
     }
 }
@@ -134,7 +149,8 @@ const WORDS: &str = "`golden-probe`, `arm-trace`, \
      `ptr-trace=<key substring>`, `graph-dot=<dir>`, `grid-trace=<key substring>`, \
      `plan-trace=<rows|all>`, `arm-bench=<key>`, `capture-serial`, `boundary-trace`, `reap-trace`, \
      `trace-census`, `nan-check`, `fuse-chains=off`, `gumbel-direct=off`, \
-     `sync-guard[=panic]`, `chunk-bytes=<bytes>`, `packed-pages`";
+     `sync-guard[=panic]`, `chunk-bytes=<bytes>`, `packed-pages`, `dense-weights`, \
+     `dense-experts`";
 
 impl std::str::FromStr for Diagnostics {
     type Err = String;
@@ -159,6 +175,8 @@ impl std::str::FromStr for Diagnostics {
                 "trace-census" => diag.trace_census = switch(word, value)?,
                 "nan-check" => diag.nan_check = switch(word, value)?,
                 "packed-pages" => diag.packed_pages = switch(word, value)?,
+                "dense-weights" => diag.dense_weights = switch(word, value)?,
+                "dense-experts" => diag.dense_experts = switch(word, value)?,
                 "fuse-chains" => diag.fuse_chains = switch(word, value)?,
                 "gumbel-direct" => diag.gumbel_direct = switch(word, value)?,
                 "sync-guard" => {
