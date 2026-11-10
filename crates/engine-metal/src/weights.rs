@@ -634,6 +634,7 @@ impl Weights {
         self.store.bytes()
             + self.mapped.iter().map(Buffer::bytes).sum::<u64>()
             + self.decoded.iter().map(Buffer::bytes).sum::<u64>()
+            + self.hosted.values().map(Buffer::bytes).sum::<u64>()
     }
 }
 
