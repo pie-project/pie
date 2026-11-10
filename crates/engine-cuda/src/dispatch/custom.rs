@@ -1286,6 +1286,7 @@ impl Run<'_> {
             *ratio,
             slabs.state_kv,
             slabs.state_score,
+            slabs.stride,
             gather_ape,
             self.tensor(*weight),
             *eps,

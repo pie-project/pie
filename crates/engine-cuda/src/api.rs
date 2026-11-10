@@ -715,7 +715,7 @@ impl Engine for Cuda {
                 seat_to_end: shell.seat_to_end(),
                 seat_spread: shell.seat_spread(),
             },
-            chunks: None,
+            chunks: Some(shell.chunk_facts()),
             limits: FireLimits {
                 max_lanes: shell.budget().max_lanes,
                 max_tokens: shell.budget().max_tokens,
@@ -805,6 +805,71 @@ impl Engine for Cuda {
 
     fn commit_pool(&mut self, kv_pages: u32) -> EngineResult<()> {
         self.loaded_mut()?.commit_pool(kv_pages).map_err(fault)
+    }
+
+    fn commit_segments(&mut self, segments: u32) -> EngineResult<()> {
+        self.loaded_mut()?.commit_segments(segments).map_err(fault)
+    }
+
+    fn release_segments(&mut self, segments: u32) -> EngineResult<()> {
+        self.loaded_mut()?.release_segments(segments).map_err(fault)
+    }
+
+    fn evacuate(&mut self, evacuation: &engine::chunk::Evacuation) -> EngineResult<()> {
+        self.loaded_mut()?.evacuate(evacuation).map_err(fault)
+    }
+
+    fn copy_slots(&mut self, copy: &engine::chunk::SlotCopy) -> EngineResult<()> {
+        use crate::store::layout::{FIXED, LIST, RING};
+        let device = |domain| matches!(domain, MemoryDomain::CudaDevice(_));
+        if !device(copy.src) || !device(copy.dst) {
+            return Err(Error::unsupported(
+                "cuda",
+                "copy_slots between tiers: the host and disk tiers of the shared shapes still \
+                 move through copy_kv and copy_state",
+            ));
+        }
+        let shell = self.loaded_mut()?;
+        shell.take_refs();
+        if copy.shape == FIXED {
+            if !copy.runs.is_empty() {
+                return Err(Error::Invalid(
+                    "a fixed record is copied whole, not a run of its tokens".into(),
+                ));
+            }
+            for &(src, dst) in &copy.slots {
+                shell.fork_state(src, dst).map_err(fault)?;
+            }
+            return Ok(());
+        }
+        if copy.shape != LIST && copy.shape != RING {
+            return Err(Error::Invalid(format!(
+                "copy_slots names shape {}, which this load does not state",
+                copy.shape
+            )));
+        }
+        let page = shell.paging().page_size;
+        let runs: Vec<engine::transfer::KvRun> = copy
+            .slots
+            .iter()
+            .map(|&(src, dst)| engine::transfer::KvRun {
+                src_page: src,
+                src_token: 0,
+                dst_page: dst,
+                dst_token: 0,
+                tokens: page,
+            })
+            .chain(copy.runs.iter().map(|run| engine::transfer::KvRun {
+                src_page: run.src,
+                src_token: run.src_token,
+                dst_page: run.dst,
+                dst_token: run.dst_token,
+                tokens: run.tokens,
+            }))
+            .collect();
+        shell
+            .copy_token_slots(copy.shape == RING, &runs)
+            .map_err(fault)
     }
 
     fn submit(&mut self, frame: &FrameSubmission) -> EngineResult<FrameTicket> {
@@ -1238,6 +1303,44 @@ impl Cuda {
                 ))
             })?;
         }
+        // A lane that names slot refs (`Lane::tables`, `Lane::fixed`) is the
+        // runtime's shared pool speaking: its kv fields carry the list and
+        // ring refs, and its recurrent record is the pair `fixed` names,
+        // copied onto the slot the fire writes where the two differ.
+        let by_refs = submission
+            .lanes
+            .iter()
+            .any(|lane| !lane.tables.is_empty() || !lane.fixed.is_empty());
+        if by_refs {
+            shell.take_refs();
+        }
+        let mut records: Vec<Option<u32>> = Vec::with_capacity(submission.lanes.len());
+        for lane in &submission.lanes {
+            let record = match lane.fixed.as_slice() {
+                [] => None,
+                [(shape, pieces)] if *shape == crate::store::layout::FIXED => {
+                    let [[run, written]] = pieces.as_slice() else {
+                        return Err(Error::Invalid(format!(
+                            "lane in slot {} names {} pieces of its recurrent record, and this \
+                             load holds a record in one slot",
+                            lane.slot,
+                            pieces.len()
+                        )));
+                    };
+                    if run != written {
+                        shell.fork_state(*run, *written).map_err(fault)?;
+                    }
+                    Some(*written)
+                }
+                _ => {
+                    return Err(Error::Invalid(format!(
+                        "lane in slot {} names fixed shapes this load does not state",
+                        lane.slot
+                    )));
+                }
+            };
+            records.push(record);
+        }
         let seated: Vec<Seated<'_>> = submission
             .lanes
             .iter()
@@ -1260,7 +1363,7 @@ impl Cuda {
                     adapter: lane_adapters[at].or(lane.adapter),
                     rs: lane.rs.clone(),
                     rs_reset: lane.rs_reset,
-                    rs_slot: lane.rs_slot,
+                    rs_slot: records[at].or(lane.rs_slot),
                     rs_snapshots: &lane.rs_snapshots,
                     readout: match &lane.readout {
                         Readout::Rows(rows) => Some(rows.as_slice()),

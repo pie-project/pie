@@ -296,7 +296,7 @@ __global__ void __launch_bounds__(256) norm_rope_pair(
         next.plane_row = -1;
         if (unit + stride < q_units) norm_rope_fetch<QPER>(next, unit + stride, qx, q_heads, win);
         norm_rope_unit<QPER, false, false>(freq_s, cur, nullptr, qy, positions, q_heads, q_eps, rotary_dim,
-                                           false, nullptr, nullptr, nullptr, nullptr, 0);
+                                           false, nullptr, nullptr, nullptr, nullptr, 0, 0);
         cur = next;
     }
     for (; unit < q_units + kv_units; unit += stride) {

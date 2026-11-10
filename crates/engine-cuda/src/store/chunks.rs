@@ -37,6 +37,8 @@ pub struct Chunks {
     /// The lowest chunk no shape has opened; chunk 0 is the null chunk.
     next: u32,
     null_zeroed: bool,
+    /// Lanes name slot refs: nothing is seated here any more.
+    refs: bool,
 }
 
 impl Chunks {
@@ -61,6 +63,7 @@ impl Chunks {
             seated: [Seating::default(), Seating::default(), Seating::default()],
             next: 1,
             null_zeroed: false,
+            refs: false,
         })
     }
 
@@ -216,6 +219,22 @@ impl Chunks {
         })
     }
 
+    /// From here on a lane names its slots by slot ref, as the runtime's
+    /// pool hands them out: what this pool seated for the load's own fires
+    /// is let go, and nothing is seated again.
+    pub fn take_refs(&mut self) {
+        if !self.refs {
+            self.refs = true;
+            self.seated = [Seating::default(), Seating::default(), Seating::default()];
+        }
+    }
+
+    /// Whether lanes name slot refs.
+    #[must_use]
+    pub fn by_refs(&self) -> bool {
+        self.refs
+    }
+
     /// Seats page `id` of today's ids on a slot, opening the lowest free
     /// chunk for its shape where the one being filled is full. The windowed
     /// id 0 is the null slot. Returns the logical chunk the slot lies in.
@@ -224,6 +243,19 @@ impl Chunks {
             return Ok(0);
         }
         let per_chunk = self.shape(kind)?.per_chunk;
+        if self.refs {
+            // A slot ref: its chunk is one the runtime opened, in a segment
+            // it had backed ahead of this fire.
+            let chunk = id / per_chunk;
+            if chunk == 0 || chunk >= self.total {
+                return Err(Fault::Ceiling {
+                    what: "chunks of the state pool a slot ref may name",
+                    need: u64::from(chunk) + 1,
+                    have: u64::from(self.total),
+                });
+            }
+            return Ok(chunk);
+        }
         let seating = &mut self.seated[kind as usize];
         if let Some(&slot) = seating.refs.get(id as usize)
             && slot != UNSEATED
@@ -260,8 +292,8 @@ impl Chunks {
 
     /// The slot ref page `id` is seated on.
     pub fn slot_ref(&self, kind: Kind, id: u32) -> Result<u32> {
-        if kind == Kind::Ring && id == 0 {
-            return Ok(0);
+        if (kind == Kind::Ring && id == 0) || self.refs {
+            return Ok(id);
         }
         self.seated[kind as usize]
             .refs
@@ -365,5 +397,81 @@ impl Chunks {
     #[must_use]
     pub fn physical(&self, logical: u32) -> Option<u32> {
         self.table.physical(logical)
+    }
+}
+
+impl Chunks {
+    /// The pool as the runtime counts it: every chunk of the range, the
+    /// null chunk reserved, each shape free to take any chunk, and the
+    /// activation's chunks under the range's end. `spare` chunks under the
+    /// activation's hold nothing the device can back (what the load's own
+    /// allocations took after the range was reserved): they are stated with
+    /// the activation's, so state stays below them.
+    #[must_use]
+    pub fn facts(&self, max_tokens: u32, spare: u32, flat: bool) -> engine::chunk::ChunkFacts {
+        use engine::chunk::{
+            ChunkFacts, Growth, Reserved, ReservedRun, SegmentFacts, SlotKind, SlotShape,
+        };
+        let layout = &self.layout;
+        let shape = |shape: &crate::store::layout::SlotShape, kind: SlotKind| SlotShape {
+            id: shape.id,
+            kind,
+            slot_bytes: shape.slot_bytes,
+            slots_per_chunk: shape.per_chunk,
+            sets_per_working_set: kind.sets_per_working_set(),
+            rows: shape.rows.iter().map(|&(row, _)| row).collect(),
+            pinned: None,
+        };
+        let mut shapes = Vec::new();
+        if let Some(list) = &layout.list {
+            shapes.push(shape(
+                list,
+                SlotKind::List {
+                    tokens: list.tokens,
+                    rate: 1,
+                },
+            ));
+        }
+        if let Some(ring) = &layout.ring {
+            shapes.push(shape(
+                ring,
+                SlotKind::Ring {
+                    window: ring.window.unwrap_or(0),
+                    tokens: ring.tokens,
+                },
+            ));
+        }
+        if let Some(fixed) = &layout.fixed {
+            shapes.push(shape(fixed, SlotKind::Fixed { pieces: 1 }));
+        }
+        let total = self.total.saturating_add(self.act);
+        let max = u32::try_from(u64::from(total).div_ceil(u64::from(layout.segment_chunks.max(1))))
+            .unwrap_or(u32::MAX);
+        ChunkFacts {
+            chunk_bytes: layout.chunk_bytes,
+            total_chunks: total,
+            segment_chunks: layout.segment_chunks,
+            segments: SegmentFacts {
+                committed: if flat { max } else { self.committed_segments() },
+                max,
+                growth: if flat {
+                    Growth::Fixed
+                } else {
+                    Growth::TwoEnded
+                },
+            },
+            reserved: vec![ReservedRun {
+                what: Reserved::Null,
+                first: 0,
+                chunks: 1,
+            }],
+            shapes,
+            act_chunks: vec![(max_tokens, self.act.saturating_add(spare))],
+            host_chunks: 0,
+            disk_chunks: 0,
+            disk_persistent: false,
+            disk_kept: false,
+            weights: Vec::new(),
+        }
     }
 }

@@ -132,6 +132,8 @@ pub struct PoolSlabs {
     pub state_score: Tensor,
 
     pub ape: Tensor,
+    /// The state's elements from one page's rows to the next page's.
+    pub stride: i64,
 }
 
 #[derive(Clone, Debug)]

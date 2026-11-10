@@ -1242,6 +1242,8 @@ impl FrameShell for Shell {
                 .map(|(((seat, table), ids), &kv_less)| {
                     if kv_less {
                         Ok(table.to_vec())
+                    } else if self.pools.by_refs() {
+                        ring_refs(&paging, seat, ids)
                     } else {
                         kv::window_table(&paging, seat, table, ids)
                     }
@@ -1770,6 +1772,42 @@ fn stated_fold(len: FoldLen, lane: usize, port: Option<&[u32]>) -> Result<u32> {
             })?
         }
     })
+}
+
+/// A lane's windowed table where it names ring slot refs: a page wholly
+/// behind the window of the lane's first row reads the null slot, the rest
+/// the refs the lane was handed, one a page of its table.
+fn ring_refs(paging: &kv::Paging, seat: &kv::Seat, refs: &[u32]) -> Result<Vec<u32>> {
+    let Some(window) = paging.window else {
+        return Ok(refs.to_vec());
+    };
+    let page_size = u64::from(paging.page_size);
+    let pages = (u64::from(seat.have) + u64::from(seat.rows))
+        .div_ceil(page_size)
+        .max(1);
+    let first = u64::from(seat.have.saturating_sub(window.tokens)) / page_size;
+    (0..pages)
+        .map(|page| {
+            if page < first {
+                return Ok(0);
+            }
+            match refs.get(page as usize) {
+                Some(&slot) if slot != 0 => Ok(slot),
+                Some(_) => Err(Fault::Unbound {
+                    what: format!(
+                        "windowed page {page} of a lane holding {} tokens, which its window \
+                         still reads and the runtime has released",
+                        seat.have
+                    ),
+                }),
+                None => Err(Fault::Ceiling {
+                    what: "ring slot refs this lane stated",
+                    need: page + 1,
+                    have: refs.len() as u64,
+                }),
+            }
+        })
+        .collect()
 }
 
 fn narrow(n: u64) -> i32 {

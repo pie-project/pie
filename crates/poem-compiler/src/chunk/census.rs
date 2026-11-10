@@ -196,6 +196,24 @@ pub fn census(trace: &Trace, state_f32: bool) -> Result<Census, ChunkError> {
         out.rs.insert(row.id, rs);
         out.rs_rows.push(row);
     }
+    // A compressor keeps a token's projection and score beside the kv row
+    // its gather keys by its pages, in the same pages.
+    for (row, width) in pooled(trace) {
+        let Some(keyed) = out
+            .tokens
+            .iter()
+            .find(|r| r.id == RowId::Cache(row))
+            .cloned()
+        else {
+            continue;
+        };
+        out.tokens.push(TokenRow {
+            id: RowId::Pool(row),
+            planes: vec![width * POOL_ELEMENT; 2],
+            ratio: 1,
+            ..keyed
+        });
+    }
     Ok(out)
 }
 
@@ -235,6 +253,46 @@ fn element(name: &str, dtype: Dtype) -> Result<u64, ChunkError> {
         row: name.to_string(),
         dtype,
     })
+}
+
+/// The compressor state's element: bf16.
+const POOL_ELEMENT: u64 = 2;
+
+/// Each cache row a pool gather keys its compressor state by, and the
+/// state's width a token: the gather's head width, twice it where a ratio-4
+/// compressor overlaps two groups.
+#[must_use]
+pub fn pooled(trace: &Trace) -> Vec<(u32, u64)> {
+    let mut rows: Vec<(u32, u64)> = Vec::new();
+    for node in &trace.nodes {
+        // A gather, or one the compressor's fused op holds.
+        let gather = match &node.op {
+            Operation::Attn(a) => a,
+            Operation::Fused(poem_ir::Fused::PoolCompress { gather, .. }) => &**gather,
+            _ => continue,
+        };
+        let Attn::PoolGather {
+            pages,
+            head_dim,
+            ratio,
+            ..
+        } = gather
+        else {
+            continue;
+        };
+        let Some(Def::Cache(row)) = trace.values.get(pages.0 as usize).map(|v| &v.def) else {
+            continue;
+        };
+        let width = if *ratio == 4 { 2 } else { 1 } * u64::from(*head_dim);
+        if width == 0 {
+            continue;
+        }
+        match rows.iter_mut().find(|(held, _)| *held == *row) {
+            Some((_, held)) => *held = (*held).max(width),
+            None => rows.push((*row, width)),
+        }
+    }
+    rows
 }
 
 /// What the ops reading one row say of it.

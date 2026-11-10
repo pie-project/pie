@@ -1203,6 +1203,7 @@ impl Run<'_> {
                     *ratio,
                     slabs.state_kv,
                     slabs.state_score,
+                    slabs.stride,
                     ape.map_or(slabs.ape, |id| self.tensor(id)),
                     &mut self.tensor(*entries),
                 )
@@ -1228,6 +1229,7 @@ impl Run<'_> {
                     *ratio,
                     slabs.state_kv,
                     slabs.state_score,
+                    slabs.stride,
                 )
             }
             Attn::PoolKvAppend {

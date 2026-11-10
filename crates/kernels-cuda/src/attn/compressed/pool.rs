@@ -153,6 +153,7 @@ pub fn state_write(
     ratio: u32,
     state_kv: Tensor,
     state_score: Tensor,
+    state_stride: i64,
 ) -> Result<(), Error> {
     const OP: &str = "attn.pool_state_write";
     dtype_dispatch!(OP, kv.dtype, { Bf16 => () });
@@ -193,6 +194,7 @@ pub fn state_write(
             width.arg(),
             pages.page_size.arg(),
             pitch.arg(),
+            state_stride.arg(),
         ],
     )
 }
@@ -207,6 +209,7 @@ pub fn gather(
     ratio: u32,
     state_kv: Tensor,
     state_score: Tensor,
+    state_stride: i64,
     ape: Tensor,
     entries: &mut Tensor,
 ) -> Result<(), Error> {
@@ -275,6 +278,7 @@ pub fn gather(
                 coff.arg(),
                 pages.page_size.arg(),
                 pitch.arg(),
+                state_stride.arg(),
                 ctx.stage(),
             ],
         );
@@ -300,6 +304,7 @@ pub fn gather(
             coff.arg(),
             pages.page_size.arg(),
             pitch.arg(),
+            state_stride.arg(),
             ctx.stage(),
         ],
     )
@@ -610,6 +615,7 @@ pub fn compress(
     ratio: u32,
     state_kv: Tensor,
     state_score: Tensor,
+    state_stride: i64,
     ape: Tensor,
     weight: Tensor,
     eps: f32,
@@ -737,6 +743,7 @@ pub fn compress(
             coff.arg(),
             pages.page_size.arg(),
             count(OP, "the state plane's row pitch", pitch)?.arg(),
+            state_stride.arg(),
             state.as_ref().map_or(ArgValue::ABSENT, |s| s.kv.arg()),
             state.as_ref().map_or(ArgValue::ABSENT, |s| s.score.arg()),
             state
