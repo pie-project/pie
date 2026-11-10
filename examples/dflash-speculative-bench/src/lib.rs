@@ -145,7 +145,7 @@ fn default_system() -> String {
 struct Output {
     sampler: &'static str,
     text: String,
-    /// `text-completion-bench`'s envelope, for `scripts/bench/pie_bench.py`.
+    /// `text-completion-bench`'s envelope, for a benchmark client (pie-project/benchmarks' `pie_bench.py`).
     num_prompt_tokens: usize,
     num_output_tokens: usize,
     token_ids: Vec<u32>,

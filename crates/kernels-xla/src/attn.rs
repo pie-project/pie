@@ -1,9 +1,12 @@
+pub(crate) mod append;
 pub mod arbiter;
 pub mod dense;
+pub mod flash;
 pub mod index;
 pub mod merge;
 pub mod mla;
 pub mod paged;
+pub mod pages;
 pub mod pool;
 pub mod ragged;
 pub mod rel;

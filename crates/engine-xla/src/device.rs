@@ -345,6 +345,16 @@ impl Device {
         self.cache.lock().expect("cache lock poisoned").remove(&key);
     }
 
+    /// Whether the program of `text` is held compiled.
+    #[must_use]
+    pub fn holds(&self, text: &str) -> bool {
+        let key = *blake3::hash(text.as_bytes()).as_bytes();
+        self.cache
+            .lock()
+            .expect("cache lock poisoned")
+            .contains_key(&key)
+    }
+
     #[must_use]
     pub fn compiled(&self) -> usize {
         self.cache.lock().expect("cache lock poisoned").len()

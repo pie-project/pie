@@ -171,6 +171,10 @@ pub struct Run<'c> {
     probes: Vec<ValueId>,
     probed: std::cell::RefCell<Vec<(ValueId, kernels_xla::hlo::Val)>>,
 
+    /// The values an unweighted per-head rms norm reads, with the head width:
+    /// the projection landing one keeps the heads' sums of squares for it.
+    head_norms: Vec<(ValueId, u32)>,
+
     /// Token-declared values on a readout-rowed path, cut to the readout
     /// rows (`crate::rows`), and a readout-rowed value telling them.
     readout_rowed: (std::sync::Arc<Vec<bool>>, Option<ValueId>),
@@ -180,6 +184,10 @@ pub struct Run<'c> {
     /// than the budget, so `attn.index_topk` answers each row all of them,
     /// in order.
     pub(crate) full_selections: Vec<(ValueId, u32)>,
+
+    /// What this fire appended to each kv cache, as the append read it: a
+    /// prefill reads its own keys from it (`attn::flash`).
+    pub(crate) appended: Vec<(ValueId, kernels_xla::attn::flash::Appended)>,
     /// Routes `linear.group_routes` built (every row's slot `g` routed to
     /// group `g`), with their group count.
     pub(crate) group_routes: Vec<(ValueId, u32)>,
@@ -231,8 +239,10 @@ impl<'c> Run<'c> {
             rs: None,
             probes: Vec::new(),
             probed: std::cell::RefCell::new(Vec::new()),
+            head_norms: Vec::new(),
             readout_rowed: (std::sync::Arc::new(Vec::new()), None),
             full_selections: Vec::new(),
+            appended: Vec::new(),
             group_routes: Vec::new(),
             boundaries: Vec::new(),
             tiled: std::cell::RefCell::new(Vec::new()),
@@ -302,6 +312,19 @@ impl<'c> Run<'c> {
     pub fn with_probes(mut self, probes: Vec<ValueId>) -> Self {
         self.probes = probes;
         self
+    }
+
+    pub fn with_head_norms(mut self, head_norms: Vec<(ValueId, u32)>) -> Self {
+        self.head_norms = head_norms;
+        self
+    }
+
+    /// The head width an unweighted per-head rms norm reads `y` at.
+    pub(crate) fn head_norm_of(&self, y: ValueId) -> Option<i64> {
+        self.head_norms
+            .iter()
+            .find(|(v, _)| *v == y)
+            .map(|(_, d)| i64::from(*d))
     }
 
     pub(crate) fn probes(&self) -> &[ValueId] {

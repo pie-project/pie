@@ -78,6 +78,9 @@ pub struct Stages {
     /// The most lanes a fire seats: a stage first seen compiles for every
     /// lane rung up to it, side by side.
     pub top: u32,
+    /// The readout rows of the fire shapes the warm ladder traced
+    /// (`Shell::readouts`).
+    pub readouts: Vec<u32>,
 }
 
 /// A rung's stage as a compile thread leaves it.
@@ -130,35 +133,71 @@ impl Stages {
         if let Some(hit) = self.map.get(&slot) {
             return Ok(Arc::clone(hit));
         }
+        // Another package whose stage lowers the same (a guest's prompt
+        // reaches its package, not its sampler) compiled this one already:
+        // it is found, nothing compiles beside it.
+        let lowered =
+            lower::lower(package, at, batch.clone(), carried).map_err(|why| why.to_string())?;
+        if !lowered.layout.runs() || device.holds(&lowered.text) {
+            let staged = stage(device, package, at, batch, carried)?;
+            self.map.insert(slot, Arc::clone(&staged));
+            return Ok(staged);
+        }
         // A stage first seen compiles for every lane rung up to the fire's
         // widest, side by side: a group grows a lane at a time, and each rung
         // it reached compiled in its own turn (v6e gpt-oss c256 on a fresh
-        // VM: 26 stage programs at 1.4 s each, 35 s of a 70 s run).
+        // VM: 26 stage programs at 1.4 s each, 35 s of a 70 s run). One that
+        // reads a readout plane does so at every readout row count the fires
+        // traced too: a fire's readout rows follow its lanes, and each count
+        // first met compiled its rungs in turn (v6e Qwen3-0.6B c256: nine
+        // counts, ~2.4 s each, all inside the measured rounds).
         let top = padded(self.top as usize).max(batch.lanes);
-        let mut rungs: Vec<u32> =
-            std::iter::successors(Some(1u32), |&r| (r < top).then(|| r.saturating_mul(2)))
-                .collect();
-        if !rungs.contains(&batch.lanes) {
-            rungs.push(batch.lanes);
+        let rungs = |top: u32| -> Vec<u32> {
+            std::iter::successors(Some(1u32), |&r| (r < top).then(|| r.saturating_mul(2))).collect()
+        };
+        let mut shapes: Vec<Batch> = rungs(top)
+            .into_iter()
+            .map(|lanes| Batch {
+                lanes,
+                reads: batch.reads.clone(),
+            })
+            .collect();
+        if !shapes.contains(&batch) {
+            shapes.push(batch.clone());
+        }
+        if batch.reads.iter().any(|r| r.readout) {
+            for &rows in &self.readouts {
+                if batch.reads.iter().any(|r| r.readout && r.rows == rows) {
+                    continue;
+                }
+                let reads: Vec<Read> = (batch.reads.iter())
+                    .map(|r| Read {
+                        rows: if r.readout { rows } else { r.rows },
+                        ..r.clone()
+                    })
+                    .collect();
+                for lanes in rungs(top.min(padded(rows as usize))) {
+                    shapes.push(Batch {
+                        lanes,
+                        reads: reads.clone(),
+                    });
+                }
+            }
         }
         let threads = std::thread::available_parallelism()
             .map_or(1, |n| n.get())
-            .clamp(1, rungs.len().min(8));
+            .clamp(1, shapes.len().min(8));
         let next = std::sync::atomic::AtomicUsize::new(0);
-        let built: Vec<Built> = rungs.iter().map(|_| std::sync::Mutex::new(None)).collect();
+        let built: Vec<Built> = shapes.iter().map(|_| std::sync::Mutex::new(None)).collect();
         std::thread::scope(|scope| {
             for _ in 0..threads {
                 scope.spawn(|| {
                     loop {
                         let i = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                        let Some(&lanes) = rungs.get(i) else {
+                        let Some(shape) = shapes.get(i) else {
                             break;
                         };
-                        let rung = Batch {
-                            lanes,
-                            reads: batch.reads.clone(),
-                        };
-                        let staged = stage(device, package, at, rung, carried);
+                        let staged = stage(device, package, at, shape.clone(), carried);
                         if let Ok(mut slot) = built[i].lock() {
                             *slot = Some(staged);
                         }
@@ -167,23 +206,19 @@ impl Stages {
             }
         });
         let mut asked = None;
-        for (lanes, built) in rungs.into_iter().zip(built) {
+        for (shape, built) in shapes.into_iter().zip(built) {
             let Ok(staged) = built.into_inner().expect("a built rung").ok_or(()) else {
                 continue;
             };
             let staged = match staged {
                 Ok(staged) => staged,
-                Err(why) if lanes == batch.lanes => return Err(why),
+                Err(why) if shape == batch => return Err(why),
                 Err(_) => continue,
             };
-            let rung = Batch {
-                lanes,
-                reads: batch.reads.clone(),
-            };
-            if lanes == batch.lanes {
+            if shape == batch {
                 asked = Some(Arc::clone(&staged));
             }
-            self.map.insert((key, at, rung, carried.to_vec()), staged);
+            self.map.insert((key, at, shape, carried.to_vec()), staged);
         }
         asked.ok_or_else(|| format!("stage {at} did not compile for {} lanes", batch.lanes))
     }
@@ -218,6 +253,7 @@ pub fn batch_of(
                     name,
                     lane,
                     rows: plane.rows,
+                    readout: plane.readout,
                     layers: plane.layers,
                     width: plane.width,
                     dtype: plane.dtype,

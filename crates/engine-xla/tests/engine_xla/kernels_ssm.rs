@@ -2186,3 +2186,232 @@ fn the_committed_mamba2_lands_the_state_after_the_commit() {
     }
     assert_close(&b.read_f32(bank), &want_bank, 1e-4, 1e-3);
 }
+
+/// The chunked rule over 128-wide heads and a slot-blocked bf16 bank takes
+/// the fused Mosaic chunk kernel on a TPU (`ssm::chunk`): its rows and landed
+/// states against the XLA form's (the token walk is reported beside them),
+/// over 64-row chunks of grouped heads and 128-row chunks of one head each.
+#[test]
+fn the_fused_chunk_kernel_matches_the_xla_form() {
+    // Lanes of 70 (two chunks), 0, 5, 1 and 130 rows, then 3 padded rows;
+    // then one lane of 300 rows (three 128-row chunks) and 20 padded rows.
+    for (g, indptr, rows, lane_slot, seed) in [
+        (
+            Gdn {
+                hk: 2,
+                hv: 4,
+                dk: 128,
+                dv: 128,
+            },
+            vec![0i32, 70, 70, 75, 76, 206],
+            209usize,
+            vec![3i32, 0, 1, 4, 2],
+            35u64,
+        ),
+        (
+            Gdn {
+                hk: 16,
+                hv: 16,
+                dk: 128,
+                dv: 128,
+            },
+            vec![0i32, 300],
+            320usize,
+            vec![1i32],
+            36u64,
+        ),
+    ] {
+        fused_against_xla(&g, &indptr, rows, &lane_slot, seed);
+    }
+}
+
+fn fused_against_xla(g: &Gdn, indptr: &[i32], rows: usize, lane_slot: &[i32], seed: u64) {
+    let lanes = indptr.len() - 1;
+    let slots = lane_slot.iter().max().map_or(1, |&m| m as usize + 2);
+    let mut slot_of_row = vec![DROP; rows];
+    for l in 0..lanes {
+        for t in indptr[l]..indptr[l + 1] {
+            slot_of_row[t as usize] = lane_slot[l];
+        }
+    }
+    let mut rng = Rng(seed);
+    let (qkv, gates) = gdn_inputs(&mut rng, g, rows);
+    let bank0: Vec<f32> = rng
+        .f32s(slots * g.stride(), -0.5, 0.5)
+        .into_iter()
+        .map(round_bf16)
+        .collect();
+    let run = |kernel: bool| -> Option<(Vec<f32>, Vec<f32>)> {
+        kernels_xla::ssm::fused_chunks(Some(kernel));
+        let mut b = Bench::new();
+        let x = b.bf16(rows as u32, g.width() as u32, &qkv);
+        let ip = b.i32(indptr.len() as u32, 1, indptr);
+        let z = b.zeros(Dtype::Bf16, rows as u32, (g.hv * g.dv) as u32);
+        let gt = b.f32(rows as u32, (2 * g.hv) as u32, &gates);
+        let bank = b.bf16((slots * g.hv * g.dk) as u32, g.dv as u32, &bank0);
+        let sl = b.i32(rows as u32, 1, &slot_of_row);
+        let y = b.zeros(Dtype::F32, rows as u32, (g.hv * g.dv) as u32);
+        let p = pool(bank, sl);
+        let rt = RaggedTensor {
+            data: x,
+            indptr: ip,
+        };
+        let ran = b
+            .run(|ctx| {
+                ssm::gated_delta_chunked(
+                    ctx,
+                    rt,
+                    z,
+                    gt,
+                    &p,
+                    g.hk as u32,
+                    g.hv as u32,
+                    g.dk as u32,
+                    g.dv as u32,
+                    y,
+                )
+            })
+            .unwrap();
+        ran.then(|| (b.read_f32(y), b.read_f32(bank)))
+    };
+    let Some((y_xla, bank_xla)) = run(false) else {
+        return;
+    };
+    let (y_k, bank_k) = run(true).unwrap();
+    kernels_xla::ssm::fused_chunks(None);
+    let w = g.hv * g.dv;
+    let mut want = bank0.clone();
+    let (mut worst_x, mut worst_k) = (0f32, 0f32);
+    for l in 0..lanes {
+        let s = lane_slot[l] as usize;
+        for t in indptr[l] as usize..indptr[l + 1] as usize {
+            let yr = g.token(
+                &qkv,
+                &gates,
+                t,
+                &mut want[s * g.stride()..(s + 1) * g.stride()],
+            );
+            for ((a, b), r) in y_xla[t * w..(t + 1) * w]
+                .iter()
+                .zip(&y_k[t * w..(t + 1) * w])
+                .zip(&yr)
+            {
+                worst_x = worst_x.max((a - r).abs());
+                worst_k = worst_k.max((b - r).abs());
+            }
+        }
+    }
+    eprintln!(
+        "{} heads, {rows} rows: against the token walk, xla form worst |err| {worst_x:.3e}, fused kernel {worst_k:.3e}",
+        g.hv
+    );
+    let y_err = y_xla
+        .iter()
+        .zip(&y_k)
+        .map(|(a, b)| (a - b).abs())
+        .fold(0f32, f32::max);
+    let bank_err = bank_xla
+        .iter()
+        .zip(&bank_k)
+        .map(|(a, b)| (a - b).abs())
+        .fold(0f32, f32::max);
+    eprintln!("fused kernel against the xla form: y max |err| {y_err:.3e}, bank {bank_err:.3e}");
+    assert_close(&y_k, &y_xla, 2e-3, 1e-2);
+    assert_close(&bank_k, &bank_xla, 4e-3, 1e-2);
+}
+
+#[test]
+fn the_decode_step_kernel_matches_the_xla_form() {
+    // One to 40 lanes (five steps of eight), padding lanes on the sink as the
+    // engine routes them; Qwen3.5-0.8B's heads, then Qwen3.6-27B's.
+    let gdn = |hv| Gdn {
+        hk: 16,
+        hv,
+        dk: 128,
+        dv: 128,
+    };
+    for (hv, rows, seed) in [
+        (16, 1usize, 51u64),
+        (16, 2, 52),
+        (16, 4, 53),
+        (16, 8, 54),
+        (16, 40, 55),
+        (48, 16, 56),
+    ] {
+        step_against_xla(&gdn(hv), rows, seed);
+    }
+}
+
+fn step_against_xla(g: &Gdn, rows: usize, seed: u64) {
+    let slots = rows + 5;
+    let sink = (slots - 1) as i32;
+    let mut slot_of: Vec<i32> = (0..rows as i32).map(|l| (l * 7 + 3) % sink).collect();
+    if rows > 8 {
+        slot_of[5] = sink;
+        slot_of[rows - 2] = sink;
+    }
+    let mut rng = Rng(seed);
+    let (qkv, gates) = gdn_inputs(&mut rng, g, rows);
+    let bank0: Vec<f32> = rng
+        .f32s(slots * g.stride(), -0.5, 0.5)
+        .into_iter()
+        .map(round_bf16)
+        .collect();
+    let run = |kernel: bool| -> Option<(Vec<f32>, Vec<f32>)> {
+        kernels_xla::ssm::step_kernel(Some(kernel));
+        let mut b = Bench::new();
+        let x = b.bf16(rows as u32, g.width() as u32, &qkv);
+        let z = b.zeros(Dtype::Bf16, rows as u32, (g.hv * g.dv) as u32);
+        let gt = b.f32(rows as u32, (2 * g.hv) as u32, &gates);
+        let bank = b.bf16((slots * g.hv * g.dk) as u32, g.dv as u32, &bank0);
+        let sl = b.i32(rows as u32, 1, &slot_of);
+        let y = b.zeros(Dtype::F32, rows as u32, (g.hv * g.dv) as u32);
+        let p = pool(bank, sl);
+        let ran = b
+            .run(|ctx| {
+                ssm::gated_delta(
+                    ctx,
+                    x,
+                    z,
+                    gt,
+                    &p,
+                    g.hk as u32,
+                    g.hv as u32,
+                    g.dk as u32,
+                    g.dv as u32,
+                    y,
+                )
+            })
+            .unwrap();
+        ran.then(|| (b.read_f32(y), b.read_f32(bank)))
+    };
+    let Some((y_xla, bank_xla)) = run(false) else {
+        return;
+    };
+    let (y_k, bank_k) = run(true).unwrap();
+    kernels_xla::ssm::step_kernel(None);
+    let worst = |a: &[f32], b: &[f32]| {
+        a.iter()
+            .zip(b)
+            .map(|(x, y)| (x - y).abs())
+            .fold(0f32, f32::max)
+    };
+    let w = g.hv * g.dv;
+    let real: Vec<usize> = (0..rows).filter(|&t| slot_of[t] != sink).collect();
+    let y_of = |y: &[f32]| -> Vec<f32> {
+        real.iter()
+            .flat_map(|&t| y[t * w..(t + 1) * w].to_vec())
+            .collect()
+    };
+    let (yk, yx) = (y_of(&y_k), y_of(&y_xla));
+    // Every slot but the sink; the sink holds garbage.
+    let n = (slots - 1) * g.stride();
+    eprintln!(
+        "{} heads, {rows} lanes: step kernel against the xla form: y max |err| {:.3e}, bank {:.3e}",
+        g.hv,
+        worst(&yk, &yx),
+        worst(&bank_k[..n], &bank_xla[..n])
+    );
+    assert_close(&yk, &yx, 2e-3, 1e-2);
+    assert_close(&bank_k[..n], &bank_xla[..n], 4e-3, 1e-2);
+}

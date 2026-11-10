@@ -5,6 +5,7 @@
 //! in the handle it updates.
 #![allow(clippy::too_many_arguments)]
 
+use kernels_xla::attn::flash::Appended;
 use kernels_xla::attn::paged;
 
 use crate::emit::Ctx;
@@ -16,10 +17,21 @@ use super::lower;
 
 /// A paged attention over `pool`: `o`, and the `lse` when it has one.
 pub fn attend(ctx: &Ctx<'_>, call: Paged, pool: KvPool) -> Result<(), Error> {
+    attend_fresh(ctx, call, pool, None)
+}
+
+/// [`attend`], given what this fire appended to the pool
+/// (`paged::attend_fresh`).
+pub fn attend_fresh(
+    ctx: &Ctx<'_>,
+    call: Paged,
+    pool: KvPool,
+    appended: Option<Appended>,
+) -> Result<(), Error> {
     lower(ctx, |l| {
         let (call_v, pool_v) = call.try_map(&pool, |t| l.read(t))?;
         let tuning = l.tuning();
-        let (o, lse) = paged::attend(l.f(), call_v, pool_v, tuning)?;
+        let (o, lse) = paged::attend_fresh(l.f(), call_v, pool_v, tuning, appended)?;
         l.land(call.o, o)?;
         if let (Some(t), Some(v)) = (call.lse, lse) {
             l.land(t, v)?;
@@ -165,7 +177,8 @@ pub fn kv_append(
     pool: &KvPool,
     write_page: Tensor,
     write_offset: Tensor,
-) -> Result<(), Error> {
+) -> Result<Option<Appended>, Error> {
+    let mut read = None;
     lower(ctx, |l| {
         let wp = l.read(write_page)?;
         let wo = l.read(write_offset)?;
@@ -173,10 +186,16 @@ pub fn kv_append(
         let keys = l.read(pool.keys)?;
         let vv = l.read(v)?;
         let values = l.read(pool.values)?;
-        let (keys, values) = paged::kv_append(l.f(), kv, vv, keys, values, pool, wp, wo)?;
+        // A prompt-tall fire's rows, which its prefill may read fresh.
+        if Appended::worth(kv) {
+            read = Some(Appended::of(l.f(), kv, vv, wp, wo)?);
+        }
+        let tuning = l.tuning();
+        let (keys, values) = paged::kv_append(l.f(), kv, vv, keys, values, pool, wp, wo, tuning)?;
         l.land(pool.keys, keys)?;
         l.land(pool.values, values)
-    })
+    })?;
+    Ok(read)
 }
 
 /// Files each row of `plane` in both of `pool`'s planes.

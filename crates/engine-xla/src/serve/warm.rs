@@ -133,15 +133,30 @@ impl Shell {
                 }
             }
         }
+        // A hybrid's full fire: its prompts fill the widest rows and the lanes
+        // they pad to push it onto the top rung (v6e Qwen3.8-27B mini20 c32:
+        // 12 prompts of 2045 rows compiled mid-run, 12.7 s).
+        let top = *buckets.last().unwrap_or(&widest);
+        if hybrid && top > widest {
+            for n in [4u32, 8, 16, 32, 64] {
+                let k = n / 2 + 1;
+                if n <= lanes_cap && widest / k >= 2 {
+                    let mut lanes = vec![fresh(prefill, widest / k); k as usize];
+                    lanes[0].rows += widest % k;
+                    shapes.push(lanes);
+                }
+            }
+        }
         // Prefills beside decodes (`MIXED_HOST_RUNG` prefill lanes): every
         // decode lane rung at every row rung from 256 it fits in, and at the
         // padding rung, which a full fire's decode pads overflow into.
         let host = pad.mixed_host_rung;
-        let top = *buckets.last().unwrap_or(&widest);
         // A hybrid fires a prompt's tail behind its last whole page beside
         // the decodes: its mixed fires take every row rung.
         let least = if hybrid { pad.prefill_floor } else { 256 };
-        for &d in buckets.iter().filter(|&&d| d <= lanes_cap) {
+        // (A fire that prefills pads its decodes to `pad.rung`: a half rung of
+        // the ladder is a decode-only fire's.)
+        for &d in buckets.iter().filter(|&&d| d <= lanes_cap && pad.rung(d) == d) {
             for &b in buckets.iter().filter(|&&b| b >= least && b >= 2 * d) {
                 let rows = if b == top {
                     // A full fire: the runtime's widest rows, decodes and all.
@@ -235,7 +250,11 @@ impl Shell {
         // GiB a MiB for it and for every compile still running (one that
         // started may not have taken its memory yet). A v5e host's 47 GB
         // stopped answering at four started together.
-        let longest = texts.iter().map(|(t, _)| t.len() as u64).max().unwrap_or(0);
+        let longest = texts
+            .iter()
+            .map(|(t, _)| hold_bytes(t) >> 6)
+            .max()
+            .unwrap_or(0);
         let need = (longest * 3) << 8;
         // A compiled program held in host memory costs ~64 bytes a byte of its
         // text (0.5 GB a 9 MiB program; 65 of them 42 GB of a v5e host's 47),
@@ -273,7 +292,7 @@ impl Shell {
                         let Some((text, sig)) = texts.get(at) else {
                             break;
                         };
-                        let hold = (text.len() as u64) << 6;
+                        let hold = hold_bytes(text);
                         let kept = held
                             .fetch_update(SeqCst, SeqCst, |h| {
                                 (h + hold <= budget).then_some(h + hold)
@@ -434,4 +453,19 @@ fn available_memory() -> Option<u64> {
     let line = info.lines().find(|l| l.starts_with("MemAvailable:"))?;
     let kib: u64 = line.split_whitespace().nth(1)?.parse().ok()?;
     Some(kib << 10)
+}
+
+/// The host memory a compiled program holds: ~64 bytes a byte of its text,
+/// less its Mosaic kernels' bodies (`tpu_custom_call` configs, one HLO
+/// instruction each however long its base64), counted at their own size.
+fn hold_bytes(text: &str) -> u64 {
+    const BODY: &str = "\\22body\\22: \\22";
+    let (mut kernels, mut rest) = (0, text);
+    while let Some(at) = rest.find(BODY) {
+        let tail = &rest[at + BODY.len()..];
+        let len = tail.find("\\22").unwrap_or(tail.len());
+        kernels += len;
+        rest = &tail[len..];
+    }
+    (((text.len() - kernels) as u64) << 6) + kernels as u64
 }

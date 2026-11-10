@@ -160,9 +160,15 @@ impl Run<'_> {
                 y,
                 weight: NormWeight::None,
             } => crate::lower::lower(self.ctx(), |l| {
-                let x_v = l.read(self.tensor(*x))?;
+                let x_t = self.tensor(*x);
+                let x_v = l.read(x_t)?;
                 let o_y = self.tensor(*y);
-                let v = elemwise::norm::rmsnorm_no_scale(l.f(), x_v, *head_dim, *eps)?;
+                let v = match l.sums(x_t) {
+                    Some(s) => {
+                        elemwise::norm::rmsnorm_no_scale_from_sums(l.f(), x_v, s, *head_dim, *eps)?
+                    }
+                    None => elemwise::norm::rmsnorm_no_scale(l.f(), x_v, *head_dim, *eps)?,
+                };
                 l.land(o_y, v)
             }),
 

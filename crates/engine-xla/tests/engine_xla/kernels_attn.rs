@@ -595,11 +595,40 @@ fn a_window_walk_bounded_by_its_rows_reach_answers_the_same_bits() {
     }
 }
 
+/// A batched decode through the page-copy kernel (`kernel.attn.decode_pages`)
+/// answers the reference as the walk does.
+#[test]
+fn a_batched_decode_through_the_page_copy_kernel_answers_the_reference() {
+    let mut tuning = kernels_xla::tuning::Tuning::DEFAULT;
+    tuning.chunks.decode_pages = 8;
+    for (qh, kvh, d) in [
+        (16usize, 8usize, 128usize),
+        (8, 2, 128),
+        (8, 2, 256),
+        (8, 1, 256),
+    ] {
+        long_decode_with(qh, kvh, d, None, tuning);
+    }
+    // a sliding window's rows read only the pages their window covers
+    long_decode_with(8, 2, 128, Some(100), tuning);
+    long_decode_with(8, 2, 256, Some(512), tuning);
+}
+
 fn long_decode(qh: usize, kvh: usize, d: usize) {
     long_decode_in(qh, kvh, d, None);
 }
 
 fn long_decode_in(qh: usize, kvh: usize, d: usize, window: Option<u32>) {
+    long_decode_with(qh, kvh, d, window, kernels_xla::tuning::Tuning::DEFAULT);
+}
+
+fn long_decode_with(
+    qh: usize,
+    kvh: usize,
+    d: usize,
+    window: Option<u32>,
+    tuning: kernels_xla::tuning::Tuning,
+) {
     let mut rng = Rng(5);
     let ps = 16;
     // 64 lanes over 90 pages; lane l holds 1 + (l * 37) % 80 pages of a
@@ -615,7 +644,7 @@ fn long_decode_in(qh: usize, kvh: usize, d: usize, window: Option<u32>) {
     let n = rows.len();
     let q = rng.bf16s(n * qh * d, 1.0);
     let scale = 0.125;
-    let mut b = Bench::new();
+    let mut b = Bench::new().with_tuning(tuning);
     let kv = pool.bind(&mut b);
     let plan = fire.decode(&mut b);
     let qt = b.bf16(n as u32, (qh * d) as u32, &q);
@@ -1278,7 +1307,7 @@ fn kv_append_writes_a_prefill_by_pages() {
         let pt = bench.i32(n as u32, 1, &page);
         let ot = bench.i32(n as u32, 1, &off);
         if !bench
-            .run(|ctx| low::kv_append(ctx, kt, vt, &kv, pt, ot))
+            .run(|ctx| low::kv_append(ctx, kt, vt, &kv, pt, ot).map(|_| ()))
             .unwrap()
         {
             return;
@@ -1295,6 +1324,214 @@ fn kv_append_writes_a_prefill_by_pages() {
         }
         assert_close(&bench.read_f32(kv.keys), &want_k, 0.0, 0.0);
         assert_close(&bench.read_f32(kv.values), &want_v, 0.0, 0.0);
+    }
+}
+
+/// A prefill that appended its rows first reads them through the flash
+/// kernel when every row's keys are fresh, and walks the pool otherwise: a
+/// fire of three fresh lanes (one spanning several key blocks), a lone row
+/// and pads, plain and under a window, against the host reference; a fire
+/// with a lane that has positions before it falls back, and still matches.
+/// The fresh rows handed over are another append's (to a twin pool), so a
+/// fresh read is told from a walk by what it answers.
+#[test]
+fn a_prefill_reads_the_rows_it_appended_fresh() {
+    let mut rng = Rng(31);
+    let (qh, kvh, d, ps) = (4usize, 2usize, 128usize, 16usize);
+    let lanes: Vec<Vec<i32>> = vec![
+        (0..40).collect(),
+        (40..48).collect(),
+        (48..52).collect(),
+        (52..56).collect(),
+    ];
+    let mut pool = Pool::new(&mut rng, ps, kvh, d, 60, lanes, 40);
+    let runs = [(0, 0, 600), (1, 0, 100), (2, 0, 1), (3, 0, 51)];
+    let fire = Fire::plain(&prefill_rows(&runs, 16));
+    let rows = fire.positions.len();
+    assert_eq!(rows % 16, 0);
+    let w = kvh * d;
+    let q = rng.bf16s(rows * qh * d, 1.0);
+    let k = rng.bf16s(rows * w, 1.0);
+    let v = rng.bf16s(rows * w, 1.0);
+    let k2 = rng.bf16s(rows * w, 1.0);
+    let v2 = rng.bf16s(rows * w, 1.0);
+    let sink = (pool.slots / ps - 1) as i32;
+    let (mut page, mut off) = (Vec::new(), Vec::new());
+    for (&lane, &kp) in fire.req.iter().zip(&fire.positions) {
+        if kp < 0 {
+            page.push(sink);
+            off.push(0);
+        } else {
+            let slot = pool.slot(lane as usize, kp as usize);
+            page.push((slot / ps) as i32);
+            off.push((slot % ps) as i32);
+        }
+    }
+    let scale = 0.1;
+    let mut b = Bench::new();
+    let kv = pool.bind(&mut b);
+    let twin = pool.bind(&mut b);
+    let plan = fire.prefill(&mut b);
+    let qt = b.bf16(rows as u32, (qh * d) as u32, &q);
+    let qr = ragged(&mut b, &runs, qt);
+    let kt = b.bf16(rows as u32, w as u32, &k);
+    let vt = b.bf16(rows as u32, w as u32, &v);
+    let kt2 = b.bf16(rows as u32, w as u32, &k2);
+    let vt2 = b.bf16(rows as u32, w as u32, &v2);
+    let pt = b.i32(rows as u32, 1, &page);
+    let ot = b.i32(rows as u32, 1, &off);
+    // The same fire with lane 1 holding 20 positions before it: a walk.
+    let mut shifted = fire.positions.clone();
+    for (p, &l) in shifted.iter_mut().zip(&fire.req) {
+        if l == 1 && *p >= 0 {
+            *p += 20;
+        }
+    }
+    let old = Fire {
+        positions: shifted,
+        ..Fire::plain(&prefill_rows(&runs, 16))
+    };
+    let plan_old = old.prefill(&mut b);
+    let (mut page_old, mut off_old) = (page.clone(), off.clone());
+    for (i, (&lane, &kp)) in old.req.iter().zip(&old.positions).enumerate() {
+        if kp >= 0 {
+            let slot = pool.slot(lane as usize, kp as usize);
+            page_old[i] = (slot / ps) as i32;
+            off_old[i] = (slot % ps) as i32;
+        }
+    }
+    let pt_old = b.i32(rows as u32, 1, &page_old);
+    let ot_old = b.i32(rows as u32, 1, &off_old);
+    let wq = (qh * d) as u32;
+    let o_fresh = b.zeros(Dtype::Bf16, rows as u32, wq);
+    let o_win = b.zeros(Dtype::Bf16, rows as u32, wq);
+    let lse = b.zeros(Dtype::F32, rows as u32, qh as u32);
+    let o_old = b.zeros(Dtype::Bf16, rows as u32, wq);
+    let o_old_win = b.zeros(Dtype::Bf16, rows as u32, wq);
+    if !b
+        .run(|ctx| {
+            low::kv_append(ctx, kt, vt, &kv, pt, ot)?;
+            let read = low::kv_append(ctx, kt2, vt2, &twin, pt, ot)?;
+            let call = arbiter::prefill_lse(
+                qr, &plan, &kv, None, d as u32, kvh as u32, scale, o_fresh, lse, 1000,
+            )?;
+            low::attend_fresh(ctx, call, kv, read)?;
+            let call = arbiter::prefill(
+                qr,
+                &plan,
+                &kv,
+                Some(100),
+                d as u32,
+                kvh as u32,
+                scale,
+                o_win,
+                1000,
+            )?;
+            low::attend_fresh(ctx, call, kv, read)?;
+            // The shifted fire appends its rows to the pool itself: its
+            // lane 1 reads 20 older keys there, beside its own rows.
+            let read = low::kv_append(ctx, kt2, vt2, &kv, pt_old, ot_old)?;
+            let call = arbiter::prefill(
+                qr, &plan_old, &kv, None, d as u32, kvh as u32, scale, o_old, 1000,
+            )?;
+            low::attend_fresh(ctx, call, kv, read)?;
+            let call = arbiter::prefill(
+                qr,
+                &plan_old,
+                &kv,
+                Some(10),
+                d as u32,
+                kvh as u32,
+                scale,
+                o_old_win,
+                1000,
+            )?;
+            low::attend_fresh(ctx, call, kv, read)
+        })
+        .unwrap()
+    {
+        return;
+    }
+    let live = rows - 16;
+    let first = Pool {
+        keys: pool.keys.clone(),
+        values: pool.values.clone(),
+        lanes: pool.lanes.clone(),
+        ..pool
+    };
+    // The device pool holds the first append, then the shifted fire's.
+    for (rows_k, rows_v, pg, of) in [(&k, &v, &page, &off), (&k2, &v2, &page_old, &off_old)] {
+        for (i, &p) in pg.iter().enumerate() {
+            if p != sink {
+                let slot = p as usize * ps + of[i] as usize;
+                pool.keys[slot * w..(slot + 1) * w].copy_from_slice(&rows_k[i * w..(i + 1) * w]);
+                pool.values[slot * w..(slot + 1) * w].copy_from_slice(&rows_v[i * w..(i + 1) * w]);
+            }
+        }
+    }
+    let (want_old, _) = sdpa(
+        &q,
+        rows,
+        qh,
+        kvh,
+        d,
+        d,
+        &pool.keys,
+        &pool.values,
+        f64::from(scale),
+        &|r| old.admitted(&pool, r, 0, true),
+        &no_bias,
+        &unit,
+    );
+    check_rows(&b.read_f32(o_old), &want_old, qh * d, live, 2e-3);
+    let (want_old_win, _) = sdpa(
+        &q,
+        rows,
+        qh,
+        kvh,
+        d,
+        d,
+        &pool.keys,
+        &pool.values,
+        f64::from(scale),
+        &|r| old.admitted(&pool, r, 10, true),
+        &no_bias,
+        &unit,
+    );
+    check_rows(&b.read_f32(o_old_win), &want_old_win, qh * d, live, 2e-3);
+    // The first fire read its fresh rows as the twin's append left them.
+    let mut pool = first;
+    for (i, &p) in page.iter().enumerate() {
+        if p != sink {
+            let slot = p as usize * ps + off[i] as usize;
+            pool.keys[slot * w..(slot + 1) * w].copy_from_slice(&k2[i * w..(i + 1) * w]);
+            pool.values[slot * w..(slot + 1) * w].copy_from_slice(&v2[i * w..(i + 1) * w]);
+        }
+    }
+    for (window, o) in [(0, o_fresh), (100, o_win)] {
+        let (want, want_lse) = sdpa(
+            &q,
+            rows,
+            qh,
+            kvh,
+            d,
+            d,
+            &pool.keys,
+            &pool.values,
+            f64::from(scale),
+            &|r| fire.admitted(&pool, r, window, true),
+            &no_bias,
+            &unit,
+        );
+        check_rows(&b.read_f32(o), &want, qh * d, live, 2e-3);
+        if window == 0 {
+            assert_close(
+                &b.read_f32(lse)[..live * qh],
+                &want_lse[..live * qh],
+                2e-3,
+                1e-4,
+            );
+        }
     }
 }
 

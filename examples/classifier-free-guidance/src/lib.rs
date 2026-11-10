@@ -55,7 +55,7 @@ fn default_guidance() -> f32 {
 
 /// The report the other sampler programs answer with (`tova-attention`,
 /// `entropy-adaptive-temperature`, ...): the text, the counts, and what the
-/// rule did, as JSON `scripts/bench/pie_bench.py` can parse.
+/// rule did, as JSON a benchmark client (pie-project/benchmarks' `pie_bench.py`) can parse.
 #[derive(Serialize)]
 struct Output {
     sampler: &'static str,

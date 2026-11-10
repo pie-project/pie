@@ -67,3 +67,5 @@ Per the user's speed rule, full suites were stopped; everything marked NOT RUN s
   old row names like `pool.2`).
 - engine-cuda (sm_120): `a_conv_decoder_fires_over_a_voxel_input` ("reopened slot drifts").
 - kernels-rocm (MI300X): `linear_act_quant::a_projection_under_64_row_factors_folds_each_block` (FP8 MFMA m33).
+- engine-xla (from main #1579, identical code on origin/main c251a2914): `chip::tests::a_v6e_runs_its_file_and_the_file_is_what_it_ran_before`
+  expects `moe_gmm_run: 1`, v6e profile now gives 4.

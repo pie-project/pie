@@ -213,6 +213,8 @@ pub struct FireCost {
 pub struct Shell {
     tuning: kernels_xla::tuning::Tuning,
     pad: crate::chip::Pad,
+    /// `chip::Engine::seats`.
+    seats: [bool; 3],
     tpu: crate::chip::Tpu,
     handles: Handles,
     trace: Trace,
@@ -257,6 +259,9 @@ pub struct Shell {
     /// While the warm ladder traces (`warm.rs`): fires whose program is new
     /// are traced, kept here and not run, and compiled together after.
     deferred: Option<Vec<Deferred>>,
+    /// The readout rows of every fire shape traced, the rows a guest stage's
+    /// readout plane comes in (`Shell::readouts`).
+    readouts: std::collections::BTreeSet<u32>,
     /// Token-declared values on a readout-rowed path (`crate::rows`), and
     /// a readout-rowed value that tells their rows.
     readout_rowed: (std::sync::Arc<Vec<bool>>, Option<ValueId>),
@@ -308,6 +313,20 @@ impl Shell {
     #[must_use]
     pub fn tpu(&self) -> crate::chip::Tpu {
         self.tpu
+    }
+
+    /// The readout rows of every fire shape traced so far (the warm
+    /// ladder's, after `prewarm`): a guest stage reading a readout plane
+    /// meets each of them.
+    #[must_use]
+    pub fn readouts(&self) -> Vec<u32> {
+        self.readouts.iter().copied().collect()
+    }
+
+    /// `engine.seated_first`, `engine.seat_to_end`, `engine.seat_spread`.
+    #[must_use]
+    pub fn seats(&self) -> [bool; 3] {
+        self.seats
     }
 
     /// Loads with the voxel ladder derived from the plan (engine-cuda's
@@ -482,7 +501,8 @@ impl Shell {
         };
         let paging_at = |pages: u64, slots: u32| -> Result<Paging> {
             Ok(Paging::of(boot.page_size, boot.context, slots, pages)?
-                .windowed(window, boot.budget.max_tokens))
+                .windowed(window, boot.budget.max_tokens)
+                .seated(boot.budget.max_lanes))
         };
         // The pool buffers are program parameters, so the pages are fixed
         // before anything traces: what the budget buys, or with none what
@@ -664,6 +684,7 @@ impl Shell {
         Ok(Shell {
             tuning,
             pad,
+            seats: engine.seats,
             tpu,
             device,
             handles,
@@ -696,6 +717,7 @@ impl Shell {
             traced: std::collections::HashMap::new(),
             shaped: std::collections::HashMap::new(),
             deferred: None,
+            readouts: std::collections::BTreeSet::new(),
             readout_rowed,
         })
     }
@@ -1554,6 +1576,7 @@ impl Shell {
         let mask_enabled = inputs.raw(handles, Dtype::U8, rows, 1, enabled_bytes);
 
         let (readout_rows, readout_layout) = readout_table(&composition, lanes, real)?;
+        self.readouts.insert(readout_rows.len() as u32);
         let tokens_at = inputs.pack_offset();
         let tokens_t = inputs.i32s(handles, &tokens, 1);
         for feed in &token_feeds {
@@ -2157,6 +2180,24 @@ impl Shell {
         Ok((self.device.program(&text, sig)?, probed))
     }
 
+    /// The values a trace's unweighted per-head rms norms read, with their head
+    /// widths.
+    fn head_norms(trace: &Trace) -> Vec<(ValueId, u32)> {
+        trace
+            .nodes
+            .iter()
+            .filter_map(|n| match &n.op {
+                poem_ir::Operation::Elemwise(poem_ir::Elemwise::Rmsnorm {
+                    x,
+                    weight: poem_ir::NormWeight::None,
+                    axis: poem_ir::NormAxis::Head(d),
+                    ..
+                }) => Some((*x, *d)),
+                _ => None,
+            })
+            .collect()
+    }
+
     /// The program text of one fire's walk, and the values it probes.
     #[allow(clippy::too_many_arguments)]
     fn trace_text(
@@ -2194,7 +2235,8 @@ impl Shell {
             .with_compressor(self.pools.compressors())
             .with_rs(rs)
             .with_readout_rowed(&self.readout_rowed)
-            .with_probes(self.probes.clone());
+            .with_probes(self.probes.clone())
+            .with_head_norms(Self::head_norms(&self.trace));
             walk(
                 &self.trace,
                 &self.compiled,

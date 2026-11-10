@@ -49,7 +49,9 @@ fn refuse<T>(why: impl Into<String>) -> Lowering<T> {
 pub struct Read {
     pub name: String,
     pub lane: u32,
+    /// The fire's readout rows when `readout`, else its plane's.
     pub rows: u32,
+    pub readout: bool,
     pub layers: u32,
     pub width: u32,
     pub dtype: Dtype,
