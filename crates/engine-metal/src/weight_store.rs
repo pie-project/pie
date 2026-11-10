@@ -1,11 +1,9 @@
 use std::fs::File;
 
-use crate::device::alloc::FileWriter;
 use crate::device::{Buffer, Context, Handles};
 use crate::error::{Fault, Result};
 type Job = (u64, u64, u64);
 type Grouped = Vec<(usize, Vec<Job>)>;
-type Writes = Vec<(FileWriter, Vec<Job>)>;
 
 #[derive(Clone, Debug)]
 struct Chunk {
@@ -125,15 +123,6 @@ impl Store {
                 .write_from_file(file, &local, threads)?;
         }
         Ok(())
-    }
-
-    pub fn file_writers(&mut self, jobs: &[Job]) -> Result<Writes> {
-        let mut out = Vec::new();
-        for (at, local) in self.group(jobs)? {
-            let writer = self.chunks[at].buffer.file_writer(&local)?;
-            out.push((writer, local));
-        }
-        Ok(out)
     }
 
     #[must_use]

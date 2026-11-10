@@ -253,12 +253,6 @@ pub struct Attached {
     pub adapter_only: bool,
 }
 
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub struct FireCost {
-    pub launches: u32,
-    pub copied: u32,
-}
-
 pub struct Shell {
     tuning: kernels_metal::Tuning,
     device: Context,
@@ -293,8 +287,6 @@ pub struct Shell {
     host_rows: bool,
     rows_wanted: bool,
     nan_flags: Option<Buffer>,
-    #[allow(dead_code)]
-    facts: kv::Facts,
     page_tables: usize,
 
     patch_seat: Option<crate::inputs::PatchSeat>,
@@ -306,7 +298,6 @@ pub struct Shell {
     feeds: crate::feeds::Feeds,
 
     copies: bool,
-    last: FireCost,
     masked: poem_ir::ClassSet,
     wide: poem_ir::ClassSet,
     corrected: poem_ir::ClassSet,
@@ -1110,10 +1101,8 @@ impl PreparedLoad<'_> {
             states_mrope,
             gathers_readout,
             feeds,
-            facts,
             page_tables,
             copies: false,
-            last: FireCost::default(),
             masked,
             wide,
             adapter_fact,
@@ -1413,18 +1402,6 @@ impl Shell {
         self.pools.spill_kv(to_disk, pages, slots)
     }
 
-    pub fn park_state(&mut self, out: bool, device: &[u32], rows: &[u32]) -> Result<()> {
-        self.drain()?;
-        self.pools.park_state(out, device, rows)
-    }
-
-    /// The rs buffer's rows move with their record (amendment 8): a page
-    /// move names nothing to move.
-    pub fn park_pages(&mut self, out: bool, pages: &[u32], rows: &[u32]) -> Result<()> {
-        let _ = (out, rows);
-        refuse_pages(pages)
-    }
-
     /// As [`Shell::park_pages`].
     pub fn copy_pages(&mut self, moves: &[(u32, u32)]) -> Result<()> {
         refuse_pages(moves)
@@ -1612,11 +1589,6 @@ impl Shell {
         self.weights.warm()
     }
 
-    #[must_use]
-    pub fn weight_windows(&self) -> usize {
-        self.weights.windows()
-    }
-
     /// The kv pool's bytes with memory behind them now, and the most that
     /// ever had at once. Both equal the pool for a fixed pool.
     #[must_use]
@@ -1691,14 +1663,6 @@ impl Shell {
         self.programs.close_channel(id)
     }
 
-    pub fn program_ready(
-        &mut self,
-        instance_id: engine::InstanceId,
-    ) -> Result<Option<crate::program::Blocked>> {
-        self.fence_instances(&[instance_id])?;
-        self.programs.ready(instance_id)
-    }
-
     pub fn program_instance(
         &mut self,
         instance_id: engine::InstanceId,
@@ -1710,21 +1674,6 @@ impl Shell {
     pub fn close_program_instance(&mut self, instance_id: engine::InstanceId) -> Result<()> {
         self.fence_instances(&[instance_id])?;
         self.programs.close_instance(instance_id)
-    }
-
-    /// A pass with no forward: its prologue, if it runs on its own, then the rest.
-    pub fn fire_program(&mut self, instance_id: engine::InstanceId) -> Result<crate::Fired> {
-        self.fence_instances(&[instance_id])?;
-        if self.programs.prologue_runs(instance_id) {
-            let fired = self
-                .programs
-                .fire(&self.device, instance_id, Stage::Prologue)?;
-            if fired != crate::Fired::Committed {
-                return Ok(fired);
-            }
-        }
-        self.programs
-            .fire(&self.device, instance_id, Stage::Epilogue)
     }
 
     pub fn register_adapter(&mut self, id: u32, planes: &[AdapterPlane<'_>]) -> Result<()> {
@@ -1809,11 +1758,6 @@ impl Shell {
     }
 
     #[must_use]
-    pub fn blob_store(&self) -> &crate::blob::Store {
-        &self.blobs
-    }
-
-    #[must_use]
     pub fn adapter_slots(&self) -> &crate::adapter::Slots {
         &self.adapters
     }
@@ -1830,18 +1774,9 @@ impl Shell {
             .adapted_word(&self.corrected, bit, word)
     }
 
-    pub fn set_copies(&mut self, copies: bool) {
-        self.copies = copies;
-    }
-
     #[must_use]
     pub fn copies(&self) -> bool {
         self.copies
-    }
-
-    #[must_use]
-    pub fn last_fire(&self) -> FireCost {
-        self.last
     }
 
     #[must_use]
@@ -3251,10 +3186,6 @@ impl Shell {
                 request_of_token: &request_of_token,
             },
         )?;
-        self.last = FireCost {
-            launches: windows.launches(),
-            copied: windows.copied(),
-        };
         let boundaries = windows.packed();
 
         let staged = crate::mask::stage(&masks)?;
@@ -3862,11 +3793,6 @@ impl Shell {
                     &sink,
                     kernels_metal::Tensor::new(source, values, 1, Dtype::F32),
                     kernels_metal::Tensor::new(into, values, 1, Dtype::Bf16),
-            let sink = Sink::new(&self.device, &frame, &self.pipelines, &self.handles);
-            #[cfg(target_vendor = "apple")]
-            let sink = sink
-                .with_handoff(self.ane.as_ref().map(crate::ane::Ane::handoff))
-                .flushing_after(HEAD_LAUNCHES);
                 )
                 .map_err(crate::error::kernel)?;
             }
@@ -3936,6 +3862,11 @@ impl Shell {
         self.feed_inputs(&mut frame, p)?;
         self.land_merges(&mut frame, p)?;
         {
+            let sink = Sink::new(&self.device, &frame, &self.pipelines, &self.handles);
+            #[cfg(target_vendor = "apple")]
+            let sink = sink
+                .with_handoff(self.ane.as_ref().map(crate::ane::Ane::handoff))
+                .flushing_after(HEAD_LAUNCHES);
             let mut run = Run::new(
                 &sink,
                 &self.handles,

@@ -36,7 +36,6 @@ pub struct Weights {
     mapped: Vec<Buffer>,
     table: WeightTable,
     banks: BTreeMap<String, Bank>,
-    residue: (usize, u64),
     decoded: Vec<Buffer>,
     /// The tables the weight cache streams by their rows, each in an
     /// allocation of its own where the load lands them (the cold road), so
@@ -263,7 +262,6 @@ impl Weights {
             mapped: Vec::new(),
             table: WeightTable(weight_table, Vec::new()),
             banks: banks(trace, &places, |at| places[at].offset),
-            residue: (0, 0),
             decoded: Vec::new(),
             hosted,
             filed: BTreeMap::new(),
@@ -278,11 +276,6 @@ impl Weights {
     #[must_use]
     pub fn windows(&self) -> usize {
         self.mapped.len()
-    }
-
-    #[must_use]
-    pub fn residue(&self) -> (usize, u64) {
-        self.residue
     }
 
     pub fn register_adapter(&mut self, id: u32, planes: &[AdapterPlane<'_>]) -> Result<()> {
@@ -960,7 +953,6 @@ fn warm(
             residue_bytes,
         )));
     }
-    let residue_planes = landed.len();
 
     let map = Mapping::of(path).map_err(|why| Some(why.to_string()))?;
     for (index, param) in trace.params.iter().enumerate() {
@@ -1184,7 +1176,6 @@ fn warm(
         mapped: files,
         table: WeightTable(table, Vec::new()),
         banks: banks(trace, places, |at| seated[at]),
-        residue: (residue_planes, residue_bytes),
         decoded: Vec::new(),
         hosted,
         filed,
