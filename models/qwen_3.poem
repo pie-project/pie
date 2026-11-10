@@ -1077,6 +1077,10 @@ def decode_signs():
 # proposals. Ternary-Bonsai's weights are stored rotated, so its forward turns
 # each rotated projection's input by the same Hadamard and signs; the KV-
 # rotated geometries turn their attention's q, k and v by a Hadamard.
+# Two readings: `text` embeds each row's token; `latent` takes the row's input
+# from `latents` instead, a latent step of LatentMAS (Zou et al., ICML 2026),
+# which feeds a row's hidden state back in as the next row. Every row read out
+# exposes its normed last hidden state beside its logits.
 
 def run_moe(x, f):
     """The routed MLP: `f.top_k` of `f.experts`, plus the gated shared expert."""
@@ -1115,12 +1119,15 @@ def forward(m, inputs):
     dr = m.dflash
     if dr != None:
         switch("block_draft", ["off", "on"])
+    switch("reading", ["text", "latent"])
+    latent = switch_is("reading", "latent")
     trunk_inputs = inputs.on(~block_rows(dr)) if dr != None else inputs
 
     towered = run_tower(inputs, m.tower) if m.tower != None else None
 
     ids = inputs.tokens()
     y = ops.gather.embed(ids, m.embed, m.vocab)
+    y = merge([inputs.on(latent).input("latents", dtype.bf16, "row", m.hidden), y.on(~latent)])
 
     if towered != None:
         y = scatter(y, towered, inputs)
@@ -1157,6 +1164,7 @@ def forward(m, inputs):
         hb = arm(dr, inputs, fused, h_block, block_rows(dr))
         x = merge([hb, x])
     x = ops.gather.gather_rows(x, inputs.readout_rows())
+    output("hidden", x)
     logits = ops.linear.lm_head(x, head)
     if dr != None:
         plant_readout(dr, logits, inputs, x, block_rows(dr))

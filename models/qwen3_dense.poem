@@ -21,6 +21,7 @@ def qwen3(id, layers, **kwargs):
 
 MODELS = [
     qwen3("qwen3-0.6b", layers = 28),
+    qwen3("qwen3-4b", layers = 36),
     qwen3("qwen3-8b", layers = 36, drafters = ["mtp"]),
     qwen3("qwen3-14b", layers = 40),
     qwen3("qwen3-32b", layers = 64),
@@ -30,6 +31,8 @@ F8 = dtype.e4m3tile128a8
 
 DEPLOYMENTS = [
     deployment("qwen3-0.6b", weights = dtype.bf16, kv = dtype.bf16),
+    deployment("qwen3-4b", weights = dtype.bf16, kv = dtype.bf16),
+    deployment("qwen3-4b", weights = dtype.u4g64, kv = dtype.bf16),
     deployment("qwen3-8b", weights = dtype.bf16, kv = dtype.bf16, drafter = "mtp"),
     deployment("qwen3-8b", weights = dtype.bf16, kv = dtype.bf16),
     deployment("qwen3-8b", weights = dtype.u4g64, kv = dtype.bf16),
@@ -80,6 +83,7 @@ def dims(hidden, layers, q_heads, kv_heads, inter, tied):
 
 DIMS = {
     "qwen3-0.6b": dims(hidden = 1024, layers = 28, q_heads = 16, kv_heads = 8, inter = 3072, tied = True),
+    "qwen3-4b": dims(hidden = 2560, layers = 36, q_heads = 32, kv_heads = 8, inter = 9728, tied = True),
     "qwen3-8b": dims(hidden = 4096, layers = 36, q_heads = 32, kv_heads = 8, inter = 12288, tied = False),
     "qwen3-14b": dims(hidden = 5120, layers = 40, q_heads = 40, kv_heads = 8, inter = 17408, tied = False),
     "qwen3-32b": dims(hidden = 5120, layers = 64, q_heads = 64, kv_heads = 8, inter = 25600, tied = False),
@@ -235,6 +239,10 @@ TRANSFORMERS = [
 # k RMS-normed per head and rotated in full (neox halves), and a SwiGLU MLP.
 # A row with an adapter adds its LoRA correction to the attention's output.
 # A deployment stretched by YaRN turns its rotation at the scaled frequencies.
+# Two readings: `text` embeds each row's token; `latent` takes the row's input
+# from `latents` instead, a latent step of LatentMAS (Zou et al., ICML 2026),
+# which feeds a row's hidden state back in as the next row. Every row read out
+# exposes its normed last hidden state beside its logits.
 
 def caches(m, c):
     kv = c.kv_space(m.kv)
@@ -255,8 +263,11 @@ def tap(mtp, layer, y, fused):
     return ops.elemwise.residual_add(part, fused)
 
 def forward(m, inputs):
+    switch("reading", ["text", "latent"])
+    latent = switch_is("reading", "latent")
     positions = inputs.positions()
     y = ops.gather.embed(inputs.tokens(), m.embed, m.vocab)
+    y = merge([inputs.on(latent).input("latents", dtype.bf16, "row", m.hidden), y.on(~latent)])
     routes = inputs.adapter_routes()
     scaling = rope_scaling(m.rope)
 
@@ -272,6 +283,7 @@ def forward(m, inputs):
     y, fused = inputs.fold_layers(m.layers, (y, None), block)
     x = ops.elemwise.rmsnorm(y, m.final_norm, m.eps)
     x = ops.gather.gather_rows(x, inputs.readout_rows())
+    output("hidden", x)
     logits = ops.linear.lm_head(x, m.embed if m.head == None else m.head)
     if m.mtp != None:
         draft(m, inputs, fused, logits, scaling)
