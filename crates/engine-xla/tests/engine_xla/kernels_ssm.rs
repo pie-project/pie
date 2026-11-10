@@ -2322,62 +2322,23 @@ fn fused_against_xla(g: &Gdn, indptr: &[i32], rows: usize, lane_slot: &[i32], se
 
 #[test]
 fn the_decode_step_kernel_matches_the_xla_form() {
-    // 40 lanes (five steps of eight), two on the sink, one routed out of
-    // range; then four lanes (one step); Qwen3.5-0.8B's and Qwen3.6-27B's heads.
-    for (g, rows, seed) in [
-        (
-            Gdn {
-                hk: 16,
-                hv: 16,
-                dk: 128,
-                dv: 128,
-            },
-            40usize,
-            51u64,
-        ),
-        (
-            Gdn {
-                hk: 16,
-                hv: 16,
-                dk: 128,
-                dv: 128,
-            },
-            4,
-            52,
-        ),
-        (
-            Gdn {
-                hk: 16,
-                hv: 48,
-                dk: 128,
-                dv: 128,
-            },
-            16,
-            53,
-        ),
+    // One to 40 lanes (five steps of eight), padding lanes on the sink as the
+    // engine routes them; Qwen3.5-0.8B's heads, then Qwen3.6-27B's.
+    let gdn = |hv| Gdn {
+        hk: 16,
+        hv,
+        dk: 128,
+        dv: 128,
+    };
+    for (hv, rows, seed) in [
+        (16, 1usize, 51u64),
+        (16, 2, 52),
+        (16, 4, 53),
+        (16, 8, 54),
+        (16, 40, 55),
+        (48, 16, 56),
     ] {
-        let _ = std::panic::catch_unwind(|| step_against_xla(&g, rows, seed));
-    }
-    for rows in [1usize, 2, 8, 16] {
-        let g = Gdn {
-            hk: 16,
-            hv: 16,
-            dk: 128,
-            dv: 128,
-        };
-        let _ = std::panic::catch_unwind(|| step_against_xla(&g, rows, 60 + rows as u64));
-    }
-    for (g, rows, seed) in [(
-        Gdn {
-            hk: 16,
-            hv: 16,
-            dk: 128,
-            dv: 128,
-        },
-        40usize,
-        51u64,
-    )] {
-        step_against_xla(&g, rows, seed);
+        step_against_xla(&gdn(hv), rows, seed);
     }
 }
 
@@ -2387,10 +2348,8 @@ fn step_against_xla(g: &Gdn, rows: usize, seed: u64) {
     let mut slot_of: Vec<i32> = (0..rows as i32).map(|l| (l * 7 + 3) % sink).collect();
     if rows > 8 {
         slot_of[5] = sink;
-        slot_of[rows - 7] = DROP;
         slot_of[rows - 2] = sink;
     }
-    let real = |t: usize| slot_of[t] != DROP && slot_of[t] != sink;
     let mut rng = Rng(seed);
     let (qkv, gates) = gdn_inputs(&mut rng, g, rows);
     let bank0: Vec<f32> = rng
@@ -2431,62 +2390,28 @@ fn step_against_xla(g: &Gdn, rows: usize, seed: u64) {
     };
     let (y_k, bank_k) = run(true).unwrap();
     kernels_xla::ssm::step_kernel(None);
-    let w = g.hv * g.dv;
-    let mut want = bank0.clone();
-    let (mut worst_x, mut worst_k) = (0f32, 0f32);
-    for t in (0..rows).filter(|&t| real(t)) {
-        let s = slot_of[t] as usize;
-        let yr = g.token(
-            &qkv,
-            &gates,
-            t,
-            &mut want[s * g.stride()..(s + 1) * g.stride()],
-        );
-        for ((a, b), r) in y_xla[t * w..(t + 1) * w]
-            .iter()
-            .zip(&y_k[t * w..(t + 1) * w])
-            .zip(&yr)
-        {
-            worst_x = worst_x.max((a - r).abs());
-            worst_k = worst_k.max((b - r).abs());
-        }
-        let e = y_k[t * w..(t + 1) * w]
-            .iter()
-            .zip(&y_xla[t * w..(t + 1) * w])
-            .map(|(a, b)| (a - b).abs())
-            .fold(0f32, f32::max);
-        if e > 2e-3 {
-            eprintln!("  lane {t}: y kernel against xla {e:.3e}");
-        }
-    }
-    eprintln!(
-        "{} heads, {rows} lanes: against the token walk, xla form worst |err| {worst_x:.3e}, step kernel {worst_k:.3e}",
-        g.hv
-    );
-    // Every slot but the sink matches; the sink holds garbage.
-    let n = (slots - 1) * g.stride();
     let worst = |a: &[f32], b: &[f32]| {
         a.iter()
             .zip(b)
             .map(|(x, y)| (x - y).abs())
             .fold(0f32, f32::max)
     };
+    let w = g.hv * g.dv;
+    let real: Vec<usize> = (0..rows).filter(|&t| slot_of[t] != sink).collect();
+    let y_of = |y: &[f32]| -> Vec<f32> {
+        real.iter()
+            .flat_map(|&t| y[t * w..(t + 1) * w].to_vec())
+            .collect()
+    };
+    let (yk, yx) = (y_of(&y_k), y_of(&y_xla));
+    // Every slot but the sink; the sink holds garbage.
+    let n = (slots - 1) * g.stride();
     eprintln!(
-        "{} heads, {rows} lanes: banks against the token walk: xla form {:.3e}, step kernel {:.3e}; kernel against xla {:.3e}",
+        "{} heads, {rows} lanes: step kernel against the xla form: y max |err| {:.3e}, bank {:.3e}",
         g.hv,
-        worst(&bank_xla[..n], &want[..n]),
-        worst(&bank_k[..n], &want[..n]),
+        worst(&yk, &yx),
         worst(&bank_k[..n], &bank_xla[..n])
     );
-    for s in 0..slots - 1 {
-        let r = s * g.stride()..(s + 1) * g.stride();
-        let e = worst(&bank_k[r.clone()], &bank_xla[r]);
-        if e > 1e-2 {
-            eprintln!(
-                "  slot {s}: kernel against xla {e:.3e}, lane {:?}",
-                slot_of.iter().position(|&x| x == s as i32)
-            );
-        }
-    }
+    assert_close(&yk, &yx, 2e-3, 1e-2);
     assert_close(&bank_k[..n], &bank_xla[..n], 4e-3, 1e-2);
 }
