@@ -918,3 +918,8 @@ The `new-memory/` directory is bookkeeping and is removed before anything lands 
   admission, diagnostics); new `PlannerError::PastPool` names the split and the shortfall.
 - e2e: 768 MiB refuses s0 with the clear message; 1 GiB identical to unconstrained.
 - Follow-up: the weight cache's 8-chunk staging floor stays pinned under held (nothing streams) -> release it.
+
+### M70 — 2026-11-10: held weights pin no staging floor
+- `sc/rt3-staging` (d63f730c9): under held (off / auto that fits) the weight cache takes no staging slots and sends
+  an empty `WeightResidency.staging` (no engine needed changes). Gives back 8 chunks (144 MiB) on the MoE mini:
+  768 MiB now passes the 48 x 3,000-token script (parks 69 to host, 54 to disk), identical to unconstrained.
