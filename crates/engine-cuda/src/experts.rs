@@ -201,6 +201,9 @@ pub struct Plan {
     /// The planes left in the serving file's mapping and never read by the
     /// device in place ([`Plan::file_weights`]).
     filed: BTreeSet<usize>,
+    /// The routed banks the weight cache takes, which `device_bytes` never
+    /// counted: their experts lie in the pool, not on the weight tier.
+    pooled: BTreeSet<usize>,
 }
 
 #[derive(Debug, Clone)]
@@ -236,9 +239,9 @@ pub struct Ranking {
     floor_bytes: u64,
     sequence: Vec<GroupPlan>,
     banks: Vec<BankPlan>,
-    /// The bytes of the routed banks the weight cache takes
-    /// ([`Ranking::caching`]): on no tier this plan cuts.
-    cached_bytes: u64,
+    /// The routed banks the weight cache takes ([`Ranking::caching`]) and
+    /// each one's bytes: on no tier this plan cuts.
+    cached: Vec<(usize, u64)>,
 }
 
 impl Ranking {
@@ -304,7 +307,7 @@ impl Ranking {
             floor_bytes,
             sequence: spillable.into_iter().chain(packed).collect(),
             banks,
-            cached_bytes: 0,
+            cached: Vec::new(),
         })
     }
 
@@ -321,7 +324,7 @@ impl Ranking {
         };
         for bank in std::mem::take(&mut self.banks) {
             if cached.contains(&bank.param) {
-                self.cached_bytes += whole(&bank);
+                self.cached.push((bank.param, whole(&bank)));
             } else {
                 self.floor.push(bank.param);
                 self.floor_bytes += whole(&bank);
@@ -376,17 +379,22 @@ impl Plan {
     }
 
     pub fn cut(ranking: &Ranking, budgets: Budgets) -> Result<Plan> {
-        let full = ranking.full;
+        // The banks the weight cache takes are the pool's, not the weight
+        // tier's: no budget is charged for them.
+        let pooled: BTreeSet<usize> = ranking.cached.iter().map(|(param, _)| *param).collect();
+        let cached_bytes: u64 = ranking.cached.iter().map(|(_, bytes)| *bytes).sum();
+        let full = ranking.full.saturating_sub(cached_bytes);
         let Some(budget) = budgets.device else {
             return Ok(Plan {
                 device_bytes: full,
+                pooled,
                 ..Plan::default()
             });
         };
-        // The banks the weight cache takes are the pool's, not the budget's.
-        if budget >= full.saturating_sub(ranking.cached_bytes) {
+        if budget >= full {
             return Ok(Plan {
                 device_bytes: full,
+                pooled,
                 ..Plan::default()
             });
         }
@@ -401,15 +409,22 @@ impl Plan {
         let floor = dense + slots;
         if budget < floor {
             return Err(Fault::Residency(format!(
-                "`device_weight_budget` is {budget} bytes; this plan's REGISTERED \
-                 planes demand {dense} resident and its {} routed banks need one \
-                 expert slot each on top, which is {floor} before anything else is \
-                 seated. A registered plane is an adapter bank, written at a store \
-                 offset reserved at load, so it cannot be moved to another tier — \
-                 every OTHER dense plane in this plan can, and the budget already \
-                 gave them up. Raise it to at least \
-                 {floor}, or state `None`.",
-                found.len(),
+                "`device_weight_budget` is {budget} bytes; the planes of this plan that \
+                 cannot leave the device demand {dense} resident (its registered planes, \
+                 adapter banks written at a store offset reserved at load; and any dense \
+                 routed bank the weight cache does not stream, which stays whole){}, \
+                 which is {floor} before anything else is seated. Every OTHER dense \
+                 plane in this plan can be moved to another tier, and the budget already \
+                 gave them up. Raise it to at least {floor}, or state `None`.",
+                if found.is_empty() {
+                    String::new()
+                } else {
+                    format!(
+                        ", and the {} routed banks the plan seats itself need one expert \
+                         slot each on top",
+                        found.len()
+                    )
+                },
             )));
         }
 
@@ -467,11 +482,8 @@ impl Plan {
             "the floor check above proved one slot fits"
         );
 
-        // A cached bank's bytes come off when the load moves it off the
-        // device (`Plan::host_experts`, `Plan::file_weights`).
         let device_bytes = dense
             + seated
-            + ranking.cached_bytes
             + found
                 .iter()
                 .map(|bank| {
@@ -510,6 +522,7 @@ impl Plan {
             declared_bytes: 0,
             cached: Vec::new(),
             filed: BTreeSet::new(),
+            pooled,
         })
     }
 
@@ -542,7 +555,10 @@ impl Plan {
                 held: Held::Pinned,
             });
             self.pinned_of.insert(at);
-            self.device_bytes = self.device_bytes.saturating_sub(reserved);
+            // A bank the weight cache takes was never counted on the device.
+            if !self.pooled.contains(&at) {
+                self.device_bytes = self.device_bytes.saturating_sub(reserved);
+            }
             self.host_bytes += reserved;
             self.declared_bytes += reserved;
             freed += reserved;
@@ -581,7 +597,10 @@ impl Plan {
                 held: Held::Pinned,
             });
             self.pinned_of.insert(at);
-            self.device_bytes = self.device_bytes.saturating_sub(reserved);
+            // A bank the weight cache takes was never counted on the device.
+            if !self.pooled.contains(&at) {
+                self.device_bytes = self.device_bytes.saturating_sub(reserved);
+            }
             self.host_bytes += reserved;
             self.declared_bytes += reserved;
             freed += reserved;
@@ -654,7 +673,10 @@ impl Plan {
             if !in_place {
                 self.filed.insert(at);
             }
-            self.device_bytes = self.device_bytes.saturating_sub(reserved);
+            // A bank the weight cache takes was never counted on the device.
+            if !self.pooled.contains(&at) {
+                self.device_bytes = self.device_bytes.saturating_sub(reserved);
+            }
             self.spill_bytes += reserved;
             freed += reserved;
             if experts {
@@ -2046,15 +2068,15 @@ mod tests {
             .expect_err("a megabyte holds nothing");
         let said = why.to_string();
         assert!(
-            said.contains("REGISTERED"),
+            said.contains("cannot leave the device"),
             "the refusal names the floor: {said}"
         );
         assert!(
-            said.contains("cannot be moved to another tier"),
+            said.contains("can be moved to another tier"),
             "and says why those planes and not the others: {said}"
         );
         assert!(
-            said.contains("every OTHER dense plane in this plan can"),
+            said.contains("Every OTHER dense plane in this plan can"),
             "and that the rest already spilled: {said}"
         );
     }
