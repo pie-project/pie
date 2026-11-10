@@ -86,6 +86,11 @@
  },
  "ple": null,
  "rope": {
+  "global": {
+   "rotary_dims": 6,
+   "span": 14,
+   "theta": 1000000.0
+  },
   "rotary_dims": 14,
   "theta": 10000.0
  },

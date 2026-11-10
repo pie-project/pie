@@ -1,5 +1,5 @@
 {
- "_doc": "Every shipping wafer program config and each family's tiny. full: a catalog deployment (model), planned through the trace, over a staged prep's tiles ($BENCH_JOB/<prep>, <prefix>); tiny: a shape fixture (shapes/), its frozen tiny checkpoint ($TINY_CKPTS/<ckpt>) prepped fresh by the capture ({ckpt}, {out}, {plan} filled). preset: the family's preset (its overrides and kernel levers are the shipping program's); positions: the positions served (4096 where the staged tiles hold 4 RoPE levels); set / levers: overrides past the preset's (none ship).",
+ "_doc": "Every shipping wafer program config and each family's tiny. full: a catalog deployment (model), planned through the trace, over a staged prep's tiles ($BENCH_JOB/<prep>, <prefix>); tiny: a shape fixture (shapes/), its frozen tiny checkpoint ($TINY_CKPTS/<ckpt>) cut fresh by the capture (landed.py's params, wafer-stage's cut). preset: the family's preset (its overrides and kernel levers are the shipping program's); positions: the positions served (4096 where the staged tiles hold 4 RoPE levels); set / levers: overrides past the preset's (none ship).",
  "configs": [
   {
    "name": "q35_9b",
@@ -131,13 +131,6 @@
    "preset": "tiny-t08",
    "set": "",
    "ckpt": "small/tiny/t08/ckpt",
-   "prep": [
-    "dense/prep_dense.py",
-    "{ckpt}",
-    "{out}",
-    "{ckpt}/golden.json",
-    "{plan}"
-   ],
    "prefix": "",
    "vocab": 80,
    "levers": "",
@@ -150,13 +143,6 @@
    "preset": "tiny-t4",
    "set": "",
    "ckpt": "small/tiny/t4/ckpt",
-   "prep": [
-    "dense/prep_dense.py",
-    "{ckpt}",
-    "{out}",
-    "{ckpt}/golden.json",
-    "{plan}"
-   ],
    "prefix": "",
    "vocab": 144,
    "levers": "",
@@ -169,13 +155,6 @@
    "preset": "tiny-q3",
    "set": "",
    "ckpt": "q8/tiny/hf",
-   "prep": [
-    "dense/prep_dense.py",
-    "{ckpt}",
-    "{out}",
-    "{ckpt}/golden.json",
-    "{plan}"
-   ],
    "prefix": "",
    "vocab": 80,
    "levers": "",
@@ -188,13 +167,6 @@
    "preset": "tiny-q3-gap",
    "set": "",
    "ckpt": "q8/tiny/hfg",
-   "prep": [
-    "dense/prep_dense.py",
-    "{ckpt}",
-    "{out}",
-    "{ckpt}/golden.json",
-    "{plan}"
-   ],
    "prefix": "",
    "vocab": 80,
    "levers": "",
@@ -207,13 +179,6 @@
    "preset": "tiny-q3",
    "set": "",
    "ckpt": "llama/tiny/hf",
-   "prep": [
-    "dense/prep_dense.py",
-    "{ckpt}",
-    "{out}",
-    "{ckpt}/golden.json",
-    "{plan}"
-   ],
    "prefix": "",
    "vocab": 80,
    "levers": "",
@@ -226,13 +191,6 @@
    "preset": "tiny",
    "set": "",
    "ckpt": "gemma/tiny/hf",
-   "prep": [
-    "gemma/prep_gemma.py",
-    "{ckpt}",
-    "{out}",
-    "{ckpt}/golden.json",
-    "{plan}"
-   ],
    "prefix": "",
    "vocab": 512,
    "levers": "",
@@ -245,13 +203,6 @@
    "preset": "tiny",
    "set": "",
    "ckpt": "gemma12/tiny/s2w9",
-   "prep": [
-    "gemma12/prep_gemma12.py",
-    "{ckpt}",
-    "{out}",
-    "{ckpt}/golden.json",
-    "{plan}"
-   ],
    "prefix": "",
    "vocab": 512,
    "levers": "",
@@ -264,13 +215,6 @@
    "preset": "tiny",
    "set": "",
    "ckpt": "gptoss/tiny/ck1",
-   "prep": [
-    "gptoss/prep_gptoss.py",
-    "{ckpt}",
-    "{out}",
-    "{plan}",
-    "{ckpt}/golden.json"
-   ],
    "prefix": "",
    "vocab": 100,
    "levers": "",

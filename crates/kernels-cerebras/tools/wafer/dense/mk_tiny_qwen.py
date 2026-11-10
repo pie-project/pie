@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """dense/mk_tiny_qwen.py <outdir> <kind> : a random tiny Qwen3.5 as an HF checkpoint (bf16 safetensors + config),
 its HF f32 greedy golden (prompt 6 + 14 tokens, margins) and HF's per-head-row max logits without the
-final rms scale (golden.json "rowmax": what the chip's res rows hold), for dense/prep_dense.py + the simulator.
+final rms scale (golden.json "rowmax": what the chip's res rows hold), for the tiny cut (baseline/landed.py, wafer-stage) + the simulator.
 kind t4 : the 4B / 9B column mapping (v heads = 2 k heads, half the rows hold GDN state, Qh 4, odd Hc)
 kind t08: the 0.8B mapping (v heads = k heads, every row holds state, Dc 2 with Qh 2)"""
 import json, os, sys

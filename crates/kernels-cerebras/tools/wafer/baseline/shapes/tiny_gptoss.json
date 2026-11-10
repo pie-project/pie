@@ -51,7 +51,13 @@
  "ple": null,
  "rope": {
   "rotary_dims": 8,
-  "theta": 150000.0
+  "theta": 150000.0,
+  "yarn": {
+   "beta_fast": 32.0,
+   "beta_slow": 1.0,
+   "factor": 32.0,
+   "original": 4096
+  }
  },
  "vocab": 100
 }

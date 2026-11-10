@@ -180,6 +180,11 @@
   "width": 8
  },
  "rope": {
+  "global": {
+   "rotary_dims": 4,
+   "span": 8,
+   "theta": 1000000.0
+  },
   "rotary_dims": 8,
   "theta": 10000.0
  },

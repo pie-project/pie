@@ -3,8 +3,9 @@
 for comparing two trees (compare.py): before and after a change that must not change them.
 
 A config's directory holds:
-- plan/       wafer-compile plan's plan.json and tiling.json (the config's model or shape, preset and overrides);
-- prep/       (tiny only) the prep the tree's prep script writes from the frozen tiny checkpoint for that plan;
+- plan/       wafer-compile plan's plan.json (the config's model or shape, preset and overrides);
+- prep/       (tiny only) the cut wafer-stage makes for that plan of the frozen tiny checkpoint's params (landed.py: the
+              import contract's reading for a checkpoint no deployment imports), with the checkpoint's golden.json;
 - build/      wafer-compile build's output for the plan in compiled/ (layout/ with layout.csl and one source a PE kind, the artifact) and
               params.used (the cslc params compare.py evaluates the layout with: none, every param a literal);
 - host/       the Rust host (examples/artifact_baseline.rs: the artifact read back, ArtifactModel::open + one greedy launch
@@ -14,8 +15,8 @@ manifest.json maps every file to its sha256 (compare.py also reads a file gzippe
 keeps its big text files).
 
 Env: BENCH_JOB (staged full preps, default spatial/bench-job), TINY_CKPTS (frozen tiny checkpoints, default
-scratch/refactor/baseline/tiny_hf), ARTIFACT_BASELINE_BIN (the artifact_baseline binary) and WAFER_COMPILE (the wafer-compile
-binary; default for both: cargo build --release into $CARGO_TARGET_DIR), PY (a python with numpy for the tree's
+scratch/refactor/baseline/tiny_hf), ARTIFACT_BASELINE_BIN (the artifact_baseline binary), WAFER_COMPILE and WAFER_STAGE (the
+wafer-compile and wafer-stage binaries; default for each: cargo build --release into $CARGO_TARGET_DIR), PY (a python with numpy for the tree's
 Python tools; default this one), WAFER_TOOLS (the tree's tools/wafer; default this file's parent's parent)."""
 import hashlib, json, os, shutil, subprocess, sys
 
@@ -39,24 +40,22 @@ def sh(cmd, cwd=None, log=None):
 
 
 def binaries():
-    """artifact_baseline and wafer-compile, built unless named."""
+    """artifact_baseline, wafer-compile and wafer-stage, built unless named."""
     t = os.environ.get("CARGO_TARGET_DIR", os.path.join(CRATE, "..", "..", "target"))
-    b, g = os.environ.get("ARTIFACT_BASELINE_BIN"), os.environ.get("WAFER_COMPILE")
+    b, g, s = (os.environ.get(k) for k in ("ARTIFACT_BASELINE_BIN", "WAFER_COMPILE", "WAFER_STAGE"))
     if not b:
         sh(["cargo", "build", "-q", "--release", "-p", "engine-cerebras", "--example", "artifact_baseline"], cwd=CRATE)
         b = os.path.join(t, "release", "examples", "artifact_baseline")
     if not g:
         sh(["cargo", "build", "-q", "--release", "-p", "kernels-cerebras", "--bin", "wafer-compile"], cwd=CRATE)
         g = os.path.join(t, "release", "wafer-compile")
-    ENV["WAFER_COMPILE"] = g
-    return b, g
+    if not s:
+        sh(["cargo", "build", "-q", "--release", "-p", "engine-cerebras", "--bin", "wafer-stage"], cwd=CRATE)
+        s = os.path.join(t, "release", "wafer-stage")
+    return b, g, s
 
 
-def fill(args, **kw):
-    return [a.format(**kw) for a in args]
-
-
-def capture(c, top, B, G):
+def capture(c, top, B, G, S):
     d = os.path.join(top, c["name"])
     shutil.rmtree(d, ignore_errors=True)
     os.makedirs(d)
@@ -70,8 +69,12 @@ def capture(c, top, B, G):
     else:
         prep, prefix = os.path.join(d, "prep"), c["prefix"]
         ck = os.path.join(TINY, c["ckpt"])
-        sh([PY] + fill([os.path.join(TOOLS, c["prep"][0])] + c["prep"][1:], ckpt=ck, out=prep, plan=pl),
-           cwd=os.path.dirname(os.path.join(TOOLS, c["prep"][0])), log=os.path.join(d, "prep.log"))
+        landed = os.path.join(d, "landed.safetensors")
+        sh([PY, os.path.join(HERE, "landed.py"), ck, landed], log=os.path.join(d, "landed.log"))
+        sh([S, "--plan", os.path.join(pl, "plan.json"), "--landed", landed, "--out", prep], log=os.path.join(d, "prep.log"))
+        os.remove(landed)
+        os.remove(os.path.join(prep, "plan.json"))
+        shutil.copy(os.path.join(ck, "golden.json"), os.path.join(prep, "golden.json"))
     # the build
     b = os.path.join(d, "build")
     lev = ["--levers", c["levers"]] if c["levers"] else []
@@ -102,10 +105,10 @@ def main():
     only = set(sys.argv[2].split(",")) if len(sys.argv) > 2 else None
     cfgs = [c for c in json.load(open(os.path.join(HERE, "configs.json")))["configs"] if not only or c["name"] in only]
     os.makedirs(top, exist_ok=True)
-    B, G = binaries()
+    B, G, S = binaries()
     for c in cfgs:
         try:
-            capture(c, top, B, G)
+            capture(c, top, B, G, S)
             print(c["name"], "ok", flush=True)
         except Exception as e:
             print(c["name"], "FAILED", e, flush=True)
