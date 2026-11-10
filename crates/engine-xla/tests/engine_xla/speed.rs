@@ -16,6 +16,14 @@ fn set(name: &str, v: u32) {
     crate::common_llm::set_knob(name, v);
 }
 
+/// Loads with the warm ladder run (as a server with `prewarm` does), unless
+/// `PIE_XLA_SPEED_WARM=0`; with `PIE_XLA_WARM_STRICT=1` a fire outside the
+/// ladder fails the probe.
+fn warm() {
+    let on = std::env::var("PIE_XLA_SPEED_WARM").as_deref() != Ok("0");
+    set("PREWARM", u32::from(on));
+}
+
 fn quiet(lane: &mut engine::fire::Lane) {
     lane.readout = Readout::None;
 }
@@ -23,6 +31,7 @@ fn quiet(lane: &mut engine::fire::Lane) {
 /// Decode tok/s at `lanes` lanes, each holding `held` prompt rows.
 fn decode(name: &str, lanes: u32, held: u32, steps: u32) -> f64 {
     let context = 1024;
+    warm();
     set("SLOTS", lanes.max(4));
     set("LANES", lanes.max(8));
     set("TOKENS", (2 * lanes).max(held).max(128));
@@ -78,6 +87,7 @@ fn median(xs: &mut [f64]) -> f64 {
 /// Prefill tok/s of one `len`-token prompt.
 fn prefill(name: &str, len: u32, runs: u32) -> f64 {
     let context = (len + 64).next_power_of_two();
+    warm();
     set("SLOTS", runs + 3);
     // `runs` prompts after two warm ones, each a working set of its own
     set("LANES", 8);
