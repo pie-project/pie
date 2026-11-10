@@ -441,6 +441,9 @@ impl Engine for Vulkan {
             media_encode: false,
             device_channel_commit: false,
             rs_verbs: shell.serves_rs_verbs(),
+            // No state lands inside a fire: the runtime cuts a pass at each
+            // checkpoint and never sends `Lane::rs_snapshots` (`validate_for`
+            // refuses them), so snapshots per piece (CONTRACT-BC 16) are moot.
             rs_snapshots: 0,
             bidirectional_attention: false,
             adapter_attachments: false,
