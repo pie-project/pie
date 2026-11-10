@@ -2423,8 +2423,8 @@ fn step_against_xla(g: &Gdn, rows: usize, seed: u64) {
 fn zz_gdn_step_timing() {
     for (hv, hk) in [(16usize, 16usize), (48, 16)] {
         let g = Gdn { hk, hv, dk: 128, dv: 128 };
-        for rows in [64usize, 256] {
-            let slots = 2 * rows + 1;
+        for (rows, spare) in [(64usize, 1usize), (256, 1), (256, 3)] {
+            let slots = spare * rows + 1;
             let sink = (slots - 1) as i32;
             let slot_of: Vec<i32> = (0..rows as i32).map(|l| (l * 7 + 3) % sink).collect();
             let mut rng = Rng(77);
@@ -2450,7 +2450,7 @@ fn zz_gdn_step_timing() {
                 if let Some(t) = t {
                     let bytes = (rows * g.stride() * 2 * 2) as f64;
                     eprintln!(
-                        "gdn step timing: hv {hv} rows {rows} kernel {kernel} bufs {nb}: {:.1} us a layer ({:.0} GB/s of state in and out)",
+                        "gdn step timing: hv {hv} rows {rows} slots {slots} kernel {kernel} bufs {nb}: {:.1} us a layer ({:.0} GB/s of state in and out)",
                         t * 1e6,
                         bytes / t / 1e9
                     );
