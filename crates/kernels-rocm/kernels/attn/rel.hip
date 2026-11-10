@@ -21,7 +21,7 @@ __global__ __launch_bounds__(kRelWaves* kWave) void paged_rel(
     const i32* __restrict__ qo_indptr, const i32* __restrict__ page_indices, const i32* __restrict__ page_indptr,
     const i32* __restrict__ last_page_lens, const float* __restrict__ bias, bf16* __restrict__ o, i32 requests,
     i32 H, i32 KVH, i32 D, i32 page_size, float sm_scale, i32 window_left, i32 extent, i32 log_floor,
-    float log_alpha, const u32* __restrict__ win) {
+    float log_alpha, long long k_stride, long long v_stride, const u32* __restrict__ win) {
     constexpr int PER = kRelMaxDim / kWave;
     __shared__ float qs[kRelWaves][kRelMaxDim];
     const Window window{win};
@@ -59,7 +59,7 @@ __global__ __launch_bounds__(kRelWaves* kWave) void paged_rel(
         const int j = j0 + l;
         float s = neg_inf();
         if (j <= hi) {
-            const bf16* kr = k_pages + kv_at<HND>(pages[j / page_size], j % page_size, kv_head, 0, page_size, KVH, D);
+            const bf16* kr = k_pages + kv_at<HND>(pages[j / page_size], j % page_size, kv_head, 0, page_size, KVH, D, k_stride);
             float dot = 0.f;
             for (int d = 0; d < D; d += 8) {
                 const Pack8<bf16> kp = *reinterpret_cast<const Pack8<bf16>*>(kr + d);
@@ -87,7 +87,7 @@ __global__ __launch_bounds__(kRelWaves* kWave) void paged_rel(
         for (int jj = 0; jj < n; ++jj) {
             const float pj = __shfl(p, jj, kWave);
             const int key = j0 + jj;
-            const bf16* vr = v_pages + kv_at<HND>(pages[key / page_size], key % page_size, kv_head, 0, page_size, KVH, D);
+            const bf16* vr = v_pages + kv_at<HND>(pages[key / page_size], key % page_size, kv_head, 0, page_size, KVH, D, v_stride);
 #pragma unroll
             for (int i = 0; i < PER; ++i) {
                 const int d = l + kWave * i;

@@ -58,6 +58,46 @@ pub(crate) fn head_split(
     Ok((row / head_dim, head_dim))
 }
 
+/// Plane `plane`'s page stride (0 keys, 1 values) in its own elements, as
+/// the kernels step a typed pointer from page to page. An absent plane
+/// (no rope plane, a single-plane pool) steps by nothing.
+pub(crate) fn page_elems(op: &'static str, pool: &KvPool, plane: usize) -> Result<i64, Error> {
+    let (bytes, tensor) = match plane {
+        0 => (pool.page_stride[0], pool.keys),
+        _ => (pool.page_stride[1], pool.values),
+    };
+    if tensor.is_absent() {
+        return Ok(0);
+    }
+    let dtype = tensor.dtype;
+    let bits = dtype.bits();
+    if bits % 8 != 0 || bytes % (bits / 8) != 0 {
+        return Err(refuse(
+            op,
+            format!("a {bytes}-byte page stride is no whole number of {dtype:?} elements"),
+        ));
+    }
+    i64::try_from(bytes / (bits / 8))
+        .map_err(|_| refuse(op, format!("a {bytes}-byte page stride passes an i64")))
+}
+
+/// The page stride the key and value planes share, in their elements, for
+/// a kernel stepping both by one stride.
+pub(crate) fn shared_page_elems(op: &'static str, pool: &KvPool) -> Result<i64, Error> {
+    let keys = page_elems(op, pool, 0)?;
+    let values = page_elems(op, pool, 1)?;
+    if keys != values {
+        return Err(refuse(
+            op,
+            format!(
+                "this kernel steps keys and values by one page stride; the pool's are {keys} and \
+                 {values} elements"
+            ),
+        ));
+    }
+    Ok(keys)
+}
+
 pub(crate) fn lanes_of(op: &'static str, indptr: Tensor) -> Result<i32, Error> {
     if indptr.dtype != Dtype::I32 {
         return Err(refuse(
@@ -111,6 +151,8 @@ pub(crate) fn write_kv_to_pages(
             pool.page_size.arg(),
             kv_heads.arg(),
             head_dim.arg(),
+            page_elems(op, pool, 0)?.arg(),
+            page_elems(op, pool, 1)?.arg(),
             ctx.stage(),
         ],
     )?;
@@ -168,6 +210,7 @@ fn envelope_update_appended(
             pool.page_size.arg(),
             kv_heads.arg(),
             head_dim.arg(),
+            page_elems(op, pool, 0)?.arg(),
             ctx.stage(),
         ],
     )
@@ -218,6 +261,8 @@ pub(crate) fn write_mla_to_pages(
             pool.page_size.arg(),
             kv_lora_rank.arg(),
             rope_dim.arg(),
+            page_elems(op, pool, 0)?.arg(),
+            page_elems(op, pool, 1)?.arg(),
             ctx.stage(),
         ],
     )

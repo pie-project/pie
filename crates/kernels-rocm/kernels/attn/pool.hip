@@ -12,10 +12,20 @@
 
 namespace pie::attn {
 
-__device__ __forceinline__ long long pool_slot(const i32* __restrict__ page_indices,
-                                               const i32* __restrict__ page_indptr, int req, int pos,
-                                               int page_size) {
-    return static_cast<long long>(page_indices[page_indptr[req] + pos / page_size]) * page_size + pos % page_size;
+// Row `off` of page `page`, as an element offset: rows `pitch` elements
+// apart, a page's rows starting `stride` elements after the page before's
+// (0: right after its `page_size` rows).
+__device__ __forceinline__ long long state_at(long long page, int off, int page_size, int pitch,
+                                              long long stride) {
+    const long long pages = stride != 0 ? stride : static_cast<long long>(page_size) * pitch;
+    return page * pages + static_cast<long long>(off) * pitch;
+}
+
+// Position `pos`'s row of request `req`'s pages, as `state_at` places it.
+__device__ __forceinline__ long long pool_row(const i32* __restrict__ page_indices,
+                                              const i32* __restrict__ page_indptr, int req, int pos, int page_size,
+                                              int pitch, long long stride) {
+    return state_at(page_indices[page_indptr[req] + pos / page_size], pos % page_size, page_size, pitch, stride);
 }
 
 // --------------------------------------------------------- boundaries --
@@ -53,14 +63,16 @@ __global__ void pool_boundary_prefill(const i32* __restrict__ positions, const i
 // ------------------------------------------------------------- state --
 
 // Row i's compressor projections (kv and score, `width` each) into the
-// state slot its write page and offset name. One block per row.
+// state slot its write page and offset name, the state's pages
+// `state_stride` elements apart (0: packed). One block per row.
 __global__ void pool_state_write(const bf16* __restrict__ kv, const bf16* __restrict__ score, bf16* __restrict__ state_kv,
                                  bf16* __restrict__ state_score, const i32* __restrict__ w_page,
-                                 const i32* __restrict__ w_off, int width, int page_size, int state_pitch) {
+                                 const i32* __restrict__ w_off, int width, int page_size, int state_pitch,
+                                 long long state_stride) {
     const int i = blockIdx.x;
     const int page = w_page[i], off = w_off[i];
     if (page < 0 || off < 0 || off >= page_size) return;
-    const long long dst = (static_cast<long long>(page) * page_size + off) * state_pitch;
+    const long long dst = state_at(page, off, page_size, state_pitch, state_stride);
     const long long src = static_cast<long long>(i) * width;
     for (int d = threadIdx.x; d < width; d += blockDim.x) {
         state_kv[dst + d] = kv[src + d];
@@ -72,18 +84,19 @@ __global__ void pool_state_write(const bf16* __restrict__ kv, const bf16* __rest
 // at the boundary (two overlapping blocks when coff is 2, the earlier one
 // in the upper half of the projections), softmax-gated per column by the
 // scores (plus the absolute position embedding, when given). Positions
-// before 0 are skipped; a row that is no boundary gets zeros.
+// before 0 are skipped; a row that is no boundary gets zeros. The state's
+// pages lie `state_stride` elements apart (0: packed).
 __global__ void pool_gather_paged(const bf16* __restrict__ state_kv, const bf16* __restrict__ state_score,
                                   const float* __restrict__ ape, const i32* __restrict__ boundary_pos,
                                   const i32* __restrict__ boundary_req, const i32* __restrict__ page_indices,
                                   const i32* __restrict__ page_indptr, bf16* __restrict__ out, int head_dim, int ratio,
-                                  int coff, int page_size, int state_pitch, const u32* __restrict__ win) {
+                                  int coff, int page_size, int state_pitch, long long state_stride,
+                                  const u32* __restrict__ win) {
     // a replayed body's padded rows past the live window hold stale boundaries (a c1024 fire faulted reading them)
     const Window live{win};
     if (!live.live(blockIdx.x)) return;
     const long long c = live.plane(blockIdx.x);
     const int window = coff * ratio, width = coff * head_dim;
-    const long long pitch = state_pitch;
     const int bpos = boundary_pos[c], req = boundary_req[c];
     bf16* orow = out + c * head_dim;
     for (int d = threadIdx.x; d < head_dim; d += blockDim.x) {
@@ -96,7 +109,8 @@ __global__ void pool_gather_paged(const bf16* __restrict__ state_kv, const bf16*
             const int pos = bpos + i - (window - 1);
             if (pos < 0) continue;
             const int col = (i >= ratio ? head_dim : 0) + d;
-            const long long at = pool_slot(page_indices, page_indptr, req, pos, page_size) * pitch + col;
+            const long long at =
+                pool_row(page_indices, page_indptr, req, pos, page_size, state_pitch, state_stride) + col;
             float s = to_f32(state_score[at]);
             if (ape != nullptr) s += ape[static_cast<long long>(pos % ratio) * width + col];
             const float v = to_f32(state_kv[at]);
@@ -112,11 +126,12 @@ __global__ void pool_gather_paged(const bf16* __restrict__ state_kv, const bf16*
 
 // The mean of the index keys of a boundary's block (ratio cells ending at
 // it; cells before position 0 count as zero). A row that is no boundary
-// gets zeros. One block per row.
+// gets zeros. One block per row; the keys' pages lie `stride` elements apart.
 __global__ void index_block_mean_paged(const bf16* __restrict__ key_pages, bf16* __restrict__ out,
                                        const i32* __restrict__ boundary_pos, const i32* __restrict__ boundary_req,
                                        const i32* __restrict__ page_indices, const i32* __restrict__ page_indptr,
-                                       int head_dim, int ratio, int page_size, const u32* __restrict__ win) {
+                                       int head_dim, int ratio, int page_size, long long stride,
+                                       const u32* __restrict__ win) {
     const Window window{win};
     if (!window.live(blockIdx.x)) return;
     const long long c = window.plane(blockIdx.x);
@@ -128,27 +143,29 @@ __global__ void index_block_mean_paged(const bf16* __restrict__ key_pages, bf16*
             for (int i = 0; i < ratio; ++i) {
                 const int pos = bpos + i - (ratio - 1);
                 if (pos < 0) continue;
-                acc += to_f32(key_pages[pool_slot(page_indices, page_indptr, req, pos, page_size) * head_dim + d]);
+                acc += to_f32(key_pages[pool_row(page_indices, page_indptr, req, pos, page_size, head_dim, stride) + d]);
             }
         }
         orow[d] = from_f32<bf16>(bpos >= 0 ? acc / static_cast<float>(ratio) : 0.f);
     }
 }
 
-// A boundary row's entry into the pool cell of its position.
+// A boundary row's entry into the pool cell of its position, the pool's
+// pages `stride` elements apart.
 __global__ void pool_store_entries(const bf16* __restrict__ entries, bf16* __restrict__ pages,
                                    const i32* __restrict__ boundary_pos, const i32* __restrict__ boundary_req,
                                    const i32* __restrict__ page_indices, const i32* __restrict__ page_indptr,
-                                   int head_dim, int page_size, int div, const u32* __restrict__ win) {
+                                   int head_dim, int page_size, int div, long long stride,
+                                   const u32* __restrict__ win) {
     const Window window{win};
     if (!window.live(blockIdx.x)) return;
     const long long c = window.plane(blockIdx.x);
     if (boundary_pos[c] < 0) return;
     // A compact pool (`div` its ratio): the entry at its index, `page_size /
     // div` a page; else at the boundary's position.
-    const long long slot =
-        pool_slot(page_indices, page_indptr, boundary_req[c], boundary_pos[c] / div, page_size / div);
-    copy_row(entries + c * head_dim, pages + slot * head_dim, head_dim);
+    const long long at = pool_row(page_indices, page_indptr, boundary_req[c], boundary_pos[c] / div,
+                                  page_size / div, head_dim, stride);
+    copy_row(entries + c * head_dim, pages + at, head_dim);
 }
 
 // --------------------------------------------------------- attention --
@@ -162,7 +179,7 @@ __global__ __launch_bounds__(mla_naive::kBlock) void pool_lse_paged(
     const bf16* __restrict__ q, const bf16* __restrict__ entries, bf16* __restrict__ o, float* __restrict__ lse,
     const i32* __restrict__ positions, const i32* __restrict__ page_indices, const i32* __restrict__ page_indptr,
     const i32* __restrict__ req_of_token, const i32* __restrict__ selection, int top_k, int heads, int head_dim,
-    int ratio, int page_size, float sm_scale, int G, int compact, const u32* __restrict__ win) {
+    int ratio, int page_size, long long stride, float sm_scale, int G, int compact, const u32* __restrict__ win) {
     extern __shared__ float pool_smem[];
     const Window window{win};
     if (!window.live(blockIdx.x)) return;
@@ -174,6 +191,8 @@ __global__ __launch_bounds__(mla_naive::kBlock) void pool_lse_paged(
     const LatentKeys keys{selection != nullptr ? selection + t * top_k : nullptr,
                           page_indices + page_indptr[req],
                           compact ? page_size / ratio : page_size,
+                          stride,
+                          0,
                           compact ? 1 : ratio,
                           0,
                           selection != nullptr ? min(top_k, max(visible, 0)) : visible,

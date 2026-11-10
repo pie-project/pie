@@ -255,6 +255,7 @@ pub fn topk(
         keys.page_size.arg(),
         max_kv.arg(),
     ];
+    let page_stride = kv::page_elems(OP, keys, 0)?;
     let launch = Launch::grid([score_blocks, rows, 1], [SCORE_KEYS, 1, 1]);
     if mfma && lists.count == 0 {
         // A prefill's rows, SCORE_ROWS a block over the same keys.
@@ -281,6 +282,7 @@ pub fn topk(
                 max_kv.arg(),
                 ratio.arg(),
                 i32::from(compact).arg(),
+                page_stride.arg(),
                 ctx.stage(),
             ],
         )?;
@@ -306,6 +308,7 @@ pub fn topk(
                 i32::from(compact).arg(),
                 ArgValue::Ptr(lists.summary),
                 lists.summary_stride.arg(),
+                page_stride.arg(),
                 ctx.stage(),
             ],
         )?;
@@ -329,6 +332,7 @@ pub fn topk(
                 max_kv.arg(),
                 ratio.arg(),
                 i32::from(compact).arg(),
+                page_stride.arg(),
                 ctx.stage(),
             ],
         )?;
@@ -551,6 +555,7 @@ pub fn topk_block_max(
             max_blocks.arg(),
             top_k.arg(),
             block.arg(),
+            kv::page_elems(OP, keys, 0)?.arg(),
             ctx.stage(),
         ],
     )

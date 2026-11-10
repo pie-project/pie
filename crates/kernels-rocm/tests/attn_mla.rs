@@ -9,6 +9,7 @@
 
 mod common;
 
+use common::spread::{agrees, out};
 use common::{Gpu, KV, close_abs, close_bf16, e4m3_code, e4m3_value, round_bf16, values};
 use dtype::Dtype;
 use kernels_rocm::attn::{mla, plan};
@@ -52,6 +53,7 @@ fn pool(
         live: [0, 0],
         ..KV
     }
+    .with_packed_stride()
 }
 
 /// Page tables for `kv_lens` at `ps` tokens a page: (indices, indptr, last
@@ -344,6 +346,31 @@ fn run_dense(
     .unwrap();
     let got = gpu.read(&o);
     let got_lse = gpu.read(&lse);
+    let what = format!("mla r{rank} h{heads} rope{rope} ps{ps} w{window:?} fp8={fp8}");
+    agrees(
+        &gpu,
+        &what,
+        &[c.pool],
+        &[],
+        &[out(&o), out(&lse)],
+        |_, pools, _| {
+            let (mut o, mut lse) = (o, lse);
+            f(
+                &ctx,
+                q.q,
+                &p,
+                q.q_pe,
+                &pools[0],
+                heads as u32,
+                rank as u32,
+                scale,
+                window,
+                &mut o,
+                with_lse.then_some(&mut lse),
+            )
+            .unwrap();
+        },
+    );
     let row = heads * rank;
     let mut t = 0;
     for (r, &ql) in qo_lens.iter().enumerate() {
@@ -519,6 +546,31 @@ fn run_selected(
     .unwrap();
     let got = gpu.read(&o);
     let got_lse = gpu.read(&lse);
+    let what = format!("mla selected h{heads} rope{rope} fp8={fp8}");
+    agrees(
+        &gpu,
+        &what,
+        &[c.pool],
+        &[],
+        &[out(&o), out(&lse)],
+        |_, pools, _| {
+            let (mut o, mut lse) = (o, lse);
+            f(
+                &ctx,
+                q.q,
+                &p,
+                q.q_pe,
+                selection,
+                &pools[0],
+                heads as u32,
+                rank as u32,
+                scale,
+                &mut o,
+                Some(&mut lse),
+            )
+            .unwrap();
+        },
+    );
     let row = heads * rank;
     let mut t = 0;
     for (r, &ql) in qo_lens.iter().enumerate() {
@@ -601,6 +653,30 @@ fn the_reference_walk_takes_other_widths() {
     )
     .unwrap();
     let got = gpu.read(&o);
+    agrees(
+        &gpu,
+        "mla naive",
+        &[c.pool],
+        &[],
+        &[out(&o)],
+        |_, pools, _| {
+            let mut o = o;
+            mla::attention_prefill(
+                &ctx,
+                q.q,
+                &p,
+                q.q_pe,
+                &pools[0],
+                heads as u32,
+                rank as u32,
+                scale,
+                None,
+                &mut o,
+                None,
+            )
+            .unwrap();
+        },
+    );
     let row = heads * rank;
     let mut t = 0;
     for (r, &ql) in qo_lens.iter().enumerate() {

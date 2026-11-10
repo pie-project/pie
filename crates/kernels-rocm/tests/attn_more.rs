@@ -9,11 +9,12 @@
 
 mod common;
 
+use common::spread::{agrees, out};
 use common::{Gpu, KV, STATE, bf16s, close_abs, close_bf16, e4m3_value, indptr_of, values};
 use dtype::Dtype;
 use kernels_rocm::attn::{self, plan, selected};
 use kernels_rocm::sampling;
-use kernels_rocm::{KvPool, RaggedTensor, RecurrentPool};
+use kernels_rocm::{KvPool, RaggedTensor, RecurrentPool, Tensor};
 
 /// A bf16 NHD pool and the host keys and values it holds, [request][token]
 /// [head][d].
@@ -79,7 +80,8 @@ fn paged_cache(
         pages_in_batch: indices.len() as i32,
         live: [0, 0],
         ..KV
-    };
+    }
+    .with_packed_stride();
     Cache {
         pool,
         keys,
@@ -314,7 +316,7 @@ fn dense_attends_inside_each_segment() {
 
 // ------------------------------------------------------------ selected --
 
-#[derive(Clone, Copy, PartialEq)]
+#[derive(Clone, Copy, PartialEq, Debug)]
 enum Walk {
     Prefill,
     Decode,
@@ -395,8 +397,15 @@ fn check_selected(gpu: &Gpu, case: Sel) {
     };
     let selection = gpu.ints_shaped(&sel, total as u32, top_k * runs);
     let scale = 1.0 / (d as f32).sqrt();
-    let mut o = gpu.zeros(total as u32, hq * d, Dtype::Bf16);
-    if walk == Tiled {
+    let o = gpu.zeros(total as u32, hq * d, Dtype::Bf16);
+    let spread = |fire: &mut dyn FnMut(&KvPool, Tensor)| {
+        let what = format!("selected {walk:?} d{d} {hq}/{hk} per_head {per_head}");
+        agrees(gpu, &what, &[pool], &[], &[out(&o)], |_, pools, _| {
+            fire(&pools[0], o);
+        });
+    };
+    let got = if walk == Tiled {
+        let mut o = o;
         let device = plan::Device::probe(&ctx).unwrap();
         let int = gpu.zeros(1, 16 << 20, Dtype::F32);
         let float = gpu.zeros(1, 16 << 20, Dtype::F32);
@@ -442,18 +451,43 @@ fn check_selected(gpu: &Gpu, case: Sel) {
         .unwrap();
         assert!(took, "the tiled selected prefill refused d{d} {hq}/{hk}");
         gpu.sync();
+        let got = gpu.read(&o);
+        spread(&mut |pool, mut o| {
+            attn::prefill_selected_tiled(
+                &ctx, q, &built, selection, pool, None, d, hk, scale, ratio, per_head, &mut o,
+            )
+            .unwrap();
+        });
+        got
     } else if walk == Decode {
+        let mut o = o;
         selected::attention_decode_selected(
             &ctx, q, selection, &pool, None, d, scale, ratio, per_head, &mut o,
         )
         .unwrap();
+        let got = gpu.read(&o);
+        spread(&mut |pool, mut o| {
+            selected::attention_decode_selected(
+                &ctx, q, selection, pool, None, d, scale, ratio, per_head, &mut o,
+            )
+            .unwrap();
+        });
+        got
     } else {
+        let mut o = o;
         selected::attention_prefill_selected(
             &ctx, q, selection, &pool, None, d, hk, scale, ratio, per_head, &mut o,
         )
         .unwrap();
-    }
-    let got = gpu.read(&o);
+        let got = gpu.read(&o);
+        spread(&mut |pool, mut o| {
+            selected::attention_prefill_selected(
+                &ctx, q, selection, pool, None, d, hk, scale, ratio, per_head, &mut o,
+            )
+            .unwrap();
+        });
+        got
+    };
     let (d_, g, ratio_) = (d as usize, (hq / hk) as usize, ratio as usize);
     for r in 0..fresh.len() {
         for i in 0..fresh[r] as usize {
@@ -668,6 +702,30 @@ fn score_capture_averages_the_observed_rows_mass() {
     )
     .unwrap();
     let got = gpu.read(&scores);
+    agrees(
+        &gpu,
+        "score capture",
+        &[pool],
+        &[],
+        &[out(&scores)],
+        |_, pools, _| {
+            let mut scores = scores;
+            kernels_rocm::attn::score::capture(
+                &ctx,
+                q,
+                &built,
+                &pools[0],
+                d,
+                hk,
+                scale,
+                observe,
+                lane_offset,
+                kv_max,
+                &mut scores,
+            )
+            .unwrap();
+        },
+    );
     let (d_, g) = (d as usize, (hq / hk) as usize);
     for r in 0..n as usize {
         let kv = kv_lens[r] as usize;
@@ -990,7 +1048,8 @@ fn fused_qkv_norms_ropes_and_writes_the_kv_slot() {
                 head_stride: if hnd { i64::from(ps * d) } else { i64::from(d) },
                 layout: i32::from(hnd),
                 ..KV
-            };
+            }
+            .with_packed_stride();
             let mut q = gpu.zeros(rows, hq * d, Dtype::Bf16);
             if let Some(w) = win {
                 ctx.arm_stage(gpu.ints(&w).ptr);
@@ -1180,6 +1239,29 @@ fn check_rel(
     )
     .unwrap();
     let got = gpu.read(&o);
+    agrees(
+        gpu,
+        "relative bias walk",
+        &[pool],
+        &[],
+        &[out(&o)],
+        |_, pools, _| {
+            let mut o = o;
+            attn::rel::walk(
+                &ctx,
+                "attn.prefill",
+                q,
+                &pools[0],
+                rel,
+                window_left,
+                d,
+                hk,
+                scale,
+                &mut o,
+            )
+            .unwrap();
+        },
+    );
     let (du, g) = (d as usize, (hq / hk) as usize);
     for r in 0..fresh.len() {
         for i in 0..fresh[r] as usize {

@@ -103,6 +103,8 @@ pub fn walk(
             stated(op, rel.extent)?.arg(),
             stated(op, rel.log_floor)?.arg(),
             rel.log_alpha.arg(),
+            kv::page_elems(op, pool, 0)?.arg(),
+            kv::page_elems(op, pool, 1)?.arg(),
             ctx.stage(),
         ],
     )

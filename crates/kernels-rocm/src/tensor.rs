@@ -98,9 +98,12 @@ pub struct KvPool {
     pub live: [u32; 2],
 
     /// Bytes from a page's rows to the next page's in the key plane and in
-    /// the value plane. The HIP kernels do not read it yet: they step pages
-    /// packed ([`KvPool::packed_stride`]), and an engine refuses a pool laid
-    /// any other way ([`KvPool::packed`]) before it fires one.
+    /// the value plane: page `p`'s rows start at `keys.ptr + p *
+    /// page_stride[0]` (the plane's pointer carries its own offset inside a
+    /// page). A plane packed page after page strides
+    /// [`KvPool::packed_stride`]. The paged kernels step pages by it in the
+    /// plane's own elements, and refuse a stride that is no whole number of
+    /// them.
     pub page_stride: [u64; 2],
 }
 
@@ -125,7 +128,7 @@ impl KvPool {
         }
     }
 
-    /// Whether both planes lie page after page: what the HIP kernels read.
+    /// Whether both planes lie page after page.
     #[must_use]
     pub const fn packed(&self) -> bool {
         let packed = Self::packed_stride(self.page_size, &self.keys, &self.values);

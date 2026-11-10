@@ -119,6 +119,7 @@ pub fn qkv_fused_qknorm_rope_vnorm_write(
     if !fp8 && !crate::attn::kv::native_bf16(pool) {
         return Err(refuse(OP, "the fused write lands bf16 or e4m3 pages"));
     }
+    let stride = crate::attn::kv::shared_page_elems(OP, pool)?;
     let warped = matches!(head_dim, 64 | 128 | 256 | 512).then(|| {
         format!(
             "::pie::custom::qkv_decode_qk_norm_rope_vnorm_write_kv_warp<::pie::i32({head_dim}), false, ::pie::i32({run}), {fp8}>"
@@ -176,6 +177,7 @@ pub fn qkv_fused_qknorm_rope_vnorm_write(
                 v_scale.arg(),
                 qk_width.arg(),
                 v_width.arg(),
+                stride.arg(),
             ],
         );
     }
@@ -227,6 +229,7 @@ pub fn qkv_fused_qknorm_rope_vnorm_write(
             eps.arg(),
             v_norm.arg(),
             rotary.arg(),
+            stride.arg(),
         ],
     )
 }
@@ -334,6 +337,7 @@ pub fn q_gate_k_norm_rope_append(
             stated(OP, rotary_dim)?.arg(),
             stated(OP, span)?.arg(),
             theta.arg(),
+            crate::attn::kv::shared_page_elems(OP, pool)?.arg(),
         ],
     )?;
     Ok(true)

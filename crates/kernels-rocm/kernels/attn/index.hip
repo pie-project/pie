@@ -118,7 +118,7 @@ __global__ __launch_bounds__(256) void index_score_paged(
     const i32* __restrict__ qo_indptr, const i32* __restrict__ page_indices, const i32* __restrict__ page_indptr,
     const i32* __restrict__ last_page_lens, float* __restrict__ scores, i32 requests, i32 heads, i32 page_size,
     i32 score_stride, i32 ratio, i32 compact, float* __restrict__ summary, i32 summary_stride,
-    const u32* __restrict__ win) {
+    long long page_stride, const u32* __restrict__ win) {
     static_assert(D % 32 == 0, "a key row is whole 32-wide k pairs");
     constexpr int KP = D / 32, TILES = 4;
     __shared__ float block_scores[256];
@@ -133,22 +133,23 @@ __global__ __launch_bounds__(256) void index_score_paged(
     const int base = static_cast<int>(blockIdx.x) * 256 + 64 * w;
 
     // A compact pool holds its keys a row each, `page_size / ratio` a page;
-    // else key j sits at its group's last position.
+    // else key j sits at its group's last position. The pages lie `page_stride`
+    // elements apart.
     const int kps = compact ? page_size / ratio : page_size;
     // The tiles' key rows first: their addresses wait on nothing else.
     mfma_ab2 kr[TILES][KP];
     {
-        long long slot[TILES];
+        long long at[TILES];
 #pragma unroll
         for (int kt = 0; kt < TILES; ++kt) {
             const int j = min(base + 16 * kt + c, row.nkeys - 1);
             const int cell = compact ? j : (j + 1) * ratio - 1;
-            slot[kt] = static_cast<long long>(row.pages[cell / kps]) * kps + cell % kps;
+            at[kt] = static_cast<long long>(row.pages[cell / kps]) * page_stride + static_cast<long long>(cell % kps) * D;
         }
 #pragma unroll
         for (int kt = 0; kt < TILES; ++kt)
 #pragma unroll
-            for (int st = 0; st < KP; ++st) kr[kt][st] = load8(key_pages + slot[kt] * D + 32 * st + 8 * g);
+            for (int st = 0; st < KP; ++st) kr[kt][st] = load8(key_pages + at[kt] + 32 * st + 8 * g);
     }
     mfma_ab2 qf[NT][KP];
     float wt[NT];
@@ -214,7 +215,7 @@ __global__ __launch_bounds__(256) void index_score_rows(
     const bf16* __restrict__ q, const bf16* __restrict__ wts, const bf16* __restrict__ key_pages,
     const i32* __restrict__ qo_indptr, const i32* __restrict__ page_indices, const i32* __restrict__ page_indptr,
     const i32* __restrict__ last_page_lens, float* __restrict__ scores, i32 rows, i32 requests, i32 heads,
-    i32 page_size, i32 score_stride, i32 ratio, i32 compact, const u32* __restrict__ win) {
+    i32 page_size, i32 score_stride, i32 ratio, i32 compact, long long page_stride, const u32* __restrict__ win) {
     static_assert(D % 32 == 0 && TT <= 256, "a key row is whole 32-wide k pairs; a thread a row");
     constexpr int KP = D / 32, TILES = 4, H = 16 * NT, QE = H * D;  // a row's query elements
     constexpr int QC = QE / 8 / 256;                                // 16-byte chunks a thread a row
@@ -298,9 +299,10 @@ __global__ __launch_bounds__(256) void index_score_rows(
                 for (int kt = 0; kt < TILES; ++kt) {
                     const int j = min(base + 16 * kt + c, nreq - 1);
                     const int cell = compact ? j : (j + 1) * ratio - 1;
-                    const long long slot = static_cast<long long>(pages[cell / kps]) * kps + cell % kps;
+                    const long long at =
+                        static_cast<long long>(pages[cell / kps]) * page_stride + static_cast<long long>(cell % kps) * D;
 #pragma unroll
-                    for (int st = 0; st < KP; ++st) kr[kt][st] = load8(key_pages + slot * D + 32 * st + 8 * g);
+                    for (int st = 0; st < KP; ++st) kr[kt][st] = load8(key_pages + at + 32 * st + 8 * g);
                 }
             }
             mfma_ab2 qf[NT][KP];
@@ -351,7 +353,7 @@ __global__ __launch_bounds__(256) void index_score_any(
     const bf16* __restrict__ q, const bf16* __restrict__ wts, const bf16* __restrict__ key_pages,
     const i32* __restrict__ qo_indptr, const i32* __restrict__ page_indices, const i32* __restrict__ page_indptr,
     const i32* __restrict__ last_page_lens, float* __restrict__ scores, i32 requests, i32 heads, i32 head_dim,
-    i32 page_size, i32 score_stride, i32 ratio, i32 compact, const u32* __restrict__ win) {
+    i32 page_size, i32 score_stride, i32 ratio, i32 compact, long long page_stride, const u32* __restrict__ win) {
     const Window window{win};
     const int t = blockIdx.y;
     if (!window.live(t)) return;
@@ -362,7 +364,8 @@ __global__ __launch_bounds__(256) void index_score_any(
     if (j >= row.nkeys) return;
     const int kps = compact ? page_size / ratio : page_size;
     const int cell = compact ? j : (j + 1) * ratio - 1;
-    const bf16* kj = key_pages + (static_cast<long long>(row.pages[cell / kps]) * kps + cell % kps) * head_dim;
+    const bf16* kj = key_pages + static_cast<long long>(row.pages[cell / kps]) * page_stride +
+                     static_cast<long long>(cell % kps) * head_dim;
     const bf16* qi = q + t_row * heads * head_dim;
     float acc = 0.f;
     for (int h = 0; h < heads; ++h) {
@@ -839,7 +842,8 @@ __global__ __launch_bounds__(256) void index_topk_block_max(
     const bf16* __restrict__ idx_q, const bf16* __restrict__ key_pages, const i32* __restrict__ qo_indptr,
     const i32* __restrict__ page_indices, const i32* __restrict__ page_indptr,
     const i32* __restrict__ last_page_lens, float* __restrict__ scores, i32* __restrict__ selection, i32 requests,
-    i32 H, i32 D, i32 page_size, i32 score_stride, i32 topk, i32 block, const u32* __restrict__ win) {
+    i32 H, i32 D, i32 page_size, i32 score_stride, i32 topk, i32 block, long long page_stride,
+    const u32* __restrict__ win) {
     constexpr int kWaves = 256 / kWave;
     __shared__ float qs[kBlockMaxHeads * kBlockMaxDim];
     const Window window{win};
@@ -878,7 +882,8 @@ __global__ __launch_bounds__(256) void index_topk_block_max(
         for (int h = 0; h < kBlockMaxHeads; ++h) best[h] = neg_inf();
         const int lo = b * block, hi = min(lo + block, abs_q + 1);
         for (int j = lo + l; j < hi; j += kWave) {
-            const bf16* kj = key_pages + (static_cast<long long>(pages[j / page_size]) * page_size + j % page_size) * D;
+            const bf16* kj = key_pages + static_cast<long long>(pages[j / page_size]) * page_stride +
+                             static_cast<long long>(j % page_size) * D;
             float dot[kBlockMaxHeads];
 #pragma unroll
             for (int h = 0; h < kBlockMaxHeads; ++h) dot[h] = 0.f;
