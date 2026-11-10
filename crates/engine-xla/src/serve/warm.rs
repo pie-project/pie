@@ -120,13 +120,16 @@ impl Shell {
             shapes.push(vec![fresh(prefill, b - 1)]);
             for n in [4u32, 8, 16, 32, 64] {
                 // A hybrid's prompts, cut at their last whole page, fire many
-                // and short.
+                // and short; so do a load's whose lanes stop short of a wide
+                // fire's 64, from 2048 rows (v6e gpt-oss c32: 16 prompts of
+                // 2893 rows).
+                let narrow = max_lanes < 64 && n == 32 && b >= 2048 && n <= max_lanes;
                 let shown = if hybrid {
                     b / n >= 2
                 } else {
                     n <= 8 && b >= 64
                 };
-                if shown && n <= lanes_cap {
+                if (shown && n <= lanes_cap) || (!hybrid && narrow) {
                     // `n - 1` lanes and the padding lane the rest takes (two
                     // or three lanes pad to four).
                     shapes.push(vec![fresh(prefill, b / n); (n - 1) as usize]);
@@ -175,18 +178,52 @@ impl Shell {
                 shapes.push(lanes);
                 // A fire this wide holds many prompts beside its decodes: their
                 // lanes pad to 32 or 64 (v6e gpt-oss c256 at 4096-row fires:
-                // 27 prompts and a decode compiled mid-run, twice, 48 s).
-                // (From 4096-row fires: what a narrower fire's short prompts
-                // take compiles on demand.)
+                // 27 prompts and a decode compiled mid-run, twice, 48 s), and
+                // from 2048 rows beside a few decodes, as a burst of prompts
+                // meets them (v6e gpt-oss c256: 18 prompts of 2857 rows and a
+                // decode). (From 4096-row fires: what a narrower fire's short
+                // prompts take compiles on demand.)
                 if b >= widest && widest >= 4096 {
                     for n in [17u32, 33] {
                         let each = rows / n;
                         if each >= 2 && d + 2 * n <= self.budgets.tokens.max_lanes {
                             let mut lanes = vec![fresh(decode, 1); d as usize];
                             lanes.extend(std::iter::repeat_n(fresh(prefill, each), n as usize));
+                            // A full fire's prompts fill the widest rows, and the
+                            // lanes they pad to push it onto the top rung (v6e
+                            // gpt-oss c256: 27 prompts and a decode, 4224 rows,
+                            // compiled mid-run, 25 s).
+                            if b == top && top > widest {
+                                lanes[d as usize].rows += rows % n;
+                            }
                             shapes.push(lanes);
                         }
                     }
+                }
+            }
+        }
+        // A full fire's many prompts beside more decodes than the lanes they
+        // leave hold at the decodes' rung: the decodes pad to the lanes left
+        // (`canonical_pads`), at the widest rows and the top (v6e gpt-oss
+        // c256: 17 prompts beside 239 decodes compiled mid-run, 23 s).
+        if widest >= 4096 && top > widest {
+            for h in [32u32, 64, 128] {
+                let left = max_lanes.saturating_sub(h);
+                // The fewest decodes whose rung passes the lanes left.
+                let mut below = 1;
+                while pad.next(below) <= left {
+                    below = pad.next(below);
+                }
+                let (d, n) = (below + 1, h / 2);
+                if d > left || d + n > lanes_cap {
+                    continue;
+                }
+                let ones = (left - d) + (h - 1 - n);
+                for rows in [widest / 2, widest - d - ones] {
+                    let mut lanes = vec![fresh(decode, 1); d as usize];
+                    lanes.extend(std::iter::repeat_n(fresh(prefill, rows / n), n as usize));
+                    lanes[d as usize].rows += rows % n;
+                    shapes.push(lanes);
                 }
             }
         }
