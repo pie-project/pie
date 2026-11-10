@@ -769,6 +769,23 @@ impl SlotPool {
         state.partial_free + u64::from(chunks) * u64::from(state.spc())
     }
 
+    /// Whether every `(shape, slots)` of `needs` could be taken at once:
+    /// each shape's partly filled chunks first, then free chunks, which the
+    /// shapes share.
+    pub fn fits(&self, needs: &[(ShapeId, u64)]) -> bool {
+        let room = u64::from(self.open.count.min(self.headroom()));
+        let mut chunks = 0u64;
+        for &(shape, slots) in needs {
+            let Some(state) = self.shapes.get(shape as usize) else {
+                return slots == 0;
+            };
+            chunks += slots
+                .saturating_sub(state.partial_free)
+                .div_ceil(u64::from(state.spc()));
+        }
+        chunks <= room
+    }
+
     pub fn shape_demand(&self, shape: ShapeId) -> ShapeDemand {
         self.shapes
             .get(shape as usize)
