@@ -11,6 +11,10 @@
 //! Entries follow the kernels-slang surface (module path, name, arguments) and
 //! the backends' shared numerics rules: compute in f32, round at the write,
 //! refuse rather than approximate.
+//!
+//! [`spatial`] is the other half: the role-split wafer program's build (a plan
+//! to the floor, links, kernels and weight bindings of a whole-wafer program,
+//! `programs/split`), which the engine places and drives.
 
 pub mod attn;
 pub mod conv;
@@ -24,6 +28,7 @@ pub mod linear;
 pub mod phase;
 pub mod plan;
 pub mod sampling;
+pub mod spatial;
 pub mod ssm;
 pub mod tensor;
 

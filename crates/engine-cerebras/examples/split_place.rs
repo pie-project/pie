@@ -8,9 +8,9 @@ use std::io::Write;
 
 use engine_cerebras::sdk::{self, DataType, Order, Rect};
 use engine_cerebras::spatial::device::Device;
-use engine_cerebras::spatial::split::emit::meta::Meta;
-use engine_cerebras::spatial::split::program::Program;
-use engine_cerebras::spatial::split::{SplitSpec, weights};
+use engine_cerebras::spatial::split::{SplitSpec, place};
+use kernels_cerebras::spatial::emit::meta::Meta;
+use kernels_cerebras::spatial::program::Program;
 use sha2::{Digest, Sha256};
 
 struct Log(std::io::BufWriter<std::fs::File>);
@@ -109,6 +109,6 @@ fn main() {
     let mut log = Log(std::io::BufWriter::new(
         std::fs::File::create(&a[4]).unwrap(),
     ));
-    weights::place(&mut log, &prog, &spec.prep, &spec.prefix).unwrap();
+    place::place(&mut log, &prog, &spec.prep, &spec.prefix).unwrap();
     eprintln!("placed {:.1} s", t0.elapsed().as_secs_f64());
 }

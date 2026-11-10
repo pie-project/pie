@@ -3,7 +3,7 @@ name = "kernels-cerebras"
 version.workspace = true
 edition = "2024"
 authors = ["In Gim <in.gim@icloud.com>"]
-description = "Cerebras kernels: the CSL kernel library, with a census naming every kernel and its argument formats, and per-op entries that emit device work (phases of kernel calls over placed buffers). The engine owns where data lives and when it runs."
+description = "Cerebras kernels: the CSL kernel library, with a census naming every kernel and its argument formats, and per-op entries that emit device work (phases of kernel calls over placed buffers); and the role-split wafer program's build (plan, blocks, floor, fabric, kernel ABI, weight bindings). The engine owns where data lives and when it runs."
 license = "Apache-2.0"
 repository = "https://github.com/pie-project/pie"
 
@@ -13,6 +13,8 @@ path = "src/lib.rs"
 
 [dependencies]
 dtype = { package = "pie-dtype", path = "../dtype" }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1"
 
 [lints]
 workspace = true

@@ -2,7 +2,7 @@
 //! `SplitModel::open` places (every PE's words of every symbol, rcfg in full),
 //! the calls it makes, the values it derives, and one greedy launch's host
 //! traffic. Two runs (before and after a change) compare file for file
-//! (`tools/split/baseline`).
+//! (`crates/kernels-cerebras/tools/split/baseline`).
 //!
 //! `split_baseline <prep dir> <prefix> <overrides k=v,...> <vocab> <out dir>`
 //!

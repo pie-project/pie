@@ -8,10 +8,10 @@
 //! (no cmaddr: the simulator).
 
 use engine_cerebras::sdk::{Platform, Runtime, Sdk, Simulator, Target};
-use engine_cerebras::spatial::split::emit::host::HostLayout;
-use engine_cerebras::spatial::split::emit::meta::Meta;
-use engine_cerebras::spatial::split::program::Program;
 use engine_cerebras::spatial::split::{SplitModel, SplitSpec, argmax};
+use kernels_cerebras::spatial::emit::host::HostLayout;
+use kernels_cerebras::spatial::emit::meta::Meta;
+use kernels_cerebras::spatial::program::Program;
 
 fn f16(h: u16) -> f32 {
     let s = if h >> 15 == 1 { -1.0 } else { 1.0 };

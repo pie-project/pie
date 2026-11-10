@@ -1,9 +1,6 @@
-//! The role-split wafer program (`csl/split`: Qwen3.5, Qwen3, Gemma 4, gpt-oss; one sequence) in
-//! process: the layered build of its geometry and placement (`ARCHITECTURE.md`: a [`family`]'s
-//! [`plan`] and [`block`]s -> [`floor`] -> [`wiring`] -> [`fabric`]; the kernels' [`abi`] and
-//! [`kernels`]; [`emit`], [`weights`]) and
-//! the model the engine drives ([`SplitModel`]): tokens at positions, a launch of S passes, the
-//! wafer token loop's out-token ring.
+//! The role-split wafer program in process ([`SplitModel`]): tokens at positions, a launch of S
+//! passes, the wafer token loop's out-token ring. The program's build (its plan, blocks, floor,
+//! fabric, kernels and bindings) is `kernels_cerebras::spatial`; [`place`] places it.
 //!
 //! The program keeps one sequence's KV and GDN state on the wafer, by
 //! position; a pass at position 0 starts a new sequence (the kernels zero
@@ -15,25 +12,15 @@
 //! the prep step from the checkpoint) and the geometry's overrides (the
 //! build's `G2`, `WL`, `CAP`).
 
-pub mod abi;
-pub mod block;
-pub mod emit;
-pub mod fabric;
-pub mod family;
-pub mod floor;
-pub mod kernels;
-pub mod npy;
-pub mod plan;
-pub mod program;
-pub mod role;
-pub mod weights;
-pub mod wiring;
+pub mod place;
 
 use std::path::{Path, PathBuf};
 
+use kernels_cerebras::spatial::npy::Npy;
+use kernels_cerebras::spatial::{emit, floor, program};
+
 use super::device::Device;
 use crate::sdk::Rect;
-use npy::Npy;
 
 type R<T> = std::result::Result<T, String>;
 
@@ -130,7 +117,7 @@ enum Embed {
 impl SplitModel {
     /// Places the prep on `dev` (a loaded, running program) and runs init: the meta's
     /// [`program::Program`] (any family, `ARCHITECTURE.md`), placed by its bindings
-    /// ([`weights::place`]), the host's map of it ([`emit::host::HostLayout`]).
+    /// ([`place::place`]), the host's map of it ([`emit::host::HostLayout`]).
     pub fn open(mut dev: Box<dyn Device>, spec: &SplitSpec, vocab: usize) -> R<SplitModel> {
         let t0 = std::time::Instant::now();
         let meta = emit::meta::Meta {
@@ -146,7 +133,7 @@ impl SplitModel {
             "split: program built"
         );
         let t1 = std::time::Instant::now();
-        weights::place(dev.as_mut(), &prog, &spec.prep, &spec.prefix)?;
+        place::place(dev.as_mut(), &prog, &spec.prep, &spec.prefix)?;
         tracing::info!(s = t1.elapsed().as_secs_f64(), "split: placed");
         dev.call("init", &[]).map_err(|e| format!("init: {e}"))?;
         // A launch can return before every PE ran it: a read from every PE
