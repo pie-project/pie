@@ -335,3 +335,36 @@ fn an_uncuttable_row_past_every_binding_is_refused() {
     );
     assert!(matches!(refused, Err(ChunkError::Uncuttable { .. })));
 }
+
+#[test]
+fn a_packed_kv_row_takes_its_stored_bytes_a_token() {
+    // KvU4 packs a head of `head_dim` to `head_dim / 2 + 2` bytes; with no
+    // head_dim stated, the codec's 256-wide anchor (130 bytes); a
+    // block-scaled row is declared in its own bytes.
+    let u4 = |head_dim| CacheRow::Kv {
+        name: "kv.0".to_string(),
+        planes: vec![1024, 1024],
+        dtype: Dtype::KvU4,
+        space: 0,
+        window: None,
+        head_dim,
+        live: None,
+        shard: Shard::Replicated,
+        rows: None,
+    };
+    let rows = CacheRow::Kv {
+        name: "kv.1".to_string(),
+        planes: vec![584],
+        dtype: Dtype::U8,
+        space: 0,
+        window: None,
+        head_dim: 512,
+        live: None,
+        shard: Shard::Replicated,
+        rows: Some(poem_ir::KvRows::V4),
+    };
+    for (row, want) in [(u4(128), 2 * 8 * 66), (u4(0), 2 * 4 * 130), (rows, 584)] {
+        let census = census::census(&trace(vec![row]), false).unwrap();
+        assert_eq!(census.tokens[0].per_token(), want);
+    }
+}

@@ -6,7 +6,7 @@ use poem_compiler::chunk::{
     TOKEN_GRAIN, human,
 };
 use poem_compiler::{Budget, Budgets, DeviceProfile};
-use poem_ir::{CacheRow, Platform, Trace};
+use poem_ir::{CacheRow, Dtype, Platform, Trace};
 
 const PRESETS: [(&str, ChunkProfile); 2] = [
     ("server-cuda", ChunkProfile::SERVER_CUDA),
@@ -158,6 +158,33 @@ fn wrongs(trace: &Trace, recipe: &ChunkRecipe) -> Vec<String> {
         SlotLayout::Fixed { rows, .. } => rows.as_slice(),
         _ => &[],
     });
+    // Every rs row lies in the same record slots, cut alike, and the
+    // recipe says what it buffers, its planes filling its tokens.
+    let rs: Vec<_> = fixed
+        .iter()
+        .filter(|r| matches!(r.row, RowId::Rs(_)))
+        .collect();
+    if rs
+        .windows(2)
+        .any(|w| (&w[0].slots, w[0].atoms_per_piece) != (&w[1].slots, w[1].atoms_per_piece))
+    {
+        wrong.push("rs rows lie apart".to_string());
+    }
+    if rs.len() != recipe.rs.len() {
+        wrong.push(format!(
+            "{} rs rows, {} described",
+            rs.len(),
+            recipe.rs.len()
+        ));
+    }
+    for (row, what) in &recipe.rs {
+        if recipe.atoms.get(row).map(|a| a.bytes) != Some(what.per_token()) {
+            wrong.push(format!(
+                "{row:?} buffers {} bytes a token",
+                what.per_token()
+            ));
+        }
+    }
     for tp in catalog::RANKS {
         let rank = recipe.per_rank(tp);
         if rank.fixed.len() != fixed.len()
@@ -398,6 +425,117 @@ fn dsv41_flash_keeps_its_replay_floor_and_ngram_ids_in_a_slot_a_thousand_share()
     };
     assert_eq!(fixed_rows(&trace, &recipe, "replay").0, 1);
     assert_eq!(fixed_rows(&trace, &recipe, "engram").0, 2);
-    assert!(*record < 1 << 10, "{record}");
+    // Each window's unfolded ids buffer as an rs row of 16 i32 ids.
+    let windows: Vec<_> = recipe
+        .rs
+        .iter()
+        .filter(|(_, rs)| {
+            rs.state
+                .is_some_and(|s| name_of(&trace, RowId::Cache(s)).contains("engram"))
+        })
+        .collect();
+    assert_eq!(windows.len(), 2);
+    assert!(windows.iter().all(|(_, rs)| rs.per_token() == 4));
+    assert!(*record < 2 << 10, "{record}");
     assert!(fixed.per_chunk(recipe.chunk_bytes) >= 1000);
+}
+
+fn planned_on(name: &str, chunk: ChunkProfile) -> (Trace, ChunkRecipe) {
+    let deployment = catalog::deployment(name).unwrap_or_else(|| panic!("`{name}` is listed"));
+    let trace = deployment.trace(Platform::Cuda);
+    let recipe = chunk::plan(&trace, &Budgets::of(Budget::default()), &on(chunk)).unwrap();
+    (trace, recipe)
+}
+
+/// The rs rows' runs, and the slots the first lies in.
+fn rs_runs(recipe: &ChunkRecipe) -> Vec<&chunk::FixedRun> {
+    let Some(SlotLayout::Fixed { rows, .. }) = recipe.fixed() else {
+        panic!("no fixed record")
+    };
+    rows.iter()
+        .filter(|r| matches!(r.row, RowId::Rs(_)))
+        .collect()
+}
+
+#[test]
+fn qwen35_vision_mtp_lays_every_rs_row_whole_in_one_slot() {
+    for (preset, chunk) in PRESETS {
+        let (trace, recipe) = planned_on("qwen35-d0.8b-vision-mtp-bf16-kv-bf16", chunk);
+        let runs = rs_runs(&recipe);
+        // A row a gated-delta layer: 18 of the 24 (every fourth is attention).
+        assert_eq!(runs.len(), 18, "{preset}");
+        let slot = runs[0].slots[0];
+        for run in &runs {
+            assert_eq!(
+                (run.pieces, run.slots.as_slice()),
+                (1, &[slot][..]),
+                "{preset}: {run:?}"
+            );
+        }
+        // Each row buffers the conv's input and `[b | a]`, committing into
+        // its layer's delta state.
+        for rs in recipe.rs.values() {
+            let state = name_of(&trace, RowId::Cache(rs.state.unwrap()));
+            assert!(state.ends_with("gdn.delta_state"), "{state}");
+            assert_eq!(rs.planes.len(), 2);
+        }
+    }
+}
+
+#[test]
+fn qwen38_flash_next_mini_buffers_its_ngram_ids_as_an_rs_row_beside_the_others() {
+    for (preset, chunk) in PRESETS {
+        let (trace, recipe) = planned_on("qwen38-flash-next-mini-bf16-kv-bf16", chunk);
+        let ids: Vec<_> = recipe
+            .rs
+            .iter()
+            .filter(|(_, rs)| {
+                rs.state
+                    .is_some_and(|s| name_of(&trace, RowId::Cache(s)) == "ple.ids_state")
+            })
+            .collect();
+        assert_eq!(ids.len(), 1, "{preset}");
+        let (id, rs) = ids[0];
+        // One plane of the unfolded token ids, an i32 each.
+        assert_eq!(rs.planes.len(), 1);
+        assert_eq!(rs.per_token(), 4);
+        assert_eq!(recipe.atoms[id].extent, u64::from(chunk::UNFOLDED_ROWS));
+        let runs = rs_runs(&recipe);
+        assert_eq!(runs.len(), 4, "{preset}: three delta layers and the ids");
+        assert!(runs.iter().all(|r| r.slots == runs[0].slots && !r.is_cut()));
+    }
+}
+
+#[test]
+fn a_kv_u4_deployment_lists_its_heads_packed() {
+    let deployment = catalog::deployment("qwen35-d0.8b-bf16-kv-bf16").unwrap();
+    let mut trace = deployment.trace(Platform::Cuda);
+    let (mut want, mut rows) = (0, 0);
+    for row in &mut trace.caches {
+        if let CacheRow::Kv {
+            dtype,
+            planes,
+            head_dim,
+            ..
+        } = row
+        {
+            *dtype = Dtype::KvU4;
+            rows += 1;
+            let block = u64::from(*head_dim);
+            assert!(block > 0 && planes.iter().all(|w| w % block == 0));
+            want += planes
+                .iter()
+                .map(|w| w / block * (block / 2 + 2))
+                .sum::<u64>();
+        }
+    }
+    for (preset, chunk) in PRESETS {
+        let recipe = chunk::plan(&trace, &Budgets::of(Budget::default()), &on(chunk))
+            .unwrap_or_else(|why| panic!("{preset}: {why}"));
+        // A kv row of 2 heads of 256, keys and values: 130 bytes a head
+        // where bf16 takes 512.
+        assert_eq!(per_token(recipe.list().unwrap()), want, "{preset}");
+        assert_eq!(want, rows * 2 * 2 * 130);
+        assert!(wrongs(&trace, &recipe).is_empty(), "{preset}");
+    }
 }

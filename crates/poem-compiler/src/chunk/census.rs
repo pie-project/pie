@@ -1,10 +1,14 @@
 //! What a trace remembers, read off today's IR: each cache row's bytes, its
 //! retention, the layer that reads it and the axis its readers let a piece
-//! cut, and the rs buffer the deferred-commit recurrences carry.
+//! cut, and the rs buffer the deferred-commit recurrences and the n-gram id
+//! windows carry.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 
-use poem_ir::{Attn, CacheRow, Conv, Def, Dim, Gather, Operands, Operation, Shard, Ssm, Trace, Ty};
+use poem_ir::{
+    Attn, CacheRow, Conv, Def, Dim, Dtype, Gather, KvRows, Operands, Operation, Shard, Ssm, Trace,
+    Ty, ValueId,
+};
 
 use super::{ChunkError, RowId};
 use crate::arena::elem_bytes;
@@ -13,7 +17,8 @@ use crate::arena::elem_bytes;
 /// unfolded past its state (a fire's speculative rows before they commit).
 pub const UNFOLDED_ROWS: u32 = 16;
 
-/// The rs buffer's element: the engine buffers its planes in bf16.
+/// The rs buffer's element: the engine buffers a recurrence's planes in
+/// bf16 (token ids in their own i32).
 const RS_ELEMENT: u64 = 2;
 
 /// The most ranks a deployment is cut across ([`crate::catalog::RANKS`]): a
@@ -90,10 +95,45 @@ pub struct FixedRow {
     pub ring_tokens: Option<u32>,
 }
 
+/// What one rs row buffers, as an engine lays it: `planes` one after
+/// another, plane `i` at `tokens x (the bytes a token of planes 0..i)` past
+/// the row's offset in each piece's slot, `tokens` the atoms a piece holds.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RsRow {
+    /// The state cache row the buffered tokens commit into: the recurrence's
+    /// own state, or the n-gram id window.
+    pub state: Option<u32>,
+    pub planes: Vec<RsPlane>,
+}
+
+impl RsRow {
+    /// The bytes a token takes across every plane.
+    #[must_use]
+    pub fn per_token(&self) -> u64 {
+        self.planes.iter().map(|p| p.bytes).sum()
+    }
+
+    /// Where plane `i` starts past the row's offset, in a piece of `tokens`.
+    #[must_use]
+    pub fn plane_at(&self, i: usize, tokens: u64) -> u64 {
+        tokens * self.planes[..i].iter().map(|p| p.bytes).sum::<u64>()
+    }
+}
+
+/// A plane of an rs row: the trace value whose token rows it buffers, and
+/// their bytes a token.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RsPlane {
+    pub value: ValueId,
+    pub bytes: u64,
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct Census {
     pub tokens: Vec<TokenRow>,
     pub fixed: Vec<FixedRow>,
+    /// What each rs row of `fixed` buffers.
+    pub rs: BTreeMap<RowId, RsRow>,
 }
 
 /// Reads every row `trace` remembers; with `state_f32`, a state row takes
@@ -111,13 +151,18 @@ pub fn census(trace: &Trace, state_f32: bool) -> Result<Census, ChunkError> {
                 dtype,
                 window,
                 shard,
+                head_dim,
+                rows,
                 ..
             } => {
-                let element = element(name, *dtype)?;
+                let planes = planes
+                    .iter()
+                    .map(|&width| stored(name, width, *dtype, *rows, *head_dim))
+                    .collect::<Result<Vec<_>, _>>()?;
                 out.tokens.push(TokenRow {
                     id,
                     layer: read.layer,
-                    planes: planes.iter().map(|w| w * element).collect(),
+                    planes,
                     window: *window,
                     ratio: read.ratio.max(1),
                     shard: shard.clone(),
@@ -129,7 +174,7 @@ pub fn census(trace: &Trace, state_f32: bool) -> Result<Census, ChunkError> {
                 dtype,
                 shard,
             } => {
-                let element = if state_f32 && *dtype != poem_ir::Dtype::I32 {
+                let element = if state_f32 && *dtype != Dtype::I32 {
                     4
                 } else {
                     element(name, *dtype)?
@@ -147,11 +192,45 @@ pub fn census(trace: &Trace, state_f32: bool) -> Result<Census, ChunkError> {
             }
         }
     }
-    out.fixed.extend(rs_rows(trace, &readers)?);
+    for (row, rs) in rs_rows(trace, &readers)? {
+        out.rs.insert(row.id, rs);
+        out.fixed.push(row);
+    }
     Ok(out)
 }
 
-fn element(name: &str, dtype: poem_ir::Dtype) -> Result<u64, ChunkError> {
+/// The bytes a token of a kv plane `width` wide takes as the engines store
+/// it: `width` elements of `dtype`; a block-scaled row's own bytes (the
+/// plane is declared in them); a `KvU4` head of `head_dim` packed to
+/// `head_dim / 2 + 2` bytes (the codec's 256-wide anchor where the trace
+/// states no head_dim); another packed format by its blocks.
+fn stored(
+    name: &str,
+    width: u64,
+    dtype: Dtype,
+    rows: Option<KvRows>,
+    head_dim: u32,
+) -> Result<u64, ChunkError> {
+    if rows.is_some() {
+        return Ok(width);
+    }
+    if let Some(element) = elem_bytes(dtype) {
+        return Ok(width * element);
+    }
+    let block = u64::from(head_dim);
+    if dtype == Dtype::KvU4 && block != 0 && width.is_multiple_of(block) {
+        return Ok(width / block * (block / 2 + 2));
+    }
+    u32::try_from(width)
+        .ok()
+        .and_then(|k| dtype.row_bytes(k))
+        .ok_or_else(|| ChunkError::Unsized {
+            row: name.to_string(),
+            dtype,
+        })
+}
+
+fn element(name: &str, dtype: Dtype) -> Result<u64, ChunkError> {
     elem_bytes(dtype).ok_or_else(|| ChunkError::Unsized {
         row: name.to_string(),
         dtype,
@@ -233,7 +312,7 @@ fn contract_of(op: &Operation) -> Option<Contract> {
     })
 }
 
-fn conv_input(op: &Operation) -> Option<poem_ir::ValueId> {
+fn conv_input(op: &Operation) -> Option<ValueId> {
     match op {
         Operation::Ssm(
             Ssm::CausalConv1d { x, .. }
@@ -295,10 +374,13 @@ fn atom(slab: &[u64], bytes: u64, read: &Read, shard: &Shard) -> Atom {
 }
 
 /// The rs buffer: a `[UNFOLDED_ROWS, width]` row a chunked recurrence whose
-/// commit is deferred, `width` the planes it replays (as the engine's
-/// `store::rs::read` lays them): the conv's input, then the gate prep's
-/// `[b | a]` (gated delta) or the forget and beta projections (KDA).
-fn rs_rows(trace: &Trace, readers: &[Read]) -> Result<Vec<FixedRow>, ChunkError> {
+/// commit is deferred, `width` the planes it replays (as the engines'
+/// `store::rs::read` lay them): the conv's input, then the gate prep's
+/// `[b | a]` (gated delta) or the forget and beta projections (KDA); then a
+/// row an n-gram id window, its unfolded token ids (as Metal's rs layout
+/// buffers them, in their own dtype). `RowId::Rs(n)`: the recurrences in
+/// node order, then the windows in the order their first reader stands.
+fn rs_rows(trace: &Trace, readers: &[Read]) -> Result<Vec<(FixedRow, RsRow)>, ChunkError> {
     let mut defined: HashMap<u32, usize> = HashMap::new();
     let mut outs = Vec::new();
     for (at, node) in trace.nodes.iter().enumerate() {
@@ -308,14 +390,19 @@ fn rs_rows(trace: &Trace, readers: &[Read]) -> Result<Vec<FixedRow>, ChunkError>
             defined.insert(out.0, at);
         }
     }
-    let op_of = |id: poem_ir::ValueId| defined.get(&id.0).map(|n| &trace.nodes[*n].op);
+    let op_of = |id: ValueId| defined.get(&id.0).map(|n| &trace.nodes[*n].op);
     let conv_x = |id| match op_of(id) {
         Some(Operation::Ssm(Ssm::CausalConv1dChunked { x, .. })) => Some(*x),
         _ => None,
     };
-    let mut rows = Vec::new();
+    let cache = |id: ValueId| match trace.values.get(id.0 as usize).map(|d| &d.def) {
+        Some(Def::Cache(row)) => Some(*row),
+        _ => None,
+    };
+    let mut recurrences = Vec::new();
+    let mut windows: Vec<(u32, ValueId, Option<u32>)> = Vec::new();
     for node in &trace.nodes {
-        let (planes, state) = match &node.op {
+        match &node.op {
             Operation::Ssm(Ssm::GatedDeltaChunked {
                 qkv, gates, state, ..
             }) => {
@@ -323,62 +410,99 @@ fn rs_rows(trace: &Trace, readers: &[Read]) -> Result<Vec<FixedRow>, ChunkError>
                     Some(Operation::Ssm(Ssm::GdnGates { ba, .. })) => Some(*ba),
                     _ => None,
                 };
-                (conv_x(*qkv).zip(ba).map(|(x, ba)| vec![x, ba]), *state)
+                if let Some((x, ba)) = conv_x(*qkv).zip(ba) {
+                    recurrences.push((vec![x, ba], *state, node.layer));
+                }
             }
             Operation::Ssm(Ssm::KdaChunked {
                 mixed, f, b, state, ..
-            }) => (conv_x(*mixed).map(|x| vec![x, *f, *b]), *state),
-            _ => continue,
-        };
-        let Some(planes) = planes else {
-            continue;
-        };
-        let mut width = 0u64;
-        for plane in planes {
-            width += width_of(trace, plane).ok_or(ChunkError::UnsizedRs)?;
+            }) => {
+                if let Some(x) = conv_x(*mixed) {
+                    recurrences.push((vec![x, *f, *b], *state, node.layer));
+                }
+            }
+            Operation::Gather(
+                Gather::NgramIds { ids, state, .. } | Gather::NgramIdsChunked { ids, state, .. },
+            ) => {
+                if let Some(row) = cache(*state)
+                    && !windows.iter().any(|(seen, ..)| *seen == row)
+                {
+                    windows.push((row, *ids, node.layer));
+                }
+            }
+            _ => {}
         }
-        // The rs planes are cut as the recurrence's own state is.
-        let shard = match trace.values.get(state.0 as usize).map(|d| &d.def) {
-            Some(Def::Cache(row)) => match trace.caches.get(*row as usize) {
-                Some(CacheRow::State { shard, .. }) => shard.clone(),
-                _ => Shard::Replicated,
+    }
+    let mut rows = Vec::new();
+    let mut push = |planes: Vec<RsPlane>, state: Option<u32>, layer: Option<u32>, shard| {
+        let per_token: u64 = planes.iter().map(|p| p.bytes).sum();
+        let id = RowId::Rs(u32::try_from(rows.len()).unwrap_or(u32::MAX));
+        let layer = state
+            .and_then(|row| readers.get(row as usize))
+            .and_then(|r| r.layer)
+            .or(layer);
+        rows.push((
+            FixedRow {
+                id,
+                layer,
+                bytes: u64::from(UNFOLDED_ROWS) * per_token,
+                atom: Atom {
+                    contract: Contract::Tokens,
+                    axis: 0,
+                    extent: u64::from(UNFOLDED_ROWS),
+                    bytes: per_token,
+                    grain: 1,
+                },
+                shard,
+                ring_tokens: None,
             },
-            _ => Shard::Replicated,
-        };
-        let shard = match shard {
-            Shard::Replicated => Shard::Replicated,
-            _ => Shard::Cut {
+            RsRow { state, planes },
+        ));
+    };
+    for (values, state, layer) in recurrences {
+        let mut planes = Vec::with_capacity(values.len());
+        let mut width = 0u64;
+        for value in values {
+            let w = width_of(trace, value).ok_or(ChunkError::UnsizedRs)?;
+            width += w;
+            planes.push(RsPlane {
+                value,
+                bytes: w * RS_ELEMENT,
+            });
+        }
+        let row = cache(state);
+        // The rs planes are cut as the recurrence's own state is.
+        let shard = match row.and_then(|row| trace.caches.get(row as usize)) {
+            Some(CacheRow::State { shard, .. }) if *shard != Shard::Replicated => Shard::Cut {
                 axis: 1,
                 segments: vec![width],
                 heads: Vec::new(),
             },
+            _ => Shard::Replicated,
         };
-        let layer = match trace.values.get(state.0 as usize).map(|d| &d.def) {
-            Some(Def::Cache(row)) => readers.get(*row as usize).and_then(|r| r.layer),
+        push(planes, row, layer, shard);
+    }
+    for (row, ids, layer) in windows {
+        let element = match trace.values.get(ids.0 as usize).map(|d| &d.ty) {
+            Some(Ty::Tensor { dtype, .. }) => elem_bytes(*dtype),
             _ => None,
-        }
-        .or(node.layer);
-        let per_token = width * RS_ELEMENT;
-        rows.push(FixedRow {
-            id: RowId::Rs(u32::try_from(rows.len()).unwrap_or(u32::MAX)),
+        };
+        let bytes = width_of(trace, ids)
+            .zip(element)
+            .map(|(w, e)| w * e)
+            .ok_or(ChunkError::UnsizedRs)?;
+        push(
+            vec![RsPlane { value: ids, bytes }],
+            Some(row),
             layer,
-            bytes: u64::from(UNFOLDED_ROWS) * per_token,
-            atom: Atom {
-                contract: Contract::Tokens,
-                axis: 0,
-                extent: u64::from(UNFOLDED_ROWS),
-                bytes: per_token,
-                grain: 1,
-            },
-            shard,
-            ring_tokens: None,
-        });
+            Shard::Replicated,
+        );
     }
     Ok(rows)
 }
 
 /// The elements a row of `value` holds (its dims past the first).
-fn width_of(trace: &Trace, value: poem_ir::ValueId) -> Option<u64> {
+fn width_of(trace: &Trace, value: ValueId) -> Option<u64> {
     let Ty::Tensor { shape, .. } = &trace.values.get(value.0 as usize)?.ty else {
         return None;
     };
