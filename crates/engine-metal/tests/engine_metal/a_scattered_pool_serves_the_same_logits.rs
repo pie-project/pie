@@ -214,9 +214,6 @@ fn serve(
     let mut held = [0u32; 2];
     let mut fed: [Vec<u32>; 2] = [PROMPTS[0].to_vec(), PROMPTS[1].to_vec()];
     let mut rows = Vec::new();
-    for lane in 0..2u32 {
-        shell.open(lane).expect("the seat opens");
-    }
     let tables = |held: [u32; 2], rows: [u32; 2]| -> [Vec<u32>; 2] {
         [0, 1].map(|lane| {
             if !refs {
