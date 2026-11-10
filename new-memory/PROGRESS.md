@@ -238,3 +238,20 @@ The `new-memory/` directory is bookkeeping and is removed before anything lands 
 - Follow-ups: weight tail waste when C must hold a whole expert (dsv4-pro, minimax-m3 on Metal); `per_rank()` does
   not cover weight slots yet; splits checked only against an earlier rule version.
 - Verified: `cargo check` poem, poem-compiler, engine-cuda, engine-metal, runtime; `poem-compiler --lib chunk`.
+
+### M14 — 2026-11-10: MA merged (state() API complete for every blocker; 8 models on handles)
+- `sc/ma-state-api` (e32910087..2cad9fe4e): unequal planes `state([tokens, [512, 64]], dt)`; row formats as dtype
+  (`kv_rows.v4|mx8|nv4|fp4_keys|fp8`); pools `tokens // r` (1/r width only for r in {2,4} when it divides — replaces
+  deepseek `packed()`/COMPACT_RATIOS); inferred: windows from WindowSink + MLA decode/prefill, MLA head width,
+  indexer/pool key widths, per-pool spaces for PoolKvAppend rows, unsplit rows for PoolGather/PoolStateWrite and
+  single-head planes (replaces split_kv), conv taps cut only when feeding attention/recurrence; `dflash.declare(kv=)`.
+- Migrated + equivalence (lowered caches identical except names, tp 1/2/4/8): dots3_note (16), glm_5 (84),
+  deepseek_v4 (104) identical; inkling, gemma_4, qwen_3 identical except accepted differences below.
+- Decisions: DFlash block rows and inkling local-layer rows are now kept only through their window (only windowed
+  attention reads them) — accepted (memory saving, same outputs expected; confirm with the golden probe);
+  gemma4-e4b-mini-l1 space renumbering (no empty space 0) — accepted. mimo_v2 `live=`: infer from
+  `split_qkv_padded`, no hint — goes to the migration batch.
+- Migration guide for the remaining models is in the MA report (record baseline via `moved!(pkg)` +
+  `PIE_RECORD_CACHES=1`, replace row names with states, share objects for shared rows, delete `caches()`, order
+  fields as the old `caches()`, rename function, run `moved::<pkg>`).
+- Verified: `cargo check` poem + poem-compiler; `pie-poem` state tests.
