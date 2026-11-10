@@ -746,6 +746,9 @@ pub(crate) fn create_engine_backend(
                     toml::Value::String(plugin.display().to_string())
                 ));
             }
+            if let Some(headroom) = opts.device_headroom {
+                boot_doc.push_str(&format!("headroom = {}\n", headroom.as_bytes()));
+            }
             let backend = opened.map_or_else(
                 || runtime::engine::backend::open::xla(boot_doc.as_bytes()),
                 Ok,
