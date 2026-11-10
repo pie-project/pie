@@ -17,7 +17,10 @@ use crate::spatial::plan::{
     Segments, Shape,
 };
 use crate::spatial::program::Program;
+use crate::spatial::tiles::spec::Spec;
 use crate::spatial::weights::Transform;
+
+mod cut;
 
 type R<T> = Result<T, String>;
 
@@ -134,18 +137,6 @@ impl Family for GptOss {
         })
     }
 
-    /// `prep_gptoss.py`'s cut: AX, MXc, PY, UNX, UNY, NU, Hc, SWA, SWR, HVC.
-    fn tiling(&self, plan: &Plan) -> R<serde_json::Value> {
-        let p = &plan.partition;
-        let ax = p.attn_cols.ok_or("gpt-oss plan: no attention columns")?;
-        let (unx, uny) = p.unit_grid.ok_or("gpt-oss plan: no unit grid")?;
-        Ok(serde_json::json!({
-            "AX": ax, "MXc": p.cols - ax, "PY": p.rows, "UNX": unx, "UNY": uny, "NU": p.units,
-            "Hc": p.row_dims[0].dims, "SWA": p.segments.scores, "SWR": p.segments.router,
-            "HVC": p.head.cols,
-        }))
-    }
-
     fn blocks(&self, plan: &Plan) -> R<Vec<Box<dyn Block>>> {
         let (p, d) = (&plan.partition, Dims::of(plan)?);
         let ax = p.attn_cols.ok_or("gpt-oss plan: no attention columns")?;
@@ -208,6 +199,10 @@ impl Family for GptOss {
 
     fn kernels(&self, prog: &Program) -> R<Kernels> {
         gptoss::kernels(prog)
+    }
+
+    fn tiles(&self, plan: &Plan, shapes: &dyn Fn(&str) -> Option<Vec<u64>>) -> R<Spec> {
+        cut::tiles(plan, shapes)
     }
 
     fn symbols(&self) -> &'static [(&'static str, &'static str)] {

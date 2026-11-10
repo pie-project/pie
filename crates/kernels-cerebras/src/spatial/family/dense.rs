@@ -18,8 +18,10 @@ use crate::spatial::plan::{
     RowRun, Segments, Shape,
 };
 use crate::spatial::program::Program;
-use crate::spatial::tiles::{Out, Params};
+use crate::spatial::tiles::spec::Spec;
 use crate::spatial::weights::{From, Slice, Transform, from};
+
+mod cut;
 
 type R<T> = Result<T, String>;
 
@@ -180,23 +182,6 @@ impl Family for Dense {
         })
     }
 
-    /// `dense/prep_dense.py`'s cut: PX, PY, UNX, UNY, K, HR, VR, NE, the units (NU), the RoPE tables'
-    /// levels and digit bits (RLV, RBITS) and, for a scaled rotation, its frequencies (FREQS).
-    fn tiling(&self, plan: &Plan) -> R<serde_json::Value> {
-        let p = &plan.partition;
-        let (unx, uny) = p.unit_grid.ok_or("dense: no unit grid")?;
-        let mut t = serde_json::json!({
-            "PX": p.cols, "PY": p.rows, "UNX": unx, "UNY": uny, "NU": p.units,
-            "K": p.layers_per_unit, "HR": p.head.rows, "VR": p.head.vocab_rows,
-            "NE": p.kv_entries.per_row, "RLV": plan.contract.rope_levels,
-            "RBITS": plan.contract.rope_bits,
-        });
-        if let Some(f) = &plan.shape.rope.freqs {
-            t["FREQS"] = serde_json::json!(f);
-        }
-        Ok(t)
-    }
-
     fn blocks(&self, plan: &Plan) -> R<Vec<Box<dyn Block>>> {
         let (s, p) = (&plan.shape, &plan.partition);
         let ug = p
@@ -302,8 +287,8 @@ impl Family for Dense {
         dense::kernels(prog)
     }
 
-    fn stage(&self, plan: &Plan, params: &dyn Params, out: &Out) -> R<()> {
-        crate::spatial::tiles::dense::stage(plan, params, out)
+    fn tiles(&self, plan: &Plan, shapes: &dyn Fn(&str) -> Option<Vec<u64>>) -> R<Spec> {
+        cut::tiles(plan, shapes)
     }
 
     fn symbols(&self) -> &'static [(&'static str, &'static str)] {

@@ -3,8 +3,8 @@
 //! in; the engine's placer turns a program's bindings ([`super::artifact::Artifact`]) into device
 //! copies in a fixed order.
 //!
-//! The tile-making half (`prep.rs` and the Python preps) stays outside for now (ARCHITECTURE.md:
-//! the [`Transform`]s are its future home).
+//! The arrays themselves are the cut's ([`super::tiles`]); a binding's `from` and [`Transform`]s
+//! record, for a reader, what the cut made them of.
 
 use serde::{Deserialize, Serialize};
 

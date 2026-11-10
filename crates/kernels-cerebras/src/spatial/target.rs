@@ -14,7 +14,7 @@ use poem_ir::{
 use super::family;
 use super::plan::{
     Act, AttnSpec, FamilyId, GdnSpec, HeadSpec, LayerKind, MlpSpec, MoeSpec, NormSpec, Plan,
-    PleSpec, Preset, RopeSpec, Shape,
+    PleSpec, Preset, RopeSpec, Shape, YarnSpec,
 };
 use super::program::Program;
 
@@ -58,8 +58,27 @@ fn act(a: &GluAct) -> R<Act> {
 }
 
 /// A rotation as the CY's RoPE tables take it: the trace's frequencies kept only where they are
-/// not `theta`'s own (a scaled rotation), and no cos / sin scale.
-fn rope(theta: f32, rotary_dims: u32, freqs: Option<&RopeFreqs>) -> R<RopeSpec> {
+/// not `theta`'s own (a scaled rotation), a proportional rotation's span, YaRN's stretch; no
+/// other cos / sin scale.
+fn rope(theta: f32, head_dim: u32, turn: &Turn, freqs: Option<&RopeFreqs>) -> R<RopeSpec> {
+    let (rotary_dims, span, yarn) = match turn {
+        Turn::Partial { rotary_dim, span } => (
+            *rotary_dim,
+            (*span != rotary_dim / 2).then_some(*span),
+            None,
+        ),
+        Turn::Yarn { yarn, .. } => (
+            head_dim,
+            None,
+            Some(YarnSpec {
+                factor: yarn.factor,
+                beta_fast: yarn.beta_fast,
+                beta_slow: yarn.beta_slow,
+                original: yarn.original_max_position,
+            }),
+        ),
+        _ => (head_dim, None, None),
+    };
     let freqs = match freqs {
         None => None,
         Some(f) if f.mscale != 1.0 => {
@@ -83,6 +102,9 @@ fn rope(theta: f32, rotary_dims: u32, freqs: Option<&RopeFreqs>) -> R<RopeSpec> 
         theta,
         rotary_dims,
         freqs,
+        span,
+        yarn,
+        global: None,
     })
 }
 
@@ -187,11 +209,7 @@ pub fn shape(trace: &Trace) -> R<Shape> {
                 freqs,
                 ..
             }) if y.rope.is_none() => {
-                let rotary_dims = match turn {
-                    Turn::Partial { rotary_dim, .. } => *rotary_dim,
-                    _ => *head_dim,
-                };
-                y.rope = Some(rope(*theta, rotary_dims, freqs.as_ref())?);
+                y.rope = Some(rope(*theta, *head_dim, turn, freqs.as_ref())?);
             }
             Operation::Gather(Gather::Select { width, .. }) => ple = Some(*width),
             _ => {}
@@ -240,14 +258,27 @@ pub fn shape(trace: &Trace) -> R<Shape> {
         top_k,
         expert_intermediate: intermediate,
     });
-    let rope = layers
+    let mut rope = layers
         .iter()
         .find_map(|y| y.rope.clone())
         .unwrap_or(RopeSpec {
             theta: 0.0,
             rotary_dims: head_dim,
             freqs: None,
+            span: None,
+            yarn: None,
+            global: None,
         });
+    rope.global = layers
+        .iter()
+        .zip(&kinds)
+        .find_map(|(y, k)| {
+            matches!(k, LayerKind::Global)
+                .then(|| y.rope.clone())
+                .flatten()
+        })
+        .filter(|g| *g != rope)
+        .map(Box::new);
     Ok(Shape {
         hidden,
         vocab,

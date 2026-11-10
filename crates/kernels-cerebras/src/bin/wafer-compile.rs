@@ -1,7 +1,6 @@
 //! `wafer-compile`: the wafer program's compiler. `plan` runs poem's spatial pass over a model's trace
-//! (or a shape stated outright) and writes the plan with what a prep tiles the checkpoint by;
-//! `build` writes everything a plan builds: the program's sources, the artifact the engine runs,
-//! and what the Python tools read.
+//! (or a shape stated outright) and writes the plan; `build` writes everything a plan builds: the
+//! program's sources and the artifact the engine runs.
 //!
 //! ```text
 //! wafer-compile plan (--model <deployment> | --shape <shape.json>) [--preset <name>] [--set K=V,...]
@@ -11,16 +10,14 @@
 //! wafer-compile link --build <dir>
 //! ```
 //!
-//! `plan` writes `<dir>/plan.json` (the [`Plan`]) and `<dir>/tiling.json` (the family's
-//! [`tiling`](kernels_cerebras::spatial::family::Family::tiling): the cut a prep tiles by, with
-//! the preset's name).
+//! `plan` writes `<dir>/plan.json` (the [`Plan`]) and names the preset it took.
 //! `--model` names a catalog deployment (`qwen35-d9b-bf16-kv-bf16`); `--preset` one of the
 //! serving family's presets (else the first that builds); `--set` overrides its keys;
 //! `--positions` the positions the program must serve (else as many as the preset holds). The
 //! preset carries the kernel levers its program ships with; `build --levers` sets more over them.
 //!
 //! `build` writes everything the plan builds into `<dir>` (`spatial::build::emit`: the sources,
-//! the artifact, what the Python tools read), its kernels the embedded ones unless `--kernels`
+//! the artifact), its kernels the embedded ones unless `--kernels`
 //! names a directory; `link` compiles a build directory with cslc into `<dir>/out`, checks every
 //! PE image's stack room and puts the artifact beside it (`<dir>/out/artifact`, what the engine
 //! opens). `link` runs where the SDK image's toolchain is (`/cb`, `/cbcore`).
@@ -29,7 +26,6 @@ use std::path::{Path, PathBuf};
 
 use kernels_cerebras::spatial::build::{self, EMITS};
 use kernels_cerebras::spatial::emit::params::Levers;
-use kernels_cerebras::spatial::family;
 use kernels_cerebras::spatial::plan::{Plan, Shape};
 use kernels_cerebras::spatial::program::Program;
 use kernels_cerebras::spatial::target::{self, Ask};
@@ -80,7 +76,7 @@ fn mkdir(dir: &Path) -> Result<(), String> {
     std::fs::create_dir_all(dir).map_err(|e| format!("{}: {e}", dir.display()))
 }
 
-/// `plan`: the plan of a deployment's trace (or of a shape file) and its tiling.
+/// `plan`: the plan of a deployment's trace (or of a shape file).
 fn plan(args: &[String]) -> Result<(), String> {
     let f = flags(
         args,
@@ -116,11 +112,12 @@ fn plan(args: &[String]) -> Result<(), String> {
     };
     let out = PathBuf::from(get(&f, "--out").ok_or(USAGE)?);
     mkdir(&out)?;
-    let plan = &planned.plan;
-    let mut tiling = family::of(plan.family).tiling(plan)?;
-    tiling["preset"] = planned.preset.name.clone().into();
-    json(&out, "plan.json", plan)?;
-    json(&out, "tiling.json", &tiling)
+    eprintln!(
+        "wafer-compile plan: the {} family, preset {}",
+        planned.plan.family.name(),
+        planned.preset.name
+    );
+    json(&out, "plan.json", &planned.plan)
 }
 
 /// `build`: everything a plan builds.

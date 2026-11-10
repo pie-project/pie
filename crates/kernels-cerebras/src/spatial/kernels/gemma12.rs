@@ -186,7 +186,7 @@ fn head(pe: &Pe) -> R<Vec<u32>> {
     Ok(w)
 }
 
-/// A head dim's columns a segment PE (rotated pairs side by side): `prep_gemma12.py::dcf`.
+/// A head dim's columns a segment PE (rotated pairs side by side).
 fn dcf(hd: u32, swa: u32) -> u32 {
     2 * (hd / 2).div_ceil(swa)
 }

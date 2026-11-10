@@ -43,8 +43,8 @@ pub const PASS_PE: Place = Place::Store {
     top: false,
 };
 
-/// The largest staged PLE file (`prep_gemma.py`'s `MAXB`).
-const FILE_MAX: u64 = 1900 * 1024 * 1024;
+/// The largest PLE file a cut stages (a file is staged whole, under the 2 GiB a stage takes).
+pub const FILE_MAX: u64 = 1900 * 1024 * 1024;
 
 /// One unit column's storage: its units top to bottom, the storage rows above the top one, the
 /// tokens a storage PE holds, its bus's colour.

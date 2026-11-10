@@ -37,8 +37,8 @@ use super::config::{Build, Config, Target, Tiles};
 
 type R<T> = std::result::Result<T, String>;
 
-/// The cut's format: bumped when a tiler's output for the same params changes.
-const TILES: u32 = 1;
+/// The cut's format: bumped when the tiler's output for the same params changes.
+const TILES: u32 = 2;
 
 /// A load's program and tiles, with the temporary cut it keeps alive (`tiles = "memory"`).
 pub struct Prepared {
@@ -62,6 +62,49 @@ impl Params for Landed {
             dtype: *dtype,
             bytes: self.bytes.get(name)?,
         })
+    }
+}
+
+impl Landed {
+    /// Params already landed, as a safetensors file of the trace's names (a test checkpoint's,
+    /// which no catalog deployment imports).
+    pub fn read(path: &Path) -> R<Landed> {
+        let all = std::fs::read(path).map_err(io(path))?;
+        let n = all
+            .get(..8)
+            .map(|b| u64::from_le_bytes(b.try_into().unwrap_or_default()) as usize)
+            .ok_or_else(|| format!("{}: no safetensors header", path.display()))?;
+        let header: serde_json::Map<String, serde_json::Value> =
+            serde_json::from_slice(all.get(8..8 + n).unwrap_or_default())
+                .map_err(|e| format!("{}: {e}", path.display()))?;
+        let (mut shapes, mut bytes) = (HashMap::new(), HashMap::new());
+        for (name, t) in header.iter().filter(|(k, _)| *k != "__metadata__") {
+            let dtype = match t["dtype"].as_str() {
+                Some("BF16") => poem_ir::Dtype::Bf16,
+                Some("F32") => poem_ir::Dtype::F32,
+                Some("U8") => poem_ir::Dtype::U8,
+                d => return Err(format!("{name}: a {d:?} tensor")),
+            };
+            let shape: Vec<u64> = t["shape"]
+                .as_array()
+                .map(|a| a.iter().filter_map(serde_json::Value::as_u64).collect())
+                .unwrap_or_default();
+            let off: Vec<usize> = t["data_offsets"]
+                .as_array()
+                .map(|a| {
+                    a.iter()
+                        .filter_map(|v| v.as_u64().map(|v| v as usize))
+                        .collect()
+                })
+                .unwrap_or_default();
+            let data = off
+                .get(..2)
+                .and_then(|o| all.get(8 + n + o[0]..8 + n + o[1]))
+                .ok_or_else(|| format!("{name}: offsets past the file"))?;
+            shapes.insert(name.clone(), (shape, dtype));
+            bytes.insert(name.clone(), data.to_vec());
+        }
+        Ok(Landed { shapes, bytes })
     }
 }
 
@@ -241,10 +284,15 @@ pub fn prepare(
         Some(w) => (Weights::parse(w)?, None),
         None => {
             let stamp = checkpoint_stamp(checkpoint)?;
-            let mut tiling = kernels_cerebras::spatial::family::of(plan.family).tiling(&plan)?;
-            tiling["checkpoint"] = stamp.into();
-            tiling["format"] = TILES.into();
-            let text = serde_json::to_string(&tiling).map_err(|e| e.to_string())?;
+            // the cut follows from the model, the partition and the contract (not the levers)
+            let parts = serde_json::json!({
+                "shape": plan.shape,
+                "partition": plan.partition,
+                "contract": plan.contract,
+                "checkpoint": stamp,
+                "format": TILES,
+            });
+            let text = serde_json::to_string(&parts).map_err(|e| e.to_string())?;
             let key = blake3::hash(text.as_bytes()).to_hex()[..16].to_string();
             let cut = |dir: &Path| -> R<()> {
                 let t0 = std::time::Instant::now();
@@ -258,7 +306,7 @@ pub fn prepare(
             };
             match cfg.wafer.tiles {
                 Tiles::Cache => {
-                    let (dir, _) = cache.entry("t", &trace.name, &key, &tiling, cut)?;
+                    let (dir, _) = cache.entry("t", &trace.name, &key, &parts, cut)?;
                     (Weights::parse(&dir.display().to_string())?, None)
                 }
                 Tiles::Memory => {

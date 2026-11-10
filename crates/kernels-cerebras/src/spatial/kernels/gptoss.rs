@@ -148,7 +148,7 @@ pub const HEAD_CTL_BAND: Kernel = Kernel {
     ..HEAD_CTL
 };
 
-/// The kernel dims the plan implies (`prep_gptoss.py`'s `Qh`, `Dc`, `NROT`, `Ic`, `NQA`, `QO`,
+/// The kernel dims the plan implies (`Qh`, `Dc`, `NROT`, `Ic`, `NQA`, `QO`,
 /// `XE`).
 pub struct Dims {
     pub k: u32,

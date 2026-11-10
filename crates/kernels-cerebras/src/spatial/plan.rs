@@ -148,9 +148,73 @@ pub struct RopeSpec {
     /// Rotated dims of a head (partial RoPE < head_dim).
     pub rotary_dims: u32,
     /// Each rotated pair's inverse frequency where it is not `theta`'s own (a scaled rotation:
-    /// Llama 3's long waves stretched); `None`: `theta ^ (-2 i / rotary_dims)`.
+    /// Llama 3's long waves stretched); `None`: `theta ^ (-i / span)`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub freqs: Option<Vec<f32>>,
+    /// Pair i turns at `theta ^ (-i / span)`; `None`: `rotary_dims / 2` (a proportional
+    /// rotation's is `head_dim / 2`: Gemma 4's global layers).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub span: Option<u32>,
+    /// YaRN's stretch of the frequencies, its attention factor on cos and sin.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub yarn: Option<YarnSpec>,
+    /// The global layers' rotation where it is not this one (Gemma 4's sliding / global).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub global: Option<Box<RopeSpec>>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
+pub struct YarnSpec {
+    pub factor: f32,
+    pub beta_fast: f32,
+    pub beta_slow: f32,
+    pub original: u32,
+}
+
+impl RopeSpec {
+    /// Pair `i`'s inverse frequency as `theta`, `span` and YaRN state it (the trace's own
+    /// frequencies aside). YaRN's ramp runs between its correction dims unrounded (HF's
+    /// `truncate: false`, what gpt-oss's checkpoint states).
+    pub fn inv_freq(&self, head_dim: u32) -> Vec<f64> {
+        let theta = f64::from(self.theta);
+        let pairs = (self.rotary_dims / 2) as usize;
+        let span = f64::from(self.span.unwrap_or(self.rotary_dims / 2));
+        match &self.yarn {
+            None => (0..pairs)
+                .map(|i| 1.0 / theta.powf(i as f64 / span))
+                .collect(),
+            Some(y) => {
+                let d = f64::from(head_dim);
+                let factor = f64::from(y.factor);
+                let pos: Vec<f64> = (0..pairs).map(|i| theta.powf((2 * i) as f64 / d)).collect();
+                let corr = |rot: f64| {
+                    (d * (f64::from(y.original) / (rot * 2.0 * std::f64::consts::PI)).ln())
+                        / (2.0 * theta.ln())
+                };
+                let (lo, mut hi) = (
+                    corr(f64::from(y.beta_fast)).max(0.0),
+                    corr(f64::from(y.beta_slow)).min(d - 1.0),
+                );
+                if lo == hi {
+                    hi += 0.001;
+                }
+                pos.iter()
+                    .enumerate()
+                    .map(|(i, p)| {
+                        let ramp = ((i as f64 - lo) / (hi - lo)).clamp(0.0, 1.0);
+                        let ext = 1.0 - ramp;
+                        (1.0 / (factor * p)) * (1.0 - ext) + (1.0 / p) * ext
+                    })
+                    .collect()
+            }
+        }
+    }
+
+    /// YaRN's attention factor on cos and sin (1: none).
+    pub fn scale(&self) -> f64 {
+        self.yarn
+            .map_or(1.0, |y| 0.1 * f64::from(y.factor).ln() + 1.0)
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize, Default)]

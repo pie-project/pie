@@ -5,6 +5,7 @@
 //! KV rows (`PYW`: E4B keeps KV on 128 of 160 rows so the 512 window is an exact ring) are in the
 //! plan. Kernels: [`gemma`].
 
+use crate::spatial::tiles::spec::Spec;
 use std::collections::BTreeMap;
 
 use crate::spatial::abi::Kernels;
@@ -24,6 +25,8 @@ use crate::spatial::plan::{
 };
 use crate::spatial::program::Program;
 use crate::spatial::weights::{Slice, Transform, from};
+
+mod cut;
 
 type R<T> = Result<T, String>;
 
@@ -292,32 +295,6 @@ impl Family for Gemma {
         })
     }
 
-    /// `prep_gemma.py`'s cut: the unit shape and count, the head, a row's dims, and each unit
-    /// column's x, units (top to bottom) and PLE storage (rows `srows`, `nt` tokens a storage PE).
-    fn tiling(&self, plan: &Plan) -> R<serde_json::Value> {
-        let p = &plan.partition;
-        let arr = Arrangement::of(plan)?;
-        let (uw, uh) = (p.cols + 1, p.rows + 1);
-        let origins = arr.origins(uw, uh)?;
-        let cols = arr
-            .columns(uw)
-            .iter()
-            .map(|(x, units, st)| {
-                let top = origins[units[0] as usize].1;
-                serde_json::json!({
-                    "x": x,
-                    "units": units,
-                    "srows": [top - st.rows, top],
-                    "nt": st.tokens,
-                })
-            })
-            .collect::<Vec<_>>();
-        Ok(serde_json::json!({
-            "PX": p.cols, "PY": p.rows, "XC": p.cols / 2, "NU": p.units, "Hc": p.row_dims[0].dims,
-            "HC": p.head.cols, "HR": p.head.rows, "origins": origins, "cols": cols,
-        }))
-    }
-
     /// The arrangement's units, the scores segments a half row, the PLE storage of each unit
     /// column, the shared-KV line, the head east of the units (fed the embedding inline), the
     /// token loop.
@@ -386,6 +363,10 @@ impl Family for Gemma {
 
     fn kernels(&self, prog: &Program) -> R<Kernels> {
         gemma::kernels(prog)
+    }
+
+    fn tiles(&self, plan: &Plan, shapes: &dyn Fn(&str) -> Option<Vec<u64>>) -> R<Spec> {
+        cut::tiles(plan, shapes)
     }
 
     fn symbols(&self) -> &'static [(&'static str, &'static str)] {

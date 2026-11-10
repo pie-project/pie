@@ -8,7 +8,7 @@ use super::abi::Kernels;
 use super::block::Block;
 use super::plan::{FamilyId, LayerKind, Plan, Preset, Shape};
 use super::program::Program;
-use super::tiles::{Out, Params};
+use super::tiles::spec::Spec;
 
 pub mod dense;
 pub mod gemma;
@@ -26,11 +26,6 @@ pub trait Family: Send + Sync {
     /// for the model. Nothing physical is decided here.
     fn plan(&self, shape: &Shape, preset: &Preset) -> R<Plan>;
 
-    /// What a prep tiles the checkpoint by for `plan` (`wafer-compile plan` writes it beside the
-    /// plan as `tiling.json`): the plan's cut in the prep's terms, and for Gemma the PLE storage
-    /// columns, for Gemma 12B the head's row groups and every row's dims.
-    fn tiling(&self, plan: &Plan) -> R<serde_json::Value>;
-
     /// The blocks the plan composes, in order: the units first, then what is placed against
     /// them. Floor, wiring, palette, overrides and copies run over them in this order.
     fn blocks(&self, plan: &Plan) -> R<Vec<Box<dyn Block>>>;
@@ -42,14 +37,9 @@ pub trait Family: Send + Sync {
     /// the kernels and the host's memcpy.
     fn symbols(&self) -> &'static [(&'static str, &'static str)];
 
-    /// Cuts the model's params into the tiles the plan's bindings place ([`super::tiles`]).
-    fn stage(&self, plan: &Plan, _params: &dyn Params, _out: &Out) -> R<()> {
-        Err(format!(
-            "the {} family has no tiler yet: stage its tiles with its Python prep and name them \
-             in [engine.debug] weights",
-            plan.family.name()
-        ))
-    }
+    /// The cut of the model's params into the tiles the plan's bindings place, as data
+    /// ([`super::tiles::spec`]); `shapes` gives a param's shape where the trace holds it.
+    fn tiles(&self, plan: &Plan, shapes: &dyn Fn(&str) -> Option<Vec<u64>>) -> R<Spec>;
 }
 
 /// A family by its id.

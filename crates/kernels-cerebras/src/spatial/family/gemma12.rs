@@ -18,9 +18,12 @@ use crate::spatial::plan::{
     RowRun, Segments, Shape,
 };
 use crate::spatial::program::Program;
+use crate::spatial::tiles::spec::Spec;
 use crate::spatial::weights::{Slice, Transform, from};
 
 pub struct Gemma12;
+
+mod cut;
 
 type R<T> = Result<T, String>;
 
@@ -178,26 +181,6 @@ impl Family for Gemma12 {
         Ok(plan)
     }
 
-    /// `prep_gemma12.py`'s cut: the unit shape and count, the attention rows and both row kinds'
-    /// dims, the scores segment width, the head (one column a row group; `hc`: every row's dims).
-    fn tiling(&self, plan: &Plan) -> R<serde_json::Value> {
-        let p = &plan.partition;
-        let groups = p.head.groups.clone().unwrap_or_default();
-        let hc: Vec<u32> = (0..p.rows)
-            .map(|r| {
-                p.row_dims
-                    .iter()
-                    .find(|run| run.rows.0 <= r && r < run.rows.1)
-                    .map_or(0, |run| run.dims)
-            })
-            .collect();
-        Ok(serde_json::json!({
-            "PX": p.cols, "PY": p.rows, "RA": p.kv_rows, "SWA": p.segments.scores,
-            "HcA": p.row_dims[0].dims, "HcW": p.row_dims[1].dims, "K": p.layers_per_unit,
-            "NU": p.units, "HC": groups.len(), "HR": p.head.rows, "groups": groups, "hc": hc,
-        }))
-    }
-
     /// The units with their row runs, the grouped head. Copies: per unit and run block its
     /// weights (bf16 -> f16) and gammas, its CY row's q / k norms and RoPE tables; the head in
     /// its two halves' files (one is over the 2 GiB a staged file may take), its rows padded with
@@ -246,6 +229,10 @@ impl Family for Gemma12 {
 
     fn kernels(&self, prog: &Program) -> R<Kernels> {
         gemma12::kernels(prog)
+    }
+
+    fn tiles(&self, plan: &Plan, shapes: &dyn Fn(&str) -> Option<Vec<u64>>) -> R<Spec> {
+        cut::tiles(plan, shapes)
     }
 
     fn symbols(&self) -> &'static [(&'static str, &'static str)] {
