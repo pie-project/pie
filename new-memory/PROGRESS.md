@@ -750,3 +750,11 @@ The `new-memory/` directory is bookkeeping and is removed before anything lands 
   container cap but not killed). Experts left in the file mapping (no pinned fallback lines).
 - qwen3-30b-a3b-mini at max_forward_tokens 5120: boot ~2-3 s (round 5: >13 min), tokens + top-4 bits = base,
   450 vs 433 tok/s. Open: RSS +1.3 GB vs base; log "bodies armed 0 of 0 compositions" to be explained.
+
+### M55 — 2026-11-10: host-tier cache spills to disk (RT2)
+- `sc/rt2-host-to-disk` (e2841c770): when a waiter wants device room and the host lacks room above its 1/8 reserve,
+  the host's lowest-key idle cache moves to disk first (HostPinned -> LocalDisk via copy_slots, kv list only),
+  journaled, whole groups on a persistent tier; suspends short of host room spill to disk too. TierMove gains
+  `source`. Host `live` excludes parked idle cache (spillable vs real state visible to policy).
+- Verified: runtime store/planner/policy::pressure 151 pass; e2e Qwen3 (640 MiB device, 512/256 MiB host, persistent
+  disk): restart takes back 750 / 875 pages, P now hits after restart (M52: cold); suspend regression identical.
