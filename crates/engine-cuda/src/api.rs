@@ -844,10 +844,15 @@ impl Engine for Cuda {
             return Ok(());
         }
         if copy.shape != LIST && copy.shape != RING {
-            return Err(Error::Invalid(format!(
-                "copy_slots names shape {}, which this load does not state",
-                copy.shape
-            )));
+            // Any other shape this load states (the rs list): whole slots.
+            if !copy.runs.is_empty() {
+                return Err(Error::Invalid(format!(
+                    "copy_slots names token runs of shape {}, whose slots are copied whole",
+                    copy.shape
+                )));
+            }
+            let pairs: Vec<[u32; 2]> = copy.slots.iter().map(|&(src, dst)| [src, dst]).collect();
+            return shell.copy_whole_slots(copy.shape, &pairs).map_err(fault);
         }
         let page = shell.paging().page_size;
         let runs: Vec<engine::transfer::KvRun> = copy
@@ -1323,12 +1328,18 @@ impl Cuda {
         // piece each, copied onto the slots the fire writes where the two
         // differ.
         use crate::store::layout::{FIXED, LIST, RING};
-        let by_refs = submission
-            .lanes
-            .iter()
-            .any(|lane| !lane.tables.is_empty() || !lane.fixed.is_empty());
+        let by_refs = submission.lanes.iter().any(|lane| {
+            !lane.tables.is_empty() || !lane.fixed.is_empty() || !lane.slot_copies.is_empty()
+        });
         if by_refs {
             shell.take_refs();
+        }
+        // Every lane's slot copies land before any lane of the fire reads
+        // or writes: a shared tail slot's rows onto the slot it then writes.
+        for lane in &submission.lanes {
+            for (shape, pairs) in &lane.slot_copies {
+                shell.copy_whole_slots(*shape, pairs).map_err(fault)?;
+            }
         }
         // Each lane's record: the one it reads and the one its fire writes.
         let mut records: Vec<Option<(u32, u32)>> = Vec::with_capacity(submission.lanes.len());

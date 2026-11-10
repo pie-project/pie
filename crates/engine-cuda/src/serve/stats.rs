@@ -196,6 +196,17 @@ impl Shell {
         self.pools.copy_slot(self.device.stream(), src, dst)
     }
 
+    /// Copies whole slots of `shape`, `(src, dst)`, on the stream ahead of
+    /// the fire that reads or writes `dst`.
+    pub fn copy_whole_slots(
+        &mut self,
+        shape: engine::chunk::ShapeId,
+        pairs: &[[u32; 2]],
+    ) -> crate::Result<()> {
+        self.pools
+            .copy_whole_slots(self.device.stream(), shape, pairs)
+    }
+
     /// Copies whole slots and token runs of a kv shape (`ring`: the windowed
     /// rows') within the state pool.
     pub fn copy_token_slots(

@@ -33,7 +33,7 @@ pub struct Chunks {
     /// The chunks under the range's end a fire's activation takes.
     act: u32,
     table: ChunkTable,
-    seated: [Seating; 3],
+    seated: [Seating; 4],
     /// The lowest chunk no shape has opened; chunk 0 is the null chunk.
     next: u32,
     null_zeroed: bool,
@@ -60,7 +60,7 @@ impl Chunks {
             total,
             act,
             table: ChunkTable::identity(total.saturating_add(act)),
-            seated: [Seating::default(), Seating::default(), Seating::default()],
+            seated: Default::default(),
             next: 1,
             null_zeroed: false,
             refs: false,
@@ -280,7 +280,7 @@ impl Chunks {
     pub fn take_refs(&mut self) {
         if !self.refs {
             self.refs = true;
-            self.seated = [Seating::default(), Seating::default(), Seating::default()];
+            self.seated = Default::default();
         }
     }
 
@@ -497,6 +497,17 @@ impl Chunks {
                     tokens: ring.tokens,
                 },
             ));
+        }
+        if let Some(rs) = &layout.rs {
+            let mut stated = shape(
+                &rs.slot,
+                SlotKind::List {
+                    tokens: rs.slot.tokens,
+                    rate: 1,
+                },
+            );
+            stated.role = engine::chunk::SlotRole::RsBuffer;
+            shapes.push(stated);
         }
         if let Some(fixed) = &layout.fixed {
             shapes.push(shape(
