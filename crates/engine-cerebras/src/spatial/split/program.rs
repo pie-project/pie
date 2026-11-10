@@ -1,22 +1,26 @@
-//! A built role-split program: the plan, its floor, wiring and laid fabric, and the family that
-//! made them. The one entry point the host, the tools and the tests use.
-//!
-//! Replaces `mod.rs::SplitSpec::geo` and the geometry steps of `SplitModel::open*` (build the
-//! family's geometry, then place); `SplitModel` keeps the run-time driving and takes a
-//! [`Program`] + [`super::emit::host::HostLayout`].
+//! A built role-split program: the plan, the blocks it composes, their floor, wiring, palette
+//! and laid fabric, every kind's kernel and the per-PE param overrides. The one entry point the
+//! host, the tools and the tests use.
 
+use super::abi::{Kernels, Overrides};
+use super::block::Block;
 use super::emit::meta::Meta;
-use super::fabric::Fabric;
+use super::fabric::{Fabric, Palette};
 use super::family::{self, Family};
-use super::floor::Floor;
+use super::floor::{Floor, FloorBuilder};
 use super::plan::Plan;
+use super::weights::{Binding, Copies};
 use super::wiring::Wiring;
 
 pub struct Program {
     pub plan: Plan,
+    pub blocks: Vec<Box<dyn Block>>,
     pub floor: Floor,
     pub wiring: Wiring,
+    pub palette: Palette,
     pub fabric: Fabric,
+    pub kernels: Kernels,
+    pub overrides: Overrides,
     pub family: Box<dyn Family>,
 }
 
@@ -28,22 +32,54 @@ impl Program {
         Program::build(fam, plan)
     }
 
-    /// The physical build of a plan: validate the plan, floor, wire, lay the fabric through the
-    /// family's palette, validate the fabric (its invariants, then every PE's routes against
-    /// its kernel's route slots). Pure (no device, no files).
+    /// The physical build of a plan: validate it; each block places its PEs, then lays its
+    /// links; the palette is the blocks' colours; lay the fabric and validate it (its
+    /// invariants); the family's kernels, every PE's routes within its kernel's route table;
+    /// the blocks' param overrides. Pure (no device, no files).
     pub fn build(family: Box<dyn Family>, plan: Plan) -> Result<Program, String> {
         plan.validate()?;
-        let floor = family.floor(&plan)?;
-        let wiring = family.wire(&plan, &floor)?;
-        let fabric = Fabric::lay(&floor, &wiring, &family.palette(&plan))?;
+        let blocks = family.blocks(&plan)?;
+        let mut fb = FloorBuilder::default();
+        for b in &blocks {
+            b.floor(&plan, &mut fb)?;
+        }
+        let floor = fb.build()?;
+        let mut wiring = Wiring::default();
+        for b in &blocks {
+            b.wire(&plan, &floor, &mut wiring)?;
+        }
+        let palette = Palette::of(blocks.iter().flat_map(|b| b.colours()));
+        let fabric = Fabric::lay(&floor, &wiring, &palette)?;
         fabric.validate(&floor)?;
-        fabric.check_route_slots(&floor, &|k| family.route_slots(k))?;
-        Ok(Program {
+        let mut prog = Program {
             plan,
+            blocks,
             floor,
             wiring,
+            palette,
             fabric,
+            kernels: Kernels::new(),
+            overrides: Overrides::default(),
             family,
-        })
+        };
+        prog.kernels = prog.family.kernels(&prog)?;
+        prog.fabric.check_route_slots(&prog.floor, &|k| {
+            prog.kernels.get(&k).map(|kb| kb.route_slots)
+        })?;
+        let mut o = Overrides::default();
+        for b in &prog.blocks {
+            b.overrides(&prog, &mut o)?;
+        }
+        prog.overrides = o;
+        Ok(prog)
+    }
+
+    /// Every copy onto the wafer: the blocks' in order.
+    pub fn bindings(&self) -> Result<Vec<Binding>, String> {
+        let mut out = Copies::default();
+        for b in &self.blocks {
+            b.bindings(self, &mut out)?;
+        }
+        Ok(out.0)
     }
 }

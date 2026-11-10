@@ -10,16 +10,16 @@
 //! link takes no shape params: `link.sh` passes only the [`MARKER`] param, which is also how
 //! `mod.rs::is_split` knows a build of this writer.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::HashMap;
 use std::fmt::Write as _;
 use std::path::Path;
 
+use crate::spatial::split::abi::{Kernels, Params};
 use crate::spatial::split::floor::{Coord, Rect};
-use crate::spatial::split::plan::FamilyId;
 use crate::spatial::split::program::Program;
-use crate::spatial::split::role::RoleKind;
+use crate::spatial::split::role::Kind;
 
-use super::params::{KernelBuild, Levers, Params, kernels, notes, tile};
+use super::params::{Levers, kernels, tile};
 
 /// The layout param that marks a build of this writer (`params.txt`, `out.json`).
 pub const MARKER: &str = "SPLIT_GEO";
@@ -31,127 +31,6 @@ fn init() void { sys_mod.unblock_cmd_stream(); }
 fn compute(steps: u32, start_pos: u32) void { sys_mod.unblock_cmd_stream(); }
 comptime { @export_symbol(init); @export_symbol(compute); }
 ";
-
-/// Every name a family's programs export, with its element type, in export order (the
-/// `NAMES` lists of `mkfull*.py`): the ABI between the kernels and the host's memcpy.
-pub fn symbols(f: FamilyId) -> &'static [(&'static str, &'static str)] {
-    match f {
-        FamilyId::Qwen => &[
-            ("w", "u16"),
-            ("rcfg", "u32"),
-            ("x", "f32"),
-            ("gam", "@fp16()"),
-            ("cw", "f32"),
-            ("gpar", "f32"),
-            ("gnw", "f32"),
-            ("qkw", "f32"),
-            ("rot", "f32"),
-            ("tab", "u32"),
-            ("hw", "u16"),
-            ("hg", "f32"),
-            ("res", "f32"),
-            ("xdbg", "f32"),
-            ("tdbg", "u32"),
-            ("xred", "f32"),
-            ("ring", "u32"),
-            ("hemb", "u16"),
-            ("lgt", "f32"),
-            ("force", "u32"),
-            ("nforce", "u32"),
-        ],
-        FamilyId::Gemma => &[
-            ("w", "u16"),
-            ("rcfg", "u32"),
-            ("tdbg", "u32"),
-            ("kvlog", "f32"),
-            ("x", "f32"),
-            ("xdbg", "f32"),
-            ("xred", "f32"),
-            ("gam", "f32"),
-            ("qkw", "f32"),
-            ("rot", "f32"),
-            ("tab", "u32"),
-            ("pl", "f32"),
-            ("plog", "f32"),
-            ("hw", "u16"),
-            ("hg", "f32"),
-            ("hemb", "u16"),
-            ("res", "f32"),
-            ("ring", "u32"),
-            ("lgt", "f32"),
-            ("force", "u32"),
-            ("nforce", "u32"),
-            ("ptab", "u16"),
-            ("psend", "u32"),
-            ("tin", "u32"),
-        ],
-        FamilyId::Gemma12 => &[
-            ("w", "u16"),
-            ("rcfg", "u32"),
-            ("tdbg", "u32"),
-            ("x", "f32"),
-            ("xdbg", "f32"),
-            ("xred", "f32"),
-            ("gam", "f32"),
-            ("qkw", "f32"),
-            ("rot", "f32"),
-            ("tab", "u32"),
-            ("hw", "u16"),
-            ("hg", "f32"),
-            ("hemb", "u16"),
-            ("res", "f32"),
-            ("ring", "u32"),
-            ("lgt", "f32"),
-            ("force", "u32"),
-            ("nforce", "u32"),
-        ],
-        FamilyId::GptOss => &[
-            ("w", "u16"),
-            ("wx", "u16"),
-            ("wr", "f32"),
-            ("rcfg", "u32"),
-            ("tdbg", "u32"),
-            ("x", "f32"),
-            ("xdbg", "f32"),
-            ("xred", "f32"),
-            ("gam", "f32"),
-            ("bo", "f32"),
-            ("bd", "f32"),
-            ("qb", "f32"),
-            ("snk", "f32"),
-            ("rot", "f32"),
-            ("rb", "f32"),
-            ("gb", "f32"),
-            ("ps", "f32"),
-            ("hw", "u16"),
-            ("hg", "f32"),
-            ("hemb", "u16"),
-            ("res", "f32"),
-            ("ring", "u32"),
-            ("lgt", "f32"),
-            ("force", "u32"),
-            ("nforce", "u32"),
-        ],
-    }
-}
-
-/// The file stem of a kind's source in the build directory (`mkfull*.py`'s names).
-pub fn stem(k: RoleKind) -> &'static str {
-    match k {
-        RoleKind::Idle => "filler",
-        RoleKind::Weight => "weight",
-        RoleKind::WeightAttn => "wa",
-        RoleKind::WeightMoe => "wm",
-        RoleKind::Cx => "cx",
-        RoleKind::Cy => "cy",
-        RoleKind::CyAttn => "cya",
-        RoleKind::CyMoe => "cym",
-        RoleKind::Head => "head",
-        RoleKind::HeadCtl => "hctl",
-        RoleKind::Relay => "relay",
-        RoleKind::Store => "ple",
-    }
-}
 
 /// A kind's source as the build directory holds it: `body`, then a one-word dummy for every
 /// exported name it does not own (`mkfull*.py`'s text, byte for byte).
@@ -228,20 +107,19 @@ pub fn rects(w: u32, h: u32, key: impl Fn(Coord) -> usize) -> Vec<(usize, Rect)>
 #[allow(clippy::type_complexity)]
 pub fn tiles(
     prog: &Program,
-    kinds: &BTreeMap<RoleKind, KernelBuild>,
-) -> Result<(Vec<Option<(RoleKind, Params)>>, Vec<usize>), String> {
-    let ns = notes(prog)?;
+    kinds: &Kernels,
+) -> Result<(Vec<Option<(Kind, Params)>>, Vec<usize>), String> {
     let (w, h) = (prog.floor.w, prog.floor.h);
-    let mut distinct: Vec<Option<(RoleKind, Params)>> = vec![None];
+    let mut distinct: Vec<Option<(Kind, Params)>> = vec![None];
     let mut index: HashMap<String, usize> = HashMap::new();
     let mut grid = vec![0usize; (w * h) as usize];
     for y in 0..h {
         for x in 0..w {
-            let t = tile(prog, kinds, &ns, Coord::new(x, y));
+            let t = tile(prog, kinds, Coord::new(x, y))?;
             let i = match t {
                 None => 0,
                 Some((k, p)) => {
-                    let key = format!("{}|{}", stem(k), p.render());
+                    let key = format!("{}|{}", k.stem, p.render());
                     *index.entry(key).or_insert_with(|| {
                         distinct.push(Some((k, p)));
                         distinct.len() - 1
@@ -255,10 +133,7 @@ pub fn tiles(
 }
 
 /// The `layout.csl` text of a program.
-pub fn layout_text(
-    prog: &Program,
-    kinds: &BTreeMap<RoleKind, KernelBuild>,
-) -> Result<String, String> {
+pub fn layout_text(prog: &Program, kinds: &Kernels) -> Result<String, String> {
     let (w, h) = (prog.floor.w, prog.floor.h);
     let (distinct, grid) = tiles(prog, kinds)?;
     let rs = rects(w, h, |c| grid[(c.y * w + c.x) as usize]);
@@ -274,7 +149,7 @@ pub fn layout_text(
         let (file, args) = match &distinct[i] {
             None => ("filler".to_string(), String::new()),
             Some((k, p)) => (
-                stem(*k).to_string(),
+                k.stem.to_string(),
                 p.items
                     .iter()
                     .map(|(n, v)| format!(", .{n} = {}", v.render()))
@@ -290,7 +165,7 @@ pub fn layout_text(
             r.y + r.h,
         );
     }
-    for (n, t) in symbols(prog.plan.shape.family) {
+    for (n, t) in prog.family.symbols() {
         let _ = writeln!(s, "  @export_name(\"{n}\", [*]{t}, true);");
     }
     s.push_str(
@@ -310,7 +185,7 @@ pub fn write(
 ) -> Result<(), String> {
     let kinds = kernels(prog, levers)?;
     std::fs::create_dir_all(out).map_err(|e| format!("{}: {e}", out.display()))?;
-    let syms = symbols(prog.plan.shape.family);
+    let syms = prog.family.symbols();
     let wr = |name: &str, text: &str| {
         let p = out.join(name);
         std::fs::write(&p, text).map_err(|e| format!("{}: {e}", p.display()))
@@ -324,11 +199,11 @@ pub fn write(
             std::fs::read_to_string(&src).map_err(|e| format!("{}: {e}", src.display()))?
         };
         wr(
-            &format!("{}.csl", stem(*k)),
+            &format!("{}.csl", k.stem),
             &kind_source(&body, syms, &kb.owns)?,
         )?;
     }
-    if !kinds.contains_key(&RoleKind::Idle) {
+    if !kinds.contains_key(&Kind::IDLE) {
         wr("filler.csl", &kind_source(FILLER, syms, &[])?)?;
     }
     wr("layout.csl", &layout_text(prog, &kinds)?)?;

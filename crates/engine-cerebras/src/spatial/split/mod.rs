@@ -1,6 +1,7 @@
 //! The role-split wafer program (`csl/split`: Qwen3.5, Qwen3, Gemma 4, gpt-oss; one sequence) in
-//! process: the layered build of its geometry and placement (`ARCHITECTURE.md`: [`plan`] ->
-//! [`floor`] -> [`wiring`] -> [`fabric`] -> [`emit`], one [`family`] a model, [`weights`]) and
+//! process: the layered build of its geometry and placement (`ARCHITECTURE.md`: a [`family`]'s
+//! [`plan`] and [`block`]s -> [`floor`] -> [`wiring`] -> [`fabric`]; the kernels' [`abi`] and
+//! [`kernels`]; [`emit`], [`weights`]) and
 //! the model the engine drives ([`SplitModel`]): tokens at positions, a launch of S passes, the
 //! wafer token loop's out-token ring.
 //!
@@ -14,10 +15,13 @@
 //! the prep step from the checkpoint) and the geometry's overrides (the
 //! build's `G2`, `WL`, `CAP`).
 
+pub mod abi;
+pub mod block;
 pub mod emit;
 pub mod fabric;
 pub mod family;
 pub mod floor;
+pub mod kernels;
 pub mod npy;
 pub mod plan;
 pub mod prep;

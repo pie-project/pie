@@ -10,26 +10,35 @@
 
 use std::collections::BTreeMap;
 
+use crate::spatial::split::abi::{KernelBuild, Kernels, Overrides};
+use crate::spatial::split::block::head::{HeadCopies, Hemb};
+use crate::spatial::split::block::units::UnitCopies;
+use crate::spatial::split::block::{self, Block, Legacy, Whole, head, segments, token_loop, units};
 use crate::spatial::split::emit::meta::Meta;
-use crate::spatial::split::emit::params::KernelBuild;
-use crate::spatial::split::emit::rcfg::RcfgAbi;
 use crate::spatial::split::fabric::{Colour, Palette};
 use crate::spatial::split::family::Family;
-use crate::spatial::split::family::abi::{self, CT5, CT6, CxIo, HeadIo, Pe};
-use crate::spatial::split::family::tiles::{HeadCopies, Hemb, UnitCopies};
 use crate::spatial::split::floor::{
     Coord, CtlLine, Dir, Floor, FloorBuilder, Rect, StoreBlock, Unit, UnitGrid, UnitLayout, skip,
 };
+use crate::spatial::split::kernels::Pe;
+use crate::spatial::split::kernels::common::{self as abi, CT5, CT6, CxIo, HeadIo};
 use crate::spatial::split::plan::{
     Act, AttnSpec, Contract, FamilyId, HeadPartition, HeadSpec, KvEntries, LayerKind, MlpSpec,
     NormSpec, Partition, Plan, PleSpec, ReduceGroups, RopeSpec, RowRun, Segments, Shape,
 };
 use crate::spatial::split::program::Program;
-use crate::spatial::split::role::{self, PeRole, RoleKind};
+use crate::spatial::split::role::{Kind, PeRole, Place};
 use crate::spatial::split::weights::{Binding, Copies, Slice, Transform, chunks, from};
-use crate::spatial::split::wiring::{self, Class, Half, Link, Port, Slot, Turn, Wiring};
+use crate::spatial::split::wiring::{self, Class, Link, Port, Turn, Wiring};
 
 pub struct Gemma;
+
+/// The PLE storage PEs and the route-only PEs west of the head (`ple_gemma.csl`).
+pub const STORE: Kind = Kind::new("ple", "ple");
+
+/// The PLE token word along each storage row, the shared-KV line.
+pub const PLE_TOKEN: Class = Class::new("TB");
+pub const SHARED_KV: Class = Class::new("KVS");
 
 // ------------------------------------------------------------------ arrangements
 
@@ -302,15 +311,12 @@ fn column_of(floor: &Floor, plan: &Plan, u: u32) -> Option<(usize, u32, u32)> {
     })
 }
 
+/// The PLE bus down storage column `i`'s unit column (`PB`).
 fn bus(i: usize) -> Class {
-    Class::PleBus(i as u8)
+    Class::at("PB", i as u8)
 }
 
-impl Family for Gemma {
-    fn id(&self) -> FamilyId {
-        FamilyId::Gemma
-    }
-
+impl Gemma {
     /// From `prep_gemma.py`'s meta: units of K layers (S .. S G, KM's bits the global layers),
     /// units at or past NO the shared-KV units (their layers read unit NO - 1's last layer of the
     /// same kind); the sliding window NES PYW exactly (WIN 0) or WIN with every row a KV row.
@@ -489,21 +495,16 @@ impl Family for Gemma {
                 for lx in 0..uw {
                     let store = if lx == xc {
                         // the block's CX column: routes only
-                        role::Store {
-                            first_token: 0,
-                            tokens: 0,
-                            level: 0,
-                            top: false,
-                        }
+                        PASS_PE
                     } else {
-                        role::Store {
-                            first_token: (y - y0) * st.tokens,
-                            tokens: st.tokens,
+                        Place::Store {
+                            first: (y - y0) * st.tokens,
+                            count: st.tokens,
                             level: lv,
                             top: y == y0,
                         }
                     };
-                    fb.set_role(Coord::new(x + lx, y), PeRole::Store(store));
+                    fb.set_role(Coord::new(x + lx, y), PeRole::new(STORE, store));
                 }
             }
             fb.stores.push(StoreBlock {
@@ -517,16 +518,11 @@ impl Family for Gemma {
         let wiring = self.wire(plan, &floor)?;
         for c in touched(&wiring) {
             if c.x < hx0
-                && matches!(floor.roles.get(c), PeRole::Idle)
+                && floor.roles.get(c).is_idle()
                 && unit_containing(&floor, c).is_none()
                 && store_of(&floor, c).is_none()
             {
-                *floor.roles.get_mut(c) = PeRole::Store(role::Store {
-                    first_token: 0,
-                    tokens: 0,
-                    level: 0,
-                    top: false,
-                });
+                *floor.roles.get_mut(c) = PeRole::new(STORE, PASS_PE);
             }
         }
         Ok(floor)
@@ -539,7 +535,7 @@ impl Family for Gemma {
     /// unit's CY row through its sharers.
     fn wire(&self, plan: &Plan, floor: &Floor) -> Result<Wiring, String> {
         let mut w = Wiring::default();
-        wiring::units(plan, floor, &mut w)?;
+        block::standard_units(plan, floor, &mut w)?;
         let p = &plan.partition;
         for unit in &floor.units {
             for r in 0..p.rows {
@@ -549,14 +545,13 @@ impl Family for Gemma {
                 wiring::segments(
                     &pts,
                     p.segments.scores,
-                    [Class::ScoreL1(Half::Lo), Class::ScoreL1(Half::Hi)],
-                    Class::ScoreCast,
-                    Slot::Segment,
+                    true,
+                    (segments::SCORE_L1, segments::SCORE_CAST, segments::SEGMENT),
                     &mut w,
                 )?;
             }
         }
-        wiring::head_input(plan, floor, &mut w)?;
+        head::head_input(plan, floor, &mut w)?;
         ple_token(floor, &mut w)?;
         ple_bus(plan, floor, &mut w)?;
         shared_kv(plan, floor, &mut w)?;
@@ -566,7 +561,7 @@ impl Family for Gemma {
     /// The base colours, the PLE token word (`TB`), the shared-KV line (`KVS`) and the
     /// arrangement's PLE buses.
     fn palette(&self, plan: &Plan) -> Palette {
-        let mut own = vec![(Class::PleToken, 0), (Class::SharedKv, 10)];
+        let mut own = vec![(PLE_TOKEN, 0), (SHARED_KV, 10)];
         if let Ok(arr) = Arrangement::of(plan) {
             own.extend(
                 arr.stores
@@ -575,14 +570,14 @@ impl Family for Gemma {
                     .map(|(i, st)| (bus(i), st.bus)),
             );
         }
-        Palette::base(&own)
+        block::standard_palette(&own)
     }
 
     /// `mkfull_gemma.py`'s kernels: each kind's source, the symbols it owns, its tile-code params
     /// as the plan states them, plus the lever defaults (`PD`). `SH` and `Ic` are the KV-owning
     /// units'; the KV-sharing units' (SH 1, their wider MLP) and the route-only store PEs' NTW 1
-    /// follow from their roles ([`crate::spatial::split::emit::params::role_params`]).
-    fn kernels(&self, prog: &Program) -> Result<BTreeMap<RoleKind, KernelBuild>, String> {
+    /// follow from their roles ([`crate::spatial::split::block::legacy_overrides`]).
+    fn kinds(&self, prog: &Program) -> Result<BTreeMap<Kind, KernelBuild>, String> {
         let plan = &prog.plan;
         let p = &plan.partition;
         let s = &plan.shape;
@@ -617,7 +612,7 @@ impl Family for Gemma {
             .unwrap_or(0);
         let mut out = BTreeMap::new();
         out.insert(
-            RoleKind::Weight,
+            Kind::WEIGHT,
             KernelBuild::ints(
                 "weight_gemma.csl",
                 &["w", "rcfg", "tdbg", "kvlog"],
@@ -647,7 +642,7 @@ impl Family for Gemma {
             ),
         );
         out.insert(
-            RoleKind::Cx,
+            Kind::CX,
             KernelBuild::ints(
                 "ctl_cx_gemma.csl",
                 &["x", "gam", "rcfg", "xdbg", "tdbg", "xred"],
@@ -661,7 +656,7 @@ impl Family for Gemma {
             ),
         );
         out.insert(
-            RoleKind::Cy,
+            Kind::CY,
             KernelBuild::ints(
                 "ctl_cy_gemma.csl",
                 &["qkw", "rot", "tab", "pl", "plog", "rcfg", "tdbg"],
@@ -685,7 +680,7 @@ impl Family for Gemma {
             ),
         );
         out.insert(
-            RoleKind::Head,
+            Kind::HEAD,
             KernelBuild::ints(
                 "head_pe.csl",
                 &["hw", "hg", "rcfg", "hemb", "tdbg"],
@@ -698,7 +693,7 @@ impl Family for Gemma {
             ),
         );
         out.insert(
-            RoleKind::HeadCtl,
+            Kind::HEAD_CTL,
             KernelBuild::ints(
                 "head_ctl_gemma.csl",
                 &[
@@ -713,7 +708,7 @@ impl Family for Gemma {
             ),
         );
         out.insert(
-            RoleKind::Store,
+            STORE,
             KernelBuild::ints(
                 "ple_gemma.csl",
                 &["ptab", "rcfg", "psend"],
@@ -777,7 +772,7 @@ impl Family for Gemma {
         // the route-only store PEs (storage blocks' CX columns, the pass PEs), by row runs
         let mut rows: BTreeMap<u32, Vec<u32>> = BTreeMap::new();
         for (c, r) in floor.roles.iter() {
-            if matches!(r, PeRole::Store(s) if s.tokens == 0) {
+            if r.kind == STORE && matches!(r.place, Place::Store { count: 0, .. }) {
                 rows.entry(c.y).or_default().push(c.x);
             }
         }
@@ -789,10 +784,9 @@ impl Family for Gemma {
         }
         let hr = p.head.rows;
         HeadCopies {
-            x0: floor.head.rect.x,
             cols: p.head.cols,
             rows: hr,
-            hw: &|_, rows, cols| Slice::of("hw", None, vec![rows, cols]),
+            hw: |_, rows, cols| Slice::of("hw", None, vec![rows, cols]),
             hw_from: vec![(
                 "embed_tokens".into(),
                 vec![Transform::PadLastRow {
@@ -802,7 +796,7 @@ impl Family for Gemma {
             hg_from: from("norm"),
             hemb: Hemb::Inline(Vec::new()),
         }
-        .put(&mut out);
+        .put(&mut out, floor.head.rect.x);
         Ok(out.0)
     }
 }
@@ -865,7 +859,7 @@ fn ple_token(floor: &Floor, w: &mut Wiring) -> Result<(), String> {
             if takes {
                 to.push(Port::Ramp);
             }
-            turn(w, Coord::new(x, y), Class::PleToken, from, to);
+            turn(w, Coord::new(x, y), PLE_TOKEN, from, to);
         }
     }
     Ok(())
@@ -972,7 +966,7 @@ fn shared_kv(plan: &Plan, floor: &Floor, w: &mut Wiring) -> Result<(), String> {
         turn(
             w,
             Coord::new(x, ysrc),
-            Class::SharedKv,
+            SHARED_KV,
             Port::Ramp,
             vec![Port::Dir(Dir::N)],
         );
@@ -988,7 +982,7 @@ fn shared_kv(plan: &Plan, floor: &Floor, w: &mut Wiring) -> Result<(), String> {
             if y > ytop {
                 to.push(Port::Dir(Dir::N));
             }
-            turn(w, at, Class::SharedKv, Port::Dir(Dir::S), to);
+            turn(w, at, SHARED_KV, Port::Dir(Dir::S), to);
         }
     }
     Ok(())
@@ -996,12 +990,12 @@ fn shared_kv(plan: &Plan, floor: &Floor, w: &mut Wiring) -> Result<(), String> {
 
 // ------------------------------------------------------------------ rcfg
 
-impl RcfgAbi for Gemma {
-    fn route_slots(&self, kind: RoleKind) -> usize {
+impl Gemma {
+    fn route_slots(kind: Kind) -> usize {
         match kind {
-            RoleKind::Weight => 18,
-            RoleKind::Store => 8,
-            RoleKind::Relay => 4,
+            Kind::WEIGHT => 18,
+            STORE => 8,
+            Kind::RELAY => 4,
             _ => 12,
         }
     }
@@ -1013,43 +1007,42 @@ impl RcfgAbi for Gemma {
     /// flag and the TB colour; the store PEs.
     fn rcfg(&self, prog: &Program, at: Coord) -> Result<Vec<u32>, String> {
         let plan = &prog.plan;
-        let pal = self.palette(plan);
-        let pe = Pe::new(prog, &pal, at);
+        let pe = Pe::new(prog, at);
         let last = plan.partition.units - 1;
-        let kvs = pe.c(Class::SharedKv)?;
-        match prog.floor.roles.get(at) {
-            PeRole::Weight(wt) => {
-                let fl = u32::from(wt.col == 0)
-                    | if kv_units(plan).1.contains(&wt.unit) {
+        let kvs = pe.c(SHARED_KV)?;
+        match prog.floor.roles.get(at).place {
+            Place::Weight { unit, row, col } => {
+                let fl = u32::from(col == 0)
+                    | if kv_units(plan).1.contains(&unit) {
                         2
                     } else {
                         0
                     }
-                    | if wt.unit == last { 4 } else { 0 };
-                let relays = [pe.turn(Slot::RelayPre), pe.turn(Slot::RelayPost)];
-                abi::weight(&pe, 18, wt.row, [fl, kvs], hand_n(plan), relays)
+                    | if unit == last { 4 } else { 0 };
+                let relays = [pe.turn(units::RELAY_PRE), pe.turn(units::RELAY_POST)];
+                abi::weight(&pe, 18, row, [fl, kvs], hand_n(plan), relays)
             }
-            PeRole::Cx(cx) => {
+            Place::Cx {
+                first,
+                last: is_last,
+                ..
+            } => {
                 let x = CxIo {
-                    first: cx.first,
-                    inn: pe.colour(Slot::XIn),
-                    out: pe.colour(Slot::XOut),
-                    emb: pe.colour(Slot::EmbIn),
-                    flags: if cx.last { 8 | 16 } else { 0 },
+                    first,
+                    inn: pe.colour(units::X_IN),
+                    out: pe.colour(units::X_OUT),
+                    emb: pe.colour(token_loop::EMB_IN),
+                    flags: if is_last { 8 | 16 } else { 0 },
                     ..CxIo::default()
                 };
                 abi::cx(&pe, x, 3, &CT5)
             }
-            PeRole::Cy(cy) => {
+            Place::Cy { unit, .. } => {
                 let mut w = abi::cy(&pe, None)?;
-                let col = column_of(&prog.floor, plan, cy.unit);
+                let col = column_of(&prog.floor, plan, unit);
                 let fl = u32::from(col.is_some())
-                    | if kv_units(plan).0 == Some(cy.unit) {
-                        2
-                    } else {
-                        0
-                    }
-                    | if cy.unit == last { 4 } else { 0 };
+                    | if kv_units(plan).0 == Some(unit) { 2 } else { 0 }
+                    | if unit == last { 4 } else { 0 };
                 let (pb, ui, lv) = match col {
                     Some((i, ui, lv)) => (pe.c(bus(i))?, ui, lv),
                     None => (0, 0, 0),
@@ -1057,12 +1050,11 @@ impl RcfgAbi for Gemma {
                 w.extend_from_slice(&[fl, pb, ui, lv, kvs]);
                 Ok(w)
             }
-            PeRole::Head(hd) => {
+            Place::Head { col: c, .. } => {
                 let (u0, ul) = match (prog.floor.units.first(), prog.floor.units.last()) {
                     (Some(a), Some(b)) => (a, b),
                     _ => return Err("split gemma: no units".into()),
                 };
-                let c = hd.col;
                 let xr = if at.y == ul.row_y(2 * c) {
                     2
                 } else if at.y == ul.row_y(2 * c + 1) {
@@ -1075,42 +1067,47 @@ impl RcfgAbi for Gemma {
                     | if at.y == u0.row_y(2 * c + 1) { 4 } else { 0 };
                 let h = HeadIo {
                     row: at.y,
-                    xr,
+                    role: xr,
                     relay_north: true,
-                    tr,
+                    turns: tr,
                     token_loop: true,
                 };
                 abi::head(&pe, h)
             }
-            PeRole::HeadCtl(_) => {
+            Place::HeadCtl { .. } => {
                 let mut w = abi::hctl(&pe, at.y * plan.partition.head.vocab_rows, true)?;
                 let tb = prog
                     .floor
                     .stores
                     .iter()
                     .any(|s| at.y >= s.rect.y && at.y < s.rect.y + s.rect.h);
-                w.extend_from_slice(&[u32::from(tb), pe.c(Class::PleToken)?]);
+                w.extend_from_slice(&[u32::from(tb), pe.c(PLE_TOKEN)?]);
                 Ok(w)
             }
-            PeRole::Store(st) => store(&pe, st),
-            PeRole::Idle | PeRole::Relay => Err(format!("{at:?}: no Gemma rcfg for this PE")),
+            Place::Store {
+                first,
+                count,
+                level,
+                top,
+            } => store(&pe, (first, count, level, top)),
+            Place::None => Err(format!("{at:?}: no Gemma rcfg for this PE")),
         }
     }
 }
 
 /// A store PE's words: the route table (8 slots), the flags (a storage PE 1, takes TB 2, the
 /// column's top 4), its first token, tokens, bus words, bus colour, TB's queue, a spare colour.
-fn store(pe: &Pe, st: &role::Store) -> Result<Vec<u32>, String> {
-    let tb = pe.c(Class::PleToken)?;
+fn store(pe: &Pe, (first, count, level, top): (u32, u32, u32, bool)) -> Result<Vec<u32>, String> {
+    let tb = pe.c(PLE_TOKEN)?;
     let mut w = pe.routes(8)?;
-    let stored = st.tokens > 0;
+    let stored = count > 0;
     let tb_in = pe
         .prog
         .fabric
         .route(pe.at, Colour(tb as u8))
         .is_some_and(|r| r.to_ramp());
     let pk = pe.parks(2)?;
-    let fl = u32::from(stored) | if tb_in { 2 } else { 0 } | if stored && st.top { 4 } else { 0 };
+    let fl = u32::from(stored) | if tb_in { 2 } else { 0 } | if stored && top { 4 } else { 0 };
     let tbq = if tb_in { tb } else { pk[0] };
     let pb = if stored {
         let i = store_of(&pe.prog.floor, pe.at)
@@ -1120,7 +1117,7 @@ fn store(pe: &Pe, st: &role::Store) -> Result<Vec<u32>, String> {
         pk[1]
     };
     let (first, tokens, level) = if stored {
-        (st.first_token, st.tokens, st.level)
+        (first, count, level)
     } else {
         (0, 0, 0)
     };
@@ -1128,3 +1125,87 @@ fn store(pe: &Pe, st: &role::Store) -> Result<Vec<u32>, String> {
     w.push(pe.spare(&[tbq], &CT6)?);
     Ok(w)
 }
+
+/// A route-only PE of the store kernel (a storage block's CX column, a pass PE).
+const PASS_PE: Place = Place::Store {
+    first: 0,
+    count: 0,
+    level: 0,
+    top: false,
+};
+
+impl Whole for Gemma {
+    fn floor(&self, plan: &Plan) -> Result<Floor, String> {
+        Gemma::floor(self, plan)
+    }
+
+    fn wire(&self, plan: &Plan, floor: &Floor) -> Result<Wiring, String> {
+        Gemma::wire(self, plan, floor)
+    }
+
+    fn palette(&self, plan: &Plan) -> Palette {
+        Gemma::palette(self, plan)
+    }
+
+    fn overrides(&self, prog: &Program, o: &mut Overrides) -> Result<(), String> {
+        block::legacy_overrides(prog, &|_| None, o)
+    }
+
+    fn bindings(&self, prog: &Program) -> Result<Vec<Binding>, String> {
+        Gemma::bindings(self, prog)
+    }
+}
+
+impl Family for Gemma {
+    fn id(&self) -> FamilyId {
+        FamilyId::Gemma
+    }
+
+    fn plan(&self, meta: &Meta) -> Result<Plan, String> {
+        Gemma::plan(self, meta)
+    }
+
+    fn blocks(&self, plan: &Plan) -> Result<Vec<Box<dyn Block>>, String> {
+        Ok(vec![Box::new(Legacy::new(Gemma, plan))])
+    }
+
+    fn kernels(&self, prog: &Program) -> Result<Kernels, String> {
+        Ok(block::legacy_kernels(
+            self.kinds(prog)?,
+            Gemma::route_slots,
+            |pe| Gemma.rcfg(pe.prog, pe.at),
+        ))
+    }
+
+    fn symbols(&self) -> &'static [(&'static str, &'static str)] {
+        SYMBOLS
+    }
+}
+
+/// Every name the kernels export, in export order (`mkfull_gemma.py`'s `NAMES`).
+const SYMBOLS: &[(&str, &str)] = &[
+    ("w", "u16"),
+    ("rcfg", "u32"),
+    ("tdbg", "u32"),
+    ("kvlog", "f32"),
+    ("x", "f32"),
+    ("xdbg", "f32"),
+    ("xred", "f32"),
+    ("gam", "f32"),
+    ("qkw", "f32"),
+    ("rot", "f32"),
+    ("tab", "u32"),
+    ("pl", "f32"),
+    ("plog", "f32"),
+    ("hw", "u16"),
+    ("hg", "f32"),
+    ("hemb", "u16"),
+    ("res", "f32"),
+    ("ring", "u32"),
+    ("lgt", "f32"),
+    ("force", "u32"),
+    ("nforce", "u32"),
+    ("ptab", "u16"),
+    ("psend", "u32"),
+    ("tin", "u32"),
+];

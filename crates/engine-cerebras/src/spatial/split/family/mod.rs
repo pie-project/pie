@@ -1,52 +1,40 @@
-//! Program families: what differs between the models the role-split program runs, as one trait
-//! a family. Everything generic (floor building, wiring primitives, the fabric, the emitters,
-//! the placer, the host) lives outside; a family composes it.
+//! Program families: what a model's program is made of. A family reads its plan off the prep's
+//! meta (until the spatial compiler hands the plan in), lists the blocks the plan composes, and
+//! builds each kind's kernel from the plan. Everything else (the floor, the wiring, the fabric,
+//! the emitters, the placer, the host) is generic over the blocks.
 
-use std::collections::BTreeMap;
-
+use super::abi::Kernels;
+use super::block::Block;
 use super::emit::meta::Meta;
-use super::emit::params::KernelBuild;
-use super::emit::rcfg::RcfgAbi;
-use super::fabric::Palette;
-use super::floor::Floor;
 use super::plan::{FamilyId, Plan};
 use super::program::Program;
-use super::role::RoleKind;
-use super::weights::Binding;
-use super::wiring::Wiring;
 
-pub mod abi;
 pub mod gemma;
 pub mod gemma12;
 pub mod gptoss;
 pub mod qwen;
-pub mod tiles;
+
+type R<T> = Result<T, String>;
 
 /// A program family. Every method is pure: same inputs, same outputs (the parity tests and the
 /// `split-geo` tool rely on it).
-pub trait Family: RcfgAbi + Send + Sync {
+pub trait Family: Send + Sync {
     fn id(&self) -> FamilyId;
 
     /// The logical plan from the prep's meta (and its overrides). Later the spatial compiler
     /// hands the plan in directly; nothing physical may be read here.
-    fn plan(&self, meta: &Meta) -> Result<Plan, String>;
+    fn plan(&self, meta: &Meta) -> R<Plan>;
 
-    /// The floorplan: units, gap / relay slots, head block, store blocks, every PE's role.
-    fn floor(&self, plan: &Plan) -> Result<Floor, String>;
+    /// The blocks the plan composes, in order: the units first, then what is placed against
+    /// them. Floor, wiring, palette, overrides and copies run over them in this order.
+    fn blocks(&self, plan: &Plan) -> R<Vec<Box<dyn Block>>>;
 
-    /// Every link: the generic unit wiring ([`super::wiring::units`]) plus the family's
-    /// segments, head input, token loop variant and extras.
-    fn wire(&self, plan: &Plan, floor: &Floor) -> Result<Wiring, String>;
+    /// Each kind's kernel and its params (levers applied by [`super::emit::params::kernels`]).
+    fn kernels(&self, prog: &Program) -> R<Kernels>;
 
-    /// The family's colour map (today's constants, so every word is unchanged).
-    fn palette(&self, plan: &Plan) -> Palette;
-
-    /// Each role kind's kernel source, owned symbols and shape params (levers applied by
-    /// [`super::emit::params::kernels`]).
-    fn kernels(&self, prog: &Program) -> Result<BTreeMap<RoleKind, KernelBuild>, String>;
-
-    /// Every copy onto the wafer, in placement order.
-    fn bindings(&self, prog: &Program) -> Result<Vec<Binding>, String>;
+    /// Every name the kernels export, with its element type, in export order: the ABI between
+    /// the kernels and the host's memcpy.
+    fn symbols(&self) -> &'static [(&'static str, &'static str)];
 }
 
 /// The family a meta was prepped for.

@@ -1,132 +1,190 @@
 # Role-split program: architecture
 
-The role-split build is layered. Each layer reads only the one before it, and only the last
-layers know about Cerebras kernels.
+A role-split program is a list of **blocks** over a logical **plan**. A family reads the plan
+(today off the prep's meta) and names the blocks it composes; the core runs every build step over
+the blocks in order and knows no model, no family and no block's vocabulary.
 
 ```
-Meta ──Family::plan──▶ Plan ──Family::floor──▶ Floor ──Family::wire──▶ Wiring
- (prep)               (logical)              (placement, roles)        (typed links)
-                                                                          │ Palette (family)
-                                                                          ▼
-                    emit::{rcfg, params, layout, host, meta}  ◀──  Fabric (routes, queues,
-                    weights::place (bindings → device)                   invariants)
+Meta ─Family::plan─▶ Plan ─Family::blocks─▶ [Block]
+                      │                        │ floor   ─▶ Floor  (units, head, stores; a PeRole a PE)
+                      │                        │ wire    ─▶ Wiring (typed links over open Classes / Slots)
+                      │                        │ colours ─▶ Palette
+                      │                        ▼
+                      │                     Fabric::lay + validate (routes, queues, invariants)
+                      │
+                      └─Family::kernels─▶ Kernels (Kind → KernelBuild: descriptor + typed params)
+                                              │ blocks' overrides ─▶ Overrides (per-PE params)
+                                              ▼
+              emit::{rcfg (Kernel::rcfg over a Pe), params + layout, host, meta}
+              Program::bindings (blocks' copies) ─▶ weights::place
 ```
 
-| Layer | Module | What it holds | Knows about |
+| Layer | Module | Holds | Knows |
 |---|---|---|---|
-| Plan | `plan.rs` | `Shape` (the model), `Partition` (counts and split factors), `Contract` (positions, CAP, LOOP, WL) | nothing physical. This is the seam to poem's spatial compiler: a trace makes the `Shape`, a search makes the `Partition`. |
-| Floor | `floor.rs`, `role.rs` | units (rects, CX / CY lines, layers), gap / relay slots, head block, store blocks; one `PeRole` a PE in a dense `Grid` | coordinates |
-| Wiring | `wiring.rs` | `Chain` (one- or two-level reduction + cast), `Multicast`, `Path`, `Turn`, `Note`; logical colour `Class`es; the `Slot` each endpoint fills | coordinates, logical colours |
-| Fabric | `fabric.rs` | `Palette` (class → colour), per-PE routes and `PeIo` (slot → endpoint), `parks` / `spare` / `route_words`, `validate` | physical colours, route words |
-| Emit | `emit/` | rcfg words (`RcfgAbi`, per family), kernel params + `layout.csl`, typed `Meta`, `HostLayout` | kernel ABIs |
-| Weights | `weights.rs` | `Binding`s (symbol, rect, source, transforms) and the one placer | the device |
-| Program | `program.rs` | `Program { plan, floor, wiring, fabric, family }`, `Program::from_meta`, `Program::build` | all of the above |
-| Shared kernel ABI | `family/abi.rs`, `family/tiles.rs` | the rcfg words every family's weight / CX / CY / head / head control kernels share (`Pe`, `weight`, `cx`, `cy`, `head`, `hctl`), and the copies the snake-unit families share (`UnitCopies`, `HeadCopies`) | the role-split kernels' ABI |
-| Families | `family/` | `qwen`, `gptoss`, `gemma`, `gemma12`: the only model-specific code | everything; they compose the generic parts |
+| Plan | `plan.rs` | `Shape` (the model), `Partition` (counts, split factors), `Contract` (positions, CAP, LOOP, WL) | nothing physical: the seam to poem's spatial compiler (a trace makes the `Shape`, a search the `Partition`) |
+| Roles | `role.rs` | `PeRole { kind: Kind, place: Place }`. `Kind` is open (name + build stem; the architecture's kinds are consts, a block declares more). `Place` is the role-split architecture's positions: weight / CX / CY of a unit, head / head control, a storage column's PE, none | coordinates |
+| Floor | `floor.rs` | `FloorBuilder` (blocks place onto it in order), units, gap / relay slots, the head block, store blocks, a `PeRole` a PE in a dense `Grid` | coordinates |
+| Wiring | `wiring.rs` | `Chain`, `Multicast`, `Path`, `Turn`, `Note`; open `Class { name, index }`, `Slot { name, kind: SlotKind }`, `NoteKey`; the core's only own vocabulary is `LOOPBACK` and `PASS` | coordinates, logical colours |
+| Fabric | `fabric.rs` | `Palette` (the blocks' colours, later replacing earlier), routes, `PeIo` (slot → endpoint, notes), `parks` / `spare` / `route_words`, the invariants | physical colours, route words |
+| Blocks | `block/` | the `Block` trait and the blocks: `units`, `segments` (`Scores`, `Onorm`), `gdn`, `head` (`HeadEast`), `token_loop`; each owns its classes, slots, notes and colours as consts | coordinates, its own vocabulary |
+| ABI | `abi.rs` | `Kernel` (source, owned symbols, params' names, route slots, rcfg writer), `params!` (a kernel's typed params struct), `words!` (an rcfg word layout), `KernelBuild`, `Kernels`, `Overrides` | the build's view of a kernel |
+| Kernels | `kernels/` | `Pe` (one PE as an rcfg writer sees it), `common` (the word layouts every family's weight / CX / CY / head / head control kernel shares, its codes named), `head` (`head_pe.csl`, `head_ctl.csl`), `q35` (Qwen's) | the CSL kernels' ABI |
+| Families | `family/` | `qwen` (blocks); `gptoss`, `gemma`, `gemma12` (one `block::Legacy` each until ported) | the model |
+| Emit | `emit/` | rcfg (`Kernel::rcfg` over a `Pe`), kernel params (levers, overrides) and `layout.csl`, typed `Meta`, `HostLayout` | kernel builds |
+| Weights | `weights.rs` | `Binding`s (symbol, rect, source, transforms), `Copies`, the placer | the device |
+| Program | `program.rs` | `Program { plan, blocks, floor, wiring, palette, fabric, kernels, overrides, family }`, `build`, `bindings` | all of the above |
 
 Rules:
 
-- A family is data plus composition. No flag on a shared struct changes behaviour for one
-  family. The generic code exposes primitives (`wiring::units`, `unit_chains`, `segments`,
-  `head_rows`, `head_input`, `token_loop`, `FloorBuilder::units`, `FloorBuilder::head_east`), and
-  a family that needs something different writes its own wiring from the primitives.
-- A family's rcfg is the shared words (`family::abi`) plus its own: role words, flags and
-  tails. Its colours are `Palette::base` plus its own classes; its kernels are
-  `KernelBuild::ints` tables; its copies go through `weights::Copies` (and `family::tiles`).
-- Every per-PE fact lives in a `Grid` (roles, routes, `PeIo`). There are no `HashMap<(u32, u32), tuple>` tables.
-- Named structs replace positional tuples (`ChainMember`, `RootQueues`, `Endpoint`).
-- Wiring is order-free. The fabric sorts routes, so adding links in a different order cannot
-  change a word.
-- Everything up to `Program` is pure: no device, no files. `split-geo` and the tests rely on this.
-- Rust is the only geometry. Python tools call `split-geo` (`src/bin/split-geo.rs`).
+- **The block is the unit of extension.** A model is a family listing blocks; a new dataflow part
+  (a new segment kind, a storage column, a band head) is a new block. Nothing in the core names a
+  family or a block's classes, slots, notes or kinds.
+- **A block owns its vocabulary.** Its `Class`es, `Slot`s, `NoteKey`s (and their value codes),
+  extra `Kind`s and colours are consts in its module (`units::ROW_L1`, `head::HEAD_IN`,
+  `head::ROLE_SOURCE`, `token_loop::TURN_TOP`, ...). Kernels' rcfg writers read the slots and
+  notes by those consts. Two blocks never declare one name: a slot is `(name, kind)` and a class
+  `(name, index)`, so a clash would merge queues.
+- **A kernel is described once.** One `Kernel` const a CSL source; its params are one `params!`
+  struct (typed fields in `@set_tile_code` order, `NAMES`, a `Param` const a name); its rcfg is one
+  writer that fills `words!` structs (named words in rcfg order). `KernelBuild::of` refuses params
+  that are not the kernel's in its order. Codes the kernels read are named consts
+  (`common::SEG_NONE`, `CX_EMB`, `LOOP_ROOT`, `fabric::member_role`, `gdn::SOURCE_SEND`, ...).
+- **Per-PE param differences are typed `Overrides`** a block states (`Block::overrides`), checked
+  against the PE's kernel at resolution. There are no stringly per-PE notes.
+- **Physical facts are derived once.** Blocks read the floor (`Unit::row_y`, `HeadBlock::col_x`,
+  ...) and the notes other blocks left; no family restates the plan as its own geometry struct.
+- **Wiring is order-free.** The fabric sorts routes and binds endpoints order-free, so the block
+  order only matters for the floor (later blocks place against earlier ones), the palette (later
+  replaces) and the copies (placement order is the host's device protocol).
+- **Everything up to `Program` is pure:** no device, no files. `split-geo` and the tests rely on
+  this. Rust is the only geometry; the Python tools call `split-geo`.
 
-## Invariants (enforced in `Fabric::lay` / `Fabric::validate` and `Plan::validate`)
+## Invariants (`Plan::validate`, `Fabric::lay` / `validate`, `check_route_slots`)
 
-These are the hardware lessons of the bring-up, made checks:
+The hardware lessons of the bring-up, made checks:
 
 1. **Route clash.** Two words for one colour at one PE is an error.
 2. **Parked queues.** An unused input queue never parks on a colour the PE sends on. Parks come
-   first from colours with no route, then from pass-through colours (`Fabric::parks`). This is
-   the 0704 hang.
-3. **Segment queues.** A segment's queues are its own and never a reduction's on the same PE.
-   This is 0733: a segment borrowed iq3.
-4. **Control lines.** A segment never spans a control line (SWA / SWG / SWV / SWR divide the
-   half-rows they live in).
+   first from colours with no route, then from pass-through colours (`Fabric::parks`). The 0704
+   hang.
+3. **Segment queues.** A `SlotKind::Segment` slot's colours are never a `SlotKind::Reduce` slot's
+   on the same PE. 0733: a segment borrowed iq3.
+4. **Control lines.** A segment never spans a control line (`wiring::segments` refuses it; the
+   plan's segment widths divide the half-rows they live in).
 5. **Path continuity.** Every `Path` runs from its sender's ramp to its receiver's ramp.
-6. **Route slots.** Routes at a PE ≤ the kernel ABI's route slots (`RcfgAbi::route_slots`).
+6. **Route slots.** Routes at a PE ≤ its kind's kernel's `route_slots`; a non-idle PE whose kind
+   has no kernel is an error.
 7. **Colour count.** Every colour < `COLOURS` (21).
-8. **Kernel-side rules.** These are not geometry, so they stay with the kernel and link tools
-   and are listed here so nobody drops them:
-   - restore a route only after its oq drains (0738);
-   - ≥768 B stack room a PE (`tools/split/chk_stack.py`);
-   - payload directories end in `_ieee`.
+8. **Loop-backs.** Every root of a `SlotKind::Reduce { loopback: true }` slot loops back to its own
+   ramp on `LOOPBACK`'s colour.
+9. **Kernel-side rules** (not geometry; listed so nobody drops them): restore a route only after
+   its oq drains (0738); ≥768 B stack room a PE (`tools/split/chk_stack.py`); payload directories
+   end in `_ieee`.
 
-## The generic layers
+## The blocks
 
-What the generic code does, for a family that composes it:
+| Block | Floor | Wiring | Vocabulary | Copies |
+|---|---|---|---|---|
+| `units::Units { grid, copies }` | units per `UnitGrid` (snake with gaps, or explicit origins); gap slots `Kind::RELAY` | `unit_chains`: row chains into CX, column chains into CY (two-level by `reduce.row` / `.col`), root loop-backs, `handoff`s along the visit order | `ROW_L1/L2/CAST`, `COL_L1/L2/CAST`, `HANDOFF_OUT/VERT[parity]/IN/ACROSS`; slots `ROW_REDUCE`, `COL_REDUCE`, `X_IN`, `X_OUT`, `RELAY_PRE`, `RELAY_POST` | `UnitCopies` per unit (quadrants of `w{u}`, CX `gam`, CY tables), relays' rcfg |
+| `segments::Scores { width }` | — | every weight row in segments of `width` | `SCORE_L1`, `SCORE_CAST`; slot `SEGMENT` | — |
+| `segments::Onorm { width }` | — | every CY row in segments (no single-PE ones) | `ONORM_L1`, `ONORM_CAST`; slot `ONORM` | — |
+| `gdn::Gdn` (`Gdn::of(plan)`) | — | the (k, q) multicast per GDN segment and key row; `Gdn::source` is the weight kernel's source word | `GDN_KQ`; slot `GDN`; `SOURCE_*` | — |
+| `head::HeadEast { cols, rows, token_loop, copies }` | the head east of the floor so far, control column in the middle | `head_rows` (into the control column), `head_input` (two CX rows a head column: relay north, column multicast) | `HEAD_RELAY`, `HEAD_COL_CAST`, `HEAD_ROW_WORD`; slots `HEAD_ROW_REDUCE`, `HEAD_IN`, `HEAD_RELAY_IN`, `HEAD_CAST`; note `ROLE` (`ROLE_RELAY`, `ROLE_SOURCE`) | `HeadCopies` (`hw`, `hg`, `hemb`, rcfg) |
+| `token_loop::TokenLoop` | — | the control column's max-reduce, the embedding's return into unit 0's CX | `LOOP_L1/L2/CAST`, `EMB_UP/DOWN/SPLIT/WEST`; slots `LOOP_REDUCE`, `EMB_IN`; note `TURN` (`TURN_TOP/EVEN/ODD`) | — |
 
-- **Plan.** `Shape::gdn` (Qwen3.5's GDN), `AttnSpec::global_head_dim` (Gemma's global layers),
-  `MlpSpec::layer_widths` (per-layer MLP widths: Gemma's KV-sharing layers), `Partition::unit_grid`
-  (a snake's slots). `RowRun::rows` is half-open; runs tile `0 .. rows`. `Plan::validate` checks: a non-empty
-  model, `hidden_placed >= hidden`, `layers <= units * layers_per_unit`, `0 < kv_rows <=
-  rows`, row runs (when given) contiguous and holding `hidden_placed` dims, nonzero segment
-  widths dividing their half (`cols / 2` for scores / GDN / o-norm; with `attn_cols`, scores
-  divide `attn_cols` and the router `cols - attn_cols`), head groups covering every row once,
-  positions within `2^(rope_bits rope_levels)` when `rope_levels > 0`.
-- **Floor.** `FloorBuilder::units(grid, extra)`: wafer = the units' box + `extra` (east, south);
-  the box is `unx (cols + 1)` x `uny (rows + 1)` for a snake (gaps included), the farthest
-  origin + a unit for explicit origins. `Snake { up_first }`: column 0 bottom-up, column 1
-  top-down, ...; gap slots `Relay`. Generic roles: `Weight` / `Cx` / `Cy` with local row / col
-  (control lines skipped), `part: Dense`, `Cx.first` / `last`; the corner `Idle`.
-  `Unit::layers` is half-open. `CtlLine::Column(x)` / `Row(y)` hold wafer coordinates.
-  `Floor::rects_by_kind` is greedy row-major (widest run, then rows down).
-- **Wiring.** `units` = `unit_chains` (row / column chains, loop-backs, handoffs) + for a
-  control-column head `head_rows` + `token_loop` when `contract.token_loop`. The primitives
-  `unit_chains`, `head_rows`, `head_input` (Qwen's / Gemma's head input) and `loopback` are
-  public for families that lay their own. `segments` lays every run, a one-PE run too. Slots `HeadRelay` and
-  `HeadCast` are `head_input`'s, `Pass` binds nothing. Notes: `head_in` (1 / 2,
-  `head_input`), `loop_turn` (bits 1 / 2 / 4, `token_loop`); the token loop's head-side ends
-  bind nothing, unit 0's CX binds `EmbIn`.
-- **Fabric.** `lay`: a chain is single-level (no `l2`, or `group` 0) or two-level, with the
-  kernels' member role codes, colours and root halves; members `Endpoint::Member`, roots `Endpoint::Root` in the
-  chain's slot; multicast source `Send`, receivers `Recv`; path `Send` at `send`, `Recv` at
-  `recv`; a `Turn` lays its word only. Binding is order-free: an equal endpoint again is a
-  no-op, a `Recv(a)` and a `Send(b)` in one slot make `Turn(a, b)`, anything else is an error.
-  Notes with one key at one PE are OR-ed. Routes are sorted by colour; several classes may map
-  to one colour. Consecutive link points must be adjacent. `Program::build`
-  checks every PE's routes against the family's `route_slots` (`Fabric::check_route_slots`).
-  `validate`: colours < 21; every bound receive colour reaches the ramp and every bound send
-  colour leaves it; segment slots share no colour with reduction slots at a PE; unit-row,
-  unit-column and head-row roots loop back on the loop-back colour.
-- **Shared ABI** (`family/abi.rs`). A `Pe` is one PE's bindings, the family's palette and
-  (gpt-oss's band) a colour it never parks on and counts as final. `weight` writes the route
-  table, the row / column reductions' queues (parked where absent), the multicasts and sends, the
-  reductions' and scores segment's roles, the family's two words, the segment's queues, the row,
-  the relays' turns and a spare colour; `cx`, `cy`, `head` and `hctl` likewise, each taking what
-  is its family's (`CxIo`: x in / out, embedding, flag bits, finals, tail; the CY's segment;
-  `HeadIo`: the relay role, the token loop's turns). A family appends its own words after.
-- **Emit.** `rcfg::dump` writes non-idle PEs x outer, y inner, kinds by `RoleKind::name`
-  ("w", "wa", "wm", "cx", "cy", "cya", "cym", "head", "hctl", "relay", "ple").
+Qwen's composition (`family/qwen.rs::blocks`): `Units` (snake, at most one gap slot), `Scores`
+when any layer attends, `Gdn` + `Onorm` when any layer is GDN, `HeadEast`, `TokenLoop` under the
+contract's token loop. Its kernels are `kernels::q35` (`weight_q35.csl`, `ctl_cx.csl`,
+`ctl_cy_q35.csl`) with `kernels::head` and `common::RELAY`.
 
-## Kernel params
+## Kernels and their ABI
 
-A kind's `KernelBuild::params` (the family's `kernels()`) hold for all its PEs; `emit::params::tile`
-resolves one PE's list: the kind's, then what its role implies (`role_params`: a row run's `Hc` and
-`ATT` 1 / 2 on `WeightPart::{AttnRow, PlainRow}` where the plan has several runs; `SH 1` and the
-unit's MLP width a column `Ic` from its layers; `NTW 1` on store PEs outside every storage block,
-Gemma's route-only pass PEs), then the family's notes (`U:<NAME>` for a whole unit, `P:<NAME>` for
-one PE). Levers (`split-geo --levers`, `mkfull.py`'s last argument) override a param in every kind
-that takes it; `<kind>.<NAME>` (the kind's `RoleKind::name`: `w.FIFOW:16`, E4B's weight FIFO) in
-that kind only. A lever no kernel takes is an error.
+```rust
+params! {
+    /// `head_pe.csl`'s params ...
+    pub struct HeadPe { VR: u32, HDc: u32, NPX: u32, HACC16: u32 }
+}
 
-`layout.csl` is written from the floor: each maximal rectangle of PEs with one kind and one resolved
-param list is one loop nest, every param a literal, so `link.sh` passes no shape params (the layout's
-`SPLIT_GEO` param marks such a build; `mod.rs::is_split` finds it in `out.json`). The per-kind
-sources are the kernels', copied.
+pub const HEAD_PE: Kernel = Kernel {
+    source: "head_pe.csl",
+    owns: &["hw", "hg", "rcfg", "hemb", "tdbg"],
+    params: HeadPe::NAMES,
+    route_slots: 12,
+    rcfg: Some(head_pe),           // fn(&Pe) -> Result<Vec<u32>, String>
+};
+
+// in the family's kernels():
+out.insert(Kind::HEAD, KernelBuild::of(&HEAD_PE, HeadPe { VR: vr, HDc: 2 * hc, NPX: 1, HACC16: 0 })?);
+```
+
+An rcfg writer reads one PE through `Pe`: `pe.member(slot)` / `root` / `halves` / `colour` /
+`turn` (the queues the links bound), `pe.note(key)`, `pe.c(class)` (the palette), `pe.parks(n)`,
+`pe.spare(finals, comptime)`, `pe.routes(slots)`, `pe.role()`. The shared leading words are
+`common::{weight, cx, cy, head, hctl}` over `words!` structs (`WeightWords`, `CxWords`, `CyWords`,
+`HeadWords`, `HctlWords`); a kernel passes what is its own (`weight`'s two words and turn width,
+`CxIo`'s flags / finals / tail, `cy`'s segment, `HeadIo`) and appends its tail.
+
+Params resolve per PE in `emit::params::tile`: the kind's `KernelBuild::params`, then the PE's
+`Overrides` (each must be a param the kind takes). Levers (`split-geo --levers`, `mkfull.py`'s last
+argument) override a param in every kind that takes it; `<kind>.<NAME>` (`w.FIFOW:16`, E4B's
+weight FIFO) in that kind only; a lever no kernel takes is an error.
+
+`layout.csl` is written from the floor: each maximal rectangle of PEs with one kind and one
+resolved param list is one loop nest, every param a literal, so `link.sh` passes no shape params
+(the layout's `SPLIT_GEO` param marks such a build; `mod.rs::is_split` finds it in `out.json`).
+The per-kind sources are the kernels', with one-word dummies for the family's other exported
+symbols (`Family::symbols`, export order).
+
+## Porting a family onto blocks
+
+gpt-oss, Gemma 4 E2B / E4B and Gemma 4 12B still run as one `block::Legacy` each: their old
+`floor` / `wire` / `palette` / `bindings` as `block::Whole`, their old per-kind kernel tables with
+the family's one rcfg function (`block::legacy_kernels`), the old role-implied params
+(`block::legacy_overrides`). Their output is the pre-port output byte for byte. To port one:
+
+1. **List the blocks.** Start from the standard ones and their order: units first, then what
+   places against them, then wiring-only blocks. Reuse a block where its doc fits exactly;
+   otherwise write a new block module under `block/` (a new block, not a flag on a shared one).
+   Likely new blocks:
+   - gpt-oss: `band` (the head as a band below the units with a control *row*: its floor, its
+     handoff down the MoE columns, the band bus, the embedding's return up unit 0's MoE column);
+     `router` segments on the CY row (MoE columns); the attention / MoE halves are kinds the units
+     block's roles are refined into (`WA`, `WM`, `CYA`, `CYM` with `FloorBuilder::each_role`, in a
+     `moe_columns` block or the band's floor step).
+   - Gemma: `ple` (the storage columns above each unit column, their token word `TB` and bus `PB`,
+     the route-only pass PEs; `Place::Store`), `shared_kv` (the KVS line from the source unit's
+     CY row through its sharers); the units with explicit origins (`UnitLayout::Explicit`) are the
+     standard `Units` with a Gemma `UnitCopies`.
+   - Gemma 12B: `head_groups` (the head fed by groups of CX rows, its own head input and token
+     loop: `HEAD_GROUP` chains), row runs (attention / plain rows) as overrides of `Hc` / `ATT`.
+2. **Declare the vocabulary** in the block's module: `pub const BAND_VERT: Class =
+   Class::new("HV2");`, `pub const BUS: Slot = Slot::io("bus");` (pick names no other block uses),
+   `pub const STORE: Kind = Kind::new("ple", "ple");`, notes as `NoteKey` with named value consts;
+   colours in the block's `colours()`. A block that recolours a standard class (gpt-oss's `HE`)
+   declares it again; the later block wins.
+3. **Move the floor and wiring** into `Block::floor` / `Block::wire`. Place against the builder
+   (`b.w` is the floor so far's width); set `b.head` (via `head_east` or directly) if the block is
+   the head. Use the standard wiring functions (`units::unit_chains`, `units::handoff`,
+   `head::head_rows`, `head::head_input`, `token_loop::token_loop`, `wiring::segments`) where they
+   fit; leave notes for the facts a kernel needs (as `head::ROLE` and `token_loop::TURN` do) instead
+   of recomputing them in the rcfg writer.
+4. **Describe the kernels** in `kernels/<family>.rs`: one `params!` struct and one `Kernel` const
+   a CSL source, the writer over `Pe` using `common::*` for the shared words. Shared CSL sources
+   reuse their descriptor (`head::HEAD_CTL` is gpt-oss's and Gemma 12B's too: its writer takes the
+   vocabulary offset along the control line, a row for gpt-oss's band). Values that differ by PE
+   are `Block::overrides` (Gemma's shared-KV units' `SH`, their MLP width `Ic`, the pass PEs'
+   `NTW`; Gemma 12B's row runs' `Hc` / `ATT`).
+5. **Copies** go in each block's `bindings`, in the old placement order (the host's device
+   protocol: compare `calls.log`).
+6. **Delete** the family's `Whole` impl, its per-family `Geom` / geometry struct, its `RcfgAbi`
+   leftovers; when the last one is ported, delete `block::{Whole, Legacy, legacy_kernels,
+   legacy_overrides, standard_palette, standard_colour, standard_units}`.
+7. **Verify** with the baseline harness (below): the family's configs must be identical to the
+   reference capture.
 
 ## Weights
 
-`Family::bindings` lists every copy in placement order: a symbol, a rectangle and a `Source`
+`Program::bindings` lists every copy, the blocks' in order: a symbol, a rectangle and a `Source`
 (`Staged` leading-range blocks, `Slice` for any sub-array: column ranges, per-PE padding, a row
 repeated down or across a rectangle, optional tables; `Rcfg`; `Inline`) with the `Transform`s the
 prep applied. `weights::place` executes them on a `Device`; `tools/split/splitgeo.py` executes the
@@ -151,6 +209,4 @@ transfer may take.
 and each family's tiny (the host's placement, calls and derived values on a recording device; the
 build's per-PE kernel and params, evaluated from `layout.csl` by `layout_eval.py`; the tiny preps),
 and compares two captures. A change that must not change behaviour is checked against the capture
-of the tree before it (README there). This refactor was checked that way against `a4c1f516d`, the
-old per-family geometry (`geo.rs`, `geo/*.rs`, `place*.rs`, the Python `split_geo*.py`), which it
-replaced.
+of the tree before it (README there).

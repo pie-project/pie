@@ -18,24 +18,23 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
+use crate::spatial::split::abi::{KernelBuild, Kernels, Overrides};
+use crate::spatial::split::block::head::{HeadCopies, Hemb};
+use crate::spatial::split::block::{self, Block, Legacy, Whole, head, segments, token_loop, units};
 use crate::spatial::split::emit::meta::Meta;
-use crate::spatial::split::emit::params::KernelBuild;
-use crate::spatial::split::emit::rcfg::RcfgAbi;
-use crate::spatial::split::fabric::{Palette, base_colour};
+use crate::spatial::split::fabric::Palette;
 use crate::spatial::split::family::Family;
-use crate::spatial::split::family::abi::{self, CT6, CxIo, HeadIo, Pe};
-use crate::spatial::split::family::tiles::{HeadCopies, Hemb};
 use crate::spatial::split::floor::{Coord, Floor, FloorBuilder, Rect, UnitGrid, UnitLayout, skip};
+use crate::spatial::split::kernels::Pe;
+use crate::spatial::split::kernels::common::{self as abi, CT6, CxIo, HeadIo};
 use crate::spatial::split::plan::{
     Act, AttnSpec, Contract, FamilyId, HeadPartition, HeadSpec, KvEntries, LayerKind, MlpSpec,
     NormSpec, Partition, Plan, ReduceGroups, RopeSpec, RowRun, Segments, Shape,
 };
 use crate::spatial::split::program::Program;
-use crate::spatial::split::role::{Cx, PeRole, RoleKind, WeightPart};
+use crate::spatial::split::role::{Kind, Place};
 use crate::spatial::split::weights::{Binding, Copies, From, Slice, Transform, chunks, from};
-use crate::spatial::split::wiring::{
-    self, Chain, Class, Half, Multicast, Parity, Path, Slot, Wiring,
-};
+use crate::spatial::split::wiring::{self, Chain, Class, Multicast, Path, Slot, Wiring};
 
 pub struct Gemma12;
 
@@ -43,27 +42,19 @@ type R<T> = Result<T, String>;
 
 // ---------------------------------------------------------------- colours
 
+/// The head-group chains (`CH`), alternating by a member's place in its group.
+pub const HEAD_GROUP: [Class; 2] = Class::pair("CH");
+
 /// Gemma 12B's own colours past the base: the head-group chains (`CH`).
-const OWN: [(Class, u8); 2] = [
-    (Class::HeadGroup(Parity::Even), 4),
-    (Class::HeadGroup(Parity::Odd), 5),
-];
+const OWN: [(Class, u8); 2] = [(HEAD_GROUP[0], 4), (HEAD_GROUP[1], 5)];
 
 /// A class's colour as an rcfg word.
 fn cw(c: Class) -> u32 {
     let own = OWN.iter().find(|(k, _)| *k == c).map(|&(_, v)| v);
     u32::from(
-        own.or_else(|| base_colour(c))
+        own.or_else(|| block::standard_colour(c))
             .expect("gemma12: every class it reads has a colour"),
     )
-}
-
-fn parity(n: usize) -> Parity {
-    if n.is_multiple_of(2) {
-        Parity::Even
-    } else {
-        Parity::Odd
-    }
 }
 
 // ---------------------------------------------------------------- geometries
@@ -372,11 +363,7 @@ impl Geo<'_> {
 
 // ---------------------------------------------------------------- Family
 
-impl Family for Gemma12 {
-    fn id(&self) -> FamilyId {
-        FamilyId::Gemma12
-    }
-
+impl Gemma12 {
     /// The plan from `prep_g12.py`'s meta, the geometry its `geo` names, and the build's `G2` /
     /// `G2W` (default 16 / 24; the tiny 2 / 2).
     fn plan(&self, meta: &Meta) -> R<Plan> {
@@ -564,16 +551,6 @@ impl Family for Gemma12 {
             layers_per_unit: plan.partition.layers_per_unit,
         };
         let mut fb = FloorBuilder::units(&grid, (0, 0))?;
-        // attention rows below RA, plain rows past it
-        fb.each_role(|role| {
-            if let PeRole::Weight(w) = role {
-                w.part = if w.row < d.ra {
-                    WeightPart::AttnRow
-                } else {
-                    WeightPart::PlainRow
-                };
-            }
-        });
         let hx0 = fb.w;
         let head = fb.head_east(hx0, d.hc, d.hr, true);
         Ok(fb.finish(head))
@@ -595,42 +572,48 @@ impl Family for Gemma12 {
         }
         check_groups(d)?;
         let mut w = Wiring::default();
-        wiring::unit_chains(plan, floor, &mut w)?;
+        units::unit_chains(plan, floor, &mut w)?;
         for u in &floor.units {
             for r in 0..d.ra {
                 let pts: Vec<Coord> = (0..d.px)
                     .map(|c| Coord::new(u.col_x(c), u.row_y(r)))
                     .collect();
-                let l1 = [Class::ScoreL1(Half::Lo), Class::ScoreL1(Half::Hi)];
-                wiring::segments(&pts, d.swa, l1, Class::ScoreCast, Slot::Segment, &mut w)?;
+                let l1 = [segments::SCORE_L1[0], segments::SCORE_L1[1]];
+                wiring::segments(
+                    &pts,
+                    d.swa,
+                    true,
+                    (l1, segments::SCORE_CAST, segments::SEGMENT),
+                    &mut w,
+                )?;
             }
         }
         head_in(&g, &mut w)?;
-        wiring::head_rows(plan, floor, &mut w)?;
+        head::head_rows(plan, floor, &mut w)?;
         token_loop(&g, plan.partition.reduce.token_loop, &mut w)?;
         Ok(w)
     }
 
     fn palette(&self, _plan: &Plan) -> Palette {
-        Palette::base(&OWN)
+        block::standard_palette(&OWN)
     }
 
     /// `mkfull_g12.py`'s kinds: each kind's source, owned symbols and tile params (in the
     /// layout's order). A weight / CX PE's `Hc` and a weight PE's `ATT` follow its row run
     /// (attention rows `Hc A`, `ATT 1`; plain rows `Hc W`, `ATT 2`): the params state the plain
-    /// rows', [`crate::spatial::split::emit::params::role_params`] sets each PE's.
-    fn kernels(&self, prog: &Program) -> R<BTreeMap<RoleKind, KernelBuild>> {
+    /// rows', [`crate::spatial::split::block::legacy_overrides`] sets each PE's.
+    fn kinds(&self, prog: &Program) -> R<BTreeMap<Kind, KernelBuild>> {
         let d = Dims::of(&prog.plan)?;
         let ring = u32::from(d.win == 0);
         let mut seen = BTreeSet::new();
         let mut out = BTreeMap::new();
         for (_, role) in prog.floor.roles.iter() {
-            let kind = role.kind();
+            let kind = role.kind;
             if !seen.insert(kind) {
                 continue;
             }
-            let kb = match role {
-                PeRole::Weight(_) => KernelBuild::ints(
+            let kb = match kind {
+                Kind::WEIGHT => KernelBuild::ints(
                     "weight_g12.csl",
                     &["w", "rcfg", "tdbg"],
                     &[
@@ -656,7 +639,7 @@ impl Family for Gemma12 {
                         ("TSTAMP", 0),
                     ],
                 ),
-                PeRole::Cx(_) => KernelBuild::ints(
+                Kind::CX => KernelBuild::ints(
                     "ctl_cx_g12.csl",
                     &["x", "gam", "rcfg", "xdbg", "tdbg", "xred"],
                     &[
@@ -667,7 +650,7 @@ impl Family for Gemma12 {
                         ("XKEEP", 0),
                     ],
                 ),
-                PeRole::Cy(_) => KernelBuild::ints(
+                Kind::CY => KernelBuild::ints(
                     "ctl_cy_g12.csl",
                     &["qkw", "rot", "tab", "rcfg", "tdbg"],
                     &[
@@ -686,19 +669,19 @@ impl Family for Gemma12 {
                         ("HDG", d.hdg),
                     ],
                 ),
-                PeRole::Head(_) => KernelBuild::ints(
+                Kind::HEAD => KernelBuild::ints(
                     "head_g12.csl",
                     &["hw", "hg", "rcfg", "hemb", "tdbg"],
                     &[("VR", d.vr), ("HDc", d.hdc), ("NPX", 1), ("HACC16", 0)],
                 ),
-                PeRole::HeadCtl(_) => KernelBuild::ints(
+                Kind::HEAD_CTL => KernelBuild::ints(
                     "head_ctl.csl",
                     &["res", "rcfg", "tdbg", "ring", "lgt", "force", "nforce"],
                     &[("VR", d.vr), ("FIFOW", 32), ("WFORCE", 0), ("WFN", d.hr)],
                 ),
                 // the filler: the empty kernel the layout writes itself
-                PeRole::Idle => continue,
-                other => return Err(format!("split g12: no {other:?} PEs")),
+                Kind::IDLE => continue,
+                other => return Err(format!("split g12: no {} PEs", other.name)),
             };
             out.insert(kind, kb);
         }
@@ -775,10 +758,9 @@ impl Family for Gemma12 {
         }
         // the head, in its two halves' files (one is over the 2 GiB a staged file may take)
         HeadCopies {
-            x0: g.hx0(),
             cols: d.hc,
             rows: d.hr,
-            hw: &|i, rows, (c0, c1)| Slice::of(&format!("hw{i}"), None, vec![rows, (0, c1 - c0)]),
+            hw: |i, rows, (c0, c1)| Slice::of(&format!("hw{i}"), None, vec![rows, (0, c1 - c0)]),
             hw_from: vec![(
                 "embed_tokens.weight".into(),
                 vec![
@@ -789,7 +771,7 @@ impl Family for Gemma12 {
             hg_from: from("norm.weight"),
             hemb: Hemb::None,
         }
-        .put(&mut out);
+        .put(&mut out, g.hx0());
         Ok(out.0)
     }
 }
@@ -829,15 +811,15 @@ fn head_in(g: &Geo, w: &mut Wiring) -> R<()> {
         let hx = g.hx(c as u32);
         w.path(Path {
             pts: (xcx..=hx).map(|x| Coord::new(x, y)).collect(),
-            class: Class::HandoffAcross,
-            send: Slot::XOut,
-            recv: Slot::HeadIn,
+            class: units::HANDOFF_ACROSS,
+            send: units::X_OUT,
+            recv: head::HEAD_IN,
         });
         w.multicast(Multicast {
             pts: (0..d.hr).map(|yy| Coord::new(hx, yy)).collect(),
             src: y as usize,
-            class: Class::HeadColCast,
-            slot: Slot::Family("g12.hm"),
+            class: head::HEAD_COL_CAST,
+            slot: Slot::io("g12.hm"),
         });
         for k in 1..grp.len() {
             w.path(Path {
@@ -845,9 +827,9 @@ fn head_in(g: &Geo, w: &mut Wiring) -> R<()> {
                     Coord::new(xcx, g.ry(ul, grp[k])),
                     Coord::new(xcx, g.ry(ul, grp[k - 1])),
                 ],
-                class: Class::HeadGroup(parity(k)),
-                send: Slot::Family("g12.ch.out"),
-                recv: Slot::Family("g12.ch.in"),
+                class: HEAD_GROUP[k % 2],
+                send: Slot::io("g12.ch.out"),
+                recv: Slot::io("g12.ch.in"),
             });
         }
     }
@@ -865,11 +847,11 @@ fn token_loop(g: &Geo, g2w: u32, w: &mut Wiring) -> R<()> {
     w.chain(Chain {
         pts: (0..hr).map(|y| Coord::new(hcol, y)).collect(),
         root: (hr / 2) as usize,
-        l1: [Class::LoopL1(Half::Lo), Class::LoopL1(Half::Hi)],
-        l2: wiring::level2(Class::LoopL2, g2w),
-        cast: Class::LoopCast,
+        l1: [token_loop::LOOP_L1[0], token_loop::LOOP_L1[1]],
+        l2: wiring::level2(token_loop::LOOP_L2, g2w),
+        cast: token_loop::LOOP_CAST,
         loopback: false,
-        slot: Slot::LoopReduce,
+        slot: token_loop::LOOP_REDUCE,
     });
     if g.origin(0).1 != g.origin(g.units() - 1).1 {
         return Err("split g12: unit 0 shares the last unit's rows".into());
@@ -880,23 +862,23 @@ fn token_loop(g: &Geo, g2w: u32, w: &mut Wiring) -> R<()> {
         let te = g.ry(0, grp[0]);
         w.path(Path {
             pts: (0..hr).rev().map(|y| Coord::new(x, y)).collect(),
-            class: Class::EmbUp,
-            send: Slot::Family("g12.va.out"),
-            recv: Slot::Family("g12.va.in"),
+            class: token_loop::EMB_UP,
+            send: Slot::io("g12.va.out"),
+            recv: Slot::io("g12.va.in"),
         });
         if te > 0 {
             w.path(Path {
                 pts: (0..=te).map(|y| Coord::new(x, y)).collect(),
-                class: Class::EmbDown,
-                send: Slot::Family("g12.vs.out"),
-                recv: Slot::Family("g12.vs.in"),
+                class: token_loop::EMB_DOWN,
+                send: Slot::io("g12.vs.out"),
+                recv: Slot::io("g12.vs.in"),
             });
         }
         w.path(Path {
             pts: (xcx..=x).rev().map(|xx| Coord::new(xx, te)).collect(),
-            class: Class::EmbWest,
-            send: Slot::Family("g12.he.out"),
-            recv: Slot::EmbIn,
+            class: token_loop::EMB_WEST,
+            send: Slot::io("g12.he.out"),
+            recv: token_loop::EMB_IN,
         });
         for k in 1..grp.len() {
             w.path(Path {
@@ -904,9 +886,9 @@ fn token_loop(g: &Geo, g2w: u32, w: &mut Wiring) -> R<()> {
                     Coord::new(xcx, g.ry(0, grp[k - 1])),
                     Coord::new(xcx, g.ry(0, grp[k])),
                 ],
-                class: Class::HeadGroup(parity(k)),
-                send: Slot::Family("g12.ch.out"),
-                recv: Slot::Family("g12.ch.in"),
+                class: HEAD_GROUP[k % 2],
+                send: Slot::io("g12.ch.out"),
+                recv: Slot::io("g12.ch.in"),
             });
         }
     }
@@ -929,14 +911,14 @@ struct CxChain {
 
 /// A CX's head-group chain: on the last unit the x chain north into the group root
 /// (`head_in`), on unit 0 the embedding's chain south from it (`wloop`, applied after).
-fn cx_chain(g: &Geo, cx: &Cx) -> CxChain {
+fn cx_chain(g: &Geo, cx: &CxPe) -> CxChain {
     let d = &g.d;
     let mut ch = CxChain::default();
     let Some((gi, k)) = d.group_of(cx.row) else {
         return ch;
     };
     let len = d.groups[gi].len();
-    let hcol = |k: usize| cw(Class::HeadGroup(parity(k)));
+    let hcol = |k: usize| cw(HEAD_GROUP[k % 2]);
     if cx.last {
         ch.nfx = d.after(gi, k);
         if k > 0 {
@@ -960,12 +942,12 @@ fn cx_chain(g: &Geo, cx: &Cx) -> CxChain {
     ch
 }
 
-impl RcfgAbi for Gemma12 {
+impl Gemma12 {
     /// The weight kernel's 18 route slots, the others' 12.
-    fn route_slots(&self, kind: RoleKind) -> usize {
+    fn route_slots(kind: Kind) -> usize {
         match kind {
-            RoleKind::Weight | RoleKind::WeightAttn | RoleKind::WeightMoe => 18,
-            RoleKind::Relay => 4,
+            Kind::WEIGHT => 18,
+            Kind::RELAY => 4,
             _ => 12,
         }
     }
@@ -981,19 +963,21 @@ impl RcfgAbi for Gemma12 {
             d: Dims::of(&prog.plan)?,
         };
         let d = &g.d;
-        let pal = self.palette(&prog.plan);
-        let pe = Pe::new(prog, &pal, at);
+        let pe = Pe::new(prog, at);
         let flush = |u: u32| u as usize == g.units() - 1;
-        match prog.floor.roles.get(at) {
-            PeRole::Weight(wt) => {
-                let (pre, post) = (pe.turn(Slot::RelayPre), pe.turn(Slot::RelayPost));
-                let fl = u32::from(wt.col == 0) | if flush(wt.unit) { 4 } else { 0 };
-                let hn = 2 * d.hc_of(wt.row) + 1;
-                abi::weight(&pe, 18, wt.row, [fl, 0], hn, [pre, post])
+        match prog.floor.roles.get(at).place {
+            Place::Weight { unit, row, col } => {
+                let (pre, post) = (pe.turn(units::RELAY_PRE), pe.turn(units::RELAY_POST));
+                let fl = u32::from(col == 0) | if flush(unit) { 4 } else { 0 };
+                let hn = 2 * d.hc_of(row) + 1;
+                abi::weight(&pe, 18, row, [fl, 0], hn, [pre, post])
             }
-            PeRole::Cx(cx) => {
+            Place::Cx {
+                row, first, last, ..
+            } => {
+                let cx = CxPe { row, first, last };
                 let pk = pe.parks(4)?;
-                let ch = cx_chain(&g, cx);
+                let ch = cx_chain(&g, &cx);
                 let mut fl = 0;
                 if cx.last {
                     fl |= 8 | 16 | if ch.member { 64 | 2 } else { 0 };
@@ -1004,9 +988,9 @@ impl RcfgAbi for Gemma12 {
                 let (ci, co) = (ch.ci.unwrap_or(pk[3]), ch.co.unwrap_or(pk[3]));
                 let x = CxIo {
                     first: cx.first,
-                    inn: pe.colour(Slot::XIn),
-                    out: pe.colour(Slot::XOut),
-                    emb: pe.colour(Slot::EmbIn),
+                    inn: pe.colour(units::X_IN),
+                    out: pe.colour(units::X_OUT),
+                    emb: pe.colour(token_loop::EMB_IN),
                     flags: fl,
                     finals: vec![ci],
                     tail: vec![
@@ -1018,33 +1002,119 @@ impl RcfgAbi for Gemma12 {
                 };
                 abi::cx(&pe, x, 4, &CT6)
             }
-            PeRole::Cy(cy) => {
+            Place::Cy { unit, .. } => {
                 let mut w = abi::cy(&pe, None)?;
-                w.extend_from_slice(&[if flush(cy.unit) { 4 } else { 0 }, 0, 0, 0, 0]);
+                w.extend_from_slice(&[if flush(unit) { 4 } else { 0 }, 0, 0, 0, 0]);
                 Ok(w)
             }
-            PeRole::Head(hd) => {
-                let grp0 = d.groups[hd.col as usize][0];
-                let xr = if hd.row == g.ry(g.units() - 1, grp0) {
+            Place::Head { row, col } => {
+                let grp0 = d.groups[col as usize][0];
+                let xr = if row == g.ry(g.units() - 1, grp0) {
                     2
                 } else {
                     0
                 };
-                let tr = u32::from(hd.row == 0) | if hd.row == g.ry(0, grp0) { 2 } else { 0 };
+                let tr = u32::from(row == 0) | if row == g.ry(0, grp0) { 2 } else { 0 };
                 let h = HeadIo {
-                    row: hd.row,
-                    xr,
+                    row,
+                    role: xr,
                     relay_north: false,
-                    tr,
+                    turns: tr,
                     token_loop: true,
                 };
                 let mut w = abi::head(&pe, h)?;
-                w.push(d.nx(hd.col as usize));
+                w.push(d.nx(col as usize));
                 Ok(w)
             }
-            PeRole::HeadCtl(hc) => abi::hctl(&pe, hc.row * d.vr, true),
-            PeRole::Idle => Ok(Vec::new()),
+            Place::HeadCtl { row, .. } => abi::hctl(&pe, row * d.vr, true),
             other => Err(format!("{at:?}: no {other:?} in Gemma 12B")),
         }
     }
 }
+
+/// A CX PE's place, as [`cx_chain`] reads it.
+struct CxPe {
+    row: u32,
+    first: bool,
+    last: bool,
+}
+
+impl Whole for Gemma12 {
+    fn floor(&self, plan: &Plan) -> R<Floor> {
+        Gemma12::floor(self, plan)
+    }
+
+    fn wire(&self, plan: &Plan, floor: &Floor) -> R<Wiring> {
+        Gemma12::wire(self, plan, floor)
+    }
+
+    fn palette(&self, plan: &Plan) -> Palette {
+        Gemma12::palette(self, plan)
+    }
+
+    /// Attention rows below `RA` (`ATT 1`), plain rows past it (`ATT 2`).
+    fn overrides(&self, prog: &Program, o: &mut Overrides) -> R<()> {
+        let ra = Dims::of(&prog.plan)?.ra;
+        let floor = &prog.floor;
+        block::legacy_overrides(
+            prog,
+            &|at| match floor.roles.get(at).place {
+                Place::Weight { row, .. } => Some(if row < ra { 1 } else { 2 }),
+                _ => None,
+            },
+            o,
+        )
+    }
+
+    fn bindings(&self, prog: &Program) -> R<Vec<Binding>> {
+        Gemma12::bindings(self, prog)
+    }
+}
+
+impl Family for Gemma12 {
+    fn id(&self) -> FamilyId {
+        FamilyId::Gemma12
+    }
+
+    fn plan(&self, meta: &Meta) -> R<Plan> {
+        Gemma12::plan(self, meta)
+    }
+
+    fn blocks(&self, plan: &Plan) -> R<Vec<Box<dyn Block>>> {
+        Ok(vec![Box::new(Legacy::new(Gemma12, plan))])
+    }
+
+    fn kernels(&self, prog: &Program) -> R<Kernels> {
+        Ok(block::legacy_kernels(
+            self.kinds(prog)?,
+            Gemma12::route_slots,
+            |pe| Gemma12.rcfg(pe.prog, pe.at),
+        ))
+    }
+
+    fn symbols(&self) -> &'static [(&'static str, &'static str)] {
+        SYMBOLS
+    }
+}
+
+/// Every name the kernels export, in export order (`mkfull_g12.py`'s `NAMES`).
+const SYMBOLS: &[(&str, &str)] = &[
+    ("w", "u16"),
+    ("rcfg", "u32"),
+    ("tdbg", "u32"),
+    ("x", "f32"),
+    ("xdbg", "f32"),
+    ("xred", "f32"),
+    ("gam", "f32"),
+    ("qkw", "f32"),
+    ("rot", "f32"),
+    ("tab", "u32"),
+    ("hw", "u16"),
+    ("hg", "f32"),
+    ("hemb", "u16"),
+    ("res", "f32"),
+    ("ring", "u32"),
+    ("lgt", "f32"),
+    ("force", "u32"),
+    ("nforce", "u32"),
+];

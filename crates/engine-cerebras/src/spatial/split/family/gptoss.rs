@@ -17,23 +17,24 @@
 
 use std::collections::BTreeMap;
 
+use crate::spatial::split::abi::{KernelBuild, Kernels, Overrides, Value};
+use crate::spatial::split::block::{self, Block, Legacy, Whole, head, segments, token_loop, units};
 use crate::spatial::split::emit::meta::Meta;
-use crate::spatial::split::emit::params::{KernelBuild, Value};
-use crate::spatial::split::emit::rcfg::RcfgAbi;
 use crate::spatial::split::fabric::Palette;
 use crate::spatial::split::family::Family;
-use crate::spatial::split::family::abi::{self, CT5, CT6, Pe, word};
 use crate::spatial::split::floor::{
     Coord, CtlLine, Floor, FloorBuilder, HeadBlock, Rect, UnitGrid, UnitLayout, skip,
 };
+use crate::spatial::split::kernels::common::{self as abi, CT5, CT6};
+use crate::spatial::split::kernels::{Pe, word};
 use crate::spatial::split::plan::{
     Act, AttnSpec, Contract, FamilyId, HeadPartition, HeadSpec, KvEntries, LayerKind, MlpSpec,
     MoeSpec, NormSpec, Partition, Plan, ReduceGroups, RopeSpec, RowRun, Segments, Shape,
 };
 use crate::spatial::split::program::Program;
-use crate::spatial::split::role::{Cx, Cy, Head, HeadCtl, PeRole, RoleKind, Weight, WeightPart};
+use crate::spatial::split::role::{Kind, PeRole, Place};
 use crate::spatial::split::weights::{Binding, Copies, Slice, Source, Transform, chunks};
-use crate::spatial::split::wiring::{self, Chain, Class, Half, Multicast, Path, Slot, Wiring};
+use crate::spatial::split::wiring::{self, Chain, Class, Multicast, Path, Slot, Wiring};
 
 pub struct GptOss;
 
@@ -57,27 +58,39 @@ pub fn geometry(name: &str) -> Result<serde_json::Value, String> {
 }
 
 // The family's queue slots past the generic ones.
-const ROUTER: Slot = Slot::Family("router");
+const ROUTER: Slot = Slot::io("gptoss.router");
 /// The last unit's x leaving its MoE row for the band (the turn's in / out).
-const BAND_IN: Slot = Slot::Family("band_in");
-const BAND_OUT: Slot = Slot::Family("band_out");
-const BAND_CAST: Slot = Slot::Family("band_cast");
+const BAND_IN: Slot = Slot::io("gptoss.band_in");
+const BAND_OUT: Slot = Slot::io("gptoss.band_out");
+const BAND_CAST: Slot = Slot::io("gptoss.band_cast");
 /// The band bus (`HE`): its east end's send, dims-row 0's take.
-const BUS_TX: Slot = Slot::Family("bus_tx");
-const BUS: Slot = Slot::Family("bus");
+const BUS_TX: Slot = Slot::io("gptoss.bus_tx");
+const BUS: Slot = Slot::io("gptoss.bus");
 /// The embedding's return: up unit 0's MoE column (`V1`) and its turn west (`W2`).
-const V1_TX: Slot = Slot::Family("v1_tx");
-const EMB_IN: Slot = Slot::Family("emb_in");
-const EMB_OUT: Slot = Slot::Family("emb_out");
+const V1_TX: Slot = Slot::io("gptoss.v1_tx");
+const EMB_IN: Slot = Slot::io("gptoss.emb_in");
+const EMB_OUT: Slot = Slot::io("gptoss.emb_out");
+
+/// gpt-oss's kinds past the standard ones: the attention / MoE weight halves and CY halves.
+pub const WA: Kind = Kind::new("wa", "wa");
+pub const WM: Kind = Kind::new("wm", "wm");
+pub const CYA: Kind = Kind::new("cya", "cya");
+pub const CYM: Kind = Kind::new("cym", "cym");
+
+/// The band's handoff down a MoE column, the embedding's return up unit 0's MoE column and
+/// west into its CX.
+pub const BAND_VERT: Class = Class::new("HV2");
+pub const BAND_V1: Class = Class::new("V1");
+pub const BAND_W2: Class = Class::new("W2");
 
 /// gpt-oss's own colours past the base: the band's handoff (`HV2`), its bus (`HE`, the
 /// embedding's return west), the return up unit 0's MoE column (`V1`) and west into its CX (`W2`).
 const HE: u8 = 10;
 const OWN: [(Class, u8); 4] = [
-    (Class::EmbWest, HE),
-    (Class::BandVert, 9),
-    (Class::BandV1, 8),
-    (Class::BandW2, 13),
+    (token_loop::EMB_WEST, HE),
+    (BAND_VERT, 9),
+    (BAND_V1, 8),
+    (BAND_W2, 13),
 ];
 
 /// Every physical quantity the family derives from a plan.
@@ -168,52 +181,52 @@ impl Geom {
         let (x, y) = (c.x, c.y);
         if y >= self.hb0 {
             if x >= self.hvc {
-                return PeRole::Idle;
+                return PeRole::IDLE;
             }
             let ly = y - self.hb0;
             if ly == self.hxc {
-                return PeRole::HeadCtl(HeadCtl {
-                    row: x,
-                    root: x == self.hvc / 2,
-                });
+                return PeRole::new(
+                    Kind::HEAD_CTL,
+                    Place::HeadCtl {
+                        row: x,
+                        root: x == self.hvc / 2,
+                    },
+                );
             }
-            return PeRole::Head(Head {
-                row: ly - u32::from(ly > self.hxc),
-                col: x,
-            });
+            return PeRole::new(
+                Kind::HEAD,
+                Place::Head {
+                    row: ly - u32::from(ly > self.hxc),
+                    col: x,
+                },
+            );
         }
         let (ux, uy) = (x / self.uw, y / self.uh);
         if ux >= self.unx || uy >= self.uny {
-            return PeRole::Idle;
+            return PeRole::IDLE;
         }
         let o = (ux * self.uw, uy * self.uh);
         let Some(unit) = units.iter().position(|&u| u == o) else {
-            return PeRole::Idle;
+            return PeRole::IDLE;
         };
         let unit = unit as u32;
         let (lx, ly) = (x - o.0, y - o.1);
         let row = ly - u32::from(ly > self.cy);
         let col = lx - u32::from(lx > self.cx);
-        let part = if lx < self.cx {
-            WeightPart::Attn
-        } else {
-            WeightPart::Moe
-        };
+        let attn = lx < self.cx;
         match (lx == self.cx, ly == self.cy) {
-            (true, true) => PeRole::Idle,
-            (true, false) => PeRole::Cx(Cx {
-                unit,
-                row,
-                first: unit == 0,
-                last: unit as usize == units.len() - 1,
-            }),
-            (false, true) => PeRole::Cy(Cy { unit, col, part }),
-            _ => PeRole::Weight(Weight {
-                unit,
-                row,
-                col,
-                part,
-            }),
+            (true, true) => PeRole::IDLE,
+            (true, false) => PeRole::new(
+                Kind::CX,
+                Place::Cx {
+                    unit,
+                    row,
+                    first: unit == 0,
+                    last: unit as usize == units.len() - 1,
+                },
+            ),
+            (false, true) => PeRole::new(if attn { CYA } else { CYM }, Place::Cy { unit, col }),
+            _ => PeRole::new(if attn { WA } else { WM }, Place::Weight { unit, row, col }),
         }
     }
 }
@@ -284,11 +297,7 @@ impl Dims {
     }
 }
 
-impl Family for GptOss {
-    fn id(&self) -> FamilyId {
-        FamilyId::GptOss
-    }
-
+impl GptOss {
     /// The plan from a `prep_gptoss.py` meta: the geometry name's table (`geo`), the checkpoint
     /// dims the prep wrote (`HD`, `K`, `KM`, `Hc`, `Qh`, `Dc`, `Ic`, `NEX`, `TK`, `HR`, `NLV`, `VR`,
     /// `V`, `WIN`), the build's `G2` / `G2W` / `NE` / `CAP` / `LOOP` / `WL`.
@@ -493,11 +502,11 @@ impl Family for GptOss {
                 w.chain(Chain {
                     pts: (0..=g.px).map(|lx| Coord::new(x0 + lx, y)).collect(),
                     root: g.cx as usize,
-                    l1: [Class::RowL1(Half::Lo), Class::RowL1(Half::Hi)],
-                    l2: wiring::level2(Class::RowL2, g.g2.row),
-                    cast: Class::RowCast,
+                    l1: [units::ROW_L1[0], units::ROW_L1[1]],
+                    l2: wiring::level2(units::ROW_L2, g.g2.row),
+                    cast: units::ROW_CAST,
                     loopback: false,
-                    slot: Slot::RowReduce,
+                    slot: units::ROW_REDUCE,
                 });
                 w.turn(wiring::loopback(Coord::new(x0 + g.cx, y)));
                 // the scores segments on the attention columns
@@ -506,11 +515,11 @@ impl Family for GptOss {
                     w.chain(Chain {
                         pts: seg.to_vec(),
                         root: seg.len() / 2,
-                        l1: [Class::ScoreL1(Half::Lo), Class::ScoreL1(Half::Hi)],
+                        l1: [segments::SCORE_L1[0], segments::SCORE_L1[1]],
                         l2: None,
-                        cast: Class::ScoreCast,
+                        cast: segments::SCORE_CAST,
                         loopback: false,
-                        slot: Slot::Segment,
+                        slot: segments::SEGMENT,
                     });
                 }
             }
@@ -519,11 +528,11 @@ impl Family for GptOss {
                 w.chain(Chain {
                     pts: (0..=g.py).map(|ly| Coord::new(x, y0 + ly)).collect(),
                     root: g.cy as usize,
-                    l1: [Class::ColL1(Half::Lo), Class::ColL1(Half::Hi)],
-                    l2: wiring::level2(Class::ColL2, g.g2.col),
-                    cast: Class::ColCast,
+                    l1: [units::COL_L1[0], units::COL_L1[1]],
+                    l2: wiring::level2(units::COL_L2, g.g2.col),
+                    cast: units::COL_CAST,
                     loopback: false,
-                    slot: Slot::ColReduce,
+                    slot: units::COL_REDUCE,
                 });
                 w.turn(wiring::loopback(Coord::new(x, y0 + g.cy)));
             }
@@ -536,16 +545,16 @@ impl Family for GptOss {
                 w.chain(Chain {
                     pts: seg.to_vec(),
                     root: seg.len() / 2,
-                    l1: [Class::OnormL1(Half::Lo), Class::OnormL1(Half::Hi)],
+                    l1: [segments::ONORM_L1[0], segments::ONORM_L1[1]],
                     l2: None,
-                    cast: Class::OnormCast,
+                    cast: segments::ONORM_CAST,
                     loopback: false,
                     slot: ROUTER,
                 });
             }
         }
         for u in 0..n.saturating_sub(1) {
-            wiring::handoff(floor, u, u + 1, &mut w)?;
+            units::handoff(floor, u, u + 1, &mut w)?;
         }
         self.head_in(&g, floor, &mut w)?;
         // the band's dims-columns: chains into the control row
@@ -553,11 +562,11 @@ impl Family for GptOss {
             w.chain(Chain {
                 pts: (0..=g.py).map(|ly| Coord::new(j, g.hb0 + ly)).collect(),
                 root: g.hxc as usize,
-                l1: [Class::RowL1(Half::Lo), Class::RowL1(Half::Hi)],
-                l2: wiring::level2(Class::RowL2, g.g2.head),
-                cast: Class::HeadRowWord,
+                l1: [units::ROW_L1[0], units::ROW_L1[1]],
+                l2: wiring::level2(units::ROW_L2, g.g2.head),
+                cast: head::HEAD_ROW_WORD,
                 loopback: false,
-                slot: Slot::HeadRowReduce,
+                slot: head::HEAD_ROW_REDUCE,
             });
             w.turn(wiring::loopback(Coord::new(j, g.hb0 + g.hxc)));
         }
@@ -568,13 +577,13 @@ impl Family for GptOss {
     }
 
     fn palette(&self, _plan: &Plan) -> Palette {
-        Palette::base(&OWN)
+        block::standard_palette(&OWN)
     }
 
     /// `mkfull_gptoss.py`'s kinds: sources, owned symbols and each kind's `@set_tile_code` params
     /// in its order, with the serving defaults (`DIAG` / `TSTAMP` / `XKEEP` / `XDLY` / `PFTZ` /
     /// `WFORCE` 0, `GLUV` 1, `CYV` 2, `FIFOW` 32, `NE` / `WIN` from the plan).
-    fn kernels(&self, prog: &Program) -> Result<BTreeMap<RoleKind, KernelBuild>, String> {
+    fn kinds(&self, prog: &Program) -> Result<BTreeMap<Kind, KernelBuild>, String> {
         let d = Dims::of(&prog.plan)?;
         let g = Geom::of(&prog.plan)?;
         let qsc = 1.0f64 / f64::from(prog.plan.shape.attn.head_dim).sqrt();
@@ -582,7 +591,7 @@ impl Family for GptOss {
         let (diag, ts, fifow) = (i(0), i(0), i(32));
         let mut out = BTreeMap::new();
         out.insert(
-            RoleKind::WeightAttn,
+            WA,
             KernelBuild::new(
                 "weight_gptoss_att.csl",
                 &["w", "rcfg", "tdbg"],
@@ -605,7 +614,7 @@ impl Family for GptOss {
             ),
         );
         out.insert(
-            RoleKind::WeightMoe,
+            WM,
             KernelBuild::new(
                 "weight_gptoss_moe.csl",
                 &["wx", "wr", "rcfg", "tdbg"],
@@ -622,7 +631,7 @@ impl Family for GptOss {
             ),
         );
         out.insert(
-            RoleKind::Cx,
+            Kind::CX,
             KernelBuild::new(
                 "ctl_cx_gptoss.csl",
                 &["x", "gam", "bo", "bd", "rcfg", "xdbg", "tdbg", "xred"],
@@ -638,7 +647,7 @@ impl Family for GptOss {
             ),
         );
         out.insert(
-            RoleKind::CyAttn,
+            CYA,
             KernelBuild::new(
                 "ctl_cy_gptoss_att.csl",
                 &["qb", "snk", "rot", "rcfg", "tdbg"],
@@ -659,7 +668,7 @@ impl Family for GptOss {
             ),
         );
         out.insert(
-            RoleKind::CyMoe,
+            CYM,
             KernelBuild::new(
                 "ctl_cy_gptoss_moe.csl",
                 &["rb", "gb", "ps", "rcfg", "tdbg"],
@@ -677,7 +686,7 @@ impl Family for GptOss {
             ),
         );
         out.insert(
-            RoleKind::Head,
+            Kind::HEAD,
             KernelBuild::new(
                 "head_pe_gptoss.csl",
                 &["hw", "hg", "rcfg", "hemb", "tdbg"],
@@ -685,7 +694,7 @@ impl Family for GptOss {
             ),
         );
         out.insert(
-            RoleKind::HeadCtl,
+            Kind::HEAD_CTL,
             KernelBuild::new(
                 "head_ctl.csl",
                 &["res", "rcfg", "tdbg", "ring", "lgt", "force", "nforce"],
@@ -698,7 +707,7 @@ impl Family for GptOss {
             ),
         );
         // the filler: memcpy's unblock only, no source file (the layout writes it inline)
-        out.insert(RoleKind::Idle, KernelBuild::filler());
+        out.insert(Kind::IDLE, KernelBuild::filler());
         Ok(out)
     }
 
@@ -830,21 +839,21 @@ impl GptOss {
             }
             w.path(Path {
                 pts: (x0 + g.cx..=xr).map(|x| Coord::new(x, y)).collect(),
-                class: Class::HandoffOut,
-                send: Slot::XOut,
+                class: units::HANDOFF_OUT,
+                send: units::X_OUT,
                 recv: BAND_IN,
             });
             let yb = g.by(r);
             w.path(Path {
                 pts: (y..=yb).map(|yy| Coord::new(xr, yy)).collect(),
-                class: Class::BandVert,
+                class: BAND_VERT,
                 send: BAND_OUT,
-                recv: Slot::HeadIn,
+                recv: head::HEAD_IN,
             });
             w.multicast(Multicast {
                 pts: (0..g.hvc).map(|j| Coord::new(j, yb)).collect(),
                 src: xr as usize,
-                class: Class::HeadColCast,
+                class: head::HEAD_COL_CAST,
                 slot: BAND_CAST,
             });
         }
@@ -859,11 +868,11 @@ impl GptOss {
         w.chain(Chain {
             pts: (0..g.hvc).map(|j| Coord::new(j, yc)).collect(),
             root: (g.hvc / 2) as usize,
-            l1: [Class::LoopL1(Half::Lo), Class::LoopL1(Half::Hi)],
-            l2: wiring::level2(Class::LoopL2, g.g2.token_loop),
-            cast: Class::LoopCast,
+            l1: [token_loop::LOOP_L1[0], token_loop::LOOP_L1[1]],
+            l2: wiring::level2(token_loop::LOOP_L2, g.g2.token_loop),
+            cast: token_loop::LOOP_CAST,
             loopback: false,
-            slot: Slot::LoopReduce,
+            slot: token_loop::LOOP_REDUCE,
         });
         let u0 = floor.units.first().ok_or("gpt-oss: no units")?;
         let (ux, uy) = (u0.rect.x, u0.rect.y);
@@ -877,7 +886,7 @@ impl GptOss {
             let yb = g.by(i);
             w.path(Path {
                 pts: (0..g.hvc).rev().map(|j| Coord::new(j, yb)).collect(),
-                class: Class::EmbWest,
+                class: token_loop::EMB_WEST,
                 send: BUS_TX,
                 recv: BUS,
             });
@@ -890,15 +899,15 @@ impl GptOss {
             pts.extend((yu..yb).rev().map(|yy| Coord::new(ci, yy)));
             w.path(Path {
                 pts,
-                class: Class::BandV1,
+                class: BAND_V1,
                 send: V1_TX,
                 recv: EMB_IN,
             });
             w.path(Path {
                 pts: (ux + g.cx..=ci).rev().map(|x| Coord::new(x, yu)).collect(),
-                class: Class::BandW2,
+                class: BAND_W2,
                 send: EMB_OUT,
-                recv: Slot::EmbIn,
+                recv: token_loop::EMB_IN,
             });
         }
         Ok(())
@@ -907,12 +916,12 @@ impl GptOss {
 
 // ---------------------------------------------------------------- rcfg
 
-impl RcfgAbi for GptOss {
-    fn route_slots(&self, kind: RoleKind) -> usize {
+impl GptOss {
+    fn route_slots(kind: Kind) -> usize {
         match kind {
-            RoleKind::WeightAttn | RoleKind::WeightMoe | RoleKind::Weight => 16,
-            RoleKind::Relay => 4,
-            RoleKind::Idle => 0,
+            WA | WM | Kind::WEIGHT => 16,
+            Kind::RELAY => 4,
+            Kind::IDLE => 0,
             _ => 12,
         }
     }
@@ -923,39 +932,40 @@ impl RcfgAbi for GptOss {
     /// head and head control PEs (never parked on the bus, which counts as final).
     fn rcfg(&self, prog: &Program, at: Coord) -> Result<Vec<u32>, String> {
         let g = Geom::of(&prog.plan)?;
-        let pal = self.palette(&prog.plan);
-        let mut pe = Pe::new(prog, &pal, at);
-        match prog.floor.roles.get(at) {
-            PeRole::Weight(wt) => {
-                let rwc = u32::from(wt.part == WeightPart::Moe && wt.col == g.ax);
+        let mut pe = Pe::new(prog, at);
+        let role = *prog.floor.roles.get(at);
+        match role.place {
+            Place::Weight { row, col, .. } => {
+                let rwc = u32::from(role.kind == WM && col == g.ax);
                 let turn = |s: Slot, inn: Slot, out: Slot| {
                     pe.turn(s).or_else(|| pe.colour(inn).zip(pe.colour(out)))
                 };
                 let relays = [
-                    turn(Slot::RelayPre, EMB_IN, EMB_OUT),
-                    turn(Slot::RelayPost, BAND_IN, BAND_OUT),
+                    turn(units::RELAY_PRE, EMB_IN, EMB_OUT),
+                    turn(units::RELAY_POST, BAND_IN, BAND_OUT),
                 ];
-                let mx = pe.c(Class::RowCast)?;
-                let mut w = abi::weight(&pe, 16, wt.row, [rwc, mx], g.hcc, relays)?;
+                let mx = pe.c(units::ROW_CAST)?;
+                let mut w = abi::weight(&pe, 16, row, [rwc, mx], g.hcc, relays)?;
                 w.push(u32::from(pe.colour(EMB_IN).is_some()));
                 Ok(w)
             }
-            PeRole::Cx(cx) => rcfg_cx(&pe, g.wl, cx.first),
-            PeRole::Cy(cy) => {
-                let mut w = abi::cy(&pe, Some((ROUTER, Class::OnormCast)))?;
+            Place::Cx { first, .. } => rcfg_cx(&pe, g.wl, first),
+            Place::Cy { col, .. } => {
+                let mut w = abi::cy(&pe, Some((ROUTER, segments::ONORM_CAST)))?;
                 // a router segment's member index: MoE column c's place in its segment
-                w.push(match cy.part {
-                    WeightPart::Moe => (cy.col - g.ax) % g.swr,
-                    _ => 0,
+                w.push(if role.kind == CYM {
+                    (col - g.ax) % g.swr
+                } else {
+                    0
                 });
                 Ok(w)
             }
-            PeRole::Head(_) => {
-                pe.band = Some(HE);
+            Place::Head { .. } => {
+                pe.reserved = Some(HE);
                 rcfg_head(&pe, g.wl)
             }
-            PeRole::HeadCtl(_) => {
-                pe.band = Some(HE);
+            Place::HeadCtl { .. } => {
+                pe.reserved = Some(HE);
                 abi::hctl(&pe, at.x * g.vr, g.wl)
             }
             r => Err(format!("{at:?}: gpt-oss has no rcfg for {r:?}")),
@@ -978,18 +988,18 @@ fn distinct(at: Coord, what: &str, q: &[u32]) -> Result<(), String> {
 fn rcfg_cx(pe: &Pe, wl: bool, first: bool) -> Result<Vec<u32>, String> {
     let pk = pe.parks(4)?;
     let (inn, out, emb) = (
-        pe.colour(Slot::XIn),
-        pe.colour(Slot::XOut),
-        pe.colour(Slot::EmbIn),
+        pe.colour(units::X_IN),
+        pe.colour(units::X_OUT),
+        pe.colour(token_loop::EMB_IN),
     );
-    let rq = pe.root(Slot::RowReduce)?;
+    let rq = pe.root(units::ROW_REDUCE)?;
     let q = [
         rq.lo.map_or(pk[0], word),
         rq.hi.map_or(pk[1], word),
         pk[2],
         inn.unwrap_or(pk[0]),
-        pe.c(Class::Loopback)?,
-        pe.c(Class::RowCast)?,
+        pe.c(wiring::LOOPBACK)?,
+        pe.c(units::ROW_CAST)?,
         out.unwrap_or(pk[1]),
     ];
     let fl = u32::from(first || inn.is_none())
@@ -1009,13 +1019,13 @@ fn rcfg_cx(pe: &Pe, wl: bool, first: bool) -> Result<Vec<u32>, String> {
 /// the flags (the loop runs, on the bus), the embedding's queues.
 fn rcfg_head(pe: &Pe, wl: bool) -> Result<Vec<u32>, String> {
     let pk = pe.parks(6)?;
-    let ro = pe.member(Slot::HeadRowReduce)?;
-    let src = pe.colour(Slot::HeadIn).is_some();
+    let ro = pe.member(head::HEAD_ROW_REDUCE)?;
+    let src = pe.colour(head::HEAD_IN).is_some();
     let bus = wl && pe.colour(BUS).is_some();
     let (hv2, hm, hr3) = (
-        pe.c(Class::BandVert)?,
-        pe.c(Class::HeadColCast)?,
-        pe.c(Class::HeadRowWord)?,
+        pe.c(BAND_VERT)?,
+        pe.c(head::HEAD_COL_CAST)?,
+        pe.c(head::HEAD_ROW_WORD)?,
     );
     let he = u32::from(HE);
     let q = [
@@ -1038,7 +1048,7 @@ fn rcfg_head(pe: &Pe, wl: bool) -> Result<Vec<u32>, String> {
         u32::from(wl) | if bus { 2 } else { 0 },
         0,
         if wl { he } else { pk[5] },
-        if wl { pe.c(Class::BandV1)? } else { pk[5] },
+        if wl { pe.c(BAND_V1)? } else { pk[5] },
     ]);
     Ok(w)
 }
@@ -1053,3 +1063,80 @@ fn py_float(v: f64) -> String {
         format!("{s}.0")
     }
 }
+
+impl Whole for GptOss {
+    fn floor(&self, plan: &Plan) -> Result<Floor, String> {
+        GptOss::floor(self, plan)
+    }
+
+    fn wire(&self, plan: &Plan, floor: &Floor) -> Result<Wiring, String> {
+        GptOss::wire(self, plan, floor)
+    }
+
+    fn palette(&self, plan: &Plan) -> Palette {
+        GptOss::palette(self, plan)
+    }
+
+    fn overrides(&self, prog: &Program, o: &mut Overrides) -> Result<(), String> {
+        block::legacy_overrides(prog, &|_| None, o)
+    }
+
+    fn bindings(&self, prog: &Program) -> Result<Vec<Binding>, String> {
+        GptOss::bindings(self, prog)
+    }
+}
+
+impl Family for GptOss {
+    fn id(&self) -> FamilyId {
+        FamilyId::GptOss
+    }
+
+    fn plan(&self, meta: &Meta) -> Result<Plan, String> {
+        GptOss::plan(self, meta)
+    }
+
+    fn blocks(&self, plan: &Plan) -> Result<Vec<Box<dyn Block>>, String> {
+        Ok(vec![Box::new(Legacy::new(GptOss, plan))])
+    }
+
+    fn kernels(&self, prog: &Program) -> Result<Kernels, String> {
+        Ok(block::legacy_kernels(
+            self.kinds(prog)?,
+            GptOss::route_slots,
+            |pe| GptOss.rcfg(pe.prog, pe.at),
+        ))
+    }
+
+    fn symbols(&self) -> &'static [(&'static str, &'static str)] {
+        SYMBOLS
+    }
+}
+
+/// Every name the kernels export, in export order (`mkfull_gptoss.py`'s `NAMES`).
+const SYMBOLS: &[(&str, &str)] = &[
+    ("w", "u16"),
+    ("wx", "u16"),
+    ("wr", "f32"),
+    ("rcfg", "u32"),
+    ("tdbg", "u32"),
+    ("x", "f32"),
+    ("xdbg", "f32"),
+    ("xred", "f32"),
+    ("gam", "f32"),
+    ("bo", "f32"),
+    ("bd", "f32"),
+    ("qb", "f32"),
+    ("snk", "f32"),
+    ("rot", "f32"),
+    ("rb", "f32"),
+    ("gb", "f32"),
+    ("ps", "f32"),
+    ("hw", "u16"),
+    ("hg", "f32"),
+    ("hemb", "u16"),
+    ("res", "f32"),
+    ("ring", "u32"),
+    ("lgt", "f32"),
+    ("force", "u32"),
+    ("nforce", "u32"),
+];

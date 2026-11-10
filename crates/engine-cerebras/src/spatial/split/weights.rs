@@ -363,7 +363,7 @@ fn words(
     }))
 }
 
-/// Places every binding of `prog` (its family's [`super::family::Family::bindings`]) on `d`,
+/// Places every binding of `prog` (its blocks' [`super::program::Program::bindings`]) on `d`,
 /// in binding order. An empty rectangle, or an optional slice not staged, is no copy.
 pub fn place(d: &mut dyn Device, prog: &Program, prep: &Path, prefix: &str) -> Result<(), String> {
     let mut staged = Staged {
@@ -372,7 +372,7 @@ pub fn place(d: &mut dyn Device, prog: &Program, prep: &Path, prefix: &str) -> R
         open: HashMap::new(),
     };
     let mut rcfg = None;
-    for b in prog.family.bindings(prog)? {
+    for b in prog.bindings()? {
         let pes = (b.rect.w * b.rect.h) as usize;
         if pes == 0 {
             continue;

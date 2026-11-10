@@ -1,14 +1,17 @@
 //! The fabric: physical colours, every PE's route table and queue bindings, and the hardware
-//! invariants checked on them. [`Fabric::lay`] turns a [`Wiring`] into routes through a family
-//! [`Palette`]; [`Fabric::validate`] refuses a program the CS-3 would hang or miscompute on.
+//! invariants checked on them. [`Fabric::lay`] turns a [`Wiring`] into routes through the
+//! program's [`Palette`] (its blocks' colour declarations); [`Fabric::validate`] refuses a
+//! program the CS-3 would hang or miscompute on.
 
 use std::collections::{BTreeMap, BTreeSet};
 
 use serde::Serialize;
 
 use super::floor::{Coord, Dir, Floor, Grid};
-use super::role::{PeRole, RoleKind};
-use super::wiring::{Chain, Class, Half, Link, Multicast, Parity, Path, Port, Slot, Turn, Wiring};
+use super::role::Kind;
+use super::wiring::{
+    Chain, Class, LOOPBACK, Link, Multicast, NoteKey, Path, Port, Slot, SlotKind, Turn, Wiring,
+};
 
 /// A physical colour (0 .. [`COLOURS`]).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize)]
@@ -54,71 +57,19 @@ impl RouteWord {
     }
 }
 
-/// A family's logical -> physical colour map. Families keep today's constants so every word is
-/// unchanged; a future allocator may assign them instead ([`Palette::allocate`]).
+/// The logical -> physical colour map: every block's declarations ([`super::block::Block::colours`])
+/// in block order, a later declaration of a class replacing an earlier one (a block recolouring a
+/// class it shares). A future allocator may assign them instead ([`Palette::allocate`]).
 #[derive(Clone, Debug, Default, Serialize)]
 pub struct Palette {
     pub map: BTreeMap<Class, Colour>,
 }
 
-/// The role-split kernels' colours (`XA`, `XB`, `MX`, ... as the kernels and tools name them):
-/// every family's palette is this plus its own classes.
-const BASE: [(Class, u8); 35] = {
-    use Class::*;
-    use Half::{Hi, Lo};
-    [
-        (RowL1(Lo), 1),
-        (RowL1(Hi), 2),
-        (RowCast, 3),
-        (ColL1(Lo), 4),
-        (ColL1(Hi), 5),
-        (ColCast, 6),
-        (Loopback, 7),
-        (ScoreL1(Lo), 8),
-        (ScoreL1(Hi), 13),
-        (ScoreCast, 9),
-        (GdnKq, 10),
-        (OnormL1(Lo), 11),
-        (OnormL1(Hi), 17),
-        (OnormCast, 12),
-        (HandoffOut, 0),
-        (HandoffIn, 11),
-        (HandoffAcross, 12),
-        (HandoffVert(Parity::Even), 15),
-        (HandoffVert(Parity::Odd), 14),
-        (RowL2(Lo), 18),
-        (RowL2(Hi), 19),
-        (ColL2(Lo), 20),
-        (ColL2(Hi), 16),
-        (HeadRelay, 4),
-        (HeadColCast, 6),
-        (HeadRowWord, 3),
-        (LoopL1(Lo), 10),
-        (LoopL1(Hi), 11),
-        (LoopL2(Lo), 13),
-        (LoopL2(Hi), 14),
-        (LoopCast, 15),
-        (EmbUp, 5),
-        (EmbDown, 8),
-        (EmbSplit, 9),
-        (EmbWest, 17),
-    ]
-};
-
-/// The base colour of `c`, if it has one.
-pub fn base_colour(c: Class) -> Option<u8> {
-    BASE.iter().find(|(k, _)| *k == c).map(|&(_, v)| v)
-}
-
 impl Palette {
-    /// The base colours with `own` added or replacing.
-    pub fn base(own: &[(Class, u8)]) -> Palette {
+    /// `decls` in order, later ones replacing.
+    pub fn of(decls: impl IntoIterator<Item = (Class, u8)>) -> Palette {
         Palette {
-            map: BASE
-                .iter()
-                .chain(own)
-                .map(|&(k, c)| (k, Colour(c)))
-                .collect(),
+            map: decls.into_iter().map(|(k, c)| (k, Colour(c))).collect(),
         }
     }
 
@@ -180,8 +131,20 @@ impl Palette {
     }
 }
 
-/// A chain member's queues: its role code in the kernel's
-/// chain protocol, its send colour, its level-1 / level-2 receive colours.
+/// A chain member's role code in the kernels' chain protocol.
+pub mod member_role {
+    /// The chain's (or its last group's) far end: sends, receives nothing.
+    pub const LEAF: u32 = 0;
+    /// Receives from the next member out, adds, sends on.
+    pub const MID: u32 = 1;
+    /// A level-2 group's head with members behind it and a group further out.
+    pub const GROUP_HEAD: u32 = 2;
+    /// The last group's head with members behind it.
+    pub const LAST_GROUP_HEAD: u32 = 3;
+}
+
+/// A chain member's queues: its role code ([`member_role`]), its send colour, its level-1 /
+/// level-2 receive colours.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
 pub struct ChainMember {
     pub role: u32,
@@ -213,8 +176,8 @@ pub enum Endpoint {
 #[derive(Clone, Debug, Default, PartialEq, Serialize)]
 pub struct PeIo {
     pub slots: BTreeMap<Slot, Endpoint>,
-    /// The family's [`super::wiring::Note`]s at this PE.
-    pub notes: BTreeMap<&'static str, u32>,
+    /// The blocks' [`super::wiring::Note`]s at this PE.
+    pub notes: BTreeMap<NoteKey, u32>,
 }
 
 /// One route at a PE.
@@ -230,18 +193,9 @@ pub struct Fabric {
     /// Every PE's routes, sorted by colour (one route a colour).
     pub routes: Grid<Vec<Route>>,
     pub io: Grid<PeIo>,
-    /// The palette's [`Class::Loopback`] colour, for the roots' loop-back check.
+    /// The palette's [`LOOPBACK`] colour, for the roots' loop-back check.
     pub loopback: Option<Colour>,
 }
-
-/// Slots of the reductions (a segment's queues never share a colour with these at a PE).
-const REDUCTIONS: [Slot; 4] = [
-    Slot::RowReduce,
-    Slot::ColReduce,
-    Slot::HeadRowReduce,
-    Slot::LoopReduce,
-];
-const SEGMENTS: [Slot; 3] = [Slot::Segment, Slot::Gdn, Slot::Onorm];
 
 impl Endpoint {
     /// The colours it takes from the ramp's input queues.
@@ -316,7 +270,7 @@ impl Lay<'_> {
     /// and a send in one slot (in either order) make a [`Endpoint::Turn`] (a relay: the path
     /// arriving and the path leaving); anything else is a clash.
     fn bind(&mut self, p: Coord, slot: Slot, ep: Endpoint) -> Result<(), String> {
-        if slot == Slot::Pass {
+        if slot.kind == SlotKind::Pass {
             return Ok(());
         }
         self.at(p)?;
@@ -387,7 +341,11 @@ impl Lay<'_> {
                         self.add(p, m, RouteWord::rx(tow) | TX_R)?;
                     }
                     ChainMember {
-                        role: u32::from(k != kmax),
+                        role: if k != kmax {
+                            member_role::MID
+                        } else {
+                            member_role::LEAF
+                        },
                         send,
                         recv1: (k < kmax).then_some(recv),
                         recv2: None,
@@ -413,7 +371,11 @@ impl Lay<'_> {
                             self.add(p, r2, RouteWord::rx(awy) | RouteWord::tx(tow))?;
                         }
                         ChainMember {
-                            role: u32::from(kk != gs),
+                            role: if kk != gs {
+                                member_role::MID
+                            } else {
+                                member_role::LEAF
+                            },
                             send,
                             recv1: (kk < gs).then_some(recv),
                             recv2: None,
@@ -427,14 +389,22 @@ impl Lay<'_> {
                         if q + 1 < qn {
                             self.add(p, r2, RouteWord::rx(awy) | TX_R)?;
                             ChainMember {
-                                role: if has1 { 2 } else { 1 },
+                                role: if has1 {
+                                    member_role::GROUP_HEAD
+                                } else {
+                                    member_role::MID
+                                },
                                 send: s2,
                                 recv1: Some(if has1 { recv } else { r2 }),
                                 recv2: has1.then_some(r2),
                             }
                         } else {
                             ChainMember {
-                                role: if has1 { 3 } else { 0 },
+                                role: if has1 {
+                                    member_role::LAST_GROUP_HEAD
+                                } else {
+                                    member_role::LEAF
+                                },
                                 send: s2,
                                 recv1: has1.then_some(recv),
                                 recv2: None,
@@ -560,7 +530,7 @@ impl Fabric {
     /// level) and `line2` (two-level, groups of `Level2::group`) exactly: the same member role
     /// codes, alternating colours by hop parity, the root's halves.
     ///
-    /// Endpoints bind order-free ([`Slot::Pass`] binds nothing; a receive and a send in one slot
+    /// Endpoints bind order-free ([`super::wiring::PASS`] binds nothing; a receive and a send in one slot
     /// make a [`Endpoint::Turn`]); [`super::wiring::Note`]s with one key at one PE are OR-ed (the
     /// turn bits). Consecutive points of every link must be adjacent.
     pub fn lay(floor: &Floor, w: &Wiring, palette: &Palette) -> Result<Fabric, String> {
@@ -590,7 +560,7 @@ impl Fabric {
         Ok(Fabric {
             routes,
             io: l.io,
-            loopback: palette.map.get(&Class::Loopback).copied(),
+            loopback: palette.map.get(&LOOPBACK).copied(),
         })
     }
 
@@ -697,8 +667,8 @@ impl Fabric {
     ///   [`Fabric::parks`] keeps unbound queues off those too);
     /// - a segment's queues are its own (no colour shared with a reduction's queues on the same
     ///   PE: 0733);
-    /// - every unit-row, unit-column and head-row root loops back to its own ramp on the
-    ///   palette's loop-back colour.
+    /// - every root of a looping reduction ([`SlotKind::Reduce`] `loopback`) loops back to its
+    ///   own ramp on the palette's loop-back colour.
     ///
     /// Path continuity (adjacent points, ramp to ramp) holds by construction in
     /// [`Fabric::lay`]. Route-restore-after-drain and stack room are kernel-side; see
@@ -731,15 +701,15 @@ impl Fabric {
                     }
                 }
             }
-            let colours = |slots: &[Slot]| -> BTreeSet<Colour> {
-                slots
+            let colours = |f: fn(SlotKind) -> bool| -> BTreeSet<Colour> {
+                io.slots
                     .iter()
-                    .filter_map(|s| io.slots.get(s))
-                    .flat_map(|ep| ep.receives().into_iter().chain(ep.sends()))
+                    .filter(|(s, _)| f(s.kind))
+                    .flat_map(|(_, ep)| ep.receives().into_iter().chain(ep.sends()))
                     .collect()
             };
-            let shared: Vec<u8> = colours(&SEGMENTS)
-                .intersection(&colours(&REDUCTIONS))
+            let shared: Vec<u8> = colours(|k| k == SlotKind::Segment)
+                .intersection(&colours(|k| matches!(k, SlotKind::Reduce { .. })))
                 .map(|c| c.0)
                 .collect();
             if !shared.is_empty() {
@@ -748,11 +718,12 @@ impl Fabric {
                 ));
             }
             if let Some(lb) = self.loopback {
-                for s in [Slot::RowReduce, Slot::ColReduce, Slot::HeadRowReduce] {
-                    if matches!(io.slots.get(&s), Some(Endpoint::Root(_)))
+                for (s, ep) in &io.slots {
+                    if s.kind == (SlotKind::Reduce { loopback: true })
+                        && matches!(ep, Endpoint::Root(_))
                         && self.route(p, lb) != Some(RouteWord(RX_R | TX_R))
                     {
-                        return here(format!("the {s:?} root has no loop-back"));
+                        return here(format!("the {} root has no loop-back", s.name));
                     }
                 }
             }
@@ -760,26 +731,27 @@ impl Fabric {
         Ok(())
     }
 
-    /// At most `slots(kind)` routes at every PE that runs a kernel (
-    /// bound, checked up front): `slots` is the family's
-    /// [`super::emit::rcfg::RcfgAbi::route_slots`]. Idle PEs are not checked here (their
-    /// words, if any family reads them, are bounded by [`Fabric::route_words`]).
+    /// At most `slots(kind)` routes at every PE that runs a kernel: `slots` is the kind's
+    /// kernel's route table ([`super::kernel::KernelBuild::route_slots`]; `None`: the program
+    /// builds no kernel for the kind, an error). Idle PEs are not checked here (their words, if
+    /// a kernel reads them, are bounded by [`Fabric::route_words`]).
     pub fn check_route_slots(
         &self,
         floor: &Floor,
-        slots: &dyn Fn(RoleKind) -> usize,
+        slots: &dyn Fn(Kind) -> Option<usize>,
     ) -> Result<(), String> {
         for (p, role) in floor.roles.iter() {
-            if matches!(role, PeRole::Idle) {
+            if role.is_idle() {
                 continue;
             }
-            let (n, max) = (self.routes(p).len(), slots(role.kind()));
+            let kind = role.kind;
+            let max = slots(kind)
+                .ok_or_else(|| format!("fabric: ({}, {}) {}: no kernel", p.x, p.y, kind.name))?;
+            let n = self.routes(p).len();
             if n > max {
                 return Err(format!(
                     "fabric: ({}, {}) {} has {n} routes > {max}",
-                    p.x,
-                    p.y,
-                    role.kind().name()
+                    p.x, p.y, kind.name
                 ));
             }
         }

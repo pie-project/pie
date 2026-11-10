@@ -1,151 +1,118 @@
-//! What each PE is: one [`PeRole`] a PE, set by the floor. A role says which kernel the PE runs
-//! and its static place in the program (unit, local row / column, variant); the queues and
-//! routes it uses are the fabric's ([`super::fabric::PeIo`]).
+//! What each PE is: one [`PeRole`] a PE, set by the floor. A role is the kernel slot it fills
+//! ([`Kind`]: open, a block declares its own) and its static place in the program ([`Place`]: the
+//! role-split architecture's positions, no model in them); the queues and routes it uses are the
+//! fabric's ([`super::fabric::PeIo`]).
 
-use serde::{Deserialize, Serialize};
+use serde::{Serialize, Serializer};
 
-/// A PE's role.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub enum PeRole {
-    /// Unused (a filler corner, the wafer's spare area): an empty kernel.
-    Idle,
-    Weight(Weight),
-    /// A unit row's control PE (row reductions' root, x handoff in / out, embedding in).
-    Cx(Cx),
-    /// A unit column's control PE (column reductions' root, norms, RoPE, attention core, act).
-    Cy(Cy),
-    /// A head weight PE (vocabulary rows of the lm_head).
-    Head(Head),
-    /// The head control line (row reductions of the head, the token loop's max-reduce).
-    HeadCtl(HeadCtl),
-    /// A gap slot PE: routes only, relays the vertical handoff.
-    Relay,
-    /// Gemma's PLE storage PE.
-    Store(Store),
+/// The kernel slot a PE fills: the key of the layout's kind map, of the kernel builds and of the
+/// rcfg dumps. Open: the architecture's own kinds are the consts here; a block that needs another
+/// (gpt-oss's attention / MoE halves, a storage column) declares a const in its module.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct Kind {
+    /// The name in the rcfg dumps and the levers (`w.FIFOW:16`).
+    pub name: &'static str,
+    /// The file stem of its source in the build directory (`mkfull*.py`'s names).
+    pub stem: &'static str,
 }
 
-/// The kernel a role runs: the key of the layout's kind map and of the kernel params.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
-pub enum RoleKind {
-    Idle,
-    Weight,
-    /// gpt-oss's attention / MoE weight halves (`wa` / `wm`).
-    WeightAttn,
-    WeightMoe,
-    Cx,
-    Cy,
-    /// gpt-oss's CY halves (`cya` / `cym`).
-    CyAttn,
-    CyMoe,
-    Head,
-    HeadCtl,
-    Relay,
-    Store,
+impl Kind {
+    pub const fn new(name: &'static str, stem: &'static str) -> Kind {
+        Kind { name, stem }
+    }
+
+    /// Unused PEs: the empty filler kernel.
+    pub const IDLE: Kind = Kind::new("filler", "filler");
+    /// A unit's weight PEs.
+    pub const WEIGHT: Kind = Kind::new("w", "weight");
+    /// A unit row's control PE (row reductions' root, x handoff in / out, embedding in).
+    pub const CX: Kind = Kind::new("cx", "cx");
+    /// A unit column's control PE (column reductions' root, norms, RoPE, attention core, act).
+    pub const CY: Kind = Kind::new("cy", "cy");
+    /// A head weight PE (vocabulary rows of the lm_head).
+    pub const HEAD: Kind = Kind::new("head", "head");
+    /// The head control line (row reductions of the head, the token loop's max-reduce).
+    pub const HEAD_CTL: Kind = Kind::new("hctl", "hctl");
+    /// A gap slot PE: routes only, relays the vertical handoff.
+    pub const RELAY: Kind = Kind::new("relay", "relay");
+}
+
+impl Serialize for Kind {
+    fn serialize<S: Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+        s.serialize_str(self.name)
+    }
+}
+
+/// Where a PE sits in the role-split program.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+pub enum Place {
+    /// No place (a filler corner, the wafer's spare area, a route-only PE).
+    None,
+    /// A unit's weight PE at local weight row / column (control lines skipped).
+    Weight {
+        unit: u32,
+        row: u32,
+        col: u32,
+    },
+    /// A unit row's control PE; `first` takes the embedding / the token loop's winner, `last`
+    /// sends the final x to the head.
+    Cx {
+        unit: u32,
+        row: u32,
+        first: bool,
+        last: bool,
+    },
+    Cy {
+        unit: u32,
+        col: u32,
+    },
+    Head {
+        row: u32,
+        col: u32,
+    },
+    /// `root`: the token loop's root (ring, force, nforce).
+    HeadCtl {
+        row: u32,
+        root: bool,
+    },
+    /// A storage column's PE: it holds items `[first, first + count)` (none: a route-only PE of
+    /// the column), at `level` from the column's foot, `top` the column's top PE.
+    Store {
+        first: u32,
+        count: u32,
+        level: u32,
+        top: bool,
+    },
+}
+
+/// A PE's role.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+pub struct PeRole {
+    pub kind: Kind,
+    pub place: Place,
 }
 
 impl PeRole {
-    pub fn kind(&self) -> RoleKind {
-        match self {
-            PeRole::Idle => RoleKind::Idle,
-            PeRole::Weight(w) => match w.part {
-                WeightPart::Attn => RoleKind::WeightAttn,
-                WeightPart::Moe => RoleKind::WeightMoe,
-                _ => RoleKind::Weight,
-            },
-            PeRole::Cx(_) => RoleKind::Cx,
-            PeRole::Cy(c) => match c.part {
-                WeightPart::Attn => RoleKind::CyAttn,
-                WeightPart::Moe => RoleKind::CyMoe,
-                _ => RoleKind::Cy,
-            },
-            PeRole::Head(_) => RoleKind::Head,
-            PeRole::HeadCtl(_) => RoleKind::HeadCtl,
-            PeRole::Relay => RoleKind::Relay,
-            PeRole::Store(_) => RoleKind::Store,
+    pub const IDLE: PeRole = PeRole {
+        kind: Kind::IDLE,
+        place: Place::None,
+    };
+
+    pub const fn new(kind: Kind, place: Place) -> PeRole {
+        PeRole { kind, place }
+    }
+
+    pub fn is_idle(&self) -> bool {
+        self.kind == Kind::IDLE
+    }
+
+    /// The unit this PE belongs to (weight, CX and CY PEs).
+    pub fn unit(&self) -> Option<u32> {
+        match self.place {
+            Place::Weight { unit, .. } | Place::Cx { unit, .. } | Place::Cy { unit, .. } => {
+                Some(unit)
+            }
+            _ => None,
         }
     }
-}
-
-impl RoleKind {
-    /// The kind's name in the rcfg dumps and the kernel layout (`geo/*.rs::kind`,
-    /// `mkfull*.py`'s kind maps): "filler", "w", "wa", "wm", "cx", "cy", "cya", "cym", "head",
-    /// "hctl", "relay", "ple".
-    pub fn name(self) -> &'static str {
-        match self {
-            RoleKind::Idle => "filler",
-            RoleKind::Weight => "w",
-            RoleKind::WeightAttn => "wa",
-            RoleKind::WeightMoe => "wm",
-            RoleKind::Cx => "cx",
-            RoleKind::Cy => "cy",
-            RoleKind::CyAttn => "cya",
-            RoleKind::CyMoe => "cym",
-            RoleKind::Head => "head",
-            RoleKind::HeadCtl => "hctl",
-            RoleKind::Relay => "relay",
-            RoleKind::Store => "ple",
-        }
-    }
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct Weight {
-    pub unit: u32,
-    /// Local weight row / column (control lines skipped).
-    pub row: u32,
-    pub col: u32,
-    /// Which part of the unit row it serves.
-    pub part: WeightPart,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub enum WeightPart {
-    /// Every layer's projections (Qwen, Gemma).
-    Dense,
-    /// gpt-oss's attention columns.
-    Attn,
-    /// gpt-oss's MoE columns.
-    Moe,
-    /// Gemma 12B's rows: attention rows (scores segments, KV) or plain rows (projections only).
-    AttnRow,
-    PlainRow,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct Cx {
-    pub unit: u32,
-    pub row: u32,
-    /// The first unit (takes the embedding / the token loop's winner).
-    pub first: bool,
-    /// The last unit (sends the final x to the head).
-    pub last: bool,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct Cy {
-    pub unit: u32,
-    pub col: u32,
-    pub part: WeightPart,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct Head {
-    pub row: u32,
-    pub col: u32,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct HeadCtl {
-    pub row: u32,
-    /// The token loop's root (ring, force, nforce).
-    pub root: bool,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct Store {
-    /// First token, tokens held, its level in the store column, the top PE of the column.
-    pub first_token: u32,
-    pub tokens: u32,
-    pub level: u32,
-    pub top: bool,
 }

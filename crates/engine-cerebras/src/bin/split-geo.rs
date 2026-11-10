@@ -39,7 +39,7 @@ use engine_cerebras::spatial::split::family;
 use engine_cerebras::spatial::split::floor::{HeadBlock, Rect, StoreBlock, Unit};
 use engine_cerebras::spatial::split::plan::Plan;
 use engine_cerebras::spatial::split::program::Program;
-use engine_cerebras::spatial::split::role::RoleKind;
+use engine_cerebras::spatial::split::role::Kind;
 use serde::Serialize;
 
 const WHATS: [&str; 7] = [
@@ -123,7 +123,7 @@ struct FloorFile<'a> {
     relays: &'a [Rect],
     head: &'a HeadBlock,
     stores: &'a [StoreBlock],
-    kinds: Vec<(RoleKind, Rect)>,
+    kinds: Vec<(Kind, Rect)>,
 }
 
 fn write(dir: &Path, name: &str, bytes: &[u8]) -> Result<(), String> {
@@ -250,7 +250,7 @@ fn run() -> Result<(), String> {
         json(&a.out, "meta.json", &Meta::of_plan(&prog.plan))?;
     }
     if want("bindings") {
-        json(&a.out, "bindings.json", &prog.family.bindings(&prog)?)?;
+        json(&a.out, "bindings.json", &prog.bindings()?)?;
     }
     Ok(())
 }

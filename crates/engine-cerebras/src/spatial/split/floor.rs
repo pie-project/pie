@@ -4,7 +4,7 @@
 
 use serde::{Deserialize, Serialize};
 
-use super::role::{Cx, Cy, Head, HeadCtl, PeRole, Weight, WeightPart};
+use super::role::{Kind, PeRole, Place};
 
 /// Position `i` of an axis whose control line sits at `c`, the line skipped.
 pub fn skip(i: u32, c: u32) -> u32 {
@@ -12,7 +12,7 @@ pub fn skip(i: u32, c: u32) -> u32 {
 }
 
 /// The inverse of [`skip`] for a position off the line.
-fn unskip(i: u32, c: u32) -> u32 {
+pub fn unskip(i: u32, c: u32) -> u32 {
     i - u32::from(i > c)
 }
 
@@ -234,7 +234,7 @@ pub struct StoreBlock {
 }
 
 /// The whole floorplan.
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Serialize)]
 pub struct Floor {
     pub w: u32,
     pub h: u32,
@@ -258,10 +258,10 @@ impl Floor {
     /// the layout emitter iterate.
     /// Greedy and deterministic: from the first uncovered PE (row-major), the widest run of its
     /// kind, then as many rows down as repeat that run uncovered.
-    pub fn rects_by_kind(&self) -> Vec<(super::role::RoleKind, Rect)> {
+    pub fn rects_by_kind(&self) -> Vec<(Kind, Rect)> {
         let (w, h) = (self.w, self.h);
         let mut done = vec![false; (w * h) as usize];
-        let kind = |x: u32, y: u32| self.roles.get(Coord::new(x, y)).kind();
+        let kind = |x: u32, y: u32| self.roles.get(Coord::new(x, y)).kind;
         let mut out = Vec::new();
         for y in 0..h {
             for x in 0..w {
@@ -292,23 +292,23 @@ impl Floor {
     }
 }
 
-/// Unit placement strategies the families compose (the snake, Gemma's explicit
-/// origins, gpt-oss's snake that starts upward).
+/// Unit placement strategies (the snake, explicit origins, a snake that starts upward).
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum UnitLayout {
-    /// `unx` x `uny` unit slots visited as a snake; `up_first`: column 0 runs upward (gpt-oss);
-    /// `gaps`: slots left out (relay only).
+    /// `unx` x `uny` unit slots visited as a snake; `up_first`: column 0 runs upward; `gaps`:
+    /// slots left out (relay only).
     Snake {
         unx: u32,
         uny: u32,
         up_first: bool,
         gaps: Vec<(u32, u32)>,
     },
-    /// Explicit unit origins in visit order (Gemma, Gemma 12B).
+    /// Explicit unit origins in visit order.
     Explicit { origins: Vec<(u32, u32)> },
 }
 
-/// The unit size and placement a family asks for; [`FloorBuilder`] turns it into units.
+/// The unit size and placement a units block asks for; [`FloorBuilder::add_units`] turns it
+/// into units.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct UnitGrid {
     /// Weight columns / rows a unit (the control column / row come on top).
@@ -322,32 +322,62 @@ pub struct UnitGrid {
     pub layers_per_unit: u32,
 }
 
-/// Generic floor construction the families call; each family adds its own blocks (head,
-/// stores) and fills roles through [`FloorBuilder::set_role`].
+/// The floor under construction: each block adds its PEs in order (the units first, then the
+/// blocks placed against them: the head, storage columns), then [`FloorBuilder::build`].
+#[derive(Default)]
 pub struct FloorBuilder {
     pub w: u32,
     pub h: u32,
     pub units: Vec<Unit>,
     pub relays: Vec<Rect>,
     pub stores: Vec<StoreBlock>,
+    pub head: Option<HeadBlock>,
     roles: Grid<PeRole>,
 }
 
+impl Default for Grid<PeRole> {
+    fn default() -> Self {
+        Grid::filled(0, 0, PeRole::IDLE)
+    }
+}
+
 impl FloorBuilder {
-    /// Units per `grid`, the wafer sized to hold them plus `extra` (w, h) for the family's
-    /// blocks; every unit PE gets its generic role (weight / CX / CY / filler corner) and gap
-    /// slots `Relay`.
+    /// A finished floor to build on.
+    pub fn of(f: Floor) -> FloorBuilder {
+        FloorBuilder {
+            w: f.w,
+            h: f.h,
+            units: f.units,
+            relays: f.relays,
+            stores: f.stores,
+            head: Some(f.head),
+            roles: f.roles,
+        }
+    }
+
+    /// [`FloorBuilder::add_units`] on an empty floor.
+    pub fn units(grid: &UnitGrid, extra: (u32, u32)) -> Result<FloorBuilder, String> {
+        let mut b = FloorBuilder::default();
+        b.add_units(grid, extra)?;
+        Ok(b)
+    }
+
+    /// Units per `grid` onto an empty floor, the wafer sized to hold them plus `extra` (w, h)
+    /// for the blocks that follow; every unit PE gets its role (weight / CX / CY / an idle
+    /// corner) and gap slots [`Kind::RELAY`].
     ///
     /// The units' bounding box is `unx (cols + 1)` x `uny (rows + 1)` for a snake (gap slots
     /// included), the farthest origin plus a unit for explicit origins. The wafer is that box
-    /// plus `extra`: `extra.0` columns east (the head block's `hx0` is the box's width) and
-    /// `extra.1` rows below (`w = hx0 + HC + 1`, `h = max(UNY UH, HR)`: a family passes `(HC + 1, HR.saturating_sub(box height))`). A block elsewhere (gpt-oss's
-    /// band below) passes `(0, 0)` and calls [`FloorBuilder::grow`].
+    /// plus `extra`: `extra.0` columns east, `extra.1` rows below. A block elsewhere grows the
+    /// wafer itself ([`FloorBuilder::grow`]).
     ///
-    /// Unit `u` runs layers `[u K, (u + 1) K)`. Generic roles: `Weight { part: Dense }` at
-    /// local (c, r), `Cx { first: u == 0, last: u == n - 1 }`, `Cy { part: Dense }`, `Idle` at
-    /// the corner; a family overwrites them where its kernels differ (gpt-oss's halves).
-    pub fn units(grid: &UnitGrid, extra: (u32, u32)) -> Result<FloorBuilder, String> {
+    /// Unit `u` runs layers `[u K, (u + 1) K)`. Roles: [`Kind::WEIGHT`] at local (c, r),
+    /// [`Kind::CX`] (`first: u == 0`, `last: u == n - 1`), [`Kind::CY`], idle at the corner; a
+    /// block overwrites the kinds its kernels differ in ([`FloorBuilder::each_role`]).
+    pub fn add_units(&mut self, grid: &UnitGrid, extra: (u32, u32)) -> Result<(), String> {
+        if !self.units.is_empty() || self.w > 0 {
+            return Err("floor: units go onto an empty floor".into());
+        }
         if grid.cx > grid.cols || grid.cy > grid.rows {
             return Err(format!(
                 "floor: control lines ({}, {}) outside a {} x {} unit",
@@ -381,12 +411,7 @@ impl FloorBuilder {
                     order.iter().map(|&(ux, uy)| (ux * uw, uy * uh)).collect();
                 let gaps: Vec<Rect> = gaps
                     .iter()
-                    .map(|&(gx, gy)| Rect {
-                        x: gx * uw,
-                        y: gy * uh,
-                        w: uw,
-                        h: uh,
-                    })
+                    .map(|&(gx, gy)| Rect::new(gx * uw, gy * uh, uw, uh))
                     .collect();
                 (origins, gaps, unx * uw, uny * uh)
             }
@@ -399,49 +424,38 @@ impl FloorBuilder {
         if origins.is_empty() {
             return Err("floor: no units".into());
         }
-        let w = bw + extra.0;
-        let h = bh + extra.1;
-        let mut roles = Grid::filled(w, h, PeRole::Idle);
+        self.grow(bw + extra.0, bh + extra.1);
         let n = origins.len() as u32;
         let k = grid.layers_per_unit;
-        let mut units = Vec::with_capacity(origins.len());
         for (i, &(x0, y0)) in origins.iter().enumerate() {
             let u = i as u32;
-            let rect = Rect {
-                x: x0,
-                y: y0,
-                w: uw,
-                h: uh,
-            };
-            if units.iter().any(|o: &Unit| overlap(&o.rect, &rect)) {
+            let rect = Rect::new(x0, y0, uw, uh);
+            if self.units.iter().any(|o: &Unit| overlap(&o.rect, &rect)) {
                 return Err(format!("floor: unit {u} at ({x0}, {y0}) overlaps another"));
             }
             for ly in 0..uh {
                 for lx in 0..uw {
+                    let (row, col) = (unskip(ly, grid.cy), unskip(lx, grid.cx));
                     let role = match (lx == grid.cx, ly == grid.cy) {
-                        (true, true) => PeRole::Idle,
-                        (true, false) => PeRole::Cx(Cx {
-                            unit: u,
-                            row: unskip(ly, grid.cy),
-                            first: u == 0,
-                            last: u + 1 == n,
-                        }),
-                        (false, true) => PeRole::Cy(Cy {
-                            unit: u,
-                            col: unskip(lx, grid.cx),
-                            part: WeightPart::Dense,
-                        }),
-                        (false, false) => PeRole::Weight(Weight {
-                            unit: u,
-                            row: unskip(ly, grid.cy),
-                            col: unskip(lx, grid.cx),
-                            part: WeightPart::Dense,
-                        }),
+                        (true, true) => PeRole::IDLE,
+                        (true, false) => PeRole::new(
+                            Kind::CX,
+                            Place::Cx {
+                                unit: u,
+                                row,
+                                first: u == 0,
+                                last: u + 1 == n,
+                            },
+                        ),
+                        (false, true) => PeRole::new(Kind::CY, Place::Cy { unit: u, col }),
+                        (false, false) => {
+                            PeRole::new(Kind::WEIGHT, Place::Weight { unit: u, row, col })
+                        }
                     };
-                    *roles.get_mut(Coord::new(x0 + lx, y0 + ly)) = role;
+                    self.set_role(Coord::new(x0 + lx, y0 + ly), role);
                 }
             }
-            units.push(Unit {
+            self.units.push(Unit {
                 index: u,
                 rect,
                 cx: grid.cx,
@@ -452,18 +466,12 @@ impl FloorBuilder {
         for g in &gaps {
             for y in g.y..g.y + g.h {
                 for x in g.x..g.x + g.w {
-                    *roles.get_mut(Coord::new(x, y)) = PeRole::Relay;
+                    self.set_role(Coord::new(x, y), PeRole::new(Kind::RELAY, Place::None));
                 }
             }
         }
-        Ok(FloorBuilder {
-            w,
-            h,
-            units,
-            relays: gaps,
-            stores: Vec::new(),
-            roles,
-        })
+        self.relays = gaps;
+        Ok(())
     }
 
     pub fn set_role(&mut self, c: Coord, role: PeRole) {
@@ -474,21 +482,20 @@ impl FloorBuilder {
         self.roles.get(c)
     }
 
-    /// Applies `f` to every PE's role (a family's refinement of the generic roles).
+    /// Applies `f` to every PE's role (a block's refinement of the generic roles).
     pub fn each_role(&mut self, f: impl FnMut(&mut PeRole)) {
         self.roles.cells.iter_mut().for_each(f);
     }
 
-    /// Grows the wafer to at least `w` x `h` (a family's head or store block past the units);
-    /// new PEs are `Idle`.
+    /// Grows the wafer to at least `w` x `h` (a block past the units); new PEs are idle.
     pub fn grow(&mut self, w: u32, h: u32) {
         let (nw, nh) = (w.max(self.w), h.max(self.h));
         if (nw, nh) == (self.w, self.h) {
             return;
         }
-        let mut roles = Grid::filled(nw, nh, PeRole::Idle);
+        let mut roles = Grid::filled(nw, nh, PeRole::IDLE);
         for (c, r) in self.roles.iter() {
-            *roles.get_mut(c) = r.clone();
+            *roles.get_mut(c) = *r;
         }
         self.roles = roles;
         self.w = nw;
@@ -505,24 +512,38 @@ impl FloorBuilder {
         for y in 0..rows {
             for i in 0..=cols {
                 let role = if i == hxc {
-                    PeRole::HeadCtl(HeadCtl {
-                        row: y,
-                        root: token_loop && y == root.y,
-                    })
+                    PeRole::new(
+                        Kind::HEAD_CTL,
+                        Place::HeadCtl {
+                            row: y,
+                            root: token_loop && y == root.y,
+                        },
+                    )
                 } else {
-                    PeRole::Head(Head {
-                        row: y,
-                        col: unskip(i, hxc),
-                    })
+                    PeRole::new(
+                        Kind::HEAD,
+                        Place::Head {
+                            row: y,
+                            col: unskip(i, hxc),
+                        },
+                    )
                 };
                 self.set_role(Coord::new(x0 + i, y), role);
             }
         }
-        HeadBlock {
+        let head = HeadBlock {
             rect: Rect::new(x0, 0, cols + 1, rows),
             ctl: CtlLine::Column(x0 + hxc),
             root,
-        }
+        };
+        self.head = Some(head.clone());
+        head
+    }
+
+    /// The floor, its head the one a block set.
+    pub fn build(self) -> Result<Floor, String> {
+        let head = self.head.clone().ok_or("floor: no block placed a head")?;
+        Ok(self.finish(head))
     }
 
     pub fn finish(self, head: HeadBlock) -> Floor {
