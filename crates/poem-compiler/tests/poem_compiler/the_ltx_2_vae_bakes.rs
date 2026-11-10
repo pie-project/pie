@@ -67,7 +67,7 @@ fn the_shapes_are_the_ltx_decoders() {
     let plan = trace(FLAGSHIP);
     assert!(
         plan.caches.iter().all(
-            |row| matches!(row, poem_ir::CacheRow::Kv { name, .. } if name.starts_with("te.kv."))
+            |row| matches!(row, poem_ir::CacheRow::Kv { name, .. } if name.starts_with("te.layers."))
         ),
         "a non-causal decoder holds nothing between fires"
     );

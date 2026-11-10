@@ -1,6 +1,7 @@
 # The pieces the diffusion transformers share: a projection and its bias,
-# laid out, read and run; an adaLN projection's slices reordered; and
-# attention over rows grouped by their own permutation and offsets.
+# laid out, read and run; an adaLN projection's slices reordered;
+# attention over rows grouped by their own permutation and offsets; and the
+# Qwen3 text encoder holding its keys and values as state.
 
 def linear(out, in_, banks, bias = True):
     """A projection from `in_` to `out` and, unless `bias` is off, its bias."""
@@ -73,3 +74,39 @@ def attend(q, k, v, rows, over, head_dim, sm_scale, mask):
         mask,
     )
     return ops.gather.unpack_rows(o, rows.perm)
+
+def held_text_encoder(te, kv):
+    """The Qwen3 text encoder `te` (lib/qwen3_encoder.poem's `encoder`),
+    each layer's keys and values the state of its kv heads in `kv` in place
+    of the row name `qwen3_caches` declares. It stands in until that lib,
+    which a package still declaring `caches()` shares, holds its own state."""
+
+    def layer(w):
+        return struct(
+            attn_norm = w.attn_norm,
+            q = w.q,
+            k = w.k,
+            v = w.v,
+            o = w.o,
+            q_norm = w.q_norm,
+            k_norm = w.k_norm,
+            mlp_norm = w.mlp_norm,
+            gate = w.gate,
+            up = w.up,
+            down = w.down,
+            kv = state([tokens, 2, te.kv_heads, te.head_dim], kv),
+        )
+
+    return struct(
+        hidden = te.hidden,
+        vocab = te.vocab,
+        q_heads = te.q_heads,
+        kv_heads = te.kv_heads,
+        head_dim = te.head_dim,
+        inter = te.inter,
+        theta = te.theta,
+        eps = te.eps,
+        sm_scale = te.sm_scale,
+        embed = te.embed,
+        layers = [layer(w) for w in te.layers],
+    )

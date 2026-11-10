@@ -2,8 +2,8 @@
 # of its transformer alone.
 
 load("//lib/spoken.poem", "QWEN_STOP")
-load("//lib/dit.poem", "adaln_order", "attend", "chunks", "linear", "norm_modulate", "reordered")
-load("//lib/qwen3_encoder.poem", "QWEN3_4B", "encoder", "qwen3_caches", "qwen3_encode", "te_read")
+load("//lib/dit.poem", "held_text_encoder", "adaln_order", "attend", "chunks", "linear", "norm_modulate", "reordered")
+load("//lib/qwen3_encoder.poem", "QWEN3_4B", "encoder", "qwen3_encode", "te_read")
 load("//lib/vae.poem", "conv_head", "convolve", "flux_vae", "read_conv", "vae_conv", "vae_decode", "vae_encode", "vae_read")
 
 NO_THINKING = template("chatml", thinking = True, generation_suffix = "<think>\n\n</think>\n\n", stop = QWEN_STOP)
@@ -114,14 +114,13 @@ def layout(id, deploy):
         fail("plain MHA over 128-wide heads: heads × 128 is the width")
     dim = d.dim
     klein = id == "flux2-klein-4b"
-    te = encoder(QWEN3_4B, TE_TAPS[-1], banks) if klein else None
+    te = held_text_encoder(encoder(QWEN3_4B, TE_TAPS[-1], banks), dtype.bf16) if klein else None
     te_context = [
         weight([dim, QWEN3_4B.hidden], banks)
         for i in range(len(TE_TAPS))
     ] if klein else None
     return struct(
         dims = d,
-        kv = dtype.bf16,
         in_channels = IN_CHANNELS,
         pack = PACK,
         head_dim = HEAD_DIM,
@@ -326,10 +325,6 @@ ROPE_THETA = 2000.0
 T_MAX_PERIOD = 10000.0
 GUIDANCE_SCALE = 1000.0
 NORM_EPS = 1e-6
-
-def caches(m, c):
-    if m.te != None:
-        qwen3_caches(m.te, c, m.kv)
 
 def forward(m, inputs):
     text_reading = ["text"] if m.te != None else []

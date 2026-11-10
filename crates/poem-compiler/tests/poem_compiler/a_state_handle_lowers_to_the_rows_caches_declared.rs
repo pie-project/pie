@@ -185,6 +185,57 @@ fn gpt_oss(path: &str, _row: &CacheRow) -> String {
     }
 }
 
+/// A VAE conv's frames, by the conv's place in the decoder (`vae.`) or the
+/// encoder (`vae.enc.`).
+fn wan_2(path: &str, _row: &CacheRow) -> String {
+    let conv = match parts(path)[..] {
+        ["vae", "enc", "down", b, "resnets", r, conv, "cache"] => {
+            format!("enc.down.{b}.res.{r}.{conv}")
+        }
+        ["vae", "enc", "down", b, "downsampler", conv, "cache"] => format!("enc.down.{b}.{conv}"),
+        ["vae", "up", b, "resnets", r, conv, "cache"] => format!("up.{b}.res.{r}.{conv}"),
+        ["vae", "up", b, "upsampler", conv, "cache"] => format!("up.{b}.{conv}"),
+        ["vae", "enc", res, conv, "cache"] if res.starts_with("mid_res") => {
+            format!("enc.mid.res.{}.{conv}", &res[7..])
+        }
+        ["vae", res, conv, "cache"] if res.starts_with("mid_res") => {
+            format!("mid.res.{}.{conv}", &res[7..])
+        }
+        ["vae", "enc", conv, "cache"] => format!("enc.{conv}"),
+        ["vae", conv, "cache"] => conv.to_string(),
+        _ => return path.to_string(),
+    };
+    format!("vae.{conv}.frames")
+}
+
+fn ltx_2(path: &str, _row: &CacheRow) -> String {
+    match parts(path)[..] {
+        ["te", "layers", l, "kv"] => format!("te.kv.{l}"),
+        _ => path.to_string(),
+    }
+}
+
+fn flux_2(path: &str, _row: &CacheRow) -> String {
+    match parts(path)[..] {
+        ["te", "layers", l, "kv"] => format!("te.kv.{l}"),
+        _ => path.to_string(),
+    }
+}
+
+fn z_image(path: &str, _row: &CacheRow) -> String {
+    match parts(path)[..] {
+        ["te", "layers", l, "kv"] => format!("te.kv.{l}"),
+        _ => path.to_string(),
+    }
+}
+
+fn hunyuan_image_3(path: &str, _row: &CacheRow) -> String {
+    match parts(path)[..] {
+        ["layers", l, "kv"] => format!("kv.{l}"),
+        _ => path.to_string(),
+    }
+}
+
 /// Every listed deployment of `package`, at one rank and at each count of
 /// [`RANKS`] it traces at.
 fn deployments(package: &str) -> Vec<Deployment> {
@@ -239,10 +290,11 @@ fn left_space_zero_empty(deployment: &str) -> bool {
 }
 
 /// Whether `caches()` declared `package`'s windowed space before its
-/// whole-sequence one: MiMo-V2's, space 0 its windowed layers' and space 1
-/// its full layers'. Spaces are now numbered whole-sequence first.
+/// whole-sequence one: MiMo-V2's (space 0 its windowed layers', space 1 its
+/// full layers') and LTX-2's text encoder (space 0 its sliding layers', space 1
+/// its global layers'). Spaces are now numbered whole-sequence first.
 fn window_space_first(package: &str) -> bool {
-    package == "mimo_v2"
+    package == "mimo_v2" || package == "ltx_2"
 }
 
 fn renamed(package: &str, deployment: &str, trace: &Trace, rename: Renaming) -> Vec<CacheRow> {
@@ -364,5 +416,10 @@ mod moved {
         qwen3_asr,
         qwen3_tts,
         gpt_oss,
+        wan_2,
+        ltx_2,
+        flux_2,
+        z_image,
+        hunyuan_image_3,
     );
 }
