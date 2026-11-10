@@ -66,3 +66,4 @@ Per the user's speed rule, full suites were stopped; everything marked NOT RUN s
 - poem-compiler: `the_dsv41_plan_is_the_published_one`, `the_dsv41_dspark_head_drafts_through_its_stages` (look up
   old row names like `pool.2`).
 - engine-cuda (sm_120): `a_conv_decoder_fires_over_a_voxel_input` ("reopened slot drifts").
+- runtime on wasm32 (pre-existing on main, offload/*.rs uses tokio::spawn / tokio::time; new-memory doesn't touch it).
