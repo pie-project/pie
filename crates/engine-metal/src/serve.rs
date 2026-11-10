@@ -671,11 +671,8 @@ impl PreparedLoad<'_> {
             });
             let least = Layout::least_chunks(chunk, bytes, rows.pieces, seated.pages_per_slot)
                 + window_chunks;
-            // The compressor side planes hold a cell a token of every list
-            // slot the pool could hold: a chunk costs its share of them.
-            let side = rows.side_bytes * chunk.checked_div(rows.list_bytes).unwrap_or(0);
             let room = boot.kv_budget.unwrap_or_else(|| accounting(0).pool);
-            let total = engine::chunk::fit(room, chunk + side, 0, least)
+            let total = engine::chunk::fit(room, chunk, 0, least)
                 .map_err(|short| Fault::Residency(short.to_string()))?;
             // The pool is one buffer.
             let binds = u32::try_from(device.max_buffer() / chunk).unwrap_or(u32::MAX);
@@ -711,7 +708,7 @@ impl PreparedLoad<'_> {
             let pages = u64::from(layout.list.map_or(0, |list| list.per_chunk)) * u64::from(total);
             (
                 paging_at(pages, boot.slots)?,
-                (chunk + side) * u64::from(total),
+                chunk * u64::from(total),
                 layout,
             )
         };
@@ -4197,7 +4194,18 @@ impl engine::frame::Shell for Shell {
             keepalive.touch();
             keepalive.begin();
         }
-        fire_trace(|| "encode-begin".to_string());
+        fire_trace(|| {
+            let lanes: Vec<String> = prepared
+                .lanes
+                .iter()
+                .map(|lane| format!("{}+{}", lane.held.unwrap_or(0), lane.lane.tokens.len()))
+                .collect();
+            format!(
+                "encode-begin rows={} lanes=[{}]",
+                prepared.descriptor.rows,
+                lanes.join(" ")
+            )
+        });
         let walked = if self.weights.tier().is_some() || self.weights.rows().is_some() {
             let trace = crate::diag::on().tier_trace;
             let before = trace.then(|| {

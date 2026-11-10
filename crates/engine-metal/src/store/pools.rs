@@ -50,14 +50,15 @@ enum Row {
         piece_atoms: u32,
         map: usize,
     },
-    /// The compressor state a pool gather keeps beside kv row `row`:
-    /// side planes `kv` and `score`, a cell a token of every physical list
-    /// slot.
+    /// The compressor state a pool gather keeps beside kv row `row`, in
+    /// that row's slots (the recipe's `RowId::Pool` run): a projection plane
+    /// at `kv` and a score plane at `score`, `width` elements a token.
     Compressed {
         row: u32,
         width: u64,
-        kv: usize,
-        score: usize,
+        paging: TablePaging,
+        kv: u64,
+        score: u64,
     },
 }
 
@@ -174,8 +175,6 @@ pub struct Rows {
     /// The page tables a fire stages, by the list each pages: the kv
     /// list's first (the All axis's), then the window list's.
     pub tables: Vec<TablePaging>,
-    /// What one physical list slot's tokens take in the side planes.
-    pub side_bytes: u64,
     /// Each distinct set of record slots a state row's pieces lie in.
     pub bands: Vec<Vec<u32>>,
     pub rs: Option<RsRows>,
@@ -397,17 +396,33 @@ impl Rows {
             None => None,
             Some(layout) => Some(rs_rows(recipe, layout)?),
         };
-        let mut side = 0usize;
-        let mut side_bytes = 0u64;
         for (row, width) in compressed_rows(trace) {
-            side_bytes += 2 * u64::from(tokens) * width * u64::from(elem_size(Dtype::Bf16));
+            let id = RowId::Pool(row);
+            let (paging, run, run_tokens) = if let Some(run) = runs.iter().find(|run| run.row == id)
+            {
+                (TablePaging::List, run, tokens)
+            } else if let Some(run) = window_runs.iter().find(|run| run.row == id) {
+                (TablePaging::Window, run, window_tokens)
+            } else {
+                return Err(disagree(format!(
+                    "keeps no compressor state beside kv row {row}, which a pool gather keys by"
+                )));
+            };
+            let plane = width * u64::from(elem_size(Dtype::Bf16));
+            if run.per_token != 2 * plane {
+                return Err(disagree(format!(
+                    "keeps kv row {row}'s compressor state at {} bytes a token, where this \
+                     shell keeps two {plane}-byte planes",
+                    run.per_token
+                )));
+            }
             rows.push(Row::Compressed {
                 row,
                 width,
-                kv: side,
-                score: side + 1,
+                paging,
+                kv: run.offset,
+                score: run.offset + u64::from(run_tokens) * plane,
             });
-            side += 2;
         }
         Ok(Rows {
             rows,
@@ -424,7 +439,6 @@ impl Rows {
                 tables.sort_by_key(|paging| *paging != TablePaging::List);
                 tables
             },
-            side_bytes,
             bands,
             rs,
             kv_rows,
@@ -500,9 +514,6 @@ pub struct Pools {
     rows: Vec<Row>,
     pool: Pool,
     layout: Layout,
-    /// The compressor side planes, a cell a token of every physical list
-    /// slot.
-    side: Vec<Buffer>,
     /// Every state row's segment table, one after another.
     maps: Option<Buffer>,
     shape_rows: [Vec<u32>; 2],
@@ -565,15 +576,6 @@ impl Pools {
         let list_slots = layout.list.map_or(0, |list| {
             u64::from(list.per_chunk) * u64::from(layout.total_chunks)
         });
-        let cells = list_slots * u64::from(paging.page_size);
-        let mut side = Vec::new();
-        for row in &rows.rows {
-            if let Row::Compressed { width, .. } = *row {
-                let bytes = cells * width * u64::from(elem_size(Dtype::Bf16));
-                side.push(Buffer::zeroed(device, bytes.max(4))?);
-                side.push(Buffer::zeroed(device, bytes.max(4))?);
-            }
-        }
         let mut pools = Pools {
             paging: Paging {
                 pages: list_slots.max(1),
@@ -593,7 +595,6 @@ impl Pools {
             rows: rows.rows,
             pool,
             layout,
-            side,
             disk: None,
             parked: None,
             tier: None,
@@ -1019,21 +1020,20 @@ impl Pools {
         self.paging
     }
 
-    /// The pool's whole range and the side planes: what it takes with every
-    /// segment committed.
+    /// The pool's whole range: what it takes with every segment committed.
     #[must_use]
     pub fn bytes(&self) -> u64 {
-        self.pool.bytes() + self.side.iter().map(Buffer::bytes).sum::<u64>()
+        self.pool.bytes()
     }
 
     #[must_use]
     pub fn committed_bytes(&self) -> u64 {
-        self.pool.committed_bytes() + self.side.iter().map(Buffer::bytes).sum::<u64>()
+        self.pool.committed_bytes()
     }
 
     #[must_use]
     pub fn high_water_bytes(&self) -> u64 {
-        self.pool.high_water_bytes() + self.side.iter().map(Buffer::bytes).sum::<u64>()
+        self.pool.high_water_bytes()
     }
 
     #[must_use]
@@ -1059,23 +1059,29 @@ impl Pools {
                 Row::Compressed {
                     row,
                     width,
+                    paging,
                     kv,
                     score,
                 } => {
-                    let plane = |at: usize| -> Result<Tensor> {
-                        let buffer = &self.side[at];
-                        Ok(Tensor::new(
-                            handles.bind(buffer, 0, buffer.bytes())?,
-                            cells,
-                            u32::try_from(width).unwrap_or(u32::MAX),
-                            Dtype::Bf16,
-                        ))
+                    // In the slots of the row it keys by: that row's page
+                    // ids and page stride.
+                    let plane = Tensor::new(
+                        handles.bind(view, 0, view.bytes())?,
+                        cells,
+                        u32::try_from(width).unwrap_or(u32::MAX),
+                        Dtype::Bf16,
+                    );
+                    let stride = match paging {
+                        TablePaging::List => list_bytes,
+                        TablePaging::Window => self.window_stride(),
                     };
                     compressed.push((
                         row,
                         PoolSlabs {
-                            state_kv: plane(kv)?,
-                            state_score: plane(score)?,
+                            kv: plane,
+                            score: plane,
+                            page_stride: [stride, stride],
+                            plane_offset: [kv, score],
                         },
                     ));
                     continue;
@@ -1198,23 +1204,37 @@ impl Pools {
         Ok(())
     }
 
-    /// Every kv run's place in a list slot: its offset and the bytes a token
-    /// takes there, side planes apart.
+    /// Every token run's place in a list slot: its offset and the bytes a
+    /// token takes there (a kv row's planes, a compressor's state planes).
     fn kv_runs(&self) -> Vec<(u64, u64)> {
         let mut runs = Vec::new();
         for row in &self.rows {
-            if let Row::Kv {
-                keys,
-                values,
-                keys_cell,
-                values_cell,
-                ..
-            } = *row
-            {
-                runs.push((keys, keys_cell));
-                if values != keys {
-                    runs.push((values, values_cell));
+            match *row {
+                Row::Kv {
+                    paging: TablePaging::List,
+                    keys,
+                    values,
+                    keys_cell,
+                    values_cell,
+                    ..
+                } => {
+                    runs.push((keys, keys_cell));
+                    if values != keys {
+                        runs.push((values, values_cell));
+                    }
                 }
+                Row::Compressed {
+                    paging: TablePaging::List,
+                    width,
+                    kv,
+                    score,
+                    ..
+                } => {
+                    let cell = width * u64::from(elem_size(Dtype::Bf16));
+                    runs.push((kv, cell));
+                    runs.push((score, cell));
+                }
+                _ => {}
             }
         }
         runs
@@ -1244,14 +1264,6 @@ impl Pools {
         }
         let list = *self.shape(LIST)?;
         let runs = self.kv_runs();
-        let sides: Vec<u64> = self
-            .rows
-            .iter()
-            .filter_map(|row| match *row {
-                Row::Compressed { width, .. } => Some(width * u64::from(elem_size(Dtype::Bf16))),
-                _ => None,
-            })
-            .collect();
         let view = self.pool.view();
         for (src, dst, span) in placed {
             if span.tokens == 0 {
@@ -1265,17 +1277,6 @@ impl Pools {
                 let to = dst_at + offset + u64::from(span.dst_token) * cell;
                 if from != to {
                     frame.copy_span(view, from, view, to, bytes)?;
-                }
-            }
-            for (at, &cell) in sides.iter().enumerate() {
-                for plane in [&self.side[2 * at], &self.side[2 * at + 1]] {
-                    let cell_at = |page: u32, token: u32| {
-                        (u64::from(page) * page_size + u64::from(token)) * cell
-                    };
-                    let (from, to) = (cell_at(src, span.src_token), cell_at(dst, span.dst_token));
-                    if from != to {
-                        frame.copy_span(plane, from, plane, to, u64::from(span.tokens) * cell)?;
-                    }
                 }
             }
         }
@@ -1542,38 +1543,7 @@ impl Pools {
     /// Moves each evacuated chunk onto its new physical chunk in `frame`
     /// and takes the moves into the chunk table.
     pub fn evacuate(&mut self, frame: &mut Frame, evacuation: &Evacuation) -> Result<()> {
-        // The compressor side planes are indexed by physical page: each
-        // moved chunk's pages move with it.
-        let mut sides = Vec::new();
-        if let Some(list) = self.layout.list
-            && !self.side.is_empty()
-        {
-            let cells = u64::from(list.per_chunk) * u64::from(self.paging.page_size);
-            for &(logical, physical) in &evacuation.moves {
-                sides.push((self.pool.physical(logical)?, physical, cells));
-            }
-        }
         self.pool.evacuate(frame, evacuation)?;
-        for (from, to, cells) in sides {
-            for row in &self.rows {
-                let Row::Compressed {
-                    width, kv: plane, ..
-                } = *row
-                else {
-                    continue;
-                };
-                let cell = width * u64::from(elem_size(Dtype::Bf16));
-                for buffer in [&self.side[plane], &self.side[plane + 1]] {
-                    frame.copy_span(
-                        buffer,
-                        u64::from(from) * cells * cell,
-                        buffer,
-                        u64::from(to) * cells * cell,
-                        cells * cell,
-                    )?;
-                }
-            }
-        }
         Ok(())
     }
 }

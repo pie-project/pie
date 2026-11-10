@@ -85,12 +85,8 @@ pub struct FireTables {
     pub mask_stride: u32,
 }
 
-#[derive(Clone, Copy, Debug)]
-pub struct PoolSlabs {
-    pub state_kv: Tensor,
-
-    pub state_score: Tensor,
-}
+/// A compressor's state beside the kv row its gather keys by.
+pub type PoolSlabs = kernels_metal::attn::pool::PoolState;
 
 #[derive(Clone, Debug)]
 pub struct FireBindings {

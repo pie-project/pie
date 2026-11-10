@@ -348,12 +348,37 @@ enum Job {
     Linear(Compiled<linear::Linear>, Arc<linear::Memory>, linear::Shape),
 }
 
+/// How often a compile is tried: the compiler service can drop its
+/// connection, and a program it never compiles leaves its work to the GPU
+/// for the load's life, which lands other bits.
+const COMPILE_TRIES: u32 = 8;
+
+/// `compile`'s answer, tried again after a refusal up to [`COMPILE_TRIES`].
+fn tried<T>(
+    what: &str,
+    compile: impl Fn() -> std::result::Result<T, String>,
+) -> std::result::Result<T, String> {
+    let mut attempt = 1;
+    loop {
+        match compile() {
+            Err(why) if attempt < COMPILE_TRIES => {
+                eprintln!(
+                    "ane: the Neural Engine {what} program did not compile ({why}); trying again"
+                );
+                std::thread::sleep(std::time::Duration::from_millis(500 * u64::from(attempt)));
+                attempt += 1;
+            }
+            answer => return answer,
+        }
+    }
+}
+
 impl Job {
     fn run(self, cache: &std::path::Path) {
         let started = std::time::Instant::now();
         match self {
             Job::Mlp(slot, memory, shape) => {
-                let result = Ffn::compile(&shape, &memory, cache);
+                let result = tried("MLP", || Ffn::compile(&shape, &memory, cache));
                 match &result {
                     Ok(_) => eprintln!(
                         "ane: Neural Engine MLP program ready in {:.1}s",
@@ -366,7 +391,9 @@ impl Job {
                 let _ = slot.set(result);
             }
             Job::Linear(slot, memory, shape) => {
-                let result = linear::Linear::compile(&shape, &memory, cache);
+                let result = tried(&format!("{} -> {}", shape.k, shape.n), || {
+                    linear::Linear::compile(&shape, &memory, cache)
+                });
                 match &result {
                     Ok(_) => eprintln!(
                         "ane: Neural Engine {} -> {} program ready in {:.1}s",
@@ -576,7 +603,9 @@ impl Private {
             return None;
         }
         let site = self.mlp.as_ref()?;
-        let evaluation = site.ffn.get()?.as_ref().ok()?.evaluation(rows)?;
+        // A fire the Neural Engine could share waits for its program, so
+        // which fires split does not hang on how fast the compile ran.
+        let evaluation = site.ffn.wait().as_ref().ok()?.evaluation(rows)?;
         let split = site.layers.get(&layer)?.split;
         Some(Plan {
             split,
@@ -601,7 +630,7 @@ impl Private {
             return None;
         }
         let site = self.projections.get(index)?;
-        let evaluation = site.program.get()?.as_ref().ok()?.evaluation(rows)?;
+        let evaluation = site.program.wait().as_ref().ok()?.evaluation(rows)?;
         let view = site.layers.get(&layer)?.view;
         Some(Columns {
             view,
