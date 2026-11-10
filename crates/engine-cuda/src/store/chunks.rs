@@ -93,6 +93,12 @@ impl Chunks {
         self.range.segment_bytes_committed()
     }
 
+    /// The unit the range is backed in.
+    #[must_use]
+    pub fn map_unit(&self) -> u64 {
+        self.range.map_unit()
+    }
+
     /// The chunks a fire's activation takes, under the range's end.
     #[must_use]
     pub fn act_chunks(&self) -> u32 {
@@ -122,8 +128,55 @@ impl Chunks {
                 have: room,
             });
         }
-        let held = self.range.held().1.max(bytes);
-        self.range.hold(pool, from, held, beside)
+        self.range.hold(pool, from, bytes, beside)
+    }
+
+    /// Backs the state's chunks of the segment the runtime's activation
+    /// span starts in, and keeps them backed: the runtime counts that
+    /// segment committed from the load and opens state below the activation
+    /// inside it. The span starts `spare` chunks under the activation's own
+    /// ([`Chunks::facts`]).
+    pub fn hold_boundary(&mut self, pool: &mut PhysicalPool, spare: u32) -> Result<Commit> {
+        let chunk = self.layout.chunk_bytes;
+        let start = self.total.saturating_sub(spare);
+        let segment = self.layout.segment_chunks.max(1);
+        let first = start / segment * segment;
+        if first >= start {
+            return Ok(Commit::Committed);
+        }
+        let outcome = self.range.hold(
+            pool,
+            u64::from(first) * chunk,
+            u64::from(start - first) * chunk,
+            false,
+        )?;
+        if outcome == Commit::Committed && first == 0 && !self.null_zeroed {
+            crate::device::zero_span(
+                self.range.span(0, chunk)?,
+                usize::try_from(chunk).unwrap_or(0),
+            )?;
+            self.null_zeroed = true;
+        }
+        Ok(outcome)
+    }
+
+    /// Holds the state's segments to the pool's first `chunks` chunks: what
+    /// the fit left the cache rows of a range reserved for more.
+    pub fn limit(&mut self, chunks: u32) {
+        self.range
+            .limit(u64::from(chunks) * self.layout.chunk_bytes);
+    }
+
+    /// Whether physical chunk `chunk` is backed: in a committed segment, or
+    /// in a span held backed.
+    #[must_use]
+    pub fn backed(&self, chunk: u32) -> bool {
+        self.range
+            .span(
+                u64::from(chunk) * self.layout.chunk_bytes,
+                self.layout.chunk_bytes,
+            )
+            .is_ok()
     }
 
     /// Reserves the range anew for `total` chunks of state, before any
@@ -136,7 +189,9 @@ impl Chunks {
                 "the state pool reshaped under committed chunks",
             ));
         }
-        let held = self.range.held().1;
+        let held = self
+            .range
+            .held(u64::from(self.total) * self.layout.chunk_bytes);
         self.range.release_all(pool);
         let act_bytes = u64::from(self.act) * self.layout.chunk_bytes;
         let mut fresh = Chunks::reserve(pool, self.layout.clone(), total, act_bytes)?;
@@ -237,7 +292,7 @@ impl Chunks {
 
     /// Seats page `id` of today's ids on a slot, opening the lowest free
     /// chunk for its shape where the one being filled is full. The windowed
-    /// id 0 is the null slot. Returns the logical chunk the slot lies in.
+    /// id 0 is the null slot. Returns the physical chunk the slot lies in.
     pub fn seat(&mut self, kind: Kind, id: u32) -> Result<u32> {
         if kind == Kind::Ring && id == 0 {
             return Ok(0);
@@ -254,13 +309,14 @@ impl Chunks {
                     have: u64::from(self.total),
                 });
             }
-            return Ok(chunk);
+            return Ok(self.table.physical(chunk).unwrap_or(chunk));
         }
         let seating = &mut self.seated[kind as usize];
         if let Some(&slot) = seating.refs.get(id as usize)
             && slot != UNSEATED
         {
-            return Ok(slot / per_chunk);
+            let chunk = slot / per_chunk;
+            return Ok(self.table.physical(chunk).unwrap_or(chunk));
         }
         let (chunk, index) = match seating.open {
             Some((chunk, index)) if index < per_chunk => (chunk, index),
@@ -281,7 +337,7 @@ impl Chunks {
             seating.refs.resize(id as usize + 1, UNSEATED);
         }
         seating.refs[id as usize] = chunk * per_chunk + index;
-        Ok(chunk)
+        Ok(self.table.physical(chunk).unwrap_or(chunk))
     }
 
     /// The chunks opened so far, the null chunk among them.

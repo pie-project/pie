@@ -329,21 +329,30 @@ fn served(fixture: &Fixture, cache: &Path) -> Vec<(u64, u32)> {
     steps
 }
 
-/// Slot refs handed out as the runtime's pool would: the lowest free chunk
-/// opened for a shape whose open chunk is full.
+/// Slot refs handed out as the runtime's pool would: a free physical chunk
+/// opened, under the logical id the engine's table places on it, for a
+/// shape whose open chunk is full.
 struct Refs {
     facts: engine::chunk::ChunkFacts,
-    next_chunk: u32,
-    /// Each shape's open chunk and the next index in it.
+    /// The engine's table, kept as its evacuations move it.
+    table: engine::chunk::ChunkTable,
+    /// The logical chunks opened so far.
+    opened: Vec<u32>,
+    /// The next physical chunk to open.
+    next: u32,
+    /// Each shape's open chunk (logical) and the next index in it.
     open: Vec<Option<(u32, u32)>>,
 }
 
 impl Refs {
-    fn of(facts: engine::chunk::ChunkFacts) -> Refs {
+    fn of(facts: engine::chunk::ChunkFacts, first: u32) -> Refs {
         let open = vec![None; facts.shapes.len()];
+        let table = engine::chunk::ChunkTable::identity(facts.total_chunks);
         Refs {
             facts,
-            next_chunk: 1,
+            table,
+            opened: Vec::new(),
+            next: first,
             open,
         }
     }
@@ -357,24 +366,44 @@ impl Refs {
         let (chunk, index) = match self.open[shape] {
             Some((chunk, index)) if index < per_chunk => (chunk, index),
             _ => {
-                self.next_chunk += 1;
-                (self.next_chunk - 1, 0)
+                let logical = self.table.logical(self.next).expect("a chunk of the pool");
+                self.next += 1;
+                self.opened.push(logical);
+                (logical, 0)
             }
         };
         self.open[shape] = Some((chunk, index + 1));
         chunk * per_chunk + index
     }
+
+    /// Moves every opened chunk onto the physical chunks from `first`, in
+    /// the order they were opened.
+    fn evacuate(&mut self, shell: &mut Shell, first: u32) {
+        let moves: Vec<(u32, u32)> = self
+            .opened
+            .iter()
+            .zip(first..)
+            .map(|(&logical, physical)| (logical, physical))
+            .collect();
+        let evacuation = engine::chunk::Evacuation { moves };
+        shell.evacuate(&evacuation).expect("the chunks move");
+        self.table
+            .apply(&evacuation)
+            .expect("the table moves as the engine's");
+    }
 }
 
 /// The model served over [`SCRIPT`] as the runtime's shared pool serves it:
-/// the lane names slot refs of the engine's stated shapes, every segment its
-/// chunks lie in is committed ahead, and after every third step each chunk
-/// opened so far is moved onto another physical chunk (an evacuation), the
-/// refs standing. The logits are the plain serving's, bit for bit.
+/// the lane names slot refs of the engine's stated shapes, in chunks opened
+/// in the pool's second segment, committed ahead. After the third step every
+/// chunk is evacuated into the first segment and the second is released;
+/// after every third step from there the chunks move again, between two
+/// places of the first segment, the refs standing throughout. The logits
+/// are the plain serving's, bit for bit.
 fn served_by_refs(fixture: &Fixture, cache: &Path) -> Vec<(u64, u32)> {
     use engine::chunk::SlotKind;
     let mut shell = load(fixture, cache);
-    let facts = shell.chunk_facts();
+    let facts = shell.chunk_facts().expect("the pool states its chunks");
     facts.validate().expect("the engine's chunk facts hold");
     eprintln!(
         "{}: chunks of {} bytes, shapes {:?}",
@@ -386,15 +415,15 @@ fn served_by_refs(fixture: &Fixture, cache: &Path) -> Vec<(u64, u32)> {
             .map(|shape| (shape.kind, shape.slot_bytes, shape.slots_per_chunk))
             .collect::<Vec<_>>()
     );
-    let mut refs = Refs::of(facts.clone());
+    let segment = facts.segment_chunks;
+    // The places in the first segment the chunks move between.
+    let spread = segment / 2;
+    let mut refs = Refs::of(facts.clone(), segment);
     let list = refs.shape(|kind| matches!(kind, SlotKind::List { .. }));
     let ring = refs.shape(|kind| matches!(kind, SlotKind::Ring { .. }));
     let fixed = refs.shape(|kind| matches!(kind, SlotKind::Fixed { .. }));
     shell.take_refs();
-    // Chunks 1.. hold the lane's slots, and the chunks they move onto lie
-    // half a segment up: all in the first segment.
-    let spread = facts.segment_chunks.max(2) / 2;
-    shell.commit_segments(1).expect("the first segment commits");
+    shell.commit_segments(2).expect("two segments commit");
     // The lane's recurrent record: a slot a piece.
     let record = fixed.map(|shape| {
         let SlotKind::Fixed { pieces } = facts.shapes[shape].kind else {
@@ -404,7 +433,7 @@ fn served_by_refs(fixture: &Fixture, cache: &Path) -> Vec<(u64, u32)> {
         shell.name_record(&pieces).expect("the record is named")
     });
     let (mut pages, mut window): (Vec<u32>, Vec<u32>) = (Vec::new(), Vec::new());
-    let mut moved = false;
+    let mut low = false;
     let mut fed = 0u32;
     let mut last = None;
     let mut steps = Vec::with_capacity(SCRIPT.len());
@@ -423,8 +452,8 @@ fn served_by_refs(fixture: &Fixture, cache: &Path) -> Vec<(u64, u32)> {
             }
         }
         assert!(
-            refs.next_chunk <= spread,
-            "the lane's chunks lie under the moves"
+            (refs.opened.len() as u32) < spread,
+            "the lane's chunks lie under the places they move between"
         );
         let word = fixture.trace.facts.word(&Request::new(
             u32::try_from(tokens.len()).expect("a count"),
@@ -449,17 +478,19 @@ fn served_by_refs(fixture: &Fixture, cache: &Path) -> Vec<(u64, u32)> {
         let top = argmax(&logits);
         last = Some(top);
         steps.push((hash_logits(&logits), top));
-        // Every chunk opened so far changes places with one past the
-        // spread, and back the next time.
-        if at % 3 == 2 {
-            let chunks = 1..refs.next_chunk;
-            let moves = chunks
-                .map(|logical| (logical, if moved { logical } else { logical + spread }))
-                .collect();
+        if at == 2 {
+            // Out of the second segment, which then goes back to the device:
+            // the chunks keep their logical ids, there.
+            refs.evacuate(&mut shell, spread);
+            refs.next = spread + refs.opened.len() as u32;
             shell
-                .evacuate(&engine::chunk::Evacuation { moves })
-                .expect("the chunks move");
-            moved = !moved;
+                .release_segments(1)
+                .expect("the second segment goes back");
+        } else if at % 3 == 2 {
+            let opened = refs.opened.len() as u32;
+            refs.evacuate(&mut shell, if low { spread } else { 1 });
+            refs.next = if low { spread + opened } else { 1 + opened };
+            low = !low;
         }
     }
     steps
@@ -594,6 +625,14 @@ fn served_buffered(fixture: &Fixture, cache: &Path) -> Vec<(u64, u32)> {
         comm: core::ptr::null_mut(),
     })
     .unwrap_or_else(|why| panic!("{} loads: {why}", fixture.model));
+    // As a worker boots it: every chunk the fit left the pool backed at
+    // load, and the facts stated from it.
+    shell.back_whole().expect("the fitted pool is backed whole");
+    shell
+        .chunk_facts()
+        .expect("the pool states its chunks")
+        .validate()
+        .expect("the engine's chunk facts hold");
     shell.open(0).expect("slot 0 opens");
     let mut steps = Vec::new();
     let mut fed = 0u32;
