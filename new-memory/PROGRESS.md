@@ -303,3 +303,17 @@ The `new-memory/` directory is bookkeeping and is removed before anything lands 
 - Not migrated: minimax_h3 — its rows come from lib/qwen3_encoder (`encoder()` + `qwen3_caches`), shared with
   flux_2/z_image (which use the temporary `lib/dit.held_text_encoder`). Final cleanup package FC handles it.
 - Verified: `cargo check` poem-compiler (tests); `moved::glm_5_next`, `moved::qwen_4`.
+
+### M19 — 2026-11-10: all 29 models on state handles; caches() string API deleted
+- `sc/fc-drop-caches` (e1f1c7314, 7e4a5ed62, 097f31684, d567e7f9e): minimax_h3 migrated (lib/qwen3_encoder
+  `encoder(..., kv)` gives each layer a state; `qwen3_caches` and `lib/dit.held_text_encoder` deleted; flux_2/z_image
+  use the encoder's own states). Deleted from the Starlark DSL: `caches()` support, `c.kv_space`/windowed, `c.kv`,
+  `c.state`, string row lookups (`inputs.kv("x")` etc.), string fallbacks in op bindings (new `StateName` argument
+  type; `bind_ops.py` ROW_NAMED). A package defining `caches()` or a string row is refused with a clear message.
+  Kept: Rust `HybridSpec`/`CacheRow` (lowering target) and Rust `Input::kv/state/...`.
+- The caches()-to-handles equivalence test and its 29 digest files are deleted (verification scaffolding; K2 changes
+  the IR and needs its own check).
+- Verified: `cargo check` poem + poem-compiler (tests), clippy, fmt; pie-poem state/package/refusal tests (18);
+  moved:: minimax_h3, flux_2, z_image, qwen3_dense, deepseek_v4 and the_flux_2*/the_z_image* before the deletion.
+- Next on this side: K2 (IR kv-space removal: CacheRow::Kv.space, Mask/Geometry{space}, write geometry) once the
+  engines key by slot shape; Metal pool switch. CUDA side (L40S): BC + RW merge together.
