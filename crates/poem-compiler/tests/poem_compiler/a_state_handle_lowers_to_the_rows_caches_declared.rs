@@ -150,7 +150,16 @@ fn minimax_h3(path: &str, _row: &CacheRow) -> String {
 }
 
 fn qwen_4(path: &str, _row: &CacheRow) -> String {
-    path.to_string()
+    match parts(path)[..] {
+        ["layers", l, "attn", "kv"] => format!("kv.{l}"),
+        ["layers", l, "indexer", "keys"] => format!("index.{l}"),
+        ["layers", l, "gdn", "conv_state"] => format!("conv.{l}"),
+        ["layers", l, "gdn", "delta_state"] => format!("delta.{l}"),
+        ["mtp", "block", "attn", "kv"] => "kv.mtp".to_string(),
+        ["ple", "ids_state"] => "ple.ids".to_string(),
+        ["ple", "conv_state"] => "ple.conv".to_string(),
+        _ => path.to_string(),
+    }
 }
 
 /// Every listed deployment of `package`, at one rank and at each count of
