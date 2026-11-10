@@ -52,6 +52,7 @@ TE = struct(
     eps = 1e-6,
 )
 TE_LAYERS = 50
+TE_DEPTH = 64
 
 DIMS = {
     "minimax-h3-fl2va": struct(
@@ -66,6 +67,7 @@ DIMS = {
         t_hidden = 5376,
         t_dim = 2688,
         rope_freqs = 16,
+        te = TE,
     ),
     "minimax-h3-mini": struct(
         dim = 128,
@@ -79,8 +81,124 @@ DIMS = {
         t_hidden = 128,
         t_dim = 64,
         rope_freqs = 8,
+        te = None,
     ),
 }
+
+# Adopting a release: a MiniMax H3 partition as its own `model_index.json`
+# states it, its denoiser a `MiniMaxH3DiTModel` and its encoder Qwen3-VL's
+# text model. The widths and depths are read from the transformer's and the
+# encoder's configs. The latent space, the patching, the modalities' adaLN
+# slices, the shifts and the encoder layer the caption is read at are this
+# family's, so a release stating others is refused by name; so is a
+# reference-to-video partition, whose references this family would place as
+# first and last frames, and the diffusers re-export, whose tensors are named
+# otherwise.
+
+def require(what, c, wants):
+    """Fail naming the first `(key, want, default)` that `c` states otherwise."""
+    for key, want, default in wants:
+        got = c.get(key, default)
+        if got != want:
+            fail("its {} states {} = {}; this family runs {}".format(what, key, got, want))
+
+def qwen3_vl_of(config):
+    """The Qwen3-VL text model `config` (a `text_encoder/config.json`) states."""
+    if config.get("model_type") != "qwen3_vl":
+        fail("its text encoder is {}; this family encodes with Qwen3-VL".format(config.get("model_type")))
+    c = config.get("text_config") or {}
+    require("text encoder", c, [
+        ("model_type", "qwen3_vl_text", None),
+        ("hidden_act", "silu", None),
+        ("attention_bias", False, False),
+        ("num_hidden_layers", TE_DEPTH, None),
+    ])
+    hidden, heads = c["hidden_size"], c["num_attention_heads"]
+    head_dim = c.get("head_dim", hidden // heads)
+    rope = c.get("rope_scaling") or {}
+    require("text encoder's rope", rope, [("rope_type", "default", "default")])
+    # A caption's tokens stand at one position on every mrope axis, so its
+    # sections turn as one rope across the head.
+    turned = 0
+    for n in rope.get("mrope_section", [head_dim // 2]):
+        turned += 2 * n
+    if turned != head_dim:
+        fail("its text encoder's mrope sections {} do not span its {}-wide heads".format(rope.get("mrope_section"), head_dim))
+    return struct(
+        hidden = hidden,
+        vocab = c["vocab_size"],
+        q_heads = heads,
+        kv_heads = c["num_key_value_heads"],
+        head_dim = head_dim,
+        inter = c["intermediate_size"],
+        theta = float(c["rope_theta"]),
+        eps = float(c.get("rms_norm_eps", 1e-6)),
+    )
+
+def adopt(id, config, special):
+    pipeline = config.get("pipeline")
+    if pipeline == None:
+        fail("this family reads a MiniMax H3 partition, which states model_index.json")
+    require("pipeline", pipeline, [("_class_name", "MiniMaxH3Pipeline", None)])
+    known = ["pipeline", "scheduler", "dit", "te", "vae", "avae"]
+    for role in config:
+        if role not in known:
+            fail("it holds a `{}` component, which this family does not run".format(role))
+    h3 = pipeline.get("_minimax_h3") or {}
+    require("pipeline", h3, [("partition", "fl2va", None)])
+    require("pipeline's shifts", h3.get("sigma_shift_scales") or {}, [("video", VIDEO_SHIFT, None), ("audio", AUDIO_SHIFT, None)])
+    if config.get("scheduler") != None:
+        require("scheduler", config["scheduler"], [("shift", VIDEO_SHIFT, None)])
+    if special.get("eos_token", QWEN_STOP[0]) not in QWEN_STOP:
+        fail("its tokenizer ends at {}; this family's at {}".format(special["eos_token"], " or ".join(QWEN_STOP)))
+    dit = config.get("dit")
+    if dit == None:
+        fail("the pipeline holds no transformer")
+    require("transformer", dit, [
+        ("_class_name", "MiniMaxH3DiTModel", None),
+        ("latents_dim", LATENT_CHANNELS, None),
+        ("audio_latents_dim", AUDIO_CHANNELS, None),
+        ("patch_size", PATCH, None),
+        ("norm_eps", NORM_EPS, None),
+        ("qk_norm_eps", NORM_EPS, None),
+        ("final_norm_eps", NORM_EPS, None),
+        ("rope_theta", ROPE_THETA, ROPE_THETA),
+    ])
+    dim = dit["hidden_size"]
+    require("transformer", dit, [
+        ("adaln_out_features", ADALN_SLICES * MODALITIES * dim, None),
+        ("final_adaln_out_features", FINAL_SLICES * dim, None),
+    ])
+    te = config.get("te")
+    te = qwen3_vl_of(te) if te != None else None
+    text_dim = dit["text_dim"]
+    if te != None and text_dim != te.hidden:
+        fail("its caption projection takes {} wide rows; its text encoder's are {}".format(text_dim, te.hidden))
+    vae = config.get("vae")
+    if vae != None:
+        require("video VAE", vae, [("_class_name", "MiniMaxH3VideoVAE", None), ("latent_channels", LATENT_CHANNELS, None)])
+    avae = config.get("avae")
+    if avae != None:
+        require("audio VAE", avae, [("_class_name", "MiniMaxH3AudioVAE", None), ("latent_channels", AUDIO_CHANNELS, None)])
+    d = struct(
+        dim = dim,
+        heads = dit["num_attention_heads"],
+        head_dim = dit["attention_head_dim"],
+        inter = dit["ffn_hidden_size"],
+        blocks = dit["num_layers"],
+        refiners = dit["token_refiner_num_layers"],
+        text_dim = text_dim,
+        t_freq = dit["timestep_input_dim"],
+        t_hidden = dit["time_embed_hidden_size"],
+        t_dim = dit["time_embed_dim"],
+        rope_freqs = dit["rope_inv_freq_len"],
+        te = te,
+    )
+    return struct(
+        MODELS = [model(id, template = CHATML, tokenizer = TOKENIZER, arch = "minimax_h3", layers = d.blocks, vocab = te.vocab if te != None else 0)],
+        DIMS = {id: d},
+        DEPLOYMENTS = [deployment(id, weights = dtype.bf16, kv = dtype.bf16)],
+    )
 
 def attn(d, banks):
     inner = d.heads * d.head_dim
@@ -142,7 +260,7 @@ def layout(id, deploy):
             video_out = linear(VIDEO_FEATURES, dim, banks),
             audio_out = linear(AUDIO_CHANNELS, dim, banks),
         ),
-        te = encoder(TE, TE_LAYERS, banks) if id == "minimax-h3-fl2va" else None,
+        te = encoder(d.te, TE_LAYERS, banks) if d.te != None else None,
         rope = struct(
             four = weight([1], dtype.f32, values = [4.0]),
             five = weight([1], dtype.f32, values = [5.0]),

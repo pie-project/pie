@@ -44,8 +44,8 @@ model, and writes `$PIE_HOME/models/adopted_<id>.poem`: the family's text as
 it shipped, the configuration it read, and the rebinding. The written package
 is checked as an import would check it (every tensor read, the plan
 compiled, the tokenizer compiled) before it is written, and it serves without
-a rebuild. Every package but `minimax_h3` adopts; each hook refuses, by
-name, what its forward does not run.
+a rebuild. Every package adopts; each hook refuses, by name, what its
+forward does not run.
 
 For a diffusers pipeline, `config` is each component's `config.json` under the
 role its tensors are prefixed by (`dit`, `te`, `vae`, …), beside the pipeline's
