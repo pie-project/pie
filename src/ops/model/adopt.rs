@@ -240,7 +240,7 @@ fn resolve(source: &str) -> Result<(PathBuf, String, bool)> {
     let root = crate::paths::pie_home()
         .join("adopt")
         .join(format!("{owner}--{name}"));
-    println!("Reading {source}'s configuration and weight headers (no weights)");
+    eprintln!("Reading {source}'s configuration and weight headers (no weights)");
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()?;
