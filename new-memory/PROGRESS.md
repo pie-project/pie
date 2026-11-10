@@ -360,3 +360,12 @@ The `new-memory/` directory is bookkeeping and is removed before anything lands 
   epoch that does not advance per fire (contract 17, to fix).
 - L40S finished BC leftovers (pieces from P3fix2 runs, rs buffer rows inside the record at s % 16, snapshots per
   piece) at 9d9bb109e and found the multi-lane group fold race -> contract 15.
+
+### M24 — 2026-11-10: RW3 merged (contract 15-17 runtime side)
+- `sc/rw3-groups-epochs` (df6183f1c): `RsSnapshot.pieces` (serde default; `slot` = first piece) filled for
+  multi-piece records; a multi-lane group with a folding lane names `[held, cow]` (cow != held) on every lane;
+  per-fire epoch: `KvStore::begin_fire()` opens an epoch for every fire at reserve, closed when the engine completes
+  it; drains release after the first fire following the evacuation copy retires; freed kv pages were under-fenced
+  before (reused while decodes ran) and are now fenced per fire.
+- Verified: `cargo check` runtime, worker, engine and every engine crate; RW3 ran store::shared/slots/rs/kv, planner,
+  pipeline::fire::rs.
