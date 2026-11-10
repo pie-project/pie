@@ -763,9 +763,10 @@ impl Pools {
         facts: &Facts,
         budgets: &poem_compiler::Budgets,
         activation: u64,
+        chunk_bytes: Option<u64>,
     ) -> Result<Pools> {
         let pool = PhysicalPool::open(device, utilization)?;
-        let layout = lay(trace, &paging, budgets)?;
+        let layout = lay(trace, &paging, budgets, chunk_bytes)?;
         let mut shapes = Vec::with_capacity(trace.caches.len());
 
         for (index, row) in trace.caches.iter().enumerate() {
@@ -2758,14 +2759,23 @@ impl Pools {
 /// recipe for a server card, its token slots this paging's pages. Where the
 /// paging keeps no window (the widest spans the context) every row is a list
 /// row.
-fn lay(trace: &Trace, paging: &Paging, budgets: &poem_compiler::Budgets) -> Result<layout::Layout> {
+fn lay(
+    trace: &Trace,
+    paging: &Paging,
+    budgets: &poem_compiler::Budgets,
+    chunk_bytes: Option<u64>,
+) -> Result<layout::Layout> {
     let context = if paging.window.is_some() {
         paging.context()
     } else {
         0
     };
+    let mut server = poem_compiler::chunk::ChunkProfile::SERVER_CUDA;
+    if let Some(bytes) = chunk_bytes {
+        server.target_chunk_bytes = bytes;
+    }
     let profile = poem_compiler::DeviceProfile {
-        chunk: poem_compiler::chunk::ChunkProfile::SERVER_CUDA.paged(paging.page_size, context),
+        chunk: server.paged(paging.page_size, context),
         ..poem_compiler::DeviceProfile::default()
     };
     let recipe =

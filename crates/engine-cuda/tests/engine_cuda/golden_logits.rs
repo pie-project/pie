@@ -259,7 +259,7 @@ fn load(fixture: &Fixture, cache: &Path) -> Shell {
         kv_budget: None,
         memory_share: engine::load::DEFAULT_DEVICE_MEMORY_SHARE,
         ordinal: 0,
-        knobs: engine_cuda::Knobs::default(),
+        knobs: knobs(),
         cache_dir: Some(cache),
         runahead: engine::runahead::Runahead::F1,
         residency: engine_cuda::experts::Plan::default(),
@@ -269,6 +269,17 @@ fn load(fixture: &Fixture, cache: &Path) -> Shell {
         comm: core::ptr::null_mut(),
     })
     .unwrap_or_else(|why| panic!("{} loads: {why}", fixture.model))
+}
+
+/// The load's knobs: `PIE_GOLDEN_CHUNK` (bytes) sets the chunk size the
+/// state pool aims near, so a miniature's records are cut into pieces as a
+/// full model's are; the logits are the same either way.
+fn knobs() -> engine_cuda::Knobs {
+    let mut knobs = engine_cuda::Knobs::default();
+    if let Ok(bytes) = std::env::var("PIE_GOLDEN_CHUNK") {
+        knobs.diagnostics.chunk_bytes = Some(bytes.parse().expect("PIE_GOLDEN_CHUNK is bytes"));
+    }
+    knobs
 }
 
 fn argmax(logits: &[f32]) -> u32 {
@@ -365,6 +376,16 @@ fn served_by_refs(fixture: &Fixture, cache: &Path) -> Vec<(u64, u32)> {
     let mut shell = load(fixture, cache);
     let facts = shell.chunk_facts();
     facts.validate().expect("the engine's chunk facts hold");
+    eprintln!(
+        "{}: chunks of {} bytes, shapes {:?}",
+        fixture.model,
+        facts.chunk_bytes,
+        facts
+            .shapes
+            .iter()
+            .map(|shape| (shape.kind, shape.slot_bytes, shape.slots_per_chunk))
+            .collect::<Vec<_>>()
+    );
     let mut refs = Refs::of(facts.clone());
     let list = refs.shape(|kind| matches!(kind, SlotKind::List { .. }));
     let ring = refs.shape(|kind| matches!(kind, SlotKind::Ring { .. }));
@@ -374,7 +395,14 @@ fn served_by_refs(fixture: &Fixture, cache: &Path) -> Vec<(u64, u32)> {
     // half a segment up: all in the first segment.
     let spread = facts.segment_chunks.max(2) / 2;
     shell.commit_segments(1).expect("the first segment commits");
-    let record = fixed.map(|shape| refs.take(shape));
+    // The lane's recurrent record: a slot a piece.
+    let record = fixed.map(|shape| {
+        let SlotKind::Fixed { pieces } = facts.shapes[shape].kind else {
+            unreachable!("the fixed shape")
+        };
+        let pieces: Vec<u32> = (0..pieces).map(|_| refs.take(shape)).collect();
+        shell.name_record(&pieces).expect("the record is named")
+    });
     let (mut pages, mut window): (Vec<u32>, Vec<u32>) = (Vec::new(), Vec::new());
     let mut moved = false;
     let mut fed = 0u32;
@@ -556,7 +584,7 @@ fn served_buffered(fixture: &Fixture, cache: &Path) -> Vec<(u64, u32)> {
         kv_budget: None,
         memory_share: engine::load::DEFAULT_DEVICE_MEMORY_SHARE,
         ordinal: 0,
-        knobs: engine_cuda::Knobs::default(),
+        knobs: knobs(),
         cache_dir: Some(cache),
         runahead: engine::runahead::Runahead::F1,
         residency: engine_cuda::experts::Plan::default(),
@@ -571,7 +599,6 @@ fn served_buffered(fixture: &Fixture, cache: &Path) -> Vec<(u64, u32)> {
     let mut fed = 0u32;
     // The slots the state has folded.
     let mut folded = 0u32;
-    let mut last = 0u32;
     let mut step = |shell: &mut Shell, tokens: &[u32], rs: RsVerb| {
         let word = fixture.trace.facts.word(&Request::new(
             u32::try_from(tokens.len()).expect("a count"),
@@ -596,7 +623,7 @@ fn served_buffered(fixture: &Fixture, cache: &Path) -> Vec<(u64, u32)> {
     let prompt = |from: u32, rows: u32| -> Vec<u32> {
         (from..from + rows).map(|t| (t * 7 + 11) % 1000).collect()
     };
-    last = step(&mut shell, &prompt(fed, 37), RsVerb::Fold).max(last * 0);
+    let mut last = step(&mut shell, &prompt(fed, 37), RsVerb::Fold);
     fed += 37;
     folded += 37;
     for at in 0..40u32 {

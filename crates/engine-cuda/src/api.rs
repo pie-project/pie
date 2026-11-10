@@ -1317,9 +1317,11 @@ impl Cuda {
             })?;
         }
         // A lane that names slot refs (`Lane::tables`, `Lane::fixed`) is the
-        // runtime's shared pool speaking: its kv fields carry the list and
-        // ring refs, and its recurrent record is the pair `fixed` names,
-        // copied onto the slot the fire writes where the two differ.
+        // runtime's shared pool speaking: its list and ring tables are its
+        // kv refs, and its recurrent record is the pairs `fixed` names, a
+        // piece each, copied onto the slots the fire writes where the two
+        // differ.
+        use crate::store::layout::{FIXED, LIST, RING};
         let by_refs = submission
             .lanes
             .iter()
@@ -1331,19 +1333,15 @@ impl Cuda {
         for lane in &submission.lanes {
             let record = match lane.fixed.as_slice() {
                 [] => None,
-                [(shape, pieces)] if *shape == crate::store::layout::FIXED => {
-                    let [[run, written]] = pieces.as_slice() else {
-                        return Err(Error::Invalid(format!(
-                            "lane in slot {} names {} pieces of its recurrent record, and this \
-                             load holds a record in one slot",
-                            lane.slot,
-                            pieces.len()
-                        )));
-                    };
+                [(shape, pieces)] if *shape == FIXED => {
+                    let runs: Vec<u32> = pieces.iter().map(|[run, _]| *run).collect();
+                    let written: Vec<u32> = pieces.iter().map(|[_, written]| *written).collect();
+                    let run = shell.name_record(&runs).map_err(fault)?;
+                    let written = shell.name_record(&written).map_err(fault)?;
                     if run != written {
-                        shell.fork_state(*run, *written).map_err(fault)?;
+                        shell.fork_state(run, written).map_err(fault)?;
                     }
-                    Some(*written)
+                    Some(written)
                 }
                 _ => {
                     return Err(Error::Invalid(format!(
@@ -1352,7 +1350,29 @@ impl Cuda {
                     )));
                 }
             };
+            for snap in lane
+                .rs_snapshots
+                .iter()
+                .filter(|snap| !snap.pieces.is_empty())
+            {
+                let named = shell.name_record(&snap.pieces).map_err(fault)?;
+                if named != snap.slot {
+                    return Err(Error::Invalid(format!(
+                        "lane in slot {} snapshots into the record at slot ref {}, whose \
+                         first piece it names {named}",
+                        lane.slot, snap.slot
+                    )));
+                }
+            }
             records.push(record);
+        }
+        // The lane's list refs are its table of pages, or, where a program
+        // places its rows, the table that translates the program's pages.
+        fn table(lane: &engine::fire::Lane, shape: engine::chunk::ShapeId) -> Option<&[u32]> {
+            lane.tables
+                .iter()
+                .find(|(id, _)| *id == shape)
+                .map(|(_, refs)| refs.as_slice())
         }
         let seated: Vec<Seated<'_>> = submission
             .lanes
@@ -1366,11 +1386,20 @@ impl Cuda {
                         tokens: &lane.tokens,
                     },
                     positions: &lane.positions,
-                    pages: &lane.kv.pages,
+                    pages: match table(lane, LIST) {
+                        Some(refs) if by_refs && lane.kv.translation.is_empty() => refs,
+                        _ => &lane.kv.pages,
+                    },
                     held: (!lane.kv.pages.is_empty()).then_some(lane.kv.held),
                     kv_less: lane.kv_less,
-                    translation: &lane.kv.translation,
-                    window: &lane.kv.window,
+                    translation: match table(lane, LIST) {
+                        Some(refs) if by_refs && !lane.kv.translation.is_empty() => refs,
+                        _ => &lane.kv.translation,
+                    },
+                    window: match table(lane, RING) {
+                        Some(refs) if by_refs => refs,
+                        _ => &lane.kv.window,
+                    },
                     mask: lane.mask.as_ref(),
                     adapter: lane_adapters[at].or(lane.adapter),
                     rs: lane.rs.clone(),
