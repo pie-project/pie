@@ -971,3 +971,9 @@ The `new-memory/` directory is bookkeeping and is removed before anything lands 
   fallback), and pin_weight_hosts rewrites the tables to the pinned copy before arming. golden_held_small: nemotron
   mini held at 256 MiB boots, arms 10/10, equals the all-host result; dense at 256 MiB = base. Runtime refusal message
   under off to be confirmed by IT.
+
+### Note — 2026-11-10: main #1604/#1605 merged; build fix
+- The merge of main (#1604 gemma-4 shared tail readouts, #1605 tall prefill kv-append parts) into new-memory broke
+  kernels-xla (pushed briefly as 68a2b38a3): #1604's new `flash::readouts` calls `older()` without the M63 page maps.
+  Fixed by passing `[keys_map, values_map]` through `attend_readouts`. engine-xla 14 / kernels-xla 18 lib tests pass.
+  TPU session to verify the readouts path bitwise on v6e.
