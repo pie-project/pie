@@ -2465,7 +2465,7 @@ fn zz_gdn_step_timing() {
 fn zz_the_decode_step_kernel_on_three_buffers_matches_the_xla_form() {
     kernels_xla::ssm::step_bufs(Some(3));
     let gdn = |hv| Gdn { hk: 16, hv, dk: 128, dv: 128 };
-    for (hv, rows, seed) in [(16, 1usize, 51u64), (16, 2, 52), (16, 3, 57), (16, 8, 54), (16, 40, 55), (48, 16, 56)] {
+    for (hv, rows, seed) in [(16, 1usize, 51u64), (16, 2, 52), (16, 4, 53), (16, 8, 54), (16, 40, 55), (48, 16, 56)] {
         step_against_xla(&gdn(hv), rows, seed);
     }
     kernels_xla::ssm::step_bufs(None);
