@@ -786,3 +786,15 @@ The `new-memory/` directory is bookkeeping and is removed before anything lands 
   live in the pool (held, or streamed by the runtime's cache).
 - Verified: routed_experts_stream plan tests, golden_submit_buffered, golden_offload = base. Untested: a real MoE
   boot under a device_weight_budget below the dense planes (IT); budget refusal text still says "REGISTERED planes".
+
+### M59 — 2026-11-10: Vulkan/wgpu experts, snapshots, PLE staging (VK3)
+- `sc/vk3` (1883bcbe9, ad470f203, 018adf1c8, 2eb5abef8): every routed bank (bf16, affine 64/8, 64/4, {32,64,128}/2,
+  MXFP4, +/- bias) is an expert weight shape read through tables on every kernel path; misses staged per layer from the
+  mmap (no second host copy); experts no longer cut into pieces (chunk >= one expert); the engines' own expert tier
+  DELETED. bf16 MoE minis (qwen3-30b-a3b, glm45-air, qwen36-35b-a3b): held = base bitwise, none/half resident = held
+  bitwise. Quantized: kernel-level bitwise only (fixture writer is bf16-only).
+- Snapshots per piece (contract 16): rs_snapshots = 4 for conv / GDN / KDA scans; bitwise vs a cut pass (1 and 4 pieces,
+  beside a buffering lane). KDA end to end untested (no KDA mini).
+- PLE misses staged in frame order without a flush (Vulkan 199.6 -> 209.6 tok/s all-resident; half 174 -> 185);
+  remaining gap is fires with misses not being recorded (proposed: ring of stages selected by an input).
+- engine-wgpu / engine-vulkan build without features again.
