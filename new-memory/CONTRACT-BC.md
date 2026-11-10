@@ -40,7 +40,9 @@ Proposed by the L40S session (branch `sc/l40s-bc`), accepted by New Pie. Runtime
     fire runs, held by the runtime). Engine validation that expects 2 must change to 1.
 11. **Shapes:** at most one list and one ring shape per load; the list slot's tokens equal the kv page size;
     ring/list refs are slot refs `chunk * slots_per_chunk + index` (ring ref 0 = null chunk).
-12. **Multi-lane groups on one working set:** the first lane gets `[src, dst]`, the others `[src, src]`.
+12. **Multi-lane groups on one working set:** in shared mode every lane of the group names the record the group
+    writes (`[src, dst]` on copy-on-write, `[x, x]` in place). Lanes 1.. read the state from the record lane 0 folds
+    into in the same fire, so the engine must fold lane 0 only after the other lanes have read the state.
     Forked rings still copy through `kv.window_copies` (to fold into `copy_slots` later). Host/disk tiers for shared
     shapes come with `copy_slots`.
 13. **Shared-mode rs buffer.** `RsVerb::Buffer.pages` ids are refcount bookkeeping only (ignore for addressing).

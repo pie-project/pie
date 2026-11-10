@@ -331,3 +331,10 @@ The `new-memory/` directory is bookkeeping and is removed before anything lands 
   piece and `sets_per_working_set = 1` need both sides).
 - Verified: `cargo check` runtime, worker, engine and every engine crate on new-memory; RW ran store/planner/governor/
   pipeline::fire::rs (154) and engine chunk (12) tests.
+
+### M21 — 2026-11-10: RW2 merged
+- `sc/rw2-buffer-rules` (fb35c00c8, 55a21671a): shared mode refuses a fire leaving more than 16 unfolded rs rows
+  (`RsError::Unfolded`; folding is the inferlet's decision, so the runtime refuses rather than folds/splits);
+  every lane of a multi-lane group names the record the group writes; `sets_per_working_set() == 1`.
+- Contract amendment 12 updated; engine must fold lane 0 only after the group's other lanes read the state.
+- Verified: `cargo check` runtime, engine, worker; RW2 ran store::rs / pipeline::fire::rs / store::shared (21).
