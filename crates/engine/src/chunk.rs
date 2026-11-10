@@ -166,11 +166,12 @@ pub enum SlotKind {
     /// compressed pools): a slot holds `tokens` tokens, of which the model
     /// keeps one row every `rate` (`tokens // rate` rows a slot).
     ///
-    /// With a `window`, a **window list** (CONTRACT-BC 19): the rows of the
-    /// layers read through that sliding window, `tokens` the kv page size.
-    /// A lane's table for it is as long as its full table, in token order;
-    /// a slot the runtime trimmed (wholly behind `committed_end - window`)
-    /// is ref 0, the null chunk.
+    /// With a `window`, a **window list** (CONTRACT-BC 19, 21): the rows of
+    /// the layers read through that sliding window, `tokens` (`T_w`) its own
+    /// page size. A lane's table for it is in its own token order, entry
+    /// `i` the slot of rows `[i * T_w, (i + 1) * T_w)`; a slot the runtime
+    /// trimmed (its last row below `committed_end - window`) is ref 0, the
+    /// null chunk.
     List {
         tokens: u32,
         rate: u32,
@@ -596,32 +597,15 @@ impl ChunkFacts {
                     shape.id, shape.kind
                 ));
             }
-            if let Some(window) = shape.kind.window() {
-                if let Some(other) = self.shapes[..at]
+            if let Some(window) = shape.kind.window()
+                && let Some(other) = self.shapes[..at]
                     .iter()
                     .find(|s| s.kind.window() == Some(window))
-                {
-                    return invalid(format!(
-                        "shapes {} and {} are both the window list of {window} rows",
-                        other.id, shape.id
-                    ));
-                }
-                let page = self.shapes.iter().find_map(|s| match s.kind {
-                    SlotKind::List {
-                        tokens,
-                        window: None,
-                        ..
-                    } if s.role == SlotRole::State => Some(tokens),
-                    _ => None,
-                });
-                if let (Some(page), SlotKind::List { tokens, .. }) = (page, shape.kind)
-                    && tokens != page
-                {
-                    return invalid(format!(
-                        "window list {} holds {tokens} tokens a slot, not the kv page's {page}",
-                        shape.id
-                    ));
-                }
+            {
+                return invalid(format!(
+                    "shapes {} and {} are both the window list of {window} rows",
+                    other.id, shape.id
+                ));
             }
             if let Some(pinned) = shape.pinned {
                 if pinned.host.end() > u64::from(self.host_chunks)

@@ -27,7 +27,7 @@ use crate::store::kv::page_table::{ExportedPage, ExportedSet, HostKvSlotId, KvPa
 use crate::store::kv::working_set::KvWorkingSet;
 use crate::store::registry as store_registry;
 use crate::store::rs::working_set::RsWorkingSet;
-use crate::store::rs::{RingState, RsExport, RsGeometry, RsSlotId};
+use crate::store::rs::{RsExport, RsGeometry, RsSlotId, WindowState};
 
 const VERSION: u32 = 1;
 /// Names are file names here, written out in hex.
@@ -135,10 +135,10 @@ struct SavedState {
     base: u32,
     frozen: u32,
     bytes: u64,
-    /// The window's position, for a model whose state is one: `buffer` is
-    /// then its windowed pages, and `window_tokens` the window.
+    /// The windows' position, for a model whose state is one window list:
+    /// `buffer` is then its table, and `window_tokens` the window.
     #[serde(default)]
-    ring: Option<RingState>,
+    window: Option<WindowState>,
     #[serde(default)]
     window_tokens: u32,
 }
@@ -301,7 +301,14 @@ async fn read_state(
 ) -> Result<(SavedState, Vec<u8>), HandleError> {
     let stores = store_registry::get(rs.model, rs.engine);
     let held: Vec<RsSlotId> = set.folded.iter().copied().collect();
-    let pages: Vec<RsSlotId> = set.buffer.iter().flatten().copied().collect();
+    if set.windows.len() > 1 {
+        return Err(HandleError::invalid(
+            "a state of several window lists is not saved to the host",
+        ));
+    }
+    // A window list's table rides as the buffer.
+    let table = set.windows.first().unwrap_or(&set.buffer);
+    let pages: Vec<RsSlotId> = table.iter().flatten().copied().collect();
     let (ids, scratch) = {
         let mut store = stores.rs.lock().unwrap();
         let on_device = |ids: &[RsSlotId], store: &crate::store::rs::RsStore| {
@@ -346,7 +353,7 @@ async fn read_state(
                 row_pages.push(row);
             }
         }
-        let pages_kind = if set.ring.is_some() {
+        let pages_kind = if set.window.is_some() {
             TierKind::Window
         } else {
             TierKind::RsPages
@@ -385,11 +392,11 @@ async fn read_state(
             state_size: rs.geom.state_size,
             buffer_page_tokens: rs.geom.buffer_page_tokens,
             folded: set.folded.is_some(),
-            buffer: set.buffer.iter().map(Option::is_some).collect(),
+            buffer: table.iter().map(Option::is_some).collect(),
             base: set.base,
             frozen: set.frozen,
             bytes: bytes.len() as u64,
-            ring: set.ring,
+            window: set.window,
             window_tokens: crate::model::model().rs_caps().window_tokens,
         },
         bytes,
@@ -860,7 +867,7 @@ async fn load_state(
         || caps.state_size != geom.state_size
         || caps.buffer_page_size != geom.buffer_page_tokens
         || caps.window_tokens != saved.window_tokens
-        || (caps.window_tokens > 0) != saved.ring.is_some()
+        || (caps.window_tokens > 0) != saved.window.is_some()
     {
         return Err(HandleError::invalid(
             "its recurrent state is not this model's",
@@ -890,16 +897,19 @@ async fn load_state(
         return Err(failed("writing recurrent state to the host", error));
     }
     let mut buffered = rows[slots..].iter().copied();
+    let table: Vec<Option<RsSlotId>> = saved
+        .buffer
+        .iter()
+        .map(|&page| page.then(|| buffered.next().expect("counted above")))
+        .collect();
+    let windowed = saved.window.is_some();
     let set = RsExport {
         folded: saved.folded.then(|| rows[0]),
-        buffer: saved
-            .buffer
-            .iter()
-            .map(|&page| page.then(|| buffered.next().expect("counted above")))
-            .collect(),
+        buffer: if windowed { Vec::new() } else { table.clone() },
         base: saved.base,
         frozen: saved.frozen,
-        ring: saved.ring,
+        windows: if windowed { vec![table] } else { Vec::new() },
+        window: saved.window,
     };
     let id = store.import(geom, set);
     Ok(RsWorkingSet::new(0, engine, id, geom))

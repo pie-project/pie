@@ -3,10 +3,10 @@ use std::collections::HashSet;
 use crate::store::grow::Grow;
 use crate::store::rs::RsUnits;
 
-/// The window-ring pages a seated lane past its window holds beyond its
-/// prompt's: the straddled page and the one its next boundary takes before
-/// the oldest is let go.
-const RING_GROWTH: u32 = 2;
+/// The slots of each window list a seated lane past its window holds beyond
+/// its prompt's: the straddled slot and the one its next boundary takes
+/// before the oldest is let go.
+const WINDOW_GROWTH: u32 = 2;
 
 /// The device's chunks by slot shape, each free and in all. In the
 /// degenerate mode a chunk is one slot of a pinned shape: a kv page (the list
@@ -192,14 +192,14 @@ impl PoolPort for RegistryPool {
     }
 
     fn rs_growth(&self) -> RsUnits {
-        if self.with_rs(|rs| rs.is_ring()) {
-            RsUnits {
-                slots: 0,
-                pages: RING_GROWTH,
-            }
-        } else {
-            RsUnits::default()
+        // Each window list's slot boundary takes a slot before the one
+        // behind its window is let go.
+        let lists = self.with_rs(|rs| rs.window_lists().len());
+        let mut windows = [0; crate::store::rs::MAX_WINDOW_LISTS];
+        for list in windows.iter_mut().take(lists) {
+            *list = WINDOW_GROWTH;
         }
+        RsUnits::of_windows(windows)
     }
 
     fn rs_host_stats(&self) -> (RsUnits, RsUnits) {

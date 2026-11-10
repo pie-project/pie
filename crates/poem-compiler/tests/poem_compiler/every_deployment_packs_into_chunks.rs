@@ -62,17 +62,26 @@ fn wrongs(trace: &Trace, recipe: &ChunkRecipe) -> Vec<String> {
             wrong.push(format!("a slot of {} past C {c}", shape.bytes()));
         }
         match shape {
-            SlotLayout::List { tokens, rows, .. } => {
+            SlotLayout::List {
+                tokens,
+                rows,
+                window,
+                ..
+            } => {
                 if tokens % TOKEN_GRAIN != 0 {
                     wrong.push(format!("{tokens} tokens a slot"));
                 }
-                // Every list, kv or window, holds the kv page.
-                if let Some(SlotLayout::List { tokens: page, .. }) = recipe.list()
-                    && page != tokens
-                {
-                    wrong.push(format!(
-                        "a list of {tokens} tokens beside the kv page {page}"
-                    ));
+                // A window list's slot is a power of two no larger than the
+                // kv page, its runs free of MIN_RUN (a fire reads a few).
+                if window.is_some() {
+                    if let Some(SlotLayout::List { tokens: page, .. }) = recipe.list()
+                        && (tokens > page || !(tokens.is_power_of_two() || tokens == page))
+                    {
+                        wrong.push(format!(
+                            "a window list of {tokens} tokens, the kv page {page}"
+                        ));
+                    }
+                    continue;
                 }
                 let mut layers: BTreeMap<(Option<u32>, Option<RowId>), u64> = BTreeMap::new();
                 for run in rows {
@@ -439,7 +448,10 @@ fn gemma4_31b_lists_80_kib_a_token_and_800_kib_through_its_window() {
     else {
         unreachable!()
     };
-    assert_eq!(tokens, page, "the window list's slot is the kv page");
+    assert!(
+        tokens <= page && tokens.is_power_of_two(),
+        "the window list's slot is its own, up to the kv page"
+    );
 }
 
 #[test]

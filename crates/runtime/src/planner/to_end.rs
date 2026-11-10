@@ -44,6 +44,7 @@ fn fold(old: Units, new: Units) -> Units {
         RsUnits {
             slots: f(old.1.slots, new.1.slots),
             pages: f(old.1.pages, new.1.pages),
+            ..RsUnits::default()
         },
     )
 }
@@ -221,7 +222,11 @@ mod tests {
 
     #[test]
     fn a_wave_the_pools_hold_only_apart_starts_spread_over_a_life() {
-        let none = RsUnits { slots: 0, pages: 0 };
+        let none = RsUnits {
+            slots: 0,
+            pages: 0,
+            ..RsUnits::default()
+        };
         let start = |spread: bool, now: Instant| {
             let mut to_end = ToEnd {
                 spread,

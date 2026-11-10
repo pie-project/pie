@@ -664,10 +664,10 @@ impl PreparedLoad<'_> {
             let seated = paging_at(1, boot.slots)?;
             let bytes = [rows.list_bytes, rows.fixed_bytes];
             let chunk = rows.chunk_bytes;
+            // A seat's window slots: its context in `T_w`-token slots.
+            let window_pages = seated.context().div_ceil(rows.window_tokens.max(1)).max(1);
             let window_chunks = chunk.checked_div(rows.window_bytes).map_or(0, |per| {
-                seated
-                    .pages_per_slot
-                    .div_ceil(u32::try_from(per).unwrap_or(1).max(1))
+                window_pages.div_ceil(u32::try_from(per).unwrap_or(1).max(1))
             });
             let least = Layout::least_chunks(chunk, bytes, rows.pieces, seated.pages_per_slot)
                 + window_chunks;
@@ -697,7 +697,12 @@ impl PreparedLoad<'_> {
                 boot.slots,
                 seated.pages_per_slot,
             )?
-            .with_window(rows.window_bytes, rows.window_rows, seated.pages_per_slot)?
+            .with_window(
+                rows.window_bytes,
+                rows.window_rows,
+                rows.window_tokens,
+                window_pages,
+            )?
             .with_rs(
                 rows.rs.as_ref().map_or(0, |rs| rs.bytes),
                 rows.rs.as_ref().map_or(0, |rs| rs.tokens),
@@ -2688,7 +2693,7 @@ impl Shell {
             };
             let record = self.record_of(seated)?;
             window_tables.push(if has_window && !seated.kv_less {
-                let page_size = u64::from(self.pools.paging().page_size.max(1));
+                let page_size = u64::from(self.pools.window_paging().page_size.max(1));
                 let after = u64::from(have) + u64::from(row.rows);
                 let pages = u32::try_from(after.div_ceil(page_size).max(1)).unwrap_or(u32::MAX);
                 let seat = (!seated.refs || seated.window.is_empty()).then_some((lane.slot, pages));
@@ -3030,7 +3035,7 @@ impl Shell {
             geometries.push(match self.pools.space_paging(space) {
                 crate::store::SpacePaging::List => kv::geometry_with(&paging, &seats, &table_refs)?,
                 crate::store::SpacePaging::Window => {
-                    kv::geometry_with(&paging, &seats, &window_refs)?
+                    kv::geometry_with(&self.pools.window_paging(), &seats, &window_refs)?
                 }
             });
         }

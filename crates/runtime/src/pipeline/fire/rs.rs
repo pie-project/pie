@@ -44,9 +44,9 @@ pub fn validate_count(
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum RsPlan {
     Groups(Vec<GroupPlan>),
-    /// The model's state is a window: each row writes the ring pages of
-    /// the kv page indexes it lands on, then moves its ring.
-    Ring(Vec<RingRow>),
+    /// The model's state is window lists: each row lands its rows in each
+    /// list's slots, then moves its windows.
+    Window(Vec<WindowRow>),
 }
 
 /// The first lane carries its fold.
@@ -70,13 +70,13 @@ pub enum GroupFold {
     Device,
 }
 
+/// A lane of a windowed model: the rows (token positions) it lands, the
+/// rows up to which its tables are read, and how its windows move after.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct RingRow {
-    /// The kv page indexes the row writes.
-    pub pages: Vec<u32>,
-    /// The kv page indexes the lane reads, in the order its table states.
-    pub translate: Vec<u32>,
-    pub advance: crate::store::rs::RingAdvance,
+pub struct WindowRow {
+    pub writes: std::ops::Range<u32>,
+    pub reads: u32,
+    pub advance: crate::store::rs::WindowAdvance,
 }
 
 /// What a fire writes of a working set's state: whether the state, to a
@@ -114,11 +114,11 @@ pub fn demand(
 ) -> Result<RsUnits, String> {
     let mut total = RsUnits::default();
     match plan {
-        RsPlan::Ring(rows) => {
+        RsPlan::Window(rows) => {
             for (&ws, row) in working_sets.iter().zip(rows) {
                 total = total.add(
                     store
-                        .ring_demand(ws, &row.pages)
+                        .window_demand(ws, row.writes.clone())
                         .map_err(|e| e.to_string())?,
                 );
             }
@@ -152,16 +152,14 @@ pub struct PreparedRs {
     pub page_copy_lanes: Vec<usize>,
     pub buffer_slot_ids: Vec<u32>,
     pub verbs: Vec<engine::fire::RsVerb>,
-    /// A windowed model's rows: each lane's window pages (in a shared pool,
-    /// window sets; 0 where it holds none), aligned with the page indexes its
-    /// row translates, and the window pages a lane writes into after a fork
-    /// shared them, copied `(src, dst)` before the fire runs: in a shared
-    /// pool each lane's own `Lane::slot_copies` of every window list
-    /// (CONTRACT-BC 19), else the pre-launch copy's windowed pages.
-    pub window: Vec<Vec<u32>>,
-    pub window_copies: Vec<(u32, u32)>,
-    /// The lane each of `window_copies` is its row's.
-    pub window_copy_lanes: Vec<usize>,
+    /// A windowed model's rows: each lane's table of each window list (in
+    /// the engine's numbering: a shared pool's slot refs, 0 where trimmed or
+    /// not written), and the window slots a lane writes into after a fork
+    /// shared them, `(lane, list, src, dst)`, copied before the fire runs:
+    /// in a shared pool each lane's own `Lane::slot_copies` of its list
+    /// (CONTRACT-BC 19, 21), else the pre-launch copy's windowed pages.
+    pub window: Vec<Vec<Vec<u32>>>,
+    pub window_copies: Vec<(usize, usize, u32, u32)>,
     pub snapshots: Vec<RsSnapshot>,
     pub txn: Option<RsTxn>,
     /// The state slots are a shared pool's records: a lane names them by
@@ -228,7 +226,7 @@ impl PreparedRs {
                     engine::fire::RsReset::Held
                 };
             }
-            if let Some(window) = self.window.get(row) {
+            if let Some(window) = self.window.get(row).and_then(|lists| lists.first()) {
                 lane.kv.window.clone_from(window);
             }
         }
@@ -253,7 +251,10 @@ impl PreparedRs {
         if self.shared {
             Vec::new()
         } else {
-            self.window_copies.clone()
+            self.window_copies
+                .iter()
+                .map(|&(_, _, src, dst)| (src, dst))
+                .collect()
         }
     }
 }
@@ -264,9 +265,9 @@ impl PreparedRs {
 /// writes buffered rows into a slot it shares); nothing where `shared` is
 /// `None`. The legacy fields stay as they are. A lane's list table is its
 /// translation where one is stated, else its pages (the list shape's slot
-/// refs either way), each window list's table its window sets' refs of that
-/// list (0 where trimmed) and the window pages it copies first among its
-/// `Lane::slot_copies` (CONTRACT-BC 19); its fixed records the
+/// refs either way), each window list's table its own (0 where trimmed)
+/// and the window slots it copies first among its `Lane::slot_copies`
+/// (CONTRACT-BC 19, 21); its fixed records the
 /// `[run, cow]` [`PreparedRs::run_cow`] names, a snapshot the slot ref of its
 /// record's first piece and, where the record takes more than one, every
 /// piece.
@@ -285,15 +286,17 @@ pub fn apply_shared(
         } else {
             &lane.kv.translation
         };
-        lane.tables = pool.lane_tables(list, &lane.kv.window);
-        let window_copies: Vec<(u32, u32)> = rs
+        let windows = rs
+            .and_then(|rs| rs.window.get(row))
+            .map_or(&[][..], Vec::as_slice);
+        lane.tables = pool.lane_tables(list, windows);
+        let window_copies: Vec<(usize, u32, u32)> = rs
             .filter(|rs| rs.shared)
             .map(|rs| {
-                rs.window_copy_lanes
+                rs.window_copies
                     .iter()
-                    .zip(&rs.window_copies)
-                    .filter(|&(&at, _)| at == row)
-                    .map(|(_, &pair)| pair)
+                    .filter(|&&(at, ..)| at == row)
+                    .map(|&(_, list, src, dst)| (list, src, dst))
                     .collect()
             })
             .unwrap_or_default();
@@ -349,28 +352,36 @@ fn note_reads(store: &mut RsStore, published: &RsPublished, out: &PreparedRs) {
         .filter(live)
         .map(RsSlotId)
         .collect();
-    let pages: Vec<RsSlotId> = out
+    let windows: Vec<RsSlotId> = out
         .window
         .iter()
-        .flatten()
-        .chain(&out.page_copies.0)
+        .flat_map(|lists| lists.iter().enumerate())
+        .flat_map(|(list, table)| table.iter().map(move |&slot| (list, slot)))
+        .filter(|(_, slot)| live(slot))
+        .map(|(list, slot)| store.window_slot(list, slot))
+        .collect();
+    let pages: Vec<RsSlotId> = out
+        .page_copies
+        .0
+        .iter()
         .copied()
         .chain(verb_pages)
         .filter(live)
         .map(|page| store.page_id(page))
+        .chain(windows)
         .collect();
     store.note_reads(seq, slots.into_iter().chain(pages));
 }
 
-fn prepare_ring_rows(
+fn prepare_window_rows(
     store: &mut RsStore,
     working_sets: &[RsWorkingSetId],
-    rows: &[RingRow],
+    rows: &[WindowRow],
     mut granted: Option<&mut RsGrant>,
 ) -> Result<PreparedRs, String> {
     if rows.len() != working_sets.len() {
         return Err(format!(
-            "a ring plan of {} row(s) for {} recurrent state(s)",
+            "a window plan of {} row(s) for {} recurrent state(s)",
             rows.len(),
             working_sets.len()
         ));
@@ -381,7 +392,7 @@ fn prepare_ring_rows(
     };
     let mut prepared_rows: Vec<RsPreparedWrite> = Vec::with_capacity(rows.len());
     for (index, (&ws, row)) in working_sets.iter().zip(rows).enumerate() {
-        match store.prepare_ring(ws, &row.pages, granted.as_deref_mut()) {
+        match store.prepare_window(ws, row.writes.clone(), granted.as_deref_mut()) {
             Ok(prepared) => prepared_rows.push(prepared),
             Err(error) => {
                 store.cancel_batch(prepared_rows);
@@ -391,27 +402,27 @@ fn prepare_ring_rows(
     }
     for (lane, prepared) in prepared_rows.iter().enumerate() {
         for (src, dst) in prepared.buffer_copy_plan() {
+            let list = store.window_list_of(dst).unwrap_or(0);
             out.window_copies
-                .push((store.engine_id(src), store.engine_id(dst)));
-            out.window_copy_lanes.push(lane);
+                .push((lane, list, store.engine_id(src), store.engine_id(dst)));
         }
     }
     let (published, folds) = store
         .publish_batch(prepared_rows)
         .map_err(|error| error.to_string())?;
     store.commit_folds(folds);
-    // The fire reads through the ring as published; only then does the
-    // commit retire what falls behind it.
+    // The fire reads the tables as published; only then does the commit
+    // retire what falls behind each window.
     for (&ws, row) in working_sets.iter().zip(rows) {
         out.window.push(
             store
-                .ring_translation(ws, row.translate.iter().copied())
+                .window_tables(ws, row.reads)
                 .map_err(|error| error.to_string())?,
         );
     }
     note_reads(store, &published, &out);
     for (&ws, row) in working_sets.iter().zip(rows) {
-        store.ring_advance(ws, row.advance, &row.translate);
+        store.window_advance(ws, row.advance);
     }
     out.txn = Some(RsTxn { published });
     Ok(out)
@@ -427,7 +438,7 @@ pub fn prepare_many(
         return Ok(PreparedRs::default());
     }
     let groups = match plan {
-        RsPlan::Ring(rows) => {
+        RsPlan::Window(rows) => {
             for (index, ws) in working_sets.iter().enumerate() {
                 if working_sets[..index].contains(ws) {
                     return Err(format!(
@@ -436,7 +447,7 @@ pub fn prepare_many(
                     ));
                 }
             }
-            return prepare_ring_rows(store, working_sets, rows, granted);
+            return prepare_window_rows(store, working_sets, rows, granted);
         }
         RsPlan::Groups(groups) => groups,
     };
@@ -784,13 +795,21 @@ mod tests {
         let shared = group(vec![0, 1], 4..12, GroupFold::Host(2));
         assert_eq!(
             demand(&store, &[ws, ws], &shared),
-            Ok(RsUnits { slots: 1, pages: 2 }),
+            Ok(RsUnits {
+                slots: 1,
+                pages: 2,
+                ..RsUnits::default()
+            }),
             "a state copy and two pages"
         );
         let alone = group(vec![0], 4..6, GroupFold::None);
         assert_eq!(
             demand(&store, &[ws], &alone),
-            Ok(RsUnits { slots: 0, pages: 1 }),
+            Ok(RsUnits {
+                slots: 0,
+                pages: 1,
+                ..RsUnits::default()
+            }),
             "one page, the state untouched"
         );
     }

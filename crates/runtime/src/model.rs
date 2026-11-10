@@ -258,7 +258,7 @@ pub struct RsCaps {
     pub state_size: u64,
     pub buffer_page_size: u32,
     /// The window the model's state is read through, when it is one:
-    /// its bounded half is then a ring of windowed kv pages, not a slot.
+    /// its bounded half is then its window lists of kv rows, not a slot.
     pub window_tokens: u32,
 }
 

@@ -3,11 +3,7 @@ use std::collections::HashSet;
 use super::{RsError, RsGeometry, RsStore, RsUnits, RsWorkingSetId};
 
 fn slots(slots: u32) -> RsUnits {
-    RsUnits { slots, pages: 0 }
-}
-
-fn pages(pages: u32) -> RsUnits {
-    RsUnits { slots: 0, pages }
+    RsUnits::of(slots, 0)
 }
 
 fn geom() -> RsGeometry {
@@ -45,7 +41,7 @@ fn tests_every_case() {
     a_checkpoint_past_a_step_goes_first();
     a_suspend_parks_private_slots_on_host_and_restore_brings_them_back();
     a_suspend_short_of_host_rows_moves_and_drops_nothing();
-    a_window_is_a_ring_of_pages_anchored_at_its_commit();
+    a_window_is_a_list_of_slots_trimmed_behind_its_commit();
     a_checkpoint_resumes_a_fresh_working_set();
     a_snapshot_resumes_at_its_row();
     a_checkpoint_holds_its_rows_as_a_cache_entry();
@@ -65,25 +61,27 @@ fn a_checkpoint_holds_its_rows_as_a_cache_entry() {
     assert_eq!(s.cache_only(), slots(0), "and its hold went with it");
 }
 
-// A windowed model's state is a ring: a fire takes the pages it writes,
-// the pages behind the committed position's window retire, a write moves the
-// head back without touching a page, a fork shares the ring and copies
-// only the page it overwrites, a suspend parks the ring on the host, and what
-// a snapshot keeps of it comes back where it stood.
-fn a_window_is_a_ring_of_pages_anchored_at_its_commit() {
-    use super::{RingAdvance, RingGeometry};
+// A windowed model's state is a window list: a fire takes the slots it
+// writes, the slots behind the committed position's window retire, a write
+// moves the head back without touching a slot, a fork shares the list and
+// copies only the slot it overwrites, a suspend parks the list on the host,
+// and what a snapshot keeps of it comes back where it stood.
+fn a_window_is_a_list_of_slots_trimmed_behind_its_commit() {
+    use super::{WindowAdvance, WindowGeometry};
     use std::collections::HashSet;
-    let mut s = RsStore::new_ring(
-        RingGeometry {
-            tokens: 32,
-            page_size: 16,
+    let mut s = RsStore::new_window(
+        WindowGeometry {
+            window: 32,
+            tokens: 16,
         },
         8,
         4,
     );
     let ws = s.create_working_set(geom());
-    let order: Vec<u32> = (0..16).collect();
-    let advance = |fold, end| RingAdvance {
+    let win = |n| RsUnits::of_windows([n, 0, 0, 0]);
+    // The rows of slots `first..=last` (16 a slot).
+    let rows = |slots: &[u32]| slots[0] * 16..(slots[slots.len() - 1] + 1) * 16;
+    let advance = |fold, end| WindowAdvance {
         positioned: true,
         settled: 0,
         reach: 0,
@@ -91,46 +89,46 @@ fn a_window_is_a_ring_of_pages_anchored_at_its_commit() {
         commit_end: end,
         head: Some(end),
     };
-    let fire = |s: &mut RsStore, ws, pages: &[u32], advance| {
-        let prepared = s.prepare_ring(ws, pages, None).unwrap();
+    let fire = |s: &mut RsStore, ws, slots: &[u32], advance| {
+        let prepared = s.prepare_window(ws, rows(slots), None).unwrap();
         let copies: Vec<_> = prepared.buffer_copy_plan().collect();
         let published = s.publish_prepared(prepared).unwrap();
-        s.ring_advance(ws, advance, &order);
+        s.window_advance(ws, advance);
         s.settle(published);
         copies
     };
-    assert_eq!(s.ring_demand(ws, &[0, 1, 2, 3, 4, 5]), Ok(pages(6)));
+    assert_eq!(s.window_demand(ws, rows(&[0, 1, 2, 3, 4, 5])), Ok(win(6)));
     fire(&mut s, ws, &[0, 1, 2, 3, 4, 5], advance(Some(u32::MAX), 96));
     assert_eq!(s.available().pages, 5, "four pages behind 96 - 32 retired");
-    assert_eq!(s.ring_positions(ws), Ok(Some((96, 96))));
-    let held = s.ring_translation(ws, 0..7).unwrap();
+    assert_eq!(s.window_positions(ws), Ok(Some((96, 96))));
+    let held = s.window_tables(ws, 7 * 16).unwrap().remove(0);
     assert_eq!(
         &held[..4],
         &[0, 0, 0, 0],
-        "behind the ring reads the null page"
+        "behind the window reads the null page"
     );
     assert!(held[4] != 0 && held[5] != 0 && held[6] == 0);
 
     // A speculative window: buffered, then written again and partly committed.
-    assert_eq!(s.ring_demand(ws, &[6]), Ok(pages(1)));
+    assert_eq!(s.window_demand(ws, rows(&[6])), Ok(win(1)));
     fire(&mut s, ws, &[6], advance(Some(0), 104));
     assert_eq!(
-        s.ring_demand(ws, &[6]),
-        Ok(pages(0)),
-        "the page is the ring's already"
+        s.window_demand(ws, rows(&[6])),
+        Ok(win(0)),
+        "the slot is the list's already"
     );
     fire(&mut s, ws, &[6], advance(Some(5), 104));
-    assert_eq!(s.ring_positions(ws), Ok(Some((101, 104))));
+    assert_eq!(s.window_positions(ws), Ok(Some((101, 104))));
     assert_eq!(
-        s.ring_demand(ws, &[3]),
-        Ok(pages(1)),
+        s.window_demand(ws, rows(&[3])),
+        Ok(win(1)),
         "a page behind the window is given back"
     );
 
     let child = s.fork(ws).unwrap();
     assert_eq!(
-        s.ring_demand(child, &[6]),
-        Ok(pages(1)),
+        s.window_demand(child, rows(&[6])),
+        Ok(win(1)),
         "a shared page copies on write"
     );
     let copies = fire(&mut s, child, &[6], advance(Some(u32::MAX), 112));
@@ -142,30 +140,30 @@ fn a_window_is_a_ring_of_pages_anchored_at_its_commit() {
 
     let set: HashSet<_> = [ws].into();
     let txn = s.prepare_suspend(&set).expect("three private pages");
-    assert!(txn.is_ring() && txn.copy_plan().pages.len() == 3);
-    assert_eq!(s.commit_suspend(txn), pages(3));
-    assert_eq!((s.held([ws]), s.swapped_units(&set)), (pages(0), pages(3)));
+    assert!(txn.is_window() && txn.copy_plan().pages.len() == 3);
+    assert_eq!(s.commit_suspend(txn), win(3));
+    assert_eq!((s.held([ws]), s.swapped_units(&set)), (win(0), win(3)));
     let kept = s.export(ws).unwrap();
-    assert_eq!(kept.buffer.iter().flatten().count(), 3);
+    assert_eq!(kept.windows[0].iter().flatten().count(), 3);
     let back = s.import(geom(), kept);
     assert_eq!(
-        s.ring_positions(back),
-        s.ring_positions(ws),
-        "a kept ring comes back where it stood"
+        s.window_positions(back),
+        s.window_positions(ws),
+        "a kept window comes back where it stood"
     );
     s.working_sets.remove(back);
     assert_eq!(s.available().pages, 7);
-    let mut granted = s.reserve(pages(3)).unwrap();
+    let mut granted = s.reserve(win(3)).unwrap();
     let txn = s.prepare_restore(&set, &mut granted).unwrap();
     assert_eq!(s.commit_restore(txn), 3);
-    assert_eq!(s.swapped_units(&set), pages(0));
+    assert_eq!(s.swapped_units(&set), win(0));
     assert_eq!(
-        s.ring_demand(ws, &[7]),
-        Ok(pages(1)),
-        "the ring reads on from its pages"
+        s.window_demand(ws, rows(&[7])),
+        Ok(win(1)),
+        "the window reads on from its slots"
     );
 
-    let device = |settled, end| RingAdvance {
+    let device = |settled, end| WindowAdvance {
         positioned: true,
         settled,
         reach: settled,
@@ -174,15 +172,15 @@ fn a_window_is_a_ring_of_pages_anchored_at_its_commit() {
         head: Some(end),
     };
     fire(&mut s, ws, &[7], device(0, 128));
-    assert_eq!(s.ring_positions(ws), Ok(Some((101, 128))));
+    assert_eq!(s.window_positions(ws), Ok(Some((101, 128))));
     fire(&mut s, ws, &[8], device(128, 144));
     assert_eq!(
-        s.ring_positions(ws),
+        s.window_positions(ws),
         Ok(Some((128, 144))),
         "a device-decided fold is settled by the next fire's first token"
     );
 
-    let lease = RingAdvance {
+    let lease = WindowAdvance {
         positioned: false,
         settled: 0,
         reach: 32,
@@ -191,29 +189,29 @@ fn a_window_is_a_ring_of_pages_anchored_at_its_commit() {
         head: None,
     };
     fire(&mut s, ws, &[2], lease);
-    assert_eq!(s.ring_positions(ws), Ok(Some((128, 144))));
+    assert_eq!(s.window_positions(ws), Ok(Some((128, 144))));
     assert_ne!(
-        s.ring_translation(ws, [2]).unwrap(),
-        [0],
+        s.window_tables(ws, 48).unwrap()[0][2],
+        0,
         "a device-geometry fire keeps the page its lease names"
     );
 
-    let decode = RingAdvance {
+    let decode = WindowAdvance {
         reach: 144,
         ..lease
     };
     fire(&mut s, ws, &[9], decode);
     assert_eq!(
-        s.ring_positions(ws),
+        s.window_positions(ws),
         Ok(Some((128, 144))),
         "a device-geometry fire commits nothing"
     );
     assert_eq!(
-        s.ring_translation(ws, [6, 7]).unwrap()[0],
+        s.window_tables(ws, 128).unwrap()[0][6],
         0,
         "and retires what lies wholly behind the window of the first token it writes"
     );
-    assert_ne!(s.ring_translation(ws, [7]).unwrap(), [0]);
+    assert_ne!(s.window_tables(ws, 128).unwrap()[0][7], 0);
 }
 
 fn a_suspend_parks_private_slots_on_host_and_restore_brings_them_back() {
@@ -251,7 +249,14 @@ fn a_suspend_parks_private_slots_on_host_and_restore_brings_them_back() {
     assert_eq!(s.commit_restore(txn), 1);
     assert_eq!(
         (s.swapped_units(&both), s.host_available()),
-        (slots(0), RsUnits { slots: 2, pages: 2 })
+        (
+            slots(0),
+            RsUnits {
+                slots: 2,
+                pages: 2,
+                ..RsUnits::default()
+            }
+        )
     );
     assert_eq!(s.folded_slot(ws), s.folded_slot(child));
     s.release_working_set(child);
@@ -279,7 +284,11 @@ fn a_suspend_parks_private_slots_on_host_and_restore_brings_them_back() {
     assert!(s.has_checkpoint(&[1; 32]), "back with its set");
     assert_eq!(
         s.host_available(),
-        RsUnits { slots: 2, pages: 2 },
+        RsUnits {
+            slots: 2,
+            pages: 2,
+            ..RsUnits::default()
+        },
         "one slot came back for both"
     );
 }

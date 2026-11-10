@@ -235,8 +235,9 @@ pub struct Lane {
     /// The lane's slot refs of the kv list and of each window list, in
     /// token order (an engine that states [`crate::chunk::ChunkFacts`]);
     /// empty during the migration, when `kv` and `rs` still say. A window
-    /// list's table is as long as the kv list's, a slot trimmed behind its
-    /// window ref 0 (CONTRACT-BC 19).
+    /// list's table is in its own token order, entry `i` its rows
+    /// `[i * T_w, (i + 1) * T_w)` (`T_w` its shape's tokens), a slot trimmed
+    /// behind its window ref 0 (CONTRACT-BC 19, 21).
     #[serde(default)]
     pub tables: Vec<(ShapeId, Vec<u32>)>,
     /// The lane's slot refs of each fixed shape, one `[run, cow]` a piece,
