@@ -42,14 +42,14 @@ impl Planes {
     }
 }
 
-/// The rows a lane buffers unfolded a recurrent layer: the state's record
-/// holds this many (`poem_compiler::chunk::UNFOLDED_ROWS`), slot `s` of the
-/// sequence in row `s % ROWS`.
-pub const ROWS: u32 = poem_compiler::chunk::UNFOLDED_ROWS;
+/// The buffered rows a seated lane replays in one fire that the scratch's
+/// range is reserved for; past them it is reserved anew.
+const REPLAYED: u32 = 16;
 
-/// The rs buffer: the rows a lane lands past its state before they fold. A
-/// lane's rows lie in its working set's record ([`Pools::rs_span`]), a
-/// block a recurrent layer, each buffered plane [`ROWS`] rows of it.
+/// The rs buffer: the rows a lane lands past its state before they fold. Its
+/// pages are slots of the state pool's rs list ([`Pools::rs_span`]): a page
+/// holds `tokens` rows of every recurrent layer's planes, a layer's rows a
+/// run of the slot, each buffered plane `tokens` rows of it.
 #[derive(Debug)]
 pub struct Buffers {
     /// The extended run's scratch: a fire's rows and the buffered slots its
@@ -59,49 +59,53 @@ pub struct Buffers {
     /// growth waits for none of them.
     scratch: Arena,
     planes: Planes,
-    /// Each buffered layer's rs rows, among the record's.
-    rows: Vec<u32>,
+    /// The rows a page holds.
+    tokens: u32,
+    /// Where each buffered layer's run starts in a page's slot.
+    rows: Vec<u64>,
     ext_row_bytes: u64,
 }
 
 impl Buffers {
-    /// The buffered planes of `trace`, checked against the rs rows the
-    /// record holds, and the scratch's range for fires of up to `max_rows`
-    /// rows beside every seated lane's buffered rows replayed once. A flat
-    /// arena backs its whole range on its first commit, so its scratch is
-    /// reserved when a fire first asks, for what it asks.
+    /// The buffered planes of `trace`, laid as the pool's rs list lays its
+    /// pages, and the scratch's range for fires of up to `max_rows` rows
+    /// beside every seated lane's buffered rows replayed once. A flat arena
+    /// backs its whole range on its first commit, so its scratch is reserved
+    /// when a fire first asks, for what it asks.
     pub fn reserve(
         trace: &Trace,
         paging: Paging,
         max_rows: u32,
         pools: &Pools,
     ) -> Result<Option<Buffers>> {
-        let Some((planes, per_token, layers)) = read(trace, ROWS)? else {
+        let layout = pools.rs_layout();
+        let tokens = layout.as_ref().map_or(1, |(tokens, _)| (*tokens).max(1));
+        let Some((planes, per_token, layers)) = read(trace, tokens)? else {
             return Ok(None);
         };
-        let block = u64::from(ROWS) * per_token * ELEMENT;
-        // The record's rs rows of a layer's block, in the layers' order; a
-        // row of another size buffers what this engine does not (an n-gram
-        // window's ids).
-        let held = pools.rs_rows();
-        let rows: Vec<u32> = (0u32..)
-            .zip(&held)
-            .filter(|&(_, &bytes)| bytes == block)
-            .map(|(at, _)| at)
+        // The list's runs of a layer's bytes a token, in the layers' order;
+        // a run of another size buffers what this engine does not (an
+        // n-gram window's ids).
+        let held = layout.map_or_else(Vec::new, |(_, runs)| runs);
+        let rows: Vec<u64> = held
+            .iter()
+            .filter(|&&(_, bytes)| bytes == per_token * ELEMENT)
+            .map(|&(offset, _)| offset)
             .take(layers as usize)
             .collect();
         if rows.len() != layers as usize {
             return Err(Fault::program(
                 "store::rs",
                 format!(
-                    "the plan buffers {layers} recurrent layer(s) of {block} bytes, and the \
-                     chunk recipe's record holds rs rows of {held:?}"
+                    "the plan buffers {layers} recurrent layer(s) of {} bytes a token, and the \
+                     chunk recipe's rs list lays runs of {held:?}",
+                    per_token * ELEMENT
                 ),
             ));
         }
         let ext_row_bytes = ext_row_bytes(trace)?;
         let reach = if elastic::mapped_on_demand() {
-            let rows = max_rows.saturating_add(paging.slots.saturating_mul(ROWS));
+            let rows = max_rows.saturating_add(paging.slots.saturating_mul(REPLAYED));
             RsScratch::need(rows, ext_row_bytes)
         } else {
             0
@@ -109,6 +113,7 @@ impl Buffers {
         Ok(Some(Buffers {
             scratch: pools.reserve_arena(reach, SCRATCH)?,
             planes,
+            tokens,
             rows,
             ext_row_bytes,
         }))
@@ -416,17 +421,22 @@ impl Buffers {
         (self.scratch.base(), self.scratch.committed_bytes())
     }
 
-    /// The address of `rows` rows of `plane` from row `row` of the record
-    /// `key` names: sequence slot `s` lies in row `s % ROWS`.
-    pub fn row(&self, pools: &Pools, key: u32, plane: Plane, row: u32, rows: u32) -> Result<u64> {
-        if row + rows > ROWS {
+    /// The rows an rs buffer page holds.
+    #[must_use]
+    pub fn page_tokens(&self) -> u32 {
+        self.tokens
+    }
+
+    /// The address of `plane`'s row `row` of rs buffer page `page`.
+    pub fn row(&self, pools: &Pools, plane: Plane, page: u32, row: u32) -> Result<u64> {
+        if row >= self.tokens {
             return Err(Fault::Ceiling {
-                what: "rs rows a record buffers a layer",
-                need: u64::from(row + rows),
-                have: u64::from(ROWS),
+                what: "rs buffer page tokens",
+                need: u64::from(row) + 1,
+                have: u64::from(self.tokens),
             });
         }
-        let layer = self
+        let run = self
             .rows
             .get(plane.layer as usize)
             .copied()
@@ -436,10 +446,9 @@ impl Buffers {
                 have: self.rows.len() as u64,
             })?;
         pools.rs_span(
-            key,
-            layer,
-            (plane.at + u64::from(row) * plane.width) * ELEMENT,
-            u64::from(rows) * plane.width * ELEMENT,
+            page,
+            run + (plane.at + u64::from(row) * plane.width) * ELEMENT,
+            plane.width * ELEMENT,
         )
     }
 }

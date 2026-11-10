@@ -1043,8 +1043,8 @@ pub struct StepView<'a> {
 }
 
 #[derive(Debug, Default, Clone)]
-struct RsFire {
-    moves: Vec<RsMove>,
+struct RsFire<'a> {
+    moves: Vec<RsMove<'a>>,
     lens: Vec<i32>,
     order: Vec<u32>,
     write_state: bool,
@@ -1120,7 +1120,7 @@ pub struct Prepared<'a> {
     geometries: Vec<kv::Geometry>,
     pages: u32,
     fresh: Vec<u32>,
-    rs: RsFire,
+    rs: RsFire<'a>,
     demand: Demand,
     slot: Option<crate::inputs::SlotGuard>,
     lengths: crate::inputs::Staged,

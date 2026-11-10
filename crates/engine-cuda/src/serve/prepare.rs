@@ -805,7 +805,8 @@ impl FrameShell for Shell {
         let mut writes: Vec<Option<(i32, i32)>> = Vec::with_capacity(rows as usize);
         let mut slot_ids: Vec<i32> = Vec::with_capacity(lanes.len());
         let mut fresh: Vec<u32> = Vec::new();
-        let mut rs_moves: Vec<RsMove> = Vec::with_capacity(lanes.len());
+        let mut rs_moves: Vec<RsMove<'a>> = Vec::with_capacity(lanes.len());
+        let mut rs_pages: Vec<u32> = Vec::new();
         let mut rs_reads: Vec<Vec<std::ops::Range<u32>>> = vec![Vec::new(); lanes.len()];
         let mut rs_folded: Vec<Option<u32>> = vec![None; lanes.len()];
         let mut rs_lens: Vec<i32> = Vec::with_capacity(lanes.len());
@@ -995,8 +996,12 @@ impl FrameShell for Shell {
             let (verb, folded) = match &seated.rs {
                 RsVerb::Fold => (RsMove::None, row.rows),
                 RsVerb::Buffer {
-                    base, folded, fold, ..
+                    pages,
+                    base,
+                    folded,
+                    fold,
                 } => {
+                    rs_pages.extend_from_slice(pages);
                     // A device-counted fold not yet settled left the state
                     // past the runtime's length.
                     let slot = seated.rs_slot.unwrap_or(lane.slot);
@@ -1025,17 +1030,6 @@ impl FrameShell for Shell {
                             ),
                         ));
                     }
-                    // The record holds a layer's unfolded rows a ring of
-                    // `ROWS`: a fire that would leave more unfolded has no
-                    // row to land its last in.
-                    let unfolded = (first + row.rows).saturating_sub(*folded);
-                    if unfolded > crate::store::rs::ROWS {
-                        return Err(Fault::Ceiling {
-                            what: "rows a lane holds unfolded past its recurrent state",
-                            need: u64::from(unfolded),
-                            have: u64::from(crate::store::rs::ROWS),
-                        });
-                    }
                     let reads = engine::fire::buffered_reads(masking, *folded, first, row.rows)
                         .map_err(|error| {
                             Fault::program("serve::rs", format!("lane {}: {error}", row.source))
@@ -1060,8 +1054,7 @@ impl FrameShell for Shell {
                         .collect();
                     (
                         RsMove::Scatter {
-                            key: slot,
-                            base: *base,
+                            pages: pages.as_slice(),
                             at: first - base,
                             fold,
                         },
@@ -1269,6 +1262,8 @@ impl FrameShell for Shell {
             .flat_map(|(table, _)| table.iter().map(|&page| u64::from(page)))
             .collect();
         self.pools.commit_frame(demand, &kv_ranges, &window_pages)?;
+        // The rs buffer pages the lanes name, seated before a row lands.
+        self.pools.seat_rs(&rs_pages)?;
         // The records as the kernels read them: each row's pieces by the
         // ids of the slots they lie in, table after table.
         let device_slot_ids = self.pools.state_tables(&slot_ids)?;

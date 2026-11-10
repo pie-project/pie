@@ -592,6 +592,20 @@ fn probe(served: fn(&Fixture, &Path) -> Vec<(u64, u32)>) {
     }
 }
 
+/// The rows a page of the load's rs buffer holds: the rs list's tokens.
+fn rs_page(shell: &mut Shell) -> u32 {
+    shell
+        .chunk_facts()
+        .expect("the pool states its chunks")
+        .shapes
+        .iter()
+        .find(|shape| shape.role == engine::chunk::SlotRole::RsBuffer)
+        .map_or(PAGE, |shape| match shape.kind {
+            engine::chunk::SlotKind::List { tokens, .. } => tokens,
+            _ => PAGE,
+        })
+}
+
 /// The model the buffered probe serves: gated delta net state with a
 /// chunked recurrence, whose rows a lane may buffer unfolded.
 const BUFFERED: &str = "qwen35-tiny";
@@ -633,6 +647,7 @@ fn served_buffered(fixture: &Fixture, cache: &Path) -> Vec<(u64, u32)> {
         .expect("the pool states its chunks")
         .validate()
         .expect("the engine's chunk facts hold");
+    let page = rs_page(&mut shell);
     shell.open(0).expect("slot 0 opens");
     let mut steps = Vec::new();
     let mut fed = 0u32;
@@ -667,10 +682,22 @@ fn served_buffered(fixture: &Fixture, cache: &Path) -> Vec<(u64, u32)> {
     folded += 37;
     for at in 0..40u32 {
         // The buffer's pages from the page the state's last slot lies in.
-        let base = folded / PAGE * PAGE;
+        let base = folded / page * page;
         let end = fed + 1;
-        let pages: Vec<u32> = (base / PAGE..end.div_ceil(PAGE))
-            .map(|page| page % 4)
+        // Halfway, the buffer's pages are copied onto slots of their own
+        // and the lane names those from there on, as a fork's first write
+        // into a shared tail page does.
+        if at == 20 {
+            let pairs: Vec<[u32; 2]> = (base / page..fed.div_ceil(page))
+                .map(|at| [at % 64, at % 64 + 64])
+                .collect();
+            shell
+                .copy_whole_slots(engine_cuda::store::layout::RS, &pairs)
+                .expect("the buffer's pages copy");
+        }
+        let shift = if at >= 20 { 64 } else { 0 };
+        let pages: Vec<u32> = (base / page..end.div_ceil(page))
+            .map(|at| at % 64 + shift)
             .collect();
         let unfolded = end - folded;
         let fold = match at % 7 {
@@ -864,6 +891,7 @@ fn served_pair_buffered(fixture: &Fixture, cache: &Path) -> Vec<(u64, u32)> {
         comm: core::ptr::null_mut(),
     })
     .unwrap_or_else(|why| panic!("{} loads: {why}", fixture.model));
+    let page = rs_page(&mut shell);
     shell.open(0).expect("slot 0 opens");
     shell.open(1).expect("slot 1 opens");
     let mut steps = Vec::new();
@@ -888,9 +916,9 @@ fn served_pair_buffered(fixture: &Fixture, cache: &Path) -> Vec<(u64, u32)> {
                     6 => unfolded,
                     _ => 0,
                 };
-                let base = folded[lane] / PAGE * PAGE;
-                let pages = (base / PAGE..end.div_ceil(PAGE))
-                    .map(|page| (page % 2) * 2 + lane as u32)
+                let base = folded[lane] / page * page;
+                let pages = (base / page..end.div_ceil(page))
+                    .map(|at| (at % 64) * 2 + lane as u32)
                     .collect();
                 (
                     RsVerb::Buffer {

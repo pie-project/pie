@@ -1164,12 +1164,6 @@ impl Pools {
                 Shape::Kv { .. } => 0,
             })
             .sum::<u64>()
-            + self
-                .chunks
-                .layout()
-                .fixed
-                .as_ref()
-                .map_or(0, |fixed| fixed.rs.iter().map(|rs| rs.bytes).sum())
     }
 
     #[must_use]
@@ -1541,8 +1535,7 @@ impl Pools {
     }
 
     /// The record's bytes as the host holds them, `(slot of the record,
-    /// offset, bytes)` in order: each recurrent row piece after piece, then
-    /// the rs buffer's rows.
+    /// offset, bytes)` in order: each recurrent row piece after piece.
     fn record_spans(&self) -> Vec<(u32, u64, u64)> {
         let Some(fixed) = self.chunks.layout().fixed.as_ref() else {
             return Vec::new();
@@ -1557,7 +1550,6 @@ impl Pools {
                 spans.push((slot, row.offset, row.piece_bytes(piece as u32)));
             }
         }
-        spans.extend(fixed.rs.iter().map(|rs| (rs.slot, rs.offset, rs.bytes)));
         spans
     }
 
@@ -1625,41 +1617,73 @@ impl Pools {
         Ok(out)
     }
 
-    /// The bytes of each recurrent layer's rs rows in a record.
+    /// The rs list as the chunk recipe lays it: the tokens a page holds, and
+    /// each rs row's run in a page, `(offset, bytes a token)`.
     #[must_use]
-    pub fn rs_rows(&self) -> Vec<u64> {
+    pub fn rs_layout(&self) -> Option<(u32, Vec<(u64, u64)>)> {
         self.chunks
             .layout()
-            .fixed
+            .rs
             .as_ref()
-            .map_or_else(Vec::new, |fixed| {
-                fixed.rs.iter().map(|rs| rs.bytes).collect()
-            })
+            .map(|rs| (rs.slot.tokens, rs.layers.clone()))
     }
 
-    /// The address of `bytes` at `offset` of recurrent layer `layer`'s rs
-    /// buffer rows in the record `key` names.
-    pub fn rs_span(&self, key: u32, layer: u32, offset: u64, bytes: u64) -> Result<u64> {
-        let fixed = self.fixed()?;
-        let rows = fixed.rs.get(layer as usize).ok_or(Fault::Ceiling {
-            what: "recurrent layers whose rs rows the record holds",
-            need: u64::from(layer) + 1,
-            have: fixed.rs.len() as u64,
-        })?;
-        if offset + bytes > rows.bytes {
-            return Err(Fault::Ceiling {
-                what: "bytes of a layer's rs rows in the record",
-                need: offset + bytes,
-                have: rows.bytes,
-            });
+    /// Seats the rs buffer pages `pages` on slots of the state pool and
+    /// backs the segments their chunks lie in.
+    pub fn seat_rs(&mut self, pages: &[u32]) -> Result<()> {
+        self.seat_pages(Kind::Rs, pages.iter().map(|&page| u64::from(page)))
+    }
+
+    /// The address of `bytes` at `offset` of rs buffer page `page`'s slot.
+    pub fn rs_span(&self, page: u32, offset: u64, bytes: u64) -> Result<u64> {
+        self.chunks.span(Kind::Rs, page, offset, bytes)
+    }
+
+    /// Copies whole slots of the shape `shape` names, `(src, dst)`, on
+    /// `stream`: a shared tail slot's rows onto the slot a fire then writes.
+    pub fn copy_whole_slots(
+        &mut self,
+        stream: *mut core::ffi::c_void,
+        shape: engine::chunk::ShapeId,
+        pairs: &[[u32; 2]],
+    ) -> Result<()> {
+        let kind = match shape {
+            layout::LIST => Kind::List,
+            layout::RING => Kind::Ring,
+            layout::FIXED => Kind::Fixed,
+            layout::RS => Kind::Rs,
+            other => {
+                return Err(Fault::program(
+                    "store::chunks",
+                    format!("a slot copy names shape {other}, which this load does not state"),
+                ));
+            }
+        };
+        let bytes = self
+            .chunks
+            .layout()
+            .shape(kind)
+            .map(|shape| shape.slot_bytes)
+            .ok_or_else(|| {
+                Fault::program(
+                    "store::chunks",
+                    format!("a slot copy of a {} in a load that lays none", kind.name()),
+                )
+            })?;
+        self.seat_pages(kind, pairs.iter().flatten().map(|&slot| u64::from(slot)))?;
+        self.fence_all_swaps(stream)?;
+        for &[src, dst] in pairs {
+            if src == dst {
+                continue;
+            }
+            crate::device::copy_d2d(
+                stream,
+                self.chunks.span(kind, dst, 0, bytes)?,
+                self.chunks.span(kind, src, 0, bytes)?,
+                usize::try_from(bytes).unwrap_or(0),
+            )?;
         }
-        let record = self.record(key)?;
-        self.chunks.span(
-            Kind::Fixed,
-            record[rows.slot as usize],
-            rows.offset + offset,
-            bytes,
-        )
+        Ok(())
     }
 
     /// The state rows of `slot`, backed first; none when the load keeps no state.

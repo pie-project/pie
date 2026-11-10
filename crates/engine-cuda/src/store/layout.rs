@@ -25,6 +25,8 @@ pub const LIST: ShapeId = ShapeId(0);
 pub const RING: ShapeId = ShapeId(1);
 /// The fixed shape's.
 pub const FIXED: ShapeId = ShapeId(2);
+/// The rs list's.
+pub const RS: ShapeId = ShapeId(3);
 
 /// Which of a load's slot shapes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -35,6 +37,9 @@ pub enum Kind {
     Ring,
     /// A working set's record of every recurrent row.
     Fixed,
+    /// A page of the rs buffer: the rows a lane lands past its state before
+    /// they fold, every recurrent layer's.
+    Rs,
 }
 
 impl Kind {
@@ -50,6 +55,7 @@ impl Kind {
             Kind::List => "kv page",
             Kind::Ring => "windowed page",
             Kind::Fixed => "state slot",
+            Kind::Rs => "rs buffer page",
         }
     }
 }
@@ -89,6 +95,11 @@ impl SlotShape {
                 rows,
                 ..
             } => (*tokens, *bytes, Some(cap.window), rows),
+            SlotLayout::RsList {
+                tokens,
+                bytes,
+                rows,
+            } => (*tokens, *bytes, None, rows),
             SlotLayout::Fixed { .. } => {
                 return Err(Fault::program(
                     "store::layout",
@@ -172,6 +183,18 @@ pub struct Layout {
     pub list: Option<SlotShape>,
     pub ring: Option<SlotShape>,
     pub fixed: Option<FixedShape>,
+    pub rs: Option<RsShape>,
+}
+
+/// The rs list: a slot holds `slot.tokens` buffered rows of every recurrent
+/// layer's rs planes, a layer's rows `layers[k]` bytes into it and a token
+/// `per_token[k]` bytes of them.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RsShape {
+    pub slot: SlotShape,
+    /// Where each rs row's run starts in a slot and its bytes a token, in
+    /// the recipe's order (a recurrent layer each, then what else buffers).
+    pub layers: Vec<(u64, u64)>,
 }
 
 /// One recurrent row of a working set's record: `pieces` equal pieces of
@@ -201,25 +224,14 @@ impl FixedRow {
     }
 }
 
-/// A recurrent layer's rs buffer rows in the record: `bytes` at `offset` of
-/// the record's slot `slot`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct RsRows {
-    pub slot: u32,
-    pub offset: u64,
-    pub bytes: u64,
-}
-
-/// The fixed shape: a working set's record of every recurrent row and of the
-/// rs buffer's rows, `pieces` slots of it.
+/// The fixed shape: a working set's record of every recurrent row, `pieces`
+/// slots of it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FixedShape {
     pub slot: SlotShape,
     /// The slots a record takes.
     pub pieces: u32,
     pub rows: Vec<FixedRow>,
-    /// The rs buffer's rows, a recurrent layer each, in the layers' order.
-    pub rs: Vec<RsRows>,
     /// The id tables a fire stages a lane: each a run of the record's slots
     /// some row's pieces lie in, the rows that share a run sharing a table.
     pub tables: Vec<Vec<u32>>,
@@ -244,7 +256,6 @@ impl FixedShape {
         let mut tables: Vec<Vec<u32>> = Vec::new();
         let mut columns: Vec<u32> = Vec::new();
         let mut rows = Vec::new();
-        let mut rs = Vec::new();
         for run in runs {
             let atom = recipe.atoms.get(&run.row).ok_or_else(|| {
                 Fault::program(
@@ -274,20 +285,10 @@ impl FixedShape {
                     });
                 }
                 RowId::Rs(_) => {
-                    let [slot] = run.slots.as_slice() else {
-                        return Err(Fault::Unbound {
-                            what: format!(
-                                "an rs buffer's rows whole in one slot of the record: the \
-                                 chunk recipe cuts them into {} pieces",
-                                run.pieces
-                            ),
-                        });
-                    };
-                    rs.push(RsRows {
-                        slot: *slot,
-                        offset: run.offset,
-                        bytes: atom.extent * atom.bytes,
-                    });
+                    return Err(Fault::program(
+                        "store::layout",
+                        "an rs row in the fixed record: the rs buffer is a list shape",
+                    ));
                 }
                 RowId::Pool(_) => {}
             }
@@ -305,7 +306,6 @@ impl FixedShape {
             },
             pieces: (*pieces_per_ws).max(1),
             rows,
-            rs,
             tables,
         })
     }
@@ -348,6 +348,22 @@ impl Layout {
             .fixed()
             .map(|layout| FixedShape::of(recipe, layout))
             .transpose()?;
+        let rs = recipe
+            .rs_list()
+            .map(|layout| -> Result<RsShape> {
+                let mut slot = SlotShape::of(layout, chunk_bytes, RS)?;
+                slot.rows.clear();
+                Ok(RsShape {
+                    slot,
+                    layers: recipe
+                        .rs
+                        .runs
+                        .iter()
+                        .map(|run| (run.offset, run.per_token))
+                        .collect(),
+                })
+            })
+            .transpose()?;
         let (_, segment_chunks) = recipe.profile.segment(chunk_bytes);
         Ok(Layout {
             chunk_bytes,
@@ -355,6 +371,7 @@ impl Layout {
             list,
             ring,
             fixed,
+            rs,
         })
     }
 
@@ -364,6 +381,7 @@ impl Layout {
             Kind::List => self.list.as_ref(),
             Kind::Ring => self.ring.as_ref(),
             Kind::Fixed => self.fixed.as_ref().map(|fixed| &fixed.slot),
+            Kind::Rs => self.rs.as_ref().map(|rs| &rs.slot),
         }
     }
 
