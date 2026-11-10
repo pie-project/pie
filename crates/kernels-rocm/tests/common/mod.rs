@@ -9,6 +9,8 @@ use dtype::Dtype;
 use kernels_rocm::hip::{self, blas};
 use kernels_rocm::{Ctx, KvPool, RecurrentPool, Snapshots, Tensor};
 
+pub mod spread;
+
 pub struct Gpu {
     pub stream: hip::Stream,
     blas: blas::Handle,
@@ -53,6 +55,45 @@ impl Gpu {
 
     pub fn sync(&self) {
         self.stream.synchronize().unwrap();
+    }
+
+    /// `values` uploaded into a fresh buffer this `Gpu` keeps, its address.
+    pub fn up<T: Copy>(&self, values: &[T]) -> u64 {
+        let mut bytes = vec![0u8; size_of_val(values).max(1)];
+        // SAFETY: `T: Copy` elements read back as their bytes.
+        bytes[..size_of_val(values)].copy_from_slice(unsafe {
+            std::slice::from_raw_parts(values.as_ptr().cast::<u8>(), size_of_val(values))
+        });
+        self.keep(hip::Buffer::from_slice(&bytes).unwrap())
+    }
+
+    /// `count` elements read from device address `at`, after the stream's
+    /// work.
+    pub fn down<T: Copy + Default>(&self, at: u64, count: usize) -> Vec<T> {
+        self.sync();
+        let mut out = vec![T::default(); count];
+        // SAFETY: `out` holds `count` elements and the copy is synchronous;
+        // `at` lies in a live allocation of this `Gpu` at least that long.
+        let code = unsafe {
+            hip::rt::hipMemcpy(
+                out.as_mut_ptr().cast(),
+                at as *const core::ffi::c_void,
+                size_of_val(out.as_slice()),
+                hip::sys::MEMCPY_DEVICE_TO_HOST,
+            )
+        };
+        assert_eq!(code, hip::sys::HIP_SUCCESS, "hipMemcpy D2H");
+        out
+    }
+
+    /// `bytes` bytes at device address `at` set to `byte`, after the
+    /// stream's work.
+    pub fn fill(&self, at: u64, byte: u8, bytes: usize) {
+        self.sync();
+        // SAFETY: the caller names `bytes` of live device memory at `at`.
+        let code =
+            unsafe { hip::rt::hipMemset(at as *mut core::ffi::c_void, i32::from(byte), bytes) };
+        assert_eq!(code, hip::sys::HIP_SUCCESS, "hipMemset");
     }
 
     fn keep(&self, buffer: hip::Buffer) -> u64 {

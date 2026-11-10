@@ -564,6 +564,7 @@ fn an_fp8_bank_on_the_matrix_core_folds_each_route() {
             gpu.ints_shaped(&routes, tokens as u32, top_k as u32),
             &mut y,
             moe::GroupSeat::RESIDENT,
+            moe::ExpertTable::RESIDENT,
         )
         .unwrap();
         let got = gpu.read(&y);

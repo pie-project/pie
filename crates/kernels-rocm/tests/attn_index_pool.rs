@@ -8,6 +8,7 @@
 
 mod common;
 
+use common::spread::{agrees, out};
 use common::{Gpu, KV, bf16s, close_abs, close_bf16, round_bf16};
 use dtype::Dtype;
 use kernels_rocm::attn::compressed::pool;
@@ -75,7 +76,8 @@ fn make_pool(gpu: &Gpu, rows: &[Vec<f32>], cells: &[usize], width: usize, ps: us
         pages_in_batch: indices.len() as i32,
         live: [0, 0],
         ..KV
-    };
+    }
+    .with_packed_stride();
     Pool {
         pool,
         indices,
@@ -258,6 +260,22 @@ fn run_topk(
     )
     .unwrap();
     let got = gpu.read_as::<i32>(&sel);
+    let what = format!("topk h{heads} d{d} ratio{ratio}");
+    agrees(&gpu, &what, &[p.pool], &[], &[out(&sel)], |_, pools, _| {
+        let mut sel = sel;
+        index::topk(
+            &ctx,
+            q,
+            weights,
+            &pools[0],
+            heads as u32,
+            d as u32,
+            top_k as u32,
+            ratio as u32,
+            &mut sel,
+        )
+        .unwrap();
+    });
     let mut t = 0;
     for (r, &ql) in qo_lens.iter().enumerate() {
         for i in 0..ql {
@@ -409,6 +427,27 @@ fn index_keys_append_and_block_mean() {
     )
     .unwrap();
     let got = gpu.read(&out);
+    let landed = common::spread::out(&out);
+    agrees(
+        &gpu,
+        "block mean",
+        &[p.pool],
+        &[],
+        &[landed],
+        |_, pools, _| {
+            let mut out = out;
+            kernels_rocm::attn::compressed::pool::block_mean(
+                &ctx,
+                bpos,
+                breq,
+                &pools[0],
+                d as u32,
+                ratio as u32,
+                &mut out,
+            )
+            .unwrap();
+        },
+    );
     let at = |r: usize, pos: usize| {
         let c = p.cell(r, pos);
         plane[c * d..(c + 1) * d].to_vec()
@@ -624,40 +663,54 @@ fn run_pool_lse(
         })
         .collect();
     let q = gpu.tensor(&qv, t as u32, (heads * d) as u32, Dtype::Bf16);
-    let mut o = gpu.zeros(t as u32, (heads * d) as u32, Dtype::Bf16);
-    let mut lse = gpu.zeros(t as u32, heads as u32, Dtype::F32);
-    match top_k {
-        None => pool::attention_lse(
-            &ctx,
-            q,
-            gpu.column(positions),
-            gpu.column(req),
-            &p.pool,
-            ratio as u32,
-            heads as u32,
-            d as u32,
-            scale,
-            &mut o,
-            &mut lse,
-        ),
-        Some(k) => pool::attention_lse_selected(
-            &ctx,
-            q,
-            gpu.column(positions),
-            gpu.column(req),
-            gpu.ints_shaped(&sel, t as u32, k as u32),
-            &p.pool,
-            ratio as u32,
-            k as u32,
-            heads as u32,
-            d as u32,
-            scale,
-            &mut o,
-            &mut lse,
-        ),
-    }
-    .unwrap();
+    let (positions_t, req_t) = (gpu.column(positions), gpu.column(req));
+    let selection = top_k.map(|k| gpu.ints_shaped(&sel, t as u32, k as u32));
+    let attend = |pool: &KvPool, mut o: Tensor, mut lse: Tensor| {
+        match (top_k, selection) {
+            (Some(k), Some(selection)) => pool::attention_lse_selected(
+                &ctx,
+                q,
+                positions_t,
+                req_t,
+                selection,
+                pool,
+                ratio as u32,
+                k as u32,
+                heads as u32,
+                d as u32,
+                scale,
+                &mut o,
+                &mut lse,
+            ),
+            _ => pool::attention_lse(
+                &ctx,
+                q,
+                positions_t,
+                req_t,
+                pool,
+                ratio as u32,
+                heads as u32,
+                d as u32,
+                scale,
+                &mut o,
+                &mut lse,
+            ),
+        }
+        .unwrap();
+    };
+    let o = gpu.zeros(t as u32, (heads * d) as u32, Dtype::Bf16);
+    let lse = gpu.zeros(t as u32, heads as u32, Dtype::F32);
+    attend(&p.pool, o, lse);
     let (got, got_lse) = (gpu.read(&o), gpu.read(&lse));
+    let what = format!("pool attention h{heads} d{d} ratio{ratio} sel{top_k:?}");
+    agrees(
+        &gpu,
+        &what,
+        &[p.pool],
+        &[],
+        &[out(&o), out(&lse)],
+        |_, pools, _| attend(&pools[0], o, lse),
+    );
     for i in 0..t {
         let r = req[i] as usize;
         for h in 0..heads {
@@ -772,6 +825,21 @@ fn run_block_max(
     )
     .unwrap();
     let got = gpu.read_as::<i32>(&sel);
+    let what = format!("block max h{heads} d{d} block{block}");
+    agrees(&gpu, &what, &[p.pool], &[], &[out(&sel)], |_, pools, _| {
+        let mut sel = sel;
+        index::topk_block_max(
+            &ctx,
+            q,
+            &pools[0],
+            heads as u32,
+            d as u32,
+            top_k as u32,
+            block as u32,
+            &mut sel,
+        )
+        .unwrap();
+    });
     let mut t = 0;
     for (r, &ql) in qo_lens.iter().enumerate() {
         for i in 0..ql {

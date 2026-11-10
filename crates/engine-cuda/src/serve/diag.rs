@@ -23,10 +23,6 @@ pub struct Diagnostics {
     /// device profile's: a small one cuts a miniature's records into the
     /// pieces only a full model's take.
     pub chunk_bytes: Option<u64>,
-    /// Lays the state pool as kernels that step pages packed address it
-    /// (what a ROCm build always does): the same logits where the model can
-    /// be laid so, a refused load where it cannot.
-    pub packed_pages: bool,
     /// States no weight shape: every table and routed bank the weight cache
     /// would stream stays dense on the device, as a load that predates the
     /// cache seats it.
@@ -65,7 +61,6 @@ impl Default for Diagnostics {
             gumbel_direct: true,
             sync_guard: None,
             chunk_bytes: None,
-            packed_pages: false,
             dense_weights: false,
             dense_experts: false,
         }
@@ -122,9 +117,6 @@ impl Diagnostics {
         if let Some(bytes) = self.chunk_bytes {
             words.push(format!("chunk-bytes={bytes}"));
         }
-        if self.packed_pages {
-            words.push("packed-pages".to_string());
-        }
         if self.dense_weights {
             words.push("dense-weights".to_string());
         }
@@ -149,7 +141,7 @@ const WORDS: &str = "`golden-probe`, `arm-trace`, \
      `ptr-trace=<key substring>`, `graph-dot=<dir>`, `grid-trace=<key substring>`, \
      `plan-trace=<rows|all>`, `arm-bench=<key>`, `capture-serial`, `boundary-trace`, `reap-trace`, \
      `trace-census`, `nan-check`, `fuse-chains=off`, `gumbel-direct=off`, \
-     `sync-guard[=panic]`, `chunk-bytes=<bytes>`, `packed-pages`, `dense-weights`, \
+     `sync-guard[=panic]`, `chunk-bytes=<bytes>`, `dense-weights`, \
      `dense-experts`";
 
 impl std::str::FromStr for Diagnostics {
@@ -174,7 +166,6 @@ impl std::str::FromStr for Diagnostics {
                 "reap-trace" => diag.reap_trace = switch(word, value)?,
                 "trace-census" => diag.trace_census = switch(word, value)?,
                 "nan-check" => diag.nan_check = switch(word, value)?,
-                "packed-pages" => diag.packed_pages = switch(word, value)?,
                 "dense-weights" => diag.dense_weights = switch(word, value)?,
                 "dense-experts" => diag.dense_experts = switch(word, value)?,
                 "fuse-chains" => diag.fuse_chains = switch(word, value)?,

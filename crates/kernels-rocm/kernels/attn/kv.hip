@@ -16,12 +16,15 @@
 
 namespace pie::attn {
 
-// The element offset of (page, slot, head, j) in either layout.
+// The element offset of (page, slot, head, j) in either layout, in a plane
+// whose pages lie `stride` elements apart (`page_size * h_kv * d` packed;
+// the plane's pointer carries its own offset inside a page).
 template <bool HND>
 __device__ __forceinline__ long long kv_at(long long page, int slot, int head, int j, int page_size,
-                                           int h_kv, int d) {
-    return HND ? ((page * h_kv + head) * page_size + slot) * d + j
-               : ((page * page_size + slot) * h_kv + head) * d + j;
+                                           int h_kv, int d, long long stride) {
+    const long long in_page = HND ? (static_cast<long long>(head) * page_size + slot) * d + j
+                                  : (static_cast<long long>(slot) * h_kv + head) * d + j;
+    return page * stride + in_page;
 }
 
 constexpr float kE4m3Unit = 2.f;
@@ -102,7 +105,8 @@ struct Kv<true> {
 };
 
 // Token row b's k and v (h_kv·d each) into page w_page[b], slot w_off[b],
-// as bf16 or (FP8) e4m3 codes. A row whose slot is out of range, or that
+// as bf16 or (FP8) e4m3 codes, the key and value planes' pages `k_stride`
+// and `v_stride` elements apart. A row whose slot is out of range, or that
 // `row_valid` marks dead, is skipped. One block per token row; 8 elements a
 // thread when d allows.
 template <bool HND, bool FP8>
@@ -110,7 +114,8 @@ __global__ void kv_append_explicit(const bf16* __restrict__ k, const bf16* __res
                                    bf16* __restrict__ k_pages, bf16* __restrict__ v_pages,
                                    const u32* __restrict__ w_page, const u32* __restrict__ w_off,
                                    const u8* __restrict__ row_valid, int B, int page_size,
-                                   int h_kv, int d, const u32* __restrict__ win) {
+                                   int h_kv, int d, long long k_stride, long long v_stride,
+                                   const u32* __restrict__ win) {
     const Window window{win};
     if (static_cast<int>(blockIdx.x) >= B || !window.live(blockIdx.x)) return;
     const long long b = window.plane(blockIdx.x);
@@ -128,33 +133,36 @@ __global__ void kv_append_explicit(const bf16* __restrict__ k, const bf16* __res
         };
         u8* kp = reinterpret_cast<u8*>(k_pages);
         u8* vp = reinterpret_cast<u8*>(v_pages);
-        if (d % 8 == 0 && aligned16(ks) && aligned16(vs)) {
+        if (d % 8 == 0 && k_stride % 8 == 0 && v_stride % 8 == 0 && aligned16(ks) && aligned16(vs)) {
             for (int i = threadIdx.x * 8; i < row; i += blockDim.x * 8) {
-                const long long dst = kv_at<HND>(page, slot, i / d, i % d, page_size, h_kv, d);
-                *reinterpret_cast<u64*>(kp + dst) = codes(*reinterpret_cast<const Pack8<bf16>*>(ks + i));
-                *reinterpret_cast<u64*>(vp + dst) = codes(*reinterpret_cast<const Pack8<bf16>*>(vs + i));
+                const long long kd = kv_at<HND>(page, slot, i / d, i % d, page_size, h_kv, d, k_stride);
+                const long long vd = kv_at<HND>(page, slot, i / d, i % d, page_size, h_kv, d, v_stride);
+                *reinterpret_cast<u64*>(kp + kd) = codes(*reinterpret_cast<const Pack8<bf16>*>(ks + i));
+                *reinterpret_cast<u64*>(vp + vd) = codes(*reinterpret_cast<const Pack8<bf16>*>(vs + i));
             }
             return;
         }
         for (int i = threadIdx.x; i < row; i += blockDim.x) {
-            const long long dst = kv_at<HND>(page, slot, i / d, i % d, page_size, h_kv, d);
-            kp[dst] = static_cast<u8>(e4m3x4(to_f32(ks[i]), 0.f, 0.f, 0.f));
-            vp[dst] = static_cast<u8>(e4m3x4(to_f32(vs[i]), 0.f, 0.f, 0.f));
+            const long long kd = kv_at<HND>(page, slot, i / d, i % d, page_size, h_kv, d, k_stride);
+            const long long vd = kv_at<HND>(page, slot, i / d, i % d, page_size, h_kv, d, v_stride);
+            kp[kd] = static_cast<u8>(e4m3x4(to_f32(ks[i]), 0.f, 0.f, 0.f));
+            vp[vd] = static_cast<u8>(e4m3x4(to_f32(vs[i]), 0.f, 0.f, 0.f));
         }
         return;
     }
-    if (d % 8 == 0 && aligned16(ks) && aligned16(vs) && aligned16(k_pages) && aligned16(v_pages)) {
+    if (d % 8 == 0 && k_stride % 8 == 0 && v_stride % 8 == 0 && aligned16(ks) && aligned16(vs) &&
+        aligned16(k_pages) && aligned16(v_pages)) {
         for (int i = threadIdx.x * 8; i < row; i += blockDim.x * 8) {
-            const long long dst = kv_at<HND>(page, slot, i / d, i % d, page_size, h_kv, d);
-            *reinterpret_cast<b128*>(k_pages + dst) = *reinterpret_cast<const b128*>(ks + i);
-            *reinterpret_cast<b128*>(v_pages + dst) = *reinterpret_cast<const b128*>(vs + i);
+            const long long kd = kv_at<HND>(page, slot, i / d, i % d, page_size, h_kv, d, k_stride);
+            const long long vd = kv_at<HND>(page, slot, i / d, i % d, page_size, h_kv, d, v_stride);
+            *reinterpret_cast<b128*>(k_pages + kd) = *reinterpret_cast<const b128*>(ks + i);
+            *reinterpret_cast<b128*>(v_pages + vd) = *reinterpret_cast<const b128*>(vs + i);
         }
         return;
     }
     for (int i = threadIdx.x; i < row; i += blockDim.x) {
-        const long long dst = kv_at<HND>(page, slot, i / d, i % d, page_size, h_kv, d);
-        k_pages[dst] = ks[i];
-        v_pages[dst] = vs[i];
+        k_pages[kv_at<HND>(page, slot, i / d, i % d, page_size, h_kv, d, k_stride)] = ks[i];
+        v_pages[kv_at<HND>(page, slot, i / d, i % d, page_size, h_kv, d, v_stride)] = vs[i];
     }
 }
 

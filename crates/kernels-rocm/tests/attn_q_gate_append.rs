@@ -22,6 +22,7 @@ fn pool(gpu: &Gpu, slots: u32, row: u32, d: u32, ps: u32, row_valid: Tensor) -> 
         head_stride: i64::from(d),
         ..KV
     }
+    .with_packed_stride()
 }
 
 #[test]

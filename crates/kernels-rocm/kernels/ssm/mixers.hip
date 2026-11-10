@@ -3,13 +3,15 @@
 // Gated DeltaNet: the causal depthwise conv in front of it, the gates, and
 // the delta-rule recurrence over a per-slot state; and Kimi Delta Attention
 // (at the end), the same with a decay per key channel. Value head h's state
-// S[i][j] is bf16 at slab + slot·stride + h·K_d·V_d + i·V_d + j; a token
+// S[i][j] is bf16 at the row's head h (`StateRows::atom`) + i·V_d + j; a token
 // stores S' = bf16(S·g) + k̂·δ (δ = (v − Sᵀgk̂)·β) and reads o = S'ᵀq̂ before
 // S' rounds. A slot's conv state holds its last (K−1)·dil + 1 inputs, oldest
-// first. A captured launch reads its extent from the window.
+// first, cut along channels: a piece holds `[window][rows.atoms]`. A
+// captured launch reads its extent from the window.
 
 #include "prim/device.hip"
 #include "prim/mfma.hip"
+#include "prim/state_rows.hip"
 
 namespace pie::attn {
 
@@ -81,8 +83,7 @@ __device__ __forceinline__ Snaps snaps_of(const int* snap, int rl) {
 // at most; a wider conv takes the loop).
 template <class T, bool SILU = true, bool RESIDUAL = false>
 __global__ void ssm_conv1d_update(const T* __restrict__ x, const T* __restrict__ weight,
-                                  const T* __restrict__ bias, T* __restrict__ state_base,
-                                  const i32* __restrict__ slot_ids, long long slot_stride,
+                                  const T* __restrict__ bias, StateRows rows,
                                   T* __restrict__ y, int R, int C, int K, int dil, bool write_state,
                                   const u8* __restrict__ mask, const u32* __restrict__ win) {
     constexpr int KMAX = 8;
@@ -90,11 +91,13 @@ __global__ void ssm_conv1d_update(const T* __restrict__ x, const T* __restrict__
     if (r >= R || (win != nullptr && r >= static_cast<int>(win[0]))) return;
     const long long row = win != nullptr ? r + static_cast<long long>(win[1]) : r;
     const int rl = win != nullptr ? r + static_cast<int>(win[3]) : r;
-    const int slot = slot_ids[rl];
-    if (slot < 0) return;
+    const i32* rid = rows.row(rl);
+    if (rid[0] < 0) return;
     const int c = blockIdx.x * blockDim.x + threadIdx.x;
     if (c >= C) return;
-    T* state = state_base + static_cast<long long>(slot) * slot_stride;
+    const int cs = rows.atoms;
+    const int ci = c % cs;
+    T* state = rows.piece<T>(rid, c / cs);
     const int span = (K - 1) * dil;
     const bool fold = folds(write_state, mask, rl);
     const float xn = to_f32(x[row * C + c]);
@@ -104,7 +107,7 @@ __global__ void ssm_conv1d_update(const T* __restrict__ x, const T* __restrict__
 #pragma unroll
         for (int k = 0; k < KMAX; ++k) {
             wk[k] = k < K ? to_f32(weight[c * K + k]) : 0.f;
-            hist[k] = k + 1 <= span ? to_f32(state[(k + 1) * C + c]) : 0.f;
+            hist[k] = k + 1 <= span ? to_f32(state[(k + 1) * cs + ci]) : 0.f;
         }
 #pragma unroll
         for (int k = 0; k < KMAX - 1; ++k)
@@ -115,17 +118,17 @@ __global__ void ssm_conv1d_update(const T* __restrict__ x, const T* __restrict__
             // The window shifted by one: row k takes row k + 1's input.
 #pragma unroll
             for (int k = 0; k < KMAX; ++k)
-                if (k < span) state[k * C + c] = from_f32<T>(hist[k]);
-            state[span * C + c] = from_f32<T>(xn);
+                if (k < span) state[k * cs + ci] = from_f32<T>(hist[k]);
+            state[span * cs + ci] = from_f32<T>(xn);
         }
         return;
     }
-    for (int k = 0; k < K - 1; ++k) acc += to_f32(weight[c * K + k]) * to_f32(state[(k * dil + 1) * C + c]);
+    for (int k = 0; k < K - 1; ++k) acc += to_f32(weight[c * K + k]) * to_f32(state[(k * dil + 1) * cs + ci]);
     acc += to_f32(weight[c * K + K - 1]) * xn;
     y[row * C + c] = from_f32<T>(conv_out<SILU, RESIDUAL>(acc, xn));
     if (fold) {
-        for (int k = 0; k < span; ++k) state[k * C + c] = state[(k + 1) * C + c];
-        state[span * C + c] = from_f32<T>(xn);
+        for (int k = 0; k < span; ++k) state[k * cs + ci] = state[(k + 1) * cs + ci];
+        state[span * cs + ci] = from_f32<T>(xn);
     }
 }
 
@@ -137,9 +140,8 @@ constexpr int kConvRows = 32;
 // `ssm_conv1d_state_commit` folds it after.
 template <class T, bool SILU = true, bool RESIDUAL = false>
 __global__ void ssm_conv1d_chunked(const T* __restrict__ x, const T* __restrict__ weight,
-                                   const T* __restrict__ bias, T* __restrict__ y,
-                                   const T* __restrict__ state_base, const i32* __restrict__ slot_ids,
-                                   const u32* __restrict__ indptr, long long slot_stride, int C,
+                                   const T* __restrict__ bias, T* __restrict__ y, StateRows rows,
+                                   const u32* __restrict__ indptr, int C,
                                    int K, int dil, bool write_state, const u8* __restrict__ mask,
                                    const int* __restrict__ commit_len, const int* __restrict__ begin_at,
                                    const u32* __restrict__ win, int lanes_stated) {
@@ -168,16 +170,18 @@ __global__ void ssm_conv1d_chunked(const T* __restrict__ x, const T* __restrict_
         const int rl = win != nullptr ? r + static_cast<int>(win[3]) : r;
         const Span s = span_of(indptr, r, rl, commit_len, begin_at);
         if (s.n <= 0) continue;
-        const int slot = slot_ids[rl];
-        if (slot < 0) continue;
+        const i32* rid = rows.row(rl);
+        if (rid[0] < 0) continue;
         const T* xr = x + (s.t0 + row0) * C;
         T* yr = y + (s.t0 + row0) * C;
-        const T* state = state_base + static_cast<long long>(slot) * slot_stride;
+        const int cs = rows.atoms;
+        const int ci = c % cs;
+        const T* state = rows.piece<const T>(rid, c / cs);
         for (int t = max(tile0, s.t0) - s.t0; t < min(tile_end, s.t0 + s.n) - s.t0; ++t) {
             float acc = b;
             for (int k = 0; k < K; ++k) {
                 const int src = t - (K - 1 - k) * dil;
-                const float xv = src < 0 ? to_f32(state[(window + src) * C + c])
+                const float xv = src < 0 ? to_f32(state[(window + src) * cs + ci])
                                          : to_f32(xr[static_cast<long long>(src) * C + c]);
                 acc += to_f32(weight[c * K + k]) * xv;
             }
@@ -193,9 +197,8 @@ __global__ void ssm_conv1d_chunked(const T* __restrict__ x, const T* __restrict_
 // bits. Grid (⌈C / (8·block)⌉, ⌈rows / 32⌉); C a multiple of 8.
 template <class T, int K, bool SILU = true, bool RESIDUAL = false>
 __global__ void ssm_conv1d_chunked_v8(const T* __restrict__ x, const T* __restrict__ weight,
-                                      const T* __restrict__ bias, T* __restrict__ y,
-                                      const T* __restrict__ state_base, const i32* __restrict__ slot_ids,
-                                      const u32* __restrict__ indptr, long long slot_stride, int C,
+                                      const T* __restrict__ bias, T* __restrict__ y, StateRows rows,
+                                      const u32* __restrict__ indptr, int C,
                                       const int* __restrict__ commit_len, const int* __restrict__ begin_at,
                                       const u32* __restrict__ win, int lanes_stated) {
     constexpr int V = 8;
@@ -231,11 +234,14 @@ __global__ void ssm_conv1d_chunked_v8(const T* __restrict__ x, const T* __restri
         const int rl = win != nullptr ? r + static_cast<int>(win[3]) : r;
         const Span s = span_of(indptr, r, rl, commit_len, begin_at);
         if (s.n <= 0) continue;
-        const int slot = slot_ids[rl];
-        if (slot < 0) continue;
+        const i32* rid = rows.row(rl);
+        if (rid[0] < 0) continue;
         const T* xr = x + (s.t0 + row0) * C + c0;
         T* yr = y + (s.t0 + row0) * C + c0;
-        const T* state = state_base + static_cast<long long>(slot) * slot_stride + c0;
+        // Eight channels never straddle a piece: a piece holds whole eights
+        // of them (the launcher checks).
+        const int cs = rows.atoms;
+        const T* state = rows.piece<const T>(rid, c0 / cs) + c0 % cs;
         const int t_begin = max(tile0, s.t0) - s.t0, t_end = min(tile_end, s.t0 + s.n) - s.t0;
         if (t_begin >= t_end) continue;
         // win_[j] holds input t - (K - 1) + j.
@@ -243,7 +249,7 @@ __global__ void ssm_conv1d_chunked_v8(const T* __restrict__ x, const T* __restri
 #pragma unroll
         for (int j = 0; j < K - 1; ++j) {
             const int src = t_begin - (K - 1) + j;
-            load(src < 0 ? state + static_cast<long long>(K + src) * C : xr + static_cast<long long>(src) * C, xw[j]);
+            load(src < 0 ? state + static_cast<long long>(K + src) * cs : xr + static_cast<long long>(src) * C, xw[j]);
         }
         for (int t = t_begin; t < t_end; ++t) {
             load(xr + static_cast<long long>(t) * C, xw[K - 1]);
@@ -266,9 +272,8 @@ __global__ void ssm_conv1d_chunked_v8(const T* __restrict__ x, const T* __restri
 
 // The window after a request's rows: its last (K−1)·dil + 1 inputs, the
 // older ones from the window it started with. Grid (⌈C / block⌉, lanes).
-__global__ void ssm_conv1d_state_commit(const bf16* __restrict__ x, bf16* __restrict__ state_base,
-                                        const i32* __restrict__ slot_ids,
-                                        const u32* __restrict__ indptr, long long slot_stride, int C,
+__global__ void ssm_conv1d_state_commit(const bf16* __restrict__ x, StateRows rows,
+                                        const u32* __restrict__ indptr, int C,
                                         int K, int dil, const u8* __restrict__ mask,
                                         const int* __restrict__ commit_len,
                                         const int* __restrict__ begin_at, const int* __restrict__ snap,
@@ -281,28 +286,30 @@ __global__ void ssm_conv1d_state_commit(const bf16* __restrict__ x, bf16* __rest
     if (r >= lanes) return;
     const int rl = win != nullptr ? r + static_cast<int>(win[3]) : r;
     if (mask != nullptr && mask[rl] == 0) return;
-    const int slot = slot_ids[rl];
-    if (slot < 0) return;
+    const i32* rid = rows.row(rl);
+    if (rid[0] < 0) return;
     const Span s = span_of(indptr, r, rl, commit_len, begin_at);
     if (s.n <= 0) return;
     const long long row0 = win != nullptr ? static_cast<long long>(win[1]) : 0;
     const int window = (K - 1) * dil + 1;
     const bf16* xr = x + (s.t0 + row0) * C;
-    bf16* state = state_base + static_cast<long long>(slot) * slot_stride;
+    const int cs = rows.atoms;
+    const int ci = c % cs;
+    bf16* state = rows.piece<bf16>(rid, c / cs);
     // Each snapshot's window, from the rows and the window the lane started
     // with, before the lane's own overwrites it.
     const Snaps sn = snaps_of(snap, rl);
     for (int e = sn.e0; e < sn.e1 && snap_rows[e] < s.n; ++e) {
-        bf16* at = state_base + static_cast<long long>(snap_slots[e]) * slot_stride;
+        bf16* at = rows.piece<bf16>(snap_slots + static_cast<long long>(e) * rows.pieces, c / cs);
         for (int i = 0; i < window; ++i) {
             const int src = snap_rows[e] - window + i;
-            at[i * C + c] = src < 0 ? state[(window + src) * C + c] : xr[static_cast<long long>(src) * C + c];
+            at[i * cs + ci] = src < 0 ? state[(window + src) * cs + ci] : xr[static_cast<long long>(src) * C + c];
         }
     }
     // Ascending s reads only rows at or after the one it overwrites.
     for (int i = 0; i < window; ++i) {
         const int src = s.n - window + i;
-        state[i * C + c] = src < 0 ? state[(window + src) * C + c] : xr[static_cast<long long>(src) * C + c];
+        state[i * cs + ci] = src < 0 ? state[(window + src) * cs + ci] : xr[static_cast<long long>(src) * C + c];
     }
 }
 
@@ -380,9 +387,8 @@ __global__ void ssm_gdn_prep_v_gates(const bf16* __restrict__ qkv, const float* 
 // and 8 columns j0.. of the block's BV-column tile, so K_d ≤ 256 / TPR.
 template <int BV>
 __global__ __launch_bounds__(256) void ssm_gdn_decode_step(
-    const bf16* __restrict__ qkv, const float* __restrict__ gates, bf16* __restrict__ state_base,
-    const i32* __restrict__ slot_ids, long long slot_stride, float* __restrict__ out, int K_h, int V_h,
-    int K_d, int V_d, int conv_dim, float q_scale, bool write_state, const u8* __restrict__ mask,
+    const bf16* __restrict__ qkv, const float* __restrict__ gates, StateRows rows, float* __restrict__ out,
+    int K_h, int V_h, int K_d, int V_d, int conv_dim, float q_scale, bool write_state, const u8* __restrict__ mask,
     const u32* __restrict__ win) {
     constexpr int BLOCK = 256, VEC = 8, TPR = BV / VEC, WAVES = BLOCK / kWave;
     static_assert(BV % VEC == 0 && kWave % TPR == 0, "a tile row is whole 8-wide packs");
@@ -394,8 +400,8 @@ __global__ __launch_bounds__(256) void ssm_gdn_decode_step(
     if (win != nullptr && r >= static_cast<int>(win[0])) return;
     const long long row = win != nullptr ? r + static_cast<long long>(win[1]) : r;
     const int rl = win != nullptr ? r + static_cast<int>(win[3]) : r;
-    const int slot = slot_ids[rl];
-    if (slot < 0) return;
+    const i32* rid = rows.row(rl);
+    if (rid[0] < 0) return;
     const bool fold = folds(write_state, mask, rl);
 
     const int tid = threadIdx.x, wave = tid / kWave;
@@ -406,8 +412,7 @@ __global__ __launch_bounds__(256) void ssm_gdn_decode_step(
     const bool live = i < K_d;
 
     // Every read of the step issued before the norms' barriers.
-    bf16* cell = state_base + static_cast<long long>(slot) * slot_stride + static_cast<long long>(h) * K_d * V_d +
-                 static_cast<long long>(i) * V_d + j0;
+    bf16* cell = rows.atom<bf16>(rid, h, static_cast<long long>(K_d) * V_d) + static_cast<long long>(i) * V_d + j0;
     Pack8<bf16> sp{};
     if (live) sp = *reinterpret_cast<const Pack8<bf16>*>(cell);
     const Pack8<bf16> vp = *reinterpret_cast<const Pack8<bf16>*>(qkv_row + 2LL * K_h * K_d + static_cast<long long>(h) * V_d + j0);
@@ -527,9 +532,8 @@ __device__ __forceinline__ u32 bf16_pack_rne(float lo, float hi) {
 // arithmetic, fused in pairs and in another order.
 template <int KD, int VD, int BLOCK>
 __global__ __launch_bounds__(BLOCK) void ssm_gdn_decode_rows(
-    const bf16* __restrict__ qkv, const float* __restrict__ gates, bf16* __restrict__ state_base,
-    const i32* __restrict__ slot_ids, long long slot_stride, float* __restrict__ out, int K_h, int V_h,
-    int conv_dim, float q_scale, bool write_state, const u8* __restrict__ mask, const u32* __restrict__ win) {
+    const bf16* __restrict__ qkv, const float* __restrict__ gates, StateRows rows, float* __restrict__ out,
+    int K_h, int V_h, int conv_dim, float q_scale, bool write_state, const u8* __restrict__ mask, const u32* __restrict__ win) {
     constexpr int WAVES = BLOCK / kWave, VEC = 8, CG = VD / VEC, RG = BLOCK / CG, Q = KD / RG;
     static_assert(VD % VEC == 0 && BLOCK % CG == 0 && KD % RG == 0 && kWave % CG == 0,
                   "whole packs, whole row groups");
@@ -540,8 +544,8 @@ __global__ __launch_bounds__(BLOCK) void ssm_gdn_decode_rows(
     if (win != nullptr && r >= static_cast<int>(win[0])) return;
     const long long row = win != nullptr ? r + static_cast<long long>(win[1]) : r;
     const int rl = win != nullptr ? r + static_cast<int>(win[3]) : r;
-    const int slot = slot_ids[rl];
-    if (slot < 0) return;
+    const i32* rid = rows.row(rl);
+    if (rid[0] < 0) return;
     const int tid = threadIdx.x, wave = tid / kWave, l = lane();
     const int h_k = h / (V_h / K_h);
     const bf16* qkv_row = qkv + row * conv_dim;
@@ -558,7 +562,7 @@ __global__ __launch_bounds__(BLOCK) void ssm_gdn_decode_rows(
     const Pack8<bf16> vp = *reinterpret_cast<const Pack8<bf16>*>(qkv_row + 2LL * K_h * KD + static_cast<long long>(h) * VD + j0);
     const float g_log = gates[row * 2 * V_h + h];
     const float beta = gates[row * 2 * V_h + V_h + h];
-    bf16* head = state_base + static_cast<long long>(slot) * slot_stride + static_cast<long long>(h) * KD * VD;
+    bf16* head = rows.atom<bf16>(rid, h, static_cast<long long>(KD) * VD);
     u32x4 sp[Q];
 #pragma unroll
     for (int q = 0; q < Q; ++q) sp[q] = state_load(head + (rg + RG * q) * VD + j0);
@@ -682,10 +686,9 @@ __global__ __launch_bounds__(BLOCK) void ssm_gdn_decode_rows(
 // shared window and zeroes the ticket.
 template <int KD, int VD, int BLOCK, int KMAX>
 __global__ __launch_bounds__(BLOCK) void ssm_gdn_step_fused(
-    const bf16* __restrict__ qkvz, const bf16* __restrict__ conv_w, bf16* __restrict__ conv_base,
-    const i32* __restrict__ conv_slots, long long conv_stride, bool conv_write, const u8* __restrict__ conv_mask,
-    const bf16* __restrict__ ba, const float* __restrict__ a_log, const bf16* __restrict__ dt_bias,
-    bf16* __restrict__ state_base, const i32* __restrict__ slot_ids, long long slot_stride, bool write_state,
+    const bf16* __restrict__ qkvz, const bf16* __restrict__ conv_w, StateRows conv_rows, bool conv_write,
+    const u8* __restrict__ conv_mask, const bf16* __restrict__ ba, const float* __restrict__ a_log,
+    const bf16* __restrict__ dt_bias, StateRows rows, bool write_state,
     const u8* __restrict__ mask, bf16* __restrict__ qkv_out, bf16* __restrict__ z_out, float* __restrict__ out,
     int* __restrict__ tickets, int K_h, int V_h, int K, float q_scale, const u32* __restrict__ win) {
     constexpr int WAVES = BLOCK / kWave, VEC = 8, CG = VD / VEC, RG = BLOCK / CG, Q = KD / RG;
@@ -701,9 +704,9 @@ __global__ __launch_bounds__(BLOCK) void ssm_gdn_step_fused(
     if (win != nullptr && r >= static_cast<int>(win[0])) return;
     const long long row = win != nullptr ? r + static_cast<long long>(win[1]) : r;
     const int rl = win != nullptr ? r + static_cast<int>(win[3]) : r;
-    const int slot = slot_ids[rl];
-    const int cslot = conv_slots[rl];
-    if (slot < 0 || cslot < 0) return;
+    const i32* rid = rows.row(rl);
+    const i32* crid = conv_rows.row(rl);
+    if (rid[0] < 0 || crid[0] < 0) return;
     const int tid = threadIdx.x, wave = tid / kWave, l = lane();
     const int G = V_h / K_h;
     const int h_k = h / G;
@@ -714,7 +717,7 @@ __global__ __launch_bounds__(BLOCK) void ssm_gdn_step_fused(
 
     // This head's state, in flight under the conv and the ticket.
     const int cg = tid % CG, rg = tid / CG, j0 = cg * VEC;
-    bf16* head = state_base + static_cast<long long>(slot) * slot_stride + static_cast<long long>(h) * KD * VD;
+    bf16* head = rows.atom<bf16>(rid, h, static_cast<long long>(KD) * VD);
     u32x4 sp[Q];
 #pragma unroll
     for (int q = 0; q < Q; ++q) sp[q] = state_load(head + (rg + RG * q) * VD + j0);
@@ -727,21 +730,25 @@ __global__ __launch_bounds__(BLOCK) void ssm_gdn_step_fused(
     const float beta = 1.f / (1.f + __expf(-bb));
 
     // The conv over this block's channels: q and k of its key head, v of
-    // its own; every read in flight before any is used.
-    int ch[CPT];
+    // its own; every read in flight before any is used. Channel ch[u]'s
+    // window column: cc[u] in the piece at cst[u], `ccs` channels a piece.
+    int ch[CPT], cc[CPT];
+    bf16* cst[CPT];
     float xn[CPT], hist[CPT][KMAX], wk[CPT][KMAX];
-    bf16* cstate = conv_base + static_cast<long long>(cslot) * conv_stride;
+    const int ccs = conv_rows.atoms;
 #pragma unroll
     for (int u = 0; u < CPT; ++u) {
         const int ii = min(tid + u * BLOCK, CH - 1);
         ch[u] = ii < KD       ? h_k * KD + ii
                 : ii < 2 * KD ? K_h * KD + h_k * KD + (ii - KD)
                               : 2 * K_h * KD + h * VD + (ii - 2 * KD);
+        cc[u] = ch[u] % ccs;
+        cst[u] = conv_rows.piece<bf16>(crid, ch[u] / ccs);
         xn[u] = to_f32(in_row[ch[u]]);
 #pragma unroll
         for (int k = 0; k < KMAX; ++k) {
             wk[u][k] = k < K ? to_f32(conv_w[ch[u] * K + k]) : 0.f;
-            hist[u][k] = k + 1 <= span ? to_f32(cstate[(k + 1) * C + ch[u]]) : 0.f;
+            hist[u][k] = k + 1 <= span ? to_f32(cst[u][(k + 1) * ccs + cc[u]]) : 0.f;
         }
     }
     const bool cfold = folds_uniform(conv_write, conv_mask, rl);
@@ -760,8 +767,8 @@ __global__ __launch_bounds__(BLOCK) void ssm_gdn_step_fused(
         if (own && cfold) {
 #pragma unroll
             for (int k = 0; k < KMAX; ++k)
-                if (k < span) cstate[k * C + ch[u]] = from_f32<bf16>(hist[u][k]);
-            cstate[span * C + ch[u]] = from_f32<bf16>(xn[u]);
+                if (k < span) cst[u][k * ccs + cc[u]] = from_f32<bf16>(hist[u][k]);
+            cst[u][span * ccs + cc[u]] = from_f32<bf16>(xn[u]);
         }
     }
     if (tid < VD) z_out[row * (V_h * VD) + h * VD + tid] = in_row[C + h * VD + tid];
@@ -783,8 +790,8 @@ __global__ __launch_bounds__(BLOCK) void ssm_gdn_step_fused(
             if (i >= 2 * KD) continue;
 #pragma unroll
             for (int k = 0; k < KMAX; ++k)
-                if (k < span) cstate[k * C + ch[u]] = from_f32<bf16>(hist[u][k]);
-            cstate[span * C + ch[u]] = from_f32<bf16>(xn[u]);
+                if (k < span) cst[u][k * ccs + cc[u]] = from_f32<bf16>(hist[u][k]);
+            cst[u][span * ccs + cc[u]] = from_f32<bf16>(xn[u]);
         }
     }
 
@@ -912,9 +919,8 @@ __global__ __launch_bounds__(BLOCK) void ssm_gdn_step_fused(
 template <int BK, int BV>
 __global__ __launch_bounds__(BV) void ssm_gdn_scan(
     const float* __restrict__ q_norm, const float* __restrict__ k_norm, const float* __restrict__ v,
-    const float* __restrict__ g_log, const float* __restrict__ beta, bf16* __restrict__ state_base,
-    const i32* __restrict__ slot_ids, const u32* __restrict__ indptr, long long slot_stride,
-    float* __restrict__ out, int K_h, int V_h, int K_d, int V_d, bool write_state,
+    const float* __restrict__ g_log, const float* __restrict__ beta, StateRows rows,
+    const u32* __restrict__ indptr, float* __restrict__ out, int K_h, int V_h, int K_d, int V_d, bool write_state,
     const int* __restrict__ commit_len, const u8* __restrict__ mask, const int* __restrict__ begin_at,
     bool fused_decay, const int* __restrict__ snap, const int* __restrict__ snap_rows,
     const i32* __restrict__ snap_slots, const u32* __restrict__ win) {
@@ -926,11 +932,11 @@ __global__ __launch_bounds__(BV) void ssm_gdn_scan(
     const long long row0 = win != nullptr ? static_cast<long long>(win[1]) : 0;
     const Span sp = span_of(indptr, r, rl, commit_len, begin_at);
     if (sp.n <= 0) return;
-    const int slot = slot_ids[rl];
-    if (slot < 0) return;
+    const i32* rid = rows.row(rl);
+    if (rid[0] < 0) return;
     const bool col = j < V_d;
     const int h_k = h / (V_h / K_h);
-    bf16* state = state_base + static_cast<long long>(slot) * slot_stride + static_cast<long long>(h) * K_d * V_d;
+    bf16* state = rows.atom<bf16>(rid, h, static_cast<long long>(K_d) * V_d);
 
     bf16 s[BK];
 #pragma unroll
@@ -967,8 +973,8 @@ __global__ __launch_bounds__(BV) void ssm_gdn_scan(
         }
         if (col) out[((sp.t0 + t + row0) * V_h + h) * V_d + j] = o;
         if (sn.e0 < sn.e1 && snap_rows[sn.e0] == t + 1) {
-            bf16* at = state_base + static_cast<long long>(snap_slots[sn.e0]) * slot_stride +
-                       static_cast<long long>(h) * K_d * V_d;
+            bf16* at = rows.atom<bf16>(snap_slots + static_cast<long long>(sn.e0) * rows.pieces, h,
+                                       static_cast<long long>(K_d) * V_d);
             if (col && folds(write_state, mask, rl)) {
 #pragma unroll
                 for (int i = 0; i < BK; ++i) {
@@ -1005,18 +1011,19 @@ struct GdnLane {
     int t0;
     int T;
     int rl;
+    // The lane's first chunk id: negative where it holds no state.
     int slot;
     Snaps sn;
 };
 
-__device__ __forceinline__ GdnLane gdn_lane(int r, const u32* indptr, const i32* slot_ids, const int* commit_len,
+__device__ __forceinline__ GdnLane gdn_lane(int r, const u32* indptr, const StateRows& rows, const int* commit_len,
                                             const int* begin_at, const int* snap, const u32* win) {
     GdnLane lane;
     lane.rl = win != nullptr ? r + static_cast<int>(win[3]) : r;
     const Span sp = span_of(indptr, r, lane.rl, commit_len, begin_at);
     lane.t0 = sp.t0;
     lane.T = sp.n;
-    lane.slot = lane.T > 0 ? slot_ids[lane.rl] : -1;
+    lane.slot = lane.T > 0 ? rows.first(lane.rl) : -1;
     lane.sn = snaps_of(snap, lane.rl);
     return lane;
 }
@@ -1139,7 +1146,7 @@ __device__ __forceinline__ void unit_lower_inverse(float (*A)[CH], float* X) {
 // kernels norm them.
 template <int BK, int BV>
 __global__ __launch_bounds__(512) void ssm_gdn_chunk_wu(
-    const bf16* __restrict__ qkv, const float* __restrict__ gates, const i32* __restrict__ slot_ids,
+    const bf16* __restrict__ qkv, const float* __restrict__ gates, StateRows rows,
     const u32* __restrict__ indptr, const int* __restrict__ commit_len, const int* __restrict__ begin_at,
     float* __restrict__ gcum, bf16* __restrict__ qb, bf16* __restrict__ kb_out, bf16* __restrict__ kT,
     bf16* __restrict__ w_out, bf16* __restrict__ u_out, int lanes, int K_h, int V_h, int conv_dim, float q_scale,
@@ -1160,7 +1167,7 @@ __global__ __launch_bounds__(512) void ssm_gdn_chunk_wu(
     if (win != nullptr) lanes = min(lanes, static_cast<int>(win[2]));
     if (lanes <= 0) return;
     const int r = gdn_slot_lane(s, lanes, indptr, begin_at, snap, win);
-    const GdnLane ln = gdn_lane(r, indptr, slot_ids, commit_len, begin_at, snap, win);
+    const GdnLane ln = gdn_lane(r, indptr, rows, commit_len, begin_at, snap, win);
     if (ln.T <= 0 || ln.slot < 0) return;
     const int j = s - gdn_chunk_base(r, indptr, begin_at, snap, win);
     if (j < 0) return;
@@ -1330,9 +1337,8 @@ __global__ __launch_bounds__(512) void ssm_gdn_chunk_wu(
 template <int BK, int BV, int BVT>
 __global__ __launch_bounds__(256) __attribute__((amdgpu_waves_per_eu(2, 2))) void ssm_gdn_chunk_h(
     const float* __restrict__ gcum, const bf16* __restrict__ kT, const bf16* __restrict__ w,
-    const bf16* __restrict__ uT, bf16* __restrict__ vnT, bf16* __restrict__ hcT, bf16* __restrict__ state_base,
-    const i32* __restrict__ slot_ids, const u32* __restrict__ indptr, long long slot_stride,
-    const int* __restrict__ commit_len, const int* __restrict__ begin_at, bool write_state,
+    const bf16* __restrict__ uT, bf16* __restrict__ vnT, bf16* __restrict__ hcT, StateRows rows,
+    const u32* __restrict__ indptr, const int* __restrict__ commit_len, const int* __restrict__ begin_at, bool write_state,
     const u8* __restrict__ mask, int lanes, int K_h, int V_h, const int* __restrict__ snap,
     const int* __restrict__ snap_rows, const i32* __restrict__ snap_slots, const u32* __restrict__ win) {
     constexpr int CH = GDN_CH, NT = BVT / 16, KT = BK / 16 / 4, KS = BK / 32, CS = CH / 32;
@@ -1356,12 +1362,12 @@ __global__ __launch_bounds__(256) __attribute__((amdgpu_waves_per_eu(2, 2))) voi
     const int vt = at % (BV / BVT);
     const int h = (at / (BV / BVT)) % V_h;
     const int r = at / ((BV / BVT) * V_h);
-    const GdnLane ln = gdn_lane(r, indptr, slot_ids, commit_len, begin_at, snap, win);
+    const GdnLane ln = gdn_lane(r, indptr, rows, commit_len, begin_at, snap, win);
     if (ln.T <= 0 || ln.slot < 0) return;
     const int hk = h / (V_h / K_h);
     const int v0 = vt * BVT;
     const int tid = threadIdx.x, wave = tid / kWave, l = lane();
-    bf16* state = state_base + static_cast<long long>(ln.slot) * slot_stride + static_cast<long long>(h) * BK * BV;
+    bf16* state = rows.atom<bf16>(rows.row(ln.rl), h, static_cast<long long>(BK) * BV);
 
     float hf[KT][NT][4];
 #pragma unroll
@@ -1479,8 +1485,8 @@ __global__ __launch_bounds__(256) __attribute__((amdgpu_waves_per_eu(2, 2))) voi
         // A snapshot lands the state as stored and the walk carries on from
         // it rounded, as a pass cut there reloads it.
         if (ck.snap >= 0) {
-            bf16* sat = state_base + static_cast<long long>(snap_slots[ck.snap]) * slot_stride +
-                        static_cast<long long>(h) * BK * BV;
+            bf16* sat = rows.atom<bf16>(snap_slots + static_cast<long long>(ck.snap) * rows.pieces, h,
+                                        static_cast<long long>(BK) * BV);
 #pragma unroll
             for (int q = 0; q < KT; ++q)
 #pragma unroll
@@ -1517,7 +1523,7 @@ __global__ __launch_bounds__(256) __attribute__((amdgpu_waves_per_eu(2, 2))) voi
 template <int BK, int BV>
 __global__ __launch_bounds__(256) void ssm_gdn_chunk_o(
     const float* __restrict__ gcum, const bf16* __restrict__ qb, const bf16* __restrict__ kb,
-    const bf16* __restrict__ vnT, const bf16* __restrict__ hcT, const i32* __restrict__ slot_ids,
+    const bf16* __restrict__ vnT, const bf16* __restrict__ hcT, StateRows rows,
     const u32* __restrict__ indptr, const int* __restrict__ commit_len, const int* __restrict__ begin_at,
     float* __restrict__ out, int lanes, int K_h, int V_h, const int* __restrict__ snap,
     const int* __restrict__ snap_rows, const i32* __restrict__ snap_slots, const u32* __restrict__ win) {
@@ -1530,7 +1536,7 @@ __global__ __launch_bounds__(256) void ssm_gdn_chunk_o(
     if (win != nullptr) lanes = min(lanes, static_cast<int>(win[2]));
     if (lanes <= 0) return;
     const int r = gdn_slot_lane(s, lanes, indptr, begin_at, snap, win);
-    const GdnLane ln = gdn_lane(r, indptr, slot_ids, commit_len, begin_at, snap, win);
+    const GdnLane ln = gdn_lane(r, indptr, rows, commit_len, begin_at, snap, win);
     if (ln.T <= 0 || ln.slot < 0) return;
     const int j = s - gdn_chunk_base(r, indptr, begin_at, snap, win);
     if (j < 0) return;
@@ -1797,8 +1803,8 @@ __device__ __forceinline__ void kda_rows_step(f32x4 (&s)[R][E], const f32x4 (&q)
 template <int D, int ROWS>
 __global__ __launch_bounds__(256) void ssm_kda_step_batched(
     const bf16* __restrict__ mixed, const bf16* __restrict__ f, const bf16* __restrict__ b,
-    const float* __restrict__ a_log, const float* __restrict__ dt_bias, float* __restrict__ state_base,
-    const i32* __restrict__ slot_ids, long long slot_stride, float* __restrict__ out, int H, float eps, float floor,
+    const float* __restrict__ a_log, const float* __restrict__ dt_bias, StateRows rows,
+    float* __restrict__ out, int H, float eps, float floor,
     bool write_state, const u8* __restrict__ mask, const u32* __restrict__ win) {
     constexpr int E = D / 32, RPP = 256 / kKdaRowLanes, R = ROWS / RPP, WAVES = 256 / kWave;
     static_assert(D % 32 == 0 && D <= 2 * kWave && ROWS % RPP == 0 && D % ROWS == 0,
@@ -1807,13 +1813,13 @@ __global__ __launch_bounds__(256) void ssm_kda_step_batched(
     if (win != nullptr && r >= static_cast<int>(win[0])) return;
     const long long row = win != nullptr ? r + static_cast<long long>(win[1]) : r;
     const int rl = win != nullptr ? r + static_cast<int>(win[3]) : r;
-    const int slot = slot_ids[rl];
-    if (slot < 0) return;
+    const i32* rid = rows.row(rl);
+    if (rid[0] < 0) return;
     const int tid = threadIdx.x, wave = tid / kWave, l = lane();
     const int c = tid % kKdaRowLanes;
     const int v0 = blockIdx.z * ROWS + tid / kKdaRowLanes;
     const long long width = static_cast<long long>(H) * D;
-    float* head = state_base + static_cast<long long>(slot) * slot_stride + static_cast<long long>(h) * D * D;
+    float* head = rows.atom<float>(rid, h, static_cast<long long>(D) * D);
     const bf16* q = mixed + row * 3 * width + static_cast<long long>(h) * D;
 
     // The token's reads first, so waiting on them waits on no state read;
@@ -1875,8 +1881,8 @@ __global__ __launch_bounds__(256) void ssm_kda_step_batched(
 template <int D>
 __global__ __launch_bounds__(8 * D) void ssm_kda_chunked_batched(
     const float* __restrict__ q_norm, const float* __restrict__ k_norm, const float* __restrict__ v,
-    const float* __restrict__ gate, const float* __restrict__ beta, float* __restrict__ state_base,
-    const i32* __restrict__ slot_ids, const u32* __restrict__ indptr, long long slot_stride,
+    const float* __restrict__ gate, const float* __restrict__ beta, StateRows rows,
+    const u32* __restrict__ indptr,
     float* __restrict__ out, int H, int D_stated, bool write_state, const int* __restrict__ commit_len,
     const u8* __restrict__ mask, const int* __restrict__ begin_at, const int* __restrict__ snap, const int* __restrict__ snap_rows,
     const i32* __restrict__ snap_slots, const u32* __restrict__ win) {
@@ -1889,11 +1895,10 @@ __global__ __launch_bounds__(8 * D) void ssm_kda_chunked_batched(
     const long long row0 = win != nullptr ? static_cast<long long>(win[1]) : 0;
     const Span sp = span_of(indptr, r, rl, commit_len, begin_at);
     if (sp.n <= 0) return;
-    const int slot = slot_ids[rl];
-    if (slot < 0) return;
+    const i32* rid = rows.row(rl);
+    if (rid[0] < 0) return;
     const int c = threadIdx.x % kKdaRowLanes, vr = threadIdx.x / kKdaRowLanes;
-    float* st = state_base + static_cast<long long>(slot) * slot_stride + static_cast<long long>(h) * D * D +
-                static_cast<long long>(vr) * D;
+    float* st = rows.atom<float>(rid, h, static_cast<long long>(D) * D) + static_cast<long long>(vr) * D;
 
     f32x4 s[E];
 #pragma unroll
@@ -1916,8 +1921,9 @@ __global__ __launch_bounds__(8 * D) void ssm_kda_chunked_batched(
         const float y = kda_row_step<E>(s, tk.q, tk.k, tk.a, vt, bt);
         if (c == 0) out[((sp.t0 + t + row0) * H + h) * D + vr] = y;
         if (sn.e0 < sn.e1 && snap_rows[sn.e0] == t + 1) {
-            float* at = state_base + static_cast<long long>(snap_slots[sn.e0]) * slot_stride +
-                        static_cast<long long>(h) * D * D + static_cast<long long>(vr) * D;
+            float* at = rows.atom<float>(snap_slots + static_cast<long long>(sn.e0) * rows.pieces, h,
+                                         static_cast<long long>(D) * D) +
+                        static_cast<long long>(vr) * D;
             if (folds(write_state, mask, rl))
 #pragma unroll
                 for (int e = 0; e < E; ++e) *reinterpret_cast<f32x4*>(at + 4 * c + 32 * e) = s[e];
@@ -2014,7 +2020,7 @@ __device__ __forceinline__ float wave_scatter_sum(float (&x)[32]) {
 template <int D>
 __global__ __launch_bounds__(512) void ssm_kda_chunk_wu(
     const bf16* __restrict__ mixed, const bf16* __restrict__ f, const bf16* __restrict__ b,
-    const float* __restrict__ a_log, const float* __restrict__ dt_bias, const i32* __restrict__ slot_ids,
+    const float* __restrict__ a_log, const float* __restrict__ dt_bias, StateRows rows,
     const u32* __restrict__ indptr, const int* __restrict__ commit_len, const int* __restrict__ begin_at,
     bf16* __restrict__ kT, bf16* __restrict__ w_out, bf16* __restrict__ uT, bf16* __restrict__ qg,
     bf16* __restrict__ p_out, float* __restrict__ gl, int lanes, int H, float eps, float floor,
@@ -2039,7 +2045,7 @@ __global__ __launch_bounds__(512) void ssm_kda_chunk_wu(
     if (win != nullptr) lanes = min(lanes, static_cast<int>(win[2]));
     if (lanes <= 0) return;
     const int r = gdn_slot_lane(s, lanes, indptr, begin_at, snap, win);
-    const GdnLane ln = gdn_lane(r, indptr, slot_ids, commit_len, begin_at, snap, win);
+    const GdnLane ln = gdn_lane(r, indptr, rows, commit_len, begin_at, snap, win);
     if (ln.T <= 0 || ln.slot < 0) return;
     const int j = s - gdn_chunk_base(r, indptr, begin_at, snap, win);
     if (j < 0) return;
@@ -2295,8 +2301,7 @@ template <int D>
 __global__ __launch_bounds__(256) void ssm_kda_chunk_ho(
     const bf16* __restrict__ kT, const bf16* __restrict__ w, const bf16* __restrict__ uT,
     const float* __restrict__ gl, const bf16* __restrict__ qg, const bf16* __restrict__ p,
-    float* __restrict__ out, float* __restrict__ state_base,
-    const i32* __restrict__ slot_ids, const u32* __restrict__ indptr, long long slot_stride,
+    float* __restrict__ out, StateRows rows, const u32* __restrict__ indptr,
     const int* __restrict__ commit_len, const int* __restrict__ begin_at, bool write_state,
     const u8* __restrict__ mask, int lanes, int H, const int* __restrict__ snap,
     const int* __restrict__ snap_rows, const i32* __restrict__ snap_slots, const u32* __restrict__ win) {
@@ -2312,14 +2317,14 @@ __global__ __launch_bounds__(256) void ssm_kda_chunk_ho(
     const int r = static_cast<int>(blockIdx.x) / ((D / BVT) * H);
     if (win != nullptr) lanes = min(lanes, static_cast<int>(win[2]));
     if (r >= lanes) return;
-    const GdnLane ln = gdn_lane(r, indptr, slot_ids, commit_len, begin_at, snap, win);
+    const GdnLane ln = gdn_lane(r, indptr, rows, commit_len, begin_at, snap, win);
     if (ln.T <= 0 || ln.slot < 0) return;
     const int v0 = vt * BVT;
     const long long row0 = win != nullptr ? static_cast<long long>(win[1]) : 0;
     const int tid = threadIdx.x, wave = tid / kWave, l = lane();
     // The lane's cells (key rows k(q)..k(q)+3, value column v0 + l % 16) are
     // four adjacent floats of St.
-    float* state = state_base + static_cast<long long>(ln.slot) * slot_stride + static_cast<long long>(h) * D * D +
+    float* state = rows.atom<float>(rows.row(ln.rl), h, static_cast<long long>(D) * D) +
                    static_cast<long long>(v0 + l % 16) * D;
     auto key = [&](int q) { return (wave + 4 * q) * 16 + 4 * (l / 16); };
 
@@ -2419,8 +2424,9 @@ __global__ __launch_bounds__(256) void ssm_kda_chunk_ho(
             for (int t = 0; t < 4; ++t) hf[q][t] = hf[q][t] * o.dk[q][t] + x[t];
         }
         if (ck.snap >= 0 && folds(write_state, mask, ln.rl)) {
-            float* at = state_base + static_cast<long long>(snap_slots[ck.snap]) * slot_stride +
-                        static_cast<long long>(h) * D * D + static_cast<long long>(v0 + l % 16) * D;
+            float* at = rows.atom<float>(snap_slots + static_cast<long long>(ck.snap) * rows.pieces, h,
+                                         static_cast<long long>(D) * D) +
+                        static_cast<long long>(v0 + l % 16) * D;
 #pragma unroll
             for (int q = 0; q < KT; ++q)
                 *reinterpret_cast<f32x4*>(at + key(q)) = f32x4{hf[q][0], hf[q][1], hf[q][2], hf[q][3]};
@@ -2445,7 +2451,7 @@ __global__ __launch_bounds__(256) void ssm_kda_chunk_ho(
 // ------------------------------------------------------------- Mamba-2 --
 
 // Mamba-2: a head's state S[p][n] (64 head dims by a 128-wide state) in f32
-// at slab + slot·stride + h·64·128, its operands off one convolved `xbc` row
+// at the row's head h (`StateRows::atom`), its operands off one convolved `xbc` row
 // (`x`, then each group's `B`, then its `C`), its decay exp(−exp(A_log)·dt)
 // one scalar a step. A token stores S = S·decay + dt·x·Bᵀ and lands
 // (S·C + D·x)·silu(z), the group norm after it. A block of four wavefronts
@@ -2493,17 +2499,15 @@ __device__ __forceinline__ void m2_token(f32x4 (&s)[M2_Q], const bf16* at, const
 __global__ __launch_bounds__(256) void ssm_mamba2_step(
     const bf16* __restrict__ xbc, const bf16* __restrict__ dt, const bf16* __restrict__ z,
     const float* __restrict__ a_log, const float* __restrict__ dt_bias, const float* __restrict__ D,
-    float* __restrict__ state_base, const i32* __restrict__ slot_ids, long long slot_stride, bf16* __restrict__ y,
-    int H, int G, bool write_state, const u8* __restrict__ mask, const u32* __restrict__ win) {
+    StateRows rows, bf16* __restrict__ y, int H, int G, bool write_state, const u8* __restrict__ mask, const u32* __restrict__ win) {
     const int r = blockIdx.x, h = blockIdx.y;
     if (win != nullptr && r >= static_cast<int>(win[0])) return;
     const long long row = win != nullptr ? r + static_cast<long long>(win[1]) : r;
     const int rl = win != nullptr ? r + static_cast<int>(win[3]) : r;
-    const int slot = slot_ids[rl];
-    if (slot < 0) return;
+    const i32* rid = rows.row(rl);
+    if (rid[0] < 0) return;
     const int inner = H * M2_P;
-    f32x4* st = reinterpret_cast<f32x4*>(state_base + static_cast<long long>(slot) * slot_stride +
-                                         static_cast<long long>(h) * M2_P * M2_N);
+    f32x4* st = reinterpret_cast<f32x4*>(rows.atom<float>(rid, h, static_cast<long long>(M2_P) * M2_N));
     f32x4 s[M2_Q];
 #pragma unroll
     for (int q = 0; q < M2_Q; ++q) s[q] = st[m2_run(q)];
@@ -2520,8 +2524,7 @@ __global__ __launch_bounds__(256) void ssm_mamba2_step(
 __global__ __launch_bounds__(256) void ssm_mamba2_scan(
     const bf16* __restrict__ xbc, const bf16* __restrict__ dt, const bf16* __restrict__ z,
     const float* __restrict__ a_log, const float* __restrict__ dt_bias, const float* __restrict__ D,
-    float* __restrict__ state_base, const i32* __restrict__ slot_ids, const u32* __restrict__ indptr,
-    long long slot_stride, const int* __restrict__ commit_len, const int* __restrict__ begin_at, bool write_state,
+    StateRows rows, const u32* __restrict__ indptr, const int* __restrict__ commit_len, const int* __restrict__ begin_at, bool write_state,
     const u8* __restrict__ mask, const int* __restrict__ snap, const int* __restrict__ snap_rows,
     const i32* __restrict__ snap_slots, bf16* __restrict__ y, int H, int G, const u32* __restrict__ win) {
     const int r = blockIdx.x, h = blockIdx.y;
@@ -2530,10 +2533,10 @@ __global__ __launch_bounds__(256) void ssm_mamba2_scan(
     const long long row0 = win != nullptr ? static_cast<long long>(win[1]) : 0;
     const Span sp = span_of(indptr, r, rl, commit_len, begin_at);
     if (sp.n <= 0) return;
-    const int slot = slot_ids[rl];
-    if (slot < 0) return;
-    const long long head = static_cast<long long>(h) * M2_P * M2_N;
-    f32x4* st = reinterpret_cast<f32x4*>(state_base + static_cast<long long>(slot) * slot_stride + head);
+    const i32* rid = rows.row(rl);
+    if (rid[0] < 0) return;
+    const long long head = static_cast<long long>(M2_P) * M2_N;
+    f32x4* st = reinterpret_cast<f32x4*>(rows.atom<float>(rid, h, head));
     f32x4 s[M2_Q];
 #pragma unroll
     for (int q = 0; q < M2_Q; ++q) s[q] = st[m2_run(q)];
@@ -2548,7 +2551,8 @@ __global__ __launch_bounds__(256) void ssm_mamba2_scan(
         m2_token(s, xbc + row * width, z + row * inner, y + row * inner, step, __expf(neg_a * step), skip, h, inner,
                  g, G);
         if (sn.e0 < sn.e1 && snap_rows[sn.e0] == t + 1) {
-            f32x4* at = reinterpret_cast<f32x4*>(state_base + static_cast<long long>(snap_slots[sn.e0]) * slot_stride + head);
+            f32x4* at = reinterpret_cast<f32x4*>(
+                rows.atom<float>(snap_slots + static_cast<long long>(sn.e0) * rows.pieces, h, head));
             if (fold)
 #pragma unroll
                 for (int q = 0; q < M2_Q; ++q) at[m2_run(q)] = s[q];

@@ -912,6 +912,8 @@ impl Run<'_> {
                     self.tensor(*routes),
                     &mut self.tensor(*y),
                     seat,
+                    // The engine streams no experts on ROCm yet.
+                    linear::moe::ExpertTable::RESIDENT,
                 )
             }
             Linear::MoeSelect {
@@ -1010,6 +1012,7 @@ impl Run<'_> {
                 scales,
                 routes,
                 &mut self.tensor(y),
+                linear::moe::ExpertTable::RESIDENT,
             );
         }
         let (codes, scales, biases, routes, seat) =
@@ -1028,6 +1031,7 @@ impl Run<'_> {
             routes,
             &mut self.tensor(y),
             seat,
+            linear::moe::ExpertTable::RESIDENT,
         )
     }
 
@@ -1111,6 +1115,7 @@ impl Run<'_> {
             routes,
             &mut self.tensor(y),
             seat,
+            linear::moe::ExpertTable::RESIDENT,
         )
     }
 

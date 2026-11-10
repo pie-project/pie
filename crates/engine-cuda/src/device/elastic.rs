@@ -659,6 +659,21 @@ impl Arena {
     /// memory to the device; a flat arena keeps its one allocation.
     fn shrink_to(&mut self, pool: &mut PhysicalPool, keep: &[usize]) {
         if self.flat {
+            // One allocation backs every unit: it goes only when none is
+            // kept, as a reshape gives its range back before allocating
+            // the next.
+            if keep.is_empty() && self.base != 0 {
+                #[cfg(feature = "device")]
+                // SAFETY: the flat arena's one allocation, freed once; the
+                // base is cleared so `Drop` frees nothing.
+                unsafe {
+                    let _ = crate::device::rt::cudaFree(self.base as *mut core::ffi::c_void);
+                }
+                pool.mark_released(pages_for_bytes(self.mapped * self.map_unit));
+                self.base = 0;
+                self.units.fill(None);
+                self.mapped = 0;
+            }
             return;
         }
         let mut dropped = 0u64;

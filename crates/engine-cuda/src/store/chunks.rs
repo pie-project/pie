@@ -53,8 +53,23 @@ impl Chunks {
         total: u32,
         act_bytes: u64,
     ) -> Result<Chunks> {
-        let total = total.max(1);
         let act = u32::try_from(act_bytes.div_ceil(layout.chunk_bytes.max(1))).unwrap_or(u32::MAX);
+        // A flat range (no device memory mapped on demand: ROCm) is one
+        // allocation of every chunk at once, so it can hold no more chunks
+        // than the pool's ceiling backs; a mapped range only reserves
+        // addresses, and the fit decides how many chunks are ever backed.
+        let total = if crate::device::elastic::mapped_on_demand() {
+            total
+        } else {
+            let backed =
+                pool.hard_pages().saturating_mul(pool.page_bytes()) / layout.chunk_bytes.max(1);
+            total.min(
+                u32::try_from(backed)
+                    .unwrap_or(u32::MAX)
+                    .saturating_sub(act),
+            )
+        };
+        let total = total.max(1);
         let bytes = (u64::from(total) + u64::from(act)) * layout.chunk_bytes;
         let segment = u64::from(layout.segment_chunks) * layout.chunk_bytes;
         Ok(Chunks {
@@ -95,6 +110,25 @@ impl Chunks {
     #[must_use]
     pub fn committed_bytes(&self) -> u64 {
         self.range.segment_bytes_committed()
+    }
+
+    /// The bytes a flat range allocated before any segment was committed
+    /// (the activation's first hold allocates every chunk at once) that
+    /// [`Chunks::reshape`] gives back: all of them but the activation's
+    /// span, which it holds again. Nothing for a mapped range, whose
+    /// backing is its committed segments and held span alone.
+    #[must_use]
+    pub fn reclaimable_bytes(&self) -> u64 {
+        if crate::device::elastic::mapped_on_demand() || !self.fresh() {
+            return 0;
+        }
+        let unit = self.range.map_unit().max(1);
+        let held = self
+            .range
+            .held(u64::from(self.total) * self.layout.chunk_bytes)
+            .div_ceil(unit)
+            .saturating_mul(unit);
+        self.range.committed_bytes().saturating_sub(held)
     }
 
     /// The unit the range is backed in.

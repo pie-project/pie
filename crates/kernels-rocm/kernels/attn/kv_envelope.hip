@@ -24,14 +24,13 @@ __device__ __forceinline__ bf16 bf16_directed(float f) {
 }
 
 // The envelope of `live` tokens of page `page`, kv head `kh`, in an NHD
-// pool ([page][token][head][dim]).
+// pool ([page][token][head][dim]) whose pages lie `stride` elements apart.
 template <class T>
 __device__ __forceinline__ void reduce_page(const T* __restrict__ k_pages, int page, int kh, int live,
-                                            int page_size, int kv_heads, int head_dim, bf16* __restrict__ env_min,
-                                            bf16* __restrict__ env_max) {
+                                            int kv_heads, int head_dim, long long stride,
+                                            bf16* __restrict__ env_min, bf16* __restrict__ env_max) {
     const long long token_stride = static_cast<long long>(kv_heads) * head_dim;
-    const T* base = k_pages + static_cast<long long>(page) * page_size * token_stride +
-                    static_cast<long long>(kh) * head_dim;
+    const T* base = k_pages + static_cast<long long>(page) * stride + static_cast<long long>(kh) * head_dim;
     const long long env = (static_cast<long long>(page) * kv_heads + kh) * head_dim;
     for (int d = threadIdx.x; d < head_dim; d += blockDim.x) {
         float mn = __builtin_huge_valf();
@@ -54,7 +53,7 @@ __global__ void update_appended(const bf16* __restrict__ k_pages, const u32* __r
                                 const u32* __restrict__ page_indices, const u32* __restrict__ page_indptr,
                                 const u32* __restrict__ last_page_lens, bf16* __restrict__ env_min,
                                 bf16* __restrict__ env_max, int requests, int page_size, int kv_heads,
-                                int head_dim, const u32* __restrict__ win) {
+                                int head_dim, long long stride, const u32* __restrict__ win) {
     const Window window{win};
     requests = window.lanes(requests);
     const int slot = blockIdx.x;
@@ -77,8 +76,8 @@ __global__ void update_appended(const bf16* __restrict__ k_pages, const u32* __r
             if (page >= pages) return;
             const int live = page == last ? last_len : page_size;
             if (live <= 0) return;
-            reduce_page(k_pages, static_cast<int>(page_indices[first_at + page]), kh, live, page_size, kv_heads,
-                        head_dim, env_min, env_max);
+            reduce_page(k_pages, static_cast<int>(page_indices[first_at + page]), kh, live, kv_heads, head_dim,
+                        stride, env_min, env_max);
             return;
         }
         seen += touched;

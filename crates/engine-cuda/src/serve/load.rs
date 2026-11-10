@@ -898,7 +898,6 @@ impl Shell {
             &budgets,
             arena_bytes,
             boot.knobs.diagnostics.chunk_bytes,
-            boot.knobs.diagnostics.packed_pages,
             boot.residency.cached_experts(),
             !boot.knobs.diagnostics.dense_weights,
         )?;

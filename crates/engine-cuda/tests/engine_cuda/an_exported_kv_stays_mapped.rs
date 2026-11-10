@@ -52,7 +52,6 @@ fn an_exported_kv_stays_mapped() {
         &budgets,
         0,
         None,
-        false,
         &[],
         true,
     )

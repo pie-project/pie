@@ -10,6 +10,7 @@
 // the core reading k in any order both operands agree on.
 
 #include "linear/mgemm.hip"
+#include "linear/table.hip"
 
 namespace pie::linear {
 
