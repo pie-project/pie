@@ -756,18 +756,13 @@ fn select_mxfp4_w4a8_tma(
         boxes: [128, 128, 1],
         swizzle: dr::CUtensorMapSwizzle::CU_TENSOR_MAP_SWIZZLE_128B,
     })?;
-    // The codes map spans the bank, or a table's window (its entries whole
-    // code rows past its base).
+    // The codes map spans a table's window (its entries whole code rows
+    // past its base), or without one the bank, where any table's entries lie.
     let (w_base, w_rows) = if table.tabled() && table.window != (0, 0) {
         let rows = table.window.1 / u64::from(x.width / 2);
         let rows =
             u32::try_from(rows).map_err(|_| refuse(OP, format!("a window of {rows} code rows")))?;
         (table.window.0, rows)
-    } else if table.tabled() {
-        return Err(refuse(
-            OP,
-            "the TMA select maps its experts' codes through the table's window, and it has none",
-        ));
     } else {
         (codes.ptr, experts * y.width)
     };
