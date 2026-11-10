@@ -12,7 +12,9 @@
 
 use engine::chunk::{ResidentWeight, WeightAtom, WeightKind, WeightResidency, WeightUses};
 
-use crate::model_logits::{CONTEXT, fixture, load, same, serve_seats};
+use poem::Dtype;
+
+use crate::model_logits::{CONTEXT, Fixture, fixture, fixture_weighed, load, same, serve_seats};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Held {
@@ -26,9 +28,8 @@ enum Held {
 
 /// Serves the seats' script under `held`; the logits, and the uses the
 /// engine reports after.
-fn served(model: &str, held: Held) -> Option<(Vec<Vec<f32>>, WeightUses)> {
-    let fixture = fixture(model, None);
-    let mut shell = load(&fixture, CONTEXT)?;
+fn served(model: &str, fixture: &Fixture, held: Held) -> Option<(Vec<Vec<f32>>, WeightUses)> {
+    let mut shell = load(fixture, CONTEXT)?;
     let facts = shell.pool_chunk_facts();
     facts.validate().expect("the facts hang together");
     assert!(
@@ -144,7 +145,23 @@ fn base(model: &str, width: usize) -> Option<Vec<Vec<f32>>> {
 }
 
 fn every_residency(model: &str) {
-    let Some((all, uses)) = served(model, Held::All) else {
+    every_residency_of(model, &fixture(model, None));
+}
+
+/// `model` with its routed experts (and every other component the
+/// deployment states) quantized: `weights` a dtype a component, the bank's
+/// codes and scales imported from seeded floats.
+fn every_residency_quantized(model: &str, weights: &[Dtype]) {
+    let fixture = fixture_weighed(model, weights);
+    let label: String = std::iter::once(model.to_string())
+        .chain(weights.iter().map(|dtype| format!("{dtype:?}").to_lowercase()))
+        .collect::<Vec<_>>()
+        .join("-");
+    every_residency_of(&label, &fixture);
+}
+
+fn every_residency_of(model: &str, fixture: &Fixture) {
+    let Some((all, uses)) = served(model, fixture, Held::All) else {
         return;
     };
     assert!(
@@ -158,13 +175,13 @@ fn every_residency(model: &str) {
         same(&format!("{model}: all resident against base"), &all, base);
         eprintln!("{model}: all resident and held = base, bit for bit");
     }
-    let (none, uses) = served(model, Held::None).expect("loaded before");
+    let (none, uses) = served(model, fixture, Held::None).expect("loaded before");
     assert!(
         uses.held.iter().all(|h| h.resident == 0),
         "{model}: no expert resident: {:?}",
         uses.held
     );
-    let (half, uses) = served(model, Held::Half).expect("loaded before");
+    let (half, uses) = served(model, fixture, Held::Half).expect("loaded before");
     assert!(
         uses.held.iter().all(|h| h.resident > 0 && h.host > 0),
         "{model}: half resident: {:?}",
@@ -193,4 +210,79 @@ fn routed_experts_beside_dense_layers_serve_the_same_logits_whatever_is_resident
 #[test]
 fn routed_experts_of_a_hybrid_serve_the_same_logits_whatever_is_resident() {
     every_residency("qwen36-35b-a3b-mini");
+}
+
+/// The quantized deployments below, each with its routed banks packed as
+/// it states.
+const QUANTIZED: &[(&str, &[Dtype])] = &[
+    ("qwen3-30b-a3b-mini", &[Dtype::Bf16, Dtype::U4g64]),
+    ("qwen3-30b-a3b-mini", &[Dtype::Bf16, Dtype::U2g32]),
+    ("qwen3-30b-a3b-mini", &[Dtype::Bf16, Dtype::U2g64]),
+    ("qwen3-30b-a3b-mini", &[Dtype::Bf16, Dtype::U2g128]),
+    ("qwen3-30b-a3b-mini", &[Dtype::Bf16, Dtype::Mxfp4]),
+    ("gptoss-20b-mini", &[Dtype::Bf16, Dtype::Mxfp4]),
+    ("glm45-air-mini", &[Dtype::U4g64]),
+    ("qwen36-35b-a3b-mini", &[Dtype::U4g64]),
+];
+
+/// Writes (imports) the quantized fixtures without a device, so the runs
+/// that serve them find them written (`$PIE_VK_FIXTURES` /
+/// `$PIE_WGPU_FIXTURES` keep them).
+#[test]
+#[ignore = "fixture preparation: the serving tests write what they lack"]
+fn quantized_fixtures_import() {
+    let mut failed = Vec::new();
+    for &(model, weights) in QUANTIZED {
+        let started = std::time::Instant::now();
+        match std::panic::catch_unwind(|| fixture_weighed(model, weights)) {
+            Ok(fixture) => eprintln!(
+                "{model} {weights:?}: {} in {:?}",
+                fixture.container.display(),
+                started.elapsed()
+            ),
+            Err(_) => failed.push(format!("{model} {weights:?}")),
+        }
+    }
+    assert!(failed.is_empty(), "these do not import: {failed:?}");
+}
+
+/// Affine 4-bit routed banks, a scale and a zero point a group of 64.
+#[test]
+fn affine_u4_routed_experts_serve_the_same_logits_whatever_is_resident() {
+    every_residency_quantized("qwen3-30b-a3b-mini", &[Dtype::Bf16, Dtype::U4g64]);
+}
+
+/// Affine 2-bit routed banks, groups of 32, 64 and 128.
+#[test]
+fn affine_u2_routed_experts_serve_the_same_logits_whatever_is_resident() {
+    for bank in [Dtype::U2g32, Dtype::U2g64, Dtype::U2g128] {
+        every_residency_quantized("qwen3-30b-a3b-mini", &[Dtype::Bf16, bank]);
+    }
+}
+
+/// MXFP4 routed banks (e2m1 codes, an e8m0 exponent a block of 32).
+#[test]
+fn mxfp4_routed_experts_serve_the_same_logits_whatever_is_resident() {
+    every_residency_quantized("qwen3-30b-a3b-mini", &[Dtype::Bf16, Dtype::Mxfp4]);
+}
+
+/// gpt-oss as deployed: MXFP4 routed banks with an expert bias each, a
+/// routed bias sum, attention sinks.
+#[test]
+fn gpt_oss_mxfp4_routed_experts_serve_the_same_logits_whatever_is_resident() {
+    every_residency_quantized("gptoss-20b-mini", &[Dtype::Bf16, Dtype::Mxfp4]);
+}
+
+/// GLM-4.5-Air's affine 4-bit routed banks beside dense layers and a shared
+/// expert, every dense plane 4-bit too.
+#[test]
+fn affine_u4_routed_experts_beside_dense_layers_serve_the_same_logits_whatever_is_resident() {
+    every_residency_quantized("glm45-air-mini", &[Dtype::U4g64]);
+}
+
+/// Qwen3.6 as deployed (4-bit throughout, 8-bit where the deployment
+/// states): routed experts of a hybrid.
+#[test]
+fn affine_u4_routed_experts_of_a_hybrid_serve_the_same_logits_whatever_is_resident() {
+    every_residency_quantized("qwen36-35b-a3b-mini", &[Dtype::U4g64]);
 }

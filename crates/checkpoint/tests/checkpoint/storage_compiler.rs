@@ -64,6 +64,7 @@ fn storage_compiler_every_case() {
     scales_naming_an_undeclared_tensor_are_a_contract_error();
     scales_may_name_a_tensor_declared_after_them();
     a_rank_3_bank_encodes_and_its_scales_keep_the_expert_axis();
+    an_affine_encode_lays_its_scales_by_the_group_it_states();
     an_encode_that_cannot_place_its_scales_is_refused();
     an_encode_whose_columns_do_not_fill_a_block_is_refused();
     an_encode_into_a_scheme_no_kernel_writes_is_refused();
@@ -2248,6 +2249,14 @@ fn encode_to(
     shape: &[i64],
     scheme: QuantScheme,
 ) -> Result<LoadPlan, checkpoint::error::Error> {
+    encode_as(name, shape, quant(scheme, DType::Bf16))
+}
+
+fn encode_as(
+    name: &str,
+    shape: &[i64],
+    spec: QuantSpec,
+) -> Result<LoadPlan, checkpoint::error::Error> {
     let metadata = Metadata {
         files: vec![File {
             id: FileId(0),
@@ -2268,9 +2277,9 @@ fn encode_to(
         alignment: 1,
         tensors: vec![TensorContract::new(
             name,
-            Expr::src("w.weight").cast(Encoding::Quant(quant(scheme, DType::Bf16))),
+            Expr::src("w.weight").cast(Encoding::Quant(spec.clone())),
             shape.to_vec(),
-            Encoding::Quant(quant(scheme, DType::Bf16)),
+            Encoding::Quant(spec),
         )],
         groups: Vec::new(),
     };
@@ -2286,6 +2295,35 @@ fn a_rank_3_bank_encodes_and_its_scales_keep_the_expert_axis() {
     assert_eq!(scales.shape, vec![2, 64, 2]);
     assert_eq!(attach.channel_axis, 2);
     assert_eq!(attach.group_size, 32);
+}
+
+/// An MLX affine bank is grouped by 32, 64 or 128 columns: its scales and
+/// zero points are laid a group each, by the group its spec states (a
+/// 2-bit bank at 32 or 128 used to be laid as if grouped by 64).
+fn an_affine_encode_lays_its_scales_by_the_group_it_states() {
+    for (bits, group) in [(2u8, 32u32), (2, 64), (2, 128), (4, 32), (4, 64), (8, 64)] {
+        let spec = QuantSpec {
+            bits_per_element: bits,
+            group_size: group,
+            ..quant(QuantScheme::MlxAffineU4, DType::Bf16)
+        };
+        let plan = encode_as("runtime.w", &[2, 8, 256], spec)
+            .unwrap_or_else(|err| panic!("u{bits} g{group} encodes: {err}"));
+        let attach = plan.attachments[0];
+        assert_eq!(attach.group_size, group, "u{bits} g{group}");
+        let cols = 256 / i64::from(group);
+        for id in [Some(attach.scale_tensor), attach.zero_point_tensor] {
+            let plane = &plan.tensors[id.expect("a zero point").0 as usize];
+            assert_eq!(plane.shape, vec![2, 8, cols], "u{bits} g{group}: {}", plane.name);
+        }
+    }
+    let spec = QuantSpec {
+        bits_per_element: 2,
+        group_size: 128,
+        ..quant(QuantScheme::MlxAffineU4, DType::Bf16)
+    };
+    let err = encode_as("runtime.w", &[8, 192], spec).unwrap_err();
+    assert!(err.to_string().contains("groups 128 columns"), "{err}");
 }
 
 fn an_encode_that_cannot_place_its_scales_is_refused() {
