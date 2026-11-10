@@ -154,3 +154,21 @@ The `new-memory/` directory is bookkeeping and is removed before anything lands 
   lib/dflash.poem and pattern.rs drafter rows.
 - Verified on new-memory: pie-poem 14+30 tests; `cargo check` poem-compiler, runtime, engine-cuda.
 - Still running: P4/P5 (CUDA degenerate kernels), P8 (golden baseline), R2 (stores on SlotPool).
+
+### M8 — 2026-11-10: weight cache decided; WC2 merged
+- Design: routed experts and PLE rows become read-only weight slots in the chunk pool (design doc section
+  "weight cache"; spec section "Weight cache"). `weight_streaming = auto|on|off`; on => under pressure weights shed to
+  the floor (MoE: current + next layer staging; PLE: this fire's rows) before any tier-pressure; off => never evicted.
+  Inside the cache: LRU, but misses stream through without insertion and membership changes only per window tick
+  (prevents thrashing on the per-token layer cycle). Streamability inferred by the compiler from the reading op
+  (no new poem declaration; `Weight::host()` to be replaced). Prior art compared: Rimuru (arXiv 2610.40305).
+- **WC2** (3c80c7adc, ee04fb0b5, 84a9c44fc): `[model] weight_streaming` (auto: stream only if the load reports weights
+  not all resident); `ChunkFacts.weights` (Expert|Rows shapes, floor slots) + `Engine::weight_residency` /
+  `weight_uses` (default unsupported); runtime `store::weights` cache with `Holder::Weights{pinned}` (floor = live,
+  resident above floor = wanted), 4-tick window membership, LRU, shed-to-floor before tier-pressure when on,
+  refill only when no kv/state waiter is short; `WeightFirst<P, W>` pool-target wrapper; governor `ticked()` hook.
+  Not live yet: needs R2's SlotPool target (wrap in WeightFirst), a planner hook to shed before raising pressure,
+  engine support (WC3 kernels, PLE staging) and the compiler's weight shapes (WC1).
+- Verified on new-memory: runtime lib 205/205 (1 ignored), engine lib 40/40.
+- Running: P4, P5 (CUDA degenerate kernels), P8 (golden baseline), R2 (stores on SlotPool), WC1 (compiler
+  streamability), WC3 (CUDA expert table).
