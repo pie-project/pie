@@ -43,3 +43,9 @@ Proposed by the L40S session (branch `sc/l40s-bc`), accepted by New Pie. Runtime
 12. **Multi-lane groups on one working set:** the first lane gets `[src, dst]`, the others `[src, src]`.
     Forked rings still copy through `kv.window_copies` (to fold into `copy_slots` later). Host/disk tiers for shared
     shapes come with `copy_slots`.
+13. **Shared-mode rs buffer.** `RsVerb::Buffer.pages` ids are refcount bookkeeping only (ignore for addressing).
+    `base` moves in whole buffer pages (kv page size), `folded` = frozen; rows written/replayed lie in
+    `[folded, writes.end)`. Engine maps buffered row `s` to row `s % 16` of the record's `[16, width]` rs rows
+    (cow record if cow != run, else run). The runtime guarantees `writes.end - folded <= 16` (RW follow-up: enforce);
+    the engine refuses otherwise. No page copies in shared mode: a buffered write onto a shared record forces record
+    CoW, so `Lane.fixed`'s run -> cow copy carries the buffer rows.
