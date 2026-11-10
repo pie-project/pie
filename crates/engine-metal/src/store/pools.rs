@@ -9,7 +9,7 @@ use kernels_metal::{KvPool, RecurrentPool, StateMap, Tensor};
 use poem_compiler::chunk::{ChunkRecipe, RowId, SlotLayout};
 use poem_ir::{CacheRow, Dtype, Trace};
 
-use super::layout::{FIXED, LIST, Layout, RING, Slots, gcd};
+use super::layout::{FIXED, LIST, Layout, Slots, WINDOW, gcd};
 use super::pool::Pool;
 use super::{
     STATE_MAP_BYTES, Seats, SpaceSeat, Spill, compressed_spaces, elem_bytes, elem_size, narrow,
@@ -151,12 +151,13 @@ pub struct RsRows {
     pub plane_at: Vec<u64>,
 }
 
-/// How a kv space's rows are paged: the list, the ring, or a small ring
-/// folded into the record (`tokens` tokens in record slot `slot`).
+/// How a kv space's rows are paged: the kv list, the window list
+/// (CONTRACT-BC 19), or a small window folded into the record (`tokens`
+/// tokens in record slot `slot`, token `t` at row `t % tokens`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SpacePaging {
     List,
-    Ring,
+    Window,
     Folded { tokens: u32, slot: u32 },
 }
 
@@ -172,8 +173,9 @@ pub struct Rows {
     pub tokens: u32,
     pub fixed_bytes: u64,
     pub pieces: u32,
-    /// The ring slot's bytes, the slots a working set's ring takes, and the
-    /// window it is read through; zero where nothing is windowed.
+    /// The window list's slot bytes (the recipe's ring slot, read as a
+    /// window list: CONTRACT-BC 19) and the window it is read through; zero
+    /// where nothing is windowed.
     pub ring_bytes: u64,
     pub ring_cap: u32,
     pub ring_window: u32,
@@ -314,7 +316,7 @@ impl Rows {
                     {
                         (SpacePaging::List, run.offset, run.per_token, tokens)
                     } else if let Some(run) = ring_runs.iter().find(|run| run.row == id) {
-                        (SpacePaging::Ring, run.offset, run.per_token, ring_tokens)
+                        (SpacePaging::Window, run.offset, run.per_token, ring_tokens)
                     } else if let Some(&(_, held)) = folded.iter().find(|(row, _)| *row == id) {
                         let run = fixed_runs.iter().find(|run| run.row == id).ok_or_else(|| {
                             disagree(format!("folds kv row `{name}` into no record slot"))
@@ -781,25 +783,25 @@ impl Pools {
         self.spaces.get(space).copied().unwrap_or(SpacePaging::List)
     }
 
-    /// What a ring page id counts: `gcd(chunk, ring slot)` bytes.
-    fn ring_stride(&self) -> u64 {
-        self.layout
-            .ring
-            .map_or(256, |ring| gcd(self.layout.chunk_bytes, ring.slot_bytes))
+    /// What a window page id counts: `gcd(chunk, window slot)` bytes.
+    fn window_stride(&self) -> u64 {
+        self.layout.window.map_or(256, |window| {
+            gcd(self.layout.chunk_bytes, window.slot_bytes)
+        })
     }
 
-    /// A lane's ring pages as kernels address them, one a kv page in token
-    /// order: `refs` (ring slot refs, 0 the null chunk) as units of
-    /// [`Pools::ring_stride`], or, seat-addressed, seat `seat`'s ring slot
-    /// `page % cap` for each of `pages` pages.
-    pub fn ring_pages(&self, refs: &[u32], seat: Option<(u32, u32)>) -> Result<Vec<u32>> {
-        let ring = *self.shape(RING)?;
-        let stride = self.ring_stride();
+    /// A lane's window pages as kernels address them, one a kv page in
+    /// token order: `refs` (window slot refs, 0 a slot trimmed behind the
+    /// window: the null chunk) as units of [`Pools::window_stride`], or,
+    /// seat-addressed, seat `seat`'s run, `pages` of them.
+    pub fn window_pages(&self, refs: &[u32], seat: Option<(u32, u32)>) -> Result<Vec<u32>> {
+        let window = *self.shape(WINDOW)?;
+        let stride = self.window_stride();
         let unit = |slot: u32| -> Result<u32> {
             if slot == 0 {
                 return Ok(0);
             }
-            let at = self.slot_offset(RING, slot)?;
+            let at = self.slot_offset(WINDOW, slot)?;
             self.pool
                 .admit(u32::try_from(at / self.layout.chunk_bytes).unwrap_or(u32::MAX))?;
             Ok(u32::try_from(at / stride).unwrap_or(u32::MAX))
@@ -807,15 +809,18 @@ impl Pools {
         if let Some((slot, pages)) = seat
             && refs.is_empty()
         {
-            let cap = self.layout.ring_cap.max(1);
+            let first = u64::from(slot) * u64::from(self.paging.pages_per_slot);
             return (0..pages)
-                .map(|page| unit(ring.seat_ref(slot * cap + page % cap)?))
+                .map(|page| {
+                    let id = u32::try_from(first + u64::from(page)).unwrap_or(u32::MAX);
+                    unit(window.seat_ref(id)?)
+                })
                 .collect();
         }
         refs.iter().map(|&r| unit(r)).collect()
     }
 
-    /// The unit (`Layout::buffer_stride`) a folded ring in record slot
+    /// The unit (`Layout::buffer_stride`) a folded window in record slot
     /// `slot` starts at, for the record whose physical pieces are `record`.
     pub fn folded_unit(&self, record: &[u32], slot: u32) -> Result<u32> {
         let fixed = *self.shape(FIXED)?;
@@ -826,14 +831,6 @@ impl Pools {
         })?;
         let at = slot_at(&self.layout, &fixed, piece);
         Ok(u32::try_from(at / self.layout.buffer_stride()).unwrap_or(u32::MAX))
-    }
-
-    /// Copies whole ring slots (slot refs) `(src, dst)`: a forked ring.
-    pub fn copy_ring(&mut self, frame: &mut Frame, moves: &[(u32, u32)]) -> Result<()> {
-        if moves.is_empty() {
-            return Ok(());
-        }
-        self.copy_whole(frame, RING, moves)
     }
 
     /// The physical page explicit write descriptor page `page` names.
@@ -1064,7 +1061,7 @@ impl Pools {
                     band_of.push(None);
                     let (stride, page_size) = match self.space_paging(space as usize) {
                         SpacePaging::List => (list_bytes, self.paging.page_size),
-                        SpacePaging::Ring => (self.ring_stride(), self.paging.page_size),
+                        SpacePaging::Window => (self.window_stride(), self.paging.page_size),
                         SpacePaging::Folded { tokens, .. } => (self.layout.buffer_stride(), tokens),
                     };
                     CachePool::Kv(KvPool {

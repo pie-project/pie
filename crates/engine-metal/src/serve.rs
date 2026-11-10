@@ -180,9 +180,10 @@ pub struct Seated<'a> {
     /// copy-on-write): a lane that folds nothing reads its state there
     /// (CONTRACT-BC 15).
     pub record_run: Option<&'a [u32]>,
-    /// The lane's ring slot refs, one a kv page in token order (0 the null
-    /// chunk), for the windowed spaces; empty seat-addresses them.
-    pub ring: &'a [u32],
+    /// The lane's window-list slot refs, one a kv page in token order (0 a
+    /// slot trimmed behind the window), for the windowed spaces; empty
+    /// seat-addresses them.
+    pub window: &'a [u32],
 }
 
 impl<'a> Seated<'a> {
@@ -208,7 +209,7 @@ impl<'a> Seated<'a> {
             refs: false,
             record: None,
             record_run: None,
-            ring: &[],
+            window: &[],
         }
     }
 
@@ -663,14 +664,15 @@ impl PreparedLoad<'_> {
             let seated = paging_at(1, boot.slots)?;
             let bytes = [rows.list_bytes, rows.fixed_bytes];
             let chunk = rows.chunk_bytes;
-            let ring_chunks = if rows.ring_bytes > 0 {
-                rows.ring_cap
+            let window_chunks = if rows.ring_bytes > 0 {
+                seated
+                    .pages_per_slot
                     .div_ceil(u32::try_from(chunk / rows.ring_bytes).unwrap_or(1).max(1))
             } else {
                 0
             };
             let least = Layout::least_chunks(chunk, bytes, rows.pieces, seated.pages_per_slot)
-                + ring_chunks;
+                + window_chunks;
             // The compressor side planes hold a cell a token of every list
             // slot the pool could hold: a chunk costs its share of them.
             let side = rows.side_bytes * chunk.checked_div(rows.list_bytes).unwrap_or(0);
@@ -697,7 +699,7 @@ impl PreparedLoad<'_> {
                 boot.slots,
                 seated.pages_per_slot,
             )?
-            .with_ring(rows.ring_bytes, rows.ring_cap, rows.ring_window)?;
+            .with_window(rows.ring_bytes, rows.ring_window, seated.pages_per_slot)?;
             let pages = u64::from(layout.list.map_or(0, |list| list.per_chunk)) * u64::from(total);
             (
                 paging_at(pages, boot.slots)?,
@@ -1056,18 +1058,6 @@ impl Shell {
         let mut frame = self.device.frame()?;
         self.pools.evacuate(&mut frame, evacuation)?;
         frame.commit()
-    }
-
-    /// Copies whole ring slots (slot refs) before the next fire.
-    pub fn copy_ring(&mut self, moves: &[(u32, u32)]) -> Result<()> {
-        if moves.is_empty() || self.pools.layout().ring.is_none() {
-            return Ok(());
-        }
-        self.drain()?;
-        let mut frame = self.device.frame()?;
-        self.pools.copy_ring(&mut frame, moves)?;
-        self.grafted = Some(frame.commit_async(None)?);
-        Ok(())
     }
 
     /// See `Engine::copy_slots`.
@@ -2593,10 +2583,10 @@ impl Shell {
         let mut seats: Vec<Seat> = Vec::with_capacity(lanes.len());
         let mut kv_less: Vec<bool> = Vec::with_capacity(lanes.len());
         let mut tables: Vec<std::borrow::Cow<'_, [u32]>> = Vec::with_capacity(lanes.len());
-        // Per lane: its ring pages and its record (folded rings lie there).
-        let mut ring_tables: Vec<Vec<u32>> = Vec::with_capacity(lanes.len());
+        // Per lane: its window pages and its record (folded windows lie there).
+        let mut window_tables: Vec<Vec<u32>> = Vec::with_capacity(lanes.len());
         let mut lane_records: Vec<Vec<u32>> = Vec::with_capacity(lanes.len());
-        let has_ring = self.pools.layout().ring.is_some();
+        let has_window = self.pools.layout().window.is_some();
         let mut tokens: Vec<i32> = Vec::with_capacity(rows as usize);
         let mut positions: Vec<i32> = Vec::with_capacity(rows as usize);
         let mut rotations: Vec<i32> = Vec::with_capacity(rows as usize);
@@ -2679,12 +2669,12 @@ impl Shell {
             };
             let record = self.record_of(seated)?;
             lane_records.push(record.clone());
-            ring_tables.push(if has_ring && !seated.kv_less {
+            window_tables.push(if has_window && !seated.kv_less {
                 let page_size = u64::from(self.pools.paging().page_size.max(1));
                 let after = u64::from(have) + u64::from(row.rows);
                 let pages = u32::try_from(after.div_ceil(page_size).max(1)).unwrap_or(u32::MAX);
-                let seat = (!seated.refs || seated.ring.is_empty()).then_some((lane.slot, pages));
-                self.pools.ring_pages(seated.ring, seat)?
+                let seat = (!seated.refs || seated.window.is_empty()).then_some((lane.slot, pages));
+                self.pools.window_pages(seated.window, seat)?
             } else {
                 Vec::new()
             });
@@ -3029,14 +3019,16 @@ impl Shell {
 
         let indptr_host = kv::indptr(&seats)?;
         let table_refs: Vec<&[u32]> = tables.iter().map(std::convert::AsRef::as_ref).collect();
-        let ring_refs: Vec<&[u32]> = ring_tables.iter().map(Vec::as_slice).collect();
+        let window_refs: Vec<&[u32]> = window_tables.iter().map(Vec::as_slice).collect();
         let mut geometries = Vec::with_capacity(self.spaces);
         for space in 0..self.spaces {
             geometries.push(match self.pools.space_paging(space) {
                 crate::store::SpacePaging::List => kv::geometry_with(&paging, &seats, &table_refs)?,
-                crate::store::SpacePaging::Ring => kv::geometry_with(&paging, &seats, &ring_refs)?,
+                crate::store::SpacePaging::Window => {
+                    kv::geometry_with(&paging, &seats, &window_refs)?
+                }
                 crate::store::SpacePaging::Folded { tokens, slot } => {
-                    // Every page of a folded ring is the record's slot: token
+                    // Every page of a folded window is the record's slot: token
                     // `t` at row `t % tokens` of it.
                     let folded = Paging {
                         page_size: tokens,

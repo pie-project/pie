@@ -28,7 +28,7 @@ use crate::error::{Fault, Result};
 
 pub const LIST: ShapeId = ShapeId(0);
 pub const FIXED: ShapeId = ShapeId(1);
-pub const RING: ShapeId = ShapeId(2);
+pub const WINDOW: ShapeId = ShapeId(2);
 
 /// The chunk an on-device Metal recipe aims at.
 pub const TARGET_CHUNK: u64 = 2 << 20;
@@ -98,11 +98,11 @@ pub struct Layout {
     pub pieces: u32,
     pub list: Option<Slots>,
     pub fixed: Option<Slots>,
-    /// The windowed rows' ring: `page_size` tokens a slot, `ring_cap` slots
-    /// a working set, read through `ring_window`.
-    pub ring: Option<Slots>,
-    pub ring_cap: u32,
-    pub ring_window: u32,
+    /// The window list (CONTRACT-BC 19): `page_size` tokens a slot of the
+    /// windowed rows, a full-length token-order table a lane, read through
+    /// `window_rows`; slots trimmed behind the window are the null chunk.
+    pub window: Option<Slots>,
+    pub window_rows: u32,
     /// The seats seat-addressed lanes take.
     pub seats: u32,
 }
@@ -130,9 +130,8 @@ impl Layout {
             pieces: pieces.max(1),
             list: Slots::of(LIST, list, chunk_bytes),
             fixed: Slots::of(FIXED, fixed, chunk_bytes),
-            ring: None,
-            ring_cap: 0,
-            ring_window: 0,
+            window: None,
+            window_rows: 0,
             seats,
         };
         if let Some(shape) = layout.shapes().find(|s| s.per_chunk == 0) {
@@ -157,13 +156,14 @@ impl Layout {
         Ok(layout)
     }
 
-    /// This layout with a ring shape of `bytes` slots, `cap` slots a
-    /// working set read through `window`; its seat run after the others.
-    pub fn with_ring(mut self, bytes: u64, cap: u32, window: u32) -> Result<Layout> {
-        let Some(mut ring) = Slots::of(RING, bytes, self.chunk_bytes) else {
+    /// This layout with a window list of `bytes` slots read through
+    /// `rows` rows; its seat run, `pages_per_seat` slots a seat, after the
+    /// others.
+    pub fn with_window(mut self, bytes: u64, rows: u32, pages_per_seat: u32) -> Result<Layout> {
+        let Some(mut window) = Slots::of(WINDOW, bytes, self.chunk_bytes) else {
             return Ok(self);
         };
-        if ring.per_chunk == 0 {
+        if window.per_chunk == 0 {
             return Err(Fault::Ceiling {
                 what: "bytes of a pool chunk",
                 need: bytes,
@@ -171,16 +171,15 @@ impl Layout {
             });
         }
         let seats = self.seats;
-        ring.seat_chunk = 1 + self.seat_chunks();
-        ring.seat_slots = seats.saturating_mul(cap);
-        self.ring = Some(ring);
-        self.ring_cap = cap;
-        self.ring_window = window;
+        window.seat_chunk = 1 + self.seat_chunks();
+        window.seat_slots = seats.saturating_mul(pages_per_seat);
+        self.window = Some(window);
+        self.window_rows = rows;
         Ok(self)
     }
 
     pub fn shapes(&self) -> impl Iterator<Item = &Slots> {
-        self.list.iter().chain(&self.fixed).chain(&self.ring)
+        self.list.iter().chain(&self.fixed).chain(&self.window)
     }
 
     #[must_use]
@@ -242,11 +241,13 @@ impl Layout {
                 &rows[0],
             ));
         }
-        if let Some(ring) = &self.ring {
+        // A window list; stated as `SlotKind::Ring` until `engine::chunk`
+        // states a list's window (CONTRACT-BC 19).
+        if let Some(window) = &self.window {
             shapes.push(shape(
-                ring,
+                window,
                 SlotKind::Ring {
-                    window: self.ring_window,
+                    window: self.window_rows,
                     tokens: self.page_size,
                 },
                 &Vec::new(),
