@@ -69,15 +69,15 @@ fn score_capture_answers_the_reference() {
     let pp = gpu.up_u32(&page_indptr);
     let qp = gpu.up_i32(&qo_indptr);
     let pos = gpu.up_i32(&positions);
-    let pool = KvPool {
-        keys: t(keys, slots, row, Dtype::Bf16),
-        values: t(keys, slots, row, Dtype::Bf16),
-        page_indices: t(pi, 3, 1, Dtype::U32),
-        page_indptr: t(pp, 3, 1, Dtype::U32),
-        page_size: page as i32,
-        seq_stride: row as u64,
-        head_stride: hd as u64,
-    };
+    let pool = KvPool::planes(
+        t(keys, slots, row, Dtype::Bf16),
+        t(keys, slots, row, Dtype::Bf16),
+        t(pi, 3, 1, Dtype::U32),
+        t(pp, 3, 1, Dtype::U32),
+        page as i32,
+        row as u64,
+        hd as u64,
+    );
     let qrag = RaggedTensor {
         data: t(q, 4, qh * hd, Dtype::Bf16),
         indptr: t(qp, 3, 1, Dtype::I32),

@@ -124,14 +124,16 @@ fn the_indexer_answers_the_reference() {
     let slots = 12 * page;
     let (keys, keyr) = gpu.up(&noise(5, slots * d));
     let keyr = f64s(&keyr);
-    let pool = |k: u32| KvPool {
-        keys: b(k, slots, d),
-        values: b(k, slots, d),
-        page_indices: u(pi, page_indices.len()),
-        page_indptr: u(pp, 3),
-        page_size: page as i32,
-        seq_stride: d as u64,
-        head_stride: d as u64,
+    let pool = |k: u32| {
+        KvPool::planes(
+            b(k, slots, d),
+            b(k, slots, d),
+            u(pi, page_indices.len()),
+            u(pp, 3),
+            page as i32,
+            d as u64,
+            d as u64,
+        )
     };
     let owner = [0i32, 0, 1];
     let own = gpu.up_i32(&owner);

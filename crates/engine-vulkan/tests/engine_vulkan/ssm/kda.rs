@@ -140,9 +140,11 @@ fn the_kda_answers_the_reference() {
     let bank0: Vec<f32> = noise(5, SLOTS * slab).iter().map(|v| v * 0.25).collect();
     let bank64 = f64s(&bank0);
     let bank0 = &bank0;
-    let pool = |bank: u32, slots: u32, rows: usize| kernels_slang::ssm::StatePool {
-        bank: t(bank, SLOTS, slab, Dtype::F32),
-        slots: t(slots, rows, 1, Dtype::U32),
+    let pool = |bank: u32, slots: u32, rows: usize| {
+        kernels_slang::ssm::StatePool::bank(
+            t(bank, SLOTS, slab, Dtype::F32),
+            t(slots, rows, 1, Dtype::U32),
+        )
     };
     let fresh = |rows: usize, work: usize| {
         move |g: &mut Gpu| -> Vec<Out> {

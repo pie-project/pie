@@ -8,6 +8,7 @@ use dtype::Dtype;
 
 use crate::encode::{Arg, Ctx, Fire, Grid, nonzero, refuse, stated};
 use crate::error::Error;
+use crate::ssm::StatePool;
 use crate::tensor::Tensor;
 
 const NGRAM: &str = "gather/ngram.slang";
@@ -138,8 +139,7 @@ fn lanes_of(op: &'static str, indptr: Tensor) -> Result<u32, Error> {
 pub fn ngram_ids(
     ctx: &Ctx<'_>,
     ids: Tensor,
-    state: Tensor,
-    slots: Tensor,
+    state: &StatePool,
     hash: Tensor,
     eos: u32,
     mults: &[u64],
@@ -157,7 +157,7 @@ pub fn ngram_ids(
         "one output column per hashed head"
     );
     debug_assert_eq!(
-        state.width,
+        state.bank.width,
         shape.ngram - 1,
         "the window a lane keeps is the n-gram context, one i32 per trailing id"
     );
@@ -165,17 +165,22 @@ pub fn ngram_ids(
     ctx.fire(
         Fire::at(NGRAM, "gather_ngram_update").apply(Grid::of([rows, 1, 1], [GROUP, 1, 1])),
         &[
-            ids.arg(),
-            state.arg_mut(),
-            slots.arg(),
-            hash.arg(),
-            ngram_ids.arg_mut(),
-            stated(OP, shape.ngram)?.arg(),
-            stated(OP, shape.heads)?.arg(),
-            stated(OP, shape.heads_per_ngram)?.arg(),
-            stated(OP, shape.eos)?.arg(),
-            stated(OP, rows)?.arg(),
-        ],
+            &[
+                ids.arg(),
+                state.slots.arg(),
+                hash.arg(),
+                ngram_ids.arg_mut(),
+            ][..],
+            &state.args(true),
+            &[
+                stated(OP, shape.ngram)?.arg(),
+                stated(OP, shape.heads)?.arg(),
+                stated(OP, shape.heads_per_ngram)?.arg(),
+                stated(OP, shape.eos)?.arg(),
+                stated(OP, rows)?.arg(),
+            ],
+        ]
+        .concat(),
     )
 }
 
@@ -185,8 +190,7 @@ pub fn ngram_ids_chunked(
     ctx: &Ctx<'_>,
     ids: Tensor,
     indptr: Tensor,
-    state: Tensor,
-    slots: Tensor,
+    state: &StatePool,
     hash: Tensor,
     eos: u32,
     mults: &[u64],
@@ -204,7 +208,7 @@ pub fn ngram_ids_chunked(
         "one output column per hashed head"
     );
     debug_assert_eq!(
-        state.width,
+        state.bank.width,
         shape.ngram - 1,
         "the window a lane keeps is the n-gram context, one i32 per trailing id"
     );
@@ -213,18 +217,23 @@ pub fn ngram_ids_chunked(
     ctx.fire(
         Fire::at(NGRAM, "gather_ngram_chunked").apply(Grid::of([lanes, 1, 1], [GROUP, 1, 1])),
         &[
-            ids.arg(),
-            indptr.arg(),
-            state.arg_mut(),
-            slots.arg(),
-            hash.arg(),
-            ngram_ids.arg_mut(),
-            stated(OP, shape.ngram)?.arg(),
-            stated(OP, shape.heads)?.arg(),
-            stated(OP, shape.heads_per_ngram)?.arg(),
-            stated(OP, shape.eos)?.arg(),
-            stated(OP, lanes)?.arg(),
-        ],
+            &[
+                ids.arg(),
+                indptr.arg(),
+                state.slots.arg(),
+                hash.arg(),
+                ngram_ids.arg_mut(),
+            ][..],
+            &state.args(true),
+            &[
+                stated(OP, shape.ngram)?.arg(),
+                stated(OP, shape.heads)?.arg(),
+                stated(OP, shape.heads_per_ngram)?.arg(),
+                stated(OP, shape.eos)?.arg(),
+                stated(OP, lanes)?.arg(),
+            ],
+        ]
+        .concat(),
     )
 }
 

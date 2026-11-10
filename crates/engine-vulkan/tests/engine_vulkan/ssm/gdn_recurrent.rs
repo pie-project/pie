@@ -123,9 +123,11 @@ fn the_gdn_recurrence_answers_the_reference() {
                 .collect();
             let bank64 = f64s(&bank0);
             let bank0 = &bank0;
-            let pool = |bank: u32, slots: u32, rows: usize| kernels_slang::ssm::StatePool {
-                bank: t(bank, SLOTS, slab, Dtype::F32),
-                slots: t(slots, rows, 1, Dtype::U32),
+            let pool = |bank: u32, slots: u32, rows: usize| {
+                kernels_slang::ssm::StatePool::bank(
+                    t(bank, SLOTS, slab, Dtype::F32),
+                    t(slots, rows, 1, Dtype::U32),
+                )
             };
             let y_n = |rows: usize| rows * sh.v_heads * sh.dv;
             let fresh = |rows: usize, work: usize| {

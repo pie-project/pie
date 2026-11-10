@@ -21,10 +21,7 @@ impl DispatchSsm for Run<'_> {
 impl Run<'_> {
     fn state_pool(&self, id: ValueId) -> StatePool {
         let pool = self.recurrent(id);
-        StatePool {
-            bank: pool.state,
-            slots: pool.slots,
-        }
+        StatePool::bank(pool.state, pool.slots)
     }
 
     fn slang_of(&self, id: ValueId) -> kernels_slang::Tensor {

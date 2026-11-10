@@ -88,8 +88,10 @@ fn the_ngram_hashers_answer_the_reference() {
         kernels_slang::gather::ngram::ngram_ids(
             c,
             it,
-            t(state, 3, SPAN, Dtype::I32),
-            t(sb, 3, 1, Dtype::U32),
+            &kernels_slang::ssm::StatePool::bank(
+                t(state, 3, SPAN, Dtype::I32),
+                t(sb, 3, 1, Dtype::U32),
+            ),
             ht,
             EOS as u32,
             &MULTS,
@@ -156,8 +158,10 @@ fn the_ngram_hashers_answer_the_reference() {
             c,
             it,
             pt,
-            t(state, 3, SPAN, Dtype::I32),
-            t(sb, 7, 1, Dtype::U32),
+            &kernels_slang::ssm::StatePool::bank(
+                t(state, 3, SPAN, Dtype::I32),
+                t(sb, 7, 1, Dtype::U32),
+            ),
             ht,
             EOS as u32,
             &MULTS,

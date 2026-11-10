@@ -130,16 +130,11 @@ pub fn gated_delta(
             .tier(tactic.tier)
             .apply(heads.grid(rows(OP, qkv)?)),
         &[
-            qkv.arg(),
-            gates.arg(),
-            state.bank.arg_mut(),
-            state.slots.arg(),
-            y.arg_mut(),
-            kh,
-            vh,
-            kd,
-            vd,
-        ],
+            &[qkv.arg(), gates.arg(), state.slots.arg(), y.arg_mut()][..],
+            &state.args(true),
+            &[kh, vh, kd, vd],
+        ]
+        .concat(),
     )
 }
 
@@ -171,17 +166,17 @@ pub fn gated_delta_chunked(
             .tier(tactic.tier)
             .apply(heads.grid(requests(OP, qkv)?)),
         &[
-            qkv.data.arg(),
-            qkv.indptr.arg(),
-            gates.arg(),
-            state.bank.arg_mut(),
-            state.slots.arg(),
-            y.arg_mut(),
-            kh,
-            vh,
-            kd,
-            vd,
-        ],
+            &[
+                qkv.data.arg(),
+                qkv.indptr.arg(),
+                gates.arg(),
+                state.slots.arg(),
+                y.arg_mut(),
+            ][..],
+            &state.args(true),
+            &[kh, vh, kd, vd],
+        ]
+        .concat(),
     )
 }
 
@@ -217,20 +212,19 @@ pub fn gated_delta_committed(
             .tier(tactic.tier)
             .apply(heads.grid(window_lanes(OP, indptr)?)),
         &[
-            qkv.arg(),
-            indptr.arg(),
-            committed.replay.arg(),
-            committed.commit.arg(),
-            committed.slots.arg(),
-            gates.arg(),
-            state.bank.arg_mut(),
-            work.arg_mut(),
-            y.arg_mut(),
-            stated(OP, committed.lane0)?.arg(),
-            kh,
-            vh,
-            kd,
-            vd,
-        ],
+            &[
+                qkv.arg(),
+                indptr.arg(),
+                committed.replay.arg(),
+                committed.commit.arg(),
+                committed.slots.arg(),
+                gates.arg(),
+                work.arg_mut(),
+                y.arg_mut(),
+            ][..],
+            &state.args(true),
+            &[stated(OP, committed.lane0)?.arg(), kh, vh, kd, vd],
+        ]
+        .concat(),
     )
 }

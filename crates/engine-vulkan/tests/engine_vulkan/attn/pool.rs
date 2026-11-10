@@ -39,14 +39,16 @@ fn the_compressed_pool_answers_the_reference() {
         page_indices[indptr[req] as usize + pos / PAGE] as usize * PAGE + pos % PAGE
     };
     let slots = 3 * PAGE;
-    let pool_of = |keys: u32, width: usize| KvPool {
-        keys: t(keys, slots, width, Dtype::Bf16),
-        values: t(keys, slots, width, Dtype::Bf16),
-        page_indices: t(pi, 3, 1, Dtype::U32),
-        page_indptr: t(pp, 3, 1, Dtype::U32),
-        page_size: PAGE as i32,
-        seq_stride: width as u64,
-        head_stride: width as u64,
+    let pool_of = |keys: u32, width: usize| {
+        KvPool::planes(
+            t(keys, slots, width, Dtype::Bf16),
+            t(keys, slots, width, Dtype::Bf16),
+            t(pi, 3, 1, Dtype::U32),
+            t(pp, 3, 1, Dtype::U32),
+            PAGE as i32,
+            width as u64,
+            width as u64,
+        )
     };
 
     // Boundaries: rows at positions 3, 5, 7, 11 of requests 0, 0, 1, 0; the

@@ -1,6 +1,7 @@
 #include "prim/bf16.slang"
 #include "prim/params.slang"
 #include "prim/reduce.slang"
+#include "prim/pool.slang"
 
 // Kimi delta attention, token by token: a workgroup a head of a row (or of a
 // request), its `head_dim x head_dim` f32 state walked one token at a time.
@@ -30,10 +31,9 @@
 [[vk::binding(6)]] StructuredBuffer<uint> b;
 [[vk::binding(7)]] StructuredBuffer<float> dt_bias;
 [[vk::binding(8)]] StructuredBuffer<float> a_log;
-[[vk::binding(9)]] RWStructuredBuffer<float> rstate;
-[[vk::binding(10)]] RWStructuredBuffer<float> work;
-[[vk::binding(11)]] RWStructuredBuffer<float> y;
-#define PARAMS_AT 12
+[[vk::binding(9)]] RWStructuredBuffer<float> work;
+[[vk::binding(10)]] RWStructuredBuffer<float> y;
+#define SEGMENTS_AT 11
 #define STATE work
 #elif defined(PIE_CHUNKED)
 [[vk::binding(0)]] StructuredBuffer<uint> mixed;
@@ -42,10 +42,9 @@
 [[vk::binding(3)]] StructuredBuffer<uint> b;
 [[vk::binding(4)]] StructuredBuffer<float> dt_bias;
 [[vk::binding(5)]] StructuredBuffer<float> a_log;
-[[vk::binding(6)]] RWStructuredBuffer<float> rstate;
-[[vk::binding(7)]] StructuredBuffer<uint> slots;
-[[vk::binding(8)]] RWStructuredBuffer<float> y;
-#define PARAMS_AT 9
+[[vk::binding(6)]] StructuredBuffer<uint> slots;
+[[vk::binding(7)]] RWStructuredBuffer<float> y;
+#define SEGMENTS_AT 8
 #define STATE rstate
 #else
 [[vk::binding(0)]] StructuredBuffer<uint> mixed;
@@ -53,14 +52,19 @@
 [[vk::binding(2)]] StructuredBuffer<uint> b;
 [[vk::binding(3)]] StructuredBuffer<float> dt_bias;
 [[vk::binding(4)]] StructuredBuffer<float> a_log;
-[[vk::binding(5)]] RWStructuredBuffer<float> rstate;
-[[vk::binding(6)]] StructuredBuffer<uint> slots;
-[[vk::binding(7)]] RWStructuredBuffer<float> y;
-#define PARAMS_AT 8
+[[vk::binding(5)]] StructuredBuffer<uint> slots;
+[[vk::binding(6)]] RWStructuredBuffer<float> y;
+#define SEGMENTS_AT 7
 #define STATE rstate
 #endif
+// The state bank, in the chunk pool's segments (`prim/pool.slang`).
+PIE_POOL_SEGMENTS(RWStructuredBuffer, float, SEGMENTS_AT)
+#define PARAMS_AT (SEGMENTS_AT + 4)
 
 struct Params {
+    uint seg_words;
+    uint state_origin;
+    uint slot_stride;
 #if defined(PIE_COMMITTED)
     int lane0;
 #endif
@@ -70,6 +74,9 @@ struct Params {
     float gate_floor;
 };
 PIE_PARAMS(PARAMS_AT, Params, params);
+PIE_POOL_READ(float, params.seg_words)
+PIE_POOL_WRITE(float, params.seg_words)
+PIE_POOL_VIEW(rstate, float, params.state_origin)
 
 groupshared float sq[DMAX];
 groupshared float sk[DMAX];
@@ -165,7 +172,7 @@ void main(uint3 group : SV_GroupID, uint3 local : SV_GroupThreadID) {
     if (span <= 0) {
         return;
     }
-    uint bank = (uint(slots[lane]) * uint(params.heads) + h) * cells;
+    uint bank = uint(slots[lane]) * params.slot_stride + h * cells;
     uint state_base = (lane * uint(params.heads) + h) * cells;
     for (uint i = tid; i < cells; i += uint(PIE_GROUP_X)) {
         work[state_base + i] = rstate[bank + i];
@@ -192,12 +199,12 @@ void main(uint3 group : SV_GroupID, uint3 local : SV_GroupThreadID) {
     if (end <= begin) {
         return;
     }
-    uint state_base = (slots[uint(begin)] * uint(params.heads) + h) * cells;
+    uint state_base = slots[uint(begin)] * params.slot_stride + h * cells;
     for (int t = begin; t < end; t++) {
         token(tid, uint(t), h, state_base);
     }
 #else
-    token(tid, r, h, (slots[r] * uint(params.heads) + h) * cells);
+    token(tid, r, h, slots[r] * params.slot_stride + h * cells);
 #endif
 }
 

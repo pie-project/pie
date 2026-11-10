@@ -173,24 +173,24 @@ fn paged_attention_answers_the_reference() {
         let (keys, kr) = gpu.up(&noise(hd as u64, slots * KVH * hd));
         let (values, vr) = gpu.up(&noise(hd as u64 + 1, slots * KVH * hd));
         let (kr, vr) = (f64s(&kr), f64s(&vr));
-        let pool = KvPool {
-            keys: t(keys, slots, KVH * hd, Dtype::Bf16),
-            values: t(values, slots, KVH * hd, Dtype::Bf16),
-            page_indices: t(pi, PAGES.len(), 1, Dtype::U32),
-            page_indptr: t(pp, 3, 1, Dtype::U32),
-            page_size: PAGE as i32,
-            seq_stride: (KVH * hd) as u64,
-            head_stride: hd as u64,
-        };
-        let spool = kernels_slang::KvPool {
-            keys: pool.keys,
-            values: pool.values,
-            page_indices: pool.page_indices,
-            page_indptr: pool.page_indptr,
-            page_size: pool.page_size,
-            seq_stride: pool.seq_stride,
-            head_stride: pool.head_stride,
-        };
+        let pool = KvPool::planes(
+            t(keys, slots, KVH * hd, Dtype::Bf16),
+            t(values, slots, KVH * hd, Dtype::Bf16),
+            t(pi, PAGES.len(), 1, Dtype::U32),
+            t(pp, 3, 1, Dtype::U32),
+            PAGE as i32,
+            (KVH * hd) as u64,
+            hd as u64,
+        );
+        let spool = kernels_slang::KvPool::planes(
+            pool.keys,
+            pool.values,
+            pool.page_indices,
+            pool.page_indptr,
+            pool.page_size,
+            pool.seq_stride,
+            pool.head_stride,
+        );
         for (what, batch, prefilling) in [("decode", &decode, false), ("prefill", &prefill, true)] {
             let rows = batch.positions.len();
             let (q, qr) = gpu.up(&noise(hd as u64 + rows as u64, rows * QH * hd));

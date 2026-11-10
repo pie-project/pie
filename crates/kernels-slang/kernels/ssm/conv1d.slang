@@ -1,5 +1,6 @@
 #include "prim/bf16.slang"
 #include "prim/params.slang"
+#include "prim/pool.slang"
 
 // The causal depthwise conv over a recurrent slot's history, SiLU after, a
 // pair of channels (one bf16 word) a lane. A slot keeps the last `hist =
@@ -25,27 +26,30 @@
 [[vk::binding(3)]] StructuredBuffer<int> commit;
 [[vk::binding(4)]] StructuredBuffer<int> slots;
 [[vk::binding(5)]] StructuredBuffer<uint> weight;
-[[vk::binding(6)]] RWStructuredBuffer<float> state;
-[[vk::binding(7)]] RWStructuredBuffer<uint> y;
-#define PARAMS_AT 8
+[[vk::binding(6)]] RWStructuredBuffer<uint> y;
+#define SEGMENTS_AT 7
 #elif defined(PIE_CHUNKED)
 [[vk::binding(0)]] StructuredBuffer<uint> x;
 [[vk::binding(1)]] StructuredBuffer<int> indptr;
 [[vk::binding(2)]] StructuredBuffer<uint> weight;
-[[vk::binding(3)]] RWStructuredBuffer<float> state;
-[[vk::binding(4)]] StructuredBuffer<uint> slots;
-[[vk::binding(5)]] RWStructuredBuffer<uint> y;
-#define PARAMS_AT 6
+[[vk::binding(3)]] StructuredBuffer<uint> slots;
+[[vk::binding(4)]] RWStructuredBuffer<uint> y;
+#define SEGMENTS_AT 5
 #else
 [[vk::binding(0)]] StructuredBuffer<uint> x;
 [[vk::binding(1)]] StructuredBuffer<uint> weight;
-[[vk::binding(2)]] RWStructuredBuffer<float> state;
-[[vk::binding(3)]] StructuredBuffer<uint> slots;
-[[vk::binding(4)]] RWStructuredBuffer<uint> y;
-#define PARAMS_AT 5
+[[vk::binding(2)]] StructuredBuffer<uint> slots;
+[[vk::binding(3)]] RWStructuredBuffer<uint> y;
+#define SEGMENTS_AT 4
 #endif
+// The history bank, in the chunk pool's segments (`prim/pool.slang`).
+PIE_POOL_SEGMENTS(RWStructuredBuffer, float, SEGMENTS_AT)
+#define PARAMS_AT (SEGMENTS_AT + 4)
 
 struct Params {
+    uint seg_words;
+    uint state_origin;
+    uint slot_stride;
 #if defined(PIE_COMMITTED)
     int lane0;
 #endif
@@ -54,6 +58,9 @@ struct Params {
     int dilation;
 };
 PIE_PARAMS(PARAMS_AT, Params, params);
+PIE_POOL_READ(float, params.seg_words)
+PIE_POOL_WRITE(float, params.seg_words)
+PIE_POOL_VIEW(state, float, params.state_origin)
 
 float silu(float z) {
     return z / (1.0 + exp(-z));
@@ -137,16 +144,16 @@ void main(uint3 gid : SV_DispatchThreadID) {
     if (span <= 0 || slot < 0) {
         return;
     }
-    walk(uint(slot) * uint(hist) * chans, begin, span, min(commit[lane], span), chans, c);
+    walk(uint(slot) * params.slot_stride, begin, span, min(commit[lane], span), chans, c);
 #elif defined(PIE_CHUNKED)
     int begin = indptr[r];
     int span = indptr[r + 1] - begin;
     if (span <= 0) {
         return;
     }
-    walk(slots[uint(begin)] * uint(hist) * chans, begin, span, span, chans, c);
+    walk(slots[uint(begin)] * params.slot_stride, begin, span, span, chans, c);
 #else
-    uint slab = slots[r] * uint(hist) * chans;
+    uint slab = slots[r] * params.slot_stride;
     float2 past[HIST_MAX];
     past_load(slab, hist, chans, c, past);
     uint tap0 = c * uint(width);

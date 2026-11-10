@@ -36,14 +36,16 @@ fn the_kv_append_answers_the_reference() {
         want_k[slot * row..][..row].copy_from_slice(&kr[i * row..][..row]);
         want_v[slot * row..][..row].copy_from_slice(&vr[i * row..][..row]);
     }
-    let pool = |keys: u32, values: u32| KvPool {
-        keys: Tensor::new(keys, slots as u32, row as u32, Dtype::Bf16),
-        values: Tensor::new(values, slots as u32, row as u32, Dtype::Bf16),
-        page_indices: u(wp),
-        page_indptr: u(wo),
-        page_size: page as i32,
-        seq_stride: row as u64,
-        head_stride: hd as u64,
+    let pool = |keys: u32, values: u32| {
+        KvPool::planes(
+            Tensor::new(keys, slots as u32, row as u32, Dtype::Bf16),
+            Tensor::new(values, slots as u32, row as u32, Dtype::Bf16),
+            u(wp),
+            u(wo),
+            page as i32,
+            row as u64,
+            hd as u64,
+        )
     };
     let kt = Tensor::new(k, 3, row as u32, Dtype::Bf16);
     let vt = Tensor::new(v, 3, row as u32, Dtype::Bf16);

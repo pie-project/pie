@@ -97,15 +97,11 @@ pub fn conv1d(
     ctx.fire(
         Fire::at(CONV1D, entry).apply(shape.grid(rows(OP, x)?)),
         &[
-            x.arg(),
-            weight.arg(),
-            state.bank.arg_mut(),
-            state.slots.arg(),
-            y.arg_mut(),
-            shape.channels.arg(),
-            shape.taps.arg(),
-            shape.dilation.arg(),
-        ],
+            &[x.arg(), weight.arg(), state.slots.arg(), y.arg_mut()][..],
+            &state.args(true),
+            &[shape.channels.arg(), shape.taps.arg(), shape.dilation.arg()],
+        ]
+        .concat(),
     )
 }
 
@@ -127,16 +123,17 @@ pub fn conv1d_chunked(
     ctx.fire(
         Fire::at(CONV1D, entry).apply(shape.grid(requests(OP, x)?)),
         &[
-            x.data.arg(),
-            x.indptr.arg(),
-            weight.arg(),
-            state.bank.arg_mut(),
-            state.slots.arg(),
-            y.arg_mut(),
-            shape.channels.arg(),
-            shape.taps.arg(),
-            shape.dilation.arg(),
-        ],
+            &[
+                x.data.arg(),
+                x.indptr.arg(),
+                weight.arg(),
+                state.slots.arg(),
+                y.arg_mut(),
+            ][..],
+            &state.args(true),
+            &[shape.channels.arg(), shape.taps.arg(), shape.dilation.arg()],
+        ]
+        .concat(),
     )
 }
 
@@ -161,18 +158,23 @@ pub fn conv1d_committed(
     ctx.fire(
         Fire::at(CONV1D, entry).apply(shape.grid(window_lanes(OP, indptr)?)),
         &[
-            x.arg(),
-            indptr.arg(),
-            committed.replay.arg(),
-            committed.commit.arg(),
-            committed.slots.arg(),
-            weight.arg(),
-            state.bank.arg_mut(),
-            y.arg_mut(),
-            stated(OP, committed.lane0)?.arg(),
-            shape.channels.arg(),
-            shape.taps.arg(),
-            shape.dilation.arg(),
-        ],
+            &[
+                x.arg(),
+                indptr.arg(),
+                committed.replay.arg(),
+                committed.commit.arg(),
+                committed.slots.arg(),
+                weight.arg(),
+                y.arg_mut(),
+            ][..],
+            &state.args(true),
+            &[
+                stated(OP, committed.lane0)?.arg(),
+                shape.channels.arg(),
+                shape.taps.arg(),
+                shape.dilation.arg(),
+            ],
+        ]
+        .concat(),
     )
 }
