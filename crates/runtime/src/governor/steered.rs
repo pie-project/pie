@@ -166,6 +166,30 @@ impl PoolTarget for EnginePool {
 /// An engine's governor target, the weight cache first.
 pub type Steered = WeightFirst<EnginePool, EnginePort>;
 
+impl Shared<Steered> {
+    /// Tells the engine the resident set it starts with and waits until it
+    /// took it: what the load does before a fire can be submitted, so none
+    /// reads from the host a row the cache holds.
+    ///
+    /// # Errors
+    ///
+    /// The engine refused it, or its lane closed first. An engine that does
+    /// not stream (it answers unsupported) is no error.
+    pub async fn boot(&self) -> anyhow::Result<()> {
+        let queued = self.with(|pool| -> anyhow::Result<_> {
+            pool.boot()?;
+            Ok(pool.port_mut().take_queued())
+        })?;
+        for answer in queued {
+            let answer = answer
+                .await
+                .unwrap_or_else(|_| Err(anyhow::anyhow!("the engine's lane closed")));
+            self.with(|pool| pool.port_mut().answered(answer))?;
+        }
+        Ok(())
+    }
+}
+
 /// A pool target the governor's loop and the planner both reach: each
 /// call takes the lock for itself.
 pub struct Shared<P>(Arc<parking_lot::Mutex<P>>);

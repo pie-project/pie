@@ -214,6 +214,8 @@ fn not_streaming_every_atom_is_pinned_and_none_is_ever_shed() {
 struct Seen {
     reads: Vec<WeightUses>,
     told: Vec<WeightResidency>,
+    /// Refuses every resident set with this error.
+    refuse: Option<String>,
 }
 
 #[derive(Clone, Default)]
@@ -236,7 +238,11 @@ impl ::engine::Engine for FakeEngine {
     }
 
     fn weight_residency(&mut self, residency: &WeightResidency) -> ::engine::Result<()> {
-        self.0.lock().unwrap().told.push(residency.clone());
+        let mut seen = self.0.lock().unwrap();
+        if let Some(refusal) = &seen.refuse {
+            return Err(::engine::Error::Load(refusal.clone()));
+        }
+        seen.told.push(residency.clone());
         Ok(())
     }
 
@@ -550,4 +556,164 @@ fn the_weight_slots_lie_above_the_reserved_runs_and_below_the_activation() {
         0,
         "no chunks past today's pinned pools"
     );
+}
+
+// ---- the load ----
+
+#[test]
+fn the_engine_holds_the_starting_residency_before_the_first_fire() {
+    for streaming in [true, false] {
+        let shape = experts(8, 2);
+        let mut slots = pool(16, &shape);
+        let cache = WeightCache::new(&[shape], WEIGHTS, streaming, &mut slots).unwrap();
+        let inner = Inner {
+            slots,
+            floor: 4 * MIB,
+        };
+        let engine = FakeEngine::default();
+        let mut pool = WeightFirst::new(inner, cache, engine.clone());
+        assert!(engine.0.lock().unwrap().told.is_empty());
+        // What the load does once the engine's lane is up, before it returns
+        // and a fire can be submitted: no governor tick has run.
+        pool.boot().unwrap();
+        let told = engine.0.lock().unwrap().told.clone();
+        assert_eq!(told.len(), 1, "the engine heard at load");
+        assert_eq!(told[0].staging.len(), 1);
+        assert_eq!(told[0].staging[0].1.len(), 2, "the floor's staging");
+        let atoms = if streaming { 0 } else { 8 };
+        assert_eq!(
+            told[0].resident.len(),
+            atoms,
+            "off: every atom resident from the first fire"
+        );
+        // The first tick has nothing new to say.
+        pool.ticked();
+        assert_eq!(engine.0.lock().unwrap().told.len(), 1);
+    }
+}
+
+#[test]
+fn off_weights_that_do_not_fit_the_pool_fail_the_load() {
+    let engine = 9_011;
+    set_streaming(engine, WeightStreaming::Off.streams(true));
+    // 15 chunks free: the floor's 2 and 32 atoms do not fit.
+    let shape = experts(32, 2);
+    let mut slots = pool(16, &shape);
+    let error = boot_cache(
+        engine,
+        WeightStreaming::Off,
+        std::slice::from_ref(&shape),
+        WEIGHTS,
+        &mut slots,
+    )
+    .unwrap_err()
+    .to_string();
+    assert!(error.contains("do not fit"), "{error}");
+    assert!(
+        error.contains(&format!("{}", 34 * MIB)),
+        "names what they need: {error}"
+    );
+    assert!(
+        error.contains(&format!("{}", 15 * MIB)),
+        "and what the pool has: {error}"
+    );
+    assert_eq!(
+        slots.held_by(&Holder::Weights {
+            shape: WEIGHTS,
+            pinned: true
+        }),
+        0
+    );
+    assert!(!streaming(engine));
+}
+
+#[test]
+fn auto_weights_that_do_not_fit_the_pool_stream_at_their_floor() {
+    let engine = 9_012;
+    // The device budget said they fit: auto resolved to not streaming.
+    set_streaming(engine, WeightStreaming::Auto.streams(true));
+    let shape = experts(32, 2);
+    let mut slots = pool(16, &shape);
+    let cache = boot_cache(
+        engine,
+        WeightStreaming::Auto,
+        std::slice::from_ref(&shape),
+        WEIGHTS,
+        &mut slots,
+    )
+    .unwrap();
+    assert!(cache.streaming(), "auto streams what the pool cannot seat");
+    assert!(streaming(engine), "and records it for the engine");
+    assert_eq!(cache.shapes(), 1, "the shapes keep a cache");
+    assert_eq!(cache.cached(), 0, "at its floor");
+    assert_eq!(cache.pinned_bytes(), 2 * MIB);
+    assert_eq!(
+        slots.held_by(&Holder::Weights {
+            shape: WEIGHTS,
+            pinned: true
+        }),
+        2
+    );
+}
+
+#[test]
+fn weights_that_fit_stay_pinned_and_a_floor_that_does_not_fails_any_mode() {
+    let engine = 9_013;
+    set_streaming(engine, false);
+    let shape = experts(8, 2);
+    let mut slots = pool(16, &shape);
+    let cache = boot_cache(
+        engine,
+        WeightStreaming::Off,
+        std::slice::from_ref(&shape),
+        WEIGHTS,
+        &mut slots,
+    )
+    .unwrap();
+    assert!(!cache.streaming());
+    assert_eq!(resident(&cache, 8).len(), 8, "off: every atom pinned");
+
+    set_streaming(engine, true);
+    let shape = experts(32, 20);
+    let mut slots = pool(16, &shape);
+    let error = boot_cache(
+        engine,
+        WeightStreaming::On,
+        std::slice::from_ref(&shape),
+        WEIGHTS,
+        &mut slots,
+    )
+    .unwrap_err()
+    .to_string();
+    assert!(error.contains("staging"), "{error}");
+}
+
+#[test]
+fn a_streaming_engine_that_refuses_the_starting_residency_fails_the_load() {
+    let shape = experts(8, 2);
+    let mut slots = pool(16, &shape);
+    let cache = WeightCache::new(&[shape], WEIGHTS, true, &mut slots).unwrap();
+    let inner = Inner {
+        slots,
+        floor: 4 * MIB,
+    };
+    let engine = FakeEngine::default();
+    engine.0.lock().unwrap().refuse = Some("no room for the staging".into());
+    let mut pool = WeightFirst::new(inner, cache, engine.clone());
+    let error = pool.boot().unwrap_err().to_string();
+    assert!(error.contains("no room for the staging"), "{error}");
+    assert!(engine.0.lock().unwrap().told.is_empty());
+}
+
+#[test]
+fn an_engine_that_does_not_stream_boots_as_before() {
+    let shape = experts(8, 2);
+    let mut slots = pool(16, &shape);
+    let cache = WeightCache::new(&[shape], WEIGHTS, true, &mut slots).unwrap();
+    let inner = Inner {
+        slots,
+        floor: 4 * MIB,
+    };
+    let mut pool = WeightFirst::new(inner, cache, Plain);
+    pool.boot().expect("unsupported is no refusal");
 }

@@ -6,7 +6,8 @@
 //! last tick asked (one tick late, within a window of
 //! [`super::WINDOW_TICKS`]). An engine that answers either verb
 //! unsupported is asked nothing more; one with no weight shapes is never
-//! asked at all.
+//! asked at all. The load alone waits: on the resident set the engine
+//! starts with, before the first fire can be submitted.
 
 use ::engine::chunk::{WeightResidency, WeightUses};
 use tokio::sync::oneshot::{Receiver, error::TryRecvError};
@@ -14,7 +15,7 @@ use tokio::sync::oneshot::{Receiver, error::TryRecvError};
 use super::WeightPort;
 use crate::scheduler::worker::HostKvOp;
 
-type Answer = Receiver<anyhow::Result<Vec<u8>>>;
+pub type Answer = Receiver<anyhow::Result<Vec<u8>>>;
 
 /// See the module docs.
 pub struct EnginePort {
@@ -63,6 +64,35 @@ impl EnginePort {
                 }
                 None
             }
+        }
+    }
+
+    /// The resident sets queued and not answered yet, for a caller that
+    /// must know the engine took them; each answer comes back through
+    /// [`Self::answered`].
+    pub fn take_queued(&mut self) -> Vec<Answer> {
+        std::mem::take(&mut self.residencies)
+    }
+
+    /// Reads an answer [`Self::take_queued`] handed out.
+    ///
+    /// # Errors
+    ///
+    /// The engine refused the resident set. An unsupported answer is no
+    /// error: the port is asked nothing more.
+    pub fn answered(&mut self, answer: anyhow::Result<Vec<u8>>) -> anyhow::Result<()> {
+        match answer {
+            Ok(_) => Ok(()),
+            Err(error)
+                if matches!(
+                    error.downcast_ref(),
+                    Some(::engine::Error::Unsupported { .. })
+                ) =>
+            {
+                self.settle(Err(error));
+                Ok(())
+            }
+            Err(error) => Err(error),
         }
     }
 
@@ -133,6 +163,18 @@ mod tests {
         assert!(port.idle());
         assert_eq!(port.uses().unwrap(), WeightUses::default());
         port.set_residency(&WeightResidency::default()).unwrap();
+    }
+
+    #[test]
+    fn a_refused_starting_residency_is_an_error_and_unsupported_is_not() {
+        let mut port = EnginePort::new(9_999, false);
+        let refused = anyhow::anyhow!("the engine is out of staging");
+        assert!(port.answered(Err(refused)).is_err());
+        assert!(!port.idle());
+        let unsupported = anyhow::Error::from(::engine::Error::unsupported("plain", "weight"));
+        port.answered(Err(unsupported)).unwrap();
+        assert!(port.idle(), "an unsupported engine is asked nothing more");
+        port.answered(Ok(Vec::new())).unwrap();
     }
 
     #[test]
