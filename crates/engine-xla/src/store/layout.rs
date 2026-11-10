@@ -331,7 +331,7 @@ impl Layout {
                     pieces: pieces as u32,
                 },
                 tokens: 0,
-                slot_bytes: per_piece as u64 * run,
+                slot_bytes: align_up(per_piece as u64 * run, lcm(run, ROW_BYTES)),
                 planes,
                 rows: cache,
             });

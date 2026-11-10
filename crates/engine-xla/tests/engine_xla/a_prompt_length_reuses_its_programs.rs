@@ -126,7 +126,7 @@ fn the_slots_a_request_lands_in_trace_no_new_program() {
         .find(|s| matches!(s.kind, engine::chunk::SlotKind::Fixed { .. }))
         .expect("a hybrid states a record")
         .id;
-    let pages: Vec<u32> = (0..64).map(|_| refs.take(kv)).collect();
+    let pages: Vec<u32> = (0..120).map(|_| refs.take(kv)).collect();
     let records: Vec<u32> = (0..SLOTS).map(|_| refs.take(fixed)).collect();
     let run = |src_page, dst_page| engine::transfer::KvRun {
         src_page,
@@ -179,12 +179,16 @@ fn decode_text(shell: &mut Shell, lanes: u32) -> usize {
     let mut refs = Refs::of_facts(Some(shell.chunk_facts()));
     let token = [7u32];
     let word = facts.word(&Request::new(1, false));
-    let held: Vec<engine::fire::Lane> = (0..lanes)
-        .map(|lane| {
-            let mut seq = Seq::new(lane % SLOTS);
+    // Lanes share the seats' slots (`lane % SLOTS`), as the old test did.
+    let seats: Vec<engine::fire::Lane> = (0..SLOTS)
+        .map(|slot| {
+            let mut seq = Seq::new(slot);
             seq.held = 300;
             seq.lane_of(CONTEXT, word, &mut refs, vec![7])
         })
+        .collect();
+    let held: Vec<engine::fire::Lane> = (0..lanes)
+        .map(|lane| seats[(lane % SLOTS) as usize].clone())
         .collect();
     let seated: Vec<Seated<'_>> = held
         .iter()
