@@ -950,3 +950,11 @@ The `new-memory/` directory is bookkeeping and is removed before anything lands 
 - Open: runtime boot fit check counts only committed segments (Metal: one ~65 MB) -> must count growable segments
   (engine works around by backing weights + floors at load). Writer refuses qwen38 u2 (ple.table 160 not a multiple
   of 64). Affine 2-bit / biased MXFP4 untested on real models.
+
+### M73 — 2026-11-10: boot weight fit counts the growable pool (RT3, PR-READINESS A3)
+- `sc/rt3-fit` (b3d9b646a): `SlotPool::growable_chunks()` (free chunks below activation across every allowed
+  segment); `SlotPool::commit_for` commits the lowest uncommitted segments the held weights (or a streaming floor)
+  need before claiming; Steered::boot asks the engine to back that prefix before the starting residency;
+  `SharedGrow::hold_mapped` keeps the governor from giving those segments back. Metal-like facts tested; CUDA e2e
+  (768 MiB and default) unchanged. Metal device run pending; engine-metal's back-everything-at-load workaround can
+  shrink later.
