@@ -406,3 +406,12 @@ The `new-memory/` directory is bookkeeping and is removed before anything lands 
   gone), `SlotShape.role` marks the rs list, base aligned down to T_rs, pressure counts rs-list slots.
   Beam 3x12 on one working set accepted (10 slots). Engines (BC, BM) must implement `slot_copies` + rs-list pages.
 - Verified: `cargo check` runtime/engine/worker; runtime `store::shared`, `store::rs`, `pipeline::fire::rs` (27).
+
+### M29 — 2026-11-10: P3fix4 merged (recipe rs list)
+- `sc/p3fix4-rs-list` (2a618acab): `SlotLayout::RsList` (T_rs in {1,2,4,8,16} chosen by waste with
+  `EXPECTED_UNFOLDED` = 4 as weighting only), fixed records hold state only, 16-row reservation gone,
+  `RsLayout::at(row, plane, s, base)`, `Waste::rs_tail`, per_rank cuts rs rows like their state's heads.
+  Waste avg CUDA 0.55% -> 0.57%, Metal 3.04% -> 2.67%; kimik3-2.8t CUDA 4.40 -> 2.05. Worse: glm53-flash-mini CUDA
+  22.84 -> 30.72 (oversized 25M record per 48M chunk, pre-existing), kimik3 Metal 5.61 -> 12.15 (extra open chunk).
+- Engines must set `SlotRole::RsBuffer` on the rs list when building facts from the recipe (BC / BM).
+- Verified: cargo check compiler/runtime/engine/worker after merge; chunk lib + golden tests on the branch.
