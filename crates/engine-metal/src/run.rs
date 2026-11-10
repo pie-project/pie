@@ -33,9 +33,9 @@ pub enum CachePool {
 
 #[derive(Clone, Debug, Default)]
 pub struct CacheTable {
-    /// One pool per cache space, in space order.
+    /// One pool per cache row, in row order.
     pub pools: Vec<CachePool>,
-    /// The compressor state beside each kv space a pool gather reads.
+    /// The compressor state beside each kv row a pool gather reads.
     pub compressed: Vec<(u32, PoolSlabs)>,
     /// Each cache row's lane table of record piece ids (its band's), for
     /// the committed scans that index a state by lane.
@@ -124,7 +124,10 @@ pub struct FireBindings {
 
     pub voxels: Option<crate::inputs::VoxelHandles>,
 
+    /// One a page table: the kv list's first, the All axis's.
     pub geometry: Vec<CacheGeometry>,
+    /// The page table of `geometry` a windowed row's write descriptor reads.
+    pub window_table: usize,
 
     pub tables: FireTables,
 
@@ -1398,7 +1401,7 @@ impl<'c> Run<'c> {
         }
         if matches!(
             self.values[at].def,
-            Def::Input(RuntimeInput::Mask { .. })
+            Def::Input(RuntimeInput::Mask)
                 | Def::Input(RuntimeInput::Geometry {
                     kind: GeomKind::Indices,
                     ..
@@ -1441,15 +1444,15 @@ impl<'c> Run<'c> {
             .gathered
             .as_ref()
             .expect("`compacted` is reached only through a gathered window");
-        if let Def::Input(RuntimeInput::Geometry { space, kind }) = &self.values[at].def {
-            let Some(space) = gathered.spaces.get(*space as usize) else {
+        if let Def::Input(RuntimeInput::Geometry { kind }) = &self.values[at].def {
+            let Some(table) = gathered.page_tables.get(self.table_of(*kind)) else {
                 return handle;
             };
             return match kind {
-                GeomKind::Indptr => space.page_indptr,
-                GeomKind::Indices => space.page_indices,
-                GeomKind::LastPageLen => space.last_page_lens,
-                GeomKind::KvLen => space.kv_len,
+                GeomKind::Indptr => table.page_indptr,
+                GeomKind::Indices => table.page_indices,
+                GeomKind::LastPageLen => table.last_page_lens,
+                GeomKind::KvLen => table.kv_len,
                 _ => handle,
             };
         }
@@ -1539,7 +1542,7 @@ impl<'c> Run<'c> {
             Def::Input(RuntimeInput::Tokens) => self.fire.tokens,
             Def::Input(RuntimeInput::ReadoutRows) => self.fire.readout_rows,
             Def::Input(RuntimeInput::Positions) => self.fire.positions,
-            Def::Input(RuntimeInput::Mask { space: _ }) => self.fire.tables.mask,
+            Def::Input(RuntimeInput::Mask) => self.fire.tables.mask,
             Def::Input(RuntimeInput::AdapterRoutes) => {
                 self.fire.adapter_routes.unwrap_or_else(|| {
                     panic!(
@@ -1625,12 +1628,12 @@ impl<'c> Run<'c> {
                 kind: GeomKind::RequestOfToken,
                 ..
             }) => self.fire.tables.request_of_token,
-            Def::Input(RuntimeInput::Geometry { space, kind }) => {
-                let space = *space as usize;
-                let seat = self.fire.geometry.get(space).unwrap_or_else(|| {
+            Def::Input(RuntimeInput::Geometry { kind }) => {
+                let table = self.table_of(*kind);
+                let seat = self.fire.geometry.get(table).unwrap_or_else(|| {
                     panic!(
-                        "value {at} names cache space {space}, and this fire binds \
-                         {} geometry spaces",
+                        "value {at} reads page table {table}, and this fire binds {} \
+                         page tables",
                         self.fire.geometry.len()
                     )
                 });
@@ -1641,8 +1644,8 @@ impl<'c> Run<'c> {
                     GeomKind::LastPageLen => seat.last_page_len,
                     GeomKind::KvLen => seat.kv_len,
                     GeomKind::RowValid => seat.row_valid,
-                    GeomKind::WritePage => seat.write_page,
-                    GeomKind::WriteOffset => seat.write_offset,
+                    GeomKind::WritePage { .. } => seat.write_page,
+                    GeomKind::WriteOffset { .. } => seat.write_offset,
                     GeomKind::RequestOfToken
                     | GeomKind::GroupOfLane
                     | GeomKind::GroupIndptr { .. }
@@ -1650,7 +1653,7 @@ impl<'c> Run<'c> {
                 };
                 bound.unwrap_or_else(|| {
                     panic!(
-                        "value {at} reads {kind:?} of cache space {space}, which this \
+                        "value {at} reads {kind:?} of page table {table}, which this \
                          fire left unbound"
                     )
                 })
@@ -1672,7 +1675,7 @@ impl<'c> Run<'c> {
                 })
             }
             Def::Cache(_) => panic!(
-                "value {at} is a cache space; it resolves to a pool through `Run::pool`, \
+                "value {at} is a cache row; it resolves to a pool through `Run::pool`, \
                  never to a tensor"
             ),
         }
@@ -1742,15 +1745,24 @@ impl<'c> Run<'c> {
         )
     }
 
+    /// The page table of the fire's that geometry input `kind` reads: the
+    /// All axis's (the first), or a write descriptor's row's list's.
+    fn table_of(&self, kind: GeomKind) -> usize {
+        match poem_exec::store::kv::geometry_window(kind) {
+            Some(_) => self.fire.window_table,
+            None => 0,
+        }
+    }
+
     pub(crate) fn pool_state(&self, pages: ValueId) -> Option<PoolSlabs> {
         let at = pages.0 as usize;
-        let Some(Def::Cache(space)) = self.values.get(at).map(|v| &v.def) else {
-            panic!("value {at} is not a cache space; the pooled state is keyed by one")
+        let Some(Def::Cache(row)) = self.values.get(at).map(|v| &v.def) else {
+            panic!("value {at} is not a cache row; the pooled state is keyed by one")
         };
         self.caches
             .compressed
             .iter()
-            .find(|(held, _)| *held == *space)
+            .find(|(held, _)| *held == *row)
             .map(|&(_, slabs)| slabs)
     }
 
@@ -1941,7 +1953,7 @@ impl<'c> Run<'c> {
         match self.cache(id) {
             CachePool::Kv(pool) => pool,
             CachePool::Recurrent(_) => panic!(
-                "value {} is a recurrent state space, and this op walks a paged kv pool",
+                "value {} is a recurrent state row, and this op walks a paged kv pool",
                 id.0
             ),
         }
@@ -1962,7 +1974,7 @@ impl<'c> Run<'c> {
                 ..*pool
             },
             CachePool::Kv(_) => panic!(
-                "value {} is a paged kv space, and this op scans a recurrent state pool",
+                "value {} is a paged kv row, and this op scans a recurrent state pool",
                 id.0
             ),
         }
@@ -1975,12 +1987,12 @@ impl<'c> Run<'c> {
                 let row = *c as usize;
                 self.caches.pools.get(row).unwrap_or_else(|| {
                     panic!(
-                        "value {at} is cache space {row}, and the shell binds {} pools",
+                        "value {at} is cache row {row}, and the shell binds {} pools",
                         self.caches.pools.len()
                     )
                 })
             }
-            _ => panic!("value {at} is not a cache space; tensors resolve through `Run::tensor`"),
+            _ => panic!("value {at} is not a cache row; tensors resolve through `Run::tensor`"),
         }
     }
 

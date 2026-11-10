@@ -1,7 +1,7 @@
 //! An op's operand types are stated on its fields (`#[output(I32)]`), and
 //! the validator names the field it refuses.
 
-use poem::{Dtype, ForwardHybrid, HybridSpec, Input, Platform, Weight, ops, trace_hybrid};
+use poem::{Dtype, ForwardHybrid, Input, Platform, StateRows, Weight, ops, trace_hybrid};
 use poem_ir::Turn;
 use poem_ir::check::Port;
 use poem_ir::{Fault, Operation, Sampling, Trace, Ty};
@@ -13,8 +13,8 @@ const VOCAB: u32 = 128;
 struct Ranked;
 
 impl ForwardHybrid for Ranked {
-    fn caches(&self) -> HybridSpec {
-        HybridSpec::new()
+    fn states(&self) -> StateRows {
+        StateRows::new()
     }
 
     fn forward(&self, inputs: Input) {
@@ -64,8 +64,8 @@ fn a_mistyped_port_is_refused_by_its_field_name() {
 struct Turned;
 
 impl ForwardHybrid for Turned {
-    fn caches(&self) -> HybridSpec {
-        HybridSpec::new()
+    fn states(&self) -> StateRows {
+        StateRows::new()
     }
 
     fn forward(&self, inputs: Input) {

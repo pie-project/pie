@@ -27,7 +27,7 @@ use eta_ir::validate::bind;
 use poem::fact;
 use poem::ops::conv::{self, ConvShape};
 use poem::{
-    Dtype, ForwardHybrid, HybridSpec, Input, ModulateForm, Platform, RaggedMask, Request, RopeForm,
+    Dtype, ForwardHybrid, Input, ModulateForm, Platform, RaggedMask, Request, RopeForm, StateRows,
     Trace, Value, Weight, ops, trace_hybrid,
 };
 use poem_ir::InputAxis;
@@ -79,8 +79,8 @@ pub fn device() -> Option<engine_xla::bench::DeviceLock> {
 pub struct DoubleBlock;
 
 impl ForwardHybrid for DoubleBlock {
-    fn caches(&self) -> HybridSpec {
-        HybridSpec::new()
+    fn states(&self) -> StateRows {
+        StateRows::new()
     }
     fn forward(&self, inputs: Input) {
         inputs
@@ -178,8 +178,8 @@ pub fn trace() -> Trace {
 pub struct TwoAxis;
 
 impl ForwardHybrid for TwoAxis {
-    fn caches(&self) -> HybridSpec {
-        HybridSpec::new()
+    fn states(&self) -> StateRows {
+        StateRows::new()
     }
     fn forward(&self, inputs: Input) {
         inputs

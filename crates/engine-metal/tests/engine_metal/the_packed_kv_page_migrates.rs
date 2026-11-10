@@ -20,7 +20,7 @@ use engine_metal::encode::Sink;
 use engine_metal::run::CachePool;
 use engine_metal::store::kv::{Facts, Paging, SpaceFacts};
 use engine_metal::store::layout::{LIST, Layout};
-use engine_metal::store::{Pools, Rows, Seats, SpaceSeat};
+use engine_metal::store::{Pools, Rows, Seats, TableSeat};
 use kernels_metal::Tensor;
 use poem_compiler::chunk::{ChunkProfile, ChunkRecipe, RowId, SlotLayout, TokenRun};
 use poem_ir::{CacheRow, Dtype, Platform, Trace};
@@ -141,7 +141,7 @@ fn seats(rig: &mut Rig) -> Seats {
         lanes: 1,
         rows: 1,
         pages: PAGES as u32,
-        spaces: vec![SpaceSeat {
+        page_tables: vec![TableSeat {
             page_indptr,
             page_indices,
             last_page_lens,
@@ -185,7 +185,6 @@ fn migrate_case(rig: &mut Rig, head_dim: usize) {
             name: String::from("kv"),
             planes: vec![width, width],
             dtype: Dtype::KvU4,
-            space: 0,
             window: None,
             head_dim: head_dim as u32,
             live: None,

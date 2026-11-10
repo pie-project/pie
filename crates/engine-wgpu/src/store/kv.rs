@@ -2,9 +2,7 @@ use poem_ir::{Trace, ValueId};
 
 use crate::error::{Fault, Result};
 
-pub use poem_exec::store::kv::{
-    Geometry, Paging, Reader, Seat, SpaceFacts, indptr, reads, row_of, space_of,
-};
+pub use poem_exec::store::kv::{Geometry, Paging, Reader, Seat, SpaceFacts, indptr, reads, row_of};
 
 pub fn geometry(paging: &Paging, seats: &[Seat]) -> Result<Geometry> {
     Ok(poem_exec::store::kv::geometry(paging, seats)?)

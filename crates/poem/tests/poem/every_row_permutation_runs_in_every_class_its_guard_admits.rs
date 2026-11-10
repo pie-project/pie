@@ -1,6 +1,6 @@
 use poem::fact;
 use poem::{
-    Dtype, ForwardHybrid, HybridSpec, Input, Platform, RaggedMask, Request, Value, Weight, ops,
+    Dtype, ForwardHybrid, Input, Platform, RaggedMask, Request, StateRows, Value, Weight, ops,
     trace_hybrid,
 };
 use poem_ir::{Gather, Operation};
@@ -11,8 +11,8 @@ const HEAD_DIM: u32 = 8;
 struct LastJointBlock;
 
 impl ForwardHybrid for LastJointBlock {
-    fn caches(&self) -> HybridSpec {
-        HybridSpec::new()
+    fn states(&self) -> StateRows {
+        StateRows::new()
     }
     fn forward(&self, inputs: Input) {
         inputs

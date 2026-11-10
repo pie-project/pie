@@ -3,7 +3,7 @@ use poem_ir::{Attn, Operands, Operation, StructKind, Trace, Ty, ValueId};
 use crate::error::{Fault, Result};
 
 pub use poem_exec::store::kv::{
-    Geometry, Paging, Reader, Seat, SpaceFacts, indptr, pad_indptr, reads, row_of, space_of,
+    Geometry, Paging, Reader, Seat, SpaceFacts, indptr, pad_indptr, reads, row_of,
 };
 
 pub fn geometry(paging: &Paging, seats: &[Seat]) -> Result<Geometry> {

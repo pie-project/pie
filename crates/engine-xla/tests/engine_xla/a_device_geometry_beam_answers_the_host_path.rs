@@ -19,7 +19,7 @@ use eta_ir::op::Op;
 use eta_ir::registry::{GeometryClass, Port, Stage};
 use eta_ir::types::{Dtype as EtaDtype, Shape};
 use poem::{
-    Dtype, ForwardHybrid, HybridSpec, Input, Platform, Trace, Value, Weight, ops, trace_hybrid,
+    Dtype, ForwardHybrid, Input, Platform, StateRows, Trace, Value, Weight, ops, trace_hybrid,
 };
 use poem_ir::Turn;
 
@@ -35,11 +35,10 @@ const BEAMS: u32 = 2;
 struct Tiny;
 
 impl ForwardHybrid for Tiny {
-    fn caches(&self) -> HybridSpec {
-        let mut spec = HybridSpec::new();
-        let space = spec.kv_space(Dtype::Bf16);
+    fn states(&self) -> StateRows {
+        let mut spec = StateRows::new();
         let plane = u64::from(HEADS) * u64::from(HEAD_DIM);
-        spec.kv(space, KV_ROW, [plane, plane], HEAD_DIM);
+        spec.kv(KV_ROW, Dtype::Bf16, [plane, plane], HEAD_DIM);
         spec
     }
 

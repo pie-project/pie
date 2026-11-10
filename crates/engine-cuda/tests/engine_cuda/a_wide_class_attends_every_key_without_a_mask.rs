@@ -6,7 +6,7 @@ use crate::common_encoder::{Weights, contract_for};
 use engine::fire::{Mask, Masking, Readout};
 use engine_cuda::{Boot, Graphs, Lane, Seated, Shell};
 use poem::{
-    Dtype, ForwardHybrid, HybridSpec, Input, Platform, Request, Trace, Weight, fact, ops,
+    Dtype, ForwardHybrid, Input, Platform, Request, StateRows, Trace, Weight, fact, ops,
     trace_hybrid,
 };
 use poem_compiler::Budget;
@@ -25,11 +25,10 @@ struct Micro {
 }
 
 impl ForwardHybrid for Micro {
-    fn caches(&self) -> HybridSpec {
-        let mut spec = HybridSpec::new();
-        let space = spec.kv_space(Dtype::Bf16);
+    fn states(&self) -> StateRows {
+        let mut spec = StateRows::new();
         let plane = u64::from(HEADS) * u64::from(HEAD_DIM);
-        spec.kv(space, KV_ROW, [plane, plane], HEAD_DIM);
+        spec.kv(KV_ROW, Dtype::Bf16, [plane, plane], HEAD_DIM);
         spec
     }
 

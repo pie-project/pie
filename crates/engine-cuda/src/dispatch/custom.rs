@@ -994,7 +994,6 @@ impl Run<'_> {
             None => (
                 self.input_of(&poem_ir::RuntimeInput::Positions)?,
                 self.input_of(&poem_ir::RuntimeInput::Geometry {
-                    space: 0,
                     kind: poem_ir::GeomKind::RequestOfToken,
                 })?,
                 None,
@@ -1068,7 +1067,6 @@ impl Run<'_> {
         }
         let positions = self.input_of(&poem_ir::RuntimeInput::Positions)?;
         let requests = self.input_of(&poem_ir::RuntimeInput::Geometry {
-            space: 0,
             kind: poem_ir::GeomKind::RequestOfToken,
         })?;
         let window_pool = self.pool_whole(cache)?;

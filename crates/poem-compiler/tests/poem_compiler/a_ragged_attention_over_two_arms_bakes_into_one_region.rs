@@ -2,7 +2,7 @@ use crate::common;
 
 use poem::fact;
 use poem::{
-    Dtype, ForwardHybrid, HybridSpec, Input, RaggedMask, Request, Weight, ops, trace_hybrid,
+    Dtype, ForwardHybrid, Input, RaggedMask, Request, StateRows, Weight, ops, trace_hybrid,
 };
 use poem_compiler::Placement;
 use poem_ir::{Attn, Def, Gather, Linear, Operation, RuntimeInput};
@@ -15,8 +15,8 @@ const HEADS: u64 = 4;
 struct CrossAttention;
 
 impl ForwardHybrid for CrossAttention {
-    fn caches(&self) -> HybridSpec {
-        HybridSpec::new()
+    fn states(&self) -> StateRows {
+        StateRows::new()
     }
     fn forward(&self, inputs: Input) {
         inputs

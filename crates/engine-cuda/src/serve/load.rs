@@ -935,7 +935,7 @@ impl Shell {
                 .saturating_mul(crate::store::rs::SNAPSHOTS),
         );
         // A page table a kv shape: the full rows' and the windowed rows'.
-        let spaces = pools.geometries();
+        let page_tables = pools.geometries();
         let patch_seat = boot.patches.as_ref().and_then(|ladder| {
             boot.trace.values.iter().find_map(|decl| {
                 let (
@@ -1000,7 +1000,7 @@ impl Shell {
         let inputs = Inputs::reserve(
             &boot.budget,
             paging,
-            spaces,
+            page_tables,
             &facts,
             compiled.classes.classes.len(),
             compiled.template().len(),
@@ -1066,7 +1066,7 @@ impl Shell {
             predicate,
             inputs,
             facts,
-            spaces,
+            page_tables,
             masked,
             wide,
             feeds,

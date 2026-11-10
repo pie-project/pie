@@ -201,7 +201,8 @@ pub enum CacheRow {
         name: String,
         planes: Vec<u64>,
         dtype: Dtype,
-        space: u32,
+        /// The rows the reading attention keeps: `None` every row of the
+        /// sequence; `Some(w)` its last `w`, the row's own window list.
         #[serde(default)]
         window: Option<u32>,
         /// The attention head_dim this cache stores. It is the packing block of

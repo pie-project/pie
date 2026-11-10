@@ -142,11 +142,11 @@ fn copyable(trace: &Trace, region: &Region) -> bool {
         };
         match &decl.def {
             Def::Cache(c) => matches!(trace.caches.get(*c as usize), Some(CacheRow::Kv { .. })),
-            Def::Input(RuntimeInput::Geometry { kind, .. }) => matches!(
+            Def::Input(RuntimeInput::Geometry { kind }) => matches!(
                 kind,
                 GeomKind::Indptr | GeomKind::Indices | GeomKind::LastPageLen | GeomKind::KvLen
             ),
-            Def::Input(RuntimeInput::Mask { .. }) => false,
+            Def::Input(RuntimeInput::Mask) => false,
             _ => match &decl.ty {
                 Ty::Struct(_) => true,
                 Ty::Tensor { shape, dtype } => match shape.first() {

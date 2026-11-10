@@ -172,7 +172,7 @@ pub struct KvDelta {
     pub pages: Vec<u32>,
     #[serde(default)]
     pub translation: Vec<u32>,
-    /// The ids of the lane's pages in the windowed kv spaces, aligned with
+    /// The ids of the lane's pages in the window list, aligned with
     /// `translation` when it is stated and with `pages` otherwise; 0 is the
     /// null page a page wholly behind the window reads.
     #[serde(default)]

@@ -6,7 +6,7 @@ use engine::Engine;
 use engine::fire::{FrameSubmission, Lane, Readout, Step, StepVoxels};
 use engine::load::{Budgets, Checkpoint, LoadRequest, Residency};
 use poem::fact;
-use poem::{Dtype, ForwardHybrid, HybridSpec, Input, Platform, Request, ops};
+use poem::{Dtype, ForwardHybrid, Input, Platform, Request, StateRows, ops};
 use poem_ir::InputAxis;
 
 use crate::common_two_axis::{Weights, contract_for};
@@ -28,8 +28,8 @@ const WIDTH: u32 = 6 + 7 + 1 + 6;
 struct Cells;
 
 impl ForwardHybrid for Cells {
-    fn caches(&self) -> HybridSpec {
-        HybridSpec::new()
+    fn states(&self) -> StateRows {
+        StateRows::new()
     }
     fn forward(&self, inputs: Input) {
         inputs

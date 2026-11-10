@@ -472,7 +472,6 @@ pub fn device_memory() -> Result<(u64, u64)> {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Shape {
     Kv {
-        space: u32,
         windowed: bool,
         dtype: Dtype,
         keys_width: u64,
@@ -513,7 +512,7 @@ impl Shape {
 }
 
 #[derive(Debug, Clone, Copy)]
-pub struct SpaceSeat {
+pub struct TableSeat {
     pub page_indptr: Tensor,
     pub page_indices: Tensor,
     pub last_page_lens: Tensor,
@@ -525,7 +524,8 @@ pub struct Seats {
     pub lanes: u32,
     pub rows: u32,
     pub pages: u32,
-    pub spaces: Vec<SpaceSeat>,
+    /// One a page table: the kv list's, then the window list's.
+    pub page_tables: Vec<TableSeat>,
     pub slot_ids: Tensor,
     pub write_state: bool,
     pub write_state_mask: Tensor,
@@ -769,7 +769,6 @@ impl Pools {
                     name,
                     planes,
                     dtype,
-                    space,
                     window,
                     live,
                     rows: quantized,
@@ -839,7 +838,6 @@ impl Pools {
                     let keys = u64::from(paging.page_size) * keys_width * element;
                     shapes.push(Shape::Kv {
                         offsets: [at, at + if values_plane == 0 { 0 } else { keys }],
-                        space: *space,
                         windowed,
                         dtype: *dtype,
                         keys_width,
@@ -873,28 +871,28 @@ impl Pools {
             debug_assert_eq!(shapes.len(), index + 1, "one shape per cache row");
         }
         let mut pooled = Vec::new();
-        for (space, width) in poem_compiler::chunk::census::pooled(trace) {
-            // A state keyed by a windowed row's pages (`space` is the cache
+        for (row, width) in poem_compiler::chunk::census::pooled(trace) {
+            // A state keyed by a windowed row's pages (`row` is the cache
             // row its gather reads) lies in the windowed pages' slots.
             let windowed = paging.window.is_some()
                 && matches!(
-                    shapes.get(space as usize),
+                    shapes.get(row as usize),
                     Some(Shape::Kv { windowed: true, .. })
                 );
             let offset = layout
                 .shape(Kind::paged(windowed))
-                .and_then(|shape| shape.pool_of(space))
+                .and_then(|shape| shape.pool_of(row))
                 .ok_or_else(|| {
                     Fault::program(
                         "store::reserve",
                         format!(
-                            "the compressor state keyed by cache row {space} has no run in \
+                            "the compressor state keyed by cache row {row} has no run in \
                              the chunk recipe's slot"
                         ),
                     )
                 })?;
             pooled.push(PoolRow {
-                space,
+                row,
                 width,
                 windowed,
                 offset,
@@ -961,7 +959,7 @@ impl Pools {
                     )
                 };
                 (
-                    row.space,
+                    row.row,
                     PoolSlabs {
                         state_kv: plane(0),
                         state_score: plane(1),
@@ -1185,13 +1183,6 @@ impl Pools {
             .any(|shape| matches!(shape, Shape::State { .. }))
     }
 
-    #[must_use]
-    pub fn windowed_space(&self, space: u32) -> bool {
-        self.shapes.iter().any(
-            |shape| matches!(shape, Shape::Kv { space: at, windowed: true, .. } if *at == space),
-        )
-    }
-
     /// The page tables a fire stages: one a kv shape, the list's and then
     /// the window list's. Every kv row of a shape reads its shape's.
     #[must_use]
@@ -1207,32 +1198,23 @@ impl Pools {
         layout.window.is_some() && at == usize::from(layout.list.is_some())
     }
 
-    /// The page table of a fire's the kv rows of `space` read: their
-    /// shape's.
+    /// The page table of a fire's that the kv rows paged in the window
+    /// list (`windowed`) or in the kv list read. The kv list's is the
+    /// first, and the All axis's: a model keeping no full-retention row
+    /// pages its All axis in its window list, then the only one.
     #[must_use]
-    pub fn geometry_of(&self, space: u32) -> usize {
-        if self.windowed_space(space) {
+    pub fn table_of(&self, windowed: bool) -> usize {
+        if windowed {
             usize::from(self.chunks.layout().list.is_some())
         } else {
             0
         }
     }
 
-    /// [`Pools::geometry_of`] for every kv space the trace numbers.
+    /// The page table a fire's rows retained through a window read.
     #[must_use]
-    pub fn geometry_map(&self) -> Vec<u32> {
-        let spaces = self
-            .shapes
-            .iter()
-            .filter_map(|shape| match shape {
-                Shape::Kv { space, .. } => Some(*space + 1),
-                Shape::State { .. } => None,
-            })
-            .max()
-            .unwrap_or(0);
-        (0..spaces)
-            .map(|space| self.geometry_of(space) as u32)
-            .collect()
+    pub fn window_table(&self) -> usize {
+        self.table_of(self.paging.window.is_some())
     }
 
     #[must_use]
@@ -1318,7 +1300,6 @@ impl Pools {
         for shape in &self.shapes {
             table.push(match *shape {
                 Shape::Kv {
-                    space,
                     windowed,
                     dtype,
                     keys_width,
@@ -1328,13 +1309,9 @@ impl Pools {
                     live,
                     offsets,
                 } => {
-                    let seat = seats.spaces.get(self.geometry_of(space)).ok_or_else(|| {
-                        Fault::Unbound {
-                            what: format!(
-                                "cache space {space}, for which this fire wrote no \
-                                     geometry"
-                            ),
-                        }
+                    let table = self.table_of(windowed);
+                    let seat = seats.page_tables.get(table).ok_or_else(|| Fault::Unbound {
+                        what: format!("page table {table}, which this fire staged none of"),
                     })?;
                     let pages = if windowed {
                         self.paging.window_pages()
@@ -1359,7 +1336,7 @@ impl Pools {
                         )
                     };
                     CachePool::Kv {
-                        space,
+                        table: table as u32,
                         pool: KvPool {
                             keys: plane(0, keys_width),
                             values: plane(1, values_width),
@@ -1810,7 +1787,7 @@ impl Pools {
         planes
     }
 
-    /// The compressor slabs keyed by a windowed space's pages (or not), and
+    /// The compressor slabs keyed by a windowed row's pages (or not), and
     /// the bytes a page holds in each.
     fn pooled_planes(&self, windowed: bool) -> Vec<(PlaneAt, u64)> {
         let page_size = self.paging.page_size;
@@ -2171,12 +2148,12 @@ impl Pools {
 
     /// The kv planes as another worker reads them: every declared page, one
     /// region per paged plane, a page `p` at `base + p * page_stride`. A
-    /// windowed space is refused: its pages are named by its own window list, not by
-    /// the kv pages a peer reads.
+    /// windowed row is refused: its pages are named by its own window list, not
+    /// by the kv pages a peer reads.
     pub fn export_kv(&mut self, ordinal: u32) -> Result<ExportedKv> {
         if !self.windowed_planes().is_empty() {
             return Err(Fault::Residency(
-                "a windowed kv space names its pages by its own window list, so it cannot be \
+                "a windowed kv row names its pages by its own window list, so it cannot be \
                  handed to another worker by the kv pages it reads"
                     .to_string(),
             ));
@@ -3057,12 +3034,12 @@ struct PlaneAt {
 
 const POOL_STATE: Dtype = Dtype::Bf16;
 
-/// A compressor's state for the kv row `space` its gather keys it by: two
+/// A compressor's state for the kv row `row` its gather keys it by: two
 /// planes (the projection, then its score) of `width` a token, `offset`
 /// into the row's pages' slots.
 #[derive(Debug)]
 struct PoolRow {
-    space: u32,
+    row: u32,
     width: u64,
     /// Keyed by a windowed row's pages.
     windowed: bool,

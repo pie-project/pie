@@ -352,7 +352,7 @@ pub struct Shell {
     #[allow(dead_code)]
     facts: kv::Facts,
 
-    spaces: usize,
+    page_tables: usize,
 
     patch_seat: Option<crate::inputs::PatchSeat>,
 
@@ -594,16 +594,14 @@ impl Shell {
 
         let mut scratch =
             Scratch::reserve(&device, &boot.trace, &compiled, &budgets, least, &tuning)?;
-        let spaces = boot
-            .trace
-            .caches
-            .iter()
-            .filter_map(|row| match row {
-                poem_ir::CacheRow::Kv { space, .. } => Some(*space as usize + 1),
-                poem_ir::CacheRow::State { .. } => None,
-            })
-            .max()
-            .unwrap_or(0);
+        // One page table: every kv row, windowed or not, pages its rows in
+        // full here, so the All axis and every write read the same one.
+        let page_tables = usize::from(
+            boot.trace
+                .caches
+                .iter()
+                .any(|row| matches!(row, poem_ir::CacheRow::Kv { .. })),
+        );
 
         let arms = boot.runahead.frames().max(1);
 
@@ -692,7 +690,7 @@ impl Shell {
                     &device,
                     &boot.budget,
                     asked,
-                    spaces,
+                    page_tables,
                     compiled.classes.classes.len(),
                     gathers,
                     patch_seat,
@@ -928,7 +926,7 @@ impl Shell {
             states_mrope,
             gathers_readout,
             facts,
-            spaces,
+            page_tables,
 
             copies: false,
             last: FireCost::default(),
@@ -996,7 +994,7 @@ impl Shell {
     }
 
     /// Unstated `budget`: `seats` sequences at `context` and at least the pool,
-    /// within a quarter of the free space. No `dir`, no tier.
+    /// within a quarter of the free table. No `dir`, no tier.
     pub fn seat_disk_kv(
         &mut self,
         budget: Option<u64>,
@@ -2045,7 +2043,7 @@ impl Shell {
 
         let indptr_host = kv::indptr(&seats)?;
         let table_refs: Vec<&[u32]> = tables.iter().map(std::convert::AsRef::as_ref).collect();
-        let mut geometries = (0..self.spaces)
+        let mut geometries = (0..self.page_tables)
             .map(|_| kv::geometry_with(&paging, &seats, &table_refs))
             .collect::<Result<Vec<_>>>()?;
 
@@ -2096,7 +2094,7 @@ impl Shell {
                 bucket,
 
                 enabled: self.copies && masks.iter().all(|lane| lane.mask.is_none()),
-                spaces: &geometries,
+                page_tables: &geometries,
                 positions: &positions,
                 request_of_token: &request_of_token,
             },
@@ -2314,7 +2312,7 @@ impl Shell {
                 rs_commit: rs_active.then_some(rs_commit.as_slice()),
                 request_of_token: &request_of_token,
                 adapter_routes: any_adapter.then_some(adapter_routes.as_slice()),
-                spaces: &geometries,
+                page_tables: &geometries,
                 mask: staged.as_ref(),
                 patches: (patch_rows > 0).then_some(crate::inputs::PatchFire {
                     payload: &patch_payload,
@@ -2367,9 +2365,9 @@ impl Shell {
             &self.inputs[arm].seats(&self.handles, &bound, pages, rows, lane_count),
         )?;
 
-        let mut geometry = Vec::with_capacity(self.spaces);
-        for space in 0..self.spaces {
-            let seat = bound.spaces[space];
+        let mut geometry = Vec::with_capacity(self.page_tables);
+        for table in 0..self.page_tables {
+            let seat = bound.page_tables[table];
             geometry.push(CacheGeometry {
                 indptr: Some(seat.indptr),
                 indices: Some(seat.indices),

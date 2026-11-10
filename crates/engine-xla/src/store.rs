@@ -8,7 +8,7 @@
 //! A kv row declared with a window (when the context outruns it) lives in the
 //! *windowed* pool instead: `Paging::window_pages()` pages, page 0 the null
 //! page every page behind a window reads (zero, never written), and its own
-//! sink page past them. Its space reads through the lanes' window tables
+//! sink page past them. Its rows read through the lanes' window tables
 //! (`kv::window_table`), as long as their full tables, so positions and
 //! masks read the same and the sliding-window rule masks the null pages.
 
@@ -62,7 +62,6 @@ fn state_dtype(declared: Dtype) -> Dtype {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Shape {
     Kv {
-        space: u32,
         head_dim: u32,
         kv_heads: u32,
         /// The values plane is the keys plane (a latent cache).
@@ -76,9 +75,9 @@ enum Shape {
     },
 }
 
-/// A fire's page geometry for one kv space, as handles.
+/// A fire's page geometry for one page table, as handles.
 #[derive(Debug, Clone, Copy)]
-pub struct SpaceSeat {
+pub struct TableSeat {
     pub page_indptr: Tensor,
     pub page_indices: Tensor,
     pub max_pages: u32,
@@ -101,7 +100,7 @@ pub struct Pools {
     roots: Vec<Vec<Tensor>>,
     shapes: Vec<Shape>,
     /// The compressed-pool state planes (`[kv, score]`, one cell per kv
-    /// cell) of each space a `PoolGather` folds into; their buffers sit in
+    /// cell) of each cache row a `PoolGather` folds into; their buffers sit in
     /// `planes` past the cache rows.
     compressor: Vec<(u32, [Tensor; 2])>,
     /// The recurrent-verb buffer plane of each rs layout plane.
@@ -207,7 +206,7 @@ pub fn pool_demand(trace: &Trace, paging: Paging) -> Result<u64> {
         };
     }
     let cells = plane_pages(paging, false) * u64::from(paging.page_size);
-    for (_, width) in compressor_spaces(trace) {
+    for (_, width) in compressor_rows(trace) {
         // Its `[kv, score]` pair, both bf16.
         total += 2 * cells * lanes(width) * 2;
     }
@@ -248,7 +247,7 @@ pub fn page_bytes(trace: &Trace, paging: Paging) -> Result<engine::chunk::Degene
             bytes.kv_page += row;
         }
     }
-    for (_, width) in compressor_spaces(trace) {
+    for (_, width) in compressor_rows(trace) {
         bytes.kv_page += 2 * page * lanes(width) * 2;
     }
     if let Some(layout) = crate::rs::Layout::read(trace)? {
@@ -298,7 +297,6 @@ impl Pools {
                     name,
                     planes: declared,
                     dtype,
-                    space,
                     window,
                     ..
                 } => {
@@ -357,7 +355,6 @@ impl Pools {
                     planes.push(row_planes);
                     roots.push(row_roots);
                     shapes.push(Shape::Kv {
-                        space: *space,
                         head_dim: narrow(head_dim),
                         kv_heads: narrow(kv_heads),
                         shared,
@@ -384,7 +381,7 @@ impl Pools {
                 }
             }
         }
-        for (space, width) in compressor_spaces(trace) {
+        for (cache_row, width) in compressor_rows(trace) {
             let row = planes.len() as u32;
             let mut pair = Vec::with_capacity(2);
             let mut bufs = Vec::with_capacity(2);
@@ -399,7 +396,7 @@ impl Pools {
             }
             planes.push(bufs);
             roots.push(pair.clone());
-            compressor.push((space, [pair[0], pair[1]]));
+            compressor.push((cache_row, [pair[0], pair[1]]));
         }
         let mut rs_buffers = Vec::new();
         if let Some(layout) = rs {
@@ -446,12 +443,34 @@ impl Pools {
         u32::try_from(self.paging.window_pages()).unwrap_or(u32::MAX)
     }
 
-    /// Whether kv space `space` lives in the windowed pool.
+    /// The page tables a fire stages, by whether each pages the windowed
+    /// pool: the full rows' first (the All axis's), then the windowed
+    /// rows'. A model keeping only windowed rows reads its All axis off the
+    /// windowed table, then the only one.
     #[must_use]
-    pub fn windowed_space(&self, space: u32) -> bool {
-        self.shapes.iter().any(
-            |shape| matches!(shape, Shape::Kv { space: at, windowed: true, .. } if *at == space),
-        )
+    pub fn tables(&self) -> Vec<bool> {
+        let held = |windowed: bool| {
+            self.shapes
+                .iter()
+                .any(|shape| matches!(shape, Shape::Kv { windowed: at, .. } if *at == windowed))
+        };
+        [false, true].into_iter().filter(|&w| held(w)).collect()
+    }
+
+    /// The page table of [`Pools::tables`] the rows in the windowed pool
+    /// (`windowed`) or in the full one read.
+    #[must_use]
+    pub fn table_of(&self, windowed: bool) -> usize {
+        let full = self.shapes.iter().any(|shape| {
+            matches!(
+                shape,
+                Shape::Kv {
+                    windowed: false,
+                    ..
+                }
+            )
+        });
+        usize::from(windowed && full)
     }
 
     #[must_use]
@@ -525,19 +544,20 @@ impl Pools {
     }
 
     /// The pools as kernel handles, with this fire's page geometry.
-    pub fn table(&self, seats: &[SpaceSeat], slot_of_row: Tensor) -> Result<CacheTable> {
+    pub fn table(&self, seats: &[TableSeat], slot_of_row: Tensor) -> Result<CacheTable> {
         let mut rows = Vec::with_capacity(self.shapes.len());
         for (roots, shape) in self.roots.iter().zip(&self.shapes) {
             rows.push(match *shape {
                 Shape::Kv {
-                    space,
+                    windowed,
                     head_dim,
                     kv_heads,
                     shared,
                     ..
                 } => {
-                    let seat = seats.get(space as usize).ok_or_else(|| Fault::Unbound {
-                        what: format!("cache space {space}, for which this fire wrote no geometry"),
+                    let table = self.table_of(windowed);
+                    let seat = seats.get(table).ok_or_else(|| Fault::Unbound {
+                        what: format!("page table {table}, which this fire staged none of"),
                     })?;
                     CachePool::Kv(KvPool {
                         keys: roots[0],
@@ -567,18 +587,18 @@ impl Pools {
         self.rs_buffers.clone()
     }
 
-    /// Every space's compressor planes, for a walk.
+    /// Every cache row's compressor planes, for a walk.
     #[must_use]
     pub fn compressors(&self) -> Vec<(u32, [Tensor; 2])> {
         self.compressor.clone()
     }
 
-    /// The compressor state planes `[kv, score]` of kv space `space`.
+    /// The compressor state planes `[kv, score]` of cache row `row`.
     #[must_use]
-    pub fn compressor(&self, space: u32) -> Option<[Tensor; 2]> {
+    pub fn compressor(&self, row: u32) -> Option<[Tensor; 2]> {
         self.compressor
             .iter()
-            .find(|(held, _)| *held == space)
+            .find(|(held, _)| *held == row)
             .map(|(_, pair)| *pair)
     }
 
@@ -931,10 +951,10 @@ impl Pools {
     }
 }
 
-/// Each kv space a `PoolGather` folds into, and the width of its
+/// Each cache row a `PoolGather` folds into, and the width of its
 /// compressor state (`coff · head_dim`, coff 2 at ratio 4).
-fn compressor_spaces(trace: &Trace) -> Vec<(u32, u64)> {
-    let mut spaces: Vec<(u32, u64)> = Vec::new();
+fn compressor_rows(trace: &Trace) -> Vec<(u32, u64)> {
+    let mut rows: Vec<(u32, u64)> = Vec::new();
     for node in &trace.nodes {
         let poem_ir::Operation::Attn(poem_ir::Attn::PoolGather {
             pages,
@@ -945,7 +965,7 @@ fn compressor_spaces(trace: &Trace) -> Vec<(u32, u64)> {
         else {
             continue;
         };
-        let Some(poem_ir::Def::Cache(space)) = trace.values.get(pages.0 as usize).map(|v| &v.def)
+        let Some(poem_ir::Def::Cache(row)) = trace.values.get(pages.0 as usize).map(|v| &v.def)
         else {
             continue;
         };
@@ -953,12 +973,12 @@ fn compressor_spaces(trace: &Trace) -> Vec<(u32, u64)> {
         if width == 0 {
             continue;
         }
-        match spaces.iter_mut().find(|(held, _)| *held == *space) {
+        match rows.iter_mut().find(|(held, _)| *held == *row) {
             Some((_, held)) => *held = (*held).max(width),
-            None => spaces.push((*space, width)),
+            None => rows.push((*row, width)),
         }
     }
-    spaces
+    rows
 }
 
 #[derive(Debug, Clone, Copy)]

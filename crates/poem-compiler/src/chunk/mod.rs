@@ -25,7 +25,7 @@
 //! token-id-gathered table rows; the chunk size weighs how whole experts
 //! fill it too.
 //!
-//! The pass reads today's IR ([`poem_ir::CacheRow`]): spaces, windows,
+//! The pass reads the IR's state rows ([`poem_ir::CacheRow`]): windows,
 //! planes and slabs from the rows, layers, compression ratios, atoms and the
 //! rs buffer from the ops that read them.
 
@@ -701,7 +701,7 @@ pub fn plan(
     let mut token_shapes = Vec::new();
     let mut fixed_rows: Vec<FixedRow> = census.fixed;
 
-    // The kv list: every full-retention row, of every space, `T` tokens a
+    // The kv list: every full-retention row, `T` tokens a
     // slot (the kv page size).
     // A window that holds a whole working set is none.
     let mut token_rows = census.tokens;

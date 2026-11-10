@@ -1743,8 +1743,7 @@ impl Run<'_> {
             let (
                 Some((x, routes, up_y, up, up_experts)),
                 Some((down_x, down_routes, down_y, down, down_experts)),
-            ) =
-                (self.routed_bank(select), self.routed_bank(down))
+            ) = (self.routed_bank(select), self.routed_bank(down))
             else {
                 return Ok(false);
             };

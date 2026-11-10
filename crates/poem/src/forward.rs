@@ -8,51 +8,33 @@ use crate::record::{Recorder, Refine, Value};
 
 pub use poem_ir::Request;
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct KvSpace(pub u32);
-
+/// The rows a forward written in Rust keeps from one fire to the next: a
+/// per-token (kv) row grows a row a token, a state row is a fixed slab a
+/// sequence holds one of. Which list a kv row's slots lie in is the
+/// compiler's to decide (`chunk::plan`), from the row's retention.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
-pub struct HybridSpec {
+pub struct StateRows {
     pub rows: Vec<CacheRow>,
-    dtypes: Vec<(Dtype, Option<u32>)>,
 }
 
-impl HybridSpec {
+impl StateRows {
     #[must_use]
-    pub fn new() -> HybridSpec {
-        HybridSpec::default()
-    }
-
-    pub fn kv_space(&mut self, dtype: Dtype) -> KvSpace {
-        self.dtypes.push((dtype, None));
-        KvSpace(self.dtypes.len() as u32 - 1)
-    }
-
-    /// A space whose rows are only ever read through a sliding window of
-    /// `window` tokens, so an engine may keep just that tail of each
-    /// sequence in it.
-    pub fn windowed_kv_space(&mut self, dtype: Dtype, window: u32) -> KvSpace {
-        self.dtypes.push((dtype, Some(window)));
-        KvSpace(self.dtypes.len() as u32 - 1)
+    pub fn new() -> StateRows {
+        StateRows::default()
     }
 
     pub fn kv(
         &mut self,
-        space: KvSpace,
         name: impl Into<String>,
+        dtype: Dtype,
         planes: impl IntoIterator<Item = u64>,
         head_dim: u32,
     ) -> DeclaredCache<'_> {
-        let (dtype, window) = *self
-            .dtypes
-            .get(space.0 as usize)
-            .unwrap_or_else(|| panic!("kv space {} is not one this spec declared", space.0));
         self.rows.push(CacheRow::Kv {
             name: name.into(),
             planes: planes.into_iter().collect(),
             dtype,
-            space: space.0,
-            window,
+            window: None,
             head_dim,
             live: None,
             shard: Shard::Replicated,
@@ -75,12 +57,29 @@ impl HybridSpec {
         });
         DeclaredCache(self.rows.last_mut().expect("a row was just pushed"))
     }
+
+    /// Whether any row grows a row a token.
+    fn per_token(&self) -> bool {
+        self.rows
+            .iter()
+            .any(|row| matches!(row, CacheRow::Kv { .. }))
+    }
 }
 
 /// A cache row just declared, to state how tensor-parallel ranks split it.
 pub struct DeclaredCache<'a>(&'a mut CacheRow);
 
 impl DeclaredCache<'_> {
+    /// The kv row is only ever read through a sliding window of `window`
+    /// tokens, so an engine may keep just that tail of each sequence.
+    pub fn window(&mut self, window: u32) -> &mut Self {
+        let CacheRow::Kv { window: kept, .. } = &mut *self.0 else {
+            panic!("only a kv row is read through a window");
+        };
+        *kept = Some(window);
+        self
+    }
+
     /// The kv row's heads are zero-padded past `key` and `value` values.
     pub fn live(&mut self, key: u32, value: u32) -> &mut Self {
         let CacheRow::Kv { live, .. } = &mut *self.0 else {
@@ -128,12 +127,12 @@ impl DeclaredCache<'_> {
 }
 
 pub trait ForwardHybrid {
-    fn caches(&self) -> HybridSpec;
+    fn states(&self) -> StateRows;
     fn forward(&self, inputs: Input);
 }
 
 pub fn trace_hybrid<M: ForwardHybrid>(name: &str, m: &M, platform: Platform) -> Trace {
-    let caches = m.caches();
+    let caches = m.states();
     let rec = Recorder::new(name, platform, caches.rows.clone());
     m.forward(Input {
         rec: rec.clone(),
@@ -142,8 +141,6 @@ pub fn trace_hybrid<M: ForwardHybrid>(name: &str, m: &M, platform: Platform) -> 
     });
     rec.finish()
 }
-
-const TOKEN_SPACE: u32 = 0;
 
 pub struct Layers<'a, T> {
     rec: &'a Recorder,
@@ -172,7 +169,7 @@ impl<T> Drop for Layers<'_, T> {
 #[derive(Clone)]
 pub struct Input {
     rec: Recorder,
-    caches: HybridSpec,
+    caches: StateRows,
     over: Guard,
 }
 
@@ -261,11 +258,10 @@ impl Input {
 
     #[must_use]
     pub fn mask(&self) -> Value {
+        self.per_token();
         self.rec
             .input(
-                RuntimeInput::Mask {
-                    space: self.kv_space(),
-                },
+                RuntimeInput::Mask,
                 Ty::Tensor {
                     shape: vec![Dim::Tokens],
                     dtype: Dtype::U8,
@@ -369,27 +365,27 @@ impl Input {
 
     #[must_use]
     pub fn kv_indptr(&self) -> Value {
-        self.geometry(self.kv_space(), GeomKind::Indptr)
+        self.read_geometry(GeomKind::Indptr)
     }
 
     #[must_use]
     pub fn kv_indices(&self) -> Value {
-        self.geometry(self.kv_space(), GeomKind::Indices)
+        self.read_geometry(GeomKind::Indices)
     }
 
     #[must_use]
     pub fn last_page_len(&self) -> Value {
-        self.geometry(self.kv_space(), GeomKind::LastPageLen)
+        self.read_geometry(GeomKind::LastPageLen)
     }
 
     #[must_use]
     pub fn kv_len(&self) -> Value {
-        self.geometry(self.kv_space(), GeomKind::KvLen)
+        self.read_geometry(GeomKind::KvLen)
     }
 
     #[must_use]
     pub fn row_valid(&self) -> Value {
-        self.geometry(self.kv_space(), GeomKind::RowValid)
+        self.read_geometry(GeomKind::RowValid)
     }
 
     /// Whether the backend reads a router's hint of the experts the next
@@ -411,32 +407,26 @@ impl Input {
 
     #[must_use]
     pub fn request_of_token(&self) -> Value {
-        self.geometry(TOKEN_SPACE, GeomKind::RequestOfToken)
+        self.geometry(GeomKind::RequestOfToken)
     }
 
     #[must_use]
     pub fn group_of_lane(&self) -> Value {
-        self.geometry(TOKEN_SPACE, GeomKind::GroupOfLane)
+        self.geometry(GeomKind::GroupOfLane)
     }
 
     #[must_use]
     pub fn group_indptr(&self) -> Value {
-        self.geometry(
-            TOKEN_SPACE,
-            GeomKind::GroupIndptr {
-                select: self.selection(),
-            },
-        )
+        self.geometry(GeomKind::GroupIndptr {
+            select: self.selection(),
+        })
     }
 
     #[must_use]
     pub fn lane_indptr(&self) -> Value {
-        self.geometry(
-            TOKEN_SPACE,
-            GeomKind::LaneIndptr {
-                select: self.selection(),
-            },
-        )
+        self.geometry(GeomKind::LaneIndptr {
+            select: self.selection(),
+        })
     }
 
     #[must_use]
@@ -513,12 +503,16 @@ impl Input {
 
     #[must_use]
     pub fn write_page(&self, row: &str) -> Value {
-        self.geometry(self.space_of(row), GeomKind::WritePage)
+        self.geometry(GeomKind::WritePage {
+            window: self.window_of(row),
+        })
     }
 
     #[must_use]
     pub fn write_offset(&self, row: &str) -> Value {
-        self.geometry(self.space_of(row), GeomKind::WriteOffset)
+        self.geometry(GeomKind::WriteOffset {
+            window: self.window_of(row),
+        })
     }
 
     #[must_use]
@@ -553,7 +547,14 @@ impl Input {
         }
     }
 
-    fn geometry(&self, space: u32, kind: GeomKind) -> Value {
+    /// A page geometry the attention plans read: the All axis's, which
+    /// only a model keeping per-token rows has.
+    fn read_geometry(&self, kind: GeomKind) -> Value {
+        self.per_token();
+        self.geometry(kind)
+    }
+
+    fn geometry(&self, kind: GeomKind) -> Value {
         let (rows, dtype) = match kind {
             GeomKind::Indptr | GeomKind::GroupIndptr { .. } | GeomKind::LaneIndptr { .. } => {
                 (Dim::LanesPlus(1), Dtype::I32)
@@ -564,13 +565,13 @@ impl Input {
             | GeomKind::KvLen
             | GeomKind::GroupOfLane => (Dim::Lanes, Dtype::I32),
             GeomKind::RowValid => (Dim::Tokens, Dtype::U8),
-            GeomKind::RequestOfToken | GeomKind::WritePage | GeomKind::WriteOffset => {
-                (Dim::Tokens, Dtype::I32)
-            }
+            GeomKind::RequestOfToken
+            | GeomKind::WritePage { .. }
+            | GeomKind::WriteOffset { .. } => (Dim::Tokens, Dtype::I32),
         };
         self.rec
             .input(
-                RuntimeInput::Geometry { space, kind },
+                RuntimeInput::Geometry { kind },
                 Ty::Tensor {
                     shape: vec![rows],
                     dtype,
@@ -579,20 +580,22 @@ impl Input {
             .refined(self.over.clone())
     }
 
-    fn kv_space(&self) -> u32 {
+    fn per_token(&self) {
         assert!(
-            !self.caches.dtypes.is_empty(),
-            "the model declares no kv space",
+            self.caches.per_token(),
+            "the model declares no per-token state",
         );
-        0
     }
 
-    fn space_of(&self, name: &str) -> u32 {
+    /// The window kv row `name` is retained through.
+    fn window_of(&self, name: &str) -> Option<u32> {
         self.caches
             .rows
             .iter()
             .find_map(|row| match row {
-                CacheRow::Kv { name: n, space, .. } if n == name => Some(*space),
+                CacheRow::Kv {
+                    name: n, window, ..
+                } if n == name => Some(*window),
                 _ => None,
             })
             .unwrap_or_else(|| panic!("`{name}` is not a kv row the model declares"))

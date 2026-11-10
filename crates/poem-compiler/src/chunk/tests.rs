@@ -28,7 +28,6 @@ fn kv(name: &str, width: u64, window: Option<u32>) -> CacheRow {
         name: name.to_string(),
         planes: vec![width, width],
         dtype: Dtype::Bf16,
-        space: u32::from(window.is_some()),
         window,
         head_dim: 128,
         live: None,
@@ -66,7 +65,14 @@ fn delta_reads(trace: &mut Trace, row: u32, layer: u32) {
         });
         ValueId(u32::try_from(trace.values.len() - 1).unwrap())
     };
-    let input = |n| Def::Input(poem_ir::RuntimeInput::Mask { space: n });
+    let input = |id| {
+        Def::Input(poem_ir::RuntimeInput::Guest {
+            id,
+            axis: poem_ir::InputAxis::Row,
+            width: 8,
+            dtype: Dtype::Bf16,
+        })
+    };
     let (qkv, z, gates) = (value(input(0), 8), value(input(1), 8), value(input(2), 8));
     let cache = value(Def::Cache(row), 1);
     let y = value(Def::Op(0), 8);
@@ -99,12 +105,9 @@ fn on(chunk: ChunkProfile) -> DeviceProfile {
 }
 
 #[test]
-fn full_rows_of_every_space_share_one_list_and_a_window_lists_at_its_page() {
+fn full_rows_share_one_list_and_a_window_lists_at_its_page() {
     let mut caches: Vec<CacheRow> = (0..4).map(|l| kv(&format!("kv.{l}"), 1024, None)).collect();
     caches.extend((0..8).map(|l| kv(&format!("swa.{l}"), 2048, Some(1024))));
-    if let CacheRow::Kv { space, .. } = &mut caches[1] {
-        *space = 7;
-    }
     let recipe = plan(&trace(caches), &budgets(), &on(ChunkProfile::SERVER_CUDA)).unwrap();
     let lists: Vec<_> = recipe
         .slots
@@ -389,7 +392,6 @@ fn a_packed_kv_row_takes_its_stored_bytes_a_token() {
         name: "kv.0".to_string(),
         planes: vec![1024, 1024],
         dtype: Dtype::KvU4,
-        space: 0,
         window: None,
         head_dim,
         live: None,
@@ -400,7 +402,6 @@ fn a_packed_kv_row_takes_its_stored_bytes_a_token() {
         name: "kv.1".to_string(),
         planes: vec![584],
         dtype: Dtype::U8,
-        space: 0,
         window: None,
         head_dim: 512,
         live: None,

@@ -2,11 +2,9 @@ use poem_ir::{Trace, ValueId};
 
 use crate::error::{Fault, Result};
 
-pub use poem_exec::store::kv::{
-    Geometry, Paging, Reader, Seat, SpaceFacts, indptr, reads, row_of, space_of,
-};
+pub use poem_exec::store::kv::{Geometry, Paging, Reader, Seat, SpaceFacts, indptr, reads, row_of};
 
-/// A lane's table in a windowed space (`poem_exec::store::kv::window_table`).
+/// A lane's table in the window list (`poem_exec::store::kv::window_table`).
 pub fn window_table(paging: &Paging, seat: &Seat, table: &[u32], ids: &[u32]) -> Result<Vec<u32>> {
     Ok(poem_exec::store::kv::window_table(
         paging, seat, table, ids,

@@ -9,7 +9,7 @@ use eta_ir::registry::Stage;
 use eta_ir::types::{Dtype as EtaDtype, Shape};
 use poem::fact;
 use poem::{
-    Dtype, ForwardHybrid, HybridSpec, Input, ModulateForm, Platform, Trace, Weight, ops,
+    Dtype, ForwardHybrid, Input, ModulateForm, Platform, StateRows, Trace, Weight, ops,
     trace_hybrid,
 };
 use poem_ir::InputAxis;
@@ -25,11 +25,10 @@ const TEXT_ROWS: u32 = 6;
 struct TokensAndLatents;
 
 impl ForwardHybrid for TokensAndLatents {
-    fn caches(&self) -> HybridSpec {
-        let mut spec = HybridSpec::new();
-        let space = spec.kv_space(Dtype::Bf16);
+    fn states(&self) -> StateRows {
+        let mut spec = StateRows::new();
         let plane = u64::from(HEADS) * u64::from(HEAD_DIM);
-        spec.kv(space, KV_ROW, [plane, plane], HEAD_DIM);
+        spec.kv(KV_ROW, Dtype::Bf16, [plane, plane], HEAD_DIM);
         spec
     }
 

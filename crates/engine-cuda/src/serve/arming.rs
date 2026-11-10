@@ -952,7 +952,7 @@ impl Shell {
             points
         };
         let seats = self.held.len() as u32;
-        let context = if self.spaces == 0 {
+        let context = if self.page_tables == 0 {
             self.budget.max_tokens
         } else {
             self.pools.paging().context()

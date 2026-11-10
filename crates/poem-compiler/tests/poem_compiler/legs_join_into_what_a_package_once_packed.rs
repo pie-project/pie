@@ -3,7 +3,7 @@
 //! stating them packed: one product by the joined weight, its bias added
 //! once, split after; one packed gated unit.
 
-use poem::{Dtype, ForwardHybrid, HybridSpec, Input, Platform, Weight, ops, trace_hybrid};
+use poem::{Dtype, ForwardHybrid, Input, Platform, StateRows, Weight, ops, trace_hybrid};
 use poem_ir::canon;
 
 const VOCAB: u32 = 64;
@@ -52,8 +52,8 @@ fn head() -> Weight {
 }
 
 impl ForwardHybrid for Apart {
-    fn caches(&self) -> HybridSpec {
-        HybridSpec::new()
+    fn states(&self) -> StateRows {
+        StateRows::new()
     }
 
     fn forward(&self, inputs: Input) {
@@ -71,8 +71,8 @@ impl ForwardHybrid for Apart {
 }
 
 impl ForwardHybrid for Packed {
-    fn caches(&self) -> HybridSpec {
-        HybridSpec::new()
+    fn states(&self) -> StateRows {
+        StateRows::new()
     }
 
     fn forward(&self, inputs: Input) {
@@ -141,8 +141,8 @@ struct Banks {
 }
 
 impl ForwardHybrid for Banks {
-    fn caches(&self) -> HybridSpec {
-        HybridSpec::new()
+    fn states(&self) -> StateRows {
+        StateRows::new()
     }
 
     fn forward(&self, inputs: Input) {
@@ -232,8 +232,8 @@ struct Gdn {
 }
 
 impl ForwardHybrid for Gdn {
-    fn caches(&self) -> HybridSpec {
-        HybridSpec::new()
+    fn states(&self) -> StateRows {
+        StateRows::new()
     }
 
     fn forward(&self, inputs: Input) {
@@ -302,8 +302,8 @@ struct Gated {
 }
 
 impl ForwardHybrid for Gated {
-    fn caches(&self) -> HybridSpec {
-        HybridSpec::new()
+    fn states(&self) -> StateRows {
+        StateRows::new()
     }
 
     fn forward(&self, inputs: Input) {
@@ -363,8 +363,8 @@ fn legs_held_whole_join_whole() {
         head: Weight,
     }
     impl ForwardHybrid for Mlp {
-        fn caches(&self) -> HybridSpec {
-            HybridSpec::new()
+        fn states(&self) -> StateRows {
+            StateRows::new()
         }
         fn forward(&self, inputs: Input) {
             use ops::linear::{glu, matmul};
@@ -444,8 +444,8 @@ fn biased_routed_legs_join_with_their_biases() {
         head: Weight,
     }
     impl ForwardHybrid for Biased {
-        fn caches(&self) -> HybridSpec {
-            HybridSpec::new()
+        fn states(&self) -> StateRows {
+            StateRows::new()
         }
         fn forward(&self, inputs: Input) {
             use ops::linear::{glu, matmul, moe_matmul_select, moe_route, moe_weighted_sum};

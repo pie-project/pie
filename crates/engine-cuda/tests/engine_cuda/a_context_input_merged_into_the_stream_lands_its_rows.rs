@@ -4,7 +4,7 @@ use crate::common_dit::{Lcg, NAME, Rig, WIDTH, Weights, assert_close, attach, bf
 use engine::Engine;
 use poem::fact;
 use poem::{
-    Dtype, ForwardHybrid, HybridSpec, Input, ModulateForm, Platform, Trace, Value, Weight, ops,
+    Dtype, ForwardHybrid, Input, ModulateForm, Platform, StateRows, Trace, Value, Weight, ops,
     trace_hybrid,
 };
 use poem_ir::InputAxis;
@@ -14,8 +14,8 @@ const FREQ: u32 = 16;
 struct MergedBlock;
 
 impl ForwardHybrid for MergedBlock {
-    fn caches(&self) -> HybridSpec {
-        HybridSpec::new()
+    fn states(&self) -> StateRows {
+        StateRows::new()
     }
     fn forward(&self, inputs: Input) {
         inputs.recorder().declare_switch(
