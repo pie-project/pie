@@ -27,7 +27,6 @@ public final class PieServer: Sendable {
         public var deviceKvBudget: String? = nil
         public var maxForwardTokens = 512
         public var maxForwardRequests = 4
-        public var maxStateSlots = 16
         public var maxModelLength = 4096
         /// The cap on each inferlet's linear memory.
         public var sandboxMemoryMB = 256
@@ -40,7 +39,6 @@ public final class PieServer: Sendable {
             case deviceKvBudget = "device_kv_budget"
             case maxForwardTokens = "max_forward_tokens"
             case maxForwardRequests = "max_forward_requests"
-            case maxStateSlots = "max_state_slots"
             case maxModelLength = "max_model_len"
             case sandboxMemoryMB = "sandbox_memory_mb"
             case maxConcurrentProcesses = "max_concurrent_processes"

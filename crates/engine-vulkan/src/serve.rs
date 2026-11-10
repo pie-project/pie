@@ -631,7 +631,6 @@ impl Shell {
             boot.contract,
             boot.checkpoint,
             device_cap,
-            boot.residency,
             boot.budget.max_tokens,
             &streamed,
         )?;
@@ -983,7 +982,7 @@ impl Shell {
         let adapter_slots = crate::adapter::Slots::new(weights.adapter_seats());
 
         let weights_stream =
-            weights.streams() || weights.gathered().is_some() || weights.pump().is_some();
+            weights.streams() || weights.gathered().is_some();
         // A recorded fire replays no expert staging: the weight cache records
         // once every expert is resident ([`Shell::weight_residency`]). A row
         // table's misses are staged by the host before the fire, so it
@@ -3356,7 +3355,6 @@ impl Shell {
                 &self.tuning,
                 self.weights.gathered(),
                 self.weights.host(),
-                self.weights.pump(),
             )
             .with_cache(
                 &self.row_caches,

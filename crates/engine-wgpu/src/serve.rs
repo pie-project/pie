@@ -664,7 +664,6 @@ impl Shell {
             boot.contract,
             boot.checkpoint,
             device_cap,
-            boot.residency,
             boot.budget.max_tokens,
             &streamed,
         )?;
@@ -3019,7 +3018,6 @@ impl Shell {
                 },
                 self.weights.gathered(),
                 self.weights.host(),
-                self.weights.pump(),
             )
             .with_cache(
                 &self.row_caches,

@@ -496,14 +496,12 @@ pub struct ModelConfig {
     /// wider compute is a normal combination.
     #[serde(default = "default_weight_dtype")]
     pub weight_dtype: String,
-    /// How many weight bytes this load may keep on the device (tier T0),
-    /// written with its unit (`"18GiB"`). Omit for uncapped.
-    #[serde(default)]
-    pub device_weight_budget: Option<ByteSize>,
-    /// How many weight bytes this load may keep in the pinned host cache
-    /// (tier T1), written with its unit (`"64GiB"`). Omit for uncapped.
-    #[serde(default)]
-    pub host_weight_budget: Option<ByteSize>,
+    /// Removed: dense weights always live on the device.
+    #[serde(default, skip_serializing)]
+    pub device_weight_budget: Removed<removed::DeviceWeightBudget>,
+    /// Removed: dense weights always live on the device.
+    #[serde(default, skip_serializing)]
+    pub host_weight_budget: Removed<removed::HostWeightBudget>,
     /// How much congestion the system may show before this gives memory
     /// back: `dedicated` never does, then `aggressive`, `balanced`, `polite`.
     /// All but `dedicated` also give back what demand stopped asking for.
@@ -706,8 +704,6 @@ impl ModelConfig {
     #[must_use]
     pub fn residency(&self) -> engine::Residency {
         engine::Residency {
-            device_weight_budget: self.device_weight_budget.map(|b| b.as_bytes()),
-            host_weight_budget: self.host_weight_budget.map(|b| b.as_bytes()),
             deferred_tier: self.host_weight_deferred,
             device_kv_budget: self.device_kv_budget.map(|b| b.as_bytes()),
             device_memory_share: self.device_memory_share,
@@ -850,18 +846,6 @@ impl ModelConfig {
              memory contention suspended kv has to go to host memory. State a real \
              budget or omit the key for every seat at full context"
         );
-        for (key, budget) in [
-            ("device_weight_budget", self.device_weight_budget),
-            ("host_weight_budget", self.host_weight_budget),
-        ] {
-            if let Some(budget) = budget {
-                ensure!(
-                    budget.as_bytes() > 0,
-                    "model.{key} is zero, and no load can hold zero weight bytes; \
-                     state a real ceiling or omit the key for uncapped"
-                );
-            }
-        }
         self.adapters.validate()?;
         Ok(())
     }
@@ -1215,6 +1199,30 @@ device = ["metal:0"]
         the_seat_count_is_stated_once_or_derived_from_the_roster();
         an_adapter_past_its_seats_or_on_a_relative_path_is_refused_by_name();
         weight_streaming_is_auto_unless_stated();
+        a_removed_key_is_refused_with_why();
+    }
+
+    fn a_removed_key_is_refused_with_why() {
+        for key in ["device_weight_budget", "host_weight_budget"] {
+            let toml = MINIMAL_METAL.replace(
+                "source = \"Qwen/Qwen3-0.6B\"",
+                &format!("source = \"Qwen/Qwen3-0.6B\"\n{key} = \"4GiB\""),
+            );
+            let err = Config::parse(&toml).unwrap_err().to_string();
+            assert!(
+                err.contains(&format!("`{key}` was removed"))
+                    && err.contains("dense weights always live in device memory"),
+                "{key}: {err}"
+            );
+        }
+        let err = toml::from_str::<backend::CudaEngineOptions>("max_state_slots = 16\n")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("`max_state_slots` was removed"), "{err}");
+        let err = toml::from_str::<backend::VulkanEngineOptions>("max_state_slots = 16\n")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("`max_state_slots` was removed"), "{err}");
     }
 
     fn weight_streaming_is_auto_unless_stated() {

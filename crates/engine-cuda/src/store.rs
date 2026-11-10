@@ -80,6 +80,23 @@ impl Accounting {
         if self.pool >= self.minimum {
             return Ok(());
         }
+        // Dense weights always live on the device: past the share, no other
+        // knob makes room for them.
+        let room = self.ceiling.saturating_sub(self.floor);
+        if self.weights > room {
+            return Err(Fault::Residency(format!(
+                "the card does not hold this deployment's weights: they take {weights} bytes \
+                 on the device, and of its {card} bytes `[model] device_memory_share` allows \
+                 pie {ceiling}, {room} past the driver's safety floor. Dense weights always \
+                 live in device memory (only routed experts and token-id tables leave it, \
+                 through the weight cache), so serve a quantized deployment of this model, \
+                 split it across devices with tensor parallelism, or raise `[model] \
+                 device_memory_share`.",
+                weights = self.weights,
+                card = self.card,
+                ceiling = self.ceiling,
+            )));
+        }
         Err(Fault::Residency(format!(
             "the card does not hold this deployment: {card} bytes on the device, of which \
              `[model] device_memory_share` allows pie {ceiling}; this load's weight tier \
@@ -89,8 +106,7 @@ impl Accounting {
              omitted. weight tier + elastic pool + safety \
              floor must fit inside the fraction of the card, and here they do not. Lower \
              `[model] max_context` or `[model] slots`, raise `[model] \
-             device_memory_share`, or state a `[model] device_weight_budget` that streams \
-             the weight tier down.",
+             device_memory_share`, or serve a quantized deployment of the model.",
             card = self.card,
             ceiling = self.ceiling,
             weights = self.weights,
@@ -406,8 +422,9 @@ pub fn admit_the_card(
 }
 
 /// The bytes this load's weight tier puts on the device: every plane the
-/// trace declares, or the `[model] device_weight_budget` stated under it,
-/// plus what else rides along resident.
+/// trace declares, or (`stated`, nonzero) what the load's plan keeps there
+/// once the weight cache's planes leave, plus what else rides along
+/// resident.
 pub fn weight_tier_bytes(trace: &Trace, stated: u64, extra_resident: u64) -> Result<u64> {
     let full: u64 = crate::weights::plane_bytes(trace)?
         .iter()
@@ -1308,9 +1325,8 @@ impl Pools {
                     "the card does not hold this deployment: {resident}; under `[model] \
                      device_memory_share` that leaves {room} bytes for the state pool, and one \
                      working set at the declared context needs {need}. Lower `[engine] \
-                     max_model_len`, raise `[model] device_memory_share`, state a `[model] \
-                     device_weight_budget` that streams the weight tier down, or free what \
-                     else holds the device."
+                     max_model_len`, raise `[model] device_memory_share`, serve a quantized \
+                     deployment of the model, or free what else holds the device."
                 )));
             }
         };

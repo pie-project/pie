@@ -796,6 +796,8 @@ impl Shell {
                 crate::device::free_bytes().unwrap_or(0) >> 20
             );
         }
+        // Rewritten in place by the CUDA build's load-time copies.
+        #[cfg_attr(not(feature = "cuda"), allow(unused_mut))]
         let mut weights = Weights::resident(
             &boot.trace,
             boot.contract,
@@ -955,13 +957,6 @@ impl Shell {
         let staging = crate::exports::regions_staging(&boot.trace, &compiled);
         let schedule_readers = regions_launching_schedules(&boot.trace, &compiled);
         crate::voxels::relabel_conv_weights(&device, &boot.trace, weights.table())?;
-        weights.rotate(&boot.trace, &compiled)?;
-        if boot.knobs.diagnostics.arm_trace {
-            eprintln!(
-                "[arm-trace] device free {} MiB after rotate",
-                crate::device::free_bytes().unwrap_or(0) >> 20
-            );
-        }
         if boot.knobs.diagnostics.arm_trace {
             eprintln!(
                 "[arm-trace] device free {} MiB after weights",
@@ -1245,20 +1240,6 @@ impl Shell {
             rs_ahead: std::collections::HashMap::new(),
             _released: Released,
         };
-        if shell.weights.rotating() && shell.graphs.records() {
-            eprintln!(
-                "engine-cuda: engine.graphs is on but this load armed a dense rotor, \
-                 so every fire walks eagerly and nothing is recorded — a rotation's \
-                 backpressure is a host cursor and a replayed graph has no walk{}",
-                if shell.bodies {
-                    "; the bodies path's load-time arming is skipped for the same reason, \
-                     since every rung it climbed would execute its warm fires and capture \
-                     nothing"
-                } else {
-                    ""
-                }
-            );
-        }
         if !shell.graphs.records() {
             eprintln!(
                 "engine-cuda: engine.graphs is {}, a diagnostic mode — every fire \
@@ -1318,9 +1299,9 @@ impl Shell {
                 Fault::Residency(format!(
                     "the card does not hold this deployment: the decoded-weight tile stream \
                      {stream} decodes its widest plane into, {tile} bytes, would not allocate \
-                     beside the weights, activations and inputs ({why}). Lower `[model] \
-                     device_weight_budget`, raise `[model] device_memory_share`, or free what \
-                     else holds the device."
+                     beside the weights, activations and inputs ({why}). Raise `[model] \
+                     device_memory_share`, serve a quantized deployment of the model, or free \
+                     what else holds the device."
                 ))
             })?;
             decoded = decoded.saturating_add(tile);

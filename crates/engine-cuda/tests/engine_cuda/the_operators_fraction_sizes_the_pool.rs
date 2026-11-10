@@ -453,7 +453,10 @@ fn the_card_does_not_hold_a_deployment_whose_weights_leave_no_context() {
     );
     roomy.admit().expect("29.6 GB holds a 2 GiB sequence");
 
-    let tight = Accounting::of(CARD, 0.90, 42 << 30, 4 << 30);
+    // Weights that fit the share, leaving the pool 2 GiB under a 4 GiB
+    // sequence.
+    let share = (CARD as f64 * 0.90) as u64;
+    let tight = Accounting::of(CARD, 0.90, share - floor - (2 << 30), 4 << 30);
     let refusal = tight
         .admit()
         .expect_err("a pool under one slot at the declared context is not a deployment")
@@ -472,8 +475,23 @@ fn the_card_does_not_hold_a_deployment_whose_weights_leave_no_context() {
         );
     }
     assert!(
-        refusal.contains("device_memory_share") && refusal.contains("device_weight_budget"),
-        "and it names the two keys that change the answer: {refusal}"
+        refusal.contains("device_memory_share") && refusal.contains("quantized"),
+        "and it names what changes the answer: {refusal}"
+    );
+
+    // Dense weights past the share: no pool would make room for them.
+    let over = Accounting::of(CARD, 0.90, 42 << 30, 4 << 30);
+    let refusal = over
+        .admit()
+        .expect_err("weights past the share are not a deployment")
+        .to_string();
+    assert!(
+        refusal.contains(&(42u64 << 30).to_string()) && refusal.contains(&over.ceiling.to_string()),
+        "the refusal names the weights' bytes and the share's: {refusal}"
+    );
+    assert!(
+        refusal.contains("quantized") && refusal.contains("tensor parallelism"),
+        "and what a model that big needs: {refusal}"
     );
 
     let demand = 32 << 30;

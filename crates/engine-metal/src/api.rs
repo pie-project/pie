@@ -382,18 +382,17 @@ impl Engine for Metal {
         // reserves pushes the load past the device (a 12B on a 16 GB Mac),
         // the width halves until it fits: a narrower prefill fire is slower,
         // a refused load serves nothing.
+        // `device_weight_budget` is gone from the load contract: dense
+        // weights always live in device memory. Metal's own budget plumbing
+        // still takes one, now always unstated, until it is removed here.
+        let device_weight_budget: Option<u64> = None;
         let mut budgets = budgets;
         let (mut prepared, mut residency_plan) = loop {
-            let gathered = crate::gather::Plan::of(
-                &trace,
-                &planes,
-                residency.device_weight_budget,
-                budgets.max_tokens,
-            )
-            .map_err(fault)?;
-            let plan =
-                experts::Plan::beside(&trace, &planes, residency.device_weight_budget, gathered)
+            let gathered =
+                crate::gather::Plan::of(&trace, &planes, device_weight_budget, budgets.max_tokens)
                     .map_err(fault)?;
+            let plan = experts::Plan::beside(&trace, &planes, device_weight_budget, gathered)
+                .map_err(fault)?;
             let room = accounting(plan.device_demand(), 0)
                 .pool
                 .saturating_sub(kv_pool)
@@ -446,10 +445,10 @@ impl Engine for Metal {
             let narrower = (budgets.max_tokens / 2).max(MIN_FITTED_FORWARD_TOKENS);
             if narrower >= budgets.max_tokens
                 || accounting(weights, prepared.arena_bytes())
-                    .admit(residency.device_weight_budget, util)
+                    .admit(device_weight_budget, util)
                     .is_ok()
                 || accounting(weights, 0)
-                    .admit(residency.device_weight_budget, util)
+                    .admit(device_weight_budget, util)
                     .is_err()
             {
                 break (prepared, plan);
@@ -467,7 +466,7 @@ impl Engine for Metal {
 
         {
             let acct = accounting(residency_plan.device_demand(), scratch);
-            if acct.admit(residency.device_weight_budget, util).is_err() {
+            if acct.admit(device_weight_budget, util).is_err() {
                 let headroom = acct.weight_headroom();
                 let regathered =
                     crate::gather::Plan::of(&trace, &planes, Some(headroom), budgets.max_tokens);
@@ -475,7 +474,7 @@ impl Engine for Metal {
                     Ok(plan) => plan,
                     Err(_) => {
                         return Err(fault(
-                            acct.admit(residency.device_weight_budget, util)
+                            acct.admit(device_weight_budget, util)
                                 .expect_err("admit errored above"),
                         ));
                     }
@@ -495,7 +494,7 @@ impl Engine for Metal {
                     }
                     Err(_) => {
                         return Err(fault(
-                            acct.admit(residency.device_weight_budget, util)
+                            acct.admit(device_weight_budget, util)
                                 .expect_err("admit errored above"),
                         ));
                     }
@@ -503,7 +502,6 @@ impl Engine for Metal {
             }
         }
 
-        residency.admit(residency_plan.device_demand(), residency_plan.host_demand())?;
         let streams = residency_plan.streams();
 
         prepared.set_residency(residency_plan.with_weights_held(residency.weights_held));

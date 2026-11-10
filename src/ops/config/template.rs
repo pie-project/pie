@@ -76,7 +76,6 @@ source = "Qwen/Qwen3.5-0.8B"
                                        # under pressure and when demand falls
 # device_memory_share  = 0.90
 # device_kv_budget     = "20GiB"  # kv pages and state slots; refused if it does not fit
-# device_weight_budget = "18GiB"  # omit for uncapped
 # weight_streaming     = "auto"   # or on, off: MoE experts and PLE rows leave the
                                   # device under pressure before kv does
 # Suspended kv goes to the host, then the disk.
@@ -159,8 +158,6 @@ device = ["cuda:0"]
 tensor_parallel_size = 1
 activation_dtype = "bfloat16"
 # kv_page_size    = 32      # omit: the engine derives one
-# max_state_slots = 256     # recurrent-state seats (hybrid models); omit for
-#                           # what the chip profile states (256 where it states none)
 # max_model_len   = 32768   # the most tokens one sequence may hold; omit for
 #                           # the context the model's config.json declares,
 #                           # shortened where one sequence at it would take
@@ -182,7 +179,6 @@ activation_dtype = "bfloat16"
 # max_forward_requests = 512    # (max_concurrent_processes derives from this)
 # max_model_len        = 8192   # omit to keep the engine's KV-ring ceiling;
                                 # setting it only ever shrinks the ring
-# max_state_slots      = 256    # recurrent-state seats (hybrid models)
 "#;
 
 #[cfg(any(feature = "vulkan", test))]
@@ -196,7 +192,6 @@ device = ["vulkan:0"]       # vkEnumeratePhysicalDevices order; 0 is the first
 activation_dtype = "bfloat16"
 # max_forward_tokens   = 10240  # omit for the engine's own defaults
 # max_forward_requests = 512    # (max_concurrent_processes derives from this)
-# max_state_slots      = 256    # recurrent-state seats (hybrid models)
 # validation           = false  # VK_LAYER_KHRONOS_validation; diagnostic only
 # pipeline_cache       = "/path/to/pipeline.bin"  # omit for $PIE_HOME/cache/vulkan-pipelines.bin
 "#;
@@ -214,7 +209,6 @@ activation_dtype = "bfloat16"
 # power_preference     = "high-performance"  # or "low-power", "none"
 # max_forward_tokens   = 10240  # omit for the engine's own defaults
 # max_forward_requests = 512    # (max_concurrent_processes derives from this)
-# max_state_slots      = 256    # recurrent-state seats (hybrid models)
 # device_memory        = "16GiB"  # omit unless the backend reports none
 # pipeline_cache       = "/path/to/pipeline.bin"  # omit for in-process only
 "#;
@@ -230,7 +224,6 @@ activation_dtype = "bfloat16"
 # plugin               = "/path/to/libtpu.so"  # omit: PIE_XLA_PLUGIN, TPU_LIBRARY_PATH, libtpu.so
 # max_forward_tokens   = 2048   # omit for the engine's own
 # max_forward_requests = 64
-# max_state_slots      = 256    # recurrent-state seats (hybrid models)
 "#;
 
 #[cfg(any(feature = "cerebras", test))]
@@ -247,7 +240,6 @@ num_threads = 16            # host threads for the simulator and staging
 # cmaddr               = "10.0.0.1:9000"  # omit to run the fabric simulator
 # max_forward_tokens   = 64     # omit for the engine's own
 # max_forward_requests = 4
-# max_state_slots      = 4      # recurrent-state seats (hybrid models)
 "#;
 
 #[cfg(test)]

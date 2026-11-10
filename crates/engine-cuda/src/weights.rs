@@ -37,7 +37,6 @@ pub struct Weights {
     banks: BTreeMap<String, Bank>,
     experts: Option<crate::experts::Tier>,
     from_cache: bool,
-    rotor: Option<crate::rotate::Rotor>,
     decoded: Vec<Buffer>,
 }
 
@@ -1067,7 +1066,6 @@ impl Weights {
             banks: banks(trace, &places),
             experts,
             from_cache,
-            rotor: None,
             decoded,
         })
     }
@@ -1618,77 +1616,6 @@ impl Weights {
             done += 1;
         }
         Ok(done)
-    }
-
-    pub fn rotate(
-        &mut self,
-        trace: &Trace,
-        compiled: &poem_compiler::CompiledModel,
-    ) -> Result<bool> {
-        let Some(tier) = self.experts.as_ref() else {
-            return Ok(false);
-        };
-        let candidates: Vec<(usize, u64)> = tier
-            .plan()
-            .groups()
-            .iter()
-            .filter(|group| {
-                !group.routed
-                    && group.held == crate::experts::Held::Pinned
-                    && group.planes.len() == 1
-            })
-            .map(|group| (group.param, group.bytes))
-            .collect();
-        if candidates.is_empty() {
-            return Ok(false);
-        }
-        let schedule = poem_compiler::prefetch::Schedule::of(trace);
-        let rotation = match crate::rotate::Rotation::plan(
-            &schedule,
-            compiled,
-            &candidates,
-            crate::rotate::SLOT_CAP,
-            crate::rotate::ARENA_CAP,
-        ) {
-            Ok(rotation) => rotation,
-            Err(_why) => return Ok(false),
-        };
-        let mut source: Vec<*const u8> = Vec::with_capacity(rotation.tenants().len());
-        for tenant in rotation.tenants() {
-            let at = tier.serving_host_of(tenant.param).ok_or_else(|| {
-                Fault::Residency(format!(
-                    "`{}` was planned to rotate and the pinned tier seats no bytes for it",
-                    trace.params[tenant.param].name
-                ))
-            })?;
-            source.push(at);
-        }
-        let rotor = crate::rotate::Rotor::open(rotation, source)?;
-        for tenant in rotor.rotation().tenants() {
-            let Some(seat) = rotor.seat(tenant.param) else {
-                continue;
-            };
-            let param = &trace.params[tenant.param];
-            let (rows, width) = rectangle(&param.shape);
-            self.table.0[tenant.param] = Some(WeightRow::Dense(Tensor::new(
-                seat,
-                u32::try_from(rows).unwrap_or(u32::MAX),
-                u32::try_from(width).unwrap_or(u32::MAX),
-                param.dtype,
-            )));
-        }
-        self.rotor = Some(rotor);
-        Ok(true)
-    }
-
-    #[must_use]
-    pub fn rotor(&self) -> Option<&crate::rotate::Rotor> {
-        self.rotor.as_ref()
-    }
-
-    #[must_use]
-    pub fn rotating(&self) -> bool {
-        self.rotor.is_some()
     }
 
     #[must_use]

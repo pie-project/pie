@@ -26,16 +26,15 @@ impl fmt::Display for Short {
                 f,
                 "`[model] device_kv_budget` states {} MiB for the kv pages and state slots, \
                  and the device has {} MiB under `[model] device_memory_share` once the \
-                 weights and working set are down; state a smaller budget, a larger share, \
-                 or a smaller `device_weight_budget`",
+                 weights and working set are down; state a smaller budget or a larger share",
                 mib(budget),
                 mib(room),
             ),
             Short::Sequence { budget, least } => write!(
                 f,
                 "`[model] device_kv_budget` states {} MiB, and one sequence at the declared \
-                 context beside the state slots takes {} MiB; state a larger budget, a \
-                 shorter `max_model_len`, or fewer `max_state_slots`",
+                 context beside the state slots takes {} MiB; state a larger budget or a \
+                 shorter `max_model_len`",
                 mib(budget),
                 mib(least),
             ),
@@ -43,8 +42,8 @@ impl fmt::Display for Short {
                 f,
                 "the device has {} MiB for the kv pages and state slots under `[model] \
                  device_memory_share`, and one sequence at the declared context beside the \
-                 state slots takes {} MiB; raise the share, state a smaller \
-                 `device_weight_budget`, a shorter `max_model_len`, or fewer `max_state_slots`",
+                 state slots takes {} MiB; raise the share, state a shorter \
+                 `max_model_len`, or serve a quantized deployment of the model",
                 mib(room),
                 mib(least),
             ),

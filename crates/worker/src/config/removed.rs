@@ -99,7 +99,14 @@ macro_rules! removed_keys {
     };
 }
 
-removed_keys! {}
+removed_keys! {
+    DeviceWeightBudget = "device_weight_budget":
+        "dense weights always live in device memory; only routed experts and token-id tables leave it, through the weight cache. A model whose dense weights do not fit the device needs a quantized deployment or tensor parallelism";
+    HostWeightBudget = "host_weight_budget":
+        "dense weights always live in device memory; only routed experts and token-id tables leave it, through the weight cache, which sizes its host copy itself";
+    MaxStateSlots = "max_state_slots":
+        "state now shares the device budget with kv pages";
+}
 
 /// The refusal for `key` (dotted or bare) if it names a removed key.
 pub fn refusal_for(key: &str) -> Option<String> {

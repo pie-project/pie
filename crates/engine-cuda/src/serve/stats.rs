@@ -84,17 +84,6 @@ impl Shell {
     }
 
     #[must_use]
-    pub fn rotation(&self) -> Option<(crate::rotate::Observed, u32, u64, u64)> {
-        let rotor = self.weights.rotor()?;
-        Some((
-            rotor.observed(),
-            rotor.rotation().slots(),
-            rotor.rotation().arena(),
-            rotor.rotation().rotating(),
-        ))
-    }
-
-    #[must_use]
     pub fn buffer_bytes(&self) -> u64 {
         // The rs buffer's rows are the records', in the state pool.
         0

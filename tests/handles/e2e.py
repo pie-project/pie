@@ -27,6 +27,9 @@ a.add_argument("--ctx", type=int, default=0); a.add_argument("--slots", type=int
 a.add_argument("--kv-budget", default=""); a.add_argument("--log", required=True)
 a.add_argument("--only", default=""); a.add_argument("--policy", default="")
 args = a.parse_args()
+if args.slots:
+    sys.exit("--slots: max_state_slots was removed (state slots share the device budget with kv "
+             "pages); size the pool with --kv-budget")
 PROMPT = list(range(1000, 1060))
 results = []
 def check(name, cond, detail=""):
@@ -378,7 +381,6 @@ async def main():
     if args.kv_budget: t = t.replace('# device_kv_budget     = "20GiB"', f'device_kv_budget = "{args.kv_budget}"')
     if args.policy: t = t.replace('# worker_policy            = "noop"', f'worker_policy = "{args.policy}"')
     if args.ctx: t = t.replace("# max_model_len   = 32768", f"max_model_len = {args.ctx}\n#")
-    if args.slots: t = t.replace("# max_state_slots = 256", f"max_state_slots = {args.slots}\n#")
     cfg.write_text(t)
     log = open(args.log, "w")
     srv = subprocess.Popen([str(PIE), "--config", str(cfg), "serve"], stdout=log, stderr=subprocess.STDOUT,

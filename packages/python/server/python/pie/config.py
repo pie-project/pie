@@ -88,9 +88,6 @@ class ModelConfig:
     skip_parts: list[str] = field(default_factory=list)
     drafter: Optional[str] = None
     weight_dtype: Optional[str] = None
-    # Sizes with a unit ("20GiB"); omit for uncapped.
-    device_weight_budget: Optional[str] = None
-    host_weight_budget: Optional[str] = None
     # Device bytes for the kv pages and state slots ("20GiB"); omit to fill
     # what device_memory_share leaves past the weights.
     device_kv_budget: Optional[str] = None
@@ -191,8 +188,7 @@ class Config:
                 if os.path.isdir(art_dir):
                     source = repo_id
         model: dict = {"name": m.name, "source": source}
-        for name in ("weight_precision", "kv_dtype", "drafter", "weight_dtype", "device_weight_budget",
-                     "host_weight_budget", "device_kv_budget", "device_memory_share", "memory_tolerance", "weight_streaming", "host_kv_budget",
+        for name in ("weight_precision", "kv_dtype", "drafter", "weight_dtype", "device_kv_budget", "device_memory_share", "memory_tolerance", "weight_streaming", "host_kv_budget",
                      "disk_kv_budget", "disk_kv_dir", "disk_kv_persistent",
                      "max_patches", "max_images", "max_voxels", "max_clips"):
             put(model, name, getattr(m, name))

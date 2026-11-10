@@ -86,8 +86,8 @@ impl Bodies {
         self.recorder.at_step(seq);
     }
 
-    pub fn eager_walk(&mut self, rotating: bool, buffered: bool) {
-        self.recorder.eager_walk(rotating, buffered);
+    pub fn eager_walk(&mut self, hosted: bool, buffered: bool) {
+        self.recorder.eager_walk(hosted, buffered);
     }
 
     pub fn eager_copy_world(&mut self) {
@@ -104,9 +104,9 @@ impl Recorder {
         self.at_seq = seq;
     }
 
-    pub fn eager_walk(&mut self, rotating: bool, buffered: bool) {
-        if rotating {
-            self.bstats.eager_rotating += 1;
+    pub fn eager_walk(&mut self, hosted: bool, buffered: bool) {
+        if hosted {
+            self.bstats.eager_hosted += 1;
         }
         if buffered {
             self.bstats.eager_buffered += 1;
@@ -701,7 +701,7 @@ pub struct BodyTally {
     pub armed_at_load: u64,
     pub sealed_declines: u64,
     pub sealed_short: u64,
-    pub eager_rotating: u64,
+    pub eager_hosted: u64,
     pub eager_buffered: u64,
     pub eager_copy_world: u64,
 }
@@ -737,7 +737,7 @@ impl core::fmt::Display for BodyStats {
             f,
             "[body-stats] hits={} misses={} reshapes={} captures={} \
              declines={} refusals={} evictions={} armed_at_load={} \
-             sealed_declines={} sealed_short={} eager_rotating={} eager_buffered={} \
+             sealed_declines={} sealed_short={} eager_hosted={} eager_buffered={} \
              eager_copy_world={} | last-capture: nodes={} edges={} islands={} \
              | resident: bodies={} segmented={} bytes={}",
             tally.hits,
@@ -750,7 +750,7 @@ impl core::fmt::Display for BodyStats {
             tally.armed_at_load,
             tally.sealed_declines,
             tally.sealed_short,
-            tally.eager_rotating,
+            tally.eager_hosted,
             tally.eager_buffered,
             tally.eager_copy_world,
             last.nodes,

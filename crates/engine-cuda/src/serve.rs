@@ -938,11 +938,7 @@ impl Shell {
     }
 
     pub(crate) fn records_bodies(&self) -> bool {
-        self.bodies
-            && self.pad
-            && self.graphs.records()
-            && !self.weights.rotating()
-            && !self.weights.hosts_experts()
+        self.bodies && self.pad && self.graphs.records() && !self.weights.hosts_experts()
     }
 
     #[must_use]

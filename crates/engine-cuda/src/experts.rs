@@ -21,30 +21,6 @@ const CELL_PLANES: usize = 3;
 
 pub type Attachments = BTreeMap<usize, Vec<usize>>;
 
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub struct Budgets {
-    pub device: Option<u64>,
-    pub host: Option<u64>,
-}
-
-impl Budgets {
-    #[must_use]
-    pub const fn uncapped() -> Budgets {
-        Budgets {
-            device: None,
-            host: None,
-        }
-    }
-
-    #[must_use]
-    pub const fn device(bytes: u64) -> Budgets {
-        Budgets {
-            device: Some(bytes),
-            host: None,
-        }
-    }
-}
-
 #[derive(Debug)]
 pub enum Spill {
     Serving(crate::checkpoint_serving::Serving),
@@ -388,156 +364,25 @@ impl Ranking {
 }
 
 impl Plan {
-    pub fn of(trace: &Trace, planes: &Attachments, budgets: Budgets) -> Result<Plan> {
-        Plan::cut(&Ranking::of(trace, planes)?, budgets)
+    pub fn of(trace: &Trace, planes: &Attachments) -> Result<Plan> {
+        Ok(Plan::cut(&Ranking::of(trace, planes)?))
     }
 
-    pub fn cut(ranking: &Ranking, budgets: Budgets) -> Result<Plan> {
-        // The banks the weight cache takes are the pool's, not the weight
-        // tier's: no budget is charged for them.
+    /// The plan of a load: every dense plane on the device, where dense
+    /// weights always live. The routed banks the weight cache takes
+    /// ([`Ranking::caching`]) are the pool's, not the weight tier's; the
+    /// planes a weight cache streams are moved off the device after
+    /// ([`Plan::host_rows`], [`Plan::host_experts`], [`Plan::file_weights`]),
+    /// as are the planes the package declares host ([`Plan::host_declared`]).
+    #[must_use]
+    pub fn cut(ranking: &Ranking) -> Plan {
         let pooled: BTreeSet<usize> = ranking.cached.iter().map(|(param, _)| *param).collect();
         let cached_bytes: u64 = ranking.cached.iter().map(|(_, bytes)| *bytes).sum();
-        let full = ranking.full.saturating_sub(cached_bytes);
-        let Some(budget) = budgets.device else {
-            return Ok(Plan {
-                device_bytes: full,
-                pooled,
-                ..Plan::default()
-            });
-        };
-        if budget >= full {
-            return Ok(Plan {
-                device_bytes: full,
-                pooled,
-                ..Plan::default()
-            });
-        }
-
-        let found = ranking.banks.clone();
-        let experts = found.first().map_or(0, |bank| bank.experts);
-        let dense = ranking.floor_bytes;
-        let slots: u64 = found
-            .iter()
-            .map(|bank| bank.stride.next_multiple_of(crate::weights::ALIGN))
-            .sum();
-        let floor = dense + slots;
-        if budget < floor {
-            return Err(Fault::Residency(format!(
-                "`device_weight_budget` is {budget} bytes; the planes of this plan that \
-                 cannot leave the device demand {dense} resident (its registered planes, \
-                 adapter banks written at a store offset reserved at load; and any dense \
-                 routed bank the weight cache does not stream, which stays whole){}, \
-                 which is {floor} before anything else is seated. Every OTHER dense \
-                 plane in this plan can be moved to another tier, and the budget already \
-                 gave them up. Raise it to at least {floor}, or state `None`.",
-                if found.is_empty() {
-                    String::new()
-                } else {
-                    format!(
-                        ", and the {} routed banks the plan seats itself need one expert \
-                         slot each on top",
-                        found.len()
-                    )
-                },
-            )));
-        }
-
-        let mut left = budget - floor;
-        let dense_pin: u64 = found
-            .iter()
-            .map(|bank| {
-                (u64::from(bank.experts) * bank.stride).next_multiple_of(crate::weights::ALIGN)
-            })
-            .sum();
-        let mut host_left = budgets.host.map(|host| host.saturating_sub(dense_pin));
-        let mut groups: Vec<GroupPlan> = Vec::new();
-        let mut seated_groups: Vec<GroupPlan> = Vec::new();
-        let mut pinned_of: BTreeSet<usize> = BTreeSet::new();
-        let mut mapped_of: BTreeSet<usize> = BTreeSet::new();
-        let mut seated = 0u64;
-        let mut spill_bytes = 0u64;
-        for mut group in ranking.sequence.iter().cloned() {
-            if group.bytes <= left {
-                left -= group.bytes;
-                seated += group.bytes;
-                if group.routed {
-                    group.held = Held::Device;
-                    seated_groups.push(group);
-                }
-                continue;
-            }
-            let fits_host = host_left.is_none_or(|host| group.bytes <= host);
-            if fits_host {
-                host_left = host_left.map(|host| host - group.bytes);
-                group.held = Held::Pinned;
-                pinned_of.extend(group.planes.iter().map(|plane| plane.param));
-            } else {
-                group.held = Held::Mapped;
-                spill_bytes += group.bytes;
-                mapped_of.extend(group.planes.iter().map(|plane| plane.param));
-            }
-            groups.push(group);
-        }
-
-        let slack = slots + left;
-        let mut resident = 0u32;
-        for n in (1..=experts).rev() {
-            let want: u64 = found
-                .iter()
-                .map(|bank| (u64::from(n) * bank.stride).next_multiple_of(crate::weights::ALIGN))
-                .sum();
-            if want <= slack {
-                resident = n;
-                break;
-            }
-        }
-        debug_assert!(
-            found.is_empty() || resident >= 1,
-            "the floor check above proved one slot fits"
-        );
-
-        let device_bytes = dense
-            + seated
-            + found
-                .iter()
-                .map(|bank| {
-                    (u64::from(resident) * bank.stride).next_multiple_of(crate::weights::ALIGN)
-                })
-                .sum::<u64>();
-        let banks: Vec<BankPlan> = match resident < experts {
-            true => found
-                .into_iter()
-                .map(|bank| BankPlan { resident, ..bank })
-                .collect(),
-            false => Vec::new(),
-        };
-        let resident_of = banks.iter().map(|bank| (bank.param, resident)).collect();
-        let host_bytes: u64 = banks
-            .iter()
-            .map(|bank| {
-                (u64::from(bank.experts) * bank.stride).next_multiple_of(crate::weights::ALIGN)
-            })
-            .sum::<u64>()
-            + groups
-                .iter()
-                .filter(|group| group.held == Held::Pinned)
-                .map(|group| group.bytes)
-                .sum::<u64>();
-        Ok(Plan {
-            banks,
-            groups,
-            seated: seated_groups,
-            resident_of,
-            pinned_of,
-            mapped_of,
-            device_bytes,
-            host_bytes,
-            spill_bytes,
-            declared_bytes: 0,
-            cached: Vec::new(),
-            filed: BTreeSet::new(),
+        Plan {
+            device_bytes: ranking.full.saturating_sub(cached_bytes),
             pooled,
-        })
+            ..Plan::default()
+        }
     }
 
     /// Moves every plane the trace declares `ParamPlacement::Host` that this
@@ -1189,9 +1034,8 @@ impl Tier {
                      not report `pageableMemoryAccess` (CUDA 12.2+ HMM), so a GPU touch \
                      of a mapped page cannot fault it in. The T2 arm needs it: \
                      registering the mapping instead would page-lock every byte of it, \
-                     which is the pinned tier under another name and is exactly what \
-                     `host_weight_budget` said this machine does not have. Raise a \
-                     budget, or run on a device that reports the attribute.",
+                     which is the pinned tier under another name. Run on a device that \
+                     reports the attribute.",
                 plan.spill_demand(),
             )));
         }
@@ -1203,9 +1047,8 @@ impl Tier {
             let Some(artifact) = source.as_ref() else {
                 return Err(Fault::Residency(format!(
                     "`{}` is planned onto the mapped tier and this load opened no \
-                     artifact to map it out of; `Residency::admit_tiers` refuses that \
-                     before the store is reserved, so reaching here is a shell that \
-                     planned a spill it never sourced",
+                     artifact to map it out of: a shell that planned a plane off the \
+                     device it never sourced",
                     group.name,
                 )));
             };
@@ -1970,12 +1813,6 @@ mod tests {
 
     use super::*;
 
-    fn a3b() -> Trace {
-        poem_compiler::catalog::deployment("qwen35-a3b-bf16-kv-bf16")
-            .expect("the catalog ships the deployment")
-            .trace(Platform::Cuda)
-    }
-
     fn gpt_oss() -> Trace {
         poem_compiler::catalog::deployment("gptoss-20b-bf16-mxfp4-kv-bf16")
             .expect("the catalog ships the deployment")
@@ -2007,7 +1844,6 @@ mod tests {
     #[test]
     fn experts_every_case() {
         a_packed_bank_the_plan_pairs_no_scales_with_is_refused_by_name();
-        a_budget_under_the_planes_that_cannot_move_is_refused_by_name();
         a_host_declared_table_leaves_the_device_and_nothing_else_does();
     }
 
@@ -2023,7 +1859,7 @@ mod tests {
                 .unwrap_or_else(|| panic!("the trace declares `{name}`"))
         };
         let table = at("ple.table");
-        let mut plan = Plan::of(&trace, &Attachments::new(), Budgets::uncapped()).expect("plans");
+        let mut plan = Plan::of(&trace, &Attachments::new()).expect("plans");
         let full = plan.device_demand();
         let freed = plan.host_declared(&trace).expect("the table moves");
         let bytes = crate::weights::plane_bytes(&trace).expect("sized")[table]
@@ -2050,7 +1886,7 @@ mod tests {
         );
 
         let trace = gpt_oss();
-        let mut plan = Plan::of(&trace, &scales_of(&trace), Budgets::uncapped()).expect("plans");
+        let mut plan = Plan::of(&trace, &scales_of(&trace)).expect("plans");
         assert_eq!(plan.host_declared(&trace).expect("nothing to move"), 0);
         assert!(
             !plan.streams(),
@@ -2060,10 +1896,7 @@ mod tests {
 
     fn a_packed_bank_the_plan_pairs_no_scales_with_is_refused_by_name() {
         let trace = gpt_oss();
-        let full = Plan::of(&trace, &scales_of(&trace), Budgets::uncapped())
-            .expect("uncapped plans")
-            .device_demand();
-        let why = Plan::of(&trace, &Attachments::new(), Budgets::device(full / 2))
+        let why = Plan::of(&trace, &Attachments::new())
             .expect_err("a packed bank with no pairing is not a bank this shell seats");
         let said = why.to_string();
         assert!(
@@ -2073,25 +1906,6 @@ mod tests {
         assert!(
             said.contains("one group or not at all"),
             "and says what the group is for: {said}"
-        );
-    }
-
-    fn a_budget_under_the_planes_that_cannot_move_is_refused_by_name() {
-        let trace = a3b();
-        let why = Plan::of(&trace, &Attachments::new(), Budgets::device(1 << 20))
-            .expect_err("a megabyte holds nothing");
-        let said = why.to_string();
-        assert!(
-            said.contains("cannot leave the device"),
-            "the refusal names the floor: {said}"
-        );
-        assert!(
-            said.contains("can be moved to another tier"),
-            "and says why those planes and not the others: {said}"
-        );
-        assert!(
-            said.contains("Every OTHER dense plane in this plan can"),
-            "and that the rest already spilled: {said}"
         );
     }
 }

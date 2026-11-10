@@ -802,10 +802,7 @@ impl FireCtx<'_> {
             });
         }
         super::btrace::mark("run_new");
-        let records = self.graphs.records()
-            && !p.rs.buffered
-            && !self.weights.rotating()
-            && !self.weights.hosts_experts();
+        let records = self.graphs.records() && !p.rs.buffered && !self.weights.hosts_experts();
         let walked = if records {
             if self.arming && !p.bodied {
                 Ok(())
@@ -845,18 +842,10 @@ impl FireCtx<'_> {
             }
         } else {
             if self.graphs.records() {
-                self.cache.eager_walk(
-                    self.weights.rotating() || self.weights.hosts_experts(),
-                    p.rs.buffered,
-                );
+                self.cache
+                    .eager_walk(self.weights.hosts_experts(), p.rs.buffered);
             }
             let mut cursor = Cursor::new(&place);
-            if let Some(rotor) = self.weights.rotor() {
-                cursor = cursor.pumping(crate::window::Pump {
-                    rotor,
-                    compute: self.device.stream(),
-                });
-            }
             walk(
                 self.trace,
                 self.compiled,
