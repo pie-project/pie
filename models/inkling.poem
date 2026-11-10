@@ -148,11 +148,13 @@ def layout(id, deploy):
             v_conv = conv("v_conv", kv_w),
             attn_conv = weight([hidden, kw]),
             mlp_conv = weight([hidden, kw]),
-            kv = "kv.{}".format(l),
-            k_state = "conv.{}.k".format(l),
-            v_state = "conv.{}.v".format(l),
-            attn_state = "conv.{}.attn".format(l),
-            mlp_state = "conv.{}.mlp".format(l),
+            # A layer's keys and values, two planes of its kv heads a token,
+            # and the taps each short convolution keeps.
+            kv = state([tokens, 2, kv_heads, hd], deploy.kv),
+            k_state = state([kw, kv_w], dtype.bf16),
+            v_state = state([kw, kv_w], dtype.bf16),
+            attn_state = state([kw, hidden], dtype.bf16),
+            mlp_state = state([kw, hidden], dtype.bf16),
             mlp_norm = vec("mlp_norm", hidden),
             mlp = mlp,
             lora_a = lora_a,
@@ -172,7 +174,6 @@ def layout(id, deploy):
         norm_eps = d.norm_eps,
         head_scale = f32(1.0 / f32(d.mup)),
         log_scaling = (d.log_floor, d.log_alpha),
-        kv = deploy.kv,
         embed = weight([d.vocab, hidden], w),
         embed_norm = weight([hidden]),
         layers = [layer(l) for l in range(d.layers)],
@@ -234,17 +235,6 @@ def huggingface(m, reads):
 
 # The forward of Inkling: relative-biased attention, short convolutions
 # around it and the MLP, a dense or sink-routed MLP.
-
-def caches(m, c):
-    kv = c.kv_space(m.kv)
-    taps = m.conv_width
-    for w in m.layers:
-        plane = w.kv_heads * m.head_dim
-        c.kv(kv, w.kv, [plane, plane], m.head_dim, heads = True)
-        c.state(w.k_state, [taps, plane], dtype.bf16, split = 1)
-        c.state(w.v_state, [taps, plane], dtype.bf16, split = 1)
-        c.state(w.attn_state, [taps, m.hidden], dtype.bf16)
-        c.state(w.mlp_state, [taps, m.hidden], dtype.bf16)
 
 def kv_heads_of(m, reading):
     for w in m.layers:
