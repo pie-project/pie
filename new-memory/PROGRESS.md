@@ -693,3 +693,15 @@ The `new-memory/` directory is bookkeeping and is removed before anything lands 
   (4) concurrent decodes at a small budget stall instead of rotating sessions through host; (5) gemma (no recurrent
   state) refused with NoRsSlots "state pool starved ... 233 free"; (6) prefix-cache pages pushed off device are
   dropped instead of demoted to host/disk (disk journal stays empty).
+
+### M50 — 2026-11-10: Metal weight streaming, multi-window, pieces + tiers on device, ANE policy
+- `sc/bmw-metal-weights` (358c26a94..8bea0076c), all on the Mac Studio (M1 Max):
+  - PLE rows through a row table + hit counters (unified memory: misses read the table in place; held frees the
+    per-table buffers); bitwise in 5 modes on gemma mini l1/l6 and dsv4 mini.
+  - Dense bf16 routed experts through an expert table (pieces per expert as atoms); bitwise in 5 modes on minimax,
+    qwen3-30b-a3b and dsv4 minis.
+  - Up to 4 window lists, each own T_w / table / trim; bitwise on a two-window muse mini past both windows.
+  - Records in 4 pieces in real fires (seat, slot ref, evacuated) bitwise; host/disk offload probe bitwise (3 models).
+  - ANE: a load waits (<= 20 min) for its ANE programs and fails if one is refused 8 times (deterministic split).
+- Left: quantized experts / quantized embedding tables not streamed (Metal, like CUDA); warm mapped loads have no
+  separate buffer to free; runtime boot with real streamed weights untested on Metal.

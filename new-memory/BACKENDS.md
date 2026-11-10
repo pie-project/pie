@@ -11,11 +11,11 @@ Legend: ✅ verified on hardware · 🟡 in progress / compile-only · 🔴 not 
 | Real ChunkFacts, slot-ref lanes, fixed pieces | ✅ M34 | ✅ M43 (MI300X) | ✅ M30 · 🔴 dsv4 window by slot ref (BM5a) | ✅ M48 | ✅ M48 | 🟡 XLA | 🟡 M43 host pool (no HW) |
 | Grow / shrink (segments, evacuation) | ✅ M34 | — flat by spec | ✅ M30 | ✅ M48 | ✅ M48 | — fixed at load | 🟡 M43 (host segments) |
 | rs list + slot_copies | ✅ M34 | ✅ golden_buffered (MI300X) | ✅ M37 | 🟡 VK | 🟡 VK | 🟡 XLA | 🟡 M43 (host sim) |
-| Window lists (own T_w, trimmed) | 🟡 one list, T_w=page (L40S: tables per list) | ✅ goldens (one list) | 🟡 one list (BM) | 🟡 VK | 🟡 VK | 🟡 XLA | 🟡 one list, T_w=page |
-| Multi-piece records end to end | ✅ engine (L40S) · 🟡 runtime boot (IT r5) | ✅ records in pieces (chunk goldens); rows cut across pieces kernel-tested | 🔴 on device (BM) | 🟡 VK | 🟡 VK | 🟡 XLA | 🟡 host sim |
-| Weight streaming: PLE rows | ✅ M35/M36/M41 | ✅ M43 golden_rows | 🔴 BM | 🔴 VK | 🔴 VK | 🟡 XLA | — weights on host |
-| Weight streaming: experts | 🟡 dense bf16 M40; quantized next | ✅ dense M47; quantized after CUDA | 🔴 BM | 🔴 VK | 🔴 VK | 🟡 XLA | — weights on host |
-| Host/disk tiers of shared shapes (copy_slots) | ✅ engine probe M43 · 🟡 e2e | ✅ golden_offload 8/8 (MI300X) | 🟡 M43 compile (BM) | 🔴 VK | 🔴 VK | 🔴 XLA | 🟡 CB (host sim) |
+| Window lists (own T_w, trimmed) | 🟡 one list, T_w=page (L40S: tables per list) | ✅ goldens (one list) | ✅ up to 4 lists M50 | 🟡 VK | 🟡 VK | 🟡 XLA | 🟡 one list, T_w=page |
+| Multi-piece records end to end | ✅ engine (L40S) · 🟡 runtime boot (IT r5) | ✅ records in pieces (chunk goldens); rows cut across pieces kernel-tested | ✅ M50 | 🟡 VK | 🟡 VK | 🟡 XLA | 🟡 host sim |
+| Weight streaming: PLE rows | ✅ M35/M36/M41 | ✅ M43 golden_rows | ✅ M50 | 🔴 VK | 🔴 VK | 🟡 XLA | — weights on host |
+| Weight streaming: experts | 🟡 dense bf16 M40; quantized next | ✅ dense M47; quantized after CUDA | ✅ dense M50; quantized next | 🔴 VK | 🔴 VK | 🟡 XLA | — weights on host |
+| Host/disk tiers of shared shapes (copy_slots) | ✅ engine probe M43 · 🟡 e2e | ✅ golden_offload 8/8 (MI300X) | ✅ M50 offload probe | 🔴 VK | 🔴 VK | 🔴 XLA | 🟡 CB (host sim) |
 | K2 (no kv spaces) | ✅ M39 | ✅ | ✅ M42 | compile | compile | compile | compile |
 
 Cerebras realization (CB, `sc/cb-chunk-pool`): the column is the host-traced `Cerebras` engine. State lives in
