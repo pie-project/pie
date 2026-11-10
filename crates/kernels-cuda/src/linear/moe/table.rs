@@ -111,17 +111,32 @@ pub struct RowTable {
     pub table: u64,
     /// Rows a block; any nonzero value under a null table.
     pub block_rows: u32,
+    /// A u32 counter a block of the rows a gather reads, or 0: the weight
+    /// cache's use record.
+    pub hits: u64,
 }
 
 impl RowTable {
     pub const RESIDENT: RowTable = RowTable {
         table: 0,
         block_rows: 1,
+        hits: 0,
     };
 
     #[must_use]
     pub const fn located(table: u64, block_rows: u32) -> RowTable {
-        RowTable { table, block_rows }
+        RowTable {
+            table,
+            block_rows,
+            hits: 0,
+        }
+    }
+
+    /// The table counting each block's reads in `hits`.
+    #[must_use]
+    pub const fn counting(mut self, hits: u64) -> RowTable {
+        self.hits = hits;
+        self
     }
 }
 

@@ -179,6 +179,77 @@ pub struct Layout {
     pub window: Option<SlotShape>,
     pub fixed: Option<FixedShape>,
     pub rs: Option<RsShape>,
+    /// The tables the weight cache streams by their rows, a shape each.
+    pub rows: Vec<RowsShape>,
+}
+
+/// The first weight shape's id; the shapes after it follow.
+pub const WEIGHTS: u32 = 4;
+
+/// A table a token-id gather reads, streamed by its rows: a slot holds a
+/// block of `block_rows` rows of `row_bytes`, of the table's `rows`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RowsShape {
+    pub id: ShapeId,
+    /// The trace's param the table is.
+    pub param: u32,
+    pub slot_bytes: u64,
+    pub per_chunk: u32,
+    pub block_rows: u32,
+    pub row_bytes: u64,
+    /// The table's rows.
+    pub rows: u64,
+    /// The blocks the table makes: its atoms.
+    pub blocks: u32,
+    /// The blocks one fire may read: what the cache never drops below.
+    pub floor: u32,
+}
+
+/// The tables of `trace` this engine streams by their rows: read only by the
+/// plain embedding gather (the one whose kernel reads a row table), a bf16
+/// plane of its own with no companion, out of the checkpoint.
+#[must_use]
+pub fn streamed_rows(trace: &poem_ir::Trace) -> Vec<usize> {
+    use poem_ir::residency::{Residency, residency};
+    use poem_ir::{Def, Gather, Operands, Operation};
+    let classes = residency(trace);
+    let mut out = Vec::new();
+    let mut inputs = Vec::new();
+    'params: for (at, param) in trace.params.iter().enumerate() {
+        if !matches!(classes[at], Residency::Rows(_))
+            || param.dtype != poem_ir::Dtype::Bf16
+            || param.shape.len() != 2
+            || param.source != poem_ir::ParamSource::Checkpoint
+        {
+            continue;
+        }
+        let mut read = false;
+        for node in &trace.nodes {
+            inputs.clear();
+            node.op.inputs(&mut inputs);
+            let reads = inputs.iter().any(|v| {
+                matches!(trace.values.get(v.0 as usize).map(|d| &d.def),
+                    Some(Def::Weight(w)) if *w as usize == at)
+            });
+            if !reads {
+                continue;
+            }
+            match &node.op {
+                Operation::Gather(Gather::Embed {
+                    weights: None,
+                    scales: None,
+                    concat: false,
+                    vocab,
+                    ..
+                }) if u64::from(*vocab) == param.shape[0] => read = true,
+                _ => continue 'params,
+            }
+        }
+        if read {
+            out.push(at);
+        }
+    }
+    out
 }
 
 /// The rs list: a slot holds `slot.tokens` buffered rows of every recurrent
@@ -322,7 +393,7 @@ impl Layout {
     /// The recipe's token shapes. This engine pages every windowed row by one
     /// table, so a recipe with two window lists is refused, and by its kv
     /// page, so a window list of another page size is.
-    pub fn of(recipe: &ChunkRecipe) -> Result<Layout> {
+    pub fn of(recipe: &ChunkRecipe, streamed: &[usize]) -> Result<Layout> {
         let chunk_bytes = recipe.chunk_bytes;
         let list = recipe
             .list()
@@ -372,6 +443,34 @@ impl Layout {
             })
             .transpose()?;
         let (_, segment_chunks) = recipe.profile.segment(chunk_bytes);
+        let mut rows = Vec::new();
+        for &param in streamed {
+            let slot = recipe.weights.iter().find(|slot| {
+                slot.kind == poem_compiler::chunk::WeightKind::Rows
+                    && slot.pieces == 1
+                    && matches!(slot.banks.as_slice(), [bank] if bank.params == [param as u32])
+            });
+            // A table the recipe lays with others is served from its host
+            // copy, no row of it cached.
+            let Some(slot) = slot else { continue };
+            let per_chunk = u32::try_from(chunk_bytes / slot.bytes.max(1)).unwrap_or(u32::MAX);
+            let block_rows = u32::try_from(slot.atoms_per_slot)
+                .unwrap_or(u32::MAX)
+                .max(1);
+            let table_rows = slot.banks[0].atoms;
+            rows.push(RowsShape {
+                id: ShapeId(WEIGHTS + rows.len() as u32),
+                param: param as u32,
+                slot_bytes: slot.bytes,
+                per_chunk: per_chunk.max(1),
+                block_rows,
+                row_bytes: slot.atom_bytes,
+                rows: table_rows,
+                blocks: u32::try_from(table_rows.div_ceil(u64::from(block_rows)))
+                    .unwrap_or(u32::MAX),
+                floor: u32::try_from(slot.floor).unwrap_or(u32::MAX),
+            });
+        }
         Ok(Layout {
             chunk_bytes,
             segment_chunks: u32::try_from(segment_chunks).unwrap_or(u32::MAX).max(1),
@@ -379,6 +478,7 @@ impl Layout {
             window,
             fixed,
             rs,
+            rows,
         })
     }
 

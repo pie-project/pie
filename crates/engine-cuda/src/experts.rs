@@ -512,6 +512,45 @@ impl Plan {
         Ok(freed)
     }
 
+    /// Moves the planes `params` (the tables the weight cache streams by
+    /// their rows) to the pinned host tier, each served through its mapped
+    /// device address: the copy a row not in the cache is read from, and
+    /// the source a row promoted into it is filled from. Returns the device
+    /// bytes it freed.
+    pub fn host_rows(&mut self, trace: &Trace, params: &[usize]) -> Result<u64> {
+        let bytes = crate::weights::plane_bytes(trace)?;
+        let mut freed = 0u64;
+        for &at in params {
+            let param = &trace.params[at];
+            if param.source != ParamSource::Checkpoint
+                || self.streamed_whole(at)
+                || self.resident_of.contains_key(&at)
+            {
+                continue;
+            }
+            let reserved = bytes[at].next_multiple_of(crate::weights::ALIGN);
+            self.groups.push(GroupPlan {
+                param: at,
+                name: param.name.clone(),
+                planes: vec![GroupPlane {
+                    param: at,
+                    bytes: bytes[at],
+                    reserved,
+                }],
+                experts: 0,
+                routed: false,
+                bytes: reserved,
+                held: Held::Pinned,
+            });
+            self.pinned_of.insert(at);
+            self.device_bytes = self.device_bytes.saturating_sub(reserved);
+            self.host_bytes += reserved;
+            self.declared_bytes += reserved;
+            freed += reserved;
+        }
+        Ok(freed)
+    }
+
     #[must_use]
     pub fn streams(&self) -> bool {
         !self.banks.is_empty() || !self.groups.is_empty()

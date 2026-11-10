@@ -141,6 +141,9 @@ pub struct FireTables {
     pub mask_indptr: Option<Tensor>,
 
     pub pool_state: Vec<(u32, PoolSlabs)>,
+
+    /// The row table of each table streamed by its rows, by its param.
+    pub row_tables: Vec<(u32, kernels_cuda::linear::moe::RowTable)>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1940,6 +1943,24 @@ impl<'c> Run<'c> {
             data: self.tensor(id),
             indptr,
         }
+    }
+
+    /// The row table weight `id`'s gather reads its rows through: the
+    /// weight cache's where the table streams by its rows, else none (the
+    /// contiguous table).
+    pub(crate) fn row_table(&self, id: ValueId) -> kernels_cuda::linear::moe::RowTable {
+        let Def::Weight(w) = &self.values[id.0 as usize].def else {
+            return kernels_cuda::linear::moe::RowTable::RESIDENT;
+        };
+        self.fire
+            .tables
+            .row_tables
+            .iter()
+            .find(|(param, _)| param == w)
+            .map_or(
+                kernels_cuda::linear::moe::RowTable::RESIDENT,
+                |(_, rows)| *rows,
+            )
     }
 
     pub(crate) fn maybe_planes(

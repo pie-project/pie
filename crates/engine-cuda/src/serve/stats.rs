@@ -181,6 +181,26 @@ impl Shell {
         self.pools.name_record(pieces)
     }
 
+    /// See `Engine::weight_residency`: stream-ordered before the next fire.
+    pub fn weight_residency(
+        &mut self,
+        residency: &engine::chunk::WeightResidency,
+    ) -> crate::Result<()> {
+        self.pools.weight_residency(self.device.stream(), residency)
+    }
+
+    /// The row-streamed tables' blocks named a slot, and all of them: the
+    /// rest a fire reads from the host copy.
+    #[must_use]
+    pub fn row_blocks(&self) -> (u64, u64) {
+        self.pools.row_blocks()
+    }
+
+    /// See `Engine::weight_uses`.
+    pub fn weight_uses(&mut self) -> crate::Result<engine::chunk::WeightUses> {
+        self.pools.weight_uses(self.device.stream())
+    }
+
     /// From here on lanes name their slots by slot ref.
     pub fn take_refs(&mut self) {
         self.pools.take_refs();

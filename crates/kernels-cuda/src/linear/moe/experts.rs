@@ -1,9 +1,9 @@
 //! Host-only: the fused expert MLP, a gate-up select then a down select over
 //! the banks `select` and its forms read.
 
+use super::table::Planes;
 #[cfg(feature = "cuda")]
 use super::*;
-use super::table::Planes;
 use crate::error::Error;
 #[cfg(feature = "cuda")]
 use crate::jit::Ctx;
