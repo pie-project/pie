@@ -362,7 +362,10 @@ impl Gmm {
                 vec![steps],
                 vec![steps],
             ],
-            ins: [Some(xs), Some(bank), weights].into_iter().flatten().collect(),
+            ins: [Some(xs), Some(bank), weights]
+                .into_iter()
+                .flatten()
+                .collect(),
             outs: vec![out],
             vmem_limit: Some(limit as u64),
             scratch: vec![
@@ -1042,13 +1045,7 @@ impl Gmm {
 
 /// `act(g) · u` over f32 `dims` vectors, as `linear::mlp`'s GLUs take it:
 /// SwiGLU `g · σ(g) · u`, GeGLU `0.5 g (1 + tanh(√(2/π) (g + 0.044715 g³))) u`.
-fn glu_of(
-    b: &mut Body,
-    act: crate::linear::moe::ExpertGlu,
-    g: V,
-    u: V,
-    dims: &[i64],
-) -> Built<V> {
+fn glu_of(b: &mut Body, act: crate::linear::moe::ExpertGlu, g: V, u: V, dims: &[i64]) -> Built<V> {
     let k = |b: &mut Body, x: f64| b.splat_f(dims, Elem::F32, x);
     let a = match act {
         crate::linear::moe::ExpertGlu::Swiglu => {
