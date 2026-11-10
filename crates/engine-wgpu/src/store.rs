@@ -1,20 +1,15 @@
+//! The load's held state in one chunk pool ([`pool::Pool`]): every cache
+//! row placed in the slot shapes of [`layout`], the slot refs the runtime
+//! hands out translated to the physical slots kernels address, and the
+//! copies, spills and evacuations that move slots.
 pub mod kv;
+pub mod layout;
+pub mod pool;
 
-use engine::transfer::KvRun;
-use kernels_slang::{KvPool, Tensor};
-
-/// A layer's recurrent cache: the state bank, each row's slot in it, and the
-/// convolution window before and after the step.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-pub struct RecurrentPool {
-    pub state: Tensor,
-
-    pub slots: Tensor,
-
-    pub conv_state: Tensor,
-
-    pub new_conv_state: Tensor,
-}
+use engine::chunk::{ChunkFacts, Evacuation, ShapeId, SlotCopy};
+use engine::transfer::{KvRun, MemoryDomain};
+use kernels_slang::{KvPool, Segments, Tensor};
+use poem_compiler::chunk::{ChunkRecipe, RowId, SlotLayout};
 use poem_ir::{CacheRow, Dtype, Trace};
 
 use crate::device::ctx::Frame;
@@ -22,6 +17,24 @@ use crate::device::{Buffer, Context, Handles, Memory};
 use crate::error::{Fault, Result};
 use crate::run::{CachePool, CacheTable};
 use crate::store::kv::{Facts, Paging};
+use crate::store::layout::{FIXED, LIST, Layout, RS, Slots, gcd};
+use crate::store::pool::Pool;
+
+/// A layer's recurrent cache as kernels bind it: `state` carries the row's
+/// geometry, `slots` each row's record unit, and the row lies in the pool's
+/// segments at word `origin + unit * slot_stride`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct RecurrentPool {
+    pub state: Tensor,
+
+    pub slots: Tensor,
+
+    pub pool: Segments,
+
+    pub origin: u32,
+
+    pub slot_stride: u32,
+}
 
 impl From<poem_exec::store::Fault> for Fault {
     fn from(fault: poem_exec::store::Fault) -> Fault {
@@ -54,27 +67,6 @@ fn state_dtype(declared: Dtype) -> Dtype {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Shape {
-    Kv {
-        head_dim: u32,
-        kv_heads: u32,
-        dtype: Dtype,
-
-        plane_bytes: u64,
-
-        values_at: u64,
-
-        values_width: u64,
-        values_bytes: u64,
-    },
-
-    State {
-        stride: u64,
-        dtype: Dtype,
-    },
-}
-
 #[derive(Debug, Clone, Copy)]
 pub struct TableSeat {
     pub page_indptr: Tensor,
@@ -101,34 +93,99 @@ pub struct Seats {
     pub slot_of_row: Tensor,
 }
 
-#[derive(Debug)]
-pub struct Pools {
-    slabs: Vec<Buffer>,
-    shapes: Vec<Shape>,
-    paging: Paging,
-    /// The kv pages the slabs hold, up to what `paging` declares: a slab
-    /// cannot give memory back, so a smaller pool is smaller slabs.
-    pages: u64,
-
-    watermark: engine::frame::Demand,
-
-    disk: Option<Spill>,
-    /// No host tier here, so parked rs rows go to disk too.
-    parked: Option<Spill>,
-    parked_pages: Option<Spill>,
+/// One cache row's place in a slot.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Row {
+    /// A kv row: its key run and value run in a list slot (one run when the
+    /// trace shares one plane), `page_size` tokens of `*_cell` bytes each.
+    Kv {
+        head_dim: u32,
+        kv_heads: u32,
+        dtype: Dtype,
+        keys: u64,
+        values: u64,
+        values_width: u64,
+        keys_cell: u64,
+        values_cell: u64,
+    },
+    /// A state row: `stride` elements at `offset` in the record's slot.
+    State {
+        stride: u64,
+        dtype: Dtype,
+        offset: u64,
+    },
 }
 
-impl Pools {
-    pub fn reserve(
-        device: &Context,
-        trace: &Trace,
-        paging: Paging,
-        facts: &Facts,
-    ) -> Result<Pools> {
-        let mut slabs = Vec::with_capacity(trace.caches.len());
-        let mut shapes = Vec::with_capacity(trace.caches.len());
+/// The rs list's slot as this shell reads it: `tokens` rows of each rs
+/// plane, each of the shell's planes at `plane_at` in the slot.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RsRows {
+    pub tokens: u32,
+    pub bytes: u64,
+    pub plane_at: Vec<u64>,
+}
 
+/// How a load's rows lay into the recipe's slots, before any pool.
+#[derive(Debug, Clone)]
+pub struct Rows {
+    rows: Vec<Row>,
+    pub chunk_bytes: u64,
+    pub list_bytes: u64,
+    /// The list slot's tokens: the kv page size.
+    pub tokens: u32,
+    pub fixed_bytes: u64,
+    pub pieces: u32,
+    pub rs: Option<RsRows>,
+    pub kv_rows: Vec<u32>,
+    pub state_rows: Vec<u32>,
+}
+
+fn disagree(what: String) -> Fault {
+    Fault::Unbound {
+        what: format!("the wgpu chunk recipe, which {what}"),
+    }
+}
+
+impl Rows {
+    /// Lays `trace`'s rows where `recipe` (the compiler's wgpu chunk
+    /// recipe, the one layout source) puts them; `facts` restates kv rows'
+    /// heads, `rs` is the shell's rs buffer. Refuses where the recipe lays a
+    /// row otherwise than this shell stores it.
+    pub fn plan(
+        trace: &Trace,
+        recipe: &ChunkRecipe,
+        facts: &Facts,
+        rs: Option<&crate::rs::Layout>,
+    ) -> Result<Rows> {
+        if recipe.windows().next().is_some() {
+            return Err(disagree(format!(
+                "keeps a window list ({}), where this shell pages windowed rows in full",
+                recipe.shapes()
+            )));
+        }
+        let (tokens, list_bytes, runs) = match recipe.list() {
+            Some(SlotLayout::List {
+                tokens,
+                bytes,
+                rows,
+                ..
+            }) => (*tokens, *bytes, rows.as_slice()),
+            _ => (0, 0, &[][..]),
+        };
+        let (fixed_bytes, pieces, fixed_runs) = match recipe.fixed() {
+            Some(SlotLayout::Fixed {
+                bytes,
+                pieces_per_ws,
+                rows,
+                ..
+            }) => (*bytes, *pieces_per_ws, rows.as_slice()),
+            _ => (0, 0, &[][..]),
+        };
+        let mut rows = Vec::with_capacity(trace.caches.len());
+        let mut kv_rows = Vec::new();
+        let mut state_rows = Vec::new();
         for (index, row) in trace.caches.iter().enumerate() {
+            let id = RowId::Cache(u32::try_from(index).unwrap_or(u32::MAX));
             match row {
                 CacheRow::Kv {
                     name,
@@ -138,49 +195,65 @@ impl Pools {
                 } => {
                     let planes = split(name, planes)?;
                     let width = planes.keys;
-
                     let restated = facts
                         .rows
                         .get(index)
                         .copied()
                         .flatten()
                         .filter(|seat| seat.kv_heads != 0);
-                    if let Some(seat) = restated {
-                        let heads = u64::from(seat.kv_heads) * u64::from(seat.head_dim);
-                        if heads != width {
-                            return Err(Fault::Unbound {
-                                what: format!(
-                                    "cache `{name}`, whose row is {width} wide while its \
-                                     consumers state {} heads of {}",
-                                    seat.kv_heads, seat.head_dim
-                                ),
-                            });
-                        }
+                    if let Some(seat) = restated
+                        && u64::from(seat.kv_heads) * u64::from(seat.head_dim) != width
+                    {
+                        return Err(Fault::Unbound {
+                            what: format!(
+                                "cache `{name}`, whose row is {width} wide while its \
+                                 consumers state {} heads of {}",
+                                seat.kv_heads, seat.head_dim
+                            ),
+                        });
                     }
-
                     let head_dim = restated.map_or(width, |seat| u64::from(seat.head_dim));
                     let kv_heads = restated.map_or(1, |seat| u64::from(seat.kv_heads));
                     let element = elem_bytes(name, *dtype)?;
-                    let cells = paging.pages() * u64::from(paging.page_size);
-                    let plane = cells * width * element;
-                    let values_bytes = cells * planes.values * element;
                     let own_values = !planes.shared && planes.values != 0;
-                    slabs.push(Buffer::zeroed(
-                        device,
-                        plane + if own_values { values_bytes } else { 0 },
-                    )?);
-                    shapes.push(Shape::Kv {
+                    let keys_cell = width * element;
+                    let values_cell = planes.values * element;
+                    let per_token = keys_cell + if own_values { values_cell } else { 0 };
+                    let run = runs
+                        .iter()
+                        .find(|run| run.row == id)
+                        .ok_or_else(|| disagree(format!("lays kv row `{name}` in no list slot")))?;
+                    if run.per_token != per_token {
+                        return Err(disagree(format!(
+                            "lays kv row `{name}` at {} bytes a token, where this shell \
+                             stores {per_token}",
+                            run.per_token
+                        )));
+                    }
+                    let keys = run.offset;
+                    let values = if own_values {
+                        keys + u64::from(tokens) * keys_cell
+                    } else {
+                        keys
+                    };
+                    if keys % 4 != 0 || values % 4 != 0 {
+                        return Err(disagree(format!(
+                            "lays kv row `{name}` at byte {keys}, inside a word"
+                        )));
+                    }
+                    kv_rows.push(u32::try_from(index).unwrap_or(u32::MAX));
+                    rows.push(Row::Kv {
                         head_dim: u32::try_from(head_dim).unwrap_or(u32::MAX),
                         kv_heads: u32::try_from(kv_heads).unwrap_or(u32::MAX),
                         dtype: *dtype,
-                        plane_bytes: plane,
-                        values_at: if own_values { plane } else { 0 },
+                        keys,
+                        values,
                         values_width: planes.values,
-
-                        values_bytes: if planes.values == 0 {
-                            plane
+                        keys_cell,
+                        values_cell: if planes.values == 0 {
+                            keys_cell
                         } else {
-                            values_bytes
+                            values_cell
                         },
                     });
                 }
@@ -189,52 +262,358 @@ impl Pools {
                 } => {
                     let stride: u64 = slab.iter().product();
                     let dtype = state_dtype(*dtype);
-                    let bytes = stride * u64::from(paging.slots) * elem_bytes(name, dtype)?;
-                    slabs.push(Buffer::zeroed(device, bytes)?);
-                    shapes.push(Shape::State { stride, dtype });
+                    let bytes = stride * elem_bytes(name, dtype)?;
+                    let run = fixed_runs.iter().find(|run| run.row == id).ok_or_else(|| {
+                        disagree(format!("lays state row `{name}` in no fixed slot"))
+                    })?;
+                    if run.pieces > 1 {
+                        return Err(disagree(format!(
+                            "cuts state row `{name}` into {} pieces, and this shell's state \
+                             kernels read a record of one piece",
+                            run.pieces
+                        )));
+                    }
+                    let atom = recipe.atoms.get(&id).ok_or_else(|| {
+                        disagree(format!("states no atoms of state row `{name}`"))
+                    })?;
+                    if atom.bytes * atom.extent != bytes {
+                        return Err(disagree(format!(
+                            "sizes state row `{name}` at {} bytes, where this shell stores \
+                             {bytes} ({dtype:?})",
+                            atom.bytes * atom.extent
+                        )));
+                    }
+                    if run.offset % 4 != 0 {
+                        return Err(disagree(format!(
+                            "lays state row `{name}` at byte {}, inside a word",
+                            run.offset
+                        )));
+                    }
+                    state_rows.push(u32::try_from(index).unwrap_or(u32::MAX));
+                    rows.push(Row::State {
+                        stride,
+                        dtype,
+                        offset: run.offset,
+                    });
                 }
             }
-            debug_assert_eq!(slabs.len(), index + 1, "one allocation per cache row");
         }
+        if rows.iter().any(|row| matches!(row, Row::State { .. })) && pieces > 1 {
+            return Err(disagree(format!(
+                "cuts a record into {pieces} pieces, and this shell's state kernels read a \
+                 record of one piece"
+            )));
+        }
+        let rs = match rs {
+            None => None,
+            Some(layout) => Some(rs_rows(recipe, layout)?),
+        };
+        Ok(Rows {
+            rows,
+            chunk_bytes: recipe.chunk_bytes,
+            list_bytes,
+            tokens,
+            fixed_bytes,
+            pieces: pieces.max(1),
+            rs,
+            kv_rows,
+            state_rows,
+        })
+    }
+}
+
+/// The rs planes' places in an rs-list slot, read off the recipe's
+/// `RsLayout`: the shell's planes matched by the values they buffer.
+fn rs_rows(recipe: &ChunkRecipe, layout: &crate::rs::Layout) -> Result<RsRows> {
+    let rs = &recipe.rs;
+    if rs.is_empty() {
+        return Err(disagree(
+            "states no rs list, where this shell buffers rs rows".to_string(),
+        ));
+    }
+    let tokens = u64::from(rs.tokens);
+    let mut plane_at: Vec<Option<u64>> = vec![None; layout.planes.len()];
+    for (id, row) in &rs.rows {
+        let run = rs
+            .run(*id)
+            .ok_or_else(|| disagree(format!("lays no run for rs row {id:?}")))?;
+        for (at, plane) in row.planes.iter().enumerate() {
+            let Some(&mine) = layout.in_of.get(&plane.value.0) else {
+                return Err(disagree(format!(
+                    "buffers value {} in rs row {id:?}, which this shell does not buffer",
+                    plane.value.0
+                )));
+            };
+            if layout.planes[mine].row_bytes != plane.bytes {
+                return Err(disagree(format!(
+                    "buffers value {} at {} bytes a token, where this shell stores {}",
+                    plane.value.0, plane.bytes, layout.planes[mine].row_bytes
+                )));
+            }
+            let offset = run.offset + row.plane_at(at, tokens);
+            match plane_at[mine] {
+                Some(held) if held != offset => {
+                    return Err(disagree(format!(
+                        "lays this shell's rs plane of value {} at two places",
+                        plane.value.0
+                    )));
+                }
+                _ => plane_at[mine] = Some(offset),
+            }
+        }
+    }
+    let plane_at = plane_at
+        .into_iter()
+        .enumerate()
+        .map(|(at, offset)| {
+            offset.ok_or_else(|| {
+                let plane = &layout.planes[at];
+                disagree(format!(
+                    "keeps no rs row for the {:?} plane of cache row {} this shell buffers",
+                    plane.role, plane.cache
+                ))
+            })
+        })
+        .collect::<Result<Vec<_>>>()?;
+    Ok(RsRows {
+        tokens: rs.tokens,
+        bytes: rs.bytes,
+        plane_at,
+    })
+}
+
+#[derive(Debug)]
+pub struct Pools {
+    paging: Paging,
+    rows: Vec<Row>,
+    pool: Pool,
+    layout: Layout,
+    shape_rows: [Vec<u32>; 2],
+    rs: Option<RsRows>,
+    /// Host chunks laid out like the device's, one id space beside them:
+    /// host memory, the device side read and written through the queue.
+    host: Vec<u8>,
+    host_chunks: u32,
+    disk: Option<Spill>,
+    watermark: engine::frame::Demand,
+}
+
+impl Pools {
+    /// The pool `layout` sizes over `rows`, kv pages of `paging`'s size,
+    /// and `host_chunks` host chunks beside it; nothing committed yet.
+    pub fn reserve(
+        device: &Context,
+        rows: Rows,
+        layout: Layout,
+        paging: Paging,
+        host_chunks: u32,
+    ) -> Result<Pools> {
+        let pool = Pool::reserve(
+            layout.chunk_bytes,
+            layout.total_chunks,
+            layout.segment_chunks,
+        )?;
+        let list_slots = layout.list.map_or(0, |list| {
+            u64::from(list.per_chunk) * u64::from(layout.total_chunks)
+        });
+        let _ = device;
+        let host =
+            vec![0u8; usize::try_from(u64::from(host_chunks) * layout.chunk_bytes).unwrap_or(0)];
         Ok(Pools {
-            slabs,
-            shapes,
-            pages: paging.pages(),
-            paging,
-            watermark: engine::frame::Demand::ZERO,
+            paging: Paging {
+                pages: list_slots.max(1),
+                ..paging
+            },
+            shape_rows: [rows.kv_rows.clone(), rows.state_rows.clone()],
+            rs: rows.rs,
+            rows: rows.rows,
+            pool,
+            layout,
+            host,
+            host_chunks,
             disk: None,
-            parked: None,
-            parked_pages: None,
+            watermark: engine::frame::Demand::ZERO,
         })
     }
 
     #[must_use]
+    pub fn layout(&self) -> &Layout {
+        &self.layout
+    }
+
+    /// The pool as the runtime counts it.
+    #[must_use]
+    pub fn chunk_facts(&self) -> ChunkFacts {
+        self.layout.facts(
+            self.pool.growth(),
+            self.pool.committed_segments(),
+            &self.shape_rows,
+            [self.host_chunks, self.disk_pages()],
+        )
+    }
+
+    fn shape(&self, id: ShapeId) -> Result<&Slots> {
+        self.layout.shape(id).ok_or_else(|| Fault::Unbound {
+            what: format!("slot shape {id}, which this pool does not hold"),
+        })
+    }
+
+    /// The physical chunk and index slot ref `slot` of `shape` sits at.
+    fn place(&self, shape: &Slots, slot: u32) -> Result<(u32, u32)> {
+        let (chunk, index) = shape.split(slot);
+        if chunk == 0 || chunk >= self.layout.total_chunks {
+            return Err(Fault::Ceiling {
+                what: "chunks a slot ref may name (past the null chunk)",
+                need: u64::from(chunk) + 1,
+                have: u64::from(self.layout.total_chunks),
+            });
+        }
+        Ok((self.pool.physical(chunk)?, index))
+    }
+
+    /// The virtual byte slot ref `slot` of shape `id` starts at, its chunk
+    /// committed.
+    fn slot_offset(&self, id: ShapeId, slot: u32) -> Result<u64> {
+        let shape = *self.shape(id)?;
+        let (chunk, index) = self.place(&shape, slot)?;
+        self.pool.admit(chunk)?;
+        Ok(u64::from(chunk) * self.layout.chunk_bytes + u64::from(index) * shape.slot_bytes)
+    }
+
+    /// What one id of shape `id` counts as kernels address it: the slot
+    /// where a chunk holds whole slots, else `gcd(chunk, slot)` bytes.
+    fn unit(&self, id: ShapeId) -> Result<u64> {
+        Ok(gcd(self.layout.chunk_bytes, self.shape(id)?.slot_bytes))
+    }
+
+    /// Slot ref `slot` of shape `id` in units of [`Pools::unit`].
+    fn units(&self, id: ShapeId, slot: u32) -> Result<u32> {
+        let at = self.slot_offset(id, slot)?;
+        u32::try_from(at / self.unit(id)?).map_err(|_| Fault::Ceiling {
+            what: "slot units a kernel indexes",
+            need: at,
+            have: u64::from(u32::MAX),
+        })
+    }
+
+    /// A lane's kv pages as kernels address them: `refs` (slot refs of the
+    /// list shape) as physical pages, or, seat-addressed, seat `seat`'s
+    /// `pages` pages.
+    pub fn kv_pages(&self, refs: &[u32], seat: Option<(u32, u32)>) -> Result<Vec<u32>> {
+        if self.layout.list.is_none() {
+            return Ok(Vec::new());
+        }
+        if let Some((slot, pages)) = seat
+            && refs.is_empty()
+        {
+            let list = *self.shape(LIST)?;
+            let first = u64::from(slot) * u64::from(self.paging.pages_per_slot);
+            return (0..pages)
+                .map(|page| {
+                    let id = u32::try_from(first + u64::from(page)).unwrap_or(u32::MAX);
+                    self.units(LIST, list.seat_ref(id)?)
+                })
+                .collect();
+        }
+        refs.iter().map(|&r| self.units(LIST, r)).collect()
+    }
+
+    /// The physical page explicit write descriptor page `page` names.
+    pub fn kv_page(&self, page: u32) -> Result<u32> {
+        self.units(LIST, page)
+    }
+
+    /// A lane's record as kernels address it: its one piece's unit, from
+    /// `refs` (slot refs of the fixed shape, a piece each) or seat `seat`'s
+    /// record.
+    pub fn record(&self, refs: Option<&[u32]>, seat: u32) -> Result<u32> {
+        if !self.has_state() {
+            return Ok(seat);
+        }
+        match refs {
+            Some([one]) => self.units(FIXED, *one),
+            Some(refs) => Err(Fault::Unbound {
+                what: format!(
+                    "a record named by {} slot refs, where this pool's records are one piece",
+                    refs.len()
+                ),
+            }),
+            None => {
+                let fixed = *self.shape(FIXED)?;
+                self.units(FIXED, fixed.seat_ref(seat)?)
+            }
+        }
+    }
+
+    /// The fixed slot ref seat `seat`'s record is.
+    pub fn seat_record(&self, seat: u32) -> Result<u32> {
+        self.shape(FIXED)?.seat_ref(seat)
+    }
+
+    /// The rs list's place in a slot, where the load buffers one.
+    #[must_use]
+    pub fn rs_rows(&self) -> Option<&RsRows> {
+        self.rs.as_ref()
+    }
+
+    /// A lane's rs-list pages as kernels address them, in token order from
+    /// the verb's base: `refs` (rs-list slot refs) as units of
+    /// [`Pools::rs_stride`], or, seat-addressed, seat `seat`'s run.
+    pub fn rs_pages(&self, refs: &[u32], seat: Option<u32>) -> Result<Vec<u32>> {
+        let rs = *self.shape(RS)?;
+        refs.iter()
+            .enumerate()
+            .map(|(at, &r)| {
+                let slot = match seat {
+                    Some(seat) => {
+                        let per = self.paging.pages_per_slot;
+                        rs.seat_ref(seat * per + u32::try_from(at).unwrap_or(u32::MAX))?
+                    }
+                    None => r,
+                };
+                self.units(RS, slot)
+            })
+            .collect()
+    }
+
+    /// The bytes an rs-list page id counts.
+    pub fn rs_stride(&self) -> u64 {
+        self.unit(RS).unwrap_or(256)
+    }
+
+    /// The pool as kernels bind it.
+    pub fn segments(&self, handles: &Handles) -> Result<Segments> {
+        self.pool.bind(handles)
+    }
+
+    #[must_use]
     pub fn state_slot_bytes(&self) -> u64 {
-        self.shapes
+        self.rows
             .iter()
-            .map(|shape| match shape {
-                Shape::State { stride, dtype } => stride * u64::from(elem_size(*dtype)),
-                Shape::Kv { .. } => 0,
+            .map(|row| match row {
+                Row::State { stride, dtype, .. } => stride * u64::from(elem_size(*dtype)),
+                Row::Kv { .. } => 0,
             })
             .sum()
     }
 
-    pub fn read_slot(&self, slot: u32) -> Result<Vec<u8>> {
-        if slot >= self.paging.slots {
-            return Err(Fault::Ceiling {
-                what: "recurrent slots",
-                need: u64::from(slot) + 1,
-                have: u64::from(self.paging.slots),
-            });
-        }
+    /// The state rows of the record at `unit`, one after another. The
+    /// caller has drained every frame that writes it.
+    pub fn read_record(&self, unit: u32) -> Result<Vec<u8>> {
+        let base = u64::from(unit) * self.unit(FIXED)?;
         let mut out = Vec::new();
-        for (slab, shape) in self.slabs.iter().zip(&self.shapes) {
-            let Shape::State { stride, dtype } = *shape else {
+        for row in &self.rows {
+            let Row::State {
+                stride,
+                dtype,
+                offset,
+            } = *row
+            else {
                 continue;
             };
-            let bytes = stride * u64::from(elem_size(dtype));
-            let mut span = vec![0u8; usize::try_from(bytes).unwrap_or(0)];
-            slab.read(u64::from(slot) * bytes, &mut span)?;
+            let mut span =
+                vec![0u8; usize::try_from(stride * u64::from(elem_size(dtype))).unwrap_or(0)];
+            self.pool.read(base + offset, &mut span)?;
             out.extend_from_slice(&span);
         }
         Ok(out)
@@ -242,9 +621,7 @@ impl Pools {
 
     #[must_use]
     pub fn has_state(&self) -> bool {
-        self.shapes
-            .iter()
-            .any(|shape| matches!(shape, Shape::State { .. }))
+        self.rows.iter().any(|row| matches!(row, Row::State { .. }))
     }
 
     #[must_use]
@@ -257,132 +634,124 @@ impl Pools {
         self.paging
     }
 
+    /// The pool's whole range.
     #[must_use]
     pub fn bytes(&self) -> u64 {
-        self.slabs.iter().map(Buffer::bytes).sum()
+        self.pool.bytes()
     }
 
+    #[must_use]
+    pub fn committed_bytes(&self) -> u64 {
+        self.pool.committed_bytes()
+    }
+
+    /// The cache table one fire binds.
     pub fn table(&self, handles: &Handles, seats: &Seats) -> Result<CacheTable> {
-        let mut rows = Vec::with_capacity(self.shapes.len());
-        for (slab, shape) in self.slabs.iter().zip(&self.shapes) {
-            rows.push(match *shape {
-                Shape::Kv {
+        let segments = self.pool.bind(handles)?;
+        let cells = u32::try_from(self.paging.pages() * u64::from(self.paging.page_size))
+            .unwrap_or(u32::MAX);
+        let list_words = self.layout.list.map_or(0, |list| list.slot_bytes / 4);
+        let fixed_unit = self.unit(FIXED).unwrap_or(4);
+        let mut rows = Vec::with_capacity(self.rows.len());
+        for row in &self.rows {
+            rows.push(match *row {
+                Row::Kv {
                     head_dim,
                     kv_heads,
                     dtype,
-                    plane_bytes,
-                    values_at,
+                    keys,
+                    values,
                     values_width,
-                    values_bytes,
+                    ..
                 } => {
-                    // The one page table every kv row reads here.
                     let seat = seats.page_tables.first().ok_or_else(|| Fault::Unbound {
                         what: "the page table, which this fire staged none of".to_string(),
                     })?;
-                    let cells = self.pages * u64::from(self.paging.page_size);
-                    let plane = |at: u64, bytes: u64, width: u64| -> Result<Tensor> {
-                        Ok(Tensor::new(
-                            handles.bind(slab, at, bytes)?,
-                            u32::try_from(cells).unwrap_or(u32::MAX),
+                    let plane = |width: u64| {
+                        Tensor::new(
+                            kernels_slang::ABSENT,
+                            cells,
                             u32::try_from(width).unwrap_or(u32::MAX),
                             dtype,
-                        ))
+                        )
                     };
-                    CachePool::Kv(KvPool::planes(
-                        plane(0, plane_bytes, u64::from(kv_heads) * u64::from(head_dim))?,
-                        plane(values_at, values_bytes, values_width)?,
-                        seat.page_indices,
-                        seat.page_indptr,
-                        narrow(u64::from(self.paging.page_size)),
-                        u64::from(kv_heads) * u64::from(head_dim),
-                        u64::from(head_dim),
-                    ))
+                    let stride = u32::try_from(list_words).unwrap_or(u32::MAX);
+                    CachePool::Kv(KvPool {
+                        keys: plane(u64::from(kv_heads) * u64::from(head_dim)),
+                        values: plane(values_width),
+                        page_indices: seat.page_indices,
+                        page_indptr: seat.page_indptr,
+                        page_size: narrow(u64::from(self.paging.page_size)),
+                        seq_stride: u64::from(kv_heads) * u64::from(head_dim),
+                        head_stride: u64::from(head_dim),
+                        pool: segments,
+                        page_stride: [stride, stride],
+                        origin: [
+                            u32::try_from(keys / 4).unwrap_or(u32::MAX),
+                            u32::try_from(values / 4).unwrap_or(u32::MAX),
+                        ],
+                    })
                 }
-                Shape::State { stride, dtype } => {
-                    let bytes = stride * u64::from(self.paging.slots) * u64::from(elem_size(dtype));
-
-                    let bank = Tensor::new(
-                        handles.bind(slab, 0, bytes)?,
+                Row::State {
+                    stride,
+                    dtype,
+                    offset,
+                } => CachePool::Recurrent(RecurrentPool {
+                    state: Tensor::new(
+                        kernels_slang::ABSENT,
                         self.paging.slots,
                         u32::try_from(stride).unwrap_or(u32::MAX),
                         dtype,
-                    );
-                    CachePool::Recurrent(RecurrentPool {
-                        state: bank,
-                        slots: seats.slot_of_row,
-                        conv_state: bank,
-                        new_conv_state: bank,
-                    })
-                }
+                    ),
+                    slots: seats.slot_of_row,
+                    pool: segments,
+                    origin: u32::try_from(offset / 4).unwrap_or(u32::MAX),
+                    slot_stride: u32::try_from(fixed_unit / 4).unwrap_or(u32::MAX),
+                }),
             });
         }
         Ok(CacheTable(rows))
     }
 
-    pub fn clear(&mut self, slot: u32) -> Result<()> {
-        if slot >= self.paging.slots {
-            return Err(Fault::Ceiling {
-                what: "recurrent slots",
-                need: u64::from(slot) + 1,
-                have: u64::from(self.paging.slots),
-            });
+    /// Zeroes the record at `unit`: a fresh lane's state. The caller has
+    /// drained every frame.
+    pub fn clear(&mut self, unit: u32) -> Result<()> {
+        if !self.has_state() {
+            return Ok(());
         }
-        for (slab, shape) in self.slabs.iter_mut().zip(&self.shapes) {
-            let Shape::State { stride, dtype } = *shape else {
-                continue;
-            };
-            let bytes = stride * u64::from(elem_size(dtype));
-            slab.zero_span(u64::from(slot) * bytes, bytes)?;
-        }
-        Ok(())
+        let bytes = self.shape(FIXED)?.slot_bytes;
+        let at = u64::from(unit) * self.unit(FIXED)?;
+        self.pool.zero(at, bytes)
     }
 
-    pub fn copy_slot(&mut self, frame: &mut Frame, src: u32, dst: u32) -> Result<()> {
-        let have = u64::from(self.paging.slots);
-        for slot in [src, dst] {
-            if u64::from(slot) >= have {
-                return Err(Fault::Ceiling {
-                    what: "recurrent slots",
-                    need: u64::from(slot) + 1,
-                    have,
-                });
+    /// Every kv run's place in a list slot: its offset and the bytes a token
+    /// takes there.
+    fn kv_runs(&self) -> Vec<(u64, u64)> {
+        let mut runs = Vec::new();
+        for row in &self.rows {
+            if let Row::Kv {
+                keys,
+                values,
+                keys_cell,
+                values_cell,
+                ..
+            } = *row
+            {
+                runs.push((keys, keys_cell));
+                if values != keys {
+                    runs.push((values, values_cell));
+                }
             }
         }
-        if src == dst {
-            return Ok(());
-        }
-        self.admit(engine::frame::Demand {
-            kv_pages: 0,
-            state_slots: src.max(dst) + 1,
-            workspace: 0,
-        })?;
-        for (slab, shape) in self.slabs.iter().zip(&self.shapes) {
-            let Shape::State { stride, dtype } = *shape else {
-                continue;
-            };
-            let bytes = stride * u64::from(elem_size(dtype));
-            frame.copy(
-                slab,
-                u64::from(src) * bytes,
-                slab,
-                u64::from(dst) * bytes,
-                bytes,
-            )?;
-        }
-        Ok(())
+        runs
     }
 
-    pub fn copy_kv(&mut self, frame: &mut Frame, moves: &[KvRun]) -> Result<()> {
-        if moves.is_empty() {
-            return Ok(());
-        }
+    /// Copies token runs between kv pages (slot refs of the list shape).
+    pub fn copy_kv(&self, frame: &mut Frame, moves: &[KvRun]) -> Result<()> {
         let page_size = u64::from(self.paging.page_size);
-        let mut highest = 0u32;
+        let runs = self.kv_runs();
         for span in moves {
-            for (page, token) in [
-                (span.src_page, span.src_token),
-                (span.dst_page, span.dst_token),
-            ] {
+            for token in [span.src_token, span.dst_token] {
                 let end = u64::from(token) + u64::from(span.tokens);
                 if end > page_size {
                     return Err(Fault::Ceiling {
@@ -391,94 +760,180 @@ impl Pools {
                         have: page_size,
                     });
                 }
-                highest = highest.max(page.saturating_add(1));
             }
-        }
-
-        self.admit(engine::frame::Demand {
-            kv_pages: highest,
-            state_slots: 0,
-            workspace: 0,
-        })?;
-        for (slab, plane, cell) in self.kv_planes() {
-            for span in moves {
-                if span.tokens == 0 {
-                    continue;
-                }
-                let bytes = u64::from(span.tokens) * cell;
-                let at = |page: u32, token: u32| {
-                    plane + (u64::from(page) * page_size + u64::from(token)) * cell
-                };
-                let (src, dst) = (
-                    at(span.src_page, span.src_token),
-                    at(span.dst_page, span.dst_token),
-                );
-                if src == dst {
-                    continue;
-                }
-
-                slab.span(src, bytes)?;
-                slab.span(dst, bytes)?;
-                frame.copy(slab, src, slab, dst, bytes)?;
-            }
-        }
-        Ok(())
-    }
-
-    /// Every kv plane as its slab, the offset its page 0 starts at in the
-    /// slab as it stands now, and the bytes one token takes in it.
-    fn kv_planes(&self) -> Vec<(&Buffer, u64, u64)> {
-        let mut planes = Vec::new();
-        for (slab, shape) in self.slabs.iter().zip(&self.shapes) {
-            let Shape::Kv {
-                head_dim,
-                kv_heads,
-                dtype,
-                values_at,
-                values_width,
-                ..
-            } = *shape
-            else {
+            if span.tokens == 0 {
                 continue;
-            };
-            let element = u64::from(elem_size(dtype));
-            planes.push((slab, 0, u64::from(kv_heads) * u64::from(head_dim) * element));
-            if values_at != 0 {
-                planes.push((slab, values_at, values_width * element));
+            }
+            let src = self.slot_offset(LIST, span.src_page)?;
+            let dst = self.slot_offset(LIST, span.dst_page)?;
+            for &(offset, cell) in &runs {
+                let from = src + offset + u64::from(span.src_token) * cell;
+                let to = dst + offset + u64::from(span.dst_token) * cell;
+                if from != to {
+                    self.pool
+                        .copy(frame, from, to, u64::from(span.tokens) * cell)?;
+                }
             }
         }
-        planes
-    }
-
-    fn state_planes(&self) -> Vec<(&Buffer, u64, u64)> {
-        self.slabs
-            .iter()
-            .zip(&self.shapes)
-            .filter_map(|(slab, shape)| match *shape {
-                Shape::State { stride, dtype } => {
-                    Some((slab, 0, stride * u64::from(elem_size(dtype))))
-                }
-                Shape::Kv { .. } => None,
-            })
-            .collect()
-    }
-
-    pub fn seat_disk(&mut self, dir: &std::path::Path, budget: u64, page_bytes: u64) -> Result<()> {
-        let stride = |bytes: u64| bytes.next_multiple_of(engine::disk::ALIGN as u64);
-        let (state, page) = (self.state_slot_bytes(), page_bytes);
-        let pair = stride(state) + stride(page);
-        let rows = u64::from(self.paging.slots).min(budget.checked_div(pair).unwrap_or(0));
-        self.parked = Spill::open(dir, "r0.rs", state, rows * stride(state))?;
-        self.parked_pages = Spill::open(dir, "r0.rsb", page, rows * stride(page))?;
-        let kv = budget - rows * pair;
-        self.disk = Spill::open(dir, "r0.kv", self.kv_page_bytes(), kv)?;
         Ok(())
+    }
+
+    /// A kv page's bytes, as the slot file holds one: a list slot.
+    #[must_use]
+    pub fn page_bytes(&self) -> u64 {
+        self.layout.list.map_or(0, |list| list.slot_bytes)
+    }
+
+    /// Copies whole slots of `id` (slot refs) `(src, dst)` on the device.
+    pub fn copy_shape(&self, frame: &mut Frame, id: ShapeId, moves: &[(u32, u32)]) -> Result<()> {
+        let bytes = self.shape(id)?.slot_bytes;
+        for &(src, dst) in moves {
+            let from = self.slot_offset(id, src)?;
+            let to = self.slot_offset(id, dst)?;
+            if from != to {
+                self.pool.copy(frame, from, to, bytes)?;
+            }
+        }
+        Ok(())
+    }
+
+    /// The host byte host slot ref `slot` of shape `id` starts at: the host
+    /// chunks are laid out like the device's.
+    fn host_offset(&self, id: ShapeId, slot: u32) -> Result<u64> {
+        let shape = *self.shape(id)?;
+        let (chunk, index) = shape.split(slot);
+        if chunk >= self.host_chunks {
+            return Err(Fault::Ceiling {
+                what: "host chunks of the state pool",
+                need: u64::from(chunk) + 1,
+                have: u64::from(self.host_chunks),
+            });
+        }
+        Ok(u64::from(chunk) * self.layout.chunk_bytes + u64::from(index) * shape.slot_bytes)
+    }
+
+    /// Slots of one shape copied as [`engine::Engine::copy_slots`] states
+    /// them: on the device (whole slots, and token runs of the list),
+    /// between the device and the host chunks, or between the device and
+    /// the slot file. A host or disk copy waits out its frame.
+    pub fn copy_slots(
+        &mut self,
+        device: &Context,
+        frame: &mut Frame,
+        copy: &SlotCopy,
+    ) -> Result<()> {
+        let here = |domain: MemoryDomain| matches!(domain, MemoryDomain::WgpuDevice(_));
+        match (copy.src, copy.dst) {
+            (src, dst) if here(src) && here(dst) => {
+                self.copy_shape(frame, copy.shape, &copy.slots)?;
+                if !copy.runs.is_empty() {
+                    if copy.shape != LIST {
+                        return Err(Fault::Unbound {
+                            what: format!(
+                                "token runs of slot shape {}, which holds no tokens",
+                                copy.shape
+                            ),
+                        });
+                    }
+                    let runs: Vec<KvRun> = copy
+                        .runs
+                        .iter()
+                        .map(|run| KvRun {
+                            src_page: run.src,
+                            src_token: run.src_token,
+                            dst_page: run.dst,
+                            dst_token: run.dst_token,
+                            tokens: run.tokens,
+                        })
+                        .collect();
+                    self.copy_kv(frame, &runs)?;
+                }
+                Ok(())
+            }
+            (src, MemoryDomain::HostPinned) if here(src) => {
+                let bytes = usize::try_from(self.shape(copy.shape)?.slot_bytes).unwrap_or(0);
+                for &(slot, at) in &copy.slots {
+                    let from = self.slot_offset(copy.shape, slot)?;
+                    let to = usize::try_from(self.host_offset(copy.shape, at)?).unwrap_or(0);
+                    let (buffer, local) = self.pool.locate(from)?;
+                    buffer.read(local, &mut self.host[to..to + bytes])?;
+                }
+                Ok(())
+            }
+            (MemoryDomain::HostPinned, dst) if here(dst) => {
+                let bytes = usize::try_from(self.shape(copy.shape)?.slot_bytes).unwrap_or(0);
+                for &(at, slot) in &copy.slots {
+                    let to = self.slot_offset(copy.shape, slot)?;
+                    let from = usize::try_from(self.host_offset(copy.shape, at)?).unwrap_or(0);
+                    self.pool.write(to, &self.host[from..from + bytes])?;
+                }
+                Ok(())
+            }
+            (src, MemoryDomain::LocalDisk) if here(src) => {
+                let (ids, slots): (Vec<u32>, Vec<u32>) = copy.slots.iter().copied().unzip();
+                self.spill(device, copy.shape, true, &ids, &slots)
+            }
+            (MemoryDomain::LocalDisk, dst) if here(dst) => {
+                let (slots, ids): (Vec<u32>, Vec<u32>) = copy.slots.iter().copied().unzip();
+                self.spill(device, copy.shape, false, &ids, &slots)
+            }
+            (src, dst) => Err(Fault::Unbound {
+                what: format!(
+                    "a slot copy from {src:?} to {dst:?}: this pool moves slots within the \
+                     device, to its host chunks and to its slot file"
+                ),
+            }),
+        }
+    }
+
+    /// Copies whole kv list slots (slot refs `ids`) and the slot file's
+    /// `slots` the way `to_disk` says. The caller has drained every frame.
+    fn spill(
+        &mut self,
+        device: &Context,
+        id: ShapeId,
+        to_disk: bool,
+        ids: &[u32],
+        slots: &[u32],
+    ) -> Result<()> {
+        if id != LIST {
+            return Err(Fault::Unbound {
+                what: format!("slot shape {id} to the slot file, which holds kv list slots"),
+            });
+        }
+        Spill::room(self.disk.as_ref(), "disk kv pages", slots)?;
+        let bytes = self.page_bytes();
+        let places = ids
+            .iter()
+            .map(|&slot| self.slot_offset(LIST, slot))
+            .collect::<Result<Vec<_>>>()?;
+        let Some(disk) = self.disk.as_ref() else {
+            return Ok(());
+        };
+        places.into_iter().zip(slots).try_for_each(|(at, &slot)| {
+            let (buffer, local) = self.pool.locate(at)?;
+            disk.copy(device, &[(buffer, local, bytes)], to_disk, &[0], &[slot])
+        })
+    }
+
+    /// Opens the kv slot file under `dir` within `budget` bytes; the kv
+    /// pages it holds.
+    pub fn seat_disk(
+        &mut self,
+        device: &Context,
+        dir: &std::path::Path,
+        budget: u64,
+    ) -> Result<u32> {
+        let page = self.page_bytes();
+        if page > 0 {
+            let _ = device;
+            self.disk = Spill::open(dir, "r0.kv", page, budget)?;
+        }
+        Ok(self.disk_pages())
     }
 
     pub fn unseat_disk(&mut self) {
         self.disk = None;
-        self.parked = None;
-        self.parked_pages = None;
     }
 
     #[must_use]
@@ -486,88 +941,70 @@ impl Pools {
         Spill::slots(self.disk.as_ref())
     }
 
-    #[must_use]
-    pub fn parked_slots(&self) -> u32 {
-        Spill::slots(self.parked.as_ref())
-    }
-
-    #[must_use]
-    pub fn parked_pages(&self) -> u32 {
-        Spill::slots(self.parked_pages.as_ref())
-    }
-
-    /// Copies whole kv pages between the device pool and the slot file,
-    /// `pages[i]` with `slots[i]`.
-    pub fn spill_kv(
-        &mut self,
-        device: &Context,
-        to_disk: bool,
-        pages: &[u32],
-        slots: &[u32],
-    ) -> Result<()> {
-        Spill::room(self.disk.as_ref(), "disk kv pages", slots)?;
-        self.admit(engine::frame::Demand {
-            kv_pages: pages.iter().map(|&page| page + 1).max().unwrap_or(0),
-            state_slots: 0,
-            workspace: 0,
-        })?;
-        let Some(disk) = self.disk.as_ref() else {
-            return Ok(());
-        };
-        let page_size = u64::from(self.paging.page_size);
-        let planes: Vec<(&Buffer, u64, u64)> = self
-            .kv_planes()
-            .into_iter()
-            .map(|(slab, at, cell)| (slab, at, page_size * cell))
-            .collect();
-        disk.copy(device, &planes, to_disk, pages, slots)
-    }
-
-    pub fn park_state(
-        &mut self,
-        device: &Context,
-        out: bool,
-        device_slots: &[u32],
-        rows: &[u32],
-    ) -> Result<()> {
-        let have = u64::from(self.paging.slots);
-        if let Some(&slot) = device_slots.iter().find(|&&slot| u64::from(slot) >= have) {
+    /// Checks what a fire touches is committed: `demand`'s kv pages and
+    /// state slots are one past the highest physical page and record unit
+    /// it names; lifts the watermark over it.
+    pub fn admit(&mut self, demand: engine::frame::Demand) -> Result<()> {
+        if demand.workspace > 0 {
             return Err(Fault::Ceiling {
-                what: "recurrent slots",
-                need: u64::from(slot) + 1,
-                have,
+                what: "pool workspace bytes",
+                need: demand.workspace,
+                have: 0,
             });
         }
-        Spill::room(self.parked.as_ref(), "parked rs rows", rows)?;
-        self.admit(engine::frame::Demand {
-            kv_pages: 0,
-            state_slots: device_slots.iter().map(|&slot| slot + 1).max().unwrap_or(0),
-            workspace: 0,
-        })?;
-        match self.parked.as_ref() {
-            Some(parked) => parked.copy(device, &self.state_planes(), out, device_slots, rows),
-            None => Ok(()),
+        let chunk = self.layout.chunk_bytes;
+        if demand.kv_pages > 0
+            && let Some(list) = self.layout.list
+        {
+            let at = u64::from(demand.kv_pages - 1) * list.slot_bytes;
+            self.pool
+                .admit(u32::try_from(at / chunk).unwrap_or(u32::MAX))?;
         }
+        if demand.state_slots > 0 && self.has_state() {
+            let at = u64::from(demand.state_slots - 1) * self.unit(FIXED)?;
+            self.pool
+                .admit(u32::try_from(at / chunk).unwrap_or(u32::MAX))?;
+        }
+        self.watermark = self.watermark.union(demand);
+        Ok(())
     }
 
-    pub fn park_pages(
-        &self,
-        device: &Context,
-        out: bool,
-        pages: &[u32],
-        rows: &[u32],
-        buffer: (&Buffer, u64),
-    ) -> Result<()> {
-        Spill::room(self.parked_pages.as_ref(), "parked rs buffer pages", rows)?;
-        match self.parked_pages.as_ref() {
-            Some(parked) => parked.copy(device, &[(buffer.0, 0, buffer.1)], out, pages, rows),
-            None => Ok(()),
-        }
+    pub fn trim(&mut self, hint: engine::frame::Demand) {
+        self.watermark = engine::frame::Demand {
+            kv_pages: self.watermark.kv_pages.min(hint.kv_pages),
+            state_slots: self.watermark.state_slots.min(hint.state_slots),
+            workspace: self.watermark.workspace.min(hint.workspace),
+        };
+    }
+
+    /// Backs the pool's first `segments` segments.
+    pub fn commit_segments(&mut self, device: &Context, segments: u32) -> Result<()> {
+        self.pool.commit_segments(device, segments)
+    }
+
+    /// The segments the seat runs lie in: what a caller firing directly
+    /// backs.
+    #[must_use]
+    pub fn seat_segments(&self) -> u32 {
+        let chunks = 1 + self.layout.seat_chunks();
+        chunks
+            .div_ceil(self.layout.segment_chunks.max(1))
+            .min(self.pool.segments())
+    }
+
+    /// Gives back every segment at and past `segments`. The caller drained
+    /// every frame, and the runtime evacuated what they held.
+    pub fn release_segments(&mut self, segments: u32) {
+        self.pool.release_segments(segments);
+    }
+
+    /// Moves each evacuated chunk onto its new physical chunk in `frame`
+    /// and takes the moves into the chunk table.
+    pub fn evacuate(&mut self, frame: &mut Frame, evacuation: &Evacuation) -> Result<()> {
+        self.pool.evacuate(frame, evacuation)
     }
 }
 
-/// The most one staging copy of a spill carries. Pressure is what brings a
-/// spill on, so a stage does not grow with the request.
 const STAGE_BYTES: usize = 32 << 20;
 
 #[derive(Debug)]
@@ -670,158 +1107,6 @@ fn slot_file(error: std::io::Error) -> Fault {
     }
 }
 
-impl Pools {
-    /// The bytes one kv page takes across every plane.
-    #[must_use]
-    pub fn kv_page_bytes(&self) -> u64 {
-        u64::from(self.paging.page_size)
-            * self
-                .kv_planes()
-                .iter()
-                .map(|&(_, _, cell)| cell)
-                .sum::<u64>()
-    }
-
-    /// Moves the kv into slabs of `pages` pages, keeping what the lower pages
-    /// hold. The new slabs are all made before any copy, so a refused one
-    /// leaves the pool as it stood. The caller has drained the frames.
-    pub fn resize(&mut self, device: &Context, pages: u64) -> Result<()> {
-        let pages = pages.clamp(1, self.paging.pages());
-        if pages == self.pages {
-            return Ok(());
-        }
-        let page_size = u64::from(self.paging.page_size);
-        let (cells, kept) = (pages * page_size, pages.min(self.pages) * page_size);
-        let mut moved = Vec::new();
-        for (at, shape) in self.shapes.iter().enumerate() {
-            let Shape::Kv {
-                head_dim,
-                kv_heads,
-                dtype,
-                values_at,
-                values_width,
-                ..
-            } = *shape
-            else {
-                continue;
-            };
-            let element = u64::from(elem_size(dtype));
-            let keys = u64::from(kv_heads) * u64::from(head_dim) * element;
-            let values = values_width * element;
-            let own_values = values_at != 0;
-            let bytes = cells * keys + if own_values { cells * values } else { 0 };
-            moved.push((at, keys, values, own_values, Buffer::zeroed(device, bytes)?));
-        }
-        let mut frame = device.frame()?;
-        for (at, keys, values, own_values, next) in &moved {
-            let slab = &self.slabs[*at];
-            frame.copy(slab, 0, next, 0, kept * keys)?;
-            if *own_values {
-                let Shape::Kv { values_at, .. } = self.shapes[*at] else {
-                    continue;
-                };
-                frame.copy(slab, values_at, next, cells * keys, kept * values)?;
-            }
-        }
-        frame.commit()?;
-        for (at, keys, values, own_values, next) in moved {
-            self.slabs[at] = next;
-            let Shape::Kv {
-                plane_bytes,
-                values_at,
-                values_bytes,
-                ..
-            } = &mut self.shapes[at]
-            else {
-                continue;
-            };
-            *plane_bytes = cells * keys;
-            *values_at = if own_values { *plane_bytes } else { 0 };
-            *values_bytes = if values == 0 {
-                *plane_bytes
-            } else {
-                cells * values
-            };
-        }
-        self.pages = pages;
-        Ok(())
-    }
-
-    /// Checks a frame's or copy's reach against the pool and lifts the
-    /// watermark over it.
-    pub fn admit(&mut self, demand: engine::frame::Demand) -> Result<()> {
-        if demand.state_slots > self.paging.slots {
-            return Err(Fault::Ceiling {
-                what: "recurrent slots",
-                need: u64::from(demand.state_slots),
-                have: u64::from(self.paging.slots),
-            });
-        }
-        if u64::from(demand.kv_pages) > self.pages {
-            return Err(Fault::Ceiling {
-                what: "kv pages",
-                need: u64::from(demand.kv_pages),
-                have: self.pages,
-            });
-        }
-
-        if demand.workspace > 0 {
-            return Err(Fault::Ceiling {
-                what: "pool workspace bytes",
-                need: demand.workspace,
-                have: 0,
-            });
-        }
-        self.watermark = self.watermark.union(demand);
-        Ok(())
-    }
-
-    pub fn trim(&mut self, hint: engine::frame::Demand) {
-        self.watermark = engine::frame::Demand {
-            kv_pages: self.watermark.kv_pages.min(hint.kv_pages),
-            state_slots: self.watermark.state_slots.min(hint.state_slots),
-            workspace: self.watermark.workspace.min(hint.workspace),
-        };
-    }
-}
-
-/// The slab each cache row declares at `paging`, one device reservation a row.
-pub fn pool_slabs(trace: &Trace, paging: Paging) -> Result<Vec<u64>> {
-    let mut slabs = Vec::with_capacity(trace.caches.len());
-    for row in &trace.caches {
-        match row {
-            CacheRow::Kv {
-                name,
-                planes,
-                dtype,
-                ..
-            } => {
-                let planes = split(name, planes)?;
-                let element = elem_bytes(name, *dtype)?;
-                let cells = paging.pages() * u64::from(paging.page_size);
-                let width = if planes.shared {
-                    planes.keys
-                } else {
-                    planes.keys + planes.values
-                };
-                slabs.push(cells * width * element);
-            }
-            CacheRow::State {
-                name, slab, dtype, ..
-            } => {
-                let stride: u64 = slab.iter().product();
-                let dtype = state_dtype(*dtype);
-                slabs.push(
-                    stride
-                        .saturating_mul(u64::from(paging.slots))
-                        .saturating_mul(elem_bytes(name, dtype)?),
-                );
-            }
-        }
-    }
-    Ok(slabs)
-}
-
 struct Planes {
     keys: u64,
     values: u64,
@@ -863,258 +1148,4 @@ fn elem_size(dtype: Dtype) -> u32 {
 
 fn narrow(n: u64) -> i32 {
     i32::try_from(n).unwrap_or(i32::MAX)
-}
-
-#[cfg(all(test, feature = "wgpu", not(target_arch = "wasm32")))]
-mod tests {
-    use super::*;
-
-    const PAGING: Paging = Paging {
-        page_size: 16,
-        pages_per_slot: 1,
-        slots: 2,
-        pages: 4,
-        window: None,
-    };
-
-    fn device() -> Option<Context> {
-        if !crate::device::present() {
-            eprintln!("no wgpu adapter on this machine; skipping");
-            return None;
-        }
-        Some(
-            Context::bind(
-                &crate::DeviceBoot::default(),
-                engine::load::DEFAULT_DEVICE_MEMORY_SHARE,
-            )
-            .expect("a wgpu device"),
-        )
-    }
-
-    /// A pool of one kv row with a key and a value plane of `cell` bytes a
-    /// token, filled with a ramp, and those bytes.
-    fn pools_of(device: &Context, paging: Paging, cell: u64) -> (Pools, Vec<u8>) {
-        let plane = paging.pages() * u64::from(paging.page_size) * cell;
-        let mut pools = Pools {
-            slabs: vec![Buffer::zeroed(device, 2 * plane).expect("a kv slab")],
-            shapes: vec![Shape::Kv {
-                head_dim: u32::try_from(cell / 4).expect("narrow"),
-                kv_heads: 1,
-                dtype: STATE_DTYPE,
-                plane_bytes: plane,
-                values_at: plane,
-                values_width: cell / 4,
-                values_bytes: plane,
-            }],
-            pages: paging.pages(),
-            paging,
-            watermark: engine::frame::Demand::ZERO,
-            disk: None,
-            parked: None,
-            parked_pages: None,
-        };
-        let bytes: Vec<u8> = (0..2 * plane).map(|at| (at % 251) as u8).collect();
-        pools.slabs[0].write(0, &bytes).expect("uploaded");
-        (pools, bytes)
-    }
-
-    fn slab(pools: &Pools, at: usize) -> Vec<u8> {
-        let mut back = vec![0u8; usize::try_from(pools.slabs[at].bytes()).expect("small")];
-        pools.slabs[at].read(0, &mut back).expect("read back");
-        back
-    }
-
-    fn scratch_dir(name: &str) -> std::path::PathBuf {
-        std::env::temp_dir().join(format!("pie-wgpu-{name}-{}", std::process::id()))
-    }
-
-    #[test]
-    fn kv_pages_and_rs_slots_come_back_from_disk_where_they_are_restored() {
-        let Some(device) = device() else { return };
-        let cell = 3 * 4u64;
-        let row = 8 * 4u64;
-        let page = 64u64;
-        let (mut pools, bytes) = pools_of(&device, PAGING, cell);
-        let plane = bytes.len() as u64 / 2;
-        pools
-            .slabs
-            .push(Buffer::zeroed(&device, 2 * row).expect("a state slab"));
-        pools.shapes.push(Shape::State {
-            stride: 8,
-            dtype: STATE_DTYPE,
-        });
-        let dir = scratch_dir("disk");
-        pools.seat_disk(&dir, 1 << 20, page).expect("a slot file");
-        pools
-            .spill_kv(&device, true, &[1, 3], &[7, 8])
-            .expect("suspended");
-        pools.slabs[0].zero_span(0, 2 * plane).expect("cleared");
-        pools
-            .spill_kv(&device, false, &[2, 0], &[7, 8])
-            .expect("restored");
-        let back = slab(&pools, 0);
-        let page_of = plane / 4;
-        for base in [0, plane] {
-            let at = |id: u64| (base + id * page_of) as usize..(base + (id + 1) * page_of) as usize;
-            assert_eq!(back[at(2)], bytes[at(1)]);
-            assert_eq!(back[at(0)], bytes[at(3)]);
-            assert!(back[at(1)].iter().all(|&b| b == 0));
-        }
-
-        let mut pages = Buffer::zeroed(&device, 2 * page).expect("a buffer slab");
-        pools.slabs[1]
-            .write(row, &bytes[..row as usize])
-            .expect("slot 1 uploaded");
-        pages
-            .write(page, &bytes[row as usize..(row + page) as usize])
-            .expect("page 1 uploaded");
-        pools.park_state(&device, true, &[1], &[0]).expect("parked");
-        // Page 1 parks in row 0 of its own file, beside the state in row 0.
-        pools
-            .park_pages(&device, true, &[1], &[0], (&pages, page))
-            .expect("parked");
-        pools.slabs[1].zero_span(0, 2 * row).expect("cleared");
-        pages.zero_span(0, 2 * page).expect("cleared");
-        pools
-            .park_state(&device, false, &[0], &[0])
-            .expect("unparked");
-        pools
-            .park_pages(&device, false, &[0], &[0], (&pages, page))
-            .expect("unparked");
-        let state = slab(&pools, 1);
-        let mut parked = vec![0u8; (2 * page) as usize];
-        pages.read(0, &mut parked).expect("read back");
-        let (row, page) = (row as usize, page as usize);
-        assert_eq!(state[..row], bytes[..row]);
-        assert!(state[row..].iter().all(|&b| b == 0));
-        assert_eq!(parked[..page], bytes[row..row + page]);
-        assert!(parked[page..].iter().all(|&b| b == 0));
-        drop(pools);
-        std::fs::remove_dir_all(dir).expect("the slot file removed");
-    }
-
-    #[test]
-    fn a_page_spilled_comes_back_across_a_resize_of_the_pool() {
-        let Some(device) = device() else { return };
-        let (mut pools, bytes) = pools_of(&device, PAGING, 3 * 4);
-        let plane = bytes.len() / 2;
-        let page = plane / 4;
-        let dir = scratch_dir("resize");
-        pools.seat_disk(&dir, 1 << 20, 0).expect("a slot file");
-        pools
-            .spill_kv(&device, true, &[3], &[0])
-            .expect("the page the shrink drops");
-
-        pools.resize(&device, 2).expect("shrunk");
-        assert!(
-            pools.spill_kv(&device, true, &[2], &[1]).is_err(),
-            "a page past the slabs as they stand"
-        );
-        // The values moved with the shrink: this spill reads them there.
-        pools
-            .spill_kv(&device, true, &[1], &[1])
-            .expect("a page of the smaller slabs");
-
-        pools.resize(&device, 4).expect("grown");
-        pools.slabs[0]
-            .zero_span(0, bytes.len() as u64)
-            .expect("cleared");
-        pools
-            .spill_kv(&device, false, &[3, 2], &[0, 1])
-            .expect("restored");
-        let back = slab(&pools, 0);
-        for base in [0, plane] {
-            let at = |id: usize| base + id * page..base + (id + 1) * page;
-            assert_eq!(back[at(3)], bytes[at(3)], "spilled before the shrink");
-            assert_eq!(back[at(2)], bytes[at(1)], "spilled while small");
-            assert!(back[at(0)].iter().all(|&b| b == 0));
-            assert!(back[at(1)].iter().all(|&b| b == 0));
-        }
-        drop(pools);
-        std::fs::remove_dir_all(dir).expect("the slot file removed");
-    }
-
-    #[test]
-    fn a_slot_write_that_fails_leaves_the_page_on_the_device() {
-        let Some(device) = device() else { return };
-        let (mut pools, bytes) = pools_of(&device, PAGING, 3 * 4);
-        let dir = scratch_dir("refused");
-        pools.seat_disk(&dir, 1 << 20, 0).expect("a slot file");
-        let page_size = u64::from(PAGING.page_size);
-        let planes: Vec<(&Buffer, u64, u64)> = pools
-            .kv_planes()
-            .into_iter()
-            .map(|(slab, at, cell)| (slab, at, page_size * cell))
-            .collect();
-        // Past `room`, so the refusal is the file's, after a slot went in.
-        let past = pools.disk_pages();
-        let disk = pools.disk.as_ref().expect("a slot file");
-        let failed = disk
-            .copy(&device, &planes, true, &[1, 2], &[0, past])
-            .expect_err("a slot the file refuses");
-        assert!(failed.to_string().contains("slot file"), "{failed}");
-        drop(planes);
-        assert_eq!(slab(&pools, 0), bytes, "the pages stay where they were");
-
-        pools
-            .spill_kv(&device, true, &[2], &[0])
-            .expect("the tier still serves");
-        pools.slabs[0]
-            .zero_span(0, bytes.len() as u64)
-            .expect("cleared");
-        pools
-            .spill_kv(&device, false, &[2], &[0])
-            .expect("restored");
-        let (plane, page) = (bytes.len() / 2, bytes.len() / 8);
-        let back = slab(&pools, 0);
-        for base in [0, plane] {
-            let at = base + 2 * page..base + 3 * page;
-            assert_eq!(back[at.clone()], bytes[at]);
-        }
-        drop(pools);
-        std::fs::remove_dir_all(dir).expect("the slot file removed");
-    }
-
-    #[test]
-    fn a_spill_wider_than_one_stage_lands_every_page() {
-        let Some(device) = device() else { return };
-        // Five pages of 12 MiB across both planes take three stages.
-        let paging = Paging {
-            page_size: 1 << 19,
-            pages_per_slot: 1,
-            slots: 1,
-            pages: 5,
-            window: None,
-        };
-        let (mut pools, bytes) = pools_of(&device, paging, 12);
-        assert_eq!(STAGE_BYTES / pools.kv_page_bytes() as usize, 2);
-        let plane = bytes.len() / 2;
-        let dir = scratch_dir("stages");
-        pools.seat_disk(&dir, 64 << 20, 0).expect("a slot file");
-        let order = [0, 1, 2, 3, 4];
-        pools
-            .spill_kv(&device, true, &order, &order)
-            .expect("suspended");
-        pools.slabs[0]
-            .zero_span(0, bytes.len() as u64)
-            .expect("cleared");
-        let reversed = [4, 3, 2, 1, 0];
-        pools
-            .spill_kv(&device, false, &reversed, &order)
-            .expect("restored");
-        let back = slab(&pools, 0);
-        let cut = plane / 5;
-        for base in [0, plane] {
-            for id in 0..5 {
-                let mirror = 4 - id;
-                assert!(
-                    back[base + id * cut..base + (id + 1) * cut]
-                        == bytes[base + mirror * cut..base + (mirror + 1) * cut],
-                    "page {id}"
-                );
-            }
-        }
-        drop(pools);
-        std::fs::remove_dir_all(dir).expect("the slot file removed");
-    }
 }
