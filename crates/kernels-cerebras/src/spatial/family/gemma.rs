@@ -16,7 +16,7 @@ use crate::spatial::block::segments::Scores;
 use crate::spatial::block::shared_kv::SharedKv;
 use crate::spatial::block::token_loop::TokenLoop;
 use crate::spatial::block::units::{UnitCopies, Units};
-use crate::spatial::family::{Family, Row, ceil_to, table};
+use crate::spatial::family::{Family, MadeFor, Row, ceil_to, table};
 use crate::spatial::floor::{UnitGrid, UnitLayout};
 use crate::spatial::kernels::gemma;
 use crate::spatial::plan::{
@@ -198,12 +198,16 @@ const PRESETS: &[Row<7>] = &[
     ("tiny", [8, 8, 5, 32, 4, 2, 2], "", ""),
 ];
 
+/// The model each shipping preset was measured on.
+const MADE_FOR: &[MadeFor] = &[("e2b", [1536, 35, 6144]), ("e4b", [2560, 42, 10240])];
+
 impl Family for Gemma {
     fn presets(&self) -> Vec<Preset> {
         table(
             ["PX", "PY", "NU", "HR", "NEG", "G2", "G2W"],
             PRESETS,
             &[("LOOP", 64.0)],
+            MADE_FOR,
         )
     }
 

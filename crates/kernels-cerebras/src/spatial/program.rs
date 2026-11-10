@@ -8,6 +8,7 @@ use super::fabric::{Fabric, Palette};
 use super::family::{self, Family};
 use super::floor::{Floor, FloorBuilder};
 use super::plan::Plan;
+use super::toolchain::{Arch, memcpy_fabric};
 use super::weights::{Binding, Copies};
 use super::wiring::Wiring;
 
@@ -41,6 +42,15 @@ impl Program {
             b.floor(&plan, &mut fb)?;
         }
         let mut floor = fb.build()?;
+        // The program and its memcpy halo on a system's wafer (the largest fabric there is).
+        let ((fw, fh), _) = memcpy_fabric(floor.w, floor.h);
+        let (sw, sh) = Arch::Wse3.system_fabric();
+        if fw > sw || fh > sh {
+            return Err(format!(
+                "{} x {} PEs (with the memcpy halo {fw} x {fh}): over the wafer's {sw} x {sh}",
+                floor.w, floor.h
+            ));
+        }
         let mut wiring = Wiring::default();
         for b in &blocks {
             b.wire(&plan, &floor, &mut wiring)?;

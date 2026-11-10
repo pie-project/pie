@@ -10,7 +10,7 @@ use crate::spatial::block::Block;
 use crate::spatial::block::head::{HeadCopies, Hemb};
 use crate::spatial::block::head_groups::HeadGroups;
 use crate::spatial::block::row_runs::{RowRuns, RunCopies};
-use crate::spatial::family::{Family, Row, ceil_to, table};
+use crate::spatial::family::{Family, MadeFor, Row, ceil_to, table};
 use crate::spatial::floor::{UnitGrid, UnitLayout};
 use crate::spatial::kernels::gemma12::{self, Dims};
 use crate::spatial::plan::{
@@ -43,6 +43,9 @@ const PRESETS: &[Row<13>] = &[
     ),
     ("tiny", [8, 8, 18, 2, 3, 3, 4, 3, 2, 4, 12, 2, 2], "", ""),
 ];
+
+/// The model each shipping preset was measured on.
+const MADE_FOR: &[MadeFor] = &[("g12", [3840, 48, 15360])];
 
 /// Head groups: the attention rows in groups of `ga`, the plain rows above the CY row and those
 /// below it in groups of `gw`.
@@ -94,7 +97,7 @@ impl Family for Gemma12 {
         let keys = [
             "PX", "PY", "HR", "HcA", "HcW", "RA", "SWA", "GA", "GW", "NU", "NEG", "G2", "G2W",
         ];
-        table(keys, PRESETS, &[("LOOP", 64.0)])
+        table(keys, PRESETS, &[("LOOP", 64.0)], MADE_FOR)
     }
 
     /// Units of K = layers / NU (S .. S G) in two unit columns; rows in two runs (the attention

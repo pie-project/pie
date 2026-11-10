@@ -136,6 +136,13 @@ pub fn emit(
     Ok(())
 }
 
+/// Whether a failed link is a PE out of memory (cslc's linker: "ran out of PE memory"): the plan
+/// does not model PE memory, so only the link tells a partition that does not fit.
+#[must_use]
+pub fn out_of_pe_memory(link_error: &str) -> bool {
+    link_error.contains("ran out of PE memory")
+}
+
 /// The fabric a program is linked against: the smallest that holds it (the simulator's), or
 /// the system's whole wafer (a program run on a CS system).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize)]

@@ -74,12 +74,17 @@ pub fn serving(shape: &Shape) -> FamilyId {
 /// overrides (`K=V,...`) and kernel levers (`K:V,...`) its shipping program was measured with.
 pub type Row<const N: usize> = (&'static str, [u32; N], &'static str, &'static str);
 
+/// A shipping preset and the shape signature of the model it was measured on
+/// ([`Shape::signature`]: hidden, layers, MLP width).
+pub type MadeFor = (&'static str, [u32; 3]);
+
 /// A family's presets from its table: each row's keys, then `extra` (keys every preset of the
-/// family states the same), then the row's overrides, and its levers.
+/// family states the same), then the row's overrides, its levers and the model it was made for.
 pub fn table<const N: usize>(
     keys: [&str; N],
     rows: &[Row<N>],
     extra: &[(&str, f64)],
+    made: &[MadeFor],
 ) -> Vec<Preset> {
     rows.iter()
         .map(|&(name, values, set, levers)| {
@@ -90,6 +95,7 @@ pub fn table<const N: usize>(
                 .set(set)
                 .expect("a preset table's overrides are K=V");
             p.levers = levers.to_string();
+            p.made_for = made.iter().find(|m| m.0 == name).map(|m| m.1);
             p
         })
         .collect()

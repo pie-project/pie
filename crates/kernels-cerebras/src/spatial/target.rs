@@ -329,7 +329,7 @@ pub struct Planned {
     pub preset: Preset,
 }
 
-/// A partition to try: a family's preset (its table's `order`-th), with the overrides set.
+/// A partition to try: a family's preset (the `order`-th tried), with the overrides set.
 #[derive(Clone, Debug)]
 pub struct Candidate {
     pub family: FamilyId,
@@ -349,11 +349,14 @@ pub struct Wafer {
 }
 
 impl Wafer {
-    /// The partitions to try, in the family's table order.
+    /// The partitions to try: the preset made for this shape first (its shipping program), then
+    /// the family's table order.
     pub fn candidates(&self) -> Vec<Candidate> {
         let id = family::serving(&self.shape);
-        family::of(id)
-            .presets()
+        let mut presets = family::of(id).presets();
+        let sig = self.shape.signature();
+        presets.sort_by_key(|p| p.made_for != Some(sig));
+        presets
             .into_iter()
             .enumerate()
             .filter(|(_, p)| self.preset.as_ref().is_none_or(|n| *n == p.name))
@@ -450,7 +453,8 @@ impl SpatialTarget for Wafer {
 }
 
 /// The plan of `trace` through poem's spatial pass: its shape, then the preset `ask` names (else
-/// the first of the family's that builds) with its overrides and positions.
+/// the one made for its shape, else the first of the family's that builds) with its overrides
+/// and positions.
 pub fn plan(trace: &Trace, ask: &Ask) -> R<Planned> {
     let wafer = ask.target(shape(trace)?)?;
     match poem_compiler::spatial::plan(trace, &wafer) {
@@ -459,6 +463,24 @@ pub fn plan(trace: &Trace, ask: &Ask) -> R<Planned> {
         Err(poem_compiler::spatial::SpatialError::NoCandidate) => Err(wafer.refused(Vec::new())),
         Err(e) => Err(format!("{}: {e}", trace.name)),
     }
+}
+
+/// Every plan of `trace` that builds, in the order [`plan`] prefers them (its choice first): a
+/// load links the next where one's program does not fit its PEs' memory.
+pub fn plans(trace: &Trace, ask: &Ask) -> R<Vec<Planned>> {
+    let wafer = ask.target(shape(trace)?)?;
+    let mut why = Vec::new();
+    let mut fit = Vec::new();
+    for c in wafer.candidates() {
+        match wafer.fit(&c) {
+            Ok(()) => fit.push(wafer.planned(c)?),
+            Err(e) => why.push(e),
+        }
+    }
+    if fit.is_empty() {
+        return Err(wafer.refused(why));
+    }
+    Ok(fit)
 }
 
 /// The plan of a shape stated outright, chosen as [`plan`] chooses.
@@ -573,10 +595,13 @@ mod tests {
             ),
             (
                 "llama31-8b-bf16-kv-bf16",
-                "9b",
+                "l3-8b",
                 (FamilyId::Dense, 8, 4, 256, 256, 16, 216),
             ),
         ] {
+            // with no preset named, each picks its shipping one
+            let chosen = plan(&trace(name), &Ask::default()).unwrap();
+            assert_eq!(chosen.preset.name, preset, "{name}");
             let p = plan(&trace(name), &Ask::preset(preset)).unwrap().plan;
             let q = &p.partition;
             let got = (
@@ -638,12 +663,46 @@ mod tests {
         assert!(e.contains("of at most 16384"), "{e}");
     }
 
-    /// With no preset named, the pass keeps the first of the family's that builds: Qwen3.5-0.8B's
-    /// 24 layers leave the 9B's eight unit slots two short, so it takes its own.
+    /// With no preset named and none made for the shape, the pass keeps the first of the
+    /// family's that builds: Qwen3.5-0.8B's 24 layers with another MLP width leave the 9B's eight
+    /// unit slots two short, so it takes the 0.8B's.
     #[test]
     fn the_first_preset_that_builds_is_kept() {
-        let p = plan(&trace("qwen35-d0.8b-bf16-kv-bf16"), &Ask::default()).unwrap();
+        let mut s = shape(&trace("qwen35-d0.8b-bf16-kv-bf16")).unwrap();
+        s.mlp.intermediate += 256;
+        let p = plan_shape(s, &Ask::default()).unwrap();
         assert_eq!(p.preset.name, "0.8b");
         assert!(plan(&trace("qwen35-d0.8b-bf16-kv-bf16"), &Ask::preset("e2b")).is_err());
+    }
+
+    /// The plans a load may fall back on start with the one `plan` chooses.
+    #[test]
+    fn the_fallback_plans_start_with_the_choice() {
+        let t = trace("llama31-8b-bf16-kv-bf16");
+        let all = plans(&t, &Ask::default()).unwrap();
+        assert_eq!(all[0].preset.name, "l3-8b");
+        assert_eq!(all[0].plan, plan(&t, &Ask::default()).unwrap().plan);
+        assert!(all.len() > 1);
+    }
+
+    /// A partition is refused where it cannot link or serve: wider than the wafer, a head's dims
+    /// not even over its columns, the MLP not even over the unit's.
+    #[test]
+    fn fit_refuses_what_cannot_serve() {
+        let t = trace("llama31-8b-bf16-kv-bf16");
+        let ask = |set: &str| Ask {
+            set: set.into(),
+            ..Ask::default()
+        };
+        let e = plan(&t, &ask("PX=320")).unwrap_err();
+        assert!(e.contains("dims over 40 columns"), "{e}");
+        let e = plan(&t, &ask("PX=288")).unwrap_err();
+        assert!(e.contains("dims over 36 columns"), "{e}");
+        let e = plan(&t, &ask("PX=512")).unwrap_err();
+        assert!(e.contains("over the wafer"), "{e}");
+        let mut odd = shape(&t).unwrap();
+        odd.mlp.intermediate += 64;
+        let e = plan_shape(odd, &Ask::default()).unwrap_err();
+        assert!(e.contains("the MLP's 14400 over 256 columns"), "{e}");
     }
 }

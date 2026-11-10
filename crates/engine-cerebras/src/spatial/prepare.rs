@@ -233,57 +233,42 @@ pub fn prepare(
     if cfg.debug.is_some() {
         tracing::warn!(settings = ?knobs, "cerebras: debug settings in force");
     }
-    let planned = target::plan(
-        trace,
-        &Ask {
-            preset: cfg.wafer.preset.clone(),
-            set: knobs.set.clone(),
-            positions: max_model_len,
-        },
-    )?;
-    let plan = planned.plan;
-    tracing::info!(
-        family = plan.family.name(),
-        preset = %planned.preset.name,
-        positions = plan.contract.positions,
-        "cerebras: the wafer program's plan"
-    );
+    let ask = Ask {
+        preset: cfg.wafer.preset.clone(),
+        set: knobs.set.clone(),
+        positions: max_model_len,
+    };
     let cache = Cache::open(cfg)?;
-
-    let program = match &knobs.program {
-        Some(p) => p.clone(),
-        None => {
-            let levers = Levers::of(&plan.levers, &knobs.levers)?;
-            let cslc = Cslc::find(&cfg.toolchain).map_err(|e| e.to_string())?;
-            // A system runs a program linked against its whole wafer.
-            let fabric = if cfg.cmaddr.is_some() {
-                Fabric::System
-            } else {
-                Fabric::Simulator
-            };
-            let key = ProgramKey::of(&plan, &levers, arch(cfg.target), fabric, cslc.frontend())?;
-            let (dir, made) = cache.entry("p", &trace.name, &key.hex, &key.parts, |tmp| {
-                if cfg.wafer.build == Build::Never {
-                    return Err(format!(
-                        "no compiled program {} in the cache and [engine.wafer] build = \
-                         \"never\": compile it first (wafer-compile build + link)",
-                        key.hex
-                    ));
+    // The plans in the order they are preferred; the next is tried where a program does not fit
+    // its PEs' memory (only its link tells).
+    let tries = target::plans(trace, &ask)?;
+    let mut tried = Vec::new();
+    let (plan, program) = 'chosen: {
+        for planned in tries {
+            let plan = planned.plan;
+            tracing::info!(
+                family = plan.family.name(),
+                preset = %planned.preset.name,
+                positions = plan.contract.positions,
+                "cerebras: the wafer program's plan"
+            );
+            let Some(p) = &knobs.program else {
+                match compile(cfg, &cache, trace, &plan, &knobs.levers) {
+                    Ok(dir) => break 'chosen (plan, dir),
+                    Err(e) if build::out_of_pe_memory(&e) => {
+                        tracing::warn!(preset = %planned.preset.name, "cerebras: {e}");
+                        tried.push(format!("preset {}: {e}", planned.preset.name));
+                        continue;
+                    }
+                    Err(e) => return Err(e),
                 }
-                let t0 = std::time::Instant::now();
-                let prog = Program::of(plan.clone())?;
-                build::emit(&prog, &levers, None, tmp, &EMITS)?;
-                let room = build::link(tmp, &cslc, arch(cfg.target), fabric)?;
-                tracing::info!(
-                    s = t0.elapsed().as_secs_f64(),
-                    stack_room = room,
-                    "cerebras: the wafer program compiled"
-                );
-                Ok(())
-            })?;
-            tracing::info!(program = %dir.display(), compiled = made, "cerebras: the wafer program");
-            dir.join("out")
+            };
+            break 'chosen (plan, p.clone());
         }
+        return Err(format!(
+            "no preset's program fits the PEs' memory: {}",
+            tried.join("; ")
+        ));
     };
 
     let (weights, scratch) = match &knobs.weights {
@@ -335,6 +320,40 @@ pub fn prepare(
         plan,
         _scratch: scratch,
     })
+}
+
+/// The program of `plan`, linked into the cache unless it holds it.
+fn compile(cfg: &Config, cache: &Cache, trace: &Trace, plan: &Plan, levers: &str) -> R<PathBuf> {
+    let levers = Levers::of(&plan.levers, levers)?;
+    let cslc = Cslc::find(&cfg.toolchain).map_err(|e| e.to_string())?;
+    // A system runs a program linked against its whole wafer.
+    let fabric = if cfg.cmaddr.is_some() {
+        Fabric::System
+    } else {
+        Fabric::Simulator
+    };
+    let key = ProgramKey::of(plan, &levers, arch(cfg.target), fabric, cslc.frontend())?;
+    let (dir, made) = cache.entry("p", &trace.name, &key.hex, &key.parts, |tmp| {
+        if cfg.wafer.build == Build::Never {
+            return Err(format!(
+                "no compiled program {} in the cache and [engine.wafer] build = \
+                 \"never\": compile it first (wafer-compile build + link)",
+                key.hex
+            ));
+        }
+        let t0 = std::time::Instant::now();
+        let prog = Program::of(plan.clone())?;
+        build::emit(&prog, &levers, None, tmp, &EMITS)?;
+        let room = build::link(tmp, &cslc, arch(cfg.target), fabric)?;
+        tracing::info!(
+            s = t0.elapsed().as_secs_f64(),
+            stack_room = room,
+            "cerebras: the wafer program compiled"
+        );
+        Ok(())
+    })?;
+    tracing::info!(program = %dir.display(), compiled = made, "cerebras: the wafer program");
+    Ok(dir.join("out"))
 }
 
 /// What identifies a checkpoint's contents: every file's name, size and modification time.

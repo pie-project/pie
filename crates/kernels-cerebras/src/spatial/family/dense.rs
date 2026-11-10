@@ -10,7 +10,7 @@ use crate::spatial::block::head::{HeadCopies, HeadEast, Hemb};
 use crate::spatial::block::segments::{Onorm, Scores};
 use crate::spatial::block::token_loop::TokenLoop;
 use crate::spatial::block::units::{UnitCopies, Units};
-use crate::spatial::family::{Family, Row, table, units_of};
+use crate::spatial::family::{Family, MadeFor, Row, table, units_of};
 use crate::spatial::floor::{UnitGrid, UnitLayout};
 use crate::spatial::kernels::dense;
 use crate::spatial::plan::{
@@ -64,6 +64,14 @@ const PRESETS: &[Row<8>] = &[
         "G2=12,WL=1",
         "NPX:1,DIAG:0,TSTAMP:0,XKEEP:0,HACC16:0,ATTL:2,SLW:1",
     ),
+    // Llama 3.1 8B: the 9B's units; every layer attends, so 32 KV entries a row (8,192
+    // positions) keep the weight PEs' stack room (3,104 B; 64 entries do not link)
+    (
+        "l3-8b",
+        [256, 256, 2, 4, 4, 1153, 216, 32],
+        "G2=16,WL=1",
+        SHIP,
+    ),
     ("tiny-t08", [8, 8, 2, 3, 4, 10, 8, 4], "G2=2,WL=1,G2W=2", ""),
     (
         "tiny-t4",
@@ -80,12 +88,22 @@ const PRESETS: &[Row<8>] = &[
     ),
 ];
 
+/// The model each shipping preset was measured on.
+const MADE_FOR: &[MadeFor] = &[
+    ("9b", [4096, 32, 12288]),
+    ("4b", [2560, 32, 9216]),
+    ("0.8b", [1024, 24, 3584]),
+    ("q3-8b", [4096, 36, 12288]),
+    ("l3-8b", [4096, 32, 14336]),
+];
+
 impl Family for Dense {
     fn presets(&self) -> Vec<Preset> {
         table(
             ["PX", "PY", "UNX", "UNY", "K", "HR", "VR", "NE"],
             PRESETS,
             &[],
+            MADE_FOR,
         )
     }
 
@@ -111,14 +129,35 @@ impl Family for Dense {
             }
             Ok(px / heads)
         };
+        // a head's dims split evenly over its columns
+        let split = |dims: u32, cols: u32, what: &str| {
+            if dims.is_multiple_of(cols) {
+                Ok(())
+            } else {
+                Err(format!("dense: {what}'s {dims} dims over {cols} columns"))
+            }
+        };
         let scores = per(s.attn.kv_heads, "KV heads")?;
+        split(s.attn.head_dim, scores, "an attention head")?;
         let (gdn, onorm) = match s.gdn {
-            Some(g) => (
-                per(g.key_heads, "key heads")?,
-                per(g.value_heads, "value heads")?,
-            ),
+            Some(g) => {
+                let (gdn, onorm) = (
+                    per(g.key_heads, "key heads")?,
+                    per(g.value_heads, "value heads")?,
+                );
+                split(g.key_dim, gdn, "a key head")?;
+                split(g.value_dim, onorm, "a value head")?;
+                (gdn, onorm)
+            }
             None => (scores, scores),
         };
+        // the MLP's columns split evenly over the unit's (the cut has no padded column)
+        if !s.mlp.intermediate.is_multiple_of(px) {
+            return Err(format!(
+                "dense: the MLP's {} over {px} columns",
+                s.mlp.intermediate
+            ));
+        }
         let g2 = pr.int("G2").unwrap_or(0);
         let ne = pr.need("NE")?;
         // a position is RLV digits of RBITS bits: enough levels for the context NE PY (at least 4)

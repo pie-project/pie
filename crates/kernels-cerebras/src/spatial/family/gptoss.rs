@@ -9,7 +9,7 @@ use crate::spatial::abi::Kernels;
 use crate::spatial::block::Block;
 use crate::spatial::block::band::{Band, BandLoop};
 use crate::spatial::block::moe::{AttnScores, MoeCopies, MoeUnits, Router};
-use crate::spatial::family::{Family, Row, ceil_to, table};
+use crate::spatial::family::{Family, MadeFor, Row, ceil_to, table};
 use crate::spatial::floor::{UnitGrid, UnitLayout};
 use crate::spatial::kernels::gptoss::{self, Dims};
 use crate::spatial::plan::{
@@ -42,6 +42,9 @@ const PRESETS: &[Row<11>] = &[
     ("tiny", [4, 8, 4, 2, 1, 2, 8, 26, 8, 2, 2], "", ""),
 ];
 
+/// The model each shipping preset was measured on.
+const MADE_FOR: &[MadeFor] = &[("full", [2880, 24, 2880])];
+
 impl Family for GptOss {
     fn presets(&self) -> Vec<Preset> {
         let keys = [
@@ -51,6 +54,7 @@ impl Family for GptOss {
             keys,
             PRESETS,
             &[("NLV", 5.0), ("HSCALE", 32768.0), ("LOOP", 64.0)],
+            MADE_FOR,
         )
     }
 

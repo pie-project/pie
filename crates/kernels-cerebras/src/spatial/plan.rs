@@ -55,6 +55,15 @@ pub struct Shape {
     pub norm: NormSpec,
 }
 
+impl Shape {
+    /// What tells one model's partition from another's within a family: the hidden size, the
+    /// layer count and the MLP's width.
+    #[must_use]
+    pub fn signature(&self) -> [u32; 3] {
+        [self.hidden, self.layers.len() as u32, self.mlp.intermediate]
+    }
+}
+
 /// One decoder layer's mixer.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum LayerKind {
@@ -451,6 +460,10 @@ pub struct Preset {
     /// The kernel levers the preset's program ships with (`K:V,...`, see
     /// [`super::emit::params::Levers`]): the plan carries them to the build.
     pub levers: String,
+    /// The shape signature of the model this preset's program was measured on (a shipping
+    /// preset's; [`Shape::signature`]): a plan with no preset named prefers it for that shape.
+    #[serde(default)]
+    pub made_for: Option<[u32; 3]>,
 }
 
 impl Preset {
@@ -459,6 +472,7 @@ impl Preset {
             name: name.to_string(),
             keys: keys.iter().map(|(k, v)| (k.to_string(), *v)).collect(),
             levers: String::new(),
+            made_for: None,
         }
     }
 
