@@ -120,9 +120,15 @@ pub fn shape(trace: &Trace) -> R<Shape> {
     for (at, node) in trace.nodes.iter().enumerate() {
         let Some(l) = analysis.layers[at] else {
             match &node.op {
+                // The token embedding: the last plain (unweighted) gather before the first layer.
+                // A multimodal trace's encoders run before it and gather their own tables
+                // (position embeddings, weighted by their grid taps).
                 Operation::Gather(Gather::Embed {
-                    table: t, vocab: v, ..
-                }) if table.is_none() => {
+                    table: t,
+                    vocab: v,
+                    weights: None,
+                    ..
+                }) if layers.is_empty() => {
                     (vocab, table) = (*v, Some(*t));
                     if let Some(Def::Weight(p)) = trace.values.get(t.0 as usize).map(|d| &d.def) {
                         hidden =
@@ -498,6 +504,26 @@ mod tests {
             .parse(name)
             .unwrap_or_else(|| panic!("{name} parses"))
             .trace(poem_ir::Platform::Cerebras)
+    }
+
+    /// A multimodal deployment (what `pie serve` identifies from a checkpoint with its vision
+    /// tower) plans the language model's program: its encoder's tables and dims are not the
+    /// model's.
+    #[test]
+    fn a_vision_deployment_plans_its_language_model() {
+        let want = plan(&trace("gemma4-e4b-bf16-kv-bf16"), &Ask::preset("e4b"))
+            .unwrap()
+            .plan;
+        let got = plan(
+            &trace("gemma4-e4b-vision-bf16-kv-bf16"),
+            &Ask::preset("e4b"),
+        )
+        .unwrap()
+        .plan;
+        assert_eq!(
+            serde_json::to_value(&got).unwrap(),
+            serde_json::to_value(&want).unwrap()
+        );
     }
 
     /// Every shipping model plans from its trace to the cut its staged prep holds: (family,
