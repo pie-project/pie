@@ -797,6 +797,8 @@ impl FrameShell for Shell {
         let mut seats: Vec<Seat> = Vec::with_capacity(lanes.len());
         let mut tables: Vec<std::borrow::Cow<'_, [u32]>> = Vec::with_capacity(lanes.len());
         let mut window_ids: Vec<std::borrow::Cow<'_, [u32]>> = Vec::with_capacity(lanes.len());
+        // Each lane's slot refs of the window lists past the first.
+        let mut more_windows: Vec<&[&[u32]]> = Vec::with_capacity(lanes.len());
         let mut kv_less_seats: Vec<bool> = Vec::with_capacity(lanes.len());
         let mut masks: Vec<crate::mask::LaneMask<'_>> = Vec::with_capacity(lanes.len());
         let mut tokens: Vec<i32> = Vec::with_capacity(rows as usize);
@@ -907,6 +909,7 @@ impl FrameShell for Shell {
                 (Some(_), None) => std::borrow::Cow::Borrowed(&[][..]),
                 (None, None) => std::borrow::Cow::Borrowed(seated.window),
             });
+            more_windows.push(seated.more_windows);
             // A kv-less lane's mask goes to the group-packed attention, not the paged prefill.
             let masking = if seated.kv_less {
                 None
@@ -1239,32 +1242,50 @@ impl FrameShell for Shell {
             }
         }
         let paging = self.pools.paging();
-        let window_tables = if self.pools.has_windowed() {
-            seats
-                .iter()
-                .zip(&tables)
-                .zip(&window_ids)
-                .zip(&kv_less_seats)
-                .map(|(((seat, table), ids), &kv_less)| {
-                    if kv_less {
-                        Ok(table.to_vec())
-                    } else if self.pools.by_refs() {
-                        window_refs(&paging, seat, ids)
-                    } else {
-                        kv::window_table(&paging, seat, table, ids)
-                    }
-                })
-                .collect::<Result<Vec<_>>>()?
+        // Each window list's table a lane, narrowest window first. Where
+        // lanes name slot refs a list has refs of its own; today's windowed
+        // page ids name a slot of every list.
+        let window_lists = if self.pools.has_windowed() {
+            self.pools.geometries() - usize::from(!self.pools.windowed_geometry(0))
         } else {
-            Vec::new()
+            0
         };
-        // The windowed pages this fire's tables name, backed as they are
-        // first used.
-        let window_pages: Vec<u64> = window_tables
+        let mut window_tables: Vec<Vec<Vec<u32>>> = Vec::with_capacity(window_lists);
+        for window in 0..window_lists {
+            let retained = self.pools.window_tokens(window);
+            window_tables.push(
+                seats
+                    .iter()
+                    .enumerate()
+                    .map(|(lane, seat)| {
+                        let (table, ids) = (&tables[lane], &window_ids[lane]);
+                        if kv_less_seats[lane] {
+                            Ok(table.to_vec())
+                        } else if self.pools.by_refs() {
+                            let ids: &[u32] = match window {
+                                0 => ids,
+                                past => more_windows[lane].get(past - 1).copied().unwrap_or(&[]),
+                            };
+                            window_refs(&paging, retained, seat, ids)
+                        } else {
+                            kv::window_table(&paging, seat, table, ids)
+                        }
+                    })
+                    .collect::<Result<Vec<_>>>()?,
+            );
+        }
+        // The windowed pages this fire's tables name, a list's apart, backed
+        // as they are first used.
+        let window_pages: Vec<Vec<u64>> = window_tables
             .iter()
-            .zip(&kv_less_seats)
-            .filter(|(_, kv_less)| !**kv_less)
-            .flat_map(|(table, _)| table.iter().map(|&page| u64::from(page)))
+            .map(|tables| {
+                tables
+                    .iter()
+                    .zip(&kv_less_seats)
+                    .filter(|(_, kv_less)| !**kv_less)
+                    .flat_map(|(table, _)| table.iter().map(|&page| u64::from(page)))
+                    .collect()
+            })
             .collect();
         self.pools.commit_frame(demand, &kv_ranges, &window_pages)?;
         // The rs buffer pages the lanes name, seated before a row lands.
@@ -1278,14 +1299,16 @@ impl FrameShell for Shell {
 
         let indptr_host = kv::indptr(&seats)?;
         let table_refs: Vec<&[u32]> = tables.iter().map(std::convert::AsRef::as_ref).collect();
-        let window_refs: Vec<&[u32]> = window_tables.iter().map(Vec::as_slice).collect();
         let mut geometries = (0..self.page_tables)
-            .map(|table| {
-                if self.pools.windowed_geometry(table) {
-                    kv::geometry_with(&paging, &seats, &window_refs)
-                } else {
-                    kv::geometry_with(&paging, &seats, &table_refs)
+            .map(|table| match self.pools.geometry_window(table) {
+                Some(window) => {
+                    let refs: Vec<&[u32]> = window_tables
+                        .get(window)
+                        .map(|tables| tables.iter().map(Vec::as_slice).collect())
+                        .unwrap_or_default();
+                    kv::geometry_with(&paging, &seats, &refs)
                 }
+                None => kv::geometry_with(&paging, &seats, &table_refs),
             })
             .collect::<Result<Vec<_>>>()?;
         super::btrace::mark("page_arith");
@@ -1301,17 +1324,17 @@ impl FrameShell for Shell {
                     .unwrap_or(0)
             };
             for (table, geometry) in geometries.iter_mut().enumerate() {
-                let windowed = self.pools.windowed_geometry(table);
+                let windowed = self.pools.geometry_window(table);
                 for (row, stated) in writes.iter().enumerate() {
                     let Some((page, offset)) = *stated else {
                         continue;
                     };
-                    let page = if windowed {
+                    let page = if let Some(window) = windowed {
                         let lane = lane_of(row);
                         let at = tables[lane]
                             .iter()
                             .position(|&held| i64::from(held) == i64::from(page));
-                        match at.and_then(|at| window_tables[lane].get(at)) {
+                        match at.and_then(|at| window_tables.get(window)?.get(lane)?.get(at)) {
                             Some(&id) if id != 0 => id as i32,
                             _ => {
                                 return Err(Fault::program(
@@ -1351,9 +1374,12 @@ impl FrameShell for Shell {
         // slot it is seated on in the state pool.
         let mut device_geometries = geometries.clone();
         for (table, geometry) in device_geometries.iter_mut().enumerate() {
-            let windowed = self.pools.windowed_geometry(table);
-            self.pools.page_ids(windowed, &mut geometry.indices)?;
-            self.pools.page_ids(windowed, &mut geometry.write_page)?;
+            let list = self
+                .pools
+                .geometry_window(table)
+                .map_or(0, |window| window as u8 + 1);
+            self.pools.page_ids(list, &mut geometry.indices)?;
+            self.pools.page_ids(list, &mut geometry.write_page)?;
         }
 
         super::btrace::mark("admit");
@@ -1801,18 +1827,24 @@ fn fold_held(
     }
 }
 
-/// A lane's windowed table where it names window list slot refs: a page wholly
-/// behind the window of the lane's first row reads the null slot, the rest
-/// the refs the lane was handed, one a page of its table.
-fn window_refs(paging: &kv::Paging, seat: &kv::Seat, refs: &[u32]) -> Result<Vec<u32>> {
-    let Some(window) = paging.window else {
+/// A lane's table of a window list retaining `retained` tokens, where it
+/// names the list's slot refs: a page wholly behind the window of the lane's
+/// first row reads the null slot, the rest the refs the lane was handed, one
+/// a page of its table.
+fn window_refs(
+    paging: &kv::Paging,
+    retained: Option<u32>,
+    seat: &kv::Seat,
+    refs: &[u32],
+) -> Result<Vec<u32>> {
+    let Some(retained) = retained.filter(|_| paging.window.is_some()) else {
         return Ok(refs.to_vec());
     };
     let page_size = u64::from(paging.page_size);
     let pages = (u64::from(seat.have) + u64::from(seat.rows))
         .div_ceil(page_size)
         .max(1);
-    let first = u64::from(seat.have.saturating_sub(window.tokens)) / page_size;
+    let first = u64::from(seat.have.saturating_sub(retained)) / page_size;
     (0..pages)
         .map(|page| {
             if page < first {

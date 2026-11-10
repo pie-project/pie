@@ -442,6 +442,9 @@ pub fn device_memory() -> Result<(u64, u64)> {
 enum Shape {
     Kv {
         windowed: bool,
+        /// The list its pages are slots of: 0 the kv list, `n` window list
+        /// `n - 1`.
+        list: u8,
         dtype: Dtype,
         keys_width: u64,
         values_width: u64,
@@ -743,9 +746,18 @@ impl Pools {
         chunk_bytes: Option<u64>,
         experts: &[usize],
         rows: bool,
+        one_window: bool,
     ) -> Result<Pools> {
         let pool = PhysicalPool::open(device, utilization)?;
-        let layout = lay(trace, &paging, budgets, chunk_bytes, experts, rows)?;
+        let layout = lay(
+            trace,
+            &paging,
+            budgets,
+            chunk_bytes,
+            experts,
+            rows,
+            one_window,
+        )?;
         let mut shapes = Vec::with_capacity(trace.caches.len());
 
         for (index, row) in trace.caches.iter().enumerate() {
@@ -761,6 +773,24 @@ impl Pools {
                 } => {
                     let element = elem_bytes(name, *dtype)?;
                     let windowed = window.is_some() && paging.window.is_some();
+                    // A windowed row pages in the window list of its window.
+                    let list = match window.filter(|_| windowed) {
+                        None => 0u8,
+                        Some(held) => layout
+                            .windows
+                            .iter()
+                            .position(|shape| shape.window == Some(held))
+                            .map(|at| at as u8 + 1)
+                            .ok_or_else(|| {
+                                Fault::program(
+                                    "store::reserve",
+                                    format!(
+                                        "cache `{name}` is read through a window of {held} \
+                                         tokens, which the chunk recipe lays no list for"
+                                    ),
+                                )
+                            })?,
+                    };
                     let (keys_width, values_width, values_plane) = match planes.as_slice() {
                         [plane] => (*plane, *plane, 0),
                         [keys, values] => (*keys, *values, 1),
@@ -812,7 +842,7 @@ impl Pools {
                         }
                     }
                     let at = layout
-                        .shape(Kind::paged(windowed))
+                        .shape(Kind::paged(list))
                         .and_then(|shape| shape.offset_of(index as u32))
                         .ok_or_else(|| {
                             Fault::program(
@@ -824,6 +854,7 @@ impl Pools {
                     shapes.push(Shape::Kv {
                         offsets: [at, at + if values_plane == 0 { 0 } else { keys }],
                         windowed,
+                        list,
                         dtype: *dtype,
                         keys_width,
                         values_width,
@@ -859,13 +890,13 @@ impl Pools {
         for (row, width) in poem_compiler::chunk::census::pooled(trace) {
             // A state keyed by a windowed row's pages (`row` is the cache
             // row its gather reads) lies in the windowed pages' slots.
-            let windowed = paging.window.is_some()
-                && matches!(
-                    shapes.get(row as usize),
-                    Some(Shape::Kv { windowed: true, .. })
-                );
+            let list = match shapes.get(row as usize) {
+                Some(Shape::Kv { list, .. }) if paging.window.is_some() => *list,
+                _ => 0,
+            };
+            let windowed = list != 0;
             let offset = layout
-                .shape(Kind::paged(windowed))
+                .shape(Kind::paged(list))
                 .and_then(|shape| shape.pool_of(row))
                 .ok_or_else(|| {
                     Fault::program(
@@ -880,6 +911,7 @@ impl Pools {
                 row,
                 width,
                 windowed,
+                list,
                 offset,
             });
         }
@@ -929,7 +961,7 @@ impl Pools {
             .iter()
             .map(|row| {
                 let grain = layout
-                    .shape(Kind::paged(row.windowed))
+                    .shape(Kind::paged(row.list))
                     .map_or(0, |shape| shape.grain);
                 let rows = u32::try_from(self.chunks.bytes() / row.plane_bytes(1).max(1))
                     .unwrap_or(u32::MAX);
@@ -1172,18 +1204,50 @@ impl Pools {
     }
 
     /// The page tables a fire stages: one a kv shape, the list's and then
-    /// the window list's. Every kv row of a shape reads its shape's.
+    /// each window list's, narrowest first. Every kv row of a shape reads
+    /// its shape's.
     #[must_use]
     pub fn geometries(&self) -> usize {
         let layout = self.chunks.layout();
-        usize::from(layout.list.is_some()) + usize::from(layout.window.is_some())
+        usize::from(layout.list.is_some()) + layout.windows.len()
     }
 
-    /// Whether page table `at` of a fire's is the window list's.
+    /// Whether page table `at` of a fire's is a window list's.
     #[must_use]
     pub fn windowed_geometry(&self, at: usize) -> bool {
+        self.geometry_window(at).is_some()
+    }
+
+    /// The window list page table `at` of a fire's is of, if it is one's.
+    #[must_use]
+    pub fn geometry_window(&self, at: usize) -> Option<usize> {
         let layout = self.chunks.layout();
-        layout.window.is_some() && at == usize::from(layout.list.is_some())
+        at.checked_sub(usize::from(layout.list.is_some()))
+            .filter(|&window| window < layout.windows.len())
+    }
+
+    /// The tokens window list `window` retains.
+    #[must_use]
+    pub fn window_tokens(&self, window: usize) -> Option<u32> {
+        self.chunks
+            .layout()
+            .windows
+            .get(window)
+            .and_then(|shape| shape.window)
+    }
+
+    /// Each window list's retention and the page table of a fire's its
+    /// rows read.
+    #[must_use]
+    pub fn window_tables(&self) -> Vec<(u32, u32)> {
+        let layout = self.chunks.layout();
+        let first = usize::from(layout.list.is_some());
+        layout
+            .windows
+            .iter()
+            .enumerate()
+            .filter_map(|(at, shape)| Some((shape.window?, (first + at) as u32)))
+            .collect()
     }
 
     /// The page table of a fire's that the kv rows paged in the window
@@ -1191,18 +1255,11 @@ impl Pools {
     /// first, and the All axis's: a model keeping no full-retention row
     /// pages its All axis in its window list, then the only one.
     #[must_use]
-    pub fn table_of(&self, windowed: bool) -> usize {
-        if windowed {
-            usize::from(self.chunks.layout().list.is_some())
-        } else {
-            0
+    pub fn table_of(&self, list: u8) -> usize {
+        match list {
+            0 => 0,
+            window => usize::from(self.chunks.layout().list.is_some()) + usize::from(window) - 1,
         }
-    }
-
-    /// The page table a fire's rows retained through a window read.
-    #[must_use]
-    pub fn window_table(&self) -> usize {
-        self.table_of(self.paging.window.is_some())
     }
 
     #[must_use]
@@ -1275,7 +1332,11 @@ impl Pools {
                 have: capacity,
             });
         }
-        self.seat_pages(Kind::Window, fresh.iter().copied())
+        // A windowed page is a slot of every window list.
+        for window in 0..self.chunks.layout().windows.len() {
+            self.seat_pages(Kind::Window(window as u8), fresh.iter().copied())?;
+        }
+        Ok(())
     }
 
     #[must_use]
@@ -1289,6 +1350,7 @@ impl Pools {
             table.push(match *shape {
                 Shape::Kv {
                     windowed,
+                    list,
                     dtype,
                     keys_width,
                     values_width,
@@ -1297,7 +1359,7 @@ impl Pools {
                     live,
                     offsets,
                 } => {
-                    let table = self.table_of(windowed);
+                    let table = self.table_of(list);
                     let seat = seats.page_tables.get(table).ok_or_else(|| Fault::Unbound {
                         what: format!("page table {table}, which this fire staged none of"),
                     })?;
@@ -1312,7 +1374,7 @@ impl Pools {
                     let grain = self
                         .chunks
                         .layout()
-                        .shape(Kind::paged(windowed))
+                        .shape(Kind::paged(list))
                         .map_or(0, |shape| shape.grain);
                     let _ = values_plane;
                     let plane = |at: usize, width: u64| {
@@ -1713,6 +1775,7 @@ impl Pools {
         for shape in &self.shapes {
             let Shape::Kv {
                 windowed: in_window,
+                list,
                 dtype,
                 keys_width,
                 values_width,
@@ -1741,9 +1804,9 @@ impl Pools {
                     crate::device::copy_d2d(
                         stream,
                         self.chunks
-                            .span(Kind::paged(in_window), span.dst_page, dst, bytes)?,
+                            .span(Kind::paged(list), span.dst_page, dst, bytes)?,
                         self.chunks
-                            .span(Kind::paged(in_window), span.src_page, src, bytes)?,
+                            .span(Kind::paged(list), span.src_page, src, bytes)?,
                         usize::try_from(bytes).unwrap_or(0),
                     )?;
                 }
@@ -1773,7 +1836,7 @@ impl Pools {
                 (0..2).map(move |at| {
                     (
                         PlaneAt {
-                            kind: Kind::paged(windowed),
+                            kind: Kind::paged(row.list),
                             offset: row.offset + at * bytes,
                         },
                         bytes,
@@ -1798,6 +1861,7 @@ impl Pools {
         for shape in &self.shapes {
             let Shape::Kv {
                 windowed: in_window,
+                list,
                 values_plane,
                 offsets,
                 ..
@@ -1811,7 +1875,7 @@ impl Pools {
             for (at, &offset) in offsets.iter().enumerate().take(values_plane + 1) {
                 planes.push((
                     PlaneAt {
-                        kind: Kind::paged(windowed),
+                        kind: Kind::paged(list),
                         offset,
                     },
                     shape.page_bytes(at, self.paging.page_size),
@@ -1827,11 +1891,12 @@ impl Pools {
         self.chunks.span(plane.kind, page, plane.offset, bytes)
     }
 
-    /// Rewrites the page ids of a fire's table (the windowed rows', `windowed`)
+    /// Rewrites the page ids of a fire's table (list `list`'s: 0 the kv
+    /// list, `n` window list `n - 1`)
     /// as the ids the paged kernels read their slots by; the fire's commit
     /// has seated them.
-    pub fn page_ids(&self, windowed: bool, ids: &mut [i32]) -> Result<()> {
-        self.chunks.page_ids(Kind::paged(windowed), ids)
+    pub fn page_ids(&self, list: u8, ids: &mut [i32]) -> Result<()> {
+        self.chunks.page_ids(Kind::paged(list), ids)
     }
 
     /// Whether the load keeps a recurrent record for state slot `slot`;
@@ -2529,7 +2594,9 @@ impl Pools {
     fn kind_of(shape: engine::chunk::ShapeId) -> Result<Kind> {
         Ok(match shape {
             layout::LIST => Kind::List,
-            layout::WINDOW => Kind::Window,
+            window if layout::window_of(window).is_some() => {
+                Kind::Window(layout::window_of(window).unwrap_or(0) as u8)
+            }
             layout::FIXED => Kind::Fixed,
             layout::RS => Kind::Rs,
             other => {
@@ -3203,7 +3270,7 @@ impl Pools {
         &mut self,
         demand: engine::frame::Demand,
         kv_ranges: &[(u64, u64)],
-        window_pages: &[u64],
+        window_pages: &[Vec<u64>],
     ) -> Result<()> {
         self.seat_pages(
             Kind::List,
@@ -3212,7 +3279,15 @@ impl Pools {
                 .flat_map(|&(first, count)| first..first.saturating_add(count)),
         )?;
         let _ = demand;
-        self.ensure_windowed(window_pages.iter().copied())
+        if self.chunks.by_refs() {
+            // Each window list's slot refs are its own.
+            for (window, pages) in window_pages.iter().enumerate() {
+                self.seat_pages(Kind::Window(window as u8), pages.iter().copied())?;
+            }
+            Ok(())
+        } else {
+            self.ensure_windowed(window_pages.iter().flatten().copied())
+        }
     }
 
     fn commit_ranges(
@@ -3258,6 +3333,7 @@ fn lay(
     chunk_bytes: Option<u64>,
     experts: &[usize],
     rows: bool,
+    one_window: bool,
 ) -> Result<layout::Layout> {
     let context = if paging.window.is_some() {
         paging.context()
@@ -3268,8 +3344,9 @@ fn lay(
     if let Some(bytes) = chunk_bytes {
         server.target_chunk_bytes = bytes;
     }
+    let paged = server.paged(paging.page_size, context);
     let profile = poem_compiler::DeviceProfile {
-        chunk: server.paged(paging.page_size, context),
+        chunk: if one_window { paged.merged() } else { paged },
         ..poem_compiler::DeviceProfile::default()
     };
     let recipe =
@@ -3295,7 +3372,11 @@ fn lay(
 fn chunks_at(layout: &layout::Layout, paging: &Paging, pages: u64, slots: u32) -> u32 {
     let chunks = 1
         + layout.chunks_for(Kind::List, pages)
-        + layout.chunks_for(Kind::Window, paging.window_pages_at(pages))
+        + (0..layout.windows.len())
+            .map(|window| {
+                layout.chunks_for(Kind::Window(window as u8), paging.window_pages_at(pages))
+            })
+            .sum::<u64>()
         + layout.chunks_for(
             Kind::Fixed,
             u64::from(slots)
@@ -3366,6 +3447,8 @@ struct PoolRow {
     width: u64,
     /// Keyed by a windowed row's pages.
     windowed: bool,
+    /// The list those pages are slots of ([`Shape::Kv`]'s).
+    list: u8,
     offset: u64,
 }
 

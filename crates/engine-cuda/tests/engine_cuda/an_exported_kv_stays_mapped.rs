@@ -54,6 +54,7 @@ fn an_exported_kv_stays_mapped() {
         None,
         &[],
         true,
+        false,
     )
     .expect("the pool reserves");
     let exported = pools

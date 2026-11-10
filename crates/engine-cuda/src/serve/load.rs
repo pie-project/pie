@@ -900,6 +900,7 @@ impl Shell {
             boot.knobs.diagnostics.chunk_bytes,
             boot.residency.cached_experts(),
             !boot.knobs.diagnostics.dense_weights,
+            boot.knobs.diagnostics.one_window,
         )?;
         if boot.knobs.diagnostics.arm_trace {
             eprintln!(

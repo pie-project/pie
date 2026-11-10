@@ -177,6 +177,25 @@ fn write_checkpoint(path: &Path, trace: &Trace) {
                     )
                 }
             }
+            // A quantized plane's bytes, each kept finite: e4m3 codes of a
+            // small magnitude, e8m0 exponents near one, and 4-bit codes.
+            Dtype::E4m3 => (
+                ztensor::Leaf::E4M3,
+                (0..count)
+                    .map(|_| {
+                        let bits = next();
+                        ((bits & 0x80) | (0x18 + (bits >> 8) % 0x28)) as u8
+                    })
+                    .collect(),
+            ),
+            Dtype::E8m0 => (
+                ztensor::Leaf::E8M0,
+                (0..count).map(|_| (118 + next() % 6) as u8).collect(),
+            ),
+            Dtype::U8 => (
+                ztensor::Leaf::U8,
+                (0..count).map(|_| next() as u8).collect(),
+            ),
             other => panic!("`{}` is {other:?}, not a dtype the probe seeds", param.name),
         };
         writer
@@ -192,9 +211,19 @@ fn write_checkpoint(path: &Path, trace: &Trace) {
 /// layout states a dtype per component (its routed experts apart) gets
 /// bf16 for each.
 fn trace_of(model: &str) -> Trace {
+    // A catalog deployment by its full name, as it is deployed (its weights'
+    // and kv's formats, its drafter); else a model's bf16 trace.
+    if let Some(deployment) = poem_compiler::catalog::deployment(model) {
+        return deployment.trace(Platform::Cuda);
+    }
     let package = poem_compiler::catalog::package_of(model)
         .unwrap_or_else(|| panic!("no package holds `{model}`"));
     let mut deploy = poem_compiler::catalog::one_rank(Dtype::Bf16, Dtype::Bf16);
+    // `PIE_GOLDEN_DRAFTER`: the model with a drafter head of that name (a
+    // drafter's rows may be read through a window of their own).
+    if let Ok(drafter) = std::env::var("PIE_GOLDEN_DRAFTER") {
+        deploy.drafter = Some(drafter);
+    }
     let mut first = None;
     for _ in 0..3 {
         match package.trace(model, &deploy, model, Platform::Cuda) {
@@ -291,6 +320,16 @@ fn knobs() -> engine_cuda::Knobs {
     if let Ok(bytes) = std::env::var("PIE_GOLDEN_CHUNK") {
         knobs.diagnostics.chunk_bytes = Some(bytes.parse().expect("PIE_GOLDEN_CHUNK is bytes"));
     }
+    // `PIE_GOLDEN_EAGER`: no graph captured and no body recorded; every
+    // fire walks its plan. The logits are a recorded body's.
+    if std::env::var_os("PIE_GOLDEN_EAGER").is_some() {
+        knobs.chip = Some(engine_cuda::chip::pinned(
+            engine_cuda::Graphs::Off,
+            Some(engine_cuda::Recording::Off),
+        ));
+    }
+    // `PIE_GOLDEN_ONE_WINDOW`: every windowed row in one window list.
+    knobs.diagnostics.one_window = std::env::var_os("PIE_GOLDEN_ONE_WINDOW").is_some();
     // No weight shape stated: the tables and routed banks dense on the
     // device, as the base engine seats them. The weight cache's own probes
     // load with its shapes ([`load_cached`]).
@@ -436,7 +475,14 @@ fn served_by_refs(fixture: &Fixture, cache: &Path) -> Vec<(u64, u32)> {
     let spread = segment / 2;
     let mut refs = Refs::of(facts.clone(), segment);
     let list = refs.shape(|kind| matches!(kind, SlotKind::List { window: None, .. }));
-    let window_list = refs.shape(|kind| kind.window().is_some());
+    // Each window list, narrowest first: a table of its own.
+    let window_lists: Vec<usize> = facts
+        .shapes
+        .iter()
+        .enumerate()
+        .filter(|(_, shape)| shape.kind.window().is_some())
+        .map(|(at, _)| at)
+        .collect();
     let fixed = refs.shape(|kind| matches!(kind, SlotKind::Fixed { .. }));
     shell.take_refs();
     shell.commit_segments(2).expect("two segments commit");
@@ -448,7 +494,8 @@ fn served_by_refs(fixture: &Fixture, cache: &Path) -> Vec<(u64, u32)> {
         let pieces: Vec<u32> = (0..pieces).map(|_| refs.take(shape)).collect();
         shell.name_record(&pieces).expect("the record is named")
     });
-    let (mut pages, mut window): (Vec<u32>, Vec<u32>) = (Vec::new(), Vec::new());
+    let mut pages: Vec<u32> = Vec::new();
+    let mut windows: Vec<Vec<u32>> = vec![Vec::new(); window_lists.len()];
     let mut low = false;
     let mut fed = 0u32;
     let mut last = None;
@@ -463,8 +510,8 @@ fn served_by_refs(fixture: &Fixture, cache: &Path) -> Vec<(u64, u32)> {
             if let Some(shape) = list {
                 pages.push(refs.take(shape));
             }
-            if let Some(shape) = window_list {
-                window.push(refs.take(shape));
+            for (table, &shape) in windows.iter_mut().zip(&window_lists) {
+                table.push(refs.take(shape));
             }
         }
         assert!(
@@ -475,10 +522,12 @@ fn served_by_refs(fixture: &Fixture, cache: &Path) -> Vec<(u64, u32)> {
             u32::try_from(tokens.len()).expect("a count"),
             false,
         ));
+        let more: Vec<&[u32]> = windows.iter().skip(1).map(Vec::as_slice).collect();
         let seated = Seated {
             pages: &pages,
             held: Some(fed),
-            window: &window,
+            window: windows.first().map_or(&[], Vec::as_slice),
+            more_windows: &more,
             rs_slot: record,
             ..Seated::of(Lane {
                 slot: 0,
@@ -493,9 +542,11 @@ fn served_by_refs(fixture: &Fixture, cache: &Path) -> Vec<(u64, u32)> {
         fed = after;
         // What the runtime trims: a window list's slot whose last row lies
         // behind the window of the rows held is the null ref from here on.
-        if let Some(retained) = window_list.and_then(|shape| facts.shapes[shape].kind.window()) {
+        // Each list is trimmed by its own window.
+        for (table, &shape) in windows.iter_mut().zip(&window_lists) {
+            let retained = facts.shapes[shape].kind.window().unwrap_or(u32::MAX);
             let behind = (fed.saturating_sub(retained) / PAGE) as usize;
-            for slot in window.iter_mut().take(behind) {
+            for slot in table.iter_mut().take(behind) {
                 *slot = 0;
             }
         }
@@ -2137,5 +2188,67 @@ fn golden_experts() {
                 );
             }
         }
+    }
+}
+
+/// The eager probe: each of `PIE_GOLDEN_MODELS` served over [`SCRIPT`] with
+/// its bodies recorded (the default) and with every fire walking its plan
+/// (no graph, no body). An eager walk may take other kernels than a capture
+/// does, so the two are printed against each other, never asserted: a
+/// recorded body that replays wrongly shows as a difference far past a
+/// kernel's rounding.
+#[test]
+#[ignore = "a probe run by hand: see the module's doc"]
+fn golden_eager() {
+    if !engine_cuda::device::present() {
+        eprintln!("skipping: no CUDA device on this machine");
+        return;
+    }
+    let cache = cache_dir();
+    for model in models() {
+        let fixture = fixture(&model, &cache);
+        let serve = |eager: bool| -> Vec<Vec<f32>> {
+            let mut knobs = knobs();
+            if eager {
+                knobs.chip = Some(engine_cuda::chip::pinned(
+                    engine_cuda::Graphs::Off,
+                    Some(engine_cuda::Recording::Off),
+                ));
+            }
+            let mut shell = load_with(&fixture, &cache, knobs);
+            shell.open(0).expect("slot 0 opens");
+            let mut fed = 0u32;
+            SCRIPT
+                .iter()
+                .map(|step| {
+                    // Fixed tokens, so the two servings read the same rows.
+                    let rows = match *step {
+                        Step::Prefill(rows) => rows,
+                        Step::Decode => 1,
+                    };
+                    let tokens: Vec<u32> = (fed..fed + rows).map(|t| (t * 7 + 11) % 1000).collect();
+                    fed += rows;
+                    fire(&mut shell, &fixture.trace, &tokens)
+                })
+                .collect()
+        };
+        let _ = serve(false);
+        let (recorded, eager) = (serve(false), serve(true));
+        let most = recorded
+            .iter()
+            .zip(&eager)
+            .flat_map(|(a, b)| a.iter().zip(b).map(|(a, b)| (a - b).abs()))
+            .fold(0f32, f32::max);
+        let span = recorded.iter().flatten().fold(0f32, |m, v| m.max(v.abs()));
+        let tops = recorded
+            .iter()
+            .zip(&eager)
+            .filter(|(a, b)| argmax(a) != argmax(b))
+            .count();
+        println!(
+            "eager {model}: most |diff| {most:e} of logits up to {span:.2}, {tops} of {} \
+             steps' top tokens differ",
+            recorded.len()
+        );
     }
 }

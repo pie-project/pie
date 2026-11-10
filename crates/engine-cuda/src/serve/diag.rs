@@ -30,6 +30,10 @@ pub struct Diagnostics {
     /// States no expert shape: the routed banks stay dense on the device,
     /// while the tables streamed by their rows are stated.
     pub dense_experts: bool,
+    /// Lays every windowed kv row in one window list, of the widest window:
+    /// a row of a narrower window then keeps pages its kernels no longer
+    /// read. The same logits as a list a window.
+    pub one_window: bool,
 }
 
 /// The sync guard's answer to a fire that waited for the device.
@@ -63,6 +67,7 @@ impl Default for Diagnostics {
             chunk_bytes: None,
             dense_weights: false,
             dense_experts: false,
+            one_window: false,
         }
     }
 }
@@ -123,6 +128,9 @@ impl Diagnostics {
         if self.dense_experts {
             words.push("dense-experts".to_string());
         }
+        if self.one_window {
+            words.push("one-window".to_string());
+        }
         (!words.is_empty()).then(|| words.join(","))
     }
 }
@@ -142,7 +150,7 @@ const WORDS: &str = "`golden-probe`, `arm-trace`, \
      `plan-trace=<rows|all>`, `arm-bench=<key>`, `capture-serial`, `boundary-trace`, `reap-trace`, \
      `trace-census`, `nan-check`, `fuse-chains=off`, `gumbel-direct=off`, \
      `sync-guard[=panic]`, `chunk-bytes=<bytes>`, `dense-weights`, \
-     `dense-experts`";
+     `dense-experts`, `one-window`";
 
 impl std::str::FromStr for Diagnostics {
     type Err = String;
@@ -168,6 +176,7 @@ impl std::str::FromStr for Diagnostics {
                 "nan-check" => diag.nan_check = switch(word, value)?,
                 "dense-weights" => diag.dense_weights = switch(word, value)?,
                 "dense-experts" => diag.dense_experts = switch(word, value)?,
+                "one-window" => diag.one_window = switch(word, value)?,
                 "fuse-chains" => diag.fuse_chains = switch(word, value)?,
                 "gumbel-direct" => diag.gumbel_direct = switch(word, value)?,
                 "sync-guard" => {
