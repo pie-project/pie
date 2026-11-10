@@ -15,6 +15,11 @@ fn locate(offset: u32) -> (usize, u64) {
 
 /// Ids handed out lowest first, so what is held packs toward the bottom of
 /// the range and a tail stays empty to give back.
+///
+/// The kv store's host and disk slots come from here. The device pools take
+/// their ids from [`super::chunks::ShapePool`]s, which are checked against
+/// this pool's epochs and limits, call for call.
+#[cfg_attr(not(test), allow(dead_code))]
 pub struct Pool<I> {
     /// A set bit: the id at that offset past `base` is free.
     free: Vec<u64>,
@@ -30,6 +35,7 @@ pub struct Pool<I> {
     id: PhantomData<I>,
 }
 
+#[cfg_attr(not(test), allow(dead_code))]
 impl<I: PoolId> Pool<I> {
     pub fn new(capacity: u32) -> Self {
         Self::new_range(0, capacity)
@@ -194,10 +200,6 @@ impl<I: PoolId> Pool<I> {
 
     pub fn limit(&self) -> u32 {
         self.limit
-    }
-
-    pub fn base(&self) -> u32 {
-        self.base
     }
 
     pub fn contains(&self, id: I) -> bool {

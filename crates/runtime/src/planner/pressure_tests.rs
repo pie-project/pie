@@ -50,6 +50,12 @@ impl KeptPool {
 }
 
 impl PoolPort for KeptPool {
+    fn chunk_stats(&self) -> ChunkStats {
+        ChunkStats {
+            pages: (self.free.lock().len() as u32, self.total),
+            rs: self.rs_stats(),
+        }
+    }
     fn device_stats(&self) -> (u32, u32) {
         (self.free.lock().len() as u32, self.total)
     }

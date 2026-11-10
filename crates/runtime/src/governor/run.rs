@@ -1,14 +1,12 @@
 //! The loop, on a pool: read the system, move the target.
 
 use super::{
-    Demand, Governor, Growth, Limits, PoolTarget, Pressure, Retarget, Signal, System, TICK,
-    Tolerance,
+    Governor, Growth, Limits, PoolTarget, Pressure, Retarget, Signal, System, TICK, Tolerance,
 };
-use crate::store::extent::{Asked, Extent, Split};
+use crate::store::grow::Grow;
 
 /// A dedicated process's whole pool stands: there is nothing to answer.
-pub fn start(extent: Extent, tolerance: Tolerance) {
-    let pool = ExtentPool::new(extent);
+pub fn start(pool: Grow, tolerance: Tolerance) {
     if tolerance == Tolerance::Dedicated || pool.growth() == Growth::Fixed {
         return;
     }
@@ -138,110 +136,32 @@ impl Steer {
     }
 }
 
-async fn watch(mut pool: ExtentPool, tolerance: Tolerance, mut system: Box<dyn System>) {
+async fn watch(mut pool: Grow, tolerance: Tolerance, mut system: Box<dyn System>) {
     let mut steer = Steer::new(&pool, tolerance, GROWTH_STEP);
-    let extent = pool.extent.clone();
+    let grow = pool.clone();
     let mut interval = crate::rt::time::interval(TICK);
     loop {
         let waiter = tokio::select! {
             _ = interval.tick() => false,
-            () = extent.waiter() => true,
+            () = grow.waiter() => true,
         };
         let read = (!waiter).then(|| system.read());
         let turn = steer.turn(&mut pool, read, &mut |signal| {
             tracing::warn!(?signal, "pool short of its target");
         });
-        extent.set_can_rise(steer.governor().can_rise());
+        grow.set_can_rise(steer.governor().can_rise());
         if let Some(yielding) = turn.yielding {
-            extent.yield_scratch(yielding).await;
+            grow.yield_scratch(yielding).await;
         }
         if turn.idled {
-            extent.release_scratch().await;
+            grow.release_scratch().await;
         }
     }
-}
-
-/// Today's pools as one target: kv pages and state slots split a byte
-/// target by what each is asked, so a segment here is one byte. Their tails
-/// empty on the extent's own task; a retarget only moves the targets.
-struct ExtentPool {
-    extent: Extent,
-    asked: Option<Asked>,
-    last: Option<Split>,
-}
-
-impl ExtentPool {
-    const fn new(extent: Extent) -> Self {
-        Self {
-            extent,
-            asked: None,
-            last: None,
-        }
-    }
-}
-
-impl PoolTarget for ExtentPool {
-    fn demand(&mut self) -> Demand {
-        let asked = self.extent.asked();
-        self.asked = Some(asked);
-        Demand {
-            wanted: asked.wanted,
-            live: asked.live,
-        }
-    }
-
-    fn segment_bytes(&self) -> u64 {
-        1
-    }
-
-    fn floor(&self) -> u64 {
-        // One context's pages and its state, so one lane can always run.
-        self.extent.floor()
-    }
-
-    fn hard_limit(&self) -> u64 {
-        self.extent.hard_limit()
-    }
-
-    fn held(&self) -> u64 {
-        self.extent.held()
-    }
-
-    fn growth(&self) -> Growth {
-        Growth::Elastic {
-            least_cut: if self.extent.moves_by_copy() {
-                u64::MAX
-            } else {
-                u64::from(self.extent.step()).saturating_mul(self.extent.page_bytes())
-            },
-        }
-    }
-
-    fn retarget(&mut self, segments: u64) -> Retarget {
-        let asked = self.asked.unwrap_or_else(|| self.extent.asked());
-        let split = self.extent.split(segments, asked);
-        if self.last != Some(split) {
-            tracing::debug!(target = segments, ?split, "pool target");
-            self.extent.retarget(split);
-            self.last = Some(split);
-        }
-        Retarget::Reached
-    }
-
-    fn take_refused(&mut self) -> bool {
-        self.extent.take_refused()
-    }
-
-    /// Narrowing rides the yield: a critical tick yields, and the loop
-    /// narrows the waves as it does.
-    fn shrink_rung(&mut self) {}
-
-    fn restore_rung(&mut self) {}
 }
 
 #[cfg(test)]
 mod tests {
-    use super::super::{CUT_EVERY, IDLE_AFTER, KEEP_CACHE, SETTLED};
+    use super::super::{CUT_EVERY, Demand, IDLE_AFTER, KEEP_CACHE, SETTLED};
     use super::*;
 
     const MIB: u64 = 1 << 20;

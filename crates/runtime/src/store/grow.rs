@@ -1,19 +1,27 @@
-//! How far a pool's ids have memory under them.
+//! How an engine's slot pools grow and shrink: the governor's
+//! [`PoolTarget`].
 //!
-//! An elastic pool hands out only committed ids, and commits ahead of them
-//! here, off the frame path: a grant never waits on a mapping unless it
-//! outruns this task, no frame ever finds its pages unbacked, and a commit
-//! the device refuses costs a waiter an eviction instead of a frame.
+//! An elastic pool hands out only the ids of committed segments (see
+//! [`super::chunks::ShapePool`]), and commits ahead of them here, off the
+//! frame path: a grant never waits on a mapping unless it outruns this task,
+//! no frame ever finds its pages unbacked, and a commit the device refuses
+//! costs a waiter an eviction instead of a frame.
+//!
+//! The governor's byte target is split over the shapes by what each is
+//! asked, and each shape's pool stops handing out ids past its share. In
+//! the degenerate mode nothing can be evacuated: a segment past the target
+//! goes once its holders let it go, and until then the pool reports it held.
 //!
 //! Memory the target allows but nothing has committed reads as free to the
 //! planner, so it plans as over a whole pool and evicts only past the target.
 
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use tokio::sync::Notify;
 
+use crate::governor::{Demand, Growth, PoolTarget, Retarget};
 use crate::scheduler::worker::PoolOp;
 use crate::store::kv::KvStore;
 use crate::store::registry;
@@ -34,7 +42,7 @@ const WHOLE_STEPS: u32 = 8;
 const VACATE_POLL: Duration = Duration::from_millis(50);
 
 #[derive(Clone)]
-pub struct Extent {
+pub struct Grow {
     model: usize,
     engine: usize,
     wake: Arc<Notify>,
@@ -46,6 +54,8 @@ pub struct Extent {
     whole: bool,
     slot_bytes: u64,
     state_step: u32,
+    /// What the governor's last turn read, and the split it last set.
+    turn: Arc<Mutex<(Option<Asked>, Option<Split>)>>,
 }
 
 /// Where a byte target puts each pool.
@@ -63,14 +73,14 @@ pub(crate) struct Asked {
     state: u64,
 }
 
-impl Extent {
+impl Grow {
     /// The extent of `engine`'s pool of pages of `page_bytes`: from nothing,
     /// or `whole` when memory only moves by copying the pool, which is worth
     /// doing only when the system asks. `slot_bytes` is what a state slot
     /// takes where it gains memory as it is handed out, else zero.
     pub fn new(model: usize, engine: usize, page_bytes: u64, whole: bool, slot_bytes: u64) -> Self {
         let stores = registry::get(model, engine);
-        let pages = registry::with_kv_lock(&stores.kv, "extent", |kv| {
+        let pages = registry::with_kv_lock(&stores.kv, "grow", |kv| {
             if !whole {
                 kv.commit_on_demand();
             }
@@ -96,6 +106,7 @@ impl Extent {
             whole,
             slot_bytes,
             state_step: STATE_AHEAD,
+            turn: Arc::new(Mutex::new((None, None))),
         }
     }
 
@@ -112,13 +123,23 @@ impl Extent {
     /// What is asked for now and, of that, what no idle cache merely keeps;
     /// each with the step kept in hand ahead of it.
     pub(crate) fn asked(&self) -> Asked {
-        let (wanted, reach, kept) = self.kv(|kv| {
+        // The page pool's demand: what is held, and a waiter's shortfall on
+        // top; never below the highest page held, which no limit cuts off.
+        let (held, wanted, reach, kept) = self.kv(|kv| {
+            let pool = kv.page_pool();
+            let slots = |bytes: u64| bytes / pool.slot_bytes().max(1);
+            let demand = pool.demand();
             (
-                kv.pages_wanted(),
-                kv.high_end(),
+                slots(demand.live),
+                slots(demand.wanted),
+                pool.high_end(),
                 kv.reclaimable_cache_pages(),
             )
         });
+        let (held, wanted) = (
+            u32::try_from(held).unwrap_or(u32::MAX),
+            u32::try_from(wanted).unwrap_or(u32::MAX),
+        );
         let pages =
             |pages: u32| u64::from(pages.saturating_add(self.step)).saturating_mul(self.page_bytes);
         let (slots, in_use) = self.rs(|rs| rs.demand());
@@ -130,7 +151,7 @@ impl Extent {
         };
         Asked {
             wanted: pages(wanted.max(reach)).saturating_add(state(slots)),
-            live: pages(wanted.saturating_sub(kept)).saturating_add(state(in_use)),
+            live: pages(held.saturating_sub(kept)).saturating_add(state(in_use)),
             state: state(slots),
         }
     }
@@ -260,7 +281,7 @@ impl Extent {
 
     fn kv<T>(&self, read: impl FnOnce(&mut KvStore) -> T) -> T {
         let stores = registry::get(self.model, self.engine);
-        registry::with_kv_lock(&stores.kv, "extent", read)
+        registry::with_kv_lock(&stores.kv, "grow", read)
     }
 
     fn rs<T>(&self, read: impl FnOnce(&mut crate::store::rs::RsStore) -> T) -> T {
@@ -388,4 +409,72 @@ impl Extent {
             let _ = crate::rt::time::timeout(VACATE_POLL, self.wake.notified()).await;
         }
     }
+}
+
+/// Today's pools as one target: kv pages and state slots split a byte
+/// target by what each is asked, so a segment here is one byte. Their tails
+/// empty on the grow task; a retarget only moves the targets.
+impl PoolTarget for Grow {
+    fn demand(&mut self) -> Demand {
+        let asked = self.asked();
+        self.turn.lock().unwrap().0 = Some(asked);
+        Demand {
+            wanted: asked.wanted,
+            live: asked.live,
+        }
+    }
+
+    fn segment_bytes(&self) -> u64 {
+        1
+    }
+
+    fn floor(&self) -> u64 {
+        // One context's pages and its state, so one lane can always run.
+        Grow::floor(self)
+    }
+
+    fn hard_limit(&self) -> u64 {
+        Grow::hard_limit(self)
+    }
+
+    fn held(&self) -> u64 {
+        Grow::held(self)
+    }
+
+    fn growth(&self) -> Growth {
+        Growth::Elastic {
+            least_cut: if self.moves_by_copy() {
+                u64::MAX
+            } else {
+                u64::from(self.step()).saturating_mul(self.page_bytes())
+            },
+        }
+    }
+
+    fn retarget(&mut self, segments: u64) -> Retarget {
+        let asked = self.turn.lock().unwrap().0;
+        let asked = asked.unwrap_or_else(|| self.asked());
+        let split = self.split(segments, asked);
+        let changed = {
+            let mut turn = self.turn.lock().unwrap();
+            let changed = turn.1 != Some(split);
+            turn.1 = Some(split);
+            changed
+        };
+        if changed {
+            tracing::debug!(target = segments, ?split, "pool target");
+            Grow::retarget(self, split);
+        }
+        Retarget::Reached
+    }
+
+    fn take_refused(&mut self) -> bool {
+        Grow::take_refused(self)
+    }
+
+    /// Narrowing rides the yield: a critical tick yields, and the loop
+    /// narrows the waves as it does.
+    fn shrink_rung(&mut self) {}
+
+    fn restore_rung(&mut self) {}
 }

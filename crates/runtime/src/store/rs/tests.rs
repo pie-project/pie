@@ -48,6 +48,21 @@ fn tests_every_case() {
     a_window_is_a_ring_of_pages_anchored_at_its_commit();
     a_checkpoint_resumes_a_fresh_working_set();
     a_snapshot_resumes_at_its_row();
+    a_checkpoint_holds_its_rows_as_a_cache_entry();
+}
+
+// A checkpoint's rows are held by its cache entry: they count as cache only
+// once no working set holds them too, and the hold goes with the checkpoint.
+fn a_checkpoint_holds_its_rows_as_a_cache_entry() {
+    let mut s = store();
+    let ws = s.create_working_set(geom());
+    write_state(&mut s, ws);
+    assert!(s.checkpoint(ws, [9; 32], None).unwrap());
+    assert_eq!(s.cache_only(), slots(0), "the owner reads it still");
+    write_state(&mut s, ws);
+    assert_eq!(s.cache_only(), slots(1), "the owner's write copied away");
+    assert_eq!(s.reclaim_cache(|_| 0), 1);
+    assert_eq!(s.cache_only(), slots(0), "and its hold went with it");
 }
 
 // A windowed model's state is a ring: a fire takes the pages it writes,

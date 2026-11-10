@@ -36,10 +36,14 @@ pub use super::segments::{ChunkMove, Evacuation, SegmentError, SegmentState, Seg
 /// A slot shape's id: its index in [`SlotPoolFacts::shapes`].
 pub type ShapeId = u16;
 
-/// Working-set copies of each fixed slot: the one a fire reads and the
-/// copy-on-write one the same fire writes. Derived from how a fire updates
-/// fixed state in place, not configured.
-pub const FIXED_SETS_PER_WORKING_SET: u32 = 2;
+/// Fixed sets each working set holds: the one its fires read. Derived, not
+/// configured.
+pub const FIXED_SETS_PER_WORKING_SET: u32 = 1;
+
+/// Copy-on-write fixed sets each running lane holds while it fires: the one
+/// the fire writes before the working set's set is let go. Charged per lane
+/// a fire carries, not per working set.
+pub const COW_SETS_PER_LANE: u32 = 1;
 
 const NONE: u32 = u32::MAX;
 const NO_SHAPE: ShapeId = ShapeId::MAX;
@@ -63,7 +67,8 @@ pub struct SlotShape {
 }
 
 impl SlotShape {
-    /// Slot sets each working set holds of this shape.
+    /// Slot sets each working set holds of this shape; a running lane holds
+    /// [`COW_SETS_PER_LANE`] more of a fixed one.
     pub fn sets_per_working_set(&self) -> u32 {
         match self.kind {
             ShapeKind::Fixed => FIXED_SETS_PER_WORKING_SET,
@@ -1581,13 +1586,13 @@ mod tests {
     }
 
     #[test]
-    fn fixed_shapes_take_two_sets_per_working_set() {
+    fn a_working_set_holds_one_set_of_each_shape() {
         let fixed = SlotShape {
             kind: ShapeKind::Fixed,
             slot_bytes: 1,
             slots_per_chunk: 1,
         };
-        assert_eq!(fixed.sets_per_working_set(), 2);
+        assert_eq!(fixed.sets_per_working_set(), 1);
         assert_eq!(
             SlotShape {
                 kind: ShapeKind::List,

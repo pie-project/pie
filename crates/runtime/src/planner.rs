@@ -42,7 +42,7 @@ pub use global::{
     planners, rekey_holders, release, wake,
 };
 pub use grant::{AllocationGrant, Demand};
-pub use pool::{PoolPort, RegistryPool};
+pub use pool::{ChunkStats, PoolPort, RegistryPool};
 pub use residency_planner::ResidencyPlanner;
 pub use stats::PlannerStats;
 pub use trace::trace_enabled;
