@@ -246,6 +246,7 @@ jobs:
           name: languages
           path: target/languages/pie-language-*.tar.gz
           if-no-files-found: error
+          retention-days: 1
 
   android:
     name: "android: core (arm64) + Kotlin packages"
