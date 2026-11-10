@@ -72,9 +72,11 @@ fn state_dtype(declared: Dtype) -> Dtype {
     }
 }
 
-/// The null chunk and the sink chunk.
+/// The null chunk; the sink is the pool's top chunk ([`Pools::sink_chunk`]):
+/// every kernel that treats a plane view's last page or block as the sink
+/// (the prefill page writer drops rows bound there) then finds it in a
+/// chunk the runtime never hands out.
 const NULL_CHUNK: u32 = 0;
-const SINK_CHUNK: u32 = 1;
 const RESERVED_CHUNKS: u32 = 2;
 
 /// A plane's affine map: page or slot id `p` is the plane's block
@@ -568,7 +570,7 @@ impl Pools {
                 },
                 ReservedRun {
                     what: Reserved::Sink,
-                    first: SINK_CHUNK,
+                    first: self.sink_chunk(),
                     chunks: 1,
                 },
             ],
@@ -612,7 +614,7 @@ impl Pools {
             need: u64::from(logical) + 1,
             have: u64::from(self.chunks),
         })?;
-        if !null_ok && chunk < RESERVED_CHUNKS {
+        if !null_ok && (chunk == NULL_CHUNK || chunk >= self.sink_chunk()) {
             return Err(Fault::Unbound {
                 what: format!(
                     "slot ref {slot} of shape {id}, which lies in reserved chunk {chunk}"
@@ -631,11 +633,17 @@ impl Pools {
         slots.iter().map(|&slot| self.grain(id, slot)).collect()
     }
 
+    /// The sink chunk: the pool's top one.
+    #[must_use]
+    pub fn sink_chunk(&self) -> u32 {
+        self.chunks.saturating_sub(1)
+    }
+
     /// The grain index of shape `id`'s slot in the sink chunk.
     #[must_use]
     pub fn sink(&self, id: ShapeId) -> u32 {
         self.layout.shape(id).map_or(0, |shape| {
-            narrow(self.layout.grain_of(shape, SINK_CHUNK, 0))
+            narrow(self.layout.grain_of(shape, self.sink_chunk(), 0))
         })
     }
 
@@ -651,7 +659,7 @@ impl Pools {
             (0..n as u64)
                 .map(|i| {
                     let at = (from + i) % (room * spc);
-                    narrow((u64::from(RESERVED_CHUNKS) + at / spc) * spc + at % spc)
+                    narrow((u64::from(NULL_CHUNK) + 1 + at / spc) * spc + at % spc)
                 })
                 .collect()
         };

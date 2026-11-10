@@ -77,7 +77,10 @@ fn reads_back(name: &str) -> ChunkFacts {
         .collect();
     assert_eq!(
         reserved,
-        vec![(Reserved::Null, 0, 1), (Reserved::Sink, 1, 1)],
+        vec![
+            (Reserved::Null, 0, 1),
+            (Reserved::Sink, facts.total_chunks - 1, 1)
+        ],
         "{name}"
     );
     for shape in &facts.shapes {

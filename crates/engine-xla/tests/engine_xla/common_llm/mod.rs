@@ -240,13 +240,7 @@ impl Refs {
         let facts = facts.filter(|facts| {
             !facts.shapes.is_empty() && facts.shapes.iter().all(|s| s.pinned.is_none())
         });
-        let next_chunk = facts.as_ref().map_or(0, |f| {
-            f.reserved
-                .iter()
-                .map(|r| r.first + r.chunks)
-                .max()
-                .unwrap_or(1)
-        });
+        let next_chunk = 0;
         Refs {
             facts,
             next_chunk,
@@ -265,6 +259,9 @@ impl Refs {
         let (chunk, used) = match self.open.get(&id.0) {
             Some(&(chunk, used)) if used < spc => (chunk, used),
             _ => {
+                while facts.is_reserved(self.next_chunk) {
+                    self.next_chunk += 1;
+                }
                 let chunk = self.next_chunk;
                 self.next_chunk += 1;
                 assert!(chunk < facts.total_chunks, "the pool ran out of chunks");
@@ -441,14 +438,15 @@ pub fn scenario(model: &mut Model, long: Option<u32>) -> Vec<Vec<u32>> {
     }
     if let Some(n) = long {
         let mut d = Seq::new(3);
-        // Prompted in two fires, then decoded beside `a`.
-        let first = n / 2;
-        let lane = d.lane(model, &mut refs, tokens(60, first as usize, vocab));
-        out.extend(model.fire(vec![lane]).iter().map(|v| bits(v)));
-        d.held += first;
-        let lane = d.lane(model, &mut refs, tokens(61, (n - first) as usize, vocab));
-        out.extend(model.fire(vec![lane]).iter().map(|v| bits(v)));
-        d.held += n - first;
+        // Prompted in fires of at most 100 rows, then decoded beside `a`.
+        let mut piece = 0u64;
+        while d.held < n {
+            let rows = (n - d.held).min(100);
+            let lane = d.lane(model, &mut refs, tokens(60 + piece, rows as usize, vocab));
+            out.extend(model.fire(vec![lane]).iter().map(|v| bits(v)));
+            d.held += rows;
+            piece += 1;
+        }
         for step in 0..3u64 {
             let la = a.lane(model, &mut refs, tokens(70 + step, 1, vocab));
             let ld = d.lane(model, &mut refs, tokens(80 + step, 1, vocab));
