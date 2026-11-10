@@ -1014,3 +1014,10 @@ The `new-memory/` directory is bookkeeping and is removed before anything lands 
 - OPEN: with DMA reads, MoE and gemma minis differ by up to 0.03 (3-7 of 16 readouts) at pools +64 MiB and larger;
   dense/hybrid bitwise at every size; reads proven exact by unit tests; with DMA reads off, bitwise at every size but
   c64 12.3k. Suspected XLA fusion change around DMA reads (unproven).
+
+### Note — 2026-11-10: XLA DMA-read pool-size dependence proven compiler-only (accepted)
+- sc/xla-tpu 234036561: PIE_XLA_POOL_DMA_CHECK=1 cross-checks every DMA block read against XLA's gather (any
+  difference -> NaN; =2 self-test NaNs 16/16). At +1040 MiB: 0/16 MoE and 0/29 gemma readouts NaN -> DMA bytes exact.
+  Optimized HLO diff +0 vs +1040: same ops / kernels, different memory-space assignment (VMEM vs HBM) and fusion
+  grouping around the opaque DMA custom calls -> moved bf16 roundings in routed MLP / attention. Accepted under the
+  kernel-arm rule (max 0.03, no top-token change). TPU now on the perf-parity gaps.
