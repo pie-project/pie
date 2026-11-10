@@ -714,3 +714,14 @@ The `new-memory/` directory is bookkeeping and is removed before anything lands 
   writer for quantized planes (comes with quantized experts).
 - Also: 4 MoE minis with weight slots at chunk 1 bitwise base (M41 follow-up). CUDA graphs vs eager (golden_eager):
   not bitwise but arm-level on all minis (max 0.02-0.66), no sign of ROCm's replay bug.
+
+### M52 — 2026-11-10: runtime pressure / tier fixes (IT round 5 problems 3-6)
+- `sc/rt-pressure` (ca1079b53, fa8f91217, 5650d93b3):
+  - Fire-epoch leak: retire_on spawned a second waiter on a completion that holds one waker per slot -> epochs never
+    retired (MTP: ~50 s, 4533 freed pages stuck). Now `WorkItemCompletion::on_settled` hook; per-set kv txn guard.
+  - Shared pool: a state (rs-list / window / record) shortfall now counts as kv pages to park (whole chunks free for
+    any shape); fixes MTP-under-pressure hang and concurrent-decode stall (gemma 192 MiB, 48 concurrent: completes).
+  - Starvation error names the state it lacked (was kv numbers under a NoRsSlots label).
+  - Idle prefix cache demotes host -> disk (journaled) under a waiter's want before anything is dropped; restart
+    takes back 750 pages, hits bitwise. Limit: pages already on host are not pushed to disk when host fills.
+- Verified: runtime store/planner/completion/fire 154 pass; e2e repros on sm_120 all identical to unconstrained.
