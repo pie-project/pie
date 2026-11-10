@@ -37,7 +37,7 @@
 use std::path::{Path, PathBuf};
 
 use checkpoint::contract::ModelContract;
-use engine_cuda::{Boot, Lane, Shell};
+use engine_cuda::{Boot, Lane, Seated, Shell};
 use poem::{Dtype, Platform, Request};
 use poem_compiler::Budget;
 use poem_ir::{ParamSource, Trace};
@@ -318,6 +318,125 @@ fn served(fixture: &Fixture, cache: &Path) -> Vec<(u64, u32)> {
     steps
 }
 
+/// Slot refs handed out as the runtime's pool would: the lowest free chunk
+/// opened for a shape whose open chunk is full.
+struct Refs {
+    facts: engine::chunk::ChunkFacts,
+    next_chunk: u32,
+    /// Each shape's open chunk and the next index in it.
+    open: Vec<Option<(u32, u32)>>,
+}
+
+impl Refs {
+    fn of(facts: engine::chunk::ChunkFacts) -> Refs {
+        let open = vec![None; facts.shapes.len()];
+        Refs {
+            facts,
+            next_chunk: 1,
+            open,
+        }
+    }
+
+    fn shape(&self, kind: fn(&engine::chunk::SlotKind) -> bool) -> Option<usize> {
+        self.facts.shapes.iter().position(|shape| kind(&shape.kind))
+    }
+
+    fn take(&mut self, shape: usize) -> u32 {
+        let per_chunk = self.facts.shapes[shape].slots_per_chunk;
+        let (chunk, index) = match self.open[shape] {
+            Some((chunk, index)) if index < per_chunk => (chunk, index),
+            _ => {
+                self.next_chunk += 1;
+                (self.next_chunk - 1, 0)
+            }
+        };
+        self.open[shape] = Some((chunk, index + 1));
+        chunk * per_chunk + index
+    }
+}
+
+/// The model served over [`SCRIPT`] as the runtime's shared pool serves it:
+/// the lane names slot refs of the engine's stated shapes, every segment its
+/// chunks lie in is committed ahead, and after every third step each chunk
+/// opened so far is moved onto another physical chunk (an evacuation), the
+/// refs standing. The logits are the plain serving's, bit for bit.
+fn served_by_refs(fixture: &Fixture, cache: &Path) -> Vec<(u64, u32)> {
+    use engine::chunk::SlotKind;
+    let mut shell = load(fixture, cache);
+    let facts = shell.chunk_facts();
+    facts.validate().expect("the engine's chunk facts hold");
+    let mut refs = Refs::of(facts.clone());
+    let list = refs.shape(|kind| matches!(kind, SlotKind::List { .. }));
+    let ring = refs.shape(|kind| matches!(kind, SlotKind::Ring { .. }));
+    let fixed = refs.shape(|kind| matches!(kind, SlotKind::Fixed { .. }));
+    shell.take_refs();
+    // Chunks 1.. hold the lane's slots, and the chunks they move onto lie
+    // half a segment up: all in the first segment.
+    let spread = facts.segment_chunks.max(2) / 2;
+    shell.commit_segments(1).expect("the first segment commits");
+    let record = fixed.map(|shape| refs.take(shape));
+    let (mut pages, mut window): (Vec<u32>, Vec<u32>) = (Vec::new(), Vec::new());
+    let mut moved = false;
+    let mut fed = 0u32;
+    let mut last = None;
+    let mut steps = Vec::with_capacity(SCRIPT.len());
+    for (at, step) in SCRIPT.iter().enumerate() {
+        let tokens: Vec<u32> = match *step {
+            Step::Prefill(rows) => (fed..fed + rows).map(|t| (t * 7 + 11) % 1000).collect(),
+            Step::Decode => vec![last.expect("a decode follows a step")],
+        };
+        let after = fed + u32::try_from(tokens.len()).expect("a count");
+        while (pages.len() as u32) < after.div_ceil(PAGE) {
+            if let Some(shape) = list {
+                pages.push(refs.take(shape));
+            }
+            if let Some(shape) = ring {
+                window.push(refs.take(shape));
+            }
+        }
+        assert!(
+            refs.next_chunk <= spread,
+            "the lane's chunks lie under the moves"
+        );
+        let word = fixture.trace.facts.word(&Request::new(
+            u32::try_from(tokens.len()).expect("a count"),
+            false,
+        ));
+        let seated = Seated {
+            pages: &pages,
+            held: Some(fed),
+            window: &window,
+            rs_slot: record,
+            ..Seated::of(Lane {
+                slot: 0,
+                word,
+                tokens: &tokens,
+            })
+        };
+        let mut rows = shell
+            .fire_media(&[seated], &[], &[])
+            .expect("the step fires");
+        let logits = rows.swap_remove(0);
+        fed = after;
+        let top = argmax(&logits);
+        last = Some(top);
+        steps.push((hash_logits(&logits), top));
+        // Every chunk opened so far changes places with one past the
+        // spread, and back the next time.
+        if at % 3 == 2 {
+            let chunks = 1..refs.next_chunk;
+            let moves = chunks
+                .map(|logical| (logical, if moved { logical } else { logical + spread }))
+                .collect();
+            shell
+                .evacuate(&engine::chunk::Evacuation { moves })
+                .expect("the chunks move");
+            moved = !moved;
+        }
+    }
+    steps
+}
+
 fn models() -> Vec<String> {
     std::env::var("PIE_GOLDEN_MODELS").map_or_else(
         |_| MODELS.iter().map(|m| (*m).to_string()).collect(),
@@ -347,6 +466,19 @@ fn golden_fixtures() {
 #[test]
 #[ignore = "a probe run by hand: see the module's doc"]
 fn golden_logits() {
+    probe(served);
+}
+
+/// The probe with each lane naming slot refs and its chunks evacuated as it
+/// decodes ([`served_by_refs`]): `PIE_GOLDEN_CHECK` against the plain
+/// probe's file proves the two serve the same logits.
+#[test]
+#[ignore = "a probe run by hand: see the module's doc"]
+fn golden_logits_by_refs() {
+    probe(served_by_refs);
+}
+
+fn probe(served: fn(&Fixture, &Path) -> Vec<(u64, u32)>) {
     if !engine_cuda::device::present() {
         eprintln!("skipping: no CUDA device on this machine");
         return;
