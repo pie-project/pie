@@ -563,11 +563,25 @@ impl Shell {
             Some(rest) if boot.kv_budget.is_none() && demand(least, boot.slots) <= rest => rest,
             _ => room,
         };
-        let (fit, slots) = engine::fit::pool_for(boot.kv_budget, boot.slots, least, room, demand)
-            .map_err(|short| Fault::Residency(short.to_string()))?;
+        // A hybrid's state slots balance against the pages a seat takes: at
+        // the tokens a sequence is expected to hold where the operator says
+        // (`seat_tokens`), else at the context. The pool holds one sequence
+        // at the context either way: seats it would not hold fall back to
+        // seats at the context.
+        let seat = boot.device.seat_tokens.map_or(least, |tokens| {
+            u64::from(tokens.div_ceil(boot.page_size.max(1))).clamp(1, least)
+        });
+        let fitted = |one_slot: u64| {
+            engine::fit::pool_for(boot.kv_budget, boot.slots, one_slot, room, &demand)
+        };
+        let (fit, slots) = match fitted(seat) {
+            Ok((fit, slots)) if fit >= least => (fit, slots),
+            _ => fitted(least).map_err(|short| Fault::Residency(short.to_string()))?,
+        };
         tracing::info!(
             pages = fit,
             slots,
+            seat_pages = seat,
             pool_mib = demand(fit, slots) >> 20,
             weight_floor_mib = weight_floor >> 20,
             "xla kv pool sized"

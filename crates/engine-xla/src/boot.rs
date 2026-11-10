@@ -37,6 +37,10 @@ fn device_boot(doc: &toml::Table) -> DeviceBoot {
             .and_then(|t| t.get("headroom"))
             .and_then(toml::Value::as_integer)
             .and_then(|v| u64::try_from(v).ok()),
+        seat_tokens: t
+            .and_then(|t| t.get("seat_tokens"))
+            .and_then(toml::Value::as_integer)
+            .and_then(|v| u32::try_from(v).ok()),
         prewarm: t
             .and_then(|t| t.get("prewarm"))
             .and_then(toml::Value::as_bool)
