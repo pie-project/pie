@@ -189,6 +189,24 @@ pub fn lower_planes(
     Ok(())
 }
 
+/// [`lower_planes`] for a kernel that writes its planes in turn, each onto
+/// what the one before left (planes of one pool: the kv append): one body,
+/// every plane landed from it.
+pub fn lower_planes_chained(
+    ctx: &Ctx<'_>,
+    planes: &[Tensor],
+    mut body: impl FnMut(&mut Lower<'_, '_>) -> Result<Vec<Option<Val>>, Error>,
+) -> Result<(), Error> {
+    lower(ctx, |l| {
+        for (plane, v) in planes.iter().zip(body(l)?) {
+            if let Some(v) = v {
+                l.land(*plane, v)?;
+            }
+        }
+        Ok(())
+    })
+}
+
 /// Lowers one kernel call into `ctx`'s function.
 pub fn lower(
     ctx: &Ctx<'_>,

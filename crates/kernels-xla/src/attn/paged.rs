@@ -2082,6 +2082,9 @@ pub fn attend_fresh(
                 && !matches!(planes, Planes::Paged { latent: true, .. })
                 && f.elem(keys) == Elem::Bf16
                 && f.elem(values) == Elem::Bf16
+                // the kernel copies pages out of whole planes, not pool views
+                && !f.is_view(keys)
+                && !f.is_view(values)
                 && super::pages::fits(geom.span, &heads, tuning.vmem_cap()) =>
         {
             // A decode's rows copy their own pages; a fire whose rows carry
@@ -2507,6 +2510,10 @@ pub(crate) fn scatter_slots_mapped(
     for (at, (&(src, plane), &map)) in pairs.iter().zip(maps).enumerate() {
         let table = match at.checked_sub(1) {
             Some(prev) if pairs[prev].1.val == plane.val => out[prev],
+            // planes of one pool: onto what the plane before left
+            Some(prev) if f.is_view(plane.val) && f.is_view(out[prev]) => {
+                rebase(f, plane.val, out[prev])?
+            }
             _ => plane.val,
         };
         let plane = Operand {
@@ -2525,7 +2532,29 @@ pub(crate) fn scatter_slots_mapped(
         )?;
         out.push(one[0]);
     }
+    // Every plane of one pool rides on the last pool written.
+    if let Some(&done) = out.last()
+        && f.is_view(done)
+    {
+        for v in &mut out {
+            if f.is_view(*v) {
+                *v = rebase(f, *v, done)?;
+            }
+        }
+    }
     Ok(out)
+}
+
+/// `plane` (a view of the chunk pool) as a view of the pool `onto` (a view)
+/// rides on: what a write to another plane of the pool left.
+fn rebase(f: &mut Func, plane: Val, onto: Val) -> Built<Val> {
+    match (f.view_parts(plane), f.view_parts(onto)) {
+        (Some((_, elem)), Some((pool, _))) => {
+            let dims = f.dims(plane).to_vec();
+            f.pool_view(pool, elem, &dims)
+        }
+        _ => Ok(plane),
+    }
 }
 
 /// Appends `src` rows into the one plane `plane` at `map(write_page) ·
@@ -2635,10 +2664,11 @@ fn scatter_slots_one_map(
                 let page = clamp_i(f, runs.page, 0, slots / ps - 1)?;
                 return super::append::write(
                     f,
-                    k.val,
-                    v.val,
-                    keys.val,
-                    values.val,
+                    &[k.val, v.val],
+                    super::append::Planes::Two {
+                        keys: keys.val,
+                        values: values.val,
+                    },
                     [runs.start, runs.first, runs.len, page],
                     total,
                     vmem_cap,
@@ -2661,10 +2691,11 @@ fn scatter_slots_one_map(
                 );
                 planes = super::append::write(
                     f,
-                    kp,
-                    vp,
-                    planes[0],
-                    planes[1],
+                    &[kp, vp],
+                    super::append::Planes::Two {
+                        keys: planes[0],
+                        values: planes[1],
+                    },
                     [part.start, part.first, part.len, pg],
                     total,
                     vmem_cap,
@@ -2680,6 +2711,37 @@ fn scatter_slots_one_map(
         Box::new(move |f: &mut Func| slot_rows(f, pairs, ps, page, off));
     let pages: crate::hlo::Branch<'_> =
         Box::new(move |f: &mut Func| page_writes(f, pairs, ps, slots / ps, &runs, None));
+    // One plane of the chunk pool (a view): a prompt's runs laid by the
+    // Mosaic kernel straight into the pool, at the plane's pages (already
+    // mapped), a page `[16, w]` as the pool lays it.
+    if let [(src, plane)] = pairs
+        && let Some((pool, Elem::Bf16)) = f.view_parts(plane.val)
+        && src.width == plane.width
+        && f.elem(src.val) == Elem::Bf16
+        && let Some(vmem_cap) = vmem_cap
+        && super::append::fits(i64::from(n), w, slots, ps, f.dims(runs.page)[0], vmem_cap)
+    {
+        let (src, plane) = (*src, *plane);
+        let kernel: crate::hlo::Branch<'_> = Box::new(move |f: &mut Func| {
+            let total = f.reshape(runs.total, &[1])?;
+            let page = clamp_i(f, runs.page, 0, slots / ps - 1)?;
+            let laid = super::append::write(
+                f,
+                &[src.val],
+                super::append::Planes::Pool {
+                    pool,
+                    maps: vec![PageMap::IDENTITY],
+                    slots,
+                },
+                [runs.start, runs.first, runs.len, page],
+                total,
+                vmem_cap,
+            )?;
+            let dims = f.dims(plane.val).to_vec();
+            Ok(vec![f.pool_view(laid[0], Elem::Bf16, &dims)?])
+        });
+        return Ok(f.case(which, &outs, vec![rows, pages, kernel])?);
+    }
     let fresh: crate::hlo::Branch<'_> =
         Box::new(move |f: &mut Func| page_writes(f, pairs, ps, slots / ps, &runs, Some(few)));
     Ok(f.case(which, &outs, vec![rows, pages, fresh])?)

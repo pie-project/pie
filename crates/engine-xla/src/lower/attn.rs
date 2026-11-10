@@ -179,7 +179,8 @@ pub fn kv_append(
     write_offset: Tensor,
 ) -> Result<Option<Appended>, Error> {
     let mut read = None;
-    crate::lower::lower_planes(ctx, &[pool.keys, pool.values], |l| {
+    // the append writes keys, then values onto what keys left
+    crate::lower::lower_planes_chained(ctx, &[pool.keys, pool.values], |l| {
         let wp = l.read(write_page)?;
         let wo = l.read(write_offset)?;
         let kv = l.read(k)?;

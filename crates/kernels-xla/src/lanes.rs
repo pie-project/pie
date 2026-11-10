@@ -267,6 +267,28 @@ pub(crate) fn take_slots(f: &mut Func, slab: Val, slot: Val, per: i64) -> Built<
     if l <= SLICED_LANES || per >= 512 {
         let zero = ci(f, 0);
         let p = ci(f, per);
+        // A pool view is read by whole blocks, so each is seen to start at
+        // a multiple of its own rows (moved as a block, not read across
+        // pool rows).
+        // Every lane's block in one gather (each clamped into the slab, as
+        // a slice is).
+        if f.is_view(slab) {
+            let blocks = f.reshape(slab, &[rows / per, per, width])?;
+            let at = f.reshape(slot, &[l, 1])?;
+            let got = f.gather(
+                blocks,
+                at,
+                &GatherDims {
+                    offset_dims: vec![1, 2],
+                    collapsed_slice_dims: vec![0],
+                    start_index_map: vec![0],
+                    index_vector_dim: 1,
+                    ..GatherDims::default()
+                },
+                &[1, per, width],
+            )?;
+            return f.reshape(got, &[l, per * width]);
+        }
         let mut out = Vec::with_capacity(l as usize);
         for i in 0..l {
             let at = f.slice_axis(slot, 0, i, i + 1)?;
@@ -320,6 +342,17 @@ pub(crate) fn land_slots(
         let rows = f.reshape(rows, &[l, per, width])?;
         let zero = ci(f, 0);
         let p = ci(f, per);
+        // a pool view lands whole blocks (see `take_slots`)
+        if f.is_view(slab) {
+            let mut out = f.reshape(slab, &[n / per, per, width])?;
+            for i in 0..l {
+                let at = f.slice_axis(slot, 0, i, i + 1)?;
+                let at = f.reshape(at, &[])?;
+                let r_i = f.slice_axis(rows, 0, i, i + 1)?;
+                out = f.dynamic_update_slice(out, r_i, &[at, zero, zero])?;
+            }
+            return f.reshape(out, &[n, width]);
+        }
         let mut out = slab;
         for i in 0..l {
             let at = f.slice_axis(slot, 0, i, i + 1)?;

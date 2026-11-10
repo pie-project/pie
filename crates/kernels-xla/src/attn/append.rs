@@ -12,6 +12,24 @@
 
 use crate::hlo::{Built, Elem, Func, Val};
 use crate::mosaic::{Body, Grid, ICmp, Kernel, MTy, Operand, Sem, Space, V, Window};
+use crate::tensor::PageMap;
+
+/// Where the kernel lands the rows: two planes of their own, or the keys
+/// and values planes of the chunk pool (`u32 [R, 128]`), each page `p` of
+/// the runs at its plane's page `map(p)`, in the pool's packed rows order
+/// (a page `[16, w]` as `[16 · w / 128, 128]`, reshaped in VMEM).
+pub(crate) enum Planes {
+    Two {
+        keys: Val,
+        values: Val,
+    },
+    /// `maps`: one a plane written (one plane alone, or keys and values).
+    Pool {
+        pool: Val,
+        maps: Vec<PageMap>,
+        slots: i64,
+    },
+}
 
 /// Rows a page holds for the kernel (a bf16 tile).
 pub(crate) const PS: i64 = 16;
@@ -41,23 +59,52 @@ pub(crate) fn fits(n: i64, w: i64, slots: i64, ps: i64, m: i64, vmem_cap: i64) -
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn write(
     f: &mut Func,
-    k: Val,
-    v: Val,
-    keys: Val,
-    values: Val,
+    srcs: &[Val],
+    planes: Planes,
     runs: [Val; 4],
     total: Val,
     vmem_cap: i64,
 ) -> Built<Vec<Val>> {
-    let (n, w) = (f.dims(k)[0], f.dims(k)[1]);
-    let slots = f.dims(keys)[0];
+    let (n, w) = (f.dims(srcs[0])[0], f.dims(srcs[0])[1]);
     let m = f.dims(runs[0])[0];
-    let any = |rows: i64| Operand {
-        array: vec![rows, w],
-        elem: Elem::Bf16,
+    // planes written: each its own source rows
+    let np = srcs.len();
+    let any_of = |array: Vec<i64>, elem: Elem| Operand {
+        array,
+        elem,
         block: vec![],
         window: Window::Any,
         index: Box::new(|_: &mut Body, _: &Grid| Ok(vec![])),
+    };
+    let any = |rows: i64| any_of(vec![rows, w], Elem::Bf16);
+    // a page's rows in the scratch: `[PS, w]`, or `[PS · w / 128, 128]` as
+    // the pool lays them
+    let kk = w / 128;
+    let (pooled, maps, slots) = match &planes {
+        Planes::Two { keys, .. } => (None, vec![PageMap::IDENTITY; 2], f.dims(*keys)[0]),
+        Planes::Pool { pool, maps, slots } => (Some(f.dims(*pool)[0]), maps.clone(), *slots),
+    };
+    if maps.len() != np {
+        return Err(crate::hlo::Malformed {
+            op: "kv_append",
+            detail: format!("{np} source planes for {} written", maps.len()),
+        });
+    }
+    let tile = if pooled.is_some() {
+        vec![PS * kk, 128]
+    } else {
+        vec![PS, w]
+    };
+    let (ins, outs) = match pooled {
+        None => (
+            vec![any(n), any(n), any(slots), any(slots)],
+            vec![any(slots), any(slots)],
+        ),
+        Some(r) => {
+            let mut ins: Vec<Operand> = (0..np).map(|_| any(n)).collect();
+            ins.push(any_of(vec![r, 128], Elem::U32));
+            (ins, vec![any_of(vec![r, 128], Elem::U32)])
+        }
     };
     let limit = (vmem(n, w, m) * 3 / 2 + (8 << 20)).min(vmem_cap);
     let kern = Kernel {
@@ -65,18 +112,35 @@ pub(crate) fn write(
         grid: vec![1],
         semantics: vec![Sem::Arbitrary],
         prefetch: vec![vec![m], vec![m], vec![m], vec![m], vec![1]],
-        ins: vec![any(n), any(n), any(slots), any(slots)],
-        outs: vec![any(slots), any(slots)],
+        ins,
+        outs,
         vmem_limit: Some(u64::try_from(limit).unwrap_or(0)),
         scratch: vec![
-            MTy::Ref(vec![2, n, w], Elem::Bf16, Space::Vmem),
-            MTy::Ref(vec![2, m, PS, w], Elem::Bf16, Space::Vmem),
-            MTy::Ref(vec![2, m, PS, w], Elem::Bf16, Space::Vmem),
+            MTy::Ref(vec![np as i64, n, w], Elem::Bf16, Space::Vmem),
+            MTy::Ref(
+                vec![np as i64, m, tile[0], tile[1]],
+                Elem::Bf16,
+                Space::Vmem,
+            ),
+            MTy::Ref(
+                vec![np as i64, m, tile[0], tile[1]],
+                Elem::Bf16,
+                Space::Vmem,
+            ),
             MTy::Sem(vec![4]),
         ],
     };
     let c = kern.build(|b, blk| {
         let pre = &blk.grid.prefetch;
+        // each plane's source and destination: the pool read as bf16 rows
+        // of 128 for both
+        let (src_planes, dst_planes) = if pooled.is_some() {
+            let i = b.ref_bitcast(blk.ins[np], Elem::Bf16)?;
+            let o = b.ref_bitcast(blk.outs[0], Elem::Bf16)?;
+            (vec![i; np], vec![o; np])
+        } else {
+            (vec![blk.ins[2], blk.ins[3]], vec![blk.outs[0], blk.outs[1]])
+        };
         let (rows, stage, old, sems) = (
             blk.scratch[0],
             blk.scratch[1],
@@ -97,12 +161,12 @@ pub(crate) fn write(
             b.ref_squeeze(r)
         };
         // The fire's rows, both planes, in whole.
-        for x in 0..2 {
+        for x in 0..np as i64 {
             let dst = plane_rows(b, x)?;
             let s = sem(b, x)?;
             b.dma_start(blk.ins[x as usize], dst, s)?;
         }
-        for x in 0..2 {
+        for x in 0..np as i64 {
             let dst = plane_rows(b, x)?;
             let s = sem(b, x)?;
             b.dma_wait(s, blk.ins[x as usize], dst)?;
@@ -119,26 +183,50 @@ pub(crate) fn write(
             let c = b.cmpi(ICmp::Ne, len, ps)?;
             b.select(a, a, c)
         };
-        let page_ref = |b: &mut Body, plane: V, j: V| -> Built<V> {
+        let page_ref = |b: &mut Body, plane: V, x: i64, j: V| -> Built<V> {
             let p = b.load(pre[3], &[j])?;
-            let ps = b.i32(PS);
-            let at = b.muli(p, ps)?;
+            let map = maps[x as usize];
+            let p = if map.is_identity() {
+                p
+            } else {
+                let by = b.i32(map.stride);
+                let p = b.muli(p, by)?;
+                let from = b.i32(map.offset);
+                b.addi(p, from)?
+            };
+            let rows = b.i32(tile[0]);
+            let at = b.muli(p, rows)?;
             let at = b.assume_multiple(at, PS)?;
             let z = b.i32(0);
-            b.ref_slice(plane, &[at, z], &[PS, w])
+            b.ref_slice(plane, &[at, z], &tile)
         };
         let slot_ref = |b: &mut Body, buf: V, x: i64, j: V| -> Built<V> {
             let xv = b.i32(x);
             let z = b.i32(0);
-            let r = b.ref_slice(buf, &[xv, j, z, z], &[1, 1, PS, w])?;
+            let r = b.ref_slice(buf, &[xv, j, z, z], &[1, 1, tile[0], tile[1]])?;
             let r = b.ref_squeeze(r)?;
             b.ref_squeeze(r)
+        };
+        // a page's rows as the kernel computes them, and back as laid
+        let as_page = |b: &mut Body, x: V| -> Built<V> {
+            if pooled.is_some() {
+                b.shape_cast(x, &[PS, w])
+            } else {
+                Ok(x)
+            }
+        };
+        let as_laid = |b: &mut Body, x: V| -> Built<V> {
+            if pooled.is_some() {
+                b.shape_cast(x, &tile)
+            } else {
+                Ok(x)
+            }
         };
         b.for_range(z, total, one, |b, j| {
             let p = partial(b, j)?;
             b.when(p, |b| {
-                for x in 0..2 {
-                    let src = page_ref(b, blk.ins[2 + x as usize], j)?;
+                for x in 0..np as i64 {
+                    let src = page_ref(b, src_planes[x as usize], x, j)?;
                     let dst = slot_ref(b, old, x, j)?;
                     let s = sem(b, 2)?;
                     b.dma_start(src, dst, s)?;
@@ -177,52 +265,64 @@ pub(crate) fn write(
             let laid = b.andi(ge, lt)?;
             let p = partial(b, j)?;
             let at = b.as_index(t0)?;
-            for x in 0..2 {
+            for x in 0..np as i64 {
                 let src = plane_rows(b, x)?;
                 let win = b.vload(src, &[at, i0], &[2 * PS, w])?;
                 let win = b.convert_f(win, Elem::F32)?;
                 let win = b.rotate(win, by, 0)?;
                 let tile = b.rows(win, 0, PS)?;
                 let tile = b.convert_f(tile, Elem::Bf16)?;
+                let tile = as_laid(b, tile)?;
                 let dst = slot_ref(b, stage, x, j)?;
                 b.vstore_all(tile, dst)?;
             }
             b.when(p, |b| {
-                for x in 0..2 {
-                    let src = page_ref(b, blk.ins[2 + x as usize], j)?;
+                for x in 0..np as i64 {
+                    let src = page_ref(b, src_planes[x as usize], x, j)?;
                     let held = slot_ref(b, old, x, j)?;
                     let s = sem(b, 2)?;
                     b.dma_wait(s, src, held)?;
                     let o = b.vload_all(held)?;
+                    let o = as_page(b, o)?;
                     let dst = slot_ref(b, stage, x, j)?;
                     let t = b.vload_all(dst)?;
+                    let t = as_page(b, t)?;
                     let merged = b.select(laid, t, o)?;
+                    let merged = as_laid(b, merged)?;
                     b.vstore_all(merged, dst)?;
                 }
                 Ok(())
             })?;
-            for x in 0..2 {
+            for x in 0..np as i64 {
                 let src = slot_ref(b, stage, x, j)?;
-                let dst = page_ref(b, blk.outs[x as usize], j)?;
+                let dst = page_ref(b, dst_planes[x as usize], x, j)?;
                 let s = sem(b, 3)?;
                 b.dma_start(src, dst, s)?;
             }
             Ok(())
         })?;
         b.for_range(z, total, one, |b, j| {
-            for x in 0..2 {
+            for x in 0..np as i64 {
                 let src = slot_ref(b, stage, x, j)?;
-                let dst = page_ref(b, blk.outs[x as usize], j)?;
+                let dst = page_ref(b, dst_planes[x as usize], x, j)?;
                 let s = sem(b, 3)?;
                 b.dma_wait(s, src, dst)?;
             }
             Ok(())
         })
     })?;
-    let ops = [
-        runs[0], runs[1], runs[2], runs[3], total, k, v, keys, values,
-    ];
-    c.call_aliased(f, &ops, &[(0, 7), (1, 8)])
+    let mut ops = vec![runs[0], runs[1], runs[2], runs[3], total];
+    ops.extend_from_slice(srcs);
+    match planes {
+        Planes::Two { keys, values } => {
+            ops.extend([keys, values]);
+            c.call_aliased(f, &ops, &[(0, 5 + np), (1, 6 + np)])
+        }
+        Planes::Pool { pool, .. } => {
+            ops.push(pool);
+            c.call_aliased(f, &ops, &[(0, 5 + np)])
+        }
+    }
 }
 
 #[cfg(test)]
@@ -244,10 +344,8 @@ mod tests {
         assert!(!fits(1000, 1024, 4096, 16, 165, 110 << 20));
         let out = write(
             &mut f,
-            k,
-            v,
-            keys,
-            values,
+            &[k, v],
+            Planes::Two { keys, values },
             [runs[0], runs[1], runs[2], runs[3]],
             total,
             110 << 20,

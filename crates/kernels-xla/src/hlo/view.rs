@@ -219,6 +219,31 @@ impl Func {
             .collect()
     }
 
+    /// Whether blocks of `nr` pool rows go as blocks of a `[R / nr, nr, 128]`
+    /// pool: a reshape that keeps (8, 128) tiles whole.
+    fn blocked(&self, rows: i64, nr: i64) -> bool {
+        nr > 1 && nr % 8 == 0 && rows % nr == 0
+    }
+
+    /// Blocks `at` (`[B]`) of `[N, nr, 128]`: `[B, nr, 128]`.
+    fn take_blocks(&mut self, blocks: Val, at: Val) -> Built<Val> {
+        let d = self.dims(blocks).to_vec();
+        let b = self.dims(at)[0];
+        let at = self.reshape(at, &[b, 1])?;
+        self.gather(
+            blocks,
+            at,
+            &GatherDims {
+                offset_dims: vec![1, 2],
+                collapsed_slice_dims: vec![0],
+                start_index_map: vec![0],
+                index_vector_dim: 1,
+                ..GatherDims::default()
+            },
+            &[1, d[1], d[2]],
+        )
+    }
+
     /// `[B · n]` pool rows: `n` from each of the `[B]` starts.
     fn rows_of(&mut self, start: Val, batch: i64, n: i64) -> Built<Val> {
         if n == 1 {
@@ -319,11 +344,29 @@ impl Func {
             };
             (rc, Some(off))
         };
-        // One index a pool row: a gather of row windows is a loop on a TPU
-        // (carrying the pool), of single rows a native gather.
-        let ids = self.rows_of(row, batch, nr)?;
-        let got = self.take_rows(view.pool, ids)?;
-        let got = self.reshape(got, &[batch, nr, LANES])?;
+        if aligned && g % len == 0 && k > 1 && crate::blocks::on() {
+            // Whole blocks by DMA, any number of rows: no element
+            // reinterpreted (`crate::blocks`).
+            let per = self.like_i(row, nr);
+            let at = self.div(row, per)?;
+            let got = crate::blocks::gather(self, view.pool, at, nr, view.elem)?;
+            return Ok(Some(self.reshape(got, &[batch, nr * e])?));
+        }
+        let got = if aligned && g % len == 0 && self.blocked(rows_total, nr) {
+            // Whole blocks at multiples of their own rows: the pool as
+            // `[R / nr, nr, 128]` (a free reshape in (8, 128) tiles) and one
+            // gather of whole blocks, as fast as a plane's own page gather.
+            let per = self.like_i(row, nr);
+            let at = self.div(row, per)?;
+            let blocks = self.reshape(view.pool, &[rows_total / nr, nr, LANES])?;
+            self.take_blocks(blocks, at)?
+        } else {
+            // One index a pool row: a gather of row windows over the 2-D
+            // pool is a loop on a TPU (carrying the pool).
+            let ids = self.rows_of(row, batch, nr)?;
+            let got = self.take_rows(view.pool, ids)?;
+            self.reshape(got, &[batch, nr, LANES])?
+        };
         let flat = self.unpack(got, view.elem)?;
         let Some(off) = off else {
             return Ok(Some(flat));
@@ -558,6 +601,38 @@ impl Func {
                 };
                 self.bitcast(x, Elem::U32)?
             };
+            if g % len == 0 && k > 1 && crate::blocks::on() {
+                // whole blocks by DMA (`crate::blocks`), any number of rows:
+                // a row scatter pays for every pool row it is handed
+                let per = self.like_i(row, nr);
+                let at = self.div(row, per)?;
+                let ups = self.reshape(ups, &[batch * nr * k, LANES])?;
+                return Ok(Some(crate::blocks::scatter(self, view.pool, at, ups, nr)?));
+            }
+            if g % len == 0 && self.blocked(rows_total, nr) {
+                // whole blocks into the pool as `[R / nr, nr, 128]` (see
+                // `read_block`)
+                let per = self.like_i(row, nr);
+                let at = self.div(row, per)?;
+                let blocks = self.reshape(view.pool, &[rows_total / nr, nr, LANES])?;
+                let at = self.reshape(at, &[batch, 1])?;
+                let ups = self.reshape(packed, &[batch, nr, LANES])?;
+                let blocks = self.scatter_hinted(
+                    blocks,
+                    at,
+                    ups,
+                    &ScatterDims {
+                        update_window_dims: vec![1, 2],
+                        inserted_window_dims: vec![0],
+                        scatter_dims_to_operand_dims: vec![0],
+                        index_vector_dim: 1,
+                        ..ScatterDims::default()
+                    },
+                    Combine::Set,
+                    unique,
+                )?;
+                return Ok(Some(self.reshape(blocks, &[rows_total, LANES])?));
+            }
             // one index a pool row (see `read_block`)
             let ids = self.rows_of(row, batch, nr)?;
             let pool = self.put_rows_hinted(view.pool, ids, packed, Combine::Set, unique)?;
@@ -801,10 +876,7 @@ impl Func {
 
     /// Loop-carried views: the pools they ride on, and how to make them
     /// views again.
-    pub(super) fn unview_carried(
-        &mut self,
-        inits: &[Val],
-    ) -> (Vec<Val>, Kinds) {
+    pub(super) fn unview_carried(&mut self, inits: &[Val]) -> (Vec<Val>, Kinds) {
         let mut out = Vec::with_capacity(inits.len());
         let mut kinds = Vec::with_capacity(inits.len());
         for &v in inits {
