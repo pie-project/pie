@@ -1552,8 +1552,7 @@ impl Frame {
         let queue = core.queue.lock().expect("queue lock poisoned");
         // SAFETY: the queue is this device's, and its lock is the external
         // sync `vkQueueWaitIdle` needs.
-        unsafe { core.device.queue_wait_idle(*queue) }
-            .map_err(|e| core.fault("vkQueueWaitIdle", e))
+        unsafe { core.device.queue_wait_idle(*queue) }.map_err(|e| core.fault("vkQueueWaitIdle", e))
     }
 
     pub fn flush(&self) -> Result<()> {

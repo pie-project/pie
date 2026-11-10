@@ -131,7 +131,7 @@ pub fn conv1d_chunked(
     let shape = Shape::of(OP, x.data, weight, state, conv_width, dilation, y)?;
     rows(OP, x.data)?;
     ctx.fire(
-        Fire::at(CONV1D, entry).apply(shape.grid(requests(OP, x)?)),
+        Fire::at(CONV1D, state.entry(OP, entry)?).apply(shape.grid(requests(OP, x)?)),
         &[
             &[
                 x.data.arg(),
@@ -140,8 +140,10 @@ pub fn conv1d_chunked(
                 state.slots.arg(),
                 y.arg_mut(),
             ][..],
+            &state.snap_table(),
             &state.piece_args(true),
             &[shape.channels.arg(), shape.taps.arg(), shape.dilation.arg()],
+            &state.snap_lane0(OP)?,
         ]
         .concat(),
     )
@@ -166,7 +168,7 @@ pub fn conv1d_committed(
     let shape = Shape::of(OP, x, weight, state, conv_width, dilation, y)?;
     nonzero(OP, "extended rows", x.rows)?;
     ctx.fire(
-        Fire::at(CONV1D, entry).apply(shape.grid(window_lanes(OP, indptr)?)),
+        Fire::at(CONV1D, state.entry(OP, entry)?).apply(shape.grid(window_lanes(OP, indptr)?)),
         &[
             &[
                 x.arg(),
@@ -177,6 +179,7 @@ pub fn conv1d_committed(
                 weight.arg(),
                 y.arg_mut(),
             ][..],
+            &state.snap_table(),
             &state.piece_args(true),
             &[
                 stated(OP, committed.lane0)?.arg(),
@@ -184,6 +187,7 @@ pub fn conv1d_committed(
                 shape.taps.arg(),
                 shape.dilation.arg(),
             ],
+            &state.snap_lane0(OP)?,
         ]
         .concat(),
     )

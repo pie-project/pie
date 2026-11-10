@@ -147,7 +147,7 @@ pub fn kda_chunked(
     let [f, b, dt_bias, a_log] = gates.planes();
     let [heads, head_dim, eps, floor] = gates.scalars(OP)?;
     ctx.fire(
-        Fire::at(KDA, entry)
+        Fire::at(KDA, state.entry(OP, entry)?)
             .tier(tier)
             .apply(gates.grid(requests(OP, mixed)?)),
         &[
@@ -161,8 +161,10 @@ pub fn kda_chunked(
                 state.slots.arg(),
                 y.arg_mut(),
             ][..],
+            &state.snap_table(),
             &state.piece_args(true),
             &[heads, head_dim, eps, floor],
+            &state.snap_lane0(OP)?,
         ]
         .concat(),
     )
@@ -188,7 +190,7 @@ pub fn kda_committed(
     let [f, b, dt_bias, a_log] = gates.planes();
     let [heads, head_dim, eps, floor] = gates.scalars(OP)?;
     ctx.fire(
-        Fire::at(KDA, entry)
+        Fire::at(KDA, state.entry(OP, entry)?)
             .tier(tier)
             .apply(gates.grid(window_lanes(OP, indptr)?)),
         &[
@@ -205,6 +207,7 @@ pub fn kda_committed(
                 work.arg_mut(),
                 y.arg_mut(),
             ][..],
+            &state.snap_table(),
             &state.piece_args(true),
             &[
                 stated(OP, committed.lane0)?.arg(),
@@ -213,6 +216,7 @@ pub fn kda_committed(
                 eps,
                 floor,
             ],
+            &state.snap_lane0(OP)?,
         ]
         .concat(),
     )

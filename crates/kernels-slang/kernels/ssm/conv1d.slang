@@ -14,6 +14,10 @@
 // the slot keeps the history as of row `commit[lane0 + r]` (none when that is
 // zero; no slot when `slots[lane0 + r] < 0`).
 //
+// `PIE_SNAPS` (with either): a request's lane also lands the history as of
+// up to `PIE_RS_SNAPSHOTS` rows inside it in records of their own
+// (`prim/pool.slang`, CONTRACT-BC 16).
+//
 // Weights are `[channels, conv_width]`, the taps of channel `c` at
 // `c * conv_width`. The grid is (channel pairs, rows or requests).
 
@@ -27,14 +31,24 @@
 [[vk::binding(4)]] StructuredBuffer<int> slots;
 [[vk::binding(5)]] StructuredBuffer<uint> weight;
 [[vk::binding(6)]] RWStructuredBuffer<uint> y;
+#if defined(PIE_SNAPS)
+[[vk::binding(7)]] StructuredBuffer<int> pie_snaps;
+#define SEGMENTS_AT 8
+#else
 #define SEGMENTS_AT 7
+#endif
 #elif defined(PIE_CHUNKED)
 [[vk::binding(0)]] StructuredBuffer<uint> x;
 [[vk::binding(1)]] StructuredBuffer<int> indptr;
 [[vk::binding(2)]] StructuredBuffer<uint> weight;
 [[vk::binding(3)]] StructuredBuffer<uint> slots;
 [[vk::binding(4)]] RWStructuredBuffer<uint> y;
+#if defined(PIE_SNAPS)
+[[vk::binding(5)]] StructuredBuffer<int> pie_snaps;
+#define SEGMENTS_AT 6
+#else
 #define SEGMENTS_AT 5
+#endif
 #else
 [[vk::binding(0)]] StructuredBuffer<uint> x;
 [[vk::binding(1)]] StructuredBuffer<uint> weight;
@@ -59,12 +73,18 @@ struct Params {
     int channels;
     int conv_width;
     int dilation;
+#if defined(PIE_SNAPS)
+    int snap_lane0;
+#endif
 };
 PIE_PARAMS(PARAMS_AT, Params, params);
 PIE_POOL_READ(float, params.seg_words)
 PIE_POOL_WRITE(float, params.seg_words)
 PIE_POOL_VIEW(state, float, params.state_origin)
 PIE_STATE_PIECES
+#if defined(PIE_SNAPS)
+PIE_STATE_SNAPSHOTS
+#endif
 
 // Where channel `c`'s history lies in the record of `slots` entry `at`: a
 // piece is `[hist][min(piece_atoms, chans)]`, the channel axis innermost.
@@ -112,8 +132,10 @@ void past_put(Column at, int s, float2 v) {
 
 #if defined(PIE_COMMITTED) || defined(PIE_CHUNKED)
 // Rows `begin .. begin + span` convolved over the slot's history, which then
-// rolls to the history as of row `keep` (none when `keep <= 0`).
-void walk(Column slab, int begin, int span, int keep, uint chans, uint c) {
+// rolls to the history as of row `keep` (none when `keep <= 0`); snapshot
+// lane `snap`'s records (none when negative) take the history as of their
+// rows.
+void walk(Column slab, int begin, int span, int keep, uint chans, uint c, int snap) {
     int width = params.conv_width;
     int dil = params.dilation;
     int hist = (width - 1) * dil + 1;
@@ -131,6 +153,22 @@ void walk(Column slab, int begin, int span, int keep, uint chans, uint c) {
         }
         y_put(uint(begin + t), chans, c, acc);
     }
+#if defined(PIE_SNAPS)
+    for (uint n = 0u; n < PIE_RS_SNAPSHOTS; n++) {
+        int at = pie_snap_row(snap, n);
+        if (at <= 0 || at > span) {
+            break;
+        }
+        Column into;
+        into.slab = pie_snap_unit(uint(snap), n, c) * params.slot_stride;
+        into.pitch = slab.pitch;
+        into.col = slab.col;
+        for (int s = 0; s < hist; s++) {
+            int src = at - hist + s;
+            past_put(into, s, src < 0 ? past[hist + src] : x_at(uint(begin + src), chans, c));
+        }
+    }
+#endif
     if (keep <= 0) {
         return;
     }
@@ -163,14 +201,24 @@ void main(uint3 gid : SV_DispatchThreadID) {
     if (span <= 0 || pie_state_none(lane)) {
         return;
     }
-    walk(column(lane, chans, c), begin, span, min(commit[lane], span), chans, c);
+#if defined(PIE_SNAPS)
+    int snap = pie_snap_lane(r);
+#else
+    int snap = -1;
+#endif
+    walk(column(lane, chans, c), begin, span, min(commit[lane], span), chans, c, snap);
 #elif defined(PIE_CHUNKED)
     int begin = indptr[r];
     int span = indptr[r + 1] - begin;
     if (span <= 0) {
         return;
     }
-    walk(column(uint(begin), chans, c), begin, span, span, chans, c);
+#if defined(PIE_SNAPS)
+    int snap = pie_snap_lane(r);
+#else
+    int snap = -1;
+#endif
+    walk(column(uint(begin), chans, c), begin, span, span, chans, c, snap);
 #else
     Column slab = column(r, chans, c);
     float2 past[HIST_MAX];
@@ -196,3 +244,5 @@ void main(uint3 gid : SV_DispatchThreadID) {
 // pie:instantiate ssm_conv1d_bf16 PIE_GROUP_X=128
 // pie:instantiate ssm_conv1d_chunked_bf16 PIE_GROUP_X=128 PIE_CHUNKED=1
 // pie:instantiate ssm_conv1d_committed_bf16 PIE_GROUP_X=128 PIE_COMMITTED=1
+// pie:instantiate ssm_conv1d_chunked_snap_bf16 PIE_GROUP_X=128 PIE_CHUNKED=1 PIE_SNAPS=1
+// pie:instantiate ssm_conv1d_committed_snap_bf16 PIE_GROUP_X=128 PIE_COMMITTED=1 PIE_SNAPS=1

@@ -16,7 +16,7 @@ Legend: ✅ verified on hardware · 🟡 in progress / compile-only · 🔴 not 
 | Weight streaming: PLE rows | ✅ M35/M36/M41 | ✅ M43 golden_rows | ✅ M50 | ✅ M53 (rows, grouped tables) | ✅ M53 | 🟡 XLA | — weights on host |
 | Weight streaming: experts | 🟡 dense bf16 M40; quantized next | ✅ dense M47; quantized after CUDA | ✅ dense M50; quantized next | ✅ VK3 dense + affine + MXFP4, every arm (engine tier deleted) | ✅ VK3 | 🟡 XLA | — weights on host |
 | Host/disk tiers of shared shapes (copy_slots) | ✅ engine probe M43 · ✅ e2e M52 | ✅ golden_offload 8/8 (MI300X) | ✅ M50 offload probe | ✅ M53 offload (dense, hybrid, window) | ✅ M53 | 🔴 XLA | 🟡 CB (host sim) |
-| Snapshots (rs_snapshots) | ✅ | ✅ | ✅ | 🔴 not served (rs_snapshots 0) VK3 | 🔴 VK3 | 🔴 XLA | — |
+| Snapshots (rs_snapshots) | ✅ | ✅ | ✅ | ✅ VK3 (4 a lane, per piece; conv, GDN, KDA) | ✅ VK3 | 🔴 XLA | — |
 | K2 (no kv spaces) | ✅ M39 | ✅ | ✅ M42 | compile | compile | compile | compile |
 
 Cerebras realization (CB, `sc/cb-chunk-pool`): the column is the host-traced `Cerebras` engine. State lives in
@@ -45,9 +45,8 @@ its merge: the kv-only shared pool of (1) for batched paged builds.
 
 Vulkan / wgpu (VK2, `sc/vk2`): window lists are lists of their own (up to four, each its T_w <= the kv page and
 its own page table; trimmed slots ref 0 = the null chunk), verified bitwise trimmed vs untrimmed with scattered and
-evacuated slots on gemma4-e4b-mini-l1 / -l6 and a two-window variant. Snapshots per piece (contract 16): not served
-on either engine and never sent to them: both state `rs_snapshots = 0`, so the runtime cuts a pass at each
-checkpoint (state lands at fire ends) and `Lane::validate_for` refuses snapshot lanes. On-device tests (`tests/*/tiers.rs`,
+evacuated slots on gemma4-e4b-mini-l1 / -l6 and a two-window variant. Snapshots per piece (contract 16): served since
+VK3 (see below). On-device tests (`tests/*/tiers.rs`,
 both engines): a lane parked on the host and back at decode 2 and its kv list through the slot file at decode 6 lands
 the never-parked logits bit for bit (qwen3-micro-text, qwen35-tiny, gemma4-e4b-mini-l6 with a trimmed window list);
 contract 15 (a group `[run, cow]`, the folding lane writing the copy, the buffering lane reading the run, the run
@@ -94,6 +93,21 @@ expert tier, e2971507c) bit for bit, and none resident (every expert staged) / e
 (`tests/*/experts.rs`); quantized schemes kernel-level: tabled = contiguous bit for bit for every scheme, a route at
 a time and in sorted tiles, slots in two segments + a staged seat (`tests/*/linear/moe/table.rs`). No quantized MoE
 mini serves end to end here (the bf16 fixture writer; gpt-oss traces only quantized).
+
+Vulkan / wgpu snapshots (VK3, contract 16): both state `rs_snapshots = 4` where the trace holds state rows and every
+op reading one is a causal conv, a gated delta or a KDA scan (else 0, and the runtime cuts the pass). A fire whose
+lanes snapshot binds a table (a lane: 4 rows into it, 0 ends; then each snapshot's record as the pool's piece units,
+`RsSnapshot.pieces` or `[slot]`; a seat's record for a seat-addressed lane) and its chunked and committed scans run a
+`PIE_SNAPS` twin (`prim/pool.slang` `PIE_STATE_SNAPSHOTS`) that writes the state as of each row into the snapshot's
+record as it walks (conv: the history rolled to that row; GDN register / memory, KDA: the head state, each lane its
+own cells). Fires without snapshots run the kernels unchanged; a snapshot fire is not recorded (its table is the
+shell's, rewritten after a drain). Refused: more than 4, a row not interior, a lane split across the fire's runs, a
+lane not folding. Verified (`tests/*/snapshots.rs`, both engines, qwen35-tiny: GDN r128 + conv): 3 snapshots of a
+150-row prompt = the pass cut at each row (record bytes) bit for bit, in one slot and in 4 pieces (64 KiB chunks),
+alone (chunked arms) and beside a lane buffering its row (committed arms); the lane's own record and logits = the
+pass without snapshots; a decode from each snapshot = the cut pass's decode. Kernel level (`tests/*/ssm`): GDN k 128
+and k 32 (memory walk) and KDA chunked with a snapshot = the f64 reference. Not on device: KDA end to end (no KDA
+miniature serves here).
 
 Pre-existing parity gaps (not memory, but in scope for parity): ROCm synth codegen, ROCm graph replay with >= 2 MoE layers (AMD d); (concat_cols, FP8 m33 fixed M43);
 sm_100 tcgen05 W4A16 arms read no expert table; Metal MLA prefill unsupported.

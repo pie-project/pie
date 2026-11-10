@@ -162,7 +162,7 @@ pub fn gated_delta_chunked(
     };
     let [kh, vh, kd, vd] = heads.args(OP)?;
     ctx.fire(
-        Fire::at(GDN_RECURRENT, entry)
+        Fire::at(GDN_RECURRENT, state.entry(OP, entry)?)
             .tier(tactic.tier)
             .apply(heads.grid(requests(OP, qkv)?)),
         &[
@@ -173,8 +173,10 @@ pub fn gated_delta_chunked(
                 state.slots.arg(),
                 y.arg_mut(),
             ][..],
+            &state.snap_table(),
             &state.piece_args(true),
             &[kh, vh, kd, vd],
+            &state.snap_lane0(OP)?,
         ]
         .concat(),
     )
@@ -208,7 +210,7 @@ pub fn gated_delta_committed(
     };
     let [kh, vh, kd, vd] = heads.args(OP)?;
     ctx.fire(
-        Fire::at(GDN_RECURRENT, entry)
+        Fire::at(GDN_RECURRENT, state.entry(OP, entry)?)
             .tier(tactic.tier)
             .apply(heads.grid(window_lanes(OP, indptr)?)),
         &[
@@ -222,8 +224,10 @@ pub fn gated_delta_committed(
                 work.arg_mut(),
                 y.arg_mut(),
             ][..],
+            &state.snap_table(),
             &state.piece_args(true),
             &[stated(OP, committed.lane0)?.arg(), kh, vh, kd, vd],
+            &state.snap_lane0(OP)?,
         ]
         .concat(),
     )

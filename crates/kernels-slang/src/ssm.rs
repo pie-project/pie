@@ -38,9 +38,59 @@ pub struct StatePool {
     pub piece_first: u32,
 
     pub piece_atoms: u32,
+
+    /// Where a prompt's scans land the state as of rows inside a lane
+    /// (CONTRACT-BC 16), when a lane of the fire snapshots.
+    pub snapshots: Option<Snapshots>,
 }
 
+/// The snapshot table a fire's chunked and committed scans read
+/// (`kernels/prim/pool.slang`, `PIE_STATE_SNAPSHOTS`): a lane,
+/// [`RS_SNAPSHOTS`] rows into it (ascending, a row `<= 0` ends them), then
+/// each snapshot's record as the pool's `pieces` units; request `r` of the
+/// scan's CSR is lane `lane0 + r`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct Snapshots {
+    pub table: Tensor,
+    pub lane0: u32,
+}
+
+/// The rows inside one lane a fire lands the state of at most.
+pub const RS_SNAPSHOTS: u32 = 4;
+
 impl StatePool {
+    /// `entry`'s twin that lands snapshots, where this fire has a table.
+    pub(crate) fn entry(
+        &self,
+        op: &'static str,
+        entry: &'static str,
+    ) -> Result<&'static str, Error> {
+        if self.snapshots.is_none() {
+            return Ok(entry);
+        }
+        let twin = entry.replacen("_chunked", "_chunked_snap", 1).replacen(
+            "_committed",
+            "_committed_snap",
+            1,
+        );
+        crate::encode::instantiated(op, twin)
+    }
+
+    /// The snapshot table's binding, before the pool's segments; none
+    /// without a table.
+    pub(crate) fn snap_table(&self) -> Vec<ArgValue> {
+        self.snapshots
+            .map(|s| vec![s.table.arg()])
+            .unwrap_or_default()
+    }
+
+    /// The table's first lane, after a scan's scalars; none without one.
+    pub(crate) fn snap_lane0(&self, op: &'static str) -> Result<Vec<ArgValue>, Error> {
+        self.snapshots
+            .map(|s| Ok(vec![crate::encode::stated(op, s.lane0)?.arg()]))
+            .unwrap_or_else(|| Ok(Vec::new()))
+    }
+
     /// A bank of its own: `bank`'s rows are the slots, one segment.
     #[must_use]
     pub fn bank(bank: Tensor, slots: Tensor) -> Self {
@@ -54,6 +104,7 @@ impl StatePool {
             pieces: 1,
             piece_first: 0,
             piece_atoms: u32::MAX,
+            snapshots: None,
         }
     }
 

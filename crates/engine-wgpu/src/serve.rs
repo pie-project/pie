@@ -185,6 +185,10 @@ pub struct Seated<'a> {
 
     pub rs_slot: Option<u32>,
 
+    /// Rows inside the lane whose state the fire lands in records of their
+    /// own (CONTRACT-BC 16; `Lane::rs_snapshots`).
+    pub rs_snapshots: &'a [engine::fire::RsSnapshot],
+
     /// Whether `pages`, `record` and the rs verb's pages are slot refs the
     /// runtime names; otherwise the lane is seat-addressed (a direct fire):
     /// its seat's runs in the pool.
@@ -228,6 +232,7 @@ impl<'a> Seated<'a> {
             rs: &FOLD,
             rs_reset: engine::fire::RsReset::Inferred,
             rs_slot: None,
+            rs_snapshots: &[],
             refs: false,
             windows: &[],
             record: None,
@@ -412,6 +417,8 @@ pub struct Shell {
     held: Vec<u32>,
 
     rs_layout: Option<std::sync::Arc<crate::rs::Layout>>,
+    /// The snapshot table a fire whose lanes snapshot binds (CONTRACT-BC 16).
+    snaps: Option<Buffer>,
 
     rs_buffers: Option<crate::rs::Buffers>,
 
@@ -1041,6 +1048,7 @@ impl Shell {
             blobs: crate::blob::Store::new(),
             held: vec![0; slots as usize],
             rs_layout,
+            snaps: None,
             rs_buffers,
             rs_scratch: None,
             out,
@@ -2038,6 +2046,10 @@ impl Shell {
         }
 
         let mut beginning: Vec<Vec<u32>> = Vec::new();
+        // Each lane's snapshot entry (`kernels_slang::ssm::Snapshots`): its
+        // rows, then each snapshot's record as units.
+        let mut snap_entries: Vec<Vec<i32>> = Vec::with_capacity(lanes.len());
+        let mut snap_units = 0u32;
 
         let mut writes: Vec<Option<(i32, i32)>> = Vec::with_capacity(rows as usize);
         for row in composition.lanes() {
@@ -2215,6 +2227,65 @@ impl Shell {
             }
 
             slot_ids.extend(state.iter().map(|&unit| unit as i32));
+            {
+                const MAX: usize = kernels_slang::ssm::RS_SNAPSHOTS as usize;
+                let snaps = seated.rs_snapshots;
+                if snaps.len() > MAX
+                    || (!snaps.is_empty() && row.rows as usize != lane.tokens.len())
+                    || snaps
+                        .iter()
+                        .any(|snap| snap.row == 0 || snap.row >= row.rows)
+                {
+                    return Err(program(
+                        "serve::rs",
+                        format!(
+                            "lane {source} snapshots its recurrent state at rows {:?} and runs \
+                             {} of its {} rows in this fire; a fire lands at most {MAX} \
+                             interior rows of a lane it runs whole",
+                            snaps.iter().map(|snap| snap.row).collect::<Vec<_>>(),
+                            row.rows,
+                            lane.tokens.len()
+                        ),
+                    ));
+                }
+                let pieces = state.len();
+                let mut entry = vec![0i32; MAX * (1 + pieces)];
+                for (n, snap) in snaps.iter().enumerate() {
+                    // The snapshot's record: a slot ref a piece (its slot the
+                    // first), or a seat's record where the lane is
+                    // seat-addressed.
+                    let units = if !seated.refs {
+                        self.pools.record(None, snap.slot)?
+                    } else if snap.pieces.is_empty() {
+                        self.pools.record(Some(&[snap.slot]), seat_slot)?
+                    } else {
+                        self.pools.record(Some(&snap.pieces), seat_slot)?
+                    };
+                    if units.len() != pieces {
+                        return Err(program(
+                            "serve::rs",
+                            format!(
+                                "lane {source}'s snapshot at row {} names a record of {} \
+                                 pieces, where its own takes {pieces}",
+                                snap.row,
+                                units.len()
+                            ),
+                        ));
+                    }
+                    entry[n] = narrow(u64::from(snap.row));
+                    for (p, &unit) in units.iter().enumerate() {
+                        entry[MAX + n * pieces + p] = unit as i32;
+                        snap_units = snap_units.max(unit.saturating_add(1));
+                    }
+                }
+                if !snaps.is_empty() && !matches!(seated.rs, engine::fire::RsVerb::Fold) {
+                    return Err(program(
+                        "serve::rs",
+                        format!("lane {source} snapshots its state and does not fold every row"),
+                    ));
+                }
+                snap_entries.push(entry);
+            }
             let at_lane = (slot_ids.len() / state.len().max(1)) as i32 - 1;
 
             if !matches!(seated.rs, engine::fire::RsVerb::Fold) {
@@ -2302,6 +2373,7 @@ impl Shell {
             state_slots: slot_ids
                 .iter()
                 .map(|&row| (row as u32).saturating_add(1))
+                .chain(std::iter::once(snap_units))
                 .max()
                 .unwrap_or(0),
 
@@ -2681,8 +2753,37 @@ impl Shell {
                 write_offset: Some(seat.write_offset),
             });
         }
+        // The snapshot table, where a lane snapshots: in a buffer of the
+        // shell's, rewritten once every fire that might read it has landed.
+        let rs_snaps = if lanes.iter().any(|seated| !seated.rs_snapshots.is_empty()) {
+            let table: Vec<u8> = snap_entries
+                .iter()
+                .flatten()
+                .flat_map(|v| v.to_le_bytes())
+                .collect();
+            self.drain()?;
+            let bytes = table.len() as u64;
+            if self.snaps.as_ref().is_none_or(|held| held.bytes() < bytes) {
+                self.snaps = Some(Buffer::host(
+                    &self.device,
+                    bytes.next_power_of_two().max(256),
+                )?);
+            }
+            let held = self.snaps.as_mut().expect("just made");
+            held.write(0, &table)?;
+            let handle = self.handles.bind(held, 0, bytes)?;
+            Some(kernels_slang::Tensor::new(
+                handle,
+                u32::try_from(table.len() / 4).unwrap_or(u32::MAX),
+                1,
+                Dtype::I32,
+            ))
+        } else {
+            None
+        };
         let patch_seats = bound.patches;
         let bindings = FireBindings {
+            rs_snaps,
             tokens: bound.tokens,
             positions: bound.positions,
             readout_rows: bound.readout_rows,

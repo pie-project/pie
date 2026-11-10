@@ -235,6 +235,62 @@ fn the_gdn_recurrence_answers_the_reference() {
                 },
             );
 
+            // The chunked walk landing a snapshot (CONTRACT-BC 16): request
+            // 0 (lane 1 of the table) the state as of its row 2 into slot 0.
+            let indptr = [0i32, 3, 3, 5];
+            let rows = 5;
+            let slot_rows = [1u32, 1, 1, 2, 2];
+            let (qkv, qr, gates, gr) = inputs(&mut gpu, 40, rows);
+            let (ib, sb) = (gpu.up_i32(&indptr), gpu.up_u32(&slot_rows));
+            let max = kernels_slang::ssm::RS_SNAPSHOTS as usize;
+            let mut table = vec![0i32; 4 * 2 * max];
+            table[2 * max] = 2;
+            table[2 * max + max] = 0;
+            let snaps = kernels_slang::ssm::Snapshots {
+                table: t(gpu.up_i32(&table), table.len(), 1, Dtype::I32),
+                lane0: 1,
+            };
+            let mut want_y = vec![0.0; y_n(rows)];
+            let mut want_s = bank64.clone();
+            for r in 0..3 {
+                for row in indptr[r] as usize..indptr[r + 1] as usize {
+                    let s = slot_rows[indptr[r] as usize] as usize;
+                    sh.token(&qr, &gr, row, &mut want_s[s * slab..][..slab], &mut want_y);
+                    if r == 0 && row == 1 {
+                        let held = want_s[s * slab..][..slab].to_vec();
+                        want_s[..slab].copy_from_slice(&held);
+                    }
+                }
+            }
+            landed(
+                &mut gpu,
+                &what("chunked, a snapshot"),
+                &fresh(rows, 0),
+                &[want_y, want_s],
+                &|g, o| {
+                    g.run(|c| {
+                        kernels_slang::ssm::gdn_recurrent::gated_delta_chunked(
+                            c,
+                            tactic,
+                            kernels_slang::RaggedTensor {
+                                data: qkv,
+                                indptr: t(ib, 4, 1, Dtype::I32),
+                            },
+                            gates,
+                            &kernels_slang::ssm::StatePool {
+                                snapshots: Some(snaps),
+                                ..pool(o[1].0, sb, rows)
+                            },
+                            kh,
+                            vh,
+                            dk,
+                            dv,
+                            y(o[0].0, rows),
+                        )
+                    })
+                },
+            );
+
             // The committed window, lanes 1..5: 2 own rows after 1 replayed,
             // kept as of row 2 on slot 2; 1 after 1, kept whole on slot 0; 1
             // after 0 with no slot; 1 after 0 kept as of none on slot 1.

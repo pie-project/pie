@@ -106,6 +106,10 @@ pub struct FireBindings {
 
     pub rs: Option<std::sync::Arc<crate::rs::Seat>>,
 
+    /// Where the prompt scans land the state as of rows inside a lane, when
+    /// a lane of the fire snapshots (CONTRACT-BC 16).
+    pub rs_snaps: Option<Tensor>,
+
     pub group_of_lane: Option<Tensor>,
     pub packings: Vec<(poem_ir::Selection, crate::inputs::PackingHandles)>,
     pub group_masks: Vec<crate::inputs::GroupMaskHandles>,
@@ -291,6 +295,17 @@ impl<'c> Run<'c> {
 
     pub(crate) fn rs_seat(&self) -> Option<std::sync::Arc<crate::rs::Seat>> {
         self.fire.rs.clone()
+    }
+
+    /// The snapshot table this window's scans read, when a lane of the fire
+    /// snapshots: its requests from the window's first lane.
+    pub(crate) fn rs_snapshots(&self) -> Option<kernels_slang::ssm::Snapshots> {
+        self.fire
+            .rs_snaps
+            .map(|table| kernels_slang::ssm::Snapshots {
+                table,
+                lane0: self.window().span.lane_offset,
+            })
     }
 
     pub(crate) fn handles(&self) -> &'c Handles {

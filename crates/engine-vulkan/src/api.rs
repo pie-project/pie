@@ -441,10 +441,9 @@ impl Engine for Vulkan {
             media_encode: false,
             device_channel_commit: false,
             rs_verbs: shell.serves_rs_verbs(),
-            // No state lands inside a fire: the runtime cuts a pass at each
-            // checkpoint and never sends `Lane::rs_snapshots` (`validate_for`
-            // refuses them), so snapshots per piece (CONTRACT-BC 16) are moot.
-            rs_snapshots: 0,
+            // The prompt scans land the state as of rows inside a lane, a
+            // record a snapshot in pieces (CONTRACT-BC 16).
+            rs_snapshots: crate::rs::snapshots(shell.trace()),
             bidirectional_attention: false,
             adapter_attachments: false,
             facts: shell.trace().facts.clone(),
@@ -1176,6 +1175,7 @@ impl Vulkan {
                 rs: &verbs[at],
                 rs_reset: lane.rs_reset,
                 rs_slot: lane.rs_slot,
+                rs_snapshots: &lane.rs_snapshots,
                 refs: true,
                 windows: &lane.tables,
                 record: record_of[at].as_deref(),

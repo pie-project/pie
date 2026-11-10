@@ -24,7 +24,7 @@ const ROWS: usize = 256;
 
 /// Slot refs handed out as the runtime would: a chunk opened a shape from
 /// `next` up, its slots taken from the top down.
-struct Refs {
+pub struct Refs {
     next: u32,
     end: u32,
     per: BTreeMap<ShapeId, u32>,
@@ -32,7 +32,7 @@ struct Refs {
 }
 
 impl Refs {
-    fn of(facts: &ChunkFacts, first: u32, end: u32) -> Refs {
+    pub fn of(facts: &ChunkFacts, first: u32, end: u32) -> Refs {
         Refs {
             next: first,
             end,
@@ -45,7 +45,7 @@ impl Refs {
         }
     }
 
-    fn take(&mut self, shape: ShapeId) -> u32 {
+    pub fn take(&mut self, shape: ShapeId) -> u32 {
         let per = self.per[&shape];
         let (chunk, used) = match self.open.get(&shape) {
             Some(&(chunk, used)) if used < per => (chunk, used),
@@ -64,11 +64,11 @@ impl Refs {
 /// What one lane holds: its kv list pages, each window list's table (0 a
 /// slot trimmed behind its window) and its record's pieces.
 #[derive(Clone, Debug, Default)]
-struct Held {
-    pages: Vec<u32>,
-    windows: Vec<(ShapeId, Vec<u32>)>,
-    record: Vec<u32>,
-    have: u32,
+pub struct Held {
+    pub pages: Vec<u32>,
+    pub windows: Vec<(ShapeId, Vec<u32>)>,
+    pub record: Vec<u32>,
+    pub have: u32,
 }
 
 /// The lists a load's lanes page: shape, tokens a slot, window.
@@ -84,7 +84,7 @@ fn lists(facts: &ChunkFacts) -> Vec<(ShapeId, u32, Option<u32>)> {
         .collect()
 }
 
-fn pieces(facts: &ChunkFacts) -> u32 {
+pub fn pieces(facts: &ChunkFacts) -> u32 {
     match facts.shape(FIXED).map(|s| s.kind) {
         Some(SlotKind::Fixed { pieces }) => pieces,
         _ => 0,
@@ -93,7 +93,7 @@ fn pieces(facts: &ChunkFacts) -> u32 {
 
 impl Held {
     /// A fresh lane: its record's pieces taken.
-    fn new(facts: &ChunkFacts, refs: &mut Refs) -> Held {
+    pub fn new(facts: &ChunkFacts, refs: &mut Refs) -> Held {
         Held {
             record: (0..pieces(facts)).map(|_| refs.take(FIXED)).collect(),
             windows: lists(facts)
@@ -107,7 +107,7 @@ impl Held {
 
     /// Every list's slots grown to `after` tokens, and each window list
     /// trimmed as the runtime trims at `have` committed rows.
-    fn grow(&mut self, facts: &ChunkFacts, refs: &mut Refs, after: u32) {
+    pub fn grow(&mut self, facts: &ChunkFacts, refs: &mut Refs, after: u32) {
         let have = self.have;
         for (id, tokens, window) in lists(facts) {
             let table = if id == LIST {
@@ -133,7 +133,12 @@ impl Held {
         }
     }
 
-    fn seated<'a>(&'a self, trace: &poem_ir::Trace, tokens: &'a [u32], slot: u32) -> Seated<'a> {
+    pub fn seated<'a>(
+        &'a self,
+        trace: &poem_ir::Trace,
+        tokens: &'a [u32],
+        slot: u32,
+    ) -> Seated<'a> {
         Seated {
             pages: &self.pages,
             windows: &self.windows,
@@ -246,7 +251,7 @@ fn park(
 
 /// The chunk the lanes' refs start at: past the seats' runs, a segment of
 /// their own; and the segments the pool commits for them.
-fn committed(shell: &mut Shell, facts: &ChunkFacts) -> (u32, u32) {
+pub fn committed(shell: &mut Shell, facts: &ChunkFacts) -> (u32, u32) {
     let low = 1 + shell.pool_layout().seat_chunks();
     let first = low.div_ceil(facts.segment_chunks) * facts.segment_chunks;
     let segments = facts.segments.max.min(first / facts.segment_chunks + 2);
@@ -365,7 +370,7 @@ fn a_windowed_lane_parked_on_the_host_and_the_disk_serves_the_same_logits() {
 }
 
 /// The rs list's tokens a slot.
-fn rs_tokens(facts: &ChunkFacts) -> u32 {
+pub fn rs_tokens(facts: &ChunkFacts) -> u32 {
     match facts.shape(RS).map(|s| s.kind) {
         Some(SlotKind::List { tokens, .. }) => tokens,
         _ => panic!("the load buffers rs rows in an rs list"),

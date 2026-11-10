@@ -12,5 +12,6 @@ mod model_logits;
 mod rows;
 mod runtime;
 mod sampling;
+mod snapshots;
 mod ssm;
 mod tiers;
