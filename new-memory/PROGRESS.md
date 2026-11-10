@@ -369,3 +369,11 @@ The `new-memory/` directory is bookkeeping and is removed before anything lands 
   before (reused while decodes ran) and are now fenced per fire.
 - Verified: `cargo check` runtime, worker, engine and every engine crate; RW3 ran store::shared/slots/rs/kv, planner,
   pipeline::fire::rs.
+
+### M25 — 2026-11-10: RWH merged (launch hang on sparse shared pools)
+- `sc/rwh-launch-hang` (7898038ac): in shared mode `KvStore::pages_out()` counted uncommitted segments as handed-out
+  pages, so a sparse pool (Metal, Growth::Bottom, one segment committed at load) reported kv pressure ~250/255 and the
+  gateway held every launch. New `ShapePool::out()` counts only slots actually held for shared list/ring shapes;
+  also fixes reported capacity/used tokens, the server handler and policy pressure. Regression test with Metal-like
+  facts. (The rs records pool's "out" has the same shape but does not feed gateway pressure — left as is.)
+- Verified: `cargo check` runtime + worker; `store::shared`.
