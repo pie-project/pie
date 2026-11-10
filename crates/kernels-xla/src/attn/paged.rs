@@ -1736,6 +1736,19 @@ pub fn attend(
     pool: KvPool<Operand>,
     tuning: Tuning,
 ) -> Result<(Val, Option<Val>), Error> {
+    attend_fresh(f, call, pool, tuning, None)
+}
+
+/// [`attend`], given what this fire appended to the pool: a blocked prefill
+/// then reads its own keys through the flash kernel where it can
+/// (`super::flash`).
+pub fn attend_fresh(
+    f: &mut Func,
+    call: Paged<Operand, Landing>,
+    pool: KvPool<Operand>,
+    tuning: Tuning,
+    fresh: Option<super::flash::Appended>,
+) -> Result<(Val, Option<Val>), Error> {
     let pool = &pool;
     let op = call.op;
     expect(op, call.q, &[Dtype::Bf16])?;
@@ -1985,16 +1998,50 @@ pub fn attend(
                 ch,
             )?
         }
-        (Walk::Blocked, None) => blocked(
-            f,
-            &planes,
-            &heads,
-            &rule,
-            &rs,
-            geom.lanes * geom.span,
-            scale,
-            ch,
-        )?,
+        (Walk::Blocked, None) => {
+            let walk = |f: &mut Func| {
+                blocked(
+                    f,
+                    &planes,
+                    &heads,
+                    &rule,
+                    &rs,
+                    geom.lanes * geom.span,
+                    scale,
+                    ch,
+                )
+            };
+            let cap_v = tuning.vmem_cap();
+            // Causal rows with no relative bias read nothing past themselves
+            // and nothing but their scaled scores; a fire of decodes beside
+            // a prompt (a few rows a lane) walks as it did.
+            let plain = call.causal
+                && rule.rel.is_none()
+                && call.o.dtype == Dtype::Bf16
+                && r >= 4 * geom.lanes;
+            match fresh.filter(|a| plain && super::flash::fits(f, a, r, &heads, cap_v)) {
+                Some(a) => super::flash::attend(
+                    f,
+                    &a,
+                    &heads,
+                    &geom,
+                    i64::from(pool.keys.rows),
+                    (keys, values),
+                    q4,
+                    lane,
+                    qpos,
+                    lo,
+                    hi,
+                    window,
+                    cap,
+                    enabled,
+                    scale,
+                    cap_v,
+                    Box::new(walk),
+                )?,
+                None => walk(f)?,
+            }
+        }
         (Walk::PerRow, None)
             if ch.decode_pages > 0
                 && r >= ch.decode_pages
@@ -2405,6 +2452,7 @@ pub(crate) fn scatter_slots(
     page_size: i32,
     write_page: Operand,
     write_offset: Operand,
+    vmem_cap: Option<i64>,
 ) -> Result<Vec<Val>, Error> {
     let Some(&(first, _)) = pairs.first() else {
         return Ok(Vec::new());
@@ -2436,6 +2484,41 @@ pub(crate) fn scatter_slots(
     let skip = f.convert(skip, Elem::I32);
     let which = with_i(f, skip, 1, Func::add)?;
     let which = f.mul(which, runs.ok)?;
+    // Two bf16 planes of 16-row pages: a prompt's runs (few of them
+    // partial) are laid by one Mosaic kernel.
+    let w = i64::from(pairs[0].1.width);
+    let m = f.dims(runs.page)[0];
+    if let [(k, keys), (v, values)] = pairs
+        && keys.val != values.val
+        && keys.width == values.width
+        && k.width == keys.width
+        && v.width == values.width
+        && f.elem(keys.val) == Elem::Bf16
+        && f.elem(values.val) == Elem::Bf16
+        && let Some(vmem_cap) = vmem_cap
+        && super::append::fits(i64::from(n), w, slots, ps, m, vmem_cap)
+    {
+        let (k, v, keys, values) = (*k, *v, *keys, *values);
+        let rows: crate::hlo::Branch<'_> =
+            Box::new(move |f: &mut Func| slot_rows(f, pairs, ps, page, off));
+        let kernel: crate::hlo::Branch<'_> = Box::new(move |f: &mut Func| {
+            let total = f.reshape(runs.total, &[1])?;
+            let page = clamp_i(f, runs.page, 0, slots / ps - 1)?;
+            super::append::write(
+                f,
+                k.val,
+                v.val,
+                keys.val,
+                values.val,
+                [runs.start, runs.first, runs.len, page],
+                total,
+                vmem_cap,
+            )
+        });
+        let pages: crate::hlo::Branch<'_> =
+            Box::new(move |f: &mut Func| page_writes(f, pairs, ps, slots / ps, &runs, None));
+        return Ok(f.case(which, &outs, vec![rows, pages, kernel])?);
+    }
     let rows: crate::hlo::Branch<'_> =
         Box::new(move |f: &mut Func| slot_rows(f, pairs, ps, page, off));
     let pages: crate::hlo::Branch<'_> =
@@ -2504,6 +2587,8 @@ struct Runs {
     ok: Val,
     /// How many live runs lay less than a whole page (i32 scalar).
     partial: Val,
+    /// How many runs are live (i32 scalar).
+    total: Val,
 }
 
 fn page_runs(f: &mut Func, n: i64, ps: i64, pages: i64, page: Val, off: Val) -> Built<Runs> {
@@ -2586,6 +2671,7 @@ fn page_runs(f: &mut Func, n: i64, ps: i64, pages: i64, page: Val, off: Val) -> 
         page: keyed,
         ok,
         partial,
+        total,
     })
 }
 
@@ -2775,6 +2861,7 @@ fn append(
     head_stride: u64,
     write_page: Operand,
     write_offset: Operand,
+    vmem_cap: Option<i64>,
 ) -> Result<(Val, Val), Error> {
     expect(op, k, &[Dtype::Bf16])?;
     if page_size <= 0 {
@@ -2800,6 +2887,7 @@ fn append(
         page_size,
         write_page,
         write_offset,
+        vmem_cap,
     )?;
     Ok((planes[0], planes[1]))
 }
@@ -2816,6 +2904,7 @@ pub fn kv_append(
     pool: &KvPool<impl Stored>,
     write_page: Operand,
     write_offset: Operand,
+    tuning: Tuning,
 ) -> Result<(Val, Val), Error> {
     append(
         f,
@@ -2829,6 +2918,7 @@ pub fn kv_append(
         pool.head_stride,
         write_page,
         write_offset,
+        Some(tuning.vmem_cap()),
     )
 }
 
@@ -2855,5 +2945,6 @@ pub fn kv_append_shared(
         pool.head_stride,
         write_page,
         write_offset,
+        None,
     )
 }

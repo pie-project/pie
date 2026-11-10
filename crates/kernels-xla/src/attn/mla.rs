@@ -364,7 +364,15 @@ pub fn kv_append(
     if let Some(r) = rope {
         pairs.push(r);
     }
-    let planes = scatter_slots(f, OP, &pairs, pool.page_size, write_page, write_offset)?;
+    let planes = scatter_slots(
+        f,
+        OP,
+        &pairs,
+        pool.page_size,
+        write_page,
+        write_offset,
+        None,
+    )?;
     Ok((planes[0], planes.get(1).copied()))
 }
 

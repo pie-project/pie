@@ -181,6 +181,10 @@ pub struct Run<'c> {
     /// than the budget, so `attn.index_topk` answers each row all of them,
     /// in order.
     pub(crate) full_selections: Vec<(ValueId, u32)>,
+
+    /// What this fire appended to each kv cache, as the append read it: a
+    /// prefill reads its own keys from it (`attn::flash`).
+    pub(crate) appended: Vec<(ValueId, kernels_xla::attn::flash::Appended)>,
     /// Routes `linear.group_routes` built (every row's slot `g` routed to
     /// group `g`), with their group count.
     pub(crate) group_routes: Vec<(ValueId, u32)>,
@@ -235,6 +239,7 @@ impl<'c> Run<'c> {
             head_norms: Vec::new(),
             readout_rowed: (std::sync::Arc::new(Vec::new()), None),
             full_selections: Vec::new(),
+            appended: Vec::new(),
             group_routes: Vec::new(),
             boundaries: Vec::new(),
             tiled: std::cell::RefCell::new(Vec::new()),
