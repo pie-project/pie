@@ -19,7 +19,9 @@
 //! indexer or a pool the width of the keys it scores; a pool appending its
 //! own entries that the row pages alone; a pool gathering from the row that
 //! no rank holds a part of it; a recurrence that its slab is cut by head; a
-//! convolution whose channels feed heads that its taps are cut by channel.
+//! convolution whose channels feed heads that its taps are cut by channel;
+//! an append whose keys and values a padded split cut out of a projection
+//! the widths its heads carry before their zeros.
 
 use std::fmt;
 
@@ -36,7 +38,7 @@ use starlark_derive::{starlark_module, starlark_value};
 
 use crate::star::values::{DtypeValue, word};
 use crate::{Dtype, HybridSpec, KvSpace};
-use poem_ir::{Attn, Def, Operands, Operation, Ssm, Trace, ValueId};
+use poem_ir::{Attn, Def, Gather, Operands, Operation, Ssm, Trace, ValueId};
 
 /// The token axis a per-token state's shape starts with: one row every
 /// `rate` tokens.
@@ -355,6 +357,9 @@ struct Reads {
     /// The slab axis its heads or channels lie on: from the end where
     /// `Err`, `Ok` from the front.
     split: Option<Result<u32, u32>>,
+    /// The widths a key head and a value head carry, zeros after them, as
+    /// a padded split cut the keys and values appended to it.
+    live: Option<[u32; 2]>,
 }
 
 impl Reads {
@@ -399,6 +404,17 @@ impl Reads {
                 anyhow::bail!("`{name}` is cut between ranks along two axes by the ops reading it")
             }
             _ => self.split = Some(axis),
+        }
+        Ok(())
+    }
+
+    fn live(&mut self, name: &str, widths: [u32; 2]) -> anyhow::Result<()> {
+        match self.live {
+            Some(seen) if seen != widths => anyhow::bail!(
+                "`{name}` is appended heads of {seen:?} live widths by one op and of {widths:?} \
+                 by another"
+            ),
+            _ => self.live = Some(widths),
         }
         Ok(())
     }
@@ -470,9 +486,44 @@ fn feeds_heads(trace: &Trace) -> impl Fn(ValueId) -> bool + '_ {
     }
 }
 
+/// The padded split a value comes from, before a projection takes it:
+/// the split's node and whether the value is its keys (`true`) or its
+/// values. Ops between (a rotation, a scale) keep the zeros its heads are
+/// padded with.
+fn padded_split(trace: &Trace) -> impl Fn(ValueId) -> Option<(usize, bool)> + '_ {
+    move |from| {
+        let mut seen = vec![false; trace.values.len()];
+        let mut todo = std::collections::VecDeque::from([from]);
+        let mut inputs = Vec::new();
+        while let Some(v) = todo.pop_front() {
+            if std::mem::replace(&mut seen[v.0 as usize], true) {
+                continue;
+            }
+            let Def::Op(n) = trace.values[v.0 as usize].def else {
+                continue;
+            };
+            match &trace.nodes[n as usize].op {
+                Operation::Gather(Gather::SplitQkvPadded { k, v: values, .. }) => {
+                    if v == *k || v == *values {
+                        return Some((n as usize, v == *k));
+                    }
+                }
+                Operation::Linear(_) => {}
+                op => {
+                    inputs.clear();
+                    op.inputs(&mut inputs);
+                    todo.extend(inputs.iter().copied());
+                }
+            }
+        }
+        None
+    }
+}
+
 /// What the ops of `trace` say of each cache row it reads, by row.
 fn reads(trace: &Trace) -> anyhow::Result<Vec<Reads>> {
     let mut out = vec![Reads::default(); trace.caches.len()];
+    let padded_split = padded_split(trace);
     let row = |id: ValueId| match trace.values[id.0 as usize].def {
         Def::Cache(index) => Some(index as usize),
         _ => None,
@@ -543,6 +594,24 @@ fn reads(trace: &Trace) -> anyhow::Result<Vec<Reads>> {
                     out[i].window(&name(i), *window)?;
                     out[i].latent(&name(i), *kv_lora_rank)?;
                     out[i].planned = true;
+                }
+            }
+            // keys and values a padded split cut out, each head zero past
+            // the widths it carries
+            Operation::Attn(Attn::KvAppend {
+                k,
+                v: Some(v),
+                cache,
+                ..
+            }) => {
+                if let Some(i) = row(*cache)
+                    && let (Some((from, true)), Some((also, false))) =
+                        (padded_split(*k), padded_split(*v))
+                    && from == also
+                    && let Operation::Gather(Gather::SplitQkvPadded { widths, .. }) =
+                        &trace.nodes[from].op
+                {
+                    out[i].live(&name(i), *widths)?;
                 }
             }
             Operation::Attn(Attn::IndexTopk { keys, head_dim, .. }) => {
@@ -740,6 +809,9 @@ fn lower(states: &[StateDecl], read: &[Reads]) -> anyhow::Result<HybridSpec> {
                 let mut row = spec.kv(space, s.name.clone(), planes(s, rate)?, head_dim);
                 if let Some(format) = s.rows {
                     row.rows(format.rows(s.dims())?);
+                }
+                if let Some([key, value]) = r.live {
+                    row.live(key, value);
                 }
                 // One plane of a single head, its key and its value both, is
                 // no head the ranks could part.

@@ -164,3 +164,48 @@ fn only_a_per_token_state_lists_its_planes() {
     let why = format!("{:#}", traced(&source).expect_err("a listed slab"));
     assert!(why.contains("a per-token state lists its planes"), "{why}");
 }
+
+const PADDED: &str = r#"
+def layout(id, deploy):
+    return struct(
+        embed = weight([16, 64]),
+        head = weight([16, 64]),
+        qkv = weight([4 * 12 + 2 * (12 + 8), 64]),
+        o = weight([64, 4 * 8]),
+        kv = state([tokens, 2, 2, 16], deploy.kv),
+    )
+
+def forward(m, inputs):
+    y = ops.gather.embed(inputs.tokens(), m.embed, 16)
+    q, k, v = ops.gather.split_qkv_padded(ops.linear.matmul(y, m.qkv), 4, 2, 12, 8, 16)
+    q, k = ops.elemwise.rope(q, inputs.positions(), 16, 10000.0, rotary.partial(8), k = k)
+    ops.attn.kv_append(k, v * f32(0.5), m.kv)
+    a = ops.attn.attend(q, inputs, m.kv, 4, 2, 16, 0.25)
+    a, _ = ops.gather.split_q_gate(a, 8)
+    y = ops.elemwise.residual_add(ops.linear.matmul(a, m.o), y)
+    output("logits", ops.linear.lm_head(ops.gather.gather_rows(y, inputs.readout_rows()), m.head))
+"#;
+
+/// The live widths of `trace`'s kv rows.
+fn live(trace: &poem_ir::Trace) -> Vec<Option<[u32; 2]>> {
+    trace
+        .caches
+        .iter()
+        .filter_map(|row| match row {
+            CacheRow::Kv { live, .. } => Some(*live),
+            CacheRow::State { .. } => None,
+        })
+        .collect()
+}
+
+#[test]
+fn a_padded_split_says_the_widths_its_heads_carry() {
+    // keys 12 and values 8 wide, each head zero-padded to 16: the split
+    // cutting out what the row is appended says so, through the rotation
+    // and the scale between
+    let trace = traced(PADDED).unwrap_or_else(|e| panic!("{e:#}"));
+    assert_eq!(live(&trace), [Some([12, 8])]);
+    // keys and values a projection cuts out whole carry their every dim
+    let trace = traced(MODEL).unwrap_or_else(|e| panic!("{e:#}"));
+    assert_eq!(live(&trace), [None; 4]);
+}
