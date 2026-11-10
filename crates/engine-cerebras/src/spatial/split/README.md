@@ -48,7 +48,7 @@ column 0, then up column 1, and so on.
   many tokens without the host.
 - **Collectives.** Every reduction is a two-level streamed chain (groups of G2) into a control
   PE. The control PE merges both halves through a FIFO and multicasts the result. Routes and
-  queue colours are static per PE: `rcfg` words from `geo.rs`. There are no axis switches, so one
+  queue colours are static per PE: `rcfg` words from the layered build (`ARCHITECTURE.md`). There are no axis switches, so one
   image serves every PE of a kind.
 
 **Queue and colour rules learned on the CS-3.** The simulator accepted every one of these
@@ -115,8 +115,8 @@ Notes on the table:
 All tools are under `crates/engine-cerebras/tools/`. Set `CSL_SDK` to the SDK directory, which holds
 `cslc` and `cs_readelf`.
 
-1. **Prep** (checkpoint -> tiles): writes `<prefix>meta.json`, `w<u>.npy`, `hw`, `hemb`, ... and
-   `params.txt`, the shape params.
+1. **Prep** (checkpoint -> tiles): writes `<prefix>meta.json`, `w<u>.npy`, `hw`, `hemb`, ... (and
+   `params.txt`). The build reads the meta; the geometry is Rust's (`split-geo`, `ARCHITECTURE.md`).
    - Any Qwen3.5 size and geometry:
      `tools/split/prep_q35.py <model> <out> <golden.json> PX PY UNX UNY K HR VR NE [prefix]`.
      The 9B: `256 256 2 4 4 1153 216 64 s9b_`. The 4B: the same with its own model. The 0.8B:
@@ -126,14 +126,17 @@ All tools are under `crates/engine-cerebras/tools/`. Set `CSL_SDK` to the SDK di
 2. **Numerics gate** (before any new lever): `tools/emu/tf_q35.py <model> <golden> <meta.json>
    ref,f16acc_s16_kv16 256 <out>`. This needs `torch` and `transformers` with Qwen3.5. For
    serve8b_region's levers on Qwen3-8B: `tools/emu/tf_qwen3_8b.py`.
-3. **Sources**: `tools/split/mkfull.py <build dir>` writes `layout.csl` and one source a PE kind
-   (weight, cx, cy, head, hctl, filler). It reads `src/spatial/csl/split`, or `$SPLIT_SRC` if set.
-4. **Link and check**: `tools/split/link.sh <build dir> <prep>/<prefix>params.txt [K:V,...]`. This is
-   a full local link at the chip's fabric dims, followed by the stack-room check. Run it on every
-   build before a chip request. Name the chip payload `*_ieee`.
+3. **Sources**: `tools/split/mkfull.py <build dir> <prep> <prefix> [overrides k=v,..] [levers K:V,..]`
+   writes `layout.csl` (every PE's kernel and params resolved), one source a PE kind and `geo/`
+   (`split-geo`'s files: rcfg, floor, host, bindings). Overrides are the meta's (as
+   `PIE_CEREBRAS_SPLIT` takes them: `G2=16,WL=1`); levers set kernel params (`CYV:2`, `SLW:1`; a
+   `<kind>.` prefix scopes one: `w.FIFOW:16`). It reads `src/spatial/csl/split`, or `$SPLIT_SRC`.
+4. **Link and check**: `tools/split/link.sh <build dir>`. This is a full local link at the chip's
+   fabric dims, followed by the stack-room check. Run it on every build before a chip request. Name
+   the chip payload `*_ieee`.
 5. **Tiny end-to-end on the simulator** (no chip):
    1. `tools/split/mk_tinyhf.py <dir> t08` (or `t4`) builds a tiny HF checkpoint and its golden.
-   2. `prep_q35.py` on it, then `mkfull.py` and `link.sh` with the tiny's params.
+   2. `prep_q35.py` on it, then `mkfull.py <build> <prep> "" G2=2,WL=1,G2W=2` and `link.sh`.
    3. `split_sim <build>/out <prep> "" G2=2,WL=1,G2W=2 5` (`--example split_sim`; `SPLIT_NTOK` caps
       the tokens) runs `SplitModel` against the golden: two sequences, a rollback and a logits row.
       Run it where the SDK runtime libraries are: inside the SDK container, through the container's
@@ -147,7 +150,7 @@ All tools are under `crates/engine-cerebras/tools/`. Set `CSL_SDK` to the SDK di
 
 ## 4. Parameters, levers and diagnostics (one place)
 
-The shape params come from the prep's `params.txt`. Every other param has a default, and the
+The shape params come from the plan (the prep's meta). Every other param has a default, and the
 default is the shipped build. Each kernel's header describes its own params and interface.
 
 | param | where | default | meaning |
@@ -237,12 +240,11 @@ They match HF f32 logprobs to within 0.004 on the chosen token.
 
 ## 7. Gemma 4 and gpt-oss-20b
 
-Both reuse the role-split machinery (`geo.rs`'s chains, segments, handoffs, head and token loop; `head_ctl.csl`)
-with their own kernels, geometry (`geo/gemma.rs`, `geo/gptoss.rs`: rcfg words identical to the Python tools on
-every PE), placement (`place_gemma.rs`, `place_gptoss.rs`) and `SplitModel` paths. The prep meta selects the path:
-`NEX` is gpt-oss, `geo` without it is Gemma. Tools: `tools/split/gemma`, `tools/split/gptoss` (prep, mkfull,
-`run_*.py` bare runner, `gotiny.sh` tiny simulation), `tools/split/split_geo.py` (the Python geometry both build
-on), `tools/emu/tf_gemma.py` and `tf_gptoss.py` (teacher-forced emulation of the kernels' number formats).
+Both reuse the role-split machinery (the generic chains, segments, handoffs, head and token loop; `head_ctl.csl`)
+with their own kernels and a family each (`family/gemma.rs`, `family/gptoss.rs`: floor, wiring, rcfg words,
+bindings). The prep meta selects the family: `NEX` is gpt-oss, `geo` without it is Gemma. Tools: `tools/split/gemma`,
+`tools/split/gptoss` (prep, `mkfull_*.py`, `run_*.py` bare runner, `gotiny.sh` tiny simulation), `tools/emu/tf_gemma.py`
+and `tf_gptoss.py` (teacher-forced emulation of the kernels' number formats).
 
 **Gemma 4** (`*_gemma.csl`, E2B and E4B; 12B below).
 - Units at explicit origins: 7 units (E2B 256 x 128, Hc 12, K 5; E4B 256 x 160, Hc 16, K 6) placed around the
@@ -261,6 +263,8 @@ on), `tools/emu/tf_gemma.py` and `tf_gptoss.py` (teacher-forced emulation of the
   a one-copy whole-ring mixer measured slower on E4B, 0.8927 against 0.8873 ms). GELU stays
   f32 (an f16 GELU flipped the long golden; `GELUT 2` is the f32 form with fewer f32 multiplies, which cost a cycle a
   word an operand); the final softcap is applied on the host (greedy-invariant).
+- Builds as on chip: E2B `mkfull.py <build> <prep> ge2_ "" WSPEC:2`; E4B (0974) `mkfull.py <build> <prep> ge4_
+  PYW=128,NEG=20,WIN=0 WSPEC:0,w.FIFOW:16` (its staged meta predates `PYW`; the weight PE's FIFO at 16 words).
 - The weight PE works out the step's position row and entry once a step (a u32 divide by a row count that is not a
   power of two is a ~270-cycle helper) and keeps the cache offsets in comptime tables.
 - Diagnostics: `DIAG 1` (no layers: handoffs, head, PLE and KVS words checked at every consumer), `PLOG 1` (the full
@@ -280,7 +284,7 @@ layers and a 2 GB tied head fill 98% of the wafer, which only fits with a row-ro
   column takes a group of CX rows: attention rows in sixes, plain rows in fives, no group across the CY row. The
   group's CX PEs chain their x to the group's root on the last unit's CX column, and the root sends it east. The
   wafer loop's embedding returns to unit 0's root row and down the same chain.
-- Tools: `tools/split/g12`. `geo/g12.rs` rcfg words are identical to `split_geo_g12.py` on all 846,094 PEs.
+- Tools: `tools/split/g12`; the family is `family/gemma12.rs`.
 
 **gpt-oss-20b** (`*_gptoss*.csl`).
 - Experts: the released MXFP4 values re-encoded losslessly as FP8 E5M2 (the high byte of an f16) with one power of
