@@ -318,10 +318,31 @@ impl KvStore {
         disk_capacity: u32,
         seed: Hash256,
     ) -> Self {
-        let capacity = pages.device;
+        Self::with_pool(
+            ShapePool::new(
+                ShapeKind::List,
+                pages.slot_bytes,
+                pages.ids_from,
+                pages.device,
+            ),
+            host_capacity,
+            disk_capacity,
+            seed,
+        )
+    }
+
+    /// A store whose device pages are `pool`'s ids: a pinned run's, or the
+    /// slot refs of a shared pool's list shape.
+    pub fn with_pool(
+        pool: ShapePool<PhysicalKvPageId>,
+        host_capacity: u32,
+        disk_capacity: u32,
+        seed: Hash256,
+    ) -> Self {
+        let capacity = pool.capacity();
         Self {
             table: KvPageTable::new(),
-            pool: ShapePool::new(ShapeKind::List, pages.slot_bytes, pages.ids_from, capacity),
+            pool,
             target_pages: capacity,
             short_pages: 0,
             mapped_pages: capacity,

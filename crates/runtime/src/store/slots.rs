@@ -18,6 +18,21 @@
 //!
 //! Budget: `reserved + state chunks + act_chunks(rung) <= committed <= total`.
 //!
+//! Position (two-ended pools): activation takes the top `act_chunks(rung)`
+//! physical chunks of the range, so state chunks lie only below
+//! `total - act_chunks(rung)` ([`SlotPool::state_limit`]). The segments under
+//! the largest rung's activation are committed from the load and never
+//! evacuated or released. Raising the rung first moves whatever state sits
+//! in the new activation span down ([`SlotPool::plan_rung`],
+//! [`SlotPool::apply_rung`]); opening lowest first keeps the top free.
+//!
+//! Logical ids mirror the engine's `ChunkTable`: logical and physical ids are
+//! a permutation of `0..total`, the identity at load, and only an evacuation
+//! changes it, the way `ChunkTable::apply` does (the moved chunk takes the
+//! target's place, the free logical id there takes the moved one's old
+//! place). Opening physical chunk `p` hands out the logical id the table maps
+//! to `p`, so the runtime's slot refs and the engine's table always agree.
+//!
 //! The local types stand in for package E1's `engine::chunk` until it lands:
 //! [`SlotShape`] is its `SlotShape` without the per-kind geometry (pieces,
 //! tokens, window, rows: the pool needs only the slot count and size),
@@ -158,6 +173,23 @@ pub enum SlotError {
     },
     #[error("{needed} chunks do not fit in {committed} committed")]
     Budget { needed: u32, committed: u32 },
+    #[error("rung {rung}'s activation takes {chunks} chunks state holds; evacuate them first")]
+    Occupied { rung: u32, chunks: u32 },
+    #[error("no free chunk below rung {rung}'s activation for {chunks} chunks in its way")]
+    NoRoom { rung: u32, chunks: u32 },
+    #[error("a rung evacuation no longer matches the pool")]
+    StaleRung,
+}
+
+/// The state chunks in the way of a rung's activation, each moved to a free
+/// chunk below it; logical ids stand. The engine copies `from` -> `to` and
+/// rewrites its chunk table before the first fire at the rung.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RungEvacuation {
+    pub rung: u32,
+    /// The activation chunks the rung takes.
+    pub act: u32,
+    pub moves: Vec<ChunkMove>,
 }
 
 /// A word bitmap with a count and a hint below which no bit is set.
@@ -370,15 +402,24 @@ pub struct SlotPool {
     shapes: Vec<ShapeState>,
     act_chunks: Vec<(u32, u32)>,
     act: u32,
+    /// The largest rung's activation chunks, the top of the range.
+    act_max: u32,
+    /// The first segment under the largest rung's activation: it and those
+    /// above are committed from the load and never evacuated or released.
+    top_segment: u32,
     chunks: Vec<ChunkMeta>,
+    /// A permutation of `0..total`, as the engine's chunk table.
     logical_to_physical: Vec<u32>,
     physical_to_logical: Vec<u32>,
     /// Free physical chunks.
     free: Bits,
-    /// Free physical chunks of committed segments: what may be opened.
+    /// Free physical chunks of committed segments below the activation, not
+    /// fenced: what may be opened.
     open: Bits,
-    /// Free logical ids.
-    logical_free: Bits,
+    /// Physical chunks a rung evacuation moved state off, kept closed until
+    /// the fire that carries the copy retires, by that fire's epoch.
+    fences: BTreeMap<u64, Vec<u32>>,
+    fenced: Bits,
     segments: Segments,
     /// Chunks opened for a shape.
     held: u32,
@@ -393,26 +434,30 @@ impl SlotPool {
         let total = facts.total_chunks;
         assert!(facts.reserved_chunks <= total);
         assert!(facts.shapes.len() < NO_SHAPE as usize);
-        let mut segments = Segments::new(total, facts.segment_chunks, facts.committed_segments);
-        let mut free = Bits::new(total, true);
-        let mut logical_free = Bits::new(total, true);
-        for chunk in 0..facts.reserved_chunks {
-            free.clear(chunk);
-            logical_free.clear(chunk);
-            segments.hold(chunk);
-        }
-        let mut open = Bits::new(total, false);
-        for segment in 0..segments.count() {
-            if segments.state(segment) == SegmentState::Committed {
-                for chunk in segments.range(segment) {
-                    if free.get(chunk) {
-                        open.set(chunk);
-                    }
-                }
-            }
-        }
         let mut act_chunks = facts.act_chunks;
         act_chunks.sort_unstable();
+        let act_max = act_chunks.last().map_or(0, |&(_, chunks)| chunks);
+        assert!(
+            facts.reserved_chunks + act_max <= total,
+            "the reserved chunks and the largest rung's activation outgrow the pool"
+        );
+        let mut segments = Segments::new(total, facts.segment_chunks, facts.committed_segments);
+        // The largest rung's activation is backed from the load.
+        let top_segment = if act_max == 0 {
+            segments.count()
+        } else {
+            segments.of(total - act_max)
+        };
+        for segment in top_segment..segments.count() {
+            if segments.state(segment) == SegmentState::Uncommitted {
+                segments.set_state(segment, SegmentState::Committed);
+            }
+        }
+        let mut free = Bits::new(total, true);
+        for chunk in 0..facts.reserved_chunks {
+            free.clear(chunk);
+            segments.hold(chunk);
+        }
         let mut pool = Self {
             chunk_bytes: facts.chunk_bytes,
             total,
@@ -420,28 +465,15 @@ impl SlotPool {
             shapes: facts.shapes.into_iter().map(ShapeState::new).collect(),
             act_chunks,
             act: 0,
+            act_max,
+            top_segment,
             chunks: vec![FREE_CHUNK; total as usize],
-            logical_to_physical: (0..total)
-                .map(|chunk| {
-                    if chunk < facts.reserved_chunks {
-                        chunk
-                    } else {
-                        NONE
-                    }
-                })
-                .collect(),
-            physical_to_logical: (0..total)
-                .map(|chunk| {
-                    if chunk < facts.reserved_chunks {
-                        chunk
-                    } else {
-                        NONE
-                    }
-                })
-                .collect(),
+            logical_to_physical: (0..total).collect(),
+            physical_to_logical: (0..total).collect(),
             free,
-            open,
-            logical_free,
+            open: Bits::new(total, false),
+            fences: BTreeMap::new(),
+            fenced: Bits::new(total, false),
             segments,
             held: 0,
             pending: BTreeMap::new(),
@@ -454,7 +486,28 @@ impl SlotPool {
             pool.reserved + pool.act <= pool.committed_chunks(),
             "the reserved chunks and the smallest rung's activation outgrow the committed segments"
         );
+        for chunk in 0..total {
+            pool.reopen(chunk);
+        }
         pool
+    }
+
+    /// Whether physical chunk `chunk` may be opened: free, in a committed
+    /// segment, below the activation and not fenced.
+    fn openable(&self, chunk: u32) -> bool {
+        self.free.get(chunk)
+            && !self.fenced.get(chunk)
+            && chunk < self.state_limit()
+            && self.segments.state(self.segments.of(chunk)) == SegmentState::Committed
+    }
+
+    /// Brings `chunk`'s place in [`Self::open`] up to date.
+    fn reopen(&mut self, chunk: u32) {
+        if self.openable(chunk) {
+            self.open.set(chunk);
+        } else {
+            self.open.clear(chunk);
+        }
     }
 
     // ---- accounting ----
@@ -495,10 +548,33 @@ impl SlotPool {
         self.act
     }
 
-    /// Sets the activation aside for fires up to `rung` tokens; refused when
-    /// the state already held leaves too little.
-    pub fn set_rung(&mut self, rung: u32) -> Result<(), SlotError> {
-        let act = self.act_chunks(rung);
+    /// The largest rung's activation chunks: the top span, committed from
+    /// the load.
+    pub fn act_max(&self) -> u32 {
+        self.act_max
+    }
+
+    /// The first segment under the largest rung's activation (the segment
+    /// count where activation lives apart).
+    pub fn top_segment(&self) -> u32 {
+        self.top_segment
+    }
+
+    /// State chunks lie at physical ids below this: the activation of the
+    /// current rung takes the rest.
+    pub fn state_limit(&self) -> u32 {
+        self.total - self.act
+    }
+
+    /// Committed segments below the top span: what `commit_segments(n)`
+    /// backs as a prefix, `0..n`.
+    pub fn prefix_segments(&self) -> u32 {
+        (0..self.top_segment)
+            .take_while(|&segment| self.segments.state(segment) != SegmentState::Uncommitted)
+            .count() as u32
+    }
+
+    fn rung_budget(&self, act: u32) -> Result<(), SlotError> {
         let needed = self.reserved + self.held + act;
         if needed > self.committed_chunks() {
             return Err(SlotError::Budget {
@@ -506,8 +582,133 @@ impl SlotPool {
                 committed: self.committed_chunks(),
             });
         }
-        self.act = act;
         Ok(())
+    }
+
+    /// State chunks at physical ids `from..to`.
+    fn held_in(&self, from: u32, to: u32) -> Vec<u32> {
+        (from..to)
+            .filter(|&chunk| !self.free.get(chunk) && chunk >= self.reserved)
+            .collect()
+    }
+
+    /// Sets the activation aside for fires up to `rung` tokens; refused when
+    /// the state already held leaves too little, or when state sits in the
+    /// span the rung's activation takes (raise it with [`Self::plan_rung`]
+    /// and [`Self::apply_rung`] then).
+    pub fn set_rung(&mut self, rung: u32) -> Result<(), SlotError> {
+        let act = self.act_chunks(rung);
+        self.rung_budget(act)?;
+        let in_way = self.held_in(self.total - act, self.state_limit()).len() as u32;
+        if in_way > 0 {
+            return Err(SlotError::Occupied {
+                rung,
+                chunks: in_way,
+            });
+        }
+        self.set_act(act);
+        Ok(())
+    }
+
+    fn set_act(&mut self, act: u32) {
+        let (was, now) = (self.state_limit(), self.total - act);
+        self.act = act;
+        for chunk in was.min(now)..was.max(now) {
+            self.reopen(chunk);
+        }
+    }
+
+    /// The moves that clear rung `rung`'s activation span of state: each
+    /// state chunk in it to the lowest free chunk below it. Empty when
+    /// nothing is in the way (or the rung takes no more than now).
+    pub fn plan_rung(&self, rung: u32) -> Result<RungEvacuation, SlotError> {
+        let act = self.act_chunks(rung);
+        self.rung_budget(act)?;
+        let limit = self.total - act;
+        let sources = self.held_in(limit, self.state_limit());
+        let moves: Vec<ChunkMove> = sources
+            .iter()
+            .zip(self.open.iter_in(0, limit))
+            .map(|(&from, to)| ChunkMove {
+                logical: self.physical_to_logical[from as usize],
+                from,
+                to,
+            })
+            .collect();
+        if moves.len() < sources.len() {
+            return Err(SlotError::NoRoom {
+                rung,
+                chunks: sources.len() as u32,
+            });
+        }
+        Ok(RungEvacuation { rung, act, moves })
+    }
+
+    /// Carries out `evacuation` and takes its rung; the fire at `epoch`
+    /// carries the copy, and the chunks moved off stay closed until it
+    /// retires. All or nothing.
+    pub fn apply_rung(&mut self, evacuation: &RungEvacuation, epoch: u64) -> Result<(), SlotError> {
+        let act = self.act_chunks(evacuation.rung);
+        self.rung_budget(act)?;
+        let limit = self.total - act;
+        if act != evacuation.act
+            || evacuation.moves.len() != self.held_in(limit, self.state_limit()).len()
+        {
+            return Err(SlotError::StaleRung);
+        }
+        let mut targets = BTreeSet::new();
+        for step in &evacuation.moves {
+            let fits = (step.logical as usize) < self.logical_to_physical.len()
+                && self.chunks[step.logical as usize].shape != NO_SHAPE
+                && self.logical_to_physical[step.logical as usize] == step.from
+                && step.from >= limit
+                && step.to < limit
+                && self.open.get(step.to)
+                && targets.insert(step.to);
+            if !fits {
+                return Err(SlotError::StaleRung);
+            }
+        }
+        for step in &evacuation.moves {
+            self.move_chunk(*step);
+            self.fenced.set(step.from);
+        }
+        if !evacuation.moves.is_empty() {
+            self.fences
+                .entry(epoch)
+                .or_default()
+                .extend(evacuation.moves.iter().map(|step| step.from));
+        }
+        self.set_act(act);
+        Ok(())
+    }
+
+    /// Moves a held chunk onto free physical chunk `step.to`, as the
+    /// engine's `ChunkTable::apply` does: the free logical id there takes the
+    /// moved one's old place.
+    fn move_chunk(&mut self, step: ChunkMove) {
+        let meta = self.chunks[step.logical as usize];
+        let displaced = self.physical_to_logical[step.to as usize];
+        self.open.clear(step.to);
+        self.free.clear(step.to);
+        self.free.set(step.from);
+        self.logical_to_physical[step.logical as usize] = step.to;
+        self.logical_to_physical[displaced as usize] = step.from;
+        self.physical_to_logical[step.to as usize] = step.logical;
+        self.physical_to_logical[step.from as usize] = displaced;
+        self.segments.let_go(step.from);
+        self.segments.hold(step.to);
+        let state = &mut self.shapes[meta.shape as usize];
+        let spc = state.spc();
+        if meta.used > 0 && meta.used < spc {
+            state
+                .partial
+                .remove(&(Reverse(meta.used), step.from, step.logical));
+            state
+                .partial
+                .insert((Reverse(meta.used), step.to, step.logical));
+        }
+        self.reopen(step.from);
     }
 
     /// Committed chunks neither held nor set aside for activation.
@@ -526,12 +727,14 @@ impl SlotPool {
         slot.chunk * self.shapes[shape as usize].spc() + slot.index
     }
 
-    /// Where logical chunk `chunk` lies now.
+    /// Where logical chunk `chunk` lies now, when it is reserved or open.
     pub fn physical(&self, chunk: u32) -> Option<u32> {
-        Some(self.logical_to_physical[chunk as usize]).filter(|&physical| physical != NONE)
+        (chunk < self.reserved || self.chunks[chunk as usize].shape != NO_SHAPE)
+            .then(|| self.logical_to_physical[chunk as usize])
     }
 
-    /// The logical -> physical table the engine keeps (`u32::MAX`: free).
+    /// The logical -> physical table the engine keeps: a permutation, free
+    /// logical ids included.
     pub fn chunk_table(&self) -> &[u32] {
         &self.logical_to_physical
     }
@@ -564,6 +767,23 @@ impl SlotPool {
         };
         let chunks = self.open.count.min(self.headroom());
         state.partial_free + u64::from(chunks) * u64::from(state.spc())
+    }
+
+    /// Whether every `(shape, slots)` of `needs` could be taken at once:
+    /// each shape's partly filled chunks first, then free chunks, which the
+    /// shapes share.
+    pub fn fits(&self, needs: &[(ShapeId, u64)]) -> bool {
+        let room = u64::from(self.open.count.min(self.headroom()));
+        let mut chunks = 0u64;
+        for &(shape, slots) in needs {
+            let Some(state) = self.shapes.get(shape as usize) else {
+                return slots == 0;
+            };
+            chunks += slots
+                .saturating_sub(state.partial_free)
+                .div_ceil(u64::from(state.spc()));
+        }
+        chunks <= room
     }
 
     pub fn shape_demand(&self, shape: ShapeId) -> ShapeDemand {
@@ -734,6 +954,15 @@ impl SlotPool {
     /// Every fire through `epoch` has retired: what waited on them is free.
     pub fn retire_through(&mut self, epoch: u64) {
         self.retired = self.retired.max(epoch);
+        let later = self.fences.split_off(&(epoch.saturating_add(1)));
+        let mut due = std::mem::replace(&mut self.fences, later);
+        if epoch == u64::MAX {
+            due.append(&mut self.fences);
+        }
+        for chunk in due.into_values().flatten() {
+            self.fenced.clear(chunk);
+            self.reopen(chunk);
+        }
         let later = self.pending.split_off(&(epoch.saturating_add(1)));
         let due = std::mem::replace(&mut self.pending, later);
         if epoch == u64::MAX {
@@ -768,16 +997,8 @@ impl SlotPool {
         let physical = self.open.first().expect("room was checked");
         self.open.clear(physical);
         self.free.clear(physical);
-        let logical = if self.logical_free.get(physical) {
-            physical
-        } else {
-            self.logical_free
-                .first()
-                .expect("as many logical ids as chunks")
-        };
-        self.logical_free.clear(logical);
-        self.logical_to_physical[logical as usize] = physical;
-        self.physical_to_logical[physical as usize] = logical;
+        let logical = self.physical_to_logical[physical as usize];
+        debug_assert_eq!(self.chunks[logical as usize].shape, NO_SHAPE);
         self.segments.hold(physical);
         self.held += 1;
         let frame = self.shapes[shape as usize].open_frame();
@@ -841,15 +1062,10 @@ impl SlotPool {
 
     fn close_chunk(&mut self, logical: u32, physical: u32) {
         self.chunks[logical as usize] = FREE_CHUNK;
-        self.logical_to_physical[logical as usize] = NONE;
-        self.physical_to_logical[physical as usize] = NONE;
-        self.logical_free.set(logical);
         self.free.set(physical);
-        if self.segments.state(self.segments.of(physical)) == SegmentState::Committed {
-            self.open.set(physical);
-        }
         self.segments.let_go(physical);
         self.held -= 1;
+        self.reopen(physical);
     }
 
     // ---- segments ----
@@ -858,9 +1074,13 @@ impl SlotPool {
         &self.segments
     }
 
-    /// The committed segment holding the fewest chunks.
+    /// The committed segment below the top span holding the fewest chunks,
+    /// the highest among equals.
     pub fn emptiest_segment(&self) -> Option<u32> {
-        self.segments.emptiest()
+        (0..self.top_segment)
+            .rev()
+            .filter(|&segment| self.segments.state(segment) == SegmentState::Committed)
+            .min_by_key(|&segment| self.segments.used(segment))
     }
 
     /// Moves every held chunk of `segment` into free committed chunks of
@@ -868,9 +1088,7 @@ impl SlotPool {
     /// the segment holds reserved chunks, or when the budget would not
     /// survive losing the segment.
     pub fn plan_evacuation(&self, segment: u32) -> Option<Evacuation> {
-        if segment >= self.segments.count()
-            || self.segments.state(segment) != SegmentState::Committed
-        {
+        if segment >= self.top_segment || self.segments.state(segment) != SegmentState::Committed {
             return None;
         }
         let range = self.segments.range(segment);
@@ -906,7 +1124,7 @@ impl SlotPool {
         let segment = evacuation.segment;
         self.segments.check(segment)?;
         let stale = SegmentError::Stale(segment);
-        if self.segments.state(segment) != SegmentState::Committed {
+        if segment >= self.top_segment || self.segments.state(segment) != SegmentState::Committed {
             return Err(stale);
         }
         let range = self.segments.range(segment);
@@ -925,6 +1143,7 @@ impl SlotPool {
         let mut targets = BTreeSet::new();
         for step in &evacuation.moves {
             let fits = (step.logical as usize) < self.logical_to_physical.len()
+                && self.chunks[step.logical as usize].shape != NO_SHAPE
                 && self.logical_to_physical[step.logical as usize] == step.from
                 && range.contains(&step.from)
                 && step.to < range.start
@@ -934,32 +1153,14 @@ impl SlotPool {
                 return Err(stale);
             }
         }
-        for chunk in range.clone() {
+        self.segments
+            .set_state(segment, SegmentState::Draining { until: epoch });
+        for chunk in range {
             self.open.clear(chunk);
         }
         for step in &evacuation.moves {
-            let meta = self.chunks[step.logical as usize];
-            self.open.clear(step.to);
-            self.free.clear(step.to);
-            self.free.set(step.from);
-            self.logical_to_physical[step.logical as usize] = step.to;
-            self.physical_to_logical[step.from as usize] = NONE;
-            self.physical_to_logical[step.to as usize] = step.logical;
-            self.segments.let_go(step.from);
-            self.segments.hold(step.to);
-            let state = &mut self.shapes[meta.shape as usize];
-            let spc = state.spc();
-            if meta.used > 0 && meta.used < spc {
-                state
-                    .partial
-                    .remove(&(Reverse(meta.used), step.from, step.logical));
-                state
-                    .partial
-                    .insert((Reverse(meta.used), step.to, step.logical));
-            }
+            self.move_chunk(*step);
         }
-        self.segments
-            .set_state(segment, SegmentState::Draining { until: epoch });
         Ok(())
     }
 
@@ -967,6 +1168,13 @@ impl SlotPool {
     /// retired, or a committed one holding nothing.
     pub fn release_segment(&mut self, segment: u32) -> Result<(), SegmentError> {
         self.segments.check(segment)?;
+        if segment >= self.top_segment {
+            return Err(SegmentError::State {
+                segment,
+                state: self.segments.state(segment),
+                wanted: "below the activation committed from the load",
+            });
+        }
         let held = self.segments.used(segment);
         if held > 0 {
             return Err(SegmentError::Held { segment, held });
@@ -993,10 +1201,10 @@ impl SlotPool {
                         needed,
                     });
                 }
-                for chunk in self.segments.range(segment) {
-                    self.open.clear(chunk);
-                }
                 self.segments.set_state(segment, SegmentState::Uncommitted);
+                for chunk in self.segments.range(segment) {
+                    self.reopen(chunk);
+                }
                 Ok(())
             }
             state => Err(SegmentError::State {
@@ -1012,11 +1220,11 @@ impl SlotPool {
         self.segments.check(segment)?;
         match self.segments.state(segment) {
             SegmentState::Uncommitted => {
+                self.segments.set_state(segment, SegmentState::Committed);
                 for chunk in self.segments.range(segment) {
                     debug_assert!(self.free.get(chunk));
-                    self.open.set(chunk);
+                    self.reopen(chunk);
                 }
-                self.segments.set_state(segment, SegmentState::Committed);
                 Ok(())
             }
             state => Err(SegmentError::State {
@@ -1052,12 +1260,11 @@ impl SlotPool {
         for logical in 0..self.total {
             let physical = self.logical_to_physical[logical as usize];
             let meta = self.chunks[logical as usize];
-            assert_eq!(self.logical_free.get(logical), physical == NONE);
-            if physical == NONE {
-                assert_eq!(meta.shape, NO_SHAPE);
+            assert_eq!(self.physical_to_logical[physical as usize], logical);
+            if meta.shape == NO_SHAPE && logical >= self.reserved {
+                assert!(self.free.get(physical), "a free logical id on a held chunk");
                 continue;
             }
-            assert_eq!(self.physical_to_logical[physical as usize], logical);
             assert!(!self.free.get(physical));
             assert!(!self.open.get(physical));
             seg_used[self.segments.of(physical) as usize] += 1;
@@ -1092,13 +1299,14 @@ impl SlotPool {
         assert_eq!(held, self.held);
         for segment in 0..self.segments.count() {
             assert_eq!(seg_used[segment as usize], self.segments.used(segment));
-            let committed = self.segments.state(segment) == SegmentState::Committed;
+            if segment >= self.top_segment {
+                assert_eq!(self.segments.state(segment), SegmentState::Committed);
+            }
             for chunk in self.segments.range(segment) {
-                assert_eq!(
-                    self.open.get(chunk),
-                    committed && self.free.get(chunk),
-                    "chunk {chunk}"
-                );
+                assert_eq!(self.open.get(chunk), self.openable(chunk), "chunk {chunk}");
+                if !self.free.get(chunk) && chunk >= self.reserved {
+                    assert!(chunk < self.state_limit(), "state in the activation span");
+                }
             }
         }
         for state in &self.shapes {
@@ -1159,6 +1367,22 @@ mod tests {
         committed: u32,
         shapes: &[(ShapeKind, u32)],
     ) -> SlotPoolFacts {
+        facts_with(
+            total,
+            segment,
+            committed,
+            shapes,
+            &[(16, 1), (256, 3), (4096, 6)],
+        )
+    }
+
+    fn facts_with(
+        total: u32,
+        segment: u32,
+        committed: u32,
+        shapes: &[(ShapeKind, u32)],
+        act_chunks: &[(u32, u32)],
+    ) -> SlotPoolFacts {
         SlotPoolFacts {
             chunk_bytes: 1 << 20,
             total_chunks: total,
@@ -1173,7 +1397,7 @@ mod tests {
                     slots_per_chunk,
                 })
                 .collect(),
-            act_chunks: vec![(16, 1), (256, 3), (4096, 6)],
+            act_chunks: act_chunks.to_vec(),
         }
     }
 
@@ -1208,7 +1432,7 @@ mod tests {
 
     #[test]
     fn a_let_go_slot_waits_for_the_last_fire_that_touched_it() {
-        let mut pool = SlotPool::new(facts(3, 3, 1, &[(ShapeKind::Fixed, 1)]));
+        let mut pool = SlotPool::new(facts_with(3, 3, 1, &[(ShapeKind::Fixed, 1)], &[(16, 1)]));
         pool.set_rung(0).unwrap();
         let ws = Holder::WorkingSet(7);
         let slots = pool.acquire(ws, 0, 1).unwrap();
@@ -1285,22 +1509,29 @@ mod tests {
     #[test]
     fn commit_ahead_names_the_lowest_segments_short_of_the_bytes() {
         let mut pool = SlotPool::new(facts(32, 8, 1, &[(ShapeKind::Fixed, 1)]));
-        // 8 committed - 1 reserved - 1 act = 6 headroom.
-        assert!(pool.commit_ahead(6 << 20).is_empty());
-        assert_eq!(pool.commit_ahead(7 << 20), [1]);
-        assert_eq!(pool.commit_ahead(100 << 20), [1, 2, 3]);
+        // Segment 0 and the top segment under the largest rung's 6 chunks
+        // are committed: 16 - 1 reserved - 1 act = 14 headroom.
+        assert_eq!(pool.committed_chunks(), 16);
+        assert_eq!(pool.top_segment(), 3);
+        assert!(pool.commit_ahead(14 << 20).is_empty());
+        assert_eq!(pool.commit_ahead(15 << 20), [1]);
+        assert_eq!(pool.commit_ahead(100 << 20), [1, 2]);
         pool.commit_segment(2).unwrap();
-        assert_eq!(pool.commit_ahead(20 << 20), [1]);
+        assert_eq!(pool.prefix_segments(), 1, "a prefix stops at the gap");
+        assert_eq!(pool.commit_ahead(23 << 20), [1]);
+        pool.commit_segment(1).unwrap();
+        assert_eq!(pool.prefix_segments(), 3);
         pool.check();
     }
 
     #[test]
     fn an_evacuation_empties_its_segment_and_keeps_every_logical_slot() {
-        let mut pool = SlotPool::new(facts(
-            24,
+        let mut pool = SlotPool::new(facts_with(
+            32,
             8,
             3,
             &[(ShapeKind::Fixed, 1), (ShapeKind::List, 2)],
+            &[(16, 1)],
         ));
         let a = Holder::WorkingSet(1);
         let b = Holder::WorkingSet(2);
@@ -1342,18 +1573,15 @@ mod tests {
         pool.retire_through(5);
         pool.release_segment(2).unwrap();
         assert_eq!(pool.segments().state(2), SegmentState::Uncommitted);
-        assert_eq!(pool.committed_chunks(), 16);
+        assert_eq!(pool.committed_chunks(), 24);
         assert!(
             matches!(
-                pool.release_segment(1),
-                Err(SegmentError::Budget {
-                    committed: 8,
-                    needed: 9,
-                    ..
-                })
+                pool.release_segment(3),
+                Err(SegmentError::State { segment: 3, .. })
             ),
-            "an empty segment goes only when the rest still fits"
+            "the activation's top segment is never released"
         );
+        assert!(pool.plan_evacuation(3).is_none());
         assert!(matches!(
             pool.release_segment(0),
             Err(SegmentError::Held { .. })
@@ -1366,7 +1594,7 @@ mod tests {
 
     #[test]
     fn a_stale_evacuation_is_refused_whole() {
-        let mut pool = SlotPool::new(facts(16, 8, 2, &[(ShapeKind::Fixed, 1)]));
+        let mut pool = SlotPool::new(facts_with(24, 8, 2, &[(ShapeKind::Fixed, 1)], &[(16, 1)]));
         let ws = Holder::WorkingSet(1);
         let slots = pool.acquire(ws, 0, 9).unwrap();
         pool.release(ws, &slots[..4], 0);
@@ -1384,6 +1612,137 @@ mod tests {
             pool.apply_evacuation(&evacuation, 1),
             Err(SegmentError::Stale(1))
         );
+        pool.check();
+    }
+
+    #[test]
+    fn state_lies_below_the_activation_and_the_top_span_is_committed_from_load() {
+        // 64 chunks of 8-chunk segments, the lowest committed; the largest
+        // rung's 12 chunks put segments 6 and 7 under activation.
+        let mut pool = SlotPool::new(facts_with(
+            64,
+            8,
+            1,
+            &[(ShapeKind::Fixed, 1)],
+            &[(16, 2), (256, 6), (4096, 12)],
+        ));
+        assert_eq!(pool.top_segment(), 6);
+        assert_eq!(pool.committed_chunks(), 8 + 16);
+        assert_eq!(pool.state_limit(), 62);
+        let ws = Holder::WorkingSet(1);
+        // 7 below in segment 0, then the top span's free chunks under the
+        // rung: 48..62.
+        let slots = pool.acquire(ws, 0, 21).unwrap();
+        let physical: Vec<u32> = slots
+            .iter()
+            .map(|slot| pool.physical(slot.chunk).unwrap())
+            .collect();
+        assert_eq!(physical[..7], [1, 2, 3, 4, 5, 6, 7]);
+        assert_eq!(physical[7..], (48..62).collect::<Vec<_>>()[..]);
+        assert!(pool.acquire(ws, 0, 1).is_err(), "the rung's 2 chunks stay");
+        // Committing segment 1 opens it, lowest first.
+        pool.commit_segment(1).unwrap();
+        let next = pool.acquire(ws, 0, 1).unwrap();
+        assert_eq!(pool.physical(next[0].chunk), Some(8));
+        pool.check();
+    }
+
+    #[test]
+    fn raising_the_rung_first_moves_state_out_of_the_new_activation_span() {
+        // Segments 0..3 committed, segment 3 under the largest rung's 8.
+        let mut pool = SlotPool::new(facts_with(
+            32,
+            8,
+            3,
+            &[(ShapeKind::Fixed, 1), (ShapeKind::List, 4)],
+            &[(16, 1), (4096, 8)],
+        ));
+        let a = Holder::WorkingSet(1);
+        // Fixed slots on physical 1..=28, the list chunk on 29.
+        let fixed = pool.acquire(a, 0, 28).unwrap();
+        let list = pool.acquire(a, 1, 3).unwrap();
+        assert_eq!(pool.physical(list[0].chunk), Some(29));
+        pool.release(a, &fixed[..10], 0);
+        let refs: Vec<u32> = fixed[10..]
+            .iter()
+            .chain(&list)
+            .map(|&slot| pool.slot_ref(slot))
+            .collect();
+        assert!(matches!(
+            pool.set_rung(4096),
+            Err(SlotError::Occupied { chunks: 6, .. })
+        ));
+        let evacuation = pool.plan_rung(4096).unwrap();
+        assert_eq!(evacuation.act, 8);
+        let from: Vec<u32> = evacuation.moves.iter().map(|step| step.from).collect();
+        let to: Vec<u32> = evacuation.moves.iter().map(|step| step.to).collect();
+        assert_eq!(from, [24, 25, 26, 27, 28, 29]);
+        assert_eq!(to, [1, 2, 3, 4, 5, 6], "lowest free first");
+        pool.apply_rung(&evacuation, 7).unwrap();
+        pool.check();
+        assert_eq!(pool.act_reserved(), 8);
+        assert_eq!(pool.state_limit(), 24);
+        let after: Vec<u32> = fixed[10..]
+            .iter()
+            .chain(&list)
+            .map(|&slot| pool.slot_ref(slot))
+            .collect();
+        assert_eq!(after, refs, "slot refs are logical: a move renames none");
+        for slot in fixed[10..].iter().chain(&list) {
+            assert!(pool.physical(slot.chunk).unwrap() < 24);
+        }
+        // The table is the permutation the engine's comes to.
+        let mut table = ::engine::chunk::ChunkTable::identity(32);
+        table
+            .apply(&::engine::chunk::Evacuation {
+                moves: evacuation
+                    .moves
+                    .iter()
+                    .map(|step| (step.logical, step.to))
+                    .collect(),
+            })
+            .unwrap();
+        assert_eq!(table.as_slice(), pool.chunk_table());
+        // A stale plan is refused whole.
+        assert_eq!(pool.apply_rung(&evacuation, 8), Err(SlotError::StaleRung));
+        // Lowering the rung opens the span again, the chunks moved off once
+        // the fire carrying the copy retires.
+        pool.set_rung(16).unwrap();
+        assert_eq!(pool.available(0), 4 + 1, "the moved-off chunks are fenced");
+        pool.retire_through(7);
+        assert_eq!(pool.available(0), 4 + 1 + 6);
+        // New chunks open lowest first, below where the moved ones went.
+        let next = pool.acquire(a, 0, 1).unwrap();
+        assert_eq!(pool.physical(next[0].chunk), Some(7));
+        pool.check();
+    }
+
+    #[test]
+    fn a_rung_with_no_room_below_is_refused_and_moves_nothing() {
+        let mut pool = SlotPool::new(facts_with(
+            16,
+            8,
+            2,
+            &[(ShapeKind::Fixed, 1)],
+            &[(16, 1), (4096, 4)],
+        ));
+        let a = Holder::WorkingSet(1);
+        pool.acquire(a, 0, 13).unwrap();
+        assert!(matches!(
+            pool.plan_rung(4096),
+            Err(SlotError::Budget { .. })
+        ));
+        let mut pool = SlotPool::new(facts_with(
+            16,
+            8,
+            2,
+            &[(ShapeKind::Fixed, 1)],
+            &[(16, 1), (4096, 4)],
+        ));
+        let slots = pool.acquire(a, 0, 14).unwrap();
+        pool.release(a, &slots[..3], 0);
+        // 3 free below, 3 in the way of the 4-chunk span: they fit.
+        assert_eq!(pool.plan_rung(4096).unwrap().moves.len(), 3);
         pool.check();
     }
 
@@ -1504,7 +1863,23 @@ mod tests {
                     model.retired = model.retired.max(through);
                 }
                 10 => {
-                    let _ = pool.set_rung([0, 200, 1000, 5000][rng.below(4) as usize]);
+                    let rung = [0, 200, 1000, 5000][rng.below(4) as usize];
+                    if pool.set_rung(rung).is_err()
+                        && let Ok(evacuation) = pool.plan_rung(rung)
+                    {
+                        let refs: Vec<(Slot, u32)> = model
+                            .held
+                            .values()
+                            .flatten()
+                            .map(|&slot| (slot, pool.slot_ref(slot)))
+                            .collect();
+                        pool.apply_rung(&evacuation, epoch).unwrap();
+                        for (slot, engine) in refs {
+                            assert_eq!(pool.slot_ref(slot), engine);
+                            assert!(pool.physical(slot.chunk).unwrap() < pool.state_limit());
+                        }
+                        epoch += 1;
+                    }
                 }
                 _ => {
                     // Shrink or grow the pool.

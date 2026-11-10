@@ -137,8 +137,26 @@ impl Steer {
 
 async fn watch(mut pool: Shared<Steered>, tolerance: Tolerance) {
     let mut steer = Steer::new(&pool, tolerance, GROWTH_STEP);
-    let (grow, engine) = pool.with(|pool| (pool.inner().grow().cloned(), pool.inner().locus().1));
+    let (grow, shared, engine) = pool.with(|pool| {
+        (
+            pool.inner().grow().cloned(),
+            pool.inner().is_shared(),
+            pool.inner().locus().1,
+        )
+    });
     let mut interval = crate::rt::time::interval(TICK);
+    // A shared pool moves its own segments off the fire path; the loop reads
+    // the system each tick and hands it the target.
+    if shared && steer.governor().tolerance() != Tolerance::Dedicated {
+        let mut system: Box<dyn System> = super::system();
+        loop {
+            interval.tick().await;
+            let read = Some(system.read());
+            steer.turn(&mut pool, read, &mut |signal| {
+                steered::signal(engine, signal);
+            });
+        }
+    }
     // A dedicated pool's size stands: the loop only ticks, reading nothing
     // and answering no waiter.
     let Some(grow) = grow.filter(|_| steer.governor().tolerance() != Tolerance::Dedicated) else {

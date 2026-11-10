@@ -6,6 +6,7 @@ pub(crate) mod pool;
 pub(crate) mod registry;
 pub(crate) mod rs;
 pub mod segments;
+pub mod shared;
 pub mod slots;
 pub mod weights;
 

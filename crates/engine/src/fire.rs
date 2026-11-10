@@ -241,10 +241,13 @@ pub struct Lane {
     /// the migration, when `kv` and `rs` still say.
     #[serde(default)]
     pub tables: Vec<(ShapeId, Vec<u32>)>,
-    /// The lane's slot refs of each fixed shape: the running set the fire
-    /// reads, and the copy-on-write set it writes.
+    /// The lane's slot refs of each fixed shape, one `[run, cow]` a piece,
+    /// in piece order. `cow == run` writes the record in place (the normal
+    /// case); `cow != run` has the engine copy `run` onto `cow` on the
+    /// stream before the fire, which then reads and writes `cow` (a fork, or
+    /// a snapshot restored, within the fire).
     #[serde(default)]
-    pub fixed: Vec<(ShapeId, [u32; 2])>,
+    pub fixed: Vec<(ShapeId, Vec<[u32; 2]>)>,
 }
 
 /// Pool pages `pages[i]` read into host kv slots `slots[i]` as the fire
@@ -378,10 +381,9 @@ impl Lane {
             }
             seen.push(shape);
         }
-        if let Some((shape, _)) = self.fixed.iter().find(|(_, [run, cow])| run == cow) {
+        if let Some((shape, _)) = self.fixed.iter().find(|(_, pieces)| pieces.is_empty()) {
             return Err(Error::Invalid(format!(
-                "lane in slot {} reads and writes the same slot of fixed shape {shape}; a \
-                 fire writes its copy-on-write set apart from the running one",
+                "lane in slot {} names fixed shape {shape} with no piece",
                 self.slot
             )));
         }
@@ -389,16 +391,32 @@ impl Lane {
     }
 
     /// Checks the lane's slot refs against the engine's chunks: each shape
-    /// stated, of the kind its table says, every ref inside the pool (or the
-    /// shape's pinned run) and off the reserved chunks, but a ring's null
-    /// ref 0.
+    /// stated, of the kind its table says, each piece of a fixed shape
+    /// named, every ref inside the pool (or the shape's pinned run) and off
+    /// the reserved chunks, but a ring's null ref 0.
     pub fn validate_chunks(&self, facts: &ChunkFacts) -> Result<()> {
+        for (id, pieces) in &self.fixed {
+            if let Some(SlotKind::Fixed { pieces: stated }) = facts.shape(*id).map(|s| s.kind)
+                && pieces.len() != stated as usize
+            {
+                return Err(Error::Invalid(format!(
+                    "lane in slot {} names {} piece(s) of fixed shape {id}, which has {stated}",
+                    self.slot,
+                    pieces.len()
+                )));
+            }
+        }
+        let fixed: Vec<(ShapeId, Vec<u32>)> = self
+            .fixed
+            .iter()
+            .map(|(shape, pieces)| (*shape, pieces.iter().flatten().copied().collect()))
+            .collect();
         let refs = self
             .tables
             .iter()
             .map(|(shape, refs)| (*shape, refs.as_slice(), false))
             .chain(
-                self.fixed
+                fixed
                     .iter()
                     .map(|(shape, refs)| (*shape, refs.as_slice(), true)),
             );

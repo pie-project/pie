@@ -436,9 +436,29 @@ async fn bootstrap_inner(config: Config) -> Result<BootstrapHandle> {
             if pools.window_tokens == 0 {
                 pools.window_tokens = d.window_tokens;
             }
+            // An engine that states a shared pool: the stores draw from one
+            // pool built of its facts, a copy-on-write record kept back for
+            // each lane a fire runs.
+            let shared = if pools.shared {
+                anyhow::ensure!(
+                    pools.page_size == 0 || pools.page_size as usize == kv_page_size,
+                    "engine pools: the shared pool's slots hold {} tokens, the kv pages {kv_page_size}",
+                    pools.page_size
+                );
+                let pool = crate::store::shared::SharedPool::new(
+                    &d.chunks,
+                    d.limits.max_forward_requests as u32,
+                    u32::try_from(d.limits.max_context).unwrap_or(u32::MAX),
+                )
+                .map_err(|error| anyhow::anyhow!("engine pools: {error}"))?;
+                Some(std::sync::Arc::new(std::sync::Mutex::new(pool)))
+            } else {
+                None
+            };
             Ok(crate::store::registry::EngineStores {
                 pools,
                 max_context: d.limits.max_context,
+                shared,
             })
         })
         .collect::<Result<Vec<_>>>()?;
@@ -517,6 +537,7 @@ async fn bootstrap_inner(config: Config) -> Result<BootstrapHandle> {
     // A planner for each engine: each holds its own kv pages, and a process
     // runs on one of them.
     let mut extents = Vec::new();
+    let mut shared_grows: Vec<crate::store::shared::SharedGrow> = Vec::new();
     let mut governed = Vec::new();
     for engine in 0..engines.len().max(1) {
         // What the worker policy reads tier bytes at; a page of unknown size
@@ -524,8 +545,12 @@ async fn bootstrap_inner(config: Config) -> Result<BootstrapHandle> {
         crate::policy::pressure::scale(engine, scales.get(engine).copied().unwrap_or_default());
         let mut pool = crate::planner::RegistryPool::new(arena_model_idx, engine, kv_swap_capable);
         let mut grow = None;
-        if let Some(&(page_bytes, whole, slot_bytes)) =
-            resizable.get(engine).filter(|(bytes, ..)| *bytes > 0)
+        let shared = arena_stores
+            .get(engine)
+            .and_then(|stores| stores.shared.clone());
+        if let Some(&(page_bytes, whole, slot_bytes)) = resizable
+            .get(engine)
+            .filter(|(bytes, ..)| *bytes > 0 && shared.is_none())
         {
             let extent = crate::store::grow::Grow::new(
                 arena_model_idx,
@@ -538,7 +563,15 @@ async fn bootstrap_inner(config: Config) -> Result<BootstrapHandle> {
             grow = Some(extent.clone());
             pool = pool.with_grow(extent);
         }
-        let steered = steered_pool(arena_model_idx, engine, chunk_facts.get(engine), grow);
+        let steered = match &shared {
+            Some(shared) => {
+                let grow =
+                    crate::store::shared::SharedGrow::new(arena_model_idx, engine, shared.clone());
+                shared_grows.push(grow.clone());
+                shared_steered_pool(arena_model_idx, engine, chunk_facts.get(engine), grow)
+            }
+            None => steered_pool(arena_model_idx, engine, chunk_facts.get(engine), grow),
+        };
         crate::planner::init_planner(
             arena_model_idx,
             engine,
@@ -657,6 +690,9 @@ async fn bootstrap_inner(config: Config) -> Result<BootstrapHandle> {
     crate::scheduler::set_frame_size(scheduler.frame_size as usize);
     crate::scheduler::set_dispatch_depth(scheduler.frame_dispatch_depth as usize);
     let scheduler_shutdown = crate::scheduler::spawn(&engines, kv_page_size as u32).await?;
+    for grow in &shared_grows {
+        grow.start();
+    }
     for extent in &extents {
         extent.start();
     }
@@ -704,6 +740,45 @@ fn steered_pool(
     };
     let quiet = cache.shapes() == 0;
     let pool = crate::governor::steered::EnginePool::new(model, engine, grow, slots);
+    crate::governor::steered::Shared::new(WeightFirst::new(
+        pool,
+        cache,
+        EnginePort::new(engine, quiet),
+    ))
+}
+
+/// Engine `engine`'s governor target where its stores draw from a shared
+/// pool: `grow` moves the pool's segments, and the weight shapes take their
+/// slots from the same pool, after the state shapes.
+fn shared_steered_pool(
+    model: usize,
+    engine: usize,
+    facts: Option<&::engine::chunk::ChunkFacts>,
+    grow: crate::store::shared::SharedGrow,
+) -> crate::governor::steered::Shared<crate::governor::steered::Steered> {
+    use crate::store::weights::{WeightCache, WeightFirst, port::EnginePort};
+    let streams = crate::store::weights::streaming(engine);
+    let none = ::engine::chunk::ChunkFacts::default();
+    let facts = facts.unwrap_or(&none);
+    let cache = {
+        let mut shared = grow.shared().lock().unwrap();
+        let first = shared.weights_first();
+        match WeightCache::new(&facts.weights, first, streams, shared.pool_mut()) {
+            Ok(cache) => cache,
+            Err(error) => {
+                tracing::warn!(
+                    engine,
+                    %error,
+                    shapes = facts.weights.len(),
+                    "the pool cannot seat the weight shapes; they stay as loaded"
+                );
+                WeightCache::new(&[], first, streams, shared.pool_mut())
+                    .expect("an empty weight cache takes no slots")
+            }
+        }
+    };
+    let quiet = cache.shapes() == 0;
+    let pool = crate::governor::steered::EnginePool::shared(model, engine, grow);
     crate::governor::steered::Shared::new(WeightFirst::new(
         pool,
         cache,

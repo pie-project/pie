@@ -170,7 +170,7 @@ fn a_lane_round_trips_with_and_without_its_slot_tables() {
         slot: 2,
         tokens: vec![1, 2, 3],
         tables: vec![(ShapeId(0), vec![4, 5]), (ShapeId(1), vec![0, 9])],
-        fixed: vec![(ShapeId(2), [11, 12])],
+        fixed: vec![(ShapeId(2), vec![[11, 12], [13, 13]])],
         ..Lane::default()
     };
     let json = serde_json::to_string(&lane).unwrap();
@@ -194,7 +194,7 @@ fn a_lane_names_its_slots_only_to_an_engine_that_states_chunks() {
     let lane = Lane {
         tokens: vec![1],
         tables: vec![(DEGENERATE_KV, vec![1, 2])],
-        fixed: vec![(DEGENERATE_STATE, [4_097, 4_098])],
+        fixed: vec![(DEGENERATE_STATE, vec![[4_097, 4_098]])],
         ..Lane::default()
     };
     lane.validate_for(chunks).unwrap();
@@ -202,17 +202,24 @@ fn a_lane_names_its_slots_only_to_an_engine_that_states_chunks() {
     Lane::decode(0, 0, 1, 0).validate_for(Serves::NONE).unwrap();
 
     let twice = Lane {
-        fixed: vec![(DEGENERATE_KV, [3, 4])],
+        fixed: vec![(DEGENERATE_KV, vec![[3, 4]])],
         ..lane.clone()
     };
     assert!(twice.validate_for(chunks).is_err(), "a shape is named once");
-    let aliased = Lane {
-        fixed: vec![(DEGENERATE_STATE, [4_097, 4_097])],
+    let in_place = Lane {
+        fixed: vec![(DEGENERATE_STATE, vec![[4_097, 4_097]])],
+        ..lane.clone()
+    };
+    in_place
+        .validate_for(chunks)
+        .expect("cow == run writes the record in place");
+    let no_piece = Lane {
+        fixed: vec![(DEGENERATE_STATE, Vec::new())],
         ..lane.clone()
     };
     assert!(
-        aliased.validate_for(chunks).is_err(),
-        "cow apart from running"
+        no_piece.validate_for(chunks).is_err(),
+        "a fixed shape names its pieces"
     );
 
     let facts = ChunkFacts::degenerate(&hybrid(), &BYTES);
@@ -235,13 +242,18 @@ fn a_lane_names_its_slots_only_to_an_engine_that_states_chunks() {
             ..lane.clone()
         },
         Lane {
-            fixed: vec![(DEGENERATE_KV, [1, 2])],
+            fixed: vec![(DEGENERATE_KV, vec![[1, 2]])],
             tables: Vec::new(),
             ..lane.clone()
         },
         // A shape the engine does not state.
         Lane {
             tables: vec![(DEGENERATE_WINDOW, vec![0])],
+            ..lane.clone()
+        },
+        // One piece more than the record has.
+        Lane {
+            fixed: vec![(DEGENERATE_STATE, vec![[4_097, 4_097], [4_098, 4_098]])],
             ..lane.clone()
         },
     ] {

@@ -1,0 +1,643 @@
+//! The shared pool against a fake engine that states real, unpinned facts:
+//! a list, a ring, a fixed record of three pieces and one of one, a weight
+//! shape, two-ended growth.
+
+use ::engine::chunk::{
+    ChunkTable, Growth as SegmentGrowth, Reserved, ReservedRun, SegmentFacts, SlotShape as Facts,
+    WeightKind, WeightShape,
+};
+use ::engine::fire::Lane;
+
+use super::*;
+
+const MIB: u64 = 1 << 20;
+const CHUNK: u64 = 16 * MIB;
+const TOTAL: u32 = 64;
+const SEGMENT: u32 = 8;
+const LIST: EngineShape = EngineShape(0);
+const RING: EngineShape = EngineShape(1);
+const GDN: EngineShape = EngineShape(2);
+const CONV: EngineShape = EngineShape(3);
+/// Pool ids, in the facts' order.
+const LIST_POOL: ShapeId = 0;
+const RING_POOL: ShapeId = 1;
+
+fn shape(id: EngineShape, kind: SlotKind, slot_bytes: u64) -> Facts {
+    Facts {
+        id,
+        kind,
+        slot_bytes,
+        slots_per_chunk: u32::try_from(CHUNK / slot_bytes).unwrap(),
+        sets_per_working_set: kind.sets_per_working_set(),
+        rows: Vec::new(),
+        pinned: None,
+    }
+}
+
+/// 64 chunks of 16 MiB in segments of 8, the lowest two committed; the
+/// largest rung's 12 chunks put segments 6 and 7 under activation.
+fn facts() -> ChunkFacts {
+    let facts = ChunkFacts {
+        chunk_bytes: CHUNK,
+        total_chunks: TOTAL,
+        segment_chunks: SEGMENT,
+        segments: SegmentFacts {
+            committed: 2,
+            max: TOTAL / SEGMENT,
+            growth: SegmentGrowth::TwoEnded,
+        },
+        reserved: vec![ReservedRun {
+            what: Reserved::Null,
+            first: 0,
+            chunks: 1,
+        }],
+        shapes: vec![
+            shape(
+                LIST,
+                SlotKind::List {
+                    tokens: 16,
+                    rate: 1,
+                },
+                MIB,
+            ),
+            shape(
+                RING,
+                SlotKind::Ring {
+                    window: 128,
+                    tokens: 16,
+                },
+                MIB / 2,
+            ),
+            shape(GDN, SlotKind::Fixed { pieces: 3 }, 4 * MIB),
+            shape(CONV, SlotKind::Fixed { pieces: 1 }, 64 << 10),
+        ],
+        act_chunks: vec![(16, 1), (256, 4), (2048, 12)],
+        weights: vec![WeightShape {
+            id: EngineShape(9),
+            kind: WeightKind::Expert,
+            slot_bytes: 8 * MIB,
+            slots_per_chunk: 2,
+            count: 8,
+            floor_slots: 2,
+            name: "layers.moe.experts".into(),
+        }],
+        ..ChunkFacts::default()
+    };
+    facts.validate().unwrap();
+    facts
+}
+
+fn pool() -> SharedPool {
+    SharedPool::new(&facts(), 2, 256).unwrap()
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum Call {
+    Commit(u32),
+    Release(u32),
+    Evacuate(Vec<(u32, u32)>),
+}
+
+/// The engine half: a chunk table, a committed prefix and the top span
+/// backed from the load. It checks what it is told against what it backs.
+struct FakeEngine {
+    table: ChunkTable,
+    prefix: u32,
+    top: u32,
+    calls: Vec<Call>,
+    refuse: bool,
+}
+
+impl FakeEngine {
+    fn new() -> Self {
+        Self {
+            table: ChunkTable::identity(TOTAL),
+            prefix: 2,
+            top: 6,
+            calls: Vec::new(),
+            refuse: false,
+        }
+    }
+
+    fn backed(&self, physical: u32) -> bool {
+        let segment = physical / SEGMENT;
+        segment < self.prefix || segment >= self.top
+    }
+
+    /// A fire at `act` activation chunks reading `lane`'s slots: every slot
+    /// it names sits on a backed chunk below the activation.
+    fn fire(&self, facts: &ChunkFacts, lane: &Lane, act: u32) {
+        lane.validate_chunks(facts).unwrap();
+        let refs =
+            lane.tables
+                .iter()
+                .flat_map(|(shape, refs)| refs.iter().map(move |&r| (*shape, r)))
+                .chain(lane.fixed.iter().flat_map(|(shape, pieces)| {
+                    pieces.iter().flatten().map(move |&r| (*shape, r))
+                }));
+        for (shape, slot) in refs {
+            if shape == RING && slot == 0 {
+                continue;
+            }
+            let logical = facts.shape(shape).unwrap().chunk_of(slot);
+            let physical = self.table.physical(logical).unwrap();
+            assert!(self.backed(physical), "slot {slot} on unbacked {physical}");
+            assert!(
+                physical < TOTAL - act,
+                "slot {slot} of shape {shape} on {physical}, in the activation"
+            );
+        }
+    }
+}
+
+impl SegmentPort for FakeEngine {
+    fn commit_segments(&mut self, segments: u32) -> ::engine::Result<()> {
+        if self.refuse {
+            return Err(::engine::Error::invalid("refused"));
+        }
+        assert!(segments > self.prefix && segments <= self.top);
+        self.prefix = segments;
+        self.calls.push(Call::Commit(segments));
+        Ok(())
+    }
+
+    fn release_segments(&mut self, segments: u32) -> ::engine::Result<()> {
+        assert!(segments < self.prefix);
+        self.prefix = segments;
+        self.calls.push(Call::Release(segments));
+        Ok(())
+    }
+
+    fn evacuate(&mut self, evacuation: &EngineEvacuation) -> ::engine::Result<()> {
+        if self.refuse {
+            return Err(::engine::Error::invalid("refused"));
+        }
+        for &(_, physical) in &evacuation.moves {
+            assert!(
+                self.backed(physical),
+                "an evacuation onto unbacked {physical}"
+            );
+        }
+        self.table.apply(evacuation)?;
+        self.calls.push(Call::Evacuate(evacuation.moves.clone()));
+        Ok(())
+    }
+}
+
+fn physical(pool: &SharedPool, shape: ShapeId, slot_ref: u32) -> u32 {
+    pool.pool()
+        .physical(pool.slot(shape, slot_ref).chunk)
+        .unwrap()
+}
+
+#[test]
+fn every_shape_opens_its_own_chunks_of_the_one_pool_lowest_first() {
+    let mut pool = pool();
+    assert_eq!(pool.pool().state_limit(), TOTAL - 12, "the largest rung");
+    // 20 list slots of 16 a chunk, 5 ring slots of 32, two records of three
+    // 4 MiB pieces (4 a chunk) and one 64 KiB piece (256 a chunk).
+    let list = pool.take_refs(LIST_POOL, 20).unwrap();
+    let ring = pool.take_refs(RING_POOL, 5).unwrap();
+    let records = pool.take_records(2).unwrap();
+    assert_eq!(records, [0, 1]);
+    let mut chunks: Vec<(ShapeId, u32)> = list
+        .iter()
+        .map(|&r| (LIST_POOL, physical(&pool, LIST_POOL, r)))
+        .chain(
+            ring.iter()
+                .map(|&r| (RING_POOL, physical(&pool, RING_POOL, r))),
+        )
+        .collect();
+    for (at, shape) in pool.fixed().to_vec().into_iter().enumerate() {
+        for record in &records {
+            for &r in &pool.record_refs(*record)[at].1 {
+                chunks.push((shape.pool, physical(&pool, shape.pool, r)));
+            }
+        }
+    }
+    chunks.sort_unstable();
+    chunks.dedup();
+    let opened: BTreeSet<u32> = chunks.iter().map(|&(_, c)| c).collect();
+    assert_eq!(opened, (1..=6).collect(), "lowest first, none shared");
+    assert_eq!(opened.len(), chunks.len(), "a chunk holds one shape");
+    for (shape, chunk) in &chunks {
+        let logical = pool
+            .pool()
+            .chunk_table()
+            .iter()
+            .position(|&p| p == *chunk)
+            .unwrap();
+        assert_eq!(pool.pool().chunk_shape(logical as u32), Some(*shape));
+    }
+    // A record's pieces: three of the 4 MiB shape, one of the conv's.
+    let refs = pool.record_refs(records[1]);
+    assert_eq!(refs[0].0, GDN);
+    assert_eq!(refs[0].1.len(), 3);
+    assert_eq!(refs[1].0, CONV);
+    assert_eq!(refs[1].1.len(), 1);
+    // A chunk let go is free for any shape: the list's second chunk goes to
+    // a record next.
+    pool.give_refs(LIST_POOL, &list[16..]);
+    let next = pool.take_records(1).unwrap();
+    assert_eq!(
+        physical(
+            &pool,
+            pool.fixed()[0].pool,
+            pool.record_refs(next[0])[0].1[2]
+        ),
+        2,
+        "the list's chunk, now the 4 MiB shape's"
+    );
+}
+
+#[test]
+fn records_count_what_the_chunks_hold_and_come_back_whole() {
+    let mut pool = pool();
+    // 62 chunks state may take under the smallest rung: 3 pieces of 4 a
+    // chunk and 1 of 256 a record.
+    assert_eq!(pool.records_capacity(), 81);
+    let free = pool.records_available();
+    // 19 chunks open now: 15 below, 4 of the top span under the largest
+    // rung; 18 for 24 records' pieces of 4 MiB, 1 for their conv pieces.
+    assert_eq!(free, 24);
+    let records = pool.take_records(free as usize).unwrap();
+    assert!(pool.take_records(1).is_none(), "all or nothing");
+    pool.give_records(&records);
+    assert_eq!(pool.records_available(), free);
+    assert_eq!(pool.pool().state_chunks(), 0);
+}
+
+#[test]
+fn a_lane_names_each_piece_run_and_cow_in_place_unless_it_forks() {
+    let facts = facts();
+    let mut pool = pool();
+    let engine = FakeEngine::new();
+    let list = pool.take_refs(LIST_POOL, 3).unwrap();
+    let ring = pool.take_refs(RING_POOL, 2).unwrap();
+    let [run, cow] = pool.take_records(2).unwrap()[..] else {
+        panic!("two records");
+    };
+    let act = pool.pool().act_reserved();
+    // Decode: the record written in place.
+    let decode = Lane {
+        tokens: vec![1],
+        tables: pool.lane_tables(&list, &[0, ring[0], ring[1]]),
+        fixed: pool.lane_fixed(run, run),
+        ..Lane::default()
+    };
+    assert_eq!(decode.tables[0], (LIST, list.clone()));
+    assert_eq!(decode.tables[1].1[0], 0, "ring ref 0 is the null chunk");
+    assert_eq!(decode.fixed.len(), 2);
+    assert_eq!(decode.fixed[0].1.len(), 3, "one [run, cow] a piece");
+    assert!(
+        decode
+            .fixed
+            .iter()
+            .flat_map(|(_, pieces)| pieces)
+            .all(|[run, cow]| run == cow)
+    );
+    decode
+        .validate_for(::engine::fire::Serves {
+            chunks: true,
+            ..::engine::fire::Serves::NONE
+        })
+        .unwrap();
+    engine.fire(&facts, &decode, act);
+    // A fork in the fire: the shared record is the run, a fresh one the cow.
+    let fork = Lane {
+        fixed: pool.lane_fixed(run, cow),
+        ..decode.clone()
+    };
+    for ((_, forked), (_, own)) in fork.fixed.iter().zip(&decode.fixed) {
+        for ([run, cow], [kept, _]) in forked.iter().zip(own) {
+            assert_eq!(run, kept, "the run is the record forked from");
+            assert_ne!(run, cow);
+        }
+    }
+    engine.fire(&facts, &fork, act);
+    assert_eq!(pool.snapshot_ref(cow), fork.fixed[0].1[0][1]);
+}
+
+#[test]
+fn raising_the_rung_moves_state_out_of_the_activation_before_the_next_fire() {
+    let facts = facts();
+    let mut pool = pool();
+    let mut engine = FakeEngine::new();
+    // Back everything below the top span, then let state into the top span
+    // by lowering the rung.
+    assert_eq!(pool.steer(8, 0, &mut engine), Retarget::Reached);
+    assert_eq!(engine.prefix, 6);
+    pool.lower_rung(16).unwrap();
+    assert_eq!(pool.pool().state_limit(), TOTAL - 1);
+    // Fill every state chunk with records, then let the low ones go.
+    let all = pool
+        .take_records(pool.records_available() as usize)
+        .unwrap();
+    let kept: Vec<u32> = all[all.len() - 6..].to_vec();
+    pool.give_records(&all[..all.len() - 6]);
+    let refs: Vec<_> = kept.iter().map(|&r| pool.record_refs(r)).collect();
+    let in_way = |pool: &SharedPool| {
+        kept.iter()
+            .flat_map(|&r| pool.record_slots(r))
+            .filter(|slot| pool.pool().physical(slot.chunk).unwrap() >= TOTAL - 12)
+            .count()
+    };
+    assert!(in_way(&pool) > 0, "state sits in the largest rung's span");
+    // The engine refuses: nothing moves, the rung stays.
+    engine.refuse = true;
+    assert!(matches!(
+        pool.raise_rung(2048, 3, &mut engine),
+        Err(RungError::Engine(_))
+    ));
+    assert_eq!(pool.pool().act_reserved(), 1);
+    engine.refuse = false;
+    pool.raise_rung(2048, 3, &mut engine).unwrap();
+    assert!(matches!(engine.calls.last(), Some(Call::Evacuate(_))));
+    assert_eq!(pool.pool().act_reserved(), 12);
+    assert_eq!(in_way(&pool), 0);
+    assert_eq!(engine.table.as_slice(), pool.pool().chunk_table());
+    for (&record, before) in kept.iter().zip(&refs) {
+        assert_eq!(&pool.record_refs(record), before, "slot refs are logical");
+        let lane = Lane {
+            tokens: vec![1],
+            fixed: pool.lane_fixed(record, record),
+            ..Lane::default()
+        };
+        engine.fire(&facts, &lane, 12);
+    }
+    // Raising to a rung already set aside moves nothing more.
+    let calls = engine.calls.len();
+    pool.raise_rung(256, 4, &mut engine).unwrap();
+    assert_eq!(engine.calls.len(), calls);
+}
+
+#[test]
+fn segments_commit_ahead_as_a_prefix_and_shrink_by_evacuating_the_highest() {
+    let mut pool = pool();
+    let mut engine = FakeEngine::new();
+    assert_eq!(pool.mapped_segments(), 4, "two below, two under activation");
+    // A waiter short of 30 chunks: commit ahead of it and the step.
+    let target = pool.ahead_target(30 * CHUNK);
+    assert_eq!(
+        target, 6,
+        "19 free, 30 and the 4 ahead wanted: two segments more"
+    );
+    assert_eq!(pool.steer(target, 0, &mut engine), Retarget::Reached);
+    assert_eq!(engine.calls, [Call::Commit(3), Call::Commit(4)]);
+    assert_eq!(pool.steer(8, 0, &mut engine), Retarget::Reached);
+    assert_eq!(
+        engine.calls,
+        [
+            Call::Commit(3),
+            Call::Commit(4),
+            Call::Commit(5),
+            Call::Commit(6)
+        ]
+    );
+    assert_eq!(pool.pool().prefix_segments(), 6);
+    assert!(pool.ahead_target(0) <= 8, "never past the pool");
+    // Hold chunks across the prefix, then free most of them.
+    let held = pool.take_refs(LIST_POOL, 16 * 44).unwrap();
+    let keep: Vec<u32> = held
+        .chunks(16)
+        .enumerate()
+        .filter(|(at, _)| at % 8 == 0)
+        .flat_map(|(_, refs)| refs.to_vec())
+        .collect();
+    let gone: Vec<u32> = held.iter().copied().filter(|r| !keep.contains(r)).collect();
+    pool.give_refs(LIST_POOL, &gone);
+    assert!(pool.pool().segments().used(5) > 0);
+    // Shrink by one segment: the highest of the prefix evacuates first.
+    engine.calls.clear();
+    assert_eq!(pool.steer(7, 9, &mut engine), Retarget::Reached);
+    let [Call::Evacuate(moves)] = &engine.calls[..] else {
+        panic!("{:?}", engine.calls);
+    };
+    assert!(moves.iter().all(|&(_, to)| to < 5 * SEGMENT));
+    assert_eq!(pool.pool().segments().used(5), 0);
+    assert_eq!(engine.table.as_slice(), pool.pool().chunk_table());
+    // Released only once the fire carrying the copy retires.
+    assert_eq!(pool.steer(7, 9, &mut engine), Retarget::Reached);
+    assert_eq!(engine.prefix, 6, "still draining");
+    pool.pool_mut().retire_through(9);
+    assert_eq!(pool.steer(7, 9, &mut engine), Retarget::Reached);
+    assert_eq!(engine.prefix, 5);
+    assert_eq!(pool.mapped_segments(), 7);
+    // A shrink with no room below says so and drops nothing.
+    let rest = pool
+        .take_refs(LIST_POOL, pool.pool().available(LIST_POOL))
+        .unwrap();
+    assert!(!rest.is_empty());
+    assert!(matches!(
+        pool.steer(4, 10, &mut engine),
+        Retarget::NoRoom { held: 7 }
+    ));
+    // The top span never goes.
+    assert_eq!(pool.pool().segments().state(6), SegmentState::Committed);
+    assert_eq!(pool.pool().segments().state(7), SegmentState::Committed);
+}
+
+#[test]
+fn a_refused_commit_hands_out_nothing_of_the_segment() {
+    let mut pool = pool();
+    let mut engine = FakeEngine::new();
+    engine.refuse = true;
+    let before = pool.pool().available(LIST_POOL);
+    assert_eq!(pool.steer(5, 0, &mut engine), Retarget::Reached);
+    assert_eq!(pool.pool().available(LIST_POOL), before);
+    assert_eq!(pool.pool().segments().state(2), SegmentState::Uncommitted);
+}
+
+#[test]
+fn governor_bytes_count_the_top_span_as_committed_from_the_load() {
+    let mut pool = pool();
+    // Two segments below and the two under activation.
+    assert_eq!(pool.held(), 4 * u64::from(SEGMENT) * CHUNK);
+    assert_eq!(pool.hard_limit(), u64::from(TOTAL) * CHUNK);
+    assert_eq!(pool.segment_bytes(), u64::from(SEGMENT) * CHUNK);
+    let empty = pool.demand();
+    assert_eq!(
+        empty.live,
+        (1 + 12) * CHUNK,
+        "the null chunk and the top span"
+    );
+    assert_eq!(empty.wanted, empty.live);
+    // A working set at 256 tokens: 16 list slots (1 chunk), a ring of 9
+    // slots (1 chunk), a record (1 + 1 chunks).
+    assert_eq!(pool.floor(), 4 * CHUNK + 13 * CHUNK);
+    assert!(matches!(pool.growth(), Growth::Elastic { .. }));
+    let list = pool.take_refs(LIST_POOL, 4).unwrap();
+    assert_eq!(
+        pool.demand().live,
+        13 * CHUNK + 4 * MIB,
+        "slots at their own size"
+    );
+    pool.give_refs(LIST_POOL, &list);
+    // A fixed pool reads as fixed.
+    let mut fixed = facts();
+    fixed.segments = SegmentFacts {
+        committed: 8,
+        max: 8,
+        growth: SegmentGrowth::Fixed,
+    };
+    let fixed = SharedPool::new(&fixed, 2, 256).unwrap();
+    assert_eq!(fixed.growth(), Growth::Fixed);
+    assert_eq!(fixed.held(), u64::from(TOTAL) * CHUNK);
+}
+
+#[test]
+fn pinned_or_unready_facts_are_refused() {
+    let degenerate = ChunkFacts::degenerate(
+        &::engine::PoolFacts {
+            kv_pages: 8,
+            kv_page_size: 16,
+            ..Default::default()
+        },
+        &::engine::chunk::DegenerateBytes {
+            kv_page: 64,
+            ..Default::default()
+        },
+    );
+    assert!(!SharedPool::states_shared(&degenerate));
+    assert!(matches!(
+        SharedPool::new(&degenerate, 1, 16),
+        Err(SharedError::Pinned(0))
+    ));
+    assert!(SharedPool::states_shared(&facts()));
+    let mut two_lists = facts();
+    two_lists.shapes.push(shape(
+        EngineShape(5),
+        SlotKind::List {
+            tokens: 16,
+            rate: 4,
+        },
+        MIB,
+    ));
+    assert!(matches!(
+        SharedPool::new(&two_lists, 1, 16),
+        Err(SharedError::Shapes { kind: "list", .. })
+    ));
+}
+
+/// The facts without the ring: a model whose state is fixed records.
+fn fixed_facts() -> ChunkFacts {
+    let mut facts = facts();
+    facts.shapes.retain(|shape| shape.id != RING);
+    facts.validate().unwrap();
+    facts
+}
+
+#[test]
+fn the_stores_take_list_refs_and_records_and_a_fork_names_its_cow() {
+    use crate::pipeline::fire::rs::{PreparedRs, apply_shared, prepare, settle};
+    use crate::store::rs::RsGeometry;
+
+    let facts = fixed_facts();
+    let shared: Shared = Arc::new(Mutex::new(SharedPool::new(&facts, 2, 256).unwrap()));
+    let stores = crate::store::registry::shared_stores(&shared, 16, 256);
+    assert!(stores.shared.is_some());
+    // kv pages are the list shape's slot refs, from the one pool.
+    let pages = crate::store::registry::with_kv_lock(&stores.kv, "test", |kv| {
+        kv.reserve_device_pages(3).unwrap()
+    });
+    let refs: Vec<u32> = pages.iter().map(|page| page.0).collect();
+    {
+        let pool = shared.lock().unwrap();
+        for &r in &refs {
+            let chunk = pool.slot(LIST_POOL, r).chunk;
+            assert_eq!(pool.pool().chunk_shape(chunk), Some(LIST_POOL));
+        }
+    }
+    let engine = FakeEngine::new();
+    let geom = RsGeometry {
+        state_size: 1024,
+        buffer_page_tokens: 4,
+    };
+    let mut rs = stores.rs.lock().unwrap();
+    assert!(rs.is_shared());
+    let ws = rs.create_working_set(geom);
+    let first = prepare(&mut rs, ws, 4).unwrap();
+    assert!(
+        first.state_copy().is_none(),
+        "no StateCopy: records copy by [run, cow]"
+    );
+    let lane = |out: &PreparedRs| {
+        let mut req = crate::engine::FireRequest {
+            lanes: vec![crate::engine::fire::lane_of(0, vec![1], 0, refs.clone())],
+            ..crate::engine::FireRequest::default()
+        };
+        out.apply_to(&mut req);
+        apply_shared(&mut req, Some(&shared), Some(out));
+        req.lanes.remove(0)
+    };
+    let in_place = |lane: &Lane| {
+        !lane.fixed.is_empty()
+            && lane
+                .fixed
+                .iter()
+                .flat_map(|(_, pieces)| pieces)
+                .all(|[run, cow]| run == cow)
+    };
+    let fresh = lane(&first);
+    assert_eq!(fresh.tables, [(LIST, refs.clone())]);
+    assert!(in_place(&fresh), "a fresh record is written in place");
+    engine.fire(&facts, &fresh, 12);
+    settle(&mut rs, first.txn);
+    let record = rs.folded_slot(ws).unwrap().unwrap().0;
+    // A decode on its own record: cow == run.
+    let decode = prepare(&mut rs, ws, 1).unwrap();
+    let decoded = lane(&decode);
+    assert!(in_place(&decoded));
+    assert_eq!(
+        decoded.fixed,
+        shared.lock().unwrap().lane_fixed(record, record)
+    );
+    settle(&mut rs, decode.txn);
+    // The fork shares the record; its first fire writes a fresh one, the
+    // engine copying the shared run onto it.
+    let fork = rs.fork(ws).unwrap();
+    let forked = prepare(&mut rs, fork, 1).unwrap();
+    let forked_lane = lane(&forked);
+    let cow = forked.slot_ids[0];
+    assert_ne!(cow, record);
+    assert_eq!(
+        forked_lane.fixed,
+        shared.lock().unwrap().lane_fixed(record, cow)
+    );
+    assert!(!in_place(&forked_lane));
+    engine.fire(&facts, &forked_lane, 12);
+    settle(&mut rs, forked.txn);
+    // Back to its own record, the original writes in place again.
+    let again = prepare(&mut rs, ws, 1).unwrap();
+    assert!(in_place(&lane(&again)));
+    settle(&mut rs, again.txn);
+}
+
+#[test]
+fn degenerate_facts_keep_their_own_pools() {
+    let pools = ::engine::PoolFacts {
+        kv_pages: 10,
+        kv_page_size: 16,
+        state_slots: 4,
+        state_slot_bytes: 4096,
+        buffer_pages: 6,
+        ..Default::default()
+    };
+    let facts = ChunkFacts::degenerate(
+        &pools,
+        &::engine::chunk::DegenerateBytes {
+            kv_page: 100,
+            window_page: 50,
+            buffer_page: 25,
+        },
+    );
+    let stores = crate::store::chunks::StorePools::of(&facts).unwrap();
+    assert!(!stores.shared);
+    assert_eq!(stores.kv.device, 10);
+    let shared = crate::store::chunks::StorePools::of(&fixed_facts()).unwrap();
+    assert!(shared.shared);
+    assert_eq!(shared.page_size, 16);
+    let mut mixed = fixed_facts();
+    mixed.shapes[0].pinned = Some(::engine::chunk::Pinned::default());
+    assert!(crate::store::chunks::StorePools::of(&mixed).is_err());
+}

@@ -28,27 +28,53 @@ use ::engine::chunk::{
 
 use super::kv::page_table::WorkingSetId;
 use super::pool::PoolId;
+use super::shared::{Shared, SharedPool, TokenShape};
 use super::slots::{
-    Demand, Holder, SegmentState, ShapeKind, Slot, SlotPool, SlotPoolFacts, SlotShape,
+    Demand, Holder, SegmentState, ShapeId, ShapeKind, Slot, SlotPool, SlotPoolFacts, SlotShape,
 };
 
 /// The holder a store's own allocations are taken under: the store's
 /// table, which refcounts them, holds each id it hands out.
 pub const STORE: Holder = Holder::WorkingSet(u64::MAX);
 
-/// One pinned shape's ids: see the module docs.
+/// Where a [`ShapePool`]'s ids come from.
+#[derive(Clone, Debug)]
+enum Backing {
+    /// A pinned shape's own pool: id `base + c` is chunk `c`.
+    Own(Box<SlotPool>),
+    /// A list or ring shape of an engine's shared pool: an id is the slot
+    /// ref, and the null chunk's ref 0 is never handed out.
+    Shape(Shared, ShapeId),
+    /// The fixed records of an engine's shared pool: id `base + r` is
+    /// record `r`, a slot of every fixed shape for each of its pieces.
+    Records(Shared),
+}
+
+/// One store's ids of one shape: a pinned shape's own run (see the module
+/// docs), or a shape of an engine's shared pool ([`super::shared`]).
 #[derive(Clone, Debug)]
 pub struct ShapePool<I> {
-    slots: SlotPool,
+    slots: Backing,
     kind: ShapeKind,
     slot_bytes: u64,
     base: u32,
     capacity: u32,
+    /// One past the highest id there may be.
+    ids_end: u32,
     /// Chunks at and past it are not handed out.
     limit: u32,
     /// Ids let go, each batch waiting on the fire at its epoch.
     pending: Vec<(u64, Vec<I>)>,
     id: PhantomData<I>,
+}
+
+/// The waiter a store's shortfall is recorded under in a shared pool, one a
+/// store: the shape's id, the records' past every shape's.
+fn waiter(backing: &Backing) -> u64 {
+    match backing {
+        Backing::Shape(_, shape) => u64::from(*shape),
+        Backing::Own(_) | Backing::Records(_) => u64::MAX,
+    }
 }
 
 impl<I: PoolId> ShapePool<I> {
@@ -70,15 +96,83 @@ impl<I: PoolId> ShapePool<I> {
             act_chunks: Vec::new(),
         });
         Self {
-            slots,
+            slots: Backing::Own(Box::new(slots)),
             kind,
             slot_bytes,
             base,
             capacity,
+            ids_end: base + capacity,
             limit: capacity,
             pending: Vec::new(),
             id: PhantomData,
         }
+    }
+
+    /// The slot refs of `shared`'s per-token shape `shape` as ids. Its
+    /// capacity is what the state chunks would hold of it alone; its ids run
+    /// to every ref the pool's chunks could name.
+    pub fn shared(shared: &Shared, shape: TokenShape) -> Self {
+        let (kind, capacity, ids_end) = {
+            let pool = shared.lock().unwrap();
+            let slots = pool.pool();
+            let kind = slots.shape(shape.pool).map_or(ShapeKind::List, |s| s.kind);
+            let refs = |chunks: u32| {
+                u32::try_from(u64::from(chunks) * u64::from(shape.slots_per_chunk))
+                    .unwrap_or(u32::MAX)
+            };
+            let state = slots
+                .total_chunks()
+                .saturating_sub(slots.reserved_chunks())
+                .saturating_sub(slots.act_chunks(0));
+            (kind, refs(state), refs(slots.total_chunks()))
+        };
+        Self {
+            slots: Backing::Shape(Arc::clone(shared), shape.pool),
+            kind,
+            slot_bytes: shape.slot_bytes,
+            base: 0,
+            capacity,
+            ids_end,
+            limit: capacity,
+            pending: Vec::new(),
+            id: PhantomData,
+        }
+    }
+
+    /// `shared`'s fixed records as ids from `base`.
+    pub fn records(shared: &Shared, base: u32) -> Self {
+        let (capacity, slot_bytes) = {
+            let pool = shared.lock().unwrap();
+            let bytes = pool
+                .fixed()
+                .iter()
+                .map(|shape| shape.slot_bytes * u64::from(shape.pieces))
+                .sum();
+            (pool.records_capacity(), bytes)
+        };
+        base.checked_add(capacity)
+            .expect("pool id range overflows u32");
+        Self {
+            slots: Backing::Records(Arc::clone(shared)),
+            kind: ShapeKind::Fixed,
+            slot_bytes,
+            base,
+            capacity,
+            ids_end: base + capacity,
+            limit: capacity,
+            pending: Vec::new(),
+            id: PhantomData,
+        }
+    }
+
+    /// One past the highest id the pool may hand out.
+    pub fn ids_end(&self) -> u32 {
+        self.ids_end
+    }
+
+    /// Whether the ids are an engine's shared pool's.
+    pub fn is_shared(&self) -> bool {
+        !matches!(self.slots, Backing::Own(_))
     }
 
     fn slot(&self, id: I) -> Slot {
@@ -93,16 +187,67 @@ impl<I: PoolId> ShapePool<I> {
         ids.iter().map(|&id| self.slot(id)).collect()
     }
 
+    /// The shared pool's slots `ids` name.
+    fn shared_slots(&self, pool: &SharedPool, ids: &[I]) -> Vec<Slot> {
+        match &self.slots {
+            Backing::Shape(_, shape) => ids
+                .iter()
+                .map(|&id| pool.slot(*shape, id.index()))
+                .collect(),
+            Backing::Records(_) => ids
+                .iter()
+                .flat_map(|&id| pool.record_slots(id.index() - self.base))
+                .collect(),
+            Backing::Own(_) => unreachable!("a pinned pool's slots are its own"),
+        }
+    }
+
+    /// Runs `f` on the slot pool `ids` live in, with their slots there.
+    fn with_slots<T>(&mut self, ids: &[I], f: impl FnOnce(&mut SlotPool, Vec<Slot>) -> T) -> T {
+        match &self.slots {
+            Backing::Own(_) => {
+                let slots = self.slots_of(ids);
+                let Backing::Own(pool) = &mut self.slots else {
+                    unreachable!()
+                };
+                f(pool, slots)
+            }
+            Backing::Shape(shared, _) | Backing::Records(shared) => {
+                let shared = Arc::clone(shared);
+                let mut pool = shared.lock().unwrap();
+                let slots = self.shared_slots(&pool, ids);
+                f(pool.pool_mut(), slots)
+            }
+        }
+    }
+
     /// The `n` lowest free ids, ascending, or none when fewer than `n`
     /// stand free under the limit.
     pub fn try_alloc_n(&mut self, n: usize) -> Option<Vec<I>> {
-        let taken = self.slots.acquire(STORE, 0, n as u64).ok()?;
-        Some(
-            taken
-                .into_iter()
-                .map(|slot| I::from_index(self.base + slot.chunk))
-                .collect(),
-        )
+        match &mut self.slots {
+            Backing::Own(pool) => {
+                let taken = pool.acquire(STORE, 0, n as u64).ok()?;
+                Some(
+                    taken
+                        .into_iter()
+                        .map(|slot| I::from_index(self.base + slot.chunk))
+                        .collect(),
+                )
+            }
+            Backing::Shape(shared, shape) => {
+                let refs = shared.lock().unwrap().take_refs(*shape, n as u64)?;
+                Some(refs.into_iter().map(I::from_index).collect())
+            }
+            Backing::Records(shared) => {
+                let records = shared.lock().unwrap().take_records(n)?;
+                Some(
+                    records
+                        .into_iter()
+                        .map(|record| I::from_index(self.base + record))
+                        .collect(),
+                )
+            }
+        }
     }
 
     /// `ids` go back once the fire at `epoch` retires.
@@ -133,18 +278,38 @@ impl<I: PoolId> ShapePool<I> {
         if ids.is_empty() {
             return;
         }
-        let slots = self.slots_of(ids);
-        self.slots.release(STORE, &slots, 0);
-        self.release_past_limit(&slots);
+        match &mut self.slots {
+            Backing::Own(pool) => {
+                let slots: Vec<Slot> = ids
+                    .iter()
+                    .map(|&id| Slot {
+                        chunk: id.index() - self.base,
+                        index: 0,
+                    })
+                    .collect();
+                pool.release(STORE, &slots, 0);
+                self.release_past_limit(&slots);
+            }
+            Backing::Shape(shared, shape) => {
+                let refs: Vec<u32> = ids.iter().map(|id| id.index()).collect();
+                shared.lock().unwrap().give_refs(*shape, &refs);
+            }
+            Backing::Records(shared) => {
+                let records: Vec<u32> = ids.iter().map(|id| id.index() - self.base).collect();
+                shared.lock().unwrap().give_records(&records);
+            }
+        }
     }
 
     /// Releases the segments of `slots` past the limit that hold nothing
     /// now, so they are not handed out again.
     fn release_past_limit(&mut self, slots: &[Slot]) {
+        let Backing::Own(pool) = &mut self.slots else {
+            return;
+        };
         for slot in slots {
-            if slot.chunk >= self.limit && self.slots.segments().used(slot.chunk) == 0 {
-                self.slots
-                    .release_segment(slot.chunk)
+            if slot.chunk >= self.limit && pool.segments().used(slot.chunk) == 0 {
+                pool.release_segment(slot.chunk)
                     .expect("an empty committed segment past the limit goes");
             }
         }
@@ -152,20 +317,21 @@ impl<I: PoolId> ShapePool<I> {
 
     /// Stops handing out ids at `limit` and up, or hands them out again.
     /// An id already out stays out until it is given back; [`Self::tail_held`]
-    /// counts those.
+    /// counts those. A shared pool moves by its segments, not by a limit.
     pub fn set_limit(&mut self, limit: u32) {
+        let Backing::Own(pool) = &mut self.slots else {
+            return;
+        };
         let limit = limit.min(self.capacity);
         for segment in 0..self.capacity {
-            let state = self.slots.segments().state(segment);
+            let state = pool.segments().state(segment);
             if segment < limit {
                 if state == SegmentState::Uncommitted {
-                    self.slots
-                        .commit_segment(segment)
+                    pool.commit_segment(segment)
                         .expect("an uncommitted segment commits");
                 }
-            } else if state == SegmentState::Committed && self.slots.segments().used(segment) == 0 {
-                self.slots
-                    .release_segment(segment)
+            } else if state == SegmentState::Committed && pool.segments().used(segment) == 0 {
+                pool.release_segment(segment)
                     .expect("an empty committed segment goes");
             }
         }
@@ -175,8 +341,11 @@ impl<I: PoolId> ShapePool<I> {
     /// The ids at and past the limit still out, waiting on an epoch or on
     /// their holder.
     pub fn tail_held(&self) -> usize {
+        let Backing::Own(pool) = &self.slots else {
+            return 0;
+        };
         (self.limit..self.capacity)
-            .filter(|&segment| self.slots.segments().used(segment) > 0)
+            .filter(|&segment| pool.segments().used(segment) > 0)
             .count()
     }
 
@@ -187,15 +356,24 @@ impl<I: PoolId> ShapePool<I> {
 
     /// One past the highest offset still out.
     pub fn high_end(&self) -> u32 {
+        let Backing::Own(pool) = &self.slots else {
+            return self.capacity;
+        };
         (0..self.capacity)
             .rev()
-            .find(|&segment| self.slots.segments().used(segment) > 0)
+            .find(|&segment| pool.segments().used(segment) > 0)
             .map_or(0, |segment| segment + 1)
     }
 
     /// Free ids under the limit.
     pub fn available(&self) -> usize {
-        self.slots.available(0) as usize
+        match &self.slots {
+            Backing::Own(pool) => pool.available(0) as usize,
+            Backing::Shape(shared, shape) => {
+                shared.lock().unwrap().pool().available(*shape) as usize
+            }
+            Backing::Records(shared) => shared.lock().unwrap().records_available() as usize,
+        }
     }
 
     pub fn capacity(&self) -> u32 {
@@ -226,55 +404,111 @@ impl<I: PoolId> ShapePool<I> {
     /// snapshot keeping them. Dropped with [`Self::unshare`] before the
     /// store lets them go.
     pub fn share(&mut self, holder: Holder, ids: &[I]) {
-        let slots = self.slots_of(ids);
-        self.slots.share(holder, &slots);
+        self.with_slots(ids, |pool, slots| pool.share(holder, &slots));
     }
 
     /// Drops `holder`'s reference again. An id holding no cache reference
     /// is passed over: the store's own count, not this, decides when an id
     /// goes, so a hold that went astray never stops a release.
     pub fn unshare(&mut self, holder: Holder, ids: &[I]) {
-        let slots: Vec<Slot> = self
-            .slots_of(ids)
-            .into_iter()
-            .filter(|&slot| {
-                let held = self.slots.refs(slot).1 > 0;
-                debug_assert!(held, "{slot:?} lets go a cache hold it never took");
-                held
-            })
-            .collect();
-        if self.slots.held_by(&holder) >= slots.len() as u64 {
-            self.slots.release(holder, &slots, 0);
-        }
+        self.with_slots(ids, |pool, slots| {
+            let slots: Vec<Slot> = slots
+                .into_iter()
+                .filter(|&slot| {
+                    let held = pool.refs(slot).1 > 0;
+                    debug_assert!(held, "{slot:?} lets go a cache hold it never took");
+                    held
+                })
+                .collect();
+            if pool.held_by(&holder) >= slots.len() as u64 {
+                pool.release(holder, &slots, 0);
+            }
+        });
     }
 
     /// The cache entries holding a reference on `id`.
     pub fn cache_refs(&self, id: I) -> u32 {
-        self.slots.refs(self.slot(id)).1
+        match &self.slots {
+            Backing::Own(pool) => pool.refs(self.slot(id)).1,
+            Backing::Shape(shared, _) | Backing::Records(shared) => {
+                let pool = shared.lock().unwrap();
+                self.shared_slots(&pool, &[id])
+                    .first()
+                    .map_or(0, |&slot| pool.pool().refs(slot).1)
+            }
+        }
     }
 
-    /// Ids `holder` holds a reference on.
+    /// Ids `holder` holds a reference on (slots, in a shared pool's records).
     pub fn held_by(&self, holder: &Holder) -> u64 {
-        self.slots.held_by(holder)
+        match &self.slots {
+            Backing::Own(pool) => pool.held_by(holder),
+            Backing::Shape(shared, _) | Backing::Records(shared) => {
+                shared.lock().unwrap().pool().held_by(holder)
+            }
+        }
     }
 
     /// Records that waiters are short `ids` of this pool, replacing what
     /// they were short before.
     pub fn wait(&mut self, ids: u64) {
-        if ids == 0 {
-            self.slots.unwait(0);
-        } else {
-            self.slots.wait(0, 0, ids);
+        let waiter = waiter(&self.slots);
+        match &mut self.slots {
+            Backing::Own(pool) => {
+                if ids == 0 {
+                    pool.unwait(0);
+                } else {
+                    pool.wait(0, 0, ids);
+                }
+            }
+            Backing::Shape(shared, shape) => {
+                let mut shared = shared.lock().unwrap();
+                if ids == 0 {
+                    shared.pool_mut().unwait(waiter);
+                } else {
+                    shared.pool_mut().wait(waiter, *shape, ids);
+                }
+            }
+            Backing::Records(shared) => {
+                let mut shared = shared.lock().unwrap();
+                let first = shared.fixed().first().copied();
+                match first {
+                    Some(shape) if ids > 0 => {
+                        shared
+                            .pool_mut()
+                            .wait(waiter, shape.pool, ids * u64::from(shape.pieces))
+                    }
+                    _ => shared.pool_mut().unwait(waiter),
+                }
+            }
         }
     }
 
     /// What is held and wanted of this pool, in bytes.
     pub fn demand(&self) -> Demand {
-        self.slots.demand()
-    }
-
-    pub fn pool(&self) -> &SlotPool {
-        &self.slots
+        let shape_demand = |pool: &SlotPool, shape: ShapeId| {
+            let demand = pool.shape_demand(shape);
+            let bytes = pool.shape(shape).map_or(0, |s| s.slot_bytes);
+            Demand {
+                live: demand.live * bytes,
+                wanted: (demand.live + demand.cached + demand.waiting) * bytes,
+            }
+        };
+        match &self.slots {
+            Backing::Own(pool) => pool.demand(),
+            Backing::Shape(shared, shape) => shape_demand(shared.lock().unwrap().pool(), *shape),
+            Backing::Records(shared) => {
+                let shared = shared.lock().unwrap();
+                shared
+                    .fixed()
+                    .iter()
+                    .map(|shape| shape_demand(shared.pool(), shape.pool))
+                    .fold(Demand::default(), |sum, demand| Demand {
+                        live: sum.live + demand.live,
+                        wanted: sum.wanted + demand.wanted,
+                    })
+            }
+        }
     }
 }
 
@@ -414,9 +648,13 @@ impl ShapeRun {
 }
 
 /// What a store needs of an engine's [`ChunkFacts`]: each of today's pools,
-/// as the pinned shape the degenerate mode states it as.
+/// as the pinned shape the degenerate mode states it as; or, where the
+/// engine states a shared pool, its geometry, the stores drawing their ids
+/// from a [`SharedPool`] built of the same facts.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct StorePools {
+    /// The shapes share one pool: the counts below are not stated.
+    pub shared: bool,
     pub page_size: u32,
     pub kv: ShapeRun,
     /// The window ring's pages but the null page 0; its ids run from 1.
@@ -429,9 +667,9 @@ pub struct StorePools {
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
 pub enum ChunkFactsError {
     #[error(
-        "shape {0} takes chunks from the shared pool; the runtime stores hold only pinned shapes until the pool switch"
+        "shape {0} takes chunks from the shared pool beside pinned shapes; an engine states every shape pinned or none"
     )]
-    Shared(u32),
+    Mixed(u32),
     #[error("shape {0} is not one of the degenerate mode's")]
     Unknown(u32),
     #[error("shape {0} cuts a slot into pieces, which the stores do not take yet")]
@@ -439,12 +677,15 @@ pub enum ChunkFactsError {
 }
 
 impl StorePools {
-    /// The stores' pools as `facts` states them. Only pinned shapes are
-    /// taken: a shape drawing from the shared pool waits for the pool switch.
+    /// The stores' pools as `facts` states them: every shape pinned (the
+    /// degenerate mode), or none (a shared pool).
     pub fn of(facts: &ChunkFacts) -> Result<Self, ChunkFactsError> {
+        if SharedPool::states_shared(facts) {
+            return Ok(Self::shared(facts));
+        }
         let mut pools = Self::default();
         for shape in &facts.shapes {
-            let pinned = shape.pinned.ok_or(ChunkFactsError::Shared(shape.id.0))?;
+            let pinned = shape.pinned.ok_or(ChunkFactsError::Mixed(shape.id.0))?;
             let run = ShapeRun::of(pinned, shape.slot_bytes, shape.slots_per_chunk);
             match (shape.id, shape.kind) {
                 (DEGENERATE_KV, SlotKind::List { tokens, .. }) => {
@@ -467,6 +708,38 @@ impl StorePools {
             }
         }
         Ok(pools)
+    }
+
+    /// A shared pool's geometry: the list and ring shapes' tokens a slot
+    /// and the window.
+    fn shared(facts: &ChunkFacts) -> Self {
+        let mut pools = Self {
+            shared: true,
+            ..Self::default()
+        };
+        for shape in &facts.shapes {
+            let run = ShapeRun {
+                slot_bytes: shape.slot_bytes,
+                ..ShapeRun::default()
+            };
+            match shape.kind {
+                SlotKind::List { tokens, .. } => {
+                    pools.page_size = tokens;
+                    pools.kv = run;
+                }
+                SlotKind::Ring { window, tokens } => {
+                    if pools.page_size == 0 {
+                        pools.page_size = tokens;
+                    }
+                    pools.window = run;
+                    pools.window_tokens = window;
+                }
+                SlotKind::Fixed { pieces } => {
+                    pools.state.slot_bytes += shape.slot_bytes * u64::from(pieces);
+                }
+            }
+        }
+        pools
     }
 
     /// The engine's window pages, the null page 0 counted.
