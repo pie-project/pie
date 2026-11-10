@@ -6,7 +6,7 @@
 //! ```text
 //! split-geo plan (--model <deployment> | --shape <shape.json>) [--preset <name>] [--set K=V,...]
 //!                --out <dir>
-//! split-geo build --plan <plan.json> --out <dir> [--emit floor,rcfg,kernels,layout,host,meta,
+//! split-geo build --plan <plan.json> --out <dir> [--emit floor,rcfg,kernels,layout,host,plan,
 //!                 bindings,program] [--levers K:V,...] [--kernels <programs/split dir>]
 //! ```
 //!
@@ -25,7 +25,7 @@
 //! - `layout/`: `layout.csl` and the per-kind sources (`emit::layout::write`), with the
 //!   `params.txt` and `geo.env` `link.sh` reads;
 //! - `host.json`: `emit::host::HostLayout`;
-//! - `meta.json`: the plan's record for the Python runners;
+//! - `plan.json`: the plan it built;
 //! - `bindings.json`: every copy onto the wafer in placement order (`Program::bindings`), which the
 //!   Python runners execute (`tools/split/splitgeo.py`'s `place`);
 //! - `program.json`: the artifact's header (`artifact::Header`: the model facts and the plan).
@@ -38,7 +38,7 @@ use std::path::{Path, PathBuf};
 
 use kernels_cerebras::spatial::artifact::Artifact;
 use kernels_cerebras::spatial::emit::params::{Levers, kernels};
-use kernels_cerebras::spatial::emit::{layout, meta, rcfg};
+use kernels_cerebras::spatial::emit::{layout, rcfg};
 use kernels_cerebras::spatial::family;
 use kernels_cerebras::spatial::floor::{HeadBlock, Rect, StoreBlock, Unit};
 use kernels_cerebras::spatial::plan::{Plan, Shape};
@@ -48,7 +48,7 @@ use kernels_cerebras::spatial::target;
 use serde::Serialize;
 
 const EMITS: [&str; 8] = [
-    "floor", "rcfg", "kernels", "layout", "host", "meta", "bindings", "program",
+    "floor", "rcfg", "kernels", "layout", "host", "plan", "bindings", "program",
 ];
 
 const USAGE: &str = "usage: split-geo plan (--model <deployment> | --shape <shape.json>) \
@@ -199,8 +199,8 @@ fn build(args: &[String]) -> Result<(), String> {
     if want("layout") {
         layout::write(&prog, &levers, &kdir, &out.join("layout"))?;
     }
-    if want("meta") {
-        json(&out, "meta.json", &meta::of_plan(&prog.plan))?;
+    if want("plan") {
+        json(&out, "plan.json", &prog.plan)?;
     }
     Ok(())
 }

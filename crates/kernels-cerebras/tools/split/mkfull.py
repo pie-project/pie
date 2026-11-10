@@ -6,7 +6,7 @@ The levers and diagnostics (CYV, GELUT, WSPEC, SLW, RING, DIAG, TSTAMP, ...; `<k
 params, defaulting to the shipped build. Everything is resolved here: link.sh compiles <outdir> with no shape params
 and puts the artifact the engine runs (<outdir>/geo's program.json, host.json, bindings.json, rcfg arrays) beside the
 compiled program. <outdir>/geo holds what the runners read (rcfg.npy, floor.json, host.json, bindings.json,
-kernels.json, meta.json)."""
+kernels.json, plan.json)."""
 import os, shutil, sys
 H = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, H)

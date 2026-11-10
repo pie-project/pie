@@ -63,7 +63,7 @@ def build(plan, out, emit=None, levers="", kernels=None):
 
 
 class Geo:
-    """What split-geo wrote: floor, host, kernels, meta (dicts), rcfg ([H][W][n] u32), bindings (list).
+    """What split-geo wrote: floor, host, kernels, plan (dicts), rcfg ([H][W][n] u32), bindings (list).
     The attributes the runners used from the old Python geometries (PX, PY, XC, YC, UW, UH, origins, HX0, HXC,
     HC, HR, unit_origin, wl, hx, hc) are derived from the floor and the host layout."""
 
@@ -72,7 +72,7 @@ class Geo:
             p = os.path.join(out, n)
             return json.load(open(p)) if os.path.exists(p) else None
         self.dir = out
-        self.floor, self.host, self.kernels, self.meta = j("floor.json"), j("host.json"), j("kernels.json"), j("meta.json")
+        self.floor, self.host, self.kernels, self.plan = j("floor.json"), j("host.json"), j("kernels.json"), j("plan.json")
         self.bindings = j("bindings.json") or []
         p = os.path.join(out, "rcfg.npy")
         self.rcfg = np.load(p, mmap_mode="r") if os.path.exists(p) else None
@@ -95,10 +95,10 @@ class Geo:
             self.HXC, self.HC = ctl["Row"] - hb["rect"]["y"], hb["rect"]["w"]
         self.root = (hb["root"]["x"], hb["root"]["y"])
         # rows a unit keeps KV on (Gemma 12B's attention rows, RA)
-        self.RA = (self.meta or {}).get("PYW", self.PY)
+        part = (self.plan or {}).get("partition") or {}
+        self.RA = part.get("kv_rows", self.PY)
         # gpt-oss: the band's top row and columns, the units' attention / MoE columns
         self.HB0, self.HVC = hb["rect"]["y"], hb["rect"]["w"]
-        part = ((self.meta or {}).get("plan") or {}).get("partition") or {}
         self.AX = part.get("attn_cols") or 0
         self.MXc = self.PX - self.AX
         self._dims = [0] * self.PY
