@@ -2214,6 +2214,7 @@ pub fn attend_readouts(
         f64::from(call.sm_scale),
         tuning.chunks,
         walked,
+        [pool.keys_map, pool.values_map],
     )?)
 }
 

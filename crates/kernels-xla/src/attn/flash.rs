@@ -674,6 +674,7 @@ pub(crate) fn readouts(
     scale: f64,
     ch: crate::tuning::Chunks,
     walk: Branch<'_>,
+    maps: [PageMap; 2],
 ) -> Built<Val> {
     let n = f.dims(lane)[0];
     let r = f.dims(q4)[0];
@@ -688,7 +689,7 @@ pub(crate) fn readouts(
     };
     let hi = with_i(f, qpos, 1, Func::add)?;
     let old = older(
-        f, geom, slots, planes, lane, qpos, lo, p0, start, live, window,
+        f, geom, slots, planes, lane, qpos, lo, p0, start, live, window, maps,
     )?;
     // Each row's fresh key rows, as `attend` reads them.
     let klo = f.max(lo, p0)?;
