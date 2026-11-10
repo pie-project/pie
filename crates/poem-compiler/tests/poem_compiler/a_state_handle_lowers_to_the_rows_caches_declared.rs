@@ -143,7 +143,10 @@ fn qwen3_asr(path: &str, _row: &CacheRow) -> String {
 }
 
 fn qwen3_tts(path: &str, _row: &CacheRow) -> String {
-    path.to_string()
+    match parts(path)[..] {
+        [stack, "layers", l, "kv"] => format!("{stack}.kv.{l}"),
+        _ => path.to_string(),
+    }
 }
 
 fn gpt_oss(path: &str, _row: &CacheRow) -> String {
@@ -186,6 +189,9 @@ fn kept_whole(package: &str, name: &str) -> bool {
         // Muse Glimmer's and Muse Spark's sliding layers read their kv
         // through their window.
         ("muse_glimmer" | "muse_spark", ["kv", _]) => true,
+        // Qwen3-TTS's codec prenet attends through a window its row was
+        // never declared with: the handle's row is kept through it.
+        ("qwen3_tts", ["codec", "kv", _]) => true,
         // A DFlash block read through a window.
         ("qwen_3" | "gemma_4", ["kv", "dflash", _]) => true,
         _ => false,
