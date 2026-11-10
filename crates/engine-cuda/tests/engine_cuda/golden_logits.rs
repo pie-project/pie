@@ -1610,3 +1610,86 @@ fn golden_rows() {
         }
     }
 }
+
+/// A prefill of 37 rows, then 300 decodes of fixed tokens on `shell`: the
+/// median and the mean decode fire, in microseconds.
+fn decode_times(shell: &mut Shell, trace: &Trace) -> (u128, u128) {
+    let prompt: Vec<u32> = (0..37u32).map(|t| (t * 7 + 11) % 1000).collect();
+    let _ = fire(shell, trace, &prompt);
+    let mut took: Vec<u128> = (0..300u32)
+        .map(|at| {
+            let start = std::time::Instant::now();
+            let _ = fire(shell, trace, &[(at * 13 + 5) % 1000]);
+            start.elapsed().as_micros()
+        })
+        .collect();
+    took.sort_unstable();
+    (
+        took[took.len() / 2],
+        took.iter().sum::<u128>() / took.len() as u128,
+    )
+}
+
+/// The row cache as a deployment that does not stream its weights holds it:
+/// every block of every row-streamed table named a slot before the first
+/// fire (the runtime's pinned set), so none is read from the host copy; and
+/// what a decode fire takes so, against one reading every row from the
+/// host. Compare with the dense table's on the base engine by hand.
+#[test]
+#[ignore = "a probe run by hand: see the module's doc"]
+fn golden_rows_resident() {
+    use engine::chunk::{ResidentWeight, WeightAtom, WeightResidency};
+    if !engine_cuda::device::present() {
+        eprintln!("skipping: no CUDA device on this machine");
+        return;
+    }
+    let cache = cache_dir();
+    let models = std::env::var("PIE_GOLDEN_MODELS")
+        .map_or_else(|_| vec!["dsv4-flash-mini".to_string()], |_| models());
+    for model in models {
+        let fixture = fixture(&model, &cache);
+        for resident in [false, true, false, true] {
+            let mut shell = load(&fixture, &cache);
+            let facts = shell.chunk_facts().expect("the pool states its chunks");
+            let (_, blocks) = shell.row_blocks();
+            assert!(blocks > 0, "{model} streams no table by its rows");
+            if resident {
+                // Every shape's blocks, each a slot, from the second segment.
+                let mut first = facts.segment_chunks;
+                let mut named = Vec::new();
+                for table in &facts.weights {
+                    named.extend((0..table.count).map(|atom| ResidentWeight {
+                        atom: WeightAtom {
+                            shape: table.id,
+                            atom,
+                        },
+                        slot: first * table.slots_per_chunk + atom,
+                    }));
+                    first += table.count.div_ceil(table.slots_per_chunk);
+                }
+                shell
+                    .commit_segments(first.div_ceil(facts.segment_chunks))
+                    .expect("the tables' segments commit");
+                shell
+                    .weight_residency(&WeightResidency {
+                        staging: Vec::new(),
+                        resident: named,
+                    })
+                    .expect("the blocks are cached");
+                assert_eq!(
+                    shell.row_blocks(),
+                    (blocks, blocks),
+                    "a block of a table held whole is read from the host copy"
+                );
+            } else {
+                assert_eq!(shell.row_blocks().0, 0);
+            }
+            shell.open(0).expect("slot 0 opens");
+            let (median, mean) = decode_times(&mut shell, &fixture.trace);
+            println!(
+                "decode-time {model} {}: median {median} us, mean {mean} us",
+                if resident { "resident" } else { "host" }
+            );
+        }
+    }
+}

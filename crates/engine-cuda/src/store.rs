@@ -2053,6 +2053,17 @@ impl Pools {
         self.stage_row_tables(stream)
     }
 
+    /// The row-streamed tables' blocks named a slot, and all of them.
+    #[must_use]
+    pub fn row_blocks(&self) -> (u64, u64) {
+        self.row_caches.iter().fold((0, 0), |(named, all), cache| {
+            (
+                named + cache.slots.iter().flatten().count() as u64,
+                all + cache.slots.len() as u64,
+            )
+        })
+    }
+
     /// See `Engine::weight_uses`: each block's reads since the last call,
     /// read on `stream` behind the fires that counted them, and zeroed.
     pub fn weight_uses(

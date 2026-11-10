@@ -189,6 +189,13 @@ impl Shell {
         self.pools.weight_residency(self.device.stream(), residency)
     }
 
+    /// The row-streamed tables' blocks named a slot, and all of them: the
+    /// rest a fire reads from the host copy.
+    #[must_use]
+    pub fn row_blocks(&self) -> (u64, u64) {
+        self.pools.row_blocks()
+    }
+
     /// See `Engine::weight_uses`.
     pub fn weight_uses(&mut self) -> crate::Result<engine::chunk::WeightUses> {
         self.pools.weight_uses(self.device.stream())
