@@ -32,6 +32,13 @@ pub enum PlannerError {
         need: u32,
         total: u32,
     },
+    /// Past what a shared pool leaves for kv and state once the weights,
+    /// the activation and the reserved chunks are set aside: no eviction
+    /// makes the room, so it fails up front and says how the pool divides.
+    PastPool {
+        need: u32,
+        room: crate::store::shared::PoolRoom,
+    },
     Hog {
         need: u32,
         held: u32,
@@ -69,6 +76,11 @@ impl std::fmt::Display for PlannerError {
             PlannerError::Impossible { need, total } => write!(
                 f,
                 "allocation of {need} units can never fit (pool total {total})"
+            ),
+            PlannerError::PastPool { need, room } => write!(
+                f,
+                "allocation of {need} kv pages can never fit: {}",
+                room.describe(*need)
             ),
             PlannerError::Hog { need, held, total } => write!(
                 f,

@@ -27,6 +27,9 @@ struct KeptPool {
     /// A shared pool's state shapes: `(free, total)` of them, and the kv
     /// pages whose chunks hold one unit of state (`rs_as_pages`).
     shared_state: Option<((RsUnits, RsUnits), u32)>,
+    /// A shared pool's division: weights and activation hold all but
+    /// `room.list_slots` pages for good.
+    room: Option<crate::store::shared::PoolRoom>,
 }
 
 impl KeptPool {
@@ -37,7 +40,14 @@ impl KeptPool {
             total: free + kept,
             model,
             shared_state: None,
+            room: None,
         }
+    }
+
+    /// A shared pool whose weights and activation leave `room` for kv.
+    fn dividing(mut self, room: crate::store::shared::PoolRoom) -> Self {
+        self.room = Some(room);
+        self
     }
 
     /// State drawn from the kv pages' chunks: `stats` of it, each unit
@@ -63,12 +73,18 @@ impl KeptPool {
 impl PoolPort for KeptPool {
     fn chunk_stats(&self) -> ChunkStats {
         ChunkStats {
-            pages: (self.free.lock().len() as u32, self.total),
+            pages: self.device_stats(),
             rs: self.rs_stats(),
         }
     }
     fn device_stats(&self) -> (u32, u32) {
-        (self.free.lock().len() as u32, self.total)
+        let total = self
+            .room
+            .map_or(self.total, |room| self.total.min(room.list_slots));
+        (self.free.lock().len() as u32, total)
+    }
+    fn room(&self) -> Option<crate::store::shared::PoolRoom> {
+        self.room
     }
     fn host_stats(&self) -> (u32, u32) {
         (0, 0)
@@ -527,5 +543,70 @@ fn a_host_short_of_room_spills_its_cache_to_disk_before_the_device_demotes() {
         asked((8, 80), (0, 64)),
         [],
         "nothing goes where neither tier has room"
+    );
+}
+
+/// IT round 9: weights held resident and the activation left one chunk of a
+/// shared pool for kv, and a session's prompt needed two. The list shape's
+/// capacity counted the weights' chunks as kv, so the ask parked, found no
+/// one to move (the pool was empty) and failed as a starved pool with "no
+/// evictable victim". It fails up front, saying how the pool divides.
+#[test]
+fn an_ask_past_what_weights_and_activation_leave_fails_saying_so() {
+    let _schedule = crate::policy::schedule::TEST_LOCK.blocking_read();
+    const MIB: u64 = 1 << 20;
+    // 67 chunks of 18 MiB: 40 of pinned weights, 25 of activation, the
+    // null chunk; one chunk (144 pages of 16 tokens) left.
+    let room = crate::store::shared::PoolRoom {
+        chunk_bytes: 18 * MIB,
+        total_chunks: 67,
+        reserved_chunks: 1,
+        act_chunks: 25,
+        weight_chunks: 40,
+        state_chunks: 1,
+        list_slots: 144,
+        list_tokens: 16,
+    };
+    // The list shape's capacity: every chunk but the null one and the
+    // activation, the weights' included.
+    let pool = Arc::new(KeptPool::new(144, 41 * 144 - 144, usize::MAX).dividing(room));
+    let planner = Arc::new(ResidencyPlanner::new(pool.clone() as Arc<dyn PoolPort>));
+    let head = ProcessId::new_v4();
+    planner.register(head);
+    planner.note_admitted(head);
+    let demand = Demand {
+        kv_pages: 188,
+        rs: RsUnits::default(),
+    };
+    let acquired = planner
+        .acquire(head, head, demand)
+        .now_or_never()
+        .expect("refused at once, not parked");
+    let Err(error) = acquired else {
+        panic!("an ask past the pool is refused");
+    };
+    assert_eq!(error, PlannerError::PastPool { need: 188, room });
+    let said = error.to_string();
+    for part in [
+        "188 kv pages (3008 tokens)",
+        "weights pinned on it take 720 MiB",
+        "activation 450 MiB",
+        "leaves 18 MiB (144 kv pages, 2304 tokens)",
+        "raise device_kv_budget by at least 18 MiB",
+    ] {
+        assert!(said.contains(part), "{part:?} missing from {said:?}");
+    }
+    assert_eq!(planner.diagnostics().queue.len(), 0, "nothing parked");
+    assert_eq!(planner.diagnostics().starvations_total, 0);
+
+    // What fits the room still waits for it as before.
+    let fits = Demand {
+        kv_pages: 100,
+        rs: RsUnits::default(),
+    };
+    let acquired = planner.acquire(head, head, fits).now_or_never();
+    assert!(
+        matches!(acquired, Some(Ok(Acquired::Granted(_)))),
+        "served from the room"
     );
 }

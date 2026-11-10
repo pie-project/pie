@@ -77,6 +77,12 @@ pub trait PoolPort: Send + Sync + 'static {
         let _ = rs;
         0
     }
+    /// How a shared pool's chunks divide for good: what the weights, the
+    /// activation and the reserved chunks hold, and what is left for kv and
+    /// state. `None` where the kv pages are a pool of their own.
+    fn room(&self) -> Option<crate::store::shared::PoolRoom> {
+        None
+    }
     /// The working sets reading pages past the pool's limit.
     fn working_sets_past_limit(&self) -> HashSet<crate::store::kv::page_table::WorkingSetId> {
         HashSet::new()
@@ -172,17 +178,29 @@ impl RegistryPool {
 impl PoolPort for RegistryPool {
     fn chunk_stats(&self) -> ChunkStats {
         ChunkStats {
-            pages: self.with_kv_tagged("planner-device-stats", |kv| {
-                (kv.available_pages() as u32, kv.capacity_pages())
-            }),
+            pages: self.device_stats(),
             rs: self.with_rs(|rs| (rs.free(), rs.capacity())),
         }
     }
 
+    /// On a shared pool the kv pages' total is what is left once the
+    /// weights' pinned chunks, the activation and the reserved chunks are
+    /// set aside: the list shape's own capacity counts every state chunk,
+    /// those the weights hold for good included.
     fn device_stats(&self) -> (u32, u32) {
-        self.with_kv_tagged("planner-device-stats", |kv| {
+        let (free, capacity) = self.with_kv_tagged("planner-device-stats", |kv| {
             (kv.available_pages() as u32, kv.capacity_pages())
-        })
+        });
+        let total = self
+            .room()
+            .map_or(capacity, |room| capacity.min(room.list_slots));
+        (free, total)
+    }
+
+    fn room(&self) -> Option<crate::store::shared::PoolRoom> {
+        let stores = crate::store::registry::try_get(self.model, self.engine)?;
+        let room = stores.shared.as_ref()?.lock().unwrap().room();
+        (room.list_tokens > 0).then_some(room)
     }
 
     fn device_out(&self) -> u32 {
