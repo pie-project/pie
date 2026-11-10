@@ -121,6 +121,11 @@ impl Recorder {
         self.refused.is_none()
     }
 
+    /// The fires recorded and the fires replayed since this recorder began.
+    pub(crate) fn counts(&self) -> (u64, u64) {
+        (self.recorded.get(), self.replayed.get())
+    }
+
     pub(crate) fn has_room(&self) -> bool {
         self.refused.is_none()
     }

@@ -14,7 +14,9 @@ use engine::chunk::{ResidentWeight, WeightAtom, WeightKind, WeightResidency, Wei
 
 use poem::Dtype;
 
-use crate::model_logits::{CONTEXT, Fixture, fixture, fixture_weighed, load, same, serve_seats};
+use crate::model_logits::{
+    CONTEXT, Fixture, PAGE, fixture, fixture_weighed, load, load_with, same, serve_seats,
+};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Held {
@@ -192,6 +194,7 @@ fn every_residency_of(model: &str, fixture: &Fixture) {
         eprintln!("{model}: {what} resident against all: most |d| {most}, argmax flips {flips}");
         same(&format!("{model}: {what} resident against all"), got, &all);
     }
+    a_held_load_seats_its_weights(model, fixture, &all);
 }
 
 /// Qwen3's MoE: dense bf16 routed banks, gate/up and down an atom.
@@ -289,4 +292,109 @@ fn affine_u4_routed_experts_beside_dense_layers_serve_the_same_logits_whatever_i
 #[ignore = "qwen36-35b-a3b-mini does not serve on this backend"]
 fn affine_u4_routed_experts_of_a_hybrid_serve_the_same_logits_whatever_is_resident() {
     every_residency_quantized("qwen36-35b-a3b-mini", &[Dtype::U4g64]);
+}
+
+/// The pages of `file` this process's mappings of it hold resident, in
+/// KiB (`/proc/self/smaps`).
+pub fn mapped_kib(file: &std::path::Path) -> u64 {
+    let Ok(smaps) = std::fs::read_to_string("/proc/self/smaps") else {
+        return 0;
+    };
+    let name = file.to_string_lossy();
+    let mut ours = false;
+    let mut kib = 0u64;
+    for line in smaps.lines() {
+        let mut words = line.split_whitespace();
+        let first = words.next().unwrap_or("");
+        if first.contains('-') && first.chars().all(|c| c.is_ascii_hexdigit() || c == '-') {
+            ours = line.ends_with(name.as_ref());
+        } else if ours && first == "Rss:" {
+            kib += words.next().and_then(|n| n.parse::<u64>().ok()).unwrap_or(0);
+        }
+    }
+    kib
+}
+
+/// A load told its weights are held (`Residency::weights_held`) seats every
+/// atom of every weight shape in pool slots itself, filled from the serving
+/// file's mapping, states where (`WeightShape::seated`), and serves from
+/// them before any residency: the logits of a residency naming every atom
+/// (`all`). A runtime adopting the seating (a held residency naming exactly
+/// those slots) fills nothing and keeps what was recorded.
+pub fn a_held_load_seats_its_weights(model: &str, fixture: &Fixture, all: &[Vec<f32>]) {
+    let Some(mut shell) = load_with(
+        fixture,
+        PAGE,
+        CONTEXT,
+        None,
+        engine::load::Residency {
+            weights_held: true,
+            ..engine::load::Residency::default()
+        },
+    ) else {
+        return;
+    };
+    let loaded = mapped_kib(&fixture.container);
+    let facts = shell.pool_chunk_facts();
+    facts.validate().expect("the facts hang together");
+    let mut resident = Vec::new();
+    let mut bytes = 0u64;
+    for shape in &facts.weights {
+        let first = shape
+            .seated
+            .unwrap_or_else(|| panic!("{model}: weight shape {} is seated", shape.id));
+        let per = shape.slots_per_chunk.max(1);
+        let last = (first + shape.count - 1) / per;
+        assert!(
+            last < facts.segments.committed * facts.segment_chunks,
+            "{model}: shape {}'s chunks {}..={last} lie in committed segments",
+            shape.id,
+            first / per
+        );
+        bytes += shape.all_bytes();
+        resident.extend((0..shape.count).map(|atom| ResidentWeight {
+            atom: WeightAtom {
+                shape: shape.id,
+                atom,
+            },
+            slot: first + atom,
+        }));
+    }
+    let file = std::fs::metadata(&fixture.container).map_or(0, |m| m.len());
+    eprintln!(
+        "{model}: a held load seated {} weight shapes, {} MiB; of the {} MiB serving file, {} \
+         MiB of its mappings resident after the load",
+        facts.weights.len(),
+        bytes >> 20,
+        file >> 20,
+        loaded >> 10
+    );
+    let early = serve_seats(&mut shell, &fixture.trace, 12);
+    same(&format!("{model}: seated by the load against all"), &early, all);
+    let uses = shell.weight_uses().expect("the uses read");
+    assert!(
+        uses.held.iter().all(|h| h.host == 0),
+        "{model}: every atom resident: {:?}",
+        uses.held
+    );
+    // The runtime adopts the seating: the first residency names those
+    // slots, held.
+    shell
+        .weight_residency(&WeightResidency {
+            staging: Vec::new(),
+            resident,
+            held: true,
+        })
+        .expect("the residency lands");
+    let adopted = serve_seats(&mut shell, &fixture.trace, 12);
+    same(&format!("{model}: adopted against all"), &adopted, all);
+    // The seating stands: the facts no longer state it, the runtime's own.
+    assert!(
+        shell.pool_chunk_facts().weights.iter().all(|w| w.seated.is_none()),
+        "{model}: the runtime's residency stands in the load's seating's place"
+    );
+    eprintln!(
+        "{model}: {} MiB of the serving file's mappings resident after serving",
+        mapped_kib(&fixture.container) >> 10
+    );
 }

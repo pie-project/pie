@@ -70,6 +70,16 @@ impl Mapping {
         self.map.len()
     }
 
+    /// Lets go of the mapping's resident pages: what was copied out of the
+    /// artifact (into pool slots) is read again only to fill a slot or stage
+    /// a miss, from the page cache, so a load whose weights lie in the pool
+    /// keeps no host copy of them resident.
+    pub fn release(&self) {
+        // SAFETY: a read-only private file mapping; dropping its pages makes
+        // the next read fault them back in from the file, unchanged.
+        let _ = unsafe { self.map.unchecked_advise(memmap2::UncheckedAdvice::DontNeed) };
+    }
+
     #[must_use]
     pub fn is_empty(&self) -> bool {
         self.map.is_empty()

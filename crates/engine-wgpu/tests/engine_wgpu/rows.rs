@@ -122,6 +122,7 @@ fn every_residency(model: &str, layers: Option<u32>) {
     );
     same(&format!("{model}: none resident against all"), &none, &all);
     same(&format!("{model}: half resident against all"), &half, &all);
+    crate::experts::a_held_load_seats_its_weights(model, &fixture(model, layers), &all);
     if let Some(dir) = std::env::var_os("PIE_WGPU_BASE") {
         let path = std::path::Path::new(&dir).join(format!("seats-{model}.bin"));
         let Ok(bytes) = std::fs::read(&path) else {
