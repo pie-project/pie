@@ -664,13 +664,11 @@ impl PreparedLoad<'_> {
             let seated = paging_at(1, boot.slots)?;
             let bytes = [rows.list_bytes, rows.fixed_bytes];
             let chunk = rows.chunk_bytes;
-            let window_chunks = if rows.ring_bytes > 0 {
+            let window_chunks = chunk.checked_div(rows.ring_bytes).map_or(0, |per| {
                 seated
                     .pages_per_slot
-                    .div_ceil(u32::try_from(chunk / rows.ring_bytes).unwrap_or(1).max(1))
-            } else {
-                0
-            };
+                    .div_ceil(u32::try_from(per).unwrap_or(1).max(1))
+            });
             let least = Layout::least_chunks(chunk, bytes, rows.pieces, seated.pages_per_slot)
                 + window_chunks;
             // The compressor side planes hold a cell a token of every list
