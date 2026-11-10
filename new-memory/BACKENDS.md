@@ -10,12 +10,12 @@ Legend: ✅ verified on hardware · 🟡 in progress / compile-only · 🔴 not 
 |---|---|---|---|---|---|---|---|
 | Real ChunkFacts, slot-ref lanes, fixed pieces | ✅ M34 | ✅ M43 (MI300X) | ✅ M30 · 🔴 dsv4 window by slot ref (BM5a) | ✅ M48 | ✅ M48 | 🟡 XLA | 🟡 M43 host pool (no HW) |
 | Grow / shrink (segments, evacuation) | ✅ M34 | — flat by spec | ✅ M30 | ✅ M48 | ✅ M48 | — fixed at load | 🟡 M43 (host segments) |
-| rs list + slot_copies | ✅ M34 | ✅ golden_buffered (MI300X) | ✅ M37 | 🟡 VK | 🟡 VK | 🟡 XLA | 🟡 M43 (host sim) |
+| rs list + slot_copies | ✅ M34 | ✅ golden_buffered (MI300X) | ✅ M37 | ✅ VK2 (rs tail fork, engine) | ✅ VK2 (rs tail fork, engine) | 🟡 XLA | 🟡 M43 (host sim) |
 | Window lists (own T_w, trimmed) | 🟡 one list, T_w=page (L40S: tables per list) | ✅ goldens (one list) | 🟡 one list (BM) | ✅ up to 4 lists, own T_w (VK2) | ✅ up to 4 lists, own T_w (VK2) | 🟡 XLA | 🟡 one list, T_w=page |
-| Multi-piece records end to end | ✅ engine (L40S) · 🟡 runtime boot (IT r5) | ✅ records in pieces (chunk goldens); rows cut across pieces kernel-tested | 🔴 on device (BM) | 🟡 VK | 🟡 VK | 🟡 XLA | 🟡 host sim |
+| Multi-piece records end to end | ✅ engine (L40S) · 🟡 runtime boot (IT r5) | ✅ records in pieces (chunk goldens); rows cut across pieces kernel-tested | 🔴 on device (BM) | ✅ M48 (4 pieces bitwise) | ✅ M48 (4 pieces bitwise) | 🟡 XLA | 🟡 host sim |
 | Weight streaming: PLE rows | ✅ M35/M36/M41 | ✅ M43 golden_rows | 🔴 BM | 🔴 VK | 🔴 VK | 🟡 XLA | — weights on host |
 | Weight streaming: experts | 🟡 dense bf16 M40; quantized next | ✅ dense M47; quantized after CUDA | 🔴 BM | 🔴 VK | 🔴 VK | 🟡 XLA | — weights on host |
-| Host/disk tiers of shared shapes (copy_slots) | ✅ engine probe M43 · 🟡 e2e | ✅ golden_offload 8/8 (MI300X) | 🟡 M43 compile (BM) | 🔴 VK | 🔴 VK | 🔴 XLA | 🟡 CB (host sim) |
+| Host/disk tiers of shared shapes (copy_slots) | ✅ engine probe M43 · 🟡 e2e | ✅ golden_offload 8/8 (MI300X) | 🟡 M43 compile (BM) | ✅ VK2 offload (dense, hybrid, window) | ✅ VK2 offload (dense, hybrid, window) | 🔴 XLA | 🟡 CB (host sim) |
 | K2 (no kv spaces) | ✅ M39 | ✅ | ✅ M42 | compile | compile | compile | compile |
 
 Cerebras realization (CB, `sc/cb-chunk-pool`): the column is the host-traced `Cerebras` engine. State lives in
@@ -46,7 +46,13 @@ Vulkan / wgpu (VK2, `sc/vk2`): window lists are lists of their own (up to four, 
 its own page table; trimmed slots ref 0 = the null chunk), verified bitwise trimmed vs untrimmed with scattered and
 evacuated slots on gemma4-e4b-mini-l1 / -l6 and a two-window variant. Snapshots per piece (contract 16): not served
 on either engine and never sent to them: both state `rs_snapshots = 0`, so the runtime cuts a pass at each
-checkpoint (state lands at fire ends) and `Lane::validate_for` refuses snapshot lanes.
+checkpoint (state lands at fire ends) and `Lane::validate_for` refuses snapshot lanes. On-device tests (`tests/*/tiers.rs`,
+both engines): a lane parked on the host and back at decode 2 and its kv list through the slot file at decode 6 lands
+the never-parked logits bit for bit (qwen3-micro-text, qwen35-tiny, gemma4-e4b-mini-l6 with a trimmed window list);
+contract 15 (a group `[run, cow]`, the folding lane writing the copy, the buffering lane reading the run, the run
+untouched) = two ungrouped lanes bit for bit; a fork's rs-list and window-list tail slot copied by `slot_copies`
+lands its parent's row bit for bit. Each has a negative control that fails (restore skipped, cow unfilled, tail
+not copied).
 
 Pre-existing parity gaps (not memory, but in scope for parity): ROCm synth codegen, ROCm graph replay with >= 2 MoE layers (AMD d); (concat_cols, FP8 m33 fixed M43);
 sm_100 tcgen05 W4A16 arms read no expert table; Metal MLA prefill unsupported.

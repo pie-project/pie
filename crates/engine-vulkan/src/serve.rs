@@ -1484,16 +1484,12 @@ impl Shell {
         self.rs_layout.is_some()
     }
 
-    /// The state rows of the record slot ref `slot` names (a seat's, where
-    /// `seated`), read on the host.
-    pub fn state_bytes(&mut self, slot: u32, seated: bool) -> Result<Vec<u8>> {
+    /// The state rows of the record `record` names (fixed slot refs, a
+    /// piece each), read on the host once every frame has landed.
+    pub fn state_bytes(&mut self, record: &[u32]) -> Result<Vec<u8>> {
         self.drain()?;
-        let unit = if seated {
-            self.pools.record(None, slot)?
-        } else {
-            self.pools.record(Some(&[slot]), slot)?
-        };
-        self.pools.read_record(&unit)
+        let units = self.pools.record(Some(record), 0)?;
+        self.pools.read_record(&units)
     }
 
     pub fn rows_of(&mut self, landed: &Landed) -> Result<Vec<Vec<f32>>> {
