@@ -4,6 +4,7 @@ use poem_ir::{
 
 use std::collections::BTreeMap;
 
+use super::census::TokenRow;
 use super::*;
 use crate::{Budget, Budgets, DeviceProfile};
 
@@ -367,4 +368,85 @@ fn a_packed_kv_row_takes_its_stored_bytes_a_token() {
         let census = census::census(&trace(vec![row]), false).unwrap();
         assert_eq!(census.tokens[0].per_token(), want);
     }
+}
+
+/// An rs row of `layer` of `per_token` bytes, in one plane.
+fn rs_row(id: u32, layer: u32, per_token: u64) -> TokenRow {
+    TokenRow {
+        id: RowId::Rs(id),
+        layer: Some(layer),
+        planes: vec![per_token],
+        window: None,
+        ratio: 1,
+        shard: Shard::Replicated,
+    }
+}
+
+fn rs_shapes(rows: &[TokenRow], align: u64) -> Vec<RsShape> {
+    [1, 2, 4, 8, 16]
+        .into_iter()
+        .map(|tokens| RsShape::of(rows, tokens, align))
+        .collect()
+}
+
+#[test]
+fn an_rs_slot_takes_more_tokens_only_where_they_fill_better() {
+    // 18 layers of 12 KiB a token in a chunk every size up to the expected
+    // unfolded tokens fills alike: a token a slot.
+    let small: Vec<TokenRow> = (0..18).map(|l| rs_row(l, l, 12 << 10)).collect();
+    let pick = pick_rs(&rs_shapes(&small, 256), 18 * (864 << 10)).unwrap();
+    assert_eq!(pick.tokens, 1);
+    // Rows of a few bytes a token: a token a slot would pad each to the
+    // alignment.
+    let ids = [rs_row(0, 0, 64), rs_row(1, 1, 64)];
+    let pick = pick_rs(&rs_shapes(&ids, 256), 16 << 20).unwrap();
+    assert_eq!((pick.tokens, pick.bytes), (EXPECTED_UNFOLDED, 512));
+    // 6.8 MB a token of every row: a slot of one token, where the chunk
+    // holds no two.
+    let large: Vec<TokenRow> = (0..60).map(|l| rs_row(l, l, 113 << 10)).collect();
+    let shapes = rs_shapes(&large, 256);
+    let pick = pick_rs(&shapes, 3 * shapes[0].bytes / 2).unwrap();
+    assert_eq!(pick.tokens, 1);
+    // Past every chunk: none.
+    assert!(pick_rs(&shapes, shapes[0].bytes - 1).is_none());
+}
+
+#[test]
+fn an_rs_slot_lays_its_rows_layer_major_and_a_token_lands_by_its_page() {
+    let rows = vec![rs_row(1, 3, 1000), rs_row(0, 1, 600)];
+    let runs = rs_runs(&rows, 4, 256);
+    assert_eq!(
+        runs.iter().map(|r| (r.row, r.offset)).collect::<Vec<_>>(),
+        vec![(RowId::Rs(0), 0), (RowId::Rs(1), 2560)]
+    );
+    let layout = RsLayout {
+        tokens: 4,
+        bytes: RsShape::of(&rows, 4, 256).bytes,
+        runs,
+        rows: [(
+            RowId::Rs(1),
+            RsRow {
+                state: None,
+                planes: vec![
+                    RsPlane {
+                        value: ValueId(0),
+                        bytes: 400,
+                    },
+                    RsPlane {
+                        value: ValueId(1),
+                        bytes: 600,
+                    },
+                ],
+            },
+        )]
+        .into(),
+    };
+    assert_eq!(layout.bytes, 2560 + 4096);
+    // Token 13 of a table from 8: page 1, token 1; plane 1 past 4 tokens of
+    // plane 0.
+    assert_eq!(
+        layout.at(RowId::Rs(1), 1, 13, 8),
+        Some((1, 2560 + 4 * 400 + 600))
+    );
+    assert_eq!(layout.at(RowId::Rs(1), 0, 7, 8), None);
 }
