@@ -157,10 +157,9 @@ struct RowSkeleton {
             // the paged cache row this row's page and slot name
             dst_row[k] = start_of(planes.out[k], of, part, width, true);
             if (store[k].page != nullptr) {
-                const long long cell = live ? store_cell(store[k], of) : -1;
+                const long long cell = live ? store_row(store[k], of, planes.out[k].row_stride) : -1;
                 lands[k] = cell >= 0;
-                dst_row[k] = (lands[k] ? cell : 0) * planes.out[k].row_stride +
-                             static_cast<long long>(part) * width;
+                dst_row[k] = (lands[k] ? cell : 0) + static_cast<long long>(part) * width;
             }
         }
         if (!live) return;

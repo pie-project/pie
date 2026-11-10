@@ -503,6 +503,7 @@ impl Run<'_> {
         let paging = pool.as_ref().map(|pool| linear::skeleton::Paging {
             valid: pool.row_valid.ptr,
             page_size: u32::try_from(pool.page_size).unwrap_or(0),
+            page_stride: pool.page_stride,
         });
         Ok((planes, landed, paging))
     }

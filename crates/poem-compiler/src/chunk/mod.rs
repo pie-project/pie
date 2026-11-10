@@ -699,24 +699,32 @@ pub fn plan(
 
     // The kv list: every full-retention row, of every space, `T` tokens a
     // slot (the kv page size).
-    let full: Vec<&TokenRow> = census
-        .tokens
-        .iter()
-        .filter(|r| r.window.is_none())
-        .collect();
+    // A window that holds a whole working set is none.
+    let mut token_rows = census.tokens;
+    for row in &mut token_rows {
+        if row
+            .window
+            .is_some_and(|w| device.full_from.is_some_and(|full| w >= full))
+        {
+            row.window = None;
+        }
+    }
+    let full: Vec<&TokenRow> = token_rows.iter().filter(|r| r.window.is_none()).collect();
     let mut windows: BTreeMap<u32, Vec<&TokenRow>> = BTreeMap::new();
-    for row in &census.tokens {
+    for row in &token_rows {
         if let Some(window) = row.window {
             windows.entry(window).or_default().push(row);
         }
     }
-    let base = census
-        .tokens
+    let base = token_rows
         .iter()
         .fold(TOKEN_GRAIN, |base, r| census::lcm(base, r.ratio));
     // The kv page; with no kv list, the page every window list's rows would
     // run [`MIN_RUN`] at, the most tokens a window slot is weighed at.
-    let page = if full.is_empty() {
+    // A backend's own page is taken as it is stated.
+    let page = if let Some(stated) = device.token_slot.filter(|&tokens| tokens > 0) {
+        stated
+    } else if full.is_empty() {
         page_tokens(
             windows.values().map(Vec::as_slice),
             base,
@@ -753,7 +761,13 @@ pub fn plan(
             let grain = rows
                 .iter()
                 .fold(TOKEN_GRAIN, |base, r| census::lcm(base, r.ratio));
-            core::iter::successors(Some(grain.min(page)), |t| t.checked_mul(2))
+            // A backend that states its page pages its windowed rows by it.
+            let least = if device.token_slot.is_some() {
+                page
+            } else {
+                grain.min(page)
+            };
+            core::iter::successors(Some(least), |t| t.checked_mul(2))
                 .take_while(|&t| t <= page)
                 .chain(core::iter::once(page))
                 .filter(|t| t % grain == 0 || *t == page)
@@ -771,7 +785,7 @@ pub fn plan(
                 .collect()
         })
         .collect();
-    for row in census.tokens.iter().chain(&census.rs_rows) {
+    for row in token_rows.iter().chain(&census.rs_rows) {
         shards.insert(row.id, row.shard.clone());
     }
 

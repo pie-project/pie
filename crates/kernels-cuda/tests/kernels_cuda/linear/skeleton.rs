@@ -888,8 +888,16 @@ fn a_paged_epilogue_lands_k_and_v_in_their_caches_rows() {
         assert_eq!(a.verify(), Ok(()));
         let stored = [Dtype::I32; 3];
         let epi = Epilogue::interned_stored(&a, &stored).expect("the skeletons take it");
-        for (rows, through) in [(5usize, false), (64, false), (5, true), (100, true)] {
-            let what = format!("{dtype:?}, {rows} rows through the tuner {through}");
+        // `gap` rows of other planes lie between two pages' rows.
+        for (rows, through, gap) in [
+            (5usize, false, 0u32),
+            (64, false, 0),
+            (5, true, 0),
+            (100, true, 0),
+            (64, false, 3),
+            (100, true, 3),
+        ] {
+            let what = format!("{dtype:?}, {rows} rows through the tuner {through}, gap {gap}");
             let mut gpu = Gpu::open();
             let mut lcg = Lcg::seeded(rows as u64 + 11);
             let ((wr, wv), (ar, av)) = (lcg.row(n * k), lcg.row(rows * k));
@@ -910,7 +918,12 @@ fn a_paged_epilogue_lands_k_and_v_in_their_caches_rows() {
                 CacheDtype::Bf16 => 2,
                 CacheDtype::E4m3 { .. } => 1,
             };
-            let pages_cells = (cells.div_ceil(page_size) * page_size) as usize;
+            let pages_cells = (cells.div_ceil(page_size) * (page_size + gap)) as usize;
+            let stride = if gap == 0 {
+                0
+            } else {
+                u64::from(page_size + gap) * (kv * bytes) as u64
+            };
             let (qo, keys, values) = (
                 gpu.zeros(rows * q * 2),
                 gpu.zeros(pages_cells * kv * bytes),
@@ -920,6 +933,7 @@ fn a_paged_epilogue_lands_k_and_v_in_their_caches_rows() {
             let paging = Some(Paging {
                 valid: va,
                 page_size,
+                page_stride: [stride, stride],
             });
             let ctx = gpu.ctx();
             let element = match dtype {
@@ -977,7 +991,14 @@ fn a_paged_epilogue_lands_k_and_v_in_their_caches_rows() {
                 TURNED,
             );
             for (r, plane) in [(1usize, keys), (2, values)] {
-                let at = paged_rows(&a, r, &given, page_size).expect("paged");
+                let at: Vec<Option<u64>> = paged_rows(&a, r, &given, page_size)
+                    .expect("paged")
+                    .into_iter()
+                    .map(|cell| {
+                        let size = u64::from(page_size);
+                        cell.map(|cell| cell / size * (size + u64::from(gap)) + cell % size)
+                    })
+                    .collect();
                 let landed: Vec<f32> = match dtype {
                     CacheDtype::Bf16 => gpu
                         .down::<u16>(plane, pages_cells * kv)

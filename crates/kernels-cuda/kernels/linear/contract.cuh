@@ -135,12 +135,11 @@ struct TileHook {
     template <int K>
     __device__ __forceinline__ void flush() {
         const Store& s = epi.store[K];
-        long long base = row;
+        long long base = static_cast<long long>(row) * epi.ld[K];
         if (s.page != nullptr) {
-            base = store_cell(s, row);
+            base = store_row(s, row, epi.ld[K]);
             if (base < 0) return;
         }
-        base *= epi.ld[K];
         if constexpr (kN % 8 == 0) {
 #pragma unroll
             for (int v = 0; v < kN / 8; ++v) {

@@ -38,9 +38,36 @@ pub struct ChunkProfile {
     /// Whether the backend keeps every state row in f32 whatever the trace
     /// declares (integer rows apart): Metal's recurrent kernels do.
     pub state_f32: bool,
+    /// The tokens a list or ring slot holds, where the backend's kernels page
+    /// their rows by a count of their own; `None` lets the plan choose
+    /// ([`super::MIN_RUN`]).
+    pub token_slot: Option<u32>,
+    /// Whether a window ring smaller than a piece folds into the fixed
+    /// record; a backend that pages every windowed row keeps it a ring.
+    pub fold_rings: bool,
+    /// Whether every windowed row shares one ring, of the widest window: a
+    /// backend that pages its windowed rows by one table. Else a ring a
+    /// window.
+    pub one_ring: bool,
+    /// The context a working set is held to, where the backend knows it: a
+    /// window at least this wide keeps every token, so its rows are list
+    /// rows.
+    pub full_from: Option<u32>,
 }
 
 impl ChunkProfile {
+    /// The profile of a backend whose kernels page windowed and full rows
+    /// alike: token slots of its page's `tokens`, the windowed rows one ring
+    /// that never folds, and a window of `context` tokens or more no window.
+    #[must_use]
+    pub const fn paged(mut self, tokens: u32, context: u32) -> ChunkProfile {
+        self.token_slot = Some(tokens);
+        self.fold_rings = false;
+        self.one_ring = true;
+        self.full_from = Some(context);
+        self
+    }
+
     /// A server CUDA card: 16 MiB chunks out of 1 GiB VMM segments, a
     /// hundred-odd working sets at 32k tokens.
     pub const SERVER_CUDA: ChunkProfile = ChunkProfile {
@@ -54,6 +81,10 @@ impl ChunkProfile {
         context: 32 * 1024,
         cut_experts: false,
         state_f32: false,
+        token_slot: None,
+        fold_rings: true,
+        one_ring: false,
+        full_from: None,
     };
 
     /// An on-device Metal GPU: chunks of a couple of MiB out of 64 MiB
@@ -69,6 +100,10 @@ impl ChunkProfile {
         context: 8 * 1024,
         cut_experts: true,
         state_f32: true,
+        token_slot: None,
+        fold_rings: true,
+        one_ring: false,
+        full_from: None,
     };
 
     /// A TPU pool fixed at load, realized as `[chunks, rows, 128]` u32 tiles.
@@ -83,6 +118,10 @@ impl ChunkProfile {
         context: 32 * 1024,
         cut_experts: false,
         state_f32: false,
+        token_slot: None,
+        fold_rings: true,
+        one_ring: false,
+        full_from: None,
     };
 
     /// What every row offset and slot size aligns to.

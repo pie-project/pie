@@ -1334,6 +1334,14 @@ impl FrameShell for Shell {
         let pages = geometries
             .first()
             .map_or(0, |geometry| geometry.indices.len() as u32);
+        // The tables as the kernels read them: each page by the id of the
+        // slot it is seated on in the state pool.
+        let mut device_geometries = geometries.clone();
+        for (space, geometry) in device_geometries.iter_mut().enumerate() {
+            let windowed = self.pools.windowed_space(space as u32);
+            self.pools.page_ids(windowed, &mut geometry.indices)?;
+            self.pools.page_ids(windowed, &mut geometry.write_page)?;
+        }
 
         super::btrace::mark("admit");
         let bucket = self
@@ -1396,7 +1404,7 @@ impl FrameShell for Shell {
                     crate::window::Copies {
                         bucket,
                         enabled: copies_here,
-                        spaces: &geometries,
+                        spaces: &device_geometries,
                     },
                     self.inputs.window_slots(),
                 )?;
@@ -1517,7 +1525,7 @@ impl FrameShell for Shell {
             if any_adapter {
                 adapter_routes.resize(carve_rows as usize, -1);
             }
-            for geometry in &mut geometries {
+            for geometry in geometries.iter_mut().chain(&mut device_geometries) {
                 geometry.write_page.resize(carve_rows as usize, -1);
                 geometry.write_offset.resize(carve_rows as usize, -1);
             }
@@ -1528,7 +1536,7 @@ impl FrameShell for Shell {
         if bodied {
             let capacity = crate::window::lane_capacity(max_lanes);
             lane_carve = lane_carve.max(capacity);
-            for geometry in &mut geometries {
+            for geometry in geometries.iter_mut().chain(&mut device_geometries) {
                 geometry.pad_to(capacity as usize);
             }
             qo_absolute = windows.qo_absolute_host().to_vec();
@@ -1558,7 +1566,7 @@ impl FrameShell for Shell {
                 qo_absolute: &qo_absolute,
                 live: if bodied { windows.live() } else { &[] },
                 slot_ids: &slot_ids,
-                spaces: &geometries,
+                spaces: &device_geometries,
                 mask: staged.as_ref(),
                 adapter_routes: any_adapter.then_some(adapter_routes.as_slice()),
                 live_rows: rows,
