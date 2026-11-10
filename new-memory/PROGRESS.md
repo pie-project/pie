@@ -890,3 +890,13 @@ The `new-memory/` directory is bookkeeping and is removed before anything lands 
   token change. Untested: sm_90 wgmma arms, real MXFP4 models (gpt-oss), budgets, speed. NVFP4 / affine / FP8 /
   W4A8 / biased selects remain.
 - Merge fix: `Run::bank_table` built only with `cuda`; ungated (featureless build).
+
+### M68 — 2026-11-10: Vulkan/wgpu quantized MoE e2e, held weights, recordable PLE misses (VK4)
+- `sc/vk4` (bf6130a45, 75259a509, 4d4c3cbfb): quantized MoE minis serve end to end through the weight cache on both
+  engines via the M64 fixture writer: qwen3-30b-a3b (u4 g64, u2 g32/64/128, MXFP4), gptoss-20b (MXFP4 + bias),
+  glm45-air (u4), qwen36-35b-a3b (u4, Vulkan) — cached+held = base (old expert tier) bitwise; none/half = held.
+  Writer fix: affine scale layout used group 64 regardless of the stated group (u2 g32 overran, g128 doubled).
+- Held weights: load seats every atom from the serving mapping, states `seated`, records once; mapping pages released
+  (0 MiB resident vs 756 MiB without). Runtime e2e adoption not run on Vulkan.
+- Vulkan PLE fires with misses record (ring of stages per arm); throughput too noisy on the shared GPU to show gain.
+- Merge fix: the deviceless Frame stub lost its `impl Frame {` line (featureless build).
