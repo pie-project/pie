@@ -29,6 +29,20 @@ impl Root {
         Some(Self { name, text, file })
     }
 
+    /// A unit the crate does not carry: source generated at run time (a
+    /// synthesized row kernel, `crate::synth`), compiled with the carried
+    /// headers in scope and cached on disk like a carried one, its key moving
+    /// with its text. `file` names it as a carried unit's path would
+    /// (`synth/….hip`).
+    #[must_use]
+    pub fn generated(file: &'static str, text: &'static str) -> Self {
+        Self {
+            name: file.strip_suffix(".hip").unwrap_or(file),
+            text,
+            file,
+        }
+    }
+
     /// The cache key of one instantiation of this unit for `arch`: it moves
     /// when the unit, any carried header, or the instantiation does.
     #[must_use]
