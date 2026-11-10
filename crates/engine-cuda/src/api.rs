@@ -656,6 +656,7 @@ impl Engine for Cuda {
             )
             .map_err(fault)?;
 
+        let chunk_facts = shell.chunk_facts().map_err(fault)?;
         let trace_name = shell.trace().name.clone();
         let (weight_bytes, arena_bytes, pool_bytes, input_bytes) = shell.footprint();
         let (pool_committed_bytes, pool_high_water_bytes, elastic_page_bytes, elastic_budget_pages) =
@@ -715,7 +716,7 @@ impl Engine for Cuda {
                 seat_to_end: shell.seat_to_end(),
                 seat_spread: shell.seat_spread(),
             },
-            chunks: Some(shell.chunk_facts()),
+            chunks: Some(chunk_facts),
             limits: FireLimits {
                 max_lanes: shell.budget().max_lanes,
                 max_tokens: shell.budget().max_tokens,

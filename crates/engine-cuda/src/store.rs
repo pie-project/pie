@@ -1001,8 +1001,13 @@ impl Pools {
     /// The watermark with `pages` kv pages and `slots` state slots: the
     /// chunks they take.
     fn declared_reshaped(&self, pages: u64, slots: u32) -> u64 {
+        // Backed in the range's map units: the last one whole.
         let layout = self.chunks.layout();
-        u64::from(chunks_at(layout, &self.paging, pages, slots)).saturating_mul(layout.chunk_bytes)
+        let unit = self.chunks.map_unit().max(1);
+        u64::from(chunks_at(layout, &self.paging, pages, slots))
+            .saturating_mul(layout.chunk_bytes)
+            .div_ceil(unit)
+            .saturating_mul(unit)
     }
 
     /// Re-reserves the kv planes and compressor slabs for a pool of `pages`,
@@ -1295,7 +1300,9 @@ impl Pools {
     /// Seats the kv pages `pages` (the windowed ones, `ring`) on slots of
     /// the state pool and backs the segments their chunks lie in.
     fn seat_pages(&mut self, kind: Kind, pages: impl IntoIterator<Item = u64>) -> Result<()> {
+        // The physical chunks the pages lie in.
         let mut highest = None;
+        let mut unbacked = None;
         for page in pages {
             let page = u32::try_from(page).map_err(|_| Fault::Ceiling {
                 what: kind.name(),
@@ -1304,27 +1311,27 @@ impl Pools {
             })?;
             let chunk = self.chunks.seat(kind, page)?;
             highest = highest.max(Some(chunk));
+            if unbacked.is_none() && !self.chunks.backed(chunk) {
+                unbacked = Some(chunk);
+            }
         }
-        let Some(highest) = highest else {
+        let (Some(highest), Some(unbacked)) = (highest, unbacked) else {
             return Ok(());
         };
-        let segments = self.chunks.segments_for(u64::from(highest) + 1);
-        if segments <= self.chunks.committed_segments() {
-            return Ok(());
-        }
         if self.chunks.by_refs() {
             // Nothing is backed on a fire's path: the runtime commits a
             // segment before it hands out a chunk of it.
             return Err(Fault::program(
                 "store::chunks",
                 format!(
-                    "a {} lies in chunk {highest}, in a segment the runtime has not committed \
-                     ({} are)",
+                    "a {} lies in physical chunk {unbacked}, which the runtime has not \
+                     committed ({} segments are)",
                     kind.name(),
                     self.chunks.committed_segments()
                 ),
             ));
         }
+        let segments = self.chunks.segments_for(u64::from(highest) + 1);
         match self.chunks.commit_segments(&mut self.pool, segments)? {
             Commit::Committed => Ok(()),
             refusal => Err(refuse(&self.pool, refusal)),
@@ -1933,6 +1940,17 @@ impl Pools {
         self.chunks.release_segments(&mut self.pool, segments)
     }
 
+    /// The chunks the fit left the cache rows, of the range's.
+    fn fitted_chunks(&self) -> u32 {
+        chunks_at(
+            self.chunks.layout(),
+            &self.paging,
+            self.paging.pages(),
+            self.paging.slots,
+        )
+        .min(self.chunks.total())
+    }
+
     /// See `Engine::evacuate`.
     pub fn evacuate(
         &mut self,
@@ -1946,17 +1964,19 @@ impl Pools {
     /// The state pool as the runtime counts it, for fires of up to
     /// `max_tokens`: the chunks the fit left the cache rows, the rest of the
     /// range stated with the activation's.
-    #[must_use]
-    pub fn chunk_facts(&self, max_tokens: u32) -> engine::chunk::ChunkFacts {
-        let fitted = chunks_at(
-            self.chunks.layout(),
-            &self.paging,
-            self.paging.pages(),
-            self.paging.slots,
-        );
+    pub fn chunk_facts(&mut self, max_tokens: u32) -> Result<engine::chunk::ChunkFacts> {
+        let fitted = self.fitted_chunks();
+        self.chunks.limit(fitted);
         let spare = self.chunks.total().saturating_sub(fitted);
-        self.chunks
-            .facts(max_tokens, spare, !elastic::mapped_on_demand())
+        // The state's chunks of the segment the stated activation starts in
+        // are backed from here on, as the runtime counts them.
+        match self.chunks.hold_boundary(&mut self.pool, spare)? {
+            Commit::Committed => {}
+            refusal => return Err(refuse(&self.pool, refusal)),
+        }
+        Ok(self
+            .chunks
+            .facts(max_tokens, spare, !elastic::mapped_on_demand()))
     }
 
     /// Refuses a page count past the pool's.
@@ -1978,24 +1998,18 @@ impl Pools {
     /// seconds, and a worker taking a dead peer's turns needs new pages then
     /// above all.
     pub fn back_whole(&mut self) -> Result<()> {
-        let pages = u32::try_from(self.paging.pages()).unwrap_or(u32::MAX);
-        let slots = if self.has_state() {
-            self.paging.slots
-        } else {
-            0
-        };
-        match self.commit_to(pages, slots)? {
-            Commit::Committed => {}
-            refusal => return Err(refuse(&self.pool, refusal)),
-        }
+        // Every segment the fitted pool's chunks lie in, the last as far
+        // as they reach: the range is reserved for more than the fit left
+        // the cache rows.
+        let fitted = self.fitted_chunks();
+        self.chunks.limit(fitted);
         match self
             .chunks
-            .commit_segments(&mut self.pool, self.chunks.segments())?
+            .commit_segments(&mut self.pool, self.chunks.segments_for(u64::from(fitted)))?
         {
             Commit::Committed => {}
             refusal => return Err(refuse(&self.pool, refusal)),
         }
-        self.ensure_windowed(0..self.paging.window_pages())?;
         self.whole = true;
         Ok(())
     }

@@ -824,7 +824,7 @@ pub fn commit_beside(pool: &PhysicalPool, arena: &mut Arena, want: &Want) -> Res
 }
 
 /// One reserved address range cut into equal segments, backed from the
-/// bottom a segment at a time, with one span of it held backed apart: the
+/// bottom a segment at a time, with spans of it held backed apart: the
 /// state pool's chunks grow up from offset 0 and a fire's activation sits
 /// under the range's end, so neither end's base ever moves.
 ///
@@ -836,8 +836,11 @@ pub struct Range {
     arena: Arena,
     segment_bytes: u64,
     committed: u32,
-    /// `(from, bytes)` that stay backed whatever is committed.
-    held: (u64, u64),
+    /// Spans `(from, bytes)` that stay backed whatever is committed.
+    held: Vec<(u64, u64)>,
+    /// The bytes from the range's start a committed segment backs at most:
+    /// past them a segment backs nothing ([`Range::limit`]).
+    limit: u64,
 }
 
 impl Range {
@@ -853,7 +856,8 @@ impl Range {
             arena: Arena::reserve(pool, bytes, label)?,
             segment_bytes: segment_bytes.max(1),
             committed: 0,
-            held: (0, 0),
+            held: Vec::new(),
+            limit: u64::MAX,
         })
     }
 
@@ -872,6 +876,12 @@ impl Range {
         self.segment_bytes
     }
 
+    /// The unit the range is backed in: what a commit rounds up to.
+    #[must_use]
+    pub const fn map_unit(&self) -> u64 {
+        self.arena.map_unit
+    }
+
     /// The segments the range holds, the last one short where the range is
     /// not a whole number of them.
     #[must_use]
@@ -884,10 +894,13 @@ impl Range {
         self.committed
     }
 
-    /// The span held backed apart from the segments, `(from, bytes)`.
+    /// The bytes held backed from `from`, apart from the segments.
     #[must_use]
-    pub const fn held(&self) -> (u64, u64) {
+    pub fn held(&self, from: u64) -> u64 {
         self.held
+            .iter()
+            .find(|span| span.0 == from)
+            .map_or(0, |span| span.1)
     }
 
     /// Every byte backed: the committed segments' and the held span's.
@@ -899,7 +912,9 @@ impl Range {
     /// The bytes the committed segments back, the held span apart.
     #[must_use]
     pub fn segment_bytes_committed(&self) -> u64 {
-        let bottom = (u64::from(self.committed) * self.segment_bytes).min(self.arena.max_bytes);
+        let bottom = (u64::from(self.committed) * self.segment_bytes)
+            .min(self.arena.max_bytes)
+            .min(self.limit);
         self.arena.units_of(&Want::Prefix(bottom)).len() as u64 * self.arena.map_unit
     }
 
@@ -914,16 +929,28 @@ impl Range {
     }
 
     /// What the range backs with `segments` committed and `held` held.
-    fn wanted(&self, segments: u32, held: (u64, u64)) -> Want {
-        let bytes = self.arena.max_bytes;
+    fn wanted(&self, segments: u32, held: &[(u64, u64)]) -> Want {
+        let bytes = self.arena.max_bytes.min(self.limit);
         let bottom = (u64::from(segments) * self.segment_bytes).min(bytes);
-        Want::Ranges(vec![(0, bottom), held])
+        Want::Ranges(
+            core::iter::once((0, bottom))
+                .chain(held.iter().copied())
+                .collect(),
+        )
+    }
+
+    /// Holds the segments to the first `bytes` of the range: a segment that
+    /// reaches past them backs only its part under them. For a range
+    /// reserved for more than its pool may come to take; set before a
+    /// segment that reaches past it is committed.
+    pub fn limit(&mut self, bytes: u64) {
+        self.limit = bytes;
     }
 
     /// Backs `bytes` from `from`, and keeps them backed whatever segments
-    /// are committed or released; the span held before is held still where
-    /// the new one covers it. `beside` backs what the pool's budget refuses
-    /// beside it ([`commit_beside`]).
+    /// are committed or released; a span held from `from` before grows to
+    /// this one, the spans held elsewhere stand. `beside` backs what the
+    /// pool's budget refuses beside it ([`commit_beside`]).
     pub fn hold(
         &mut self,
         pool: &mut PhysicalPool,
@@ -931,8 +958,12 @@ impl Range {
         bytes: u64,
         beside: bool,
     ) -> Result<Commit> {
-        let held = (from, bytes);
-        let want = self.wanted(self.committed, held);
+        let mut held = self.held.clone();
+        match held.iter_mut().find(|span| span.0 == from) {
+            Some(span) => span.1 = span.1.max(bytes),
+            None => held.push((from, bytes)),
+        }
+        let want = self.wanted(self.committed, &held);
         let mut targets = [Target {
             arena: &mut self.arena,
             want: want.clone(),
@@ -954,7 +985,7 @@ impl Range {
         if segments <= self.committed {
             return Ok(Commit::Committed);
         }
-        let want = self.wanted(segments, self.held);
+        let want = self.wanted(segments, &self.held);
         let mut targets = [Target {
             arena: &mut self.arena,
             want,
@@ -974,7 +1005,9 @@ impl Range {
         if segments >= self.committed {
             return Ok(());
         }
-        let keep = self.arena.target_units(&self.wanted(segments, self.held))?;
+        let keep = self
+            .arena
+            .target_units(&self.wanted(segments, &self.held))?;
         self.arena.shrink_to(pool, &keep);
         self.committed = segments;
         Ok(())
@@ -985,7 +1018,7 @@ impl Range {
     pub fn release_all(&mut self, pool: &mut PhysicalPool) {
         self.arena.shrink_to(pool, &[]);
         self.committed = 0;
-        self.held = (0, 0);
+        self.held.clear();
     }
 }
 

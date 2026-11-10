@@ -170,9 +170,9 @@ impl Shell {
 
     /// The state pool as the runtime counts it
     /// ([`crate::store::Pools::chunk_facts`]).
-    #[must_use]
-    pub fn chunk_facts(&self) -> engine::chunk::ChunkFacts {
-        self.pools.chunk_facts(self.budget().max_tokens)
+    pub fn chunk_facts(&mut self) -> crate::Result<engine::chunk::ChunkFacts> {
+        let max_tokens = self.budget().max_tokens;
+        self.pools.chunk_facts(max_tokens)
     }
 
     /// Names the recurrent record whose pieces lie in the slot refs
