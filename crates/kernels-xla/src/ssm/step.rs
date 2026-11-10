@@ -55,12 +55,28 @@ pub(super) fn gdn_step(
     let qk = f.mul(h.q, h.k)?;
     let qk = f.reduce(qk, &[2], Fold::Sum)?;
     let qk = lanes(f, qk)?;
-    let compiled = kernel(t, g, hv, rows, per, mxu > 0 && t >= mxu)?;
-    let out = compiled.call_aliased(f, &[slot, h.q, h.k, h.v, a, beta, qk, slab], &[(1, 7)])?;
-    Ok(Some((out[0], out[1])))
+    // A bank in the chunk pool is read and written as the pool itself.
+    let pool = f.view_parts(slab).map(|(pool, _)| pool);
+    let bank_val = pool.unwrap_or(slab);
+    let compiled = kernel(t, g, hv, rows, per, mxu > 0 && t >= mxu, pool.is_some())?;
+    let out = compiled.call_aliased(f, &[slot, h.q, h.k, h.v, a, beta, qk, bank_val], &[(1, 7)])?;
+    let bank = if pool.is_some() {
+        f.pool_view(out[1], Elem::Bf16, &[rows, dv])?
+    } else {
+        out[1]
+    };
+    Ok(Some((out[0], bank)))
 }
 
-fn kernel(t: i64, g: i64, hv: i64, rows: i64, per: i64, mxu: bool) -> Built<crate::mosaic::Compiled> {
+fn kernel(
+    t: i64,
+    g: i64,
+    hv: i64,
+    rows: i64,
+    per: i64,
+    mxu: bool,
+    pooled: bool,
+) -> Built<crate::mosaic::Compiled> {
     let (dk, dv) = (128, 128);
     let lane = |w: i64| Operand {
         array: vec![t, hv, w],
@@ -72,10 +88,16 @@ fn kernel(t: i64, g: i64, hv: i64, rows: i64, per: i64, mxu: bool) -> Built<crat
             Ok(vec![gr.ids[0], z, z])
         }),
     };
+    // pooled: the u32 pool, two bf16 rows a pool row
+    let (bank_dims, bank_elem) = if pooled {
+        (vec![rows / 2, dv], Elem::U32)
+    } else {
+        (vec![rows, dv], Elem::Bf16)
+    };
     let bank = || Operand {
-        array: vec![rows, dv],
-        elem: Elem::Bf16,
-        block: vec![rows, dv],
+        array: bank_dims.clone(),
+        elem: bank_elem,
+        block: bank_dims.clone(),
         window: Window::Any,
         index: Box::new(|b: &mut Body, _: &Grid| Ok(vec![b.i32(0), b.i32(0)])),
     };
@@ -113,6 +135,14 @@ fn kernel(t: i64, g: i64, hv: i64, rows: i64, per: i64, mxu: bool) -> Built<crat
             blk.ins[0], blk.ins[1], blk.ins[2], blk.ins[3], blk.ins[4], blk.ins[5], blk.ins[6],
         );
         let (y_r, bank_out) = (blk.outs[0], blk.outs[1]);
+        let (bank_in, bank_out) = if pooled {
+            (
+                b.ref_bitcast(bank_in, Elem::Bf16)?,
+                b.ref_bitcast(bank_out, Elem::Bf16)?,
+            )
+        } else {
+            (bank_in, bank_out)
+        };
         let (buf, sems) = (blk.scratch[0], blk.scratch[1]);
         // Row `row`'s state between its slot of the bank and buffer `s`:
         // loaded or stored, started or waited for.

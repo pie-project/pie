@@ -136,12 +136,29 @@ pub(super) fn gdn_chunks(
     let gcum = f.scan_steps(g3, 1, Fold::Sum)?;
     let gcum = f.reshape(gcum, &[sr, hv])?;
 
-    let compiled = kernel(hk, hv, dk, dv, c, nc, rows)?;
+    // A bank in the chunk pool is read and written as the pool itself.
+    let pool = f.view_parts(slab).map(|(pool, _)| pool);
+    let compiled = kernel(hk, hv, dk, dv, c, nc, rows, pool.is_some())?;
     let out = compiled.call_aliased(
         f,
-        &[first_i, last_i, slot_n, q, k, v, gcum, beta, slab],
+        &[
+            first_i,
+            last_i,
+            slot_n,
+            q,
+            k,
+            v,
+            gcum,
+            beta,
+            pool.unwrap_or(slab),
+        ],
         &[(1, 8)],
     )?;
+    let bank = if pool.is_some() {
+        f.pool_view(out[1], Elem::Bf16, &[rows, dv])?
+    } else {
+        out[1]
+    };
     let o = out[0];
 
     // Token `ti` sits in its segment's chunk `cstart + local / c`.
@@ -164,7 +181,7 @@ pub(super) fn gdn_chunks(
     let o = f.reshape(o, &[sr, hv * dv])?;
     let y = f.take_rows(o, pos)?;
     let y = f.reshape(y, &[t, hv, dv])?;
-    Ok(Some((y, out[1])))
+    Ok(Some((y, bank)))
 }
 
 /// The kernel: grid over the `nc` chunks, the state carried in VMEM.
@@ -176,6 +193,7 @@ fn kernel(
     c: i64,
     nc: i64,
     rows: i64,
+    pooled: bool,
 ) -> Built<crate::mosaic::Compiled> {
     let sr = nc * c;
     let per = hv * dk;
@@ -191,10 +209,16 @@ fn kernel(
             Ok(idx)
         }),
     };
+    // pooled: the u32 pool, two bf16 rows a pool row
+    let (bank_dims, bank_elem) = if pooled {
+        (vec![rows / 2, dv], Elem::U32)
+    } else {
+        (vec![rows, dv], Elem::Bf16)
+    };
     let bank = || Operand {
-        array: vec![rows, dv],
-        elem: Elem::Bf16,
-        block: vec![rows, dv],
+        array: bank_dims.clone(),
+        elem: bank_elem,
+        block: bank_dims.clone(),
         window: Window::Any,
         index: Box::new(|b, _g: &Grid| Ok(vec![b.i32(0), b.i32(0)])),
     };
@@ -236,6 +260,14 @@ fn kernel(
             blk.ins[0], blk.ins[1], blk.ins[2], blk.ins[3], blk.ins[4], blk.ins[5],
         );
         let (o_r, bank_o) = (blk.outs[0], blk.outs[1]);
+        let (bank_r, bank_o) = if pooled {
+            (
+                b.ref_bitcast(bank_r, Elem::Bf16)?,
+                b.ref_bitcast(bank_o, Elem::Bf16)?,
+            )
+        } else {
+            (bank_r, bank_o)
+        };
         let (st, sb, sems) = (blk.scratch[0], blk.scratch[1], blk.scratch[2]);
         let n = blk.grid.ids[0];
         let z = b.i32(0);

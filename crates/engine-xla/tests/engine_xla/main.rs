@@ -28,6 +28,7 @@ mod kernels_norm_fused;
 mod kernels_pack;
 mod kernels_ple;
 mod kernels_pool;
+mod kernels_pool_view;
 mod kernels_quant;
 mod kernels_replay;
 mod kernels_rope;
