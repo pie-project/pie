@@ -377,3 +377,17 @@ The `new-memory/` directory is bookkeeping and is removed before anything lands 
   also fixes reported capacity/used tokens, the server handler and policy pressure. Regression test with Metal-like
   facts. (The rs records pool's "out" has the same shape but does not feed gateway pressure — left as is.)
 - Verified: `cargo check` runtime + worker; `store::shared`.
+
+### M26 — 2026-11-10: P3fix3 merged; IT round 2 results
+- `sc/p3fix3-recipe-gaps` (60eea984e state_f32, f6a56e21b, 2e35d560e): rs rows of a record share slots — whole if
+  they fit, else every rs row cut identically on its tokens, piece p in slot p, chosen by waste
+  (`ChunkRecipe::rs: RsLayout { pieces, tokens_per_piece, slots, rows }`); other rows may fill the room rs rows leave;
+  n-gram id rows get an i32 rs row (Metal layout); KvU4 / block-scaled `rows` formats are sized; Metal `state_f32`.
+  Average waste 0.47% -> 0.55% CUDA, 2.96% -> 3.04% Metal; kimik3-2.8t 4.40% CUDA, 5.75% Metal.
+- IT round 2 (new-memory 65d849523 + sc/l40s-bc 131eca26d, sm_120, default config): Qwen3-0.6B and gemma-4-E2B
+  identical everywhere; grow -> evacuate -> release -> keep decoding identical on Qwen3, gemma, Qwen3.5-0.8B.
+  Open: (1) Qwen3.5 fires batching lanes of DIFFERENT working sets diverge by ~1 bf16 ulp from the first shared
+  fire (deterministic) — engine, suspected kernel-arm choice by alignment; sent to L40S. (2) beam 3x12 on Qwen3.5
+  refused by the 16-row rs limit (degenerate mode serves it) — design decision pending (proposed: overflow rows
+  beyond 16 borrow shared-pool slots). (3) no mamba/Nemotron mini importable for e2e.
+- BC + RW merge stays on hold until (1) and (2) are resolved.
