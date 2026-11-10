@@ -47,7 +47,7 @@ impl Run<'_> {
                     self.ctx(),
                     ext_ids,
                     self.qo_indptr(),
-                    &self.rs_committed(&seat),
+                    &self.rs_committed(&seat, *state),
                     &self.recurrent(*state),
                     hash,
                     *eos,

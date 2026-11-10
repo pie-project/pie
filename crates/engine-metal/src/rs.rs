@@ -315,37 +315,25 @@ pub struct Buffers {
 }
 
 impl Buffers {
-    /// Each plane's offset in a page of `page_size` tokens, and the page's
-    /// bytes: the buffer shape's slot in the state pool.
+    /// The rs buffer as rows of the records in the state pool `slab`: each
+    /// plane's 16 rows at `plane_at` in a record's slot, a lane's buffered
+    /// row `s` at row `s % 16`; a lane's "page" is its record's slot,
+    /// counted in units of `stride` from the pool's base.
     #[must_use]
-    pub fn page_layout(layout: &Layout, page_size: u32) -> (Vec<u64>, u64) {
-        let (plane_at, page_bytes, _) = Self::geometry(
-            layout,
-            Paging {
-                slots: 1,
-                ..Paging::of(page_size.max(1), 1, 1, 1).expect("a page size of one at least")
-            },
-        );
-        (plane_at, page_bytes)
-    }
-
-    /// The buffers as pages of the state pool `slab`, page ids counting
-    /// `stride` bytes from its base.
-    #[must_use]
-    pub fn in_pool(layout: &Layout, page_tokens: u32, slab: Buffer, stride: u64) -> Buffers {
-        let (plane_at, page_bytes) = Self::page_layout(layout, page_tokens);
+    pub fn in_pool(layout: &Layout, plane_at: Vec<u64>, slab: Buffer, stride: u64) -> Buffers {
+        let _ = layout;
         Buffers {
             slots: u32::try_from(slab.bytes() / stride.max(1)).unwrap_or(u32::MAX),
             slab,
-            page_tokens: page_tokens.max(1),
-            page_bytes,
+            page_tokens: poem_compiler::chunk::UNFOLDED_ROWS,
+            page_bytes: stride,
             stride,
             plane_at,
         }
     }
 
-    /// The bytes `reserve` takes for `layout` at `paging`: the load's memory
-    /// check counts them before anything is allocated.
+    /// The bytes per-page rs buffers would take for `layout` at `paging`:
+    /// the load's estimate before any pool.
     #[must_use]
     pub fn demand(layout: &Layout, paging: Paging) -> u64 {
         Self::geometry(layout, paging).2.max(256)

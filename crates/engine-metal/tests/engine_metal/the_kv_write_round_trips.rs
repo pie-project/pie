@@ -483,11 +483,9 @@ fn the_pre_estimate_sizes_packed_kv_exactly_at_any_head_dim() {
             plans: Vec::new(),
         };
         let _ = &device;
-        let actual = Rows::plan(&trace, PAGE_SIZE, &facts)
-            .expect("plan")
-            .token_bytes()
-            * u64::from(PAGE_SIZE)
-            * PAGES;
+        let _ = &facts;
+        let actual =
+            Rows::estimate(&trace, PAGE_SIZE).expect("plan").0 * u64::from(PAGE_SIZE) * PAGES;
         eprintln!(
             "[match ] {dtype:?} kv_heads={kv_heads} head_dim={head_dim:>3}: \
              pool_demand={est} B  laid={actual} B"

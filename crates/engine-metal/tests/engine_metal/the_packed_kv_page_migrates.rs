@@ -22,6 +22,7 @@ use engine_metal::store::kv::{Facts, Paging, SpaceFacts};
 use engine_metal::store::layout::{LIST, Layout};
 use engine_metal::store::{Pools, Rows, Seats, SpaceSeat};
 use kernels_metal::Tensor;
+use poem_compiler::chunk::{ChunkProfile, ChunkRecipe, RowId, SlotLayout, TokenRun};
 use poem_ir::{CacheRow, Dtype, Platform, Trace};
 
 const HEADS: usize = 2; // kv_heads
@@ -148,6 +149,8 @@ fn seats(rig: &mut Rig) -> Seats {
         }],
         slot_ids,
         slot_of_row,
+        lane_bands: Vec::new(),
+        row_bands: Vec::new(),
     }
 }
 
@@ -207,20 +210,44 @@ fn migrate_case(rig: &mut Rig, head_dim: usize) {
 
     // A pool of two chunks of four list slots: the null chunk, and chunk 1
     // whose first two slots the migration names.
-    let rows = Rows::plan(&trace, PAGE_SIZE, &facts).expect("plan packed KV");
-    let slot = rows.list_bytes;
+    // The compiler's recipe sizes no packed row (KvU4 has no element), so
+    // the test states the list slot a recipe would: one row, key run then
+    // value run.
+    let run = (PAGE_SIZE as usize * HEADS * per) as u64;
+    let slot = (2 * run).next_multiple_of(256);
+    let recipe = ChunkRecipe {
+        chunk_bytes: 4 * slot,
+        slots: vec![SlotLayout::List {
+            tokens: PAGE_SIZE,
+            bytes: slot,
+            rows: vec![TokenRun {
+                row: RowId::Cache(0),
+                layer: None,
+                offset: 0,
+                per_token: 2 * (HEADS * per) as u64,
+            }],
+        }],
+        atoms: Default::default(),
+        shards: Default::default(),
+        short_runs: Vec::new(),
+        cow_sets: 1,
+        waste: Default::default(),
+        profile: ChunkProfile::ON_DEVICE_METAL,
+        weights: Vec::new(),
+    };
+    let rows = Rows::plan(&trace, &recipe, &facts, None).expect("plan packed KV");
     let layout = Layout::new(
         4 * slot,
         2,
         engine_metal::store::pool::segment_chunks(4 * slot),
         PAGE_SIZE,
-        [slot, 0, 0],
+        [slot, 0],
+        1,
         0,
         0,
     )
     .expect("a layout");
-    let mut pools =
-        Pools::reserve(&rig.device, rows, layout, paging, Vec::new()).expect("reserve packed KV");
+    let mut pools = Pools::reserve(&rig.device, rows, layout, paging).expect("reserve packed KV");
     pools.commit_segments(1).expect("map the pool");
     let (src, dst) = (4u32, 5u32);
     let seats = seats(rig);

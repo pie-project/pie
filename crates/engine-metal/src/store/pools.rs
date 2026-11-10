@@ -6,9 +6,10 @@
 use engine::chunk::{ChunkFacts, Evacuation, ShapeId, SlotCopy};
 use engine::transfer::{KvRun, MemoryDomain};
 use kernels_metal::{KvPool, RecurrentPool, StateMap, Tensor};
+use poem_compiler::chunk::{ChunkRecipe, RowId, SlotLayout};
 use poem_ir::{CacheRow, Dtype, Trace};
 
-use super::layout::{self, BUFFER, FIXED, LIST, Layout, Slots};
+use super::layout::{FIXED, LIST, Layout, Slots};
 use super::pool::Pool;
 use super::{
     STATE_MAP_BYTES, Seats, SpaceSeat, Spill, compressed_spaces, elem_bytes, elem_size, narrow,
@@ -36,12 +37,16 @@ enum Row {
         keys_cell: u64,
         values_cell: u64,
     },
-    /// A state row: `stride` elements at `offset` in the fixed slot, found
-    /// through segment table `map`.
+    /// A state row: `stride` elements, `pieces` pieces of `piece_atoms`
+    /// atoms each at `offset` in the record's slots of `band`, found through
+    /// segment table `map`.
     State {
         stride: u64,
         dtype: Dtype,
         offset: u64,
+        band: usize,
+        pieces: u32,
+        piece_atoms: u32,
         map: usize,
     },
     /// The compressor state a pool gather keeps beside kv space `space`:
@@ -55,61 +60,177 @@ enum Row {
     },
 }
 
-/// How a load's rows lay into slots, before any pool is reserved.
+/// One kv row's geometry as this shell stores it.
+struct KvCells {
+    space: u32,
+    head_dim: u32,
+    kv_heads: u32,
+    dtype: Dtype,
+    keys_cell: u64,
+    values_cell: u64,
+    values_width: u64,
+    own_values: bool,
+}
+
+/// Row `index` of `trace`, a kv row, as this shell stores it; `facts`
+/// restates its heads.
+#[allow(clippy::too_many_arguments)]
+fn kv_cells(
+    index: usize,
+    name: &str,
+    planes: &[u64],
+    dtype: Dtype,
+    space: u32,
+    trace_head_dim: u32,
+    facts: &Facts,
+) -> Result<KvCells> {
+    let planes = split(name, planes)?;
+    let width = planes.keys;
+    let restated = facts
+        .rows
+        .get(index)
+        .copied()
+        .flatten()
+        .filter(|seat| seat.kv_heads != 0);
+    if let Some(seat) = restated {
+        let heads = u64::from(seat.kv_heads) * u64::from(seat.head_dim);
+        if heads != width {
+            return Err(Fault::Unbound {
+                what: format!(
+                    "cache `{name}`, whose row is {width} wide while its consumers state {} \
+                     heads of {}",
+                    seat.kv_heads, seat.head_dim
+                ),
+            });
+        }
+    }
+    // A restated seat, else the row's own head width, else the whole row a
+    // head.
+    let row_head_dim = (trace_head_dim != 0).then_some(trace_head_dim);
+    let head_dim = restated
+        .map(|seat| u64::from(seat.head_dim))
+        .or(row_head_dim.map(u64::from))
+        .unwrap_or(width);
+    let kv_heads = restated
+        .map(|seat| u64::from(seat.kv_heads))
+        .or(row_head_dim.map(|d| width / u64::from(d)))
+        .unwrap_or(1);
+    let (head_dim, kv_heads) = if kv_heads == 0 {
+        (width, 1)
+    } else {
+        (head_dim, kv_heads)
+    };
+    let block = restated.map(|seat| seat.head_dim).or(row_head_dim);
+    Ok(KvCells {
+        space,
+        head_dim: u32::try_from(head_dim).unwrap_or(u32::MAX),
+        kv_heads: u32::try_from(kv_heads).unwrap_or(u32::MAX),
+        dtype,
+        keys_cell: row_stride(name, dtype, width, block)?,
+        values_cell: if planes.values == 0 {
+            0
+        } else {
+            row_stride(name, dtype, planes.values, block)?
+        },
+        values_width: planes.values,
+        own_values: !planes.shared && planes.values != 0,
+    })
+}
+
+/// Where the rs buffer lies in a record: the record's slot holding every
+/// replayed layer's `[16, width]` rows, and each of the shell's rs planes'
+/// offset in that slot (its 16 rows one after another).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RsRows {
+    pub slot: u32,
+    pub plane_at: Vec<u64>,
+}
+
+/// How a load's rows lay into the recipe's slots, before any pool is
+/// reserved.
 #[derive(Debug, Clone)]
 pub struct Rows {
     rows: Vec<Row>,
-    /// A list slot's bytes, a fixed slot's, and what one physical list
-    /// slot's tokens take in the side planes.
+    /// The recipe's chunk, its list slot and its tokens, its fixed slot and
+    /// the slots a record takes.
+    pub chunk_bytes: u64,
     pub list_bytes: u64,
+    pub tokens: u32,
     pub fixed_bytes: u64,
+    pub pieces: u32,
+    /// What one physical list slot's tokens take in the side planes.
     pub side_bytes: u64,
+    /// Each distinct set of record slots a state row's pieces lie in.
+    pub bands: Vec<Vec<u32>>,
+    pub rs: Option<RsRows>,
     /// The trace's cache rows each shape lays out, in order.
     pub kv_rows: Vec<u32>,
     pub state_rows: Vec<u32>,
 }
 
+/// Why the recipe and this shell disagree, as a load refusal.
+fn disagree(what: String) -> Fault {
+    Fault::Unbound {
+        what: format!("the on-device Metal chunk recipe, which {what}"),
+    }
+}
+
+/// The chunked recurrences whose commit is deferred, in node order: the
+/// recipe's `RowId::Rs(n)` is the n-th. Each with the shell's rs planes it
+/// replays: the conv's input, then `[b | a]` (gated delta) or `f` and `b`
+/// (KDA).
+fn rs_layers(trace: &Trace) -> Vec<Vec<(u32, crate::rs::Role)>> {
+    use crate::rs::Role;
+    use poem_ir::{Def, Operation, Ssm};
+    let mut defined = std::collections::HashMap::new();
+    let mut outs = Vec::new();
+    for (at, node) in trace.nodes.iter().enumerate() {
+        outs.clear();
+        poem_ir::Operands::outputs(&node.op, &mut outs);
+        for out in &outs {
+            defined.insert(out.0, at);
+        }
+    }
+    let op_of = |id: poem_ir::ValueId| defined.get(&id.0).map(|n| &trace.nodes[*n].op);
+    let cache = |id: poem_ir::ValueId| match trace.values.get(id.0 as usize).map(|v| &v.def) {
+        Some(Def::Cache(row)) => Some(*row),
+        _ => None,
+    };
+    let conv = |id| match op_of(id) {
+        Some(Operation::Ssm(Ssm::CausalConv1dChunked { state, .. })) => cache(*state),
+        _ => None,
+    };
+    let mut layers = Vec::new();
+    for node in &trace.nodes {
+        let planes = match &node.op {
+            Operation::Ssm(Ssm::GatedDeltaChunked {
+                qkv, gates, state, ..
+            }) => {
+                let gated = matches!(op_of(*gates), Some(Operation::Ssm(Ssm::GdnGates { .. })));
+                conv(*qkv)
+                    .zip(cache(*state))
+                    .filter(|_| gated)
+                    .map(|(c, s)| vec![(c, Role::ConvX), (s, Role::Ba)])
+            }
+            Operation::Ssm(Ssm::KdaChunked { mixed, state, .. }) => conv(*mixed)
+                .zip(cache(*state))
+                .map(|(c, s)| vec![(c, Role::ConvX), (s, Role::KdaF), (s, Role::KdaB)]),
+            _ => continue,
+        };
+        if let Some(planes) = planes {
+            layers.push(planes);
+        }
+    }
+    layers
+}
+
 impl Rows {
-    /// The bytes one token takes across every kv row, unaligned.
-    #[must_use]
-    pub fn token_bytes(&self) -> u64 {
-        self.rows
-            .iter()
-            .map(|row| match *row {
-                Row::Kv {
-                    keys,
-                    values,
-                    keys_cell,
-                    values_cell,
-                    ..
-                } => keys_cell + if values == keys { 0 } else { values_cell },
-                Row::State { .. } | Row::Compressed { .. } => 0,
-            })
-            .sum()
-    }
-
-    /// The bytes a working set's state rows take, unaligned.
-    #[must_use]
-    pub fn state_bytes(&self) -> u64 {
-        self.rows
-            .iter()
-            .map(|row| match *row {
-                Row::State { stride, dtype, .. } => stride * u64::from(elem_size(dtype)),
-                Row::Kv { .. } | Row::Compressed { .. } => 0,
-            })
-            .sum()
-    }
-
-    /// Lays `trace`'s rows into slots of `page_size` tokens; `facts`
-    /// restates kv rows' heads.
-    pub fn plan(trace: &Trace, page_size: u32, facts: &Facts) -> Result<Rows> {
-        let tokens = u64::from(page_size);
-        let mut rows = Vec::with_capacity(trace.caches.len());
-        let mut list = 0u64;
-        let mut fixed = 0u64;
-        let mut maps = 0usize;
-        let mut kv_rows = Vec::new();
-        let mut state_rows = Vec::new();
+    /// The bytes one token takes across every kv row, and a working set's
+    /// state rows, unaligned: an estimate before any recipe.
+    pub fn estimate(trace: &Trace, page_size: u32) -> Result<(u64, u64, u64)> {
+        let facts = Facts::default();
+        let mut token = 0u64;
+        let mut state = 0u64;
         for (index, row) in trace.caches.iter().enumerate() {
             match row {
                 CacheRow::Kv {
@@ -117,73 +238,109 @@ impl Rows {
                     planes,
                     dtype,
                     space,
-                    head_dim: trace_head_dim,
+                    head_dim,
                     ..
                 } => {
-                    let planes = split(name, planes)?;
-                    let width = planes.keys;
-                    let restated = facts
-                        .rows
-                        .get(index)
-                        .copied()
-                        .flatten()
-                        .filter(|seat| seat.kv_heads != 0);
-                    if let Some(seat) = restated {
-                        let heads = u64::from(seat.kv_heads) * u64::from(seat.head_dim);
-                        if heads != width {
-                            return Err(Fault::Unbound {
-                                what: format!(
-                                    "cache `{name}`, whose row is {width} wide while its \
-                                     consumers state {} heads of {}",
-                                    seat.kv_heads, seat.head_dim
-                                ),
-                            });
-                        }
+                    let kv = kv_cells(index, name, planes, *dtype, *space, *head_dim, &facts)?;
+                    token += kv.keys_cell + if kv.own_values { kv.values_cell } else { 0 };
+                }
+                CacheRow::State {
+                    name, slab, dtype, ..
+                } => {
+                    let dtype = state_dtype(*dtype);
+                    state += slab.iter().product::<u64>() * elem_bytes(name, dtype)?;
+                }
+            }
+        }
+        let side = compressed_spaces(trace)
+            .iter()
+            .map(|(_, width)| 2 * u64::from(page_size) * width * u64::from(elem_size(Dtype::Bf16)))
+            .sum();
+        Ok((token, state, side))
+    }
+
+    /// Lays `trace`'s rows where `recipe` (the compiler's on-device Metal
+    /// chunk recipe, the one layout source) puts them; `facts` restates kv
+    /// rows' heads, `rs` is the shell's rs buffer. Refuses where the recipe
+    /// lays a row otherwise than this shell stores it.
+    pub fn plan(
+        trace: &Trace,
+        recipe: &ChunkRecipe,
+        facts: &Facts,
+        rs: Option<&crate::rs::Layout>,
+    ) -> Result<Rows> {
+        if recipe.rings().next().is_some()
+            || matches!(recipe.fixed(), Some(SlotLayout::Fixed { folded, .. }) if !folded.is_empty())
+        {
+            return Err(disagree(format!(
+                "keeps windowed kv rows in rings ({}), where this shell pages them in full in \
+                 the list",
+                recipe.shapes()
+            )));
+        }
+        let (tokens, list_bytes, runs) = match recipe.list() {
+            Some(SlotLayout::List {
+                tokens,
+                bytes,
+                rows,
+            }) => (*tokens, *bytes, rows.as_slice()),
+            _ => (0, 0, &[][..]),
+        };
+        let (fixed_bytes, pieces, fixed_runs) = match recipe.fixed() {
+            Some(SlotLayout::Fixed {
+                bytes,
+                pieces_per_ws,
+                rows,
+                ..
+            }) => (*bytes, *pieces_per_ws, rows.as_slice()),
+            _ => (0, 0, &[][..]),
+        };
+        let mut rows = Vec::with_capacity(trace.caches.len());
+        let mut bands: Vec<Vec<u32>> = Vec::new();
+        let mut maps = 0usize;
+        let mut kv_rows = Vec::new();
+        let mut state_rows = Vec::new();
+        for (index, row) in trace.caches.iter().enumerate() {
+            let id = RowId::Cache(u32::try_from(index).unwrap_or(u32::MAX));
+            match row {
+                CacheRow::Kv {
+                    name,
+                    planes,
+                    dtype,
+                    space,
+                    head_dim,
+                    ..
+                } => {
+                    let kv = kv_cells(index, name, planes, *dtype, *space, *head_dim, facts)?;
+                    let run = runs
+                        .iter()
+                        .find(|run| run.row == id)
+                        .ok_or_else(|| disagree(format!("lays kv row `{name}` in no list slot")))?;
+                    let per_token = kv.keys_cell + if kv.own_values { kv.values_cell } else { 0 };
+                    if per_token != run.per_token {
+                        return Err(disagree(format!(
+                            "lays kv row `{name}` at {} bytes a token, where this shell stores \
+                             {per_token}",
+                            run.per_token
+                        )));
                     }
-                    // As the per-plane pools sized it: a restated seat, else
-                    // the row's own head width, else the whole row a head.
-                    let row_head_dim = (*trace_head_dim != 0).then_some(*trace_head_dim);
-                    let head_dim = restated
-                        .map(|seat| u64::from(seat.head_dim))
-                        .or(row_head_dim.map(u64::from))
-                        .unwrap_or(width);
-                    let kv_heads = restated
-                        .map(|seat| u64::from(seat.kv_heads))
-                        .or(row_head_dim.map(|d| width / u64::from(d)))
-                        .unwrap_or(1);
-                    let (head_dim, kv_heads) = if kv_heads == 0 {
-                        (width, 1)
-                    } else {
-                        (head_dim, kv_heads)
-                    };
-                    let block = restated.map(|seat| seat.head_dim).or(row_head_dim);
-                    let keys_cell = row_stride(name, *dtype, width, block)?;
-                    let values_cell = if planes.values == 0 {
-                        0
-                    } else {
-                        row_stride(name, *dtype, planes.values, block)?
-                    };
-                    let own_values = !planes.shared && planes.values != 0;
-                    let keys = layout::align(list);
-                    list = keys + tokens * keys_cell;
-                    let values = if own_values {
-                        let at = layout::align(list);
-                        list = at + tokens * values_cell;
-                        at
+                    let keys = run.offset;
+                    let values = if kv.own_values {
+                        keys + u64::from(tokens) * kv.keys_cell
                     } else {
                         keys
                     };
                     kv_rows.push(u32::try_from(index).unwrap_or(u32::MAX));
                     rows.push(Row::Kv {
-                        space: *space,
-                        head_dim: u32::try_from(head_dim).unwrap_or(u32::MAX),
-                        kv_heads: u32::try_from(kv_heads).unwrap_or(u32::MAX),
-                        dtype: *dtype,
+                        space: kv.space,
+                        head_dim: kv.head_dim,
+                        kv_heads: kv.kv_heads,
+                        dtype: kv.dtype,
                         keys,
                         values,
-                        values_width: planes.values,
-                        keys_cell,
-                        values_cell,
+                        values_width: kv.values_width,
+                        keys_cell: kv.keys_cell,
+                        values_cell: kv.values_cell,
                     });
                 }
                 CacheRow::State {
@@ -191,23 +348,59 @@ impl Rows {
                 } => {
                     let stride: u64 = slab.iter().product();
                     let dtype = state_dtype(*dtype);
-                    let offset = layout::align(fixed);
-                    fixed = offset + stride * elem_bytes(name, dtype)?;
+                    let bytes = stride * elem_bytes(name, dtype)?;
+                    let run = fixed_runs.iter().find(|run| run.row == id).ok_or_else(|| {
+                        disagree(format!("lays state row `{name}` in no fixed slot"))
+                    })?;
+                    let atom = recipe.atoms.get(&id).ok_or_else(|| {
+                        disagree(format!("states no atoms of state row `{name}`"))
+                    })?;
+                    if atom.bytes * atom.extent != bytes {
+                        return Err(disagree(format!(
+                            "sizes state row `{name}` at {} bytes, where this shell stores {bytes} \
+                             ({dtype:?})",
+                            atom.bytes * atom.extent
+                        )));
+                    }
+                    if run.offset % u64::from(elem_size(dtype)) != 0 {
+                        return Err(disagree(format!(
+                            "lays state row `{name}` at byte {}, inside an element",
+                            run.offset
+                        )));
+                    }
+                    let band = match bands.iter().position(|band| *band == run.slots) {
+                        Some(band) => band,
+                        None => {
+                            bands.push(run.slots.clone());
+                            bands.len() - 1
+                        }
+                    };
                     state_rows.push(u32::try_from(index).unwrap_or(u32::MAX));
                     rows.push(Row::State {
                         stride,
                         dtype,
-                        offset,
+                        offset: run.offset,
+                        band,
+                        pieces: run.pieces,
+                        piece_atoms: if run.pieces <= 1 {
+                            u32::MAX
+                        } else {
+                            u32::try_from(run.atoms_per_piece).unwrap_or(u32::MAX)
+                        },
                         map: maps,
                     });
                     maps += 1;
                 }
             }
         }
+        let rs = match rs {
+            None => None,
+            Some(layout) => Some(rs_rows(trace, recipe, fixed_runs, layout)?),
+        };
         let mut side = 0usize;
         let mut side_bytes = 0u64;
         for (space, width) in compressed_spaces(trace) {
-            side_bytes += 2 * tokens * width * u64::from(elem_size(Dtype::Bf16));
+            side_bytes += 2 * u64::from(tokens) * width * u64::from(elem_size(Dtype::Bf16));
             rows.push(Row::Compressed {
                 space,
                 width,
@@ -218,13 +411,89 @@ impl Rows {
         }
         Ok(Rows {
             rows,
-            list_bytes: layout::align(list),
-            fixed_bytes: layout::align(fixed),
+            chunk_bytes: recipe.chunk_bytes,
+            list_bytes,
+            tokens,
+            fixed_bytes,
+            pieces,
             side_bytes,
+            bands,
+            rs,
             kv_rows,
             state_rows,
         })
     }
+}
+
+/// The rs planes' places in the record: each replayed layer's `[16, width]`
+/// row (the recipe's `RowId::Rs(n)`) holds that layer's planes one after
+/// another, 16 rows each. Every layer's row lies whole in one slot, the same
+/// for all.
+fn rs_rows(
+    trace: &Trace,
+    recipe: &ChunkRecipe,
+    runs: &[poem_compiler::chunk::FixedRun],
+    layout: &crate::rs::Layout,
+) -> Result<RsRows> {
+    let rows = u64::from(poem_compiler::chunk::UNFOLDED_ROWS);
+    let mut plane_at: Vec<Option<u64>> = vec![None; layout.planes.len()];
+    let mut slot = None;
+    for (n, planes) in rs_layers(trace).into_iter().enumerate() {
+        let id = RowId::Rs(u32::try_from(n).unwrap_or(u32::MAX));
+        let run = runs
+            .iter()
+            .find(|run| run.row == id)
+            .ok_or_else(|| disagree(format!("lays no rs buffer row for replayed layer {n}")))?;
+        let room = recipe
+            .atoms
+            .get(&id)
+            .map_or(0, |atom| atom.bytes * atom.extent);
+        if run.pieces != 1 || slot.is_some_and(|s| s != run.slots[0]) {
+            return Err(disagree(format!(
+                "cuts or scatters the rs buffer rows (layer {n} in slots {:?}), where this \
+                 shell reads every layer's from one slot",
+                run.slots
+            )));
+        }
+        slot = Some(run.slots[0]);
+        let mut at = run.offset;
+        for (cache, role) in planes {
+            let Some(plane) = layout
+                .planes
+                .iter()
+                .position(|p| p.cache == cache && p.role == role)
+            else {
+                return Err(disagree(format!(
+                    "buffers a {role:?} plane of cache row {cache} the shell does not"
+                )));
+            };
+            plane_at[plane] = Some(at);
+            at += rows * layout.planes[plane].row_bytes;
+        }
+        if at - run.offset > room {
+            return Err(disagree(format!(
+                "gives replayed layer {n} {room} bytes of rs rows, where this shell stores {}",
+                at - run.offset
+            )));
+        }
+    }
+    let plane_at = plane_at
+        .into_iter()
+        .enumerate()
+        .map(|(at, offset)| {
+            offset.ok_or_else(|| {
+                let plane = &layout.planes[at];
+                disagree(format!(
+                    "keeps no rs row for the {:?} plane of cache row {} this shell buffers",
+                    plane.role, plane.cache
+                ))
+            })
+        })
+        .collect::<Result<Vec<_>>>()?;
+    Ok(RsRows {
+        slot: slot.unwrap_or(0),
+        plane_at,
+    })
 }
 
 #[derive(Debug)]
@@ -238,10 +507,12 @@ pub struct Pools {
     side: Vec<Buffer>,
     /// Every state row's segment table, one after another.
     maps: Option<Buffer>,
-    shape_rows: [Vec<u32>; 3],
+    shape_rows: [Vec<u32>; 2],
+    /// Each distinct set of record slots a state row's pieces lie in.
+    bands: Vec<Vec<u32>>,
+    rs: Option<RsRows>,
     disk: Option<Spill>,
     parked: Option<Spill>,
-    parked_pages: Option<Spill>,
 }
 
 /// The first byte of physical slot `slot` of `shape`.
@@ -252,13 +523,7 @@ fn slot_at(layout: &Layout, shape: &Slots, slot: u32) -> u64 {
 
 impl Pools {
     /// The pool `layout` sizes over `rows`, kv pages of `paging`'s size.
-    pub fn reserve(
-        device: &Context,
-        rows: Rows,
-        layout: Layout,
-        paging: Paging,
-        rs_rows: Vec<u32>,
-    ) -> Result<Pools> {
+    pub fn reserve(device: &Context, rows: Rows, layout: Layout, paging: Paging) -> Result<Pools> {
         let pool = Pool::reserve(
             device,
             layout.chunk_bytes,
@@ -283,14 +548,15 @@ impl Pools {
                 ..paging
             },
             maps: None,
-            shape_rows: [rows.kv_rows.clone(), rows.state_rows.clone(), rs_rows],
+            shape_rows: [rows.kv_rows.clone(), rows.state_rows.clone()],
+            bands: rows.bands,
+            rs: rows.rs,
             rows: rows.rows,
             pool,
             layout,
             side,
             disk: None,
             parked: None,
-            parked_pages: None,
         };
         pools.write_maps(device)?;
         Ok(pools)
@@ -298,14 +564,21 @@ impl Pools {
 
     /// Writes each state row's segment table: the bank is the whole pool,
     /// a chunk `chunk_bytes` apart, a slot the fixed slot apart, the row at
-    /// its offset in the slot; one segment, one piece.
+    /// its offset in each of its pieces' slots; one segment.
     fn write_maps(&mut self, device: &Context) -> Result<()> {
         let Some(fixed) = self.layout.fixed else {
             return Ok(());
         };
         let mut tables = Vec::new();
         for row in &self.rows {
-            let Row::State { dtype, offset, .. } = *row else {
+            let Row::State {
+                dtype,
+                offset,
+                pieces,
+                piece_atoms,
+                ..
+            } = *row
+            else {
                 continue;
             };
             let element = u64::from(elem_size(dtype));
@@ -314,8 +587,8 @@ impl Pools {
                 chunk_slots: fixed.per_chunk,
                 chunk_stride: self.layout.chunk_bytes / element,
                 seg_chunks: u32::MAX,
-                piece_atoms: u32::MAX,
-                pieces: 1,
+                piece_atoms,
+                pieces: pieces.max(1),
                 bases: vec![offset / element],
             };
             tables.extend(map.bytes());
@@ -327,6 +600,49 @@ impl Pools {
         buffer.write(0, &tables)?;
         self.maps = Some(buffer);
         Ok(())
+    }
+
+    /// Each band's width: the ids a lane's or a row's table holds for the
+    /// state rows whose pieces lie in that band's record slots.
+    #[must_use]
+    pub fn bands(&self) -> Vec<u32> {
+        self.bands
+            .iter()
+            .map(|band| u32::try_from(band.len()).unwrap_or(u32::MAX))
+            .collect()
+    }
+
+    /// `record`'s physical piece ids as each band reads them, band after
+    /// band.
+    #[must_use]
+    pub fn band_ids(&self, record: &[u32]) -> Vec<i32> {
+        self.bands
+            .iter()
+            .flatten()
+            .map(|&slot| record.get(slot as usize).map_or(-1, |&id| id as i32))
+            .collect()
+    }
+
+    /// The rs buffer's place in a record, where the load buffers one.
+    #[must_use]
+    pub fn rs_rows(&self) -> Option<&RsRows> {
+        self.rs.as_ref()
+    }
+
+    /// The unit (`Layout::buffer_stride`) the rs rows of the record whose
+    /// physical pieces are `record` start at.
+    pub fn rs_unit(&self, record: &[u32]) -> Result<u32> {
+        let rs = self.rs.as_ref().ok_or_else(|| Fault::Unbound {
+            what: "the rs buffer rows of a load that buffers none".to_string(),
+        })?;
+        let fixed = *self.shape(FIXED)?;
+        let piece = *record.get(rs.slot as usize).ok_or(Fault::Ceiling {
+            what: "pieces of a record",
+            need: u64::from(rs.slot) + 1,
+            have: record.len() as u64,
+        })?;
+        let at = slot_at(&self.layout, &fixed, piece);
+        Ok(u32::try_from(at / self.layout.buffer_stride()).unwrap_or(u32::MAX))
     }
 
     #[must_use]
@@ -407,33 +723,54 @@ impl Pools {
         self.physical(LIST, page)
     }
 
-    /// The physical fixed slot a lane's state id names: a slot ref, or a
-    /// seat-addressed id.
+    /// A lane's record as kernels address it, one physical id a piece:
+    /// `refs` (slot refs of the fixed shape, a piece each), or a lone ref of
+    /// a one-piece record, or seat `seat`'s record.
+    pub fn record(&self, refs: Option<&[u32]>, seat: u32) -> Result<Vec<u32>> {
+        if !self.has_state() {
+            return Ok(vec![seat]);
+        }
+        let pieces = self.layout.pieces;
+        match refs {
+            Some(refs) => {
+                if refs.len() != pieces as usize {
+                    return Err(Fault::Unbound {
+                        what: format!(
+                            "a record named by {} slot refs, where this pool's records are {pieces} \
+                             pieces",
+                            refs.len()
+                        ),
+                    });
+                }
+                refs.iter().map(|&r| self.physical(FIXED, r)).collect()
+            }
+            None => {
+                let fixed = *self.shape(FIXED)?;
+                (0..pieces)
+                    .map(|p| self.physical(FIXED, fixed.seat_ref(seat * pieces + p)?))
+                    .collect()
+            }
+        }
+    }
+
+    /// The physical fixed slot a one-piece record's slot ref (or, seated,
+    /// its seat) names.
     pub fn state_slot(&self, id: u32, seated: bool) -> Result<u32> {
         if !self.has_state() {
             return Ok(id);
         }
-        let id = if seated {
-            self.shape(FIXED)?.seat_ref(id)?
-        } else {
-            id
-        };
+        if seated {
+            return Ok(self.record(None, id)?[0]);
+        }
+        if self.layout.pieces != 1 {
+            return Err(Fault::Unbound {
+                what: format!(
+                    "a record named by one slot ref, where this pool's records are {} pieces",
+                    self.layout.pieces
+                ),
+            });
+        }
         self.physical(FIXED, id)
-    }
-
-    /// The units rs buffer page ids count kernels address for `pages`
-    /// (slot refs of the buffer shape, or seat-addressed ids).
-    pub fn buffer_pages(&self, pages: &[u32], seated: bool) -> Result<Vec<u32>> {
-        let shape = *self.shape(BUFFER)?;
-        let stride = self.layout.buffer_stride();
-        pages
-            .iter()
-            .map(|&page| {
-                let page = if seated { shape.seat_ref(page)? } else { page };
-                let at = self.slot_offset(BUFFER, page)?;
-                Ok(u32::try_from(at / stride).unwrap_or(u32::MAX))
-            })
-            .collect()
     }
 
     #[must_use]
@@ -459,25 +796,45 @@ impl Pools {
         Ok(out)
     }
 
-    /// Physical fixed slot `slot`'s state rows, one after another.
-    pub fn read_slot(&self, slot: u32) -> Result<Vec<u8>> {
+    /// The state rows of the record whose physical pieces are `record`,
+    /// one after another, each row's pieces in order.
+    pub fn read_record(&self, record: &[u32]) -> Result<Vec<u8>> {
         let fixed = *self.shape(FIXED)?;
-        let base = self.physical_slot_at(&fixed, slot)?;
         let mut out = Vec::new();
         for row in &self.rows {
             let Row::State {
                 stride,
                 dtype,
                 offset,
+                band,
+                pieces,
+                piece_atoms,
                 ..
             } = *row
             else {
                 continue;
             };
             let bytes = stride * u64::from(elem_size(dtype));
-            let mut span = vec![0u8; usize::try_from(bytes).unwrap_or(0)];
-            self.pool.read(base + offset, &mut span)?;
-            out.extend_from_slice(&span);
+            let piece = if pieces <= 1 {
+                bytes
+            } else {
+                bytes.div_ceil(u64::from(pieces))
+            };
+            let _ = piece_atoms;
+            let mut left = bytes;
+            for &slot in &self.bands[band] {
+                let id = *record.get(slot as usize).ok_or(Fault::Ceiling {
+                    what: "pieces of a record",
+                    need: u64::from(slot) + 1,
+                    have: record.len() as u64,
+                })?;
+                let take = piece.min(left);
+                let mut span = vec![0u8; usize::try_from(take).unwrap_or(0)];
+                self.pool
+                    .read(self.physical_slot_at(&fixed, id)? + offset, &mut span)?;
+                out.extend_from_slice(&span);
+                left -= take;
+            }
         }
         Ok(out)
     }
@@ -530,6 +887,7 @@ impl Pools {
         let mut pools = Vec::with_capacity(self.rows.len());
         let mut compressed = Vec::new();
         let mut state_row = 0u64;
+        let mut lane_slots = Vec::with_capacity(self.rows.len());
         for row in &self.rows {
             pools.push(match *row {
                 Row::Compressed {
@@ -583,6 +941,7 @@ impl Pools {
                             dtype,
                         ))
                     };
+                    lane_slots.push(None);
                     CachePool::Kv(KvPool {
                         keys: plane(u64::from(kv_heads) * u64::from(head_dim))?,
                         values: plane(values_width)?,
@@ -596,7 +955,12 @@ impl Pools {
                         plane_offset: [keys, values],
                     })
                 }
-                Row::State { stride, dtype, .. } => {
+                Row::State {
+                    stride,
+                    dtype,
+                    band,
+                    ..
+                } => {
                     let fixed = self.shape(FIXED)?;
                     let slots = u32::try_from(
                         u64::from(fixed.per_chunk) * u64::from(self.layout.total_chunks),
@@ -618,9 +982,20 @@ impl Pools {
                         Dtype::U64,
                     );
                     state_row += 1;
+                    lane_slots.push(Some(
+                        seats
+                            .lane_bands
+                            .get(band)
+                            .copied()
+                            .unwrap_or(seats.slot_ids),
+                    ));
                     CachePool::Recurrent(RecurrentPool {
                         state: bank,
-                        slots: seats.slot_of_row,
+                        slots: seats
+                            .row_bands
+                            .get(band)
+                            .copied()
+                            .unwrap_or(seats.slot_of_row),
                         conv_state: bank,
                         new_conv_state: bank,
                         segments,
@@ -628,17 +1003,25 @@ impl Pools {
                 }
             });
         }
-        Ok(CacheTable { pools, compressed })
+        Ok(CacheTable {
+            pools,
+            compressed,
+            lane_slots,
+        })
     }
 
-    /// Zeroes physical fixed slot `slot`: a fresh lane's state.
-    pub fn clear(&mut self, slot: u32) -> Result<()> {
+    /// Zeroes the record whose physical pieces are `record`: a fresh lane's
+    /// state.
+    pub fn clear(&mut self, record: &[u32]) -> Result<()> {
         if !self.has_state() {
             return Ok(());
         }
         let fixed = *self.shape(FIXED)?;
-        let at = self.physical_slot_at(&fixed, slot)?;
-        self.pool.zero(at, fixed.slot_bytes)
+        for &piece in record {
+            let at = self.physical_slot_at(&fixed, piece)?;
+            self.pool.zero(at, fixed.slot_bytes)?;
+        }
+        Ok(())
     }
 
     /// Every kv run's place in a list slot: its offset and the bytes a token
@@ -756,11 +1139,6 @@ impl Pools {
         Ok(())
     }
 
-    /// Copies whole rs buffer pages (slot refs) `(src, dst)` on the device.
-    pub fn copy_buffer_pages(&mut self, frame: &mut Frame, moves: &[(u32, u32)]) -> Result<()> {
-        self.copy_whole(frame, BUFFER, moves)
-    }
-
     /// Slots of one shape copied as [`engine::Engine::copy_slots`] states
     /// them: on the device (whole slots, and token runs of the list), or
     /// between the device and the slot files.
@@ -816,7 +1194,6 @@ impl Pools {
         let (what, bytes) = match id {
             LIST => ("disk kv pages", self.shape(LIST)?.slot_bytes),
             FIXED => ("parked rs rows", self.shape(FIXED)?.slot_bytes),
-            BUFFER => ("parked rs buffer pages", self.shape(BUFFER)?.slot_bytes),
             other => {
                 return Err(Fault::Unbound {
                     what: format!("slot shape {other}, which this pool does not hold"),
@@ -833,8 +1210,7 @@ impl Pools {
         }
         let file = match id {
             LIST => &mut self.disk,
-            FIXED => &mut self.parked,
-            _ => &mut self.parked_pages,
+            _ => &mut self.parked,
         };
         Spill::room(file.as_ref(), what, slots)?;
         let Some(spill) = file.as_mut() else {
@@ -861,27 +1237,23 @@ impl Pools {
     }
 
     /// Opens the slot files under `dir` within `budget` bytes: parked
-    /// records and their buffer pages first, as many as there are seats,
-    /// then kv pages; the kv pages they hold.
+    /// record pieces first, as many as the seats' records, then kv pages;
+    /// the kv pages they hold.
     pub fn seat_disk(&mut self, dir: &std::path::Path, budget: u64) -> Result<u32> {
         let stride = |bytes: u64| bytes.next_multiple_of(engine::disk::ALIGN as u64);
         let state = self.layout.fixed.map_or(0, |f| f.slot_bytes);
-        let page = self.layout.buffer.map_or(0, |b| b.slot_bytes);
-        let pair = stride(state) + stride(page);
         let rows = if state == 0 {
             0
         } else {
-            u64::from(self.paging.slots).min(budget.checked_div(pair).unwrap_or(0))
+            (u64::from(self.paging.slots) * u64::from(self.layout.pieces))
+                .min(budget.checked_div(stride(state)).unwrap_or(0))
         };
         if state > 0 {
             self.parked = Spill::open(dir, "r0.rs", state, rows * stride(state))?;
         }
-        if page > 0 {
-            self.parked_pages = Spill::open(dir, "r0.rsb", page, rows * stride(page))?;
-        }
         let kv = self.page_bytes()?;
         if kv > 0 {
-            self.disk = Spill::open(dir, "r0.kv", kv, budget - rows * pair)?;
+            self.disk = Spill::open(dir, "r0.kv", kv, budget - rows * stride(state))?;
         }
         Ok(Spill::slots(self.disk.as_ref()))
     }
@@ -891,23 +1263,16 @@ impl Pools {
         Spill::slots(self.parked.as_ref())
     }
 
-    #[must_use]
-    pub fn parked_pages(&self) -> u32 {
-        Spill::slots(self.parked_pages.as_ref())
-    }
-
     /// Copies whole kv pages (slot refs) between the pool and the slot
     /// file, `pages[i]` with `slots[i]`.
     pub fn spill_kv(&mut self, to_disk: bool, pages: &[u32], slots: &[u32]) -> Result<()> {
         self.spill(LIST, to_disk, pages, slots)
     }
 
+    /// Copies whole record pieces (slot refs) between the pool and the
+    /// slot file.
     pub fn park_state(&mut self, out: bool, device: &[u32], rows: &[u32]) -> Result<()> {
         self.spill(FIXED, out, device, rows)
-    }
-
-    pub fn park_pages(&mut self, out: bool, pages: &[u32], rows: &[u32]) -> Result<()> {
-        self.spill(BUFFER, out, pages, rows)
     }
 
     /// Checks what a fire touches is committed: `demand`'s kv pages and
@@ -1018,7 +1383,7 @@ mod tests {
 
     #[test]
     fn a_slot_starts_at_its_chunk_then_its_index() {
-        let layout = Layout::new(1 << 20, 8, 4, 16, [64 << 10, 256 << 10, 0], 2, 4).unwrap();
+        let layout = Layout::new(1 << 20, 8, 4, 16, [64 << 10, 256 << 10], 1, 2, 4).unwrap();
         let list = layout.list.unwrap();
         assert_eq!(slot_at(&layout, &list, 16), 1 << 20);
         assert_eq!(slot_at(&layout, &list, 17), (1 << 20) + (64 << 10));

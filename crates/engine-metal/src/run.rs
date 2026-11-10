@@ -37,6 +37,9 @@ pub struct CacheTable {
     pub pools: Vec<CachePool>,
     /// The compressor state beside each kv space a pool gather reads.
     pub compressed: Vec<(u32, PoolSlabs)>,
+    /// Each cache row's lane table of record piece ids (its band's), for
+    /// the committed scans that index a state by lane.
+    pub lane_slots: Vec<Option<Tensor>>,
 }
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -1927,6 +1930,14 @@ impl<'c> Run<'c> {
                 "value {} is a recurrent state space, and this op walks a paged kv pool",
                 id.0
             ),
+        }
+    }
+
+    /// The lane table of record piece ids cache row `id`'s state reads.
+    pub(crate) fn lane_slots(&self, id: ValueId) -> Option<Tensor> {
+        match &self.values[id.0 as usize].def {
+            Def::Cache(row) => self.caches.lane_slots.get(*row as usize).copied().flatten(),
+            _ => None,
         }
     }
 

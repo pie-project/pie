@@ -29,11 +29,13 @@ impl Run<'_> {
         }
     }
 
-    pub(crate) fn rs_committed(&self, seat: &Seat) -> Committed {
+    /// The committed scan's tables for the state `state`: its band's lane
+    /// table of record piece ids.
+    pub(crate) fn rs_committed(&self, seat: &Seat, state: poem_ir::ValueId) -> Committed {
         Committed {
             replay: seat.replay,
             commit: seat.commit,
-            slots: seat.slots,
+            slots: self.lane_slots(state).unwrap_or(seat.slots),
             lane0: self.window().span.lane_offset,
         }
     }
@@ -297,7 +299,7 @@ impl Run<'_> {
                 source,
                 paged,
                 self.qo_indptr(),
-                &self.rs_committed(seat),
+                &self.rs_committed(seat, conv.state),
                 conv.weight,
                 &self.recurrent(conv.state),
                 conv.conv_width,
@@ -313,7 +315,7 @@ impl Run<'_> {
             self.ctx(),
             ext_x,
             self.qo_indptr(),
-            &self.rs_committed(seat),
+            &self.rs_committed(seat, conv.state),
             conv.weight,
             &self.recurrent(conv.state),
             conv.conv_width,

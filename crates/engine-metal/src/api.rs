@@ -1041,7 +1041,7 @@ impl Metal {
         // record there; until the runtime states them, the legacy fields
         // carry the same slot refs.
         let mut pages_of: Vec<Option<Vec<u32>>> = Vec::with_capacity(submission.lanes.len());
-        let mut state_of: Vec<Option<u32>> = Vec::with_capacity(submission.lanes.len());
+        let mut record_of: Vec<Option<Vec<u32>>> = Vec::with_capacity(submission.lanes.len());
         let mut forks: Vec<(u32, u32)> = Vec::new();
         for lane in &submission.lanes {
             pages_of.push(
@@ -1054,23 +1054,16 @@ impl Metal {
                 .fixed
                 .iter()
                 .find(|(shape, _)| *shape == crate::store::layout::FIXED);
-            state_of.push(match fixed {
-                None => None,
-                Some((shape, pieces)) => {
-                    let &[[run, cow]] = pieces.as_slice() else {
-                        return Err(Error::Invalid(format!(
-                            "lane in slot {} names {} pieces of fixed shape {shape}, whose \
-                             records this engine keeps whole",
-                            lane.slot,
-                            pieces.len()
-                        )));
-                    };
-                    if run != cow {
+            record_of.push(fixed.map(|(_, pieces)| {
+                // `cow != run`: the record is copied before the fire, once
+                // for every lane of a group naming the same pair.
+                for &[run, cow] in pieces {
+                    if run != cow && !forks.contains(&(run, cow)) {
                         forks.push((run, cow));
                     }
-                    Some(cow)
                 }
-            });
+                pieces.iter().map(|&[_, cow]| cow).collect()
+            }));
         }
         if !forks.is_empty() {
             shell.copy_state(&forks).map_err(fault)?;
@@ -1102,9 +1095,10 @@ impl Metal {
                     translation: &lane.kv.translation,
                     rs: &lane.rs,
                     rs_reset: lane.rs_reset,
-                    rs_slot: state_of[at].or(lane.rs_slot),
+                    rs_slot: lane.rs_slot,
                     rs_snapshots: &lane.rs_snapshots,
                     refs: true,
+                    record: record_of[at].as_deref(),
                 })
             })
             .collect::<EngineResult<Vec<_>>>()?;

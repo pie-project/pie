@@ -116,7 +116,7 @@ fn load(fixture: &Fixture) -> Shell {
         trace: fixture.trace.clone(),
         contract: &fixture.contract,
         checkpoint: &fixture.container,
-        budget: Budget::new(SEATS, 64),
+        budget: Budget::new(SEATS, 256),
         patches: None,
         voxels: None,
         profile: None,
@@ -147,12 +147,13 @@ enum Placement {
     /// Seat-addressed: each lane's seat runs.
     Seats,
     /// Slot refs the runtime would name: pages strided over chunks
-    /// `first .. first + 3` from the top down, lane `l`'s record in chunk
-    /// `first + 3 + l`.
+    /// `first .. first + 3` from the top down, piece `p` of lane `l`'s
+    /// record in chunk `first + 3 + l * pieces + p`.
     Refs {
         first: u32,
         per_list: u32,
         per_fixed: u32,
+        pieces: u32,
     },
 }
 
@@ -170,25 +171,36 @@ impl Placement {
         }
     }
 
-    fn record(&self, lane: u32) -> u32 {
+    fn record(&self, lane: u32) -> Vec<u32> {
         match *self {
-            Placement::Seats => unreachable!(),
+            Placement::Seats => Vec::new(),
             Placement::Refs {
-                first, per_fixed, ..
-            } => (first + 3 + lane) * per_fixed + (lane * 3 + 1) % per_fixed,
+                first,
+                per_fixed,
+                pieces,
+                ..
+            } => (0..pieces)
+                .map(|p| (first + 3 + lane * pieces + p) * per_fixed + (lane * 3 + 1) % per_fixed)
+                .collect(),
+        }
+    }
+
+    /// The chunks this placement holds: three of pages and the records.
+    fn held(&self) -> u32 {
+        match *self {
+            Placement::Seats => 0,
+            Placement::Refs { pieces, .. } => 3 + 2 * pieces,
         }
     }
 }
 
-const PROMPTS: [&[u32]; 2] = [
-    &[
-        7, 42, 11, 200, 3, 99, 128, 65, 17, 4, 150, 23, 77, 1, 9, 30, 31, 101, 5, 6, 200, 2, 13,
-        14, 15, 66, 67, 68, 69, 70, 100, 110, 120, 130, 140, 150, 160,
-    ],
-    &[
-        5, 4, 3, 2, 1, 250, 240, 230, 220, 210, 200, 190, 180, 170, 160, 150, 140, 130, 120, 110,
-    ],
-];
+/// Two prompts long enough to span pages of the recipe's tokens.
+fn prompts() -> [Vec<u32>; 2] {
+    [
+        (0..150u32).map(|at| (at * 37 + 11) % 256).collect(),
+        (0..90u32).map(|at| (at * 53 + 5) % 256).collect(),
+    ]
+}
 
 /// Prefills each lane alone, then decodes both together `steps` times;
 /// after `evacuate_at` decodes, `between` runs (an evacuation). Every
@@ -203,14 +215,16 @@ fn serve(
 ) -> Vec<Vec<f32>> {
     let refs = matches!(place, Placement::Refs { .. });
     let mut held = [0u32; 2];
-    let mut fed: [Vec<u32>; 2] = [PROMPTS[0].to_vec(), PROMPTS[1].to_vec()];
+    let mut fed: [Vec<u32>; 2] = prompts();
+    let page = shell.paging().page_size;
+    let records = [place.record(0), place.record(1)];
     let mut rows = Vec::new();
     let tables = |held: [u32; 2], rows: [u32; 2]| -> [Vec<u32>; 2] {
         [0, 1].map(|lane| {
             if !refs {
                 return Vec::new();
             }
-            let pages = (held[lane] + rows[lane]).div_ceil(PAGE);
+            let pages = (held[lane] + rows[lane]).div_ceil(page);
             (0..pages)
                 .map(|page| place.page(lane as u32, page))
                 .collect()
@@ -222,7 +236,7 @@ fn serve(
             .map(|&(lane, tokens, have, pages)| Seated {
                 pages,
                 held: Some(have),
-                rs_slot: refs.then(|| place.record(lane)),
+                record: refs.then(|| records[lane as usize].as_slice()),
                 refs,
                 ..Seated::of(Lane {
                     slot: lane,
@@ -265,9 +279,6 @@ fn serve(
     }
     rows
 }
-
-/// The chunks the scattered placement holds: three of pages, two records.
-const HELD: u32 = 5;
 
 /// Panics at the first row whose logits differ in a bit.
 fn same(what: &str, got: &[Vec<f32>], want: &[Vec<f32>]) {
@@ -331,18 +342,26 @@ fn check(model: &str, hybrid: bool) {
     let layout = shell.pool_layout();
     let segment = facts.segment_chunks;
     let low = 1 + layout.seat_chunks();
-    let kept = (low + HELD).div_ceil(segment);
+    let per = |id| facts.shape(id).map_or(1, |s| s.slots_per_chunk);
+    let place = Placement::Refs {
+        first: 0,
+        per_list: per(LIST),
+        per_fixed: per(FIXED),
+        pieces: layout.pieces,
+    };
+    let held = place.held();
+    let kept = (low + held).div_ceil(segment);
     let first = kept * segment;
-    let commit = kept + HELD.div_ceil(segment);
+    let commit = kept + held.div_ceil(segment);
     assert!(
         facts.segments.max >= commit,
         "{model}: the pool spans {commit} segments"
     );
-    let per = |id| facts.shape(id).map_or(1, |s| s.slots_per_chunk);
     let place = Placement::Refs {
         first,
         per_list: per(LIST),
         per_fixed: per(FIXED),
+        pieces: layout.pieces,
     };
     shell.commit_segments(commit).expect("the segments commit");
     let sparse = facts.segments.growth == Growth::Bottom;
@@ -353,7 +372,7 @@ fn check(model: &str, hybrid: bool) {
         STEPS,
         STEPS / 2,
         &mut |shell| {
-            let moves = (0..HELD).map(|at| (first + at, low + at)).collect();
+            let moves = (0..held).map(|at| (first + at, low + at)).collect();
             shell
                 .evacuate(&Evacuation { moves })
                 .expect("the evacuation lands");
@@ -389,7 +408,7 @@ fn a_scattered_hybrid_pool_serves_the_same_logits() {
 #[test]
 #[allow(unsafe_code)]
 fn a_reserved_hybrid_pool_states_shared_chunks() {
-    use engine_metal::store::layout::{BUFFER, Layout};
+    use engine_metal::store::layout::Layout;
     use engine_metal::store::{Pools, Rows};
 
     if !engine_metal::device::present() {
@@ -402,18 +421,32 @@ fn a_reserved_hybrid_pool_states_shared_chunks() {
         .trace(Platform::Metal);
     let device = engine_metal::Context::bind().expect("the system device");
     let facts = engine_metal::store::kv::probe(&trace).expect("the kv facts");
-    let rows = Rows::plan(&trace, PAGE, &facts).expect("the rows lay out");
+    let budgets = poem_compiler::Budgets::of(Budget::new(SEATS, 64));
+    let recipe = engine_metal::chunks::recipe(&trace, &budgets).expect("a recipe");
     let rs = engine_metal::rs::Layout::read(&trace).expect("the rs layout");
-    let buffer = rs
-        .as_ref()
-        .map_or(0, |rs| engine_metal::rs::Buffers::page_layout(rs, PAGE).1);
-    let bytes = [rows.list_bytes, rows.fixed_bytes, buffer];
-    let chunk = Layout::chunk_bytes(bytes[0], bytes[1], bytes[2], 2 << 20);
+    let rows = match Rows::plan(&trace, &recipe, &facts, rs.as_ref()) {
+        Ok(rows) => rows,
+        Err(why) => {
+            eprintln!("{name}: the recipe and this shell disagree: {why}");
+            return;
+        }
+    };
+    let chunk = rows.chunk_bytes;
     let segment = engine_metal::store::pool::segment_chunks(chunk);
-    let layout =
-        Layout::new(chunk, 3 * segment, segment, PAGE, bytes, SEATS, 16).expect("a layout");
-    let paging = engine_metal::store::kv::Paging::of(PAGE, 256, SEATS, 1).expect("a paging");
-    let mut pools = Pools::reserve(&device, rows, layout, paging, Vec::new()).expect("a pool");
+    let layout = Layout::new(
+        chunk,
+        3 * segment,
+        segment,
+        rows.tokens,
+        [rows.list_bytes, rows.fixed_bytes],
+        rows.pieces,
+        SEATS,
+        4,
+    )
+    .expect("a layout");
+    let paging = engine_metal::store::kv::Paging::of(rows.tokens, 256, SEATS, 1).expect("a paging");
+    let bands = rows.bands.clone();
+    let mut pools = Pools::reserve(&device, rows, layout, paging).expect("a pool");
     let facts = pools.chunk_facts();
     eprintln!(
         "{name}: {} chunks of {} B, segments {:?}, shapes {:?}",
@@ -427,7 +460,12 @@ fn a_reserved_hybrid_pool_states_shared_chunks() {
             .collect::<Vec<_>>()
     );
     facts.validate().expect("the facts hang together");
-    for id in [LIST, FIXED, BUFFER] {
+    eprintln!("{name}: bands {bands:?}");
+    assert_eq!(
+        pools.bands().iter().sum::<u32>() as usize,
+        bands.iter().map(Vec::len).sum::<usize>()
+    );
+    for id in [LIST, FIXED] {
         let shape = facts.shape(id).expect("the shape stands");
         assert!(shape.pinned.is_none());
         assert!(shape.slot_bytes * u64::from(shape.slots_per_chunk) <= facts.chunk_bytes);

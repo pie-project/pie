@@ -5,13 +5,13 @@ pub mod layout;
 pub mod pool;
 mod pools;
 
-pub use pools::{Pools, Rows};
+pub use pools::{Pools, Rows, RsRows};
 
 use kernels_metal::{StateMap, Tensor};
 use poem_ir::{Attn, Def, Dtype, Operation, Trace};
 
 use crate::error::{Fault, Result};
-use crate::store::kv::{Facts, Paging};
+use crate::store::kv::Paging;
 
 impl From<poem_exec::store::Fault> for Fault {
     fn from(fault: poem_exec::store::Fault) -> Fault {
@@ -60,6 +60,9 @@ pub struct Seats {
     pub spaces: Vec<SpaceSeat>,
     pub slot_ids: Tensor,
     pub slot_of_row: Tensor,
+    /// Each band's lane and row tables (`Pools::bands`).
+    pub lane_bands: Vec<Tensor>,
+    pub row_bands: Vec<Tensor>,
 }
 
 /// Bytes of one state row's segment table: its head and one segment.
@@ -117,11 +120,11 @@ impl PoolDemand {
     /// `trace`'s held state at `paging`'s page size and slots, beside
     /// `rs`'s recurrent-state buffers; `paging`'s page count is not read.
     pub fn of(trace: &Trace, paging: Paging, rs: Option<&crate::rs::Layout>) -> Result<PoolDemand> {
-        let rows = Rows::plan(trace, paging.page_size, &Facts::default())?;
+        let (token, state, side) = Rows::estimate(trace, paging.page_size)?;
         let buffers = rs.map_or(0, |layout| crate::rs::Buffers::demand(layout, paging));
         Ok(PoolDemand {
-            per_page: rows.token_bytes() * u64::from(paging.page_size) + rows.side_bytes,
-            fixed: buffers + rows.state_bytes() * u64::from(paging.slots),
+            per_page: token * u64::from(paging.page_size) + side,
+            fixed: buffers + state * u64::from(paging.slots),
         })
     }
 

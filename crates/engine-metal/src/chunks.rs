@@ -93,17 +93,19 @@ impl Shell {
     }
 }
 
-/// The chunk the compiler's on-device Metal recipe packs `trace` into
-/// under `budgets`; [`crate::store::layout::TARGET_CHUNK`] where it packs
-/// into none.
-#[must_use]
-pub fn recipe_chunk(trace: &poem_ir::Trace, budgets: &Budgets) -> u64 {
+/// The compiler's on-device Metal recipe for `trace` under `budgets`: the
+/// pool's one layout source.
+pub fn recipe(
+    trace: &poem_ir::Trace,
+    budgets: &Budgets,
+) -> Result<poem_compiler::chunk::ChunkRecipe> {
     let profile = DeviceProfile {
         chunk: ChunkProfile::ON_DEVICE_METAL,
         ..DeviceProfile::default()
     };
-    poem_compiler::chunk::plan(trace, budgets, &profile)
-        .map_or(crate::store::layout::TARGET_CHUNK, |recipe| {
-            recipe.chunk_bytes
-        })
+    poem_compiler::chunk::plan(trace, budgets, &profile).map_err(|why| {
+        crate::error::Fault::Unbound {
+            what: format!("the on-device Metal chunk recipe of this trace: {why}"),
+        }
+    })
 }
