@@ -857,3 +857,12 @@ The `new-memory/` directory is bookkeeping and is removed before anything lands 
 - `sc/l40s-tier-bounds` (7b544a593): seat_tier cuts host_kv_budget to the machine's available memory (MemAvailable +
   cgroup limit; RLIMIT_MEMLOCK does not govern cudaHostAlloc) with a warning, so the stated host_chunks can be pinned;
   the pin thread warns on a failed chunk (locked vs asked). golden_offload unchanged; cut / warning paths untested.
+
+### Note — 2026-11-10: IT round 8 (sm_120, M64) — REGRESSION from M62
+- Default config RSS 27,178 MiB at ready (base 1,810; M58 2,551): the default host tier equals the device pool
+  (1,442 chunks x 18.9 MB) and M62 pins ALL of it at boot. Would OOM the full 30B in the 59 GB container. With
+  host_kv_budget = 1GiB: 2,228 MiB. Assigned to L40S: pin a bounded lookahead, not the whole budget.
+- dsv41 dspark two-window mini: refused on sm_120 too (fused.lse_sink: fp8 compressed rows only read by
+  attn::compressed::decode::decode, not this shape / gathered seats) -> kernel gap, two-window bitwise still unverified.
+- device_weight_budget 512 / 128 MiB on the MoE mini: serves, tokens = base, but decode ~38 tok/s (~10x slower;
+  eager rotor + host plane reads) -> recordable rotor task.
