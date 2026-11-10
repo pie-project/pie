@@ -101,6 +101,10 @@ pub struct FireBindings {
 
     pub geometry: Vec<CacheGeometry>,
 
+    /// The page table each window's write descriptors read, by the window
+    /// a geometry input states (CONTRACT-BC 21); any other reads table 0.
+    pub window_tables: Vec<(u32, usize)>,
+
     pub tables: FireTables,
 
     pub rs: Option<std::sync::Arc<crate::rs::Seat>>,
@@ -428,7 +432,7 @@ impl<'c> Run<'c> {
             .as_ref()
             .expect("`compacted` is reached only through a gathered window");
         if let Def::Input(RuntimeInput::Geometry { kind }) = &self.values[at].def {
-            let Some(table) = gathered.page_tables.first() else {
+            let Some(table) = gathered.page_tables.get(self.table_of(*kind)) else {
                 return handle;
             };
             return match kind {
@@ -587,9 +591,13 @@ impl<'c> Run<'c> {
                 })
             }
             Def::Input(RuntimeInput::Geometry { kind }) => {
-                // One page table: the All axis's and every write's.
-                let seat = self.fire.geometry.first().unwrap_or_else(|| {
-                    panic!("value {at} reads a page table, and this fire binds none")
+                // The All axis's table, or a write descriptor's row's list's.
+                let table = self.table_of(*kind);
+                let seat = self.fire.geometry.get(table).unwrap_or_else(|| {
+                    panic!(
+                        "value {at} reads page table {table}, and this fire binds {}",
+                        self.fire.geometry.len()
+                    )
                 });
                 let bound = match kind {
                     GeomKind::Indptr => seat.indptr,
@@ -929,6 +937,20 @@ impl<'c> Run<'c> {
                 id.0
             ),
         }
+    }
+
+    /// The page table geometry input `kind` reads: the All axis's (the
+    /// first), or a write descriptor's row's list's.
+    fn table_of(&self, kind: GeomKind) -> usize {
+        poem_exec::store::kv::geometry_window(kind)
+            .and_then(|window| {
+                self.fire
+                    .window_tables
+                    .iter()
+                    .find(|(held, _)| *held == window)
+                    .map(|&(_, table)| table)
+            })
+            .unwrap_or(0)
     }
 
     pub(crate) fn pool(&self, id: ValueId) -> &KvPool {

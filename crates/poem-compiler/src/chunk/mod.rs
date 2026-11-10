@@ -772,8 +772,10 @@ pub fn plan(
             let grain = rows
                 .iter()
                 .fold(TOKEN_GRAIN, |base, r| census::lcm(base, r.ratio));
-            // A backend that states its page pages its windowed rows by it.
-            let least = if device.token_slot.is_some() {
+            // A backend that pages its windowed rows by one table pages them
+            // by its stated page; one with a table a window list takes the
+            // window's own slot.
+            let least = if device.token_slot.is_some() && device.one_window {
                 page
             } else {
                 grain.min(page)

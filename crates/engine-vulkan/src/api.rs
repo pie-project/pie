@@ -1164,6 +1164,7 @@ impl Vulkan {
                 rs_reset: lane.rs_reset,
                 rs_slot: lane.rs_slot,
                 refs: true,
+                windows: &lane.tables,
                 record: record_of[at].as_deref(),
                 record_run: run_of[at].as_deref(),
 

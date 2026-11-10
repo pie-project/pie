@@ -29,8 +29,7 @@ impl Shell {
             adapter_banks: u32::try_from(self.banks().len()).unwrap_or(u32::MAX),
             slab_kv_page_bytes: self.kv_page_bytes(),
             disk_kv_pages,
-            // The sliding rows are paged in full here: the model's window
-            // is a fact of the model, its pool is not.
+            // The model's window; its rows lie in window lists.
             window_tokens: poem_exec::store::kv::declared_window(self.trace()).unwrap_or(0),
             ..PoolFacts::default()
         }
@@ -49,8 +48,9 @@ impl Shell {
 /// The chunk profile of a Vulkan or WebGPU device whose one binding spans
 /// `binding` bytes: chunks of a few MiB, segments no larger than a binding
 /// (a pool is at most four of them, `kernels/prim/pool.slang`), kv pages
-/// of the load's `page_size` holding windowed rows in full (these kernels
-/// page every kv row by one table), state rows in f32.
+/// of the load's `page_size`, a window list a distinct window narrower than
+/// the `context` (each its own `T_w` and page table, CONTRACT-BC 21), state
+/// rows in f32.
 #[must_use]
 pub fn profile(page_size: u32, context: u32, binding: u64, target: Option<u64>) -> ChunkProfile {
     ChunkProfile {
@@ -65,9 +65,9 @@ pub fn profile(page_size: u32, context: u32, binding: u64, target: Option<u64>) 
         cut_experts: true,
         state_f32: true,
         token_slot: Some(page_size),
-        one_window: true,
-        // Every window holds its rows whole: no window list.
-        full_from: Some(1),
+        one_window: false,
+        // A window as wide as the context keeps every token: a list row.
+        full_from: Some(context),
     }
 }
 

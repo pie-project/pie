@@ -188,6 +188,11 @@ pub struct Seated<'a> {
     /// its seat's runs in the pool.
     pub refs: bool,
 
+    /// The lane's window list tables (CONTRACT-BC 21): each window list's
+    /// shape and its slot refs in its own token order, 0 where trimmed.
+    /// Read where `refs` holds; a list it names not is seat-addressed.
+    pub windows: &'a [(engine::chunk::ShapeId, Vec<u32>)],
+
     /// The lane's record, one fixed slot ref a piece, the side it writes
     /// (the copy-on-write side where the runtime names two).
     pub record: Option<&'a [u32]>,
@@ -226,6 +231,7 @@ impl<'a> Seated<'a> {
             rs_reset: engine::fire::RsReset::Inferred,
             rs_slot: None,
             refs: false,
+            windows: &[],
             record: None,
             record_run: None,
             feed: None,
@@ -556,7 +562,20 @@ impl Shell {
                 .context()
                 .div_ceil(rs_tokens.max(1))
                 .div_ceil(u32::try_from(per).unwrap_or(1).max(1))
-        });
+        }) + rows
+            .windows
+            .iter()
+            .map(|w| {
+                let per = u32::try_from(chunk / w.bytes.max(1)).unwrap_or(1).max(1);
+                asked.context().div_ceil(w.tokens.max(1)).div_ceil(per)
+            })
+            .sum::<u32>();
+        // The most pages a lane's table takes: the narrowest slot's.
+        let table_pages = rows
+            .windows
+            .iter()
+            .map(|w| asked.context().div_ceil(w.tokens.max(1)))
+            .fold(asked.pages_per_slot, u32::max);
         let least = Paging {
             pages: u64::from(asked.pages_per_slot),
             ..asked
@@ -584,14 +603,9 @@ impl Shell {
 
         let mut scratch =
             Scratch::reserve(&device, &boot.trace, &compiled, &budgets, least, &tuning)?;
-        // One page table: every kv row, windowed or not, pages its rows in
-        // full here, so the All axis and every write read the same one.
-        let page_tables = usize::from(
-            boot.trace
-                .caches
-                .iter()
-                .any(|row| matches!(row, poem_ir::CacheRow::Kv { .. })),
-        );
+        // A page table a list the kv rows lie in: the kv list's first (the
+        // All axis's), then each window list's (CONTRACT-BC 21).
+        let page_tables = rows.tables.len();
 
         let arms = boot.runahead.frames().max(1);
 
@@ -681,6 +695,7 @@ impl Shell {
                     &boot.budget,
                     asked,
                     page_tables,
+                    table_pages,
                     compiled.classes.classes.len(),
                     gathers,
                     patch_seat,
@@ -870,6 +885,19 @@ impl Shell {
             asked.pages_per_slot,
         )?
         .with_rs(rs_bytes, rs_tokens, asked.pages_per_slot)?;
+        let layout = rows
+            .windows
+            .iter()
+            .enumerate()
+            .try_fold(layout, |layout, (k, w)| {
+                layout.with_window(
+                    k,
+                    w.bytes,
+                    w.window,
+                    w.tokens,
+                    asked.context().div_ceil(w.tokens.max(1)),
+                )
+            })?;
         let pages = u64::from(layout.list.map_or(0, |list| list.per_chunk)) * u64::from(total);
         let slots = boot.slots;
         tracing::info!(
@@ -2104,6 +2132,9 @@ impl Shell {
         let mut kv_less: Vec<bool> = Vec::with_capacity(lanes.len());
 
         let mut tables: Vec<std::borrow::Cow<'_, [u32]>> = Vec::with_capacity(lanes.len());
+        // Each window list's tables, a lane each, by the fire's page tables.
+        let mut window_tables: Vec<Vec<Vec<u32>>> =
+            vec![Vec::with_capacity(lanes.len()); self.pools.tables().len()];
         let mut tokens: Vec<i32> = Vec::with_capacity(rows as usize);
         let mut positions: Vec<i32> = Vec::with_capacity(rows as usize);
         let mut rotations: Vec<i32> = Vec::with_capacity(rows as usize);
@@ -2233,6 +2264,43 @@ impl Shell {
                     Some((lane.slot, u32::try_from(pages).unwrap_or(u32::MAX))),
                 )?
             }));
+            for (at, &paged) in self.pools.tables().iter().enumerate() {
+                let Some(k) = paged.window() else {
+                    continue;
+                };
+                let shape = crate::store::layout::window_shape(k);
+                let named = seated
+                    .windows
+                    .iter()
+                    .find(|(id, _)| *id == shape)
+                    .map(|(_, refs)| refs.as_slice())
+                    .filter(|_| seated.refs);
+                let table = match named {
+                    _ if seated.kv_less => Vec::new(),
+                    Some(refs) => self.pools.list_pages(paged, refs, None)?,
+                    None if seated.refs => {
+                        return Err(program(
+                            "serve::stage",
+                            format!(
+                                "lane {source} names its slots by ref and no table of window \
+                                 list {shape}"
+                            ),
+                        ));
+                    }
+                    None => {
+                        let tokens = self.pools.paging_of(paged).page_size.max(1);
+                        let pages = (u64::from(have) + u64::from(row.rows))
+                            .div_ceil(u64::from(tokens))
+                            .max(1);
+                        self.pools.list_pages(
+                            paged,
+                            &[],
+                            Some((lane.slot, u32::try_from(pages).unwrap_or(u32::MAX))),
+                        )?
+                    }
+                };
+                window_tables[at].push(table);
+            }
 
             // A kv-less lane's mask goes to its group-packed attention, not the paged prefill.
             let masking = seated.mask.filter(|_| !seated.kv_less);
@@ -2386,12 +2454,37 @@ impl Shell {
 
         let indptr_host = kv::indptr(&seats)?;
         let table_refs: Vec<&[u32]> = tables.iter().map(std::convert::AsRef::as_ref).collect();
-        let mut geometries = (0..self.page_tables)
-            .map(|_| kv::geometry_with(&paging, &seats, &table_refs))
-            .collect::<Result<Vec<_>>>()?;
+        let mut geometries = Vec::with_capacity(self.page_tables);
+        for (at, &paged) in self.pools.tables().iter().enumerate() {
+            geometries.push(match paged {
+                crate::store::Paged::List => kv::geometry_with(&paging, &seats, &table_refs)?,
+                crate::store::Paged::Window(_) => {
+                    let refs: Vec<&[u32]> = window_tables[at].iter().map(Vec::as_slice).collect();
+                    let list = self.pools.paging_of(paged);
+                    // A fire of kv-less lanes reads no geometry.
+                    let list = if kv_free {
+                        Paging {
+                            page_size: list.page_size,
+                            pages_per_slot: paging
+                                .pages_per_slot
+                                .saturating_mul((paging.page_size / list.page_size.max(1)).max(1)),
+                            ..paging
+                        }
+                    } else {
+                        list
+                    };
+                    kv::geometry_with(&list, &seats, &refs)?
+                }
+            });
+        }
 
         if writes.iter().any(Option::is_some) {
-            for geometry in &mut geometries {
+            // Explicit write descriptors name kv list pages.
+            for (geometry, _) in geometries
+                .iter_mut()
+                .zip(self.pools.tables())
+                .filter(|(_, paged)| **paged == crate::store::Paged::List)
+            {
                 for (row, stated) in writes.iter().enumerate() {
                     let Some((page, offset)) = *stated else {
                         continue;
@@ -2756,6 +2849,7 @@ impl Shell {
 
             mrope_positions: bound.mrope_positions,
             geometry,
+            window_tables: self.pools.window_tables(),
             tables: FireTables {
                 request_of_token: bound.request_of_token,
                 mask: bound.mask,

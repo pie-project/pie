@@ -277,6 +277,7 @@ impl Inputs {
         budget: &Budget,
         paging: Paging,
         page_tables: usize,
+        table_pages: u32,
         classes: usize,
         gathered: usize,
         patch: Option<PatchSeat>,
@@ -289,7 +290,8 @@ impl Inputs {
         let pieces = pieces.max(1);
         let rows = u64::from(budget.max_tokens);
         let lanes = u64::from(budget.max_lanes);
-        let pages = u64::from(budget.max_lanes) * u64::from(paging.pages_per_slot);
+        // A lane's table holds as many pages as its narrowest list takes.
+        let pages = u64::from(budget.max_lanes) * u64::from(paging.pages_per_slot.max(table_pages));
 
         let per_gathered = 3 * rows + page_tables as u64 * (2 * lanes + (lanes + 1) + pages);
         let window_ints =
