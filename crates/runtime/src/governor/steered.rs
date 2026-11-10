@@ -8,19 +8,23 @@ use std::sync::Arc;
 use crate::policy::pressure::{self, Tier};
 use crate::store::grow::Grow;
 use crate::store::registry;
+use crate::store::shared::SharedGrow;
 use crate::store::slots::SlotPool;
 use crate::store::weights::port::EnginePort;
 use crate::store::weights::{SlotAccess, WeightFirst};
 
 use super::{Demand, Growth, PoolTarget, Retarget, Signal};
 
-/// Today's pools of one engine, and the slots its weight shapes take.
+/// Today's pools of one engine, and the slots its weight shapes take; or
+/// the shared pool an engine that states one runs on, the weight shapes'
+/// slots among the state's.
 pub struct EnginePool {
     model: usize,
     engine: usize,
     /// `None`: the pools are whole from the load and never move.
     grow: Option<Grow>,
     weights: SlotPool,
+    shared: Option<SharedGrow>,
 }
 
 impl EnginePool {
@@ -31,7 +35,26 @@ impl EnginePool {
             engine,
             grow,
             weights,
+            shared: None,
         }
+    }
+
+    /// An engine's shared pool, which `grow` moves.
+    #[must_use]
+    pub fn shared(model: usize, engine: usize, grow: SharedGrow) -> Self {
+        Self {
+            model,
+            engine,
+            grow: None,
+            weights: crate::store::weights::slot_pool(&::engine::chunk::ChunkFacts::default()),
+            shared: Some(grow),
+        }
+    }
+
+    /// Whether the engine runs on a shared pool.
+    #[must_use]
+    pub const fn is_shared(&self) -> bool {
+        self.shared.is_some()
     }
 
     #[must_use]
@@ -56,62 +79,85 @@ impl SlotAccess for EnginePool {
                     (kv.current_epoch(), kv.retired_through())
                 })
             });
+        if let Some(shared) = &self.shared {
+            let mut pool = shared.shared().lock().unwrap();
+            pool.pool_mut().retire_through(retired);
+            f(pool.pool_mut(), epoch);
+            return;
+        }
         self.weights.retire_through(retired);
         f(&mut self.weights, epoch);
     }
 }
 
+impl EnginePool {
+    /// The target that moves: the shared pool's, else today's pools'.
+    fn target(&self) -> Option<&dyn PoolTarget> {
+        match (&self.shared, &self.grow) {
+            (Some(shared), _) => Some(shared),
+            (None, Some(grow)) => Some(grow),
+            (None, None) => None,
+        }
+    }
+
+    fn target_mut(&mut self) -> Option<&mut dyn PoolTarget> {
+        match (&mut self.shared, &mut self.grow) {
+            (Some(shared), _) => Some(shared),
+            (None, Some(grow)) => Some(grow),
+            (None, None) => None,
+        }
+    }
+}
+
 impl PoolTarget for EnginePool {
     fn demand(&mut self) -> Demand {
-        self.grow
-            .as_mut()
+        self.target_mut()
             .map_or(Demand { wanted: 0, live: 0 }, PoolTarget::demand)
     }
 
     fn segment_bytes(&self) -> u64 {
-        self.grow.as_ref().map_or(1, PoolTarget::segment_bytes)
+        self.target().map_or(1, PoolTarget::segment_bytes)
     }
 
     fn floor(&self) -> u64 {
-        self.grow.as_ref().map_or(0, PoolTarget::floor)
+        self.target().map_or(0, PoolTarget::floor)
     }
 
     fn hard_limit(&self) -> u64 {
-        self.grow.as_ref().map_or(0, PoolTarget::hard_limit)
+        self.target().map_or(0, PoolTarget::hard_limit)
     }
 
     fn held(&self) -> u64 {
-        self.grow.as_ref().map_or(0, PoolTarget::held)
+        self.target().map_or(0, PoolTarget::held)
     }
 
     fn growth(&self) -> Growth {
-        self.grow.as_ref().map_or(Growth::Fixed, PoolTarget::growth)
+        self.target().map_or(Growth::Fixed, PoolTarget::growth)
     }
 
     fn retarget(&mut self, segments: u64) -> Retarget {
-        self.grow.as_mut().map_or(Retarget::Reached, |grow| {
-            PoolTarget::retarget(grow, segments)
-        })
+        self.target_mut()
+            .map_or(Retarget::Reached, |grow| grow.retarget(segments))
     }
 
     fn take_refused(&mut self) -> bool {
-        self.grow.as_mut().is_some_and(PoolTarget::take_refused)
+        self.target_mut().is_some_and(PoolTarget::take_refused)
     }
 
     fn shrink_rung(&mut self) {
-        if let Some(grow) = &mut self.grow {
+        if let Some(grow) = self.target_mut() {
             grow.shrink_rung();
         }
     }
 
     fn restore_rung(&mut self) {
-        if let Some(grow) = &mut self.grow {
+        if let Some(grow) = self.target_mut() {
             grow.restore_rung();
         }
     }
 
     fn ticked(&mut self) {
-        if let Some(grow) = &mut self.grow {
+        if let Some(grow) = self.target_mut() {
             grow.ticked();
         }
     }

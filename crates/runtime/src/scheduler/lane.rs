@@ -801,6 +801,9 @@ impl Lane {
                         PoolOp::CommitState(slots) => engine.commit_state(slots),
                         PoolOp::ReleaseState(slots) => engine.release_state(slots),
                         PoolOp::ReleaseScratch => engine.release_scratch(),
+                        PoolOp::CommitSegments(segments) => engine.commit_segments(segments),
+                        PoolOp::ReleaseSegments(segments) => engine.release_segments(segments),
+                        PoolOp::Evacuate(evacuation) => engine.evacuate(&evacuation),
                     }
                     .map_err(anyhow::Error::from)
                 });

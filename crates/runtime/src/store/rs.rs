@@ -13,6 +13,7 @@ use crate::store::chunks::{ShapePool, StorePools};
 use crate::store::genmap::{GenKey, GenMap};
 use crate::store::kv::hash::Hash256;
 use crate::store::pool::PoolId;
+use crate::store::shared::Shared;
 use crate::store::slots::{Demand, Holder, ShapeKind};
 use write::{
     RsBufferTarget, RsPendingFold, RsPendingFolds, RsPreparedWrite, RsPublished, RsSnapshot,
@@ -97,6 +98,11 @@ pub enum RsError {
 }
 
 pub const RS_TRANSLATION_UNMAPPED: u32 = u32::MAX;
+
+/// The buffer page ids a shared pool's store keeps a record: the most rows
+/// a fire leaves unfolded, a page each at the smallest page, and as many
+/// again for a copy-on-write.
+const BUFFER_PAGES_PER_RECORD: u32 = 32;
 
 /// A count in each recurrent pool: state slots and buffer pages. Each is
 /// a fixed slot shape's slots, and in the degenerate mode a slot is a chunk,
@@ -333,6 +339,54 @@ impl RsStore {
                 pools.buffer.host,
             )
         }
+    }
+
+    /// The store an engine's shared pool backs: a window ring of the ring
+    /// shape's slot refs where there is a window (ref 0, in the null chunk,
+    /// is never handed out), else the pool's fixed records as state slots.
+    /// The rs buffer's rows ride inside each record, so its pages take no
+    /// memory: they number the rows the store tracks, nothing more.
+    pub fn shared(shared: &Shared) -> Self {
+        let (ring, fixed) = {
+            let pool = shared.lock().unwrap();
+            (pool.ring(), !pool.fixed().is_empty())
+        };
+        if let Some(ring) = ring {
+            let pages = ShapePool::shared(shared, ring);
+            let host = pages.ids_end().max(1);
+            return Self::build(
+                ShapePool::new(ShapeKind::Fixed, 0, 0, 0),
+                pages,
+                ShapePool::new(ShapeKind::Fixed, 0, host, 0),
+                ShapePool::new(ShapeKind::Ring, ring.slot_bytes, host, 0),
+                0,
+                Some(RingGeometry {
+                    tokens: ring.window,
+                    page_size: ring.tokens,
+                }),
+            );
+        }
+        let slots = if fixed {
+            ShapePool::records(shared, 0)
+        } else {
+            ShapePool::new(ShapeKind::Fixed, 0, 0, 0)
+        };
+        let records = slots.capacity();
+        let pages = records.saturating_mul(BUFFER_PAGES_PER_RECORD);
+        let host = records + pages;
+        Self::build(
+            slots,
+            ShapePool::new(ShapeKind::Fixed, 0, records, pages),
+            ShapePool::new(ShapeKind::Fixed, 0, host, 0),
+            ShapePool::new(ShapeKind::Fixed, 0, host, 0),
+            records,
+            None,
+        )
+    }
+
+    /// Whether the state slots are a shared pool's records.
+    pub fn is_shared(&self) -> bool {
+        self.slots.is_shared() || self.pages.is_shared()
     }
 
     fn build(
@@ -1134,12 +1188,26 @@ impl RsStore {
         writes: Option<std::ops::Range<u32>>,
     ) -> Result<RsUnits, RsError> {
         let entry = self.entry(ws)?;
-        let state = write_state && (fresh || entry.folded.is_none_or(|id| self.ref_count(id) > 1));
         let targets = self.buffer_targets(entry, writes)?;
+        let write_state = write_state || self.buffer_writes_record(entry.folded, &targets);
+        let state = write_state && (fresh || entry.folded.is_none_or(|id| self.ref_count(id) > 1));
         Ok(RsUnits {
             slots: u32::from(state),
             pages: self.targets_demand(&targets),
         })
+    }
+
+    /// Whether writing buffer `targets` writes a record another holder
+    /// shares: in a shared pool the buffer rows ride inside the record, so
+    /// the record is copied on write as the state is.
+    fn buffer_writes_record(
+        &self,
+        folded: Option<RsSlotId>,
+        targets: &[(u32, Option<RsSlotId>)],
+    ) -> bool {
+        self.slots.is_shared()
+            && !targets.is_empty()
+            && folded.is_some_and(|id| self.ref_count(id) > 1)
     }
 
     fn buffer_targets(
@@ -1214,6 +1282,7 @@ impl RsStore {
             );
             entry.folded
         };
+        let write_state = write_state || self.buffer_writes_record(folded, &buffer_targets_src);
         let need = RsUnits {
             slots: u32::from(
                 write_state && (fresh || folded.is_none_or(|id| self.ref_count(id) > 1)),

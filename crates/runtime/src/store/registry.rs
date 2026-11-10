@@ -1,9 +1,11 @@
 use std::sync::atomic::Ordering;
 use std::sync::{Arc, LazyLock, Mutex, RwLock};
 
-use super::chunks::{Seats, StorePools};
+use super::chunks::{Seats, ShapePool, StorePools};
 use super::kv::KvStore;
 use super::rs::RsStore;
+use super::shared::Shared;
+use super::slots::ShapeKind;
 
 static KV_TAINTED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
@@ -42,6 +44,9 @@ pub struct Stores {
     pub seats: Arc<Mutex<Seats>>,
     pub kv_page_size: u32,
     pub context_pages: u64,
+    /// The engine's shared chunk pool, where it states one: the stores
+    /// draw their ids from it, and lanes name their slots by its shapes.
+    pub shared: Option<Shared>,
 }
 
 fn context_pages(max_context: usize, kv_page_size: u32) -> u64 {
@@ -104,6 +109,7 @@ pub fn register_model_with_swap(
             };
             EngineStores {
                 pools: StorePools {
+                    shared: false,
                     page_size: kv_page_size,
                     kv: ShapeRun {
                         disk: num_disk_pages.get(d).copied().unwrap_or(0),
@@ -121,17 +127,20 @@ pub fn register_model_with_swap(
                     buffer: run(pool.pages, pool.host_pages),
                 },
                 max_context: max_context.get(d).copied().unwrap_or(0),
+                shared: None,
             }
         })
         .collect();
     register_model_with_chunks(kv_page_size, &engines)
 }
 
-/// One engine's stores: its pools as chunks, and its longest context.
-#[derive(Clone, Copy, Debug, Default)]
+/// One engine's stores: its pools as chunks, its longest context, and the
+/// shared pool the stores draw from where it states one.
+#[derive(Clone, Debug, Default)]
 pub struct EngineStores {
     pub pools: StorePools,
     pub max_context: usize,
+    pub shared: Option<Shared>,
 }
 
 /// Registers a model whose engines state their pools as `engines` say.
@@ -140,6 +149,9 @@ pub fn register_model_with_chunks(kv_page_size: u32, engines: &[EngineStores]) -
         .iter()
         .map(|engine| {
             let pools = &engine.pools;
+            if let Some(shared) = &engine.shared {
+                return Some(shared_stores(shared, kv_page_size, engine.max_context));
+            }
             let mut kv = KvStore::with_pages(
                 pools.kv,
                 pools.kv.host,
@@ -165,10 +177,41 @@ pub fn register_model_with_chunks(kv_page_size: u32, engines: &[EngineStores]) -
                 seats: Arc::new(Mutex::new(Seats::new(slots))),
                 kv_page_size,
                 context_pages: context_pages(max_context, kv_page_size),
+                shared: None,
             })
         })
         .collect();
     REGISTRY.push(RwLock::new(stores))
+}
+
+/// The stores of an engine whose pool is `shared`: kv pages are the list
+/// shape's slot refs, the rs store's state slots its records (or its ring
+/// pages the ring shape's refs), as many seats as records. No host or disk
+/// tier yet: those move by `copy_slots`, which no store speaks yet.
+pub fn shared_stores(shared: &Shared, kv_page_size: u32, max_context: usize) -> Stores {
+    let (list, records) = {
+        let pool = shared.lock().unwrap();
+        (pool.list(), pool.records_capacity())
+    };
+    let pages = list.map_or_else(
+        || ShapePool::new(ShapeKind::List, 0, 0, 0),
+        |list| ShapePool::shared(shared, list),
+    );
+    let mut kv = KvStore::with_pool(pages, 0, 0, rand::random::<[u8; 32]>());
+    if let Some(identity) = crate::model::identity() {
+        kv.set_domain(identity.domain());
+    }
+    let rs = RsStore::shared(shared);
+    kv.set_keeps(kv_sharing() && records == 0 && !rs.is_ring());
+    kv.set_page_size(kv_page_size);
+    Stores {
+        kv: Arc::new(parking_lot::Mutex::new(kv)),
+        rs: Arc::new(Mutex::new(rs)),
+        seats: Arc::new(Mutex::new(Seats::new(records))),
+        kv_page_size,
+        context_pages: context_pages(max_context, kv_page_size),
+        shared: Some(Arc::clone(shared)),
+    }
 }
 
 /// `PIE_KV_SHARE`, on unless `0`.
@@ -248,6 +291,7 @@ mod tests {
             seats: Arc::new(Mutex::new(Seats::new(num_slots as u32))),
             kv_page_size,
             context_pages: context_pages(max_context, kv_page_size),
+            shared: None,
         });
         Ok(())
     }

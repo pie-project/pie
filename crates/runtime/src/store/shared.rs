@@ -796,3 +796,6 @@ pub enum RungError {
 
 #[cfg(test)]
 mod tests;
+
+mod target;
+pub use target::SharedGrow;
