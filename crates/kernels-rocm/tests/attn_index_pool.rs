@@ -497,6 +497,7 @@ fn pool_state_gather_and_store() {
             ratio as u32,
             st_kv.pool.keys,
             st_sc.pool.keys,
+            0,
         )
         .unwrap();
         let ape = bf16s(ratio * width, 40, 0.5);
@@ -512,6 +513,7 @@ fn pool_state_gather_and_store() {
             ratio as u32,
             st_kv.pool.keys,
             st_sc.pool.keys,
+            0,
             gpu.tensor(&ape, ratio as u32, width as u32, Dtype::F32),
             &mut entries,
         )

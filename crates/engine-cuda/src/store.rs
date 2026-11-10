@@ -569,6 +569,9 @@ pub struct Pools {
     records: std::collections::HashMap<u32, Vec<u32>>,
     /// The lanes a fire's staged id tables are laid for, and the entries its
     /// snapshot table is ([`Pools::seat_tables`]).
+    /// Whether the pool is laid for kernels that step pages packed and read
+    /// a recurrent row whole in its slot ([`pack`]).
+    packed: bool,
     id_lanes: u32,
     snap_entries: u32,
     shapes: Vec<Shape>,
@@ -753,9 +756,11 @@ impl Pools {
         budgets: &poem_compiler::Budgets,
         activation: u64,
         chunk_bytes: Option<u64>,
+        packed: bool,
     ) -> Result<Pools> {
+        let packed = packed || PACKED_KERNELS;
         let pool = PhysicalPool::open(device, utilization)?;
-        let layout = lay(trace, &paging, budgets, chunk_bytes)?;
+        let mut layout = lay(trace, &paging, budgets, chunk_bytes)?;
         let mut shapes = Vec::with_capacity(trace.caches.len());
 
         for (index, row) in trace.caches.iter().enumerate() {
@@ -895,6 +900,9 @@ impl Pools {
                 offset,
             });
         }
+        if packed {
+            pack(&mut layout, &shapes, &pooled, paging.page_size)?;
+        }
         let total = chunks_at(&layout, &paging, paging.pages(), paging.slots);
         let chunks = chunks::Chunks::reserve(&pool, layout, total, activation)?;
         Ok(Pools {
@@ -904,6 +912,7 @@ impl Pools {
             records: std::collections::HashMap::new(),
             id_lanes: 1,
             snap_entries: 1,
+            packed,
             shapes,
             pooled,
             paging,
@@ -1388,8 +1397,11 @@ impl Pools {
                     let row = &fixed.rows[run];
                     let element = u64::from(elem_size(dtype)).max(1);
                     let step = wide(fixed.slot.grain / element);
+                    // Kernels that read a row whole in its slot take the
+                    // row's place in the slot in the slab's pointer.
+                    let folded = if self.packed { row.offset } else { 0 };
                     let slab = Tensor::new(
-                        self.chunks.base(),
+                        self.chunks.base() + folded,
                         u32::try_from(self.chunks.bytes() / fixed.slot.grain.max(1))
                             .unwrap_or(u32::MAX),
                         narrow(stride) as u32,
@@ -1421,7 +1433,7 @@ impl Pools {
                             table: Tensor::ABSENT,
                             seg_chunks: 0,
                             pieces: row.pieces,
-                            piece_off: wide(row.offset / element),
+                            piece_off: wide((row.offset - folded) / element),
                             piece_atoms: if row.pieces > 1 {
                                 u32::try_from(row.atoms_per_piece).unwrap_or(u32::MAX)
                             } else {
@@ -2940,6 +2952,66 @@ fn lay(
             what: format!("a chunk recipe for this load's cache rows: {why}"),
         })?;
     layout::Layout::of(&recipe, &layout::streamed_rows(trace))
+}
+
+/// Whether this build's kernels step a plane's pages one right after another
+/// and find a recurrent row whole in its slot: the HIP kernels, which read
+/// neither a pool's page stride nor a record's pieces yet
+/// (`new-memory/ROCM-PORT.md`).
+const PACKED_KERNELS: bool = cfg!(feature = "rocm");
+
+/// Lays `layout` as kernels that step pages packed address it
+/// ([`PACKED_KERNELS`], or the `packed-pages` diagnostic): each kv shape's pages step one plane's packed page,
+/// and no recurrent row is cut. A load whose planes disagree, or whose
+/// record is cut into pieces, is refused.
+fn pack(
+    layout: &mut layout::Layout,
+    shapes: &[Shape],
+    pooled: &[PoolRow],
+    page_size: u32,
+) -> Result<()> {
+    for windowed in [false, true] {
+        let mut strides = Vec::new();
+        for shape in shapes {
+            if let Shape::Kv {
+                windowed: held,
+                dtype,
+                keys_width,
+                values_width,
+                values_plane,
+                ..
+            } = *shape
+                && held == windowed
+            {
+                let element = u64::from(elem_size(dtype));
+                strides.push(u64::from(page_size) * keys_width * element);
+                if values_plane != 0 {
+                    strides.push(u64::from(page_size) * values_width * element);
+                }
+            }
+        }
+        strides.extend(
+            pooled
+                .iter()
+                .filter(|row| row.windowed == windowed)
+                .map(|row| row.plane_bytes(page_size)),
+        );
+        layout.pack(Kind::paged(windowed), &strides)?;
+    }
+    if let Some(row) = layout
+        .fixed
+        .as_ref()
+        .and_then(|fixed| fixed.rows.iter().find(|row| row.pieces > 1))
+    {
+        return Err(Fault::Unbound {
+            what: format!(
+                "recurrent row {} cut into {} pieces of the record, which this backend's \
+                 kernels read whole in one slot",
+                row.row, row.pieces
+            ),
+        });
+    }
+    Ok(())
 }
 
 /// The chunks a pool of `pages` kv pages takes: the null chunk, the pages'

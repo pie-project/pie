@@ -14,8 +14,9 @@ use common::{Gpu, bf16, bf16s, values};
 use dtype::Dtype;
 use kernels_rocm::Tensor;
 use kernels_rocm::conv::{
-    Conv3d, ConvPath, TimePad, avg_down, cache_gather, cache_store, conv_weight_taps_major,
-    conv3d_on, patchify, pixel_shuffle, pixel_unshuffle, unpatchify, upsample_nearest,
+    Conv3d, ConvPath, TimePad, avg_down, cache_gather_slab, cache_store_slab,
+    conv_weight_taps_major, conv3d_on, patchify, pixel_shuffle, pixel_unshuffle, unpatchify,
+    upsample_nearest,
 };
 use kernels_rocm::elemwise::posenc::{GridRule, derive_grid};
 use spatial::{
@@ -508,7 +509,7 @@ fn the_frame_cache_gathers_and_stores_each_lanes_window() {
     let ids = gpu.ints(&slots);
     let ctx = gpu.ctx();
     let mut cache = gpu.zeros(cache_rows as u32, c as u32, Dtype::Bf16);
-    cache_gather(&ctx, slab, ids, g, frames as u32, &mut cache).expect("the gather fires");
+    cache_gather_slab(&ctx, slab, ids, g, frames as u32, &mut cache).expect("the gather fires");
     let mut want_cache = Vec::new();
     for (b, &slot) in boxes.iter().zip(&slots) {
         let n = frames * b.plane() * c;
@@ -520,7 +521,7 @@ fn the_frame_cache_gathers_and_stores_each_lanes_window() {
 
     let x = bf16s(rows * c, 0x5707, 1.0);
     let mut out = gpu.tensor(&slab_vals, 3, stride as u32, Dtype::Bf16);
-    cache_store(
+    cache_store_slab(
         &ctx,
         gpu.tensor(&x, rows as u32, c as u32, Dtype::Bf16),
         cache,

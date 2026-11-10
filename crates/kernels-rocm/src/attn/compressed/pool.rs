@@ -137,6 +137,29 @@ pub fn boundary_prefill(
     )
 }
 
+/// The compressor state slabs as the HIP kernels read them: a page's rows
+/// right after the page before's. `stride` is the elements between two
+/// pages' rows as an engine states them (0: packed); any other is the chunk
+/// pool's layout, which these kernels do not address.
+fn packed_state(
+    op: &'static str,
+    pages: &KvPool,
+    state: &Tensor,
+    stride: i64,
+) -> Result<(), Error> {
+    let packed = i64::from(pages.page_size) * i64::from(state.width);
+    if stride != 0 && stride != packed {
+        return Err(refuse(
+            op,
+            format!(
+                "compressor state pages {stride} elements apart, not the {packed} of pages \
+                 laid one after another: the HIP kernels read them packed"
+            ),
+        ));
+    }
+    Ok(())
+}
+
 #[allow(clippy::too_many_arguments)]
 pub fn state_write(
     ctx: &Ctx,
@@ -149,9 +172,11 @@ pub fn state_write(
     ratio: u32,
     state_kv: Tensor,
     state_score: Tensor,
+    state_stride: i64,
 ) -> Result<(), Error> {
     const OP: &str = "attn.pool_state_write";
     dtype_dispatch!(OP, kv.dtype, { Bf16 => () });
+    packed_state(OP, pages, &state_kv, state_stride)?;
     let ratio = pooling_ratio(OP, ratio)?;
     let head_dim = count(OP, "the head width this compressor states", head_dim)?;
     let width = count(OP, "the compressor's row width", kv.width)?;
@@ -200,11 +225,13 @@ pub fn gather(
     ratio: u32,
     state_kv: Tensor,
     state_score: Tensor,
+    state_stride: i64,
     ape: Tensor,
     entries: &mut Tensor,
 ) -> Result<(), Error> {
     const OP: &str = "attn.pool_gather";
     dtype_dispatch!(OP, entries.dtype, { Bf16 => () });
+    packed_state(OP, pages, &state_kv, state_stride)?;
     boundary_tables(OP, &boundary_pos, &boundary_req);
     if entries.width != head_dim {
         return Err(refuse(

@@ -177,6 +177,7 @@ pub const KV: KvPool = KvPool {
     max_pages_per_request: 0,
     pages_in_batch: 0,
     live: [0, 0],
+    page_stride: [0, 0],
 };
 
 /// A recurrent pool writing every lane's state, nothing else seated.
@@ -192,6 +193,7 @@ pub const STATE: RecurrentPool = RecurrentPool {
     begin_at: Tensor::ABSENT,
     fused_decay: false,
     snapshots: Snapshots::NONE,
+    segments: kernels_rocm::Segments::ONE,
 };
 
 /// f32 → bf16, round to nearest even, as the device stores.

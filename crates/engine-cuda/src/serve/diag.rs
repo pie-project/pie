@@ -23,6 +23,10 @@ pub struct Diagnostics {
     /// device profile's: a small one cuts a miniature's records into the
     /// pieces only a full model's take.
     pub chunk_bytes: Option<u64>,
+    /// Lays the state pool as kernels that step pages packed address it
+    /// (what a ROCm build always does): the same logits where the model can
+    /// be laid so, a refused load where it cannot.
+    pub packed_pages: bool,
 }
 
 /// The sync guard's answer to a fire that waited for the device.
@@ -54,6 +58,7 @@ impl Default for Diagnostics {
             gumbel_direct: true,
             sync_guard: None,
             chunk_bytes: None,
+            packed_pages: false,
         }
     }
 }
@@ -108,6 +113,9 @@ impl Diagnostics {
         if let Some(bytes) = self.chunk_bytes {
             words.push(format!("chunk-bytes={bytes}"));
         }
+        if self.packed_pages {
+            words.push("packed-pages".to_string());
+        }
         (!words.is_empty()).then(|| words.join(","))
     }
 }
@@ -126,7 +134,7 @@ const WORDS: &str = "`golden-probe`, `arm-trace`, \
      `ptr-trace=<key substring>`, `graph-dot=<dir>`, `grid-trace=<key substring>`, \
      `plan-trace=<rows|all>`, `arm-bench=<key>`, `capture-serial`, `boundary-trace`, `reap-trace`, \
      `trace-census`, `nan-check`, `fuse-chains=off`, `gumbel-direct=off`, \
-     `sync-guard[=panic]`, `chunk-bytes=<bytes>`";
+     `sync-guard[=panic]`, `chunk-bytes=<bytes>`, `packed-pages`";
 
 impl std::str::FromStr for Diagnostics {
     type Err = String;
@@ -150,6 +158,7 @@ impl std::str::FromStr for Diagnostics {
                 "reap-trace" => diag.reap_trace = switch(word, value)?,
                 "trace-census" => diag.trace_census = switch(word, value)?,
                 "nan-check" => diag.nan_check = switch(word, value)?,
+                "packed-pages" => diag.packed_pages = switch(word, value)?,
                 "fuse-chains" => diag.fuse_chains = switch(word, value)?,
                 "gumbel-direct" => diag.gumbel_direct = switch(word, value)?,
                 "sync-guard" => {
