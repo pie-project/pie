@@ -2887,6 +2887,7 @@ pub async fn submit_pass_stamped<C: FireContext>(
             }
             crate::offload::stream::tap(pid, &stores, &mut req);
             rs_prepared.apply_to(&mut req);
+            rs::apply_shared(&mut req, stores.shared.as_ref(), Some(&rs_prepared));
             checkpoints_here.extend(
                 rs_prepared
                     .snapshots
@@ -3942,6 +3943,7 @@ async fn fire_device_geometry<C: FireContext>(
         });
     }
     let settles = settling(&parts);
+    rs::apply_shared(&mut req, stores.shared.as_ref(), Some(&rs_prepared));
     let submit_error = crate::scheduler::submit_prebuilt_tracked_async_with_kv_and_rs_copy_on(
         &scheduler,
         req,

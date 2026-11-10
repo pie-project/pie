@@ -155,10 +155,39 @@ pub struct PreparedRs {
     pub window_copies: Vec<(u32, u32)>,
     pub snapshots: Vec<RsSnapshot>,
     pub txn: Option<RsTxn>,
+    /// The state slots are a shared pool's records: a lane names them by
+    /// `Lane::fixed`, and a copy is the engine's `[run, cow]`, not a
+    /// `StateCopy`.
+    pub shared: bool,
+    /// Lanes whose `slot_ids` name a record their working set writes or
+    /// holds.
+    pub bound: Vec<bool>,
 }
 
 impl PreparedRs {
+    /// Lane `row`'s `[run, cow]` records: the one its working set held and
+    /// the one the fire writes, the same where it writes in place.
+    #[must_use]
+    pub fn run_cow(&self, row: usize) -> Option<(u32, u32)> {
+        if !self.bound.get(row).copied().unwrap_or(false) {
+            return None;
+        }
+        let slot = *self.slot_ids.get(row)?;
+        let run = self
+            .copies
+            .1
+            .iter()
+            .position(|&dst| dst == slot)
+            .map_or(slot, |at| self.copies.0[at]);
+        Some((run, slot))
+    }
+
     pub fn state_copy(&self) -> Option<engine::StateCopy> {
+        if self.shared {
+            // The engine copies each lane's run onto its cow itself; the
+            // buffer pages ride inside the records.
+            return None;
+        }
         let moves = |(src, dst): &(Vec<u32>, Vec<u32>)| -> Vec<engine::transfer::StateMove> {
             src.iter()
                 .zip(dst)
@@ -208,6 +237,39 @@ impl PreparedRs {
             && !self.window_copies.is_empty()
         {
             lane.kv.window_copies.clone_from(&self.window_copies);
+        }
+    }
+}
+
+/// Names each lane's slots by the shared pool's shapes, for an engine that
+/// states one (`Lane::tables`, `Lane::fixed`); nothing where `shared` is
+/// `None`. The legacy fields stay as they are. A lane's list table is its
+/// translation where one is stated, else its pages (the list shape's slot
+/// refs either way), its ring table its window refs; its fixed records the
+/// `[run, cow]` [`PreparedRs::run_cow`] names, a snapshot the slot ref of its
+/// record's first piece.
+pub fn apply_shared(
+    req: &mut crate::engine::FireRequest,
+    shared: Option<&crate::store::shared::Shared>,
+    rs: Option<&PreparedRs>,
+) {
+    let Some(shared) = shared else {
+        return;
+    };
+    let pool = shared.lock().unwrap();
+    for (row, lane) in req.lanes.iter_mut().enumerate() {
+        let list = if lane.kv.translation.is_empty() {
+            &lane.kv.pages
+        } else {
+            &lane.kv.translation
+        };
+        lane.tables = pool.lane_tables(list, &lane.kv.window);
+        let records = rs.filter(|rs| rs.shared).and_then(|rs| rs.run_cow(row));
+        lane.fixed = records.map_or_else(Vec::new, |(run, cow)| pool.lane_fixed(run, cow));
+        if records.is_some() {
+            for snap in &mut lane.rs_snapshots {
+                snap.slot = pool.snapshot_ref(snap.slot);
+            }
         }
     }
 }
@@ -325,6 +387,8 @@ pub fn prepare_many(
         verbs: vec![engine::fire::RsVerb::Fold; lanes],
         slot_ids: vec![0; lanes],
         slot_flags: vec![0; lanes],
+        shared: store.is_shared(),
+        bound: vec![false; lanes],
         ..PreparedRs::default()
     };
     let mut prepared: Vec<RsPreparedWrite> = Vec::with_capacity(groups.len());
@@ -355,6 +419,7 @@ pub fn prepare_many(
         // The first lane writes the state; the others read what it held, or
         // the zeros it starts from.
         for (at, &lane) in group.lanes.iter().enumerate() {
+            out.bound[lane] = true;
             match (at, write.state(), held) {
                 (_, Some(state), None) if at > 0 => {
                     out.slot_ids[lane] = state.slot.0;
@@ -371,7 +436,7 @@ pub fn prepare_many(
                     }
                 }
                 (_, _, Some(slot)) => out.slot_ids[lane] = slot.0,
-                (_, _, None) => {}
+                (_, _, None) => out.bound[lane] = false,
             }
         }
         for target in write.buffer_targets() {

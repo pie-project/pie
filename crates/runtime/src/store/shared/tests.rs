@@ -518,3 +518,126 @@ fn pinned_or_unready_facts_are_refused() {
         Err(SharedError::Shapes { kind: "list", .. })
     ));
 }
+
+/// The facts without the ring: a model whose state is fixed records.
+fn fixed_facts() -> ChunkFacts {
+    let mut facts = facts();
+    facts.shapes.retain(|shape| shape.id != RING);
+    facts.validate().unwrap();
+    facts
+}
+
+#[test]
+fn the_stores_take_list_refs_and_records_and_a_fork_names_its_cow() {
+    use crate::pipeline::fire::rs::{PreparedRs, apply_shared, prepare, settle};
+    use crate::store::rs::RsGeometry;
+
+    let facts = fixed_facts();
+    let shared: Shared = Arc::new(Mutex::new(SharedPool::new(&facts, 2, 256).unwrap()));
+    let stores = crate::store::registry::shared_stores(&shared, 16, 256);
+    assert!(stores.shared.is_some());
+    // kv pages are the list shape's slot refs, from the one pool.
+    let pages = crate::store::registry::with_kv_lock(&stores.kv, "test", |kv| {
+        kv.reserve_device_pages(3).unwrap()
+    });
+    let refs: Vec<u32> = pages.iter().map(|page| page.0).collect();
+    {
+        let pool = shared.lock().unwrap();
+        for &r in &refs {
+            let chunk = pool.slot(LIST_POOL, r).chunk;
+            assert_eq!(pool.pool().chunk_shape(chunk), Some(LIST_POOL));
+        }
+    }
+    let engine = FakeEngine::new();
+    let geom = RsGeometry {
+        state_size: 1024,
+        buffer_page_tokens: 4,
+    };
+    let mut rs = stores.rs.lock().unwrap();
+    assert!(rs.is_shared());
+    let ws = rs.create_working_set(geom);
+    let first = prepare(&mut rs, ws, 4).unwrap();
+    assert!(
+        first.state_copy().is_none(),
+        "no StateCopy: records copy by [run, cow]"
+    );
+    let lane = |out: &PreparedRs| {
+        let mut req = crate::engine::FireRequest {
+            lanes: vec![crate::engine::fire::lane_of(0, vec![1], 0, refs.clone())],
+            ..crate::engine::FireRequest::default()
+        };
+        out.apply_to(&mut req);
+        apply_shared(&mut req, Some(&shared), Some(out));
+        req.lanes.remove(0)
+    };
+    let in_place = |lane: &Lane| {
+        !lane.fixed.is_empty()
+            && lane
+                .fixed
+                .iter()
+                .flat_map(|(_, pieces)| pieces)
+                .all(|[run, cow]| run == cow)
+    };
+    let fresh = lane(&first);
+    assert_eq!(fresh.tables, [(LIST, refs.clone())]);
+    assert!(in_place(&fresh), "a fresh record is written in place");
+    engine.fire(&facts, &fresh, 12);
+    settle(&mut rs, first.txn);
+    let record = rs.folded_slot(ws).unwrap().unwrap().0;
+    // A decode on its own record: cow == run.
+    let decode = prepare(&mut rs, ws, 1).unwrap();
+    let decoded = lane(&decode);
+    assert!(in_place(&decoded));
+    assert_eq!(
+        decoded.fixed,
+        shared.lock().unwrap().lane_fixed(record, record)
+    );
+    settle(&mut rs, decode.txn);
+    // The fork shares the record; its first fire writes a fresh one, the
+    // engine copying the shared run onto it.
+    let fork = rs.fork(ws).unwrap();
+    let forked = prepare(&mut rs, fork, 1).unwrap();
+    let forked_lane = lane(&forked);
+    let cow = forked.slot_ids[0];
+    assert_ne!(cow, record);
+    assert_eq!(
+        forked_lane.fixed,
+        shared.lock().unwrap().lane_fixed(record, cow)
+    );
+    assert!(!in_place(&forked_lane));
+    engine.fire(&facts, &forked_lane, 12);
+    settle(&mut rs, forked.txn);
+    // Back to its own record, the original writes in place again.
+    let again = prepare(&mut rs, ws, 1).unwrap();
+    assert!(in_place(&lane(&again)));
+    settle(&mut rs, again.txn);
+}
+
+#[test]
+fn degenerate_facts_keep_their_own_pools() {
+    let pools = ::engine::PoolFacts {
+        kv_pages: 10,
+        kv_page_size: 16,
+        state_slots: 4,
+        state_slot_bytes: 4096,
+        buffer_pages: 6,
+        ..Default::default()
+    };
+    let facts = ChunkFacts::degenerate(
+        &pools,
+        &::engine::chunk::DegenerateBytes {
+            kv_page: 100,
+            window_page: 50,
+            buffer_page: 25,
+        },
+    );
+    let stores = crate::store::chunks::StorePools::of(&facts).unwrap();
+    assert!(!stores.shared);
+    assert_eq!(stores.kv.device, 10);
+    let shared = crate::store::chunks::StorePools::of(&fixed_facts()).unwrap();
+    assert!(shared.shared);
+    assert_eq!(shared.page_size, 16);
+    let mut mixed = fixed_facts();
+    mixed.shapes[0].pinned = Some(::engine::chunk::Pinned::default());
+    assert!(crate::store::chunks::StorePools::of(&mixed).is_err());
+}
