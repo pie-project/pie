@@ -213,7 +213,10 @@ __device__ __forceinline__ void fp8_tile(const u8* __restrict__ act, const float
         constexpr int S = decltype(slot)::value;
 #pragma unroll
         for (int mb = 0; mb < MB; ++mb) {
-            if (mb >= live_mb) continue;
+            if (mb >= live_mb) {
+                __builtin_amdgcn_sched_barrier(0);
+                continue;
+            }
             moe_u2 xb[4];
 #pragma unroll
             for (int kk = 0; kk < 4; ++kk)
