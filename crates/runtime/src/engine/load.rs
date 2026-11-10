@@ -435,6 +435,17 @@ pub fn conversion_contract(
     None
 }
 
+pub fn lands(metadata: &Metadata, contract: &ModelContract) -> std::result::Result<(), String> {
+    if let Some(plane) = poem_compiler::catalog::requantizes(contract) {
+        return Err(format!(
+            "reads it only by re-quantizing `{plane}`, which an import takes by `--deployment`"
+        ));
+    }
+    checkpoint::plan::compile(metadata, contract, convert_target())
+        .map(|_| ())
+        .map_err(|why| why.to_string())
+}
+
 fn convert_target() -> checkpoint::plan::StorageTarget {
     checkpoint::plan::StorageTarget {
         tile_map_mask: checkpoint::plan::CONVERT_TILE_MAP_MASK,

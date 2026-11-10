@@ -46,6 +46,8 @@ pub struct ImportArgs {
     pub keep_source: bool,
 }
 
+const ADOPTED: &str = "PIE_IMPORT_ADOPTED";
+
 struct Consumed<'a> {
     metadata: &'a Metadata,
     /// The drafter head's own files, when pie fetched them for this import.
@@ -234,13 +236,25 @@ pub fn run(mut args: ImportArgs, global: &crate::args::GlobalArgs) -> Result<cra
         merge_metadata(&mut metadata, overlay.metadata.clone());
     }
     let metadata = metadata;
-    let (deployment, contract) = choose_deployment(
+    let chosen = choose_deployment(
         args.deployment.as_deref(),
         &opened,
         &metadata,
         platform,
         &source.path,
-    )?;
+    );
+    let (deployment, contract) = match chosen {
+        Ok(chosen) => chosen,
+        Err(refused)
+            if args.deployment.is_none()
+                && overlay.is_none()
+                && std::env::var_os(ADOPTED).is_none() =>
+        {
+            drop(opened);
+            return adopt_then_import(&source.path, &args.source, refused);
+        }
+        Err(refused) => return Err(refused),
+    };
     let deployment = deployment.as_str();
     drop(opened);
     refuse_a_decode_of_packed_codes(deployment, &contract, &metadata)?;
@@ -1513,6 +1527,35 @@ fn choose_deployment(
             )
         },
     )
+}
+
+fn adopt_then_import(
+    checkpoint: &Path,
+    source: &str,
+    unclaimed: anyhow::Error,
+) -> Result<crate::ui::Answer> {
+    match crate::ops::model::adopt::behind_the_scenes(checkpoint, source)? {
+        crate::ops::model::adopt::Behind::Refused(why) => Err(anyhow!(
+            "{unclaimed}\n\nNo model family adopts it either: {why}"
+        )),
+        crate::ops::model::adopt::Behind::Adopted(line) => {
+            println!(
+                "{} {line}",
+                crate::ui::Mark::Did
+                    .render(&crate::ui::Palette::for_stream(crate::ui::Stream::Stdout))
+            );
+            let status = std::process::Command::new(std::env::current_exe()?)
+                .args(std::env::args_os().skip(1))
+                .env(ADOPTED, "1")
+                .status()
+                .context("importing the adopted checkpoint")?;
+            let code = status
+                .code()
+                .and_then(|c| u8::try_from(c).ok())
+                .unwrap_or(1);
+            Ok(crate::ui::Answer::quiet().with_code(std::process::ExitCode::from(code)))
+        }
+    }
 }
 
 fn refuse_a_source_no_deployment_in_this_build_claims(checkpoint: &Path) -> anyhow::Error {
