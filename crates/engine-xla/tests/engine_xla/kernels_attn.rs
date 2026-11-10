@@ -614,6 +614,100 @@ fn a_batched_decode_through_the_page_copy_kernel_answers_the_reference() {
     long_decode_with(8, 2, 256, Some(512), tuning);
 }
 
+/// A fire of 39 decodes (one row a lane) on both sides of a 300-row prompt,
+/// 40 lanes: the decodes walk their own lanes' keys apart from the prompt's
+/// row blocks, through the walk and the page-copy kernel, windowed or not.
+#[test]
+fn decodes_beside_a_prompt_walk_their_own_lanes_apart() {
+    let mut tuning = kernels_xla::tuning::Tuning::DEFAULT;
+    tuning.chunks.decode_pages = 8;
+    for (qh, kvh, d) in [(8usize, 2usize, 128usize), (16, 8, 128), (8, 1, 256)] {
+        for window in [None, Some(100)] {
+            decodes_beside_a_prompt(qh, kvh, d, window, kernels_xla::tuning::Tuning::DEFAULT);
+            decodes_beside_a_prompt(qh, kvh, d, window, tuning);
+        }
+    }
+}
+
+fn decodes_beside_a_prompt(
+    qh: usize,
+    kvh: usize,
+    d: usize,
+    window: Option<u32>,
+    tuning: kernels_xla::tuning::Tuning,
+) {
+    let mut rng = Rng(13);
+    let ps = 16;
+    // lane 0 the prompt's 19 pages; lane l > 0 a decode at position
+    // 20 + (l * 37) % 230 over its own pages
+    let at = |l: usize| 20 + (l as i32 * 37) % 230;
+    let mut next = 0;
+    let lanes: Vec<Vec<i32>> = (0..40)
+        .map(|l| {
+            let n = if l == 0 { 19 } else { at(l) as usize / ps + 1 };
+            let pages = (next..next + n as i32).collect();
+            next += n as i32;
+            pages
+        })
+        .collect();
+    let pool = Pool::new(&mut rng, ps, kvh, d, next as usize, lanes, 20);
+    let mut runs: Vec<(i32, i32, i32)> = (1..20).map(|l| (l, at(l as usize), 1)).collect();
+    runs.push((0, 0, 300));
+    runs.extend((20..40).map(|l| (l, at(l as usize), 1)));
+    let fire = Fire::plain(&prefill_rows(&runs, 3));
+    let rows = fire.positions.len();
+    let q = rng.bf16s(rows * qh * d, 1.0);
+    let scale = 0.125;
+    let mut b = Bench::new().with_tuning(tuning);
+    let kv = pool.bind(&mut b);
+    let plan = fire.prefill(&mut b);
+    let qt = b.bf16(rows as u32, (qh * d) as u32, &q);
+    let qr = ragged(&mut b, &runs, qt);
+    let o = b.zeros(Dtype::Bf16, rows as u32, (qh * d) as u32);
+    let lse = b.zeros(Dtype::F32, rows as u32, qh as u32);
+    if !b
+        .run(|ctx| match window {
+            None => low::attend(
+                ctx,
+                attn::prefill_lse(qr, &plan, &kv, None, d as u32, kvh as u32, scale, o, lse)?,
+                kv,
+            ),
+            Some(_) => low::attend(
+                ctx,
+                attn::prefill(qr, &plan, &kv, window, d as u32, kvh as u32, scale, o)?,
+                kv,
+            ),
+        })
+        .unwrap()
+    {
+        return;
+    }
+    let (want, want_lse) = sdpa(
+        &q,
+        rows,
+        qh,
+        kvh,
+        d,
+        d,
+        &pool.keys,
+        &pool.values,
+        f64::from(scale),
+        &|r| fire.admitted(&pool, r, window.unwrap_or(0), true),
+        &no_bias,
+        &unit,
+    );
+    let live = rows - 3;
+    check_rows(&b.read_f32(o), &want, qh * d, live, 1e-3);
+    if window.is_none() {
+        assert_close(
+            &b.read_f32(lse)[..live * qh],
+            &want_lse[..live * qh],
+            2e-3,
+            1e-4,
+        );
+    }
+}
+
 fn long_decode(qh: usize, kvh: usize, d: usize) {
     long_decode_in(qh, kvh, d, None);
 }
