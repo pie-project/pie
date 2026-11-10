@@ -180,9 +180,14 @@ fn a_device_resolved_beam_answers_what_the_host_path_answers() {
             .covers(eta_ir::registry::PortMask::DEVICE_GEOMETRY)
     );
 
+    // Pages are slot refs of the pool's kv list, as the runtime hands
+    // them out.
+    let mut refs = crate::common_llm::Refs::of_facts(rig.loaded.caps.chunks.clone());
+    let kv = refs.shapes(|s| s.role == engine::chunk::SlotRole::State)[0].id;
+
     // The prompt: one page, shared by every beam.
     let prompt: Vec<u32> = (0..PAGE).map(|i| (i * 7 + 3) % VOCAB).collect();
-    let shared = 1u32;
+    let shared = refs.take(kv);
     rig.fire(
         vec![host_lane(0, prompt, vec![shared], 0)],
         Vec::new(),
@@ -192,8 +197,8 @@ fn a_device_resolved_beam_answers_what_the_host_path_answers() {
     // Host beams write their own pages 2, 3; device beams 4, 5, which each
     // device lane's translation table names as its working set's second
     // page, after the shared prompt's.
-    let host_own = [2u32, 3];
-    let device_own = [4u32, 5];
+    let host_own = [refs.take(kv), refs.take(kv)];
+    let device_own = [refs.take(kv), refs.take(kv)];
 
     let program = rig.register(beam_program());
     let channels = vec![
