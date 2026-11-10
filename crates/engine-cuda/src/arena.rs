@@ -4,26 +4,27 @@ use poem_compiler::ArenaMap;
 use poem_exec::store::arena::rect;
 use poem_ir::ValueId;
 
-use crate::device::elastic;
 use crate::error::{Fault, Result};
 use crate::run::SlotTable;
 use crate::store::Pools;
 
+/// A fire's activation: the span under the state pool's end
+/// ([`Pools::activation_base`]), backed as far as the load's fires reach.
 #[derive(Debug)]
 pub struct Arena {
-    store: elastic::Arena,
     committed: u64,
     reserved: u64,
 }
 
 impl Arena {
-    /// Reserves `bytes`, the most any arena map this load carves asks for.
-    pub fn reserve(bytes: u64, pools: &Pools) -> Result<Arena> {
-        Ok(Arena {
-            store: pools.reserve_arena(bytes, "activation arena")?,
+    /// `bytes`, the most any arena map this load carves asks for: what the
+    /// pool was reserved its activation chunks for.
+    #[must_use]
+    pub fn reserve(bytes: u64) -> Arena {
+        Arena {
             committed: 0,
             reserved: bytes,
-        })
+        }
     }
 
     /// Backs the whole reservation: the `attn.scores` planes over the prefix
@@ -32,9 +33,7 @@ impl Arena {
         if self.committed >= self.reserved {
             return Ok(());
         }
-        if pools.commit_arena(&mut self.store, self.reserved).is_err() {
-            pools.commit_beside(&mut self.store, self.reserved)?;
-        }
+        pools.hold_activation(self.reserved, true)?;
         self.committed = self.reserved;
         Ok(())
     }
@@ -43,14 +42,9 @@ impl Arena {
         if bytes <= self.committed {
             return Ok(());
         }
-        pools.commit_arena(&mut self.store, bytes)?;
+        pools.hold_activation(bytes, false)?;
         self.committed = bytes;
         Ok(())
-    }
-
-    #[must_use]
-    pub fn base(&self) -> u64 {
-        self.store.base()
     }
 
     #[must_use]
@@ -59,8 +53,8 @@ impl Arena {
     }
 
     #[must_use]
-    pub fn slots(&self, map: &ArenaMap, rows: poem_compiler::FireRows) -> SlotTable {
-        carve(self.base(), map, rows)
+    pub fn slots(&self, pools: &Pools, map: &ArenaMap, rows: poem_compiler::FireRows) -> SlotTable {
+        carve(pools.activation_base(), map, rows)
     }
 
     /// Reads `into.len()` bytes at `at` on `stream` (the shell's own), and
@@ -68,8 +62,14 @@ impl Arena {
     /// stream of the context, a peer rank's on the same device too, and a
     /// peer spinning in its next step's collective waits on this rank's
     /// launch, which queues behind the legacy copy.
-    pub fn read(&self, stream: *mut core::ffi::c_void, at: u64, into: &mut [u8]) -> Result<()> {
-        let base = self.base();
+    pub fn read(
+        &self,
+        pools: &Pools,
+        stream: *mut core::ffi::c_void,
+        at: u64,
+        into: &mut [u8],
+    ) -> Result<()> {
+        let base = pools.activation_base();
         let offset = at.checked_sub(base).ok_or(Fault::Ceiling {
             what: "bytes into the arena",
             need: at,

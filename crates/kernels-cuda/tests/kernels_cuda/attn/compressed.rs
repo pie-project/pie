@@ -438,7 +438,7 @@ fn a_padded_lane_closes_no_pool_entry() {
         let ctx = gpu.ctx().with_tuning(tuned(|t| t.rows_vec = vec));
         ctx.arm_stage(win_at);
         let out = &mut ten(out_at, 3, 64, Bf16);
-        let fired = pools::gather(&ctx, bpos, breq, &state, 64, 4, kv, score, absent, out);
+        let fired = pools::gather(&ctx, bpos, breq, &state, 64, 4, kv, score, 0, absent, out);
         fired.expect("the gather fires");
         gpu.sync();
         let out: Vec<u16> = gpu.down(out_at, 3 * 64);

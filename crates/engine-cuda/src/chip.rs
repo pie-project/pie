@@ -78,12 +78,6 @@ pub struct WorkingSetPercent(pub u32);
 #[decision(id = "engine.lattice_steps", constant(set(1, 2)), default = 1, tune = engine)]
 pub struct LatticeSteps(pub u32);
 
-/// Recurrent-state slots a lane gets when `[engine] max_state_slots` is unset,
-/// so a hybrid trunk seats every lane it batches; 0 keeps the fixed 256.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Decision)]
-#[decision(id = "engine.state_slots_per_lane", constant(range(0..=8)), default = 0, tune = engine)]
-pub struct StateSlotsPerLane(pub u32);
-
 /// Whether a hybrid trunk whose state slots cannot seat every lane at the
 /// configured dispatch depth (two frames a lane) asks the runtime to post one
 /// frame a lane instead, seating up to twice the lanes. Off keeps the depth.
@@ -179,7 +173,6 @@ static REGISTRY: LazyLock<Registry> = LazyLock::new(|| {
         .add::<Grouped>()
         .add::<WorkingSetPercent>()
         .add::<LatticeSteps>()
-        .add::<StateSlotsPerLane>()
         .add::<OneFrameWhenShort>()
         .add::<SeatedFirst>()
         .add::<SeatToEnd>()
@@ -276,7 +269,6 @@ pub struct Engine {
     pub grouped: bool,
     pub working_set_percent: u32,
     pub lattice_steps: u32,
-    pub state_slots_per_lane: u32,
     pub one_frame_when_short: bool,
     pub seated_first: bool,
     pub seat_to_end: bool,
@@ -311,7 +303,6 @@ impl Engine {
             grouped: profile.on::<Grouped>(&Anywhere),
             working_set_percent: profile.get::<WorkingSetPercent>().0,
             lattice_steps: profile.get::<LatticeSteps>().0,
-            state_slots_per_lane: profile.get::<StateSlotsPerLane>().0,
             one_frame_when_short: profile.on::<OneFrameWhenShort>(&Anywhere),
             seated_first: profile.on::<SeatedFirst>(&Anywhere),
             seat_to_end: profile.on::<SeatToEnd>(&Anywhere),
@@ -793,7 +784,6 @@ mod tests {
                 grouped: true,
                 working_set_percent: 50,
                 lattice_steps: 1,
-                state_slots_per_lane: 0,
                 one_frame_when_short: false,
                 seated_first: false,
                 seat_to_end: false,
@@ -864,7 +854,6 @@ mod tests {
             tuning.selected_mma,
             "a B200 walks a selection on the tensor cores"
         );
-        assert_eq!(Engine::of(&b200).state_slots_per_lane, 2);
         assert!(Engine::of(&b200).one_frame_when_short);
         assert!(Engine::of(&b200).seated_first);
         assert_eq!(Engine::of(&b200).forward_tokens, 16384);
@@ -876,7 +865,6 @@ mod tests {
             Engine {
                 lattice_steps: 1,
                 prefill_lattice_from: Engine::of(&family).prefill_lattice_from,
-                state_slots_per_lane: 0,
                 one_frame_when_short: false,
                 seated_first: false,
                 seat_to_end: false,
@@ -893,7 +881,6 @@ mod tests {
             "only the row lattice, the state seating, the planner's order, the fire width and \
              the host planes differ from the family's engine"
         );
-        assert_eq!(Engine::of(&family).state_slots_per_lane, 0);
         assert!(!Engine::of(&family).one_frame_when_short);
         assert!(!Engine::of(&family).seated_first);
         assert!(!Engine::of(&family).host_planes);

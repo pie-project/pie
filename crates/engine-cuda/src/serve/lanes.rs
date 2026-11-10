@@ -24,6 +24,11 @@ pub struct Seated<'a> {
     pub rs: RsVerb,
     pub rs_reset: RsReset,
     pub rs_slot: Option<u32>,
+    /// The record the lane's state is read from where its fire folds
+    /// nothing into it (a lane beside the one that folds, in one fire of one
+    /// working set): the record as it stood before the fire, while the
+    /// lane's rows land in `rs_slot`'s. `None`: `rs_slot`'s.
+    pub rs_read: Option<u32>,
     pub rs_snapshots: &'a [RsSnapshot],
     pub readout: Option<&'a [u32]>,
     pub group: Option<u32>,
@@ -49,6 +54,7 @@ impl<'a> Seated<'a> {
             rs: RsVerb::Fold,
             rs_reset: RsReset::Inferred,
             rs_slot: None,
+            rs_read: None,
             rs_snapshots: &[],
             readout: None,
             group: None,

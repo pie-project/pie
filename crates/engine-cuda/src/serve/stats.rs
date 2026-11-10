@@ -5,7 +5,6 @@ use super::{Graphs, Shell};
 
 use crate::record;
 use crate::store::kv::Paging;
-use crate::store::rs::Buffers;
 
 impl Shell {
     #[must_use]
@@ -97,12 +96,13 @@ impl Shell {
 
     #[must_use]
     pub fn buffer_bytes(&self) -> u64 {
-        self.buffers.as_ref().map_or(0, Buffers::bytes)
+        // The rs buffer's rows are the records', in the state pool.
+        0
     }
 
     #[must_use]
     pub fn buffer_capacity_bytes(&self) -> u64 {
-        self.buffers.as_ref().map_or(0, Buffers::capacity_bytes)
+        0
     }
 
     #[must_use]
@@ -147,6 +147,76 @@ impl Shell {
     #[must_use]
     pub fn accounting(&self) -> crate::store::Accounting {
         self.accounting
+    }
+
+    /// See `Engine::commit_segments`: off a fire's path.
+    pub fn commit_segments(&mut self, segments: u32) -> crate::Result<()> {
+        self.pools.commit_segments(segments)
+    }
+
+    /// See `Engine::release_segments`. The runtime has waited out every
+    /// frame that named the segments' chunks; what the stream still holds
+    /// (an evacuation's copy out of them) lands first.
+    pub fn release_segments(&mut self, segments: u32) -> crate::Result<()> {
+        self.device.synchronize()?;
+        self.pools.release_segments(segments)
+    }
+
+    /// See `Engine::evacuate`: the copy and the table change are ordered on
+    /// the stream behind every fire enqueued so far and before the next.
+    pub fn evacuate(&mut self, evacuation: &engine::chunk::Evacuation) -> crate::Result<()> {
+        self.pools.evacuate(self.device.stream(), evacuation)
+    }
+
+    /// The state pool as the runtime counts it
+    /// ([`crate::store::Pools::chunk_facts`]).
+    pub fn chunk_facts(&mut self) -> crate::Result<engine::chunk::ChunkFacts> {
+        let max_tokens = self.budget().max_tokens;
+        self.pools.chunk_facts(max_tokens)
+    }
+
+    /// Names the recurrent record whose pieces lie in the slot refs
+    /// `pieces`: the slot a lane then names it by (its first).
+    pub fn name_record(&mut self, pieces: &[u32]) -> crate::Result<u32> {
+        self.pools.name_record(pieces)
+    }
+
+    /// From here on lanes name their slots by slot ref.
+    pub fn take_refs(&mut self) {
+        self.pools.take_refs();
+    }
+
+    /// Copies a working set's recurrent record from slot `src` onto `dst`,
+    /// on the stream ahead of the fire that writes `dst`.
+    pub fn fork_state(&mut self, src: u32, dst: u32) -> crate::Result<()> {
+        match self.rs_ahead.get(&src).copied() {
+            Some(at) => self.rs_ahead.insert(dst, at),
+            None => self.rs_ahead.remove(&dst),
+        };
+        self.pools.copy_slot(self.device.stream(), src, dst)
+    }
+
+    /// Copies whole slots of `shape`, `(src, dst)`, on the stream ahead of
+    /// the fire that reads or writes `dst`.
+    pub fn copy_whole_slots(
+        &mut self,
+        shape: engine::chunk::ShapeId,
+        pairs: &[[u32; 2]],
+    ) -> crate::Result<()> {
+        self.pools
+            .copy_whole_slots(self.device.stream(), shape, pairs)
+    }
+
+    /// Copies whole slots and token runs of a kv shape (`ring`: the windowed
+    /// rows') within the state pool.
+    pub fn copy_token_slots(
+        &mut self,
+        ring: bool,
+        runs: &[engine::transfer::KvRun],
+    ) -> crate::Result<()> {
+        self.pools.fence_all_swaps(self.device.stream())?;
+        let (list, windowed): (&[_], &[_]) = if ring { (&[], runs) } else { (runs, &[]) };
+        self.pools.copy_kv(self.device.stream(), list, windowed)
     }
 
     /// See `Engine::commit_pool`.

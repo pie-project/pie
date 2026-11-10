@@ -1,0 +1,442 @@
+//! How the cache rows sit in the state pool's chunks: the compiler's chunk
+//! recipe ([`poem_compiler::chunk::plan`]) read for this engine's paging.
+//!
+//! The pool is `total` chunks of `chunk_bytes`, chunk `p` at
+//! `base + p * chunk_bytes`. A chunk holds slots of one shape. A **list**
+//! slot is one kv page of every full-retention row, layer after layer, and a
+//! **ring** slot one page of every windowed row; a row's key plane and then
+//! its value plane run where the recipe puts the row.
+//!
+//! A paged kernel reads page `q` of a plane at `plane base + q * grain`
+//! ([`kernels_cuda::KvPool::page_stride`]). `grain` is the largest step both
+//! a chunk and the shape's slot are whole numbers of, so every slot of every
+//! chunk has a `q`: slot `i` of physical chunk `p` is
+//! `(p * chunk_bytes + i * slot_bytes) / grain`. The recipe makes a chunk a
+//! whole number of list slots, so a list slot's `q` is its slot ref.
+
+use engine::chunk::ShapeId;
+use poem_compiler::chunk::{ChunkRecipe, RowId, SlotLayout};
+
+use crate::error::{Fault, Result};
+
+/// The list shape's id in the facts this engine states.
+pub const LIST: ShapeId = ShapeId(0);
+/// The ring shape's.
+pub const RING: ShapeId = ShapeId(1);
+/// The fixed shape's.
+pub const FIXED: ShapeId = ShapeId(2);
+/// The rs list's.
+pub const RS: ShapeId = ShapeId(3);
+
+/// Which of a load's slot shapes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Kind {
+    /// A page of every full-retention kv row.
+    List,
+    /// A page of every windowed kv row.
+    Ring,
+    /// A working set's record of every recurrent row.
+    Fixed,
+    /// A page of the rs buffer: the rows a lane lands past its state before
+    /// they fold, every recurrent layer's.
+    Rs,
+}
+
+impl Kind {
+    /// The shape a kv row's pages are slots of.
+    #[must_use]
+    pub const fn paged(windowed: bool) -> Kind {
+        if windowed { Kind::Ring } else { Kind::List }
+    }
+
+    #[must_use]
+    pub const fn name(self) -> &'static str {
+        match self {
+            Kind::List => "kv page",
+            Kind::Ring => "windowed page",
+            Kind::Fixed => "state slot",
+            Kind::Rs => "rs buffer page",
+        }
+    }
+}
+
+/// One slot shape: the pages of the kv rows that share a page table, or the
+/// record of the recurrent rows.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SlotShape {
+    pub id: ShapeId,
+    /// Tokens a slot holds: the page size (0 for the fixed shape).
+    pub tokens: u32,
+    pub slot_bytes: u64,
+    pub per_chunk: u32,
+    /// The step page ids count in.
+    pub grain: u64,
+    /// The window its rows are read through; `None` for the list.
+    pub window: Option<u32>,
+    /// Each cache row laid in the slot, and where its run starts.
+    pub rows: Vec<(u32, u64)>,
+    /// Each compressor state laid in the slot, by the cache row its gather
+    /// keys it by, and where its two planes start.
+    pub pools: Vec<(u32, u64)>,
+}
+
+impl SlotShape {
+    fn of(layout: &SlotLayout, chunk_bytes: u64, id: ShapeId) -> Result<SlotShape> {
+        let (tokens, bytes, window, runs) = match layout {
+            SlotLayout::List {
+                tokens,
+                bytes,
+                rows,
+            } => (*tokens, *bytes, None, rows),
+            SlotLayout::Ring {
+                tokens,
+                bytes,
+                cap,
+                rows,
+                ..
+            } => (*tokens, *bytes, Some(cap.window), rows),
+            SlotLayout::RsList {
+                tokens,
+                bytes,
+                rows,
+            } => (*tokens, *bytes, None, rows),
+            SlotLayout::Fixed { .. } => {
+                return Err(Fault::program(
+                    "store::layout",
+                    "a fixed slot read as a token slot",
+                ));
+            }
+        };
+        let per_chunk = u32::try_from(chunk_bytes / bytes.max(1)).unwrap_or(u32::MAX);
+        if bytes == 0 || per_chunk == 0 {
+            return Err(Fault::program(
+                "store::layout",
+                format!("a token slot of {bytes} bytes fits no chunk of {chunk_bytes}"),
+            ));
+        }
+        Ok(SlotShape {
+            id,
+            tokens,
+            slot_bytes: bytes,
+            per_chunk,
+            grain: gcd(chunk_bytes, bytes),
+            window,
+            rows: runs
+                .iter()
+                .filter_map(|run| match run.row {
+                    RowId::Cache(row) => Some((row, run.offset)),
+                    RowId::Rs(_) | RowId::Pool(_) => None,
+                })
+                .collect(),
+            pools: runs
+                .iter()
+                .filter_map(|run| match run.row {
+                    RowId::Pool(row) => Some((row, run.offset)),
+                    RowId::Cache(_) | RowId::Rs(_) => None,
+                })
+                .collect(),
+        })
+    }
+
+    /// Where the compressor state keyed by cache row `row` starts in a slot.
+    #[must_use]
+    pub fn pool_of(&self, row: u32) -> Option<u64> {
+        self.pools
+            .iter()
+            .find(|(held, _)| *held == row)
+            .map(|&(_, offset)| offset)
+    }
+
+    /// Where cache row `row`'s run starts in a slot.
+    #[must_use]
+    pub fn offset_of(&self, row: u32) -> Option<u64> {
+        self.rows
+            .iter()
+            .find(|(held, _)| *held == row)
+            .map(|&(_, offset)| offset)
+    }
+
+    /// Bytes from the pool's base to slot `index` of physical chunk `chunk`.
+    #[must_use]
+    pub fn slot_at(&self, chunk_bytes: u64, chunk: u32, index: u32) -> u64 {
+        u64::from(chunk) * chunk_bytes + u64::from(index) * self.slot_bytes
+    }
+
+    /// The page id a kernel reads that slot by.
+    #[must_use]
+    pub fn page_id(&self, chunk_bytes: u64, chunk: u32, index: u32) -> u64 {
+        self.slot_at(chunk_bytes, chunk, index) / self.grain
+    }
+
+    #[must_use]
+    pub fn slot_ref(&self, chunk: u32, index: u32) -> u32 {
+        chunk.saturating_mul(self.per_chunk).saturating_add(index)
+    }
+}
+
+/// The slot shapes of a load.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Layout {
+    pub chunk_bytes: u64,
+    /// Chunks a segment, by the recipe's device profile.
+    pub segment_chunks: u32,
+    pub list: Option<SlotShape>,
+    pub ring: Option<SlotShape>,
+    pub fixed: Option<FixedShape>,
+    pub rs: Option<RsShape>,
+}
+
+/// The rs list: a slot holds `slot.tokens` buffered rows of every recurrent
+/// layer's rs planes, a layer's rows `layers[k]` bytes into it and a token
+/// `per_token[k]` bytes of them.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RsShape {
+    pub slot: SlotShape,
+    /// Where each rs row's run starts in a slot and its bytes a token, in
+    /// the recipe's order (a recurrent layer each, then what else buffers).
+    pub layers: Vec<(u64, u64)>,
+}
+
+/// One recurrent row of a working set's record: `pieces` equal pieces of
+/// `atoms_per_piece` atoms (the last padded past the row's `atoms`), each
+/// `offset` bytes into a slot of its own.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FixedRow {
+    /// The cache row.
+    pub row: u32,
+    pub pieces: u32,
+    pub atoms_per_piece: u64,
+    pub atoms: u64,
+    pub atom_bytes: u64,
+    pub offset: u64,
+    /// The record's slots its pieces lie in, one a piece.
+    pub slots: Vec<u32>,
+    /// Where its ids start among a lane's staged ids ([`FixedShape::tables`]).
+    pub column: u32,
+}
+
+impl FixedRow {
+    /// The bytes piece `piece` holds of the row.
+    #[must_use]
+    pub fn piece_bytes(&self, piece: u32) -> u64 {
+        let start = (u64::from(piece) * self.atoms_per_piece).min(self.atoms);
+        ((start + self.atoms_per_piece).min(self.atoms) - start) * self.atom_bytes
+    }
+}
+
+/// The fixed shape: a working set's record of every recurrent row, `pieces`
+/// slots of it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FixedShape {
+    pub slot: SlotShape,
+    /// The slots a record takes.
+    pub pieces: u32,
+    pub rows: Vec<FixedRow>,
+    /// The id tables a fire stages a lane: each a run of the record's slots
+    /// some row's pieces lie in, the rows that share a run sharing a table.
+    pub tables: Vec<Vec<u32>>,
+}
+
+impl FixedShape {
+    fn of(recipe: &ChunkRecipe, layout: &SlotLayout) -> Result<FixedShape> {
+        let chunk_bytes = recipe.chunk_bytes;
+        let SlotLayout::Fixed {
+            bytes,
+            pieces_per_ws,
+            rows: runs,
+            ..
+        } = layout
+        else {
+            return Err(Fault::program(
+                "store::layout",
+                "a token slot read as the fixed slot",
+            ));
+        };
+        let per_chunk = u32::try_from(chunk_bytes / (*bytes).max(1)).unwrap_or(u32::MAX);
+        let mut tables: Vec<Vec<u32>> = Vec::new();
+        let mut columns: Vec<u32> = Vec::new();
+        let mut rows = Vec::new();
+        for run in runs {
+            let atom = recipe.atoms.get(&run.row).ok_or_else(|| {
+                Fault::program(
+                    "store::layout",
+                    format!("the chunk recipe states no atom for {:?}", run.row),
+                )
+            })?;
+            match run.row {
+                RowId::Cache(row) => {
+                    let table = match tables.iter().position(|held| *held == run.slots) {
+                        Some(at) => at,
+                        None => {
+                            columns.push(tables.iter().map(|t| t.len() as u32).sum());
+                            tables.push(run.slots.clone());
+                            tables.len() - 1
+                        }
+                    };
+                    rows.push(FixedRow {
+                        row,
+                        pieces: run.pieces,
+                        atoms_per_piece: run.atoms_per_piece,
+                        atoms: atom.extent,
+                        atom_bytes: atom.bytes,
+                        offset: run.offset,
+                        slots: run.slots.clone(),
+                        column: columns[table],
+                    });
+                }
+                RowId::Rs(_) => {
+                    return Err(Fault::program(
+                        "store::layout",
+                        "an rs row in the fixed record: the rs buffer is a list shape",
+                    ));
+                }
+                RowId::Pool(_) => {}
+            }
+        }
+        Ok(FixedShape {
+            slot: SlotShape {
+                id: FIXED,
+                tokens: 0,
+                slot_bytes: *bytes,
+                per_chunk: per_chunk.max(1),
+                grain: gcd(chunk_bytes, *bytes),
+                window: None,
+                rows: Vec::new(),
+                pools: Vec::new(),
+            },
+            pieces: (*pieces_per_ws).max(1),
+            rows,
+            tables,
+        })
+    }
+
+    /// Cache row `row`'s place in the record.
+    #[must_use]
+    pub fn row(&self, row: u32) -> Option<&FixedRow> {
+        self.rows.iter().find(|held| held.row == row)
+    }
+
+    /// The ids a fire stages a lane: every table's.
+    #[must_use]
+    pub fn ids_a_lane(&self) -> u32 {
+        self.tables.iter().map(|table| table.len() as u32).sum()
+    }
+}
+
+impl Layout {
+    /// The recipe's token shapes. This engine pages every windowed row by one
+    /// table, so a recipe with rings of two windows is refused.
+    pub fn of(recipe: &ChunkRecipe) -> Result<Layout> {
+        let chunk_bytes = recipe.chunk_bytes;
+        let list = recipe
+            .list()
+            .map(|layout| SlotShape::of(layout, chunk_bytes, LIST))
+            .transpose()?;
+        let mut rings = recipe.rings();
+        let ring = rings
+            .next()
+            .map(|layout| SlotShape::of(layout, chunk_bytes, RING))
+            .transpose()?;
+        if rings.next().is_some() {
+            return Err(Fault::Unbound {
+                what: "kv rows read through windows of two widths, which this engine pages \
+                       by one windowed table"
+                    .to_string(),
+            });
+        }
+        let fixed = recipe
+            .fixed()
+            .map(|layout| FixedShape::of(recipe, layout))
+            .transpose()?;
+        let rs = recipe
+            .rs_list()
+            .map(|layout| -> Result<RsShape> {
+                let mut slot = SlotShape::of(layout, chunk_bytes, RS)?;
+                slot.rows.clear();
+                Ok(RsShape {
+                    slot,
+                    layers: recipe
+                        .rs
+                        .runs
+                        .iter()
+                        .map(|run| (run.offset, run.per_token))
+                        .collect(),
+                })
+            })
+            .transpose()?;
+        let (_, segment_chunks) = recipe.profile.segment(chunk_bytes);
+        Ok(Layout {
+            chunk_bytes,
+            segment_chunks: u32::try_from(segment_chunks).unwrap_or(u32::MAX).max(1),
+            list,
+            ring,
+            fixed,
+            rs,
+        })
+    }
+
+    #[must_use]
+    pub fn shape(&self, kind: Kind) -> Option<&SlotShape> {
+        match kind {
+            Kind::List => self.list.as_ref(),
+            Kind::Ring => self.ring.as_ref(),
+            Kind::Fixed => self.fixed.as_ref().map(|fixed| &fixed.slot),
+            Kind::Rs => self.rs.as_ref().map(|rs| &rs.slot),
+        }
+    }
+
+    /// The chunks `slots` slots of a shape take.
+    #[must_use]
+    pub fn chunks_for(&self, kind: Kind, slots: u64) -> u64 {
+        self.shape(kind)
+            .map_or(0, |shape| slots.div_ceil(u64::from(shape.per_chunk.max(1))))
+    }
+}
+
+fn gcd(mut a: u64, mut b: u64) -> u64 {
+    while b != 0 {
+        (a, b) = (b, a % b);
+    }
+    a.max(1)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_list_slot_is_read_by_its_slot_ref_and_a_ring_slot_by_its_grain() {
+        let chunk = 48 * 256;
+        let list = SlotShape {
+            id: LIST,
+            tokens: 16,
+            slot_bytes: 12 * 256,
+            per_chunk: 4,
+            grain: gcd(chunk, 12 * 256),
+            window: None,
+            rows: vec![(0, 0), (3, 1024)],
+            pools: Vec::new(),
+        };
+        assert_eq!(list.grain, list.slot_bytes);
+        assert_eq!(list.page_id(chunk, 5, 3), u64::from(list.slot_ref(5, 3)));
+        assert_eq!(list.offset_of(3), Some(1024));
+        assert_eq!(list.offset_of(1), None);
+
+        // A ring slot of 20 units in a chunk of 48: two a chunk, eight spare.
+        let ring = SlotShape {
+            id: RING,
+            tokens: 16,
+            slot_bytes: 20 * 256,
+            per_chunk: 2,
+            grain: gcd(chunk, 20 * 256),
+            window: Some(64),
+            rows: vec![(1, 0)],
+            pools: Vec::new(),
+        };
+        assert_eq!(ring.grain, 4 * 256);
+        for (chunk_id, index) in [(0u32, 0u32), (1, 1), (7, 0), (7, 1)] {
+            let q = ring.page_id(chunk, chunk_id, index);
+            assert_eq!(q * ring.grain, ring.slot_at(chunk, chunk_id, index));
+        }
+    }
+}

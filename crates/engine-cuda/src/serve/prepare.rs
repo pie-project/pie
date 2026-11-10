@@ -805,8 +805,8 @@ impl FrameShell for Shell {
         let mut writes: Vec<Option<(i32, i32)>> = Vec::with_capacity(rows as usize);
         let mut slot_ids: Vec<i32> = Vec::with_capacity(lanes.len());
         let mut fresh: Vec<u32> = Vec::new();
-        let mut rs_pages_named = 0u32;
         let mut rs_moves: Vec<RsMove<'a>> = Vec::with_capacity(lanes.len());
+        let mut rs_pages: Vec<u32> = Vec::new();
         let mut rs_reads: Vec<Vec<std::ops::Range<u32>>> = vec![Vec::new(); lanes.len()];
         let mut rs_folded: Vec<Option<u32>> = vec![None; lanes.len()];
         let mut rs_lens: Vec<i32> = Vec::with_capacity(lanes.len());
@@ -993,10 +993,6 @@ impl FrameShell for Shell {
             let fire_lane = rs_moves.len();
             rs_order[row.source as usize] = fire_lane as u32;
             let port = envelope_of[source].and_then(|(held, _)| resolved[held].fold.as_deref());
-            if let RsVerb::Buffer { pages, .. } = &seated.rs {
-                rs_pages_named =
-                    rs_pages_named.max(pages.iter().copied().max().map_or(0, |page| page + 1));
-            }
             let (verb, folded) = match &seated.rs {
                 RsVerb::Fold => (RsMove::None, row.rows),
                 RsVerb::Buffer {
@@ -1005,6 +1001,7 @@ impl FrameShell for Shell {
                     folded,
                     fold,
                 } => {
+                    rs_pages.extend_from_slice(pages);
                     // A device-counted fold not yet settled left the state
                     // past the runtime's length.
                     let slot = seated.rs_slot.unwrap_or(lane.slot);
@@ -1074,10 +1071,14 @@ impl FrameShell for Shell {
                     ),
                 });
             }
-            if verb != RsMove::None
-                && let Some(buffers) = self.buffers.as_mut()
+            // A lane that folds nothing reads the state as it stood before
+            // the fire, while the lane beside it folds into the record the
+            // fire writes: the two never meet in one row.
+            if matches!(verb, RsMove::Scatter { fold: 0, .. })
+                && let Some(read) = seated.rs_read
+                && let Some(named) = slot_ids.last_mut()
             {
-                buffers.ensure(&mut self.pools, rs_pages_named)?;
+                *named = read as i32;
             }
             rs_moves.push(verb);
             rs_lens.push(narrow(u64::from(folded)));
@@ -1242,6 +1243,8 @@ impl FrameShell for Shell {
                 .map(|(((seat, table), ids), &kv_less)| {
                     if kv_less {
                         Ok(table.to_vec())
+                    } else if self.pools.by_refs() {
+                        ring_refs(&paging, seat, ids)
                     } else {
                         kv::window_table(&paging, seat, table, ids)
                     }
@@ -1259,6 +1262,12 @@ impl FrameShell for Shell {
             .flat_map(|(table, _)| table.iter().map(|&page| u64::from(page)))
             .collect();
         self.pools.commit_frame(demand, &kv_ranges, &window_pages)?;
+        // The rs buffer pages the lanes name, seated before a row lands.
+        self.pools.seat_rs(&rs_pages)?;
+        // The records as the kernels read them: each row's pieces by the
+        // ids of the slots they lie in, table after table.
+        let device_slot_ids = self.pools.state_tables(&slot_ids)?;
+        snapshots.slots = self.pools.snapshot_tables(&snapshots.slots)?;
         self.pools
             .fence_swaps(self.device.stream(), &kv_ranges, &window_pages)?;
         super::btrace::mark("commit_frame");
@@ -1268,7 +1277,7 @@ impl FrameShell for Shell {
         let window_refs: Vec<&[u32]> = window_tables.iter().map(Vec::as_slice).collect();
         let mut geometries = (0..self.spaces)
             .map(|space| {
-                if self.pools.windowed_space(space as u32) {
+                if self.pools.windowed_geometry(space) {
                     kv::geometry_with(&paging, &seats, &window_refs)
                 } else {
                     kv::geometry_with(&paging, &seats, &table_refs)
@@ -1288,7 +1297,7 @@ impl FrameShell for Shell {
                     .unwrap_or(0)
             };
             for (space, geometry) in geometries.iter_mut().enumerate() {
-                let windowed = self.pools.windowed_space(space as u32);
+                let windowed = self.pools.windowed_geometry(space);
                 for (row, stated) in writes.iter().enumerate() {
                     let Some((page, offset)) = *stated else {
                         continue;
@@ -1334,6 +1343,14 @@ impl FrameShell for Shell {
         let pages = geometries
             .first()
             .map_or(0, |geometry| geometry.indices.len() as u32);
+        // The tables as the kernels read them: each page by the id of the
+        // slot it is seated on in the state pool.
+        let mut device_geometries = geometries.clone();
+        for (space, geometry) in device_geometries.iter_mut().enumerate() {
+            let windowed = self.pools.windowed_geometry(space);
+            self.pools.page_ids(windowed, &mut geometry.indices)?;
+            self.pools.page_ids(windowed, &mut geometry.write_page)?;
+        }
 
         super::btrace::mark("admit");
         let bucket = self
@@ -1396,7 +1413,7 @@ impl FrameShell for Shell {
                     crate::window::Copies {
                         bucket,
                         enabled: copies_here,
-                        spaces: &geometries,
+                        spaces: &device_geometries,
                     },
                     self.inputs.window_slots(),
                 )?;
@@ -1517,7 +1534,7 @@ impl FrameShell for Shell {
             if any_adapter {
                 adapter_routes.resize(carve_rows as usize, -1);
             }
-            for geometry in &mut geometries {
+            for geometry in geometries.iter_mut().chain(&mut device_geometries) {
                 geometry.write_page.resize(carve_rows as usize, -1);
                 geometry.write_offset.resize(carve_rows as usize, -1);
             }
@@ -1528,7 +1545,7 @@ impl FrameShell for Shell {
         if bodied {
             let capacity = crate::window::lane_capacity(max_lanes);
             lane_carve = lane_carve.max(capacity);
-            for geometry in &mut geometries {
+            for geometry in geometries.iter_mut().chain(&mut device_geometries) {
                 geometry.pad_to(capacity as usize);
             }
             qo_absolute = windows.qo_absolute_host().to_vec();
@@ -1558,7 +1575,8 @@ impl FrameShell for Shell {
                 qo_absolute: &qo_absolute,
                 live: if bodied { windows.live() } else { &[] },
                 slot_ids: &slot_ids,
-                spaces: &geometries,
+                state_ids: &device_slot_ids,
+                spaces: &device_geometries,
                 mask: staged.as_ref(),
                 adapter_routes: any_adapter.then_some(adapter_routes.as_slice()),
                 live_rows: rows,
@@ -1584,7 +1602,7 @@ impl FrameShell for Shell {
             0
         };
         let placed = match geometries.as_slice() {
-            [space] if !self.pools.windowed_space(0) => Some(space),
+            [space] if !self.pools.windowed_geometry(0) => Some(space),
             _ => None,
         };
         let kv_reports: Vec<super::KvReport> = composition
@@ -1757,6 +1775,42 @@ fn stated_fold(len: FoldLen, lane: usize, port: Option<&[u32]>) -> Result<u32> {
             })?
         }
     })
+}
+
+/// A lane's windowed table where it names ring slot refs: a page wholly
+/// behind the window of the lane's first row reads the null slot, the rest
+/// the refs the lane was handed, one a page of its table.
+fn ring_refs(paging: &kv::Paging, seat: &kv::Seat, refs: &[u32]) -> Result<Vec<u32>> {
+    let Some(window) = paging.window else {
+        return Ok(refs.to_vec());
+    };
+    let page_size = u64::from(paging.page_size);
+    let pages = (u64::from(seat.have) + u64::from(seat.rows))
+        .div_ceil(page_size)
+        .max(1);
+    let first = u64::from(seat.have.saturating_sub(window.tokens)) / page_size;
+    (0..pages)
+        .map(|page| {
+            if page < first {
+                return Ok(0);
+            }
+            match refs.get(page as usize) {
+                Some(&slot) if slot != 0 => Ok(slot),
+                Some(_) => Err(Fault::Unbound {
+                    what: format!(
+                        "windowed page {page} of a lane holding {} tokens, which its window \
+                         still reads and the runtime has released",
+                        seat.have
+                    ),
+                }),
+                None => Err(Fault::Ceiling {
+                    what: "ring slot refs this lane stated",
+                    need: page + 1,
+                    have: refs.len() as u64,
+                }),
+            }
+        })
+        .collect()
 }
 
 fn narrow(n: u64) -> i32 {

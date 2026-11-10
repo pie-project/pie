@@ -108,22 +108,7 @@ pub(super) fn bake(boot: &mut Boot<'_>) -> Result<Baked> {
             );
         }
     }
-    let stated_slots = boot.slots;
-    boot.slots = poem_compiler::state_slots(
-        boot.slots,
-        &boot.trace,
-        match engine.state_slots_per_lane {
-            0 => DEFAULT_STATE_SLOTS,
-            per_lane => per_lane.saturating_mul(boot.budget.max_lanes).max(1),
-        },
-    );
-    // Slots the config states or the profile derives a lane each are kept at
-    // the fit up to the lanes a fire batches; the fixed default is fitted.
-    let kept_slots = if stated_slots > 0 || engine.state_slots_per_lane > 0 {
-        boot.slots
-    } else {
-        0
-    };
+    boot.slots = poem_compiler::state_slots(boot.slots, &boot.trace, DEFAULT_STATE_SLOTS);
 
     kernels_cuda::disk::install(boot.cache_dir);
 
@@ -436,7 +421,6 @@ pub(super) fn bake(boot: &mut Boot<'_>) -> Result<Baked> {
         profile,
         regions,
         anchored,
-        kept_slots,
         asked,
     })
 }
@@ -650,7 +634,6 @@ impl Shell {
             profile,
             regions: folded,
             anchored,
-            kept_slots,
             asked,
         } = bake(&mut boot)?;
         // Every generated kernel compiled and loaded now, before a fire can
@@ -876,6 +859,14 @@ impl Shell {
                 crate::device::free_bytes().unwrap_or(0) >> 20
             );
         }
+        // The fires that run the side streams carve their own arena
+        // (`CompiledModel::arena_forked`): the larger of the two is what the
+        // pool keeps under its end for a fire's activation.
+        let forked_bytes = compiled
+            .arena_forked
+            .as_ref()
+            .map_or(0, |forked| forked.bytes);
+        let arena_bytes = compiled.arena.bytes.max(forked_bytes);
         let pools = Pools::reserve(
             device.ordinal(),
             boot.memory_share,
@@ -883,6 +874,9 @@ impl Shell {
             paging,
             boot.kv_budget,
             &facts,
+            &budgets,
+            arena_bytes,
+            boot.knobs.diagnostics.chunk_bytes,
         )?;
         if boot.knobs.diagnostics.arm_trace {
             eprintln!(
@@ -892,20 +886,9 @@ impl Shell {
         }
         let buffers = Buffers::reserve(&boot.trace, paging, budgets.tokens.max_tokens, &pools)?;
         let mut pools = pools;
-        pools.keep_slots(kept_slots.min(boot.budget.max_lanes));
-        if let Some(buffers) = &buffers {
-            pools.seat_buffered(buffers.slot_bytes(), buffers.map_unit());
-        }
-        // The fires that run the side streams carve their own arena
-        // (`CompiledModel::arena_forked`): the larger of the two is reserved
-        // and held. Committed whole: a fire reading out past one row a lane
-        // (a verify reads every row) would otherwise grow it outside the fit.
-        let forked_bytes = compiled
-            .arena_forked
-            .as_ref()
-            .map_or(0, |forked| forked.bytes);
-        let arena_bytes = compiled.arena.bytes.max(forked_bytes);
-        let mut arena = Arena::reserve(arena_bytes, &pools)?;
+        // Committed whole: a fire reading out past one row a lane (a verify
+        // reads every row) would otherwise grow it outside the fit.
+        let mut arena = Arena::reserve(arena_bytes);
         let unscored = compiled.arena.scores_from(&boot.trace).max(
             compiled
                 .arena_forked
@@ -926,17 +909,16 @@ impl Shell {
                     true
                 }
             }) > 0,
+            pools.ids_a_lane(),
         )?;
-        let spaces = boot
-            .trace
-            .caches
-            .iter()
-            .filter_map(|row| match row {
-                poem_ir::CacheRow::Kv { space, .. } => Some(*space as usize + 1),
-                poem_ir::CacheRow::State { .. } => None,
-            })
-            .max()
-            .unwrap_or(0);
+        pools.seat_tables(
+            crate::window::lane_capacity(boot.budget.max_lanes),
+            boot.budget
+                .max_lanes
+                .saturating_mul(crate::store::rs::SNAPSHOTS),
+        );
+        // A page table a kv shape: the full rows' and the windowed rows'.
+        let spaces = pools.geometries();
         let patch_seat = boot.patches.as_ref().and_then(|ladder| {
             boot.trace.values.iter().find_map(|decl| {
                 let (
@@ -1016,6 +998,7 @@ impl Shell {
             feeds.selections.len(),
             !masked.is_empty() || !wide.is_empty(),
             &schedule_streams(&boot.trace, &compiled),
+            pools.ids_a_lane(),
         )?;
 
         let exports = Exports::of(&boot.trace, &compiled)?;
@@ -1275,21 +1258,6 @@ impl Shell {
                 fitted.spare >> 20,
             );
             shell.bodies_mem = usize::try_from(fitted.bodies).unwrap_or(usize::MAX);
-        }
-        if (fitted.slots as usize) < shell.held.len() {
-            eprintln!(
-                "engine-cuda: [engine] max_state_slots {} is served at {} on this card: the \
-                 recurrent slab is declared for every slot, and at {} the kv pages beside it \
-                 seated fewer sequences than there were slots, so the slots were cut to where \
-                 the two seat alike, or to half of the room past one sequence where that is \
-                 more; the pool seats {} sequences at the declared context. State a smaller \
-                 max_state_slots to choose it.",
-                shell.held.len(),
-                fitted.slots,
-                shell.held.len(),
-                fitted.fit / u64::from(shell.pools.paging().pages_per_slot),
-            );
-            shell.held.truncate(fitted.slots as usize);
         }
         Ok(Staged {
             shell,
@@ -1693,8 +1661,6 @@ pub(super) struct Baked {
     pub(super) regions: std::collections::BTreeMap<u64, kernels_ir::Region>,
     /// The anchored region each `fused.anchored` of the trace names, by key.
     pub(super) anchored: std::collections::BTreeMap<u64, kernels_ir::Anchored>,
-    /// The state slots `Pools::keep_slots` keeps, before the lanes cap them.
-    pub(super) kept_slots: u32,
     /// The budget asked before the card cut its tokens at the asked lanes.
     pub(super) asked: Budget,
 }

@@ -2197,6 +2197,7 @@ impl TuneArena {
                 a.paging = Some(Paging {
                     valid: 0,
                     page_size: 1,
+                    page_stride: [0, 0],
                 });
             }
             a

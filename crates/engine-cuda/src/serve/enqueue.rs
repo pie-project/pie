@@ -529,6 +529,7 @@ impl FireCtx<'_> {
             _ => (&self.compiled.arena, false),
         };
         let mut slots = self.arena.slots(
+            self.pools,
             map,
             poem_compiler::FireRows {
                 tokens: carve_rows,
@@ -699,6 +700,7 @@ impl FireCtx<'_> {
                 .collect(),
             inputs: staged.inputs.clone(),
             geometry,
+            geometry_of: self.pools.geometry_map(),
             schedules,
             plan_values: facts.plans.len(),
             tables: FireTables {
@@ -806,6 +808,7 @@ impl FireCtx<'_> {
         {
             run = run.buffered(RsSeat {
                 buffers: pool,
+                pools: self.pools,
                 lanes: &p.rs.moves,
                 reads: &p.rs.reads,
                 scratch: rs_scratch.as_ref(),
