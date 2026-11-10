@@ -4,6 +4,7 @@
 
 #![allow(clippy::too_many_arguments)]
 
+mod adopt;
 mod bind;
 mod formats;
 mod forward;
@@ -17,8 +18,9 @@ mod paths;
 mod run;
 mod values;
 
+pub use adopt::{ADOPT, Adoption, Refusal};
 pub use manifest::{Manifest, Model, Published, Template, Tokenizer, dtype_of, precision_of};
 pub use package::Package;
 pub use paths::renamed;
-pub use run::{Deploy, ImageSpec};
+pub use run::{Deploy, ImageSpec, Recognized};
 pub use values::{precision_word, word};

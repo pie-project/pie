@@ -4244,6 +4244,7 @@ dependencies = [
  "blake3",
  "checkpoint",
  "pie-poem-ir",
+ "serde_json",
  "starlark",
  "starlark_derive",
  "tempfile",
