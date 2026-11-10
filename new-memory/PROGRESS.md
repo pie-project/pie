@@ -434,3 +434,12 @@ The `new-memory/` directory is bookkeeping and is removed before anything lands 
   snapshots in a fire, contract 15 group path, slot_copies.
 - Open (P3): qwen38-flash-next-mini refused — Metal buffers every conv input incl. cache row 9 that feeds no
   deferred recurrence; recipe keeps no rs row for it.
+
+### M31 — 2026-11-10: WC3 merged (CUDA expert / row tables)
+- `sc/wc3-cuda-expert-table` (9e1aa09e3; forks A bf16/FP8, B FP4/affine-u4, C tcgen05 grouped + mega-MoE):
+  `ExpertTable { table: u64 addresses table[e*planes+p], hits, located, window }`, `RowTable { table, block_rows }`;
+  null table = contiguous bank (degenerate, computed in-kernel); misses may point at mapped host memory
+  (located=false, plain-load selects only). Engine passes RESIDENT for now.
+- Verified sm_120: moe_table / moe_table_fp8 / moe_table_fp4 bitwise vs contiguous under scattered pools; the timing
+  test failed once under a concurrent IT run (247 vs 74 us), passes alone (table 27 us vs contiguous 44 us).
+- Next: L40S builds PLE streaming on RowTable (`sc/l40s-wc-ple`).
