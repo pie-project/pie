@@ -1515,7 +1515,7 @@ fn delta(
                 && input.rule()
                 && step_kernel_on()
                 && let Some(out) =
-                    step::gdn_step(fq, &heads, lanes.slot, slab, per, tuning.ssm.step_bufs)?
+                    step::gdn_step(fq, &heads, lanes.slot, slab, per, tuning.ssm.step_mxu)?
             {
                 return Ok(out);
             }
