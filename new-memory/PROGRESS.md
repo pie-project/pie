@@ -535,3 +535,12 @@ The `new-memory/` directory is bookkeeping and is removed before anything lands 
   284-prompt at token 212 before the window); 1500/fork/resume past window equal. Started with BM (M30), not WL2.
   Logit-level check pending. Metal multi-window-list not done (untestable on device now). MTP accepts 0/127 drafts
   on Qwen3.5-0.8B in both builds (separate issue).
+
+### M38 — 2026-11-10: ROCm option B merged
+- `sc/l40s-rocm` (2f4e8ed78): kernels-rocm Rust side on the new API (page_stride, Segments, RowTable stub,
+  state_stride, conv cache by &RecurrentPool), each refusing what its unmodified .hip kernel cannot address; ROCm
+  engine lays the pool packed (Layout::pack), recurrent rows as one piece, no row streaming. Refused at load: mixed
+  packed page sizes in one shape (DeepSeek V4, dots, MiniMax shapes — possible ROCm regression until option A),
+  non-whole packed pages, multi-piece recurrent rows. new-memory/ROCM-PORT.md lists option A work.
+- Verified (no AMD hardware): cargo check/clippy rocm builds; CUDA default goldens unchanged; CUDA with
+  `packed-pages` diagnostic bit-identical on 5 mini models. HIP kernels not compiled or run.
