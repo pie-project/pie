@@ -147,14 +147,12 @@ pub struct RsRows {
     pub plane_at: Vec<u64>,
 }
 
-/// How a kv space's rows are paged: the kv list, the window list
-/// (CONTRACT-BC 19), or a small window folded into the record (`tokens`
-/// tokens in record slot `slot`, token `t` at row `t % tokens`).
+/// How a kv space's rows are paged: the kv list or the window list
+/// (CONTRACT-BC 19).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SpacePaging {
     List,
     Window,
-    Folded { tokens: u32, slot: u32 },
 }
 
 /// How a load's rows lay into the recipe's slots, before any pool is
@@ -169,12 +167,10 @@ pub struct Rows {
     pub tokens: u32,
     pub fixed_bytes: u64,
     pub pieces: u32,
-    /// The window list's slot bytes (the recipe's ring slot, read as a
-    /// window list: CONTRACT-BC 19) and the window it is read through; zero
-    /// where nothing is windowed.
-    pub ring_bytes: u64,
-    pub ring_cap: u32,
-    pub ring_window: u32,
+    /// The window list's slot bytes (CONTRACT-BC 19) and the rows its
+    /// window retains; zero where nothing is windowed.
+    pub window_bytes: u64,
+    pub window_rows: u32,
     /// How each kv space is paged, by space.
     pub spaces: Vec<SpacePaging>,
     /// What one physical list slot's tokens take in the side planes.
@@ -239,33 +235,29 @@ impl Rows {
         facts: &Facts,
         rs: Option<&crate::rs::Layout>,
     ) -> Result<Rows> {
-        let rings: Vec<&SlotLayout> = recipe.rings().collect();
-        if rings.len() > 1 {
+        let windows: Vec<&SlotLayout> = recipe.windows().collect();
+        if windows.len() > 1 {
             return Err(disagree(format!(
-                "keeps {} ring shapes ({}), where a load pages one",
-                rings.len(),
+                "keeps {} window lists ({}), where a load pages one",
+                windows.len(),
                 recipe.shapes()
             )));
         }
-        let (ring_tokens, ring_bytes, ring_cap, ring_window, ring_runs) = match rings.first() {
-            Some(SlotLayout::Ring {
+        let (window_tokens, window_bytes, window_rows, window_runs) = match windows.first() {
+            Some(SlotLayout::List {
                 tokens,
                 bytes,
-                cap_slots,
-                cap,
                 rows,
-            }) => (*tokens, *bytes, *cap_slots, cap.window, rows.as_slice()),
-            _ => (0, 0, 0, 0, &[][..]),
-        };
-        let folded: &[(RowId, u32)] = match recipe.fixed() {
-            Some(SlotLayout::Fixed { folded, .. }) => folded,
-            _ => &[],
+                window: Some(window),
+            }) => (*tokens, *bytes, *window, rows.as_slice()),
+            _ => (0, 0, 0, &[][..]),
         };
         let (tokens, list_bytes, runs) = match recipe.list() {
             Some(SlotLayout::List {
                 tokens,
                 bytes,
                 rows,
+                ..
             }) => (*tokens, *bytes, rows.as_slice()),
             _ => (0, 0, &[][..]),
         };
@@ -278,12 +270,16 @@ impl Rows {
             }) => (*bytes, *pieces_per_ws, rows.as_slice()),
             _ => (0, 0, &[][..]),
         };
-        // Without a list the ring's slot is the kv page.
-        let tokens = if list_bytes == 0 { ring_tokens } else { tokens };
-        if ring_bytes > 0 && ring_tokens != tokens {
+        // Without a list the window list's slot is the kv page.
+        let tokens = if list_bytes == 0 {
+            window_tokens
+        } else {
+            tokens
+        };
+        if window_bytes > 0 && window_tokens != tokens {
             return Err(disagree(format!(
-                "pages windowed rows {ring_tokens} tokens a ring slot beside {tokens}-token kv \
-                 pages, where a ring slot is one kv page"
+                "pages windowed rows {window_tokens} tokens a window slot beside {tokens}-token \
+                 kv pages, where a window list's slot is one kv page"
             )));
         }
         let mut spaces: Vec<Option<SpacePaging>> = Vec::new();
@@ -305,38 +301,21 @@ impl Rows {
                 } => {
                     let kv = kv_cells(index, name, planes, *dtype, *space, *head_dim, facts)?;
                     let per_token = kv.keys_cell + if kv.own_values { kv.values_cell } else { 0 };
-                    // Where the row lies: a list slot, a ring slot, or the
-                    // record (a folded ring), and the tokens a run holds.
-                    let (paging, offset, stated, run_tokens) = if let Some(run) =
-                        runs.iter().find(|run| run.row == id)
-                    {
-                        (SpacePaging::List, run.offset, run.per_token, tokens)
-                    } else if let Some(run) = ring_runs.iter().find(|run| run.row == id) {
-                        (SpacePaging::Window, run.offset, run.per_token, ring_tokens)
-                    } else if let Some(&(_, held)) = folded.iter().find(|(row, _)| *row == id) {
-                        let run = fixed_runs.iter().find(|run| run.row == id).ok_or_else(|| {
-                            disagree(format!("folds kv row `{name}` into no record slot"))
-                        })?;
-                        if run.pieces != 1 {
-                            return Err(disagree(format!(
-                                "cuts folded ring row `{name}` into {} pieces, where this \
-                                     shell reads a folded ring whole",
-                                run.pieces
-                            )));
-                        }
-                        let bytes = recipe.atoms.get(&id).map_or(0, |a| a.bytes);
-                        (
-                            SpacePaging::Folded {
-                                tokens: held,
-                                slot: run.slots[0],
-                            },
-                            run.offset,
-                            bytes,
-                            held,
-                        )
-                    } else {
-                        return Err(disagree(format!("lays kv row `{name}` in no slot")));
-                    };
+                    // Where the row lies: a kv list slot or a window list
+                    // slot, and the tokens a run holds.
+                    let (paging, offset, stated, run_tokens) =
+                        if let Some(run) = runs.iter().find(|run| run.row == id) {
+                            (SpacePaging::List, run.offset, run.per_token, tokens)
+                        } else if let Some(run) = window_runs.iter().find(|run| run.row == id) {
+                            (
+                                SpacePaging::Window,
+                                run.offset,
+                                run.per_token,
+                                window_tokens,
+                            )
+                        } else {
+                            return Err(disagree(format!("lays kv row `{name}` in no slot")));
+                        };
                     if per_token != stated {
                         return Err(disagree(format!(
                             "lays kv row `{name}` at {stated} bytes a token, where this shell \
@@ -449,9 +428,8 @@ impl Rows {
             tokens,
             fixed_bytes,
             pieces,
-            ring_bytes,
-            ring_cap,
-            ring_window,
+            window_bytes,
+            window_rows,
             spaces: spaces
                 .into_iter()
                 .map(|paging| paging.unwrap_or(SpacePaging::List))
@@ -812,19 +790,6 @@ impl Pools {
         refs.iter().map(|&r| unit(r)).collect()
     }
 
-    /// The unit (`Layout::buffer_stride`) a folded window in record slot
-    /// `slot` starts at, for the record whose physical pieces are `record`.
-    pub fn folded_unit(&self, record: &[u32], slot: u32) -> Result<u32> {
-        let fixed = *self.shape(FIXED)?;
-        let piece = *record.get(slot as usize).ok_or(Fault::Ceiling {
-            what: "pieces of a record",
-            need: u64::from(slot) + 1,
-            have: record.len() as u64,
-        })?;
-        let at = slot_at(&self.layout, &fixed, piece);
-        Ok(u32::try_from(at / self.layout.buffer_stride()).unwrap_or(u32::MAX))
-    }
-
     /// The physical page explicit write descriptor page `page` names.
     pub fn kv_page(&self, page: u32) -> Result<u32> {
         self.physical(LIST, page)
@@ -1054,7 +1019,6 @@ impl Pools {
                     let (stride, page_size) = match self.space_paging(space as usize) {
                         SpacePaging::List => (list_bytes, self.paging.page_size),
                         SpacePaging::Window => (self.window_stride(), self.paging.page_size),
-                        SpacePaging::Folded { tokens, .. } => (self.layout.buffer_stride(), tokens),
                     };
                     CachePool::Kv(KvPool {
                         keys: plane(u64::from(kv_heads) * u64::from(head_dim))?,

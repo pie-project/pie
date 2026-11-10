@@ -636,7 +636,22 @@ impl Engine for Cerebras {
         }
         let page_size = self.loaded_mut()?.paging().page_size;
         let moves = copy.runs(page_size)?;
-        self.loaded_mut()?.copy_kv(&moves).map_err(fault)
+        // Windowed pages a write into a shared one copies first ride the
+        // pre-launch copy beside the kv list's (CONTRACT-BC 19).
+        let windowed: Vec<engine::transfer::KvRun> = copy
+            .windowed
+            .iter()
+            .map(|&(src, dst)| engine::transfer::KvRun {
+                src_page: src,
+                src_token: 0,
+                dst_page: dst,
+                dst_token: 0,
+                tokens: page_size,
+            })
+            .collect();
+        self.loaded_mut()?
+            .copy_kv_with(&moves, &windowed)
+            .map_err(fault)
     }
 
     fn copy_state(&mut self, copy: &StateCopy) -> EngineResult<()> {
@@ -1173,7 +1188,6 @@ impl Cerebras {
                     Some(DeviceLane { pages: Some(_), .. }) => &[],
                     _ => &lane.kv.window,
                 },
-                window_copies: &lane.kv.window_copies,
             })
             .collect();
         let clips: Vec<crate::serve::Clips<'_>> = submission

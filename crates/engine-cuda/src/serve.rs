@@ -515,6 +515,16 @@ impl Shell {
     /// row's pages are named by the fire that reads them, so cells moved
     /// between pages here would leave its copy behind.
     pub fn copy_kv(&mut self, moves: &[engine::transfer::KvRun], cells: bool) -> Result<()> {
+        self.copy_kv_with(moves, &[], cells)
+    }
+
+    /// [`Self::copy_kv`] with whole windowed pages beside the full ones.
+    pub fn copy_kv_with(
+        &mut self,
+        moves: &[engine::transfer::KvRun],
+        windowed: &[engine::transfer::KvRun],
+        cells: bool,
+    ) -> Result<()> {
         if cells && self.pools.has_windowed() {
             return Err(Fault::Unbound {
                 what: "a token-cell kv copy on a load with windowed kv rows, whose pages this \
@@ -523,7 +533,7 @@ impl Shell {
             });
         }
         self.pools.fence_all_swaps(self.device.stream())?;
-        self.pools.copy_kv(self.device.stream(), moves, &[])
+        self.pools.copy_kv(self.device.stream(), moves, windowed)
     }
 
     /// Backs every page the pools declare ([`crate::store::Pools::back_whole`]).

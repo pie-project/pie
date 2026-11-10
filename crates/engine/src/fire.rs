@@ -177,10 +177,6 @@ pub struct KvDelta {
     /// null page a page wholly behind the window reads.
     #[serde(default)]
     pub window: Vec<u32>,
-    /// Windowed pages copied `(src, dst)` before the fire runs, beside the
-    /// full pages the fire's pre-launch copy moves.
-    #[serde(default)]
-    pub window_copies: Vec<(u32, u32)>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -236,9 +232,11 @@ pub struct Lane {
     /// an engine that taps ([`crate::Engine::tap_groups`]).
     #[serde(default)]
     pub tap: Option<Tap>,
-    /// The lane's slot refs of each list or ring shape, in token order
-    /// (an engine that states [`crate::chunk::ChunkFacts`]); empty during
-    /// the migration, when `kv` and `rs` still say.
+    /// The lane's slot refs of the kv list and of each window list, in
+    /// token order (an engine that states [`crate::chunk::ChunkFacts`]);
+    /// empty during the migration, when `kv` and `rs` still say. A window
+    /// list's table is as long as the kv list's, a slot trimmed behind its
+    /// window ref 0 (CONTRACT-BC 19).
     #[serde(default)]
     pub tables: Vec<(ShapeId, Vec<u32>)>,
     /// The lane's slot refs of each fixed shape, one `[run, cow]` a piece,
@@ -250,9 +248,12 @@ pub struct Lane {
     pub fixed: Vec<(ShapeId, Vec<[u32; 2]>)>,
     /// Whole-slot copies `[src, dst]` (logical slot refs) of each list
     /// shape, made on the stream before the fire runs, after the fires
-    /// before it: today only the rs list, where a lane writes buffered rows
-    /// into a slot it shared with a fork (CONTRACT-BC 18). Its
-    /// `RsVerb::Buffer::pages` already name `dst`. Every lane's copies of
+    /// before it: the rs list, where a lane writes buffered rows into a
+    /// slot it shared with a fork (CONTRACT-BC 18; its
+    /// `RsVerb::Buffer::pages` already name `dst`), and a window list,
+    /// where a lane writes rows into a slot it shares with a fork or a
+    /// prefix-cache entry (CONTRACT-BC 19; its table already names `dst`).
+    /// Every lane's copies of
     /// a fire land before any lane of it reads or writes; no two name the
     /// same `dst`.
     #[serde(default)]
@@ -402,7 +403,7 @@ impl Lane {
     /// Checks the lane's slot refs against the engine's chunks: each shape
     /// stated, of the kind its table says, each piece of a fixed shape
     /// named, every ref inside the pool (or the shape's pinned run) and off
-    /// the reserved chunks, but a ring's null ref 0.
+    /// the reserved chunks, but a window list's null ref 0 in its table.
     pub fn validate_chunks(&self, facts: &ChunkFacts) -> Result<()> {
         for (id, pieces) in &self.fixed {
             if let Some(SlotKind::Fixed { pieces: stated }) = facts.shape(*id).map(|s| s.kind)
@@ -425,24 +426,30 @@ impl Lane {
             .iter()
             .map(|(shape, pairs)| (*shape, pairs.iter().flatten().copied().collect()))
             .collect();
+        // Each shape's refs, whether they are fixed pieces, and whether a
+        // null ref 0 may stand among them (a window list's table).
         let refs = self
             .tables
             .iter()
-            .chain(&copies)
-            .map(|(shape, refs)| (*shape, refs.as_slice(), false))
+            .map(|(shape, refs)| (*shape, refs.as_slice(), false, true))
+            .chain(
+                copies
+                    .iter()
+                    .map(|(shape, refs)| (*shape, refs.as_slice(), false, false)),
+            )
             .chain(
                 fixed
                     .iter()
-                    .map(|(shape, refs)| (*shape, refs.as_slice(), true)),
+                    .map(|(shape, refs)| (*shape, refs.as_slice(), true, false)),
             );
-        for (id, refs, fixed) in refs {
+        for (id, refs, fixed, table) in refs {
             let Some(shape) = facts.shape(id) else {
                 return Err(Error::Invalid(format!(
                     "lane in slot {} names shape {id}, which the engine does not state",
                     self.slot
                 )));
             };
-            let ring = matches!(shape.kind, SlotKind::Ring { .. });
+            let trims = table && shape.kind.window().is_some();
             if fixed == shape.kind.per_token() {
                 return Err(Error::Invalid(format!(
                     "lane in slot {} names {:?} shape {id} as {}",
@@ -459,7 +466,7 @@ impl Lane {
                 |pinned| pinned.device,
             );
             for &slot in refs {
-                if ring && slot == 0 {
+                if trims && slot == 0 {
                     continue;
                 }
                 let chunk = shape.chunk_of(slot);

@@ -68,10 +68,9 @@ const WORD: u32 = u64::BITS;
 pub enum ShapeKind {
     /// Whole-sequence state (recurrent, conv, rs buffer, snapshot ids).
     Fixed,
-    /// Per-token state kept for every token (full-attention kv).
+    /// Per-token state, in token order: the kv list, a window list (its
+    /// slots behind the window trimmed), the rs list.
     List,
-    /// Per-token state kept for a window (sliding-window kv).
-    Ring,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -87,7 +86,7 @@ impl SlotShape {
     pub fn sets_per_working_set(&self) -> u32 {
         match self.kind {
             ShapeKind::Fixed => FIXED_SETS_PER_WORKING_SET,
-            ShapeKind::List | ShapeKind::Ring => 1,
+            ShapeKind::List => 1,
         }
     }
 }
@@ -1968,7 +1967,7 @@ mod tests {
                 &[
                     (ShapeKind::List, 4),
                     (ShapeKind::Fixed, 1),
-                    (ShapeKind::Ring, 70),
+                    (ShapeKind::List, 70),
                 ],
             );
         }

@@ -664,7 +664,7 @@ impl PreparedLoad<'_> {
             let seated = paging_at(1, boot.slots)?;
             let bytes = [rows.list_bytes, rows.fixed_bytes];
             let chunk = rows.chunk_bytes;
-            let window_chunks = chunk.checked_div(rows.ring_bytes).map_or(0, |per| {
+            let window_chunks = chunk.checked_div(rows.window_bytes).map_or(0, |per| {
                 seated
                     .pages_per_slot
                     .div_ceil(u32::try_from(per).unwrap_or(1).max(1))
@@ -697,7 +697,7 @@ impl PreparedLoad<'_> {
                 boot.slots,
                 seated.pages_per_slot,
             )?
-            .with_window(rows.ring_bytes, rows.ring_window, seated.pages_per_slot)?
+            .with_window(rows.window_bytes, rows.window_rows, seated.pages_per_slot)?
             .with_rs(
                 rows.rs.as_ref().map_or(0, |rs| rs.bytes),
                 rows.rs.as_ref().map_or(0, |rs| rs.tokens),
@@ -2603,9 +2603,8 @@ impl Shell {
         let mut seats: Vec<Seat> = Vec::with_capacity(lanes.len());
         let mut kv_less: Vec<bool> = Vec::with_capacity(lanes.len());
         let mut tables: Vec<std::borrow::Cow<'_, [u32]>> = Vec::with_capacity(lanes.len());
-        // Per lane: its window pages and its record (folded windows lie there).
+        // Per lane: its window list pages.
         let mut window_tables: Vec<Vec<u32>> = Vec::with_capacity(lanes.len());
-        let mut lane_records: Vec<Vec<u32>> = Vec::with_capacity(lanes.len());
         let has_window = self.pools.layout().window.is_some();
         let mut tokens: Vec<i32> = Vec::with_capacity(rows as usize);
         let mut positions: Vec<i32> = Vec::with_capacity(rows as usize);
@@ -2688,7 +2687,6 @@ impl Shell {
                 engine::fire::RsReset::Held => false,
             };
             let record = self.record_of(seated)?;
-            lane_records.push(record.clone());
             window_tables.push(if has_window && !seated.kv_less {
                 let page_size = u64::from(self.pools.paging().page_size.max(1));
                 let after = u64::from(have) + u64::from(row.rows);
@@ -3033,26 +3031,6 @@ impl Shell {
                 crate::store::SpacePaging::List => kv::geometry_with(&paging, &seats, &table_refs)?,
                 crate::store::SpacePaging::Window => {
                     kv::geometry_with(&paging, &seats, &window_refs)?
-                }
-                crate::store::SpacePaging::Folded { tokens, slot } => {
-                    // Every page of a folded window is the record's slot: token
-                    // `t` at row `t % tokens` of it.
-                    let folded = Paging {
-                        page_size: tokens,
-                        pages_per_slot: paging.context().div_ceil(tokens.max(1)).max(1),
-                        ..paging
-                    };
-                    let units = seats
-                        .iter()
-                        .zip(&lane_records)
-                        .map(|(seat, record)| {
-                            let after = u64::from(seat.have) + u64::from(seat.rows);
-                            let pages = after.div_ceil(u64::from(tokens.max(1))).max(1);
-                            Ok(vec![self.pools.folded_unit(record, slot)?; pages as usize])
-                        })
-                        .collect::<Result<Vec<_>>>()?;
-                    let refs: Vec<&[u32]> = units.iter().map(Vec::as_slice).collect();
-                    kv::geometry_with(&folded, &seats, &refs)?
                 }
             });
         }

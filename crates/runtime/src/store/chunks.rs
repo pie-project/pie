@@ -42,12 +42,15 @@ pub const STORE: Holder = Holder::WorkingSet(u64::MAX);
 enum Backing {
     /// A pinned shape's own pool: id `base + c` is chunk `c`.
     Own(Box<SlotPool>),
-    /// A list or ring shape of an engine's shared pool: an id is the slot
-    /// ref, and the null chunk's ref 0 is never handed out.
+    /// A list shape of an engine's shared pool: an id is the slot ref, and
+    /// the null chunk's ref 0 is never handed out.
     Shape(Shared, ShapeId),
     /// The fixed records of an engine's shared pool: id `base + r` is
     /// record `r`, a slot of every fixed shape for each of its pieces.
     Records(Shared),
+    /// The window sets of an engine's shared pool: id `base + w` is window
+    /// set `w` (from 1), a slot of every window list.
+    Windows(Shared),
 }
 
 /// One store's ids of one shape: a pinned shape's own run (see the module
@@ -74,6 +77,7 @@ fn waiter(backing: &Backing) -> u64 {
     match backing {
         Backing::Shape(_, shape) => u64::from(*shape),
         Backing::Own(_) | Backing::Records(_) => u64::MAX,
+        Backing::Windows(_) => u64::MAX - 1,
     }
 }
 
@@ -173,6 +177,31 @@ impl<I: PoolId> ShapePool<I> {
         }
     }
 
+    /// `shared`'s window sets as ids from `base`; id `base` itself (window
+    /// set 0, the null chunk) is never handed out.
+    pub fn window_sets(shared: &Shared, base: u32) -> Self {
+        let (capacity, slot_bytes) = {
+            let pool = shared.lock().unwrap();
+            let bytes = pool.windows().iter().map(|shape| shape.slot_bytes).sum();
+            (pool.window_sets_capacity(), bytes)
+        };
+        let ids_end = base
+            .checked_add(capacity)
+            .and_then(|end| end.checked_add(1))
+            .expect("pool id range overflows u32");
+        Self {
+            slots: Backing::Windows(Arc::clone(shared)),
+            kind: ShapeKind::List,
+            slot_bytes,
+            base,
+            capacity,
+            ids_end,
+            limit: capacity,
+            pending: Vec::new(),
+            id: PhantomData,
+        }
+    }
+
     /// One past the highest id the pool may hand out.
     pub fn ids_end(&self) -> u32 {
         self.ids_end
@@ -206,6 +235,10 @@ impl<I: PoolId> ShapePool<I> {
                 .iter()
                 .flat_map(|&id| pool.record_slots(id.index() - self.base))
                 .collect(),
+            Backing::Windows(_) => ids
+                .iter()
+                .flat_map(|&id| pool.window_set_slots(id.index() - self.base))
+                .collect(),
             Backing::Own(_) => unreachable!("a pinned pool's slots are its own"),
         }
     }
@@ -220,7 +253,7 @@ impl<I: PoolId> ShapePool<I> {
                 };
                 f(pool, slots)
             }
-            Backing::Shape(shared, _) | Backing::Records(shared) => {
+            Backing::Shape(shared, _) | Backing::Records(shared) | Backing::Windows(shared) => {
                 let shared = Arc::clone(shared);
                 let mut pool = shared.lock().unwrap();
                 let slots = self.shared_slots(&pool, ids);
@@ -256,6 +289,14 @@ impl<I: PoolId> ShapePool<I> {
                     records
                         .into_iter()
                         .map(|record| I::from_index(self.base + record))
+                        .collect(),
+                )
+            }
+            Backing::Windows(shared) => {
+                let sets = shared.lock().unwrap().take_window_sets(n)?;
+                Some(
+                    sets.into_iter()
+                        .map(|set| I::from_index(self.base + set))
                         .collect(),
                 )
             }
@@ -309,6 +350,10 @@ impl<I: PoolId> ShapePool<I> {
             Backing::Records(shared) => {
                 let records: Vec<u32> = ids.iter().map(|id| id.index() - self.base).collect();
                 shared.lock().unwrap().give_records(&records);
+            }
+            Backing::Windows(shared) => {
+                let sets: Vec<u32> = ids.iter().map(|id| id.index() - self.base).collect();
+                shared.lock().unwrap().give_window_sets(&sets);
             }
         }
     }
@@ -385,6 +430,7 @@ impl<I: PoolId> ShapePool<I> {
                 shared.lock().unwrap().pool().available(*shape) as usize
             }
             Backing::Records(shared) => shared.lock().unwrap().records_available() as usize,
+            Backing::Windows(shared) => shared.lock().unwrap().window_sets_available() as usize,
         }
     }
 
@@ -397,7 +443,7 @@ impl<I: PoolId> ShapePool<I> {
                 let demand = shared.lock().unwrap().pool().shape_demand(*shape);
                 u32::try_from(demand.live + demand.cached).unwrap_or(u32::MAX)
             }
-            Backing::Own(_) | Backing::Records(_) => {
+            Backing::Own(_) | Backing::Records(_) | Backing::Windows(_) => {
                 self.limit.saturating_sub(self.available() as u32)
             }
         }
@@ -416,7 +462,12 @@ impl<I: PoolId> ShapePool<I> {
     }
 
     pub fn contains(&self, id: I) -> bool {
-        (self.base..self.base.saturating_add(self.capacity)).contains(&id.index())
+        let end = match self.slots {
+            // Window set ids run from 1 to the capacity.
+            Backing::Windows(_) => self.ids_end,
+            _ => self.base.saturating_add(self.capacity),
+        };
+        (self.base..end).contains(&id.index())
     }
 
     pub fn kind(&self) -> ShapeKind {
@@ -457,7 +508,7 @@ impl<I: PoolId> ShapePool<I> {
     pub fn cache_refs(&self, id: I) -> u32 {
         match &self.slots {
             Backing::Own(pool) => pool.refs(self.slot(id)).1,
-            Backing::Shape(shared, _) | Backing::Records(shared) => {
+            Backing::Shape(shared, _) | Backing::Records(shared) | Backing::Windows(shared) => {
                 let pool = shared.lock().unwrap();
                 self.shared_slots(&pool, &[id])
                     .first()
@@ -470,7 +521,7 @@ impl<I: PoolId> ShapePool<I> {
     pub fn held_by(&self, holder: &Holder) -> u64 {
         match &self.slots {
             Backing::Own(pool) => pool.held_by(holder),
-            Backing::Shape(shared, _) | Backing::Records(shared) => {
+            Backing::Shape(shared, _) | Backing::Records(shared) | Backing::Windows(shared) => {
                 shared.lock().unwrap().pool().held_by(holder)
             }
         }
@@ -508,6 +559,14 @@ impl<I: PoolId> ShapePool<I> {
                     _ => shared.pool_mut().unwait(waiter),
                 }
             }
+            Backing::Windows(shared) => {
+                let mut shared = shared.lock().unwrap();
+                let first = shared.windows().first().copied();
+                match first {
+                    Some(shape) if ids > 0 => shared.pool_mut().wait(waiter, shape.pool, ids),
+                    _ => shared.pool_mut().unwait(waiter),
+                }
+            }
         }
     }
 
@@ -528,6 +587,17 @@ impl<I: PoolId> ShapePool<I> {
                 let shared = shared.lock().unwrap();
                 shared
                     .fixed()
+                    .iter()
+                    .map(|shape| shape_demand(shared.pool(), shape.pool))
+                    .fold(Demand::default(), |sum, demand| Demand {
+                        live: sum.live + demand.live,
+                        wanted: sum.wanted + demand.wanted,
+                    })
+            }
+            Backing::Windows(shared) => {
+                let shared = shared.lock().unwrap();
+                shared
+                    .windows()
                     .iter()
                     .map(|shape| shape_demand(shared.pool(), shape.pool))
                     .fold(Demand::default(), |sum, demand| Demand {
@@ -684,7 +754,8 @@ pub struct StorePools {
     pub shared: bool,
     pub page_size: u32,
     pub kv: ShapeRun,
-    /// The window ring's pages but the null page 0; its ids run from 1.
+    /// The window list's pages but the null page 0; its ids run from 1.
+    /// A shared pool's window lists are its window sets, not counted here.
     pub window: ShapeRun,
     pub window_tokens: u32,
     pub state: ShapeRun,
@@ -715,11 +786,25 @@ impl StorePools {
             let pinned = shape.pinned.ok_or(ChunkFactsError::Mixed(shape.id.0))?;
             let run = ShapeRun::of(pinned, shape.slot_bytes, shape.slots_per_chunk);
             match (shape.id, shape.kind) {
-                (DEGENERATE_KV, SlotKind::List { tokens, .. }) => {
+                (
+                    DEGENERATE_KV,
+                    SlotKind::List {
+                        tokens,
+                        window: None,
+                        ..
+                    },
+                ) => {
                     pools.page_size = tokens;
                     pools.kv = run;
                 }
-                (DEGENERATE_WINDOW, SlotKind::Ring { window, tokens }) => {
+                (
+                    DEGENERATE_WINDOW,
+                    SlotKind::List {
+                        tokens,
+                        window: Some(window),
+                        ..
+                    },
+                ) => {
                     pools.page_size = tokens;
                     pools.window = run;
                     pools.window_tokens = window;
@@ -737,8 +822,9 @@ impl StorePools {
         Ok(pools)
     }
 
-    /// A shared pool's geometry: the kv list and ring shapes' tokens a
-    /// slot and the window, and the rs list's slot bytes as the buffer's.
+    /// A shared pool's geometry: the kv list's tokens a slot, the widest
+    /// window and a window set's bytes (a slot of every window list), and
+    /// the rs list's slot bytes as the buffer's.
     fn shared(facts: &ChunkFacts) -> Self {
         let mut pools = Self {
             shared: true,
@@ -755,16 +841,24 @@ impl StorePools {
                 SlotKind::List { .. } if shape.role == ::engine::chunk::SlotRole::RsBuffer => {
                     pools.buffer = run;
                 }
-                SlotKind::List { tokens, .. } => {
+                SlotKind::List {
+                    tokens,
+                    window: None,
+                    ..
+                } => {
                     pools.page_size = tokens;
                     pools.kv = run;
                 }
-                SlotKind::Ring { window, tokens } => {
+                SlotKind::List {
+                    tokens,
+                    window: Some(window),
+                    ..
+                } => {
                     if pools.page_size == 0 {
                         pools.page_size = tokens;
                     }
-                    pools.window = run;
-                    pools.window_tokens = window;
+                    pools.window.slot_bytes += shape.slot_bytes;
+                    pools.window_tokens = pools.window_tokens.max(window);
                 }
                 SlotKind::Fixed { pieces } => {
                     pools.state.slot_bytes += shape.slot_bytes * u64::from(pieces);

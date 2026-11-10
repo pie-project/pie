@@ -552,7 +552,6 @@ impl Shell {
                 kv_less: false,
                 translation: &[],
                 window: &lane.window,
-                window_copies: &[],
                 mask: lane.mask.as_ref(),
                 adapter: lane.adapter,
                 readout: None,

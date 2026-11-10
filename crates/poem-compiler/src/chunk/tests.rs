@@ -99,7 +99,7 @@ fn on(chunk: ChunkProfile) -> DeviceProfile {
 }
 
 #[test]
-fn full_rows_of_every_space_share_one_list_and_a_window_rings() {
+fn full_rows_of_every_space_share_one_list_and_a_window_lists_at_its_page() {
     let mut caches: Vec<CacheRow> = (0..4).map(|l| kv(&format!("kv.{l}"), 1024, None)).collect();
     caches.extend((0..8).map(|l| kv(&format!("swa.{l}"), 2048, Some(1024))));
     if let CacheRow::Kv { space, .. } = &mut caches[1] {
@@ -109,13 +109,14 @@ fn full_rows_of_every_space_share_one_list_and_a_window_rings() {
     let lists: Vec<_> = recipe
         .slots
         .iter()
-        .filter(|s| matches!(s, SlotLayout::List { .. }))
+        .filter(|s| matches!(s, SlotLayout::List { window: None, .. }))
         .collect();
     assert_eq!(lists.len(), 1);
     let SlotLayout::List {
         tokens,
         bytes,
         rows,
+        ..
     } = lists[0]
     else {
         unreachable!()
@@ -124,17 +125,28 @@ fn full_rows_of_every_space_share_one_list_and_a_window_rings() {
     assert_eq!(tokens % TOKEN_GRAIN, 0);
     assert_eq!(*bytes, u64::from(*tokens) * 4 * 4096);
     assert!(u64::from(*tokens) * 4096 >= MIN_RUN);
-    let SlotLayout::Ring {
+    let page = *tokens;
+    let windows: Vec<&SlotLayout> = recipe.windows().collect();
+    assert_eq!(windows.len(), 1);
+    let SlotLayout::List {
         tokens,
-        cap_slots,
-        cap,
+        rows,
+        window: Some(retained),
         ..
-    } = recipe.rings().next().unwrap()
+    } = windows[0]
     else {
         unreachable!()
     };
-    assert_eq!(cap.window, 1024);
-    assert_eq!(*cap_slots, cap.tokens().div_ceil(*tokens) + 1);
+    assert_eq!(*retained, 1024);
+    assert_eq!(*tokens, page, "a window list's slot is the kv page");
+    assert_eq!(rows.len(), 8);
+    // A working set holds the slots its window covers and the one its
+    // oldest row retires from, never more than its context fills.
+    assert_eq!(
+        windows[0].slots_per_ws(1 << 20),
+        u64::from(1024u32.div_ceil(page) + 1)
+    );
+    assert_eq!(windows[0].slots_per_ws(page), 1);
     assert_eq!(
         recipe.chunk_bytes % bytes,
         0,
@@ -311,14 +323,32 @@ fn a_tiled_profile_aligns_every_row_and_slot_to_its_tile() {
 }
 
 #[test]
-fn a_small_window_folds_into_the_fixed_record() {
-    let caches = vec![kv("kv.0", 512, None), kv("swa.0", 64, Some(64))];
+fn every_distinct_window_is_a_window_list_of_the_kv_page_however_small() {
+    let caches = vec![
+        kv("kv.0", 512, None),
+        kv("swa.0", 64, Some(64)),
+        kv("swa.1", 64, Some(64)),
+        kv("swa.2", 128, Some(4096)),
+    ];
     let recipe = plan(&trace(caches), &budgets(), &on(ChunkProfile::SERVER_CUDA)).unwrap();
-    assert_eq!(recipe.rings().count(), 0);
-    let Some(SlotLayout::Fixed { folded, .. }) = recipe.fixed() else {
-        panic!("the ring folds into a fixed record")
+    assert!(recipe.fixed().is_none(), "no window folds into a record");
+    let Some(SlotLayout::List { tokens: page, .. }) = recipe.list() else {
+        panic!("a kv list")
     };
-    assert_eq!(folded.len(), 1);
+    let windows: Vec<(Option<u32>, u32, usize)> = recipe
+        .windows()
+        .map(|s| match s {
+            SlotLayout::List {
+                tokens,
+                rows,
+                window,
+                ..
+            } => (*window, *tokens, rows.len()),
+            _ => unreachable!(),
+        })
+        .collect();
+    assert_eq!(windows, vec![(Some(64), *page, 2), (Some(4096), *page, 1)]);
+    assert!(recipe.shapes().contains(&format!("W64:{page}x")));
 }
 
 #[test]

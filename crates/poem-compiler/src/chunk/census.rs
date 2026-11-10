@@ -31,7 +31,7 @@ pub enum Contract {
     Channels,
     /// A conv3d frame cache: frame positions, axis 0.
     Frames,
-    /// Attention rows (a window ring folded into the record): tokens, axis 0.
+    /// Attention rows: tokens, axis 0.
     Tokens,
     /// Read whole (n-gram id windows, the replay floor, anything unknown).
     Whole,
@@ -87,8 +87,6 @@ pub struct FixedRow {
     pub bytes: u64,
     pub atom: Atom,
     pub shard: Shard,
-    /// A window ring folded in: the tokens it holds.
-    pub ring_tokens: Option<u32>,
 }
 
 /// What one rs row buffers, as an engine lays it in an rs-list slot of
@@ -187,7 +185,6 @@ pub fn census(trace: &Trace, state_f32: bool) -> Result<Census, ChunkError> {
                     bytes,
                     atom,
                     shard: shard.clone(),
-                    ring_tokens: None,
                 });
             }
         }

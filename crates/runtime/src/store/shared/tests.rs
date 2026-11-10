@@ -1,5 +1,5 @@
 //! The shared pool against a fake engine that states real, unpinned facts:
-//! a list, a ring, a fixed record of three pieces and one of one, a weight
+//! a list, a window list, a fixed record of three pieces and one of one, a weight
 //! shape, two-ended growth.
 
 use ::engine::chunk::{
@@ -61,14 +61,16 @@ fn facts() -> ChunkFacts {
                 SlotKind::List {
                     tokens: 16,
                     rate: 1,
+                    window: None,
                 },
                 MIB,
             ),
             shape(
                 RING,
-                SlotKind::Ring {
-                    window: 128,
+                SlotKind::List {
                     tokens: 16,
+                    rate: 1,
+                    window: Some(128),
                 },
                 MIB / 2,
             ),
@@ -277,7 +279,12 @@ fn a_lane_names_each_piece_run_and_cow_in_place_unless_it_forks() {
     let mut pool = pool();
     let engine = FakeEngine::new();
     let list = pool.take_refs(LIST_POOL, 3).unwrap();
-    let ring = pool.take_refs(RING_POOL, 2).unwrap();
+    let sets = pool.take_window_sets(2).unwrap();
+    assert_eq!(sets, [1, 2], "window set 0 is the null chunk's");
+    let ring: Vec<u32> = sets
+        .iter()
+        .map(|&set| pool.window_set_refs(set)[0])
+        .collect();
     let [run, cow] = pool.take_records(2).unwrap()[..] else {
         panic!("two records");
     };
@@ -285,12 +292,16 @@ fn a_lane_names_each_piece_run_and_cow_in_place_unless_it_forks() {
     // Decode: the record written in place.
     let decode = Lane {
         tokens: vec![1],
-        tables: pool.lane_tables(&list, &[0, ring[0], ring[1]]),
+        tables: pool.lane_tables(&list, &[0, sets[0], sets[1]]),
         fixed: pool.lane_fixed(run, run),
         ..Lane::default()
     };
     assert_eq!(decode.tables[0], (LIST, list.clone()));
-    assert_eq!(decode.tables[1].1[0], 0, "ring ref 0 is the null chunk");
+    assert_eq!(
+        decode.tables[1],
+        (RING, vec![0, ring[0], ring[1]]),
+        "a full-length table, ref 0 the null chunk where the window trimmed"
+    );
     assert_eq!(decode.fixed.len(), 2);
     assert_eq!(decode.fixed[0].1.len(), 3, "one [run, cow] a piece");
     assert!(
@@ -466,8 +477,8 @@ fn governor_bytes_count_the_top_span_as_committed_from_the_load() {
         "the null chunk and the top span"
     );
     assert_eq!(empty.wanted, empty.live);
-    // A working set at 256 tokens: 16 list slots (1 chunk), a ring of 9
-    // slots (1 chunk), a record (1 + 1 chunks).
+    // A working set at 256 tokens: 16 list slots (1 chunk), 9 window slots
+    // (ceil(128 / 16) + 1, 1 chunk), a record (1 + 1 chunks).
     assert_eq!(pool.floor(), 4 * CHUNK + 13 * CHUNK);
     assert!(matches!(pool.growth(), Growth::Elastic { .. }));
     let list = pool.take_refs(LIST_POOL, 4).unwrap();
@@ -514,6 +525,7 @@ fn pinned_or_unready_facts_are_refused() {
         SlotKind::List {
             tokens: 16,
             rate: 4,
+            window: None,
         },
         MIB,
     ));
@@ -533,6 +545,7 @@ fn pinned_or_unready_facts_are_refused() {
             SlotKind::List {
                 tokens: RS_TOKENS,
                 rate: 1,
+                window: None,
             },
             MIB / 4,
         )
@@ -565,6 +578,7 @@ fn fixed_facts() -> ChunkFacts {
             SlotKind::List {
                 tokens: RS_TOKENS,
                 rate: 1,
+                window: None,
             },
             MIB / 4,
         )
@@ -967,6 +981,7 @@ fn metal_like_facts() -> ChunkFacts {
                 SlotKind::List {
                     tokens: 16,
                     rate: 1,
+                    window: None,
                 },
                 2 * MIB,
             )
@@ -1221,4 +1236,271 @@ fn a_fork_shares_rs_slots_and_copies_a_shared_tail_before_writing() {
     rs.release_working_set(ws);
     rs.retire_idle();
     assert_eq!(rs_live(&shared, &[]), 0, "every reference back");
+}
+
+/// A second window list, of 32 rows, beside the facts' 64-row one.
+const NARROW: EngineShape = EngineShape(5);
+/// The window lists' pool ids, in the facts' order.
+const WIDE_POOL: ShapeId = 1;
+const NARROW_POOL: ShapeId = 2;
+
+/// A windowed model on a shared pool (CONTRACT-BC 19): the kv list of 16
+/// tokens a slot, and two window lists of the kv page, 64 and 32 rows.
+fn window_facts() -> ChunkFacts {
+    let mut facts = facts();
+    facts
+        .shapes
+        .retain(|shape| shape.id == LIST || shape.id == RING);
+    facts.shapes[1].kind = SlotKind::List {
+        tokens: 16,
+        rate: 1,
+        window: Some(64),
+    };
+    facts.shapes.push(shape(
+        NARROW,
+        SlotKind::List {
+            tokens: 16,
+            rate: 1,
+            window: Some(32),
+        },
+        MIB / 4,
+    ));
+    facts.validate().unwrap();
+    facts
+}
+
+/// A windowed working set's rows `rows` landed in one host-positioned fire
+/// that commits `fold` of them (`None`: every row), its table the kv pages
+/// it has reached.
+fn window_fire(
+    rs: &mut crate::store::rs::RsStore,
+    ws: crate::store::rs::RsWorkingSetId,
+    rows: std::ops::Range<u32>,
+    fold: Option<u32>,
+) -> crate::pipeline::fire::rs::PreparedRs {
+    use crate::pipeline::fire::rs::{RingRow, RsPlan, prepare_many};
+    let page = 16;
+    let plan = RsPlan::Ring(vec![RingRow {
+        pages: (rows.start / page..rows.end.div_ceil(page)).collect(),
+        translate: (0..rows.end.div_ceil(page)).collect(),
+        advance: crate::store::rs::RingAdvance {
+            positioned: true,
+            settled: rows.start,
+            reach: rows.start,
+            fold: Some(fold.unwrap_or(rows.end - rows.start)),
+            commit_end: rows.end,
+            head: Some(rows.end),
+        },
+    }]);
+    prepare_many(rs, &[ws], &plan, None).unwrap()
+}
+
+/// Each window list's slots the pool holds now, narrowest first.
+fn window_live(shared: &Shared) -> (u64, u64) {
+    let pool = shared.lock().unwrap();
+    (
+        pool.pool().shape_demand(NARROW_POOL).live,
+        pool.pool().shape_demand(WIDE_POOL).live,
+    )
+}
+
+fn windowed_stores() -> (ChunkFacts, Shared, crate::store::registry::Stores) {
+    let facts = window_facts();
+    let shared: Shared = Arc::new(Mutex::new(SharedPool::new(&facts, 2, 256).unwrap()));
+    let stores = crate::store::registry::shared_stores(&shared, 16, 256);
+    (facts, shared, stores)
+}
+
+/// The window lists' tables a lane of `out` names, narrowest first.
+fn window_tables(out: &crate::pipeline::fire::rs::PreparedRs, shared: &Shared) -> Vec<Vec<u32>> {
+    let lane = shared_lanes(out, shared, 1).remove(0);
+    [NARROW, RING]
+        .iter()
+        .map(|id| {
+            lane.tables
+                .iter()
+                .find(|(shape, _)| shape == id)
+                .map(|(_, refs)| refs.clone())
+                .unwrap_or_default()
+        })
+        .collect()
+}
+
+fn window_geometry() -> crate::store::rs::RsGeometry {
+    crate::store::rs::RsGeometry {
+        state_size: 0,
+        buffer_page_tokens: 16,
+    }
+}
+
+/// (a) A window list keeps every slot a row of the widest window reaches
+/// and drops one once its last row lies below `committed_end - window`:
+/// its table keeps its token-order length, the dropped slot ref 0.
+#[test]
+fn a_window_list_trims_a_slot_wholly_behind_its_window() {
+    use crate::pipeline::fire::rs::settle;
+    let (facts, shared, stores) = windowed_stores();
+    {
+        let pool = shared.lock().unwrap();
+        let windows: Vec<(EngineShape, u32)> =
+            pool.windows().iter().map(|w| (w.id, w.window)).collect();
+        assert_eq!(windows, vec![(NARROW, 32), (RING, 64)], "narrowest first");
+    }
+    let mut rs = stores.rs.lock().unwrap();
+    assert!(rs.is_ring() && rs.is_shared());
+    let ws = rs.create_working_set(window_geometry());
+    let out = window_fire(&mut rs, ws, 0..64, None);
+    let tables = window_tables(&out, &shared);
+    assert!(tables.iter().all(|t| t.len() == 4 && !t.contains(&0)));
+    settle(&mut rs, out.txn);
+    rs.retire_idle();
+    assert_eq!(window_live(&shared), (4, 4), "nothing lies behind 64 - 64");
+
+    // Row 79 committed: page 0's last row, 15, is not below 79 - 64.
+    let out = window_fire(&mut rs, ws, 64..79, None);
+    settle(&mut rs, out.txn);
+    rs.retire_idle();
+    assert_eq!(window_live(&shared), (5, 5));
+    // Row 80: it is, and the slot goes back once the fire that read it
+    // retired.
+    let out = window_fire(&mut rs, ws, 79..80, None);
+    let read = window_tables(&out, &shared);
+    assert!(read.iter().all(|t| t[0] != 0), "the fire reads it still");
+    assert_eq!(window_live(&shared), (5, 5), "held until that fire retires");
+    settle(&mut rs, out.txn);
+    rs.retire_idle();
+    assert_eq!(window_live(&shared), (4, 4));
+    let out = window_fire(&mut rs, ws, 80..81, None);
+    for table in window_tables(&out, &shared) {
+        assert_eq!(table.len(), 6, "a table as long as the kv table");
+        assert_eq!(table[0], 0, "the trimmed slot reads the null chunk");
+        assert!(table[1..].iter().all(|&r| r != 0));
+    }
+    shared_lanes(&out, &shared, 1)
+        .remove(0)
+        .validate_chunks(&facts)
+        .unwrap();
+    settle(&mut rs, out.txn);
+    rs.release_working_set(ws);
+    rs.retire_idle();
+    assert_eq!(window_live(&shared), (0, 0));
+}
+
+/// (b) A prefill longer than the window holds a slot for every page it
+/// writes while it runs, and the trim after it drops all but those the
+/// window reaches.
+#[test]
+fn a_prefill_past_the_window_holds_its_slots_until_the_trim() {
+    use crate::pipeline::fire::rs::settle;
+    let (_, shared, stores) = windowed_stores();
+    let mut rs = stores.rs.lock().unwrap();
+    let ws = rs.create_working_set(window_geometry());
+    let out = window_fire(&mut rs, ws, 0..160, None);
+    let tables = window_tables(&out, &shared);
+    assert!(
+        tables.iter().all(|t| t.len() == 10 && !t.contains(&0)),
+        "the prefill reads every page it writes: {tables:?}"
+    );
+    assert_eq!(window_live(&shared), (10, 10));
+    settle(&mut rs, out.txn);
+    rs.retire_idle();
+    // 160 - 64 = 96: pages 0..6 lie wholly behind it.
+    assert_eq!(window_live(&shared), (4, 4));
+    let out = window_fire(&mut rs, ws, 160..161, None);
+    for table in window_tables(&out, &shared) {
+        assert_eq!(table[..6], [0; 6]);
+        assert!(table[6..].iter().all(|&r| r != 0));
+    }
+    settle(&mut rs, out.txn);
+    rs.release_working_set(ws);
+    rs.retire_idle();
+    assert_eq!(window_live(&shared), (0, 0));
+}
+
+/// (c) A fork and a prefix-cache checkpoint share a working set's window
+/// slots by refcount; a write into the shared, partly filled tail slot
+/// copies it first (each window list's `Lane::slot_copies`), and every slot
+/// comes back once each holder lets go.
+#[test]
+fn a_fork_and_a_checkpoint_share_window_slots_and_all_come_back() {
+    use crate::pipeline::fire::rs::settle;
+    let (facts, shared, stores) = windowed_stores();
+    let mut rs = stores.rs.lock().unwrap();
+    let ws = rs.create_working_set(window_geometry());
+    let out = window_fire(&mut rs, ws, 0..56, None);
+    let parent = window_tables(&out, &shared);
+    settle(&mut rs, out.txn);
+    assert_eq!(window_live(&shared), (4, 4));
+
+    let fork = rs.fork(ws).unwrap();
+    assert!(
+        rs.checkpoint(ws, [7; 32], None).unwrap(),
+        "a window checkpoints"
+    );
+    assert_eq!(window_live(&shared), (4, 4), "all three share them");
+    let out = window_fire(&mut rs, fork, 56..60, None);
+    let lane = shared_lanes(&out, &shared, 1).remove(0);
+    lane.validate_chunks(&facts).unwrap();
+    let forked = window_tables(&out, &shared);
+    for (at, id) in [NARROW, RING].iter().enumerate() {
+        assert_eq!(forked[at][..3], parent[at][..3], "full slots stay shared");
+        assert_ne!(forked[at][3], parent[at][3], "the tail is the fork's copy");
+        let copies = lane
+            .slot_copies
+            .iter()
+            .find(|(shape, _)| shape == id)
+            .map(|(_, pairs)| pairs.clone());
+        assert_eq!(copies, Some(vec![[parent[at][3], forked[at][3]]]));
+    }
+    settle(&mut rs, out.txn);
+    assert_eq!(window_live(&shared), (5, 5));
+
+    // A fresh set takes the checkpoint's slots, shared.
+    let resumed = rs.create_working_set(window_geometry());
+    assert!(rs.adopt_checkpoint(resumed, &[7; 32]).unwrap());
+    let out = window_fire(&mut rs, resumed, 56..57, None);
+    assert_eq!(window_tables(&out, &shared)[1][..3], parent[1][..3]);
+    settle(&mut rs, out.txn);
+
+    for held in [fork, ws, resumed] {
+        rs.release_working_set(held);
+    }
+    rs.retire_idle();
+    assert_eq!(window_live(&shared), (4, 4), "the checkpoint holds its own");
+    assert_eq!(rs.reclaim_cache(|_| 0), 4, "its four window sets go");
+    rs.retire_idle();
+    assert_eq!(window_live(&shared), (0, 0), "every reference back");
+}
+
+/// (d) Rows of a fire still being decided (spec drafts) never count as
+/// committed: the window trims behind what the fires commit only.
+#[test]
+fn spec_draft_rows_are_not_committed_rows() {
+    use crate::pipeline::fire::rs::settle;
+    let (_, shared, stores) = windowed_stores();
+    let mut rs = stores.rs.lock().unwrap();
+    let ws = rs.create_working_set(window_geometry());
+    let out = window_fire(&mut rs, ws, 0..64, None);
+    settle(&mut rs, out.txn);
+    // Drafts to 96, none accepted: committed stays 64.
+    let out = window_fire(&mut rs, ws, 64..96, Some(0));
+    settle(&mut rs, out.txn);
+    rs.retire_idle();
+    assert_eq!(rs.ring_positions(ws), Ok(Some((64, 96))));
+    assert_eq!(window_live(&shared), (6, 6), "no draft row trims a slot");
+    // Five accepted: committed 69, page 0 still reaches 69 - 64.
+    let out = window_fire(&mut rs, ws, 64..96, Some(5));
+    settle(&mut rs, out.txn);
+    rs.retire_idle();
+    assert_eq!(rs.ring_positions(ws), Ok(Some((69, 96))));
+    assert_eq!(window_live(&shared), (6, 6));
+    // Through 96 accepted: pages 0 and 1 lie behind 96 - 64.
+    let out = window_fire(&mut rs, ws, 69..96, None);
+    settle(&mut rs, out.txn);
+    rs.retire_idle();
+    assert_eq!(rs.ring_positions(ws), Ok(Some((96, 96))));
+    assert_eq!(window_live(&shared), (4, 4));
+    rs.release_working_set(ws);
+    rs.retire_idle();
+    assert_eq!(window_live(&shared), (0, 0));
 }

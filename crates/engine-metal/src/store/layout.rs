@@ -224,14 +224,6 @@ impl Layout {
         self.shapes().map(Slots::seat_chunks).sum()
     }
 
-    /// What a folded window's page id counts: `gcd(chunk, fixed slot)`, so a
-    /// fixed slot's first byte is a whole number of them from the base.
-    #[must_use]
-    pub fn buffer_stride(&self) -> u64 {
-        self.fixed
-            .map_or(256, |f| gcd(self.chunk_bytes, f.slot_bytes))
-    }
-
     /// What an rs-list page id counts: `gcd(chunk, rs slot)`.
     #[must_use]
     pub fn rs_stride(&self) -> u64 {
@@ -276,18 +268,20 @@ impl Layout {
                 SlotKind::List {
                     tokens: self.page_size,
                     rate: 1,
+                    window: None,
                 },
                 &rows[0],
             ));
         }
-        // A window list; stated as `SlotKind::Ring` until `engine::chunk`
-        // states a list's window (CONTRACT-BC 19).
+        // The window list: a list of the kv page with its window
+        // (CONTRACT-BC 19).
         if let Some(window) = &self.window {
             shapes.push(shape(
                 window,
-                SlotKind::Ring {
-                    window: self.window_rows,
+                SlotKind::List {
                     tokens: self.page_size,
+                    rate: 1,
+                    window: Some(self.window_rows),
                 },
                 &Vec::new(),
             ));
@@ -300,6 +294,7 @@ impl Layout {
                     SlotKind::List {
                         tokens: self.rs_tokens,
                         rate: 1,
+                        window: None,
                     },
                     &Vec::new(),
                 )
@@ -370,7 +365,6 @@ mod tests {
         assert_eq!(list.seat_ref(9).unwrap(), list.per_chunk + 9);
         assert!(list.seat_ref(32).is_err());
         assert_eq!(layout.seat_chunks(), 4);
-        assert_eq!(layout.buffer_stride(), 256 << 10);
         let facts = layout.facts(Growth::Bottom, 1, &Default::default());
         facts.validate().unwrap();
         assert_eq!(facts.state_chunks(), 99);

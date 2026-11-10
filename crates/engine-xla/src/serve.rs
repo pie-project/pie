@@ -162,9 +162,6 @@ pub struct Seated<'a> {
     /// The lane's pages in the windowed pool, aligned with `pages` (0 the
     /// null page); empty for a lane handed none.
     pub window: &'a [u32],
-
-    /// Windowed pages copied `(src, dst)` before the fire runs.
-    pub window_copies: &'a [(u32, u32)],
 }
 
 const FOLD: engine::fire::RsVerb = engine::fire::RsVerb::Fold;
@@ -190,7 +187,6 @@ impl<'a> Seated<'a> {
             writes: None,
             first: None,
             window: &[],
-            window_copies: &[],
         }
     }
 }
@@ -836,7 +832,17 @@ impl Shell {
     }
 
     pub fn copy_kv(&mut self, moves: &[engine::transfer::KvRun]) -> Result<()> {
-        self.pools.copy_kv(&self.device, &self.handles, moves, &[])
+        self.copy_kv_with(moves, &[])
+    }
+
+    /// [`Self::copy_kv`] with whole windowed pages beside the full ones.
+    pub fn copy_kv_with(
+        &mut self,
+        moves: &[engine::transfer::KvRun],
+        windowed: &[engine::transfer::KvRun],
+    ) -> Result<()> {
+        self.pools
+            .copy_kv(&self.device, &self.handles, moves, windowed)
     }
 
     pub fn copy_state(&mut self, src: u32, dst: u32) -> Result<()> {
@@ -1440,24 +1446,6 @@ impl Shell {
         })?;
         self.pools
             .clear_slots(&self.device, &self.handles, &beginning)?;
-        // The windowed pages the runtime copies before this fire (a fork's
-        // window), whole pages in the windowed pool's own ids.
-        let window_copies: Vec<engine::transfer::KvRun> = lanes
-            .iter()
-            .flat_map(|seated| seated.window_copies)
-            .map(|&(src, dst)| engine::transfer::KvRun {
-                src_page: src,
-                src_token: 0,
-                dst_page: dst,
-                dst_token: 0,
-                tokens: paging.page_size,
-            })
-            .collect();
-        if !window_copies.is_empty() {
-            self.pools
-                .copy_kv(&self.device, &self.handles, &[], &window_copies)?;
-        }
-
         let indptr_host = kv::indptr(&seats)?;
         let table_refs: Vec<&[u32]> = tables.iter().map(Vec::as_slice).collect();
         let window_refs: Vec<&[u32]> = window_tables.iter().map(Vec::as_slice).collect();

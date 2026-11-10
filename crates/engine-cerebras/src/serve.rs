@@ -161,9 +161,6 @@ pub struct Seated<'a> {
     /// The lane's pages in the windowed pool, aligned with `pages` (0 the
     /// null page); empty for a lane handed none.
     pub window: &'a [u32],
-
-    /// Windowed pages copied `(src, dst)` before the fire runs.
-    pub window_copies: &'a [(u32, u32)],
 }
 
 const FOLD: engine::fire::RsVerb = engine::fire::RsVerb::Fold;
@@ -189,7 +186,6 @@ impl<'a> Seated<'a> {
             writes: None,
             first: None,
             window: &[],
-            window_copies: &[],
         }
     }
 }
@@ -864,7 +860,17 @@ impl Shell {
     }
 
     pub fn copy_kv(&mut self, moves: &[engine::transfer::KvRun]) -> Result<()> {
-        self.pools.copy_kv(&self.device, &self.handles, moves, &[])
+        self.copy_kv_with(moves, &[])
+    }
+
+    /// [`Self::copy_kv`] with whole windowed pages beside the full ones.
+    pub fn copy_kv_with(
+        &mut self,
+        moves: &[engine::transfer::KvRun],
+        windowed: &[engine::transfer::KvRun],
+    ) -> Result<()> {
+        self.pools
+            .copy_kv(&self.device, &self.handles, moves, windowed)
     }
 
     pub fn copy_state(&mut self, src: u32, dst: u32) -> Result<()> {
