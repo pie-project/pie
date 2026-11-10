@@ -228,31 +228,38 @@ impl Shell {
     }
 
     fn warm_fire(&mut self, shape: &[Want]) -> Result<()> {
+        use crate::store::pool::{FIXED, LIST, WINDOW};
         let slots = self.held.len().max(1) as u32;
         let page_size = self.paging().page_size.max(1);
-        let pool = u32::try_from(self.paging().pages())
-            .unwrap_or(u32::MAX)
-            .max(1);
-        let windowed = self.paging().window_pages().saturating_sub(1).max(1);
         let has_window = self.pools.has_windowed();
-        // Every lane reads the same pages from 0: what warm fires write is
-        // never read back, and the pool need not hold a page per lane.
+        // Every lane reads the same slots from the pool's first chunk past
+        // the null one: what warm fires write is never read back, and
+        // nothing is seated yet.
+        let records = self.pools.capacity().records.max(1);
         let owned: Vec<(Vec<u32>, Vec<u32>, Vec<u32>)> = shape
             .iter()
             .map(|want| {
                 let n = (held_of(want, page_size) + want.rows)
                     .div_ceil(page_size)
                     .max(1);
-                let pages: Vec<u32> = (0..n).map(|p| p % pool).collect();
+                let pages = self.pools.warm_refs(LIST, n);
                 let window = if has_window {
-                    pages
-                        .iter()
-                        .map(|&page| 1 + u32::try_from(u64::from(page) % windowed).unwrap_or(0))
-                        .collect()
+                    self.pools.warm_refs(WINDOW, n)
                 } else {
                     Vec::new()
                 };
                 (vec![0; want.rows as usize], pages, window)
+            })
+            .collect();
+        let pieces = self
+            .pools
+            .pool()
+            .shape(FIXED)
+            .map_or(0, crate::store::pool::Shape::pieces);
+        let held: Vec<Vec<u32>> = (0..records)
+            .map(|record| {
+                let all = self.pools.warm_refs(FIXED, (record + 1) * pieces);
+                all[(record * pieces) as usize..].to_vec()
             })
             .collect();
         for slot in 0..(shape.len() as u32).min(slots) {
@@ -271,6 +278,7 @@ impl Shell {
                 seated.pages = pages;
                 seated.window = window;
                 seated.held = Some(held_of(want, page_size));
+                seated.record = &held[at % held.len()];
                 seated
             })
             .collect();

@@ -4,13 +4,6 @@ use crate::error::{Fault, Result};
 
 pub use poem_exec::store::kv::{Geometry, Paging, Reader, Seat, SpaceFacts, indptr, reads, row_of};
 
-/// A lane's table in the window list (`poem_exec::store::kv::window_table`).
-pub fn window_table(paging: &Paging, seat: &Seat, table: &[u32], ids: &[u32]) -> Result<Vec<u32>> {
-    Ok(poem_exec::store::kv::window_table(
-        paging, seat, table, ids,
-    )?)
-}
-
 pub fn geometry(paging: &Paging, seats: &[Seat]) -> Result<Geometry> {
     Ok(poem_exec::store::kv::geometry(paging, seats)?)
 }

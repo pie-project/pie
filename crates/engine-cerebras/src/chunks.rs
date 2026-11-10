@@ -1,21 +1,19 @@
-//! The pools as chunks, as they stand today: one host buffer per plane fixed
-//! at load, each pool a pinned run of one-slot chunks (`ChunkFacts::degenerate`),
-//! and past them the sink page and slot a fire's padding lanes write.
-//!
-//! Beside the facts the load logs, at debug, the chunk recipe the compiler
-//! would pack this trace into on a server card (no Cerebras preset yet):
-//! informational, for the pool switch.
+//! What a load tells the runtime about its pool: the chunk facts of the
+//! host chunk pool ([`crate::store::pool`]), the legacy pool facts the
+//! runtime still reads beside them, and, at debug, the chunk recipe the
+//! compiler would pack this trace into on a server card (no Cerebras preset:
+//! the host pool lays its slots out from the engine's own planes).
 
 use engine::caps::PoolFacts;
-use engine::chunk::{ChunkFacts, Reserved, ReservedRun};
+use engine::chunk::ChunkFacts;
 use poem_compiler::chunk::{ChunkProfile, human};
 use poem_compiler::{Budgets, DeviceProfile};
 
-use crate::error::Result;
+use crate::error::{Fault, Result};
 use crate::serve::Shell;
 
 impl Shell {
-    /// Today's pools, as the load states them.
+    /// The pools as the budget sized them, as the load states them.
     #[must_use]
     pub fn pool_facts(&self) -> PoolFacts {
         let paging = self.paging();
@@ -36,17 +34,17 @@ impl Shell {
         }
     }
 
-    /// `pools` as degenerate chunks, the sink page of each kv pool and the
-    /// sink slot of the state slabs reserved past them.
-    pub fn chunk_facts(&self, pools: &PoolFacts) -> Result<ChunkFacts> {
-        let bytes = crate::store::page_bytes(self.trace(), self.paging())?;
-        let sinks = u32::from(pools.kv_pages > 0 && bytes.kv_page > 0)
-            + u32::from(pools.window_pages > 0 && bytes.window_page > 0)
-            + u32::from(pools.state_slots > 0);
-        Ok(with_sinks(ChunkFacts::degenerate(pools, &bytes), sinks))
+    /// The host chunk pool as the runtime counts it: one shared pool, its
+    /// shapes unpinned.
+    pub fn chunk_facts(&self) -> Result<ChunkFacts> {
+        let facts = self.pool().facts();
+        facts.validate().map_err(|why| Fault::Unbound {
+            what: format!("the host pool's chunk facts: {why}"),
+        })?;
+        Ok(facts)
     }
 
-    /// Logs, at debug, beside the degenerate `facts`, the chunk recipe
+    /// Logs, at debug, beside the pool's `facts`, the chunk recipe
     /// `poem_compiler::chunk::plan` packs this trace into under the server preset.
     pub fn log_chunk_recipe(&self, facts: &ChunkFacts) {
         if !tracing::enabled!(tracing::Level::DEBUG) {
@@ -62,8 +60,8 @@ impl Shell {
                 backend = "cerebras",
                 profile = "server-cuda",
                 chunk = %human(recipe.chunk_bytes),
-                degenerate_chunks = facts.total_chunks,
-                degenerate_chunk = %human(facts.chunk_bytes),
+                pool_chunks = facts.total_chunks,
+                pool_chunk = %human(facts.chunk_bytes),
                 shapes = %recipe.shapes(),
                 chunks_per_working_set = recipe.chunks_per_ws(),
                 waste_percent = recipe.waste.percent(),
@@ -72,27 +70,10 @@ impl Shell {
             Err(error) => tracing::debug!(
                 backend = "cerebras",
                 %error,
-                degenerate_chunks = facts.total_chunks,
-                degenerate_chunk = %human(facts.chunk_bytes),
+                pool_chunks = facts.total_chunks,
+                pool_chunk = %human(facts.chunk_bytes),
                 "this trace packs into no chunk recipe"
             ),
         }
     }
-}
-
-/// `facts` with `sinks` chunks reserved past its pool for padding lanes,
-/// the one segment grown over them.
-#[must_use]
-pub fn with_sinks(mut facts: ChunkFacts, sinks: u32) -> ChunkFacts {
-    if sinks == 0 {
-        return facts;
-    }
-    facts.reserved.push(ReservedRun {
-        what: Reserved::Sink,
-        first: facts.total_chunks,
-        chunks: sinks,
-    });
-    facts.total_chunks += sinks;
-    facts.segment_chunks = facts.total_chunks;
-    facts
 }

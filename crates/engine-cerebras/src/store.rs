@@ -1,27 +1,33 @@
-//! The kv and recurrent-state pools: one host buffer per plane, donated to
-//! every program that writes it and replaced by what that program returns.
-//! Maintenance (clearing or copying slots, moving kv cells) edits the host
-//! words directly.
+//! The kv and recurrent state: a chunk pool on the host ([`pool`]) and the
+//! planes one fire reads and writes ([`stage`]).
 //!
-//! Each kv plane carries one page past the pool (`Paging::pages()`), and each
-//! state slab one slot past the slots: the *sink* page and slot a fire's
-//! padding lanes read and write, so padding never touches a live row.
+//! Every slot a working set holds lives in the host pool, named by the slot
+//! refs the runtime hands out (CONTRACT-BC 4, 18-21). A fire's program
+//! reads typed planes, one host buffer a plane, donated to the program and
+//! replaced by what it returns: before each fire the slots its lanes name
+//! are copied into those planes under fire-local ids, and after it what the
+//! fire wrote is copied back.
 //!
-//! A kv row declared with a window (when the context outruns it) lives in the
-//! *windowed* pool instead: `Paging::window_pages()` pages, page 0 the null
-//! page every page behind a window reads (zero, never written), and its own
-//! sink page past them. Its rows read through the lanes' window tables
-//! (`kv::window_table`), as long as their full tables, so positions and
+//! Each kv plane carries one page past the staged ones, and each state slab
+//! one record past them: the *sink* page and record a fire's padding lanes
+//! read and write, so padding never touches a staged row.
+//!
+//! A kv row declared with a window (when the context outruns it) lives in
+//! the *window list* instead: its planes' page 0 is the null page every
+//! page behind a window reads (zero, never written), the staged pages
+//! follow, and its own sink page past them. Its rows read through the
+//! lanes' window tables, as long as their full tables, so positions and
 //! masks read the same and the sliding-window rule masks the null pages.
 
 pub mod kv;
+pub mod pool;
+pub mod stage;
 
 use engine::transfer::KvRun;
 use kernels_cerebras::{KvPool, RecurrentPool, Tensor};
 use poem_ir::{CacheRow, Dtype, Trace};
 
-/// Source and destination rows of a pool copy.
-type Moves = (Vec<i64>, Vec<i64>);
+pub use stage::{Capacity, Stage};
 
 use crate::device::Buffer;
 use crate::device::Device;
@@ -107,16 +113,19 @@ pub struct Pools {
     compressor: Vec<(u32, [Tensor; 2])>,
     /// The recurrent-verb buffer plane of each rs layout plane.
     rs_buffers: Vec<Tensor>,
+    /// The pools as the budget sized them (the legacy pool facts' counts).
     paging: Paging,
-    watermark: engine::frame::Demand,
-    bytes: u64,
+    /// What one fire stages: the planes' rows.
+    capacity: Capacity,
+    pool: pool::HostPool,
 }
 
 impl std::fmt::Debug for Pools {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Pools")
             .field("rows", &self.shapes.len())
-            .field("bytes", &self.bytes)
+            .field("capacity", &self.capacity)
+            .field("pool", &self.pool.layout())
             .finish()
     }
 }
@@ -175,9 +184,10 @@ pub fn window_of(trace: &Trace) -> Result<Option<u32>> {
         .max())
 }
 
-/// Bytes the pools of `trace` take at `paging`, sink page and slot included:
-/// what [`Pools::reserve`] lands there, compressor and recurrent-verb
-/// planes too.
+/// Bytes the pools of `trace` take at `paging` in their declared dtypes,
+/// a sink page and slot included, compressor and recurrent-verb planes too:
+/// the measure a kv budget sizes `paging` by. The host pool
+/// ([`Pools::reserve`]) then holds every slot of that paging.
 pub fn pool_demand(trace: &Trace, paging: Paging) -> Result<u64> {
     let mut total = 0u64;
     for row in &trace.caches {
@@ -264,26 +274,58 @@ fn rs_rows(paging: Paging) -> u64 {
 }
 
 impl Pools {
+    /// The staging planes of a fire of at most `lanes` lanes and the host
+    /// pool behind them, which holds what `paging`'s pools held (its kv
+    /// pages, windowed pages, state slots and rs pages) beside a
+    /// copy-on-write record for each lane a fire runs.
     pub fn reserve(
         device: &Device,
         handles: &Handles,
         trace: &Trace,
         paging: Paging,
+        lanes: u32,
         facts: &Facts,
         rs: Option<&crate::rs::Layout>,
     ) -> Result<Pools> {
+        Pools::reserve_at(
+            device,
+            handles,
+            (trace, paging, lanes),
+            facts,
+            rs,
+            pool::TARGET_CHUNK_BYTES,
+        )
+    }
+
+    /// [`Pools::reserve`] with chunks of up to `target` bytes.
+    pub(crate) fn reserve_at(
+        device: &Device,
+        handles: &Handles,
+        (trace, paging, lanes): (&Trace, Paging, u32),
+        facts: &Facts,
+        rs: Option<&crate::rs::Layout>,
+        target: u64,
+    ) -> Result<Pools> {
+        let capacity = capacity_of(trace, paging, lanes, rs.is_some());
+        let page = paging.page_size;
         let mut planes = Vec::with_capacity(trace.caches.len());
         let mut roots = Vec::with_capacity(trace.caches.len());
         let mut shapes = Vec::with_capacity(trace.caches.len());
         let mut compressor = Vec::new();
-        let cells =
-            u32::try_from((paging.pages() + 1) * u64::from(paging.page_size)).map_err(|_| {
-                Fault::Ceiling {
-                    what: "kv cells in one plane",
-                    need: (paging.pages() + 1) * u64::from(paging.page_size),
-                    have: u64::from(u32::MAX),
-                }
-            })?;
+        let mut drafts = pool::Drafts::default();
+        let cells = |pages: u32| -> Result<u32> {
+            let need = (u64::from(pages) + 1) * u64::from(page);
+            u32::try_from(need).map_err(|_| Fault::Ceiling {
+                what: "kv cells in one plane",
+                need,
+                have: u64::from(u32::MAX),
+            })
+        };
+        let list_draft = |slots: u64| pool::Draft {
+            tokens: page,
+            slots,
+            ..pool::Draft::default()
+        };
         for (index, row) in trace.caches.iter().enumerate() {
             match row {
                 CacheRow::Kv {
@@ -295,7 +337,11 @@ impl Pools {
                 } => {
                     let split = split(name, declared)?;
                     let windowed = windowed_row(paging, *window);
-                    let cells = narrow(plane_pages(paging, windowed) * u64::from(paging.page_size));
+                    let rows = if windowed {
+                        cells(capacity.window_pages)?
+                    } else {
+                        cells(capacity.kv_pages)?
+                    };
                     let restated = facts
                         .rows
                         .get(index)
@@ -317,33 +363,46 @@ impl Pools {
                     let head_dim = restated.map_or(split.keys, |seat| u64::from(seat.head_dim));
                     let kv_heads = restated.map_or(1, |seat| u64::from(seat.kv_heads));
                     let shared = split.shared || split.values == 0;
-                    let mut row_planes =
-                        vec![device.zeros_or_dry(*dtype, cells, narrow(split.keys))?];
-                    let keys = handles.root(Root {
-                        source: Source::Pool {
-                            row: index as u32,
-                            plane: 0,
-                        },
-                        dtype: *dtype,
-                        rows: cells,
-                        width: narrow(split.keys),
-                    });
-                    let mut row_roots = vec![keys];
-                    if !shared {
-                        row_planes.push(device.zeros_or_dry(
-                            *dtype,
-                            cells,
-                            narrow(split.values),
-                        )?);
+                    let draft = if windowed {
+                        &mut drafts
+                            .window
+                            .get_or_insert_with(|| {
+                                (
+                                    list_draft(paging.window_pages().saturating_sub(1)),
+                                    paging.window.map_or(0, |w| w.tokens),
+                                )
+                            })
+                            .0
+                    } else {
+                        drafts
+                            .list
+                            .get_or_insert_with(|| list_draft(paging.pages()))
+                    };
+                    draft.rows.push(index as u32);
+                    let widths = if shared {
+                        vec![split.keys]
+                    } else {
+                        vec![split.keys, split.values]
+                    };
+                    let mut row_planes = Vec::with_capacity(widths.len());
+                    let mut row_roots = Vec::with_capacity(widths.len());
+                    for (plane, width) in widths.into_iter().enumerate() {
+                        let (plane, width) = (plane as u8, narrow(width));
+                        row_planes.push(device.zeros_or_dry(*dtype, rows, width)?);
                         row_roots.push(handles.root(Root {
                             source: Source::Pool {
                                 row: index as u32,
-                                plane: 1,
+                                plane,
                             },
                             dtype: *dtype,
-                            rows: cells,
-                            width: narrow(split.values),
+                            rows,
+                            width,
                         }));
+                        draft.sections.push(pool::Section {
+                            row: index as u32,
+                            plane,
+                            width,
+                        });
                     }
                     planes.push(row_planes);
                     roots.push(row_roots);
@@ -357,7 +416,7 @@ impl Pools {
                 CacheRow::State { slab, dtype, .. } => {
                     let stride: u64 = slab.iter().product();
                     let dtype = state_dtype(*dtype);
-                    let slots = paging.slots + 1;
+                    let slots = capacity.records + 1;
                     planes.push(vec![device.zeros_or_dry(dtype, slots, narrow(stride))?]);
                     roots.push(vec![handles.root(Root {
                         source: Source::Pool {
@@ -369,21 +428,41 @@ impl Pools {
                         width: narrow(stride),
                     })]);
                     shapes.push(Shape::State { stride, dtype });
+                    let draft = drafts.fixed.get_or_insert_with(|| pool::Draft {
+                        tokens: 1,
+                        slots: u64::from(paging.slots) + u64::from(capacity.records),
+                        ..pool::Draft::default()
+                    });
+                    draft.rows.push(index as u32);
+                    draft.sections.push(pool::Section {
+                        row: index as u32,
+                        plane: 0,
+                        width: narrow(stride),
+                    });
                 }
             }
         }
+        let kv_cells = cells(capacity.kv_pages)?;
         for (cache_row, width) in compressor_rows(trace) {
             let row = planes.len() as u32;
             let mut pair = Vec::with_capacity(2);
             let mut bufs = Vec::with_capacity(2);
+            let draft = drafts
+                .list
+                .get_or_insert_with(|| list_draft(paging.pages()));
             for plane in 0..2u8 {
-                bufs.push(device.zeros_or_dry(Dtype::Bf16, cells, narrow(width))?);
+                bufs.push(device.zeros_or_dry(Dtype::Bf16, kv_cells, narrow(width))?);
                 pair.push(handles.root(Root {
                     source: Source::Pool { row, plane },
                     dtype: Dtype::Bf16,
-                    rows: cells,
+                    rows: kv_cells,
                     width: narrow(width),
                 }));
+                draft.sections.push(pool::Section {
+                    row,
+                    plane,
+                    width: narrow(width),
+                });
             }
             planes.push(bufs);
             roots.push(pair.clone());
@@ -391,7 +470,13 @@ impl Pools {
         }
         let mut rs_buffers = Vec::new();
         if let Some(layout) = rs {
-            let rows = narrow(rs_rows(paging));
+            let rows = narrow(u64::from(capacity.rs_pages) * u64::from(page));
+            let mut draft = pool::Draft {
+                tokens: page,
+                // A page a state slot, and two a lane a fire runs.
+                slots: u64::from(paging.slots.max(1)) + u64::from(capacity.rs_pages),
+                ..pool::Draft::default()
+            };
             for plane in &layout.planes {
                 let row = planes.len() as u32;
                 planes.push(vec![device.zeros_or_dry(plane.dtype, rows, plane.width)?]);
@@ -403,8 +488,18 @@ impl Pools {
                 });
                 roots.push(vec![t]);
                 rs_buffers.push(t);
+                if !draft.rows.contains(&plane.cache) {
+                    draft.rows.push(plane.cache);
+                }
+                draft.sections.push(pool::Section {
+                    row,
+                    plane: 0,
+                    width: plane.width,
+                });
             }
+            drafts.rs = Some(draft);
         }
+        let layout = pool::Layout::plan(&drafts, target)?;
         Ok(Pools {
             planes,
             roots,
@@ -412,8 +507,8 @@ impl Pools {
             compressor,
             rs_buffers,
             paging,
-            watermark: engine::frame::Demand::ZERO,
-            bytes: pool_demand(trace, paging)?,
+            capacity,
+            pool: pool::HostPool::new(layout, device.is_dry()),
         })
     }
 
@@ -422,16 +517,31 @@ impl Pools {
         self.paging
     }
 
-    /// The page a padding lane's rows read and write.
+    /// What one fire stages at most.
     #[must_use]
-    pub fn sink_page(&self) -> u32 {
-        u32::try_from(self.paging.pages()).unwrap_or(u32::MAX)
+    pub fn capacity(&self) -> Capacity {
+        self.capacity
     }
 
-    /// The windowed pool's sink page: one past its pages.
+    #[must_use]
+    pub fn pool(&self) -> &pool::HostPool {
+        &self.pool
+    }
+
+    pub fn pool_mut(&mut self) -> &mut pool::HostPool {
+        &mut self.pool
+    }
+
+    /// The page a padding lane's rows read and write: past the staged ones.
+    #[must_use]
+    pub fn sink_page(&self) -> u32 {
+        self.capacity.kv_pages
+    }
+
+    /// The windowed planes' sink page: past the staged ones.
     #[must_use]
     pub fn window_sink_page(&self) -> u32 {
-        u32::try_from(self.paging.window_pages()).unwrap_or(u32::MAX)
+        self.capacity.window_pages
     }
 
     /// The page tables a fire stages, by whether each pages the windowed
@@ -471,20 +581,26 @@ impl Pools {
             .any(|shape| matches!(shape, Shape::Kv { windowed: true, .. }))
     }
 
-    /// The slot a padding lane's recurrent rows read and write.
+    /// The record a padding lane's recurrent rows read and write.
     #[must_use]
     pub fn sink_slot(&self) -> u32 {
-        self.paging.slots
+        self.capacity.records
     }
 
+    /// Bytes the host pool and the staging planes take.
     #[must_use]
     pub fn bytes(&self) -> u64 {
-        self.bytes
+        self.pool.layout().bytes() + self.staging_bytes()
     }
 
+    /// Bytes the staging planes take, one word an element.
     #[must_use]
-    pub fn watermark(&self) -> engine::frame::Demand {
-        self.watermark
+    pub fn staging_bytes(&self) -> u64 {
+        self.roots
+            .iter()
+            .flatten()
+            .map(|t| u64::from(t.rows) * u64::from(t.width) * 4)
+            .sum()
     }
 
     #[must_use]
@@ -593,137 +709,7 @@ impl Pools {
             .map(|(_, pair)| *pair)
     }
 
-    /// The state rows' handles, for maintenance programs.
-    fn state_rows(&self) -> impl Iterator<Item = (u32, Tensor, u64)> + '_ {
-        self.roots
-            .iter()
-            .zip(&self.shapes)
-            .enumerate()
-            .filter_map(|(row, (roots, shape))| match shape {
-                Shape::State { stride, .. } => Some((row as u32, roots[0], *stride)),
-                Shape::Kv { .. } => None,
-            })
-    }
-
-    /// The kv planes (row, plane) in the full (`windowed` false) or the
-    /// windowed pool, for maintenance.
-    fn kv_planes(&self, windowed: bool) -> impl Iterator<Item = (u32, u8)> + '_ {
-        self.roots
-            .iter()
-            .zip(&self.shapes)
-            .enumerate()
-            .filter(move |(_, (_, shape))| {
-                matches!(shape, Shape::Kv { windowed: held, .. } if *held == windowed)
-            })
-            .flat_map(|(row, (roots, _))| (0..roots.len()).map(move |p| (row as u32, p as u8)))
-    }
-
-    fn check_slot(&self, slot: u32) -> Result<()> {
-        if slot >= self.paging.slots {
-            return Err(Fault::Ceiling {
-                what: "recurrent slots",
-                need: u64::from(slot) + 1,
-                have: u64::from(self.paging.slots),
-            });
-        }
-        Ok(())
-    }
-
-    /// Edits plane `plane` of row `row` on the host: `f` gets its words and
-    /// row width. Nothing on a dry device.
-    fn edit(&mut self, row: u32, plane: u8, f: impl FnOnce(&mut [u32], usize)) -> Result<()> {
-        let slot = self
-            .planes
-            .get_mut(row as usize)
-            .and_then(|p| p.get_mut(plane as usize))
-            .ok_or_else(|| Fault::Unbound {
-                what: format!("pool plane {row}.{plane}"),
-            })?;
-        let Some(buffer) = slot.take() else {
-            return Ok(());
-        };
-        let (rows, width) = buffer.shape();
-        let mut words = buffer.words().to_vec();
-        f(&mut words, width as usize);
-        *slot = Buffer::new(buffer.dtype(), rows, width, words);
-        Ok(())
-    }
-
-    /// Zeros slot `slot` of every state slab.
-    pub fn clear(&mut self, device: &Device, handles: &Handles, slot: u32) -> Result<()> {
-        let _ = (device, handles);
-        self.check_slot(slot)?;
-        if !self.has_state() {
-            return Ok(());
-        }
-        let rows: Vec<u32> = self.state_rows().map(|r| r.0).collect();
-        for row in rows {
-            self.edit(row, 0, |words, width| {
-                let at = slot as usize * width;
-                words[at..at + width].fill(0);
-            })?;
-        }
-        Ok(())
-    }
-
-    /// Copies slot `src` of every state slab over slot `dst`.
-    pub fn copy_slot(
-        &mut self,
-        device: &Device,
-        handles: &Handles,
-        src: u32,
-        dst: u32,
-    ) -> Result<()> {
-        let _ = (device, handles);
-        self.check_slot(src)?;
-        self.check_slot(dst)?;
-        let rows: Vec<u32> = self.state_rows().map(|r| r.0).collect();
-        for row in rows {
-            self.edit(row, 0, |words, width| {
-                let (s, d) = (src as usize * width, dst as usize * width);
-                words.copy_within(s..s + width, d);
-            })?;
-        }
-        // A recurrent slot is its state row and its buffered page.
-        self.move_buffer_pages(&[(src, dst)])
-    }
-
-    /// The device-side form of kv `moves` over the `windowed` (or full)
-    /// planes, for a program that keeps its pools (`Device::queue_moves`):
-    /// one move a plane, in pool rows.
-    pub fn kv_moves(
-        &self,
-        handles: &Handles,
-        windowed: bool,
-        moves: &[KvRun],
-    ) -> Vec<crate::device::PoolMove> {
-        let ps = self.paging.page_size;
-        let mut out = Vec::new();
-        for (row, plane) in self.kv_planes(windowed) {
-            let Some(t) = self
-                .roots
-                .get(row as usize)
-                .and_then(|p| p.get(plane as usize))
-            else {
-                continue;
-            };
-            let Some((root, _)) = handles.locate(t.buf) else {
-                continue;
-            };
-            let export = crate::trace::root_name(root);
-            for m in moves {
-                out.push(crate::device::PoolMove {
-                    export: export.clone(),
-                    src_row: u64::from(m.src_page) * u64::from(ps) + u64::from(m.src_token),
-                    dst_row: u64::from(m.dst_page) * u64::from(ps) + u64::from(m.dst_token),
-                    rows: m.tokens,
-                    page_size: ps,
-                });
-            }
-        }
-        out
-    }
-
+    /// The rs buffer pages the legacy pool facts count: one a state slot.
     #[must_use]
     pub fn buffer_pages(&self) -> u32 {
         if self.rs_buffers.is_empty() {
@@ -733,163 +719,200 @@ impl Pools {
         }
     }
 
-    pub fn copy_pages(&mut self, moves: &[(u32, u32)]) -> Result<()> {
-        if moves.is_empty() {
-            return Ok(());
-        }
-        let pages = self.buffer_pages();
-        if let Some(&page) = moves
-            .iter()
-            .flat_map(|(a, b)| [a, b])
-            .find(|&&page| page >= pages)
-        {
-            return Err(Fault::Ceiling {
-                what: "recurrent buffer pages",
-                need: u64::from(page) + 1,
-                have: u64::from(pages),
-            });
-        }
-        self.move_buffer_pages(moves)
+    /// `n` slot refs of shape `id` from the first chunk past the null one,
+    /// for fires whose contents nothing reads (the warm ladder's); none
+    /// where the pool holds no such shape.
+    #[must_use]
+    pub fn warm_refs(&self, id: engine::chunk::ShapeId, n: u32) -> Vec<u32> {
+        let Ok(shape) = self.pool.shape(id) else {
+            return Vec::new();
+        };
+        let per = shape.per_chunk.max(1);
+        let slots = per.saturating_mul(self.pool.layout().total_chunks.saturating_sub(1));
+        (0..n).map(|i| per + i % slots.max(1)).collect()
     }
 
-    /// Copies page `src` of every recurrent buffer plane over page `dst`.
-    fn move_buffer_pages(&mut self, moves: &[(u32, u32)]) -> Result<()> {
-        let page = self.paging.page_size.max(1) as usize;
-        let first = self.planes.len() - self.rs_buffers.len();
-        for row in first..self.planes.len() {
-            self.edit(row as u32, 0, |words, width| {
-                let span = page * width;
-                for &(src, dst) in moves {
-                    let (s, d) = (src as usize * span, dst as usize * span);
-                    words.copy_within(s..s + span, d);
-                }
-            })?;
+    /// A fire's staging, empty, at this load's capacity.
+    #[must_use]
+    pub fn begin(&self) -> Stage {
+        Stage::new(self.capacity)
+    }
+
+    /// The shapes this pool holds, in id order.
+    fn held(&self) -> Vec<engine::chunk::ShapeId> {
+        self.pool.layout().shapes.iter().map(|s| s.id).collect()
+    }
+
+    /// Copies every slot `stage` names out of the host pool into its local
+    /// rows of the staging planes (scratch rows and the null page zeroed).
+    /// Nothing on a dry device.
+    pub fn stage(&mut self, stage: &Stage) -> Result<()> {
+        if self.pool.is_dry() {
+            return Ok(());
+        }
+        for id in self.held() {
+            let shape = self.pool.shape(id)?.clone();
+            let sources = stage::sources(&self.pool, stage, id)?;
+            for (section, first, words) in shape.sections() {
+                let (first, words) = (first as usize, words as usize);
+                edit(&mut self.planes, section.row, section.plane, |plane, _| {
+                    for (local, source) in &sources {
+                        let at = *local as usize * words;
+                        let to = &mut plane[at..at + words];
+                        match source {
+                            Some(slot) => to.copy_from_slice(&slot[first..first + words]),
+                            None => to.fill(0),
+                        }
+                    }
+                })?;
+            }
         }
         Ok(())
     }
 
-    /// Applies kv `moves` to every full kv plane and `windowed` (whole
-    /// pages, in the windowed pool's own ids) to every windowed one, cell
-    /// by cell on the host.
-    pub fn copy_kv(
-        &mut self,
-        device: &Device,
-        handles: &Handles,
-        moves: &[KvRun],
-        windowed: &[KvRun],
-    ) -> Result<()> {
-        let _ = (device, handles);
-        let page = self.paging.page_size;
-        let cells = |moves: &[KvRun], pages: u64| -> Result<(Vec<i64>, Vec<i64>)> {
-            let mut src: Vec<i64> = Vec::new();
-            let mut dst: Vec<i64> = Vec::new();
-            for m in moves {
-                for (what, at) in [("source", m.src_page), ("destination", m.dst_page)] {
-                    if u64::from(at) >= pages {
-                        return Err(Fault::Ceiling {
-                            what: if what == "source" {
-                                "kv copy source pages"
-                            } else {
-                                "kv copy destination pages"
-                            },
-                            need: u64::from(at) + 1,
-                            have: pages,
-                        });
-                    }
-                }
-                for t in 0..m.tokens {
-                    src.push(i64::from(m.src_page) * i64::from(page) + i64::from(m.src_token + t));
-                    dst.push(i64::from(m.dst_page) * i64::from(page) + i64::from(m.dst_token + t));
+    /// Copies what the fire left in the staged rows back into the host
+    /// pool's slots: every staged slot but scratch rows, the null page and
+    /// a record a lane only read.
+    pub fn unstage(&mut self, stage: &Stage) -> Result<()> {
+        if self.pool.is_dry() {
+            return Ok(());
+        }
+        for id in self.held() {
+            let shape = self.pool.shape(id)?.clone();
+            let kept = stage::kept(stage, id);
+            if kept.is_empty() {
+                continue;
+            }
+            // Each kept unit's words: a list slot, or a whole record.
+            let unit = usize::try_from(if id == pool::FIXED {
+                shape.record_words
+            } else {
+                shape.slot_words
+            })
+            .unwrap_or(0);
+            let mut units: Vec<Vec<u32>> = vec![vec![0; unit]; kept.len()];
+            for (section, first, words) in shape.sections() {
+                let (first, words) = (first as usize, words as usize);
+                let plane = self
+                    .get(section.row, section.plane)
+                    .ok_or_else(|| Fault::Unbound {
+                        what: format!(
+                            "pool plane {}.{}, which a program still holds",
+                            section.row, section.plane
+                        ),
+                    })?
+                    .words();
+                for ((local, _), out) in kept.iter().zip(&mut units) {
+                    let at = *local as usize * words;
+                    out[first..first + words].copy_from_slice(&plane[at..at + words]);
                 }
             }
-            Ok((src, dst))
-        };
-        let full = cells(moves, self.paging.pages())?;
-        let window = if self.has_windowed() {
-            cells(windowed, self.paging.window_pages())?
-        } else {
-            (Vec::new(), Vec::new())
-        };
-        if full.0.is_empty() && window.0.is_empty() {
-            return Ok(());
-        }
-        let mut planes: Vec<((u32, u8), &Moves)> = Vec::new();
-        if !full.0.is_empty() {
-            planes.extend(self.kv_planes(false).map(|p| (p, &full)));
-        }
-        if !window.0.is_empty() {
-            planes.extend(self.kv_planes(true).map(|p| (p, &window)));
-        }
-        for ((row, plane), (src, dst)) in planes {
-            self.edit(row, plane, |words, width| {
-                // Gather every source cell first, then scatter: a cell may
-                // be both a source and a destination.
-                let gathered: Vec<u32> = src
-                    .iter()
-                    .flat_map(|s| words[*s as usize * width..(*s as usize + 1) * width].to_vec())
-                    .collect();
-                for (i, d) in dst.iter().enumerate() {
-                    let at = *d as usize * width;
-                    words[at..at + width].copy_from_slice(&gathered[i * width..(i + 1) * width]);
+            let piece = usize::try_from(shape.slot_words).unwrap_or(0);
+            for ((_, slots), words) in kept.iter().zip(units) {
+                for (at, &slot) in slots.iter().enumerate() {
+                    if let Some(to) = self.pool.slot_mut(id, slot)? {
+                        let from = (at * piece).min(words.len());
+                        let take = piece.min(words.len() - from);
+                        to[..take].copy_from_slice(&words[from..from + take]);
+                    }
                 }
-            })?;
+            }
         }
         Ok(())
     }
 
-    /// The bytes of slot `slot` across every state slab, in row order.
-    pub fn read_slot(&self, slot: u32) -> Result<Vec<u8>> {
-        self.check_slot(slot)?;
-        let mut out = Vec::new();
-        for (row, _, stride) in self.state_rows() {
-            let Some(buffer) = self.get(row, 0) else {
-                continue;
-            };
-            let all = buffer.download()?;
-            let per = all.len() / (self.paging.slots as usize + 1);
-            let _ = stride;
-            out.extend_from_slice(&all[slot as usize * per..(slot as usize + 1) * per]);
+    /// Applies kv `moves` (token runs between slot refs of the kv list) and
+    /// `windowed` (whole slots of the window list) in the host pool. Every
+    /// source is read before anything is written: a slot may be both.
+    pub fn copy_kv(&mut self, moves: &[KvRun], windowed: &[(u32, u32)]) -> Result<()> {
+        if !moves.is_empty() {
+            let shape = self.pool.shape(pool::LIST)?.clone();
+            let mut sources = Vec::with_capacity(moves.len());
+            for m in moves {
+                if m.src_token.saturating_add(m.tokens) > shape.tokens
+                    || m.dst_token.saturating_add(m.tokens) > shape.tokens
+                {
+                    return Err(Fault::Ceiling {
+                        what: "rows of a kv page a copy reaches",
+                        need: u64::from(m.src_token.max(m.dst_token)) + u64::from(m.tokens),
+                        have: u64::from(shape.tokens),
+                    });
+                }
+                self.pool.span(pool::LIST, m.dst_page)?;
+                sources.push(self.pool.slot(pool::LIST, m.src_page)?.map(<[u32]>::to_vec));
+            }
+            for (m, source) in moves.iter().zip(sources) {
+                let (Some(from), Some(to)) = (source, self.pool.slot_mut(pool::LIST, m.dst_page)?)
+                else {
+                    continue;
+                };
+                for (section, first, _) in shape.sections() {
+                    let w = section.width as usize;
+                    let s = first as usize + m.src_token as usize * w;
+                    let d = first as usize + m.dst_token as usize * w;
+                    let n = m.tokens as usize * w;
+                    to[d..d + n].copy_from_slice(&from[s..s + n]);
+                }
+            }
         }
-        Ok(out)
+        if !windowed.is_empty() {
+            self.pool.copy_slots(pool::WINDOW, windowed)?;
+        }
+        Ok(())
     }
 }
 
-impl Pools {
-    /// Checks a frame's or copy's reach against the pool and lifts the
-    /// watermark over it.
-    pub fn admit(&mut self, demand: engine::frame::Demand) -> Result<()> {
-        if demand.state_slots > self.paging.slots {
-            return Err(Fault::Ceiling {
-                what: "recurrent slots",
-                need: u64::from(demand.state_slots),
-                have: u64::from(self.paging.slots),
-            });
-        }
-        if u64::from(demand.kv_pages) > self.paging.pages() {
-            return Err(Fault::Ceiling {
-                what: "kv pages",
-                need: u64::from(demand.kv_pages),
-                have: self.paging.pages(),
-            });
-        }
-        if demand.workspace > 0 {
-            return Err(Fault::Ceiling {
-                what: "pool workspace bytes",
-                need: demand.workspace,
-                have: 0,
-            });
-        }
-        self.watermark = self.watermark.union(demand);
-        Ok(())
+/// What a fire of at most `lanes` lanes stages: a kv page for every page
+/// its lanes may name (no more than the pool holds), a windowed page for
+/// each beside the null page, a state record a lane (no more than the
+/// slots the pool seats) and two rs pages a record.
+#[must_use]
+pub fn capacity_of(trace: &Trace, paging: Paging, lanes: u32, rs: bool) -> Capacity {
+    let lane_pages = u64::from(lanes.max(1)) * u64::from(paging.pages_per_slot);
+    let kv_pages = narrow(paging.pages().min(lane_pages).max(1));
+    let states = trace
+        .caches
+        .iter()
+        .any(|row| matches!(row, CacheRow::State { .. }));
+    let records = if states {
+        paging.slots.min(lanes).max(1)
+    } else {
+        0
+    };
+    Capacity {
+        kv_pages,
+        window_pages: if paging.window.is_some() {
+            narrow(paging.window_pages().min(lane_pages).max(1)) + 1
+        } else {
+            1
+        },
+        records,
+        rs_pages: if rs { 2 * records.max(1) } else { 0 },
     }
+}
 
-    pub fn trim(&mut self, hint: engine::frame::Demand) {
-        self.watermark = engine::frame::Demand {
-            kv_pages: self.watermark.kv_pages.min(hint.kv_pages),
-            state_slots: self.watermark.state_slots.min(hint.state_slots),
-            workspace: self.watermark.workspace.min(hint.workspace),
-        };
-    }
+/// Edits plane `plane` of row `row` on the host: `f` gets its words and
+/// row width. Nothing where the plane holds no buffer (a dry device).
+fn edit(
+    planes: &mut [Vec<Option<Buffer>>],
+    row: u32,
+    plane: u8,
+    f: impl FnOnce(&mut [u32], usize),
+) -> Result<()> {
+    let slot = planes
+        .get_mut(row as usize)
+        .and_then(|p| p.get_mut(plane as usize))
+        .ok_or_else(|| Fault::Unbound {
+            what: format!("pool plane {row}.{plane}"),
+        })?;
+    let Some(buffer) = slot.take() else {
+        return Ok(());
+    };
+    let (rows, width) = buffer.shape();
+    let mut words = buffer.words().to_vec();
+    f(&mut words, width as usize);
+    *slot = Buffer::new(buffer.dtype(), rows, width, words);
+    Ok(())
 }
 
 /// Each cache row a `PoolGather` folds into, and the width of its

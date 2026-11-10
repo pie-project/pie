@@ -18,7 +18,6 @@ use std::path::Path;
 
 use checkpoint::contract::ModelContract;
 use engine::fire::Masking;
-use engine::frame::Demand;
 use kernels_cerebras::Tensor;
 use poem_compiler::{Budget, Budgets, CompiledModel, DeviceProfile, FireRows, compile_axes};
 use poem_exec::fire::{At, Cursor, Filter, FireDescriptor, Lane as FireLane, compose_axes, walk};
@@ -123,6 +122,7 @@ const PATCH_ROUTE_DROP: i32 = -1;
 pub struct Seated<'a> {
     pub lane: Lane<'a>,
 
+    /// The lane's kv list slot refs, in token order.
     pub pages: &'a [u32],
 
     pub held: Option<u32>,
@@ -137,8 +137,15 @@ pub struct Seated<'a> {
 
     pub rs_reset: engine::fire::RsReset,
 
-    pub rs_slot: Option<u32>,
+    /// The record the lane's state is read from and written to: its fixed
+    /// shape's slot refs, one a piece (`Lane::fixed`'s `cow`).
+    pub record: &'a [u32],
 
+    /// Where the lane reads its state from instead, when it differs and
+    /// the lane folds nothing (`Lane::fixed`'s `run`): CONTRACT-BC 15.
+    pub record_run: Option<&'a [u32]>,
+
+    /// The verb; a `Buffer`'s pages are rs list slot refs.
     pub rs: &'a engine::fire::RsVerb,
 
     pub media: Option<Media<'a>>,
@@ -158,8 +165,8 @@ pub struct Seated<'a> {
 
     pub first: Option<u32>,
 
-    /// The lane's pages in the windowed pool, aligned with `pages` (0 the
-    /// null page); empty for a lane handed none.
+    /// The lane's window list slot refs, aligned with `pages` (0 a slot
+    /// trimmed behind the window: the null page).
     pub window: &'a [u32],
 }
 
@@ -177,7 +184,8 @@ impl<'a> Seated<'a> {
             positions: &[],
             readout: None,
             rs_reset: engine::fire::RsReset::Inferred,
-            rs_slot: None,
+            record: &[],
+            record_run: None,
             rs: &FOLD,
             media: None,
             inputs: &[],
@@ -594,11 +602,20 @@ impl Shell {
             )?
         };
         let rs_layout = crate::rs::Layout::read(&boot.trace)?.map(std::sync::Arc::new);
+        if crate::fabric::keep_pools() {
+            return Err(Fault::Unbound {
+                what: "the `keep_pools` switch, which keeps the pool planes on the fabric \
+                       across fires: state lives in the host chunk pool here, and each fire's \
+                       planes are staged from it"
+                    .to_string(),
+            });
+        }
         let pools = Pools::reserve(
             &device,
             &handles,
             &boot.trace,
             paging,
+            boot.budget.max_lanes,
             &facts,
             rs_layout.as_deref(),
         )?;
@@ -834,8 +851,9 @@ impl Shell {
         self.pools.has_state()
     }
 
+    /// Seats `slot` afresh: a lane seated by slot (a model that pages no
+    /// kv) holds no rows. Its state record is the runtime's to name.
     pub fn open(&mut self, slot: u32) -> Result<()> {
-        self.pools.clear(&self.device, &self.handles, slot)?;
         let seats = self.held.len() as u64;
         let held = self.held.get_mut(slot as usize).ok_or(Fault::Ceiling {
             what: "slots",
@@ -846,35 +864,35 @@ impl Shell {
         Ok(())
     }
 
-    pub fn copy_kv(&mut self, moves: &[engine::transfer::KvRun]) -> Result<()> {
-        self.copy_kv_with(moves, &[])
-    }
-
-    /// [`Self::copy_kv`] with whole windowed pages beside the full ones.
+    /// Applies kv `moves` (token runs between kv list slot refs) and
+    /// `windowed` (whole window list slots) in the host pool.
     pub fn copy_kv_with(
         &mut self,
         moves: &[engine::transfer::KvRun],
-        windowed: &[engine::transfer::KvRun],
+        windowed: &[(u32, u32)],
     ) -> Result<()> {
-        self.pools
-            .copy_kv(&self.device, &self.handles, moves, windowed)
+        self.pools.copy_kv(moves, windowed)
     }
 
-    pub fn copy_state(&mut self, src: u32, dst: u32) -> Result<()> {
-        self.pools.copy_slot(&self.device, &self.handles, src, dst)
+    /// The pools' host chunk pool.
+    #[must_use]
+    pub fn pool(&self) -> &crate::store::pool::HostPool {
+        self.pools.pool()
+    }
+
+    pub fn pool_mut(&mut self) -> &mut crate::store::pool::HostPool {
+        self.pools.pool_mut()
+    }
+
+    /// What one fire stages at most.
+    #[must_use]
+    pub fn capacity(&self) -> crate::store::Capacity {
+        self.pools.capacity()
     }
 
     #[must_use]
     pub fn buffer_pages(&self) -> u32 {
         self.pools.buffer_pages()
-    }
-
-    pub fn copy_pages(&mut self, moves: &[(u32, u32)]) -> Result<()> {
-        self.pools.copy_pages(moves)
-    }
-
-    pub fn state_bytes(&self, slot: u32) -> Result<Vec<u8>> {
-        self.pools.read_slot(slot)
     }
 
     pub fn register_adapter(
