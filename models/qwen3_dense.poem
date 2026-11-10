@@ -85,6 +85,44 @@ DIMS = {
     "qwen3-32b": dims(hidden = 5120, layers = 64, q_heads = 64, kv_heads = 8, inter = 25600, tied = False),
 }
 
+def adopt(id, config, special):
+    if config.get("model_type", "qwen3") != "qwen3":
+        fail("the config's model_type is {}; this family is qwen3".format(config.get("model_type")))
+    if config.get("hidden_act", "silu") != "silu":
+        fail("its MLP gates by {}; this family's SwiGLU gates by silu".format(config["hidden_act"]))
+    if config.get("attention_bias", False):
+        fail("its attention projections carry biases, which this family's do not")
+    if config.get("use_sliding_window", False):
+        fail("it attends through a sliding window in some layers; this family attends in full")
+    if config.get("rope_scaling") != None:
+        fail("its config scales its rope ({}); this family stretches its rope only by a deployment's -yarn".format(config["rope_scaling"]))
+    hidden = config["hidden_size"]
+    q_heads = config["num_attention_heads"]
+    d = struct(
+        hidden = hidden,
+        layers = config["num_hidden_layers"],
+        q_heads = q_heads,
+        kv_heads = config.get("num_key_value_heads", q_heads),
+        inter = config["intermediate_size"],
+        tied = config.get("tie_word_embeddings", False),
+        head_dim = config.get("head_dim", hidden // q_heads),
+        vocab = config["vocab_size"],
+        theta = float(config.get("rope_theta", 1000000.0)),
+        norm_eps = float(config.get("rms_norm_eps", 1e-6)),
+    )
+    return struct(
+        MODELS = [model(id, template = CHATML, tokenizer = TOKENIZER, arch = "qwen3", layers = d.layers, vocab = d.vocab)],
+        DIMS = {id: d},
+        DEPLOYMENTS = [
+            deployment(id, weights = dtype.bf16, kv = dtype.bf16),
+            deployment(id, weights = dtype.bf16, kv = dtype.e4m3),
+            deployment(id, weights = F8, kv = dtype.e4m3),
+            deployment(id, weights = dtype.e4m3g128a8, kv = dtype.e4m3),
+            deployment(id, weights = dtype.nvfp4, kv = dtype.e4m3),
+            deployment(id, weights = dtype.u4g64, kv = dtype.bf16),
+        ],
+    )
+
 # A release whose projections a deployment keeps as released (Qwen's block
 # FP8, compressed-tensors' per-channel FP8 as RedHatAI's *-FP8-dynamic store
 # it, modelopt's NVFP4), its tables and norms bf16.

@@ -71,6 +71,7 @@ def dims(hidden, layers, q_heads, inter):
         rope_high_freq_factor = 4.0,
         rope_original_max_position = 8192,
         norm_eps = 1e-5,
+        tied = False,
     )
 
 DIMS = {
@@ -78,6 +79,61 @@ DIMS = {
     "llama33-70b": dims(hidden = 8192, layers = 80, q_heads = 64, inter = 28672),
     "llama33-70b-mini-l4": dims(hidden = 8192, layers = 4, q_heads = 64, inter = 28672),
 }
+
+def adopt(id, config, special):
+    kind = config.get("model_type", "llama")
+    if kind not in ["llama", "mistral"]:
+        fail("the config's model_type is {}; this family is llama (and mistral, which is llama-shaped)".format(kind))
+    window = config.get("sliding_window")
+    if window != None and window < config.get("max_position_embeddings", 0):
+        fail("it attends through a {}-token sliding window; this family attends in full".format(window))
+    if config.get("hidden_act", "silu") != "silu":
+        fail("its MLP gates by {}; this family's SwiGLU gates by silu".format(config["hidden_act"]))
+    if config.get("attention_bias", False) or config.get("mlp_bias", False):
+        fail("its projections carry biases, which this family's do not")
+    hidden = config["hidden_size"]
+    q_heads = config["num_attention_heads"]
+    scaling = config.get("rope_scaling")
+    if scaling != None and scaling.get("rope_type", scaling.get("type")) != "llama3":
+        fail("it scales its rope as {}; this family turns it unscaled or llama3-scaled".format(scaling.get("rope_type", scaling.get("type"))))
+    head_dim = config.get("head_dim", hidden // q_heads)
+    if head_dim * q_heads != hidden and config.get("head_dim") == None:
+        fail("its heads do not divide its width")
+    vocab = config["vocab_size"]
+    d = struct(
+        hidden = hidden,
+        layers = config["num_hidden_layers"],
+        q_heads = q_heads,
+        kv_heads = config.get("num_key_value_heads", q_heads),
+        inter = config["intermediate_size"],
+        head_dim = head_dim,
+        vocab = vocab,
+        theta = float(config.get("rope_theta", 10000.0)),
+        rope_factor = None if scaling == None else float(scaling["factor"]),
+        rope_low_freq_factor = None if scaling == None else float(scaling.get("low_freq_factor", 1.0)),
+        rope_high_freq_factor = None if scaling == None else float(scaling.get("high_freq_factor", 4.0)),
+        rope_original_max_position = None if scaling == None else scaling.get("original_max_position_embeddings", 8192),
+        norm_eps = float(config.get("rms_norm_eps", 1e-5)),
+        tied = config.get("tie_word_embeddings", False),
+    )
+    if vocab == 128256:
+        spoken = struct(template = LLAMA, tokenizer = TOKENIZER)
+    else:
+        eos = special.get("eos_token")
+        if eos == None:
+            fail("its tokenizer_config.json names no eos_token, which a raw template stops at")
+        spoken = struct(template = template("raw", stop = [eos]), tokenizer = tokenizer(markers = [[eos]]))
+    return struct(
+        MODELS = [model(id, template = spoken.template, tokenizer = spoken.tokenizer, arch = "llama", layers = d.layers, vocab = vocab)],
+        DIMS = {id: d},
+        DEPLOYMENTS = [
+            deployment(id, weights = BF, kv = BF),
+            deployment(id, weights = BF, kv = E4M3),
+            deployment(id, weights = F8, kv = E4M3),
+            deployment(id, weights = NV4W, kv = E4M3),
+            deployment(id, weights = U4, kv = BF),
+        ],
+    )
 
 # A release whose projections a deployment keeps as released, its tables bf16.
 RELEASED = [dtype.e4m3tile128a8, dtype.nvfp4]
@@ -144,7 +200,7 @@ def layout(id, deploy):
         kv_width = kv_width,
         inter = d.inter,
         theta = d.theta,
-        rope = struct(
+        rope = None if d.rope_factor == None else struct(
             factor = d.rope_factor,
             low_freq_factor = d.rope_low_freq_factor,
             high_freq_factor = d.rope_high_freq_factor,
@@ -154,7 +210,7 @@ def layout(id, deploy):
         sm_scale = f32(1.0 / f32(sqrt(hd))),
         kv = deploy.kv,
         embed = weight([d.vocab, hidden], table),
-        head = weight([d.vocab, hidden], table),
+        head = None if d.tied else weight([d.vocab, hidden], table),
         layers = [layer(l) for l in range(d.layers)],
         final_norm = weight([hidden]),
         mtp = mtp,
@@ -166,7 +222,13 @@ def layout(id, deploy):
 # checked against its config.
 
 def configured(m):
-    return [
+    scaled = [] if m.rope == None else [
+        config("rope_scaling.factor", m.rope.factor),
+        config("rope_scaling.low_freq_factor", m.rope.low_freq_factor),
+        config("rope_scaling.high_freq_factor", m.rope.high_freq_factor),
+        config("rope_scaling.original_max_position_embeddings", m.rope.original_max_position),
+    ]
+    return scaled + [
         config("hidden_size", m.hidden),
         config("vocab_size", m.vocab),
         config("num_attention_heads", m.q_heads),
@@ -175,10 +237,6 @@ def configured(m):
         config("intermediate_size", m.inter),
         config("rms_norm_eps", m.eps),
         config("rope_theta", m.theta),
-        config("rope_scaling.factor", m.rope.factor),
-        config("rope_scaling.low_freq_factor", m.rope.low_freq_factor),
-        config("rope_scaling.high_freq_factor", m.rope.high_freq_factor),
-        config("rope_scaling.original_max_position_embeddings", m.rope.original_max_position),
     ]
 
 def read_checkpoint(reads, m):
@@ -251,7 +309,7 @@ def tap(mtp, layer, y, fused):
 
 def forward(m, inputs):
     positions = inputs.positions()
-    scaling = rope_scaling({
+    scaling = None if m.rope == None else rope_scaling({
         "rope_type": "llama3",
         "factor": m.rope.factor,
         "low_freq_factor": m.rope.low_freq_factor,
@@ -273,7 +331,7 @@ def forward(m, inputs):
     y, fused = inputs.fold_layers(m.layers, (y, None), block)
     x = ops.elemwise.rmsnorm(y, m.final_norm, m.eps)
     x = ops.gather.gather_rows(x, inputs.readout_rows())
-    logits = ops.linear.lm_head(x, m.head)
+    logits = ops.linear.lm_head(x, m.embed if m.head == None else m.head)
     if m.mtp != None:
         draft(m, inputs, fused, logits, scaling)
     else:
