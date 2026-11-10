@@ -571,7 +571,6 @@ fn refit(
         // 1024 rows at 1024 lanes, then the lanes to 512: one 717-token prompt a fire.
         // Back at 8192 rows: pf64-512 7.05k -> 10.35k tok/s (vLLM 9.03k at 1024
         // sequences), pf1024-512 7.92k -> 10.37k (9.00k), c1024 2.69k -> 2.71k (2.72k).
-        let mut tokens = tokens;
         while lanes < asked_lanes && tokens < asked.max_tokens {
             let wider = tokens.saturating_mul(2).min(asked.max_tokens);
             if working_at(lanes, wider, scoped) > room_at(wider, owed)? {
