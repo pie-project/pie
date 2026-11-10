@@ -224,7 +224,14 @@ impl Pool {
     /// Copies each moved chunk onto its new physical chunk in `frame`, then
     /// takes the moves into the table: the caller commits `frame` before any
     /// later fire is encoded, so the copies land first.
-    pub fn evacuate(&mut self, frame: &mut Frame, evacuation: &Evacuation) -> Result<()> {
+    /// Returns each move as `(from, to)` physical chunks, for what lies
+    /// beside the pool indexed by physical chunk.
+    pub fn evacuate(
+        &mut self,
+        frame: &mut Frame,
+        evacuation: &Evacuation,
+    ) -> Result<Vec<(u32, u32)>> {
+        let mut moved = Vec::with_capacity(evacuation.moves.len());
         let mut table = self.table.clone();
         table.apply(evacuation).map_err(|why| Fault::Program {
             at: "store::pool::evacuate",
@@ -237,6 +244,7 @@ impl Pool {
             if from == physical {
                 continue;
             }
+            moved.push((from, physical));
             self.copy(
                 frame,
                 u64::from(from) * self.chunk_bytes,
@@ -245,7 +253,7 @@ impl Pool {
             )?;
         }
         self.table = table;
-        Ok(())
+        Ok(moved)
     }
 
     /// Copies `bytes` from virtual byte `from` to `to` in `frame`; neither

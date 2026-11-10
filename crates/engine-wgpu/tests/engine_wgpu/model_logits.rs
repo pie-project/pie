@@ -64,6 +64,10 @@ fn write_checkpoint(path: &Path, trace: &Trace) {
                     .flat_map(|_| value(next()).to_le_bytes())
                     .collect(),
             ),
+            // Ids (a hash router's token-to-expert table): all 0, an id
+            // every table holds.
+            Dtype::I64 => (ztensor::Leaf::I(64), vec![0u8; 8 * count]),
+            Dtype::I32 => (ztensor::Leaf::I(32), vec![0u8; 4 * count]),
             other => panic!(
                 "`{}` is {other:?}, not a dtype the fixture seeds",
                 param.name
@@ -109,7 +113,16 @@ pub fn fixture(model: &str, layers: Option<u32>) -> Fixture {
 }
 
 pub fn load(fixture: &Fixture, context: u32) -> Option<Shell> {
-    let device = engine_wgpu::api::DeviceBoot::default();
+    load_at(fixture, context, None)
+}
+
+/// [`load`], the pool's recipe aiming at chunks of `chunk` bytes where
+/// stated.
+pub fn load_at(fixture: &Fixture, context: u32, chunk: Option<u64>) -> Option<Shell> {
+    let device = engine_wgpu::api::DeviceBoot {
+        chunk_bytes: chunk,
+        ..engine_wgpu::api::DeviceBoot::default()
+    };
     if let Err(why) = engine_wgpu::Context::bind(&device, 0.25) {
         eprintln!("skipping: no wgpu device ({why})");
         return None;
@@ -253,11 +266,13 @@ fn same(what: &str, got: &[Vec<f32>], want: &[Vec<f32>]) {
 }
 
 /// Slot refs the runtime would name: pages strided over chunks `first ..
-/// first + 3` from the top down, lane `l`'s record in chunk `first + 3 + l`.
+/// first + 3` from the top down, piece `p` of lane `l`'s record in chunk
+/// `first + 3 + l * pieces + p`.
 struct Refs {
     first: u32,
     per_list: u32,
     per_fixed: u32,
+    pieces: u32,
 }
 
 impl Refs {
@@ -267,12 +282,19 @@ impl Refs {
         chunk * self.per_list + index
     }
 
-    fn record(&self, lane: u32) -> u32 {
-        (self.first + 3 + lane) * self.per_fixed + (lane * 3 + 1) % self.per_fixed
+    fn record(&self, lane: u32) -> Vec<u32> {
+        (0..self.pieces)
+            .map(|p| {
+                (self.first + 3 + lane * self.pieces + p) * self.per_fixed
+                    + (lane * 3 + 1) % self.per_fixed
+            })
+            .collect()
     }
 
-    /// The chunks these refs hold: three of pages and two of records.
-    const HELD: u32 = 5;
+    /// The chunks these refs hold: three of pages and two records'.
+    fn held(&self) -> u32 {
+        3 + 2 * self.pieces
+    }
 }
 
 /// As [`serve_seats`], every lane addressed by slot refs; after
@@ -288,7 +310,7 @@ fn serve_refs(
     let mut held = [0u32; 2];
     let mut fed: [Vec<u32>; 2] = prompts();
     let page = shell.paging().page_size;
-    let records = [[refs.record(0)], [refs.record(1)]];
+    let records = [refs.record(0), refs.record(1)];
     let mut rows = Vec::new();
     let table = |lane: usize, upto: u32| -> Vec<u32> {
         (0..upto.div_ceil(page))
@@ -342,16 +364,22 @@ fn serve_refs(
 /// the runtime names by slot refs in a segment of their own, those chunks
 /// evacuated mid-decode below it and that segment given back, the decode
 /// running on through the moved chunks.
-fn scattered(model: &str) {
+fn scattered(model: &str) -> Vec<Vec<f32>> {
+    scattered_at(model, None)
+}
+
+/// [`scattered`] over a pool whose recipe aims at `chunk`-byte chunks;
+/// the seats' rows.
+fn scattered_at(model: &str, chunk: Option<u64>) -> Vec<Vec<f32>> {
     const STEPS: usize = 12;
     let fixture = fixture(model, None);
-    let Some(mut shell) = load(&fixture, CONTEXT) else {
-        return;
+    let Some(mut shell) = load_at(&fixture, CONTEXT, chunk) else {
+        return Vec::new();
     };
     let seats = serve_seats(&mut shell, &fixture.trace, STEPS);
     drop(shell);
 
-    let mut shell = load(&fixture, CONTEXT).expect("loaded before");
+    let mut shell = load_at(&fixture, CONTEXT, chunk).expect("loaded before");
     let facts = shell.pool_chunk_facts();
     facts.validate().expect("the facts hang together");
     eprintln!(
@@ -371,9 +399,14 @@ fn scattered(model: &str) {
     let segment = facts.segment_chunks;
     let low = 1 + layout.seat_chunks();
     let per = |id| facts.shape(id).map_or(1, |s| s.slots_per_chunk);
-    let kept = (low + Refs::HELD).div_ceil(segment);
+    let pieces = match facts.shape(FIXED).map(|s| s.kind) {
+        Some(engine::chunk::SlotKind::Fixed { pieces }) => pieces,
+        _ => 1,
+    };
+    let held = 3 + 2 * pieces;
+    let kept = (low + held).div_ceil(segment);
     let first = kept * segment;
-    let commit = (first + Refs::HELD).div_ceil(segment);
+    let commit = (first + held).div_ceil(segment);
     assert!(
         facts.segments.max >= commit,
         "{model}: the pool spans {commit} segments, it has {}",
@@ -383,7 +416,9 @@ fn scattered(model: &str) {
         first,
         per_list: per(LIST),
         per_fixed: per(FIXED),
+        pieces,
     };
+    assert_eq!(refs.held(), held);
     shell.commit_segments(commit).expect("the segments commit");
     let scattered = serve_refs(
         &mut shell,
@@ -392,7 +427,7 @@ fn scattered(model: &str) {
         STEPS,
         STEPS / 2,
         &mut |shell| {
-            let moves = (0..Refs::HELD).map(|at| (first + at, low + at)).collect();
+            let moves = (0..held).map(|at| (first + at, low + at)).collect();
             shell
                 .evacuate(&Evacuation { moves })
                 .expect("the evacuation lands");
@@ -407,6 +442,7 @@ fn scattered(model: &str) {
         &scattered,
         &seats,
     );
+    seats
 }
 
 #[test]
@@ -417,6 +453,34 @@ fn a_scattered_dense_pool_serves_the_same_logits() {
 #[test]
 fn a_scattered_hybrid_pool_serves_the_same_logits() {
     scattered("qwen35-tiny");
+}
+
+/// A model with a compressed kv pool: its compressor side planes, a cell a
+/// token of every physical list page, follow the pages an evacuation moves.
+/// Ignored: dsv4-flash-mini does not serve here, before the pool as after
+/// (before it, its side planes overran a binding; now its index top-k
+/// refuses the index pool's pitch).
+#[test]
+#[ignore = "dsv4-flash-mini does not serve on this backend"]
+fn a_scattered_compressed_pool_serves_the_same_logits() {
+    scattered("dsv4-flash-mini");
+}
+
+/// A record cut over several slots (a chunk smaller than it, as
+/// `PIE_GOLDEN_CHUNK` forces on CUDA): the same logits, bit for bit, as the
+/// record in one slot, its pieces scattered and evacuated as above.
+#[test]
+fn a_record_in_pieces_serves_the_same_logits() {
+    let whole = scattered("qwen35-tiny");
+    let chunk = std::env::var("PIE_WGPU_CHUNK").map_or(64 << 10, |bytes| {
+        bytes.parse().expect("PIE_WGPU_CHUNK is bytes")
+    });
+    let pieces = scattered_at("qwen35-tiny", Some(chunk));
+    same(
+        "qwen35-tiny: a record in pieces against one whole",
+        &pieces,
+        &whole,
+    );
 }
 
 #[test]

@@ -38,6 +38,16 @@ impl Shape {
                 format!("{channels} channels are odd, and this conv lands a bf16 pair a lane"),
             ));
         }
+        if state.piece_atoms < channels && !state.piece_atoms.is_multiple_of(2) {
+            return Err(refuse(
+                op,
+                format!(
+                    "the history is cut {} channels a piece, which splits the channel pair a \
+                     lane lands",
+                    state.piece_atoms
+                ),
+            ));
+        }
         nonzero(op, "the conv width this statement states", conv_width)?;
         nonzero(op, "the dilation this statement states", dilation)?;
         let hist = (conv_width - 1)
@@ -98,7 +108,7 @@ pub fn conv1d(
         Fire::at(CONV1D, entry).apply(shape.grid(rows(OP, x)?)),
         &[
             &[x.arg(), weight.arg(), state.slots.arg(), y.arg_mut()][..],
-            &state.args(true),
+            &state.piece_args(true),
             &[shape.channels.arg(), shape.taps.arg(), shape.dilation.arg()],
         ]
         .concat(),
@@ -130,7 +140,7 @@ pub fn conv1d_chunked(
                 state.slots.arg(),
                 y.arg_mut(),
             ][..],
-            &state.args(true),
+            &state.piece_args(true),
             &[shape.channels.arg(), shape.taps.arg(), shape.dilation.arg()],
         ]
         .concat(),
@@ -167,7 +177,7 @@ pub fn conv1d_committed(
                 weight.arg(),
                 y.arg_mut(),
             ][..],
-            &state.args(true),
+            &state.piece_args(true),
             &[
                 stated(OP, committed.lane0)?.arg(),
                 shape.channels.arg(),

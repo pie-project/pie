@@ -34,6 +34,15 @@ pub struct RecurrentPool {
     pub origin: u32,
 
     pub slot_stride: u32,
+
+    /// The units a `slots` entry holds: a record's pieces.
+    pub pieces: u32,
+
+    /// The entry's slot this row's piece 0 lies in.
+    pub piece_first: u32,
+
+    /// The atoms one piece of this row holds (`u32::MAX`: whole).
+    pub piece_atoms: u32,
 }
 
 impl From<poem_exec::store::Fault> for Fault {
@@ -108,11 +117,16 @@ enum Row {
         keys_cell: u64,
         values_cell: u64,
     },
-    /// A state row: `stride` elements at `offset` in the record's slot.
+    /// A state row: `stride` elements at `offset` in the record's slots
+    /// `first ..`: whole in slot `first`, or cut `piece_atoms` atoms
+    /// (`piece_bytes` bytes) a piece, piece `p` in slot `first + p`.
     State {
         stride: u64,
         dtype: Dtype,
         offset: u64,
+        first: u32,
+        piece_atoms: u32,
+        piece_bytes: u64,
     },
 }
 
@@ -266,13 +280,6 @@ impl Rows {
                     let run = fixed_runs.iter().find(|run| run.row == id).ok_or_else(|| {
                         disagree(format!("lays state row `{name}` in no fixed slot"))
                     })?;
-                    if run.pieces > 1 {
-                        return Err(disagree(format!(
-                            "cuts state row `{name}` into {} pieces, and this shell's state \
-                             kernels read a record of one piece",
-                            run.pieces
-                        )));
-                    }
                     let atom = recipe.atoms.get(&id).ok_or_else(|| {
                         disagree(format!("states no atoms of state row `{name}`"))
                     })?;
@@ -290,19 +297,38 @@ impl Rows {
                         )));
                     }
                     state_rows.push(u32::try_from(index).unwrap_or(u32::MAX));
+                    let first = run.slots.first().copied().unwrap_or(0);
+                    if run
+                        .slots
+                        .iter()
+                        .zip(first..)
+                        .any(|(&slot, want)| slot != want)
+                    {
+                        return Err(disagree(format!(
+                            "lays the pieces of state row `{name}` in record slots {:?}, \
+                             where this shell reads them in consecutive slots",
+                            run.slots
+                        )));
+                    }
+                    let cut = run.pieces > 1;
                     rows.push(Row::State {
                         stride,
                         dtype,
                         offset: run.offset,
+                        first,
+                        piece_atoms: if cut {
+                            u32::try_from(run.atoms_per_piece).unwrap_or(u32::MAX)
+                        } else {
+                            u32::MAX
+                        },
+                        piece_bytes: if cut {
+                            run.atoms_per_piece * atom.bytes
+                        } else {
+                            bytes
+                        },
                     });
                 }
             }
-        }
-        if rows.iter().any(|row| matches!(row, Row::State { .. })) && pieces > 1 {
-            return Err(disagree(format!(
-                "cuts a record into {pieces} pieces, and this shell's state kernels read a \
-                 record of one piece"
-            )));
         }
         let rs = match rs {
             None => None,
@@ -523,31 +549,37 @@ impl Pools {
         self.units(LIST, page)
     }
 
-    /// A lane's record as kernels address it: its one piece's unit, from
-    /// `refs` (slot refs of the fixed shape, a piece each) or seat `seat`'s
-    /// record.
-    pub fn record(&self, refs: Option<&[u32]>, seat: u32) -> Result<u32> {
+    /// The slots a record takes.
+    #[must_use]
+    pub fn pieces(&self) -> u32 {
+        self.layout.pieces.max(1)
+    }
+
+    /// A lane's record as kernels address it, one unit a piece: from `refs`
+    /// (slot refs of the fixed shape, a piece each) or seat `seat`'s record.
+    pub fn record(&self, refs: Option<&[u32]>, seat: u32) -> Result<Vec<u32>> {
+        let pieces = self.pieces();
         if !self.has_state() {
-            return Ok(seat);
+            return Ok(vec![seat; pieces as usize]);
         }
         match refs {
-            Some([one]) => self.units(FIXED, *one),
+            Some(refs) if refs.len() == pieces as usize => {
+                refs.iter().map(|&r| self.units(FIXED, r)).collect()
+            }
             Some(refs) => Err(Fault::Unbound {
                 what: format!(
-                    "a record named by {} slot refs, where this pool's records are one piece",
+                    "a record named by {} slot refs, where this pool's records are {pieces} \
+                     pieces",
                     refs.len()
                 ),
             }),
             None => {
                 let fixed = *self.shape(FIXED)?;
-                self.units(FIXED, fixed.seat_ref(seat)?)
+                (0..pieces)
+                    .map(|p| self.units(FIXED, fixed.seat_ref(seat * pieces + p)?))
+                    .collect()
             }
         }
-    }
-
-    /// The fixed slot ref seat `seat`'s record is.
-    pub fn seat_record(&self, seat: u32) -> Result<u32> {
-        self.shape(FIXED)?.seat_ref(seat)
     }
 
     /// The rs list's place in a slot, where the load buffers one.
@@ -597,24 +629,39 @@ impl Pools {
             .sum()
     }
 
-    /// The state rows of the record at `unit`, one after another. The
-    /// caller has drained every frame that writes it.
-    pub fn read_record(&self, unit: u32) -> Result<Vec<u8>> {
-        let base = u64::from(unit) * self.unit(FIXED)?;
+    /// The state rows of the record at `units` (a piece each), one after
+    /// another, each row's pieces in order. The caller has drained every
+    /// frame that writes it.
+    pub fn read_record(&self, units: &[u32]) -> Result<Vec<u8>> {
+        let unit = self.unit(FIXED)?;
         let mut out = Vec::new();
         for row in &self.rows {
             let Row::State {
                 stride,
                 dtype,
                 offset,
+                first,
+                piece_bytes,
+                ..
             } = *row
             else {
                 continue;
             };
-            let mut span =
-                vec![0u8; usize::try_from(stride * u64::from(elem_size(dtype))).unwrap_or(0)];
-            self.pool.read(base + offset, &mut span)?;
-            out.extend_from_slice(&span);
+            let mut left = stride * u64::from(elem_size(dtype));
+            let mut piece = first as usize;
+            while left > 0 {
+                let id = *units.get(piece).ok_or(Fault::Ceiling {
+                    what: "pieces of a record",
+                    need: piece as u64 + 1,
+                    have: units.len() as u64,
+                })?;
+                let take = piece_bytes.min(left);
+                let mut span = vec![0u8; usize::try_from(take).unwrap_or(0)];
+                self.pool.read(u64::from(id) * unit + offset, &mut span)?;
+                out.extend_from_slice(&span);
+                left -= take;
+                piece += 1;
+            }
         }
         Ok(out)
     }
@@ -696,6 +743,9 @@ impl Pools {
                     stride,
                     dtype,
                     offset,
+                    first,
+                    piece_atoms,
+                    ..
                 } => CachePool::Recurrent(RecurrentPool {
                     state: Tensor::new(
                         kernels_slang::ABSENT,
@@ -707,21 +757,27 @@ impl Pools {
                     pool: segments,
                     origin: u32::try_from(offset / 4).unwrap_or(u32::MAX),
                     slot_stride: u32::try_from(fixed_unit / 4).unwrap_or(u32::MAX),
+                    pieces: self.pieces(),
+                    piece_first: first,
+                    piece_atoms,
                 }),
             });
         }
         Ok(CacheTable(rows))
     }
 
-    /// Zeroes the record at `unit`: a fresh lane's state. The caller has
-    /// drained every frame.
-    pub fn clear(&mut self, unit: u32) -> Result<()> {
+    /// Zeroes the record at `units` (a piece each): a fresh lane's state.
+    /// The caller has drained every frame.
+    pub fn clear(&mut self, units: &[u32]) -> Result<()> {
         if !self.has_state() {
             return Ok(());
         }
         let bytes = self.shape(FIXED)?.slot_bytes;
-        let at = u64::from(unit) * self.unit(FIXED)?;
-        self.pool.zero(at, bytes)
+        let unit = self.unit(FIXED)?;
+        for &id in units {
+            self.pool.zero(u64::from(id) * unit, bytes)?;
+        }
+        Ok(())
     }
 
     /// Every kv run's place in a list slot: its offset and the bytes a token
@@ -1000,8 +1056,22 @@ impl Pools {
 
     /// Moves each evacuated chunk onto its new physical chunk in `frame`
     /// and takes the moves into the chunk table.
-    pub fn evacuate(&mut self, frame: &mut Frame, evacuation: &Evacuation) -> Result<()> {
-        self.pool.evacuate(frame, evacuation)
+    /// Returns each move as `(from, to)` physical list pages: the first
+    /// page of each chunk moved and the pages a chunk holds.
+    pub fn evacuate(
+        &mut self,
+        frame: &mut Frame,
+        evacuation: &Evacuation,
+    ) -> Result<(Vec<(u64, u64)>, u64)> {
+        let moved = self.pool.evacuate(frame, evacuation)?;
+        let per = u64::from(self.layout.list.map_or(0, |list| list.per_chunk));
+        Ok((
+            moved
+                .into_iter()
+                .map(|(from, to)| (u64::from(from) * per, u64::from(to) * per))
+                .collect(),
+            per,
+        ))
     }
 }
 

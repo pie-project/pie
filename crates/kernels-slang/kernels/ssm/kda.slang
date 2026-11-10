@@ -65,6 +65,9 @@ struct Params {
     uint seg_words;
     uint state_origin;
     uint slot_stride;
+    uint pieces;
+    uint piece_first;
+    uint piece_atoms;
 #if defined(PIE_COMMITTED)
     int lane0;
 #endif
@@ -77,6 +80,7 @@ PIE_PARAMS(PARAMS_AT, Params, params);
 PIE_POOL_READ(float, params.seg_words)
 PIE_POOL_WRITE(float, params.seg_words)
 PIE_POOL_VIEW(rstate, float, params.state_origin)
+PIE_STATE_PIECES
 
 groupshared float sq[DMAX];
 groupshared float sk[DMAX];
@@ -160,7 +164,7 @@ void main(uint3 group : SV_GroupID, uint3 local : SV_GroupThreadID) {
         }
         int span = (indptr[r + 1] - indptr[r]) + replay[lane];
         kda_lo = begin;
-        kda_hi = slots[lane] < 0 ? begin : begin + span;
+        kda_hi = pie_state_none(lane) ? begin : begin + span;
         kda_keep = min(commit[lane], span);
     }
     GroupMemoryBarrierWithGroupSync();
@@ -172,7 +176,7 @@ void main(uint3 group : SV_GroupID, uint3 local : SV_GroupThreadID) {
     if (span <= 0) {
         return;
     }
-    uint bank = uint(slots[lane]) * params.slot_stride + h * cells;
+    uint bank = pie_state_atom(lane, h, cells);
     uint state_base = (lane * uint(params.heads) + h) * cells;
     for (uint i = tid; i < cells; i += uint(PIE_GROUP_X)) {
         work[state_base + i] = rstate[bank + i];
@@ -199,12 +203,12 @@ void main(uint3 group : SV_GroupID, uint3 local : SV_GroupThreadID) {
     if (end <= begin) {
         return;
     }
-    uint state_base = slots[uint(begin)] * params.slot_stride + h * cells;
+    uint state_base = pie_state_atom(uint(begin), h, cells);
     for (int t = begin; t < end; t++) {
         token(tid, uint(t), h, state_base);
     }
 #else
-    token(tid, r, h, slots[r] * params.slot_stride + h * cells);
+    token(tid, r, h, pie_state_atom(r, h, cells));
 #endif
 }
 

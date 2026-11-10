@@ -532,6 +532,7 @@ impl Shell {
             boot.page_size,
             boot.context,
             device.max_buffer(),
+            boot.device.chunk_bytes,
         )?;
         let rows = crate::store::Rows::plan(&boot.trace, &recipe, &facts, rs_layout.as_deref())?;
         let page_size = if rows.tokens > 0 {
@@ -687,6 +688,7 @@ impl Shell {
                     &feeds.seats(),
                     feeds.selections.len(),
                     voxel_seat,
+                    rows.pieces,
                 )
             })
             .collect::<Result<Vec<_>>>()?;
@@ -832,7 +834,23 @@ impl Shell {
         let words = u32::try_from(2 * u64::from(u32::MAX) / chunk).unwrap_or(u32::MAX)
             / kernels_slang::SEGMENTS as u32
             * kernels_slang::SEGMENTS as u32;
-        let total = total.min(binds).min(words);
+        // The compressor side planes hold a cell a token of every physical
+        // list page, beside the pool in one scratch buffer: a chunk costs its
+        // share of them, and they stay within one binding.
+        let side = crate::scratch::pool_bytes(
+            &boot.trace,
+            Paging {
+                pages: chunk.checked_div(rows.list_bytes).unwrap_or(0),
+                ..asked
+            },
+        );
+        let sides = if side == 0 {
+            u32::MAX
+        } else {
+            let room_chunks = room / (chunk + side);
+            u32::try_from(room_chunks.min(device.max_buffer() / side)).unwrap_or(u32::MAX)
+        };
+        let total = total.min(binds).min(words).min(sides);
         if total < least_chunks {
             return Err(Fault::Residency(format!(
                 "one working set takes {least_chunks} chunks of {chunk} bytes, and this device \
@@ -962,8 +980,8 @@ impl Shell {
             self.drain()?;
             let seats = self.pools.seat_segments();
             self.commit_segments(seats)?;
-            let unit = self.pools.record(None, slot)?;
-            self.pools.clear(unit)?;
+            let units = self.pools.record(None, slot)?;
+            self.pools.clear(&units)?;
         }
         let seats = self.held.len() as u64;
         let held = self.held.get_mut(slot as usize).ok_or(Fault::Ceiling {
@@ -1109,7 +1127,23 @@ impl Shell {
             return Ok(());
         }
         let mut frame = self.device.frame()?;
-        self.pools.evacuate(&mut frame, evacuation)?;
+        let (moved, pages) = self.pools.evacuate(&mut frame, evacuation)?;
+        // The compressor side planes hold a cell a token of every physical
+        // list page: each moved chunk's pages move with it.
+        let tokens = u64::from(self.pools.paging().page_size);
+        let plane = self.scratch.plane();
+        for (at, cell) in self.scratch.side_planes() {
+            let run = pages * tokens * cell;
+            for &(from, to) in &moved {
+                frame.copy(
+                    plane,
+                    at + from * tokens * cell,
+                    plane,
+                    at + to * tokens * cell,
+                    run,
+                )?;
+            }
+        }
         self.grafted = Some(frame.commit_async(None)?);
         Ok(())
     }
@@ -1431,7 +1465,7 @@ impl Shell {
         } else {
             self.pools.record(Some(&[slot]), slot)?
         };
-        self.pools.read_record(unit)
+        self.pools.read_record(&unit)
     }
 
     pub fn rows_of(&mut self, landed: &Landed) -> Result<Vec<Vec<f32>>> {
@@ -2090,7 +2124,7 @@ impl Shell {
             adapter_routes.reserve(rows as usize);
         }
 
-        let mut beginning: Vec<u32> = Vec::new();
+        let mut beginning: Vec<Vec<u32>> = Vec::new();
 
         let mut writes: Vec<Option<(i32, i32)>> = Vec::with_capacity(rows as usize);
         let mut feeds: Vec<(u32, &'a Buffer)> = Vec::new();
@@ -2171,7 +2205,7 @@ impl Shell {
             // run side, which no lane writes this fire (CONTRACT-BC 15).
             let state = match seated.record_run {
                 Some(run) if plan.commit == 0 => self.pools.record(Some(run), seat_slot)?,
-                _ => record,
+                _ => record.clone(),
             };
             let fresh = match seated.rs_reset {
                 engine::fire::RsReset::Inferred => have == 0,
@@ -2243,8 +2277,8 @@ impl Shell {
                 adapter_routes.extend(std::iter::repeat_n(id, row.rows as usize));
             }
 
-            slot_ids.push(state as i32);
-            let at_lane = slot_ids.len() as i32 - 1;
+            slot_ids.extend(state.iter().map(|&unit| unit as i32));
+            let at_lane = (slot_ids.len() / state.len().max(1)) as i32 - 1;
 
             if !matches!(seated.rs, engine::fire::RsVerb::Fold) {
                 if self.rs_layout.is_none() {
@@ -2284,7 +2318,7 @@ impl Shell {
                         positions.push(if self.states_mrope { row } else { stated });
                         rotations.push(stated);
                         request_of_token.push(at_lane);
-                        slot_of_row.push(state as i32);
+                        slot_of_row.extend(state.iter().map(|&unit| unit as i32));
                     }
                     writes.extend(std::iter::repeat_n(None, rows_here));
                 }
@@ -2346,8 +2380,8 @@ impl Shell {
         if !beginning.is_empty() && self.pools.has_state() {
             self.drain()?;
         }
-        for unit in beginning {
-            self.pools.clear(unit)?;
+        for units in beginning {
+            self.pools.clear(&units)?;
         }
 
         let indptr_host = kv::indptr(&seats)?;

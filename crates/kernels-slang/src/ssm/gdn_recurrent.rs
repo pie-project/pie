@@ -131,7 +131,7 @@ pub fn gated_delta(
             .apply(heads.grid(rows(OP, qkv)?)),
         &[
             &[qkv.arg(), gates.arg(), state.slots.arg(), y.arg_mut()][..],
-            &state.args(true),
+            &state.piece_args(true),
             &[kh, vh, kd, vd],
         ]
         .concat(),
@@ -173,7 +173,7 @@ pub fn gated_delta_chunked(
                 state.slots.arg(),
                 y.arg_mut(),
             ][..],
-            &state.args(true),
+            &state.piece_args(true),
             &[kh, vh, kd, vd],
         ]
         .concat(),
@@ -222,7 +222,7 @@ pub fn gated_delta_committed(
                 work.arg_mut(),
                 y.arg_mut(),
             ][..],
-            &state.args(true),
+            &state.piece_args(true),
             &[stated(OP, committed.lane0)?.arg(), kh, vh, kd, vd],
         ]
         .concat(),

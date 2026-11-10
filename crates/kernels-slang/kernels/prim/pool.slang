@@ -48,6 +48,26 @@
         pie_seg3[v - s] = x; \
     }
 
+// A record cut into pieces (SPEC 4: a fixed row larger than a slot is cut on
+// its atom axis into equal pieces, each in a slot of its own at one common
+// offset). A state kernel's `slots` table holds `params.pieces` units a lane
+// or a row, the record's slots in order; this row's piece `p` lies in slot
+// `params.piece_first + p`, `params.piece_atoms` atoms a piece. Needs
+// `slots` and `params` (`pieces`, `piece_first`, `piece_atoms`,
+// `slot_stride`) declared before.
+#define PIE_STATE_PIECES \
+    uint pie_piece_unit(uint at, uint atom) { \
+        return uint(slots[at * params.pieces + params.piece_first + atom / params.piece_atoms]); \
+    } \
+    /* Atom `atom` (each `elems` long, atoms outermost) of entry `at`'s record. */ \
+    uint pie_state_atom(uint at, uint atom, uint elems) { \
+        return pie_piece_unit(at, atom) * params.slot_stride + (atom % params.piece_atoms) * elems; \
+    } \
+    /* Whether entry `at` names no record (a negative unit). */ \
+    bool pie_state_none(uint at) { \
+        return int(slots[at * params.pieces]) < 0; \
+    }
+
 // A read-only window on the pool from `origin_` on.
 #define PIE_POOL_VIEW_RO(name_, type_, origin_) \
     struct name_##_pool_view { \

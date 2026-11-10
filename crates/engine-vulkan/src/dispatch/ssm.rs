@@ -27,6 +27,9 @@ impl Run<'_> {
             pool: pool.pool,
             origin: pool.origin,
             slot_stride: pool.slot_stride,
+            pieces: pool.pieces,
+            piece_first: pool.piece_first,
+            piece_atoms: pool.piece_atoms,
         }
     }
 

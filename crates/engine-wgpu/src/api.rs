@@ -38,6 +38,10 @@ pub struct DeviceBoot {
 
     /// `$PIE_HOME/profiles`, where a native user's adapter profiles live.
     pub profiles: Option<PathBuf>,
+
+    /// Diagnostics: the chunk size the pool's recipe aims at, in place of
+    /// the profile's (a small one cuts records into pieces).
+    pub chunk_bytes: Option<u64>,
 }
 
 impl Default for DeviceBoot {
@@ -49,6 +53,7 @@ impl Default for DeviceBoot {
             pipeline_cache: None,
             device_memory: None,
             profiles: None,
+            chunk_bytes: None,
         }
     }
 }

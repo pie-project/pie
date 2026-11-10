@@ -52,9 +52,9 @@ impl Shell {
 /// of the load's `page_size` holding windowed rows in full (these kernels
 /// page every kv row by one table), state rows in f32.
 #[must_use]
-pub fn profile(page_size: u32, context: u32, binding: u64) -> ChunkProfile {
+pub fn profile(page_size: u32, context: u32, binding: u64, target: Option<u64>) -> ChunkProfile {
     ChunkProfile {
-        target_chunk_bytes: crate::store::layout::TARGET_CHUNK,
+        target_chunk_bytes: target.unwrap_or(crate::store::layout::TARGET_CHUNK),
         segment_bytes: binding,
         segment_grain: 256,
         max_binding_bytes: binding,
@@ -79,9 +79,10 @@ pub fn recipe(
     page_size: u32,
     context: u32,
     binding: u64,
+    target: Option<u64>,
 ) -> Result<poem_compiler::chunk::ChunkRecipe> {
     let device = DeviceProfile {
-        chunk: profile(page_size, context, binding),
+        chunk: profile(page_size, context, binding, target),
         ..DeviceProfile::default()
     };
     poem_compiler::chunk::plan(trace, budgets, &device).map_err(|why| Fault::Unbound {

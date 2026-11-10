@@ -59,6 +59,9 @@ struct Params {
     uint seg_words;
     uint state_origin;
     uint slot_stride;
+    uint pieces;
+    uint piece_first;
+    uint piece_atoms;
 #if defined(PIE_COMMITTED)
     int lane0;
 #endif
@@ -72,9 +75,11 @@ PIE_POOL_READ(float, params.seg_words)
 PIE_POOL_WRITE(float, params.seg_words)
 PIE_POOL_VIEW(rstate, float, params.state_origin)
 
-// Where value head `hv`'s state starts in slot `slot`.
-uint state_at(uint slot, uint hv, uint head) {
-    return slot * params.slot_stride + hv * head;
+PIE_STATE_PIECES
+
+// Where value head `hv`'s state starts in the record of `slots` entry `at`.
+uint state_at(uint at, uint hv, uint head) {
+    return pie_state_atom(at, hv, head);
 }
 
 groupshared float sq[KMAX];
@@ -202,7 +207,7 @@ void main(uint3 group : SV_GroupID, uint3 local : SV_GroupThreadID) {
         }
         int span = (indptr[r + 1] - indptr[r]) + replay[lane];
         gdn_lo = begin;
-        gdn_hi = slots[lane] < 0 ? begin : begin + span;
+        gdn_hi = pie_state_none(lane) ? begin : begin + span;
         gdn_keep = min(commit[lane], span);
     }
     GroupMemoryBarrierWithGroupSync();
@@ -214,7 +219,7 @@ void main(uint3 group : SV_GroupID, uint3 local : SV_GroupThreadID) {
     if (span <= 0) {
         return;
     }
-    uint bank = state_at(uint(slots[lane]), hv, head);
+    uint bank = state_at(lane, hv, head);
 #if defined(PIE_DK_REG)
     reg_load(tid, bank);
     for (int t = 0; t < span; t++) {
@@ -254,7 +259,7 @@ void main(uint3 group : SV_GroupID, uint3 local : SV_GroupThreadID) {
     if (end <= begin) {
         return;
     }
-    uint state_base = state_at(slots[uint(begin)], hv, head);
+    uint state_base = state_at(uint(begin), hv, head);
 #if defined(PIE_DK_REG)
     reg_load(tid, state_base);
 #endif
@@ -265,7 +270,7 @@ void main(uint3 group : SV_GroupID, uint3 local : SV_GroupThreadID) {
     reg_store(tid, state_base);
 #endif
 #else
-    uint state_base = state_at(slots[r], hv, head);
+    uint state_base = state_at(r, hv, head);
 #if defined(PIE_DK_REG)
     reg_load(tid, state_base);
 #endif

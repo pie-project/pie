@@ -34,6 +34,10 @@ pub struct DeviceBoot {
 
     /// `$PIE_HOME/profiles`, where a user's device profiles live.
     pub profiles: Option<PathBuf>,
+
+    /// Diagnostics: the chunk size the pool's recipe aims at, in place of
+    /// the profile's (a small one cuts records into pieces).
+    pub chunk_bytes: Option<u64>,
 }
 
 struct PendingStep {
