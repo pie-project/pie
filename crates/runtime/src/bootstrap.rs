@@ -496,7 +496,17 @@ async fn bootstrap_inner(config: Config) -> Result<BootstrapHandle> {
     let engines: Vec<usize> = engine_configs
         .into_iter()
         .map(|d| {
-            let streams = weight_streaming.streams(d.weights_fit);
+            // Weights the engine states as shapes start off the device (the
+            // engine reads them from host until the starting residency), so
+            // its `weights_fit` says nothing of them: `auto` holds them
+            // unless the pool cannot seat them all, which
+            // `store::weights::boot_cache` decides.
+            let streams = match weight_streaming {
+                crate::store::weights::WeightStreaming::Auto if !d.chunks.weights.is_empty() => {
+                    false
+                }
+                mode => mode.streams(d.weights_fit),
+            };
             let id = engine::register_engine_backend(
                 engine::EngineSpec {
                     device_domain: ::engine::MemoryDomain::HostPinned,
