@@ -769,3 +769,11 @@ The `new-memory/` directory is bookkeeping and is removed before anything lands 
   base; off-by-one-chunk and auto-undersized cases = untold results bitwise.
 - Next: runtime adopts `seated` at boot (RWS). Known: engine-wgpu without features fails to build (VK2 rows.rs
   `write_shared` on the stub buffer) — VK3 to fix.
+
+### M57 — 2026-11-10: runtime adopts the engine's weight seating (RWS)
+- `sc/rws-adopt-seated` (8a7bddb09): `SlotPool::claim` takes exact slot refs (fails cleanly on any conflict);
+  WeightCache claims every seated shape before staging / other shapes; held residency names first + a; auto-undersized
+  keeps whole seated chunks as cache.
+- sm_120, qwen3-30b-a3b-mini at 5120 tokens: off and auto both show no re-seat warning and "bodies armed 131 of 131"
+  (the M54 "0 of 0" bug is gone); tokens + top-4 bits = base; 405 / 399 tok/s (shared GPU; earlier rounds 450-481,
+  so re-measure on a quiet GPU).
