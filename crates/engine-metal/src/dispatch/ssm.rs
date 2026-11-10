@@ -83,7 +83,7 @@ impl Run<'_> {
                     &self.recurrent(*state),
                     *state_dim,
                     y,
-                    self.rs_snapshots(),
+                    self.rs_snapshots(*state),
                 )
             }
             Ssm::CausalConv1d {
@@ -182,7 +182,7 @@ impl Run<'_> {
                         *k_dim,
                         *v_dim,
                         self.tensor(*y),
-                        self.rs_snapshots(),
+                        self.rs_snapshots(*state),
                     );
                 }
                 // Heads the verify scan does not stage take the gate prep
@@ -206,7 +206,7 @@ impl Run<'_> {
                     *k_dim,
                     *v_dim,
                     ext_y,
-                    self.rs_snapshots(),
+                    self.rs_snapshots(*state),
                 )?;
                 self.rs_land(OP, &seat, ext_y, *y)
             }
@@ -245,7 +245,7 @@ impl Run<'_> {
                 *conv_width,
                 *dilation,
                 self.tensor(*y),
-                self.rs_snapshots(),
+                self.rs_snapshots(*state),
             ),
             Ssm::ShortConv { .. } | Ssm::ShortConvChunked { .. } => {
                 Err(kernels_metal::Error::Unsupported { op: op.name() })
@@ -349,7 +349,7 @@ impl Run<'_> {
                 *k_dim,
                 *v_dim,
                 self.tensor(*y),
-                self.rs_snapshots(),
+                self.rs_snapshots(*state),
             ),
             Ssm::Kda {
                 mixed,

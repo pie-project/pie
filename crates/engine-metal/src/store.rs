@@ -5,7 +5,7 @@ pub mod layout;
 pub mod pool;
 mod pools;
 
-pub use pools::{Pools, Rows, RsRows};
+pub use pools::{Pools, Rows, RsRows, SpacePaging};
 
 use kernels_metal::{StateMap, Tensor};
 use poem_ir::{Attn, Def, Dtype, Operation, Trace};

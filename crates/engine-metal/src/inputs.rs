@@ -103,6 +103,8 @@ pub struct Handles {
     pub rs_replay: Option<Tensor>,
     pub rs_commit: Option<Tensor>,
     pub rs_snaps: Option<Tensor>,
+    /// Each band's snapshot table, `[lanes, RS_SNAPSHOTS * (1 + width)]`.
+    pub rs_snap_bands: Vec<Tensor>,
     pub rs_pages: Option<Tensor>,
     pub group_of_lane: Option<Tensor>,
     pub packings: Vec<PackingHandles>,
@@ -385,7 +387,9 @@ impl Inputs {
         let mrope = mrope.then(|| take(rows * AXES * 4));
         let rs_replay = take(lanes * 4);
         let rs_commit = take(lanes * 4);
-        let rs_snaps = take(lanes * u64::from(SNAP_INTS) * 4);
+        let snap_ints =
+            u64::from(kernels_metal::ssm::RS_SNAPSHOTS) * (bands.len().max(1) as u64 + width);
+        let rs_snaps = take(lanes * snap_ints.max(u64::from(SNAP_INTS)) * 4);
         let rs_pages = take(lanes * u64::from(crate::rs::PAGE_INTS) * 4);
         let total = at;
 
@@ -1019,6 +1023,24 @@ impl Inputs {
                 Some(i32s(handles, &self.store, self.rs_commit, lanes)?)
             } else {
                 None
+            },
+            rs_snap_bands: match fire.rs_snaps {
+                Some(snaps) => {
+                    let max = kernels_metal::ssm::RS_SNAPSHOTS;
+                    let per_lane: u32 = self.bands.iter().map(|&w| max * (1 + w)).sum();
+                    let lanes = snaps.len() as u32 / per_lane.max(1);
+                    let mut at = self.rs_snaps;
+                    self.bands
+                        .iter()
+                        .map(|&w| {
+                            let ints = lanes * max * (1 + w);
+                            let buf = handles.bind(&self.store, at, u64::from(ints.max(1)) * 4)?;
+                            at += u64::from(ints) * 4;
+                            Ok(Tensor::new(buf, ints.max(1), 1, Dtype::I32))
+                        })
+                        .collect::<Result<Vec<_>>>()?
+                }
+                None => Vec::new(),
             },
             rs_snaps: match fire.rs_snaps {
                 Some(snaps) => Some(i32s(

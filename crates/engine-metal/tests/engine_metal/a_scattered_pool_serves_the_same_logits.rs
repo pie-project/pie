@@ -398,6 +398,11 @@ fn a_scattered_dense_pool_serves_the_same_logits() {
 }
 
 #[test]
+fn a_scattered_windowed_pool_serves_the_same_logits() {
+    check("gemma4-e4b-mini-l1", false);
+}
+
+#[test]
 fn a_scattered_hybrid_pool_serves_the_same_logits() {
     check("qwen35-tiny", true);
 }

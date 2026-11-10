@@ -28,6 +28,7 @@ use crate::error::{Fault, Result};
 
 pub const LIST: ShapeId = ShapeId(0);
 pub const FIXED: ShapeId = ShapeId(1);
+pub const RING: ShapeId = ShapeId(2);
 
 /// The chunk an on-device Metal recipe aims at.
 pub const TARGET_CHUNK: u64 = 2 << 20;
@@ -97,6 +98,11 @@ pub struct Layout {
     pub pieces: u32,
     pub list: Option<Slots>,
     pub fixed: Option<Slots>,
+    /// The windowed rows' ring: `page_size` tokens a slot, `ring_cap` slots
+    /// a working set, read through `ring_window`.
+    pub ring: Option<Slots>,
+    pub ring_cap: u32,
+    pub ring_window: u32,
 }
 
 impl Layout {
@@ -122,6 +128,9 @@ impl Layout {
             pieces: pieces.max(1),
             list: Slots::of(LIST, list, chunk_bytes),
             fixed: Slots::of(FIXED, fixed, chunk_bytes),
+            ring: None,
+            ring_cap: 0,
+            ring_window: 0,
         };
         if let Some(shape) = layout.shapes().find(|s| s.per_chunk == 0) {
             return Err(Fault::Ceiling {
@@ -145,8 +154,34 @@ impl Layout {
         Ok(layout)
     }
 
+    /// This layout with a ring shape of `bytes` slots, `cap` slots a
+    /// working set read through `window`; its seat run after the others.
+    pub fn with_ring(mut self, bytes: u64, cap: u32, window: u32) -> Result<Layout> {
+        let Some(mut ring) = Slots::of(RING, bytes, self.chunk_bytes) else {
+            return Ok(self);
+        };
+        if ring.per_chunk == 0 {
+            return Err(Fault::Ceiling {
+                what: "bytes of a pool chunk",
+                need: bytes,
+                have: self.chunk_bytes,
+            });
+        }
+        let seats = self
+            .fixed
+            .map(|f| f.seat_slots / self.pieces.max(1))
+            .or(self.list.map(|l| l.seat_slots))
+            .unwrap_or(0);
+        ring.seat_chunk = 1 + self.seat_chunks();
+        ring.seat_slots = seats.saturating_mul(cap);
+        self.ring = Some(ring);
+        self.ring_cap = cap;
+        self.ring_window = window;
+        Ok(self)
+    }
+
     pub fn shapes(&self) -> impl Iterator<Item = &Slots> {
-        self.list.iter().chain(&self.fixed)
+        self.list.iter().chain(&self.fixed).chain(&self.ring)
     }
 
     #[must_use]
@@ -206,6 +241,16 @@ impl Layout {
                     rate: 1,
                 },
                 &rows[0],
+            ));
+        }
+        if let Some(ring) = &self.ring {
+            shapes.push(shape(
+                ring,
+                SlotKind::Ring {
+                    window: self.ring_window,
+                    tokens: self.page_size,
+                },
+                &Vec::new(),
             ));
         }
         if let Some(fixed) = &self.fixed {

@@ -9,7 +9,7 @@ use kernels_metal::{KvPool, RecurrentPool, StateMap, Tensor};
 use poem_compiler::chunk::{ChunkRecipe, RowId, SlotLayout};
 use poem_ir::{CacheRow, Dtype, Trace};
 
-use super::layout::{FIXED, LIST, Layout, Slots};
+use super::layout::{FIXED, LIST, Layout, RING, Slots, gcd};
 use super::pool::Pool;
 use super::{
     STATE_MAP_BYTES, Seats, SpaceSeat, Spill, compressed_spaces, elem_bytes, elem_size, narrow,
@@ -137,13 +137,27 @@ fn kv_cells(
     })
 }
 
-/// Where the rs buffer lies in a record: the record's slot holding every
-/// replayed layer's `[16, width]` rows, and each of the shell's rs planes'
-/// offset in that slot (its 16 rows one after another).
+/// Where the rs buffer lies in a record (the recipe's `RsLayout`): every
+/// rs row cut alike into `pieces` pieces of `tokens_per_piece` tokens,
+/// piece `p` in record slot `slots[p]`, and each of the shell's rs planes'
+/// offset in a piece (its `tokens_per_piece` rows one after another).
+/// Buffered row `s` lies in piece `(s % 16) / tokens_per_piece`, row
+/// `(s % 16) % tokens_per_piece` of it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RsRows {
-    pub slot: u32,
+    pub pieces: u32,
+    pub tokens_per_piece: u32,
+    pub slots: Vec<u32>,
     pub plane_at: Vec<u64>,
+}
+
+/// How a kv space's rows are paged: the list, the ring, or a small ring
+/// folded into the record (`tokens` tokens in record slot `slot`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SpacePaging {
+    List,
+    Ring,
+    Folded { tokens: u32, slot: u32 },
 }
 
 /// How a load's rows lay into the recipe's slots, before any pool is
@@ -158,6 +172,13 @@ pub struct Rows {
     pub tokens: u32,
     pub fixed_bytes: u64,
     pub pieces: u32,
+    /// The ring slot's bytes, the slots a working set's ring takes, and the
+    /// window it is read through; zero where nothing is windowed.
+    pub ring_bytes: u64,
+    pub ring_cap: u32,
+    pub ring_window: u32,
+    /// How each kv space is paged, by space.
+    pub spaces: Vec<SpacePaging>,
     /// What one physical list slot's tokens take in the side planes.
     pub side_bytes: u64,
     /// Each distinct set of record slots a state row's pieces lie in.
@@ -173,55 +194,6 @@ fn disagree(what: String) -> Fault {
     Fault::Unbound {
         what: format!("the on-device Metal chunk recipe, which {what}"),
     }
-}
-
-/// The chunked recurrences whose commit is deferred, in node order: the
-/// recipe's `RowId::Rs(n)` is the n-th. Each with the shell's rs planes it
-/// replays: the conv's input, then `[b | a]` (gated delta) or `f` and `b`
-/// (KDA).
-fn rs_layers(trace: &Trace) -> Vec<Vec<(u32, crate::rs::Role)>> {
-    use crate::rs::Role;
-    use poem_ir::{Def, Operation, Ssm};
-    let mut defined = std::collections::HashMap::new();
-    let mut outs = Vec::new();
-    for (at, node) in trace.nodes.iter().enumerate() {
-        outs.clear();
-        poem_ir::Operands::outputs(&node.op, &mut outs);
-        for out in &outs {
-            defined.insert(out.0, at);
-        }
-    }
-    let op_of = |id: poem_ir::ValueId| defined.get(&id.0).map(|n| &trace.nodes[*n].op);
-    let cache = |id: poem_ir::ValueId| match trace.values.get(id.0 as usize).map(|v| &v.def) {
-        Some(Def::Cache(row)) => Some(*row),
-        _ => None,
-    };
-    let conv = |id| match op_of(id) {
-        Some(Operation::Ssm(Ssm::CausalConv1dChunked { state, .. })) => cache(*state),
-        _ => None,
-    };
-    let mut layers = Vec::new();
-    for node in &trace.nodes {
-        let planes = match &node.op {
-            Operation::Ssm(Ssm::GatedDeltaChunked {
-                qkv, gates, state, ..
-            }) => {
-                let gated = matches!(op_of(*gates), Some(Operation::Ssm(Ssm::GdnGates { .. })));
-                conv(*qkv)
-                    .zip(cache(*state))
-                    .filter(|_| gated)
-                    .map(|(c, s)| vec![(c, Role::ConvX), (s, Role::Ba)])
-            }
-            Operation::Ssm(Ssm::KdaChunked { mixed, state, .. }) => conv(*mixed)
-                .zip(cache(*state))
-                .map(|(c, s)| vec![(c, Role::ConvX), (s, Role::KdaF), (s, Role::KdaB)]),
-            _ => continue,
-        };
-        if let Some(planes) = planes {
-            layers.push(planes);
-        }
-    }
-    layers
 }
 
 impl Rows {
@@ -269,15 +241,28 @@ impl Rows {
         facts: &Facts,
         rs: Option<&crate::rs::Layout>,
     ) -> Result<Rows> {
-        if recipe.rings().next().is_some()
-            || matches!(recipe.fixed(), Some(SlotLayout::Fixed { folded, .. }) if !folded.is_empty())
-        {
+        let rings: Vec<&SlotLayout> = recipe.rings().collect();
+        if rings.len() > 1 {
             return Err(disagree(format!(
-                "keeps windowed kv rows in rings ({}), where this shell pages them in full in \
-                 the list",
+                "keeps {} ring shapes ({}), where a load pages one",
+                rings.len(),
                 recipe.shapes()
             )));
         }
+        let (ring_tokens, ring_bytes, ring_cap, ring_window, ring_runs) = match rings.first() {
+            Some(SlotLayout::Ring {
+                tokens,
+                bytes,
+                cap_slots,
+                cap,
+                rows,
+            }) => (*tokens, *bytes, *cap_slots, cap.window, rows.as_slice()),
+            _ => (0, 0, 0, 0, &[][..]),
+        };
+        let folded: &[(RowId, u32)] = match recipe.fixed() {
+            Some(SlotLayout::Fixed { folded, .. }) => folded,
+            _ => &[],
+        };
         let (tokens, list_bytes, runs) = match recipe.list() {
             Some(SlotLayout::List {
                 tokens,
@@ -295,6 +280,15 @@ impl Rows {
             }) => (*bytes, *pieces_per_ws, rows.as_slice()),
             _ => (0, 0, &[][..]),
         };
+        // Without a list the ring's slot is the kv page.
+        let tokens = if list_bytes == 0 { ring_tokens } else { tokens };
+        if ring_bytes > 0 && ring_tokens != tokens {
+            return Err(disagree(format!(
+                "pages windowed rows {ring_tokens} tokens a ring slot beside {tokens}-token kv \
+                 pages, where a ring slot is one kv page"
+            )));
+        }
+        let mut spaces: Vec<Option<SpacePaging>> = Vec::new();
         let mut rows = Vec::with_capacity(trace.caches.len());
         let mut bands: Vec<Vec<u32>> = Vec::new();
         let mut maps = 0usize;
@@ -312,21 +306,62 @@ impl Rows {
                     ..
                 } => {
                     let kv = kv_cells(index, name, planes, *dtype, *space, *head_dim, facts)?;
-                    let run = runs
-                        .iter()
-                        .find(|run| run.row == id)
-                        .ok_or_else(|| disagree(format!("lays kv row `{name}` in no list slot")))?;
                     let per_token = kv.keys_cell + if kv.own_values { kv.values_cell } else { 0 };
-                    if per_token != run.per_token {
+                    // Where the row lies: a list slot, a ring slot, or the
+                    // record (a folded ring), and the tokens a run holds.
+                    let (paging, offset, stated, run_tokens) = if let Some(run) =
+                        runs.iter().find(|run| run.row == id)
+                    {
+                        (SpacePaging::List, run.offset, run.per_token, tokens)
+                    } else if let Some(run) = ring_runs.iter().find(|run| run.row == id) {
+                        (SpacePaging::Ring, run.offset, run.per_token, ring_tokens)
+                    } else if let Some(&(_, held)) = folded.iter().find(|(row, _)| *row == id) {
+                        let run = fixed_runs.iter().find(|run| run.row == id).ok_or_else(|| {
+                            disagree(format!("folds kv row `{name}` into no record slot"))
+                        })?;
+                        if run.pieces != 1 {
+                            return Err(disagree(format!(
+                                "cuts folded ring row `{name}` into {} pieces, where this \
+                                     shell reads a folded ring whole",
+                                run.pieces
+                            )));
+                        }
+                        let bytes = recipe.atoms.get(&id).map_or(0, |a| a.bytes);
+                        (
+                            SpacePaging::Folded {
+                                tokens: held,
+                                slot: run.slots[0],
+                            },
+                            run.offset,
+                            bytes,
+                            held,
+                        )
+                    } else {
+                        return Err(disagree(format!("lays kv row `{name}` in no slot")));
+                    };
+                    if per_token != stated {
                         return Err(disagree(format!(
-                            "lays kv row `{name}` at {} bytes a token, where this shell stores \
-                             {per_token}",
-                            run.per_token
+                            "lays kv row `{name}` at {stated} bytes a token, where this shell \
+                             stores {per_token}"
                         )));
                     }
-                    let keys = run.offset;
+                    let at = *space as usize;
+                    if spaces.len() <= at {
+                        spaces.resize(at + 1, None);
+                    }
+                    match spaces[at] {
+                        None => spaces[at] = Some(paging),
+                        Some(held) if held == paging => {}
+                        Some(held) => {
+                            return Err(disagree(format!(
+                                "pages kv space {space}'s rows apart ({held:?} and {paging:?}), \
+                                 where one table pages a space"
+                            )));
+                        }
+                    }
+                    let keys = offset;
                     let values = if kv.own_values {
-                        keys + u64::from(tokens) * kv.keys_cell
+                        keys + u64::from(run_tokens) * kv.keys_cell
                     } else {
                         keys
                     };
@@ -395,7 +430,7 @@ impl Rows {
         }
         let rs = match rs {
             None => None,
-            Some(layout) => Some(rs_rows(trace, recipe, fixed_runs, layout)?),
+            Some(layout) => Some(rs_rows(recipe, fixed_runs, layout)?),
         };
         let mut side = 0usize;
         let mut side_bytes = 0u64;
@@ -416,6 +451,13 @@ impl Rows {
             tokens,
             fixed_bytes,
             pieces,
+            ring_bytes,
+            ring_cap,
+            ring_window,
+            spaces: spaces
+                .into_iter()
+                .map(|paging| paging.unwrap_or(SpacePaging::List))
+                .collect(),
             side_bytes,
             bands,
             rs,
@@ -425,56 +467,56 @@ impl Rows {
     }
 }
 
-/// The rs planes' places in the record: each replayed layer's `[16, width]`
-/// row (the recipe's `RowId::Rs(n)`) holds that layer's planes one after
-/// another, 16 rows each. Every layer's row lies whole in one slot, the same
-/// for all.
+/// The rs planes' places in a record piece, read off the recipe's
+/// `RsLayout`: each rs row's planes one after another past its offset, each
+/// plane `tokens_per_piece` rows; the shell's planes matched by the values
+/// they buffer.
 fn rs_rows(
-    trace: &Trace,
     recipe: &ChunkRecipe,
     runs: &[poem_compiler::chunk::FixedRun],
     layout: &crate::rs::Layout,
 ) -> Result<RsRows> {
-    let rows = u64::from(poem_compiler::chunk::UNFOLDED_ROWS);
+    let rs = &recipe.rs;
+    let rows16 = poem_compiler::chunk::UNFOLDED_ROWS;
+    let tokens = u32::try_from(rs.tokens_per_piece).unwrap_or(u32::MAX);
+    // The rs buffer becomes a list shape of its own (CONTRACT-BC 18); until
+    // then this shell reads only whole rs rows inside the record.
+    if rs.pieces != 1 || tokens != rows16 {
+        return Err(disagree(format!(
+            "cuts the rs rows into {} pieces of {} tokens, where this shell reads them whole \
+             until the rs buffer is a list shape of its own",
+            rs.pieces, rs.tokens_per_piece
+        )));
+    }
     let mut plane_at: Vec<Option<u64>> = vec![None; layout.planes.len()];
-    let mut slot = None;
-    for (n, planes) in rs_layers(trace).into_iter().enumerate() {
-        let id = RowId::Rs(u32::try_from(n).unwrap_or(u32::MAX));
+    for (id, row) in &rs.rows {
         let run = runs
             .iter()
-            .find(|run| run.row == id)
-            .ok_or_else(|| disagree(format!("lays no rs buffer row for replayed layer {n}")))?;
-        let room = recipe
-            .atoms
-            .get(&id)
-            .map_or(0, |atom| atom.bytes * atom.extent);
-        if run.pieces != 1 || slot.is_some_and(|s| s != run.slots[0]) {
-            return Err(disagree(format!(
-                "cuts or scatters the rs buffer rows (layer {n} in slots {:?}), where this \
-                 shell reads every layer's from one slot",
-                run.slots
-            )));
-        }
-        slot = Some(run.slots[0]);
-        let mut at = run.offset;
-        for (cache, role) in planes {
-            let Some(plane) = layout
-                .planes
-                .iter()
-                .position(|p| p.cache == cache && p.role == role)
-            else {
+            .find(|run| run.row == *id)
+            .ok_or_else(|| disagree(format!("lays no record slot for rs row {id:?}")))?;
+        for (at, plane) in row.planes.iter().enumerate() {
+            let Some(&mine) = layout.in_of.get(&plane.value.0) else {
                 return Err(disagree(format!(
-                    "buffers a {role:?} plane of cache row {cache} the shell does not"
+                    "buffers value {} in rs row {id:?}, which this shell does not buffer",
+                    plane.value.0
                 )));
             };
-            plane_at[plane] = Some(at);
-            at += rows * layout.planes[plane].row_bytes;
-        }
-        if at - run.offset > room {
-            return Err(disagree(format!(
-                "gives replayed layer {n} {room} bytes of rs rows, where this shell stores {}",
-                at - run.offset
-            )));
+            if layout.planes[mine].row_bytes != plane.bytes {
+                return Err(disagree(format!(
+                    "buffers value {} at {} bytes a token, where this shell stores {}",
+                    plane.value.0, plane.bytes, layout.planes[mine].row_bytes
+                )));
+            }
+            let offset = run.offset + row.plane_at(at, rs.tokens_per_piece);
+            match plane_at[mine] {
+                Some(held) if held != offset => {
+                    return Err(disagree(format!(
+                        "lays this shell's rs plane of value {} at two places",
+                        plane.value.0
+                    )));
+                }
+                _ => plane_at[mine] = Some(offset),
+            }
         }
     }
     let plane_at = plane_at
@@ -491,7 +533,9 @@ fn rs_rows(
         })
         .collect::<Result<Vec<_>>>()?;
     Ok(RsRows {
-        slot: slot.unwrap_or(0),
+        pieces: rs.pieces,
+        tokens_per_piece: tokens,
+        slots: rs.slots.clone(),
         plane_at,
     })
 }
@@ -511,6 +555,8 @@ pub struct Pools {
     /// Each distinct set of record slots a state row's pieces lie in.
     bands: Vec<Vec<u32>>,
     rs: Option<RsRows>,
+    /// How each kv space is paged.
+    spaces: Vec<SpacePaging>,
     disk: Option<Spill>,
     parked: Option<Spill>,
 }
@@ -549,8 +595,15 @@ impl Pools {
             },
             maps: None,
             shape_rows: [rows.kv_rows.clone(), rows.state_rows.clone()],
-            bands: rows.bands,
+            // A load without state rows still numbers each lane's seat: one
+            // band of one id.
+            bands: if rows.bands.is_empty() {
+                vec![vec![0]]
+            } else {
+                rows.bands
+            },
             rs: rows.rs,
+            spaces: rows.spaces,
             rows: rows.rows,
             pool,
             layout,
@@ -636,9 +689,9 @@ impl Pools {
             what: "the rs buffer rows of a load that buffers none".to_string(),
         })?;
         let fixed = *self.shape(FIXED)?;
-        let piece = *record.get(rs.slot as usize).ok_or(Fault::Ceiling {
+        let piece = *record.get(rs.slots[0] as usize).ok_or(Fault::Ceiling {
             what: "pieces of a record",
-            need: u64::from(rs.slot) + 1,
+            need: u64::from(rs.slots[0]) + 1,
             have: record.len() as u64,
         })?;
         let at = slot_at(&self.layout, &fixed, piece);
@@ -716,6 +769,67 @@ impl Pools {
                 .collect();
         }
         refs.iter().map(|&r| self.physical(LIST, r)).collect()
+    }
+
+    /// How kv space `space` is paged.
+    #[must_use]
+    pub fn space_paging(&self, space: usize) -> SpacePaging {
+        self.spaces.get(space).copied().unwrap_or(SpacePaging::List)
+    }
+
+    /// What a ring page id counts: `gcd(chunk, ring slot)` bytes.
+    fn ring_stride(&self) -> u64 {
+        self.layout
+            .ring
+            .map_or(256, |ring| gcd(self.layout.chunk_bytes, ring.slot_bytes))
+    }
+
+    /// A lane's ring pages as kernels address them, one a kv page in token
+    /// order: `refs` (ring slot refs, 0 the null chunk) as units of
+    /// [`Pools::ring_stride`], or, seat-addressed, seat `seat`'s ring slot
+    /// `page % cap` for each of `pages` pages.
+    pub fn ring_pages(&self, refs: &[u32], seat: Option<(u32, u32)>) -> Result<Vec<u32>> {
+        let ring = *self.shape(RING)?;
+        let stride = self.ring_stride();
+        let unit = |slot: u32| -> Result<u32> {
+            if slot == 0 {
+                return Ok(0);
+            }
+            let at = self.slot_offset(RING, slot)?;
+            self.pool
+                .admit(u32::try_from(at / self.layout.chunk_bytes).unwrap_or(u32::MAX))?;
+            Ok(u32::try_from(at / stride).unwrap_or(u32::MAX))
+        };
+        if let Some((slot, pages)) = seat
+            && refs.is_empty()
+        {
+            let cap = self.layout.ring_cap.max(1);
+            return (0..pages)
+                .map(|page| unit(ring.seat_ref(slot * cap + page % cap)?))
+                .collect();
+        }
+        refs.iter().map(|&r| unit(r)).collect()
+    }
+
+    /// The unit (`Layout::buffer_stride`) a folded ring in record slot
+    /// `slot` starts at, for the record whose physical pieces are `record`.
+    pub fn folded_unit(&self, record: &[u32], slot: u32) -> Result<u32> {
+        let fixed = *self.shape(FIXED)?;
+        let piece = *record.get(slot as usize).ok_or(Fault::Ceiling {
+            what: "pieces of a record",
+            need: u64::from(slot) + 1,
+            have: record.len() as u64,
+        })?;
+        let at = slot_at(&self.layout, &fixed, piece);
+        Ok(u32::try_from(at / self.layout.buffer_stride()).unwrap_or(u32::MAX))
+    }
+
+    /// Copies whole ring slots (slot refs) `(src, dst)`: a forked ring.
+    pub fn copy_ring(&mut self, frame: &mut Frame, moves: &[(u32, u32)]) -> Result<()> {
+        if moves.is_empty() {
+            return Ok(());
+        }
+        self.copy_whole(frame, RING, moves)
     }
 
     /// The physical page explicit write descriptor page `page` names.
@@ -888,6 +1002,7 @@ impl Pools {
         let mut compressed = Vec::new();
         let mut state_row = 0u64;
         let mut lane_slots = Vec::with_capacity(self.rows.len());
+        let mut band_of = Vec::with_capacity(self.rows.len());
         for row in &self.rows {
             pools.push(match *row {
                 Row::Compressed {
@@ -942,16 +1057,22 @@ impl Pools {
                         ))
                     };
                     lane_slots.push(None);
+                    band_of.push(None);
+                    let (stride, page_size) = match self.space_paging(space as usize) {
+                        SpacePaging::List => (list_bytes, self.paging.page_size),
+                        SpacePaging::Ring => (self.ring_stride(), self.paging.page_size),
+                        SpacePaging::Folded { tokens, .. } => (self.layout.buffer_stride(), tokens),
+                    };
                     CachePool::Kv(KvPool {
                         keys: plane(u64::from(kv_heads) * u64::from(head_dim))?,
                         values: plane(values_width)?,
                         page_indices: seat.page_indices,
                         page_indptr: seat.page_indptr,
-                        page_size: narrow(u64::from(self.paging.page_size)),
+                        page_size: narrow(u64::from(page_size)),
                         seq_stride: u64::from(kv_heads) * u64::from(head_dim),
                         head_stride: u64::from(head_dim),
                         q8,
-                        page_stride: [list_bytes, list_bytes],
+                        page_stride: [stride, stride],
                         plane_offset: [keys, values],
                     })
                 }
@@ -982,6 +1103,7 @@ impl Pools {
                         Dtype::U64,
                     );
                     state_row += 1;
+                    band_of.push(Some(band));
                     lane_slots.push(Some(
                         seats
                             .lane_bands
@@ -1007,6 +1129,7 @@ impl Pools {
             pools,
             compressed,
             lane_slots,
+            band_of,
         })
     }
 
@@ -1303,6 +1426,16 @@ impl Pools {
 
     /// Backs the pool's first `segments` segments.
     pub fn commit_segments(&mut self, segments: u32) -> Result<()> {
+        self.pool.commit_segments(segments)
+    }
+
+    /// Backs the segments the seat runs lie in: what a caller firing
+    /// directly asks.
+    pub fn commit_seats(&mut self) -> Result<()> {
+        let chunks = 1 + self.layout.seat_chunks();
+        let segments = chunks
+            .div_ceil(self.layout.segment_chunks.max(1))
+            .min(self.pool.segments());
         self.pool.commit_segments(segments)
     }
 

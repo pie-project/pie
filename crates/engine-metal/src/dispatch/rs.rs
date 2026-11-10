@@ -306,7 +306,7 @@ impl Run<'_> {
                 conv.dilation,
                 ext_y,
                 self.tensor(y),
-                self.rs_snapshots(),
+                self.rs_snapshots(conv.state),
             )?;
             return Ok(ext_y);
         }
@@ -321,7 +321,7 @@ impl Run<'_> {
             conv.conv_width,
             conv.dilation,
             ext_y,
-            self.rs_snapshots(),
+            self.rs_snapshots(conv.state),
         )?;
         self.rs_land(OP, seat, ext_y, y)?;
         Ok(ext_y)

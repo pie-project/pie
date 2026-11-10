@@ -1042,6 +1042,9 @@ impl Metal {
         // carry the same slot refs.
         let mut pages_of: Vec<Option<Vec<u32>>> = Vec::with_capacity(submission.lanes.len());
         let mut record_of: Vec<Option<Vec<u32>>> = Vec::with_capacity(submission.lanes.len());
+        let mut run_of: Vec<Option<Vec<u32>>> = Vec::with_capacity(submission.lanes.len());
+        let mut ring_of: Vec<Option<Vec<u32>>> = Vec::with_capacity(submission.lanes.len());
+        let mut ring_copies: Vec<(u32, u32)> = Vec::new();
         let mut forks: Vec<(u32, u32)> = Vec::new();
         for lane in &submission.lanes {
             pages_of.push(
@@ -1050,10 +1053,27 @@ impl Metal {
                     .find(|(shape, _)| *shape == crate::store::layout::LIST)
                     .map(|(_, refs)| refs.clone()),
             );
+            ring_of.push(
+                lane.tables
+                    .iter()
+                    .find(|(shape, _)| *shape == crate::store::layout::RING)
+                    .map(|(_, refs)| refs.clone()),
+            );
+            for &copy in &lane.kv.window_copies {
+                if !ring_copies.contains(&copy) {
+                    ring_copies.push(copy);
+                }
+            }
             let fixed = lane
                 .fixed
                 .iter()
                 .find(|(shape, _)| *shape == crate::store::layout::FIXED);
+            run_of.push(fixed.and_then(|(_, pieces)| {
+                pieces
+                    .iter()
+                    .any(|&[run, cow]| run != cow)
+                    .then(|| pieces.iter().map(|&[run, _]| run).collect())
+            }));
             record_of.push(fixed.map(|(_, pieces)| {
                 // `cow != run`: the record is copied before the fire, once
                 // for every lane of a group naming the same pair.
@@ -1068,6 +1088,8 @@ impl Metal {
         if !forks.is_empty() {
             shell.copy_state(&forks).map_err(fault)?;
         }
+        // A forked ring's slots copy before the fire reads them.
+        shell.copy_ring(&ring_copies).map_err(fault)?;
         let seated: Vec<Seated<'_>> = submission
             .lanes
             .iter()
@@ -1099,6 +1121,8 @@ impl Metal {
                     rs_snapshots: &lane.rs_snapshots,
                     refs: true,
                     record: record_of[at].as_deref(),
+                    record_run: run_of[at].as_deref(),
+                    ring: ring_of[at].as_deref().unwrap_or(&lane.kv.window),
                 })
             })
             .collect::<EngineResult<Vec<_>>>()?;

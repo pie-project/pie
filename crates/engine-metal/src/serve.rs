@@ -176,6 +176,13 @@ pub struct Seated<'a> {
     /// The record the fire reads and writes, a slot ref a piece
     /// (`Lane::fixed`'s cow side); `None`: `rs_slot`, else the seat's.
     pub record: Option<&'a [u32]>,
+    /// The record's run side where it differs from `record` (a group's
+    /// copy-on-write): a lane that folds nothing reads its state there
+    /// (CONTRACT-BC 15).
+    pub record_run: Option<&'a [u32]>,
+    /// The lane's ring slot refs, one a kv page in token order (0 the null
+    /// chunk), for the windowed spaces; empty seat-addresses them.
+    pub ring: &'a [u32],
 }
 
 impl<'a> Seated<'a> {
@@ -200,6 +207,8 @@ impl<'a> Seated<'a> {
             rs_snapshots: &[],
             refs: false,
             record: None,
+            record_run: None,
+            ring: &[],
         }
     }
 
@@ -654,7 +663,14 @@ impl PreparedLoad<'_> {
             let seated = paging_at(1, boot.slots)?;
             let bytes = [rows.list_bytes, rows.fixed_bytes];
             let chunk = rows.chunk_bytes;
-            let least = Layout::least_chunks(chunk, bytes, rows.pieces, seated.pages_per_slot);
+            let ring_chunks = if rows.ring_bytes > 0 {
+                rows.ring_cap
+                    .div_ceil(u32::try_from(chunk / rows.ring_bytes).unwrap_or(1).max(1))
+            } else {
+                0
+            };
+            let least = Layout::least_chunks(chunk, bytes, rows.pieces, seated.pages_per_slot)
+                + ring_chunks;
             // The compressor side planes hold a cell a token of every list
             // slot the pool could hold: a chunk costs its share of them.
             let side = rows.side_bytes * chunk.checked_div(rows.list_bytes).unwrap_or(0);
@@ -680,7 +696,8 @@ impl PreparedLoad<'_> {
                 rows.pieces,
                 boot.slots,
                 seated.pages_per_slot,
-            )?;
+            )?
+            .with_ring(rows.ring_bytes, rows.ring_cap, rows.ring_window)?;
             let pages = u64::from(layout.list.map_or(0, |list| list.per_chunk)) * u64::from(total);
             (
                 paging_at(pages, boot.slots)?,
@@ -1039,6 +1056,18 @@ impl Shell {
         let mut frame = self.device.frame()?;
         self.pools.evacuate(&mut frame, evacuation)?;
         frame.commit()
+    }
+
+    /// Copies whole ring slots (slot refs) before the next fire.
+    pub fn copy_ring(&mut self, moves: &[(u32, u32)]) -> Result<()> {
+        if moves.is_empty() || self.pools.layout().ring.is_none() {
+            return Ok(());
+        }
+        self.drain()?;
+        let mut frame = self.device.frame()?;
+        self.pools.copy_ring(&mut frame, moves)?;
+        self.grafted = Some(frame.commit_async(None)?);
+        Ok(())
     }
 
     /// See `Engine::copy_slots`.
@@ -2564,6 +2593,10 @@ impl Shell {
         let mut seats: Vec<Seat> = Vec::with_capacity(lanes.len());
         let mut kv_less: Vec<bool> = Vec::with_capacity(lanes.len());
         let mut tables: Vec<std::borrow::Cow<'_, [u32]>> = Vec::with_capacity(lanes.len());
+        // Per lane: its ring pages and its record (folded rings lie there).
+        let mut ring_tables: Vec<Vec<u32>> = Vec::with_capacity(lanes.len());
+        let mut lane_records: Vec<Vec<u32>> = Vec::with_capacity(lanes.len());
+        let has_ring = self.pools.layout().ring.is_some();
         let mut tokens: Vec<i32> = Vec::with_capacity(rows as usize);
         let mut positions: Vec<i32> = Vec::with_capacity(rows as usize);
         let mut rotations: Vec<i32> = Vec::with_capacity(rows as usize);
@@ -2577,7 +2610,7 @@ impl Shell {
         let mut rs_active = false;
         // Per fire lane, the rows inside it whose state lands in a slot of its
         // own and then those slots (`kernels_metal::ssm::Snapshots`).
-        let mut rs_snaps: Vec<i32> = Vec::new();
+        let mut snap_bands: Vec<Vec<i32>> = Vec::new();
         let mut snap_slots = 0u32;
         let mut request_of_token: Vec<i32> = Vec::with_capacity(rows as usize);
         let mut masks: Vec<crate::mask::LaneMask<'_>> = Vec::with_capacity(lanes.len());
@@ -2645,7 +2678,16 @@ impl Shell {
                 engine::fire::RsReset::Held => false,
             };
             let record = self.record_of(seated)?;
-            let band_ids = self.pools.band_ids(&record);
+            lane_records.push(record.clone());
+            ring_tables.push(if has_ring && !seated.kv_less {
+                let page_size = u64::from(self.pools.paging().page_size.max(1));
+                let after = u64::from(have) + u64::from(row.rows);
+                let pages = u32::try_from(after.div_ceil(page_size).max(1)).unwrap_or(u32::MAX);
+                let seat = (!seated.refs || seated.ring.is_empty()).then_some((lane.slot, pages));
+                self.pools.ring_pages(seated.ring, seat)?
+            } else {
+                Vec::new()
+            });
             state_top = record
                 .iter()
                 .map(|&id| id.saturating_add(1))
@@ -2718,24 +2760,8 @@ impl Shell {
                     .map_or(-1, |id| i32::try_from(id).unwrap_or(-1));
                 adapter_routes.extend(std::iter::repeat_n(id, row.rows as usize));
             }
-            {
-                let mut at = 0usize;
-                for (band, &width) in lane_bands.iter_mut().zip(&widths) {
-                    band.extend_from_slice(&band_ids[at..at + width as usize]);
-                    at += width as usize;
-                }
-            }
             // This lane's index: its seat was pushed above.
             let at_lane = seats.len() as i32 - 1;
-            {
-                let mut at = 0usize;
-                for (band, &width) in row_bands.iter_mut().zip(&widths) {
-                    for _ in 0..row.rows {
-                        band.extend_from_slice(&band_ids[at..at + width as usize]);
-                    }
-                    at += width as usize;
-                }
-            }
             {
                 const MAX: usize = kernels_metal::ssm::RS_SNAPSHOTS as usize;
                 let snaps = seated.rs_snapshots;
@@ -2757,30 +2783,44 @@ impl Shell {
                         ),
                     ));
                 }
-                if !snaps.is_empty() && record.len() != 1 {
-                    return Err(Fault::program(
-                        "serve::rs",
-                        format!(
-                            "lane {source} snapshots a record of {} pieces; a snapshot names \
-                             one slot ref (amendment 9) and lands only a one-piece record",
-                            record.len()
-                        ),
-                    ));
+                if !snaps.is_empty() && snap_bands.is_empty() {
+                    snap_bands = widths
+                        .iter()
+                        .map(|&w| vec![0i32; at_lane as usize * MAX * (1 + w as usize)])
+                        .collect();
                 }
-                if !snaps.is_empty() && rs_snaps.is_empty() {
-                    rs_snaps.resize(at_lane as usize * 2 * MAX, 0);
-                }
-                // Lane 0 leaves the table empty above, so emptiness cannot
+                // Lane 0 leaves the tables empty above, so emptiness cannot
                 // stand for "no lane has snapshots".
-                if !snaps.is_empty() || !rs_snaps.is_empty() {
-                    let mut entry = [0i32; 2 * MAX];
-                    for (at, snap) in snaps.iter().enumerate() {
-                        entry[at] = narrow(u64::from(snap.row));
-                        let slot = self.pools.state_slot(snap.slot, !seated.refs)?;
-                        entry[MAX + at] = narrow(u64::from(slot));
-                        snap_slots = snap_slots.max(slot.saturating_add(1));
+                if !snaps.is_empty() || !snap_bands.is_empty() {
+                    // Each snapshot's record, a physical id a piece
+                    // (`RsSnapshot::pieces`, its slot the first; a seat's
+                    // record where the lane is seat-addressed).
+                    let mut records = Vec::with_capacity(snaps.len());
+                    for snap in snaps {
+                        let record = if !seated.refs {
+                            self.pools.record(None, snap.slot)?
+                        } else if snap.pieces.is_empty() {
+                            vec![self.pools.state_slot(snap.slot, false)?]
+                        } else {
+                            self.pools.record(Some(&snap.pieces), lane.slot)?
+                        };
+                        snap_slots = record
+                            .iter()
+                            .map(|&id| id.saturating_add(1))
+                            .fold(snap_slots, u32::max);
+                        records.push(self.pools.band_ids(&record));
                     }
-                    rs_snaps.extend(entry);
+                    let mut at = 0usize;
+                    for (band, &w) in snap_bands.iter_mut().zip(&widths) {
+                        let w = w as usize;
+                        let mut entry = vec![0i32; MAX * (1 + w)];
+                        for (n, (snap, ids)) in snaps.iter().zip(&records).enumerate() {
+                            entry[n] = narrow(u64::from(snap.row));
+                            entry[MAX + n * w..MAX + (n + 1) * w].copy_from_slice(&ids[at..at + w]);
+                        }
+                        band.extend(entry);
+                        at += w;
+                    }
                 }
             }
             if !matches!(seated.rs, engine::fire::RsVerb::Fold) {
@@ -2846,6 +2886,32 @@ impl Shell {
                     "recurrent seat: lane {} rows {} replay {} commit {} gather {:?} scatter {:?}",
                     row.source, row.rows, plan.replay, plan.commit, plan.gather, plan.scatter
                 );
+            }
+            // The state the lane's kernels read and fold: the record it
+            // writes, but a lane of a copy-on-write group that folds nothing
+            // reads the run side, which no other lane writes this fire
+            // (CONTRACT-BC 15); its buffered rows still land in `record`.
+            let state = match seated.record_run {
+                Some(run) if plan.commit == 0 => self.pools.record(Some(run), lane.slot)?,
+                _ => record.clone(),
+            };
+            state_top = state
+                .iter()
+                .map(|&id| id.saturating_add(1))
+                .fold(state_top, u32::max);
+            let band_ids = self.pools.band_ids(&state);
+            {
+                let mut at = 0usize;
+                for ((lanes_band, rows_band), &width) in
+                    lane_bands.iter_mut().zip(row_bands.iter_mut()).zip(&widths)
+                {
+                    let ids = &band_ids[at..at + width as usize];
+                    lanes_band.extend_from_slice(ids);
+                    for _ in 0..row.rows {
+                        rows_band.extend_from_slice(ids);
+                    }
+                    at += width as usize;
+                }
             }
             rs_plans.push(plan);
             if !seated.positions.is_empty() && seated.positions.len() != lane.tokens.len() {
@@ -2947,7 +3013,7 @@ impl Shell {
         // A caller firing directly (every lane seat-addressed) has no
         // runtime to commit ahead of it: the segments its seats touch back now.
         if lanes.iter().all(|seated| !seated.refs) {
-            self.pools.commit_for(demand)?;
+            self.pools.commit_seats()?;
         }
         self.pools.admit(demand)?;
 
@@ -2958,15 +3024,44 @@ impl Shell {
             self.pools.clear(&record)?;
         }
         let slot_ids: Vec<i32> = lane_bands.concat();
+        let rs_snaps: Vec<i32> = snap_bands.concat();
         let slot_of_row: Vec<i32> = row_bands.concat();
 
         let indptr_host = kv::indptr(&seats)?;
         let table_refs: Vec<&[u32]> = tables.iter().map(std::convert::AsRef::as_ref).collect();
-        let mut geometries = (0..self.spaces)
-            .map(|_| kv::geometry_with(&paging, &seats, &table_refs))
-            .collect::<Result<Vec<_>>>()?;
+        let ring_refs: Vec<&[u32]> = ring_tables.iter().map(Vec::as_slice).collect();
+        let mut geometries = Vec::with_capacity(self.spaces);
+        for space in 0..self.spaces {
+            geometries.push(match self.pools.space_paging(space) {
+                crate::store::SpacePaging::List => kv::geometry_with(&paging, &seats, &table_refs)?,
+                crate::store::SpacePaging::Ring => kv::geometry_with(&paging, &seats, &ring_refs)?,
+                crate::store::SpacePaging::Folded { tokens, slot } => {
+                    // Every page of a folded ring is the record's slot: token
+                    // `t` at row `t % tokens` of it.
+                    let folded = Paging {
+                        page_size: tokens,
+                        pages_per_slot: paging.context().div_ceil(tokens.max(1)).max(1),
+                        ..paging
+                    };
+                    let units = seats
+                        .iter()
+                        .zip(&lane_records)
+                        .map(|(seat, record)| {
+                            let after = u64::from(seat.have) + u64::from(seat.rows);
+                            let pages = after.div_ceil(u64::from(tokens.max(1))).max(1);
+                            Ok(vec![self.pools.folded_unit(record, slot)?; pages as usize])
+                        })
+                        .collect::<Result<Vec<_>>>()?;
+                    let refs: Vec<&[u32]> = units.iter().map(Vec::as_slice).collect();
+                    kv::geometry_with(&folded, &seats, &refs)?
+                }
+            });
+        }
         if writes.iter().any(Option::is_some) {
-            for geometry in &mut geometries {
+            for (space, geometry) in geometries.iter_mut().enumerate() {
+                if self.pools.space_paging(space) != crate::store::SpacePaging::List {
+                    continue;
+                }
                 for (row, stated) in writes.iter().enumerate() {
                     let Some((page, offset)) = *stated else {
                         continue;
@@ -3473,6 +3568,7 @@ impl Shell {
                 mask_stride: bound.mask_stride,
             },
             rs_snaps: bound.rs_snaps,
+            rs_snap_bands: bound.rs_snap_bands.clone(),
             rs: if rs_active {
                 let (Some(layout), Some(buffers), Some(scratch)) =
                     (&self.rs_layout, &self.rs_buffers, &self.rs_scratch)
