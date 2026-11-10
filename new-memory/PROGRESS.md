@@ -338,3 +338,14 @@ The `new-memory/` directory is bookkeeping and is removed before anything lands 
   every lane of a multi-lane group names the record the group writes; `sets_per_working_set() == 1`.
 - Contract amendment 12 updated; engine must fold lane 0 only after the group's other lanes read the state.
 - Verified: `cargo check` runtime, engine, worker; RW2 ran store::rs / pipeline::fire::rs / store::shared (21).
+
+### M22 — 2026-11-10: P3fix2 merged (equal fixed-record pieces)
+- `sc/p3fix2-equal-pieces` (39c0b17ae): a fixed row larger than a slot is cut on its atom axis into the fewest equal
+  pieces (whole grains, last padded as waste), each in its own slot at one common offset; rows that fit stay whole and
+  share slots. `SlotLayout::Fixed` exposes `FixedRun { row, pieces, atoms_per_piece, offset, slots }` (fills P5
+  `StateRows` / P6 `state_map` 1:1); `per_rank` gives `RankRun`. Waste: nemotron3-super 1.48% -> 0.53% server,
+  4.04% -> 0.54% Metal; qwen3-next Metal 6.84% -> 1.36%. Regressions on Metal for hybrids whose C < 2 pieces
+  (qwen35-397b 12.4% -> 34.1%, qwen35-122b e4m3 11.8% -> 34.2%, glm53-flash-mtp 4.0% -> 16.8%).
+- Follow-up: the 1 MiB min-piece rule comes from a CUDA prefill-GDN observation; measure on Metal and move the floor
+  into DeviceProfile (smaller on Metal would recover these regressions).
+- Verified: `pie-poem-compiler --lib chunk`.
