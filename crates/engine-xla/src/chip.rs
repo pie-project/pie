@@ -399,6 +399,7 @@ mod tests {
         want.chunks.block_rows = 256;
         want.chunks.decode_pages = 64;
         want.rope_flat_rows = 1024;
+        want.moe_gmm_run = 4;
         assert_eq!(
             kernels_xla::tuning::Tuning::on(&profile, Tpu::of("TPU v6 lite").vmem_bytes()),
             want
