@@ -643,6 +643,9 @@ struct Shelf {
     slots: u32,
     per_chunk: u32,
     chunks: Vec<Option<crate::device::Pinned>>,
+    /// The chunks a background thread pins ahead of the copies, in order,
+    /// each as it lands ([`Shelf::pin_ahead`]); `None` where one failed.
+    ahead: Option<std::sync::mpsc::Receiver<(usize, Option<crate::device::Pinned>)>>,
 }
 
 impl Shelf {
@@ -655,11 +658,90 @@ impl Shelf {
             slots,
             per_chunk,
             chunks: (0..slots.div_ceil(per_chunk)).map(|_| None).collect(),
+            ahead: None,
+        }
+    }
+
+    /// The bytes chunk `chunk` pins.
+    fn chunk_bytes(&self, chunk: u32) -> usize {
+        let slot_bytes: u64 = self.planes.iter().sum();
+        let held = (self.slots - chunk * self.per_chunk).min(self.per_chunk);
+        usize::try_from(u64::from(held) * slot_bytes).unwrap_or(usize::MAX)
+    }
+
+    /// Starts a thread that pins every chunk, lowest first, so a copy finds
+    /// its chunk pinned and page-locks nothing itself: locking a chunk takes
+    /// a quarter of a second, on the thread every fire is enqueued from. A
+    /// copy that needs a chunk not yet pinned waits for it. Without a device
+    /// to bind, or a thread, the chunks are pinned as copies touch them.
+    fn pin_ahead(&mut self) {
+        let Ok(ordinal) = crate::device::ctx::current() else {
+            return;
+        };
+        let sizes: Vec<usize> = (0..self.chunks.len() as u32)
+            .map(|chunk| self.chunk_bytes(chunk))
+            .collect();
+        let (send, pinned) = std::sync::mpsc::channel();
+        let spawned = std::thread::Builder::new()
+            .name("pie-host-tier-pin".to_string())
+            .spawn(move || {
+                if crate::device::ctx::bind_thread(ordinal).is_err() {
+                    return;
+                }
+                for (chunk, bytes) in sizes.into_iter().enumerate() {
+                    let held = huge_tier(bytes)
+                        .or_else(|| crate::device::Pinned::mapped_uninit(bytes).ok());
+                    let failed = held.is_none();
+                    if send.send((chunk, held)).is_err() || failed {
+                        return;
+                    }
+                }
+            });
+        if spawned.is_ok() {
+            self.ahead = Some(pinned);
+        }
+    }
+
+    /// Takes the chunks the background thread has pinned so far; waits for
+    /// chunk `until` where one is given and the thread still pins.
+    fn take_pinned(&mut self, until: Option<u32>) {
+        let Some(ahead) = self.ahead.as_ref() else {
+            return;
+        };
+        let mut closed = false;
+        loop {
+            let waits = until.is_some_and(|chunk| self.chunks[chunk as usize].is_none());
+            let next = if waits {
+                ahead.recv().ok()
+            } else {
+                match ahead.try_recv() {
+                    Ok(next) => Some(next),
+                    Err(std::sync::mpsc::TryRecvError::Empty) => break,
+                    Err(std::sync::mpsc::TryRecvError::Disconnected) => None,
+                }
+            };
+            match next {
+                Some((chunk, Some(pinned))) => {
+                    if self.chunks[chunk].is_none() {
+                        self.chunks[chunk] = Some(pinned);
+                    }
+                }
+                // A chunk the thread could not pin, or the thread gone: the
+                // copy that needs one pins it itself, and says why not.
+                Some((_, None)) | None => {
+                    closed = true;
+                    break;
+                }
+            }
+        }
+        if closed {
+            self.ahead = None;
         }
     }
 
     /// Pins the chunks that hold `slots`.
     fn back(&mut self, slots: impl IntoIterator<Item = u32>, what: &'static str) -> Result<()> {
+        self.take_pinned(None);
         let slot_bytes: u64 = self.planes.iter().sum();
         for slot in slots {
             if slot >= self.slots {
@@ -670,6 +752,9 @@ impl Shelf {
                 });
             }
             let chunk = slot / self.per_chunk;
+            if self.chunks[chunk as usize].is_none() {
+                self.take_pinned(Some(chunk));
+            }
             if self.chunks[chunk as usize].is_none() {
                 let held = (self.slots - chunk * self.per_chunk).min(self.per_chunk);
                 let bytes = usize::try_from(u64::from(held) * slot_bytes).unwrap_or(usize::MAX);
@@ -2845,12 +2930,17 @@ impl Pools {
     }
 
     /// Seats the host tier of `budget` bytes: as many whole chunks of the
-    /// state pool's size, pinned a [`SHELF_CHUNK`] at a time as copies first
-    /// touch them.
+    /// state pool's size, pinned a [`SHELF_CHUNK`] at a time by a thread of
+    /// its own from the seating on ([`Shelf::pin_ahead`]), so the whole
+    /// budget is page-locked soon after and no copy locks a page itself.
     pub fn seat_tier(&mut self, budget: u64) {
         let chunk = self.chunks.layout().chunk_bytes;
         let chunks = u32::try_from(budget.checked_div(chunk).unwrap_or(0)).unwrap_or(u32::MAX);
-        self.tier = (chunks > 0).then(|| Shelf::new(vec![chunk], chunks));
+        self.tier = (chunks > 0).then(|| {
+            let mut shelf = Shelf::new(vec![chunk], chunks);
+            shelf.pin_ahead();
+            shelf
+        });
     }
 
     /// The host tier's chunks.
