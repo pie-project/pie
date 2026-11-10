@@ -733,3 +733,13 @@ The `new-memory/` directory is bookkeeping and is removed before anything lands 
   bitwise with negative controls. PLE rows streamed (misses: flush + read token ids + host-visible stage —
   synchronous on fires with misses; all-resident fast path, Vulkan command-buffer recording kept).
 - Snapshots not served (rs_snapshots 0) -> parity gap. Experts not started. Runtime e2e not run.
+
+### M54 — 2026-11-10: held weights keep no host copy, arm once (CUDA)
+- `sc/l40s-held-weights` (213b3fcd0): `Residency.weights_held` (worker: held unless weight_streaming = "on"); a held
+  load leaves streamed tables / routed banks in the serving file mapping (not device, not pinned), fires nothing until
+  the first residency, which fills every slot from the file and arms once. Decoded-at-load planes fall back to a
+  pinned copy (logged). Streaming loads refuse up front when the pinned miss copy exceeds the machine's free memory.
+- Boot (L40S): nemotron mini 5120 tokens 282.6 s -> 6.3 s; dsv4 mini 256 tokens 102.7 s -> 15.2 s; logits = base;
+  pinned host bytes 609 MiB / 4850 MiB -> 0.
+- Open: auto + pool can't seat -> runtime streams but engine was told held (refuses non-held) -> must build the miss
+  copy lazily (assigned). Peak RSS on a real-size model, HMM branch, refusal message, real imported files: untested.
