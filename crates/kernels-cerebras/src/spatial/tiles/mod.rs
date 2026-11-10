@@ -43,13 +43,17 @@ impl<'a> Param<'a> {
         match self.dtype {
             Dtype::Bf16 => Ok(self
                 .bytes
-                .chunks_exact(2)
-                .map(|b| f32::from_bits(u32::from(u16::from_le_bytes([b[0], b[1]])) << 16))
+                .as_chunks::<2>()
+                .0
+                .iter()
+                .map(|b| f32::from_bits(u32::from(u16::from_le_bytes(*b)) << 16))
                 .collect()),
             Dtype::F32 => Ok(self
                 .bytes
-                .chunks_exact(4)
-                .map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+                .as_chunks::<4>()
+                .0
+                .iter()
+                .map(|b| f32::from_le_bytes(*b))
                 .collect()),
             d => Err(format!("a {d:?} param where bf16 or f32 is cut")),
         }
@@ -60,13 +64,17 @@ impl<'a> Param<'a> {
         match self.dtype {
             Dtype::Bf16 => Ok(self
                 .bytes
-                .chunks_exact(2)
-                .map(|b| u16::from_le_bytes([b[0], b[1]]))
+                .as_chunks::<2>()
+                .0
+                .iter()
+                .map(|b| u16::from_le_bytes(*b))
                 .collect()),
             Dtype::F32 => Ok(self
                 .bytes
-                .chunks_exact(4)
-                .map(|b| (u32::from_le_bytes([b[0], b[1], b[2], b[3]]) >> 16) as u16)
+                .as_chunks::<4>()
+                .0
+                .iter()
+                .map(|b| (u32::from_le_bytes(*b) >> 16) as u16)
                 .collect()),
             d => Err(format!("a {d:?} param where bf16 or f32 is cut")),
         }
@@ -80,7 +88,13 @@ pub fn f16(x: f32) -> u16 {
     let exp = ((b >> 23) & 0xff) as i32;
     let man = b & 0x7f_ffff;
     if exp == 0xff {
-        return sign | 0x7c00 | if man != 0 { 0x200 | (man >> 13) as u16 } else { 0 };
+        return sign
+            | 0x7c00
+            | if man != 0 {
+                0x200 | (man >> 13) as u16
+            } else {
+                0
+            };
     }
     let e = exp - 127 + 15;
     if e >= 0x1f {
@@ -211,8 +225,8 @@ mod tests {
             (5.9604645e-08, 0x0001),
             (2.9802322e-08, 0x0000),
             (1.0009766, 0x3c01),
-            (1.00048828125, 0x3c00),
-            (1.00146484375, 0x3c02),
+            (f32::from_bits(0x3f80_1000), 0x3c00),
+            (f32::from_bits(0x3f80_3000), 0x3c02),
             (0.0, 0),
         ] {
             assert_eq!(f16(x), h, "{x}");

@@ -567,10 +567,16 @@ mod tests {
             ..Ask::default()
         };
         let full = plan(&t, &ask(None)).unwrap().plan;
-        assert_eq!((full.contract.positions, full.contract.rope_levels), (16384, 5));
+        assert_eq!(
+            (full.contract.positions, full.contract.rope_levels),
+            (16384, 5)
+        );
         assert_eq!(full.levers, "NPX:1,DIAG:0,TSTAMP:0,XKEEP:0,HACC16:0,ATTL:2");
         let short = plan(&t, &ask(Some(4096))).unwrap().plan;
-        assert_eq!((short.contract.positions, short.contract.rope_levels), (4096, 4));
+        assert_eq!(
+            (short.contract.positions, short.contract.rope_levels),
+            (4096, 4)
+        );
         let e = plan(&t, &ask(Some(1 << 20))).unwrap_err();
         assert!(e.contains("of at most 16384"), "{e}");
     }

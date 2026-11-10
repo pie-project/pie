@@ -5,7 +5,7 @@ for comparing two trees (compare.py): before and after a change that must not ch
 A config's directory holds:
 - plan/       wafer-compile plan's plan.json and tiling.json (the config's model or shape, preset and overrides);
 - prep/       (tiny only) the prep the tree's prep script writes from the frozen tiny checkpoint for that plan;
-- build/      build.py's output for the plan (layout.csl, one source a PE kind, compiled/ with the artifact) and
+- build/      wafer-compile build's output for the plan in compiled/ (layout/ with layout.csl and one source a PE kind, the artifact) and
               params.used (the cslc params compare.py evaluates the layout with: none, every param a literal);
 - host/       the Rust host (examples/artifact_baseline.rs: the artifact read back, ArtifactModel::open + one greedy launch
               on a recording device): pe.tsv (every PE's words of every symbol, hashed), rcfg.txt (every PE's rcfg
@@ -74,7 +74,8 @@ def capture(c, top, B, G):
            cwd=os.path.dirname(os.path.join(TOOLS, c["prep"][0])), log=os.path.join(d, "prep.log"))
     # the build
     b = os.path.join(d, "build")
-    sh([PY, os.path.join(TOOLS, "build.py"), b, os.path.join(pl, "plan.json"), c["levers"]], cwd=TOOLS)
+    lev = ["--levers", c["levers"]] if c["levers"] else []
+    sh([G, "build", "--plan", os.path.join(pl, "plan.json"), "--out", os.path.join(b, "compiled")] + lev)
     open(os.path.join(b, "params.used"), "w").write("\n")  # (every param a literal: the link takes none)
     # the Rust host, on the build's artifact
     sh([B, os.path.join(b, "compiled"), prep, prefix, str(c["vocab"]), os.path.join(d, "host")], log=os.path.join(d, "host.log"))

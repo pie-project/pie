@@ -179,9 +179,19 @@ const PRESETS: &[Row<7>] = &[
     // name, [PX, PY, NU, HR, NEG, G2, G2W], overrides, levers
     ("e2b", [256, 128, 7, 1130, 32, 16, 24], "", "WSPEC:2"),
     // E4B as on the chip (request 0974): PYW 128, NES 4, NEG 20
-    ("e4b", [256, 160, 7, 1130, 20, 16, 24], "", "DIAG:0,WSPEC:0,w.FIFOW:16"),
+    (
+        "e4b",
+        [256, 160, 7, 1130, 20, 16, 24],
+        "",
+        "DIAG:0,WSPEC:0,w.FIFOW:16",
+    ),
     // E4B at its first staged params (PYW 160, NEG 16)
-    ("e4b-meta", [256, 160, 7, 1130, 20, 16, 24], "PYW=160,NEG=16", "w.FIFOW:16"),
+    (
+        "e4b-meta",
+        [256, 160, 7, 1130, 20, 16, 24],
+        "PYW=160,NEG=16",
+        "w.FIFOW:16",
+    ),
     ("tiny", [8, 8, 5, 32, 4, 2, 2], "", ""),
 ];
 

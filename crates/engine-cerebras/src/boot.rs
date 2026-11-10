@@ -9,5 +9,8 @@ pub fn open_engine(
     config_bytes: &[u8],
     contract_for: ContractFor,
 ) -> Result<Box<dyn engine::Engine>, String> {
-    Ok(Box::new(Spatial::new(Config::parse(config_bytes)?, contract_for)))
+    Ok(Box::new(Spatial::new(
+        Config::parse(config_bytes)?,
+        contract_for,
+    )))
 }

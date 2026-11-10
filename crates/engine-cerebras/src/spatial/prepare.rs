@@ -68,7 +68,10 @@ impl Params for Landed {
 /// Lands every param of `trace` from `checkpoint` through the import contract, on the host.
 pub fn land(trace: &Trace, contract: &ModelContract, checkpoint: &Path) -> R<Landed> {
     let (metadata, snapshot) = if checkpoint.is_dir() {
-        (parse_metadata(checkpoint).map_err(|e| e.to_string())?, checkpoint)
+        (
+            parse_metadata(checkpoint).map_err(|e| e.to_string())?,
+            checkpoint,
+        )
     } else {
         (
             zt::parse(checkpoint).map_err(|e| e.to_string())?,
@@ -107,7 +110,13 @@ fn io(p: &Path) -> impl Fn(std::io::Error) -> String + '_ {
 /// A file name part of the model's name.
 fn slug(name: &str) -> String {
     name.chars()
-        .map(|c| if c.is_ascii_alphanumeric() || c == '.' { c } else { '-' })
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '.' {
+                c
+            } else {
+                '-'
+            }
+        })
         .collect()
 }
 
@@ -155,7 +164,10 @@ impl Cache {
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::rename(&tmp, &dir).map_err(io(&dir))?;
         std::fs::write(dir.join("READY"), b"").map_err(io(&dir))?;
-        for e in std::fs::read_dir(&self.root).map_err(io(&self.root))?.flatten() {
+        for e in std::fs::read_dir(&self.root)
+            .map_err(io(&self.root))?
+            .flatten()
+        {
             let n = e.file_name().to_string_lossy().to_string();
             if n.starts_with(&stem) && e.path() != dir {
                 tracing::info!(entry = %n, "cerebras cache: a stale entry dropped");
@@ -229,8 +241,7 @@ pub fn prepare(
         Some(w) => (Weights::parse(w)?, None),
         None => {
             let stamp = checkpoint_stamp(checkpoint)?;
-            let mut tiling =
-                kernels_cerebras::spatial::family::of(plan.family).tiling(&plan)?;
+            let mut tiling = kernels_cerebras::spatial::family::of(plan.family).tiling(&plan)?;
             tiling["checkpoint"] = stamp.into();
             tiling["format"] = TILES.into();
             let text = serde_json::to_string(&tiling).map_err(|e| e.to_string())?;
@@ -239,7 +250,10 @@ pub fn prepare(
                 let t0 = std::time::Instant::now();
                 let landed = land(trace, contract, checkpoint)?;
                 tiles::stage(&plan, &landed, dir)?;
-                tracing::info!(s = t0.elapsed().as_secs_f64(), "cerebras: the checkpoint cut");
+                tracing::info!(
+                    s = t0.elapsed().as_secs_f64(),
+                    "cerebras: the checkpoint cut"
+                );
                 Ok(())
             };
             match cfg.wafer.tiles {
@@ -253,7 +267,10 @@ pub fn prepare(
                         .tempdir_in(&cache.root)
                         .map_err(|e| e.to_string())?;
                     cut(tmp.path())?;
-                    (Weights::parse(&tmp.path().display().to_string())?, Some(tmp))
+                    (
+                        Weights::parse(&tmp.path().display().to_string())?,
+                        Some(tmp),
+                    )
                 }
             }
         }
@@ -287,7 +304,9 @@ fn checkpoint_stamp(checkpoint: &Path) -> R<String> {
             .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
             .map_or(0, |d| d.as_secs());
         files.push((
-            p.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default(),
+            p.file_name()
+                .map(|n| n.to_string_lossy().to_string())
+                .unwrap_or_default(),
             m.len(),
             mtime,
         ));

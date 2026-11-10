@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """prep_gemma12.py <model dir> <outdir> <golden json> <plan dir> [prefix]: a Gemma 4 12B-shaped checkpoint
-(bf16 safetensors; no PLE, no shared KV, attention_k_eq_v) in run_gemma12.py's prep format (src/spatial/README.md, Gemma 4 12B),
+(bf16 safetensors; no PLE, no shared KV, attention_k_eq_v) in the wafer program tile format (src/spatial/README.md, Gemma 4 12B),
 cut as the plan in <plan dir> says (`wafer-compile plan`'s tiling.json).
 Units of K layers (S .. S G), unit u = layers K u .. K u + K - 1.
 - Rows: attention rows r < RA hold Hc A hidden dims, plain rows Hc W; row r's dims are [off_r, off_r + Hc_r) of the

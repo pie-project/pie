@@ -3,7 +3,7 @@
 Any Qwen3.5, or dense (every layer attention, no output gate, plain norm weights, full RoPE: Qwen3, Llama 3; q / k
 norms where the checkpoint has them, a scaled rotation's frequencies from the plan's FREQS)
 checkpoint (bf16 or f32 safetensors, the VL layout "model.language_model." or text-only "model.") in
-the wafer program prep format (the files PIE_CEREBRAS_WEIGHTS=<outdir>:<prefix> names; kernels-cerebras src/spatial/weights.rs
+the wafer program tile format (what `[engine.debug] weights = "<outdir>:<prefix>"` places; kernels-cerebras src/spatial/weights.rs
 copies them onto the wafer), cut as the plan in <plan dir> says (`wafer-compile plan`'s tiling.json). Units of PX x PY weight PEs, K layers each (the model's layer kinds, GDN / attention by
 `layer_types`, the same K-layer pattern in every unit), UNX x UNY units, the head PY / 2 columns of
 2 Hc dims by HR rows of VR vocabulary rows; lm_head = the embedding when tied. Weights as f16 bits.

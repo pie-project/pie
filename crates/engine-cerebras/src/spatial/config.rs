@@ -120,10 +120,11 @@ impl Config {
         let doc: toml::Table = text
             .parse()
             .map_err(|e| format!("the cerebras boot config is not TOML: {e}"))?;
-        let table = doc.get("cerebras").cloned().unwrap_or_else(|| toml::Value::Table(Default::default()));
-        table
-            .try_into()
-            .map_err(|e| format!("[cerebras]: {e}"))
+        let table = doc
+            .get("cerebras")
+            .cloned()
+            .unwrap_or_else(|| toml::Value::Table(Default::default()));
+        table.try_into().map_err(|e| format!("[cerebras]: {e}"))
     }
 
     /// The boot document of this config.
@@ -153,9 +154,11 @@ mod tests {
     fn defaults_and_round_trip() {
         let c = of("").unwrap();
         assert_eq!(c, Config::default());
-        let c = of("[cerebras]\ncmaddr = \"10.0.0.1:9000\"\nlookahead = 32\nasync = true\n\
+        let c = of(
+            "[cerebras]\ncmaddr = \"10.0.0.1:9000\"\nlookahead = 32\nasync = true\n\
                     [cerebras.wafer]\npreset = \"9b\"\nbuild = \"never\"\n\
-                    [cerebras.toolchain]\ncompile_timeout = 600\n")
+                    [cerebras.toolchain]\ncompile_timeout = 600\n",
+        )
         .unwrap();
         assert_eq!(c.lookahead, Some(32));
         assert_eq!(c.wafer.build, Build::Never);
@@ -169,6 +172,8 @@ mod tests {
     fn nothing_reads_the_environment() {
         let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
         let mut hits = Vec::new();
+        // (assembled, so this test does not find itself)
+        let tools = ["\"tools", "/wafer"].concat();
         for dir in [root.join("src"), root.join("../kernels-cerebras/src")] {
             let mut stack = vec![dir];
             while let Some(d) = stack.pop() {
@@ -181,10 +186,10 @@ mod tests {
                     let text = std::fs::read_to_string(&p).unwrap_or_default();
                     for (n, line) in text.lines().enumerate() {
                         let code = line.split("//").next().unwrap_or("");
-                        let env = ["var(", "var_os("].iter().any(|v| {
-                            code.contains(&format!("env::{v}\"PIE_CEREBRAS"))
-                        });
-                        if env || code.contains("\"tools/wafer") {
+                        let env = ["var(", "var_os("]
+                            .iter()
+                            .any(|v| code.contains(&format!("env::{v}\"PIE_CEREBRAS")));
+                        if env || code.contains(&tools) {
                             hits.push(format!("{}:{}: {line}", p.display(), n + 1));
                         }
                     }

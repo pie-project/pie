@@ -36,16 +36,22 @@ def code(path):
 def build(a, b, cfg):
     """The differences between two configs' builds (a list of strings, empty when they compile the same)."""
     out = []
-    da, db = os.path.join(a, cfg, "build"), os.path.join(b, cfg, "build")
+
+    def layout(top):
+        """A build's layout directory: build.py copied it to the build's top, wafer-compile keeps it in compiled/layout."""
+        return top if os.path.exists(os.path.join(top, "layout.csl")) else os.path.join(top, "compiled", "layout")
+
+    ta_, tb_ = os.path.join(a, cfg, "build"), os.path.join(b, cfg, "build")
+    da, db = layout(ta_), layout(tb_)
     if not os.path.exists(os.path.join(db, "layout.csl")):
         return ["no candidate build"]
 
-    def ev(d):
-        used = os.path.join(d, "params.used")
+    def ev(d, top):
+        used = os.path.join(top, "params.used")
         p = layout_eval.parse_params(open(used).read()) if os.path.exists(used) else {}
         return layout_eval.tiles(open(os.path.join(d, "layout.csl")).read(), p)
 
-    (ta, ea), (tb, eb) = ev(da), ev(db)
+    (ta, ea), (tb, eb) = ev(da, ta_), ev(db, tb_)
     if ea != eb:
         out.append(f"exports: -{sorted(set(ea) - set(eb))} +{sorted(set(eb) - set(ea))}")
     pes = sorted(set(ta) | set(tb))

@@ -64,7 +64,7 @@ violations; the chip did not.
   send colour; that hung the row reductions. Never let two input queues share a colour, even
   briefly (`bind_iqs`).
 - **Keep at least 768 B of stack room in every image.** The linker does not count the stack, which
-  grows down from 0xC000. `tools/wafer/chk_stack.py` checks this after every link.
+  grows down from 0xC000. `wafer-compile link` checks this after every link.
 - **Name chip payloads `*_ieee`.** The bench harness otherwise compiles with
   `--fp16-format=bf16`, which turns the f16 kernels into garbage.
 
@@ -87,7 +87,7 @@ and Qwen3-8B.
 | Qwen3.5-9B | wafer program (wl11: 8 units 256 x 256, K 4) | 1,961 | 1,908 (0.5241 ms/step, 97.3%) | loop 381.7k cycles; GDN 11.1k / attention 11.45k a layer |
 | Qwen3.5-4B | wafer program, the 9B geometry (Hc 10, Ic 36) | 2,057 | 1,998 (0.5005 ms/step, 97.1%) | GDN 10.6k / attention 10.96k |
 | Qwen3.5-0.8B | wafer program, 6 units of 256 x 128 (Hc 8, Ic 14, NE 128) | 3,390 | 3,286 (0.3043 ms/step, 96.9%) | GDN 8.2k / attention 9.2k |
-| Qwen3-8B | wafer program (9 units 256 x 228, Hc 18, K 4, gap slot; GATE 0, SLW 1) | 1,825 (0.548 ms, G2 12) | 1,811 (0.5521 ms, 99.3%, L64, G2 12) | greedy 512 and TF 512 golden; Pie 12 of 12 reps golden (G2 16 and 12). `PIE_CEREBRAS_WEIGHTS=<prep>:q84_` (plan `G2=12,WL=1`). The removed per-model layout: 1,642 |
+| Qwen3-8B | wafer program (9 units 256 x 228, Hc 18, K 4, gap slot; GATE 0, SLW 1) | 1,825 (0.548 ms, G2 12) | 1,811 (0.5521 ms, 99.3%, L64, G2 12) | greedy 512 and TF 512 golden; Pie 12 of 12 reps golden (G2 16 and 12). Preset `q3-8b`. The removed per-model layout: 1,642 |
 | Gemma 4 E2B | wafer program Gemma (7 units 256 x 128, Hc 12, K 5; WSPEC 2) | 1,451 (0.6894 ms) | 1,436 (0.6962 ms, 99.0%) | greedy 720 golden; TF 256 0 mismatches |
 | Gemma 4 E4B | wafer program Gemma (7 units 256 x 160, Hc 16, K 6; KV on 128 rows) | 1,127 (0.8873 ms) | 1,118 (0.8944 ms, 99.2%) | TF 165 and 640 (past the 512 window) 0 mismatches, greedy x 2 golden, Pie 3 reps golden (0974); global context 2,560 positions (NEG 20 x 128) |
 | Gemma 4 12B | wafer program 12B (8 units 344 x 283: 128 attention rows Hc 12, plain rows Hc 15; K 6; RING 1) | 1,057 (0.9462 ms) | 1,055 (0.9483 ms, 99.8%) | TF 212 0 mismatches, greedy golden; TF 1,600 past the window: 3 bf16 near-ties (below); global context 4,096 |
@@ -96,7 +96,7 @@ and Qwen3-8B.
 Notes on the table:
 
 - The 9B, 4B and 0.8B builds share kernel sources; only the params differ.
-- Pie runs 32-step loops (`PIE_CEREBRAS_POSTED_LOOP=32`). Longer loops lower the per-step cost but
+- Pie runs 32-step loops (`posted_loop = 32`). Longer loops lower the per-step cost but
   lose wall time at the tail.
 - Pie's own cost is about 0.45 ms per posted launch, so Pie reaches 97% of bare.
 - Qwen3-8B: 36 dense attention layers in 9 K4 units on a 2 x 5 grid. The slot (1, 1) stays out of the snake so
@@ -110,48 +110,72 @@ Notes on the table:
 - Llama 3.1 8B: 32 dense layers without q / k norms on the 9B's 8 K4 units (the first preset that builds), its
   rotation Llama 3's scaled frequencies from the trace, eps 1e-5. Not yet measured on the chip.
 
-## 3. Build and run
+## 3. Serve, build and run
 
-The build tools are under `crates/kernels-cerebras/tools/` (`tools/wafer`), the numerics gates under
-`crates/engine-cerebras/tools/emu`. Set `CSL_SDK` to the SDK directory, which holds `cslc` and
-`cs_readelf`.
+**Serve.** `pie serve` with the cerebras engine and a model is all a served model needs:
 
-1. **Plan**: `wafer-compile plan --model <deployment> --preset <name> [--set K=V,..] --out <plan dir>`
-   (`ARCHITECTURE.md`): the model's shape from its trace, the family it needs, the preset's partition.
-   Presets: Qwen `9b`, `4b`, `0.8b`, `q3-8b`; Gemma `e2b`, `e4b`; Gemma 12B `g12`; gpt-oss `full`;
-   and `tiny*` for the simulator. Overrides are the preset's keys (`G2=16,WL=1`; the 0.8B
-   `G2=16,G2Y=8,WL=1`). A checkpoint with no catalog deployment takes `--shape <shape.json>`.
-2. **Prep** (checkpoint -> tiles, cut as the plan's `tiling.json` says): writes `<prefix>w<u>.npy`,
-   `hw`, `hemb`, ... and `<prefix>meta.json` (a record of what it tiled).
-   - Any Qwen3.5 / Qwen3 / Llama 3 size: `tools/wafer/dense/prep_dense.py <model> <out> <golden.json> <plan dir> [prefix]`;
-     Gemma, Gemma 12B and gpt-oss alike (`gemma/prep_gemma.py`, `gemma12/prep_gemma12.py`,
-     `gptoss/prep_gptoss.py <model> <out> <plan dir> <golden.json> [prefix]`).
-3. **Numerics gate** (before any new lever): `tools/emu/tf_q35.py <model> <golden> <meta.json>
+```toml
+[engine]
+kind = "cerebras"
+target = "wse3"
+cmaddr = "10.x.y.z:9000"   # omit for the fabric simulator
+max_model_len = 4096       # the positions the program is built for; omit for as many as the preset holds
+lookahead = 254
+async = true
+# posted_loop = 32         # default: the plan's LOOP
+
+[engine.wafer]             # all optional
+# preset = "9b"            # else the first of the family's presets that builds
+# build = "never"          # refuse a program the cache does not hold (a chip session)
+# tiles = "memory"         # cut the checkpoint for each load instead of caching the cut
+
+[engine.toolchain]         # only off the SDK image's layout (cslc, cslang_root, python, sdk_lib, compile_timeout)
+
+[engine.debug]             # bench settings only; a load logs them
+# program = "<linked dir>"           # open this program instead of building one
+# weights = "<dir>[:<prefix>]"       # place these staged tiles instead of cutting the checkpoint
+# set = "G2=12"                      # overrides of the preset's keys
+# levers = "DIAG:1,TSTAMP:1"         # kernel levers past the preset's
+# force_prompt = true                # the prompt through the token loop
+# posted = false                     # one loop at a time
+# loop_room = false                  # loops not bounded by the lane's pages
+```
+
+A load plans the model's trace (the family its shape needs, the preset, the positions), builds and links the
+program, and cuts the checkpoint for it (`engine-cerebras` `spatial::prepare`). Both are kept in the engine cache
+(`<PIE_HOME>/.../cerebras/wafer`, `p-<model>-<key>` and `t-<model>-<key>`), keyed by everything they follow from,
+so a second load compiles and cuts nothing; a whole-wafer compile takes minutes. Pie config: `frame_size 4`,
+`frame_dispatch_depth 63`. The Dense family (Qwen3.5, Qwen3, Llama 3) cuts its checkpoint in Rust
+(`spatial::tiles`); Gemma, Gemma 12B and gpt-oss do not yet, so they serve tiles staged by their Python prep,
+named in `[engine.debug] weights`.
+
+**Build by hand** (no SDK needed until the link):
+
+1. **Plan**: `wafer-compile plan --model <deployment> [--preset <name>] [--set K=V,..] [--positions N] --out
+   <plan dir>` (`ARCHITECTURE.md`): the model's shape from its trace, the family it needs, the preset's partition.
+   Presets: Dense `9b`, `4b`, `0.8b`, `q3-8b`; Gemma `e2b`, `e4b`, `e4b-meta`; Gemma 12B `g12`; gpt-oss `full`;
+   and `tiny*` for the simulator. A preset carries the overrides and kernel levers its program shipped with. A
+   checkpoint with no catalog deployment takes `--shape <shape.json>`.
+2. **Sources**: `wafer-compile build --plan <plan.json> --out <build dir> [--levers K:V,..]` writes `layout/`
+   (`layout.csl`, every PE's kernel and params resolved, and one source a PE kind, from the embedded kernels or
+   `--kernels <dir>`) and the artifact (rcfg, host, bindings, `program.json`). Levers set kernel params past the
+   plan's (`CYV:2`, `SLW:1`; a `<kind>.` prefix scopes one: `w.FIFOW:16`).
+3. **Link and check**: `wafer-compile link --build <build dir>`, where the SDK image's toolchain is (inside the
+   SDK container): a full link at the chip's fabric dims, every PE image's stack room checked (>= 768 B), the
+   artifact put in `out/artifact`.
+4. **Cut**: `wafer-stage --model <deployment> --checkpoint <dir> --out <dir> [--positions N]` (engine-cerebras):
+   the tiles a load cuts. The Python preps (`tools/wafer/<family>/prep_<family>.py <model> <out> <golden.json>
+   <plan dir> [prefix]`) cut the tiny fixtures and the families with no Rust cut yet.
+5. **Numerics gate** (before any new lever): `tools/emu/tf_q35.py <model> <golden> <meta.json>
    ref,f16acc_s16_kv16 256 <out>`. This needs `torch` and `transformers` with Qwen3.5.
-4. **Sources**: `tools/wafer/build.py <build dir> <plan.json> [levers K:V,..]` writes `layout.csl`
-   (every PE's kernel and params resolved), one source a PE kind and `compiled/` (`wafer-compile
-   build`'s files: rcfg, floor, host, bindings, plan, and `program.json`: with the host, bindings and
-   rcfg files it is the artifact the engine runs). Levers set kernel params (`CYV:2`, `SLW:1`; a
-   `<kind>.` prefix scopes one: `w.FIFOW:16`). It reads `programs/wafer`, or `$WAFER_KERNELS`.
-5. **Link and check**: `tools/wafer/link.sh <build dir>`. This is a full local link at the chip's
-   fabric dims, followed by the stack-room check; it puts the artifact in `out/artifact`. Run it on
-   every build before a chip request. Name the chip payload `*_ieee`.
 6. **Tiny end-to-end on the simulator** (no chip):
    1. `tools/wafer/dense/mk_tiny_qwen.py <dir> t08` (or `t4`; `mk_tiny_llama.py <dir>` a tiny Llama 3) builds a
       tiny HF checkpoint and its golden.
-   2. `wafer-compile plan --shape <its shape.json> --preset tiny-t08 --set G2=2,WL=1,G2W=2 --out <plan>`,
-      `dense/prep_dense.py` on it, then `build.py <build> <plan>/plan.json` and `link.sh`.
+   2. `wafer-compile plan --shape <its shape.json> --preset tiny-t08 --out <plan>`, `dense/prep_dense.py` on
+      it, then `wafer-compile build` and `link`.
    3. `artifact_sim <build>/out <prep> "" 5` (engine-cerebras `--example artifact_sim`; `ARTIFACT_SIM_NTOK`
       caps the tokens) runs `ArtifactModel` against the golden: two sequences, a rollback and a logits
-      row. Run it where the SDK runtime libraries are: inside the SDK container, through the
-      container's glibc loader for a host-built binary, or with `PIE_CEREBRAS_SDK_LIB`.
-7. **Serve**: `pie serve` with the cerebras engine, `spatial_program` the linked program (its `out/`, with
-   `artifact/`), and `PIE_CEREBRAS_WEIGHTS=<prep dir>:<prefix>`. Pie config: `frame_size 4`,
-   `frame_dispatch_depth 63`, `spatial_lookahead 254`. The engine opens nothing but the artifact
-   (`Wafer::open`, `ArtifactModel`).
-8. **Regenerate the shipping programs**: `tools/wafer/regen.sh <out root>` plans and builds every
-   shipping config from its trace (the presets and overrides the chip runs used) into
-   `<out root>/<config>/{plan,build}`; see the script for the staged preps they place.
+      row, inside the SDK container (through its glibc loader for a host-built binary).
 
 ## 4. Parameters, levers and diagnostics (one place)
 
@@ -161,7 +185,7 @@ default is the shipped build. Each kernel's header describes its own params and 
 | param | where | default | meaning |
 |---|---|---|---|
 | `NPX` | head_pe | 1 | x in NPX f16 parts. 1 was emulated exact on all three goldens. |
-| `MV` | weight | 1 (build.py) | f16 tiles with f16 accumulation (0: bf16 tiles, f32 accumulation) |
+| `MV` | weight | 1 | f16 tiles with f16 accumulation (0: bf16 tiles, f32 accumulation) |
 | `SILU16`, `CONVQK`, `ATTV`, `GDEC`, `ROPEP`, `SILUQ` | CY (GDEC also weight) | 1 | the layer trims: f16 MLP SiLU; q/k conv first; vector gate; decay off the path; next position's RoPE tables early; lean f32 SiLU. The 0 forms are the earlier, slower code. |
 | `ATTL` | CY, weight | 2 | the log-sum-exp steps go in a second multicast after o (0: they ride with o) |
 | `SSQL` | CX, weight | 1 | x's sum of squares follows x |
@@ -173,7 +197,7 @@ default is the shipped build. Each kernel's header describes its own params and 
 | `DIAG` | weight, CX, CY | 0 | bisection bits: 1 no layers, 2 one layer, 4 no MLP, 8 column reduction only, 16 row reduction only |
 | `HOSTX` | CX | 0 | simulator tests: x is the host's, no handoff |
 | `WFORCE`, `WFN` | head_ctl | 0 | diagnostics: a forced winner sequence `(s WFORCE + 7) % (VR WFN)` that exercises every row's return path |
-| `force` / `nforce` | head_ctl (symbols) | - | the host forces the first `nforce` steps' tokens: a whole prompt through the loop in one launch (`PIE_CEREBRAS_FORCE_PROMPT`), and teacher-forced checks |
+| `force` / `nforce` | head_ctl (symbols) | - | the host forces the first `nforce` steps' tokens: a whole prompt through the loop in one launch (`[engine.debug] force_prompt`), and teacher-forced checks |
 | `HACC16` | head_pe | 0 | measurement: f16 head accumulation, about -1.7k cycles. It halves the 9B golden's tightest margin and, stacked with other levers, flipped it. |
 | `FIFOW` | all | 32 | the reductions' FIFO depth |
 | `SLW` | CY | 0 | the f16 SiLU without its subnormal flush (the tail to 2^-24). Qwen3-8B needs it (`tools/emu/silu16.py`'s `silu16w`): the flush costs 2 golden tokens in emulation. |
@@ -192,15 +216,13 @@ These variants were removed after they failed:
 - VARG 1: superseded.
 - A streamed act-into-down variant: a DSR-driven `@map` does not take a fabin DSD.
 
-## 5. Environment (Pie host) and metrics
+## 5. Serving settings and metrics
 
-| variable | meaning |
-|---|---|
-| `PIE_CEREBRAS_WEIGHTS=<prep dir>:<prefix>` | the prep's tiles the program places (the program is the compiled one with its `artifact/`; its plan fixed the chain groups, the token loop, `CAP`) |
-| `PIE_CEREBRAS_POSTED_LOOP` | steps a posted loop runs past its row (default: the plan's `LOOP`: Qwen 32, Gemma and gpt-oss 64). Loops double from 8 up to this value. |
-| `PIE_CEREBRAS_POSTED=0` | one loop at a time (synchronous, bounded by the lane's pages) |
-| `PIE_CEREBRAS_LOOP_ROOM=off` | synchronous mode with no page bound |
-| `PIE_CEREBRAS_FORCE_PROMPT=1` | the prompt is forced through the token loop (one launch: prefill and the first token). Needs `force` / `nforce`. |
+The `[engine]` settings above are the whole configuration: the engine reads no environment variable. The
+posted loop's length is the plan's `LOOP` (Dense 32, Gemma and gpt-oss 64) unless `posted_loop` sets it; loops
+double from 8 up to it. `[engine.debug]`'s `posted = false` runs one loop at a time (bounded by the lane's
+pages; `loop_room = false` drops the bound) and `force_prompt` forces the prompt through the token loop (one
+launch: prefill and the first token; the program needs `force` / `nforce`).
 
 **Posted loops.** Greedy decoding runs as token loops posted back to back. The next loop goes onto
 the wafer while the previous loop's rows are answered. The wafer idles about 0.02 ms between loops.
@@ -247,7 +269,7 @@ Both reuse the wafer program machinery (the generic chains, segments, handoffs, 
 with their own kernels and a family each (`family/gemma.rs`, `family/gptoss.rs`: presets, blocks, kernels). The
 model's shape selects the family (`family::serving`): experts take gpt-oss's, per-layer inputs or shared KV Gemma's,
 sliding layers otherwise the 12B's. Tools: `tools/wafer/gemma`,
-`tools/wafer/gptoss` (prep, `run_*.py` bare runner on `host.py`; `build.py` adds the plan's runner, `gotiny.sh` runs a tiny one), `tools/emu/tf_gemma.py`
+`tools/wafer/gptoss` (prep, tiny fixture), `tools/emu/tf_gemma.py`
 and `tf_gptoss.py` (teacher-forced emulation of the kernels' number formats).
 
 **Gemma 4** (`*_gemma.csl`, E2B and E4B; 12B below).
@@ -267,8 +289,8 @@ and `tf_gptoss.py` (teacher-forced emulation of the kernels' number formats).
   a one-copy whole-ring mixer measured slower on E4B, 0.8927 against 0.8873 ms). GELU stays
   f32 (an f16 GELU flipped the long golden; `GELUT 2` is the f32 form with fewer f32 multiplies, which cost a cycle a
   word an operand); the final softcap is applied on the host (greedy-invariant).
-- Builds as on chip: E2B preset `e2b`, `build.py <build> <plan.json> WSPEC:2`; E4B (0974) preset `e4b` (PYW 128,
-  NEG 20: the exact ring), `build.py <build> <plan.json> WSPEC:0,w.FIFOW:16` (the weight PE's FIFO at 16 words).
+- Builds as on chip: E2B preset `e2b` (WSPEC 2); E4B (0974) preset `e4b` (PYW 128, NEG 20: the exact ring; WSPEC 0,
+  the weight PE's FIFO at 16 words).
 - The weight PE works out the step's position row and entry once a step (a u32 divide by a row count that is not a
   power of two is a ~270-cycle helper) and keeps the cache offsets in comptime tables.
 - Diagnostics: `DIAG 1` (no layers: handoffs, head, PLE and KVS words checked at every consumer), `PLOG 1` (the full
@@ -299,5 +321,5 @@ layers and a 2 GB tied head fill 98% of the wafer, which only fits with a row-ro
 - Head: 201,088 untied rows in a band below the units; logits are prescaled (`HSCALE`, 2^15) and the host divides.
 - Pass criterion: the bf16 golden, with mismatches classified by `tools/emu/classify_tf.py` (bf16 top-1 tie, router
   tie at the step or before it); the f32 reference is secondary.
-- Serving build (the build.py defaults): `GLUV 1` (SwiGLU as vector ops), `CYV 2` (the attention CY's exp as a vector
+- Serving build (the `full` preset's levers): `GLUV 1` (SwiGLU as vector ops), `CYV 2` (the attention CY's exp as a vector
   op, bit-identical). `CYV 1` / `3` and the stamps (`TSTAMP`) are opt-in.

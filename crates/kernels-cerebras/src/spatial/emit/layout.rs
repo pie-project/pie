@@ -171,8 +171,7 @@ pub fn layout_text(prog: &Program, kinds: &Kernels) -> Result<String, String> {
 }
 
 /// Writes `<out>/layout.csl` and one `<kind>.csl` a role kind (the kernel source, embedded or from
-/// `kernels_dir`, with the other kinds' exported names as one-word dummies), plus `dims.env` (the
-/// rectangle and fabric dims, for the Python runners).
+/// `kernels_dir`, with the other kinds' exported names as one-word dummies).
 pub fn write(
     prog: &Program,
     levers: &Levers,
@@ -194,8 +193,7 @@ pub fn write(
             match kernels_dir {
                 Some(dir) => {
                     let src = dir.join(kb.source);
-                    std::fs::read_to_string(&src)
-                        .map_err(|e| format!("{}: {e}", src.display()))?
+                    std::fs::read_to_string(&src).map_err(|e| format!("{}: {e}", src.display()))?
                 }
                 None => sources::get(kb.source)
                     .ok_or_else(|| format!("no kernel {}", kb.source))?
@@ -211,10 +209,5 @@ pub fn write(
         wr("filler.csl", &kind_source(FILLER, syms, &[])?)?;
     }
     wr("layout.csl", &layout_text(prog, &kinds)?)?;
-    let (w, h) = (prog.floor.w, prog.floor.h);
-    wr(
-        "dims.env",
-        &format!("FW={} FH={} PW={w} PH={h}\n", w + 7, h + 2),
-    )?;
     Ok(())
 }

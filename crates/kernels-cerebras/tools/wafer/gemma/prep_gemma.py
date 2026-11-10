@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """prep_gemma.py <model dir> <outdir> <golden json> <plan dir> [prefix]: a Gemma 4 checkpoint (bf16
-safetensors, "model.language_model." or "model.") in run_gemma.py's prep format (src/spatial/README.md, "Gemma 4"), cut as
+safetensors, "model.language_model." or "model.") in the wafer program tile format (src/spatial/README.md, "Gemma 4"), cut as
 the plan in <plan dir> says (`wafer-compile plan`'s tiling.json).
 Units of K layers (S .. S G), unit u = layers K u .. K u + K - 1; units below NO (= first shared layer / K) own their
 KV, the rest are shared-KV units. Weight column c (of PX): kv copy c // (PX / 2) (its Qh = nq / 2 q heads), within

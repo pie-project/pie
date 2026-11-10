@@ -32,8 +32,8 @@ use kernels_cerebras::spatial::emit::params::Levers;
 use kernels_cerebras::spatial::family;
 use kernels_cerebras::spatial::plan::{Plan, Shape};
 use kernels_cerebras::spatial::program::Program;
-use kernels_cerebras::spatial::toolchain::{Arch, Cslc, Toolchain};
 use kernels_cerebras::spatial::target::{self, Ask};
+use kernels_cerebras::spatial::toolchain::{Arch, Cslc, Toolchain};
 
 const USAGE: &str = "usage: wafer-compile plan (--model <deployment> | --shape <shape.json>) \
      [--preset <name>] [--set K=V,...] [--positions N] --out <dir>\n       wafer-compile build --plan <plan.json> \
@@ -84,7 +84,14 @@ fn mkdir(dir: &Path) -> Result<(), String> {
 fn plan(args: &[String]) -> Result<(), String> {
     let f = flags(
         args,
-        &["--model", "--shape", "--preset", "--set", "--positions", "--out"],
+        &[
+            "--model",
+            "--shape",
+            "--preset",
+            "--set",
+            "--positions",
+            "--out",
+        ],
     )?;
     let ask = Ask {
         preset: get(&f, "--preset").map(str::to_string),
@@ -127,7 +134,13 @@ fn build(args: &[String]) -> Result<(), String> {
     let emit: Vec<&str> = get(&f, "--emit").map_or(EMITS.to_vec(), |e| e.split(',').collect());
     let levers = Levers::of(&plan.levers, get(&f, "--levers").unwrap_or(""))?;
     let prog = Program::of(plan)?;
-    build::emit(&prog, &levers, get(&f, "--kernels").map(Path::new), &out, &emit)
+    build::emit(
+        &prog,
+        &levers,
+        get(&f, "--kernels").map(Path::new),
+        &out,
+        &emit,
+    )
 }
 
 /// `link`: a build directory compiled, checked and its artifact put beside it.

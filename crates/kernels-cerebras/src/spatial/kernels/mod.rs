@@ -16,11 +16,11 @@ use super::role::PeRole;
 use super::wiring::{Class, NoteKey, Slot};
 
 pub mod common;
+pub mod dense;
 pub mod gemma;
 pub mod gemma12;
 pub mod gptoss;
 pub mod head;
-pub mod dense;
 
 type R<T> = Result<T, String>;
 

@@ -264,7 +264,7 @@ impl ArtifactModel {
     }
 
     /// `tokens` and `extra` passes past them in one launch
-    /// (`PIE_CEREBRAS_FORCE_PROMPT=1`, a build with the head's force table):
+    /// (the debug `force_prompt`, a build with the head's force table):
     /// the first token's x from the host, then the root's winner at steps
     /// s < n - 1 forced to `tokens[s + 1]` (the ring keeps the argmax). The
     /// ring's first `n + extra` words when `read`.

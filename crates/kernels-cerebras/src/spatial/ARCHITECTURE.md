@@ -87,7 +87,7 @@ The hardware lessons of the bring-up, made checks:
 8. **Loop-backs.** Every root of a `SlotKind::Reduce { loopback: true }` slot loops back to its own
    ramp on `LOOPBACK`'s colour.
 9. **Kernel-side rules** (not geometry; listed so nobody drops them): restore a route only after
-   its oq drains (0738); ≥768 B stack room a PE (`tools/wafer/chk_stack.py`); payload directories
+   its oq drains (0738); ≥768 B stack room a PE (`wafer-compile link`, `Cslc::stack_room`); payload directories
    end in `_ieee`.
 
 ## The blocks
@@ -146,12 +146,12 @@ An rcfg writer reads one PE through `Pe`: `pe.member(slot)` / `root` / `halves` 
 `CxIo`'s flags / finals / tail, `cy`'s segment, `HeadIo`) and appends its tail.
 
 Params resolve per PE in `emit::params::tile`: the kind's `KernelBuild::params`, then the PE's
-`Overrides` (each must be a param the kind takes). Levers (`wafer-compile --levers`, `build.py`'s last
+`Overrides` (each must be a param the kind takes). Levers (the preset's, carried by the plan, and `wafer-compile build --levers`'s; the last
 argument) override a param in every kind that takes it; `<kind>.<NAME>` (`w.FIFOW:16`, E4B's
 weight FIFO) in that kind only; a lever no kernel takes is an error.
 
 `layout.csl` is written from the floor: each maximal rectangle of PEs with one kind and one
-resolved param list is one loop nest, every param a literal, so `link.sh` passes no params.
+resolved param list is one loop nest, every param a literal, so the link passes no params.
 The per-kind sources are the kernels', with one-word dummies for the family's other exported
 symbols (`Family::symbols`, export order).
 
@@ -217,25 +217,33 @@ and writes, the x runs, the head and the token loop's root, the softcap, the pos
 the bindings in placement order, every PE's rcfg words, the model facts of the host's math
 (`Header::model`: vocabulary, hidden size, eps, `lgt`'s prescale), and the plan as a record.
 `wafer-compile build` writes it (`program.json`, `host.json`, `bindings.json`, `rcfg.npy`,
-`rcfg_n.npy`); `link.sh` puts it in the compiled program's `artifact/`. The engine's
-`ArtifactModel` reads it from there, places the prep's tiles (`PIE_CEREBRAS_WEIGHTS=<prep
-dir>:<prefix>`) by its bindings and drives the program from it alone; it builds nothing, and a
-program without an artifact is refused.
+`rcfg_n.npy`); the link (`build::link`) puts it in the compiled program's `artifact/`. The engine's
+`ArtifactModel` reads it from there, places the load's tiles by its bindings and drives the program from it
+alone; a program without an artifact is refused.
+
+## Building in the engine
+
+A load (`engine-cerebras` `spatial::prepare`) runs the same library calls as the tools: `target::plan` (the
+positions the serving context asks for), `build::emit` and `build::link` with the configured toolchain (the CSL
+kernels embedded in the crate, `spatial::sources`), and `tiles::stage` over the checkpoint's params landed
+through the runtime's import contract. The program is cached by its `ProgramKey` (plan, levers, every kernel
+source, the build `FORMAT`, the compiler version, the toolchain and the architecture), the cut by the plan's
+tiling and the checkpoint; each model keeps one of each.
 
 ## Tools
 
 - `wafer-compile plan (--model <deployment> | --shape <shape.json>) [--preset <name>] [--set
-  K=V,..] --out <dir>` writes `plan.json` and `tiling.json` (what a prep cuts the checkpoint by, and
-  the preset's name). `wafer-compile build --plan <plan.json> --out <dir> [--emit ..] [--levers ..]`
-  writes `floor.json`, `rcfg.npy` / `rcfg_n.npy` / `rcfg.txt`, `kernels.json`, `layout/` (with
-  `dims.env`), `host.json`, `plan.json`, `bindings.json` and `program.json`.
-- The preps (`dense/prep_dense.py`, `gemma/prep_gemma.py`, `gemma12/prep_gemma12.py`,
-  `gptoss/prep_gptoss.py`) keep the checkpoint maths and cut it as a plan directory's `tiling.json`
-  says.
-- `tools/wafer/build.py <out> <plan.json> [levers]` is the build directory of any family (the
-  `build_{gemma,gemma12,gptoss}.py` add their runner); `link.sh` links it, checks stack room and
-  puts the artifact beside the compiled program; `gotiny.sh` runs a tiny prep on the
-  simulator; `regen.sh` rebuilds the shipping programs (README there).
+  K=V,..] [--positions N] --out <dir>` writes `plan.json` and `tiling.json` (what a Python prep cuts the
+  checkpoint by, and the preset's name). `wafer-compile build --plan <plan.json> --out <dir> [--emit ..]
+  [--levers ..] [--kernels <dir>]` writes `floor.json`, `rcfg.npy` / `rcfg_n.npy` / `rcfg.txt`,
+  `kernels.json`, `layout/`, `host.json`, `plan.json`, `bindings.json` and `program.json`. `wafer-compile
+  link --build <dir>` links it where the SDK toolchain is, checks the stack room and puts the artifact in
+  `out/artifact`.
+- `wafer-stage` (engine-cerebras) cuts a catalog deployment's checkpoint for its plan as a load does.
+- The Python preps (`dense/prep_dense.py`, `gemma/prep_gemma.py`, `gemma12/prep_gemma12.py`,
+  `gptoss/prep_gptoss.py`) cut a checkpoint as a plan directory's `tiling.json` says: the tiny fixtures
+  (no catalog deployment) and the families with no Rust cut yet. `<family>/mk_tiny_*.py` make the tiny
+  checkpoints and their goldens.
 
 ## Verification
 

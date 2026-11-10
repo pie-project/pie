@@ -43,7 +43,11 @@ impl Cut {
                 for i in 0..self.hc {
                     let d = r * self.hc + i;
                     for &o in cols.iter().take(n) {
-                        dst.push(if d < self.h { f16(w[o * self.h + d]) } else { 0 });
+                        dst.push(if d < self.h {
+                            f16(w[o * self.h + d])
+                        } else {
+                            0
+                        });
                     }
                 }
             }
@@ -116,7 +120,7 @@ pub fn stage(plan: &Plan, params: &dyn Params, out: &Out) -> R<()> {
     let pat = &kinds[..k];
     let nlg = pat.iter().filter(|g| **g).count();
     let inter = s.mlp.intermediate as usize;
-    if inter % px != 0 {
+    if !inter.is_multiple_of(px) {
         return Err(format!("dense: the MLP's {inter} over {px} columns"));
     }
     let hc = h.div_ceil(py);
@@ -131,8 +135,16 @@ pub fn stage(plan: &Plan, params: &dyn Params, out: &Out) -> R<()> {
     let cut = Cut { px, py, h, hc };
 
     let cols = |f: &dyn Fn(usize) -> Vec<usize>| -> Vec<Vec<usize>> { (0..px).map(f).collect() };
-    let qidx = |c: usize| -> Vec<usize> { (0..dk).map(|j| (c / cpk) * hk + (c % cpk) * dk + j).collect() };
-    let vidx = |c: usize| -> Vec<usize> { (0..dv).map(|j| (c / cpv) * hv + (c % cpv) * dv + j).collect() };
+    let qidx = |c: usize| -> Vec<usize> {
+        (0..dk)
+            .map(|j| (c / cpk) * hk + (c % cpk) * dk + j)
+            .collect()
+    };
+    let vidx = |c: usize| -> Vec<usize> {
+        (0..dv)
+            .map(|j| (c / cpv) * hv + (c % cpv) * dv + j)
+            .collect()
+    };
     // a column's head dims: rotated pairs side by side, then plain dims
     let perm = |pa: usize| -> Vec<usize> {
         if pa < nrc {
@@ -168,7 +180,7 @@ pub fn stage(plan: &Plan, params: &dyn Params, out: &Out) -> R<()> {
     for u in 0..nu {
         let mut parts: Vec<Vec<u16>> = vec![Vec::new(); py * px];
         let (mut g, mut a) = (0usize, 0usize);
-        for l in k * u..k * u + k {
+        for (l, &gdn) in kinds.iter().enumerate().skip(k * u).take(k) {
             let lk = l % k;
             let ln1 = pad(nw(layer(params, l, &["mixer_norm", "attn_norm"])?.f32()?));
             let ln2 = pad(nw(layer(params, l, &["mlp_norm"])?.f32()?));
@@ -178,13 +190,13 @@ pub fn stage(plan: &Plan, params: &dyn Params, out: &Out) -> R<()> {
                     gam[(u * py + r) * gw + lk * 2 * hc + hc + i] = f16(ln2[r * hc + i]);
                 }
             }
-            if kinds[l] {
+            if gdn {
                 // GDN: [qkv | z | b | a] in, out
                 let mut win = layer(params, l, &["gdn.in_qkvz"])?.f32()?;
                 win.extend(layer(params, l, &["gdn.in_ba"])?.f32()?);
                 let idx = cols(&|c| {
                     let (q, vv, vh) = (qidx(c), vidx(c), c / cpv);
-                    let mut o: Vec<usize> = q.iter().copied().collect();
+                    let mut o: Vec<usize> = q.clone();
                     o.extend(q.iter().map(|x| kd + x));
                     o.extend(vv.iter().map(|x| 2 * kd + x));
                     o.extend(vv.iter().map(|x| 2 * kd + vd + x));
@@ -257,14 +269,14 @@ pub fn stage(plan: &Plan, params: &dyn Params, out: &Out) -> R<()> {
                     Ok(q) => nw(q.f32()?),
                     Err(_) => vec![1.0; hd],
                 };
-                for c in 0..px {
+                for (c, dims) in pd.iter().enumerate() {
                     let base = (u * px + c) * qkww + a * (qh * dc + dc);
                     for x in 0..qh {
-                        for (j, &d) in pd[c].iter().enumerate() {
+                        for (j, &d) in dims.iter().enumerate() {
                             qkw[base + x * dc + j] = qn[d] / isq;
                         }
                     }
-                    for (j, &d) in pd[c].iter().enumerate() {
+                    for (j, &d) in dims.iter().enumerate() {
                         qkw[base + qh * dc + j] = kn[d];
                     }
                 }
@@ -340,7 +352,11 @@ pub fn stage(plan: &Plan, params: &dyn Params, out: &Out) -> R<()> {
             for kk in 0..hdc {
                 let d = hcol * hdc + kk;
                 for vrow in 0..vr {
-                    let src = if big * vr + vrow < v { big * vr + vrow } else { row(vrow) };
+                    let src = if big * vr + vrow < v {
+                        big * vr + vrow
+                    } else {
+                        row(vrow)
+                    };
                     hw.push(if d < h { f16(wh[src * h + d]) } else { 0 });
                 }
             }

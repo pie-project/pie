@@ -197,7 +197,10 @@ impl ProgramKey {
     pub fn of(plan: &Plan, levers: &Levers, arch: Arch, toolchain: &Path) -> R<ProgramKey> {
         let mut k = blake3::Hasher::new();
         for (name, src) in sources::KERNELS {
-            k.update(name.as_bytes()).update(&[0]).update(src.as_bytes()).update(&[0]);
+            k.update(name.as_bytes())
+                .update(&[0])
+                .update(src.as_bytes())
+                .update(&[0]);
         }
         let parts = serde_json::json!({
             "plan": plan,

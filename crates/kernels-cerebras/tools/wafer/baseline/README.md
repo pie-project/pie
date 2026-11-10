@@ -17,7 +17,7 @@ refactor that must not change behaviour can be checked file for file against the
 - `capture.py <out> [names]`: per config (see its docstring for the files):
   - `plan/`: `wafer-compile plan`'s `plan.json` and `tiling.json`;
   - `prep/` (tiny only): the prep's files;
-  - `build/`: `build.py`'s output for the plan (its `compiled/` holds the artifact) and `params.used` (the cslc params
+  - `build/`: `wafer-compile build`'s output for the plan in `compiled/` (`layout/` and the artifact) and `params.used` (the cslc params
     compare.py evaluates the layout with: none, every param a literal);
   - `host/`: the Rust host on the build's artifact (engine-cerebras `examples/artifact_baseline.rs`: `Artifact::read`,
     `ArtifactModel::open`, then one `greedy` launch on a recording device):
@@ -41,7 +41,7 @@ python3 tools/wafer/baseline/compare.py <reference capture> /tmp/cand
 Entry points the harness relies on (keep them, or adapt the harness in the same commit and say so):
 - `wafer-compile plan` / `build`;
 - engine-cerebras `examples/artifact_baseline.rs <artifact dir> <prep dir> <prefix> <vocab> <out dir>`;
-- `build.py <out> <plan.json> [levers]`, writing `layout.csl`, one `.csl` a PE kind and `compiled/`;
+- `wafer-compile build --plan <plan.json> --out <dir> [--levers ..]`, writing `layout/` and the artifact;
 - each family's prep CLI (`configs.json`'s `prep`), writing `<prefix>meta.json` and the `.npy` tiles.
 
 ## References

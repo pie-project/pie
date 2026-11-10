@@ -11,7 +11,6 @@ use crate::spatial::block::segments::{Onorm, Scores};
 use crate::spatial::block::token_loop::TokenLoop;
 use crate::spatial::block::units::{UnitCopies, Units};
 use crate::spatial::family::{Family, Row, table, units_of};
-use crate::spatial::tiles::{Out, Params};
 use crate::spatial::floor::{UnitGrid, UnitLayout};
 use crate::spatial::kernels::dense;
 use crate::spatial::plan::{
@@ -19,6 +18,7 @@ use crate::spatial::plan::{
     RowRun, Segments, Shape,
 };
 use crate::spatial::program::Program;
+use crate::spatial::tiles::{Out, Params};
 use crate::spatial::weights::{From, Slice, Transform, from};
 
 type R<T> = Result<T, String>;
@@ -49,7 +49,12 @@ const PRESETS: &[Row<8>] = &[
     // name, [PX, PY, UNX, UNY, K, HR, VR, NE], overrides, levers
     ("9b", [256, 256, 2, 4, 4, 1153, 216, 64], "G2=16,WL=1", SHIP),
     ("4b", [256, 256, 2, 4, 4, 1153, 216, 64], "G2=16,WL=1", SHIP),
-    ("0.8b", [256, 128, 2, 3, 4, 1153, 216, 128], "G2=16,G2Y=8,WL=1", SHIP),
+    (
+        "0.8b",
+        [256, 128, 2, 3, 4, 1153, 216, 128],
+        "G2=16,G2Y=8,WL=1",
+        SHIP,
+    ),
     // Qwen3-8B: 36 layers on 9 units, one gap slot (requests 0961 / 0963)
     (
         "q3-8b",
@@ -58,14 +63,28 @@ const PRESETS: &[Row<8>] = &[
         "NPX:1,DIAG:0,TSTAMP:0,XKEEP:0,HACC16:0,ATTL:2,SLW:1",
     ),
     ("tiny-t08", [8, 8, 2, 3, 4, 10, 8, 4], "G2=2,WL=1,G2W=2", ""),
-    ("tiny-t4", [16, 16, 2, 2, 4, 18, 8, 4], "G2=2,WL=1,G2W=2", ""),
+    (
+        "tiny-t4",
+        [16, 16, 2, 2, 4, 18, 8, 4],
+        "G2=2,WL=1,G2W=2",
+        "",
+    ),
     ("tiny-q3", [16, 8, 2, 2, 3, 10, 8, 4], "G2=2,WL=1,G2W=2", ""),
-    ("tiny-q3-gap", [16, 8, 2, 3, 4, 10, 8, 4], "G2=2,WL=1,G2W=2", ""),
+    (
+        "tiny-q3-gap",
+        [16, 8, 2, 3, 4, 10, 8, 4],
+        "G2=2,WL=1,G2W=2",
+        "",
+    ),
 ];
 
 impl Family for Dense {
     fn presets(&self) -> Vec<Preset> {
-        table(["PX", "PY", "UNX", "UNY", "K", "HR", "VR", "NE"], PRESETS, &[])
+        table(
+            ["PX", "PY", "UNX", "UNY", "K", "HR", "VR", "NE"],
+            PRESETS,
+            &[],
+        )
     }
 
     /// Units of K layers, every unit the same kinds (GDN and gated attention, or Qwen3's plain

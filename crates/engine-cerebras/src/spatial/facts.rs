@@ -86,7 +86,12 @@ impl Facts {
         let float = |out: &&ClassOutput| {
             out.decl.readout && matches!(out.decl.dtype, Dtype::Bf16 | Dtype::F32)
         };
-        let out = match self.exports.iter().filter(float).find(|o| o.decl.name == LOGITS) {
+        let out = match self
+            .exports
+            .iter()
+            .filter(float)
+            .find(|o| o.decl.name == LOGITS)
+        {
             Some(out) => out,
             None => {
                 let mut floats = self.exports.iter().filter(float);

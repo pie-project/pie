@@ -148,9 +148,7 @@ impl Spatial {
             // lookahead alone): the rows past a sequence's end are waste.
             let room = (pages.len() as u32 * self.kv.page_size)
                 .saturating_sub(start + tokens.len() as u32) as usize;
-            let bounded = !posting
-                && self.debug.loop_room.unwrap_or(true)
-                && !pages.is_empty();
+            let bounded = !posting && self.debug.loop_room.unwrap_or(true) && !pages.is_empty();
             let steps = if bounded { steps.min(room) } else { steps };
             // With the prompt forced through the loop (debug `force_prompt`), the
             // waited-for launch is the prompt alone: its first token right after the
@@ -206,9 +204,7 @@ impl Spatial {
     /// Whether greedy loops are posted back to back (debug `posted = false`: one
     /// loop at a time).
     fn loop_posting(&self) -> bool {
-        self.model.is_some()
-            && self.lookahead() > 0
-            && self.debug.posted.unwrap_or(true)
+        self.model.is_some() && self.lookahead() > 0 && self.debug.posted.unwrap_or(true)
     }
 
     /// The posted loop's rows into the cache (waiting for it, or only if it

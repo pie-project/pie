@@ -322,16 +322,22 @@ impl Cslc {
     pub fn stack_room(&self, out: &Path) -> Result<u32, Error> {
         let mut images: std::collections::BTreeMap<u32, PathBuf> = Default::default();
         let bin = out.join("bin");
-        for entry in std::fs::read_dir(&bin).map_err(|e| Error::Spawn(format!("{}: {e}", bin.display())))? {
+        for entry in
+            std::fs::read_dir(&bin).map_err(|e| Error::Spawn(format!("{}: {e}", bin.display())))?
+        {
             let path = entry.map_err(|e| Error::Spawn(e.to_string()))?.path();
             let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
-            let Some(rest) = name.strip_prefix("out_").and_then(|r| r.strip_suffix(".elf")) else {
+            let Some(rest) = name
+                .strip_prefix("out_")
+                .and_then(|r| r.strip_suffix(".elf"))
+            else {
                 continue;
             };
             let Some((image, chunk)) = rest.split_once('_') else {
                 continue;
             };
-            let (Ok(image), true) = (image.parse(), chunk.bytes().all(|b| b.is_ascii_digit())) else {
+            let (Ok(image), true) = (image.parse(), chunk.bytes().all(|b| b.is_ascii_digit()))
+            else {
                 continue;
             };
             let slot = images.entry(image).or_insert_with(|| path.clone());

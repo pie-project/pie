@@ -10,10 +10,10 @@ use super::plan::{FamilyId, LayerKind, Plan, Preset, Shape};
 use super::program::Program;
 use super::tiles::{Out, Params};
 
+pub mod dense;
 pub mod gemma;
 pub mod gemma12;
 pub mod gptoss;
-pub mod dense;
 
 type R<T> = Result<T, String>;
 
@@ -86,10 +86,15 @@ pub type Row<const N: usize> = (&'static str, [u32; N], &'static str, &'static s
 
 /// A family's presets from its table: each row's keys, then `extra` (keys every preset of the
 /// family states the same), then the row's overrides, and its levers.
-pub fn table<const N: usize>(keys: [&str; N], rows: &[Row<N>], extra: &[(&str, f64)]) -> Vec<Preset> {
+pub fn table<const N: usize>(
+    keys: [&str; N],
+    rows: &[Row<N>],
+    extra: &[(&str, f64)],
+) -> Vec<Preset> {
     rows.iter()
         .map(|&(name, values, set, levers)| {
-            let mut kv: Vec<(&str, f64)> = keys.iter().copied().zip(values.map(f64::from)).collect();
+            let mut kv: Vec<(&str, f64)> =
+                keys.iter().copied().zip(values.map(f64::from)).collect();
             kv.extend_from_slice(extra);
             let mut p = Preset::new(name, &kv)
                 .set(set)
