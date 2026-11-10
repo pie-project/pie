@@ -76,6 +76,24 @@ impl Kernel {
             Err(crate::jit::runtimeless("jit.load"))
         }
     }
+
+    /// Whether [`Kernel::load`] (or a fire) loaded this kernel on the
+    /// current device.
+    #[must_use]
+    pub fn is_loaded(&self) -> bool {
+        #[cfg(feature = "rocm")]
+        {
+            cache::current_device()
+                .ok()
+                .and_then(|ordinal| usize::try_from(ordinal).ok())
+                .and_then(|at| self.loaded.get(at))
+                .is_some_and(|slot| matches!(slot.get(), Some(Ok(_))))
+        }
+        #[cfg(not(feature = "rocm"))]
+        {
+            false
+        }
+    }
 }
 
 #[cfg(feature = "rocm")]

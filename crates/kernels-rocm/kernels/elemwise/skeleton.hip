@@ -1,135 +1,470 @@
 #pragma once
 
-// The row skeleton, HIP's: one row of bf16 planes a block, held whole in
-// registers, around a body kernels-ir's schedule prints in the skeleton's
-// hooks (`kernels_rocm::synth::print`). The same hooks as kernels-cuda's
-// `elemwise/skeleton.cuh`, over a wavefront's reductions.
+// The row skeleton, HIP's: kernels-cuda's `elemwise/skeleton.cuh` over a
+// wavefront of kWave lanes (64 on CDNA). A body kernels-ir's schedule prints
+// in the skeleton's hooks (`kernels_rocm::synth::print`) computes a row held
+// whole in registers; the skeleton loads its planes, reduces over the row or
+// its heads, shares the row through LDS and lands each result where its
+// store says.
 
 #include "prim/device.hip"
+#include "prim/store.hip"
 
 namespace pie::elemwise {
 
-// A bf16 plane a row skeleton reads or writes: its first element and how far
-// apart its rows sit, in elements (0 for one row every row shares, as a
-// norm's weight).
+// A plane a row skeleton reads or writes: its first element, how far apart
+// its rows sit, in elements (0 for one row every row shares, as a norm's
+// weight), the ids its rows are picked by (each row `r` reads the plane's
+// row `ids[r]`, an embedding's; null for row `r`'s own), the vectors of 8
+// it repeats every (a head's weight read by every head; 0 for a plane as
+// wide as the row), and the rows an id picks among: one past them (or
+// below 0) picks row 0, as the gather kernels pick it.
 struct Plane {
-    bf16* base;
+    const void* base;
     long long row_stride;
+    const int* ids;
+    int period;
+    int bound;
 };
 
 // What a row skeleton fires over: its body's IN parameters and OUT results,
-// every row `width` wide.
+// every row `width` wide, `rows` rows; each of the planes' rows cut into
+// `parts` of the skeleton's (a row of heads, each head its own row), and
+// `table` floats of shared memory the body tables what a column alone
+// computes in; then where each result lands. `kernels_rocm::elemwise::skeleton`
+// mirrors it.
 template <int IN, int OUT>
 struct Planes {
     Plane in[IN];
     Plane out[OUT];
     int width;
+    int rows;
+    int parts;
+    int table;
+    Store store[OUT];
 };
 
-// One row of bf16 planes held whole in registers: a thread holds PER
-// vectors of 8 elements of each parameter and each result. A body names an
-// element by its index `e` in [0, N), column (tid + (e / 8) * BLOCK) * 8 +
-// e % 8, and asks the skeleton for everything else. An element past the row
-// (`!valid(e)`) reads garbage and is never stored; a body keeps it out of
-// its reductions. A parameter whose bit `ONES` sets is one element every
-// row reads (a layer's scale), read once and named `one(k)`.
-template <int BLOCK, int PER, int IN, int OUT, unsigned ONES = 0u>
+// How parameter `k` is stored, two bits of DT each: a bf16 plane, an f32
+// one, or (a scalar's) an i32 element.
+constexpr int kBf16 = 0;
+constexpr int kF32 = 1;
+constexpr int kI32 = 2;
+
+// The sums a skeleton combines over the row in one pass of its barriers
+// (`reduce_sums`).
+constexpr int kBatch = 8;
+
+// The vector of 8 each thread's slot holds: the slot's own (`lane + p *
+// LANES`), or where a body lays its vectors out (`Body::vector`, a
+// pair-packed turn's turned vectors on the first threads).
+struct InOrder {
+    __device__ __forceinline__ static unsigned vector(unsigned s) { return s; }
+};
+
+template <class B, class = void>
+struct OrderOf {
+    using type = InOrder;
+};
+template <class B>
+struct OrderOf<B, decltype(static_cast<void>(B::vector(0u)))> {
+    using type = B;
+};
+
+// The lanes of a wavefront ordered among themselves: what a row of a
+// wavefront's lanes or fewer shares its row across. A wavefront runs in
+// lockstep; the fences keep the LDS writes before it visible after it.
+__device__ __forceinline__ void wave_sync() {
+    __builtin_amdgcn_fence(__ATOMIC_RELEASE, "wavefront");
+    __builtin_amdgcn_wave_barrier();
+    __builtin_amdgcn_fence(__ATOMIC_ACQUIRE, "wavefront");
+}
+
+// One row of planes held whole in registers: LANES threads a row (BLOCK /
+// LANES rows a block), each holding VECS vectors of 8 elements of each
+// parameter and each result. A body names an element by its index `e` in
+// [0, N), column (lane + (e / 8) * LANES) * 8 + e % 8 (or where `ORDER` lays
+// the slot), and asks the skeleton for everything else: its parameters'
+// values, where its results go, and the row's sums. Every index a body
+// passes is a constant once its loops unroll, so the arrays live in
+// registers. An element past the row (`!valid(e)`) reads garbage and is
+// never stored; a body keeps it out of its reductions. A parameter whose bit
+// `ONES` sets is one element a row (a layer's scale, every row the same, or
+// a row's position), read once and named `one(k)`. A parameter whose bit
+// `LATE` sets is a row the body first reads in a later pass: its vectors are
+// issued where the body asks (`load<k>()`). One whose bit `STREAM` sets is
+// fetched a vector at a time where each pass reaches it (`fetch<m>(p)`),
+// never held across passes. A row past the fire's (`!live`) computes on
+// garbage beside its block's live rows, through every barrier they meet,
+// and stores nothing. `READ_ONLY` (no result lands over a parameter) is
+// kernels-cuda's read-only path; AMD reads every plane through the one
+// vector cache, so it changes nothing here.
+template <int BLOCK, int LANES, int VECS, int IN, int OUT, unsigned ONES, unsigned long long DT,
+          bool READ_ONLY, unsigned LATE = 0u, class ORDER = InOrder, unsigned STREAM = 0u>
 struct RowSkeleton {
-    static constexpr int N = PER * 8;
+    static_assert((LANES & (LANES - 1)) == 0 && LANES <= BLOCK && (LANES <= kWave || LANES % kWave == 0),
+                  "a row is a power-of-two run of a block's threads");
+    static_assert(BLOCK % kWave == 0, "a block is whole wavefronts");
+    static constexpr int PER = VECS;
+    static constexpr int THREADS = BLOCK;
+    static constexpr int N = VECS * 8;
+    // The f32 a row shares (`share`): a row of its lanes' elements.
+    static constexpr int SHARED = LANES * N;
+    // The wavefronts of a block: the partials a reduction past a wavefront
+    // gathers.
+    static constexpr int kWaves = BLOCK / kWave;
 
     int width;
-    int tid;
+    int lane;
+    int group;
     int vectors;
+    bool live;
     float* buf;
-    uint4* dst[OUT];
-    uint4 in[IN][PER];
-    uint4 out[OUT][PER];
+    float* row;
+    float* tab;
+    // Each result's store, the plane element its row starts at, and whether
+    // its row lands at all (a paged row past its page, or not live, does
+    // not).
+    Store store[OUT];
+    void* dst[OUT];
+    long long dst_row[OUT];
+    bool lands[OUT];
+    // A late or streamed parameter's first vector, issued by `load<k>()`.
+    const uint4* src[IN];
+    // The vectors each parameter repeats every (a head's weight); else 0.
+    int period[IN];
+    // The vector of 8 each of this thread's slots holds (`ORDER`).
+    unsigned at[VECS];
+    uint4 in[IN][VECS];
+    // An f32 plane's vector of 8 is two words; its last four elements here.
+    uint4 hi[IN][VECS];
+    uint4 out[OUT][VECS];
     float ones[IN];
 
-    // Every parameter's vectors are issued up front, before any body math.
-    __device__ __forceinline__ RowSkeleton(const Planes<IN, OUT>& planes, long long row, float* buf)
+    __host__ __device__ static constexpr int dtype(int k) { return static_cast<int>((DT >> (2 * k)) & 3ull); }
+
+    // Where the skeleton's row, part `part` of the planes' row `of`, starts in
+    // `plane`: a row its own (`whole`), or one element.
+    __device__ __forceinline__ static long long start_of(const Plane& plane, int of, int part, int width,
+                                                         bool whole) {
+        if (plane.row_stride == 0) return 0;
+        long long src = of;
+        if (plane.ids != nullptr) {
+            const int id = plane.ids[of];
+            src = id >= 0 && id < plane.bound ? id : 0;
+        }
+        return src * plane.row_stride + (whole ? static_cast<long long>(part) * width : 0);
+    }
+
+    // Every parameter's vectors are issued up front, before any body math,
+    // but those `LATE` or `STREAM` sets.
+    __device__ __forceinline__ RowSkeleton(const Planes<IN, OUT>& planes, int of, int part,
+                                           bool live, float* buf, float* shared)
         : width(planes.width),
-          tid(static_cast<int>(threadIdx.x)),
+          lane(static_cast<int>(threadIdx.x) % LANES),
+          group(static_cast<int>(threadIdx.x) / LANES),
           vectors(planes.width / 8),
-          buf(buf) {
+          live(live),
+          buf(buf),
+          row(shared + planes.table + (static_cast<int>(threadIdx.x) / LANES) * SHARED),
+          tab(shared) {
+#pragma unroll
+        for (int p = 0; p < VECS; ++p) at[p] = ORDER::vector(static_cast<unsigned>(lane + p * LANES));
 #pragma unroll
         for (int k = 0; k < OUT; ++k) {
-            dst[k] = reinterpret_cast<uint4*>(planes.out[k].base + row * planes.out[k].row_stride);
+            store[k] = planes.store[k];
+            if (store[k].to == 0) store[k].to = planes.width;
+            lands[k] = true;
+            dst[k] = const_cast<void*>(planes.out[k].base);
+            // the window's first column lands at the plane row's start, or
+            // the paged cache row this row's page and slot name
+            dst_row[k] = start_of(planes.out[k], of, part, width, true);
+            if (store[k].page != nullptr) {
+                const long long cell = live ? store_row(store[k], of, planes.out[k].row_stride) : -1;
+                lands[k] = cell >= 0;
+                dst_row[k] = (lands[k] ? cell : 0) + static_cast<long long>(part) * width;
+            }
         }
+        if (!live) return;
 #pragma unroll
         for (int k = 0; k < IN; ++k) {
+            const Plane& plane = planes.in[k];
+            const long long first = start_of(plane, of, part, width, !((ONES >> k) & 1u));
             if ((ONES >> k) & 1u) {
-                ones[k] = to_f32(planes.in[k].base[0]);
+                if (dtype(k) == kI32) {
+                    ones[k] = static_cast<float>(static_cast<const int*>(plane.base)[first]);
+                } else if (dtype(k) == kF32) {
+                    ones[k] = static_cast<const float*>(plane.base)[first];
+                } else {
+                    ones[k] = to_f32(static_cast<const bf16*>(plane.base)[first]);
+                }
                 continue;
             }
-            const uint4* src =
-                reinterpret_cast<const uint4*>(planes.in[k].base + row * planes.in[k].row_stride);
-#pragma unroll
-            for (int p = 0; p < PER; ++p) {
-                const int i = tid + p * BLOCK;
-                if (i < vectors) in[k][p] = src[i];
-            }
+            src[k] = dtype(k) == kF32
+                         ? reinterpret_cast<const uint4*>(static_cast<const float*>(plane.base) + first)
+                         : reinterpret_cast<const uint4*>(static_cast<const bf16*>(plane.base) + first);
+            period[k] = plane.period;
+            if (!(((LATE | STREAM) >> k) & 1u)) issue(k);
         }
     }
 
-    __device__ __forceinline__ bool valid(int e) const { return tid + (e / 8) * BLOCK < vectors; }
+    // Parameter `k`'s vector `p` from `src[k]`.
+    __device__ __forceinline__ void issue_one(int k, int p) {
+        const int slot = lane + p * LANES;
+        if (slot >= vectors) return;
+        const int i = static_cast<int>(at[p]);
+        const int v = period[k] > 0 ? i % period[k] : i;
+        if (dtype(k) == kF32) {
+            in[k][p] = src[k][2 * v];
+            hi[k][p] = src[k][2 * v + 1];
+        } else {
+            in[k][p] = src[k][v];
+        }
+    }
+
+    // Parameter `k`'s vectors from `src[k]`.
+    __device__ __forceinline__ void issue(int k) {
+#pragma unroll
+        for (int p = 0; p < VECS; ++p) issue_one(k, p);
+    }
+
+    // The streamed parameters of `M` (a pass's reads) at vector `p`, where
+    // the pass reaches it: a row too many planes wide for the registers
+    // holds one vector of each at a time, read again by each pass.
+    template <unsigned M>
+    __device__ __forceinline__ void fetch(int p) {
+        if constexpr ((M & STREAM) != 0u) {
+            if (!live) return;
+#pragma unroll
+            for (int k = 0; k < IN; ++k)
+                if (((M & STREAM) >> k) & 1u) issue_one(k, p);
+        }
+    }
+
+    // A late parameter's vectors, issued where the body first wants them
+    // near (the pass before the one that reads them); a parameter this
+    // skeleton loaded up front is already held.
+    template <int K>
+    __device__ __forceinline__ void load() {
+        if constexpr (((LATE >> K) & 1u) != 0u) {
+            if (live) issue(K);
+        }
+    }
+
+    __device__ __forceinline__ bool valid(int e) const { return lane + (e / 8) * LANES < vectors; }
+
+    __device__ __forceinline__ unsigned col(int e) const {
+        return at[e / 8] * 8u + static_cast<unsigned>(e % 8);
+    }
 
     __device__ __forceinline__ float one(int k) const { return ones[k]; }
 
-    __device__ __forceinline__ unsigned col(int e) const {
-        return static_cast<unsigned>((tid + (e / 8) * BLOCK) * 8 + e % 8);
+    // Whether slot `q` of this thread is one of the first `k` of its row: a
+    // pair-packed turn's turned vectors.
+    __device__ __forceinline__ bool turned(int q, unsigned k) const {
+        return static_cast<unsigned>(lane + q * LANES) < k;
     }
 
-    // An angle as the hand kernels turn one.
-    __device__ __forceinline__ float sin(float v) const { return __sinf(v); }
-    __device__ __forceinline__ float cos(float v) const { return __cosf(v); }
-
     __device__ __forceinline__ float ld(int k, int e) const {
+        if (dtype(k) == kF32) {
+            const uint4& word = e % 8 < 4 ? in[k][e / 8] : hi[k][e / 8];
+            return reinterpret_cast<const float*>(&word)[e % 4];
+        }
         return to_f32(reinterpret_cast<const bf16*>(&in[k][e / 8])[e % 8]);
     }
 
-    // `v` as result `k` holds it: rounded to the plane's bf16, what a later
-    // read of the result sees.
+    // `v` as result `k` holds it: rounded to the plane's bf16, which is
+    // what a later read of the result sees, read back from the stored bits.
     __device__ __forceinline__ float st(int k, int e, float v) {
         const bf16 stored = from_f32<bf16>(v);
         reinterpret_cast<bf16*>(&out[k][e / 8])[e % 8] = stored;
-        return to_f32(stored);
+        return __uint_as_float(static_cast<u32>(__builtin_bit_cast(u16, stored)) << 16);
     }
 
     // `v` rounded to bf16 and back: a value the program a body came from
     // stores between two ops, read on as it stored it.
     __device__ __forceinline__ float round_bf16(float v) const { return to_f32(from_f32<bf16>(v)); }
 
-    __device__ __forceinline__ float reduce_sum(float local) { return block_sum(local, buf); }
+    // An angle's sine and cosine, f32 to within an ulp or two over every
+    // angle a position reaches (ocml's `sinf` and `cosf`). kernels-cuda
+    // turns through `__sincosf`; AMD's hardware sine takes revolutions and
+    // only a few hundred of them, short of a long prompt's angles, so HIP's
+    // skeleton turns through the precise pair instead.
+    __device__ __forceinline__ float sin(float v) const { return ::sinf(v); }
+    __device__ __forceinline__ float cos(float v) const { return ::cosf(v); }
 
-    __device__ __forceinline__ float reduce_max(float local) { return block_max(local, buf); }
+    // Partials combined over runs of S threads, in place, the total to each
+    // of them: a butterfly over a wavefront's lanes, and past a wavefront
+    // the wavefronts' totals in the butterfly's order too (wavefront `i` and
+    // `i ^ off`), each thread folding its run's from LDS in the same order,
+    // so every thread of a run holds the same bits.
+    template <int S, bool MAX, int K>
+    __device__ __forceinline__ void reduce_runs(float (&a)[K]) {
+        static_assert((S & (S - 1)) == 0 && S <= BLOCK, "a run is a power of two of a block's threads");
+        auto join = [](float x, float y) { return MAX ? fmaxf(x, y) : x + y; };
+        constexpr int kLanes = S < kWave ? S : kWave;
+#pragma unroll
+        for (int p = 0; p < K; ++p)
+#pragma unroll
+            for (int off = kLanes / 2; off > 0; off >>= 1) a[p] = join(a[p], __shfl_xor(a[p], off, kWave));
+        if constexpr (S > kWave) {
+            constexpr int kSpan = S / kWave;
+            const int wave = static_cast<int>(threadIdx.x) / kWave;
+            if (static_cast<int>(threadIdx.x) % kWave == 0) {
+#pragma unroll
+                for (int p = 0; p < K; ++p) buf[p * kWaves + wave] = a[p];
+            }
+            __syncthreads();
+            const int first = wave / kSpan * kSpan;
+#pragma unroll
+            for (int p = 0; p < K; ++p) {
+                float t[kSpan];
+#pragma unroll
+                for (int w = 0; w < kSpan; ++w) t[w] = buf[p * kWaves + first + w];
+#pragma unroll
+                for (int off = kSpan / 2; off > 0; off >>= 1)
+#pragma unroll
+                    for (int i = 0; i < off; ++i) t[i] = join(t[i], t[i + off]);
+                a[p] = t[0];
+            }
+            __syncthreads();
+        }
+    }
 
-    // Result `K`'s row to memory, once its last element is written.
+    // `K` sums over the row at once, in place, a batch of up to kBatch
+    // through one pass of the block's barriers: a blend's candidates' square
+    // sums and dots.
+    template <int K>
+    __device__ __forceinline__ void reduce_sums(float (&a)[K]) {
+#pragma unroll
+        for (int at0 = 0; at0 < K; at0 += kBatch) {
+            constexpr int kMost = K < kBatch ? K : kBatch;
+            float batch[kMost];
+#pragma unroll
+            for (int j = 0; j < kMost; ++j) batch[j] = at0 + j < K ? a[at0 + j] : 0.f;
+            reduce_runs<LANES, false>(batch);
+#pragma unroll
+            for (int j = 0; j < kMost; ++j)
+                if (at0 + j < K) a[at0 + j] = batch[j];
+        }
+    }
+
+    __device__ __forceinline__ float reduce_sum(float local) {
+        float a[1] = {local};
+        reduce_runs<LANES, false>(a);
+        return a[0];
+    }
+
+    __device__ __forceinline__ float reduce_max(float local) {
+        float a[1] = {local};
+        reduce_runs<LANES, true>(a);
+        return a[0];
+    }
+
+    // Each vector's partial combined over its head of S vectors, in place:
+    // a head's lanes sit side by side (S divides LANES).
+    template <int S, bool MAX>
+    __device__ __forceinline__ void reduce_heads(float (&a)[VECS]) {
+        static_assert((S & (S - 1)) == 0 && S <= LANES && LANES % S == 0,
+                      "a head is a power-of-two run of a row's lanes");
+        reduce_runs<S, MAX>(a);
+    }
+
+    template <int S>
+    __device__ __forceinline__ void reduce_sum_heads(float (&a)[VECS]) {
+        reduce_heads<S, false>(a);
+    }
+
+    template <int S>
+    __device__ __forceinline__ void reduce_max_heads(float (&a)[VECS]) {
+        reduce_heads<S, true>(a);
+    }
+
+    // A gather within the row: each element shared at its column, the row
+    // complete for every thread (`sync`), then any column read back.
+    __device__ __forceinline__ void share(int e, float v) { row[col(e)] = v; }
+
+    // A row within a wavefront shares its row with that wavefront's lanes
+    // alone.
+    __device__ __forceinline__ void sync() {
+        if constexpr (LANES <= kWave) {
+            wave_sync();
+        } else {
+            __syncthreads();
+        }
+    }
+
+    // The block's table complete for every thread.
+    __device__ __forceinline__ void sync_block() { __syncthreads(); }
+
+    // The block's table complete for every thread by the first read of it,
+    // which follows a row's share (`sync()`): that share meets the whole
+    // block where a row is more than a wavefront's lanes; a wavefront's row
+    // meets its wavefront alone, so the table takes a barrier of its own.
+    __device__ __forceinline__ void sync_table() {
+        if constexpr (LANES <= kWave) __syncthreads();
+    }
+
+    __device__ __forceinline__ float peer(unsigned c) const { return row[c < SHARED ? c : 0u]; }
+
+    // What a column alone computes, tabled once a block: the body writes
+    // entry `c` of its table (each thread its own entries, `f.sync_block()`
+    // after) and every row reads it back.
+    __device__ __forceinline__ float* table() const { return tab; }
+
+    __device__ __forceinline__ unsigned thread() const { return threadIdx.x; }
+
+    // Result `K`'s row to memory: a body flushes a result once its last
+    // element is written, so the store overlaps whatever follows.
     template <int K>
     __device__ __forceinline__ void flush() {
+        if (!live || !lands[K]) return;
 #pragma unroll
-        for (int p = 0; p < PER; ++p) {
-            const int i = tid + p * BLOCK;
-            if (i < vectors) dst[K][i] = out[K][p];
+        for (int p = 0; p < VECS; ++p) {
+            const int slot = lane + p * LANES;
+            // the column the window lands the vector at: a head's of every
+            // stride
+            const long long landed = slot < vectors ? store_at(store[K], at[p] * 8ll, store[K].to) : -1;
+            if (landed >= 0) store8(dst[K], dst_row[K] + landed, out[K][p], store[K]);
         }
     }
 };
 
-// A row skeleton a block a row: `body(f)` computes the row in hooks over `f`.
-// The rows past a staged window's live count are left as they are.
-template <class Body, int BLOCK, int PER, int IN, int OUT, unsigned ONES = 0u>
+// A row skeleton of LANES threads a row: `body(f)` computes the row in hooks
+// over `f`, its own fields (a norm's eps) passed by value. The rows past a
+// staged window's live count are left as they are. A body that tables its
+// columns' values is fired with `planes.table` floats of dynamic shared
+// memory, and one that shares its row BLOCK * VECS * 8 floats more.
+template <class Body, int BLOCK, int LANES, int VECS, int IN, int OUT, unsigned ONES = 0u,
+          unsigned long long DT = 0ull, bool READ_ONLY = false, unsigned LATE = 0u,
+          unsigned STREAM = 0u>
 __global__ void __launch_bounds__(BLOCK) row_skeleton(
     const Planes<IN, OUT> planes,
     const Body body,
     const u32* __restrict__ win)
 {
-    const int row = blockIdx.x;
-    if (win != nullptr && row >= static_cast<int>(win[0])) return;
-    const int plane_row = win != nullptr ? row + static_cast<int>(win[1]) : row;
+    constexpr int ROWS = BLOCK / LANES;
+    // A staged window's rows are the planes' rows; the skeleton's are their
+    // parts.
+    const int live_rows =
+        win != nullptr ? min(planes.rows, static_cast<int>(win[0]) * planes.parts) : planes.rows;
+    const int first = static_cast<int>(blockIdx.x) * ROWS;
+    if (first >= live_rows) return;
+    const int row = first + static_cast<int>(threadIdx.x) / LANES;
+    // the planes' row and the part of it
+    int of = row;
+    int part = 0;
+    if (planes.parts > 1) {
+        of = row / planes.parts;
+        part = row - of * planes.parts;
+    }
+    if (win != nullptr) of += static_cast<int>(win[1]);
 
-    __shared__ float buf[BLOCK / 32 + 1];
-    RowSkeleton<BLOCK, PER, IN, OUT, ONES> f(planes, plane_row, buf);
+    __shared__ float buf[(VECS > kBatch ? VECS : kBatch) * (BLOCK / kWave) + 1];
+    extern __shared__ float shared[];
+    RowSkeleton<BLOCK, LANES, VECS, IN, OUT, ONES, DT, READ_ONLY, LATE,
+                typename OrderOf<Body>::type, STREAM>
+        f(planes, of, part, row < live_rows, buf, shared);
     body(f);
 }
 
-}
+}  // namespace pie::elemwise
