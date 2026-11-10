@@ -493,3 +493,13 @@ The `new-memory/` directory is bookkeeping and is removed before anything lands 
 - Gemma mini jump explained: single-lane prefill(n) vs prefill(n-1)+decode(1) moves the random-weight mini by 4-6.5
   too; real gemma is bf16-noise only.
 - Next: IT rerun of the MTP reused-record repro on this build; PLE rebase; K2; tiers; ROCm; other backends.
+
+### M35 — 2026-11-10: PLE row cache merged (CUDA weight streaming, rows)
+- `sc/l40s-wc-ple` (eb79b3076): `embed_tabled` + per-block hit counters; engine pins plain-Gather::Embed tables on
+  host (mapped), states their row blocks as a weight shape (WEIGHTS=4); `weight_residency` h2d-fills named slots and
+  rewrites the RowTable, unnamed blocks read zero-copy; `weight_uses` returns/clears per-block device counts.
+- Verified L40S: golden_rows host/cached/mixed = base; golden_logits 8, by_refs, submit_buffered = base;
+  golden_rows_resident (streaming off: all blocks seated before the first fire at engine level); decode one-row
+  fires resident 8.98 ms / all-host 8.98 / base 9.09 (debug).
+- Gaps: first residency published only at the first governor tick (fires before read host); bootstrap fallback
+  "stay as loaded" = permanent host reads on CUDA; staging floor ignored (sync h2d); other embed variants resident.
