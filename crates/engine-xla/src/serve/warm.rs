@@ -248,7 +248,11 @@ impl Shell {
         // GiB a MiB for it and for every compile still running (one that
         // started may not have taken its memory yet). A v5e host's 47 GB
         // stopped answering at four started together.
-        let longest = texts.iter().map(|(t, _)| t.len() as u64).max().unwrap_or(0);
+        let longest = texts
+            .iter()
+            .map(|(t, _)| hold_bytes(t) >> 6)
+            .max()
+            .unwrap_or(0);
         let need = (longest * 3) << 8;
         // A compiled program held in host memory costs ~64 bytes a byte of its
         // text (0.5 GB a 9 MiB program; 65 of them 42 GB of a v5e host's 47),
@@ -286,7 +290,7 @@ impl Shell {
                         let Some((text, sig)) = texts.get(at) else {
                             break;
                         };
-                        let hold = (text.len() as u64) << 6;
+                        let hold = hold_bytes(text);
                         let kept = held
                             .fetch_update(SeqCst, SeqCst, |h| {
                                 (h + hold <= budget).then_some(h + hold)
@@ -447,4 +451,19 @@ fn available_memory() -> Option<u64> {
     let line = info.lines().find(|l| l.starts_with("MemAvailable:"))?;
     let kib: u64 = line.split_whitespace().nth(1)?.parse().ok()?;
     Some(kib << 10)
+}
+
+/// The host memory a compiled program holds: ~64 bytes a byte of its text,
+/// less its Mosaic kernels' bodies (`tpu_custom_call` configs, one HLO
+/// instruction each however long its base64), counted at their own size.
+fn hold_bytes(text: &str) -> u64 {
+    const BODY: &str = "\\22body\\22: \\22";
+    let (mut kernels, mut rest) = (0, text);
+    while let Some(at) = rest.find(BODY) {
+        let tail = &rest[at + BODY.len()..];
+        let len = tail.find("\\22").unwrap_or(tail.len());
+        kernels += len;
+        rest = &tail[len..];
+    }
+    (((text.len() - kernels) as u64) << 6) + kernels as u64
 }
