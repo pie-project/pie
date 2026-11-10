@@ -244,6 +244,32 @@ pub fn streamed(trace: &Trace) -> Vec<usize> {
     all
 }
 
+/// What `trace`'s weights demand of the device however the runtime runs the
+/// weight cache, its params' stored bytes `plane_bytes` (aligned): every
+/// weight no shape of `recipe` streams, whole, and of the streamable ones
+/// only the floor each shape's slots keep; and the streamable weights'
+/// whole bytes, which a held set seats in pool slots and a streaming one
+/// reads a few atoms of at a time.
+#[must_use]
+pub fn resident_demand(trace: &Trace, recipe: &ChunkRecipe, plane_bytes: &[u64]) -> (u64, u64) {
+    let shapes = Shape::of(trace, recipe);
+    let streamed: std::collections::BTreeSet<usize> = shapes
+        .iter()
+        .flat_map(|shape| shape.planes.iter().map(|plane| plane.param))
+        .collect();
+    let aligned = |at: usize| plane_bytes[at].next_multiple_of(crate::weights::ALIGN);
+    let kept: u64 = (0..plane_bytes.len())
+        .filter(|at| !streamed.contains(at))
+        .map(aligned)
+        .sum();
+    let floor: u64 = shapes
+        .iter()
+        .map(|shape| u64::from(shape.floor) * shape.slot_bytes)
+        .sum();
+    let streamable: u64 = streamed.iter().map(|&at| aligned(at)).sum();
+    (kept + floor, streamable)
+}
+
 /// One weight's part of a shape. Its groups (row blocks, or a layer's
 /// experts) are `stride` bytes apart in the weight's own copy, each cut into
 /// `pieces` runs of `piece` bytes (an expert's rows on the output axis; a

@@ -348,17 +348,38 @@ impl Engine for Metal {
         };
         let contract = (self.contract_for)(&trace, &path).map_err(Error::Load)?;
 
-        // Dense weights always live in device memory: their bytes come off
-        // the device first (the weight cache's tables and banks among them,
-        // read whole until the runtime names their slots).
-        let weights = crate::weights::plane_bytes(&trace)
-            .map_err(fault)?
-            .iter()
-            .map(|plane| plane.next_multiple_of(crate::weights::ALIGN))
-            .sum::<u64>();
-        let (working_set, elsewhere) = {
+        let (working_set, elsewhere, caches) = {
             let device = crate::device::Context::bind().map_err(fault)?;
-            (device.working_set(), device.held_elsewhere())
+            (
+                device.working_set(),
+                device.held_elsewhere(),
+                // The weight cache runs where the queue keeps a residency set.
+                device
+                    .hold_resident(std::iter::empty(), true)
+                    .map_err(fault)?,
+            )
+        };
+        // Dense weights always live in device memory, and so does every
+        // weight the weight cache does not stream; of the streamable ones
+        // (routed experts, token-id tables) only the floor the cache keeps
+        // must: the rest leaves the device under streaming, and a held set
+        // seats it in the pool.
+        let planes = crate::weights::plane_bytes(&trace).map_err(fault)?;
+        let (weights, streamable) = if caches {
+            let recipe = crate::chunks::recipe(
+                &trace,
+                &poem_compiler::Budgets::of(bake_budgets(&budgets, &trace)),
+            )
+            .map_err(fault)?;
+            crate::store::streamed::resident_demand(&trace, &recipe, &planes)
+        } else {
+            (
+                planes
+                    .iter()
+                    .map(|plane| plane.next_multiple_of(crate::weights::ALIGN))
+                    .sum::<u64>(),
+                0,
+            )
         };
         let util = residency.device_memory_share;
         let slots = poem_compiler::state_slots(budgets.slots, &trace, DEFAULT_STATE_SLOTS);
@@ -381,6 +402,7 @@ impl Engine for Metal {
                 scratch,
                 kv_pool,
             )
+            .with_streamable(streamable)
         };
 
         // Compiled before the residency check, so the check prices the arena

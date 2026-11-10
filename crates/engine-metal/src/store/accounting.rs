@@ -17,6 +17,10 @@ pub struct Accounting {
     pub floor: u64,
     pub pool: u64,
     pub minimum: u64,
+    /// The streamable weights' whole bytes (routed experts, token-id
+    /// tables), which `weights` counts at their floor only: they leave the
+    /// device through the weight cache.
+    pub streamable: u64,
 }
 
 impl Accounting {
@@ -69,7 +73,16 @@ impl Accounting {
                 .saturating_sub(scratch)
                 .saturating_sub(floor),
             minimum,
+            streamable: 0,
         }
+    }
+
+    /// This accounting naming `bytes` of streamable weights the weights it
+    /// charges count at their floor.
+    #[must_use]
+    pub fn with_streamable(mut self, bytes: u64) -> Accounting {
+        self.streamable = bytes;
+        self
     }
 
     /// Refuses a load whose dense weights, arena scratch and the driver's
@@ -79,6 +92,15 @@ impl Accounting {
         if self.pool >= self.minimum {
             return Ok(());
         }
+        let streamable = if self.streamable > 0 {
+            format!(
+                ", the {} bytes of streamable experts and tables counted at the floor the \
+                 weight cache keeps of them",
+                self.streamable
+            )
+        } else {
+            String::new()
+        };
         let scratch = if self.scratch > 0 {
             format!(
                 ", the arena scratch the compiled axes reserve takes {} (sized by `[engine] \
@@ -92,7 +114,7 @@ impl Accounting {
             "the device does not hold this deployment: recommendedMaxWorkingSetSize is \
              {working_set} bytes, other processes held {elsewhere} of it when this load began, \
              and `[model] device_memory_share` = {utilization} allows pie {ceiling}; the \
-             weights take {weights} (dense weights always live in device memory){scratch} and the \
+             weights that stay in device memory take {weights} (every dense plane{streamable}){scratch} and the \
              driver's safety floor holds back {floor}, leaving {pool} bytes for the kv pool, \
              which needs {minimum} (`[model] device_kv_budget`, or one sequence at the \
              declared context when that is omitted). On Apple Silicon a GPU-touched Shared \

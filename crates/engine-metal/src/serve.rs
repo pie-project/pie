@@ -381,7 +381,6 @@ impl Shell {
         weights: &mut Weights,
         trace: &Trace,
         recipe: &poem_compiler::chunk::ChunkRecipe,
-        held: bool,
     ) -> Result<Vec<crate::store::streamed::Cache>> {
         let shapes = crate::store::streamed::Shape::of(trace, recipe);
         if shapes.is_empty() || !device.hold_resident(std::iter::empty(), true)? {
@@ -389,7 +388,7 @@ impl Shell {
         }
         let mut caches = Vec::with_capacity(shapes.len());
         for shape in shapes {
-            let mut cache = crate::store::streamed::Cache::open(
+            let cache = crate::store::streamed::Cache::open(
                 device,
                 handles,
                 shape,
@@ -400,13 +399,10 @@ impl Shell {
                 },
                 |param| weights.filed(param),
             )?;
-            // A held load seats every atom in the pool before any fire: the
-            // own copies join the residency set only where a miss reads
-            // them in place (`Shell::hold_weight_hosts`).
-            if !held {
-                device.hold_resident(cache.host_slabs(), true)?;
-                cache.set_hosts_resident(true);
-            }
+            // The weights' own copies join the residency set only where a
+            // miss reads them in place (`Shell::hold_weight_hosts`, once the
+            // load has or has not seated them): a weight read out of the
+            // serving file gets its window then.
             for (param, table) in cache.tables() {
                 weights.read_through(param, table);
             }
@@ -765,9 +761,14 @@ impl PreparedLoad<'_> {
                 &mut weights,
                 &boot.trace,
                 &recipe,
-                boot.residency.weights_held(),
             )?
         };
+        // A weight kept apart that no cache takes is read whole, in place.
+        let claimed: std::collections::BTreeSet<usize> = weight_caches
+            .iter()
+            .flat_map(|cache| cache.shape.planes.iter().map(|plane| plane.param))
+            .collect();
+        weights.open_unclaimed(&device, &handles, &claimed)?;
         handles.seal();
 
         // The kv pool and the recurrent-state buffers beside it: both are
@@ -792,6 +793,7 @@ impl PreparedLoad<'_> {
                 compiled.arena.bytes,
                 pool,
             )
+            .with_streamable(weights.filed_bytes())
         };
         // One chunk pool holds every kv page and every record (the rs
         // buffer's rows inside it), in what the room holds of whole chunks.

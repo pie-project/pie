@@ -130,12 +130,12 @@ impl Weights {
             .map(|(at, param)| (param.name.as_str(), at))
             .collect();
         let pairings = pairings(&landing, &index)?;
-        // A load whose weight cache the runtime holds seats the streamed
-        // weights in pool slots itself: a warm load reads each out of the
-        // serving file through a window of its own, which nothing but a
-        // miss would read in place.
+        // A warm load keeps each streamable weight out of the mapped
+        // windows, read out of the serving file through a window of its own
+        // that only a miss opens: a held set seats it in the pool, a
+        // streaming one reads a few atoms of it at a time.
         let apart: std::collections::BTreeSet<usize> =
-            if plan.weights_held() && !plan.whole_weights() {
+            if !plan.whole_weights() {
                 crate::store::streamed::streamed(trace)
                     .into_iter()
                     .collect()
@@ -392,6 +392,40 @@ impl Weights {
         handles.rebind_at(handle, &window, cut.view(offset).unwrap_or(0))?;
         self.hosted.insert(param, window);
         Ok(handles.get(handle).map(|binding| binding.clone()))
+    }
+
+    /// Opens the window of every weight kept apart that `claimed` (the
+    /// weight cache's params) does not take: such a weight is read whole,
+    /// in place.
+    pub fn open_unclaimed(
+        &mut self,
+        device: &Context,
+        handles: &Handles,
+        claimed: &std::collections::BTreeSet<usize>,
+    ) -> Result<()> {
+        let unclaimed: Vec<usize> = self
+            .filed
+            .keys()
+            .copied()
+            .filter(|param| !claimed.contains(param))
+            .collect();
+        for param in unclaimed {
+            let handle = match self.table.0.get(param).copied().flatten() {
+                Some(WeightRow::Dense(plane)) => plane.buf,
+                Some(WeightRow::Planes(bank)) => bank.codes.buf,
+                None => continue,
+            };
+            self.open_filed(device, handles, param, handle)?;
+            self.filed.remove(&param);
+        }
+        Ok(())
+    }
+
+    /// The bytes of the weights kept apart from the mapped windows (see
+    /// `filed`), which no window charges.
+    #[must_use]
+    pub fn filed_bytes(&self) -> u64 {
+        self.filed.values().map(|(_, _, bytes)| *bytes).sum()
     }
 
     /// Where `param` lies in the serving file, where a warm held load
