@@ -455,3 +455,14 @@ The `new-memory/` directory is bookkeeping and is removed before anything lands 
 - Waste regression (T forced to the kv page): models with windows CUDA 0.36 -> 1.19%, Metal 2.43 -> 4.47%;
   dsv41-flash-dspark 1.33 -> 19.3 / 5.9 -> 45.7, dsv4-base 0.48 -> 16.6 / 7.1 -> 22.8. -> WL2: per-window T_w and
   independent trimming.
+
+### Note — 2026-11-10: IT round 3 (sm_120)
+- Gemma-4-E2B 2-lane vs 1-lane (degenerate, 48/37, 48/48, 700/37, 1200/600, window 512): top-4 logits move up to
+  ~0.5 at step 0, no token changes; lane result independent of partner/order; plans correct. vs fp32 HF reference
+  alone and together are equally far (bf16 pipeline error size). Not a bug.
+- Shared mode (aaefde791 + sc/l40s-bc 51a1d2e81): beam 3x12 runs; tokens identical to degenerate for beam 2x8/3x12/
+  4x16, ckpt_sync, MTP k=0/2/4, resume/fork/long prompt/sequential incl. top-4 bits. Group fire dumps on
+  sc/it-rw-bc 7100e78bb `new-memory/it-divergence/group/` (for the L40S group probe).
+- Engine bug (pre-existing): engine-cuda serve/prepare.rs `rs_ahead` not cleared on a plain Fold, so a new working set
+  reusing an rs record after MTP is refused ("lands its rows at slot 29 ... below 92"). Fix assigned to L40S (BC).
+- Seen once: engine stall during MTP ("pending CloseInstance 19, frame k=2 lanes=1 pending_binds=1"), not reproduced.
