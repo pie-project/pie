@@ -2601,7 +2601,8 @@ fn segment_sum(
         depth: SegmentSum::depth_of(tb, k, e, chunk),
         vmem_cap: tuning.vmem_cap(),
     };
-    if !seg.fits() || n % 128 != 0 || tm % chunk != 0 {
+    // (The cuts it is measured on: 32 experts, rows 2048 and 2816 wide.)
+    if !seg.fits() || n % 128 != 0 || n > 4096 || e > 32 || tm % chunk != 0 {
         return Ok(None);
     }
     // Each block's pairs per expert (the pairs are token-major: block `b`
