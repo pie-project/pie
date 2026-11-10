@@ -167,7 +167,10 @@ impl SharedGrow {
                 }
             }
             if evacuating {
-                // The segment drains until the next fire retires.
+                // The segment drains until the first fire handed out after
+                // the engine took the copy retires.
+                let (current, _) = self.epochs();
+                self.shared.lock().unwrap().evacuated(current);
                 return;
             }
         }

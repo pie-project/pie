@@ -265,8 +265,9 @@ pub(crate) async fn fire_float_lane<C: FireContext>(
         None => Vec::new(),
     };
     let plan = fold_one_plan(&rs_ids);
-    let rs_prepared = match reserve(
+    let (rs_prepared, epoch) = match reserve(
         ctx,
+        (model, engine),
         &stores,
         quorum_pipeline_id,
         &[],
@@ -276,7 +277,7 @@ pub(crate) async fn fire_float_lane<C: FireContext>(
     )
     .await
     {
-        Ok(Reserved { rs, .. }) => rs,
+        Ok(Reserved { rs, epoch, .. }) => (rs, epoch),
         Err(error) => return Ok(Err(error)),
     };
     for lane in &mut req.lanes {
@@ -317,6 +318,7 @@ pub(crate) async fn fire_float_lane<C: FireContext>(
         record_submit_failure(ctx, &fwd, &pipeline_failure, &reason);
         return Ok(Err(reason));
     }
+    epoch.retire_on(&completion);
     ticket_reservation.commit();
     advance_shadow(ctx, &fwd)?;
     let mut advanced: Vec<u32> = Vec::new();

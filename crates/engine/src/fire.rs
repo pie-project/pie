@@ -502,11 +502,17 @@ impl Serves {
     }
 }
 
-/// The state after the lane's first `row` rows, landed in state slot `slot`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+/// The state after the lane's first `row` rows, landed in a record of its
+/// own: state slot `slot`, or, to an engine that states chunks, the fixed
+/// shape's slot ref of the record's first piece. `pieces` names every piece
+/// of that record, in piece order, where it takes more than one; empty, the
+/// record is `slot` alone.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RsSnapshot {
     pub row: u32,
     pub slot: u32,
+    #[serde(default)]
+    pub pieces: Vec<u32>,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
