@@ -1072,6 +1072,7 @@ fn the_routed_mlp_on_one_sort_answers_its_parts() {
     for (t, tk, glu) in [
         (40usize, 4usize, moe::ExpertGlu::Swiglu),
         (9, 2, moe::ExpertGlu::GegluTanh),
+        (1100, 4, moe::ExpertGlu::Swiglu),
     ] {
         let x = data(t * h, 61);
         let wu: Vec<f32> = data(e * 2 * i * h, 62)
@@ -1086,9 +1087,10 @@ fn the_routed_mlp_on_one_sort_answers_its_parts() {
             .map(|p| ((hash(p / tk, 64) as usize + p % tk) % e) as i32)
             .collect();
         let weights: Vec<f32> = data(t * tk, 65).iter().map(|v| v.abs()).collect();
-        let run = |fused: bool, steps: i64| {
+        let run = |fused: bool, steps: i64, segment: i64| {
             let mut b = Bench::new().with_tuning(kernels_xla::tuning::Tuning {
                 moe_gmm_run: steps,
+                moe_segment_tokens: segment,
                 ..kernels_xla::tuning::Tuning::DEFAULT
             });
             let xt = b.bf16(t as u32, h as u32, &x);
@@ -1167,13 +1169,20 @@ fn the_routed_mlp_on_one_sort_answers_its_parts() {
             }
             Some(b.read_f32(y))
         };
-        let (Some(fused), Some(parts), Some(stepped)) = (run(true, 1), run(false, 1), run(true, 4))
-        else {
+        let (Some(fused), Some(parts), Some(stepped), Some(segmented)) = (
+            run(true, 1, 0),
+            run(false, 1, 0),
+            run(true, 4, 0),
+            run(true, 4, 128),
+        ) else {
             return;
         };
         let scale = parts.iter().fold(0f32, |m, v| m.max(v.abs()));
         assert_close(&fused, &parts, 0.01 * scale.max(1.0), 1e-2);
         // Four of an expert's tiles a step land what a step a tile does.
         assert_eq!(stepped, fused);
+        // Each token's rows summed a block of tokens at a time: the one-hot
+        // dot's sums, to the order their f32 terms add in.
+        assert_close(&segmented, &stepped, 1e-4 * scale.max(1.0), 1e-5);
     }
 }
