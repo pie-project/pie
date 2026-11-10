@@ -34,6 +34,17 @@ const G: i64 = 8;
 /// Keys a chunk of a row's walk.
 const CHUNK: i64 = 128;
 
+/// Rows whose pages are in VMEM or on their way: a row's copies are short
+/// beside the HBM's latency, so with one row ahead the copies wait on each
+/// other more than on the bandwidth.
+fn depth() -> i64 {
+    std::env::var("PIE_PAGES_DEPTH")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(2)
+        .clamp(2, 8)
+}
+
 /// The query heads' lanes: a row's heads padded to a whole vreg row (heads
 /// past `qh` score nothing and are cut off after).
 const QP: i64 = 128;
@@ -57,9 +68,9 @@ struct Shape {
 impl Shape {
     fn vmem(span: i64, h: &Heads) -> i64 {
         let (qh, w, wv) = (h.qh(), h.kvh * h.d, h.kvh * h.dv);
-        // both slots of keys and values, the state, the blocks, room for
+        // every slot of keys and values, the state, the blocks, room for
         // a chunk's temporaries
-        2 * span * (w + wv) * 2
+        depth() * span * (w + wv) * 2
             + h.dv * QP * 4
             + 2 * G * (qh * h.d * 4 + h.dv * QP * 4 + 2 * QP * 4)
             + 8 * CHUNK * (w + wv) * 4
@@ -90,6 +101,7 @@ fn kernel(s: &Shape, vmem_cap: i64) -> Built<Compiled> {
     let (qh, gq, d, dv, kvh) = (h.qh(), h.g, h.d, h.dv, h.kvh);
     let (w, wv) = (kvh * d, kvh * dv);
     let steps = rp / G;
+    let depth = depth();
     let rows = |b: &mut Body, gr: &Grid| -> Built<Vec<V>> {
         let zero = b.i32(0);
         Ok(vec![gr.ids[0], zero])
@@ -125,9 +137,9 @@ fn kernel(s: &Shape, vmem_cap: i64) -> Built<Compiled> {
         ],
         vmem_limit: Some(u64::try_from(vmem_cap).unwrap_or(0)),
         scratch: vec![
-            MTy::Ref(vec![2, span, w], Elem::Bf16, Space::Vmem),
-            MTy::Ref(vec![2, span, wv], Elem::Bf16, Space::Vmem),
-            MTy::Sem(vec![2, 2]),
+            MTy::Ref(vec![depth, span, w], Elem::Bf16, Space::Vmem),
+            MTy::Ref(vec![depth, span, wv], Elem::Bf16, Space::Vmem),
+            MTy::Sem(vec![2, depth]),
             MTy::Ref(vec![1, QP], Elem::F32, Space::Vmem),
             MTy::Ref(vec![1, QP], Elem::F32, Space::Vmem),
             MTy::Ref(vec![dv, QP], Elem::F32, Space::Vmem),
@@ -190,8 +202,11 @@ fn kernel(s: &Shape, vmem_cap: i64) -> Built<Compiled> {
         let zero = b.i32(0);
         let first = b.cmpi(ICmp::Eq, i, zero)?;
         b.when(first, |b| {
-            let z = b.i32(0);
-            copies(b, z, z, false)
+            for j in 0..(depth - 1).min(rp) {
+                let j = b.i32(j);
+                copies(b, j, j, false)?;
+            }
+            Ok(())
         })?;
 
         // the block-diagonal query's column heads and row heads (a row
@@ -228,16 +243,16 @@ fn kernel(s: &Shape, vmem_cap: i64) -> Built<Compiled> {
         let (z, gn, step1) = (b.i32(0), b.i32(G), b.i32(1));
         b.for_range(z, gn, step1, |b, r| {
             let row = b.addi(base, r)?;
-            let two = b.i32(2);
-            let slot = b.remsi(row, two)?;
-            // the next row's pages fly while this row computes
-            let one = b.i32(1);
-            let next = b.addi(row, one)?;
+            let dv_ = b.i32(depth);
+            let slot = b.remsi(row, dv_)?;
+            // the rows ahead's pages fly while this row computes
+            let ahead = b.i32(depth - 1);
+            let next = b.addi(row, ahead)?;
             let rpv = b.i32(rp);
             let more = b.cmpi(ICmp::Slt, next, rpv)?;
             b.when(more, |b| {
-                let one = b.i32(1);
-                let other = b.subi(one, slot)?;
+                let dv_ = b.i32(depth);
+                let other = b.remsi(next, dv_)?;
                 copies(b, next, other, false)
             })?;
             copies(b, row, slot, true)?;
