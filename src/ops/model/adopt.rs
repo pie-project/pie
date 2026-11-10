@@ -17,7 +17,7 @@ use clap::Args;
 use runtime::engine::load::Platform;
 use serde::Serialize;
 
-use crate::ui::{Align, Mark, Palette, Row, Table};
+use crate::ui::{Mark, Palette};
 
 #[derive(Args, Debug)]
 pub struct AdoptArgs {
@@ -35,6 +35,10 @@ pub struct AdoptArgs {
     /// Replace an earlier adoption of the same name.
     #[arg(long)]
     pub force: bool,
+    /// Show every setting compared, every deployment's reason, and the
+    /// adoption block.
+    #[arg(long, short = 'v')]
+    pub verbose: bool,
 }
 
 const PLATFORMS: [Platform; 6] = [
@@ -57,6 +61,7 @@ pub fn run(args: AdoptArgs) -> Result<crate::ui::Answer> {
     let catalog = runtime::catalog::catalog();
     let kin = catalog.kin(&src, platform);
     let mut report = Report {
+        schema: SCHEMA,
         card,
         hollow,
         kin: kin.iter().map(Family::of).collect(),
@@ -65,6 +70,7 @@ pub fn run(args: AdoptArgs) -> Result<crate::ui::Answer> {
         refused: None,
         passed_over: Vec::new(),
         unknown: None,
+        verbose: args.verbose,
     };
 
     if kin.is_empty() {
@@ -139,11 +145,7 @@ pub fn run(args: AdoptArgs) -> Result<crate::ui::Answer> {
         if verdict.is_ok() && first.is_none() {
             first = Some(deployment.clone());
         }
-        deployments.push(Landing {
-            name: deployment.name.clone(),
-            reads: verdict.is_ok(),
-            why: verdict.err().map(|why| reason(&why)),
-        });
+        deployments.push(Landing::of(deployment, verdict));
     }
     let traces = match &first {
         Some(d) => PLATFORMS
@@ -184,13 +186,13 @@ pub fn run(args: AdoptArgs) -> Result<crate::ui::Answer> {
         dry_run: args.dry_run,
         text: if args.show {
             Some(package_text)
-        } else if args.dry_run {
+        } else if args.verbose {
             Some(adopted.adoption.block.clone())
         } else {
             None
         },
         whole: args.show,
-        next: format!("pie model import {}", args.source),
+        source: args.source.clone(),
     });
     let code = if first.is_some() && tokenizer.is_ok() {
         std::process::ExitCode::SUCCESS
@@ -240,7 +242,9 @@ fn resolve(source: &str) -> Result<(PathBuf, String, bool)> {
     let root = crate::paths::pie_home()
         .join("adopt")
         .join(format!("{owner}--{name}"));
-    eprintln!("Reading {source}'s configuration and weight headers (no weights)");
+    if crate::ui::is_interactive(crate::ui::Stream::Stderr) {
+        eprintln!("Fetching {source} metadata (config, tokenizer, weight headers)…");
+    }
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()?;
@@ -441,8 +445,12 @@ fn reason(text: &str) -> String {
     said.trim().to_string()
 }
 
+/// The version of `--json`'s shape: a field renamed or removed bumps it.
+const SCHEMA: u32 = 1;
+
 #[derive(Serialize)]
 struct Report {
+    schema: u32,
     card: Card,
     hollow: bool,
     kin: Vec<Family>,
@@ -452,6 +460,8 @@ struct Report {
     /// What each nearer family that refused it said.
     passed_over: Vec<String>,
     unknown: Option<Unknown>,
+    #[serde(skip)]
+    verbose: bool,
 }
 
 /// What a checkpoint states of itself, as a person would ask it.
@@ -485,24 +495,44 @@ impl Card {
         let kv = int("num_key_value_heads").or(q);
         let head = int("head_dim").or_else(|| Some(hidden? / q?));
         if let Some(h) = hidden {
-            fact("width", format!("{h}"));
+            fact("Hidden size", grouped(h));
         }
         if let Some(l) = layers {
-            fact("depth", format!("{l} layers"));
+            let mut said = grouped(l);
+            if let Some(types) = text
+                .get("layer_types")
+                .and_then(serde_json::Value::as_array)
+            {
+                let mut kinds: BTreeMap<&str, usize> = BTreeMap::new();
+                for t in types.iter().filter_map(serde_json::Value::as_str) {
+                    *kinds.entry(t).or_default() += 1;
+                }
+                if kinds.len() > 1 {
+                    said.push_str(&format!(
+                        " ({})",
+                        kinds
+                            .iter()
+                            .map(|(k, n)| format!("{n} {}", k.replace('_', " ")))
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    ));
+                }
+            }
+            fact("Layers", said);
         }
         if let (Some(q), Some(kv)) = (q, kv) {
-            let grouping = if kv == q {
-                "multi-head".to_string()
+            let kind = if kv == q {
+                "MHA".to_string()
             } else if kv == 1 {
-                "multi-query".to_string()
+                "MQA".to_string()
             } else {
-                format!("grouped {}:1", q / kv.max(1))
+                "GQA".to_string()
             };
             fact(
-                "attention",
+                "Attention",
                 format!(
-                    "{q} query heads, {kv} key/value heads ({grouping}){}",
-                    head.map(|d| format!(", {d} wide")).unwrap_or_default()
+                    "{kind} · {q} query / {kv} KV heads{}",
+                    head.map(|d| format!(" · head dim {d}")).unwrap_or_default()
                 ),
             );
         }
@@ -512,42 +542,23 @@ impl Card {
                 .and_then(serde_json::Value::as_bool)
                 != Some(false)
         {
-            fact("window", format!("sliding, {window} tokens"));
-        }
-        if let Some(types) = text
-            .get("layer_types")
-            .and_then(serde_json::Value::as_array)
-        {
-            let mut kinds: BTreeMap<&str, usize> = BTreeMap::new();
-            for t in types.iter().filter_map(serde_json::Value::as_str) {
-                *kinds.entry(t).or_default() += 1;
-            }
-            if kinds.len() > 1 {
-                fact(
-                    "layer kinds",
-                    kinds
-                        .iter()
-                        .map(|(k, n)| format!("{n} {k}"))
-                        .collect::<Vec<_>>()
-                        .join(", "),
-                );
-            }
+            fact("Sliding window", format!("{} tokens", grouped(window)));
         }
         let experts = int("num_experts")
             .or_else(|| int("num_local_experts"))
             .or_else(|| int("n_routed_experts"));
         match experts {
             Some(e) if e > 1 => fact(
-                "mlp",
+                "MLP",
                 format!(
-                    "{e} experts, {} routed a token{}{}",
+                    "MoE · {e} experts, top-{}{}{}",
                     int("num_experts_per_tok").map_or("?".to_string(), |k| k.to_string()),
                     int("moe_intermediate_size")
-                        .map(|w| format!(", {w} wide"))
+                        .map(|w| format!(" · expert dim {}", grouped(w)))
                         .unwrap_or_default(),
                     int("n_shared_experts")
                         .filter(|n| *n > 0)
-                        .map(|n| format!(", {n} shared"))
+                        .map(|n| format!(" · {n} shared"))
                         .unwrap_or_default()
                 ),
             ),
@@ -562,7 +573,7 @@ impl Card {
                     } else {
                         format!("gated {act}")
                     };
-                    fact("mlp", format!("{kind}, {inter} wide"));
+                    fact("MLP", format!("{kind} · {}", grouped(inter)));
                 }
             }
         }
@@ -575,14 +586,11 @@ impl Card {
                 .and_then(serde_json::Value::as_bool)
                 .unwrap_or(false);
             fact(
-                "vocabulary",
+                "Vocabulary",
                 format!(
-                    "{vocab} tokens{}",
-                    if tied {
-                        ", head tied to the embedding"
-                    } else {
-                        ", its own head"
-                    }
+                    "{}{}",
+                    grouped(vocab),
+                    if tied { " (tied embeddings)" } else { "" }
                 ),
             );
         }
@@ -592,33 +600,34 @@ impl Card {
                 .and_then(|r| r.get("rope_theta"))
                 .and_then(serde_json::Value::as_f64)
         });
-        let scaling = text
-            .get("rope_scaling")
-            .filter(|s| !s.is_null())
-            .map(|s| {
-                let kind = s
-                    .get("rope_type")
-                    .or_else(|| s.get("type"))
-                    .and_then(serde_json::Value::as_str)
-                    .unwrap_or("scaled");
-                match s.get("factor").and_then(serde_json::Value::as_f64) {
-                    Some(f) => format!("{kind} ×{f}"),
-                    None => kind.to_string(),
-                }
-            })
-            .unwrap_or_else(|| "unscaled".to_string());
-        fact(
-            "position",
-            format!(
-                "rope{}, {scaling}{}",
-                theta.map(|t| format!(" base {t}")).unwrap_or_default(),
-                context
-                    .map(|c| format!("; {c} positions"))
-                    .unwrap_or_default()
-            ),
-        );
+        let scaling = text.get("rope_scaling").filter(|s| !s.is_null()).map(|s| {
+            let kind = s
+                .get("rope_type")
+                .or_else(|| s.get("type"))
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("scaled");
+            match s.get("factor").and_then(serde_json::Value::as_f64) {
+                Some(f) => format!(" · {kind} ×{}", number(f)),
+                None => format!(" · {kind}"),
+            }
+        });
+        if context.is_some() || theta.is_some() {
+            fact(
+                "Context",
+                format!(
+                    "{}{}{}",
+                    context
+                        .map(|c| format!("{} tokens", grouped(c)))
+                        .unwrap_or_else(|| "—".to_string()),
+                    theta
+                        .map(|t| format!(" · RoPE θ {}", number(t)))
+                        .unwrap_or_default(),
+                    scaling.unwrap_or_default()
+                ),
+            );
+        }
         if let Some(eps) = float("rms_norm_eps") {
-            fact("norm", format!("RMS, ε {eps:e}"));
+            fact("Norm", format!("RMSNorm · ε {}", number(eps)));
         }
         if let Some(q) = config.get("quantization_config") {
             let method = q
@@ -626,12 +635,13 @@ impl Card {
                 .and_then(serde_json::Value::as_str)
                 .unwrap_or("quantized");
             let detail = q
-                .get("fmt")
+                .get("quant_algo")
+                .or_else(|| q.get("fmt"))
                 .or_else(|| q.get("format"))
                 .or_else(|| q.get("bits"))
-                .map(|v| format!(" {}", v.to_string().trim_matches('"')))
+                .map(|v| format!(" · {}", v.to_string().trim_matches('"')))
                 .unwrap_or_default();
-            fact("quantization", format!("{method}{detail}"));
+            fact("Quantization", format!("{method}{detail}"));
         }
 
         let mut dtypes: BTreeMap<String, usize> = BTreeMap::new();
@@ -662,6 +672,18 @@ impl Card {
             (Some(l), Some(kv), Some(d)) => Some(2 * l * kv * d * 2),
             _ => None,
         };
+        if let Some(per) = kv_bytes_per_token {
+            fact(
+                "KV cache (bf16)",
+                format!(
+                    "{} / token{}",
+                    size(per),
+                    context
+                        .map(|c| format!(" · {} at {} tokens", size(per * c), grouped(c)))
+                        .unwrap_or_default()
+                ),
+            );
+        }
         Card {
             origin: origin.to_string(),
             architecture: config
@@ -682,6 +704,13 @@ impl Card {
             kv_bytes_per_token,
             context,
         }
+    }
+
+    /// The stored precisions, by how many tensors hold each, most first.
+    fn stored(&self) -> Vec<String> {
+        let mut by: Vec<(&String, &usize)> = self.dtypes.iter().collect();
+        by.sort_by(|a, b| b.1.cmp(a.1));
+        by.into_iter().map(|(d, _)| label(d)).collect()
     }
 }
 
@@ -737,14 +766,48 @@ struct Adoption {
     dry_run: bool,
     text: Option<String>,
     whole: bool,
-    next: String,
+    source: String,
 }
 
 #[derive(Serialize)]
 struct Landing {
     name: String,
+    /// Each weight role's precision, as people name them (`bf16`, `fp8`, `int4`).
+    weights: Vec<String>,
+    kv: String,
+    extras: Vec<String>,
     reads: bool,
     why: Option<String>,
+}
+
+impl Landing {
+    fn of(
+        deployment: &runtime::catalog::Deployment,
+        verdict: std::result::Result<(), String>,
+    ) -> Landing {
+        let deploy = &deployment.deploy;
+        let mut weights: Vec<String> = Vec::new();
+        for precision in &deploy.weights {
+            let said = label(&poem::star::precision_word(*precision));
+            if !weights.contains(&said) {
+                weights.push(said);
+            }
+        }
+        let mut extras: Vec<String> = deploy.parts.clone();
+        extras.extend(deploy.drafter.iter().map(|d| format!("{d} drafter")));
+        Landing {
+            name: deployment.name.clone(),
+            weights,
+            kv: label(&poem::star::word(deploy.kv)),
+            extras,
+            reads: verdict.is_ok(),
+            why: verdict.err().map(|why| reason(&why)),
+        }
+    }
+
+    fn precision(&self) -> String {
+        format!("{} weights · {} KV", self.weights.join(" + "), self.kv)
+    }
 }
 
 /// A checkpoint no family recognizes: what a layer of it holds, for whoever
@@ -782,9 +845,54 @@ fn layer_suffix(name: &str) -> Option<(u64, String)> {
     Some((index, parts[at + 2..].join(".")))
 }
 
+/// A precision as people name it: `bf16`, `fp8`, `nvfp4`, `int4`.
+fn label(word: &str) -> String {
+    let word = word.to_ascii_lowercase();
+    let named = [
+        ("bf16", "bf16"),
+        ("f16", "fp16"),
+        ("f32", "fp32"),
+        ("nvfp4", "nvfp4"),
+        ("mxfp4", "mxfp4"),
+        ("mxfp8", "mxfp8"),
+        ("e4m3", "fp8"),
+        ("e5m2", "fp8"),
+        ("f8", "fp8"),
+        ("fp4", "fp4"),
+        ("u8", "int8"),
+        ("i8", "int8"),
+        ("u4", "int4"),
+        ("i4", "int4"),
+        ("u3", "int3"),
+        ("u2", "int2"),
+        ("u1", "int1"),
+    ];
+    named
+        .iter()
+        .find(|(prefix, _)| word.starts_with(prefix))
+        .map_or(word.clone(), |(_, label)| (*label).to_string())
+}
+
+/// `n` with its thousands grouped: `151,936`.
+fn grouped(n: u64) -> String {
+    let digits = n.to_string();
+    let mut out = String::with_capacity(digits.len() + digits.len() / 3);
+    for (i, c) in digits.chars().enumerate() {
+        if i > 0 && (digits.len() - i).is_multiple_of(3) {
+            out.push(',');
+        }
+        out.push(c);
+    }
+    out
+}
+
 fn number(n: f64) -> String {
     if n.fract() == 0.0 && n.abs() < 1e15 {
-        format!("{}", n as i64)
+        if n < 0.0 {
+            format!("-{}", grouped((-n) as u64))
+        } else {
+            grouped(n as u64)
+        }
     } else if n.abs() < 1e-3 {
         format!("{n:e}")
     } else {
@@ -792,286 +900,336 @@ fn number(n: f64) -> String {
     }
 }
 
+/// `n` bytes with a space before the unit: `7.5 GiB`.
+fn size(n: u64) -> String {
+    let said = crate::ui::bytes(n);
+    match said.find(|c: char| c.is_ascii_alphabetic()) {
+        Some(at) => format!("{} {}", &said[..at], &said[at..]),
+        None => said,
+    }
+}
+
 fn count(n: u64) -> String {
     match n {
+        n if n >= 1_000_000_000_000 => format!("{:.2}T", n as f64 / 1e12),
         n if n >= 1_000_000_000 => format!("{:.2}B", n as f64 / 1e9),
         n if n >= 1_000_000 => format!("{:.1}M", n as f64 / 1e6),
-        n => n.to_string(),
+        n => grouped(n),
     }
+}
+
+/// A backend as its users name it.
+fn backend(name: &str) -> &str {
+    match name {
+        "cuda" => "CUDA",
+        "metal" => "Metal",
+        "vulkan" => "Vulkan",
+        "wgpu" => "WebGPU",
+        "xla" => "XLA",
+        "cerebras" => "Cerebras",
+        other => other,
+    }
+}
+
+/// Key–value rows under a section, the keys in one column.
+const KEY: usize = 16;
+
+fn section(p: &Palette, title: &str) {
+    println!();
+    println!("{}", p.bold(title));
+}
+
+fn row(p: &Palette, key: &str, value: impl std::fmt::Display) {
+    println!("  {}{value}", p.dim(format!("{key:<KEY$}")));
+}
+
+fn more(p: &Palette, value: impl std::fmt::Display) {
+    println!("  {}{value}", " ".repeat(KEY));
+    let _ = p;
 }
 
 impl crate::ui::Report for Report {
     fn render(&self, p: &Palette) {
+        let ok = Mark::Did.render(p);
+        let no = Mark::Blocked.render(p);
         let c = &self.card;
-        let what = match (&c.architecture, &c.model_type) {
-            (Some(a), Some(t)) => format!("{a} ({t})"),
-            (Some(a), None) => a.clone(),
-            (None, Some(t)) => t.clone(),
-            (None, None) => "no architecture stated".to_string(),
-        };
-        println!("{}  {}  {}", p.bold(&c.origin), p.dim("·"), what);
-        println!(
-            "  {} parameters as stored, {} in {} tensors over {} file{}{}",
-            count(c.parameters),
-            crate::ui::bytes(c.stored_bytes),
-            c.tensors,
-            c.files,
-            if c.files == 1 { "" } else { "s" },
-            if self.hollow {
-                p.dim(" (headers read; no weights fetched)").to_string()
-            } else {
-                String::new()
+
+        // Header: what was read.
+        println!("{}", p.bold(&c.origin));
+        let mut said = Vec::new();
+        if let Some(a) = &c.architecture {
+            said.push(a.clone());
+        }
+        said.push(format!("{} parameters", count(c.parameters)));
+        said.push(size(c.stored_bytes));
+        let stored = c.stored();
+        if !stored.is_empty() {
+            said.push(stored.join(" + "));
+        }
+        println!("  {}", said.join(" · "));
+        if self.hollow {
+            println!("  {}", p.dim("Metadata only: no weights were downloaded."));
+        }
+
+        // MODEL: the architecture, as config.json states it.
+        if !c.facts.is_empty() {
+            section(p, "MODEL");
+            for (key, value) in &c.facts {
+                row(p, key, value);
             }
-        );
+        }
 
-        println!();
-        println!("{}", p.bold("What it is"));
-        let mut t = Table::new([Align::Left, Align::Left], 2);
-        for (what, value) in &c.facts {
-            t.push(Row::new(Mark::Plain, [what.clone(), value.clone()]));
-        }
-        t.push(Row::new(
-            Mark::Plain,
-            [
-                "stored as".to_string(),
-                c.dtypes
-                    .iter()
-                    .map(|(d, n)| format!("{d} ×{n}"))
-                    .collect::<Vec<_>>()
-                    .join(", "),
-            ],
-        ));
-        if let Some(per) = c.kv_bytes_per_token {
-            let at = c.context.unwrap_or(32768);
-            t.push(Row::new(
-                Mark::Plain,
-                [
-                    "kv cache".to_string(),
-                    format!(
-                        "{} a token in bf16; {} for {at} tokens",
-                        crate::ui::bytes(per),
-                        crate::ui::bytes(per * at)
-                    ),
-                ],
-            ));
-        }
-        t.print(p);
-
-        println!();
-        println!("{}", p.bold("What this build knows of it"));
-        if self.kin.is_empty() {
-            println!(
-                "  {} no family's formats recognize these tensor names",
-                Mark::Blocked.render(p)
-            );
-        }
-        let others: Vec<&str> = self
-            .kin
-            .iter()
-            .skip(1)
-            .map(|f| f.package.as_str())
-            .collect();
-        for f in self.kin.iter().take(1) {
-            println!(
-                "  {} {} recognizes its tensor names (its `{}` format){}",
-                Mark::Did.render(p),
-                p.bold(&f.package),
-                f.format,
-                if f.adopts {
-                    ""
-                } else {
-                    ", but lists its models by hand"
+        // COMPATIBILITY: which family it is, and where it departs.
+        section(p, "COMPATIBILITY");
+        match self.kin.first() {
+            None => row(
+                p,
+                "Family",
+                format!("{no} no installed family matches these tensor names"),
+            ),
+            Some(f) => {
+                row(p, "Family", format!("{} {}", ok, f.package));
+                let total = f.agreeing.len() + f.departing.len();
+                if total > 0 {
+                    row(
+                        p,
+                        "Closest model",
+                        format!(
+                            "{}  {}",
+                            f.nearest,
+                            p.dim(format!("{} of {total} settings match", f.agreeing.len()))
+                        ),
+                    );
                 }
-            );
-            println!(
-                "    nearest listed model: {} ({} of {} numbers differ)",
-                f.nearest,
-                f.departing.len(),
-                f.departing.len() + f.agreeing.len()
-            );
-            let mut t = Table::new([Align::Left, Align::Left, Align::Right, Align::Right], 9);
-            t.push(Row::new(
-                Mark::Plain,
-                [
-                    "".to_string(),
-                    p.dim("config.json").to_string(),
-                    p.dim(&f.nearest).to_string(),
-                    p.dim("this checkpoint").to_string(),
-                ],
-            ));
-            for v in &f.departing {
-                t.push(Row::new(
-                    Mark::Warn,
-                    [
-                        "".to_string(),
-                        v.key.clone(),
+                let width = f.departing.iter().map(|v| v.key.len()).max().unwrap_or(0);
+                for (i, v) in f.departing.iter().enumerate() {
+                    let change = format!(
+                        "{:<width$}  {} → {}",
+                        v.key,
                         number(v.built),
-                        v.stated.map(number).unwrap_or_default(),
-                    ],
-                ));
+                        v.stated.map_or("unstated".to_string(), number)
+                    );
+                    if i == 0 {
+                        row(p, "Differences", change);
+                    } else {
+                        more(p, change);
+                    }
+                }
+                if self.verbose {
+                    for v in &f.agreeing {
+                        more(
+                            p,
+                            p.dim(format!(
+                                "{:<width$}  {} (same)",
+                                v.key,
+                                v.stated.map_or("unstated".to_string(), number)
+                            )),
+                        );
+                    }
+                    for other in self.kin.iter().skip(1) {
+                        row(
+                            p,
+                            "Also matches",
+                            p.dim(format!("{} (by tensor names)", other.package)),
+                        );
+                    }
+                    for why in &self.passed_over {
+                        row(p, "Passed over", p.dim(why));
+                    }
+                }
             }
-            for v in &f.agreeing {
-                t.push(Row::new(
-                    Mark::Absent,
-                    [
-                        "".to_string(),
-                        p.dim(&v.key).to_string(),
-                        p.dim(number(v.built)).to_string(),
-                        p.dim(
-                            v.stated
-                                .map(number)
-                                .unwrap_or_else(|| "unstated".to_string()),
-                        )
-                        .to_string(),
-                    ],
-                ));
-            }
-            t.print(p);
-        }
-        if !others.is_empty() {
-            println!(
-                "  {}",
-                p.dim(format!(
-                    "also recognized by name, further off: {}",
-                    others.join(", ")
-                ))
-            );
         }
 
-        if let Some(served) = &self.served {
-            println!();
-            println!(
-                "{} Served as it is, as {}: {}",
-                Mark::Did.render(p),
-                p.bold(served),
-                p.dim(format!("pie model import {}", c.origin))
+        if let Some(unknown) = &self.unknown {
+            if self.verbose {
+                section(p, "LAYER 0 TENSORS");
+                for (name, shape) in &unknown.layer {
+                    row(p, name, p.dim(format!("{shape:?}")));
+                }
+            }
+            section(p, "RESULT");
+            row(p, "Status", format!("{no} Unknown architecture"));
+            row(
+                p,
+                "Next",
+                "Support needs a new model package (see models/README.md).",
             );
+            if !self.verbose {
+                more(p, p.dim("Run with --verbose to list its layer-0 tensors."));
+            }
             return;
         }
-        if let Some(unknown) = &self.unknown {
-            println!();
-            println!("{}", p.bold("What a package for it would read"));
-            println!("  layer 0 holds:");
-            let mut t = Table::new([Align::Left, Align::Left], 1);
-            for (name, shape) in &unknown.layer {
-                t.push(Row::new(Mark::Plain, [name.clone(), format!("{shape:?}")]));
-            }
-            t.print(p);
-            if !unknown.outside.is_empty() {
-                println!("  outside its layers:");
-                let mut t = Table::new([Align::Left, Align::Left], 1);
-                for (name, shape) in unknown.outside.iter().take(12) {
-                    t.push(Row::new(Mark::Plain, [name.clone(), format!("{shape:?}")]));
-                }
-                t.print(p);
-            }
-            println!(
-                "  {}",
-                p.dim("A new architecture is a new package under models/ (see models/README.md).")
+        if let Some(served) = &self.served {
+            section(p, "RESULT");
+            row(
+                p,
+                "Status",
+                format!("{ok} Already supported as {}", p.bold(served)),
             );
+            row(p, "Next", format!("pie model import {}", c.origin));
             return;
         }
         if let Some(why) = &self.refused {
-            println!();
-            println!("{} Not adopted: {why}", Mark::Blocked.render(p));
+            section(p, "RESULT");
+            row(p, "Status", format!("{no} Not supported"));
+            for (i, why) in why.split("; and ").enumerate() {
+                let why = reason(why);
+                if i == 0 {
+                    row(p, "Reason", why);
+                } else {
+                    more(p, why);
+                }
+            }
             return;
         }
         let Some(a) = &self.adoption else { return };
-        println!();
-        println!("{}", p.bold("How Pie adjusted to it"));
-        for why in &self.passed_over {
-            println!("  {} passed over: {why}", Mark::Absent.render(p));
-        }
-        println!(
-            "  {} {}'s adopt() read config.json as the model {}, rebinding {}",
-            Mark::Did.render(p),
-            a.family,
-            p.bold(&a.id),
-            a.rebinds.join(", ")
-        );
-        let mut t = Table::new([Align::Left, Align::Left], 1);
-        for d in &a.deployments {
-            let (mark, said) = if d.reads {
-                (
-                    Mark::Did,
-                    "reads every tensor it needs and lands".to_string(),
-                )
+
+        // DEPLOYMENTS: what it can be served as.
+        section(p, "DEPLOYMENTS");
+        let readable: Vec<&Landing> = a.deployments.iter().filter(|d| d.reads).collect();
+        let width = readable
+            .iter()
+            .map(|d| d.precision().chars().count())
+            .max()
+            .unwrap_or(0);
+        for d in &readable {
+            let extras = if d.extras.is_empty() {
+                String::new()
             } else {
-                (Mark::Absent, d.why.clone().unwrap_or_default())
+                format!(" · {}", d.extras.join(" · "))
             };
-            t.push(Row::new(mark, [d.name.clone(), said]));
-        }
-        t.print(p);
-        if !a.traces.is_empty() {
             println!(
-                "  its program traces for: {}",
-                a.traces
-                    .iter()
-                    .map(|(b, ok)| format!(
-                        "{b} {}",
-                        if *ok {
-                            Mark::Did.render(p)
-                        } else {
-                            Mark::Blocked.render(p)
-                        }
-                    ))
-                    .collect::<Vec<_>>()
-                    .join("  ")
+                "  {ok} {:<width$}{extras}  {}",
+                d.precision(),
+                p.dim(&d.name)
             );
-            println!(
-                "  {}",
-                p.dim(
-                    "(a trace is the model's program; each engine's kernels are its own, and \
-                     an op one lacks is refused at its first forward)"
-                )
+        }
+        let unreadable: Vec<&Landing> = a.deployments.iter().filter(|d| !d.reads).collect();
+        if !unreadable.is_empty() {
+            if self.verbose {
+                for d in &unreadable {
+                    println!(
+                        "  {} {}  {}",
+                        Mark::Absent.render(p),
+                        d.precision(),
+                        p.dim(d.why.as_deref().unwrap_or_default())
+                    );
+                }
+            } else {
+                let mut wanted: Vec<String> = Vec::new();
+                for d in &unreadable {
+                    for w in &d.weights {
+                        if !stored.contains(w) && !wanted.contains(w) {
+                            wanted.push(w.clone());
+                        }
+                    }
+                }
+                let said = if wanted.is_empty() {
+                    format!(
+                        "{} more not readable from this checkpoint",
+                        unreadable.len()
+                    )
+                } else {
+                    format!(
+                        "{} weights need a checkpoint stored that way (this one is {})",
+                        wanted.join(" / "),
+                        stored.first().map_or("?", String::as_str)
+                    )
+                };
+                println!("  {} {}", Mark::Absent.render(p), p.dim(said));
+            }
+        }
+
+        // VALIDATION: what was checked before anything is written.
+        section(p, "VALIDATION");
+        if readable.is_empty() {
+            row(
+                p,
+                "Weights",
+                format!("{no} no deployment can read this checkpoint"),
+            );
+        } else {
+            row(
+                p,
+                "Weights",
+                format!("{ok} all required tensors present, shapes match"),
             );
         }
         match &a.tokenizer {
-            None => println!("  {} its tokenizer compiles", Mark::Did.render(p)),
-            Some(why) => println!(
-                "  {} its tokenizer does not compile: {}",
-                Mark::Blocked.render(p),
-                reason(why)
-            ),
+            None => row(p, "Tokenizer", format!("{ok} compiles")),
+            Some(why) => row(p, "Tokenizer", format!("{no} {}", reason(why))),
         }
+        if !a.traces.is_empty() {
+            let traced = a
+                .traces
+                .iter()
+                .map(|(b, traced)| format!("{} {}", if *traced { &ok } else { &no }, backend(b)))
+                .collect::<Vec<_>>()
+                .join("  ");
+            row(p, "Graph", traced);
+            more(
+                p,
+                p.dim("checks the model program per backend; kernels are verified at first run"),
+            );
+        }
+        if self.verbose {
+            row(
+                p,
+                "Family hook",
+                p.dim(format!("{}.adopt() set {}", a.family, a.rebinds.join(", "))),
+            );
+        }
+
         if let Some(text) = &a.text {
-            println!();
-            println!(
-                "{}",
-                p.dim(format!(
-                    "---- {}.poem{} ----",
-                    a.package,
-                    if a.whole {
-                        ""
-                    } else {
-                        ", as it ends (--show prints it whole)"
-                    }
-                ))
+            section(
+                p,
+                &format!(
+                    "PACKAGE  {}",
+                    p.dim(format!(
+                        "{}.poem{}",
+                        a.package,
+                        if a.whole {
+                            ""
+                        } else {
+                            ", adoption block (--show prints the whole file)"
+                        }
+                    ))
+                ),
             );
             println!("{text}");
         }
-        println!();
+
+        // RESULT: one verdict, and what to run next.
+        section(p, "RESULT");
+        let next_import = format!("pie model import {}", a.source);
         if a.tokenizer.is_some() {
-            println!(
-                "{} Its tokenizer is outside the pipelines pie compiles, so an import would \
-                 refuse it; nothing written",
-                Mark::Blocked.render(p)
+            row(
+                p,
+                "Status",
+                format!("{no} Not adoptable: its tokenizer is not supported"),
             );
-        } else if !a.deployments.iter().any(|d| d.reads) {
-            println!(
-                "{} No deployment of the adoption reads it; nothing written",
-                Mark::Blocked.render(p)
+        } else if readable.is_empty() {
+            row(
+                p,
+                "Status",
+                format!("{no} Not adoptable: no deployment reads this checkpoint"),
             );
         } else if let Some(written) = &a.written {
-            println!(
-                "{} Wrote {}; this build now serves {}",
-                Mark::Did.render(p),
-                crate::ui::short_path(written),
-                p.bold(&a.id)
-            );
-            println!("  next: {}", p.bold(&a.next));
+            row(p, "Status", format!("{ok} Adopted as {}", p.bold(&a.id)));
+            row(p, "Package", crate::ui::short_path(written));
+            row(p, "Next", next_import);
         } else if a.dry_run {
-            println!("{} Dry run: nothing written", Mark::Chosen.render(p));
+            row(
+                p,
+                "Status",
+                format!(
+                    "{ok} Ready to adopt as {}  {}",
+                    p.bold(&a.id),
+                    p.dim("(dry run: nothing written)")
+                ),
+            );
+            row(p, "Next", format!("pie model adopt {}", a.source));
+            more(p, next_import);
         }
     }
 }
@@ -1104,6 +1262,19 @@ mod tests {
         assert_eq!(read["a"][2], serde_json::json!(-f64::MAX));
         assert!(read["a"][3].is_null());
         assert_eq!(read["b"], "NaN \"Infinity");
+    }
+
+    #[test]
+    fn numbers_and_precisions_read_as_people_write_them() {
+        assert_eq!(grouped(151_936), "151,936");
+        assert_eq!(grouped(36), "36");
+        assert_eq!(number(1_000_000.0), "1,000,000");
+        assert_eq!(number(1e-6), "1e-6");
+        assert_eq!(size(7_500 << 20), "7.3 GiB");
+        assert_eq!(label("e4m3tile128a8"), "fp8");
+        assert_eq!(label("u4g64"), "int4");
+        assert_eq!(label("nvfp4a4"), "nvfp4");
+        assert_eq!(label("bf16"), "bf16");
     }
 
     #[test]
