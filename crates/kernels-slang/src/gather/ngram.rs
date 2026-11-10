@@ -171,7 +171,7 @@ pub fn ngram_ids(
                 hash.arg(),
                 ngram_ids.arg_mut(),
             ][..],
-            &state.args(true),
+            &state.piece_args(true),
             &[
                 stated(OP, shape.ngram)?.arg(),
                 stated(OP, shape.heads)?.arg(),
@@ -224,7 +224,7 @@ pub fn ngram_ids_chunked(
                 hash.arg(),
                 ngram_ids.arg_mut(),
             ][..],
-            &state.args(true),
+            &state.piece_args(true),
             &[
                 stated(OP, shape.ngram)?.arg(),
                 stated(OP, shape.heads)?.arg(),

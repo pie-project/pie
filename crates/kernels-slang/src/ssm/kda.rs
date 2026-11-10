@@ -125,7 +125,7 @@ pub fn kda(
                 state.slots.arg(),
                 y.arg_mut(),
             ][..],
-            &state.args(true),
+            &state.piece_args(true),
             &[heads, head_dim, eps, floor],
         ]
         .concat(),
@@ -161,7 +161,7 @@ pub fn kda_chunked(
                 state.slots.arg(),
                 y.arg_mut(),
             ][..],
-            &state.args(true),
+            &state.piece_args(true),
             &[heads, head_dim, eps, floor],
         ]
         .concat(),
@@ -205,7 +205,7 @@ pub fn kda_committed(
                 work.arg_mut(),
                 y.arg_mut(),
             ][..],
-            &state.args(true),
+            &state.piece_args(true),
             &[
                 stated(OP, committed.lane0)?.arg(),
                 heads,

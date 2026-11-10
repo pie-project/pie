@@ -38,6 +38,9 @@ struct Params {
     uint seg_words;
     uint state_origin;
     uint slot_stride;
+    uint pieces;
+    uint piece_first;
+    uint piece_atoms;
     int ngram;
     int heads;
     int heads_per_ngram;
@@ -48,6 +51,7 @@ PIE_PARAMS(PIE_PARAMS_AT, Params, params);
 PIE_POOL_READ(int, params.seg_words)
 PIE_POOL_WRITE(int, params.seg_words)
 PIE_POOL_VIEW(state, int, params.state_origin)
+PIE_STATE_PIECES
 
 U64 hash_at(uint i) {
     return u64_of(hash[2u * i], hash[2u * i + 1u]);
@@ -96,7 +100,7 @@ void main(uint3 gid : SV_DispatchThreadID) {
     }
     int span = params.ngram - 1;
 #if defined(PIE_UPDATE)
-    uint slab = slots[r] * params.slot_stride;
+    uint slab = pie_piece_unit(r, 0u) * params.slot_stride;
     int window[MAX_NGRAM] = { 0, 0, 0, 0 };
     int fresh = ids[r];
     window[0] = fresh;
@@ -115,7 +119,7 @@ void main(uint3 gid : SV_DispatchThreadID) {
     if (rows <= 0) {
         return;
     }
-    uint slab = slots[uint(begin)] * params.slot_stride;
+    uint slab = pie_piece_unit(uint(begin), 0u) * params.slot_stride;
     for (int t = 0; t < rows; t++) {
         int window[MAX_NGRAM] = { 0, 0, 0, 0 };
         window[0] = ids[uint(begin + t)];

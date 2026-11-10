@@ -38,6 +38,10 @@ pub struct DeviceBoot {
 
     /// `$PIE_HOME/profiles`, where a native user's adapter profiles live.
     pub profiles: Option<PathBuf>,
+
+    /// Diagnostics: the chunk size the pool's recipe aims at, in place of
+    /// the profile's (a small one cuts records into pieces).
+    pub chunk_bytes: Option<u64>,
 }
 
 impl Default for DeviceBoot {
@@ -49,6 +53,7 @@ impl Default for DeviceBoot {
             pipeline_cache: None,
             device_memory: None,
             profiles: None,
+            chunk_bytes: None,
         }
     }
 }
@@ -438,8 +443,7 @@ impl Engine for Wgpu {
         let paging = shell.paging();
 
         let pools = shell.pool_facts(disk_kv_pages);
-        let chunks = shell.chunk_facts(&pools);
-        shell.log_chunk_recipe(&chunks);
+        let chunks = shell.chunk_facts().map_err(fault)?;
 
         let caps = Capabilities {
             device: DeviceFacts {
@@ -522,12 +526,20 @@ impl Engine for Wgpu {
         })
     }
 
-    fn commit_pool(&mut self, kv_pages: u32) -> EngineResult<()> {
-        self.loaded_mut()?.resize_pool(kv_pages).map_err(fault)
+    fn commit_segments(&mut self, segments: u32) -> EngineResult<()> {
+        self.loaded_mut()?.commit_segments(segments).map_err(fault)
     }
 
-    fn release_pool(&mut self, kv_pages: u32) -> EngineResult<()> {
-        self.loaded_mut()?.resize_pool(kv_pages).map_err(fault)
+    fn release_segments(&mut self, segments: u32) -> EngineResult<()> {
+        self.loaded_mut()?.release_segments(segments).map_err(fault)
+    }
+
+    fn evacuate(&mut self, evacuation: &engine::chunk::Evacuation) -> EngineResult<()> {
+        self.loaded_mut()?.evacuate(evacuation).map_err(fault)
+    }
+
+    fn copy_slots(&mut self, copy: &engine::chunk::SlotCopy) -> EngineResult<()> {
+        self.loaded_mut()?.copy_slots(copy).map_err(fault)
     }
 
     fn submit(&mut self, frame: &FrameSubmission) -> EngineResult<FrameTicket> {
@@ -743,14 +755,6 @@ impl Engine for Wgpu {
     fn copy_kv(&mut self, copy: &KvCopy) -> EngineResult<()> {
         copy.validate()?;
         let device = self.caps.as_ref().map(|caps| caps.device.domain);
-        if let Some((MemoryDomain::LocalDisk, out, pages, slots)) =
-            device.and_then(|device| copy.tier_move(device))
-        {
-            return self
-                .loaded_mut()?
-                .spill_kv(out, pages, slots)
-                .map_err(fault);
-        }
         if device.is_none_or(|device| copy.src != device || copy.dst != device) {
             return Err(Error::Unsupported {
                 verb: kv_copy_direction(copy.src, copy.dst),
@@ -773,24 +777,26 @@ impl Engine for Wgpu {
         let ends = |moves: &[engine::transfer::StateMove]| -> (Vec<u32>, Vec<u32>) {
             moves.iter().map(|m| (m.src_slot_id, m.dst_slot_id)).unzip()
         };
-        let ((src, dst), (page_src, page_dst)) = (ends(&copy.moves), ends(&copy.pages));
-        let shell = self.loaded_mut()?;
-        let copied: crate::error::Result<()> = match copy.direction {
-            StateDirection::DeviceToDevice => src
-                .iter()
-                .zip(&dst)
-                .try_for_each(|(&src, &dst)| shell.copy_state(src, dst))
-                .and_then(|()| {
-                    shell.copy_pages(&page_src.into_iter().zip(page_dst).collect::<Vec<_>>())
-                }),
-            StateDirection::DeviceToHost => shell
-                .park_state(true, &src, &dst)
-                .and_then(|()| shell.park_pages(true, &page_src, &page_dst)),
-            StateDirection::HostToDevice => shell
-                .park_state(false, &dst, &src)
-                .and_then(|()| shell.park_pages(false, &page_dst, &page_src)),
-        };
-        copied.map_err(fault)
+        if !copy.pages.is_empty() {
+            return Err(Error::Invalid(
+                "a state copy naming rs buffer pages: the rs buffer is the pool's rs list, \
+                 whose slots move by `copy_slots`"
+                    .to_string(),
+            ));
+        }
+        let (src, dst) = ends(&copy.moves);
+        match copy.direction {
+            StateDirection::DeviceToDevice => self
+                .loaded_mut()?
+                .copy_state(&src.into_iter().zip(dst).collect::<Vec<_>>())
+                .map_err(fault),
+            StateDirection::DeviceToHost | StateDirection::HostToDevice => {
+                Err(Error::Unsupported {
+                    verb: "copy_state between tiers (host chunks move by `copy_slots`)",
+                    engine: "vulkan",
+                })
+            }
+        }
     }
 }
 
@@ -1062,6 +1068,50 @@ impl Wgpu {
                 ))
             })?;
         }
+        // A lane stating its slot tables names its kv pages and its record
+        // there (CONTRACT-BC 4); until the runtime states them, the legacy
+        // fields carry the same slot refs.
+        let mut pages_of: Vec<Option<Vec<u32>>> = Vec::with_capacity(submission.lanes.len());
+        let mut record_of: Vec<Option<Vec<u32>>> = Vec::with_capacity(submission.lanes.len());
+        let mut run_of: Vec<Option<Vec<u32>>> = Vec::with_capacity(submission.lanes.len());
+        let mut forks: Vec<(u32, u32)> = Vec::new();
+        for lane in &submission.lanes {
+            pages_of.push(
+                lane.tables
+                    .iter()
+                    .find(|(shape, _)| *shape == crate::store::layout::LIST)
+                    .map(|(_, refs)| refs.clone()),
+            );
+            let fixed = lane
+                .fixed
+                .iter()
+                .find(|(shape, _)| *shape == crate::store::layout::FIXED);
+            run_of.push(fixed.and_then(|(_, pieces)| {
+                pieces
+                    .iter()
+                    .any(|&[run, cow]| run != cow)
+                    .then(|| pieces.iter().map(|&[run, _]| run).collect())
+            }));
+            record_of.push(fixed.map(|(_, pieces)| {
+                // `cow != run`: the record is copied before the fire, once
+                // for every lane of a group naming the same pair.
+                for &[run, cow] in pieces {
+                    if run != cow && !forks.contains(&(run, cow)) {
+                        forks.push((run, cow));
+                    }
+                }
+                pieces.iter().map(|&[_, cow]| cow).collect()
+            }));
+        }
+        shell.copy_state(&forks).map_err(fault)?;
+        // Tail copies (an rs-list or kv slot a fork shares) land before any
+        // lane of the fire reads or writes (CONTRACT-BC 20).
+        let slot_copies: Vec<_> = submission
+            .lanes
+            .iter()
+            .flat_map(|lane| lane.slot_copies.iter().cloned())
+            .collect();
+        shell.copy_slot_pairs(&slot_copies).map_err(fault)?;
         let seated: Vec<Seated<'_>> = submission
             .lanes
             .iter()
@@ -1073,8 +1123,8 @@ impl Wgpu {
                     word: words[at],
                     tokens: resolved[at].as_deref().unwrap_or(&lane.tokens),
                 },
-                pages: &lane.kv.pages,
-                held: (!lane.kv.pages.is_empty()).then_some(lane.kv.held),
+                pages: pages_of[at].as_deref().unwrap_or(&lane.kv.pages),
+                held: (!lane.kv.pages.is_empty() || pages_of[at].is_some()).then_some(lane.kv.held),
                 kv_less: lane.kv_less,
 
                 mask: resolved_masks[at].as_ref().or(lane.mask.as_ref()),
@@ -1093,6 +1143,9 @@ impl Wgpu {
                 rs: &verbs[at],
                 rs_reset: lane.rs_reset,
                 rs_slot: lane.rs_slot,
+                refs: true,
+                record: record_of[at].as_deref(),
+                record_run: run_of[at].as_deref(),
 
                 group: lane.group,
                 inputs: &input_cells[at],

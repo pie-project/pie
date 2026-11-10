@@ -7,17 +7,20 @@ use dtype::Dtype;
 use crate::encode::{Arg, ArgValue};
 use crate::encode::{nonzero, refuse};
 use crate::error::Error;
-use crate::tensor::{RaggedTensor, SEGMENTS, Segments, Tensor, words_of};
+use crate::tensor::{RaggedTensor, Segments, Tensor, words_of};
 
 pub mod conv1d;
 pub mod gdn_prep;
 pub mod gdn_recurrent;
 pub mod kda;
 
-/// A recurrent state pool: the bank of slots and the slot of each row.
-/// `bank` carries the row's geometry (its width is one slot's elements);
-/// the slots lie in the chunk pool `pool`, slot `s`'s row at word `origin +
-/// s * slot_stride` (SPEC 10: `base + slot * stride + offset`).
+/// A recurrent state pool: the bank of slots and the slots of each row.
+/// `bank` carries the row's geometry (its width is one record's elements);
+/// the slots lie in the chunk pool `pool`, slot unit `s`'s row at word
+/// `origin + s * slot_stride` (SPEC 10: `base + slot * stride + offset`).
+/// A record is `pieces` slots, `slots` holding that many units an entry;
+/// this row's atoms (heads, channels) are cut `piece_atoms` a piece, piece
+/// `p` in the entry's slot `piece_first + p` (`kernels/prim/pool.slang`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct StatePool {
     pub bank: Tensor,
@@ -29,6 +32,12 @@ pub struct StatePool {
     pub origin: u32,
 
     pub slot_stride: u32,
+
+    pub pieces: u32,
+
+    pub piece_first: u32,
+
+    pub piece_atoms: u32,
 }
 
 impl StatePool {
@@ -42,24 +51,36 @@ impl StatePool {
             pool: Segments::one(bank.buf, words_of(bank).max(1)),
             origin: 0,
             slot_stride: u32::try_from(row).unwrap_or(u32::MAX),
+            pieces: 1,
+            piece_first: 0,
+            piece_atoms: u32::MAX,
         }
     }
 
     /// The pool's four segment bindings, then its scalars (segment words,
-    /// origin, slot stride): what every state kernel takes after its own
-    /// buffers, its own scalars after.
+    /// origin, slot stride): what a state kernel takes after its own
+    /// buffers; [`StatePool::piece_args`] adds the pieces.
     #[must_use]
-    pub fn args(&self, mutable: bool) -> [ArgValue; SEGMENTS + 3] {
-        let [a, b, c, d] = self.pool.args(mutable);
-        [
-            a,
-            b,
-            c,
-            d,
+    pub fn args(&self, mutable: bool) -> Vec<ArgValue> {
+        let mut args = self.pool.args(mutable).to_vec();
+        args.extend([
             self.pool.words.arg(),
             self.origin.arg(),
             self.slot_stride.arg(),
-        ]
+        ]);
+        args
+    }
+
+    /// [`StatePool::args`], then the pieces' scalars.
+    #[must_use]
+    pub fn piece_args(&self, mutable: bool) -> Vec<ArgValue> {
+        let mut args = self.args(mutable);
+        args.extend([
+            self.pieces.arg(),
+            self.piece_first.arg(),
+            self.piece_atoms.arg(),
+        ]);
+        args
     }
 }
 

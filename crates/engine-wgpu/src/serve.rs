@@ -185,6 +185,20 @@ pub struct Seated<'a> {
 
     pub rs_slot: Option<u32>,
 
+    /// Whether `pages`, `record` and the rs verb's pages are slot refs the
+    /// runtime names; otherwise the lane is seat-addressed (a direct fire):
+    /// its seat's runs in the pool.
+    pub refs: bool,
+
+    /// The lane's record, one fixed slot ref a piece, the side it writes
+    /// (the copy-on-write side where the runtime names two).
+    pub record: Option<&'a [u32]>,
+
+    /// The record's run side where it differs from `record` (a group's
+    /// copy-on-write): a lane that folds nothing reads its state there
+    /// (CONTRACT-BC 15).
+    pub record_run: Option<&'a [u32]>,
+
     pub translation: &'a [u32],
 
     pub group: Option<u32>,
@@ -209,6 +223,9 @@ impl<'a> Seated<'a> {
             rs: &FOLD,
             rs_reset: engine::fire::RsReset::Inferred,
             rs_slot: None,
+            refs: false,
+            record: None,
+            record_run: None,
             group: None,
             inputs: &[],
         }
@@ -437,6 +454,7 @@ impl Shell {
         let mut boot = boot;
         let share = boot.residency.device_memory_share;
         let kv_budget = boot.residency.device_kv_budget;
+        let host_kv_budget = boot.residency.host_kv_budget;
         let device = match boot.handed.take() {
             Some(handed) => Context::adopt(boot.device, share, handed)?,
             None => Context::bind(boot.device, share)?,
@@ -536,46 +554,53 @@ impl Shell {
             }
         }
 
-        let asked = Paging::of(boot.page_size, boot.context, boot.slots, 1)?;
         let handles = Handles::new();
 
-        // The pool takes `[model] device_kv_budget`, or with none stated
-        // every page the share leaves once the weights and the working set
-        // are down, each slab within one device reservation. The weights
-        // are held only to leave it one sequence: a budget past what they
-        // leave is refused, not made room for.
+        // One chunk pool holds every kv page, every record and the rs list
+        // (SPEC 11): the compiler's Vulkan recipe is its one layout source,
+        // the chunk, the list slot (its tokens are the kv page size) and
+        // where every row lies in its slot.
         let rs_layout = crate::rs::Layout::read(&boot.trace)?.map(std::sync::Arc::new);
-        let pool_at = |pages: u64, slots: u32| -> Result<u64> {
-            let paging = Paging {
-                pages,
-                slots,
-                ..asked
-            };
-            let slabs = crate::store::pool_slabs(&boot.trace, paging)?;
-            if slabs.iter().any(|slab| *slab > device.max_buffer()) {
-                return Ok(u64::MAX);
-            }
-            Ok(slabs
-                .iter()
-                .fold(0u64, |sum, slab| sum.saturating_add(*slab))
-                .saturating_add(
-                    rs_layout
-                        .as_ref()
-                        .map_or(0, |layout| crate::rs::Buffers::bytes_at(layout, paging)),
-                )
-                .saturating_add(crate::scratch::pool_bytes(&boot.trace, paging)))
+        let recipe = crate::chunks::recipe(
+            &boot.trace,
+            &budgets,
+            boot.page_size,
+            boot.context,
+            device.max_buffer(),
+            boot.device.chunk_bytes,
+        )?;
+        let rows = crate::store::Rows::plan(&boot.trace, &recipe, &facts, rs_layout.as_deref())?;
+        let page_size = if rows.tokens > 0 {
+            rows.tokens
+        } else {
+            boot.page_size
         };
-        let one_slot = u64::from(asked.pages_per_slot);
+        let asked = Paging::of(page_size, boot.context, boot.slots, 1)?;
+        let chunk = rows.chunk_bytes;
+        let rs_bytes = rows.rs.as_ref().map_or(0, |rs| rs.bytes);
+        let rs_tokens = rows.rs.as_ref().map_or(0, |rs| rs.tokens);
+        // One working set: its pages, its record and one written
+        // copy-on-write, and its rs-list pages, beside the null chunk.
+        let least_chunks = crate::store::layout::Layout::least_chunks(
+            chunk,
+            [rows.list_bytes, rows.fixed_bytes],
+            rows.pieces,
+            asked.pages_per_slot,
+        ) + chunk.checked_div(rs_bytes).map_or(0, |per| {
+            asked
+                .context()
+                .div_ceil(rs_tokens.max(1))
+                .div_ceil(u32::try_from(per).unwrap_or(1).max(1))
+        });
         let least = Paging {
-            pages: one_slot,
-            slots: engine::fit::least_state_slots(1).min(asked.slots),
+            pages: u64::from(asked.pages_per_slot),
             ..asked
         };
 
         let arena = Arena::reserve(&device, &compiled.arena)?;
-        let device_cap = device
-            .left()
-            .saturating_sub(pool_at(least.pages, least.slots)?);
+        let device_cap = device.left().saturating_sub(
+            u64::from(least_chunks) * chunk + crate::scratch::pool_bytes(&boot.trace, least),
+        );
         let mut weights = Weights::resident(
             &device,
             &handles,
@@ -698,6 +723,7 @@ impl Shell {
                     &feeds.seats(),
                     feeds.selections.len(),
                     voxel_seat,
+                    rows.pieces,
                 )
             })
             .collect::<Result<Vec<_>>>()?;
@@ -828,57 +854,70 @@ impl Shell {
             .map(|seat| Buffer::with(&device, seat.bytes(), crate::device::Memory::Readback))
             .collect::<Result<Vec<_>>>()?;
 
-        let room = device
-            .left()
-            .saturating_add(crate::scratch::pool_bytes(&boot.trace, least));
-        let bytes_at = |pages: u64, slots: u32| pool_at(pages, slots).unwrap_or(u64::MAX);
-        // A stated budget holds the asked slots; with none, a hybrid's state
-        // slots give way before the pool would seat no sequence.
-        let slots = match kv_budget {
-            Some(_) => asked.slots,
-            None => {
-                engine::fit::pool_within(u64::from(u32::MAX), asked.slots, one_slot, room, bytes_at)
-                    .map_or(least.slots, |(_, slots)| slots)
-            }
+        // The pool takes the bytes `[model] device_kv_budget` states, or all
+        // the weights and the working set leave of the share, in whole
+        // chunks; the kernels bind it in at most four segments, none past
+        // the device's binding limit.
+        let room = kv_budget.unwrap_or_else(|| device.left());
+        let total = engine::chunk::fit(room, chunk, 0, least_chunks)
+            .map_err(|short| Fault::Residency(short.to_string()))?;
+        let binds = u32::try_from(
+            (device.max_buffer() / chunk).saturating_mul(kernels_slang::SEGMENTS as u64),
+        )
+        .unwrap_or(u32::MAX);
+        // Whole segments of a quarter of the pool, all four within the
+        // bf16-element index the kernels address the pool by.
+        let words = u32::try_from(2 * u64::from(u32::MAX) / chunk).unwrap_or(u32::MAX)
+            / kernels_slang::SEGMENTS as u32
+            * kernels_slang::SEGMENTS as u32;
+        // The compressor side planes hold a cell a token of every physical
+        // list page, beside the pool in one scratch buffer: a chunk costs its
+        // share of them, and they stay within one binding.
+        let side = crate::scratch::pool_bytes(
+            &boot.trace,
+            Paging {
+                pages: chunk.checked_div(rows.list_bytes).unwrap_or(0),
+                ..asked
+            },
+        );
+        let sides = if side == 0 {
+            u32::MAX
+        } else {
+            let room_chunks = room / (chunk + side);
+            u32::try_from(room_chunks.min(device.max_buffer() / side)).unwrap_or(u32::MAX)
         };
-        let pages =
-            engine::fit::pages_for(kv_budget, room, one_slot, |pages| bytes_at(pages, slots))
-                .map_err(|short| Fault::Residency(short.to_string()))?;
-        // A stated budget is never cut: one buffer stopping short of it is a
-        // refusal, as the room is.
-        if let Some(budget) = kv_budget {
-            let next = crate::store::pool_slabs(
-                &boot.trace,
-                Paging {
-                    pages: pages + 1,
-                    slots,
-                    ..asked
-                },
-            )?;
-            if next.iter().any(|slab| *slab > device.max_buffer())
-                && next.iter().sum::<u64>() <= budget
-            {
-                return Err(Fault::Residency(format!(
-                    "`[model] device_kv_budget` states {} MiB, and a cache row is one buffer, \
-                     which this device binds up to {} MiB of: {pages} pages fill it at {} MiB. \
-                     State a budget of at most that",
-                    budget >> 20,
-                    device.max_buffer() >> 20,
-                    bytes_at(pages, slots) >> 20,
-                )));
-            }
+        let total = total.min(binds).min(words).min(sides);
+        if total < least_chunks {
+            return Err(Fault::Residency(format!(
+                "one working set takes {least_chunks} chunks of {chunk} bytes, and this device \
+                 binds four segments of {} MiB",
+                device.max_buffer() >> 20
+            )));
         }
+        let segment_chunks = crate::store::pool::segment_chunks(chunk, total, device.max_buffer());
+        let layout = crate::store::layout::Layout::new(
+            chunk,
+            total,
+            segment_chunks,
+            page_size,
+            [rows.list_bytes, rows.fixed_bytes],
+            rows.pieces,
+            boot.slots,
+            asked.pages_per_slot,
+        )?
+        .with_rs(rs_bytes, rs_tokens, asked.pages_per_slot)?;
+        let pages = u64::from(layout.list.map_or(0, |list| list.per_chunk)) * u64::from(total);
+        let slots = boot.slots;
         tracing::info!(
-            pages,
-            slots,
-            asked_slots = asked.slots,
+            chunk,
+            total,
+            segment_chunks,
             kv_budget,
             room,
-            weights = weights.bytes(),
-            "the cache pool is fitted to the kv budget or to what the share leaves"
+            "the chunk pool is sized to its budget or what the weights and the working set leave"
         );
         let paging = Paging {
-            pages,
+            pages: pages.max(1),
             slots,
             ..asked
         };
@@ -888,11 +927,14 @@ impl Shell {
             drop(scratch);
             scratch = Scratch::reserve(&device, &boot.trace, &compiled, &budgets, paging, &tuning)?;
         }
-        let pools = Pools::reserve(&device, &boot.trace, paging, &facts)?;
-        let rs_buffers = match &rs_layout {
-            Some(layout) => Some(crate::rs::Buffers::reserve(&device, layout, paging)?),
-            None => None,
-        };
+        let host_chunks =
+            host_kv_budget.map_or(0, |bytes| u32::try_from(bytes / chunk).unwrap_or(u32::MAX));
+        let rs_at = rows.rs.clone();
+        let mut pools = Pools::reserve(&device, rows, layout, paging, host_chunks)?;
+        // The null chunk's segment stands from the load on.
+        pools.commit_segments(&device, 1)?;
+        let rs_buffers =
+            rs_at.map(|at| crate::rs::Buffers::in_pool(at.plane_at, at.tokens, pools.rs_stride()));
 
         let adapter_fact = adapter_fact(&compiled.classes, &corrected);
         let adapter_slots = crate::adapter::Slots::new(weights.adapter_seats());
@@ -959,11 +1001,15 @@ impl Shell {
         })
     }
 
+    /// Opens seat `slot` for a direct fire: its record zeroed, nothing held.
     pub fn open(&mut self, slot: u32) -> Result<()> {
         if self.pools.has_state() {
             self.drain()?;
+            let seats = self.pools.seat_segments();
+            self.commit_segments(seats)?;
+            let units = self.pools.record(None, slot)?;
+            self.pools.clear(&units)?;
         }
-        self.pools.clear(slot)?;
         let seats = self.held.len() as u64;
         let held = self.held.get_mut(slot as usize).ok_or(Fault::Ceiling {
             what: "slots",
@@ -974,27 +1020,19 @@ impl Shell {
         Ok(())
     }
 
+    /// Copies token runs between kv pages (slot refs of the kv list).
     pub fn copy_kv(&mut self, moves: &[engine::transfer::KvRun]) -> Result<()> {
         if moves.is_empty() {
             return Ok(());
         }
-
         let mut frame = self.device.frame()?;
         self.pools.copy_kv(&mut frame, moves)?;
-
         self.grafted = Some(frame.commit_async(None)?);
         Ok(())
     }
 
-    pub fn copy_state(&mut self, src: u32, dst: u32) -> Result<()> {
-        let mut frame = self.device.frame()?;
-        self.pools.copy_slot(&mut frame, src, dst)?;
-        self.grafted = Some(frame.commit_async(None)?);
-        Ok(())
-    }
-
-    /// Unstated `budget`: `seats` sequences at `context` and at least the pool,
-    /// within a quarter of the free table. No `dir`, no tier.
+    /// Unstated `budget`: `seats` sequences at `context` and at least the
+    /// pool's kv pages, within a quarter of the free disk.
     pub fn seat_disk_kv(
         &mut self,
         budget: Option<u64>,
@@ -1004,22 +1042,18 @@ impl Shell {
     ) -> Result<u32> {
         let Some(dir) = dir else { return Ok(0) };
         let paging = self.pools.paging();
-        let buffered = self
-            .rs_buffers
-            .as_ref()
-            .map_or(0, |buffers| buffers.pages().1);
         let unstated = budget.is_none();
         let budget = budget.unwrap_or_else(|| {
             engine::disk::unstated_budget(
                 dir,
-                u64::from(paging.slots),
-                self.pools.state_slot_bytes() + buffered,
+                0,
+                0,
                 paging.pages(),
                 u64::from(seats) * u64::from(context).div_ceil(u64::from(paging.page_size.max(1))),
-                self.pools.kv_page_bytes(),
+                self.pools.page_bytes(),
             )
         });
-        if let Err(error) = self.pools.seat_disk(dir, budget, buffered) {
+        if let Err(error) = self.pools.seat_disk(&self.device, dir, budget) {
             if !unstated {
                 return Err(error);
             }
@@ -1028,58 +1062,112 @@ impl Shell {
         Ok(self.pools.disk_pages())
     }
 
-    #[must_use]
-    pub fn parked_state_slots(&self) -> u32 {
-        self.pools.parked_slots()
-    }
-
-    #[must_use]
-    pub fn parked_buffer_pages(&self) -> u32 {
-        self.pools.parked_pages()
-    }
-
-    #[must_use]
-    pub fn buffer_pages(&self) -> u32 {
-        self.rs_buffers
-            .as_ref()
-            .map_or(0, crate::rs::Buffers::page_count)
-    }
-
-    pub fn spill_kv(&mut self, to_disk: bool, device: &[u32], disk: &[u32]) -> Result<()> {
-        self.pools.spill_kv(&self.device, to_disk, device, disk)
-    }
-
-    pub fn park_state(&mut self, out: bool, device: &[u32], rows: &[u32]) -> Result<()> {
-        self.pools.park_state(&self.device, out, device, rows)
-    }
-
-    pub fn park_pages(&mut self, out: bool, pages: &[u32], rows: &[u32]) -> Result<()> {
-        if pages.is_empty() {
+    /// Copies whole fixed slots (slot refs) `(src, dst)`: a record written
+    /// copy-on-write.
+    pub fn copy_state(&mut self, moves: &[(u32, u32)]) -> Result<()> {
+        if moves.is_empty() || !self.pools.has_state() {
             return Ok(());
         }
-        let buffers = self.rs_buffers.as_ref().ok_or(Fault::Ceiling {
-            what: "recurrent buffer pages",
-            need: 1,
-            have: 0,
-        })?;
+        let mut frame = self.device.frame()?;
         self.pools
-            .park_pages(&self.device, out, pages, rows, buffers.pages())
+            .copy_shape(&mut frame, crate::store::layout::FIXED, moves)?;
+        self.grafted = Some(frame.commit_async(None)?);
+        Ok(())
     }
 
-    pub fn copy_pages(&mut self, moves: &[(u32, u32)]) -> Result<()> {
-        let Some(buffers) = self.rs_buffers.as_ref().filter(|_| !moves.is_empty()) else {
+    /// A fire's stated whole-slot copies (CONTRACT-BC 20), each shape's
+    /// `[src, dst]` pairs, on the queue before the fire.
+    pub fn copy_slot_pairs(
+        &mut self,
+        copies: &[(engine::chunk::ShapeId, Vec<[u32; 2]>)],
+    ) -> Result<()> {
+        if copies.iter().all(|(_, pairs)| pairs.is_empty()) {
             return Ok(());
-        };
-        let (slab, bytes) = buffers.pages();
+        }
         let mut frame = self.device.frame()?;
-        for &(src, dst) in moves {
-            frame.copy(
-                slab,
-                u64::from(src) * bytes,
-                slab,
-                u64::from(dst) * bytes,
-                bytes,
-            )?;
+        for (shape, pairs) in copies {
+            let moves: Vec<(u32, u32)> = pairs.iter().map(|&[src, dst]| (src, dst)).collect();
+            self.pools.copy_shape(&mut frame, *shape, &moves)?;
+        }
+        self.grafted = Some(frame.commit_async(None)?);
+        Ok(())
+    }
+
+    /// See `Engine::copy_slots`: on the device in queue order; to or from
+    /// the host chunks or the slot file once every frame has landed.
+    pub fn copy_slots(&mut self, copy: &engine::chunk::SlotCopy) -> Result<()> {
+        if copy.slots.is_empty() && copy.runs.is_empty() {
+            return Ok(());
+        }
+        let on_device = matches!(copy.src, engine::transfer::MemoryDomain::WgpuDevice(_))
+            && matches!(copy.dst, engine::transfer::MemoryDomain::WgpuDevice(_));
+        if !on_device {
+            self.drain()?;
+        }
+        let mut frame = self.device.frame()?;
+        self.pools.copy_slots(&self.device, &mut frame, copy)?;
+        if on_device {
+            self.grafted = Some(frame.commit_async(None)?);
+        } else {
+            frame.commit()?;
+        }
+        Ok(())
+    }
+
+    /// The pool as the runtime counts it.
+    #[must_use]
+    pub fn pool_chunk_facts(&self) -> engine::chunk::ChunkFacts {
+        self.pools.chunk_facts()
+    }
+
+    #[must_use]
+    pub fn pool_layout(&self) -> crate::store::layout::Layout {
+        *self.pools.layout()
+    }
+
+    /// Backs the pool's first `segments` segments; never on a fire's path.
+    pub fn commit_segments(&mut self, segments: u32) -> Result<()> {
+        if segments <= self.pools.chunk_facts().segments.committed {
+            return Ok(());
+        }
+        self.drain()?;
+        self.handles.rewind();
+        self.pools.commit_segments(&self.device, segments)
+    }
+
+    /// Gives back every segment at and past `segments`, once every frame
+    /// that might read them has landed.
+    pub fn release_segments(&mut self, segments: u32) -> Result<()> {
+        self.drain()?;
+        // The rows of the last fire bind the segments this gives back.
+        self.handles.rewind();
+        self.pools.release_segments(segments);
+        Ok(())
+    }
+
+    /// Copies each evacuated chunk onto its new physical chunk, on the queue
+    /// before the next fire, and takes the moves into the chunk table.
+    pub fn evacuate(&mut self, evacuation: &engine::chunk::Evacuation) -> Result<()> {
+        if evacuation.moves.is_empty() {
+            return Ok(());
+        }
+        let mut frame = self.device.frame()?;
+        let (moved, pages) = self.pools.evacuate(&mut frame, evacuation)?;
+        // The compressor side planes hold a cell a token of every physical
+        // list page: each moved chunk's pages move with it.
+        let tokens = u64::from(self.pools.paging().page_size);
+        let plane = self.scratch.plane();
+        for (at, cell) in self.scratch.side_planes() {
+            let run = pages * tokens * cell;
+            for &(from, to) in &moved {
+                frame.copy(
+                    plane,
+                    at + from * tokens * cell,
+                    plane,
+                    at + to * tokens * cell,
+                    run,
+                )?;
+            }
         }
         self.grafted = Some(frame.commit_async(None)?);
         Ok(())
@@ -1185,8 +1273,7 @@ impl Shell {
             self.arena.bytes(),
             self.pools.bytes(),
             self.inputs.iter().map(Inputs::bytes).sum::<u64>()
-                + self.readout.iter().map(Buffer::bytes).sum::<u64>()
-                + self.rs_buffer_bytes(),
+                + self.readout.iter().map(Buffer::bytes).sum::<u64>(),
         )
     }
 
@@ -1211,6 +1298,12 @@ impl Shell {
 
     pub fn fire_seated(&mut self, lanes: &[Seated<'_>]) -> Result<Vec<Vec<f32>>> {
         use engine::frame::Shell as FrameShell;
+        // A direct fire's seat-addressed lanes read the seats' runs: back
+        // their segments first, off the fire's path.
+        if lanes.iter().any(|lane| !lane.refs) {
+            let seats = self.pools.seat_segments();
+            self.commit_segments(seats)?;
+        }
         let prepared = FrameShell::prepare(
             self,
             StepView {
@@ -1265,33 +1358,9 @@ impl Shell {
             .collect())
     }
 
-    /// Moves the pool to slabs of `kv_pages` pages, the only way a slab gives
-    /// memory back: frames stop here until the copy lands.
-    pub fn resize_pool(&mut self, kv_pages: u32) -> Result<()> {
-        self.drain()?;
-        // The rows of the last fire bind the slabs this replaces.
-        self.handles.rewind();
-        self.pools.resize(&self.device, u64::from(kv_pages))
-    }
-
-    /// What one page or slot of each pool takes, for the degenerate chunk
-    /// facts: a kv page across every kv plane, an rs buffer page. The
-    /// sliding rows are paged in full, so no windowed page.
-    #[must_use]
-    pub fn degenerate_bytes(&self) -> engine::chunk::DegenerateBytes {
-        engine::chunk::DegenerateBytes {
-            kv_page: self.kv_page_bytes(),
-            window_page: 0,
-            buffer_page: self
-                .rs_buffers
-                .as_ref()
-                .map_or(0, crate::rs::Buffers::page_bytes),
-        }
-    }
-
     #[must_use]
     pub fn kv_page_bytes(&self) -> u64 {
-        self.pools.kv_page_bytes()
+        self.pools.page_bytes()
     }
 
     pub fn drain(&mut self) -> Result<()> {
@@ -1411,16 +1480,16 @@ impl Shell {
         self.rs_layout.is_some()
     }
 
-    #[must_use]
-    pub fn rs_buffer_bytes(&self) -> u64 {
-        self.rs_buffers
-            .as_ref()
-            .map_or(0, crate::rs::Buffers::bytes)
-    }
-
-    pub fn state_bytes(&mut self, slot: u32) -> Result<Vec<u8>> {
+    /// The state rows of the record slot ref `slot` names (a seat's, where
+    /// `seated`), read on the host.
+    pub fn state_bytes(&mut self, slot: u32, seated: bool) -> Result<Vec<u8>> {
         self.drain()?;
-        self.pools.read_slot(slot)
+        let unit = if seated {
+            self.pools.record(None, slot)?
+        } else {
+            self.pools.record(Some(&[slot]), slot)?
+        };
+        self.pools.read_record(&unit)
     }
 
     pub fn rows_of(&mut self, landed: &Landed) -> Result<Vec<Vec<f32>>> {
@@ -1848,7 +1917,7 @@ impl Shell {
             adapter_routes.reserve(rows as usize);
         }
 
-        let mut beginning: Vec<u32> = Vec::new();
+        let mut beginning: Vec<Vec<u32>> = Vec::new();
 
         let mut writes: Vec<Option<(i32, i32)>> = Vec::with_capacity(rows as usize);
         for row in composition.lanes() {
@@ -1875,13 +1944,56 @@ impl Shell {
                 "a lane's rows stand where the composition placed them"
             );
 
+            // The lane's slots as kernels address them: slot refs the
+            // runtime names, or a seat's runs for a direct fire.
+            let seat_slot = seated.rs_slot.unwrap_or(lane.slot);
+            let record = if seated.refs {
+                match (seated.record, seated.rs_slot) {
+                    (Some(record), _) => self.pools.record(Some(record), seat_slot)?,
+                    (None, Some(slot)) => self.pools.record(Some(&[slot]), seat_slot)?,
+                    (None, None) => self.pools.record(None, seat_slot)?,
+                }
+            } else {
+                self.pools.record(None, seat_slot)?
+            };
+            // The buffered rows' rs-list pages, as units of the pool.
+            let verb = match seated.rs {
+                engine::fire::RsVerb::Buffer {
+                    pages,
+                    base,
+                    folded,
+                    fold,
+                } if self.pools.rs_rows().is_some() => engine::fire::RsVerb::Buffer {
+                    pages: self
+                        .pools
+                        .rs_pages(pages, (!seated.refs).then_some(seat_slot))?,
+                    base: *base,
+                    folded: *folded,
+                    fold: *fold,
+                },
+                other => other.clone(),
+            };
+            let plan = engine::rs::LanePlan::of(
+                &verb,
+                row.rows,
+                have,
+                seated.mask.filter(|_| !seated.kv_less),
+                None,
+            )
+            .map_err(|error| program("serve::rs", format!("lane {}: {error}", row.source)))?;
+            // A lane of a copy-on-write group that folds nothing reads the
+            // run side, which no lane writes this fire (CONTRACT-BC 15).
+            let state = match seated.record_run {
+                Some(run) if plan.commit == 0 => self.pools.record(Some(run), seat_slot)?,
+                _ => record.clone(),
+            };
             let fresh = match seated.rs_reset {
                 engine::fire::RsReset::Inferred => have == 0,
                 engine::fire::RsReset::Fresh => true,
                 engine::fire::RsReset::Held => false,
             };
             if fresh {
-                beginning.push(seated.rs_slot.unwrap_or(lane.slot));
+                beginning.push(record);
             }
             seats.push(Seat {
                 slot: lane.slot,
@@ -1890,7 +2002,17 @@ impl Shell {
             });
             kv_less.push(seated.kv_less);
 
-            tables.push(std::borrow::Cow::Borrowed(seated.pages));
+            let pages = (u64::from(have) + u64::from(row.rows))
+                .div_ceil(u64::from(self.pools.paging().page_size.max(1)))
+                .max(1);
+            tables.push(std::borrow::Cow::Owned(if seated.refs {
+                self.pools.kv_pages(seated.pages, None)?
+            } else {
+                self.pools.kv_pages(
+                    &[],
+                    Some((lane.slot, u32::try_from(pages).unwrap_or(u32::MAX))),
+                )?
+            }));
 
             // A kv-less lane's mask goes to its group-packed attention, not the paged prefill.
             let masking = seated.mask.filter(|_| !seated.kv_less);
@@ -1935,8 +2057,8 @@ impl Shell {
                 adapter_routes.extend(std::iter::repeat_n(id, row.rows as usize));
             }
 
-            slot_ids.push(seated.rs_slot.unwrap_or(lane.slot) as i32);
-            let at_lane = slot_ids.len() as i32 - 1;
+            slot_ids.extend(state.iter().map(|&unit| unit as i32));
+            let at_lane = (slot_ids.len() / state.len().max(1)) as i32 - 1;
 
             if !matches!(seated.rs, engine::fire::RsVerb::Fold) {
                 if self.rs_layout.is_none() {
@@ -1951,11 +2073,7 @@ impl Shell {
                 }
                 rs_active = true;
             }
-            rs_plans.push(
-                engine::rs::LanePlan::of(seated.rs, row.rows, have, masking, None).map_err(
-                    |error| program("serve::rs", format!("lane {}: {error}", row.source)),
-                )?,
-            );
+            rs_plans.push(plan);
 
             if !seated.positions.is_empty() && seated.positions.len() != lane.tokens.len() {
                 return Err(Fault::Positions {
@@ -1975,7 +2093,7 @@ impl Shell {
                             None => narrow(u64::from(have) + at as u64),
                         });
                         request_of_token.push(at_lane);
-                        slot_of_row.push(seated.rs_slot.unwrap_or(lane.slot) as i32);
+                        slot_of_row.extend(state.iter().map(|&unit| unit as i32));
                     }
                     writes.extend(std::iter::repeat_n(None, rows_here));
                 }
@@ -2037,8 +2155,8 @@ impl Shell {
         if !beginning.is_empty() && self.pools.has_state() {
             self.drain()?;
         }
-        for slot in beginning {
-            self.pools.clear(slot)?;
+        for units in beginning {
+            self.pools.clear(&units)?;
         }
 
         let indptr_host = kv::indptr(&seats)?;
@@ -2435,6 +2553,7 @@ impl Shell {
                     &self.handles,
                     layout,
                     buffers,
+                    self.pools.segments(&self.handles)?,
                     scratch,
                     rs_plans,
                     replay,

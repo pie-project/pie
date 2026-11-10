@@ -75,16 +75,16 @@ impl Run<'_> {
         let row_bytes = seat.layout.planes[plane].row_bytes;
         let mut done = 0u32;
         while done < run.count {
-            let (at, room) = seat
+            let (pool, at, room) = seat
                 .locate(run, plane, run.from + done)
                 .map_err(|fault| Self::kernel(fault, op))?;
             let take = room.min(run.count - done);
             let bytes = u64::from(take) * row_bytes;
             let rows_at = u64::from(row0 + done) * row_bytes;
             if into_slab {
-                self.rs_copy(op, (rect.buf, rows_at), (seat.pool, at), bytes)?;
+                self.rs_copy(op, (rect.buf, rows_at), (pool, at), bytes)?;
             } else {
-                self.rs_copy(op, (seat.pool, at), (rect.buf, rows_at), bytes)?;
+                self.rs_copy(op, (pool, at), (rect.buf, rows_at), bytes)?;
             }
             done += take;
         }

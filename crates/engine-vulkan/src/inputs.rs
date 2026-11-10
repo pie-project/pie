@@ -234,6 +234,8 @@ pub struct Inputs {
     row_valid: u64,
     slot_ids: u64,
     slot_of_row: u64,
+    /// The units a slot entry holds: a record's pieces.
+    pieces: u32,
     adapter_routes: u64,
     request_of_token: u64,
     mask_planes: u64,
@@ -282,7 +284,9 @@ impl Inputs {
         seats: &[Seat],
         selections: usize,
         voxel: Option<VoxelSeat>,
+        pieces: u32,
     ) -> Result<Inputs> {
+        let pieces = pieces.max(1);
         let rows = u64::from(budget.max_tokens);
         let lanes = u64::from(budget.max_lanes);
         let pages = u64::from(budget.max_lanes) * u64::from(paging.pages_per_slot);
@@ -302,9 +306,9 @@ impl Inputs {
         let readout_rows = take(rows * 4);
         let windows = take(window_ints * 4);
         let row_valid = take(rows);
-        let slot_ids = take(lanes * 4);
+        let slot_ids = take(lanes * u64::from(pieces) * 4);
 
-        let slot_of_row = take(rows * 4);
+        let slot_of_row = take(rows * u64::from(pieces) * 4);
 
         let adapter_routes = take(rows * 4);
         let request_of_token = take(rows * 4);
@@ -383,6 +387,7 @@ impl Inputs {
             row_valid,
             slot_ids,
             slot_of_row,
+            pieces,
             adapter_routes,
             request_of_token,
             mask_planes,
@@ -505,7 +510,7 @@ impl Inputs {
 
     pub fn write(&mut self, handles: &crate::device::Handles, fire: &Fire<'_>) -> Result<Handles> {
         let rows = fire.tokens.len() as u32;
-        let lanes = fire.slot_ids.len() as u32;
+        let lanes = fire.slot_ids.len() as u32 / self.pieces;
 
         let valid = vec![1u8; rows as usize];
 
@@ -888,8 +893,8 @@ impl Inputs {
 
             windows: handles.bind(&self.store, self.windows, fire.windows.len() as u64 * 4)?,
             page_tables,
-            slot_ids: i32s(handles, &self.store, self.slot_ids, lanes)?,
-            slot_of_row: i32s(handles, &self.store, self.slot_of_row, rows)?,
+            slot_ids: entries(handles, &self.store, self.slot_ids, lanes, self.pieces)?,
+            slot_of_row: entries(handles, &self.store, self.slot_of_row, rows, self.pieces)?,
             adapter_routes: match adapter_routes {
                 None => None,
                 Some(rows) => Some(i32s(handles, &self.store, self.adapter_routes, rows)?),
@@ -970,6 +975,18 @@ impl Inputs {
 fn i32s(handles: &crate::device::Handles, store: &Buffer, at: u64, rows: u32) -> Result<Tensor> {
     let buf = handles.bind(store, at, u64::from(rows) * 4)?;
     Ok(Tensor::new(buf, rows, 1, Dtype::I32))
+}
+
+/// `rows` entries of `width` i32 units each: a slot table.
+fn entries(
+    handles: &crate::device::Handles,
+    store: &Buffer,
+    at: u64,
+    rows: u32,
+    width: u32,
+) -> Result<Tensor> {
+    let buf = handles.bind(store, at, u64::from(rows) * u64::from(width) * 4)?;
+    Ok(Tensor::new(buf, rows, width, Dtype::I32))
 }
 
 fn u32s(handles: &crate::device::Handles, store: &Buffer, at: u64, rows: u32) -> Result<Tensor> {

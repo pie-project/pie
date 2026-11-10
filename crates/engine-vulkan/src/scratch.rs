@@ -427,6 +427,24 @@ impl Scratch {
         })())
     }
 
+    /// The buffer every room lies in.
+    #[must_use]
+    pub fn plane(&self) -> &Buffer {
+        &self.plane
+    }
+
+    /// Every compressor side plane (state and score of each pooled row): its
+    /// first byte in [`Scratch::plane`] and the bytes a cell (a token of a
+    /// physical list page) takes.
+    #[must_use]
+    pub fn side_planes(&self) -> Vec<(u64, u64)> {
+        self.pool
+            .iter()
+            .flat_map(|pool| [pool.state_kv, pool.state_score])
+            .map(|room| (room.at, u64::from(room.width) * room.dtype.bytes_ceil()))
+            .collect()
+    }
+
     pub fn pool_state(&self, handles: &Handles, row: u32) -> Option<Result<PoolSlabs>> {
         let rooms = *self.pool.iter().find(|held| held.row == row)?;
         let mint = || {
