@@ -25,3 +25,21 @@ Proposed by the L40S session (branch `sc/l40s-bc`), accepted by New Pie. Runtime
 5. **Facts.** CUDA reports real `ChunkFacts` (unpinned shapes from `chunk::plan` SERVER_CUDA, `Growth::TwoEnded`,
    `act_chunks` per token bucket). The runtime must accept unpinned/shared shapes (today `StorePools::of` refuses
    them), so BC and RW merge together.
+
+## Amendments (2026-11-10, after RW)
+6. **Logical ids:** the engine's `ChunkTable` starts as the identity and changes only through `Evacuation` moves,
+   applied in order (`ChunkTable::apply`). The runtime opens a chunk at physical p under the logical id the table maps
+   to p.
+7. **Segment verbs:** `commit_segments(n)` backs `0..n` (prefix); `release_segments(n)` releases from n up but never
+   the top `act_chunks_max` span. The runtime shrinks by evacuating the highest committed prefix segment.
+8. **Fixed pieces:** `Lane.fixed` lists every fixed shape with exactly `pieces` pairs. The rs buffer sits inside the
+   fixed record (no buffer pages). `cow != run` is the only state copy the runtime asks for; no `StateCopy` for records.
+9. **Snapshots:** `RsSnapshot` carries one ref per piece of the snapshot's fixed record (Vec, piece order) — to be
+   changed on both sides; today it is a single ref (first piece), valid only for one-piece records.
+10. **`sets_per_working_set` = 1** for fixed shapes (one set per working set; the CoW reserve is one record per lane a
+    fire runs, held by the runtime). Engine validation that expects 2 must change to 1.
+11. **Shapes:** at most one list and one ring shape per load; the list slot's tokens equal the kv page size;
+    ring/list refs are slot refs `chunk * slots_per_chunk + index` (ring ref 0 = null chunk).
+12. **Multi-lane groups on one working set:** the first lane gets `[src, dst]`, the others `[src, src]`.
+    Forked rings still copy through `kv.window_copies` (to fold into `copy_slots` later). Host/disk tiers for shared
+    shapes come with `copy_slots`.

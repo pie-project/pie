@@ -317,3 +317,17 @@ The `new-memory/` directory is bookkeeping and is removed before anything lands 
   moved:: minimax_h3, flux_2, z_image, qwen3_dense, deepseek_v4 and the_flux_2*/the_z_image* before the deletion.
 - Next on this side: K2 (IR kv-space removal: CacheRow::Kv.space, Mask/Geometry{space}, write geometry) once the
   engines key by slot shape; Metal pool switch. CUDA side (L40S): BC + RW merge together.
+
+### M20 — 2026-11-10: RW merged (runtime on real shared ChunkFacts)
+- `sc/rw-runtime-shared-pool` (10bae1966, 010cce492, aed977a99, ac80264ca, 9e4f75977): `Lane.fixed` per piece with
+  `cow == run` legal (in place); slot pool enforces the activation position rule (state below
+  `total - act_chunks(rung)`, top act_max span committed from load, `plan_rung/apply_rung` evacuate before a raise);
+  logical ids follow the engine's ChunkTable; `store::shared::SharedPool` (list, ring, fixed records with the rs
+  buffer inside, weight shapes, any chunk to any shape); stores draw from it; `SharedGrow` governor target sends
+  CommitSegments / Evacuate / ReleaseSegments through the engine lane; fire paths fill `Lane.tables`/`Lane.fixed`
+  (fork/restore takes a record from the per-lane CoW reserve). Degenerate path unchanged.
+- Not live yet: rung raises (the scheduler cannot yet cap a fire's tokens by rung, so fires stay at the largest rung);
+  shrink only releases the top of the prefix. Contract amendments 6-12 recorded in CONTRACT-BC.md (snapshot refs per
+  piece and `sets_per_working_set = 1` need both sides).
+- Verified: `cargo check` runtime, worker, engine and every engine crate on new-memory; RW ran store/planner/governor/
+  pipeline::fire::rs (154) and engine chunk (12) tests.
