@@ -529,6 +529,7 @@ impl FireCtx<'_> {
             _ => (&self.compiled.arena, false),
         };
         let mut slots = self.arena.slots(
+            &self.pools,
             map,
             poem_compiler::FireRows {
                 tokens: carve_rows,

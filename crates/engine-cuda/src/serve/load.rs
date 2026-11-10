@@ -876,6 +876,14 @@ impl Shell {
                 crate::device::free_bytes().unwrap_or(0) >> 20
             );
         }
+        // The fires that run the side streams carve their own arena
+        // (`CompiledModel::arena_forked`): the larger of the two is what the
+        // pool keeps under its end for a fire's activation.
+        let forked_bytes = compiled
+            .arena_forked
+            .as_ref()
+            .map_or(0, |forked| forked.bytes);
+        let arena_bytes = compiled.arena.bytes.max(forked_bytes);
         let pools = Pools::reserve(
             device.ordinal(),
             boot.memory_share,
@@ -884,6 +892,7 @@ impl Shell {
             boot.kv_budget,
             &facts,
             &budgets,
+            arena_bytes,
         )?;
         if boot.knobs.diagnostics.arm_trace {
             eprintln!(
@@ -897,16 +906,9 @@ impl Shell {
         if let Some(buffers) = &buffers {
             pools.seat_buffered(buffers.slot_bytes(), buffers.map_unit());
         }
-        // The fires that run the side streams carve their own arena
-        // (`CompiledModel::arena_forked`): the larger of the two is reserved
-        // and held. Committed whole: a fire reading out past one row a lane
-        // (a verify reads every row) would otherwise grow it outside the fit.
-        let forked_bytes = compiled
-            .arena_forked
-            .as_ref()
-            .map_or(0, |forked| forked.bytes);
-        let arena_bytes = compiled.arena.bytes.max(forked_bytes);
-        let mut arena = Arena::reserve(arena_bytes, &pools)?;
+        // Committed whole: a fire reading out past one row a lane (a verify
+        // reads every row) would otherwise grow it outside the fit.
+        let mut arena = Arena::reserve(arena_bytes);
         let unscored = compiled.arena.scores_from(&boot.trace).max(
             compiled
                 .arena_forked

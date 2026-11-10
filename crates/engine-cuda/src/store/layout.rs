@@ -26,11 +26,40 @@ pub const RING: ShapeId = ShapeId(1);
 /// The fixed shape's.
 pub const FIXED: ShapeId = ShapeId(2);
 
-/// One per-token shape: the pages of the rows that share a page table.
+/// Which of a load's slot shapes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Kind {
+    /// A page of every full-retention kv row.
+    List,
+    /// A page of every windowed kv row.
+    Ring,
+    /// A working set's record of every recurrent row.
+    Fixed,
+}
+
+impl Kind {
+    /// The shape a kv row's pages are slots of.
+    #[must_use]
+    pub const fn paged(windowed: bool) -> Kind {
+        if windowed { Kind::Ring } else { Kind::List }
+    }
+
+    #[must_use]
+    pub const fn name(self) -> &'static str {
+        match self {
+            Kind::List => "kv page",
+            Kind::Ring => "windowed page",
+            Kind::Fixed => "state slot",
+        }
+    }
+}
+
+/// One slot shape: the pages of the kv rows that share a page table, or the
+/// record of the recurrent rows.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct TokenShape {
+pub struct SlotShape {
     pub id: ShapeId,
-    /// Tokens a slot holds: the page size.
+    /// Tokens a slot holds: the page size (0 for the fixed shape).
     pub tokens: u32,
     pub slot_bytes: u64,
     pub per_chunk: u32,
@@ -42,8 +71,8 @@ pub struct TokenShape {
     pub rows: Vec<(u32, u64)>,
 }
 
-impl TokenShape {
-    fn of(layout: &SlotLayout, chunk_bytes: u64, id: ShapeId) -> Result<TokenShape> {
+impl SlotShape {
+    fn of(layout: &SlotLayout, chunk_bytes: u64, id: ShapeId) -> Result<SlotShape> {
         let (tokens, bytes, window, runs) = match layout {
             SlotLayout::List {
                 tokens,
@@ -71,7 +100,7 @@ impl TokenShape {
                 format!("a token slot of {bytes} bytes fits no chunk of {chunk_bytes}"),
             ));
         }
-        Ok(TokenShape {
+        Ok(SlotShape {
             id,
             tokens,
             slot_bytes: bytes,
@@ -82,6 +111,48 @@ impl TokenShape {
                 .iter()
                 .filter_map(|run| match run.row {
                     RowId::Cache(row) => Some((row, run.offset)),
+                    RowId::Rs(_) => None,
+                })
+                .collect(),
+        })
+    }
+
+    /// The fixed shape: a working set's record of the recurrent rows, each
+    /// where the recipe puts it. A record the recipe cuts into pieces is
+    /// refused: this engine's state tables name one slot a lane.
+    fn fixed(layout: &SlotLayout, chunk_bytes: u64) -> Result<SlotShape> {
+        let SlotLayout::Fixed {
+            bytes,
+            record,
+            pieces_per_ws,
+            pieces,
+            ..
+        } = layout
+        else {
+            return Err(Fault::program(
+                "store::layout",
+                "a token slot read as the fixed slot",
+            ));
+        };
+        if *pieces_per_ws != 1 {
+            return Err(Fault::Unbound {
+                what: format!(
+                    "a recurrent record of {record} bytes whole in one chunk of                      {chunk_bytes}: the chunk recipe cuts it into {pieces_per_ws} pieces,                      which this engine's state tables do not name yet"
+                ),
+            });
+        }
+        let per_chunk = u32::try_from(chunk_bytes / (*bytes).max(1)).unwrap_or(u32::MAX);
+        Ok(SlotShape {
+            id: FIXED,
+            tokens: 0,
+            slot_bytes: *bytes,
+            per_chunk: per_chunk.max(1),
+            grain: gcd(chunk_bytes, *bytes),
+            window: None,
+            rows: pieces
+                .iter()
+                .filter_map(|piece| match piece.row {
+                    RowId::Cache(row) => Some((row, piece.offset)),
                     RowId::Rs(_) => None,
                 })
                 .collect(),
@@ -115,14 +186,15 @@ impl TokenShape {
     }
 }
 
-/// The token shapes of a load.
+/// The slot shapes of a load.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Layout {
     pub chunk_bytes: u64,
     /// Chunks a segment, by the recipe's device profile.
     pub segment_chunks: u32,
-    pub list: Option<TokenShape>,
-    pub ring: Option<TokenShape>,
+    pub list: Option<SlotShape>,
+    pub ring: Option<SlotShape>,
+    pub fixed: Option<SlotShape>,
 }
 
 impl Layout {
@@ -132,12 +204,12 @@ impl Layout {
         let chunk_bytes = recipe.chunk_bytes;
         let list = recipe
             .list()
-            .map(|layout| TokenShape::of(layout, chunk_bytes, LIST))
+            .map(|layout| SlotShape::of(layout, chunk_bytes, LIST))
             .transpose()?;
         let mut rings = recipe.rings();
         let ring = rings
             .next()
-            .map(|layout| TokenShape::of(layout, chunk_bytes, RING))
+            .map(|layout| SlotShape::of(layout, chunk_bytes, RING))
             .transpose()?;
         if rings.next().is_some() {
             return Err(Fault::Unbound {
@@ -146,28 +218,33 @@ impl Layout {
                     .to_string(),
             });
         }
+        let fixed = recipe
+            .fixed()
+            .map(|layout| SlotShape::fixed(layout, chunk_bytes))
+            .transpose()?;
         let (_, segment_chunks) = recipe.profile.segment(chunk_bytes);
         Ok(Layout {
             chunk_bytes,
             segment_chunks: u32::try_from(segment_chunks).unwrap_or(u32::MAX).max(1),
             list,
             ring,
+            fixed,
         })
     }
 
     #[must_use]
-    pub fn shape(&self, ring: bool) -> Option<&TokenShape> {
-        if ring {
-            self.ring.as_ref()
-        } else {
-            self.list.as_ref()
+    pub fn shape(&self, kind: Kind) -> Option<&SlotShape> {
+        match kind {
+            Kind::List => self.list.as_ref(),
+            Kind::Ring => self.ring.as_ref(),
+            Kind::Fixed => self.fixed.as_ref(),
         }
     }
 
     /// The chunks `slots` slots of a shape take.
     #[must_use]
-    pub fn chunks_for(&self, ring: bool, slots: u64) -> u64 {
-        self.shape(ring)
+    pub fn chunks_for(&self, kind: Kind, slots: u64) -> u64 {
+        self.shape(kind)
             .map_or(0, |shape| slots.div_ceil(u64::from(shape.per_chunk.max(1))))
     }
 }
@@ -186,7 +263,7 @@ mod tests {
     #[test]
     fn a_list_slot_is_read_by_its_slot_ref_and_a_ring_slot_by_its_grain() {
         let chunk = 48 * 256;
-        let list = TokenShape {
+        let list = SlotShape {
             id: LIST,
             tokens: 16,
             slot_bytes: 12 * 256,
@@ -201,7 +278,7 @@ mod tests {
         assert_eq!(list.offset_of(1), None);
 
         // A ring slot of 20 units in a chunk of 48: two a chunk, eight spare.
-        let ring = TokenShape {
+        let ring = SlotShape {
             id: RING,
             tokens: 16,
             slot_bytes: 20 * 256,

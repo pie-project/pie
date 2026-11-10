@@ -824,7 +824,7 @@ pub fn commit_beside(pool: &PhysicalPool, arena: &mut Arena, want: &Want) -> Res
 }
 
 /// One reserved address range cut into equal segments, backed from the
-/// bottom a segment at a time, with a span at its top backed apart: the
+/// bottom a segment at a time, with one span of it held backed apart: the
 /// state pool's chunks grow up from offset 0 and a fire's activation sits
 /// under the range's end, so neither end's base ever moves.
 ///
@@ -836,8 +836,8 @@ pub struct Range {
     arena: Arena,
     segment_bytes: u64,
     committed: u32,
-    /// Bytes under the range's end that stay backed whatever is committed.
-    top: u64,
+    /// `(from, bytes)` that stay backed whatever is committed.
+    held: (u64, u64),
 }
 
 impl Range {
@@ -853,7 +853,7 @@ impl Range {
             arena: Arena::reserve(pool, bytes, label)?,
             segment_bytes: segment_bytes.max(1),
             committed: 0,
-            top: 0,
+            held: (0, 0),
         })
     }
 
@@ -884,14 +884,23 @@ impl Range {
         self.committed
     }
 
+    /// The span held backed apart from the segments, `(from, bytes)`.
     #[must_use]
-    pub const fn top_bytes(&self) -> u64 {
-        self.top
+    pub const fn held(&self) -> (u64, u64) {
+        self.held
     }
 
+    /// Every byte backed: the committed segments' and the held span's.
     #[must_use]
     pub fn committed_bytes(&self) -> u64 {
         self.arena.committed_bytes()
+    }
+
+    /// The bytes the committed segments back, the held span apart.
+    #[must_use]
+    pub fn segment_bytes_committed(&self) -> u64 {
+        let bottom = (u64::from(self.committed) * self.segment_bytes).min(self.arena.max_bytes);
+        self.arena.units_of(&Want::Prefix(bottom)).len() as u64 * self.arena.map_unit
     }
 
     #[must_use]
@@ -904,30 +913,37 @@ impl Range {
         self.arena.span(offset, len)
     }
 
-    /// What the range backs with `segments` committed and `top` bytes held
-    /// under its end.
-    fn wanted(&self, segments: u32, top: u64) -> Want {
+    /// What the range backs with `segments` committed and `held` held.
+    fn wanted(&self, segments: u32, held: (u64, u64)) -> Want {
         let bytes = self.arena.max_bytes;
         let bottom = (u64::from(segments) * self.segment_bytes).min(bytes);
-        let top = top.min(bytes);
-        Want::Ranges(vec![(0, bottom), (bytes - top, top)])
+        Want::Ranges(vec![(0, bottom), held])
     }
 
-    fn back(&mut self, pool: &mut PhysicalPool, segments: u32, top: u64) -> Result<Commit> {
-        let want = self.wanted(segments, top);
+    /// Backs `bytes` from `from`, and keeps them backed whatever segments
+    /// are committed or released; the span held before is held still where
+    /// the new one covers it. `beside` backs what the pool's budget refuses
+    /// beside it ([`commit_beside`]).
+    pub fn hold(
+        &mut self,
+        pool: &mut PhysicalPool,
+        from: u64,
+        bytes: u64,
+        beside: bool,
+    ) -> Result<Commit> {
+        let held = (from, bytes);
+        let want = self.wanted(self.committed, held);
         let mut targets = [Target {
             arena: &mut self.arena,
-            want,
+            want: want.clone(),
         }];
-        commit_atomically(pool, &mut targets)
-    }
-
-    /// Backs `bytes` under the range's end, and keeps them backed.
-    pub fn hold_top(&mut self, pool: &mut PhysicalPool, bytes: u64) -> Result<Commit> {
-        let top = self.top.max(bytes);
-        let outcome = self.back(pool, self.committed, top)?;
+        let mut outcome = commit_atomically(pool, &mut targets)?;
+        if outcome != Commit::Committed && beside {
+            commit_beside(pool, &mut self.arena, &want)?;
+            outcome = Commit::Committed;
+        }
         if outcome == Commit::Committed {
-            self.top = top.min(self.arena.max_bytes);
+            self.held = held;
         }
         Ok(outcome)
     }
@@ -938,7 +954,12 @@ impl Range {
         if segments <= self.committed {
             return Ok(Commit::Committed);
         }
-        let outcome = self.back(pool, segments, self.top)?;
+        let want = self.wanted(segments, self.held);
+        let mut targets = [Target {
+            arena: &mut self.arena,
+            want,
+        }];
+        let outcome = commit_atomically(pool, &mut targets)?;
         if outcome == Commit::Committed {
             self.committed = segments;
         }
@@ -953,10 +974,18 @@ impl Range {
         if segments >= self.committed {
             return Ok(());
         }
-        let keep = self.arena.target_units(&self.wanted(segments, self.top))?;
+        let keep = self.arena.target_units(&self.wanted(segments, self.held))?;
         self.arena.shrink_to(pool, &keep);
         self.committed = segments;
         Ok(())
+    }
+
+    /// Gives back everything, the held span too: before the range is
+    /// dropped for another, so the pool's count of what is backed stands.
+    pub fn release_all(&mut self, pool: &mut PhysicalPool) {
+        self.arena.shrink_to(pool, &[]);
+        self.committed = 0;
+        self.held = (0, 0);
     }
 }
 
