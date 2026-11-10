@@ -33,11 +33,11 @@ attn.decode_pages = 64
 # heads took 896 us a layer (482 now), Qwen3.6-27B's 48 heads 2464 (1285); under 16 lanes the VPU's is
 # as fast
 ssm.step_mxu = 16
-# a routed MLP's prompt of 2048 tokens and more sums each block of 128 tokens' runs of expert rows by its
-# own dot, as on v6e, not by the pick (Gemma-4-26B-A4B's 32-expert cut, 2048 tokens: 2481 -> 2015 us;
-# Qwen3.6-35B-A3B's 16-expert cut 1213 -> 1095); at 1024 the pick is cheaper (1116 vs 1142, 625 vs 659)
+# a routed MLP's prompt of 1280 tokens and more sums each block of 128 tokens' runs of expert rows by its
+# own dot, as on v6e, not by the pick (Gemma-4-26B-A4B's 32-expert cut, 1664 tokens: 2132 -> 1734 us;
+# Qwen3.6-35B-A3B's 16-expert cut 995 -> 936); at 1088 Qwen's pick is cheaper (690 vs 725)
 moe.segment_tokens = 128
-moe.segment_from = 2048
+moe.segment_from = 1280
 
 [provenance]
 measured = [

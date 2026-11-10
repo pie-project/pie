@@ -77,10 +77,10 @@ pub struct MoeSegmentTokens(pub u32);
 
 /// The fewest tokens a fire holds for its routed MLP's sum to take the
 /// blocks (`kernel.moe.segment_tokens`): below them the one-hot dot or the
-/// pick is cheaper (v5e: Qwen3.6-35B-A3B's 16-expert cut at 1024 tokens
-/// 625 -> 659 us through the blocks, at 2048 1213 -> 1095).
+/// pick is cheaper (v5e: Qwen3.6-35B-A3B's 16-expert cut at 1088 tokens
+/// 690 -> 725 us through the blocks, at 1280 747 -> 733).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Decision)]
-#[decision(id = "kernel.moe.segment_from", constant(set(1024, 2048)), default = 1024, tune = search)]
+#[decision(id = "kernel.moe.segment_from", constant(range(0..=8192)), default = 1024, tune = search)]
 pub struct MoeSegmentFrom(pub u32);
 
 /// Whether a routed MLP's gate-up grouped matmul lands its rows' GLU, each
