@@ -48,11 +48,12 @@ pub(crate) fn inv_rms_rows(
 /// fires: 0.36 ms each beside its 0.1 ms of arithmetic).
 const TALL_ROWS: i64 = 1024;
 
-/// Whether a per-head norm takes the tall form: heads of 256 and wider (a
-/// 128-wide head's view lays out as its rows do: Qwen3-0.6B's prompts ran
-/// 1% slower through the MXU).
+/// Whether a per-head norm takes the tall form: 32 heads of 256 and wider
+/// (gemma-4-31B's `q`). Fewer or narrower heads lay out cheaply enough that
+/// the MXU's full-precision sums cost more (v5e gemma-4-E2B c256, 8 heads:
+/// 7.44k -> 7.09k tok/s; Qwen3-0.6B's 128-wide heads: prompts 1% slower).
 fn tall(rows: i64, heads: i64, axis: i64) -> bool {
-    heads > 1 && rows >= TALL_ROWS && axis >= 256
+    heads >= 32 && rows >= TALL_ROWS && axis >= 256
 }
 
 /// [`inv_rms_rows`] for a tall fire: each head's sum of squares through
