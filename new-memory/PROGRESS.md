@@ -422,3 +422,15 @@ The `new-memory/` directory is bookkeeping and is removed before anything lands 
   the hybrid prefill path, not a runtime/BC addressing bug. L40S asked to confirm and name the kernel arm.
 - Open: the degenerate runtime never co-batches fresh hybrid working sets (Qwen3 does) — explains why the old build
   never showed this.
+
+### M30 — 2026-11-10: BM merged (Metal on the shared chunk pool)
+- `sc/bm-metal-pool` (3e1a9f1df, on 76b080825): window list (contract 19; stopgap: stated as `SlotKind::Ring
+  { window, tokens }` until engine::chunk lists carry a window — WL replaces), rs list (18/20, T_rs from recipe),
+  `Lane.slot_copies`, snapshots per piece (16), contract 15 group reads, FixedRun pieces.
+- Verified on Mac Studio via `pie run text-completion`, greedy, 2 prompts x 48 tokens, tokens equal to 76b080825
+  degenerate: Qwen3-0.6B, Qwen3.5-0.8B (hybrid, MTP), gemma-4-e4b-it-4bit (sliding). Engine scattered-pool tests
+  (qwen3-micro-text, qwen35-tiny, gemma4-e4b-mini-l1), packed kv migration, store:: lib tests.
+- Not exercised on device: trimming past the 512 window, spec decode (rs buffer), multi-piece records in a fire,
+  snapshots in a fire, contract 15 group path, slot_copies.
+- Open (P3): qwen38-flash-next-mini refused — Metal buffers every conv input incl. cache row 9 that feeds no
+  deferred recurrence; recipe keeps no rs row for it.
