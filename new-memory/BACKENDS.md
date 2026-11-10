@@ -8,8 +8,8 @@ Legend: ✅ verified on hardware · 🟡 in progress / compile-only · 🔴 not 
 
 | Feature | CUDA | ROCm | Metal | Vulkan | wgpu | XLA/TPU | Cerebras |
 |---|---|---|---|---|---|---|---|
-| Real ChunkFacts, slot-ref lanes, fixed pieces | ✅ M34 | ✅ M43 (MI300X) | ✅ M30 · 🔴 dsv4 window by slot ref (BM5a) | 🟡 VK (kernels M43, pool next) | 🟡 VK | 🟡 XLA | 🟡 M43 host pool (no HW) |
-| Grow / shrink (segments, evacuation) | ✅ M34 | — flat by spec | ✅ M30 | 🟡 VK | 🟡 VK | — fixed at load | 🟡 M43 (host segments) |
+| Real ChunkFacts, slot-ref lanes, fixed pieces | ✅ M34 | ✅ M43 (MI300X) | ✅ M30 · 🔴 dsv4 window by slot ref (BM5a) | ✅ M48 | ✅ M48 | 🟡 XLA | 🟡 M43 host pool (no HW) |
+| Grow / shrink (segments, evacuation) | ✅ M34 | — flat by spec | ✅ M30 | ✅ M48 | ✅ M48 | — fixed at load | 🟡 M43 (host segments) |
 | rs list + slot_copies | ✅ M34 | ✅ golden_buffered (MI300X) | ✅ M37 | 🟡 VK | 🟡 VK | 🟡 XLA | 🟡 M43 (host sim) |
 | Window lists (own T_w, trimmed) | 🟡 one list, T_w=page (L40S: tables per list) | ✅ goldens (one list) | 🟡 one list (BM) | 🟡 VK | 🟡 VK | 🟡 XLA | 🟡 one list, T_w=page |
 | Multi-piece records end to end | ✅ engine (L40S) · 🟡 runtime boot (IT r5) | ✅ records in pieces (chunk goldens); rows cut across pieces kernel-tested | 🔴 on device (BM) | 🟡 VK | 🟡 VK | 🟡 XLA | 🟡 host sim |

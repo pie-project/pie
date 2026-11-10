@@ -666,3 +666,14 @@ The `new-memory/` directory is bookkeeping and is removed before anything lands 
 ### Note — 2026-11-10: ROCm tiers verified (MI300X)
 - golden_offload 8/8 models (incl. mamba, dsv4, dots3, minimax, mimo), 12/12 steps bitwise vs never-offloaded,
   host + disk chunks exercised. No ROCm-only legacy tier code left (sc/tier-shared deleted the shared verbs).
+
+### M48 — 2026-11-10: Vulkan + wgpu on the shared chunk pool
+- `sc/vk-chunk-pool` (c390f42a8, 601a9c51f, c64788741): one pool in up to 4 buffer-segment bindings (<= binding
+  limit, pool <= 8 GiB for 32-bit bf16 indexing), ~4 MiB chunks, bottom growth, evacuation queued before the next fire;
+  slot-ref lanes, rs list pages, slot_copies, contract 15; copy_slots device/host/disk (wgpu host tier = plain host
+  memory via queue); per-row slabs, pool resize, separate rs buffer and parked tiers deleted. Records in pieces (state
+  kernels look pieces up per lane). Compressor side planes follow evacuation (untested: dsv4 mini never ran on Vulkan).
+- Verified (RTX PRO 4500, NVIDIA Vulkan; wgpu via Vulkan): default placement = base 88a621693 (wgpu all 3, Vulkan
+  hybrid + windowed; dense 1 ulp accepted); scattered + evacuate + release mid-decode bitwise; 4-piece records bitwise.
+- Open: window lists not trimmed (kept whole in the kv list), snapshots, on-device test of tiers / group CoW /
+  slot_copies, weight streaming. Build needs PIE_SLANGC=/root/slang/2026.17/bin/slangc on this machine.
