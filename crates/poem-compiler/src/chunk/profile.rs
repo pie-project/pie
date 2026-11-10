@@ -55,13 +55,20 @@ pub struct ChunkProfile {
 
 impl ChunkProfile {
     /// The profile of a backend whose kernels page windowed and full rows
-    /// alike: token slots of its page's `tokens`, the windowed rows one
-    /// window list, and a window of `context` tokens or more no window.
+    /// alike: token slots of its page's `tokens`, a window list a window,
+    /// and a window of `context` tokens or more no window.
     #[must_use]
     pub const fn paged(mut self, tokens: u32, context: u32) -> ChunkProfile {
         self.token_slot = Some(tokens);
-        self.one_window = true;
         self.full_from = Some(context);
+        self
+    }
+
+    /// The profile with every windowed row in one window list, of the
+    /// widest window ([`ChunkProfile::one_window`]).
+    #[must_use]
+    pub const fn merged(mut self) -> ChunkProfile {
+        self.one_window = true;
         self
     }
 

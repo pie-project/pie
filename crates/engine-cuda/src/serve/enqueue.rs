@@ -685,7 +685,7 @@ impl FireCtx<'_> {
                 .collect(),
             inputs: staged.inputs.clone(),
             geometry,
-            window_table: self.pools.window_table() as u32,
+            window_tables: self.pools.window_tables(),
             schedules,
             plan_values: facts.plans.len(),
             tables: FireTables {

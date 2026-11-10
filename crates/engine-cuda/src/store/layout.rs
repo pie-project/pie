@@ -21,8 +21,30 @@ use crate::error::{Fault, Result};
 
 /// The list shape's id in the facts this engine states.
 pub const LIST: ShapeId = ShapeId(0);
-/// The window list's.
+/// The first (narrowest) window list's; the lists after it are
+/// [`window_id`]'s.
 pub const WINDOW: ShapeId = ShapeId(1);
+/// The window lists a load may state (CONTRACT-BC 21).
+pub const MOST_WINDOWS: usize = 4;
+/// The ids of the window lists past the first start here, clear of the
+/// weight shapes' ([`WEIGHTS`] on).
+const MORE_WINDOWS: u32 = 1 << 16;
+
+/// Window list `at`'s id in the facts this engine states, narrowest first.
+#[must_use]
+pub const fn window_id(at: usize) -> ShapeId {
+    if at == 0 {
+        WINDOW
+    } else {
+        ShapeId(MORE_WINDOWS + at as u32)
+    }
+}
+
+/// The window list shape id `id` names, if it names one.
+#[must_use]
+pub fn window_of(id: ShapeId) -> Option<usize> {
+    (0..MOST_WINDOWS).find(|&at| window_id(at) == id)
+}
 /// The fixed shape's.
 pub const FIXED: ShapeId = ShapeId(2);
 /// The rs list's.
@@ -33,8 +55,9 @@ pub const RS: ShapeId = ShapeId(3);
 pub enum Kind {
     /// A page of every full-retention kv row.
     List,
-    /// A page of every windowed kv row.
-    Window,
+    /// A page of every kv row read through one window: window list `.0`,
+    /// narrowest first.
+    Window(u8),
     /// A working set's record of every recurrent row.
     Fixed,
     /// A page of the rs buffer: the rows a lane lands past its state before
@@ -43,19 +66,47 @@ pub enum Kind {
 }
 
 impl Kind {
-    pub const ALL: [Kind; 4] = [Kind::List, Kind::Window, Kind::Fixed, Kind::Rs];
+    /// Every kind, the window lists a load may state among them.
+    pub const ALL: [Kind; Kind::COUNT] = [
+        Kind::List,
+        Kind::Fixed,
+        Kind::Rs,
+        Kind::Window(0),
+        Kind::Window(1),
+        Kind::Window(2),
+        Kind::Window(3),
+    ];
 
-    /// The shape a kv row's pages are slots of.
+    /// The shape the pages of a kv row of list `list` are slots of: 0 the
+    /// kv list, `n` window list `n - 1`.
     #[must_use]
-    pub const fn paged(windowed: bool) -> Kind {
-        if windowed { Kind::Window } else { Kind::List }
+    pub const fn paged(list: u8) -> Kind {
+        if list == 0 {
+            Kind::List
+        } else {
+            Kind::Window(list - 1)
+        }
     }
+
+    /// A place of its own among the kinds, for a table a kind.
+    #[must_use]
+    pub const fn index(self) -> usize {
+        match self {
+            Kind::List => 0,
+            Kind::Fixed => 1,
+            Kind::Rs => 2,
+            Kind::Window(at) => 3 + at as usize,
+        }
+    }
+
+    /// The kinds [`Kind::index`] numbers.
+    pub const COUNT: usize = 3 + MOST_WINDOWS;
 
     #[must_use]
     pub const fn name(self) -> &'static str {
         match self {
             Kind::List => "kv page",
-            Kind::Window => "windowed page",
+            Kind::Window(_) => "windowed page",
             Kind::Fixed => "state slot",
             Kind::Rs => "rs buffer page",
         }
@@ -177,8 +228,9 @@ pub struct Layout {
     /// Chunks a segment, by the recipe's device profile.
     pub segment_chunks: u32,
     pub list: Option<SlotShape>,
-    /// The window list: this engine pages every windowed row by one table.
-    pub window: Option<SlotShape>,
+    /// The window lists, narrowest first: the kv rows read through one
+    /// window page by one table.
+    pub windows: Vec<SlotShape>,
     pub fixed: Option<FixedShape>,
     pub rs: Option<RsShape>,
     /// The tables the weight cache streams by their rows, a shape each.
@@ -501,9 +553,8 @@ impl FixedShape {
 }
 
 impl Layout {
-    /// The recipe's token shapes. This engine pages every windowed row by one
-    /// table, so a recipe with two window lists is refused, and by its kv
-    /// page, so a window list of another page size is.
+    /// The recipe's token shapes. This engine pages every list by its kv
+    /// page, so a window list of another page size is refused.
     ///
     /// `streamed` are the tables streamed by their rows and `banks` the
     /// routed banks streamed an expert at a time, each with its plane's
@@ -515,27 +566,30 @@ impl Layout {
             .list()
             .map(|layout| SlotShape::of(layout, chunk_bytes, LIST))
             .transpose()?;
-        let mut windows = recipe.windows();
-        let window = windows
-            .next()
-            .map(|layout| SlotShape::of(layout, chunk_bytes, WINDOW))
-            .transpose()?;
-        if let (Some(list), Some(window)) = (&list, &window)
-            && list.tokens != window.tokens
-        {
+        let windows = recipe
+            .windows()
+            .enumerate()
+            .map(|(at, layout)| SlotShape::of(layout, chunk_bytes, window_id(at)))
+            .collect::<Result<Vec<_>>>()?;
+        if windows.len() > MOST_WINDOWS {
             return Err(Fault::Unbound {
                 what: format!(
-                    "a window list of {} tokens a slot beside kv pages of {}, which this \
-                     engine's kernels page alike",
-                    window.tokens, list.tokens
+                    "kv rows read through {} windows; a load states at most {MOST_WINDOWS} \
+                     window lists",
+                    windows.len()
                 ),
             });
         }
-        if windows.next().is_some() {
+        // Every list pages by the engine's one page size.
+        let page = list.as_ref().or(windows.first()).map(|shape| shape.tokens);
+        if let Some(window) = windows.iter().find(|shape| Some(shape.tokens) != page) {
             return Err(Fault::Unbound {
-                what: "kv rows read through windows of two widths, which this engine pages \
-                       by one windowed table"
-                    .to_string(),
+                what: format!(
+                    "a window list of {} tokens a slot beside pages of {}, which this \
+                     engine's kernels page alike",
+                    window.tokens,
+                    page.unwrap_or(0)
+                ),
             });
         }
         let fixed = recipe
@@ -641,7 +695,7 @@ impl Layout {
             chunk_bytes,
             segment_chunks: u32::try_from(segment_chunks).unwrap_or(u32::MAX).max(1),
             list,
-            window,
+            windows,
             fixed,
             rs,
             rows,
@@ -653,7 +707,7 @@ impl Layout {
     pub fn shape(&self, kind: Kind) -> Option<&SlotShape> {
         match kind {
             Kind::List => self.list.as_ref(),
-            Kind::Window => self.window.as_ref(),
+            Kind::Window(at) => self.windows.get(at as usize),
             Kind::Fixed => self.fixed.as_ref().map(|fixed| &fixed.slot),
             Kind::Rs => self.rs.as_ref().map(|rs| &rs.slot),
         }
@@ -677,6 +731,28 @@ fn gcd(mut a: u64, mut b: u64) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn each_window_list_has_an_id_and_a_kind_of_its_own() {
+        let ids: Vec<ShapeId> = (0..MOST_WINDOWS).map(window_id).collect();
+        assert_eq!(ids[0], WINDOW);
+        for (at, id) in ids.iter().enumerate() {
+            assert_eq!(window_of(*id), Some(at));
+            assert!(![LIST, FIXED, RS].contains(id));
+            assert!(ids[..at].iter().all(|held| held != id));
+        }
+        assert_eq!(window_of(LIST), None);
+        assert_eq!(window_of(ShapeId(WEIGHTS)), None);
+        // List 0 is the kv list, list n window list n - 1, and every kind
+        // indexes a table of its own.
+        assert_eq!(Kind::paged(0), Kind::List);
+        assert_eq!(Kind::paged(2), Kind::Window(1));
+        let mut seen = [false; Kind::COUNT];
+        for kind in Kind::ALL {
+            assert!(!std::mem::replace(&mut seen[kind.index()], true));
+        }
+        assert!(seen.iter().all(|seen| *seen));
+    }
 
     #[test]
     fn a_list_slot_is_read_by_its_slot_ref_and_a_window_slot_by_its_grain() {

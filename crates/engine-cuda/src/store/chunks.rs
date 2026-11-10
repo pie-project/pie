@@ -33,7 +33,7 @@ pub struct Chunks {
     /// The chunks under the range's end a fire's activation takes.
     act: u32,
     table: ChunkTable,
-    seated: [Seating; 4],
+    seated: [Seating; Kind::COUNT],
     /// The lowest chunk no shape has opened; chunk 0 is the null chunk.
     next: u32,
     null_zeroed: bool,
@@ -330,7 +330,7 @@ impl Chunks {
                 let Ok(shape) = self.shape(*kind) else {
                     return false;
                 };
-                self.seated[*kind as usize]
+                self.seated[kind.index()]
                     .refs
                     .iter()
                     .any(|&slot| slot != UNSEATED && chunks.contains(&(slot / shape.per_chunk)))
@@ -359,7 +359,7 @@ impl Chunks {
     /// chunk for its shape where the one being filled is full. The windowed
     /// id 0 is the null slot. Returns the physical chunk the slot lies in.
     pub fn seat(&mut self, kind: Kind, id: u32) -> Result<u32> {
-        if kind == Kind::Window && id == 0 {
+        if matches!(kind, Kind::Window(_)) && id == 0 {
             return Ok(0);
         }
         let per_chunk = self.shape(kind)?.per_chunk;
@@ -376,7 +376,7 @@ impl Chunks {
             }
             return Ok(self.table.physical(chunk).unwrap_or(chunk));
         }
-        let seating = &mut self.seated[kind as usize];
+        let seating = &mut self.seated[kind.index()];
         if let Some(&slot) = seating.refs.get(id as usize)
             && slot != UNSEATED
         {
@@ -425,10 +425,10 @@ impl Chunks {
 
     /// The slot ref page `id` is seated on.
     pub fn slot_ref(&self, kind: Kind, id: u32) -> Result<u32> {
-        if (kind == Kind::Window && id == 0) || self.refs {
+        if (matches!(kind, Kind::Window(_)) && id == 0) || self.refs {
             return Ok(id);
         }
-        self.seated[kind as usize]
+        self.seated[kind.index()]
             .refs
             .get(id as usize)
             .copied()
@@ -589,7 +589,7 @@ impl Chunks {
                 },
             ));
         }
-        if let Some(window) = &layout.window {
+        for window in &layout.windows {
             shapes.push(shape(
                 window,
                 SlotKind::List {

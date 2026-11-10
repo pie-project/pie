@@ -18,6 +18,9 @@ pub struct Seated<'a> {
     pub kv_less: bool,
     pub translation: &'a [u32],
     pub window: &'a [u32],
+    /// The lane's slot refs of the window lists past the first, narrowest
+    /// first: a list each, where lanes name slot refs.
+    pub more_windows: &'a [&'a [u32]],
     pub mask: Option<&'a Masking>,
     pub adapter: Option<u32>,
     pub rs: RsVerb,
@@ -47,6 +50,7 @@ impl<'a> Seated<'a> {
             kv_less: false,
             translation: &[],
             window: &[],
+            more_windows: &[],
             mask: None,
             adapter: None,
             rs: RsVerb::Fold,

@@ -355,10 +355,11 @@ pub struct FireBindings {
 
     /// The fire's page tables, one a kv shape.
     pub geometry: Vec<CacheGeometry>,
-    /// The page table the kv rows retained through a window read: the
-    /// window list's, or the kv list's where windowed rows are paged in
-    /// full. The All axis reads the first.
-    pub window_table: u32,
+    /// The page table the kv rows retained through each window read, by
+    /// the window's tokens: its window list's. A window not named here is
+    /// paged in full, in the kv list's (the first, which the All axis
+    /// reads).
+    pub window_tables: Vec<(u32, u32)>,
 
     pub schedules: Vec<Option<ScheduleSeat>>,
     pub plan_values: usize,
@@ -2419,10 +2420,14 @@ impl<'c> Run<'c> {
     /// The page table of the fire's that geometry input `kind` reads: the
     /// All axis's (the first), or a write descriptor's row's list's.
     fn table_of(&self, kind: GeomKind) -> usize {
-        match poem_exec::store::kv::geometry_window(kind) {
-            Some(_) => self.fire.window_table as usize,
-            None => 0,
-        }
+        poem_exec::store::kv::geometry_window(kind)
+            .and_then(|window| {
+                self.fire
+                    .window_tables
+                    .iter()
+                    .find(|(tokens, _)| *tokens == window)
+            })
+            .map_or(0, |(_, table)| *table as usize)
     }
 
     fn geometry(&self, at: usize, table: usize) -> &CacheGeometry {

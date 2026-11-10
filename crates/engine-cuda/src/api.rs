@@ -1389,6 +1389,16 @@ impl Cuda {
                 .find(|(id, _)| *id == shape)
                 .map(|(_, refs)| refs.as_slice())
         }
+        // Each lane's refs of the window lists past the first, a list each.
+        let more_windows: Vec<Vec<&[u32]>> = submission
+            .lanes
+            .iter()
+            .map(|lane| {
+                (1..crate::store::layout::MOST_WINDOWS)
+                    .map_while(|at| table(lane, crate::store::layout::window_id(at)))
+                    .collect()
+            })
+            .collect();
         let seated: Vec<Seated<'_>> = submission
             .lanes
             .iter()
@@ -1415,6 +1425,7 @@ impl Cuda {
                         Some(refs) if by_refs => refs,
                         _ => &lane.kv.window,
                     },
+                    more_windows: if by_refs { &more_windows[at] } else { &[] },
                     mask: lane.mask.as_ref(),
                     adapter: lane_adapters[at].or(lane.adapter),
                     rs: lane.rs.clone(),
