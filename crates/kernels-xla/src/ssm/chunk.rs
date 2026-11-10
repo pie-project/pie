@@ -82,6 +82,7 @@ pub(super) fn gdn_chunks(
     let last_n = f.and(last_n, live_n)?;
     let first_i = f.convert(first_n, Elem::I32);
     let last_i = f.convert(last_n, Elem::I32);
+    let live_i = f.convert(live_n, Elem::I32);
     let slot_n = take(f, lanes.slot, lane_n)?;
     let slot_n = clamp_i(f, slot_n, 0, slots - 1)?;
 
@@ -139,8 +140,8 @@ pub(super) fn gdn_chunks(
     let compiled = kernel(hk, hv, dk, dv, c, nc, rows)?;
     let out = compiled.call_aliased(
         f,
-        &[first_i, last_i, slot_n, q, k, v, gcum, beta, slab],
-        &[(1, 8)],
+        &[first_i, last_i, slot_n, live_i, q, k, v, gcum, beta, slab],
+        &[(1, 9)],
     )?;
     let o = out[0];
 
@@ -210,7 +211,7 @@ fn kernel(
         name: "gdn_chunks".to_string(),
         grid: vec![nc],
         semantics: vec![Sem::Arbitrary],
-        prefetch: vec![vec![nc], vec![nc], vec![nc]],
+        prefetch: vec![vec![nc], vec![nc], vec![nc], vec![nc]],
         ins: vec![
             chunk(vec![hk, sr, dk], vec![hk, c, dk], 1, Elem::F32),
             chunk(vec![hk, sr, dk], vec![hk, c, dk], 1, Elem::F32),
@@ -249,113 +250,120 @@ fn kernel(
         let last = b.load(blk.grid.prefetch[1], &[n])?;
         let last = b.cmpi(ICmp::Ne, last, z)?;
 
-        // A lane's first chunk starts from its slot of the bank.
-        b.when(first, |b| {
-            let src = b.ref_slice(bank_r, &[at, z], &[per, dv])?;
-            b.dma_start(src, sb, sem)?;
-            b.dma_wait(sem, src, sb)?;
-            let s = b.vload_all(sb)?;
-            let s = b.convert_f(s, Elem::F32)?;
-            let s = b.shape_cast(s, &[hv, dk, dv])?;
-            b.vstore_all(s, st)
-        })?;
+        // The chunks past the fire's own (the grid holds the most a fire of
+        // its rows and lanes can take) are skipped.
+        let live = b.load(blk.grid.prefetch[3], &[n])?;
+        let live = b.cmpi(ICmp::Ne, live, z)?;
+        b.when(live, |b| {
+            // A lane's first chunk starts from its slot of the bank.
+            b.when(first, |b| {
+                let src = b.ref_slice(bank_r, &[at, z], &[per, dv])?;
+                b.dma_start(src, sb, sem)?;
+                b.dma_wait(sem, src, sb)?;
+                let s = b.vload_all(sb)?;
+                let s = b.convert_f(s, Elem::F32)?;
+                let s = b.shape_cast(s, &[hv, dk, dv])?;
+                b.vstore_all(s, st)
+            })?;
 
-        let s0 = b.vload_all(st)?;
-        let q = b.vload_all(q_r)?;
-        let k = b.vload_all(k_r)?;
-        let v = b.vload_all(v_r)?;
-        // The chunk's decay sums and `β`, a row per token and a lane per
-        // head, turned to a row per head: as a lane-wide column per token
-        // (`[H, C, 1]` stretched) and as the row itself.
-        let gt = b.vload_all(g_r)?;
-        let gt = b.transpose(gt)?;
-        let grow = b.shape_cast(gt, &[hv, 1, c])?;
-        let gcol = b.shape_cast(gt, &[hv, c, 1])?;
-        let gb = b.broadcast(gcol, &[hv, c, 128])?;
-        let bt = b.vload_all(b_r)?;
-        let bt = b.transpose(bt)?;
-        let bcol = b.shape_cast(bt, &[hv, c, 1])?;
-        let bb = b.broadcast(bcol, &[hv, c, 128])?;
-        // Key heads spread over their value heads.
-        let spread =
-            |b: &mut crate::mosaic::Body, x: crate::mosaic::V| -> Built<crate::mosaic::V> {
-                if rep == 1 {
-                    return Ok(x);
-                }
-                let x = b.shape_cast(x, &[hk, 1, c, dk])?;
-                let x = b.broadcast(x, &[hk, rep, c, dk])?;
-                b.shape_cast(x, &[hv, c, dk])
-            };
-        let q = spread(b, q)?;
-        let k = spread(b, k)?;
+            let s0 = b.vload_all(st)?;
+            let q = b.vload_all(q_r)?;
+            let k = b.vload_all(k_r)?;
+            let v = b.vload_all(v_r)?;
+            // The chunk's decay sums and `β`, a row per token and a lane per
+            // head, turned to a row per head: as a lane-wide column per token
+            // (`[H, C, 1]` stretched) and as the row itself.
+            let gt = b.vload_all(g_r)?;
+            let gt = b.transpose(gt)?;
+            let grow = b.shape_cast(gt, &[hv, 1, c])?;
+            let gcol = b.shape_cast(gt, &[hv, c, 1])?;
+            let gb = b.broadcast(gcol, &[hv, c, 128])?;
+            let bt = b.vload_all(b_r)?;
+            let bt = b.transpose(bt)?;
+            let bcol = b.shape_cast(bt, &[hv, c, 1])?;
+            let bb = b.broadcast(bcol, &[hv, c, 128])?;
+            // Key heads spread over their value heads.
+            let spread =
+                |b: &mut crate::mosaic::Body, x: crate::mosaic::V| -> Built<crate::mosaic::V> {
+                    if rep == 1 {
+                        return Ok(x);
+                    }
+                    let x = b.shape_cast(x, &[hk, 1, c, dk])?;
+                    let x = b.broadcast(x, &[hk, rep, c, dk])?;
+                    b.shape_cast(x, &[hv, c, dk])
+                };
+            let q = spread(b, q)?;
+            let k = spread(b, k)?;
 
-        let sq = [hv, c, c];
-        let ri = b.iota(&sq, 1);
-        let cj = b.iota(&sq, 2);
-        let lower = b.cmpi(ICmp::Sge, ri, cj)?;
-        let strict = b.cmpi(ICmp::Sgt, ri, cj)?;
-        let diag = b.cmpi(ICmp::Eq, ri, cj)?;
-        let zero_sq = b.splat_f(&sq, Elem::F32, 0.0)?;
-        let one_sq = b.splat_f(&sq, Elem::F32, 1.0)?;
-        let eye = b.select(diag, one_sq, zero_sq)?;
+            let sq = [hv, c, c];
+            let ri = b.iota(&sq, 1);
+            let cj = b.iota(&sq, 2);
+            let lower = b.cmpi(ICmp::Sge, ri, cj)?;
+            let strict = b.cmpi(ICmp::Sgt, ri, cj)?;
+            let diag = b.cmpi(ICmp::Eq, ri, cj)?;
+            let zero_sq = b.splat_f(&sq, Elem::F32, 0.0)?;
+            let one_sq = b.splat_f(&sq, Elem::F32, 1.0)?;
+            let eye = b.select(diag, one_sq, zero_sq)?;
 
-        // Decay from row `j` to row `i` of the chunk, `exp(g_i − g_j)`.
-        let gc = b.broadcast(gcol, &sq)?;
-        let gr = b.broadcast(grow, &sq)?;
-        let dlt = b.subf(gc, gr)?;
-        let dlt = b.select(lower, dlt, zero_sq)?;
-        let dm = b.exp(dlt)?;
-        let e = b.exp(gb)?;
-        let beta = bb;
+            // Decay from row `j` to row `i` of the chunk, `exp(g_i − g_j)`.
+            let gc = b.broadcast(gcol, &sq)?;
+            let gr = b.broadcast(grow, &sq)?;
+            let dlt = b.subf(gc, gr)?;
+            let dlt = b.select(lower, dlt, zero_sq)?;
+            let dm = b.exp(dlt)?;
+            let e = b.exp(gb)?;
+            let beta = bb;
 
-        // `T = I + β · dm ∘ k kᵀ`, unit lower-triangular, and `T⁻¹ [β v | β e k]`
-        // by block forward substitution, as the XLA form solves it.
-        let kb = b.mulf(k, beta)?;
-        let kk = b.matmul_g(kb, k, zero_sq, 2, 2, false)?;
-        let a = b.mulf(dm, kk)?;
-        let a = b.select(strict, a, zero_sq)?;
-        let tm = b.addf(a, eye)?;
-        let vb = b.mulf(v, beta)?;
-        let kbe = b.mulf(kb, e)?;
-        let rhs = b.concat(&[vb, kbe], 2)?;
-        let uw = solve_unit_lower(b, tm, rhs, hv, c)?;
-        let u = b.slice(uw, &[0, 0, 0], &[hv, c, dv])?;
-        let w = b.slice(uw, &[0, 0, dv], &[hv, c, dk])?;
-        let zero_cv = b.splat_f(&[hv, c, dv], Elem::F32, 0.0)?;
-        let ws = b.matmul_g(w, s0, zero_cv, 2, 1, false)?;
-        let u = b.subf(u, ws)?;
-        let qe = b.mulf(q, e)?;
-        let oq = b.matmul_g(qe, s0, zero_cv, 2, 1, false)?;
-        let qk = b.matmul_g(q, k, zero_sq, 2, 2, false)?;
-        let p = b.mulf(qk, dm)?;
-        let p = b.select(lower, p, zero_sq)?;
-        let o2 = b.matmul_g(p, u, zero_cv, 2, 1, false)?;
-        let o = b.addf(oq, o2)?;
-        b.vstore_all(o, o_r)?;
+            // `T = I + β · dm ∘ k kᵀ`, unit lower-triangular, and `T⁻¹ [β v | β e k]`
+            // by block forward substitution, as the XLA form solves it.
+            let kb = b.mulf(k, beta)?;
+            let kk = b.matmul_g(kb, k, zero_sq, 2, 2, false)?;
+            let a = b.mulf(dm, kk)?;
+            let a = b.select(strict, a, zero_sq)?;
+            let tm = b.addf(a, eye)?;
+            let vb = b.mulf(v, beta)?;
+            let kbe = b.mulf(kb, e)?;
+            let rhs = b.concat(&[vb, kbe], 2)?;
+            let uw = solve_unit_lower(b, tm, rhs, hv, c)?;
+            let u = b.slice(uw, &[0, 0, 0], &[hv, c, dv])?;
+            let w = b.slice(uw, &[0, 0, dv], &[hv, c, dk])?;
+            let zero_cv = b.splat_f(&[hv, c, dv], Elem::F32, 0.0)?;
+            let ws = b.matmul_g(w, s0, zero_cv, 2, 1, false)?;
+            let u = b.subf(u, ws)?;
+            let qe = b.mulf(q, e)?;
+            let oq = b.matmul_g(qe, s0, zero_cv, 2, 1, false)?;
+            let qk = b.matmul_g(q, k, zero_sq, 2, 2, false)?;
+            let p = b.mulf(qk, dm)?;
+            let p = b.select(lower, p, zero_sq)?;
+            let o2 = b.matmul_g(p, u, zero_cv, 2, 1, false)?;
+            let o = b.addf(oq, o2)?;
+            b.vstore_all(o, o_r)?;
 
-        // The state after the chunk: decayed to its end, plus `kᵀ u` with
-        // each row's decay to the end.
-        let glast = b.slice(gb, &[0, c - 1, 0], &[hv, 1, 128])?;
-        let glast_c = b.broadcast(glast, &[hv, c, 128])?;
-        let tail = b.subf(glast_c, gb)?;
-        let tail = b.exp(tail)?;
-        let kt = b.mulf(k, tail)?;
-        let zero_s = b.splat_f(&[hv, dk, dv], Elem::F32, 0.0)?;
-        let upd = b.matmul_g(kt, u, zero_s, 1, 1, false)?;
-        let gl = b.exp(glast)?;
-        let gl = b.broadcast(gl, &[hv, dk, dv])?;
-        let decayed = b.mulf(s0, gl)?;
-        let s1 = b.addf(decayed, upd)?;
-        b.vstore_all(s1, st)?;
+            // The state after the chunk: decayed to its end, plus `kᵀ u` with
+            // each row's decay to the end.
+            let glast = b.slice(gb, &[0, c - 1, 0], &[hv, 1, 128])?;
+            let glast_c = b.broadcast(glast, &[hv, c, 128])?;
+            let tail = b.subf(glast_c, gb)?;
+            let tail = b.exp(tail)?;
+            let kt = b.mulf(k, tail)?;
+            let zero_s = b.splat_f(&[hv, dk, dv], Elem::F32, 0.0)?;
+            let upd = b.matmul_g(kt, u, zero_s, 1, 1, false)?;
+            let gl = b.exp(glast)?;
+            let gl = b.broadcast(gl, &[hv, dk, dv])?;
+            let decayed = b.mulf(s0, gl)?;
+            let s1 = b.addf(decayed, upd)?;
+            b.vstore_all(s1, st)?;
 
-        // A lane's last chunk lands its state in the bank.
-        b.when(last, |b| {
-            let s = b.shape_cast(s1, &[per, dv])?;
-            let s = b.convert_f(s, Elem::Bf16)?;
-            b.vstore_all(s, sb)?;
-            let dst = b.ref_slice(bank_o, &[at, z], &[per, dv])?;
-            b.dma_start(sb, dst, sem)?;
-            b.dma_wait(sem, sb, dst)
+            // A lane's last chunk lands its state in the bank.
+            b.when(last, |b| {
+                let s = b.shape_cast(s1, &[per, dv])?;
+                let s = b.convert_f(s, Elem::Bf16)?;
+                b.vstore_all(s, sb)?;
+                let dst = b.ref_slice(bank_o, &[at, z], &[per, dv])?;
+                b.dma_start(sb, dst, sem)?;
+                b.dma_wait(sem, sb, dst)
+            })?;
+            Ok(())
         })?;
         Ok(())
     })

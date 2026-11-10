@@ -799,6 +799,101 @@ struct Segs {
     capture: Val,
 }
 
+/// From this many lanes a ragged GDN fire's decodes step apart (see
+/// [`apart_decodes`]).
+const APART_LANES: i64 = 32;
+
+/// A ragged fire's decodes stepped apart from its prompts' chunks: `segs`
+/// the fire's segments with theirs emptied, `slab` the bank with their
+/// states stepped, `y` their values (`[lanes, H, dv]`) for the fire's rows
+/// `rows` (unused slots past the fire's rows, each its own).
+struct Apart {
+    segs: Segs,
+    slab: Val,
+    y: Val,
+    rows: Val,
+}
+
+impl Apart {
+    /// `y` (`[t, H, dv]`) with the decodes' rows put in.
+    fn put(&self, f: &mut Func, y: Val) -> Built<Val> {
+        let d = f.dims(y).to_vec();
+        let w = d[1] * d[2];
+        let n = f.dims(self.rows)[0];
+        let flat = f.reshape(y, &[d[0], w])?;
+        let part = f.reshape(self.y, &[n, w])?;
+        let part = f.convert(part, f.elem(flat));
+        let out = f.put_rows_hinted(flat, self.rows, part, crate::hlo::Combine::Set, true)?;
+        f.reshape(out, &d)
+    }
+}
+
+/// The decodes of a ragged fire (its lanes of one row), stepped through the
+/// decode kernel; `None` where the kernel does not take them.
+#[allow(clippy::too_many_arguments)]
+fn apart_decodes(
+    f: &mut Func,
+    input: &DeltaIn,
+    raw: &Raw,
+    lanes: &Lanes,
+    segs: &Segs,
+    slab: Val,
+    per: i64,
+    mxu: i64,
+) -> Built<Option<Apart>> {
+    let l = lanes.count(f);
+    let t = f.dims(raw.rows[0])[0];
+    let one = cmp_i(f, Cmp::Eq, lanes.span, 1)?;
+    let one = f.and(one, lanes.write)?;
+    let n = f.convert(one, Elem::I32);
+    let at = f.scan_steps(n, 0, Fold::Sum)?;
+    let ones = full_i(f, 1, l);
+    let at = f.sub(at, ones)?;
+    let io = iota(f, l);
+    let past = full_i(f, l, l);
+    let off = f.add(io, past)?;
+    let at = f.select(one, at, off)?;
+    // each slot the lane of a decode, the unused ones past the lanes
+    let idx = f.reshape(off, &[l, 1])?;
+    let lane_of = f.reshape(io, &[l, 1])?;
+    let idx = f.put_rows_hinted(idx, at, lane_of, crate::hlo::Combine::Set, true)?;
+    let idx = f.reshape(idx, &[l])?;
+    let used = cmp_i(f, Cmp::Lt, idx, l)?;
+    let lane = clamp_i(f, idx, 0, l - 1)?;
+    let row = take(f, lanes.begin, lane)?;
+    let row = clamp_i(f, row, 0, t - 1)?;
+    let slot = take(f, lanes.slot, lane)?;
+    let out = full_i(f, -1, l);
+    let slot = f.select(used, slot, out)?;
+    let mut rows = Vec::with_capacity(raw.rows.len());
+    for &r in &raw.rows {
+        rows.push(f.take_rows(r, row)?);
+    }
+    let heads = input.heads_from(f, &rows, &raw.fixed)?;
+    let Some((y, slab)) = step::gdn_step(f, &heads, slot, slab, per, mxu)? else {
+        return Ok(None);
+    };
+    let tt = full_i(f, t, l);
+    let beyond = f.add(io, tt)?;
+    let rows = f.select(used, row, beyond)?;
+    let zero = full_i(f, 0, l);
+    let len = f.select(one, zero, segs.len)?;
+    let kept = f.not(one);
+    let capture = f.and(segs.capture, kept)?;
+    Ok(Some(Apart {
+        segs: Segs {
+            begin: segs.begin,
+            len,
+            lane: segs.lane,
+            reset: segs.reset,
+            capture,
+        },
+        slab,
+        y,
+        rows,
+    }))
+}
+
 /// One segment per lane, the lane's whole span.
 fn whole_segs(f: &mut Func, lanes: &Lanes) -> Segs {
     let l = lanes.count(f);
@@ -1605,10 +1700,40 @@ fn delta(
             let fq = &mut *f;
             let l = lanes.count(fq);
             let kernel = ragged && t > chunk && fused_chunks_on();
-            let fused = if kernel {
-                chunk::gdn_chunks(fq, &input, &raw, &segs, &lanes, slab, per, chunk)?
+            // A fire's decodes (lanes of one row) beside its prompts step
+            // through the decode kernel: in the chunk kernel each is a chunk
+            // of its own, as costly as a prompt's.
+            let apart = if kernel
+                && l >= APART_LANES
+                && input.rule()
+                && matches!(input, DeltaIn::Gdn { .. })
+                && step_kernel_on()
+            {
+                apart_decodes(
+                    fq,
+                    &input,
+                    &raw,
+                    &lanes,
+                    &segs,
+                    slab,
+                    per,
+                    tuning.ssm.step_mxu,
+                )?
             } else {
                 None
+            };
+            let fused = match (kernel, apart) {
+                (false, _) => None,
+                (true, Some(a)) => {
+                    match chunk::gdn_chunks(fq, &input, &raw, &a.segs, &lanes, a.slab, per, chunk)?
+                    {
+                        Some((y, slab)) => Some((a.put(fq, y)?, slab)),
+                        None => None,
+                    }
+                }
+                (true, None) => {
+                    chunk::gdn_chunks(fq, &input, &raw, &segs, &lanes, slab, per, chunk)?
+                }
             };
             // every lane fits one chunk only when the whole fire does: an average under `chunk` lets a
             // prompt beside decodes (or a padding lane) lose its rows past the first chunk
