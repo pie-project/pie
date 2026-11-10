@@ -15,6 +15,7 @@ mod pq;
 pub mod prefetch;
 mod region;
 pub mod shard;
+pub mod spatial;
 pub mod stream;
 pub mod temporal;
 pub mod tile;
