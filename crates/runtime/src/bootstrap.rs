@@ -807,6 +807,7 @@ fn shared_steered_pool(
         let first = shared.weights_first();
         boot_cache(engine, mode, &facts.weights, first, shared.pool_mut())?
     };
+    grow.hold_mapped();
     let quiet = cache.shapes() == 0;
     let pool = crate::governor::steered::EnginePool::shared(model, engine, grow);
     Ok(crate::governor::steered::Shared::new(WeightFirst::new(
