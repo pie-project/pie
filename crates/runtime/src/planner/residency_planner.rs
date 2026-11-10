@@ -327,6 +327,41 @@ impl ResidencyPlanner {
         true
     }
 
+    /// Idle cache the device is short of room for moves down a tier, host
+    /// first then disk, rather than being dropped: whether a move is on its
+    /// way (its landing frees the pages and pokes the planner). Only under
+    /// a waiter's want, never while pages stand free; what keeps back a
+    /// share of the host for suspends ([`HOST_RESERVE_DIVISOR`]) is not
+    /// spent on cache.
+    pub(super) fn demote_idle(self: &Arc<Self>) -> bool {
+        if !self.port.suspend_capable() {
+            return false;
+        }
+        if self.demoting.swap(true, Ordering::AcqRel) {
+            return true;
+        }
+        let (host_free, host_total) = self.port.host_stats();
+        let (disk_free, _) = self.port.disk_stats();
+        let room = host_free.saturating_sub(host_total / HOST_RESERVE_DIVISOR) + disk_free;
+        let txn = (room > 0)
+            .then(|| self.port.prepare_demote(room as usize))
+            .flatten();
+        let Some(txn) = txn else {
+            self.demoting.store(false, Ordering::Release);
+            return false;
+        };
+        exec::spawn_move_out(self.clone(), txn, "demote", Self::demote_done);
+        true
+    }
+
+    fn demote_done(self: &Arc<Self>, moved: bool) {
+        self.demoting.store(false, Ordering::Release);
+        if moved {
+            self.re_arm_idle_reclaim();
+        }
+        self.poke();
+    }
+
     pub(super) fn re_arm_idle_reclaim(&self) {
         self.idle_reclaim_exhausted.store(false, Ordering::Release);
         self.sweep_exhausted.store(false, Ordering::Release);

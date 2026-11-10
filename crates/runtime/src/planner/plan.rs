@@ -120,6 +120,10 @@ impl ResidencyPlanner {
                     if self.port.grow_pages(count) {
                         return;
                     }
+                    // Idle cache moves down a tier before any is dropped.
+                    if self.demote_idle() {
+                        return;
+                    }
                     if self.reclaim_idle_once() {
                         continue;
                     }
@@ -133,6 +137,11 @@ impl ResidencyPlanner {
                     fund_by_eviction,
                 } => {
                     if self.port.grow_rs(need) {
+                        return;
+                    }
+                    // On a shared pool the chunks idle cache holds open for
+                    // state too: it moves down a tier before any is dropped.
+                    if self.port.rs_as_pages(need) > 0 && self.demote_idle() {
                         return;
                     }
                     if self.reclaim_idle_once() || self.reclaim_head_sharing() {

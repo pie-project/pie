@@ -76,6 +76,10 @@ pub struct KvResidencyTxn {
     /// The list shape the pages are slots of, where they are a shared
     /// pool's (CONTRACT-BC 22): the copy is the engine's `copy_slots`.
     shape: Option<::engine::chunk::ShapeId>,
+    /// A demote's sealed pages, by place, that a persistent disk tier keeps
+    /// as copies once they land on disk: the journal names them, so the next
+    /// run takes them back.
+    records: HashMap<TriePageLocation, journal::PageRecord>,
 }
 
 impl KvResidencyTxn {
@@ -776,6 +780,9 @@ impl KvStore {
         let freed = moves.len();
         self.pool
             .recycle_after_epoch(moves.into_iter().map(|(_, gpu, _)| gpu).collect(), epoch);
+        // With no fire in flight the epoch has retired already: the pages
+        // are free now, not at a next fire that may wait on them.
+        self.retire_idle();
         tracing::debug!(target: "pie::kv", pages = freed, "settled on disk");
         freed
     }
@@ -894,12 +901,17 @@ impl KvStore {
             .collect()
     }
 
+    /// Moves idle cache off the device, host first and what the host
+    /// cannot take to disk (as a suspend's pages go), lowest retention key
+    /// first: one group, up to `room` pages. A persistent disk tier keeps
+    /// what lands on disk as its copies, journaled.
     pub fn prepare_demote(
         &mut self,
         room: usize,
         keys: impl Keys,
     ) -> Result<Option<KvResidencyTxn>, KvStoreError> {
-        let room = room.min(self.host_pool.available());
+        // Free slots only: a demote gives up no copy for idle cache.
+        let room = room.min(self.host_pool.available() + self.disk_pool.available());
         if room == 0 {
             return Ok(None);
         }
@@ -924,11 +936,108 @@ impl KvStore {
                 }
                 pages.truncate(room);
                 tracing::debug!(target: "pie::kv", pages = pages.len(), "demote");
-                return Ok(Some(self.prepare_move_out(&HashSet::new(), pages)?));
+                let records = self.demote_records(&ids, &pages, key);
+                // A run split over the tiers would leave its disk tail
+                // following on from pages a restart loses: a persistent
+                // tier takes a group the host cannot hold whole.
+                let host = self.host_pool.available();
+                let on_host = if pages.len() <= host
+                    || records.is_empty()
+                    || self.disk_pool.available() < pages.len()
+                {
+                    host.min(pages.len())
+                } else {
+                    0
+                };
+                let mut txn = self.prepare_move_out_split(&HashSet::new(), pages, on_host)?;
+                txn.records = records;
+                return Ok(Some(txn));
             }
             groups = later;
         }
         Ok(None)
+    }
+
+    /// The journal records of the sealed whole pages of `pages`, read off
+    /// the paths of entries `ids`, kept under `retention`; none where the
+    /// disk tier is not kept.
+    fn demote_records(
+        &self,
+        ids: &[u64],
+        pages: &[(TriePageLocation, PhysicalKvPageId)],
+        retention: i64,
+    ) -> HashMap<TriePageLocation, journal::PageRecord> {
+        if self.persisted.is_none() || !self.keeps {
+            return HashMap::new();
+        }
+        let wanted: HashSet<TriePageLocation> = pages.iter().map(|&(at, _)| at).collect();
+        let mut records = HashMap::new();
+        for terminal in self.roots(ids) {
+            let mut parent = None;
+            for (at, key) in self.table.path_pages(terminal) {
+                let Some(key) = key else {
+                    break;
+                };
+                if wanted.contains(&at) && !records.contains_key(&at) {
+                    let tokens = self.table.token_hashes_at(&at).unwrap_or_default();
+                    if tokens.len() == self.page_size as usize {
+                        records.insert(
+                            at,
+                            journal::PageRecord {
+                                page: key,
+                                parent,
+                                tokens: tokens.to_vec(),
+                                retention,
+                            },
+                        );
+                    }
+                }
+                parent = Some(key);
+            }
+        }
+        records
+    }
+
+    /// The demoted pages that landed on disk become the persistent tier's
+    /// copies, each backing its page: journaled, durably.
+    fn keep_demoted(
+        &mut self,
+        pages: &[SwapPage],
+        mut records: HashMap<TriePageLocation, journal::PageRecord>,
+    ) {
+        let Some(persisted) = &mut self.persisted else {
+            return;
+        };
+        let mut kept = 0;
+        let mut written = Ok(());
+        for page in pages {
+            let KvPageBacking::OnDisk(slot) = page.swapped else {
+                continue;
+            };
+            let Some(record) = records.remove(&page.location) else {
+                continue;
+            };
+            if persisted.by_key.contains_key(&record.page) || persisted.slots.contains_key(&slot) {
+                continue;
+            }
+            written = persisted.journal.put(slot.0, &record);
+            if written.is_err() {
+                break;
+            }
+            persisted.slots.insert(slot, record.page);
+            persisted.by_key.insert(record.page, slot);
+            persisted.retention.insert(slot, record.retention);
+            persisted.back(slot);
+            kept += 1;
+        }
+        if let Err(error) = written.and_then(|()| persisted.journal.sync()) {
+            tracing::error!(target: "pie::kv", %error, "disk kv journal not written; the tier is kept no longer");
+            self.abandon_persisted();
+            return;
+        }
+        if kept > 0 {
+            tracing::debug!(target: "pie::kv", pages = kept, "demoted to disk, journaled");
+        }
     }
 
     pub fn below_device(&self, run: &[TriePageLocation]) -> usize {
@@ -989,6 +1098,7 @@ impl KvStore {
             pages,
             pinned: vec![last.node],
             shape: self.shape,
+            records: HashMap::new(),
         }))
     }
 
@@ -2337,6 +2447,17 @@ impl KvStore {
     ) -> Result<KvResidencyTxn, KvStoreError> {
         // Host first; what host cannot take goes to disk.
         let on_host = self.host_pool.available().min(pages.len());
+        self.prepare_move_out_split(working_sets, pages, on_host)
+    }
+
+    /// [`Self::prepare_move_out`] with the first `on_host` pages to the host
+    /// and the rest to disk; both counted free by the caller.
+    fn prepare_move_out_split(
+        &mut self,
+        working_sets: &HashSet<WorkingSetId>,
+        pages: Vec<(TriePageLocation, PhysicalKvPageId)>,
+        on_host: usize,
+    ) -> Result<KvResidencyTxn, KvStoreError> {
         let host = self.host_pool.try_alloc_n(on_host).expect("counted above");
         let disk = self
             .disk_pool
@@ -2370,6 +2491,7 @@ impl KvStore {
             pages,
             pinned,
             shape: self.shape,
+            records: HashMap::new(),
         })
     }
 
@@ -2388,7 +2510,7 @@ impl KvStore {
         self.moved.notify_waiters();
     }
 
-    pub fn commit_suspend(&mut self, txn: KvResidencyTxn) -> Result<usize, KvStoreError> {
+    pub fn commit_suspend(&mut self, mut txn: KvResidencyTxn) -> Result<usize, KvStoreError> {
         let replacements: Vec<_> = txn
             .pages
             .iter()
@@ -2408,6 +2530,10 @@ impl KvStore {
         let freed = self.unpin_move(&txn);
         for &ws in &txn.working_sets {
             self.refresh_flat(ws);
+        }
+        let records = std::mem::take(&mut txn.records);
+        if !records.is_empty() {
+            self.keep_demoted(&txn.pages, records);
         }
         let count = txn.pages.len();
         self.pool.recycle_after_epoch(
@@ -2471,6 +2597,7 @@ impl KvStore {
             pages,
             pinned,
             shape: self.shape,
+            records: HashMap::new(),
         })
     }
 

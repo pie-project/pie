@@ -1450,6 +1450,106 @@ fn a_persisted_run_settles_on_disk_and_outlives_hits_and_restarts() {
 }
 
 #[test]
+/// Idle cache the device wants room from moves down a tier rather than going:
+/// the host first, what the host cannot take to disk, and on a persistent
+/// tier what lands on disk is journaled, so the next run takes it back and
+/// a hit there serves it. Settled on disk later, its device pages are free
+/// at once with no fire in flight.
+fn demoted_cache_past_the_host_lands_on_disk_journaled_and_outlives_a_restart() {
+    use super::hash::{chain_slots, page_hash};
+    use ::engine::transfer::MemoryDomain::{HostPinned, LocalDisk};
+    let seed = h(53);
+    let tokens: Vec<Vec<Option<Hash256>>> =
+        chain_slots(&seed, None, 0, &(400..412).collect::<Vec<_>>())
+            .chunks(4)
+            .map(|page| page.iter().map(|h| Some(*h)).collect())
+            .collect();
+    let keys: Vec<Hash256> = tokens.iter().map(|page| page_hash(page)).collect();
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("g0.journal");
+    // One host slot, eight on disk.
+    let store_for = || {
+        let mut store = KvStore::new_with_swap(8, 1, 8, seed);
+        store.set_page_size(4);
+        store.set_keeps(true);
+        store
+    };
+
+    let mut store = store_for();
+    assert_eq!(store.keep_disk(&path, true).unwrap(), 0);
+    let gpu = store.pool.try_alloc_n(3).unwrap();
+    assert!(store.import_cached_at(
+        &[],
+        tokens.clone(),
+        keys.clone(),
+        gpu.into_iter().map(KvPageBacking::Resident).collect(),
+    ));
+    let txn = store
+        .prepare_demote(8, |_| 0)
+        .unwrap()
+        .expect("three idle pages to move");
+    let tiers: Vec<_> = txn
+        .copy_plans()
+        .iter()
+        .map(|(tier, gpu, _)| (*tier, gpu.len()))
+        .collect();
+    assert_eq!(
+        tiers,
+        [(LocalDisk, 3)],
+        "a run the host cannot hold whole goes to disk whole"
+    );
+    assert_eq!(store.commit_suspend(txn).unwrap(), 3);
+    store.retire_idle();
+    assert_eq!(store.available_pages(), 8, "the device is free of it");
+    assert_eq!(store.persisted_pages(), 3, "what landed on disk is kept");
+    let run = store.cached_run_any_tier(&keys);
+    assert_eq!((run.len(), store.below_device(&run)), (3, 3));
+
+    // A hit brings it up; its copies stay, so the next want of room
+    // settles it on them with nothing copied, the pages free at once.
+    let mut granted = store.pool.try_alloc_n(3).unwrap();
+    let txn = store
+        .prepare_promote(&run, &mut granted)
+        .unwrap()
+        .expect("a promotion");
+    let pin = store.commit_promote(txn).unwrap();
+    store.release_reader(pin);
+    assert_eq!(store.persisted_pages(), 3);
+    let epoch = store.current_epoch();
+    assert_eq!(
+        store.reclaim_droppable(epoch, |_| 1),
+        3,
+        "it settles on its copies"
+    );
+    assert_eq!(store.available_pages(), 8, "freed now, not at a next fire");
+    drop(store);
+
+    // A restart takes it back from the journal, on disk.
+    let mut store = store_for();
+    assert_eq!(store.keep_disk(&path, true).unwrap(), 3);
+    let run = store.cached_run_any_tier(&keys);
+    assert_eq!((run.len(), store.below_device(&run)), (3, 3));
+
+    // Without a persistent tier the host takes what it can, as a suspend.
+    let mut store = store_for();
+    let gpu = store.pool.try_alloc_n(3).unwrap();
+    assert!(store.import_cached_at(
+        &[],
+        tokens.clone(),
+        keys.clone(),
+        gpu.into_iter().map(KvPageBacking::Resident).collect(),
+    ));
+    let txn = store.prepare_demote(8, |_| 0).unwrap().unwrap();
+    let tiers: Vec<_> = txn
+        .copy_plans()
+        .iter()
+        .map(|(tier, gpu, _)| (*tier, gpu.len()))
+        .collect();
+    assert_eq!(tiers, [(HostPinned, 1), (LocalDisk, 2)], "host first");
+    store.abort_suspend(txn);
+}
+
+#[test]
 /// An owner's ask to keep a prefix on disk goes out with the runs it left,
 /// a prefix persisted is a run of its own, and the ask goes with the last
 /// of its owner's entries.
