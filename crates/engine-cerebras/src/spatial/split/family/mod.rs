@@ -19,7 +19,10 @@ type R<T> = Result<T, String>;
 /// A program family. Every method is pure: same inputs, same outputs (the parity tests and the
 /// `split-geo` tool rely on it).
 pub trait Family: Send + Sync {
-    fn id(&self) -> FamilyId;
+    /// A named geometry as JSON: the partition choices a prep tiles the checkpoint for, before
+    /// any meta exists (`split-geo --geometry <family>:<name>`). The meta the prep writes records
+    /// them, and [`Family::plan`] reads them back with the model's dims.
+    fn geometry(&self, name: &str) -> R<serde_json::Value>;
 
     /// The logical plan from the prep's meta (and its overrides). Later the spatial compiler
     /// hands the plan in directly; nothing physical may be read here.
@@ -37,7 +40,7 @@ pub trait Family: Send + Sync {
     fn symbols(&self) -> &'static [(&'static str, &'static str)];
 }
 
-/// The family a meta was prepped for.
+/// A family by its id.
 pub fn of(id: FamilyId) -> Box<dyn Family> {
     match id {
         FamilyId::Qwen => Box::new(qwen::Qwen),

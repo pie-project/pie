@@ -16,9 +16,9 @@ use super::role::PeRole;
 use super::wiring::{Class, NoteKey, Slot};
 
 pub mod common;
-pub mod gptoss;
 pub mod gemma;
 pub mod gemma12;
+pub mod gptoss;
 pub mod head;
 pub mod q35;
 

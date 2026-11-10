@@ -25,12 +25,6 @@ pub const COLOURS: u8 = 21;
 pub struct RouteWord(pub u32);
 
 impl RouteWord {
-    pub fn rx_ramp() -> u32 {
-        0x80
-    }
-    pub fn tx_ramp() -> u32 {
-        0x10
-    }
     pub fn rx(d: Dir) -> u32 {
         match d {
             Dir::W => 0x00,
@@ -78,56 +72,6 @@ impl Palette {
             .get(&c)
             .copied()
             .ok_or_else(|| format!("palette: no colour for {c:?}"))
-    }
-
-    /// Assigns colours to every class `w` uses so no PE sees two classes on one colour, by
-    /// graph colouring over the classes that meet at a PE. Not used by the shipping families
-    /// (their palettes are fixed); the seam for the spatial compiler.
-    ///
-    /// Greedy over the classes in their order: each takes the lowest colour no class it meets
-    /// has taken. Every class of a link counts as meeting at every PE of that link (a chain's
-    /// level-1, level-2 and cast classes all), which over-approximates and so never clashes.
-    pub fn allocate(floor: &Floor, w: &Wiring) -> Result<Palette, String> {
-        let mut at: BTreeMap<Coord, BTreeSet<Class>> = BTreeMap::new();
-        for link in &w.links {
-            let (pts, classes): (Vec<Coord>, Vec<Class>) = match link {
-                Link::Chain(c) => {
-                    let mut cl = vec![c.l1[0], c.l1[1], c.cast];
-                    if let Some(l2) = c.l2 {
-                        cl.extend(l2.colours);
-                    }
-                    (c.pts.clone(), cl)
-                }
-                Link::Multicast(m) => (m.pts.clone(), vec![m.class]),
-                Link::Path(p) => (p.pts.clone(), vec![p.class]),
-                Link::Turn(t) => (vec![t.at], vec![t.class]),
-            };
-            for p in pts {
-                if p.x >= floor.w || p.y >= floor.h {
-                    return Err(format!("palette: ({}, {}) off the floor", p.x, p.y));
-                }
-                at.entry(p).or_default().extend(classes.iter().copied());
-            }
-        }
-        let mut meets: BTreeMap<Class, BTreeSet<Class>> = BTreeMap::new();
-        for set in at.values() {
-            for &a in set {
-                let e = meets.entry(a).or_default();
-                e.extend(set.iter().copied().filter(|&b| b != a));
-            }
-        }
-        let mut map: BTreeMap<Class, Colour> = BTreeMap::new();
-        for (&class, others) in &meets {
-            let taken: BTreeSet<u8> = others
-                .iter()
-                .filter_map(|o| map.get(o).map(|c| c.0))
-                .collect();
-            let c = (0..COLOURS)
-                .find(|c| !taken.contains(c))
-                .ok_or_else(|| format!("palette: no colour left for {class:?}"))?;
-            map.insert(class, Colour(c));
-        }
-        Ok(Palette { map })
     }
 }
 
@@ -603,12 +547,7 @@ impl Fabric {
 
     /// `n` colours to park unused input queues on: first colours with no route at `at`, then
     /// colours whose route neither delivers to nor takes from the ramp — never the PE's own send
-    /// colour.
-    pub fn parks(&self, at: Coord, n: usize) -> Result<Vec<Colour>, String> {
-        self.parks_avoiding(at, n, &[])
-    }
-
-    /// [`Fabric::parks`], never on `avoid` (a colour the kernel sends on at run time).
+    /// colour, nor one of `avoid` (a colour the kernel sends on at run time).
     pub fn parks_avoiding(
         &self,
         at: Coord,
@@ -664,7 +603,7 @@ impl Fabric {
     ///   needs the family's ABI);
     /// - every bound input queue's colour delivers to the PE's ramp, and every bound send
     ///   colour takes from it: no queue waits on a colour the PE only sends on (the 0704 hang;
-    ///   [`Fabric::parks`] keeps unbound queues off those too);
+    ///   [`Fabric::parks_avoiding`] keeps unbound queues off those too);
     /// - a segment's queues are its own (no colour shared with a reduction's queues on the same
     ///   PE: 0733);
     /// - every root of a looping reduction ([`SlotKind::Reduce`] `loopback`) loops back to its

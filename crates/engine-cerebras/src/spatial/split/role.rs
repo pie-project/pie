@@ -105,14 +105,4 @@ impl PeRole {
     pub fn is_idle(&self) -> bool {
         self.kind == Kind::IDLE
     }
-
-    /// The unit this PE belongs to (weight, CX and CY PEs).
-    pub fn unit(&self) -> Option<u32> {
-        match self.place {
-            Place::Weight { unit, .. } | Place::Cx { unit, .. } | Place::Cy { unit, .. } => {
-                Some(unit)
-            }
-            _ => None,
-        }
-    }
 }

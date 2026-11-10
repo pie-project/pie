@@ -79,12 +79,8 @@ impl Meta {
     /// The family the meta was prepped for: an explicit `family` key, else today's sniffing
     /// (`NEX`: gpt-oss; `geo` + `RA`: Gemma 12B; `geo`: Gemma; otherwise Qwen).
     pub fn family(&self) -> FamilyId {
-        match self.str("family") {
-            Some("qwen") => return FamilyId::Qwen,
-            Some("gptoss") => return FamilyId::GptOss,
-            Some("gemma") => return FamilyId::Gemma,
-            Some("gemma12") => return FamilyId::Gemma12,
-            _ => {}
+        if let Some(f) = self.str("family").and_then(FamilyId::of_name) {
+            return f;
         }
         if self.map.contains_key("NEX") {
             FamilyId::GptOss
@@ -108,7 +104,7 @@ impl Meta {
         let mut put = |k: &str, v: serde_json::Value| {
             m.insert(k.to_string(), v);
         };
-        put("family", family_name(s.family).into());
+        put("family", s.family.name().into());
         put(
             PLAN_KEY,
             serde_json::to_value(plan).unwrap_or(serde_json::Value::Null),
@@ -144,15 +140,5 @@ impl Meta {
             put("SOFTCAP", f64::from(cap).into());
         }
         Meta { map: m }
-    }
-}
-
-/// The `family` key's spelling.
-pub fn family_name(f: FamilyId) -> &'static str {
-    match f {
-        FamilyId::Qwen => "qwen",
-        FamilyId::GptOss => "gptoss",
-        FamilyId::Gemma => "gemma",
-        FamilyId::Gemma12 => "gemma12",
     }
 }

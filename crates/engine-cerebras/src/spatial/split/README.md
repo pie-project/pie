@@ -117,12 +117,9 @@ All tools are under `crates/engine-cerebras/tools/`. Set `CSL_SDK` to the SDK di
 
 1. **Prep** (checkpoint -> tiles): writes `<prefix>meta.json`, `w<u>.npy`, `hw`, `hemb`, ... (and
    `params.txt`). The build reads the meta; the geometry is Rust's (`split-geo`, `ARCHITECTURE.md`).
-   - Any Qwen3.5 size and geometry:
-     `tools/split/prep_q35.py <model> <out> <golden.json> PX PY UNX UNY K HR VR NE [prefix]`.
-     The 9B: `256 256 2 4 4 1153 216 64 s9b_`. The 4B: the same with its own model. The 0.8B:
-     `256 128 2 3 4 1153 216 128 s08b_`.
-   - The 9B in Rust: `cargo run --release -p engine-cerebras --example split_prep -- <ckpt> <out> s9b_`.
-     `--check` compares it word for word against a Python prep.
+   - Any Qwen3.5 / Qwen3 size: `tools/split/prep_q35.py <model> <out> <golden.json> <geometry> [prefix]`,
+     the geometry one of `split-geo --geometry qwen:<name>`'s (`9b`, `4b`, `0.8b`, `q3-8b`; the
+     table in `family/qwen.rs`), or explicit `PX PY UNX UNY K HR VR NE [prefix] [units]`.
 2. **Numerics gate** (before any new lever): `tools/emu/tf_q35.py <model> <golden> <meta.json>
    ref,f16acc_s16_kv16 256 <out>`. This needs `torch` and `transformers` with Qwen3.5. For
    serve8b_region's levers on Qwen3-8B: `tools/emu/tf_qwen3_8b.py`.

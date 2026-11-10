@@ -38,9 +38,31 @@ fn gap(units: u32, (unx, uny): (u32, u32)) -> R<Option<(u32, u32)>> {
     }
 }
 
+/// The named geometries (`prep_q35.py <model> <out> <golden> <name> [prefix]`): weight columns
+/// and rows a unit (PX, PY), the unit slots (UNX x UNY) and units (NU; one short: a gap slot),
+/// layers a unit (K), the head's rows and vocabulary rows a head PE (HR, VR), KV entries a row
+/// (NE). A new size adds one.
+const GEOMETRIES: &[(&str, [u32; 9])] = &[
+    // name, [PX, PY, UNX, UNY, NU, K, HR, VR, NE]
+    ("9b", [256, 256, 2, 4, 8, 4, 1153, 216, 64]),
+    ("4b", [256, 256, 2, 4, 8, 4, 1153, 216, 64]),
+    ("0.8b", [256, 128, 2, 3, 6, 4, 1153, 216, 128]),
+    // Qwen3-8B: 36 layers on 9 units, one gap slot
+    ("q3-8b", [256, 228, 2, 5, 9, 4, 1153, 132, 17]),
+];
+
 impl Family for Qwen {
-    fn id(&self) -> FamilyId {
-        FamilyId::Qwen
+    fn geometry(&self, name: &str) -> R<serde_json::Value> {
+        let [px, py, unx, uny, nu, k, hr, vr, ne] = GEOMETRIES
+            .iter()
+            .find(|(n, _)| *n == name)
+            .map(|(_, g)| *g)
+            .ok_or_else(|| format!("qwen: no geometry {name}"))?;
+        gap(nu, (unx, uny))?;
+        Ok(serde_json::json!({
+            "PX": px, "PY": py, "UNX": unx, "UNY": uny, "NU": nu, "K": k, "HR": hr, "VR": vr,
+            "NE": ne,
+        }))
     }
 
     fn plan(&self, meta: &Meta) -> R<Plan> {

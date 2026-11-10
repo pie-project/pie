@@ -24,7 +24,6 @@ pub mod floor;
 pub mod kernels;
 pub mod npy;
 pub mod plan;
-pub mod prep;
 pub mod program;
 pub mod role;
 pub mod weights;
@@ -143,7 +142,7 @@ impl SplitModel {
             ms = t0.elapsed().as_millis() as u64,
             w = hl.w,
             h = hl.h,
-            family = emit::meta::family_name(prog.plan.shape.family),
+            family = prog.plan.shape.family.name(),
             "split: program built"
         );
         let t1 = std::time::Instant::now();

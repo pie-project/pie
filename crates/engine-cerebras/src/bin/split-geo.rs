@@ -6,7 +6,7 @@
 //!           [--what floor,rcfg,kernels,layout,host,meta,bindings]
 //!           [--levers K:V,...] [--kernels <csl/split dir>]
 //! split-geo --plan <plan.json> --out <dir> [...]
-//! split-geo --geometry <gemma|gemma12|gptoss>:<name>
+//! split-geo --geometry <qwen|gptoss|gemma|gemma12>:<name>
 //! ```
 //!
 //! `--geometry` prints a named geometry as JSON (what a prep needs before its meta exists: the
@@ -37,7 +37,7 @@ use engine_cerebras::spatial::split::emit::params::{Levers, kernels};
 use engine_cerebras::spatial::split::emit::{layout, rcfg};
 use engine_cerebras::spatial::split::family;
 use engine_cerebras::spatial::split::floor::{HeadBlock, Rect, StoreBlock, Unit};
-use engine_cerebras::spatial::split::plan::Plan;
+use engine_cerebras::spatial::split::plan::{FamilyId, Plan};
 use engine_cerebras::spatial::split::program::Program;
 use engine_cerebras::spatial::split::role::Kind;
 use serde::Serialize;
@@ -162,12 +162,11 @@ fn geometry(spec: &str) -> Result<serde_json::Value, String> {
     let (fam, name) = spec
         .split_once(':')
         .ok_or_else(|| format!("--geometry {spec}: <family>:<name>"))?;
-    match fam {
-        "gemma" => family::gemma::geometry(name),
-        "gemma12" => family::gemma12::geometry_json(name),
-        "gptoss" => family::gptoss::geometry(name),
-        _ => Err(format!("--geometry {spec}: gemma, gemma12 or gptoss")),
-    }
+    let id = FamilyId::of_name(fam).ok_or_else(|| {
+        let names: Vec<_> = FamilyId::ALL.iter().map(|f| f.name()).collect();
+        format!("--geometry {spec}: a family of {}", names.join(", "))
+    })?;
+    family::of(id).geometry(name)
 }
 
 fn run() -> Result<(), String> {

@@ -152,33 +152,6 @@ impl KernelBuild {
             rcfg: kernel.rcfg,
         })
     }
-
-    /// An untyped build: `source` owning `owns`, its params `items` in order, no route table or
-    /// rcfg writer yet (the caller sets them).
-    pub fn new(source: &'static str, owns: &[&'static str], items: Vec<(&str, Value)>) -> Self {
-        let mut params = Params::default();
-        for (k, v) in items {
-            params.set(k, v);
-        }
-        KernelBuild {
-            source,
-            owns: owns.to_vec(),
-            params,
-            route_slots: 0,
-            rcfg: None,
-        }
-    }
-
-    /// [`KernelBuild::new`] with integer params.
-    pub fn ints(source: &'static str, owns: &[&'static str], items: &[(&str, u32)]) -> Self {
-        let items = items.iter().map(|&(k, v)| (k, Value::from(v))).collect();
-        KernelBuild::new(source, owns, items)
-    }
-
-    /// The filler: an empty kernel the layout writes inline (no source file, owns nothing).
-    pub fn filler() -> Self {
-        KernelBuild::new("", &[], Vec::new())
-    }
 }
 
 /// Every kind's kernel build of a program.

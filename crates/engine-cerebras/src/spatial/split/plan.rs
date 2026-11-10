@@ -19,6 +19,29 @@ pub enum FamilyId {
     Gemma12,
 }
 
+impl FamilyId {
+    pub const ALL: [FamilyId; 4] = [
+        FamilyId::Qwen,
+        FamilyId::GptOss,
+        FamilyId::Gemma,
+        FamilyId::Gemma12,
+    ];
+
+    /// The family's name: the meta's `family` key, `split-geo --geometry <name>:<geometry>`.
+    pub fn name(self) -> &'static str {
+        match self {
+            FamilyId::Qwen => "qwen",
+            FamilyId::GptOss => "gptoss",
+            FamilyId::Gemma => "gemma",
+            FamilyId::Gemma12 => "gemma12",
+        }
+    }
+
+    pub fn of_name(name: &str) -> Option<FamilyId> {
+        FamilyId::ALL.into_iter().find(|f| f.name() == name)
+    }
+}
+
 /// The model, as the wafer program needs it. Pure model facts: the same for every partition.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct Shape {

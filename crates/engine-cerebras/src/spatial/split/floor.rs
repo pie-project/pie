@@ -342,19 +342,6 @@ impl Default for Grid<PeRole> {
 }
 
 impl FloorBuilder {
-    /// A finished floor to build on.
-    pub fn of(f: Floor) -> FloorBuilder {
-        FloorBuilder {
-            w: f.w,
-            h: f.h,
-            units: f.units,
-            relays: f.relays,
-            stores: f.stores,
-            head: Some(f.head),
-            roles: f.roles,
-        }
-    }
-
     /// [`FloorBuilder::add_units`] on an empty floor.
     pub fn units(grid: &UnitGrid, extra: (u32, u32)) -> Result<FloorBuilder, String> {
         let mut b = FloorBuilder::default();

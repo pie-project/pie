@@ -208,44 +208,40 @@ const NAMED: &[Named] = &[
     },
 ];
 
-/// A named geometry as the prep reads it (`split-geo --geometry gemma:<name>`), before any meta
-/// exists: the unit shape and count, the head, a row's dims, and each unit column's x, units (top
-/// to bottom) and PLE storage (rows `srows`, `nt` tokens a storage PE).
-pub fn geometry(name: &str) -> Result<serde_json::Value, String> {
-    let n = NAMED
-        .iter()
-        .find(|n| n.name == name)
-        .ok_or_else(|| format!("split gemma: no geometry {name}"))?;
-    let (px, py, nu) = n.shape;
-    let (_, arr) = ARRANGEMENTS
-        .iter()
-        .find(|(k, _)| *k == (px, py, nu))
-        .ok_or_else(|| format!("split gemma: no arrangement for {name}"))?;
-    let (uw, uh) = (px + 1, py + 1);
-    let origins = arr.origins(uw, uh)?;
-    let cols = arr
-        .columns(uw)
-        .iter()
-        .map(|(x, units, st)| {
-            let top = origins[units[0] as usize].1;
-            serde_json::json!({
-                "x": x,
-                "units": units,
-                "srows": [top - st.rows, top],
-                "nt": st.tokens,
-            })
-        })
-        .collect::<Vec<_>>();
-    Ok(serde_json::json!({
-        "PX": px, "PY": py, "XC": px / 2, "NU": nu, "Hc": n.dims, "HC": n.head_cols,
-        "HR": n.head_rows,
-        "origins": origins, "cols": cols,
-    }))
-}
-
 impl Family for Gemma {
-    fn id(&self) -> FamilyId {
-        FamilyId::Gemma
+    /// A named geometry as the prep reads it (`split-geo --geometry gemma:<name>`), before any meta
+    /// exists: the unit shape and count, the head, a row's dims, and each unit column's x, units (top
+    /// to bottom) and PLE storage (rows `srows`, `nt` tokens a storage PE).
+    fn geometry(&self, name: &str) -> R<serde_json::Value> {
+        let n = NAMED
+            .iter()
+            .find(|n| n.name == name)
+            .ok_or_else(|| format!("split gemma: no geometry {name}"))?;
+        let (px, py, nu) = n.shape;
+        let (_, arr) = ARRANGEMENTS
+            .iter()
+            .find(|(k, _)| *k == (px, py, nu))
+            .ok_or_else(|| format!("split gemma: no arrangement for {name}"))?;
+        let (uw, uh) = (px + 1, py + 1);
+        let origins = arr.origins(uw, uh)?;
+        let cols = arr
+            .columns(uw)
+            .iter()
+            .map(|(x, units, st)| {
+                let top = origins[units[0] as usize].1;
+                serde_json::json!({
+                    "x": x,
+                    "units": units,
+                    "srows": [top - st.rows, top],
+                    "nt": st.tokens,
+                })
+            })
+            .collect::<Vec<_>>();
+        Ok(serde_json::json!({
+            "PX": px, "PY": py, "XC": px / 2, "NU": nu, "Hc": n.dims, "HC": n.head_cols,
+            "HR": n.head_rows,
+            "origins": origins, "cols": cols,
+        }))
     }
 
     /// From `prep_gemma.py`'s meta: units of K layers (S .. S G, KM's bits the global layers),

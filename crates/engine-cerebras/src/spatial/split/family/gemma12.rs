@@ -75,21 +75,6 @@ fn geometry(name: &str) -> R<Geometry> {
     }
 }
 
-/// A named geometry as the prep reads it (`split-geo --geometry gemma12:<name>`), before any meta
-/// exists: the unit shape and count, the attention rows and both row kinds' dims, the scores
-/// segment width, the head (one column a row group; `hc`: every row's dims).
-pub fn geometry_json(name: &str) -> R<serde_json::Value> {
-    let g = geometry(name)?;
-    let groups = groups_split(g.py, g.py / 2, g.ra, g.ga, g.gw);
-    let hc: Vec<u32> = (0..g.py)
-        .map(|r| if r < g.ra { g.hca } else { g.hcw })
-        .collect();
-    Ok(serde_json::json!({
-        "PX": g.px, "PY": g.py, "RA": g.ra, "SWA": g.swa, "HcA": g.hca, "HcW": g.hcw, "K": g.k,
-        "NU": g.units, "HC": groups.len(), "HR": g.hr, "groups": groups, "hc": hc,
-    }))
-}
-
 /// Head groups: the attention rows in groups of `ga`, the plain rows above the CY row and those
 /// below it in groups of `gw`.
 pub fn groups_split(py: u32, yc: u32, ra: u32, ga: u32, gw: u32) -> Vec<Vec<u32>> {
@@ -293,8 +278,19 @@ impl Gemma12 {
 }
 
 impl Family for Gemma12 {
-    fn id(&self) -> FamilyId {
-        FamilyId::Gemma12
+    /// A named geometry as the prep reads it (`split-geo --geometry gemma12:<name>`), before any meta
+    /// exists: the unit shape and count, the attention rows and both row kinds' dims, the scores
+    /// segment width, the head (one column a row group; `hc`: every row's dims).
+    fn geometry(&self, name: &str) -> R<serde_json::Value> {
+        let g = geometry(name)?;
+        let groups = groups_split(g.py, g.py / 2, g.ra, g.ga, g.gw);
+        let hc: Vec<u32> = (0..g.py)
+            .map(|r| if r < g.ra { g.hca } else { g.hcw })
+            .collect();
+        Ok(serde_json::json!({
+            "PX": g.px, "PY": g.py, "RA": g.ra, "SWA": g.swa, "HcA": g.hca, "HcW": g.hcw, "K": g.k,
+            "NU": g.units, "HC": groups.len(), "HR": g.hr, "groups": groups, "hc": hc,
+        }))
     }
 
     fn plan(&self, meta: &Meta) -> R<Plan> {

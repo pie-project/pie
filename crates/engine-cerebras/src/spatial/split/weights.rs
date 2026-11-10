@@ -31,8 +31,6 @@ pub enum Source {
     Slice(Slice),
     /// Every PE's rcfg words over the rectangle ([`super::emit::rcfg`]).
     Rcfg,
-    /// Words the family makes from the plan (a table, a constant), row-major over the rectangle.
-    Inline(Vec<u32>),
 }
 
 /// A sub-array of a staged npy (`<prefix><name>.npy`) laid onto a rectangle.
@@ -183,8 +181,6 @@ pub enum Transform {
     /// gpt-oss's MXFP4 experts re-encoded losslessly as E5M2.
     Mxfp4ToE5m2,
     Bf16ToF16,
-    /// A tile permutation the kernel's layout wants (`prep.rs::perm`).
-    Permute(Vec<u32>),
 }
 
 /// One copy onto the wafer.
@@ -242,38 +238,6 @@ pub fn chunks(r0: u32, r1: u32, step: u32) -> impl Iterator<Item = (u32, u32)> {
 /// One checkpoint tensor, untransformed.
 pub fn from(t: &str) -> From {
     vec![(t.to_string(), Vec::new())]
-}
-
-/// A staged file the job uploads: kept under the 2 GiB a staged file may take (the 0918
-/// failure), split by a leading index range when larger.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
-pub struct StagedFile {
-    pub path: PathBuf,
-    pub bytes: u64,
-}
-
-/// The largest staged file (2 GiB less the gRPC frame's headroom).
-pub const STAGE_MAX: u64 = (1 << 31) - (1 << 20);
-
-/// Splits a staged array's leading index into files under [`STAGE_MAX`] (names `<name>0`,
-/// `<name>1`, ...; one file, `<name>`, when it fits). The ranges are as even as the rows allow; a
-/// single row over the limit still gets a file of its own (it cannot be split by its leading
-/// index).
-pub fn stage_split(name: &str, rows: u32, row_bytes: u64) -> Vec<(String, (u32, u32))> {
-    let total = u64::from(rows) * row_bytes;
-    if total <= STAGE_MAX || rows <= 1 {
-        return vec![(name.to_string(), (0, rows))];
-    }
-    let per_file = (STAGE_MAX / row_bytes.max(1)).max(1);
-    let files = u64::from(rows).div_ceil(per_file);
-    let per = u64::from(rows).div_ceil(files) as u32;
-    (0..files as u32)
-        .map(|i| {
-            let a = i * per;
-            (format!("{name}{i}"), (a, ((i + 1) * per).min(rows)))
-        })
-        .filter(|(_, (a, b))| b > a)
-        .collect()
 }
 
 /// The staged arrays a placement reads, opened once each.
@@ -336,7 +300,6 @@ fn words(
             }
             sl.words(staged.get(&sl.name)?)?
         }
-        Source::Inline(v) => v.clone(),
         Source::Rcfg => {
             if rcfg.is_none() {
                 *rcfg = Some(super::emit::rcfg::all(prog)?);

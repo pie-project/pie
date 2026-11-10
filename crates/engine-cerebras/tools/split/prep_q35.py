@@ -1,9 +1,11 @@
 #!/usr/bin/env python3
-"""prep_q35.py <model dir> <outdir> <golden json> PX PY UNX UNY K HR VR NE [prefix] [nunits]: any Qwen3.5
+"""prep_q35.py <model dir> <outdir> <golden json> <geometry> [prefix]
+   prep_q35.py <model dir> <outdir> <golden json> PX PY UNX UNY K HR VR NE [prefix] [nunits]
+Any Qwen3.5
 or Qwen3 (dense: every layer attention, no output gate, plain norm weights, full RoPE)
 checkpoint (bf16 or f32 safetensors, the VL layout "model.language_model." or text-only "model.") in
 the role-split prep format (the files PIE_CEREBRAS_SPLIT=<outdir>:<prefix> names; spatial/split/weights.rs
-copies them onto the wafer). At the 9B's dims it writes the same arrays as `split_prep` (Rust, 9B only). Units of PX x PY weight PEs, K layers each (the model's layer kinds, GDN / attention by
+copies them onto the wafer). Units of PX x PY weight PEs, K layers each (the model's layer kinds, GDN / attention by
 `layer_types`, the same K-layer pattern in every unit), UNX x UNY units, the head PY / 2 columns of
 2 Hc dims by HR rows of VR vocabulary rows; lm_head = the embedding when tied. Weights as f16 bits.
 
@@ -18,11 +20,18 @@ Writes w<u>.npy, gam, cw, gpar, gnw, qkw, rot, hw, hg, embed, hemb, embrows, gol
 (each with the optional prefix)."""
 import glob, json, os, shutil, struct, sys
 import numpy as np
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import splitgeo
 
 MD, out, GOLD = sys.argv[1:4]
-PX, PY, UNX, UNY, K, HR, VR, NE = map(int, sys.argv[4:12])
-PRE = sys.argv[12] if len(sys.argv) > 12 else ""
-NUN = int(sys.argv[13]) if len(sys.argv) > 13 else UNX * UNY
+if sys.argv[4].isdigit():          # an explicit geometry (the tiny tests)
+    PX, PY, UNX, UNY, K, HR, VR, NE = map(int, sys.argv[4:12])
+    PRE = sys.argv[12] if len(sys.argv) > 12 else ""
+    NUN = int(sys.argv[13]) if len(sys.argv) > 13 and sys.argv[13] else UNX * UNY
+else:                              # a named one (split-geo --geometry qwen:<name>: 9b, 4b, 0.8b, q3-8b)
+    g = splitgeo.geometry("qwen:" + sys.argv[4])
+    PX, PY, UNX, UNY, K, HR, VR, NE, NUN = g.PX, g.PY, g.UNX, g.UNY, g.K, g.HR, g.VR, g.NE, g.NU
+    PRE = sys.argv[5] if len(sys.argv) > 5 else ""
 os.makedirs(out, exist_ok=True)
 cfg = json.load(open(os.path.join(MD, "config.json")))
 tc = cfg.get("text_config", cfg)

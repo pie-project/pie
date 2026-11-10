@@ -1,38 +1,40 @@
 # Role-split program: architecture
 
-A role-split program is a list of **blocks** over a logical **plan**. A family reads the plan
-(today off the prep's meta) and names the blocks it composes; the core runs every build step over
-the blocks in order and knows no model, no family and no block's vocabulary.
+A role-split program is a list of **blocks** over a logical **plan**. A family turns a model and
+a chosen geometry into the plan and names the blocks it composes; the core runs every build step
+over the blocks in order and knows no model, no family and no block's vocabulary.
 
 ```
-Meta ─Family::plan─▶ Plan ─Family::blocks─▶ [Block]
-                      │                        │ floor   ─▶ Floor  (units, head, stores; a PeRole a PE)
-                      │                        │ wire    ─▶ Wiring (typed links over open Classes / Slots)
-                      │                        │ colours ─▶ Palette
-                      │                        ▼
-                      │                     Fabric::lay + validate (routes, queues, invariants)
-                      │
-                      └─Family::kernels─▶ Kernels (Kind → KernelBuild: descriptor + typed params)
-                                              │ blocks' overrides ─▶ Overrides (per-PE params)
-                                              ▼
-              emit::{rcfg (Kernel::rcfg over a Pe), params + layout, host, meta}
-              Program::bindings (blocks' copies) ─▶ weights::place
+model dims + geometry ─Family::plan─▶ Plan ─Family::blocks─▶ [Block]
+ (the prep's meta)                     │                        │ floor   ─▶ Floor  (units, head, stores; a PeRole a PE)
+                                       │                        │ wire    ─▶ Wiring (typed links over open Classes / Slots)
+ plan.json (split-geo --plan) ─────────┤                        │ settle  ─▶ Floor  (PEs placed where links cross)
+                                       │                        │ colours ─▶ Palette
+                                       │                        ▼
+                                       │                     Fabric::lay + validate (routes, queues, invariants)
+                                       │
+                                       └─Family::kernels─▶ Kernels (Kind → KernelBuild: descriptor + typed params)
+                                                               │ blocks' overrides ─▶ Overrides (per-PE params)
+                                                               ▼
+                               emit::{rcfg (Kernel::rcfg over a Pe), params + layout, host, meta}
+                               Program::bindings (blocks' copies) ─▶ weights::place
 ```
 
 | Layer | Module | Holds | Knows |
 |---|---|---|---|
-| Plan | `plan.rs` | `Shape` (the model), `Partition` (counts, split factors), `Contract` (positions, CAP, LOOP, WL) | nothing physical: the seam to poem's spatial compiler (a trace makes the `Shape`, a search the `Partition`) |
+| Plan | `plan.rs` | `Shape` (the model), `Partition` (counts, split factors), `Contract` (positions, CAP, LOOP, WL); serde, so a plan is a file | nothing physical: the seam to poem's spatial compiler (below) |
 | Roles | `role.rs` | `PeRole { kind: Kind, place: Place }`. `Kind` is open (name + build stem; the architecture's kinds are consts, a block declares more). `Place` is the role-split architecture's positions: weight / CX / CY of a unit, head / head control, a storage column's PE, none | coordinates |
 | Floor | `floor.rs` | `FloorBuilder` (blocks place onto it in order), units, gap / relay slots, the head block, store blocks, a `PeRole` a PE in a dense `Grid` | coordinates |
 | Wiring | `wiring.rs` | `Chain`, `Multicast`, `Path`, `Turn`, `Note`; open `Class { name, index }`, `Slot { name, kind: SlotKind }`, `NoteKey`; the core's only own vocabulary is `LOOPBACK` and `PASS` | coordinates, logical colours |
-| Fabric | `fabric.rs` | `Palette` (the blocks' colours, later replacing earlier), routes, `PeIo` (slot → endpoint, notes), `parks` / `spare` / `route_words`, the invariants | physical colours, route words |
-| Blocks | `block/` | the `Block` trait and the blocks: `units`, `segments` (`Scores`, `Onorm`), `gdn`, `head` (`HeadEast`), `token_loop`; each owns its classes, slots, notes and colours as consts | coordinates, its own vocabulary |
+| Fabric | `fabric.rs` | `Palette` (the blocks' colours, later replacing earlier), routes, `PeIo` (slot → endpoint, notes), parks / spare / route words, the invariants | physical colours, route words |
+| Blocks | `block/` | the `Block` trait and the blocks (table below); each owns its classes, slots, notes, kinds and colours as consts | coordinates, its own vocabulary |
 | ABI | `abi.rs` | `Kernel` (source, owned symbols, params' names, route slots, rcfg writer), `params!` (a kernel's typed params struct), `words!` (an rcfg word layout), `KernelBuild`, `Kernels`, `Overrides` | the build's view of a kernel |
-| Kernels | `kernels/` | `Pe` (one PE as an rcfg writer sees it), `common` (the word layouts every family's weight / CX / CY / head / head control kernel shares, its codes named), `head` (`head_pe.csl`, `head_ctl.csl`), `q35` (Qwen's) | the CSL kernels' ABI |
-| Families | `family/` | `qwen` (blocks); `gptoss`, `gemma`, `gemma12` (one `block::Legacy` each until ported) | the model |
-| Emit | `emit/` | rcfg (`Kernel::rcfg` over a `Pe`), kernel params (levers, overrides) and `layout.csl`, typed `Meta`, `HostLayout` | kernel builds |
+| Kernels | `kernels/` | `Pe` (one PE as an rcfg writer sees it); `common` (the word layouts every family's weight / CX / CY / head / head control kernel shares, its codes named, the relay); `head` (`head_pe.csl`, `head_ctl.csl`); one module a family's own kernels: `q35`, `gptoss`, `gemma`, `gemma12` | the CSL kernels' ABI |
+| Families | `family/` | `qwen`, `gptoss`, `gemma`, `gemma12`: named geometries, the plan from a model's dims and a geometry, the block list, the kernels | the model |
+| Emit | `emit/` | rcfg, kernel params (levers, overrides) and `layout.csl`, typed `Meta`, `HostLayout` (everything the host driver reads and writes on the wafer) | kernel builds |
 | Weights | `weights.rs` | `Binding`s (symbol, rect, source, transforms), `Copies`, the placer | the device |
 | Program | `program.rs` | `Program { plan, blocks, floor, wiring, palette, fabric, kernels, overrides, family }`, `build`, `bindings` | all of the above |
+| Host | `mod.rs` | `SplitModel`: one sequence on the wafer, driven through `HostLayout` only; it names no family | the device |
 
 Rules:
 
@@ -65,7 +67,7 @@ The hardware lessons of the bring-up, made checks:
 
 1. **Route clash.** Two words for one colour at one PE is an error.
 2. **Parked queues.** An unused input queue never parks on a colour the PE sends on. Parks come
-   first from colours with no route, then from pass-through colours (`Fabric::parks`). The 0704
+   first from colours with no route, then from pass-through colours (`Fabric::parks_avoiding`). The 0704
    hang.
 3. **Segment queues.** A `SlotKind::Segment` slot's colours are never a `SlotKind::Reduce` slot's
    on the same PE. 0733: a segment borrowed iq3.
@@ -91,11 +93,23 @@ The hardware lessons of the bring-up, made checks:
 | `gdn::Gdn` (`Gdn::of(plan)`) | — | the (k, q) multicast per GDN segment and key row; `Gdn::source` is the weight kernel's source word | `GDN_KQ`; slot `GDN`; `SOURCE_*` | — |
 | `head::HeadEast { cols, rows, token_loop, copies }` | the head east of the floor so far, control column in the middle | `head_rows` (into the control column), `head_input` (two CX rows a head column: relay north, column multicast) | `HEAD_RELAY`, `HEAD_COL_CAST`, `HEAD_ROW_WORD`; slots `HEAD_ROW_REDUCE`, `HEAD_IN`, `HEAD_RELAY_IN`, `HEAD_CAST`; note `ROLE` (`ROLE_RELAY`, `ROLE_SOURCE`) | `HeadCopies` (`hw`, `hg`, `hemb`, rcfg) |
 | `token_loop::TokenLoop` | — | the control column's max-reduce, the embedding's return into unit 0's CX | `LOOP_L1/L2/CAST`, `EMB_UP/DOWN/SPLIT/WEST`; slots `LOOP_REDUCE`, `EMB_IN`; note `TURN` (`TURN_TOP/EVEN/ODD`) | — |
+| `ple::Ple { columns }` | a storage block above each unit column's top unit (`Place::Store`, kind `STORE`; its CX column route-only); `settle`: every idle PE west of the head outside the units and storage that a link crosses runs the store kernel route-only | `TOKEN` west along each storage row from the head control column; `bus(i)` down each weight column of column `i` into every unit's CY | `TOKEN`, `bus(i)`; `NTW` (route-only PEs outside the storage: 1) | storage tiles `pt<col>_<n>` (staged files under 1,900 MiB), the route-only PEs' rcfg |
+| `shared_kv::SharedKv` | — | `LINE` north from the source unit's CY row through the sharers above it | `LINE`; `SH`, `Ic` on the sharers' weight / CY PEs | — |
+| `moe::MoeUnits { grid, copies }` | units as `Units`, weight / CY kinds refined by half (`WA`, `WM`, `CYA`, `CYM`: attention columns west of CX, MoE east) | `unit_chains` | the kinds | `MoeCopies` per unit and half |
+| `moe::AttnScores`, `moe::Router` | — | scores segments on the attention columns; router segments on the CY row's MoE columns | `ROUTER` (a segment slot) | — |
+| `band::Band` | the head as a band below the units with a control row | the x down the MoE columns (`BAND_VERT`), the band columns' chains into the control row | `BAND_VERT`; slots `BAND_IN`, `BAND_OUT`, `BAND_CAST` | the band's head tiles |
+| `band::BandLoop` | — | the control row's max-reduce, the bus, the embedding's return (`BAND_V1`, `BAND_W2`); recolours `token_loop::EMB_WEST` to `BUS_COLOUR` | `BAND_V1`, `BAND_W2`; slots `BUS`, `BUS_TX`, `V1_TX`, `V1_RX`, `W2_TX` | — |
+| `row_runs::RowRuns { grid, copies }` | units as `Units` | `unit_chains`; scores segments on the attention runs' rows only | `HC`, `ATT` (`ATT_ROW`, `PLAIN_ROW`) overrides: a weight / CX PE's run's dims, a weight PE's run's role | `RunCopies` per unit and run block (`w{u}a` / `w{u}w`, `gama` / `gamw`, the CY tables) |
+| `head_groups::HeadGroups { cols, rows, copies }` | the head east of the units (token loop on) | `head_rows`; per group the x chain north on the last unit (`HEAD_GROUP`), its root east, the column multicast; the embedding back up, down, west into unit 0 and down the chain; the max-reduce | `HEAD_GROUP`; slots `CHAIN_IN`, `CHAIN_OUT`, `CAST`; notes `FORWARD`, `head::ROLE`, `token_loop::TURN` | `HeadCopies` |
 
-Qwen's composition (`family/qwen.rs::blocks`): `Units` (snake, at most one gap slot), `Scores`
-when any layer attends, `Gdn` + `Onorm` when any layer is GDN, `HeadEast`, `TokenLoop` under the
-contract's token loop. Its kernels are `kernels::q35` (`weight_q35.csl`, `ctl_cx.csl`,
-`ctl_cy_q35.csl`) with `kernels::head` and `common::RELAY`.
+Compositions (`family/*.rs::blocks`):
+
+| Family | Blocks | Kernels |
+|---|---|---|
+| Qwen3.5 / Qwen3 | `Units` (snake, at most one gap slot), `Scores` when any layer attends, `Gdn` + `Onorm` when any layer is GDN, `HeadEast`, `TokenLoop` under the contract's token loop | `kernels::q35` (`weight_q35`, `ctl_cx`, `ctl_cy_q35`) + `head` + `common::RELAY` |
+| gpt-oss | `MoeUnits` (a snake starting upward), `AttnScores`, `Router`, `Band`, `BandLoop` | `kernels::gptoss` (`wa`, `wm`, `cx`, `cya`, `cym`, the band head; `head_ctl.csl` with the bus reserved) |
+| Gemma 4 E2B / E4B | `Units` (explicit origins: the arrangement its unit shape names), `Scores` (a half row), `Ple`, `SharedKv`, `HeadEast`, `TokenLoop` | `kernels::gemma` (`weight_gemma`, `ctl_cx_gemma`, `ctl_cy_gemma`, `head_ctl_gemma`, `ple_gemma`) + `head::HEAD_PE` |
+| Gemma 4 12B | `RowRuns` (explicit origins, attention / plain row runs), `HeadGroups` | `kernels::gemma12` (`weight_g12`, `ctl_cx_g12`, `ctl_cy_g12`, `head_g12`) + `head::HEAD_CTL` |
 
 ## Kernels and their ABI
 
@@ -135,61 +149,56 @@ resolved param list is one loop nest, every param a literal, so `link.sh` passes
 The per-kind sources are the kernels', with one-word dummies for the family's other exported
 symbols (`Family::symbols`, export order).
 
-## Porting a family onto blocks
+## Adding a model
 
-gpt-oss, Gemma 4 E2B / E4B and Gemma 4 12B still run as one `block::Legacy` each: their old
-`floor` / `wire` / `palette` / `bindings` as `block::Whole`, their old per-kind kernel tables with
-the family's one rcfg function (`block::legacy_kernels`), the old role-implied params
-(`block::legacy_overrides`). Their output is the pre-port output byte for byte. To port one:
+1. **Plan.** A model of an existing family is a new named geometry in the family's table
+   (`family/qwen.rs::GEOMETRIES`, Gemma's arrangements and names, gpt-oss's and 12B's tables):
+   the prep tiles for it (`split-geo --geometry <family>:<name>`) and records it in the meta;
+   `Family::plan` derives the rest. A new family implements `Family`: `geometry`, `plan` (fill
+   `Shape` from the model's dims, `Partition` from the geometry, `Contract`), `blocks`, `kernels`,
+   `symbols`.
+2. **List the blocks.** Units first, then what places against them, then wiring-only blocks.
+   Reuse a block where its doc fits exactly; otherwise write a new module under `block/` (a new
+   block, not a flag on a shared one).
+3. **Declare the vocabulary** in the block's module: `pub const BAND_VERT: Class =
+   Class::new("HV2");`, `pub const BUS: Slot = Slot::io("band_bus");` (names no other block uses),
+   `pub const WA: Kind = Kind::new("wa", "wa");`, notes as `NoteKey` with named value consts;
+   colours in the block's `colours()`. A block that recolours another's class declares it again;
+   the later block wins.
+4. **Floor and wiring** go in `Block::floor` / `wire` (and `settle` for PEs placed where links
+   cross). Place against the builder; use the standard wiring (`units::unit_chains`,
+   `units::handoff`, `head::head_rows`, `head::head_input`, `token_loop::token_loop`,
+   `wiring::segments`) where it fits; leave notes for facts a kernel needs (`head::ROLE`,
+   `token_loop::TURN`) instead of recomputing them in an rcfg writer.
+5. **Kernels** in `kernels/<family>.rs`: one `params!` struct and one `Kernel` const a CSL source,
+   the writer over `Pe` using `common::*` for the shared words. Values that differ by PE are
+   `Block::overrides`.
+6. **Copies** in each block's `bindings`, in placement order (the host's device protocol).
+7. **Host.** Anything the driver must find goes in `HostLayout`, derived from the program.
+8. **Verify** with the baseline harness (below) and the tiny simulator run.
 
-1. **List the blocks.** Start from the standard ones and their order: units first, then what
-   places against them, then wiring-only blocks. Reuse a block where its doc fits exactly;
-   otherwise write a new block module under `block/` (a new block, not a flag on a shared one).
-   Likely new blocks:
-   - gpt-oss: `band` (the head as a band below the units with a control *row*: its floor, its
-     handoff down the MoE columns, the band bus, the embedding's return up unit 0's MoE column);
-     `router` segments on the CY row (MoE columns); the attention / MoE halves are kinds the units
-     block's roles are refined into (`WA`, `WM`, `CYA`, `CYM` with `FloorBuilder::each_role`, in a
-     `moe_columns` block or the band's floor step).
-   - Gemma: `ple` (the storage columns above each unit column, their token word `TB` and bus `PB`,
-     the route-only pass PEs; `Place::Store`), `shared_kv` (the KVS line from the source unit's
-     CY row through its sharers); the units with explicit origins (`UnitLayout::Explicit`) are the
-     standard `Units` with a Gemma `UnitCopies`.
-   - Gemma 12B: `head_groups` (the head fed by groups of CX rows, its own head input and token
-     loop: `HEAD_GROUP` chains), row runs (attention / plain rows) as overrides of `Hc` / `ATT`.
-2. **Declare the vocabulary** in the block's module: `pub const BAND_VERT: Class =
-   Class::new("HV2");`, `pub const BUS: Slot = Slot::io("bus");` (pick names no other block uses),
-   `pub const STORE: Kind = Kind::new("ple", "ple");`, notes as `NoteKey` with named value consts;
-   colours in the block's `colours()`. A block that recolours a standard class (gpt-oss's `HE`)
-   declares it again; the later block wins.
-3. **Move the floor and wiring** into `Block::floor` / `Block::wire`. Place against the builder
-   (`b.w` is the floor so far's width); set `b.head` (via `head_east` or directly) if the block is
-   the head. Use the standard wiring functions (`units::unit_chains`, `units::handoff`,
-   `head::head_rows`, `head::head_input`, `token_loop::token_loop`, `wiring::segments`) where they
-   fit; leave notes for the facts a kernel needs (as `head::ROLE` and `token_loop::TURN` do) instead
-   of recomputing them in the rcfg writer.
-4. **Describe the kernels** in `kernels/<family>.rs`: one `params!` struct and one `Kernel` const
-   a CSL source, the writer over `Pe` using `common::*` for the shared words. Shared CSL sources
-   reuse their descriptor (`head::HEAD_CTL` is gpt-oss's and Gemma 12B's too: its writer takes the
-   vocabulary offset along the control line, a row for gpt-oss's band). Values that differ by PE
-   are `Block::overrides` (Gemma's shared-KV units' `SH`, their MLP width `Ic`, the pass PEs'
-   `NTW`; Gemma 12B's row runs' `Hc` / `ATT`).
-5. **Copies** go in each block's `bindings`, in the old placement order (the host's device
-   protocol: compare `calls.log`).
-6. **Delete** the family's `Whole` impl, its per-family `Geom` / geometry struct, its `RcfgAbi`
-   leftovers; when the last one is ported, delete `block::{Whole, Legacy, legacy_kernels,
-   legacy_overrides, standard_palette, standard_colour, standard_units}`.
-7. **Verify** with the baseline harness (below): the family's configs must be identical to the
-   reference capture.
+## The plan seam (poem)
+
+`Program::build(family, plan)` is the whole physical compiler; its only input is a `Plan`
+(`split-geo --plan plan.json` builds one from a file). Today the plan comes from the prep's meta:
+the model's dims the prep read off the checkpoint, plus the geometry it was tiled for (a named
+geometry from the family's Rust table, `split-geo --geometry`; the build's `G2*`, `WL`, `CAP`, `LOOP`
+overrides), turned into `Shape` / `Partition` / `Contract` by `Family::plan`. `split-geo`'s
+`meta.json` (`Meta::of_plan`) records the whole plan under `plan`.
+
+The spatial compiler replaces the first arrow: poem's trace gives the `Shape` (layer kinds, attention
+/ MLP / MoE / GDN / PLE specs), a search over the family's blocks gives the `Partition` (units,
+layers a unit, rows and columns, row runs, KV rows, reduction groups, segment widths, the head's cut)
+and the `Contract`. Everything after `Plan` stays as it is.
 
 ## Weights
 
 `Program::bindings` lists every copy, the blocks' in order: a symbol, a rectangle and a `Source`
 (`Staged` leading-range blocks, `Slice` for any sub-array: column ranges, per-PE padding, a row
-repeated down or across a rectangle, optional tables; `Rcfg`; `Inline`) with the `Transform`s the
-prep applied. `weights::place` executes them on a `Device`; `tools/split/splitgeo.py` executes the
-same `bindings.json` on the appliance runners. `stage_split` keeps a staged file under the 2 GiB a
-transfer may take.
+repeated down or across a rectangle, optional tables; `Rcfg`) with the `Transform`s the prep
+applied. `weights::place` executes them on a `Device`; `tools/split/splitgeo.py` executes the same
+`bindings.json` on the appliance runners. The preps keep every staged file under the 2 GiB a
+transfer may take (split head tiles, `ple`'s 1,900 MiB storage files).
 
 ## Tools
 
@@ -201,7 +210,9 @@ transfer may take.
   family (the `mkfull_{gemma,g12,gptoss}.py` add their runner); `link.sh` links it and checks stack
   room; the `gotiny.sh` scripts run a tiny prep on the simulator.
 - The preps (`prep_q35.py`, `gemma/prep_gemma.py`, `g12/prep_g12.py`, `gptoss/prep_gptoss.py`) keep
-  the checkpoint maths and read their named geometry from `split-geo --geometry`.
+  the checkpoint maths and read their named geometry from `split-geo --geometry`
+  (`qwen:9b|4b|0.8b|q3-8b`, `gptoss:full`, `gemma:e2b|e4b`, `gemma12:g12`, and `tiny` for the
+  last three; `prep_q35.py` also takes an explicit geometry, as its tiny tests do).
 
 ## Verification
 

@@ -33,19 +33,15 @@ fn table(name: &str) -> Result<[u32; 9], String> {
     }
 }
 
-/// A named geometry as the prep reads it (`split-geo --geometry gptoss:<name>`), before any meta
-/// exists.
-pub fn geometry(name: &str) -> Result<serde_json::Value, String> {
-    let [ax, mx, py, unx, uny, hc, swa, swr, hvc] = table(name)?;
-    Ok(serde_json::json!({
-        "AX": ax, "MXc": mx, "PY": py, "UNX": unx, "UNY": uny, "NU": unx * uny, "Hc": hc,
-        "SWA": swa, "SWR": swr, "HVC": hvc,
-    }))
-}
-
 impl Family for GptOss {
-    fn id(&self) -> FamilyId {
-        FamilyId::GptOss
+    /// A named geometry as the prep reads it (`split-geo --geometry gptoss:<name>`), before any meta
+    /// exists.
+    fn geometry(&self, name: &str) -> R<serde_json::Value> {
+        let [ax, mx, py, unx, uny, hc, swa, swr, hvc] = table(name)?;
+        Ok(serde_json::json!({
+            "AX": ax, "MXc": mx, "PY": py, "UNX": unx, "UNY": uny, "NU": unx * uny, "Hc": hc,
+            "SWA": swa, "SWR": swr, "HVC": hvc,
+        }))
     }
 
     /// The plan from a `prep_gptoss.py` meta: the geometry name's table (`geo`), the checkpoint
