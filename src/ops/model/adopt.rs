@@ -19,26 +19,24 @@ use serde::Serialize;
 
 use crate::ui::{Mark, Palette};
 
+/// Explains a checkpoint: what it is, which family knows it, and what
+/// `pie model import` would adopt it as. Writes nothing; an import adopts.
 #[derive(Args, Debug)]
 pub struct AdoptArgs {
     /// A Hugging Face model (`owner/name`) or a checkpoint directory.
     pub source: String,
-    /// The model id to adopt it as; by default its repository's name, lowercased.
-    #[arg(long, value_name = "ID")]
-    pub id: Option<String>,
-    /// Say what would be adopted and print the package; write nothing.
-    #[arg(long)]
-    pub dry_run: bool,
-    /// Print the package written.
-    #[arg(long)]
-    pub show: bool,
-    /// Replace an earlier adoption of the same name.
-    #[arg(long)]
-    pub force: bool,
     /// Show every setting compared, every deployment's reason, and the
     /// adoption block.
     #[arg(long, short = 'v')]
     pub verbose: bool,
+}
+
+/// What an evaluation does with an adoption: explain it (and check it on
+/// every backend), or write it for this machine's import.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Mode {
+    Explain { verbose: bool },
+    Write,
 }
 
 const PLATFORMS: [Platform; 6] = [
@@ -52,7 +50,10 @@ const PLATFORMS: [Platform; 6] = [
 
 pub fn run(args: AdoptArgs) -> Result<crate::ui::Answer> {
     let (dir, origin, hollow) = resolve(&args.source)?;
-    let (report, code) = evaluate(&dir, &origin, hollow, &args)?;
+    let mode = Mode::Explain {
+        verbose: args.verbose,
+    };
+    let (report, code) = evaluate(&dir, &origin, hollow, mode)?;
     Ok(crate::ui::Answer::report(report).with_code(code))
 }
 
@@ -68,15 +69,7 @@ pub(crate) enum Behind {
 /// Adopts the downloaded checkpoint at `dir` (`source` as the user named it)
 /// for an import that found no deployment claiming it.
 pub(crate) fn behind_the_scenes(dir: &Path, source: &str) -> Result<Behind> {
-    let args = AdoptArgs {
-        source: source.to_string(),
-        id: None,
-        dry_run: false,
-        show: false,
-        force: false,
-        verbose: false,
-    };
-    let (report, _) = evaluate(dir, source, false, &args)?;
+    let (report, _) = evaluate(dir, source, false, Mode::Write)?;
     if let Some(a) = report.adoption.as_ref().filter(|a| a.written.is_some()) {
         let family = report.kin.iter().find(|k| k.package == a.family);
         let changed: Vec<String> = family
@@ -127,14 +120,15 @@ pub(crate) fn behind_the_scenes(dir: &Path, source: &str) -> Result<Behind> {
     Ok(Behind::Refused(why))
 }
 
-/// The report on the checkpoint at `dir`, adopting it unless `args` says
-/// only to look, and the exit code it is answered with.
+/// The report on the checkpoint at `dir`, its adoption written in
+/// [`Mode::Write`], and the exit code it is answered with.
 fn evaluate(
     dir: &Path,
     origin: &str,
     hollow: bool,
-    args: &AdoptArgs,
+    mode: Mode,
 ) -> Result<(Report, std::process::ExitCode)> {
+    let verbose = matches!(mode, Mode::Explain { verbose: true });
     let (dir, origin) = (dir.to_path_buf(), origin.to_string());
     let config = configuration(&dir)?;
     let src = runtime::engine::load::open_source(&dir)?;
@@ -154,7 +148,7 @@ fn evaluate(
         refused: None,
         passed_over: Vec::new(),
         unknown: None,
-        verbose: args.verbose,
+        verbose,
     };
 
     if kin.is_empty() {
@@ -177,14 +171,12 @@ fn evaluate(
         return Ok((report, std::process::ExitCode::from(2)));
     }
 
-    let id = match &args.id {
-        Some(id) => id.clone(),
-        None => model_id(&origin),
-    };
+    let id = model_id(&origin);
     let name = package_name(&id);
     let target = crate::paths::models_dir().join(format!("{name}.poem"));
-    let catalog_for_adoption = if target.exists() && args.force {
-        // The earlier adoption is the one replaced: read the catalog without it.
+    let catalog_for_adoption = if target.exists() {
+        // An earlier adoption under this name claims nothing of this
+        // checkpoint, or it would be served: read the catalog without it.
         let mut tree = runtime::catalog::Tree::read(&crate::paths::models_dir())
             .map_err(|why| anyhow!("{why}"))?;
         tree.packages.retain(|(n, _)| *n != name);
@@ -231,30 +223,22 @@ fn evaluate(
         }
         deployments.push(Landing::of(deployment, verdict));
     }
+    // An explanation checks the program on every backend; an import, on
+    // this machine's alone.
+    let platforms: &[Platform] = match mode {
+        Mode::Explain { .. } => &PLATFORMS,
+        Mode::Write => std::slice::from_ref(&platform),
+    };
     let traces = match &first {
-        Some(d) => PLATFORMS
+        Some(d) => platforms
             .iter()
             .map(|p| (p.backend().to_string(), d.try_trace(*p).is_ok()))
             .collect(),
         None => Vec::new(),
     };
-    let package_text = adopted
-        .adoption
-        .files
-        .iter()
-        .map(|(_, text)| text.as_str())
-        .collect::<Vec<_>>()
-        .join("\n");
     let tokenizer = tokenizer_of(&dir);
     let mut written = None;
-    if first.is_some() && tokenizer.is_ok() && !args.dry_run {
-        if target.exists() && !args.force {
-            bail!(
-                "{} holds an earlier adoption; pass --force to replace it, or --id to adopt it \
-                 under another name",
-                crate::ui::short_path(&target)
-            );
-        }
+    if mode == Mode::Write && first.is_some() && tokenizer.is_ok() {
         write_package(&crate::paths::models_dir(), &adopted.adoption.files)?;
         written = Some(target.clone());
     }
@@ -267,16 +251,8 @@ fn evaluate(
         traces,
         tokenizer: tokenizer.clone().err(),
         written,
-        dry_run: args.dry_run,
-        text: if args.show {
-            Some(package_text)
-        } else if args.verbose {
-            Some(adopted.adoption.block.clone())
-        } else {
-            None
-        },
-        whole: args.show,
-        source: args.source.clone(),
+        text: verbose.then(|| adopted.adoption.block.clone()),
+        source: origin.clone(),
     });
     let code = if first.is_some() && tokenizer.is_ok() {
         std::process::ExitCode::SUCCESS
@@ -813,9 +789,7 @@ struct Adoption {
     /// Why the checkpoint's tokenizer does not compile, where it does not.
     tokenizer: Option<String>,
     written: Option<PathBuf>,
-    dry_run: bool,
     text: Option<String>,
-    whole: bool,
     source: String,
 }
 
@@ -1202,15 +1176,7 @@ impl Report {
             sections.push(self.validation(a));
             if let Some(text) = &a.text {
                 let mut package = Section::new("PACKAGE");
-                package.aside = Some(format!(
-                    "{}.poem{}",
-                    a.package,
-                    if a.whole {
-                        ""
-                    } else {
-                        ", adoption block (--show prints the whole file)"
-                    }
-                ));
+                package.aside = Some(format!("{}.poem, its adoption block", a.package));
                 package.lines.push(Line::Verbatim(text.clone()));
                 sections.push(package);
             }
@@ -1456,21 +1422,16 @@ impl Report {
                 );
                 s.field("Package", vec![plain(crate::ui::short_path(written))]);
                 s.field("Next", import);
-            } else if a.dry_run {
+            } else {
                 s.field(
                     "Status",
                     vec![
                         mark(Mark::Did),
-                        plain(" Ready to adopt as "),
+                        plain(" Supported: import adopts it as "),
                         bold(&a.id),
-                        plain(GAP),
-                        dim("(dry run: nothing written)"),
                     ],
                 );
-                s.fields(
-                    "Next",
-                    vec![vec![plain(format!("pie model adopt {}", a.source))], import],
-                );
+                s.field("Next", import);
             }
         }
         s

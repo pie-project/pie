@@ -22,7 +22,7 @@ pub enum ModelCmd {
         name: String,
     },
     Import(import::ImportArgs),
-    /// Explain a checkpoint, and adopt it into a family that recognizes it.
+    /// Explain a checkpoint: what it is, and what `import` would adopt it as.
     Adopt(adopt::AdoptArgs),
     Remove {
         name: String,

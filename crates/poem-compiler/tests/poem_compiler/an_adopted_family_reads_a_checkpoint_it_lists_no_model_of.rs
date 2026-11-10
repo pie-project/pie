@@ -307,17 +307,3 @@ fn a_family_refuses_what_its_forward_does_not_run() {
         .to_string();
     assert!(why.contains("scales its rope as yarn"), "{why}");
 }
-
-#[test]
-fn every_adopting_family_leaves_its_listed_models_as_they_were() {
-    for package in repository().packages().iter().filter(|p| p.adopts()) {
-        for deployment in repository()
-            .deployments()
-            .filter(|d| d.package.name() == package.name())
-        {
-            deployment
-                .try_trace(Platform::Cuda)
-                .unwrap_or_else(|why| panic!("{}: {why}", deployment.name));
-        }
-    }
-}

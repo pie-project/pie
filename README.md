@@ -47,7 +47,7 @@ changed. `pie model adopt` explains a checkpoint without importing it.
 
 ```bash
 pie model import Qwen/Qwen3-4B      # adopted into qwen3_dense, then imported
-pie model adopt Qwen/Qwen3-4B --dry-run   # what it is, and what Pie would do
+pie model adopt Qwen/Qwen3-4B      # what it is, and what import would do
 ```
 
 See the [install guide](https://pie-project.org/docs/install) for manual
