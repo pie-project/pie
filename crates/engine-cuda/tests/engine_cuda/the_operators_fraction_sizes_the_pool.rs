@@ -1,10 +1,11 @@
+use engine::fit::pages_within;
 use engine_cuda::device::elastic::map_unit_for;
 use engine_cuda::device::elastic::{budget_bytes, safety_floor_bytes};
 use engine_cuda::store::kv::Paging;
 use engine_cuda::store::{
     Accounting, BODIES_FLOOR_BYTES, PROGRAM_ROWS_A_LANE, bodies_allowance, decoded_weight_reserve,
-    holds_within, least_state_slots, one_slot_bytes, pages_within, program_scratch_reserve,
-    state_slots_within, tokens_within, window_fire_bytes, window_of,
+    holds_within, one_slot_bytes, program_scratch_reserve, tokens_within, window_fire_bytes,
+    window_of,
 };
 
 const CARD: u64 = 48_305_799_168;
@@ -16,15 +17,12 @@ fn the_operators_fraction_sizes_the_pool_every_case() {
     the_whole_card_is_the_arithmetic_the_pool_had_before();
     the_fraction_is_of_the_card_and_charges_what_is_already_on_it();
     the_card_does_not_hold_a_deployment_whose_weights_leave_no_context();
-    the_declared_pool_is_sized_to_what_the_card_hands_out();
     the_pool_leaves_room_for_the_programs_guests_register();
     the_reservations_scale_to_a_twenty_four_gigabyte_card();
     the_decoded_weight_tiles_are_held_out_of_the_pool();
     the_bodies_keep_their_floor_and_the_tile_is_taken_before_any_capture();
     a_twenty_seven_b_serves_on_a_twenty_four_gigabyte_card_at_the_asked_lanes();
-    a_tight_fit_still_seats_one_buffered_lane();
     a_sliding_row_holds_its_window_and_not_the_context();
-    a_hybrids_slots_are_cut_to_what_leaves_the_pages_their_half();
 }
 
 fn a_twenty_seven_b_serves_on_a_twenty_four_gigabyte_card_at_the_asked_lanes() {
@@ -121,39 +119,6 @@ fn a_sliding_row_holds_its_window_and_not_the_context() {
         at(34_816).window_pages_at(8 * 2176),
         1 + 65 + 129 + 7 * 2176 / 2,
         "past one sequence, a windowed page for every two kv pages"
-    );
-}
-
-fn a_tight_fit_still_seats_one_buffered_lane() {
-    // One seat levelled to two slots starved every buffered lane (#686).
-    assert_eq!(least_state_slots(1), 3);
-}
-
-fn a_hybrids_slots_are_cut_to_what_leaves_the_pages_their_half() {
-    // pie-evals nightly 36081551337 on an L40S: qwen3.6-27b q4_k_m at a 32k
-    // context asked 256 slots, whose slabs alone overran the 12576 MiB the
-    // card had for the cache rows, and the fit fell to 2 slots — one lane.
-    const ROOM: u64 = 12576 << 20;
-    const ONE_SEQUENCE: u64 = 2400 << 20;
-    const SLAB: u64 = 64 << 20;
-    let slabs_at = |slots: u32| u64::from(slots) * SLAB;
-
-    let slots = state_slots_within(256, ROOM, ONE_SEQUENCE, slabs_at);
-    assert_eq!(slots, 78, "39 seats of two slots, not the floor");
-    assert!(
-        slabs_at(slots) <= (ROOM - ONE_SEQUENCE) / 2
-            && slabs_at(slots + 2) > (ROOM - ONE_SEQUENCE) / 2,
-        "the most whole seats whose slabs leave the pages their half"
-    );
-    assert_eq!(
-        state_slots_within(256, u64::MAX, ONE_SEQUENCE, slabs_at),
-        256,
-        "never more than asked"
-    );
-    assert_eq!(
-        state_slots_within(256, ONE_SEQUENCE, ONE_SEQUENCE, slabs_at),
-        least_state_slots(1),
-        "and never under what one buffered lane holds"
     );
 }
 
@@ -436,54 +401,6 @@ fn the_pool_leaves_room_for_the_programs_guests_register() {
         eta_exec::SCRATCH_MAX_BYTES,
         "and never past what the program contract lets one program take"
     );
-}
-
-fn the_declared_pool_is_sized_to_what_the_card_hands_out() {
-    // gpt-oss-20b at 16 tokens a page: 24 layers of a key and a value plane,
-    // each 512 wide in bf16, so 16 KiB of every page lands in each of 48
-    // planes and each plane is backed in 32 MiB map units. The config's
-    // 256-slot default at a 4096 context asks 65536 pages, the 49152 MiB
-    // pool issue #630 saw declared on a 32 GB card.
-    const PLANES: u64 = 48;
-    const PLANE_PAGE: u64 = 16 * 1024;
-    const MAP_UNIT: u64 = 32 << 20;
-    let declared_at = |pages: u64| PLANES * (pages * PLANE_PAGE).div_ceil(MAP_UNIT) * MAP_UNIT;
-    let asked = 65536;
-    assert_eq!(declared_at(asked), 49152 << 20);
-
-    let room = 13_826_523_136;
-    let fit = pages_within(asked, room, declared_at);
-    assert_eq!(
-        fit, 16384,
-        "256 MiB of every plane, the last unit that fits"
-    );
-    assert!(declared_at(fit) <= room, "what is declared is backed");
-    assert!(
-        declared_at(fit + 1) > room,
-        "and nothing the card could back is left on the table"
-    );
-    assert_eq!(
-        declared_at(fit),
-        12288 << 20,
-        "the step function lands under the room, not at it"
-    );
-
-    assert_eq!(
-        pages_within(asked, 49152 << 20, declared_at),
-        asked,
-        "a pool that fits is the pool that was asked"
-    );
-    assert_eq!(
-        pages_within(asked, u64::MAX, declared_at),
-        asked,
-        "and never more than asked"
-    );
-    assert_eq!(
-        pages_within(asked, PLANES * MAP_UNIT - 1, declared_at),
-        0,
-        "under one map unit a plane, not one page fits, which the caller refuses"
-    );
-    assert_eq!(pages_within(0, room, declared_at), 0);
 }
 
 fn the_whole_card_is_the_arithmetic_the_pool_had_before() {

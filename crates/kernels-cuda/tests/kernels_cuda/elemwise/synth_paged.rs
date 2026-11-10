@@ -4,7 +4,9 @@
 //! the row's columns in a plane of its own (a split's piece), or a paged
 //! cache's row its page and slot name (`page · page_size + slot`, none where
 //! the slot lies past the page or the row is not live), bf16 or e4m3 under a
-//! scale, each element as kernels-ir's `CacheDtype::stored` declares it.
+//! scale, each element as kernels-ir's `CacheDtype::stored` declares it. A
+//! cache whose pages lie a stride apart (rows of other planes between them)
+//! takes the same rows a stride apart, and nothing between.
 
 use crate::common::{Gpu, Lcg, from_bf16};
 use dtype::Dtype::Bf16;
@@ -28,7 +30,23 @@ fn e4m3(byte: u8) -> f32 {
 
 #[test]
 fn a_result_lands_its_window_or_its_cache_row() {
+    lands(0);
+}
+
+#[test]
+fn a_result_lands_in_pages_a_stride_apart() {
+    lands(3);
+}
+
+/// `gap` rows of the plane lie between one page's rows and the next page's.
+fn lands(gap: usize) {
     let (rows, width, page_size, pages) = (7usize, 256usize, 4u32, 4usize);
+    let page_rows = page_size as usize + gap;
+    let page_stride = if gap == 0 {
+        0
+    } else {
+        (page_rows * width) as u32
+    };
     // x · s, landed three ways
     let region = Region {
         width: width as u32,
@@ -45,7 +63,7 @@ fn a_result_lands_its_window_or_its_cache_row() {
     let slot: Vec<i32> = vec![1, 0, 3, 5, 2, 3, 0];
     let valid: Vec<u8> = vec![1, 1, 1, 1, 1, 0, 1];
     let (pg, sl, va) = (gpu.up(&page), gpu.up(&slot), gpu.up(&valid));
-    let cells = page_size as usize * pages;
+    let cells = page_rows * pages;
     let window = gpu.zeros(rows * 128 * 2);
     let bf16_cache = gpu.zeros(cells * width * 2);
     let fp8_cache = gpu.zeros(cells * width);
@@ -60,6 +78,7 @@ fn a_result_lands_its_window_or_its_cache_row() {
         valid: va,
         page_size,
         e4m3,
+        page_stride,
     };
     let scale = 0.5f32;
     let ins = [
@@ -99,7 +118,7 @@ fn a_result_lands_its_window_or_its_cache_row() {
             valid[r] != 0
                 && slot[r] >= 0
                 && (slot[r] as u32) < page_size
-                && page[r] as usize * page_size as usize + slot[r] as usize == cell
+                && page[r] as usize * page_rows + slot[r] as usize == cell
         });
         for c in 0..width {
             let (b, q) = (

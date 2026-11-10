@@ -656,6 +656,7 @@ impl Engine for Cuda {
             )
             .map_err(fault)?;
 
+        let chunk_facts = shell.chunk_facts().map_err(fault)?;
         let trace_name = shell.trace().name.clone();
         let (weight_bytes, arena_bytes, pool_bytes, input_bytes) = shell.footprint();
         let (pool_committed_bytes, pool_high_water_bytes, elastic_page_bytes, elastic_budget_pages) =
@@ -715,7 +716,7 @@ impl Engine for Cuda {
                 seat_to_end: shell.seat_to_end(),
                 seat_spread: shell.seat_spread(),
             },
-            chunks: None,
+            chunks: Some(chunk_facts),
             limits: FireLimits {
                 max_lanes: shell.budget().max_lanes,
                 max_tokens: shell.budget().max_tokens,
@@ -805,6 +806,76 @@ impl Engine for Cuda {
 
     fn commit_pool(&mut self, kv_pages: u32) -> EngineResult<()> {
         self.loaded_mut()?.commit_pool(kv_pages).map_err(fault)
+    }
+
+    fn commit_segments(&mut self, segments: u32) -> EngineResult<()> {
+        self.loaded_mut()?.commit_segments(segments).map_err(fault)
+    }
+
+    fn release_segments(&mut self, segments: u32) -> EngineResult<()> {
+        self.loaded_mut()?.release_segments(segments).map_err(fault)
+    }
+
+    fn evacuate(&mut self, evacuation: &engine::chunk::Evacuation) -> EngineResult<()> {
+        self.loaded_mut()?.evacuate(evacuation).map_err(fault)
+    }
+
+    fn copy_slots(&mut self, copy: &engine::chunk::SlotCopy) -> EngineResult<()> {
+        use crate::store::layout::{FIXED, LIST, WINDOW};
+        let device = |domain| matches!(domain, MemoryDomain::CudaDevice(_));
+        if !device(copy.src) || !device(copy.dst) {
+            return Err(Error::unsupported(
+                "cuda",
+                "copy_slots between tiers: the host and disk tiers of the shared shapes still \
+                 move through copy_kv and copy_state",
+            ));
+        }
+        let shell = self.loaded_mut()?;
+        shell.take_refs();
+        if copy.shape == FIXED {
+            if !copy.runs.is_empty() {
+                return Err(Error::Invalid(
+                    "a fixed record is copied whole, not a run of its tokens".into(),
+                ));
+            }
+            for &(src, dst) in &copy.slots {
+                shell.fork_state(src, dst).map_err(fault)?;
+            }
+            return Ok(());
+        }
+        if copy.shape != LIST && copy.shape != WINDOW {
+            // Any other shape this load states (the rs list): whole slots.
+            if !copy.runs.is_empty() {
+                return Err(Error::Invalid(format!(
+                    "copy_slots names token runs of shape {}, whose slots are copied whole",
+                    copy.shape
+                )));
+            }
+            let pairs: Vec<[u32; 2]> = copy.slots.iter().map(|&(src, dst)| [src, dst]).collect();
+            return shell.copy_whole_slots(copy.shape, &pairs).map_err(fault);
+        }
+        let page = shell.paging().page_size;
+        let runs: Vec<engine::transfer::KvRun> = copy
+            .slots
+            .iter()
+            .map(|&(src, dst)| engine::transfer::KvRun {
+                src_page: src,
+                src_token: 0,
+                dst_page: dst,
+                dst_token: 0,
+                tokens: page,
+            })
+            .chain(copy.runs.iter().map(|run| engine::transfer::KvRun {
+                src_page: run.src,
+                src_token: run.src_token,
+                dst_page: run.dst,
+                dst_token: run.dst_token,
+                tokens: run.tokens,
+            }))
+            .collect();
+        shell
+            .copy_token_slots(copy.shape == WINDOW, &runs)
+            .map_err(fault)
     }
 
     fn submit(&mut self, frame: &FrameSubmission) -> EngineResult<FrameTicket> {
@@ -1251,6 +1322,74 @@ impl Cuda {
                 ))
             })?;
         }
+        // A lane that names slot refs (`Lane::tables`, `Lane::fixed`) is the
+        // runtime's shared pool speaking: its kv and window list tables are its
+        // kv refs, and its recurrent record is the pairs `fixed` names, a
+        // piece each, copied onto the slots the fire writes where the two
+        // differ.
+        use crate::store::layout::{FIXED, LIST, WINDOW};
+        let by_refs = submission.lanes.iter().any(|lane| {
+            !lane.tables.is_empty() || !lane.fixed.is_empty() || !lane.slot_copies.is_empty()
+        });
+        if by_refs {
+            shell.take_refs();
+        }
+        // Every lane's slot copies land before any lane of the fire reads
+        // or writes: a shared tail slot's rows onto the slot it then writes.
+        for lane in &submission.lanes {
+            for (shape, pairs) in &lane.slot_copies {
+                shell.copy_whole_slots(*shape, pairs).map_err(fault)?;
+            }
+        }
+        // Each lane's record: the one it reads and the one its fire writes.
+        let mut records: Vec<Option<(u32, u32)>> = Vec::with_capacity(submission.lanes.len());
+        let mut forked: Vec<(u32, u32)> = Vec::new();
+        for lane in &submission.lanes {
+            let record = match lane.fixed.as_slice() {
+                [] => None,
+                [(shape, pieces)] if *shape == FIXED => {
+                    let runs: Vec<u32> = pieces.iter().map(|[run, _]| *run).collect();
+                    let written: Vec<u32> = pieces.iter().map(|[_, written]| *written).collect();
+                    let run = shell.name_record(&runs).map_err(fault)?;
+                    let written = shell.name_record(&written).map_err(fault)?;
+                    // The lanes of one working set name one pair: copied once.
+                    if run != written && !forked.contains(&(run, written)) {
+                        shell.fork_state(run, written).map_err(fault)?;
+                        forked.push((run, written));
+                    }
+                    Some((run, written))
+                }
+                _ => {
+                    return Err(Error::Invalid(format!(
+                        "lane in slot {} names fixed shapes this load does not state",
+                        lane.slot
+                    )));
+                }
+            };
+            for snap in lane
+                .rs_snapshots
+                .iter()
+                .filter(|snap| !snap.pieces.is_empty())
+            {
+                let named = shell.name_record(&snap.pieces).map_err(fault)?;
+                if named != snap.slot {
+                    return Err(Error::Invalid(format!(
+                        "lane in slot {} snapshots into the record at slot ref {}, whose \
+                         first piece it names {named}",
+                        lane.slot, snap.slot
+                    )));
+                }
+            }
+            records.push(record);
+        }
+        // The lane's list refs are its table of pages, or, where a program
+        // places its rows, the table that translates the program's pages.
+        fn table(lane: &engine::fire::Lane, shape: engine::chunk::ShapeId) -> Option<&[u32]> {
+            lane.tables
+                .iter()
+                .find(|(id, _)| *id == shape)
+                .map(|(_, refs)| refs.as_slice())
+        }
         let seated: Vec<Seated<'_>> = submission
             .lanes
             .iter()
@@ -1263,16 +1402,26 @@ impl Cuda {
                         tokens: &lane.tokens,
                     },
                     positions: &lane.positions,
-                    pages: &lane.kv.pages,
+                    pages: match table(lane, LIST) {
+                        Some(refs) if by_refs && lane.kv.translation.is_empty() => refs,
+                        _ => &lane.kv.pages,
+                    },
                     held: (!lane.kv.pages.is_empty()).then_some(lane.kv.held),
                     kv_less: lane.kv_less,
-                    translation: &lane.kv.translation,
-                    window: &lane.kv.window,
+                    translation: match table(lane, LIST) {
+                        Some(refs) if by_refs && !lane.kv.translation.is_empty() => refs,
+                        _ => &lane.kv.translation,
+                    },
+                    window: match table(lane, WINDOW) {
+                        Some(refs) if by_refs => refs,
+                        _ => &lane.kv.window,
+                    },
                     mask: lane.mask.as_ref(),
                     adapter: lane_adapters[at].or(lane.adapter),
                     rs: lane.rs.clone(),
                     rs_reset: lane.rs_reset,
-                    rs_slot: lane.rs_slot,
+                    rs_slot: records[at].map(|(_, written)| written).or(lane.rs_slot),
+                    rs_read: records[at].map(|(run, _)| run),
                     rs_snapshots: &lane.rs_snapshots,
                     readout: match &lane.readout {
                         Readout::Rows(rows) => Some(rows.as_slice()),

@@ -27,6 +27,7 @@ const WORDS: &[(&str, Reads)] = &[
     ("sync-guard=panic", |d| {
         d.sync_guard == Some(SyncGuard::Panic)
     }),
+    ("chunk-bytes=1048576", |d| d.chunk_bytes == Some(1 << 20)),
 ];
 
 #[test]

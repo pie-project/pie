@@ -178,6 +178,10 @@ pub struct Segments {
     pub pieces: u32,
 
     pub piece_off: i64,
+
+    /// The atoms a piece holds, where the pieces are not an equal split of
+    /// the row's atoms (the last one padded past them); 0: `atoms / pieces`.
+    pub piece_atoms: u32,
 }
 
 impl Segments {
@@ -187,6 +191,7 @@ impl Segments {
         seg_chunks: 0,
         pieces: 1,
         piece_off: 0,
+        piece_atoms: 0,
     };
 
     /// Where `op`'s rows of `slab` live, named by the ids `ids`, a row
@@ -201,9 +206,18 @@ impl Segments {
     ) -> Result<StateRows, crate::error::Error> {
         let refuse = |detail: String| crate::error::Error::Backend { op, detail };
         let pieces = self.pieces.max(1);
-        if atoms == 0 || !atoms.is_multiple_of(pieces) {
+        let per_piece = if self.piece_atoms != 0 {
+            self.piece_atoms
+        } else {
+            atoms / pieces
+        };
+        if atoms == 0
+            || (self.piece_atoms == 0 && !atoms.is_multiple_of(pieces))
+            || u64::from(per_piece) * u64::from(pieces) < u64::from(atoms)
+            || u64::from(per_piece) * u64::from(pieces - 1) >= u64::from(atoms)
+        {
             return Err(refuse(format!(
-                "a state row of {atoms} atoms does not split into {pieces} equal pieces"
+                "a state row of {atoms} atoms does not lie in {pieces} pieces of {per_piece}"
             )));
         }
         if !self.table.is_absent() && self.seg_chunks == 0 {
@@ -222,7 +236,7 @@ impl Segments {
             off: self.piece_off,
             seg_chunks: narrow(self.seg_chunks, "chunks a segment")?,
             pieces: narrow(pieces, "pieces a row")?,
-            atoms: narrow(atoms / pieces, "atoms a piece")?,
+            atoms: narrow(per_piece, "atoms a piece")?,
             pad: 0,
         })
     }

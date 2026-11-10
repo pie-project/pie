@@ -805,8 +805,8 @@ impl FrameShell for Shell {
         let mut writes: Vec<Option<(i32, i32)>> = Vec::with_capacity(rows as usize);
         let mut slot_ids: Vec<i32> = Vec::with_capacity(lanes.len());
         let mut fresh: Vec<u32> = Vec::new();
-        let mut rs_pages_named = 0u32;
         let mut rs_moves: Vec<RsMove<'a>> = Vec::with_capacity(lanes.len());
+        let mut rs_pages: Vec<u32> = Vec::new();
         let mut rs_reads: Vec<Vec<std::ops::Range<u32>>> = vec![Vec::new(); lanes.len()];
         let mut rs_folded: Vec<Option<u32>> = vec![None; lanes.len()];
         let mut rs_lens: Vec<i32> = Vec::with_capacity(lanes.len());
@@ -993,28 +993,30 @@ impl FrameShell for Shell {
             let fire_lane = rs_moves.len();
             rs_order[row.source as usize] = fire_lane as u32;
             let port = envelope_of[source].and_then(|(held, _)| resolved[held].fold.as_deref());
-            if let RsVerb::Buffer { pages, .. } = &seated.rs {
-                rs_pages_named =
-                    rs_pages_named.max(pages.iter().copied().max().map_or(0, |page| page + 1));
-            }
             let (verb, folded) = match &seated.rs {
-                RsVerb::Fold => (RsMove::None, row.rows),
+                RsVerb::Fold => {
+                    // A lane that folds its rows itself leaves nothing ahead:
+                    // a working set new to this record starts so.
+                    let slot = seated.rs_slot.unwrap_or(lane.slot);
+                    fold_held(&mut self.rs_ahead, slot, None, false);
+                    (RsMove::None, row.rows)
+                }
                 RsVerb::Buffer {
                     pages,
                     base,
                     folded,
                     fold,
                 } => {
+                    rs_pages.extend_from_slice(pages);
                     // A device-counted fold not yet settled left the state
                     // past the runtime's length.
                     let slot = seated.rs_slot.unwrap_or(lane.slot);
-                    let folded = &match self.rs_ahead.get(&slot) {
-                        Some(&at) if at > *folded && seated.rs_reset != RsReset::Fresh => at,
-                        _ => {
-                            self.rs_ahead.remove(&slot);
-                            *folded
-                        }
-                    };
+                    let folded = &fold_held(
+                        &mut self.rs_ahead,
+                        slot,
+                        Some(*folded),
+                        seated.rs_reset == RsReset::Fresh,
+                    );
                     let stated = match &ports {
                         Some(ports) => ports.slots(row.rows as usize)?,
                         None => None,
@@ -1074,10 +1076,14 @@ impl FrameShell for Shell {
                     ),
                 });
             }
-            if verb != RsMove::None
-                && let Some(buffers) = self.buffers.as_mut()
+            // A lane that folds nothing reads the state as it stood before
+            // the fire, while the lane beside it folds into the record the
+            // fire writes: the two never meet in one row.
+            if matches!(verb, RsMove::Scatter { fold: 0, .. })
+                && let Some(read) = seated.rs_read
+                && let Some(named) = slot_ids.last_mut()
             {
-                buffers.ensure(&mut self.pools, rs_pages_named)?;
+                *named = read as i32;
             }
             rs_moves.push(verb);
             rs_lens.push(narrow(u64::from(folded)));
@@ -1242,6 +1248,8 @@ impl FrameShell for Shell {
                 .map(|(((seat, table), ids), &kv_less)| {
                     if kv_less {
                         Ok(table.to_vec())
+                    } else if self.pools.by_refs() {
+                        window_refs(&paging, seat, ids)
                     } else {
                         kv::window_table(&paging, seat, table, ids)
                     }
@@ -1259,6 +1267,12 @@ impl FrameShell for Shell {
             .flat_map(|(table, _)| table.iter().map(|&page| u64::from(page)))
             .collect();
         self.pools.commit_frame(demand, &kv_ranges, &window_pages)?;
+        // The rs buffer pages the lanes name, seated before a row lands.
+        self.pools.seat_rs(&rs_pages)?;
+        // The records as the kernels read them: each row's pieces by the
+        // ids of the slots they lie in, table after table.
+        let device_slot_ids = self.pools.state_tables(&slot_ids)?;
+        snapshots.slots = self.pools.snapshot_tables(&snapshots.slots)?;
         self.pools
             .fence_swaps(self.device.stream(), &kv_ranges, &window_pages)?;
         super::btrace::mark("commit_frame");
@@ -1268,7 +1282,7 @@ impl FrameShell for Shell {
         let window_refs: Vec<&[u32]> = window_tables.iter().map(Vec::as_slice).collect();
         let mut geometries = (0..self.spaces)
             .map(|space| {
-                if self.pools.windowed_space(space as u32) {
+                if self.pools.windowed_geometry(space) {
                     kv::geometry_with(&paging, &seats, &window_refs)
                 } else {
                     kv::geometry_with(&paging, &seats, &table_refs)
@@ -1288,7 +1302,7 @@ impl FrameShell for Shell {
                     .unwrap_or(0)
             };
             for (space, geometry) in geometries.iter_mut().enumerate() {
-                let windowed = self.pools.windowed_space(space as u32);
+                let windowed = self.pools.windowed_geometry(space);
                 for (row, stated) in writes.iter().enumerate() {
                     let Some((page, offset)) = *stated else {
                         continue;
@@ -1334,6 +1348,14 @@ impl FrameShell for Shell {
         let pages = geometries
             .first()
             .map_or(0, |geometry| geometry.indices.len() as u32);
+        // The tables as the kernels read them: each page by the id of the
+        // slot it is seated on in the state pool.
+        let mut device_geometries = geometries.clone();
+        for (space, geometry) in device_geometries.iter_mut().enumerate() {
+            let windowed = self.pools.windowed_geometry(space);
+            self.pools.page_ids(windowed, &mut geometry.indices)?;
+            self.pools.page_ids(windowed, &mut geometry.write_page)?;
+        }
 
         super::btrace::mark("admit");
         let bucket = self
@@ -1396,7 +1418,7 @@ impl FrameShell for Shell {
                     crate::window::Copies {
                         bucket,
                         enabled: copies_here,
-                        spaces: &geometries,
+                        spaces: &device_geometries,
                     },
                     self.inputs.window_slots(),
                 )?;
@@ -1517,7 +1539,7 @@ impl FrameShell for Shell {
             if any_adapter {
                 adapter_routes.resize(carve_rows as usize, -1);
             }
-            for geometry in &mut geometries {
+            for geometry in geometries.iter_mut().chain(&mut device_geometries) {
                 geometry.write_page.resize(carve_rows as usize, -1);
                 geometry.write_offset.resize(carve_rows as usize, -1);
             }
@@ -1528,7 +1550,7 @@ impl FrameShell for Shell {
         if bodied {
             let capacity = crate::window::lane_capacity(max_lanes);
             lane_carve = lane_carve.max(capacity);
-            for geometry in &mut geometries {
+            for geometry in geometries.iter_mut().chain(&mut device_geometries) {
                 geometry.pad_to(capacity as usize);
             }
             qo_absolute = windows.qo_absolute_host().to_vec();
@@ -1558,7 +1580,8 @@ impl FrameShell for Shell {
                 qo_absolute: &qo_absolute,
                 live: if bodied { windows.live() } else { &[] },
                 slot_ids: &slot_ids,
-                spaces: &geometries,
+                state_ids: &device_slot_ids,
+                spaces: &device_geometries,
                 mask: staged.as_ref(),
                 adapter_routes: any_adapter.then_some(adapter_routes.as_slice()),
                 live_rows: rows,
@@ -1584,7 +1607,7 @@ impl FrameShell for Shell {
             0
         };
         let placed = match geometries.as_slice() {
-            [space] if !self.pools.windowed_space(0) => Some(space),
+            [space] if !self.pools.windowed_geometry(0) => Some(space),
             _ => None,
         };
         let kv_reports: Vec<super::KvReport> = composition
@@ -1759,6 +1782,62 @@ fn stated_fold(len: FoldLen, lane: usize, port: Option<&[u32]>) -> Result<u32> {
     })
 }
 
+/// The slots the state in record `slot` holds as a lane's fire finds it.
+/// A buffered lane states `folded`, which a device-counted fold not yet
+/// settled has left behind what `ahead` holds; a lane that starts fresh, or
+/// folds its rows itself (`None`: a working set new to the record starts
+/// with such a fire), leaves nothing ahead.
+fn fold_held(
+    ahead: &mut std::collections::HashMap<u32, u32>,
+    slot: u32,
+    folded: Option<u32>,
+    fresh: bool,
+) -> u32 {
+    match (ahead.get(&slot), folded) {
+        (Some(&at), Some(folded)) if at > folded && !fresh => at,
+        (_, folded) => {
+            ahead.remove(&slot);
+            folded.unwrap_or(0)
+        }
+    }
+}
+
+/// A lane's windowed table where it names window list slot refs: a page wholly
+/// behind the window of the lane's first row reads the null slot, the rest
+/// the refs the lane was handed, one a page of its table.
+fn window_refs(paging: &kv::Paging, seat: &kv::Seat, refs: &[u32]) -> Result<Vec<u32>> {
+    let Some(window) = paging.window else {
+        return Ok(refs.to_vec());
+    };
+    let page_size = u64::from(paging.page_size);
+    let pages = (u64::from(seat.have) + u64::from(seat.rows))
+        .div_ceil(page_size)
+        .max(1);
+    let first = u64::from(seat.have.saturating_sub(window.tokens)) / page_size;
+    (0..pages)
+        .map(|page| {
+            if page < first {
+                return Ok(0);
+            }
+            match refs.get(page as usize) {
+                Some(&slot) if slot != 0 => Ok(slot),
+                Some(_) => Err(Fault::Unbound {
+                    what: format!(
+                        "windowed page {page} of a lane holding {} tokens, which its window \
+                         still reads and the runtime has released",
+                        seat.have
+                    ),
+                }),
+                None => Err(Fault::Ceiling {
+                    what: "window list slot refs this lane stated",
+                    need: page + 1,
+                    have: refs.len() as u64,
+                }),
+            }
+        })
+        .collect()
+}
+
 fn narrow(n: u64) -> i32 {
     i32::try_from(n).unwrap_or(i32::MAX)
 }
@@ -1864,7 +1943,7 @@ impl Shell {
 
 #[cfg(test)]
 mod tests {
-    use super::readout_extent;
+    use super::{fold_held, readout_extent};
 
     #[test]
     fn a_readout_as_tall_as_the_fire_holds_the_bucket() {
@@ -1872,5 +1951,24 @@ mod tests {
         assert_eq!(readout_extent(133, 256, 5), 5);
         assert_eq!(readout_extent(133, 133, 133), 133);
         assert_eq!(readout_extent(0, 64, 0), 0);
+    }
+
+    /// A device-counted fold left record 3's state at slot 92; the record
+    /// then went to a new working set, whose prefill folds its own rows. Its
+    /// buffered fires read the state where they state it, not at 92.
+    #[test]
+    fn a_folding_lane_forgets_the_fold_a_record_was_left_ahead_at() {
+        let mut ahead = std::collections::HashMap::from([(3u32, 92u32), (5, 40)]);
+        // The working set the fold was counted for still reads it ahead.
+        assert_eq!(fold_held(&mut ahead, 3, Some(60), false), 92);
+        // A new working set's prefill on the record.
+        fold_held(&mut ahead, 3, None, false);
+        assert_eq!(fold_held(&mut ahead, 3, Some(28), false), 28);
+        // A fresh buffered lane forgets it too, and a settled fold is past it.
+        assert_eq!(fold_held(&mut ahead, 5, Some(12), true), 12);
+        assert!(ahead.is_empty());
+        ahead.insert(7, 40);
+        assert_eq!(fold_held(&mut ahead, 7, Some(48), false), 48);
+        assert!(ahead.is_empty());
     }
 }

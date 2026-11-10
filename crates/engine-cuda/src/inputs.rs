@@ -255,7 +255,12 @@ pub struct Fire<'a> {
     pub windows: &'a [i32],
     pub qo_absolute: &'a [i32],
     pub live: &'a [u32],
+    /// The record each lane names (under zero: none), a lane each.
     pub slot_ids: &'a [i32],
+    /// The ids the recurrent kernels read the records by: `slot_ids`
+    /// rewritten a lane each, or a block of lanes a table of pieces
+    /// (`Pools::state_tables`).
+    pub state_ids: &'a [i32],
     pub adapter_routes: Option<&'a [i32]>,
     pub readout_rows: &'a [i32],
     pub readout_live: u32,
@@ -350,6 +355,8 @@ pub struct Staged {
     mask_bytes: Option<u32>,
     space_indices: Vec<u32>,
     space_lanes: u32,
+    /// The ids staged for the recurrent rows.
+    state_ids: u32,
     packed: bool,
 }
 
@@ -557,6 +564,7 @@ impl Inputs {
         selections: usize,
         masked: bool,
         schedule_streams: &[Option<u32>],
+        state_ids: u32,
     ) -> Result<Inputs> {
         let rows = u64::from(budget.max_tokens);
         let lanes = u64::from(crate::window::lane_capacity(budget.max_lanes));
@@ -580,7 +588,7 @@ impl Inputs {
         let live_ints = live_seat.words();
         let live_rows = take(live_ints * 4);
         let row_valid = take(rows);
-        let slot_ids = take(lanes * 4);
+        let slot_ids = take(lanes * 4 * u64::from(state_ids.max(1)));
         let adapter_routes = take(rows * 4);
         let readout_rows = take(rows * 4);
         let readout_live = take(4);
@@ -885,8 +893,14 @@ impl Inputs {
             bytes_of(fire.lane_of_row),
             "staged lane of row",
         )?;
-        put(self.slot_ids, bytes_of(fire.slot_ids), "staged slot ids")?;
-        if space_lanes > lanes {
+        put(self.slot_ids, bytes_of(fire.state_ids), "staged slot ids")?;
+        let tabled = fire.state_ids.len() != fire.slot_ids.len();
+        let state_ids = if tabled {
+            fire.state_ids.len() as u32
+        } else {
+            space_lanes
+        };
+        if space_lanes > lanes && !tabled {
             let inert = vec![-1i32; (space_lanes - lanes) as usize];
             put(
                 self.slot_ids + u64::from(lanes) * 4,
@@ -1030,6 +1044,7 @@ impl Inputs {
             mask_bytes,
             space_indices,
             space_lanes,
+            state_ids,
             packed,
         })
     }
@@ -1175,6 +1190,7 @@ impl Inputs {
             mask_bytes,
             space_indices,
             space_lanes,
+            state_ids,
             packed,
         } = staged;
         let readouts = *readouts;
@@ -1234,7 +1250,7 @@ impl Inputs {
         copy(at_lane_of_row, rows as usize * 4)?;
         copy(at_readouts, readouts as usize * 4)?;
         copy(at_readout_live, 4)?;
-        copy(at_slot_ids, space_lanes as usize * 4)?;
+        copy(at_slot_ids, *state_ids as usize * 4)?;
         if let Some(routes) = adapter_rows {
             copy(at_routes, *routes as usize * 4)?;
         }

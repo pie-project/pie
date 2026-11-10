@@ -132,6 +132,8 @@ pub struct PoolSlabs {
     pub state_score: Tensor,
 
     pub ape: Tensor,
+    /// The state's elements from one page's rows to the next page's.
+    pub stride: i64,
 }
 
 #[derive(Clone, Debug)]
@@ -144,6 +146,8 @@ pub struct FireTables {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RsMove<'a> {
     None,
+    /// The lane's rows land in its rs buffer pages `pages`, from token `at`
+    /// of them.
     Scatter {
         pages: &'a [u32],
         at: u32,
@@ -206,6 +210,7 @@ impl RsScratch {
 #[derive(Debug, Clone, Copy)]
 pub struct RsSeat<'a> {
     pub buffers: &'a crate::store::rs::Buffers,
+    pub pools: &'a crate::store::Pools,
     pub lanes: &'a [RsMove<'a>],
     pub reads: &'a [Vec<std::ops::Range<u32>>],
     pub scratch: Option<&'a RsScratch>,
@@ -251,20 +256,15 @@ impl RsSeat<'_> {
                     have: capacity,
                 });
             }
+            // A page's rows of a plane lie one after another: a run a page.
             let mut done = 0u32;
             while done < count {
                 let token = from + done;
-                let page = token / page_tokens;
-                let in_page = token % page_tokens;
+                let (page, in_page) = (token / page_tokens, token % page_tokens);
                 let take = (page_tokens - in_page).min(count - done);
-                let page_slot = *pages
-                    .get(page as usize)
-                    .ok_or(crate::error::Fault::Ceiling {
-                        what: "rs buffer pages",
-                        need: u64::from(page) + 1,
-                        have: pages.len() as u64,
-                    })?;
-                let slab = self.buffers.row(plane, page_slot, in_page)?;
+                let slab = self
+                    .buffers
+                    .row(self.pools, plane, pages[page as usize], in_page)?;
                 let rows_at =
                     rows.ptr + (u64::from(pair[0] as u32) + u64::from(done)) * plane.width * elem;
                 let bytes =
@@ -291,8 +291,7 @@ impl RsSeat<'_> {
         let mut done = 0u32;
         while done < count {
             let token = from + done;
-            let page = token / page_tokens;
-            let in_page = token % page_tokens;
+            let (page, in_page) = (token / page_tokens, token % page_tokens);
             let take = (page_tokens - in_page).min(count - done);
             let page_slot = *pages
                 .get(page as usize)
@@ -301,7 +300,7 @@ impl RsSeat<'_> {
                     need: u64::from(page) + 1,
                     have: pages.len() as u64,
                 })?;
-            let slab = self.buffers.row(plane, page_slot, in_page)?;
+            let slab = self.buffers.row(self.pools, plane, page_slot, in_page)?;
             runs.push(kernels_cuda::runtime::channel::WordRun {
                 src: slab,
                 dst_word: dst_word_base + done * row_words,
@@ -344,7 +343,10 @@ pub struct FireBindings {
     pub group_masks: Vec<crate::inputs::GroupMaskHandles>,
     pub inputs: Vec<InputBinding>,
 
+    /// The fire's page tables, one a kv shape.
     pub geometry: Vec<CacheGeometry>,
+    /// The page table each kv space of the trace reads: its shape's.
+    pub geometry_of: Vec<u32>,
 
     pub schedules: Vec<Option<ScheduleSeat>>,
     pub plan_values: usize,
@@ -1074,7 +1076,7 @@ impl<'c> Run<'c> {
         for (r, &(begin, replay, rows)) in lanes.iter().enumerate() {
             if replay > 0
                 && let Some(plane) = plane
-                && let Some(RsMove::Scatter { pages, .. }) = seat.lanes.get(lane0 + r)
+                && let Some(&RsMove::Scatter { pages, .. }) = seat.lanes.get(lane0 + r)
             {
                 if plane.width != u64::from(own.width) {
                     return Err(kernels_cuda::Error::Backend {
@@ -1582,7 +1584,7 @@ impl<'c> Run<'c> {
             .as_ref()
             .expect("`compacted` is reached only through a gathered window");
         if let Def::Input(RuntimeInput::Geometry { space, kind }) = &self.values[at].def {
-            let Some(space) = gathered.spaces.get(*space as usize) else {
+            let Some(space) = gathered.spaces.get(self.geometry_at(*space)) else {
                 return handle;
             };
             return match kind {
@@ -2181,7 +2183,7 @@ impl<'c> Run<'c> {
             CachePool::Kv { space, pool } => {
                 let window = self.window().span();
                 if let Some(gathered) = &self.window().gathered {
-                    let seat = gathered.spaces.get(*space as usize);
+                    let seat = gathered.spaces.get(self.geometry_at(*space));
                     return KvPool {
                         page_indptr: seat.map_or(pool.page_indptr, |seat| seat.page_indptr),
                         page_indices: seat.map_or(pool.page_indices, |seat| seat.page_indices),
@@ -2222,7 +2224,12 @@ impl<'c> Run<'c> {
             let CachePool::Kv { space, .. } = self.cache(id) else {
                 return None;
             };
-            let seat = self.fire.geometry.get(*space as usize)?.planning.as_ref()?;
+            let seat = self
+                .fire
+                .geometry
+                .get(self.geometry_at(*space))?
+                .planning
+                .as_ref()?;
             u32::try_from(*seat.kv_indptr.get(lane as usize)?).ok()
         };
         let pages = window
@@ -2376,8 +2383,16 @@ impl<'c> Run<'c> {
         }
     }
 
+    /// The page table of the fire's that kv space `space` reads.
+    fn geometry_at(&self, space: u32) -> usize {
+        self.fire
+            .geometry_of
+            .get(space as usize)
+            .map_or(0, |&at| at as usize)
+    }
+
     fn geometry(&self, at: usize, space: u32) -> &CacheGeometry {
-        let space = space as usize;
+        let space = self.geometry_at(space);
         self.fire.geometry.get(space).unwrap_or_else(|| {
             panic!(
                 "value {at} names cache space {space}, and this fire binds {} geometry spaces",
@@ -2449,7 +2464,7 @@ impl<'c> Run<'c> {
         let (kv_indptr, kv_len) = match window
             .gathered
             .as_ref()
-            .and_then(|g| g.spaces.get(*space as usize))
+            .and_then(|g| g.spaces.get(self.geometry_at(*space)))
         {
             Some(gathered) => (
                 gathered.page_indptr_host.as_slice(),

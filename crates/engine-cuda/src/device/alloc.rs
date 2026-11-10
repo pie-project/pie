@@ -1080,6 +1080,21 @@ pub fn copy_batch(
     to_host: bool,
     spans: &[(u64, u64, usize)],
 ) -> Result<()> {
+    batch(stream, !to_host, to_host, spans)
+}
+
+/// Copies every `(dst, src, bytes)` span within the device in one call, in
+/// the stream's order: what moves a pool's chunks out of a segment.
+pub fn copy_batch_d2d(stream: *mut core::ffi::c_void, spans: &[(u64, u64, usize)]) -> Result<()> {
+    batch(stream, false, false, spans)
+}
+
+fn batch(
+    stream: *mut core::ffi::c_void,
+    src_host: bool,
+    dst_host: bool,
+    spans: &[(u64, u64, usize)],
+) -> Result<()> {
     let live: Vec<(u64, u64, usize)> = spans.iter().copied().filter(|s| s.2 > 0).collect();
     #[cfg(all(feature = "cuda", not(feature = "rocm")))]
     if live.len() > 1 {
@@ -1104,11 +1119,8 @@ pub fn copy_batch(
                 type_: rt::cudaMemLocationType::cudaMemLocationTypeDevice,
                 id: device,
             };
-            let (src_hint, dst_hint) = if to_host {
-                (on_device, host)
-            } else {
-                (host, on_device)
-            };
+            let hint = |on_host: bool| if on_host { host } else { on_device };
+            let (src_hint, dst_hint) = (hint(src_host), hint(dst_host));
             let mut attrs = [rt::cudaMemcpyAttributes {
                 srcAccessOrder: rt::cudaMemcpySrcAccessOrder::cudaMemcpySrcAccessOrderStream,
                 srcLocHint: src_hint,
@@ -1139,7 +1151,7 @@ pub fn copy_batch(
         }
     }
     #[cfg(not(all(feature = "cuda", not(feature = "rocm"))))]
-    let _ = to_host;
+    let _ = (src_host, dst_host);
     for (dst, src, bytes) in live {
         copy_any(stream, dst, src, bytes)?;
     }
