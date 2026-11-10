@@ -172,3 +172,18 @@ The `new-memory/` directory is bookkeeping and is removed before anything lands 
 - Verified on new-memory: runtime lib 205/205 (1 ignored), engine lib 40/40.
 - Running: P4, P5 (CUDA degenerate kernels), P8 (golden baseline), R2 (stores on SlotPool), WC1 (compiler
   streamability), WC3 (CUDA expert table).
+
+### M9 — 2026-11-10: P5 CUDA state segments and P8 golden probe merged; speed rule
+- Rule (user): no full test suites; `cargo check` + tests for the changed code only (spec "Verification rules").
+- **P5** (2fd2b2c20): every CUDA state kernel (GDN step/chunked incl. sm80/sm100, KDA, Mamba-2, conv1d x8, Wan frame
+  cache gather/store, replay_floor, ngram) addresses rows via `StateRows{base, segs, ids, chunk, off, seg_chunks,
+  pieces, atoms}`; `Segments::ONE` = today's `base + slot*stride`. Frame cache cut along slab axis-0 rows
+  (frame x spatial). Bitwise tests: slot layout vs pieces shuffled across two segments with garbage — identical,
+  wrong offset fails. Not GPU-tested here: sm100 tcgen05 walk; engine-cuda suite only built. Still contiguous:
+  host-side copy_slot/zero_slot/state_spans and the engine's per-lane slot tables (needs piece-aware ids).
+- **P8** (e536895fe): `engine-cuda/tests/engine_cuda/golden_logits.rs` (ignored tests; `golden_fixtures` then
+  `golden_logits::golden_logits` under the GPU lock; `PIE_GOLDEN_CACHE` keeps checkpoints + recorded cuBLAS picks so
+  separate processes match). 8 miniatures (dense, sliding+global, GDN hybrid, mamba+MoE, compressed pools, dense,
+  lightning+full, windowed/full), 12 hashed steps each; base hashes in GOLDEN-LOGITS-BASE.txt. Determinism proven for
+  qwen3/qwen35 across processes; other six recorded once. Baseline failures (partial) in BASELINE-FAILURES.md.
+- Running: P4 (CUDA kv stride), R2 (stores on SlotPool), WC1 (compiler streamability), WC3 (CUDA expert table).

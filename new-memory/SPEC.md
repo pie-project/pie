@@ -20,7 +20,9 @@ must need one poem line and no engine change.
    A ring with a small static cap folds into fixed. Fixed records larger than C split into equal pieces that never
    cross an op's atom (GDN/KDA/mamba: head axis; conv: channel; conv3d frame cache: frame-position axis 0;
    attention: token; n-gram ids: uncuttable). Do not cut pieces below 1MiB until prefill GDN is measured.
-   Two fixed sets per working set (running + same-fire copy-on-write) — derived, not configured.
+   Fixed sets: ONE per working set (resting or running) plus ONE copy-on-write set per lane that runs in a fire
+   (fork / snapshot restore within the same fire) — i.e. the CoW reserve scales with max lanes, not with working
+   sets. Derived, not configured. (Earlier text said "two per working set": that was wrong.)
 5. Working set is logical: slots are refcounted; holders = working sets, prefix-cache entries, snapshots.
 6. Budget: `state chunks + act_chunks(rung) <= total chunks`. No rs:kv ratio, no `max_state_slots`, no kv budget knob.
 7. Roles: memory governor (runtime/governor.rs) decides HOW MUCH (target bytes); PLEX (policy) decides WHAT stays;
@@ -48,6 +50,9 @@ must need one poem line and no engine change.
    deleted right after each backend verifies; removed config keys are rejected with a clear message.
 
 ## Verification rules
+- SPEED RULE (user, 2026-11-10): do NOT run full test suites. Run `cargo check` plus only the tests that exercise
+  what you changed (filter by module/test name) and the new tests you wrote. Bitwise checks for the kernel family
+  you touched still count as necessary; unrelated suites and catalog-wide sweeps do not.
 - Bitwise comparisons: same process, or share the GEMM algorithm cache (cuBLAS picks algorithms per process).
   Concurrent requests can diverge by batching timing; keep them out of bitwise sets.
 - Known pre-existing failures on main (do not chase, but confirm on main before claiming a regression):
@@ -65,3 +70,22 @@ must need one poem line and no engine change.
   Never push to `main`, `state-chunk` or `new-memory`; the coordinator merges.
 - Before starting, make sure your branch is based on `origin/state-chunk` or later `origin/new-memory` (run `git fetch origin` and rebase if not).
 - Follow CONTRIBUTING.md and the repo's existing style; run clippy/rustfmt on crates you touch.
+
+## Weight cache (MoE experts, PLE) — decided 2026-11-09
+- Routed experts (expert axis) and PLE / token-id-gathered table rows (row blocks) live in the chunk pool as
+  read-only **weight slots** owned by a weight-cache holder. Everything else (attention, shared experts, router,
+  embedding/head, norms) stays resident as today. Dense-weight streaming is out of scope.
+- No new poem declaration: the compiler infers streamability from the reading op — read only by a router-selected
+  MoE op => expert-streamable (atom = expert); read only by a token-id row gather => row-streamable (atom = row block);
+  anything else or mixed => resident. `Weight::host()` / `ParamPlacement::Host` are replaced by this inference and
+  deleted. The result goes into `ChunkRecipe` as weight slot shapes.
+- Deployment mode `weight_streaming = auto | on | off` (auto: off if the model fits, else on).
+  off: weights never evicted; pressure goes to KV/state via tier-pressure (PLEX). on: under pressure, weight slots are
+  evicted FIRST down to the floor, then KV/state via PLEX. Recovery: live KV/state first, then weights refill.
+- Floor: MoE = current layer + next layer staging (double buffer) of top-k experts; PLE = this fire's rows.
+- Residency inside the weight cache: LRU order, but (1) a miss never inserts into the cache — it streams through a
+  staging slot and is dropped; (2) cache membership changes only at the governor tick (~1s) from the use record of
+  the last window. This prevents thrashing on the per-token layer cycle. The runtime/engine decides (not PLEX).
+- Kernels: MoE kernels take an expert -> (chunk, offset) table (degenerate = today's contiguous expert bank);
+  inside CUDA graphs, missing experts are filled into staging by a zero-copy gather kernel reading pinned host memory.
+  PLE is first (rows are known before the fire).
