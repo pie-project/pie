@@ -718,3 +718,180 @@ fn an_engine_that_does_not_stream_boots_as_before() {
     let mut pool = WeightFirst::new(inner, cache, Plain);
     pool.boot().expect("unsupported is no refusal");
 }
+
+// ---- adopting the load's own seating ----
+
+/// Weight shape `id` of `count` atoms `per_chunk` to a chunk, its floor
+/// `floor`, the load having seated atom `a` at slot ref `seated + a`.
+fn seated(id: u32, count: u32, per_chunk: u32, floor: u32, seated: u32) -> WeightShape {
+    WeightShape {
+        id: EngineShape(id),
+        slots_per_chunk: per_chunk,
+        seated: Some(seated),
+        ..experts(count, floor)
+    }
+}
+
+/// As [`pool`], with every shape of `weights` after the kv shape.
+fn pool_of(chunks: u32, weights: &[WeightShape]) -> SlotPool {
+    let mut shapes = vec![SlotShape {
+        kind: ShapeKind::List,
+        slot_bytes: MIB,
+        slots_per_chunk: 1,
+    }];
+    shapes.extend(pool_shapes(weights));
+    SlotPool::new(SlotPoolFacts {
+        chunk_bytes: MIB,
+        total_chunks: chunks,
+        segment_chunks: SEGMENT,
+        committed_segments: chunks / SEGMENT,
+        reserved_chunks: 1,
+        shapes,
+        act_chunks: Vec::new(),
+    })
+}
+
+/// What the engine hears at load from the cache `boot_cache` builds.
+fn booted(
+    engine: usize,
+    mode: WeightStreaming,
+    weights: &[WeightShape],
+    chunks: u32,
+) -> WeightResidency {
+    set_streaming(engine, false);
+    let mut slots = pool_of(chunks, weights);
+    let cache = boot_cache(engine, mode, weights, WEIGHTS, &mut slots).unwrap();
+    let fake = FakeEngine::default();
+    let inner = Inner { slots, floor: 0 };
+    let mut pool = WeightFirst::new(inner, cache, fake.clone());
+    pool.boot().unwrap();
+    let told = fake.0.lock().unwrap().told.clone();
+    assert_eq!(told.len(), 1, "the engine heard once at load");
+    told.into_iter().next().unwrap()
+}
+
+fn slots_of(residency: &WeightResidency, shape: u32) -> Vec<(u32, u32)> {
+    residency
+        .resident
+        .iter()
+        .filter(|resident| resident.atom.shape == EngineShape(shape))
+        .map(|resident| (resident.atom.atom, resident.slot))
+        .collect()
+}
+
+fn staging_of(residency: &WeightResidency, shape: u32) -> Vec<u32> {
+    residency
+        .staging
+        .iter()
+        .find(|(id, _)| *id == EngineShape(shape))
+        .map(|(_, slots)| slots.clone())
+        .unwrap_or_default()
+}
+
+#[test]
+fn a_held_shape_the_load_seated_is_named_exactly_where_it_lies() {
+    for mode in [WeightStreaming::Off, WeightStreaming::Auto] {
+        // Ten atoms four to a chunk, seated from chunk 2 (slot ref 8):
+        // chunk 1 below stays free, so lowest-first would have moved them.
+        let shape = seated(7, 10, 4, 2, 8);
+        let told = booted(9_021, mode, &[shape], 32);
+        assert!(told.held, "{mode:?}: held");
+        assert_eq!(
+            slots_of(&told, 7),
+            (0..10).map(|a| (a, 8 + a)).collect::<Vec<_>>(),
+            "{mode:?}: atom a at the seated slot ref 8 + a"
+        );
+        let staging = staging_of(&told, 7);
+        assert_eq!(staging.len(), 2);
+        assert!(
+            staging.iter().all(|slot| !(8..18).contains(slot)),
+            "{mode:?}: the staging lies apart from the seated atoms: {staging:?}"
+        );
+    }
+}
+
+#[test]
+fn two_shapes_seated_back_to_back_both_stay_put() {
+    // The first fills chunks 1-2 whole, so its staging opens a fresh chunk:
+    // taken before the second shape's claim, it would be chunk 3, the
+    // second's.
+    let a = seated(7, 8, 4, 2, 4);
+    let b = seated(8, 3, 2, 1, 6);
+    let told = booted(9_022, WeightStreaming::Off, &[a, b], 32);
+    assert!(told.held);
+    assert_eq!(
+        slots_of(&told, 7),
+        (0..8).map(|a| (a, 4 + a)).collect::<Vec<_>>()
+    );
+    assert_eq!(
+        slots_of(&told, 8),
+        (0..3).map(|a| (a, 6 + a)).collect::<Vec<_>>()
+    );
+    // The second's staging takes the free slot of its last chunk (ref 9);
+    // the first's a chunk of its own past both (chunk 5, refs 20..).
+    assert_eq!(staging_of(&told, 8), [9]);
+    assert_eq!(staging_of(&told, 7), [20, 21]);
+}
+
+#[test]
+fn auto_streaming_a_seated_shape_keeps_what_fits_where_it_was_seated() {
+    let engine = 9_023;
+    // Forty atoms two to a chunk (20 chunks) against 15 free: auto streams.
+    let shape = seated(7, 40, 2, 2, 2);
+    let told = booted(engine, WeightStreaming::Auto, &[shape], 16);
+    assert!(streaming(engine), "auto streams what the pool cannot seat");
+    assert!(!told.held);
+    // One chunk left for the floor: 14 seated chunks kept, atoms 0..28.
+    assert_eq!(
+        slots_of(&told, 7),
+        (0..28).map(|a| (a, 2 + a)).collect::<Vec<_>>(),
+        "every atom kept at its seated slot"
+    );
+    let staging = staging_of(&told, 7);
+    assert_eq!(staging.len(), 2);
+    assert!(
+        staging.iter().all(|slot| *slot >= 30),
+        "the staging past the kept atoms: {staging:?}"
+    );
+}
+
+#[test]
+fn seated_chunks_something_else_holds_fail_the_load() {
+    let engine = 9_024;
+    set_streaming(engine, false);
+    let shape = seated(7, 8, 4, 2, 4);
+    let mut slots = pool_of(32, std::slice::from_ref(&shape));
+    // Chunk 1, the shape's first, already open for kv.
+    slots.acquire(Holder::WorkingSet(1), KV, 1).unwrap();
+    let error = boot_cache(
+        engine,
+        WeightStreaming::Off,
+        std::slice::from_ref(&shape),
+        WEIGHTS,
+        &mut slots,
+    )
+    .unwrap_err()
+    .to_string();
+    assert!(error.contains("cannot adopt"), "{error}");
+    assert!(error.contains("chunk 1"), "names the chunk: {error}");
+    assert!(error.contains("open for a shape already"), "{error}");
+    for pinned in [true, false] {
+        assert_eq!(
+            slots.held_by(&Holder::Weights {
+                shape: WEIGHTS,
+                pinned
+            }),
+            0,
+            "nothing seated elsewhere instead"
+        );
+    }
+
+    // Two shapes the load says share a chunk: the second cannot be adopted.
+    let a = seated(7, 6, 4, 0, 4);
+    let b = seated(8, 2, 4, 0, 8);
+    let mut slots = pool_of(32, &[a.clone(), b.clone()]);
+    let error = boot_cache(engine, WeightStreaming::Off, &[a, b], WEIGHTS, &mut slots)
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains("open for a shape already"), "{error}");
+}

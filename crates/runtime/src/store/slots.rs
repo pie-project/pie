@@ -178,6 +178,9 @@ pub enum SlotError {
     NoRoom { rung: u32, chunks: u32 },
     #[error("a rung evacuation no longer matches the pool")]
     StaleRung,
+    /// A claim named a chunk that cannot be taken whole as it stands.
+    #[error("chunk {chunk} cannot be claimed: {why}")]
+    Unclaimable { chunk: u32, why: &'static str },
 }
 
 /// The state chunks in the way of a rung's activation, each moved to a free
@@ -867,6 +870,121 @@ impl SlotPool {
         Ok(taken)
     }
 
+    /// Exactly slot refs `first .. first + n` of `shape` for `holder`, in
+    /// ref order: the chunks they lie in, `first` its chunk's slot 0, each
+    /// opened for the shape where it is named rather than lowest first (a
+    /// last chunk's slots past `n` stay free for the shape). What a load's
+    /// own placement is adopted by. A segment of theirs not yet committed
+    /// is counted committed: the backend backed it. All or nothing.
+    ///
+    /// # Errors
+    ///
+    /// [`SlotError::Unclaimable`] where `first` is not a slot 0 or a chunk
+    /// is past the pool, reserved, open already, not free, in the
+    /// activation span or draining; [`SlotError::Budget`] where the chunks
+    /// outgrow what is committed.
+    pub fn claim(
+        &mut self,
+        holder: Holder,
+        shape: ShapeId,
+        first: u32,
+        n: u64,
+    ) -> Result<Vec<Slot>, SlotError> {
+        let range = self.claimable(shape, first, n)?;
+        let count = range.end - range.start;
+        let uncommitted: BTreeSet<u32> = range
+            .clone()
+            .map(|chunk| self.segments.of(self.logical_to_physical[chunk as usize]))
+            .filter(|&segment| self.segments.state(segment) == SegmentState::Uncommitted)
+            .collect();
+        let added: u32 = uncommitted
+            .iter()
+            .map(|&segment| self.segments.len(segment))
+            .sum();
+        let needed = self.reserved + self.held + self.act + count;
+        let committed = self.committed_chunks() + added;
+        if needed > committed {
+            return Err(SlotError::Budget { needed, committed });
+        }
+        for segment in uncommitted {
+            self.segments.set_state(segment, SegmentState::Committed);
+            for chunk in self.segments.range(segment) {
+                self.reopen(chunk);
+            }
+        }
+        let mut taken = Vec::with_capacity(usize::try_from(n).unwrap_or(0));
+        for chunk in range {
+            let physical = self.logical_to_physical[chunk as usize];
+            let opened = self.open_at(physical, shape);
+            debug_assert_eq!(opened, chunk);
+            self.fill(chunk, holder.is_live(), n - taken.len() as u64, &mut taken);
+        }
+        if n > 0 {
+            *self.holders.entry(holder).or_default() += n;
+        }
+        Ok(taken)
+    }
+
+    /// Whether [`Self::claim`] of the same slots could take their chunks as
+    /// the pool stands, budget aside: the logical chunks they lie in.
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::claim`]'s [`SlotError::Unclaimable`].
+    pub fn claimable(
+        &self,
+        shape: ShapeId,
+        first: u32,
+        n: u64,
+    ) -> Result<std::ops::Range<u32>, SlotError> {
+        let spc = self
+            .shapes
+            .get(shape as usize)
+            .ok_or(SlotError::UnknownShape(shape))?
+            .spc();
+        let start = first / spc;
+        if !first.is_multiple_of(spc) {
+            return Err(SlotError::Unclaimable {
+                chunk: start,
+                why: "the first slot is not its chunk's slot 0",
+            });
+        }
+        let count = u32::try_from(n.div_ceil(u64::from(spc))).unwrap_or(u32::MAX);
+        let range = start..start.saturating_add(count);
+        for chunk in range.clone() {
+            if let Some(why) = self.unclaimable(chunk) {
+                return Err(SlotError::Unclaimable { chunk, why });
+            }
+        }
+        Ok(range)
+    }
+
+    /// Why logical chunk `chunk` cannot be claimed now, if it cannot.
+    fn unclaimable(&self, chunk: u32) -> Option<&'static str> {
+        if chunk >= self.total {
+            return Some("past the pool");
+        }
+        if chunk < self.reserved {
+            return Some("reserved");
+        }
+        if self.chunks[chunk as usize].shape != NO_SHAPE {
+            return Some("open for a shape already");
+        }
+        let physical = self.logical_to_physical[chunk as usize];
+        if !self.free.get(physical) || self.fenced.get(physical) {
+            Some("not free")
+        } else if physical >= self.state_limit() {
+            Some("in the activation span")
+        } else if matches!(
+            self.segments.state(self.segments.of(physical)),
+            SegmentState::Draining { .. }
+        ) {
+            Some("its segment is draining")
+        } else {
+            None
+        }
+    }
+
     /// Adds `holder`'s reference to slots someone already holds.
     pub fn share(&mut self, holder: Holder, slots: &[Slot]) {
         let live = holder.is_live();
@@ -999,6 +1117,11 @@ impl SlotPool {
     /// checked the room.
     fn open_chunk(&mut self, shape: ShapeId) -> u32 {
         let physical = self.open.first().expect("room was checked");
+        self.open_at(physical, shape)
+    }
+
+    /// Opens free physical chunk `physical` for `shape`; its logical id.
+    fn open_at(&mut self, physical: u32, shape: ShapeId) -> u32 {
         self.open.clear(physical);
         self.free.clear(physical);
         let logical = self.physical_to_logical[physical as usize];
@@ -1445,6 +1568,37 @@ mod tests {
                 Slot { chunk: 2, index: 0 },
             ]
         );
+        pool.check();
+    }
+
+    #[test]
+    fn a_claim_takes_exactly_the_named_slots_or_nothing() {
+        let mut pool = SlotPool::new(facts(32, 8, 1, &[(ShapeKind::Fixed, 4)]));
+        let held = Holder::WorkingSet(1);
+        // Slot refs 40..46: chunks 10 and 11, in a segment not committed yet.
+        let slots = pool.claim(held, 0, 40, 6).unwrap();
+        let refs: Vec<u32> = slots.iter().map(|&slot| pool.slot_ref(slot)).collect();
+        assert_eq!(refs, (40..46).collect::<Vec<_>>());
+        assert_eq!(pool.segments().state(1), SegmentState::Committed);
+        assert_eq!(pool.held_by(&held), 6);
+        pool.check();
+        // The last chunk's free slots are the shape's, taken first.
+        let more = pool.acquire(held, 0, 2).unwrap();
+        let refs: Vec<u32> = more.iter().map(|&slot| pool.slot_ref(slot)).collect();
+        assert_eq!(refs, [46, 47]);
+        let refused = |pool: &mut SlotPool, first, n| match pool.claim(held, 0, first, n) {
+            Err(SlotError::Unclaimable { why, .. }) => why,
+            other => panic!("{other:?}"),
+        };
+        assert_eq!(refused(&mut pool, 36, 8), "open for a shape already");
+        assert_eq!(
+            refused(&mut pool, 41, 1),
+            "the first slot is not its chunk's slot 0"
+        );
+        assert_eq!(refused(&mut pool, 0, 1), "reserved");
+        assert_eq!(refused(&mut pool, 124, 1), "in the activation span");
+        assert_eq!(refused(&mut pool, 128, 1), "past the pool");
+        assert_eq!(pool.held_by(&held), 8, "a refused claim takes nothing");
         pool.check();
     }
 

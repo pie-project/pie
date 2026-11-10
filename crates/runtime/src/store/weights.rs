@@ -33,7 +33,10 @@
 //!
 //! The engine hears the resident set it starts with at load, before any
 //! fire ([`WeightFirst::boot`]), and each change after at a governor tick
-//! or a shed.
+//! or a shed. Where the load seated a shape's atoms itself
+//! ([`WeightShape::seated`]), the cache claims those exact slots and the
+//! starting set names them there, so no atom moves; seated slots something
+//! else holds fail the load.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::sync::RwLock;
@@ -212,6 +215,39 @@ pub fn slot_pool(facts: &ChunkFacts) -> SlotPool {
     })
 }
 
+/// Why a weight cache could not be seated at load.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum SeatError {
+    #[error(transparent)]
+    Pool(#[from] SlotError),
+    /// The slots the load seated a shape in ([`WeightShape::seated`]) are
+    /// not free to adopt: something else holds them. The load fails rather
+    /// than seat the weights again elsewhere.
+    #[error(
+        "weight shape {name} ({count} atoms): the load seated it at slot refs \
+         {first}..{end}, which the runtime cannot adopt: {error}"
+    )]
+    Seated {
+        name: String,
+        count: u32,
+        first: u32,
+        end: u64,
+        error: SlotError,
+    },
+}
+
+impl SeatError {
+    fn seated(facts: &WeightShape, first: u32, error: SlotError) -> Self {
+        SeatError::Seated {
+            name: facts.name.clone(),
+            count: facts.count,
+            first,
+            end: u64::from(first) + u64::from(facts.count),
+            error,
+        }
+    }
+}
+
 /// Window length in governor ticks: membership changes once a window.
 pub const WINDOW_TICKS: u32 = 4;
 
@@ -276,30 +312,85 @@ impl WeightCache {
     /// `first` on are [`pool_shapes`] of `weights`; not streaming, every
     /// atom too, pinned.
     ///
+    /// A shape the load seated itself ([`WeightShape::seated`]) keeps its
+    /// atoms where they lie: those exact slots are claimed first, before
+    /// any is taken lowest first. Not streaming, every one of them, pinned;
+    /// streaming, as cache above the floor, whole seated chunks in atom
+    /// order while every shape's floor still fits beside them.
+    ///
     /// # Errors
     ///
-    /// The pool cannot seat the floor (or, not streaming, the weights).
+    /// The pool cannot seat the floor (or, not streaming, the weights), or
+    /// the slots a shape was seated in are not free to claim
+    /// ([`SeatError::Seated`]).
     pub fn new(
         weights: &[WeightShape],
         first: ShapeId,
         streaming: bool,
         pool: &mut SlotPool,
-    ) -> Result<Self, SlotError> {
-        let mut shapes = Vec::with_capacity(weights.len());
+    ) -> Result<Self, SeatError> {
+        let shape_of =
+            |at: usize| first + ShapeId::try_from(at).expect("weight shapes fit a shape id");
+        // What the load seated itself is adopted where it lies, before any
+        // slot is taken lowest first: nothing else may land in its chunks.
+        // Held, every seated chunk must be free to claim, checked for all
+        // shapes before any is claimed; streaming, each chunk kept is
+        // checked as it is claimed.
+        let mut resident: Vec<BTreeMap<u32, Slot>> = vec![BTreeMap::new(); weights.len()];
+        if !streaming {
+            for (at, facts) in weights.iter().enumerate() {
+                let Some(seated) = facts.seated else { continue };
+                pool.claimable(shape_of(at), seated, u64::from(facts.count))
+                    .map_err(|error| SeatError::seated(facts, seated, error))?;
+            }
+        }
+        // Streaming, the seated atoms stay as cache while every floor still
+        // fits beside them, whole chunks in atom order.
+        let floor_chunks: u64 = weights
+            .iter()
+            .map(|facts| {
+                u64::from(facts.floor_slots).div_ceil(u64::from(facts.slots_per_chunk.max(1)))
+            })
+            .sum();
         for (at, facts) in weights.iter().enumerate() {
-            let shape = first + ShapeId::try_from(at).expect("weight shapes fit a shape id");
+            let Some(seated) = facts.seated else { continue };
+            let shape = shape_of(at);
+            let spc = facts.slots_per_chunk.max(1);
+            let atoms: Vec<(u32, u32)> = if streaming {
+                (0..facts.count)
+                    .step_by(spc as usize)
+                    .map(|atom| (atom, spc.min(facts.count - atom)))
+                    .collect()
+            } else {
+                vec![(0, facts.count)]
+            };
+            for (from, n) in atoms {
+                if streaming && u64::from(pool.free_chunks()) <= floor_chunks {
+                    break;
+                }
+                let holder = Holder::Weights {
+                    shape,
+                    pinned: !streaming,
+                };
+                let slots = pool
+                    .claim(holder, shape, seated + from, u64::from(n))
+                    .map_err(|error| SeatError::seated(facts, seated, error))?;
+                resident[at].extend((from..from + n).zip(slots));
+            }
+        }
+        let mut shapes = Vec::with_capacity(weights.len());
+        for ((at, facts), mut resident) in weights.iter().enumerate().zip(resident) {
+            let shape = shape_of(at);
             let holder = Holder::Weights {
                 shape,
                 pinned: true,
             };
             let staging = pool.acquire(holder, shape, u64::from(facts.floor_slots))?;
-            let resident = if streaming {
-                BTreeMap::new()
-            } else {
-                (0..facts.count)
+            if !streaming && facts.seated.is_none() {
+                resident = (0..facts.count)
                     .zip(pool.acquire(holder, shape, u64::from(facts.count))?)
-                    .collect()
-            };
+                    .collect();
+            }
             shapes.push(Kept {
                 facts: facts.clone(),
                 pool: shape,
