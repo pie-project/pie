@@ -2,6 +2,8 @@ use poem_ir::{
     CacheRow, Def, Dim, Dtype, Node, Operation, Platform, Shard, Ssm, Trace, Ty, ValueDecl, ValueId,
 };
 
+use std::collections::BTreeMap;
+
 use super::*;
 use crate::{Budget, Budgets, DeviceProfile};
 
@@ -140,9 +142,101 @@ fn full_rows_of_every_space_share_one_list_and_a_window_rings() {
     assert!(recipe.fixed().is_none());
 }
 
+/// What is wrong with the fixed `rows` of a slot of `bytes`: a piece past
+/// its slot or atoms, pieces of a cut row off its grain, two runs sharing
+/// bytes of a slot.
+fn overlaps(recipe: &ChunkRecipe, rows: &[FixedRun], bytes: u64, slots: u32) -> Vec<String> {
+    let mut wrong = Vec::new();
+    let mut held: BTreeMap<u32, Vec<(u64, u64)>> = BTreeMap::new();
+    for run in rows {
+        let atom = recipe.atoms[&run.row];
+        let end = run.offset + run.piece_bytes(&atom);
+        if run.slots.len() != run.pieces as usize
+            || end > bytes
+            || u64::from(run.pieces) * run.atoms_per_piece < atom.extent
+            || u64::from(run.pieces - 1) * run.atoms_per_piece >= atom.extent
+            || (run.is_cut() && run.atoms_per_piece % atom.grain != 0)
+        {
+            wrong.push(format!("{run:?} of {atom:?}"));
+        }
+        for &slot in &run.slots {
+            if slot >= slots {
+                wrong.push(format!("{run:?} past slot {slots}"));
+            }
+            held.entry(slot).or_default().push((run.offset, end));
+        }
+    }
+    for (slot, mut spans) in held {
+        spans.sort_unstable();
+        for pair in spans.windows(2) {
+            if pair[1].0 < pair[0].1 {
+                wrong.push(format!("slot {slot}: {pair:?}"));
+            }
+        }
+    }
+    wrong
+}
+
 #[test]
-fn a_record_past_the_chunk_is_cut_on_heads_into_equal_pieces() {
-    // 12 layers of a 4 MiB f32 state [128 heads, 64, 128] and a 64 KiB conv.
+fn a_row_past_the_slot_is_cut_on_heads_into_equal_pieces_at_one_offset() {
+    // 12 layers of a 6 MiB f32 state [96 heads, 64, 256] and a 64 KiB conv,
+    // on a device whose chunks hold at most 4 MiB.
+    let mut caches = Vec::new();
+    for l in 0..12 {
+        caches.push(state(&format!("ssm.{l}"), vec![96, 64, 256], Dtype::F32));
+        caches.push(state(&format!("conv.{l}"), vec![4, 8192], Dtype::Bf16));
+    }
+    let mut t = trace(caches);
+    for l in 0..12 {
+        delta_reads(&mut t, 2 * l, l);
+    }
+    let recipe = plan(&t, &budgets(), &on(ChunkProfile::ON_DEVICE_METAL)).unwrap();
+    let Some(SlotLayout::Fixed {
+        bytes,
+        record,
+        pieces_per_ws,
+        rows,
+        ..
+    }) = recipe.fixed()
+    else {
+        panic!("no fixed shape")
+    };
+    assert_eq!(*record, 12 * ((6 << 20) + (64 << 10)));
+    assert!(*bytes <= recipe.chunk_bytes && *bytes >= MIN_PIECE);
+    assert!(u64::from(*pieces_per_ws) * bytes >= *record);
+    assert_eq!(rows.len(), 24);
+    let wrong = overlaps(&recipe, rows, *bytes, *pieces_per_ws);
+    assert!(wrong.is_empty(), "{wrong:#?}");
+    for run in rows {
+        let atom = recipe.atoms[&run.row];
+        if atom.bytes * atom.extent == 6 << 20 {
+            // Every state is cut alike: equal pieces of whole heads.
+            assert!(run.is_cut(), "{run:?}");
+            assert_eq!(atom.contract, Contract::Heads);
+            assert_eq!(run.atoms_per_piece % atom.grain, 0);
+            assert_eq!(run.slots.len(), run.pieces as usize);
+        } else {
+            assert_eq!((run.pieces, run.atoms_per_piece), (1, atom.extent));
+        }
+    }
+    // Each rank of 4 holds a quarter of every cut row's pieces, in as many
+    // slots at offsets common to them, and as many chunks.
+    let rank = recipe.per_rank(4);
+    assert_eq!(rank.slots.len(), recipe.slots.len());
+    assert!(rank.chunk_bytes <= recipe.chunk_bytes / 4 + (64 << 10));
+    assert_eq!(rank.fixed.len(), rows.len());
+    for (run, on) in rows.iter().zip(&rank.fixed) {
+        assert_eq!(run.row, on.row);
+        if run.is_cut() {
+            assert_eq!(on.atoms_per_piece * 4, run.atoms_per_piece);
+        }
+    }
+}
+
+#[test]
+fn rows_under_the_slot_stay_whole_and_share_slots() {
+    // 12 layers of a 4 MiB state and a 64 KiB conv past a chunk of 32 MiB:
+    // no row is cut; whole rows pack into shared slots.
     let mut caches = Vec::new();
     for l in 0..12 {
         caches.push(state(&format!("ssm.{l}"), vec![128, 64, 128], Dtype::F32));
@@ -152,34 +246,21 @@ fn a_record_past_the_chunk_is_cut_on_heads_into_equal_pieces() {
     for l in 0..12 {
         delta_reads(&mut t, 2 * l, l);
     }
-    let profile = on(ChunkProfile::SERVER_CUDA);
-    let recipe = plan(&t, &budgets(), &profile).unwrap();
+    let recipe = plan(&t, &budgets(), &on(ChunkProfile::SERVER_CUDA)).unwrap();
     let Some(SlotLayout::Fixed {
         bytes,
-        record,
         pieces_per_ws,
-        pieces,
+        rows,
         ..
     }) = recipe.fixed()
     else {
         panic!("no fixed shape")
     };
-    assert_eq!(*record, 12 * ((4 << 20) + (64 << 10)));
-    assert!(*bytes <= recipe.chunk_bytes && *bytes >= MIN_PIECE);
-    assert!(u64::from(*pieces_per_ws) * bytes >= *record);
-    for piece in pieces {
-        let atom = recipe.atoms[&piece.row];
-        assert!(piece.span.end <= atom.extent);
-        assert!(piece.offset + (piece.span.end - piece.span.start) * atom.bytes <= *bytes);
-        if atom.extent > 1 && piece.span != (0..atom.extent) {
-            assert_eq!(atom.contract, Contract::Heads);
-            assert_eq!(piece.span.start % atom.grain, 0);
-        }
-    }
-    // Each rank of 4 holds a quarter of every cut row and as many chunks.
-    let rank = recipe.per_rank(4);
-    assert_eq!(rank.slots.len(), recipe.slots.len());
-    assert!(rank.chunk_bytes <= recipe.chunk_bytes / 4 + (64 << 10));
+    assert!(*bytes >= 4 << 20);
+    assert!(rows.iter().all(|r| !r.is_cut()));
+    assert!(*pieces_per_ws < 24);
+    let wrong = overlaps(&recipe, rows, *bytes, *pieces_per_ws);
+    assert!(wrong.is_empty(), "{wrong:#?}");
 }
 
 #[test]

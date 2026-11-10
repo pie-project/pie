@@ -8,8 +8,10 @@
 //! sharing one window; a working set holds `cap_slots` of them. A **fixed**
 //! slot holds a working set's record of every fixed state (recurrent and
 //! conv states, frame caches, n-gram ids, the rs buffer as `[P, width]`
-//! rows), whole when it fits in a chunk, else cut into equal pieces on the
-//! atoms its readers let a piece cut.
+//! rows), whole when it fits in a chunk, else in slots of a piece's size: a
+//! row no larger stays whole beside others, a row larger is cut on the atoms
+//! its readers let a piece cut into equal pieces, each at one offset in its
+//! own slot ([`FixedRun`]).
 //!
 //! Beside the states, a **weight** slot holds read-only weights a device may
 //! stream ([`weights`]): a routed expert of an MoE layer, or a block of
@@ -76,6 +78,9 @@ pub const FIXED_SLOT_FLOOR: u64 = 1 << 10;
 /// at the best-filling size, for the states to choose among the sizes.
 const WEIGHT_TAIL_SLACK: f64 = 0.01;
 
+/// The most ways the fixed slot sizes weighed cut a row.
+const MOST_CUTS: u64 = 64;
+
 /// The most chunk sizes the plan weighs.
 const MOST_CANDIDATES: u64 = 128;
 
@@ -121,14 +126,40 @@ impl RingCap {
     }
 }
 
-/// One span of a fixed row a piece holds: atoms `span` along the row's atom
-/// axis, at `offset` in piece `piece` of the working set's record.
+/// Where a fixed row lies in a working set's record, as an engine addresses
+/// it (CUDA `StateRows`, Metal `state_map`): `pieces` equal pieces of
+/// `atoms_per_piece` atoms along the row's atom axis, the last padded where
+/// the atoms do not divide; piece `p` at `offset` bytes into the record's
+/// slot `slots[p]`. A whole row is one piece of all its atoms.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Piece {
+pub struct FixedRun {
     pub row: RowId,
-    pub span: Range<u64>,
-    pub piece: u32,
+    pub pieces: u32,
+    pub atoms_per_piece: u64,
     pub offset: u64,
+    /// The record's slots the pieces lie in, `0..pieces_per_ws`, one a piece.
+    pub slots: Vec<u32>,
+}
+
+impl FixedRun {
+    /// The atoms piece `p` holds of a row of `extent` atoms; empty past them.
+    #[must_use]
+    pub fn span(&self, p: u32, extent: u64) -> Range<u64> {
+        let start = (u64::from(p) * self.atoms_per_piece).min(extent);
+        start..(start + self.atoms_per_piece).min(extent)
+    }
+
+    /// A piece's bytes, padding counted, of a row of `atom`s.
+    #[must_use]
+    pub fn piece_bytes(&self, atom: &Atom) -> u64 {
+        self.atoms_per_piece * atom.bytes
+    }
+
+    /// Whether the row is cut.
+    #[must_use]
+    pub fn is_cut(&self) -> bool {
+        self.pieces > 1
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -150,8 +181,10 @@ pub enum SlotLayout {
         bytes: u64,
         /// The record's bytes, its rows aligned.
         record: u64,
+        /// The slots a working set's record takes.
         pieces_per_ws: u32,
-        pieces: Vec<Piece>,
+        /// Every fixed row's run, in the record's row order.
+        rows: Vec<FixedRun>,
         /// Window rings small enough to hold whole in the record, and the
         /// tokens each holds.
         folded: Vec<(RowId, u32)>,
@@ -373,6 +406,7 @@ impl ChunkRecipe {
         let align = self.profile.align();
         let parts = |row: &RowId| self.shards.get(row).map_or(1, |shard| parts(shard, tp));
         let mut slots = Vec::with_capacity(self.slots.len());
+        let mut fixed = Vec::new();
         for shape in &self.slots {
             let bytes = match shape {
                 SlotLayout::List { tokens, rows, .. } | SlotLayout::Ring { tokens, rows, .. } => {
@@ -388,22 +422,10 @@ impl ChunkRecipe {
                         align,
                     )
                 }
-                SlotLayout::Fixed { pieces, .. } => {
-                    let mut used: BTreeMap<u32, u64> = BTreeMap::new();
-                    for piece in pieces {
-                        let atom = self.atoms[&piece.row];
-                        let span = (piece.span.end - piece.span.start) * atom.bytes;
-                        let at = used.entry(piece.piece).or_default();
-                        *at = align_up(*at, align) + span.div_ceil(parts(&piece.row));
-                    }
-                    align_up(
-                        used.values()
-                            .copied()
-                            .max()
-                            .unwrap_or(0)
-                            .max(FIXED_SLOT_FLOOR),
-                        align,
-                    )
+                SlotLayout::Fixed { rows, .. } => {
+                    let (used, runs) = self.rank_runs(rows, tp);
+                    fixed = runs;
+                    align_up(used.max(FIXED_SLOT_FLOOR), align)
                 }
             };
             slots.push((bytes, shape.per_chunk(self.chunk_bytes)));
@@ -417,7 +439,58 @@ impl ChunkRecipe {
             tp,
             chunk_bytes: align_up(chunk, align),
             slots,
+            fixed,
         }
+    }
+
+    /// The fixed `rows` on one of `tp` ranks: each keeps its pieces and
+    /// slots, its pieces shrink by the parts the ranks cut it into (atoms
+    /// where they cut its atom axis, an atom's bytes where they cut another),
+    /// and the offsets close up, a cut row's still common to its slots. The
+    /// most bytes a slot then holds, and the runs.
+    fn rank_runs(&self, rows: &[FixedRun], tp: u32) -> (u64, Vec<RankRun>) {
+        let align = self.profile.align();
+        let mut order: Vec<(usize, &FixedRun)> = rows.iter().enumerate().collect();
+        order.sort_by_key(|(_, r)| (r.offset, r.slots.first().copied()));
+        let mut used: BTreeMap<u32, u64> = BTreeMap::new();
+        let mut runs = vec![None; rows.len()];
+        for (at, run) in order {
+            let atom = self.atoms[&run.row];
+            let shard = self.shards.get(&run.row);
+            let parts = shard.map_or(1, |shard| parts(shard, tp));
+            let on_atoms = parts > 1
+                && match shard {
+                    Some(Shard::Cut { axis, .. }) => *axis == atom.axis,
+                    Some(Shard::Inferred) => atom.axis == 0,
+                    _ => false,
+                }
+                && run.atoms_per_piece % parts == 0;
+            let (atoms_per_piece, atom_bytes) = if on_atoms {
+                (run.atoms_per_piece / parts, atom.bytes)
+            } else {
+                (run.atoms_per_piece, atom.bytes.div_ceil(parts))
+            };
+            let piece_bytes = atoms_per_piece * atom_bytes;
+            let offset = run
+                .slots
+                .iter()
+                .map(|s| align_up(used.get(s).copied().unwrap_or(0), align))
+                .max()
+                .unwrap_or(0);
+            for s in &run.slots {
+                used.insert(*s, offset + piece_bytes);
+            }
+            runs[at] = Some(RankRun {
+                row: run.row,
+                offset,
+                atoms_per_piece,
+                piece_bytes,
+            });
+        }
+        (
+            used.values().copied().max().unwrap_or(0),
+            runs.into_iter().flatten().collect(),
+        )
     }
 
     /// The shapes in a line: `L16x1.25M` (list: tokens x slot), `R1024:16x12.5M*67`
@@ -455,6 +528,19 @@ pub struct RankRecipe {
     pub tp: u32,
     pub chunk_bytes: u64,
     pub slots: Vec<(u64, u64)>,
+    /// Each fixed row's run on the rank, in the recipe's row order: the
+    /// unsplit run's pieces and slots, at these offsets and sizes.
+    pub fixed: Vec<RankRun>,
+}
+
+/// A fixed row's run on one rank ([`ChunkRecipe::per_rank`]): its pieces
+/// and slots are the unsplit [`FixedRun`]'s.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RankRun {
+    pub row: RowId,
+    pub offset: u64,
+    pub atoms_per_piece: u64,
+    pub piece_bytes: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
@@ -686,13 +772,13 @@ pub fn plan(
 
     let mut slots = token_shapes;
     if let Some(pick) = pick {
-        let (pieces_per_ws, pieces) =
-            fixed::pack(&fixed_rows, pick.slot, align, true).unwrap_or((0, Vec::new()));
+        let (pieces_per_ws, rows) =
+            fixed::pack(&fixed_rows, pick.slot, align, pick.least, true).unwrap_or((0, Vec::new()));
         slots.push(SlotLayout::Fixed {
             bytes: pick.slot,
             record,
             pieces_per_ws,
-            pieces,
+            rows,
             folded,
         });
     }
@@ -777,18 +863,23 @@ fn token_layout(
 struct FixedPick {
     slot: u64,
     pieces: u32,
+    /// The least bytes a cut piece holds.
+    least: u64,
 }
 
 /// The fixed slot for chunks of `chunk` bytes: the record whole where it
-/// fits; else, of the piece sizes that fill a chunk (`chunk / k`) or end a
-/// piece on a row boundary, no smaller than [`MIN_PIECE`], the one that
-/// wastes least in the pieces and in the chunks they fill, the larger on a
-/// near tie.
+/// fits; else, of the piece sizes that fill a chunk (`chunk / k`), end a slot
+/// on a row boundary, or hold `k` equal pieces of a cut row, no smaller than
+/// [`MIN_PIECE`], the one that wastes least in the slots (padding counted)
+/// and in the chunks they fill, the larger on a near tie. Cut pieces hold
+/// [`MIN_PIECE`] at least where any size lets them, else as few as a size
+/// takes.
 fn pick_fixed(rows: &[FixedRow], record: u64, chunk: u64, align: u64) -> Option<FixedPick> {
     if record <= chunk {
         return Some(FixedPick {
             slot: align_up(record.max(FIXED_SLOT_FLOOR), align),
             pieces: 1,
+            least: 0,
         });
     }
     let least = MIN_PIECE.min(chunk);
@@ -800,23 +891,53 @@ fn pick_fixed(rows: &[FixedRow], record: u64, chunk: u64, align: u64) -> Option<
         at = align_up(at, align) + row.bytes;
         sizes.push(align_up(at, align));
     }
+    // A slot of `k` equal pieces of a row cut `n` ways.
+    let mut atoms: Vec<Atom> = rows
+        .iter()
+        .filter(|r| fixed::cuttable(r) && r.bytes > least)
+        .map(|r| r.atom)
+        .collect();
+    atoms.sort_by_key(|a| (a.extent, a.bytes, a.grain));
+    atoms.dedup();
+    for atom in atoms {
+        let units = atom.extent.div_ceil(atom.grain);
+        for n in 2..=units.min(MOST_CUTS) {
+            let piece = align_up(units.div_ceil(n) * atom.grain * atom.bytes, align);
+            if piece < least {
+                break;
+            }
+            sizes.extend((1..=chunk / piece).map(|k| k * piece));
+        }
+    }
     sizes.retain(|&slot| slot >= least && slot <= chunk);
     sizes.sort_unstable_by(|a, b| b.cmp(a));
     sizes.dedup();
     let near = record / 1000;
-    let mut best: Option<(u64, FixedPick)> = None;
-    for slot in sizes {
-        let Some((pieces, _)) = fixed::pack(rows, slot, align, false) else {
-            continue;
-        };
-        let per = chunk / slot;
-        let held = u64::from(pieces) * slot;
-        let cost = held.saturating_sub(record) + u64::from(pieces) * (chunk - per * slot) / per;
-        if best.as_ref().is_none_or(|(was, _)| cost + near < *was) {
-            best = Some((cost, FixedPick { slot, pieces }));
+    for least in [least, 0] {
+        let mut best: Option<(u64, FixedPick)> = None;
+        for &slot in &sizes {
+            let Some((pieces, _)) = fixed::pack(rows, slot, align, least, false) else {
+                continue;
+            };
+            let per = chunk / slot;
+            let held = u64::from(pieces) * slot;
+            let cost = held.saturating_sub(record) + u64::from(pieces) * (chunk - per * slot) / per;
+            if best.as_ref().is_none_or(|(was, _)| cost + near < *was) {
+                best = Some((
+                    cost,
+                    FixedPick {
+                        slot,
+                        pieces,
+                        least,
+                    },
+                ));
+            }
+        }
+        if best.is_some() {
+            return best.map(|(_, pick)| pick);
         }
     }
-    best.map(|(_, pick)| pick)
+    None
 }
 
 /// What a working set takes at the profile's context with chunks of `chunk`
