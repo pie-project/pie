@@ -251,9 +251,14 @@ fn kernel(
         let last = b.cmpi(ICmp::Ne, last, z)?;
 
         // The chunks past the fire's own (the grid holds the most a fire of
-        // its rows and lanes can take) are skipped.
+        // its rows and lanes can take) answer zeros and step nothing.
         let live = b.load(blk.grid.prefetch[3], &[n])?;
+        let dead = b.cmpi(ICmp::Eq, live, z)?;
         let live = b.cmpi(ICmp::Ne, live, z)?;
+        b.when(dead, |b| {
+            let zero = b.splat_f(&[hv, c, dv], Elem::F32, 0.0)?;
+            b.vstore_all(zero, o_r)
+        })?;
         b.when(live, |b| {
             // A lane's first chunk starts from its slot of the bank.
             b.when(first, |b| {
