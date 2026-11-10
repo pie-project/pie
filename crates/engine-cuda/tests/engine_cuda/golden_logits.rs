@@ -1,4 +1,4 @@
-#![cfg(feature = "cuda")]
+#![cfg(feature = "device")]
 
 //! The golden-logits probe: a fixed set of catalog miniatures, one of each
 //! cache shape (dense attention, sliding windows, GDN and mamba state,
