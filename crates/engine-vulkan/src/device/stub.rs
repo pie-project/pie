@@ -124,6 +124,7 @@ pub struct Frame {
     never: std::convert::Infallible,
 }
 
+impl Frame {
     pub fn flush_settled(&self) -> Result<()> {
         self.flush()
     }
