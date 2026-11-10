@@ -1221,8 +1221,7 @@ impl SegmentSum {
             self.chunk,
             self.depth,
         );
-        if tb != 128 || c % 16 != 0 || r % c != 0 || n % 128 != 0 || rows % c != 0 || !self.fits()
-        {
+        if tb != 128 || c % 16 != 0 || r % c != 0 || n % 128 != 0 || rows % c != 0 || !self.fits() {
             return bad(format!("{self:?}"));
         }
         let any = |array: Vec<i64>, elem: Elem| Operand {
@@ -1245,7 +1244,10 @@ impl SegmentSum {
             grid: vec![nb],
             semantics: vec![Sem::Arbitrary],
             prefetch: vec![vec![nb * e], vec![nb * e], vec![nb * e]],
-            ins: vec![any(vec![rows, 128], Elem::I32), any(vec![rows, n], Elem::Bf16)],
+            ins: vec![
+                any(vec![rows, 128], Elem::I32),
+                any(vec![rows, n], Elem::Bf16),
+            ],
             outs: vec![out],
             vmem_limit: Some(limit as u64),
             scratch: vec![
@@ -1256,8 +1258,12 @@ impl SegmentSum {
             ],
         };
         kernel.build(|b, blk| {
-            let (ybuf, tbuf, ysems, tsems) =
-                (blk.scratch[0], blk.scratch[1], blk.scratch[2], blk.scratch[3]);
+            let (ybuf, tbuf, ysems, tsems) = (
+                blk.scratch[0],
+                blk.scratch[1],
+                blk.scratch[2],
+                blk.scratch[3],
+            );
             let (tok, ys) = (blk.ins[0], blk.ins[1]);
             let pre = &blk.grid.prefetch;
             let s = blk.grid.ids[0];

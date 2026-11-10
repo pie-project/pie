@@ -19,6 +19,9 @@ rope.flat_rows = 1024
 # a routed MLP's grouped matmul takes up to four of an expert's row tiles a step through one dot
 # (Gemma-4-26B-A4B's 32-expert cut, 1792-row fire: 1228 -> 1022 us a layer, bit for bit)
 moe.gmm_run = 4
+# a routed MLP's prompt sums each block of 128 tokens' runs of expert rows by its own dot, not one one-hot dot
+# over every row (Gemma-4-26B-A4B's 32-expert cut, 1792-row fire: the sum 288 us a layer)
+moe.segment_tokens = 128
 # a decode of 64 rows and more reads each row's own pages through the page-copy kernel
 attn.decode_pages = 64
 
@@ -44,6 +47,7 @@ measured = [
   "kernel.moe.loop_tile_max",
   "kernel.moe.loop_unroll",
   "kernel.moe.path",
+  "kernel.moe.segment_tokens",
   "kernel.quant.decode",
   "kernel.rope.flat_rows",
   "gather.embed_fold",
