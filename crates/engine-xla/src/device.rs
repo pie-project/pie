@@ -304,6 +304,11 @@ impl Device {
                 exe
             }
         };
+        if let Some((temp, out, arg, code)) = exe.memory() {
+            static MOST: std::sync::atomic::AtomicI64 = std::sync::atomic::AtomicI64::new(0);
+            let most = MOST.fetch_max(temp, std::sync::atomic::Ordering::Relaxed).max(temp);
+            tracing::info!(temp, out, arg, code, most, "xla program memory");
+        }
         let program = Arc::new(Program {
             exe: Some(exe),
             sig,

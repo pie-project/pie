@@ -688,6 +688,29 @@ impl Executable {
         self.outputs
     }
 
+    /// Diag: (temp, output, argument, generated code) bytes the plugin reports.
+    pub fn memory(&self) -> Option<(i64, i64, i64, i64)> {
+        let mut g = args!(PJRT_LoadedExecutable_GetExecutable_Args {
+            loaded_executable: self.raw
+        });
+        call!(&self.api, PJRT_LoadedExecutable_GetExecutable, &mut g).ok()?;
+        let mut a = args!(PJRT_Executable_GetCompiledMemoryStats_Args {
+            executable: g.executable,
+        });
+        let done = call!(&self.api, PJRT_Executable_GetCompiledMemoryStats, &mut a);
+        let mut d = args!(PJRT_Executable_Destroy_Args {
+            executable: g.executable
+        });
+        let _ = call!(&self.api, PJRT_Executable_Destroy, &mut d);
+        done.ok()?;
+        Some((
+            a.temp_size_in_bytes,
+            a.output_size_in_bytes,
+            a.argument_size_in_bytes,
+            a.generated_code_size_in_bytes,
+        ))
+    }
+
     /// The executable's serialized form, for `Client::deserialize`.
     pub fn serialize(&self) -> Result<Vec<u8>> {
         let mut g = args!(PJRT_LoadedExecutable_GetExecutable_Args {
