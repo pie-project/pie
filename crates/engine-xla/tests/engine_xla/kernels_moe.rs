@@ -1087,11 +1087,11 @@ fn the_routed_mlp_on_one_sort_answers_its_parts() {
             .map(|p| ((hash(p / tk, 64) as usize + p % tk) % e) as i32)
             .collect();
         let weights: Vec<f32> = data(t * tk, 65).iter().map(|v| v.abs()).collect();
-        let run = |fused: bool, steps: i64, segment: i64, glu: bool| {
+        let run = |fused: bool, steps: i64, segment: i64, in_kernel: bool| {
             let mut b = Bench::new().with_tuning(kernels_xla::tuning::Tuning {
                 moe_gmm_run: steps,
                 moe_segment_tokens: segment,
-                moe_gmm_glu: glu,
+                moe_gmm_glu: in_kernel,
                 ..kernels_xla::tuning::Tuning::DEFAULT
             });
             let xt = b.bf16(t as u32, h as u32, &x);
