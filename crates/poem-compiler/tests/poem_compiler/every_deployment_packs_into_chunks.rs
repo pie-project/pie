@@ -2,8 +2,8 @@ use std::collections::BTreeMap;
 
 use poem_compiler::catalog::{self, Deployment};
 use poem_compiler::chunk::{
-    self, ChunkProfile, ChunkRecipe, FIXED_SETS_PER_WS, MIN_PIECE, MIN_RUN, RowId, SlotLayout,
-    TOKEN_GRAIN, human,
+    self, ChunkProfile, ChunkRecipe, FIXED_SETS_PER_WS, MIN_PIECE, MIN_RUN, MOST_RS_TOKENS, RowId,
+    SlotLayout, TOKEN_GRAIN, human,
 };
 use poem_compiler::{Budget, Budgets, DeviceProfile};
 use poem_ir::{CacheRow, Dtype, Platform, Trace};
@@ -80,6 +80,30 @@ fn wrongs(trace: &Trace, recipe: &ChunkRecipe) -> Vec<String> {
                     }
                 }
             }
+            // The rs list: a power of two of tokens, rows apart and inside
+            // the slot; no run need reach MIN_RUN.
+            SlotLayout::RsList {
+                tokens,
+                bytes,
+                rows,
+            } => {
+                if !tokens.is_power_of_two() || *tokens > MOST_RS_TOKENS {
+                    wrong.push(format!("{tokens} rs tokens a slot"));
+                }
+                let mut end = 0;
+                for run in rows {
+                    if run.offset < end || run.offset % device.align() != 0 {
+                        wrong.push(format!("rs run {run:?} overlaps or is misaligned"));
+                    }
+                    end = run.offset + u64::from(*tokens) * run.per_token;
+                }
+                if end > *bytes {
+                    wrong.push(format!("rs runs end at {end} past the slot of {bytes}"));
+                }
+                if rows.windows(2).any(|w| w[0].layer > w[1].layer) {
+                    wrong.push("rs runs not layer-major".into());
+                }
+            }
             SlotLayout::Fixed {
                 bytes,
                 record,
@@ -136,7 +160,9 @@ fn wrongs(trace: &Trace, recipe: &ChunkRecipe) -> Vec<String> {
     let mut held: BTreeMap<RowId, usize> = BTreeMap::new();
     for shape in &recipe.slots {
         match shape {
-            SlotLayout::List { rows, .. } | SlotLayout::Ring { rows, .. } => {
+            SlotLayout::List { rows, .. }
+            | SlotLayout::RsList { rows, .. }
+            | SlotLayout::Ring { rows, .. } => {
                 for run in rows {
                     *held.entry(run.row).or_default() += 1;
                 }
@@ -158,38 +184,42 @@ fn wrongs(trace: &Trace, recipe: &ChunkRecipe) -> Vec<String> {
         SlotLayout::Fixed { rows, .. } => rows.as_slice(),
         _ => &[],
     });
-    // Every rs row lies in the same record slots, cut alike, and the
-    // recipe says what it buffers, its planes filling its tokens.
-    let rs: Vec<_> = fixed
-        .iter()
-        .filter(|r| matches!(r.row, RowId::Rs(_)))
-        .collect();
+    // The fixed record holds state only; every rs row lies once in the rs
+    // list, as the recipe's rs layout says, and the recipe says what each
+    // buffers, its planes filling its bytes a token.
+    if fixed.iter().any(|r| matches!(r.row, RowId::Rs(_))) {
+        wrong.push("an rs row in the fixed record".into());
+    }
     let layout = &recipe.rs;
-    if rs.iter().any(|r| {
-        (r.pieces, &r.slots, r.atoms_per_piece)
-            != (layout.pieces, &layout.slots, layout.tokens_per_piece)
-    }) {
-        wrong.push(format!("rs rows lie apart of {layout:?}"));
+    match recipe.rs_list() {
+        Some(SlotLayout::RsList {
+            tokens,
+            bytes,
+            rows,
+        }) => {
+            if (*tokens, *bytes, rows) != (layout.tokens, layout.bytes, &layout.runs) {
+                wrong.push(format!("rs list unlike the rs layout {layout:?}"));
+            }
+        }
+        _ if !layout.rows.is_empty() || !layout.is_empty() => {
+            wrong.push(format!("rs rows without an rs list: {layout:?}"));
+        }
+        _ => {}
     }
-    let covered: u64 = (0..layout.pieces)
-        .map(|p| layout.tokens(p).count() as u64)
-        .sum();
-    if !rs.is_empty() && covered != u64::from(chunk::UNFOLDED_ROWS) {
-        wrong.push(format!("rs pieces cover {covered} tokens"));
-    }
-    if rs.len() != layout.rows.len() {
+    if layout.runs.len() != layout.rows.len() {
         wrong.push(format!(
-            "{} rs rows, {} described",
-            rs.len(),
+            "{} rs runs, {} described",
+            layout.runs.len(),
             layout.rows.len()
         ));
     }
-    for (row, what) in &layout.rows {
-        if recipe.atoms.get(row).map(|a| a.bytes) != Some(what.per_token()) {
-            wrong.push(format!(
-                "{row:?} buffers {} bytes a token",
-                what.per_token()
-            ));
+    for run in &layout.runs {
+        let what = layout.rows.get(&run.row).map(chunk::RsRow::per_token);
+        if what != Some(run.per_token) {
+            wrong.push(format!("{:?} buffers {what:?} bytes a token", run.row));
+        }
+        if !matches!(run.row, RowId::Rs(_)) {
+            wrong.push(format!("{:?} in the rs list", run.row));
         }
     }
     for tp in catalog::RANKS {
@@ -324,9 +354,9 @@ fn fixed_rows(trace: &Trace, recipe: &ChunkRecipe, part: &str) -> (usize, Vec<u6
 
 fn per_token(shape: &SlotLayout) -> u64 {
     match shape {
-        SlotLayout::List { rows, .. } | SlotLayout::Ring { rows, .. } => {
-            rows.iter().map(|r| r.per_token).sum()
-        }
+        SlotLayout::List { rows, .. }
+        | SlotLayout::RsList { rows, .. }
+        | SlotLayout::Ring { rows, .. } => rows.iter().map(|r| r.per_token).sum(),
         SlotLayout::Fixed { .. } => 0,
     }
 }
@@ -342,15 +372,10 @@ fn qwen3_next_packs_36_delta_and_conv_states_with_next_to_no_waste() {
         fixed_rows(&trace, &recipe, "conv_state"),
         (36, vec![64 << 10])
     );
-    let rs = recipe
-        .atoms
-        .keys()
-        .filter(|r| matches!(r, RowId::Rs(_)))
-        .count();
-    assert_eq!(rs, 36, "a rs buffer a gated-delta layer");
+    assert_eq!(recipe.rs.rows.len(), 36, "a rs row a gated-delta layer");
+    assert!(recipe.atoms.keys().all(|r| !matches!(r, RowId::Rs(_))));
     // What the fixed records take past their bytes, in their pieces and in
-    // the chunks those fill: the rs rows (258 KiB a layer) keep a slot from
-    // dividing a chunk of list slots exactly, so a little stays.
+    // the chunks those fill.
     let overhead = fixed_overhead(&recipe);
     println!("qwen3-next fixed overhead {:.2}%", 100.0 * overhead);
     assert!(overhead < 0.02, "{overhead}");
@@ -455,18 +480,16 @@ fn planned_on(name: &str, chunk: ChunkProfile) -> (Trace, ChunkRecipe) {
     (trace, recipe)
 }
 
-/// The rs rows' runs, and the slots the first lies in.
-fn rs_runs(recipe: &ChunkRecipe) -> Vec<&chunk::FixedRun> {
-    let Some(SlotLayout::Fixed { rows, .. }) = recipe.fixed() else {
-        panic!("no fixed record")
+/// The rs list's runs.
+fn rs_runs(recipe: &ChunkRecipe) -> &[chunk::TokenRun] {
+    let Some(SlotLayout::RsList { rows, .. }) = recipe.rs_list() else {
+        panic!("no rs list")
     };
-    rows.iter()
-        .filter(|r| matches!(r.row, RowId::Rs(_)))
-        .collect()
+    rows
 }
 
 #[test]
-fn qwen35_vision_mtp_lays_every_rs_row_in_the_same_slots_cut_alike() {
+fn qwen35_vision_mtp_lays_its_rs_rows_in_an_rs_list_layer_major() {
     for (preset, chunk) in PRESETS {
         let (trace, recipe) = planned_on("qwen35-d0.8b-vision-mtp-bf16-kv-bf16", chunk);
         let runs = rs_runs(&recipe);
@@ -474,19 +497,20 @@ fn qwen35_vision_mtp_lays_every_rs_row_in_the_same_slots_cut_alike() {
         assert_eq!(runs.len(), 18, "{preset}");
         let rs = &recipe.rs;
         println!(
-            "{preset}: rs rows in {} piece(s) of {} tokens, slots {:?}",
-            rs.pieces, rs.tokens_per_piece, rs.slots
+            "{preset}: rs list of {} tokens a slot, {} a slot, {} a token",
+            rs.tokens,
+            human(rs.bytes),
+            human(runs.iter().map(|r| r.per_token).sum())
         );
-        assert_eq!(rs.slots.len(), rs.pieces as usize);
-        for run in &runs {
-            assert_eq!(
-                (run.pieces, &run.slots, run.atoms_per_piece),
-                (rs.pieces, &rs.slots, rs.tokens_per_piece),
-                "{preset}: {run:?}"
-            );
-        }
-        // The rows lie one after another in each piece's slot.
+        assert!(rs.tokens >= 1 && rs.bytes <= recipe.chunk_bytes);
+        // The rows lie one after another, layer by layer.
         assert!(runs.windows(2).all(|w| w[0].offset < w[1].offset));
+        assert!(runs.windows(2).all(|w| w[0].layer < w[1].layer));
+        // The fixed record holds the delta and conv states only.
+        let Some(SlotLayout::Fixed { rows, .. }) = recipe.fixed() else {
+            panic!("no fixed record")
+        };
+        assert!(rows.iter().all(|r| matches!(r.row, RowId::Cache(_))));
         // Each row buffers the conv's input and `[b | a]`, committing into
         // its layer's delta state.
         for rs in recipe.rs.rows.values() {
@@ -515,10 +539,28 @@ fn qwen38_flash_next_mini_buffers_its_ngram_ids_as_an_rs_row_beside_the_others()
         // One plane of the unfolded token ids, an i32 each.
         assert_eq!(rs.planes.len(), 1);
         assert_eq!(rs.per_token(), 4);
-        assert_eq!(recipe.atoms[id].extent, u64::from(chunk::UNFOLDED_ROWS));
         let runs = rs_runs(&recipe);
         assert_eq!(runs.len(), 4, "{preset}: three delta layers and the ids");
-        assert!(runs.iter().all(|r| r.slots == recipe.rs.slots));
+        assert_eq!(recipe.rs.run(*id).unwrap().per_token, 4);
+        println!("{preset}: rs list {}", recipe.shapes());
+    }
+}
+
+#[test]
+fn kimik3_2_8t_buffers_a_token_a_slot_of_its_rs_list() {
+    for (preset, chunk) in PRESETS {
+        let (_, recipe) = planned_on("kimik3-2.8t-bf16-mxfp4-kv-bf16", chunk);
+        let per_token: u64 = rs_runs(&recipe).iter().map(|r| r.per_token).sum();
+        // Every KDA layer's conv input, forget and beta: megabytes a token.
+        assert!(per_token > 6 << 20, "{preset}: {per_token}");
+        println!(
+            "{preset}: C {} rs list {} tokens x {}",
+            human(recipe.chunk_bytes),
+            recipe.rs.tokens,
+            human(recipe.rs.bytes)
+        );
+        assert_eq!(recipe.rs.tokens, 1, "{preset}");
+        assert!(recipe.rs.bytes <= recipe.chunk_bytes);
     }
 }
 

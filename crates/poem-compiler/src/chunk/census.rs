@@ -1,7 +1,7 @@
 //! What a trace remembers, read off today's IR: each cache row's bytes, its
 //! retention, the layer that reads it and the axis its readers let a piece
 //! cut, and the rs buffer the deferred-commit recurrences and the n-gram id
-//! windows carry.
+//! windows carry: a per-token row each, laid in the rs list.
 
 use std::collections::{BTreeMap, HashMap};
 
@@ -12,10 +12,6 @@ use poem_ir::{
 
 use super::{ChunkError, RowId};
 use crate::arena::elem_bytes;
-
-/// The tokens the rs buffer holds a recurrent layer: the most a lane carries
-/// unfolded past its state (a fire's speculative rows before they commit).
-pub const UNFOLDED_ROWS: u32 = 16;
 
 /// The rs buffer's element: the engine buffers a recurrence's planes in
 /// bf16 (token ids in their own i32).
@@ -35,7 +31,7 @@ pub enum Contract {
     Channels,
     /// A conv3d frame cache: frame positions, axis 0.
     Frames,
-    /// Attention rows and the rs buffer: tokens, axis 0.
+    /// Attention rows (a window ring folded into the record): tokens, axis 0.
     Tokens,
     /// Read whole (n-gram id windows, the replay floor, anything unknown).
     Whole,
@@ -95,9 +91,10 @@ pub struct FixedRow {
     pub ring_tokens: Option<u32>,
 }
 
-/// What one rs row buffers, as an engine lays it: `planes` one after
-/// another, plane `i` at `tokens x (the bytes a token of planes 0..i)` past
-/// the row's offset in each piece's slot, `tokens` the atoms a piece holds.
+/// What one rs row buffers, as an engine lays it in an rs-list slot of
+/// `tokens` tokens: `planes` one after another, plane `i` at
+/// `tokens x (the bytes a token of planes 0..i)` past the row's offset, token
+/// `t` of a plane `t x` its bytes a token past the plane's start.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RsRow {
     /// The state cache row the buffered tokens commit into: the recurrence's
@@ -113,7 +110,7 @@ impl RsRow {
         self.planes.iter().map(|p| p.bytes).sum()
     }
 
-    /// Where plane `i` starts past the row's offset, in a piece of `tokens`.
+    /// Where plane `i` starts past the row's offset, in a slot of `tokens`.
     #[must_use]
     pub fn plane_at(&self, i: usize, tokens: u64) -> u64 {
         tokens * self.planes[..i].iter().map(|p| p.bytes).sum::<u64>()
@@ -132,7 +129,10 @@ pub struct RsPlane {
 pub struct Census {
     pub tokens: Vec<TokenRow>,
     pub fixed: Vec<FixedRow>,
-    /// What each rs row of `fixed` buffers.
+    /// The rs buffer's rows: per-token rows of the rs list, a token's bytes
+    /// every plane's.
+    pub rs_rows: Vec<TokenRow>,
+    /// What each of `rs_rows` buffers.
     pub rs: BTreeMap<RowId, RsRow>,
 }
 
@@ -194,7 +194,7 @@ pub fn census(trace: &Trace, state_f32: bool) -> Result<Census, ChunkError> {
     }
     for (row, rs) in rs_rows(trace, &readers)? {
         out.rs.insert(row.id, rs);
-        out.fixed.push(row);
+        out.rs_rows.push(row);
     }
     Ok(out)
 }
@@ -373,14 +373,14 @@ fn atom(slab: &[u64], bytes: u64, read: &Read, shard: &Shard) -> Atom {
     }
 }
 
-/// The rs buffer: a `[UNFOLDED_ROWS, width]` row a chunked recurrence whose
+/// The rs buffer: a per-token row of `width` a chunked recurrence whose
 /// commit is deferred, `width` the planes it replays (as the engines'
 /// `store::rs::read` lay them): the conv's input, then the gate prep's
 /// `[b | a]` (gated delta) or the forget and beta projections (KDA); then a
 /// row an n-gram id window, its unfolded token ids (as Metal's rs layout
 /// buffers them, in their own dtype). `RowId::Rs(n)`: the recurrences in
 /// node order, then the windows in the order their first reader stands.
-fn rs_rows(trace: &Trace, readers: &[Read]) -> Result<Vec<(FixedRow, RsRow)>, ChunkError> {
+fn rs_rows(trace: &Trace, readers: &[Read]) -> Result<Vec<(TokenRow, RsRow)>, ChunkError> {
     let mut defined: HashMap<u32, usize> = HashMap::new();
     let mut outs = Vec::new();
     for (at, node) in trace.nodes.iter().enumerate() {
@@ -435,26 +435,19 @@ fn rs_rows(trace: &Trace, readers: &[Read]) -> Result<Vec<(FixedRow, RsRow)>, Ch
     }
     let mut rows = Vec::new();
     let mut push = |planes: Vec<RsPlane>, state: Option<u32>, layer: Option<u32>, shard| {
-        let per_token: u64 = planes.iter().map(|p| p.bytes).sum();
         let id = RowId::Rs(u32::try_from(rows.len()).unwrap_or(u32::MAX));
         let layer = state
             .and_then(|row| readers.get(row as usize))
             .and_then(|r| r.layer)
             .or(layer);
         rows.push((
-            FixedRow {
+            TokenRow {
                 id,
                 layer,
-                bytes: u64::from(UNFOLDED_ROWS) * per_token,
-                atom: Atom {
-                    contract: Contract::Tokens,
-                    axis: 0,
-                    extent: u64::from(UNFOLDED_ROWS),
-                    bytes: per_token,
-                    grain: 1,
-                },
+                planes: planes.iter().map(|p| p.bytes).collect(),
+                window: None,
+                ratio: 1,
                 shard,
-                ring_tokens: None,
             },
             RsRow { state, planes },
         ));
@@ -471,12 +464,16 @@ fn rs_rows(trace: &Trace, readers: &[Read]) -> Result<Vec<(FixedRow, RsRow)>, Ch
             });
         }
         let row = cache(state);
-        // The rs planes are cut as the recurrence's own state is.
+        // The rs planes are cut as the recurrence's own state is: as many
+        // parts as its heads let the ranks cut.
         let shard = match row.and_then(|row| trace.caches.get(row as usize)) {
             Some(CacheRow::State { shard, .. }) if *shard != Shard::Replicated => Shard::Cut {
                 axis: 1,
                 segments: vec![width],
-                heads: Vec::new(),
+                heads: match shard {
+                    Shard::Cut { heads, .. } => heads.clone(),
+                    _ => Vec::new(),
+                },
             },
             _ => Shard::Replicated,
         };
