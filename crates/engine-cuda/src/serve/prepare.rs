@@ -994,7 +994,13 @@ impl FrameShell for Shell {
             rs_order[row.source as usize] = fire_lane as u32;
             let port = envelope_of[source].and_then(|(held, _)| resolved[held].fold.as_deref());
             let (verb, folded) = match &seated.rs {
-                RsVerb::Fold => (RsMove::None, row.rows),
+                RsVerb::Fold => {
+                    // A lane that folds its rows itself leaves nothing ahead:
+                    // a working set new to this record starts so.
+                    let slot = seated.rs_slot.unwrap_or(lane.slot);
+                    fold_held(&mut self.rs_ahead, slot, None, false);
+                    (RsMove::None, row.rows)
+                }
                 RsVerb::Buffer {
                     pages,
                     base,
@@ -1005,13 +1011,12 @@ impl FrameShell for Shell {
                     // A device-counted fold not yet settled left the state
                     // past the runtime's length.
                     let slot = seated.rs_slot.unwrap_or(lane.slot);
-                    let folded = &match self.rs_ahead.get(&slot) {
-                        Some(&at) if at > *folded && seated.rs_reset != RsReset::Fresh => at,
-                        _ => {
-                            self.rs_ahead.remove(&slot);
-                            *folded
-                        }
-                    };
+                    let folded = &fold_held(
+                        &mut self.rs_ahead,
+                        slot,
+                        Some(*folded),
+                        seated.rs_reset == RsReset::Fresh,
+                    );
                     let stated = match &ports {
                         Some(ports) => ports.slots(row.rows as usize)?,
                         None => None,
@@ -1777,6 +1782,26 @@ fn stated_fold(len: FoldLen, lane: usize, port: Option<&[u32]>) -> Result<u32> {
     })
 }
 
+/// The slots the state in record `slot` holds as a lane's fire finds it.
+/// A buffered lane states `folded`, which a device-counted fold not yet
+/// settled has left behind what `ahead` holds; a lane that starts fresh, or
+/// folds its rows itself (`None`: a working set new to the record starts
+/// with such a fire), leaves nothing ahead.
+fn fold_held(
+    ahead: &mut std::collections::HashMap<u32, u32>,
+    slot: u32,
+    folded: Option<u32>,
+    fresh: bool,
+) -> u32 {
+    match (ahead.get(&slot), folded) {
+        (Some(&at), Some(folded)) if at > folded && !fresh => at,
+        (_, folded) => {
+            ahead.remove(&slot);
+            folded.unwrap_or(0)
+        }
+    }
+}
+
 /// A lane's windowed table where it names window list slot refs: a page wholly
 /// behind the window of the lane's first row reads the null slot, the rest
 /// the refs the lane was handed, one a page of its table.
@@ -1918,7 +1943,7 @@ impl Shell {
 
 #[cfg(test)]
 mod tests {
-    use super::readout_extent;
+    use super::{fold_held, readout_extent};
 
     #[test]
     fn a_readout_as_tall_as_the_fire_holds_the_bucket() {
@@ -1926,5 +1951,24 @@ mod tests {
         assert_eq!(readout_extent(133, 256, 5), 5);
         assert_eq!(readout_extent(133, 133, 133), 133);
         assert_eq!(readout_extent(0, 64, 0), 0);
+    }
+
+    /// A device-counted fold left record 3's state at slot 92; the record
+    /// then went to a new working set, whose prefill folds its own rows. Its
+    /// buffered fires read the state where they state it, not at 92.
+    #[test]
+    fn a_folding_lane_forgets_the_fold_a_record_was_left_ahead_at() {
+        let mut ahead = std::collections::HashMap::from([(3u32, 92u32), (5, 40)]);
+        // The working set the fold was counted for still reads it ahead.
+        assert_eq!(fold_held(&mut ahead, 3, Some(60), false), 92);
+        // A new working set's prefill on the record.
+        fold_held(&mut ahead, 3, None, false);
+        assert_eq!(fold_held(&mut ahead, 3, Some(28), false), 28);
+        // A fresh buffered lane forgets it too, and a settled fold is past it.
+        assert_eq!(fold_held(&mut ahead, 5, Some(12), true), 12);
+        assert!(ahead.is_empty());
+        ahead.insert(7, 40);
+        assert_eq!(fold_held(&mut ahead, 7, Some(48), false), 48);
+        assert!(ahead.is_empty());
     }
 }
