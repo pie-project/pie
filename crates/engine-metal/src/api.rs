@@ -15,7 +15,7 @@ use engine::load::{Budgets as LoadBudgets, Checkpoint, LoadFacts, LoadRequest, L
 use engine::program::{
     BindExtents, BoundInstance, InstanceBinding, InstanceId, ProgramId, ProgramRegistration,
 };
-use engine::transfer::{KvCopy, MemoryDomain, StateCopy, StateDirection};
+use engine::transfer::{KvCopy, MemoryDomain};
 use eta_ir::registry::{GeometryClass, Port, PortMask};
 use poem_compiler::{Budget, DeviceProfile, PATCH_LATTICE_FLOOR, PatchLadder};
 use poem_ir::Trace;
@@ -863,36 +863,6 @@ impl Engine for Metal {
         self.loaded_mut()?.copy_kv(&moves).map_err(fault)
     }
 
-    fn copy_state(&mut self, copy: &StateCopy) -> EngineResult<()> {
-        for (at, move_) in copy.moves.iter().enumerate() {
-            if move_.src_token_offset != 0 || move_.dst_token_offset != 0 {
-                return Err(Error::Invalid(format!(
-                    "state move {at} names a token offset, and a recurrent bank is a folded \
-                     summary of a prefix rather than an array of per-token entries — this \
-                     engine moves whole slots"
-                )));
-            }
-        }
-        let ends = |moves: &[engine::transfer::StateMove]| -> (Vec<u32>, Vec<u32>) {
-            moves.iter().map(|m| (m.src_slot_id, m.dst_slot_id)).unzip()
-        };
-        let ((src, dst), (page_src, page_dst)) = (ends(&copy.moves), ends(&copy.pages));
-        let shell = self.loaded_mut()?;
-        let copied: crate::error::Result<()> = match copy.direction {
-            StateDirection::DeviceToDevice => shell
-                .copy_state(&src.into_iter().zip(dst).collect::<Vec<_>>())
-                .and_then(|()| {
-                    shell.copy_pages(&page_src.into_iter().zip(page_dst).collect::<Vec<_>>())
-                }),
-            StateDirection::DeviceToHost => shell
-                .park_state(true, &src, &dst)
-                .and_then(|()| shell.park_pages(true, &page_src, &page_dst)),
-            StateDirection::HostToDevice => shell
-                .park_state(false, &dst, &src)
-                .and_then(|()| shell.park_pages(false, &page_dst, &page_src)),
-        };
-        copied.map_err(fault)
-    }
 }
 
 impl Metal {

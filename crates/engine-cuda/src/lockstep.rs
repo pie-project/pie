@@ -32,7 +32,7 @@ use engine::fire::{FireTicket, FrameSubmission, FrameTicket, Step};
 use engine::load::{LoadRequest, Loaded};
 use engine::placement::Limits;
 use engine::program::{BoundInstance, InstanceBinding, InstanceId, ProgramId, ProgramRegistration};
-use engine::transfer::{KvCopy, KvHandle, StateCopy};
+use engine::transfer::{KvCopy, KvHandle};
 
 /// What a rank brings to a step: its frame and the token bucket it asks.
 pub struct Arrival<F> {
@@ -815,10 +815,6 @@ impl Engine for Rank {
 
     fn copy_kv(&mut self, copy: &KvCopy) -> EngineResult<()> {
         self.with(|cuda| cuda.copy_kv(copy))
-    }
-
-    fn copy_state(&mut self, copy: &StateCopy) -> EngineResult<()> {
-        self.with(|cuda| cuda.copy_state(copy))
     }
 
     fn copy_slots(&mut self, copy: &engine::chunk::SlotCopy) -> EngineResult<()> {

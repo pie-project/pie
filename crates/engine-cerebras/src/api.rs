@@ -33,7 +33,7 @@ use engine::fire::{
 };
 use engine::load::{Budgets as LoadBudgets, Checkpoint, LoadFacts, LoadRequest, Loaded};
 use engine::program::{BoundInstance, InstanceBinding, InstanceId, ProgramId, ProgramRegistration};
-use engine::transfer::{KvCopy, MemoryDomain, StateCopy};
+use engine::transfer::{KvCopy, MemoryDomain};
 use eta_ir::registry::{GeometryClass, PortMask, Stage};
 use poem_compiler::{Budget, PATCH_LATTICE_FLOOR, PatchLadder};
 use poem_ir::Trace;
@@ -675,16 +675,6 @@ impl Engine for Cerebras {
         self.loaded_mut()?
             .copy_kv_with(&moves, &copy.windowed)
             .map_err(fault)
-    }
-
-    fn copy_state(&mut self, copy: &StateCopy) -> EngineResult<()> {
-        let _ = copy;
-        Err(Error::Unsupported {
-            verb: "`copy_state`: this engine's records are slot refs of its fixed shape, \
-                   copied as a lane's `[run, cow]` (`Lane::fixed`), and its rs rows an rs \
-                   list's slots (`Lane::slot_copies`)",
-            engine: "cerebras",
-        })
     }
 
     fn commit_segments(&mut self, segments: u32) -> EngineResult<()> {

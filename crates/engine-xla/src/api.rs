@@ -33,7 +33,7 @@ use engine::fire::{
 };
 use engine::load::{Budgets as LoadBudgets, Checkpoint, LoadFacts, LoadRequest, Loaded};
 use engine::program::{BoundInstance, InstanceBinding, InstanceId, ProgramId, ProgramRegistration};
-use engine::transfer::{KvCopy, MemoryDomain, StateCopy};
+use engine::transfer::{KvCopy, MemoryDomain};
 use eta_ir::registry::{GeometryClass, PortMask, Stage};
 use poem_compiler::{Budget, PATCH_LATTICE_FLOOR, PatchLadder};
 use poem_ir::Trace;
@@ -655,19 +655,6 @@ impl Engine for Xla {
             shell.copy_slots(&pairs).map_err(fault)?;
         }
         Ok(())
-    }
-
-    /// A record is copied by naming a copy-on-write slot in `Lane::fixed`
-    /// (CONTRACT-BC 8); no state moves by ids outside the pool.
-    fn copy_state(&mut self, copy: &StateCopy) -> EngineResult<()> {
-        if copy.moves.is_empty() && copy.pages.is_empty() {
-            return Ok(());
-        }
-        Err(Error::Unsupported {
-            verb: "`copy_state` (records copy by `Lane::fixed` copy-on-write slots, rs list \
-                   slots by `Lane::slot_copies`)",
-            engine: "xla",
-        })
     }
 
     /// The pool is fixed at load: one segment, committed whole.

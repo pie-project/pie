@@ -367,15 +367,6 @@ impl Shell {
         self.tap_sink = Some(sink);
     }
 
-    pub fn copy_state(&mut self, src: u32, dst: u32) -> Result<()> {
-        match self.rs_ahead.get(&src).copied() {
-            Some(at) => self.rs_ahead.insert(dst, at),
-            None => self.rs_ahead.remove(&dst),
-        };
-        self.pools.copy_slot(self.device.stream(), src, dst)?;
-        self.device.synchronize()
-    }
-
     /// Whether this load asks the planner to serve a decoding lane's pages
     /// before a prompt waiting to be seated (`engine.seated_first`).
     #[must_use]
@@ -404,12 +395,6 @@ impl Shell {
 
     fn state_row_bytes(&self) -> u64 {
         self.pools.state_slot_bytes()
-    }
-
-    /// A buffer page moved within the device: there is none, the rs list's
-    /// slots moving by `copy_slots`.
-    pub fn copy_pages(&mut self, moves: &[(u32, u32)]) -> Result<()> {
-        no_buffer_pages(moves.len())
     }
 
     /// Copies full pages and token cells in the full kv rows. A windowed
@@ -1088,14 +1073,3 @@ impl EnqueuedPhase for Enqueued<'_> {
     }
 }
 
-/// Refuses a move of rs buffer pages by page id: the rs list's slots move
-/// by `copy_slots` (CONTRACT-BC 18, 22).
-fn no_buffer_pages(named: usize) -> Result<()> {
-    if named == 0 {
-        return Ok(());
-    }
-    Err(Fault::Unsupported(format!(
-        "{named} rs buffer page(s) named by page id: this engine moves the rs list's slots by \
-         copy_slots"
-    )))
-}

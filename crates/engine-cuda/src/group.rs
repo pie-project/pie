@@ -10,7 +10,7 @@ use engine::fire::MediaEncode;
 use engine::fire::{FrameSubmission, FrameTicket, Step};
 use engine::load::{LoadRequest, Loaded};
 use engine::program::{BoundInstance, InstanceBinding, InstanceId, ProgramId, ProgramRegistration};
-use engine::transfer::{KvCopy, KvHandle, StateCopy};
+use engine::transfer::{KvCopy, KvHandle};
 use eta_ir::container::HostRole;
 
 use crate::api::{ContractFor, Cuda, DeviceBoot, World};
@@ -529,11 +529,6 @@ impl Engine for Group {
     fn copy_kv(&mut self, copy: &KvCopy) -> EngineResult<()> {
         let copy = copy.clone();
         self.lead(move |rank| rank.copy_kv(&copy))
-    }
-
-    fn copy_state(&mut self, copy: &StateCopy) -> EngineResult<()> {
-        let copy = copy.clone();
-        self.lead(move |rank| rank.copy_state(&copy))
     }
 
     /// Each rank moves its band of every slot to and from its own tiers

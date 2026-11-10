@@ -13,7 +13,7 @@ use engine::fire::{
 };
 use engine::load::{Budgets as LoadBudgets, Checkpoint, LoadFacts, LoadRequest, Loaded};
 use engine::program::{BoundInstance, InstanceBinding, InstanceId, ProgramId, ProgramRegistration};
-use engine::transfer::{KvCopy, MemoryDomain, StateCopy, StateDirection};
+use engine::transfer::{KvCopy, MemoryDomain};
 use eta_ir::registry::{GeometryClass, PortMask, Stage};
 use poem_compiler::{Budget, DeviceProfile, PATCH_LATTICE_FLOOR, PatchLadder};
 use poem_ir::Trace;
@@ -767,38 +767,6 @@ impl Engine for Vulkan {
         self.loaded_mut()?.copy_kv(&moves).map_err(fault)
     }
 
-    fn copy_state(&mut self, copy: &StateCopy) -> EngineResult<()> {
-        for (at, move_) in copy.moves.iter().enumerate() {
-            if move_.src_token_offset != 0 || move_.dst_token_offset != 0 {
-                return Err(Error::Invalid(format!(
-                    "state move {at} names a token offset; this engine moves whole slots"
-                )));
-            }
-        }
-        let ends = |moves: &[engine::transfer::StateMove]| -> (Vec<u32>, Vec<u32>) {
-            moves.iter().map(|m| (m.src_slot_id, m.dst_slot_id)).unzip()
-        };
-        if !copy.pages.is_empty() {
-            return Err(Error::Invalid(
-                "a state copy naming rs buffer pages: the rs buffer is the pool's rs list, \
-                 whose slots move by `copy_slots`"
-                    .to_string(),
-            ));
-        }
-        let (src, dst) = ends(&copy.moves);
-        match copy.direction {
-            StateDirection::DeviceToDevice => self
-                .loaded_mut()?
-                .copy_state(&src.into_iter().zip(dst).collect::<Vec<_>>())
-                .map_err(fault),
-            StateDirection::DeviceToHost | StateDirection::HostToDevice => {
-                Err(Error::Unsupported {
-                    verb: "copy_state between tiers (host chunks move by `copy_slots`)",
-                    engine: "vulkan",
-                })
-            }
-        }
-    }
 }
 
 impl Vulkan {
