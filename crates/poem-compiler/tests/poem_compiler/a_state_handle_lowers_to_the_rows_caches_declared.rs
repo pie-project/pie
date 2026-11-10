@@ -72,7 +72,15 @@ fn inkling(path: &str, _row: &CacheRow) -> String {
 }
 
 fn deepseek_v4(path: &str, _row: &CacheRow) -> String {
-    path.to_string()
+    match parts(path)[..] {
+        ["layers", l, "attn", "kv"] => format!("kv.{l}"),
+        ["layers", l, "attn", "pool", "entries"] => format!("pool.{l}"),
+        ["layers", l, "attn", "indexer", "keys"] => format!("index.{l}"),
+        ["layers", l, "engram", "ids_state"] => format!("engram.{l}"),
+        ["mtp", "block", "attn", "kv"] => "kv.mtp".to_string(),
+        ["dspark", "stages", s, "attn", "kv"] => format!("dspark.{s}"),
+        _ => path.to_string(),
+    }
 }
 
 fn gemma_4(path: &str, _row: &CacheRow) -> String {

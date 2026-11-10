@@ -5,7 +5,20 @@
 
 load("//lib/adapters.poem", "banks", "corrected")
 load("//lib/hyper.poem", "hyper", "mix", "mixes", "gate", "collapse", "predict_route")
-load("//lib/mla.poem", "fp8_rows", "boundaries")
+load("//lib/mla.poem", "boundaries")
+
+def held(kv):
+    """What a deployment's kv keeps DeepSeek's rows as: the window's, the
+    pools' entries and the index keys. An e4m3 kv keeps V4's rows
+    (FlashMLA's fp8_ds_mla) in the window and the pools, its index keys at
+    bf16; an nvfp4 kv keeps V4.1's as its reference quantizes them: the
+    window as MXFP8 rows, the pools as compressed rows, the index keys as
+    FP4 keys."""
+    if kv == dtype.e4m3:
+        return struct(window = kv_rows.v4, pool = kv_rows.v4, keys = dtype.bf16)
+    if kv == dtype.nvfp4:
+        return struct(window = kv_rows.mx8, pool = kv_rows.nv4, keys = kv_rows.fp4_keys)
+    return struct(window = kv, pool = kv, keys = kv)
 
 R1 = template("deepseek")
 TOKENIZER = tokenizer(markers = [["<｜end▁of▁sentence｜>", "<|EOT|>"]])
@@ -85,6 +98,7 @@ def base(w, kv, d):
     hidden = d.hidden
     streams = d.streams
     q_w = d.heads * d.head_dim
+    rows = held(kv)
 
     def layer(l):
         n = lambda s: "layer.{}.{}".format(l, s)
@@ -138,8 +152,10 @@ def base(w, kv, d):
                 o_up = weight([hidden, d.o_lora], w),
                 o_groups = 1,
                 sink = weight([d.heads], w),
-                kv = "kv.{}".format(l),
-                pool = struct(ratio = ratio, entries = "pool.{}".format(l), compressor = None, owner = True)
+                # The window's row a token, and a pool's entry every `ratio`.
+                kv = state([tokens, q_w], rows.window),
+                pool = struct(ratio = ratio, entries = state([tokens // ratio, d.head_dim], rows.pool),
+                              compressor = None, owner = True)
                     if ratio != None else None,
                 indexer = None,
                 selection = "none",
@@ -158,7 +174,6 @@ def base(w, kv, d):
         heads = d.heads,
         head_dim = d.head_dim,
         window = d.window,
-        kv = kv,
         hyper = hyper(streams, d.norm_eps, d.gate_eps, d.alpha, d.sinkhorn),
         embed = weight([d.vocab, hidden], w),
         head = None,
@@ -254,6 +269,7 @@ def flash(w, r, kv, d, quant = None):
     kv_latent = d.kv_latent
     o_out = d.o_groups * d.o_lora
     idx_w = d.index_heads * d.index_head_dim
+    rows = held(kv)
 
     def compressor(prefix, ratio, entries, norm_w):
         return struct(
@@ -264,8 +280,8 @@ def flash(w, r, kv, d, quant = None):
             norm_eps = d.norm_eps,
         )
 
-    def layer_at(prefix, key, ratio, hash, experts, routed_banks, weights, sdense, lin = None):
-        """The layer named `prefix`, its caches named by `key`."""
+    def layer_at(prefix, ratio, hash, experts, routed_banks, weights, sdense, lin = None):
+        """The layer named `prefix`."""
         n = lambda s: "{}.{}".format(prefix, s)
         q = lin if lin != None else weights
         norm = lambda s, dim: weight([dim], sdense)
@@ -276,7 +292,7 @@ def flash(w, r, kv, d, quant = None):
             entries = 2 * kv_latent if has_indexer else kv_latent
             pool = struct(
                 ratio = ratio,
-                entries = "pool." + key,
+                entries = state([tokens // ratio, d.head_dim], rows.pool),
                 compressor = compressor(n("compressor"), ratio, entries, kv_latent),
                 owner = True,
             )
@@ -295,7 +311,7 @@ def flash(w, r, kv, d, quant = None):
                 compressor = compressor(n("indexer.compressor"), ratio, 2 * d.index_head_dim, d.index_head_dim),
                 wk = None,
                 k_norm = None,
-                keys = "index." + key,
+                keys = state([tokens // ratio, d.index_head_dim], rows.keys),
                 owns_keys = True,
             )
         if hash:
@@ -323,7 +339,7 @@ def flash(w, r, kv, d, quant = None):
                 o_up = weight([hidden, o_out], q),
                 o_groups = d.o_groups,
                 sink = weight([d.heads], sdense),
-                kv = "kv." + key,
+                kv = state([tokens, kv_latent], rows.window),
                 pool = pool,
                 indexer = indexer,
                 selection = "own" if has_indexer else "none",
@@ -339,7 +355,6 @@ def flash(w, r, kv, d, quant = None):
     layers = [
         layer_at(
             "layer.{}".format(l),
-            key = str(l),
             ratio = d.pool[l],
             hash = l < d.num_hash_layers,
             experts = d.experts,
@@ -360,7 +375,6 @@ def flash(w, r, kv, d, quant = None):
             h_proj = weight([streams * hidden, hidden], bf),
             block = layer_at(
                 "mtp.decoder",
-                key = "mtp",
                 ratio = None,
                 hash = False,
                 experts = DRAFT_EXPERTS,
@@ -378,7 +392,6 @@ def flash(w, r, kv, d, quant = None):
         heads = d.heads,
         head_dim = d.head_dim,
         window = d.window,
-        kv = kv,
         hyper = hyper(streams, d.norm_eps, d.gate_eps, d.alpha, d.sinkhorn),
         embed = weight([d.vocab, hidden], w),
         head = weight([d.vocab, hidden], w),
@@ -506,6 +519,11 @@ def flash41(w, r, kv, d, quant = None, dspark = False):
     o_out = d.o_groups * d.o_lora
     o_in = q_w // d.o_groups
     idx_w = d.index_heads * d.index_head_dim
+    rows = held(kv)
+    # Each KV source's pool, an entry every `ratio` positions, and its index
+    # keys: the layers after it up to the next source read them.
+    pools = {s: state([tokens // plan.ratios[s], d.head_dim], rows.pool) for s in plan.kv_sources}
+    index_keys = {s: state([tokens // plan.ratios[s], d.index_head_dim], rows.keys) for s in plan.kv_sources}
 
     def layer(l):
         prefix = "layer.{}".format(l)
@@ -525,7 +543,7 @@ def flash41(w, r, kv, d, quant = None, dspark = False):
                 fail("layer {} compresses at ratio {} but no KV source precedes it".format(l, ratio))
             pool = struct(
                 ratio = ratio,
-                entries = "pool.{}".format(kv_of),
+                entries = pools[kv_of],
                 compressor = struct(
                     wkv = weight([kv_latent, hidden]),
                     wgate = weight([kv_latent, hidden]) if ratio > 1 else None,
@@ -550,7 +568,7 @@ def flash41(w, r, kv, d, quant = None, dspark = False):
                 compressor = None,
                 wk = weight([d.index_head_dim, kv_latent]) if owner else None,
                 k_norm = norm("indexer.k_norm", d.index_head_dim) if owner else None,
-                keys = "index.{}".format(kv_of if kv_of != None else l),
+                keys = index_keys[kv_of],
                 owns_keys = owner,
             )
         selection = {"swa": "none", "full": "own", "reindex": "own", "reuse": "shared"}[csa]
@@ -579,16 +597,16 @@ def flash41(w, r, kv, d, quant = None, dspark = False):
                 head_dim = e.head_dim,
                 pad = e.pad,
                 eps = d.norm_eps,
-                ids_state = "engram.{}".format(l),
+                # The last `ngram - 1` tokens a lane read.
+                ids_state = state([e.ngram - 1], dtype.i32),
             )
 
-        return block(prefix, l, "kv.{}".format(l), ratio, pool, indexer, selection, engram,
-                     d.experts, d.top_k)
+        return block(prefix, l, ratio, pool, indexer, selection, engram, d.experts, d.top_k)
 
-    def block(prefix, l, kv_name, ratio, pool, indexer, selection, engram, experts, top_k,
+    def block(prefix, l, ratio, pool, indexer, selection, engram, experts, top_k,
               window_sink = None):
         """A V4.1 block under `prefix` (routed banks stored as layer `l`'s):
-        attention over the window `kv_name` and `pool`, MoE of `experts` taken
+        attention over its window's row a token and `pool`, MoE of `experts` taken
         `top_k` a row. With `window_sink`, a DSpark stage's: its rows read that
         many window positions ending at their lane's last."""
         n = lambda s: "{}.{}".format(prefix, s)
@@ -615,7 +633,7 @@ def flash41(w, r, kv, d, quant = None, dspark = False):
                 o_up = weight([hidden, o_out], q),
                 o_groups = d.o_groups,
                 sink = weight([d.heads]),
-                kv = kv_name,
+                kv = state([tokens, kv_latent], rows.window),
                 pool = pool,
                 indexer = indexer,
                 selection = selection,
@@ -644,8 +662,8 @@ def flash41(w, r, kv, d, quant = None, dspark = False):
         ds = d.dspark
         targets = plan.dspark_targets
         stages = [
-            block("dspark.{}".format(s), plan.layers + s, "dspark.{}".format(s), 0, None, None, "none",
-                  None, ds.experts, ds.top_k, window_sink = d.window + ds.block)
+            block("dspark.{}".format(s), plan.layers + s, 0, None, None, "none", None, ds.experts,
+                  ds.top_k, window_sink = d.window + ds.block)
             for s in range(ds.stages)
         ]
         return struct(
@@ -666,12 +684,14 @@ def flash41(w, r, kv, d, quant = None, dspark = False):
         heads = d.heads,
         head_dim = d.head_dim,
         window = d.window,
-        kv = kv,
         hyper = hyper(streams, d.norm_eps, d.gate_eps, d.alpha, d.sinkhorn, single_pass = True),
         embed = weight([d.vocab, hidden]),
         head = weight([d.vocab, hidden]),
         hc_head = None,
         layers = [layer(l) for l in range(plan.layers)],
+        # The causal encoder-decoder's replay mark: where a lane's replay
+        # floor stands.
+        replay = state([1], dtype.i32) if plan.decoder != None else None,
         final_norm = weight([hidden]),
         final_norm_eps = d.norm_eps,
         mtp = None,
@@ -1197,106 +1217,17 @@ def summed(streams, hidden, count):
         y = ops.elemwise.residual_add(stream, y)
     return ops.elemwise.residual_add(rest, y)
 
-# An e4m3 kv deployment keeps the window's plane and the compressed rows as
-# DeepSeek's fp8 rows (FlashMLA's fp8_ds_mla): 448 e4m3 codes and the 64
-# rotated dims in bf16 a position, with seven ue8m0 exponents (one a 64
-# codes) in each page's footer, 584 bytes a position in a u8 plane. The
-# index keys stay at bf16.
-DS_ROW = 584
-
-# An nvfp4 kv deployment keeps V4.1's caches as its reference quantizes
-# them: the window's plane as MXFP8 rows (all 512 dims e4m3 under one ue8m0
-# a 32, 528 bytes a position), the compressed rows as NVFP4 ones (e2m1 under
-# one e4m3 a 16, 288 bytes) and the index keys as FP4 ones (e2m1 under one
-# ue8m0 a 32, 68 bytes), its index queries read at FP4 against them.
-MX8_ROW = 528
-NV4_ROW = 288
-FP4_KEY_ROW = 68
-
-# The ratios whose pools pack their entries a row each: every page size a
-# deployment serves at is a multiple of them.
-COMPACT_RATIOS = [2, 4]
-
-def fp4_rows(m):
-    return m.kv == dtype.nvfp4
-
-def split_kv(m, at):
-    """Whether the ranks split `at`'s cached kv by its heads: a row of more
-    than one head, unless a pool gathers its entries from the whole row."""
-    pooled = at.pool != None and at.pool.compressor == None
-    return at.kv_down.shape[0] > m.head_dim and not pooled
-
-def caches(m, c):
-    fp8 = fp8_rows(m)
-    fp4 = fp4_rows(m)
-    rows = dtype.u8 if fp8 or fp4 else m.kv
-    keys = dtype.u8 if fp4 else dtype.bf16 if fp8 else m.kv
-
-    def row(at):
-        if fp8:
-            return [DS_ROW]
-        if fp4:
-            return [MX8_ROW]
-        return [at.kv_down.shape[0]]
-
-    # The element format of the window's rows and of the pool's entries,
-    # fixed by the deployment's kv.
-    window_rows = "v4" if fp8 else "mx8" if fp4 else None
-    pool_rows = "v4" if fp8 else "nv4" if fp4 else None
-
-    # A pool compressing `ratio` positions into an entry keeps its entries
-    # compact, a row each: each position holds `1 / ratio` of a row (a page
-    # of positions `page / ratio` entries), where the ratio divides a page.
-    # A coarser pool (V4's 128) keeps a row a position, at each group's last.
-    def packed(width, ratio):
-        if ratio in COMPACT_RATIOS and width % ratio == 0:
-            return [width // ratio]
-        return [width]
-
-    # The window's plane is read only through its window: a windowed space,
-    # so a sequence keeps just its last `m.window` positions of it.
-    kv = c.kv_space(rows, m.window)
-    for w in m.layers:
-        at = w.attn
-        c.kv(kv, at.kv, row(at), m.head_dim, heads = split_kv(m, at), rows = window_rows)
-        ratio = at.pool.ratio if at.pool != None else 1
-        if at.pool != None and at.pool.owner:
-            pool = c.kv_space(rows)
-            entry = DS_ROW if fp8 else NV4_ROW if fp4 else m.head_dim
-            c.kv(pool, at.pool.entries, packed(entry, ratio), m.head_dim, rows = pool_rows)
-        if at.indexer != None and at.indexer.owns_keys:
-            index = c.kv_space(keys)
-            key = FP4_KEY_ROW if fp4 else at.indexer.head_dim
-            c.kv(index, at.indexer.keys, packed(key, ratio), at.indexer.head_dim,
-                 rows = "fp4_keys" if fp4 else None)
-        if w.engram != None:
-            c.state(w.engram.ids_state, [w.engram.ngram - 1], dtype.i32)
-    if m.decoder != None:
-        c.state(REPLAY, [1], dtype.i32)
-    if m.mtp != None:
-        at = m.mtp.block.attn
-        c.kv(kv, at.kv, row(at), m.head_dim, heads = split_kv(m, at), rows = window_rows)
-    if m.dspark != None:
-        # A DSpark stage's window: the last `m.window` committed positions
-        # and the drafted block above them.
-        ds = m.dspark
-        space = c.kv_space(rows, m.window + ds.block)
-        for st in ds.stages:
-            at = st.attn
-            c.kv(space, at.kv, row(at), m.head_dim, heads = split_kv(m, at), rows = window_rows)
-
 # The dtype the forward computes in on every deployment.
 ACT = dtype.bf16
 
 # A causal encoder-decoder's bounded replay (V4.1): a long prompt's leading
 # rows may run through the encoder alone (`fact.encode()` lanes), the decoder
 # replaying its last window; its windows read no keys below a lane's floor.
-REPLAY = "replay"
 
-def replay_floor(inputs, positions):
+def replay_floor(m, positions):
     """Each row's replay floor: an encoder-only lane's rows set it past
     themselves, every other row reads its own."""
-    state = inputs.state(REPLAY)
+    state = m.replay
     skipped = fact.encode()
     ops.attn.replay_floor(positions.on(skipped), state, True)
     return ops.attn.replay_floor(positions.on(~skipped), state, False)
@@ -1333,7 +1264,7 @@ def forward(m, inputs):
     floor = None
     replay_plan = None
     if m.decoder != None:
-        floor = replay_floor(inputs, positions.on(~switch_is("block_draft", "on")) if ds != None else positions)
+        floor = replay_floor(m, positions.on(~switch_is("block_draft", "on")) if ds != None else positions)
         # The decoder's rows are its own classes': a plan of their own.
         replayed = trunk.on(~fact.encode())
         replay_plan = ops.attn.plan_prefill(replayed, m.heads, kvh, m.head_dim, m.window)
