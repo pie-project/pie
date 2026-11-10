@@ -582,3 +582,13 @@ The `new-memory/` directory is bookkeeping and is removed before anything lands 
 - One conflict (engine-xla api.rs PoolFacts): new-memory's `shell.pool_facts()` now carries main's seat fields
   (seated_first / seat_to_end / seat_spread). engine-xla lib 7/8: the v6e tuning test fails identically on main.
 - Main is actively changing engine-xla / kernels-xla; the XLA chunk-pool port must rebase often.
+
+### M41 — 2026-11-10: weight-slot corruption fix (sc/l40s-weight-chunks ed36cd4d8)
+- Bug in M35/M36/M40: before lanes name slot refs the engine seats lane pages itself in the lowest free chunks, the
+  same chunks the runtime's allocator gives weight slots -> warm-up / re-arm fires overwrote cached experts / rows
+  (nemotron mini cached: wrong logits once slots sat at chunk 1). Probes had hidden it (slots in segment 2).
+- Fix: residency chunks are kept clear of engine seating (seated pages there reseated; refused if a live lane holds
+  rows on engine-seated pages); a held set arriving after slot-ref lanes no longer re-arms (stays on per-route select,
+  logged). Probes now lay weight slots from chunk 1.
+- Follow-up (design): engine self-seating and the runtime allocator share one pool; warm-up lanes should not use
+  runtime-owned chunks at all (e.g. a reserved scratch chunk) — revisit when degenerate mode is deleted.
