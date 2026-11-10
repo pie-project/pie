@@ -21,4 +21,4 @@ Legend: ✅ verified on hardware · 🟡 in progress / compile-only · 🔴 not 
 Pre-existing parity gaps (not memory, but in scope for parity): ROCm synth codegen, `gather.concat_cols`, FP8 MFMA m33;
 sm_100 tcgen05 W4A16 arms read no expert table; Metal MLA prefill unsupported.
 
-Owners: L40S (CUDA), AMD (ROCm), BM agent (Metal, Mac Studio), VK agent (Vulkan + wgpu), XLA agent (XLA/TPU, sc/xla-chunk-pool; no TPU — verified where it runs, rest marked unverified), TIER agent (host/disk tiers), Cerebras: unassigned.
+Owners: L40S (CUDA), AMD (ROCm), BM agent (Metal, Mac Studio), VK agent (Vulkan + wgpu), XLA agent (XLA/TPU, sc/xla-chunk-pool; no TPU — verified where it runs, rest marked unverified), TIER agent (host/disk tiers), CB agent (Cerebras, sc/cb-chunk-pool; no hardware — lib tests + host simulation, rest unverified).
