@@ -27,15 +27,12 @@ pub mod weight_store;
 
 pub mod decoded;
 pub(crate) mod feeds;
-#[cfg(target_vendor = "apple")]
-pub mod icb;
 pub mod inputs;
 mod keepalive;
 mod legs;
 pub mod mapping;
 pub mod mask;
 pub mod program;
-pub mod rebind;
 pub mod record;
 pub mod rs;
 pub mod run;
@@ -61,8 +58,6 @@ pub use diag::Diagnostics;
 pub use encode::{Sink, kernel_profile, reset_kernel_profile};
 pub use error::{Fault, Result};
 pub use experts::Plan as ResidencyPlan;
-#[cfg(target_vendor = "apple")]
-pub use icb::{Icb, Rebound};
 pub use inputs::Inputs;
 pub use program::{Fired, Launched, Plane as ProgramPlane, Session as ProgramSession};
 pub use record::{Arg, Point, Recording, Slot, Tape};

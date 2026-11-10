@@ -316,10 +316,6 @@ pub struct Shell {
     blobs: crate::blob::Store,
     held: Vec<u32>,
     programs: crate::program::Plane,
-    #[cfg(target_vendor = "apple")]
-    icb: Option<crate::icb::Icb>,
-    #[cfg(target_vendor = "apple")]
-    rebound: crate::icb::Rebound,
 }
 
 /// The longest a load waits for the Neural Engine's programs.
@@ -1127,10 +1123,6 @@ impl PreparedLoad<'_> {
             corrected,
             held: vec![0; paging.slots as usize],
             programs: crate::program::Plane::new(),
-            #[cfg(target_vendor = "apple")]
-            icb: None,
-            #[cfg(target_vendor = "apple")]
-            rebound: crate::icb::Rebound::default(),
         };
         shell.settle_ane()?;
         Ok(shell)
@@ -2473,46 +2465,20 @@ impl Shell {
         self.record_seated(&seated)
     }
 
-    #[cfg(target_vendor = "apple")]
-    pub fn build_icb(&mut self, lanes: &[Lane<'_>]) -> Result<()> {
-        let seated: Vec<Seated<'_>> = lanes.iter().copied().map(Seated::of).collect();
-        let taped = self
-            .drive(&seated, Mode::Record)?
-            .tape
-            .ok_or_else(|| Fault::Unbound {
-                what: "a recording, from a walk that was asked for one".to_string(),
-            })?;
-        let mode = Mode::Build {
-            slots: taped.slots.len(),
-            constants: crate::icb::constants_for(&taped),
-        };
-        self.drive(&seated, mode).map(|_| ())
-    }
-
-    #[cfg(target_vendor = "apple")]
-    #[must_use]
-    pub fn icb(&self) -> Option<&crate::icb::Icb> {
-        self.icb.as_ref()
-    }
-
-    #[cfg(target_vendor = "apple")]
-    #[must_use]
-    pub fn rebound(&self) -> crate::icb::Rebound {
-        self.rebound
-    }
-
-    #[cfg(target_vendor = "apple")]
-    pub fn fire_indirect(&mut self, lanes: &[Lane<'_>]) -> Result<Vec<Vec<f32>>> {
-        let seated: Vec<Seated<'_>> = lanes.iter().copied().map(Seated::of).collect();
-        Ok(self.drive(&seated, Mode::Replay)?.logits)
-    }
-
     pub fn record_seated(&mut self, lanes: &[Seated<'_>]) -> Result<Recording> {
-        self.drive(lanes, Mode::Record)?
-            .tape
-            .ok_or_else(|| Fault::Unbound {
-                what: "a recording, from a walk that was asked for one".to_string(),
-            })
+        self.drain()?;
+        let p = self.stage(StepView {
+            lanes,
+            attachments: &[],
+            media: &[],
+            clips: &[],
+            done: None,
+        })?;
+        let walked = self.walk_once(&p, Mode::Record)?;
+        self.handles.rewind();
+        walked.tape.ok_or_else(|| Fault::Unbound {
+            what: "a recording, from a walk that was asked for one".to_string(),
+        })
     }
 
     #[allow(clippy::arc_with_non_send_sync)]
@@ -3980,7 +3946,7 @@ impl Shell {
         let place = At::new();
         let mut frame = match mode {
             Mode::Encode => Some(self.device.frame()?),
-            Mode::Record | Mode::Build { .. } | Mode::Replay => None,
+            Mode::Record => None,
         };
         if let Some(frame) = frame.as_mut() {
             if let Some(plane) = self.nan_flags.as_ref() {
@@ -4005,20 +3971,7 @@ impl Shell {
                     .flushing_after(HEAD_LAUNCHES);
                 Encoded::Live(sink)
             }
-            Mode::Record | Mode::Replay => {
-                Encoded::Taped(Tape::new(&self.handles, &place, &p.windows))
-            }
-            #[cfg(target_vendor = "apple")]
-            Mode::Build { slots, constants } => Encoded::Built(crate::icb::Builder::new(
-                &self.device,
-                &self.pipelines,
-                &self.handles,
-                &place,
-                slots,
-                constants,
-            )?),
-            #[cfg(not(target_vendor = "apple"))]
-            Mode::Build { .. } => return Err(Fault::Deviceless),
+            Mode::Record => Encoded::Taped(Tape::new(&self.handles, &place, &p.windows)),
         };
         {
             let mut run = Run::new(
@@ -4054,16 +4007,9 @@ impl Shell {
             .iter()
             .map(|class| (class.rows, class.lanes))
             .collect();
-        #[cfg_attr(not(target_vendor = "apple"), allow(unused_mut))]
-        let mut built = None;
         let taped = match sink {
             Encoded::Live(_) => None,
             Encoded::Taped(tape) => Some(tape.finish(classes)),
-            #[cfg(target_vendor = "apple")]
-            Encoded::Built(builder) => {
-                built = Some(builder.finish()?);
-                None
-            }
         };
         let launches = (0..self.compiled.template().len() as u32)
             .map(|region| p.windows.runs(region).max(1))
@@ -4071,98 +4017,7 @@ impl Shell {
         Ok(Walked {
             frame,
             tape: taped,
-            built,
             launches,
-        })
-    }
-
-    #[allow(clippy::too_many_lines)]
-    #[cfg_attr(
-        not(target_vendor = "apple"),
-        allow(
-            unreachable_code,
-            reason = "off Apple every mode below diverges with `Deviceless`, so the \
-                      readback after them is unreachable rather than absent"
-        )
-    )]
-    fn drive(&mut self, lanes: &[Seated<'_>], mode: Mode) -> Result<Outcome> {
-        debug_assert!(
-            !matches!(mode, Mode::Encode),
-            "the encoding mode goes through the three phases"
-        );
-        self.drain()?;
-        let p = self.stage(StepView {
-            lanes,
-            attachments: &[],
-            media: &[],
-            clips: &[],
-            done: None,
-        })?;
-        let walked = self.walk_once(&p, mode)?;
-        let taped = walked.tape;
-        #[cfg(target_vendor = "apple")]
-        if let Some(built) = walked.built {
-            self.icb = Some(built);
-        }
-        #[cfg(not(target_vendor = "apple"))]
-        let _ = walked.built;
-        match mode {
-            Mode::Record => {
-                self.handles.rewind();
-                return Ok(Outcome {
-                    logits: Vec::new(),
-                    tape: taped,
-                });
-            }
-            Mode::Build { .. } => {
-                self.handles.rewind();
-                return Ok(Outcome {
-                    logits: Vec::new(),
-                    tape: None,
-                });
-            }
-            Mode::Replay => {
-                #[cfg(target_vendor = "apple")]
-                {
-                    let taped = taped.expect("the replay mode records");
-                    let Shell {
-                        device,
-                        pipelines,
-                        icb,
-                        rebound,
-                        ..
-                    } = self;
-                    let icb = icb.as_mut().ok_or_else(|| Fault::Unbound {
-                        what: "an indirect command buffer, which this load never built".to_string(),
-                    })?;
-                    *rebound = icb.rebind(device, pipelines, &taped)?;
-                    icb.execute(device)?;
-                }
-                #[cfg(not(target_vendor = "apple"))]
-                {
-                    let _ = taped;
-                    return Err(Fault::Deviceless);
-                }
-            }
-            Mode::Encode => unreachable!("checked above"),
-        }
-
-        let mut taken = vec![Vec::new(); lanes.len()];
-        for row in p.composition.lanes() {
-            let Some((_, offset, width, element)) = self.readback_row(&p, row)? else {
-                continue;
-            };
-            let mut raw = vec![0u8; width as usize * element as usize];
-            self.arena.read(offset, &mut raw)?;
-            taken[row.source as usize] = widen(&raw, element as usize);
-        }
-
-        self.advance(&p);
-
-        self.handles.rewind();
-        Ok(Outcome {
-            logits: taken,
-            tape: None,
         })
     }
 
@@ -4180,39 +4035,14 @@ impl Shell {
 const SETTLED_RING: usize = 2 * Runahead::STEPS_MAX as usize;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-#[cfg_attr(
-    not(target_vendor = "apple"),
-    allow(
-        dead_code,
-        reason = "the indirect plane is Apple's; the modes are named on both"
-    )
-)]
 enum Mode {
     Encode,
     Record,
-    Build { slots: usize, constants: u64 },
-    Replay,
-}
-
-struct Outcome {
-    #[cfg_attr(
-        not(target_vendor = "apple"),
-        allow(
-            dead_code,
-            reason = "the only reader is the indirect plane's, which is Apple's"
-        )
-    )]
-    logits: Vec<Vec<f32>>,
-    tape: Option<Recording>,
 }
 
 struct Walked {
     frame: Option<Frame>,
     tape: Option<Recording>,
-    #[cfg(target_vendor = "apple")]
-    built: Option<crate::icb::Icb>,
-    #[cfg(not(target_vendor = "apple"))]
-    built: Option<()>,
     launches: u32,
 }
 
@@ -4474,8 +4304,6 @@ impl engine::frame::Shell for Shell {
 enum Encoded<'a> {
     Live(Sink<'a>),
     Taped(Tape<'a>),
-    #[cfg(target_vendor = "apple")]
-    Built(crate::icb::Builder<'a>),
 }
 
 impl kernels_metal::Encode for Encoded<'_> {
@@ -4487,8 +4315,6 @@ impl kernels_metal::Encode for Encoded<'_> {
         match self {
             Encoded::Live(sink) => sink.fire(fire, args),
             Encoded::Taped(tape) => tape.fire(fire, args),
-            #[cfg(target_vendor = "apple")]
-            Encoded::Built(builder) => builder.fire(fire, args),
         }
     }
 
@@ -4496,8 +4322,6 @@ impl kernels_metal::Encode for Encoded<'_> {
         match self {
             Encoded::Live(sink) => sink.absent(),
             Encoded::Taped(tape) => tape.absent(),
-            #[cfg(target_vendor = "apple")]
-            Encoded::Built(builder) => builder.absent(),
         }
     }
 
@@ -4505,8 +4329,6 @@ impl kernels_metal::Encode for Encoded<'_> {
         match self {
             Encoded::Live(sink) => sink.signal(stamp),
             Encoded::Taped(tape) => tape.signal(stamp),
-            #[cfg(target_vendor = "apple")]
-            Encoded::Built(builder) => builder.signal(stamp),
         }
     }
 
@@ -4514,8 +4336,6 @@ impl kernels_metal::Encode for Encoded<'_> {
         match self {
             Encoded::Live(sink) => sink.wait(stamp),
             Encoded::Taped(tape) => tape.wait(stamp),
-            #[cfg(target_vendor = "apple")]
-            Encoded::Built(builder) => builder.wait(stamp),
         }
     }
 
@@ -4526,8 +4346,6 @@ impl kernels_metal::Encode for Encoded<'_> {
         match self {
             Encoded::Live(sink) => sink.on_commit(then),
             Encoded::Taped(tape) => tape.on_commit(then),
-            #[cfg(target_vendor = "apple")]
-            Encoded::Built(builder) => builder.on_commit(then),
         }
     }
 }
