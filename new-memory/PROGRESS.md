@@ -202,3 +202,11 @@ The `new-memory/` directory is bookkeeping and is removed before anything lands 
   old stats views remain as thin views; shared-pool / pieced facts are refused at boot until engines report them.
 - Verified on new-memory: `cargo check` runtime + worker; `runtime --lib store::` 63/63.
 - Running: P4 (CUDA kv stride), WC1 (compiler streamability), WC3 (CUDA expert table).
+
+### M11 — 2026-11-10: P3fix merged
+- `sc/p3fix-fixed-sets` (1cdab5d05): chunk recipe uses `FIXED_SETS_PER_WS = 1` + `COW_SETS_PER_LANE = 1` counted once
+  per pool (`cow_sets(&Budgets) = max_lanes`); new `fixed_sets_per_ws()`, `cow_sets()/cow_slots()/cow_chunks()`.
+  Server preset: qwen3-next fixed 47.8 MiB/ws (was 95.5), nemotron-super 163.3 (was 326.7); C unchanged.
+  Note: the default budget's 256 lanes make the CoW reserve large (and distort the Metal preset numbers);
+  revisit whether the reserve should cover only lanes that fork/snapshot in a fire.
+- Verified: `pie-poem-compiler --lib chunk`.
