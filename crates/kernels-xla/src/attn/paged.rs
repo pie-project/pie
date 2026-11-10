@@ -1013,7 +1013,7 @@ pub(crate) fn per_row(
         body(f, zero, &st0)?
     } else if table.is_none() && std::env::var("PIE_ROW_UNROLL").is_ok_and(|v| v == "1") && n <= 16 {
         // every chunk in line: the same gathers in every layer over this pool
-        let mut st = st0;
+        let mut st = st0.to_vec();
         for ci in 0..n {
             let at = scalar_i(f, ci);
             st = body(f, at, &st)?;
