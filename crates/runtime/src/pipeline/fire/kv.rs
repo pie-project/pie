@@ -92,6 +92,13 @@ pub fn prepare_explicit_reserved(
     Ok((copies, KvTxn { seq }))
 }
 
+/// The epoch a fire holds from its submission until it retires.
+pub fn begin_fire(store: &mut KvStore) -> KvTxn {
+    KvTxn {
+        seq: store.begin_fire(),
+    }
+}
+
 pub fn settle(store: &mut KvStore, txn: KvTxn) {
     store.settle(txn.seq);
 }

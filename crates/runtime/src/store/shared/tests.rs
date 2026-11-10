@@ -642,6 +642,9 @@ fn degenerate_facts_keep_their_own_pools() {
     assert!(crate::store::chunks::StorePools::of(&mixed).is_err());
 }
 
+/// A lane's [`Lane::fixed`].
+type LaneFixed = Vec<(EngineShape, Vec<[u32; 2]>)>;
+
 #[test]
 fn every_lane_of_a_group_names_the_record_the_group_writes() {
     use crate::pipeline::fire::rs::{
@@ -680,6 +683,19 @@ fn every_lane_of_a_group_names_the_record_the_group_writes() {
         req.lanes.into_iter().map(|lane| lane.fixed).collect()
     };
 
+    // CONTRACT-BC 15: the engine runs a fire's lanes at once, a lane that
+    // folds nothing reading `run` while a folding one writes `cow`; so with
+    // any lane folding, no lane of the group names its record in place.
+    let copied_on_every_lane = |lanes: &[LaneFixed]| {
+        lanes.iter().all(|fixed| {
+            !fixed.is_empty()
+                && fixed
+                    .iter()
+                    .flat_map(|(_, pieces)| pieces)
+                    .all(|[run, cow]| run != cow)
+        })
+    };
+
     // One lane folds: the group writes a fresh record, and every lane's
     // buffered rows land in it.
     let held = rs.folded_slot(ws).unwrap().unwrap().0;
@@ -687,7 +703,9 @@ fn every_lane_of_a_group_names_the_record_the_group_writes() {
     let cow = out.slot_ids[0];
     assert_ne!(cow, held);
     let want = shared.lock().unwrap().lane_fixed(held, cow);
-    assert_eq!(fixed(&out), vec![want.clone(), want.clone(), want]);
+    let lanes = fixed(&out);
+    assert!(copied_on_every_lane(&lanes), "{lanes:?}");
+    assert_eq!(lanes, vec![want.clone(), want.clone(), want]);
     settle(&mut rs, out.txn);
     assert_eq!(rs.folded_slot(ws).unwrap().map(|slot| slot.0), Some(cow));
 
@@ -732,4 +750,170 @@ fn every_lane_of_a_group_names_the_record_the_group_writes() {
     assert!(refused.ends_with(&error), "{refused}");
     assert_eq!(rs.frozen(ws), Ok(frozen), "a refused fire folds nothing");
     assert_eq!(rs.buffer_size(ws), size, "nor grows the buffer");
+
+    // A lone lane that folds writes its own record in place.
+    let solo = rs.create_working_set(geom);
+    let first = prepare(&mut rs, solo, 4).unwrap();
+    settle(&mut rs, first.txn);
+    let own = rs.folded_slot(solo).unwrap().unwrap().0;
+    let out = prepare(&mut rs, solo, 1).unwrap();
+    let mut req = crate::engine::FireRequest {
+        lanes: vec![crate::engine::fire::lane_of(0, vec![1], 0, Vec::new())],
+        ..crate::engine::FireRequest::default()
+    };
+    out.apply_to(&mut req);
+    apply_shared(&mut req, Some(&shared), Some(&out));
+    assert_eq!(
+        req.lanes[0].fixed,
+        shared.lock().unwrap().lane_fixed(own, own)
+    );
+    settle(&mut rs, out.txn);
+
+    // A fold the device makes is a fold: every lane takes the copy too.
+    let frozen = rs.frozen(solo).unwrap();
+    let out = prepare_many(
+        &mut rs,
+        &[solo; 3],
+        &group(frozen..frozen + 3, GroupFold::Device),
+        None,
+    )
+    .unwrap();
+    let device = out.slot_ids[0];
+    assert_ne!(device, own);
+    let lanes = fixed(&out);
+    assert!(copied_on_every_lane(&lanes), "{lanes:?}");
+    let want = shared.lock().unwrap().lane_fixed(own, device);
+    assert_eq!(lanes, vec![want.clone(), want.clone(), want]);
+    settle(&mut rs, out.txn);
+}
+
+#[test]
+fn a_snapshot_names_every_piece_of_its_record() {
+    use crate::pipeline::fire::rs::{
+        GroupFold, GroupPlan, RsPlan, apply_shared, prepare, prepare_many, settle,
+    };
+    use crate::store::rs::RsGeometry;
+
+    let facts = fixed_facts();
+    let shared: Shared = Arc::new(Mutex::new(SharedPool::new(&facts, 2, 256).unwrap()));
+    let stores = crate::store::registry::shared_stores(&shared, 16, 256);
+    let mut rs = stores.rs.lock().unwrap();
+    let ws = rs.create_working_set(RsGeometry {
+        state_size: 1024,
+        buffer_page_tokens: 4,
+    });
+    let first = prepare(&mut rs, ws, 4).unwrap();
+    settle(&mut rs, first.txn);
+    let plan = RsPlan::Groups(vec![GroupPlan {
+        lanes: vec![0],
+        writes: None,
+        fold: GroupFold::Host(4),
+        snapshots: vec![2],
+    }]);
+    let out = prepare_many(&mut rs, &[ws], &plan, None).unwrap();
+    let mut req = crate::engine::FireRequest {
+        lanes: vec![crate::engine::fire::lane_of(0, vec![1; 4], 0, Vec::new())],
+        ..crate::engine::FireRequest::default()
+    };
+    out.apply_to(&mut req);
+    apply_shared(&mut req, Some(&shared), Some(&out));
+    let [snap] = &req.lanes[0].rs_snapshots[..] else {
+        panic!("one snapshot");
+    };
+    let record = out.snapshots[0].slot.0;
+    let refs = shared.lock().unwrap().record_refs(record);
+    assert_eq!(refs[0].0, GDN);
+    assert_eq!(snap.row, 2);
+    assert_eq!(snap.pieces, refs[0].1, "every piece, in piece order");
+    assert_eq!(snap.pieces.len(), 3);
+    assert_eq!(snap.slot, snap.pieces[0], "the slot stays the first piece");
+    settle(&mut rs, out.txn);
+
+    // A record of one piece is named by its slot alone.
+    let mut one = fixed_facts();
+    one.shapes.retain(|shape| shape.id != GDN);
+    let mut pool = SharedPool::new(&one, 2, 256).unwrap();
+    let [record] = pool.take_records(1).unwrap()[..] else {
+        panic!("one record");
+    };
+    assert!(pool.snapshot_pieces(record).is_empty());
+    assert_eq!(pool.snapshot_ref(record), pool.record_refs(record)[0].1[0]);
+}
+
+/// CONTRACT-BC 17: every fire takes an epoch of the kv store, so a drained
+/// segment goes once the first fire after the engine took its copy retires
+/// (before, the epoch moved only on a copy-on-write, and a drain waited
+/// on a fire that never came).
+#[test]
+fn a_drained_segment_goes_once_the_next_fire_retires() {
+    let mut pool = pool();
+    let mut engine = FakeEngine::new();
+    let mut kv = crate::store::kv::KvStore::new(8, [7u8; 32]);
+    assert_eq!(pool.steer(8, 0, &mut engine), Retarget::Reached);
+    let held = pool.take_refs(LIST_POOL, 16 * 44).unwrap();
+    let keep: Vec<u32> = held
+        .chunks(16)
+        .enumerate()
+        .filter(|(at, _)| at % 8 == 0)
+        .flat_map(|(_, refs)| refs.to_vec())
+        .collect();
+    let gone: Vec<u32> = held.iter().copied().filter(|r| !keep.contains(r)).collect();
+    pool.give_refs(LIST_POOL, &gone);
+    // A decode in flight that copies nothing still holds an epoch.
+    let decode = kv.begin_fire();
+    let walk = |pool: &mut SharedPool, kv: &crate::store::kv::KvStore, engine: &mut FakeEngine| {
+        pool.pool_mut().retire_through(kv.retired_through());
+        pool.steer(7, kv.current_epoch() + 1, engine)
+    };
+    engine.calls.clear();
+    assert_eq!(walk(&mut pool, &kv, &mut engine), Retarget::Reached);
+    assert!(matches!(engine.calls[..], [Call::Evacuate(_)]));
+    // A second fire is handed out before the engine answers the copy: it
+    // may run ahead of the copy, and the drain waits on it too.
+    let racing = kv.begin_fire();
+    pool.evacuated(kv.current_epoch());
+    let draining = || SegmentState::Draining { until: racing + 1 };
+    assert_eq!(pool.pool().segments().state(5), draining());
+    kv.settle(decode);
+    kv.settle(racing);
+    assert_eq!(walk(&mut pool, &kv, &mut engine), Retarget::Reached);
+    assert_eq!(engine.prefix, 6, "no fire after the copy has retired yet");
+    // The next fire, a decode that copies nothing, runs after the copy.
+    let next = kv.begin_fire();
+    assert_eq!(next, racing + 1);
+    assert_eq!(walk(&mut pool, &kv, &mut engine), Retarget::Reached);
+    assert_eq!(engine.prefix, 6, "it is still in flight");
+    kv.settle(next);
+    assert_eq!(walk(&mut pool, &kv, &mut engine), Retarget::Reached);
+    assert_eq!(engine.prefix, 5, "released");
+    assert_eq!(engine.calls.last(), Some(&Call::Release(5)));
+}
+
+/// CONTRACT-BC 17: a page let go while a fire that reads it runs goes back
+/// to the shared pool only once that fire retires, though the fire copies
+/// nothing (before, it went back at once).
+#[test]
+fn a_freed_slot_waits_for_the_fire_that_read_it() {
+    let shared: Shared = Arc::new(Mutex::new(SharedPool::new(&fixed_facts(), 2, 256).unwrap()));
+    let stores = crate::store::registry::shared_stores(&shared, 16, 256);
+    let available = || shared.lock().unwrap().pool().available(LIST_POOL);
+    crate::store::registry::with_kv_lock(&stores.kv, "test", |kv| {
+        let ws = kv.create_working_set();
+        kv.reserve(ws, 1).unwrap();
+        let mut granted = kv.reserve_device_pages(1).unwrap();
+        let (_, txn) =
+            crate::pipeline::fire::kv::prepare_explicit_reserved(kv, ws, &[0], &mut granted)
+                .unwrap();
+        crate::pipeline::fire::kv::settle(kv, txn);
+        let page = kv.lookup(ws, 0).unwrap();
+        let before = available();
+        // A decode reads the page; its working set is let go meanwhile.
+        let fire = crate::pipeline::fire::kv::begin_fire(kv);
+        let epoch = kv.current_epoch();
+        kv.release_working_set(ws, epoch);
+        kv.retire_idle();
+        assert_eq!(available(), before, "{page:?} waits on the fire");
+        crate::pipeline::fire::kv::settle(kv, fire);
+        assert_eq!(available(), before + 1, "{page:?} back once it retired");
+    });
 }

@@ -581,6 +581,19 @@ impl SharedPool {
             .unwrap_or(0)
     }
 
+    /// Every piece of record `id`'s first fixed shape, in piece order, for
+    /// [`::engine::fire::RsSnapshot::pieces`] (CONTRACT-BC 16); empty where
+    /// the record is one piece, which [`Self::snapshot_ref`] names alone.
+    #[must_use]
+    pub fn snapshot_pieces(&self, id: u32) -> Vec<u32> {
+        self.record_refs(id)
+            .into_iter()
+            .next()
+            .map(|(_, refs)| refs)
+            .filter(|refs| refs.len() > 1)
+            .unwrap_or_default()
+    }
+
     // ---- rungs ----
 
     /// Sets the activation aside for fires of up to `rung` tokens. A rung
@@ -678,6 +691,15 @@ impl SharedPool {
             }
             SegmentState::Uncommitted => None,
         }
+    }
+
+    /// The engine took the evacuation [`Self::next_move`] planned, with
+    /// fires through `current` (the kv store's per-fire epoch, CONTRACT-BC
+    /// 17) handed out by then. Any of those may run ahead of the copy and
+    /// read the old location; the first fire after them runs after it. The
+    /// segment drains until that one, `current + 1`, retires.
+    pub fn evacuated(&mut self, current: u64) {
+        self.pool.fence_drains(current.saturating_add(1));
     }
 
     fn apply_evacuation(&mut self, evacuation: &Evacuation, epoch: u64) {

@@ -1164,6 +1164,20 @@ impl SlotPool {
         Ok(())
     }
 
+    /// Every draining segment waits on the fire at `epoch` too, where it
+    /// waited on an earlier one: the fire known, once the engine took the
+    /// evacuation, to come after its copy.
+    pub fn fence_drains(&mut self, epoch: u64) {
+        for segment in 0..self.segments.count() {
+            if let SegmentState::Draining { until } = self.segments.state(segment)
+                && until < epoch
+            {
+                self.segments
+                    .set_state(segment, SegmentState::Draining { until: epoch });
+            }
+        }
+    }
+
     /// Gives `segment` back: a drained one once its evacuation's fire has
     /// retired, or a committed one holding nothing.
     pub fn release_segment(&mut self, segment: u32) -> Result<(), SegmentError> {

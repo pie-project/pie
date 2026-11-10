@@ -520,7 +520,20 @@ impl KvStore {
         self.domain
     }
 
+    /// The epoch of the last fire (or write) handed out: an id let go now
+    /// waits on it, and with it on every fire that may read it.
     pub fn current_epoch(&self) -> u64 {
+        self.seq
+    }
+
+    /// Opens the epoch of a fire about to be submitted (CONTRACT-BC 17):
+    /// every fire takes one, a decode and a prefill that copy nothing
+    /// included, so what is let go while it runs (a freed page or slot, a
+    /// segment an evacuation drained) waits until it retires. Closed by
+    /// [`Self::settle`].
+    pub fn begin_fire(&mut self) -> u64 {
+        self.seq += 1;
+        self.outstanding.insert(self.seq);
         self.seq
     }
 

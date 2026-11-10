@@ -230,6 +230,7 @@ impl PreparedRs {
                 .map(|snap| engine::fire::RsSnapshot {
                     row: snap.row,
                     slot: snap.slot.0,
+                    pieces: Vec::new(),
                 })
                 .collect();
         }
@@ -247,7 +248,8 @@ impl PreparedRs {
 /// translation where one is stated, else its pages (the list shape's slot
 /// refs either way), its ring table its window refs; its fixed records the
 /// `[run, cow]` [`PreparedRs::run_cow`] names, a snapshot the slot ref of its
-/// record's first piece.
+/// record's first piece and, where the record takes more than one, every
+/// piece.
 pub fn apply_shared(
     req: &mut crate::engine::FireRequest,
     shared: Option<&crate::store::shared::Shared>,
@@ -268,6 +270,7 @@ pub fn apply_shared(
         lane.fixed = records.map_or_else(Vec::new, |(run, cow)| pool.lane_fixed(run, cow));
         if records.is_some() {
             for snap in &mut lane.rs_snapshots {
+                snap.pieces = pool.snapshot_pieces(snap.slot);
                 snap.slot = pool.snapshot_ref(snap.slot);
             }
         }

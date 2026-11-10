@@ -169,6 +169,35 @@ impl Drop for KvTxnGuard {
     }
 }
 
+/// A fire's own epoch in its engine's kv store (CONTRACT-BC 17): opened
+/// once its slots are bound, closed when the engine retires it, or, never
+/// submitted, when it is dropped. Every fire holds one, so the kv epoch
+/// that fences freed pages, the shared pool's freed slots and an evacuated
+/// segment's drain moves with every fire, not only with a copy-on-write.
+struct FireEpoch {
+    _txn: KvTxnGuard,
+}
+
+impl FireEpoch {
+    fn begin(model: usize, engine: usize, stores: &crate::store::registry::Stores) -> Self {
+        let txn = crate::store::registry::with_kv_lock(&stores.kv, "fire-epoch", kv::begin_fire);
+        Self {
+            _txn: KvTxnGuard::new(model, engine, Some(txn)),
+        }
+    }
+
+    /// Closes the epoch once the engine has run the fire `completion`
+    /// waits on: no sooner, since what it frees may still be read, and no
+    /// later than that, since a pass may not settle its fires for long.
+    fn retire_on(self, completion: &crate::engine::WorkItemCompletion) {
+        let completion = completion.clone();
+        crate::rt::spawn(async move {
+            let _ = completion.await;
+            drop(self);
+        });
+    }
+}
+
 struct RsTxnsGuard {
     model: usize,
     engine: usize,
@@ -1155,11 +1184,15 @@ struct Reserved {
     copies: kv::PageCopies,
     kvtxns: Vec<KvTxnGuard>,
     rs: rs::PreparedRs,
+    epoch: FireEpoch,
 }
 
-/// A demand that drifted from its grant is quoted again.
+/// A demand that drifted from its grant is quoted again. What it binds
+/// opens the fire's epoch on engine `engine` of model `model`.
+#[allow(clippy::too_many_arguments)]
 async fn reserve<C: FireContext>(
     ctx: &mut C,
+    (model, engine): (usize, usize),
     stores: &crate::store::registry::Stores,
     pipeline_id: uuid::Uuid,
     sets: &[(&KvWorkingSet, Written)],
@@ -1202,6 +1235,7 @@ async fn reserve<C: FireContext>(
                     copies,
                     kvtxns,
                     rs,
+                    epoch: FireEpoch::begin(model, engine, stores),
                 });
             }
             Err(ReservedError::Stale) if attempts < STALE_DEMAND_ATTEMPTS => attempts += 1,
@@ -2781,6 +2815,7 @@ pub async fn submit_pass_stamped<C: FireContext>(
             };
             let reserved = reserve(
                 ctx,
+                (model, engine),
                 &stores,
                 quorum_pipeline_id,
                 &sets,
@@ -2794,6 +2829,7 @@ pub async fn submit_pass_stamped<C: FireContext>(
                 copies: (copy_src, copy_dst),
                 kvtxns,
                 rs: rs_prepared,
+                epoch,
             } = match reserved {
                 Ok(reserved) => reserved,
                 Err(error) => return Ok(Err(error)),
@@ -2931,6 +2967,7 @@ pub async fn submit_pass_stamped<C: FireContext>(
                 record_submit_failure(ctx, &fwd, &pipeline_failure, &reason);
                 return Ok(Err(reason));
             }
+            epoch.retire_on(&completion);
             if let Some(reservation) = ticket_reservation {
                 reservation.commit();
             }
@@ -3733,6 +3770,7 @@ async fn fire_device_geometry<C: FireContext>(
     };
     let reserved = reserve(
         ctx,
+        (ws.model, ws.engine),
         &stores,
         quorum_pipeline_id,
         &sets,
@@ -3746,6 +3784,7 @@ async fn fire_device_geometry<C: FireContext>(
         copies: (copy_src, copy_dst),
         kvtxns,
         rs: mut rs_prepared,
+        epoch,
     } = match reserved {
         Ok(reserved) => reserved,
         Err(error) => return Ok(Err(error)),
@@ -3964,6 +4003,7 @@ async fn fire_device_geometry<C: FireContext>(
         record_submit_failure(ctx, &fwd, &pipeline_failure, &reason);
         return Ok(Err(reason));
     }
+    epoch.retire_on(&completion);
     ticket_reservation.commit();
     advance_shadow(ctx, &fwd)?;
     advance_cursors(&pass_lanes, None, &[], &fold, &settles);
