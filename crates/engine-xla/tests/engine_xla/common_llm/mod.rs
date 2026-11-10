@@ -22,9 +22,7 @@ static KNOBS: std::sync::Mutex<Vec<(String, u32)>> = std::sync::Mutex::new(Vec::
 
 /// Sets load budget `name` (`SLOTS`, `LANES`, `TOKENS`) for later loads.
 pub fn set_knob(name: &str, v: u32) {
-    let mut knobs = KNOBS
-        .lock()
-        .expect("the knobs");
+    let mut knobs = KNOBS.lock().expect("the knobs");
     knobs.retain(|(n, _)| n != name);
     knobs.push((name.to_string(), v));
 }

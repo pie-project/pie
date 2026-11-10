@@ -25,7 +25,7 @@ fn decode(name: &str, lanes: u32, held: u32, steps: u32) -> f64 {
     let context = 1024;
     set("SLOTS", lanes.max(4));
     set("LANES", lanes.max(8));
-    set("TOKENS", lanes.max(held).max(128));
+    set("TOKENS", (2 * lanes).max(held).max(128));
     let mut model = Model::load(name, None, context, 7);
     let vocab = model.vocab;
     let mut refs = Refs::of(&model);
