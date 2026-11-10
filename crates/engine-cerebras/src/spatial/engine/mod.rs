@@ -383,7 +383,7 @@ impl Engine for Spatial {
                 codegen_backend: None,
             },
             pools,
-            chunks: Some(chunks),
+            chunks,
             limits: FireLimits {
                 // The model holds one sequence's cache; a fire's lanes run one
                 // after another, each cache brought back from its tokens.

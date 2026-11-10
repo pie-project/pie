@@ -139,8 +139,7 @@ pub struct EngineConfig {
     pub weights_fit: bool,
     pub total_pages: usize,
     /// The pools as chunks: what the engine states
-    /// ([`::engine::Capabilities::chunks`]), else today's pools as the
-    /// degenerate mode's pinned shapes.
+    /// ([`::engine::Capabilities::chunks`]).
     pub chunks: ::engine::chunk::ChunkFacts,
     /// Bytes a kv page takes where the pool can change size; zero: it cannot.
     pub resizable_kv_page_bytes: u64,

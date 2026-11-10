@@ -124,11 +124,9 @@ impl PoolFacts {
 pub struct Capabilities {
     pub device: DeviceFacts,
     pub pools: PoolFacts,
-    /// The pools as chunks, where the engine states them; `None` keeps
-    /// `pools` the only word. Beside `pools` until every backend reports
-    /// chunks.
+    /// The pools as chunks.
     #[serde(default)]
-    pub chunks: Option<ChunkFacts>,
+    pub chunks: ChunkFacts,
     pub limits: FireLimits,
     pub ports: PortMask,
     pub geometry: GeometryClass,

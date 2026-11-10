@@ -438,7 +438,7 @@ impl Engine for Cerebras {
                 codegen_backend: None,
             },
             pools,
-            chunks: Some(chunks),
+            chunks,
             limits: FireLimits {
                 max_lanes,
                 max_tokens: budgets.max_tokens,
@@ -1182,7 +1182,7 @@ impl Cerebras {
         let facts = self
             .caps
             .as_ref()
-            .and_then(|caps| caps.chunks.clone())
+            .map(|caps| caps.chunks.clone())
             .ok_or_else(|| Error::Load("the cerebras engine has no model loaded".into()))?;
         let shell = self.loaded_mut()?;
         let mut words: Vec<u64> = submission.lanes.iter().map(|lane| lane.word).collect();

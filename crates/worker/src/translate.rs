@@ -163,15 +163,7 @@ fn build_model(
             runtime::bootstrap::EngineConfig {
                 weights_fit: g.facts.weights_resident,
                 total_pages: g.caps.pools.kv_pages as usize,
-                chunks: g.caps.chunks.clone().unwrap_or_else(|| {
-                    engine::chunk::ChunkFacts::degenerate(
-                        &g.caps.pools,
-                        &engine::chunk::DegenerateBytes {
-                            kv_page: resizable_kv_page_bytes(&g.caps.pools),
-                            ..Default::default()
-                        },
-                    )
-                }),
+                chunks: g.caps.chunks.clone(),
                 resizable_kv_page_bytes: resizable_kv_page_bytes(&g.caps.pools),
                 pool_whole_at_load: g.caps.pools.slab_kv_page_bytes > 0,
                 elastic_state_slot_bytes: g.caps.pools.elastic_state_slot_bytes,

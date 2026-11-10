@@ -524,7 +524,7 @@ impl Engine for Metal {
                 codegen_backend: Some("metal".to_string()),
             },
             pools,
-            chunks: Some(chunks),
+            chunks,
             limits: FireLimits {
                 max_lanes: budgets.max_lanes,
                 max_tokens: budgets.max_tokens,

@@ -389,16 +389,14 @@ impl Engine for Group {
         let least = |of: fn(&engine::chunk::ChunkFacts) -> u32| {
             answers
                 .iter()
-                .filter_map(|loaded| loaded.caps.chunks.as_ref().map(of))
+                .map(|loaded| of(&loaded.caps.chunks))
                 .min()
                 .unwrap_or(0)
         };
         let (host_chunks, disk_chunks) = (least(|c| c.host_chunks), least(|c| c.disk_chunks));
         for loaded in &mut answers {
-            if let Some(chunks) = loaded.caps.chunks.as_mut() {
-                chunks.host_chunks = host_chunks;
-                chunks.disk_chunks = disk_chunks;
-            }
+            loaded.caps.chunks.host_chunks = host_chunks;
+            loaded.caps.chunks.disk_chunks = disk_chunks;
         }
         // a rank's facts (codegen backend, pools) exist only once it has loaded;
         // the snapshot taken at open was empty, and a group that keeps it says
