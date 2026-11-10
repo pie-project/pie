@@ -239,11 +239,13 @@ def layout(id, deploy):
 # checked against its config.
 
 def configured(m):
+    # Required: a Llama 3.0 checkpoint states no rope_scaling and turns its
+    # rope unscaled, so a row turning llama3's must not read it.
     scaled = [] if m.rope == None else [
-        config("rope_scaling.factor", m.rope.factor),
-        config("rope_scaling.low_freq_factor", m.rope.low_freq_factor),
-        config("rope_scaling.high_freq_factor", m.rope.high_freq_factor),
-        config("rope_scaling.original_max_position_embeddings", m.rope.original_max_position),
+        config("rope_scaling.factor", m.rope.factor, required = True),
+        config("rope_scaling.low_freq_factor", m.rope.low_freq_factor, required = True),
+        config("rope_scaling.high_freq_factor", m.rope.high_freq_factor, required = True),
+        config("rope_scaling.original_max_position_embeddings", m.rope.original_max_position, required = True),
     ]
     windowed = [] if m.window == None else [config("sliding_window", m.window)]
     return scaled + windowed + [

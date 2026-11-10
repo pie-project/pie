@@ -367,3 +367,60 @@ fn a_llama_family_adopts_a_sliding_window_and_a_scaled_rope() {
         .expect("the windowed, yarn-scaled model traces");
 }
 
+#[test]
+fn a_llama_3_0_is_not_read_as_a_llama_3_1() {
+    let config = serde_json::json!({
+        "model_type": "llama",
+        "hidden_size": 64,
+        "num_hidden_layers": 2,
+        "num_attention_heads": 4,
+        "num_key_value_heads": 2,
+        "intermediate_size": 128,
+        "vocab_size": 128256,
+        "max_position_embeddings": 8192,
+        "rope_theta": 500000.0,
+    });
+    let src = checkpoint(
+        "llama30",
+        &trunk(Trunk {
+            hidden: 64,
+            layers: 2,
+            q: 4,
+            kv: 2,
+            head_dim: 16,
+            inter: 128,
+            vocab: 128256,
+            qk_norm: false,
+            tied: false,
+        }),
+        &config,
+    );
+    let catalog = repository();
+    let kin = catalog.kin(&src, Platform::Cuda);
+    let llama = kin
+        .iter()
+        .find(|k| k.package.name() == "llama_3")
+        .expect("Llama 3's formats recognize it");
+    assert!(
+        llama
+            .nearest
+            .departing
+            .iter()
+            .any(|a| a.key == "rope_scaling.factor"),
+        "a checkpoint stating no rope_scaling departs from a llama3-scaled row"
+    );
+    let adopted = catalog
+        .adopt(
+            llama,
+            "adopted_llama_30",
+            "llama-30",
+            &reading(&src, &config),
+            Platform::Cuda,
+        )
+        .expect("the family adopts it with its rope unscaled");
+    assert!(
+        adopted.adoption.block.contains("\"rope_theta\": 500000"),
+        "{}",
+        adopted.adoption.block
+    );
+}
