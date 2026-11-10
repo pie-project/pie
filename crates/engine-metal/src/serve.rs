@@ -4189,7 +4189,18 @@ impl engine::frame::Shell for Shell {
             keepalive.touch();
             keepalive.begin();
         }
-        fire_trace(|| "encode-begin".to_string());
+        fire_trace(|| {
+            let lanes: Vec<String> = prepared
+                .lanes
+                .iter()
+                .map(|lane| format!("{}+{}", lane.held.unwrap_or(0), lane.lane.tokens.len()))
+                .collect();
+            format!(
+                "encode-begin rows={} lanes=[{}]",
+                prepared.descriptor.rows,
+                lanes.join(" ")
+            )
+        });
         let walked = if self.weights.tier().is_some() || self.weights.rows().is_some() {
             let trace = crate::diag::on().tier_trace;
             let before = trace.then(|| {
