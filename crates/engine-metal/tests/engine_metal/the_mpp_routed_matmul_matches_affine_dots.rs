@@ -139,6 +139,7 @@ moe.tile_rows = [
                 at(3, tokens, k, Dtype::Bf16),
                 bank,
                 None,
+                None,
                 at(4, tokens, top_k, Dtype::I32),
                 experts,
                 RoutedScratch {

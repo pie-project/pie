@@ -313,6 +313,19 @@ impl Pool {
         Ok(())
     }
 
+    /// The host address of physical chunk `physical`'s bytes, valid until
+    /// the segment holding it is given back; the caller writes through it
+    /// only where no frame in flight reads them.
+    pub fn chunk_host(&self, physical: u32) -> Result<std::ptr::NonNull<u8>> {
+        self.admit(physical)?;
+        let offset = u64::from(physical) * self.chunk_bytes;
+        match &self.backing {
+            Backing::Flat(buffer) => buffer.host_span(offset, self.chunk_bytes),
+            #[cfg(target_vendor = "apple")]
+            Backing::Sparse { store, .. } => store.host_span(offset, self.chunk_bytes),
+        }
+    }
+
     /// `into.len()` bytes from `offset`, read on the host.
     pub fn read(&self, offset: u64, into: &mut [u8]) -> Result<()> {
         match &self.backing {

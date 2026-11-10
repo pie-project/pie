@@ -69,6 +69,7 @@ inline constexpr int routed_tgp() {
 #include "../prim/gemm_mma.h"
 #include "../prim/gemm_loader.h"
 #include "dequant.h"
+#include "moe/expert_at.h"
 
 template <
     typename T,
@@ -571,6 +572,7 @@ template <typename T, int group_size, int bits, int BM, int BK, int BN>
     const constant int& N      [[buffer(6)]],
 
     const device int* tile_expert [[buffer(12)]],
+    PIE_EXPERT_TABLE_ARGS,
     uint3 tid       [[threadgroup_position_in_grid]],
     uint simd_gid   [[simdgroup_index_in_threadgroup]],
     uint simd_lid   [[thread_index_in_simdgroup]]) {
@@ -581,16 +583,23 @@ template <typename T, int group_size, int bits, int BM, int BK, int BN>
   constexpr int bytes_per_pack = get_bytes_per_pack<bits>();
   constexpr int BK_padded = (BK + 16 / sizeof(T));
 
-  const size_t w_bytes = size_t(e) * size_t(N) * size_t(K) *
-                         size_t(bytes_per_pack) / size_t(pack_factor);
-  const size_t g_off = size_t(e) * size_t(N) * size_t(K / group_size);
+  // The expert's planes as the bank lays them, or where its table puts the
+  // piece holding this tile's BN output rows.
+  const ulong w_row = ulong(K) * ulong(bytes_per_pack) / ulong(pack_factor);
+  const ulong g_row = ulong(K / group_size) * sizeof(T);
+  const uint row = tid.x * BN;
+  const device char* we = expert_plane((const device char*)w, codes_at, pieces,
+                                       piece_rows, ulong(N) * w_row, w_row, uint(e), row);
+  const device char* se = expert_plane((const device char*)scales, scales_at, pieces,
+                                       piece_rows, ulong(N) * g_row, g_row, uint(e), row);
+  const device char* be = expert_plane((const device char*)biases, biases_at, pieces,
+                                       piece_rows, ulong(N) * g_row, g_row, uint(e), row);
 
   threadgroup T Xs[BM * BK_padded];
   threadgroup T Ws[BN * BK_padded];
   qmm_t_aligned_impl<T, group_size, bits, BM, BK, BN, false>(
-      (const device uint32_t*)((const device uint8_t*)w + w_bytes),
-      scales + g_off, biases + g_off, x, y, nullptr, Xs, Ws, K, K, N, tid,
-      simd_gid, simd_lid);
+      (const device uint32_t*)we, (const device T*)se, (const device T*)be, x, y,
+      nullptr, Xs, Ws, K, K, N, tid, simd_gid, simd_lid);
 }
 
 template <typename T, int group_size, int bits, int BM, int BK, int BN>
@@ -603,6 +612,7 @@ template <typename T, int group_size, int bits, int BM, int BK, int BN>
     const constant int& K      [[buffer(5)]],
     const constant int& N      [[buffer(6)]],
     const device int* tile_expert [[buffer(12)]],
+    PIE_EXPERT_TABLE_ARGS,
     uint3 tid       [[threadgroup_position_in_grid]],
     uint simd_gid   [[simdgroup_index_in_threadgroup]],
     uint simd_lid   [[thread_index_in_simdgroup]]) {
@@ -618,16 +628,23 @@ template <typename T, int group_size, int bits, int BM, int BK, int BN>
   const int K_w = K * bytes_per_pack / pack_factor;
   const int K_g = K / group_size;
   const int y_col = int(tid.x) * BN;
-  const size_t w_bytes = size_t(e) * size_t(N) * size_t(K) *
-                         size_t(bytes_per_pack) / size_t(pack_factor);
-  const size_t g_off = size_t(e) * size_t(N) * size_t(K_g);
+  const ulong w_row = ulong(K_w), g_row = ulong(K_g) * sizeof(T);
+  const device uint8_t* we = (const device uint8_t*)expert_plane(
+      (const device char*)w, codes_at, pieces, piece_rows, ulong(N) * w_row, w_row,
+      uint(e), uint(y_col));
+  const device T* se = (const device T*)expert_plane(
+      (const device char*)scales, scales_at, pieces, piece_rows, ulong(N) * g_row, g_row,
+      uint(e), uint(y_col));
+  const device T* be = (const device T*)expert_plane(
+      (const device char*)biases, biases_at, pieces, piece_rows, ulong(N) * g_row, g_row,
+      uint(e), uint(y_col));
 
   threadgroup half Xs[BM * BK_padded];
   threadgroup half Ws[BN * BK_padded];
   loader_w_t loader_w(
-      (const device uint8_t*)w + w_bytes + size_t(y_col) * size_t(K_w),
-      scales + g_off + size_t(y_col) * size_t(K_g),
-      biases + g_off + size_t(y_col) * size_t(K_g), K, Ws, simd_gid, simd_lid);
+      we + size_t(y_col) * size_t(K_w),
+      se + size_t(y_col) * size_t(K_g),
+      be + size_t(y_col) * size_t(K_g), K, Ws, simd_gid, simd_lid);
   qmm_t_cast_loaded_impl<T, loader_w_t, BM, BK, BN, false, false,
                          routed_wm<BM>()>(
       x, y, (const device T*)nullptr, Xs, Ws, K, N, tid, simd_gid, simd_lid,
@@ -715,6 +732,11 @@ METAL_FUNC void mxfp4_qmm_t_routed_impl(
     const constant int& N,
     const device T* bias,
     const device int* tile_expert,
+    const device ExpertPlaneAt* codes_at,
+    const device ExpertPlaneAt* scales_at,
+    const device ExpertPlaneAt* bias_at,
+    int pieces,
+    int piece_rows,
     threadgroup half* Xs,
     threadgroup half* Ws,
     uint3 tid,
@@ -726,17 +748,23 @@ METAL_FUNC void mxfp4_qmm_t_routed_impl(
   constexpr int BK_padded = BK + 16 / sizeof(half);
   constexpr int tgp_size = routed_tgp<BM>();
   const int y_col = int(tid.x) * BN;
-  const size_t expert_w = size_t(e) * size_t(N) * size_t(K) / 2;
-  const size_t expert_s = size_t(e) * size_t(N) * size_t(K / 32);
-  const device uint8_t* wb = (const device uint8_t*)w + expert_w + y_col * K / 2;
-  const device uint8_t* sb = exponents + expert_s + y_col * (K / 32);
+  const ulong w_row = ulong(K) / 2, s_row = ulong(K / 32);
+  const device uint8_t* wb = (const device uint8_t*)expert_plane(
+      (const device char*)w, codes_at, pieces, piece_rows, ulong(N) * w_row, w_row,
+      uint(e), uint(y_col)) + y_col * K / 2;
+  const device uint8_t* sb = (const device uint8_t*)expert_plane(
+      (const device char*)exponents, scales_at, pieces, piece_rows, ulong(N) * s_row, s_row,
+      uint(e), uint(y_col)) + y_col * (K / 32);
 
   using loader_w_t = Mxfp4VecLoader<T, BN, BK, BK_padded, 1, tgp_size, half>;
   loader_w_t loader_w(wb, sb, K, Ws, simd_gid, simd_lid);
   qmm_t_cast_loaded_impl<T, loader_w_t, BM, BK, BN, WITH_BIAS, false,
                          routed_wm<BM>()>(
       x, y,
-      WITH_BIAS ? bias + size_t(e) * size_t(N) + y_col : (const device T*)nullptr,
+      WITH_BIAS ? (const device T*)expert_plane((const device char*)bias, bias_at, pieces,
+                                                piece_rows, ulong(N) * sizeof(T), sizeof(T),
+                                                uint(e), uint(y_col)) + y_col
+                : (const device T*)nullptr,
       Xs, Ws, K, N, tid, simd_gid, simd_lid, loader_w);
 }
 
@@ -750,6 +778,7 @@ template <typename T, int BM, int BK, int BN>
     const constant int& N [[buffer(6)]],
     const device T* bias [[buffer(7)]],
     const device int* tile_expert [[buffer(12)]],
+    PIE_EXPERT_TABLE_ARGS,
     uint3 tid [[threadgroup_position_in_grid]],
     uint simd_gid [[simdgroup_index_in_threadgroup]],
     uint simd_lid [[thread_index_in_simdgroup]]) {
@@ -757,8 +786,8 @@ template <typename T, int BM, int BK, int BN>
   threadgroup half Xs[BM * BK_padded];
   threadgroup half Ws[BN * BK_padded];
   mxfp4_qmm_t_routed_impl<T, BM, BK, BN, true>(
-      w, exponents, x, y, K, N, bias, tile_expert, Xs, Ws, tid, simd_gid,
-      simd_lid);
+      w, exponents, x, y, K, N, bias, tile_expert, codes_at, scales_at, bias_at,
+      pieces, piece_rows, Xs, Ws, tid, simd_gid, simd_lid);
 }
 
 template <typename T, int BM, int BK, int BN>
@@ -770,6 +799,7 @@ template <typename T, int BM, int BK, int BN>
     const constant int& K [[buffer(5)]],
     const constant int& N [[buffer(6)]],
     const device int* tile_expert [[buffer(12)]],
+    PIE_EXPERT_TABLE_ARGS,
     uint3 tid [[threadgroup_position_in_grid]],
     uint simd_gid [[simdgroup_index_in_threadgroup]],
     uint simd_lid [[thread_index_in_simdgroup]]) {
@@ -777,8 +807,8 @@ template <typename T, int BM, int BK, int BN>
   threadgroup half Xs[BM * BK_padded];
   threadgroup half Ws[BN * BK_padded];
   mxfp4_qmm_t_routed_impl<T, BM, BK, BN, false>(
-      w, exponents, x, y, K, N, (const device T*)nullptr, tile_expert, Xs, Ws,
-      tid, simd_gid, simd_lid);
+      w, exponents, x, y, K, N, (const device T*)nullptr, tile_expert, codes_at,
+      scales_at, bias_at, pieces, piece_rows, Xs, Ws, tid, simd_gid, simd_lid);
 }
 
 #define PIE_STAMP_qmm_t_routed(entry, gs, b, bm, bk, bn)                       \
@@ -786,7 +816,8 @@ template <typename T, int BM, int BK, int BN>
   [[kernel]] void affine_qmm_t_routed<bfloat, gs, b, bm, bk, bn>(              \
       const device uint32_t*, const device bfloat*, const device bfloat*,      \
       const device bfloat*, device bfloat*, const constant int&,               \
-      const constant int&, const device int*, uint3, uint, uint);
+      const constant int&, const device int*, PIE_EXPERT_TABLE_TYPES, uint3,   \
+      uint, uint);
 
 #define PIE_STAMP_qmm_t_wide(entry, gs, b, bm, bk, bn)                         \
   template [[host_name(entry)]]                                                \
@@ -822,7 +853,8 @@ template <typename T, int BM, int BK, int BN>
   [[kernel]] void mxfp4_qmm_t_routed_bias<bfloat, bm, 32, bn>(              \
       const device uint32_t*, const device uint8_t*, const device bfloat*,   \
       device bfloat*, const constant int&, const constant int&,              \
-      const device bfloat*, const device int*, uint3, uint, uint);
+      const device bfloat*, const device int*, PIE_EXPERT_TABLE_TYPES, uint3, \
+      uint, uint);
 
 instantiate_mxfp4_qmm_t_routed(16, 16)
 instantiate_mxfp4_qmm_t_routed(16, 32)
@@ -840,7 +872,7 @@ instantiate_mxfp4_qmm_t_routed(64, 64)
   [[kernel]] void mxfp4_qmm_t_routed<bfloat, bm, 32, bn>(                   \
       const device uint32_t*, const device uint8_t*, const device bfloat*,   \
       device bfloat*, const constant int&, const constant int&,              \
-      const device int*, uint3, uint, uint);
+      const device int*, PIE_EXPERT_TABLE_TYPES, uint3, uint, uint);
 
 instantiate_mxfp4_qmm_t_routed_plain(16, 16)
 instantiate_mxfp4_qmm_t_routed_plain(16, 32)
@@ -858,7 +890,8 @@ instantiate_mxfp4_qmm_t_routed_plain(64, 64)
   [[kernel]] void affine_qmm_t_routed_fp16<bfloat, 64, 4, bm, 32, bn>(        \
       const device uint32_t*, const device bfloat*, const device bfloat*,     \
       const device bfloat*, device bfloat*, const constant int&,              \
-      const constant int&, const device int*, uint3, uint, uint);
+      const constant int&, const device int*, PIE_EXPERT_TABLE_TYPES, uint3,  \
+      uint, uint);
 
 instantiate_qmm_t_routed_fp16(8, 16)
 instantiate_qmm_t_routed_fp16(8, 32)

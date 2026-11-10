@@ -470,6 +470,31 @@ impl Buffer {
         }
     }
 
+    /// The host address of the `len` bytes at `offset`, valid while the
+    /// buffer lives; the caller writes through it only where no frame in
+    /// flight reads those bytes.
+    pub fn host_span(&self, offset: u64, len: u64) -> Result<std::ptr::NonNull<u8>> {
+        self.hosted("host span")?;
+        self.span(offset, len)?;
+        #[cfg(target_vendor = "apple")]
+        {
+            // SAFETY: inside the buffer's own bytes (checked above).
+            let at = unsafe {
+                self.slab
+                    .contents()
+                    .as_ptr()
+                    .cast::<u8>()
+                    .add(usize::try_from(offset).expect("an offset inside a live mapping"))
+            };
+            std::ptr::NonNull::new(at).ok_or(Fault::Deviceless)
+        }
+        #[cfg(not(target_vendor = "apple"))]
+        {
+            let _ = offset;
+            Err(Fault::Deviceless)
+        }
+    }
+
     pub fn read(&self, offset: u64, into: &mut [u8]) -> Result<()> {
         self.hosted("read")?;
         self.span(offset, into.len() as u64)?;

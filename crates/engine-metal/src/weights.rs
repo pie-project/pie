@@ -49,6 +49,11 @@ pub struct Weights {
     /// allocation of its own where the load lands them (the cold road), so
     /// a held set can give them back (`store::streamed`).
     hosted: BTreeMap<usize, Buffer>,
+    /// Of `hosted`, the tables a warm held load reads out of the serving
+    /// file through windows of their own (no other window spans them): the
+    /// mapping and each one's offset in it, so a pool slot is filled from
+    /// the file without touching the mapping's pages.
+    filed: BTreeMap<usize, (std::sync::Arc<Mapping>, u64, u64)>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -133,6 +138,19 @@ impl Weights {
             .map(|(at, param)| (param.name.as_str(), at))
             .collect();
         let pairings = pairings(&landing, &index)?;
+        // A load whose weight cache the runtime holds seats the streamed
+        // weights in pool slots itself: a warm load reads each out of the
+        // serving file through a window of its own, which nothing but a
+        // miss would read in place.
+        let apart: std::collections::BTreeSet<usize> =
+            if plan.weights_held() && !plan.whole_weights() {
+                crate::store::streamed::streamed(trace)
+                    .into_iter()
+                    .filter(|&at| !places[at].streamed)
+                    .collect()
+            } else {
+                std::collections::BTreeSet::new()
+            };
 
         match warm(
             device,
@@ -146,6 +164,7 @@ impl Weights {
             plan,
             &places,
             &pairings,
+            &apart,
         ) {
             Ok(weights) => return Ok(weights),
             Err(None) => {}
@@ -302,6 +321,7 @@ impl Weights {
             residue: (0, 0),
             decoded: Vec::new(),
             hosted,
+            filed: BTreeMap::new(),
         })
     }
 
@@ -415,7 +435,48 @@ impl Weights {
     /// Gives back `param`'s own allocation, where the load landed it in one
     /// (`store::streamed`): answers whether there was one. No fire reads it.
     pub fn release_hosted(&mut self, param: usize) -> bool {
+        self.filed.remove(&param);
         self.hosted.remove(&param).is_some()
+    }
+
+    /// Opens `param`'s window of its own over the serving file (see
+    /// `filed`), and points `handle` at it: answers the binding a fire then
+    /// reads it in place through. `None` where it is not kept apart.
+    pub fn open_filed(
+        &mut self,
+        device: &Context,
+        handles: &Handles,
+        param: usize,
+        handle: u32,
+    ) -> Result<Option<crate::device::handles::Binding>> {
+        let Some((map, offset, bytes)) = self.filed.get(&param).cloned() else {
+            return Ok(None);
+        };
+        let cut = mapping::Cut::around(&map, offset, bytes);
+        let window = Buffer::window(device, map, cut)?;
+        handles.rebind_at(handle, &window, cut.view(offset).unwrap_or(0))?;
+        self.hosted.insert(param, window);
+        Ok(handles.get(handle).map(|binding| binding.clone()))
+    }
+
+    /// Where `param` lies in the serving file, where a warm held load
+    /// reads it through a window of its own (see `filed`).
+    #[must_use]
+    pub fn filed(&self, param: usize) -> Option<(std::sync::Arc<Mapping>, u64)> {
+        self.filed
+            .get(&param)
+            .map(|(map, offset, _)| (std::sync::Arc::clone(map), *offset))
+    }
+
+    /// The bytes of the streamed weights' own allocations (`hosted`) that
+    /// are memory of their own: a window of the serving file is not.
+    #[must_use]
+    pub fn hosted_bytes(&self) -> u64 {
+        self.hosted
+            .iter()
+            .filter(|(at, _)| !self.filed.contains_key(at))
+            .map(|(_, buffer)| buffer.bytes())
+            .sum()
     }
 
     #[must_use]
@@ -634,7 +695,7 @@ impl Weights {
         self.store.bytes()
             + self.mapped.iter().map(Buffer::bytes).sum::<u64>()
             + self.decoded.iter().map(Buffer::bytes).sum::<u64>()
-            + self.hosted.values().map(Buffer::bytes).sum::<u64>()
+            + self.hosted_bytes()
     }
 }
 
@@ -859,6 +920,8 @@ pub(crate) fn plane_bytes(trace: &Trace) -> Result<Vec<u64>> {
 enum Seat {
     Artifact(u64),
     Store(u64),
+    /// In the artifact at this offset, read through a window of its own.
+    Apart(u64),
 }
 
 const PROBE: usize = 32;
@@ -876,6 +939,7 @@ fn warm(
     plan: &Plan,
     places: &[Place],
     pairings: &BTreeMap<&str, Pairing>,
+    apart: &std::collections::BTreeSet<usize>,
 ) -> std::result::Result<Weights, Option<String>> {
     let gather = plan.gathered();
     if path.is_dir() {
@@ -985,6 +1049,10 @@ fn warm(
             store_bytes += place.reserved;
             continue;
         }
+        if apart.contains(&index) {
+            seats.push(Seat::Apart(offset));
+            continue;
+        }
         covers.push((param.name.as_str(), offset, place.full));
         seats.push(Seat::Artifact(offset));
     }
@@ -1048,7 +1116,7 @@ fn warm(
         .enumerate()
         .filter_map(|(index, place)| match seats[index] {
             Seat::Store(offset) => Some((offset, place.reserved)),
-            Seat::Artifact(_) => None,
+            Seat::Artifact(_) | Seat::Apart(_) => None,
         })
         .collect();
     debug_assert_eq!(
@@ -1108,14 +1176,37 @@ fn warm(
         }
     }
     let bound = covers.iter().map(|(_, _, length)| *length).sum::<u64>();
-    let cuts = mapping::cut(&map, mapping::ceiling(device.max_buffer()), &covers)
-        .map_err(|why| Some(why.to_string()))?;
+    let kept_apart: Vec<(u64, u64)> = seats
+        .iter()
+        .enumerate()
+        .filter_map(|(index, seat)| match seat {
+            Seat::Apart(offset) => Some((*offset, places[index].full)),
+            _ => None,
+        })
+        .collect();
+    let cuts = mapping::cut(
+        &map,
+        mapping::ceiling(device.max_buffer()),
+        &covers,
+        &kept_apart,
+    )
+    .map_err(|why| Some(why.to_string()))?;
     let mut files = Vec::with_capacity(cuts.len());
     for cut in &cuts {
         files.push(
             Buffer::window(device, std::sync::Arc::clone(&map), *cut)
                 .map_err(|why| Some(why.to_string()))?,
         );
+    }
+    // Each plane kept apart is bound to no memory until a fire would read
+    // it in place: a window of its own is opened then
+    // (`Weights::open_filed`); a slot is filled from the file.
+    let hosted = BTreeMap::new();
+    let mut filed = BTreeMap::new();
+    let placeholder = Buffer::zeroed(device, ALIGN).map_err(|why| Some(why.to_string()))?;
+    for (index, seat) in seats.iter().enumerate() {
+        let Seat::Apart(offset) = *seat else { continue };
+        filed.insert(index, (std::sync::Arc::clone(&map), offset, places[index].full));
     }
     let row = |index: usize| -> std::result::Result<Tensor, Option<String>> {
         let place = &places[index];
@@ -1142,6 +1233,7 @@ fn warm(
                 handles.bind(&files[at], view, place.bytes)
             }
             Seat::Store(offset) => store.bind(handles, offset, place.bytes),
+            Seat::Apart(_) => handles.bind(&placeholder, 0, 0),
         }
         .map_err(|why| {
             Some(format!(
@@ -1192,7 +1284,7 @@ fn warm(
     let seated: Vec<u64> = seats
         .iter()
         .map(|seat| match seat {
-            Seat::Store(offset) | Seat::Artifact(offset) => *offset,
+            Seat::Store(offset) | Seat::Artifact(offset) | Seat::Apart(offset) => *offset,
         })
         .collect();
     let tier = plan
@@ -1231,7 +1323,8 @@ fn warm(
         banks: banks(trace, places, |at| seated[at]),
         residue: (residue_planes, residue_bytes),
         decoded: Vec::new(),
-        hosted: BTreeMap::new(),
+        hosted,
+        filed,
     })
 }
 

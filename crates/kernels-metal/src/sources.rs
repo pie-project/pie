@@ -205,6 +205,10 @@ pub const SOURCES: &[(&str, &str)] = &[
         include_str!(concat!(source_root!(), "/linear/lora.metal")),
     ),
     (
+        "linear/moe/expert_at.h",
+        include_str!(concat!(source_root!(), "/linear/moe/expert_at.h")),
+    ),
+    (
         "linear/moe/route.metal",
         include_str!(concat!(source_root!(), "/linear/moe/route.metal")),
     ),

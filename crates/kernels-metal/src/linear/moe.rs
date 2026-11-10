@@ -422,7 +422,7 @@ pub fn matmul_grouped(
     let x = Tensor::new(x.buf, rows, x.width / groups_nz, x.dtype);
     let y = Tensor::new(y.buf, rows, y.width / groups_nz, y.dtype);
     match plane {
-        GroupedPlane::Bank(bank) => matmul_select_quant(ctx, x, bank, routes, y),
+        GroupedPlane::Bank(bank) => matmul_select_quant(ctx, x, bank, None, routes, y),
         GroupedPlane::Dense(dense) => matmul_select(ctx, x, dense, routes, y),
     }
 }
@@ -588,6 +588,85 @@ pub fn matmul_select_tabled(
     )
 }
 
+/// Where each expert's planes of a quantized routed bank lie, for the
+/// routed matmuls (`linear/moe/expert_at.h`): one GPU address table a plane
+/// (`codes`, `scales`, the affine zero points `biases`, the expert output
+/// `bias`), one address a piece of an expert (entry `expert * pieces +
+/// piece`), a piece holding `piece_rows` of the plane's output rows from
+/// `piece * piece_rows` on, laid as in the bank. `hits`, where stated, a
+/// `u32` an expert each route reading it adds one to ([`count_routes`]).
+/// Every arm reads a run of whole output-row tiles from one piece, so a
+/// table cut in pieces holds [`BankTable::ROWS`]-row multiples (or every
+/// row in its first piece).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct BankTable {
+    pub codes: Tensor,
+    pub scales: Tensor,
+    pub biases: Option<Tensor>,
+    pub bias: Option<Tensor>,
+    pub pieces: u32,
+    pub piece_rows: u32,
+    pub hits: Option<Tensor>,
+}
+
+impl BankTable {
+    /// The output rows a piece holds a multiple of: the widest column tile
+    /// any routed arm reads from one expert's rows at once.
+    pub const ROWS: u32 = 128;
+}
+
+/// The table arguments of a routed kernel (`codes_at` .. `piece_rows`):
+/// absent with no pieces where `experts` is `None`.
+fn table_args(
+    ctx: &Ctx<'_>,
+    op: &'static str,
+    experts: Option<BankTable>,
+) -> Result<[crate::encode::ArgValue; 6], Error> {
+    let Some(table) = experts else {
+        return Ok([
+            ctx.absent()?,
+            ctx.absent()?,
+            ctx.absent()?,
+            ctx.absent()?,
+            0i32.arg(),
+            0i32.arg(),
+        ]);
+    };
+    let pieces = nonzero(op, "pieces an expert", table.pieces)?;
+    let piece_rows = nonzero(op, "rows a piece", table.piece_rows)?;
+    let or_absent = |plane: Option<Tensor>| match plane {
+        Some(plane) => Ok(plane.arg()),
+        None => ctx.absent(),
+    };
+    Ok([
+        table.codes.arg(),
+        table.scales.arg(),
+        or_absent(table.biases)?,
+        or_absent(table.bias)?,
+        stated(op, pieces)?.arg(),
+        stated(op, piece_rows)?.arg(),
+    ])
+}
+
+/// Adds one to `hits[e]` for each route of `routes` naming expert `e`: the
+/// weight cache's use record of a routed bank read through a table.
+pub fn count_routes(ctx: &Ctx<'_>, routes: Tensor, hits: Tensor) -> Result<(), Error> {
+    const OP: &str = "linear.moe_count_routes";
+    let n = routes.rows.saturating_mul(routes.width);
+    if n == 0 {
+        return Ok(());
+    }
+    ctx.fire(
+        Fire::at(ROUTE_FILE, "moe_count_routes").apply(Grid::of([n.div_ceil(256) * 256, 1, 1], [256, 1, 1])),
+        &[
+            routes.arg(),
+            hits.arg_mut(),
+            stated(OP, n)?.arg(),
+            stated(OP, hits.rows.saturating_mul(hits.width))?.arg(),
+        ],
+    )
+}
+
 fn routed_point(op: &'static str, bank: Bank, biased: bool) -> Result<&'static str, Error> {
     match (bank.affine(), bank.group, bank.bits) {
         (true, 64, 8) if biased => Ok("affine_qmv_routed_bias_bfloat16_gs_64_b_8"),
@@ -642,6 +721,7 @@ pub fn matmul_select_bias(
     ctx: &Ctx<'_>,
     x: Tensor,
     bank: Bank,
+    experts: Option<BankTable>,
     bias: Tensor,
     routes: Tensor,
     y: Tensor,
@@ -673,7 +753,10 @@ pub fn matmul_select_bias(
             stated(OP, fan.x_slot_stride)?.arg(),
             stated(OP, fan.x_row_stride)?.arg(),
             stated(OP, fan.top_k)?.arg(),
-        ],
+        ]
+        .into_iter()
+        .chain(table_args(ctx, OP, experts)?)
+        .collect::<Vec<_>>(),
     )
 }
 
@@ -681,6 +764,7 @@ pub fn matmul_select_quant(
     ctx: &Ctx<'_>,
     x: Tensor,
     bank: Bank,
+    experts: Option<BankTable>,
     routes: Tensor,
     y: Tensor,
 ) -> Result<(), Error> {
@@ -707,7 +791,10 @@ pub fn matmul_select_quant(
             stated(OP, fan.x_slot_stride)?.arg(),
             stated(OP, fan.x_row_stride)?.arg(),
             stated(OP, fan.top_k)?.arg(),
-        ],
+        ]
+        .into_iter()
+        .chain(table_args(ctx, OP, experts)?)
+        .collect::<Vec<_>>(),
     )
 }
 
@@ -894,6 +981,7 @@ pub fn matmul_select_batched(
     op: &'static str,
     x: Tensor,
     bank: Bank,
+    experts_at: Option<BankTable>,
     bias: Option<Tensor>,
     routes: Tensor,
     experts: u32,
@@ -1025,7 +1113,14 @@ pub fn matmul_select_batched(
                 },
                 scratch.tile_expert.arg(),
                 scratch.perm.arg(),
-            ],
+                ctx.absent()?,
+                ctx.absent()?,
+                ctx.absent()?,
+                ctx.absent()?,
+            ]
+            .into_iter()
+            .chain(table_args(ctx, op, experts_at)?)
+            .collect::<Vec<_>>(),
         )?;
     } else if let Some((m, n, simdgroups)) = mpp {
         const FILE: &str = "linear/qmm_mpp.metal";
@@ -1064,7 +1159,14 @@ pub fn matmul_select_batched(
                 stated(op, y.width)?.arg(),
                 scratch.sums.arg(),
                 scratch.tile_expert.arg(),
-            ],
+                ctx.absent()?,
+                ctx.absent()?,
+                ctx.absent()?,
+                ctx.absent()?,
+            ]
+            .into_iter()
+            .chain(table_args(ctx, op, experts_at)?)
+            .collect::<Vec<_>>(),
         )?;
     } else if let Some(point) = point {
         let mut args = vec![
@@ -1084,6 +1186,7 @@ pub fn matmul_select_batched(
             args.push(ctx.absent()?);
         }
         args.push(scratch.tile_expert.arg());
+        args.extend(table_args(ctx, op, experts_at)?);
         let mut grid = crate::linear::qmm::tiled::qmm_grid(
             op,
             stated(op, y.width)?,
@@ -1472,6 +1575,7 @@ fn register_banks(
 pub fn register_glu(
     ctx: &Ctx<'_>,
     gate_up: Bank,
+    experts_at: Option<BankTable>,
     shared: Option<Bank>,
     width: u32,
     inter: u32,
@@ -1527,7 +1631,11 @@ pub fn register_glu(
             stated(OP, width)?.arg(),
             stated(OP, inter)?.arg(),
             stated(OP, experts)?.arg(),
-        ],
+            ctx.absent()?,
+        ]
+        .into_iter()
+        .chain(table_args(ctx, OP, experts_at)?)
+        .collect::<Vec<_>>(),
     )
 }
 
@@ -1539,6 +1647,7 @@ pub fn register_glu(
 pub fn register_down(
     ctx: &Ctx<'_>,
     down: Bank,
+    experts_at: Option<BankTable>,
     shared: Option<Bank>,
     inter: u32,
     columns: u32,
@@ -1590,7 +1699,10 @@ pub fn register_down(
             stated(OP, columns)?.arg(),
             stated(OP, experts)?.arg(),
             rooms.rows.arg(),
-        ],
+        ]
+        .into_iter()
+        .chain(table_args(ctx, OP, experts_at)?)
+        .collect::<Vec<_>>(),
     )
 }
 

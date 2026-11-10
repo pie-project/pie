@@ -133,12 +133,43 @@ struct Plane {
     bytes: u64,
 }
 
+/// The output rows a piece of a cut quantized expert holds a multiple of:
+/// the widest column tile the on-device Metal routed arms read from one
+/// expert's rows at once (`kernels_metal::linear::moe::BankTable::ROWS`).
+/// A piece of an expert whose layer holds a packed plane spans
+/// [`piece_rows`] rows; a bf16 layer's planes are read a row at a time and
+/// cut at `ceil(N / k)`.
+pub const PIECE_ROW_GRAIN: u64 = 128;
+
+/// The output rows piece `j` of `k` pieces holds of a plane of `rows`
+/// rows, from `j * piece_rows(..)` on: `ceil(rows / k)`, rounded up to
+/// `grain` where cut (the last pieces may hold fewer, or none).
+#[must_use]
+pub fn piece_rows(rows: u64, k: u64, grain: u64) -> u64 {
+    let rows_a_piece = rows.div_ceil(k.max(1));
+    if k <= 1 {
+        rows_a_piece
+    } else {
+        rows_a_piece.next_multiple_of(grain.max(1)).min(rows)
+    }
+}
+
+/// Whether a plane stored as `dtype` is packed codes (or their factors'
+/// companions ride with them): an expert layer holding one is cut on
+/// [`PIECE_ROW_GRAIN`] rows.
+#[must_use]
+pub fn packed(dtype: Dtype) -> bool {
+    !matches!(dtype, Dtype::Bf16 | Dtype::F16 | Dtype::F32)
+}
+
 /// A slot shape before the chunk size is known.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) struct Group {
     kind: WeightKind,
     atom_bytes: u64,
     planes: Vec<Plane>,
+    /// The rows a piece holds a multiple of (see [`piece_rows`]).
+    grain: u64,
     /// Rows: ids a fire may read (`max_tokens x ids a token`), else 0.
     fire_ids: u64,
     /// Experts: the most a token's route picks.
@@ -254,6 +285,11 @@ pub(super) fn census(trace: &Trace, max_tokens: u32) -> Vec<Group> {
             .collect();
         shape.sort_unstable();
         let atom_bytes = shape.iter().map(|p| p.bytes).sum();
+        let grain = if qs.iter().any(|q| packed(trace.params[*q].dtype)) {
+            PIECE_ROW_GRAIN
+        } else {
+            1
+        };
         let bank = WeightBank {
             layer,
             atoms: experts,
@@ -262,7 +298,7 @@ pub(super) fn census(trace: &Trace, max_tokens: u32) -> Vec<Group> {
         // Layers whose experts are alike share one shape.
         if let Some(group) = groups
             .iter_mut()
-            .find(|g| g.kind == WeightKind::Expert && g.planes == shape)
+            .find(|g| g.kind == WeightKind::Expert && g.planes == shape && g.grain == grain)
         {
             group.top_k = group.top_k.max(top_k);
             group.banks.push(bank);
@@ -271,6 +307,7 @@ pub(super) fn census(trace: &Trace, max_tokens: u32) -> Vec<Group> {
                 kind: WeightKind::Expert,
                 atom_bytes,
                 planes: shape,
+                grain,
                 fire_ids: 0,
                 top_k,
                 banks: vec![bank],
@@ -286,6 +323,7 @@ pub(super) fn census(trace: &Trace, max_tokens: u32) -> Vec<Group> {
             kind: WeightKind::Rows,
             atom_bytes,
             planes: Vec::new(),
+            grain: 1,
             fire_ids: u64::from(max_tokens.max(1)) * u64::from(ids_per_token.max(1)),
             top_k: 0,
             banks: vec![WeightBank {
@@ -320,7 +358,7 @@ pub(super) fn layout(
                     } else if cut {
                         let k = whole.div_ceil(chunk.max(1));
                         let bytes = (k..=k.saturating_mul(2)).find_map(|k| {
-                            let piece = piece_bytes(&group.planes, k, align);
+                            let piece = piece_bytes(&group.planes, k, align, group.grain);
                             (piece <= chunk).then_some((k, piece))
                         })?;
                         if bytes.1 < MIN_PIECE {
@@ -366,16 +404,16 @@ pub(super) fn layout(
 }
 
 /// The largest of `k` pieces of an expert cut on its planes' output axis:
-/// `ceil(N / k)` rows of each plane, the planes of no output axis in the
+/// [`piece_rows`] rows of each plane, the planes of no output axis in the
 /// first piece.
-fn piece_bytes(planes: &[Plane], k: u64, align: u64) -> u64 {
+fn piece_bytes(planes: &[Plane], k: u64, align: u64, grain: u64) -> u64 {
     let mut piece = 0;
     for plane in planes {
         piece = align_up(piece, align);
         piece += if plane.rows == 0 {
             plane.bytes
         } else {
-            plane.rows.div_ceil(k) * (plane.bytes / plane.rows)
+            piece_rows(plane.rows, k, grain) * (plane.bytes / plane.rows)
         };
     }
     align_up(piece, align)

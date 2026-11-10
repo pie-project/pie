@@ -506,7 +506,7 @@ impl Engine for Metal {
         residency.admit(residency_plan.device_demand(), residency_plan.host_demand())?;
         let streams = residency_plan.streams();
 
-        prepared.set_residency(residency_plan);
+        prepared.set_residency(residency_plan.with_weights_held(residency.weights_held));
         let mut shell = prepared.load().map_err(fault)?;
 
         shell.mount_adapters(self.boot.adapter_dir.clone());

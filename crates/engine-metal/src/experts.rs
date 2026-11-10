@@ -33,6 +33,10 @@ pub struct Plan {
     /// The chunk the pool's recipe aims near, where not the on-device
     /// Metal profile's (a diagnostic: records cut into pieces).
     chunk_bytes: Option<u64>,
+    /// The runtime holds the weight cache's atoms for the load's life
+    /// (`engine::load::Residency::weights_held`): the load seats them in
+    /// pool slots itself and states where (`WeightShape::seated`).
+    weights_held: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -191,6 +195,7 @@ impl Plan {
             streaming: None,
             whole_weights: false,
             chunk_bytes: None,
+            weights_held: false,
         })
     }
 
@@ -213,6 +218,18 @@ impl Plan {
     #[must_use]
     pub fn whole_weights(&self) -> bool {
         self.whole_weights
+    }
+
+    /// This plan told the runtime holds the weights (see `weights_held`).
+    #[must_use]
+    pub fn with_weights_held(mut self, held: bool) -> Plan {
+        self.weights_held = held;
+        self
+    }
+
+    #[must_use]
+    pub fn weights_held(&self) -> bool {
+        self.weights_held
     }
 
     /// This plan's pool aiming its chunk near `bytes` (see `chunk_bytes`).

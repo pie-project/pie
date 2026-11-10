@@ -64,6 +64,12 @@ use kernels_metal::linear::moe::ExpertTable;
 pub enum Streamed {
     Rows(RowTable),
     Experts(ExpertTable),
+    /// A quantized routed bank's planes (codes, scales, zero points, its
+    /// select's bias), at its codes param.
+    Bank(kernels_metal::linear::moe::BankTable),
+    /// A quantized table's planes (codes, scales, zero points), at its
+    /// codes param.
+    BankRows(kernels_metal::gather::BankRows),
 }
 use poem_compiler::chunk::ChunkRecipe;
 use poem_ir::{Def, Operands, Operation, Trace};
@@ -102,18 +108,21 @@ fn read_only_by(trace: &Trace, at: usize, reads: impl Fn(&Operation) -> bool) ->
 }
 
 /// The tables of `trace` this engine streams by their rows: read only by the
-/// plain embedding gather, a bf16 plane of its own with no companion, out
-/// of the checkpoint (as `engine-cuda`'s `layout::streamed_rows`).
+/// plain embedding gather, out of the checkpoint (as `engine-cuda`'s
+/// `layout::streamed_rows`): a bf16 plane of its own with no companion, or
+/// affine 4/8-bit codes (the gather `embed_gather.metal` reads through a
+/// table) with their scales and zero points.
 #[must_use]
 pub fn streamed_rows(trace: &Trace) -> Vec<usize> {
     use poem_ir::Gather;
-    use poem_ir::residency::{Residency, residency};
+    use poem_ir::residency::{Residency, leads, residency};
+    use poem_ir::Dtype;
     let classes = residency(trace);
-    (0..trace.params.len())
+    let mut tables: Vec<usize> = (0..trace.params.len())
         .filter(|&at| {
             let param = &trace.params[at];
             matches!(classes[at], Residency::Rows(_))
-                && param.dtype == poem_ir::Dtype::Bf16
+                && matches!(param.dtype, Dtype::Bf16 | Dtype::U4g64 | Dtype::U4g32 | Dtype::U8g64)
                 && param.shape.len() == 2
                 && param.source == poem_ir::ParamSource::Checkpoint
                 && read_only_by(trace, at, |op| {
@@ -126,38 +135,102 @@ pub fn streamed_rows(trace: &Trace) -> Vec<usize> {
                     }) if u64::from(*vocab) == param.shape[0])
                 })
         })
-        .collect()
+        .collect();
+    let lead = leads(trace);
+    let companions: Vec<usize> = (0..trace.params.len())
+        .filter(|&at| {
+            lead[at] != at
+                && tables.contains(&lead[at])
+                && trace.params[lead[at]].dtype != Dtype::Bf16
+                && matches!(classes[at], Residency::Rows(_))
+                && trace.params[at].source == poem_ir::ParamSource::Checkpoint
+        })
+        .collect();
+    tables.extend(companions);
+    tables.sort_unstable();
+    tables
+}
+
+/// Whether a routed bank stored as `dtype` is one every routed arm reads
+/// through an expert table: affine codes at 64/{2,4,8}, 32/2, 128/2 and
+/// MXFP4 (`kernels_metal::linear::moe::BankTable`).
+fn tabled_codes(dtype: poem_ir::Dtype) -> bool {
+    use poem_ir::Dtype;
+    matches!(
+        dtype,
+        Dtype::U4g64 | Dtype::U8g64 | Dtype::U2g64 | Dtype::U2g32 | Dtype::U2g128 | Dtype::Mxfp4
+    )
 }
 
 /// The routed banks of `trace` this engine streams an expert at a time:
-/// dense bf16 planes out of the checkpoint read only at the `bank` port of a
-/// plain routed select (no bias, no quantization), the select whose kernel
-/// reads an expert table (as `engine-cuda`'s `layout::streamed_experts`,
-/// before its recipe grouping, which [`Shape::experts`] applies).
+/// planes out of the checkpoint read only at the `bank` port of a routed
+/// select whose kernels read an expert table (as `engine-cuda`'s
+/// `layout::streamed_experts`, before its recipe grouping, which
+/// [`Shape::experts`] applies): a dense bf16 bank of a plain select (no
+/// bias, not quantized), or a quantized bank ([`tabled_codes`]) of any
+/// select of no `quant` scheme; with each quantized bank its companions
+/// (scales, zero points) and its select's expert bias.
 #[must_use]
 pub fn streamed_experts(trace: &Trace) -> Vec<usize> {
     use poem_ir::Linear;
-    use poem_ir::residency::{Residency, residency};
+    use poem_ir::residency::{Residency, leads, residency};
     let classes = residency(trace);
-    (0..trace.params.len())
+    let weight = |id: &poem_ir::ValueId, at: usize| {
+        matches!(trace.values.get(id.0 as usize).map(|d| &d.def),
+            Some(Def::Weight(w)) if *w as usize == at)
+    };
+    let expert = |at: usize| {
+        let param = &trace.params[at];
+        matches!(classes[at], Residency::Expert(_))
+            && param.shape.len() >= 2
+            && param.source == poem_ir::ParamSource::Checkpoint
+    };
+    let mut banks: Vec<usize> = (0..trace.params.len())
         .filter(|&at| {
-            let param = &trace.params[at];
-            matches!(classes[at], Residency::Expert(_))
-                && param.dtype == poem_ir::Dtype::Bf16
-                && param.shape.len() >= 2
-                && param.source == poem_ir::ParamSource::Checkpoint
-                && read_only_by(trace, at, |op| {
-                    matches!(op, Operation::Linear(Linear::MoeSelect {
+            let dtype = trace.params[at].dtype;
+            expert(at)
+                && (dtype == poem_ir::Dtype::Bf16 || tabled_codes(dtype))
+                && read_only_by(trace, at, |op| match op {
+                    Operation::Linear(Linear::MoeSelect {
                         bank,
-                        bias: None,
-                        quantized: false,
+                        bias,
+                        quantized,
                         quant: None,
                         ..
-                    }) if matches!(trace.values.get(bank.0 as usize).map(|d| &d.def),
-                        Some(Def::Weight(w)) if *w as usize == at))
+                    }) if weight(bank, at) => {
+                        tabled_codes(dtype) || (bias.is_none() && !*quantized)
+                    }
+                    _ => false,
                 })
         })
-        .collect()
+        .collect();
+    // A quantized bank's companions, and its selects' expert biases.
+    let quantized: Vec<usize> = banks
+        .iter()
+        .copied()
+        .filter(|&at| tabled_codes(trace.params[at].dtype))
+        .collect();
+    let lead = leads(trace);
+    for at in 0..trace.params.len() {
+        if !expert(at) || banks.contains(&at) {
+            continue;
+        }
+        let companion = lead[at] != at && quantized.contains(&lead[at]);
+        let bias = trace.params[at].dtype == poem_ir::Dtype::Bf16
+            && read_only_by(trace, at, |op| {
+                matches!(op, Operation::Linear(Linear::MoeSelect {
+                    bank,
+                    bias: Some(bias),
+                    quant: None,
+                    ..
+                }) if weight(bias, at) && quantized.iter().any(|&b| weight(bank, b)))
+            });
+        if companion || bias {
+            banks.push(at);
+        }
+    }
+    banks.sort_unstable();
+    banks
 }
 
 /// Every param [`streamed_rows`] or [`streamed_experts`] names: the ones a
@@ -295,7 +368,12 @@ impl Shape {
         let mut planes = Vec::with_capacity(params.len());
         let mut used = 0u64;
         for (k, &param) in params.iter().enumerate() {
-            let row = trace.params[param].shape[1] * 2;
+            // A row's stored bytes (codes at their packed width).
+            let full = poem_compiler::chunk::weights::plane_bytes(&trace.params[param]);
+            let row = full.checked_div(rows)?;
+            if row * rows != full {
+                return None;
+            }
             let stride = u64::from(block_rows) * row;
             planes.push(Plane {
                 param,
@@ -354,6 +432,10 @@ impl Shape {
                 return None;
             }
             let mut used = 0u64;
+            let layer_quantized = bank
+                .params
+                .iter()
+                .any(|&p| poem_compiler::chunk::weights::packed(trace.params[p as usize].dtype));
             for (k, &param) in bank.params.iter().enumerate() {
                 let param = param as usize;
                 let held = &trace.params[param];
@@ -361,9 +443,34 @@ impl Shape {
                     return None;
                 }
                 let rows = *held.shape.get(1)?;
-                let row = held.shape[2..].iter().product::<u64>() * 2;
-                let piece_rows = rows.div_ceil(u64::from(pieces));
+                // A row's stored bytes: the plane's over its experts' rows
+                // (codes at their packed width).
+                let full = poem_compiler::chunk::weights::plane_bytes(held);
+                let row = full.checked_div(experts * rows)?;
+                if row * experts * rows != full {
+                    return None;
+                }
+                // As the recipe cuts it: a layer holding a packed plane on
+                // whole tiles of every routed arm.
+                let grain = if layer_quantized {
+                    poem_compiler::chunk::weights::PIECE_ROW_GRAIN
+                } else {
+                    1
+                };
+                let piece_rows =
+                    poem_compiler::chunk::weights::piece_rows(rows, u64::from(pieces), grain);
                 let piece = piece_rows * row;
+                // A quantized plane lies 16-byte aligned, and its pieces hold
+                // whole tiles (or every row).
+                if layer_quantized
+                    && (!used.is_multiple_of(16)
+                        || (piece_rows < rows
+                            && !piece_rows.is_multiple_of(u64::from(
+                                kernels_metal::linear::moe::BankTable::ROWS,
+                            ))))
+                {
+                    return None;
+                }
                 planes.push(Plane {
                     param,
                     atom: u32::try_from(layer).ok()?.checked_mul(entries)?,
@@ -420,6 +527,39 @@ struct Host {
     binding: Binding,
     /// The handle the load bound the weight at (released with the copy).
     handle: u32,
+    /// Where the weight lies in the serving file, where the load reads it
+    /// through a window of its own: a slot is then filled from the file on
+    /// the host, which leaves the mapping's pages untouched.
+    file: Option<(std::sync::Arc<crate::mapping::Mapping>, u64)>,
+    /// Whether `binding` is the weight's own memory (a file weight's is a
+    /// placeholder until [`Cache::open_files`]).
+    opened: bool,
+}
+
+/// Slots filled on the host from the serving file: `(from, to, bytes)`
+/// each, `bytes` at `from` in the file to `to` bytes into the pool, in the
+/// file's order.
+#[derive(Debug, Clone)]
+pub struct FileFills {
+    pub file: std::sync::Arc<crate::mapping::Mapping>,
+    pub fills: Vec<(u64, u64, u64)>,
+}
+
+impl FileFills {
+    /// `bytes` bytes at `from`, read from the file (not through its
+    /// mapping).
+    pub fn read(&self, from: u64, bytes: u64, into: &mut Vec<u8>) -> Result<()> {
+        use std::os::unix::fs::FileExt;
+        into.resize(usize::try_from(bytes).unwrap_or(usize::MAX), 0);
+        self.file
+            .file()
+            .read_exact_at(into, from)
+            .map_err(|why| Fault::Mapped {
+                step: "read",
+                what: self.file.path().display().to_string(),
+                why: why.to_string(),
+            })
+    }
 }
 
 /// One weight shape's cache: its address tables, its hit counters and
@@ -437,6 +577,12 @@ pub struct Cache {
     hit_handles: Vec<Option<u32>>,
     /// The slot ref each atom is named, if any.
     slots: Vec<Option<u32>>,
+    /// The load seated every atom itself (`WeightShape::seated`), until the
+    /// runtime's first residency.
+    preseated: bool,
+    /// Whether the weights' own copies are in the queue's residency set
+    /// (they are read in place by a miss).
+    hosts_resident: bool,
 }
 
 impl Cache {
@@ -448,6 +594,7 @@ impl Cache {
         handles: &Handles,
         shape: Shape,
         handle_of: impl Fn(usize) -> Option<u32>,
+        file_of: impl Fn(usize) -> Option<(std::sync::Arc<crate::mapping::Mapping>, u64)>,
     ) -> Result<Cache> {
         let mut hosts = Vec::with_capacity(shape.planes.len());
         let mut tables = Vec::with_capacity(shape.planes.len());
@@ -465,7 +612,12 @@ impl Cache {
                 .ok_or_else(|| Fault::Unbound {
                     what: format!("handle {handle} of streamed param {param}"),
                 })?;
-            hosts.push(Some(Host { binding, handle }));
+            hosts.push(Some(Host {
+                binding,
+                handle,
+                opened: false,
+                file: file_of(param),
+            }));
             let entries = u64::from(plane.entries);
             let table = Buffer::zeroed(device, entries * 8)?;
             let bound = handles.bind(&table, 0, entries * 8)?;
@@ -484,6 +636,8 @@ impl Cache {
             tables,
             hits,
             hit_handles,
+            preseated: false,
+            hosts_resident: false,
         };
         cache.stage(None)?;
         Ok(cache)
@@ -562,23 +716,32 @@ impl Cache {
     /// blitted from their weights into `frame` (the pool `into`, a slot
     /// ref's byte offset by `offset`). The tables are rewritten by
     /// [`Cache::restage`] once `frame` is committed.
+    ///
+    /// A weight read from the serving file is not blitted: its fills are
+    /// answered, for the caller to write on the host.
     pub fn take(
         &mut self,
         frame: &mut Frame,
         named: Vec<Option<u32>>,
         into: &Buffer,
         offset: SlotAt<'_>,
-    ) -> Result<()> {
+    ) -> Result<Vec<FileFills>> {
+        // Each atom newly named a slot, and the slot's byte offset.
+        let mut to: Vec<Option<u64>> = vec![None; named.len()];
         for (atom, slot) in named.iter().enumerate() {
             let Some(slot) = *slot else { continue };
-            if self.slots[atom] == Some(slot) {
-                continue;
+            if self.slots[atom] != Some(slot) {
+                to[atom] = Some(offset(slot)?);
             }
-            let to = offset(slot)?;
-            let atom = u32::try_from(atom).unwrap_or(u32::MAX);
-            for (plane, host) in self.shape.planes.iter().zip(&self.hosts) {
-                let Some(entry) = atom.checked_sub(plane.atom).filter(|e| *e < plane.entries)
-                else {
+        }
+        // A plane at a time, its entries in order: a file weight's fills
+        // follow one another in the file.
+        let mut fills = Vec::new();
+        for (plane, host) in self.shape.planes.iter().zip(&self.hosts) {
+            let mut file_fills = Vec::new();
+            for entry in 0..plane.entries {
+                let atom = plane.atom + entry;
+                let Some(to) = to.get(atom as usize).copied().flatten() else {
                     continue;
                 };
                 let Some(host) = host else {
@@ -594,6 +757,10 @@ impl Cache {
                 if bytes == 0 {
                     continue;
                 }
+                if let Some((_, at)) = &host.file {
+                    file_fills.push((at + plane.entry_at(entry), to + plane.at, bytes));
+                    continue;
+                }
                 frame.copy(
                     host.binding.slab(),
                     host.binding.offset() + plane.entry_at(entry),
@@ -602,15 +769,82 @@ impl Cache {
                     bytes,
                 )?;
             }
+            if let Some(Host {
+                file: Some((file, _)),
+                ..
+            }) = host
+                && !file_fills.is_empty()
+            {
+                fills.push(FileFills {
+                    file: std::sync::Arc::clone(file),
+                    fills: file_fills,
+                });
+            }
         }
         self.slots = named;
-        Ok(())
+        Ok(fills)
     }
 
     /// Rewrites the address tables for the slots the atoms are named now,
     /// through the pool at `base` (see [`Cache::stage`]).
     pub fn restage(&mut self, base: u64, offset: SlotAt<'_>) -> Result<()> {
         self.stage(Some((base, offset)))
+    }
+
+    /// The shape's facts, stating where the load seated it while it holds
+    /// its own seating.
+    #[must_use]
+    pub fn facts(&self) -> WeightShape {
+        WeightShape {
+            seated: if self.preseated {
+                self.slots.first().copied().flatten()
+            } else {
+                None
+            },
+            ..self.shape.facts()
+        }
+    }
+
+    /// Marks the slots named as the load's own seating (or not).
+    pub fn set_preseated(&mut self, preseated: bool) {
+        self.preseated = preseated;
+    }
+
+    #[must_use]
+    pub fn preseated(&self) -> bool {
+        self.preseated
+    }
+
+    /// Whether the weights' own copies are held in the queue's residency
+    /// set; marked so by the caller who put them there.
+    #[must_use]
+    pub fn hosts_resident(&self) -> bool {
+        self.hosts_resident
+    }
+
+    pub fn set_hosts_resident(&mut self, resident: bool) {
+        self.hosts_resident = resident;
+    }
+
+    /// Gives each weight read from the serving file, and bound to no
+    /// memory yet, the binding `open` answers for it (a window over the
+    /// file a miss reads in place), by param and handle. The caller
+    /// restages the tables after.
+    pub fn open_files(
+        &mut self,
+        mut open: impl FnMut(usize, u32) -> Result<Option<Binding>>,
+    ) -> Result<()> {
+        for (host, plane) in self.hosts.iter_mut().zip(&self.shape.planes) {
+            let Some(host) = host else { continue };
+            if host.file.is_none() || host.opened {
+                continue;
+            }
+            if let Some(binding) = open(plane.param, host.handle)? {
+                host.binding = binding;
+            }
+            host.opened = true;
+        }
+        Ok(())
     }
 
     /// Whether every atom is named a slot.

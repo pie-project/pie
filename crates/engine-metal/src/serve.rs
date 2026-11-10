@@ -386,6 +386,7 @@ impl Shell {
         trace: &Trace,
         recipe: &poem_compiler::chunk::ChunkRecipe,
         experts: bool,
+        held: bool,
     ) -> Result<Vec<crate::store::streamed::Cache>> {
         let shapes = crate::store::streamed::Shape::of(trace, recipe, experts);
         if shapes.is_empty() || !device.hold_resident(std::iter::empty(), true)? {
@@ -393,24 +394,136 @@ impl Shell {
         }
         let mut caches = Vec::with_capacity(shapes.len());
         for shape in shapes {
-            let cache =
-                crate::store::streamed::Cache::open(device, handles, shape, |param| match weights
-                    .table()
-                    .0
-                    .get(param)
-                    .copied()
-                    .flatten()
-                {
+            let mut cache = crate::store::streamed::Cache::open(
+                device,
+                handles,
+                shape,
+                |param| match weights.table().0.get(param).copied().flatten() {
                     Some(crate::run::WeightRow::Dense(plane)) => Some(plane.buf),
-                    _ => None,
-                })?;
-            device.hold_resident(cache.host_slabs(), true)?;
+                    Some(crate::run::WeightRow::Planes(bank)) => Some(bank.codes.buf),
+                    None => None,
+                },
+                |param| weights.filed(param),
+            )?;
+            // A held load seats every atom in the pool before any fire: the
+            // own copies join the residency set only where a miss reads
+            // them in place (`Shell::hold_weight_hosts`).
+            if !held {
+                device.hold_resident(cache.host_slabs(), true)?;
+                cache.set_hosts_resident(true);
+            }
             for (param, table) in cache.tables() {
                 weights.read_through(param, table);
             }
             caches.push(cache);
         }
+        Shell::bank_tables(weights, trace, &caches)?;
         Ok(caches)
+    }
+
+    /// Each quantized routed bank the caches stream reads its planes (codes,
+    /// scales, zero points, its select's expert bias) through one
+    /// `BankTable`, at its codes param.
+    fn bank_tables(
+        weights: &mut Weights,
+        trace: &Trace,
+        caches: &[crate::store::streamed::Cache],
+    ) -> Result<()> {
+        use crate::store::streamed::Streamed;
+        let mut planes = BTreeMap::new();
+        let mut rows = BTreeMap::new();
+        for cache in caches {
+            for (param, table) in cache.tables() {
+                match table {
+                    Streamed::Experts(table) => {
+                        planes.insert(param, table);
+                    }
+                    Streamed::Rows(table) => {
+                        rows.insert(param, table);
+                    }
+                    Streamed::Bank(_) | Streamed::BankRows(_) => {}
+                }
+            }
+        }
+        let named = |name: String| trace.params.iter().position(|p| p.name == name);
+        // A quantized table's planes, a block of rows at a time.
+        for (&codes, &table) in &rows {
+            let Some(crate::run::WeightRow::Planes(_)) =
+                weights.table().0.get(codes).copied().flatten()
+            else {
+                continue;
+            };
+            let name = &trace.params[codes].name;
+            let plane = |suffix: &str| {
+                named(format!("{name}{suffix}"))
+                    .and_then(|p| rows.get(&p).copied())
+                    .ok_or_else(|| Fault::Unbound {
+                        what: format!(
+                            "the `{suffix}` plane of streamed table `{name}`, which no cache streams"
+                        ),
+                    })
+            };
+            let (scales, biases) = (plane(poem_ir::SCALES)?, plane(poem_ir::BIASES)?);
+            weights.read_through(
+                codes,
+                Streamed::BankRows(kernels_metal::gather::BankRows {
+                    codes: table.at,
+                    scales: scales.at,
+                    biases: biases.at,
+                    block_rows: table.block_rows,
+                    hits: table.hits.or(scales.hits).or(biases.hits),
+                }),
+            );
+        }
+        let weight_of = |id: ValueId| match trace.values.get(id.0 as usize).map(|d| &d.def) {
+            Some(poem_ir::Def::Weight(w)) => Some(*w as usize),
+            _ => None,
+        };
+        for (&codes, &table) in &planes {
+            let Some(crate::run::WeightRow::Planes(_)) =
+                weights.table().0.get(codes).copied().flatten()
+            else {
+                continue;
+            };
+            let name = &trace.params[codes].name;
+            let missing = |what: &str| Fault::Unbound {
+                what: format!("the {what} of streamed routed bank `{name}`, which no cache streams"),
+            };
+            let at = |param: Option<usize>, what: &str| -> Result<Option<kernels_metal::Tensor>> {
+                param
+                    .map(|p| planes.get(&p).map(|t| t.at).ok_or_else(|| missing(what)))
+                    .transpose()
+            };
+            let scales = at(Some(named(format!("{name}{}", poem_ir::SCALES)).ok_or_else(|| missing("scales"))?), "scales")?
+                .ok_or_else(|| missing("scales"))?;
+            let biases = at(named(format!("{name}{}", poem_ir::BIASES)), "zero points")?;
+            let bias = trace.nodes.iter().find_map(|node| match &node.op {
+                Operation::Linear(poem_ir::Linear::MoeSelect {
+                    bank,
+                    bias: Some(bias),
+                    ..
+                }) if weight_of(*bank) == Some(codes) => weight_of(*bias),
+                _ => None,
+            });
+            let bias = at(bias, "expert bias")?;
+            let hits = [Some(codes), named(format!("{name}{}", poem_ir::SCALES)), named(format!("{name}{}", poem_ir::BIASES))]
+                .into_iter()
+                .flatten()
+                .find_map(|p| planes.get(&p).and_then(|t| t.hits));
+            weights.read_through(
+                codes,
+                Streamed::Bank(kernels_metal::linear::moe::BankTable {
+                    codes: table.at,
+                    scales,
+                    biases,
+                    bias,
+                    pieces: table.pieces,
+                    piece_rows: table.piece_rows,
+                    hits,
+                }),
+            );
+        }
+        Ok(())
     }
 
     pub fn load(boot: Boot<'_>) -> Result<Shell> {
@@ -731,6 +844,7 @@ impl PreparedLoad<'_> {
                 &boot.trace,
                 &recipe,
                 !boot.residency.streams(),
+                boot.residency.weights_held(),
             )?
         };
         handles.seal();
@@ -868,6 +982,31 @@ impl PreparedLoad<'_> {
         pools.seat_weights(weight_caches);
         // The null chunk and the floor stand from the load on.
         pools.commit_segments(1)?;
+        // A load whose weights the runtime holds seats every atom in pool
+        // slots itself, from the serving file where it reads them there,
+        // and states where (`WeightShape::seated`); the runtime adopts it.
+        if boot.residency.weights_held() && !pools.weight_caches().is_empty() {
+            match pools.preseat_plan() {
+                Some(plan) => {
+                    let started = std::time::Instant::now();
+                    let mut frame = device.frame()?;
+                    pools.preseat_weights(&mut frame, &plan)?;
+                    frame.commit()?;
+                    pools.restage_weights()?;
+                    tracing::info!(
+                        atoms = plan.resident.len(),
+                        shapes = pools.weight_caches().len(),
+                        ms = started.elapsed().as_millis() as u64,
+                        "the held weights are seated in the pool at load"
+                    );
+                }
+                None => tracing::info!(
+                    "the pool cannot hold every weight atom beside the seats: the held \
+                     weights are read in place until the runtime names their slots"
+                ),
+            }
+        }
+        Shell::hold_weight_hosts(&device, &handles, &mut weights, &mut pools)?;
         let rs_buffers = rs_at.map(|at| {
             crate::rs::Buffers::in_pool(
                 at.plane_at,
@@ -1164,11 +1303,25 @@ impl Shell {
         self.pools.weight_residency(&mut frame, residency)?;
         frame.commit()?;
         self.pools.restage_weights()?;
+        Shell::hold_weight_hosts(
+            &self.device,
+            &self.handles,
+            &mut self.weights,
+            &mut self.pools,
+        )?;
+        let resident: Vec<bool> = self
+            .pools
+            .weight_caches()
+            .iter()
+            .map(crate::store::streamed::Cache::hosts_resident)
+            .collect();
         let released = self.pools.release_weight_hosts();
         if !released.is_empty() {
             let empty = Buffer::zeroed(&self.device, 0)?;
-            self.device
-                .hold_resident(released.iter().map(|(_, _, slab)| slab), false)?;
+            if resident.iter().any(|r| *r) {
+                self.device
+                    .hold_resident(released.iter().map(|(_, _, slab)| slab), false)?;
+            }
             let mut freed = 0;
             for (param, handle, _) in &released {
                 self.handles.rebind(*handle, &empty)?;
@@ -1180,6 +1333,42 @@ impl Shell {
                 "the held weight set names every block: the row-streamed tables' own copies \
                  are given back"
             );
+        }
+        Ok(())
+    }
+
+    /// Puts the weights' own copies in the queue's residency set wherever a
+    /// fire may read one in place: a cache whose atoms are not all in slots
+    /// under a held set, and the load did not seat them all.
+    fn hold_weight_hosts(
+        device: &Context,
+        handles: &Handles,
+        weights: &mut Weights,
+        pools: &mut Pools,
+    ) -> Result<()> {
+        let whole = pools.weights_whole()
+            || pools
+                .weight_caches()
+                .iter()
+                .all(crate::store::streamed::Cache::preseated);
+        if whole {
+            return Ok(());
+        }
+        let mut opened = false;
+        for cache in pools.weight_caches_mut() {
+            if !cache.hosts_resident() && !cache.released() {
+                // A weight the load reads out of the serving file gets a
+                // window of its own now that a miss reads it in place.
+                cache.open_files(|param, handle| {
+                    opened = true;
+                    weights.open_filed(device, handles, param, handle)
+                })?;
+                device.hold_resident(cache.host_slabs(), true)?;
+                cache.set_hosts_resident(true);
+            }
+        }
+        if opened {
+            pools.restage_weights()?;
         }
         Ok(())
     }

@@ -1140,6 +1140,8 @@ impl Run<'_> {
                 ..
             } => {
                 const OP: &str = "linear.moe_select";
+                let table = self.bank_table(*bank);
+                self.count_bank(table, self.tensor(*routes))?;
                 if let Some(scratch) = self.routed_rooms() {
                     let sorted = self.chain_select(*x, *bank, *routes, *y);
                     if linear::moe::matmul_select_batched(
@@ -1147,6 +1149,7 @@ impl Run<'_> {
                         OP,
                         self.tensor(*x),
                         self.planes(*bank),
+                        table,
                         Some(self.tensor(*bias)),
                         self.tensor(*routes),
                         self.experts(*routes),
@@ -1170,6 +1173,7 @@ impl Run<'_> {
                     self.ctx(),
                     self.tensor(*x),
                     self.planes(*bank),
+                    table,
                     self.tensor(*bias),
                     self.tensor(*routes),
                     self.tensor(*y),
@@ -1192,6 +1196,8 @@ impl Run<'_> {
                 {
                     return Ok(());
                 }
+                let table = self.bank_table(*bank);
+                self.count_bank(table, self.tensor(*routes))?;
                 if let Some(scratch) = self.routed_rooms() {
                     let sorted = self.chain_select(*x, *bank, *routes, *y);
                     if linear::moe::matmul_select_batched(
@@ -1199,6 +1205,7 @@ impl Run<'_> {
                         OP,
                         self.tensor(*x),
                         self.planes(*bank),
+                        table,
                         None,
                         self.tensor(*routes),
                         self.experts(*routes),
@@ -1222,6 +1229,7 @@ impl Run<'_> {
                     self.ctx(),
                     self.tensor(*x),
                     self.planes(*bank),
+                    table,
                     self.tensor(*routes),
                     self.tensor(*y),
                 )

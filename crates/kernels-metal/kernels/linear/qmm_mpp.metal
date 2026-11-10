@@ -39,6 +39,7 @@ kernel void qmm_mpp_pack_bank(const device uint *codes [[buffer(0)]],
 }
 
 #include "../prim/mpp.h"
+#include "moe/expert_at.h"
 
 template <int M, int N, int S, bool PACKED, bool RELAXED, int PARTS, bool PAIRED, bool LOCAL,
           int ROW_GROUP, class Index>
@@ -163,7 +164,7 @@ affine_qmm_mpp_routed(const device uchar *weights [[buffer(0)]],
                       const device bfloat *input [[buffer(3)]],
                       device bfloat *output [[buffer(4)]], constant int &width [[buffer(5)]],
                       constant int &columns [[buffer(6)]], const device float *sums [[buffer(7)]],
-                      const device int *tile_expert [[buffer(8)]],
+                      const device int *tile_expert [[buffer(8)]], PIE_EXPERT_TABLE_ARGS,
                       uint3 position [[threadgroup_position_in_grid]]) {
   const uint column_tile = position.x, row_tile = position.y;
   const int expert = tile_expert[row_tile * M / TILE];
@@ -171,7 +172,19 @@ affine_qmm_mpp_routed(const device uchar *weights [[buffer(0)]],
     return;
   const int groups = width / 64;
   const uint row = row_tile * M;
-  const ulong column = ulong(expert) * columns + column_tile * N;
+  // The expert's planes as the bank lays them, or where its table puts the
+  // piece holding this tile's N columns; `column` counts from the expert's.
+  const ulong column = column_tile * N;
+  const ulong w_row = ulong(width / 2), g_row = ulong(groups) * sizeof(bfloat);
+  weights = (const device uchar *)expert_plane((const device char *)weights, codes_at, pieces,
+                                               piece_rows, ulong(columns) * w_row, w_row,
+                                               uint(expert), uint(column));
+  scales = (const device bfloat *)expert_plane((const device char *)scales, scales_at, pieces,
+                                               piece_rows, ulong(columns) * g_row, g_row,
+                                               uint(expert), uint(column));
+  biases = (const device bfloat *)expert_plane((const device char *)biases, biases_at, pieces,
+                                               piece_rows, ulong(columns) * g_row, g_row,
+                                               uint(expert), uint(column));
   auto activations = tensor(const_cast<device bfloat *>(input) + ulong(row) * width,
                             dextents<int, 2>{width, M}, array<int, 2>{1, width});
   auto weight_view = [&](uint group) {
@@ -212,7 +225,7 @@ affine_qmm_mpp_routed(const device uchar *weights [[buffer(0)]],
   template [[host_name(name)]] [[kernel]] void affine_qmm_mpp_routed<m, n, s, tile>(               \
       const device uchar *, const device bfloat *, const device bfloat *, const device bfloat *,   \
       device bfloat *, constant int &, constant int &, const device float *, const device int *,   \
-      uint3);
+      PIE_EXPERT_TABLE_TYPES, uint3);
 
 // The routed MXFP4 matmul on the MPP matmul: each
 // 64-wide slice of the expert's codes is decoded into threadgroup bfloat (an E2M1 value times
@@ -276,7 +289,7 @@ mxfp4_qmm_mpp_routed(const device uchar *codes [[buffer(0)]],
                      constant int &width [[buffer(4)]], constant int &columns [[buffer(5)]],
                      const device bfloat *bias [[buffer(6)]],
                      const device int *tile_expert [[buffer(7)]],
-                     const device int *perm [[buffer(8)]],
+                     const device int *perm [[buffer(8)]], PIE_EXPERT_TABLE_ARGS,
                      uint3 position [[threadgroup_position_in_grid]],
                      uint thread_id [[thread_index_in_threadgroup]]) {
   constexpr int BK = 64, LD = BK + 8, THREADS = 32 * S;
@@ -286,8 +299,22 @@ mxfp4_qmm_mpp_routed(const device uchar *codes [[buffer(0)]],
   if (expert < 0)
     return;
   const uint row = row_tile * M;
-  const ulong column = ulong(expert) * columns + column_tile * N;
   const int blocks = width / 32;
+  // The expert's planes as the bank lays them, or where its table puts the
+  // piece holding this tile's N columns; `column` counts from the expert's.
+  const ulong column = column_tile * N;
+  const ulong w_row = ulong(width / 2), s_row = ulong(blocks);
+  codes = (const device uchar *)expert_plane((const device char *)codes, codes_at, pieces,
+                                             piece_rows, ulong(columns) * w_row, w_row,
+                                             uint(expert), uint(column));
+  exponents = (const device uchar *)expert_plane((const device char *)exponents, scales_at,
+                                                 pieces, piece_rows, ulong(columns) * s_row,
+                                                 s_row, uint(expert), uint(column));
+  if (BIAS) {
+    bias = (const device bfloat *)expert_plane((const device char *)bias, bias_at, pieces,
+                                               piece_rows, ulong(columns) * sizeof(bfloat),
+                                               sizeof(bfloat), uint(expert), uint(column));
+  }
   threadgroup bfloat staged[2][N * LD];
 
   // This thread's run of PER_THREAD bytes: one weight row, BK/2 bytes per row.
@@ -351,4 +378,4 @@ mxfp4_qmm_mpp_routed(const device uchar *codes [[buffer(0)]],
   template [[host_name(name)]] [[kernel]] void mxfp4_qmm_mpp_routed<m, n, s, tile, bias>(          \
       const device uchar *, const device uchar *, const device bfloat *, device bfloat *,          \
       constant int &, constant int &, const device bfloat *, const device int *, const device int *, \
-      uint3, uint);
+      PIE_EXPERT_TABLE_TYPES, uint3, uint);

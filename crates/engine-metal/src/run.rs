@@ -857,9 +857,12 @@ impl<'c> Run<'c> {
             moe::REGISTER_CUT.groups(inter, columns),
             rooms,
         )?;
+        let gate_up_table = self.bank_table(bank);
+        self.count_bank(gate_up_table, rt)?;
         moe::register_glu(
             self.ctx(),
             gate_up,
+            gate_up_table,
             shared.map(|s| s.gate_up),
             xt.width,
             inter,
@@ -1040,9 +1043,12 @@ impl<'c> Run<'c> {
         let rooms = self
             .register_rooms()
             .expect("the register chain began over the rooms the load reserved");
+        let table = self.bank_table(bank);
+        self.count_bank(table, self.tensor(routes))?;
         kernels_metal::linear::moe::register_down(
             self.ctx(),
             self.planes(bank),
+            table,
             tiled.shared.map(|s| s.down),
             self.tensor(x).width,
             self.tensor(y).width,
@@ -1681,7 +1687,7 @@ impl<'c> Run<'c> {
     pub(crate) fn row_table(&self, id: ValueId) -> Option<kernels_metal::gather::RowTable> {
         match self.streamed(id)? {
             crate::store::streamed::Streamed::Rows(table) => Some(table),
-            crate::store::streamed::Streamed::Experts(_) => None,
+            _ => None,
         }
     }
 
@@ -1693,7 +1699,41 @@ impl<'c> Run<'c> {
     ) -> Option<kernels_metal::linear::moe::ExpertTable> {
         match self.streamed(id)? {
             crate::store::streamed::Streamed::Experts(table) => Some(table),
-            crate::store::streamed::Streamed::Rows(_) => None,
+            _ => None,
+        }
+    }
+
+    /// The tables a quantized table `id` is read through, where the weight
+    /// cache streams it by its rows.
+    pub(crate) fn bank_rows(&self, id: ValueId) -> Option<kernels_metal::gather::BankRows> {
+        match self.streamed(id)? {
+            crate::store::streamed::Streamed::BankRows(table) => Some(table),
+            _ => None,
+        }
+    }
+
+    /// The tables a quantized routed bank `id` is read through, where the
+    /// weight cache streams it an expert at a time.
+    pub(crate) fn bank_table(
+        &self,
+        id: ValueId,
+    ) -> Option<kernels_metal::linear::moe::BankTable> {
+        match self.streamed(id)? {
+            crate::store::streamed::Streamed::Bank(table) => Some(table),
+            _ => None,
+        }
+    }
+
+    /// Counts each route of `routes` against its expert, where `table` keeps
+    /// its bank's use record (the weight cache's hit counters).
+    pub(crate) fn count_bank(
+        &self,
+        table: Option<kernels_metal::linear::moe::BankTable>,
+        routes: kernels_metal::Tensor,
+    ) -> Result<(), kernels_metal::Error> {
+        match table.and_then(|table| table.hits) {
+            Some(hits) => kernels_metal::linear::moe::count_routes(self.ctx(), routes, hits),
+            None => Ok(()),
         }
     }
 
