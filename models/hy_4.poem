@@ -4,7 +4,6 @@
 load("//pie/codec.poem", "kept", "stacked_bank", read_weight = "weight")
 load("//lib/adapters.poem", "banks", "corrected")
 load("//lib/hyper.poem", "collapse")
-load("//lib/mla.poem", "fp8_rows", "cache")
 load("//lib/mtp.poem", "draft")
 
 HY = template("hy", thinking = True)
@@ -91,7 +90,7 @@ def head(prefix, streams, hidden):
 
 def attention(n, d, hidden, weights, norms, eps, kv, sink, indexer, kept = None):
     """The gated latent attention named by `n`, its projections in `weights`
-    and its norms in `norms`, caching under `kv`, its sink logits at `sink`;
+    and its norms in `norms`, its latent rows the state `kv`, its sink logits at `sink`;
     `indexer` ranks its keys, or with none it reads the last ranking. Its
     latent up-projection and gate are at `kept`, or `weights`."""
     kept = kept or weights
@@ -196,6 +195,13 @@ def layout(id, deploy):
     streams = d.streams
     a = d.mla
     index_width = d.index_heads * d.index_head_dim
+    # An attention's latent rows: the latent and its rotated dims a token, as
+    # vLLM's standard fp8 rows (a byte a dim, one plane) on an e4m3 kv. The
+    # index keys stay at bf16 there.
+    fp8 = deploy.kv == dtype.e4m3
+    latent = lambda: (state([tokens, a.kv_lora_rank + a.qk_rope_head_dim], kv_rows.fp8) if fp8
+                      else state([tokens, [a.kv_lora_rank, a.qk_rope_head_dim]], deploy.kv))
+    index_keys = lambda: state([tokens, d.index_head_dim], dtype.bf16 if fp8 else deploy.kv)
 
     def mla_at(prefix, kv, keys, sink):
         n = lambda s: "{}.{}".format(prefix, s)
@@ -246,7 +252,7 @@ def layout(id, deploy):
         n = lambda s: "layer.{}.{}".format(l, s)
         norm = lambda s: weight([hidden])
         lora_a, lora_b = banks(hidden)
-        keys = "index.{}".format(l) if ranks(l) else None
+        keys = index_keys() if ranks(l) else None
         if l < d.dense_layers:
             iw = d.dense_inter
             mlp = struct(
@@ -262,7 +268,7 @@ def layout(id, deploy):
             attn_mix = mix(n, "attn_hc", streams, hidden),
             attn_norm = norm("attn_norm"),
             attn_norm_eps = d.norm_eps,
-            attn = mla_at("layer.{}".format(l), "kv.{}".format(l), keys, n("sink")),
+            attn = mla_at("layer.{}".format(l), latent(), keys, n("sink")),
             mlp_mix = mix(n, "ffn_hc", streams, hidden),
             mlp_norm = norm("mlp_norm"),
             mlp_norm_eps = d.norm_eps,
@@ -279,7 +285,7 @@ def layout(id, deploy):
             e_proj = weight([hidden, hidden]),
             h_proj = weight([hidden, hidden]),
             attn_norm = weight([hidden]),
-            attn = mla_at("mtp", "kv.mtp", "index.mtp", "mtp.sink"),
+            attn = mla_at("mtp", latent(), index_keys(), "mtp.sink"),
             mlp_norm = weight([hidden]),
             mlp = routed_at("mtp", draft),
             norm = weight([hidden]),
@@ -291,7 +297,6 @@ def layout(id, deploy):
         vocab = d.vocab,
         heads = a.heads,
         kv_lora_rank = a.kv_lora_rank,
-        kv = deploy.kv,
         hyper = hyper(streams, d.norm_eps, d.gate_eps, d.alpha),
         embed = weight([d.vocab, hidden], weights),
         head = weight([d.vocab, hidden], weights),
@@ -526,19 +531,6 @@ def mlp(x, f):
     gate, up = ops.linear.matmul(x, s.gate), ops.linear.matmul(x, s.up)
     act = ops.linear.glu(gate, gating.swiglu(), up = up)
     return ops.elemwise.residual_add(ops.linear.matmul(act, s.down), routed)
-
-def caches(m, c):
-    fp8 = fp8_rows(m)
-    kv = c.kv_space(dtype.u8 if fp8 else m.kv)
-    index = c.kv_space(dtype.bf16 if fp8 else m.kv)
-    for w in m.layers:
-        cache(c, kv, w.attn, fp8)
-        if w.attn.indexer != None:
-            c.kv(index, w.attn.indexer.keys, [w.attn.indexer.head_dim], w.attn.indexer.head_dim)
-    if m.mtp != None:
-        a = m.mtp.attn
-        cache(c, kv, a, fp8)
-        c.kv(index, a.indexer.keys, [a.indexer.head_dim], a.indexer.head_dim)
 
 def forward(m, inputs):
     hy = m.hyper

@@ -122,8 +122,8 @@ fn glm_5_next(path: &str, _row: &CacheRow) -> String {
     path.to_string()
 }
 
-fn hy_4(path: &str, _row: &CacheRow) -> String {
-    path.to_string()
+fn hy_4(path: &str, row: &CacheRow) -> String {
+    glm_5(path, row)
 }
 
 fn minimax_m3(path: &str, _row: &CacheRow) -> String {
