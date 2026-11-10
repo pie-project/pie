@@ -7,7 +7,7 @@
 
 use crate::attn::compressed::decode::Rows;
 use crate::error::Error;
-use crate::jit::{ArgValue, Ctx, Fire, Launch, aligned16, kernel};
+use crate::jit::{Arg, ArgValue, Ctx, Fire, Launch, aligned16, kernel};
 use crate::linear::gemm_sm100::supported;
 use crate::tensor::{KvPool, Tensor};
 use dtype::Dtype;
@@ -104,6 +104,10 @@ pub fn takes(
         && pooled.ratio > 0
         && (fp8 || plain_bf16(window_pool))
         && (fp8 || plain_bf16(&entries_of(pooled).0))
+        // Its tensor maps and row loads read the planes cell by cell, page
+        // after page.
+        && window_pool.packed()
+        && pooled.entries.packed()
 }
 
 /// Whether [`window_only`] serves this window.
@@ -510,6 +514,7 @@ fn stage(
                 ArgValue::Ptr(table),
                 ArgValue::I32(i32::try_from(pages).unwrap_or(i32::MAX)),
                 ArgValue::I32(pool.page_size),
+                crate::attn::kv::page_elems(op, pool, 0)?.arg(),
             ],
         )?;
     }
@@ -520,5 +525,6 @@ fn stage(
         seq_stride: i64::from(HEAD_DIM),
         head_stride: i64::from(HEAD_DIM),
         ..*pool
-    })
+    }
+    .with_packed_stride())
 }

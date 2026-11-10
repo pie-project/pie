@@ -145,6 +145,7 @@ pub fn capture(
             pool.last_page_lens.arg(),
             scores.arg(),
             page_size.arg(),
+            kv::page_elems(OP, pool, 0)?.arg(),
             stated(OP, num_q_heads)?.arg(),
             stated(OP, num_kv_heads)?.arg(),
             head_dim.arg(),

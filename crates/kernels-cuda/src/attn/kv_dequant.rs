@@ -8,6 +8,7 @@ use crate::attn::kv::KvScheme;
 use crate::attn::kv::fp4_block_size;
 use crate::attn::kv::native_bf16;
 use crate::attn::kv::native_e4m3;
+use crate::attn::kv::packed_only;
 use crate::attn::kv::scheme_of;
 #[cfg(feature = "cuda")]
 use crate::jit::ArgValue;
@@ -40,7 +41,13 @@ pub(crate) fn widen_e4m3(
     let page = u32::try_from(pool.page_size).unwrap_or(0);
     let width = pool.keys.width;
     let row_bytes = u64::from(page) * u64::from(width);
-    if pages == 0 || pool.layout != 0 || !row_bytes.is_multiple_of(16) {
+    let [k_stride, v_stride] = pool.page_stride;
+    if pages == 0
+        || pool.layout != 0
+        || !row_bytes.is_multiple_of(16)
+        || !k_stride.is_multiple_of(16)
+        || !v_stride.is_multiple_of(16)
+    {
         return Ok(None);
     }
     let bytes = usize::try_from(u64::from(pages) * row_bytes * 2).unwrap_or(usize::MAX);
@@ -66,15 +73,21 @@ pub(crate) fn widen_e4m3(
             ArgValue::Ptr(ids),
             i64::try_from(chunks).unwrap_or(i64::MAX).arg(),
             i32::try_from(row_bytes / 16).unwrap_or(i32::MAX).arg(),
+            i64::try_from(k_stride / 16).unwrap_or(i64::MAX).arg(),
+            i64::try_from(v_stride / 16).unwrap_or(i64::MAX).arg(),
         ],
     )?;
     let cells = pages * page;
-    Ok(Some(KvPool {
-        keys: Tensor::new(k, cells, width, Dtype::Bf16),
-        values: Tensor::new(v, cells, pool.values.width, Dtype::Bf16),
-        page_indices: Tensor::new(ids, pages, 1, Dtype::I32),
-        ..*pool
-    }))
+    // The shadow lies page after page in its own buffers.
+    Ok(Some(
+        KvPool {
+            keys: Tensor::new(k, cells, width, Dtype::Bf16),
+            values: Tensor::new(v, cells, pool.values.width, Dtype::Bf16),
+            page_indices: Tensor::new(ids, pages, 1, Dtype::I32),
+            ..*pool
+        }
+        .with_packed_stride(),
+    ))
 }
 
 fn active_geometry(
@@ -104,6 +117,8 @@ pub(crate) fn dequant_active(
     if native_bf16(pool) || native_e4m3(pool) {
         return Ok(());
     }
+    // The quantized schemes' scale planes and bf16 shadow lie packed.
+    packed_only(op, pool, "a quantized scheme's widening")?;
     let (logical_n, page_elems, launch) =
         active_geometry(pool.page_size, num_kv_heads, head_dim, pool.pages_in_batch);
 

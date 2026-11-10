@@ -82,7 +82,15 @@ pub(super) fn fire(
     // Where the tcgen05 pass serves, fp8 rows at any head count are read
     // 64 heads a pass (a rank's share under tensor parallelism, or more
     // than 64); elsewhere they take the path any other shape takes.
-    if fp8 && s.heads != 64 && s.heads > 0 && ctx.tuning().mla_sparse && supported() {
+    // Its tensor maps read the planes cell by cell, page after page: a pool
+    // laid otherwise takes the tensor-core kernel.
+    if fp8
+        && s.heads != 64
+        && s.heads > 0
+        && ctx.tuning().mla_sparse
+        && supported()
+        && pool.packed()
+    {
         return Some(by_sixty_four(ctx, op, s, o));
     }
     let cells = pool.keys.rows;
@@ -94,6 +102,7 @@ pub(super) fn fire(
         && s.q.dtype == Dtype::Bf16
         && (pool.keys.dtype == Dtype::Bf16 || fp8)
         && pool.page_size > 0
+        && pool.packed()
         && cells > 0
         && s.selection.width > 0
         && o.width == 64 * 512

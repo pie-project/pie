@@ -7,7 +7,7 @@ use crate::error::Error;
 use crate::attn::kv;
 use crate::jit::Ctx;
 #[cfg(feature = "cuda")]
-use crate::jit::{ArgValue, Fire, Launch, kernel, refuse};
+use crate::jit::{Arg, ArgValue, Fire, Launch, kernel, refuse};
 use crate::tensor::{KvPool, Tensor};
 #[cfg(feature = "cuda")]
 use dtype::Dtype;
@@ -161,6 +161,8 @@ pub fn prefill_expanded(
                 ArgValue::Ptr(ident + u64::from(first) * 4),
                 ArgValue::Ptr(live),
                 int(requests),
+                kv::page_elems(OP, pool, 0)?.arg(),
+                kv::page_elems(OP, pool, 1)?.arg(),
             ],
         )?;
         // Each cell's heads expanded: `[heads][nope + v]` a cell.

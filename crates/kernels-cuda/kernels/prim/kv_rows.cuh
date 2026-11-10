@@ -35,8 +35,10 @@ struct DsRow {
     std::uint8_t* scales;
 };
 
-__device__ __forceinline__ DsRow ds_row(std::uint8_t* plane, long long page, int off, int ps) {
-    std::uint8_t* base = plane + page * static_cast<long long>(ps) * kDsRow;
+// Its page's rows lie `stride` bytes from the previous page's (`ps * kDsRow`
+// packed).
+__device__ __forceinline__ DsRow ds_row(std::uint8_t* plane, long long page, int off, int ps, long long stride) {
+    std::uint8_t* base = plane + page * stride;
     return {base + static_cast<long long>(off) * kDsData,
             base + static_cast<long long>(ps) * kDsData + static_cast<long long>(off) * kDsScaleBytes};
 }
@@ -190,10 +192,12 @@ struct Rows<kNv4> {
     static constexpr int kScale = kDsDim / 16;
 };
 
+// Row `off` of page `page`, its pages `stride` bytes apart (`ps * (kData +
+// kScale)` packed).
 template <int F>
-__device__ __forceinline__ DsRow rows_at(std::uint8_t* plane, long long page, int off, int ps) {
+__device__ __forceinline__ DsRow rows_at(std::uint8_t* plane, long long page, int off, int ps, long long stride) {
     using T = Rows<F>;
-    std::uint8_t* base = plane + page * static_cast<long long>(ps) * (T::kData + T::kScale);
+    std::uint8_t* base = plane + page * stride;
     return {base + static_cast<long long>(off) * T::kData,
             base + static_cast<long long>(ps) * T::kData + static_cast<long long>(off) * T::kScale};
 }

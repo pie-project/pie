@@ -34,11 +34,12 @@ __device__ inline void reduce_page(
     int page_size,
     int num_kv_heads,
     int head_dim,
+    long long stride_page,
     bf16* __restrict__ env_min,
     bf16* __restrict__ env_max)
 {
     const long token_stride = static_cast<long>(num_kv_heads) * head_dim;
-    const long page_base = static_cast<long>(page) * page_size * token_stride +
+    const long page_base = static_cast<long>(page) * stride_page +
                            static_cast<long>(kh) * head_dim;
     const long env_base =
         (static_cast<long>(page) * num_kv_heads + kh) * head_dim;
@@ -70,6 +71,7 @@ __global__ void update_appended(
     int page_size,
     int num_kv_heads,
     int head_dim,
+    long long stride_page,
     const u32* __restrict__ win)
 {
     const int slot = blockIdx.x;
@@ -107,7 +109,7 @@ __global__ void update_appended(
             reduce_page(
                 k_pages,
                 static_cast<int>(kv_page_indices[pages_first + page_in_req]),
-                kh, live, page_size, num_kv_heads, head_dim, env_min, env_max);
+                kh, live, page_size, num_kv_heads, head_dim, stride_page, env_min, env_max);
             return;
         }
         seen += touched;

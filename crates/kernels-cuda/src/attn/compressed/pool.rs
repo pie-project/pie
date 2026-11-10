@@ -374,6 +374,7 @@ pub fn kv_append(
             head_dim.arg(),
             pool.page_size.arg(),
             div.arg(),
+            kv::page_elems(OP, pool, 0)?.arg(),
             ctx.stage(),
         ],
     )
@@ -461,6 +462,7 @@ pub fn attention_lse(
             entries.page_size.arg(),
             sm_scale.arg(),
             i32::from(compact(entries, ratio.unsigned_abs(), i64::from(head_dim))).arg(),
+            kv::page_elems(OP, entries, 0)?.arg(),
             ctx.stage(),
         ],
     )
@@ -585,6 +587,7 @@ pub fn attention_lse_selected(
             entries.page_size.arg(),
             sm_scale.arg(),
             i32::from(compact(entries, ratio.unsigned_abs(), i64::from(head_dim))).arg(),
+            kv::page_elems(OP, entries, 0)?.arg(),
             ctx.stage(),
         ],
     )
@@ -728,6 +731,7 @@ pub fn compress(
             out.page_indptr.arg(),
             out.page_size.arg(),
             out_div.arg(),
+            kv::page_elems(OP, out, 0)?.arg(),
             head_dim_i.arg(),
             ratio.arg(),
             coff.arg(),
@@ -800,6 +804,7 @@ pub fn block_mean(
             head_dim.arg(),
             ratio.arg(),
             keys.page_size.arg(),
+            kv::page_elems(OP, keys, 0)?.arg(),
             ctx.stage(),
         ],
     )?;

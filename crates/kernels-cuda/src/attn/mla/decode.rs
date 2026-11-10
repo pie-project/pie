@@ -63,6 +63,9 @@ pub(crate) mod naive {
         pub kv_lora_rank: i32,
         pub rope_dim: i32,
         pub page_size: i32,
+        /// Elements from a page's latent (rotated) rows to the next page's.
+        pub ckv_stride: i64,
+        pub kpe_stride: i64,
         pub total_tokens: i32,
         pub num_requests: i32,
         pub num_heads: i32,
@@ -117,6 +120,8 @@ pub(crate) mod naive {
             && shape.rope_dim == 64
             && shape.num_heads > 0
             && shape.num_heads % 64 == 0
+            // Its slots keep a key's cell in 16 bits.
+            && shape.page_size < 1 << 16
         {
             return wgmma(ctx, op, ptrs, shape);
         }
@@ -184,6 +189,8 @@ pub(crate) mod naive {
                     shape.num_requests.arg(),
                     shape.num_heads.arg(),
                     shape.page_size.arg(),
+                    shape.ckv_stride.arg(),
+                    shape.kpe_stride.arg(),
                     shape.sm_scale.arg(),
                     shape.causal.arg(),
                     ctx.stage(),
@@ -280,6 +287,8 @@ pub(crate) mod naive {
                 shape.kv_lora_rank.arg(),
                 shape.rope_dim.arg(),
                 shape.page_size.arg(),
+                shape.ckv_stride.arg(),
+                shape.kpe_stride.arg(),
                 shape.sm_scale.arg(),
                 shape.causal.arg(),
                 g.arg(),
@@ -357,6 +366,8 @@ pub(crate) mod naive {
                 shape.num_requests.arg(),
                 shape.num_heads.arg(),
                 shape.page_size.arg(),
+                shape.ckv_stride.arg(),
+                shape.kpe_stride.arg(),
                 shape.sm_scale.arg(),
                 shape.causal.arg(),
                 ctx.stage(),
@@ -587,9 +598,9 @@ pub(crate) mod fa2 {
             q_nope_stride_h: rank,
             q_pe_stride_n: num_heads * rope,
             q_pe_stride_h: rope,
-            ckv_stride_page: page_size * rank,
+            ckv_stride_page: layer.ckv_stride,
             ckv_stride_n: rank,
-            kpe_stride_page: page_size * rope,
+            kpe_stride_page: layer.kpe_stride,
             kpe_stride_n: rope,
             o_stride_n: num_heads * rank,
             o_stride_h: rank,

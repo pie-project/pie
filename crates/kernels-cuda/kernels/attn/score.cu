@@ -13,6 +13,7 @@ __global__ void score_capture(
     const i32* __restrict__ kv_last_page_lens,
     float* __restrict__ scores,
     int page_size,
+    long long stride_page,
     int num_q_heads,
     int num_kv_heads,
     int head_dim,
@@ -87,7 +88,7 @@ __global__ void score_capture(
             slot.offset_in_page = j - page_in_req * page_size;
             const bf16* k_row =
                 k_pages + kv_dst_index<HND_LAYOUT>(slot, kv_head * head_dim, page_size,
-                                                   num_kv_heads, head_dim);
+                                                   num_kv_heads, head_dim, stride_page);
             float dot = 0.f;
 #pragma unroll
             for (int u = 0; u < VPT; ++u) {
@@ -130,7 +131,7 @@ __global__ void score_capture(
             slot.offset_in_page = j - page_in_req * page_size;
             const bf16* k_row =
                 k_pages + kv_dst_index<HND_LAYOUT>(slot, kv_head * head_dim, page_size,
-                                                   num_kv_heads, head_dim);
+                                                   num_kv_heads, head_dim, stride_page);
             float dot = 0.f;
 #pragma unroll
             for (int u = 0; u < VPT; ++u) {

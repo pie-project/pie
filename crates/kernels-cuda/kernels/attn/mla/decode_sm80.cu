@@ -35,7 +35,8 @@ __global__ void mla_naive_paged_kernel(
     __nv_bfloat16* __restrict__ o,
     float* __restrict__ lse,
     const std::int32_t* __restrict__ selection, int top_k,
-    int R, int H, int CKV, int KPE, int page_size, float sm_scale, bool causal,
+    int R, int H, int CKV, int KPE, int page_size, long long ckv_stride, long long kpe_stride,
+    float sm_scale, bool causal,
     int G, int window,
     const u32* __restrict__ win)
 {
@@ -105,9 +106,9 @@ __global__ void mla_naive_paged_kernel(
             static_cast<int>(kv_page_indices[pages_first + j / page_size]);
         const int off = j % page_size;
         const __nv_bfloat16* ckv_j =
-            ckv_pages + (static_cast<long long>(page) * page_size + off) * CKV;
+            ckv_pages + static_cast<long long>(page) * ckv_stride + static_cast<long long>(off) * CKV;
         const __nv_bfloat16* kpe_j =
-            kpe_pages + (static_cast<long long>(page) * page_size + off) * KPE;
+            kpe_pages + static_cast<long long>(page) * kpe_stride + static_cast<long long>(off) * KPE;
 
         float kv[MaxPer];
         float pd = 0.f;
@@ -213,7 +214,8 @@ __global__ __launch_bounds__(kThreads, PIE_MLA_MMA_MINBLK) void mla_mma_paged_ke
     __nv_bfloat16* __restrict__ part_o,
     float* __restrict__ part_lse,
     const std::int32_t* __restrict__ selection, int top_k, int dense,
-    int R, int H, int page_size, float sm_scale, bool causal,
+    int R, int H, int page_size, long long ckv_stride, long long kpe_stride,
+    float sm_scale, bool causal,
     const u32* __restrict__ win)
 {
     // `KPE` is the rope width: 64 with a rotated part, 0 for NoPE latents
@@ -313,7 +315,10 @@ __global__ __launch_bounds__(kThreads, PIE_MLA_MMA_MINBLK) void mla_mma_paged_ke
     const int g = lane >> 2, p = (lane & 3) << 1;
     const int dbase = warp * kDimsPerWarp;
 
-    __shared__ long long s_slot[kBK];
+    // Each tile row's latent and rotated rows, as element offsets into
+    // their planes (-1: no key).
+    __shared__ long long s_ckv[kBK];
+    __shared__ long long s_kpe[kBK];
     // Which of each stage's tile rows hold a key, for the scores' mask.
     __shared__ bool s_ok[kStages * kBK];
     auto issue_tile = [&](int j0, int stage) {
@@ -323,24 +328,22 @@ __global__ __launch_bounds__(kThreads, PIE_MLA_MMA_MINBLK) void mla_mma_paged_ke
             if (srow != nullptr) j = n < j_hi ? srow[n] : -1;
             const bool ok = n < j_hi && j >= 0 && j < j_end;
             s_ok[stage * kBK + rr] = ok;
-            s_slot[rr] =
-                ok
-                    ? (static_cast<long long>(
-                           kv_page_indices[pages_first + j / page_size]) *
-                           page_size +
-                       (j % page_size))
-                    : -1;
+            const long long page =
+                ok ? static_cast<long long>(kv_page_indices[pages_first + j / page_size]) : 0;
+            const long long off = ok ? j % page_size : 0;
+            s_ckv[rr] = ok ? page * ckv_stride + off * (kFp8 ? kD : kCkv) : -1;
+            s_kpe[rr] = ok ? page * kpe_stride + off * kKpe : -1;
         }
         __syncthreads();
         __nv_bfloat16* dst_base = sKbuf + stage * (kBK * kLdD);
         for (int c = tid; c < kBK * kChunksPerRow; c += kThreads) {
             const int row = c / kChunksPerRow;
             const int d = (c % kChunksPerRow) * 8;
-            const long long slot = s_slot[row];
+            const long long slot = s_ckv[row];
             __nv_bfloat16* dst = dst_base + row * kLdD + d;
             if (slot >= 0 && kFp8) {
                 const uint2 codes = *reinterpret_cast<const uint2*>(
-                    reinterpret_cast<const std::uint8_t*>(ckv_pages) + slot * kD + d);
+                    reinterpret_cast<const std::uint8_t*>(ckv_pages) + slot + d);
                 const unsigned short pairs[4] = {
                     static_cast<unsigned short>(codes.x), static_cast<unsigned short>(codes.x >> 16),
                     static_cast<unsigned short>(codes.y), static_cast<unsigned short>(codes.y >> 16)};
@@ -357,9 +360,8 @@ __global__ __launch_bounds__(kThreads, PIE_MLA_MMA_MINBLK) void mla_mma_paged_ke
             } else if (slot >= 0) {
                 const void* src =
                     (d < kCkv)
-                        ? static_cast<const void*>(ckv_pages + slot * kCkv + d)
-                        : static_cast<const void*>(kpe_pages + slot * kKpe +
-                                                   (d - kCkv));
+                        ? static_cast<const void*>(ckv_pages + slot + d)
+                        : static_cast<const void*>(kpe_pages + s_kpe[row] + (d - kCkv));
                 __pipeline_memcpy_async(dst, src, 16);
             } else {
                 *reinterpret_cast<int4*>(dst) = make_int4(0, 0, 0, 0);

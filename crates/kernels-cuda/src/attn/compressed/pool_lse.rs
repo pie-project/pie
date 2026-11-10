@@ -76,6 +76,7 @@ pub(crate) fn pool_mma(
             entries.page_size.arg(),
             sm_scale.arg(),
             i32::from(compact(entries, ratio.unsigned_abs(), i64::from(head_dim))).arg(),
+            crate::attn::kv::page_elems(op, entries, 0)?.arg(),
             fold.map_or(ArgValue::ABSENT, |(window_o, _, _)| window_o.arg()),
             fold.map_or(ArgValue::ABSENT, |(_, window_lse, _)| window_lse.arg()),
             fold.map_or(ArgValue::ABSENT, |(_, _, sinks)| sinks.arg()),

@@ -5,6 +5,7 @@
 
 use crate::common::attn_ref::{attend, col, near, pool, ten, tuned, wide};
 use crate::common::host::to_e4m3;
+use crate::common::spread::agrees;
 use crate::common::tc5::e4m3;
 use crate::common::{Gpu, Lcg, from_bf16, host::upload_to};
 use dtype::Dtype::{Bf16, E4m3, F32, I32};
@@ -183,11 +184,8 @@ fn check_live(
     );
     let toggles = Toggles::of(tuning);
     let (ip, kl, total) = (&kv_indptr[a..=b], &kv_len[a..b], rows as u32);
-    // Twice off one staged plan: one fire's workspace must not spoil the next.
-    for _ in 0..2 {
-        gpu.sync();
-        upload_to(o_at, &vec![0x7f7fu16; rows * qw]);
-        let fired = if lanes.is_some() {
+    let mut fire = |kvp: &KvPool| {
+        if lanes.is_some() {
             let grid = grid_of(d, qh, kvh, &device);
             let plan = plan::plan_decode(
                 ip, kl, shape, live, window, graph, grid, toggles, &device, ws,
@@ -196,9 +194,9 @@ fn check_live(
             plan.stage(&ctx).expect("the plan uploads");
             match sinked {
                 true => {
-                    attn::decode_lse_sink(&ctx, qt, &plan, &kvp, window, d, scale, o, lse, sink_t)
+                    attn::decode_lse_sink(&ctx, qt, &plan, kvp, window, d, scale, o, lse, sink_t)
                 }
-                false => attn::decode_lse(&ctx, qt, &plan, &kvp, window, d, scale, o, lse),
+                false => attn::decode_lse(&ctx, qt, &plan, kvp, window, d, scale, o, lse),
             }
         } else {
             let (q, k, l) = (&qo, &kv_indptr, &kv_len);
@@ -209,11 +207,16 @@ fn check_live(
             plan.stage(&ctx).expect("the plan uploads");
             let (w, s) = (window, scale);
             match sinked {
-                true => attn::prefill_lse_sink(&ctx, qt, &plan, &kvp, w, d, kvh, s, o, lse, sink_t),
-                false => attn::prefill_lse(&ctx, qt, &plan, &kvp, w, d, kvh, s, o, lse),
+                true => attn::prefill_lse_sink(&ctx, qt, &plan, kvp, w, d, kvh, s, o, lse, sink_t),
+                false => attn::prefill_lse(&ctx, qt, &plan, kvp, w, d, kvh, s, o, lse),
             }
-        };
-        fired.expect("the attention fires");
+        }
+    };
+    // Twice off one staged plan: one fire's workspace must not spoil the next.
+    for _ in 0..2 {
+        gpu.sync();
+        upload_to(o_at, &vec![0x7f7fu16; rows * qw]);
+        fire(&kvp).expect("the attention fires");
     }
     let what = format!("{qh}/{kvh} heads of {d}, {window:?}, {graph} {sinked} {lanes:?}");
     // Rows outside the plan's lanes keep the scrub.
@@ -239,6 +242,11 @@ fn check_live(
     let got_lse: Vec<f32> = gpu.down(lse_at, rows * qh as usize);
     let span = ra * qh as usize..rb * qh as usize;
     near(&got_lse[span.clone()], &want_lse[span], 1e-2, 1.0, &what);
+    // The same fire over the pool's pages spread apart lands the same bytes.
+    let outs = [(o_at, rows * qw * 2), (lse_at, rows * qh as usize * 4)];
+    agrees(&mut gpu, &what, &[kvp], &[], &outs, |_, pools, _| {
+        fire(&pools[0]).expect("the attention fires");
+    });
 }
 
 #[test]

@@ -53,7 +53,7 @@ __global__ __launch_bounds__(W * 32) void sdpa_paged_selected_mma_kernel(
     const u32* __restrict__ kv_last_page_lens,
     const i32* __restrict__ selection,
     __nv_bfloat16* __restrict__ o,
-    i32 R, i32 H, i32 KVH, i32 page_size, float sm_scale,
+    i32 R, i32 H, i32 KVH, i32 page_size, i64 stride_page, float sm_scale,
     i32 top_k, i32 ratio, i32 per_head,
     const u32* __restrict__ win)
 {
@@ -137,8 +137,8 @@ __global__ __launch_bounds__(W * 32) void sdpa_paged_selected_mma_kernel(
             }
             s_slot[warp][lane] = j < 0
                 ? -1
-                : static_cast<long long>(kv_page_indices[pages_first + j / page_size]) * page_size
-                      + j % page_size;
+                : static_cast<long long>(kv_page_indices[pages_first + j / page_size]) * stride_page
+                      + static_cast<long long>(j % page_size) * KVH * D;
         }
         __syncwarp();
         for (int c = lane; c < kKeys * kChunks; c += 32) {
@@ -148,7 +148,7 @@ __global__ __launch_bounds__(W * 32) void sdpa_paged_selected_mma_kernel(
             __nv_bfloat16* kd = sK + key * kLd + d;
             __nv_bfloat16* vd = sV + key * kLd + d;
             if (slot >= 0) {
-                const long long at = (slot * KVH + kv_head) * D + d;
+                const long long at = slot + kv_head * D + d;
                 __pipeline_memcpy_async(kd, k_pages + at, 16);
                 __pipeline_memcpy_async(vd, v_pages + at, 16);
             } else {
@@ -342,7 +342,7 @@ __global__ __launch_bounds__(Tile<D>::kThreads) void sdpa_paged_selected_tile_ke
     const u32* __restrict__ kv_last_page_lens,
     const i32* __restrict__ selection,
     __nv_bfloat16* __restrict__ o,
-    i32 R, i32 H, i32 KVH, i32 page_size, float sm_scale,
+    i32 R, i32 H, i32 KVH, i32 page_size, i64 stride_page, float sm_scale,
     i32 top_k, i32 ratio, i32 per_head, i32 tokens,
     const u32* __restrict__ win)
 {
@@ -479,8 +479,8 @@ __global__ __launch_bounds__(Tile<D>::kThreads) void sdpa_paged_selected_tile_ke
                 key_s[stage][tid] = j;
                 slot_s[stage][tid] = j < 0
                     ? -1
-                    : static_cast<long long>(kv_page_indices[pages_first + j / page_size]) * page_size
-                          + j % page_size;
+                    : static_cast<long long>(kv_page_indices[pages_first + j / page_size]) * stride_page
+                          + static_cast<long long>(j % page_size) * KVH * D;
             }
             __syncthreads();
             __nv_bfloat16* sK = sKV + stage * (2 * kKeys * kLd);
@@ -490,7 +490,7 @@ __global__ __launch_bounds__(Tile<D>::kThreads) void sdpa_paged_selected_tile_ke
                 const int d = (c % kChunks) * 8;
                 const long long slot = slot_s[stage][key];
                 if (slot >= 0) {
-                    const long long at = (slot * KVH + kv_head) * D + d;
+                    const long long at = slot + kv_head * D + d;
                     __pipeline_memcpy_async(sK + key * kLd + d, k_pages + at, 16);
                     __pipeline_memcpy_async(sV + key * kLd + d, v_pages + at, 16);
                 } else {
