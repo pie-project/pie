@@ -1493,6 +1493,65 @@ impl Frame {
         Ok(())
     }
 
+    /// Writes `bytes` into `into` from `at` in the frame's own order
+    /// (`vkCmdUpdateBuffer`, the data inline in the command buffer): after
+    /// every kernel recorded before it, and those of frames submitted
+    /// earlier, have read `into`, and before every kernel after it reads it.
+    /// The host never touches memory a fire in flight reads. `at` and the
+    /// length are whole words.
+    pub(crate) fn update(&self, into: &Buffer, at: u64, bytes: &[u8]) -> Result<()> {
+        /// The most one `vkCmdUpdateBuffer` takes.
+        const MOST: usize = 65536;
+        if bytes.is_empty() {
+            return Ok(());
+        }
+        into.span(at, bytes.len() as u64)?;
+        if !at.is_multiple_of(4) || !bytes.len().is_multiple_of(4) {
+            return Err(Fault::Device {
+                call: "vkCmdUpdateBuffer",
+                why: format!("{} bytes at {at} are not whole words", bytes.len()),
+            });
+        }
+        let slab = into.slab();
+        let d = &self.inner.core.device;
+        let cmd = self.inner.cmd;
+        // SAFETY: `Frame` is not `Sync`, so this thread is the only recorder
+        // of the open frame's `cmd`; the slab is live and retained below, and
+        // `span` bounds every update, each at most 65536 bytes of whole words.
+        unsafe {
+            let before = vk::MemoryBarrier::default()
+                .src_access_mask(vk::AccessFlags::SHADER_WRITE | vk::AccessFlags::SHADER_READ)
+                .dst_access_mask(vk::AccessFlags::TRANSFER_WRITE);
+            d.cmd_pipeline_barrier(
+                cmd,
+                vk::PipelineStageFlags::COMPUTE_SHADER,
+                vk::PipelineStageFlags::TRANSFER,
+                vk::DependencyFlags::empty(),
+                &[before],
+                &[],
+                &[],
+            );
+            for (k, part) in bytes.chunks(MOST).enumerate() {
+                d.cmd_update_buffer(cmd, slab.buffer, at + (k * MOST) as u64, part);
+            }
+            let after = vk::MemoryBarrier::default()
+                .src_access_mask(vk::AccessFlags::TRANSFER_WRITE)
+                .dst_access_mask(vk::AccessFlags::SHADER_READ | vk::AccessFlags::SHADER_WRITE);
+            d.cmd_pipeline_barrier(
+                cmd,
+                vk::PipelineStageFlags::TRANSFER,
+                vk::PipelineStageFlags::COMPUTE_SHADER,
+                vk::DependencyFlags::empty(),
+                &[after],
+                &[],
+                &[],
+            );
+        }
+        self.retain(slab);
+        self.hazards_settled();
+        Ok(())
+    }
+
     pub fn fill_zero(&mut self, into: &Buffer, at: u64, len: u64) -> Result<()> {
         if len == 0 {
             return Ok(());

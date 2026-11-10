@@ -125,6 +125,10 @@ pub struct Frame {
 }
 
 impl Frame {
+    pub(crate) fn update(&self, _into: &Buffer, _at: u64, _bytes: &[u8]) -> Result<()> {
+        self.flush()
+    }
+
     pub fn flush_settled(&self) -> Result<()> {
         self.flush()
     }

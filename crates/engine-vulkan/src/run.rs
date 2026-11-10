@@ -110,6 +110,10 @@ pub struct FireBindings {
     /// a lane of the fire snapshots (CONTRACT-BC 16).
     pub rs_snaps: Option<Tensor>,
 
+    /// The fire's token ids as the host wrote them, where no lane's token
+    /// is fed on the device: a gather of them reads its ids from here.
+    pub tokens_host: Option<std::sync::Arc<[i32]>>,
+
     pub group_of_lane: Option<Tensor>,
     pub packings: Vec<(poem_ir::Selection, crate::inputs::PackingHandles)>,
     pub group_masks: Vec<crate::inputs::GroupMaskHandles>,
@@ -887,8 +891,20 @@ impl<'c> Run<'c> {
     pub(crate) fn row_table(
         &self,
         table: ValueId,
-        ids: Tensor,
+        ids_value: ValueId,
     ) -> Result<Option<kernels_slang::gather::embed::RowTable>, kernels_slang::Error> {
+        let ids = self.tensor(ids_value);
+        // The fire's own token ids, this window's rows of them: the host
+        // knows them, so a miss stages without reading them back.
+        let known = match &self.values[ids_value.0 as usize].def {
+            Def::Input(RuntimeInput::Tokens) if self.window().gathered.is_none() => {
+                self.fire.tokens_host.as_deref().and_then(|tokens| {
+                    let span = self.window().span;
+                    tokens.get(span.row_offset as usize..(span.row_offset + span.rows) as usize)
+                })
+            }
+            _ => None,
+        };
         let (Some(rows), Some(pool), Some(host)) = (self.row_caches, self.cache_pool, self.host)
         else {
             return Ok(None);
@@ -900,11 +916,20 @@ impl<'c> Run<'c> {
         let Some(plane) = self.cached_planes.get(&param) else {
             return Ok(None);
         };
-        rows.table(self.handles, host, plane, param, ids, &self.row_ids, pool)
-            .map_err(|why| kernels_slang::Error::Backend {
-                op: "gather.embed",
-                detail: why.to_string(),
-            })
+        rows.table(
+            self.handles,
+            host,
+            plane,
+            param,
+            ids,
+            known,
+            &self.row_ids,
+            pool,
+        )
+        .map_err(|why| kernels_slang::Error::Backend {
+            op: "gather.embed",
+            detail: why.to_string(),
+        })
     }
 
     pub(crate) fn gathered_table(

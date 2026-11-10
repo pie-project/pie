@@ -2784,6 +2784,8 @@ impl Shell {
         let patch_seats = bound.patches;
         let bindings = FireBindings {
             rs_snaps,
+            // No lane is fed its token on the device here.
+            tokens_host: Some(std::sync::Arc::from(tokens.as_slice())),
             tokens: bound.tokens,
             positions: bound.positions,
             readout_rows: bound.readout_rows,

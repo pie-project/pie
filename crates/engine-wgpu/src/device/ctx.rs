@@ -769,6 +769,14 @@ impl Frame {
         (ring.chunks.last().expect("non-empty").clone(), at)
     }
 
+    /// Writes `bytes` into `into` from `at` in queue order: the queue lands
+    /// the write after every frame submitted before and before this one
+    /// (WebGPU's queue timeline), so no fire in flight reads it changed and
+    /// no kernel of this frame reads it unwritten.
+    pub(crate) fn update(&self, into: &super::Buffer, at: u64, bytes: &[u8]) -> Result<()> {
+        into.write_shared(at, bytes)
+    }
+
     pub fn copy(
         &mut self,
         source: &super::Buffer,

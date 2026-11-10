@@ -9,8 +9,10 @@
 //! in which slot ([`RowCaches::residency`]); the engine fills a newly named
 //! slot from the host and points the block's entry at it. A fire reads a
 //! row through its block's entry ([`kernels_slang::gather::embed::RowTable`]);
-//! a row of a block not resident is staged for that fire from the host
-//! (the ids read back after the frame so far lands), never cached. Each
+//! a row of a block not resident is staged for that fire from the host,
+//! never cached: where the gather reads the fire's own token ids (the host
+//! wrote them) the rows go into the stage in the frame's order and nothing
+//! waits; else the ids are read back after the frame so far lands. Each
 //! read counts a use of its block, which [`RowCaches::uses`] reports.
 
 use std::collections::BTreeMap;
@@ -521,9 +523,11 @@ impl RowCaches {
 
     /// Table `param`'s row table for a fire gathering `ids`, the pool as
     /// `pool` binds it: rows of blocks not resident staged from the host
-    /// (`host`, the table's plane `plane`) for this fire, after the frame
-    /// recorded so far lands (`ids` may be written by it). `None` where
-    /// `param` is not streamed.
+    /// (`host`, the table's plane `plane`) for this fire. Where the host
+    /// holds the ids (`known`: the fire's tokens) the rows land in the stage
+    /// in the frame's order (`Frame::update`), behind every fire before it;
+    /// else after the frame recorded so far lands (`ids` may be written by
+    /// it), the ids read back. `None` where `param` is not streamed.
     #[allow(clippy::too_many_arguments)]
     pub fn table(
         &self,
@@ -532,6 +536,7 @@ impl RowCaches {
         plane: &HostPlane,
         param: usize,
         ids: Tensor,
+        known: Option<&[i32]>,
         read: &std::cell::RefCell<Option<(u32, Vec<i32>)>>,
         pool: kernels_slang::Segments,
     ) -> Result<Option<kernels_slang::gather::embed::RowTable>> {
@@ -551,23 +556,29 @@ impl RowCaches {
         let missing = cache.slots.contains(&NOT_HELD);
         if missing {
             let mut held = read.borrow_mut();
-            if held.as_ref().is_none_or(|(buf, _)| *buf != ids.buf) {
-                crate::probe::with_frame(Frame::flush_settled).ok_or_else(|| {
-                    Fault::Residency("no frame is recording on this thread".into())
-                })??;
-                let raw = handles.read(ids.buf, u64::from(rows) * 4)?;
-                let got = raw
-                    .as_chunks::<4>()
-                    .0
-                    .iter()
-                    .map(|w| i32::from_le_bytes(*w))
-                    .collect();
-                *held = Some((ids.buf, got));
-            }
-            let ids_host = &held.as_ref().expect("read above").1;
+            let ids_host: &[i32] = match known {
+                Some(known) if known.len() == rows as usize => known,
+                _ => {
+                    if held.as_ref().is_none_or(|(buf, _)| *buf != ids.buf) {
+                        crate::probe::with_frame(Frame::flush_settled).ok_or_else(|| {
+                            Fault::Residency("no frame is recording on this thread".into())
+                        })??;
+                        let raw = handles.read(ids.buf, u64::from(rows) * 4)?;
+                        let got = raw
+                            .as_chunks::<4>()
+                            .0
+                            .iter()
+                            .map(|w| i32::from_le_bytes(*w))
+                            .collect();
+                        *held = Some((ids.buf, got));
+                    }
+                    &held.as_ref().expect("read above").1
+                }
+            };
+            let row_bytes = usize::try_from(table.row_bytes).unwrap_or(0);
             let mut stage_rows = vec![NOT_HELD; rows as usize];
-            let mut row = vec![0u8; usize::try_from(table.row_bytes).unwrap_or(0)];
-            let (stage, staged) = (&cache.stage[k], &cache.staged[k]);
+            let mut image = vec![0u8; ids_host.len() * row_bytes];
+            let mut last = 0usize;
             for (n, &raw) in ids_host.iter().enumerate() {
                 let id = if raw >= 0 && u64::from(raw.unsigned_abs()) < cache.shape.rows {
                     u64::from(raw.unsigned_abs())
@@ -578,12 +589,28 @@ impl RowCaches {
                 if cache.slots[block as usize] != NOT_HELD {
                     continue;
                 }
-                plane.row_into(host.map(), id, &mut row)?;
-                stage.write_shared(n as u64 * table.row_bytes, &row)?;
+                plane.row_into(
+                    host.map(),
+                    id,
+                    &mut image[n * row_bytes..(n + 1) * row_bytes],
+                )?;
                 stage_rows[n] = u32::try_from(n).unwrap_or(NOT_HELD);
+                last = n + 1;
             }
+            let (stage, staged) = (&cache.stage[k], &cache.staged[k]);
             let bytes: Vec<u8> = stage_rows.iter().flat_map(|r| r.to_le_bytes()).collect();
-            staged.write_shared(0, &bytes)?;
+            let image = &image[..last * row_bytes];
+            if known.is_some_and(|known| known.len() == rows as usize) {
+                // In the frame's order: no fire in flight reads it changed.
+                crate::probe::with_frame(|frame| {
+                    frame.update(stage, 0, image)?;
+                    frame.update(staged, 0, &bytes)
+                })
+                .ok_or_else(|| Fault::Residency("no frame is recording on this thread".into()))??;
+            } else {
+                stage.write_shared(0, image)?;
+                staged.write_shared(0, &bytes)?;
+            }
         }
         let bind = |buffer: &Buffer, len: u64, width: u32, dtype: Dtype| -> Result<Tensor> {
             let handle = handles.bind(buffer, 0, len.max(4))?;

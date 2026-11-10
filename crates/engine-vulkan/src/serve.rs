@@ -3057,6 +3057,9 @@ impl Shell {
         let patch_seats = bound.patches;
         let bindings = FireBindings {
             rs_snaps,
+            tokens_host: feeds
+                .is_empty()
+                .then(|| std::sync::Arc::from(tokens.as_slice())),
             group_masks,
             tokens: bound.tokens,
             positions: bound.positions,

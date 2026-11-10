@@ -109,6 +109,18 @@ pass without snapshots; a decode from each snapshot = the cut pass's decode. Ker
 and k 32 (memory walk) and KDA chunked with a snapshot = the f64 reference. Not on device: KDA end to end (no KDA
 miniature serves here).
 
+Vulkan / wgpu PLE miss path (VK3): a row table's misses no longer flush when the gather reads the fire's own token
+ids (every decode and prefill): the host knows them, so the rows are staged in the frame's order (Vulkan:
+`vkCmdUpdateBuffer`, inline in the command buffer behind a compute->transfer barrier, so no fire in flight reads the
+stage changed; wgpu: the queue write, ordered by WebGPU's queue timeline). Ids the device writes still flush, settle
+the queue (`Frame::flush_settled`) and read back. Measured (release, RTX PRO 4500, gemma4-e4b-mini-l6, 4 lanes, 192
+decode fires, best of 3; `rows::the_miss_path_costs_this_much_decode_throughput`, ignored): Vulkan all resident 199.6
+/ half 174.3 / none 183.4 tok/s with the synchronous flush; 209.6 / 185.0 / 181.5 with the ordered stage. The flush
+was ~1 point of the ~12 % gap; the rest is that a fire with misses is not recorded (the stage is per fire), so it is
+re-encoded each fire. wgpu (no recording): 122.6 / 125.0 / 120.3, no gap. l36 Vulkan (sync path): 57.7 / 54.7 /
+55.4. Next if it matters: stage through a per-fire binding a recording can replay (a ring of stages indexed by an
+input), so misses keep recording.
+
 Pre-existing parity gaps (not memory, but in scope for parity): ROCm synth codegen, ROCm graph replay with >= 2 MoE layers (AMD d); (concat_cols, FP8 m33 fixed M43);
 sm_100 tcgen05 W4A16 arms read no expert table; Metal MLA prefill unsupported.
 
