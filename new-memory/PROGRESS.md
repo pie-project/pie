@@ -544,3 +544,12 @@ The `new-memory/` directory is bookkeeping and is removed before anything lands 
   non-whole packed pages, multi-piece recurrent rows. new-memory/ROCM-PORT.md lists option A work.
 - Verified (no AMD hardware): cargo check/clippy rocm builds; CUDA default goldens unchanged; CUDA with
   `packed-pages` diagnostic bit-identical on 5 mini models. HIP kernels not compiled or run.
+
+### Note — 2026-11-10: BM3 — Metal gemma long-prompt divergence explained (no bug)
+- Cause: kv page size. Pre-BM Metal paged gemma at 32 tokens; since BM the recipe pages kv list + window list at 16.
+  `kernels-metal/kernels/attn/sdpa_paged.metal` switches from a token walk to a per-page SIMD-group walk at 32 pages,
+  i.e. at 497 keys with 16-token pages vs 1009 with 32 — first logit difference always at query position 496.
+- Proof: pre-BM with `engine.kv_page_size = 16` is bit-identical to M37 (prefill row + every step's top-5).
+  Divergences are bf16 ties (margin 0 / 0.25 at logits ~25). Accepted under the kernel-arm rule.
+- Follow-up (perf, not correctness): measure Metal decode/prefill at 16 vs 32-token pages before fixing the
+  recipe's Metal page size.
