@@ -75,6 +75,13 @@ pub struct MoeGmmBlockMib(pub u32);
 #[decision(id = "kernel.moe.segment_tokens", constant(set(0, 128)), default = 0, tune = search)]
 pub struct MoeSegmentTokens(pub u32);
 
+/// Whether a routed MLP's gate-up grouped matmul lands its rows' GLU, each
+/// times its weight, in the kernel (1), or its packed halves for the GLU
+/// after (0).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Decision)]
+#[decision(id = "kernel.moe.gmm_glu", constant(set(0, 1)), default = 0, tune = search)]
+pub struct MoeGmmGlu(pub u32);
+
 macro_rules! moe_costs {
     ($($ty:ident = $id:literal, $lo:literal ..= $hi:literal, $default:literal, $doc:literal;)*) => {
         $(
@@ -205,6 +212,7 @@ pub fn register(registry: &mut Registry) {
         .add::<MoeGmmRun>()
         .add::<MoeGmmBlockMib>()
         .add::<MoeSegmentTokens>()
+        .add::<MoeGmmGlu>()
         .add::<MoeDenseAllMi>()
         .add::<MoeSliceMib>()
         .add::<MoeSlicePairs>()
@@ -287,6 +295,7 @@ pub struct Tuning {
     pub moe_gmm_run: i64,
     pub moe_gmm_block_bytes: i64,
     pub moe_segment_tokens: i64,
+    pub moe_gmm_glu: bool,
     pub moe_costs: MoeCosts,
     pub grouped: Grouped,
     pub attn_per_row_max: i64,
@@ -308,6 +317,7 @@ impl Tuning {
         moe_gmm_run: 1,
         moe_gmm_block_bytes: 12 << 20,
         moe_segment_tokens: 0,
+        moe_gmm_glu: false,
         moe_costs: MoeCosts {
             dense_all: 1 << 27,
             slice_bytes: 18 << 20,
@@ -353,6 +363,7 @@ impl Tuning {
             moe_gmm_run: n(profile.get::<MoeGmmRun>().0),
             moe_gmm_block_bytes: n(profile.get::<MoeGmmBlockMib>().0) << 20,
             moe_segment_tokens: n(profile.get::<MoeSegmentTokens>().0),
+            moe_gmm_glu: profile.get::<MoeGmmGlu>().0 == 1,
             moe_costs: MoeCosts {
                 dense_all: n(profile.get::<MoeDenseAllMi>().0) << 20,
                 slice_bytes: n(profile.get::<MoeSliceMib>().0) << 20,

@@ -1087,10 +1087,11 @@ fn the_routed_mlp_on_one_sort_answers_its_parts() {
             .map(|p| ((hash(p / tk, 64) as usize + p % tk) % e) as i32)
             .collect();
         let weights: Vec<f32> = data(t * tk, 65).iter().map(|v| v.abs()).collect();
-        let run = |fused: bool, steps: i64, segment: i64| {
+        let run = |fused: bool, steps: i64, segment: i64, in_kernel: bool| {
             let mut b = Bench::new().with_tuning(kernels_xla::tuning::Tuning {
                 moe_gmm_run: steps,
                 moe_segment_tokens: segment,
+                moe_gmm_glu: in_kernel,
                 ..kernels_xla::tuning::Tuning::DEFAULT
             });
             let xt = b.bf16(t as u32, h as u32, &x);
@@ -1169,11 +1170,12 @@ fn the_routed_mlp_on_one_sort_answers_its_parts() {
             }
             Some(b.read_f32(y))
         };
-        let (Some(fused), Some(parts), Some(stepped), Some(segmented)) = (
-            run(true, 1, 0),
-            run(false, 1, 0),
-            run(true, 4, 0),
-            run(true, 4, 128),
+        let (Some(fused), Some(parts), Some(stepped), Some(segmented), Some(inside)) = (
+            run(true, 1, 0, false),
+            run(false, 1, 0, false),
+            run(true, 4, 0, false),
+            run(true, 4, 128, false),
+            run(true, 4, 0, true),
         ) else {
             return;
         };
@@ -1184,5 +1186,8 @@ fn the_routed_mlp_on_one_sort_answers_its_parts() {
         // Each token's rows summed a block of tokens at a time: the one-hot
         // dot's sums, to the order their f32 terms add in.
         assert_close(&segmented, &stepped, 1e-4 * scale.max(1.0), 1e-5);
+        // The GLU and each row's weight in the gate-up kernel: its parts', to
+        // a bf16 rounding of the rows between the legs.
+        assert_close(&inside, &parts, 0.01 * scale.max(1.0), 1e-2);
     }
 }
