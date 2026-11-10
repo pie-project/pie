@@ -964,3 +964,10 @@ The `new-memory/` directory is bookkeeping and is removed before anything lands 
   growable fit (M73) passes on device. `pie run`: gemma-4-e4b-4bit and Qwen3.6-35B-A3B-4bit tokens = base in off /
   auto / on; Qwen3.6 boot ~11 s vs base 32-37 s; footprint ~0.1 GB below M72. qwen38 u2 imports (writer fixed in M68);
   new affine 2-bit (g128) + 4-bit + 8-bit weight-cache test bitwise in all eight modes.
+
+### M75 — 2026-11-10: held load with a small pool no longer crashes (PR-READINESS A2)
+- `sc/l40s-held-small` (2da2eaa12): preseat_plan ignored a stated device_kv_budget and seated weights into chunks the
+  fit then cut off -> arming wrote unbacked memory (CUDA 700). Now it stops at the budget (seated = None -> pinned
+  fallback), and pin_weight_hosts rewrites the tables to the pinned copy before arming. golden_held_small: nemotron
+  mini held at 256 MiB boots, arms 10/10, equals the all-host result; dense at 256 MiB = base. Runtime refusal message
+  under off to be confirmed by IT.
