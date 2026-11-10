@@ -93,7 +93,8 @@ def mix_of(w):
     return struct(embed = w, head = w, proj = w, experts = w, index = None)
 
 def attention(n, d, proj, dense, kv):
-    """The attention named by `n`, its projections at `proj`, caching in `kv`."""
+    """The attention named by `n`, its projections at `proj`, its keys and
+    values the state `kv`."""
     hd = d.head_dim
     return struct(
         rotary_dim = d.rotary_dim,
@@ -111,7 +112,7 @@ def attention(n, d, proj, dense, kv):
 
 def indexer(n, d, dense, keys, proj = None):
     """The block indexer named by `n`: `heads` queries, one per kv head, and
-    one key a token, cached in `keys`; its projections at `proj`, or `dense`."""
+    one key a token, the state `keys`; its projections at `proj`, or `dense`."""
     ix = d.indexer
     proj = proj or dense
     return struct(
@@ -166,14 +167,19 @@ def layout(id, deploy):
         d = dims(layers = deploy.layers or d.layers, experts = deploy.experts or d.experts, theta = 10000000.0 if mixed else d.theta)
     mix = mix_of(deploy.weights if mixed else deploy.weights[0])
     dense = compute(mix.proj)
+    # An attention's keys and values, two planes of its kv heads a token, and
+    # its indexer's one raw key a token, bf16 at any kv, as the indexer's
+    # kernels read them.
+    kv = lambda: state([tokens, 2, d.kv_heads, d.head_dim], deploy.kv)
+    index_keys = lambda: state([tokens, d.indexer.head_dim], dtype.bf16)
 
     def layer(l):
         n = lambda s: "layer.{}.{}".format(l, s)
         sparse = l >= d.dense_layers
         return struct(
             attn_norm = weight([d.hidden]),
-            attn = attention(n, d, mix.proj, dense, "kv.{}".format(l)),
-            indexer = indexer(n, d, dense, "index.{}".format(l), mix.index) if sparse else None,
+            attn = attention(n, d, mix.proj, dense, kv()),
+            indexer = indexer(n, d, dense, index_keys(), mix.index) if sparse else None,
             mlp_norm = weight([d.hidden]),
             mlp = routed(n, d, mix, dense) if sparse else None,
             dense = None if sparse else mlp(d, d.dense_inter, mix.proj),
@@ -186,7 +192,6 @@ def layout(id, deploy):
         kv_heads = d.kv_heads,
         head_dim = d.head_dim,
         norm_eps = d.norm_eps,
-        kv = deploy.kv,
         embed = weight([d.vocab, d.hidden], mix.embed),
         head = weight([d.vocab, d.hidden], mix.head),
         final_norm = weight([d.hidden]),
@@ -278,17 +283,6 @@ def read_mlp(reads, f, n):
 # SwiGLU-OAI MLP. A sparse layer's indexer ranks the 128-key blocks a row sees
 # by their best key, for each kv head on its own, and that head's queries read
 # its sixteen blocks, the row's own among them; a dense layer's read every key.
-
-def caches(m, c):
-    kv = c.kv_space(m.kv)
-    plane = m.kv_heads * m.head_dim
-    for w in m.layers:
-        c.kv(kv, w.attn.kv, [plane, plane], m.head_dim, heads = True)
-        if w.indexer != None:
-            # One raw indexer key a token, bf16 at any kv, as the
-            # indexer's kernels read them.
-            index = c.kv_space(dtype.bf16)
-            c.kv(index, w.indexer.keys, [w.indexer.head_dim], w.indexer.head_dim)
 
 def forward(m, inputs):
     y = ops.gather.embed(inputs.tokens(), m.embed, m.vocab)

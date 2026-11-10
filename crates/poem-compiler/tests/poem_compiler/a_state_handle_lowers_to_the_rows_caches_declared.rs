@@ -236,6 +236,50 @@ fn hunyuan_image_3(path: &str, _row: &CacheRow) -> String {
     }
 }
 
+fn kimi_k3(path: &str, _row: &CacheRow) -> String {
+    match parts(path)[..] {
+        ["layers", l, "mixer", "kv"] => format!("kv.{l}"),
+        ["layers", l, "mixer", "conv_state"] => format!("conv.{l}"),
+        ["layers", l, "mixer", "delta_state"] => format!("delta.{l}"),
+        _ => path.to_string(),
+    }
+}
+
+fn glm_5_next(path: &str, row: &CacheRow) -> String {
+    match parts(path)[..] {
+        ["layers", l, "mixer", "kv"] => format!("kv.{l}"),
+        ["layers", l, "mixer", "indexer", "keys"] => format!("index.{l}"),
+        ["layers", l, "mixer", "conv_state"] => format!("conv.{l}"),
+        ["layers", l, "mixer", "delta_state"] => format!("delta.{l}"),
+        _ => glm_5(path, row),
+    }
+}
+
+fn hy_4(path: &str, row: &CacheRow) -> String {
+    glm_5(path, row)
+}
+
+fn minimax_m3(path: &str, _row: &CacheRow) -> String {
+    match parts(path)[..] {
+        ["layers", l, "attn", "kv"] => format!("kv.{l}"),
+        ["layers", l, "indexer", "keys"] => format!("index.{l}"),
+        _ => path.to_string(),
+    }
+}
+
+fn qwen_4(path: &str, _row: &CacheRow) -> String {
+    match parts(path)[..] {
+        ["layers", l, "attn", "kv"] => format!("kv.{l}"),
+        ["layers", l, "indexer", "keys"] => format!("index.{l}"),
+        ["layers", l, "gdn", "conv_state"] => format!("conv.{l}"),
+        ["layers", l, "gdn", "delta_state"] => format!("delta.{l}"),
+        ["mtp", "block", "attn", "kv"] => "kv.mtp".to_string(),
+        ["ple", "ids_state"] => "ple.ids".to_string(),
+        ["ple", "conv_state"] => "ple.conv".to_string(),
+        _ => path.to_string(),
+    }
+}
+
 /// Every listed deployment of `package`, at one rank and at each count of
 /// [`RANKS`] it traces at.
 fn deployments(package: &str) -> Vec<Deployment> {
@@ -297,6 +341,20 @@ fn window_space_first(package: &str) -> bool {
     package == "mimo_v2" || package == "ltx_2"
 }
 
+/// Whether `caches()` gave each index-key row of `package` a space of its
+/// own, made in its loop over the layers: the handles' rows are alike, all
+/// in the one space of their dtype, numbered after every other.
+fn index_space_a_layer(package: &str) -> bool {
+    matches!(package, "minimax_m3" | "glm_5_next" | "qwen_4")
+}
+
+/// Whether `caches()` gave `package`'s latent rows a rope plane of no
+/// width: GLM-5-next's latent attention rotates no dims, and a state holds
+/// no axis of zero, so its handle's row is the latent's one plane.
+fn keeps_an_empty_rope_plane(package: &str) -> bool {
+    package == "glm_5_next"
+}
+
 fn renamed(package: &str, deployment: &str, trace: &Trace, rename: Renaming) -> Vec<CacheRow> {
     let mut rows = trace.caches.clone();
     if window_space_first(package) {
@@ -331,6 +389,33 @@ fn renamed(package: &str, deployment: &str, trace: &Trace, rename: Renaming) -> 
         {
             *space = 0;
             *window = None;
+        }
+    }
+    if keeps_an_empty_rope_plane(package) {
+        for row in &mut rows {
+            if let CacheRow::Kv {
+                name,
+                planes,
+                rows: None,
+                ..
+            } = row
+                && name.starts_with("kv.")
+                && planes.len() == 1
+            {
+                planes.push(0);
+            }
+        }
+    }
+    if index_space_a_layer(package) {
+        let mut next = None;
+        for row in &mut rows {
+            if let CacheRow::Kv { name, space, .. } = row
+                && name.starts_with("index.")
+            {
+                let at = next.unwrap_or(*space);
+                *space = at;
+                next = Some(at + 1);
+            }
         }
     }
     rows
@@ -421,5 +506,10 @@ mod moved {
         flux_2,
         z_image,
         hunyuan_image_3,
+        kimi_k3,
+        glm_5_next,
+        hy_4,
+        minimax_m3,
+        qwen_4,
     );
 }
