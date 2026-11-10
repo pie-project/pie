@@ -2329,14 +2329,16 @@ fn fused_against_xla(g: &Gdn, indptr: &[i32], rows: usize, lane_slot: &[i32], se
         .zip(&y_k)
         .map(|(a, b)| (a - b).abs())
         .fold(0f32, f32::max);
-    let bank_err = bank_xla
+    // the last slot is the sink, what lanes routed out of the bank left
+    let real = (slots - 1) * g.stride();
+    let bank_err = bank_xla[..real]
         .iter()
-        .zip(&bank_k)
+        .zip(&bank_k[..real])
         .map(|(a, b)| (a - b).abs())
         .fold(0f32, f32::max);
     eprintln!("fused kernel against the xla form: y max |err| {y_err:.3e}, bank {bank_err:.3e}");
     assert_close(&y_k, &y_xla, 2e-3, 1e-2);
-    assert_close(&bank_k, &bank_xla, 4e-3, 1e-2);
+    assert_close(&bank_k[..real], &bank_xla[..real], 4e-3, 1e-2);
 }
 
 #[test]
