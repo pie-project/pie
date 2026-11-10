@@ -1029,3 +1029,13 @@ The `new-memory/` directory is bookkeeping and is removed before anything lands 
   Goldens / rows / held_small / experts = base; build matrix clean.
 - Left: kernels-cuda / kernels-rocm still take a GroupSeat argument always passed RESIDENT -> remove (CUDA side L40S,
   HIP side AMD) before the quantized formats.
+
+### M79 — 2026-11-10: ROCm generated region kernels by default (AMD A3)
+- `sc/amd-rocm-port` (2c74009b4, e6799ade4, 78bcf5591, d3f60e9c5, 60da5cb9f): ROCm JIT compiles generated units; the
+  wave64 row skeleton at parity with kernels-cuda synth (22 CUDA synth tests pass on MI300X); ROCm serves synthesized
+  regions and its replaced hand row fusions are deleted; ROCm goldens re-baselined with per-step traces.
+  Parity: dense / hybrid within noise; MoE b8 within noise over five prompts. CUDA golden_logits unchanged after merge.
+- `sc/amd-envelope-test` (e526a6a5): stale kv envelope test (missing page-stride arg) fixed; not a serving bug.
+- Recorded pre-existing: two models on one ROCm device (flat arenas on main too).
+- OPEN (blocker): ROCm at DEFAULT config arms 0 bodies on new-memory (main 89/89): the flat chunk range takes all the
+  spare before bodies -> EAGER agent fixing in shared code.
