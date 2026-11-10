@@ -8,15 +8,15 @@ Legend: ✅ verified on hardware · 🟡 in progress / compile-only · 🔴 not 
 
 | Feature | CUDA | ROCm | Metal | Vulkan | wgpu | XLA/TPU | Cerebras |
 |---|---|---|---|---|---|---|---|
-| Real ChunkFacts, slot-ref lanes, fixed pieces | ✅ M34 | 🟡 AMD (B: packed only) | ✅ M30 | 🟡 VK | 🟡 VK | 🔴 degenerate | 🟡 CB (host pool) |
-| Grow / shrink (segments, evacuation) | ✅ M34 | 🟡 AMD (flat: — by spec) | ✅ M30 | 🟡 VK | 🟡 VK | — fixed at load | 🟡 CB (host segments) |
-| rs list + slot_copies | ✅ M34 | 🟡 AMD | ✅ M37 | 🟡 VK | 🟡 VK | 🔴 | 🟡 CB |
-| Window lists (own T_w, trimmed) | 🟡 one list, T_w=page | 🟡 AMD | 🟡 one list | 🟡 VK | 🟡 VK | 🔴 | 🟡 CB (one list, T_w=page) |
-| Multi-piece records end to end | 🟡 L40S | 🟡 AMD | 🔴 untested | 🟡 VK | 🟡 VK | 🔴 | 🟡 CB (host sim) |
-| Weight streaming: PLE rows | ✅ M35/M36 | 🟡 AMD | 🔴 | 🟡 VK | 🟡 VK | 🔴 | — weights on host |
-| Weight streaming: experts | 🟡 L40S | 🟡 AMD (after L40S) | 🔴 | 🟡 VK | 🟡 VK | 🔴 | — weights on host |
-| Host/disk tiers of shared shapes (copy_slots) | 🔴 | 🔴 | 🔴 | 🔴 | 🔴 | 🔴 | 🔴 |
-| K2 (no kv spaces) | ✅ M39 | ✅ compile | 🟡 BM4 | compile | compile | compile | compile |
+| Real ChunkFacts, slot-ref lanes, fixed pieces | ✅ M34 | ✅ M43 (MI300X) | ✅ M30 · 🔴 dsv4 window by slot ref (BM5a) | 🟡 VK (kernels M43, pool next) | 🟡 VK | 🟡 XLA | 🟡 M43 host pool (no HW) |
+| Grow / shrink (segments, evacuation) | ✅ M34 | — flat by spec | ✅ M30 | 🟡 VK | 🟡 VK | — fixed at load | 🟡 M43 (host segments) |
+| rs list + slot_copies | ✅ M34 | 🟡 kernels, buffered goldens pending | ✅ M37 | 🟡 VK | 🟡 VK | 🟡 XLA | 🟡 M43 (host sim) |
+| Window lists (own T_w, trimmed) | 🟡 one list, T_w=page (L40S: tables per list) | ✅ goldens (one list) | 🟡 one list (BM) | 🟡 VK | 🟡 VK | 🟡 XLA | 🟡 one list, T_w=page |
+| Multi-piece records end to end | ✅ engine (L40S) · 🟡 runtime boot (IT r5) | 🟡 kernels, chunk golden pending | 🔴 on device (BM) | 🟡 VK | 🟡 VK | 🟡 XLA | 🟡 host sim |
+| Weight streaming: PLE rows | ✅ M35/M36/M41 | ✅ M43 golden_rows | 🔴 BM | 🔴 VK | 🔴 VK | 🟡 XLA | — weights on host |
+| Weight streaming: experts | 🟡 dense bf16 M40; quantized next | 🟡 kernels read tables; engine next | 🔴 BM | 🔴 VK | 🔴 VK | 🟡 XLA | — weights on host |
+| Host/disk tiers of shared shapes (copy_slots) | ✅ engine probe M43 · 🟡 e2e | 🔴 AMD | 🟡 M43 compile (BM) | 🔴 VK | 🔴 VK | 🔴 XLA | 🔴 hook only |
+| K2 (no kv spaces) | ✅ M39 | ✅ | ✅ M42 | compile | compile | compile | compile |
 
 Cerebras realization (CB, `sc/cb-chunk-pool`): the column is the host-traced `Cerebras` engine. State lives in
 one host chunk arena (shared, unpinned shapes: the kv list, one window list of the widest window with T_w = kv
@@ -29,7 +29,7 @@ weight shapes are stated and `weight_residency` / `weight_uses` take and report 
 states degenerate facts. No hardware here: lib tests and a host simulation of staging against in-place slots;
 nothing ran on a CS system or the simulator.
 
-Pre-existing parity gaps (not memory, but in scope for parity): ROCm synth codegen, `gather.concat_cols`, FP8 MFMA m33;
+Pre-existing parity gaps (not memory, but in scope for parity): ROCm synth codegen, ROCm graph replay with >= 2 MoE layers (AMD d); (concat_cols, FP8 m33 fixed M43);
 sm_100 tcgen05 W4A16 arms read no expert table; Metal MLA prefill unsupported.
 
 Owners: L40S (CUDA), AMD (ROCm), BM agent (Metal, Mac Studio), VK agent (Vulkan + wgpu), XLA agent (XLA/TPU, sc/xla-chunk-pool; no TPU — verified where it runs, rest marked unverified), TIER agent (host/disk tiers), CB agent (Cerebras, sc/cb-chunk-pool; no hardware — lib tests + host simulation, rest unverified).
