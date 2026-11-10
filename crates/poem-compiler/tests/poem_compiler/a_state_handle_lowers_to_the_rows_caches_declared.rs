@@ -150,7 +150,11 @@ fn qwen3_tts(path: &str, _row: &CacheRow) -> String {
 }
 
 fn gpt_oss(path: &str, _row: &CacheRow) -> String {
-    path.to_string()
+    match parts(path)[..] {
+        ["layers", l, "attn", "kv"] => format!("kv.{l}"),
+        ["dflash", "blocks", b, "attn", "kv"] => format!("kv.dflash.{b}"),
+        _ => path.to_string(),
+    }
 }
 
 /// Every listed deployment of `package`, at one rank and at each count of
@@ -186,9 +190,9 @@ fn kept_whole(package: &str, name: &str) -> bool {
     match (package, &parts(name)[..]) {
         // Inkling's local layers read their kv through the local window.
         ("inkling", ["kv", _]) => true,
-        // Muse Glimmer's and Muse Spark's sliding layers read their kv
-        // through their window.
-        ("muse_glimmer" | "muse_spark", ["kv", _]) => true,
+        // Muse Glimmer's, Muse Spark's and gpt-oss's sliding layers read
+        // their kv through their window.
+        ("muse_glimmer" | "muse_spark" | "gpt_oss", ["kv", _]) => true,
         // Qwen3-TTS's codec prenet attends through a window its row was
         // never declared with: the handle's row is kept through it.
         ("qwen3_tts", ["codec", "kv", _]) => true,
