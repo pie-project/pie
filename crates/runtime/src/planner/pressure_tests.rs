@@ -216,6 +216,71 @@ async fn a_short_waiter_raises_once_per_band_crossing_and_is_served_after_a_disc
     assert_eq!(planner.diagnostics().queue.len(), 0);
 }
 
+/// What a parked waiter's planner did, in order: a shed of the weight cache
+/// (and what it gave back), or a tier-pressure said.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Step {
+    Shed(u64),
+    Said(Tier, u64),
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn a_short_waiter_sheds_the_weight_cache_before_it_raises_tier_pressure() {
+    let _schedule = crate::policy::schedule::TEST_LOCK.read().await;
+    let pool = Arc::new(KeptPool::new(0, 4, usize::MAX));
+    let steps: Arc<parking_lot::Mutex<Vec<Step>>> = Arc::default();
+    let sink = {
+        let steps = steps.clone();
+        Arc::new(move |tier, bytes| steps.lock().push(Step::Said(tier, bytes))) as Sink
+    };
+    // Three atoms above the floor: the first shed gives them all back.
+    let cached = Arc::new(std::sync::atomic::AtomicU64::new(3));
+    let shed: super::WeightShed = {
+        let (steps, cached) = (steps.clone(), cached.clone());
+        Arc::new(move || {
+            let shed = cached.swap(0, std::sync::atomic::Ordering::AcqRel);
+            steps.lock().push(Step::Shed(shed));
+            shed
+        })
+    };
+    let planner = Arc::new(
+        ResidencyPlanner::new(pool.clone() as Arc<dyn PoolPort>)
+            .pressure_sink(sink)
+            .weight_shed(shed),
+    );
+    let head = ProcessId::new_v4();
+    planner.register(head);
+    planner.note_admitted(head);
+    let demand = Demand {
+        kv_pages: 2,
+        rs: RsUnits::default(),
+    };
+    let p = planner.clone();
+    let parked = crate::rt::spawn(async move { p.acquire(head, head, demand).await });
+    tokio::time::sleep(Duration::from_millis(350)).await;
+    let steps = steps.lock().clone();
+    let first_said = steps
+        .iter()
+        .position(|step| matches!(step, Step::Said(Tier::Device, bytes) if *bytes > 0))
+        .expect("the policy hears of it once the cache is at its floor");
+    assert_eq!(
+        steps[0],
+        Step::Shed(3),
+        "the cache goes first, before any tier-pressure: {steps:?}"
+    );
+    assert!(
+        steps[..first_said].contains(&Step::Shed(0)),
+        "tier-pressure only after a shed found nothing above the floor: {steps:?}"
+    );
+    assert!(
+        steps[first_said..]
+            .iter()
+            .all(|step| !matches!(step, Step::Shed(n) if *n > 0)),
+        "nothing above the floor was left once pressure was said: {steps:?}"
+    );
+    parked.abort();
+}
+
 #[test]
 fn a_waiter_the_planner_funds_itself_raises_nothing() {
     let _schedule = crate::policy::schedule::TEST_LOCK.blocking_read();

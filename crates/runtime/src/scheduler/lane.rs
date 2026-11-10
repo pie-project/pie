@@ -828,6 +828,14 @@ impl Lane {
                     HostKvOp::TapGroups => {
                         Ok(serde_json::to_vec(&engine.tap_groups()).unwrap_or_default())
                     }
+                    HostKvOp::WeightResidency(residency) => engine
+                        .weight_residency(&residency)
+                        .map(|()| Vec::new())
+                        .map_err(Into::into),
+                    HostKvOp::WeightUses => engine
+                        .weight_uses()
+                        .map(|uses| serde_json::to_vec(&uses).unwrap_or_default())
+                        .map_err(Into::into),
                     HostKvOp::Layout => Ok(engine
                         .host_kv_layout()
                         .and_then(|layout| serde_json::to_vec(&layout).ok())

@@ -1,16 +1,15 @@
 //! The loop, on a pool: read the system, move the target.
 
+use super::steered::{self, Shared, Steered};
 use super::{
     Governor, Growth, Limits, PoolTarget, Pressure, Retarget, Signal, System, TICK, Tolerance,
 };
-use crate::store::grow::Grow;
 
-/// A dedicated process's whole pool stands: there is nothing to answer.
-pub fn start(pool: Grow, tolerance: Tolerance) {
-    if tolerance == Tolerance::Dedicated || pool.growth() == Growth::Fixed {
-        return;
-    }
-    crate::rt::spawn(watch(pool, tolerance, super::system()));
+/// Steers `pool`, an engine's: a dedicated or fixed pool keeps its size,
+/// but its loop still ticks, since the weight cache in front of it settles
+/// its windows on the governor's tick.
+pub fn start(pool: Shared<Steered>, tolerance: Tolerance) {
+    crate::rt::spawn(watch(pool, tolerance));
 }
 
 /// What one calm tick may add. A unified memory machine has no budget to
@@ -136,10 +135,19 @@ impl Steer {
     }
 }
 
-async fn watch(mut pool: Grow, tolerance: Tolerance, mut system: Box<dyn System>) {
+async fn watch(mut pool: Shared<Steered>, tolerance: Tolerance) {
     let mut steer = Steer::new(&pool, tolerance, GROWTH_STEP);
-    let grow = pool.clone();
+    let (grow, engine) = pool.with(|pool| (pool.inner().grow().cloned(), pool.inner().locus().1));
     let mut interval = crate::rt::time::interval(TICK);
+    // A dedicated pool's size stands: the loop only ticks, reading nothing
+    // and answering no waiter.
+    let Some(grow) = grow.filter(|_| steer.governor().tolerance() != Tolerance::Dedicated) else {
+        loop {
+            interval.tick().await;
+            steer.turn(&mut pool, Some(Pressure::Calm), &mut |_| {});
+        }
+    };
+    let mut system: Box<dyn System> = super::system();
     loop {
         let waiter = tokio::select! {
             _ = interval.tick() => false,
@@ -147,7 +155,7 @@ async fn watch(mut pool: Grow, tolerance: Tolerance, mut system: Box<dyn System>
         };
         let read = (!waiter).then(|| system.read());
         let turn = steer.turn(&mut pool, read, &mut |signal| {
-            tracing::warn!(?signal, "pool short of its target");
+            steered::signal(engine, signal);
         });
         grow.set_can_rise(steer.governor().can_rise());
         if let Some(yielding) = turn.yielding {

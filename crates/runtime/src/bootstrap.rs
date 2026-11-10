@@ -420,6 +420,9 @@ async fn bootstrap_inner(config: Config) -> Result<BootstrapHandle> {
             state_slot_bytes: d.rs_cache_slot_bytes,
         })
         .collect();
+    // Each engine's weight shapes and the chunks they may take.
+    let chunk_facts: Vec<::engine::chunk::ChunkFacts> =
+        engine_configs.iter().map(|d| d.chunks.clone()).collect();
     let arena_disk_kept: Vec<Option<KeptDisk>> =
         engine_configs.iter().map(|d| d.disk_kept.clone()).collect();
     // Each engine's pools as chunks: what it states, else today's pools as
@@ -514,11 +517,13 @@ async fn bootstrap_inner(config: Config) -> Result<BootstrapHandle> {
     // A planner for each engine: each holds its own kv pages, and a process
     // runs on one of them.
     let mut extents = Vec::new();
+    let mut governed = Vec::new();
     for engine in 0..engines.len().max(1) {
         // What the worker policy reads tier bytes at; a page of unknown size
         // leaves them unread.
         crate::policy::pressure::scale(engine, scales.get(engine).copied().unwrap_or_default());
         let mut pool = crate::planner::RegistryPool::new(arena_model_idx, engine, kv_swap_capable);
+        let mut grow = None;
         if let Some(&(page_bytes, whole, slot_bytes)) =
             resizable.get(engine).filter(|(bytes, ..)| *bytes > 0)
         {
@@ -530,8 +535,10 @@ async fn bootstrap_inner(config: Config) -> Result<BootstrapHandle> {
                 slot_bytes,
             );
             extents.push(extent.clone());
+            grow = Some(extent.clone());
             pool = pool.with_grow(extent);
         }
+        let steered = steered_pool(arena_model_idx, engine, chunk_facts.get(engine), grow);
         crate::planner::init_planner(
             arena_model_idx,
             engine,
@@ -539,8 +546,10 @@ async fn bootstrap_inner(config: Config) -> Result<BootstrapHandle> {
                 .seated_first(seated_first)
                 .cow_lanes(fire_lanes.get(engine).copied().unwrap_or(1))
                 .seat_to_end(seat_to_end)
-                .seat_spread(seat_spread),
+                .seat_spread(seat_spread)
+                .weight_shed(steered.shed_hook()),
         );
+        governed.push(steered);
     }
     // After the gates and the planner it orders exist.
     #[cfg(not(target_arch = "wasm32"))]
@@ -650,7 +659,9 @@ async fn bootstrap_inner(config: Config) -> Result<BootstrapHandle> {
     let scheduler_shutdown = crate::scheduler::spawn(&engines, kv_page_size as u32).await?;
     for extent in &extents {
         extent.start();
-        crate::governor::run::start(extent.clone(), memory_tolerance);
+    }
+    for steered in governed {
+        crate::governor::run::start(steered, memory_tolerance);
     }
     active_guard.disarm();
     Ok(BootstrapHandle {
@@ -661,6 +672,43 @@ async fn bootstrap_inner(config: Config) -> Result<BootstrapHandle> {
             engine_ids: engines,
         }),
     })
+}
+
+/// Engine `engine`'s governor target: its pools (`grow` where they can
+/// change size) with its weight cache in front. Weight shapes the pool
+/// cannot seat stay as the engine loaded them, and the cache holds none.
+fn steered_pool(
+    model: usize,
+    engine: usize,
+    facts: Option<&::engine::chunk::ChunkFacts>,
+    grow: Option<crate::store::grow::Grow>,
+) -> crate::governor::steered::Shared<crate::governor::steered::Steered> {
+    use crate::store::weights::{WeightCache, WeightFirst, port::EnginePort, slot_pool};
+    let streams = crate::store::weights::streaming(engine);
+    let none = ::engine::chunk::ChunkFacts::default();
+    let facts = facts.unwrap_or(&none);
+    let mut slots = slot_pool(facts);
+    let cache = match WeightCache::new(&facts.weights, 0, streams, &mut slots) {
+        Ok(cache) => cache,
+        Err(error) => {
+            tracing::warn!(
+                engine,
+                %error,
+                shapes = facts.weights.len(),
+                "the pool cannot seat the weight shapes; they stay as loaded"
+            );
+            slots = slot_pool(&none);
+            WeightCache::new(&[], 0, streams, &mut slots)
+                .expect("an empty weight cache takes no slots")
+        }
+    };
+    let quiet = cache.shapes() == 0;
+    let pool = crate::governor::steered::EnginePool::new(model, engine, grow, slots);
+    crate::governor::steered::Shared::new(WeightFirst::new(
+        pool,
+        cache,
+        EnginePort::new(engine, quiet),
+    ))
 }
 
 fn verify_config(config: &Config) -> Result<()> {

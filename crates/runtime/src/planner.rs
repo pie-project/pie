@@ -44,6 +44,7 @@ pub use global::{
 pub use grant::{AllocationGrant, Demand};
 pub use pool::{ChunkStats, PoolPort, RegistryPool};
 pub use residency_planner::ResidencyPlanner;
+pub use short::WeightShed;
 pub use stats::PlannerStats;
 pub use trace::trace_enabled;
 

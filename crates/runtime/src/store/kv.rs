@@ -504,11 +504,14 @@ impl KvStore {
     }
 
     pub fn retire_idle(&mut self) {
-        let through = self
-            .outstanding
+        self.pool.retire_through(self.retired_through());
+    }
+
+    /// The last epoch every fire through which has retired.
+    pub fn retired_through(&self) -> u64 {
+        self.outstanding
             .first()
-            .map_or(self.seq, |&oldest| oldest.saturating_sub(1));
-        self.pool.retire_through(through);
+            .map_or(self.seq, |&oldest| oldest.saturating_sub(1))
     }
 
     pub fn create_working_set(&mut self) -> WorkingSetId {

@@ -23,6 +23,7 @@
 pub mod macos;
 pub mod psi;
 pub mod run;
+pub mod steered;
 
 use std::time::Duration;
 
