@@ -1195,3 +1195,248 @@ fn golden_batching() {
         }
     }
 }
+
+fn contract_of(trace: &Trace, path: &Path) -> std::result::Result<ModelContract, String> {
+    let source = ztensor::Source::open(path).map_err(|why| why.to_string())?;
+    poem::import::own_contract(&source, &trace.params, 1, Platform::Cuda)
+        .map_err(|why| why.to_string())
+}
+
+/// The buffered script ([`served_buffered`]) driven as the runtime drives an
+/// engine: through `Engine::load`, `commit_segments` and `submit`, each lane
+/// naming slot refs — its kv pages in `Lane::tables`, its record in
+/// `Lane::fixed` (written in place), its unfolded rows in rs-list slots
+/// through `RsVerb::Buffer::pages`, and, halfway, those pages copied onto
+/// slots of their own by `Lane::slot_copies`.
+fn submitted_buffered(fixture: &Fixture, cache: &Path) -> Vec<(u64, u32)> {
+    use engine::chunk::{SlotKind, SlotRole};
+    use engine::fire::{FoldLen, FrameSubmission, KvDelta, RsVerb, Step};
+    use engine::{Engine, load};
+    let boot = engine_cuda::DeviceBoot {
+        cache_dir: Some(cache.to_path_buf()),
+        ..engine_cuda::DeviceBoot::default()
+    };
+    let mut engine = engine_cuda::open(boot, contract_of).expect("the engine opens");
+    let loaded = engine
+        .load(load::LoadRequest {
+            trace: fixture.trace.clone(),
+            checkpoint: load::Checkpoint::Path(fixture.container.clone()),
+            budgets: load::Budgets {
+                max_lanes: 1,
+                max_tokens: TOKENS,
+                buckets: Vec::new(),
+                max_adapters: 0,
+                page_size: PAGE,
+                max_context: CONTEXT,
+                context_declared: false,
+                slots: 4,
+                max_patches: None,
+                max_images: None,
+                max_voxels: None,
+                max_clips: None,
+            },
+            residency: load::Residency::default(),
+            ordinal: 0,
+            frames_in_flight: 1,
+        })
+        .unwrap_or_else(|why| panic!("{} loads: {why}", fixture.model));
+    let facts = loaded
+        .caps
+        .chunks
+        .clone()
+        .expect("the engine states chunks");
+    facts.validate().expect("the engine's chunk facts hold");
+    let shape = |want: fn(&engine::chunk::SlotShape) -> bool| {
+        facts
+            .shapes
+            .iter()
+            .position(want)
+            .expect("the shape is stated")
+    };
+    let list = shape(|s| matches!(s.kind, SlotKind::List { .. }) && s.role == SlotRole::State);
+    let rs = shape(|s| s.role == SlotRole::RsBuffer);
+    let fixed = shape(|s| matches!(s.kind, SlotKind::Fixed { .. }));
+    let ids = [list, rs, fixed].map(|at| facts.shapes[at].id);
+    let SlotKind::List { tokens: page, .. } = facts.shapes[rs].kind else {
+        unreachable!("the rs list")
+    };
+    let SlotKind::Fixed { pieces } = facts.shapes[fixed].kind else {
+        unreachable!("the fixed shape")
+    };
+    engine
+        .commit_segments(facts.segments.committed.max(1))
+        .expect("the first segment commits");
+    let mut refs = Refs::of(facts.clone(), 1);
+    let record: Vec<[u32; 2]> = (0..pieces)
+        .map(|_| {
+            let slot = refs.take(fixed);
+            [slot, slot]
+        })
+        .collect();
+    let mut pages: Vec<u32> = Vec::new();
+    // The rs buffer's pages by their place in the sequence.
+    let mut buffered: std::collections::BTreeMap<u32, u32> = std::collections::BTreeMap::new();
+    let mut steps = Vec::new();
+    let mut fed = 0u32;
+    let mut folded = 0u32;
+    let mut fire = |engine: &mut engine_cuda::Cuda,
+                    refs: &mut Refs,
+                    pages: &mut Vec<u32>,
+                    fed: u32,
+                    tokens: Vec<u32>,
+                    rs: RsVerb,
+                    copies: Vec<[u32; 2]>| {
+        let after = fed + tokens.len() as u32;
+        while (pages.len() as u32) < after.div_ceil(PAGE) {
+            pages.push(refs.take(list));
+        }
+        let word = fixture.trace.facts.word(&Request::new(
+            u32::try_from(tokens.len()).expect("a count"),
+            false,
+        ));
+        let lane = engine::fire::Lane {
+            slot: 0,
+            word,
+            tokens,
+            kv: KvDelta {
+                held: fed,
+                pages: pages.clone(),
+                ..KvDelta::default()
+            },
+            rs,
+            tables: vec![(ids[0], pages.clone())],
+            fixed: vec![(ids[2], record.clone())],
+            slot_copies: if copies.is_empty() {
+                Vec::new()
+            } else {
+                vec![(ids[1], copies)]
+            },
+            ..engine::fire::Lane::default()
+        };
+        lane.validate_chunks(&facts)
+            .expect("the lane's refs are the pool's");
+        let mut ticket = engine
+            .submit(&FrameSubmission::of(Step {
+                lanes: vec![lane],
+                ..Step::default()
+            }))
+            .expect("the frame fires");
+        engine.settle_frame(&mut ticket).expect("the frame settles");
+        let logits = &ticket.steps[0].readouts[0].values;
+        let top = argmax(logits);
+        steps.push((hash_logits(logits), top));
+        top
+    };
+    let prompt = |from: u32, rows: u32| -> Vec<u32> {
+        (from..from + rows).map(|t| (t * 7 + 11) % 1000).collect()
+    };
+    let mut last = fire(
+        &mut engine,
+        &mut refs,
+        &mut pages,
+        fed,
+        prompt(fed, 37),
+        RsVerb::Fold,
+        Vec::new(),
+    );
+    fed += 37;
+    folded += 37;
+    for at in 0..40u32 {
+        let base = folded / page * page;
+        let end = fed + 1;
+        buffered.retain(|&held, _| held >= base / page);
+        let mut copies = Vec::new();
+        if at == 20 {
+            for slot in buffered.values_mut() {
+                let fresh = refs.take(rs);
+                copies.push([*slot, fresh]);
+                *slot = fresh;
+            }
+        }
+        let named: Vec<u32> = (base / page..end.div_ceil(page))
+            .map(|held| *buffered.entry(held).or_insert_with(|| refs.take(rs)))
+            .collect();
+        let unfolded = end - folded;
+        let fold = match at % 7 {
+            _ if at == 39 || unfolded >= 14 => unfolded,
+            3 => 2.min(unfolded),
+            6 => unfolded,
+            _ => 0,
+        };
+        last = fire(
+            &mut engine,
+            &mut refs,
+            &mut pages,
+            fed,
+            vec![last],
+            RsVerb::Buffer {
+                pages: named,
+                base,
+                folded,
+                fold: FoldLen::Host(fold),
+            },
+            copies,
+        );
+        fed = end;
+        folded += fold;
+    }
+    last = fire(
+        &mut engine,
+        &mut refs,
+        &mut pages,
+        fed,
+        prompt(fed, 50),
+        RsVerb::Fold,
+        Vec::new(),
+    );
+    fed += 50;
+    fire(
+        &mut engine,
+        &mut refs,
+        &mut pages,
+        fed,
+        vec![last],
+        RsVerb::Fold,
+        Vec::new(),
+    );
+    steps
+}
+
+/// The buffered probe through `Engine::submit` ([`submitted_buffered`]):
+/// the lines of [`golden_buffered`], compared with `PIE_GOLDEN_CHECK` as its
+/// are.
+#[test]
+#[ignore = "a probe run by hand: see the module's doc"]
+fn golden_submit_buffered() {
+    if !engine_cuda::device::present() {
+        eprintln!("skipping: no CUDA device on this machine");
+        return;
+    }
+    let cache = cache_dir();
+    let fixture = fixture(BUFFERED, &cache);
+    let _ = submitted_buffered(&fixture, &cache);
+    let steps = submitted_buffered(&fixture, &cache);
+    let mut lines = Vec::new();
+    let mut all = FNV;
+    for (at, (hash, top)) in steps.iter().enumerate() {
+        all = fnv_bytes(all, &hash.to_le_bytes());
+        lines.push(format!("golden {BUFFERED}-buffered {at} {hash:016x} {top}"));
+    }
+    lines.push(format!("golden {BUFFERED}-buffered all {all:016x}"));
+    for line in &lines {
+        println!("{line}");
+    }
+    if let Some(want) = std::env::var_os("PIE_GOLDEN_CHECK") {
+        let want = std::fs::read_to_string(&want)
+            .unwrap_or_else(|why| panic!("{}: {why}", Path::new(&want).display()));
+        let held: Vec<&str> = want
+            .lines()
+            .filter(|line| line.contains("-buffered ") && !line.contains("-pair-"))
+            .collect();
+        assert_eq!(
+            held,
+            lines.iter().map(String::as_str).collect::<Vec<_>>(),
+            "the buffered logits moved"
+        );
+    }
+}
