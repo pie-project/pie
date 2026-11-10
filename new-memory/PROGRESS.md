@@ -806,3 +806,12 @@ The `new-memory/` directory is bookkeeping and is removed before anything lands 
   with the budget (608 MB at 16 MiB ... 2.0 GB at 1400 MiB). Serves only at >= 2 GiB. Assigned to L40S.
 - RSS: M58 2,552 MiB vs M54 2,779 vs base 1,810 (expert mapping pages released; ~0.75 GB above base, likely dense
   planes read in place from the mapping — to break down).
+
+### M60 — 2026-11-10: device_weight_budget fixed for cached experts
+- `sc/l40s-budget-fix` (ca8acc446): banks the weight cache takes are on no tier from the cut on (`Plan::pooled`); demand
+  excludes them; refusal text names what cannot leave the device. Mapping pages of dense planes copied out of the
+  serving file released after the load's stream syncs.
+- golden_budget (engine API, minimax-m3-mini, 2.7 GB experts): no budget = base bitwise; 512 MiB and 128 MiB load
+  and serve (dense planes on the pinned host tier, experts in the pool), max 0.125 vs unbudgeted, no top-token change.
+- Known (pre-existing): a budgeted load arms a dense rotor and walks every fire eagerly (no recorded bodies) -> perf
+  follow-up. RSS re-check pending (IT).
