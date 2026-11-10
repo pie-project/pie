@@ -2430,7 +2430,9 @@ fn zz_gdn_step_timing() {
             let mut rng = Rng(77);
             let (qkv, gates) = gdn_inputs(&mut rng, &g, rows);
             let bank0: Vec<f32> = rng.f32s(slots * g.stride(), -0.5, 0.5).into_iter().map(round_bf16).collect();
-            for kernel in [true, false] {
+            for (kernel, nb) in [(true, "2"), (true, "3"), (false, "2")] {
+                // SAFETY: the chip tests run one at a time (--test-threads 1)
+                unsafe { std::env::set_var("PIE_GDN_STEP_BUFS", nb) };
                 kernels_xla::ssm::step_kernel(Some(kernel));
                 let mut b = Bench::new();
                 let x = b.bf16(rows as u32, g.width() as u32, &qkv);
@@ -2448,7 +2450,7 @@ fn zz_gdn_step_timing() {
                 if let Some(t) = t {
                     let bytes = (rows * g.stride() * 2 * 2) as f64;
                     eprintln!(
-                        "gdn step timing: hv {hv} rows {rows} kernel {kernel}: {:.1} us a layer ({:.0} GB/s of state in and out)",
+                        "gdn step timing: hv {hv} rows {rows} kernel {kernel} bufs {nb}: {:.1} us a layer ({:.0} GB/s of state in and out)",
                         t * 1e6,
                         bytes / t / 1e9
                     );

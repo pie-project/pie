@@ -79,7 +79,8 @@ fn kernel(t: i64, g: i64, hv: i64, rows: i64, per: i64) -> Built<crate::mosaic::
     };
     let state = per * dv;
     // the two state buffers and a few f32 copies of a state as it steps
-    let vmem = 2 * state * 2 + 6 * state * 4 + 2 * 6 * g * hv * 128 * 4 + (8 << 20);
+    let nb: i64 = std::env::var("PIE_GDN_STEP_BUFS").ok().and_then(|v| v.parse().ok()).unwrap_or(2).clamp(2, 3);
+    let vmem = nb * state * 2 + 6 * state * 4 + 2 * 6 * g * hv * 128 * 4 + (8 << 20);
     let k = Kernel {
         name: "gdn_step".into(),
         grid: vec![t / g],
@@ -97,8 +98,8 @@ fn kernel(t: i64, g: i64, hv: i64, rows: i64, per: i64) -> Built<crate::mosaic::
         outs: vec![lane(dv), bank()],
         vmem_limit: Some(u64::try_from(vmem).unwrap_or(0)),
         scratch: vec![
-            MTy::Ref(vec![2, per, dv], Elem::Bf16, Space::Vmem),
-            MTy::Sem(vec![2, 2]),
+            MTy::Ref(vec![nb, per, dv], Elem::Bf16, Space::Vmem),
+            MTy::Sem(vec![2, nb]),
         ],
     };
     k.build(|b, blk| {
@@ -141,19 +142,20 @@ fn kernel(t: i64, g: i64, hv: i64, rows: i64, per: i64) -> Built<crate::mosaic::
         let (z, one) = (b.i32(0), b.i32(1));
         b.for_range(z, gv, one, |b, r| {
             let row = b.addi(base, r)?;
-            let two = b.i32(2);
-            let s = b.remsi(row, two)?;
+            let nbv = b.i32(nb);
+            let s = b.remsi(row, nbv)?;
             let one = b.i32(1);
-            let other = b.subi(one, s)?;
-            // the row before stored out of the other buffer before that
-            // buffer takes the next row
-            let past = b.cmpi(ICmp::Sge, row, one)?;
+            let next = b.addi(row, one)?;
+            // the next row's buffer: the one the row `nb - 1` before stored
+            // out of, waited for before it takes the next row
+            let other = b.remsi(next, nbv)?;
+            let back = b.i32(nb - 1);
+            let past = b.cmpi(ICmp::Sge, row, back)?;
             b.when(past, |b| {
-                let one = b.i32(1);
-                let prev = b.subi(row, one)?;
+                let back = b.i32(nb - 1);
+                let prev = b.subi(row, back)?;
                 copy(b, prev, other, true, true)
             })?;
-            let next = b.addi(row, one)?;
             let tv = b.i32(t);
             let more = b.cmpi(ICmp::Slt, next, tv)?;
             b.when(more, |b| copy(b, next, other, false, false))?;
@@ -204,7 +206,19 @@ fn kernel(t: i64, g: i64, hv: i64, rows: i64, per: i64) -> Built<crate::mosaic::
             copy(b, row, s, true, false)?;
             let last = b.i32(t - 1);
             let fin = b.cmpi(ICmp::Eq, row, last)?;
-            b.when(fin, |b| copy(b, row, s, true, true))
+            b.when(fin, |b| {
+                // every store still in flight: the last `nb - 1` rows'
+                for back in (1..nb - 1).rev() {
+                    if t - 1 - back >= 0 {
+                        let bk = b.i32(back);
+                        let prev = b.subi(row, bk)?;
+                        let nbv = b.i32(nb);
+                        let ps = b.remsi(prev, nbv)?;
+                        copy(b, prev, ps, true, true)?;
+                    }
+                }
+                copy(b, row, s, true, true)
+            })
         })
     })
 }
