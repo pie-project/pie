@@ -4262,6 +4262,7 @@ dependencies = [
  "pie-poem-ir",
  "pie-profile",
  "serde",
+ "serde_json",
  "thiserror 2.0.21",
  "tokenizer",
  "ztensor",
