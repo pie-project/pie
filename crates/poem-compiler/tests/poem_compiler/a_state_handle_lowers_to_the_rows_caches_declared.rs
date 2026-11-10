@@ -145,10 +145,6 @@ fn minimax_m3(path: &str, _row: &CacheRow) -> String {
     }
 }
 
-fn minimax_h3(path: &str, _row: &CacheRow) -> String {
-    path.to_string()
-}
-
 fn qwen_4(path: &str, _row: &CacheRow) -> String {
     match parts(path)[..] {
         ["layers", l, "attn", "kv"] => format!("kv.{l}"),
@@ -352,7 +348,6 @@ mod moved {
         glm_5_next,
         hy_4,
         minimax_m3,
-        minimax_h3,
         qwen_4,
     );
 }
