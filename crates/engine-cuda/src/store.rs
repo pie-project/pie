@@ -1044,10 +1044,13 @@ impl Pools {
         programs: u64,
         resident: &dyn core::fmt::Display,
     ) -> Result<Fitted> {
+        // A flat range allocated whole before the fit is the pool's to
+        // reshape: its bytes count as room, less the activation it keeps.
         let live = self
             .pool
             .spare_bytes(0)?
-            .saturating_add(self.committed_bytes());
+            .saturating_add(self.committed_bytes())
+            .saturating_add(self.chunks.reclaimable_bytes());
         let layout = self.chunks.layout();
         let chunk = layout.chunk_bytes;
         // One working set at the declared context beside the null chunk:
