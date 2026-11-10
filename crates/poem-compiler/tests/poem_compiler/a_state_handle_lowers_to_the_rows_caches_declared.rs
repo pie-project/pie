@@ -138,7 +138,10 @@ fn wan_2(path: &str, _row: &CacheRow) -> String {
 }
 
 fn ltx_2(path: &str, _row: &CacheRow) -> String {
-    path.to_string()
+    match parts(path)[..] {
+        ["te", "layers", l, "kv"] => format!("te.kv.{l}"),
+        _ => path.to_string(),
+    }
 }
 
 fn flux_2(path: &str, _row: &CacheRow) -> String {
@@ -200,12 +203,28 @@ fn left_space_zero_empty(deployment: &str) -> bool {
     deployment.starts_with("gemma4-e4b-mini-l1-")
 }
 
+/// Whether `caches()` declared `package`'s windowed space before its
+/// whole-sequence one: LTX-2's text encoder put its sliding layers' rows in
+/// space 0 and its global layers' in space 1. A handle's whole-sequence
+/// rows take space 0, a window's the space after; the rows are otherwise
+/// alike.
+fn window_first(package: &str) -> bool {
+    package == "ltx_2"
+}
+
 fn renamed(package: &str, deployment: &str, trace: &Trace, rename: Renaming) -> Vec<CacheRow> {
     let mut rows = trace.caches.clone();
     if left_space_zero_empty(deployment) {
         for row in &mut rows {
             if let CacheRow::Kv { space, .. } = row {
                 *space += 1;
+            }
+        }
+    }
+    if window_first(package) {
+        for row in &mut rows {
+            if let CacheRow::Kv { space, .. } = row {
+                *space = 1 - *space;
             }
         }
     }

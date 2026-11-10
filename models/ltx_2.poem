@@ -195,7 +195,9 @@ GEMMA = struct(
 # The hidden states the connectors read: the embedding and every layer's.
 TEXT_STATES = GEMMA.layers + 1
 
-def text_encoder(d, banks):
+def text_encoder(d, banks, kv):
+    """Gemma 4's layers, each attention's keys and values the state of
+    its kv heads in `kv`."""
     g = GEMMA
     norm = lambda: weight([g.hidden])
 
@@ -218,7 +220,7 @@ def text_encoder(d, banks):
             up = weight([g.inter, g.hidden], banks),
             down = weight([g.hidden, g.inter], banks),
             scalar = weight([1]),
-            kv = "te.kv.{}".format(l),
+            kv = state([tokens, 2, a.kv_heads, a.head_dim], kv),
         )
 
     return struct(
@@ -304,7 +306,6 @@ def layout(id, deploy):
     flagship = id == "ltx25"
     return struct(
         dims = d,
-        kv = deploy.kv,
         rope = rope_constants(),
         rope_axes = ROPE_AXES,
         t_freq_dim = T_FREQ_DIM,
@@ -319,7 +320,7 @@ def layout(id, deploy):
             connector("connectors.video", d.cross_dim, d.heads, d.conn_layers, banks),
             connector("connectors.audio", d.audio_cross_dim, d.audio_heads, d.conn_layers, banks),
         ),
-        te = text_encoder(d, banks) if flagship else None,
+        te = text_encoder(d, banks, deploy.kv) if flagship else None,
         vae = vae(dtype.bf16) if flagship else None,
     )
 
@@ -518,14 +519,6 @@ NORM_EPS = 1e-6
 ROPE_THETA = 10000.0
 GATE_SCALE = 2.0
 VAE_EPS = 1e-8
-
-def caches(m, c):
-    if m.te == None:
-        return
-    spaces = [c.kv_space(m.kv, GEMMA.sliding.window), c.kv_space(m.kv)]
-    for w in m.te.layers:
-        plane = w.attn.kv_heads * w.attn.head_dim
-        c.kv(spaces[0 if w.attn.window else 1], w.kv, [plane, plane], w.attn.head_dim, heads = True)
 
 def forward(m, inputs):
     switch("reading", (["text"] if m.te != None else []) + ["denoise"] + (["vae.decode"] if m.vae != None else []))
