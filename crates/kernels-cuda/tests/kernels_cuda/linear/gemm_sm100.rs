@@ -150,7 +150,7 @@ fn run((a, w, lay, [n, k], f, rs, plan, tun): Case) {
             Some(groups) => {
                 let alpha_e = pick(mixed, 0, alpha_e);
                 #[rustfmt::skip]
-                let g = Grouped { experts: e as u32, groups, alpha_e };
+                let g = Grouped::contiguous(e as u32, groups, alpha_e);
                 let plan = plan.unwrap_or_else(|| Plan::grouped(&g, n32, k32, m, 148));
                 grouped_gemm_epi_with(ctx, a_op, w_op, y, g, [n32, k32], alpha * s, epi, plan)
             }
@@ -286,7 +286,7 @@ fn a_swapped_contiguous_group_of_scaled_rows_refuses_a_q_tile_past_64() {
     let b = Bench::new(0x64);
     let nv = Operand::scaled(0, NV.0, 0, 16);
     #[rustfmt::skip]
-    let g = Grouped { experts: 8, groups: Groups::Contiguous { offsets: 0, rows: 0, cap: 0 }, alpha_e: 0 };
+    let g = Grouped::contiguous(8, Groups::Contiguous { offsets: 0, rows: 0, cap: 0 }, 0);
     let fire = |bn| {
         grouped_gemm_epi_with(
             &b.ctx(),

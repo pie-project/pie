@@ -59,21 +59,6 @@ pub(crate) fn selected(
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub struct ExpertTable {
-    pub table: u64,
-    pub hits: u64,
-}
-
-impl ExpertTable {
-    pub const RESIDENT: ExpertTable = ExpertTable { table: 0, hits: 0 };
-
-    #[must_use]
-    pub const fn streams(&self) -> bool {
-        self.table != 0
-    }
-}
-
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct GroupSeat {
     pub cell: u64,
     pub hits: u64,
@@ -110,7 +95,7 @@ pub fn matmul_select(
             routes.rows,
             fan.route_count,
         ) {
-            return select_tc5(
+            return select_tc5_with(
                 ctx,
                 OP,
                 x,
@@ -122,6 +107,7 @@ pub fn matmul_select(
                 routes,
                 y,
                 crate::linear::gemm_sm100::Epilogue::STORE,
+                (experts, Planes::Dense),
             );
         }
         // Where there are no tcgen05 GEMMs, a batch whose experts fill their
@@ -137,12 +123,12 @@ pub fn matmul_select(
             && tiled
             && bank.dtype == Dtype::Bf16
             && !experts.streams()
-            && select_bf16_held(ctx, OP, x, bank.ptr, bank.rows, routes, y, None)?
+            && select_bf16_held(ctx, OP, x, bank.ptr, bank.rows, routes, y, None, experts)?
         {
             return Ok(());
         }
         if let Some(count) = grouped_worth(ctx, x, bank, y, &fan, experts) {
-            return select_grouped(ctx, OP, x, bank, routes, y, count);
+            return select_grouped(ctx, OP, x, bank, routes, y, count, experts);
         }
         // Bf16 experts under a captured graph have no grouped path (tcgen05 is
         // Blackwell's, cuBLAS is not graph-capturable); the per-route GEMV
@@ -160,9 +146,9 @@ pub fn matmul_select(
         {
             // On Hopper, wgmma over the same staging (sm_90a).
             if hopper_wgmma() && y.width.is_multiple_of(128) {
-                return select_bf16_wgmma(ctx, OP, x, bank, routes, y, &fan, bank.rows);
+                return select_bf16_wgmma(ctx, OP, x, bank, routes, y, &fan, bank.rows, experts);
             }
-            return select_bf16_mma(ctx, OP, x, bank, routes, y, &fan, bank.rows);
+            return select_bf16_mma(ctx, OP, x, bank, routes, y, &fan, bank.rows, experts);
         }
     }
     select_gemv(ctx, OP, x, bank, routes, y, experts)
@@ -214,6 +200,33 @@ pub(crate) fn select_tc5(
     y: &mut Tensor,
     epi: crate::linear::gemm_sm100::Epilogue,
 ) -> Result<(), Error> {
+    select_tc5_with(
+        ctx,
+        op,
+        x,
+        w,
+        experts,
+        routes,
+        y,
+        epi,
+        (ExpertTable::RESIDENT, Planes::Dense),
+    )
+}
+
+/// [`select_tc5`] over the experts `table` places, a bank of `planes`.
+#[cfg(feature = "cuda")]
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn select_tc5_with(
+    ctx: &Ctx,
+    op: &'static str,
+    x: Tensor,
+    w: crate::linear::gemm_sm100::Operand,
+    experts: u32,
+    routes: Tensor,
+    y: &mut Tensor,
+    epi: crate::linear::gemm_sm100::Epilogue,
+    (table, planes): (ExpertTable, Planes),
+) -> Result<(), Error> {
     use crate::linear::{act_quant, gemm_sm100};
     const GROUPED_X: &str = "linear.moe_tc5_x";
     const GROUPED_Y: &str = "linear.moe_tc5_y";
@@ -234,11 +247,7 @@ pub(crate) fn select_tc5(
         gemm_sm100::Operand::plain(xs, gemm_sm100::Elem::Bf16),
         w,
         ys,
-        gemm_sm100::Grouped {
-            experts,
-            groups: layout.groups,
-            alpha_e: 0,
-        },
+        gemm_sm100::Grouped::contiguous(experts, layout.groups, 0).tabled(table, planes),
         [n, k],
         1.0,
         // An expert's padding rows land nowhere.
@@ -305,6 +314,7 @@ pub(super) fn grouped_worth(
 }
 
 #[cfg(feature = "cuda")]
+#[allow(clippy::too_many_arguments)]
 pub(super) fn select_grouped(
     ctx: &Ctx,
     op: &'static str,
@@ -313,6 +323,7 @@ pub(super) fn select_grouped(
     routes: Tensor,
     y: &mut Tensor,
     experts: u32,
+    table: ExpertTable,
 ) -> Result<(), Error> {
     use cudarc::cublas::sys::{
         cublasComputeType_t, cublasContext, cublasGemmAlgo_t, cublasGemmBatchedEx, cublasHandle_t,
@@ -439,6 +450,7 @@ pub(super) fn select_grouped(
             block_size.arg(),
             k.arg(),
             n.arg(),
+            ArgValue::Ptr(table.at()),
         ],
     )?;
 
@@ -691,9 +703,21 @@ pub fn matmul_select_bias(
     routes: Tensor,
     y: &mut Tensor,
     seat: GroupSeat,
+    experts: ExpertTable,
 ) -> Result<(), Error> {
     const OP: &str = "linear.moe_select";
-    matmul_select_mxfp4(ctx, OP, x, codes, scales, Some(bias), routes, y, seat)
+    matmul_select_mxfp4(
+        ctx,
+        OP,
+        x,
+        codes,
+        scales,
+        Some(bias),
+        routes,
+        y,
+        seat,
+        experts,
+    )
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -706,10 +730,13 @@ pub fn matmul_select_quant(
     routes: Tensor,
     y: &mut Tensor,
     seat: GroupSeat,
+    experts: ExpertTable,
 ) -> Result<(), Error> {
     const OP: &str = "linear.moe_select";
     match biases {
-        None => matmul_select_mxfp4(ctx, OP, x, codes, scales, None, routes, y, seat),
-        Some(biases) => matmul_select_mlxu4(ctx, OP, x, codes, scales, biases, routes, y, seat),
+        None => matmul_select_mxfp4(ctx, OP, x, codes, scales, None, routes, y, seat, experts),
+        Some(biases) => {
+            matmul_select_mlxu4(ctx, OP, x, codes, scales, biases, routes, y, seat, experts)
+        }
     }
 }

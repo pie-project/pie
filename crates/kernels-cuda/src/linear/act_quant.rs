@@ -19,6 +19,7 @@ use dtype::Dtype;
 use crate::error::Error;
 use crate::jit::{Arg, ArgValue, Ctx, Fire, Launch, kernel, refuse, stated};
 use crate::linear::gemm_sm100;
+use crate::linear::moe::{ExpertTable, Planes};
 use crate::tensor::Tensor;
 
 const ACT_QUANT: &str = "linear/act_quant.cu";
@@ -608,6 +609,40 @@ pub fn select(
     bank: Bank,
     y: &mut Tensor,
 ) -> Result<(), Error> {
+    select_with(
+        ctx,
+        op,
+        fmt,
+        x,
+        routes,
+        input_scales,
+        bank,
+        y,
+        ExpertTable::RESIDENT,
+    )
+}
+
+/// [`select`] over the experts `table` places: `[codes, atoms]` an expert
+/// ([`Planes::Scaled`]), or an NVFP4 bank's four ([`Planes::Nvfp4A4`], its
+/// per-expert scalars read contiguous from `input_scales` and
+/// `alpha_from`).
+#[allow(clippy::too_many_arguments)]
+pub fn select_with(
+    ctx: &Ctx,
+    op: &'static str,
+    fmt: Format,
+    x: Tensor,
+    routes: Tensor,
+    input_scales: Option<Tensor>,
+    bank: Bank,
+    y: &mut Tensor,
+    table: ExpertTable,
+) -> Result<(), Error> {
+    let planes = if bank.gran == 16 {
+        Planes::Nvfp4A4
+    } else {
+        Planes::Scaled
+    };
     let Bank { experts, n, k, .. } = bank;
     let tokens = routes.rows;
     let count = tokens * routes.width;
@@ -670,11 +705,7 @@ pub fn select(
         gemm_sm100::Operand::scaled(codes as u64, a_elem, atoms, fmt.gran()),
         gemm_sm100::Operand::scaled(bank.codes, bank.elem, bank.atoms, bank.gran),
         grouped,
-        gemm_sm100::Grouped {
-            experts,
-            groups,
-            alpha_e: bank.alpha_e,
-        },
+        gemm_sm100::Grouped::contiguous(experts, groups, bank.alpha_e).tabled(table, planes),
         [n, k],
         1.0,
         // An expert's padding rows land nowhere.

@@ -1222,6 +1222,7 @@ impl Run<'_> {
                         self.tensor(*routes),
                         &mut self.tensor(*y),
                         None,
+                        linear::moe::ExpertTable::RESIDENT,
                     )?
                 {
                     return Ok(());
@@ -1248,6 +1249,7 @@ impl Run<'_> {
                     self.tensor(*routes),
                     &mut self.tensor(*y),
                     seat,
+                    linear::moe::ExpertTable::RESIDENT,
                 )
             }
             Linear::MoeSelect {
@@ -1382,6 +1384,7 @@ impl Run<'_> {
                     route_t,
                     &mut out,
                     Glu::Swiglu,
+                    linear::moe::ExpertTable::RESIDENT,
                 );
             }
         }
@@ -1404,6 +1407,7 @@ impl Run<'_> {
                 routes,
                 &mut out,
                 Some(Glu::Relu2),
+                linear::moe::ExpertTable::RESIDENT,
             );
         }
         // The profile first: a tcgen05 device with its grouped GEMM off resolves nothing.
@@ -1491,6 +1495,7 @@ impl Run<'_> {
                 routes,
                 &mut out,
                 Some(glu),
+                linear::moe::ExpertTable::RESIDENT,
             )? {
                 return Ok(true);
             }
@@ -1734,7 +1739,10 @@ impl Run<'_> {
             if gate_add.is_some() || normed.is_some() {
                 return Ok(false);
             }
-            let (Some((x, routes, up_y, up, _)), Some((down_x, down_routes, down_y, down, _))) =
+            let (
+                Some((x, routes, up_y, up, up_experts)),
+                Some((down_x, down_routes, down_y, down, down_experts)),
+            ) =
                 (self.routed_bank(select), self.routed_bank(down))
             else {
                 return Ok(false);
@@ -1750,7 +1758,8 @@ impl Run<'_> {
             let glu = Glu::SwigluClamp { limit };
             #[rustfmt::skip]
             let m = linear::moe::RoutedMlp { x, up, glu, down, routes, weights, inter: intermediate };
-            return linear::moe::experts_weighted_first(self.ctx(), m, shared, &mut out);
+            let tables = [up_experts, down_experts];
+            return linear::moe::experts_weighted_first(self.ctx(), m, shared, &mut out, tables);
         }
         let (packed, hidden, intermediate, glu) = match *glu {
             Linear::Glu {
@@ -1951,7 +1960,7 @@ impl Run<'_> {
         let mut out = self.tensor(y);
         #[rustfmt::skip]
         let m = linear::moe::RoutedMlp { x, up, glu, down, routes, weights, inter: intermediate };
-        linear::moe::mega(self.ctx(), m, fold, &mut out)
+        linear::moe::mega(self.ctx(), m, fold, &mut out, [up_experts, down_experts])
     }
 
     /// A quantized bank's select of `x`.
@@ -1978,6 +1987,7 @@ impl Run<'_> {
                 routes,
                 &mut self.tensor(y),
                 None,
+                linear::moe::ExpertTable::RESIDENT,
             )?
         {
             return Ok(());
@@ -2001,6 +2011,7 @@ impl Run<'_> {
                 routes,
                 &mut self.tensor(y),
                 seat,
+                linear::moe::ExpertTable::RESIDENT,
             );
         }
         let (codes, scales, biases, routes, seat) =
@@ -2019,6 +2030,7 @@ impl Run<'_> {
             routes,
             &mut self.tensor(y),
             seat,
+            linear::moe::ExpertTable::RESIDENT,
         )
     }
 
@@ -2078,6 +2090,7 @@ impl Run<'_> {
                     self.tensor(routes),
                     &mut self.tensor(y),
                     gran,
+                    linear::moe::ExpertTable::RESIDENT,
                 )?
             {
                 return Ok(());
@@ -2098,6 +2111,7 @@ impl Run<'_> {
                     self.tensor(input_scales),
                     self.tensor(routes),
                     &mut self.tensor(y),
+                    linear::moe::ExpertTable::RESIDENT,
                 )?
             {
                 return Ok(());
@@ -2214,6 +2228,7 @@ impl Run<'_> {
                 atoms,
                 route_t,
                 &mut out,
+                linear::moe::ExpertTable::RESIDENT,
             )? {
                 return Ok(());
             }
@@ -2394,6 +2409,7 @@ impl Run<'_> {
                         self.tensor(routes),
                         &mut self.tensor(y),
                         None,
+                        linear::moe::ExpertTable::RESIDENT,
                     )?
                 {
                     return Ok(());
@@ -2413,6 +2429,7 @@ impl Run<'_> {
                             codes.rows,
                             route_t,
                             &mut out,
+                            linear::moe::ExpertTable::RESIDENT,
                         );
                     }
                 }
@@ -2452,6 +2469,7 @@ impl Run<'_> {
                         codes.rows,
                         routes,
                         &mut self.tensor(y),
+                        linear::moe::ExpertTable::RESIDENT,
                     );
                 }
                 linear::moe::select_fp8_w8a16(
@@ -2465,6 +2483,7 @@ impl Run<'_> {
                     routes,
                     &mut self.tensor(y),
                     None,
+                    linear::moe::ExpertTable::RESIDENT,
                 )
             }
             stored => Err(kernels_cuda::Error::Backend {

@@ -2,6 +2,7 @@
 #include "linear/wgmma.cuh"
 #include "linear/grouped_fp8.cuh"
 #include "linear/moe_w4.cuh"
+#include "linear/moe/table.cuh"
 #include "linear/w8a16.cuh"
 
 namespace pie::linear {
@@ -22,7 +23,7 @@ __global__ void __launch_bounds__(128) moe_select_fp8a8_wgmma(
     const u8* __restrict__ xq, const u8* __restrict__ xe, const i32* __restrict__ order,
     const i32* __restrict__ offsets, const i32* __restrict__ work, const u8* __restrict__ weight,
     const u8* __restrict__ atoms, bf16* __restrict__ out, int act_div, int n, int k,
-    int num_experts) {
+    int num_experts, const u64* __restrict__ expert_table) {
     constexpr int kA = 128 * 128;
     constexpr int kStage = kA + kR * 128;
     constexpr int kF = kR / 2;  // a thread's sums of one m64 x kR
@@ -41,8 +42,11 @@ __global__ void __launch_bounds__(128) moe_select_fp8a8_wgmma(
     const int warp = tid >> 5, lane = tid & 31, g = lane >> 2, c = lane & 3;
     const int row0 = static_cast<int>(blockIdx.y) * 128;
     const int blocks = k / 128;
-    const u8* w_e = weight + (static_cast<long long>(expert) * n + row0) * k;
-    const u8* atoms_at = atoms + atom_offset(expert * n + row0, 0, blocks);
+    // The expert table ([codes, atoms] an expert), resolved once a tile.
+    const u8* w_e = expert_plane(weight, static_cast<long long>(n) * k, expert_table, 2, 0, expert)
+        + static_cast<long long>(row0) * k;
+    const ExpertAtoms ea = expert_atoms(atoms, expert_table, expert, n);
+    const u8* atoms_at = ea.at + atom_offset(ea.row0 + row0, 0, blocks);
 
     auto load = [&](int kb, int st) {
         u8* a = smem + st * kStage;
@@ -186,7 +190,7 @@ template <int kR, int kAtoms = 1>
 __global__ void __launch_bounds__(128) moe_select_bf16_wgmma(
     const bf16* __restrict__ act, const i32* __restrict__ order, const i32* __restrict__ offsets,
     const i32* __restrict__ work, const bf16* __restrict__ weight, bf16* __restrict__ out,
-    int act_div, int n, int k, int num_experts) {
+    int act_div, int n, int k, int num_experts, const u64* __restrict__ expert_table) {
     constexpr int kT = 1;
     constexpr int kRows = 64 * kT;
     // `kAtoms` 64-wide K atoms a stage (64 or 128 of K).
@@ -208,7 +212,9 @@ __global__ void __launch_bounds__(128) moe_select_bf16_wgmma(
     const int warp = tid >> 5, lane = tid & 31, g = lane >> 2, c = lane & 3;
     const int row0 = static_cast<int>(blockIdx.y) * kRows;
     const int steps = k / (64 * kAtoms);
-    const bf16* w_e = weight + (static_cast<long long>(expert) * n + row0) * k;
+    // The expert table (one plane an expert), resolved once a tile.
+    const bf16* w_e = expert_plane(weight, static_cast<long long>(n) * k, expert_table, 1, 0, expert)
+        + static_cast<long long>(row0) * k;
 
     auto load = [&](int kb, int st) {
         u8* a = smem + st * kStage;
@@ -303,7 +309,8 @@ __global__ void __launch_bounds__(128 * kWg, kWg == 2 ? 1 : kSlice == 64 ? 3 : 2
     const bf16* __restrict__ act, const i32* __restrict__ order, const i32* __restrict__ offsets,
     const i32* __restrict__ work, const u8* __restrict__ codes, const u8* __restrict__ scales,
     const bf16* __restrict__ bias, bf16* __restrict__ out, int act_div, int n, int k,
-    int num_experts, int inter, float limit, float galpha, const float* __restrict__ tscale) {
+    int num_experts, int inter, float limit, float galpha, const float* __restrict__ tscale,
+    const u64* __restrict__ expert_table) {
     constexpr int kT = 2;
     constexpr int kThreads = 128 * kWg;
     // A stage: the routes' two K-major atoms (128 codes), then the CTA's
@@ -352,9 +359,9 @@ __global__ void __launch_bounds__(128 * kWg, kWg == 2 ? 1 : kSlice == 64 ? 3 : 2
     // A last chunk of 64 codes: the K steps it holds.
     const int tail_steps = (k & 127) != 0 ? (k & 127) >> 4 : 8;
     const long long row_bytes = k >> 1;
-    const u8* w_e = codes + static_cast<long long>(expert) * n * row_bytes;
+    const u8* w_e = expert_plane(codes, 1LL * n * row_bytes, expert_table, 3, 0, expert);
     const int sf_row = kNv ? k >> 4 : k >> 5;
-    const u8* s_e = scales + static_cast<long long>(expert) * n * sf_row;
+    const u8* s_e = expert_plane(scales, 1LL * n * sf_row, expert_table, 3, 1, expert);
 
     // This thread's route runs' rows (-1 past the slice), and its code and
     // scale runs' bank rows, clamped into the bank (a row past it lands
@@ -552,8 +559,8 @@ __global__ void __launch_bounds__(128 * kWg, kWg == 2 ? 1 : kSlice == 64 ? 3 : 2
     }
     asm volatile("cp.async.wait_group 0;\n" ::);
 
-    const bf16* b_e = bias != nullptr ? bias + static_cast<long long>(expert) * n : nullptr;
-    const float* t_e = kNv ? tscale + static_cast<long long>(expert) * n : nullptr;
+    const bf16* b_e = bias != nullptr ? expert_plane(bias, 1LL * n, expert_table, 3, 2, expert) : nullptr;
+    const float* t_e = kNv ? expert_plane(tscale, 1LL * n, expert_table, 3, 2, expert) : nullptr;
     auto factor = [&](int row) { return kNv ? t_e[row] * 256.f : 1.f; };
     if (row_base >= span) return;
     w4mma::w4_land<kGlu, kT, kSlice / 8, 64>(acc, factor, b_e, order, begin, count, out, n, inter, row_base,
@@ -610,7 +617,7 @@ __global__ void __launch_bounds__(384, 1) moe_select_bf16_wsgemm(
     const bf16* __restrict__ act, const i32* __restrict__ order, const i32* __restrict__ offsets,
     const i32* __restrict__ work, const bf16* __restrict__ weight, const bf16* __restrict__ bias,
     bf16* __restrict__ out, int act_div, int n, int k, int num_experts, int inter, float limit,
-    float galpha) {
+    float galpha, const u64* __restrict__ expert_table) {
     // A GLU's gate and up rows side by side; relu^2 (6) is no GLU, its rows as they are.
     constexpr bool kGated = kGlu != 0 && kGlu != 6;
     constexpr int kSlice = 128;
@@ -648,7 +655,8 @@ __global__ void __launch_bounds__(384, 1) moe_select_bf16_wsgemm(
     if (wg == 0) {
         // The producer: its rows of each stage, gathered.
         asm volatile("setmaxnreg.dec.sync.aligned.u32 40;\n");
-        const bf16* w_e = weight + static_cast<long long>(expert) * n * k;
+        // The expert table (one plane an expert), resolved once a tile.
+        const bf16* w_e = expert_plane(weight, static_cast<long long>(n) * k, expert_table, 1, 0, expert);
         const bf16* asrc[8];
         int alive[8];
 #pragma unroll
@@ -808,7 +816,7 @@ __global__ void __launch_bounds__(384, 1) moe_select_fp8a8_wsgemm(
     const u8* __restrict__ xq, const u8* __restrict__ xe, const i32* __restrict__ order,
     const i32* __restrict__ offsets, const i32* __restrict__ work, const u8* __restrict__ weight,
     const u8* __restrict__ atoms, bf16* __restrict__ out, int act_div, int n, int k,
-    int num_experts) {
+    int num_experts, const u64* __restrict__ expert_table) {
     constexpr int kSlice = 128;
     constexpr int kA = kSlice * 128;        // 128 routes x 128 codes
     constexpr int kB = 128 * 128 * kHalves; // the weight rows x 128 codes
@@ -843,7 +851,9 @@ __global__ void __launch_bounds__(384, 1) moe_select_fp8a8_wsgemm(
     if (wg == 0) {
         // The producer: its rows of each stage, gathered.
         asm volatile("setmaxnreg.dec.sync.aligned.u32 40;\n");
-        const u8* w_e = weight + (static_cast<long long>(expert) * n + row0) * k;
+        // The expert table ([codes, atoms] an expert), resolved once a tile.
+        const u8* w_e = expert_plane(weight, static_cast<long long>(n) * k, expert_table, 2, 0, expert)
+            + static_cast<long long>(row0) * k;
         const u8* asrc[8];
         int alive[8];
 #pragma unroll
@@ -897,7 +907,8 @@ __global__ void __launch_bounds__(384, 1) moe_select_fp8a8_wsgemm(
         const int r = c_wg * 64 + 16 * warp + g + 8 * h;
         xr[h] = r < count ? order[begin + r] / act_div : -1;
     }
-    const u8* atoms_at = atoms + atom_offset(expert * n + row0, 0, blocks);
+    const ExpertAtoms ea = expert_atoms(atoms, expert_table, expert, n);
+    const u8* atoms_at = ea.at + atom_offset(ea.row0 + row0, 0, blocks);
     auto scale = [&](int kb, int h) {
         return xr[h] >= 0 ? static_cast<int>(xe[static_cast<long long>(xr[h]) * blocks + kb]) : -1;
     };
@@ -1017,7 +1028,8 @@ __global__ void __launch_bounds__(384, 1) moe_select_fp8a8_tma(
     const __grid_constant__ wgfp8tma::TmaMap map_w, const u8* __restrict__ xq,
     const u8* __restrict__ xe, const i32* __restrict__ order, const i32* __restrict__ offsets,
     const i32* __restrict__ work, const u8* __restrict__ atoms, bf16* __restrict__ out, int act_div,
-    int n, int k, int num_experts, unsigned* __restrict__ ticket) {
+    int n, int k, int num_experts, unsigned* __restrict__ ticket,
+    const u64* __restrict__ expert_table, u64 window) {
     constexpr int kA = 128 * 128;  // 128 routes x 128 codes
     constexpr int kB = 256 * 128;  // 256 weight rows x 128 codes
     constexpr int kStage = kA + kB;
@@ -1092,7 +1104,9 @@ __global__ void __launch_bounds__(384, 1) moe_select_fp8a8_tma(
                 alive[i] = r < count;
                 asrc[i] = xq + static_cast<long long>(alive[i] ? order[begin + r] / act_div : 0) * k;
             }
-            const int wrow = expert * n + row0;
+            // The expert's first row in the map: its table entry past the
+            // window, or `expert n` in the bank.
+            const int wrow = static_cast<int>(expert_row(expert_table, 2, 0, expert, n, window, k)) + row0;
             for (int kb = 0; kb < blocks; ++kb, ++it) {
                 const int s = it % kStages;
                 if (it >= kStages) wgbf16gemm::bar_wait(empty + s, ((it / kStages) - 1) & 1);
@@ -1135,7 +1149,8 @@ __global__ void __launch_bounds__(384, 1) moe_select_fp8a8_tma(
             const int r = c_wg * 64 + 16 * warp + g + 8 * h;
             xr[h] = r < count ? order[begin + r] / act_div : -1;
         }
-        const u8* atoms_at = atoms + atom_offset(expert * n + row0, 0, blocks);
+        const ExpertAtoms ea = expert_atoms(atoms, expert_table, expert, n);
+        const u8* atoms_at = ea.at + atom_offset(ea.row0 + row0, 0, blocks);
         auto scale = [&](int kb, int h) {
             return xr[h] >= 0 ? static_cast<int>(xe[static_cast<long long>(xr[h]) * blocks + kb]) : -1;
         };

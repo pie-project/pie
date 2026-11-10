@@ -131,23 +131,23 @@ fn routed((kind, tuning, [ex, tokens, top, n, k], by_token, f, flags): Case) {
         (K::Bf16, _) => moe::matmul_select(&ctx, x, t(c, ex, n * k, Bf16), r, &mut y, RES),
         (K::Affine, _) => {
             let (fs, zs) = (t(fz.0, ex, n * k / 32, U8), t(fz.1, ex, n * k / 32, U8));
-            moe::matmul_select_quant(&ctx, x, mx, fs, Some(zs), r, &mut y, SEAT)
+            moe::matmul_select_quant(&ctx, x, mx, fs, Some(zs), r, &mut y, SEAT, RES)
         }
         (K::Mx, _) if tuning.mxfp4_w4a8_from > 0 => {
             let gran = pick(flags & 16 != 0, 128, 32);
-            moe::select_mxfp4_w4a8(&ctx, x, mx, sc, r, &mut y, gran)
+            moe::select_mxfp4_w4a8(&ctx, x, mx, sc, r, &mut y, gran, RES)
                 .map(|took| assert_eq!(took, w4a8_here(), "the arm takes the fire"))
         }
-        (K::Mx, _) => moe::matmul_select_quant(&ctx, x, mx, sc, None, r, &mut y, SEAT),
+        (K::Mx, _) => moe::matmul_select_quant(&ctx, x, mx, sc, None, r, &mut y, SEAT, RES),
         (K::MxBias, _) => {
             let bias = t(bias, ex, n, Bf16);
-            moe::matmul_select_bias(&ctx, x, mx, sc, bias, r, &mut y, SEAT)
+            moe::matmul_select_bias(&ctx, x, mx, sc, bias, r, &mut y, SEAT, RES)
         }
-        (K::Nv, _) => moe::select_nvfp4(&ctx, x, nvc, sc, nvt, r, &mut y, SEAT),
+        (K::Nv, _) => moe::select_nvfp4(&ctx, x, nvc, sc, nvt, r, &mut y, SEAT, RES),
         (K::Atoms, _) => {
             let xb = read_back(&ctx, "test", fmt, Source::rows(x, None), back).expect("reads");
             a = b.read(back, rows_x * k);
-            let mut go = || moe::select_mxfp4_atoms(&ctx, xb, mx, atoms, r, &mut y);
+            let mut go = || moe::select_mxfp4_atoms(&ctx, xb, mx, atoms, r, &mut y, RES);
             let keep = flags & 8 != 0;
             (if keep { moe::keeping_order(go) } else { go() }).map(took)
         }
@@ -190,7 +190,7 @@ fn routed((kind, tuning, [ex, tokens, top, n, k], by_token, f, flags): Case) {
         // The row-major select after takes the kept route order.
         let x = pick(kind == K::Atoms, t(back, rows_x, k, Bf16), x);
         let mut y = b.out(count, rows);
-        moe::matmul_select_quant(&ctx, x, mx, sc, None, r, &mut y, SEAT).expect("fires");
+        moe::matmul_select_quant(&ctx, x, mx, sc, None, r, &mut y, SEAT, RES).expect("fires");
         b.check(y.ptr, &d, TOL, &format!("{what}: the select after"));
     }
 }
@@ -507,7 +507,7 @@ fn the_routed_mlp_kept_by_expert_answers_the_host() {
             };
             #[rustfmt::skip]
             let took = match gate {
-                Some(true) => moe::experts_weighted_first(&ctx, m, st, &mut y),
+                Some(true) => moe::experts_weighted_first(&ctx, m, st, &mut y, [RES; 2]),
                 _ => moe::experts(&ctx, m, &mut y, RES, RES, gate.map(|_| (st, gt)), norm),
             };
             assert!(took.expect("fires"), "{what}: the grouped GEMM takes it");
@@ -553,7 +553,7 @@ fn the_w8a16_selects_answer_the_routed_dot() {
         let ctx = b.ctx();
         let x = t(x, rows_x, k, Bf16);
         select_fp8_w8a16(
-            &ctx, "test", x, codes, atoms, ex as u32, 128, r, &mut y, None,
+            &ctx, "test", x, codes, atoms, ex as u32, 128, r, &mut y, None, RES,
         )
         .expect("the W8A16 select fires");
         let w = |r: usize, c: usize, i: usize| f64::from(s.value(routes[r] as usize * n + c, k, i));
@@ -592,6 +592,7 @@ fn the_bf16_prefill_selects_answer_the_routed_dot() {
             t(b.up(&routes), tokens, top, I32),
             &mut y,
             glu,
+            RES,
         )
         .expect("the select fires");
         assert!(took, "{what}: the select takes the fire");
@@ -652,7 +653,7 @@ fn w4a8_select_timing() {
         let r = t(b.up(&routes), tokens, top, I32);
         let mut y = b.out(tokens * top, n);
         for _ in 0..5 {
-            assert!(moe::select_mxfp4_w4a8(&ctx, x, mx, sc, r, &mut y, 128).expect("fires"));
+            assert!(moe::select_mxfp4_w4a8(&ctx, x, mx, sc, r, &mut y, 128, RES).expect("fires"));
         }
         b.sync();
     }
