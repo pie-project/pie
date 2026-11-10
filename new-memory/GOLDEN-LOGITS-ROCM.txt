@@ -1,12 +1,9 @@
-# ROCm golden_logits baselines (MI300X gfx942, ROCm 7.15, graphs on), new-memory after M45 (db186bbf).
-# golden_logits == golden_logits_by_refs for all 8. e536895fe's graphs-on hashes for dsv4/dots3/mimo are INVALID
-# (split-plane routed GLU bug, fixed in db186bbf).
-qwen3-micro-text      d9f712387d038d74
-gemma4-e4b-mini-l6    137b48516a0045d9
-qwen35-tiny           537248bc4356de62
-nemotron3-nano-mini   5f90d15792161083
-minimax-m3-mini       f0ad4baa073042df
-dsv4-flash-mini       00f3b51d95e16bb9
-dots3-note-mini       f328e534f77d6ef0
-mimo26-flash-mini     e23b713b673c0cb2   (shaped; differs from fully eager ad8b8d30 from fire 5 by split-kv arm, 1 ulp median)
-qwen35-tiny-buffered  6a4d99f3771d8ad7   (golden_buffered; submit_buffered equal; also at PIE_GOLDEN_CHUNK=1048576 / 262144)
+golden qwen3-micro-text all d9f712387d038d74
+golden gemma4-e4b-mini-l6 all 137b48516a0045d9
+golden qwen35-tiny all 537248bc4356de62
+golden nemotron3-nano-mini all 5f90d15792161083
+golden minimax-m3-mini all f0ad4baa073042df
+golden dsv4-flash-mini all 00f3b51d95e16bb9
+golden dots3-note-mini all f328e534f77d6ef0
+golden mimo26-flash-mini all e23b713b673c0cb2
+golden qwen35-tiny-buffered all 6a4d99f3771d8ad7

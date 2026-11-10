@@ -656,3 +656,9 @@ The `new-memory/` directory is bookkeeping and is removed before anything lands 
 - Held because: the Mosaic kv append is disabled for pool planes (plain HLO writes) and the bitcast views may cost a
   TPU relayout — TPU decode/prefill speed unmeasured, while main is actively tuning TPU v5e/v6e. Needs a TPU owner to
   run the bitwise gate + kernel tests listed in the agent report and measure speed. Weight streaming: design only.
+
+### M47 — 2026-11-10: ROCm dense experts on the weight cache
+- d3769d3e: streamed_experts no longer returns early on ROCm; HIP dense arms already read ExpertTable. golden_experts
+  (MI300X): cached+held = baseline on nemotron/minimax/mimo/dots3/dsv4; host/mixed = per-route stream arm (max diff
+  0.03-0.34; dsv4 flips a near tie at step 9). Quantized ROCm selects still RESIDENT (follow CUDA's next step).
+- GOLDEN-LOGITS-ROCM.txt rewritten in probe format (usable as PIE_GOLDEN_CHECK); notes moved to .md.
