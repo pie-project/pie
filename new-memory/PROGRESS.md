@@ -705,3 +705,12 @@ The `new-memory/` directory is bookkeeping and is removed before anything lands 
   - ANE: a load waits (<= 20 min) for its ANE programs and fails if one is refused 8 times (deterministic split).
 - Left: quantized experts / quantized embedding tables not streamed (Metal, like CUDA); warm mapped loads have no
   separate buffer to free; runtime boot with real streamed weights untested on Metal.
+
+### M51 — 2026-11-10: CUDA window lists each by their own table
+- `sc/l40s-window-tables` (e5d2f9f51): up to 4 window lists, narrowest first (ids 1, then 65536 + index), each seated
+  and trimmed apart; `one-window` diagnostic / `.merged()` keep the old single list. T_w = kv page (16).
+- Verified L40S: golden_logits 8, by_refs 8 (each table trimmed by its own window), pair_by_refs, submit_buffered,
+  golden_offload all = base. Two-window models untested (only quantized mini / 26B real model) -> needs fixture
+  writer for quantized planes (comes with quantized experts).
+- Also: 4 MoE minis with weight slots at chunk 1 bitwise base (M41 follow-up). CUDA graphs vs eager (golden_eager):
+  not bitwise but arm-level on all minis (max 0.02-0.66), no sign of ROCm's replay bug.
