@@ -1,4 +1,4 @@
-#![cfg(feature = "cuda")]
+#![cfg(feature = "device")]
 
 //! A model served with `compiler.synth_regions` on (CUDA's default), each
 //! chain of elementwise and row ops one generated kernel, answers the
@@ -118,12 +118,14 @@ fn fixture(model: &'static str) -> Fixture {
 
 /// [`fixture`] of the trace packed as a deployment's is (`pack::pack_as`):
 /// q, k and v one product, a gate and an up one packed bank.
+#[cfg(feature = "cuda")]
 fn packed_fixture(model: &'static str) -> Fixture {
     packed_fixture_kv(model, Dtype::Bf16)
 }
 
 /// [`packed_fixture`] with its KV cache stored as `kv` (bf16, or e4m3 under
 /// a unit scale).
+#[cfg(feature = "cuda")]
 fn packed_fixture_kv(model: &'static str, kv: Dtype) -> Fixture {
     let trace = poem_compiler::catalog::trace_of(model, Dtype::Bf16, kv, Platform::Cuda);
     let shape = poem_compiler::pack::shape(&trace);
@@ -210,6 +212,7 @@ fn prompt(tokens: u32) -> Vec<u32> {
 }
 
 /// `got` is `want` bit for bit, step by step.
+#[cfg(feature = "cuda")]
 fn bit_for_bit(got: &[Vec<f32>], want: &[Vec<f32>], against: &str) {
     assert_eq!(got.len(), want.len());
     for (step, (got, want)) in got.iter().zip(want).enumerate() {
@@ -310,10 +313,17 @@ const SPREAD: f32 = 2e-2;
 /// bits, so a bf16 place apart before the cache (the epilogue's own order)
 /// can land a whole e4m3 place apart (2^-3, sixteen of bf16's), the
 /// reference's own append rounding the row it is handed so too.
+#[cfg(feature = "cuda")]
 const SPREAD_FP8: f32 = 4e-2;
 
 /// The norms' register forms: the unfused ops summing in another order.
+#[cfg(feature = "cuda")]
 const NUDGED: &str = "[kernel]\nelemwise.rows_vec = true\n";
+/// The prefill's projections on the batch engine rather than hipBLASLt:
+/// the unfused ops summing their contractions in another order (ROCm's
+/// norms have one form a shape, so they carry nothing apart).
+#[cfg(feature = "rocm")]
+const NUDGED: &str = "[kernel]\ndense.batch_until = 64\ndense.batch_weight_mi = 0\ndense.batch_weight_max_mi = 65536\n";
 
 const TOKENS: u32 = 256;
 const DECODES: usize = 4;
@@ -398,6 +408,8 @@ fn a_synthesized_region_serves_the_logits_of_its_ops() {
 /// prefill of a few rows (the contraction skeletons, as the tuner picks) and one past every skeleton's (cuBLASLt's bias, the unfused leg),
 /// then the decode steps (the gemv), held as a routed model's logits are
 /// ([`close_past_routing`]).
+// No contraction skeleton on ROCm yet.
+#[cfg(feature = "cuda")]
 #[test]
 fn an_anchored_region_serves_the_logits_of_its_ops() {
     let _one = serialized();
@@ -444,6 +456,8 @@ fn an_anchored_region_serves_the_logits_of_its_ops() {
 /// skeleton's rows (the unfused leg) and one of a few, then the decode
 /// steps, each step's logits within [`close`]'s bound (and a routed
 /// model's within [`close_past_routing`]'s).
+// No contraction skeleton on ROCm yet.
+#[cfg(feature = "cuda")]
 #[test]
 fn a_paged_epilogue_serves_the_logits_of_its_kv_append() {
     let _one = serialized();
@@ -493,11 +507,13 @@ fn a_paged_epilogue_serves_the_logits_of_its_kv_append() {
 /// decoded), and a last-bit difference may route that row to other experts
 /// than the reference's: a step past the bound with the reference's top
 /// token is let through with a note, a minority of them.
+#[cfg(feature = "cuda")]
 fn close_past_routing(got: &[Vec<f32>], want: &[Vec<f32>], carry: &[Vec<f32>], against: &str) {
     close_past_routing_within(got, want, carry, against, SPREAD);
 }
 
 /// [`close_past_routing`] within `share` of each step's spread.
+#[cfg(feature = "cuda")]
 fn close_past_routing_within(
     got: &[Vec<f32>],
     want: &[Vec<f32>],
@@ -550,12 +566,14 @@ fn close_past_routing_within(
 /// algorithm's, each its own order, so its carry is measured on the ops'
 /// products in another algorithm's (one cuBLASLt heuristic, a smaller
 /// workspace).
+#[cfg(feature = "cuda")]
 const REORDERED: &str =
     "[kernel]\nelemwise.rows_vec = true\ngemm.heuristics = 1\ngemm.workspace_mb = 4\n";
 
 /// The models served by [`an_anchored_region_serves_the_logits_of_its_ops`],
 /// each from a few rows (the contraction skeletons) and past every skeleton's,
 /// and whether it routes its rows to experts.
+#[cfg(feature = "cuda")]
 const ANCHORED: [(&str, &[u32], bool); 4] = [
     ("glm45-air-mini", &[37, 100], true),
     ("glm47-mini", &[37, 100], true),
@@ -573,6 +591,9 @@ const ANCHORED: [(&str, &[u32], bool); 4] = [
 /// them, and so would invalidate that capture
 /// (`cudaErrorStreamCaptureInvalidated`, 901; the copy itself
 /// `cudaErrorStreamCaptureImplicit`, 906).
+/// CUDA only: ROCm backs each arena flat, the first load's pool taking
+/// the device whatever its share, so a second model does not load beside it.
+#[cfg(feature = "cuda")]
 #[test]
 fn two_models_served_at_once_answer_what_each_answers_alone() {
     let _one = serialized();

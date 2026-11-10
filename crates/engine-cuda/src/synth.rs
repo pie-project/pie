@@ -16,7 +16,6 @@
 use std::collections::BTreeMap;
 
 use kernels_ir::{Anchored, Region};
-#[cfg(not(feature = "rocm"))]
 use poem_ir::{Def, Dtype, Ty, ValueDecl};
 use poem_ir::{Fused, Operation, RegionRead, Trace, ValueId};
 
@@ -24,17 +23,14 @@ use crate::error::{Fault, Result};
 
 #[cfg(not(feature = "rocm"))]
 use kernels_cuda::linear::skeleton::Epilogue;
-#[cfg(not(feature = "rocm"))]
 use kernels_cuda::synth::{In, Out, Synthesized};
 
-#[cfg(not(feature = "rocm"))]
 type Variants = Vec<(Vec<In>, Synthesized)>;
 
 /// Each generated kernel of a load, by body hash and width, and by how
 /// its parameters are stored.
 #[derive(Debug, Default)]
 pub struct Regions {
-    #[cfg(not(feature = "rocm"))]
     kernels: BTreeMap<(u64, u32), Variants>,
     /// Each anchored region's epilogue, by the region's key.
     #[cfg(not(feature = "rocm"))]
@@ -43,7 +39,6 @@ pub struct Regions {
 
 /// A load's regions where its trace holds none.
 pub(crate) static NONE: Regions = Regions {
-    #[cfg(not(feature = "rocm"))]
     kernels: BTreeMap::new(),
     #[cfg(not(feature = "rocm"))]
     anchors: BTreeMap::new(),
@@ -76,15 +71,13 @@ pub fn fold_anchors_with(trace: Trace, skinny: bool) -> (Trace, BTreeMap<u64, An
 
 /// Whether this backend's row kernels serve `region` over a chain's planes
 /// as it stores them (`chain::fold`'s `serves`): the row skeleton's own
-/// contract ([`kernels_cuda::synth::supports`]). ROCm's build generates no
-/// row kernel.
+/// contract ([`kernels_cuda::synth::supports`]).
 #[must_use]
 pub fn serves_region(
     region: &Region,
     ins: &[poem_compiler::fuse::chain::In],
     outs: &[poem_compiler::fuse::chain::Out],
 ) -> bool {
-    #[cfg(not(feature = "rocm"))]
     {
         let forms: Vec<In> = ins
             .iter()
@@ -104,11 +97,6 @@ pub fn serves_region(
             .collect();
         let results: Vec<Out> = outs.iter().map(|out| Out::Rows(out.dtype)).collect();
         kernels_cuda::synth::supports(region, &forms, &results).is_ok()
-    }
-    #[cfg(feature = "rocm")]
-    {
-        let _ = (region, ins, outs);
-        false
     }
 }
 
@@ -130,9 +118,7 @@ fn anchored(trace: &Trace) -> impl Iterator<Item = (u32, u64, &[ValueId], &[Valu
 }
 
 /// One `fused.region` of a trace: its node, parameters (and how each is
-/// read), width, region key and results. ROCm reads only where it lies
-/// (to refuse it).
-#[cfg_attr(feature = "rocm", allow(dead_code))]
+/// read), width, region key and results.
 struct Site<'t> {
     node: u32,
     ins: &'t [ValueId],
@@ -168,14 +154,27 @@ fn regions(trace: &Trace) -> impl Iterator<Item = Site<'_>> {
 impl Regions {
     /// The kernels `trace`'s regions fire, compiled (or read from the disk
     /// cache) and loaded on the current device, `regions` the compiler's.
-    #[cfg(not(feature = "rocm"))]
+    /// ROCm generates row kernels but holds no contraction skeleton yet: a
+    /// trace with an anchored region is not served there.
     pub(crate) fn load(
         trace: &Trace,
         regions_of: &BTreeMap<u64, Region>,
         anchored_of: &BTreeMap<u64, Anchored>,
         tuning: &kernels_cuda::tuning::Tuning,
     ) -> Result<Regions> {
+        #[cfg(feature = "rocm")]
+        {
+            let _ = (anchored_of, tuning);
+            if let Some((node, ..)) = anchored(trace).next() {
+                return Err(Fault::Unsupported(format!(
+                    "the `fused.anchored` at node {node}: this backend has no contraction \
+                     skeletons; serve it with `compiler.synth_anchors` off"
+                )));
+            }
+        }
+        #[cfg(not(feature = "rocm"))]
         let mut anchors = BTreeMap::new();
+        #[cfg(not(feature = "rocm"))]
         for (node, key, ins, outs, landed) in anchored(trace) {
             let broken = |why: String| Fault::Region {
                 node,
@@ -251,45 +250,21 @@ impl Regions {
                 held.push((forms, kernel));
             }
         }
-        Ok(Regions { kernels, anchors })
-    }
-
-    /// This backend generates no row kernel: a trace with a region is not
-    /// served.
-    #[cfg(feature = "rocm")]
-    pub(crate) fn load(
-        trace: &Trace,
-        _regions: &BTreeMap<u64, Region>,
-        _anchored: &BTreeMap<u64, Anchored>,
-        _tuning: &kernels_cuda::tuning::Tuning,
-    ) -> Result<Regions> {
-        if let Some(Site { node, .. }) = regions(trace).next() {
-            return Err(Fault::Unsupported(format!(
-                "the `fused.region` at node {node}: this backend generates no row kernel; \
-                 serve it with `compiler.synth_regions` off"
-            )));
-        }
-        match anchored(trace).next() {
-            Some((node, ..)) => Err(Fault::Unsupported(format!(
-                "the `fused.anchored` at node {node}: this backend has no contraction skeletons; \
-                 serve it with `compiler.synth_anchors` off"
-            ))),
-            None => Ok(Regions {}),
-        }
+        Ok(Regions {
+            kernels,
+            #[cfg(not(feature = "rocm"))]
+            anchors,
+        })
     }
 
     /// How many kernels the load generated: one a region, width and
     /// storage, and one epilogue an anchored region.
     #[must_use]
     pub fn len(&self) -> usize {
+        let kernels = self.kernels.values().map(Vec::len).sum::<usize>();
         #[cfg(not(feature = "rocm"))]
-        {
-            self.kernels.values().map(Vec::len).sum::<usize>() + self.anchors.len()
-        }
-        #[cfg(feature = "rocm")]
-        {
-            0
-        }
+        let kernels = kernels + self.anchors.len();
+        kernels
     }
 
     #[must_use]
@@ -305,7 +280,6 @@ impl Regions {
 
     /// The kernel of the region of key `body` over rows `width` wide, its
     /// parameters stored as `forms` says.
-    #[cfg(not(feature = "rocm"))]
     pub(crate) fn get(&self, body: u64, width: u32, forms: &[In]) -> Option<Synthesized> {
         self.kernels
             .get(&(body, width))?
@@ -319,7 +293,6 @@ impl Regions {
 /// element, one row of a weight every row reads, rows picked by id (as
 /// `reads` says), one element a row (a position: a value one element a
 /// row), or each row its own; in the dtype its plane holds.
-#[cfg(not(feature = "rocm"))]
 pub(crate) fn forms(
     values: &[ValueDecl],
     ins: &[ValueId],
@@ -349,7 +322,6 @@ pub(crate) fn forms(
 
 /// Whether `decl` is one element a row, its own: a value of rows one
 /// element wide (a position).
-#[cfg(not(feature = "rocm"))]
 fn each(decl: &ValueDecl) -> bool {
     !matches!(decl.def, Def::Weight(_))
         && matches!(
@@ -362,7 +334,6 @@ fn each(decl: &ValueDecl) -> bool {
 /// Why a region's planes are not its own: a result twice, or over one of
 /// its parameters. The skeleton's blocks read their rows whole before writing,
 /// but a block's row is not another block's.
-#[cfg(not(feature = "rocm"))]
 fn aliased(ins: &[ValueId], outs: &[ValueId]) -> Option<String> {
     outs.iter().enumerate().find_map(|(k, out)| {
         if outs[..k].contains(out) {
@@ -376,7 +347,6 @@ fn aliased(ins: &[ValueId], outs: &[ValueId]) -> Option<String> {
 }
 
 /// Whether `decl` is one row every row reads: a weight of rank 1.
-#[cfg(not(feature = "rocm"))]
 pub(crate) fn shared(decl: &ValueDecl) -> bool {
     matches!(decl.def, Def::Weight(_))
         && matches!(&decl.ty, Ty::Tensor { shape, .. } if shape.len() == 1)
@@ -384,7 +354,6 @@ pub(crate) fn shared(decl: &ValueDecl) -> bool {
 
 /// Whether `decl` is one element every row reads: a weight of one element
 /// (a layer's scale).
-#[cfg(not(feature = "rocm"))]
 pub(crate) fn one(decl: &ValueDecl) -> bool {
     matches!(decl.def, Def::Weight(_))
         && matches!(&decl.ty, Ty::Tensor { shape, .. } if shape.as_slice() == [poem_ir::Dim::Const(1)])
@@ -392,7 +361,6 @@ pub(crate) fn one(decl: &ValueDecl) -> bool {
 
 /// How `v` is stored, a weight as its parameter states; `None` for a
 /// struct.
-#[cfg(not(feature = "rocm"))]
 fn dtype_of(trace: &Trace, v: ValueId) -> Option<Dtype> {
     let decl = &trace.values[v.0 as usize];
     match (&decl.def, &decl.ty) {

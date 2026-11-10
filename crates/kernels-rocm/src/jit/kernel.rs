@@ -30,6 +30,16 @@ type Table = HashMap<&'static str, HashMap<Box<str>, &'static Kernel>>;
 /// The kernel `name` of the unit `file`: the same reference for every call
 /// with the same two.
 pub fn kernel(file: &'static str, name: &str) -> &'static Kernel {
+    made(file, name, || Root::of(file))
+}
+
+/// The kernel `name` of `root`, a generated unit ([`Root::generated`]): the
+/// same reference for every call with the same unit and name.
+pub(crate) fn generated(root: Root, name: &str) -> &'static Kernel {
+    made(root.file, name, || Some(root))
+}
+
+fn made(file: &'static str, name: &str, root: impl FnOnce() -> Option<Root>) -> &'static Kernel {
     static KERNELS: OnceLock<Mutex<Table>> = OnceLock::new();
     let mut table = KERNELS
         .get_or_init(|| Mutex::new(HashMap::new()))
@@ -42,12 +52,48 @@ pub fn kernel(file: &'static str, name: &str) -> &'static Kernel {
     let made: &'static Kernel = Box::leak(Box::new(Kernel {
         file,
         name: Box::leak(name.into()),
-        root: Root::of(file),
+        root: root(),
         #[cfg(feature = "rocm")]
         loaded: [const { OnceLock::new() }; MAX_DEVICES],
     }));
     named.insert(name.into(), made);
     made
+}
+
+impl Kernel {
+    /// Compiles this kernel (or reads it from the disk cache) and loads it
+    /// on the current device now, so that no fire of it does: a module load
+    /// waits on the device, and mid-fire that is whatever the device runs.
+    pub fn load(&'static self) -> Result<(), crate::Error> {
+        #[cfg(feature = "rocm")]
+        {
+            self.resolve()
+                .map(|_| ())
+                .map_err(|fault| fault.at("jit.load"))
+        }
+        #[cfg(not(feature = "rocm"))]
+        {
+            Err(crate::jit::runtimeless("jit.load"))
+        }
+    }
+
+    /// Whether [`Kernel::load`] (or a fire) loaded this kernel on the
+    /// current device.
+    #[must_use]
+    pub fn is_loaded(&self) -> bool {
+        #[cfg(feature = "rocm")]
+        {
+            cache::current_device()
+                .ok()
+                .and_then(|ordinal| usize::try_from(ordinal).ok())
+                .and_then(|at| self.loaded.get(at))
+                .is_some_and(|slot| matches!(slot.get(), Some(Ok(_))))
+        }
+        #[cfg(not(feature = "rocm"))]
+        {
+            false
+        }
+    }
 }
 
 #[cfg(feature = "rocm")]
@@ -91,3 +137,29 @@ impl PartialEq for Kernel {
 }
 
 impl Eq for Kernel {}
+
+#[cfg(all(test, feature = "rocm"))]
+mod tests {
+    use super::{Root, generated};
+
+    /// A unit the crate does not carry compiles with the carried headers in
+    /// scope and loads on the device; the same unit and name are one kernel.
+    #[test]
+    fn a_generated_unit_compiles_against_the_carried_headers() {
+        if crate::jit::cache::current_device().is_err() {
+            return;
+        }
+        const TEXT: &str = "#include \"prim/device.hip\"\n\
+                            namespace pie::generated_test {\n\
+                            __global__ void fill(float* __restrict__ y) { y[threadIdx.x] = 1.f; }\n\
+                            }\n";
+        let root = Root::generated("synth/generated_test.hip", TEXT);
+        assert_eq!(root.name, "synth/generated_test");
+        let made = generated(root, "::pie::generated_test::fill");
+        made.load().expect("the generated unit compiles and loads");
+        assert!(std::ptr::eq(
+            made,
+            generated(root, "::pie::generated_test::fill")
+        ));
+    }
+}

@@ -191,9 +191,16 @@ static REGISTRY: LazyLock<Registry> = LazyLock::new(|| {
     #[cfg(not(feature = "rocm"))]
     poem_compiler::costs::register_regions(&mut r, 2);
     // HIP graphs have no conditional node: one is priced past any launch it
-    // could skip, so the compiler lowers every region to `AlwaysLaunch`.
+    // could skip, so the compiler lowers every region to `AlwaysLaunch`. The
+    // residual norms run as generated row kernels there too; the products'
+    // epilogues keep their hand rules until ROCm holds contraction skeletons.
     #[cfg(feature = "rocm")]
-    poem_compiler::costs::register_for(&mut r, 2, poem_compiler::costs::Conditionals::Absent);
+    poem_compiler::costs::register_regions_for(
+        &mut r,
+        2,
+        poem_compiler::costs::Conditionals::Absent,
+        false,
+    );
     r
 });
 
@@ -805,7 +812,7 @@ mod tests {
         assert_eq!(
             poem_compiler::DeviceProfile::of(&registry().defaults(), 132, &[], &[]),
             poem_compiler::DeviceProfile {
-                synth_regions: cfg!(not(feature = "rocm")),
+                synth_regions: true,
                 synth_anchors: cfg!(not(feature = "rocm")),
                 ..poem_compiler::DeviceProfile::default()
             }
@@ -1247,10 +1254,12 @@ mod hip {
     fn the_defaults_price_conditionals_past_any_launch() {
         // HIP graphs have no conditional node: one is priced past any launch
         // it could skip, so the compiler lowers every region to AlwaysLaunch.
+        // Chains fold into generated row kernels; no contraction skeleton yet.
         assert_eq!(
             poem_compiler::DeviceProfile::of(&registry().defaults(), 132, &[], &[]),
             poem_compiler::DeviceProfile {
                 cond_fixed_us: 1_000_000.0,
+                synth_regions: true,
                 ..poem_compiler::DeviceProfile::default()
             }
         );
