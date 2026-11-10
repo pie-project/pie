@@ -941,11 +941,22 @@ impl Pools {
         self.pool.commit_segments(segments)
     }
 
-    /// Backs the segments the seat runs lie in: what a caller firing
-    /// directly asks.
-    pub fn commit_seats(&mut self) -> Result<()> {
-        let chunks = 1 + self.layout.seat_chunks();
-        let segments = chunks
+    /// Backs every segment up to the highest physical page and slot
+    /// `demand` names (one past each, as [`Pools::admit`] reads them).
+    pub fn commit_for(&mut self, demand: engine::frame::Demand) -> Result<()> {
+        let mut chunk = 0u32;
+        if demand.kv_pages > 0
+            && let Some(list) = self.layout.list
+        {
+            chunk = chunk.max((demand.kv_pages - 1) / list.per_chunk);
+        }
+        if demand.state_slots > 0
+            && self.has_state()
+            && let Some(fixed) = self.layout.fixed
+        {
+            chunk = chunk.max((demand.state_slots - 1) / fixed.per_chunk);
+        }
+        let segments = (chunk + 1)
             .div_ceil(self.layout.segment_chunks.max(1))
             .min(self.pool.segments());
         self.pool.commit_segments(segments)

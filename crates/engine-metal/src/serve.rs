@@ -1622,8 +1622,6 @@ impl Shell {
         attachments: &[Attached],
     ) -> Result<Vec<Vec<f32>>> {
         use engine::frame::Shell as FrameShell;
-        // A caller firing directly has no runtime to commit ahead of it.
-        self.pools.commit_seats()?;
         let prepared = FrameShell::prepare(
             self,
             StepView {
@@ -2893,6 +2891,11 @@ impl Shell {
                 .max(snap_slots),
             workspace: 0,
         };
+        // A caller firing directly (every lane seat-addressed) has no
+        // runtime to commit ahead of it: the segments its seats touch back now.
+        if lanes.iter().all(|seated| !seated.refs) {
+            self.pools.commit_for(demand)?;
+        }
         self.pools.admit(demand)?;
 
         if !beginning.is_empty() && self.pools.has_state() {
