@@ -37,8 +37,7 @@ __device__ __forceinline__ Factor factor_bits(u32 s, u32 off) {
 template <class T, class F, int kBits, int kOffset, int kGroup, int SHAPE, int LANE, int NT, int RS, int SPLIT, int R>
 __global__ __launch_bounds__(kWave* SPLIT) void matmul_affine_decode(
     const T* __restrict__ act, const u8* __restrict__ codes, const u8* __restrict__ scales,
-    const u8* __restrict__ biases, T* __restrict__ out, int m, int n, int k, const AffineSeat* __restrict__ seat,
-    const u32* __restrict__ win) {
+    const u8* __restrict__ biases, T* __restrict__ out, int m, int n, int k, const u32* __restrict__ win) {
     using U = Unpack<T, kBits>;
     constexpr int kSlots = kWave / SHAPE;     // lane groups along k
     constexpr int kBytes = LANE * kBits / 8;  // codes a lane reads a piece
@@ -57,7 +56,7 @@ __global__ __launch_bounds__(kWave* SPLIT) void matmul_affine_decode(
     const int rows = win == nullptr ? m : min(m, static_cast<int>(win[0]));
     const int r0 = blockIdx.y * SHAPE * RS;
     if (r0 >= rows) return;
-    const AffinePlanes planes = seated(codes, scales, biases, seat);
+    const AffinePlanes planes{codes, scales, biases};
 
     const int l = lane(), wave = threadIdx.x / kWave;
     const int across = l % SHAPE, slot = l / SHAPE;  // a lane's row in a tile, and its k
@@ -246,7 +245,7 @@ template <class T, class F, int kBits, int kOffset, int kGroup, int LANE, int NT
 __global__ __launch_bounds__(kWave* SPLIT) void matmul_affine_stream(
     const T* __restrict__ act, const u8* __restrict__ codes, const u8* __restrict__ scales,
     const u8* __restrict__ biases, T* __restrict__ out, float* __restrict__ slices, int m, int n, int k,
-    const AffineSeat* __restrict__ seat, const u32* __restrict__ win) {
+    const u32* __restrict__ win) {
     using Q = Quads<T, kBits>;
     constexpr int kBytes = LANE * kBits / 8;  // code bytes a lane reads a piece
     constexpr int kWords = kBytes / 4;
@@ -266,7 +265,7 @@ __global__ __launch_bounds__(kWave* SPLIT) void matmul_affine_stream(
 
     const int rows = win == nullptr ? m : min(m, static_cast<int>(win[0]));
     if (rows <= 0) return;
-    const AffinePlanes planes = seated(codes, scales, biases, seat);
+    const AffinePlanes planes{codes, scales, biases};
     const int l = lane(), j = l % 4, b = l / 4;
     const int wave = __builtin_amdgcn_readfirstlane(static_cast<int>(threadIdx.x) / kWave);
     const int groups = k / kGroup;
@@ -515,7 +514,7 @@ template <class T, class F, int kBits, int kOffset, int kGroup, int KS, int WM, 
 __global__ __launch_bounds__(4 * kWave) void matmul_affine_tile(
     const T* __restrict__ act, const u8* __restrict__ codes, const u8* __restrict__ scales,
     const u8* __restrict__ biases, T* __restrict__ out, float* __restrict__ part, int per, int m, int n, int k,
-    const AffineSeat* __restrict__ seat, const u32* __restrict__ win) {
+    const u32* __restrict__ win) {
     using Q = Quads<T, kBits>;
     constexpr int kThreads = 4 * kWave;
     constexpr int WN = 4 / WM;
@@ -554,7 +553,7 @@ __global__ __launch_bounds__(4 * kWave) void matmul_affine_tile(
     const int rows = win == nullptr ? m : min(m, static_cast<int>(win[0]));
     const int m0 = blockIdx.x * BM;
     if (m0 >= rows) return;
-    const AffinePlanes planes = seated(codes, scales, biases, seat);
+    const AffinePlanes planes{codes, scales, biases};
     const int n0 = blockIdx.y * BN;
     const int tid = threadIdx.x, l = lane(), wave = tid / kWave;
     const int wm = wave / WN, wn = wave % WN;
@@ -872,10 +871,10 @@ template <class T, class F, int kBits, int kOffset, int kGroup, int BM>
 __global__ __launch_bounds__(kGemmThreads) void matmul_affine_gemm(
     const T* __restrict__ act, const u8* __restrict__ codes, const u8* __restrict__ scales,
     const u8* __restrict__ biases, T* __restrict__ out, float* __restrict__ part, int per, int m, int n, int k,
-    const AffineSeat* __restrict__ seat, const u32* __restrict__ win) {
+    const u32* __restrict__ win) {
     const int rows = win == nullptr ? m : min(m, static_cast<int>(win[0]));
     if (static_cast<int>(blockIdx.x) * BM >= rows) return;
-    AffineRows<T, F, kBits, kOffset, kGroup> stage(seated(codes, scales, biases, seat), n, k);
+    AffineRows<T, F, kBits, kOffset, kGroup> stage(AffinePlanes{codes, scales, biases}, n, k);
     affine_gemm<T, BM>(act, out, part, per, rows, n, k, stage);
 }
 
@@ -921,8 +920,7 @@ __global__ void scale_rows(T* __restrict__ buf, const T* __restrict__ l, int wid
 //
 // Packed expert banks (mxfp4, MLX affine) for the routed matmul. The decode
 // legs stream (linear/moe_kit.hip); the grouped legs take routes ordered by
-// expert from `moe_route_order`. A seat's `bases`, when given, names the
-// planes in place of the resident ones; `group_hits` counts the routes read.
+// expert from `moe_route_order`.
 
 #include "linear/moe_kit.hip"
 
@@ -1096,9 +1094,8 @@ __global__ __launch_bounds__(256) void moe_route_span_scatter(const i32* __restr
 template <class C, class T, class F>
 __device__ __forceinline__ void select_stream(const T* __restrict__ act, const i32* __restrict__ routes,
                                               T* __restrict__ out, int top_k, int act_div, int n, int k,
-                                              unsigned int* __restrict__ group_hits, int rows_per_wave,
-                                              const u32* __restrict__ win, unsigned int* __restrict__ expert_hits,
-                                              F&& planes) {
+                                              int rows_per_wave, const u32* __restrict__ win,
+                                              unsigned int* __restrict__ expert_hits, F&& planes) {
     extern __shared__ __align__(16) unsigned char stream_smem[];
     const int route = blockIdx.x;
     if (win != nullptr && route >= static_cast<int>(win[0]) * top_k) return;
@@ -1109,7 +1106,6 @@ __device__ __forceinline__ void select_stream(const T* __restrict__ act, const i
         stream_zero(y, n, rows_per_wave);
         return;
     }
-    if (group_hits != nullptr && blockIdx.y == 0 && threadIdx.x == 0) atomicAdd(group_hits, 1u);
     if (blockIdx.y == 0 && threadIdx.x == 0) expert_note(expert_hits, expert, 1u);
     const T* bias = nullptr;
     const typename C::Planes p = planes(expert, bias);
@@ -1120,17 +1116,15 @@ template <class T>
 __global__ __launch_bounds__(256) void moe_matmul_select_mxfp4(
     const T* __restrict__ act, const i32* __restrict__ routes, const u8* __restrict__ codes,
     const u8* __restrict__ scales, const T* __restrict__ bias, T* __restrict__ out, int top_k, int act_div, int n,
-    int k, const MoeGroupBases* __restrict__ bases, unsigned int* __restrict__ group_hits, int rows_per_wave,
-    const u32* __restrict__ win, const u64* __restrict__ expert_table, unsigned int* __restrict__ expert_hits) {
+    int k, int rows_per_wave, const u32* __restrict__ win, const u64* __restrict__ expert_table,
+    unsigned int* __restrict__ expert_hits) {
     select_stream<StreamMxfp4<T>, T>(
-        act, routes, out, top_k, act_div, n, k, group_hits, rows_per_wave, win, expert_hits,
+        act, routes, out, top_k, act_div, n, k, rows_per_wave, win, expert_hits,
         [&](int e, const T*& b) {
-            const u8* c = bases != nullptr ? bases->codes : codes;
-            const u8* s = bases != nullptr ? bases->scales : scales;
             const long long rows = 1LL * n;
             if (bias != nullptr) b = expert_plane(bias, rows, expert_table, 3, 2, e);
-            return typename StreamMxfp4<T>::Planes{expert_plane(c, rows * (k / 2), expert_table, 3, 0, e),
-                                                   expert_plane(s, rows * (k / 32), expert_table, 3, 1, e)};
+            return typename StreamMxfp4<T>::Planes{expert_plane(codes, rows * (k / 2), expert_table, 3, 0, e),
+                                                   expert_plane(scales, rows * (k / 32), expert_table, 3, 1, e)};
         });
 }
 
@@ -1138,21 +1132,18 @@ template <class T, int BITS, int GROUP>
 __global__ __launch_bounds__(256) void moe_matmul_select_mlxu4(
     const T* __restrict__ act, const i32* __restrict__ routes, const u8* __restrict__ codes,
     const u8* __restrict__ scales, const u8* __restrict__ biases, T* __restrict__ out, int top_k, int act_div, int n,
-    int k, const MoeGroupBases* __restrict__ bases, unsigned int* __restrict__ group_hits, int rows_per_wave,
-    const u32* __restrict__ win, const u64* __restrict__ expert_table, unsigned int* __restrict__ expert_hits) {
+    int k, int rows_per_wave, const u32* __restrict__ win, const u64* __restrict__ expert_table,
+    unsigned int* __restrict__ expert_hits) {
     using C = StreamAffine<T, BITS, GROUP>;
-    select_stream<C, T>(act, routes, out, top_k, act_div, n, k, group_hits, rows_per_wave, win, expert_hits,
+    select_stream<C, T>(act, routes, out, top_k, act_div, n, k, rows_per_wave, win, expert_hits,
                         [&](int e, const T*&) {
-                            const u8* c = bases != nullptr ? bases->codes : codes;
-                            const u8* s = bases != nullptr ? bases->scales : scales;
-                            const u8* b = bases != nullptr ? bases->biases : biases;
                             const long long rows = 1LL * n;
                             const long long factors = rows * (k / GROUP);
                             return typename C::Planes{
-                                expert_plane(reinterpret_cast<const u32*>(c), rows * (k * BITS / 32), expert_table, 3,
+                                expert_plane(reinterpret_cast<const u32*>(codes), rows * (k * BITS / 32), expert_table, 3,
                                              0, e),
-                                expert_plane(reinterpret_cast<const bf16*>(s), factors, expert_table, 3, 1, e),
-                                expert_plane(reinterpret_cast<const bf16*>(b), factors, expert_table, 3, 2, e)};
+                                expert_plane(reinterpret_cast<const bf16*>(scales), factors, expert_table, 3, 1, e),
+                                expert_plane(reinterpret_cast<const bf16*>(biases), factors, expert_table, 3, 2, e)};
                         });
 }
 
@@ -1164,19 +1155,15 @@ __global__ __launch_bounds__(kGroupWaves<MT>* kWave) void moe_matmul_select_mxfp
     const bf16* __restrict__ act, const i32* __restrict__ order, const i32* __restrict__ offsets,
     const i32* __restrict__ work, const u8* __restrict__ codes, const u8* __restrict__ scales,
     const bf16* __restrict__ bias, bf16* __restrict__ out, int act_div, int n, int k, int num_experts,
-    const MoeGroupBases* __restrict__ bases, unsigned int* __restrict__ group_hits, const u64* __restrict__ expert_table, unsigned int* __restrict__ expert_hits) {
+    const u64* __restrict__ expert_table, unsigned int* __restrict__ expert_hits) {
     GroupItem item;
     if (!group_item(offsets, work, num_experts, MT, item)) return;
-    if (group_hits != nullptr && blockIdx.y == 0 && threadIdx.x == 0)
-        atomicAdd(group_hits, static_cast<unsigned>(item.count));
     if (blockIdx.y == 0 && threadIdx.x == 0) expert_note(expert_hits, item.expert, item.count);
-    const u8* c = bases != nullptr ? bases->codes : codes;
-    const u8* s = bases != nullptr ? bases->scales : scales;
     const long long rows = 1LL * n;
     const int e = item.expert;
     grouped_tile<GroupMxfp4, bf16, MT>(act, order, item.begin, item.count,
-                                       {expert_plane(c, rows * (k / 2), expert_table, 3, 0, e),
-                                        expert_plane(s, rows * (k / 32), expert_table, 3, 1, e)},
+                                       {expert_plane(codes, rows * (k / 2), expert_table, 3, 0, e),
+                                        expert_plane(scales, rows * (k / 32), expert_table, 3, 1, e)},
                                        bias != nullptr ? expert_plane(bias, rows, expert_table, 3, 2, e) : nullptr, out,
                                        act_div, n, k);
 }
@@ -1186,23 +1173,18 @@ __global__ __launch_bounds__(kGroupWaves<MT>* kWave) void moe_matmul_select_mlxu
     const bf16* __restrict__ act, const i32* __restrict__ order, const i32* __restrict__ offsets,
     const i32* __restrict__ work, const u8* __restrict__ codes, const u8* __restrict__ scales,
     const u8* __restrict__ biases, bf16* __restrict__ out, int act_div, int n, int k, int num_experts,
-    const MoeGroupBases* __restrict__ bases, unsigned int* __restrict__ group_hits, const u64* __restrict__ expert_table, unsigned int* __restrict__ expert_hits) {
+    const u64* __restrict__ expert_table, unsigned int* __restrict__ expert_hits) {
     GroupItem item;
     if (!group_item(offsets, work, num_experts, MT, item)) return;
-    if (group_hits != nullptr && blockIdx.y == 0 && threadIdx.x == 0)
-        atomicAdd(group_hits, static_cast<unsigned>(item.count));
     if (blockIdx.y == 0 && threadIdx.x == 0) expert_note(expert_hits, item.expert, item.count);
-    const u8* c = bases != nullptr ? bases->codes : codes;
-    const u8* s = bases != nullptr ? bases->scales : scales;
-    const u8* b = bases != nullptr ? bases->biases : biases;
     const long long rows = 1LL * n;
     const long long factors = rows * (k / GROUP);
     const int e = item.expert;
     grouped_tile<GroupAffine<BITS, GROUP>, bf16, MT>(
         act, order, item.begin, item.count,
-        {expert_plane(reinterpret_cast<const u32*>(c), rows * (k * BITS / 32), expert_table, 3, 0, e),
-         expert_plane(reinterpret_cast<const bf16*>(s), factors, expert_table, 3, 1, e),
-         expert_plane(reinterpret_cast<const bf16*>(b), factors, expert_table, 3, 2, e)},
+        {expert_plane(reinterpret_cast<const u32*>(codes), rows * (k * BITS / 32), expert_table, 3, 0, e),
+         expert_plane(reinterpret_cast<const bf16*>(scales), factors, expert_table, 3, 1, e),
+         expert_plane(reinterpret_cast<const bf16*>(biases), factors, expert_table, 3, 2, e)},
         nullptr, out, act_div, n, k);
 }
 
@@ -1217,19 +1199,15 @@ __global__ __launch_bounds__(256) void moe_matmul_select_mxfp4_batch(
     const bf16* __restrict__ act, const i32* __restrict__ order, const i32* __restrict__ offsets,
     const i32* __restrict__ work, const u8* __restrict__ codes, const u8* __restrict__ scales,
     const bf16* __restrict__ bias, bf16* __restrict__ out, int act_div, int n, int k, int num_experts,
-    const MoeGroupBases* __restrict__ bases, unsigned int* __restrict__ group_hits, const u64* __restrict__ expert_table, unsigned int* __restrict__ expert_hits) {
+    const u64* __restrict__ expert_table, unsigned int* __restrict__ expert_hits) {
     GroupItem item;
     if (!group_item(offsets, work, num_experts, MT, item)) return;
-    if (group_hits != nullptr && blockIdx.y == 0 && threadIdx.x == 0)
-        atomicAdd(group_hits, static_cast<unsigned>(item.count));
     if (blockIdx.y == 0 && threadIdx.x == 0) expert_note(expert_hits, item.expert, item.count);
-    const u8* c = bases != nullptr ? bases->codes : codes;
-    const u8* s = bases != nullptr ? bases->scales : scales;
     const long long rows = 1LL * n;
     const int e = item.expert;
     batch_tile<BatchMxfp4<MT == 32 ? 64 : 128>, bf16, MT, NBW, kBatchDepth>(
         act, order, item.begin, item.count,
-        {expert_plane(c, rows * (k / 2), expert_table, 3, 0, e), expert_plane(s, rows * (k / 32), expert_table, 3, 1, e)},
+        {expert_plane(codes, rows * (k / 2), expert_table, 3, 0, e), expert_plane(scales, rows * (k / 32), expert_table, 3, 1, e)},
         bias != nullptr ? expert_plane(bias, rows, expert_table, 3, 2, e) : nullptr, out, act_div, n, k, blockIdx.y);
 }
 
@@ -1238,25 +1216,20 @@ __global__ __launch_bounds__(256) void moe_matmul_select_mlxu4_batch(
     const bf16* __restrict__ act, const i32* __restrict__ order, const i32* __restrict__ offsets,
     const i32* __restrict__ work, const u8* __restrict__ codes, const u8* __restrict__ scales,
     const u8* __restrict__ biases, bf16* __restrict__ out, int act_div, int n, int k, int num_experts,
-    const MoeGroupBases* __restrict__ bases, unsigned int* __restrict__ group_hits, const u64* __restrict__ expert_table, unsigned int* __restrict__ expert_hits) {
+    const u64* __restrict__ expert_table, unsigned int* __restrict__ expert_hits) {
     static_assert(BITS == 4, "the batch leg reads four-bit codes");
     constexpr int ROW_BYTES = MT < 32 || GROUP == 128 ? 128 : 64;
     GroupItem item;
     if (!group_item(offsets, work, num_experts, MT, item)) return;
-    if (group_hits != nullptr && blockIdx.y == 0 && threadIdx.x == 0)
-        atomicAdd(group_hits, static_cast<unsigned>(item.count));
     if (blockIdx.y == 0 && threadIdx.x == 0) expert_note(expert_hits, item.expert, item.count);
-    const u8* c = bases != nullptr ? bases->codes : codes;
-    const u8* s = bases != nullptr ? bases->scales : scales;
-    const u8* b = bases != nullptr ? bases->biases : biases;
     const long long rows = 1LL * n;
     const long long factors = rows * (k / GROUP);
     const int e = item.expert;
     batch_tile<BatchAffine<GROUP, ROW_BYTES>, bf16, MT, NBW, kBatchDepth>(
         act, order, item.begin, item.count,
-        {expert_plane(reinterpret_cast<const u32*>(c), rows * (k / 8), expert_table, 3, 0, e),
-         expert_plane(reinterpret_cast<const bf16*>(s), factors, expert_table, 3, 1, e),
-         expert_plane(reinterpret_cast<const bf16*>(b), factors, expert_table, 3, 2, e)},
+        {expert_plane(reinterpret_cast<const u32*>(codes), rows * (k / 8), expert_table, 3, 0, e),
+         expert_plane(reinterpret_cast<const bf16*>(scales), factors, expert_table, 3, 1, e),
+         expert_plane(reinterpret_cast<const bf16*>(biases), factors, expert_table, 3, 2, e)},
         nullptr, out, act_div, n, k, blockIdx.y);
 }
 
@@ -1327,19 +1300,16 @@ template <class T>
 __global__ __launch_bounds__(256) void moe_matmul_select_mxfp4_grouped(
     const T* __restrict__ act, const i32* __restrict__ order, const i32* __restrict__ offsets,
     const u8* __restrict__ codes, const u8* __restrict__ scales, const T* __restrict__ bias, T* __restrict__ out,
-    int act_div, int n, int k, int num_experts, const MoeGroupBases* __restrict__ bases,
-    unsigned int* __restrict__ group_hits, const u64* __restrict__ expert_table, unsigned int* __restrict__ expert_hits) {
+    int act_div, int n, int k, int num_experts, const u64* __restrict__ expert_table,
+    unsigned int* __restrict__ expert_hits) {
     const int expert = blockIdx.x;
     if (expert >= num_experts || static_cast<int>(blockIdx.y) * kSimtTileN >= n) return;
     const int begin = offsets[expert], end = offsets[expert + 1];
     if (begin >= end) return;
-    if (group_hits != nullptr && blockIdx.y == 0 && threadIdx.x == 0)
-        atomicAdd(group_hits, static_cast<unsigned>(end - begin));
     if (blockIdx.y == 0 && threadIdx.x == 0) expert_note(expert_hits, expert, static_cast<unsigned>(end - begin));
     const long long rows = 1LL * n;
-    const u32* w32 = reinterpret_cast<const u32*>(
-        expert_plane(bases != nullptr ? bases->codes : codes, rows * (k / 2), expert_table, 3, 0, expert));
-    const u8* s8 = expert_plane(bases != nullptr ? bases->scales : scales, rows * (k / 32), expert_table, 3, 1, expert);
+    const u32* w32 = reinterpret_cast<const u32*>(expert_plane(codes, rows * (k / 2), expert_table, 3, 0, expert));
+    const u8* s8 = expert_plane(scales, rows * (k / 32), expert_table, 3, 1, expert);
     grouped_simt<T>(act, order, begin, end,
                     bias != nullptr ? expert_plane(bias, rows, expert_table, 3, 2, expert) : nullptr, out, act_div, n,
                     k,
@@ -1355,23 +1325,19 @@ template <class T, int BITS, int GROUP>
 __global__ __launch_bounds__(256) void moe_matmul_select_mlxu4_grouped(
     const T* __restrict__ act, const i32* __restrict__ order, const i32* __restrict__ offsets,
     const u8* __restrict__ codes, const u8* __restrict__ scales, const u8* __restrict__ biases, T* __restrict__ out,
-    int act_div, int n, int k, int num_experts, const MoeGroupBases* __restrict__ bases,
-    unsigned int* __restrict__ group_hits, const u64* __restrict__ expert_table, unsigned int* __restrict__ expert_hits) {
+    int act_div, int n, int k, int num_experts, const u64* __restrict__ expert_table,
+    unsigned int* __restrict__ expert_hits) {
     const int expert = blockIdx.x;
     if (expert >= num_experts || static_cast<int>(blockIdx.y) * kSimtTileN >= n) return;
     const int begin = offsets[expert], end = offsets[expert + 1];
     if (begin >= end) return;
-    if (group_hits != nullptr && blockIdx.y == 0 && threadIdx.x == 0)
-        atomicAdd(group_hits, static_cast<unsigned>(end - begin));
     if (blockIdx.y == 0 && threadIdx.x == 0) expert_note(expert_hits, expert, static_cast<unsigned>(end - begin));
     const long long rows = 1LL * n;
     const long long factors = rows * (k / GROUP);
-    const u32* w32 = expert_plane(reinterpret_cast<const u32*>(bases != nullptr ? bases->codes : codes),
-                                  rows * (k * BITS / 32), expert_table, 3, 0, expert);
-    const bf16* s16 = expert_plane(reinterpret_cast<const bf16*>(bases != nullptr ? bases->scales : scales), factors,
-                                   expert_table, 3, 1, expert);
-    const bf16* b16 = expert_plane(reinterpret_cast<const bf16*>(bases != nullptr ? bases->biases : biases), factors,
-                                   expert_table, 3, 2, expert);
+    const u32* w32 =
+        expert_plane(reinterpret_cast<const u32*>(codes), rows * (k * BITS / 32), expert_table, 3, 0, expert);
+    const bf16* s16 = expert_plane(reinterpret_cast<const bf16*>(scales), factors, expert_table, 3, 1, expert);
+    const bf16* b16 = expert_plane(reinterpret_cast<const bf16*>(biases), factors, expert_table, 3, 2, expert);
     grouped_simt<T>(act, order, begin, end, nullptr, out, act_div, n, k, [&](int row, int kk, float* w) {
         const long long f = static_cast<long long>(row) * (k / GROUP) + kk / GROUP;
         const float sv = to_f32(s16[f]), bv = to_f32(b16[f]);

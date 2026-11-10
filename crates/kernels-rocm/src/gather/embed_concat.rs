@@ -60,7 +60,6 @@ pub fn embed_concat(
     )
 }
 
-#[allow(clippy::too_many_arguments)]
 pub fn embed_concat_mlxu4(
     ctx: &Ctx,
     ids: Tensor,
@@ -68,7 +67,6 @@ pub fn embed_concat_mlxu4(
     scales: Tensor,
     biases: Option<Tensor>,
     vocab: u32,
-    seat: crate::linear::moe::GroupSeat,
     y: &mut Tensor,
 ) -> Result<(), Error> {
     const OP: &str = "gather.embed";
@@ -132,14 +130,11 @@ pub fn embed_concat_mlxu4(
             stated(OP, group)?.arg(),
             stated(OP, vocab)?.arg(),
             stated(OP, 0u32)?.arg(),
-            crate::jit::ArgValue::Ptr(seat.cell),
-            crate::jit::ArgValue::Ptr(seat.hits),
             ctx.stage(),
         ],
     )
 }
 
-#[allow(clippy::too_many_arguments)]
 pub fn embed_mlx_affine(
     ctx: &Ctx,
     ids: Tensor,
@@ -147,7 +142,6 @@ pub fn embed_mlx_affine(
     scales: Tensor,
     biases: Option<Tensor>,
     vocab: u32,
-    seat: crate::linear::moe::GroupSeat,
     y: &mut Tensor,
 ) -> Result<(), Error> {
     const OP: &str = "gather.embed";
@@ -218,8 +212,6 @@ pub fn embed_mlx_affine(
             stated(OP, group)?.arg(),
             stated(OP, band)?.arg(),
             stated(OP, offset)?.arg(),
-            crate::jit::ArgValue::Ptr(seat.cell),
-            crate::jit::ArgValue::Ptr(seat.hits),
             ctx.stage(),
         ],
     )

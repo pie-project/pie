@@ -129,15 +129,6 @@ __device__ __forceinline__ b128 fp4_shuffle(b128 x) {
              __builtin_amdgcn_perm(x.w[1], x.w[0], 0x07060302u), __builtin_amdgcn_perm(x.w[3], x.w[2], 0x07060302u)}};
 }
 
-// The pointers a packed bank's seat names when its experts stream from a
-// group buffer instead of the resident planes.
-struct alignas(16) MoeGroupBases {
-    const u8* codes;
-    const u8* scales;
-    const u8* biases;
-    const u8* pad;
-};
-
 // ------------------------------------------------------------ stream ----
 
 constexpr int kStreamWaves = 4;

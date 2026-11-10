@@ -103,27 +103,11 @@ constexpr int kOffPreInt = 1;
 constexpr int kOffPreReal = 2;
 constexpr int kOffPreConst = 3;
 
-// Where a streaming tier seated a projection's planes this step: the fire
-// binds the slot, the tier fills it before the step runs.
-struct alignas(16) AffineSeat {
-    const u8* codes;
-    const u8* scales;
-    const u8* biases;
-    const u8* pad;
-};
-
 struct AffinePlanes {
     const u8* codes;
     const u8* scales;
     const u8* biases;
 };
-
-__device__ __forceinline__ AffinePlanes seated(const u8* codes, const u8* scales, const u8* biases,
-                                               const AffineSeat* seat) {
-    if (seat == nullptr) return {codes, scales, biases};
-    const AffineSeat at = *seat;
-    return {at.codes, at.scales, at.biases};
-}
 
 // One group's factor pair: the scale and the offset as the format states it.
 struct Factor {

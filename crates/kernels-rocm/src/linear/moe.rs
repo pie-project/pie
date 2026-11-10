@@ -539,21 +539,6 @@ impl RowTable {
     }
 }
 
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub struct GroupSeat {
-    pub cell: u64,
-    pub hits: u64,
-}
-
-impl GroupSeat {
-    pub const RESIDENT: GroupSeat = GroupSeat { cell: 0, hits: 0 };
-
-    #[must_use]
-    pub const fn streams(&self) -> bool {
-        self.cell != 0
-    }
-}
-
 pub fn matmul_select(
     ctx: &Ctx,
     x: Tensor,
@@ -605,7 +590,6 @@ pub fn matmul_select(
             count,
             mt,
             nbw,
-            None,
             &[
                 ArgValue::Ptr(0),
                 ArgValue::Ptr(0),
@@ -802,9 +786,8 @@ fn batch_items(ctx: &Ctx, fan: &Selected, experts: u32, widest: u32, until: u32)
 
 /// A batch fire: routes ordered by expert into `mt`-route items, then one
 /// item a block row against 64·nbw weight rows a block. `planes` are
-/// the bank's arguments, between the work list and the result; a packed
-/// bank's seat follows the extents, and `tail` (ending in the expert table
-/// and its counter) the seat.
+/// the bank's arguments, between the work list and the result, and `tail`
+/// (ending in the expert table and its counter) follows the extents.
 #[allow(clippy::too_many_arguments)]
 fn select_batch(
     ctx: &Ctx,
@@ -819,7 +802,6 @@ fn select_batch(
     experts: u32,
     mt: u32,
     nbw: u32,
-    seat: Option<GroupSeat>,
     tail: &[ArgValue],
 ) -> Result<(), Error> {
     let k = stated(op, x.width)?;
@@ -840,9 +822,6 @@ fn select_batch(
         k.arg(),
         stated(op, experts)?.arg(),
     ]);
-    if let Some(seat) = seat {
-        args.extend([ArgValue::Ptr(seat.cell), ArgValue::Ptr(seat.hits)]);
-    }
     args.extend_from_slice(tail);
     ctx.fire(
         op,
@@ -2084,7 +2063,6 @@ fn matmul_select_mxfp4(
     bias: Option<Tensor>,
     routes: Tensor,
     y: &mut Tensor,
-    seat: GroupSeat,
     table: ExpertTable,
 ) -> Result<(), Error> {
     const MXFP4_BLOCK: u32 = 32;
@@ -2142,7 +2120,6 @@ fn matmul_select_mxfp4(
             experts,
             mt,
             BATCH_NBW,
-            Some(seat),
             &table.args(),
         );
     }
@@ -2177,8 +2154,6 @@ fn matmul_select_mxfp4(
             n.arg(),
             k.arg(),
             stated(op, experts)?.arg(),
-            ArgValue::Ptr(seat.cell),
-            ArgValue::Ptr(seat.hits),
             ArgValue::Ptr(table.table),
             ArgValue::Ptr(table.hits),
         ]);
@@ -2224,8 +2199,6 @@ fn matmul_select_mxfp4(
             act_div.arg(),
             n.arg(),
             k.arg(),
-            ArgValue::Ptr(seat.cell),
-            ArgValue::Ptr(seat.hits),
             rows.arg(),
             ctx.stage(),
             ArgValue::Ptr(table.table),
@@ -2398,22 +2371,10 @@ pub fn matmul_select_bias(
     bias: Tensor,
     routes: Tensor,
     y: &mut Tensor,
-    seat: GroupSeat,
     table: ExpertTable,
 ) -> Result<(), Error> {
     const OP: &str = "linear.moe_select";
-    matmul_select_mxfp4(
-        ctx,
-        OP,
-        x,
-        codes,
-        scales,
-        Some(bias),
-        routes,
-        y,
-        seat,
-        table,
-    )
+    matmul_select_mxfp4(ctx, OP, x, codes, scales, Some(bias), routes, y, table)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -2425,7 +2386,6 @@ pub fn matmul_select_quant(
     biases: Option<Tensor>,
     routes: Tensor,
     y: &mut Tensor,
-    seat: GroupSeat,
     table: ExpertTable,
 ) -> Result<(), Error> {
     const OP: &str = "linear.moe_select";
@@ -2438,10 +2398,8 @@ pub fn matmul_select_quant(
         ));
     }
     match biases {
-        None => matmul_select_mxfp4(ctx, OP, x, codes, scales, None, routes, y, seat, table),
-        Some(biases) => {
-            matmul_select_mlxu4(ctx, OP, x, codes, scales, biases, routes, y, seat, table)
-        }
+        None => matmul_select_mxfp4(ctx, OP, x, codes, scales, None, routes, y, table),
+        Some(biases) => matmul_select_mlxu4(ctx, OP, x, codes, scales, biases, routes, y, table),
     }
 }
 
@@ -2461,7 +2419,6 @@ pub fn fp8_tiles(x: Tensor, codes: Tensor, scales: Tensor, y: &Tensor) -> bool {
 /// batches items of the least of 16, 32 and 64 routes holding what an expert
 /// averages; past 64 routes an expert the prefill tile, items of 128 against
 /// 256 weight rows. An expert past its item takes another.
-#[allow(clippy::too_many_arguments)]
 pub fn matmul_select_fp8_mfma(
     ctx: &Ctx,
     x: Tensor,
@@ -2469,14 +2426,13 @@ pub fn matmul_select_fp8_mfma(
     scales: Tensor,
     routes: Tensor,
     y: &mut Tensor,
-    seat: GroupSeat,
     table: ExpertTable,
 ) -> Result<(), Error> {
     const OP: &str = "linear.moe_select";
     dtype_dispatch!(OP, x.dtype, { Bf16 => () });
     let (q, act_scales) = crate::linear::act_quant::quantized_codes(ctx, OP, x, 128, false, 1)?;
     located_only(OP, table, "an fp8 bank's select")?;
-    matmul_select_fp8_quantized(ctx, x, q, act_scales, codes, scales, routes, y, seat, table)
+    matmul_select_fp8_quantized(ctx, x, q, act_scales, codes, scales, routes, y, table)
 }
 
 /// `matmul_select_fp8_mfma` over rows already quantized (`q`, `act_scales`
@@ -2491,7 +2447,6 @@ pub fn matmul_select_fp8_quantized(
     scales: Tensor,
     routes: Tensor,
     y: &mut Tensor,
-    seat: GroupSeat,
     table: ExpertTable,
 ) -> Result<(), Error> {
     const OP: &str = "linear.moe_select";
@@ -2572,8 +2527,6 @@ pub fn matmul_select_fp8_quantized(
         nn.arg(),
         kk.arg(),
         stated(op, experts)?.arg(),
-        ArgValue::Ptr(seat.cell),
-        ArgValue::Ptr(seat.hits),
         ArgValue::Ptr(table.table),
         ArgValue::Ptr(table.hits),
     ]);
@@ -2597,7 +2550,6 @@ fn matmul_select_mlxu4(
     biases: Tensor,
     routes: Tensor,
     y: &mut Tensor,
-    seat: GroupSeat,
     table: ExpertTable,
 ) -> Result<(), Error> {
     const UNIT: u32 = 32;
@@ -2687,7 +2639,6 @@ fn matmul_select_mlxu4(
             experts,
             mt,
             BATCH_NBW,
-            Some(seat),
             &table.args(),
         );
     }
@@ -2724,8 +2675,6 @@ fn matmul_select_mlxu4(
             n.arg(),
             k.arg(),
             stated(op, experts)?.arg(),
-            ArgValue::Ptr(seat.cell),
-            ArgValue::Ptr(seat.hits),
             ArgValue::Ptr(table.table),
             ArgValue::Ptr(table.hits),
         ]);
@@ -2770,8 +2719,6 @@ fn matmul_select_mlxu4(
             act_div.arg(),
             n.arg(),
             k.arg(),
-            ArgValue::Ptr(seat.cell),
-            ArgValue::Ptr(seat.hits),
             rows.arg(),
             ctx.stage(),
             ArgValue::Ptr(table.table),

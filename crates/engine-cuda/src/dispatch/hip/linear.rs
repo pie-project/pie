@@ -1,7 +1,6 @@
 use kernels_cuda::Tensor;
 use kernels_cuda::linear;
 use kernels_cuda::linear::affine::OffsetKind;
-use kernels_cuda::linear::moe::GroupSeat;
 use poem_exec::{DispatchLinear, KernelError};
 use poem_ir::{Dtype, Fused, Linear, Operands, ValueId};
 
@@ -290,15 +289,7 @@ impl Run<'_> {
                     } else {
                         linear::affine::tiled::matmul_gemv
                     };
-                    entry(
-                        self.ctx(),
-                        act,
-                        codes,
-                        scales,
-                        biases,
-                        &mut self.tensor(*y),
-                        GroupSeat::RESIDENT,
-                    )
+                    entry(self.ctx(), act, codes, scales, biases, &mut self.tensor(*y))
                 }
                 None => self.row_major_matmul(act, w, y),
             },
@@ -321,15 +312,7 @@ impl Run<'_> {
                     } else {
                         linear::affine::tiled::lm_head_gemv
                     };
-                    entry(
-                        self.ctx(),
-                        act,
-                        codes,
-                        scales,
-                        biases,
-                        &mut self.tensor(*y),
-                        GroupSeat::RESIDENT,
-                    )
+                    entry(self.ctx(), act, codes, scales, biases, &mut self.tensor(*y))
                 }
                 None => self.row_major_lm_head(act, w, y),
             },
@@ -917,7 +900,6 @@ impl Run<'_> {
                     self.tensor(*bias),
                     self.tensor(*routes),
                     &mut self.tensor(*y),
-                    GroupSeat::RESIDENT,
                     // The engine streams no experts on ROCm yet.
                     linear::moe::ExpertTable::RESIDENT,
                 )
@@ -1032,7 +1014,6 @@ impl Run<'_> {
             biases,
             routes,
             &mut self.tensor(y),
-            GroupSeat::RESIDENT,
             linear::moe::ExpertTable::RESIDENT,
         )
     }
@@ -1115,7 +1096,6 @@ impl Run<'_> {
             scales,
             routes,
             &mut self.tensor(y),
-            GroupSeat::RESIDENT,
             linear::moe::ExpertTable::RESIDENT,
         )
     }
@@ -1222,7 +1202,6 @@ impl Run<'_> {
                     biases,
                     Dtype::Bf16,
                     &mut self.tensor(*y),
-                    GroupSeat::RESIDENT,
                 )
             }
             None => linear::gemm::matmul(
@@ -1258,7 +1237,6 @@ impl Run<'_> {
                     biases,
                     Dtype::Bf16,
                     &mut self.tensor(*y),
-                    GroupSeat::RESIDENT,
                 )
             }
             None => {
