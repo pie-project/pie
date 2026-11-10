@@ -122,11 +122,17 @@ fn mimo_v2(path: &str, _row: &CacheRow) -> String {
 }
 
 fn muse_glimmer(path: &str, _row: &CacheRow) -> String {
-    path.to_string()
+    match parts(path)[..] {
+        ["layers", l, "kv"] => format!("kv.{l}"),
+        _ => path.to_string(),
+    }
 }
 
 fn muse_spark(path: &str, _row: &CacheRow) -> String {
-    path.to_string()
+    match parts(path)[..] {
+        ["layers", l, "kv"] => format!("kv.{l}"),
+        _ => path.to_string(),
+    }
 }
 
 fn qwen3_asr(path: &str, _row: &CacheRow) -> String {
@@ -174,6 +180,9 @@ fn kept_whole(package: &str, name: &str) -> bool {
     match (package, &parts(name)[..]) {
         // Inkling's local layers read their kv through the local window.
         ("inkling", ["kv", _]) => true,
+        // Muse Glimmer's and Muse Spark's sliding layers read their kv
+        // through their window.
+        ("muse_glimmer" | "muse_spark", ["kv", _]) => true,
         // A DFlash block read through a window.
         ("qwen_3" | "gemma_4", ["kv", "dflash", _]) => true,
         _ => false,
