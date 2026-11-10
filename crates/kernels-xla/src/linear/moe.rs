@@ -2551,7 +2551,7 @@ pub fn experts(
     // v6e, Qwen3.6-35B-A3B's 557-token Raw prompt 3% slower through the
     // blocks.)
     if tuning.moe_segment_tokens > 0
-        && t >= 8 * tuning.moe_segment_tokens
+        && t >= tuning.moe_segment_from
         && let Some(y) = segment_sum(f, &sorted, up, up_fan, down_rows, r, valid, tuning)?
     {
         return Ok(Some(y));
