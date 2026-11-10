@@ -174,8 +174,23 @@ impl Cuda {
         let contract = (self.contract_for)(trace, path).map_err(Error::Load)?;
         let prospect =
             crate::weights::prospect(trace, &contract, path, self.target()).map_err(fault)?;
+        // The weight cache streams the dense routed banks an expert at a
+        // time: the plan seats none itself, and `device_weight_budget` only
+        // says which dense planes leave the device. (The HIP build states no
+        // expert shape yet, and its plan still seats them.)
+        let diagnostics = &self.boot.knobs.diagnostics;
+        let cached = if diagnostics.dense_weights || diagnostics.dense_experts {
+            Vec::new()
+        } else {
+            crate::store::layout::streamed_experts(trace)
+        };
+        let ranking = if cfg!(feature = "rocm") {
+            prospect.ranking.clone()
+        } else {
+            prospect.ranking.clone().caching(&cached)
+        };
         let plan = crate::experts::Plan::cut(
-            &prospect.ranking,
+            &ranking,
             crate::experts::Budgets {
                 device: residency.device_weight_budget,
                 host: residency.host_weight_budget,
