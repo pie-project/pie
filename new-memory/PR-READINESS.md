@@ -13,7 +13,7 @@ Branch today: 432 commits ahead of main, 782 files, +86k / -13k. Main merged in 
 | A6 | XLA: Mosaic page copy / flash / kv append on the pool; speed vs main; MoE result varies with pool chunk count (CUDA plugin) | TPU | in progress |
 | A7 | XLA weight streaming + snapshots (sc/xla2, partial) | TPU | queued |
 | A8 | Cerebras wafer `Spatial` engine still states degenerate facts (owner's unmerged branch) | Cerebras owner | blocked |
-| A10 | Delete device/host weight budgets, dense rotor, dense host tier; max_state_slots out of backend options | L40S (+Metal/Vulkan owners) | assigned |
+| A10 | Delete device/host weight budgets, dense rotor, dense host tier; max_state_slots | L40S, Metal, VK5 | done M76 (dead legacy tier cleanup left) |
 | A9 | dsv41 two-window mini cannot fire on sm_89/sm_120 (fused.lse_sink kernel gap) -> two-window CUDA unverified | L40S | queued |
 
 ## B. Decide before the PR (user)

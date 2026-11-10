@@ -977,3 +977,17 @@ The `new-memory/` directory is bookkeeping and is removed before anything lands 
   kernels-xla (pushed briefly as 68a2b38a3): #1604's new `flash::readouts` calls `older()` without the M63 page maps.
   Fixed by passing `[keys_map, values_map]` through `attend_readouts`. engine-xla 14 / kernels-xla 18 lib tests pass.
   TPU session to verify the readouts path bitwise on v6e.
+
+### M76 — 2026-11-10: dense weights always on device (A10, B2)
+- `sc/l40s-dense-on-device` (0cef5ef5d) + `sc/bmx3-metal` (731361b76, d1187db11): `device_weight_budget`,
+  `host_weight_budget` and `max_state_slots` removed (config/removed.rs refuses each with why; six backend option
+  structs + embedded Settings; bindings / template / Python / tests updated). CUDA rotate.rs and the dense rotor,
+  Budgets, admit tiers deleted; Plan::cut puts every dense plane on the device; refusal up front when weights exceed
+  the share. Vulkan/wgpu dense pump + host ring deleted, same refusal. Metal: budget plumbing gone plus its own
+  unreachable expert tier / gathered-row slab / host source (~3,900 lines); its fit counts streamable weights at the
+  cache floor.
+- Verified: L40S golden_logits / by_refs (8) / rows / offload / experts = base; Vulkan + wgpu logits = base bitwise
+  (VK5, 16 + 14 dumps) and the refusal fires; Mac: weight-cache tests, pie run gemma-4-e4b + Qwen3.6-35B tokens = base;
+  full cargo check matrix after merge.
+- Left (follow-up commit, L40S): engine-cuda's now-unreachable legacy expert tier and Residency.deferred_tier /
+  host_weight_deferred -> delete. tests/handles/e2e.py --slots runs need new sizing.
