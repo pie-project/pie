@@ -159,7 +159,6 @@ fn build_model(
         .into_iter()
         .enumerate()
         .map(|(group, g)| {
-            let backend_kind = g.backend.kind().to_string();
             let disk_kept = kept_disk(m, group, &g);
             runtime::bootstrap::EngineConfig {
                 weights_fit: g.facts.weights_resident,
@@ -179,21 +178,13 @@ fn build_model(
                 window_pages: g.caps.pools.window_pages,
                 window_tokens: g.caps.pools.window_tokens,
                 cpu_pages: g.caps.pools.host_kv_pages as usize,
-                cpu_window_pages: g.caps.pools.host_window_pages,
                 disk_pages: g.caps.pools.disk_kv_pages,
                 disk_kept,
-                kv_copy: g.caps.kv_copy,
-                backend_kind,
-                rs_cache_required: g.caps.pools.state_slots != 0,
                 rs_cache_slots: g.caps.pools.state_slots as usize,
-                one_frame_when_short: g.caps.pools.one_frame_when_short,
                 seated_first: g.caps.pools.seated_first,
                 seat_to_end: g.caps.pools.seat_to_end,
                 seat_spread: g.caps.pools.seat_spread,
                 rs_cache_slot_bytes: g.caps.pools.state_slot_bytes,
-                rs_host_slots: g.caps.pools.host_state_slots as usize,
-                rs_buffer_pages: g.caps.pools.buffer_pages,
-                rs_host_buffer_pages: g.caps.pools.host_buffer_pages,
                 draft_block: g.caps.draft_block,
                 draft_mask_token: g.caps.draft_mask_token,
                 draft_proposals_from: g.caps.draft_proposals_from,
