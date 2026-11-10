@@ -84,47 +84,49 @@ fn wrongs(trace: &Trace, recipe: &ChunkRecipe) -> Vec<String> {
                 bytes,
                 record,
                 pieces_per_ws,
-                pieces,
+                rows,
                 ..
             } => {
                 if *record > c && *bytes < MIN_PIECE {
                     wrong.push(format!("a piece of {bytes} under the least piece"));
                 }
-                let mut covered: BTreeMap<RowId, u64> = BTreeMap::new();
-                let mut ends: BTreeMap<u32, u64> = BTreeMap::new();
-                for piece in pieces {
-                    let atom = recipe.atoms[&piece.row];
-                    let at = covered.entry(piece.row).or_default();
-                    if piece.span.start != *at || piece.span.end > atom.extent {
-                        wrong.push(format!("{:?} spans {:?} after {at}", piece.row, piece.span));
-                    }
-                    *at = piece.span.end;
-                    let cut = piece.span != (0..atom.extent);
-                    if cut
-                        && (piece.span.start % atom.grain != 0
-                            || (piece.span.end != atom.extent && piece.span.end % atom.grain != 0))
+                let mut held: BTreeMap<u32, Vec<(u64, u64)>> = BTreeMap::new();
+                for run in rows {
+                    let atom = recipe.atoms[&run.row];
+                    let pieces = u64::from(run.pieces);
+                    // Equal pieces of whole grains, covering the row, none
+                    // empty, one a slot.
+                    if run.pieces == 0
+                        || pieces * run.atoms_per_piece < atom.extent
+                        || (pieces - 1) * run.atoms_per_piece >= atom.extent
+                        || run.slots.len() != run.pieces as usize
                     {
-                        wrong.push(format!(
-                            "{:?} cut off its grain: {:?}",
-                            piece.row, piece.span
-                        ));
+                        wrong.push(format!("{:?} pieces {run:?} of {atom:?}", run.row));
                     }
-                    if cut && atom.extent == 1 {
-                        wrong.push(format!("{:?} is uncuttable but cut", piece.row));
+                    if run.is_cut() && run.atoms_per_piece % atom.grain != 0 {
+                        wrong.push(format!("{:?} cut off its grain: {run:?}", run.row));
                     }
-                    let end = piece.offset + (piece.span.end - piece.span.start) * atom.bytes;
-                    let last = ends.entry(piece.piece).or_default();
-                    if piece.offset < *last || end > *bytes || piece.piece >= *pieces_per_ws {
+                    if run.is_cut() && atom.extent == 1 {
+                        wrong.push(format!("{:?} is uncuttable but cut", run.row));
+                    }
+                    let end = run.offset + run.piece_bytes(&atom);
+                    if end > *bytes {
                         wrong.push(format!(
                             "{:?} lands at {} past its room",
-                            piece.row, piece.offset
+                            run.row, run.offset
                         ));
                     }
-                    *last = end;
+                    for &slot in &run.slots {
+                        if slot >= *pieces_per_ws {
+                            wrong.push(format!("{:?} in slot {slot} past the record", run.row));
+                        }
+                        held.entry(slot).or_default().push((run.offset, end));
+                    }
                 }
-                for (row, at) in covered {
-                    if at != recipe.atoms[&row].extent {
-                        wrong.push(format!("{row:?} covered to {at}"));
+                for (slot, mut spans) in held {
+                    spans.sort_unstable();
+                    if spans.windows(2).any(|pair| pair[1].0 < pair[0].1) {
+                        wrong.push(format!("slot {slot} holds overlapping rows: {spans:?}"));
                     }
                 }
             }
@@ -139,11 +141,9 @@ fn wrongs(trace: &Trace, recipe: &ChunkRecipe) -> Vec<String> {
                     *held.entry(run.row).or_default() += 1;
                 }
             }
-            SlotLayout::Fixed { pieces, .. } => {
-                let rows: std::collections::BTreeSet<RowId> =
-                    pieces.iter().map(|p| p.row).collect();
-                for row in rows {
-                    *held.entry(row).or_default() += 1;
+            SlotLayout::Fixed { rows, .. } => {
+                for run in rows {
+                    *held.entry(run.row).or_default() += 1;
                 }
             }
         }
@@ -154,8 +154,19 @@ fn wrongs(trace: &Trace, recipe: &ChunkRecipe) -> Vec<String> {
             wrong.push(format!("{id:?} held {:?} times", held.get(&id)));
         }
     }
+    let fixed = recipe.fixed().map_or(&[][..], |f| match f {
+        SlotLayout::Fixed { rows, .. } => rows.as_slice(),
+        _ => &[],
+    });
     for tp in catalog::RANKS {
         let rank = recipe.per_rank(tp);
+        if rank.fixed.len() != fixed.len()
+            || rank.fixed.iter().zip(fixed).any(|(on, run)| {
+                on.row != run.row || on.piece_bytes > run.piece_bytes(&recipe.atoms[&run.row])
+            })
+        {
+            wrong.push(format!("rank of {tp}: fixed runs unlike the recipe's"));
+        }
         for ((bytes, per), shape) in rank.slots.iter().zip(&recipe.slots) {
             if bytes * per > rank.chunk_bytes || *per != shape.per_chunk(c) {
                 wrong.push(format!(
@@ -289,8 +300,14 @@ fn per_token(shape: &SlotLayout) -> u64 {
 #[test]
 fn qwen3_next_packs_36_delta_and_conv_states_with_next_to_no_waste() {
     let (trace, recipe) = planned("qwen3-next-80b-a3b-bf16-kv-bf16");
-    assert_eq!(fixed_rows(&trace, &recipe, "delta."), (36, vec![1 << 20]));
-    assert_eq!(fixed_rows(&trace, &recipe, "conv."), (36, vec![64 << 10]));
+    assert_eq!(
+        fixed_rows(&trace, &recipe, "delta_state"),
+        (36, vec![1 << 20])
+    );
+    assert_eq!(
+        fixed_rows(&trace, &recipe, "conv_state"),
+        (36, vec![64 << 10])
+    );
     let rs = recipe
         .atoms
         .keys()

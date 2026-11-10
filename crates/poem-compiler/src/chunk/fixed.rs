@@ -1,81 +1,128 @@
-//! A working set's fixed record laid into pieces of one slot size: rows in
-//! order, each whole where it fits, a row past the piece's room cut on its
-//! atoms into the next pieces.
+//! A working set's fixed record laid into slots of one size, as the engines
+//! address a row: `pieces` equal pieces of `atoms_per_piece` atoms each,
+//! every piece at one `offset` in its own slot.
+//!
+//! A row no larger than a slot stays whole: one piece, packed first-fit with
+//! other whole rows into a slot. A row larger is cut on its atom axis into
+//! the fewest equal pieces a slot holds (the last padded); rows cut into as
+//! many pieces share a band of that many slots, one piece a slot, each row
+//! at its own offset common to the band.
 
 use super::census::FixedRow;
-use super::{MIN_PIECE, Piece, align_up};
+use super::{FixedRun, MIN_PIECE, align_up};
 
-/// Lays `rows` into pieces of `slot` bytes: the pieces a working set takes,
-/// and where each row's spans land when `build`. `None` where a row that
-/// may not be cut is larger than `slot`.
-pub fn pack(rows: &[FixedRow], slot: u64, align: u64, build: bool) -> Option<(u32, Vec<Piece>)> {
-    let mut pieces = Vec::new();
-    let mut piece = 0u32;
-    let mut used = 0u64;
-    let mut any = false;
+/// A band of `n` slots from record slot `first`, holding cut rows of `n`
+/// pieces each.
+struct Band {
+    first: u32,
+    n: u32,
+}
+
+/// Lays `rows` into slots of `slot` bytes: the slots a working set's record
+/// takes, and each row's run when `build`. `None` where a row that may not be
+/// cut is larger than `slot`, or where a cut piece would hold fewer than
+/// `least` bytes.
+pub fn pack(
+    rows: &[FixedRow],
+    slot: u64,
+    align: u64,
+    least: u64,
+    build: bool,
+) -> Option<(u32, Vec<FixedRun>)> {
+    if rows.is_empty() {
+        return None;
+    }
+    let mut used: Vec<u64> = Vec::new();
+    let mut bands: Vec<Band> = Vec::new();
+    let mut runs = Vec::new();
     for row in rows {
-        any = true;
-        let start = align_up(used, align);
-        if start + row.bytes <= slot {
-            if build {
-                pieces.push(Piece {
-                    row: row.id,
-                    span: 0..row.atom.extent,
-                    piece,
-                    offset: start,
-                });
-            }
-            used = start + row.bytes;
-            continue;
-        }
-        if !cuttable(row) {
+        if row.bytes <= slot || !cuttable(row) {
             if row.bytes > slot {
                 return None;
             }
-            piece += 1;
+            let at = used
+                .iter()
+                .position(|&u| align_up(u, align) + row.bytes <= slot);
+            let at = at.unwrap_or_else(|| {
+                used.push(0);
+                used.len() - 1
+            });
+            let offset = align_up(used[at], align);
+            used[at] = offset + row.bytes;
             if build {
-                pieces.push(Piece {
+                runs.push(FixedRun {
                     row: row.id,
-                    span: 0..row.atom.extent,
-                    piece,
-                    offset: 0,
+                    pieces: 1,
+                    atoms_per_piece: row.atom.extent,
+                    offset,
+                    slots: vec![u32::try_from(at).ok()?],
                 });
             }
-            used = row.bytes;
             continue;
         }
-        let unit = row.atom.bytes * row.atom.grain;
-        let mut at = 0u64;
-        loop {
-            let start = align_up(used, align);
-            let room = slot.saturating_sub(start);
-            let take = ((room / unit) * row.atom.grain).min(row.atom.extent - at);
-            if take == 0 {
-                if used == 0 {
-                    return None;
-                }
-                piece += 1;
-                used = 0;
-                continue;
-            }
-            if build {
-                pieces.push(Piece {
-                    row: row.id,
-                    span: at..at + take,
-                    piece,
-                    offset: start,
+        let (n, atoms) = cut(row, slot, least)?;
+        let bytes = atoms * row.atom.bytes;
+        let top = |band: &Band, used: &[u64]| {
+            let first = band.first as usize;
+            align_up(
+                used[first..first + band.n as usize]
+                    .iter()
+                    .copied()
+                    .max()
+                    .unwrap_or(0),
+                align,
+            )
+        };
+        let band = match bands
+            .iter()
+            .position(|b| b.n == n && top(b, &used) + bytes <= slot)
+        {
+            Some(band) => band,
+            None => {
+                bands.push(Band {
+                    first: u32::try_from(used.len()).ok()?,
+                    n,
                 });
+                used.extend(std::iter::repeat_n(0, n as usize));
+                bands.len() - 1
             }
-            used = start + take * row.atom.bytes;
-            at += take;
-            if at == row.atom.extent {
-                break;
-            }
-            piece += 1;
-            used = 0;
+        };
+        let band = &bands[band];
+        let offset = top(band, &used);
+        let first = band.first as usize;
+        for u in &mut used[first..first + n as usize] {
+            *u = offset + bytes;
+        }
+        if build {
+            runs.push(FixedRun {
+                row: row.id,
+                pieces: n,
+                atoms_per_piece: atoms,
+                offset,
+                slots: (band.first..band.first + n).collect(),
+            });
         }
     }
-    any.then_some((piece + 1, pieces))
+    Some((u32::try_from(used.len()).ok()?, runs))
+}
+
+/// The fewest equal pieces of whole grains `row` cuts into for each to fit
+/// `slot`, and the atoms a piece holds; `None` where a grain outgrows the
+/// slot or a piece would hold fewer than `least` bytes.
+pub fn cut(row: &FixedRow, slot: u64, least: u64) -> Option<(u32, u64)> {
+    let atom = row.atom;
+    let unit = atom.bytes * atom.grain;
+    let per = slot / unit.max(1);
+    if per == 0 {
+        return None;
+    }
+    let units = atom.extent.div_ceil(atom.grain);
+    let n = units.div_ceil(per);
+    let atoms = units.div_ceil(n) * atom.grain;
+    if atoms * atom.bytes < least {
+        return None;
+    }
+    Some((u32::try_from(n).ok()?, atoms))
 }
 
 /// A row a piece may cut: one its readers cut on an axis, no smaller than a
