@@ -202,6 +202,20 @@ impl<'a> Seated<'a> {
     }
 }
 
+/// Where a slot of the pool's shapes lies (CONTRACT-BC 22).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Tier {
+    Device,
+    Host,
+    Disk,
+}
+
+fn no_disk() -> Fault {
+    Fault::Unbound {
+        what: "the slot file, which this load seated none of".to_string(),
+    }
+}
+
 /// A fire the warm ladder traced and has not compiled yet.
 pub(crate) struct Deferred {
     key: [u8; 32],
@@ -233,6 +247,10 @@ pub struct Shell {
     budgets: Budgets,
     weights: Weights,
     pools: Pools,
+    /// The host tier (CONTRACT-BC 22): chunks of the pool's size.
+    host: crate::store::tier::Host,
+    /// The slot file below it, kv list slots.
+    disk: Option<crate::store::tier::Disk>,
     /// The outputs the plan's classes write, and per class the one its
     /// lanes read back to the host: the last float row or voxel output.
     exports: Vec<poem_exec::feeds::ClassOutput>,
@@ -616,7 +634,9 @@ impl Shell {
                 ..poem_compiler::DeviceProfile::default()
             },
         )
-        .map_or(crate::store::layout::TARGET_CHUNK, |recipe| recipe.chunk_bytes);
+        .map_or(crate::store::layout::TARGET_CHUNK, |recipe| {
+            recipe.chunk_bytes
+        });
         let pools = Pools::reserve(
             &device,
             &handles,
@@ -717,6 +737,8 @@ impl Shell {
             budgets,
             weights,
             pools,
+            host: crate::store::tier::Host::default(),
+            disk: None,
             exports,
             readback,
             dit,
@@ -893,6 +915,116 @@ impl Shell {
     #[must_use]
     pub fn pools(&self) -> &Pools {
         &self.pools
+    }
+
+    /// Seats the host tier, `host` bytes of whole chunks (`None`: as many as
+    /// the device pool holds), and the slot file `disk` names
+    /// (`(dir, bytes, persistent)`), kv list slots.
+    pub fn seat_tiers(
+        &mut self,
+        host: Option<u64>,
+        disk: Option<(&Path, u64, bool)>,
+    ) -> Result<()> {
+        let chunk = self.pools.layout().chunk_bytes;
+        let chunks = match host {
+            Some(bytes) => u32::try_from(bytes / chunk.max(1)).unwrap_or(u32::MAX),
+            None => self.pools.chunks().saturating_sub(2),
+        };
+        self.host = crate::store::tier::Host::new(chunks, chunk);
+        self.disk = match (disk, self.pools.layout().kv()) {
+            (Some((dir, bytes, persistent)), Some(kv)) if bytes > 0 => Some(
+                crate::store::tier::Disk::open(dir, bytes, kv.slot_bytes, persistent)?,
+            ),
+            _ => None,
+        };
+        Ok(())
+    }
+
+    /// The pool's facts with its tiers.
+    #[must_use]
+    pub fn tiered_facts(&self) -> engine::chunk::ChunkFacts {
+        let mut facts = self.pools.facts();
+        facts.host_chunks = self.host.chunks();
+        if let (Some(disk), Some(kv)) = (&self.disk, self.pools.layout().kv()) {
+            let spc = self.pools.layout().slots_per_chunk(kv).max(1);
+            facts.disk_chunks = disk.slots() / spc;
+            facts.disk_persistent = disk.persistent();
+            facts.disk_kept = disk.kept();
+        }
+        facts
+    }
+
+    /// Moves whole slots of shape `id` between the device, the host tier and
+    /// the slot file (CONTRACT-BC 22): `(src, dst)` refs of each side's own
+    /// space, in order.
+    pub fn copy_tier(
+        &mut self,
+        id: engine::chunk::ShapeId,
+        from: Tier,
+        to: Tier,
+        pairs: &[(u32, u32)],
+    ) -> Result<()> {
+        let facts = self.pools.facts();
+        let shape = facts.shape(id).cloned().ok_or_else(|| Fault::Unbound {
+            what: format!("slot shape {id}, which this load does not state"),
+        })?;
+        let disk_ok = self.pools.kv_shape() == Some(id);
+        if (from == Tier::Disk || to == Tier::Disk) && !disk_ok {
+            return Err(Fault::Unbound {
+                what: format!("shape {id} on the slot file, which holds kv list slots only"),
+            });
+        }
+        if from == Tier::Device && to == Tier::Device {
+            let copies: Vec<_> = pairs.iter().map(|&(a, b)| (id, a, b)).collect();
+            return self.pools.copy(&self.device, &self.handles, &copies);
+        }
+        let len = shape.slot_bytes;
+        let chunk = facts.chunk_bytes;
+        // Every source slot's bytes, in order.
+        let srcs: Vec<u32> = pairs.iter().map(|p| p.0).collect();
+        let mut data: Vec<u8> = match from {
+            Tier::Device => self
+                .pools
+                .read_slots(&self.device, &self.handles, id, &srcs)?,
+            Tier::Host => {
+                let mut out = Vec::with_capacity(srcs.len() * len as usize);
+                for &slot in &srcs {
+                    out.extend_from_slice(self.host.read(shape.tier_offset(chunk, slot), len)?);
+                }
+                out
+            }
+            Tier::Disk => {
+                let disk = self.disk.as_mut().ok_or_else(no_disk)?;
+                let mut out = Vec::with_capacity(srcs.len() * len as usize);
+                for &slot in &srcs {
+                    out.extend(disk.read(slot)?);
+                }
+                out
+            }
+        };
+        if data.len() as u64 != srcs.len() as u64 * len {
+            data.resize((srcs.len() as u64 * len) as usize, 0);
+        }
+        let dsts: Vec<u32> = pairs.iter().map(|p| p.1).collect();
+        match to {
+            Tier::Device => {
+                self.pools
+                    .write_slots(&self.device, &self.handles, id, &dsts, &data)?
+            }
+            Tier::Host => {
+                for (at, &slot) in dsts.iter().enumerate() {
+                    let bytes = &data[at * len as usize..(at + 1) * len as usize];
+                    self.host.write(shape.tier_offset(chunk, slot), bytes)?;
+                }
+            }
+            Tier::Disk => {
+                let disk = self.disk.as_mut().ok_or_else(no_disk)?;
+                for (at, &slot) in dsts.iter().enumerate() {
+                    disk.write(slot, &data[at * len as usize..(at + 1) * len as usize])?;
+                }
+            }
+        }
+        Ok(())
     }
 
     pub fn register_adapter(
@@ -1302,7 +1434,11 @@ impl Shell {
             let have = match seated.held {
                 _ if seated.kv_less => 0,
                 Some(held) => held,
-                None => self.held.get(seated.lane.slot as usize).copied().unwrap_or(0),
+                None => self
+                    .held
+                    .get(seated.lane.slot as usize)
+                    .copied()
+                    .unwrap_or(0),
             };
             let is_fresh = match seated.rs_reset {
                 engine::fire::RsReset::Inferred => have == 0,
@@ -1374,7 +1510,8 @@ impl Shell {
         // Per lane its index, and per record piece each lane's and each
         // row's slot (grain index).
         let mut lane_at: Vec<i32> = Vec::with_capacity(submitted.len());
-        let mut record_ids: Vec<Vec<i32>> = vec![Vec::with_capacity(submitted.len()); records.len()];
+        let mut record_ids: Vec<Vec<i32>> =
+            vec![Vec::with_capacity(submitted.len()); records.len()];
         let mut request_of_token: Vec<i32> = Vec::with_capacity(rows as usize);
         let mut record_rows: Vec<Vec<i32>> = vec![Vec::with_capacity(rows as usize); records.len()];
         let mut masks: Vec<crate::mask::LaneMask<'_>> = Vec::with_capacity(submitted.len());
@@ -1407,9 +1544,8 @@ impl Shell {
                     wide: false,
                 });
                 lane_at.push(at_lane);
-                let read_only = !(row.rows == 1
-                    && real > 0
-                    && lanes.iter().all(|s| s.lane.tokens.len() == 1));
+                let read_only =
+                    !(row.rows == 1 && real > 0 && lanes.iter().all(|s| s.lane.tokens.len() == 1));
                 for (r, &sink) in record_sinks.iter().enumerate() {
                     let sink = sink as i32;
                     record_ids[r].push(sink);

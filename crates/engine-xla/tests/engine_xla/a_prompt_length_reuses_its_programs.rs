@@ -84,7 +84,12 @@ fn prefill(shell: &mut Shell, n: u32) {
 }
 
 /// `lane`'s slot refs as the shell seats them, reaching `after` rows.
-fn seated<'a>(lane: &'a engine::fire::Lane, word: u64, tokens: &'a [u32], after: u32) -> Seated<'a> {
+fn seated<'a>(
+    lane: &'a engine::fire::Lane,
+    word: u64,
+    tokens: &'a [u32],
+    after: u32,
+) -> Seated<'a> {
     let mut seated = Seated::of(Lane {
         slot: lane.slot,
         word,
@@ -158,7 +163,10 @@ fn the_slots_a_request_lands_in_trace_no_new_program() {
             .expect("the record copies");
         let page = slot * 8;
         shell
-            .copy_kv(&[run(pages[page], pages[page + 40]), run(pages[page + 1], pages[page + 41])])
+            .copy_kv(&[
+                run(pages[page], pages[page + 40]),
+                run(pages[page + 1], pages[page + 41]),
+            ])
             .expect("the kv copies");
         shell
             .copy_kv(&[part(pages[page + 2], pages[page + 42])])

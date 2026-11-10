@@ -850,19 +850,8 @@ pub mod pool {
             let s = l.read(score)?;
             let sk = l.read(state_kv)?;
             let ss = l.read(state_score)?;
-            let (kv, sc) = pool::state_write(
-                l.f(),
-                k,
-                s,
-                pages,
-                wp,
-                wo,
-                head_dim,
-                ratio,
-                sk,
-                ss,
-                maps,
-            )?;
+            let (kv, sc) =
+                pool::state_write(l.f(), k, s, pages, wp, wo, head_dim, ratio, sk, ss, maps)?;
             Ok(vec![Some(kv), Some(sc)])
         })
     }

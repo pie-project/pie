@@ -605,12 +605,11 @@ fn view_rows(root: Root, t: Tensor) -> Result<u32, kernels_xla::Error> {
 
 /// A view's whole value back as its root's: the inverse of [`reinterpret`].
 fn unview(f: &mut Func, v: Val, root: Root) -> Result<Val, kernels_xla::Error> {
-    let want = storage(root.dtype, root.rows, root.width).ok_or_else(|| {
-        kernels_xla::Error::Backend {
+    let want =
+        storage(root.dtype, root.rows, root.width).ok_or_else(|| kernels_xla::Error::Backend {
             op: "trace",
             detail: format!("a {:?} root, which has no storage form", root.dtype),
-        }
-    })?;
+        })?;
     let bytes = f.bitcast(v, Elem::U8)?;
     let per = i64::from(want.elem.bits() / 8).max(1);
     let n = f.ty(bytes).elements();
@@ -736,7 +735,10 @@ mod tests {
             cx.write(keys, k)?;
             cx.write(values, v)
         });
-        assert!(refused.is_err(), "the second plane's stale value lands nowhere");
+        assert!(
+            refused.is_err(),
+            "the second plane's stale value lands nowhere"
+        );
         // Read after the first write, it lands.
         let tracer = Tracer::new(&handles);
         tracer

@@ -810,9 +810,13 @@ impl<'c> Run<'c> {
     pub(crate) fn record_of(&self, id: ValueId) -> usize {
         let at = id.0 as usize;
         match &self.values[at].def {
-            Def::Cache(c) => self.caches.1.get(*c as usize).copied().flatten().unwrap_or_else(|| {
-                panic!("value {at} is cache row {c}, which lies in no record")
-            }),
+            Def::Cache(c) => self
+                .caches
+                .1
+                .get(*c as usize)
+                .copied()
+                .flatten()
+                .unwrap_or_else(|| panic!("value {at} is cache row {c}, which lies in no record")),
             _ => panic!("value {at} is not a cache row"),
         }
     }

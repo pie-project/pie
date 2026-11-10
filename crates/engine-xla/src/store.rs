@@ -20,6 +20,7 @@
 
 pub mod kv;
 pub mod layout;
+pub mod tier;
 
 use crate::handle::{KvPool, RecurrentPool, Tensor};
 use engine::chunk::{
@@ -271,7 +272,6 @@ fn rs_rows(paging: Paging) -> u64 {
     u64::from(paging.slots.max(1)) * u64::from(paging.page_size.max(1))
 }
 
-
 /// The planes every cache row lays, as the layout reads them.
 fn layout_rows<'a>(
     trace: &'a Trace,
@@ -403,11 +403,12 @@ impl Pools {
         let mut views: Vec<(What, Tensor, Map)> = Vec::new();
         for shape in &layout.shapes {
             for plane in &shape.planes {
-                let t = handles
-                    .view(root, plane.dtype, plane.width)
-                    .map_err(|e| Fault::Unbound {
-                        what: format!("a view of pool plane {:?}: {e}", plane.what),
-                    })?;
+                let t =
+                    handles
+                        .view(root, plane.dtype, plane.width)
+                        .map_err(|e| Fault::Unbound {
+                            what: format!("a view of pool plane {:?}: {e}", plane.what),
+                        })?;
                 views.push((plane.what, t, map_of(&layout, shape, plane)));
             }
         }
@@ -472,7 +473,11 @@ impl Pools {
             compressor.push((row, [kv, score], [kv_map, score_map]));
         }
         let rs_buffers = (0..rows.rs.len())
-            .map(|plane| view(What::Rs { plane: plane as u32 }))
+            .map(|plane| {
+                view(What::Rs {
+                    plane: plane as u32,
+                })
+            })
             .collect::<Result<Vec<_>>>()?;
         let total = u64::from(chunks) * layout.chunk_bytes;
         tracing::info!(
@@ -629,9 +634,9 @@ impl Pools {
     /// The grain index of shape `id`'s slot in the sink chunk.
     #[must_use]
     pub fn sink(&self, id: ShapeId) -> u32 {
-        self.layout
-            .shape(id)
-            .map_or(0, |shape| narrow(self.layout.grain_of(shape, SINK_CHUNK, 0)))
+        self.layout.shape(id).map_or(0, |shape| {
+            narrow(self.layout.grain_of(shape, SINK_CHUNK, 0))
+        })
     }
 
     /// Slot refs for a lane the shell fires for itself (the warm ladder, a
@@ -755,7 +760,9 @@ impl Pools {
 
     #[must_use]
     pub fn get(&self, row: u32, plane: u8) -> Option<&Buffer> {
-        ((row, plane) == (0, 0)).then_some(self.buffer.as_ref()).flatten()
+        ((row, plane) == (0, 0))
+            .then_some(self.buffer.as_ref())
+            .flatten()
     }
 
     /// Puts back what a program returned for the pool.
@@ -835,7 +842,12 @@ impl Pools {
 
     /// Zeros each of `slots` (`(shape, slot ref)`) whole: the records a
     /// fresh state starts from.
-    pub fn zero(&mut self, device: &Device, handles: &Handles, slots: &[(ShapeId, u32)]) -> Result<()> {
+    pub fn zero(
+        &mut self,
+        device: &Device,
+        handles: &Handles,
+        slots: &[(ShapeId, u32)],
+    ) -> Result<()> {
         let mut by: std::collections::BTreeMap<u64, Vec<i64>> = Default::default();
         for &(id, slot) in slots {
             let q = self.grain(id, slot)?;
@@ -867,7 +879,12 @@ impl Pools {
 
     /// Copies whole slots `(shape, src ref, dst ref)` in order (a later one
     /// may read what an earlier one wrote).
-    pub fn copy(&mut self, device: &Device, handles: &Handles, copies: &[(ShapeId, u32, u32)]) -> Result<()> {
+    pub fn copy(
+        &mut self,
+        device: &Device,
+        handles: &Handles,
+        copies: &[(ShapeId, u32, u32)],
+    ) -> Result<()> {
         let mut spans: Vec<(u64, i64, i64)> = Vec::with_capacity(copies.len());
         for &(id, src, dst) in copies {
             if src == dst {
@@ -883,7 +900,12 @@ impl Pools {
 
     /// Copies `rows` pool rows from each span's first to its second, a
     /// program a run of equal sizes, in order.
-    fn copy_rows(&mut self, device: &Device, handles: &Handles, spans: &[(u64, i64, i64)]) -> Result<()> {
+    fn copy_rows(
+        &mut self,
+        device: &Device,
+        handles: &Handles,
+        spans: &[(u64, i64, i64)],
+    ) -> Result<()> {
         let mut at = 0;
         while at < spans.len() {
             let rows = spans[at].0;
@@ -917,7 +939,12 @@ impl Pools {
     }
 
     /// Applies an evacuation: each chunk's bytes moved, then the table.
-    pub fn evacuate(&mut self, device: &Device, handles: &Handles, evacuation: &Evacuation) -> Result<()> {
+    pub fn evacuate(
+        &mut self,
+        device: &Device,
+        handles: &Handles,
+        evacuation: &Evacuation,
+    ) -> Result<()> {
         let rows = self.layout.chunk_bytes / ROW_BYTES;
         let spans: Vec<(u64, i64, i64)> = evacuation
             .moves
@@ -975,8 +1002,14 @@ impl Pools {
             let mut dst: Vec<i64> = Vec::new();
             for &(sq, st, dq, dt, n) in &cells {
                 for t in 0..n {
-                    src.push((i64::from(sq) * map.stride + map.offset) * i64::from(page) + i64::from(st + t));
-                    dst.push((i64::from(dq) * map.stride + map.offset) * i64::from(page) + i64::from(dt + t));
+                    src.push(
+                        (i64::from(sq) * map.stride + map.offset) * i64::from(page)
+                            + i64::from(st + t),
+                    );
+                    dst.push(
+                        (i64::from(dq) * map.stride + map.offset) * i64::from(page)
+                            + i64::from(dt + t),
+                    );
                 }
             }
             let n = src.len().next_power_of_two();
@@ -1003,6 +1036,123 @@ impl Pools {
             crate::exec::maintain(device, tracer, self, &inputs)?;
         }
         Ok(())
+    }
+
+    /// The bytes of each of `slots` (`(shape, slot ref)`, one shape), in
+    /// order: one program gathers their pool rows into a result, which is
+    /// downloaded. Ordered after every fire submitted before it.
+    pub fn read_slots(
+        &mut self,
+        device: &Device,
+        handles: &Handles,
+        id: ShapeId,
+        slots: &[u32],
+    ) -> Result<Vec<u8>> {
+        if slots.is_empty() || device.is_dry() {
+            return Ok(Vec::new());
+        }
+        let rows = self.shape(id)?.slot_bytes / ROW_BYTES;
+        let mut at: Vec<i64> = slots
+            .iter()
+            .map(|&slot| self.rows_at(id, self.grain(id, slot)?))
+            .collect::<Result<_>>()?;
+        let n = at.len();
+        pad_pow2(&mut at, 1);
+        let (inputs, list) = indices(handles, &at);
+        let tracer = Tracer::new(handles).with_pack(inputs.pack_len());
+        let root = self.root;
+        let mut out = None;
+        tracer.emit(&mut |cx| {
+            let whole = cx.read(root)?;
+            let col = cx.const_i(Elem::I32, 0, &[]);
+            let mut blocks = Vec::with_capacity(at.len());
+            for m in 0..at.len() as i64 {
+                let row = index_at(cx, list, m, 1)?;
+                blocks.push(cx.dynamic_slice(whole, &[row, col], &[rows as i64, 128])?);
+            }
+            out = Some(if blocks.len() == 1 {
+                blocks[0]
+            } else {
+                cx.concat(&blocks, 0)?
+            });
+            Ok(())
+        })?;
+        let out = out.expect("the gather emitted");
+        let got = crate::exec::run(device, tracer, &[out], None, self, &inputs, true)?;
+        let bytes = got
+            .first()
+            .ok_or_else(|| Fault::Unbound {
+                what: "the gathered slots, which the program did not return".to_string(),
+            })?
+            .download()?;
+        let len = (n as u64 * rows * ROW_BYTES) as usize;
+        Ok(bytes[..len.min(bytes.len())].to_vec())
+    }
+
+    /// Lands `bytes` (each of `slots` whole, in order, one shape) in the
+    /// pool: one upload, a `dynamic_update_slice` a slot.
+    pub fn write_slots(
+        &mut self,
+        device: &Device,
+        handles: &Handles,
+        id: ShapeId,
+        slots: &[u32],
+        bytes: &[u8],
+    ) -> Result<()> {
+        if slots.is_empty() || device.is_dry() {
+            return Ok(());
+        }
+        let rows = self.shape(id)?.slot_bytes / ROW_BYTES;
+        if bytes.len() as u64 != slots.len() as u64 * rows * ROW_BYTES {
+            return Err(Fault::Unbound {
+                what: format!(
+                    "{} bytes for {} slots of {} bytes",
+                    bytes.len(),
+                    slots.len(),
+                    rows * ROW_BYTES
+                ),
+            });
+        }
+        let mut at: Vec<i64> = slots
+            .iter()
+            .map(|&slot| self.rows_at(id, self.grain(id, slot)?))
+            .collect::<Result<_>>()?;
+        // Pads repeat the last slot with its own bytes.
+        let n = at.len();
+        pad_pow2(&mut at, 1);
+        let mut data = bytes.to_vec();
+        let last = bytes[bytes.len() - (rows * ROW_BYTES) as usize..].to_vec();
+        for _ in n..at.len() {
+            data.extend_from_slice(&last);
+        }
+        let mut inputs = crate::inputs::Inputs::new();
+        let landed = inputs.raw(
+            handles,
+            Dtype::U32,
+            narrow(at.len() as u64 * rows),
+            128,
+            data,
+        );
+        let values: Vec<i32> = at
+            .iter()
+            .map(|&v| i32::try_from(v).unwrap_or(i32::MAX))
+            .collect();
+        let list = inputs.i32s(handles, &values, 1);
+        let tracer = Tracer::new(handles).with_pack(inputs.pack_len());
+        let root = self.root;
+        let count = at.len() as i64;
+        tracer.emit(&mut |cx| {
+            let mut whole = cx.read(root)?;
+            let all = cx.read(landed)?;
+            let col = cx.const_i(Elem::I32, 0, &[]);
+            for m in 0..count {
+                let row = index_at(cx, list, m, 1)?;
+                let block = cx.slice_axis(all, 0, m * rows as i64, (m + 1) * rows as i64)?;
+                whole = cx.dynamic_update_slice(whole, block, &[row, col])?;
+            }
+            cx.write(root, whole)
+        })?;
+        crate::exec::maintain(device, tracer, self, &inputs)
     }
 
     /// The bytes of each of `slots` (`(shape, slot ref)`), in order.

@@ -43,15 +43,26 @@ const MOST_CHUNK: u64 = 256 << 20;
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum What {
     /// A kv row's key plane (its only plane where keys and values share).
-    Keys { row: u32 },
-    Values { row: u32 },
+    Keys {
+        row: u32,
+    },
+    Values {
+        row: u32,
+    },
     /// The compressor state of the kv row a pool gather keys by its pages:
     /// `which` 0 the kv projection, 1 its score.
-    Compressor { row: u32, which: u8 },
+    Compressor {
+        row: u32,
+        which: u8,
+    },
     /// A recurrent (or conv, or frame-cache) state row.
-    State { row: u32 },
+    State {
+        row: u32,
+    },
     /// A buffered recurrence input, the rs layout's plane `plane`.
-    Rs { plane: u32 },
+    Rs {
+        plane: u32,
+    },
 }
 
 /// One plane's place in its shape's slot.
@@ -482,7 +493,13 @@ fn cache_name(trace: Option<&Trace>, row: usize) -> &str {
 }
 
 /// A list shape over `rows`, `tokens` a slot.
-fn list(id: ShapeId, kind: Kind, tokens: u32, rows: &[ListRow], trace: Option<&Trace>) -> Result<Shape> {
+fn list(
+    id: ShapeId,
+    kind: Kind,
+    tokens: u32,
+    rows: &[ListRow],
+    trace: Option<&Trace>,
+) -> Result<Shape> {
     let mut planes = Vec::new();
     let mut cache = Vec::new();
     for row in rows {
@@ -538,7 +555,6 @@ mod tests {
 
     #[test]
     fn every_run_lands_on_a_block_of_its_view_in_any_slot() {
-
         let rows = Rows {
             trace: None,
             page: 16,
@@ -561,7 +577,7 @@ mod tests {
         };
         let layout = Layout::of(&rows, TARGET_CHUNK).expect("the layout");
         let c = layout.chunk_bytes;
-        assert!(c >= TARGET_CHUNK && c % TILE_BYTES == 0, "{c}");
+        assert!(c >= TARGET_CHUNK && c.is_multiple_of(TILE_BYTES), "{c}");
         let kinds: Vec<Kind> = layout.shapes.iter().map(|s| s.kind).collect();
         assert_eq!(
             kinds,
@@ -599,12 +615,15 @@ mod tests {
         assert_eq!(kv.tokens, 16);
         assert_eq!(c % kv.slot_bytes, 0, "the kv list fills its chunks");
         assert_eq!(plane(kv, 0).run, 16 * 512 * 2);
-        assert_eq!(kv.planes.len(), 5, "keys, values, the latent, two compressor planes");
+        assert_eq!(
+            kv.planes.len(),
+            5,
+            "keys, values, the latent, two compressor planes"
+        );
     }
 
     #[test]
     fn a_record_larger_than_a_chunk_is_cut_between_blocks() {
-
         let rows = Rows {
             trace: None,
             page: 16,

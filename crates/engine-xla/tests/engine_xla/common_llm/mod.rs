@@ -38,7 +38,9 @@ fn write_checkpoint(path: &std::path::Path, trace: &poem_ir::Trace, seed: u64) {
         let norm = param.name.ends_with("norm");
         let mut state = fnv(&param.name) ^ seed;
         let mut next = || {
-            state = state.wrapping_mul(6_364_136_223_846_793_005).wrapping_add(1);
+            state = state
+                .wrapping_mul(6_364_136_223_846_793_005)
+                .wrapping_add(1);
             state >> 33
         };
         let unit = |bits: u64| (bits as f32 / (1u64 << 31) as f32) - 0.5;
@@ -62,7 +64,10 @@ fn write_checkpoint(path: &std::path::Path, trace: &poem_ir::Trace, seed: u64) {
                     .flat_map(|_| value(next()).to_le_bytes())
                     .collect(),
             ),
-            other => panic!("`{}` is {other:?}, not a dtype the fixture seeds", param.name),
+            other => panic!(
+                "`{}` is {other:?}, not a dtype the fixture seeds",
+                param.name
+            ),
         };
         writer
             .add(param.name.as_str(), param.shape.clone(), leaf, &bytes)
@@ -90,6 +95,17 @@ impl Model {
     /// Model `name` of the catalog, cut to `layers` where stated, its
     /// weights drawn from `seed`, seated at `context` tokens.
     pub fn load(name: &str, layers: Option<u32>, context: u32, seed: u64) -> Model {
+        Model::load_with(name, layers, context, seed, None)
+    }
+
+    /// [`Model::load`] with a slot file under `disk` (1 MiB of kv slots).
+    pub fn load_with(
+        name: &str,
+        layers: Option<u32>,
+        context: u32,
+        seed: u64,
+        disk: Option<&std::path::Path>,
+    ) -> Model {
         let package = poem_compiler::catalog::package_of(name).expect("the model is listed");
         let deploy = poem::star::Deploy {
             layers,
@@ -117,7 +133,14 @@ impl Model {
         let facts = trace.facts.clone();
         let mut engine = Xla::new(DeviceBoot::default(), contract_for);
         let residency = Residency {
-            device_kv_budget: crate::common::kv_budget(&trace, context, SLOTS, SLOTS * context / PAGE),
+            device_kv_budget: crate::common::kv_budget(
+                &trace,
+                context,
+                SLOTS,
+                SLOTS * context / PAGE,
+            ),
+            disk_kv_dir: disk.map(std::path::Path::to_path_buf),
+            disk_kv_budget: disk.map(|_| 64 << 20),
             ..Residency::default()
         };
         let loaded = engine
@@ -268,9 +291,9 @@ impl Refs {
 pub struct Seq {
     pub slot: u32,
     pub held: u32,
-    kv: Vec<u32>,
-    window: Vec<u32>,
-    record: Vec<(engine::chunk::ShapeId, Vec<[u32; 2]>)>,
+    pub kv: Vec<u32>,
+    pub window: Vec<u32>,
+    pub record: Vec<(engine::chunk::ShapeId, Vec<[u32; 2]>)>,
 }
 
 impl Seq {
@@ -321,7 +344,15 @@ impl Seq {
             }
             lane.tables.push((list.id, self.kv[..need].to_vec()));
         }
-        for list in refs.shapes(|s| matches!(s.kind, SlotKind::List { window: Some(_), .. })) {
+        for list in refs.shapes(|s| {
+            matches!(
+                s.kind,
+                SlotKind::List {
+                    window: Some(_),
+                    ..
+                }
+            )
+        }) {
             let SlotKind::List {
                 tokens,
                 window: Some(w),

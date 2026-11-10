@@ -70,14 +70,22 @@ fn reads_back(name: &str) -> ChunkFacts {
     assert_eq!((facts.segments.committed, facts.segments.max), (1, 1));
     assert_eq!(facts.segment_chunks, facts.total_chunks);
     assert!(facts.act_chunks.is_empty(), "activation lives apart");
-    let reserved: Vec<_> = facts.reserved.iter().map(|r| (r.what, r.first, r.chunks)).collect();
+    let reserved: Vec<_> = facts
+        .reserved
+        .iter()
+        .map(|r| (r.what, r.first, r.chunks))
+        .collect();
     assert_eq!(
         reserved,
         vec![(Reserved::Null, 0, 1), (Reserved::Sink, 1, 1)],
         "{name}"
     );
     for shape in &facts.shapes {
-        assert!(shape.pinned.is_none(), "{name}: shape {} shares the pool", shape.id);
+        assert!(
+            shape.pinned.is_none(),
+            "{name}: shape {} shares the pool",
+            shape.id
+        );
         assert!(shape.slot_bytes > 0 && shape.slot_bytes <= facts.chunk_bytes);
         assert_eq!(
             shape.slots_per_chunk as u64,

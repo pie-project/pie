@@ -403,7 +403,10 @@ impl Shell {
                 let n = (held_of(want, page_size) + want.rows)
                     .div_ceil(page_size)
                     .max(1);
-                (vec![0; want.rows as usize], self.pools.scratch(0, n as usize))
+                (
+                    vec![0; want.rows as usize],
+                    self.pools.scratch(0, n as usize),
+                )
             })
             .collect();
         for slot in 0..(shape.len() as u32).min(slots) {

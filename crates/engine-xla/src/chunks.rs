@@ -49,7 +49,7 @@ impl Shell {
     /// null and sink chunks reserved, every shape shared.
     #[must_use]
     pub fn chunk_facts(&self) -> ChunkFacts {
-        self.pools().facts()
+        self.tiered_facts()
     }
 
     /// Logs, at debug, beside `facts`, the chunk recipe

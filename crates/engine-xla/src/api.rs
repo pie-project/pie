@@ -376,7 +376,19 @@ impl Engine for Xla {
         let paging = shell.paging();
         let drafter = shell.trace().drafter;
         let pools = shell.pool_facts();
-        let chunks = shell.chunk_facts();
+        shell
+            .seat_tiers(
+                residency.host_kv_budget,
+                residency.disk_kv_dir.as_deref().map(|dir| {
+                    (
+                        dir,
+                        residency.disk_kv_budget.unwrap_or(0),
+                        residency.disk_kv_persistent,
+                    )
+                }),
+            )
+            .map_err(fault)?;
+        let chunks = shell.tiered_facts();
         shell.log_chunk_recipe(&chunks);
         let caps = Capabilities {
             device: DeviceFacts {
@@ -684,19 +696,33 @@ impl Engine for Xla {
     /// from sc/tier-shared's contract) lands here; until that contract is
     /// merged only device-to-device copies are served.
     fn copy_slots(&mut self, copy: &engine::chunk::SlotCopy) -> EngineResult<()> {
+        use crate::serve::Tier;
         let device = self.caps.as_ref().map(|caps| caps.device.domain);
-        if Some(copy.src) != device || Some(copy.dst) != device {
-            // HOOK (sc/tier-shared): host <-> device copies of shared shapes
-            // stage here — a d2h is a download of the slots' pool rows
-            // (`Shell::slot_bytes`), an h2d an upload landed by one
-            // `dynamic_update_slice` program a slot (`store::Pools`'s copy
-            // programs, fed from an input instead of the pool).
+        let tier = |domain| match domain {
+            MemoryDomain::HostPinned => Some(Tier::Host),
+            MemoryDomain::LocalDisk => Some(Tier::Disk),
+            d if Some(d) == device => Some(Tier::Device),
+            _ => None,
+        };
+        let (Some(from), Some(to)) = (tier(copy.src), tier(copy.dst)) else {
             return Err(Error::Unsupported {
-                verb: "`copy_slots` between tiers (waits for the host tier contract)",
+                verb: "`copy_slots` to or from a domain other than the device, the host tier \
+                       and the slot file",
                 engine: "xla",
             });
-        }
+        };
         let shell = self.loaded_mut()?;
+        if from != Tier::Device || to != Tier::Device {
+            // Between tiers (CONTRACT-BC 22): whole slots, laid alike.
+            if !copy.runs.is_empty() {
+                return Err(Error::Invalid(
+                    "token runs move within the device; between tiers a slot moves whole".into(),
+                ));
+            }
+            return shell
+                .copy_tier(copy.shape, from, to, &copy.slots)
+                .map_err(fault);
+        }
         let pairs: Vec<(engine::chunk::ShapeId, u32, u32)> = copy
             .slots
             .iter()
@@ -1199,12 +1225,9 @@ impl Xla {
                 *slot = Some(bound.slot);
             }
         }
-        let (kv_shape, window_shape) = self
-            .shell
-            .as_ref()
-            .map_or((None, None), |shell| {
-                (shell.pools().kv_shape(), shell.pools().window_shape())
-            });
+        let (kv_shape, window_shape) = self.shell.as_ref().map_or((None, None), |shell| {
+            (shell.pools().kv_shape(), shell.pools().window_shape())
+        });
         let shell = self.loaded_mut()?;
         let mut words: Vec<u64> = submission.lanes.iter().map(|lane| lane.word).collect();
         for (at, slot) in lane_adapters.iter().enumerate() {

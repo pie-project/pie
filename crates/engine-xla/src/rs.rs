@@ -330,11 +330,14 @@ impl WindowMap {
                 have: run.pages.len() as u64,
             })?;
             let row = u64::from(slot) * u64::from(page_tokens) + u64::from(token % page_tokens);
-            i32::try_from(row).ok().filter(|&r| r != DROP).ok_or(Fault::Ceiling {
-                what: "rs list rows an i32 addresses",
-                need: row,
-                have: i32::MAX as u64 - 1,
-            })
+            i32::try_from(row)
+                .ok()
+                .filter(|&r| r != DROP)
+                .ok_or(Fault::Ceiling {
+                    what: "rs list rows an i32 addresses",
+                    need: row,
+                    have: i32::MAX as u64 - 1,
+                })
         };
         for r in 0..indptr.len().saturating_sub(1) {
             let start = indptr[r].max(0) as u32;
