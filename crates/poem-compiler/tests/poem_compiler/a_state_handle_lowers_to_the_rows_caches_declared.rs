@@ -114,6 +114,30 @@ fn glm_5(path: &str, _row: &CacheRow) -> String {
     }
 }
 
+fn kimi_k3(path: &str, _row: &CacheRow) -> String {
+    path.to_string()
+}
+
+fn glm_5_next(path: &str, _row: &CacheRow) -> String {
+    path.to_string()
+}
+
+fn hy_4(path: &str, _row: &CacheRow) -> String {
+    path.to_string()
+}
+
+fn minimax_m3(path: &str, _row: &CacheRow) -> String {
+    path.to_string()
+}
+
+fn minimax_h3(path: &str, _row: &CacheRow) -> String {
+    path.to_string()
+}
+
+fn qwen_4(path: &str, _row: &CacheRow) -> String {
+    path.to_string()
+}
+
 /// Every listed deployment of `package`, at one rank and at each count of
 /// [`RANKS`] it traces at.
 fn deployments(package: &str) -> Vec<Deployment> {
@@ -259,5 +283,11 @@ mod moved {
         gemma_4,
         qwen_3,
         glm_5,
+        kimi_k3,
+        glm_5_next,
+        hy_4,
+        minimax_m3,
+        minimax_h3,
+        qwen_4,
     );
 }
