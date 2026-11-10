@@ -378,7 +378,11 @@ impl Device {
             && let (Some(client), Ok(device)) = (self.client.as_ref(), self.device())
             && let Ok(stats) = client.memory_stats(device)
         {
-            tracing::info!(runs = n + 1, in_use = stats.bytes_in_use, peak = ?stats.peak, limit = ?stats.bytes_limit, "xla device memory");
+            tracing::info!(runs = n + 1, in_use = stats.bytes_in_use, peak = ?stats.peak, limit = ?stats.bytes_limit,
+                planes = crate::readout::COUNT.load(std::sync::atomic::Ordering::Relaxed),
+                plane_mib = crate::readout::LIVE.load(std::sync::atomic::Ordering::Relaxed) >> 20,
+                programs = self.cache.lock().map_or(0, |c| c.len()),
+                "xla device memory");
         }
         let at = profile::before(self.api());
         let (outs, done) = exe.execute(self.device()?, args)?;

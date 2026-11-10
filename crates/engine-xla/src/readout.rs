@@ -45,6 +45,9 @@ impl Plane {
         layers: u32,
         dtype: Dtype,
     ) -> Plane {
+        let bytes = i64::from(rows) * i64::from(width) * i64::from(layers.max(1)) * 4;
+        LIVE.fetch_add(bytes, std::sync::atomic::Ordering::Relaxed);
+        COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         Plane {
             name,
             axis,
@@ -94,6 +97,18 @@ impl Plane {
             ),
             _ => unreachable!("a plane is f32 or i32"),
         })
+    }
+}
+
+/// Diag: bytes and count of the readout planes alive.
+pub static LIVE: std::sync::atomic::AtomicI64 = std::sync::atomic::AtomicI64::new(0);
+pub static COUNT: std::sync::atomic::AtomicI64 = std::sync::atomic::AtomicI64::new(0);
+
+impl Drop for Plane {
+    fn drop(&mut self) {
+        let bytes = i64::from(self.rows) * i64::from(self.width) * i64::from(self.layers.max(1)) * 4;
+        LIVE.fetch_sub(bytes, std::sync::atomic::Ordering::Relaxed);
+        COUNT.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
     }
 }
 
