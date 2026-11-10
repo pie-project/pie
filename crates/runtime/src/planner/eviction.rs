@@ -35,9 +35,14 @@ impl ResidencyPlanner {
             .collect();
         ordered.sort_by_key(|&(_, rank, quiescent)| (!quiescent, std::cmp::Reverse(rank)));
         let pids: Vec<ProcessId> = ordered.iter().map(|(pid, ..)| *pid).collect();
-        let rs_quotes: Vec<RsUnits> = pids
+        // On a shared pool the state a victim parks frees chunks kv takes:
+        // it is worth that many kv pages to a head short of kv.
+        let rs_quotes: Vec<(RsUnits, u32)> = pids
             .iter()
-            .map(|&pid| suspendable_rs_units(pid, model, engine))
+            .map(|&pid| {
+                let rs = suspendable_rs_units(pid, model, engine);
+                (rs, self.port.rs_as_pages(rs))
+            })
             .collect();
         Self::pick_with_budget_escalation(&pids, &rs_quotes, deficit, room, |pids, budget| {
             crate::inferlet::process::residency::kv_reclaim_quotes(pids, model, engine, budget)
@@ -46,7 +51,7 @@ impl ResidencyPlanner {
 
     fn pick_with_budget_escalation(
         pids: &[ProcessId],
-        rs_quotes: &[RsUnits],
+        rs_quotes: &[(RsUnits, u32)],
         deficit: Reclaim,
         room: Reclaim,
         quote: impl Fn(&[ProcessId], u32) -> Vec<Option<ReclaimQuote>>,
@@ -73,18 +78,20 @@ impl ResidencyPlanner {
     /// A pick's pages move whole, so one whose pages exceed the room left
     /// is unhostable; its rs slots park only when host rows hold them all,
     /// and stay on the device otherwise. One that adds nothing the head
-    /// still lacks stays.
+    /// still lacks stays. Each quote's rs comes with what it is worth in kv
+    /// pages (on a shared pool the chunks it frees; else 0), which counts
+    /// toward the head's pages.
     fn pick_from_quotes(
         pids: &[ProcessId],
         quotes: Vec<Option<ReclaimQuote>>,
-        rs_quotes: &[RsUnits],
+        rs_quotes: &[(RsUnits, u32)],
         deficit: Reclaim,
         room: Reclaim,
     ) -> (Vec<(ProcessId, Reclaim)>, Vec<ProcessId>) {
         let mut picks = Vec::new();
         let mut unhostable = Vec::new();
         let (mut covered, mut room) = (Reclaim::default(), room);
-        for ((&pid, quote), &rs) in pids.iter().zip(quotes).zip(rs_quotes) {
+        for ((&pid, quote), &(rs, worth)) in pids.iter().zip(quotes).zip(rs_quotes) {
             if covered.covers(deficit) {
                 break;
             }
@@ -92,13 +99,13 @@ impl ResidencyPlanner {
                 Some(ReclaimQuote::Pages(pages)) => pages,
                 _ => 0,
             };
-            let rs = if room.rs.covers(rs) {
-                rs
+            let (rs, worth) = if room.rs.covers(rs) {
+                (rs, worth)
             } else {
-                RsUnits::default()
+                (RsUnits::default(), 0)
             };
             let frees = Reclaim { pages, rs };
-            let helps = (pages > 0 && covered.pages < deficit.pages)
+            let helps = (pages.saturating_add(worth) > 0 && covered.pages < deficit.pages)
                 || (rs.slots > 0 && covered.rs.slots < deficit.rs.slots)
                 || (rs.pages > 0 && covered.rs.pages < deficit.rs.pages);
             if !helps {
@@ -109,7 +116,10 @@ impl ResidencyPlanner {
                 continue;
             }
             room = room.sub(frees);
-            covered = covered.add(frees);
+            covered = covered.add(Reclaim {
+                pages: pages.saturating_add(worth),
+                rs,
+            });
             picks.push((pid, frees));
         }
         (picks, unhostable)
@@ -141,14 +151,19 @@ impl ResidencyPlanner {
         let host_short = self.port.suspend_capable()
             && ((victims.deficit.pages > 0 && swap_free == 0)
                 || !self.swap_room().rs.covers(victims.deficit.rs));
+        // Kv the head itself lacks waits on the supply first; kv that stands
+        // for state it lacks moves now, as nothing else frees its chunks.
+        let kv_deficit = victims.deficit.pages.saturating_sub(victims.rs_pages);
         if victims.deficit.pages > 0 {
             if !self.port.suspend_capable() || swap_free == 0 {
                 self.note_short(victims.head, deficit, if host_short { deficit } else { 0 });
                 self.check_starvation(StarveCause::NoSwapRoom);
                 return;
             }
-            if (swap_free.saturating_mul(HOST_RESERVE_DIVISOR) <= swap_total && !self.is_wedged())
-                || !self.supply_stalled()
+            if kv_deficit > 0
+                && ((swap_free.saturating_mul(HOST_RESERVE_DIVISOR) <= swap_total
+                    && !self.is_wedged())
+                    || !self.supply_stalled())
             {
                 self.stats
                     .eviction_deferrals
@@ -201,7 +216,7 @@ impl ResidencyPlanner {
         let (free, _) = self.port.device_stats();
         let (rs_free, rs_total) = self.port.rs_stats();
         let rs_growth = self.rs_growth();
-        self.with_inner(|inner| {
+        let (mut victims, spare) = self.with_inner(|inner| {
             let (head, waiter) = inner.unmet_head()?;
             // What the device still has free and an eviction in flight
             // returns is supply, not deficit, as `supply_stalled` counts it.
@@ -210,6 +225,9 @@ impl ResidencyPlanner {
                 .max(inner.queued_quantum())
                 .saturating_sub(inner.accum.len() as u32);
             let expected = inner.expected_reclaim();
+            // In-flight moves past what the head's own kv takes free chunks
+            // for its state too.
+            let spare = expected.pages.saturating_sub(missing);
             let deficit = Reclaim {
                 pages: missing.saturating_sub(expected.pages.saturating_add(free)),
                 rs: waiter
@@ -252,13 +270,30 @@ impl ResidencyPlanner {
                     e6_fresh: proc.progressed || proc.idle || proc.held,
                 })
                 .collect();
-            Some(VictimSet {
-                head,
-                head_pid: waiter.pid,
-                deficit,
-                members,
-            })
-        })
+            Some((
+                VictimSet {
+                    head,
+                    head_pid: waiter.pid,
+                    deficit,
+                    rs_pages: 0,
+                    members,
+                },
+                spare,
+            ))
+        })?;
+        // State the head lacks on a shared pool is kv to move: the chunks it
+        // frees open for the state's shapes. Without this the planner moves
+        // nothing for it and the policy is asked to discard instead.
+        let as_pages = self.port.rs_as_pages(victims.deficit.rs);
+        if as_pages > 0 {
+            victims.rs_pages = as_pages.saturating_sub(spare);
+            victims.deficit.pages = victims.deficit.pages.saturating_add(victims.rs_pages);
+            victims.deficit.rs = RsUnits::default();
+            if victims.deficit == Reclaim::default() {
+                return None;
+            }
+        }
+        Some(victims)
     }
 
     fn commit_evictions(

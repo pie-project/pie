@@ -42,6 +42,10 @@ pub enum PlannerError {
         free: u32,
         total: u32,
         cause: StarveCause,
+        /// Short of state (`NoRsSlots`): the victim's own ask of the state
+        /// shapes, and what of them stands free and in all. `need`, `free`
+        /// and `total` are kv pages either way.
+        state: Option<(RsUnits, RsUnits, RsUnits)>,
     },
     RsHog {
         need: RsUnits,
@@ -76,19 +80,22 @@ impl std::fmt::Display for PlannerError {
                 free,
                 total,
                 cause,
-            } => {
-                let (pool, unit) = if matches!(cause, StarveCause::NoRsSlots) {
-                    ("state", "slots")
-                } else {
-                    ("KV", "pages")
-                };
-                write!(
+                state,
+            } => match state {
+                // The pages were never what it lacked: say the state.
+                Some((need, free, total)) => write!(
                     f,
-                    "{pool} pool starved: {need} {unit} asked, {free} free of {total}, {}, and no \
-                     fire in flight anywhere to complete and free {unit}",
+                    "state pool starved: {need} asked, {free} free of {total}, {}, and no \
+                     fire in flight anywhere to complete and free state",
                     cause.describe(),
-                )
-            }
+                ),
+                None => write!(
+                    f,
+                    "KV pool starved: {need} pages asked, {free} free of {total}, {}, and no \
+                     fire in flight anywhere to complete and free pages",
+                    cause.describe(),
+                ),
+            },
             PlannerError::RsHog { need, held, total } => write!(
                 f,
                 "recurrent pools exhausted by this process alone: it holds {held} and asks \
@@ -111,3 +118,43 @@ impl std::fmt::Display for PlannerError {
 }
 
 impl std::error::Error for PlannerError {}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A waiter short of window slots says so in window slots, not in the
+    /// kv pages that stood free beside them ("125 slots asked, 233 free of
+    /// 1870" were pages).
+    #[test]
+    fn a_state_starvation_names_the_state_it_lacked() {
+        let mut windows = [0; crate::store::rs::MAX_WINDOW_LISTS];
+        windows[0] = 33;
+        let need = RsUnits::of_windows(windows);
+        windows[0] = 24;
+        let free = RsUnits::of_windows(windows);
+        windows[0] = 935;
+        let total = RsUnits::of_windows(windows);
+        let error = PlannerError::Starved {
+            need: 125,
+            free: 233,
+            total: 1870,
+            cause: StarveCause::NoRsSlots,
+            state: Some((need, free, total)),
+        };
+        let said = error.to_string();
+        assert!(said.starts_with("state pool starved: 0 state slot(s) and 33 buffer page(s) (window lists [33, 0, 0, 0]) asked, 0 state slot(s) and 24"), "{said}");
+        assert!(!said.contains("233"), "{said}");
+        let kv = PlannerError::Starved {
+            need: 125,
+            free: 0,
+            total: 1870,
+            cause: StarveCause::NoEligibleVictim,
+            state: None,
+        };
+        assert!(
+            kv.to_string()
+                .starts_with("KV pool starved: 125 pages asked, 0 free of 1870")
+        );
+    }
+}

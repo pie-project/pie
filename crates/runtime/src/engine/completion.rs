@@ -513,6 +513,30 @@ struct WorkItemCompletionState {
     native_retired: AtomicBool,
     message: Mutex<Option<String>>,
     guard: Option<Arc<dyn CompletionLease>>,
+    /// Run once the completion resolves (or, never resolved, as the last
+    /// handle on it goes): see [`WorkItemCompletion::on_settled`].
+    on_settled: Mutex<Vec<SettledHook>>,
+}
+
+type SettledHook = Box<dyn FnOnce() + Send>;
+
+/// Runs `hooks` off the caller's stack where a runtime is up: a resolution
+/// may come under a store's lock its hooks take.
+fn run_settled(hooks: Vec<SettledHook>) {
+    if hooks.is_empty() {
+        return;
+    }
+    if crate::rt::has_runtime() {
+        crate::rt::spawn(async move {
+            for hook in hooks {
+                hook();
+            }
+        });
+    } else {
+        for hook in hooks {
+            hook();
+        }
+    }
 }
 
 impl WorkItemCompletionState {
@@ -528,7 +552,13 @@ impl WorkItemCompletionState {
             native_retired: AtomicBool::new(false),
             message: Mutex::new(None),
             guard,
+            on_settled: Mutex::new(Vec::new()),
         }
+    }
+
+    fn settled(&self) {
+        let hooks = std::mem::take(&mut *self.on_settled.lock().unwrap());
+        run_settled(hooks);
     }
 
     fn target_epoch(&self) -> u64 {
@@ -555,6 +585,7 @@ impl WorkItemCompletionState {
 
         let outcome = WakerTable::global().wake(self.slot);
         let _ = outcome;
+        self.settled();
     }
 
     fn resolve_failure(&self, message: impl Into<String>) {
@@ -563,6 +594,7 @@ impl WorkItemCompletionState {
             .store(WORK_ITEM_RESOLUTION_FAILED, Ordering::Release);
 
         let _ = WakerTable::global().wake(self.slot);
+        self.settled();
     }
 
     fn request_cancel(&self) {
@@ -634,6 +666,8 @@ impl Drop for WorkItemCompletionState {
         if self.native_retired.load(Ordering::Acquire) {
             self.terminal.mark_recyclable();
         }
+        // No one holds the work item any more: nothing runs it now.
+        run_settled(std::mem::take(self.on_settled.get_mut().unwrap()));
     }
 }
 
@@ -734,6 +768,20 @@ impl WorkItemCompletion {
 
     pub fn is_settled(&self) -> bool {
         self.state.result().is_some()
+    }
+
+    /// Runs `hook` once this resolves: now if it has, else as it does (or,
+    /// never resolved, once the last handle on it goes). Unlike awaiting it,
+    /// this takes no waker: a completion wakes one waiter, the one that
+    /// finalizes it, and a second waiter would take its wakeup.
+    pub fn on_settled(&self, hook: impl FnOnce() + Send + 'static) {
+        let mut hooks = self.state.on_settled.lock().unwrap();
+        if self.state.result().is_none() {
+            hooks.push(Box::new(hook));
+            return;
+        }
+        drop(hooks);
+        hook();
     }
 
     pub fn same_request(&self, other: &Self) -> bool {
@@ -961,5 +1009,66 @@ impl FrameSettlements {
         for mut pending in frames {
             pending.land(0, true).publish(broker);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::WorkItemCompletion;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::time::Duration;
+
+    async fn eventually(flag: &AtomicBool) -> bool {
+        for _ in 0..200 {
+            if flag.load(Ordering::Acquire) {
+                return true;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        false
+    }
+
+    /// A fire's epoch retires as its completion resolves while the pass that
+    /// finalizes the fire awaits the same completion. A completion wakes one
+    /// waiter, so the epoch once awaited it too and lost the wakeup to the
+    /// finalizer: the epoch, and every id freed after it, stayed open until
+    /// shutdown, and a pool under pressure starved behind it.
+    #[tokio::test]
+    async fn a_settled_hook_runs_beside_the_waiter_that_finalizes() {
+        let completion = WorkItemCompletion::deferred_with_guard(None);
+        let retired = Arc::new(AtomicBool::new(false));
+        let flag = retired.clone();
+        completion.on_settled(move || flag.store(true, Ordering::Release));
+        let finalizer = tokio::spawn(completion.clone());
+        // The finalizer registers its waker after the hook.
+        tokio::task::yield_now().await;
+        assert!(!retired.load(Ordering::Acquire), "nothing resolved yet");
+        completion.reject("done");
+        let finalized = tokio::time::timeout(Duration::from_secs(5), finalizer).await;
+        assert!(finalized.is_ok(), "the finalizer is woken");
+        assert!(
+            eventually(&retired).await,
+            "the epoch's hook ran beside the finalizer"
+        );
+    }
+
+    /// A hook on a resolved completion runs at once; one on a completion no
+    /// one resolves runs as its last handle goes.
+    #[tokio::test]
+    async fn a_settled_hook_runs_once_resolved_or_abandoned() {
+        let resolved = WorkItemCompletion::deferred_with_guard(None);
+        resolved.reject("done");
+        let ran = Arc::new(AtomicBool::new(false));
+        let flag = ran.clone();
+        resolved.on_settled(move || flag.store(true, Ordering::Release));
+        assert!(ran.load(Ordering::Acquire));
+
+        let abandoned = WorkItemCompletion::deferred_with_guard(None);
+        let ran = Arc::new(AtomicBool::new(false));
+        let flag = ran.clone();
+        abandoned.on_settled(move || flag.store(true, Ordering::Release));
+        drop(abandoned);
+        assert!(eventually(&ran).await, "an abandoned completion's hook ran");
     }
 }

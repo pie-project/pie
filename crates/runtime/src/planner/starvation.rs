@@ -118,7 +118,7 @@ impl ResidencyPlanner {
         let Some(victim_key) = self.pick_starvation_victim(cause) else {
             return;
         };
-        let (rs_free, _) = self.port.rs_stats();
+        let (rs_free, rs_total) = self.port.rs_stats();
         let notify = self.with_inner(|inner| {
             let (_, head) = inner.unmet_head()?;
             // A head the pools already cover is served next, so a kill would
@@ -143,11 +143,13 @@ impl ResidencyPlanner {
             if outcome.is_some() {
                 return None;
             }
+            let state = (cause == StarveCause::NoRsSlots).then_some((demand.rs, rs_free, rs_total));
             *outcome = Some(Err(PlannerError::Starved {
                 need: demand.kv_pages,
                 free,
                 total,
                 cause,
+                state,
             }));
             let notify = notify.clone();
             inner.killing.insert(victim_pid);

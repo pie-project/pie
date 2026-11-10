@@ -24,6 +24,9 @@ struct KeptPool {
     kept: parking_lot::Mutex<Vec<PhysicalKvPageId>>,
     total: u32,
     model: usize,
+    /// A shared pool's state shapes: `(free, total)` of them, and the kv
+    /// pages whose chunks hold one unit of state (`rs_as_pages`).
+    shared_state: Option<((RsUnits, RsUnits), u32)>,
 }
 
 impl KeptPool {
@@ -33,7 +36,15 @@ impl KeptPool {
             kept: parking_lot::Mutex::new((free..free + kept).map(PhysicalKvPageId).collect()),
             total: free + kept,
             model,
+            shared_state: None,
         }
+    }
+
+    /// State drawn from the kv pages' chunks: `stats` of it, each unit
+    /// worth `pages` kv pages parked.
+    fn sharing_state(mut self, stats: (RsUnits, RsUnits), pages: u32) -> Self {
+        self.shared_state = Some((stats, pages));
+        self
     }
 
     /// The policy's `discard`: what the cache kept is free.
@@ -66,8 +77,15 @@ impl PoolPort for KeptPool {
         (0, 0)
     }
     fn rs_stats(&self) -> (RsUnits, RsUnits) {
+        if let Some((stats, _)) = self.shared_state {
+            return stats;
+        }
         self.with_rs(|rs| (rs.free(), rs.capacity()))
             .unwrap_or_default()
+    }
+    fn rs_as_pages(&self, rs: RsUnits) -> u32 {
+        self.shared_state
+            .map_or(0, |(_, pages)| (rs.slots + rs.pages) * pages)
     }
     fn rs_host_stats(&self) -> (RsUnits, RsUnits) {
         Default::default()
@@ -99,6 +117,11 @@ impl PoolPort for KeptPool {
         self.free.lock().extend(pages);
     }
     fn reserve_rs(&self, need: RsUnits) -> Option<crate::store::rs::RsGrant> {
+        if let Some(((free, _), _)) = self.shared_state
+            && !free.covers(need)
+        {
+            return None;
+        }
         self.with_rs(|rs| rs.reserve(need))
             .unwrap_or_else(|| Some(Default::default()))
     }
@@ -361,4 +384,46 @@ fn a_model_without_fixed_state_is_not_charged() {
         planner.register(pid);
         assert!(planner.admit(pid).now_or_never().is_some());
     }
+}
+
+/// On a shared pool the state a waiter lacks comes from chunks kv holds:
+/// the planner counts it as kv pages to park, so it moves idle holders out
+/// rather than leave the policy to discard them.
+#[tokio::test(flavor = "current_thread")]
+async fn state_short_on_a_shared_pool_is_kv_for_the_planner_to_park() {
+    let _schedule = crate::policy::schedule::TEST_LOCK.read().await;
+    // No state free of 23 rs list pages; each takes 2 kv pages parked.
+    let stats = (RsUnits::default(), RsUnits::of(0, 23));
+    // Idle cache the policy may let go: the head waits on it, not on a restart.
+    let pool = Arc::new(KeptPool::new(4, 2, usize::MAX).sharing_state(stats, 2));
+    let (sink, _said) = recording();
+    let planner =
+        Arc::new(ResidencyPlanner::new(pool.clone() as Arc<dyn PoolPort>).pressure_sink(sink));
+    let head = ProcessId::new_v4();
+    planner.register(head);
+    planner.note_admitted(head);
+    let demand = Demand {
+        kv_pages: 1,
+        rs: RsUnits::of(0, 5),
+    };
+    let p = planner.clone();
+    let parked = crate::rt::spawn(async move { p.acquire(head, head, demand).await });
+    for _ in 0..200 {
+        crate::rt::yield_now().await;
+        if !planner.diagnostics().queue.is_empty() {
+            break;
+        }
+    }
+    let victims = planner.victim_set().expect("the head is short");
+    assert_eq!(victims.deficit.rs, RsUnits::default(), "no state left owed");
+    assert_eq!(
+        victims.rs_pages, 10,
+        "five rs pages as ten kv pages to park"
+    );
+    assert_eq!(victims.deficit.pages, 10, "the head's own kv is free");
+
+    // Without a shared pool the state is its own: no kv move frees it.
+    let own = Arc::new(KeptPool::new(4, 0, usize::MAX));
+    assert_eq!(own.rs_as_pages(RsUnits::of(0, 5)), 0);
+    parked.abort();
 }

@@ -14,6 +14,9 @@ pub(super) struct VictimSet {
     pub(super) head: EntryKey,
     pub(super) head_pid: ProcessId,
     pub(super) deficit: Reclaim,
+    /// Of `deficit.pages`, those that stand for state the head lacks: kv
+    /// that parks frees chunks any shape opens ([`super::PoolPort::rs_as_pages`]).
+    pub(super) rs_pages: u32,
     pub(super) members: Vec<Victim>,
 }
 

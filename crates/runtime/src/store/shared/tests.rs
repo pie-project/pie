@@ -586,6 +586,49 @@ fn fixed_facts() -> ChunkFacts {
 /// `fixed_facts`' rs list's pool id: the shapes' last.
 const RS_POOL: ShapeId = 3;
 
+/// State a waiter lacks is kv to park: the kv list slots whose chunks, let go
+/// whole, open for the rs list's slots and for whole records.
+#[test]
+fn state_short_counts_as_the_kv_list_slots_whose_chunks_it_takes() {
+    use crate::store::rs::RsUnits;
+    let pool = SharedPool::new(&fixed_facts(), 2, 256).unwrap();
+    let spc = |shape: ShapeId| u64::from(pool.pool().shape(shape).unwrap().slots_per_chunk);
+    let list = spc(LIST_POOL);
+    let rs = spc(RS_POOL);
+    assert_eq!(pool.list_slots_for(RsUnits::default()), 0);
+    // One rs list slot past a chunk's takes two chunks.
+    assert_eq!(
+        pool.list_slots_for(RsUnits::of(0, u32::try_from(rs).unwrap() + 1)),
+        2 * list
+    );
+    // A record: each fixed shape's pieces, chunk by chunk.
+    let record: u64 = pool
+        .fixed()
+        .iter()
+        .map(|shape| u64::from(shape.pieces).div_ceil(spc(shape.pool)))
+        .sum();
+    assert!(record > 0);
+    assert_eq!(pool.list_slots_for(RsUnits::of(1, 0)), record * list);
+
+    // A model whose only state is its windows (gemma): window list slots,
+    // each list by its own chunks, narrowest first.
+    let windowed = SharedPool::new(&window_facts(), 2, 256).unwrap();
+    let spc = |pool: &SharedPool, shape: ShapeId| {
+        u64::from(pool.pool().shape(shape).unwrap().slots_per_chunk)
+    };
+    let list = spc(&windowed, LIST_POOL);
+    let narrow = windowed.windows()[0];
+    let wide = windowed.windows()[1];
+    let mut lists = [0; crate::store::rs::MAX_WINDOW_LISTS];
+    lists[0] = u32::try_from(spc(&windowed, narrow.pool)).unwrap();
+    lists[1] = u32::try_from(spc(&windowed, wide.pool)).unwrap() + 1;
+    assert_eq!(
+        windowed.list_slots_for(RsUnits::of_windows(lists)),
+        3 * list,
+        "one chunk of the narrow list, two of the wide"
+    );
+}
+
 #[test]
 fn the_stores_take_list_refs_and_records_and_a_fork_names_its_cow() {
     use crate::pipeline::fire::rs::{PreparedRs, apply_shared, prepare, settle};

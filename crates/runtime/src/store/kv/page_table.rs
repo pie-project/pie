@@ -858,6 +858,22 @@ impl KvPageTable {
             .collect()
     }
 
+    /// Each page of `terminal`'s path from token 0: where it is, and its
+    /// key where it is sealed.
+    pub fn path_pages(&self, terminal: NodeId) -> Vec<(TriePageLocation, Option<Hash256>)> {
+        if !self.nodes.contains(terminal) {
+            return Vec::new();
+        }
+        let len = self.contribution_len(terminal);
+        if len == 0 {
+            return Vec::new();
+        }
+        self.path_locations(terminal, len - 1)
+            .into_iter()
+            .map(|at| (at, self.page_key_at(&at)))
+            .collect()
+    }
+
     /// Every sealed page's key, on any tier: what this worker can give a
     /// peer that asks by key.
     pub fn sealed_keys(&self) -> std::collections::HashSet<Hash256> {

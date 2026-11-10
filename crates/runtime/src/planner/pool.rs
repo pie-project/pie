@@ -69,6 +69,14 @@ pub trait PoolPort: Send + Sync + 'static {
             rs: need,
         })
     }
+    /// The device pages that, parked whole, make room for `rs` of the state
+    /// shapes: a shared pool opens any chunk for any shape, so a state
+    /// shortfall is met by moving kv out. 0 where state has pools of its
+    /// own, which no kv move frees.
+    fn rs_as_pages(&self, rs: RsUnits) -> u32 {
+        let _ = rs;
+        0
+    }
     /// The working sets reading pages past the pool's limit.
     fn working_sets_past_limit(&self) -> HashSet<crate::store::kv::page_table::WorkingSetId> {
         HashSet::new()
@@ -204,6 +212,18 @@ impl PoolPort for RegistryPool {
 
     fn rs_host_stats(&self) -> (RsUnits, RsUnits) {
         self.with_rs(|rs| (rs.host_available(), rs.host_capacity()))
+    }
+
+    fn rs_as_pages(&self, rs: RsUnits) -> u32 {
+        if rs.is_zero() {
+            return 0;
+        }
+        let stores = crate::store::registry::get(self.model, self.engine);
+        let Some(shared) = stores.shared.as_ref() else {
+            return 0;
+        };
+        let slots = shared.lock().unwrap().list_slots_for(rs);
+        u32::try_from(slots).unwrap_or(u32::MAX)
     }
 
     fn reclaim_idle(&self) -> u32 {
