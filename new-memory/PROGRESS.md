@@ -777,3 +777,12 @@ The `new-memory/` directory is bookkeeping and is removed before anything lands 
 - sm_120, qwen3-30b-a3b-mini at 5120 tokens: off and auto both show no re-seat warning and "bodies armed 131 of 131"
   (the M54 "0 of 0" bug is gone); tokens + top-4 bits = base; 405 / 399 tok/s (shared GPU; earlier rounds 450-481,
   so re-measure on a quiet GPU).
+
+### M58 — 2026-11-10: CUDA plan seats no expert itself (plan A)
+- `sc/l40s-cuda-plan-a` (e1e7c9a83): dense routed banks the weight cache takes are off every plan tier; uncached dense
+  banks stay whole on device; device_weight_budget now only decides which DENSE planes spill to host. On CUDA the
+  engine's per-expert slab / vote / promote are unreachable (kept only for ROCm quantized banks until their cache).
+- BEHAVIOR CHANGE: a CUDA MoE that used device_weight_budget to keep some experts on device no longer does; experts
+  live in the pool (held, or streamed by the runtime's cache).
+- Verified: routed_experts_stream plan tests, golden_submit_buffered, golden_offload = base. Untested: a real MoE
+  boot under a device_weight_budget below the dense planes (IT); budget refusal text still says "REGISTERED planes".
