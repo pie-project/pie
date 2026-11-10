@@ -3,7 +3,7 @@
 
 #[cfg(feature = "cuda")]
 use super::*;
-#[cfg(feature = "cuda")]
+use super::table::Planes;
 use crate::error::Error;
 #[cfg(feature = "cuda")]
 use crate::jit::Ctx;
