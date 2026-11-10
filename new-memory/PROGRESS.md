@@ -958,3 +958,9 @@ The `new-memory/` directory is bookkeeping and is removed before anything lands 
   `SharedGrow::hold_mapped` keeps the governor from giving those segments back. Metal-like facts tested; CUDA e2e
   (768 MiB and default) unchanged. Metal device run pending; engine-metal's back-everything-at-load workaround can
   shrink later.
+
+### M74 — 2026-11-10: Metal on the M73 runtime fit (BMX2)
+- `sc/bmx2-metal` (bc2fd6d12, ff47d82a3): engine-metal backs only the chunks it seats (whole segments); the runtime's
+  growable fit (M73) passes on device. `pie run`: gemma-4-e4b-4bit and Qwen3.6-35B-A3B-4bit tokens = base in off /
+  auto / on; Qwen3.6 boot ~11 s vs base 32-37 s; footprint ~0.1 GB below M72. qwen38 u2 imports (writer fixed in M68);
+  new affine 2-bit (g128) + 4-bit + 8-bit weight-cache test bitwise in all eight modes.
