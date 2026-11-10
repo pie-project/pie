@@ -3,11 +3,11 @@
 //! rollback (replayed from 0) and a logits row (`lgt`: its argmax is the first token).
 //!
 //!
-//! `split_sim_gptoss <program out dir> <prep dir> <prefix> <overrides> <steps a launch> [cmaddr]`
+//! `split_sim_gptoss <program out dir> <prep dir> <prefix> <steps a launch> [cmaddr]`
 //! (no cmaddr: the simulator; SPLIT_NTOK caps the tokens).
 
 use engine_cerebras::sdk::{Platform, Runtime, Sdk, Simulator, Target};
-use engine_cerebras::spatial::split::{SplitModel, SplitSpec, argmax};
+use engine_cerebras::spatial::split::{SplitModel, SplitSpec, argmax, artifact};
 
 fn run(m: &mut SplitModel, prompt: &[u32], n: usize, steps: usize) -> Vec<u32> {
     let mut got = Vec::new();
@@ -27,9 +27,10 @@ fn run(m: &mut SplitModel, prompt: &[u32], n: usize, steps: usize) -> Vec<u32> {
 
 fn main() {
     let a: Vec<String> = std::env::args().collect();
-    let spec = SplitSpec::parse(&format!("{}:{}:{}", a[2], a[3], a[4])).unwrap();
-    let steps: usize = a[5].parse().unwrap();
-    let platform = match a.get(6) {
+    let spec = SplitSpec::parse(&format!("{}:{}", a[2], a[3])).unwrap();
+    let steps: usize = a[4].parse().unwrap();
+    let art = artifact(std::path::Path::new(&a[1])).unwrap();
+    let platform = match a.get(5) {
         Some(c) => Platform::System { cmaddr: c.clone() },
         None => Platform::Simulator(Simulator {
             num_threads: 8,
@@ -50,12 +51,12 @@ fn main() {
     let n: usize = std::env::var("SPLIT_NTOK")
         .map_or(want.len(), |v| v.parse().unwrap())
         .min(want.len());
-    let vocab = spec.int("V").unwrap() as usize;
+    let vocab = art.header.model.vocab as usize;
     let sdk = Sdk::open().unwrap();
     let mut rt = Runtime::new(sdk, std::path::Path::new(&a[1]), platform, "WARNING").unwrap();
     rt.load();
     rt.run();
-    let mut m = SplitModel::open(Box::new(rt), &spec, vocab).unwrap();
+    let mut m = SplitModel::open(Box::new(rt), &spec, &art, vocab).unwrap();
     let mut ok = true;
     for rep in 0..2 {
         let t0 = std::time::Instant::now();

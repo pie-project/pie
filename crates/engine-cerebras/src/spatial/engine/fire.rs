@@ -428,7 +428,7 @@ impl Spatial {
         let start = c.tokens.len();
         // A loop's rows come back when it ends: the request's last rows wait
         // for its whole loop, so posted loops stay short
-        // (`PIE_CEREBRAS_SPLIT_LOOP`, else the prep meta's `LOOP`, else 32
+        // (`PIE_CEREBRAS_SPLIT_LOOP`, else the program plan's loop, else 32
         // steps past the row).
         let prep_loop = self.model()?.split_loop;
         let c = &mut self.kv.cached;

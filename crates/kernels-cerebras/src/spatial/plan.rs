@@ -1,8 +1,10 @@
-//! The logical plan: what the model is ([`Shape`]) and how it is cut ([`Partition`]), with the
-//! run-time promises a build makes ([`Contract`]). No coordinates, colours or kernel names: this is
-//! the seam the spatial compiler takes over later (poem's trace makes the [`Shape`], a search
-//! makes the [`Partition`]); today a family reads both off the prep's meta
+//! The logical plan: what the model is ([`Shape`]), how it is cut ([`Partition`]) and what the
+//! build promises at run time ([`Contract`]), with the family that builds it. No coordinates,
+//! colours or kernel names: the spatial pass reads the [`Shape`] off the model's trace
+//! ([`super::target`]) and a family turns it and a [`Preset`] into the plan
 //! ([`super::family::Family::plan`]).
+
+use std::collections::BTreeMap;
 
 use serde::{Deserialize, Serialize};
 
@@ -27,7 +29,7 @@ impl FamilyId {
         FamilyId::Gemma12,
     ];
 
-    /// The family's name: the meta's `family` key, `split-geo --geometry <name>:<geometry>`.
+    /// The family's name (the plan's record, error messages).
     pub fn name(self) -> &'static str {
         match self {
             FamilyId::Qwen => "qwen",
@@ -42,14 +44,12 @@ impl FamilyId {
     }
 }
 
-/// The model, as the wafer program needs it. Pure model facts: the same for every partition.
+/// The model, as the wafer program needs it: the model's own facts, read off its trace, the same
+/// for every partition.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct Shape {
-    pub family: FamilyId,
     /// Hidden size of the checkpoint (norms divide by this).
     pub hidden: u32,
-    /// Hidden size as placed (zero-padded so the row split divides it; Qwen3-8B 4,096 -> 4,104).
-    pub hidden_placed: u32,
     /// Vocabulary of the checkpoint (the head pads past it with copies of its last real row).
     pub vocab: u32,
     pub layers: Vec<LayerKind>,
@@ -89,12 +89,9 @@ pub struct AttnSpec {
     pub global_head_dim: Option<u32>,
     /// Qwen3.5's sigmoid output gate.
     pub output_gate: bool,
-    /// Gemma 12B's k = v.
-    pub k_eq_v: bool,
     pub qk_norm: bool,
     /// gpt-oss's attention sinks.
     pub sinks: bool,
-    pub softcap: Option<f32>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -243,7 +240,7 @@ pub struct HeadPartition {
 }
 
 /// What a build promises the host at run time.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
 pub struct Contract {
     /// Positions the program serves: min(KV entries x KV rows, the RoPE tables' reach).
     pub positions: u32,
@@ -256,11 +253,14 @@ pub struct Contract {
     pub loop_len: u32,
     /// The on-wafer token loop (`WL`).
     pub token_loop: bool,
+    /// The logits' prescale the head applies (gpt-oss's band head: 2^15), 1 without one.
+    pub logit_scale: f32,
 }
 
 /// The logical plan: the input of the physical build ([`super::program::Program::build`]).
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct Plan {
+    pub family: FamilyId,
     pub shape: Shape,
     pub partition: Partition,
     pub contract: Contract,
@@ -268,7 +268,7 @@ pub struct Plan {
 
 impl Plan {
     /// Checks the plan is self-consistent before any physical work: divisibility (`rows` divides
-    /// `hidden_placed`, segments divide the half-rows they live in, head groups cover every row),
+    /// the placed hidden, segments divide the half-rows they live in, head groups cover every row),
     /// `layers_per_unit * units == layers.len()`, `kv_rows <= rows`, positions within the RoPE
     /// reach.
     ///
@@ -280,10 +280,11 @@ impl Plan {
         if sh.hidden == 0 || sh.vocab == 0 || sh.layers.is_empty() {
             return bad("an empty model".into());
         }
-        if sh.hidden_placed < sh.hidden {
+        if pa.hidden_placed() < sh.hidden {
             return bad(format!(
                 "placed hidden {} < hidden {}",
-                sh.hidden_placed, sh.hidden
+                pa.hidden_placed(),
+                sh.hidden
             ));
         }
         if pa.units == 0 || pa.layers_per_unit == 0 || pa.rows == 0 || pa.cols == 0 {
@@ -301,25 +302,15 @@ impl Plan {
         if pa.kv_rows == 0 || pa.kv_rows > pa.rows {
             return bad(format!("KV rows {} of {} rows", pa.kv_rows, pa.rows));
         }
-        if !pa.row_dims.is_empty() {
-            let mut next = 0;
-            let mut dims = 0;
-            for run in &pa.row_dims {
-                if run.rows.0 != next || run.rows.1 <= run.rows.0 {
-                    return bad(format!("row runs not contiguous at {:?}", run.rows));
-                }
-                next = run.rows.1;
-                dims += (run.rows.1 - run.rows.0) * run.dims;
+        let mut next = 0;
+        for run in &pa.row_dims {
+            if run.rows.0 != next || run.rows.1 <= run.rows.0 {
+                return bad(format!("row runs not contiguous at {:?}", run.rows));
             }
-            if next != pa.rows {
-                return bad(format!("row runs end at {next}, not {}", pa.rows));
-            }
-            if dims != sh.hidden_placed {
-                return bad(format!(
-                    "row runs hold {dims} dims, the placed hidden is {}",
-                    sh.hidden_placed
-                ));
-            }
+            next = run.rows.1;
+        }
+        if next != pa.rows {
+            return bad(format!("row runs end at {next}, not {}", pa.rows));
         }
         // A segment lives in one half of a unit row and must not span its control column.
         let halves: Vec<(&str, u32, u32)> = match pa.attn_cols {
@@ -374,5 +365,59 @@ impl Plan {
             }
         }
         Ok(())
+    }
+}
+
+impl Partition {
+    /// The hidden size as placed: every row's dims (zero-padded past the model's hidden where the
+    /// rows do not divide it; Qwen3-8B 4,096 -> 4,104).
+    pub fn hidden_placed(&self) -> u32 {
+        self.row_dims
+            .iter()
+            .map(|r| (r.rows.1 - r.rows.0) * r.dims)
+            .sum()
+    }
+}
+
+/// A family's partition choices by name (its preset table), with any overrides set over them:
+/// the counts and split factors a family turns into a [`Partition`] and a [`Contract`] for a
+/// [`Shape`]. Keys are the family's (`PX`, `PY`, `K`, `G2`, ...); values are numbers.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct Preset {
+    pub name: String,
+    pub keys: BTreeMap<String, f64>,
+}
+
+impl Preset {
+    pub fn new(name: &str, keys: &[(&str, f64)]) -> Preset {
+        Preset {
+            name: name.to_string(),
+            keys: keys.iter().map(|(k, v)| (k.to_string(), *v)).collect(),
+        }
+    }
+
+    /// `k=v,...` over the preset's keys.
+    pub fn set(mut self, kvs: &str) -> Result<Preset, String> {
+        for kv in kvs.split(',').filter(|s| !s.is_empty()) {
+            let (k, v) = kv
+                .split_once('=')
+                .ok_or_else(|| format!("--set {kv}: k=v"))?;
+            let v: f64 = v.parse().map_err(|e| format!("--set {kv}: {e}"))?;
+            self.keys.insert(k.to_string(), v);
+        }
+        Ok(self)
+    }
+
+    pub fn float(&self, k: &str) -> Option<f64> {
+        self.keys.get(k).copied()
+    }
+
+    pub fn int(&self, k: &str) -> Option<u32> {
+        self.float(k).map(|v| v as u32)
+    }
+
+    pub fn need(&self, k: &str) -> Result<u32, String> {
+        self.int(k)
+            .ok_or_else(|| format!("preset {}: no {k}", self.name))
     }
 }

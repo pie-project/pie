@@ -1,54 +1,59 @@
-//! `split-geo`: the role-split program's geometry as files, for the Python tools (the preps,
-//! `mkfull*.py`, `run*.py`), so Rust is the one geometry implementation.
+//! `split-geo`: the wafer program's compiler. `plan` runs poem's spatial pass over a model's trace
+//! (or a shape stated outright) and writes the plan with what a prep tiles the checkpoint by;
+//! `build` writes everything a plan builds: the program's sources, the artifact the engine runs,
+//! and what the Python tools read.
 //!
 //! ```text
-//! split-geo <prep dir> <prefix> [k=v,...] --out <dir>
-//!           [--what floor,rcfg,kernels,layout,host,meta,bindings,program]
-//!           [--levers K:V,...] [--kernels <programs/split dir>]
-//! split-geo --plan <plan.json> --out <dir> [...]
-//! split-geo --geometry <qwen|gptoss|gemma|gemma12>:<name>
+//! split-geo plan (--model <deployment> | --shape <shape.json>) [--preset <name>] [--set K=V,...]
+//!                --out <dir>
+//! split-geo build --plan <plan.json> --out <dir> [--emit floor,rcfg,kernels,layout,host,meta,
+//!                 bindings,program] [--levers K:V,...] [--kernels <programs/split dir>]
 //! ```
 //!
-//! `--geometry` prints a named geometry as JSON (what a prep needs before its meta exists: the
-//! unit shape, the head, Gemma's PLE storage columns, Gemma 12B's row groups); the prep then
-//! writes the meta the plan reads.
+//! `plan` writes `<dir>/plan.json` (the [`Plan`]) and `<dir>/tiling.json` (the family's
+//! [`tiling`](kernels_cerebras::spatial::family::Family::tiling): the cut a prep tiles by, with
+//! the preset's name).
+//! `--model` names a catalog deployment (`qwen35-d9b-bf16-kv-bf16`); `--preset` one of the
+//! serving family's presets (else the first that builds); `--set` overrides its keys.
 //!
-//! Writes, under `<dir>`:
+//! `build` writes, under `<dir>`:
 //! - `floor.json`: units (rects, cx / cy, layers), relays, head block, stores, and the kind
 //!   rectangles (`Floor::rects_by_kind`);
 //! - `rcfg.npy` (u32, [h][w][words], zero-padded to the longest; idle PEs all zero), `rcfg_n.npy`
-//!   (u32, [h][w]: each PE's word count) and `rcfg.txt`
-//!   (`emit::rcfg::dump`, the parity tests' format);
+//!   (u32, [h][w]: each PE's word count) and `rcfg.txt` (`emit::rcfg::dump`);
 //! - `kernels.json`: each role kind's source, owned symbols and params (levers applied);
 //! - `layout/`: `layout.csl` and the per-kind sources (`emit::layout::write`), with the
 //!   `params.txt` and `geo.env` `link.sh` reads;
 //! - `host.json`: `emit::host::HostLayout`;
-//! - `meta.json`: the meta the plan states;
+//! - `meta.json`: the plan's record for the Python runners;
 //! - `bindings.json`: every copy onto the wafer in placement order (`Program::bindings`), which the
-//!   Python runners execute (`tools/split/splitgeo.py`'s `place`) instead of placing on their own;
-//! - `program.json`: the artifact's header (`artifact::Header`: the model facts, the meta it was
-//!   built from). With `host.json`, `bindings.json` and the rcfg arrays it is the
-//!   `artifact::Artifact` the engine runs (`PIE_CEREBRAS_SPLIT_ARTIFACT`, or
-//!   `<prep>/<prefix>program/`).
+//!   Python runners execute (`tools/split/splitgeo.py`'s `place`);
+//! - `program.json`: the artifact's header (`artifact::Header`: the model facts and the plan).
+//!   With `host.json`, `bindings.json` and the rcfg arrays it is the `artifact::Artifact` the
+//!   engine runs.
 //!
 //! The kernel sources default to `$SPLIT_SRC`, else this crate's `programs/split`.
 
 use std::path::{Path, PathBuf};
 
 use kernels_cerebras::spatial::artifact::Artifact;
-use kernels_cerebras::spatial::emit::meta::Meta;
 use kernels_cerebras::spatial::emit::params::{Levers, kernels};
-use kernels_cerebras::spatial::emit::{layout, rcfg};
+use kernels_cerebras::spatial::emit::{layout, meta, rcfg};
 use kernels_cerebras::spatial::family;
 use kernels_cerebras::spatial::floor::{HeadBlock, Rect, StoreBlock, Unit};
-use kernels_cerebras::spatial::plan::{FamilyId, Plan};
+use kernels_cerebras::spatial::plan::{Plan, Shape};
 use kernels_cerebras::spatial::program::Program;
 use kernels_cerebras::spatial::role::Kind;
+use kernels_cerebras::spatial::target;
 use serde::Serialize;
 
-const WHATS: [&str; 8] = [
+const EMITS: [&str; 8] = [
     "floor", "rcfg", "kernels", "layout", "host", "meta", "bindings", "program",
 ];
+
+const USAGE: &str = "usage: split-geo plan (--model <deployment> | --shape <shape.json>) \
+     [--preset <name>] [--set K=V,...] --out <dir>\n       split-geo build --plan <plan.json> \
+     --out <dir> [--emit a,b] [--levers K:V,...] [--kernels <dir>]";
 
 fn main() {
     if let Err(e) = run() {
@@ -57,65 +62,27 @@ fn main() {
     }
 }
 
-struct Args {
-    prep: Option<(PathBuf, String, String)>,
-    plan: Option<PathBuf>,
-    out: PathBuf,
-    what: Vec<String>,
-    levers: Levers,
-    kernels: PathBuf,
-}
-
-fn usage() -> String {
-    "usage: split-geo <prep dir> <prefix> [k=v,...] --out <dir> [--what a,b] [--levers K:V,...] \
-     [--kernels <dir>] | split-geo --plan <plan.json> --out <dir> [...] | split-geo --geometry \
-     <family>:<name>"
-        .to_string()
-}
-
-fn args() -> Result<Args, String> {
-    let mut pos = Vec::new();
-    let (mut plan, mut out, mut what, mut levers, mut kdir) = (None, None, None, None, None);
-    let mut it = std::env::args().skip(1);
+/// The flags after the subcommand, by name.
+fn flags(args: &[String], known: &[&str]) -> Result<Vec<(String, String)>, String> {
+    let mut out = Vec::new();
+    let mut it = args.iter();
     while let Some(a) = it.next() {
-        let mut val = || {
-            it.next()
-                .ok_or_else(|| format!("{a}: a value\n{}", usage()))
-        };
-        match a.as_str() {
-            "--plan" => plan = Some(PathBuf::from(val()?)),
-            "--out" => out = Some(PathBuf::from(val()?)),
-            "--what" => what = Some(val()?),
-            "--levers" => levers = Some(val()?),
-            "--kernels" => kdir = Some(PathBuf::from(val()?)),
-            "-h" | "--help" => return Err(usage()),
-            _ if a.starts_with("--") => return Err(format!("{a}?\n{}", usage())),
-            _ => pos.push(a),
+        if !known.contains(&a.as_str()) {
+            return Err(format!("{a}?\n{USAGE}"));
         }
+        let v = it.next().ok_or_else(|| format!("{a}: a value\n{USAGE}"))?;
+        out.push((a.clone(), v.clone()));
     }
-    let prep = match (plan.is_some(), pos.len()) {
-        (true, 0) => None,
-        (false, 2) => Some((PathBuf::from(&pos[0]), pos[1].clone(), String::new())),
-        (false, 3) => Some((PathBuf::from(&pos[0]), pos[1].clone(), pos[2].clone())),
-        _ => return Err(usage()),
-    };
-    let what: Vec<String> = what
-        .map(|w| w.split(',').map(str::to_string).collect())
-        .unwrap_or_else(|| WHATS.iter().map(|s| s.to_string()).collect());
-    if let Some(w) = what.iter().find(|w| !WHATS.contains(&w.as_str())) {
-        return Err(format!("--what {w}: one of {}", WHATS.join(",")));
-    }
-    let kernels = kdir
-        .or_else(|| std::env::var_os("SPLIT_SRC").map(PathBuf::from))
-        .unwrap_or_else(|| Path::new(env!("CARGO_MANIFEST_DIR")).join("programs/split"));
-    Ok(Args {
-        prep,
-        plan,
-        out: out.ok_or_else(usage)?,
-        what,
-        levers: Levers::parse(levers.as_deref().unwrap_or(""))?,
-        kernels,
-    })
+    Ok(out)
+}
+
+fn get<'a>(f: &'a [(String, String)], k: &str) -> Option<&'a str> {
+    f.iter().find(|(n, _)| n == k).map(|(_, v)| v.as_str())
+}
+
+fn read<T: for<'de> serde::Deserialize<'de>>(p: &str) -> Result<T, String> {
+    let text = std::fs::read_to_string(p).map_err(|e| format!("{p}: {e}"))?;
+    serde_json::from_str(&text).map_err(|e| format!("{p}: {e}"))
 }
 
 /// `floor.json`: the floor without its per-PE role grid (the kind rectangles stand for it).
@@ -140,47 +107,61 @@ fn json(dir: &Path, name: &str, v: &impl Serialize) -> Result<(), String> {
     write(dir, name, format!("{s}\n").as_bytes())
 }
 
-/// `--geometry <family>:<name>`: the named geometry (see the module doc).
-fn geometry(spec: &str) -> Result<serde_json::Value, String> {
-    let (fam, name) = spec
-        .split_once(':')
-        .ok_or_else(|| format!("--geometry {spec}: <family>:<name>"))?;
-    let id = FamilyId::of_name(fam).ok_or_else(|| {
-        let names: Vec<_> = FamilyId::ALL.iter().map(|f| f.name()).collect();
-        format!("--geometry {spec}: a family of {}", names.join(", "))
-    })?;
-    family::of(id).geometry(name)
+fn mkdir(dir: &Path) -> Result<(), String> {
+    std::fs::create_dir_all(dir).map_err(|e| format!("{}: {e}", dir.display()))
 }
 
-fn run() -> Result<(), String> {
-    let mut argv = std::env::args().skip(1);
-    if let (Some(f), Some(spec)) = (argv.next(), argv.next())
-        && f == "--geometry"
-    {
-        let v = geometry(&spec)?;
-        println!("{}", serde_json::to_string(&v).map_err(|e| e.to_string())?);
-        return Ok(());
-    }
-    let a = args()?;
-    let (prog, meta) = match (&a.prep, &a.plan) {
-        (Some((dir, prefix, ov)), _) => {
-            let meta = Meta::read(dir, prefix, ov)?;
-            (Program::from_meta(&meta)?, Some(meta))
+/// `plan`: the plan of a deployment's trace (or of a shape file) and its tiling.
+fn plan(args: &[String]) -> Result<(), String> {
+    let f = flags(args, &["--model", "--shape", "--preset", "--set", "--out"])?;
+    let (preset, set) = (get(&f, "--preset"), get(&f, "--set").unwrap_or(""));
+    let planned = match (get(&f, "--model"), get(&f, "--shape")) {
+        (Some(name), None) => {
+            let catalog = poem_compiler::catalog::repository();
+            let d = catalog
+                .parse(name)
+                .ok_or_else(|| format!("--model {name}: no such deployment"))?;
+            let trace = d
+                .try_trace(poem_ir::Platform::Cerebras)
+                .map_err(|e| format!("--model {name}: {e}"))?;
+            target::plan(&trace, preset, set)?
         }
-        (None, Some(p)) => {
-            let text = std::fs::read_to_string(p).map_err(|e| format!("{}: {e}", p.display()))?;
-            let plan: Plan =
-                serde_json::from_str(&text).map_err(|e| format!("{}: {e}", p.display()))?;
-            (Program::build(family::of(plan.shape.family), plan)?, None)
-        }
-        (None, None) => return Err(usage()),
+        (None, Some(path)) => target::plan_shape(read::<Shape>(path)?, preset, set)?,
+        _ => return Err(format!("--model or --shape, one of them\n{USAGE}")),
     };
-    std::fs::create_dir_all(&a.out).map_err(|e| format!("{}: {e}", a.out.display()))?;
-    let want = |w: &str| a.what.iter().any(|x| x == w);
+    let out = PathBuf::from(get(&f, "--out").ok_or(USAGE)?);
+    mkdir(&out)?;
+    let plan = &planned.plan;
+    let mut tiling = family::of(plan.family).tiling(plan)?;
+    tiling["preset"] = planned.preset.name.clone().into();
+    json(&out, "plan.json", plan)?;
+    json(&out, "tiling.json", &tiling)
+}
+
+/// `build`: everything a plan builds.
+fn build(args: &[String]) -> Result<(), String> {
+    let f = flags(
+        args,
+        &["--plan", "--out", "--emit", "--levers", "--kernels"],
+    )?;
+    let plan: Plan = read(get(&f, "--plan").ok_or(USAGE)?)?;
+    let out = PathBuf::from(get(&f, "--out").ok_or(USAGE)?);
+    let emit: Vec<&str> = get(&f, "--emit").map_or(EMITS.to_vec(), |e| e.split(',').collect());
+    if let Some(e) = emit.iter().find(|e| !EMITS.contains(e)) {
+        return Err(format!("--emit {e}: of {}", EMITS.join(",")));
+    }
+    let levers = Levers::parse(get(&f, "--levers").unwrap_or(""))?;
+    let kdir = get(&f, "--kernels")
+        .map(PathBuf::from)
+        .or_else(|| std::env::var_os("SPLIT_SRC").map(PathBuf::from))
+        .unwrap_or_else(|| Path::new(env!("CARGO_MANIFEST_DIR")).join("programs/split"));
+    let prog = Program::of(plan)?;
+    mkdir(&out)?;
+    let want = |w: &str| emit.contains(&w);
     if want("floor") {
         let f = &prog.floor;
         json(
-            &a.out,
+            &out,
             "floor.json",
             &FloorFile {
                 w: f.w,
@@ -193,37 +174,42 @@ fn run() -> Result<(), String> {
             },
         )?;
     }
-    let art = if ["rcfg", "host", "bindings", "program"]
+    if ["rcfg", "host", "bindings", "program"]
         .iter()
         .any(|w| want(w))
     {
-        Some(Artifact::of(&prog, meta.as_ref())?)
-    } else {
-        None
-    };
-    if let Some(art) = &art {
+        let art = Artifact::of(&prog)?;
         if want("rcfg") {
-            art.write_rcfg(&a.out)?;
-            write(&a.out, "rcfg.txt", rcfg::dump(&prog)?.as_bytes())?;
+            art.write_rcfg(&out)?;
+            write(&out, "rcfg.txt", rcfg::dump(&prog)?.as_bytes())?;
         }
         if want("host") {
-            art.write_host(&a.out)?;
+            art.write_host(&out)?;
         }
         if want("bindings") {
-            art.write_bindings(&a.out)?;
+            art.write_bindings(&out)?;
         }
         if want("program") {
-            art.write_header(&a.out)?;
+            art.write_header(&out)?;
         }
     }
     if want("kernels") {
-        json(&a.out, "kernels.json", &kernels(&prog, &a.levers)?)?;
+        json(&out, "kernels.json", &kernels(&prog, &levers)?)?;
     }
     if want("layout") {
-        layout::write(&prog, &a.levers, &a.kernels, &a.out.join("layout"))?;
+        layout::write(&prog, &levers, &kdir, &out.join("layout"))?;
     }
     if want("meta") {
-        json(&a.out, "meta.json", &Meta::of_plan(&prog.plan))?;
+        json(&out, "meta.json", &meta::of_plan(&prog.plan))?;
     }
     Ok(())
+}
+
+fn run() -> Result<(), String> {
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    match args.first().map(String::as_str) {
+        Some("plan") => plan(&args[1..]),
+        Some("build") => build(&args[1..]),
+        _ => Err(USAGE.to_string()),
+    }
 }

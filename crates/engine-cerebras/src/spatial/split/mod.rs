@@ -1,27 +1,22 @@
-//! The role-split wafer program in process ([`SplitModel`]): tokens at positions, a launch of S
-//! passes, the wafer token loop's out-token ring. The program is an
-//! [`Artifact`] (`kernels_cerebras::spatial`: the host's map of the wafer, every copy onto it,
-//! every PE's rcfg words); nothing here names a model.
+//! The wafer program in process ([`SplitModel`]): tokens at positions, a launch of S passes, the
+//! wafer token loop's out-token ring. The program is an [`Artifact`] (`kernels_cerebras::spatial`:
+//! the host's map of the wafer, every copy onto it, every PE's rcfg words), which `link.sh` puts in
+//! the compiled program's `artifact/`; nothing here names a model or builds anything.
 //!
 //! The program keeps one sequence's KV and GDN state on the wafer, by
 //! position; a pass at position 0 starts a new sequence (the kernels zero
 //! their state). The host keeps the tokens the wafer has taken, so a run
 //! that starts behind them (a fork, a rejected row) replays from 0.
 //!
-//! Selected by `PIE_CEREBRAS_SPLIT=<prep dir>:<prefix>[:k=v,...]`: the
-//! prepared tiles (`<prefix>meta.json`, `<prefix>w<u>.npy`, ...; built by
-//! the prep step from the checkpoint) and the build's overrides (`G2`, `WL`,
-//! `CAP`). The artifact is `PIE_CEREBRAS_SPLIT_ARTIFACT`, else
-//! `<prep dir>/<prefix>program/` ([`artifact`]).
+//! The weights are the prep's tiles: `PIE_CEREBRAS_SPLIT=<prep dir>:<prefix>`
+//! (`<prefix>w<u>.npy`, ...; built by the prep step from the checkpoint for the program's plan).
 
 pub mod place;
 
-use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 use kernels_cerebras::spatial::artifact::Artifact;
 use kernels_cerebras::spatial::emit::host::HostLayout;
-use kernels_cerebras::spatial::emit::meta::Meta;
 use kernels_cerebras::spatial::floor;
 use kernels_cerebras::spatial::npy::Npy;
 
@@ -30,50 +25,33 @@ use crate::sdk::Rect;
 
 type R<T> = std::result::Result<T, String>;
 
-/// `PIE_CEREBRAS_SPLIT`: the prep directory, the file prefix, the overrides.
+/// The artifact's directory in a compiled program.
+pub const ARTIFACT: &str = "artifact";
+
+/// `PIE_CEREBRAS_SPLIT`: where the prep's tiles are, and their file prefix.
 #[derive(Clone, Debug)]
 pub struct SplitSpec {
     pub prep: PathBuf,
     pub prefix: String,
-    pub meta: serde_json::Map<String, serde_json::Value>,
 }
 
 impl SplitSpec {
-    pub fn from_env() -> R<Option<SplitSpec>> {
+    pub fn from_env() -> R<SplitSpec> {
         match std::env::var("PIE_CEREBRAS_SPLIT") {
-            Ok(v) if !v.is_empty() => SplitSpec::parse(&v).map(Some),
-            _ => Ok(None),
+            Ok(v) if !v.is_empty() => SplitSpec::parse(&v),
+            _ => Err("PIE_CEREBRAS_SPLIT (<prep dir>:<prefix>) is unset".into()),
         }
     }
 
     pub fn parse(v: &str) -> R<SplitSpec> {
-        let mut it = v.splitn(3, ':');
-        let prep = PathBuf::from(it.next().unwrap_or("."));
-        let prefix = it.next().unwrap_or("").to_string();
-        let path = prep.join(format!("{prefix}meta.json"));
-        let mut meta: serde_json::Map<String, serde_json::Value> = serde_json::from_str(
-            &std::fs::read_to_string(&path).map_err(|e| format!("{}: {e}", path.display()))?,
-        )
-        .map_err(|e| format!("{}: {e}", path.display()))?;
-        for kv in it.next().unwrap_or("").split(',').filter(|s| !s.is_empty()) {
-            let (k, x) = kv
-                .split_once('=')
-                .ok_or_else(|| format!("PIE_CEREBRAS_SPLIT override {kv}: k=v"))?;
-            let n: i64 = x.parse().map_err(|e| format!("override {kv}: {e}"))?;
-            let val = match meta.get(k) {
-                Some(serde_json::Value::Bool(_)) => serde_json::Value::Bool(n != 0),
-                _ => serde_json::Value::from(n),
-            };
-            meta.insert(k.to_string(), val);
+        let (prep, prefix) = v.split_once(':').unwrap_or((v, ""));
+        if prefix.contains(':') {
+            return Err(format!("PIE_CEREBRAS_SPLIT {v}: <prep dir>:<prefix>"));
         }
-        Ok(SplitSpec { prep, prefix, meta })
-    }
-
-    pub fn int(&self, k: &str) -> Option<u32> {
-        match self.meta.get(k)? {
-            serde_json::Value::Bool(b) => Some(u32::from(*b)),
-            v => v.as_u64().map(|x| x as u32),
-        }
+        Ok(SplitSpec {
+            prep: PathBuf::from(prep),
+            prefix: prefix.to_string(),
+        })
     }
 
     pub fn file(&self, name: &str) -> PathBuf {
@@ -87,6 +65,23 @@ impl SplitSpec {
     pub fn has(&self, name: &str) -> bool {
         self.file(&format!("{name}.npy")).exists()
     }
+}
+
+/// A compiled wafer program: one with an artifact.
+pub fn is_split(program: &Path) -> bool {
+    program.join(ARTIFACT).join("program.json").exists()
+}
+
+/// The artifact of the compiled program at `program`.
+pub fn artifact(program: &Path) -> R<Artifact> {
+    let dir = program.join(ARTIFACT);
+    if !dir.join("program.json").exists() {
+        return Err(format!(
+            "{}: no artifact (split-geo build --plan <plan.json> --out <dir>, then link.sh <dir>)",
+            dir.display()
+        ));
+    }
+    Artifact::read(&dir)
 }
 
 /// The role-split model on a loaded program. Everything program-specific comes from its
@@ -107,7 +102,7 @@ pub struct SplitModel {
     x_off: Vec<usize>,
     embed: Embed,
     eps: f32,
-    /// `lgt`'s prescale (the prep's `HSCALE`: the band head's 2^15 logits; 1 without one).
+    /// `lgt`'s prescale (the plan's: the band head's 2^15 logits; 1 without one).
     lgt_scale: f32,
     /// Prompt rows forced through the token loop (`PIE_CEREBRAS_SPLIT_FORCE=1`).
     force: bool,
@@ -120,56 +115,9 @@ enum Embed {
     Table(Npy),
 }
 
-/// The program's artifact for `spec`: `PIE_CEREBRAS_SPLIT_ARTIFACT`, else
-/// `<prep>/<prefix>program/`, checked against the prep's meta. A prep staged before artifacts
-/// has none: compat, the artifact is built here from its meta (`split-geo <prep> <prefix>
-/// [overrides] --out <prep>/<prefix>program` writes it once).
-pub fn artifact(spec: &SplitSpec) -> R<Artifact> {
-    let dir = std::env::var_os("PIE_CEREBRAS_SPLIT_ARTIFACT")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| spec.file("program"));
-    let meta: BTreeMap<String, serde_json::Value> = spec.meta.clone().into_iter().collect();
-    if !dir.join("program.json").exists() {
-        tracing::warn!(
-            dir = %dir.display(),
-            "split: no artifact; building it from the prep's meta (compat)"
-        );
-        return Artifact::build(&Meta { map: meta });
-    }
-    let art = Artifact::read(&dir)?;
-    if let Some(built) = &art.header.meta
-        && *built != meta
-    {
-        let keys: Vec<&String> = built
-            .keys()
-            .chain(meta.keys())
-            .filter(|k| built.get(*k) != meta.get(*k))
-            .collect();
-        return Err(format!(
-            "{}: built from another meta (keys {keys:?} differ): rebuild it with split-geo",
-            dir.display()
-        ));
-    }
-    Ok(art)
-}
-
 impl SplitModel {
-    /// Places the prep on `dev` (a loaded, running program) and runs init, by the program's
-    /// [`artifact`].
-    pub fn open(dev: Box<dyn Device>, spec: &SplitSpec, vocab: usize) -> R<SplitModel> {
-        let t0 = std::time::Instant::now();
-        let art = artifact(spec)?;
-        tracing::info!(
-            ms = t0.elapsed().as_millis() as u64,
-            w = art.host.w,
-            h = art.host.h,
-            "split: program read"
-        );
-        SplitModel::open_artifact(dev, spec, &art, vocab)
-    }
-
     /// Places the prep on `dev` by `art`'s bindings ([`place::place`]) and runs init.
-    pub fn open_artifact(
+    pub fn open(
         mut dev: Box<dyn Device>,
         spec: &SplitSpec,
         art: &Artifact,
@@ -206,7 +154,7 @@ impl SplitModel {
             x_off: hl.x_offsets(),
             embed,
             eps: model.eps,
-            lgt_scale: model.lgt_scale,
+            lgt_scale: model.logit_scale,
             force: std::env::var("PIE_CEREBRAS_SPLIT_FORCE").is_ok_and(|v| v == "1"),
             hl,
             dev,
@@ -466,18 +414,4 @@ pub fn argmax(l: &[f32]) -> Option<u32> {
         }
     }
     best.map(|(i, _)| i as u32)
-}
-
-/// A compiled split program: the env names a prep and the program's
-/// out.json has a role-split layout's params (the layered build's
-/// `SPLIT_GEO`; the unit grid, or the layouts compiled before it).
-pub fn is_split(program: &Path) -> bool {
-    std::env::var("PIE_CEREBRAS_SPLIT").is_ok_and(|v| !v.is_empty())
-        && std::fs::read_to_string(program.join("out.json")).is_ok_and(|s| {
-            s.contains("\"SPLIT_GEO\"")
-                || (s.contains("\"UNX\"") && s.contains("\"UNY\""))
-                || (s.contains("\"NTW\"") && s.contains("\"Ic1\""))
-                || (s.contains("\"NEX\"") && s.contains("\"QO\""))
-                || (s.contains("\"HcA\"") && s.contains("\"HcW\""))
-        })
 }

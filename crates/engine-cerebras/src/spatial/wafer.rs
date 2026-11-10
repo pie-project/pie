@@ -1453,7 +1453,7 @@ pub struct Wafer {
     pub row_order: Option<super::paged::RowOrder>,
     /// The role-split program ([`super::split`]).
     pub split: bool,
-    /// The prep's posted-loop length (its meta's `LOOP`; `PIE_CEREBRAS_SPLIT_LOOP` overrides it).
+    /// The program's posted-loop length (its plan's; `PIE_CEREBRAS_SPLIT_LOOP` overrides it).
     pub split_loop: Option<usize>,
     /// Posted token loops' answers (the role-split program).
     posted: mpsc::Receiver<Answer>,
@@ -1755,8 +1755,9 @@ impl Wafer {
     /// The role-split program ([`super::split`]) on its own thread: one
     /// sequence, greedy rows by the wafer token loop, logits rows by `lgt`.
     fn open_split(program: PathBuf, ckpt: &Ckpt, platform: Platform) -> R<Wafer> {
-        let spec = super::split::SplitSpec::from_env()?.ok_or("PIE_CEREBRAS_SPLIT is unset")?;
-        let split_loop = spec.int("LOOP").map(|v| v as usize);
+        let spec = super::split::SplitSpec::from_env()?;
+        let art = super::split::artifact(&program)?;
+        let split_loop = Some(art.host.loop_len as usize);
         let cfg = ckpt.config();
         let vocab = cfg["text_config"]["vocab_size"]
             .as_u64()
@@ -1777,7 +1778,7 @@ impl Wafer {
                     rt.load();
                     rt.run();
                     tracing::info!(s = t0.elapsed().as_secs_f64(), "split: program loaded");
-                    super::split::SplitModel::open(Box::new(rt), &spec, vocab)
+                    super::split::SplitModel::open(Box::new(rt), &spec, &art, vocab)
                 };
                 let mut m = match open() {
                     Ok(m) => {

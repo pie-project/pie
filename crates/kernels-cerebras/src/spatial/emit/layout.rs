@@ -6,9 +6,8 @@
 //! dummies for every exported name the kind does not own, in the family's export order). The
 //! layout is written from the floor instead of re-deriving it in CSL: every PE's kernel and
 //! resolved params ([`super::params::tile`]) grouped into maximal rectangles, one loop nest a
-//! rectangle, every param a literal. The levers are applied before (`split-geo --levers`), so the
-//! link takes no shape params: `link.sh` passes only the [`MARKER`] param, which is also how
-//! the engine's `split::is_split` knows a build of this writer.
+//! rectangle, every param a literal. The levers are applied before (`split-geo build --levers`),
+//! so the link takes no params.
 
 use std::collections::HashMap;
 use std::fmt::Write as _;
@@ -20,9 +19,6 @@ use crate::spatial::program::Program;
 use crate::spatial::role::Kind;
 
 use super::params::{Levers, kernels, tile};
-
-/// The layout param that marks a build of this writer (`params.txt`, `out.json`).
-pub const MARKER: &str = "SPLIT_GEO";
 
 /// The empty kernel of PEs with no role (and of kinds a family builds no kernel for).
 const FILLER: &str = "param memcpy_params;
@@ -138,7 +134,6 @@ pub fn layout_text(prog: &Program, kinds: &Kernels) -> Result<String, String> {
     let (distinct, grid) = tiles(prog, kinds)?;
     let rs = rects(w, h, |c| grid[(c.y * w + c.x) as usize]);
     let mut s = String::new();
-    let _ = writeln!(s, "param {MARKER}: u16 = 1;");
     s.push_str("param kernel_rows: u16 = 0;\nparam kernel_cols: u16 = 0;\nparam iters: u16 = 0;\n");
     let _ = writeln!(s, "const W: u16 = {w};\nconst HH: u16 = {h};");
     s.push_str(
@@ -176,7 +171,7 @@ pub fn layout_text(prog: &Program, kinds: &Kernels) -> Result<String, String> {
 
 /// Writes `<out>/layout.csl` and one `<kind>.csl` a role kind (the kernel source with the other
 /// kinds' exported names as one-word dummies), as `mkfull*.py` do, plus what `link.sh` reads:
-/// `params.txt` (the [`MARKER`]) and `geo.env` (the rectangle and fabric dims).
+/// `geo.env` (the rectangle and fabric dims).
 pub fn write(
     prog: &Program,
     levers: &Levers,
@@ -207,7 +202,6 @@ pub fn write(
         wr("filler.csl", &kind_source(FILLER, syms, &[])?)?;
     }
     wr("layout.csl", &layout_text(prog, &kinds)?)?;
-    wr("params.txt", &format!("{MARKER}:1\n"))?;
     let (w, h) = (prog.floor.w, prog.floor.h);
     wr(
         "geo.env",

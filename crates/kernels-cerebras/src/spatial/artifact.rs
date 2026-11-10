@@ -4,29 +4,28 @@
 //! any plan is run the same way.
 //!
 //! On disk, a directory (what `split-geo` writes):
-//! - `program.json`: [`Header`] (the format, the model facts, the meta it was built from);
+//! - `program.json`: [`Header`] (the format, the model facts, the plan it was built from);
 //! - `host.json`: [`HostLayout`];
 //! - `bindings.json`: the [`Binding`]s;
 //! - `rcfg.npy` (u32, `[h][w][words]`, zero-padded to the longest; idle PEs all zero) and
 //!   `rcfg_n.npy` (u32, `[h][w]`: each PE's word count).
 
-use std::collections::BTreeMap;
 use std::path::Path;
 
 use serde::{Deserialize, Serialize};
 
 use super::emit::host::HostLayout;
-use super::emit::meta::Meta;
 use super::emit::rcfg;
 use super::floor::{Coord, Grid};
 use super::npy::{self, Npy};
+use super::plan::Plan;
 use super::program::Program;
 use super::weights::Binding;
 
 type R<T> = Result<T, String>;
 
 /// The artifact format [`Artifact::read`] takes.
-pub const FORMAT: u32 = 1;
+pub const FORMAT: u32 = 2;
 
 /// The model facts the host's math needs.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -37,8 +36,8 @@ pub struct Model {
     pub hidden: u32,
     /// The final norm's eps (the host scales `lgt` by its 1/rms).
     pub eps: f32,
-    /// `lgt`'s prescale (the prep's `HSCALE`: the band head's 2^15 logits; 1 without one).
-    pub lgt_scale: f32,
+    /// `lgt`'s prescale (the plan's: the band head's 2^15 logits; 1 without one).
+    pub logit_scale: f32,
 }
 
 /// `program.json`.
@@ -46,9 +45,8 @@ pub struct Model {
 pub struct Header {
     pub format: u32,
     pub model: Model,
-    /// The prep's meta (overrides applied) the program was built from; `None` for a program
-    /// built from a plan file. A host opening a prep checks it against the prep's.
-    pub meta: Option<BTreeMap<String, serde_json::Value>>,
+    /// The plan the program was built from (a record: the host runs the rest of the artifact).
+    pub plan: Plan,
 }
 
 /// A built program, as the engine runs it.
@@ -73,13 +71,8 @@ fn read_json<T: for<'de> Deserialize<'de>>(dir: &Path, name: &str) -> R<T> {
 }
 
 impl Artifact {
-    /// The program `meta` states ([`Program::from_meta`]), as the engine runs it.
-    pub fn build(meta: &Meta) -> R<Artifact> {
-        Artifact::of(&Program::from_meta(meta)?, Some(meta))
-    }
-
-    /// `prog` as the engine runs it; `meta`: the prep's meta it was built from, if any.
-    pub fn of(prog: &Program, meta: Option<&Meta>) -> R<Artifact> {
+    /// `prog` as the engine runs it.
+    pub fn of(prog: &Program) -> R<Artifact> {
         let s = &prog.plan.shape;
         Ok(Artifact {
             header: Header {
@@ -88,9 +81,9 @@ impl Artifact {
                     vocab: s.vocab,
                     hidden: s.hidden,
                     eps: s.norm.eps,
-                    lgt_scale: meta.and_then(|m| m.float("HSCALE")).unwrap_or(1.0) as f32,
+                    logit_scale: prog.plan.contract.logit_scale,
                 },
-                meta: meta.map(|m| m.map.clone()),
+                plan: prog.plan.clone(),
             },
             host: HostLayout::of(prog)?,
             bindings: prog.bindings()?,
@@ -152,7 +145,7 @@ impl Artifact {
         let header: Header = read_json(dir, "program.json")?;
         if header.format != FORMAT {
             return Err(format!(
-                "{}: artifact format {}, this build reads {FORMAT} (rebuild it with split-geo)",
+                "{}: artifact format {}, this build reads {FORMAT} (rebuild it with wafer-compile)",
                 dir.display(),
                 header.format
             ));

@@ -4,11 +4,12 @@
 //! and a logits row (`lgt`; on a Qwen3.5 prep also against a host reference).
 //! Qwen3.5 and Gemma 4 preps; gpt-oss has `split_sim_gptoss`.
 //!
-//! `split_sim <program out dir> <prep dir> <prefix> <overrides> <steps a launch> [cmaddr]`
+//! `split_sim <program out dir> <prep dir> <prefix> <steps a launch> [cmaddr]`
 //! (no cmaddr: the simulator).
 
 use engine_cerebras::sdk::{Platform, Runtime, Sdk, Simulator, Target};
 use engine_cerebras::spatial::split::{SplitModel, SplitSpec, argmax, artifact};
+use kernels_cerebras::spatial::plan::FamilyId;
 
 fn f16(h: u16) -> f32 {
     let s = if h >> 15 == 1 { -1.0 } else { 1.0 };
@@ -39,9 +40,10 @@ fn run(m: &mut SplitModel, prompt: &[u32], n: usize, steps: usize) -> Vec<u32> {
 
 fn main() {
     let a: Vec<String> = std::env::args().collect();
-    let spec = SplitSpec::parse(&format!("{}:{}:{}", a[2], a[3], a[4])).unwrap();
-    let steps: usize = a[5].parse().unwrap();
-    let platform = match a.get(6) {
+    let spec = SplitSpec::parse(&format!("{}:{}", a[2], a[3])).unwrap();
+    let steps: usize = a[4].parse().unwrap();
+    let art = artifact(std::path::Path::new(&a[1])).unwrap();
+    let platform = match a.get(5) {
         Some(c) => Platform::System { cmaddr: c.clone() },
         None => Platform::Simulator(Simulator {
             num_threads: 8,
@@ -62,12 +64,12 @@ fn main() {
     let n: usize = std::env::var("SPLIT_NTOK")
         .map_or(want.len(), |v| v.parse().unwrap())
         .min(want.len());
-    let vocab = (spec.int("HR").unwrap() * spec.int("VR").unwrap()) as usize;
+    let vocab = art.header.model.vocab as usize;
     let sdk = Sdk::open().unwrap();
     let mut rt = Runtime::new(sdk, std::path::Path::new(&a[1]), platform, "WARNING").unwrap();
     rt.load();
     rt.run();
-    let mut m = SplitModel::open(Box::new(rt), &spec, vocab).unwrap();
+    let mut m = SplitModel::open(Box::new(rt), &spec, &art, vocab).unwrap();
     let mut ok = true;
     for rep in 0..2 {
         let t0 = std::time::Instant::now();
@@ -104,13 +106,14 @@ fn main() {
     let best = argmax(&l).unwrap();
     ok &= best == want[0];
     println!("LOGITS argmax {best} want {}", want[0]);
-    if spec.meta.get("geo").is_some() {
-        // Gemma's tied head has its own tile layout: the argmax check above is the test
-        println!("LOGITS host reference: Qwen3.5 preps only");
+    if art.header.plan.family != FamilyId::Qwen {
+        // the reference reads the Qwen head's tile layout: elsewhere the argmax check above is
+        // the test
+        println!("LOGITS host reference: Qwen preps only");
     } else {
-        let hl = artifact(&spec).unwrap().host;
+        let hl = &art.host;
         let (cx, ly) = (hl.last_cx.x, hl.last_cx.y);
-        let hc = spec.int("Hc").unwrap() as usize;
+        let hc = hl.row_dims as usize;
         let (py, yc) = (hl.rows, hl.cy_row);
         let mut x = Vec::new();
         for (r0, r1) in [(0, yc), (yc, py)] {
@@ -129,12 +132,12 @@ fn main() {
                     .map(f32::from_bits),
             );
         }
-        let hidden = spec.int("H").unwrap() as f64;
+        let hidden = f64::from(art.header.model.hidden);
         let rms = (x.iter().map(|v| (*v as f64).powi(2)).sum::<f64>() / hidden + 1e-6).sqrt();
         let hw = spec.npy("hw").unwrap();
         let hg = spec.npy("hg").unwrap();
         let (hr, hcn, per) = (hw.shape[0], hw.shape[1], hw.shape[2]);
-        let vr = spec.int("VR").unwrap() as usize;
+        let vr = hl.vocab_rows as usize;
         let hdc = per / vr;
         let mut w = Vec::new();
         hw.words(0, hr * hcn * per, &mut w).unwrap();

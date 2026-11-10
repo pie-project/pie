@@ -20,5 +20,6 @@ pub mod npy;
 pub mod plan;
 pub mod program;
 pub mod role;
+pub mod target;
 pub mod weights;
 pub mod wiring;

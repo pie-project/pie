@@ -4,7 +4,6 @@
 
 use super::abi::{Kernels, Overrides};
 use super::block::Block;
-use super::emit::meta::Meta;
 use super::fabric::{Fabric, Palette};
 use super::family::{self, Family};
 use super::floor::{Floor, FloorBuilder};
@@ -25,11 +24,9 @@ pub struct Program {
 }
 
 impl Program {
-    /// From a prep's meta: the family it names, its plan, then [`Program::build`].
-    pub fn from_meta(meta: &Meta) -> Result<Program, String> {
-        let fam = family::of(meta.family());
-        let plan = fam.plan(meta)?;
-        Program::build(fam, plan)
+    /// The program of `plan`, by its family ([`Program::build`]).
+    pub fn of(plan: Plan) -> Result<Program, String> {
+        Program::build(family::of(plan.family), plan)
     }
 
     /// The physical build of a plan: validate it; each block places its PEs, then lays its

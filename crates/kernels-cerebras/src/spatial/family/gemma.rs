@@ -15,13 +15,12 @@ use crate::spatial::block::segments::Scores;
 use crate::spatial::block::shared_kv::SharedKv;
 use crate::spatial::block::token_loop::TokenLoop;
 use crate::spatial::block::units::{UnitCopies, Units};
-use crate::spatial::emit::meta::Meta;
-use crate::spatial::family::Family;
+use crate::spatial::family::{Family, ceil_to};
 use crate::spatial::floor::{UnitGrid, UnitLayout};
 use crate::spatial::kernels::gemma;
 use crate::spatial::plan::{
-    Act, AttnSpec, Contract, FamilyId, HeadPartition, HeadSpec, KvEntries, LayerKind, MlpSpec,
-    NormSpec, Partition, Plan, PleSpec, ReduceGroups, RopeSpec, RowRun, Segments, Shape,
+    Contract, FamilyId, HeadPartition, KvEntries, LayerKind, Partition, Plan, Preset, ReduceGroups,
+    RowRun, Segments, Shape,
 };
 use crate::spatial::program::Program;
 use crate::spatial::weights::{Slice, Transform, from};
@@ -173,56 +172,126 @@ impl Arrangement {
     }
 }
 
-/// A named Gemma geometry the prep builds for (`prep_gemma.py`'s `geo`): the unit shape that picks
-/// the arrangement (weight columns, rows, units), the head's columns and rows, and the dims a
-/// weight row holds.
-struct Named {
-    name: &'static str,
-    shape: (u32, u32, u32),
-    head_cols: u32,
-    head_rows: u32,
-    dims: u32,
-}
-
-const NAMED: &[Named] = &[
-    Named {
-        name: "tiny",
-        shape: (8, 8, 5),
-        head_cols: 4,
-        head_rows: 32,
-        dims: 3,
-    },
-    Named {
-        name: "e2b",
-        shape: (256, 128, 7),
-        head_cols: 64,
-        head_rows: 1130,
-        dims: 12,
-    },
-    Named {
-        name: "e4b",
-        shape: (256, 160, 7),
-        head_cols: 80,
-        head_rows: 1130,
-        dims: 16,
-    },
+/// The presets: the unit shape that picks the arrangement (weight columns, rows, units), the head's
+/// rows, the global KV entries a KV row (NEG; the context is NEG x the KV rows), the reduction
+/// groups and the posted loop.
+const PRESETS: &[(&str, [u32; 7])] = &[
+    // name, [PX, PY, NU, HR, NEG, G2, G2W]
+    ("e2b", [256, 128, 7, 1130, 32, 16, 24]),
+    ("e4b", [256, 160, 7, 1130, 20, 16, 24]),
+    ("tiny", [8, 8, 5, 32, 4, 2, 2]),
 ];
 
 impl Family for Gemma {
-    /// A named geometry as the prep reads it (`split-geo --geometry gemma:<name>`), before any meta
-    /// exists: the unit shape and count, the head, a row's dims, and each unit column's x, units (top
-    /// to bottom) and PLE storage (rows `srows`, `nt` tokens a storage PE).
-    fn geometry(&self, name: &str) -> R<serde_json::Value> {
-        let n = NAMED
+    fn presets(&self) -> Vec<Preset> {
+        let keys = ["PX", "PY", "NU", "HR", "NEG", "G2", "G2W"];
+        PRESETS
             .iter()
-            .find(|n| n.name == name)
-            .ok_or_else(|| format!("split gemma: no geometry {name}"))?;
-        let (px, py, nu) = n.shape;
-        let (_, arr) = ARRANGEMENTS
+            .map(|(name, g)| {
+                let mut kv: Vec<(&str, f64)> = keys
+                    .iter()
+                    .zip(g)
+                    .map(|(k, v)| (*k, f64::from(*v)))
+                    .collect();
+                kv.push(("LOOP", 64.0));
+                Preset::new(name, &kv)
+            })
+            .collect()
+    }
+
+    /// Units of K = layers / NU (S .. S G); a row's dims the hidden over PY; the sliding window
+    /// over the KV rows (`PYW`: the window over the fewest sliding entries a row, NES, where that
+    /// divides it, so the ring is exact; else every row, and the kernel masks the older entries);
+    /// the head PY / 2 columns of VR vocabulary rows (a multiple of 8). Overrides: `PYW`, `NEG`,
+    /// `G2`, `G2W`, `CAP`, `LOOP`.
+    fn plan(&self, s: &Shape, pr: &Preset) -> R<Plan> {
+        let (px, py, nu) = (pr.need("PX")?, pr.need("PY")?, pr.need("NU")?);
+        let n = s.layers.len() as u32;
+        if nu == 0 || !n.is_multiple_of(nu) {
+            return Err(format!("gemma: {n} layers on {nu} units"));
+        }
+        let k = n / nu;
+        if !s.hidden.is_multiple_of(py) {
+            return Err(format!("gemma: {} hidden over {py} rows", s.hidden));
+        }
+        let window = s
+            .layers
             .iter()
-            .find(|(k, _)| *k == (px, py, nu))
-            .ok_or_else(|| format!("split gemma: no arrangement for {name}"))?;
-        let (uw, uh) = (px + 1, py + 1);
+            .find_map(|l| match l {
+                LayerKind::Sliding { window } => Some(*window),
+                _ => None,
+            })
+            .ok_or("gemma: no sliding layer")?;
+        let nes = window.div_ceil(py);
+        let pyw = pr.int("PYW").unwrap_or(if window.is_multiple_of(nes) {
+            window / nes
+        } else {
+            py
+        });
+        let nes = window.div_ceil(pyw);
+        let neg = pr.need("NEG")?;
+        let hr = pr.need("HR")?;
+        let partition = Partition {
+            unit_grid: None,
+            units: nu,
+            layers_per_unit: k,
+            rows: py,
+            cols: px,
+            row_dims: vec![RowRun {
+                rows: (0, py),
+                dims: s.hidden / py,
+                attention: true,
+            }],
+            kv_rows: pyw,
+            kv_entries: KvEntries {
+                per_row: neg,
+                global: Some(neg),
+                sliding: Some(nes),
+            },
+            reduce: ReduceGroups {
+                row: pr.need("G2")?,
+                col: pr.need("G2")?,
+                head: pr.need("G2")?,
+                token_loop: pr.need("G2W")?,
+            },
+            // a scores segment a half row
+            segments: Segments {
+                scores: px / 2,
+                gdn: px / 2,
+                onorm: px / 2,
+                ..Default::default()
+            },
+            attn_cols: None,
+            head: HeadPartition {
+                cols: py / 2,
+                rows: hr,
+                vocab_rows: ceil_to(s.vocab, hr, 8),
+                ..Default::default()
+            },
+        };
+        let contract = Contract {
+            positions: neg * pyw,
+            rope_levels: 4,
+            rope_bits: 3,
+            cap: pr.int("CAP").unwrap_or(256),
+            loop_len: pr.need("LOOP")?,
+            token_loop: true,
+            logit_scale: 1.0,
+        };
+        Ok(Plan {
+            family: FamilyId::Gemma,
+            shape: s.clone(),
+            partition,
+            contract,
+        })
+    }
+
+    /// `prep_gemma.py`'s cut: the unit shape and count, the head, a row's dims, and each unit
+    /// column's x, units (top to bottom) and PLE storage (rows `srows`, `nt` tokens a storage PE).
+    fn tiling(&self, plan: &Plan) -> R<serde_json::Value> {
+        let p = &plan.partition;
+        let arr = Arrangement::of(plan)?;
+        let (uw, uh) = (p.cols + 1, p.rows + 1);
         let origins = arr.origins(uw, uh)?;
         let cols = arr
             .columns(uw)
@@ -238,147 +307,9 @@ impl Family for Gemma {
             })
             .collect::<Vec<_>>();
         Ok(serde_json::json!({
-            "PX": px, "PY": py, "XC": px / 2, "NU": nu, "Hc": n.dims, "HC": n.head_cols,
-            "HR": n.head_rows,
-            "origins": origins, "cols": cols,
+            "PX": p.cols, "PY": p.rows, "XC": p.cols / 2, "NU": p.units, "Hc": p.row_dims[0].dims,
+            "HC": p.head.cols, "HR": p.head.rows, "origins": origins, "cols": cols,
         }))
-    }
-
-    /// From `prep_gemma.py`'s meta: units of K layers (S .. S G, KM's bits the global layers),
-    /// units at or past NO the shared-KV units (their layers read unit NO - 1's last layer of the
-    /// same kind); the sliding window NES PYW exactly (WIN 0) or WIN with every row a KV row.
-    /// `geo` (the arrangement's name) only picks the reduction groups' defaults, as before.
-    fn plan(&self, meta: &Meta) -> R<Plan> {
-        let px = meta.need("PX")?;
-        let py = meta.need("PY")?;
-        let hcc = meta.need("Hc")?;
-        let k = meta.need("K")?;
-        let km = meta.need("KM")?;
-        let no = meta.need("NO")?;
-        let nu = meta.need("NU")?;
-        let nes = meta.need("NES")?;
-        let neg = meta.need("NEG")?;
-        let win = meta.int("WIN").unwrap_or(0);
-        let pyw = meta.int("PYW").unwrap_or(py);
-        let tiny = meta.str("geo") == Some("tiny");
-        let g2 = meta.int("G2").unwrap_or(if tiny { 2 } else { 16 });
-        let g2w = meta.int("G2W").unwrap_or(if tiny { 2 } else { 24 });
-        let window = if win > 0 { win } else { nes * pyw };
-        let global = |l: u32| (km >> (l % k)) & 1 == 1;
-        let owned = k * no;
-        let layers = (0..k * nu)
-            .map(|l| {
-                if l < owned {
-                    return Ok(if global(l) {
-                        LayerKind::Global
-                    } else {
-                        LayerKind::Sliding { window }
-                    });
-                }
-                // a shared layer reads the last owner layer of its kind
-                let from = (0..owned)
-                    .rev()
-                    .find(|&f| global(f) == global(l))
-                    .ok_or_else(|| format!("split gemma: no owner layer for shared layer {l}"))?;
-                Ok(LayerKind::SharedKv {
-                    from,
-                    sliding: !global(l),
-                })
-            })
-            .collect::<Result<Vec<_>, String>>()?;
-        let (ic0, ic1) = (meta.need("Ic0")?, meta.need("Ic1")?);
-        let shape = Shape {
-            gdn: None,
-            family: FamilyId::Gemma,
-            hidden: meta.need("H")?,
-            hidden_placed: meta.need("H")?,
-            vocab: meta.need("V")?,
-            layers,
-            attn: AttnSpec {
-                q_heads: 2 * meta.need("Qh")?,
-                // the prep's kv heads (1 or 2) are not in the meta; nothing physical reads them
-                kv_heads: meta.int("NKV").unwrap_or(1),
-                head_dim: meta.need("HDS")?,
-                global_head_dim: Some(meta.need("HDG")?),
-                qk_norm: true,
-                ..Default::default()
-            },
-            // the KV-owning layers' width; the sharing layers' (Ic1 a column) differs
-            mlp: MlpSpec {
-                intermediate: ic0 * px,
-                act: Act::GeluTanh,
-                layer_widths: (0..k * nu)
-                    .map(|l| if l < owned { ic0 * px } else { ic1 * px })
-                    .collect(),
-            },
-            moe: None,
-            ple: Some(PleSpec { width: px }),
-            head: HeadSpec {
-                tied: true,
-                final_softcap: Some(meta.float("SOFTCAP").unwrap_or(30.0) as f32),
-            },
-            rope: RopeSpec {
-                // the prep bakes the tables (`rot`); the meta records no theta
-                theta: meta.float("ROPE_THETA").unwrap_or(0.0) as f32,
-                rotary_dims: meta.need("HDS")?,
-            },
-            norm: NormSpec {
-                eps: meta.float("EPS").unwrap_or(1e-6) as f32,
-                sandwich: true,
-                ..Default::default()
-            },
-        };
-        let partition = Partition {
-            unit_grid: None,
-            units: nu,
-            layers_per_unit: k,
-            rows: py,
-            cols: px,
-            row_dims: vec![RowRun {
-                rows: (0, py),
-                dims: hcc,
-                attention: true,
-            }],
-            kv_rows: pyw,
-            kv_entries: KvEntries {
-                per_row: neg,
-                global: Some(neg),
-                sliding: Some(nes),
-            },
-            reduce: ReduceGroups {
-                row: g2,
-                col: g2,
-                head: g2,
-                token_loop: g2w,
-            },
-            // a scores segment a half row
-            segments: Segments {
-                scores: px / 2,
-                gdn: px / 2,
-                onorm: px / 2,
-                ..Default::default()
-            },
-            attn_cols: None,
-            head: HeadPartition {
-                cols: meta.need("HC")?,
-                rows: meta.need("HR")?,
-                vocab_rows: meta.need("VR")?,
-                ..Default::default()
-            },
-        };
-        let contract = Contract {
-            positions: neg * pyw,
-            rope_levels: 4,
-            rope_bits: 3,
-            cap: meta.int("CAP").unwrap_or(256),
-            loop_len: meta.int("LOOP").unwrap_or(32),
-            token_loop: true,
-        };
-        Ok(Plan {
-            shape,
-            partition,
-            contract,
-        })
     }
 
     /// The arrangement's units, the scores segments a half row, the PLE storage of each unit

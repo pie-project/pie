@@ -31,6 +31,8 @@ pub struct HostLayout {
     pub positions: u32,
     pub cap: u32,
     pub token_loop: bool,
+    /// Posted loop steps a launch, by default (the plan's contract).
+    pub loop_len: u32,
     /// Weight rows a unit (the hidden dim's split) and the CY row's local index among them (the
     /// x runs split there: the CX column skips the CY row).
     pub rows: u32,
@@ -68,24 +70,13 @@ impl HostLayout {
         let (f, p, c) = (&prog.floor, &prog.plan.partition, &prog.plan.contract);
         let first = f.units.first().ok_or("split program: no units")?;
         let last = f.units.last().ok_or("split program: no units")?;
-        let hidden = prog.plan.shape.hidden_placed;
         let cy_row = first.cy;
-        // x runs: the plan's row runs (one covering every row when it states none), each cut at
-        // the CY row, which the CX column skips
-        let runs: Vec<(u32, u32, u32)> = if p.row_dims.is_empty() {
-            if p.rows == 0 || !hidden.is_multiple_of(p.rows) {
-                return Err(format!(
-                    "split program: {} rows do not divide the hidden {hidden}",
-                    p.rows
-                ));
-            }
-            vec![(0, p.rows, hidden / p.rows)]
-        } else {
-            p.row_dims
-                .iter()
-                .map(|r| (r.rows.0, r.rows.1, r.dims))
-                .collect()
-        };
+        // x runs: the plan's row runs, each cut at the CY row, which the CX column skips
+        let runs: Vec<(u32, u32, u32)> = p
+            .row_dims
+            .iter()
+            .map(|r| (r.rows.0, r.rows.1, r.dims))
+            .collect();
         let mut x_runs = Vec::new();
         for (r0, r1, d) in runs {
             for (a, b) in [(r0, r1.min(cy_row)), (r0.max(cy_row), r1)] {
@@ -123,7 +114,7 @@ impl HostLayout {
         // a head PE's embedding words: the hidden over the head's dims split (its columns, or
         // the band's rows)
         let dims_split = if band.is_some() { head_rows } else { head_cols };
-        let hemb_words = hidden.checked_div(dims_split).unwrap_or(0);
+        let hemb_words = p.hidden_placed().checked_div(dims_split).unwrap_or(0);
         let logits = match band {
             Some((x, y, n)) => Rect { x, y, w: n, h: 1 },
             None => Rect {
@@ -147,6 +138,7 @@ impl HostLayout {
             positions: c.positions,
             cap: c.cap,
             token_loop: c.token_loop,
+            loop_len: c.loop_len,
             rows: p.rows,
             cy_row,
             row_dims,

@@ -3028,6 +3028,8 @@ name = "kernels-cerebras"
 version = "0.6.0"
 dependencies = [
  "pie-dtype",
+ "pie-poem-compiler",
+ "pie-poem-ir",
  "serde",
  "serde_json",
 ]

@@ -1,12 +1,12 @@
-//! Program families: what a model's program is made of. A family reads its plan off the prep's
-//! meta (until the spatial compiler hands the plan in), lists the blocks the plan composes, and
-//! builds each kind's kernel from the plan. Everything else (the floor, the wiring, the fabric,
-//! the emitters, the placer, the host) is generic over the blocks.
+//! Program families: what a model's program is made of. A family turns the model's shape and a
+//! preset of its own into the plan, lists the blocks the plan composes, and builds each kind's
+//! kernel from the plan. Everything else (the floor, the wiring, the fabric, the emitters, the
+//! placer, the host) is generic over the blocks. Which family serves a model follows from what
+//! its shape needs ([`serving`]), never from its name.
 
 use super::abi::Kernels;
 use super::block::Block;
-use super::emit::meta::Meta;
-use super::plan::{FamilyId, Plan};
+use super::plan::{FamilyId, LayerKind, Plan, Preset, Shape};
 use super::program::Program;
 
 pub mod gemma;
@@ -16,17 +16,19 @@ pub mod qwen;
 
 type R<T> = Result<T, String>;
 
-/// A program family. Every method is pure: same inputs, same outputs (the parity tests and the
-/// `split-geo` tool rely on it).
+/// A program family. Every method is pure: same inputs, same outputs.
 pub trait Family: Send + Sync {
-    /// A named geometry as JSON: the partition choices a prep tiles the checkpoint for, before
-    /// any meta exists (`split-geo --geometry <family>:<name>`). The meta the prep writes records
-    /// them, and [`Family::plan`] reads them back with the model's dims.
-    fn geometry(&self, name: &str) -> R<serde_json::Value>;
+    /// The family's presets, in the order the spatial pass tries them.
+    fn presets(&self) -> Vec<Preset>;
 
-    /// The logical plan from the prep's meta (and its overrides). Later the spatial compiler
-    /// hands the plan in directly; nothing physical may be read here.
-    fn plan(&self, meta: &Meta) -> R<Plan>;
+    /// The plan of `shape` under `preset`: the partition and contract the preset's choices make
+    /// for the model. Nothing physical is decided here.
+    fn plan(&self, shape: &Shape, preset: &Preset) -> R<Plan>;
+
+    /// What a prep tiles the checkpoint by for `plan` (`wafer-compile plan` writes it beside the
+    /// plan as `tiling.json`): the plan's cut in the prep's terms, and for Gemma the PLE storage
+    /// columns, for Gemma 12B the head's row groups and every row's dims.
+    fn tiling(&self, plan: &Plan) -> R<serde_json::Value>;
 
     /// The blocks the plan composes, in order: the units first, then what is placed against
     /// them. Floor, wiring, palette, overrides and copies run over them in this order.
@@ -48,4 +50,46 @@ pub fn of(id: FamilyId) -> Box<dyn Family> {
         FamilyId::Gemma => Box::new(gemma::Gemma),
         FamilyId::Gemma12 => Box::new(gemma12::Gemma12),
     }
+}
+
+/// The family whose blocks `shape` needs: routed experts take the MoE columns and the band head
+/// (gpt-oss); per-layer inputs or layers over another's KV take the PLE storage and the shared-KV
+/// line (Gemma 4 E2B / E4B); sliding layers otherwise take the attention / plain row runs and the
+/// grouped head (Gemma 4 12B); the rest (GDN, gated or plain attention) the snake of units
+/// (Qwen).
+pub fn serving(shape: &Shape) -> FamilyId {
+    let any = |f: fn(&LayerKind) -> bool| shape.layers.iter().any(f);
+    if shape.moe.is_some() {
+        FamilyId::GptOss
+    } else if shape.ple.is_some() || any(|k| matches!(k, LayerKind::SharedKv { .. })) {
+        FamilyId::Gemma
+    } else if any(|k| matches!(k, LayerKind::Sliding { .. })) {
+        FamilyId::Gemma12
+    } else {
+        FamilyId::Qwen
+    }
+}
+
+/// Layers `layers` in units of `k`, every unit the same kinds; the unit count.
+pub fn units_of(layers: &[LayerKind], k: u32, family: &str) -> R<u32> {
+    let n = layers.len() as u32;
+    if k == 0 || !n.is_multiple_of(k) {
+        return Err(format!("{family}: {n} layers in units of {k}"));
+    }
+    Ok(n / k)
+}
+
+/// The global layers of the first unit as a mask (`KM`): bit l for its layer l.
+pub fn global_mask(layers: &[LayerKind], k: u32) -> u32 {
+    layers[..k as usize]
+        .iter()
+        .enumerate()
+        .filter(|(_, l)| matches!(l, LayerKind::Global))
+        .map(|(i, _)| 1 << i)
+        .sum()
+}
+
+/// `n / d` rounded up to a multiple of `m`.
+pub fn ceil_to(n: u32, d: u32, m: u32) -> u32 {
+    n.div_ceil(d).div_ceil(m) * m
 }

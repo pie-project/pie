@@ -9,13 +9,12 @@ use crate::spatial::abi::Kernels;
 use crate::spatial::block::Block;
 use crate::spatial::block::band::{Band, BandLoop};
 use crate::spatial::block::moe::{AttnScores, MoeCopies, MoeUnits, Router};
-use crate::spatial::emit::meta::Meta;
-use crate::spatial::family::Family;
+use crate::spatial::family::{Family, ceil_to};
 use crate::spatial::floor::{UnitGrid, UnitLayout};
 use crate::spatial::kernels::gptoss::{self, Dims};
 use crate::spatial::plan::{
-    Act, AttnSpec, Contract, FamilyId, HeadPartition, HeadSpec, KvEntries, LayerKind, MlpSpec,
-    MoeSpec, NormSpec, Partition, Plan, ReduceGroups, RopeSpec, RowRun, Segments, Shape,
+    Contract, FamilyId, HeadPartition, KvEntries, Partition, Plan, Preset, ReduceGroups, RowRun,
+    Segments, Shape,
 };
 use crate::spatial::program::Program;
 use crate::spatial::weights::Transform;
@@ -24,111 +23,65 @@ type R<T> = Result<T, String>;
 
 pub struct GptOss;
 
-/// (AX, MX, PY, UNX, UNY, Hc, SWA, SWR, HVC) of a geometry name.
-fn table(name: &str) -> Result<[u32; 9], String> {
-    match name {
-        "tiny" => Ok([4, 8, 4, 2, 1, 8, 2, 8, 26]),
-        "full" => Ok([64, 288, 160, 2, 6, 18, 8, 32, 748]),
-        _ => Err(format!("gpt-oss geometry {name}?")),
-    }
-}
+/// The presets: attention and MoE columns a unit (AX, MX), rows (PY), the unit slots (UNX x UNY,
+/// every slot a unit), the scores and router segments (SWA, SWR), the band's vocabulary columns
+/// (HVC), KV entries a row (NE), the RoPE tables' levels (NLV), the reduction groups (G2, G2W);
+/// the logits' prescale (HSCALE: the band head's 2^15) and the posted loop (LOOP).
+const PRESETS: &[(&str, [u32; 11])] = &[
+    // name, [AX, MX, PY, UNX, UNY, SWA, SWR, HVC, NE, G2, G2W]
+    ("full", [64, 288, 160, 2, 6, 8, 32, 748, 128, 16, 24]),
+    ("tiny", [4, 8, 4, 2, 1, 2, 8, 26, 128, 2, 2]),
+];
 
 impl Family for GptOss {
-    /// A named geometry as the prep reads it (`split-geo --geometry gptoss:<name>`), before any meta
-    /// exists.
-    fn geometry(&self, name: &str) -> R<serde_json::Value> {
-        let [ax, mx, py, unx, uny, hc, swa, swr, hvc] = table(name)?;
-        Ok(serde_json::json!({
-            "AX": ax, "MXc": mx, "PY": py, "UNX": unx, "UNY": uny, "NU": unx * uny, "Hc": hc,
-            "SWA": swa, "SWR": swr, "HVC": hvc,
-        }))
+    fn presets(&self) -> Vec<Preset> {
+        let keys = [
+            "AX", "MX", "PY", "UNX", "UNY", "SWA", "SWR", "HVC", "NE", "G2", "G2W",
+        ];
+        PRESETS
+            .iter()
+            .map(|(name, g)| {
+                let mut kv: Vec<(&str, f64)> = keys
+                    .iter()
+                    .zip(g)
+                    .map(|(k, v)| (*k, f64::from(*v)))
+                    .collect();
+                kv.extend([("NLV", 5.0), ("HSCALE", 32768.0), ("LOOP", 64.0)]);
+                Preset::new(name, &kv)
+            })
+            .collect()
     }
 
-    /// The plan from a `prep_gptoss.py` meta: the geometry name's table (`geo`), the checkpoint
-    /// dims the prep wrote (`HD`, `K`, `KM`, `Hc`, `Qh`, `Dc`, `Ic`, `NEX`, `TK`, `HR`, `NLV`, `VR`,
-    /// `V`, `WIN`), the build's `G2` / `G2W` / `NE` / `CAP` / `LOOP` / `WL`.
-    fn plan(&self, meta: &Meta) -> R<Plan> {
-        let name = meta.str("geo").ok_or("split gpt-oss meta: no geo")?;
-        let [ax, mx, py, unx, uny, hcc, swa, swr, hvc] = table(name)?;
-        let tiny = name == "tiny";
-        for (k, v) in [
-            ("AX", ax),
-            ("MX", mx),
-            ("PY", py),
-            ("Hc", hcc),
-            ("HVC", hvc),
-            ("NU", unx * uny),
-        ] {
-            if meta.int(k).is_some_and(|m| m != v) {
-                return Err(format!(
-                    "split gpt-oss meta: {k} {:?} vs geo {name}'s {v}",
-                    meta.int(k)
-                ));
-            }
-        }
+    /// Units of K = layers / units, a row's dims the hidden over PY; a scores segment a KV head's
+    /// attention columns; the band head HVC columns of VR vocabulary rows (a multiple of 8, the
+    /// head control's argmax). Overrides: `NE`, `G2`, `G2W`, `CAP`, `LOOP`, `WL` (the token loop;
+    /// on unless 0).
+    fn plan(&self, s: &Shape, pr: &Preset) -> R<Plan> {
+        let (ax, mx, py) = (pr.need("AX")?, pr.need("MX")?, pr.need("PY")?);
+        let (unx, uny) = (pr.need("UNX")?, pr.need("UNY")?);
+        let (swa, hvc) = (pr.need("SWA")?, pr.need("HVC")?);
         let units = unx * uny;
-        let k = meta.need("K")?;
-        let km = meta.need("KM")?;
-        let qh = meta.need("Qh")?;
-        let hd = meta.need("HD")?;
-        let ic = meta.need("Ic")?;
-        let win = meta.int("WIN").unwrap_or(128);
-        if !ax.is_multiple_of(swa) {
-            return Err("gpt-oss: SWA must divide the attention columns".into());
+        let n = s.layers.len() as u32;
+        if units == 0 || !n.is_multiple_of(units) {
+            return Err(format!("gpt-oss: {n} layers on {units} units"));
         }
-        let kv_heads = ax / swa;
-        if meta.int("Dc").is_some_and(|d| d * swa != hd) {
-            return Err("split gpt-oss meta: Dc x SWA != HD".into());
+        let k = n / units;
+        if s.layers
+            .chunks(k as usize)
+            .any(|u| u != &s.layers[..k as usize])
+        {
+            return Err("gpt-oss: every unit the same layer kinds".into());
         }
-        let layers = (0..units * k)
-            .map(|l| {
-                if km & (1 << (l % k)) != 0 {
-                    LayerKind::Global
-                } else {
-                    LayerKind::Sliding { window: win }
-                }
-            })
-            .collect();
-        let g2 = meta.int("G2").unwrap_or(if tiny { 2 } else { 16 });
-        let g2w = meta.int("G2W").unwrap_or(if tiny { 2 } else { 24 });
-        let ne = meta.int("NE").unwrap_or(128);
-        let shape = Shape {
-            gdn: None,
-            family: FamilyId::GptOss,
-            hidden: meta.need("HR")?,
-            hidden_placed: py * hcc,
-            vocab: meta.need("V")?,
-            layers,
-            attn: AttnSpec {
-                q_heads: kv_heads * qh,
-                kv_heads,
-                head_dim: hd,
-                sinks: true,
-                ..Default::default()
-            },
-            mlp: MlpSpec {
-                layer_widths: Vec::new(),
-                intermediate: mx * ic,
-                act: Act::SwigluOai,
-            },
-            moe: Some(MoeSpec {
-                experts: meta.need("NEX")?,
-                top_k: meta.need("TK")?,
-                expert_intermediate: mx * ic,
-            }),
-            ple: None,
-            head: HeadSpec {
-                ..Default::default()
-            },
-            rope: RopeSpec {
-                theta: meta.float("THETA").unwrap_or(150_000.0) as f32,
-                rotary_dims: hd,
-            },
-            norm: NormSpec {
-                eps: 1e-5,
-                ..Default::default()
-            },
-        };
+        if !ax.is_multiple_of(swa) || ax / swa != s.attn.kv_heads {
+            return Err(format!(
+                "gpt-oss: {ax} attention columns in segments of {swa} for {} KV heads",
+                s.attn.kv_heads
+            ));
+        }
+        if !s.hidden.is_multiple_of(py) {
+            return Err(format!("gpt-oss: {} hidden over {py} rows", s.hidden));
+        }
+        let ne = pr.need("NE")?;
         let partition = Partition {
             unit_grid: Some((unx, uny)),
             units,
@@ -137,7 +90,7 @@ impl Family for GptOss {
             cols: ax + mx,
             row_dims: vec![RowRun {
                 rows: (0, py),
-                dims: hcc,
+                dims: s.hidden / py,
                 attention: true,
             }],
             kv_rows: py,
@@ -146,37 +99,51 @@ impl Family for GptOss {
                 ..Default::default()
             },
             reduce: ReduceGroups {
-                row: g2,
-                col: g2,
-                head: g2,
-                token_loop: g2w,
+                row: pr.need("G2")?,
+                col: pr.need("G2")?,
+                head: pr.need("G2")?,
+                token_loop: pr.need("G2W")?,
             },
             segments: Segments {
                 scores: swa,
-                router: Some(swr),
+                router: Some(pr.need("SWR")?),
                 ..Default::default()
             },
             attn_cols: Some(ax),
             head: HeadPartition {
                 cols: hvc,
                 rows: py,
-                vocab_rows: meta.need("VR")?,
+                vocab_rows: ceil_to(s.vocab, hvc, 8),
                 ..Default::default()
             },
         };
         let contract = Contract {
             positions: ne * py,
-            rope_levels: meta.int("NLV").unwrap_or(5),
+            rope_levels: pr.need("NLV")?,
             rope_bits: 3,
-            cap: meta.int("CAP").unwrap_or(256),
-            loop_len: meta.int("LOOP").unwrap_or(32),
-            token_loop: meta.int("WL").is_none_or(|v| v != 0),
+            cap: pr.int("CAP").unwrap_or(256),
+            loop_len: pr.need("LOOP")?,
+            token_loop: pr.int("WL").is_none_or(|v| v != 0),
+            logit_scale: pr.float("HSCALE").unwrap_or(1.0) as f32,
         };
         Ok(Plan {
-            shape,
+            family: FamilyId::GptOss,
+            shape: s.clone(),
             partition,
             contract,
         })
+    }
+
+    /// `prep_gptoss.py`'s cut: AX, MXc, PY, UNX, UNY, NU, Hc, SWA, SWR, HVC.
+    fn tiling(&self, plan: &Plan) -> R<serde_json::Value> {
+        let p = &plan.partition;
+        let ax = p.attn_cols.ok_or("gpt-oss plan: no attention columns")?;
+        let (unx, uny) = p.unit_grid.ok_or("gpt-oss plan: no unit grid")?;
+        Ok(serde_json::json!({
+            "AX": ax, "MXc": p.cols - ax, "PY": p.rows, "UNX": unx, "UNY": uny, "NU": p.units,
+            "Hc": p.row_dims[0].dims, "SWA": p.segments.scores, "SWR": p.segments.router,
+            "HVC": p.head.cols,
+        }))
     }
 
     fn blocks(&self, plan: &Plan) -> R<Vec<Box<dyn Block>>> {

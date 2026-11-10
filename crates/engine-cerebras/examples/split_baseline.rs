@@ -1,11 +1,11 @@
-//! The role-split host's whole output for one prep, on a recording device: the
-//! prep's artifact built, written and read back (`kernels_cerebras::spatial::artifact`), then what
-//! `SplitModel::open_artifact` places (every PE's words of every symbol, rcfg in full),
+//! The wafer program host's whole output for one artifact and prep, on a recording device: the
+//! artifact `split-geo build` wrote, read as the engine reads it, then what `SplitModel::open`
+//! places (every PE's words of every symbol, rcfg in full),
 //! the calls it makes, the values it derives, and one greedy launch's host
 //! traffic. Two runs (before and after a change) compare file for file
 //! (`crates/kernels-cerebras/tools/split/baseline`).
 //!
-//! `split_baseline <prep dir> <prefix> <overrides k=v,...> <vocab> <out dir>`
+//! `split_baseline <artifact dir> <prep dir> <prefix> <vocab> <out dir>`
 //!
 //! Writes into `<out dir>`: `pe.tsv` (`sym x y n bits sha256` a PE, the last
 //! write of each symbol, sorted), `rcfg.txt` (`x y w..` a PE), `calls.log`
@@ -19,7 +19,6 @@ use engine_cerebras::sdk::{self, DataType, Order, Rect};
 use engine_cerebras::spatial::device::Device;
 use engine_cerebras::spatial::split::{SplitModel, SplitSpec};
 use kernels_cerebras::spatial::artifact::Artifact;
-use kernels_cerebras::spatial::emit::meta::Meta;
 use sha2::{Digest, Sha256};
 
 fn hex(d: &[u8]) -> String {
@@ -225,10 +224,10 @@ impl Device for Shared {
 fn main() {
     let a: Vec<String> = std::env::args().collect();
     if a.len() != 6 {
-        eprintln!("split_baseline <prep dir> <prefix> <overrides> <vocab> <out dir>");
+        eprintln!("split_baseline <artifact dir> <prep dir> <prefix> <vocab> <out dir>");
         std::process::exit(2);
     }
-    let spec = SplitSpec::parse(&format!("{}:{}:{}", a[1], a[2], a[3])).unwrap();
+    let spec = SplitSpec::parse(&format!("{}:{}", a[2], a[3])).unwrap();
     let vocab: usize = a[4].parse().unwrap();
     let out = std::path::Path::new(&a[5]);
     std::fs::create_dir_all(out).unwrap();
@@ -239,17 +238,8 @@ fn main() {
     }));
     let t0 = std::time::Instant::now();
     let mut derived = serde_json::Map::new();
-    // the artifact through its files, as the engine reads one
-    let art = || -> Result<Artifact, String> {
-        let meta = Meta {
-            map: spec.meta.clone().into_iter().collect(),
-        };
-        let dir = tempfile::tempdir().map_err(|e| e.to_string())?;
-        Artifact::build(&meta)?.write(dir.path())?;
-        Artifact::read(dir.path())
-    };
-    let opened = art()
-        .and_then(|a| SplitModel::open_artifact(Box::new(Shared(rec.clone())), &spec, &a, vocab));
+    let opened = Artifact::read(std::path::Path::new(&a[1]))
+        .and_then(|art| SplitModel::open(Box::new(Shared(rec.clone())), &spec, &art, vocab));
     match opened {
         Ok(mut m) => {
             derived.insert("vocab".into(), m.vocab.into());

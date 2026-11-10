@@ -10,13 +10,12 @@ use crate::spatial::block::head::{HeadCopies, HeadEast, Hemb};
 use crate::spatial::block::segments::{Onorm, Scores};
 use crate::spatial::block::token_loop::TokenLoop;
 use crate::spatial::block::units::{UnitCopies, Units};
-use crate::spatial::emit::meta::Meta;
-use crate::spatial::family::Family;
+use crate::spatial::family::{Family, units_of};
 use crate::spatial::floor::{UnitGrid, UnitLayout};
 use crate::spatial::kernels::q35;
 use crate::spatial::plan::{
-    Act, AttnSpec, Contract, FamilyId, GdnSpec, HeadPartition, HeadSpec, KvEntries, LayerKind,
-    MlpSpec, NormSpec, Partition, Plan, ReduceGroups, RopeSpec, RowRun, Segments, Shape,
+    Contract, FamilyId, HeadPartition, KvEntries, LayerKind, Partition, Plan, Preset, ReduceGroups,
+    RowRun, Segments, Shape,
 };
 use crate::spatial::program::Program;
 use crate::spatial::weights::{From, Slice, Transform, from};
@@ -38,138 +37,85 @@ fn gap(units: u32, (unx, uny): (u32, u32)) -> R<Option<(u32, u32)>> {
     }
 }
 
-/// The named geometries (`prep_q35.py <model> <out> <golden> <name> [prefix]`): weight columns
-/// and rows a unit (PX, PY), the unit slots (UNX x UNY) and units (NU; one short: a gap slot),
-/// layers a unit (K), the head's rows and vocabulary rows a head PE (HR, VR), KV entries a row
-/// (NE). A new size adds one.
-const GEOMETRIES: &[(&str, [u32; 9])] = &[
-    // name, [PX, PY, UNX, UNY, NU, K, HR, VR, NE]
-    ("9b", [256, 256, 2, 4, 8, 4, 1153, 216, 64]),
-    ("4b", [256, 256, 2, 4, 8, 4, 1153, 216, 64]),
-    ("0.8b", [256, 128, 2, 3, 6, 4, 1153, 216, 128]),
+/// The presets: weight columns and rows a unit (PX, PY), the unit slots (UNX x UNY; the units are
+/// the layers over K, one short of the slots leaves a gap slot), layers a unit (K), the head's rows
+/// and vocabulary rows a head PE (HR, VR), KV entries a row (NE). A new size adds one; the tiny
+/// ones are the simulator's.
+const PRESETS: &[(&str, [u32; 8])] = &[
+    // name, [PX, PY, UNX, UNY, K, HR, VR, NE]
+    ("9b", [256, 256, 2, 4, 4, 1153, 216, 64]),
+    ("4b", [256, 256, 2, 4, 4, 1153, 216, 64]),
+    ("0.8b", [256, 128, 2, 3, 4, 1153, 216, 128]),
     // Qwen3-8B: 36 layers on 9 units, one gap slot
-    ("q3-8b", [256, 228, 2, 5, 9, 4, 1153, 132, 17]),
+    ("q3-8b", [256, 228, 2, 5, 4, 1153, 132, 17]),
+    ("tiny-t08", [8, 8, 2, 3, 4, 10, 8, 4]),
+    ("tiny-t4", [16, 16, 2, 2, 4, 18, 8, 4]),
+    ("tiny-q3", [16, 8, 2, 2, 3, 10, 8, 4]),
+    ("tiny-q3-gap", [16, 8, 2, 3, 4, 10, 8, 4]),
 ];
 
 impl Family for Qwen {
-    fn geometry(&self, name: &str) -> R<serde_json::Value> {
-        let [px, py, unx, uny, nu, k, hr, vr, ne] = GEOMETRIES
+    fn presets(&self) -> Vec<Preset> {
+        PRESETS
             .iter()
-            .find(|(n, _)| *n == name)
-            .map(|(_, g)| *g)
-            .ok_or_else(|| format!("qwen: no geometry {name}"))?;
-        gap(nu, (unx, uny))?;
-        Ok(serde_json::json!({
-            "PX": px, "PY": py, "UNX": unx, "UNY": uny, "NU": nu, "K": k, "HR": hr, "VR": vr,
-            "NE": ne,
-        }))
+            .map(|(name, g)| {
+                let keys = ["PX", "PY", "UNX", "UNY", "K", "HR", "VR", "NE"];
+                let kv: Vec<(&str, f64)> = keys
+                    .iter()
+                    .zip(g)
+                    .map(|(k, v)| (*k, f64::from(*v)))
+                    .collect();
+                Preset::new(name, &kv)
+            })
+            .collect()
     }
 
-    fn plan(&self, meta: &Meta) -> R<Plan> {
-        let px = meta.need("PX")?;
-        let py = meta.need("PY")?;
-        let (unx, uny) = (meta.need("UNX")?, meta.need("UNY")?);
-        let k = meta.need("K")?;
-        let km = meta.int("KM").unwrap_or((1 << k) - 1);
-        let gap = meta.int("GAPX").zip(meta.int("GAPY"));
-        let units = unx * uny - u32::from(gap.is_some());
-        if let Some(g) = gap
-            && (unx * uny - units != 1 || g != (unx - 1, 1))
-        {
-            return Err(format!(
-                "qwen meta: gap slot {g:?} is not the snake's ({}, 1)",
-                unx - 1
-            ));
+    /// Units of K layers, every unit the same kinds (GDN and gated attention, or Qwen3's plain
+    /// attention); a row's dims the hidden over PY (zero-padded past it); a scores segment a KV
+    /// head's columns, GDN's a key head's, the o-norm's a value head's (Qwen3: the scores'); the
+    /// head PY / 2 columns; the RoPE tables enough levels for the context. Overrides: the
+    /// reduction groups (`G2`, `G2X` / `G2Y` / `G2H`, `G2W`), the RoPE tables' levels and digit
+    /// bits (`RLV`, `RBITS`), `CAP`, `LOOP`, the token loop (`WL`).
+    fn plan(&self, s: &Shape, pr: &Preset) -> R<Plan> {
+        let (px, py, k) = (pr.need("PX")?, pr.need("PY")?, pr.need("K")?);
+        let unit_grid = (pr.need("UNX")?, pr.need("UNY")?);
+        let units = units_of(&s.layers, k, "qwen")?;
+        gap(units, unit_grid)?;
+        let pattern = &s.layers[..k as usize];
+        if s.layers.chunks(k as usize).any(|u| u != pattern) {
+            return Err("qwen: every unit the same layer kinds".into());
         }
-        let pattern: Vec<LayerKind> = (0..k)
-            .map(|l| {
-                if km >> l & 1 != 0 {
-                    LayerKind::Global
-                } else {
-                    LayerKind::Gdn
-                }
-            })
-            .collect();
-        let layers: Vec<LayerKind> = (0..units).flat_map(|_| pattern.clone()).collect();
-        let (swa, swg, swv) = (meta.need("SWA")?, meta.need("SWG")?, meta.need("SWV")?);
-        let gate = meta.int("GATE").unwrap_or(1);
-        let head_dim = meta.need("HD")?;
-        let kv_heads = px / swa;
-        let qh = meta.need("Qh")?;
-        let hc = meta.need("Hc")?;
-        let hidden = meta.int("H").unwrap_or(hc * py);
-        let gdn = if km == (1 << k) - 1 {
-            None
-        } else {
-            let key_dim = meta.need("HK")?;
-            if meta.int("DKH").is_some_and(|d| d != key_dim)
-                || meta.int("DKG").is_some_and(|d| d * swg != key_dim)
-            {
-                return Err("qwen meta: DKG / DKH disagree with HK / SWG".into());
+        let per = |heads: u32, what: &str| {
+            if heads == 0 || !px.is_multiple_of(heads) {
+                return Err(format!("qwen: {heads} {what} over {px} columns"));
             }
-            Some(GdnSpec {
-                key_heads: px / swg,
-                value_heads: px / swv,
-                key_dim,
-                value_dim: meta.need("HV")?,
-            })
+            Ok(px / heads)
         };
-        let g2 = meta.int("G2").unwrap_or(0);
-        let rope_levels = meta.int("RLV").unwrap_or(4);
-        let rope_bits = meta.int("RBITS").unwrap_or(3);
-        let ne = meta.need("NE")?;
-        let shape = Shape {
-            family: FamilyId::Qwen,
-            hidden,
-            hidden_placed: hc * py,
-            vocab: meta.int("V").unwrap_or(0),
-            layers,
-            attn: AttnSpec {
-                q_heads: qh * kv_heads,
-                kv_heads,
-                head_dim,
-                output_gate: gate != 0,
-                qk_norm: true,
-                ..Default::default()
-            },
-            mlp: MlpSpec {
-                layer_widths: Vec::new(),
-                intermediate: meta.need("Ic")? * px,
-                act: Act::Silu,
-            },
-            moe: None,
-            gdn,
-            ple: None,
-            head: HeadSpec {
-                tied: meta.int("tied").unwrap_or(0) != 0,
-                ..Default::default()
-            },
-            rope: RopeSpec {
-                // (the preps write the tables, not theta: 0 unless the meta records it)
-                theta: meta.float("THETA").unwrap_or(0.0) as f32,
-                // Qwen3: full RoPE; Qwen3.5: a quarter of the head (the preps' partial factor)
-                rotary_dims: meta.int("ROTD").unwrap_or(if gate == 0 {
-                    head_dim
-                } else {
-                    head_dim / 4
-                }),
-            },
-            norm: NormSpec {
-                eps: meta.float("EPS").unwrap_or(1e-6) as f32,
-                unit_offset: gate != 0,
-                ..Default::default()
-            },
+        let scores = per(s.attn.kv_heads, "KV heads")?;
+        let (gdn, onorm) = match s.gdn {
+            Some(g) => (
+                per(g.key_heads, "key heads")?,
+                per(g.value_heads, "value heads")?,
+            ),
+            None => (scores, scores),
         };
+        let g2 = pr.int("G2").unwrap_or(0);
+        let ne = pr.need("NE")?;
+        // a position is RLV digits of RBITS bits: enough levels for the context NE PY (at least 4)
+        let rope_bits = pr.int("RBITS").unwrap_or(3);
+        let rope_levels = pr
+            .int("RLV")
+            .unwrap_or(4.max((32 - (ne * py - 1).leading_zeros()).div_ceil(rope_bits)));
         let partition = Partition {
             units,
             layers_per_unit: k,
-            unit_grid: Some((unx, uny)),
+            unit_grid: Some(unit_grid),
             rows: py,
             cols: px,
             row_dims: vec![RowRun {
                 rows: (0, py),
-                dims: hc,
-                attention: km != 0,
+                dims: s.hidden.div_ceil(py),
+                attention: pattern.iter().any(|l| !matches!(l, LayerKind::Gdn)),
             }],
             kv_rows: py,
             kv_entries: KvEntries {
@@ -177,22 +123,22 @@ impl Family for Qwen {
                 ..Default::default()
             },
             reduce: ReduceGroups {
-                row: meta.int("G2X").unwrap_or(g2),
-                col: meta.int("G2Y").unwrap_or(g2),
-                head: meta.int("G2H").unwrap_or(g2),
-                token_loop: meta.int("G2W").unwrap_or(24),
+                row: pr.int("G2X").unwrap_or(g2),
+                col: pr.int("G2Y").unwrap_or(g2),
+                head: pr.int("G2H").unwrap_or(g2),
+                token_loop: pr.int("G2W").unwrap_or(24),
             },
             segments: Segments {
-                scores: swa,
-                gdn: swg,
-                onorm: swv,
+                scores,
+                gdn,
+                onorm,
                 ..Default::default()
             },
             attn_cols: None,
             head: HeadPartition {
-                cols: meta.need("HC")?,
-                rows: meta.need("HR")?,
-                vocab_rows: meta.need("VR")?,
+                cols: py / 2,
+                rows: pr.need("HR")?,
+                vocab_rows: pr.need("VR")?,
                 ..Default::default()
             },
         };
@@ -201,15 +147,30 @@ impl Family for Qwen {
             positions: (ne * py).min(1 << (rope_bits * rope_levels).min(31)),
             rope_levels,
             rope_bits,
-            cap: meta.int("CAP").unwrap_or(256),
-            loop_len: meta.int("LOOP").unwrap_or(32),
-            token_loop: meta.int("WL").unwrap_or(0) != 0,
+            cap: pr.int("CAP").unwrap_or(256),
+            loop_len: pr.int("LOOP").unwrap_or(32),
+            token_loop: pr.int("WL").unwrap_or(0) != 0,
+            logit_scale: 1.0,
         };
         Ok(Plan {
-            shape,
+            family: FamilyId::Qwen,
+            shape: s.clone(),
             partition,
             contract,
         })
+    }
+
+    /// `prep_q35.py`'s cut: PX, PY, UNX, UNY, K, HR, VR, NE, the units (NU) and the RoPE tables'
+    /// levels and digit bits (RLV, RBITS).
+    fn tiling(&self, plan: &Plan) -> R<serde_json::Value> {
+        let p = &plan.partition;
+        let (unx, uny) = p.unit_grid.ok_or("qwen: no unit grid")?;
+        Ok(serde_json::json!({
+            "PX": p.cols, "PY": p.rows, "UNX": unx, "UNY": uny, "NU": p.units,
+            "K": p.layers_per_unit, "HR": p.head.rows, "VR": p.head.vocab_rows,
+            "NE": p.kv_entries.per_row, "RLV": plan.contract.rope_levels,
+            "RBITS": plan.contract.rope_bits,
+        }))
     }
 
     fn blocks(&self, plan: &Plan) -> R<Vec<Box<dyn Block>>> {
@@ -234,12 +195,10 @@ impl Family for Qwen {
             return Err("qwen: head columns = CX rows / 2".into());
         }
         // Qwen3-8B's hidden zero-padded to the row split
+        let placed = p.hidden_placed();
         let pad = |t: &str| -> From {
-            let tr = if s.hidden_placed != s.hidden {
-                vec![Transform::PadZero {
-                    dim: 1,
-                    to: s.hidden_placed,
-                }]
+            let tr = if placed != s.hidden {
+                vec![Transform::PadZero { dim: 1, to: placed }]
             } else {
                 vec![]
             };
