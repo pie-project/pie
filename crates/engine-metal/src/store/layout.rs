@@ -103,6 +103,8 @@ pub struct Layout {
     pub ring: Option<Slots>,
     pub ring_cap: u32,
     pub ring_window: u32,
+    /// The seats seat-addressed lanes take.
+    pub seats: u32,
 }
 
 impl Layout {
@@ -131,6 +133,7 @@ impl Layout {
             ring: None,
             ring_cap: 0,
             ring_window: 0,
+            seats,
         };
         if let Some(shape) = layout.shapes().find(|s| s.per_chunk == 0) {
             return Err(Fault::Ceiling {
@@ -167,11 +170,7 @@ impl Layout {
                 have: self.chunk_bytes,
             });
         }
-        let seats = self
-            .fixed
-            .map(|f| f.seat_slots / self.pieces.max(1))
-            .or(self.list.map(|l| l.seat_slots))
-            .unwrap_or(0);
+        let seats = self.seats;
         ring.seat_chunk = 1 + self.seat_chunks();
         ring.seat_slots = seats.saturating_mul(cap);
         self.ring = Some(ring);
