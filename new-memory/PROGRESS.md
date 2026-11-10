@@ -923,3 +923,14 @@ The `new-memory/` directory is bookkeeping and is removed before anything lands 
 - `sc/rt3-staging` (d63f730c9): under held (off / auto that fits) the weight cache takes no staging slots and sends
   an empty `WeightResidency.staging` (no engine needed changes). Gives back 8 chunks (144 MiB) on the MoE mini:
   768 MiB now passes the 48 x 3,000-token script (parks 69 to host, 54 to disk), identical to unconstrained.
+
+### M71 — 2026-11-10: XLA pool planes are lazy row views (TPU session)
+- `sc/xla-tpu` (be7276b4a, 6c4de8a67): M63's whole-pool bitcast views were padded ~64x on TPU (192 GiB of temporaries
+  at +3 GiB). Now a pool view emits nothing; gathers / slices read single 512-byte pool rows and unpack only those;
+  scatters pack into rows (mask + or, last write wins, read-splice-write for unaligned blocks); while/case carry the
+  pool; anything else materializes and is logged (PIE_XLA_VIEW_STRICT=1 refuses). "Packed rows" element order matches
+  a Mosaic bitcast of a u32 block; GDN step/chunk Mosaic kernels bitcast their bank ref in VMEM.
+- v6e, Mosaic on, strict: qwen3-micro, qwen35-tiny, gemma mini bitwise vs base at default, +3, +20/+24 GiB pools;
+  fire HBM at a 24 GiB pool = pool in place + < 300 MB. engine-xla 14 + kernels-xla 18 lib tests pass.
+- Next (TPU): Mosaic decode page copy, flash fresh rows, kv append on the pool; speed vs main. CUDA-plugin chunk-count
+  re-check pending here.
