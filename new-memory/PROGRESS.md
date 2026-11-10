@@ -210,3 +210,14 @@ The `new-memory/` directory is bookkeeping and is removed before anything lands 
   Note: the default budget's 256 lanes make the CoW reserve large (and distort the Metal preset numbers);
   revisit whether the reserve should cover only lanes that fork/snapshot in a fire.
 - Verified: `pie-poem-compiler --lib chunk`.
+
+### M12 — 2026-11-10: GW merged (governor + weight cache wired)
+- `sc/gw-governor-wiring` (683d6662b): each engine's pool target is `WeightFirst<Grow or Fixed>` (governor/steered.rs),
+  shared by governor and planner; weight shapes from `ChunkFacts.weights` get their own slot pool for now
+  (store::weights::slot_pool; none in degenerate mode); the governor now also runs (tick-only) for dedicated/fixed
+  pools; `Signal::TierPressure/Eased` -> `pressure::raise/relieve` on a separate gauge; planner sheds the weight cache
+  before raising device pressure; `weight_residency`/`weight_uses` go through the engine's scheduler lane, non-blocking,
+  stop asking after "unsupported". Behavior unchanged for every engine today (streaming off, no weight shapes).
+- Left: weights live in a separate slot pool until the pool switch (shedding does not yet free kv/state memory);
+  nothing fills `ChunkFacts.weights` yet (needs WC1 + engines).
+- Verified: `cargo check` runtime + worker; `runtime --lib governor`.
