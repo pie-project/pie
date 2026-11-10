@@ -221,10 +221,11 @@ pub fn swiglu_clamp_split(
     ctx: &Ctx,
     gate: Tensor,
     up: Tensor,
+    fan: u32,
     limit: f32,
     y: &mut Tensor,
 ) -> Result<(), Error> {
-    swiglu_clamp_lanes(ctx, "linear.glu", gate, Some(up), None, 1, limit, y)
+    swiglu_clamp_lanes(ctx, "linear.glu", gate, Some(up), None, fan, limit, y)
 }
 
 /// [`swiglu_clamp_split`] of routed rows, each row times its route's

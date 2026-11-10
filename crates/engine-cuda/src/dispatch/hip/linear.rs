@@ -511,13 +511,19 @@ impl Run<'_> {
                 weights: None,
                 act: poem_ir::GluAct::Swiglu,
                 ..
-            } => linear::glu::swiglu_clamp_split(
-                self.ctx(),
-                self.tensor(*gate),
-                self.tensor(*up),
-                limit.unwrap_or(f32::MAX),
-                &mut self.tensor(*y),
-            ),
+            } => {
+                // Routed legs are a plane of `fan` rows a token: the staged
+                // seat counts tokens, so it is scaled onto the plane's rows.
+                let fan = self.plane_fan(*y);
+                linear::glu::swiglu_clamp_split(
+                    self.ctx(),
+                    self.tensor(*gate),
+                    self.tensor(*up),
+                    fan,
+                    limit.unwrap_or(f32::MAX),
+                    &mut self.tensor(*y),
+                )
+            }
             Linear::Glu {
                 gate: Some(gate),
                 up: Some(up),
