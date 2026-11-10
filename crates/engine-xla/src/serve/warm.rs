@@ -183,7 +183,7 @@ impl Shell {
                 // meets them (v6e gpt-oss c256: 18 prompts of 2857 rows and a
                 // decode). (From 4096-row fires: what a narrower fire's short
                 // prompts take compiles on demand.)
-                if widest >= 4096 && (b >= widest || (b >= 2048 && d <= 8)) {
+                if b >= widest && widest >= 4096 {
                     for n in [17u32, 33] {
                         let each = rows / n;
                         if each >= 2 && d + 2 * n <= self.budgets.tokens.max_lanes {
