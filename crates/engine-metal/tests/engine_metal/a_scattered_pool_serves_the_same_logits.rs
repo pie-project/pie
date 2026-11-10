@@ -387,6 +387,7 @@ fn a_scattered_hybrid_pool_serves_the_same_logits() {
 /// landed: one chunk space with a list, a record and an rs buffer shape, none
 /// pinned; segments commit from the bottom and go back.
 #[test]
+#[allow(unsafe_code)]
 fn a_reserved_hybrid_pool_states_shared_chunks() {
     use engine_metal::store::layout::{BUFFER, Layout};
     use engine_metal::store::{Pools, Rows};
