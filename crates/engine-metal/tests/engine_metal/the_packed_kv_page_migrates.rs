@@ -234,6 +234,7 @@ fn migrate_case(rig: &mut Rig, head_dim: usize) {
         waste: Default::default(),
         profile: ChunkProfile::ON_DEVICE_METAL,
         weights: Vec::new(),
+        rs: Default::default(),
     };
     let rows = Rows::plan(&trace, &recipe, &facts, None).expect("plan packed KV");
     let layout = Layout::new(
