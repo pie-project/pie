@@ -35,6 +35,9 @@ pub struct ChunkProfile {
     /// along its banks' output axis ([`super::weights`]); otherwise the
     /// chunk is never smaller than an expert.
     pub cut_experts: bool,
+    /// Whether the backend keeps every state row in f32 whatever the trace
+    /// declares (integer rows apart): Metal's recurrent kernels do.
+    pub state_f32: bool,
 }
 
 impl ChunkProfile {
@@ -50,6 +53,7 @@ impl ChunkProfile {
         concurrency: 128,
         context: 32 * 1024,
         cut_experts: false,
+        state_f32: false,
     };
 
     /// An on-device Metal GPU: chunks of a couple of MiB out of 64 MiB
@@ -64,6 +68,7 @@ impl ChunkProfile {
         concurrency: 4,
         context: 8 * 1024,
         cut_experts: true,
+        state_f32: true,
     };
 
     /// A TPU pool fixed at load, realized as `[chunks, rows, 128]` u32 tiles.
@@ -77,6 +82,7 @@ impl ChunkProfile {
         concurrency: 128,
         context: 32 * 1024,
         cut_experts: false,
+        state_f32: false,
     };
 
     /// What every row offset and slot size aligns to.
