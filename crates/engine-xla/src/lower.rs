@@ -157,6 +157,38 @@ impl Lower<'_, '_> {
 
 pub mod attn;
 
+/// Lowers a kernel call that lands several pool planes: once a plane, each
+/// time reading its operands afresh and landing only that plane (the others'
+/// results are dead and dropped), since every plane is a view of one pool
+/// and a whole-plane result read before another plane's write would land
+/// without it. Planes that are one handle land in one pass, chained as the
+/// kernel chains them. `body` answers one value a plane, `None` where the
+/// call lands nothing there.
+pub fn lower_planes(
+    ctx: &Ctx<'_>,
+    planes: &[Tensor],
+    mut body: impl FnMut(&mut Lower<'_, '_>) -> Result<Vec<Option<Val>>, Error>,
+) -> Result<(), Error> {
+    let one = planes.windows(2).all(|w| w[0].buf == w[1].buf);
+    if one {
+        return lower(ctx, |l| {
+            for (plane, v) in planes.iter().zip(body(l)?) {
+                if let Some(v) = v {
+                    l.land(*plane, v)?;
+                }
+            }
+            Ok(())
+        });
+    }
+    for (at, plane) in planes.iter().enumerate() {
+        lower(ctx, |l| match body(l)?.get(at).copied().flatten() {
+            Some(v) => l.land(*plane, v),
+            None => Ok(()),
+        })?;
+    }
+    Ok(())
+}
+
 /// Lowers one kernel call into `ctx`'s function.
 pub fn lower(
     ctx: &Ctx<'_>,

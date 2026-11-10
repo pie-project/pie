@@ -151,6 +151,21 @@ impl Handles {
         Tensor::new(bindings.len() as u32 - 1, root.rows, root.width, root.dtype)
     }
 
+    /// A handle over the whole of `t`'s root read as `width`-wide rows of
+    /// `dtype`: a plane of the pool, as many rows as the root's bits hold.
+    pub fn view(&self, t: Tensor, dtype: Dtype, width: u32) -> Result<Tensor, kernels_xla::Error> {
+        let b = self.bindings.borrow()[t.buf as usize];
+        let root = self.root_of(b.root);
+        let probe = Tensor::new(t.buf, 0, width, dtype);
+        let rows = view_rows(root, probe)?;
+        let mut bindings = self.bindings.borrow_mut();
+        bindings.push(Binding {
+            root: b.root,
+            row_offset: 0,
+        });
+        Ok(Tensor::new(bindings.len() as u32 - 1, rows, width, dtype))
+    }
+
     /// A handle over rows `[skip, skip + keep)` of `t`'s root window.
     #[must_use]
     pub fn cut(&self, t: Tensor, skip: u32, keep: u32) -> Tensor {
@@ -227,6 +242,12 @@ struct State {
     written: BTreeMap<u32, ()>,
     /// A root's per-head sums of squares, landed with its current value.
     sums: BTreeMap<u32, Val>,
+    /// The pool value each pool handle was last read from or written as.
+    view_reads: BTreeMap<u32, Val>,
+    /// Each pool value read at another element and width, once: two planes
+    /// of one view read the same value, so a kernel that scatters into both
+    /// chains the second onto the first.
+    views: Vec<((Val, Dtype, u32), Val)>,
 }
 
 impl<'h> Tracer<'h> {
@@ -242,6 +263,8 @@ impl<'h> Tracer<'h> {
                 params: Vec::new(),
                 written: BTreeMap::new(),
                 sums: BTreeMap::new(),
+                view_reads: BTreeMap::new(),
+                views: Vec::new(),
             }),
         }
     }
@@ -413,6 +436,8 @@ struct Lens<'a> {
     params: &'a mut Vec<(u32, Source)>,
     written: &'a mut BTreeMap<u32, ()>,
     sums: &'a mut BTreeMap<u32, Val>,
+    view_reads: &'a mut BTreeMap<u32, Val>,
+    views: &'a mut Vec<((Val, Dtype, u32), Val)>,
 }
 
 impl Lens<'_> {
@@ -441,8 +466,22 @@ impl Env for Lens<'_> {
             self.pack_len,
             root,
         )?;
-        let whole = reinterpret(f, whole, r, t)?;
-        if offset == 0 && t.rows == r.rows {
+        if r.source.persistent() {
+            self.view_reads.insert(t.buf, whole);
+        }
+        let rows = view_rows(r, t)?;
+        let key = (whole, t.dtype, t.width);
+        let whole = match self.views.iter().find(|(held, _)| *held == key) {
+            Some(&(_, v)) if r.source.persistent() => v,
+            _ => {
+                let v = reinterpret(f, whole, r, t)?;
+                if r.source.persistent() && (t.width != r.width || t.dtype != r.dtype) {
+                    self.views.push((key, v));
+                }
+                v
+            }
+        };
+        if offset == 0 && t.rows == rows {
             return Ok(whole);
         }
         Ok(f.slice_axis(whole, 0, i64::from(offset), i64::from(offset + t.rows))?)
@@ -458,13 +497,27 @@ impl Env for Lens<'_> {
                 })?;
         let r = self.handles.root_of(root);
         if t.width != r.width || t.dtype != r.dtype {
-            return Err(kernels_xla::Error::Backend {
-                op: "trace",
-                detail: format!(
-                    "a {}-wide {:?} write lands on a {}-wide {:?} root",
-                    t.width, t.dtype, r.width, r.dtype
-                ),
-            });
+            // A view of a pool lands whole, as the pool's own bits.
+            let rows = view_rows(r, t)?;
+            if !r.source.persistent() || offset != 0 || t.rows != rows {
+                return Err(kernels_xla::Error::Backend {
+                    op: "trace",
+                    detail: format!(
+                        "a {}-wide {:?} write of {} rows lands on a {}-wide {:?} root",
+                        t.width, t.dtype, t.rows, r.width, r.dtype
+                    ),
+                });
+            }
+            self.stale(root, t)?;
+            let next = unview(f, v, r)?;
+            self.current.insert(root, next);
+            self.sums.remove(&root);
+            self.view_reads.insert(t.buf, next);
+            self.written.insert(root, ());
+            return Ok(());
+        }
+        if r.source.persistent() {
+            self.stale(root, t)?;
         }
         let next = if offset == 0 && t.rows == r.rows {
             v
@@ -482,6 +535,9 @@ impl Env for Lens<'_> {
             f.dynamic_update_slice(whole, v, &[at, zero])?
         };
         self.current.insert(root, next);
+        if r.source.persistent() {
+            self.view_reads.insert(t.buf, next);
+        }
         self.written.insert(root, ());
         self.sums.remove(&root);
         Ok(())
@@ -498,13 +554,80 @@ impl Env for Lens<'_> {
     }
 }
 
-/// A handle may view its root under another width or element (a packed
-/// weight read as raw bytes); only the identity is served for now.
+impl Lens<'_> {
+    /// Refuses a write of a pool handle built on the pool as it stood
+    /// before another handle of it was written since: one pool backs every
+    /// plane, and a whole-plane result read before the other plane's write
+    /// would land without it. A lowering lands one plane of a pool an emit,
+    /// reading it after the last write.
+    fn stale(&self, root: u32, t: Tensor) -> Result<(), kernels_xla::Error> {
+        match (self.view_reads.get(&t.buf), self.current.get(&root)) {
+            (Some(read), Some(now)) if read != now => Err(kernels_xla::Error::Backend {
+                op: "trace",
+                detail: format!(
+                    "pool handle {} lands a value built on the pool as it stood before \
+                     another of its planes was written",
+                    t.buf
+                ),
+            }),
+            _ => Ok(()),
+        }
+    }
+}
+
+/// The rows `t` views its root as: the root's bits at `t`'s width and
+/// element (the root's own rows when they are the same).
+fn view_rows(root: Root, t: Tensor) -> Result<u32, kernels_xla::Error> {
+    if t.width == root.width && t.dtype == root.dtype {
+        return Ok(root.rows);
+    }
+    let bits = |dtype: Dtype, rows: u32, width: u32| {
+        storage(dtype, rows, width).map(|ty| ty.elements() * i64::from(ty.elem.bits()))
+    };
+    let all = bits(root.dtype, root.rows, root.width);
+    let row = bits(t.dtype, 1, t.width);
+    match (all, row) {
+        (Some(all), Some(row)) if row > 0 && all % row == 0 => {
+            u32::try_from(all / row).map_err(|_| kernels_xla::Error::Backend {
+                op: "trace",
+                detail: format!("a view of {} rows", all / row),
+            })
+        }
+        _ => Err(kernels_xla::Error::Backend {
+            op: "trace",
+            detail: format!(
+                "a {}-wide {:?} view of a {}x{} {:?} root",
+                t.width, t.dtype, root.rows, root.width, root.dtype
+            ),
+        }),
+    }
+}
+
+/// A view's whole value back as its root's: the inverse of [`reinterpret`].
+fn unview(f: &mut Func, v: Val, root: Root) -> Result<Val, kernels_xla::Error> {
+    let want =
+        storage(root.dtype, root.rows, root.width).ok_or_else(|| kernels_xla::Error::Backend {
+            op: "trace",
+            detail: format!("a {:?} root, which has no storage form", root.dtype),
+        })?;
+    let bytes = f.bitcast(v, Elem::U8)?;
+    let per = i64::from(want.elem.bits() / 8).max(1);
+    let n = f.ty(bytes).elements();
+    if per == 1 {
+        return Ok(f.reshape(bytes, &want.dims)?);
+    }
+    let r = f.reshape(bytes, &[n / per, per])?;
+    let r = f.bitcast(r, want.elem)?;
+    Ok(f.reshape(r, &want.dims)?)
+}
+
+/// A handle may view its root under another width or element: a packed
+/// weight read as raw bytes, a pool plane read out of the one pool.
 fn reinterpret(f: &mut Func, v: Val, root: Root, t: Tensor) -> Result<Val, kernels_xla::Error> {
     if t.width == root.width && t.dtype == root.dtype {
         return Ok(v);
     }
-    let want = storage(t.dtype, root.rows, t.width);
+    let want = storage(t.dtype, view_rows(root, t)?, t.width);
     match want {
         Some(ty)
             if ty.elements() * i64::from(ty.elem.bits())
@@ -548,6 +671,8 @@ impl Emit for Tracer<'_> {
             written,
             pack_len,
             sums,
+            view_reads,
+            views,
         } = &mut *state;
         let mut lens = Lens {
             handles: self.handles,
@@ -556,8 +681,73 @@ impl Emit for Tracer<'_> {
             params,
             written,
             sums,
+            view_reads,
+            views,
         };
         let mut cx = Cx::new(func, &mut lens).with_tuning(self.tuning);
         body(&mut cx)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn pool(handles: &Handles) -> Tensor {
+        handles.root(Root {
+            source: Source::Pool { row: 0, plane: 0 },
+            dtype: Dtype::U32,
+            rows: 64,
+            width: 128,
+        })
+    }
+
+    #[test]
+    fn a_plane_reads_the_pool_as_its_own_rows_and_lands_back_whole() {
+        let handles = Handles::new();
+        let root = pool(&handles);
+        let keys = handles.view(root, Dtype::Bf16, 256).expect("a view");
+        assert_eq!(keys.rows, 64 * 128 * 4 / (256 * 2));
+        let tracer = Tracer::new(&handles);
+        tracer
+            .emit(&mut |cx| {
+                let v = cx.read(keys)?;
+                assert_eq!(cx.dims(v), &[64, 256]);
+                cx.write(keys, v)
+            })
+            .expect("a whole view lands");
+        let (text, sig) = tracer.finish(&[]);
+        assert_eq!(sig.results.len(), 1, "the pool is the one result");
+        assert!(text.contains("bitcast_convert"), "{text}");
+    }
+
+    #[test]
+    fn a_plane_landed_off_a_pool_another_plane_replaced_is_refused() {
+        let handles = Handles::new();
+        let root = pool(&handles);
+        let keys = handles.view(root, Dtype::Bf16, 256).expect("a view");
+        let values = handles.view(root, Dtype::Bf16, 256).expect("a view");
+        let tracer = Tracer::new(&handles);
+        let refused = tracer.emit(&mut |cx| {
+            let k = cx.read(keys)?;
+            let v = cx.read(values)?;
+            assert_eq!(k, v, "one view of one pool value is read once");
+            cx.write(keys, k)?;
+            cx.write(values, v)
+        });
+        assert!(
+            refused.is_err(),
+            "the second plane's stale value lands nowhere"
+        );
+        // Read after the first write, it lands.
+        let tracer = Tracer::new(&handles);
+        tracer
+            .emit(&mut |cx| {
+                let k = cx.read(keys)?;
+                cx.write(keys, k)?;
+                let v = cx.read(values)?;
+                cx.write(values, v)
+            })
+            .expect("a plane read after the other's write lands");
     }
 }
