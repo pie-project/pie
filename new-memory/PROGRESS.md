@@ -524,3 +524,14 @@ The `new-memory/` directory is bookkeeping and is removed before anything lands 
 - Verified: cargo check runtime/worker; store::weights 24, governor::steered 5. Not covered by a test: the
   bootstrap wait through a real scheduler lane (IT to check with WeightUses.held host == 0 after boot).
 - Closes the M35 gaps 1-2; open: staging floor ignored (sync h2d), other embed variants resident, experts engine side.
+
+### M37 — 2026-11-10: BM2 merged (Metal window lists verified on device)
+- `sc/bm2-metal-window` (cd907604e): page tables sized per window list; runtime 6da9a5d14 fixes "KV/state pool
+  starved" on long prompts (dedicated shared pool may grow to its whole range; state waiters reach its walker).
+- Mac: trimmed window list reads bitwise as the untrimmed one (gemma4-e4b-mini-l1 700-token prefill in 256 pieces;
+  muse-glimmer-30b-mini-l8 T_w 16 beside 32-token kv pages, 2200 prompt past the 2048 window). Qwen3.5-0.8B MTP
+  k=0/2/4, beam 3x12/1x12, text-completion equal to pre-BM incl. acceptance counts (rs list + slot_copies on device).
+- Open: gemma-4-e4b-it-4bit long-prompt greedy differs from pre-BM (76b080825) in some runs (700-prompt at token 12,
+  284-prompt at token 212 before the window); 1500/fork/resume past window equal. Started with BM (M30), not WL2.
+  Logit-level check pending. Metal multi-window-list not done (untestable on device now). MTP accepts 0/127 drafts
+  on Qwen3.5-0.8B in both builds (separate issue).
