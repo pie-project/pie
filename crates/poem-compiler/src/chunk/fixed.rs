@@ -4,22 +4,23 @@
 //!
 //! The rs rows go first, together: an engine reads a lane's rs buffer
 //! through one page table, so every rs row lies in the same record slots,
-//! one after another. They stay whole in slot 0 unless the plan lets them
-//! be cut (they outgrow every chunk the device would take); then every one
-//! is cut alike on its tokens into the fewest equal pieces whose share of
-//! each fits a slot, piece `p` of every rs row in slot `p`.
+//! one after another. Where they fit a slot they stay whole in slot 0; else
+//! (where the plan lets them be cut) every one is cut alike on its tokens
+//! into the fewest equal pieces whose share of each fits a slot, piece `p`
+//! of every rs row in slot `p`.
 //!
-//! Then the other rows. A row no larger than a slot stays whole: one piece,
-//! packed first-fit with other whole rows into a slot. A row larger is cut
-//! on its atom axis into the fewest equal pieces a slot holds (the last
-//! padded); rows cut into as many pieces share a band of that many slots,
-//! one piece a slot, each row at its own offset common to the band.
+//! Then the other rows. A row no larger than a piece's cap stays whole: one
+//! piece, packed first-fit with other whole rows into a slot. A row larger
+//! is cut on its atom axis into the fewest equal pieces the cap holds (the
+//! last padded), laid in a window of as many slots of a band whose slots
+//! that many divide (its own band where none has room), one piece a slot,
+//! at an offset common to the window.
 
 use super::census::FixedRow;
-use super::{FixedRun, MIN_PIECE, RowId, align_up};
+use super::{FixedRun, MIN_PIECE, RowId, align_down, align_up};
 
 /// A band of `n` slots from record slot `first`, holding cut rows of `n`
-/// pieces each.
+/// pieces each, or of a divisor of `n` in windows of its slots.
 struct Band {
     first: u32,
     n: u32,
@@ -31,22 +32,34 @@ pub fn is_rs(row: &FixedRow) -> bool {
     matches!(row.id, RowId::Rs(_))
 }
 
-/// Lays `rows` into slots of `slot` bytes: the slots a working set's record
-/// takes, and each row's run (in `rows`' order) when `build`. `None` where a
-/// row that may not be cut is larger than `slot` (the rs rows together,
-/// unless `rs_cut`), or where a cut piece would hold fewer than `least`
-/// bytes.
-pub fn pack(
-    rows: &[FixedRow],
-    slot: u64,
-    align: u64,
-    least: u64,
-    rs_cut: bool,
-    build: bool,
-) -> Option<(u32, Vec<FixedRun>)> {
+/// How [`pack`] lays a record: slots of `slot` bytes, a cut piece of a row
+/// other than the rs rows no larger than `cap` nor smaller than `least`, the
+/// rs rows cut where `rs_cut`.
+#[derive(Debug, Clone, Copy)]
+pub struct Packing {
+    pub slot: u64,
+    pub cap: u64,
+    pub align: u64,
+    pub least: u64,
+    pub rs_cut: bool,
+}
+
+/// Lays `rows` as `how` says: the slots a working set's record takes, and
+/// each row's run (in `rows`' order) when `build`. `None` where a row that
+/// may not be cut is larger than a slot (the rs rows together, unless
+/// `rs_cut`), or where a cut piece would hold fewer than `least` bytes.
+pub fn pack(rows: &[FixedRow], how: Packing, build: bool) -> Option<(u32, Vec<FixedRun>)> {
+    let Packing {
+        slot,
+        cap,
+        align,
+        least,
+        rs_cut,
+    } = how;
     if rows.is_empty() {
         return None;
     }
+    let cap = cap.min(slot);
     let mut used: Vec<u64> = Vec::new();
     let mut bands: Vec<Band> = Vec::new();
     let mut runs: Vec<Option<FixedRun>> = Vec::new();
@@ -79,7 +92,7 @@ pub fn pack(
         if is_rs(row) {
             continue;
         }
-        if row.bytes <= slot || !cuttable(row) {
+        if row.bytes <= cap || !cuttable(row) {
             if row.bytes > slot {
                 return None;
             }
@@ -103,12 +116,11 @@ pub fn pack(
             }
             continue;
         }
-        let (n, atoms) = cut(row, slot, least)?;
+        let (n, atoms) = cut(row, cap, least)?;
         let bytes = atoms * row.atom.bytes;
-        let top = |band: &Band, used: &[u64]| {
-            let first = band.first as usize;
+        let top = |first: usize, used: &[u64]| {
             align_up(
-                used[first..first + band.n as usize]
+                used[first..first + n as usize]
                     .iter()
                     .copied()
                     .max()
@@ -116,33 +128,36 @@ pub fn pack(
                 align,
             )
         };
-        let band = match bands
+        // The first window of `n` slots of a band `n` divides with room.
+        let window = bands
             .iter()
-            .position(|b| b.n == n && top(b, &used) + bytes <= slot)
-        {
-            Some(band) => band,
+            .filter(|b| b.n % n == 0)
+            .flat_map(|b| (0..b.n / n).map(move |k| (b.first + k * n) as usize))
+            .find(|&first| top(first, &used) + bytes <= slot);
+        let first = match window {
+            Some(first) => first,
             None => {
+                let first = used.len();
                 bands.push(Band {
-                    first: u32::try_from(used.len()).ok()?,
+                    first: u32::try_from(first).ok()?,
                     n,
                 });
                 used.extend(std::iter::repeat_n(0, n as usize));
-                bands.len() - 1
+                first
             }
         };
-        let band = &bands[band];
-        let offset = top(band, &used);
-        let first = band.first as usize;
+        let offset = top(first, &used);
         for u in &mut used[first..first + n as usize] {
             *u = offset + bytes;
         }
         if build {
+            let first = u32::try_from(first).ok()?;
             runs[i] = Some(FixedRun {
                 row: row.id,
                 pieces: n,
                 atoms_per_piece: atoms,
                 offset,
-                slots: (band.first..band.first + n).collect(),
+                slots: (first..first + n).collect(),
             });
         }
     }
@@ -181,6 +196,22 @@ fn rs_pieces(rs: &[&FixedRow], slot: u64, align: u64, cut: bool) -> Option<(u32,
     Some((u32::try_from(n).ok()?, atoms))
 }
 
+/// The room the rs rows leave in each slot they lie in at slots of `slot`
+/// bytes: a cap for the other rows' pieces that fills it. `None` where there
+/// are no rs rows or they do not lie in `slot`.
+#[must_use]
+pub fn rs_room(rows: &[FixedRow], slot: u64, align: u64, rs_cut: bool) -> Option<u64> {
+    let rs: Vec<&FixedRow> = rows.iter().filter(|r| is_rs(r)).collect();
+    if rs.is_empty() {
+        return None;
+    }
+    let (_, atoms) = rs_pieces(&rs, slot, align, rs_cut)?;
+    Some(align_down(
+        slot - align_up(rs_bytes(&rs, atoms, align), align).min(slot),
+        align,
+    ))
+}
+
 /// The slots of one piece the rs rows cut `n` ways take: their share of
 /// each, aligned; `None` where they are not cut `n` ways.
 #[must_use]
@@ -191,12 +222,12 @@ pub fn rs_piece(rs: &[&FixedRow], n: u64, align: u64) -> Option<u64> {
 }
 
 /// The fewest equal pieces of whole grains `row` cuts into for each to fit
-/// `slot`, and the atoms a piece holds; `None` where a grain outgrows the
-/// slot or a piece would hold fewer than `least` bytes.
-pub fn cut(row: &FixedRow, slot: u64, least: u64) -> Option<(u32, u64)> {
+/// `cap`, and the atoms a piece holds; `None` where a grain outgrows the
+/// cap or a piece would hold fewer than `least` bytes.
+pub fn cut(row: &FixedRow, cap: u64, least: u64) -> Option<(u32, u64)> {
     let atom = row.atom;
     let unit = atom.bytes * atom.grain;
-    let per = slot / unit.max(1);
+    let per = cap / unit.max(1);
     if per == 0 {
         return None;
     }

@@ -164,20 +164,27 @@ fn wrongs(trace: &Trace, recipe: &ChunkRecipe) -> Vec<String> {
         .iter()
         .filter(|r| matches!(r.row, RowId::Rs(_)))
         .collect();
-    if rs
-        .windows(2)
-        .any(|w| (&w[0].slots, w[0].atoms_per_piece) != (&w[1].slots, w[1].atoms_per_piece))
-    {
-        wrong.push("rs rows lie apart".to_string());
+    let layout = &recipe.rs;
+    if rs.iter().any(|r| {
+        (r.pieces, &r.slots, r.atoms_per_piece)
+            != (layout.pieces, &layout.slots, layout.tokens_per_piece)
+    }) {
+        wrong.push(format!("rs rows lie apart of {layout:?}"));
     }
-    if rs.len() != recipe.rs.len() {
+    let covered: u64 = (0..layout.pieces)
+        .map(|p| layout.tokens(p).count() as u64)
+        .sum();
+    if !rs.is_empty() && covered != u64::from(chunk::UNFOLDED_ROWS) {
+        wrong.push(format!("rs pieces cover {covered} tokens"));
+    }
+    if rs.len() != layout.rows.len() {
         wrong.push(format!(
             "{} rs rows, {} described",
             rs.len(),
-            recipe.rs.len()
+            layout.rows.len()
         ));
     }
-    for (row, what) in &recipe.rs {
+    for (row, what) in &layout.rows {
         if recipe.atoms.get(row).map(|a| a.bytes) != Some(what.per_token()) {
             wrong.push(format!(
                 "{row:?} buffers {} bytes a token",
@@ -428,6 +435,7 @@ fn dsv41_flash_keeps_its_replay_floor_and_ngram_ids_in_a_slot_a_thousand_share()
     // Each window's unfolded ids buffer as an rs row of 16 i32 ids.
     let windows: Vec<_> = recipe
         .rs
+        .rows
         .iter()
         .filter(|(_, rs)| {
             rs.state
@@ -458,23 +466,30 @@ fn rs_runs(recipe: &ChunkRecipe) -> Vec<&chunk::FixedRun> {
 }
 
 #[test]
-fn qwen35_vision_mtp_lays_every_rs_row_whole_in_one_slot() {
+fn qwen35_vision_mtp_lays_every_rs_row_in_the_same_slots_cut_alike() {
     for (preset, chunk) in PRESETS {
         let (trace, recipe) = planned_on("qwen35-d0.8b-vision-mtp-bf16-kv-bf16", chunk);
         let runs = rs_runs(&recipe);
         // A row a gated-delta layer: 18 of the 24 (every fourth is attention).
         assert_eq!(runs.len(), 18, "{preset}");
-        let slot = runs[0].slots[0];
+        let rs = &recipe.rs;
+        println!(
+            "{preset}: rs rows in {} piece(s) of {} tokens, slots {:?}",
+            rs.pieces, rs.tokens_per_piece, rs.slots
+        );
+        assert_eq!(rs.slots.len(), rs.pieces as usize);
         for run in &runs {
             assert_eq!(
-                (run.pieces, run.slots.as_slice()),
-                (1, &[slot][..]),
+                (run.pieces, &run.slots, run.atoms_per_piece),
+                (rs.pieces, &rs.slots, rs.tokens_per_piece),
                 "{preset}: {run:?}"
             );
         }
+        // The rows lie one after another in each piece's slot.
+        assert!(runs.windows(2).all(|w| w[0].offset < w[1].offset));
         // Each row buffers the conv's input and `[b | a]`, committing into
         // its layer's delta state.
-        for rs in recipe.rs.values() {
+        for rs in recipe.rs.rows.values() {
             let state = name_of(&trace, RowId::Cache(rs.state.unwrap()));
             assert!(state.ends_with("gdn.delta_state"), "{state}");
             assert_eq!(rs.planes.len(), 2);
@@ -488,6 +503,7 @@ fn qwen38_flash_next_mini_buffers_its_ngram_ids_as_an_rs_row_beside_the_others()
         let (trace, recipe) = planned_on("qwen38-flash-next-mini-bf16-kv-bf16", chunk);
         let ids: Vec<_> = recipe
             .rs
+            .rows
             .iter()
             .filter(|(_, rs)| {
                 rs.state
@@ -502,7 +518,7 @@ fn qwen38_flash_next_mini_buffers_its_ngram_ids_as_an_rs_row_beside_the_others()
         assert_eq!(recipe.atoms[id].extent, u64::from(chunk::UNFOLDED_ROWS));
         let runs = rs_runs(&recipe);
         assert_eq!(runs.len(), 4, "{preset}: three delta layers and the ids");
-        assert!(runs.iter().all(|r| r.slots == runs[0].slots && !r.is_cut()));
+        assert!(runs.iter().all(|r| r.slots == recipe.rs.slots));
     }
 }
 

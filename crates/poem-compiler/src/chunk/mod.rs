@@ -11,7 +11,8 @@
 //! rows), whole when it fits in a chunk, else in slots of a piece's size: a
 //! row no larger stays whole beside others, a row larger is cut on the atoms
 //! its readers let a piece cut into equal pieces, each at one offset in its
-//! own slot ([`FixedRun`]). The rs rows lie together in the same slots, as
+//! own slot ([`FixedRun`]). The rs rows lie together in the same slots, whole
+//! or cut alike on their tokens, whichever wastes less ([`RsLayout`]), as
 //! an engine reads a lane's rs buffer through one page table.
 //!
 //! Beside the states, a **weight** slot holds read-only weights a device may
@@ -302,9 +303,45 @@ pub struct ChunkRecipe {
     /// The weight slot shapes: routed experts and gathered table rows the
     /// pool may hold read-only, one shape each kind of atom.
     pub weights: Vec<WeightSlot>,
+    /// How the rs rows lie in the fixed record, whole or cut, and what each
+    /// buffers.
+    pub rs: RsLayout,
+}
+
+/// The rs buffer in a working set's fixed record. Every rs row lies in the
+/// same record slots, cut alike: piece `p` of every row (its tokens
+/// [`RsLayout::tokens`]) in record slot `slots[p]`, each row at its
+/// [`FixedRun::offset`] there; one piece (slot 0, all 16 tokens) where whole.
+/// An engine reads a lane's rs buffer through one page table: the lane's
+/// pieces of these slots.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct RsLayout {
+    /// The pieces every rs row is cut into; 1 where whole, 0 where there
+    /// are no rs rows.
+    pub pieces: u32,
+    /// The tokens a piece holds; the last piece holds what is left.
+    pub tokens_per_piece: u64,
+    /// The record slots the pieces lie in, one a piece.
+    pub slots: Vec<u32>,
     /// What each rs row buffers: the state it commits into and its planes,
     /// in the order they lie in the row.
-    pub rs: BTreeMap<RowId, RsRow>,
+    pub rows: BTreeMap<RowId, RsRow>,
+}
+
+impl RsLayout {
+    /// Whether the rs rows are cut into pieces.
+    #[must_use]
+    pub fn is_cut(&self) -> bool {
+        self.pieces > 1
+    }
+
+    /// The tokens piece `p` holds, of [`UNFOLDED_ROWS`].
+    #[must_use]
+    pub fn tokens(&self, p: u32) -> Range<u64> {
+        let extent = u64::from(UNFOLDED_ROWS);
+        let start = (u64::from(p) * self.tokens_per_piece).min(extent);
+        start..(start + self.tokens_per_piece).min(extent)
+    }
 }
 
 impl ChunkRecipe {
@@ -689,11 +726,11 @@ pub fn plan(
     let record = fixed_rows
         .iter()
         .fold(0, |at, r| align_up(at, align) + r.bytes);
-    // The rs rows lie together, whole where a chunk the device would take
-    // holds them; else cut alike on their tokens.
+    // The rs rows lie together: whole, or cut alike on their tokens where
+    // that wastes less and they are no smaller than a piece may be.
     let rs: Vec<&FixedRow> = fixed_rows.iter().filter(|r| fixed::is_rs(r)).collect();
     let rs_bytes = fixed::rs_piece(&rs, 1, align).unwrap_or(0);
-    let rs_cut = rs_bytes > hi;
+    let rs_cut = rs_bytes >= MIN_PIECE;
     let rs_whole = rs
         .first()
         .filter(|_| !rs_cut)
@@ -802,10 +839,18 @@ pub fn plan(
         .sum();
 
     let mut slots = token_shapes;
+    let mut rs = RsLayout {
+        rows: census.rs,
+        ..RsLayout::default()
+    };
     if let Some(pick) = pick {
         let (pieces_per_ws, rows) =
-            fixed::pack(&fixed_rows, pick.slot, align, pick.least, rs_cut, true)
-                .unwrap_or((0, Vec::new()));
+            fixed::pack(&fixed_rows, pick.packing(align, rs_cut), true).unwrap_or((0, Vec::new()));
+        if let Some(run) = rows.iter().find(|r| matches!(r.row, RowId::Rs(_))) {
+            rs.pieces = run.pieces;
+            rs.tokens_per_piece = run.atoms_per_piece;
+            rs.slots.clone_from(&run.slots);
+        }
         slots.push(SlotLayout::Fixed {
             bytes: pick.slot,
             record,
@@ -824,7 +869,7 @@ pub fn plan(
         waste,
         profile: device,
         weights,
-        rs: census.rs,
+        rs,
     })
 }
 
@@ -896,8 +941,22 @@ fn token_layout(
 struct FixedPick {
     slot: u64,
     pieces: u32,
+    /// The most bytes a cut piece of a row other than the rs rows holds.
+    cap: u64,
     /// The least bytes a cut piece holds.
     least: u64,
+}
+
+impl FixedPick {
+    fn packing(&self, align: u64, rs_cut: bool) -> fixed::Packing {
+        fixed::Packing {
+            slot: self.slot,
+            cap: self.cap,
+            align,
+            least: self.least,
+            rs_cut,
+        }
+    }
 }
 
 /// The fixed slot for chunks of `chunk` bytes: the record whole where it
@@ -906,7 +965,8 @@ struct FixedPick {
 /// [`MIN_PIECE`], the one that wastes least in the slots (padding counted)
 /// and in the chunks they fill, the larger on a near tie. Cut pieces hold
 /// [`MIN_PIECE`] at least where any size lets them, else as few as a size
-/// takes.
+/// takes. A cut piece fills its slot, or the room the rs rows leave in
+/// theirs, whichever wastes less.
 fn pick_fixed(
     rows: &[FixedRow],
     record: u64,
@@ -915,9 +975,11 @@ fn pick_fixed(
     rs_cut: bool,
 ) -> Option<FixedPick> {
     if record <= chunk {
+        let slot = align_up(record.max(FIXED_SLOT_FLOOR), align);
         return Some(FixedPick {
-            slot: align_up(record.max(FIXED_SLOT_FLOOR), align),
+            slot,
             pieces: 1,
+            cap: slot,
             least: 0,
         });
     }
@@ -969,21 +1031,26 @@ fn pick_fixed(
     for least in [least, 0] {
         let mut best: Option<(u64, FixedPick)> = None;
         for &slot in &sizes {
-            let Some((pieces, _)) = fixed::pack(rows, slot, align, least, rs_cut, false) else {
-                continue;
-            };
-            let per = chunk / slot;
-            let held = u64::from(pieces) * slot;
-            let cost = held.saturating_sub(record) + u64::from(pieces) * (chunk - per * slot) / per;
-            if best.as_ref().is_none_or(|(was, _)| cost + near < *was) {
-                best = Some((
-                    cost,
-                    FixedPick {
-                        slot,
-                        pieces,
-                        least,
-                    },
-                ));
+            let room =
+                fixed::rs_room(rows, slot, align, rs_cut).filter(|&r| r >= least && r < slot);
+            for cap in core::iter::once(slot).chain(room) {
+                let pick = FixedPick {
+                    slot,
+                    pieces: 0,
+                    cap,
+                    least,
+                };
+                let Some((pieces, _)) = fixed::pack(rows, pick.packing(align, rs_cut), false)
+                else {
+                    continue;
+                };
+                let per = chunk / slot;
+                let held = u64::from(pieces) * slot;
+                let cost =
+                    held.saturating_sub(record) + u64::from(pieces) * (chunk - per * slot) / per;
+                if best.as_ref().is_none_or(|(was, _)| cost + near < *was) {
+                    best = Some((cost, FixedPick { pieces, ..pick }));
+                }
             }
         }
         if best.is_some() {
