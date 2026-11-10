@@ -94,7 +94,7 @@ pub fn register(registry: &mut Registry, side_streams: u32) {
 }
 
 pub fn register_for(registry: &mut Registry, side_streams: u32, conditionals: Conditionals) {
-    register_all(registry, side_streams, conditionals, false);
+    register_all(registry, side_streams, conditionals, false, false);
 }
 
 /// [`register`], `compiler.synth_regions` and `compiler.synth_anchors` on
@@ -102,7 +102,19 @@ pub fn register_for(registry: &mut Registry, side_streams: u32, conditionals: Co
 /// generated row kernels and a product's epilogue to its contraction
 /// skeletons.
 pub fn register_regions(registry: &mut Registry, side_streams: u32) {
-    register_all(registry, side_streams, Conditionals::Native, true);
+    register_all(registry, side_streams, Conditionals::Native, true, true);
+}
+
+/// [`register_for`], `compiler.synth_regions` on by default, and
+/// `compiler.synth_anchors` where `anchors`: a backend whose row kernels
+/// are generated, and whose contraction skeletons may not be yet.
+pub fn register_regions_for(
+    registry: &mut Registry,
+    side_streams: u32,
+    conditionals: Conditionals,
+    anchors: bool,
+) {
+    register_all(registry, side_streams, conditionals, true, anchors);
 }
 
 fn register_all(
@@ -110,6 +122,7 @@ fn register_all(
     side_streams: u32,
     conditionals: Conditionals,
     regions: bool,
+    anchors: bool,
 ) {
     registry.add::<LaunchUs>();
     match conditionals {
@@ -133,7 +146,7 @@ fn register_all(
         .add::<DagStreams>()
         .add::<DagStreamsUntil>()
         .add_defaulting::<SynthRegions>(if regions { "true" } else { "false" })
-        .add_defaulting::<SynthAnchors>(if regions { "true" } else { "false" })
+        .add_defaulting::<SynthAnchors>(if anchors { "true" } else { "false" })
         .add_defaulting::<SideStreams>(&side_streams.to_string());
 }
 

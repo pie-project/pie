@@ -37,8 +37,21 @@ impl DispatchFused for Run<'_> {
     fn dispatch(&mut self, op: &Fused) -> Result<(), KernelError> {
         match op {
             _ if refuses(op) => Err(kernels_cuda::Error::Unsupported { op: op.name() }),
-            // A synthesized region's body is not launched here yet.
-            Fused::Region { .. } | Fused::Anchored { .. } | Fused::Epilogue { .. } => {
+            Fused::Region {
+                ins,
+                reads,
+                width,
+                key: body,
+                outs,
+            } => {
+                if outs.first().is_some_and(|out| self.lane_shaped(*out)) {
+                    self.unseated(|| self.region(ins, reads, *width, *body, outs))
+                } else {
+                    self.region(ins, reads, *width, *body, outs)
+                }
+            }
+            // No contraction skeleton on this backend yet.
+            Fused::Anchored { .. } | Fused::Epilogue { .. } => {
                 Err(kernels_cuda::Error::Unsupported { op: op.name() })
             }
             Fused::GdnStep { .. } => return self.gdn_step(op),

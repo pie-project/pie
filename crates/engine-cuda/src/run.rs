@@ -1687,7 +1687,6 @@ impl<'c> Run<'c> {
 
     /// The kernel the load generated for the region of `body` over rows
     /// `width` wide.
-    #[cfg(not(feature = "rocm"))]
     pub(crate) fn region_kernel(
         &self,
         body: u64,
