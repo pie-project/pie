@@ -95,6 +95,88 @@ branch, same profile file. Watch especially:
 - One window list (widest window, T_w = kv page), as CUDA's interim.
 - Fixed rows larger than a chunk are never cut (the chunk stretches to the largest block); a record spans pieces only
   between blocks.
-- rs snapshots: not served on XLA (as before).
-- Weight streaming (PLE rows, experts): not implemented; all weights stay resident.
+- rs snapshots: served by firing the pass in pieces (section 5); a kernel-level form is a speed item.
+- Weight streaming: section 5 (dense bf16 only; quantized banks stay resident; a streaming load seats every atom at load).
 - Frame caches (DiT conv3d) read the record's first piece only.
+
+## 5. Weight streaming and snapshots (`sc/xla2`, on top of the chunk pool)
+
+What it is (design, `crates/engine-xla/src/store/streamed.rs`, `serve/stream.rs`, `snapshot.rs`):
+
+- **Held loads stream nothing.** `Residency::weights_held` (the worker sets it unless `weight_streaming = "on"`):
+  no weight shape is stated, every plane lands as the base build lands it, and every program is the base build's
+  (checked on the CUDA plugin by dumping programs, section 5.1). On XLA "held" is therefore the dense planes, not
+  pool slots: a pool slot and a dense buffer cannot alias in PJRT, and a held program reading weights out of the
+  pool would pay the bitcast relayout of section 3.2 on every read.
+- **A streaming load** (`weights_held = false`) states `WeightKind::Rows` shapes (a bf16 table every reader of
+  which is a plain token-id `Gather::Embed` of the fire's tokens: PLE, an untied embedding) and `WeightKind::Expert`
+  shapes (dense bf16 banks read only by plain routed selects, alone or in a fused routed MLP; an atom = one expert
+  of one layer, every bank's plane back to back). Every atom is seated in the pool at load, just below the sink
+  (`WeightShape::seated`); the host keeps the landed bytes (the miss copy) until a held residency names every atom
+  (`WeightResidency::held`), then drops them. A residency that moves an atom after that is refused (refilling from
+  the serving file is not built).
+- **Rows**: the host knows a fire's token ids (ids the device feeds are downloaded first: a sync, the documented
+  fallback), so each token row's row of the pool is a per-fire input; a block in no slot is uploaded into a staging
+  slot before the fire. The program gathers rows from a bf16 view of the pool: no block table on the device.
+- **Experts**: a select reads its bank as the dense `[E*rows, cols]` value the base build reads, gathered from the
+  pool (512-byte rows) by a per-fire input of each expert's first row: the kernels are the base build's. Routes are
+  decided inside the fire, so a fire with a layer whose experts are not all in slots is **cut before that layer's
+  first select** (`Tracer::cut`): the segment runs, its activations stay on the device as carried buffers, the
+  routes come back (D2H), the routed experts in no slot are uploaded into staging slots, the layer's expert table
+  is rewritten in the pack, and the next segment runs. A layer whose experts are all resident costs no cut.
+- **Snapshots inside a pass** (contract 16): a step whose lanes snapshot is fired in pieces, the lane's rows up to
+  each snapshot row alone, the record copied whole into the snapshot record after each piece, the last piece with
+  the step's other lanes. Bitwise the cut pass by construction. `rs_snapshots = 4` where the load holds state.
+  Contract 16 amended: `RsSnapshot.fixed` names the snapshot record in every fixed shape (XLA states one fixed shape
+  a distinct state block size).
+
+### 5.1 Bitwise on TPU (branch vs base, Mosaic on)
+
+```sh
+# base dumps as in section 1, plus the MoE gate (a_routed_model_answers_bit_for_bit, qwen3-30b-a3b-mini):
+PIE_XLA_GOLDEN_DUMP=$G PIE_XLA_DUMP=/tmp/progs-base/<test> cargo test --release -p engine-xla --test engine_xla -- \
+  a_pool_answers_what_the_base_build_answered::<test> --test-threads=1      # base build
+# branch, held (programs must be the base build's: same file names under PIE_XLA_DUMP)
+PIE_XLA_WEIGHTS_HELD=1 PIE_XLA_GOLDEN=$G PIE_XLA_DUMP=/tmp/progs-held/<test> cargo test --release -p engine-xla \
+  --test engine_xla -- a_pool_answers_what_the_base_build_answered::<test> --test-threads=1
+diff <(ls /tmp/progs-base/<test>) <(ls /tmp/progs-held/<test>)             # expect no output
+# branch, streaming: every residency (seated / moved / none / half / held) = a held load at the same pool size
+PIE_XLA_GOLDEN=$G cargo test --release -p engine-xla --test engine_xla -- streamed_weights:: snapshots:: \
+  --test-threads=1 --nocapture
+```
+
+- `streamed_weights::a_streamed_row_table_*` (gemma4-e4b-mini-l1, PLE): every case must also print `= the base
+  build's dump, bit for bit` (CUDA plugin: all five did).
+- `streamed_weights::streamed_experts_*` (qwen3-30b-a3b-mini: experts + its untied embedding as rows): every case
+  must equal the held load grown to the same pool (the control). On TPU the MoE runs the Mosaic grouped-matmul kernel
+  on a bank gathered from the pool: equal bits there are the real check of "same kernels on the same values".
+- `snapshots::` (qwen35-tiny): snapshots / record / readouts / decodes = the cut pass. On TPU the GDN Mosaic step and
+  fused-chunk kernels run here (off on the CUDA plugin).
+- **Pool-size sensitivity (found here, pre-existing, M63).** On the CUDA plugin the base build's own readouts
+  change with the pool's chunk count alone: qwen3-30b-a3b-mini held, +1 / +4 / +37 chunks changes the 50-row prompt
+  fired beside a decode (and the decodes after it), max |d| 0.016, no top-token change; +130 chunks (pool past
+  2 GiB) changes every readout (max |d| 0.11). gemma4-e4b-mini-l1 +16 chunks: no change. Check on TPU: run the
+  gate's held load grown (`Model::load_held_grown`, `DeviceBoot::pool_extra_chunks`) against the base dump; a
+  difference past 2 GiB of pool is likely an i32 offset somewhere in the pool views (TPU pools are tens of GiB).
+
+### 5.2 Speed (v5e / v6e, branch streaming vs held)
+
+1. **Expert bank gathered per layer per fire.** A streamed select reads `[E*rows, cols]` gathered from the pool every
+   fire: O(bank) HBM traffic per layer even for a decode whose base reads top-k experts. Measure decode tok/s at
+   c = 1 / 64 on a MoE, streaming all-resident vs held. Fix path: hand the kernels the pool view and an expert ->
+   row table (the gmm kernel's scalar-prefetched group offsets, the slice path's dynamic offsets) so no bank is
+   materialized.
+2. **Cut fires.** Each layer whose experts are not all resident costs a program boundary, a D2H of its routes and an
+   H2D of its misses; the activations cross as carried buffers. Measure fire latency vs resident fraction (none /
+   half / all) and the compile count: a new cut set compiles L+1 programs per fire shape (the warm ladder compiles
+   only the uncut program). XLA cannot overlap the next segment's launch with the staging upload today.
+3. **Row gathers from a bitcast view.** The PLE / embedding gather reads a bf16 view of the whole u32 pool
+   (section 3.2): check the HLO for a pool-sized copy per gather.
+4. **Device-fed token ids with streamed rows.** A lane whose tokens come off the device (a guest pass's output)
+   downloads them before the fire: a sync per fire for device token loops.
+5. **Staging uploads.** Misses land through maintenance programs (back-to-back slots as one block, lone slots 64 a
+   program): one extra program per fire with misses.
+6. **Snapshots.** A fire per snapshot row (the cut pass's cost). A scan that lands its state as it walks (as
+   Vulkan's `PIE_SNAPS` twin) would take one fire; the Mosaic GDN kernels would need the same.
+7. **Expert uses of resident layers are not counted** (no routes come back without a cut): the runtime's LRU sees
+   only cut layers' experts. Counting them needs the routes as extra outputs downloaded at settle.
