@@ -434,7 +434,7 @@ fn poll_wait_slot<T>(
     }
     match check() {
         Some(result) => {
-            table.deregister(slot);
+            table.deregister_waker(slot, cx.waker());
             Poll::Ready(result)
         }
         None => Poll::Pending,

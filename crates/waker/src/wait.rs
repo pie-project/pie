@@ -9,6 +9,9 @@ pub struct WaitFuture<'t, F> {
     table: &'t WakerTable,
     slot: WakerSlotId,
     check: F,
+    /// The waker this future last registered on the slot, which it alone
+    /// takes back: other tasks may wait on the same slot.
+    registered: Option<std::task::Waker>,
 }
 
 impl<'t, F, T> WaitFuture<'t, F>
@@ -16,7 +19,12 @@ where
     F: FnMut() -> Readiness<T> + Unpin,
 {
     pub fn new(table: &'t WakerTable, slot: WakerSlotId, check: F) -> Self {
-        WaitFuture { table, slot, check }
+        WaitFuture {
+            table,
+            slot,
+            check,
+            registered: None,
+        }
     }
 }
 
@@ -36,9 +44,11 @@ where
             cx.waker().wake_by_ref();
             return std::task::Poll::Pending;
         }
+        this.registered = Some(cx.waker().clone());
         match (this.check)() {
             Readiness::Ready(v) => {
-                this.table.deregister(this.slot);
+                this.table.deregister_waker(this.slot, cx.waker());
+                this.registered = None;
                 std::task::Poll::Ready(v)
             }
             Readiness::Pending { .. } => std::task::Poll::Pending,
@@ -48,6 +58,8 @@ where
 
 impl<F> Drop for WaitFuture<'_, F> {
     fn drop(&mut self) {
-        self.table.deregister(self.slot);
+        if let Some(waker) = self.registered.take() {
+            self.table.deregister_waker(self.slot, &waker);
+        }
     }
 }

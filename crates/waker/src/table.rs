@@ -27,7 +27,10 @@ struct SlotState {
     generation: u32,
     waiter_epoch: Option<u64>,
     published_epoch: u64,
-    waker: Option<Waker>,
+    /// Every task waiting on the slot: a completion is awaited from more
+    /// than one task (a pipeline's lanes each wait on its front fire), and
+    /// a wake reaches them all.
+    wakers: Vec<Waker>,
     retired: bool,
 }
 
@@ -38,7 +41,7 @@ impl Slot {
                 generation: 1,
                 waiter_epoch: None,
                 published_epoch: 0,
-                waker: None,
+                wakers: Vec::new(),
                 retired: false,
             }),
         }
@@ -135,7 +138,7 @@ impl WakerTable {
                 }
                 debug_assert!(state.waiter_epoch.is_none());
                 debug_assert_eq!(state.published_epoch, 0);
-                debug_assert!(state.waker.is_none());
+                debug_assert!(state.wakers.is_empty());
                 return slot_id(state.generation, index);
             }
 
@@ -159,7 +162,7 @@ impl WakerTable {
                 return;
             }
 
-            let waker = state.waker.take();
+            let waker = std::mem::take(&mut state.wakers);
             state.waiter_epoch = None;
             state.published_epoch = 0;
 
@@ -174,7 +177,7 @@ impl WakerTable {
             (waker, recycle)
         };
 
-        if let Some(waker) = waker {
+        for waker in waker {
             waker.wake();
         }
         if recycle {
@@ -197,11 +200,56 @@ impl WakerTable {
             if !Self::is_live(&state, generation) {
                 return false;
             }
-            state.waiter_epoch = Some(observed_epoch);
-            state.waker.replace(waker)
+            // The earliest epoch any waiter saw: a wake past it reaches them
+            // all, each re-checking its own condition.
+            state.waiter_epoch = Some(
+                state
+                    .waiter_epoch
+                    .map_or(observed_epoch, |held| held.min(observed_epoch)),
+            );
+            match state.wakers.iter_mut().find(|held| held.will_wake(&waker)) {
+                Some(held) => Some(std::mem::replace(held, waker)),
+                None => {
+                    state.wakers.push(waker);
+                    None
+                }
+            }
         };
         drop(replaced);
         true
+    }
+
+    /// Drops `waker`'s registration on the slot, leaving every other task
+    /// waiting on it registered.
+    pub fn deregister_waker(&self, id: WakerSlotId, waker: &Waker) {
+        let (generation, index) = split_id(id);
+        let Some(slot) = self.slot(index) else {
+            return;
+        };
+        let removed = {
+            let mut state = slot.state.lock().expect("lock poisoned");
+            if !Self::is_live(&state, generation) {
+                return;
+            }
+            let removed: Vec<Waker> = {
+                let mut kept = Vec::with_capacity(state.wakers.len());
+                let mut removed = Vec::new();
+                for held in state.wakers.drain(..) {
+                    if held.will_wake(waker) {
+                        removed.push(held);
+                    } else {
+                        kept.push(held);
+                    }
+                }
+                state.wakers = kept;
+                removed
+            };
+            if state.wakers.is_empty() {
+                state.waiter_epoch = None;
+            }
+            removed
+        };
+        drop(removed);
     }
 
     pub fn deregister(&self, id: WakerSlotId) {
@@ -215,7 +263,7 @@ impl WakerTable {
                 return;
             }
             state.waiter_epoch = None;
-            state.waker.take()
+            std::mem::take(&mut state.wakers)
         };
         drop(removed);
     }
@@ -256,16 +304,18 @@ impl WakerTable {
                     }
                     Some(_) => {
                         state.waiter_epoch = None;
-                        match state.waker.take() {
-                            Some(waker) => (WakeOutcome::Woken, Some(waker)),
-                            None => (WakeOutcome::Empty, None),
+                        let wakers = std::mem::take(&mut state.wakers);
+                        if wakers.is_empty() {
+                            (WakeOutcome::Empty, None)
+                        } else {
+                            (WakeOutcome::Woken, Some(wakers))
                         }
                     }
                 }
             }
         };
 
-        if let Some(waker) = waker {
+        for waker in waker.into_iter().flatten() {
             waker.wake();
         }
         self.record(outcome);
@@ -299,16 +349,18 @@ impl WakerTable {
                     }
                     Some(_) => {
                         state.waiter_epoch = None;
-                        match state.waker.take() {
-                            Some(waker) => (WakeOutcome::Woken, Some(waker)),
-                            None => (WakeOutcome::Empty, None),
+                        let wakers = std::mem::take(&mut state.wakers);
+                        if wakers.is_empty() {
+                            (WakeOutcome::Empty, None)
+                        } else {
+                            (WakeOutcome::Woken, Some(wakers))
                         }
                     }
                 }
             }
         };
 
-        if let Some(waker) = waker {
+        for waker in waker.into_iter().flatten() {
             waker.wake();
         }
         self.record(outcome);

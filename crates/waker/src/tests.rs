@@ -23,6 +23,7 @@ fn tests_every_case() {
     stale_generation_is_noop_b10();
     spurious_wakes_are_harmless();
     sweep_on_abort_resolves_blocked_take_to_err_b12();
+    every_task_waiting_on_a_slot_is_woken();
 }
 
 fn alloc_register_wake_roundtrip() {
@@ -170,4 +171,40 @@ fn sweep_on_abort_resolves_blocked_take_to_err_b12() {
     assert_eq!(res, Err("poisoned"));
     let m = t.metrics();
     assert_eq!(m.swept, 2, "both endpoints swept");
+}
+
+/// Two tasks waiting on one slot (a pipeline's lanes on its front fire): a
+/// wake reaches both, and one task taking its registration back leaves the
+/// other's in place.
+fn every_task_waiting_on_a_slot_is_woken() {
+    let t = WakerTable::new();
+    let id = t.alloc();
+    let (a, wa) = flag_waker();
+    let (b, wb) = flag_waker();
+    assert!(t.register(id, &wa, 0));
+    assert!(t.register(id, &wb, 0));
+    assert_eq!(t.wake(id), WakeOutcome::Woken);
+    assert!(
+        a.0.load(std::sync::atomic::Ordering::SeqCst),
+        "the first waiter is woken"
+    );
+    assert!(
+        b.0.load(std::sync::atomic::Ordering::SeqCst),
+        "the second waiter is woken"
+    );
+
+    let (c, wc) = flag_waker();
+    let (d, wd) = flag_waker();
+    assert!(t.register(id, &wc, 0));
+    assert!(t.register(id, &wd, 0));
+    t.deregister_waker(id, &wc);
+    assert_eq!(t.wake(id), WakeOutcome::Woken);
+    assert!(
+        !c.0.load(std::sync::atomic::Ordering::SeqCst),
+        "a withdrawn waiter is not woken"
+    );
+    assert!(
+        d.0.load(std::sync::atomic::Ordering::SeqCst),
+        "the waiter left registered is"
+    );
 }
