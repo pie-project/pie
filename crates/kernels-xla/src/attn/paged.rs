@@ -2135,6 +2135,88 @@ pub fn attend_fresh(
     Ok((flashed.o, lse))
 }
 
+/// A decode over a fire's readout rows (`call.q`'s rows, at the fire rows
+/// `rows` names), each attending as the token it reads out, its position
+/// and lane in `call.tables`. Where every readout's lane holds no keys from
+/// before the fire, its keys are the rows the fire appended (`fresh`, one a
+/// fire row: `cache_rows` and `request_of_token` are the fire's), its
+/// lane's run up to itself: one blocked walk over that rectangle reads them,
+/// not a gather of every row's pages (a prompt's 32 padded lanes read 1024
+/// pages a layer). The fire decides at run time; the paged walk is the
+/// other branch, and the only one without `fresh`.
+#[allow(clippy::too_many_arguments)]
+pub fn attend_readouts(
+    f: &mut Func,
+    call: Paged<Operand, Landing>,
+    pool: KvPool<Operand>,
+    tuning: Tuning,
+    fresh: Option<super::flash::Appended>,
+    rows: Operand,
+    cache_rows: Operand,
+    request_of_token: Operand,
+) -> Result<Val, Error> {
+    const OP: &str = "attn.decode";
+    let walk = move |f: &mut Func| attend_fresh(f, call, pool, tuning, None).map(|(o, _)| o);
+    // A fire of a row a lane (decodes) holds no prompt: its lanes' keys are
+    // older than it.
+    let Some(ap) = fresh.filter(|_| {
+        call.rel.is_none()
+            && call.selection.is_none()
+            && call.lse.is_none()
+            && call.causal
+            && cache_rows.rows > call.q.rows
+    }) else {
+        return walk(f);
+    };
+    let kv_heads = pool_heads(OP, &pool, call.head_dim)?;
+    let q_heads = row_heads(OP, call.q.width, call.head_dim)?;
+    let n = i64::from(cache_rows.rows);
+    let width = i64::from(kv_heads * call.head_dim);
+    if f.dims(ap.k) != [n, width]
+        || f.dims(ap.v) != [n, width]
+        || request_of_token.rows != cache_rows.rows
+    {
+        return walk(f);
+    }
+    let r = call.q.rows;
+    let heads = Heads {
+        kvh: i64::from(kv_heads),
+        g: i64::from(q_heads / kv_heads),
+        d: i64::from(call.head_dim),
+        dv: i64::from(call.head_dim),
+    };
+    let window = window_extent(OP, call.window)?;
+    let geom = read_geometry(f, &pool)?;
+    let at = read_rows_i32(f, OP, rows, r)?;
+    let at = clamp_i(f, at, 0, n - 1)?;
+    let qpos = read_rows_i32(f, OP, cache_rows, cache_rows.rows)?;
+    let req = read_rows_i32(f, OP, request_of_token, request_of_token.rows)?;
+    let lane = geom.lane_of(f, req)?;
+    let q4 = f.reshape(call.q.val, &[i64::from(r), heads.kvh, heads.g, heads.d])?;
+    let walked: crate::hlo::Branch<'_> = Box::new(move |f: &mut Func| {
+        Ok(vec![walk(f).map_err(|e| crate::hlo::Malformed {
+            op: OP,
+            detail: e.to_string(),
+        })?])
+    });
+    Ok(super::flash::readouts(
+        f,
+        &ap,
+        &heads,
+        &geom,
+        i64::from(pool.keys.rows),
+        (pool.keys.val, pool.values.val),
+        q4,
+        at,
+        lane,
+        qpos,
+        window,
+        f64::from(call.sm_scale),
+        tuning.chunks,
+        walked,
+    )?)
+}
+
 /// The key positions a block selection names, per row: the named blocks
 /// (`ratio` cells each; ids outside `[0, (q_pos+1)/ratio)` skipped as `-1`),
 /// then the open block the selection cannot name.
@@ -2607,7 +2689,6 @@ fn scatter_slots_one_map(
     // they are views of one pool buffer, which two aliased outputs of the
     // kernel cannot both update.
     let w = i64::from(pairs[0].1.width);
-    let m = f.dims(runs.page)[0];
     if let [(k, keys), (v, values)] = pairs
         && map.is_identity()
         && keys.val != values.val
@@ -2617,24 +2698,61 @@ fn scatter_slots_one_map(
         && f.elem(keys.val) == Elem::Bf16
         && f.elem(values.val) == Elem::Bf16
         && let Some(vmem_cap) = vmem_cap
-        && super::append::fits(i64::from(n), w, slots, ps, m, vmem_cap)
+        && let Some(parts) = [1, 2, 4].into_iter().find(|&p| {
+            let rows = i64::from(n) / p;
+            i64::from(n) % (p * ps) == 0
+                && super::append::fits(rows, w, slots, ps, rows / ps + 64, vmem_cap)
+        })
     {
         let (k, v, keys, values) = (*k, *v, *keys, *values);
         let rows: crate::hlo::Branch<'_> =
             Box::new(move |f: &mut Func| slot_rows(f, pairs, ps, page, off));
+        // A fire too tall for the kernel's VMEM (a 1792-row prefill of 16
+        // kv heads of 256) lays its rows in equal parts, one kernel a part,
+        // each over the planes the one before it wrote: a page two parts
+        // share takes the first's rows before the second's.
         let kernel: crate::hlo::Branch<'_> = Box::new(move |f: &mut Func| {
-            let total = f.reshape(runs.total, &[1])?;
-            let page = clamp_i(f, runs.page, 0, slots / ps - 1)?;
-            super::append::write(
-                f,
-                k.val,
-                v.val,
-                keys.val,
-                values.val,
-                [runs.start, runs.first, runs.len, page],
-                total,
-                vmem_cap,
-            )
+            if parts == 1 {
+                let total = f.reshape(runs.total, &[1])?;
+                let page = clamp_i(f, runs.page, 0, slots / ps - 1)?;
+                return super::append::write(
+                    f,
+                    k.val,
+                    v.val,
+                    keys.val,
+                    values.val,
+                    [runs.start, runs.first, runs.len, page],
+                    total,
+                    vmem_cap,
+                );
+            }
+            let rows = i64::from(n) / parts;
+            let mut planes = vec![keys.val, values.val];
+            for at in 0..parts {
+                let (lo, hi) = (at * rows, (at + 1) * rows);
+                let (pp, po) = (
+                    f.slice_axis(page, 0, lo, hi)?,
+                    f.slice_axis(off, 0, lo, hi)?,
+                );
+                let part = page_runs(f, rows, ps, slots / ps, pp, po)?;
+                let total = f.reshape(part.total, &[1])?;
+                let pg = clamp_i(f, part.page, 0, slots / ps - 1)?;
+                let (kp, vp) = (
+                    f.slice_axis(k.val, 0, lo, hi)?,
+                    f.slice_axis(v.val, 0, lo, hi)?,
+                );
+                planes = super::append::write(
+                    f,
+                    kp,
+                    vp,
+                    planes[0],
+                    planes[1],
+                    [part.start, part.first, part.len, pg],
+                    total,
+                    vmem_cap,
+                )?;
+            }
+            Ok(planes)
         });
         let pages: crate::hlo::Branch<'_> =
             Box::new(move |f: &mut Func| page_writes(f, pairs, ps, slots / ps, &runs, None));
