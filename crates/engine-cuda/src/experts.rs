@@ -198,6 +198,9 @@ pub struct Plan {
     /// The routed banks the weight cache streams an expert at a time
     /// ([`Plan::host_experts`]).
     cached: Vec<usize>,
+    /// The planes left in the serving file's mapping and never read by the
+    /// device in place ([`Plan::file_weights`]).
+    filed: BTreeSet<usize>,
 }
 
 #[derive(Debug, Clone)]
@@ -476,6 +479,7 @@ impl Plan {
             spill_bytes,
             declared_bytes: 0,
             cached: Vec::new(),
+            filed: BTreeSet::new(),
         })
     }
 
@@ -572,6 +576,74 @@ impl Plan {
     #[must_use]
     pub fn cached_experts(&self) -> &[usize] {
         &self.cached
+    }
+
+    /// Leaves the planes `params` (weights the weight cache takes) in the
+    /// serving file's mapping, neither on the device nor pinned. `experts`
+    /// are the routed banks among them ([`Plan::cached_experts`]).
+    ///
+    /// Not `in_place`, the runtime holds them whole in the pool for the
+    /// load's life: each is copied into its pool slots once, at the first
+    /// weight residency, and never read where it lies. `in_place`, a
+    /// deployment that streams reads a miss out of the mapping, which needs
+    /// a device that faults mapped pages in ([`pageable_access`]).
+    ///
+    /// Returns the device bytes it freed.
+    pub fn file_weights(
+        &mut self,
+        trace: &Trace,
+        params: &[usize],
+        experts: bool,
+        in_place: bool,
+    ) -> Result<u64> {
+        let bytes = crate::weights::plane_bytes(trace)?;
+        let mut freed = 0u64;
+        for &at in params {
+            let param = &trace.params[at];
+            if param.source != ParamSource::Checkpoint
+                || self.streamed_whole(at)
+                || self.resident_of.contains_key(&at)
+            {
+                continue;
+            }
+            let reserved = bytes[at].next_multiple_of(crate::weights::ALIGN);
+            self.groups.push(GroupPlan {
+                param: at,
+                name: param.name.clone(),
+                planes: vec![GroupPlane {
+                    param: at,
+                    bytes: bytes[at],
+                    reserved,
+                }],
+                experts: 0,
+                routed: false,
+                bytes: reserved,
+                held: Held::Mapped,
+            });
+            self.mapped_of.insert(at);
+            if !in_place {
+                self.filed.insert(at);
+            }
+            self.device_bytes = self.device_bytes.saturating_sub(reserved);
+            self.spill_bytes += reserved;
+            freed += reserved;
+            if experts {
+                self.cached.push(at);
+            }
+        }
+        Ok(freed)
+    }
+
+    /// Whether `param` is left in the serving file ([`Plan::file_weights`]).
+    #[must_use]
+    pub fn filed(&self, param: usize) -> bool {
+        self.filed.contains(&param)
+    }
+
+    /// Whether any plane is left in the serving file.
+    #[must_use]
+    pub fn files(&self) -> bool {
+        !self.filed.is_empty()
     }
 
     #[must_use]
@@ -1039,7 +1111,12 @@ impl Tier {
                 }
             })
             .collect();
-        let spilled = plan.groups().iter().any(|group| group.held == Held::Mapped);
+        // A plane left in the file for the weight cache is copied out of
+        // it, never touched by the device where it lies.
+        let spilled = plan
+            .groups()
+            .iter()
+            .any(|group| group.held == Held::Mapped && !plan.filed(group.param));
         if spilled && !pageable_access() {
             return Err(Fault::Residency(format!(
                 "this load plans {} bytes onto the mapped tier and this device does \
@@ -1105,10 +1182,15 @@ impl Tier {
                 .iter()
                 .filter(|group| group.held == Held::Mapped)
                 .count();
+            let filed = mapped
+                .iter()
+                .filter(|plane| plan.filed(plane.param))
+                .count();
             eprintln!(
                 "engine-cuda: the MAPPED tier holds {groups} group(s), {} plane(s), {bytes} \
-                 byte(s) read where they lie in {} — neither budget held them; a GPU touch \
-                 faults the page in over HMM",
+                 byte(s) left in {}: {filed} plane(s) the pool will hold, copied into their \
+                 slots at the first weight residency and never read where they lie; the \
+                 rest read in place, a GPU touch faulting the page in over HMM",
                 mapped.len(),
                 source.as_ref().map_or_else(
                     || "<no artifact>".to_string(),

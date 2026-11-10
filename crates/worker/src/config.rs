@@ -717,6 +717,9 @@ impl ModelConfig {
             disk_kv_dir: self.disk_kv_dir.clone(),
             disk_kv_persistent: self.disk_kv_persistent,
             kv_export: false,
+            // Unless told to stream, the weight cache holds every atom for
+            // the load's life.
+            weights_held: self.weight_streaming != runtime::store::weights::WeightStreaming::On,
         }
     }
 

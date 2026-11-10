@@ -50,6 +50,19 @@ impl Serving {
         self.artifact.plane(name).ok()
     }
 
+    /// Whether the file holds each of `params` as the trace reads it: a
+    /// plane of exactly `bytes[param]` bytes, which a pool slot can be
+    /// filled from where it lies.
+    #[must_use]
+    pub fn holds(&self, params: &[usize], bytes: &[u64]) -> bool {
+        params.iter().all(|&param| {
+            u32::try_from(param)
+                .ok()
+                .and_then(|id| self.plane(id))
+                .is_some_and(|plane| Some(&(plane.len() as u64)) == bytes.get(param))
+        })
+    }
+
     #[must_use]
     pub fn name(&self, id: u32) -> Option<&str> {
         self.names.get(id as usize).map(String::as_str)
