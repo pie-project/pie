@@ -90,14 +90,22 @@ struct Fixture {
 }
 
 fn fixture(model: &str) -> Fixture {
+    fixture_of(model, None)
+}
+
+/// The model's fixture, cut to `layers` where stated.
+fn fixture_of(model: &str, layers: Option<u32>) -> Fixture {
     let package = poem_compiler::catalog::package_of(model).expect("the model is listed");
-    let deploy = poem_compiler::catalog::one_rank(Dtype::Bf16, Dtype::Bf16);
+    let deploy = poem::star::Deploy {
+        layers,
+        ..poem_compiler::catalog::one_rank(Dtype::Bf16, Dtype::Bf16)
+    };
     let trace = package
         .trace(model, &deploy, model, Platform::Metal)
         .unwrap_or_else(|why| panic!("`{model}` traces: {why:#}"));
     let dir = std::env::temp_dir().join(format!("pie-bm-pool-{}", std::process::id()));
     std::fs::create_dir_all(&dir).expect("the fixture dir");
-    let container = dir.join(format!("{model}.zt"));
+    let container = dir.join(format!("{model}-{}.zt", layers.unwrap_or(0)));
     if !container.exists() {
         write_checkpoint(&container, &trace);
     }
@@ -503,19 +511,26 @@ fn a_reserved_hybrid_pool_states_shared_chunks() {
 /// the runtime trims, each step.
 #[test]
 fn a_trimmed_window_list_reads_as_the_whole_one() {
-    trimmed_window("gemma4-e4b-mini-l1");
+    trimmed_window("gemma4-e4b-mini-l1", None, 1024, 700);
 }
 
-fn trimmed_window(model: &str) {
+/// As [`a_trimmed_window_list_reads_as_the_whole_one`], a window list of
+/// `T_w` = 16-token slots beside 32-token kv pages (CONTRACT-BC 21): four
+/// layers of a sliding-window decoder past its 2048-row window.
+#[test]
+fn a_trimmed_window_list_of_smaller_slots_reads_as_the_whole_one() {
+    trimmed_window("muse-glimmer-30b-mini-l8", Some(4), 2560, 2200);
+}
+
+fn trimmed_window(model: &str, layers: Option<u32>, context: u32, prompt: u32) {
     use engine_metal::store::layout::WINDOW;
 
     if !engine_metal::device::present() {
         eprintln!("skipping: no Metal device");
         return;
     }
-    let fixture = fixture(model);
-    let context = 1024;
-    let prompt: Vec<u32> = (0..700u32).map(|at| (at * 37 + 11) % 256).collect();
+    let fixture = fixture_of(model, layers);
+    let prompt: Vec<u32> = (0..prompt).map(|at| (at * 37 + 11) % 256).collect();
     const STEPS: usize = 24;
     let run = |trimmed: bool| -> Vec<Vec<f32>> {
         let mut shell = load_with(&fixture, context);
