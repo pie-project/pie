@@ -199,8 +199,9 @@ fn not_streaming_every_atom_is_pinned_and_none_is_ever_shed() {
     let mut slots = pool(16, &shape);
     let mut cache = WeightCache::new(&[shape], WEIGHTS, false, &mut slots).unwrap();
     assert_eq!(resident(&cache, 8), (0..8).collect::<Vec<_>>());
-    assert_eq!(cache.pinned_bytes(), 10 * MIB);
-    assert_eq!(slots.demand().live, 10 * MIB);
+    // Every atom, and no staging: a held set misses nothing.
+    assert_eq!(cache.pinned_bytes(), 8 * MIB);
+    assert_eq!(slots.demand().live, 8 * MIB);
     assert_eq!(cache.shed(&mut slots, 0), 0);
     cache.record(&uses(&[(1, 1)]));
     close_window(&mut cache, &mut slots, true);
@@ -430,7 +431,7 @@ fn a_shed_that_makes_room_raises_no_pressure_at_all() {
 
 #[test]
 fn not_streaming_the_weights_stay_and_pressure_goes_to_kv_and_state() {
-    // 1 + 2 floor + 8 pinned + 5 kv = 16 chunks.
+    // 1 reserved + 8 pinned + 5 kv of 16 chunks (held: no staging floor).
     let (mut pool, _) = steered(false, 8, 5);
     pool.inner_mut().floor = MIB;
     let mut steer = Steer::new(&pool, Tolerance::Balanced, 64 * MIB);
@@ -447,8 +448,8 @@ fn not_streaming_the_weights_stay_and_pressure_goes_to_kv_and_state() {
             shape: WEIGHTS,
             pinned: true
         }),
-        10,
-        "no weight was evicted"
+        8,
+        "no weight was evicted (and held, none is staging)"
     );
 }
 
@@ -548,8 +549,8 @@ fn the_weight_slots_lie_above_the_reserved_runs_and_below_the_activation() {
     assert_eq!(cache.shapes(), 1);
     assert_eq!(
         slots.available(0),
-        26 - 2 - 8,
-        "not streaming: the floor and every atom"
+        26 - 8,
+        "not streaming: every atom, and no staging floor"
     );
     let none = slot_pool(&ChunkFacts::default());
     assert_eq!(
@@ -579,8 +580,15 @@ fn the_engine_holds_the_starting_residency_before_the_first_fire() {
         pool.boot().unwrap();
         let told = engine.0.lock().unwrap().told.clone();
         assert_eq!(told.len(), 1, "the engine heard at load");
-        assert_eq!(told[0].staging.len(), 1);
-        assert_eq!(told[0].staging[0].1.len(), 2, "the floor's staging");
+        if streaming {
+            assert_eq!(told[0].staging.len(), 1);
+            assert_eq!(told[0].staging[0].1.len(), 2, "the floor's staging");
+        } else {
+            assert!(
+                told[0].staging.is_empty(),
+                "held: nothing streams, no staging"
+            );
+        }
         let atoms = if streaming { 0 } else { 8 };
         assert_eq!(
             told[0].resident.len(),
@@ -597,7 +605,7 @@ fn the_engine_holds_the_starting_residency_before_the_first_fire() {
 fn off_weights_that_do_not_fit_the_pool_fail_the_load() {
     let engine = 9_011;
     set_streaming(engine, WeightStreaming::Off.streams(true));
-    // 15 chunks free: the floor's 2 and 32 atoms do not fit.
+    // 15 chunks free: 32 atoms do not fit.
     let shape = experts(32, 2);
     let mut slots = pool(16, &shape);
     let error = boot_cache(
@@ -611,7 +619,7 @@ fn off_weights_that_do_not_fit_the_pool_fail_the_load() {
     .to_string();
     assert!(error.contains("do not fit"), "{error}");
     assert!(
-        error.contains(&format!("{}", 34 * MIB)),
+        error.contains(&format!("{}", 32 * MIB)),
         "names what they need: {error}"
     );
     assert!(
@@ -801,20 +809,18 @@ fn a_held_shape_the_load_seated_is_named_exactly_where_it_lies() {
             (0..10).map(|a| (a, 8 + a)).collect::<Vec<_>>(),
             "{mode:?}: atom a at the seated slot ref 8 + a"
         );
-        let staging = staging_of(&told, 7);
-        assert_eq!(staging.len(), 2);
         assert!(
-            staging.iter().all(|slot| !(8..18).contains(slot)),
-            "{mode:?}: the staging lies apart from the seated atoms: {staging:?}"
+            told.staging.is_empty(),
+            "{mode:?}: held, nothing streams and no staging is named: {:?}",
+            told.staging
         );
     }
 }
 
 #[test]
 fn two_shapes_seated_back_to_back_both_stay_put() {
-    // The first fills chunks 1-2 whole, so its staging opens a fresh chunk:
-    // taken before the second shape's claim, it would be chunk 3, the
-    // second's.
+    // The first fills chunks 1-2 whole and the second starts in chunk 3:
+    // each claimed where it lies, before anything is taken lowest first.
     let a = seated(7, 8, 4, 2, 4);
     let b = seated(8, 3, 2, 1, 6);
     let told = booted(9_022, WeightStreaming::Off, &[a, b], 32);
@@ -827,10 +833,8 @@ fn two_shapes_seated_back_to_back_both_stay_put() {
         slots_of(&told, 8),
         (0..3).map(|a| (a, 6 + a)).collect::<Vec<_>>()
     );
-    // The second's staging takes the free slot of its last chunk (ref 9);
-    // the first's a chunk of its own past both (chunk 5, refs 20..).
-    assert_eq!(staging_of(&told, 8), [9]);
-    assert_eq!(staging_of(&told, 7), [20, 21]);
+    // Held: neither takes staging.
+    assert!(staging_of(&told, 8).is_empty() && staging_of(&told, 7).is_empty());
 }
 
 #[test]

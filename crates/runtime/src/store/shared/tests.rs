@@ -1616,11 +1616,11 @@ mod tiers;
 
 /// What is left for kv and state is the pool less the null chunk, the
 /// smallest rung's activation and the chunks the weights pin: held, every
-/// atom and the staging floor; streaming, the floor alone.
+/// atom and no staging (nothing streams); streaming, the floor alone.
 #[test]
 fn the_room_left_for_kv_takes_out_what_the_weights_pin() {
     let facts = facts();
-    for (streaming, weight_chunks) in [(false, 5), (true, 1)] {
+    for (streaming, weight_chunks) in [(false, 4), (true, 1)] {
         let mut shared = pool();
         let first = shared.weights_first();
         crate::store::weights::WeightCache::new(
