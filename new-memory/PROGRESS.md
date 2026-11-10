@@ -630,3 +630,10 @@ The `new-memory/` directory is bookkeeping and is removed before anything lands 
 - Wafer `Spatial` engine keeps degenerate facts: kv pages are fixed wafer locations, recurrent state is replayed (not
   addressable), and the unmerged `cerebras-model-support` branch owns those files. Follow-up for its owner after
   that branch merges: a kv-only shared pool for batched paged builds. Details in BACKENDS.md.
+
+### M45 — 2026-11-10: ROCm graph-replay bug fixed (pre-existing, not memory)
+- `db186bbf`: HIP `swiglu_clamp_split` hardcoded fan = 1 for split gate/up routed planes (MiMo, DeepSeek V4, dots), so
+  under a seat (every captured body) only the first `live` routes landed and the down select read stale rows. Now
+  takes plane_fan like CUDA's twin. CUDA unaffected. Test linear_glu_flat fails with fan 1, passes now.
+- ROCm baselines recorded in new-memory/GOLDEN-LOGITS-ROCM.txt (dsv4/dots3 = eager; mimo shaped, split-kv arm).
+- Note: this ROCm bug also exists on main (served wrong logits under graphs for split-plane MoE before the redesign).
