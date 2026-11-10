@@ -872,11 +872,6 @@ impl Shell {
         self.arm_lattice(false)
     }
 
-    pub fn verify_bodies(&mut self) -> Result<usize> {
-        self.arm_lattice(true)?;
-        Ok(self.armed.as_ref().map_or(0, |armed| armed.armed))
-    }
-
     /// Arms the lattice, an expert-parallel rank with its collectives
     /// fenced (`EpRank::fence`): every rank fires the same synthetic steps,
     /// and whatever they first use (a module, a tune, a pinned slot, a

@@ -56,12 +56,6 @@ use crate::window::Windows;
 use enqueue::{GuestBatch, Owed, Reap, reap_guest_fires};
 use segments::Segmented;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub struct FireCost {
-    pub launches: u32,
-    pub copied: u32,
-}
-
 pub struct Shell {
     device: Context,
     accounting: crate::store::Accounting,
@@ -130,7 +124,6 @@ pub struct Shell {
     armed_body: Option<record::BodyKey>,
     segments: std::collections::HashMap<record::BodyKey, Segmented>,
     windows_memo: Vec<prepare::WindowsMemo>,
-    last: FireCost,
     cache: GraphCache,
     runahead: engine::runahead::Runahead,
     programs: ProgramPlane,
@@ -619,10 +612,6 @@ impl Shell {
         self.predicate.lands_snapshots()
     }
 
-    pub fn fold_predicate(&self, lanes: u32) -> Result<Vec<u8>> {
-        self.predicate.read_mask(self.device.stream(), lanes)
-    }
-
     pub fn register_adapter(&mut self, id: u32, planes: &[AdapterPlane<'_>]) -> Result<()> {
         self.weights
             .register_adapter(self.device.stream(), id, planes)
@@ -1072,4 +1061,3 @@ impl EnqueuedPhase for Enqueued<'_> {
         self.launches
     }
 }
-

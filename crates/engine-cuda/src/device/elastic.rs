@@ -433,11 +433,6 @@ impl Arena {
     }
 
     #[must_use]
-    pub const fn map_unit(&self) -> u64 {
-        self.map_unit
-    }
-
-    #[must_use]
     pub fn committed_bytes(&self) -> u64 {
         self.mapped * self.map_unit
     }
