@@ -876,3 +876,17 @@ The `new-memory/` directory is bookkeeping and is removed before anything lands 
 - Tests: waker unit + 2 loom tests (every interleaving), runtime engine/pipeline/scheduler/inferlet; deterministic
   `every_lane_waiting_on_the_front_fire_wakes_when_it_settles` fails before ([false,false,false,true]), passes after.
   MI300X 0/40 hangs (was 20-30%); CUDA 20/20 clean.
+
+### M67 — 2026-11-10: host tier locked lazily again; MXFP4 expert banks in the weight cache (CUDA)
+- `sc/l40s-tier-ahead` (4c57bf934): fixes the M62 regression (27 GB RSS at boot). The pin thread locks 512 MiB ahead
+  of use in 32 MiB pieces, paced (locking stalls every device-runtime call); a copy past the lookahead locks its own
+  pieces. golden_offload: RSS +530 MiB after seating with a 27 GB budget (was all of it); 0.5 GB offload enqueue
+  23.7-26.6 ms (M62 whole-pinned 30-32 ms). Host chunks unlock only at drop -> RSS tracks the host high-water mark.
+  RSS at ready on a real server: IT to confirm.
+- `sc/l40s-wc-quant-engine` (40568ae3c): MXFP4 W4A16 routed banks (plain quantized MoeSelect, no bias / act quant)
+  stated as Expert weight shapes on CUDA off tcgen05 (ROCm, sm_100: none); one table per bank (codes, scales);
+  use counts via note_routes while the set may change; held MXFP4 sets report zero uses.
+  golden_experts dsv4-flash-mini-bf16-mxfp4: cached/held/moved bitwise the dense serve; host/mixed max 0.51, no top
+  token change. Untested: sm_90 wgmma arms, real MXFP4 models (gpt-oss), budgets, speed. NVFP4 / affine / FP8 /
+  W4A8 / biased selects remain.
+- Merge fix: `Run::bank_table` built only with `cuda`; ungated (featureless build).
