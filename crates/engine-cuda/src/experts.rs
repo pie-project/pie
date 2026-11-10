@@ -1,23 +1,10 @@
 #![allow(unsafe_code)]
 use std::collections::{BTreeMap, BTreeSet};
-use std::ffi::c_void;
-use std::sync::atomic::{AtomicU64, Ordering};
 
 use poem_ir::{Def, Linear, Operation, ParamSource, Trace, ValueId};
 
-use crate::device::graph::Event;
-use crate::device::{Buffer, Pinned, copy_any};
+use crate::device::Pinned;
 use crate::error::{Fault, Result};
-
-const ENTRY: u64 = 8;
-
-const COUNTER: u64 = 4;
-
-const MOVES: usize = 2;
-
-const CELL: u64 = 32;
-
-const CELL_PLANES: usize = 3;
 
 pub type Attachments = BTreeMap<usize, Vec<usize>>;
 
@@ -50,83 +37,8 @@ impl Spill {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Held {
-    Device,
     Pinned,
     Mapped,
-}
-
-impl Held {
-    #[must_use]
-    pub const fn rung(self) -> u8 {
-        match self {
-            Held::Device => 0,
-            Held::Pinned => 1,
-            Held::Mapped => 2,
-        }
-    }
-}
-
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub struct Observed {
-    pub seated: u64,
-    pub bytes: u64,
-    pub absent: u64,
-    pub loads: u64,
-    pub deferred: u64,
-    pub promoted: u64,
-    pub window_ms: u64,
-}
-
-#[derive(Clone, Copy)]
-enum Stat {
-    Seated = 0,
-    Bytes = 1,
-    Absent = 2,
-    Loads = 3,
-    Deferred = 4,
-    Promoted = 5,
-    WindowMs = 6,
-}
-
-static T2: [AtomicU64; 7] = [
-    AtomicU64::new(0),
-    AtomicU64::new(0),
-    AtomicU64::new(0),
-    AtomicU64::new(0),
-    AtomicU64::new(0),
-    AtomicU64::new(0),
-    AtomicU64::new(0),
-];
-
-fn bump(stat: Stat) {
-    add(stat, 1);
-}
-
-fn add(stat: Stat, by: u64) {
-    T2[stat as usize].fetch_add(by, Ordering::Relaxed);
-}
-
-#[must_use]
-pub fn observed() -> Observed {
-    let at = |stat: Stat| T2[stat as usize].load(Ordering::Relaxed);
-    Observed {
-        seated: at(Stat::Seated),
-        bytes: at(Stat::Bytes),
-        absent: at(Stat::Absent),
-        loads: at(Stat::Loads),
-        deferred: at(Stat::Deferred),
-        promoted: at(Stat::Promoted),
-        window_ms: at(Stat::WindowMs),
-    }
-}
-
-pub fn count_deferred() {
-    bump(Stat::Deferred);
-}
-
-pub fn count_promoted(window_ms: u64) {
-    bump(Stat::Promoted);
-    T2[Stat::WindowMs as usize].store(window_ms, Ordering::Relaxed);
 }
 
 #[must_use]
@@ -159,18 +71,12 @@ pub fn pageable_access() -> bool {
 
 #[derive(Debug, Clone, Default)]
 pub struct Plan {
-    banks: Vec<BankPlan>,
     groups: Vec<GroupPlan>,
-    seated: Vec<GroupPlan>,
-    resident_of: BTreeMap<usize, u32>,
     pinned_of: BTreeSet<usize>,
     mapped_of: BTreeSet<usize>,
     device_bytes: u64,
     host_bytes: u64,
     spill_bytes: u64,
-    /// Host bytes of the planes `host_declared` moved: fixed mapped
-    /// addresses, read in place, so a recorded body may hold them.
-    declared_bytes: u64,
     /// The routed banks the weight cache streams an expert at a time
     /// ([`Plan::host_experts`]).
     cached: Vec<usize>,
@@ -186,7 +92,6 @@ pub struct Plan {
 pub struct BankPlan {
     pub param: usize,
     pub experts: u32,
-    pub resident: u32,
     pub stride: u64,
 }
 
@@ -202,19 +107,17 @@ pub struct GroupPlan {
     pub param: usize,
     pub name: String,
     pub planes: Vec<GroupPlane>,
-    pub experts: u32,
-    pub routed: bool,
     pub bytes: u64,
     pub held: Held,
 }
 
+/// The weights a load's plan sizes: every plane's bytes, and the routed
+/// banks among them (dense banks, and packed ones as a group of planes).
 #[derive(Debug, Clone)]
 pub struct Ranking {
     full: u64,
-    floor: Vec<usize>,
-    floor_bytes: u64,
-    sequence: Vec<GroupPlan>,
     banks: Vec<BankPlan>,
+    packed: Vec<GroupPlan>,
     /// The routed banks the weight cache takes ([`Ranking::caching`]) and
     /// each one's bytes: on no tier this plan cuts.
     cached: Vec<(usize, u64)>,
@@ -228,61 +131,10 @@ impl Ranking {
             .map(|b| b.next_multiple_of(crate::weights::ALIGN))
             .sum();
         let (banks, packed) = routed(trace, planes, &bytes)?;
-        let streamable: BTreeSet<usize> = banks
-            .iter()
-            .map(|bank| bank.param)
-            .chain(
-                packed
-                    .iter()
-                    .flat_map(|group| group.planes.iter().map(|plane| plane.param)),
-            )
-            .collect();
-        let mut floor: Vec<usize> = Vec::new();
-        let mut floor_bytes = 0u64;
-        let mut spillable: Vec<GroupPlan> = Vec::new();
-        for (at, param) in trace.params.iter().enumerate() {
-            if streamable.contains(&at) {
-                continue;
-            }
-            let reserved = bytes[at].next_multiple_of(crate::weights::ALIGN);
-            if param.source == ParamSource::Registered {
-                floor.push(at);
-                floor_bytes += reserved;
-                continue;
-            }
-            spillable.push(GroupPlan {
-                param: at,
-                name: param.name.clone(),
-                planes: vec![GroupPlane {
-                    param: at,
-                    bytes: bytes[at],
-                    reserved,
-                }],
-                experts: 0,
-                bytes: reserved,
-                held: Held::Pinned,
-                routed: false,
-            });
-        }
-        let schedule = poem_compiler::prefetch::Schedule::of(trace);
-        let rank: BTreeMap<usize, usize> = schedule
-            .order()
-            .into_iter()
-            .enumerate()
-            .map(|(at, param)| (param, at))
-            .collect();
-        spillable.sort_by_key(|group| {
-            (
-                rank.get(&group.param).copied().unwrap_or(usize::MAX),
-                group.param,
-            )
-        });
         Ok(Ranking {
             full,
-            floor,
-            floor_bytes,
-            sequence: spillable.into_iter().chain(packed).collect(),
             banks,
+            packed,
             cached: Vec::new(),
         })
     }
@@ -295,71 +147,25 @@ impl Ranking {
     /// beside the planes that cannot move.
     #[must_use]
     pub fn caching(mut self, cached: &[usize]) -> Ranking {
-        let whole = |bank: &BankPlan| {
-            (u64::from(bank.experts) * bank.stride).next_multiple_of(crate::weights::ALIGN)
-        };
-        for bank in std::mem::take(&mut self.banks) {
+        for bank in &self.banks {
             if cached.contains(&bank.param) {
-                self.cached.push((bank.param, whole(&bank)));
-            } else {
-                self.floor.push(bank.param);
-                self.floor_bytes += whole(&bank);
+                let whole =
+                    (u64::from(bank.experts) * bank.stride).next_multiple_of(crate::weights::ALIGN);
+                self.cached.push((bank.param, whole));
             }
         }
-        // A packed bank the cache takes, each plane of it: off the sequence
-        // the plan cuts.
-        for group in std::mem::take(&mut self.sequence) {
-            if group.routed && cached.contains(&group.param) {
+        // A packed bank the cache takes, each plane of it.
+        for group in &self.packed {
+            if cached.contains(&group.param) {
                 self.cached.extend(
                     group
                         .planes
                         .iter()
                         .map(|plane| (plane.param, plane.reserved)),
                 );
-            } else {
-                self.sequence.push(group);
             }
         }
         self
-    }
-
-    #[must_use]
-    pub fn full(&self) -> u64 {
-        self.full
-    }
-
-    #[must_use]
-    pub fn floor(&self) -> &[usize] {
-        &self.floor
-    }
-
-    #[must_use]
-    pub fn sequence(&self) -> &[GroupPlan] {
-        &self.sequence
-    }
-
-    #[must_use]
-    pub fn banks(&self) -> &[BankPlan] {
-        &self.banks
-    }
-
-    #[must_use]
-    pub fn images(&self) -> Vec<(u64, u64, u64, u64)> {
-        let mut out = Vec::new();
-        let mut at = 0u64;
-        for group in &self.sequence {
-            for plane in &group.planes {
-                out.push((plane.param as u64, at, plane.bytes, plane.reserved));
-                at += plane.reserved;
-            }
-        }
-        for bank in &self.banks {
-            let span = u64::from(bank.experts) * bank.stride;
-            let reserved = span.next_multiple_of(crate::weights::ALIGN);
-            out.push((bank.param as u64, at, span, reserved));
-            at += reserved;
-        }
-        out
     }
 }
 
@@ -395,7 +201,6 @@ impl Plan {
             if param.placement != poem_ir::ParamPlacement::Host
                 || param.source != ParamSource::Checkpoint
                 || self.streamed_whole(at)
-                || self.resident_of.contains_key(&at)
             {
                 continue;
             }
@@ -408,8 +213,6 @@ impl Plan {
                     bytes: bytes[at],
                     reserved,
                 }],
-                experts: 0,
-                routed: false,
                 bytes: reserved,
                 held: Held::Pinned,
             });
@@ -419,7 +222,6 @@ impl Plan {
                 self.device_bytes = self.device_bytes.saturating_sub(reserved);
             }
             self.host_bytes += reserved;
-            self.declared_bytes += reserved;
             freed += reserved;
         }
         Ok(freed)
@@ -435,10 +237,7 @@ impl Plan {
         let mut freed = 0u64;
         for &at in params {
             let param = &trace.params[at];
-            if param.source != ParamSource::Checkpoint
-                || self.streamed_whole(at)
-                || self.resident_of.contains_key(&at)
-            {
+            if param.source != ParamSource::Checkpoint || self.streamed_whole(at) {
                 continue;
             }
             let reserved = bytes[at].next_multiple_of(crate::weights::ALIGN);
@@ -450,8 +249,6 @@ impl Plan {
                     bytes: bytes[at],
                     reserved,
                 }],
-                experts: 0,
-                routed: false,
                 bytes: reserved,
                 held: Held::Pinned,
             });
@@ -461,7 +258,6 @@ impl Plan {
                 self.device_bytes = self.device_bytes.saturating_sub(reserved);
             }
             self.host_bytes += reserved;
-            self.declared_bytes += reserved;
             freed += reserved;
         }
         Ok(freed)
@@ -508,10 +304,7 @@ impl Plan {
         let mut freed = 0u64;
         for &at in params {
             let param = &trace.params[at];
-            if param.source != ParamSource::Checkpoint
-                || self.streamed_whole(at)
-                || self.resident_of.contains_key(&at)
-            {
+            if param.source != ParamSource::Checkpoint || self.streamed_whole(at) {
                 continue;
             }
             let reserved = bytes[at].next_multiple_of(crate::weights::ALIGN);
@@ -523,8 +316,6 @@ impl Plan {
                     bytes: bytes[at],
                     reserved,
                 }],
-                experts: 0,
-                routed: false,
                 bytes: reserved,
                 held: Held::Mapped,
             });
@@ -559,22 +350,12 @@ impl Plan {
 
     #[must_use]
     pub fn streams(&self) -> bool {
-        !self.banks.is_empty() || !self.groups.is_empty()
-    }
-
-    #[must_use]
-    pub fn banks(&self) -> &[BankPlan] {
-        &self.banks
+        !self.groups.is_empty()
     }
 
     #[must_use]
     pub fn groups(&self) -> &[GroupPlan] {
         &self.groups
-    }
-
-    #[must_use]
-    pub fn seated(&self) -> &[GroupPlan] {
-        &self.seated
     }
 
     #[must_use]
@@ -598,11 +379,6 @@ impl Plan {
     }
 
     #[must_use]
-    pub fn resident(&self, param: usize) -> Option<u32> {
-        self.resident_of.get(&param).copied()
-    }
-
-    #[must_use]
     pub fn device_demand(&self) -> u64 {
         self.device_bytes
     }
@@ -617,28 +393,14 @@ impl Plan {
         self.host_walk().0
     }
 
-    /// Whether the host tier holds anything besides the planes the trace
-    /// declared `host`: experts seated per fire or planes the budget spilled,
-    /// whose addresses a recorded body cannot hold.
-    #[must_use]
-    pub fn hosts_beyond_declared(&self) -> bool {
-        self.host_image() > self.declared_bytes
-    }
-
     #[must_use]
     pub fn host_image(&self) -> u64 {
         self.host_walk().1
     }
 
     fn host_walk(&self) -> (Vec<(u64, u64, u64, u64)>, u64) {
-        let mut out = Vec::with_capacity(self.banks.len() + self.groups.len());
+        let mut out = Vec::with_capacity(self.groups.len());
         let mut at = 0u64;
-        for bank in &self.banks {
-            let span = u64::from(bank.experts) * bank.stride;
-            let reserved = span.next_multiple_of(crate::weights::ALIGN);
-            out.push((bank.param as u64, at, span, reserved));
-            at += reserved;
-        }
         for group in &self.groups {
             if group.held != Held::Pinned {
                 continue;
@@ -768,7 +530,6 @@ fn routed(
             banks.push(BankPlan {
                 param: at,
                 experts,
-                resident: experts,
                 stride: plane / u64::from(experts),
             });
             continue;
@@ -809,10 +570,8 @@ fn routed(
             param: at,
             name: param.name.clone(),
             planes,
-            experts,
             bytes: total,
             held: Held::Pinned,
-            routed: true,
         });
     }
     banks.sort_by_key(|bank| bank.param);
@@ -832,21 +591,6 @@ fn weight_of(trace: &Trace, id: ValueId) -> Result<usize> {
 }
 
 #[derive(Debug)]
-struct Seat {
-    param: usize,
-    experts: u32,
-    resident: u32,
-    stride: u64,
-    host_at: u64,
-    serving_at: u64,
-    entry_at: usize,
-    counter_at: usize,
-    slab: u64,
-    slot_of: Vec<Option<u32>>,
-    in_slot: Vec<u32>,
-}
-
-#[derive(Debug)]
 struct Whole {
     param: usize,
     host_at: u64,
@@ -857,185 +601,60 @@ struct Whole {
 struct Mapped {
     param: usize,
     at: u64,
-    bytes: u64,
 }
 
-#[derive(Debug)]
-struct Group {
-    param: usize,
-    name: String,
-    planes: Vec<GroupPlane>,
-    cell_at: usize,
-    at: Vec<u64>,
-    held: Held,
-    backing: Vec<u64>,
-    berth: Option<usize>,
-    settled: u64,
-}
-
-#[derive(Debug)]
-struct Berth {
-    tier: Held,
-    at: Vec<u64>,
-    shape: Vec<u64>,
-    holds: Option<usize>,
-}
-
-#[derive(Debug, Clone, Copy)]
-struct Swap {
-    berth: usize,
-    group: usize,
-}
-
-#[derive(Debug, Clone, Copy)]
-enum Step {
-    Open(Swap),
-    Close(Swap),
-}
-
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub struct GroupHandles {
-    pub cell: u64,
-    pub hits: u64,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct Handles {
-    pub table: u64,
-    pub counts: u64,
-}
-
+/// How the pinned host image starts: zeroed, to be landed cold, or
+/// uninitialized, to be read back from the serving file's own image.
 #[derive(Debug)]
 pub enum Fill {
     Cold,
     Restored,
-    Deferred(crate::checkpoint_serving::Serving),
 }
 
-#[derive(Debug)]
-struct Refill {
-    filling: Option<std::thread::JoinHandle<()>>,
-    filled: std::sync::mpsc::Receiver<Pinned>,
-    began: std::time::Instant,
-}
-
-enum Filled {
-    Waiting,
-    Ready(Pinned),
-    Refused,
-}
-
-impl Refill {
-    fn poll(&mut self) -> Filled {
-        use std::sync::mpsc::TryRecvError;
-
-        match self.filled.try_recv() {
-            Ok(host) => Filled::Ready(host),
-            Err(TryRecvError::Empty) => Filled::Waiting,
-            Err(TryRecvError::Disconnected) => Filled::Refused,
-        }
-    }
-
-    fn window_ms(&self) -> u64 {
-        u64::try_from(self.began.elapsed().as_millis()).unwrap_or(u64::MAX)
-    }
-}
-
-impl Drop for Refill {
-    fn drop(&mut self) {
-        if let Some(filling) = self.filling.take() {
-            let _ = filling.join();
-        }
-    }
-}
-
+/// The weights a load keeps off the device, each read where it lies: the
+/// planes the plan pins (the weight cache's host copies, the planes a
+/// package declares host) in one page-locked image the device maps, and
+/// the planes left in the serving file's mapping.
 #[derive(Debug)]
 pub struct Tier {
     plan: Plan,
     host: Pinned,
-    refill: Option<Refill>,
-    image: Option<crate::checkpoint_serving::Serving>,
-    table: Buffer,
-    shadow: Pinned,
-    counts: Buffer,
-    mirror: Pinned,
-    seats: Vec<Seat>,
     wholes: Vec<Whole>,
-    cells: Buffer,
-    cell_shadow: Pinned,
-    group_counts: Buffer,
-    group_mirror: Pinned,
-    groups: Vec<Group>,
-    berths: Vec<Berth>,
-    swap: Option<Swap>,
-    landed: Event,
-    ladder_open: bool,
-    tick: u64,
-    /// The spill `backing` points into, held mapped for the tier's life.
+    /// The spill the mapped planes point into, held mapped for the tier's
+    /// life.
     _source: Option<Spill>,
     mapped: Vec<Mapped>,
-    drained: Event,
-    ready: Event,
-    moving: bool,
 }
 
 impl Tier {
     pub fn open(plan: Plan, source: Option<Spill>, fill: Fill) -> Result<Tier> {
         let layout = plan.host_layout();
-        let host_at = plan.host_image();
-        let mut seats = Vec::with_capacity(plan.banks.len());
-        let (mut entry_at, mut counter_at) = (0usize, 0usize);
-        for (bank, span) in plan.banks().iter().zip(&layout) {
-            debug_assert_eq!(
-                span.0, bank.param as u64,
-                "the layout walks the banks first"
-            );
-            seats.push(Seat {
-                param: bank.param,
-                experts: bank.experts,
-                resident: bank.resident,
-                stride: bank.stride,
-                host_at: span.1,
-                serving_at: 0,
-                entry_at,
-                counter_at,
-                slab: 0,
-                slot_of: vec![None; bank.experts as usize],
-                in_slot: Vec::new(),
-            });
-            entry_at += bank.experts as usize;
-            counter_at += bank.experts as usize;
-        }
-        let planes = plan
-            .groups()
+        let want = usize::try_from(plan.host_image()).unwrap_or(usize::MAX);
+        let host = match fill {
+            Fill::Cold => Pinned::mapped(want)?,
+            Fill::Restored => Pinned::mapped_uninit(want)?,
+        };
+        let wholes = layout
             .iter()
-            .filter(|group| group.held == Held::Pinned)
-            .flat_map(|group| &group.planes);
-        let mut wholes: Vec<Whole> = planes
-            .zip(layout.get(plan.banks().len()..).unwrap_or(&[]))
-            .map(|(plane, span)| {
-                debug_assert_eq!(span.0, plane.param as u64, "then every pinned plane");
-                Whole {
-                    param: plane.param,
-                    host_at: span.1,
-                    serving_at: 0,
-                }
+            .map(|&(param, host_at, _, _)| Whole {
+                param: usize::try_from(param).unwrap_or(usize::MAX),
+                host_at,
+                serving_at: host.device().saturating_add(host_at),
             })
             .collect();
         // A plane left in the file for the weight cache is copied out of
         // it, never touched by the device where it lies.
-        let spilled = plan
+        let in_place = plan
             .groups()
             .iter()
             .any(|group| group.held == Held::Mapped && !plan.filed(group.param));
-        if spilled && !pageable_access() {
+        if in_place && !pageable_access() {
             return Err(Fault::Residency(format!(
                 "this load plans {} bytes onto the mapped tier and this device does \
-                     not report `pageableMemoryAccess` (CUDA 12.2+ HMM), so a GPU touch \
-                     of a mapped page cannot fault it in. The T2 arm needs it: \
-                     registering the mapping instead would page-lock every byte of it, \
-                     which is the pinned tier under another name. Run on a device that \
-                     reports the attribute.",
+                 not report `pageableMemoryAccess` (CUDA 12.2+ HMM), so a GPU touch of a \
+                 mapped page cannot fault it in. Registering the mapping instead would \
+                 page-lock every byte of it, which is the pinned tier under another name. \
+                 Run on a device that reports the attribute.",
                 plan.spill_demand(),
             )));
         }
@@ -1055,7 +674,6 @@ impl Tier {
             for seat in &group.planes {
                 let id = u32::try_from(seat.param).unwrap_or(u32::MAX);
                 let Some(bytes) = artifact.plane(id) else {
-                    bump(Stat::Absent);
                     return Err(Fault::Residency(format!(
                         "`{}` is planned onto the mapped tier and the artifact at {} \
                          carries no plane {id}. {}",
@@ -1065,7 +683,6 @@ impl Tier {
                     )));
                 };
                 if bytes.len() as u64 != seat.bytes {
-                    bump(Stat::Absent);
                     return Err(Fault::Residency(format!(
                         "`{}`'s plane {id} is {} bytes in the artifact and {} in this \
                          plan; the two were written from different traces",
@@ -1077,15 +694,11 @@ impl Tier {
                 mapped.push(Mapped {
                     param: seat.param,
                     at: bytes.as_ptr() as u64,
-                    bytes: bytes.len() as u64,
                 });
-                bump(Stat::Seated);
-                add(Stat::Bytes, bytes.len() as u64);
             }
         }
         if !mapped.is_empty() {
-            bump(Stat::Loads);
-            let bytes: u64 = mapped.iter().map(|plane| plane.bytes).sum();
+            let bytes: u64 = plan.mapped_layout().iter().map(|plane| plane.2).sum();
             let groups = plan
                 .groups()
                 .iter()
@@ -1107,134 +720,22 @@ impl Tier {
                 ),
             );
         }
-        let mut roster: Vec<&GroupPlan> = plan
-            .seated()
-            .iter()
-            .chain(plan.groups().iter().filter(|group| group.routed))
-            .collect();
-        roster.sort_by_key(|group| group.param);
-        let mut groups = Vec::with_capacity(roster.len());
-        for (cell_at, group) in roster.into_iter().enumerate() {
-            if group.planes.len() < 2 || group.planes.len() > CELL_PLANES {
-                return Err(Fault::Residency(format!(
-                    "`{}` is a routed packed bank of {} planes and a base cell seats \
-                     two or three — codes beside factors, and an affine bank's zero \
-                     points beside those, written as one word so that no state of the \
-                     cell can name one group's codes and another's factors. Refused \
-                     rather than seated with a plane unaddressed.",
-                    group.name,
-                    group.planes.len(),
-                )));
-            }
-            let backing = match source.as_ref() {
-                None => Vec::new(),
-                Some(artifact) => group
-                    .planes
-                    .iter()
-                    .map(|plane| {
-                        let id = u32::try_from(plane.param).unwrap_or(u32::MAX);
-                        artifact
-                            .plane(id)
-                            .filter(|bytes| bytes.len() as u64 == plane.bytes)
-                            .map(|bytes| bytes.as_ptr() as u64)
-                    })
-                    .collect::<Option<Vec<u64>>>()
-                    .unwrap_or_default(),
-            };
-            groups.push(Group {
-                param: group.param,
-                name: group.name.clone(),
-                planes: group.planes.clone(),
-                cell_at,
-                at: Vec::new(),
-                held: group.held,
-                backing,
-                berth: None,
-                settled: 0,
-            });
-        }
-        let entries = entry_at as u64 * ENTRY;
-        let counters = counter_at as u64 * COUNTER;
-        let cells = groups.len() as u64 * CELL;
-        let group_counters = groups.len() as u64 * COUNTER;
-        let want = usize::try_from(host_at).unwrap_or(usize::MAX);
-        let (host, image) = match fill {
-            Fill::Cold => (Pinned::mapped(want)?, None),
-            Fill::Restored => (Pinned::mapped_uninit(want)?, None),
-            Fill::Deferred(artifact) => (Pinned::mapped(0)?, Some(artifact)),
-        };
-        let mut serving = Vec::with_capacity(layout.len());
-        for (param, host_at, _, reserved) in layout.iter().copied() {
-            serving.push(match &image {
-                None => host.device().saturating_add(host_at),
-                Some(artifact) => {
-                    let id = u32::try_from(param).unwrap_or(u32::MAX);
-                    let Some(bytes) = artifact.plane_reserved(id, reserved) else {
-                        let plane = artifact
-                            .name(id)
-                            .map_or_else(|| format!("param {param}"), |name| format!("`{name}`"));
-                        return Err(Fault::Residency(format!(
-                            "the serving artifact at {} does not carry {plane} out to \
-                             {reserved} bytes, and a deferred seat reads that plane's T1 \
-                             bytes out of the file where they lie; the file names another \
-                             deployment",
-                            artifact.path().display(),
-                        )));
-                    };
-                    bytes.as_ptr() as u64
-                }
-            });
-        }
-        for (seat, at) in seats.iter_mut().zip(&serving) {
-            seat.serving_at = *at;
-        }
-        for (whole, at) in wholes
-            .iter_mut()
-            .zip(serving.get(plan.banks().len()..).unwrap_or(&[]))
-        {
-            whole.serving_at = *at;
-        }
         Ok(Tier {
             plan,
             host,
-            refill: None,
-            image,
-            table: Buffer::zeroed(usize::try_from(entries).unwrap_or(usize::MAX))?,
-            shadow: Pinned::mapped(usize::try_from(entries).unwrap_or(usize::MAX))?,
-            counts: Buffer::zeroed(usize::try_from(counters).unwrap_or(usize::MAX))?,
-            mirror: Pinned::mapped(usize::try_from(counters).unwrap_or(usize::MAX))?,
-            seats,
             wholes,
-            cells: Buffer::zeroed(usize::try_from(cells).unwrap_or(usize::MAX))?,
-            cell_shadow: Pinned::mapped(usize::try_from(cells).unwrap_or(usize::MAX))?,
-            group_counts: Buffer::zeroed(usize::try_from(group_counters).unwrap_or(usize::MAX))?,
-            group_mirror: Pinned::mapped(usize::try_from(group_counters).unwrap_or(usize::MAX))?,
-            ladder_open: groups.iter().any(|group| !group.backing.is_empty()),
-            groups,
-            berths: Vec::new(),
-            swap: None,
-            landed: Event::new()?,
-            tick: 0,
             _source: source,
             mapped,
-            drained: Event::new()?,
-            ready: Event::new()?,
-            moving: false,
         })
     }
 
+    /// Where `param` lies in the pinned image, from its start.
     #[must_use]
     pub fn host_offset(&self, param: usize) -> Option<u64> {
-        self.seats
+        self.wholes
             .iter()
-            .find(|seat| seat.param == param)
-            .map(|seat| seat.host_at)
-            .or_else(|| {
-                self.wholes
-                    .iter()
-                    .find(|whole| whole.param == param)
-                    .map(|whole| whole.host_at)
-            })
+            .find(|whole| whole.param == param)
+            .map(|whole| whole.host_at)
     }
 
     #[must_use]
@@ -1265,15 +766,11 @@ impl Tier {
 
     /// Frees the pinned host image where it holds only `held`: the copies
     /// of weights the runtime holds whole in the pool for the load's life,
-    /// which no fire reads and nothing is refilled from. Returns the bytes
-    /// freed; 0 where the image also holds a plane read in place, or a seat
-    /// the tier fills.
+    /// which no fire reads. Returns the bytes freed; 0 where the image also
+    /// holds a plane read in place.
     pub fn release_host(&mut self, held: &[usize]) -> u64 {
         if held.is_empty()
             || self.host.bytes() == 0
-            || !self.seats.is_empty()
-            || self.refill.is_some()
-            || self.image.is_some()
             || !self.wholes.iter().all(|whole| held.contains(&whole.param))
         {
             return 0;
@@ -1283,528 +780,14 @@ impl Tier {
         bytes
     }
 
-    #[must_use]
-    pub fn deferring(&self) -> bool {
-        self.image.is_some() && self.host.bytes() == 0
-    }
-
-    #[must_use]
-    pub fn deferred_image(&self) -> Option<&crate::checkpoint_serving::Serving> {
-        self.image.as_ref().filter(|_| self.host.bytes() == 0)
-    }
-
-    #[must_use]
-    pub fn serving_host_of(&self, param: usize) -> Option<*const u8> {
-        self.seats
-            .iter()
-            .find(|seat| seat.param == param)
-            .map(|seat| seat.serving_at)
-            .or_else(|| {
-                self.wholes
-                    .iter()
-                    .find(|whole| whole.param == param)
-                    .map(|whole| whole.serving_at)
-            })
-            .map(|at| at as *const u8)
-    }
-
-    pub fn arm_refill(
-        &mut self,
-        filling: std::thread::JoinHandle<()>,
-        filled: std::sync::mpsc::Receiver<Pinned>,
-    ) {
-        self.refill = Some(Refill {
-            filling: Some(filling),
-            filled,
-            began: std::time::Instant::now(),
-        });
-    }
-
-    fn install(
-        &mut self,
-        host: Pinned,
-        window_ms: u64,
-        compute: *mut c_void,
-        notify: *mut c_void,
-    ) -> Result<()> {
-        self.drained.record(compute)?;
-        self.drained.wait(notify)?;
-        self.host = host;
-        self.reseat();
-        self.refill = None;
-        eprintln!(
-            "engine-cuda: the deferred tier is INSTALLED after {window_ms} ms — every T1 \
-             read is a page-locked read from here"
-        );
-        for at in 0..self.groups.len() {
-            if self.groups[at].held != Held::Pinned || self.groups[at].berth.is_some() {
-                continue;
-            }
-            let mut where_at = Vec::with_capacity(self.groups[at].planes.len());
-            for plane in &self.groups[at].planes {
-                let Some(whole) = self.wholes.iter().find(|whole| whole.param == plane.param)
-                else {
-                    return Err(Fault::Residency(format!(
-                        "`{}` is held on the pinned tier and plane {} has no offset in \
-                         its image; the seating and the install were built from \
-                         different walks",
-                        self.groups[at].name, plane.param,
-                    )));
-                };
-                where_at.push(whole.serving_at);
-            }
-            self.groups[at].at = where_at.clone();
-            let berth = self.berths.len();
-            self.berths.push(Berth {
-                tier: Held::Pinned,
-                at: where_at,
-                shape: self.groups[at]
-                    .planes
-                    .iter()
-                    .map(|plane| plane.reserved)
-                    .collect(),
-                holds: Some(at),
-            });
-            self.groups[at].berth = Some(berth);
-        }
-        self.publish_all(notify)?;
-        self.publish_cells(notify)?;
-        self.ready.record(notify)?;
-        self.ready.wait(compute)?;
-        self.moving = true;
-        count_promoted(window_ms);
-        Ok(())
-    }
-
-    fn reseat(&mut self) {
-        let base = self.host.device();
-        for seat in &mut self.seats {
-            seat.serving_at = base.saturating_add(seat.host_at);
-        }
-        for whole in &mut self.wholes {
-            whole.serving_at = base.saturating_add(whole.host_at);
-        }
-    }
-
     pub fn zero_host(&self) {
         self.host.zero();
-    }
-
-    pub fn land(
-        &mut self,
-        slab_of: &[u64],
-        store_at: &[(usize, u64)],
-        stream: *mut c_void,
-    ) -> Result<()> {
-        debug_assert_eq!(slab_of.len(), self.seats.len());
-        self.seat_groups(store_at)?;
-        for (seat, slab) in self.seats.iter_mut().zip(slab_of) {
-            seat.slab = *slab;
-            seat.in_slot = (0..seat.resident).collect();
-            for expert in 0..seat.resident {
-                seat.slot_of[expert as usize] = Some(expert);
-            }
-        }
-        for seat in &self.seats {
-            for (slot, expert) in seat.in_slot.iter().enumerate() {
-                copy_any(
-                    stream,
-                    seat.slab + slot as u64 * seat.stride,
-                    seat.serving_at + u64::from(*expert) * seat.stride,
-                    usize::try_from(seat.stride).unwrap_or(usize::MAX),
-                )?;
-            }
-        }
-        self.publish_all(stream)?;
-        self.publish_cells(stream)
-    }
-
-    fn seat_groups(&mut self, store_at: &[(usize, u64)]) -> Result<()> {
-        for at in 0..self.groups.len() {
-            let held = self.groups[at].held;
-            let mut where_at = Vec::with_capacity(self.groups[at].planes.len());
-            for plane in &self.groups[at].planes {
-                let found = match held {
-                    Held::Device => store_at
-                        .iter()
-                        .find(|(param, _)| *param == plane.param)
-                        .map(|(_, at)| *at),
-                    Held::Pinned => self
-                        .wholes
-                        .iter()
-                        .find(|whole| whole.param == plane.param)
-                        .map(|whole| whole.serving_at),
-                    Held::Mapped => self
-                        .mapped
-                        .iter()
-                        .find(|mapped| mapped.param == plane.param)
-                        .map(|mapped| mapped.at),
-                };
-                let Some(found) = found else {
-                    return Err(Fault::Residency(format!(
-                        "`{}` is planned {held:?} and plane {} has no address on that tier; the \
-                         plan and the seating were built from different walks",
-                        self.groups[at].name, plane.param,
-                    )));
-                };
-                where_at.push(found);
-            }
-            self.groups[at].at = where_at.clone();
-            let deferring = held == Held::Pinned && self.refill.is_some();
-            if held != Held::Mapped && !deferring {
-                let berth = self.berths.len();
-                self.berths.push(Berth {
-                    tier: held,
-                    at: where_at,
-                    shape: self.groups[at]
-                        .planes
-                        .iter()
-                        .map(|plane| plane.reserved)
-                        .collect(),
-                    holds: Some(at),
-                });
-                self.groups[at].berth = Some(berth);
-            }
-        }
-        Ok(())
-    }
-
-    fn publish_cells(&mut self, stream: *mut c_void) -> Result<()> {
-        if self.cell_shadow.bytes() == 0 {
-            return Ok(());
-        }
-        for at in 0..self.groups.len() {
-            self.write_cell(at);
-        }
-        copy_any(
-            stream,
-            self.cells.ptr(),
-            self.cell_shadow.device(),
-            self.cell_shadow.bytes(),
-        )
-    }
-
-    fn write_cell(&self, at: usize) {
-        let group = &self.groups[at];
-        let mut word = [0u8; CELL as usize];
-        for (plane, address) in group.at.iter().enumerate().take(CELL_PLANES) {
-            let byte = plane * 8;
-            word[byte..byte + 8].copy_from_slice(&address.to_ne_bytes());
-        }
-        self.cell_shadow.write(group.cell_at * CELL as usize, &word);
-    }
-
-    fn copy_cell(&self, at: usize, stream: *mut c_void) -> Result<()> {
-        let cell = self.groups[at].cell_at as u64 * CELL;
-        copy_any(
-            stream,
-            self.cells.ptr() + cell,
-            self.cell_shadow.device() + cell,
-            CELL as usize,
-        )
-    }
-
-    fn publish_all(&mut self, stream: *mut c_void) -> Result<()> {
-        if self.shadow.bytes() == 0 {
-            return Ok(());
-        }
-        for seat in &self.seats {
-            for expert in 0..seat.experts {
-                let entry = seat.entry_at + expert as usize;
-                let value = address_of(seat, expert);
-                self.shadow
-                    .write(entry * ENTRY as usize, &value.to_ne_bytes());
-            }
-        }
-        copy_any(
-            stream,
-            self.table.ptr(),
-            self.shadow.device(),
-            self.shadow.bytes(),
-        )
-    }
-
-    #[must_use]
-    pub fn group_handles(&self, param: usize) -> Option<GroupHandles> {
-        self.groups
-            .iter()
-            .find(|group| group.param == param)
-            .map(|group| GroupHandles {
-                cell: self.cells.ptr() + group.cell_at as u64 * CELL,
-                hits: self.group_counts.ptr() + group.cell_at as u64 * COUNTER,
-            })
-    }
-
-    #[must_use]
-    pub fn handles(&self, param: usize) -> Option<Handles> {
-        self.seats
-            .iter()
-            .find(|seat| seat.param == param)
-            .map(|seat| Handles {
-                table: self.table.ptr() + seat.entry_at as u64 * ENTRY,
-                counts: self.counts.ptr() + seat.counter_at as u64 * COUNTER,
-            })
-    }
-
-    pub fn drain(&self, stream: *mut c_void) -> Result<()> {
-        if self.counts.bytes() > 0 {
-            copy_any(
-                stream,
-                self.mirror.device(),
-                self.counts.ptr(),
-                self.counts.bytes(),
-            )?;
-        }
-        if self.group_counts.bytes() > 0 {
-            copy_any(
-                stream,
-                self.group_mirror.device(),
-                self.group_counts.ptr(),
-                self.group_counts.bytes(),
-            )?;
-        }
-        Ok(())
-    }
-
-    pub fn promote(&mut self, compute: *mut c_void, notify: *mut c_void) -> Result<u32> {
-        if self.seats.is_empty() && self.groups.is_empty() && self.refill.is_none() {
-            return Ok(0);
-        }
-        if self.moving && !self.ready.done()? {
-            return Ok(0);
-        }
-        if self.swap.is_some() && !self.landed.done()? {
-            return Ok(0);
-        }
-        if self.swap.is_none() && self.refill.is_some() {
-            let (filled, window) = match self.refill.as_mut() {
-                Some(refill) => (refill.poll(), refill.window_ms()),
-                None => (Filled::Waiting, 0),
-            };
-            match filled {
-                Filled::Waiting => {}
-                Filled::Ready(host) => {
-                    self.install(host, window, compute, notify)?;
-                    return Ok(0);
-                }
-                Filled::Refused => self.refill = None,
-            }
-        }
-        let hits = self.mirror.read(0, self.mirror.bytes());
-        let moves = self.decide(&hits);
-        let step = self.step();
-        if moves.is_empty() && step.is_none() {
-            return Ok(0);
-        }
-
-        self.drained.record(compute)?;
-        self.drained.wait(notify)?;
-        for (at, slot, out, into) in &moves {
-            let seat = &mut self.seats[*at];
-            if let Some(out) = out {
-                seat.slot_of[*out as usize] = None;
-                let entry = seat.entry_at + *out as usize;
-                let value = pinned_address_of(seat, *out);
-                self.shadow
-                    .write(entry * ENTRY as usize, &value.to_ne_bytes());
-                copy_any(
-                    notify,
-                    self.table.ptr() + entry as u64 * ENTRY,
-                    self.shadow.device() + entry as u64 * ENTRY,
-                    ENTRY as usize,
-                )?;
-            }
-            let seat = &self.seats[*at];
-            let dst = seat.slab + u64::from(*slot) * seat.stride;
-            copy_any(
-                notify,
-                dst,
-                seat.serving_at + u64::from(*into) * seat.stride,
-                usize::try_from(seat.stride).unwrap_or(usize::MAX),
-            )?;
-            let entry = seat.entry_at + *into as usize;
-            self.shadow
-                .write(entry * ENTRY as usize, &dst.to_ne_bytes());
-            copy_any(
-                notify,
-                self.table.ptr() + entry as u64 * ENTRY,
-                self.shadow.device() + entry as u64 * ENTRY,
-                ENTRY as usize,
-            )?;
-            let seat = &mut self.seats[*at];
-            seat.slot_of[*into as usize] = Some(*slot);
-            seat.in_slot[*slot as usize] = *into;
-        }
-        let bulk = match step {
-            Some(Step::Open(swap)) => {
-                self.open_berth(swap, notify)?;
-                Some(swap)
-            }
-            Some(Step::Close(swap)) => {
-                self.close_berth(swap, notify)?;
-                None
-            }
-            None => None,
-        };
-        self.ready.record(notify)?;
-        self.ready.wait(compute)?;
-        if let Some(swap) = bulk {
-            let into = self.berths[swap.berth].at.clone();
-            let group = &self.groups[swap.group];
-            let from: Vec<(u64, u64)> = group
-                .at
-                .iter()
-                .zip(&group.planes)
-                .map(|(at, plane)| (*at, plane.bytes))
-                .collect();
-            for (dst, (src, bytes)) in into.into_iter().zip(from) {
-                copy_any(
-                    notify,
-                    dst,
-                    src,
-                    usize::try_from(bytes).unwrap_or(usize::MAX),
-                )?;
-            }
-            self.landed.record(notify)?;
-            self.swap = Some(swap);
-        }
-        self.moving = true;
-        Ok(u32::try_from(moves.len()).unwrap_or(u32::MAX))
-    }
-
-    fn open_berth(&mut self, swap: Swap, notify: *mut c_void) -> Result<()> {
-        if let Some(out) = self.berths[swap.berth].holds {
-            self.groups[out].at = self.groups[out].backing.clone();
-            self.groups[out].held = Held::Mapped;
-            self.groups[out].berth = None;
-            self.tick += 1;
-            self.groups[out].settled = self.tick;
-            self.write_cell(out);
-            self.copy_cell(out, notify)?;
-        }
-        self.berths[swap.berth].holds = None;
-        Ok(())
-    }
-
-    fn close_berth(&mut self, swap: Swap, notify: *mut c_void) -> Result<()> {
-        let berth = &self.berths[swap.berth];
-        let (tier, at) = (berth.tier, berth.at.clone());
-        if let Some(was) = self.groups[swap.group].berth {
-            self.berths[was].holds = None;
-        }
-        self.groups[swap.group].at = at;
-        self.groups[swap.group].held = tier;
-        self.groups[swap.group].berth = Some(swap.berth);
-        self.berths[swap.berth].holds = Some(swap.group);
-        self.tick += 1;
-        self.groups[swap.group].settled = self.tick;
-        self.write_cell(swap.group);
-        self.copy_cell(swap.group, notify)?;
-        self.swap = None;
-        Ok(())
-    }
-
-    fn step(&self) -> Option<Step> {
-        if let Some(swap) = self.swap {
-            return Some(Step::Close(swap));
-        }
-        if self.berths.is_empty() || !self.ladder_open {
-            return None;
-        }
-        let hits = self.group_mirror.read(0, self.group_mirror.bytes());
-        self.decide_group(&hits).map(Step::Open)
-    }
-
-    fn decide_group(&self, hits: &[u8]) -> Option<Swap> {
-        let count = |at: usize| -> u32 {
-            let byte = at * COUNTER as usize;
-            hits.get(byte..byte + COUNTER as usize)
-                .and_then(|word| word.try_into().ok())
-                .map_or(0, u32::from_ne_bytes)
-        };
-        vote(&self.berths, &self.groups, count)
-    }
-
-    fn decide(&self, hits: &[u8]) -> Vec<(usize, u32, Option<u32>, u32)> {
-        let count = |at: usize| -> u32 {
-            let byte = at * COUNTER as usize;
-            hits.get(byte..byte + COUNTER as usize)
-                .and_then(|w| w.try_into().ok())
-                .map_or(0, u32::from_ne_bytes)
-        };
-        let mut out = Vec::new();
-        for (at, seat) in self.seats.iter().enumerate() {
-            let mut cold: Vec<(u32, u32)> = seat
-                .in_slot
-                .iter()
-                .enumerate()
-                .map(|(slot, expert)| (count(seat.counter_at + *expert as usize), slot as u32))
-                .collect();
-            cold.sort_unstable();
-            let mut hot: Vec<(u32, u32)> = (0..seat.experts)
-                .filter(|expert| seat.slot_of[*expert as usize].is_none())
-                .map(|expert| (count(seat.counter_at + expert as usize), expert))
-                .collect();
-            hot.sort_unstable_by(|a, b| b.cmp(a));
-            for ((cold_hits, slot), (hot_hits, expert)) in cold.iter().zip(&hot).take(MOVES) {
-                if hot_hits <= cold_hits {
-                    break;
-                }
-                out.push((at, *slot, Some(seat.in_slot[*slot as usize]), *expert));
-            }
-        }
-        out
     }
 
     #[must_use]
     pub fn plan(&self) -> &Plan {
         &self.plan
     }
-}
-
-fn vote(berths: &[Berth], groups: &[Group], count: impl Fn(usize) -> u32) -> Option<Swap> {
-    let mut best: Option<(u32, Swap)> = None;
-    for (at, berth) in berths.iter().enumerate() {
-        let out = match berth.holds {
-            Some(out) if groups[out].backing.is_empty() => continue,
-            held => held,
-        };
-        let floor = out.map_or(0, |out| count(groups[out].cell_at));
-        for (group, candidate) in groups.iter().enumerate() {
-            if candidate.berth == Some(at) || candidate.held.rung() <= berth.tier.rung() {
-                continue;
-            }
-            if candidate.planes.len() != berth.shape.len()
-                || candidate
-                    .planes
-                    .iter()
-                    .zip(&berth.shape)
-                    .any(|(plane, want)| plane.reserved != *want)
-            {
-                continue;
-            }
-            let hot = count(candidate.cell_at);
-            if hot <= floor {
-                continue;
-            }
-            let gain = hot - floor;
-            if best.is_none_or(|(had, _)| gain > had) {
-                best = Some((gain, Swap { berth: at, group }));
-            }
-        }
-    }
-    best.map(|(_, swap)| swap)
-}
-
-fn address_of(seat: &Seat, expert: u32) -> u64 {
-    match seat.slot_of[expert as usize] {
-        Some(slot) => seat.slab + u64::from(slot) * seat.stride,
-        None => pinned_address_of(seat, expert),
-    }
-}
-
-fn pinned_address_of(seat: &Seat, expert: u32) -> u64 {
-    seat.serving_at + u64::from(expert) * seat.stride
 }
 
 #[cfg(test)]
@@ -1875,10 +858,6 @@ mod tests {
         );
         assert_eq!(plan.device_demand(), full - bytes);
         assert_eq!(plan.host_demand(), bytes);
-        assert!(
-            !plan.hosts_beyond_declared(),
-            "a declared plane alone leaves a recorded body free to hold it"
-        );
         assert_eq!(
             plan.host_declared(&trace).expect("again"),
             0,

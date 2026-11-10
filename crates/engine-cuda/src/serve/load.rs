@@ -97,10 +97,6 @@ pub(super) fn bake(boot: &mut Boot<'_>) -> Result<Baked> {
     if engine.host_planes {
         let freed = boot.residency.host_declared(&boot.trace)?;
         if freed > 0 {
-            // The deferred fill republishes routed seats only; a dense row
-            // read through the artifact's mapping would stay there, so the
-            // host image is built at boot.
-            boot.deferred_tier = false;
             eprintln!(
                 "engine-cuda: {:.1} GiB of planes the package declares `host` serve from \
                  pinned host memory (engine.host_planes)",
@@ -108,12 +104,8 @@ pub(super) fn bake(boot: &mut Boot<'_>) -> Result<Baked> {
             );
         }
     }
-    // So do the routed banks it streams an expert at a time, where the
-    // load's own weight budget seats no expert itself.
-    if boot.residency.banks().is_empty()
-        && !boot.knobs.diagnostics.dense_weights
-        && !boot.knobs.diagnostics.dense_experts
-    {
+    // So do the routed banks it streams an expert at a time.
+    if !boot.knobs.diagnostics.dense_weights && !boot.knobs.diagnostics.dense_experts {
         let banks = crate::store::layout::streamed_experts(&boot.trace);
         match host_copy(boot, &banks)? {
             HostCopy::Filed => {
@@ -125,9 +117,7 @@ pub(super) fn bake(boot: &mut Boot<'_>) -> Result<Baked> {
                     .file_weights(&boot.trace, &banks, true, true)?;
             }
             HostCopy::Pinned => {
-                if boot.residency.host_experts(&boot.trace, &banks)? > 0 {
-                    boot.deferred_tier = false;
-                }
+                boot.residency.host_experts(&boot.trace, &banks)?;
             }
         }
     }
@@ -217,9 +207,7 @@ pub(super) fn bake(boot: &mut Boot<'_>) -> Result<Baked> {
                     .file_weights(&boot.trace, &streamed, false, true)?;
             }
             HostCopy::Pinned => {
-                if boot.residency.host_rows(&boot.trace, &streamed)? > 0 {
-                    boot.deferred_tier = false;
-                }
+                boot.residency.host_rows(&boot.trace, &streamed)?;
             }
         }
     }
@@ -813,7 +801,6 @@ impl Shell {
                 )
             },
             decode_dense,
-            boot.deferred_tier,
         )?;
         // `kernel.gemm.fp8_o_down`: grouped projections on fp8b128, as vLLM
         // reads DeepSeek-V4's `wo_a` (the wide fires on tcgen05).

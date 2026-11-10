@@ -59,8 +59,6 @@ pub const DEFAULT_DEVICE_MEMORY_SHARE: f64 = 0.9;
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Residency {
-    #[serde(default = "deferred_by_default")]
-    pub deferred_tier: bool,
     /// Device bytes the kv pages and recurrent-state slots take; `None`
     /// fills what `device_memory_share` leaves.
     #[serde(default)]
@@ -102,10 +100,6 @@ pub struct Residency {
     pub weights_held: bool,
 }
 
-fn deferred_by_default() -> bool {
-    true
-}
-
 fn default_share() -> f64 {
     DEFAULT_DEVICE_MEMORY_SHARE
 }
@@ -129,7 +123,6 @@ impl Residency {
     #[must_use]
     pub const fn uncapped() -> Residency {
         Residency {
-            deferred_tier: true,
             device_kv_budget: None,
             device_memory_share: DEFAULT_DEVICE_MEMORY_SHARE,
             host_kv_budget: None,

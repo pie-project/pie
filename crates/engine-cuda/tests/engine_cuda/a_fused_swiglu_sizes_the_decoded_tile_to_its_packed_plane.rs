@@ -210,7 +210,6 @@ fn fire(fixture: &Fixture, knobs: Knobs) -> engine_cuda::Result<(Vec<f32>, Vec<u
         cache_dir: None,
         runahead: engine::runahead::Runahead::F1,
         residency: engine_cuda::experts::Plan::default(),
-        deferred_tier: false,
         world: engine_cuda::World::default(),
         expert: engine_cuda::World::default(),
         comm: core::ptr::null_mut(),

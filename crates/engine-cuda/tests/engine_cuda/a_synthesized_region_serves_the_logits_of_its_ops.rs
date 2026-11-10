@@ -172,7 +172,6 @@ fn load(fixture: &Fixture, overrides: &str, tokens: u32) -> Shell {
         cache_dir: None,
         runahead: engine::runahead::Runahead::F1,
         residency: engine_cuda::experts::Plan::default(),
-        deferred_tier: false,
         world: engine_cuda::World::default(),
         expert: engine_cuda::World::default(),
         comm: core::ptr::null_mut(),

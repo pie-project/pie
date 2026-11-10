@@ -17,7 +17,6 @@ fn logits(trace: Trace, path: &Path, prompt: &[u32], decodes: u32) -> Vec<Vec<f3
     let contract = contract_for(&trace, path).expect("the random planes fit the trace");
     let mut shell = Shell::load(Boot {
         voxels: None,
-        deferred_tier: false,
         residency: engine_cuda::experts::Plan::default(),
         trace,
         contract: &contract,

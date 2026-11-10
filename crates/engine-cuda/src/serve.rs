@@ -230,9 +230,6 @@ impl Shell {
                     "`{}` is laid out for its product, not slot by slot",
                     param.name
                 )),
-                Some(WeightRow::Streamed { .. }) => {
-                    Err(format!("`{}` streams through the expert tier", param.name))
-                }
                 None => Err(format!("`{}` is not bound", param.name)),
             }
             .and_then(|tensors| {
@@ -938,7 +935,7 @@ impl Shell {
     }
 
     pub(crate) fn records_bodies(&self) -> bool {
-        self.bodies && self.pad && self.graphs.records() && !self.weights.hosts_experts()
+        self.bodies && self.pad && self.graphs.records()
     }
 
     #[must_use]

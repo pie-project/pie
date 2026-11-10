@@ -615,7 +615,6 @@ impl Engine for Cuda {
             cache_dir: self.boot.cache_dir.as_deref(),
             runahead: engine::runahead::Runahead::of(frames_in_flight),
             residency: plan,
-            deferred_tier: residency.deferred_tier,
             world: self.boot.world,
             expert: self.expert,
             comm: self

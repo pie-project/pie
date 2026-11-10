@@ -1745,12 +1745,6 @@ impl FrameShell for Shell {
         Self: 'a,
     {
         let mut p = prepared;
-        if !self.arming {
-            let (compute, notify) = (self.device.stream(), self.device.notify_stream());
-            if let Some(tier) = self.weights.experts_mut() {
-                tier.promote(compute, notify)?;
-            }
-        }
         let slot = p
             .slot
             .take()

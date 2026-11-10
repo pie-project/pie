@@ -121,7 +121,6 @@ pub struct Boot<'a> {
     pub cache_dir: Option<&'a Path>,
     pub runahead: engine::runahead::Runahead,
     pub residency: crate::experts::Plan,
-    pub deferred_tier: bool,
     pub world: crate::api::World,
     /// The rank's place in its expert-parallel group: which slots of each
     /// routed bank its checkpoint read keeps.

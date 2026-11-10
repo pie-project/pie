@@ -14,7 +14,6 @@ use checkpoint::plan::{LoadPlan, StorageTarget, compile, compile_streaming};
 use checkpoint::types::{ScaleForm, TensorId};
 use kernels_cuda::Tensor;
 use kernels_cuda::linear::affine::OffsetKind;
-use kernels_cuda::linear::moe::GroupSeat;
 use poem_ir::{Dtype, ParamSource, Trace};
 
 use crate::device::Buffer;
@@ -203,10 +202,7 @@ fn restore_from_checkpoint(
         .as_ref()
         .map(|tier| tier.plan().host_layout())
         .unwrap_or_default();
-    let seated = tier
-        .as_ref()
-        .is_some_and(|tier| tier.deferred_image().is_some());
-    let refill = match seated || layout.is_empty() {
+    let refill = match layout.is_empty() {
         true => None,
         false => Some(serving.refill(&layout).map_err(Rotten::Bytes)?),
     };
@@ -224,9 +220,6 @@ fn restore_from_checkpoint(
         if place.reserved == 0
             || trace.params.get(param).map(|p| p.source) != Some(ParamSource::Checkpoint)
         {
-            continue;
-        }
-        if plan.resident(param).is_some() {
             continue;
         }
         let id = u32::try_from(param).unwrap_or(u32::MAX);
@@ -317,126 +310,14 @@ fn restore_from_checkpoint(
         serving.path(),
         pumped,
         pinned,
-        if seated {
-            "verified where they lie"
-        } else {
-            "copied and verified"
-        },
+        "copied and verified",
     );
     Ok(())
-}
-
-fn defer_tiers(
-    serving: Option<&crate::checkpoint_serving::Serving>,
-    plan: &crate::experts::Plan,
-    deferred: bool,
-) -> Option<crate::checkpoint_serving::Serving> {
-    let serving = serving?;
-    if !deferred || plan.host_image() == 0 || !crate::experts::pageable_access() {
-        return None;
-    }
-    if let Err(why) = serving.covers(&plan.host_layout()) {
-        eprintln!(
-            "engine-cuda: the tier is not deferred — {why}, so this boot builds its \
-             page-locked image the eager way; the load is unaffected"
-        );
-        return None;
-    }
-    Some(serving.clone())
 }
 
 enum Rotten {
     Bytes(String),
     Machine(String),
-}
-
-fn arm_refill(tier: &mut crate::experts::Tier) {
-    let Some(image) = tier.deferred_image() else {
-        return;
-    };
-    let refill = match image.refill(&tier.plan().host_layout()) {
-        Ok(refill) => refill,
-        Err(why) => {
-            eprintln!(
-                "engine-cuda: the deferred tier's fill cannot be described ({why}); it will \
-                 serve out of the artifact for the life of this load"
-            );
-            return;
-        }
-    };
-    let bytes = usize::try_from(tier.plan().host_image()).unwrap_or(usize::MAX);
-    let ordinal = match crate::device::ctx::current() {
-        Ok(ordinal) => ordinal,
-        Err(why) => {
-            eprintln!(
-                "engine-cuda: the deferred tier cannot name its device ({why}); it will \
-                 serve out of {:?} for the life of this load",
-                refill.path,
-            );
-            return;
-        }
-    };
-    let (send, filled) = std::sync::mpsc::channel();
-    let objects = refill.landings.len();
-    let path = refill.path.clone();
-    match std::thread::Builder::new()
-        .name("pie-tier-refill".to_string())
-        .spawn(move || refill_from(&refill, bytes, ordinal, &send))
-    {
-        Ok(filling) => {
-            eprintln!(
-                "engine-cuda: the tier is DEFERRED — {objects} object(s) of {bytes} byte(s) \
-                 served out of {path:?} where they lie while a background thread builds \
-                 the page-locked copy; until it lands, a T1 read is a page fault"
-            );
-            tier.arm_refill(filling, filled);
-        }
-        Err(why) => eprintln!(
-            "engine-cuda: the deferred tier's fill thread would not start ({why}); it \
-             will serve out of the artifact for the life of this load"
-        ),
-    }
-}
-
-fn refill_from(
-    refill: &crate::checkpoint_serving::Landings,
-    bytes: usize,
-    ordinal: i32,
-    out: &std::sync::mpsc::Sender<crate::device::Pinned>,
-) {
-    let path = &refill.path;
-    if let Err(why) = crate::device::ctx::bind_thread(ordinal) {
-        eprintln!("engine-cuda: the deferred tier's fill cannot bind device {ordinal} ({why})");
-        return;
-    }
-    let host = match crate::device::Pinning::uninit(bytes) {
-        Ok(host) => host,
-        Err(why) => {
-            eprintln!(
-                "engine-cuda: the deferred tier's fill could not map {bytes} bytes \
-                 ({why}); the seat serves out of {path:?} for the life of this load"
-            );
-            return;
-        }
-    };
-    // SAFETY: `host` maps exactly `bytes`, which `host_layout` tiles, and
-    // was made on this thread with no other reader until it is sent.
-    match unsafe { crate::checkpoint_serving::read_into(refill, host.host()) } {
-        Ok(()) => match host.lock() {
-            Ok(host) => {
-                let _ = out.send(host);
-            }
-            Err(why) => eprintln!(
-                "engine-cuda: the deferred tier's fill could not page-lock {bytes} bytes \
-                 ({why}); the seat serves out of {path:?} for the life of this load"
-            ),
-        },
-        Err(why) => eprintln!(
-            "engine-cuda: the deferred tier's fill could not read {path:?} back ({why}); \
-             the seat serves out of the mapping and the file is left alone. {}",
-            checkpoint::serving::rebuild(None),
-        ),
-    }
 }
 
 enum Scratch {
@@ -795,7 +676,6 @@ impl Weights {
         stream: *mut core::ffi::c_void,
         target: StorageTarget,
         decode_dense: bool,
-        deferred_tier: bool,
     ) -> Result<Weights> {
         let (metadata, snapshot) = if path.is_dir() {
             (parse_metadata(path)?, path)
@@ -816,7 +696,6 @@ impl Weights {
         let total = places.last().map_or(0, |p| p.offset + p.reserved);
         let mut store = Buffer::zeroed(usize::try_from(total).unwrap_or(usize::MAX))?;
         let serving = crate::checkpoint_serving::Serving::open(path, trace);
-        let deferred = defer_tiers(serving.as_ref(), &plan, deferred_tier);
         // A serving artifact lays out every expert: a rank holding some
         // of a bank's slots reads its own from the checkpoint.
         let restorable = target.tp_size == 1
@@ -830,10 +709,9 @@ impl Weights {
         };
         let mut experts = match plan.streams() {
             true => {
-                let fill = match (deferred, restorable) {
-                    (Some(artifact), _) => crate::experts::Fill::Deferred(artifact),
-                    (None, true) => crate::experts::Fill::Restored,
-                    (None, false) => crate::experts::Fill::Cold,
+                let fill = match restorable {
+                    true => crate::experts::Fill::Restored,
+                    false => crate::experts::Fill::Cold,
                 };
                 Some(crate::experts::Tier::open(plan.clone(), source, fill)?)
             }
@@ -911,11 +789,6 @@ impl Weights {
             }
         };
 
-        if let Some(tier) = experts.as_mut().filter(|tier| tier.deferring()) {
-            crate::experts::count_deferred();
-            arm_refill(tier);
-        }
-
         // A boot that read its image out of the serving file copied each
         // plane out of the file's mapping, which stays mapped for the planes
         // read from it later: the pages of the ones copied are let go.
@@ -943,14 +816,7 @@ impl Weights {
                 });
             }
             let row = match pairings.get(trace.params[at].name.as_str()) {
-                Some(pairing)
-                    if decode_dense
-                        && decodes_at_load(&trace.params[at])
-                        && experts
-                            .as_ref()
-                            .and_then(|tier| tier.group_handles(at))
-                            .is_none() =>
-                {
+                Some(pairing) if decode_dense && decodes_at_load(&trace.params[at]) => {
                     let codes = packed(experts.as_ref(), &store, &places, at)?;
                     let scales = packed(experts.as_ref(), &store, &places, pairing.scales)?;
                     let biases = match pairing.biases {
@@ -987,13 +853,6 @@ impl Weights {
                         Some(biases) => Some(packed(experts.as_ref(), &store, &places, biases)?),
                         None => None,
                     },
-                    seat: experts
-                        .as_ref()
-                        .and_then(|tier| tier.group_handles(at))
-                        .map_or(GroupSeat::RESIDENT, |seat| GroupSeat {
-                            cell: seat.cell,
-                            hits: seat.hits,
-                        }),
                 },
                 None => {
                     let handle = Tensor::new(
@@ -1002,14 +861,7 @@ impl Weights {
                         place.width,
                         place.dtype,
                     );
-                    match experts.as_ref().and_then(|tier| tier.handles(at)) {
-                        None => WeightRow::Dense(handle),
-                        Some(handles) => WeightRow::Streamed {
-                            slab: handle,
-                            table: handles.table,
-                            counts: handles.counts,
-                        },
-                    }
+                    WeightRow::Dense(handle)
                 }
             };
             table.push(Some(row));
@@ -1038,22 +890,6 @@ impl Weights {
         }
         #[cfg(feature = "cuda")]
         lay_tile_banks(trace, &mut table, &mut decoded, stream)?;
-        if let Some(tier) = experts.as_mut() {
-            let slabs: Vec<u64> = tier
-                .plan()
-                .banks()
-                .iter()
-                .map(|bank| store.at(places[bank.param].offset))
-                .collect::<Result<_>>()?;
-            let store_at: Vec<(usize, u64)> = tier
-                .plan()
-                .seated()
-                .iter()
-                .flat_map(|group| group.planes.clone())
-                .map(|plane| Ok((plane.param, store.at(places[plane.param].offset)?)))
-                .collect::<Result<_>>()?;
-            tier.land(&slabs, &store_at, stream)?;
-        }
         Ok(Weights {
             store,
             table: WeightTable(
@@ -1416,7 +1252,6 @@ impl Weights {
             let Some(Some(WeightRow::Planes {
                 codes,
                 scales,
-                seat,
                 atoms: false,
                 lanes: false,
                 ..
@@ -1433,11 +1268,10 @@ impl Weights {
             let k = shape[shape.len() - 2] * 32;
             // A bank off the device (the weight cache's, or a tier's) has
             // no copy: its mapped planes are no device pointer.
-            if seat.streams()
-                || self
-                    .experts
-                    .as_ref()
-                    .is_some_and(|tier| tier.offloaded_at(at).is_some())
+            if self
+                .experts
+                .as_ref()
+                .is_some_and(|tier| tier.offloaded_at(at).is_some())
                 || crate::device::alloc::is_host_pointer(codes.ptr)
                 || crate::device::alloc::is_host_pointer(scales.ptr)
                 || rows == 0
@@ -1547,7 +1381,6 @@ impl Weights {
             let Some(Some(WeightRow::Planes {
                 codes,
                 scales,
-                seat,
                 atoms: false,
                 lanes: false,
                 ..
@@ -1564,11 +1397,10 @@ impl Weights {
             let k = shape[shape.len() - 2] * 32;
             // A bank off the device (the weight cache's, or a tier's) has
             // no copy: its mapped planes are no device pointer.
-            if seat.streams()
-                || self
-                    .experts
-                    .as_ref()
-                    .is_some_and(|tier| tier.offloaded_at(at).is_some())
+            if self
+                .experts
+                .as_ref()
+                .is_some_and(|tier| tier.offloaded_at(at).is_some())
                 || crate::device::alloc::is_host_pointer(codes.ptr)
                 || crate::device::alloc::is_host_pointer(scales.ptr)
                 || rows == 0
@@ -1616,13 +1448,6 @@ impl Weights {
             done += 1;
         }
         Ok(done)
-    }
-
-    #[must_use]
-    pub fn hosts_experts(&self) -> bool {
-        self.experts
-            .as_ref()
-            .is_some_and(|tier| tier.plan().hosts_beyond_declared())
     }
 
     #[must_use]
@@ -1820,14 +1645,7 @@ fn places(trace: &Trace, plan: &crate::experts::Plan) -> Result<Vec<Place>> {
     for (index, param) in trace.params.iter().enumerate() {
         let (rows, width) = rectangle(&param.shape);
         let plane = bytes[index];
-        let held = if plan.streamed_whole(index) {
-            0
-        } else {
-            match plan.resident(index) {
-                Some(resident) if rows > 0 => plane / rows * u64::from(resident),
-                _ => plane,
-            }
-        };
+        let held = if plan.streamed_whole(index) { 0 } else { plane };
         out.push(Place {
             offset: at,
             bytes: plane,
@@ -1878,16 +1696,7 @@ impl TensorSink for Landing<'_> {
             self.landed[at] = true;
             return Ok(());
         }
-        let streamed = self.plan.resident(at).is_some() || self.plan.pinned(at);
-        if streamed
-            && self
-                .experts
-                .as_ref()
-                .is_some_and(|tier| tier.deferred_image().is_some())
-        {
-            self.landed[at] = true;
-            return Ok(());
-        }
+        let streamed = self.plan.pinned(at);
         match self.experts.filter(|_| streamed) {
             Some(tier) => {
                 let host_at = tier.host_offset(at).ok_or_else(|| {
@@ -2060,13 +1869,7 @@ fn lay_atoms(
     }
     let mut temp: Option<Buffer> = None;
     for (at, gran) in banks {
-        let Some(Some(WeightRow::Planes {
-            scales,
-            seat,
-            atoms,
-            ..
-        })) = table.get_mut(at)
-        else {
+        let Some(Some(WeightRow::Planes { scales, atoms, .. })) = table.get_mut(at) else {
             continue;
         };
         // An MXFP4 plane is `[.., rows, blocks, 16]` bytes, an NVFP4 one its
@@ -2091,8 +1894,7 @@ fn lay_atoms(
         if rows == 0 || cols == 0 {
             continue;
         }
-        if seat.streams()
-            || crate::device::alloc::is_host_pointer(scales.ptr)
+        if crate::device::alloc::is_host_pointer(scales.ptr)
             || !rows.is_multiple_of(128)
             || !cols.is_multiple_of(4)
         {
@@ -2149,7 +1951,6 @@ fn lay_tile_banks(
         let Some(Some(WeightRow::Planes {
             codes,
             scales,
-            seat,
             atoms,
             ..
         })) = table.get_mut(at)
@@ -2165,7 +1966,6 @@ fn lay_tile_banks(
         }
         // The factors plane is bound as bytes; its param states it f32.
         if *atoms
-            || seat.streams()
             || crate::device::alloc::is_host_pointer(codes.ptr)
             || crate::device::alloc::is_host_pointer(scales.ptr)
         {

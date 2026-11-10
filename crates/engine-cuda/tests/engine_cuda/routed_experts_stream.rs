@@ -46,7 +46,7 @@ fn a_plan_whose_cache_takes_the_banks_seats_no_expert() {
         .expect("ranks")
         .caching(&cached);
     let mut plan = Plan::cut(&ranking);
-    assert!(plan.banks().is_empty() && !plan.streams());
+    assert!(!plan.streams());
     // The banks are the pool's from the cut on: the weight tier is never
     // charged for them, before the load moves them or after.
     assert_eq!(plan.device_demand(), full - bank_bytes);
@@ -64,7 +64,7 @@ fn a_bank_the_cache_does_not_take_stays_whole_on_the_device() {
         .expect("ranks")
         .caching(&[]);
     let plan = Plan::cut(&ranking);
-    assert!(plan.banks().is_empty() && !plan.streams());
+    assert!(!plan.streams());
     assert_eq!(plan.device_demand(), full);
 }
 

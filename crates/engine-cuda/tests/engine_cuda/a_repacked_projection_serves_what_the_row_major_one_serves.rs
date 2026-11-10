@@ -328,7 +328,6 @@ fn logits(arm: Arm, prompt: &[u32]) -> Vec<f32> {
         cache_dir: None,
         runahead: engine::runahead::Runahead::F1,
         residency: engine_cuda::experts::Plan::default(),
-        deferred_tier: false,
         world: engine_cuda::World::default(),
         expert: engine_cuda::World::default(),
         comm: core::ptr::null_mut(),
