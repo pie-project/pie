@@ -101,6 +101,10 @@ pub struct FireBindings {
 
     pub geometry: Vec<CacheGeometry>,
 
+    /// The page table each window's write descriptors read, by the window
+    /// a geometry input states (CONTRACT-BC 21); any other reads table 0.
+    pub window_tables: Vec<(u32, usize)>,
+
     pub tables: FireTables,
 
     pub rs: Option<std::sync::Arc<crate::rs::Seat>>,
@@ -141,6 +145,13 @@ pub struct Run<'c> {
     pump: Option<&'c crate::experts::Pump>,
 
     stage: std::cell::RefCell<StageCache>,
+
+    /// The weight cache's row tables, their host copies by param, the pool
+    /// their slots lie in, and the ids a fire's gathers read back.
+    row_caches: Option<&'c crate::store::rows::RowCaches>,
+    row_planes: std::collections::BTreeMap<usize, &'c crate::experts::HostPlane>,
+    row_pool: Option<kernels_slang::Segments>,
+    row_ids: std::cell::RefCell<Option<(u32, Vec<i32>)>>,
 
     arena: &'c SlotTable,
 
@@ -209,6 +220,10 @@ impl<'c> Run<'c> {
             host,
             pump,
             stage: std::cell::RefCell::new(StageCache::default()),
+            row_caches: None,
+            row_planes: std::collections::BTreeMap::new(),
+            row_pool: None,
+            row_ids: std::cell::RefCell::new(None),
             arena,
             caches,
             structs: vec![None; values.len() * windows.max_runs() as usize],
@@ -450,7 +465,7 @@ impl<'c> Run<'c> {
             .as_ref()
             .expect("`compacted` is reached only through a gathered window");
         if let Def::Input(RuntimeInput::Geometry { kind }) = &self.values[at].def {
-            let Some(table) = gathered.page_tables.first() else {
+            let Some(table) = gathered.page_tables.get(self.table_of(*kind)) else {
                 return handle;
             };
             return match kind {
@@ -613,9 +628,13 @@ impl<'c> Run<'c> {
                 })
             }
             Def::Input(RuntimeInput::Geometry { kind }) => {
-                // One page table: the All axis's and every write's.
-                let seat = self.fire.geometry.first().unwrap_or_else(|| {
-                    panic!("value {at} reads a page table, and this fire binds none")
+                // The All axis's table, or a write descriptor's row's list's.
+                let table = self.table_of(*kind);
+                let seat = self.fire.geometry.get(table).unwrap_or_else(|| {
+                    panic!(
+                        "value {at} reads page table {table}, and this fire binds {}",
+                        self.fire.geometry.len()
+                    )
                 });
                 let bound = match kind {
                     GeomKind::Indptr => seat.indptr,
@@ -869,6 +888,48 @@ impl<'c> Run<'c> {
         Ok(Some((out_bank, out_bias, seats.routes(routes))))
     }
 
+    /// This run with the weight cache's row tables: `planes` their host
+    /// copies by param, `pool` the pool their slots lie in.
+    #[must_use]
+    pub fn with_rows(
+        mut self,
+        rows: &'c crate::store::rows::RowCaches,
+        planes: std::collections::BTreeMap<usize, &'c crate::experts::HostPlane>,
+        pool: kernels_slang::Segments,
+    ) -> Self {
+        if !rows.is_empty() {
+            self.row_caches = Some(rows);
+            self.row_planes = planes;
+            self.row_pool = Some(pool);
+        }
+        self
+    }
+
+    /// Weight value `table`'s row table where the weight cache streams it,
+    /// for a gather of `ids`.
+    pub(crate) fn row_table(
+        &self,
+        table: ValueId,
+        ids: Tensor,
+    ) -> Result<Option<kernels_slang::gather::embed::RowTable>, kernels_slang::Error> {
+        let (Some(rows), Some(pool), Some(host)) = (self.row_caches, self.row_pool, self.host)
+        else {
+            return Ok(None);
+        };
+        let Def::Weight(w) = &self.values[table.0 as usize].def else {
+            return Ok(None);
+        };
+        let param = *w as usize;
+        let Some(plane) = self.row_planes.get(&param) else {
+            return Ok(None);
+        };
+        rows.table(self.handles, host, plane, param, ids, &self.row_ids, pool)
+            .map_err(|why| kernels_slang::Error::Backend {
+                op: "gather.embed",
+                detail: why.to_string(),
+            })
+    }
+
     pub(crate) fn gathered_table(
         &self,
         bank: Bank,
@@ -951,6 +1012,20 @@ impl<'c> Run<'c> {
                 id.0
             ),
         }
+    }
+
+    /// The page table geometry input `kind` reads: the All axis's (the
+    /// first), or a write descriptor's row's list's.
+    fn table_of(&self, kind: GeomKind) -> usize {
+        poem_exec::store::kv::geometry_window(kind)
+            .and_then(|window| {
+                self.fire
+                    .window_tables
+                    .iter()
+                    .find(|(held, _)| *held == window)
+                    .map(|&(_, table)| table)
+            })
+            .unwrap_or(0)
     }
 
     pub(crate) fn pool(&self, id: ValueId) -> &KvPool {

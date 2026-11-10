@@ -10,12 +10,13 @@ Legend: ✅ verified on hardware · 🟡 in progress / compile-only · 🔴 not 
 |---|---|---|---|---|---|---|---|
 | Real ChunkFacts, slot-ref lanes, fixed pieces | ✅ M34 | ✅ M43 (MI300X) | ✅ M30 · 🔴 dsv4 window by slot ref (BM5a) | ✅ M48 | ✅ M48 | 🟡 XLA | 🟡 M43 host pool (no HW) |
 | Grow / shrink (segments, evacuation) | ✅ M34 | — flat by spec | ✅ M30 | ✅ M48 | ✅ M48 | — fixed at load | 🟡 M43 (host segments) |
-| rs list + slot_copies | ✅ M34 | ✅ golden_buffered (MI300X) | ✅ M37 | 🟡 VK | 🟡 VK | 🟡 XLA | 🟡 M43 (host sim) |
-| Window lists (own T_w, trimmed) | ✅ tables per list M51 (T_w = page; 2-window untested) | ✅ goldens (one list) | ✅ up to 4 lists M50 | 🟡 VK | 🟡 VK | 🟡 XLA | 🟡 one list, T_w=page |
-| Multi-piece records end to end | ✅ engine (L40S) · 🟡 runtime boot (IT r5) | ✅ records in pieces (chunk goldens); rows cut across pieces kernel-tested | ✅ M50 | 🟡 VK | 🟡 VK | 🟡 XLA | 🟡 host sim |
-| Weight streaming: PLE rows | ✅ M35/M36/M41 | ✅ M43 golden_rows | ✅ M50 | 🔴 VK | 🔴 VK | 🟡 XLA | — weights on host |
-| Weight streaming: experts | 🟡 dense bf16 M40; quantized next | ✅ dense M47; quantized after CUDA | ✅ dense M50; quantized next | 🔴 VK | 🔴 VK | 🟡 XLA | — weights on host |
-| Host/disk tiers of shared shapes (copy_slots) | ✅ engine probe M43 · 🟡 e2e | ✅ golden_offload 8/8 (MI300X) | ✅ M50 offload probe | 🔴 VK | 🔴 VK | 🔴 XLA | 🟡 CB (host sim) |
+| rs list + slot_copies | ✅ M34 | ✅ golden_buffered (MI300X) | ✅ M37 | ✅ M53 (rs tail fork, engine) | ✅ M53 | 🟡 XLA | 🟡 M43 (host sim) |
+| Window lists (own T_w, trimmed) | ✅ tables per list M51 (T_w = page; 2-window untested) | ✅ goldens (one list) | ✅ up to 4 lists M50 | ✅ up to 4 lists, own T_w M53 | ✅ M53 | 🟡 XLA | 🟡 one list, T_w=page |
+| Multi-piece records end to end | ✅ engine (L40S) · ✅ runtime boot (IT r5, 18 pieces) | ✅ records in pieces (chunk goldens); rows cut across pieces kernel-tested | ✅ M50 | ✅ M48 (4 pieces bitwise) | ✅ M48 | 🟡 XLA | 🟡 host sim |
+| Weight streaming: PLE rows | ✅ M35/M36/M41 | ✅ M43 golden_rows | ✅ M50 | ✅ M53 (rows, grouped tables) | ✅ M53 | 🟡 XLA | — weights on host |
+| Weight streaming: experts | 🟡 dense bf16 M40; quantized next | ✅ dense M47; quantized after CUDA | ✅ dense M50; quantized next | 🔴 VK3 | 🔴 VK3 | 🟡 XLA | — weights on host |
+| Host/disk tiers of shared shapes (copy_slots) | ✅ engine probe M43 · ✅ e2e M52 | ✅ golden_offload 8/8 (MI300X) | ✅ M50 offload probe | ✅ M53 offload (dense, hybrid, window) | ✅ M53 | 🔴 XLA | 🟡 CB (host sim) |
+| Snapshots (rs_snapshots) | ✅ | ✅ | ✅ | 🔴 not served (rs_snapshots 0) VK3 | 🔴 VK3 | 🔴 XLA | — |
 | K2 (no kv spaces) | ✅ M39 | ✅ | ✅ M42 | compile | compile | compile | compile |
 
 Cerebras realization (CB, `sc/cb-chunk-pool`): the column is the host-traced `Cerebras` engine. State lives in
@@ -41,6 +42,34 @@ shape would stop the runtime seating state for the wafer's hybrid builds; (3) on
 replayed tokens, not pages; (4) the unmerged `cerebras-model-support` branch (the Spatial owner's) rewrites
 `spatial/engine/{fire,mod,posted}.rs`, `paged.rs` and `wafer.rs` (+1149 / -62). Follow-up for that owner after
 its merge: the kv-only shared pool of (1) for batched paged builds.
+
+Vulkan / wgpu (VK2, `sc/vk2`): window lists are lists of their own (up to four, each its T_w <= the kv page and
+its own page table; trimmed slots ref 0 = the null chunk), verified bitwise trimmed vs untrimmed with scattered and
+evacuated slots on gemma4-e4b-mini-l1 / -l6 and a two-window variant. Snapshots per piece (contract 16): not served
+on either engine and never sent to them: both state `rs_snapshots = 0`, so the runtime cuts a pass at each
+checkpoint (state lands at fire ends) and `Lane::validate_for` refuses snapshot lanes. On-device tests (`tests/*/tiers.rs`,
+both engines): a lane parked on the host and back at decode 2 and its kv list through the slot file at decode 6 lands
+the never-parked logits bit for bit (qwen3-micro-text, qwen35-tiny, gemma4-e4b-mini-l6 with a trimmed window list);
+contract 15 (a group `[run, cow]`, the folding lane writing the copy, the buffering lane reading the run, the run
+untouched) = two ungrouped lanes bit for bit; a fork's rs-list and window-list tail slot copied by `slot_copies`
+lands its parent's row bit for bit. Each has a negative control that fails (restore skipped, cow unfilled, tail
+not copied).
+
+Vulkan / wgpu weight cache (VK2): row tables only. The tables a plain token-id gather alone reads (PLE) stay on
+the host (the mapped artifact) and are stated as `WeightKind::Rows` shapes (ids from 8; tables the recipe groups
+share an atom, a token id's row of each, so gemma4-e4b's per-layer tables are one shape, unlike CUDA's one table a
+shape). `weight_residency` fills newly named slots from the host in batched uploads (one copy of merged regions a
+segment), rewrites a u32 block -> pool-unit table; evacuation rewrites it. `gather_embed_tabled` (Slang, SPIR-V and
+WGSL) reads a resident block from the pool and a block not resident from rows staged for that fire: the engine
+flushes the frame, reads the ids back, copies the missing rows from the host into a host-visible stage both
+backends can bind (wgpu: through the queue). Uses: one atomic a row read into a per-block counter (the group's
+first table), `weight_uses` reads and zeroes them and reports `WeightUses.held`. Held fast path: with every block
+resident no fire flushes or stages, and on Vulkan fires record again (a residency not wholly resident refuses
+recording). Seat-addressed fires are refused while a weight slot lies in the seats' chunks (M41). Verified: a
+gather copies, so all-resident (held, after an evacuation of every weight chunk), none resident and every other
+block resident land the same bits, and all-resident = the build before the cache bit for bit (gemma4-e4b-mini-l1,
+both engines; -l6 grouped tables within the build). Routed experts (expert table) not built on these engines yet:
+the engines' own expert tier (`device_weight_budget`, pump, gathered seats) still serves MoE banks.
 
 Pre-existing parity gaps (not memory, but in scope for parity): ROCm synth codegen, ROCm graph replay with >= 2 MoE layers (AMD d); (concat_cols, FP8 m33 fixed M43);
 sm_100 tcgen05 W4A16 arms read no expert table; Metal MLA prefill unsupported.

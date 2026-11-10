@@ -104,6 +104,10 @@ pub struct Weights {
     banks: BTreeMap<String, Bank>,
 
     decoded: Vec<Buffer>,
+
+    /// The host bytes of the tables the weight cache streams by their rows
+    /// (the runtime's to place, not this load's own tier).
+    row_bytes: u64,
 }
 
 impl Weights {
@@ -117,6 +121,7 @@ impl Weights {
         device_cap: u64,
         residency: Residency,
         max_tokens: u32,
+        streamed: &[usize],
     ) -> Result<Weights> {
         readable_plane_orders(trace)?;
 
@@ -158,7 +163,7 @@ impl Weights {
             .iter()
             .map(|param| param.source != ParamSource::Checkpoint)
             .collect();
-        let layout = plan.tiers(&reserved, &planes, &pinned, device_cap, residency)?;
+        let layout = plan.tiers(&reserved, &planes, &pinned, streamed, device_cap, residency)?;
         let places = places(trace, &layout)?;
 
         let spans = |tier: Tier| -> Vec<(u64, u64)> {
@@ -324,6 +329,7 @@ impl Weights {
             table: WeightTable(weight_table),
             banks: banks(trace, &places),
             decoded: Vec::new(),
+            row_bytes: streamed.iter().map(|&at| reserved[at]).sum(),
         })
     }
 
@@ -420,8 +426,10 @@ impl Weights {
     }
 
     #[must_use]
+    /// Whether this load streams weights by a tier of its own: planes on
+    /// the host besides the weight cache's row tables, or spilled.
     pub fn streams(&self) -> bool {
-        self.layout.streams()
+        self.layout.tiers.spilled > 0 || self.layout.tiers.host > self.row_bytes
     }
 
     #[must_use]
@@ -559,6 +567,24 @@ impl Weights {
     #[must_use]
     pub fn host(&self) -> Option<&HostTier> {
         self.host.as_ref()
+    }
+
+    /// The host planes of the tables `rows` streams, by param.
+    #[must_use]
+    pub fn row_planes(&self, rows: &crate::store::rows::RowCaches) -> BTreeMap<usize, &HostPlane> {
+        let Some(host) = self.host.as_ref() else {
+            return BTreeMap::new();
+        };
+        self.table
+            .0
+            .iter()
+            .enumerate()
+            .filter(|(at, _)| rows.streams(*at))
+            .filter_map(|(at, row)| match row {
+                Some(WeightRow::Dense(plane)) => host.plane(plane.buf).map(|p| (at, p)),
+                _ => None,
+            })
+            .collect()
     }
 }
 

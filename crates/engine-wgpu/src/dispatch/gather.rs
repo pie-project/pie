@@ -113,6 +113,16 @@ impl Run<'_> {
                     *vocab,
                     self.tensor(*y),
                 ),
+                // A table the weight cache streams by its rows.
+                None if let Some(rows) = self.row_table(*table, self.tensor(*ids))? => {
+                    kernels_slang::gather::embed::embed_tabled(
+                        self.ctx,
+                        self.tensor(*ids),
+                        &rows,
+                        *vocab,
+                        self.tensor(*y),
+                    )
+                }
                 None => kernels_slang::gather::embed::embed(
                     self.ctx,
                     self.tensor(*ids),

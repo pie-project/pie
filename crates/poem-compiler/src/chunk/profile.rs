@@ -38,9 +38,11 @@ pub struct ChunkProfile {
     /// Whether the backend keeps every state row in f32 whatever the trace
     /// declares (integer rows apart): Metal's recurrent kernels do.
     pub state_f32: bool,
-    /// The tokens a slot of the kv list and of each window list holds, where
-    /// the backend's kernels page their rows by a count of their own; `None`
-    /// lets the plan choose ([`super::MIN_RUN`]).
+    /// The tokens a slot of the kv list holds, where the backend's kernels
+    /// page their rows by a count of their own (and a slot of each window
+    /// list too where `one_window` holds; else a window list still picks
+    /// its own `T_w` no larger); `None` lets the plan choose
+    /// ([`super::MIN_RUN`]).
     pub token_slot: Option<u32>,
     /// Whether every windowed row shares one window list, of the widest
     /// window: a backend that pages its windowed rows by one table (a row of

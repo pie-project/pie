@@ -15,6 +15,10 @@
 //!   row at `unit * gcd(chunk, slot) + offset` ([`kernels_slang::ssm::StatePool`]).
 //! - [`RS`]: the rs list (CONTRACT-BC 18, 20): `rs_tokens` unfolded rows of
 //!   every recurrent layer's rs planes a slot.
+//! - [`window_shape`]`(k)`: window list `k` (CONTRACT-BC 19, 21), narrowest
+//!   window first: `T_w` tokens of every row of that window a slot,
+//!   layer-major, a page table of its own; a slot trimmed behind the window
+//!   is ref 0 (the null chunk), which the window kernels never read.
 //!
 //! A lane the runtime does not address by slot refs (a direct
 //! [`crate::Shell::fire`]) is *seat-addressed*: seat `s` takes the list slots
@@ -30,8 +34,27 @@ use crate::error::{Fault, Result};
 
 pub const LIST: ShapeId = ShapeId(0);
 pub const FIXED: ShapeId = ShapeId(1);
+/// The first (narrowest) window list.
 pub const WINDOW: ShapeId = ShapeId(2);
 pub const RS: ShapeId = ShapeId(3);
+
+/// The most window lists a load holds (`ChunkFacts::validate`'s bound).
+pub const WINDOWS: usize = 4;
+
+/// Window list `k`'s shape: [`WINDOW`], then 4, 5, 6.
+#[must_use]
+pub fn window_shape(k: usize) -> ShapeId {
+    match k {
+        0 => WINDOW,
+        k => ShapeId(3 + u32::try_from(k).unwrap_or(u32::MAX)),
+    }
+}
+
+/// Which window list shape `id` is, if one.
+#[must_use]
+pub fn window_of(id: ShapeId) -> Option<usize> {
+    (0..WINDOWS).find(|&k| window_shape(k) == id)
+}
 
 /// The chunk a Vulkan recipe aims at.
 pub const TARGET_CHUNK: u64 = 4 << 20;
@@ -89,6 +112,15 @@ impl Slots {
     }
 }
 
+/// A window list's place: its slots, the rows its window retains and the
+/// tokens (`T_w`) a slot holds.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct WindowList {
+    pub slots: Slots,
+    pub window: u32,
+    pub tokens: u32,
+}
+
 /// The pool's chunk size, its shapes and its extent.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Layout {
@@ -101,13 +133,10 @@ pub struct Layout {
     pub pieces: u32,
     pub list: Option<Slots>,
     pub fixed: Option<Slots>,
-    /// The window list (CONTRACT-BC 19, 21): `window_tokens` (`T_w`) tokens
-    /// a slot of the windowed rows, a table in its own token order a lane,
-    /// read through `window_rows`; slots trimmed behind the window are the
-    /// null chunk.
-    pub window: Option<Slots>,
-    pub window_rows: u32,
-    pub window_tokens: u32,
+    /// The window lists (CONTRACT-BC 19, 21), narrowest window first, list
+    /// `k` shape [`window_shape`]`(k)`: a table in its own token order a
+    /// lane; slots trimmed behind the window are the null chunk.
+    pub windows: [Option<WindowList>; WINDOWS],
     /// The rs list (CONTRACT-BC 18, 20): `rs_tokens` unfolded rows of every
     /// recurrent layer's rs planes a slot.
     pub rs: Option<Slots>,
@@ -139,9 +168,7 @@ impl Layout {
             pieces: pieces.max(1),
             list: Slots::of(LIST, list, chunk_bytes),
             fixed: Slots::of(FIXED, fixed, chunk_bytes),
-            window: None,
-            window_rows: 0,
-            window_tokens: 0,
+            windows: [None; WINDOWS],
             rs: None,
             rs_tokens: 0,
             seats,
@@ -168,33 +195,48 @@ impl Layout {
         Ok(layout)
     }
 
-    /// This layout with a window list of `bytes` slots of `tokens` rows,
-    /// read through `rows` rows; its seat run, `pages_per_seat` slots a
-    /// seat, after the others.
+    /// This layout with window list `k` of `bytes` slots of `tokens` rows,
+    /// retaining `window` rows; its seat run, `pages_per_seat` slots a seat,
+    /// after the others.
     pub fn with_window(
         mut self,
+        k: usize,
         bytes: u64,
-        rows: u32,
+        window: u32,
         tokens: u32,
         pages_per_seat: u32,
     ) -> Result<Layout> {
-        let Some(mut window) = Slots::of(WINDOW, bytes, self.chunk_bytes) else {
+        if k >= WINDOWS {
+            return Err(Fault::Ceiling {
+                what: "window lists of a load",
+                need: k as u64 + 1,
+                have: WINDOWS as u64,
+            });
+        }
+        let Some(mut slots) = Slots::of(window_shape(k), bytes, self.chunk_bytes) else {
             return Ok(self);
         };
-        if window.per_chunk == 0 {
+        if slots.per_chunk == 0 {
             return Err(Fault::Ceiling {
                 what: "bytes of a pool chunk",
                 need: bytes,
                 have: self.chunk_bytes,
             });
         }
-        let seats = self.seats;
-        window.seat_chunk = 1 + self.seat_chunks();
-        window.seat_slots = seats.saturating_mul(pages_per_seat);
-        self.window = Some(window);
-        self.window_rows = rows;
-        self.window_tokens = tokens;
+        slots.seat_chunk = 1 + self.seat_chunks();
+        slots.seat_slots = self.seats.saturating_mul(pages_per_seat);
+        self.windows[k] = Some(WindowList {
+            slots,
+            window,
+            tokens,
+        });
         Ok(self)
+    }
+
+    /// Window list `k`, where the load holds one.
+    #[must_use]
+    pub fn window(&self, k: usize) -> Option<&WindowList> {
+        self.windows.get(k).and_then(Option::as_ref)
     }
 
     /// This layout with an rs list of `bytes` slots of `tokens` rows; its
@@ -221,7 +263,7 @@ impl Layout {
         self.list
             .iter()
             .chain(&self.fixed)
-            .chain(&self.window)
+            .chain(self.windows.iter().flatten().map(|w| &w.slots))
             .chain(&self.rs)
     }
 
@@ -265,7 +307,7 @@ impl Layout {
         &self,
         growth: Growth,
         committed: u32,
-        rows: &[Vec<u32>; 2],
+        rows: &[Vec<u32>],
         [host_chunks, disk_chunks]: [u32; 2],
     ) -> ChunkFacts {
         let segments = self.total_chunks.div_ceil(self.segment_chunks.max(1));
@@ -288,21 +330,23 @@ impl Layout {
                     rate: 1,
                     window: None,
                 },
-                &rows[0],
+                rows.first().unwrap_or(&Vec::new()),
             ));
         }
-        // The window list: a list of its own slot with its window
+        // The window lists: lists of their own slot with their window
         // (CONTRACT-BC 19, 21).
-        if let Some(window) = &self.window {
-            shapes.push(shape(
-                window,
-                SlotKind::List {
-                    tokens: self.window_tokens,
-                    rate: 1,
-                    window: Some(self.window_rows),
-                },
-                &Vec::new(),
-            ));
+        for (k, list) in self.windows.iter().enumerate() {
+            if let Some(list) = list {
+                shapes.push(shape(
+                    &list.slots,
+                    SlotKind::List {
+                        tokens: list.tokens,
+                        rate: 1,
+                        window: Some(list.window),
+                    },
+                    rows.get(2 + k).unwrap_or(&Vec::new()),
+                ));
+            }
         }
         if let Some(rs) = &self.rs {
             shapes.push(SlotShape {
@@ -324,7 +368,7 @@ impl Layout {
                 SlotKind::Fixed {
                     pieces: self.pieces,
                 },
-                &rows[1],
+                rows.get(1).unwrap_or(&Vec::new()),
             ));
         }
         ChunkFacts {
@@ -383,7 +427,7 @@ mod tests {
         assert_eq!(list.seat_ref(9).unwrap(), list.per_chunk + 9);
         assert!(list.seat_ref(32).is_err());
         assert_eq!(layout.seat_chunks(), 4);
-        let facts = layout.facts(Growth::Bottom, 1, &Default::default(), [0, 0]);
+        let facts = layout.facts(Growth::Bottom, 1, &[], [0, 0]);
         facts.validate().unwrap();
         assert_eq!(facts.state_chunks(), 99);
         assert_eq!(facts.segments.committed, 1);
@@ -392,9 +436,54 @@ mod tests {
             facts.shape(FIXED).unwrap().kind,
             SlotKind::Fixed { pieces: 2 }
         );
-        let flat = layout.facts(Growth::Fixed, 0, &Default::default(), [0, 0]);
+        let flat = layout.facts(Growth::Fixed, 0, &[], [0, 0]);
         flat.validate().unwrap();
         assert_eq!(flat.segments.committed, flat.segments.max);
+    }
+
+    #[test]
+    fn each_window_takes_a_list_of_its_own_and_a_seat_run_past_the_others() {
+        let chunk = 1 << 20;
+        let layout = Layout::new(
+            chunk,
+            100,
+            crate::store::pool::segment_chunks(chunk, 100, 1 << 30),
+            32,
+            [64 << 10, 0],
+            1,
+            2,
+            8,
+        )
+        .unwrap()
+        .with_window(0, 16 << 10, 256, 16, 16)
+        .unwrap()
+        .with_window(1, 32 << 10, 512, 32, 8)
+        .unwrap();
+        let narrow = layout.window(0).unwrap();
+        let wide = layout.window(1).unwrap();
+        assert_eq!((narrow.slots.id, wide.slots.id), (WINDOW, ShapeId(4)));
+        assert_eq!(window_of(ShapeId(4)), Some(1));
+        assert_eq!(window_of(RS), None);
+        // The list's 16 seat pages fill one chunk; each window's run after.
+        assert_eq!(narrow.slots.seat_chunk, 2);
+        assert_eq!(narrow.slots.seat_slots, 32);
+        assert_eq!(wide.slots.seat_chunk, 3);
+        let facts = layout.facts(Growth::Bottom, 1, &[], [0, 0]);
+        facts.validate().unwrap();
+        let windows: Vec<_> = facts
+            .shapes
+            .iter()
+            .filter_map(|s| match s.kind {
+                SlotKind::List {
+                    tokens,
+                    window: Some(w),
+                    ..
+                } => Some((s.id, tokens, w)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(windows, [(WINDOW, 16, 256), (ShapeId(4), 32, 512)]);
+        assert!(layout.with_window(WINDOWS, 16 << 10, 1024, 16, 16).is_err());
     }
 
     #[test]

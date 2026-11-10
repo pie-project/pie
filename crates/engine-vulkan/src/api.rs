@@ -441,6 +441,9 @@ impl Engine for Vulkan {
             media_encode: false,
             device_channel_commit: false,
             rs_verbs: shell.serves_rs_verbs(),
+            // No state lands inside a fire: the runtime cuts a pass at each
+            // checkpoint and never sends `Lane::rs_snapshots` (`validate_for`
+            // refuses them), so snapshots per piece (CONTRACT-BC 16) are moot.
             rs_snapshots: 0,
             bidirectional_attention: false,
             adapter_attachments: false,
@@ -483,6 +486,16 @@ impl Engine for Vulkan {
 
     fn copy_slots(&mut self, copy: &engine::chunk::SlotCopy) -> EngineResult<()> {
         self.loaded_mut()?.copy_slots(copy).map_err(fault)
+    }
+
+    fn weight_residency(&mut self, residency: &engine::chunk::WeightResidency) -> EngineResult<()> {
+        self.loaded_mut()?
+            .weight_residency(residency)
+            .map_err(fault)
+    }
+
+    fn weight_uses(&mut self) -> EngineResult<engine::chunk::WeightUses> {
+        self.loaded_mut()?.weight_uses().map_err(fault)
     }
 
     fn submit(&mut self, frame: &FrameSubmission) -> EngineResult<FrameTicket> {
@@ -1164,6 +1177,7 @@ impl Vulkan {
                 rs_reset: lane.rs_reset,
                 rs_slot: lane.rs_slot,
                 refs: true,
+                windows: &lane.tables,
                 record: record_of[at].as_deref(),
                 record_run: run_of[at].as_deref(),
 
