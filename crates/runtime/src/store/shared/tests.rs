@@ -1638,3 +1638,117 @@ fn the_room_left_for_kv_takes_out_what_the_weights_pin() {
         assert_eq!(room.list_tokens, 16);
     }
 }
+
+/// [`metal_like_facts`] with a weight shape of `count` 2 MiB atoms, one a
+/// chunk, a floor of 4, seated by the load from slot ref `seated`.
+fn metal_weights(count: u32, seated: Option<u32>) -> ChunkFacts {
+    let mut facts = metal_like_facts();
+    facts.weights = vec![WeightShape {
+        id: EngineShape(9),
+        kind: WeightKind::Expert,
+        slot_bytes: 2 * MIB,
+        slots_per_chunk: 1,
+        count,
+        floor_slots: 4,
+        name: "layers.moe.experts".into(),
+        seated,
+    }];
+    facts.validate().unwrap();
+    facts
+}
+
+fn boot_metal(
+    engine: usize,
+    mode: crate::store::weights::WeightStreaming,
+    facts: &ChunkFacts,
+) -> (
+    SharedPool,
+    anyhow::Result<crate::store::weights::WeightCache>,
+) {
+    crate::store::weights::set_streaming(engine, mode.streams(true));
+    let mut shared = SharedPool::new(facts, 1, 4096).unwrap();
+    let first = shared.weights_first();
+    let cache =
+        crate::store::weights::boot_cache(engine, mode, &facts.weights, first, shared.pool_mut());
+    (shared, cache)
+}
+
+/// A pool that grows from the bottom commits one segment (32 chunks) at
+/// load. Held weights of 100 chunks fit what it can grow to: the fit check
+/// counted the committed segment alone, so `off` refused them and `auto`
+/// streamed. They now fit, and the segments they take are committed as a
+/// prefix, for the engine to back before it is told the residency.
+#[test]
+fn held_weights_fit_what_a_bottom_grown_pool_can_grow_to_and_commit_their_segments() {
+    use crate::store::weights::WeightStreaming;
+    for (engine, mode) in [
+        (9_101, WeightStreaming::Off),
+        (9_102, WeightStreaming::Auto),
+    ] {
+        let facts = metal_weights(100, None);
+        let (shared, cache) = boot_metal(engine, mode, &facts);
+        let pool = shared.pool();
+        let mut cache = cache.unwrap_or_else(|error| panic!("{mode:?}: {error}"));
+        assert!(!cache.streaming(), "{mode:?}: held, not streamed");
+        assert!(!crate::store::weights::streaming(engine));
+        // 1 null + 100 atoms (no staging held) = 101 chunks: segments 0..4.
+        assert_eq!(cache.take_backing(), Some(4), "{mode:?}");
+        assert_eq!(cache.take_backing(), None, "taken once");
+        assert_eq!(pool.prefix_segments(), 4);
+        assert_eq!(pool.state_chunks(), 100);
+        assert_eq!(pool.free_chunks(), 128 - 101, "the rest of segment 3");
+        assert_eq!(pool.growable_chunks(), 1024 - 101);
+        let residency = cache.residency(pool);
+        assert!(residency.held && residency.staging.is_empty());
+        assert_eq!(residency.resident.len(), 100);
+        assert!(
+            residency
+                .resident
+                .iter()
+                .all(|r| r.slot >= 1 && r.slot < 128),
+            "every atom in the committed prefix"
+        );
+    }
+}
+
+/// Seated by the load past the committed segment: the prefix through the
+/// seated range is committed before the claim.
+#[test]
+fn a_seated_held_shape_past_the_committed_segment_commits_through_its_range() {
+    use crate::store::weights::WeightStreaming;
+    let facts = metal_weights(70, Some(1));
+    let (shared, cache) = boot_metal(9_103, WeightStreaming::Off, &facts);
+    let mut cache = cache.unwrap();
+    // Chunks 1..71: segments 0..3.
+    assert_eq!(cache.take_backing(), Some(3));
+    let residency = cache.residency(shared.pool());
+    assert!(
+        residency.resident.iter().all(|r| r.slot == r.atom.atom + 1),
+        "named where the load seated them"
+    );
+}
+
+/// What the whole pool cannot hold still fails `off` (naming what the pool
+/// can grow to) and streams under `auto`, whose floor fits the committed
+/// segment: nothing to back.
+#[test]
+fn weights_past_what_the_pool_can_grow_to_fail_off_and_stream_under_auto() {
+    use crate::store::weights::WeightStreaming;
+    let facts = metal_weights(2000, None);
+    let (_, cache) = boot_metal(9_104, WeightStreaming::Off, &facts);
+    let error = cache.unwrap_err().to_string();
+    assert!(error.contains("do not fit"), "{error}");
+    assert!(
+        error.contains(&format!("{} bytes free", 1023 * 2 * MIB)),
+        "what it can grow to, not the committed segment: {error}"
+    );
+    let (shared, cache) = boot_metal(9_105, WeightStreaming::Auto, &facts);
+    let mut cache = cache.unwrap();
+    assert!(cache.streaming());
+    assert_eq!(
+        cache.take_backing(),
+        None,
+        "the floor fits the committed segment"
+    );
+    assert_eq!(shared.pool().prefix_segments(), 1);
+}

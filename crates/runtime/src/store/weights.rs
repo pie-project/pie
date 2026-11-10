@@ -133,9 +133,11 @@ pub fn boot_cache(
     };
     let floor: u64 = weights.iter().map(WeightShape::floor_bytes).sum();
     let all: u64 = weights.iter().map(WeightShape::all_bytes).sum();
-    let free = u64::from(pool.free_chunks()) * pool.chunk_bytes();
+    // What the pool can grow to, not what the load committed: the weights
+    // commit the segments they take (`WeightCache::new`).
+    let free = u64::from(pool.growable_chunks()) * pool.chunk_bytes();
     let mut streams = streaming(engine);
-    if !streams && !pool.fits(&needs(true)) {
+    if !streams && !pool.fits_grown(&needs(true)) {
         anyhow::ensure!(
             mode != WeightStreaming::Off,
             "weight_streaming = \"off\": engine {engine}'s weights do not fit its pool: \
@@ -143,7 +145,7 @@ pub fn boot_cache(
              bytes free ({} chunks of {} bytes); set weight_streaming = \"auto\" or \"on\" \
              to stream them",
             weights.len(),
-            pool.free_chunks(),
+            pool.growable_chunks(),
             pool.chunk_bytes(),
         );
         tracing::info!(
@@ -157,11 +159,11 @@ pub fn boot_cache(
         streams = true;
     }
     anyhow::ensure!(
-        pool.fits(&needs(!streams)),
+        pool.fits_grown(&needs(!streams)),
         "engine {engine}'s pool cannot seat the weight staging: it needs {floor} bytes \
          over {} shapes, the pool has {free} bytes free ({} chunks of {} bytes)",
         weights.len(),
-        pool.free_chunks(),
+        pool.growable_chunks(),
         pool.chunk_bytes(),
     );
     WeightCache::new(weights, first, streams, pool)
@@ -306,6 +308,10 @@ pub struct WeightCache {
     ticks: u32,
     record: HashMap<WeightAtom, Seen>,
     changed: bool,
+    /// The committed prefix the engine must back before the weights land:
+    /// the segments [`Self::new`] committed past what the load committed,
+    /// taken by the load ([`Self::take_backing`]).
+    backing: Option<u32>,
 }
 
 impl WeightCache {
@@ -332,6 +338,39 @@ impl WeightCache {
     ) -> Result<Self, SeatError> {
         let shape_of =
             |at: usize| first + ShapeId::try_from(at).expect("weight shapes fit a shape id");
+        // The pool may hold only part of its segments committed at load
+        // (one, on an engine that grows from the bottom): commit, as a
+        // prefix, what the weights take before claiming it. Held, every
+        // seated range and every other shape's atoms; streaming, the floor
+        // (seated atoms are kept as cache only where room stands).
+        let needs: Vec<(ShapeId, u64)> = weights
+            .iter()
+            .enumerate()
+            .map(|(at, facts)| {
+                let slots = match (streaming, facts.seated) {
+                    (true, _) => facts.floor_slots,
+                    (false, Some(_)) => 0,
+                    (false, None) => facts.count,
+                };
+                (shape_of(at), u64::from(slots))
+            })
+            .collect();
+        let through = if streaming {
+            0
+        } else {
+            weights
+                .iter()
+                .filter_map(|facts| {
+                    let spc = facts.slots_per_chunk.max(1);
+                    facts
+                        .seated
+                        .map(|seated| seated / spc + facts.count.div_ceil(spc))
+                })
+                .max()
+                .unwrap_or(0)
+        };
+        let backing =
+            (!pool.commit_for(&needs, through).is_empty()).then(|| pool.prefix_segments());
         // What the load seated itself is adopted where it lies, before any
         // slot is taken lowest first: nothing else may land in its chunks.
         // Held, every seated chunk must be free to claim, checked for all
@@ -366,7 +405,7 @@ impl WeightCache {
                 vec![(0, facts.count)]
             };
             for (from, n) in atoms {
-                if streaming && u64::from(pool.free_chunks()) <= floor_chunks {
+                if streaming && u64::from(pool.growable_chunks()) <= floor_chunks {
                     break;
                 }
                 let holder = Holder::Weights {
@@ -412,7 +451,15 @@ impl WeightCache {
             ticks: 0,
             record: HashMap::new(),
             changed: true,
+            backing,
         })
+    }
+
+    /// The committed prefix the engine must back before it is told the
+    /// residency (`commit_segments`), once: `None` where the load's own
+    /// commit held the weights.
+    pub fn take_backing(&mut self) -> Option<u32> {
+        self.backing.take()
     }
 
     #[must_use]
@@ -700,6 +747,11 @@ impl<P: PoolTarget + SlotAccess, W: WeightPort> WeightFirst<P, W> {
 
     pub const fn cache(&self) -> &WeightCache {
         &self.cache
+    }
+
+    /// See [`WeightCache::take_backing`].
+    pub fn take_backing(&mut self) -> Option<u32> {
+        self.cache.take_backing()
     }
 
     pub const fn port(&self) -> &W {

@@ -793,6 +793,77 @@ impl SlotPool {
         chunks <= room
     }
 
+    /// Free chunks a shape could open once every segment below the
+    /// activation the facts allow were committed: what the pool can grow
+    /// to, short of the reserved chunks, the activation and what is held.
+    pub fn growable_chunks(&self) -> u32 {
+        let free = (0..self.state_limit())
+            .filter(|&chunk| {
+                self.free.get(chunk)
+                    && !self.fenced.get(chunk)
+                    && !matches!(
+                        self.segments.state(self.segments.of(chunk)),
+                        SegmentState::Draining { .. }
+                    )
+            })
+            .count() as u32;
+        free.min(
+            self.total
+                .saturating_sub(self.reserved + self.held + self.act),
+        )
+    }
+
+    /// [`Self::fits`] against what the pool can grow to
+    /// ([`Self::growable_chunks`]), committed or not.
+    pub fn fits_grown(&self, needs: &[(ShapeId, u64)]) -> bool {
+        self.chunks_for(needs)
+            .is_some_and(|chunks| chunks <= u64::from(self.growable_chunks()))
+    }
+
+    fn chunks_for(&self, needs: &[(ShapeId, u64)]) -> Option<u64> {
+        let mut chunks = 0u64;
+        for &(shape, slots) in needs {
+            let Some(state) = self.shapes.get(shape as usize) else {
+                if slots == 0 {
+                    continue;
+                }
+                return None;
+            };
+            chunks += slots
+                .saturating_sub(state.partial_free)
+                .div_ceil(u64::from(state.spc()));
+        }
+        Some(chunks)
+    }
+
+    /// Commits the lowest uncommitted segments below the activation, a
+    /// prefix, until `needs` fit the committed chunks and every chunk below
+    /// physical chunk `through` lies in a committed segment. The segments
+    /// committed, lowest first: the engine backs them (`commit_segments`
+    /// of the prefix they end) before anything lands in them. Stops short
+    /// where no segment is left; the take that follows says so.
+    pub fn commit_for(&mut self, needs: &[(ShapeId, u64)], through: u32) -> Vec<u32> {
+        let mut committed = Vec::new();
+        loop {
+            let covered = (0..through.min(self.total)).all(|chunk| {
+                self.segments.state(self.segments.of(chunk)) != SegmentState::Uncommitted
+            });
+            if covered && self.fits(needs) {
+                return committed;
+            }
+            let Some(segment) = self
+                .segments
+                .uncommitted()
+                .find(|&segment| segment < self.top_segment)
+            else {
+                return committed;
+            };
+            self.commit_segment(segment)
+                .expect("an uncommitted segment commits");
+            committed.push(segment);
+        }
+    }
+
     pub fn shape_demand(&self, shape: ShapeId) -> ShapeDemand {
         self.shapes
             .get(shape as usize)

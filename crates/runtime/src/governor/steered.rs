@@ -51,6 +51,11 @@ impl EnginePool {
         }
     }
 
+    #[must_use]
+    pub const fn engine(&self) -> usize {
+        self.engine
+    }
+
     /// Whether the engine runs on a shared pool.
     #[must_use]
     pub const fn is_shared(&self) -> bool {
@@ -176,6 +181,22 @@ impl Shared<Steered> {
     /// The engine refused it, or its lane closed first. An engine that does
     /// not stream (it answers unsupported) is no error.
     pub async fn boot(&self) -> anyhow::Result<()> {
+        // The segments the weights were committed into past the load's
+        // own: the engine backs them before it is told where the weights
+        // lie, so it fills backed memory.
+        let (engine, backing) = self.with(|pool| (pool.inner().engine(), pool.take_backing()));
+        if let Some(prefix) = backing {
+            crate::scheduler::pool(
+                engine,
+                crate::scheduler::worker::PoolOp::CommitSegments(prefix),
+            )
+            .await
+            .map_err(|error| {
+                anyhow::anyhow!(
+                    "the engine did not back the {prefix} segments its weights take: {error}"
+                )
+            })?;
+        }
         let queued = self.with(|pool| -> anyhow::Result<_> {
             pool.boot()?;
             Ok(pool.port_mut().take_queued())

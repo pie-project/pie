@@ -47,6 +47,14 @@ impl SharedGrow {
         }
     }
 
+    /// Holds the segments mapped now as the target: what the load
+    /// committed for the weights is not given back before the governor
+    /// first says otherwise.
+    pub fn hold_mapped(&self) {
+        let mapped = self.shared.lock().unwrap().mapped_segments();
+        self.target.fetch_max(mapped, Ordering::AcqRel);
+    }
+
     #[must_use]
     pub fn shared(&self) -> &Shared {
         &self.shared
