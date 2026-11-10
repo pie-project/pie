@@ -514,3 +514,13 @@ The `new-memory/` directory is bookkeeping and is removed before anything lands 
 - Grow -> evacuate -> release mid-decode identical: Qwen3.5 (40 WS, 3 segments, two releases, fork after shrink),
   gemma (90 WS, list + window list chunks moved).
 - golden_logits and golden_logits_by_refs byte-identical to GOLDEN-LOGITS-BASE; golden_submit_buffered = buffered.
+
+### M36 — 2026-11-10: RWW merged (weight residency at boot) + row stats
+- `sc/l40s-row-stats` (90af984b5): `WeightUses.held: Vec<WeightHeld { shape, resident, host }>`; CUDA fills it.
+- `sc/rww-weight-boot` (c249d150e): bootstrap sends each engine its starting residency on the scheduler lane and
+  waits for the answer before governors start / any fire; a streaming engine refusing it fails the load (unsupported
+  = fine). `store::weights::boot_cache` replaces "stay as loaded": off + doesn't fit -> load error with bytes needed
+  vs free; auto + doesn't fit -> stream at floor; floor doesn't fit -> load error in any mode. off pins every atom.
+- Verified: cargo check runtime/worker; store::weights 24, governor::steered 5. Not covered by a test: the
+  bootstrap wait through a real scheduler lane (IT to check with WeightUses.held host == 0 after boot).
+- Closes the M35 gaps 1-2; open: staging floor ignored (sync h2d), other embed variants resident, experts engine side.
