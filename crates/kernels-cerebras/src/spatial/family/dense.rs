@@ -11,6 +11,7 @@ use crate::spatial::block::segments::{Onorm, Scores};
 use crate::spatial::block::token_loop::TokenLoop;
 use crate::spatial::block::units::{UnitCopies, Units};
 use crate::spatial::family::{Family, Row, table, units_of};
+use crate::spatial::tiles::{Out, Params};
 use crate::spatial::floor::{UnitGrid, UnitLayout};
 use crate::spatial::kernels::dense;
 use crate::spatial::plan::{
@@ -280,6 +281,10 @@ impl Family for Dense {
 
     fn kernels(&self, prog: &Program) -> R<Kernels> {
         dense::kernels(prog)
+    }
+
+    fn stage(&self, plan: &Plan, params: &dyn Params, out: &Out) -> R<()> {
+        crate::spatial::tiles::dense::stage(plan, params, out)
     }
 
     fn symbols(&self) -> &'static [(&'static str, &'static str)] {

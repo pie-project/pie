@@ -8,6 +8,7 @@ use super::abi::Kernels;
 use super::block::Block;
 use super::plan::{FamilyId, LayerKind, Plan, Preset, Shape};
 use super::program::Program;
+use super::tiles::{Out, Params};
 
 pub mod gemma;
 pub mod gemma12;
@@ -40,6 +41,15 @@ pub trait Family: Send + Sync {
     /// Every name the kernels export, with its element type, in export order: the ABI between
     /// the kernels and the host's memcpy.
     fn symbols(&self) -> &'static [(&'static str, &'static str)];
+
+    /// Cuts the model's params into the tiles the plan's bindings place ([`super::tiles`]).
+    fn stage(&self, plan: &Plan, _params: &dyn Params, _out: &Out) -> R<()> {
+        Err(format!(
+            "the {} family has no tiler yet: stage its tiles with its Python prep and name them \
+             in [engine.debug] weights",
+            plan.family.name()
+        ))
+    }
 }
 
 /// A family by its id.

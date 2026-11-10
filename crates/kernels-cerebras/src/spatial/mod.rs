@@ -24,6 +24,7 @@ pub mod program;
 pub mod role;
 pub mod sources;
 pub mod target;
+pub mod tiles;
 pub mod toolchain;
 pub mod weights;
 pub mod wiring;
