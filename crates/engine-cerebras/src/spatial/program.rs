@@ -838,10 +838,6 @@ impl ProgramSpec {
             Sampler::Argmax => None,
         }
     }
-    /// Words of a virtual lane's VM control (`vmlane`).
-    pub fn vmlane_words(&self) -> usize {
-        self.vm_abi().map_or(2, |a| a.lane_words)
-    }
     pub fn layers(&self) -> usize {
         match self.layers {
             Layers::Strips { full, gw, gh, .. } => full * gw + (gh - full) * (gw - 1),

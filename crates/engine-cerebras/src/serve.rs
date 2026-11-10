@@ -207,14 +207,6 @@ pub(crate) struct Deferred {
     probed: Vec<ValueId>,
 }
 
-/// What one fire cost the host, for the bench.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub struct FireCost {
-    pub nodes: u32,
-    pub compiled: bool,
-    pub text_bytes: usize,
-}
-
 /// Fields drop in order: every buffer (weights, pools) goes before the
 /// device whose client made it.
 pub struct Shell {
@@ -253,7 +245,6 @@ pub struct Shell {
     /// program which of them its trailing outputs hold.
     probes: Vec<ValueId>,
     probed: std::collections::HashMap<[u8; 32], Vec<ValueId>>,
-    last: FireCost,
     /// Programs by the fire shape that traced them: a fire whose shape was
     /// seen skips the walk and runs what the first one compiled.
     traced: std::collections::HashMap<[u8; 32], std::sync::Arc<crate::device::Program>>,
@@ -349,53 +340,6 @@ pub(super) fn lane_rung(n: u32) -> u32 {
 }
 
 impl Shell {
-    /// Follows `unified` from here on: every whole-fire program traced
-    /// takes its kernels, kept slots, arena and table capacity, so the
-    /// classes share one program text and one resident server.
-    pub fn set_unified(&mut self, unified: Option<crate::fabric::Unified>) {
-        self.unified = unified;
-    }
-
-    /// The shape uniting the whole-fire programs among `texts` (what a dry
-    /// shell's `Device::dry_texts` kept of its fires): `None` when
-    /// none of them rendered table-driven.
-    pub fn unified_of_texts(texts: &[String]) -> Option<crate::fabric::Unified> {
-        let programs = Self::table_programs(texts);
-        if programs.is_empty() {
-            return None;
-        }
-        if programs.iter().all(|p| p.len() == 1) {
-            return Some(crate::fabric::Unified::union(
-                programs.iter().map(|p| &p[0]),
-            ));
-        }
-        crate::fabric::Unified::union_rows(&programs)
-    }
-
-    /// The partition of the fire into rows every class is to follow, from
-    /// the programs a dry shell traced (`Unified::partition`): a shell
-    /// traced again under it splits every class alike, and
-    /// `unified_of_texts` then unites the rows.
-    pub fn unified_partition(texts: &[String]) -> Option<crate::fabric::Unified> {
-        crate::fabric::Unified::partition(&Self::table_programs(texts))
-    }
-
-    /// Each whole-fire program's tables (its rows), from the texts.
-    fn table_programs(texts: &[String]) -> Vec<Vec<crate::fabric::Table>> {
-        texts
-            .iter()
-            .flat_map(|t| t.split(crate::trace::PHASE_SEPARATOR))
-            .filter_map(crate::trace::unrender)
-            .filter_map(|r| {
-                if !r.manifest.tables.is_empty() {
-                    Some(r.manifest.tables)
-                } else {
-                    r.manifest.table.map(|t| vec![t])
-                }
-            })
-            .collect()
-    }
-
     /// Loads with the voxel ladder derived from the plan (engine-cuda's
     /// defaults); [`Shell::load_with`] names one.
     pub fn load(boot: Boot<'_>) -> Result<Shell> {
@@ -726,7 +670,6 @@ impl Shell {
             token_feeds: Vec::new(),
             probes: Vec::new(),
             probed: std::collections::HashMap::new(),
-            last: FireCost::default(),
             traced: std::collections::HashMap::new(),
             shaped: std::collections::HashMap::new(),
             deferred: None,
@@ -764,13 +707,6 @@ impl Shell {
     #[must_use]
     pub fn readout_output(&self) -> Option<(String, u32)> {
         float_readout(&self.exports).map(|out| (out.decl.name.clone(), out.decl.width))
-    }
-
-    /// The width of the float output read at the readout rows, when the plan
-    /// reads one.
-    #[must_use]
-    pub fn readout_width(&self) -> Option<u32> {
-        float_readout(&self.exports).map(|out| out.decl.width)
     }
 
     /// The patch element the plan's image tower reads, if it has one.
@@ -829,11 +765,6 @@ impl Shell {
     #[must_use]
     pub fn held(&self, slot: u32) -> u32 {
         self.held.get(slot as usize).copied().unwrap_or(0)
-    }
-
-    #[must_use]
-    pub fn last_fire(&self) -> FireCost {
-        self.last
     }
 
     #[must_use]
