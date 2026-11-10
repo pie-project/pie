@@ -2194,7 +2194,14 @@ fn the_committed_mamba2_lands_the_state_after_the_commit() {
 #[test]
 fn the_fused_chunk_kernel_matches_the_xla_form() {
     // Lanes of 70 (two chunks), 0, 5, 1 and 130 rows, then 3 padded rows;
-    // then one lane of 300 rows (three 128-row chunks) and 20 padded rows.
+    // then one lane of 300 rows (three 128-row chunks) and 20 padded rows;
+    // then 39 decodes (lanes of one row) on both sides of a 300-row prompt,
+    // which step apart from its chunks, and 5 padded rows.
+    let mut beside = vec![0i32];
+    for l in 0..40 {
+        beside.push(beside[l] + if l == 20 { 300 } else { 1 });
+    }
+    let beside_slots: Vec<i32> = (0..40).map(|l| (l * 17 + 5) % 40).collect();
     for (g, indptr, rows, lane_slot, seed) in [
         (
             Gdn {
@@ -2219,6 +2226,18 @@ fn the_fused_chunk_kernel_matches_the_xla_form() {
             320usize,
             vec![1i32],
             36u64,
+        ),
+        (
+            Gdn {
+                hk: 16,
+                hv: 16,
+                dk: 128,
+                dv: 128,
+            },
+            beside,
+            344usize,
+            beside_slots,
+            37u64,
         ),
     ] {
         fused_against_xla(&g, &indptr, rows, &lane_slot, seed);
