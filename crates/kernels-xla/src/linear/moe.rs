@@ -2500,13 +2500,16 @@ pub fn experts(
         .ok_or_else(|| refuse(OP, "the sort carried no weights"))?;
     // The GLU and the weight in the gate-up kernel, its rows half as wide,
     // where an expert's tile holds 64 rows or more (at 16, a 64-lane decode
-    // of Qwen3.6-35B-A3B's cut: 323 -> 340 us; at 64, 256 lanes: 359 -> 337).
+    // of Qwen3.6-35B-A3B's cut: 323 -> 340 us; at 64, 256 lanes: 359 -> 337)
+    // and each half is whole lane tiles (Gemma-4-26B-A4B's 704: c64 3136 ->
+    // 3096 tok/s).
     let inside = crate::linear::moe_gmm::Gmm {
         glu: Some(glu),
         ..up
     };
     let hidden = if tuning.moe_gmm_glu
         && up.tm >= 64
+        && intermediate % 128 == 0
         && up.stepping()
         && up.orient == crate::linear::moe_gmm::Orient::NMajor
         && inside.kernel().is_ok()
