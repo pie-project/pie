@@ -221,3 +221,20 @@ The `new-memory/` directory is bookkeeping and is removed before anything lands 
 - Left: weights live in a separate slot pool until the pool switch (shedding does not yet free kv/state memory);
   nothing fills `ChunkFacts.weights` yet (needs WC1 + engines).
 - Verified: `cargo check` runtime + worker; `runtime --lib governor`.
+
+### M13 — 2026-11-10: WC1 merged (weights classified by their readers)
+- `sc/wc1-weight-streamability` (519f4e8a0, 3c46867ad, 611b89c5d, f30863656): `poem_ir::residency` classifies every
+  weight: expert-streamable (read only by MoeSelect / MoeBiasSum / fused Moe* selects; atom = expert on axis 0),
+  row-streamable (read only by token-id gathers Embed / EmbedScaleAdd*; atom = row), else resident; companion planes
+  follow their main plane. `ParamPlacement` is now derived when a trace finishes; `Weight::host`, the Starlark
+  binding and qwen_4's `.host()` are deleted. `ChunkRecipe.weights: Vec<WeightSlot>` (Expert slot = one expert of one
+  MoE layer across the banks its selects read; Rows slot = a token id's rows across tables gathered alike), floor
+  (top-k x 2 layers; rows = min(slots, max_tokens x ids/token)), Metal `cut_experts` cuts experts along each bank's
+  output axis into >= 1MiB pieces. Placement equivalence: inferred Host set == old hand marking in every deployment
+  (CUDA + Metal).
+- Decisions: untied input embeddings classify row-streamable and get weight slots (follows the reader rule; the
+  spec's "embedding stays resident" is narrowed to tied embeddings / heads). The Host placement still uses a narrow
+  rule ("hashed table read outside every layer") to reproduce today's marking; unify later.
+- Follow-ups: weight tail waste when C must hold a whole expert (dsv4-pro, minimax-m3 on Metal); `per_rank()` does
+  not cover weight slots yet; splits checked only against an earlier rule version.
+- Verified: `cargo check` poem, poem-compiler, engine-cuda, engine-metal, runtime; `poem-compiler --lib chunk`.
