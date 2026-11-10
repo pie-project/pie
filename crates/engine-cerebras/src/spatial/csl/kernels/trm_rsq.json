@@ -1,6 +1,0 @@
-[
- {
-  "old": "fn rsqrt(v: f32) f32 {\n  var y = @bitcast(f32, @as(u32, 0x5f3759df) - (@bitcast(u32, v) >> 1));\n  const h = 0.5 * v;\n  y = y * (1.5 - h * y * y);\n  y = y * (1.5 - h * y * y);\n  y = y * (1.5 - h * y * y);\n  return y;\n}\n",
-  "new": "fn rsqrt(v: f32) f32 {\n  // (trm 256) two Newton steps: relative error 4.6e-6 (the rms scales; 1/l = rsqrt^2, 9.2e-6)\n  var y = @bitcast(f32, @as(u32, 0x5f3759df) - (@bitcast(u32, v) >> 1));\n  const h = 0.5 * v;\n  y = y * (1.5 - h * y * y);\n  y = y * (1.5 - h * y * y);\n  return y;\n}\n"
- }
-]

@@ -1,6 +1,0 @@
-[
- {
-  "old": "fn x_ssq(dst: mem1d_dsd) void {\n  @fmuls(sqx_t(), x_all, x_all);\n  halve(@get_dsd(mem1d_dsd, .{ .tensor_access = |i|{B * Hc} -> s[i] }), Hc, B, false);\n  @fmovs(dst, sqx_b);\n}\n",
-  "new": "fn x_ssq(dst: mem1d_dsd) void {\n  // (trm 2) B 1: a scalar loop (simulator 142 cycles against the tree's 271; a stride-0\n  // accumulate is wrong on hardware, 0530)\n  var ss: f32 = 0.0;\n  var h: u16 = 0;\n  while (h < Hc) : (h += 1) { ss += x[h] * x[h]; }\n  @fmovs(dst, ss);\n}\n"
- }
-]

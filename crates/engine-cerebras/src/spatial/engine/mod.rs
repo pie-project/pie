@@ -1,13 +1,10 @@
-//! The engine layer: PIE's `Engine` over a wafer program. It loads the
-//! model (plans or reads its program, opens the wafer), then serves fires:
-//! batching lanes into launches, keeping lanes' KV pages (and the host
-//! tier), routing epilogues to the host interpreter or the wafer's VM.
-//! Everything about the program itself (its shape, symbols, tables, page
-//! layout) comes from the program layer ([`super::program`],
-//! [`super::component`]) through the driver ([`super::wafer`]).
+//! The engine layer: PIE's `Engine` over the wafer program. It loads the
+//! model (opens the compiled program, places the prep's tiles), then serves
+//! fires: each lane's rows through the program's one-sequence cache (brought
+//! to the lane's history first), the guest passes in the host interpreter,
+//! the lanes' readouts.
 
 mod fire;
-mod guest_vm;
 mod kv;
 mod launch;
 mod posted;
@@ -25,16 +22,15 @@ use engine::transfer::MemoryDomain;
 use eta_ir::registry::{GeometryClass, PortMask};
 
 use super::SpatialBoot;
-use fire::PagedAhead;
 use kv::Kv;
 
-use super::{build, ckpt, guest4, model, wafer};
+use super::{artifact, wafer};
 
 use crate::api::{ContractFor, DeviceBoot, bake_budgets, fault, patch_ladder, refusal};
 use crate::serve::{Boot, Shell};
 
-/// The spatial engine: the model forward in the wafer program,
-/// guest programs on the host (or the wafer's VM), PIE's KV pages.
+/// The spatial engine: the model forward in the wafer program, guest
+/// programs on the host.
 pub struct Spatial {
     programs: crate::program::Plane,
     boot: DeviceBoot,
@@ -46,64 +42,22 @@ pub struct Spatial {
     readout: Option<(String, u32)>,
     model: Option<wafer::Wafer>,
     kv: Kv,
-    /// Programs whose guest translation was told, and those the guest VM
-    /// can run, by program id.
-    guest_probed: std::collections::HashSet<u64>,
-    guest_programs: std::collections::HashMap<u64, std::sync::Arc<guest4::lane::Program>>,
-    /// Programs the VM could take that the cost forecast keeps on the host,
-    /// and why.
-    guest_costly: std::collections::HashMap<u64, String>,
-    /// The model's parameter count (the forecast's default token time).
-    params: f64,
-    /// The guest VM a lane's instance runs on, while it does.
-    guest_vms: std::collections::HashMap<InstanceId, guest4::lane::CheckVm>,
-    /// The instance whose program the wafer head's VM holds (`guest`
-    /// "wafer"): its homes live there while it does.
-    vm_owner: Option<InstanceId>,
-    /// A multi-lane VM: the program it holds and each lane's request.
-    vm_program: Option<u64>,
-    vm_banks: Vec<Option<InstanceId>>,
-    /// A per-lane-program VM: each lane's program as placed (empty until
-    /// the first placement).
-    vm_bank_progs: Vec<Option<u64>>,
-    /// Each bank's last fire (`paged_fires`): who an eviction takes first.
-    vm_bank_used: Vec<u64>,
-    /// Evicted instances' bank windows, word for word, until they place
-    /// again (or are gone).
-    vm_parked: std::collections::HashMap<InstanceId, guest4::slots::Parked>,
     /// Fires run (the model-time log's count).
     fires: u64,
-    /// Epilogue steps the guest VM ran.
-    guest_steps: u64,
-    /// Rows of history replayed into the model's cache (the fallback for a
-    /// model that owns no paged KV), and fires run on paged KV.
+    /// Rows of history replayed into the model's cache.
     replayed: u64,
-    paged_fires: u64,
-    /// Rows re-prefilled into a lane's own pages.
-    refilled: u64,
     /// Greedy rows a token loop answered, and the loops run.
     ahead_hits: u64,
-    /// The wafer program's posted token loop: the token it was fed and
-    /// its position.
-    split_posted: Option<(u32, usize)>,
     ahead_runs: u64,
-    /// A paged lane's token loop run ahead on the wafer, by sequence slot:
-    /// the slot its next row writes, then each row's expected token and the
-    /// argmax it already has (its K/V written on the lane's own pages).
-    paged_ahead: std::collections::HashMap<u32, PagedAhead>,
-    /// The token loop's answer row, reused fire to fire.
-    one_hot: fire::OneHotRow,
+    /// The posted token loop on the wafer: the token it was fed and its
+    /// position.
+    loop_posted: Option<(u32, usize)>,
     next_fire: u64,
     next_frame: u64,
     sink: Option<engine::CompletionSink>,
     pending: Option<(FrameId, Vec<Vec<LaneReadout>>)>,
-    /// Steps posted and not yet run (an asynchronous engine), the token
-    /// loop continuation on the wafer, the steps the wafer's thread already
-    /// reported landed, and the loops started (each loop's epoch).
+    /// Steps posted and not yet run (an asynchronous engine).
     posted: std::collections::VecDeque<posted::Posted>,
-    in_flight: Option<posted::InFlight>,
-    reported: std::collections::HashSet<(u64, u32)>,
-    next_loop: u64,
 }
 
 impl Spatial {
@@ -119,110 +73,23 @@ impl Spatial {
             readout: None,
             model: None,
             kv: Kv::default(),
-            guest_probed: std::collections::HashSet::new(),
-            guest_programs: std::collections::HashMap::new(),
-            guest_costly: std::collections::HashMap::new(),
-            params: 0.0,
-            guest_vms: std::collections::HashMap::new(),
-            vm_owner: None,
-            vm_program: None,
-            vm_banks: Vec::new(),
-            vm_bank_progs: Vec::new(),
-            vm_bank_used: Vec::new(),
-            vm_parked: std::collections::HashMap::new(),
             fires: 0,
-            guest_steps: 0,
             replayed: 0,
-            paged_fires: 0,
-            refilled: 0,
             ahead_hits: 0,
-            split_posted: None,
             ahead_runs: 0,
-            paged_ahead: std::collections::HashMap::new(),
-            one_hot: fire::OneHotRow::default(),
+            loop_posted: None,
             next_fire: 0,
             next_frame: 0,
             sink: None,
             pending: None,
             posted: std::collections::VecDeque::new(),
-            in_flight: None,
-            reported: std::collections::HashSet::new(),
-            next_loop: 0,
         }
-    }
-
-    /// The wafer program's directory: named (`program`), or built from the
-    /// model's plan (`serve`); checked against the model (dims, layers,
-    /// vocabulary, and what the placement assumes: the head, eps, q/k
-    /// norms, theta).
-    fn program_dir(&self, spec: &Read, page_size: usize) -> EngineResult<String> {
-        let program = match &self.spatial.program {
-            Some(dir) => Some(dir.clone()),
-            None => match &self.spatial.serve {
-                // PIE builds the program from the model's plan.
-                Some(t) => {
-                    let cfg = build::ServeConfig::from_toml(t, page_size)
-                        .map_err(|e| Error::Load(e.to_string()))?;
-                    let (target, system) = (self.boot.target, self.boot.cmaddr.is_some());
-                    let built = match spec {
-                        Read::Dense(spec) => build::build_for(spec, &cfg, target, system),
-                        Read::Gemma(g) => build::build_g4(g, &cfg, target, system),
-                    };
-                    Some(
-                        built
-                            .map_err(|e| Error::Load(format!("building the spatial program: {e}")))?
-                            .display()
-                            .to_string(),
-                    )
-                }
-                None => None,
-            },
-        };
-        let Some(program) = program else {
-            return Err(Error::Load(
-                "[cerebras.spatial] names no wafer program (`program` or `serve`)".into(),
-            ));
-        };
-        let out_json = Path::new(&program).join("out.json");
-        let json: serde_json::Value = std::fs::read_to_string(&out_json)
-            .ok()
-            .and_then(|text| serde_json::from_str(&text).ok())
-            .ok_or_else(|| Error::Load(format!("{}: no readable out.json", out_json.display())))?;
-        // The wafer program carries its own model (the prep's tiles).
-        if !super::artifact::is_artifact_program(Path::new(&program)) {
-            let get = model::out_json_params(&json);
-            match spec {
-                Read::Dense(spec) => spec.check_program(get),
-                Read::Gemma(g) => g.check_program(get),
-            }
-            .map_err(|e| Error::Load(e.to_string()))?;
-        }
-        Ok(program)
     }
 
     fn model(&mut self) -> EngineResult<&mut wafer::Wafer> {
         self.model
             .as_mut()
             .ok_or_else(|| Error::Load("the spatial engine has no model loaded".into()))
-    }
-}
-
-/// The model as the spatial kernels see it: a Qwen3-dense-like model (or
-/// Qwen3.5's hybrid), or Gemma 4 dense (serve_g4).
-enum Read {
-    Dense(model::ModelSpec),
-    Gemma(super::model_g4::G4Spec),
-}
-
-impl Read {
-    /// The trace as one of the two; ModelSpec's refusal when neither reads.
-    fn of(trace: &poem_ir::Trace) -> Result<Read, model::Refused> {
-        match model::ModelSpec::read(trace) {
-            Ok(spec) => Ok(Read::Dense(spec)),
-            Err(why) => super::model_g4::G4Spec::read(trace)
-                .map(Read::Gemma)
-                .map_err(|_| why),
-        }
     }
 }
 
@@ -265,32 +132,6 @@ impl Engine for Spatial {
         );
         let slots =
             poem_compiler::state_slots(budgets.slots, &trace, crate::api::DEFAULT_STATE_SLOTS);
-        // The model as the spatial kernels see it: refused here unless its
-        // structure is one they implement (spatial/plan.rs).
-        // (a wafer program carries its own model, its prep's tiles: a trace the kernels' reader
-        // refuses is still served by it; artifact/mod.rs)
-        let artifact = self
-            .spatial
-            .program
-            .as_ref()
-            .is_some_and(|p| super::artifact::is_artifact_program(Path::new(p)));
-        let spec = match Read::of(&trace) {
-            Ok(s) => s,
-            Err(_) if artifact => Read::Dense(model::ModelSpec::for_artifact(&trace)),
-            Err(e) => return Err(Error::Load(e.to_string())),
-        };
-        // The weights land by the trace's params (the shell takes the trace).
-        let weights_trace = trace.clone();
-        self.params = match &spec {
-            Read::Dense(spec) => {
-                let (h, hd) = (spec.hidden as f64, spec.head_dim as f64);
-                let attn = h * hd * (2 * spec.q_heads + 2 * spec.kv_heads) as f64;
-                let heads = if spec.tied { 1.0 } else { 2.0 };
-                spec.layers as f64 * (attn + 3.0 * h * spec.inter as f64)
-                    + heads * spec.vocab as f64 * h
-            }
-            Read::Gemma(g) => g.params(),
-        };
         let shell = Shell::load_dry(
             Boot {
                 patches,
@@ -310,13 +151,15 @@ impl Engine for Spatial {
         )
         .map_err(fault)?;
         self.readout = shell.readout_output();
-        // The wafer program: compiled, built from the plan, or named.
-        let ckpt = self
-            .spatial
-            .ckpt
-            .clone()
-            .unwrap_or_else(|| Path::new(&path).display().to_string());
-        let program = &self.program_dir(&spec, budgets.page_size as usize)?;
+        // The wafer program: compiled outside the engine, its artifact beside it.
+        let program = Path::new(&self.spatial.program);
+        if !artifact::is_artifact_program(program) {
+            return Err(Error::Load(format!(
+                "{}: not a compiled wafer program (no artifact/program.json): wafer-compile \
+                 build --plan <plan.json> --out <dir>, then link.sh <dir>",
+                program.display()
+            )));
+        }
         let platform = match &self.boot.cmaddr {
             Some(cmaddr) => crate::sdk::Platform::System {
                 cmaddr: cmaddr.clone(),
@@ -326,93 +169,27 @@ impl Engine for Spatial {
                 ..crate::sdk::Simulator::new(self.boot.target)
             }),
         };
-        // RoPE as the trace states it: theta's frequencies, or its scaled
-        // table (llama3). serve_g4 reads both readings' RoPE from the
-        // checkpoint.
-        let rope = Some(match &spec {
-            Read::Dense(spec) => wafer::Rotary {
-                theta: f64::from(spec.rope_theta),
-                table: spec.rope_table.as_ref().map(|t| t.inv_freq.clone()),
-            },
-            Read::Gemma(g) => wafer::Rotary {
-                theta: f64::from(g.theta),
-                table: None,
-            },
-        });
-        // The weights through PIE's checkpoint path (the load's contract
-        // over its checkpoint); `ckpt` names a Hugging Face directory
-        // instead.
-        let weights = match &self.spatial.ckpt {
-            Some(dir) => ckpt::Ckpt::open(Path::new(dir)),
-            None => ckpt::Ckpt::landed(&weights_trace, &contract, Path::new(&path)),
-        }
-        .map_err(|e| Error::Load(format!("the spatial wafer model's weights: {e}")))?;
-        let w = wafer::Wafer::open(program.into(), weights, platform, rope)
+        let vocab = self
+            .readout
+            .as_ref()
+            .map_or(usize::MAX, |(_, w)| *w as usize);
+        let w = wafer::Wafer::open(program.to_path_buf(), platform, vocab)
             .map_err(|e| Error::Load(format!("the spatial wafer model: {e}")))?;
         tracing::info!(
-            program,
-            ckpt,
+            program = %program.display(),
             vocab = w.vocab,
             hidden = w.hidden,
             "spatial wafer model loaded"
         );
-        // A batched build owns the KV as PIE's pages.
-        let paged_model = w.paged.is_some();
+        // The context the model holds: the wafer program's positions.
+        let model_context = u32::try_from(w.positions).unwrap_or(u32::MAX);
         self.model = Some(w);
-        self.kv = Kv {
-            paged: paged_model,
-            ..Kv::default()
-        };
+        self.kv = Kv::default();
 
         let trace_name = shell.trace().name.clone();
         let paging = shell.paging();
         self.kv.page_size = paging.page_size;
-        // A build with shorter pages than PIE's (HV, PS 1) is paged PIE's
-        // way: the wafer handle expands each PIE page into its kernel pages.
-        if let Some(w) = self.model.as_mut() {
-            w.page_as(paging.page_size as usize);
-        }
-        // A batched wafer build's pool is PIE's: the same page size, and at
-        // least the pages PIE hands out.
-        if let Some(w) = &self.model
-            && let Some(shape) = w.paged
-            && (paging.page_size as usize != shape.page_size
-                || paging.pages() > shape.pages() as u64)
-        {
-            return Err(Error::Load(format!(
-                "the wafer program's KV pool is {} pages of {}; this load pages {} of {} \
-                     (set the page size and the KV budget to fit it)",
-                shape.pages(),
-                shape.page_size,
-                paging.pages(),
-                paging.page_size
-            )));
-        }
-        // The host tier: `host_kv_budget` of whole pages, on a wafer build
-        // whose pages the host can read and write.
-        self.kv.host_pages = match &self.model {
-            Some(w) => match (w.paged, w.page_bytes, residency.host_kv_budget) {
-                (Some(_), Some(bytes), Some(budget)) if bytes > 0 => {
-                    u32::try_from(budget / bytes as u64).unwrap_or(u32::MAX)
-                }
-                _ => 0,
-            },
-            _ => 0,
-        };
-        if self.kv.host_pages > 0 {
-            tracing::info!(
-                pages = self.kv.host_pages,
-                "spatial: the host keeps suspended lanes' kv pages"
-            );
-        }
         let state_rows = shell.has_state();
-        let wafer_pool = self.model.as_ref().and_then(|w| w.paged);
-        // The context the model holds: the wafer program's positions (a
-        // lane's pages on a batched build).
-        let model_context = self
-            .model
-            .as_ref()
-            .map_or(u32::MAX, |w| u32::try_from(w.positions).unwrap_or(u32::MAX));
         let caps = Capabilities {
             device: DeviceFacts {
                 backend: "cerebras".to_string(),
@@ -426,18 +203,13 @@ impl Engine for Spatial {
                 codegen_backend: None,
             },
             pools: PoolFacts {
-                // A batched wafer build reads at most E of a lane's pages on a
-                // row: pages below rows x E fill every row E times over, so no
-                // lane can name more.
-                kv_pages: u32::try_from(paging.pages())
-                    .unwrap_or(u32::MAX)
-                    .min(wafer_pool.map_or(u32::MAX, |s| (s.rows * s.entries) as u32)),
+                // The pages hold tokens here (the program's cache is replayed from them).
+                kv_pages: u32::try_from(paging.pages()).unwrap_or(u32::MAX),
                 kv_page_size: paging.page_size,
                 state_slots: if state_rows { paging.slots } else { 0 },
                 buffer_pages: shell.buffer_pages(),
                 state_slot_bytes: shell.state_slot_bytes(),
                 adapter_banks: 0,
-                host_kv_pages: self.kv.host_pages,
                 ..PoolFacts::default()
             },
             limits: FireLimits {
@@ -445,9 +217,7 @@ impl Engine for Spatial {
                 // after another, each cache brought back from its tokens.
                 max_lanes: budgets.max_lanes.max(1),
                 max_tokens: budgets.max_tokens,
-                max_page_refs: paging
-                    .pages_per_slot
-                    .min(wafer_pool.map_or(u32::MAX, |s| s.max_page_refs() as u32)),
+                max_page_refs: paging.pages_per_slot,
                 max_context: paging.context().min(model_context),
                 prefill_rows: 0,
                 max_readouts: budgets.max_tokens,
@@ -457,22 +227,14 @@ impl Engine for Spatial {
             draft_block: 0,
             draft_mask_token: 0,
             draft_proposals_from: 1,
-            // A paged model attends what each row's mask says; a model of
-            // one sequence a cache runs causal attention only, so it takes
-            // no mask port.
-            ports: if paged_model {
-                PortMask::DEVICE_GEOMETRY.with(eta_ir::registry::Port::AttnMask)
-            } else {
-                PortMask::DEVICE_GEOMETRY
-            },
+            // One sequence a cache runs causal attention only: no mask port.
+            ports: PortMask::DEVICE_GEOMETRY,
             geometry: GeometryClass::DeviceGeometry,
             kv_copy: KvCopyDomains {
-                // Pages are tokens here: a copy copies them. A wafer build
-                // whose pages the host can read parks a suspended lane's
-                // pages on the host (never attended there).
+                // Pages are tokens here: a copy copies them.
                 device_to_device: true,
-                device_to_host: self.kv.host_pages > 0,
-                host_to_device: self.kv.host_pages > 0,
+                device_to_host: false,
+                host_to_device: false,
                 host_to_host: false,
             },
             kv_handle: None,
@@ -504,34 +266,14 @@ impl Engine for Spatial {
         })
     }
 
-    /// A serve_q35 build's recurrent states, a row to a row (the wafer
-    /// keeps each state's tokens: a copy's lane replays them).
+    /// Recurrent states replay from their tokens (the program holds one
+    /// sequence's): a copy is not a device move here.
     fn copy_state(&mut self, copy: &engine::transfer::StateCopy) -> EngineResult<()> {
         copy.device_only("cerebras-spatial")?;
-        if !copy.pages.is_empty() {
-            return Err(Error::Unsupported {
-                verb: "`copy_state` of buffer pages on the wafer",
-                engine: "cerebras-spatial",
-            });
-        }
-        self.drain();
-        let w = self.model()?;
-        if !w.recurrent {
-            return Err(Error::Unsupported {
-                verb: "`copy_state` on a wafer build without recurrent layers",
-                engine: "cerebras-spatial",
-            });
-        }
-        for (at, m) in copy.moves.iter().enumerate() {
-            if m.src_token_offset != 0 || m.dst_token_offset != 0 {
-                return Err(Error::Invalid(format!(
-                    "state move {at} names a token offset; the wafer moves whole states"
-                )));
-            }
-            w.copy_state(m.src_slot_id, m.dst_slot_id)
-                .map_err(|e| Error::Device(format!("the wafer model: {e}")))?;
-        }
-        Ok(())
+        Err(Error::Unsupported {
+            verb: "`copy_state` on the wafer program (its state replays from tokens)",
+            engine: "cerebras-spatial",
+        })
     }
 
     fn copy_kv(&mut self, copy: &engine::transfer::KvCopy) -> EngineResult<()> {
@@ -547,13 +289,6 @@ impl Engine for Spatial {
             tracing::debug!(target: "spatial_trace", "spatial-trace copy_kv: {copy:?}");
         }
         let device = self.caps.as_ref().map(|caps| caps.device.domain);
-        let host = engine::transfer::MemoryDomain::HostPinned;
-        if self.kv.host_pages > 0 && Some(copy.src) == device && copy.dst == host {
-            return self.page_out(copy);
-        }
-        if self.kv.host_pages > 0 && copy.src == host && Some(copy.dst) == device {
-            return self.page_in(copy);
-        }
         if Some(copy.src) != device || Some(copy.dst) != device {
             return Err(Error::Unsupported {
                 verb: "`copy_kv` between domains other than this load's device",
@@ -561,10 +296,6 @@ impl Engine for Spatial {
             });
         }
         let size = self.kv.page_size.max(1);
-        if self.model.as_ref().is_some_and(|w| w.paged.is_some()) {
-            let runs = copy.runs(size)?;
-            launch::copy_paged(self.model()?, &runs)?;
-        }
         for run in copy.runs(size)? {
             let src: Vec<Option<u32>> = self
                 .kv
@@ -614,14 +345,11 @@ impl Engine for Spatial {
                 caps.geometry, binding.geometry
             )));
         }
-        let bound = self.programs.bind(binding).map_err(refusal)?;
-        self.probe_guest(bound.id, bound.program);
-        Ok(bound)
+        self.programs.bind(binding).map_err(refusal)
     }
 
     fn close_instance(&mut self, id: InstanceId) -> EngineResult<()> {
         self.drain();
-        self.guest_vms.remove(&id);
         self.programs.close_instance(id).map_err(refusal)
     }
 

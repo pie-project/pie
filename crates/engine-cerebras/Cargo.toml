@@ -24,8 +24,6 @@ poem-ir = { package = "pie-poem-ir", path = "../poem-ir" }
 engine = { path = "../engine" }
 poem-exec = { package = "pie-poem-exec", path = "../poem-exec" }
 poem-compiler = { package = "pie-poem-compiler", path = "../poem-compiler" }
-poem = { package = "pie-poem", path = "../poem" }
-anyhow = "1"
 eta-ir = { package = "pie-eta-ir", path = "../eta-ir" }
 eta-exec = { path = "../eta-exec" }
 eta-compiler = { path = "../eta-compiler" }
@@ -35,8 +33,6 @@ blake3 = "1"
 
 [dev-dependencies]
 sha2 = "0.11"
-ztensor-compat = { workspace = true }
-ztensor = { workspace = true }
 
 [lints]
 workspace = true

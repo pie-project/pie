@@ -1,6 +1,0 @@
-[
- {
-  "old": "      @fmovs(ib_dsd, fin(q_ib, 1));\n",
-  "new": "      @fmovs(ib_dsd, fin(q_ib, 1));\n      while (ib[0] == -2.0) { @fmovs(ib_dsd, fin(q_ib, 1)); }   // (trm 16384) the head's tie signal\n"
- }
-]

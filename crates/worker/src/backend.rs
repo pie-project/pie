@@ -806,53 +806,22 @@ pub(crate) fn create_engine_backend(
                     toml::Value::String(cmaddr.clone())
                 ));
             }
-            if opts.spatial_program.is_some() || opts.spatial_serve.is_some() {
+            if let Some(program) = &opts.spatial_program {
                 boot_doc.push_str("[cerebras.spatial]\n");
-                if let Some(program) = &opts.spatial_program {
-                    boot_doc.push_str(&format!(
-                        "program = {}\n",
-                        toml::Value::String(program.clone())
-                    ));
-                }
-                if let Some(guest) = &opts.spatial_guest {
-                    boot_doc.push_str(&format!("guest = {}\n", toml::Value::String(guest.clone())));
-                }
+                boot_doc.push_str(&format!(
+                    "program = {}\n",
+                    toml::Value::String(program.clone())
+                ));
                 if let Some(lookahead) = opts.spatial_lookahead {
                     boot_doc.push_str(&format!("lookahead = {lookahead}\n"));
                 }
                 if let Some(asynchronous) = opts.spatial_async {
                     boot_doc.push_str(&format!("async = {asynchronous}\n"));
                 }
-                if let Some(ckpt) = &opts.spatial_ckpt {
-                    boot_doc.push_str(&format!("ckpt = {}\n", toml::Value::String(ckpt.clone())));
-                }
-                if let Some(cycles) = opts.spatial_token_cycles {
-                    boot_doc.push_str(&format!("token_cycles = {cycles}\n"));
-                }
-                if let Some(margin) = opts.spatial_pre_margin {
-                    boot_doc.push_str(&format!("pre_margin = {}\n", toml::Value::Float(margin)));
-                }
-                if let Some(fraction) = opts.spatial_main_fraction {
-                    boot_doc.push_str(&format!(
-                        "main_fraction = {}\n",
-                        toml::Value::Float(fraction)
-                    ));
-                }
             }
             if let Some(switches) = &opts.switches {
                 let mut cerebras = toml::Table::new();
                 cerebras.insert("switches".into(), toml::Value::Table(switches.clone()));
-                let mut doc = toml::Table::new();
-                doc.insert("cerebras".into(), toml::Value::Table(cerebras));
-                boot_doc.push('\n');
-                boot_doc.push_str(&toml::to_string(&doc)?);
-            }
-            if let Some(serve) = &opts.spatial_serve {
-                // Nested under [cerebras.spatial.serve], its own sub-tables too.
-                let mut spatial = toml::Table::new();
-                spatial.insert("serve".into(), toml::Value::Table(serve.clone()));
-                let mut cerebras = toml::Table::new();
-                cerebras.insert("spatial".into(), toml::Value::Table(spatial));
                 let mut doc = toml::Table::new();
                 doc.insert("cerebras".into(), toml::Value::Table(cerebras));
                 boot_doc.push('\n');
