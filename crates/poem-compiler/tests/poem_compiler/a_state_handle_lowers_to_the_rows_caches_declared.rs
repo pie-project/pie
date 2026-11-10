@@ -127,7 +127,11 @@ fn hy_4(path: &str, _row: &CacheRow) -> String {
 }
 
 fn minimax_m3(path: &str, _row: &CacheRow) -> String {
-    path.to_string()
+    match parts(path)[..] {
+        ["layers", l, "attn", "kv"] => format!("kv.{l}"),
+        ["layers", l, "indexer", "keys"] => format!("index.{l}"),
+        _ => path.to_string(),
+    }
 }
 
 fn minimax_h3(path: &str, _row: &CacheRow) -> String {
@@ -185,6 +189,13 @@ fn left_space_zero_empty(deployment: &str) -> bool {
     deployment.starts_with("gemma4-e4b-mini-l1-")
 }
 
+/// Whether `caches()` gave each index-key row of `package` a space of its
+/// own, made in its loop over the layers: the handles' rows are alike, all
+/// in the one space of their dtype, numbered after every other.
+fn index_space_a_layer(package: &str) -> bool {
+    matches!(package, "minimax_m3" | "glm_5_next" | "qwen_4")
+}
+
 fn renamed(package: &str, deployment: &str, trace: &Trace, rename: Renaming) -> Vec<CacheRow> {
     let mut rows = trace.caches.clone();
     if left_space_zero_empty(deployment) {
@@ -208,6 +219,18 @@ fn renamed(package: &str, deployment: &str, trace: &Trace, rename: Renaming) -> 
         {
             *space = 0;
             *window = None;
+        }
+    }
+    if index_space_a_layer(package) {
+        let mut next = None;
+        for row in &mut rows {
+            if let CacheRow::Kv { name, space, .. } = row
+                && name.starts_with("index.")
+            {
+                let at = next.unwrap_or(*space);
+                *space = at;
+                next = Some(at + 1);
+            }
         }
     }
     rows
