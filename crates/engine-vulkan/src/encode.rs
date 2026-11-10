@@ -189,11 +189,6 @@ impl<'a> Sink<'a> {
         self
     }
 
-    #[must_use]
-    pub fn into_frame(self) -> Option<Frame> {
-        None
-    }
-
     fn refuse(fire: Fire, fault: Fault) -> Error {
         Error::Backend {
             op: fire.entrypoint,
@@ -576,11 +571,6 @@ impl<'a> Sink<'a> {
             _pipelines: pipelines,
             _handles: handles,
         }
-    }
-
-    #[must_use]
-    pub fn into_frame(self) -> Option<Frame> {
-        None
     }
 }
 

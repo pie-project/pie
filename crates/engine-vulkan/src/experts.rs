@@ -718,11 +718,6 @@ impl Plan {
     }
 
     #[must_use]
-    pub fn is_gathered(&self, param: usize) -> bool {
-        self.gathered.contains_key(&param)
-    }
-
-    #[must_use]
     pub fn gathered_demand(&self, max_tokens: u32) -> u32 {
         if self.gathered.is_empty() {
             return 0;

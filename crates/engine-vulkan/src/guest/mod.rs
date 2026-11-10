@@ -54,14 +54,6 @@ impl std::fmt::Display for Refused {
 
 const ENTRY: &str = "main";
 
-pub fn entry_source(stage: usize, plan: &LaunchStagePlan) -> Result<String, Refused> {
-    every_op_emits(stage, plan)?;
-    wgsl::emit_launch_stage(ENTRY, plan).map_err(|why| Refused::Emitting {
-        stage,
-        why: why.to_string(),
-    })
-}
-
 fn every_op_emits(stage: usize, plan: &LaunchStagePlan) -> Result<(), Refused> {
     let mut missing: Vec<(u8, &'static str)> = Vec::new();
     for op in &plan.ops {

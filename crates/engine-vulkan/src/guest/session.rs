@@ -335,32 +335,6 @@ impl Session {
         Ok(())
     }
 
-    pub fn copy_in(
-        &mut self,
-        frame: &mut Frame,
-        stage: usize,
-        value: u32,
-        source: &Buffer,
-        source_at: u64,
-        len: u64,
-    ) -> Result<()> {
-        let (at, held) = self.span(stage, value).ok_or_else(|| Fault::Program {
-            at: "guest::session",
-            why: format!("value {value} is not stage {stage}'s"),
-        })?;
-        if len > held {
-            return Err(Fault::Program {
-                at: "guest::session",
-                why: format!(
-                    "value {value} of stage {stage} holds {held} bytes and a copy of {len} \
-                     was asked for"
-                ),
-            });
-        }
-        let stage = &self.stages[stage];
-        frame.copy(source, source_at, &stage.heap, at, len)
-    }
-
     pub fn read_back(&mut self, frame: &mut Frame, stage: usize, value: u32) -> Result<()> {
         let (at, len) = self.span(stage, value).ok_or_else(|| Fault::Program {
             at: "guest::session",

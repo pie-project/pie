@@ -766,7 +766,6 @@ impl Engine for Vulkan {
         let moves = copy.runs(page_size)?;
         self.loaded_mut()?.copy_kv(&moves).map_err(fault)
     }
-
 }
 
 impl Vulkan {
