@@ -461,7 +461,7 @@ impl Engine for Xla {
             media_encode: false,
             device_channel_commit: true,
             rs_verbs: shell.serves_rs_verbs(),
-            rs_snapshots: 0,
+            rs_snapshots: shell.snapshots(),
             bidirectional_attention: true,
             adapter_attachments: false,
             facts: shell.trace().facts.clone(),
@@ -511,7 +511,11 @@ impl Engine for Xla {
                 step: index as u32,
             };
             let latch = crate::program::Latch::new(at, self.sink.clone());
-            let (ticket, settle) = self.fire_step(step, &latch)?;
+            let (ticket, settle) = if step.lanes.iter().any(|l| !l.rs_snapshots.is_empty()) {
+                self.fire_snapshotting(step, &latch)?
+            } else {
+                self.fire_step(step, &latch)?
+            };
             // The submitter's hold: the step is done once its passes land.
             latch.release(Ok(()));
             steps.push(ticket);
@@ -1095,6 +1099,35 @@ impl Xla {
         }
 
         Ok(LaneFeeds { cells, voxels })
+    }
+
+    /// A step whose lanes snapshot their recurrent state inside the pass,
+    /// fired in pieces (`crate::snapshot`): the last piece's ticket.
+    fn fire_snapshotting(
+        &mut self,
+        step: &engine::fire::Step,
+        latch: &std::sync::Arc<crate::program::Latch>,
+    ) -> EngineResult<(FireTicket, StepSettle)> {
+        let shell = self.shell.as_ref().ok_or_else(|| {
+            Error::Load("the xla engine has no model loaded; load one first".into())
+        })?;
+        let records: Vec<engine::chunk::ShapeId> =
+            shell.pools().fixed_shapes().map(|(id, _)| id).collect();
+        let bits = crate::snapshot::Bits::of(&shell.trace().facts);
+        let pieces = crate::snapshot::pieces(step, bits, &records).map_err(fault)?;
+        let last = pieces.len() - 1;
+        for (at, piece) in pieces.into_iter().enumerate() {
+            let fired = self.fire_step(&piece.step, latch)?;
+            if !piece.copies.is_empty() {
+                self.loaded_mut()?
+                    .copy_slots(&piece.copies)
+                    .map_err(fault)?;
+            }
+            if at == last {
+                return Ok(fired);
+            }
+        }
+        unreachable!("a step cuts into one piece at least")
     }
 
     fn fire_step(

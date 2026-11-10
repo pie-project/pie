@@ -238,6 +238,7 @@ impl PreparedRs {
                     row: snap.row,
                     slot: snap.slot.0,
                     pieces: Vec::new(),
+                    fixed: Vec::new(),
                 })
                 .collect();
         }
@@ -326,6 +327,7 @@ pub fn apply_shared(
         if records.is_some() {
             for snap in &mut lane.rs_snapshots {
                 snap.pieces = pool.snapshot_pieces(snap.slot);
+                snap.fixed = pool.record_refs(snap.slot);
                 snap.slot = pool.snapshot_ref(snap.slot);
             }
         }

@@ -60,7 +60,11 @@ Proposed by the L40S session (branch `sc/l40s-bc`), accepted by New Pie. Runtime
     `[src, dst]` with `dst != src` on EVERY lane (a CoW record from the reserve); `[x, x]` on a multi-lane group only
     when no lane folds. Single-lane fires: in place stays in place.
 16. **Snapshots per piece.** `RsSnapshot.pieces: Vec<u32>` (serde default; `slot` = first piece) — the runtime fills
-    `pieces` when a record has more than one piece.
+    `pieces` when a record has more than one piece. Amended (XLA, `sc/xla2`): `RsSnapshot.fixed: Vec<(ShapeId,
+    Vec<u32>)>` (serde default) names the snapshot record as `Lane.fixed` names a lane's — every fixed shape's slot
+    refs, a piece each; the runtime fills it from the record (`record_refs`). An engine whose record spans more than
+    one fixed shape (XLA: one fixed shape a distinct state block size) reads it; `slot` / `pieces` still name the first
+    shape's for the others.
 17. **Epochs.** Draining an evacuated segment and recycling freed slots are fenced by a per-fire epoch that advances
     on every fire (not only on copy-on-write / explicit writes).
 18. **rs buffer is an rs-list shape (supersedes 8's "rs buffer inside the record" and 13 entirely; amends 11).**

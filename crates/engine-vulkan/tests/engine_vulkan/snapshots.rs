@@ -77,6 +77,7 @@ fn snapshot_lands_the_cut_pass(model: &str, chunk: Option<u64>, beside_buffering
             } else {
                 Vec::new()
             },
+            fixed: Vec::new(),
         })
         .collect();
     let mut lanes = vec![Seated {
