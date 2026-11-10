@@ -176,6 +176,12 @@ pub struct SsmChunk(pub u32);
 #[decision(id = "kernel.ssm.long_chunk", constant(set(64, 128, 256)), default = 128, tune = search)]
 pub struct SsmLongChunk(pub u32);
 
+/// State buffers the GDN decode step kernel cycles a lane's state through:
+/// with three, a lane's state stores back while the next lane steps.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Decision)]
+#[decision(id = "kernel.ssm.step_bufs", constant(set(2, 3)), default = 2, tune = search)]
+pub struct SsmStepBufs(pub u32);
+
 /// Tokens per chunk of the per-channel-decay (KDA) chunked scan, whose
 /// intra-chunk decay is a `[C, C, d]` product.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Decision)]
@@ -209,7 +215,8 @@ pub fn register(registry: &mut Registry) {
         .add::<AttnUnrolledBlocks>()
         .add::<SsmChunk>()
         .add::<SsmLongChunk>()
-        .add::<SsmKdaChunk>();
+        .add::<SsmKdaChunk>()
+        .add::<SsmStepBufs>();
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -256,6 +263,8 @@ pub struct SsmChunks {
     pub chunk: i64,
     pub long_chunk: i64,
     pub kda_chunk: i64,
+    /// The GDN decode step kernel's state buffers ([`SsmStepBufs`]).
+    pub step_bufs: i64,
 }
 
 /// The kernel decisions one load runs under, and the device's VMEM.
@@ -316,6 +325,7 @@ impl Tuning {
             chunk: 64,
             long_chunk: 128,
             kda_chunk: 16,
+            step_bufs: 2,
         },
         vmem_bytes: Self::V6E_VMEM,
     };
@@ -368,6 +378,7 @@ impl Tuning {
                 chunk: n(profile.get::<SsmChunk>().0),
                 long_chunk: n(profile.get::<SsmLongChunk>().0),
                 kda_chunk: n(profile.get::<SsmKdaChunk>().0),
+                step_bufs: n(profile.get::<SsmStepBufs>().0),
             },
             vmem_bytes,
         }

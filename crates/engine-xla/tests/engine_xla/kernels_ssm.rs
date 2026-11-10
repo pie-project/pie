@@ -2323,26 +2323,29 @@ fn fused_against_xla(g: &Gdn, indptr: &[i32], rows: usize, lane_slot: &[i32], se
 #[test]
 fn the_decode_step_kernel_matches_the_xla_form() {
     // One to 40 lanes (five steps of eight), padding lanes on the sink as the
-    // engine routes them; Qwen3.5-0.8B's heads, then Qwen3.6-27B's.
+    // engine routes them; Qwen3.5-0.8B's heads, then Qwen3.6-27B's; the
+    // state through two buffers and through three (`kernel.ssm.step_bufs`).
     let gdn = |hv| Gdn {
         hk: 16,
         hv,
         dk: 128,
         dv: 128,
     };
-    for (hv, rows, seed) in [
-        (16, 1usize, 51u64),
-        (16, 2, 52),
-        (16, 4, 53),
-        (16, 8, 54),
-        (16, 40, 55),
-        (48, 16, 56),
-    ] {
-        step_against_xla(&gdn(hv), rows, seed);
+    for bufs in [2, 3] {
+        for (hv, rows, seed) in [
+            (16, 1usize, 51u64),
+            (16, 2, 52),
+            (16, 4, 53),
+            (16, 8, 54),
+            (16, 40, 55),
+            (48, 16, 56),
+        ] {
+            step_against_xla(&gdn(hv), rows, seed, bufs);
+        }
     }
 }
 
-fn step_against_xla(g: &Gdn, rows: usize, seed: u64) {
+fn step_against_xla(g: &Gdn, rows: usize, seed: u64, bufs: i64) {
     let slots = rows + 5;
     let sink = (slots - 1) as i32;
     let mut slot_of: Vec<i32> = (0..rows as i32).map(|l| (l * 7 + 3) % sink).collect();
@@ -2359,7 +2362,9 @@ fn step_against_xla(g: &Gdn, rows: usize, seed: u64) {
         .collect();
     let run = |kernel: bool| -> Option<(Vec<f32>, Vec<f32>)> {
         kernels_xla::ssm::step_kernel(Some(kernel));
-        let mut b = Bench::new();
+        let mut tuning = kernels_xla::tuning::Tuning::DEFAULT;
+        tuning.ssm.step_bufs = bufs;
+        let mut b = Bench::new().with_tuning(tuning);
         let x = b.bf16(rows as u32, g.width() as u32, &qkv);
         let z = b.zeros(Dtype::Bf16, rows as u32, (g.hv * g.dv) as u32);
         let gt = b.f32(rows as u32, (2 * g.hv) as u32, &gates);
@@ -2407,7 +2412,7 @@ fn step_against_xla(g: &Gdn, rows: usize, seed: u64) {
     // Every slot but the sink; the sink holds garbage.
     let n = (slots - 1) * g.stride();
     eprintln!(
-        "{} heads, {rows} lanes: step kernel against the xla form: y max |err| {:.3e}, bank {:.3e}",
+        "{} heads, {rows} lanes, {bufs} buffers: step kernel against the xla form: y max |err| {:.3e}, bank {:.3e}",
         g.hv,
         worst(&yk, &yx),
         worst(&bank_k[..n], &bank_xla[..n])

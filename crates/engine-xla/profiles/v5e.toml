@@ -28,6 +28,10 @@ moe.cost.onehot_mi = 8
 # per-row walk read every row to the batch's longest context (Qwen3-0.6B c256: 256-lane steps 24.6 ->
 # 21.9 ms, 6.9k -> 7.7k tok/s; Raw and pf256-512 run the same programs)
 attn.decode_pages = 64
+# a GDN decode step's lane state stores back while the next lane steps, through three buffers: with
+# two, each store waited before the next load (256 lanes, Qwen3.5-0.8B's 16 heads: 896 -> 674 us a
+# layer; Qwen3.6-27B's 48: 2464 -> 1862 us)
+ssm.step_bufs = 3
 
 [provenance]
 measured = [
@@ -39,4 +43,5 @@ measured = [
   "kernel.attn.decode_pages",
   "kernel.attn.unrolled_blocks",
   "kernel.moe.cost.onehot_mi",
+  "kernel.ssm.step_bufs",
 ]

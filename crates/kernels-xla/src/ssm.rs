@@ -1514,7 +1514,8 @@ fn delta(
             if matches!(input, DeltaIn::Gdn { .. })
                 && input.rule()
                 && step_kernel_on()
-                && let Some(out) = step::gdn_step(fq, &heads, lanes.slot, slab, per)?
+                && let Some(out) =
+                    step::gdn_step(fq, &heads, lanes.slot, slab, per, tuning.ssm.step_bufs)?
             {
                 return Ok(out);
             }
