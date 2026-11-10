@@ -33,7 +33,7 @@ impl Run<'_> {
                     let ids = l.read(self.tensor(*ids))?;
                     let slab = l.read(pool.state)?;
                     let map = l.read_opt(map.map(|m| self.tensor(m)))?;
-                    let slots = l.read(pool.slots)?;
+                    let slots = l.slots(&pool)?;
                     let (rows, next) = gather::ngram::ngram_ids(
                         l.f(),
                         ids,
@@ -70,7 +70,7 @@ impl Run<'_> {
                     let slab = l.read(pool.state)?;
                     let map = l.read_opt(map.map(|m| self.tensor(m)))?;
                     let indptr = l.read(ids.indptr)?;
-                    let slots = l.read(pool.slots)?;
+                    let slots = l.slots(&pool)?;
                     let (rows, next) = gather::ngram::ngram_ids_chunked(
                         l.f(),
                         kernels_xla::tensor::RaggedTensor { data, indptr },

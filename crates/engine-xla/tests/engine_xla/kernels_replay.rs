@@ -26,6 +26,8 @@ fn kv_pool(b: &mut Bench, keys: Tensor) -> KvPool {
         max_pages: 3,
         seq_stride: u64::from(keys.width),
         head_stride: u64::from(keys.width),
+        keys_map: kernels_xla::tensor::PageMap::IDENTITY,
+        values_map: kernels_xla::tensor::PageMap::IDENTITY,
     }
 }
 
@@ -48,6 +50,7 @@ fn a_replay_floor_marks_its_lanes_or_reads_their_state() {
             slots: slot_t,
             conv_state: state,
             new_conv_state: state,
+            map: kernels_xla::tensor::PageMap::IDENTITY,
         };
         if !b
             .run(|ctx| attn::replay_floor(ctx, RaggedTensor { data, indptr }, pool, mark, floor))

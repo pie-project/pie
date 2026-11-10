@@ -69,7 +69,7 @@ pub fn replay_floor(
     lower(ctx, |l| {
         let pos = l.ragged(positions)?;
         let slab = l.read(state.state)?;
-        let slots = l.read(state.slots)?;
+        let slots = l.slots(&state)?;
         let (v, next) =
             kernels_xla::attn::replay::floor(l.f(), pos, slab, slots, mark, floor.landing())?;
         l.land(floor, v)?;
@@ -854,7 +854,19 @@ pub mod pool {
             let s = l.read(score)?;
             let sk = l.read(state_kv)?;
             let ss = l.read(state_score)?;
-            let (kv, sc) = pool::state_write(l.f(), k, s, pages, wp, wo, head_dim, ratio, sk, ss)?;
+            let (kv, sc) = pool::state_write(
+                l.f(),
+                k,
+                s,
+                pages,
+                wp,
+                wo,
+                head_dim,
+                ratio,
+                sk,
+                ss,
+                [kernels_xla::tensor::PageMap::IDENTITY; 2],
+            )?;
             l.land(state_kv, kv)?;
             l.land(state_score, sc)
         })
@@ -894,6 +906,7 @@ pub mod pool {
                 ss,
                 ape,
                 entries.landing(),
+                [kernels_xla::tensor::PageMap::IDENTITY; 2],
             )?;
             l.land(entries, y)
         })

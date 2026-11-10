@@ -156,7 +156,10 @@ impl Shell {
         let least = if hybrid { pad.prefill_floor } else { 256 };
         // (A fire that prefills pads its decodes to `pad.rung`: a half rung of
         // the ladder is a decode-only fire's.)
-        for &d in buckets.iter().filter(|&&d| d <= lanes_cap && pad.rung(d) == d) {
+        for &d in buckets
+            .iter()
+            .filter(|&&d| d <= lanes_cap && pad.rung(d) == d)
+        {
             for &b in buckets.iter().filter(|&&b| b >= least && b >= 2 * d) {
                 let rows = if b == top {
                     // A full fire: the runtime's widest rows, decodes and all.

@@ -4,6 +4,7 @@ use dtype::Dtype;
 use engine_xla::bench::{Bench, assert_close, round_bf16};
 use engine_xla::handle::Committed;
 use engine_xla::handle::{RaggedTensor, RecurrentPool, Tensor};
+use kernels_xla::tensor::PageMap;
 
 const DROP: i32 = i32::MAX;
 
@@ -66,12 +67,7 @@ mod ssm {
         y: Tensor,
     ) -> Result<(), Error> {
         lower(ctx, |l| {
-            let (x, w, bank, slots) = (
-                l.read(x)?,
-                l.read(w)?,
-                l.read(p.conv_state)?,
-                l.read(p.slots)?,
-            );
+            let (x, w, bank, slots) = (l.read(x)?, l.read(w)?, l.read(p.conv_state)?, l.slots(p)?);
             let (yv, next) =
                 kernels_xla::ssm::short_conv(l.f(), x, w, bank, slots, k, y.landing())?;
             l.land(y, yv)?;
@@ -92,7 +88,7 @@ mod ssm {
             let w = l.read(w)?;
             let bank = l.read(p.conv_state)?;
             let indptr = l.read(x.indptr)?;
-            let slots = l.read(p.slots)?;
+            let slots = l.slots(p)?;
             let (yv, next) = kernels_xla::ssm::short_conv_chunked(
                 l.f(),
                 kernels_xla::tensor::RaggedTensor { data, indptr },
@@ -117,12 +113,7 @@ mod ssm {
         y: Tensor,
     ) -> Result<(), Error> {
         lower(ctx, |l| {
-            let (x, w, bank, slots) = (
-                l.read(x)?,
-                l.read(w)?,
-                l.read(p.conv_state)?,
-                l.read(p.slots)?,
-            );
+            let (x, w, bank, slots) = (l.read(x)?, l.read(w)?, l.read(p.conv_state)?, l.slots(p)?);
             let (yv, next) = kernels_xla::ssm::causal_conv1d(
                 l.f(),
                 x,
@@ -153,7 +144,7 @@ mod ssm {
             let w = l.read(w)?;
             let bank = l.read(p.conv_state)?;
             let indptr = l.read(x.indptr)?;
-            let slots = l.read(p.slots)?;
+            let slots = l.slots(p)?;
             let (yv, next) = kernels_xla::ssm::causal_conv1d_chunked(
                 l.f(),
                 kernels_xla::tensor::RaggedTensor { data, indptr },
@@ -231,12 +222,8 @@ mod ssm {
         y: Tensor,
     ) -> Result<(), Error> {
         lower(ctx, |l| {
-            let (qkv, gates, slab, slots) = (
-                l.read(qkv)?,
-                l.read(gates)?,
-                l.read(p.state)?,
-                l.read(p.slots)?,
-            );
+            let (qkv, gates, slab, slots) =
+                (l.read(qkv)?, l.read(gates)?, l.read(p.state)?, l.slots(p)?);
             let tuning = l.tuning();
             let (yv, next) = kernels_xla::ssm::gated_delta(
                 l.f(),
@@ -273,7 +260,7 @@ mod ssm {
             let gates = l.read(gates)?;
             let slab = l.read(p.state)?;
             let indptr = l.read(qkv.indptr)?;
-            let slots = l.read(p.slots)?;
+            let slots = l.slots(p)?;
             let tuning = l.tuning();
             let (yv, next) = kernels_xla::ssm::gated_delta_chunked(
                 l.f(),
@@ -353,7 +340,7 @@ mod ssm {
             let dt = l.read(dt)?;
             let al = l.read(al)?;
             let slab = l.read(p.state)?;
-            let slots = l.read(p.slots)?;
+            let slots = l.slots(p)?;
             let tuning = l.tuning();
             let (yv, next) = kernels_xla::ssm::kda_step(
                 l.f(),
@@ -398,7 +385,7 @@ mod ssm {
             let al = l.read(al)?;
             let slab = l.read(p.state)?;
             let indptr = l.read(mixed.indptr)?;
-            let slots = l.read(p.slots)?;
+            let slots = l.slots(p)?;
             let tuning = l.tuning();
             let (yv, next) = kernels_xla::ssm::kda_chunked(
                 l.f(),
@@ -484,7 +471,7 @@ mod ssm {
                 l.read(w)?,
                 l.read(bias)?,
                 l.read(p.conv_state)?,
-                l.read(p.slots)?,
+                l.slots(p)?,
             );
             let (yv, next) = kernels_xla::ssm::causal_conv1d(
                 l.f(),
@@ -541,7 +528,7 @@ mod ssm {
             let (xbc, dt, z) = (l.read(xbc)?, l.read(dt)?, l.read(z)?);
             let mb = banks(l, m)?;
             let slab = l.read(p.state)?;
-            let slots = l.read(p.slots)?;
+            let slots = l.slots(p)?;
             let tuning = l.tuning();
             let (yv, next) =
                 kernels_xla::ssm::mamba2(l.f(), xbc, dt, z, mb, slab, slots, y.landing(), tuning)?;
@@ -565,7 +552,7 @@ mod ssm {
             let mb = banks(l, m)?;
             let slab = l.read(p.state)?;
             let indptr = l.read(xbc.indptr)?;
-            let slots = l.read(p.slots)?;
+            let slots = l.slots(p)?;
             let tuning = l.tuning();
             let (yv, next) = kernels_xla::ssm::mamba2_chunked(
                 l.f(),
@@ -626,6 +613,7 @@ fn pool(state: Tensor, slots: Tensor) -> RecurrentPool {
         slots,
         conv_state: state,
         new_conv_state: state,
+        map: kernels_xla::tensor::PageMap::IDENTITY,
     }
 }
 
@@ -1142,6 +1130,200 @@ fn the_gated_delta_decode_in_rounds_folds_one_token_per_lane() {
         assert_close(&got[t * w..(t + 1) * w], &yr, 1e-4, 1e-3);
     }
     assert_close(&b.read_f32(bank), &want, 1e-5, 1e-4);
+}
+
+/// `bank` (`slots` blocks of `block` elements) laid with slot `s` at block
+/// `map(s)` of a bank of `blocks` blocks, a loud garbage value elsewhere.
+fn lay_bank(bank: &[f32], block: usize, slots: usize, map: PageMap, blocks: usize) -> Vec<f32> {
+    let mut out = vec![64.0f32; blocks * block];
+    for s in 0..slots {
+        let at = map.page(s as i64) as usize * block;
+        out[at..at + block].copy_from_slice(&bank[s * block..(s + 1) * block]);
+    }
+    out
+}
+
+/// A laid bank read back as its `slots` blocks, and whether every block no
+/// slot lies in still holds its garbage.
+fn unlay_bank(laid: &[f32], block: usize, slots: usize, map: PageMap) -> (Vec<f32>, bool) {
+    let mut out = vec![0.0f32; slots * block];
+    let mut held = vec![false; laid.len() / block];
+    for s in 0..slots {
+        let at = map.page(s as i64) as usize;
+        held[at] = true;
+        out[s * block..(s + 1) * block].copy_from_slice(&laid[at * block..(at + 1) * block]);
+    }
+    let clean = held.iter().enumerate().all(|(at, &h)| {
+        h || laid[at * block..(at + 1) * block]
+            .iter()
+            .all(|&x| x == 64.0)
+    });
+    (out, clean)
+}
+
+const SLOT_MAP: PageMap = PageMap {
+    stride: 3,
+    offset: 2,
+};
+
+/// A gated-delta decode of `rows` lanes over a bank of `per` rows a slot,
+/// laid by `map`: `y`, the bank read back as its slots, and whether no
+/// write landed outside a slot.
+fn gdn_decode_mapped(map: PageMap, rows: usize, per: usize) -> Option<(Vec<f32>, Vec<f32>, bool)> {
+    let g = Gdn {
+        hk: 2,
+        hv: 4,
+        dk: 16,
+        dv: 12,
+    };
+    let slots = rows + 3;
+    let mut rng = Rng(41);
+    let (qkv, gates) = gdn_inputs(&mut rng, &g, rows);
+    let bank0 = rng.f32s(slots * g.stride(), -0.5, 0.5);
+    // Every lane its own slot, backwards, the third a dropped write.
+    let slot_of: Vec<i32> = (0..rows)
+        .map(|r| if r == 2 { DROP } else { (slots - 1 - r) as i32 })
+        .collect();
+    let blocks = map.page(slots as i64 - 1) as usize + 1;
+    let laid = lay_bank(&bank0, g.stride(), slots, map, blocks);
+    let width = g.stride() / per;
+    let mut b = Bench::new();
+    let x = b.bf16(rows as u32, g.width() as u32, &qkv);
+    let z = b.zeros(Dtype::Bf16, rows as u32, (g.hv * g.dv) as u32);
+    let gt = b.f32(rows as u32, (2 * g.hv) as u32, &gates);
+    let bank = b.f32((blocks * per) as u32, width as u32, &laid);
+    let sl = b.i32(rows as u32, 1, &slot_of);
+    let y = b.zeros(Dtype::F32, rows as u32, (g.hv * g.dv) as u32);
+    let p = RecurrentPool {
+        map,
+        ..pool(bank, sl)
+    };
+    if !b
+        .run(|ctx| {
+            ssm::gated_delta(
+                ctx,
+                x,
+                z,
+                gt,
+                &p,
+                g.hk as u32,
+                g.hv as u32,
+                g.dk as u32,
+                g.dv as u32,
+                y,
+            )
+        })
+        .unwrap()
+    {
+        return None;
+    }
+    let (got, clean) = unlay_bank(&b.read_f32(bank), g.stride(), slots, map);
+    Some((b.read_f32(y), got, clean))
+}
+
+/// A state bank laid by a slot map (slot `s` at block `3s + 2`, garbage
+/// between) steps every lane as the identity bank does, bit for bit: one
+/// row a slot and blocks of rows, a fire short enough to slice its lanes
+/// and one wide enough to gather them, a dropped lane among them.
+#[test]
+fn a_mapped_state_bank_steps_what_the_identity_bank_steps() {
+    for (rows, per) in [(5usize, 1usize), (20, 1), (5, 4), (20, 4)] {
+        let Some(want) = gdn_decode_mapped(PageMap::IDENTITY, rows, per) else {
+            return;
+        };
+        let got = gdn_decode_mapped(SLOT_MAP, rows, per).expect("the device ran once");
+        let bits = |v: &[f32]| v.iter().map(|x| x.to_bits()).collect::<Vec<_>>();
+        assert_eq!(
+            bits(&got.0),
+            bits(&want.0),
+            "{rows} lanes, {per} rows a slot: y"
+        );
+        assert_eq!(
+            bits(&got.1),
+            bits(&want.1),
+            "{rows} lanes, {per} rows a slot: bank"
+        );
+        assert!(
+            got.2,
+            "{rows} lanes, {per} rows a slot: a write left its slot"
+        );
+    }
+}
+
+/// A chunked walk over a mapped bank: lanes' slots by the map, a padded
+/// lane reading the sink as `-(s) - 1` (mapped, never written).
+#[test]
+fn a_mapped_state_bank_walks_chunked_lanes_and_a_padded_one() {
+    let g = Gdn {
+        hk: 1,
+        hv: 2,
+        dk: 32,
+        dv: 24,
+    };
+    let indptr = vec![0i32, 70, 75, 76, 79];
+    let rows = 79usize;
+    // Three lanes, then a padded lane reading the sink slot 5.
+    let lane_slot = [3i32, 0, 1, -6];
+    let slots = 6usize;
+    let run = |map: PageMap| -> Option<(Vec<f32>, Vec<f32>, bool)> {
+        let mut slot_of_row = vec![DROP; rows];
+        for l in 0..lane_slot.len() {
+            for t in indptr[l]..indptr[l + 1] {
+                slot_of_row[t as usize] = lane_slot[l];
+            }
+        }
+        let mut rng = Rng(43);
+        let (qkv, gates) = gdn_inputs(&mut rng, &g, rows);
+        let bank0 = rng.f32s(slots * g.stride(), -0.5, 0.5);
+        let blocks = map.page(slots as i64 - 1) as usize + 1;
+        let laid = lay_bank(&bank0, g.stride(), slots, map, blocks);
+        let mut b = Bench::new();
+        let x = b.bf16(rows as u32, g.width() as u32, &qkv);
+        let ip = b.i32(indptr.len() as u32, 1, &indptr);
+        let z = b.zeros(Dtype::Bf16, rows as u32, (g.hv * g.dv) as u32);
+        let gt = b.f32(rows as u32, (2 * g.hv) as u32, &gates);
+        let bank = b.f32(blocks as u32, g.stride() as u32, &laid);
+        let sl = b.i32(rows as u32, 1, &slot_of_row);
+        let y = b.zeros(Dtype::F32, rows as u32, (g.hv * g.dv) as u32);
+        let p = RecurrentPool {
+            map,
+            ..pool(bank, sl)
+        };
+        let rt = RaggedTensor {
+            data: x,
+            indptr: ip,
+        };
+        if !b
+            .run(|ctx| {
+                ssm::gated_delta_chunked(
+                    ctx,
+                    rt,
+                    z,
+                    gt,
+                    &p,
+                    g.hk as u32,
+                    g.hv as u32,
+                    g.dk as u32,
+                    g.dv as u32,
+                    y,
+                )
+            })
+            .unwrap()
+        {
+            return None;
+        }
+        let (got, clean) = unlay_bank(&b.read_f32(bank), g.stride(), slots, map);
+        Some((b.read_f32(y), got, clean))
+    };
+    let Some(want) = run(PageMap::IDENTITY) else {
+        return;
+    };
+    let got = run(SLOT_MAP).expect("the device ran once");
+    let bits = |v: &[f32]| v.iter().map(|x| x.to_bits()).collect::<Vec<_>>();
+    let live = indptr[3] as usize * g.hv * g.dv;
+    assert_eq!(bits(&got.0[..live]), bits(&want.0[..live]), "y");
+    assert_eq!(bits(&got.1), bits(&want.1), "bank");
+    assert!(got.2, "a write left its slot");
 }
 
 #[test]
@@ -2419,4 +2601,118 @@ fn step_against_xla(g: &Gdn, rows: usize, seed: u64, mxu: i64) {
     );
     assert_close(&yk, &yx, 2e-3, 1e-2);
     assert_close(&bank_k[..n], &bank_xla[..n], 4e-3, 1e-2);
+}
+
+/// A GDN fire over a bf16 bank of one slot per lane (`hv · dk` rows of
+/// `dv`), the bank laid by `map`, through the step kernel (`step`, a decode)
+/// or the fused chunk kernel (a ragged fire): `y` and the bank read back as
+/// its slots, and whether no write left them.
+fn mapped_kernel_fire(
+    g: &Gdn,
+    indptr: Option<&[i32]>,
+    slot_of_row: &[i32],
+    slots: usize,
+    map: PageMap,
+    seed: u64,
+) -> Option<(Vec<f32>, Vec<f32>, bool)> {
+    let rows = slot_of_row.len();
+    let mut rng = Rng(seed);
+    let (qkv, gates) = gdn_inputs(&mut rng, g, rows);
+    let bank0: Vec<f32> = rng
+        .f32s(slots * g.stride(), -0.5, 0.5)
+        .into_iter()
+        .map(round_bf16)
+        .collect();
+    let blocks = map.page(slots as i64 - 1) as usize + 2;
+    let laid = lay_bank(&bank0, g.stride(), slots, map, blocks);
+    let mut b = Bench::new();
+    let x = b.bf16(rows as u32, g.width() as u32, &qkv);
+    let z = b.zeros(Dtype::Bf16, rows as u32, (g.hv * g.dv) as u32);
+    let gt = b.f32(rows as u32, (2 * g.hv) as u32, &gates);
+    let bank = b.bf16((blocks * g.hv * g.dk) as u32, g.dv as u32, &laid);
+    let sl = b.i32(rows as u32, 1, slot_of_row);
+    let y = b.zeros(Dtype::F32, rows as u32, (g.hv * g.dv) as u32);
+    let p = RecurrentPool {
+        map,
+        ..pool(bank, sl)
+    };
+    let ip = indptr.map(|ip| b.i32(ip.len() as u32, 1, ip));
+    let (hk, hv, dk, dv) = (g.hk as u32, g.hv as u32, g.dk as u32, g.dv as u32);
+    let ran = b
+        .run(|ctx| match ip {
+            Some(ip) => {
+                let rt = RaggedTensor {
+                    data: x,
+                    indptr: ip,
+                };
+                ssm::gated_delta_chunked(ctx, rt, z, gt, &p, hk, hv, dk, dv, y)
+            }
+            None => ssm::gated_delta(ctx, x, z, gt, &p, hk, hv, dk, dv, y),
+        })
+        .unwrap();
+    if !ran {
+        return None;
+    }
+    let (got, clean) = unlay_bank(&b.read_f32(bank), g.stride(), slots, map);
+    Some((b.read_f32(y), got, clean))
+}
+
+fn on_tpu() -> bool {
+    engine_xla::bench::client().is_some_and(|c| {
+        let c = c.lock().expect("the client");
+        c.device(0)
+            .and_then(|d| c.device_kind(d).ok())
+            .is_some_and(|k| k.to_ascii_lowercase().contains("tpu"))
+    })
+}
+
+/// TPU ONLY (skipped elsewhere; unverified off a TPU): the GDN decode step
+/// kernel and the fused chunk kernel read and land each lane's slot through
+/// `RecurrentPool::map` (the slot table mapped before the kernel), bit for
+/// bit as on the identity bank, a lane on the sink among them.
+#[test]
+fn the_gdn_kernels_step_a_mapped_bank_tpu_only() {
+    if !on_tpu() {
+        eprintln!("skipped: the GDN Mosaic kernels run on a TPU");
+        return;
+    }
+    let g = Gdn {
+        hk: 16,
+        hv: 16,
+        dk: 128,
+        dv: 128,
+    };
+    let bits = |v: &[f32]| v.iter().map(|x| x.to_bits()).collect::<Vec<_>>();
+    // decode: 12 lanes, one on the sink (the bank's last slot)
+    kernels_xla::ssm::step_kernel(Some(true));
+    let slots = 14usize;
+    let slot_of: Vec<i32> = (0..12)
+        .map(|l| {
+            if l == 5 {
+                slots as i32 - 1
+            } else {
+                (l * 5 + 2) % 13
+            }
+        })
+        .collect();
+    let want = mapped_kernel_fire(&g, None, &slot_of, slots, PageMap::IDENTITY, 61).unwrap();
+    let got = mapped_kernel_fire(&g, None, &slot_of, slots, SLOT_MAP, 61).unwrap();
+    kernels_xla::ssm::step_kernel(None);
+    assert_eq!(bits(&got.0), bits(&want.0), "step: y");
+    assert_eq!(bits(&got.1), bits(&want.1), "step: bank");
+    assert!(got.2, "step: a write left its slot");
+    // chunks: lanes of 300 and 141 rows
+    kernels_xla::ssm::fused_chunks(Some(true));
+    let indptr = [0i32, 300, 441];
+    let mut slot_of_row = vec![DROP; 448];
+    slot_of_row[..300].fill(3);
+    slot_of_row[300..441].fill(1);
+    let want =
+        mapped_kernel_fire(&g, Some(&indptr), &slot_of_row, 5, PageMap::IDENTITY, 62).unwrap();
+    let got = mapped_kernel_fire(&g, Some(&indptr), &slot_of_row, 5, SLOT_MAP, 62).unwrap();
+    kernels_xla::ssm::fused_chunks(None);
+    let live = 441 * g.hv * g.dv;
+    assert_eq!(bits(&got.0[..live]), bits(&want.0[..live]), "chunks: y");
+    assert_eq!(bits(&got.1), bits(&want.1), "chunks: bank");
+    assert!(got.2, "chunks: a write left its slot");
 }

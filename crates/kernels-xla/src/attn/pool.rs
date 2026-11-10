@@ -12,7 +12,7 @@ use crate::check::expect;
 use crate::error::{Error, refuse};
 use crate::hlo::{Built, Cmp, Combine, Elem, Fold, Func, ScatterDims, Val};
 use crate::lanes::{DROP, ci, clamp_i, cmp_i, flat_i32, loop_at_most, nonzero, take};
-use crate::tensor::{KvPool, Landing, Operand, Stored};
+use crate::tensor::{KvPool, Landing, Operand, PageMap, Stored};
 
 /// Keys per step of the pooled readers' flash loop.
 const KEY_BLOCK: i64 = 256;
@@ -73,18 +73,20 @@ pub(crate) fn put_cols(f: &mut Func, table: Val, at: Val, rows: Val) -> Built<Va
 }
 
 /// A KV pool's page tables as flat i32 vectors (indices, then indptr), and
-/// its page size.
+/// its page size; the indices name the plane's own pages (`map`).
 pub(crate) fn paging(
     f: &mut Func,
     op: &'static str,
     page_indices: Operand,
     page_indptr: Operand,
     page_size: i32,
+    map: PageMap,
 ) -> Result<(Val, Val, i64), Error> {
     if page_size <= 0 {
         return Err(refuse(op, "the pool's page size is zero"));
     }
     let indices = flat_i32(f, page_indices)?;
+    let indices = map.apply(f, indices)?;
     let indptr = flat_i32(f, page_indptr)?;
     Ok((indices, indptr, i64::from(page_size)))
 }
@@ -292,7 +294,8 @@ pub fn boundary_prefill(
 /// Files each row's compressor projections (`kv`, gate logits `score`) into
 /// the state planes at `write_page · page_size + write_offset`; a negative
 /// page or an offset outside the page drops the row. `pages` gives the
-/// paging. The new `(state_kv, state_score)`.
+/// paging, `maps` where each state plane's pages lie. The new
+/// `(state_kv, state_score)`: each [`state_write_plane`] of its own.
 pub fn state_write(
     f: &mut Func,
     kv: Operand,
@@ -304,7 +307,75 @@ pub fn state_write(
     ratio: u32,
     state_kv: Operand,
     state_score: Operand,
+    maps: [PageMap; 2],
 ) -> Result<(Val, Val), Error> {
+    state_checks(
+        kv,
+        score,
+        pages,
+        write_page,
+        write_offset,
+        head_dim,
+        ratio,
+        state_kv,
+        state_score,
+    )?;
+    let sk = state_write_plane(f, kv, pages, write_page, write_offset, state_kv, maps[0])?;
+    let ss = state_write_plane(
+        f,
+        score,
+        pages,
+        write_page,
+        write_offset,
+        state_score,
+        maps[1],
+    )?;
+    Ok((sk, ss))
+}
+
+/// One compressor state plane of [`state_write`]: `src` (the kv
+/// projection or the gate logits) filed into `state` at
+/// `map(write_page) · page_size + write_offset`. The new `state`. (A
+/// lowering on the shared chunk pool lands one plane per call.)
+pub fn state_write_plane(
+    f: &mut Func,
+    src: Operand,
+    pages: &KvPool<impl Stored>,
+    write_page: Operand,
+    write_offset: Operand,
+    state: Operand,
+    map: PageMap,
+) -> Result<Val, Error> {
+    const OP: &str = "attn.pool_state_write";
+    expect(OP, src, &[Dtype::Bf16])?;
+    if pages.page_size <= 0 {
+        return Err(refuse(OP, "the source pool's page size is zero"));
+    }
+    if state.width < src.width {
+        return Err(refuse(OP, "the state slab is narrower than the row"));
+    }
+    let rows = nonzero(OP, "rows", src.rows)?;
+    long_enough(OP, "write-page table", write_page, rows)?;
+    long_enough(OP, "write-offset table", write_offset, rows)?;
+    let (n, ps) = (i64::from(rows), i64::from(pages.page_size));
+    let wp = flat_i32(f, write_page)?;
+    let wo = flat_i32(f, write_offset)?;
+    let at = write_cell(f, wp, wo, n, ps, map)?;
+    Ok(put_cols(f, state.val, at, src.val)?)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn state_checks(
+    kv: Operand,
+    score: Operand,
+    pages: &KvPool<impl Stored>,
+    write_page: Operand,
+    write_offset: Operand,
+    head_dim: u32,
+    ratio: u32,
+    state_kv: Operand,
+    state_score: Operand,
+) -> Result<(), Error> {
     const OP: &str = "attn.pool_state_write";
     expect(OP, kv, &[Dtype::Bf16])?;
     if pages.page_size <= 0 {
@@ -333,19 +404,21 @@ pub fn state_write(
     let rows = nonzero(OP, "rows", kv.rows)?;
     long_enough(OP, "write-page table", write_page, rows)?;
     long_enough(OP, "write-offset table", write_offset, rows)?;
-    let (n, ps) = (i64::from(rows), i64::from(pages.page_size));
-    let wp = flat_i32(f, write_page)?;
-    let wo = flat_i32(f, write_offset)?;
-    let at = write_cell(f, wp, wo, n, ps)?;
-    let sk = put_cols(f, state_kv.val, at, kv.val)?;
-    let ss = put_cols(f, state_score.val, at, score.val)?;
-    Ok((sk, ss))
+    Ok(())
 }
 
-/// `page · ps + off` of each row, or [`DROP`] when the page is negative or
-/// the offset is outside the page.
-pub(crate) fn write_cell(f: &mut Func, page: Val, off: Val, n: i64, ps: i64) -> Built<Val> {
+/// `map(page) · ps + off` of each row, or [`DROP`] when the page is
+/// negative or the offset is outside the page.
+pub(crate) fn write_cell(
+    f: &mut Func,
+    page: Val,
+    off: Val,
+    n: i64,
+    ps: i64,
+    map: PageMap,
+) -> Built<Val> {
     let page = first(f, page, n)?;
+    let page = map.apply(f, page)?;
     let off = first(f, off, n)?;
     let a = cmp_i(f, Cmp::Ge, page, 0)?;
     let b = cmp_i(f, Cmp::Ge, off, 0)?;
@@ -379,6 +452,7 @@ pub fn gather(
     state_score: Operand,
     ape: Option<Operand>,
     entries: Landing,
+    maps: [PageMap; 2],
 ) -> Result<Val, Error> {
     const OP: &str = "attn.pool_gather";
     expect(OP, entries, &[Dtype::Bf16])?;
@@ -439,7 +513,21 @@ pub fn gather(
         i64::from(coff),
     );
     let window = coff * r;
-    let (indices, indptr, ps) = paging(f, OP, page_indices, page_indptr, pages.page_size)?;
+    let (raw, indptr, ps) = paging(
+        f,
+        OP,
+        page_indices,
+        page_indptr,
+        pages.page_size,
+        PageMap::IDENTITY,
+    )?;
+    let indices = maps[0].apply(f, raw)?;
+    let score_indices = if maps[1] == maps[0] {
+        indices
+    } else {
+        maps[1].apply(f, raw)?
+    };
+    let indices = [indices, score_indices];
     let bpos = flat_i32(f, boundary_pos)?;
     let breq = flat_i32(f, boundary_req)?;
     let bpos = first(f, bpos, n)?;
@@ -542,7 +630,7 @@ fn gather_rows(
     bpos: Val,
     breq: Val,
     n: i64,
-    indices: Val,
+    indices: [Val; 2],
     indptr: Val,
     ps: i64,
     hd: i64,
@@ -563,11 +651,17 @@ fn gather_rows(
     let pos = f.sub(pos, back)?;
     let live = cmp_i(f, Cmp::Ge, pos, 0)?;
     let req = f.broadcast(breq, &[n, window], &[0])?;
-    let cell = cell_of(f, indices, indptr, req, pos, ps)?;
+    let cell = cell_of(f, indices[0], indptr, req, pos, ps)?;
     let cell = f.reshape(cell, &[n * window])?;
+    let score_cell = if indices[1] == indices[0] {
+        cell
+    } else {
+        let c = cell_of(f, indices[1], indptr, req, pos, ps)?;
+        f.reshape(c, &[n * window])?
+    };
     let pitch = f.dims(sk)[1];
     let kvr = f.take_rows(sk, cell)?;
-    let scr = f.take_rows(ss, cell)?;
+    let scr = f.take_rows(ss, score_cell)?;
     let kvr = f.reshape(kvr, &[n, window, pitch])?;
     let scr = f.reshape(scr, &[n, window, pitch])?;
     // Position i < ratio reads columns [0, hd), the rest [hd, 2hd).
@@ -655,7 +749,14 @@ pub fn kv_append(
     long_enough(OP, "boundary position table", boundary_pos, rows)?;
     long_enough(OP, "boundary request table", boundary_req, rows)?;
     let n = i64::from(rows);
-    let (indices, indptr, ps) = paging(f, OP, page_indices, page_indptr, pool.page_size)?;
+    let (indices, indptr, ps) = paging(
+        f,
+        OP,
+        page_indices,
+        page_indptr,
+        pool.page_size,
+        pool.keys_map,
+    )?;
     let bpos = flat_i32(f, boundary_pos)?;
     let breq = flat_i32(f, boundary_req)?;
     let bpos = first(f, bpos, n)?;
@@ -1064,6 +1165,7 @@ pub fn lse(
         planes.page_indices,
         planes.page_indptr,
         entries.page_size,
+        entries.keys_map,
     )?;
     let qv = call.q.val;
     let pos = flat_i32(f, call.positions)?;
@@ -1108,6 +1210,9 @@ pub fn lse(
             values: table,
             geom,
             latent: true,
+            // `paging` mapped the table's pages already.
+            keys_map: crate::tensor::PageMap::IDENTITY,
+            values_map: crate::tensor::PageMap::IDENTITY,
         };
         let h = Heads {
             kvh: 1,

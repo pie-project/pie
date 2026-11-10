@@ -225,6 +225,8 @@ fn a_pooled_reader_whose_bound_closes_no_block_reads_nothing() {
         max_pages: 3,
         seq_stride: hd as u64,
         head_stride: hd as u64,
+        keys_map: kernels_xla::tensor::PageMap::IDENTITY,
+        values_map: kernels_xla::tensor::PageMap::IDENTITY,
     };
     let o = b.bf16(
         rows as u32,

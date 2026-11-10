@@ -568,6 +568,8 @@ impl Pools {
                         max_pages: seat.max_pages,
                         seq_stride: u64::from(kv_heads) * u64::from(head_dim),
                         head_stride: u64::from(head_dim),
+                        keys_map: kernels_xla::tensor::PageMap::IDENTITY,
+                        values_map: kernels_xla::tensor::PageMap::IDENTITY,
                     })
                 }
                 Shape::State { .. } => CachePool::Recurrent(RecurrentPool {
@@ -575,6 +577,7 @@ impl Pools {
                     slots: slot_of_row,
                     conv_state: roots[0],
                     new_conv_state: roots[0],
+                    map: kernels_xla::tensor::PageMap::IDENTITY,
                 }),
             });
         }
