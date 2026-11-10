@@ -153,7 +153,10 @@ fn z_image(path: &str, _row: &CacheRow) -> String {
 }
 
 fn hunyuan_image_3(path: &str, _row: &CacheRow) -> String {
-    path.to_string()
+    match parts(path)[..] {
+        ["layers", l, "kv"] => format!("kv.{l}"),
+        _ => path.to_string(),
+    }
 }
 
 /// Every listed deployment of `package`, at one rank and at each count of

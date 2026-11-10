@@ -116,6 +116,8 @@ def layout(id, deploy):
     kv_w = d.kv_heads * hd
     iw = d.moe_inter
     sw = d.shared_inter
+    # An attention's keys and values, two planes of its kv heads a token.
+    kv = lambda: state([tokens, 2, d.kv_heads, hd], deploy.kv)
 
     def layer(l):
         return struct(
@@ -124,7 +126,7 @@ def layout(id, deploy):
             q_norm = weight([hd]),
             k_norm = weight([hd]),
             o_proj = weight([hidden, q_w], banks),
-            kv = "kv.{}".format(l),
+            kv = kv(),
             mlp_norm = weight([hidden]),
             router = weight([d.experts, hidden]),
             experts_gate_up = weight([d.experts, 2 * iw, hidden], experts),
@@ -139,7 +141,6 @@ def layout(id, deploy):
     hw = d.head_hidden
     return struct(
         dims = d,
-        kv = deploy.kv,
         rope_axes = ROPE_AXES,
         t_freq_dim = T_FREQ_DIM,
         latent_channels = LATENT_CHANNELS,
@@ -294,12 +295,6 @@ ROPE_THETA = 10000.0
 T_MAX_PERIOD = 10000.0
 GN_GROUPS = 32
 GN_EPS = 1e-5
-
-def caches(m, c):
-    kv = c.kv_space(m.kv)
-    plane = m.kv_width
-    for w in m.layers:
-        c.kv(kv, w.kv, [plane, plane], m.dims.head_dim, heads = True)
 
 def on_canvas():
     """The canvas rows: the denoise reading's, with the mask the canvas
