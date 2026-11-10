@@ -5,7 +5,7 @@
 //!
 //! ```text
 //! wafer-compile plan (--model <deployment> | --shape <shape.json>) [--preset <name>] [--set K=V,...]
-//!                --out <dir>
+//!                [--positions N] --out <dir>
 //! wafer-compile build --plan <plan.json> --out <dir> [--emit floor,rcfg,kernels,layout,host,plan,
 //!                 bindings,program] [--levers K:V,...] [--kernels <programs/wafer dir>]
 //! ```
@@ -14,7 +14,9 @@
 //! [`tiling`](kernels_cerebras::spatial::family::Family::tiling): the cut a prep tiles by, with
 //! the preset's name).
 //! `--model` names a catalog deployment (`qwen35-d9b-bf16-kv-bf16`); `--preset` one of the
-//! serving family's presets (else the first that builds); `--set` overrides its keys.
+//! serving family's presets (else the first that builds); `--set` overrides its keys;
+//! `--positions` the positions the program must serve (else as many as the preset holds). The
+//! preset carries the kernel levers its program ships with; `build --levers` sets more over them.
 //!
 //! `build` writes, under `<dir>`:
 //! - `floor.json`: units (rects, cx / cy, layers), relays, head block, stores, and the kind
@@ -44,7 +46,7 @@ use kernels_cerebras::spatial::floor::{HeadBlock, Rect, StoreBlock, Unit};
 use kernels_cerebras::spatial::plan::{Plan, Shape};
 use kernels_cerebras::spatial::program::Program;
 use kernels_cerebras::spatial::role::Kind;
-use kernels_cerebras::spatial::target;
+use kernels_cerebras::spatial::target::{self, Ask};
 use serde::Serialize;
 
 const EMITS: [&str; 8] = [
@@ -52,7 +54,7 @@ const EMITS: [&str; 8] = [
 ];
 
 const USAGE: &str = "usage: wafer-compile plan (--model <deployment> | --shape <shape.json>) \
-     [--preset <name>] [--set K=V,...] --out <dir>\n       wafer-compile build --plan <plan.json> \
+     [--preset <name>] [--set K=V,...] [--positions N] --out <dir>\n       wafer-compile build --plan <plan.json> \
      --out <dir> [--emit a,b] [--levers K:V,...] [--kernels <dir>]";
 
 fn main() {
@@ -113,8 +115,17 @@ fn mkdir(dir: &Path) -> Result<(), String> {
 
 /// `plan`: the plan of a deployment's trace (or of a shape file) and its tiling.
 fn plan(args: &[String]) -> Result<(), String> {
-    let f = flags(args, &["--model", "--shape", "--preset", "--set", "--out"])?;
-    let (preset, set) = (get(&f, "--preset"), get(&f, "--set").unwrap_or(""));
+    let f = flags(
+        args,
+        &["--model", "--shape", "--preset", "--set", "--positions", "--out"],
+    )?;
+    let ask = Ask {
+        preset: get(&f, "--preset").map(str::to_string),
+        set: get(&f, "--set").unwrap_or("").to_string(),
+        positions: get(&f, "--positions")
+            .map(|n| n.parse().map_err(|e| format!("--positions {n}: {e}")))
+            .transpose()?,
+    };
     let planned = match (get(&f, "--model"), get(&f, "--shape")) {
         (Some(name), None) => {
             let catalog = poem_compiler::catalog::repository();
@@ -124,9 +135,9 @@ fn plan(args: &[String]) -> Result<(), String> {
             let trace = d
                 .try_trace(poem_ir::Platform::Cerebras)
                 .map_err(|e| format!("--model {name}: {e}"))?;
-            target::plan(&trace, preset, set)?
+            target::plan(&trace, &ask)?
         }
-        (None, Some(path)) => target::plan_shape(read::<Shape>(path)?, preset, set)?,
+        (None, Some(path)) => target::plan_shape(read::<Shape>(path)?, &ask)?,
         _ => return Err(format!("--model or --shape, one of them\n{USAGE}")),
     };
     let out = PathBuf::from(get(&f, "--out").ok_or(USAGE)?);
@@ -150,7 +161,7 @@ fn build(args: &[String]) -> Result<(), String> {
     if let Some(e) = emit.iter().find(|e| !EMITS.contains(e)) {
         return Err(format!("--emit {e}: of {}", EMITS.join(",")));
     }
-    let levers = Levers::parse(get(&f, "--levers").unwrap_or(""))?;
+    let levers = Levers::of(&plan.levers, get(&f, "--levers").unwrap_or(""))?;
     let kdir = get(&f, "--kernels")
         .map(PathBuf::from)
         .or_else(|| std::env::var_os("WAFER_KERNELS").map(PathBuf::from))

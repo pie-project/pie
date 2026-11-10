@@ -15,7 +15,7 @@ use crate::spatial::block::segments::Scores;
 use crate::spatial::block::shared_kv::SharedKv;
 use crate::spatial::block::token_loop::TokenLoop;
 use crate::spatial::block::units::{UnitCopies, Units};
-use crate::spatial::family::{Family, ceil_to};
+use crate::spatial::family::{Family, Row, ceil_to, table};
 use crate::spatial::floor::{UnitGrid, UnitLayout};
 use crate::spatial::kernels::gemma;
 use crate::spatial::plan::{
@@ -175,28 +175,23 @@ impl Arrangement {
 /// The presets: the unit shape that picks the arrangement (weight columns, rows, units), the head's
 /// rows, the global KV entries a KV row (NEG; the context is NEG x the KV rows), the reduction
 /// groups and the posted loop.
-const PRESETS: &[(&str, [u32; 7])] = &[
-    // name, [PX, PY, NU, HR, NEG, G2, G2W]
-    ("e2b", [256, 128, 7, 1130, 32, 16, 24]),
-    ("e4b", [256, 160, 7, 1130, 20, 16, 24]),
-    ("tiny", [8, 8, 5, 32, 4, 2, 2]),
+const PRESETS: &[Row<7>] = &[
+    // name, [PX, PY, NU, HR, NEG, G2, G2W], overrides, levers
+    ("e2b", [256, 128, 7, 1130, 32, 16, 24], "", "WSPEC:2"),
+    // E4B as on the chip (request 0974): PYW 128, NES 4, NEG 20
+    ("e4b", [256, 160, 7, 1130, 20, 16, 24], "", "DIAG:0,WSPEC:0,w.FIFOW:16"),
+    // E4B at its first staged params (PYW 160, NEG 16)
+    ("e4b-meta", [256, 160, 7, 1130, 20, 16, 24], "PYW=160,NEG=16", "w.FIFOW:16"),
+    ("tiny", [8, 8, 5, 32, 4, 2, 2], "", ""),
 ];
 
 impl Family for Gemma {
     fn presets(&self) -> Vec<Preset> {
-        let keys = ["PX", "PY", "NU", "HR", "NEG", "G2", "G2W"];
-        PRESETS
-            .iter()
-            .map(|(name, g)| {
-                let mut kv: Vec<(&str, f64)> = keys
-                    .iter()
-                    .zip(g)
-                    .map(|(k, v)| (*k, f64::from(*v)))
-                    .collect();
-                kv.push(("LOOP", 64.0));
-                Preset::new(name, &kv)
-            })
-            .collect()
+        table(
+            ["PX", "PY", "NU", "HR", "NEG", "G2", "G2W"],
+            PRESETS,
+            &[("LOOP", 64.0)],
+        )
     }
 
     /// Units of K = layers / NU (S .. S G); a row's dims the hidden over PY; the sliding window
@@ -283,6 +278,7 @@ impl Family for Gemma {
             shape: s.clone(),
             partition,
             contract,
+            levers: pr.levers.clone(),
         })
     }
 

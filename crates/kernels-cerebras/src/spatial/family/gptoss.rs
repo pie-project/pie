@@ -9,7 +9,7 @@ use crate::spatial::abi::Kernels;
 use crate::spatial::block::Block;
 use crate::spatial::block::band::{Band, BandLoop};
 use crate::spatial::block::moe::{AttnScores, MoeCopies, MoeUnits, Router};
-use crate::spatial::family::{Family, ceil_to};
+use crate::spatial::family::{Family, Row, ceil_to, table};
 use crate::spatial::floor::{UnitGrid, UnitLayout};
 use crate::spatial::kernels::gptoss::{self, Dims};
 use crate::spatial::plan::{
@@ -27,10 +27,16 @@ pub struct GptOss;
 /// every slot a unit), the scores and router segments (SWA, SWR), the band's vocabulary columns
 /// (HVC), KV entries a row (NE), the RoPE tables' levels (NLV), the reduction groups (G2, G2W);
 /// the logits' prescale (HSCALE: the band head's 2^15) and the posted loop (LOOP).
-const PRESETS: &[(&str, [u32; 11])] = &[
-    // name, [AX, MX, PY, UNX, UNY, SWA, SWR, HVC, NE, G2, G2W]
-    ("full", [64, 288, 160, 2, 6, 8, 32, 748, 128, 16, 24]),
-    ("tiny", [4, 8, 4, 2, 1, 2, 8, 26, 128, 2, 2]),
+const PRESETS: &[Row<11>] = &[
+    // name, [AX, MX, PY, UNX, UNY, SWA, SWR, HVC, NE, G2, G2W], overrides, levers
+    // (request 0887: CYV 2, GLUV 1)
+    (
+        "full",
+        [64, 288, 160, 2, 6, 8, 32, 748, 128, 16, 24],
+        "",
+        "DIAG:0,GLUV:1,CYV:2",
+    ),
+    ("tiny", [4, 8, 4, 2, 1, 2, 8, 26, 8, 2, 2], "", ""),
 ];
 
 impl Family for GptOss {
@@ -38,18 +44,11 @@ impl Family for GptOss {
         let keys = [
             "AX", "MX", "PY", "UNX", "UNY", "SWA", "SWR", "HVC", "NE", "G2", "G2W",
         ];
-        PRESETS
-            .iter()
-            .map(|(name, g)| {
-                let mut kv: Vec<(&str, f64)> = keys
-                    .iter()
-                    .zip(g)
-                    .map(|(k, v)| (*k, f64::from(*v)))
-                    .collect();
-                kv.extend([("NLV", 5.0), ("HSCALE", 32768.0), ("LOOP", 64.0)]);
-                Preset::new(name, &kv)
-            })
-            .collect()
+        table(
+            keys,
+            PRESETS,
+            &[("NLV", 5.0), ("HSCALE", 32768.0), ("LOOP", 64.0)],
+        )
     }
 
     /// Units of K = layers / units, a row's dims the hidden over PY; a scores segment a KV head's
@@ -131,6 +130,7 @@ impl Family for GptOss {
             shape: s.clone(),
             partition,
             contract,
+            levers: pr.levers.clone(),
         })
     }
 

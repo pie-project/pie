@@ -70,6 +70,26 @@ pub fn serving(shape: &Shape) -> FamilyId {
     }
 }
 
+/// A row of a family's preset table: its name, the values of the family's keys, and the
+/// overrides (`K=V,...`) and kernel levers (`K:V,...`) its shipping program was measured with.
+pub type Row<const N: usize> = (&'static str, [u32; N], &'static str, &'static str);
+
+/// A family's presets from its table: each row's keys, then `extra` (keys every preset of the
+/// family states the same), then the row's overrides, and its levers.
+pub fn table<const N: usize>(keys: [&str; N], rows: &[Row<N>], extra: &[(&str, f64)]) -> Vec<Preset> {
+    rows.iter()
+        .map(|&(name, values, set, levers)| {
+            let mut kv: Vec<(&str, f64)> = keys.iter().copied().zip(values.map(f64::from)).collect();
+            kv.extend_from_slice(extra);
+            let mut p = Preset::new(name, &kv)
+                .set(set)
+                .expect("a preset table's overrides are K=V");
+            p.levers = levers.to_string();
+            p
+        })
+        .collect()
+}
+
 /// Layers `layers` in units of `k`, every unit the same kinds; the unit count.
 pub fn units_of(layers: &[LayerKind], k: u32, family: &str) -> R<u32> {
     let n = layers.len() as u32;

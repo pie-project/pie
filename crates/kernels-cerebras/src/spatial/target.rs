@@ -306,6 +306,9 @@ pub struct Wafer {
     pub shape: Shape,
     pub preset: Option<String>,
     pub set: String,
+    /// The positions the program must serve (the serving context); `None`: as many as the
+    /// preset holds.
+    pub positions: Option<u32>,
 }
 
 impl Wafer {
@@ -318,18 +321,33 @@ impl Wafer {
             .enumerate()
             .filter(|(_, p)| self.preset.as_ref().is_none_or(|n| *n == p.name))
             .filter_map(|(order, p)| {
+                let mut preset = p.set(&self.set).ok()?;
+                if let Some(n) = self.positions {
+                    preset.keys.insert("CTX".into(), f64::from(n));
+                }
                 Some(Candidate {
                     family: id,
-                    preset: p.set(&self.set).ok()?,
+                    preset,
                     order,
                 })
             })
             .collect()
     }
 
-    /// The plan `c` makes of the shape.
+    /// The plan `c` makes of the shape, serving exactly the positions asked for (if any).
     pub fn plan_of(&self, c: &Candidate) -> R<Plan> {
-        family::of(c.family).plan(&self.shape, &c.preset)
+        let mut plan = family::of(c.family).plan(&self.shape, &c.preset)?;
+        if let Some(n) = self.positions {
+            let held = plan.contract.positions;
+            if n > held {
+                return Err(format!(
+                    "preset {}: {n} positions, of at most {held}",
+                    c.preset.name
+                ));
+            }
+            plan.contract.positions = n;
+        }
+        Ok(plan)
     }
 
     /// `c` with the plan it makes.
@@ -394,15 +412,10 @@ impl SpatialTarget for Wafer {
     }
 }
 
-/// The plan of `trace` through poem's spatial pass: its shape, then the named preset (else the
-/// first of the family's that builds) with `set`'s overrides.
-pub fn plan(trace: &Trace, preset: Option<&str>, set: &str) -> R<Planned> {
-    Preset::default().set(set)?;
-    let wafer = Wafer {
-        shape: shape(trace)?,
-        preset: preset.map(str::to_string),
-        set: set.to_string(),
-    };
+/// The plan of `trace` through poem's spatial pass: its shape, then the preset `ask` names (else
+/// the first of the family's that builds) with its overrides and positions.
+pub fn plan(trace: &Trace, ask: &Ask) -> R<Planned> {
+    let wafer = ask.target(shape(trace)?)?;
     match poem_compiler::spatial::plan(trace, &wafer) {
         Ok(p) => wafer.planned(p.partition),
         Err(poem_compiler::spatial::SpatialError::Unfit(why)) => Err(wafer.refused(why)),
@@ -412,14 +425,37 @@ pub fn plan(trace: &Trace, preset: Option<&str>, set: &str) -> R<Planned> {
 }
 
 /// The plan of a shape stated outright, chosen as [`plan`] chooses.
-pub fn plan_shape(shape: Shape, preset: Option<&str>, set: &str) -> R<Planned> {
-    Preset::default().set(set)?;
-    Wafer {
-        shape,
-        preset: preset.map(str::to_string),
-        set: set.to_string(),
+pub fn plan_shape(shape: Shape, ask: &Ask) -> R<Planned> {
+    ask.target(shape)?.choose()
+}
+
+/// What a plan is asked for beyond the model: a preset by name (else the first of the family's
+/// that builds), overrides of its keys (`K=V,...`), and the positions it must serve.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Ask {
+    pub preset: Option<String>,
+    pub set: String,
+    pub positions: Option<u32>,
+}
+
+impl Ask {
+    fn target(&self, shape: Shape) -> R<Wafer> {
+        Preset::default().set(&self.set)?;
+        Ok(Wafer {
+            shape,
+            preset: self.preset.clone(),
+            set: self.set.clone(),
+            positions: self.positions,
+        })
     }
-    .choose()
+
+    /// A named preset, nothing else.
+    pub fn preset(name: &str) -> Ask {
+        Ask {
+            preset: Some(name.into()),
+            ..Ask::default()
+        }
+    }
 }
 
 #[cfg(test)]
@@ -484,7 +520,7 @@ mod tests {
                 (FamilyId::Dense, 8, 4, 256, 256, 16, 216),
             ),
         ] {
-            let p = plan(&trace(name), Some(preset), "").unwrap().plan;
+            let p = plan(&trace(name), &Ask::preset(preset)).unwrap().plan;
             let q = &p.partition;
             let got = (
                 p.family,
@@ -503,7 +539,7 @@ mod tests {
     /// stretched: frequencies of their own), eps 1e-5; with no preset named, the first that fits.
     #[test]
     fn llama_plans_from_its_trace() {
-        let p = plan(&trace("llama31-8b-bf16-kv-bf16"), None, "")
+        let p = plan(&trace("llama31-8b-bf16-kv-bf16"), &Ask::default())
             .unwrap()
             .plan;
         let s = &p.shape;
@@ -520,12 +556,31 @@ mod tests {
         assert!(f[63] < 500_000f32.powf(-126.0 / 128.0) / 7.0);
     }
 
+    /// The positions asked for bound the plan: the RoPE tables' levels follow them, and more than
+    /// the preset holds refuse it.
+    #[test]
+    fn positions_bound_the_plan() {
+        let t = trace("qwen35-d9b-bf16-kv-bf16");
+        let ask = |positions| Ask {
+            preset: Some("9b".into()),
+            positions,
+            ..Ask::default()
+        };
+        let full = plan(&t, &ask(None)).unwrap().plan;
+        assert_eq!((full.contract.positions, full.contract.rope_levels), (16384, 5));
+        assert_eq!(full.levers, "NPX:1,DIAG:0,TSTAMP:0,XKEEP:0,HACC16:0,ATTL:2");
+        let short = plan(&t, &ask(Some(4096))).unwrap().plan;
+        assert_eq!((short.contract.positions, short.contract.rope_levels), (4096, 4));
+        let e = plan(&t, &ask(Some(1 << 20))).unwrap_err();
+        assert!(e.contains("of at most 16384"), "{e}");
+    }
+
     /// With no preset named, the pass keeps the first of the family's that builds: Qwen3.5-0.8B's
     /// 24 layers leave the 9B's eight unit slots two short, so it takes its own.
     #[test]
     fn the_first_preset_that_builds_is_kept() {
-        let p = plan(&trace("qwen35-d0.8b-bf16-kv-bf16"), None, "").unwrap();
+        let p = plan(&trace("qwen35-d0.8b-bf16-kv-bf16"), &Ask::default()).unwrap();
         assert_eq!(p.preset.name, "0.8b");
-        assert!(plan(&trace("qwen35-d0.8b-bf16-kv-bf16"), Some("e2b"), "").is_err());
+        assert!(plan(&trace("qwen35-d0.8b-bf16-kv-bf16"), &Ask::preset("e2b")).is_err());
     }
 }

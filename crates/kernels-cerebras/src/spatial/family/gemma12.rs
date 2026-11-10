@@ -10,7 +10,7 @@ use crate::spatial::block::Block;
 use crate::spatial::block::head::{HeadCopies, Hemb};
 use crate::spatial::block::head_groups::HeadGroups;
 use crate::spatial::block::row_runs::{RowRuns, RunCopies};
-use crate::spatial::family::{Family, ceil_to};
+use crate::spatial::family::{Family, Row, ceil_to, table};
 use crate::spatial::floor::{UnitGrid, UnitLayout};
 use crate::spatial::kernels::gemma12::{self, Dims};
 use crate::spatial::plan::{
@@ -29,13 +29,16 @@ type R<T> = Result<T, String>;
 /// window an exact ring of 8 x 128), the scores segment width (SWA), the head groups' sizes
 /// (attention rows in groups of GA, plain rows in groups of GW, never across the CY row), the
 /// units (NU), the global KV entries a KV row (NEG), the reduction groups (G2, G2W).
-const PRESETS: &[(&str, [u32; 13])] = &[
-    // name, [PX, PY, HR, HcA, HcW, RA, SWA, GA, GW, NU, NEG, G2, G2W]
+const PRESETS: &[Row<13>] = &[
+    // name, [PX, PY, HR, HcA, HcW, RA, SWA, GA, GW, NU, NEG, G2, G2W], overrides, levers
+    // (requests 0920 / 0921: the exact ring, 54 head columns)
     (
         "g12",
         [344, 283, 1153, 12, 15, 128, 43, 6, 5, 8, 32, 16, 24],
+        "",
+        "DIAG:0",
     ),
-    ("tiny", [8, 8, 18, 2, 3, 3, 4, 3, 2, 4, 12, 2, 2]),
+    ("tiny", [8, 8, 18, 2, 3, 3, 4, 3, 2, 4, 12, 2, 2], "", ""),
 ];
 
 /// Head groups: the attention rows in groups of `ga`, the plain rows above the CY row and those
@@ -88,18 +91,7 @@ impl Family for Gemma12 {
         let keys = [
             "PX", "PY", "HR", "HcA", "HcW", "RA", "SWA", "GA", "GW", "NU", "NEG", "G2", "G2W",
         ];
-        PRESETS
-            .iter()
-            .map(|(name, g)| {
-                let mut kv: Vec<(&str, f64)> = keys
-                    .iter()
-                    .zip(g)
-                    .map(|(k, v)| (*k, f64::from(*v)))
-                    .collect();
-                kv.push(("LOOP", 64.0));
-                Preset::new(name, &kv)
-            })
-            .collect()
+        table(keys, PRESETS, &[("LOOP", 64.0)])
     }
 
     /// Units of K = layers / NU (S .. S G) in two unit columns; rows in two runs (the attention
@@ -179,6 +171,7 @@ impl Family for Gemma12 {
                 token_loop: true,
                 logit_scale: 1.0,
             },
+            levers: pr.levers.clone(),
         };
         // the kernels' shape of it (q heads a segment, the MLP's columns) must hold
         Dims::of(&plan)?;

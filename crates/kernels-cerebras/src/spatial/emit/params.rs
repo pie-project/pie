@@ -20,7 +20,14 @@ pub struct Levers {
 }
 
 impl Levers {
-    /// `K:V,K:V` (or `K=V`), as `link.sh`'s extra params and `wafer-compile --levers` take them.
+    /// A plan's levers with `more` set over them.
+    pub fn of(plan: &str, more: &str) -> Result<Levers, String> {
+        let mut l = Levers::parse(plan)?;
+        l.items.extend(Levers::parse(more)?.items);
+        Ok(l)
+    }
+
+    /// `K:V,K:V` (or `K=V`), as `wafer-compile --levers` takes them.
     pub fn parse(s: &str) -> Result<Levers, String> {
         let mut items = BTreeMap::new();
         for kv in s.split(',').filter(|s| !s.is_empty()) {

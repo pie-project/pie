@@ -63,7 +63,8 @@ def capture(c, top, B, G):
     # the plan
     pl = os.path.join(d, "plan")
     src = ["--model", c["model"]] if "model" in c else ["--shape", os.path.join(HERE, c["shape"])]
-    sh([G, "plan"] + src + ["--preset", c["preset"], "--set", c["set"], "--out", pl], log=os.path.join(d, "plan.log"))
+    pos = ["--positions", str(c["positions"])] if c.get("positions") else []
+    sh([G, "plan"] + src + ["--preset", c["preset"], "--set", c["set"]] + pos + ["--out", pl], log=os.path.join(d, "plan.log"))
     if c["kind"] == "full":
         prep, prefix = os.path.join(JOB, c["prep"]), c["prefix"]
     else:

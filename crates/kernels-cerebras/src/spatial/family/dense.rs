@@ -10,7 +10,7 @@ use crate::spatial::block::head::{HeadCopies, HeadEast, Hemb};
 use crate::spatial::block::segments::{Onorm, Scores};
 use crate::spatial::block::token_loop::TokenLoop;
 use crate::spatial::block::units::{UnitCopies, Units};
-use crate::spatial::family::{Family, units_of};
+use crate::spatial::family::{Family, Row, table, units_of};
 use crate::spatial::floor::{UnitGrid, UnitLayout};
 use crate::spatial::kernels::dense;
 use crate::spatial::plan::{
@@ -41,39 +41,37 @@ fn gap(units: u32, (unx, uny): (u32, u32)) -> R<Option<(u32, u32)>> {
 /// the layers over K, one short of the slots leaves a gap slot), layers a unit (K), the head's rows
 /// and vocabulary rows a head PE (HR, VR), KV entries a row (NE). A new size adds one; the tiny
 /// ones are the simulator's.
-const PRESETS: &[(&str, [u32; 8])] = &[
-    // name, [PX, PY, UNX, UNY, K, HR, VR, NE]
-    ("9b", [256, 256, 2, 4, 4, 1153, 216, 64]),
-    ("4b", [256, 256, 2, 4, 4, 1153, 216, 64]),
-    ("0.8b", [256, 128, 2, 3, 4, 1153, 216, 128]),
-    // Qwen3-8B: 36 layers on 9 units, one gap slot
-    ("q3-8b", [256, 228, 2, 5, 4, 1153, 132, 17]),
-    ("tiny-t08", [8, 8, 2, 3, 4, 10, 8, 4]),
-    ("tiny-t4", [16, 16, 2, 2, 4, 18, 8, 4]),
-    ("tiny-q3", [16, 8, 2, 2, 3, 10, 8, 4]),
-    ("tiny-q3-gap", [16, 8, 2, 3, 4, 10, 8, 4]),
+/// The shipping levers of the unit snake's kernels (requests 0900 .. 0905).
+const SHIP: &str = "NPX:1,DIAG:0,TSTAMP:0,XKEEP:0,HACC16:0,ATTL:2";
+
+const PRESETS: &[Row<8>] = &[
+    // name, [PX, PY, UNX, UNY, K, HR, VR, NE], overrides, levers
+    ("9b", [256, 256, 2, 4, 4, 1153, 216, 64], "G2=16,WL=1", SHIP),
+    ("4b", [256, 256, 2, 4, 4, 1153, 216, 64], "G2=16,WL=1", SHIP),
+    ("0.8b", [256, 128, 2, 3, 4, 1153, 216, 128], "G2=16,G2Y=8,WL=1", SHIP),
+    // Qwen3-8B: 36 layers on 9 units, one gap slot (requests 0961 / 0963)
+    (
+        "q3-8b",
+        [256, 228, 2, 5, 4, 1153, 132, 17],
+        "G2=12,WL=1",
+        "NPX:1,DIAG:0,TSTAMP:0,XKEEP:0,HACC16:0,ATTL:2,SLW:1",
+    ),
+    ("tiny-t08", [8, 8, 2, 3, 4, 10, 8, 4], "G2=2,WL=1,G2W=2", ""),
+    ("tiny-t4", [16, 16, 2, 2, 4, 18, 8, 4], "G2=2,WL=1,G2W=2", ""),
+    ("tiny-q3", [16, 8, 2, 2, 3, 10, 8, 4], "G2=2,WL=1,G2W=2", ""),
+    ("tiny-q3-gap", [16, 8, 2, 3, 4, 10, 8, 4], "G2=2,WL=1,G2W=2", ""),
 ];
 
 impl Family for Dense {
     fn presets(&self) -> Vec<Preset> {
-        PRESETS
-            .iter()
-            .map(|(name, g)| {
-                let keys = ["PX", "PY", "UNX", "UNY", "K", "HR", "VR", "NE"];
-                let kv: Vec<(&str, f64)> = keys
-                    .iter()
-                    .zip(g)
-                    .map(|(k, v)| (*k, f64::from(*v)))
-                    .collect();
-                Preset::new(name, &kv)
-            })
-            .collect()
+        table(["PX", "PY", "UNX", "UNY", "K", "HR", "VR", "NE"], PRESETS, &[])
     }
 
     /// Units of K layers, every unit the same kinds (GDN and gated attention, or Qwen3's plain
     /// attention); a row's dims the hidden over PY (zero-padded past it); a scores segment a KV
     /// head's columns, GDN's a key head's, the o-norm's a value head's (Qwen3: the scores'); the
-    /// head PY / 2 columns; the RoPE tables enough levels for the context. Overrides: the
+    /// head PY / 2 columns; the RoPE tables enough levels for the context (`CTX`, the positions
+    /// asked for, where fewer than NE PY). Overrides: the
     /// reduction groups (`G2`, `G2X` / `G2Y` / `G2H`, `G2W`), the RoPE tables' levels and digit
     /// bits (`RLV`, `RBITS`), `CAP`, `LOOP`, the token loop (`WL`).
     fn plan(&self, s: &Shape, pr: &Preset) -> R<Plan> {
@@ -103,9 +101,10 @@ impl Family for Dense {
         let ne = pr.need("NE")?;
         // a position is RLV digits of RBITS bits: enough levels for the context NE PY (at least 4)
         let rope_bits = pr.int("RBITS").unwrap_or(3);
+        let reach = pr.int("CTX").map_or(ne * py, |c| c.min(ne * py));
         let rope_levels = pr
             .int("RLV")
-            .unwrap_or(4.max((32 - (ne * py - 1).leading_zeros()).div_ceil(rope_bits)));
+            .unwrap_or(4.max((32 - (reach - 1).leading_zeros()).div_ceil(rope_bits)));
         let partition = Partition {
             units,
             layers_per_unit: k,
@@ -157,6 +156,7 @@ impl Family for Dense {
             shape: s.clone(),
             partition,
             contract,
+            levers: pr.levers.clone(),
         })
     }
 

@@ -259,6 +259,9 @@ pub struct Plan {
     pub shape: Shape,
     pub partition: Partition,
     pub contract: Contract,
+    /// The kernel levers the build applies (the preset's, `K:V,...`).
+    #[serde(default)]
+    pub levers: String,
 }
 
 impl Plan {
@@ -381,6 +384,9 @@ impl Partition {
 pub struct Preset {
     pub name: String,
     pub keys: BTreeMap<String, f64>,
+    /// The kernel levers the preset's program ships with (`K:V,...`, see
+    /// [`super::emit::params::Levers`]): the plan carries them to the build.
+    pub levers: String,
 }
 
 impl Preset {
@@ -388,6 +394,7 @@ impl Preset {
         Preset {
             name: name.to_string(),
             keys: keys.iter().map(|(k, v)| (k.to_string(), *v)).collect(),
+            levers: String::new(),
         }
     }
 
