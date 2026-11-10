@@ -153,7 +153,9 @@ def layout(id, deploy):
                 qkv = weight([q_qk + kv_kv if unpadded else q_w + 2 * kv_w, hidden], weights),
                 o_proj = weight([hidden, d.q_heads * d.v_head_dim]),
                 sinks = weight([d.q_heads]) if reading == WINDOWED else None,
-                kv = "kv.{}".format(l),
+                # Keys and values, each head laid PADDED wide; the split
+                # cutting them out says the widths before the zeros.
+                kv = state([tokens, 2, kv_heads, PADDED], deploy.kv),
             ),
             attn_norm = norm("attn_norm"),
             attn_norm_eps = d.norm_eps,
@@ -179,7 +181,6 @@ def layout(id, deploy):
         value_scale = d.value_scale,
         sm_scale = f32(1.0 / f32(sqrt(d.qk_head_dim))),
         shards = d.shards,
-        kv = deploy.kv,
         embed = weight([d.vocab, hidden]),
         head = weight([d.vocab, hidden]),
         layers = [layer(l) for l in range(d.layers)],
@@ -355,13 +356,6 @@ def packed_bank(reads, w, stems):
 # of each rotated, full on its few layers and over a 128-token window with
 # sinks on the rest; then a dense SwiGLU MLP, or experts chosen by a biased
 # sigmoid router.
-
-def caches(m, c):
-    spaces = [c.kv_space(m.kv, m.window), c.kv_space(m.kv)]
-    for w in m.layers:
-        at = w.attn
-        plane = at.kv_heads * m.head_dim
-        c.kv(spaces[at.reading], at.kv, [plane, plane], m.head_dim, heads = True, live = [m.qk_head_dim, m.v_head_dim])
 
 def forward(m, inputs):
     positions = inputs.positions()

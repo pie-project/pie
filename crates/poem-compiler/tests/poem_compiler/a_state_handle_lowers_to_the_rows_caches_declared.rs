@@ -115,7 +115,10 @@ fn glm_5(path: &str, _row: &CacheRow) -> String {
 }
 
 fn mimo_v2(path: &str, _row: &CacheRow) -> String {
-    path.to_string()
+    match parts(path)[..] {
+        ["layers", l, "attn", "kv"] => format!("kv.{l}"),
+        _ => path.to_string(),
+    }
 }
 
 fn muse_glimmer(path: &str, _row: &CacheRow) -> String {
@@ -185,8 +188,26 @@ fn left_space_zero_empty(deployment: &str) -> bool {
     deployment.starts_with("gemma4-e4b-mini-l1-")
 }
 
+/// Whether `caches()` declared `package`'s windowed space before its
+/// whole-sequence one: MiMo-V2's, space 0 its windowed layers' and space 1
+/// its full layers'. Spaces are now numbered whole-sequence first.
+fn window_space_first(package: &str) -> bool {
+    package == "mimo_v2"
+}
+
 fn renamed(package: &str, deployment: &str, trace: &Trace, rename: Renaming) -> Vec<CacheRow> {
     let mut rows = trace.caches.clone();
+    if window_space_first(package) {
+        for row in &mut rows {
+            if let CacheRow::Kv { space, .. } = row {
+                *space = match *space {
+                    0 => 1,
+                    1 => 0,
+                    other => other,
+                };
+            }
+        }
+    }
     if left_space_zero_empty(deployment) {
         for row in &mut rows {
             if let CacheRow::Kv { space, .. } = row {
