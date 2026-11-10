@@ -514,8 +514,8 @@ impl SharedPool {
     }
 
     /// How the device's chunks divide: what the reserved chunks, the
-    /// activation and the weights' pinned slots (the staging floor, and
-    /// every atom where they do not stream) hold for good, and what is left
+    /// activation and the weights' pinned slots (held, every atom;
+    /// streaming, the staging floor) hold for good, and what is left
     /// for kv and state. No eviction reaches below that.
     #[must_use]
     pub fn room(&self) -> PoolRoom {

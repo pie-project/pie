@@ -7,7 +7,8 @@
 //!
 //! - the **floor**: each shape's staging slots, what a fire cannot run
 //!   without (the top-k experts of this layer and the next; this fire's
-//!   rows). Pinned: live demand, never evicted.
+//!   rows). Pinned: live demand, never evicted. Streaming only: a held set
+//!   (every atom resident) misses nothing and takes none.
 //! - the **cache**: resident atoms above the floor. Wanted demand, the
 //!   first thing to go when the pool is short.
 //!
@@ -124,8 +125,9 @@ pub fn boot_cache(
             .enumerate()
             .map(|(at, facts)| {
                 let shape = first + ShapeId::try_from(at).expect("weight shapes fit a shape id");
-                let atoms = if all { facts.count } else { 0 };
-                (shape, u64::from(facts.floor_slots) + u64::from(atoms))
+                // Held, every atom and no staging; streaming, the floor.
+                let slots = if all { facts.count } else { facts.floor_slots };
+                (shape, u64::from(slots))
             })
             .collect()
     };
@@ -137,17 +139,16 @@ pub fn boot_cache(
         anyhow::ensure!(
             mode != WeightStreaming::Off,
             "weight_streaming = \"off\": engine {engine}'s weights do not fit its pool: \
-             every weight resident needs {} bytes ({all} of weights over {} shapes, \
-             {floor} of staging), the pool has {free} bytes free ({} chunks of {} bytes); \
-             set weight_streaming = \"auto\" or \"on\" to stream them",
-            all.saturating_add(floor),
+             every weight resident needs {all} bytes over {} shapes, the pool has {free} \
+             bytes free ({} chunks of {} bytes); set weight_streaming = \"auto\" or \"on\" \
+             to stream them",
             weights.len(),
             pool.free_chunks(),
             pool.chunk_bytes(),
         );
         tracing::info!(
             engine,
-            need_bytes = all.saturating_add(floor),
+            need_bytes = all,
             free_bytes = free,
             floor_bytes = floor,
             "the weights do not fit the pool: they stream, the cache at its floor"
@@ -385,7 +386,13 @@ impl WeightCache {
                 shape,
                 pinned: true,
             };
-            let staging = pool.acquire(holder, shape, u64::from(facts.floor_slots))?;
+            // A held set has every atom resident: nothing misses, so
+            // nothing streams through a staging slot and none is taken.
+            let staging = if streaming {
+                pool.acquire(holder, shape, u64::from(facts.floor_slots))?
+            } else {
+                Vec::new()
+            };
             if !streaming && facts.seated.is_none() {
                 resident = (0..facts.count)
                     .zip(pool.acquire(holder, shape, u64::from(facts.count))?)
@@ -425,18 +432,18 @@ impl WeightCache {
         self.shapes.iter().any(|kept| kept.pool == shape)
     }
 
-    /// The bytes held whatever the pressure: the floor, and not streaming
-    /// every atom.
+    /// The bytes held whatever the pressure: streaming, the floor; not
+    /// streaming, every atom (and no staging, which nothing streams
+    /// through).
     #[must_use]
     pub fn pinned_bytes(&self) -> u64 {
         self.shapes
             .iter()
             .map(|kept| {
-                let floor = kept.facts.floor_bytes();
                 if self.streaming {
-                    floor
+                    kept.facts.floor_bytes()
                 } else {
-                    floor.saturating_add(kept.facts.all_bytes())
+                    kept.facts.all_bytes()
                 }
             })
             .sum()
@@ -609,13 +616,16 @@ impl WeightCache {
             ..WeightResidency::default()
         };
         for kept in &self.shapes {
-            residency.staging.push((
-                kept.facts.id,
-                kept.staging
-                    .iter()
-                    .map(|&slot| pool.slot_ref(slot))
-                    .collect(),
-            ));
+            // Held, nothing streams: the staging list is empty.
+            if self.streaming {
+                residency.staging.push((
+                    kept.facts.id,
+                    kept.staging
+                        .iter()
+                        .map(|&slot| pool.slot_ref(slot))
+                        .collect(),
+                ));
+            }
             residency
                 .resident
                 .extend(kept.resident.iter().map(|(&atom, &slot)| ResidentWeight {
