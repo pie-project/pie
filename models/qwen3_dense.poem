@@ -75,6 +75,9 @@ def dims(hidden, layers, q_heads, kv_heads, inter, tied):
         head_dim = 128,
         vocab = 151936,
         theta = 1000000.0,
+        # A scaling config.json states, turned as stated.
+        rope_scaling = None,
+        max_position = None,
         norm_eps = 1e-6,
     )
 
@@ -94,8 +97,14 @@ def adopt(id, config, special):
         fail("its attention projections carry biases, which this family's do not")
     if config.get("use_sliding_window", False):
         fail("it attends through a sliding window in some layers; this family attends in full")
-    if config.get("rope_scaling") != None:
-        fail("its config scales its rope ({}); this family stretches its rope only by a deployment's -yarn".format(config["rope_scaling"]))
+    scaling = config.get("rope_scaling")
+    if scaling != None and scaling.get("rope_type", scaling.get("type")) in [None, "default"]:
+        scaling = None
+    max_position = config.get("max_position_embeddings")
+    if scaling != None:
+        # Linear, dynamic NTK, YaRN or LongRoPE: turned as stated, and a type
+        # pie does not turn is refused here, by name.
+        rope_scaling(scaling, max_position = max_position)
     hidden = config["hidden_size"]
     q_heads = config["num_attention_heads"]
     d = struct(
@@ -108,6 +117,8 @@ def adopt(id, config, special):
         head_dim = config.get("head_dim", hidden // q_heads),
         vocab = config["vocab_size"],
         theta = float(config.get("rope_theta", 1000000.0)),
+        rope_scaling = scaling,
+        max_position = max_position,
         norm_eps = float(config.get("rms_norm_eps", 1e-6)),
     )
     return struct(
@@ -192,7 +203,8 @@ def layout(id, deploy):
         eps = d.norm_eps,
         # Qwen3's native context, which YaRN stretches (its card: factor 4
         # over 32768 tokens).
-        rope = yarn(deploy, 32768),
+        rope = yarn(deploy, 32768) or d.rope_scaling,
+        max_position = d.max_position,
         sm_scale = f32(1.0 / f32(sqrt(hd))),
         kv = deploy.kv,
         embed = weight([d.vocab, hidden]),
@@ -296,7 +308,7 @@ def forward(m, inputs):
     positions = inputs.positions()
     y = ops.gather.embed(inputs.tokens(), m.embed, m.vocab)
     routes = inputs.adapter_routes()
-    scaling = rope_scaling(m.rope)
+    scaling = rope_scaling(m.rope, max_position = m.max_position)
 
     def block(l, w, carried):
         y, fused = carried
