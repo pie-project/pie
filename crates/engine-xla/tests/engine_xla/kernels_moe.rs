@@ -1072,7 +1072,7 @@ fn the_routed_mlp_on_one_sort_answers_its_parts() {
     for (t, tk, glu) in [
         (40usize, 4usize, moe::ExpertGlu::Swiglu),
         (9, 2, moe::ExpertGlu::GegluTanh),
-        (600, 4, moe::ExpertGlu::Swiglu),
+        (1100, 4, moe::ExpertGlu::Swiglu),
     ] {
         let x = data(t * h, 61);
         let wu: Vec<f32> = data(e * 2 * i * h, 62)

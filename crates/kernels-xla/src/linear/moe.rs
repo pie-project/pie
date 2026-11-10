@@ -2517,9 +2517,12 @@ pub fn experts(
     let hidden = f.convert(hidden, Elem::Bf16);
     let down_rows = tiles_of(f, dn, &down_bank, &sorted, hidden)?;
     let n = i64::from(routed.width);
-    // (A prompt's fire: a decode's lanes sum by the one-hot dot.)
+    // (A wide prompt's fire: a decode's lanes, and a fire of 640 rows, sum
+    // by the one-hot dot, whose cells grow as the square of its tokens:
+    // v6e, Qwen3.6-35B-A3B's 557-token Raw prompt 3% slower through the
+    // blocks.)
     if tuning.moe_segment_tokens > 0
-        && t >= 4 * tuning.moe_segment_tokens
+        && t >= 8 * tuning.moe_segment_tokens
         && let Some(y) = segment_sum(f, &sorted, up, up_fan, down_rows, r, valid, tuning)?
     {
         return Ok(Some(y));
