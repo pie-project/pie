@@ -1,6 +1,6 @@
 use crate::error::Error;
 use crate::jit::{Arg, Ctx, Fire, Launch, count, dtype_dispatch, kernel, refuse, stated};
-use crate::tensor::{RecurrentPool, Tensor};
+use crate::tensor::{RecurrentPool, StateRows, Tensor};
 use crate::voxels::{flat_elements, lanes_of};
 use dtype::Dtype;
 
@@ -17,14 +17,23 @@ pub fn cache_rows(grid: &[i32], frames: u32) -> u64 {
         .sum()
 }
 
+/// The lanes, frames, channels, a row's elements, the cache's elements and
+/// blocks, and where the rows live.
+type Checked = (i32, i32, i32, i64, i64, u32, StateRows);
+
+/// The frame slab's rows (`pool.slab`, `[slots, frames * plane * C]`)
+/// cut along their frame-position rows: `pool.segments` lays a lane's row
+/// out in pieces of whole rows of `C`, `pool.slot_stride_elems` apart (0: a
+/// row apart, the slab's own rows).
 fn check(
     op: &'static str,
-    slab: Tensor,
+    pool: &RecurrentPool,
     slot_ids: Tensor,
     grid: Tensor,
     cache: Tensor,
     frames: u32,
-) -> Result<(i32, i32, i32, i64, i64, u32), Error> {
+) -> Result<Checked, Error> {
+    let slab = pool.slab;
     dtype_dispatch!(op, cache.dtype, { Bf16 => () });
     if slab.dtype != Dtype::Bf16 {
         return Err(refuse(op, "the slab is not bf16"));
@@ -41,29 +50,40 @@ fn check(
     }
     let frames = count(op, "the cached frames", frames)?;
     let c = count(op, "the channel count", cache.width)?;
-    let stride = i64::from(slab.width);
+    let row_elems = i64::from(slab.width);
+    let chunk = if pool.slot_stride_elems == 0 {
+        row_elems
+    } else {
+        pool.slot_stride_elems
+    };
+    let rows = pool.segments.rows(
+        op,
+        slab,
+        slot_ids,
+        chunk,
+        slab.width.div_ceil(cache.width.max(1)),
+    )?;
     let (blocks, total) = flat_elements(op, cache, BLOCK)?;
-    Ok((lanes, frames, c, stride, total, blocks))
+    Ok((lanes, frames, c, row_elems, total, blocks, rows))
 }
 
-pub fn cache_gather_slab(
+pub fn cache_gather(
     ctx: &Ctx,
-    slab: Tensor,
+    pool: &RecurrentPool,
     slot_ids: Tensor,
     grid: Tensor,
     frames: u32,
     cache: &mut Tensor,
 ) -> Result<(), Error> {
     const OP: &str = "conv.cache_gather";
-    let (lanes, frames, c, stride, total, blocks) =
-        check(OP, slab, slot_ids, grid, *cache, frames)?;
+    let (lanes, frames, c, stride, total, blocks, rows) =
+        check(OP, pool, slot_ids, grid, *cache, frames)?;
     ctx.fire(
         OP,
         Fire::at(kernel(FILE, "::pie::conv::cache_gather<::pie::bf16>"))
             .apply(Launch::grid([blocks, 1, 1], [BLOCK, 1, 1])),
         &[
-            slab.arg(),
-            slot_ids.arg(),
+            rows.arg(),
             grid.arg(),
             cache.arg(),
             lanes.arg(),
@@ -77,78 +97,6 @@ pub fn cache_gather_slab(
 
 /// `x_base`: the row `grid` addresses `x`'s row 0 at.
 #[allow(clippy::too_many_arguments)]
-pub fn cache_store_slab(
-    ctx: &Ctx,
-    x: Tensor,
-    cache: Tensor,
-    slot_ids: Tensor,
-    grid: Tensor,
-    frames: u32,
-    slab: &mut Tensor,
-    x_base: u32,
-) -> Result<(), Error> {
-    const OP: &str = "conv.cache_store";
-    let (lanes, frames, c, stride, total, blocks) =
-        check(OP, *slab, slot_ids, grid, cache, frames)?;
-    if x.dtype != Dtype::Bf16 || x.width != cache.width {
-        return Err(refuse(OP, "the input is not `[rows, C_in]` bf16"));
-    }
-    ctx.fire(
-        OP,
-        Fire::at(kernel(FILE, "::pie::conv::cache_store<::pie::bf16>"))
-            .apply(Launch::grid([blocks, 1, 1], [BLOCK, 1, 1])),
-        &[
-            x.arg(),
-            cache.arg(),
-            slot_ids.arg(),
-            grid.arg(),
-            slab.arg(),
-            lanes.arg(),
-            frames.arg(),
-            c.arg(),
-            stride.arg(),
-            stated(OP, x_base)?.arg(),
-            total.arg(),
-        ],
-    )
-}
-
-/// The slab the HIP frame cache reads `pool`'s rows in: a row whole in its
-/// slot, slots a row apart. Rows cut into pieces, a segment table, or slots
-/// further apart than a row are the chunk pool's layout, which these kernels
-/// do not address.
-fn whole_slab(op: &'static str, pool: &RecurrentPool) -> Result<Tensor, Error> {
-    let slab = pool.slab;
-    let apart = pool.slot_stride_elems;
-    if !pool.segments.whole() || (apart != 0 && apart != i64::from(slab.width)) {
-        return Err(refuse(
-            op,
-            format!(
-                "a frame cache laid in {} piece(s) a row, slots {apart} elements apart for \
-                 rows of {}: the HIP kernels read a row whole in its slot, slots a row apart",
-                pool.segments.pieces.max(1),
-                slab.width
-            ),
-        ));
-    }
-    Ok(slab)
-}
-
-/// [`cache_gather_slab`] over `pool`'s rows, as an engine states them.
-pub fn cache_gather(
-    ctx: &Ctx,
-    pool: &RecurrentPool,
-    slot_ids: Tensor,
-    grid: Tensor,
-    frames: u32,
-    cache: &mut Tensor,
-) -> Result<(), Error> {
-    let slab = whole_slab("conv.cache_gather", pool)?;
-    cache_gather_slab(ctx, slab, slot_ids, grid, frames, cache)
-}
-
-/// [`cache_store_slab`] over `pool`'s rows, as an engine states them.
-#[allow(clippy::too_many_arguments)]
 pub fn cache_store(
     ctx: &Ctx,
     x: Tensor,
@@ -159,6 +107,27 @@ pub fn cache_store(
     frames: u32,
     x_base: u32,
 ) -> Result<(), Error> {
-    let mut slab = whole_slab("conv.cache_store", pool)?;
-    cache_store_slab(ctx, x, cache, slot_ids, grid, frames, &mut slab, x_base)
+    const OP: &str = "conv.cache_store";
+    let (lanes, frames, c, stride, total, blocks, rows) =
+        check(OP, pool, slot_ids, grid, cache, frames)?;
+    if x.dtype != Dtype::Bf16 || x.width != cache.width {
+        return Err(refuse(OP, "the input is not `[rows, C_in]` bf16"));
+    }
+    ctx.fire(
+        OP,
+        Fire::at(kernel(FILE, "::pie::conv::cache_store<::pie::bf16>"))
+            .apply(Launch::grid([blocks, 1, 1], [BLOCK, 1, 1])),
+        &[
+            x.arg(),
+            cache.arg(),
+            rows.arg(),
+            grid.arg(),
+            lanes.arg(),
+            frames.arg(),
+            c.arg(),
+            stride.arg(),
+            stated(OP, x_base)?.arg(),
+            total.arg(),
+        ],
+    )
 }
