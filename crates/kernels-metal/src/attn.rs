@@ -2826,6 +2826,34 @@ pub mod pool {
 
     const META_BLOCK: u32 = 128;
 
+    /// A compressor's state for the kv row its gather keys by: a projection
+    /// plane and a score plane, a token a cell, paged as that row is (its
+    /// page table, its page size), each plane `plane_offset` bytes from its
+    /// binding's origin and `page_stride` bytes a page.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub struct PoolState {
+        pub kv: Tensor,
+        pub score: Tensor,
+        pub page_stride: [u64; 2],
+        pub plane_offset: [u64; 2],
+    }
+
+    impl PoolState {
+        /// Two slabs of their own, each a run of `page_size`-token pages.
+        #[must_use]
+        pub fn dense(kv: Tensor, score: Tensor, page_size: i32) -> PoolState {
+            PoolState {
+                kv,
+                score,
+                page_stride: [
+                    KvPool::dense_page_stride(kv, page_size, 0),
+                    KvPool::dense_page_stride(score, page_size, 0),
+                ],
+                plane_offset: [0, 0],
+            }
+        }
+    }
+
     /// The pool's width a position: `row` itself, or a compact pool's
     /// `row / div` (`div` positions to an entry, whole within a page).
     pub(crate) fn pitch(op: &'static str, pool: &KvPool, row: u32) -> Result<i32, Error> {
@@ -3006,10 +3034,10 @@ pub mod pool {
         write_offset: Tensor,
         head_dim: u32,
         ratio: u32,
-        state_kv: Tensor,
-        state_score: Tensor,
+        state: PoolState,
     ) -> Result<(), Error> {
         const OP: &str = "attn.pool_state_write";
+        let (state_kv, state_score) = (state.kv, state.score);
         let entry = dtype_dispatch!(OP, kv.dtype, { Bf16 => "pool_state_write_bfloat16" });
         debug_assert_eq!(
             score.dtype, kv.dtype,
@@ -3065,7 +3093,6 @@ pub mod pool {
             ));
         }
         let rows = nonzero(OP, "rows", kv.rows)?;
-        let slab_page = KvPool::dense_page_stride(state_kv, pages.page_size, 0);
         ctx.fire(
             Fire::at(FILE, entry).apply(Grid::of([width, rows, 1], [width.min(256), 1, 1])),
             &[
@@ -3078,12 +3105,11 @@ pub mod pool {
                 stated(OP, width)?.arg(),
                 pages.page_size.arg(),
                 stated(OP, pitch)?.arg(),
-                // The compressor's two slabs page with the pool, each its own run
-                // of `page_size` rows of `pitch`.
-                slab_page.arg(),
-                slab_page.arg(),
-                0u64.arg(),
-                0u64.arg(),
+                // The compressor's two planes page with the row they key by.
+                state.page_stride[0].arg(),
+                state.page_stride[1].arg(),
+                state.plane_offset[0].arg(),
+                state.plane_offset[1].arg(),
             ],
         )
     }
@@ -3096,12 +3122,12 @@ pub mod pool {
         pages: &KvPool,
         head_dim: u32,
         ratio: u32,
-        state_kv: Tensor,
-        state_score: Tensor,
+        state: PoolState,
         ape: Option<Tensor>,
         entries: Tensor,
     ) -> Result<(), Error> {
         const OP: &str = "attn.pool_gather";
+        let (state_kv, state_score) = (state.kv, state.score);
         let entry = dtype_dispatch!(OP, entries.dtype, { Bf16 => "pool_gather_paged_bfloat16" });
         boundary_tables(OP, &boundary_pos, &boundary_req);
         debug_assert_eq!(
@@ -3186,7 +3212,6 @@ pub mod pool {
                 ));
             }
         }
-        let slab_page = KvPool::dense_page_stride(state_kv, pages.page_size, 0);
         ctx.fire(
             Fire::at(FILE, entry).apply(Grid::of([head_dim, rows, 1], [head_dim, 1, 1])),
             &[
@@ -3204,12 +3229,11 @@ pub mod pool {
                 pages.page_size.arg(),
                 i32::from(ape.is_some()).arg(),
                 stated(OP, pitch)?.arg(),
-                // The compressor's two slabs page with the pool, each its own run
-                // of `page_size` rows of `pitch`.
-                slab_page.arg(),
-                slab_page.arg(),
-                0u64.arg(),
-                0u64.arg(),
+                // The compressor's two planes page with the row they key by.
+                state.page_stride[0].arg(),
+                state.page_stride[1].arg(),
+                state.plane_offset[0].arg(),
+                state.plane_offset[1].arg(),
             ],
         )
     }
