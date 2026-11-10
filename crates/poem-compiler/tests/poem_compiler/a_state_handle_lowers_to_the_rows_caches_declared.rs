@@ -114,6 +114,30 @@ fn glm_5(path: &str, _row: &CacheRow) -> String {
     }
 }
 
+fn mimo_v2(path: &str, _row: &CacheRow) -> String {
+    path.to_string()
+}
+
+fn muse_glimmer(path: &str, _row: &CacheRow) -> String {
+    path.to_string()
+}
+
+fn muse_spark(path: &str, _row: &CacheRow) -> String {
+    path.to_string()
+}
+
+fn qwen3_asr(path: &str, _row: &CacheRow) -> String {
+    path.to_string()
+}
+
+fn qwen3_tts(path: &str, _row: &CacheRow) -> String {
+    path.to_string()
+}
+
+fn gpt_oss(path: &str, _row: &CacheRow) -> String {
+    path.to_string()
+}
+
 /// Every listed deployment of `package`, at one rank and at each count of
 /// [`RANKS`] it traces at.
 fn deployments(package: &str) -> Vec<Deployment> {
@@ -259,5 +283,11 @@ mod moved {
         gemma_4,
         qwen_3,
         glm_5,
+        mimo_v2,
+        muse_glimmer,
+        muse_spark,
+        qwen3_asr,
+        qwen3_tts,
+        gpt_oss,
     );
 }
