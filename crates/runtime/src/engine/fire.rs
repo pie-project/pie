@@ -95,7 +95,6 @@ pub struct StepFire {
     /// The completions those cells are of, resolved once the step lands.
     pub completions: Vec<crate::engine::WorkItemCompletion>,
     pub instances: Vec<::engine::InstanceId>,
-    pub logical_fire_ids: Vec<u64>,
 }
 
 #[derive(Default)]

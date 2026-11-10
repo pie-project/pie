@@ -135,8 +135,7 @@ impl Linker {
         let component = main.component;
         let language = main.script.is_some();
 
-        let process_ctx =
-            ProcessCtx::new(process_id, output, &policy, main.script).await?;
+        let process_ctx = ProcessCtx::new(process_id, output, &policy, main.script).await?;
         let mut store = Store::new(&engine, process_ctx);
         store.limiter(|ctx| ctx.limits());
 
@@ -219,8 +218,7 @@ impl ServiceHandler for Linker {
                 let pre_cache = Arc::clone(&self.instance_pre_cache);
                 crate::rt::spawn(async move {
                     let result = Linker::instantiate(
-                        engine, policy, base_cache, pre_cache, process_id, &program,
-                        output,
+                        engine, policy, base_cache, pre_cache, process_id, &program, output,
                     )
                     .await;
                     let _ = response.send(result);

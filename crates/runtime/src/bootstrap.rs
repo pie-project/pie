@@ -209,7 +209,6 @@ pub struct TelemetryConfig {
 
 pub struct BootstrapHandle {
     pub port: u16,
-    pub model_idx: usize,
     shutdown: Option<RuntimeShutdown>,
 }
 
@@ -513,7 +512,6 @@ async fn bootstrap_inner(config: Config) -> Result<BootstrapHandle> {
             let id = engine::register_engine_backend(
                 engine::EngineSpec {
                     device_domain: ::engine::MemoryDomain::HostPinned,
-                    num_kv_pages: d.total_pages,
                     limits: d.limits,
                     device_geometry_port_mask: d.device_geometry_port_mask,
                 },
@@ -743,7 +741,6 @@ async fn bootstrap_inner(config: Config) -> Result<BootstrapHandle> {
     active_guard.disarm();
     Ok(BootstrapHandle {
         port: bound_port,
-        model_idx: arena_model_idx,
         shutdown: Some(RuntimeShutdown {
             scheduler: scheduler_shutdown,
             engine_ids: engines,

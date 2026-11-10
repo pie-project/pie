@@ -1115,7 +1115,7 @@ impl ResidencyPlanner {
             DevicePageReservation::empty()
         };
         let rs = self.reserve_rs_slots(demand.rs)?;
-        Some(AllocationGrant::new(demand, kv, rs))
+        Some(AllocationGrant::new(kv, rs))
     }
 
     pub(super) fn reserve_rs_slots(&self, need: RsUnits) -> Option<RsSlotReservation> {

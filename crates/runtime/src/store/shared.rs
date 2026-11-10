@@ -303,11 +303,7 @@ impl SharedPool {
         Self::build(&tier, 0, 0).map(Some)
     }
 
-    fn build(
-        facts: &ChunkFacts,
-        reserved: u32,
-        max_context: u32,
-    ) -> Result<Self, SharedError> {
+    fn build(facts: &ChunkFacts, reserved: u32, max_context: u32) -> Result<Self, SharedError> {
         let mut shapes = Vec::with_capacity(facts.shapes.len() + facts.weights.len());
         let (mut lists, mut rs_lists, mut windows, mut fixed) =
             (Vec::new(), Vec::new(), Vec::new(), Vec::new());
@@ -1070,12 +1066,6 @@ impl SharedPool {
                 least_cut: self.segment_bytes(),
             },
         }
-    }
-
-    /// The holder record slots are taken under.
-    #[must_use]
-    pub const fn store_holder() -> Holder {
-        STORE
     }
 }
 

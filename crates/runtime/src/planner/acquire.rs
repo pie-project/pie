@@ -223,7 +223,6 @@ impl ResidencyPlanner {
                             match self.collect_outcome(key) {
                                 Collect::Wait => {
                                     tracing::warn!(%pid, %error, "planner: a short waiter gives up");
-                                    self.stats.cancelled_waits.fetch_add(1, Ordering::Relaxed);
                                     // The registration's drop takes it off the queue.
                                     Err(error)
                                 }
@@ -234,9 +233,6 @@ impl ResidencyPlanner {
                         }
                         Collect::Ready(outcome) => {
                             ptrace!("collect key={:?} ok={}", key, outcome.is_ok());
-                            if matches!(outcome, Err(PlannerError::Cancelled)) {
-                                self.stats.cancelled_waits.fetch_add(1, Ordering::Relaxed);
-                            }
                             outcome.map(Acquired::Granted)
                         }
                         Collect::Yield => Ok(Acquired::Yield),

@@ -889,7 +889,7 @@ impl Lane {
         plan: &crate::engine::InstanceBindingPlan,
     ) -> Result<BoundInstance> {
         let bound = engine.bind_instance(&plan.binding)?;
-        let bound = BoundInstance::new(plan.engine_id, &bound, plan.pacing_wait_id);
+        let bound = BoundInstance::new(&bound, plan.pacing_wait_id);
         channels.bind(bound.instance_id, plan.binding.channels.clone());
         Ok(bound)
     }

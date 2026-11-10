@@ -945,7 +945,6 @@ pub struct BatchScheduler {
     engine_id: EngineId,
     handle: SchedulerHandle,
     thread: Option<crate::rt::thread::JoinHandle<()>>,
-    stats: Arc<SchedulerStats>,
 }
 
 impl BatchScheduler {
@@ -991,12 +990,7 @@ impl BatchScheduler {
             engine_id,
             handle,
             thread: Some(thread),
-            stats,
         }
-    }
-
-    pub fn stats(&self) -> &Arc<SchedulerStats> {
-        &self.stats
     }
 
     fn shutdown(&mut self) {
@@ -2753,7 +2747,6 @@ mod tests {
                         terminal_cells: Vec::new(),
                         completions: Vec::new(),
                         instances: vec![::engine::InstanceId(0)],
-                        logical_fire_ids: vec![token],
                     }],
                 },
                 false,
@@ -2830,7 +2823,6 @@ mod tests {
                     terminal_cells: Vec::new(),
                     completions: Vec::new(),
                     instances: vec![::engine::InstanceId(0)],
-                    logical_fire_ids: vec![42],
                 }],
             },
             false,

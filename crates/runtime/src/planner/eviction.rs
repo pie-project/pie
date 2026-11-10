@@ -540,13 +540,12 @@ impl ResidencyPlanner {
                 return ServeOutcome::Stale(rs);
             }
             let kv = inner.accum.donate(demand.kv_pages);
-            *outcome = Some(Ok(AllocationGrant::new(demand, kv, rs)));
+            *outcome = Some(Ok(AllocationGrant::new(kv, rs)));
             ServeOutcome::Served(notify.clone())
         });
         match outcome {
             ServeOutcome::Served(notify) => {
                 self.stats.serves.fetch_add(1, Ordering::Relaxed);
-                self.stats.hoard_bypasses.fetch_add(1, Ordering::Relaxed);
                 notify.notify_waiters();
                 self.poke();
                 true

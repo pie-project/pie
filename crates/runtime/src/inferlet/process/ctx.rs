@@ -21,7 +21,6 @@ use crate::store::rs::RsWorkingSetId;
 pub enum OutputMode {
     Discard,
     Stream,
-    Log { program: String },
 }
 
 pub struct ProcessCtx {
@@ -140,16 +139,6 @@ impl ProcessCtx {
                         .stdout(move |bytes| out.write_bytes(bytes))
                         .stderr(move |bytes| err.write_bytes(bytes));
                 }
-                OutputMode::Log { program } => {
-                    let program: Arc<str> = Arc::from(program);
-                    let (out, err) = (
-                        LogStream::new_server_stdout(program.clone()),
-                        LogStream::new_server_stderr(program),
-                    );
-                    builder = builder
-                        .stdout(move |bytes| out.write_bytes(bytes))
-                        .stderr(move |bytes| err.write_bytes(bytes));
-                }
             }
             builder.build()
         };
@@ -177,11 +166,6 @@ impl ProcessCtx {
             OutputMode::Stream => {
                 builder.stdout(LogStream::new_stdout(id));
                 builder.stderr(LogStream::new_stderr(id));
-            }
-            OutputMode::Log { program } => {
-                let program: Arc<str> = Arc::from(program);
-                builder.stdout(LogStream::new_server_stdout(program.clone()));
-                builder.stderr(LogStream::new_server_stderr(program));
             }
         }
 
