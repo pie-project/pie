@@ -2548,13 +2548,13 @@ impl KvStore {
     /// A target below the pool is room it can rise into: what is said of the
     /// pool to anyone deciding on its fullness comes from here.
     pub fn pages_out(&self) -> u32 {
-        (self.pool.limit() - self.free_committed() as u32) + self.pool.tail_held() as u32
+        self.pool.out() + self.pool.tail_held() as u32
     }
 
     /// Pages out below the limit, and pages a waiter is short of on top. The
     /// tail is on its way out and asks for nothing.
     pub fn pages_wanted(&self) -> u32 {
-        (self.pool.limit() - self.free_committed() as u32).saturating_add(self.short_pages)
+        self.pool.out().saturating_add(self.short_pages)
     }
 
     /// What of the tail past the limit is still out.

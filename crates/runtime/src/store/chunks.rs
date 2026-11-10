@@ -376,6 +376,21 @@ impl<I: PoolId> ShapePool<I> {
         }
     }
 
+    /// Ids handed out under the limit. A shared pool's list or ring shape
+    /// counts the slots held of it: its segments not yet committed are room
+    /// it grows into, not ids out.
+    pub fn out(&self) -> u32 {
+        match &self.slots {
+            Backing::Shape(shared, shape) => {
+                let demand = shared.lock().unwrap().pool().shape_demand(*shape);
+                u32::try_from(demand.live + demand.cached).unwrap_or(u32::MAX)
+            }
+            Backing::Own(_) | Backing::Records(_) => {
+                self.limit.saturating_sub(self.available() as u32)
+            }
+        }
+    }
+
     pub fn capacity(&self) -> u32 {
         self.capacity
     }

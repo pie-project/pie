@@ -733,3 +733,62 @@ fn every_lane_of_a_group_names_the_record_the_group_writes() {
     assert_eq!(rs.frozen(ws), Ok(frozen), "a refused fire folds nothing");
     assert_eq!(rs.buffer_size(ws), size, "nor grows the buffer");
 }
+
+/// What the Metal engine states for a dense model on its sparse pool: one
+/// list shape a page a chunk, bottom growth with one segment of many
+/// committed at load, and no activation span (activation keeps its arena).
+fn metal_like_facts() -> ChunkFacts {
+    let facts = ChunkFacts {
+        chunk_bytes: 2 * MIB,
+        total_chunks: 1024,
+        segment_chunks: 32,
+        segments: SegmentFacts {
+            committed: 1,
+            max: 1024 / 32,
+            growth: SegmentGrowth::Bottom,
+        },
+        reserved: vec![ReservedRun {
+            what: Reserved::Null,
+            first: 0,
+            chunks: 1,
+        }],
+        shapes: vec![Facts {
+            slots_per_chunk: 1,
+            ..shape(
+                LIST,
+                SlotKind::List {
+                    tokens: 16,
+                    rate: 1,
+                },
+                2 * MIB,
+            )
+        }],
+        act_chunks: Vec::new(),
+        ..ChunkFacts::default()
+    };
+    facts.validate().unwrap();
+    facts
+}
+
+/// Pages out are the pages handed out, not the segments still uncommitted:
+/// an idle pool with most of its segments uncommitted read as kv pressure
+/// near 255, and the gateway held every launch for headroom no fire would
+/// ever come to commit.
+#[test]
+fn uncommitted_segments_are_not_pages_out() {
+    let facts = metal_like_facts();
+    let shared: Shared = Arc::new(Mutex::new(SharedPool::new(&facts, 1, 4096).unwrap()));
+    let stores = crate::store::registry::shared_stores(&shared, 16, 4096);
+    let counts = || {
+        crate::store::registry::with_kv_lock(&stores.kv, "test", |kv| {
+            (kv.capacity_pages(), kv.pages_out())
+        })
+    };
+    let (capacity, out) = counts();
+    assert_eq!(capacity, 1023, "every chunk but the null one");
+    assert_eq!(out, 0, "an idle pool hands out nothing");
+    crate::store::registry::with_kv_lock(&stores.kv, "test", |kv| {
+        kv.reserve_device_pages(3).unwrap()
+    });
+    assert_eq!(counts(), (1023, 3));
+}
