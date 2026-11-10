@@ -1717,11 +1717,61 @@ impl Pools {
         self.weight_caches = caches;
         taken?;
         // Slots filled from the serving file, on the host: no frame reads
-        // them (the caller drained every frame).
+        // them (the caller drained every frame). Fills that follow one
+        // another in the file are read in one run, and a slot is written
+        // through its chunk's host address where the chunk has one.
+        const RUN: u64 = 64 << 20;
+        let chunk_bytes = self.layout.chunk_bytes;
         let mut bytes = Vec::new();
-        for fill in fills {
-            fill.read(&mut bytes)?;
-            self.pool.write(fill.to, &bytes)?;
+        let mut hosts: std::collections::HashMap<u32, Option<std::ptr::NonNull<u8>>> =
+            std::collections::HashMap::new();
+        for group in &fills {
+            let list = &group.fills;
+            let mut at = 0;
+            while at < list.len() {
+                let first = list[at].0;
+                let mut end = at + 1;
+                let mut last = first + list[at].2;
+                while end < list.len() && list[end].0 == last && last + list[end].2 - first <= RUN
+                {
+                    last += list[end].2;
+                    end += 1;
+                }
+                group.read(first, last - first, &mut bytes)?;
+                for &(from, to, len) in &list[at..end] {
+                    let start = usize::try_from(from - first).unwrap_or(usize::MAX);
+                    let len = usize::try_from(len).unwrap_or(usize::MAX);
+                    let piece = &bytes[start..start + len];
+                    let physical = u32::try_from(to / chunk_bytes).unwrap_or(u32::MAX);
+                    let within = usize::try_from(to % chunk_bytes).unwrap_or(usize::MAX);
+                    // A chunk that spans two of the sparse pool's heaps has
+                    // no one host address: written a slot at a time.
+                    let base = *hosts
+                        .entry(physical)
+                        .or_insert_with(|| self.pool.chunk_host(physical).ok());
+                    match base {
+                        Some(base)
+                            if within + len <= usize::try_from(chunk_bytes).unwrap_or(0) =>
+                        {
+                            // SAFETY: `within + len` bytes inside the chunk
+                            // the address names, committed (`chunk_host`
+                            // admits it), which no frame in flight reads
+                            // (the caller drained them); the source is this
+                            // function's own buffer.
+                            #[allow(unsafe_code)]
+                            unsafe {
+                                std::ptr::copy_nonoverlapping(
+                                    piece.as_ptr(),
+                                    base.as_ptr().add(within),
+                                    len,
+                                );
+                            }
+                        }
+                        _ => self.pool.write(to, piece)?,
+                    }
+                }
+                at = end;
+            }
         }
         Ok(())
     }
@@ -1729,12 +1779,20 @@ impl Pools {
     /// The residency the load seats its weights by before the runtime names
     /// any slot: every atom of every shape, each shape in chunks of its
     /// own, from the first segment above the seats' runs (which a
-    /// seat-addressed fire writes) on. `None` where the pool cannot hold
-    /// them all.
+    /// seat-addressed fire writes) where they fit there, else from chunk 1
+    /// (a seat-addressed fire over them is then refused, `weights_in_seats`;
+    /// the runtime names slot refs). `None` where the pool cannot hold them
+    /// all.
     #[must_use]
     pub fn preseat_plan(&self) -> Option<engine::chunk::WeightResidency> {
         let segment = self.layout.segment_chunks.max(1);
-        let mut first = (1 + self.layout.seat_chunks()).div_ceil(segment) * segment;
+        let above = (1 + self.layout.seat_chunks()).div_ceil(segment) * segment;
+        [above, 1].into_iter().find_map(|first| self.preseat_from(first))
+    }
+
+    /// Every atom of every shape from chunk `first` on, each shape in chunks
+    /// of its own; `None` past the pool.
+    fn preseat_from(&self, mut first: u32) -> Option<engine::chunk::WeightResidency> {
         let mut resident = Vec::new();
         for cache in &self.weight_caches {
             let per_chunk = cache.shape.per_chunk.max(1);
@@ -1779,8 +1837,19 @@ impl Pools {
             })
             .max()
             .unwrap_or(0);
+        // Backed through the weights and as many chunks again as every
+        // shape's floor takes: the runtime seats a held set's staging beside
+        // the weights in what is backed at load.
+        let floor: u32 = self
+            .weight_caches
+            .iter()
+            .map(|cache| cache.shape.floor.div_ceil(cache.shape.per_chunk.max(1)))
+            .sum();
         let segment = self.layout.segment_chunks.max(1);
-        self.pool.commit_segments((last + 1).div_ceil(segment))?;
+        let segments = (last + 1 + floor)
+            .div_ceil(segment)
+            .min(self.pool.segments());
+        self.pool.commit_segments(segments)?;
         self.weight_residency(frame, plan)?;
         for cache in &mut self.weight_caches {
             cache.set_preseated(true);

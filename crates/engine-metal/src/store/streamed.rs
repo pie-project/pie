@@ -536,24 +536,24 @@ struct Host {
     opened: bool,
 }
 
-/// A slot filled on the host from the serving file: `bytes` at `from` in
-/// the file, to `to` bytes into the pool.
+/// Slots filled on the host from the serving file: `(from, to, bytes)`
+/// each, `bytes` at `from` in the file to `to` bytes into the pool, in the
+/// file's order.
 #[derive(Debug, Clone)]
-pub struct FileFill {
+pub struct FileFills {
     pub file: std::sync::Arc<crate::mapping::Mapping>,
-    pub from: u64,
-    pub to: u64,
-    pub bytes: u64,
+    pub fills: Vec<(u64, u64, u64)>,
 }
 
-impl FileFill {
-    /// The bytes, read from the file (not through its mapping).
-    pub fn read(&self, into: &mut Vec<u8>) -> Result<()> {
+impl FileFills {
+    /// `bytes` bytes at `from`, read from the file (not through its
+    /// mapping).
+    pub fn read(&self, from: u64, bytes: u64, into: &mut Vec<u8>) -> Result<()> {
         use std::os::unix::fs::FileExt;
-        into.resize(usize::try_from(self.bytes).unwrap_or(usize::MAX), 0);
+        into.resize(usize::try_from(bytes).unwrap_or(usize::MAX), 0);
         self.file
             .file()
-            .read_exact_at(into, self.from)
+            .read_exact_at(into, from)
             .map_err(|why| Fault::Mapped {
                 step: "read",
                 what: self.file.path().display().to_string(),
@@ -725,18 +725,23 @@ impl Cache {
         named: Vec<Option<u32>>,
         into: &Buffer,
         offset: SlotAt<'_>,
-    ) -> Result<Vec<FileFill>> {
-        let mut fills = Vec::new();
+    ) -> Result<Vec<FileFills>> {
+        // Each atom newly named a slot, and the slot's byte offset.
+        let mut to: Vec<Option<u64>> = vec![None; named.len()];
         for (atom, slot) in named.iter().enumerate() {
             let Some(slot) = *slot else { continue };
-            if self.slots[atom] == Some(slot) {
-                continue;
+            if self.slots[atom] != Some(slot) {
+                to[atom] = Some(offset(slot)?);
             }
-            let to = offset(slot)?;
-            let atom = u32::try_from(atom).unwrap_or(u32::MAX);
-            for (plane, host) in self.shape.planes.iter().zip(&self.hosts) {
-                let Some(entry) = atom.checked_sub(plane.atom).filter(|e| *e < plane.entries)
-                else {
+        }
+        // A plane at a time, its entries in order: a file weight's fills
+        // follow one another in the file.
+        let mut fills = Vec::new();
+        for (plane, host) in self.shape.planes.iter().zip(&self.hosts) {
+            let mut file_fills = Vec::new();
+            for entry in 0..plane.entries {
+                let atom = plane.atom + entry;
+                let Some(to) = to.get(atom as usize).copied().flatten() else {
                     continue;
                 };
                 let Some(host) = host else {
@@ -752,13 +757,8 @@ impl Cache {
                 if bytes == 0 {
                     continue;
                 }
-                if let Some((file, at)) = &host.file {
-                    fills.push(FileFill {
-                        file: std::sync::Arc::clone(file),
-                        from: at + plane.entry_at(entry),
-                        to: to + plane.at,
-                        bytes,
-                    });
+                if let Some((_, at)) = &host.file {
+                    file_fills.push((at + plane.entry_at(entry), to + plane.at, bytes));
                     continue;
                 }
                 frame.copy(
@@ -768,6 +768,17 @@ impl Cache {
                     to + plane.at,
                     bytes,
                 )?;
+            }
+            if let Some(Host {
+                file: Some((file, _)),
+                ..
+            }) = host
+                && !file_fills.is_empty()
+            {
+                fills.push(FileFills {
+                    file: std::sync::Arc::clone(file),
+                    fills: file_fills,
+                });
             }
         }
         self.slots = named;
