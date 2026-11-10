@@ -558,6 +558,7 @@ impl Shell {
                 rs: RsVerb::Fold,
                 rs_reset: RsReset::Inferred,
                 rs_slot: None,
+                rs_read: None,
                 rs_snapshots: &[],
                 group: None,
                 inputs: &[],

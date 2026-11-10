@@ -1078,6 +1078,15 @@ impl FrameShell for Shell {
                     ),
                 });
             }
+            // A lane that folds nothing reads the state as it stood before
+            // the fire, while the lane beside it folds into the record the
+            // fire writes: the two never meet in one row.
+            if matches!(verb, RsMove::Scatter { fold: 0, .. })
+                && let Some(read) = seated.rs_read
+                && let Some(named) = slot_ids.last_mut()
+            {
+                *named = read as i32;
+            }
             rs_moves.push(verb);
             rs_lens.push(narrow(u64::from(folded)));
             let runs_correction = self.corrected.contains(row.class as usize);
