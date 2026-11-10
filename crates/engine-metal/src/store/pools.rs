@@ -9,7 +9,7 @@ use kernels_metal::{KvPool, RecurrentPool, StateMap, Tensor};
 use poem_compiler::chunk::{ChunkRecipe, RowId, SlotLayout};
 use poem_ir::{CacheRow, Dtype, Trace};
 
-use super::layout::{FIXED, LIST, Layout, RS, Slots, WINDOW, gcd};
+use super::layout::{FIXED, LIST, Layout, MAX_WINDOWS, RS, Slots, WINDOWS, gcd};
 use super::pool::Pool;
 use super::{
     STATE_MAP_BYTES, Seats, Spill, TableSeat, compressed_rows, elem_bytes, elem_size, narrow,
@@ -147,11 +147,20 @@ pub struct RsRows {
 }
 
 /// The list a kv row's slots lie in, so the page table it reads: the kv
-/// list or the window list (CONTRACT-BC 19).
+/// list or window list `k` (CONTRACT-BC 19, 21).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TablePaging {
     List,
-    Window,
+    Window(u8),
+}
+
+/// One window list as the recipe lays it: its slot bytes, the rows its
+/// window retains and the tokens (`T_w`) a slot holds.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct WindowRows {
+    pub bytes: u64,
+    pub rows: u32,
+    pub tokens: u32,
 }
 
 /// How a load's rows lay into the recipe's slots, before any pool is
@@ -166,14 +175,11 @@ pub struct Rows {
     pub tokens: u32,
     pub fixed_bytes: u64,
     pub pieces: u32,
-    /// The window list's slot bytes (CONTRACT-BC 19), the rows its window
-    /// retains and the tokens (`T_w`) a slot holds (CONTRACT-BC 21); zero
+    /// The window lists (CONTRACT-BC 19, 21), in the recipe's order; none
     /// where nothing is windowed.
-    pub window_bytes: u64,
-    pub window_rows: u32,
-    pub window_tokens: u32,
+    pub windows: Vec<WindowRows>,
     /// The page tables a fire stages, by the list each pages: the kv
-    /// list's first (the All axis's), then the window list's.
+    /// list's first (the All axis's), then the window lists'.
     pub tables: Vec<TablePaging>,
     /// Each distinct set of record slots a state row's pieces lie in.
     pub bands: Vec<Vec<u32>>,
@@ -234,22 +240,37 @@ impl Rows {
         facts: &Facts,
         rs: Option<&crate::rs::Layout>,
     ) -> Result<Rows> {
-        let windows: Vec<&SlotLayout> = recipe.windows().collect();
-        if windows.len() > 1 {
-            return Err(disagree(format!(
-                "keeps {} window lists ({}), where a load pages one",
-                windows.len(),
-                recipe.shapes()
-            )));
-        }
-        let (window_tokens, window_bytes, window_rows, window_runs) = match windows.first() {
-            Some(SlotLayout::List {
+        let mut windows: Vec<WindowRows> = Vec::new();
+        let mut window_runs: Vec<&[poem_compiler::chunk::TokenRun]> = Vec::new();
+        for layout in recipe.windows() {
+            if let SlotLayout::List {
                 tokens,
                 bytes,
                 rows,
                 window: Some(window),
-            }) => (*tokens, *bytes, *window, rows.as_slice()),
-            _ => (0, 0, 0, &[][..]),
+            } = layout
+            {
+                windows.push(WindowRows {
+                    bytes: *bytes,
+                    rows: *window,
+                    tokens: *tokens,
+                });
+                window_runs.push(rows.as_slice());
+            }
+        }
+        if windows.len() > MAX_WINDOWS {
+            return Err(disagree(format!(
+                "keeps {} window lists ({}), where a load pages at most {MAX_WINDOWS}",
+                windows.len(),
+                recipe.shapes()
+            )));
+        }
+        // The window list a row's run lies in, and its run.
+        let windowed = |id: RowId| {
+            window_runs
+                .iter()
+                .enumerate()
+                .find_map(|(k, runs)| runs.iter().find(|run| run.row == id).map(|run| (k, run)))
         };
         let (tokens, list_bytes, runs) = match recipe.list() {
             Some(SlotLayout::List {
@@ -269,16 +290,17 @@ impl Rows {
             }) => (*bytes, *pieces_per_ws, rows.as_slice()),
             _ => (0, 0, &[][..]),
         };
-        // Without a list the window list's slot is the kv page.
+        // Without a list the widest window slot is the kv page.
         let tokens = if list_bytes == 0 {
-            window_tokens
+            windows.iter().map(|w| w.tokens).max().unwrap_or(0)
         } else {
             tokens
         };
-        if window_bytes > 0 && (window_tokens == 0 || window_tokens > tokens) {
+        if let Some(window) = windows.iter().find(|w| w.tokens == 0 || w.tokens > tokens) {
             return Err(disagree(format!(
-                "pages windowed rows {window_tokens} tokens a window slot beside {tokens}-token \
-                 kv pages, where a window list's slot holds no more than a kv page"
+                "pages windowed rows {} tokens a window slot beside {tokens}-token kv pages, \
+                 where a window list's slot holds no more than a kv page",
+                window.tokens
             )));
         }
         let mut tables: Vec<TablePaging> = Vec::new();
@@ -304,12 +326,12 @@ impl Rows {
                     let (paging, offset, stated, run_tokens) =
                         if let Some(run) = runs.iter().find(|run| run.row == id) {
                             (TablePaging::List, run.offset, run.per_token, tokens)
-                        } else if let Some(run) = window_runs.iter().find(|run| run.row == id) {
+                        } else if let Some((k, run)) = windowed(id) {
                             (
-                                TablePaging::Window,
+                                TablePaging::Window(u8::try_from(k).unwrap_or(u8::MAX)),
                                 run.offset,
                                 run.per_token,
-                                window_tokens,
+                                windows[k].tokens,
                             )
                         } else {
                             return Err(disagree(format!("lays kv row `{name}` in no slot")));
@@ -401,8 +423,12 @@ impl Rows {
             let (paging, run, run_tokens) = if let Some(run) = runs.iter().find(|run| run.row == id)
             {
                 (TablePaging::List, run, tokens)
-            } else if let Some(run) = window_runs.iter().find(|run| run.row == id) {
-                (TablePaging::Window, run, window_tokens)
+            } else if let Some((k, run)) = windowed(id) {
+                (
+                    TablePaging::Window(u8::try_from(k).unwrap_or(u8::MAX)),
+                    run,
+                    windows[k].tokens,
+                )
             } else {
                 return Err(disagree(format!(
                     "keeps no compressor state beside kv row {row}, which a pool gather keys by"
@@ -431,12 +457,14 @@ impl Rows {
             tokens,
             fixed_bytes,
             pieces,
-            window_bytes,
-            window_rows,
-            window_tokens,
-            // The kv list's table first: the All axis reads it.
+            windows,
+            // The kv list's table first (the All axis reads it), then the
+            // window lists' in order.
             tables: {
-                tables.sort_by_key(|paging| *paging != TablePaging::List);
+                tables.sort_by_key(|paging| match paging {
+                    TablePaging::List => 0,
+                    TablePaging::Window(k) => 1 + u32::from(*k),
+                });
                 tables
             },
             bands,
@@ -845,11 +873,11 @@ impl Pools {
             .unwrap_or(0)
     }
 
-    /// The window list's paging: `T_w` tokens a page (CONTRACT-BC 21),
-    /// as many pages a seat as its context fills.
+    /// Window list `k`'s paging: `T_w` tokens a page (CONTRACT-BC 21), as
+    /// many pages a seat as its context fills.
     #[must_use]
-    pub fn window_paging(&self) -> Paging {
-        let tokens = self.layout.window_tokens.max(1);
+    pub fn window_paging(&self, k: usize) -> Paging {
+        let tokens = self.layout.window(k).map_or(1, |w| w.tokens.max(1));
         Paging {
             page_size: tokens,
             pages_per_slot: self.paging.context().div_ceil(tokens).max(1),
@@ -857,25 +885,43 @@ impl Pools {
         }
     }
 
-    /// What a window page id counts: `gcd(chunk, window slot)` bytes.
-    fn window_stride(&self) -> u64 {
-        self.layout.window.map_or(256, |window| {
-            gcd(self.layout.chunk_bytes, window.slot_bytes)
+    /// The most pages a seat takes in any window list.
+    #[must_use]
+    pub fn window_pages_per_slot(&self) -> u32 {
+        (0..MAX_WINDOWS)
+            .filter(|&k| self.layout.window(k).is_some())
+            .map(|k| self.window_paging(k).pages_per_slot)
+            .max()
+            .unwrap_or(0)
+    }
+
+    /// What window list `k`'s page id counts: `gcd(chunk, window slot)`
+    /// bytes.
+    fn window_stride(&self, k: usize) -> u64 {
+        self.layout.window(k).map_or(256, |window| {
+            gcd(self.layout.chunk_bytes, window.slots.slot_bytes)
         })
     }
 
-    /// A lane's window pages as kernels address them, one a window slot
-    /// (`T_w` tokens) in token order: `refs` (window slot refs, 0 a slot trimmed behind the
-    /// window: the null chunk) as units of [`Pools::window_stride`], or,
-    /// seat-addressed, seat `seat`'s run, `pages` of them.
-    pub fn window_pages(&self, refs: &[u32], seat: Option<(u32, u32)>) -> Result<Vec<u32>> {
-        let window = *self.shape(WINDOW)?;
-        let stride = self.window_stride();
+    /// A lane's pages of window list `k` as kernels address them, one a
+    /// window slot (`T_w` tokens) in token order: `refs` (window slot refs,
+    /// 0 a slot trimmed behind the window: the null chunk) as units of
+    /// [`Pools::window_stride`], or, seat-addressed, seat `seat`'s run,
+    /// `pages` of them.
+    pub fn window_pages(
+        &self,
+        k: usize,
+        refs: &[u32],
+        seat: Option<(u32, u32)>,
+    ) -> Result<Vec<u32>> {
+        let id = WINDOWS[k.min(MAX_WINDOWS - 1)];
+        let window = *self.shape(id)?;
+        let stride = self.window_stride(k);
         let unit = |slot: u32| -> Result<u32> {
             if slot == 0 {
                 return Ok(0);
             }
-            let at = self.slot_offset(WINDOW, slot)?;
+            let at = self.slot_offset(id, slot)?;
             self.pool
                 .admit(u32::try_from(at / self.layout.chunk_bytes).unwrap_or(u32::MAX))?;
             Ok(u32::try_from(at / stride).unwrap_or(u32::MAX))
@@ -883,7 +929,7 @@ impl Pools {
         if let Some((slot, pages)) = seat
             && refs.is_empty()
         {
-            let first = u64::from(slot) * u64::from(self.window_paging().pages_per_slot);
+            let first = u64::from(slot) * u64::from(self.window_paging(k).pages_per_slot);
             return (0..pages)
                 .map(|page| {
                     let id = u32::try_from(first + u64::from(page)).unwrap_or(u32::MAX);
@@ -1084,7 +1130,7 @@ impl Pools {
                     );
                     let stride = match paging {
                         TablePaging::List => list_bytes,
-                        TablePaging::Window => self.window_stride(),
+                        TablePaging::Window(k) => self.window_stride(usize::from(k)),
                     };
                     compressed.push((
                         row,
@@ -1125,9 +1171,10 @@ impl Pools {
                     tables.push(Some(table));
                     let (stride, page_size) = match paging {
                         TablePaging::List => (list_bytes, self.paging.page_size),
-                        TablePaging::Window => {
-                            (self.window_stride(), self.window_paging().page_size)
-                        }
+                        TablePaging::Window(k) => (
+                            self.window_stride(usize::from(k)),
+                            self.window_paging(usize::from(k)).page_size,
+                        ),
                     };
                     CachePool::Kv(KvPool {
                         keys: plane(u64::from(kv_heads) * u64::from(head_dim))?,

@@ -28,8 +28,25 @@ use crate::error::{Fault, Result};
 
 pub const LIST: ShapeId = ShapeId(0);
 pub const FIXED: ShapeId = ShapeId(1);
+/// The first window list's shape.
 pub const WINDOW: ShapeId = ShapeId(2);
 pub const RS: ShapeId = ShapeId(3);
+
+/// The most window lists a load pages (CONTRACT-BC 21).
+pub const MAX_WINDOWS: usize = 4;
+
+/// Each window list's shape, in the recipe's order: the first is
+/// [`WINDOW`], the others follow the rs list.
+pub const WINDOWS: [ShapeId; MAX_WINDOWS] = [WINDOW, ShapeId(4), ShapeId(5), ShapeId(6)];
+
+/// One window list's place in the pool: its slots, the rows its window
+/// retains and its tokens (`T_w`) a slot.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct WindowList {
+    pub slots: Slots,
+    pub rows: u32,
+    pub tokens: u32,
+}
 
 /// The chunk an on-device Metal recipe aims at.
 pub const TARGET_CHUNK: u64 = 2 << 20;
@@ -99,13 +116,10 @@ pub struct Layout {
     pub pieces: u32,
     pub list: Option<Slots>,
     pub fixed: Option<Slots>,
-    /// The window list (CONTRACT-BC 19, 21): `window_tokens` (`T_w`) tokens
-    /// a slot of the windowed rows, a table in its own token order a lane,
-    /// read through `window_rows`; slots trimmed behind the window are the
-    /// null chunk.
-    pub window: Option<Slots>,
-    pub window_rows: u32,
-    pub window_tokens: u32,
+    /// The window lists (CONTRACT-BC 19, 21), one a distinct window: each
+    /// `T_w` tokens a slot of the rows it windows, a table in its own token
+    /// order a lane; slots trimmed behind the window are the null chunk.
+    pub windows: [Option<WindowList>; MAX_WINDOWS],
     /// The rs list (CONTRACT-BC 18, 20): `rs_tokens` unfolded rows of every
     /// recurrent layer's rs planes a slot.
     pub rs: Option<Slots>,
@@ -137,9 +151,7 @@ impl Layout {
             pieces: pieces.max(1),
             list: Slots::of(LIST, list, chunk_bytes),
             fixed: Slots::of(FIXED, fixed, chunk_bytes),
-            window: None,
-            window_rows: 0,
-            window_tokens: 0,
+            windows: [None; MAX_WINDOWS],
             rs: None,
             rs_tokens: 0,
             seats,
@@ -166,8 +178,8 @@ impl Layout {
         Ok(layout)
     }
 
-    /// This layout with a window list of `bytes` slots of `tokens` rows,
-    /// read through `rows` rows; its seat run, `pages_per_seat` slots a
+    /// This layout with one more window list, of `bytes` slots of `tokens`
+    /// rows retaining `rows` rows; its seat run, `pages_per_seat` slots a
     /// seat, after the others.
     pub fn with_window(
         mut self,
@@ -176,7 +188,15 @@ impl Layout {
         tokens: u32,
         pages_per_seat: u32,
     ) -> Result<Layout> {
-        let Some(mut window) = Slots::of(WINDOW, bytes, self.chunk_bytes) else {
+        let at = self.windows.iter().take_while(|w| w.is_some()).count();
+        let Some(&id) = WINDOWS.get(at) else {
+            return Err(Fault::Ceiling {
+                what: "window lists of a load",
+                need: at as u64 + 1,
+                have: MAX_WINDOWS as u64,
+            });
+        };
+        let Some(mut window) = Slots::of(id, bytes, self.chunk_bytes) else {
             return Ok(self);
         };
         if window.per_chunk == 0 {
@@ -189,10 +209,23 @@ impl Layout {
         let seats = self.seats;
         window.seat_chunk = 1 + self.seat_chunks();
         window.seat_slots = seats.saturating_mul(pages_per_seat);
-        self.window = Some(window);
-        self.window_rows = rows;
-        self.window_tokens = tokens;
+        self.windows[at] = Some(WindowList {
+            slots: window,
+            rows,
+            tokens,
+        });
         Ok(self)
+    }
+
+    /// The window lists, in order.
+    pub fn window_lists(&self) -> impl Iterator<Item = &WindowList> {
+        self.windows.iter().flatten()
+    }
+
+    /// Window list `k`.
+    #[must_use]
+    pub fn window(&self, k: usize) -> Option<&WindowList> {
+        self.windows.get(k).and_then(Option::as_ref)
     }
 
     /// This layout with an rs list of `bytes` slots of `tokens` rows; its
@@ -219,7 +252,7 @@ impl Layout {
         self.list
             .iter()
             .chain(&self.fixed)
-            .chain(&self.window)
+            .chain(self.window_lists().map(|window| &window.slots))
             .chain(&self.rs)
     }
 
@@ -283,15 +316,15 @@ impl Layout {
                 &rows[0],
             ));
         }
-        // The window list: a list of its own slot with its window
+        // The window lists: lists of their own slots, each with its window
         // (CONTRACT-BC 19, 21).
-        if let Some(window) = &self.window {
+        for window in self.window_lists() {
             shapes.push(shape(
-                window,
+                &window.slots,
                 SlotKind::List {
-                    tokens: self.window_tokens,
+                    tokens: window.tokens,
                     rate: 1,
-                    window: Some(self.window_rows),
+                    window: Some(window.rows),
                 },
                 &Vec::new(),
             ));

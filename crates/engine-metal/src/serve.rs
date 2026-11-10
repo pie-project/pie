@@ -180,10 +180,11 @@ pub struct Seated<'a> {
     /// copy-on-write): a lane that folds nothing reads its state there
     /// (CONTRACT-BC 15).
     pub record_run: Option<&'a [u32]>,
-    /// The lane's window-list slot refs, one a kv page in token order (0 a
-    /// slot trimmed behind the window), for the windowed rows; empty
+    /// The lane's window-list slot refs, one table a window list (the
+    /// load's order), each one a `T_w` slot in token order (0 a slot
+    /// trimmed behind the window), for the windowed rows; a missing or empty
     /// seat-addresses them.
-    pub window: &'a [u32],
+    pub windows: &'a [Vec<u32>],
 }
 
 impl<'a> Seated<'a> {
@@ -209,7 +210,7 @@ impl<'a> Seated<'a> {
             refs: false,
             record: None,
             record_run: None,
-            window: &[],
+            windows: &[],
         }
     }
 
@@ -715,11 +716,23 @@ impl PreparedLoad<'_> {
             let seated = paging_at(1, boot.slots)?;
             let bytes = [rows.list_bytes, rows.fixed_bytes];
             let chunk = rows.chunk_bytes;
-            // A seat's window slots: its context in `T_w`-token slots.
-            let window_pages = seated.context().div_ceil(rows.window_tokens.max(1)).max(1);
-            let window_chunks = chunk.checked_div(rows.window_bytes).map_or(0, |per| {
-                window_pages.div_ceil(u32::try_from(per).unwrap_or(1).max(1))
-            });
+            // A seat's slots of each window list: its context in `T_w`-token
+            // slots.
+            let window_pages: Vec<u32> = rows
+                .windows
+                .iter()
+                .map(|w| seated.context().div_ceil(w.tokens.max(1)).max(1))
+                .collect();
+            let window_chunks: u32 = rows
+                .windows
+                .iter()
+                .zip(&window_pages)
+                .map(|(w, pages)| {
+                    chunk.checked_div(w.bytes).map_or(0, |per| {
+                        pages.div_ceil(u32::try_from(per).unwrap_or(1).max(1))
+                    })
+                })
+                .sum();
             let least = Layout::least_chunks(chunk, bytes, rows.pieces, seated.pages_per_slot)
                 + window_chunks;
             // The row-streamed tables' blocks come out of this room as the
@@ -738,7 +751,7 @@ impl PreparedLoad<'_> {
                 )));
             }
             let total = total.min(binds);
-            let layout = Layout::new(
+            let mut layout = Layout::new(
                 chunk,
                 total,
                 crate::store::pool::segment_chunks(chunk),
@@ -747,14 +760,11 @@ impl PreparedLoad<'_> {
                 rows.pieces,
                 boot.slots,
                 seated.pages_per_slot,
-            )?
-            .with_window(
-                rows.window_bytes,
-                rows.window_rows,
-                rows.window_tokens,
-                window_pages,
-            )?
-            .with_rs(
+            )?;
+            for (window, pages) in rows.windows.iter().zip(&window_pages) {
+                layout = layout.with_window(window.bytes, window.rows, window.tokens, *pages)?;
+            }
+            let layout = layout.with_rs(
                 rows.rs.as_ref().map_or(0, |rs| rs.bytes),
                 rows.rs.as_ref().map_or(0, |rs| rs.tokens),
                 seated.pages_per_slot,
@@ -917,10 +927,7 @@ impl PreparedLoad<'_> {
                     &run_caps,
                     &run_passes,
                     &pools.bands(),
-                    pools
-                        .layout()
-                        .window
-                        .map_or(0, |_| pools.window_paging().pages_per_slot),
+                    pools.window_pages_per_slot(),
                 )
             })
             .collect::<Result<Vec<_>>>()?;
@@ -2726,9 +2733,10 @@ impl Shell {
         let mut seats: Vec<Seat> = Vec::with_capacity(lanes.len());
         let mut kv_less: Vec<bool> = Vec::with_capacity(lanes.len());
         let mut tables: Vec<std::borrow::Cow<'_, [u32]>> = Vec::with_capacity(lanes.len());
-        // Per lane: its window list pages.
-        let mut window_tables: Vec<Vec<u32>> = Vec::with_capacity(lanes.len());
-        let has_window = self.pools.layout().window.is_some();
+        // Per window list, per lane: its pages.
+        let window_lists = self.pools.layout().window_lists().count();
+        let mut window_tables: Vec<Vec<Vec<u32>>> =
+            vec![Vec::with_capacity(lanes.len()); window_lists];
         let mut tokens: Vec<i32> = Vec::with_capacity(rows as usize);
         let mut positions: Vec<i32> = Vec::with_capacity(rows as usize);
         let mut rotations: Vec<i32> = Vec::with_capacity(rows as usize);
@@ -2810,15 +2818,18 @@ impl Shell {
                 engine::fire::RsReset::Held => false,
             };
             let record = self.record_of(seated)?;
-            window_tables.push(if has_window && !seated.kv_less {
-                let page_size = u64::from(self.pools.window_paging().page_size.max(1));
-                let after = u64::from(have) + u64::from(row.rows);
-                let pages = u32::try_from(after.div_ceil(page_size).max(1)).unwrap_or(u32::MAX);
-                let seat = (!seated.refs || seated.window.is_empty()).then_some((lane.slot, pages));
-                self.pools.window_pages(seated.window, seat)?
-            } else {
-                Vec::new()
-            });
+            for (k, lists) in window_tables.iter_mut().enumerate() {
+                lists.push(if seated.kv_less {
+                    Vec::new()
+                } else {
+                    let page_size = u64::from(self.pools.window_paging(k).page_size.max(1));
+                    let after = u64::from(have) + u64::from(row.rows);
+                    let pages = u32::try_from(after.div_ceil(page_size).max(1)).unwrap_or(u32::MAX);
+                    let refs = seated.windows.get(k).map_or(&[][..], Vec::as_slice);
+                    let seat = (!seated.refs || refs.is_empty()).then_some((lane.slot, pages));
+                    self.pools.window_pages(k, refs, seat)?
+                });
+            }
             state_top = record
                 .iter()
                 .map(|&id| id.saturating_add(1))
@@ -3147,13 +3158,20 @@ impl Shell {
 
         let indptr_host = kv::indptr(&seats)?;
         let table_refs: Vec<&[u32]> = tables.iter().map(std::convert::AsRef::as_ref).collect();
-        let window_refs: Vec<&[u32]> = window_tables.iter().map(Vec::as_slice).collect();
+        let window_refs: Vec<Vec<&[u32]>> = window_tables
+            .iter()
+            .map(|lists| lists.iter().map(Vec::as_slice).collect())
+            .collect();
         let mut geometries = Vec::with_capacity(self.page_tables);
         for &paging_of in self.pools.tables() {
             geometries.push(match paging_of {
                 crate::store::TablePaging::List => kv::geometry_with(&paging, &seats, &table_refs)?,
-                crate::store::TablePaging::Window => {
-                    kv::geometry_with(&self.pools.window_paging(), &seats, &window_refs)?
+                crate::store::TablePaging::Window(k) => {
+                    let k = usize::from(k);
+                    let refs = window_refs.get(k).ok_or_else(|| {
+                        Fault::program("serve::prepare", format!("window list {k} has no table"))
+                    })?;
+                    kv::geometry_with(&self.pools.window_paging(k), &seats, refs)?
                 }
             });
         }
@@ -3658,7 +3676,20 @@ impl Shell {
             voxels: bound.voxels,
             inputs: bound.inputs,
             geometry,
-            window_table: self.pools.table_of(crate::store::TablePaging::Window),
+            window_tables: self
+                .pools
+                .layout()
+                .window_lists()
+                .enumerate()
+                .map(|(k, window)| {
+                    (
+                        window.rows,
+                        self.pools.table_of(crate::store::TablePaging::Window(
+                            u8::try_from(k).unwrap_or(u8::MAX),
+                        )),
+                    )
+                })
+                .collect(),
             tables: FireTables {
                 request_of_token: bound.request_of_token,
                 readout_positions: bound.readout_positions,

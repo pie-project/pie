@@ -130,8 +130,9 @@ pub struct FireBindings {
 
     /// One a page table: the kv list's first, the All axis's.
     pub geometry: Vec<CacheGeometry>,
-    /// The page table of `geometry` a windowed row's write descriptor reads.
-    pub window_table: usize,
+    /// The page table of `geometry` each window list's write descriptors
+    /// read, by the window (rows retained) the list keeps.
+    pub window_tables: Vec<(u32, usize)>,
 
     pub tables: FireTables,
 
@@ -1754,7 +1755,13 @@ impl<'c> Run<'c> {
     /// All axis's (the first), or a write descriptor's row's list's.
     fn table_of(&self, kind: GeomKind) -> usize {
         match poem_exec::store::kv::geometry_window(kind) {
-            Some(_) => self.fire.window_table,
+            Some(window) => self
+                .fire
+                .window_tables
+                .iter()
+                .find(|(rows, _)| *rows == window)
+                .or(self.fire.window_tables.first())
+                .map_or(0, |(_, table)| *table),
             None => 0,
         }
     }
