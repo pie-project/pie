@@ -602,3 +602,24 @@ The `new-memory/` directory is bookkeeping and is removed before anything lands 
   ignored at eddd0d2c7. Shared mode uses slot refs -> must fix before more Metal features (BM5a).
 - OPEN: Metal gemma run-to-run nondeterminism already at M38 (1 of 3 runs differs). Source unknown.
 - Metal MTP on Qwen3.5-0.8B accepts 0/127 drafts in every build (pre-existing).
+
+### M43 — 2026-11-10: ROCm option A, host/disk tiers (contract 22), Vulkan/wgpu kernels step 1, Cerebras host pool
+- `sc/amd-rocm-port` (a1dcf5886, MI300X): flat range fixes; recurrent rows via segments + pieces; kv page stride +
+  compressor stride across all paged HIP kernels; RowTable embed; ExpertTable in every HIP routed select;
+  concat_cols ported; FP8 tile sched_barrier fix (m33 off BASELINE-FAILURES); PACKED/pack paths deleted.
+  Goldens: 6/8 = ref incl. dots + minimax (were refused); dsv4 + mimo differ ONLY with graphs on, and the ref
+  (e536895fe) is wrong too -> pre-existing ROCm graph-replay bug with >= 2 MoE layers (AMD item d). golden_rows dsv4
+  host/cached/mixed equal. CUDA golden_logits + by_refs on sm_120 still = GOLDEN-LOGITS-BASE after the merge.
+- `sc/tier-shared` (b52b19ca9, 1a7ce3a12): host tier = second chunk pool, disk = kv list slots in the slot file;
+  every shared shape parks/restores through copy_slots, holders kept; kv_swap_capable on shared pools (CUDA kv
+  pressure now suspends to host). CUDA legacy host rs/window shelves and copy_state_host etc. deleted.
+  Verified: runtime tiers 6/6 + store/planner/scheduler; CUDA golden_offload (dense, window, GDN) bitwise vs never
+  offloaded, with a negative control. Open: Metal device check; e2e suspend/resume; tier copies on the compute stream
+  (legacy overlapped on a swap stream — perf follow-up); named snapshots / taps of host refs; MTP + park e2e.
+- `sc/vk-chunk-pool` step 1 (e45549767, ad0e2a3fc): Slang kernels address kv/state as base + slot*stride + offset in
+  up to 4 segment bindings (WGSL has no buffer arrays); new model_logits tests; wgpu bitwise, Vulkan hybrid/window
+  bitwise, dense 1 bf16 ulp (driver codegen, address math proven exact). Engines still degenerate; pool switch next.
+- `sc/cb-chunk-pool` (191684a88): Cerebras state in a host chunk pool (segments really allocate/free/evacuate),
+  fires stage named slots into per-fire planes and copy back; one window list (widest) interim; weights always host
+  -> no weight shapes. 124 lib tests incl. host-simulation word-for-word checks. Unverified on CS hardware.
+  Behavior: recurrent models' lanes per fire <= state slots. Wafer `Spatial` engine still degenerate.

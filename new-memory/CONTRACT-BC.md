@@ -101,3 +101,18 @@ Proposed by the L40S session (branch `sc/l40s-bc`), accepted by New Pie. Runtime
     the per-fire epoch. Forks / prefix-cache checkpoints share window slots by refcount, list by list. A write into a
     shared window slot is preceded by a whole-slot copy in `Lane.slot_copies` under that list's shape id (degenerate
     pools: `KvCopy.windowed` pairs on the pre-launch copy). `KvDelta::window_copies` is removed.
+22. **Host and disk tiers of shared shapes (fills in the tiers part of 12).** `ChunkFacts.host_chunks`: host chunks
+    of `chunk_bytes`, ids from 0, none reserved, no ChunkTable (a host ref names its own place); any state shape
+    (weights excepted) may open any host chunk; a host ref of shape s is `chunk * s.slots_per_chunk + index` at
+    `SlotShape::tier_offset(chunk_bytes, ref)`, laid out exactly as the device slot. `ChunkFacts.disk_chunks`: chunks
+    of kv-list slots; disk ref r = slot r of the engine's kv slot file; no other shape goes to disk;
+    `disk_persistent` / `disk_kept` keep their meaning and the runtime journals disk refs as it journaled pages.
+    `Engine::copy_slots(SlotCopy { shape, src, dst, slots, runs: [] })` moves whole slots of one shape device <->
+    HostPinned, device <-> LocalDisk, HostPinned <-> LocalDisk (kv list only); device refs logical; token runs device
+    only; a record moves as one copy per fixed shape, pieces paired in order. Ordering: a copy reads what every
+    earlier fire wrote and lands before every later fire; copies run in submission order; the runtime may reuse a
+    source / name a destination again once the call returns. The runtime parks only settled, private slots (sharing
+    checkpoints move together); a parked slot keeps its holders; restore lands in fresh device slots named by the
+    lane's tables / Lane.fixed. Byte reads of host refs (read_host_kv / read_host_state) are not stated. copy_kv /
+    copy_state to/from host remain only for engines stating degenerate facts. TP: smallest host/disk chunk counts
+    across ranks; each rank moves its band.
