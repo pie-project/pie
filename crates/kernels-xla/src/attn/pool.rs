@@ -47,17 +47,18 @@ pub(crate) fn cell_of(
 /// Writes `rows` `[n, w]` over columns `[0, w)` of `table` `[N, P]` at row
 /// `at[i]`; out-of-range rows are dropped.
 pub(crate) fn put_cols(f: &mut Func, table: Val, at: Val, rows: Val) -> Built<Val> {
-    let (p, w) = (f.dims(table)[1], f.dims(rows)[1]);
+    let (cells, p, w) = (f.dims(table)[0], f.dims(table)[1], f.dims(rows)[1]);
     let elem = f.elem(table);
     let rows = f.convert(rows, elem);
+    let at = apart(f, at, cells)?;
     if p == w {
-        return f.put_rows(table, at, rows, Combine::Set);
+        return f.put_rows_hinted(table, at, rows, Combine::Set, true);
     }
     let n = f.dims(at)[0];
     let at = f.reshape(at, &[n, 1])?;
     let zero = f.const_i(Elem::I32, 0, &[n, 1]);
     let idx = f.concat(&[at, zero], 1)?;
-    f.scatter(
+    f.scatter_hinted(
         table,
         idx,
         rows,
@@ -69,7 +70,23 @@ pub(crate) fn put_cols(f: &mut Func, table: Val, at: Val, rows: Val) -> Built<Va
             ..ScatterDims::default()
         },
         Combine::Set,
+        true,
     )
+}
+
+/// `at` with each row outside `[0, cells)` moved to a row of its own past
+/// the plane, so a write there drops and the write's rows are distinct: XLA
+/// then writes them side by side, not one after another (v6e DeepSeek-V4
+/// prompt fires: a pool plane's 2304 rows 0.35 ms a write).
+fn apart(f: &mut Func, at: Val, cells: i64) -> Built<Val> {
+    let n = f.dims(at)[0];
+    let lo = cmp_i(f, Cmp::Ge, at, 0)?;
+    let hi = cmp_i(f, Cmp::Lt, at, cells)?;
+    let inside = f.and(lo, hi)?;
+    let past = f.like_i(at, cells);
+    let k = f.iota(Elem::I32, &[n], 0);
+    let past = f.add(past, k)?;
+    f.select(inside, at, past)
 }
 
 /// A KV pool's page tables as flat i32 vectors (indices, then indptr), and
@@ -169,7 +186,8 @@ fn put_entries(f: &mut Func, table: Val, at: Val, rows: Val, div: i64) -> Built<
     let elem = f.elem(table);
     let rows = f.convert(rows, elem);
     let rows = f.reshape(rows, &[n * div, w])?;
-    f.put_rows(table, c, rows, Combine::Set)
+    let c = apart(f, c, cells)?;
+    f.put_rows_hinted(table, c, rows, Combine::Set, true)
 }
 
 fn long_enough(op: &'static str, what: &str, t: impl Stored, n: u32) -> Result<(), Error> {
