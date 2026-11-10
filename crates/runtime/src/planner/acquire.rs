@@ -124,6 +124,12 @@ impl ResidencyPlanner {
         }
         let (_, kv_total) = self.port.device_stats();
         if demand.kv_pages > kv_total {
+            if let Some(room) = self.port.room() {
+                return Err(PlannerError::PastPool {
+                    need: demand.kv_pages,
+                    room,
+                });
+            }
             return Err(PlannerError::Impossible {
                 need: demand.kv_pages,
                 total: kv_total,

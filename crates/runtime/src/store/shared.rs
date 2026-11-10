@@ -80,6 +80,54 @@ pub enum SharedError {
     },
 }
 
+/// A shared pool's chunks as they divide for good ([`SharedPool::room`]).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct PoolRoom {
+    pub chunk_bytes: u64,
+    pub total_chunks: u32,
+    pub reserved_chunks: u32,
+    /// The activation set aside under the smallest rung.
+    pub act_chunks: u32,
+    /// The chunks the weights' pinned slots take.
+    pub weight_chunks: u32,
+    /// What is left for kv and state: no move frees more.
+    pub state_chunks: u32,
+    /// `state_chunks` as kv list slots (pages).
+    pub list_slots: u32,
+    /// Tokens a kv list slot holds.
+    pub list_tokens: u32,
+}
+
+impl PoolRoom {
+    /// Says how the pool divides, for an ask of `need` kv pages it can
+    /// never meet.
+    #[must_use]
+    pub fn describe(&self, need: u32) -> String {
+        const MIB: u64 = 1 << 20;
+        let mib = |chunks: u32| u64::from(chunks) * self.chunk_bytes / MIB;
+        let short = need.saturating_sub(self.list_slots);
+        let per_chunk = u64::from(self.list_slots / self.state_chunks.max(1)).max(1);
+        let short_mib = u64::from(short).div_ceil(per_chunk) * self.chunk_bytes / MIB;
+        format!(
+            "the device pool holds {} MiB ({} chunks of {} MiB): weights pinned on it take \
+             {} MiB, activation {} MiB, reserved {} MiB, which leaves {} MiB ({} kv pages, \
+             {} tokens) for kv and state; this ask needs {need} kv pages ({} tokens), so no \
+             eviction can make room — raise device_kv_budget by at least {short_mib} MiB, or \
+             let the weights stream (weight_streaming = \"auto\" or \"on\")",
+            mib(self.total_chunks),
+            self.total_chunks,
+            self.chunk_bytes / MIB,
+            mib(self.weight_chunks),
+            mib(self.act_chunks),
+            mib(self.reserved_chunks),
+            mib(self.state_chunks),
+            self.list_slots,
+            u64::from(self.list_slots) * u64::from(self.list_tokens),
+            u64::from(need) * u64::from(self.list_tokens),
+        )
+    }
+}
+
 /// A per-token shape the stores take.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct TokenShape {
@@ -463,6 +511,47 @@ impl SharedPool {
     #[must_use]
     pub fn weights_first(&self) -> ShapeId {
         self.weights_first
+    }
+
+    /// How the device's chunks divide: what the reserved chunks, the
+    /// activation and the weights' pinned slots (the staging floor, and
+    /// every atom where they do not stream) hold for good, and what is left
+    /// for kv and state. No eviction reaches below that.
+    #[must_use]
+    pub fn room(&self) -> PoolRoom {
+        let pool = &self.pool;
+        let weight_chunks: u32 = (self.weights_first..)
+            .map_while(|shape| {
+                pool.shape(shape)
+                    .map(|facts| (shape, facts.slots_per_chunk))
+            })
+            .map(|(shape, spc)| {
+                let slots = pool.held_by(&Holder::Weights {
+                    shape,
+                    pinned: true,
+                });
+                u32::try_from(slots.div_ceil(u64::from(spc.max(1)))).unwrap_or(u32::MAX)
+            })
+            .sum();
+        let act_chunks = pool.act_chunks(0);
+        let state_chunks = pool
+            .total_chunks()
+            .saturating_sub(pool.reserved_chunks())
+            .saturating_sub(act_chunks)
+            .saturating_sub(weight_chunks);
+        PoolRoom {
+            chunk_bytes: pool.chunk_bytes(),
+            total_chunks: pool.total_chunks(),
+            reserved_chunks: pool.reserved_chunks(),
+            act_chunks,
+            weight_chunks,
+            state_chunks,
+            list_slots: self.list.map_or(0, |list| {
+                u32::try_from(u64::from(state_chunks) * u64::from(list.slots_per_chunk))
+                    .unwrap_or(u32::MAX)
+            }),
+            list_tokens: self.list.map_or(0, |list| list.tokens),
+        }
     }
 
     /// Copy-on-write records kept back for the lanes of one fire.
