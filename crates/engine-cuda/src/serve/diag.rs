@@ -34,6 +34,10 @@ pub struct Diagnostics {
     /// a row of a narrower window then keeps pages its kernels no longer
     /// read. The same logits as a list a window.
     pub one_window: bool,
+    /// Copies between the device and the host tier ride the compute stream,
+    /// ahead of every fire after them, not the swap stream beside those
+    /// fires: to weigh the overlap.
+    pub tier_inline: bool,
 }
 
 /// The sync guard's answer to a fire that waited for the device.
@@ -68,6 +72,7 @@ impl Default for Diagnostics {
             dense_weights: false,
             dense_experts: false,
             one_window: false,
+            tier_inline: false,
         }
     }
 }
@@ -131,6 +136,9 @@ impl Diagnostics {
         if self.one_window {
             words.push("one-window".to_string());
         }
+        if self.tier_inline {
+            words.push("tier-inline".to_string());
+        }
         (!words.is_empty()).then(|| words.join(","))
     }
 }
@@ -150,7 +158,7 @@ const WORDS: &str = "`golden-probe`, `arm-trace`, \
      `plan-trace=<rows|all>`, `arm-bench=<key>`, `capture-serial`, `boundary-trace`, `reap-trace`, \
      `trace-census`, `nan-check`, `fuse-chains=off`, `gumbel-direct=off`, \
      `sync-guard[=panic]`, `chunk-bytes=<bytes>`, `dense-weights`, \
-     `dense-experts`, `one-window`";
+     `dense-experts`, `one-window`, `tier-inline`";
 
 impl std::str::FromStr for Diagnostics {
     type Err = String;
@@ -177,6 +185,7 @@ impl std::str::FromStr for Diagnostics {
                 "dense-weights" => diag.dense_weights = switch(word, value)?,
                 "dense-experts" => diag.dense_experts = switch(word, value)?,
                 "one-window" => diag.one_window = switch(word, value)?,
+                "tier-inline" => diag.tier_inline = switch(word, value)?,
                 "fuse-chains" => diag.fuse_chains = switch(word, value)?,
                 "gumbel-direct" => diag.gumbel_direct = switch(word, value)?,
                 "sync-guard" => {
