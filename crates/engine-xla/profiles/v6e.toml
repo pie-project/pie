@@ -16,6 +16,9 @@ attn.block_rows = 256
 # a prompt's narrow-head rope turns the row as it lies, no `[rows, heads, 64]` relayouts (gpt-oss-20b
 # 4096-row pf256 fire 125.5 -> 123.4 ms; a v5e loses by as much, so it stays off there)
 rope.flat_rows = 1024
+# a routed MLP's grouped matmul takes up to four of an expert's row tiles a step through one dot
+# (Gemma-4-26B-A4B's 32-expert cut, 1792-row fire: 1228 -> 1022 us a layer, bit for bit)
+moe.gmm_run = 4
 # a decode of 64 rows and more reads each row's own pages through the page-copy kernel
 attn.decode_pages = 64
 
@@ -36,6 +39,7 @@ measured = [
   "kernel.moe.cost.whole_bytes_per_ns",
   "kernel.moe.cost.whole_partial_fs",
   "kernel.moe.gmm_block_mib",
+  "kernel.moe.gmm_run",
   "kernel.moe.gmm_tm",
   "kernel.moe.loop_tile_max",
   "kernel.moe.loop_unroll",

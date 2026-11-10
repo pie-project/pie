@@ -1152,6 +1152,7 @@ fn gmm_spec(
         // 4 lanes, 16 pairs, 8.4 -> 8.7 ms, so not there).
         prefetch: !mxfp4 || (16 * e <= p && p <= e * tm),
         sums: None,
+        run: 1,
     };
     spec.out_width().ok().map(|_| spec)
 }
@@ -1200,6 +1201,7 @@ pub(crate) fn tile_projection(
         out,
         prefetch: false,
         sums,
+        run: 1,
     };
     if spec.out_width().ok() != Some(n) {
         return Ok(None);
@@ -1632,6 +1634,63 @@ struct Sorted {
     /// the next expert's weights while a run's tiles go.
     run: Val,
     nxt: Val,
+    /// Each expert's tiles, the tiles up to its last, and its rank among
+    /// the routed.
+    per: Val,
+    tend: Val,
+    rank: Val,
+}
+
+/// A stepping kernel's schedule (`moe_gmm::Gmm::stepping`): each step's
+/// expert, the step count, each step's run and the next run's expert, its
+/// first tile and its tile count, i32 `[steps]` (`[1]` the count).
+fn steps(
+    f: &mut Func,
+    spec: crate::linear::moe_gmm::Gmm,
+    sorted: &Sorted,
+) -> Result<[Val; 6], Error> {
+    let (e, j, n) = (spec.experts, spec.run, spec.steps());
+    let more = f.const_i(Elem::I32, j - 1, &[e]);
+    let sp = f.add(sorted.per, more)?;
+    let jj = f.const_i(Elem::I32, j, &[e]);
+    let sp = f.div(sp, jj)?;
+    let send = f.scan(sp, 0, Fold::Sum)?;
+    let sstart = f.sub(send, sp)?;
+    let ns = f.slice(send, &[e - 1], &[e], &[1])?;
+    let sexp = {
+        let ends = f.broadcast(send, &[n, e], &[1])?;
+        let ss = f.iota(Elem::I32, &[n, e], 0);
+        let done = f.compare(Cmp::Le, ends, ss)?;
+        let one = f.const_i(Elem::I32, 1, &[n, e]);
+        let none = f.const_i(Elem::I32, 0, &[n, e]);
+        let done = f.select(done, one, none)?;
+        let se = f.reduce(done, &[1], Fold::Sum)?;
+        let hi = f.const_i(Elem::I32, e - 1, &[n]);
+        f.min(se, hi)?
+    };
+    let si = f.iota(Elem::I32, &[n], 0);
+    let first = pick_small(f, sstart, sexp)?;
+    let local = f.sub(si, first)?;
+    let jn = f.const_i(Elem::I32, j, &[n]);
+    let done = f.mul(local, jn)?;
+    let tstart = f.sub(sorted.tend, sorted.per)?;
+    let t0 = pick_small(f, tstart, sexp)?;
+    let stile = f.add(t0, done)?;
+    let per = pick_small(f, sorted.per, sexp)?;
+    let left = f.sub(per, done)?;
+    let scnt = f.min(left, jn)?;
+    let one = f.const_i(Elem::I32, 1, &[n]);
+    let scnt = f.max(scnt, one)?;
+    let srun = pick_small(f, sorted.rank, sexp)?;
+    let end = pick_small(f, send, sexp)?;
+    let top = f.const_i(Elem::I32, n - 1, &[n]);
+    let at = f.min(end, top)?;
+    let nx = pick_small(f, sexp, at)?;
+    let nsb = f.broadcast(ns, &[n], &[0])?;
+    let more = f.compare(Cmp::Lt, end, nsb)?;
+    let none = f.const_i(Elem::I32, -1, &[n]);
+    let snxt = f.select(more, nx, none)?;
+    Ok([sexp, ns, srun, snxt, stile, scnt])
 }
 
 /// The pairs sorted by expert (unrouted last), each expert's run of rows
@@ -1771,6 +1830,9 @@ fn sorted(
         ws: weights.map(|_| by[2]),
         run,
         nxt,
+        per,
+        tend,
+        rank,
     })
 }
 
@@ -1800,6 +1862,10 @@ fn tiles_of(
         Orient::NMajor => w,
     };
     let kernel = spec.kernel()?;
+    if spec.stepping() {
+        let st = steps(f, spec, sorted)?;
+        return Ok(kernel.call(f, &[st[0], st[1], st[2], st[3], st[4], st[5], xs, w])?[0]);
+    }
     if spec.prefetching() {
         return Ok(kernel.call(f, &[sorted.se, sorted.nt, sorted.run, sorted.nxt, xs, w])?[0]);
     }
@@ -2400,6 +2466,17 @@ pub fn experts(
     if up.tm != dn.tm || up.tiles != dn.tiles || !flat(up)? || !flat(dn)? {
         return Ok(None);
     }
+    let run = tuning.moe_gmm_run;
+    let stepped = |s: crate::linear::moe_gmm::Gmm| crate::linear::moe_gmm::Gmm { run, ..s };
+    let (up, dn) = if run > 1 && stepped(up).stepping() && stepped(dn).stepping() {
+        let slack = |s: crate::linear::moe_gmm::Gmm| crate::linear::moe_gmm::Gmm {
+            tiles: s.tiles + run - 1,
+            ..stepped(s)
+        };
+        (slack(up), slack(dn))
+    } else {
+        (up, dn)
+    };
     let e = up_fan.experts;
     let r = f.reshape(routes.val, &[p])?;
     let zero = f.const_i(Elem::I32, 0, &[p]);

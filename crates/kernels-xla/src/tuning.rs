@@ -50,6 +50,17 @@ pub struct MoeLoopTileMax(pub u32);
 #[decision(id = "kernel.moe.gmm_tm", constant(set(16, 32, 64, 128)), default = 16, tune = search)]
 pub struct MoeGmmTm(pub u32);
 
+/// Row tiles one grid step of the grouped-matmul kernel takes, all of one
+/// expert's run, through one dot (a dense bank's routed MLP): the MXU loads
+/// each weight tile once for them all, and the steps' overhead is paid once
+/// (v6e, a 2048-token fire of Qwen3.6-35B-A3B's 32-expert cut: its gate-up
+/// 213 -> 147 us, its down 139 -> 89). 1 takes a step a tile (a v5e's
+/// 128-wide MXU loses by it: Gemma-4-26B-A4B's 1792-row routed MLP 2.7 ->
+/// 3.3 ms).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Decision)]
+#[decision(id = "kernel.moe.gmm_run", constant(set(1, 2, 4, 8)), default = 1, tune = search)]
+pub struct MoeGmmRun(pub u32);
+
 /// Weight bytes one block of the grouped-matmul kernel holds, in MiB (two
 /// are in flight, plus a bf16 copy): bigger blocks take fewer DMA steps and
 /// more VMEM.
@@ -177,6 +188,7 @@ pub fn register(registry: &mut Registry) {
         .add::<MoeLoopUnroll>()
         .add::<MoeLoopTileMax>()
         .add::<MoeGmmTm>()
+        .add::<MoeGmmRun>()
         .add::<MoeGmmBlockMib>()
         .add::<MoeDenseAllMi>()
         .add::<MoeSliceMib>()
@@ -253,6 +265,7 @@ pub struct Tuning {
     pub moe_loop_unroll: i64,
     pub moe_loop_tile_max: i64,
     pub moe_gmm_tm: i64,
+    pub moe_gmm_run: i64,
     pub moe_gmm_block_bytes: i64,
     pub moe_costs: MoeCosts,
     pub grouped: Grouped,
@@ -272,6 +285,7 @@ impl Tuning {
         moe_loop_unroll: 2,
         moe_loop_tile_max: 128,
         moe_gmm_tm: 16,
+        moe_gmm_run: 1,
         moe_gmm_block_bytes: 12 << 20,
         moe_costs: MoeCosts {
             dense_all: 1 << 27,
@@ -314,6 +328,7 @@ impl Tuning {
             moe_loop_unroll: n(profile.get::<MoeLoopUnroll>().0),
             moe_loop_tile_max: n(profile.get::<MoeLoopTileMax>().0),
             moe_gmm_tm: n(profile.get::<MoeGmmTm>().0),
+            moe_gmm_run: n(profile.get::<MoeGmmRun>().0),
             moe_gmm_block_bytes: n(profile.get::<MoeGmmBlockMib>().0) << 20,
             moe_costs: MoeCosts {
                 dense_all: n(profile.get::<MoeDenseAllMi>().0) << 20,
