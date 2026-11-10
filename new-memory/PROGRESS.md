@@ -503,3 +503,14 @@ The `new-memory/` directory is bookkeeping and is removed before anything lands 
   fires resident 8.98 ms / all-host 8.98 / base 9.09 (debug).
 - Gaps: first residency published only at the first governor tick (fires before read host); bootstrap fallback
   "stay as loaded" = permanent host reads on CUDA; staging floor ignored (sync h2d); other embed variants resident.
+
+### Note — 2026-11-10: IT round 4 on M34 (sm_120) — pass
+- Default config runs SHARED mode (Qwen3.5: 10.3 MB chunks x 3125, segments of 104, 3 shapes; gemma-4-E2B 16.7 MB,
+  list + window list).
+- MTP rs_ahead repro fixed: 24 runs reusing record 2, no errors, no CloseInstance stall, tokens = degenerate.
+- Tokens + top-4 bits identical to degenerate aaefde791: Qwen3.5 beam 2x8/3x12/4x16, ckpt_sync, MTP k=0/2/4,
+  resume/fork/1500+fork/sequential; gemma-4-E2B same set + 3 concurrent lanes + 1500-token fork past the 512 window +
+  prompt pairs 48/37, 48/48, 700/37, 1200/600 alone and concurrent. Gemma beam refused on both builds (windowed).
+- Grow -> evacuate -> release mid-decode identical: Qwen3.5 (40 WS, 3 segments, two releases, fork after shrink),
+  gemma (90 WS, list + window list chunks moved).
+- golden_logits and golden_logits_by_refs byte-identical to GOLDEN-LOGITS-BASE; golden_submit_buffered = buffered.
