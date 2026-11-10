@@ -4,6 +4,7 @@
 use super::table::Planes;
 #[cfg(feature = "cuda")]
 use super::*;
+#[cfg(feature = "cuda")]
 use crate::error::Error;
 #[cfg(feature = "cuda")]
 use crate::jit::Ctx;
