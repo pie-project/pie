@@ -367,6 +367,14 @@ impl Device {
             return Ok(Vec::new());
         }
         let exe = program.exe.as_ref().ok_or(Fault::Deviceless)?;
+        static RUNS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let n = RUNS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        if n % 2000 == 1999
+            && let (Some(client), Ok(device)) = (self.client.as_ref(), self.device())
+            && let Ok(stats) = client.memory_stats(device)
+        {
+            tracing::info!(runs = n + 1, in_use = stats.bytes_in_use, peak = ?stats.peak, limit = ?stats.bytes_limit, "xla device memory");
+        }
         let at = profile::before(self.api());
         let (outs, done) = exe.execute(self.device()?, args)?;
         if wait || at.is_some() {
