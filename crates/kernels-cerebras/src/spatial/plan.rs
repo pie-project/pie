@@ -11,9 +11,9 @@ use serde::{Deserialize, Serialize};
 /// Which program family a plan builds (each is one [`super::family::Family`]).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum FamilyId {
-    /// Qwen3.5 (GDN + gated attention), Qwen3 and Llama 3 (dense attention, no output gate):
-    /// `family/qwen.rs`.
-    Qwen,
+    /// The unit snake: GDN and / or attention layers with one MLP each (Qwen3.5's GDN + gated
+    /// attention, Qwen3 and Llama 3's dense attention): `family/dense.rs`.
+    Dense,
     /// gpt-oss (attention / MoE column split, banded head): `family/gptoss.rs`.
     GptOss,
     /// Gemma 4 E2B / E4B (PLE storage, shared KV, sliding / global layers): `family/gemma.rs`.
@@ -26,7 +26,7 @@ impl FamilyId {
     /// The family's name (the plan's record, error messages).
     pub fn name(self) -> &'static str {
         match self {
-            FamilyId::Qwen => "qwen",
+            FamilyId::Dense => "dense",
             FamilyId::GptOss => "gptoss",
             FamilyId::Gemma => "gemma",
             FamilyId::Gemma12 => "gemma12",

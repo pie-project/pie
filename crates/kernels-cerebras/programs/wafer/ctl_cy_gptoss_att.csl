@@ -13,7 +13,7 @@
 //
 // Interface. Exports qb (f32 [layer][NQA] biases), snk (f32 [layer][Qh]), rot (f32 RoPE tables [NLV][8]
 // [cos | sin][NROT]), tdbg, rcfg, init, compute(steps, start_pos).
-// rcfg: as ctl_cy_qwen.csl (the segment words unused).
+// rcfg: as ctl_cy_dense.csl (the segment words unused).
 //
 // Params. Shape: K, NQA, Qh, Dc, NROT, HR (hidden), NLV (RoPE table levels: positions < 8^NLV), QSC (1 / sqrt(head dim)).
 param memcpy_params;

@@ -4,7 +4,7 @@
 //!
 //! - [`common`]: the word layouts every family's weight, CX, CY, head and head control kernels
 //!   share (their leading words), with the codes the kernels read named;
-//! - [`qwen`]: Qwen3.5 / Qwen3's kernels (`weight_qwen.csl`, `ctl_cx.csl`, `ctl_cy_qwen.csl`,
+//! - [`dense`]: the unit snake's kernels (Qwen3.5, Qwen3, Llama 3) (`weight_dense.csl`, `ctl_cx.csl`, `ctl_cy_dense.csl`,
 //!   `head_pe.csl`, `head_ctl.csl`, `relay.csl`);
 //! - [`gemma`]: Gemma 4 E2B / E4B's (`weight_gemma.csl`, `ctl_cx_gemma.csl`, `ctl_cy_gemma.csl`,
 //!   `head_ctl_gemma.csl`, `ple_gemma.csl`; `head_pe.csl`).
@@ -20,7 +20,7 @@ pub mod gemma;
 pub mod gemma12;
 pub mod gptoss;
 pub mod head;
-pub mod qwen;
+pub mod dense;
 
 type R<T> = Result<T, String>;
 

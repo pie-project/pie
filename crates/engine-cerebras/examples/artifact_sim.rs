@@ -106,7 +106,7 @@ fn main() {
     let best = argmax(&l).unwrap();
     ok &= best == want[0];
     println!("LOGITS argmax {best} want {}", want[0]);
-    if art.header.plan.family != FamilyId::Qwen {
+    if art.header.plan.family != FamilyId::Dense {
         // the reference reads the Qwen head's tile layout: elsewhere the argmax check above is
         // the test
         println!("LOGITS host reference: Qwen preps only");

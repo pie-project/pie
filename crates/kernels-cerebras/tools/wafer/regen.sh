@@ -15,7 +15,7 @@
 #   gpo (go_)                                            gpt-oss-20b
 # Their <prefix>meta.json / params.txt are records nobody reads now.
 # Llama 3.1 8B has no staged prep yet: plan it (`wafer-compile plan --model llama31-8b-bf16-kv-bf16`, the first preset
-# that builds), cut the HF checkpoint with qwen/prep_qwen.py for that plan, and build / link as here.
+# that builds), cut the HF checkpoint with dense/prep_dense.py for that plan, and build / link as here.
 #
 # Env: PY (a python with numpy), WAFER_COMPILE (the binary; default: built into $CARGO_TARGET_DIR), CSL_SDK (link).
 set -e

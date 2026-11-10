@@ -94,7 +94,7 @@ fn fin(comptime q: input_queue, n: u16) fabin_dsd {
 }
 const NR: u16 = 12;
 const RQ: u16 = 1 + 2 * NR;
-var rcfg = @zeros([RQ + 16]u32);   // ctl_cy_qwen's; [RQ+11] flags (bit 2 the flush unit)
+var rcfg = @zeros([RQ + 16]u32);   // ctl_cy_dense's; [RQ+11] flags (bit 2 the flush unit)
 var rcfg_ptr: [*]u32 = &rcfg;
 var cfl: u16 = 0;
 fn iqc(comptime qid: u16, c: u32) void {
@@ -164,7 +164,7 @@ fn reduce(n: u16) void {
 }
 fn mcast(n: u16) void { @fmovs(fout(q_mc, n), uv(0, n)); }
 
-// ---------------------------------------------------------------- scalar math (ctl_cy_qwen's)
+// ---------------------------------------------------------------- scalar math (ctl_cy_dense's)
 fn rsqrt(v: f32) f32 {
   var y = @bitcast(f32, @as(u32, 0x5f3759df) - (@bitcast(u32, v) >> 1));
   y = y * (1.5 - 0.5 * v * y * y);

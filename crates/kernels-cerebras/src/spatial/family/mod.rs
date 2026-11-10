@@ -12,7 +12,7 @@ use super::program::Program;
 pub mod gemma;
 pub mod gemma12;
 pub mod gptoss;
-pub mod qwen;
+pub mod dense;
 
 type R<T> = Result<T, String>;
 
@@ -45,7 +45,7 @@ pub trait Family: Send + Sync {
 /// A family by its id.
 pub fn of(id: FamilyId) -> Box<dyn Family> {
     match id {
-        FamilyId::Qwen => Box::new(qwen::Qwen),
+        FamilyId::Dense => Box::new(dense::Dense),
         FamilyId::GptOss => Box::new(gptoss::GptOss),
         FamilyId::Gemma => Box::new(gemma::Gemma),
         FamilyId::Gemma12 => Box::new(gemma12::Gemma12),
@@ -66,7 +66,7 @@ pub fn serving(shape: &Shape) -> FamilyId {
     } else if any(|k| matches!(k, LayerKind::Sliding { .. })) {
         FamilyId::Gemma12
     } else {
-        FamilyId::Qwen
+        FamilyId::Dense
     }
 }
 

@@ -441,22 +441,22 @@ mod tests {
             (
                 "qwen35-d9b-bf16-kv-bf16",
                 "9b",
-                (FamilyId::Qwen, 8, 4, 256, 256, 16, 216),
+                (FamilyId::Dense, 8, 4, 256, 256, 16, 216),
             ),
             (
                 "qwen35-d4b-bf16-kv-bf16",
                 "4b",
-                (FamilyId::Qwen, 8, 4, 256, 256, 10, 216),
+                (FamilyId::Dense, 8, 4, 256, 256, 10, 216),
             ),
             (
                 "qwen35-d0.8b-bf16-kv-bf16",
                 "0.8b",
-                (FamilyId::Qwen, 6, 4, 256, 128, 8, 216),
+                (FamilyId::Dense, 6, 4, 256, 128, 8, 216),
             ),
             (
                 "qwen3-8b-bf16-kv-bf16",
                 "q3-8b",
-                (FamilyId::Qwen, 9, 4, 256, 228, 18, 132),
+                (FamilyId::Dense, 9, 4, 256, 228, 18, 132),
             ),
             (
                 "gemma4-e2b-bf16-kv-bf16",
@@ -481,7 +481,7 @@ mod tests {
             (
                 "llama31-8b-bf16-kv-bf16",
                 "9b",
-                (FamilyId::Qwen, 8, 4, 256, 256, 16, 216),
+                (FamilyId::Dense, 8, 4, 256, 256, 16, 216),
             ),
         ] {
             let p = plan(&trace(name), Some(preset), "").unwrap().plan;
@@ -507,7 +507,7 @@ mod tests {
             .unwrap()
             .plan;
         let s = &p.shape;
-        assert_eq!(p.family, FamilyId::Qwen);
+        assert_eq!(p.family, FamilyId::Dense);
         assert!(!s.attn.qk_norm && !s.attn.output_gate && s.gdn.is_none());
         assert_eq!(
             (s.attn.q_heads, s.attn.kv_heads, s.attn.head_dim),

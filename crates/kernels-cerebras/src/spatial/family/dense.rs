@@ -1,7 +1,7 @@
 //! Qwen3.5 (GDN layers + gated full attention: 9B / 4B / 0.8B), Qwen3 and Llama 3 (dense
 //! attention, no output gate: Qwen3-8B, Llama 3.1 8B): a snake of PX x PY units (at most one gap slot, whose PEs relay), the
 //! scores segments on every weight row, GDN's (k, q) multicast and the o-norm segments where
-//! there are GDN layers, the head east of the units, the token loop. Kernels: [`qwen`].
+//! there are GDN layers, the head east of the units, the token loop. Kernels: [`dense`].
 
 use crate::spatial::abi::Kernels;
 use crate::spatial::block::Block;
@@ -12,7 +12,7 @@ use crate::spatial::block::token_loop::TokenLoop;
 use crate::spatial::block::units::{UnitCopies, Units};
 use crate::spatial::family::{Family, units_of};
 use crate::spatial::floor::{UnitGrid, UnitLayout};
-use crate::spatial::kernels::qwen;
+use crate::spatial::kernels::dense;
 use crate::spatial::plan::{
     Contract, FamilyId, HeadPartition, KvEntries, LayerKind, Partition, Plan, Preset, ReduceGroups,
     RowRun, Segments, Shape,
@@ -22,7 +22,7 @@ use crate::spatial::weights::{From, Slice, Transform, from};
 
 type R<T> = Result<T, String>;
 
-pub struct Qwen;
+pub struct Dense;
 
 /// The unit slots' gap: none when the units fill the grid; one slot short, the last column's
 /// row-1 slot stays out of the snake (the last unit still ends on row 0, the token loop's
@@ -32,7 +32,7 @@ fn gap(units: u32, (unx, uny): (u32, u32)) -> R<Option<(u32, u32)>> {
         Some(0) => Ok(None),
         Some(1) if unx % 2 == 0 && uny >= 3 => Ok(Some((unx - 1, 1))),
         _ => Err(format!(
-            "qwen: {units} units on {unx} x {uny} slots (at most one gap slot, on an even number of unit columns, below the turn row)"
+            "dense: {units} units on {unx} x {uny} slots (at most one gap slot, on an even number of unit columns, below the turn row)"
         )),
     }
 }
@@ -54,7 +54,7 @@ const PRESETS: &[(&str, [u32; 8])] = &[
     ("tiny-q3-gap", [16, 8, 2, 3, 4, 10, 8, 4]),
 ];
 
-impl Family for Qwen {
+impl Family for Dense {
     fn presets(&self) -> Vec<Preset> {
         PRESETS
             .iter()
@@ -79,15 +79,15 @@ impl Family for Qwen {
     fn plan(&self, s: &Shape, pr: &Preset) -> R<Plan> {
         let (px, py, k) = (pr.need("PX")?, pr.need("PY")?, pr.need("K")?);
         let unit_grid = (pr.need("UNX")?, pr.need("UNY")?);
-        let units = units_of(&s.layers, k, "qwen")?;
+        let units = units_of(&s.layers, k, "dense")?;
         gap(units, unit_grid)?;
         let pattern = &s.layers[..k as usize];
         if s.layers.chunks(k as usize).any(|u| u != pattern) {
-            return Err("qwen: every unit the same layer kinds".into());
+            return Err("dense: every unit the same layer kinds".into());
         }
         let per = |heads: u32, what: &str| {
             if heads == 0 || !px.is_multiple_of(heads) {
-                return Err(format!("qwen: {heads} {what} over {px} columns"));
+                return Err(format!("dense: {heads} {what} over {px} columns"));
             }
             Ok(px / heads)
         };
@@ -153,18 +153,18 @@ impl Family for Qwen {
             logit_scale: 1.0,
         };
         Ok(Plan {
-            family: FamilyId::Qwen,
+            family: FamilyId::Dense,
             shape: s.clone(),
             partition,
             contract,
         })
     }
 
-    /// `qwen/prep_qwen.py`'s cut: PX, PY, UNX, UNY, K, HR, VR, NE, the units (NU), the RoPE tables'
+    /// `dense/prep_dense.py`'s cut: PX, PY, UNX, UNY, K, HR, VR, NE, the units (NU), the RoPE tables'
     /// levels and digit bits (RLV, RBITS) and, for a scaled rotation, its frequencies (FREQS).
     fn tiling(&self, plan: &Plan) -> R<serde_json::Value> {
         let p = &plan.partition;
-        let (unx, uny) = p.unit_grid.ok_or("qwen: no unit grid")?;
+        let (unx, uny) = p.unit_grid.ok_or("dense: no unit grid")?;
         let mut t = serde_json::json!({
             "PX": p.cols, "PY": p.rows, "UNX": unx, "UNY": uny, "NU": p.units,
             "K": p.layers_per_unit, "HR": p.head.rows, "VR": p.head.vocab_rows,
@@ -181,7 +181,7 @@ impl Family for Qwen {
         let (s, p) = (&plan.shape, &plan.partition);
         let ug = p
             .unit_grid
-            .ok_or("qwen: the plan has no unit grid (UNX, UNY)")?;
+            .ok_or("dense: the plan has no unit grid (UNX, UNY)")?;
         let (cols, rows) = (p.cols, p.rows);
         for (n, sw) in [
             ("SWA", p.segments.scores),
@@ -190,13 +190,13 @@ impl Family for Qwen {
         ] {
             if sw == 0 || (cols / 2) % sw != 0 {
                 return Err(format!(
-                    "qwen: {n} {sw} does not divide XC {} (a segment would span the control column)",
+                    "dense: {n} {sw} does not divide XC {} (a segment would span the control column)",
                     cols / 2
                 ));
             }
         }
         if p.head.cols * 2 != rows {
-            return Err("qwen: head columns = CX rows / 2".into());
+            return Err("dense: head columns = CX rows / 2".into());
         }
         // Qwen3-8B's hidden zero-padded to the row split
         let placed = p.hidden_placed();
@@ -279,10 +279,10 @@ impl Family for Qwen {
     }
 
     fn kernels(&self, prog: &Program) -> R<Kernels> {
-        qwen::kernels(prog)
+        dense::kernels(prog)
     }
 
     fn symbols(&self) -> &'static [(&'static str, &'static str)] {
-        qwen::SYMBOLS
+        dense::SYMBOLS
     }
 }

@@ -129,7 +129,7 @@
    "set": "G2=2,WL=1,G2W=2",
    "ckpt": "small/tiny/t08/ckpt",
    "prep": [
-    "qwen/prep_qwen.py",
+    "dense/prep_dense.py",
     "{ckpt}",
     "{out}",
     "{ckpt}/golden.json",
@@ -148,7 +148,7 @@
    "set": "G2=2,WL=1,G2W=2",
    "ckpt": "small/tiny/t4/ckpt",
    "prep": [
-    "qwen/prep_qwen.py",
+    "dense/prep_dense.py",
     "{ckpt}",
     "{out}",
     "{ckpt}/golden.json",
@@ -167,7 +167,7 @@
    "set": "G2=2,WL=1,G2W=2",
    "ckpt": "q8/tiny/hf",
    "prep": [
-    "qwen/prep_qwen.py",
+    "dense/prep_dense.py",
     "{ckpt}",
     "{out}",
     "{ckpt}/golden.json",
@@ -186,7 +186,7 @@
    "set": "G2=2,WL=1,G2W=2",
    "ckpt": "q8/tiny/hfg",
    "prep": [
-    "qwen/prep_qwen.py",
+    "dense/prep_dense.py",
     "{ckpt}",
     "{out}",
     "{ckpt}/golden.json",
@@ -205,7 +205,7 @@
    "set": "G2=2,WL=1,G2W=2",
    "ckpt": "llama/tiny/hf",
    "prep": [
-    "qwen/prep_qwen.py",
+    "dense/prep_dense.py",
     "{ckpt}",
     "{out}",
     "{ckpt}/golden.json",
@@ -214,7 +214,7 @@
    "prefix": "",
    "vocab": 80,
    "levers": "",
-   "source": "tools/wafer/qwen/mk_tiny_llama.py (SEED 5)"
+   "source": "tools/wafer/dense/mk_tiny_llama.py (SEED 5)"
   },
   {
    "name": "tiny_gemma",

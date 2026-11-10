@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""qwen/prep_qwen.py <model dir> <outdir> <golden json> <plan dir> [prefix]
+"""dense/prep_dense.py <model dir> <outdir> <golden json> <plan dir> [prefix]
 Any Qwen3.5, or dense (every layer attention, no output gate, plain norm weights, full RoPE: Qwen3, Llama 3; q / k
 norms where the checkpoint has them, a scaled rotation's frequencies from the plan's FREQS)
 checkpoint (bf16 or f32 safetensors, the VL layout "model.language_model." or text-only "model.") in

@@ -1,11 +1,11 @@
-// wafer/ctl_cy_gemma.csl: the wafer program column control PE for Gemma 4 (ctl_cy_qwen.csl's attention without GDN;
+// wafer/ctl_cy_gemma.csl: the wafer program column control PE for Gemma 4 (ctl_cy_dense.csl's attention without GDN;
 // src/spatial/README.md 7). A layer:
 // - attention: the reduction [W a | W b | |r|^2, |x|^2, x.p, |p|^2] (deferred norm: s = rsqrt(mean r^2 + eps), the
 //   input's rms from |x + s p|^2), t = rr (W a + s W b) = [q (Qh Dc) | k Dc | v Dc]; the raw |q_h|^2, |k|^2, |v|^2
 //   partials; q / k norm weights; RoPE (sliding: theta 1e4 over the head; global: proportional, 25%); multicast
 //   [q | k | v | position | |q_h|^2 | |k|^2 | |v|^2 | s]; the source unit also sends [k | v | |k|^2 | |v|^2] of its
 //   last sliding and its global layer north on KVS (+ a sequence word after the global); then the softmax passes
-//   (o / l, the redo flag, the log-sum-exp steps) as ctl_cy_qwen's without the output gate.
+//   (o / l, the redo flag, the log-sum-exp steps) as ctl_cy_dense's without the output gate.
 // - MLP: [W a | W b | sums] (gate | up), s1, GELU-tanh(gate) up, multicast [act | s1].
 // - PLE: [G a | G b | |d|^2 ..], s2, z = GELU(G a + s2 G b) ple (this column's PLE value of the layer), multicast [z | s2].
 // - the flush unit's last: [|h|^2 ..] -> multicast [s].
@@ -103,7 +103,7 @@ fn fin(comptime q: input_queue, n: u16) fabin_dsd {
 }
 const NR: u16 = 12;
 const RQ: u16 = 1 + 2 * NR;
-var rcfg = @zeros([RQ + 16]u32);   // ctl_cy_qwen's; [RQ+11] flags (bit 0 on a PLE bus, 1 the KVS source, 2 flush unit),
+var rcfg = @zeros([RQ + 16]u32);   // ctl_cy_dense's; [RQ+11] flags (bit 0 on a PLE bus, 1 the KVS source, 2 flush unit),
 var rcfg_ptr: [*]u32 = &rcfg;      // [RQ+12] PB colour, [RQ+13] this unit's place in the column, [RQ+14] bus words, [RQ+15] KVS
 var cfl: u16 = 0;
 var pui: u16 = 0;
@@ -179,7 +179,7 @@ fn reduce(n: u16) void {
 }
 fn mcast(n: u16) void { @fmovs(fout(q_mc, n), uv(0, n)); }
 
-// ---------------------------------------------------------------- scalar math (ctl_cy_qwen's)
+// ---------------------------------------------------------------- scalar math (ctl_cy_dense's)
 fn rsqrt(v: f32) f32 {
   var y = @bitcast(f32, @as(u32, 0x5f3759df) - (@bitcast(u32, v) >> 1));
   y = y * (1.5 - 0.5 * v * y * y);

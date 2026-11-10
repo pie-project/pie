@@ -18,7 +18,7 @@
 //
 // Interface. Exports wx (u16: per layer, per expert [gate|up Hc/2 x 2Ic][down Ic/2 x Hc]), wr (f32: per
 // layer the router tile Hc), rcfg, tdbg, init, compute(steps, start_pos). rcfg as weight_gptoss_att.csl,
-// [11] = 1 on the column that carries [e | w] to CX. Queues and hardware rules: as weight_qwen.csl.
+// [11] = 1 on the column that carries [e | w] to CX. Queues and hardware rules: as weight_dense.csl.
 //
 // Params. Shape: K, Hc, Ic, NEX (32), TK (4). Diagnostics: TSTAMP, DIAG. FIFOW.
 param memcpy_params;

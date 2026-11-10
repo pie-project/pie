@@ -79,7 +79,7 @@ impl From<Lit> for Value {
 }
 
 /// A param's name (a `@set_tile_code` field). Each params struct declares its own as
-/// associated consts (`WeightQwen::ATT`).
+/// associated consts (`WeightDense::ATT`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize)]
 pub struct Param(pub &'static str);
 

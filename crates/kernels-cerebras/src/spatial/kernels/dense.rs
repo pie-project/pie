@@ -1,5 +1,5 @@
 //! Qwen3.5 (GDN layers + gated full attention), Qwen3 and Llama 3 (dense attention, no output gate):
-//! `weight_qwen.csl`, `ctl_cx.csl`, `ctl_cy_qwen.csl`, with the head's and the relay's
+//! `weight_dense.csl`, `ctl_cx.csl`, `ctl_cy_dense.csl`, with the head's and the relay's
 //! ([`super::head`], [`super::common::RELAY`]). Their params from the plan ([`kernels`]) and
 //! their rcfg writers.
 
@@ -44,10 +44,10 @@ pub const SYMBOLS: &[(&str, &str)] = &[
 ];
 
 params! {
-    /// `weight_qwen.csl`: layers a unit and the attention layers' mask, x's dims a row, the q /
+    /// `weight_dense.csl`: layers a unit and the attention layers' mask, x's dims a row, the q /
     /// MLP / GDN / KV shapes a column, the KV rows and entries, the levers' defaults, whether
     /// the q / k heads are normed (`QKN`).
-    pub struct WeightQwen {
+    pub struct WeightDense {
         K: u32, Hc: u32, QO: u32, Ic: u32, MV: u32, KM: u32, NQA: u32, NQG: u32, GDN: u32,
         ATT: u32, DV: u32, DK: u32, Qh: u32, Dc: u32, NE: u32, PYW: u32, HD: u32, DIAG: u32,
         FIFOW: u32, GDEC: u32, ATTL: u32, TSTAMP: u32, QKN: u32,
@@ -60,10 +60,10 @@ params! {
 }
 
 params! {
-    /// `ctl_cy_qwen.csl`: the layer mask and shapes as the weight kernel's, the hidden size
+    /// `ctl_cy_dense.csl`: the layer mask and shapes as the weight kernel's, the hidden size
     /// (`HR`), the conv width, the RoPE pairs and table levels, the levers' defaults, the norms'
     /// eps.
-    pub struct CtlCyQwen {
+    pub struct CtlCyDense {
         K: u32, KM: u32, NQA: u32, NQG: u32, Qh: u32, Dc: u32, DK: u32, DV: u32, Ic: u32,
         HR: u32, CONV: u32, NROT: u32, HK: u32, HV: u32, DIAG: u32, FIFOW: u32, SILU16: u32,
         CONVQK: u32, ATTV: u32, GDEC: u32, ATTL: u32, TSTAMP: u32, GATE: u32, SLW: u32,
@@ -72,9 +72,9 @@ params! {
 }
 
 pub const WEIGHT_QWEN: Kernel = Kernel {
-    source: "weight_qwen.csl",
+    source: "weight_dense.csl",
     owns: &["w", "rcfg", "tdbg"],
-    params: WeightQwen::NAMES,
+    params: WeightDense::NAMES,
     route_slots: 16,
     rcfg: Some(weight),
 };
@@ -88,9 +88,9 @@ pub const CTL_CX: Kernel = Kernel {
 };
 
 pub const CTL_CY_QWEN: Kernel = Kernel {
-    source: "ctl_cy_qwen.csl",
+    source: "ctl_cy_dense.csl",
     owns: &["cw", "gpar", "gnw", "qkw", "rot", "tab", "rcfg", "tdbg"],
-    params: CtlCyQwen::NAMES,
+    params: CtlCyDense::NAMES,
     route_slots: 12,
     rcfg: Some(cy),
 };
@@ -100,7 +100,7 @@ pub const CTL_CY_QWEN: Kernel = Kernel {
 /// words.
 fn weight(pe: &Pe) -> R<Vec<u32>> {
     let Place::Weight { row, col, .. } = pe.role().place else {
-        return Err(format!("{:?}: weight_qwen off a weight PE", pe.at));
+        return Err(format!("{:?}: weight_dense off a weight PE", pe.at));
     };
     let plan = &pe.prog.plan;
     let source = Gdn::of(plan).map_or(SOURCE_NONE, |g| g.source(row, col));
@@ -112,7 +112,7 @@ fn weight(pe: &Pe) -> R<Vec<u32>> {
         .partition
         .row_dims
         .first()
-        .ok_or("qwen: no row dims")?
+        .ok_or("dense: no row dims")?
         .dims;
     let relays = [pe.turn(RELAY_PRE), pe.turn(RELAY_POST)];
     common::weight(pe, 16, row, [source, gdn], hc, relays)
@@ -149,7 +149,7 @@ pub fn kernels(prog: &Program) -> R<Kernels> {
         .filter(|(_, l)| !matches!(l, LayerKind::Gdn))
         .map(|(i, _)| 1 << i)
         .sum();
-    let hcc = p.row_dims.first().ok_or("qwen: no row dims")?.dims;
+    let hcc = p.row_dims.first().ok_or("dense: no row dims")?.dims;
     let gate = u32::from(s.attn.output_gate);
     let (hd, kvh) = (s.attn.head_dim, s.attn.kv_heads);
     let qh = s.attn.q_heads / kvh;
@@ -168,7 +168,7 @@ pub fn kernels(prog: &Program) -> R<Kernels> {
         Kind::WEIGHT,
         KernelBuild::of(
             &WEIGHT_QWEN,
-            WeightQwen {
+            WeightDense {
                 K: k,
                 Hc: hcc,
                 QO: qh * dc,
@@ -214,7 +214,7 @@ pub fn kernels(prog: &Program) -> R<Kernels> {
         Kind::CY,
         KernelBuild::of(
             &CTL_CY_QWEN,
-            CtlCyQwen {
+            CtlCyDense {
                 K: k,
                 KM: km,
                 NQA: nqa,

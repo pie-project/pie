@@ -13,7 +13,7 @@ refactor that must not change behaviour can be checked file for file against the
     ring);
   - gpt-oss-20b (CYV 2, GLUV 1);
   - tiny: Qwen3.5 t08 and t4, Qwen3 dense with and without a gap slot, Llama 3 (no q / k norm, eps 1e-5, its scaled
-    rotation: `qwen/mk_tiny_llama.py`), Gemma, Gemma 12B, gpt-oss.
+    rotation: `dense/mk_tiny_llama.py`), Gemma, Gemma 12B, gpt-oss.
 - `capture.py <out> [names]`: per config (see its docstring for the files):
   - `plan/`: `wafer-compile plan`'s `plan.json` and `tiling.json`;
   - `prep/` (tiny only): the prep's files;

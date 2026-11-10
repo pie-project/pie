@@ -12,7 +12,7 @@
 //
 // Interface. Exports rb (f32 [layer] the router bias of this column's output), gb (f32 [layer][NEX][2 Ic]
 // gate | up biases), ps (f32 [layer][NEX][2]: 2^Pg, 2^Pd), tdbg, rcfg, init, compute(steps, start_pos).
-// rcfg: as ctl_cy_qwen.csl ([7] the segment role, its colours [8] iq6 / [9] iq7, oq4).
+// rcfg: as ctl_cy_dense.csl ([7] the segment role, its colours [8] iq6 / [9] iq7, oq4).
 //
 // Params. Shape: K, Ic, NEX, TK, HR, ROUT (this column's router output is rcfg's word: it is a runtime
 // role), SWL (limit 7), SWA (alpha 1.702).
@@ -28,7 +28,7 @@ param FIFOW: u16 = 32;
 param SWL: f32 = 7.0;
 param SWA: f32 = 1.702;
 param GLUV: u16 = 0;   // 1: glu = max(g, g e) / (1 + e), e = exp(-SWA |g|), the reciprocal by a quadratic and two Newton
-                       // steps (ctl_cy_qwen.csl vsiluq's arithmetic) as vector ops; 0: e = exp(-SWA g), a scalar recip a word
+                       // steps (ctl_cy_dense.csl vsiluq's arithmetic) as vector ops; 0: e = exp(-SWA g), a scalar recip a word
 
 const sys_mod = @import_module("<memcpy/memcpy>", memcpy_params);
 const tile_config = @import_module("<tile_config>");

@@ -17,7 +17,7 @@
 // KV matvecs accumulate in f32; the projections in f16 (x f16, W f16 = the bf16 weights, exact).
 //
 // Interface. Exports w (u16: per layer [qkv Hc x NQA][o QO x Hc], f16 bits), rcfg, tdbg, init,
-// compute(steps, start_pos). Queues and the hardware rules: as weight_qwen.csl (own queue a flow; a route
+// compute(steps, start_pos). Queues and the hardware rules: as weight_dense.csl (own queue a flow; a route
 // rebound for a send is restored only after its output queue drains; no park on the PE's own send colour;
 // >= 768 B stack room).
 // rcfg: [0] routes n, [1..1+2n); from RQ: [0..6) iq2..iq7, [6] oq5, [7] oq3,

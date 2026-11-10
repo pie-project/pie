@@ -14,7 +14,7 @@ H = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, H)
 import compiler
 
-# each family's bare runner (the Qwen family has none: its programs run through the engine's ArtifactModel)
+# each family's bare runner (the Dense family has none: its programs run through the engine's ArtifactModel)
 RUNNERS = {"Gemma": "gemma/run_gemma.py", "Gemma12": "gemma12/run_gemma12.py", "GptOss": "gptoss/run_gptoss.py"}
 
 

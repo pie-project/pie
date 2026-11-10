@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
-"""qwen/mk_tiny_llama.py <outdir>: a random tiny Llama 3 as an HF checkpoint (bf16 safetensors + config) and its HF f32
-greedy golden (prompt 6 + 14 tokens, margins), for qwen/prep_qwen.py + the simulator. Dense attention with no q / k
+"""dense/mk_tiny_llama.py <outdir>: a random tiny Llama 3 as an HF checkpoint (bf16 safetensors + config) and its HF f32
+greedy golden (prompt 6 + 14 tokens, margins), for dense/prep_dense.py + the simulator. Dense attention with no q / k
 norm, eps 1e-5 and Llama 3's scaled rotation at a short original length (16), so the stretched waves are exercised;
 the shape fixture baseline/shapes/tiny_llama.json states the same model, its FREQS what this rotation turns at."""
 import json, os, sys

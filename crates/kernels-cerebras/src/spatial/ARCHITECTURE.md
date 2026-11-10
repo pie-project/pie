@@ -36,8 +36,8 @@ engine (`engine-cerebras`) runs its **artifact** and knows none of it (below).
 | Fabric | `fabric.rs` | `Palette` (the blocks' colours, later replacing earlier), routes, `PeIo` (slot → endpoint, notes), parks / spare / route words, the invariants | physical colours, route words |
 | Blocks | `block/` | the `Block` trait and the blocks (table below); each owns its classes, slots, notes, kinds and colours as consts | coordinates, its own vocabulary |
 | ABI | `abi.rs` | `Kernel` (source, owned symbols, params' names, route slots, rcfg writer), `params!` (a kernel's typed params struct), `words!` (an rcfg word layout), `KernelBuild`, `Kernels`, `Overrides` | the build's view of a kernel |
-| Kernels | `kernels/` | `Pe` (one PE as an rcfg writer sees it); `common` (the word layouts every family's weight / CX / CY / head / head control kernel shares, its codes named, the relay); `head` (`head_pe.csl`, `head_ctl.csl`); one module a family's own kernels: `qwen`, `gptoss`, `gemma`, `gemma12` | the CSL kernels' ABI |
-| Families | `family/` | `serving` (the family a shape needs); `qwen`, `gptoss`, `gemma`, `gemma12`: presets, the plan of a shape under a preset, the tiling a prep cuts by, the block list, the kernels | the model's shape |
+| Kernels | `kernels/` | `Pe` (one PE as an rcfg writer sees it); `common` (the word layouts every family's weight / CX / CY / head / head control kernel shares, its codes named, the relay); `head` (`head_pe.csl`, `head_ctl.csl`); one module a family's own kernels: `dense`, `gptoss`, `gemma`, `gemma12` | the CSL kernels' ABI |
+| Families | `family/` | `serving` (the family a shape needs); `dense`, `gptoss`, `gemma`, `gemma12`: presets, the plan of a shape under a preset, the tiling a prep cuts by, the block list, the kernels | the model's shape |
 | Emit | `emit/` | rcfg, kernel params (levers, overrides) and `layout.csl`, `HostLayout` (everything the host driver reads and writes on the wafer) | kernel builds |
 | Weights | `weights.rs` | `Binding`s (symbol, rect, source, transforms), `Copies`, the placer | the device |
 | Program | `program.rs` | `Program { plan, blocks, floor, wiring, palette, fabric, kernels, overrides, family }`, `build`, `bindings` | all of the above |
@@ -113,7 +113,7 @@ Compositions (`family/*.rs::blocks`):
 
 | Family | Blocks | Kernels |
 |---|---|---|
-| Qwen3.5 / Qwen3 | `Units` (snake, at most one gap slot), `Scores` when any layer attends, `Gdn` + `Onorm` when any layer is GDN, `HeadEast`, `TokenLoop` under the contract's token loop | `kernels::qwen` (`weight_qwen`, `ctl_cx`, `ctl_cy_qwen`) + `head` + `common::RELAY` |
+| Dense (Qwen3.5, Qwen3, Llama 3) | `Units` (snake, at most one gap slot), `Scores` when any layer attends, `Gdn` + `Onorm` when any layer is GDN, `HeadEast`, `TokenLoop` under the contract's token loop | `kernels::dense` (`weight_dense`, `ctl_cx`, `ctl_cy_dense`) + `head` + `common::RELAY` |
 | gpt-oss | `MoeUnits` (a snake starting upward), `AttnScores`, `Router`, `Band`, `BandLoop` | `kernels::gptoss` (`wa`, `wm`, `cx`, `cya`, `cym`, the band head; `head_ctl.csl` with the bus reserved) |
 | Gemma 4 E2B / E4B | `Units` (explicit origins: the arrangement its unit shape names), `Scores` (a half row), `Ple`, `SharedKv`, `HeadEast`, `TokenLoop` | `kernels::gemma` (`weight_gemma`, `ctl_cx_gemma`, `ctl_cy_gemma`, `head_ctl_gemma`, `ple_gemma`) + `head::HEAD_PE` |
 | Gemma 4 12B | `RowRuns` (explicit origins, attention / plain row runs), `HeadGroups` | `kernels::gemma12` (`weight_gemma12`, `ctl_cx_gemma12`, `ctl_cy_gemma12`, `head_gemma12`) + `head::HEAD_CTL` |
@@ -161,7 +161,7 @@ symbols (`Family::symbols`, export order).
    reader does not know (a new mixer, a new activation) is refused by name; teach `target.rs` the op
    and give the plan's `Shape` the field the blocks need.
 2. **Family.** `family::serving` picks the family from what the shape needs. A model of an existing
-   family is a new preset in the family's table (`family/qwen.rs::PRESETS`, Gemma's presets and
+   family is a new preset in the family's table (`family/dense.rs::PRESETS`, Gemma's presets and
    arrangements, gpt-oss's and 12B's): the counts and split factors the plan cannot derive from the
    shape. A new family implements `Family` (`presets`, `plan`, `tiling`, `blocks`, `kernels`,
    `symbols`) and a rule in `serving`.
@@ -229,7 +229,7 @@ program without an artifact is refused.
   the preset's name). `wafer-compile build --plan <plan.json> --out <dir> [--emit ..] [--levers ..]`
   writes `floor.json`, `rcfg.npy` / `rcfg_n.npy` / `rcfg.txt`, `kernels.json`, `layout/` (with
   `dims.env`), `host.json`, `plan.json`, `bindings.json` and `program.json`.
-- The preps (`qwen/prep_qwen.py`, `gemma/prep_gemma.py`, `gemma12/prep_gemma12.py`,
+- The preps (`dense/prep_dense.py`, `gemma/prep_gemma.py`, `gemma12/prep_gemma12.py`,
   `gptoss/prep_gptoss.py`) keep the checkpoint maths and cut it as a plan directory's `tiling.json`
   says.
 - `tools/wafer/build.py <out> <plan.json> [levers]` is the build directory of any family (the

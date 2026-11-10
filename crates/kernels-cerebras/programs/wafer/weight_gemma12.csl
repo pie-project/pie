@@ -104,7 +104,7 @@ const y_d0 = y_d;
 const y16_d = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{Y16N} -> y16[i] });
 var a_d = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{YN} -> w[i] });
 
-// ---------------------------------------------------------------- fabric (weight_qwen's queues)
+// ---------------------------------------------------------------- fabric (weight_dense's queues)
 const q_xa = @get_input_queue(2);
 const q_xb = @get_input_queue(3);
 const q_ya = @get_input_queue(4);
@@ -130,7 +130,7 @@ fn fin(comptime q: input_queue, n: u16) fabin_dsd {
   return @set_dsd_length(@get_dsd(fabin_dsd, .{ .extent = 1, .input_queue = q }), n);
 }
 
-// rcfg: weight_qwen's words; [RQ+11] flags (bit 0 column 0, bit 2 the flush unit)
+// rcfg: weight_dense's words; [RQ+11] flags (bit 0 column 0, bit 2 the flush unit)
 const NR: u16 = 18;
 const RQ: u16 = 1 + 2 * NR;
 var rcfg = @zeros([RQ + 25]u32);
@@ -254,7 +254,7 @@ fn mv(off: u16, R: u16, N: u16, yo: u16) void {
     @map(mvs_step, xv);
   }
 }
-// KV matvecs: f16 operands, f32 accumulation (weight_qwen.kvmv)
+// KV matvecs: f16 operands, f32 accumulation (weight_dense.kvmv)
 fn kvmv(p: [*]u16, R: u16, N: u16, xo: u16, yo: u16) void {
   const a = @set_dsd_length(@set_dsd_base_addr(a_d, p), N);
   const xv = @set_dsd_length(@increment_dsd_offset(xh_d, @as(i16, xo), @fp16()), R);
@@ -280,7 +280,7 @@ fn send_row(sv: f32) void {
   send_x(Hc + 1);
 }
 
-// ---------------------------------------------------------------- segments (weight_qwen.qmode / seg_ar)
+// ---------------------------------------------------------------- segments (weight_dense.qmode / seg_ar)
 fn qmode(m: u16) void {
   while ((tile_config.output_queue_status.get_raw() & 0x1000) == 0) {}   // oq4 empty
   if (m == 0) {

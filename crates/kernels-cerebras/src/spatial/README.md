@@ -19,7 +19,7 @@ of every collective move onto a few control PEs.
 (PX + 1) x (PY + 1) PEs. Each unit runs K layers. The units are visited as a snake: down unit
 column 0, then up column 1, and so on.
 
-- **Weight PE** (`programs/wafer/weight_qwen.csl`). Holds its K layers' four tiles: the row's x chunk
+- **Weight PE** (`programs/wafer/weight_dense.csl`). Holds its K layers' four tiles: the row's x chunk
   (Hc dims) by the column's outputs, as f16 bits. A layer runs as:
   1. x from CX's row multicast
   2. the qkv partial goes into the column reduction to CY
@@ -32,7 +32,7 @@ column 0, then up column 1, and so on.
   - Attention: NE KV entries a row; position p lives on row p % PY.
 - **CX** (`ctl_cx.csl`). Holds x's chunk, the residuals and the norms' gammas. It is the root of the
   row reductions and does the unit handoff.
-- **CY** (`ctl_cy_qwen.csl`). The root of the column reductions. It does the rms scale, the GDN conv,
+- **CY** (`ctl_cy_dense.csl`). The root of the column reductions. It does the rms scale, the GDN conv,
   SiLU, gates, delta and the gated norm, RoPE and the q/k norms, the softmax's o / l with its redo
   flag and log-sum-exp steps, and the MLP SiLU.
 - **Head** (`head_pe.csl`, `head_ctl.csl`). HC columns of HDc dims by HR rows of VR vocabulary rows.
@@ -123,7 +123,7 @@ The build tools are under `crates/kernels-cerebras/tools/` (`tools/wafer`), the 
    `G2=16,G2Y=8,WL=1`). A checkpoint with no catalog deployment takes `--shape <shape.json>`.
 2. **Prep** (checkpoint -> tiles, cut as the plan's `tiling.json` says): writes `<prefix>w<u>.npy`,
    `hw`, `hemb`, ... and `<prefix>meta.json` (a record of what it tiled).
-   - Any Qwen3.5 / Qwen3 / Llama 3 size: `tools/wafer/qwen/prep_qwen.py <model> <out> <golden.json> <plan dir> [prefix]`;
+   - Any Qwen3.5 / Qwen3 / Llama 3 size: `tools/wafer/dense/prep_dense.py <model> <out> <golden.json> <plan dir> [prefix]`;
      Gemma, Gemma 12B and gpt-oss alike (`gemma/prep_gemma.py`, `gemma12/prep_gemma12.py`,
      `gptoss/prep_gptoss.py <model> <out> <plan dir> <golden.json> [prefix]`).
 3. **Numerics gate** (before any new lever): `tools/emu/tf_q35.py <model> <golden> <meta.json>
@@ -137,10 +137,10 @@ The build tools are under `crates/kernels-cerebras/tools/` (`tools/wafer`), the 
    fabric dims, followed by the stack-room check; it puts the artifact in `out/artifact`. Run it on
    every build before a chip request. Name the chip payload `*_ieee`.
 6. **Tiny end-to-end on the simulator** (no chip):
-   1. `tools/wafer/qwen/mk_tiny_qwen.py <dir> t08` (or `t4`; `mk_tiny_llama.py <dir>` a tiny Llama 3) builds a
+   1. `tools/wafer/dense/mk_tiny_qwen.py <dir> t08` (or `t4`; `mk_tiny_llama.py <dir>` a tiny Llama 3) builds a
       tiny HF checkpoint and its golden.
    2. `wafer-compile plan --shape <its shape.json> --preset tiny-t08 --set G2=2,WL=1,G2W=2 --out <plan>`,
-      `qwen/prep_qwen.py` on it, then `build.py <build> <plan>/plan.json` and `link.sh`.
+      `dense/prep_dense.py` on it, then `build.py <build> <plan>/plan.json` and `link.sh`.
    3. `artifact_sim <build>/out <prep> "" 5` (engine-cerebras `--example artifact_sim`; `ARTIFACT_SIM_NTOK`
       caps the tokens) runs `ArtifactModel` against the golden: two sequences, a rollback and a logits
       row. Run it where the SDK runtime libraries are: inside the SDK container, through the
