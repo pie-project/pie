@@ -1,20 +1,20 @@
 #!/usr/bin/env python3
-"""prep_gemma.py <model dir> <outdir> <golden json> <geo: tiny | e2b | e4b> NEG [prefix] (NEG: global entries a KV row; context NEG PYW): a Gemma 4 checkpoint (bf16
-safetensors, "model.language_model." or "model.") in run_gemma.py's prep format (src/spatial/README.md, "Gemma 4").
+"""prep_gemma.py <model dir> <outdir> <golden json> <plan dir> [prefix]: a Gemma 4 checkpoint (bf16
+safetensors, "model.language_model." or "model.") in run_gemma.py's prep format (src/spatial/README.md, "Gemma 4"), cut as
+the plan in <plan dir> says (`split-geo plan`'s tiling.json).
 Units of K layers (S .. S G), unit u = layers K u .. K u + K - 1; units below NO (= first shared layer / K) own their
 KV, the rest are shared-KV units. Weight column c (of PX): kv copy c // (PX / 2) (its Qh = nq / 2 q heads), within
 the copy p = c % (PX / 2): Dc / 2 rotated pairs (j, j + hd / 2), j = p Dc / 2 + t, side by side; PLE dim c.
 Writes w<u> (f16 bits), gam (f32: a layer's input / post-attention / pre-FFN / post-FFN / post-PLE gammas, the layer
 scalar; + the embedding scale), qkw, rot, hw, hg, hemb, embed, embrows, pt<col>_<part> (the per-layer inputs, f16,
-precomputed for every vocab id: (RMSNorm(Wpm e) + 16 T) / sqrt 2), golden.json, meta.json, params.txt."""
+precomputed for every vocab id: (RMSNorm(Wpm e) + 16 T) / sqrt 2), golden.json, meta.json."""
 import glob, json, os, shutil, struct, sys
 import numpy as np
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."))
 import splitgeo
 
-MD, out, GOLD, GEO = sys.argv[1:5]
-NEG = int(sys.argv[5])
-PRE = sys.argv[6] if len(sys.argv) > 6 else ""
+MD, out, GOLD = sys.argv[1:4]
+PRE = sys.argv[5] if len(sys.argv) > 5 else ""
 os.makedirs(out, exist_ok=True)
 cfg = json.load(open(os.path.join(MD, "config.json")))
 tc = cfg.get("text_config", cfg)
@@ -36,7 +36,8 @@ def bits(name):
 def f16(a):
     return np.asarray(a, np.float32).astype(np.float16).view(np.uint16)
 
-g = splitgeo.geometry("gemma:" + GEO)
+g = splitgeo.tiling(sys.argv[4])
+GEO = g.preset
 PX, PY, XC = g.PX, g.PY, g.XC
 H, NL, I = tc["hidden_size"], tc["num_hidden_layers"], tc["intermediate_size"]
 nq, nkv = tc["num_attention_heads"], tc["num_key_value_heads"]
@@ -220,20 +221,9 @@ for t0 in range(0, V, CH):
         print("ple", t1, "/", V, flush=True)
 for a in mm.values():
     a.flush()
-SW = tc["sliding_window"]
-NES = -(-SW // PY)
-# the KV rows: the first PYW of the PY a unit; a window NES PYW exactly where SW / NES fits (E4B: 4 x 128 of 160 rows,
-# the rest hold no entries), else every row and a longer ring whose older entries the kernel masks
-PYW = SW // NES if SW % NES == 0 else PY
-WIN = 0 if NES * PYW == SW else SW
-KVR = dict(PYW=PYW) if PYW != PY else {}
-meta = dict(geo=GEO, PX=PX, PY=PY, **KVR, Hc=Hc, H=H, V=V, K=K, KM=KM, NO=NO, NU=NU, Qh=Qh, DcS=DcS, DcG=DcG, NES=NES, WIN=WIN,
-            NEG=NEG, HDS=hdS, HDG=hdG, Ic0=IcO, Ic1=IcS, HC=HC, HR=HR, VR=VR, LW=LWS, cols=cols, EPS=tc.get("rms_norm_eps", 1e-6),
+meta = dict(geo=GEO, PX=PX, PY=PY, Hc=Hc, H=H, V=V, K=K, KM=KM, NO=NO, NU=NU, Qh=Qh, DcS=DcS, DcG=DcG,
+            HDS=hdS, HDG=hdG, Ic0=IcO, Ic1=IcS, HC=HC, HR=HR, VR=VR, LW=LWS, cols=cols, EPS=tc.get("rms_norm_eps", 1e-6),
             model=os.path.basename(MD.rstrip("/")),
             LOOP=64)   # Pie's posted-loop length (0846 / 0848: 64 beat 32 and 48)
 json.dump(meta, open(os.path.join(out, PRE + "meta.json"), "w"))
-NTW = max(c_["nt"] * c_["lv"] for c_ in cols)
-cp = dict(K=K, KM=KM, Hc=Hc, Qh=Qh, DcS=DcS, DcG=DcG, NES=NES, WIN=WIN, NEG=NEG, **KVR, HDS=hdS, HDG=hdG, HR_=H, Ic0=IcO, Ic1=IcS,
-          NO=NO, VR=VR, NTW=NTW, NPX=1)
-open(os.path.join(out, PRE + "params.txt"), "w").write(",".join(f"{k}:{v}" for k, v in cp.items()) + "\n")
 print("prepared", out, json.dumps({k: v for k, v in meta.items() if k != "cols"}))

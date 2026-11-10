@@ -1,0 +1,57 @@
+{
+ "attn": {
+  "global_head_dim": null,
+  "head_dim": 8,
+  "kv_heads": 2,
+  "output_gate": false,
+  "q_heads": 4,
+  "qk_norm": false,
+  "sinks": true
+ },
+ "gdn": null,
+ "head": {
+  "final_softcap": null,
+  "tied": false
+ },
+ "hidden": 32,
+ "layers": [
+  {
+   "Sliding": {
+    "window": 4
+   }
+  },
+  "Global",
+  {
+   "Sliding": {
+    "window": 4
+   }
+  },
+  "Global"
+ ],
+ "mlp": {
+  "act": "SwigluOai",
+  "intermediate": 32,
+  "layer_widths": [
+   32,
+   32,
+   32,
+   32
+  ]
+ },
+ "moe": {
+  "expert_intermediate": 32,
+  "experts": 8,
+  "top_k": 4
+ },
+ "norm": {
+  "eps": 1e-05,
+  "sandwich": false,
+  "unit_offset": false
+ },
+ "ple": null,
+ "rope": {
+  "rotary_dims": 8,
+  "theta": 150000.0
+ },
+ "vocab": 100
+}

@@ -1,11 +1,10 @@
 #!/usr/bin/env python3
-"""prep_q35.py <model dir> <outdir> <golden json> <geometry> [prefix]
-   prep_q35.py <model dir> <outdir> <golden json> PX PY UNX UNY K HR VR NE [prefix] [nunits]
+"""prep_q35.py <model dir> <outdir> <golden json> <plan dir> [prefix]
 Any Qwen3.5
 or Qwen3 (dense: every layer attention, no output gate, plain norm weights, full RoPE)
 checkpoint (bf16 or f32 safetensors, the VL layout "model.language_model." or text-only "model.") in
 the role-split prep format (the files PIE_CEREBRAS_SPLIT=<outdir>:<prefix> names; kernels-cerebras src/spatial/weights.rs
-copies them onto the wafer). Units of PX x PY weight PEs, K layers each (the model's layer kinds, GDN / attention by
+copies them onto the wafer), cut as the plan in <plan dir> says (`split-geo plan`'s tiling.json). Units of PX x PY weight PEs, K layers each (the model's layer kinds, GDN / attention by
 `layer_types`, the same K-layer pattern in every unit), UNX x UNY units, the head PY / 2 columns of
 2 Hc dims by HR rows of VR vocabulary rows; lm_head = the embedding when tied. Weights as f16 bits.
 
@@ -24,14 +23,10 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import splitgeo
 
 MD, out, GOLD = sys.argv[1:4]
-if sys.argv[4].isdigit():          # an explicit geometry (the tiny tests)
-    PX, PY, UNX, UNY, K, HR, VR, NE = map(int, sys.argv[4:12])
-    PRE = sys.argv[12] if len(sys.argv) > 12 else ""
-    NUN = int(sys.argv[13]) if len(sys.argv) > 13 and sys.argv[13] else UNX * UNY
-else:                              # a named one (split-geo --geometry qwen:<name>: 9b, 4b, 0.8b, q3-8b)
-    g = splitgeo.geometry("qwen:" + sys.argv[4])
-    PX, PY, UNX, UNY, K, HR, VR, NE, NUN = g.PX, g.PY, g.UNX, g.UNY, g.K, g.HR, g.VR, g.NE, g.NU
-    PRE = sys.argv[5] if len(sys.argv) > 5 else ""
+g = splitgeo.tiling(sys.argv[4])
+PX, PY, UNX, UNY, K, HR, VR, NE, NU = g.PX, g.PY, g.UNX, g.UNY, g.K, g.HR, g.VR, g.NE, g.NU
+RLV, RBITS = g.RLV, g.RBITS
+PRE = sys.argv[5] if len(sys.argv) > 5 else ""
 os.makedirs(out, exist_ok=True)
 cfg = json.load(open(os.path.join(MD, "config.json")))
 tc = cfg.get("text_config", cfg)
@@ -74,7 +69,6 @@ rd = int(hd * prf)
 CONV = tc.get("linear_conv_kernel_dim", 4)
 tied = bool(cfg.get("tie_word_embeddings", tc.get("tie_word_embeddings", False)))
 kinds = ["A" if t == "full_attention" else "G" for t in tc.get("layer_types", ["full_attention"] * NL)]
-NU = NUN
 assert NL == NU * K, (NL, NU, K)
 # one slot short of the grid (an odd count on an even number of unit columns): the last column's row-1 slot
 # stays out of the snake, so the last unit still ends on row 0 (the wafer loop's return); its PEs relay
@@ -200,10 +194,7 @@ for u in range(ULIM):
 np.save(os.path.join(out, PRE + "gam.npy"), gam)
 for n, arr in (("cw", cw), ("gpar", gpar), ("gnw", gnw), ("qkw", qkw)):
     np.save(os.path.join(out, PRE + n + ".npy"), arr)
-# RoPE tables: a position is RLV digits of RBITS bits; RLV covers the context NE PY (at least 4, the 9B's earlier
-# builds); PREP_RBITS / PREP_RLV override (tiny tests put the level boundary at a few positions)
-RBITS = int(os.environ.get("PREP_RBITS", "3"))
-RLV = int(os.environ.get("PREP_RLV", "0")) or max(4, -(-(NE * PY - 1).bit_length() // RBITS))
+# RoPE tables: a position is RLV digits of RBITS bits (the plan's)
 RB = 1 << RBITS
 rot = np.zeros((PX, RLV, RB, 2, NROT), np.float32)
 for p in range(PX):
@@ -250,14 +241,4 @@ meta = dict(PX=PX, PY=PY, UNX=UNX, UNY=UNY, HC=HC, HR=HR, VR=VR, Hc=Hc, SWA=cpa,
             has_att=KM != 0, has_gdn=NLG > 0, K=K, KM=KM, Ic=Ic, NQA=NQA, NQG=NQG, Qh=Qh, Dc=Dc, DK=DK, DV=DV, NE=NE, HD=hd,
             NROT=NROT, HK=hk, HV=hv, H=H, GATE=GATE, RLV=RLV, RBITS=RBITS, **({"GAPX": GAP[0], "GAPY": GAP[1]} if GAP else {}), EPS=tc.get("rms_norm_eps", 1e-6), V=V, model=os.path.basename(MD.rstrip("/")))
 json.dump(meta, open(os.path.join(out, PRE + "meta.json"), "w"))
-# the compile params (mkfull.py's layout params) for this prep
-cp = dict(PX=PX, PY=PY, UNX=UNX, UNY=UNY, HC=HC, HR=HR, VR=VR, K=K, KM=KM, Hc=Hc, Ic=Ic, NQA=NQA, NQG=NQG, Qh=Qh, Dc=Dc,
-          DK=DK, DV=DV, NE=NE, HR_=H, HD=hd, NROT=NROT, HK=hk, HV=hv)
-if Q3:
-    cp["GATE"] = 0
-if GAP:
-    cp["GAPX"], cp["GAPY"] = GAP
-if (RLV, RBITS) != (4, 3):
-    cp["RLV"], cp["RBITS"] = RLV, RBITS
-open(os.path.join(out, PRE + "params.txt"), "w").write(",".join(f"{k}:{v}" for k, v in cp.items()) + "\n")
 print("prepared", out, json.dumps(meta))

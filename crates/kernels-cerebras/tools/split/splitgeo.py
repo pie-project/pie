@@ -1,14 +1,14 @@
-"""splitgeo.py: the role-split geometry for the Python tools, from the Rust `split-geo` binary. Rust is the one geometry: this module only runs
-the binary, reads what it writes, and executes its placement (`bindings.json`) on a runner.
+"""splitgeo.py: the wafer program for the Python tools, from the Rust `split-geo` compiler. Rust is the one plan and
+geometry: this module only runs the binary, reads what it writes, and executes its placement (`bindings.json`) on a runner.
 
-  build(prep, prefix, overrides, out, what=None, levers="")   run split-geo into <out>
-  load(out)                                                    the files of <out>, as a Geo
-  place(put, npy, geo)                                         every copy of bindings.json, in order
-  geometry("gemma:e2b")                                        a named geometry, before any meta (the preps)
+  plan(out, model=None, shape=None, preset=None, set="")   split-geo plan: <out>/plan.json, <out>/tiling.json
+  tiling(plan_dir)                                         <plan_dir>/tiling.json, as attributes (the preps)
+  build(plan, out, emit=None, levers="", kernels=None)     split-geo build: everything the plan builds, into <out>
+  load(out)                                                the files of <out>, as a Geo
+  place(put, npy, geo)                                     every copy of bindings.json, in order
 
 The binary: $SPLIT_GEO, else `split-geo` on PATH, else the crate's cargo target (`cargo run --bin split-geo`).
-Runners on the appliance only `load` / `place` a geo directory written on the user node (mkfull.py does);
-a geometry override (G2, G2W, ...) needs that directory rebuilt with the same override."""
+Runners on the appliance only `load` / `place` a directory written on the user node (mkfull.py does)."""
 import json, os, shutil, subprocess
 import numpy as np
 
@@ -24,31 +24,42 @@ def _cmd():
             "--bin", "split-geo", "--"]
 
 
-def build(prep, prefix, overrides, out, what=None, levers="", kernels=None):
-    """split-geo <prep> <prefix> <overrides> --out <out> [--what ..] [--levers ..] [--kernels ..]"""
-    a = _cmd() + [os.path.abspath(prep), prefix, overrides or "", "--out", os.path.abspath(out)]
-    if what:
-        a += ["--what", what if isinstance(what, str) else ",".join(what)]
+def plan(out, model=None, shape=None, preset=None, set=""):
+    """split-geo plan (--model <deployment> | --shape <shape.json>) [--preset ..] [--set ..] --out <out>"""
+    a = _cmd() + ["plan", "--out", os.path.abspath(out)]
+    a += ["--model", model] if model else ["--shape", os.path.abspath(shape)]
+    if preset:
+        a += ["--preset", preset]
+    if set:
+        a += ["--set", set]
+    subprocess.run(a, check=True)
+    return out
+
+
+class Named:
+    """A JSON object's fields as attributes."""
+
+    def __init__(self, d):
+        self.__dict__.update(d)
+
+
+def tiling(plan_dir):
+    """What a prep tiles the checkpoint by (split-geo plan's tiling.json): the plan's cut in the prep's terms (the
+    unit shape, the head, Gemma's PLE storage columns, Gemma 12B's row groups and every row's dims) and the preset."""
+    return Named(json.load(open(os.path.join(plan_dir, "tiling.json"))))
+
+
+def build(plan, out, emit=None, levers="", kernels=None):
+    """split-geo build --plan <plan.json> --out <out> [--emit ..] [--levers ..] [--kernels ..]"""
+    a = _cmd() + ["build", "--plan", os.path.abspath(plan), "--out", os.path.abspath(out)]
+    if emit:
+        a += ["--emit", emit if isinstance(emit, str) else ",".join(emit)]
     if levers:
         a += ["--levers", levers]
     if kernels:
         a += ["--kernels", os.path.abspath(kernels)]
     subprocess.run(a, check=True)
     return out
-
-
-class Named:
-    """A named geometry's fields as attributes (`split-geo --geometry`)."""
-
-    def __init__(self, d):
-        self.__dict__.update(d)
-
-
-def geometry(spec):
-    """split-geo --geometry <family>:<name>: what a prep needs before its meta exists (the unit shape, the
-    head, Gemma's PLE storage columns, Gemma 12B's row groups and every row's dims)."""
-    r = subprocess.run(_cmd() + ["--geometry", spec], check=True, capture_output=True, text=True)
-    return Named(json.loads(r.stdout))
 
 
 class Geo:

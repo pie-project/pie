@@ -1,402 +1,258 @@
 {
- "_doc": "Every shipping role-split config and each family's tiny. full: a staged prep (job dir, $SPLIT_JOB). tiny: a frozen tiny checkpoint ($SPLIT_TINY) prepped fresh by the capture. split: PIE_CEREBRAS_SPLIT's overrides (what the chip / Pie ran). cslc: the program's compile params (the chip run's, merged over the prep's params.txt when it has one). mkfull: the build script and its arguments ({out} the build dir, {prep} / {prefix} the prep, then the meta overrides and the kernel levers the chip / Pie build used); the cslc params of the build are `cslc` (a parametric layout's) and are passed to layout_eval.py when comparing.",
+ "_doc": "Every shipping wafer program config and each family's tiny. full: a catalog deployment (model), planned through the trace, over a staged prep's tiles ($SPLIT_JOB/<prep>, <prefix>); tiny: a shape fixture (shapes/), its frozen tiny checkpoint ($SPLIT_TINY/<ckpt>) prepped fresh by the capture ({ckpt}, {out}, {plan} filled). preset / set: split-geo plan's (what the chip / Pie runs used; RLV 4 where the staged tiles hold 4 RoPE levels). levers: mkfull.py's kernel levers.",
  "configs": [
   {
    "name": "q35_9b",
-   "family": "q35",
    "kind": "full",
+   "model": "qwen35-d9b-bf16-kv-bf16",
+   "preset": "9b",
+   "set": "G2=16,WL=1,RLV=4",
    "prep": "s9b",
    "prefix": "s9b_",
-   "split": "G2=16,WL=1",
    "vocab": 248320,
-   "mkfull": [
-    "mkfull.py",
-    "{out}",
-    "{prep}",
-    "{prefix}",
-    "G2=16,WL=1",
-    "NPX:1,DIAG:0,TSTAMP:0,XKEEP:0,HACC16:0,ATTL:2"
-   ],
-   "cslc": "PX:256,PY:256,UNX:2,UNY:4,HC:128,HR:1153,VR:216,K:4,KM:8,Hc:16,Ic:48,NQA:40,NQG:50,Qh:4,Dc:4,DK:8,DV:16,NE:64,HR_:4096,HD:256,NROT:2,HK:128,HV:128,NPX:1,DIAG:0,TSTAMP:0,XKEEP:0,HACC16:0,ATTL:2",
+   "levers": "NPX:1,DIAG:0,TSTAMP:0,XKEEP:0,HACC16:0,ATTL:2",
    "source": "requests 0900 / 0901"
   },
   {
    "name": "q35_9b_rlv5",
-   "family": "q35",
    "kind": "full",
+   "model": "qwen35-d9b-bf16-kv-bf16",
+   "preset": "9b",
+   "set": "G2=16,WL=1,RLV=5",
    "prep": "s9b5",
    "prefix": "s9b5_",
-   "split": "G2=16,WL=1",
    "vocab": 248320,
-   "mkfull": [
-    "mkfull.py",
-    "{out}",
-    "{prep}",
-    "{prefix}",
-    "G2=16,WL=1",
-    "NPX:1,DIAG:0,TSTAMP:0,XKEEP:0,HACC16:0,ATTL:2"
-   ],
-   "cslc": "PX:256,PY:256,UNX:2,UNY:4,HC:128,HR:1153,VR:216,K:4,KM:8,Hc:16,Ic:48,NQA:40,NQG:50,Qh:4,Dc:4,DK:8,DV:16,NE:64,HR_:4096,HD:256,NROT:2,HK:128,HV:128,NPX:1,DIAG:0,TSTAMP:0,XKEEP:0,HACC16:0,ATTL:2,RLV:5,RBITS:3",
+   "levers": "NPX:1,DIAG:0,TSTAMP:0,XKEEP:0,HACC16:0,ATTL:2",
    "source": "request 0965"
   },
   {
    "name": "q35_4b",
-   "family": "q35",
    "kind": "full",
+   "model": "qwen35-d4b-bf16-kv-bf16",
+   "preset": "4b",
+   "set": "G2=16,WL=1,RLV=4",
    "prep": "s4b",
    "prefix": "s4b_",
-   "split": "G2=16,WL=1",
    "vocab": 248320,
-   "mkfull": [
-    "mkfull.py",
-    "{out}",
-    "{prep}",
-    "{prefix}",
-    "G2=16,WL=1",
-    "NPX:1,DIAG:0,TSTAMP:0,XKEEP:0,HACC16:0,ATTL:2"
-   ],
-   "cslc": "PX:256,PY:256,UNX:2,UNY:4,HC:128,HR:1153,VR:216,K:4,KM:8,Hc:10,Ic:36,NQA:40,NQG:50,Qh:4,Dc:4,DK:8,DV:16,NE:64,HR_:2560,HD:256,NROT:2,HK:128,HV:128,NPX:1,DIAG:0,TSTAMP:0,XKEEP:0,HACC16:0,ATTL:2",
+   "levers": "NPX:1,DIAG:0,TSTAMP:0,XKEEP:0,HACC16:0,ATTL:2",
    "source": "requests 0902 / 0903"
   },
   {
    "name": "q35_08b",
-   "family": "q35",
    "kind": "full",
+   "model": "qwen35-d0.8b-bf16-kv-bf16",
+   "preset": "0.8b",
+   "set": "G2=16,G2Y=8,WL=1,RLV=4",
    "prep": "s08b",
    "prefix": "s08b_",
-   "split": "G2=16,G2Y=8,WL=1",
    "vocab": 248320,
-   "mkfull": [
-    "mkfull.py",
-    "{out}",
-    "{prep}",
-    "{prefix}",
-    "G2=16,G2Y=8,WL=1",
-    "NPX:1,DIAG:0,TSTAMP:0,XKEEP:0,HACC16:0,ATTL:2"
-   ],
-   "cslc": "PX:256,PY:128,UNX:2,UNY:3,HC:64,HR:1153,VR:216,K:4,KM:8,Hc:8,Ic:14,NQA:20,NQG:34,Qh:4,Dc:2,DK:8,DV:8,NE:128,HR_:1024,HD:256,NROT:1,HK:128,HV:128,NPX:1,DIAG:0,TSTAMP:0,XKEEP:0,HACC16:0,ATTL:2",
+   "levers": "NPX:1,DIAG:0,TSTAMP:0,XKEEP:0,HACC16:0,ATTL:2",
    "source": "requests 0904 / 0905"
   },
   {
    "name": "q3_8b",
-   "family": "q35",
    "kind": "full",
+   "model": "qwen3-8b-bf16-kv-bf16",
+   "preset": "q3-8b",
+   "set": "G2=12,WL=1",
    "prep": "q8p4",
    "prefix": "q84_",
-   "split": "G2=12,WL=1",
    "vocab": 151936,
-   "mkfull": [
-    "mkfull.py",
-    "{out}",
-    "{prep}",
-    "{prefix}",
-    "G2=12,WL=1",
-    "NPX:1,DIAG:0,TSTAMP:0,XKEEP:0,HACC16:0,ATTL:2,SLW:1"
-   ],
-   "cslc": "PX:256,PY:228,UNX:2,UNY:5,HC:114,HR:1153,VR:132,K:4,KM:15,Hc:18,Ic:48,NQA:24,NQG:42,Qh:4,Dc:4,DK:4,DV:16,NE:17,HR_:4096,HD:128,NROT:2,HK:128,HV:512,GATE:0,GAPX:1,GAPY:1,NPX:1,DIAG:0,TSTAMP:0,XKEEP:0,HACC16:0,ATTL:2,SLW:1",
+   "levers": "NPX:1,DIAG:0,TSTAMP:0,XKEEP:0,HACC16:0,ATTL:2,SLW:1",
    "source": "requests 0961 / 0963 (9 K4 units, gap slot (1, 1), G2 12)"
   },
   {
    "name": "gemma_e2b",
-   "family": "gemma",
    "kind": "full",
+   "model": "gemma4-e2b-bf16-kv-bf16",
+   "preset": "e2b",
+   "set": "",
    "prep": "ge2",
    "prefix": "ge2_",
-   "split": "",
    "vocab": 262144,
-   "mkfull": [
-    "mkfull.py",
-    "{out}",
-    "{prep}",
-    "{prefix}",
-    "",
-    "WSPEC:2"
-   ],
-   "cslc": "K:5,KM:16,Hc:12,Qh:4,DcS:2,DcG:4,NES:4,NEG:32,HDS:256,HDG:512,HR_:1536,Ic0:24,Ic1:48,NO:3,VR:232,NTW:19000,NPX:1,WSPEC:2",
+   "levers": "WSPEC:2",
    "source": "requests 0970 / 0972"
   },
   {
    "name": "gemma_e4b",
-   "family": "gemma",
    "kind": "full",
+   "model": "gemma4-e4b-bf16-kv-bf16",
+   "preset": "e4b",
+   "set": "",
    "prep": "ge4",
    "prefix": "ge4_",
-   "split": "",
    "vocab": 262144,
-   "mkfull": [
-    "mkfull.py",
-    "{out}",
-    "{prep}",
-    "{prefix}",
-    "PYW=128,NEG=20,WIN=0",
-    "DIAG:0,WSPEC:0,w.FIFOW:16"
-   ],
-   "cslc": "K:6,KM:32,Hc:16,Qh:4,DcS:2,DcG:4,NES:4,WIN:0,NEG:20,HDS:256,HDG:512,HR_:2560,Ic0:40,Ic1:40,NO:4,VR:232,NTW:18990,NPX:1,WFIFO:16,DIAG:0,PYW:128,WSPEC:0",
+   "levers": "DIAG:0,WSPEC:0,w.FIFOW:16",
    "source": "request 0974 (the staged meta predates PYW: NEG 16 x PY 160 = NEG 20 x PYW 128 = 2,560)"
   },
   {
    "name": "gemma_e4b_meta",
-   "family": "gemma",
    "kind": "full",
+   "model": "gemma4-e4b-bf16-kv-bf16",
+   "preset": "e4b",
+   "set": "PYW=160,NEG=16",
    "prep": "ge4",
    "prefix": "ge4_",
-   "split": "",
    "vocab": 262144,
-   "mkfull": [
-    "mkfull.py",
-    "{out}",
-    "{prep}",
-    "{prefix}",
-    "",
-    "w.FIFOW:16"
-   ],
-   "cslc": "@params",
+   "levers": "w.FIFOW:16",
    "source": "E4B at its staged params.txt alone (the defaults)"
   },
   {
    "name": "gemma_12b",
-   "family": "g12",
    "kind": "full",
+   "model": "gemma4-12b-bf16-kv-bf16",
+   "preset": "g12",
+   "set": "",
    "prep": "g12r",
    "prefix": "g12r_",
-   "split": "",
    "vocab": 262144,
-   "mkfull": [
-    "mkfull.py",
-    "{out}",
-    "{prep}",
-    "{prefix}",
-    "",
-    "DIAG:0"
-   ],
-   "cslc": "K:6,KM:32,HcA:12,HcW:15,Qh:2,DcS:6,DcG:12,NES:8,WIN:0,RING:1,NEG:32,HDS:256,HDG:512,HR_:3840,Ic:45,VR:232,HDc:75,NPX:1,DIAG:0",
+   "levers": "DIAG:0",
    "source": "requests 0920 / 0921 (exact ring, 54 head columns, hw0 / hw1)"
   },
   {
    "name": "gptoss_20b",
-   "family": "gptoss",
    "kind": "full",
+   "model": "gptoss-20b-bf16-mxfp4-kv-bf16",
+   "preset": "full",
+   "set": "",
    "prep": "gpo",
    "prefix": "go_",
-   "split": "G2=16,WL=1",
    "vocab": 201088,
-   "mkfull": [
-    "mkfull.py",
-    "{out}",
-    "{prep}",
-    "{prefix}",
-    "G2=16,WL=1",
-    "DIAG:0,GLUV:1,CYV:2"
-   ],
-   "cslc": "K:2,KM:2,Hc:18,NQA:80,QO:64,Qh:8,Dc:8,NROT:4,Ic:10,NEX:32,TK:4,HR:2880,NLV:5,VR:272,DIAG:0,GLUV:1,CYV:2",
+   "levers": "DIAG:0,GLUV:1,CYV:2",
    "source": "request 0887 (CYV 2, GLUV 1, meta LOOP)"
   },
   {
    "name": "tiny_q35_t08",
-   "family": "q35",
    "kind": "tiny",
+   "shape": "shapes/tiny_q35_t08.json",
+   "preset": "tiny-t08",
+   "set": "G2=2,WL=1,G2W=2",
    "ckpt": "small/tiny/t08/ckpt",
-   "prefix": "",
-   "split": "G2=2,WL=1,G2W=2",
-   "vocab": 80,
    "prep": [
     "prep_q35.py",
     "{ckpt}",
     "{out}",
     "{ckpt}/golden.json",
-    "8",
-    "8",
-    "2",
-    "3",
-    "4",
-    "10",
-    "8",
-    "4"
+    "{plan}"
    ],
-   "mkfull": [
-    "mkfull.py",
-    "{out}",
-    "{prep}",
-    "{prefix}",
-    "G2=2,WL=1,G2W=2",
-    ""
-   ],
-   "cslc": "@params"
+   "prefix": "",
+   "vocab": 80,
+   "levers": "",
+   "source": ""
   },
   {
    "name": "tiny_q35_t4",
-   "family": "q35",
    "kind": "tiny",
+   "shape": "shapes/tiny_q35_t4.json",
+   "preset": "tiny-t4",
+   "set": "G2=2,WL=1,G2W=2",
    "ckpt": "small/tiny/t4/ckpt",
-   "prefix": "",
-   "split": "G2=2,WL=1,G2W=2",
-   "vocab": 144,
    "prep": [
     "prep_q35.py",
     "{ckpt}",
     "{out}",
     "{ckpt}/golden.json",
-    "16",
-    "16",
-    "2",
-    "2",
-    "4",
-    "18",
-    "8",
-    "4"
+    "{plan}"
    ],
-   "mkfull": [
-    "mkfull.py",
-    "{out}",
-    "{prep}",
-    "{prefix}",
-    "G2=2,WL=1,G2W=2",
-    ""
-   ],
-   "cslc": "@params"
+   "prefix": "",
+   "vocab": 144,
+   "levers": "",
+   "source": ""
   },
   {
    "name": "tiny_q3",
-   "family": "q35",
    "kind": "tiny",
+   "shape": "shapes/tiny_q3.json",
+   "preset": "tiny-q3",
+   "set": "G2=2,WL=1,G2W=2",
    "ckpt": "q8/tiny/hf",
-   "prefix": "",
-   "split": "G2=2,WL=1,G2W=2",
-   "vocab": 80,
    "prep": [
     "prep_q35.py",
     "{ckpt}",
     "{out}",
     "{ckpt}/golden.json",
-    "16",
-    "8",
-    "2",
-    "2",
-    "3",
-    "10",
-    "8",
-    "4"
+    "{plan}"
    ],
-   "mkfull": [
-    "mkfull.py",
-    "{out}",
-    "{prep}",
-    "{prefix}",
-    "G2=2,WL=1,G2W=2",
-    ""
-   ],
-   "cslc": "@params"
+   "prefix": "",
+   "vocab": 80,
+   "levers": "",
+   "source": ""
   },
   {
    "name": "tiny_q3_gap",
-   "family": "q35",
    "kind": "tiny",
+   "shape": "shapes/tiny_q3_gap.json",
+   "preset": "tiny-q3-gap",
+   "set": "G2=2,WL=1,G2W=2",
    "ckpt": "q8/tiny/hfg",
-   "prefix": "",
-   "split": "G2=2,WL=1,G2W=2",
-   "vocab": 80,
    "prep": [
     "prep_q35.py",
     "{ckpt}",
     "{out}",
     "{ckpt}/golden.json",
-    "16",
-    "8",
-    "2",
-    "3",
-    "4",
-    "10",
-    "8",
-    "4",
-    "",
-    "5"
+    "{plan}"
    ],
-   "mkfull": [
-    "mkfull.py",
-    "{out}",
-    "{prep}",
-    "{prefix}",
-    "G2=2,WL=1,G2W=2",
-    ""
-   ],
-   "cslc": "@params"
+   "prefix": "",
+   "vocab": 80,
+   "levers": "",
+   "source": ""
   },
   {
    "name": "tiny_gemma",
-   "family": "gemma",
    "kind": "tiny",
+   "shape": "shapes/tiny_gemma.json",
+   "preset": "tiny",
+   "set": "",
    "ckpt": "gemma/tiny/hf",
-   "prefix": "",
-   "split": "",
-   "vocab": 512,
    "prep": [
     "gemma/prep_gemma.py",
     "{ckpt}",
     "{out}",
     "{ckpt}/golden.json",
-    "tiny",
-    "4"
+    "{plan}"
    ],
-   "mkfull": [
-    "mkfull.py",
-    "{out}",
-    "{prep}",
-    "{prefix}",
-    "G2=2,G2W=2",
-    ""
-   ],
-   "cslc": "@params"
+   "prefix": "",
+   "vocab": 512,
+   "levers": "",
+   "source": ""
   },
   {
    "name": "tiny_g12",
-   "family": "g12",
    "kind": "tiny",
+   "shape": "shapes/tiny_g12.json",
+   "preset": "tiny",
+   "set": "",
    "ckpt": "gemma12/tiny/s2w9",
-   "prefix": "",
-   "split": "",
-   "vocab": 512,
    "prep": [
     "g12/prep_g12.py",
     "{ckpt}",
     "{out}",
     "{ckpt}/golden.json",
-    "tiny",
-    "12"
+    "{plan}"
    ],
-   "mkfull": [
-    "mkfull.py",
-    "{out}",
-    "{prep}",
-    "{prefix}",
-    "G2=2,G2W=2",
-    ""
-   ],
-   "cslc": "@params"
+   "prefix": "",
+   "vocab": 512,
+   "levers": "",
+   "source": ""
   },
   {
    "name": "tiny_gptoss",
-   "family": "gptoss",
    "kind": "tiny",
+   "shape": "shapes/tiny_gptoss.json",
+   "preset": "tiny",
+   "set": "NE=8",
    "ckpt": "gptoss/tiny/ck1",
-   "prefix": "",
-   "split": "",
-   "vocab": 100,
    "prep": [
     "gptoss/prep_gptoss.py",
     "{ckpt}",
     "{out}",
-    "tiny",
+    "{plan}",
     "{ckpt}/golden.json"
    ],
-   "mkfull": [
-    "mkfull.py",
-    "{out}",
-    "{prep}",
-    "{prefix}",
-    "NE=8,WIN=4",
-    ""
-   ],
-   "cslc": "@params,NE:8,WIN:4"
+   "prefix": "",
+   "vocab": 100,
+   "levers": "",
+   "source": ""
   }
  ]
 }

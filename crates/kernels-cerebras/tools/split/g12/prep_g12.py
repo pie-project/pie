@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
-"""prep_g12.py <model dir> <outdir> <golden json> <geo: tiny | g12> NEG [prefix]: a Gemma 4 12B-shaped checkpoint
-(bf16 safetensors; no PLE, no shared KV, attention_k_eq_v) in run_g12.py's prep format (src/spatial/README.md, Gemma 4 12B).
+"""prep_g12.py <model dir> <outdir> <golden json> <plan dir> [prefix]: a Gemma 4 12B-shaped checkpoint
+(bf16 safetensors; no PLE, no shared KV, attention_k_eq_v) in run_g12.py's prep format (src/spatial/README.md, Gemma 4 12B),
+cut as the plan in <plan dir> says (`split-geo plan`'s tiling.json).
 Units of K layers (S .. S G), unit u = layers K u .. K u + K - 1.
 - Rows: attention rows r < RA hold Hc A hidden dims, plain rows Hc W; row r's dims are [off_r, off_r + Hc_r) of the
   padded hidden (dims >= H: zero weights, zero gammas).
@@ -10,15 +11,14 @@ Units of K layers (S .. S G), unit u = layers K u .. K u + K - 1.
 - MLP: column c holds intermediate dims c Ic .. (>= I: padding).
 - Head: column c = the dims of its row group (geo.groups), HDc slots (padding past nx); tied (embed_tokens), f16.
 Writes w<u>a / w<u>w (f16 bits, A / W rows), gama / gamw (f32: a layer's input / post-attention / pre-FFN / post-FFN
-gammas, the layer scalar; + the embedding scale), qkw, rot, hw0 / hw1 (the head's halves), hg, embed, embrows, golden.json, meta.json, params.txt."""
+gammas, the layer scalar; + the embedding scale), qkw, rot, hw0 / hw1 (the head's halves), hg, embed, embrows, golden.json, meta.json."""
 import glob, json, os, shutil, struct, sys
 import numpy as np
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."))
 import splitgeo
 
-MD, out, GOLD, GEO = sys.argv[1:5]
-NEG = int(sys.argv[5])
-PRE = sys.argv[6] if len(sys.argv) > 6 else ""
+MD, out, GOLD = sys.argv[1:4]
+PRE = sys.argv[5] if len(sys.argv) > 5 else ""
 os.makedirs(out, exist_ok=True)
 cfg = json.load(open(os.path.join(MD, "config.json")))
 tc = cfg.get("text_config", cfg)
@@ -40,7 +40,8 @@ def bits(name):
 def f16(a):
     return np.asarray(a, np.float32).astype(np.float16).view(np.uint16)
 
-g = splitgeo.geometry("gemma12:" + GEO)
+g = splitgeo.tiling(sys.argv[4])
+GEO = g.preset
 PX, PY, RA, SWA = g.PX, g.PY, g.RA, g.SWA
 HcA, HcW = g.HcA, g.HcW
 H, NL, I = tc["hidden_size"], tc["num_hidden_layers"], tc["intermediate_size"]
@@ -224,15 +225,9 @@ gold = json.load(open(GOLD))
 ids = gold["prompt_ids"] + gold["tokens"]
 np.save(os.path.join(out, PRE + "embrows.npy"), np.asarray(eb)[ids])
 shutil.copy(GOLD, os.path.join(out, PRE + "golden.json"))
-SW = tc["sliding_window"]
-NES = -(-SW // RA)
-WIN = 0 if NES * RA == SW else SW                 # a longer ring: the kernel masks entries out of the window
 meta = dict(geo=GEO, PX=PX, PY=PY, RA=RA, HcA=HcA, HcW=HcW, H=H, HP=HP, V=V, K=K, KM=KM, NU=NU, Qh=Qh, DcS=DcS, DcG=DcG,
-            NES=NES, WIN=WIN, NEG=NEG, HDS=hdS, HDG=hdG, Ic=Ic, HC=HC, HR=HR, VR=VR, HDc=HDc, LW=LWS,
+            HDS=hdS, HDG=hdG, Ic=Ic, HC=HC, HR=HR, VR=VR, HDc=HDc, LW=LWS,
             EPS=tc.get("rms_norm_eps", 1e-6), SOFTCAP=tc.get("final_logit_softcapping"), model=os.path.basename(MD.rstrip("/")),
             LOOP=64)
 json.dump(meta, open(os.path.join(out, PRE + "meta.json"), "w"))
-cp = dict(K=K, KM=KM, HcA=HcA, HcW=HcW, Qh=Qh, DcS=DcS, DcG=DcG, NES=NES, WIN=WIN, RING=1 if WIN == 0 else 0, NEG=NEG, HDS=hdS, HDG=hdG, HR_=H, Ic=Ic,
-          VR=VR, HDc=HDc, NPX=1)
-open(os.path.join(out, PRE + "params.txt"), "w").write(",".join(f"{k}:{v}" for k, v in cp.items()) + "\n")
 print("prepared", out, json.dumps(meta))

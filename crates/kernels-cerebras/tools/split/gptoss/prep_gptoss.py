@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""prep_gptoss.py <model dir> <out dir> <geo: tiny | full> <golden.json> [prefix] [--units a,b] [--nohead]
+"""prep_gptoss.py <model dir> <out dir> <plan dir> <golden.json> [prefix] [--units a,b] [--nohead]
 
 gpt-oss checkpoint (as released: MXFP4 experts, bf16 elsewhere) -> the role-split tiles (split-geo's
 geometry; unit u holds layers K u .. K u + K - 1, K = layers / units):
@@ -10,7 +10,7 @@ geometry; unit u holds layers K u .. K u + K - 1, K = layers / units):
   qb{u}  f32 [AX][K NQA], snk{u} f32 [AX][K Qh], rot f32 [AX][NLV 8 2 NROT]       (attention CY)
   rb{u}  f32 [MX][K], gb{u} f32 [MX][K NEX 2Ic], ps{u} f32 [MX][K NEX 2]           (MoE CY: 2^Pg, 2^Pd)
   hw u16 [PY][HVC][HDc VR] (f16 of 2^15 lm_head, [dim][vocab row]), hg f32 [PY][HDc], hemb u16 [PY][HVC][VR HDc]
-  embrows u16 [the golden's ids][H] (bf16 bits), meta.json, params.txt, golden.json
+  embrows u16 [the golden's ids][H] (bf16 bits), meta.json, golden.json
 E5M2 checker (fails the prep): every expert weight decoded from its byte (byte << 8 as f16, times 2^P) equals
 HF's MXFP4 dequant (FP4 LUT x 2^(scale - 127)) exactly, and is 0 or an f16 normal.
 Column mapping: attention column c = kv head c // SWA, j = c % SWA: rotated pairs i = j NROT + p, p < NROT,
@@ -109,12 +109,13 @@ def yarn(cfg):
 def main():
     args = [a for a in sys.argv[1:] if not a.startswith("--")]
     opts = dict(a[2:].split("=", 1) if "=" in a else (a[2:], "1") for a in sys.argv[1:] if a.startswith("--"))
-    model, out, geo, golden = args[:4]
+    model, out, plan, golden = args[:4]
     pre = args[4] if len(args) > 4 else ""
     os.makedirs(out, exist_ok=True)
     cfg = json.load(open(f"{model}/config.json"))
     ck = Ckpt(model)
-    g = splitgeo.geometry("gptoss:" + geo)
+    g = splitgeo.tiling(plan)
+    geo = g.preset
     PY, AX, MXc, Hc = g.PY, g.AX, g.MXc, g.Hc
     H, L, NEX, TK = cfg["hidden_size"], cfg["num_hidden_layers"], cfg["num_local_experts"], cfg["num_experts_per_tok"]
     NH, NKV, HD, I = cfg["num_attention_heads"], cfg["num_key_value_heads"], cfg["head_dim"], cfg["intermediate_size"]
@@ -249,7 +250,6 @@ def main():
                 LOOP=64)   # Pie's posted-loop length (0886: L64 the faster)
     json.dump(meta, open(f"{out}/{pre}meta.json", "w"), indent=1)
     json.dump(stats, open(f"{out}/{pre}stats.json", "w"))
-    open(f"{out}/{pre}params.txt", "w").write(",".join(f"{k}:{meta[k]}" for k in ("K", "KM", "Hc", "NQA", "QO", "Qh", "Dc", "NROT", "Ic", "NEX", "TK", "HR", "NLV", "VR")) + "\n")
     print("ok", out, json.dumps(meta))
 
 
