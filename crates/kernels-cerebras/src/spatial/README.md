@@ -159,9 +159,12 @@ layout, one tiler makes it); `[engine.debug] weights` serves tiles staged elsewh
    (`layout.csl`, every PE's kernel and params resolved, and one source a PE kind, from the embedded kernels or
    `--kernels <dir>`) and the artifact (rcfg, host, bindings, `program.json`). Levers set kernel params past the
    plan's (`CYV:2`, `SLW:1`; a `<kind>.` prefix scopes one: `w.FIFOW:16`).
-3. **Link and check**: `wafer-compile link --build <build dir>`, where the SDK image's toolchain is (inside the
-   SDK container): a full link at the chip's fabric dims, every PE image's stack room checked (>= 768 B), the
-   artifact put in `out/artifact`.
+3. **Link and check**: `wafer-compile link --build <build dir> [--fabric system]`, where the SDK image's
+   toolchain is (inside the SDK container): a full link against the smallest fabric that holds the program (the
+   simulator's) or, with `--fabric system`, the CS system's whole wafer (762 x 1172 on a CS-3: a program linked
+   against a smaller fabric does not run on the system; a load with `cmaddr` links this way), every PE image's
+   stack room checked (>= 768 B), the artifact put in `out/artifact`. A PE that runs out of memory shows here
+   only: the plan does not model PE memory yet.
 4. **Cut**: `wafer-stage --model <deployment> --checkpoint <dir> --out <dir> [--positions N]` (engine-cerebras):
    the tiles a load cuts (`tiles::stage`: the family's [`tiles::spec`] statement of its layout, made by the one
    tiler `tiles::cut`). `wafer-stage --plan <plan.json> --landed <params.safetensors> --out <dir>` cuts params

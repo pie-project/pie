@@ -20,6 +20,16 @@ pub enum Arch {
 }
 
 impl Arch {
+    /// A system's whole fabric, columns by rows: what a program run on the system is compiled
+    /// against (the SDK runtime reports no fabric size).
+    #[must_use]
+    pub fn system_fabric(self) -> (u32, u32) {
+        match self {
+            Arch::Wse2 => (757, 996),
+            Arch::Wse3 => (762, 1172),
+        }
+    }
+
     fn flag(self) -> &'static str {
         match self {
             Arch::Wse2 => "wse2",
@@ -255,7 +265,9 @@ impl Cslc {
 
         // The compiler is bounded: a hung front end or linker must not hold a load forever.
         let timeout = self.timeout;
-        cmd.stdout(std::process::Stdio::piped())
+        // Its progress on stdout is not read: a piped stdout nobody drains blocks the compiler
+        // once the pipe fills.
+        cmd.stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::piped());
         let mut child = cmd.spawn().map_err(|e| Error::Spawn(e.to_string()))?;
         let started = std::time::Instant::now();
@@ -287,21 +299,28 @@ impl Cslc {
         };
         let stderr_text = drain.join().unwrap_or_default();
         if !status.success() {
-            let tail: Vec<&str> = stderr_text
-                .lines()
-                .rev()
-                .take(40)
-                .collect::<Vec<_>>()
-                .into_iter()
-                .rev()
-                .collect();
             return Err(Error::Failed {
                 status: status.code(),
-                stderr: tail.join("\n"),
+                stderr: causes(&stderr_text),
             });
         }
         Ok(())
     }
+}
+
+/// A failed compile's stderr cut to its causes: each distinct line once, the linker's echoes of
+/// an object it could not open (one per image, after the error that left the object unwritten)
+/// dropped when anything else is said, at most 40 lines.
+fn causes(stderr: &str) -> String {
+    let mut seen = std::collections::BTreeSet::new();
+    let lines: Vec<&str> = stderr
+        .lines()
+        .filter(|l| !l.trim().is_empty() && seen.insert(*l))
+        .collect();
+    let echo = |l: &&str| l.contains("cannot open /tmp/cslc-") || l.starts_with("Failed to link:");
+    let said: Vec<&str> = lines.iter().copied().filter(|l| !echo(l)).collect();
+    let keep = if said.is_empty() { lines } else { said };
+    keep.into_iter().take(40).collect::<Vec<_>>().join("\n")
 }
 
 impl Cslc {
@@ -406,4 +425,32 @@ fn read_dirs(dir: &Path) -> Vec<PathBuf> {
                 .collect()
         })
         .unwrap_or_default()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_failed_link_reports_its_cause_not_the_echoes() {
+        let stderr = "ld.lld: error: cannot open /tmp/cslc-1/a.o: No such file or directory\n\
+                      Failed to link: /tmp/cslc-1/a.o\n\
+                      ld.lld: error: ran out of PE memory for data (section .bss) \n\
+                      ld.lld: error: cannot open /tmp/cslc-1/a.o: No such file or directory\n\
+                      ld.lld: error: ran out of PE memory for data (section .bss) \n";
+        assert_eq!(
+            causes(stderr),
+            "ld.lld: error: ran out of PE memory for data (section .bss) "
+        );
+        assert_eq!(
+            causes("Failed to link: /tmp/cslc-1/a.o\n"),
+            "Failed to link: /tmp/cslc-1/a.o"
+        );
+    }
+
+    #[test]
+    fn a_system_program_is_linked_against_the_whole_wafer() {
+        assert_eq!(Arch::Wse3.system_fabric(), (762, 1172));
+        assert_eq!(memcpy_fabric(643, 1153), ((650, 1155), (4, 1)));
+    }
 }

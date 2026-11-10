@@ -7,7 +7,7 @@
 //!                [--positions N] --out <dir>
 //! wafer-compile build --plan <plan.json> --out <dir> [--emit floor,rcfg,kernels,layout,host,plan,
 //!                 bindings,program] [--levers K:V,...] [--kernels <programs/wafer dir>]
-//! wafer-compile link --build <dir>
+//! wafer-compile link --build <dir> [--fabric simulator|system]
 //! ```
 //!
 //! `plan` writes `<dir>/plan.json` (the [`Plan`]) and names the preset it took.
@@ -18,13 +18,14 @@
 //!
 //! `build` writes everything the plan builds into `<dir>` (`spatial::build::emit`: the sources,
 //! the artifact), its kernels the embedded ones unless `--kernels`
-//! names a directory; `link` compiles a build directory with cslc into `<dir>/out`, checks every
-//! PE image's stack room and puts the artifact beside it (`<dir>/out/artifact`, what the engine
-//! opens). `link` runs where the SDK image's toolchain is (`/cb`, `/cbcore`).
+//! names a directory; `link` compiles a build directory with cslc into `<dir>/out` (against the
+//! smallest fabric that holds it, or with `--fabric system` a CS system's whole wafer), checks
+//! every PE image's stack room and puts the artifact beside it (`<dir>/out/artifact`, what the
+//! engine opens). `link` runs where the SDK image's toolchain is (`/cb`, `/cbcore`).
 
 use std::path::{Path, PathBuf};
 
-use kernels_cerebras::spatial::build::{self, EMITS};
+use kernels_cerebras::spatial::build::{self, EMITS, Fabric};
 use kernels_cerebras::spatial::emit::params::Levers;
 use kernels_cerebras::spatial::plan::{Plan, Shape};
 use kernels_cerebras::spatial::program::Program;
@@ -34,7 +35,7 @@ use kernels_cerebras::spatial::toolchain::{Arch, Cslc, Toolchain};
 const USAGE: &str = "usage: wafer-compile plan (--model <deployment> | --shape <shape.json>) \
      [--preset <name>] [--set K=V,...] [--positions N] --out <dir>\n       wafer-compile build --plan <plan.json> \
      --out <dir> [--emit a,b] [--levers K:V,...] [--kernels <dir>]\n       wafer-compile link \
-     --build <dir>";
+     --build <dir> [--fabric simulator|system]";
 
 fn main() {
     if let Err(e) = run() {
@@ -142,10 +143,15 @@ fn build(args: &[String]) -> Result<(), String> {
 
 /// `link`: a build directory compiled, checked and its artifact put beside it.
 fn link(args: &[String]) -> Result<(), String> {
-    let f = flags(args, &["--build"])?;
+    let f = flags(args, &["--build", "--fabric"])?;
     let dir = PathBuf::from(get(&f, "--build").ok_or(USAGE)?);
+    let fabric = match get(&f, "--fabric").unwrap_or("simulator") {
+        "simulator" => Fabric::Simulator,
+        "system" => Fabric::System,
+        other => return Err(format!("--fabric {other}: simulator or system")),
+    };
     let cslc = Cslc::find(&Toolchain::default()).map_err(|e| e.to_string())?;
-    let room = build::link(&dir, &cslc, Arch::Wse3)?;
+    let room = build::link(&dir, &cslc, Arch::Wse3, fabric)?;
     println!("STACK_ROOM min {room} B; need >= {}: ok", build::STACK_ROOM);
     Ok(())
 }

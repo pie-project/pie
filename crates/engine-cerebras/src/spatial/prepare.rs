@@ -23,7 +23,7 @@ use checkpoint::file::read::parse_metadata;
 use checkpoint::file::zt;
 use checkpoint::plan::{StorageTarget, compile_streaming};
 use checkpoint::types::BackendKind;
-use kernels_cerebras::spatial::build::{self, EMITS, ProgramKey};
+use kernels_cerebras::spatial::build::{self, EMITS, Fabric, ProgramKey};
 use kernels_cerebras::spatial::emit::params::Levers;
 use kernels_cerebras::spatial::plan::Plan;
 use kernels_cerebras::spatial::program::Program;
@@ -255,7 +255,13 @@ pub fn prepare(
         None => {
             let levers = Levers::of(&plan.levers, &knobs.levers)?;
             let cslc = Cslc::find(&cfg.toolchain).map_err(|e| e.to_string())?;
-            let key = ProgramKey::of(&plan, &levers, arch(cfg.target), cslc.frontend())?;
+            // A system runs a program linked against its whole wafer.
+            let fabric = if cfg.cmaddr.is_some() {
+                Fabric::System
+            } else {
+                Fabric::Simulator
+            };
+            let key = ProgramKey::of(&plan, &levers, arch(cfg.target), fabric, cslc.frontend())?;
             let (dir, made) = cache.entry("p", &trace.name, &key.hex, &key.parts, |tmp| {
                 if cfg.wafer.build == Build::Never {
                     return Err(format!(
@@ -267,7 +273,7 @@ pub fn prepare(
                 let t0 = std::time::Instant::now();
                 let prog = Program::of(plan.clone())?;
                 build::emit(&prog, &levers, None, tmp, &EMITS)?;
-                let room = build::link(tmp, &cslc, arch(cfg.target))?;
+                let room = build::link(tmp, &cslc, arch(cfg.target), fabric)?;
                 tracing::info!(
                     s = t0.elapsed().as_secs_f64(),
                     stack_room = room,

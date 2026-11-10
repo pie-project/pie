@@ -136,10 +136,18 @@ pub fn emit(
     Ok(())
 }
 
-/// Links the build in `dir` ([`emit`]'s, every param a literal): cslc over its `layout/` at the
-/// wafer program's dims (IEEE f16, one memcpy channel) into `dir/out`, every PE image's stack
-/// room checked, the artifact copied to `dir/out/artifact`. Returns the least stack room.
-pub fn link(dir: &Path, cslc: &Cslc, arch: Arch) -> R<u32> {
+/// The fabric a program is linked against: the smallest that holds it (the simulator's), or
+/// the system's whole wafer (a program run on a CS system).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize)]
+pub enum Fabric {
+    Simulator,
+    System,
+}
+
+/// Links the build in `dir` ([`emit`]'s, every param a literal): cslc over its `layout/` on
+/// `fabric` (IEEE f16, one memcpy channel) into `dir/out`, every PE image's stack room checked,
+/// the artifact copied to `dir/out/artifact`. Returns the least stack room.
+pub fn link(dir: &Path, cslc: &Cslc, arch: Arch, fabric: Fabric) -> R<u32> {
     let floor: serde_json::Value = serde_json::from_slice(
         &std::fs::read(dir.join("floor.json")).map_err(|e| format!("{}: {e}", dir.display()))?,
     )
@@ -151,7 +159,10 @@ pub fn link(dir: &Path, cslc: &Cslc, arch: Arch) -> R<u32> {
             .ok_or_else(|| format!("floor.json: no {k}"))
     };
     let (w, h) = (dim("w")?, dim("h")?);
-    let (fabric_dims, fabric_offsets) = memcpy_fabric(w, h);
+    let (mut fabric_dims, fabric_offsets) = memcpy_fabric(w, h);
+    if fabric == Fabric::System {
+        fabric_dims = arch.system_fabric();
+    }
     let out = dir.join("out");
     if out.exists() {
         std::fs::remove_dir_all(&out).map_err(|e| format!("{}: {e}", out.display()))?;
@@ -185,8 +196,8 @@ pub fn link(dir: &Path, cslc: &Cslc, arch: Arch) -> R<u32> {
 }
 
 /// The key of a compiled program: a digest of everything its bytes follow from (the plan, the
-/// levers, every kernel source, this compiler's [`FORMAT`] and version, the toolchain and the
-/// architecture), and those parts as a readable record (`key.json`).
+/// levers, every kernel source, this compiler's [`FORMAT`] and version, the toolchain, the
+/// architecture and the fabric), and those parts as a readable record (`key.json`).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ProgramKey {
     pub hex: String,
@@ -194,7 +205,13 @@ pub struct ProgramKey {
 }
 
 impl ProgramKey {
-    pub fn of(plan: &Plan, levers: &Levers, arch: Arch, toolchain: &Path) -> R<ProgramKey> {
+    pub fn of(
+        plan: &Plan,
+        levers: &Levers,
+        arch: Arch,
+        fabric: Fabric,
+        toolchain: &Path,
+    ) -> R<ProgramKey> {
         let mut k = blake3::Hasher::new();
         for (name, src) in sources::KERNELS {
             k.update(name.as_bytes())
@@ -209,6 +226,7 @@ impl ProgramKey {
             "format": FORMAT,
             "compiler": env!("CARGO_PKG_VERSION"),
             "arch": format!("{arch:?}"),
+            "fabric": fabric,
             "toolchain": toolchain.display().to_string(),
         });
         let text = serde_json::to_string(&parts).map_err(|e| e.to_string())?;
