@@ -273,6 +273,15 @@ impl SharedPool {
             .saturating_sub(facts.act_chunks.first().map_or(0, |&(_, chunks)| chunks));
         shared.records_capacity = shared.records_fitting(state_chunks);
         shared.least_chunks = shared.working_set_chunks(max_context);
+        tracing::debug!(
+            chunk_bytes = facts.chunk_bytes,
+            total_chunks = facts.total_chunks,
+            segment_chunks = facts.segment_chunks,
+            committed = facts.segments.committed,
+            shapes = facts.shapes.len(),
+            records = shared.records_capacity,
+            "a shared pool"
+        );
         Ok(shared)
     }
 
@@ -647,7 +656,10 @@ impl SharedPool {
         match segments.state(last) {
             SegmentState::Draining { .. } => Some(match self.pool.release_segment(last) {
                 Ok(()) => SegmentMove::Release { prefix: last },
-                Err(_) => SegmentMove::Wait,
+                Err(error) => {
+                    tracing::trace!(%error, epoch, "a draining segment waits");
+                    SegmentMove::Wait
+                }
             }),
             SegmentState::Committed if segments.used(last) == 0 => {
                 Some(match self.pool.release_segment(last) {

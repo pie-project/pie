@@ -568,6 +568,7 @@ async fn bootstrap_inner(config: Config) -> Result<BootstrapHandle> {
                 let grow =
                     crate::store::shared::SharedGrow::new(arena_model_idx, engine, shared.clone());
                 shared_grows.push(grow.clone());
+                pool = pool.with_shared_grow(grow.clone());
                 shared_steered_pool(arena_model_idx, engine, chunk_facts.get(engine), grow)
             }
             None => steered_pool(arena_model_idx, engine, chunk_facts.get(engine), grow),

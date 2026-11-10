@@ -52,6 +52,21 @@ impl SharedGrow {
         &self.shared
     }
 
+    /// Looks again now: a waiter is short.
+    pub fn wake(&self) {
+        self.wake.notify_one();
+    }
+
+    /// Whether a segment below the top span is still uncommitted, under the
+    /// governor's target.
+    #[must_use]
+    pub fn can_grow(&self) -> bool {
+        let pool = self.shared.lock().unwrap();
+        let top = pool.pool().top_segment();
+        pool.pool().prefix_segments() < top
+            && pool.mapped_segments() < self.target.load(Ordering::Acquire)
+    }
+
     /// Starts moving; the scheduler that takes the moves is up.
     pub fn start(&self) {
         crate::rt::spawn(self.clone().run());
@@ -71,9 +86,13 @@ impl SharedGrow {
     /// The segments to be at: the governor's target, and on the way up no
     /// further than what stands ready ahead of the waiters asks.
     fn goal(&self) -> u32 {
-        let target = self.target.load(Ordering::Acquire);
+        let pinned = pinned_segments();
+        let target = pinned.unwrap_or_else(|| self.target.load(Ordering::Acquire));
         let pool = self.shared.lock().unwrap();
         let mapped = pool.mapped_segments();
+        if pinned.is_some() {
+            return target;
+        }
         if target <= mapped {
             return target;
         }
@@ -82,7 +101,16 @@ impl SharedGrow {
             .demand()
             .wanted
             .saturating_sub(pool.pool().demand().live);
-        target.min(pool.ahead_target(short))
+        let ahead = pool.ahead_target(short);
+        tracing::trace!(
+            target,
+            mapped,
+            short,
+            ahead,
+            headroom = pool.pool().headroom(),
+            "segment goal"
+        );
+        target.min(ahead)
     }
 
     async fn run(self) {
@@ -114,6 +142,7 @@ impl SharedGrow {
                 Some(SegmentMove::Release { prefix }) => PoolOp::ReleaseSegments(prefix),
             };
             self.no_room.store(false, Ordering::Release);
+            tracing::debug!(engine = self.engine, goal, ?op, "a segment move");
             let commit = match &op {
                 PoolOp::CommitSegments(prefix) => Some(*prefix),
                 _ => None,
@@ -143,6 +172,17 @@ impl SharedGrow {
             }
         }
     }
+}
+
+/// A test hook: while the file `PIE_SHARED_SEGMENTS_FILE` names holds a
+/// number, that many mapped segments stand in for the governor's target, so
+/// a test can force a grow or a shrink (and its evacuation) mid-run.
+fn pinned_segments() -> Option<u32> {
+    static PATH: std::sync::OnceLock<Option<std::path::PathBuf>> = std::sync::OnceLock::new();
+    let path = PATH
+        .get_or_init(|| std::env::var_os("PIE_SHARED_SEGMENTS_FILE").map(Into::into))
+        .as_ref()?;
+    std::fs::read_to_string(path).ok()?.trim().parse().ok()
 }
 
 impl PoolTarget for SharedGrow {

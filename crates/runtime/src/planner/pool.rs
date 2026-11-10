@@ -105,6 +105,9 @@ pub struct RegistryPool {
     /// The last count of reclaimable idle pages and when it was taken.
     reclaimable: parking_lot::Mutex<Option<(crate::rt::Instant, u32)>>,
     grow: Option<Grow>,
+    /// A shared pool's segment walker: what waiters are short reaches its
+    /// demand, so it commits segments ahead of them.
+    shared: Option<crate::store::shared::SharedGrow>,
 }
 
 /// How long a count of reclaimable idle pages stands: counting walks every
@@ -120,7 +123,14 @@ impl RegistryPool {
             suspend_capable,
             reclaimable: parking_lot::Mutex::new(None),
             grow: None,
+            shared: None,
         }
+    }
+
+    /// Grows a shared pool's segments for the pages waiters are short.
+    pub fn with_shared_grow(mut self, grow: crate::store::shared::SharedGrow) -> Self {
+        self.shared = Some(grow);
+        self
     }
 
     /// Commits the pool's pages on demand rather than holding them whole.
@@ -233,6 +243,13 @@ impl PoolPort for RegistryPool {
     ) -> Option<Vec<crate::store::kv::page_table::PhysicalKvPageId>> {
         let (pages, due) = self.with_kv_tagged("planner-reserve", |kv| {
             let pages = kv.reserve_device_pages(count as usize);
+            if self.shared.is_some() {
+                if pages.is_none() {
+                    kv.note_short(count);
+                } else {
+                    kv.clear_short();
+                }
+            }
             let due = self.grow.as_ref().is_some_and(|grow| {
                 if pages.is_none() {
                     kv.note_short(count);
@@ -244,6 +261,11 @@ impl PoolPort for RegistryPool {
         if due && let Some(grow) = &self.grow {
             grow.wake();
         }
+        if pages.is_none()
+            && let Some(shared) = &self.shared
+        {
+            shared.wake();
+        }
         pages
     }
 
@@ -252,6 +274,15 @@ impl PoolPort for RegistryPool {
     }
 
     fn grow(&self, need: super::Demand) -> bool {
+        if let Some(shared) = &self.shared {
+            if need.kv_pages > 0 {
+                self.with_kv_tagged("planner-grow", |kv| kv.note_short(need.kv_pages));
+            }
+            return shared.can_grow() && {
+                shared.wake();
+                true
+            };
+        }
         let Some(grow) = &self.grow else {
             return false;
         };

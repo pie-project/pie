@@ -2481,6 +2481,14 @@ impl KvStore {
         self.pool.wait(u64::from(self.short_pages));
     }
 
+    /// No waiter is short any more (a shared pool: a reservation went through).
+    pub fn clear_short(&mut self) {
+        if self.short_pages > 0 {
+            self.short_pages = 0;
+            self.pool.wait(0);
+        }
+    }
+
     /// Whether committing further would add a page.
     pub fn can_commit(&self) -> bool {
         self.pool.limit() < self.target_pages
