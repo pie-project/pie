@@ -36,10 +36,11 @@ pub(crate) fn kda_chunked_mma(
     const STAGE: u32 = 3 * CH * LD * 2 + CH * LDV * 2 + 2 * CH * LDT * 2 + D * FLOAT;
     let heads = shape.heads;
     let slots = shape.n.div_ceil(CH) + lanes;
-    let rows = u64::from(shape.n + CH) * u64::from(heads) * u64::from(D);
-    let qg = plane_bf16(ctx, op, "attn.ssm_kda_chunk_qg", rows)?;
-    let kg = plane_bf16(ctx, op, "attn.ssm_kda_chunk_kg", rows)?;
-    let ke = plane_bf16(ctx, op, "attn.ssm_kda_chunk_ke", rows)?;
+    let planes = u64::from(shape.n + CH) * u64::from(heads) * u64::from(D);
+    let qg = plane_bf16(ctx, op, "attn.ssm_kda_chunk_qg", planes)?;
+    let kg = plane_bf16(ctx, op, "attn.ssm_kda_chunk_kg", planes)?;
+    let ke = plane_bf16(ctx, op, "attn.ssm_kda_chunk_ke", planes)?;
+    let rows = state.rows(op, state.slab, state.slot_stride_elems, heads)?;
     let squares = u64::from(slots) * u64::from(heads) * u64::from(CH * CH);
     let tb = plane_bf16(ctx, op, "attn.ssm_kda_chunk_t", squares)?;
     let pm = plane_bf16(ctx, op, "attn.ssm_kda_chunk_p", squares)?;
@@ -63,7 +64,7 @@ pub(crate) fn kda_chunked_mma(
             gates.a_log.arg(),
             gates.dt_bias.arg(),
             gates.floor.arg(),
-            state.slot_ids.arg(),
+            rows.arg(),
             mixed.indptr.arg(),
             state.commit_len.arg(),
             state.begin_at.arg(),
@@ -90,10 +91,8 @@ pub(crate) fn kda_chunked_mma(
             ArgValue::Ptr(ke),
             ArgValue::Ptr(tb),
             ArgValue::Ptr(pm),
-            state.slab.arg(),
-            state.slot_ids.arg(),
+            rows.arg(),
             mixed.indptr.arg(),
-            state.slot_stride_elems.arg(),
             state.commit_len.arg(),
             state.begin_at.arg(),
             state.write_state.arg(),

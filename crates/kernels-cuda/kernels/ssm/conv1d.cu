@@ -1,4 +1,5 @@
 #include "ssm/state.cuh"
+#include "prim/state_rows.cuh"
 
 namespace pie::ssm {
 
@@ -19,10 +20,8 @@ __global__ void conv1d_chunked(
     const T* __restrict__ weight,
     const T* __restrict__ bias,
     T* __restrict__ y,
-    T* __restrict__ state_out_base,
-    const int* __restrict__ slot_ids,
+    StateRows rows,
     const u32* __restrict__ qo_indptr,
-    long long slot_stride_elems,
     int C, int K, int dil, bool write_state,
     const u8* __restrict__ write_state_mask,
     const int* commit_len,
@@ -55,11 +54,13 @@ __global__ void conv1d_chunked(
     }
     if (Nr <= 0) return;
 
-    const int slot = slot_ids[rl];
-    if (slot < 0) return;
+    const i32* rid = rows.row(rl);
+    if (rid[0] < 0) return;
     const T* x_r = x + (long long)(t0 + row0) * C;
     T* y_r = y + (long long)(t0 + row0) * C;
-    T* state = state_out_base + (long long)slot * slot_stride_elems;
+    const int cs = rows.atoms;
+    const int ci = c % cs;
+    T* state = rows.piece<T>(rid, c / cs);
 
     const int tid = threadIdx.x;
     const int block_size = blockDim.x;
@@ -73,7 +74,7 @@ __global__ void conv1d_chunked(
             const int src_t = t - (K - 1 - k) * dil;
             float xv = 0.f;
             if (src_t < 0) {
-                xv = Elem<T>::to_f32(state[((K - 1) * dil + 1 + src_t) * C + c]);
+                xv = Elem<T>::to_f32(state[((K - 1) * dil + 1 + src_t) * cs + ci]);
             } else {
                 xv = Elem<T>::to_f32(x_r[src_t * C + c]);
             }
@@ -86,16 +87,16 @@ __global__ void conv1d_chunked(
 
     __syncthreads();
 
-    if (state_out_base && write_state &&
+    if (rows.live() && write_state &&
         (write_state_mask == nullptr || write_state_mask[rl] != 0) &&
         tid == 0) {
         const int span = (K - 1) * dil + 1;
         for (int s = 0; s < span; ++s) {
             const int src_t = Nr - span + s;
             const float v = (src_t < 0)
-                ? Elem<T>::to_f32(state[(span + src_t) * C + c])
+                ? Elem<T>::to_f32(state[(span + src_t) * cs + ci])
                 : Elem<T>::to_f32(x_r[src_t * C + c]);
-            state[s * C + c] = Elem<T>::from_f32(v);
+            state[s * cs + ci] = Elem<T>::from_f32(v);
         }
     }
 }
@@ -106,10 +107,8 @@ __global__ void conv1d_chunked_channel_tile(
     const T* __restrict__ weight,
     const T* __restrict__ bias,
     T* __restrict__ y,
-    T* __restrict__ state_out_base,
-    const int* __restrict__ slot_ids,
+    StateRows rows,
     const u32* __restrict__ qo_indptr,
-    long long slot_stride_elems,
     int C, int K, int dil, bool write_state,
     const u8* __restrict__ write_state_mask,
     const int* commit_len,
@@ -140,11 +139,13 @@ __global__ void conv1d_chunked_channel_tile(
     }
     if (Nr <= 0) return;
 
-    const int slot = slot_ids[rl];
-    if (slot < 0) return;
+    const i32* rid = rows.row(rl);
+    if (rid[0] < 0) return;
     const T* x_r = x + static_cast<long long>(t0 + row0) * C;
     T* y_r = y + static_cast<long long>(t0 + row0) * C;
-    T* state = state_out_base + static_cast<long long>(slot) * slot_stride_elems;
+    const int cs = rows.atoms;
+    const int ci = c % cs;
+    T* state = rows.piece<T>(rid, c / cs);
 
     const float bias_v = bias ? Elem<T>::to_f32(bias[c]) : 0.f;
     float wv[8];
@@ -161,7 +162,7 @@ __global__ void conv1d_chunked_channel_tile(
             const int src_t = t - (K - 1 - k) * dil;
             float xv = 0.f;
             if (src_t < 0) {
-                xv = Elem<T>::to_f32(state[((K - 1) * dil + 1 + src_t) * C + c]);
+                xv = Elem<T>::to_f32(state[((K - 1) * dil + 1 + src_t) * cs + ci]);
             } else {
                 xv = Elem<T>::to_f32(x_r[src_t * C + c]);
             }
@@ -171,15 +172,15 @@ __global__ void conv1d_chunked_channel_tile(
             conv_out<SILU, RESIDUAL>(acc, Elem<T>::to_f32(x_r[static_cast<long long>(t) * C + c])));
     }
 
-    if (state_out_base && write_state &&
+    if (rows.live() && write_state &&
         (write_state_mask == nullptr || write_state_mask[rl] != 0)) {
         const int span = (K - 1) * dil + 1;
         for (int s = 0; s < span; ++s) {
             const int src_t = Nr - span + s;
             const float v = (src_t < 0)
-                ? Elem<T>::to_f32(state[(span + src_t) * C + c])
+                ? Elem<T>::to_f32(state[(span + src_t) * cs + ci])
                 : Elem<T>::to_f32(x_r[src_t * C + c]);
-            state[s * C + c] = Elem<T>::from_f32(v);
+            state[s * cs + ci] = Elem<T>::from_f32(v);
         }
     }
 }
@@ -192,10 +193,8 @@ __global__ void conv1d_chunked_row_tile(
     const T* __restrict__ weight,
     const T* __restrict__ bias,
     T* __restrict__ y,
-    T* __restrict__ state_out_base,
-    const int* __restrict__ slot_ids,
+    StateRows rows,
     const u32* __restrict__ qo_indptr,
-    long long slot_stride_elems,
     int C, int K, int dil, bool write_state,
     const u8* __restrict__ write_state_mask,
     const int* commit_len,
@@ -243,11 +242,13 @@ __global__ void conv1d_chunked_row_tile(
             if (cl < Nr) Nr = cl;
         }
         if (Nr <= 0) continue;
-        const int slot = slot_ids[rl];
-        if (slot < 0) continue;
+        const i32* rid = rows.row(rl);
+        if (rid[0] < 0) continue;
         const T* x_r = x + static_cast<long long>(t0 + row0) * C;
         T* y_r = y + static_cast<long long>(t0 + row0) * C;
-        T* state = state_out_base + static_cast<long long>(slot) * slot_stride_elems;
+        const int cs = rows.atoms;
+        const int ci = c % cs;
+        T* state = rows.piece<T>(rid, c / cs);
         const int t_lo = max(tile0, t0) - t0;
         const int t_hi = min(tile_end, t0 + Nr) - t0;
         for (int t = t_lo; t < t_hi; ++t) {
@@ -258,7 +259,7 @@ __global__ void conv1d_chunked_row_tile(
                 const int src_t = t - (K - 1 - k) * dil;
                 float xv = 0.f;
                 if (src_t < 0) {
-                    xv = Elem<T>::to_f32(state[(span + src_t) * C + c]);
+                    xv = Elem<T>::to_f32(state[(span + src_t) * cs + ci]);
                 } else {
                     xv = Elem<T>::to_f32(x_r[static_cast<long long>(src_t) * C + c]);
                 }
@@ -280,10 +281,8 @@ __global__ void conv1d_chunked_row_tile_vec8(
     const T* __restrict__ weight,
     const T* __restrict__ bias,
     T* __restrict__ y,
-    T* __restrict__ state_out_base,
-    const int* __restrict__ slot_ids,
+    StateRows rows,
     const u32* __restrict__ qo_indptr,
-    long long slot_stride_elems,
     int C, int K, int dil, bool write_state,
     const u8* __restrict__ write_state_mask,
     const int* commit_len,
@@ -349,11 +348,12 @@ __global__ void conv1d_chunked_row_tile_vec8(
             if (cl < Nr) Nr = cl;
         }
         if (Nr <= 0) continue;
-        const int slot = slot_ids[rl];
-        if (slot < 0) continue;
+        const i32* rid = rows.row(rl);
+        if (rid[0] < 0) continue;
         const T* x_r = x + static_cast<long long>(t0 + row0) * C + c;
         T* y_r = y + static_cast<long long>(t0 + row0) * C + c;
-        const T* state = state_out_base + static_cast<long long>(slot) * slot_stride_elems + c;
+        const int cs = rows.atoms;
+        const T* state = rows.piece<const T>(rid, c / cs) + c % cs;
         const int t_lo = max(tile0, t0) - t0;
         const int t_hi = min(tile_end, t0 + Nr) - t0;
         if (t_lo >= t_hi) continue;
@@ -362,7 +362,7 @@ __global__ void conv1d_chunked_row_tile_vec8(
         for (int j = 0; j < TAPS - 1; ++j) {
             const int src = t_lo - (TAPS - 1) + j;
             const uint4 raw = src < 0
-                ? *reinterpret_cast<const uint4*>(state + static_cast<long long>(TAPS + src) * C)
+                ? *reinterpret_cast<const uint4*>(state + static_cast<long long>(TAPS + src) * cs)
                 : *reinterpret_cast<const uint4*>(x_r + static_cast<long long>(src) * C);
             unpack8(raw, hist[j]);
         }
@@ -408,10 +408,8 @@ __global__ void __launch_bounds__(128, 8) conv1d_chunked_row_tile_vec4(
     const T* __restrict__ weight,
     const T* __restrict__ bias,
     T* __restrict__ y,
-    T* __restrict__ state_out_base,
-    const int* __restrict__ slot_ids,
+    StateRows rows,
     const u32* __restrict__ qo_indptr,
-    long long slot_stride_elems,
     int C, int K, int dil, bool write_state,
     const u8* __restrict__ write_state_mask,
     const int* commit_len,
@@ -471,11 +469,12 @@ __global__ void __launch_bounds__(128, 8) conv1d_chunked_row_tile_vec4(
             if (cl < Nr) Nr = cl;
         }
         if (Nr <= 0) continue;
-        const int slot = slot_ids[rl];
-        if (slot < 0) continue;
+        const i32* rid = rows.row(rl);
+        if (rid[0] < 0) continue;
         const T* x_r = x + static_cast<long long>(t0 + row0) * C + c;
         T* y_r = y + static_cast<long long>(t0 + row0) * C + c;
-        const T* state = state_out_base + static_cast<long long>(slot) * slot_stride_elems + c;
+        const int cs = rows.atoms;
+        const T* state = rows.piece<const T>(rid, c / cs) + c % cs;
         const int t_lo = max(tile0, t0) - t0;
         const int t_hi = min(tile_end, t0 + Nr) - t0;
         if (t_lo >= t_hi) continue;
@@ -484,7 +483,7 @@ __global__ void __launch_bounds__(128, 8) conv1d_chunked_row_tile_vec4(
         for (int j = 0; j < TAPS - 1; ++j) {
             const int src = t_lo - (TAPS - 1) + j;
             hist[j] = src < 0
-                ? *reinterpret_cast<const Run*>(state + static_cast<long long>(TAPS + src) * C)
+                ? *reinterpret_cast<const Run*>(state + static_cast<long long>(TAPS + src) * cs)
                 : *reinterpret_cast<const Run*>(x_r + static_cast<long long>(src) * C);
         }
         for (int tb = t_lo; tb < t_hi; tb += RUN) {
@@ -527,10 +526,8 @@ __global__ void __launch_bounds__(128, 8) conv1d_chunked_row_tile_vec4(
 template <class T>
 __global__ void conv1d_state_commit(
     const T* __restrict__ x,
-    T* __restrict__ state_out_base,
-    const int* __restrict__ slot_ids,
+    StateRows rows,
     const u32* __restrict__ qo_indptr,
-    long long slot_stride_elems,
     int C, int K, int dil,
     const u8* __restrict__ write_state_mask,
     const int* commit_len,
@@ -548,8 +545,8 @@ __global__ void conv1d_state_commit(
     if (r >= lanes) return;
     const int rl = win != nullptr ? r + static_cast<int>(win[3]) : r;
     if (write_state_mask != nullptr && write_state_mask[rl] == 0) return;
-    const int slot = slot_ids[rl];
-    if (slot < 0) return;
+    const i32* rid = rows.row(rl);
+    if (rid[0] < 0) return;
     int t0 = static_cast<int>(qo_indptr[r]);
     int Nr = static_cast<int>(qo_indptr[r + 1]) - t0;
     if (begin_at != nullptr) {
@@ -565,24 +562,26 @@ __global__ void conv1d_state_commit(
     const int row0 = win != nullptr ? static_cast<int>(win[1]) : 0;
     const int span = (K - 1) * dil + 1;
     const T* x_r = x + static_cast<long long>(t0 + row0) * C;
-    T* state = state_out_base + static_cast<long long>(slot) * slot_stride_elems;
+    const int cs = rows.atoms;
+    const int ci = c % cs;
+    T* state = rows.piece<T>(rid, c / cs);
     // Each snapshot's window, from the rows and the window the lane started
     // with, before the lane's own overwrites it.
     const Snaps sn = snaps_of(snap, rl);
     for (int e = sn.e0; e < sn.e1 && snap_rows[e] < Nr; ++e) {
-        T* at = state_out_base + static_cast<long long>(snap_slots[e]) * slot_stride_elems;
+        T* at = rows.piece<T>(snap_slots + static_cast<long long>(e) * rows.pieces, c / cs);
         for (int s = 0; s < span; ++s) {
             const int src_t = snap_rows[e] - span + s;
-            at[s * C + c] = src_t < 0 ? state[(span + src_t) * C + c]
+            at[s * cs + ci] = src_t < 0 ? state[(span + src_t) * cs + ci]
                                       : x_r[static_cast<long long>(src_t) * C + c];
         }
     }
     for (int s = 0; s < span; ++s) {
         const int src_t = Nr - span + s;
         const float v = (src_t < 0)
-            ? Elem<T>::to_f32(state[(span + src_t) * C + c])
+            ? Elem<T>::to_f32(state[(span + src_t) * cs + ci])
             : Elem<T>::to_f32(x_r[static_cast<long long>(src_t) * C + c]);
-        state[s * C + c] = Elem<T>::from_f32(v);
+        state[s * cs + ci] = Elem<T>::from_f32(v);
     }
 }
 
@@ -591,9 +590,7 @@ __global__ void conv1d_update(
     const T* __restrict__ x,
     const T* __restrict__ weight,
     const T* __restrict__ bias,
-    T* __restrict__ state_base,
-    const int* __restrict__ slot_ids,
-    long long slot_stride_elems,
+    StateRows rows,
     T* __restrict__ y,
     int R, int C, int K, int dil,
     bool write_state,
@@ -609,9 +606,11 @@ __global__ void conv1d_update(
     if (r >= R || c >= C) return;
 
     const int rl = win != nullptr ? r + static_cast<int>(win[3]) : r;
-    const int slot = slot_ids[rl];
-    if (slot < 0) return;
-    T* state = state_base + (long long)slot * slot_stride_elems;
+    const i32* rid = rows.row(rl);
+    if (rid[0] < 0) return;
+    const int cs = rows.atoms;
+    const int ci = c % cs;
+    T* state = rows.piece<T>(rid, c / cs);
     const T* x_r = x + (long long)r_row * C;
     T* y_r = y + (long long)r_row * C;
 
@@ -624,7 +623,7 @@ __global__ void conv1d_update(
         if (k >= K) break;
         float xv;
         if (k < K - 1) {
-            xv = Elem<T>::to_f32(state[(k * dil + 1) * C + c]);
+            xv = Elem<T>::to_f32(state[(k * dil + 1) * cs + ci]);
         } else {
             xv = new_x;
         }
@@ -636,9 +635,9 @@ __global__ void conv1d_update(
     if (!folds(write_state, write_state_mask, rl)) return;
     const int span = (K - 1) * dil;
     for (int k = 0; k < span; ++k) {
-        state[k * C + c] = state[(k + 1) * C + c];
+        state[k * cs + ci] = state[(k + 1) * cs + ci];
     }
-    state[span * C + c] = Elem<T>::from_f32(new_x);
+    state[span * cs + ci] = Elem<T>::from_f32(new_x);
 }
 
 template <class T, bool SILU = true, bool RESIDUAL = false>
@@ -646,9 +645,7 @@ __global__ void conv1d_update_vec8(
     const T* __restrict__ x,
     const T* __restrict__ weight,
     const T* __restrict__ bias,
-    T* __restrict__ state_base,
-    const int* __restrict__ slot_ids,
-    long long slot_stride_elems,
+    StateRows rows,
     T* __restrict__ y,
     int R, int C, int K,
     bool write_state,
@@ -670,9 +667,11 @@ __global__ void conv1d_update_vec8(
     if (r >= R || c0 >= C) return;
 
     const int rl = win != nullptr ? r + static_cast<int>(win[3]) : r;
-    const int slot = slot_ids[rl];
-    if (slot < 0) return;
-    T* state = state_base + (long long)slot * slot_stride_elems;
+    const i32* rid = rows.row(rl);
+    if (rid[0] < 0) return;
+    const int cs = rows.atoms;
+    const int ci = c0 % cs;
+    T* state = rows.piece<T>(rid, c0 / cs);
     const int span = K - 1;
 
     Vec xv;
@@ -693,7 +692,7 @@ __global__ void conv1d_update_vec8(
     #pragma unroll
     for (int k = 0; k < K_MAX - 1; ++k) {
         if (k < span) {
-            window[k].raw = *reinterpret_cast<const uint4*>(state + (long long)(k + 1) * C + c0);
+            window[k].raw = *reinterpret_cast<const uint4*>(state + (long long)(k + 1) * cs + ci);
         }
     }
     const T* wflat = &wv[0].e[0];
@@ -726,10 +725,10 @@ __global__ void conv1d_update_vec8(
     #pragma unroll
     for (int k = 0; k < K_MAX - 1; ++k) {
         if (k < span) {
-            *reinterpret_cast<uint4*>(state + (long long)k * C + c0) = window[k].raw;
+            *reinterpret_cast<uint4*>(state + (long long)k * cs + ci) = window[k].raw;
         }
     }
-    *reinterpret_cast<uint4*>(state + (long long)span * C + c0) = xv.raw;
+    *reinterpret_cast<uint4*>(state + (long long)span * cs + ci) = xv.raw;
 }
 
 }

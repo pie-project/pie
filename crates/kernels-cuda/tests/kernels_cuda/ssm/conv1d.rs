@@ -46,6 +46,7 @@ fn conv_update(write_state: bool, mask: Option<[u8; 3]>, channels: usize) {
         commit_len: Tensor::ABSENT,
         begin_at: Tensor::ABSENT,
         fused_decay: false,
+        segments: kernels_cuda::Segments::ONE,
         snapshots: kernels_cuda::Snapshots::NONE,
     };
     let mut y = Tensor::new(y_at, rows, channels as u32, Dtype::Bf16);

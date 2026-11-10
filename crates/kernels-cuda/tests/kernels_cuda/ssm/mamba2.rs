@@ -142,6 +142,7 @@ fn the_mamba2_scan_and_step_answer_the_serial_recurrence() {
         commit_len: Tensor::ABSENT,
         begin_at: Tensor::ABSENT,
         fused_decay: false,
+        segments: kernels_cuda::Segments::ONE,
         snapshots: kernels_cuda::Snapshots::NONE,
     };
     let at = |base: u64, row: usize, width: usize| base + (row * width * 2) as u64;

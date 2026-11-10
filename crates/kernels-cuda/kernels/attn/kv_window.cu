@@ -1,4 +1,5 @@
 #include "prim/device.cuh"
+#include "prim/state_rows.cuh"
 
 // Bounded replay's floors (DeepSeek-V4.1's Causal Encoder-Decoder): a
 // lane's least position whose window keys its decoder layers hold. A block
@@ -10,10 +11,8 @@ namespace pie::attn {
 
 __global__ void replay_floor(
     const int* __restrict__ positions,
-    int* __restrict__ state_base,
-    const int* __restrict__ slot_ids,
+    StateRows rows,
     const u32* __restrict__ qo_indptr,
-    long long slot_stride_elems,
     int* __restrict__ floors,
     int mark,
     bool write_state,
@@ -27,8 +26,8 @@ __global__ void replay_floor(
     const int t0 = static_cast<int>(qo_indptr[r]) + row0;
     const int n = static_cast<int>(qo_indptr[r + 1]) - static_cast<int>(qo_indptr[r]);
     if (n <= 0) return;
-    const int slot = slot_ids[rl];
-    int* state = slot >= 0 ? state_base + static_cast<long long>(slot) * slot_stride_elems : nullptr;
+    const i32* rid = rows.row(rl);
+    int* state = rid[0] >= 0 ? rows.piece<int>(rid, 0) : nullptr;
     const int floor = mark ? positions[t0 + n - 1] + 1 : (state != nullptr ? state[0] : 0);
     for (int t = static_cast<int>(threadIdx.x); t < n; t += static_cast<int>(blockDim.x)) {
         floors[t0 + t] = floor;

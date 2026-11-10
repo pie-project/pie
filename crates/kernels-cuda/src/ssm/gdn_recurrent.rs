@@ -28,7 +28,8 @@ pub fn gated_delta(
     debug_assert_eq!(y.dtype, Dtype::F32, "`{OP}` lands an f32 accumulator");
     let shape = Delta::of(OP, qkv, gates, y, k_heads, v_heads, k_dim, v_dim)?;
     seated(OP, state, "gdn_step", true, false, false)?;
-    if fused_fits(&shape, state, qkv, y) {
+    let rows = state.rows(OP, state.slab, state.slot_stride_elems, v_heads)?;
+    if fused_fits(&shape, state, &rows, qkv, y) {
         return shape.decode_fused(ctx, OP, qkv, gates, state, y);
     }
     let staged = shape.stage(ctx, OP, qkv, gates, StagePlanes::Step)?;
@@ -54,9 +55,7 @@ pub fn gated_delta(
             ArgValue::Ptr(staged.v),
             ArgValue::Ptr(staged.g_log),
             ArgValue::Ptr(staged.beta),
-            state.slab.arg(),
-            state.slot_ids.arg(),
-            state.slot_stride_elems.arg(),
+            rows.arg(),
             y.arg(),
             stated(OP, k_heads)?.arg(),
             stated(OP, v_heads)?.arg(),
@@ -78,13 +77,19 @@ const FUSED_BK: u32 = 128;
 
 /// Whether the fused step's vector reads land whole: every row it touches
 /// starts on a 16-byte boundary and the key width is whole sixteen-row steps.
-fn fused_fits(shape: &Delta, state: &RecurrentPool, qkv: Tensor, y: &Tensor) -> bool {
+fn fused_fits(
+    shape: &Delta,
+    state: &RecurrentPool,
+    rows: &StateRows,
+    qkv: Tensor,
+    y: &Tensor,
+) -> bool {
     const VEC: u32 = 8;
     shape.conv_dim.is_multiple_of(VEC)
         && (shape.k_heads * shape.k_dim).is_multiple_of(VEC)
         && shape.v_dim.is_multiple_of(FUSED_BV)
         && shape.k_dim.is_multiple_of(16)
-        && state.slot_stride_elems % i64::from(VEC) == 0
+        && rows.keeps(i64::from(VEC))
         && shape.k_dim <= FUSED_BK
         && [qkv.ptr, y.ptr, state.slab.ptr]
             .iter()
@@ -152,6 +157,7 @@ impl Delta {
     ) -> Result<(), Error> {
         #[allow(clippy::cast_precision_loss)]
         let q_scale = (self.k_dim as f32).sqrt().recip();
+        let rows = state.rows(op, state.slab, state.slot_stride_elems, self.v_heads)?;
         let sms = ctx.multiprocessors().unwrap_or(148);
         let tiles = self
             .n
@@ -176,9 +182,7 @@ impl Delta {
             &[
                 qkv.arg(),
                 gates.arg(),
-                state.slab.arg(),
-                state.slot_ids.arg(),
-                state.slot_stride_elems.arg(),
+                rows.arg(),
                 y.arg(),
                 stated(op, self.k_heads)?.arg(),
                 stated(op, self.v_heads)?.arg(),

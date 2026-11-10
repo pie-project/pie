@@ -1,4 +1,5 @@
 #include "ssm/copy.cuh"
+#include "prim/state_rows.cuh"
 
 namespace pie::ssm {
 
@@ -11,9 +12,7 @@ __global__ void gdn_step(
     const float* __restrict__ v,
     const float* __restrict__ g_log,
     const float* __restrict__ beta,
-    StateT*      __restrict__ state_base,
-    const i32* __restrict__ slot_ids,
-    long long slot_stride_elems,
+    StateRows rows,
     float*       __restrict__ out,
     int K_h, int V_h, int K_d, int V_d,
     bool write_state,
@@ -29,8 +28,8 @@ __global__ void gdn_step(
     const int repeat = V_h / K_h;
     const int h_k = h / repeat;
     const int rl = win != nullptr ? r + static_cast<int>(win[3]) : r;
-    const int slot = slot_ids[rl];
-    if (slot < 0) return;
+    const i32* rid = rows.row(rl);
+    if (rid[0] < 0) return;
     const bool fold = folds(write_state, write_state_mask, rl);
 
     const long long qh = ((long long)r * K_h + h_k) * K_d;
@@ -41,9 +40,7 @@ __global__ void gdn_step(
     const float  g_h = __expf(g_log[vh]);
     const float  beta_h = beta[vh];
 
-    StateT* state = state_base
-        + (long long)slot * slot_stride_elems
-        + (long long)h * K_d * V_d;
+    StateT* state = rows.atom<StateT>(rid, h, (long long)K_d * V_d);
     float* out_bh = out + ((long long)r_row * V_h + h) * V_d;
 
     extern __shared__ float smem[];
@@ -91,9 +88,7 @@ __global__ void gdn_step_smem(
     const float* __restrict__ v,
     const float* __restrict__ g_log,
     const float* __restrict__ beta,
-    __nv_bfloat16* __restrict__ state_base,
-    const i32* __restrict__ slot_ids,
-    long long slot_stride_elems,
+    StateRows rows,
     float*       __restrict__ out,
     int K_h, int V_h, int K_d, int V_d,
     bool write_state,
@@ -112,8 +107,8 @@ __global__ void gdn_step_smem(
     const int repeat = V_h / K_h;
     const int h_k = h / repeat;
     const int rl = win != nullptr ? r + static_cast<int>(win[3]) : r;
-    const int slot = slot_ids[rl];
-    if (slot < 0) return;
+    const i32* rid = rows.row(rl);
+    if (rid[0] < 0) return;
     const bool fold = folds(write_state, write_state_mask, rl);
 
     const long long qh = ((long long)r * K_h + h_k) * K_d;
@@ -122,9 +117,7 @@ __global__ void gdn_step_smem(
     const float g_h = __expf(g_log[vh]);
     const float beta_h = beta[vh];
 
-    __nv_bfloat16* state = state_base
-        + (long long)slot * slot_stride_elems
-        + (long long)h * K_d * V_d;
+    __nv_bfloat16* state = rows.atom<__nv_bfloat16>(rid, h, (long long)K_d * V_d);
     float* out_bh = out + ((long long)r_row * V_h + h) * V_d;
 
     extern __shared__ __nv_bfloat16 smem_smem_step[];
@@ -208,9 +201,7 @@ template <int W>
 __global__ void __launch_bounds__(W * 32) gdn_step_fused(
     const bf16* __restrict__ qkv_post,
     const float* __restrict__ gates,
-    __nv_bfloat16* __restrict__ state_base,
-    const i32* __restrict__ slot_ids,
-    long long slot_stride_elems,
+    StateRows rows,
     float* __restrict__ out,
     int K_h, int V_h, int K_d, int V_d, int conv_dim,
     float q_scale,
@@ -250,13 +241,12 @@ __global__ void __launch_bounds__(W * 32) gdn_step_fused(
         if (r >= live_rows) return tl;
         tl.r_row = win != nullptr ? r + static_cast<int>(win[1]) : r;
         const int rl = win != nullptr ? r + static_cast<int>(win[3]) : r;
-        const int slot = slot_ids[rl];
-        if (slot < 0) return tl;
+        const i32* rid = rows.row(rl);
+        if (rid[0] < 0) return tl;
         tl.live = true;
         tl.fold = folds(write_state, write_state_mask, rl);
         tl.j0 = vt * 16 + (lane & 1) * VEC;
-        tl.cell = state_base + (long long)slot * slot_stride_elems
-            + (long long)tl.h * K_d * V_d + tl.j0;
+        tl.cell = rows.atom<__nv_bfloat16>(rid, tl.h, (long long)K_d * V_d) + tl.j0;
         return tl;
     };
     auto issue = [&](const Tile& tl, int stage) {

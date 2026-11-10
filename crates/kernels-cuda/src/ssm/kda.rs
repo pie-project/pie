@@ -213,6 +213,7 @@ pub fn kda(
     debug_assert_eq!(y.dtype, Dtype::F32, "`{OP}` lands an f32 accumulator");
     let shape = Kda::of(OP, mixed, f, b, y, heads, head_dim)?;
     f32_state(OP, state)?;
+    let rows = state.rows(OP, state.slab, state.slot_stride_elems, heads)?;
     seated(OP, state, "kda_step", true, false, false)?;
     let work = shape.work(ctx, OP, state, shape.n)?;
     if ctx.tuning().ssm_kda_step_fused && matches!(shape.head_dim, 32 | 64 | 128) {
@@ -245,9 +246,7 @@ pub fn kda(
                 dt_bias.arg(),
                 gate_floor.arg(),
                 norm_eps.arg(),
-                state.slab.arg(),
-                state.slot_ids.arg(),
-                state.slot_stride_elems.arg(),
+                rows.arg(),
                 y.arg(),
                 stated(OP, shape.heads)?.arg(),
                 stated(OP, shape.head_dim)?.arg(),
@@ -279,9 +278,7 @@ pub fn kda(
             ArgValue::Ptr(staged.v),
             ArgValue::Ptr(staged.gate),
             ArgValue::Ptr(staged.beta),
-            state.slab.arg(),
-            state.slot_ids.arg(),
-            state.slot_stride_elems.arg(),
+            rows.arg(),
             y.arg(),
             stated(OP, shape.heads)?.arg(),
             stated(OP, shape.head_dim)?.arg(),
@@ -338,6 +335,7 @@ pub fn kda_chunked(
     let lanes = requests(OP, mixed)?;
     f32_state(OP, state)?;
     seated(OP, state, "kda_chunked", true, true, true)?;
+    let rows = state.rows(OP, state.slab, state.slot_stride_elems, heads)?;
     if ctx.tuning().ssm_kda_chunked && shape.head_dim == 128 {
         // The tensor-core prep reads the raw rows and forms the norms and
         // gates itself.
@@ -369,10 +367,8 @@ pub fn kda_chunked(
             ArgValue::Ptr(staged.v),
             ArgValue::Ptr(staged.gate),
             ArgValue::Ptr(staged.beta),
-            state.slab.arg(),
-            state.slot_ids.arg(),
+            rows.arg(),
             mixed.indptr.arg(),
-            state.slot_stride_elems.arg(),
             y.arg(),
             stated(OP, shape.heads)?.arg(),
             stated(OP, shape.head_dim)?.arg(),

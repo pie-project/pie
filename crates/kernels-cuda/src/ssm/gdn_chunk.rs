@@ -51,15 +51,13 @@ pub fn gdn_lands_snapshots(ctx: &Ctx, k_dim: u32) -> bool {
 #[repr(C)]
 struct Tc5Params {
     gates: u64,
-    state: u64,
-    slot_ids: u64,
+    rows: StateRows,
     qo_indptr: u64,
     commit_len: u64,
     begin_at: u64,
     write_state_mask: u64,
     out: u64,
     win: u64,
-    slot_stride: i64,
     lanes: i32,
     k_heads: i32,
     v_heads: i32,
@@ -138,15 +136,13 @@ fn gated_delta_chunked_tc5(
     };
     let params = Tc5Params {
         gates: gates.ptr,
-        state: state.slab.ptr,
-        slot_ids: state.slot_ids.ptr,
+        rows: state.rows(op, state.slab, state.slot_stride_elems, shape.v_heads)?,
         qo_indptr: qkv.indptr.ptr,
         commit_len: state.commit_len.ptr,
         begin_at: state.begin_at.ptr,
         write_state_mask: state.write_state_mask.ptr,
         out: y.ptr,
         win,
-        slot_stride: state.slot_stride_elems,
         lanes: int(lanes),
         k_heads: int(shape.k_heads),
         v_heads: int(shape.v_heads),
@@ -187,6 +183,7 @@ fn gated_delta_chunked_fla(
     const LDA: u32 = 68;
     let lanes = requests(op, qkv)?;
     seated(op, state, "ssm_gdn_chunk", true, true, true)?;
+    let rows = state.rows(op, state.slab, state.slot_stride_elems, shape.v_heads)?;
     let (k_dim, v_dim, v_heads, k_heads) = (shape.k_dim, shape.v_dim, shape.v_heads, shape.k_heads);
     // A snapshot cuts a lane's chunk where it lands: one more chunk slot each.
     let slots = shape.n.div_ceil(CH) + lanes + state.snapshots.count;
@@ -240,7 +237,7 @@ fn gated_delta_chunked_fla(
         &[
             qkv.data.arg(),
             gates.arg(),
-            state.slot_ids.arg(),
+            rows.arg(),
             qkv.indptr.arg(),
             state.commit_len.arg(),
             state.begin_at.arg(),
@@ -278,10 +275,8 @@ fn gated_delta_chunked_fla(
             ArgValue::Ptr(w),
             ArgValue::Ptr(u),
             ArgValue::Ptr(pm),
-            state.slab.arg(),
-            state.slot_ids.arg(),
+            rows.arg(),
             qkv.indptr.arg(),
-            state.slot_stride_elems.arg(),
             state.commit_len.arg(),
             state.begin_at.arg(),
             state.write_state.arg(),
@@ -323,6 +318,7 @@ fn gated_delta_chunked_split(
             "this fire lands state snapshots and the three wmma launches have no seat for them",
         ));
     }
+    let rows = state.rows(op, state.slab, state.slot_stride_elems, shape.v_heads)?;
     let (k_dim, v_dim, v_heads, k_heads) = (shape.k_dim, shape.v_dim, shape.v_heads, shape.k_heads);
     let slots = shape.n.div_ceil(CH) + lanes;
     let padded = Delta {
@@ -384,7 +380,7 @@ fn gated_delta_chunked_split(
             ArgValue::Ptr(staged.v),
             ArgValue::Ptr(staged.g_log),
             ArgValue::Ptr(staged.beta),
-            state.slot_ids.arg(),
+            rows.arg(),
             qkv.indptr.arg(),
             state.commit_len.arg(),
             state.begin_at.arg(),
@@ -417,10 +413,8 @@ fn gated_delta_chunked_split(
             ArgValue::Ptr(u),
             ArgValue::Ptr(vnt),
             ArgValue::Ptr(hct),
-            state.slab.arg(),
-            state.slot_ids.arg(),
+            rows.arg(),
             qkv.indptr.arg(),
-            state.slot_stride_elems.arg(),
             state.commit_len.arg(),
             state.begin_at.arg(),
             state.write_state.arg(),
@@ -444,7 +438,7 @@ fn gated_delta_chunked_split(
             ArgValue::Ptr(kb),
             ArgValue::Ptr(vnt),
             ArgValue::Ptr(hct),
-            state.slot_ids.arg(),
+            rows.arg(),
             qkv.indptr.arg(),
             state.commit_len.arg(),
             state.begin_at.arg(),
@@ -544,6 +538,7 @@ pub fn gated_delta_chunked(
     debug_assert_eq!(y.dtype, Dtype::F32, "`{OP}` lands an f32 accumulator");
     let shape = Delta::of(OP, qkv.data, gates, y, k_heads, v_heads, k_dim, v_dim)?;
     let lanes = requests(OP, qkv)?;
+    let rows = state.rows(OP, state.slab, state.slot_stride_elems, v_heads)?;
     let wide =
         k_dim == BK_MAX_FLA && v_dim == BV_FLA && !SERIAL_SCAN.with(core::cell::Cell::get) && !scan;
     #[cfg(feature = "cuda")]
@@ -555,7 +550,7 @@ pub fn gated_delta_chunked(
     if let Some(bv) = scan_bv
         && shape.conv_dim.is_multiple_of(8)
         && (k_heads * k_dim).is_multiple_of(8)
-        && state.slot_stride_elems % 8 == 0
+        && rows.keeps(8)
         && [qkv.data.ptr, y.ptr, state.slab.ptr]
             .iter()
             .all(|&at| aligned16(at))
@@ -585,10 +580,8 @@ pub fn gated_delta_chunked(
                 ArgValue::Ptr(staged.v),
                 ArgValue::Ptr(staged.g_log),
                 ArgValue::Ptr(staged.beta),
-                state.slab.arg(),
-                state.slot_ids.arg(),
+                rows.arg(),
                 qkv.indptr.arg(),
-                state.slot_stride_elems.arg(),
                 y.arg(),
                 stated(OP, k_heads)?.arg(),
                 stated(OP, v_heads)?.arg(),
@@ -631,10 +624,8 @@ pub fn gated_delta_chunked(
                 ArgValue::Ptr(staged.v),
                 ArgValue::Ptr(staged.g_log),
                 ArgValue::Ptr(staged.beta),
-                state.slab.arg(),
-                state.slot_ids.arg(),
+                rows.arg(),
                 qkv.indptr.arg(),
-                state.slot_stride_elems.arg(),
                 y.arg(),
                 stated(OP, k_heads)?.arg(),
                 stated(OP, v_heads)?.arg(),
@@ -688,10 +679,8 @@ pub fn gated_delta_chunked(
             ArgValue::Ptr(staged.v),
             ArgValue::Ptr(staged.g_log),
             ArgValue::Ptr(staged.beta),
-            state.slab.arg(),
-            state.slot_ids.arg(),
+            rows.arg(),
             qkv.indptr.arg(),
-            state.slot_stride_elems.arg(),
             y.arg(),
             stated(OP, v_heads)?.arg(),
             stated(OP, k_dim)?.arg(),

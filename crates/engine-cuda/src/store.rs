@@ -1541,6 +1541,7 @@ impl Pools {
                         dtype,
                     ),
                     conv_stride: stride as i64,
+                    segments: kernels_cuda::Segments::ONE,
                 }),
             });
         }
