@@ -20,6 +20,14 @@ impl DispatchAttn for Run<'_> {
 }
 
 impl Run<'_> {
+    /// What this fire appended to `cache`, for a prefill reading it.
+    fn fresh(&self, cache: poem_ir::ValueId) -> Option<kernels_xla::attn::flash::Appended> {
+        self.appended
+            .iter()
+            .find(|(c, _)| *c == cache)
+            .map(|&(_, a)| a)
+    }
+
     fn requests(&self) -> u32 {
         u32::try_from(self.qo_indptr_host().len().saturating_sub(1)).unwrap_or(u32::MAX)
     }
@@ -298,7 +306,7 @@ impl Run<'_> {
                     self.tensor(*o),
                     self.requests(),
                 )?;
-                crate::lower::attn::attend(self.ctx(), call, pool)
+                crate::lower::attn::attend_fresh(self.ctx(), call, pool, self.fresh(*cache))
             }
 
             Attn::ReplayFloor {
@@ -605,7 +613,7 @@ impl Run<'_> {
                     self.tensor(*o),
                     self.requests(),
                 )?;
-                crate::lower::attn::attend(self.ctx(), call, pool)
+                crate::lower::attn::attend_fresh(self.ctx(), call, pool, self.fresh(*cache))
             }
             Attn::Prefill {
                 q,
@@ -638,7 +646,7 @@ impl Run<'_> {
                     self.tensor(*lse),
                     self.requests(),
                 )?;
-                crate::lower::attn::attend(self.ctx(), call, pool)
+                crate::lower::attn::attend_fresh(self.ctx(), call, pool, self.fresh(*cache))
             }
             Attn::Decode {
                 q,
@@ -698,7 +706,7 @@ impl Run<'_> {
                     self.tensor(*lse),
                     self.requests(),
                 )?;
-                crate::lower::attn::attend(self.ctx(), call, pool)
+                crate::lower::attn::attend_fresh(self.ctx(), call, pool, self.fresh(*cache))
             }
             Attn::Sink {
                 o,
@@ -739,14 +747,21 @@ impl Run<'_> {
                 cache,
                 write_page,
                 write_offset,
-            } => crate::lower::attn::kv_append(
-                self.ctx(),
-                self.tensor(*k),
-                self.tensor(*v),
-                self.pool(*cache),
-                self.tensor(*write_page),
-                self.tensor(*write_offset),
-            ),
+            } => {
+                let read = crate::lower::attn::kv_append(
+                    self.ctx(),
+                    self.tensor(*k),
+                    self.tensor(*v),
+                    self.pool(*cache),
+                    self.tensor(*write_page),
+                    self.tensor(*write_offset),
+                )?;
+                self.appended.retain(|(c, _)| c != cache);
+                if let Some(read) = read {
+                    self.appended.push((*cache, read));
+                }
+                Ok(())
+            }
             Attn::KvAppend {
                 k: plane,
                 v: None,

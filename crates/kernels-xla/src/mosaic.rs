@@ -361,6 +361,21 @@ impl Body {
         Ok(self.op1("math.exp", &[v], "fastmath = #arith.fastmath<none>", t))
     }
 
+    /// `v` rotated along `axis` by the i32 `by` (`tpu.dynamic_rotate`):
+    /// element `i` moves to `(i + by) mod n`.
+    pub fn rotate(&mut self, v: V, by: V, axis: usize) -> Built<V> {
+        let (d, e) = self.vec_of(v)?;
+        if self.ty(by) != &MTy::I32 || axis >= d.len() {
+            return bad(format!("a rotation of {} by {}", self.ty(v), self.ty(by)));
+        }
+        Ok(self.op1(
+            "tpu.dynamic_rotate",
+            &[v, by],
+            &format!("dimension = {axis} : si32"),
+            MTy::Vector(d, e),
+        ))
+    }
+
     /// A 2-d vector transposed (`tpu.transpose`).
     pub fn transpose(&mut self, v: V) -> Built<V> {
         let (d, e) = self.vec_of(v)?;
@@ -880,15 +895,22 @@ impl Body {
     /// The sum of a 2-d f32 vector over its rows, kept as `[1, cols]`
     /// (`vector.multi_reduction` over axis 0).
     pub fn sum_rows(&mut self, v: V) -> Built<V> {
+        self.reduce_cols(v, false)
+    }
+
+    /// The maximum (`max`) or sum of a 2-d f32 vector over its rows, kept
+    /// as `[1, cols]` (`vector.multi_reduction` over axis 0).
+    pub fn reduce_cols(&mut self, v: V, max: bool) -> Built<V> {
         let (d, e) = self.vec_of(v)?;
         if d.len() != 2 || e != Elem::F32 {
-            return bad(format!("a column sum of {}", self.ty(v)));
+            return bad(format!("a column reduction of {}", self.ty(v)));
         }
-        let init = self.splat_f(&[d[1]], e, 0.0)?;
+        let init = self.splat_f(&[d[1]], e, if max { f64::NEG_INFINITY } else { 0.0 })?;
+        let kind = if max { "maximumf" } else { "add" };
         let r = self.op1(
             "vector.multi_reduction",
             &[v, init],
-            "kind = #vector.kind<add>, reduction_dims = array<i64: 0>",
+            &format!("kind = #vector.kind<{kind}>, reduction_dims = array<i64: 0>"),
             MTy::Vector(vec![d[1]], e),
         );
         self.shape_cast(r, &[1, d[1]])
