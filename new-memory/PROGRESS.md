@@ -677,3 +677,19 @@ The `new-memory/` directory is bookkeeping and is removed before anything lands 
   hybrid + windowed; dense 1 ulp accepted); scattered + evacuate + release mid-decode bitwise; 4-piece records bitwise.
 - Open: window lists not trimmed (kept whole in the kv list), snapshots, on-device test of tiers / group CoW /
   slot_copies, weight streaming. Build needs PIE_SLANGC=/root/slang/2026.17/bin/slangc on this machine.
+
+### M49 — 2026-11-10: IT round 5 (sm_120) + auto-mode fix
+- Fix `sc/it-weights-auto` 1d98747c0: engines with weight shapes report weights_resident=false (weights start on
+  host), so auto always resolved to streaming; now auto starts held and boot_cache decides fit.
+- Real MoE (Qwen3-30B-A3B cut to the mini shape, real weights; the full 57 GiB model is OOM-killed by the 62 GB
+  container because the engine pins a full host copy of the experts at load): off = held before the first fire,
+  576 MiB host freed, host=0, tokens + top-4 bits = base, 481 vs 493 tok/s. on (512 MiB): runs, residency changes
+  per tick, 208-219 tok/s, sheds weights before tier-pressure.
+- Qwen3.5 record in 18 pieces (chunk-bytes): beam/MTP/fork/resume/grow-evacuate-release identical to default chunks.
+- Host tier e2e (M43): sequential sessions parked/restored 49/97, all identical (Qwen3.5, gemma).
+- NEW PROBLEMS: (1) first boot with experts on host took >13 min arming at max_forward_tokens 5120 (every arming
+  fire reads experts per route from host); (2) engine pins a full host copy of routed experts at load -> large MoE
+  cannot load in limited RAM; (3) MTP k=2 under kv pressure hangs ("nothing is left to discard", short never met);
+  (4) concurrent decodes at a small budget stall instead of rotating sessions through host; (5) gemma (no recurrent
+  state) refused with NoRsSlots "state pool starved ... 233 free"; (6) prefix-cache pages pushed off device are
+  dropped instead of demoted to host/disk (disk journal stays empty).
