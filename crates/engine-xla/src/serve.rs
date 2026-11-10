@@ -1617,7 +1617,8 @@ impl Shell {
         let mask = inputs.raw(handles, Dtype::U8, rows, columns, mask_bytes);
         let mask_enabled = inputs.raw(handles, Dtype::U8, rows, 1, enabled_bytes);
 
-        let (readout_rows, readout_layout) = readout_table(&composition, lanes, real)?;
+        let (readout_rows, readout_layout, readout_indptr) =
+            readout_table(&composition, lanes, real)?;
         self.readouts.insert(readout_rows.len() as u32);
         let tokens_at = inputs.pack_offset();
         let tokens_t = inputs.i32s(handles, &tokens, 1);
@@ -1810,11 +1811,31 @@ impl Shell {
         let slots = self.slots(fire_rows);
         let planes = self.planes(&composition, &slots, readout_rows.len() as u32)?;
 
+        // Each window's readouts (its lanes'): a window short of every lane
+        // cuts its readout-rowed values to them, so they reach the text.
+        let readout_spans: Vec<(u32, u32)> = windows
+            .all()
+            .iter()
+            .map(|w| {
+                let at = |lane: u32| {
+                    readout_indptr
+                        .get(lane as usize)
+                        .or(readout_indptr.last())
+                        .copied()
+                        .unwrap_or(0)
+                };
+                (
+                    at(w.span.lane_offset),
+                    at(w.span.lane_offset + w.span.lanes),
+                )
+            })
+            .collect();
         let bindings = FireBindings {
             tokens: tokens_t,
             positions: positions_t,
             cache_rows: cache_rows_t,
             readout_rows: readout_t,
+            readout_indptr,
             adapter_routes: adapter_t,
             mrope_positions: mrope_t,
             patches: patch_bindings,
@@ -1834,7 +1855,7 @@ impl Shell {
         // descriptor, every input's shape, the page bound and the readout.
         let key = *blake3::hash(
             format!(
-                "{descriptor:?}|{windows:?}|{}|{max_pages}|{}|{}|{rs_active}|{dit_key}|{:?}",
+                "{descriptor:?}|{windows:?}|{}|{max_pages}|{}|{}|{rs_active}|{dit_key}|{:?}|{readout_spans:?}",
                 inputs.shapes(),
                 readout_rows.len(),
                 self.gathers_readout,
@@ -1855,7 +1876,7 @@ impl Shell {
                 descriptor.lanes.iter().map(|l| (l.class, l.word)).collect();
             *blake3::hash(
                 format!(
-                    "{:?}|{}|{}|{lanes:?}|{}|{}|{max_pages}|{}|{}|{rs_active}",
+                    "{:?}|{}|{}|{lanes:?}|{}|{}|{max_pages}|{}|{}|{rs_active}|{readout_spans:?}",
                     descriptor.classes,
                     descriptor.rows,
                     descriptor.bucket,
@@ -2526,10 +2547,11 @@ struct PlaneShape {
     dtype: Dtype,
 }
 
-type ReadoutTable = (Vec<i32>, Vec<(u32, u32)>);
+type ReadoutTable = (Vec<i32>, Vec<(u32, u32)>, Vec<u32>);
 
-/// The token rows whose logits come back, and per real lane where its rows
-/// sit in that list. Padding lanes read their last row so the table is as
+/// The token rows whose logits come back, per real lane where its rows
+/// sit in that list, and where each of the fire's lanes' rows start in it
+/// (then their end). Padding lanes read their last row so the table is as
 /// long as the fire's lanes (its length is part of the program).
 fn readout_table(
     composition: &poem_exec::fire::Composition,
@@ -2538,7 +2560,9 @@ fn readout_table(
 ) -> Result<ReadoutTable> {
     let mut table: Vec<i32> = Vec::with_capacity(composition.lanes().len());
     let mut layout: Vec<(u32, u32)> = vec![(0, 0); real];
+    let mut indptr: Vec<u32> = Vec::with_capacity(composition.lanes().len() + 1);
     for row in composition.lanes() {
+        indptr.push(table.len() as u32);
         if row.rows == 0 {
             continue;
         }
@@ -2568,7 +2592,8 @@ fn readout_table(
                 .map(|&at| i32::try_from(at).unwrap_or(i32::MAX)),
         );
     }
-    Ok((table, layout))
+    indptr.push(table.len() as u32);
+    Ok((table, layout, indptr))
 }
 
 /// Each submitted lane's clips, checked: one submission per lane, no box
