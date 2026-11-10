@@ -250,10 +250,6 @@ impl ExpertShape {
 pub fn streamed_experts(trace: &poem_ir::Trace) -> Vec<usize> {
     use poem_ir::residency::{Residency, residency};
     use poem_ir::{Def, Linear, Operands, Operation};
-    // The HIP selects take no table that names a pool slot yet.
-    if cfg!(feature = "rocm") {
-        return Vec::new();
-    }
     let classes = residency(trace);
     let mut out = Vec::new();
     let mut inputs = Vec::new();
