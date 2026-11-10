@@ -874,6 +874,10 @@ impl PreparedLoad<'_> {
                     &run_caps,
                     &run_passes,
                     &pools.bands(),
+                    pools
+                        .layout()
+                        .window
+                        .map_or(0, |_| pools.window_paging().pages_per_slot),
                 )
             })
             .collect::<Result<Vec<_>>>()?;

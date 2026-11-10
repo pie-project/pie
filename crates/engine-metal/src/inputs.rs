@@ -301,13 +301,21 @@ impl Inputs {
         run_caps: &[u32],
         run_passes: &[u32],
         bands: &[u32],
+        pages_per_lane: u32,
     ) -> Result<Inputs> {
         let width = u64::from(bands.iter().sum::<u32>().max(1));
         let rows = u64::from(budget.max_tokens);
         let lanes = u64::from(budget.max_lanes);
-        let pages = u64::from(budget.max_lanes) * u64::from(paging.pages_per_slot);
+        // A space's page table holds the most pages a lane's table does in
+        // any space: a window list of `T_w`-token slots takes more pages
+        // than the kv list where `T_w` is the smaller.
+        let paged = Paging {
+            pages_per_slot: paging.pages_per_slot.max(pages_per_lane),
+            ..paging
+        };
+        let pages = u64::from(budget.max_lanes) * u64::from(paged.pages_per_slot);
         let window_ints = window_ints(
-            budget, paging, spaces, classes, max_runs, gathered, run_caps, run_passes,
+            budget, paged, spaces, classes, max_runs, gathered, run_caps, run_passes,
         );
 
         let mut at = 0u64;

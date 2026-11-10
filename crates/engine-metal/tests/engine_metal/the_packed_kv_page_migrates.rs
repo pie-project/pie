@@ -220,6 +220,7 @@ fn migrate_case(rig: &mut Rig, head_dim: usize) {
         slots: vec![SlotLayout::List {
             tokens: PAGE_SIZE,
             bytes: slot,
+            window: None,
             rows: vec![TokenRun {
                 row: RowId::Cache(0),
                 layer: None,

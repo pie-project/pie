@@ -90,14 +90,22 @@ struct Fixture {
 }
 
 fn fixture(model: &str) -> Fixture {
+    fixture_of(model, None)
+}
+
+/// The model's fixture, cut to `layers` where stated.
+fn fixture_of(model: &str, layers: Option<u32>) -> Fixture {
     let package = poem_compiler::catalog::package_of(model).expect("the model is listed");
-    let deploy = poem_compiler::catalog::one_rank(Dtype::Bf16, Dtype::Bf16);
+    let deploy = poem::star::Deploy {
+        layers,
+        ..poem_compiler::catalog::one_rank(Dtype::Bf16, Dtype::Bf16)
+    };
     let trace = package
         .trace(model, &deploy, model, Platform::Metal)
         .unwrap_or_else(|why| panic!("`{model}` traces: {why:#}"));
     let dir = std::env::temp_dir().join(format!("pie-bm-pool-{}", std::process::id()));
     std::fs::create_dir_all(&dir).expect("the fixture dir");
-    let container = dir.join(format!("{model}.zt"));
+    let container = dir.join(format!("{model}-{}.zt", layers.unwrap_or(0)));
     if !container.exists() {
         write_checkpoint(&container, &trace);
     }
@@ -112,6 +120,10 @@ fn fixture(model: &str) -> Fixture {
 }
 
 fn load(fixture: &Fixture) -> Shell {
+    load_with(fixture, CONTEXT)
+}
+
+fn load_with(fixture: &Fixture, context: u32) -> Shell {
     Shell::load(Boot {
         trace: fixture.trace.clone(),
         contract: &fixture.contract,
@@ -121,7 +133,7 @@ fn load(fixture: &Fixture) -> Shell {
         voxels: None,
         profile: None,
         page_size: PAGE,
-        context: CONTEXT,
+        context,
         slots: SEATS,
         kv_budget: None,
         memory_share: engine::load::DEFAULT_DEVICE_MEMORY_SHARE,
@@ -489,4 +501,110 @@ fn a_reserved_hybrid_pool_states_shared_chunks() {
     // SAFETY: nothing ran on this pool.
     unsafe { pools.release_segments(1) }.expect("one goes back");
     assert_eq!(pools.chunk_facts().segments.committed, 1);
+}
+
+/// A window list the runtime trims (CONTRACT-BC 19, 21): pages wholly behind
+/// the window read the null chunk (ref 0). One lane of a 1-layer windowed
+/// miniature prefills past its 512-row window and decodes on; its logits are
+/// the same bits whether the window list holds every page (seat-addressed)
+/// or only the window's, scattered over chunks by slot ref and trimmed as
+/// the runtime trims, each step.
+#[test]
+fn a_trimmed_window_list_reads_as_the_whole_one() {
+    trimmed_window("gemma4-e4b-mini-l1", None, 1024, 700);
+}
+
+/// As [`a_trimmed_window_list_reads_as_the_whole_one`], a window list of
+/// `T_w` = 16-token slots beside 32-token kv pages (CONTRACT-BC 21): four
+/// layers of a sliding-window decoder past its 2048-row window.
+#[test]
+fn a_trimmed_window_list_of_smaller_slots_reads_as_the_whole_one() {
+    trimmed_window("muse-glimmer-30b-mini-l8", Some(4), 2560, 2200);
+}
+
+fn trimmed_window(model: &str, layers: Option<u32>, context: u32, prompt: u32) {
+    use engine_metal::store::layout::WINDOW;
+
+    if !engine_metal::device::present() {
+        eprintln!("skipping: no Metal device");
+        return;
+    }
+    let fixture = fixture_of(model, layers);
+    let prompt: Vec<u32> = (0..prompt).map(|at| (at * 37 + 11) % 256).collect();
+    const STEPS: usize = 24;
+    let run = |trimmed: bool| -> Vec<Vec<f32>> {
+        let mut shell = load_with(&fixture, context);
+        let facts = shell.pool_chunk_facts();
+        eprintln!(
+            "{model}: shapes {:?}",
+            facts
+                .shapes
+                .iter()
+                .map(|s| (s.id.0, s.kind, s.slot_bytes, s.slots_per_chunk))
+                .collect::<Vec<_>>()
+        );
+        let layout = shell.pool_layout();
+        let window = facts.shape(WINDOW).expect("a window list");
+        let engine::chunk::SlotKind::List {
+            tokens,
+            window: Some(rows),
+            ..
+        } = window.kind
+        else {
+            panic!("the window list states its window: {:?}", window.kind);
+        };
+        let per = window.slots_per_chunk;
+        let first =
+            (1 + layout.seat_chunks()).div_ceil(facts.segment_chunks) * facts.segment_chunks;
+        let pages = context.div_ceil(tokens);
+        let commit = (first + pages.div_ceil(per) + 1).div_ceil(facts.segment_chunks);
+        shell.commit_segments(commit).expect("the segments commit");
+        // Page k of the lane in chunk first + k / per, slots strided in it.
+        let slot_ref = |k: u32| (first + k / per) * per + (k * 7 + 3) % per;
+        let mut rows_out = Vec::new();
+        let mut held = 0u32;
+        let mut fed: Vec<u32> = prompt.clone();
+        for step in 0..=STEPS {
+            let chunks: Vec<Vec<u32>> = if step == 0 {
+                fed.chunks(256).map(<[u32]>::to_vec).collect()
+            } else {
+                vec![fed.clone()]
+            };
+            let mut last = Vec::new();
+            for tokens_in in chunks {
+                let n = tokens_in.len() as u32;
+                let after = held + n;
+                // Trimmed as the runtime trims: a page whose last row lies
+                // below `committed_end - window` reads the null chunk.
+                let table: Vec<u32> = (0..after.div_ceil(tokens))
+                    .map(|k| {
+                        let last_row = (k + 1) * tokens - 1;
+                        if trimmed && last_row + rows < held {
+                            0
+                        } else {
+                            slot_ref(k)
+                        }
+                    })
+                    .collect();
+                let seated = Seated {
+                    held: Some(held),
+                    refs: trimmed,
+                    window: if trimmed { &table } else { &[] },
+                    ..Seated::of(Lane {
+                        slot: 0,
+                        word: word(&fixture.trace, n),
+                        tokens: &tokens_in,
+                    })
+                };
+                last = shell.fire_seated(&[seated]).expect("the fire lands");
+                held = after;
+            }
+            fed = vec![argmax(&last[0])];
+            rows_out.extend(last);
+        }
+        rows_out
+    };
+    let whole = run(false);
+    let trimmed = run(true);
+    same(&format!("{model}: trimmed against whole"), &trimmed, &whole);
 }

@@ -278,6 +278,11 @@ impl PoolPort for RegistryPool {
             if need.kv_pages > 0 {
                 self.with_kv_tagged("planner-grow", |kv| kv.note_short(need.kv_pages));
             }
+            // State, window and rs-list slots come from the same pool: the
+            // walker commits for what their waiters are short too.
+            if !need.rs.is_zero() {
+                self.with_rs(|rs| rs.note_short_shared(need.rs));
+            }
             return shared.can_grow() && {
                 shared.wake();
                 true
@@ -325,6 +330,11 @@ impl PoolPort for RegistryPool {
     fn reserve_rs(&self, need: RsUnits) -> Option<crate::store::rs::RsGrant> {
         let (grant, due) = self.with_rs(|rs| {
             let grant = rs.reserve(need);
+            // A shared pool's waiter got what it was short: its shortfall
+            // no longer asks the segment walker for more.
+            if grant.is_some() && self.shared.is_some() {
+                rs.note_short_shared(RsUnits::default());
+            }
             let due = self
                 .grow
                 .as_ref()
