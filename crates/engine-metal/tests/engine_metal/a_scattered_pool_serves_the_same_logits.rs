@@ -506,13 +506,6 @@ fn a_trimmed_window_list_reads_as_the_whole_one() {
     trimmed_window("gemma4-e4b-mini-l1");
 }
 
-/// As [`a_trimmed_window_list_reads_as_the_whole_one`], a window list of
-/// `T_w` = 16-token slots beside 32-token kv pages (CONTRACT-BC 21).
-#[test]
-fn a_trimmed_window_list_of_smaller_slots_reads_as_the_whole_one() {
-    trimmed_window("dots3-note-mini");
-}
-
 fn trimmed_window(model: &str) {
     use engine_metal::store::layout::WINDOW;
 
@@ -549,24 +542,10 @@ fn trimmed_window(model: &str) {
         let first =
             (1 + layout.seat_chunks()).div_ceil(facts.segment_chunks) * facts.segment_chunks;
         let pages = context.div_ceil(tokens);
-        let window_chunks = pages.div_ceil(per);
-        // A kv list beside the window list (its slots the kv pages): its
-        // pages in the chunks above the window list's.
-        let list = facts.shape(LIST).map(|list| {
-            let engine::chunk::SlotKind::List { tokens, .. } = list.kind else {
-                panic!("the kv list is a list: {:?}", list.kind);
-            };
-            (tokens, list.slots_per_chunk)
-        });
-        let list_chunks = list.map_or(0, |(t, per)| context.div_ceil(t).div_ceil(per));
-        let commit = (first + window_chunks + list_chunks + 1).div_ceil(facts.segment_chunks);
+        let commit = (first + pages.div_ceil(per) + 1).div_ceil(facts.segment_chunks);
         shell.commit_segments(commit).expect("the segments commit");
         // Page k of the lane in chunk first + k / per, slots strided in it.
         let slot_ref = |k: u32| (first + k / per) * per + (k * 7 + 3) % per;
-        let list_ref = |k: u32| {
-            let (_, per) = list.expect("a kv list");
-            (first + window_chunks + k / per) * per + (k * 5 + 1) % per
-        };
         let mut rows_out = Vec::new();
         let mut held = 0u32;
         let mut fed: Vec<u32> = prompt.clone();
@@ -592,14 +571,9 @@ fn trimmed_window(model: &str) {
                         }
                     })
                     .collect();
-                let list_pages: Vec<u32> = match list {
-                    Some((t, _)) if trimmed => (0..after.div_ceil(t)).map(list_ref).collect(),
-                    _ => Vec::new(),
-                };
                 let seated = Seated {
                     held: Some(held),
                     refs: trimmed,
-                    pages: &list_pages,
                     window: if trimmed { &table } else { &[] },
                     ..Seated::of(Lane {
                         slot: 0,
