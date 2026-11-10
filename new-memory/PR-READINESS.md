@@ -7,7 +7,7 @@ Branch today: 432 commits ahead of main, 782 files, +86k / -13k. Main merged in 
 |---|---|---|---|
 | A1 | CUDA quantized expert banks: NVFP4, affine u4/u2, block FP8, W4A8/W4A4, biased selects (MXFP4 done M67) | L40S | in progress |
 | A2 | CUDA held load with a pool too small: illegal address at boot instead of the clean refusal (IT r9) | L40S | assigned |
-| A3 | Runtime boot fit counts only committed segments (Metal) | RT3 | in progress |
+| A3 | Runtime boot fit counts only committed segments (Metal) | RT3 | done M73 (Metal device run pending) |
 | A4 | ROCm quantized expert banks (after A1) | AMD | queued |
 | A5 | ROCm generated region kernels: flip + delete hand rules (b8/b64 in-process numbers pending) | AMD | in progress |
 | A6 | XLA: Mosaic page copy / flash / kv append on the pool; speed vs main; MoE result varies with pool chunk count (CUDA plugin) | TPU | in progress |
