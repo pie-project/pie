@@ -2356,6 +2356,18 @@ fn the_decode_step_kernel_matches_the_xla_form() {
             53,
         ),
     ] {
+        let _ = std::panic::catch_unwind(|| step_against_xla(&g, rows, seed));
+    }
+    for (g, rows, seed) in [(
+        Gdn {
+            hk: 16,
+            hv: 16,
+            dk: 128,
+            dv: 128,
+        },
+        40usize,
+        51u64,
+    )] {
         step_against_xla(&g, rows, seed);
     }
 }
@@ -2442,5 +2454,28 @@ fn step_against_xla(g: &Gdn, rows: usize, seed: u64) {
     );
     // Every slot but the sink matches; the sink holds garbage.
     let n = (slots - 1) * g.stride();
+    let worst = |a: &[f32], b: &[f32]| {
+        a.iter()
+            .zip(b)
+            .map(|(x, y)| (x - y).abs())
+            .fold(0f32, f32::max)
+    };
+    eprintln!(
+        "{} heads, {rows} lanes: banks against the token walk: xla form {:.3e}, step kernel {:.3e}; kernel against xla {:.3e}",
+        g.hv,
+        worst(&bank_xla[..n], &want[..n]),
+        worst(&bank_k[..n], &want[..n]),
+        worst(&bank_k[..n], &bank_xla[..n])
+    );
+    for s in 0..slots - 1 {
+        let r = s * g.stride()..(s + 1) * g.stride();
+        let e = worst(&bank_k[r.clone()], &bank_xla[r]);
+        if e > 1e-2 {
+            eprintln!(
+                "  slot {s}: kernel against xla {e:.3e}, lane {:?}",
+                slot_of.iter().position(|&x| x == s as i32)
+            );
+        }
+    }
     assert_close(&bank_k[..n], &bank_xla[..n], 4e-3, 1e-2);
 }
