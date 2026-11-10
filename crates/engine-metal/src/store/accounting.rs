@@ -72,22 +72,13 @@ impl Accounting {
         }
     }
 
-    #[must_use]
-    pub fn weight_headroom(&self) -> u64 {
-        self.ceiling
-            .saturating_sub(self.scratch)
-            .saturating_sub(self.floor)
-            .saturating_sub(self.minimum)
-    }
-
-    pub fn admit(&self, budget: Option<u64>, utilization: f64) -> Result<()> {
+    /// Refuses a load whose dense weights, arena scratch and the driver's
+    /// floor leave the kv pool less than it needs. Dense weights always live
+    /// in device memory, so the refusal names their bytes and the remedies.
+    pub fn admit(&self, utilization: f64) -> Result<()> {
         if self.pool >= self.minimum {
             return Ok(());
         }
-        let budget = match budget {
-            Some(bytes) => format!("{bytes} bytes"),
-            None => "uncapped (the whole table resident)".to_string(),
-        };
         let scratch = if self.scratch > 0 {
             format!(
                 ", the arena scratch the compiled axes reserve takes {} (sized by `[engine] \
@@ -100,16 +91,15 @@ impl Accounting {
         Err(Fault::Residency(format!(
             "the device does not hold this deployment: recommendedMaxWorkingSetSize is \
              {working_set} bytes, other processes held {elsewhere} of it when this load began, \
-             and `[model] device_memory_share` = {utilization} allows pie {ceiling}; this load's resident weight tier takes {weights} \
-             (`device_weight_budget` {budget}){scratch} and the driver's safety floor holds \
-             back {floor}, leaving {pool} bytes for the kv pool — and the pool needs \
-             {minimum} resident (`[model] device_kv_budget`, or one sequence at the \
-             declared context when that is omitted). On Apple Silicon a GPU-touched \
-             Shared page is WIRED and the pager never evicts it (.wiki/alto/streaming.md), \
-             so this is a hard bound and not a hint: lower `[model] max_context` or `[model] \
-             slots`, lower `[engine] max_forward_tokens`, raise `[model] \
-             device_memory_share`, or state a smaller `[model] device_weight_budget` to \
-             stream the weight tier down.",
+             and `[model] device_memory_share` = {utilization} allows pie {ceiling}; the \
+             weights take {weights} (dense weights always live in device memory){scratch} and the \
+             driver's safety floor holds back {floor}, leaving {pool} bytes for the kv pool, \
+             which needs {minimum} (`[model] device_kv_budget`, or one sequence at the \
+             declared context when that is omitted). On Apple Silicon a GPU-touched Shared \
+             page is WIRED and the pager never evicts it, so this is a hard bound: serve a \
+             quantized deployment of the model (its dense weights in fewer bytes), lower \
+             `[model] max_context` or `[engine] max_forward_tokens`, or raise `[model] \
+             device_memory_share`.",
             working_set = self.working_set,
             elsewhere = self.elsewhere,
             ceiling = self.ceiling,
@@ -131,47 +121,19 @@ mod tests {
     #[test]
     fn accounting_every_case() {
         the_arena_scratch_counts_against_the_ceiling();
-        the_weight_headroom_leaves_the_arena_scratch_out();
         a_load_under_the_ceiling_is_admitted_and_one_over_it_refuses();
         a_non_finite_fraction_is_read_as_the_whole_working_set();
         what_other_processes_hold_comes_off_the_ceiling();
-    }
-
-    fn the_weight_headroom_leaves_the_arena_scratch_out() {
-        let ws = 21_800 * (GIB / 1000);
-        let util = 0.9;
-        let without = Accounting::of(ws, 0, util, 11 * GIB, 4 * GIB);
-        let with = Accounting::with_scratch(ws, 0, util, 11 * GIB, 6 * GIB, 4 * GIB);
-        assert_eq!(with.weight_headroom(), without.weight_headroom() - 6 * GIB);
-        // Weights that fit the headroom priced without scratch do not fit the
-        // load that wires it: the check must see the scratch to re-plan them.
-        let weights = without.weight_headroom();
-        assert!(
-            Accounting::of(ws, 0, util, weights, 4 * GIB)
-                .admit(Some(weights), util)
-                .is_ok()
-        );
-        assert!(
-            Accounting::with_scratch(ws, 0, util, weights, 6 * GIB, 4 * GIB)
-                .admit(Some(weights), util)
-                .is_err()
-        );
-        let shrunk = with.weight_headroom();
-        assert!(
-            Accounting::with_scratch(ws, 0, util, shrunk, 6 * GIB, 4 * GIB)
-                .admit(Some(shrunk), util)
-                .is_ok()
-        );
     }
 
     fn the_arena_scratch_counts_against_the_ceiling() {
         let ws = 21_800 * (GIB / 1000);
         let util = DEFAULT_DEVICE_MEMORY_SHARE;
         let without = Accounting::of(ws, 0, util, 11 * GIB, 4 * GIB);
-        assert!(without.admit(Some(11 * GIB), util).is_ok());
+        assert!(without.admit(util).is_ok());
         let with = Accounting::with_scratch(ws, 0, util, 11 * GIB, 6 * GIB, 4 * GIB);
         let why = with
-            .admit(Some(11 * GIB), util)
+            .admit(util)
             .expect_err("11 + 6 + 4 GiB is over ~19.6");
         let said = format!("{why}");
         assert!(
@@ -186,19 +148,19 @@ mod tests {
         let util = DEFAULT_DEVICE_MEMORY_SHARE;
         let ok = Accounting::of(ws, 0, util, 11 * GIB, 4 * GIB);
         assert!(
-            ok.admit(Some(11 * GIB), util).is_ok(),
+            ok.admit(util).is_ok(),
             "11 + 4 GiB fits under ~19.6"
         );
         let over = Accounting::of(ws, 0, util, 18 * GIB, 4 * GIB);
         let why = over
-            .admit(Some(18 * GIB), util)
+            .admit(util)
             .expect_err("18 + 4 GiB over the ceiling");
         let said = format!("{why}");
         for needle in [
             "recommendedMaxWorkingSetSize",
             "device_memory_share",
             "WIRED",
-            "device_weight_budget",
+            "quantized deployment",
         ] {
             assert!(said.contains(needle), "the refusal names {needle}: {said}");
         }

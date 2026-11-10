@@ -1,4 +1,3 @@
-use std::cell::RefCell;
 use std::collections::BTreeMap;
 use std::path::Path;
 
@@ -10,7 +9,7 @@ use checkpoint::file::read::parse_metadata;
 use checkpoint::file::serve;
 use checkpoint::file::serve::Artifact;
 use checkpoint::file::zt;
-use checkpoint::plan::{LoadPlan, StorageTarget, compile, compile_streaming};
+use checkpoint::plan::{LoadPlan, StorageTarget, compile};
 use checkpoint::serving::{self, Stamp};
 use checkpoint::types::{BackendKind, ScaleForm, TensorId};
 use kernels_metal::Tensor;
@@ -18,9 +17,7 @@ use poem_ir::{Dtype, ParamSource, Trace};
 
 use crate::device::{Buffer, Context, Handles};
 use crate::error::{Fault, Result};
-use crate::experts::{Attachments, Plan, Source, Tier};
-use crate::gather;
-use crate::host_source::HostSource;
+use crate::experts::Plan;
 use crate::mapping::{self, Mapping};
 use crate::run::{WeightRow, WeightTable};
 use crate::weight_store::Store;
@@ -37,11 +34,7 @@ pub struct AdapterPlane<'a> {
 pub struct Weights {
     store: Store,
     mapped: Vec<Buffer>,
-    /// The bytes of the planes the mapped windows bind in place.
-    bound: u64,
     table: WeightTable,
-    tier: Option<RefCell<Tier>>,
-    rows: Option<RefCell<gather::Slab>>,
     banks: BTreeMap<String, Bank>,
     residue: (usize, u64),
     decoded: Vec<Buffer>,
@@ -117,7 +110,6 @@ impl Weights {
         plan: &Plan,
     ) -> Result<Weights> {
         readable_plane_orders(trace)?;
-        let gather = plan.gathered();
 
         serves_this_deployment(path, trace.platform.backend(), &trace.name)?;
 
@@ -130,7 +122,7 @@ impl Weights {
         let target = StorageTarget::for_backend(BackendKind::Metal, 0, 1);
         let landing = compile(&metadata, contract, target.clone())?;
 
-        let places = places(trace, plan, plan.gathered())?;
+        let places = places(trace)?;
         let index: BTreeMap<&str, usize> = trace
             .params
             .iter()
@@ -146,7 +138,6 @@ impl Weights {
             if plan.weights_held() && !plan.whole_weights() {
                 crate::store::streamed::streamed(trace)
                     .into_iter()
-                    .filter(|&at| !places[at].streamed)
                     .collect()
             } else {
                 std::collections::BTreeSet::new()
@@ -161,7 +152,6 @@ impl Weights {
             snapshot,
             target.clone(),
             path,
-            plan,
             &places,
             &pairings,
             &apart,
@@ -170,20 +160,12 @@ impl Weights {
             Err(None) => {}
             Err(Some(why)) => {
                 let held = std::fs::metadata(path).map(|it| it.len()).unwrap_or(0);
-                let staging = std::env::temp_dir();
                 eprintln!(
                     "engine-metal: {} loads cold — {why}.\n\
-                     engine-metal: that road reads all {:.2} GiB of it through the executor \
-                     and stages {:.2} GiB of routed bands under {}, where {} free; the warm \
-                     arm would have read no weight byte at all.",
+                     engine-metal: that road reads all {:.2} GiB of it through the executor; \
+                     the warm arm would have read no weight byte at all.",
                     path.display(),
                     held as f64 / (1u64 << 30) as f64,
-                    plan.source_bytes() as f64 / (1u64 << 30) as f64,
-                    staging.display(),
-                    match crate::host_source::free_bytes(&staging) {
-                        Some(free) => format!("{:.2} GiB is", free as f64 / (1u64 << 30) as f64),
-                        None => "an unknown amount is".to_string(),
-                    },
                 );
             }
         }
@@ -198,7 +180,7 @@ impl Weights {
             let mut at = 0u64;
             for (index, place) in packed.iter_mut().enumerate() {
                 place.offset = at;
-                if own.contains(&index) && !place.streamed {
+                if own.contains(&index) {
                     place.reserved = 0;
                 }
                 at += place.reserved;
@@ -207,34 +189,19 @@ impl Weights {
         };
         let mut hosted = BTreeMap::new();
         for &index in &own {
-            if !places[index].streamed {
-                hosted.insert(index, Buffer::zeroed(device, places[index].full)?);
-            }
+            hosted.insert(index, Buffer::zeroed(device, places[index].full)?);
         }
         let spans: Vec<(u64, u64)> = places.iter().map(|p| (p.offset, p.reserved)).collect();
         let mut store = Store::zeroed(device, &spans, device.max_buffer())?;
 
-        let mut host = HostSource::open(plan.source_bytes())?;
-        let mut table = HostSource::open(gather.source_bytes())?;
         let mut sink = Landing {
             store: &mut store,
             hosted: &mut hosted,
-            host: &mut host,
-            table: &mut table,
-            plan,
-            gather,
             places: &places,
             index: &index,
             landed: vec![false; places.len()],
         };
-        let landed = if plan.streams() || gather.gathers() {
-            let streaming = compile_streaming(&metadata, contract, target)?;
-            Execution::new(&streaming, snapshot)
-                .streaming()
-                .sink(&mut sink)
-                .run()?;
-            sink.landed
-        } else {
+        let landed = {
             let mut scratch = vec![0u8; usize::try_from(landing.memory.arena_bytes()).unwrap_or(0)];
             let mut backing: &mut [u8] = &mut scratch;
             Execution::new(&landing, snapshot)
@@ -291,32 +258,10 @@ impl Weights {
                 None => WeightRow::Dense(dense(at)?),
             }));
         }
-        let offsets: Vec<u64> = places.iter().map(|place| place.offset).collect();
-        let tier = plan
-            .streams()
-            .then(|| {
-                Tier::open(plan, &store, Source::landed(plan, host), &offsets).map(RefCell::new)
-            })
-            .transpose()?;
-        let rows = gather
-            .gathers()
-            .then(|| {
-                gather::Slab::open(
-                    gather,
-                    &store,
-                    Source::from_host(table, gather.host_bands()),
-                    &offsets,
-                )
-                .map(RefCell::new)
-            })
-            .transpose()?;
         Ok(Weights {
             store,
             mapped: Vec::new(),
-            bound: 0,
             table: WeightTable(weight_table, Vec::new()),
-            tier,
-            rows,
             banks: banks(trace, &places, |at| places[at].offset),
             residue: (0, 0),
             decoded: Vec::new(),
@@ -338,16 +283,6 @@ impl Weights {
     #[must_use]
     pub fn residue(&self) -> (usize, u64) {
         self.residue
-    }
-
-    #[must_use]
-    pub fn rows(&self) -> Option<&RefCell<gather::Slab>> {
-        self.rows.as_ref()
-    }
-
-    #[must_use]
-    pub fn tier(&self) -> Option<&RefCell<Tier>> {
-        self.tier.as_ref()
     }
 
     pub fn register_adapter(&mut self, id: u32, planes: &[AdapterPlane<'_>]) -> Result<()> {
@@ -555,11 +490,6 @@ impl Weights {
         if layout != crate::chip::WeightsLayout::MppPacked {
             return Ok(());
         }
-        if self.tier.is_some() || self.rows.is_some() {
-            return Err(Fault::Residency(
-                "MPP packing requires immutable resident weights".into(),
-            ));
-        }
         let mut dense = vec![false; trace.params.len()];
         for node in &trace.nodes {
             for (_, w, _) in crate::legs::matmuls(&node.op) {
@@ -678,18 +608,6 @@ impl Weights {
         Ok(())
     }
 
-    /// The bytes the mapped windows hold past the planes they bind: on a
-    /// streamed load read out of the artifact, its routed bank, which
-    /// `bytes` already charges as the windows' length.
-    #[must_use]
-    pub fn spanned(&self) -> u64 {
-        self.mapped
-            .iter()
-            .map(Buffer::bytes)
-            .sum::<u64>()
-            .saturating_sub(self.bound)
-    }
-
     #[must_use]
     pub fn bytes(&self) -> u64 {
         self.store.bytes()
@@ -697,36 +615,6 @@ impl Weights {
             + self.decoded.iter().map(Buffer::bytes).sum::<u64>()
             + self.hosted_bytes()
     }
-}
-
-pub fn attachments(trace: &Trace, contract: &ModelContract, path: &Path) -> Result<Attachments> {
-    readable_plane_orders(trace)?;
-    let metadata = if path.is_dir() {
-        parse_metadata(path)?
-    } else {
-        zt::parse(path)?
-    };
-    let landing = compile(
-        &metadata,
-        contract,
-        StorageTarget::for_backend(BackendKind::Metal, 0, 1),
-    )?;
-    let index: BTreeMap<&str, usize> = trace
-        .params
-        .iter()
-        .enumerate()
-        .map(|(at, param)| (param.name.as_str(), at))
-        .collect();
-    let mut out = Attachments::new();
-    for (name, pairing) in pairings(&landing, &index)? {
-        let Some(&at) = index.get(name) else {
-            continue;
-        };
-        let mut planes = vec![pairing.scales];
-        planes.extend(pairing.biases);
-        out.insert(at, planes);
-    }
-    Ok(out)
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -876,8 +764,6 @@ struct Place {
     bytes: u64,
     reserved: u64,
     full: u64,
-    streamed: bool,
-    gathered: bool,
     rows: u32,
     width: u32,
     dtype: Dtype,
@@ -936,12 +822,10 @@ fn warm(
     snapshot: &Path,
     target: StorageTarget,
     path: &Path,
-    plan: &Plan,
     places: &[Place],
     pairings: &BTreeMap<&str, Pairing>,
     apart: &std::collections::BTreeSet<usize>,
 ) -> std::result::Result<Weights, Option<String>> {
-    let gather = plan.gathered();
     if path.is_dir() {
         return Err(None);
     }
@@ -975,8 +859,6 @@ fn warm(
     let mut store_bytes = 0u64;
     let mut residue_bytes = 0u64;
     let mut from_file: Vec<Option<u64>> = vec![None; places.len()];
-    let mut bands: BTreeMap<usize, u64> = BTreeMap::new();
-    let mut rows_of: BTreeMap<usize, u64> = BTreeMap::new();
     let mut stored = 0u64;
     for (index, param) in trace.params.iter().enumerate() {
         let place = &places[index];
@@ -994,19 +876,6 @@ fn warm(
                     .and_then(|from| locate(from).map(|found| (*from, found)))
             });
         let Some(object) = object else {
-            if place.streamed {
-                return Err(Some(format!(
-                    "its {} `{}` is a plane this load holds CPU-side and the artifact \
-                     carries in no form — its seat is a slab and cannot be landed whole \
-                     into that seat",
-                    if place.gathered {
-                        "gathered table"
-                    } else {
-                        "routed band"
-                    },
-                    param.name,
-                )));
-            }
             let Some(residue_of) = residue_of(contract, &param.name) else {
                 return Err(Some(format!(
                     "it carries no plane `{}` and this contract declares none — the \
@@ -1022,7 +891,7 @@ fn warm(
             continue;
         };
         let (object, (offset, length)) = object;
-        if length != place.full || (!place.streamed && place.bytes != place.full) {
+        if length != place.full || place.bytes != place.full {
             return Err(Some(format!(
                 "its plane `{}` (stored as `{object}`) is {length} bytes and this plan \
                  declares {}",
@@ -1039,16 +908,6 @@ fn warm(
         from_file[index] = Some(offset);
         stored += place.full;
         objects.push(object);
-        if place.streamed {
-            if place.gathered {
-                rows_of.insert(index, offset);
-            } else {
-                bands.insert(index, offset);
-            }
-            seats.push(Seat::Store(store_bytes));
-            store_bytes += place.reserved;
-            continue;
-        }
         if apart.contains(&index) {
             seats.push(Seat::Apart(offset));
             continue;
@@ -1175,7 +1034,6 @@ fn warm(
             )));
         }
     }
-    let bound = covers.iter().map(|(_, _, length)| *length).sum::<u64>();
     let kept_apart: Vec<(u64, u64)> = seats
         .iter()
         .enumerate()
@@ -1287,39 +1145,10 @@ fn warm(
             Seat::Store(offset) | Seat::Artifact(offset) | Seat::Apart(offset) => *offset,
         })
         .collect();
-    let tier = plan
-        .streams()
-        .then(|| {
-            Tier::open(
-                plan,
-                &store,
-                Source::artifact(std::sync::Arc::clone(&map), bands),
-                &seated,
-            )
-            .map(RefCell::new)
-        })
-        .transpose()
-        .map_err(|why| Some(format!("its routed tier does not open ({why})")))?;
-    let rows = gather
-        .gathers()
-        .then(|| {
-            gather::Slab::open(
-                gather,
-                &store,
-                Source::artifact(std::sync::Arc::clone(&map), rows_of),
-                &seated,
-            )
-            .map(RefCell::new)
-        })
-        .transpose()
-        .map_err(|why| Some(format!("its gathered row slab does not open ({why})")))?;
     Ok(Weights {
         store,
         mapped: files,
-        bound,
         table: WeightTable(table, Vec::new()),
-        tier,
-        rows,
         banks: banks(trace, places, |at| seated[at]),
         residue: (residue_planes, residue_bytes),
         decoded: Vec::new(),
@@ -1368,31 +1197,23 @@ impl TensorSink for Residue<'_> {
     }
 }
 
-fn places(trace: &Trace, plan: &Plan, gather: &gather::Plan) -> Result<Vec<Place>> {
+fn places(trace: &Trace) -> Result<Vec<Place>> {
     let bytes = plane_bytes(trace)?;
     let mut out = Vec::with_capacity(trace.params.len());
     let mut at = 0u64;
     for (index, param) in trace.params.iter().enumerate() {
         let (rows, width) = rectangle(&param.shape);
         let full = bytes[index];
-        let seated = plan.resident(index);
-        let gathered = gather.resident(index);
-        let (reserve, rows) = match seated.or(gathered) {
-            Some(slots) if rows > 0 => (full / rows * u64::from(slots), u64::from(slots)),
-            _ => (full, rows),
-        };
         out.push(Place {
             offset: at,
-            bytes: reserve,
-            reserved: reserve.next_multiple_of(ALIGN),
+            bytes: full,
+            reserved: full.next_multiple_of(ALIGN),
             full,
-            streamed: seated.is_some() || gathered.is_some(),
-            gathered: gathered.is_some(),
             rows: u32::try_from(rows).unwrap_or(u32::MAX),
             width: u32::try_from(width).unwrap_or(u32::MAX),
             dtype: param.dtype,
         });
-        at += reserve.next_multiple_of(ALIGN);
+        at += full.next_multiple_of(ALIGN);
     }
     Ok(out)
 }
@@ -1407,10 +1228,6 @@ fn rectangle(shape: &[u64]) -> (u64, u64) {
 struct Landing<'a> {
     store: &'a mut Store,
     hosted: &'a mut BTreeMap<usize, Buffer>,
-    host: &'a mut [u8],
-    table: &'a mut [u8],
-    plan: &'a Plan,
-    gather: &'a gather::Plan,
     places: &'a [Place],
     index: &'a BTreeMap<&'a str, usize>,
     landed: Vec<bool>,
@@ -1433,30 +1250,7 @@ impl TensorSink for Landing<'_> {
                 place.full
             )));
         }
-        if place.streamed {
-            let (what, at_host, into) = if place.gathered {
-                (
-                    "gathered table",
-                    self.gather.host_at(at).unwrap_or(0),
-                    &mut *self.table,
-                )
-            } else {
-                (
-                    "streamed band",
-                    self.plan.host_at(at).unwrap_or(0),
-                    &mut *self.host,
-                )
-            };
-            let from = usize::try_from(at_host).unwrap_or(usize::MAX);
-            let into = into.get_mut(from..from + bytes.len()).ok_or_else(|| {
-                LoadError::Internal(format!(
-                    "`{name}` is a {what} whose {} bytes leave its host source at \
-                         offset {from}",
-                    bytes.len()
-                ))
-            })?;
-            into.copy_from_slice(bytes);
-        } else if let Some(own) = self.hosted.get_mut(&at) {
+        if let Some(own) = self.hosted.get_mut(&at) {
             own.write(0, bytes)
                 .map_err(|fault| LoadError::Internal(fault.to_string()))?;
         } else {
@@ -1536,7 +1330,7 @@ mod tests {
         let trace = poem_compiler::catalog::deployment("qwen35-d0.8b-bf16-kv-bf16")
             .expect("the catalog ships the deployment")
             .trace(Platform::Metal);
-        let places = places(&trace, &Plan::default(), &gather::Plan::default())
+        let places = places(&trace)
             .expect("every param of a bf16 deployment has an element size");
 
         assert_eq!(places.len(), trace.params.len());

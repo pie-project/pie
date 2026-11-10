@@ -1,7 +1,7 @@
 //! engine-metal's integration tests, one binary: each module was a test file.
 
 mod a_buffered_fold_is_the_fold_it_replaces;
-mod a_capped_fire_packs_no_more_windows_than_the_load_reserved;
+mod a_fire_packs_no_more_windows_than_the_load_reserved;
 mod a_column_cut_of_a_bank_multiplies_as_its_copy;
 mod a_copied_window_is_one_encode_over_the_same_rows;
 mod a_fenced_frame_lands_both_sides;

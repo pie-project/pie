@@ -314,10 +314,6 @@ pub struct Shell {
     adapter_fact: Option<u32>,
     adapters: crate::adapter::Slots,
     blobs: crate::blob::Store,
-    cuts: Vec<Option<ValueId>>,
-    row_cuts: Vec<Option<ValueId>>,
-    run_caps: Vec<u32>,
-    run_passes: Vec<u32>,
     held: Vec<u32>,
     programs: crate::program::Plane,
     #[cfg(target_vendor = "apple")]
@@ -375,8 +371,8 @@ impl Shell {
     }
 
     /// The weight cache (`store::streamed`): one cache a weight shape the
-    /// recipe gives weights this engine streams (experts only where no
-    /// other tier holds a bank), every atom read from its weight in place
+    /// recipe gives weights this engine streams, every atom read from its
+    /// weight in place
     /// until the runtime names slots. None on a device whose queue keeps no
     /// residency set (the weights are then read whole, as before).
     fn weight_caches(
@@ -385,10 +381,9 @@ impl Shell {
         weights: &mut Weights,
         trace: &Trace,
         recipe: &poem_compiler::chunk::ChunkRecipe,
-        experts: bool,
         held: bool,
     ) -> Result<Vec<crate::store::streamed::Cache>> {
-        let shapes = crate::store::streamed::Shape::of(trace, recipe, experts);
+        let shapes = crate::store::streamed::Shape::of(trace, recipe);
         if shapes.is_empty() || !device.hold_resident(std::iter::empty(), true)? {
             return Ok(Vec::new());
         }
@@ -596,7 +591,6 @@ impl Shell {
         Ok(PreparedLoad {
             boot,
             device,
-            perf_cores,
             chip,
             tuning,
             elsewhere,
@@ -611,7 +605,6 @@ impl Shell {
 pub struct PreparedLoad<'a> {
     boot: Boot<'a>,
     device: Context,
-    perf_cores: u32,
     chip: profile::Profile,
     tuning: kernels_metal::Tuning,
     elsewhere: u64,
@@ -637,7 +630,6 @@ impl PreparedLoad<'_> {
         let PreparedLoad {
             boot,
             device,
-            perf_cores,
             chip,
             tuning,
             elsewhere,
@@ -737,83 +729,13 @@ impl PreparedLoad<'_> {
         }
 
         let handles = Handles::new();
-        let cuts = crate::experts::cuts(&boot.trace, &compiled, &boot.residency)?;
-        let run_caps: Vec<u32> = (0..compiled.template().len())
-            .map(|region| {
-                let slots = boot.residency.slots();
-                let routes = region
-                    .checked_sub(1)
-                    .and_then(|router| cuts.get(router).copied().flatten());
-                let stated = match *chip.get::<crate::chip::StreamCut>() {
-                    crate::chip::StreamCut::FanOut => 0,
-                    crate::chip::StreamCut::Fixed { rows } => rows,
-                };
-                match (routes, slots) {
-                    (Some(_), slots) if slots > 0 && stated > 0 => stated,
-                    (Some(routes), slots) if slots > 0 => {
-                        crate::experts::fan_out(&boot.trace, routes)
-                            .map_or(0, |k| (slots / k.max(1)).max(1))
-                    }
-                    _ => 0,
-                }
-            })
-            .collect();
-        let passes_on = crate::diag::on().expert_passes;
-        let run_passes: Vec<u32> = (0..compiled.template().len())
-            .map(|region| {
-                let routes = region
-                    .checked_sub(1)
-                    .and_then(|router| cuts.get(router).copied().flatten());
-                match routes {
-                    Some(routes) if passes_on => boot
-                        .residency
-                        .groups()
-                        .iter()
-                        .find(|group| group.routes == routes)
-                        .map_or(0, |group| {
-                            if group.slots > 0 {
-                                group
-                                    .experts
-                                    .div_ceil(crate::experts::pass_group(group.slots))
-                            } else {
-                                0
-                            }
-                        }),
-                    _ => 0,
-                }
-            })
-            .collect();
-        if crate::diag::on().cut_trace {
-            let capped: Vec<(usize, u32, u32)> = run_caps
-                .iter()
-                .zip(&run_passes)
-                .enumerate()
-                .filter(|(_, (cap, _))| **cap > 0)
-                .map(|(at, (cap, passes))| (at, *cap, *passes))
-                .collect();
-            eprintln!(
-                "cuts: slots {} capped regions (region, cap, passes) {capped:?}",
-                boot.residency.slots()
-            );
-        }
-        let row_cuts = if boot.residency.gathered().gathers() {
-            crate::gather::cuts(&boot.trace, &compiled)?
-        } else {
-            vec![None; compiled.template().len()]
-        };
-        let prefetch = chip.get::<crate::chip::ExpertsPrefetch>().0;
-        let threads = chip.get::<crate::chip::ExpertsThreads>().count(perf_cores);
-        let residency = boot
-            .residency
-            .clone()
-            .with_streaming(prefetch as usize, threads as usize);
         let mut weights = Weights::resident(
             &device,
             &handles,
             &boot.trace,
             boot.contract,
             boot.checkpoint,
-            &residency,
+            &boot.residency,
         )?;
         weights.decode_absorbed(&device, &handles, &boot.trace)?;
         weights.relabel_conv_weights(&device, &handles, &boot.trace)?;
@@ -843,7 +765,6 @@ impl PreparedLoad<'_> {
                 &mut weights,
                 &boot.trace,
                 &recipe,
-                !boot.residency.streams(),
                 boot.residency.weights_held(),
             )?
         };
@@ -941,36 +862,10 @@ impl PreparedLoad<'_> {
 
         {
             let acct = accounting(pool_bytes);
-            acct.admit(Some(weights.bytes()), boot.memory_share)?;
-            // A bank read out of the artifact's own mapping is already in the
-            // weights, as the windows that span it: only what lies outside them
-            // is streamed on top.
-            let source = boot
-                .residency
-                .source_bytes()
-                .saturating_sub(weights.spanned());
-            let ram = Context::physical_memory();
-            let wired = acct.weights + acct.scratch + acct.minimum + acct.floor;
-            if source > 0 && ram > 0 && wired + source > ram - ram / 6 {
-                return Err(Fault::Residency(format!(
-                    "this streamed load wires {wired} bytes (weights {weights}, arena scratch \
-                     {scratch} at `[engine] max_forward_tokens`, kv pool {pool}, driver floor \
-                     {floor}) and reads its {source} streamed bytes out of the artifact's page \
-                     cache — the same {ram} bytes of unified memory. Together they exceed \
-                     five sixths of it, so the cache would be squeezed out and every seat \
-                     copy would come from the disk: the load would crawl, not page. Lower \
-                     `[model] device_weight_budget` or `[engine] max_forward_tokens`, or \
-                     hold the model resident on a box that fits it.",
-                    weights = acct.weights,
-                    scratch = acct.scratch,
-                    pool = acct.minimum,
-                    floor = acct.floor,
-                )));
-            }
+            acct.admit(boot.memory_share)?;
             if crate::diag::on().tier_trace {
                 eprintln!(
-                    "residency: wired {wired} (weights {} scratch {} kv {} floor {}), streamed \
-                     source {source}, working set {}, ram {ram}",
+                    "residency: weights {} scratch {} kv {} floor {}, working set {}",
                     acct.weights, acct.scratch, acct.minimum, acct.floor, acct.working_set
                 );
             }
@@ -1104,15 +999,12 @@ impl PreparedLoad<'_> {
                     paging,
                     page_tables,
                     compiled.classes.classes.len(),
-                    poem_exec::fire::max_runs(&compiled),
                     gathers,
                     patch_seat,
                     voxel_seat,
                     states_mrope,
                     &seats,
                     selections,
-                    &run_caps,
-                    &run_passes,
                     &pools.bands(),
                     pools.window_pages_per_slot(),
                 )
@@ -1231,10 +1123,6 @@ impl PreparedLoad<'_> {
             adapters: adapter_slots,
             blobs: crate::blob::Store::new(),
             corrected,
-            cuts,
-            row_cuts,
-            run_caps,
-            run_passes,
             held: vec![0; paging.slots as usize],
             programs: crate::program::Plane::new(),
             #[cfg(target_vendor = "apple")]
@@ -1949,19 +1837,6 @@ impl Shell {
             .adapted_word(&self.corrected, bit, word)
     }
 
-    #[must_use]
-    pub fn weights_resident(&self) -> bool {
-        self.weights.tier().is_none()
-    }
-
-    #[must_use]
-    pub fn expert_residency(&self) -> Vec<crate::experts::GroupResidency> {
-        self.weights
-            .tier()
-            .map(|tier| tier.borrow().residency())
-            .unwrap_or_default()
-    }
-
     pub fn set_copies(&mut self, copies: bool) {
         self.copies = copies;
     }
@@ -1974,42 +1849,6 @@ impl Shell {
     #[must_use]
     pub fn last_fire(&self) -> FireCost {
         self.last
-    }
-
-    #[must_use]
-    pub fn expert_motion(&self) -> (u64, u64) {
-        self.weights
-            .tier()
-            .map_or((0, 0), |tier| tier.borrow().motion())
-    }
-
-    #[must_use]
-    pub fn expert_hits(&self) -> (u64, u64) {
-        self.weights
-            .tier()
-            .map_or((0, 0), |tier| tier.borrow().hits())
-    }
-
-    #[must_use]
-    pub fn expert_host_time(&self) -> (u64, u64, u64) {
-        self.weights
-            .tier()
-            .map_or((0, 0, 0), |tier| tier.borrow().host_time())
-    }
-
-    #[must_use]
-    pub fn gathered_rows(&self) -> Option<crate::gather::Residency> {
-        self.weights.rows().map(|rows| rows.borrow().residency())
-    }
-
-    #[must_use]
-    pub fn expert_source(&self) -> Option<(u64, u64)> {
-        self.weights.tier().and_then(|tier| tier.borrow().source())
-    }
-
-    #[must_use]
-    pub fn expert_source_kind(&self) -> Option<&'static str> {
-        self.weights.tier().map(|tier| tier.borrow().source_kind())
     }
 
     #[must_use]
@@ -2954,9 +2793,7 @@ impl Shell {
             })
             .collect();
         let composition = compose_axes(&self.compiled, &self.budgets, &submitted)?;
-        let mut descriptor = FireDescriptor::of(&composition);
-        descriptor.run_caps = self.run_caps.clone();
-        descriptor.run_passes = self.run_passes.clone();
+        let descriptor = FireDescriptor::of(&composition);
         let rows = composition.rows();
         let lane_count = composition.lane_count();
 
@@ -3467,8 +3304,6 @@ impl Shell {
                 positions: &positions,
                 request_of_token: &request_of_token,
             },
-            &self.run_caps,
-            &self.run_passes,
         )?;
         self.last = FireCost {
             launches: windows.launches(),
@@ -4239,88 +4074,6 @@ impl Shell {
         })
     }
 
-    fn walk_streamed(&self, p: &Prepared<'_>) -> Result<Walked> {
-        let tier = self.weights.tier();
-        let rows = self.weights.rows();
-        if let Some(rows) = rows {
-            rows.borrow_mut().fire();
-        }
-        for (region, cut) in self.row_cuts.iter().enumerate() {
-            let runs = p.windows.runs(region as u32);
-            if cut.is_some() && runs > 1 {
-                return Err(Fault::Residency(format!(
-                    "region {region} carries an n-gram hasher and this fire splits its \
-                     window into {runs} runs; a gathered load cuts its command buffer once \
-                     per region, so the second run would read the first run's SEAT numbers \
-                     as table rows and seat them again. Raise `device_weight_budget` to \
-                     hold the n-gram table whole, or submit a composition whose classes \
-                     are consecutive."
-                )));
-            }
-        }
-
-        let place = At::new();
-        let mut frame = self.device.frame()?;
-        self.feed_inputs(&mut frame, p)?;
-        self.land_merges(&mut frame, p)?;
-        let sink = Encoded::Live(Sink::streaming(
-            &self.device,
-            frame,
-            &self.pipelines,
-            &self.handles,
-            crate::encode::Cuts::new(
-                &place,
-                &self.cuts,
-                &self.row_cuts,
-                &p.slots,
-                &p.windows,
-                self.arena.store().clone(),
-                tier,
-                rows,
-            ),
-        ));
-        {
-            let mut run = Run::new(
-                &sink,
-                &self.handles,
-                &self.trace.values,
-                &self.trace.nodes,
-                self.weights.table(),
-                &p.slots,
-                &p.caches,
-                p.bindings.clone(),
-                &p.windows,
-                &place,
-                &self.scratch,
-                &self.tuning,
-            )
-            .with_regions(self.compiled.template());
-            walk(
-                &self.trace,
-                &self.compiled,
-                &p.descriptor,
-                &mut run,
-                &mut Cursor::new(&place),
-                Filter::default(),
-            )?;
-        }
-        let frame = match sink {
-            Encoded::Live(sink) => sink.into_frame(),
-            Encoded::Taped(_) => None,
-            #[cfg(target_vendor = "apple")]
-            Encoded::Built(_) => None,
-        };
-        let launches = (0..self.compiled.template().len() as u32)
-            .map(|region| p.windows.runs(region).max(1))
-            .sum();
-        Ok(Walked {
-            frame,
-            tape: None,
-            built: None,
-            launches,
-        })
-    }
-
     #[allow(clippy::too_many_lines)]
     #[cfg_attr(
         not(target_vendor = "apple"),
@@ -4597,40 +4350,7 @@ impl engine::frame::Shell for Shell {
                 lanes.join(" ")
             )
         });
-        let walked = if self.weights.tier().is_some() || self.weights.rows().is_some() {
-            let trace = crate::diag::on().tier_trace;
-            let before = trace.then(|| {
-                (
-                    self.expert_motion(),
-                    self.expert_hits(),
-                    self.expert_host_time(),
-                    std::time::Instant::now(),
-                )
-            });
-            let walked = self.walk_streamed(&prepared)?;
-            if let Some(((swaps0, cuts0), (hits0, misses0), (cut0, copy0, wait0), started)) = before
-            {
-                let (swaps, cuts) = self.expert_motion();
-                let (hits, misses) = self.expert_hits();
-                let (cut_ns, copy_ns, wait_ns) = self.expert_host_time();
-                eprintln!(
-                    "tier: fire of {} row(s): {} seat copies over {} cuts, {} hits / {} misses; \
-                     cuts {:.1} ms (copies {:.1} ms, waiting on the device {:.1} ms); walk {:.1} ms",
-                    prepared.descriptor.rows,
-                    swaps - swaps0,
-                    cuts - cuts0,
-                    hits - hits0,
-                    misses - misses0,
-                    (cut_ns - cut0) as f64 / 1e6,
-                    (copy_ns - copy0) as f64 / 1e6,
-                    (wait_ns - wait0) as f64 / 1e6,
-                    started.elapsed().as_secs_f64() * 1e3
-                );
-            }
-            walked
-        } else {
-            self.walk_once(&prepared, Mode::Encode)?
-        };
+        let walked = self.walk_once(&prepared, Mode::Encode)?;
         fire_trace(|| "forward-encoded".to_string());
         let profile = crate::encode::kernel_profile();
         if !profile.is_empty() {

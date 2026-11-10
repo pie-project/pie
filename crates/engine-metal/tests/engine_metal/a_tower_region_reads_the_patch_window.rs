@@ -163,8 +163,6 @@ fn each_region_is_cut_at_its_own_axis_s_window() {
         fire.voxel_classes(),
         &indptr(&[5, 3, 4]),
         Copies::off(),
-        &[],
-        &[],
     )
     .expect("every region seats a window");
 
@@ -251,8 +249,6 @@ fn a_fire_with_no_image_gets_the_token_windows_it_always_had() {
             fire.voxel_classes(),
             &boundaries,
             Copies::off(),
-            &[],
-            &[],
         )
         .expect("every region seats a window")
     };

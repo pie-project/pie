@@ -242,7 +242,7 @@ struct Laid {
 /// tail themselves.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Rows {
-    Span([poem_exec::fire::MaskSpan; 3], u32, bool),
+    Span([poem_exec::fire::MaskSpan; 3], bool),
     Region(u32, u32, bool),
 }
 
@@ -1000,7 +1000,6 @@ impl<'c> Run<'c> {
             }
             let window = self.windows.at(index, 0);
             if window.gathered.is_some()
-                || window.passes > 1
                 || window.span.rows == 0
                 || *rows.get_or_insert(window.span.rows) != window.span.rows
             {
@@ -1193,7 +1192,7 @@ impl<'c> Run<'c> {
         let window = self.window();
         Some((
             region.nodes.clone(),
-            window.gathered.is_none() && window.passes <= 1,
+            window.gathered.is_none(),
         ))
     }
 
@@ -1941,20 +1940,7 @@ impl<'c> Run<'c> {
             .unwrap_or_else(|fault| {
                 panic!("the precast plane this load reserved does not mint: {fault}")
             });
-        let window = self.window();
-        let rows = if window.gathered.is_some() || window.passes > 1 {
-            Rows::Region(
-                self.place.region.get(),
-                self.place.run.get(),
-                self.place.tail.get(),
-            )
-        } else {
-            Rows::Span(
-                [window.span, window.patch, window.voxel],
-                window.pass,
-                self.place.tail.get(),
-            )
-        };
+        let rows = self.rows_here();
         let standing = self.table.get().is_some_and(|laid| {
             laid.act == act
                 && laid.rows == rows
@@ -1975,7 +1961,7 @@ impl<'c> Run<'c> {
     /// The rows of a value the walk's place reads ([`Rows`]).
     fn rows_here(&self) -> Rows {
         let window = self.window();
-        if window.gathered.is_some() || window.passes > 1 {
+        if window.gathered.is_some() {
             Rows::Region(
                 self.place.region.get(),
                 self.place.run.get(),
@@ -1984,7 +1970,6 @@ impl<'c> Run<'c> {
         } else {
             Rows::Span(
                 [window.span, window.patch, window.voxel],
-                window.pass,
                 self.place.tail.get(),
             )
         }

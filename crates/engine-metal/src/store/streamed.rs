@@ -305,12 +305,11 @@ pub struct Shape {
 impl Shape {
     /// The shapes of `recipe` this engine streams: rows shapes whose every
     /// table is in [`streamed_rows`], then expert shapes (one piece an
-    /// expert) whose every bank of every layer is in [`streamed_experts`];
-    /// experts only where `experts` (no other tier holds a bank). A slot
-    /// that holds a weight this engine does not stream is not stated, its
-    /// weights read whole.
+    /// expert) whose every bank of every layer is in [`streamed_experts`].
+    /// A slot that holds a weight this engine does not stream is not
+    /// stated, its weights read whole.
     #[must_use]
-    pub fn of(trace: &Trace, recipe: &ChunkRecipe, experts: bool) -> Vec<Shape> {
+    pub fn of(trace: &Trace, recipe: &ChunkRecipe) -> Vec<Shape> {
         let mut out = Vec::new();
         let rows = streamed_rows(trace);
         for slot in &recipe.weights {
@@ -321,15 +320,13 @@ impl Shape {
                 out.push(shape);
             }
         }
-        if experts {
-            let banks = streamed_experts(trace);
-            for slot in &recipe.weights {
-                if slot.kind != poem_compiler::chunk::WeightKind::Expert {
-                    continue;
-                }
-                if let Some(shape) = Shape::experts(trace, recipe, slot, &banks, out.len()) {
-                    out.push(shape);
-                }
+        let banks = streamed_experts(trace);
+        for slot in &recipe.weights {
+            if slot.kind != poem_compiler::chunk::WeightKind::Expert {
+                continue;
+            }
+            if let Some(shape) = Shape::experts(trace, recipe, slot, &banks, out.len()) {
+                out.push(shape);
             }
         }
         out
