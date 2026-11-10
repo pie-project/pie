@@ -28,9 +28,6 @@ def layout(id, deploy):
 "#;
 
 const FORWARD: &str = r#"
-def caches(m, c):
-    pass
-
 def forward(m, inputs):
     return ops.linear.lm_head(ops.gather.embed(inputs.tokens(), m.embed, 16), m.head)
 "#;

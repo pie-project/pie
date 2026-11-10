@@ -972,7 +972,7 @@ pub(crate) static OPS: &[Op] = &[
         call: |a, heap| {
             let q: Value = a.next()?;
             let inputs: Input = a.next()?;
-            let kv: String = a.next()?;
+            let kv: StateName = a.next()?;
             let q_heads: u32 = a.next()?;
             let kv_heads: u32 = a.next()?;
             let head_dim: u32 = a.next()?;
@@ -991,7 +991,7 @@ pub(crate) static OPS: &[Op] = &[
                     ops::attn::attend(
                         &q,
                         &inputs,
-                        &kv,
+                        &kv.0,
                         q_heads,
                         kv_heads,
                         head_dim,
@@ -1018,7 +1018,7 @@ pub(crate) static OPS: &[Op] = &[
         call: |a, heap| {
             let q: Value = a.next()?;
             let inputs: Input = a.next()?;
-            let kv: String = a.next()?;
+            let kv: StateName = a.next()?;
             let q_heads: u32 = a.next()?;
             let kv_heads: u32 = a.next()?;
             let head_dim: u32 = a.next()?;
@@ -1029,7 +1029,7 @@ pub(crate) static OPS: &[Op] = &[
                 heap,
                 dsl("attn.score_capture", || {
                     ops::attn::score_capture(
-                        &q, &inputs, &kv, q_heads, kv_heads, head_dim, sm_scale, observe, kv_max,
+                        &q, &inputs, &kv.0, q_heads, kv_heads, head_dim, sm_scale, observe, kv_max,
                     )
                 })?,
             )
@@ -1055,7 +1055,7 @@ pub(crate) static OPS: &[Op] = &[
             let q: Value = a.next()?;
             let q_pe: Value = a.next()?;
             let inputs: Input = a.next()?;
-            let kv: String = a.next()?;
+            let kv: StateName = a.next()?;
             let heads: u32 = a.next()?;
             let kv_lora_rank: u32 = a.next()?;
             let sm_scale: f32 = a.next()?;
@@ -1070,7 +1070,7 @@ pub(crate) static OPS: &[Op] = &[
                         &q,
                         &q_pe,
                         &inputs,
-                        &kv,
+                        &kv.0,
                         heads,
                         kv_lora_rank,
                         sm_scale,
@@ -3321,8 +3321,11 @@ pub(crate) static INPUTS: &[Op] = &[
         params: &["inputs", "row"],
         call: |a, heap| {
             let inputs: Input = a.next()?;
-            let row: String = a.next()?;
-            result(heap, dsl("inputs.write_page", || inputs.write_page(&row))?)
+            let row: StateName = a.next()?;
+            result(
+                heap,
+                dsl("inputs.write_page", || inputs.write_page(&row.0))?,
+            )
         },
     },
     Op {
@@ -3331,10 +3334,10 @@ pub(crate) static INPUTS: &[Op] = &[
         params: &["inputs", "row"],
         call: |a, heap| {
             let inputs: Input = a.next()?;
-            let row: String = a.next()?;
+            let row: StateName = a.next()?;
             result(
                 heap,
-                dsl("inputs.write_offset", || inputs.write_offset(&row))?,
+                dsl("inputs.write_offset", || inputs.write_offset(&row.0))?,
             )
         },
     },
@@ -3344,8 +3347,8 @@ pub(crate) static INPUTS: &[Op] = &[
         params: &["inputs", "name"],
         call: |a, heap| {
             let inputs: Input = a.next()?;
-            let name: String = a.next()?;
-            result(heap, dsl("inputs.kv", || inputs.kv(&name))?)
+            let name: StateName = a.next()?;
+            result(heap, dsl("inputs.kv", || inputs.kv(&name.0))?)
         },
     },
     Op {
@@ -3354,8 +3357,8 @@ pub(crate) static INPUTS: &[Op] = &[
         params: &["inputs", "name"],
         call: |a, heap| {
             let inputs: Input = a.next()?;
-            let name: String = a.next()?;
-            result(heap, dsl("inputs.state", || inputs.state(&name))?)
+            let name: StateName = a.next()?;
+            result(heap, dsl("inputs.state", || inputs.state(&name.0))?)
         },
     },
 ];

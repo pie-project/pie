@@ -2,7 +2,7 @@
 # its diffusion transformer alone.
 
 load("//lib/spoken.poem", "QWEN_STOP")
-load("//lib/dit.poem", "held_text_encoder", "attend", "biased", "chunks", "linear", "run_linear")
+load("//lib/dit.poem", "attend", "biased", "chunks", "linear", "run_linear")
 load("//lib/qwen3_encoder.poem", "QWEN3_4B", "encoder", "qwen3_encode", "te_read")
 load("//lib/vae.poem", "flux_vae", "vae_decode", "vae_encode", "vae_read")
 
@@ -133,7 +133,7 @@ def layout(id, deploy):
             final_ada = linear(dim, ADALN_DIM, banks),
             final_linear = linear(PATCH_FEATURES, dim, banks),
         ),
-        te = held_text_encoder(encoder(QWEN3_4B, TE_LAYERS, banks), dtype.bf16) if turbo else None,
+        te = encoder(QWEN3_4B, TE_LAYERS, banks, dtype.bf16) if turbo else None,
         vae = flux_vae(CHANNELS, CHANNELS, vae_latent) if turbo else None,
         shift = 3.0,
         tap = deploy.tap or "",

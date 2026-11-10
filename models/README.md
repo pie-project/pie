@@ -7,9 +7,9 @@ live in [`lib/`](lib) and are loaded as `//lib/…`.
 | Entry | Purpose |
 |---|---|
 | `MODELS`, `DEPLOYMENTS`, `PUBLISHED` | Model metadata (`template`, `tokenizer`, parts, drafters), deployments in import preference order, and published draft heads |
-| `layout(id, deploy)` | Weight struct; each field's path (`layers.3.q`) names its parameter in the trace and its tensor in the `.zt` artifact |
+| `layout(id, deploy)` | Weights and state: each field's path (`layers.3.q`) names its parameter in the trace and its tensor in the `.zt` artifact; `state(shape, dtype)` declares what the model remembers (a first axis of `tokens` is per-token kv, otherwise a fixed slab), named by its path (`layers.3.kv`) |
 | `media(id, deploy)` | Image framing (`patch`, `block`, `mrope`, delimiters, `frame(h, w, budget)`) for vision models |
-| `caches(m, c)`, `forward(m, inputs)` | KV / recurrent state caches and the traced forward pass |
+| `forward(m, inputs)` | The traced forward pass; it hands each `state(...)` handle to the ops that read and write it |
 | `formats(m)` | Checkpoint format mappings onto the declared layout |
 
 Deployments follow the naming convention
