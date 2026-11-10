@@ -30,6 +30,12 @@ pub(crate) fn slab_address(slab: &Slab) -> u64 {
     slab.gpuAddress()
 }
 
+#[cfg(not(target_vendor = "apple"))]
+pub(crate) fn slab_address(slab: &Slab) -> u64 {
+    let _ = slab;
+    0
+}
+
 #[derive(Clone)]
 pub struct Buffer {
     slab: Slab,

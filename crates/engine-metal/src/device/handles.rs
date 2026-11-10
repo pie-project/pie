@@ -151,6 +151,23 @@ impl Handles {
         Ok(at as u32)
     }
 
+    /// Binds `handle` to the start of `buffer` instead of what it was
+    /// bound to, letting go of that: for a plane nothing binds any more
+    /// (the weight cache's given-back tables).
+    pub fn rebind(&self, handle: u32, buffer: &Buffer) -> Result<()> {
+        let mut rows = self.rows.borrow_mut();
+        let row = rows
+            .get_mut(handle as usize)
+            .ok_or_else(|| Fault::Unbound {
+                what: format!("handle {handle}, which this load minted no row for"),
+            })?;
+        *row = Binding {
+            slab: buffer.slab().clone(),
+            offset: 0,
+        };
+        Ok(())
+    }
+
     #[must_use]
     pub fn get(&self, handle: u32) -> Option<Ref<'_, Binding>> {
         if handle == NIL {

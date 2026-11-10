@@ -640,6 +640,16 @@ impl Engine for Metal {
         self.loaded_mut()?.copy_slots(copy).map_err(fault)
     }
 
+    fn weight_residency(&mut self, residency: &engine::chunk::WeightResidency) -> EngineResult<()> {
+        self.loaded_mut()?
+            .weight_residency(residency)
+            .map_err(fault)
+    }
+
+    fn weight_uses(&mut self) -> EngineResult<engine::chunk::WeightUses> {
+        self.loaded_mut()?.weight_uses().map_err(fault)
+    }
+
     fn submit(&mut self, frame: &FrameSubmission) -> EngineResult<FrameTicket> {
         frame.validate_for(
             self.caps
@@ -1045,7 +1055,7 @@ impl Metal {
         let mut pages_of: Vec<Option<Vec<u32>>> = Vec::with_capacity(submission.lanes.len());
         let mut record_of: Vec<Option<Vec<u32>>> = Vec::with_capacity(submission.lanes.len());
         let mut run_of: Vec<Option<Vec<u32>>> = Vec::with_capacity(submission.lanes.len());
-        let mut window_of: Vec<Option<Vec<u32>>> = Vec::with_capacity(submission.lanes.len());
+        let mut window_of: Vec<Vec<Vec<u32>>> = Vec::with_capacity(submission.lanes.len());
         let mut forks: Vec<(u32, u32)> = Vec::new();
         for lane in &submission.lanes {
             pages_of.push(
@@ -1054,12 +1064,26 @@ impl Metal {
                     .find(|(shape, _)| *shape == crate::store::layout::LIST)
                     .map(|(_, refs)| refs.clone()),
             );
-            window_of.push(
-                lane.tables
-                    .iter()
-                    .find(|(shape, _)| *shape == crate::store::layout::WINDOW)
-                    .map(|(_, refs)| refs.clone()),
-            );
+            // One table a window list, in the load's order; until the
+            // runtime states them, the legacy window pages are the first
+            // list's.
+            let lists = shell.pool_layout().window_lists().count();
+            let mut windows: Vec<Vec<u32>> = crate::store::layout::WINDOWS[..lists]
+                .iter()
+                .map(|id| {
+                    lane.tables
+                        .iter()
+                        .find(|(shape, _)| shape == id)
+                        .map(|(_, refs)| refs.clone())
+                        .unwrap_or_default()
+                })
+                .collect();
+            if let Some(first) = windows.first_mut()
+                && first.is_empty()
+            {
+                first.clone_from(&lane.kv.window);
+            }
+            window_of.push(windows);
             let fixed = lane
                 .fixed
                 .iter()
@@ -1124,7 +1148,7 @@ impl Metal {
                     refs: true,
                     record: record_of[at].as_deref(),
                     record_run: run_of[at].as_deref(),
-                    window: window_of[at].as_deref().unwrap_or(&lane.kv.window),
+                    windows: &window_of[at],
                 })
             })
             .collect::<EngineResult<Vec<_>>>()?;

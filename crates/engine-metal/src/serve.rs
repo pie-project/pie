@@ -180,10 +180,11 @@ pub struct Seated<'a> {
     /// copy-on-write): a lane that folds nothing reads its state there
     /// (CONTRACT-BC 15).
     pub record_run: Option<&'a [u32]>,
-    /// The lane's window-list slot refs, one a kv page in token order (0 a
-    /// slot trimmed behind the window), for the windowed rows; empty
+    /// The lane's window-list slot refs, one table a window list (the
+    /// load's order), each one a `T_w` slot in token order (0 a slot
+    /// trimmed behind the window), for the windowed rows; a missing or empty
     /// seat-addresses them.
-    pub window: &'a [u32],
+    pub windows: &'a [Vec<u32>],
 }
 
 impl<'a> Seated<'a> {
@@ -209,7 +210,7 @@ impl<'a> Seated<'a> {
             refs: false,
             record: None,
             record_run: None,
-            window: &[],
+            windows: &[],
         }
     }
 
@@ -325,7 +326,93 @@ pub struct Shell {
     rebound: crate::icb::Rebound,
 }
 
+/// The longest a load waits for the Neural Engine's programs.
+const ANE_COMPILE_LIMIT: std::time::Duration = std::time::Duration::from_secs(20 * 60);
+
 impl Shell {
+    /// Waits until every Neural Engine program this load would split work
+    /// with has compiled, and refuses the load if the compiler refused one
+    /// (after its retries): the Neural Engine's int8 share lands other bits
+    /// than the GPU alone, so a load that served without a refused program
+    /// would answer differently from one where it compiled. Every load that
+    /// serves therefore serves the split the device profile states, for
+    /// its whole life; a load the compiler will not take fails, to be
+    /// retried or loaded with the work kept on the GPU (`kernel.ane.mlp =
+    /// gpu`, `kernel.ane.projections = gpu` in the device profile).
+    fn settle_ane(&self) -> Result<()> {
+        let Some(ane) = &self.ane else {
+            return Ok(());
+        };
+        let began = std::time::Instant::now();
+        loop {
+            match ane.compiled() {
+                Some(Ok(())) => return Ok(()),
+                Some(Err(why)) => {
+                    return Err(Fault::Device {
+                        call: "the Neural Engine compile",
+                        why: format!(
+                            "{why}, on every try: this load would serve the work that program \
+                             takes on the GPU alone, which lands other bits than the split the \
+                             device profile states, so it is refused rather than served \
+                             differently. Load again, or keep the work on the GPU \
+                             (`kernel.ane.mlp = gpu`, `kernel.ane.projections = gpu`)"
+                        ),
+                    });
+                }
+                None if began.elapsed() > ANE_COMPILE_LIMIT => {
+                    return Err(Fault::Device {
+                        call: "the Neural Engine compile",
+                        why: format!(
+                            "no answer in {} s: the load is refused rather than served with \
+                             the split undecided",
+                            ANE_COMPILE_LIMIT.as_secs()
+                        ),
+                    });
+                }
+                None => std::thread::sleep(std::time::Duration::from_millis(20)),
+            }
+        }
+    }
+
+    /// The weight cache (`store::streamed`): one cache a weight shape the
+    /// recipe gives weights this engine streams (experts only where no
+    /// other tier holds a bank), every atom read from its weight in place
+    /// until the runtime names slots. None on a device whose queue keeps no
+    /// residency set (the weights are then read whole, as before).
+    fn weight_caches(
+        device: &Context,
+        handles: &Handles,
+        weights: &mut Weights,
+        trace: &Trace,
+        recipe: &poem_compiler::chunk::ChunkRecipe,
+        experts: bool,
+    ) -> Result<Vec<crate::store::streamed::Cache>> {
+        let shapes = crate::store::streamed::Shape::of(trace, recipe, experts);
+        if shapes.is_empty() || !device.hold_resident(std::iter::empty(), true)? {
+            return Ok(Vec::new());
+        }
+        let mut caches = Vec::with_capacity(shapes.len());
+        for shape in shapes {
+            let cache =
+                crate::store::streamed::Cache::open(device, handles, shape, |param| match weights
+                    .table()
+                    .0
+                    .get(param)
+                    .copied()
+                    .flatten()
+                {
+                    Some(crate::run::WeightRow::Dense(plane)) => Some(plane.buf),
+                    _ => None,
+                })?;
+            device.hold_resident(cache.host_slabs(), true)?;
+            for (param, table) in cache.tables() {
+                weights.read_through(param, table);
+            }
+            caches.push(cache);
+        }
+        Ok(caches)
+    }
+
     pub fn load(boot: Boot<'_>) -> Result<Shell> {
         Self::prepare(boot)?.load()
     }
@@ -629,6 +716,23 @@ impl PreparedLoad<'_> {
                 None
             },
         );
+        // The compiler's on-device Metal recipe is the one layout source: the
+        // chunk, the list slot (its tokens are the kv page size), where
+        // every fixed row's pieces lie in a record, and the weight slots.
+        let recipe =
+            crate::chunks::recipe_near(&boot.trace, &budgets, boot.residency.chunk_bytes())?;
+        let weight_caches = if boot.residency.whole_weights() {
+            Vec::new()
+        } else {
+            Shell::weight_caches(
+                &device,
+                &handles,
+                &mut weights,
+                &boot.trace,
+                &recipe,
+                !boot.residency.streams(),
+            )?
+        };
         handles.seal();
 
         // The kv pool and the recurrent-state buffers beside it: both are
@@ -637,10 +741,6 @@ impl PreparedLoad<'_> {
         // scratch and the driver's floor are placed. A stated `kv_budget` is
         // its bytes; none takes all of the room.
         let rs_layout = crate::rs::Layout::read(&boot.trace)?.map(std::sync::Arc::new);
-        // The compiler's on-device Metal recipe is the one layout source: the
-        // chunk, the list slot (its tokens are the kv page size) and where
-        // every fixed row's pieces lie in a record.
-        let recipe = crate::chunks::recipe(&boot.trace, &budgets)?;
         let rows = crate::store::Rows::plan(&boot.trace, &recipe, &facts, rs_layout.as_deref())?;
         let page_size = if rows.tokens > 0 {
             rows.tokens
@@ -664,13 +764,28 @@ impl PreparedLoad<'_> {
             let seated = paging_at(1, boot.slots)?;
             let bytes = [rows.list_bytes, rows.fixed_bytes];
             let chunk = rows.chunk_bytes;
-            // A seat's window slots: its context in `T_w`-token slots.
-            let window_pages = seated.context().div_ceil(rows.window_tokens.max(1)).max(1);
-            let window_chunks = chunk.checked_div(rows.window_bytes).map_or(0, |per| {
-                window_pages.div_ceil(u32::try_from(per).unwrap_or(1).max(1))
-            });
+            // A seat's slots of each window list: its context in `T_w`-token
+            // slots.
+            let window_pages: Vec<u32> = rows
+                .windows
+                .iter()
+                .map(|w| seated.context().div_ceil(w.tokens.max(1)).max(1))
+                .collect();
+            let window_chunks: u32 = rows
+                .windows
+                .iter()
+                .zip(&window_pages)
+                .map(|(w, pages)| {
+                    chunk.checked_div(w.bytes).map_or(0, |per| {
+                        pages.div_ceil(u32::try_from(per).unwrap_or(1).max(1))
+                    })
+                })
+                .sum();
             let least = Layout::least_chunks(chunk, bytes, rows.pieces, seated.pages_per_slot)
                 + window_chunks;
+            // The row-streamed tables' blocks come out of this room as the
+            // runtime names them; their own copies are counted in the
+            // weights until a held set gives them back.
             let room = boot.kv_budget.unwrap_or_else(|| accounting(0).pool);
             let total = engine::chunk::fit(room, chunk, 0, least)
                 .map_err(|short| Fault::Residency(short.to_string()))?;
@@ -684,7 +799,7 @@ impl PreparedLoad<'_> {
                 )));
             }
             let total = total.min(binds);
-            let layout = Layout::new(
+            let mut layout = Layout::new(
                 chunk,
                 total,
                 crate::store::pool::segment_chunks(chunk),
@@ -693,14 +808,11 @@ impl PreparedLoad<'_> {
                 rows.pieces,
                 boot.slots,
                 seated.pages_per_slot,
-            )?
-            .with_window(
-                rows.window_bytes,
-                rows.window_rows,
-                rows.window_tokens,
-                window_pages,
-            )?
-            .with_rs(
+            )?;
+            for (window, pages) in rows.windows.iter().zip(&window_pages) {
+                layout = layout.with_window(window.bytes, window.rows, window.tokens, *pages)?;
+            }
+            let layout = layout.with_rs(
                 rows.rs.as_ref().map_or(0, |rs| rs.bytes),
                 rows.rs.as_ref().map_or(0, |rs| rs.tokens),
                 seated.pages_per_slot,
@@ -753,6 +865,7 @@ impl PreparedLoad<'_> {
         let arena_ladder = poem_compiler::arena_ladder(&boot.trace, &budgets, &compiled)?;
         let rs_at = rows.rs.clone();
         let mut pools = Pools::reserve(&device, rows, layout, paging)?;
+        pools.seat_weights(weight_caches);
         // The null chunk and the floor stand from the load on.
         pools.commit_segments(1)?;
         let rs_buffers = rs_at.map(|at| {
@@ -862,10 +975,7 @@ impl PreparedLoad<'_> {
                     &run_caps,
                     &run_passes,
                     &pools.bands(),
-                    pools
-                        .layout()
-                        .window
-                        .map_or(0, |_| pools.window_paging().pages_per_slot),
+                    pools.window_pages_per_slot(),
                 )
             })
             .collect::<Result<Vec<_>>>()?;
@@ -934,7 +1044,7 @@ impl PreparedLoad<'_> {
             )?),
             false => None,
         };
-        Ok(Shell {
+        let shell = Shell {
             tuning,
             device,
             keepalive,
@@ -992,7 +1102,9 @@ impl PreparedLoad<'_> {
             icb: None,
             #[cfg(target_vendor = "apple")]
             rebound: crate::icb::Rebound::default(),
-        })
+        };
+        shell.settle_ane()?;
+        Ok(shell)
     }
 }
 
@@ -1037,6 +1149,63 @@ impl Shell {
     /// See `Engine::commit_segments`.
     pub fn commit_segments(&mut self, segments: u32) -> Result<()> {
         self.pools.commit_segments(segments)
+    }
+
+    /// See `Engine::weight_residency`: every frame drains, blocks newly
+    /// named a slot land in it, and every address table is rewritten
+    /// before the next fire. A held set naming every atom gives back the
+    /// tables' own copies (`store::streamed`).
+    pub fn weight_residency(&mut self, residency: &engine::chunk::WeightResidency) -> Result<()> {
+        if self.pools.weight_caches().is_empty() && residency.resident.is_empty() {
+            return Ok(());
+        }
+        self.drain()?;
+        let mut frame = self.device.frame()?;
+        self.pools.weight_residency(&mut frame, residency)?;
+        frame.commit()?;
+        self.pools.restage_weights()?;
+        let released = self.pools.release_weight_hosts();
+        if !released.is_empty() {
+            let empty = Buffer::zeroed(&self.device, 0)?;
+            self.device
+                .hold_resident(released.iter().map(|(_, _, slab)| slab), false)?;
+            let mut freed = 0;
+            for (param, handle, _) in &released {
+                self.handles.rebind(*handle, &empty)?;
+                freed += usize::from(self.weights.release_hosted(*param));
+            }
+            tracing::info!(
+                tables = released.len(),
+                own_allocations = freed,
+                "the held weight set names every block: the row-streamed tables' own copies \
+                 are given back"
+            );
+        }
+        Ok(())
+    }
+
+    /// See `Engine::weight_uses`: each atom's reads since the last call.
+    pub fn weight_uses(&mut self) -> Result<engine::chunk::WeightUses> {
+        self.drain()?;
+        self.pools.weight_uses()
+    }
+
+    /// Whether every streamed weight's own copy was given back (a held set
+    /// naming every atom).
+    #[must_use]
+    pub fn weights_given_back(&self) -> bool {
+        let caches = self.pools.weight_caches();
+        !caches.is_empty() && caches.iter().all(crate::store::streamed::Cache::released)
+    }
+
+    /// The streamed weights' atoms named a slot, and all of them.
+    #[must_use]
+    pub fn weight_atoms(&self) -> (u64, u64) {
+        self.pools
+            .weight_caches()
+            .iter()
+            .map(crate::store::streamed::Cache::atoms)
+            .fold((0, 0), |(a, b), (c, d)| (a + c, b + d))
     }
 
     /// See `Engine::release_segments`: every frame drains first.
@@ -2602,12 +2771,22 @@ impl Shell {
         let rows = composition.rows();
         let lane_count = composition.lane_count();
 
+        // A seat-addressed lane writes the seat runs' chunks; a weight slot
+        // named there would be overwritten under the cache's feet.
+        if lanes.iter().any(|seated| !seated.refs) && self.pools.weights_in_seats() {
+            return Err(Fault::Unbound {
+                what: "a seat-addressed lane while the weight cache holds a slot in a chunk \
+                       the seat runs take"
+                    .to_string(),
+            });
+        }
         let mut seats: Vec<Seat> = Vec::with_capacity(lanes.len());
         let mut kv_less: Vec<bool> = Vec::with_capacity(lanes.len());
         let mut tables: Vec<std::borrow::Cow<'_, [u32]>> = Vec::with_capacity(lanes.len());
-        // Per lane: its window list pages.
-        let mut window_tables: Vec<Vec<u32>> = Vec::with_capacity(lanes.len());
-        let has_window = self.pools.layout().window.is_some();
+        // Per window list, per lane: its pages.
+        let window_lists = self.pools.layout().window_lists().count();
+        let mut window_tables: Vec<Vec<Vec<u32>>> =
+            vec![Vec::with_capacity(lanes.len()); window_lists];
         let mut tokens: Vec<i32> = Vec::with_capacity(rows as usize);
         let mut positions: Vec<i32> = Vec::with_capacity(rows as usize);
         let mut rotations: Vec<i32> = Vec::with_capacity(rows as usize);
@@ -2689,15 +2868,18 @@ impl Shell {
                 engine::fire::RsReset::Held => false,
             };
             let record = self.record_of(seated)?;
-            window_tables.push(if has_window && !seated.kv_less {
-                let page_size = u64::from(self.pools.window_paging().page_size.max(1));
-                let after = u64::from(have) + u64::from(row.rows);
-                let pages = u32::try_from(after.div_ceil(page_size).max(1)).unwrap_or(u32::MAX);
-                let seat = (!seated.refs || seated.window.is_empty()).then_some((lane.slot, pages));
-                self.pools.window_pages(seated.window, seat)?
-            } else {
-                Vec::new()
-            });
+            for (k, lists) in window_tables.iter_mut().enumerate() {
+                lists.push(if seated.kv_less {
+                    Vec::new()
+                } else {
+                    let page_size = u64::from(self.pools.window_paging(k).page_size.max(1));
+                    let after = u64::from(have) + u64::from(row.rows);
+                    let pages = u32::try_from(after.div_ceil(page_size).max(1)).unwrap_or(u32::MAX);
+                    let refs = seated.windows.get(k).map_or(&[][..], Vec::as_slice);
+                    let seat = (!seated.refs || refs.is_empty()).then_some((lane.slot, pages));
+                    self.pools.window_pages(k, refs, seat)?
+                });
+            }
             state_top = record
                 .iter()
                 .map(|&id| id.saturating_add(1))
@@ -3026,13 +3208,20 @@ impl Shell {
 
         let indptr_host = kv::indptr(&seats)?;
         let table_refs: Vec<&[u32]> = tables.iter().map(std::convert::AsRef::as_ref).collect();
-        let window_refs: Vec<&[u32]> = window_tables.iter().map(Vec::as_slice).collect();
+        let window_refs: Vec<Vec<&[u32]>> = window_tables
+            .iter()
+            .map(|lists| lists.iter().map(Vec::as_slice).collect())
+            .collect();
         let mut geometries = Vec::with_capacity(self.page_tables);
         for &paging_of in self.pools.tables() {
             geometries.push(match paging_of {
                 crate::store::TablePaging::List => kv::geometry_with(&paging, &seats, &table_refs)?,
-                crate::store::TablePaging::Window => {
-                    kv::geometry_with(&self.pools.window_paging(), &seats, &window_refs)?
+                crate::store::TablePaging::Window(k) => {
+                    let k = usize::from(k);
+                    let refs = window_refs.get(k).ok_or_else(|| {
+                        Fault::program("serve::prepare", format!("window list {k} has no table"))
+                    })?;
+                    kv::geometry_with(&self.pools.window_paging(k), &seats, refs)?
                 }
             });
         }
@@ -3537,7 +3726,20 @@ impl Shell {
             voxels: bound.voxels,
             inputs: bound.inputs,
             geometry,
-            window_table: self.pools.table_of(crate::store::TablePaging::Window),
+            window_tables: self
+                .pools
+                .layout()
+                .window_lists()
+                .enumerate()
+                .map(|(k, window)| {
+                    (
+                        window.rows,
+                        self.pools.table_of(crate::store::TablePaging::Window(
+                            u8::try_from(k).unwrap_or(u8::MAX),
+                        )),
+                    )
+                })
+                .collect(),
             tables: FireTables {
                 request_of_token: bound.request_of_token,
                 readout_positions: bound.readout_positions,

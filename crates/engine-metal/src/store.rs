@@ -4,8 +4,9 @@ pub mod kv;
 pub mod layout;
 pub mod pool;
 mod pools;
+pub mod streamed;
 
-pub use pools::{Pools, Rows, RsRows, TablePaging};
+pub use pools::{Pools, Rows, RsRows, TablePaging, WindowRows};
 
 use kernels_metal::{StateMap, Tensor};
 use poem_ir::{Attn, Def, Dtype, Operation, Trace};

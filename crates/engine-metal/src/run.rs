@@ -19,8 +19,14 @@ pub enum WeightRow {
     Planes(Bank),
 }
 
+/// Each param's binding, and the address table each weight the weight
+/// cache streams is read through (`None`: read whole, as bound): a row
+/// table, or for a routed bank an expert table (one-row blocks).
 #[derive(Clone, Debug, Default)]
-pub struct WeightTable(pub Vec<Option<WeightRow>>);
+pub struct WeightTable(
+    pub Vec<Option<WeightRow>>,
+    pub Vec<Option<crate::store::streamed::Streamed>>,
+);
 
 #[derive(Clone, Debug, Default)]
 pub struct SlotTable(pub Vec<Option<Tensor>>);
@@ -124,8 +130,9 @@ pub struct FireBindings {
 
     /// One a page table: the kv list's first, the All axis's.
     pub geometry: Vec<CacheGeometry>,
-    /// The page table of `geometry` a windowed row's write descriptor reads.
-    pub window_table: usize,
+    /// The page table of `geometry` each window list's write descriptors
+    /// read, by the window (rows retained) the list keeps.
+    pub window_tables: Vec<(u32, usize)>,
 
     pub tables: FireTables,
 
@@ -1669,6 +1676,34 @@ impl<'c> Run<'c> {
         })
     }
 
+    /// The address table weight `id` is read through, where the weight
+    /// cache streams it (by its rows, or an expert at a time).
+    pub(crate) fn row_table(&self, id: ValueId) -> Option<kernels_metal::gather::RowTable> {
+        match self.streamed(id)? {
+            crate::store::streamed::Streamed::Rows(table) => Some(table),
+            crate::store::streamed::Streamed::Experts(_) => None,
+        }
+    }
+
+    /// The expert table routed bank `id` is read through, where the weight
+    /// cache streams it an expert at a time.
+    pub(crate) fn expert_table(
+        &self,
+        id: ValueId,
+    ) -> Option<kernels_metal::linear::moe::ExpertTable> {
+        match self.streamed(id)? {
+            crate::store::streamed::Streamed::Experts(table) => Some(table),
+            crate::store::streamed::Streamed::Rows(_) => None,
+        }
+    }
+
+    fn streamed(&self, id: ValueId) -> Option<crate::store::streamed::Streamed> {
+        let Def::Weight(w) = &self.values[id.0 as usize].def else {
+            return None;
+        };
+        self.weights.1.get(*w as usize).copied().flatten()
+    }
+
     pub(crate) fn banked(&self, id: ValueId) -> Option<Bank> {
         let at = id.0 as usize;
         let Def::Weight(w) = &self.values[at].def else {
@@ -1720,7 +1755,13 @@ impl<'c> Run<'c> {
     /// All axis's (the first), or a write descriptor's row's list's.
     fn table_of(&self, kind: GeomKind) -> usize {
         match poem_exec::store::kv::geometry_window(kind) {
-            Some(_) => self.fire.window_table,
+            Some(window) => self
+                .fire
+                .window_tables
+                .iter()
+                .find(|(rows, _)| *rows == window)
+                .or(self.fire.window_tables.first())
+                .map_or(0, |(_, table)| *table),
             None => 0,
         }
     }

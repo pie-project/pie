@@ -93,10 +93,10 @@ fn write_checkpoint(path: &Path, trace: &Trace) {
     writer.finish().expect("the fixture finishes");
 }
 
-struct Fixture {
-    trace: Trace,
-    contract: ModelContract,
-    container: PathBuf,
+pub(super) struct Fixture {
+    pub(super) trace: Trace,
+    pub(super) contract: ModelContract,
+    pub(super) container: PathBuf,
 }
 
 fn fixture(model: &str) -> Fixture {
@@ -104,7 +104,7 @@ fn fixture(model: &str) -> Fixture {
 }
 
 /// The model's fixture, cut to `layers` where stated.
-fn fixture_of(model: &str, layers: Option<u32>) -> Fixture {
+pub(super) fn fixture_of(model: &str, layers: Option<u32>) -> Fixture {
     let package = poem_compiler::catalog::package_of(model).expect("the model is listed");
     let deploy = poem::star::Deploy {
         layers,
@@ -113,9 +113,14 @@ fn fixture_of(model: &str, layers: Option<u32>) -> Fixture {
     let trace = package
         .trace(model, &deploy, model, Platform::Metal)
         .unwrap_or_else(|why| panic!("`{model}` traces: {why:#}"));
+    fixture_from(trace, &format!("{model}-{}", layers.unwrap_or(0)))
+}
+
+/// The fixture of `trace`, its checkpoint written under `name`.
+pub(super) fn fixture_from(trace: Trace, name: &str) -> Fixture {
     let dir = std::env::temp_dir().join(format!("pie-bm-pool-{}", std::process::id()));
     std::fs::create_dir_all(&dir).expect("the fixture dir");
-    let container = dir.join(format!("{model}-{}.zt", layers.unwrap_or(0)));
+    let container = dir.join(format!("{name}.zt"));
     if !container.exists() {
         write_checkpoint(&container, &trace);
     }
@@ -129,11 +134,14 @@ fn fixture_of(model: &str, layers: Option<u32>) -> Fixture {
     }
 }
 
-fn load(fixture: &Fixture) -> Shell {
-    load_with(fixture, CONTEXT)
+pub(super) fn load_with(fixture: &Fixture, context: u32) -> Shell {
+    load_near(fixture, context, None)
 }
 
-fn load_with(fixture: &Fixture, context: u32) -> Shell {
+/// The shell, its pool's recipe aiming its chunk near `chunk` bytes where
+/// stated.
+fn load_near(fixture: &Fixture, context: u32, chunk: Option<u64>) -> Shell {
+    let residency = engine_metal::ResidencyPlan::default();
     Shell::load(Boot {
         trace: fixture.trace.clone(),
         contract: &fixture.contract,
@@ -148,17 +156,20 @@ fn load_with(fixture: &Fixture, context: u32) -> Shell {
         kv_budget: None,
         memory_share: engine::load::DEFAULT_DEVICE_MEMORY_SHARE,
         runahead: engine::runahead::Runahead::F1,
-        residency: engine_metal::ResidencyPlan::default(),
+        residency: match chunk {
+            Some(bytes) => residency.with_chunk_bytes(bytes),
+            None => residency,
+        },
         profiles: None,
     })
     .unwrap_or_else(|why| panic!("the shell loads: {why}"))
 }
 
-fn word(trace: &Trace, rows: u32) -> u64 {
+pub(super) fn word(trace: &Trace, rows: u32) -> u64 {
     trace.facts.word(&Request::new(rows, false))
 }
 
-fn argmax(logits: &[f32]) -> u32 {
+pub(super) fn argmax(logits: &[f32]) -> u32 {
     (0..logits.len())
         .max_by(|&a, &b| logits[a].total_cmp(&logits[b]))
         .unwrap_or(0) as u32
@@ -303,7 +314,7 @@ fn serve(
 }
 
 /// Panics at the first row whose logits differ in a bit.
-fn same(what: &str, got: &[Vec<f32>], want: &[Vec<f32>]) {
+pub(super) fn same(what: &str, got: &[Vec<f32>], want: &[Vec<f32>]) {
     assert_eq!(got.len(), want.len(), "{what}: rows");
     for (at, (got, want)) in got.iter().zip(want).enumerate() {
         let differ = got
@@ -327,8 +338,15 @@ fn check(model: &str, hybrid: bool) {
         eprintln!("skipping: no Metal device");
         return;
     }
+    check_near(model, hybrid, None);
+}
+
+/// [`check`] over a pool whose chunk aims near `chunk` bytes where stated:
+/// the seats' logits.
+fn check_near(model: &str, hybrid: bool, chunk: Option<u64>) -> Vec<Vec<f32>> {
     let fixture = fixture(model);
     const STEPS: usize = 12;
+    let load = |fixture: &Fixture| load_near(fixture, CONTEXT, chunk);
 
     let mut shell = load(&fixture);
     let facts = shell.pool_chunk_facts();
@@ -412,6 +430,7 @@ fn check(model: &str, hybrid: bool) {
         &scattered,
         &seats,
     );
+    seats
 }
 
 #[test]
@@ -427,6 +446,36 @@ fn a_scattered_windowed_pool_serves_the_same_logits() {
 #[test]
 fn a_scattered_hybrid_pool_serves_the_same_logits() {
     check("qwen35-tiny", true);
+}
+
+/// A gated-delta hybrid's record cut into pieces on device: its chunk aimed
+/// at 256 KiB, the 1.6 MiB record lies in pieces of their own, each piece of
+/// each lane in a chunk of its own once scattered by slot ref (and evacuated
+/// mid-decode); the logits are the same bits as the seats' runs, and as the
+/// whole record's under the profile's own chunk.
+#[test]
+fn a_record_in_pieces_serves_the_whole_records_logits() {
+    if !engine_metal::device::present() {
+        eprintln!("skipping: no Metal device");
+        return;
+    }
+    let model = "qwen35-tiny";
+    const CHUNK: u64 = 256 << 10;
+    let pieces = load_near(&fixture(model), CONTEXT, Some(CHUNK))
+        .pool_layout()
+        .pieces;
+    assert!(
+        pieces > 1,
+        "{model}'s record is whole in a {CHUNK}-byte chunk"
+    );
+    eprintln!("{model}: the record in {pieces} pieces");
+    let cut = check_near(model, true, Some(CHUNK));
+    let whole = check_near(model, true, None);
+    same(
+        &format!("{model}: the record in {pieces} pieces against whole"),
+        &cut,
+        &whole,
+    );
 }
 
 /// The pools a GDN hybrid's catalog trace lays on this device, no weights
@@ -543,17 +592,23 @@ fn a_trimmed_window_list_beside_a_compressed_kv_list_reads_as_the_whole_one() {
 }
 
 fn trimmed_window(model: &str, layers: Option<u32>, context: u32, prompt: u32) {
-    use engine_metal::store::layout::WINDOW;
-
     if !engine_metal::device::present() {
         eprintln!("skipping: no Metal device");
         return;
     }
-    let fixture = fixture_of(model, layers);
+    trimmed_windows(model, &fixture_of(model, layers), context, prompt, 1);
+}
+
+/// Seat-addressed (every window page held) against slot refs trimmed as the
+/// runtime trims, each of the load's `lists` window lists by its own window
+/// and `T_w`, its slots in chunks of its own.
+fn trimmed_windows(model: &str, fixture: &Fixture, context: u32, prompt: u32, lists: usize) {
+    use engine_metal::store::layout::WINDOWS;
+
     let prompt: Vec<u32> = (0..prompt).map(|at| (at * 37 + 11) % 256).collect();
     const STEPS: usize = 24;
     let run = |trimmed: bool| -> Vec<Vec<f32>> {
-        let mut shell = load_with(&fixture, context);
+        let mut shell = load_with(fixture, context);
         let facts = shell.pool_chunk_facts();
         eprintln!(
             "{model}: shapes {:?}",
@@ -564,22 +619,39 @@ fn trimmed_window(model: &str, layers: Option<u32>, context: u32, prompt: u32) {
                 .collect::<Vec<_>>()
         );
         let layout = shell.pool_layout();
-        let window = facts.shape(WINDOW).expect("a window list");
-        let engine::chunk::SlotKind::List {
-            tokens,
-            window: Some(rows),
-            ..
-        } = window.kind
-        else {
-            panic!("the window list states its window: {:?}", window.kind);
-        };
-        let per = window.slots_per_chunk;
-        let first =
+        let mut first =
             (1 + layout.seat_chunks()).div_ceil(facts.segment_chunks) * facts.segment_chunks;
-        let pages = context.div_ceil(tokens);
-        let window_chunks = pages.div_ceil(per);
-        // A kv list beside the window list: its pages in the chunks above
-        // the window list's.
+        // Each window list: (T_w, window, slots a chunk, first chunk, step).
+        let mut windows = Vec::new();
+        for id in &WINDOWS[..lists] {
+            let window = facts.shape(*id).expect("a window list");
+            let engine::chunk::SlotKind::List {
+                tokens,
+                window: Some(rows),
+                ..
+            } = window.kind
+            else {
+                panic!("the window list states its window: {:?}", window.kind);
+            };
+            let per = window.slots_per_chunk;
+            // Page k of the lane in chunk first + k / per, slots strided in
+            // it by a step prime to `per`, so each page has a slot of its own.
+            let step = [7u32, 11, 13, 17]
+                .into_iter()
+                .find(|step| !per.is_multiple_of(*step))
+                .expect("a step prime to the slots a chunk");
+            windows.push((tokens, rows, per, first, step));
+            first += context.div_ceil(tokens).div_ceil(per);
+        }
+        assert!(
+            facts.shape(WINDOWS[lists]).is_none(),
+            "{model} states more than {lists} window lists"
+        );
+        let mut rows_retained: Vec<u32> = windows.iter().map(|w| w.1).collect();
+        rows_retained.dedup();
+        assert_eq!(rows_retained.len(), lists, "each list its own window");
+        // A kv list beside the window lists: its pages in the chunks above
+        // theirs.
         let list = facts.shape(LIST).map(|list| {
             let engine::chunk::SlotKind::List { tokens, .. } = list.kind else {
                 panic!("the kv list is a list: {:?}", list.kind);
@@ -587,18 +659,11 @@ fn trimmed_window(model: &str, layers: Option<u32>, context: u32, prompt: u32) {
             (tokens, list.slots_per_chunk)
         });
         let list_chunks = list.map_or(0, |(t, per)| context.div_ceil(t).div_ceil(per));
-        let commit = (first + window_chunks + list_chunks + 1).div_ceil(facts.segment_chunks);
+        let commit = (first + list_chunks + 1).div_ceil(facts.segment_chunks);
         shell.commit_segments(commit).expect("the segments commit");
-        // Page k of the lane in chunk first + k / per, slots strided in it
-        // by a step prime to `per`, so each page has a slot of its own.
-        let step = [7u32, 11, 13, 17]
-            .into_iter()
-            .find(|step| per % step != 0)
-            .expect("a step prime to the slots a chunk");
-        let slot_ref = |k: u32| (first + k / per) * per + (k * step + 3) % per;
         let list_ref = |k: u32| {
             let (_, per) = list.expect("a kv list");
-            (first + window_chunks + k / per) * per + (k * 5 + 1) % per
+            (first + k / per) * per + (k * 5 + 1) % per
         };
         let mut rows_out = Vec::new();
         let mut held = 0u32;
@@ -615,14 +680,19 @@ fn trimmed_window(model: &str, layers: Option<u32>, context: u32, prompt: u32) {
                 let after = held + n;
                 // Trimmed as the runtime trims: a page whose last row lies
                 // below `committed_end - window` reads the null chunk.
-                let table: Vec<u32> = (0..after.div_ceil(tokens))
-                    .map(|k| {
-                        let last_row = (k + 1) * tokens - 1;
-                        if trimmed && last_row + rows < held {
-                            0
-                        } else {
-                            slot_ref(k)
-                        }
+                let tables: Vec<Vec<u32>> = windows
+                    .iter()
+                    .map(|&(tokens, rows, per, first, step)| {
+                        (0..after.div_ceil(tokens))
+                            .map(|k| {
+                                let last_row = (k + 1) * tokens - 1;
+                                if last_row + rows < held {
+                                    0
+                                } else {
+                                    (first + k / per) * per + (k * step + 3) % per
+                                }
+                            })
+                            .collect()
                     })
                     .collect();
                 let list_pages: Vec<u32> = match list {
@@ -633,7 +703,7 @@ fn trimmed_window(model: &str, layers: Option<u32>, context: u32, prompt: u32) {
                     held: Some(held),
                     refs: trimmed,
                     pages: &list_pages,
-                    window: if trimmed { &table } else { &[] },
+                    windows: if trimmed { &tables } else { &[] },
                     ..Seated::of(Lane {
                         slot: 0,
                         word: word(&fixture.trace, n),
@@ -651,4 +721,58 @@ fn trimmed_window(model: &str, layers: Option<u32>, context: u32, prompt: u32) {
     let whole = run(false);
     let trimmed = run(true);
     same(&format!("{model}: trimmed against whole"), &trimmed, &whole);
+}
+
+/// Two window lists, each trimmed by its own window (CONTRACT-BC 21): a
+/// synthetic miniature, muse-glimmer-30b-mini-l8 with every other windowed
+/// layer's window halved (1024 beside 2048), its catalog copied and patched
+/// for this test alone. Past both windows, the trimmed lists read as the
+/// whole ones bit for bit.
+#[test]
+fn two_trimmed_window_lists_read_as_the_whole_ones() {
+    if !engine_metal::device::present() {
+        eprintln!("skipping: no Metal device");
+        return;
+    }
+    let model = "muse-glimmer-30b-mini-l8";
+    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../models");
+    let copy = std::env::temp_dir().join(format!("pie-bm-pool-{}-models", std::process::id()));
+    let _ = std::fs::remove_dir_all(&copy);
+    std::fs::create_dir_all(&copy).expect("the catalog copy");
+    for entry in std::fs::read_dir(&root).expect("the catalog") {
+        let entry = entry.expect("a catalog entry");
+        let into = copy.join(entry.file_name());
+        if entry.file_type().expect("its type").is_dir() {
+            let status = std::process::Command::new("cp")
+                .arg("-R")
+                .arg(entry.path())
+                .arg(&into)
+                .status()
+                .expect("cp runs");
+            assert!(status.success());
+        } else {
+            std::fs::copy(entry.path(), &into).expect("the file copies");
+        }
+    }
+    let poem = copy.join("muse_glimmer.poem");
+    let text = std::fs::read_to_string(&poem).expect("the package reads");
+    let patched = text.replace(
+        "        win = windows[reading]\n",
+        "        win = windows[reading]\n        if win and l % 2 == 1:\n            win = m.window // 2\n",
+    );
+    assert_ne!(patched, text, "the patch applies");
+    std::fs::write(&poem, patched).expect("the package writes");
+    let catalog = poem_compiler::catalog::Catalog::from_dir(&copy).expect("the copy reads");
+    let package = catalog.package_of(model).expect("the model is listed");
+    let trace = package
+        .trace(
+            model,
+            &poem_compiler::catalog::one_rank(Dtype::Bf16, Dtype::Bf16),
+            model,
+            Platform::Metal,
+        )
+        .unwrap_or_else(|why| panic!("`{model}` traces: {why:#}"));
+    std::fs::remove_dir_all(&copy).expect("the copy goes");
+    let fixture = fixture_from(trace, &format!("{model}-two-windows"));
+    trimmed_windows(model, &fixture, 2560, 2200, 2);
 }

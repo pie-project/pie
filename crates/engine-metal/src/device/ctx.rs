@@ -376,6 +376,29 @@ impl Context {
         Ok(opened)
     }
 
+    /// Keeps `slabs` resident for every frame on this context's queue (or
+    /// lets them go, `keep` false), through the Metal 4 residency set the
+    /// queue carries: answers false where there is none.
+    pub fn hold_resident<'a>(
+        &self,
+        slabs: impl IntoIterator<Item = &'a super::alloc::Slab>,
+        keep: bool,
+    ) -> Result<bool> {
+        #[cfg(target_vendor = "apple")]
+        {
+            let Some(sparse) = self.sparse()? else {
+                return Ok(false);
+            };
+            sparse.hold(slabs, keep);
+            Ok(true)
+        }
+        #[cfg(not(target_vendor = "apple"))]
+        {
+            let _ = (slabs.into_iter().count(), keep);
+            Ok(false)
+        }
+    }
+
     pub fn frame(&self) -> Result<Frame> {
         #[cfg(target_vendor = "apple")]
         {

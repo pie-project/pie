@@ -1121,10 +1121,11 @@ impl Run<'_> {
                 quantized: false,
                 quant: None,
                 ..
-            } => linear::moe::matmul_select(
+            } => linear::moe::matmul_select_tabled(
                 self.ctx(),
                 self.tensor(*x),
                 self.tensor(*bank),
+                self.expert_table(*bank),
                 self.tensor(*routes),
                 self.tensor(*y),
             ),

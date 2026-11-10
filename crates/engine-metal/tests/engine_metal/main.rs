@@ -6,6 +6,7 @@ mod a_column_cut_of_a_bank_multiplies_as_its_copy;
 mod a_copied_window_is_one_encode_over_the_same_rows;
 mod a_fenced_frame_lands_both_sides;
 mod a_gate_and_an_up_apart_land_what_they_land_packed;
+mod a_parked_lane_serves_the_never_parked_logits;
 mod a_prompt_scan_lands_its_snapshots;
 mod a_scattered_kv_pool_is_the_dense_one;
 mod a_scattered_pool_serves_the_same_logits;
@@ -46,6 +47,7 @@ mod the_selector_reads_out_the_reference_walk;
 mod the_staged_rows_match_affine_dots;
 mod the_tower_reads_pixels_as_the_host_cut_them;
 mod the_voxel_axis_answers_its_host_reference;
+mod the_weight_cache_serves_the_dense_logits;
 
 /// The `device_kv_budget` a test states for its shell: none, so the chunk
 /// pool spans the room. A sparse pool maps only the segments a fire touches

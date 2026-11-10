@@ -9,7 +9,7 @@ use kernels_metal::{KvPool, RecurrentPool, StateMap, Tensor};
 use poem_compiler::chunk::{ChunkRecipe, RowId, SlotLayout};
 use poem_ir::{CacheRow, Dtype, Trace};
 
-use super::layout::{FIXED, LIST, Layout, RS, Slots, WINDOW, gcd};
+use super::layout::{FIXED, LIST, Layout, MAX_WINDOWS, RS, Slots, WINDOWS, gcd};
 use super::pool::Pool;
 use super::{
     STATE_MAP_BYTES, Seats, Spill, TableSeat, compressed_rows, elem_bytes, elem_size, narrow,
@@ -147,11 +147,20 @@ pub struct RsRows {
 }
 
 /// The list a kv row's slots lie in, so the page table it reads: the kv
-/// list or the window list (CONTRACT-BC 19).
+/// list or window list `k` (CONTRACT-BC 19, 21).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TablePaging {
     List,
-    Window,
+    Window(u8),
+}
+
+/// One window list as the recipe lays it: its slot bytes, the rows its
+/// window retains and the tokens (`T_w`) a slot holds.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct WindowRows {
+    pub bytes: u64,
+    pub rows: u32,
+    pub tokens: u32,
 }
 
 /// How a load's rows lay into the recipe's slots, before any pool is
@@ -166,14 +175,11 @@ pub struct Rows {
     pub tokens: u32,
     pub fixed_bytes: u64,
     pub pieces: u32,
-    /// The window list's slot bytes (CONTRACT-BC 19), the rows its window
-    /// retains and the tokens (`T_w`) a slot holds (CONTRACT-BC 21); zero
+    /// The window lists (CONTRACT-BC 19, 21), in the recipe's order; none
     /// where nothing is windowed.
-    pub window_bytes: u64,
-    pub window_rows: u32,
-    pub window_tokens: u32,
+    pub windows: Vec<WindowRows>,
     /// The page tables a fire stages, by the list each pages: the kv
-    /// list's first (the All axis's), then the window list's.
+    /// list's first (the All axis's), then the window lists'.
     pub tables: Vec<TablePaging>,
     /// Each distinct set of record slots a state row's pieces lie in.
     pub bands: Vec<Vec<u32>>,
@@ -234,22 +240,37 @@ impl Rows {
         facts: &Facts,
         rs: Option<&crate::rs::Layout>,
     ) -> Result<Rows> {
-        let windows: Vec<&SlotLayout> = recipe.windows().collect();
-        if windows.len() > 1 {
-            return Err(disagree(format!(
-                "keeps {} window lists ({}), where a load pages one",
-                windows.len(),
-                recipe.shapes()
-            )));
-        }
-        let (window_tokens, window_bytes, window_rows, window_runs) = match windows.first() {
-            Some(SlotLayout::List {
+        let mut windows: Vec<WindowRows> = Vec::new();
+        let mut window_runs: Vec<&[poem_compiler::chunk::TokenRun]> = Vec::new();
+        for layout in recipe.windows() {
+            if let SlotLayout::List {
                 tokens,
                 bytes,
                 rows,
                 window: Some(window),
-            }) => (*tokens, *bytes, *window, rows.as_slice()),
-            _ => (0, 0, 0, &[][..]),
+            } = layout
+            {
+                windows.push(WindowRows {
+                    bytes: *bytes,
+                    rows: *window,
+                    tokens: *tokens,
+                });
+                window_runs.push(rows.as_slice());
+            }
+        }
+        if windows.len() > MAX_WINDOWS {
+            return Err(disagree(format!(
+                "keeps {} window lists ({}), where a load pages at most {MAX_WINDOWS}",
+                windows.len(),
+                recipe.shapes()
+            )));
+        }
+        // The window list a row's run lies in, and its run.
+        let windowed = |id: RowId| {
+            window_runs
+                .iter()
+                .enumerate()
+                .find_map(|(k, runs)| runs.iter().find(|run| run.row == id).map(|run| (k, run)))
         };
         let (tokens, list_bytes, runs) = match recipe.list() {
             Some(SlotLayout::List {
@@ -269,16 +290,17 @@ impl Rows {
             }) => (*bytes, *pieces_per_ws, rows.as_slice()),
             _ => (0, 0, &[][..]),
         };
-        // Without a list the window list's slot is the kv page.
+        // Without a list the widest window slot is the kv page.
         let tokens = if list_bytes == 0 {
-            window_tokens
+            windows.iter().map(|w| w.tokens).max().unwrap_or(0)
         } else {
             tokens
         };
-        if window_bytes > 0 && (window_tokens == 0 || window_tokens > tokens) {
+        if let Some(window) = windows.iter().find(|w| w.tokens == 0 || w.tokens > tokens) {
             return Err(disagree(format!(
-                "pages windowed rows {window_tokens} tokens a window slot beside {tokens}-token \
-                 kv pages, where a window list's slot holds no more than a kv page"
+                "pages windowed rows {} tokens a window slot beside {tokens}-token kv pages, \
+                 where a window list's slot holds no more than a kv page",
+                window.tokens
             )));
         }
         let mut tables: Vec<TablePaging> = Vec::new();
@@ -304,12 +326,12 @@ impl Rows {
                     let (paging, offset, stated, run_tokens) =
                         if let Some(run) = runs.iter().find(|run| run.row == id) {
                             (TablePaging::List, run.offset, run.per_token, tokens)
-                        } else if let Some(run) = window_runs.iter().find(|run| run.row == id) {
+                        } else if let Some((k, run)) = windowed(id) {
                             (
-                                TablePaging::Window,
+                                TablePaging::Window(u8::try_from(k).unwrap_or(u8::MAX)),
                                 run.offset,
                                 run.per_token,
-                                window_tokens,
+                                windows[k].tokens,
                             )
                         } else {
                             return Err(disagree(format!("lays kv row `{name}` in no slot")));
@@ -401,8 +423,12 @@ impl Rows {
             let (paging, run, run_tokens) = if let Some(run) = runs.iter().find(|run| run.row == id)
             {
                 (TablePaging::List, run, tokens)
-            } else if let Some(run) = window_runs.iter().find(|run| run.row == id) {
-                (TablePaging::Window, run, window_tokens)
+            } else if let Some((k, run)) = windowed(id) {
+                (
+                    TablePaging::Window(u8::try_from(k).unwrap_or(u8::MAX)),
+                    run,
+                    windows[k].tokens,
+                )
             } else {
                 return Err(disagree(format!(
                     "keeps no compressor state beside kv row {row}, which a pool gather keys by"
@@ -431,12 +457,14 @@ impl Rows {
             tokens,
             fixed_bytes,
             pieces,
-            window_bytes,
-            window_rows,
-            window_tokens,
-            // The kv list's table first: the All axis reads it.
+            windows,
+            // The kv list's table first (the All axis reads it), then the
+            // window lists' in order.
             tables: {
-                tables.sort_by_key(|paging| *paging != TablePaging::List);
+                tables.sort_by_key(|paging| match paging {
+                    TablePaging::List => 0,
+                    TablePaging::Window(k) => 1 + u32::from(*k),
+                });
                 tables
             },
             bands,
@@ -526,6 +554,10 @@ pub struct Pools {
     parked: Option<Spill>,
     /// The shared pool's host tier (CONTRACT-BC 22), where one is stated.
     tier: Option<HostTier>,
+    /// The weight cache's row-streamed tables, a shape each (`super::rows`).
+    weight_caches: Vec<super::streamed::Cache>,
+    /// The runtime holds the weight set for the load's life.
+    weights_held: bool,
 }
 
 /// The host tier: chunks of the pool's size in host memory apart from the
@@ -598,6 +630,8 @@ impl Pools {
             disk: None,
             parked: None,
             tier: None,
+            weight_caches: Vec::new(),
+            weights_held: false,
         };
         pools.write_maps(device)?;
         Ok(pools)
@@ -716,6 +750,11 @@ impl Pools {
         facts.host_chunks = self.tier.as_ref().map_or(0, |tier| {
             u32::try_from(tier.chunks.len()).unwrap_or(u32::MAX)
         });
+        facts.weights = self
+            .weight_caches
+            .iter()
+            .map(|cache| cache.shape.facts())
+            .collect();
         facts.disk_chunks = self.layout.list.map_or(0, |list| {
             Spill::slots(self.disk.as_ref())
                 .checked_div(list.per_chunk)
@@ -834,11 +873,11 @@ impl Pools {
             .unwrap_or(0)
     }
 
-    /// The window list's paging: `T_w` tokens a page (CONTRACT-BC 21),
-    /// as many pages a seat as its context fills.
+    /// Window list `k`'s paging: `T_w` tokens a page (CONTRACT-BC 21), as
+    /// many pages a seat as its context fills.
     #[must_use]
-    pub fn window_paging(&self) -> Paging {
-        let tokens = self.layout.window_tokens.max(1);
+    pub fn window_paging(&self, k: usize) -> Paging {
+        let tokens = self.layout.window(k).map_or(1, |w| w.tokens.max(1));
         Paging {
             page_size: tokens,
             pages_per_slot: self.paging.context().div_ceil(tokens).max(1),
@@ -846,25 +885,43 @@ impl Pools {
         }
     }
 
-    /// What a window page id counts: `gcd(chunk, window slot)` bytes.
-    fn window_stride(&self) -> u64 {
-        self.layout.window.map_or(256, |window| {
-            gcd(self.layout.chunk_bytes, window.slot_bytes)
+    /// The most pages a seat takes in any window list.
+    #[must_use]
+    pub fn window_pages_per_slot(&self) -> u32 {
+        (0..MAX_WINDOWS)
+            .filter(|&k| self.layout.window(k).is_some())
+            .map(|k| self.window_paging(k).pages_per_slot)
+            .max()
+            .unwrap_or(0)
+    }
+
+    /// What window list `k`'s page id counts: `gcd(chunk, window slot)`
+    /// bytes.
+    fn window_stride(&self, k: usize) -> u64 {
+        self.layout.window(k).map_or(256, |window| {
+            gcd(self.layout.chunk_bytes, window.slots.slot_bytes)
         })
     }
 
-    /// A lane's window pages as kernels address them, one a window slot
-    /// (`T_w` tokens) in token order: `refs` (window slot refs, 0 a slot trimmed behind the
-    /// window: the null chunk) as units of [`Pools::window_stride`], or,
-    /// seat-addressed, seat `seat`'s run, `pages` of them.
-    pub fn window_pages(&self, refs: &[u32], seat: Option<(u32, u32)>) -> Result<Vec<u32>> {
-        let window = *self.shape(WINDOW)?;
-        let stride = self.window_stride();
+    /// A lane's pages of window list `k` as kernels address them, one a
+    /// window slot (`T_w` tokens) in token order: `refs` (window slot refs,
+    /// 0 a slot trimmed behind the window: the null chunk) as units of
+    /// [`Pools::window_stride`], or, seat-addressed, seat `seat`'s run,
+    /// `pages` of them.
+    pub fn window_pages(
+        &self,
+        k: usize,
+        refs: &[u32],
+        seat: Option<(u32, u32)>,
+    ) -> Result<Vec<u32>> {
+        let id = WINDOWS[k.min(MAX_WINDOWS - 1)];
+        let window = *self.shape(id)?;
+        let stride = self.window_stride(k);
         let unit = |slot: u32| -> Result<u32> {
             if slot == 0 {
                 return Ok(0);
             }
-            let at = self.slot_offset(WINDOW, slot)?;
+            let at = self.slot_offset(id, slot)?;
             self.pool
                 .admit(u32::try_from(at / self.layout.chunk_bytes).unwrap_or(u32::MAX))?;
             Ok(u32::try_from(at / stride).unwrap_or(u32::MAX))
@@ -872,7 +929,7 @@ impl Pools {
         if let Some((slot, pages)) = seat
             && refs.is_empty()
         {
-            let first = u64::from(slot) * u64::from(self.window_paging().pages_per_slot);
+            let first = u64::from(slot) * u64::from(self.window_paging(k).pages_per_slot);
             return (0..pages)
                 .map(|page| {
                     let id = u32::try_from(first + u64::from(page)).unwrap_or(u32::MAX);
@@ -1073,7 +1130,7 @@ impl Pools {
                     );
                     let stride = match paging {
                         TablePaging::List => list_bytes,
-                        TablePaging::Window => self.window_stride(),
+                        TablePaging::Window(k) => self.window_stride(usize::from(k)),
                     };
                     compressed.push((
                         row,
@@ -1114,9 +1171,10 @@ impl Pools {
                     tables.push(Some(table));
                     let (stride, page_size) = match paging {
                         TablePaging::List => (list_bytes, self.paging.page_size),
-                        TablePaging::Window => {
-                            (self.window_stride(), self.window_paging().page_size)
-                        }
+                        TablePaging::Window(k) => (
+                            self.window_stride(usize::from(k)),
+                            self.window_paging(usize::from(k)).page_size,
+                        ),
                     };
                     CachePool::Kv(KvPool {
                         keys: plane(u64::from(kv_heads) * u64::from(head_dim))?,
@@ -1541,10 +1599,159 @@ impl Pools {
     }
 
     /// Moves each evacuated chunk onto its new physical chunk in `frame`
-    /// and takes the moves into the chunk table.
+    /// and takes the moves into the chunk table; the weight cache's address
+    /// tables follow (no frame is in flight: the caller drained them).
     pub fn evacuate(&mut self, frame: &mut Frame, evacuation: &Evacuation) -> Result<()> {
         self.pool.evacuate(frame, evacuation)?;
-        Ok(())
+        self.restage_weights()
+    }
+
+    /// Takes the weight cache's row-streamed tables (`super::rows`).
+    pub fn seat_weights(&mut self, caches: Vec<super::streamed::Cache>) {
+        self.weight_caches = caches;
+    }
+
+    #[must_use]
+    pub fn weight_caches(&self) -> &[super::streamed::Cache] {
+        &self.weight_caches
+    }
+
+    /// The byte offset in the pool of weight slot ref `slot` of a shape of
+    /// `per_chunk` slots of `slot_bytes`: refused on the null chunk, past
+    /// the pool, or on a chunk with no memory behind it.
+    fn weight_slot(&self, per_chunk: u32, slot_bytes: u64, slot: u32) -> Result<u64> {
+        let (chunk, index) = (slot / per_chunk.max(1), slot % per_chunk.max(1));
+        if chunk == 0 || chunk >= self.layout.total_chunks {
+            return Err(Fault::Ceiling {
+                what: "chunks a weight slot ref may name (past the null chunk)",
+                need: u64::from(chunk) + 1,
+                have: u64::from(self.layout.total_chunks),
+            });
+        }
+        let physical = self.pool.physical(chunk)?;
+        self.pool.admit(physical)?;
+        Ok(u64::from(physical) * self.layout.chunk_bytes + u64::from(index) * slot_bytes)
+    }
+
+    /// See `Engine::weight_residency`: blocks newly named a slot are copied
+    /// into it in `frame`. The caller has drained every frame, commits
+    /// `frame`, then calls [`Pools::restage_weights`].
+    pub fn weight_residency(
+        &mut self,
+        frame: &mut Frame,
+        residency: &engine::chunk::WeightResidency,
+    ) -> Result<()> {
+        if self.weights_held && !residency.held {
+            return Err(Fault::Unbound {
+                what: "a weight residency that is not held after one that was: a held set is \
+                       the load's for life"
+                    .to_string(),
+            });
+        }
+        if let Some(stray) = residency.resident.iter().find(|resident| {
+            !self
+                .weight_caches
+                .iter()
+                .any(|cache| cache.shape.id == resident.atom.shape)
+        }) {
+            return Err(Fault::Unbound {
+                what: format!(
+                    "weight shape {}, which this load does not state",
+                    stray.atom.shape
+                ),
+            });
+        }
+        self.weights_held = residency.held;
+        let mut caches = std::mem::take(&mut self.weight_caches);
+        let taken = (|| -> Result<()> {
+            for cache in &mut caches {
+                let shape = cache.shape.clone();
+                let mut named: Vec<Option<u32>> = vec![None; shape.count as usize];
+                for resident in residency
+                    .resident
+                    .iter()
+                    .filter(|resident| resident.atom.shape == shape.id)
+                {
+                    let Some(seat) = named.get_mut(resident.atom.atom as usize) else {
+                        return Err(Fault::Ceiling {
+                            what: "atoms of a weight shape",
+                            need: u64::from(resident.atom.atom) + 1,
+                            have: u64::from(shape.count),
+                        });
+                    };
+                    *seat = Some(resident.slot);
+                }
+                let offset = |slot: u32| self.weight_slot(shape.per_chunk, shape.slot_bytes, slot);
+                cache.take(frame, named, self.pool.view(), &offset)?;
+            }
+            Ok(())
+        })();
+        self.weight_caches = caches;
+        taken
+    }
+
+    /// Rewrites every weight address table for where its blocks lie now.
+    /// No frame is in flight.
+    pub fn restage_weights(&mut self) -> Result<()> {
+        let base = crate::device::alloc::slab_address(self.pool.view().slab());
+        let mut caches = std::mem::take(&mut self.weight_caches);
+        let staged = caches.iter_mut().try_for_each(|cache| {
+            let (per_chunk, slot_bytes) = (cache.shape.per_chunk, cache.shape.slot_bytes);
+            cache.restage(base, &|slot| self.weight_slot(per_chunk, slot_bytes, slot))
+        });
+        self.weight_caches = caches;
+        staged
+    }
+
+    /// Whether the runtime holds the weight set for the load's life and
+    /// names every atom of every shape: the tables' own copies may go.
+    #[must_use]
+    pub fn weights_whole(&self) -> bool {
+        self.weights_held
+            && !self.weight_caches.is_empty()
+            && self.weight_caches.iter().all(super::streamed::Cache::whole)
+    }
+
+    /// Gives back every table's own copy (see [`super::streamed::Cache::release`]).
+    pub fn release_weight_hosts(&mut self) -> Vec<(usize, u32, crate::device::alloc::Slab)> {
+        if !self.weights_whole() {
+            return Vec::new();
+        }
+        self.weight_caches
+            .iter_mut()
+            .flat_map(super::streamed::Cache::release)
+            .collect()
+    }
+
+    /// See `Engine::weight_uses`. No frame is in flight.
+    pub fn weight_uses(&mut self) -> Result<engine::chunk::WeightUses> {
+        let mut uses = Vec::new();
+        for cache in &mut self.weight_caches {
+            cache.uses(&mut uses)?;
+        }
+        Ok(engine::chunk::WeightUses {
+            uses,
+            held: self
+                .weight_caches
+                .iter()
+                .map(super::streamed::Cache::held)
+                .collect(),
+        })
+    }
+
+    /// Whether a weight slot is named in a chunk the seat runs take, where a
+    /// seat-addressed lane (a caller firing directly) writes kv and state
+    /// the runtime does not see.
+    #[must_use]
+    pub fn weights_in_seats(&self) -> bool {
+        let seats = 1..1 + self.layout.seat_chunks();
+        self.weight_caches.iter().any(|cache| {
+            cache
+                .slots()
+                .iter()
+                .flatten()
+                .any(|slot| seats.contains(&(slot / cache.shape.per_chunk.max(1))))
+        })
     }
 }
 
