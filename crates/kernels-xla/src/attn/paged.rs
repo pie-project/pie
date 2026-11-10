@@ -2048,7 +2048,7 @@ pub fn attend_fresh(
                 // narrow kv heads read so little a row that the kernel's
                 // per-row work costs more than the walk's reads (v6e
                 // gemma-4-E2B c256, one 256-wide kv head: 13.8k -> 9.2k tok/s)
-                && heads.kvh * heads.d >= 1024
+                && (heads.kvh * heads.d >= 1024 || std::env::var("PIE_PAGES_NARROW").is_ok_and(|v| v == "1"))
                 && rule.rel.is_none()
                 && rule.rbias.is_none()
                 && !matches!(planes, Planes::Paged { latent: true, .. })
