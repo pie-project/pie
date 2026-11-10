@@ -544,6 +544,9 @@ pub struct Pools {
     /// Whether the host copies the caches fill from are gone
     /// ([`Pools::drop_weight_hosts`]).
     hosts_dropped: bool,
+    /// The caches' host copies are the serving file's mapping, which no
+    /// fire may read in place ([`Pools::file_weights`]).
+    weights_filed: bool,
     /// Each record a lane named by slot refs, by its first piece's ref: the
     /// refs of all its pieces.
     records: std::collections::HashMap<u32, Vec<u32>>,
@@ -924,6 +927,7 @@ impl Pools {
             expert_caches: Vec::new(),
             weights_held: false,
             hosts_dropped: false,
+            weights_filed: false,
             records: std::collections::HashMap::new(),
             id_lanes: 1,
             snap_entries: 1,
@@ -2176,6 +2180,38 @@ impl Pools {
                 .map(|(_, table)| table.located)
                 .collect()
         };
+        if self.weights_filed {
+            let named = |shape: engine::chunk::ShapeId| {
+                residency
+                    .resident
+                    .iter()
+                    .filter(|resident| resident.atom.shape == shape)
+                    .count()
+            };
+            let short = self
+                .row_caches
+                .iter()
+                .map(|cache| (cache.shape.id, cache.slots.len()))
+                .chain(
+                    self.expert_caches
+                        .iter()
+                        .map(|cache| (cache.shape.id, cache.slots.len())),
+                )
+                .find(|&(shape, atoms)| named(shape) < atoms);
+            if !residency.held || short.is_some() {
+                return Err(Fault::Unbound {
+                    what: format!(
+                        "a weight residency that {} on a load told its weights are held: \
+                         it kept no copy a miss could be read from",
+                        match short {
+                            Some((shape, atoms)) =>
+                                format!("names {} of shape {shape}'s {atoms} atoms", named(shape)),
+                            None => "is not held".to_string(),
+                        }
+                    ),
+                });
+            }
+        }
         let before = located(self);
         self.weights_held = residency.held;
         for at in 0..self.row_caches.len() {
@@ -2314,7 +2350,21 @@ impl Pools {
                     .to_string(),
             });
         }
+        if self.weights_filed {
+            // Pageable memory: a copy a span, staged by the runtime.
+            for &(slot, file, bytes) in fills {
+                crate::device::copy_any(stream, slot, file, bytes)?;
+            }
+            return Ok(());
+        }
         crate::device::copy_batch(stream, false, fills)
+    }
+
+    /// The caches' host copies are the serving file's mapping: a slot is
+    /// filled from it, and no atom is read where it lies, so a residency
+    /// names every atom and holds them.
+    pub fn file_weights(&mut self) {
+        self.weights_filed = true;
     }
 
     /// The params whose host copies no fire reads and no fill needs again:

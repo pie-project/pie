@@ -202,10 +202,16 @@ impl Shell {
             self.device.synchronize()?;
         }
         self.pools.keep_clear(chunks);
-        if self
+        let flipped = self
             .pools
-            .weight_residency(self.device.stream(), residency)?
-        {
+            .weight_residency(self.device.stream(), residency)?;
+        if self.weights_awaited {
+            // The slots are filled: the lattice is armed, this once.
+            self.device.synchronize()?;
+            self.weights_awaited = false;
+            self.cache.forget_bodies();
+            self.arm_bodies()?;
+        } else if flipped {
             if self.pools.by_refs() {
                 // The lattice fires lanes this shell seats itself, which a
                 // pool whose slots the runtime hands out no longer has: the

@@ -95,6 +95,13 @@ pub struct Residency {
     /// at load and keeps them mapped for its life.
     #[serde(default)]
     pub kv_export: bool,
+    /// Whether the weights an engine states as weight shapes are held for
+    /// the load's life: the deployment does not stream them, and the first
+    /// weight residency names every atom before any fire
+    /// (`WeightResidency::held`). An engine may then keep no host copy of
+    /// them and choose its kernels once, at that residency.
+    #[serde(default)]
+    pub weights_held: bool,
 }
 
 fn deferred_by_default() -> bool {
@@ -134,6 +141,7 @@ impl Residency {
             disk_kv_dir: None,
             disk_kv_persistent: false,
             kv_export: false,
+            weights_held: false,
         }
     }
 

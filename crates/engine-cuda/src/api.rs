@@ -608,7 +608,10 @@ impl Engine for Cuda {
             } else {
                 self.boot.ordinal
             },
-            knobs: self.boot.knobs.clone(),
+            knobs: crate::Knobs {
+                weights_held: residency.weights_held,
+                ..self.boot.knobs.clone()
+            },
             cache_dir: self.boot.cache_dir.as_deref(),
             runahead: engine::runahead::Runahead::of(frames_in_flight),
             residency: plan,

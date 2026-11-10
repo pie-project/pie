@@ -115,8 +115,20 @@ pub(super) fn bake(boot: &mut Boot<'_>) -> Result<Baked> {
         && !boot.knobs.diagnostics.dense_experts
     {
         let banks = crate::store::layout::streamed_experts(&boot.trace);
-        if boot.residency.host_experts(&boot.trace, &banks)? > 0 {
-            boot.deferred_tier = false;
+        match host_copy(boot, &banks)? {
+            HostCopy::Filed => {
+                boot.residency
+                    .file_weights(&boot.trace, &banks, true, false)?;
+            }
+            HostCopy::Mapped => {
+                boot.residency
+                    .file_weights(&boot.trace, &banks, true, true)?;
+            }
+            HostCopy::Pinned => {
+                if boot.residency.host_experts(&boot.trace, &banks)? > 0 {
+                    boot.deferred_tier = false;
+                }
+            }
         }
     }
     boot.slots = poem_compiler::state_slots(boot.slots, &boot.trace, DEFAULT_STATE_SLOTS);
@@ -195,8 +207,20 @@ pub(super) fn bake(boot: &mut Boot<'_>) -> Result<Baked> {
     // above folded into another op is read whole, and stays on the device.
     if !boot.knobs.diagnostics.dense_weights {
         let streamed = crate::store::layout::streamed_rows(&boot.trace);
-        if boot.residency.host_rows(&boot.trace, &streamed)? > 0 {
-            boot.deferred_tier = false;
+        match host_copy(boot, &streamed)? {
+            HostCopy::Filed => {
+                boot.residency
+                    .file_weights(&boot.trace, &streamed, false, false)?;
+            }
+            HostCopy::Mapped => {
+                boot.residency
+                    .file_weights(&boot.trace, &streamed, false, true)?;
+            }
+            HostCopy::Pinned => {
+                if boot.residency.host_rows(&boot.trace, &streamed)? > 0 {
+                    boot.deferred_tier = false;
+                }
+            }
         }
     }
     if boot.knobs.diagnostics.trace_census {
@@ -459,6 +483,70 @@ pub(super) fn bake(boot: &mut Boot<'_>) -> Result<Baked> {
 /// token budget back toward `asked`'s, the budget before `bake` cut it at the
 /// asked lanes; `Pools::fit_the_card` still refuses past that.
 #[allow(clippy::too_many_arguments)]
+/// Where the weight cache's copy of a streamable weight lies off the device.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum HostCopy {
+    /// In the serving file's mapping, copied into pool slots at the first
+    /// weight residency and never read where it lies.
+    Filed,
+    /// In the serving file's mapping, a miss read where it lies.
+    Mapped,
+    /// Pinned on the host tier, a miss read where it lies.
+    Pinned,
+}
+
+/// Where the weights `params` the weight cache takes are kept off the
+/// device.
+///
+/// A load whose weights the runtime holds whole in the pool for its life
+/// (`Knobs::weights_held`) leaves them in the model's serving file, where
+/// the file holds each as the trace reads it; no fire reads a host copy.
+/// A load that streams reads its misses from a copy: the file's mapping
+/// where the device faults mapped pages in, else pinned host memory, which
+/// is refused where the machine does not have it rather than left to the
+/// kernel to kill.
+fn host_copy(boot: &Boot<'_>, params: &[usize]) -> Result<HostCopy> {
+    if params.is_empty() {
+        return Ok(HostCopy::Pinned);
+    }
+    let bytes = crate::weights::plane_bytes(&boot.trace)?;
+    let in_file = crate::checkpoint_serving::Serving::open(boot.checkpoint, &boot.trace)
+        .is_some_and(|serving| serving.holds(params, &bytes));
+    let pinned: u64 = params.iter().map(|&param| bytes[param]).sum();
+    if boot.knobs.weights_held {
+        if in_file {
+            return Ok(HostCopy::Filed);
+        }
+        eprintln!(
+            "engine-cuda: {} MiB of weights the pool will hold are pinned on the host at \
+             load: {} does not hold their planes as this plan reads them (a plane decoded \
+             at load), so their slots cannot be filled from the file",
+            pinned >> 20,
+            boot.checkpoint.display()
+        );
+    } else if in_file && crate::experts::pageable_access() {
+        return Ok(HostCopy::Mapped);
+    }
+    let have = crate::weights::available_memory();
+    if pinned > have {
+        return Err(Fault::Residency(format!(
+            "this load keeps a pinned host copy of the weights its cache streams, {:.1} GiB, \
+             and this machine has {:.1} GiB of memory left for it. {}",
+            pinned as f64 / f64::from(1u32 << 30),
+            have as f64 / f64::from(1u32 << 30),
+            if boot.knobs.weights_held {
+                "Its checkpoint's planes need decoding at load, so they cannot be read \
+                 from the file; give the host more memory."
+            } else {
+                "Set `weight_streaming = \"off\"` (the weights are then held on the \
+                 device and read from the file), or use a device with pageable memory \
+                 access (HMM)."
+            }
+        )));
+    }
+    Ok(HostCopy::Pinned)
+}
+
 fn refit(
     boot: &mut Boot<'_>,
     device: &Context,
@@ -1103,6 +1191,7 @@ impl Shell {
             tiers,
             landing,
             armed: None,
+            weights_awaited: false,
             media,
             shifted,
             lane_shifted,
@@ -1341,7 +1430,19 @@ impl Staged {
                 crate::device::free_bytes().unwrap_or(0) >> 20
             );
         }
-        shell.arm_bodies()?;
+        // Weights left in the serving file are on no tier a fire can read
+        // until the first weight residency fills their slots: the lattice
+        // is armed there, once, over where they then lie.
+        if shell
+            .weights
+            .experts()
+            .is_some_and(|tier| tier.plan().files())
+        {
+            shell.weights_awaited = true;
+            shell.pools.file_weights();
+        } else {
+            shell.arm_bodies()?;
+        }
         let resident = footprint(&shell, device_total, free_before);
         let fitted = shell.pools.fit_the_card(0, held_for_fires, &resident)?;
         if arm_trace {

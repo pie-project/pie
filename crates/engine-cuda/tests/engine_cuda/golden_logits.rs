@@ -121,9 +121,11 @@ fn hash_logits(logits: &[f32]) -> u64 {
 /// to fewer experts.
 const INDEX_SPAN: u64 = 8;
 
-fn write_checkpoint(path: &Path, trace: &Trace) {
-    let mut writer =
-        ztensor::Writer::create(path).unwrap_or_else(|why| panic!("{}: {why}", path.display()));
+type Seeded = (String, Vec<u64>, ztensor::Leaf, Vec<u8>);
+
+/// `trace`'s checkpoint planes seeded by name, in name order.
+fn seeded_planes(trace: &Trace) -> Vec<Seeded> {
+    let mut out = Vec::new();
     let mut planes: Vec<_> = trace
         .params
         .iter()
@@ -198,13 +200,42 @@ fn write_checkpoint(path: &Path, trace: &Trace) {
             ),
             other => panic!("`{}` is {other:?}, not a dtype the probe seeds", param.name),
         };
+        out.push((param.name.clone(), param.shape.clone(), leaf, bytes));
+    }
+    out
+}
+
+fn write_checkpoint(path: &Path, trace: &Trace) {
+    let mut writer =
+        ztensor::Writer::create(path).unwrap_or_else(|why| panic!("{}: {why}", path.display()));
+    for (name, shape, leaf, bytes) in seeded_planes(trace) {
         writer
-            .add(param.name.as_str(), param.shape.clone(), leaf, &bytes)
-            .unwrap_or_else(|why| panic!("`{}`: {why}", param.name));
+            .add(name.as_str(), shape, leaf, &bytes)
+            .unwrap_or_else(|why| panic!("`{name}`: {why}"));
     }
     writer
         .finish()
         .unwrap_or_else(|why| panic!("{}: {why}", path.display()));
+}
+
+/// The same planes as a serving artifact: the file a deployed model loads
+/// from, whose planes lie in it as the trace reads them.
+fn write_serving(path: &Path, trace: &Trace, model: &str) {
+    use checkpoint::file::emit::{self, Object};
+    let planes = seeded_planes(trace);
+    let objects: Vec<Object<'_>> = planes
+        .iter()
+        .map(|(name, shape, leaf, bytes)| Object::leaf(name, shape.clone(), *leaf, bytes))
+        .collect();
+    emit::write(
+        path,
+        &checkpoint::serving::Stamp::of("cuda", model),
+        &std::collections::BTreeMap::new(),
+        4096,
+        &objects,
+        |object, plane, _| panic!("{object}/{plane} is not streamed here"),
+    )
+    .unwrap_or_else(|why| panic!("{}: {why}", path.display()));
 }
 
 /// `model` traced for CUDA, every plane and its kv cache bf16: a model whose
@@ -245,13 +276,24 @@ struct Fixture {
 /// `model`'s trace and its seeded checkpoint, written once into `cache`'s
 /// `fixtures` and read back by every later run.
 fn fixture(model: &str, cache: &Path) -> Fixture {
+    fixture_as(model, cache, false)
+}
+
+/// [`fixture`], the checkpoint a serving artifact where `serving`: the same
+/// bytes, laid as a deployed model's file lays them.
+fn fixture_as(model: &str, cache: &Path, serving: bool) -> Fixture {
     let trace = trace_of(model);
     let dir = cache.join("fixtures");
     std::fs::create_dir_all(&dir).unwrap_or_else(|why| panic!("{}: {why}", dir.display()));
-    let container = dir.join(format!("{model}.zt"));
+    let suffix = if serving { "serving.zt" } else { "zt" };
+    let container = dir.join(format!("{model}.{suffix}"));
     if !container.exists() {
-        let partial = dir.join(format!("{model}.zt.{}", std::process::id()));
-        write_checkpoint(&partial, &trace);
+        let partial = dir.join(format!("{model}.{suffix}.{}", std::process::id()));
+        if serving {
+            write_serving(&partial, &trace, model);
+        } else {
+            write_checkpoint(&partial, &trace);
+        }
         std::fs::rename(&partial, &container)
             .unwrap_or_else(|why| panic!("{}: {why}", container.display()));
     }
@@ -278,20 +320,20 @@ fn load(fixture: &Fixture, cache: &Path) -> Shell {
     load_with(fixture, cache, knobs())
 }
 
-/// The model loaded with the weight cache's shapes stated: every atom read
-/// from the host copy until a residency names it a slot.
-fn load_cached(fixture: &Fixture, cache: &Path) -> Shell {
-    let mut knobs = knobs();
-    knobs.diagnostics.dense_weights = false;
-    load_with(fixture, cache, knobs)
-}
-
 fn load_with(fixture: &Fixture, cache: &Path, knobs: engine_cuda::Knobs) -> Shell {
     Shell::load(Boot {
         trace: fixture.trace.clone(),
         contract: &fixture.contract,
         checkpoint: &fixture.container,
-        budget: Budget::new(1, TOKENS),
+        // `PIE_GOLDEN_TOKENS`: the most rows a fire lands, which the
+        // lattice a load arms grows with.
+        budget: Budget::new(
+            1,
+            std::env::var("PIE_GOLDEN_TOKENS")
+                .ok()
+                .and_then(|tokens| tokens.parse().ok())
+                .unwrap_or(TOKENS),
+        ),
         patches: None,
         voxels: None,
         page_size: PAGE,
@@ -2019,8 +2061,20 @@ fn golden_rows_resident() {
 /// or every other one): each step's logits. Checks the use record's counts
 /// of where the experts lie.
 fn served_experts(fixture: &Fixture, cache: &Path, rows: Rows) -> Vec<Vec<f32>> {
+    served_experts_as(fixture, cache, rows, false)
+}
+
+/// [`served_experts`], the load told at the start that its weights are held
+/// (`told`: a deployment that streams nothing says so in its load request),
+/// so it keeps no host copy and arms at the residency.
+fn served_experts_as(fixture: &Fixture, cache: &Path, rows: Rows, told: bool) -> Vec<Vec<f32>> {
+    let began = std::time::Instant::now();
     use engine::chunk::{ResidentWeight, WeightAtom, WeightKind, WeightResidency};
-    let mut shell = load_cached(fixture, cache);
+    let mut knobs = knobs();
+    knobs.diagnostics.dense_weights = false;
+    knobs.weights_held = told;
+    let mut shell = load_with(fixture, cache, knobs);
+    let loaded = began.elapsed();
     let facts = shell.chunk_facts().expect("the pool states its chunks");
     facts.validate().expect("the engine's chunk facts hold");
     let shapes: Vec<_> = facts
@@ -2087,6 +2141,13 @@ fn served_experts(fixture: &Fixture, cache: &Path, rows: Rows) -> Vec<Vec<f32>> 
             })
             .expect("the experts are cached");
     }
+    println!(
+        "boot {} {rows:?}{}: load {:.1} s, to the residency's end {:.1} s",
+        fixture.model,
+        if told { " told held" } else { "" },
+        loaded.as_secs_f64(),
+        began.elapsed().as_secs_f64()
+    );
     shell.open(0).expect("slot 0 opens");
     let mut fed = 0u32;
     let mut last = None;
@@ -2162,6 +2223,19 @@ fn golden_experts() {
                 "{model} with every expert cached: the logits moved ({line})"
             );
         }
+        // The same set on a load told from the start that it is held: no
+        // host copy, the lattice armed once.
+        let serving = fixture_as(&model, &cache, true);
+        let told = served_experts_as(&serving, &cache, Rows::Cached, true);
+        println!(
+            "golden {model} all {:016x} (Cached, told held)",
+            hash(&told)
+        );
+        assert_eq!(
+            hash(&told),
+            hash(&cached),
+            "{model} told its weights are held"
+        );
         for rows in [Rows::Host, Rows::Mixed] {
             let steps = served_experts(&fixture, &cache, rows);
             let most = steps
@@ -2249,6 +2323,40 @@ fn golden_eager() {
             "eager {model}: most |diff| {most:e} of logits up to {span:.2}, {tops} of {} \
              steps' top tokens differ",
             recorded.len()
+        );
+    }
+}
+
+/// The boot probe: each of `PIE_GOLDEN_MODELS` (Nemotron's miniature by
+/// default) loaded with every routed expert held, timed to the end of the
+/// first weight residency: on a load not told its weights are held (it pins
+/// their host copy, arms on it, and arms again at the residency) and on one
+/// told at load (the weights left in the serving file, armed once). The
+/// logits are the same; the times are printed.
+#[test]
+#[ignore = "a probe run by hand: see the module's doc"]
+fn golden_boot() {
+    if !engine_cuda::device::present() {
+        eprintln!("skipping: no CUDA device on this machine");
+        return;
+    }
+    let cache = cache_dir();
+    let models = std::env::var("PIE_GOLDEN_MODELS")
+        .map_or_else(|_| vec!["nemotron3-nano-mini".to_string()], |_| models());
+    for model in models {
+        let plain = fixture(&model, &cache);
+        let serving = fixture_as(&model, &cache, true);
+        let hash = |steps: &[Vec<f32>]| {
+            steps.iter().fold(FNV, |all, logits| {
+                fnv_bytes(all, &hash_logits(logits).to_le_bytes())
+            })
+        };
+        let untold = served_experts_as(&plain, &cache, Rows::Cached, false);
+        let told = served_experts_as(&serving, &cache, Rows::Cached, true);
+        assert_eq!(
+            hash(&told),
+            hash(&untold),
+            "{model} told its weights are held"
         );
     }
 }
