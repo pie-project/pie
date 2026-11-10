@@ -1,4 +1,5 @@
 #include "prim/device.cuh"
+#include "linear/moe/table.cuh"
 
 namespace pie::gather {
 
@@ -11,8 +12,12 @@ __global__ void embed(
     const bf16* __restrict__ weight,
     bf16* __restrict__ y,
     int hidden, int vocab, int num_tokens, int per_row,
-    const u32* __restrict__ win)
+    const u32* __restrict__ win,
+    const u64* __restrict__ rows_table, int block_rows, u32* __restrict__ hits)
 {
+    // `rows_table` (a row table, `linear/moe/table.cuh`) names where each
+    // block of `block_rows` rows lies, null for the contiguous table; `hits`
+    // counts the rows read a block, null where nobody asks.
     const int idx = static_cast<int>(blockIdx.x) * blockDim.x + threadIdx.x;
     if (idx >= num_tokens * per_row) return;
     const int n = idx / per_row;
@@ -24,8 +29,9 @@ __global__ void embed(
 
     const i32 tid_raw = token_ids[plane_row];
     const int tid = (tid_raw >= 0 && tid_raw < vocab) ? tid_raw : 0;
-    const bf16* row = weight + static_cast<long long>(tid) * hidden;
+    const bf16* row = ::pie::linear::table_row(weight, hidden, rows_table, 1, 0, block_rows, tid);
     bf16* out = y + static_cast<long long>(plane_row) * hidden;
+    if (hits != nullptr && h == 0) atomicAdd(&hits[tid / block_rows], 1u);
 
     if constexpr (VEC) {
         reinterpret_cast<float4*>(out)[h] =
