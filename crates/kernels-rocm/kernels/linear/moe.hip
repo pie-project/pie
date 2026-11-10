@@ -509,29 +509,40 @@ __global__ void reorder_moe_aligned_output(const T* __restrict__ aligned_out, co
 }
 
 // The batched GEMM's pointer triples, one a block of aligned rows.
+// An expert's weight is its entry in `expert_table` when given; a block of
+// its routes counts them in `expert_hits` (the aligned rows naming a route
+// below `num_routes`).
 template <class T>
 __global__ void build_moe_leg_ptrs(const i32* __restrict__ expert_ids, const T* __restrict__ bank_base,
                                    const T* __restrict__ aligned_in, T* __restrict__ aligned_out,
                                    const T** __restrict__ w_ptrs, const T** __restrict__ act_ptrs,
-                                   T** __restrict__ out_ptrs, int max_blocks, int block_size, int K, int N) {
+                                   T** __restrict__ out_ptrs, int max_blocks, int block_size, int K, int N,
+                                   const u64* __restrict__ expert_table, unsigned int* __restrict__ expert_hits,
+                                   const i32* __restrict__ sorted_route_ids, int num_routes) {
     const int b = blockIdx.x * blockDim.x + threadIdx.x;
     if (b >= max_blocks) return;
     const int e = expert_ids[b];
     const long long row = static_cast<long long>(b) * block_size;
-    w_ptrs[b] = bank_base + static_cast<long long>(e < 0 ? 0 : e) * N * K;
+    w_ptrs[b] = expert_plane(bank_base, static_cast<long long>(N) * K, expert_table, 1, 0, e < 0 ? 0 : e);
+    if (expert_hits != nullptr && e >= 0) {
+        unsigned int live = 0;
+        for (int i = 0; i < block_size; ++i) live += sorted_route_ids[row + i] < num_routes ? 1u : 0u;
+        if (live != 0) atomicAdd(&expert_hits[e], live);
+    }
     act_ptrs[b] = aligned_in + row * K;
     out_ptrs[b] = aligned_out + row * N;
 }
 
 // ------------------------------------------------------ dense matmuls ---
 
-// y[route] = bank[expert]·x[token or route] for a T bank (`table`, when
-// given, names each expert's rows; `hits` counts each expert's routes).
+// y[route] = bank[expert]·x[token or route] for a T bank (`expert_table`,
+// when given, names each expert's plane; `expert_hits` counts each expert's
+// routes).
 // Grid (routes, ⌈N / (4·R)⌉), 256 threads; see stream_rows.
 template <class T, bool BY_TOKEN>
 __device__ __forceinline__ void select_gemv(const i32* __restrict__ topk_idx, const T* __restrict__ act,
                                             const T* __restrict__ weight_base, T* __restrict__ out, int top_k, int K,
-                                            int N, long long expert_stride, const T* const* __restrict__ expert_table,
+                                            int N, long long expert_stride, const u64* __restrict__ expert_table,
                                             unsigned int* __restrict__ expert_hits, int rows_per_wave,
                                             const u32* __restrict__ win) {
     extern __shared__ __align__(16) unsigned char stream_smem[];
@@ -544,8 +555,8 @@ __device__ __forceinline__ void select_gemv(const i32* __restrict__ topk_idx, co
         stream_zero(y, N, rows_per_wave);
         return;
     }
-    if (expert_hits != nullptr && blockIdx.y == 0 && threadIdx.x == 0) atomicAdd(&expert_hits[expert], 1u);
-    const T* w = expert_table != nullptr ? expert_table[expert] : weight_base + expert * expert_stride;
+    if (blockIdx.y == 0 && threadIdx.x == 0) expert_note(expert_hits, expert, 1u);
+    const T* w = expert_plane(weight_base, expert_stride, expert_table, 1, 0, expert);
     const T* x = act + (BY_TOKEN ? plane_route / top_k : plane_route) * K;
     stream_rows<StreamDense<T>, T>({w}, x, y, nullptr, N, K, rows_per_wave, stream_smem);
 }
@@ -553,7 +564,7 @@ __device__ __forceinline__ void select_gemv(const i32* __restrict__ topk_idx, co
 template <class T>
 __global__ __launch_bounds__(256) void moe_matmul_select_gemv_by_token(
     const i32* __restrict__ topk_idx, const T* __restrict__ act, const T* __restrict__ weight_base,
-    T* __restrict__ out, int top_k, int K, int N, long long expert_stride, const T* const* __restrict__ expert_table,
+    T* __restrict__ out, int top_k, int K, int N, long long expert_stride, const u64* __restrict__ expert_table,
     unsigned int* __restrict__ expert_hits, int rows_per_wave, const u32* __restrict__ win) {
     select_gemv<T, true>(topk_idx, act, weight_base, out, top_k, K, N, expert_stride, expert_table, expert_hits,
                          rows_per_wave, win);
@@ -562,7 +573,7 @@ __global__ __launch_bounds__(256) void moe_matmul_select_gemv_by_token(
 template <class T>
 __global__ __launch_bounds__(256) void moe_matmul_select_gemv_by_route(
     const i32* __restrict__ topk_idx, const T* __restrict__ act, const T* __restrict__ weight_base,
-    T* __restrict__ out, int top_k, int K, int N, long long expert_stride, const T* const* __restrict__ expert_table,
+    T* __restrict__ out, int top_k, int K, int N, long long expert_stride, const u64* __restrict__ expert_table,
     unsigned int* __restrict__ expert_hits, int rows_per_wave, const u32* __restrict__ win) {
     select_gemv<T, false>(topk_idx, act, weight_base, out, top_k, K, N, expert_stride, expert_table, expert_hits,
                           rows_per_wave, win);
@@ -612,7 +623,8 @@ __device__ __forceinline__ void decode_row(const T* row, moe_u4* w) {
 template <class T, int CH, int RPW>
 __global__ __launch_bounds__(kDecodeWaves* kWave) void moe_decode_glu(
     const i32* __restrict__ topk_idx, const T* __restrict__ act, const T* __restrict__ bank, T* __restrict__ h,
-    int top_k, int I, long long expert_stride, const u32* __restrict__ win) {
+    int top_k, int I, long long expert_stride, const u32* __restrict__ win, const u64* __restrict__ expert_table,
+    unsigned int* __restrict__ expert_hits) {
     constexpr int K = 512 * CH;
     const int route = blockIdx.x;
     if (win != nullptr && route >= static_cast<int>(win[0]) * top_k) return;
@@ -632,7 +644,8 @@ __global__ __launch_bounds__(kDecodeWaves* kWave) void moe_decode_glu(
     b128 xs[CH];
 #pragma unroll
     for (int c = 0; c < CH; ++c) xs[c] = x[c * kWave];
-    const T* w = bank + expert * expert_stride;
+    if (blockIdx.y == 0 && threadIdx.x == 0) expert_note(expert_hits, expert, 1u);
+    const T* w = expert_plane(bank, expert_stride, expert_table, 1, 0, expert);
     moe_u4 g[RPW][CH], u[RPW][CH];
 #pragma unroll
     for (int r = 0; r < RPW; ++r) {
@@ -661,7 +674,8 @@ template <class T, int CH, int TOPK, int RPW>
 __global__ __launch_bounds__(kDecodeWaves* kWave) void moe_decode_down(
     const i32* __restrict__ topk_idx, const float* __restrict__ weights, const T* __restrict__ h,
     const T* __restrict__ bank, T* __restrict__ out, const T* __restrict__ shared, const T* __restrict__ gate,
-    int gate_stride, int H, long long expert_stride, const u32* __restrict__ win) {
+    int gate_stride, int H, long long expert_stride, const u32* __restrict__ win,
+    const u64* __restrict__ expert_table, unsigned int* __restrict__ expert_hits) {
     constexpr int K = 512 * CH;
     const Window window{win};
     if (!window.live(blockIdx.x)) return;
@@ -677,6 +691,10 @@ __global__ __launch_bounds__(kDecodeWaves* kWave) void moe_decode_down(
         expert[k] = topk_idx[token * TOPK + k];
         wk[k] = weights[token * TOPK + k];
     }
+    if (blockIdx.y == 0 && threadIdx.x < TOPK) expert_note(expert_hits, expert[threadIdx.x], 1u);
+    const T* wd[TOPK];
+#pragma unroll
+    for (int k = 0; k < TOPK; ++k) wd[k] = expert_plane(bank, expert_stride, expert_table, 1, 0, max(expert[k], 0));
     b128 hs[TOPK][CH];
 #pragma unroll
     for (int k = 0; k < TOPK; ++k) {
@@ -690,7 +708,7 @@ __global__ __launch_bounds__(kDecodeWaves* kWave) void moe_decode_down(
         const long long row = min(row0 + r, H - 1);
 #pragma unroll
         for (int k = 0; k < TOPK; ++k)
-            decode_row<CH>(bank + max(expert[k], 0) * expert_stride + row * K, dv[r][k]);
+            decode_row<CH>(wd[k] + row * K, dv[r][k]);
     }
     const float s = shared != nullptr ? 1.f / (1.f + __expf(-to_f32(gate[token * gate_stride]))) : 0.f;
 #pragma unroll
@@ -722,7 +740,9 @@ __global__ __launch_bounds__(kGroupWaves<MT>* kWave) void moe_matmul_select_grou
                                                                  const i32* __restrict__ offsets,
                                                                  const i32* __restrict__ work,
                                                                  const T* __restrict__ bank, T* __restrict__ out,
-                                                                 int act_div, int n, int k, int num_experts) {
+                                                                 int act_div, int n, int k, int num_experts,
+                                                                 const u64* __restrict__ expert_table,
+                                                                 unsigned int* __restrict__ expert_hits) {
     // Each XCD (block b runs on XCD b mod 8) takes a run of the grid in
     // (tile, item) order: its CUs walk one weight tile's items together, so
     // the tile is read from its L2 once a wave of them, not once an XCD each.
@@ -732,7 +752,8 @@ __global__ __launch_bounds__(kGroupWaves<MT>* kWave) void moe_matmul_select_grou
     const int at = x * q + min(x, r) + b / kDenseXcds;  // XCD x owns q (+1 below r) blocks
     GroupItem item;
     if (!group_item(offsets, work, num_experts, MT, item, at % gridDim.x)) return;
-    const T* w = bank + static_cast<long long>(item.expert) * n * k;
+    if (at / gridDim.x == 0 && threadIdx.x == 0) expert_note(expert_hits, item.expert, item.count);
+    const T* w = expert_plane(bank, static_cast<long long>(n) * k, expert_table, 1, 0, item.expert);
     grouped_tile<GroupDense<T>, T, MT, 2, kGroupWaves<MT>, SORTED>(act, order, item.begin, item.count, {w},
                                                                   nullptr, out, act_div, n, k, at / gridDim.x);
 }
@@ -744,14 +765,15 @@ template <class T, int MT, int NBW, int WAVES, int SORTED = 0, int GLU = 0>
 __global__ __launch_bounds__(WAVES* kWave) void moe_matmul_select_grouped_tall(
     const T* __restrict__ act, const i32* __restrict__ order, const i32* __restrict__ offsets,
     const i32* __restrict__ work, const T* __restrict__ bank, T* __restrict__ out, int act_div, int n, int k,
-    int num_experts, float limit) {
+    int num_experts, const u64* __restrict__ expert_table, unsigned int* __restrict__ expert_hits, float limit) {
     const int blocks = gridDim.x * gridDim.y;
     const int b = blockIdx.x + gridDim.x * blockIdx.y;
     const int x = b % kDenseXcds, q = blocks / kDenseXcds, r = blocks % kDenseXcds;
     const int at = x * q + min(x, r) + b / kDenseXcds;
     GroupItem item;
     if (!group_item(offsets, work, num_experts, MT, item, at % gridDim.x)) return;
-    const T* w = bank + static_cast<long long>(item.expert) * n * k;
+    if (at / gridDim.x == 0 && threadIdx.x == 0) expert_note(expert_hits, item.expert, item.count);
+    const T* w = expert_plane(bank, static_cast<long long>(n) * k, expert_table, 1, 0, item.expert);
     grouped_tile<GroupDense<T>, T, MT, NBW, WAVES, SORTED, GLU>(act, order, item.begin, item.count, {w}, nullptr,
                                                                 out, act_div, n, k, at / gridDim.x, limit);
 }
@@ -766,7 +788,7 @@ __global__ __launch_bounds__(256) void moe_matmul_select_dense_batch(
     const T* __restrict__ act, const i32* __restrict__ order, const i32* __restrict__ offsets,
     const i32* __restrict__ work, const T* __restrict__ bank, T* __restrict__ out, int act_div, int n, int k,
     int num_experts, const T* __restrict__ shared, const T* __restrict__ shared_act, T* __restrict__ shared_out,
-    int shared_rows) {
+    int shared_rows, const u64* __restrict__ expert_table, unsigned int* __restrict__ expert_hits) {
     constexpr int SBY = MT >= 32 ? 128 : 256;
     const int items = (shared_rows + MT - 1) / MT, b = static_cast<int>(blockIdx.x);
     if (b < items) {
@@ -776,7 +798,8 @@ __global__ __launch_bounds__(256) void moe_matmul_select_dense_batch(
     }
     GroupItem item;
     if (!group_item(offsets, work, num_experts, MT, item, b - items)) return;
-    const T* w = bank + static_cast<long long>(item.expert) * n * k;
+    if (blockIdx.y == 0 && threadIdx.x == 0) expert_note(expert_hits, item.expert, item.count);
+    const T* w = expert_plane(bank, static_cast<long long>(n) * k, expert_table, 1, 0, item.expert);
     batch_tile<BatchDense<T, SBY>, T, MT, NBW, 3>(act, order, item.begin, item.count, {w}, nullptr, out, act_div, n, k,
                                                   blockIdx.y);
 }
@@ -790,7 +813,8 @@ template <class T, int MT>
 __global__ __launch_bounds__(256) void moe_matmul_select_dense_batch_swiglu(
     const T* __restrict__ act, const i32* __restrict__ order, const i32* __restrict__ offsets,
     const i32* __restrict__ work, const T* __restrict__ bank, T* __restrict__ h, int act_div, int n, int k,
-    int num_experts, const T* __restrict__ shared, T* __restrict__ shared_h, int shared_rows) {
+    int num_experts, const T* __restrict__ shared, T* __restrict__ shared_h, int shared_rows,
+    const u64* __restrict__ expert_table, unsigned int* __restrict__ expert_hits) {
     constexpr int SBY = MT >= 32 ? 128 : 256;
     const int items = (shared_rows + MT - 1) / MT, b = static_cast<int>(blockIdx.x);
     if (b < items) {
@@ -800,7 +824,8 @@ __global__ __launch_bounds__(256) void moe_matmul_select_dense_batch_swiglu(
     }
     GroupItem item;
     if (!group_item(offsets, work, num_experts, MT, item, b - items)) return;
-    const T* w = bank + static_cast<long long>(item.expert) * 2 * n * k;
+    if (blockIdx.y == 0 && threadIdx.x == 0) expert_note(expert_hits, item.expert, item.count);
+    const T* w = expert_plane(bank, static_cast<long long>(2) * n * k, expert_table, 1, 0, item.expert);
     batch_tile<BatchDense<T, SBY>, T, MT, 1, 3, true>(act, order, item.begin, item.count, {w}, nullptr, h, act_div, n,
                                                       k, blockIdx.y);
 }
@@ -815,12 +840,14 @@ template <class T, int MW, int NT, int KC, int DEPTH, int ADEPTH>
 __global__ __launch_bounds__(256) void moe_matmul_select_dense_wide(
     const T* __restrict__ act, const i32* __restrict__ order, const i32* __restrict__ offsets,
     const i32* __restrict__ work, const T* __restrict__ bank, T* __restrict__ out, int act_div, int n, int k,
-    int num_experts, u32 act_bytes, int per_xcd) {
+    int num_experts, u32 act_bytes, int per_xcd, const u64* __restrict__ expert_table,
+    unsigned int* __restrict__ expert_hits) {
     const int b = blockIdx.x, slot = b / kDenseXcds;
     const int at = b % kDenseXcds + kDenseXcds * (slot % per_xcd), tile = slot / per_xcd;
     GroupItem item;
     if (!group_item(offsets, work, num_experts, 4 * MW, item, at)) return;
-    const T* w = bank + static_cast<long long>(item.expert) * n * k;
+    if (tile == 0 && threadIdx.x == 0) expert_note(expert_hits, item.expert, item.count);
+    const T* w = expert_plane(bank, static_cast<long long>(n) * k, expert_table, 1, 0, item.expert);
     wide_tile<T, MW, NT, KC, DEPTH, ADEPTH>(act, act_bytes, order, item.begin, item.count, w, out, act_div, n, k, tile);
 }
 
@@ -915,9 +942,13 @@ __device__ __forceinline__ void lt_record(u32* __restrict__ rec, u32 n, u32 c, u
     for (int i = 0; i < 49; ++i) rec[i] = w[i];
 }
 
+// An expert's weight is its entry in `expert_table` when given, and
+// `expert_hits` counts its routes.
 template <class T>
 __device__ __forceinline__ void lt_write_args(const i32* __restrict__ offsets, u32* __restrict__ args, u64 bank,
-                                              u64 staged_in, u64 staged_out, int n, int k, int num_experts) {
+                                              u64 staged_in, u64 staged_out, int n, int k, int num_experts,
+                                              const u64* __restrict__ expert_table,
+                                              unsigned int* __restrict__ expert_hits) {
     for (int e = threadIdx.x; e <= num_experts; e += blockDim.x) {
         u32* rec = args + static_cast<long long>(e) * 49;
         if (e == num_experts) {
@@ -926,8 +957,10 @@ __device__ __forceinline__ void lt_write_args(const i32* __restrict__ offsets, u
         }
         const u32 off = static_cast<u32>(offsets[e]);
         const u32 c = static_cast<u32>(offsets[e + 1]) - off;
-        lt_record<T>(rec, n, c, k, staged_out + static_cast<u64>(off) * n * sizeof(T),
-                     bank + static_cast<u64>(e) * n * k * sizeof(T), staged_in + static_cast<u64>(off) * k * sizeof(T));
+        if (c != 0) expert_note(expert_hits, e, c);
+        const u64 w = expert_table != nullptr ? expert_table[e] : bank + static_cast<u64>(e) * n * k * sizeof(T);
+        lt_record<T>(rec, n, c, k, staged_out + static_cast<u64>(off) * n * sizeof(T), w,
+                     staged_in + static_cast<u64>(off) * k * sizeof(T));
     }
 }
 
@@ -940,9 +973,12 @@ template <class T>
 __global__ __launch_bounds__(256) void moe_lt_scatter(const T* __restrict__ act, const i32* __restrict__ order,
                                                       const i32* __restrict__ offsets, T* __restrict__ staged,
                                                       u32* __restrict__ args, i32* __restrict__ pos, u64 bank,
-                                                      u64 staged_out, int act_div, int n, int k, int num_experts) {
+                                                      u64 staged_out, int act_div, int n, int k, int num_experts,
+                                                      const u64* __restrict__ expert_table,
+                                                      unsigned int* __restrict__ expert_hits) {
     if (blockIdx.x == 0)
-        lt_write_args<T>(offsets, args, bank, reinterpret_cast<u64>(staged), staged_out, n, k, num_experts);
+        lt_write_args<T>(offsets, args, bank, reinterpret_cast<u64>(staged), staged_out, n, k, num_experts,
+                         expert_table, expert_hits);
     using V = uint4;
     const int pieces = k / 8;
     const long long routed = offsets[num_experts];
@@ -962,8 +998,10 @@ __global__ __launch_bounds__(256) void moe_lt_scatter(const T* __restrict__ act,
 // projection of the sorted routed MLP). One block.
 template <class T>
 __global__ __launch_bounds__(256) void moe_lt_args(const i32* __restrict__ offsets, u32* __restrict__ args, u64 bank,
-                                                   u64 staged_in, u64 staged_out, int n, int k, int num_experts) {
-    lt_write_args<T>(offsets, args, bank, staged_in, staged_out, n, k, num_experts);
+                                                   u64 staged_in, u64 staged_out, int n, int k, int num_experts,
+                                                   const u64* __restrict__ expert_table,
+                                                   unsigned int* __restrict__ expert_hits) {
+    lt_write_args<T>(offsets, args, bank, staged_in, staged_out, n, k, num_experts, expert_table, expert_hits);
 }
 
 // A projection over the live rows of a padded plane (an lm head over a
