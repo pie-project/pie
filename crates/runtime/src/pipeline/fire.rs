@@ -214,10 +214,10 @@ impl FireEpoch {
     /// Closes the epoch once the engine has run the fire `completion`
     /// waits on: no sooner, since what it frees may still be read, and no
     /// later than that, since a pass may not settle its fires for long.
-    /// Not by awaiting it: the completion wakes one waiter, and the pass
-    /// that finalizes the fire awaits it too, so a second waiter here lost
-    /// its wakeup and held the epoch, and every id freed after it, open
-    /// until shutdown.
+    /// By a hook, not a task awaiting it: nothing is spawned a fire, and the
+    /// epoch closes where the completion resolves. (Awaiting it once lost
+    /// the wakeup to the pass that finalizes the fire, when a completion
+    /// woke one waiter, and held the epoch open until shutdown.)
     fn retire_on(self, completion: &crate::engine::WorkItemCompletion) {
         completion.on_settled(move || drop(self));
     }
@@ -4225,6 +4225,68 @@ pub(crate) mod lifecycle_tests {
             );
             assert_eq!(failure.lock().expect("test failure").is_some(), failed);
         }
+        Ok(())
+    }
+
+    struct Flag(std::sync::atomic::AtomicBool);
+
+    impl std::task::Wake for Flag {
+        fn wake(self: Arc<Self>) {
+            self.0.store(true, std::sync::atomic::Ordering::Release);
+        }
+    }
+
+    /// Lanes that all wait on one front fire register their wakers on its
+    /// completion before it settles: settling it wakes every one of them,
+    /// not only the last to register (MI300X: 5-7 of 8 lanes slept for good
+    /// on a settled fire while the eighth decoded alone).
+    #[tokio::test(flavor = "current_thread")]
+    async fn every_lane_waiting_on_the_front_fire_wakes_when_it_settles() -> anyhow::Result<()> {
+        use std::future::Future;
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let (fires, completion, ws, _stores, _failure) = pending_fire_fixture(Vec::new());
+        let mut context = TestContext {
+            id: uuid::Uuid::new_v4(),
+            resources: ResourceTable::new(),
+        };
+        context.resources.push(ws)?;
+        let flag = || Arc::new(Flag(AtomicBool::new(false)));
+        // Three lanes at the front fire, and a drain awaiting its completion.
+        let flags: Vec<Arc<Flag>> = (0..4).map(|_| flag()).collect();
+        let mut woken = Vec::new();
+        {
+            let mut lanes: Vec<_> = flags[..3]
+                .iter()
+                .map(|flag| {
+                    (
+                        Box::pin(fires.await_front_completion()),
+                        std::task::Waker::from(flag.clone()),
+                    )
+                })
+                .collect();
+            let mut drain = completion.clone();
+            let drain_waker = std::task::Waker::from(flags[3].clone());
+            for (wait, waker) in &mut lanes {
+                let mut cx = std::task::Context::from_waker(waker);
+                assert!(wait.as_mut().poll(&mut cx).is_pending(), "nothing settled yet");
+            }
+            let mut cx = std::task::Context::from_waker(&drain_waker);
+            assert!(std::pin::Pin::new(&mut drain).poll(&mut cx).is_pending());
+
+            resolve_test_completion(&completion, false);
+            woken.extend(flags.iter().map(|flag| flag.0.load(Ordering::Acquire)));
+            for (wait, waker) in &mut lanes {
+                let mut cx = std::task::Context::from_waker(waker);
+                assert!(wait.as_mut().poll(&mut cx).is_ready(), "the fire settled");
+            }
+        }
+        finalize_all(&mut context, &fires, true).await?;
+        assert_eq!(
+            woken,
+            vec![true; 4],
+            "every waiter registered before the settle is woken by it (three lanes, then the \
+             drain)"
+        );
         Ok(())
     }
 

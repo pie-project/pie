@@ -434,7 +434,11 @@ fn poll_wait_slot<T>(
     }
     match check() {
         Some(result) => {
-            table.deregister(slot);
+            // The slot keeps one entry a task: another future of this task
+            // may wait on the same completion, so the task polls again.
+            if table.deregister_waker(slot, cx.waker()) {
+                cx.waker().wake_by_ref();
+            }
             Poll::Ready(result)
         }
         None => Poll::Pending,
@@ -772,8 +776,8 @@ impl WorkItemCompletion {
 
     /// Runs `hook` once this resolves: now if it has, else as it does (or,
     /// never resolved, once the last handle on it goes). Unlike awaiting it,
-    /// this takes no waker: a completion wakes one waiter, the one that
-    /// finalizes it, and a second waiter would take its wakeup.
+    /// this takes no waker and no task: a hook runs where the completion
+    /// resolves, with nothing left to poll.
     pub fn on_settled(&self, hook: impl FnOnce() + Send + 'static) {
         let mut hooks = self.state.on_settled.lock().unwrap();
         if self.state.result().is_none() {
@@ -1030,8 +1034,8 @@ mod tests {
     }
 
     /// A fire's epoch retires as its completion resolves while the pass that
-    /// finalizes the fire awaits the same completion. A completion wakes one
-    /// waiter, so the epoch once awaited it too and lost the wakeup to the
+    /// finalizes the fire awaits the same completion. A completion once woke
+    /// one waiter, so the epoch, awaiting it too, lost the wakeup to the
     /// finalizer: the epoch, and every id freed after it, stayed open until
     /// shutdown, and a pool under pressure starved behind it.
     #[tokio::test]
