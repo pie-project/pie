@@ -900,3 +900,13 @@ The `new-memory/` directory is bookkeeping and is removed before anything lands 
   (0 MiB resident vs 756 MiB without). Runtime e2e adoption not run on Vulkan.
 - Vulkan PLE fires with misses record (ring of stages per arm); throughput too noisy on the shared GPU to show gain.
 - Merge fix: the deviceless Frame stub lost its `impl Frame {` line (featureless build).
+
+### Note — 2026-11-10: IT round 9 on M67 (sm_120)
+- RSS at ready (qwen3-30b-a3b-mini, off, default): 1,744 MiB (base 1,810; M64 27,178) -> M62 regression fixed.
+  Tokens + top-4 = base; 491 tok/s. Offload-heavy (1 GiB device kv): all 98 entries identical, RSS grows by what is
+  parked. gemma-4-E2B / Qwen3.5 sanity: tokens = base, 10x batch-8 rounds with no stalls.
+- BUG (engine): off + device_kv_budget 256 MiB -> CUDA illegal address (700) at boot instead of the clean "weights do
+  not fit" refusal (604 MB of held experts vs a 252 MiB pool). Assigned to L40S.
+- BUG (runtime): 768 MiB device kv -> "pool starved with no reclaim path ... NoEligibleVictim" without parking idle
+  sessions first (1 GiB parks and passes). Assigned to RT3.
+- To look at: gemma decode 123 vs 136 tok/s (measured once); gemma boot peak 7.2 GB on both builds.
