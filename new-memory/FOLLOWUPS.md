@@ -7,9 +7,8 @@ holder beside working sets / prefix entries / snapshots: the governor decides ho
 (candidates include weight atoms, valued by `weight_uses` and the cost of a miss), the pool moves.
 - Engines switch the held fast path both ways on their own (all atoms resident for a while -> located tables / fast
   arms; first eviction -> lazy miss copy from the file mapping, slow arms), with the re-arm cost known to PLEX.
-- Snapshots become disk-tier holders; dense planes eventually become weight shapes (needs the recordable rotor).
-- Removes: budget_device_pool, budget_disk_snapshots, weights_streaming, budget_host_weights, and in the long run
-  budget_device_weights.
+- Snapshots become disk-tier holders. Dense weights always stay on the device (user decision; budgets deleted, A10).
+- Removes: budget_device_pool, budget_disk_snapshots, weights_streaming.
 
 ## F2. Config surface rename (do together with F1, only for the keys that remain)
 Agreed shape: `[engine.memory]` with prefix keys — budget_device / budget_host / budget_disk, disk_path,

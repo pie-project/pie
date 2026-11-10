@@ -13,11 +13,13 @@ Branch today: 432 commits ahead of main, 782 files, +86k / -13k. Main merged in 
 | A6 | XLA: Mosaic page copy / flash / kv append on the pool; speed vs main; MoE result varies with pool chunk count (CUDA plugin) | TPU | in progress |
 | A7 | XLA weight streaming + snapshots (sc/xla2, partial) | TPU | queued |
 | A8 | Cerebras wafer `Spatial` engine still states degenerate facts (owner's unmerged branch) | Cerebras owner | blocked |
+| A10 | Delete device/host weight budgets, dense rotor, dense host tier; max_state_slots out of backend options | L40S (+Metal/Vulkan owners) | assigned |
 | A9 | dsv41 two-window mini cannot fire on sm_89/sm_120 (fused.lse_sink kernel gap) -> two-window CUDA unverified | L40S | queued |
 
 ## B. Decide before the PR (user)
 - B1: DECIDED: ROCm anchored (GEMM-epilogue) synth is IN the PR (AMD, A4 of their synth plan).
-- B2: Recordable rotor (budgeted loads decode ~10x slower): block, or follow-up?
+- B2: DECIDED: dense weights always live on the device. device_weight_budget / host_weight_budget, the dense rotor
+  and the dense host weight tier are DELETED (A10, L40S); the recordable-rotor task is moot.
 - B3: DECIDED: all `new-memory/` docs are excluded from the PR (delete the folder from the PR branch at the end).
 - B4: DECIDED: one broad verification sweep per backend right before the PR (all goldens + catalog chunk tests + IT
   e2e scenarios) is allowed.
