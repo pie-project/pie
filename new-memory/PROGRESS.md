@@ -743,3 +743,10 @@ The `new-memory/` directory is bookkeeping and is removed before anything lands 
   pinned host bytes 609 MiB / 4850 MiB -> 0.
 - Open: auto + pool can't seat -> runtime streams but engine was told held (refuses non-held) -> must build the miss
   copy lazily (assigned). Peak RSS on a real-size model, HMM branch, refusal message, real imported files: untested.
+
+### Note — 2026-11-10: IT round 6 on M54 (sm_120)
+- Full Qwen3-30B-A3B bf16: off -> clean boot_cache error (58.1 GB needed, 25.6 GB free), no OOM kill; auto -> runtime
+  streams, engine refuses (held mismatch, L40S fixing). Peak RSS ~55-56 GiB (likely file-backed mapping pages; at the
+  container cap but not killed). Experts left in the file mapping (no pinned fallback lines).
+- qwen3-30b-a3b-mini at max_forward_tokens 5120: boot ~2-3 s (round 5: >13 min), tokens + top-4 bits = base,
+  450 vs 433 tok/s. Open: RSS +1.3 GB vs base; log "bodies armed 0 of 0 compositions" to be explained.
