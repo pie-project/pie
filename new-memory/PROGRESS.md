@@ -866,3 +866,13 @@ The `new-memory/` directory is bookkeeping and is removed before anything lands 
   attn::compressed::decode::decode, not this shape / gathered seats) -> kernel gap, two-window bitwise still unverified.
 - device_weight_budget 512 / 128 MiB on the MoE mini: serves, tokens = base, but decode ~38 tok/s (~10x slower;
   eager rotor + host plane reads) -> recordable rotor task.
+
+### M66 — 2026-11-10: wait slots wake every waiter (serving hang fix, all backends)
+- `sc/amd-waker` a7c301013 (AMD) + `sc/hang-fix` 0fd90731b: a WakerTable slot held ONE waker and `register` replaced
+  it, so of several lanes awaiting the same front fire only the last woke; the others slept on a settled completion
+  and the scheduler quorum waited forever (MI300X: 20-30% of batch-8 runs hung; CUDA hid it by settling first).
+  Now a slot keeps every waiter (deduped per task); a future that takes back a shared registration wakes its task so
+  sibling futures re-poll; teardown sweeps. M52's on_settled hook kept (no longer needed for correctness).
+- Tests: waker unit + 2 loom tests (every interleaving), runtime engine/pipeline/scheduler/inferlet; deterministic
+  `every_lane_waiting_on_the_front_fire_wakes_when_it_settles` fails before ([false,false,false,true]), passes after.
+  MI300X 0/40 hangs (was 20-30%); CUDA 20/20 clean.
