@@ -114,6 +114,34 @@ fn glm_5(path: &str, _row: &CacheRow) -> String {
     }
 }
 
+fn llama_3(path: &str, _row: &CacheRow) -> String {
+    match parts(path)[..] {
+        ["layers", l, "kv"] => format!("kv.{l}"),
+        ["mtp", "kv"] => "kv.mtp".to_string(),
+        ["draft_kv"] => "kv.draft".to_string(),
+        _ => path.to_string(),
+    }
+}
+
+fn layer_kv(path: &str) -> String {
+    match parts(path)[..] {
+        ["layers", l, "kv"] => format!("kv.{l}"),
+        _ => path.to_string(),
+    }
+}
+
+fn glm_4(path: &str, _row: &CacheRow) -> String {
+    layer_kv(path)
+}
+
+fn minimax_m2(path: &str, _row: &CacheRow) -> String {
+    layer_kv(path)
+}
+
+fn qwen3_moe(path: &str, _row: &CacheRow) -> String {
+    layer_kv(path)
+}
+
 /// Every listed deployment of `package`, at one rank and at each count of
 /// [`RANKS`] it traces at.
 fn deployments(package: &str) -> Vec<Deployment> {
@@ -259,5 +287,9 @@ mod moved {
         gemma_4,
         qwen_3,
         glm_5,
+        llama_3,
+        glm_4,
+        minimax_m2,
+        qwen3_moe,
     );
 }
