@@ -119,6 +119,9 @@ impl Tpu {
     /// Device memory a load leaves free past its weights and pool.
     #[must_use]
     pub fn headroom(&self) -> u64 {
+        if let Some(mib) = std::env::var("PIE_XLA_HEADROOM_MIB").ok().and_then(|v| v.parse::<u64>().ok()) {
+            return mib << 20;
+        }
         self.hbm_bytes() / 16
     }
 }
