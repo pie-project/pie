@@ -384,8 +384,6 @@ impl Engine for Group {
             pools.disk_kv_pages = tiers.disk_kv_pages;
             pools.disk_kv_persistent = tiers.disk_kv_persistent;
             pools.disk_kv_kept = tiers.disk_kv_kept;
-            loaded.caps.kv_copy.device_to_host &= tiers.host_kv_pages > 0;
-            loaded.caps.kv_copy.host_to_device &= tiers.host_kv_pages > 0;
         }
         // The shared pool's tiers (CONTRACT-BC 22): what every rank holds.
         let least = |of: fn(&engine::chunk::ChunkFacts) -> u32| {

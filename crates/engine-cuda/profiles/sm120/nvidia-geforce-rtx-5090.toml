@@ -165,7 +165,6 @@ measured = [
   "engine.graphs",
   "engine.host_planes",
   "engine.lattice_steps",
-  "engine.one_frame_when_short",
   "engine.prefill_lattice_from",
   "engine.prefill_lattice_steps",
   "engine.recording",

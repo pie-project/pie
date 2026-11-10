@@ -5,7 +5,7 @@ use std::sync::Arc;
 
 use checkpoint::contract::ModelContract;
 use engine::Engine;
-use engine::caps::{Capabilities, DeviceFacts, FireLimits, KvCopyDomains, PoolFacts};
+use engine::caps::{Capabilities, DeviceFacts, FireLimits, PoolFacts};
 use engine::channel::{ChannelId, ChannelRegistration, HostMirror, RegisteredChannel};
 use engine::error::{Error, Result as EngineResult};
 use engine::fire::{
@@ -717,7 +717,6 @@ impl Engine for Cuda {
                 disk_kv_pages,
                 disk_kv_persistent: residency.disk_kv_persistent && disk_kv_pages > 0,
                 disk_kv_kept: shell.disk_kv_kept(),
-                one_frame_when_short: shell.one_frame_when_short(),
                 seated_first: shell.seated_first(),
                 seat_to_end: shell.seat_to_end(),
                 seat_spread: shell.seat_spread(),
@@ -743,12 +742,6 @@ impl Engine for Cuda {
                 .with(Port::AttnMask)
                 .with(Port::Fold),
             geometry: GeometryClass::DeviceGeometry,
-            kv_copy: KvCopyDomains {
-                device_to_device: true,
-                device_to_host: host_kv_pages > 0,
-                host_to_device: host_kv_pages > 0,
-                host_to_host: false,
-            },
             kv_handle,
             media_encode: false,
             device_channel_commit: true,

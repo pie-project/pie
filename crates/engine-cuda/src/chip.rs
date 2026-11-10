@@ -78,13 +78,6 @@ pub struct WorkingSetPercent(pub u32);
 #[decision(id = "engine.lattice_steps", constant(set(1, 2)), default = 1, tune = engine)]
 pub struct LatticeSteps(pub u32);
 
-/// Whether a hybrid trunk whose state slots cannot seat every lane at the
-/// configured dispatch depth (two frames a lane) asks the runtime to post one
-/// frame a lane instead, seating up to twice the lanes. Off keeps the depth.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Decision)]
-#[decision(id = "engine.one_frame_when_short", flag, default = false, tune = engine)]
-pub struct OneFrameWhenShort;
-
 /// Whether a decoding lane's next pages come before seating a waiting prompt,
 /// and a prompt waits rather than suspending a lane
 /// (`PoolFacts::seated_first`). Off keeps arrival order.
@@ -173,7 +166,6 @@ static REGISTRY: LazyLock<Registry> = LazyLock::new(|| {
         .add::<Grouped>()
         .add::<WorkingSetPercent>()
         .add::<LatticeSteps>()
-        .add::<OneFrameWhenShort>()
         .add::<SeatedFirst>()
         .add::<SeatToEnd>()
         .add::<SeatSpread>()
@@ -269,7 +261,6 @@ pub struct Engine {
     pub grouped: bool,
     pub working_set_percent: u32,
     pub lattice_steps: u32,
-    pub one_frame_when_short: bool,
     pub seated_first: bool,
     pub seat_to_end: bool,
     pub seat_spread: bool,
@@ -303,7 +294,6 @@ impl Engine {
             grouped: profile.on::<Grouped>(&Anywhere),
             working_set_percent: profile.get::<WorkingSetPercent>().0,
             lattice_steps: profile.get::<LatticeSteps>().0,
-            one_frame_when_short: profile.on::<OneFrameWhenShort>(&Anywhere),
             seated_first: profile.on::<SeatedFirst>(&Anywhere),
             seat_to_end: profile.on::<SeatToEnd>(&Anywhere),
             seat_spread: profile.on::<SeatSpread>(&Anywhere),
@@ -784,7 +774,6 @@ mod tests {
                 grouped: true,
                 working_set_percent: 50,
                 lattice_steps: 1,
-                one_frame_when_short: false,
                 seated_first: false,
                 seat_to_end: false,
                 seat_spread: false,
@@ -854,7 +843,6 @@ mod tests {
             tuning.selected_mma,
             "a B200 walks a selection on the tensor cores"
         );
-        assert!(Engine::of(&b200).one_frame_when_short);
         assert!(Engine::of(&b200).seated_first);
         assert_eq!(Engine::of(&b200).forward_tokens, 16384);
         assert_eq!(Engine::of(&b200).walk_fire_rows, 4096);
@@ -865,7 +853,6 @@ mod tests {
             Engine {
                 lattice_steps: 1,
                 prefill_lattice_from: Engine::of(&family).prefill_lattice_from,
-                one_frame_when_short: false,
                 seated_first: false,
                 seat_to_end: false,
                 seat_spread: false,
@@ -881,7 +868,6 @@ mod tests {
             "only the row lattice, the state seating, the planner's order, the fire width and \
              the host planes differ from the family's engine"
         );
-        assert!(!Engine::of(&family).one_frame_when_short);
         assert!(!Engine::of(&family).seated_first);
         assert!(!Engine::of(&family).host_planes);
         assert_eq!(Engine::of(&family).lattice_steps, 1);

@@ -113,8 +113,6 @@ pub struct Shell {
     exports: Exports,
     graphs: Graphs,
     copies: bool,
-    /// `engine.one_frame_when_short`.
-    one_frame_when_short: bool,
     /// `engine.seated_first`.
     seated_first: bool,
     /// `engine.seat_to_end`.
@@ -376,13 +374,6 @@ impl Shell {
         };
         self.pools.copy_slot(self.device.stream(), src, dst)?;
         self.device.synchronize()
-    }
-
-    /// Whether this load would post one frame a lane rather than seat fewer
-    /// lanes than it batches (`engine.one_frame_when_short`).
-    #[must_use]
-    pub fn one_frame_when_short(&self) -> bool {
-        self.one_frame_when_short
     }
 
     /// Whether this load asks the planner to serve a decoding lane's pages

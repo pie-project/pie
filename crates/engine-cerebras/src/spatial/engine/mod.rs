@@ -15,7 +15,7 @@ mod posted;
 use std::path::Path;
 
 use engine::Engine;
-use engine::caps::{Capabilities, DeviceFacts, FireLimits, KvCopyDomains, PoolFacts};
+use engine::caps::{Capabilities, DeviceFacts, FireLimits, PoolFacts};
 use engine::channel::{ChannelId, ChannelRegistration, RegisteredChannel};
 use engine::error::{Error, Result as EngineResult};
 use engine::fire::{FireId, FireTicket, FrameId, FrameSubmission, FrameTicket, LaneReadout};
@@ -410,15 +410,6 @@ impl Engine for Spatial {
                 PortMask::DEVICE_GEOMETRY
             },
             geometry: GeometryClass::DeviceGeometry,
-            kv_copy: KvCopyDomains {
-                // Pages are tokens here: a copy copies them. A wafer build
-                // whose pages the host can read parks a suspended lane's
-                // pages on the host (never attended there).
-                device_to_device: true,
-                device_to_host: self.kv.host_pages > 0,
-                host_to_device: self.kv.host_pages > 0,
-                host_to_host: false,
-            },
             kv_handle: None,
             media_encode: false,
             device_channel_commit: true,
