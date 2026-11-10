@@ -2415,3 +2415,46 @@ fn step_against_xla(g: &Gdn, rows: usize, seed: u64) {
     assert_close(&yk, &yx, 2e-3, 1e-2);
     assert_close(&bank_k[..n], &bank_xla[..n], 4e-3, 1e-2);
 }
+
+/// Scratch timing (not for main): a 256-lane decode fire's gated delta at
+/// Qwen3.5-0.8B's and Qwen3.6-27B's heads, the step kernel against the XLA
+/// form, per layer.
+#[test]
+fn zz_gdn_step_timing() {
+    for (hv, hk) in [(16usize, 16usize), (48, 16)] {
+        let g = Gdn { hk, hv, dk: 128, dv: 128 };
+        for rows in [64usize, 256] {
+            let slots = 2 * rows + 1;
+            let sink = (slots - 1) as i32;
+            let slot_of: Vec<i32> = (0..rows as i32).map(|l| (l * 7 + 3) % sink).collect();
+            let mut rng = Rng(77);
+            let (qkv, gates) = gdn_inputs(&mut rng, &g, rows);
+            let bank0: Vec<f32> = rng.f32s(slots * g.stride(), -0.5, 0.5).into_iter().map(round_bf16).collect();
+            for kernel in [true, false] {
+                kernels_xla::ssm::step_kernel(Some(kernel));
+                let mut b = Bench::new();
+                let x = b.bf16(rows as u32, g.width() as u32, &qkv);
+                let z = b.zeros(Dtype::Bf16, rows as u32, (g.hv * g.dv) as u32);
+                let gt = b.f32(rows as u32, (2 * g.hv) as u32, &gates);
+                let bank = b.bf16((slots * g.hv * g.dk) as u32, g.dv as u32, &bank0);
+                let sl = b.i32(rows as u32, 1, &slot_of);
+                let y = b.zeros(Dtype::F32, rows as u32, (g.hv * g.dv) as u32);
+                let p = pool(bank, sl);
+                let t = b
+                    .time_in_place(50, &[bank], |ctx| {
+                        ssm::gated_delta(ctx, x, z, gt, &p, g.hk as u32, g.hv as u32, g.dk as u32, g.dv as u32, y)
+                    })
+                    .unwrap();
+                if let Some(t) = t {
+                    let bytes = (rows * g.stride() * 2 * 2) as f64;
+                    eprintln!(
+                        "gdn step timing: hv {hv} rows {rows} kernel {kernel}: {:.1} us a layer ({:.0} GB/s of state in and out)",
+                        t * 1e6,
+                        bytes / t / 1e9
+                    );
+                }
+            }
+            kernels_xla::ssm::step_kernel(None);
+        }
+    }
+}
