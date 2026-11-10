@@ -637,3 +637,13 @@ The `new-memory/` directory is bookkeeping and is removed before anything lands 
   takes plane_fan like CUDA's twin. CUDA unaffected. Test linear_glu_flat fails with fan 1, passes now.
 - ROCm baselines recorded in new-memory/GOLDEN-LOGITS-ROCM.txt (dsv4/dots3 = eager; mimo shaped, split-kv arm).
 - Note: this ROCm bug also exists on main (served wrong logits under graphs for split-plane MoE before the redesign).
+
+### M46 — 2026-11-10: BM5 merged (Metal compressor state in pool; ANE determinism)
+- BM5a: the dsv4 "slot-ref bug" was the test's stride (7 = slots per chunk); fixed b4391da5f, test un-ignored. Real
+  engine bugs found on the way (418b34efa): Metal compressor state lived in side buffers indexed by kv-list page while
+  pool gathers address by window-list ids; window slot copies / spills / evacuations didn't carry it; copy_kv copied
+  window rows at kv-list offsets. Now compressor state lives in its row's slots (as the recipe and CUDA do).
+  Trimmed-window tests bitwise on Mac: gemma mini, muse (T_w 16 / T 32), dsv4-flash-mini.
+- BM5b: Metal gemma run-to-run nondeterminism = ANE compile refusals (ANECompilerService 4097) and serving before
+  compiles finished. Fix d6132f473 / 87d2f7bfa: ANE compile retried up to 8x with backoff; fires that can use the ANE
+  wait for their program. 4 forced-cold runs = warm output. Open: all 8 refused -> GPU keeps the work (logged).
