@@ -48,6 +48,8 @@ DIMS = {
         double_blocks = 5,
         single_blocks = 20,
         guidance_embeds = False,
+        te = QWEN3_4B,
+        vae = True,
     ),
     "flux2-mini": struct(
         dim = 256,
@@ -57,6 +59,8 @@ DIMS = {
         double_blocks = 2,
         single_blocks = 2,
         guidance_embeds = True,
+        te = None,
+        vae = False,
     ),
 }
 
@@ -107,18 +111,117 @@ def vae_latent():
         post_quant_conv = vae_conv(VAE_CHANNELS, VAE_CHANNELS, 1),
     )
 
+def require(what, c, wants):
+    """Fail naming the first `(key, want, default)` that `c` states otherwise."""
+    for key, want, default in wants:
+        got = c.get(key, default)
+        if got != want:
+            fail("its {} states {} = {}; this family runs {}".format(what, key, got, want))
+
+def qwen3_of(c):
+    """The Qwen3 text encoder `c` (a `text_encoder/config.json`) states."""
+    if c.get("model_type") != "qwen3":
+        fail("its text encoder is {}; this family encodes with Qwen3".format(c.get("model_type")))
+    rope = c.get("rope_parameters") or {}
+    require("text encoder", c, [
+        ("hidden_act", "silu", "silu"),
+        ("attention_bias", False, False),
+        ("use_sliding_window", False, False),
+        ("rope_scaling", None, None),
+    ])
+    require("text encoder's rope", rope, [("rope_type", "default", "default")])
+    hidden, q_heads = c["hidden_size"], c["num_attention_heads"]
+    return struct(
+        hidden = hidden,
+        vocab = c["vocab_size"],
+        q_heads = q_heads,
+        kv_heads = c.get("num_key_value_heads", q_heads),
+        head_dim = c.get("head_dim", hidden // q_heads),
+        inter = c["intermediate_size"],
+        theta = float(c.get("rope_theta", rope.get("rope_theta", 1000000.0))),
+        eps = float(c.get("rms_norm_eps", 1e-6)),
+    )
+
+def adopt(id, config, special):
+    pipeline = config.get("pipeline")
+    dit = config.get("dit") if pipeline != None else config
+    if dit == None:
+        fail("the pipeline holds no transformer")
+    dit = dict(dit)
+    if dit.get("out_channels") == None:
+        dit["out_channels"] = IN_CHANNELS
+    require("transformer", dit, [
+        ("_class_name", "Flux2Transformer2DModel", "Flux2Transformer2DModel"),
+        ("attention_head_dim", HEAD_DIM, None),
+        ("axes_dims_rope", ROPE_DIMS, None),
+        ("rope_theta", ROPE_THETA, None),
+        ("in_channels", IN_CHANNELS, None),
+        ("out_channels", IN_CHANNELS, IN_CHANNELS),
+        ("patch_size", 1, 1),
+        ("mlp_ratio", MLP_RATIO, None),
+        ("timestep_guidance_channels", T_FREQ_DIM, None),
+        ("eps", NORM_EPS, None),
+    ])
+    if pipeline != None and not pipeline.get("is_distilled", False):
+        fail("its pipeline ({}) is not the distilled one; this family pins the distilled four-step schedule".format(pipeline.get("_class_name")))
+    te = config.get("te") if pipeline != None else None
+    te = qwen3_of(te) if te != None else None
+    if te != None and config["te"]["num_hidden_layers"] < TE_TAPS[-1]:
+        fail("its text encoder has {} layers; this family taps layer {}".format(config["te"]["num_hidden_layers"], TE_TAPS[-1]))
+    vae = config.get("vae") if pipeline != None else None
+    if vae != None:
+        require("VAE", vae, [
+            ("_class_name", "AutoencoderKLFlux2", None),
+            ("in_channels", 3, 3),
+            ("out_channels", 3, 3),
+            ("latent_channels", VAE_CHANNELS, None),
+            ("block_out_channels", [128, 256, 512, 512], None),
+            ("layers_per_block", 2, None),
+            ("norm_num_groups", 32, 32),
+            ("act_fn", "silu", "silu"),
+            ("mid_block_add_attention", True, True),
+            ("use_quant_conv", True, True),
+            ("use_post_quant_conv", True, True),
+            ("patch_size", [PACK, PACK], None),
+            ("batch_norm_eps", BN_EPS, None),
+        ])
+    heads = dit["num_attention_heads"]
+    dim = heads * HEAD_DIM
+    context_in = dit["joint_attention_dim"]
+    if te != None and context_in != len(TE_TAPS) * te.hidden:
+        fail("its context is {} wide; {} taps of its {}-wide encoder are {}".format(context_in, len(TE_TAPS), te.hidden, len(TE_TAPS) * te.hidden))
+    d = struct(
+        dim = dim,
+        heads = heads,
+        inter = dim * MLP_RATIO,
+        context_in = context_in,
+        double_blocks = dit["num_layers"],
+        single_blocks = dit["num_single_layers"],
+        guidance_embeds = dit.get("guidance_embeds", False),
+        te = te,
+        vae = vae != None,
+    )
+    layers = TE_TAPS[-1] if te != None else d.double_blocks + d.single_blocks
+    return struct(
+        MODELS = [model(id, template = NO_THINKING, tokenizer = TOKENIZER, arch = "flux_2", layers = layers, vocab = te.vocab if te != None else 0)],
+        DIMS = {id: d},
+        DEPLOYMENTS = [
+            deployment(id, weights = dtype.bf16, kv = dtype.bf16),
+            deployment(id, weights = dtype.u4g64, kv = dtype.bf16),
+        ],
+    )
+
 def layout(id, deploy):
     banks = roles(deploy, "banks", exact = True).banks
     d = DIMS[id]
     if d.heads * HEAD_DIM != d.dim:
         fail("plain MHA over 128-wide heads: heads × 128 is the width")
     dim = d.dim
-    klein = id == "flux2-klein-4b"
-    te = encoder(QWEN3_4B, TE_TAPS[-1], banks) if klein else None
+    te = encoder(d.te, TE_TAPS[-1], banks) if d.te != None else None
     te_context = [
-        weight([dim, QWEN3_4B.hidden], banks)
+        weight([dim, d.te.hidden], banks)
         for i in range(len(TE_TAPS))
-    ] if klein else None
+    ] if te != None else None
     return struct(
         dims = d,
         kv = dtype.bf16,
@@ -152,7 +255,7 @@ def layout(id, deploy):
         te = te,
         te_taps = TE_TAPS,
         te_context = te_context,
-        vae = flux_vae(VAE_CHANNELS, 2 * VAE_CHANNELS, vae_latent) if klein else None,
+        vae = flux_vae(VAE_CHANNELS, 2 * VAE_CHANNELS, vae_latent) if d.vae else None,
     )
 
 A1 = 8.73809524e-5

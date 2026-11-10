@@ -1,0 +1,184 @@
+{
+  "config": {
+    "dit": {
+      "_class_name": "Flux2Transformer2DModel",
+      "_diffusers_version": "0.37.0.dev0",
+      "_name_or_path": "/raid/yiyi/klein-4b-distilled-diffusers/transformer",
+      "attention_head_dim": 128,
+      "axes_dims_rope": [
+        32,
+        32,
+        32,
+        32
+      ],
+      "eps": 1e-06,
+      "guidance_embeds": false,
+      "in_channels": 128,
+      "joint_attention_dim": 7680,
+      "mlp_ratio": 3.0,
+      "num_attention_heads": 24,
+      "num_layers": 5,
+      "num_single_layers": 20,
+      "out_channels": null,
+      "patch_size": 1,
+      "rope_theta": 2000,
+      "timestep_guidance_channels": 256
+    },
+    "pipeline": {
+      "_class_name": "Flux2KleinPipeline",
+      "_diffusers_version": "0.37.0.dev0",
+      "is_distilled": true,
+      "scheduler": [
+        "diffusers",
+        "FlowMatchEulerDiscreteScheduler"
+      ],
+      "text_encoder": [
+        "transformers",
+        "Qwen3ForCausalLM"
+      ],
+      "tokenizer": [
+        "transformers",
+        "Qwen2TokenizerFast"
+      ],
+      "transformer": [
+        "diffusers",
+        "Flux2Transformer2DModel"
+      ],
+      "vae": [
+        "diffusers",
+        "AutoencoderKLFlux2"
+      ]
+    },
+    "scheduler": {
+      "_class_name": "FlowMatchEulerDiscreteScheduler",
+      "_diffusers_version": "0.37.0.dev0",
+      "base_image_seq_len": 256,
+      "base_shift": 0.5,
+      "invert_sigmas": false,
+      "max_image_seq_len": 4096,
+      "max_shift": 1.15,
+      "num_train_timesteps": 1000,
+      "shift": 3.0,
+      "shift_terminal": null,
+      "stochastic_sampling": false,
+      "time_shift_type": "exponential",
+      "use_beta_sigmas": false,
+      "use_dynamic_shifting": true,
+      "use_exponential_sigmas": false,
+      "use_karras_sigmas": false
+    },
+    "te": {
+      "architectures": [
+        "Qwen3ForCausalLM"
+      ],
+      "attention_bias": false,
+      "attention_dropout": 0.0,
+      "bos_token_id": 151643,
+      "dtype": "bfloat16",
+      "eos_token_id": 151645,
+      "head_dim": 128,
+      "hidden_act": "silu",
+      "hidden_size": 2560,
+      "initializer_range": 0.02,
+      "intermediate_size": 9728,
+      "layer_types": [
+        "full_attention",
+        "full_attention",
+        "full_attention",
+        "full_attention",
+        "full_attention",
+        "full_attention",
+        "full_attention",
+        "full_attention",
+        "full_attention",
+        "full_attention",
+        "full_attention",
+        "full_attention",
+        "full_attention",
+        "full_attention",
+        "full_attention",
+        "full_attention",
+        "full_attention",
+        "full_attention",
+        "full_attention",
+        "full_attention",
+        "full_attention",
+        "full_attention",
+        "full_attention",
+        "full_attention",
+        "full_attention",
+        "full_attention",
+        "full_attention",
+        "full_attention",
+        "full_attention",
+        "full_attention",
+        "full_attention",
+        "full_attention",
+        "full_attention",
+        "full_attention",
+        "full_attention",
+        "full_attention"
+      ],
+      "max_position_embeddings": 40960,
+      "max_window_layers": 36,
+      "model_type": "qwen3",
+      "num_attention_heads": 32,
+      "num_hidden_layers": 36,
+      "num_key_value_heads": 8,
+      "rms_norm_eps": 1e-06,
+      "rope_scaling": null,
+      "rope_theta": 1000000,
+      "sliding_window": null,
+      "tie_word_embeddings": true,
+      "transformers_version": "4.56.1",
+      "use_cache": true,
+      "use_sliding_window": false,
+      "vocab_size": 151936
+    },
+    "vae": {
+      "_class_name": "AutoencoderKLFlux2",
+      "_diffusers_version": "0.37.0.dev0",
+      "_name_or_path": "black-forest-labs/FLUX.2-dev",
+      "act_fn": "silu",
+      "batch_norm_eps": 0.0001,
+      "batch_norm_momentum": 0.1,
+      "block_out_channels": [
+        128,
+        256,
+        512,
+        512
+      ],
+      "down_block_types": [
+        "DownEncoderBlock2D",
+        "DownEncoderBlock2D",
+        "DownEncoderBlock2D",
+        "DownEncoderBlock2D"
+      ],
+      "force_upcast": true,
+      "in_channels": 3,
+      "latent_channels": 32,
+      "layers_per_block": 2,
+      "mid_block_add_attention": true,
+      "norm_num_groups": 32,
+      "out_channels": 3,
+      "patch_size": [
+        2,
+        2
+      ],
+      "sample_size": 1024,
+      "up_block_types": [
+        "UpDecoderBlock2D",
+        "UpDecoderBlock2D",
+        "UpDecoderBlock2D",
+        "UpDecoderBlock2D"
+      ],
+      "use_post_quant_conv": true,
+      "use_quant_conv": true
+    }
+  },
+  "source": "black-forest-labs/FLUX.2-klein-4B",
+  "special": {
+    "eos_token": "<|im_end|>",
+    "pad_token": "<|endoftext|>"
+  }
+}

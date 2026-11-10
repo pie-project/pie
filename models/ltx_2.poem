@@ -54,7 +54,7 @@ AUDIO_HEAD_DIM = 64
 CHANNELS = 128
 FF_MULT = 4
 
-def dims(layers, heads, audio_heads, cross_dim, audio_cross_dim, conn_layers):
+def dims(layers, heads, audio_heads, cross_dim, audio_cross_dim, conn_layers, te = None, vae = False):
     dim = heads * HEAD_DIM
     audio_dim = audio_heads * AUDIO_HEAD_DIM
     f = dim // (2 * ROPE_AXES)
@@ -72,7 +72,21 @@ def dims(layers, heads, audio_heads, cross_dim, audio_cross_dim, conn_layers):
         audio_dim = audio_dim,
         rope_dims = [2 * f, 2 * f, 2 * f, 0],
         audio_rope_dims = [audio_dim, 0, 0, 0],
+        te = te,
+        vae = vae,
     )
+
+GEMMA = struct(
+    hidden = 3840,
+    vocab = 262144,
+    layers = 48,
+    q_heads = 16,
+    inter = 15360,
+    full_every = 6,
+    eps = 1e-6,
+    sliding = struct(kv_heads = 8, head_dim = 256, window = 1024, theta = 10000.0, turn = None),
+    full = struct(kv_heads = 1, head_dim = 512, window = None, theta = 1000000.0, turn = 128),
+)
 
 DIMS = {
     "ltx25": dims(
@@ -82,6 +96,8 @@ DIMS = {
         cross_dim = 4096,
         audio_cross_dim = 2048,
         conn_layers = 8,
+        te = GEMMA,
+        vae = True,
     ),
     "ltx25-mini": dims(
         layers = 2,
@@ -178,25 +194,9 @@ def connector(prefix, dim, heads, layers, banks):
         rope_dims = [dim, 0, 0, 0],
     )
 
-# Gemma 4 12B: sliding-window layers with a global one every sixth, each
-# global layer's values its keys.
-GEMMA = struct(
-    hidden = 3840,
-    vocab = 262144,
-    layers = 48,
-    q_heads = 16,
-    inter = 15360,
-    full_every = 6,
-    eps = 1e-6,
-    sliding = struct(kv_heads = 8, head_dim = 256, window = 1024, theta = 10000.0, turn = None),
-    full = struct(kv_heads = 1, head_dim = 512, window = None, theta = 1000000.0, turn = 128),
-)
-
-# The hidden states the connectors read: the embedding and every layer's.
-TEXT_STATES = GEMMA.layers + 1
-
 def text_encoder(d, banks):
-    g = GEMMA
+    g = d.te
+    states = g.layers + 1
     norm = lambda: weight([g.hidden])
 
     def layer(l):
@@ -222,11 +222,13 @@ def text_encoder(d, banks):
         )
 
     return struct(
+        g = g,
+        states = states,
         embed = weight([g.vocab, g.hidden], banks),
         layers = [layer(l) for l in range(g.layers)],
         final_norm = norm(),
         proj = [
-            struct(linear = linear(width, g.hidden * TEXT_STATES, banks), rescale = f32(sqrt(width / g.hidden)))
+            struct(linear = linear(width, g.hidden * states, banks), rescale = f32(sqrt(width / g.hidden)))
             for width in [d.cross_dim, d.audio_cross_dim]
         ],
     )
@@ -298,10 +300,174 @@ def rope_constants():
         hw_bias = constant([hw_bias, hw_bias]),
     )
 
+def require(what, c, wants):
+    """Fail naming the first `(key, want, default)` that `c` states otherwise."""
+    for key, want, default in wants:
+        got = c.get(key, default)
+        if got != want:
+            fail("its {} states {} = {}; this family runs {}".format(what, key, got, want))
+
+def gemma_of(config):
+    """The Gemma 4 encoder `config` (a `text_encoder/config.json`) states."""
+    c = config.get("text_config", config)
+    if c.get("model_type") not in ["gemma4_text", "gemma4_unified_text"]:
+        fail("its text encoder is {}; this family encodes with Gemma 4".format(c.get("model_type")))
+    require("text encoder", c, [
+        ("hidden_activation", "gelu_pytorch_tanh", None),
+        ("attention_bias", False, False),
+        ("enable_moe_block", False, False),
+        ("hidden_size_per_layer_input", 0, 0),
+        ("num_kv_shared_layers", 0, 0),
+        ("use_double_wide_mlp", False, False),
+    ])
+    rope = c.get("rope_parameters") or {}
+    full, sliding = rope.get("full_attention") or {}, rope.get("sliding_attention") or {}
+    require("global layers' rope", full, [("rope_type", "proportional", None)])
+    require("sliding layers' rope", sliding, [("rope_type", "default", "default"), ("partial_rotary_factor", 1.0, 1.0)])
+    layers = c["num_hidden_layers"]
+    types = c.get("layer_types") or []
+    if "full_attention" not in types:
+        fail("its text encoder states no global layer; this family's attends globally every few layers")
+    every = types.index("full_attention") + 1
+    if types != ["full_attention" if l % every == every - 1 else "sliding_attention" for l in range(layers)]:
+        fail("its text encoder's layers are not a global one every {}th".format(every))
+    global_head_dim = c["global_head_dim"]
+    turn = global_head_dim * full.get("partial_rotary_factor", 1.0)
+    if turn != int(turn):
+        fail("its global layers turn {} of each head's lanes; a whole number turns".format(turn))
+    return struct(
+        hidden = c["hidden_size"],
+        vocab = c["vocab_size"],
+        layers = layers,
+        q_heads = c["num_attention_heads"],
+        inter = c["intermediate_size"],
+        full_every = every,
+        eps = float(c.get("rms_norm_eps", 1e-6)),
+        sliding = struct(kv_heads = c["num_key_value_heads"], head_dim = c["head_dim"], window = c["sliding_window"], theta = float(sliding.get("rope_theta", 10000.0)), turn = None),
+        full = struct(kv_heads = c["num_global_key_value_heads"], head_dim = global_head_dim, window = None, theta = float(full["rope_theta"]), turn = int(turn) if turn < global_head_dim else None),
+    )
+
+def adopt(id, config, special):
+    if config.get("pipeline") == None:
+        fail("this family reads a diffusers pipeline, which states model_index.json")
+    dit, conn = config.get("dit"), config.get("connectors")
+    if dit == None or conn == None:
+        fail("the pipeline holds no {}".format("transformer" if dit == None else "text connectors"))
+    require("transformer", dit, [
+        ("_class_name", "LTX2VideoTransformer3DModel", None),
+        ("attention_head_dim", HEAD_DIM, None),
+        ("audio_attention_head_dim", AUDIO_HEAD_DIM, None),
+        ("in_channels", CHANNELS, None),
+        ("out_channels", CHANNELS, None),
+        ("audio_in_channels", CHANNELS, None),
+        ("audio_out_channels", CHANNELS, None),
+        ("patch_size", PATCH_H, None),
+        ("patch_size_t", PATCH_T, None),
+        ("audio_patch_size", 1, None),
+        ("audio_patch_size_t", 1, None),
+        ("activation_fn", "gelu-approximate", None),
+        ("attention_bias", True, None),
+        ("attention_out_bias", True, None),
+        ("qk_norm", "rms_norm_across_heads", None),
+        ("norm_elementwise_affine", False, None),
+        ("norm_eps", NORM_EPS, None),
+        ("rope_type", "split", None),
+        ("rope_theta", ROPE_THETA, None),
+        ("base_height", ROPE_BASE_HW, None),
+        ("base_width", ROPE_BASE_HW, None),
+        ("pos_embed_max_pos", ROPE_BASE_T, None),
+        ("audio_pos_embed_max_pos", ROPE_BASE_T, None),
+        ("causal_offset", CAUSAL_OFFSET, None),
+        ("audio_scale_factor", AUDIO_COMPRESSION, None),
+        ("audio_hop_length", 160, None),
+        ("audio_sampling_rate", 16000, None),
+        ("vae_scale_factors", [VAE_TEMPORAL_COMPRESSION, VAE_SPATIAL_COMPRESSION, VAE_SPATIAL_COMPRESSION], None),
+        ("timestep_scale_multiplier", TRAIN_STEPS, None),
+        ("cross_attn_timestep_scale_multiplier", TRAIN_STEPS, None),
+        ("gated_attn", True, False),
+        ("audio_gated_attn", True, False),
+        ("cross_attn_mod", True, False),
+        ("audio_cross_attn_mod", True, False),
+        ("ff_bias", False, None),
+        ("audio_ff_bias", True, None),
+        ("use_prompt_adaln_single", True, False),
+        ("use_prompt_embeddings", False, None),
+        ("use_keyframes_abs_pos_embedding", True, None),
+        ("perturbed_attn", True, None),
+    ])
+    heads, audio_heads = dit["num_attention_heads"], dit["audio_num_attention_heads"]
+    cross_dim, audio_cross_dim = dit["cross_attention_dim"], dit["audio_cross_attention_dim"]
+    layers = conn["video_connector_num_layers"]
+    require("text connectors", conn, [
+        ("_class_name", "LTX2TextConnectors", None),
+        ("video_connector_num_attention_heads", heads, None),
+        ("video_connector_attention_head_dim", cross_dim // heads, None),
+        ("video_hidden_dim", cross_dim, None),
+        ("audio_connector_num_attention_heads", audio_heads, None),
+        ("audio_connector_attention_head_dim", audio_cross_dim // audio_heads, None),
+        ("audio_hidden_dim", audio_cross_dim, None),
+        ("audio_connector_num_layers", layers, None),
+        ("video_connector_num_learnable_registers", REGISTERS, None),
+        ("audio_connector_num_learnable_registers", REGISTERS, None),
+        ("connector_rope_base_seq_len", CONN_ROPE_BASE, None),
+        ("rope_theta", ROPE_THETA, None),
+        ("rope_type", "split", None),
+        ("per_modality_projections", True, False),
+        ("proj_bias", True, False),
+        ("video_gated_attn", True, False),
+        ("audio_gated_attn", True, False),
+        ("causal_temporal_positioning", False, None),
+    ])
+    if cross_dim % heads != 0 or audio_cross_dim % audio_heads != 0:
+        fail("its connectors' widths do not split into its heads")
+    te = config.get("te")
+    te = gemma_of(te) if te != None else None
+    if te != None:
+        require("transformer", dit, [("caption_channels", te.hidden, None)])
+        require("text connectors", conn, [("caption_channels", te.hidden, None), ("text_proj_in_factor", te.layers + 1, None)])
+    vae = config.get("vae")
+    if vae != None:
+        require("VAE", vae, [
+            ("_class_name", "AutoencoderKLLTX2Video", None),
+            ("latent_channels", VAE_Z, None),
+            ("out_channels", VAE_RGB, None),
+            ("patch_size", VAE_PATCH, None),
+            ("patch_size_t", 1, None),
+            ("decoder_block_out_channels", [256, 512, 512, 1024], None),
+            ("decoder_layers_per_block", [4, 6, 4, 2, 2], None),
+            ("decoder_spatio_temporal_scaling", [True, True, True, True], None),
+            ("decoder_inject_noise", [False, False, False, False, False], None),
+            ("upsample_type", ["spatiotemporal", "spatiotemporal", "temporal", "spatial"], None),
+            ("upsample_factor", [2, 2, 1, 2], None),
+            ("upsample_residual", [False, False, False, False], None),
+            ("decoder_causal", False, None),
+            ("decoder_spatial_padding_mode", "zeros", None),
+            ("timestep_conditioning", False, None),
+            ("spatial_compression_ratio", VAE_SPATIAL_COMPRESSION, None),
+            ("temporal_compression_ratio", VAE_TEMPORAL_COMPRESSION, None),
+        ])
+    d = dims(
+        layers = dit["num_layers"],
+        heads = heads,
+        audio_heads = audio_heads,
+        cross_dim = cross_dim,
+        audio_cross_dim = audio_cross_dim,
+        conn_layers = layers,
+        te = te,
+        vae = vae != None,
+    )
+    return struct(
+        MODELS = [model(id, template = CHATML, tokenizer = TOKENIZER, arch = "ltx_2", layers = d.layers, vocab = 0)],
+        DIMS = {id: d},
+        DEPLOYMENTS = [
+            deployment(id, weights = dtype.bf16, kv = dtype.bf16),
+            deployment(id, weights = dtype.u4g64, kv = dtype.bf16),
+        ],
+    )
+
 def layout(id, deploy):
     banks = roles(deploy, "banks", exact = True).banks
     d = DIMS[id]
-    flagship = id == "ltx25"
     return struct(
         dims = d,
         kv = deploy.kv,
@@ -319,8 +485,8 @@ def layout(id, deploy):
             connector("connectors.video", d.cross_dim, d.heads, d.conn_layers, banks),
             connector("connectors.audio", d.audio_cross_dim, d.audio_heads, d.conn_layers, banks),
         ),
-        te = text_encoder(d, banks) if flagship else None,
-        vae = vae(dtype.bf16) if flagship else None,
+        te = text_encoder(d, banks) if d.te != None else None,
+        vae = vae(dtype.bf16) if d.vae else None,
     )
 
 def generative(m):
@@ -489,7 +655,7 @@ def read_text_encoder(reads, te, d):
 
     # The checkpoint stacks the states channel-major (`c·49 + state`), ours
     # state-major.
-    cols = [c * TEXT_STATES + s for s in range(TEXT_STATES) for c in range(GEMMA.hidden)]
+    cols = [c * te.states + s for s in range(te.states) for c in range(te.g.hidden)]
     for p, stream in zip(te.proj, ["video", "audio"]):
         stem = "connectors.{}_text_proj_in".format(stream)
         reads.read_expr(p.linear.w, src(stem + ".weight").gather(1, cols))
@@ -522,7 +688,7 @@ VAE_EPS = 1e-8
 def caches(m, c):
     if m.te == None:
         return
-    spaces = [c.kv_space(m.kv, GEMMA.sliding.window), c.kv_space(m.kv)]
+    spaces = [c.kv_space(m.kv, m.te.g.sliding.window), c.kv_space(m.kv)]
     for w in m.te.layers:
         plane = w.attn.kv_heads * w.attn.head_dim
         c.kv(spaces[0 if w.attn.window else 1], w.kv, [plane, plane], w.attn.head_dim, heads = True)
@@ -545,7 +711,7 @@ def text(arm, te):
     """Every hidden state of the encoder, the last one normed, each RMS-normed
     alone and all side by side, through each connector's input projection
     (its rows rescaled to its width), the two side by side."""
-    g = GEMMA
+    g = te.g
     plans = [ops.attn.plan_prefill(arm, g.q_heads, a.kv_heads, a.head_dim, a.window) for a in [g.sliding, g.full]]
     positions = arm.positions()
     y = ops.gather.embed(arm.tokens(), te.embed, g.vocab) * f32(sqrt(g.hidden))

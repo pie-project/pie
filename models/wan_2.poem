@@ -42,6 +42,15 @@ TE_HEAD_DIM = 64
 TE_INTER = 10240
 TE_LAYERS = 24
 TE_BUCKETS = 32
+UMT5_XXL = struct(
+    hidden = TE_HIDDEN,
+    vocab = TE_VOCAB,
+    heads = TE_HEADS,
+    head_dim = TE_HEAD_DIM,
+    inter = TE_INTER,
+    layers = TE_LAYERS,
+    buckets = TE_BUCKETS,
+)
 
 VAE_Z = 48
 VAE_PIX_CHANNELS = 12
@@ -55,7 +64,7 @@ VAE_ENC_RESNETS = 2
 VAE_TEMPORAL_DOWN = [False, True, True, False]
 VAE_MAX_LATENT_PLANE = 44 * 80
 
-def dims(dim, heads, head_dim, ffn, layers, channels, text_dim = 64, freq_dim = 256):
+def dims(dim, heads, head_dim, ffn, layers, channels, text_dim = 64, freq_dim = 256, te = None, vae = False):
     hw = 2 * (head_dim // 6)
     return struct(
         dim = dim,
@@ -69,10 +78,12 @@ def dims(dim, heads, head_dim, ffn, layers, channels, text_dim = 64, freq_dim = 
         rope_dims = [head_dim - 2 * hw, hw, hw, 0],
         sm_scale = f32(1.0 / f32(sqrt(head_dim))),
         patch = channels * PATCH_VOL,
+        te = te,
+        vae = vae,
     )
 
 DIMS = {
-    "wan22-ti2v-5b": dims(dim = 3072, heads = 24, head_dim = 128, ffn = 14336, layers = 30, channels = 48, text_dim = TE_HIDDEN),
+    "wan22-ti2v-5b": dims(dim = 3072, heads = 24, head_dim = 128, ffn = 14336, layers = 30, channels = 48, text_dim = TE_HIDDEN, te = UMT5_XXL, vae = True),
     "wan22-mini-d128": dims(dim = 256, heads = 2, head_dim = 128, ffn = 512, layers = 2, channels = 16),
     "wan22-mini-nano": dims(dim = 48, heads = 2, head_dim = 24, ffn = 128, layers = 2, channels = 16, freq_dim = 32),
 }
@@ -106,31 +117,31 @@ def block(d, banks):
         ),
     )
 
-def text_encoder(banks):
-    inner = TE_HEADS * TE_HEAD_DIM
+def text_encoder(c, banks):
+    inner = c.heads * c.head_dim
 
     def layer(l):
         return struct(
-            attn_norm = weight([TE_HIDDEN]),
-            q = weight([inner, TE_HIDDEN], banks),
-            k = weight([inner, TE_HIDDEN], banks),
-            v = weight([inner, TE_HIDDEN], banks),
-            o = weight([TE_HIDDEN, inner], banks),
-            rel_bias = weight([TE_BUCKETS, TE_HEADS]),
-            ffn_norm = weight([TE_HIDDEN]),
-            wi_0 = weight([TE_INTER, TE_HIDDEN], banks),
-            wi_1 = weight([TE_INTER, TE_HIDDEN], banks),
-            wo = weight([TE_HIDDEN, TE_INTER], banks),
+            attn_norm = weight([c.hidden]),
+            q = weight([inner, c.hidden], banks),
+            k = weight([inner, c.hidden], banks),
+            v = weight([inner, c.hidden], banks),
+            o = weight([c.hidden, inner], banks),
+            rel_bias = weight([c.buckets, c.heads]),
+            ffn_norm = weight([c.hidden]),
+            wi_0 = weight([c.inter, c.hidden], banks),
+            wi_1 = weight([c.inter, c.hidden], banks),
+            wo = weight([c.hidden, c.inter], banks),
         )
 
     return struct(
-        vocab = TE_VOCAB,
-        head_dim = TE_HEAD_DIM,
-        buckets = TE_BUCKETS,
+        vocab = c.vocab,
+        head_dim = c.head_dim,
+        buckets = c.buckets,
         max_tokens = CONTEXT_LEN,
-        embed = weight([TE_VOCAB, TE_HIDDEN], banks),
-        layers = [layer(l) for l in range(TE_LAYERS)],
-        final_norm = weight([TE_HIDDEN]),
+        embed = weight([c.vocab, c.hidden], banks),
+        layers = [layer(l) for l in range(c.layers)],
+        final_norm = weight([c.hidden]),
     )
 
 def conv_weights(name, c_out, c_in, k, plane, banks, front = None):
@@ -281,10 +292,111 @@ def vae(banks):
         enc = vae_encoder(banks),
     )
 
+def require(what, c, wants):
+    """Fail naming the first `(key, want, default)` that `c` states otherwise."""
+    for key, want, default in wants:
+        got = c.get(key, default)
+        if got != want:
+            fail("its {} states {} = {}; this family runs {}".format(what, key, got, want))
+
+def umt5_of(c):
+    """The UMT5 encoder `c` (a `text_encoder/config.json`) states."""
+    if c.get("model_type") != "umt5":
+        fail("its text encoder is {}; this family encodes with UMT5".format(c.get("model_type")))
+    require("text encoder", c, [
+        ("feed_forward_proj", "gated-gelu", None),
+        ("dense_act_fn", "gelu_new", None),
+        ("layer_norm_epsilon", TE_EPS, None),
+        ("relative_attention_max_distance", TE_MAX_DISTANCE, None),
+    ])
+    return struct(
+        hidden = c["d_model"],
+        vocab = c["vocab_size"],
+        heads = c["num_heads"],
+        head_dim = c["d_kv"],
+        inter = c["d_ff"],
+        layers = c["num_layers"],
+        buckets = c["relative_attention_num_buckets"],
+    )
+
+def adopt(id, config, special):
+    pipeline = config.get("pipeline")
+    dit = config.get("dit") if pipeline != None else config
+    if dit == None:
+        fail("the pipeline holds no transformer")
+    require("transformer", dit, [
+        ("_class_name", "WanTransformer3DModel", "WanTransformer3DModel"),
+        ("patch_size", [PATCH_T, PATCH_H, PATCH_W], None),
+        ("qk_norm", "rms_norm_across_heads", None),
+        ("cross_attn_norm", True, None),
+        ("eps", NORM_EPS, None),
+        ("added_kv_proj_dim", None, None),
+        ("image_dim", None, None),
+        ("pos_embed_seq_len", None, None),
+        ("in_channels", VAE_Z, None),
+        ("out_channels", VAE_Z, None),
+    ])
+    if pipeline != None:
+        if config.get("dit2") != None or pipeline.get("boundary_ratio") != None:
+            fail("it hands the low-noise steps to a second transformer; this family runs one denoiser")
+        if config.get("ie") != None:
+            fail("it conditions on an image encoder's features, which this family does not")
+        require("pipeline", pipeline, [("expand_timesteps", True, False)])
+    if config.get("scheduler") != None:
+        require("scheduler", config["scheduler"], [("flow_shift", SHIFT_TI2V, None)])
+    if special.get("eos_token", "</s>") != "</s>":
+        fail("its tokenizer ends at {}; this family's at </s>".format(special["eos_token"]))
+    te = config.get("te") if pipeline != None else None
+    te = umt5_of(te) if te != None else None
+    text_dim = dit["text_dim"]
+    if te != None and text_dim != te.hidden:
+        fail("its text embedder takes {} wide rows; its text encoder's are {}".format(text_dim, te.hidden))
+    vae = config.get("vae") if pipeline != None else None
+    if vae != None:
+        require("VAE", vae, [
+            ("_class_name", "AutoencoderKLWan", None),
+            ("z_dim", VAE_Z, None),
+            ("in_channels", VAE_PIX_CHANNELS, None),
+            ("out_channels", VAE_PIX_CHANNELS, None),
+            ("patch_size", VAE_PATCH, None),
+            ("base_dim", VAE_ENCODER_DIMS[0], None),
+            ("decoder_base_dim", VAE_DECODER_DIMS[-1], None),
+            ("dim_mult", [1, 2, 4, 4], None),
+            ("num_res_blocks", VAE_ENC_RESNETS, None),
+            ("temperal_downsample", VAE_TEMPORAL_DOWN[:3], None),
+            ("is_residual", True, None),
+            ("attn_scales", [], None),
+            ("clip_output", False, None),
+            ("scale_factor_spatial", VAE_SPATIAL_COMPRESSION, None),
+            ("scale_factor_temporal", VAE_TEMPORAL_COMPRESSION, None),
+            ("latents_mean", VAE_LATENTS_MEAN, None),
+            ("latents_std", VAE_LATENTS_STD, None),
+        ])
+    heads, head_dim = dit["num_attention_heads"], dit["attention_head_dim"]
+    d = dims(
+        dim = heads * head_dim,
+        heads = heads,
+        head_dim = head_dim,
+        ffn = dit["ffn_dim"],
+        layers = dit["num_layers"],
+        channels = dit["in_channels"],
+        text_dim = text_dim,
+        freq_dim = dit["freq_dim"],
+        te = te,
+        vae = vae != None,
+    )
+    return struct(
+        MODELS = [model(id, template = RAW, tokenizer = TOKENIZER, arch = "wan_2", layers = te.layers if te != None else d.layers, vocab = te.vocab if te != None else 0)],
+        DIMS = {id: d},
+        DEPLOYMENTS = [
+            deployment(id, weights = dtype.bf16, kv = dtype.bf16),
+            deployment(id, weights = dtype.u4g64, kv = dtype.bf16),
+        ],
+    )
+
 def layout(id, deploy):
     banks = roles(deploy, "banks", exact = True).banks
     d = DIMS[id]
-    whole = id == "wan22-ti2v-5b"
     if d.heads * d.head_dim != d.dim:
         fail("plain MHA: heads × head_dim is the width")
     dim = d.dim
@@ -301,8 +413,8 @@ def layout(id, deploy):
             head_table = weight([HEAD_SLICES * dim], dtype.f32),
             proj_out = linear(d.patch, dim, banks),
         ),
-        te = text_encoder(banks) if whole else None,
-        vae = vae(dtype.bf16) if whole else None,
+        te = text_encoder(d.te, banks) if d.te != None else None,
+        vae = vae(dtype.bf16) if d.vae else None,
         shift = SHIFT_TI2V,
     )
 
