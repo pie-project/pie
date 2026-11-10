@@ -1086,8 +1086,11 @@ fn the_routed_mlp_on_one_sort_answers_its_parts() {
             .map(|p| ((hash(p / tk, 64) as usize + p % tk) % e) as i32)
             .collect();
         let weights: Vec<f32> = data(t * tk, 65).iter().map(|v| v.abs()).collect();
-        let run = |fused: bool| {
-            let mut b = Bench::new();
+        let run = |fused: bool, steps: i64| {
+            let mut b = Bench::new().with_tuning(kernels_xla::tuning::Tuning {
+                moe_gmm_run: steps,
+                ..kernels_xla::tuning::Tuning::DEFAULT
+            });
             let xt = b.bf16(t as u32, h as u32, &x);
             let ut = b.bf16(e as u32, (2 * i * h) as u32, &wu);
             let dt = b.bf16(e as u32, (h * i) as u32, &wd);
@@ -1164,10 +1167,13 @@ fn the_routed_mlp_on_one_sort_answers_its_parts() {
             }
             Some(b.read_f32(y))
         };
-        let (Some(fused), Some(parts)) = (run(true), run(false)) else {
+        let (Some(fused), Some(parts), Some(stepped)) = (run(true, 1), run(false, 1), run(true, 4))
+        else {
             return;
         };
         let scale = parts.iter().fold(0f32, |m, v| m.max(v.abs()));
         assert_close(&fused, &parts, 0.01 * scale.max(1.0), 1e-2);
+        // Four of an expert's tiles a step land what a step a tile does.
+        assert_eq!(stepped, fused);
     }
 }

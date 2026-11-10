@@ -100,6 +100,11 @@ pub struct Gmm {
     /// follows a block-FP8 projection (`tile`, one expert, whole heads a
     /// block).
     pub sums: Option<i64>,
+    /// Tiles a grid step takes at most, all of one expert's run (a
+    /// prefetching kernel over a plain bank, no bias, whole-`N` blocks; 1:
+    /// a step a tile). The step's rows go through one dot, so the MXU loads
+    /// each weight tile once for up to `run · tm` rows.
+    pub run: i64,
 }
 
 /// How the weights are cut into blocks.
@@ -232,6 +237,250 @@ impl Gmm {
                 (Orient::KMajor, Ok(Cut::Element { .. })) => !self.bias && whole(),
                 _ => false,
             }
+    }
+
+    /// Whether a grid step takes up to `run` tiles of one expert's run
+    /// ([`Gmm::run`]): `kernel` then takes, after `se` and `nt` (here each
+    /// step's expert and the step count), each step's run, the next run's
+    /// expert, its first tile and its tile count, all i32 `[tiles]`; the
+    /// rows hold `run - 1` tiles past the last a step may start at.
+    #[must_use]
+    pub fn stepping(&self) -> bool {
+        self.run > 1
+            && self.prefetching()
+            && !self.bias
+            && matches!(self.cut(), Ok(Cut::Blocked { tn }) if tn == self.n)
+    }
+
+    /// The grid steps a stepping kernel runs at most: each expert's run of
+    /// tiles cut into steps of `run` (the rows' last `run - 1` tiles are
+    /// slack no step starts in).
+    #[must_use]
+    pub fn steps(&self) -> i64 {
+        let tiles = (self.tiles - (self.run - 1)).max(1);
+        let runs = self.experts.min(tiles);
+        tiles.min((tiles + runs * (self.run - 1) + self.run - 1) / self.run)
+    }
+
+    fn kernel_steps(&self) -> Built<Compiled> {
+        let (k, n, tm, j) = (self.k, self.n, self.tm, self.run);
+        let rows = self.tiles * tm;
+        let orient = self.orient;
+        let (rb, cb) = match orient {
+            Orient::NMajor => (n, k),
+            Orient::KMajor => (k, n),
+        };
+        let out_elem = self.out;
+        if !matches!(out_elem, Elem::F32 | Elem::Bf16) {
+            return bad(format!("a {out_elem:?} result"));
+        }
+        fn last(b: &mut Body, g: &Grid) -> Built<V> {
+            let zero = b.index(0);
+            let nt = b.load(g.prefetch[1], &[zero])?;
+            let one = b.i32(1);
+            let top = b.subi(nt, one)?;
+            let z = b.i32(0);
+            let top = b.maxsi(top, z)?;
+            b.minsi(g.ids[1], top)
+        }
+        // A step's rows: `run` tiles from its first, read whole (the rows
+        // past its count are the next run's, or the slack).
+        let xs = Operand {
+            array: vec![rows, k],
+            elem: Elem::Bf16,
+            block: vec![j * tm, k],
+            window: Window::Element,
+            index: Box::new(move |b: &mut Body, g: &Grid| {
+                let s = last(b, g)?;
+                let si = b.as_index(s)?;
+                let t = b.load(g.prefetch[4], &[si])?;
+                let tt = b.i32(tm);
+                let at = b.muli(t, tt)?;
+                let at = b.assume_multiple(at, tm)?;
+                Ok(vec![at, b.i32(0)])
+            }),
+        };
+        let bank = Operand {
+            array: self.bank_dims().to_vec(),
+            elem: self.w,
+            block: self.bank_dims().to_vec(),
+            window: Window::Any,
+            index: Box::new(|b: &mut Body, _: &Grid| Ok(vec![b.i32(0), b.i32(0)])),
+        };
+        let out = Operand {
+            array: vec![rows, n],
+            elem: out_elem,
+            block: vec![rows, n],
+            window: Window::Any,
+            index: Box::new(|b: &mut Body, _: &Grid| Ok(vec![b.i32(0), b.i32(0)])),
+        };
+        let wb = self.wbytes();
+        let convert = if self.w == Elem::Bf16 { 0 } else { k * n * 2 };
+        let ob = i64::from(out_elem.bits()) / 8;
+        let vmem =
+            2 * j * tm * k * 2 + 2 * k * n * wb + convert + j * tm * n * 4 + 2 * j * tm * n * ob;
+        let floor = (32 << 20).min(self.vmem_cap);
+        let limit = (vmem * 2 + (8 << 20)).clamp(floor, self.vmem_cap);
+        let steps = self.steps();
+        let kernel = Kernel {
+            name: "gmm".into(),
+            grid: vec![1, steps],
+            semantics: vec![Sem::Arbitrary, Sem::Arbitrary],
+            prefetch: vec![
+                vec![steps],
+                vec![1],
+                vec![steps],
+                vec![steps],
+                vec![steps],
+                vec![steps],
+            ],
+            ins: vec![xs, bank],
+            outs: vec![out],
+            vmem_limit: Some(limit as u64),
+            scratch: vec![
+                MTy::Ref(vec![2, rb, cb], self.w, Space::Vmem),
+                MTy::Sem(vec![2]),
+                MTy::Ref(vec![2, j * tm, n], out_elem, Space::Vmem),
+                MTy::Sem(vec![2]),
+            ],
+        };
+        kernel.build(|b, blk| {
+            let (wbuf, wsems, obuf, osems) = (
+                blk.scratch[0],
+                blk.scratch[1],
+                blk.scratch[2],
+                blk.scratch[3],
+            );
+            let bank = blk.ins[1];
+            let outr = blk.outs[0];
+            let pre = &blk.grid.prefetch;
+            let s = blk.grid.ids[1];
+            // The copy of expert `ex`'s weights into slot `slot`.
+            let wcopy = |b: &mut Body, ex: V, slot: V| -> Built<(V, V, V)> {
+                let z = b.i32(0);
+                let nn = b.i32(n);
+                let at = b.muli(ex, nn)?;
+                let src = match orient {
+                    Orient::NMajor => b.ref_slice(bank, &[at, z], &[n, k])?,
+                    Orient::KMajor => b.ref_slice(bank, &[z, at], &[k, n])?,
+                };
+                let dst = b.ref_slice(wbuf, &[slot, z, z], &[1, rb, cb])?;
+                let dst = b.ref_squeeze(dst)?;
+                let sem = b.ref_slice(wsems, &[slot], &[1])?;
+                let sem = b.ref_squeeze(sem)?;
+                Ok((src, dst, sem))
+            };
+            // The copy of step `st`'s `c` tiles of result rows out of slot
+            // `slot`.
+            let ocopy = |b: &mut Body, st: V, slot: V, c: i64| -> Built<(V, V, V)> {
+                let z = b.i32(0);
+                let si = b.as_index(st)?;
+                let t = b.load(pre[4], &[si])?;
+                let tt = b.i32(tm);
+                let at = b.muli(t, tt)?;
+                let at = b.assume_multiple(at, tm)?;
+                let src = b.ref_slice(obuf, &[slot, z, z], &[1, c * tm, n])?;
+                let src = b.ref_squeeze(src)?;
+                let dst = b.ref_slice(outr, &[at, z], &[c * tm, n])?;
+                let sem = b.ref_slice(osems, &[slot], &[1])?;
+                let sem = b.ref_squeeze(sem)?;
+                Ok((src, dst, sem))
+            };
+            // Waits for step `st`'s copy out (its tile count read again).
+            let owait = |b: &mut Body, st: V| -> Built<()> {
+                let two = b.i32(2);
+                let slot = b.remsi(st, two)?;
+                let si = b.as_index(st)?;
+                let cnt = b.load(pre[5], &[si])?;
+                for c in 1..=j {
+                    let cc = b.i32(c);
+                    let is = b.cmpi(ICmp::Eq, cnt, cc)?;
+                    b.when(is, |b| {
+                        let (src, dst, sem) = ocopy(b, st, slot, c)?;
+                        b.dma_wait(sem, src, dst)
+                    })?;
+                }
+                Ok(())
+            };
+            let zero = b.index(0);
+            let ns = b.load(pre[1], &[zero])?;
+            let live = b.cmpi(ICmp::Slt, s, ns)?;
+            b.when(live, |b| {
+                let si = b.as_index(s)?;
+                let r = b.load(pre[2], &[si])?;
+                let two = b.i32(2);
+                let wslot = b.remsi(r, two)?;
+                let z = b.i32(0);
+                let one = b.i32(1);
+                let before = b.subi(s, one)?;
+                let before = b.maxsi(before, z)?;
+                let bi = b.as_index(before)?;
+                let rp = b.load(pre[2], &[bi])?;
+                let at0 = b.cmpi(ICmp::Eq, s, z)?;
+                let moved = b.cmpi(ICmp::Ne, rp, r)?;
+                let first = b.select(at0, at0, moved)?;
+                b.when(at0, |b| {
+                    let ex = b.load(pre[0], &[si])?;
+                    let (src, dst, sem) = wcopy(b, ex, wslot)?;
+                    b.dma_start(src, dst, sem)
+                })?;
+                b.when(first, |b| {
+                    let z = b.i32(0);
+                    let (src, dst, sem) = wcopy(b, z, wslot)?;
+                    b.dma_wait(sem, src, dst)?;
+                    let nx = b.load(pre[3], &[si])?;
+                    let has = b.cmpi(ICmp::Sge, nx, z)?;
+                    b.when(has, |b| {
+                        let one = b.i32(1);
+                        let other = b.subi(one, wslot)?;
+                        let (src, dst, sem) = wcopy(b, nx, other)?;
+                        b.dma_start(src, dst, sem)
+                    })
+                })?;
+                // The slot this step lands in was last copied out two steps
+                // back.
+                let two = b.i32(2);
+                let oslot = b.remsi(s, two)?;
+                let back = b.subi(s, two)?;
+                let had = b.cmpi(ICmp::Sge, back, z)?;
+                b.when(had, |b| owait(b, back))?;
+                let z = b.i32(0);
+                let held = b.ref_slice(wbuf, &[wslot, z, z], &[1, rb, cb])?;
+                let held = b.ref_squeeze(held)?;
+                let cnt = b.load(pre[5], &[si])?;
+                for c in 1..=j {
+                    let cc = b.i32(c);
+                    let is = b.cmpi(ICmp::Eq, cnt, cc)?;
+                    b.when(is, |b| {
+                        let zi = b.index(0);
+                        let x = b.vload(blk.ins[0], &[zi, zi], &[c * tm, k])?;
+                        let w = b.vload_all(held)?;
+                        let w = b.convert_f(w, Elem::Bf16)?;
+                        let acc = b.splat_f(&[c * tm, n], Elem::F32, 0.0)?;
+                        let y = b.matmul(x, w, acc, orient == Orient::NMajor)?;
+                        let y = b.convert_f(y, out_elem)?;
+                        let z = b.i32(0);
+                        let dst = b.ref_slice(obuf, &[oslot, z, z], &[1, c * tm, n])?;
+                        let dst = b.ref_squeeze(dst)?;
+                        b.vstore_all(y, dst)?;
+                        let (src, dst, sem) = ocopy(b, s, oslot, c)?;
+                        b.dma_start(src, dst, sem)
+                    })?;
+                }
+                // The last step waits for its copy and the one before it.
+                let one = b.i32(1);
+                let end = b.subi(ns, one)?;
+                let at_end = b.cmpi(ICmp::Eq, s, end)?;
+                b.when(at_end, |b| {
+                    let z = b.i32(0);
+                    let one = b.i32(1);
+                    let prev = b.subi(s, one)?;
+                    let had = b.cmpi(ICmp::Sge, prev, z)?;
+                    b.when(had, |b| owait(b, prev))?;
+                    owait(b, s)
+                })
+            })
+        })
     }
 
     fn kernel_prefetching(&self) -> Built<Compiled> {
@@ -439,6 +688,9 @@ impl Gmm {
     pub fn kernel(&self) -> Built<Compiled> {
         if self.tm % 16 != 0 || self.tiles < 1 || self.k < 1 || self.n < 1 || self.experts < 1 {
             return bad(format!("{self:?}"));
+        }
+        if self.stepping() {
+            return self.kernel_steps();
         }
         if self.prefetching() {
             return self.kernel_prefetching();
@@ -932,6 +1184,7 @@ mod tests {
             out: Elem::F32,
             prefetch: false,
             sums: None,
+            run: 1,
         }
     }
 
