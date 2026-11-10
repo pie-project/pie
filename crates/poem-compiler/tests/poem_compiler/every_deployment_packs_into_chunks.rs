@@ -62,9 +62,17 @@ fn wrongs(trace: &Trace, recipe: &ChunkRecipe) -> Vec<String> {
             wrong.push(format!("a slot of {} past C {c}", shape.bytes()));
         }
         match shape {
-            SlotLayout::List { tokens, rows, .. } | SlotLayout::Ring { tokens, rows, .. } => {
+            SlotLayout::List { tokens, rows, .. } => {
                 if tokens % TOKEN_GRAIN != 0 {
                     wrong.push(format!("{tokens} tokens a slot"));
+                }
+                // Every list, kv or window, holds the kv page.
+                if let Some(SlotLayout::List { tokens: page, .. }) = recipe.list()
+                    && page != tokens
+                {
+                    wrong.push(format!(
+                        "a list of {tokens} tokens beside the kv page {page}"
+                    ));
                 }
                 let mut layers: BTreeMap<(Option<u32>, Option<RowId>), u64> = BTreeMap::new();
                 for run in rows {
@@ -160,9 +168,7 @@ fn wrongs(trace: &Trace, recipe: &ChunkRecipe) -> Vec<String> {
     let mut held: BTreeMap<RowId, usize> = BTreeMap::new();
     for shape in &recipe.slots {
         match shape {
-            SlotLayout::List { rows, .. }
-            | SlotLayout::RsList { rows, .. }
-            | SlotLayout::Ring { rows, .. } => {
+            SlotLayout::List { rows, .. } | SlotLayout::RsList { rows, .. } => {
                 for run in rows {
                     *held.entry(run.row).or_default() += 1;
                 }
@@ -354,9 +360,9 @@ fn fixed_rows(trace: &Trace, recipe: &ChunkRecipe, part: &str) -> (usize, Vec<u6
 
 fn per_token(shape: &SlotLayout) -> u64 {
     match shape {
-        SlotLayout::List { rows, .. }
-        | SlotLayout::RsList { rows, .. }
-        | SlotLayout::Ring { rows, .. } => rows.iter().map(|r| r.per_token).sum(),
+        SlotLayout::List { rows, .. } | SlotLayout::RsList { rows, .. } => {
+            rows.iter().map(|r| r.per_token).sum()
+        }
         SlotLayout::Fixed { .. } => 0,
     }
 }
@@ -420,20 +426,24 @@ fn nemotron_super_holds_40_four_mib_states_and_their_convs() {
 }
 
 #[test]
-fn gemma4_31b_lists_80_kib_a_token_and_rings_800_kib_through_its_window() {
+fn gemma4_31b_lists_80_kib_a_token_and_800_kib_through_its_window() {
     let (_, recipe) = planned("gemma4-31b-bf16-kv-bf16");
-    assert_eq!(per_token(recipe.list().unwrap()), 80 << 10);
-    let rings: Vec<&SlotLayout> = recipe.rings().collect();
-    assert_eq!(rings.len(), 1);
-    let SlotLayout::Ring { cap, .. } = rings[0] else {
+    let list = recipe.list().unwrap();
+    assert_eq!(per_token(list), 80 << 10);
+    let windows: Vec<&SlotLayout> = recipe.windows().collect();
+    assert_eq!(windows.len(), 1);
+    assert_eq!(windows[0].window(), Some(1024));
+    assert_eq!(per_token(windows[0]), 800 << 10);
+    let (SlotLayout::List { tokens: page, .. }, SlotLayout::List { tokens, .. }) =
+        (list, windows[0])
+    else {
         unreachable!()
     };
-    assert_eq!(cap.window, 1024);
-    assert_eq!(per_token(rings[0]), 800 << 10);
+    assert_eq!(tokens, page, "the window list's slot is the kv page");
 }
 
 #[test]
-fn dsv4_pro_lists_its_pools_as_one_shape_and_rings_its_window() {
+fn dsv4_pro_lists_its_pools_as_one_shape_and_its_window_as_another() {
     let (_, recipe) = planned("dsv4-pro-bf16-mxfp4-kv-bf16");
     let list = recipe.list().unwrap();
     // 30 pools of 256 B, 30 index keys of 64 B and 31 pools of 1 KiB a token:
@@ -443,9 +453,9 @@ fn dsv4_pro_lists_its_pools_as_one_shape_and_rings_its_window() {
         unreachable!()
     };
     assert_eq!(tokens % 128, 0);
-    let rings: Vec<&SlotLayout> = recipe.rings().collect();
-    assert_eq!(rings.len(), 1);
-    assert_eq!(per_token(rings[0]), 61 << 10);
+    let windows: Vec<&SlotLayout> = recipe.windows().collect();
+    assert_eq!(windows.len(), 1);
+    assert_eq!(per_token(windows[0]), 61 << 10);
 }
 
 #[test]

@@ -427,31 +427,6 @@ impl Shell {
         for slot in beginning {
             self.pools.clear(&self.device, &self.handles, slot)?;
         }
-        // The windowed pages the runtime copies before this fire (a fork's
-        // window), whole pages in the windowed pool's own ids.
-        let window_copies: Vec<engine::transfer::KvRun> = lanes
-            .iter()
-            .flat_map(|seated| seated.window_copies)
-            .map(|&(src, dst)| engine::transfer::KvRun {
-                src_page: src,
-                src_token: 0,
-                dst_page: dst,
-                dst_token: 0,
-                tokens: paging.page_size,
-            })
-            .collect();
-        if !window_copies.is_empty() {
-            if crate::fabric::keep_pools() {
-                // The pools stay on the device: the next program's table
-                // carries the moves.
-                self.device
-                    .queue_moves(self.pools.kv_moves(&self.handles, true, &window_copies));
-            } else {
-                self.pools
-                    .copy_kv(&self.device, &self.handles, &[], &window_copies)?;
-            }
-        }
-
         let indptr_host = kv::indptr(&seats)?;
         let table_refs: Vec<&[u32]> = tables.iter().map(Vec::as_slice).collect();
         let window_refs: Vec<&[u32]> = window_tables.iter().map(Vec::as_slice).collect();

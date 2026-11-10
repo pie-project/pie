@@ -289,6 +289,102 @@ fn facts_that_do_not_hang_together_are_refused() {
     }
 }
 
+/// A shared pool's kv list beside window lists of `windows`, each of
+/// `tokens` a slot.
+fn window_lists(page: u32, windows: &[(u32, u32)]) -> ChunkFacts {
+    let shape = |id: u32, tokens: u32, window: Option<u32>| SlotShape {
+        id: ShapeId(id),
+        kind: SlotKind::List {
+            tokens,
+            rate: 1,
+            window,
+        },
+        slot_bytes: 1 << 20,
+        slots_per_chunk: 4,
+        sets_per_working_set: 1,
+        rows: Vec::new(),
+        pinned: None,
+        role: SlotRole::State,
+    };
+    let mut shapes = vec![shape(0, page, None)];
+    for (at, &(window, tokens)) in windows.iter().enumerate() {
+        shapes.push(shape(at as u32 + 1, tokens, Some(window)));
+    }
+    ChunkFacts {
+        chunk_bytes: 4 << 20,
+        total_chunks: 64,
+        segment_chunks: 64,
+        segments: SegmentFacts {
+            committed: 1,
+            max: 1,
+            growth: Growth::Fixed,
+        },
+        reserved: vec![ReservedRun {
+            what: Reserved::Null,
+            first: 0,
+            chunks: 1,
+        }],
+        shapes,
+        ..ChunkFacts::default()
+    }
+}
+
+/// CONTRACT-BC 19: a window list is a list shape of the kv page with its
+/// window, one a distinct window; its table may name the null ref 0 where
+/// the runtime trimmed a slot, its copies never.
+#[test]
+fn a_window_list_is_a_list_of_the_kv_page_one_a_window() {
+    window_lists(16, &[(128, 16), (1_024, 16)])
+        .validate()
+        .unwrap();
+    for bad in [
+        window_lists(16, &[(128, 16), (128, 16)]),
+        window_lists(16, &[(128, 32)]),
+        window_lists(16, &[(0, 16)]),
+    ] {
+        assert!(bad.validate().is_err(), "{bad:?}");
+    }
+    let mut rs_window = window_lists(16, &[(128, 16)]);
+    rs_window.shapes[1].role = SlotRole::RsBuffer;
+    assert!(rs_window.validate().is_err(), "the rs list has no window");
+
+    // A shape stated before the field was: no window.
+    let mut old = serde_json::to_value(SlotKind::List {
+        tokens: 16,
+        rate: 1,
+        window: None,
+    })
+    .unwrap();
+    old["List"].as_object_mut().unwrap().remove("window");
+    assert_eq!(
+        serde_json::from_value::<SlotKind>(old).unwrap().window(),
+        None
+    );
+
+    let facts = window_lists(16, &[(128, 16)]);
+    let lane = Lane {
+        tables: vec![(ShapeId(0), vec![4, 5, 6]), (ShapeId(1), vec![0, 0, 9])],
+        ..Lane::default()
+    };
+    lane.validate_chunks(&facts).unwrap();
+    let null_kv = Lane {
+        tables: vec![(ShapeId(0), vec![0, 5, 6])],
+        ..Lane::default()
+    };
+    assert!(
+        null_kv.validate_chunks(&facts).is_err(),
+        "the kv list trims nothing"
+    );
+    let null_copy = Lane {
+        slot_copies: vec![(ShapeId(1), vec![[0, 9]])],
+        ..lane
+    };
+    assert!(
+        null_copy.validate_chunks(&facts).is_err(),
+        "a copy names real slots"
+    );
+}
+
 #[test]
 fn a_rung_takes_the_smallest_activation_that_holds_it() {
     let facts = ChunkFacts {
@@ -315,6 +411,7 @@ fn slot_refs_name_a_chunk_and_an_index() {
         kind: SlotKind::List {
             tokens: 16,
             rate: 4,
+            window: None,
         },
         slot_bytes: 1 << 20,
         slots_per_chunk: 16,

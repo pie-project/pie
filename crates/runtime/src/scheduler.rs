@@ -382,18 +382,23 @@ pub(crate) fn submit_prebuilt_tracked_async_with_kv_and_rs_copy_on(
     completion: crate::engine::WorkItemCompletion,
     copy_src: Vec<u32>,
     copy_dst: Vec<u32>,
+    windowed: Vec<(u32, u32)>,
     rs_copy: Option<::engine::StateCopy>,
     frame: Option<FrameStamp>,
     lora_program: bool,
 ) -> Result<()> {
-    let prelaunch_copy = (!copy_src.is_empty()).then_some(::engine::KvCopy {
-        src: handle.device_domain(),
-        dst: handle.device_domain(),
-        src_page_ids: copy_src,
-        dst_page_ids: copy_dst,
-        moves: Vec::new(),
-        windowed: Vec::new(),
-    });
+    // The windowed pages a write into a shared window page copies first ride
+    // the kv list's pre-launch copy, on an engine on today's pools
+    // (CONTRACT-BC 19's tail rule); a shared pool states them per lane.
+    let prelaunch_copy =
+        (!copy_src.is_empty() || !windowed.is_empty()).then_some(::engine::KvCopy {
+            src: handle.device_domain(),
+            dst: handle.device_domain(),
+            src_page_ids: copy_src,
+            dst_page_ids: copy_dst,
+            moves: Vec::new(),
+            windowed,
+        });
     handle.submit_prebuilt_tracked_with_copy(
         request,
         instance_id,

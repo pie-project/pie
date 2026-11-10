@@ -2,16 +2,19 @@
 //! picks the chunk size `C` for a device and lays each kind of state into a
 //! slot shape a chunk holds many of.
 //!
-//! Four slot shapes. A **list** slot holds `T` tokens of every
+//! Three slot shapes. A **list** slot holds `T` tokens of every
 //! full-retention kv row, layer-major (each row a contiguous run of
-//! `T x row bytes`). An **rs list** slot holds `T_rs` tokens of the rs buffer
-//! (a deferred-commit recurrence's unfolded inputs, an n-gram id window's
-//! unfolded ids), every row's planes, layer-major like the list
-//! ([`RsLayout`]); a lane holds as many as its unfolded tokens fill, none
-//! when everything is folded. A **ring** slot holds `T` tokens of the
-//! window rows sharing one window; a working set holds `cap_slots` of them.
-//! A **fixed** slot holds a working set's record of every fixed state
-//! (recurrent and conv states, frame caches, n-gram ids), whole when it fits
+//! `T x row bytes`). A **window list** is a list of the window rows sharing
+//! one window, one a distinct window, its slots of the same `T` (the kv page
+//! size): a working set holds slots in token order like the kv list and
+//! drops each once it lies wholly behind the window, so it holds about
+//! `ceil(window / T) + 1` of them. An **rs list** slot holds `T_rs` tokens
+//! of the rs buffer (a deferred-commit recurrence's unfolded inputs, an
+//! n-gram id window's unfolded ids), every row's planes, layer-major like
+//! the list ([`RsLayout`]); a lane holds as many as its unfolded tokens
+//! fill, none when everything is folded. A **fixed** slot holds a working
+//! set's record of every fixed state (recurrent and conv states, frame
+//! caches, n-gram ids), whole when it fits
 //! in a chunk, else in slots of a piece's size: a row no larger stays whole
 //! beside others, a row larger is cut on the atoms its readers let a piece
 //! cut into equal pieces, each at one offset in its own slot ([`FixedRun`]).
@@ -81,9 +84,6 @@ pub const FIXED_SLOT_FLOOR: u64 = 1 << 10;
 /// at the best-filling size, for the states to choose among the sizes.
 const WEIGHT_TAIL_SLACK: f64 = 0.01;
 
-/// The rows a fire lands in a window ring before the oldest retire.
-pub const RING_FIRE_ROWS: u32 = 16;
-
 /// The most tokens an rs-list slot holds; it holds a power of two of them.
 pub const MOST_RS_TOKENS: u32 = 16;
 
@@ -120,30 +120,6 @@ pub struct TokenRun {
     pub layer: Option<u32>,
     pub offset: u64,
     pub per_token: u64,
-}
-
-/// What a ring holds past its window: the drafted rows a lane verifies and
-/// the rows one fire lands before the oldest retire.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct RingCap {
-    pub window: u32,
-    pub draft: u32,
-    pub fire_rows: u32,
-}
-
-impl RingCap {
-    /// The tokens a working set's ring must hold at once.
-    #[must_use]
-    pub fn tokens(&self) -> u32 {
-        self.window + self.draft + self.fire_rows
-    }
-
-    /// `ceil((W + draft + fire rows) / T) + 1`: the slot the oldest token
-    /// is retiring from stays held while the newest fills.
-    #[must_use]
-    pub fn slots(&self, tokens: u32) -> u32 {
-        self.tokens().div_ceil(tokens.max(1)) + 1
-    }
 }
 
 /// Where a fixed row lies in a working set's record, as an engine addresses
@@ -184,27 +160,21 @@ impl FixedRun {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SlotLayout {
+    /// `tokens` tokens of each row, layer-major. With a `window`, a window
+    /// list: its rows retain `window` tokens, and a working set's slots
+    /// wholly behind them are dropped (the table keeps its token-order
+    /// length, a dropped slot the null ref); `tokens` is the kv list's.
     List {
         tokens: u32,
         bytes: u64,
         rows: Vec<TokenRun>,
+        window: Option<u32>,
     },
     /// The rs buffer's rows, `tokens` (`T_rs`) of each, layer-major:
     /// [`ChunkRecipe::rs`] says how a buffered token lies.
     RsList {
         tokens: u32,
         bytes: u64,
-        rows: Vec<TokenRun>,
-    },
-    /// A window's rows: a working set holds `cap_slots` slots of `tokens`
-    /// tokens each, reused in turn. Position `t` lies in the working set's
-    /// ring slot `(t / tokens) % cap_slots`, a row's token at its run's
-    /// `offset + (t % tokens) x per_token`; `cap.window` is the retention.
-    Ring {
-        tokens: u32,
-        bytes: u64,
-        cap_slots: u32,
-        cap: RingCap,
         rows: Vec<TokenRun>,
     },
     Fixed {
@@ -216,10 +186,6 @@ pub enum SlotLayout {
         pieces_per_ws: u32,
         /// Every fixed row's run, in the record's row order.
         rows: Vec<FixedRun>,
-        /// Window rings small enough to hold whole in the record, and the
-        /// tokens each holds: a fixed row of that many token atoms,
-        /// position `t` at atom `t % tokens`.
-        folded: Vec<(RowId, u32)>,
     },
 }
 
@@ -230,21 +196,25 @@ impl SlotLayout {
         match self {
             SlotLayout::List { bytes, .. }
             | SlotLayout::RsList { bytes, .. }
-            | SlotLayout::Ring { bytes, .. }
             | SlotLayout::Fixed { bytes, .. } => *bytes,
         }
     }
 
-    /// The slots of this shape a working set holds at `context` tokens; of
-    /// the rs list, at [`EXPECTED_UNFOLDED`] tokens.
+    /// The slots of this shape a working set holds at `context` tokens: of
+    /// a window list, no more than `ceil(window / T) + 1` (the slot the
+    /// oldest row retires from stays while the newest fills); of the rs
+    /// list, at [`EXPECTED_UNFOLDED`] tokens.
     #[must_use]
     pub fn slots_per_ws(&self, context: u32) -> u64 {
         match self {
-            SlotLayout::List { tokens, .. } => u64::from(context.div_ceil(*tokens)),
+            SlotLayout::List { tokens, window, .. } => {
+                let tokens = (*tokens).max(1);
+                let all = context.div_ceil(tokens);
+                u64::from(window.map_or(all, |w| all.min(w.div_ceil(tokens) + 1)))
+            }
             SlotLayout::RsList { tokens, .. } => {
                 u64::from(EXPECTED_UNFOLDED.div_ceil((*tokens).max(1)))
             }
-            SlotLayout::Ring { cap_slots, .. } => u64::from(*cap_slots),
             SlotLayout::Fixed { pieces_per_ws, .. } => {
                 u64::from(FIXED_SETS_PER_WS) * u64::from(*pieces_per_ws)
             }
@@ -257,11 +227,18 @@ impl SlotLayout {
         chunk / self.bytes().max(1)
     }
 
+    /// The rows a window list retains; `None` for every other shape.
+    #[must_use]
+    pub fn window(&self) -> Option<u32> {
+        match self {
+            SlotLayout::List { window, .. } => *window,
+            _ => None,
+        }
+    }
+
     fn runs(&self) -> &[TokenRun] {
         match self {
-            SlotLayout::List { rows, .. }
-            | SlotLayout::RsList { rows, .. }
-            | SlotLayout::Ring { rows, .. } => rows,
+            SlotLayout::List { rows, .. } | SlotLayout::RsList { rows, .. } => rows,
             SlotLayout::Fixed { .. } => &[],
         }
     }
@@ -271,11 +248,14 @@ impl SlotLayout {
 /// nothing, by cause.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct Waste {
-    /// What the states hold: list tokens at the context, rs-list tokens at
-    /// [`EXPECTED_UNFOLDED`], the rings' slots, the working set's fixed
-    /// record and its share of the pool's copy-on-write records.
+    /// What the states hold: kv list tokens at the context, each window
+    /// list's tokens at the context or its window, rs-list tokens at
+    /// [`EXPECTED_UNFOLDED`], the working set's fixed record and its share
+    /// of the pool's copy-on-write records.
     pub state: u64,
-    /// The list's last slot past the context, and alignment inside slots.
+    /// The kv and window lists' slots past the tokens they hold (the last
+    /// slot's room, a window list's slot the oldest row retires from), and
+    /// alignment inside slots.
     pub list_tail: u64,
     /// The rs list's last slot past [`EXPECTED_UNFOLDED`] tokens, and
     /// alignment inside slots.
@@ -436,7 +416,7 @@ impl ChunkRecipe {
     pub fn list(&self) -> Option<&SlotLayout> {
         self.slots
             .iter()
-            .find(|s| matches!(s, SlotLayout::List { .. }))
+            .find(|s| matches!(s, SlotLayout::List { window: None, .. }))
     }
 
     /// The rs list shape.
@@ -447,10 +427,17 @@ impl ChunkRecipe {
             .find(|s| matches!(s, SlotLayout::RsList { .. }))
     }
 
-    pub fn rings(&self) -> impl Iterator<Item = &SlotLayout> {
-        self.slots
-            .iter()
-            .filter(|s| matches!(s, SlotLayout::Ring { .. }))
+    /// The window lists, one a distinct window, narrowest first.
+    pub fn windows(&self) -> impl Iterator<Item = &SlotLayout> {
+        self.slots.iter().filter(|s| {
+            matches!(
+                s,
+                SlotLayout::List {
+                    window: Some(_),
+                    ..
+                }
+            )
+        })
     }
 
     #[must_use]
@@ -522,19 +509,19 @@ impl ChunkRecipe {
         let mut fixed = Vec::new();
         for shape in &self.slots {
             let bytes = match shape {
-                SlotLayout::List { tokens, rows, .. }
-                | SlotLayout::RsList { tokens, rows, .. }
-                | SlotLayout::Ring { tokens, rows, .. } => align_up(
-                    rows.iter()
-                        .map(|r| {
-                            align_up(
-                                u64::from(*tokens) * r.per_token.div_ceil(parts(&r.row)),
-                                align,
-                            )
-                        })
-                        .sum(),
-                    align,
-                ),
+                SlotLayout::List { tokens, rows, .. } | SlotLayout::RsList { tokens, rows, .. } => {
+                    align_up(
+                        rows.iter()
+                            .map(|r| {
+                                align_up(
+                                    u64::from(*tokens) * r.per_token.div_ceil(parts(&r.row)),
+                                    align,
+                                )
+                            })
+                            .sum(),
+                        align,
+                    )
+                }
                 SlotLayout::Fixed { rows, .. } => {
                     let (used, runs) = self.rank_runs(rows, tp);
                     fixed = runs;
@@ -607,25 +594,28 @@ impl ChunkRecipe {
     }
 
     /// The shapes in a line: `L16x1.25M` (list: tokens x slot), `rs4x880K`
-    /// (rs list: tokens x slot), `R1024:16x12.5M*67` (ring: window: tokens x
-    /// slot * slots a working set), `F3x16M/47.3M` (fixed: pieces x slot /
-    /// record).
+    /// (rs list: tokens x slot), `W1024:16x12.5M` (window list: window:
+    /// tokens x slot), `F3x16M/47.3M` (fixed: pieces x slot / record).
     #[must_use]
     pub fn shapes(&self) -> String {
         self.slots
             .iter()
             .map(|s| match s {
-                SlotLayout::List { tokens, bytes, .. } => format!("L{tokens}x{}", human(*bytes)),
+                SlotLayout::List {
+                    tokens,
+                    bytes,
+                    window: None,
+                    ..
+                } => format!("L{tokens}x{}", human(*bytes)),
+                SlotLayout::List {
+                    tokens,
+                    bytes,
+                    window: Some(window),
+                    ..
+                } => format!("W{window}:{tokens}x{}", human(*bytes)),
                 SlotLayout::RsList { tokens, bytes, .. } => {
                     format!("rs{tokens}x{}", human(*bytes))
                 }
-                SlotLayout::Ring {
-                    tokens,
-                    bytes,
-                    cap_slots,
-                    cap,
-                    ..
-                } => format!("R{}:{tokens}x{}*{cap_slots}", cap.window, human(*bytes)),
                 SlotLayout::Fixed {
                     bytes,
                     record,
@@ -701,84 +691,51 @@ pub fn plan(
         });
     }
 
-    let draft = crate::arena::readouts_per_lane(trace)
-        .min(budgets.tokens.readouts_per_lane.max(1))
-        .saturating_sub(1);
-    let fire_rows = RING_FIRE_ROWS.min(budgets.tokens.max_tokens.max(1));
-
     let mut shards: BTreeMap<RowId, Shard> = BTreeMap::new();
     let mut short_runs = Vec::new();
     let mut token_shapes = Vec::new();
     let mut fixed_rows: Vec<FixedRow> = census.fixed;
 
-    // One list shape: every full-retention row, of every space.
+    // The kv list (every full-retention row, of every space), then a window
+    // list a distinct window, narrowest first: each slot `T` tokens, the kv
+    // page size, one for every list.
+    let mut groups: Vec<(Option<u32>, Vec<&TokenRow>)> = Vec::new();
     let full: Vec<&TokenRow> = census
         .tokens
         .iter()
         .filter(|r| r.window.is_none())
         .collect();
     if !full.is_empty() {
-        let base = full
-            .iter()
-            .fold(TOKEN_GRAIN, |base, r| census::lcm(base, r.ratio));
-        let (tokens, bytes, rows, short) = token_layout(&full, base, device.most(), align);
-        short_runs.extend(short);
-        token_shapes.push(SlotLayout::List {
-            tokens,
-            bytes,
-            rows,
-        });
+        groups.push((None, full));
     }
-
-    // A ring shape a window, unless its whole cap is smaller than a piece.
     let mut windows: BTreeMap<u32, Vec<&TokenRow>> = BTreeMap::new();
-    for row in census.tokens.iter().filter(|r| r.window.is_some()) {
-        windows
-            .entry(row.window.unwrap_or(0))
-            .or_default()
-            .push(row);
-    }
-    let mut folded = Vec::new();
-    for (window, rows) in windows {
-        let cap = RingCap {
-            window,
-            draft,
-            fire_rows,
-        };
-        let per_token: u64 = rows.iter().map(|r| r.per_token()).sum();
-        if u64::from(cap.tokens()) * per_token <= MIN_PIECE {
-            for row in rows {
-                let extent = u64::from(cap.tokens());
-                folded.push((row.id, cap.tokens()));
-                fixed_rows.push(FixedRow {
-                    id: row.id,
-                    layer: row.layer,
-                    bytes: extent * row.per_token(),
-                    atom: Atom {
-                        contract: Contract::Tokens,
-                        axis: 0,
-                        extent,
-                        bytes: row.per_token(),
-                        grain: 1,
-                    },
-                    shard: row.shard.clone(),
-                    ring_tokens: Some(cap.tokens()),
-                });
-            }
-            continue;
+    for row in &census.tokens {
+        if let Some(window) = row.window {
+            windows.entry(window).or_default().push(row);
         }
-        let base = rows
+    }
+    groups.extend(windows.into_iter().map(|(w, rows)| (Some(w), rows)));
+    if !groups.is_empty() {
+        let base = census
+            .tokens
             .iter()
             .fold(TOKEN_GRAIN, |base, r| census::lcm(base, r.ratio));
-        let (tokens, bytes, runs, short) = token_layout(&rows, base, device.most(), align);
-        short_runs.extend(short);
-        token_shapes.push(SlotLayout::Ring {
-            tokens,
-            bytes,
-            cap_slots: cap.slots(tokens),
-            cap,
-            rows: runs,
-        });
+        let tokens = page_tokens(
+            groups.iter().map(|(_, rows)| rows.as_slice()),
+            base,
+            device.most(),
+            align,
+        );
+        for (window, rows) in &groups {
+            let (bytes, runs, short) = token_layout(rows, tokens, align);
+            short_runs.extend(short);
+            token_shapes.push(SlotLayout::List {
+                tokens,
+                bytes,
+                rows: runs,
+                window: *window,
+            });
+        }
     }
     for row in census.tokens.iter().chain(&census.rs_rows) {
         shards.insert(row.id, row.shard.clone());
@@ -822,7 +779,7 @@ pub fn plan(
     // uncuttable row, a token of every rs row, or an expert.
     let unit = token_shapes
         .first()
-        .filter(|s| matches!(s, SlotLayout::List { .. }))
+        .filter(|s| matches!(s, SlotLayout::List { window: None, .. }))
         .map_or(align_up(64 << 10, align), SlotLayout::bytes);
     let least = token_shapes
         .iter()
@@ -853,8 +810,8 @@ pub fn plan(
         .collect();
 
     // Weight slots first: of the sizes whose chunks the weights fill within
-    // a point of the best, the one the states (kv list, rs list, rings and
-    // fixed records together) waste least in.
+    // a point of the best, the one the states (kv list, window lists, rs
+    // list and fixed records together) waste least in.
     let mut weighed = Vec::new();
     for chunk in candidates {
         let pick = if fixed_rows.is_empty() {
@@ -923,7 +880,8 @@ pub fn plan(
         .map(|w| w.chunks(chunk_bytes) * chunk_bytes - w.total_bytes())
         .sum();
 
-    // The shapes, as engines take them: kv list, rs list, rings, fixed.
+    // The shapes, as engines take them: kv list, rs list, window lists,
+    // fixed.
     let mut slots = token_shapes;
     let mut rs = RsLayout {
         rows: census.rs,
@@ -934,7 +892,10 @@ pub fn plan(
         rs.tokens = shape.tokens;
         rs.bytes = shape.bytes;
         rs.runs.clone_from(&runs);
-        let at = usize::from(matches!(slots.first(), Some(SlotLayout::List { .. })));
+        let at = usize::from(matches!(
+            slots.first(),
+            Some(SlotLayout::List { window: None, .. })
+        ));
         slots.insert(
             at,
             SlotLayout::RsList {
@@ -952,7 +913,6 @@ pub fn plan(
             record,
             pieces_per_ws,
             rows,
-            folded,
         });
     }
     Ok(ChunkRecipe {
@@ -969,49 +929,86 @@ pub fn plan(
     })
 }
 
-/// A token slot of `rows`, layer-major: the fewest tokens, a multiple of
-/// `base`, at which every layer's rows run [`MIN_RUN`] bytes, unless the slot
-/// would outgrow `most`; then the most tokens that fit, and the layers left
-/// short.
-fn token_layout(
-    rows: &[&TokenRow],
-    base: u32,
-    most: u64,
-    align: u64,
-) -> (u32, u64, Vec<TokenRun>, Vec<RowId>) {
+/// A layer's bytes a token of `rows`, the thinnest; a row no layer reads is
+/// its own.
+fn thinnest(rows: &[&TokenRow]) -> u64 {
+    layers(rows)
+        .values()
+        .map(|(b, _)| *b)
+        .min()
+        .unwrap_or(1)
+        .max(1)
+}
+
+/// Each layer's bytes a token of `rows` and its first row; a row no layer
+/// reads is its own layer.
+fn layers(rows: &[&TokenRow]) -> BTreeMap<(Option<u32>, Option<RowId>), (u64, RowId)> {
     let mut rows: Vec<&TokenRow> = rows.to_vec();
     rows.sort_by_key(|r| (r.layer.unwrap_or(u32::MAX), r.id));
-    // A layer's bytes a token; a row no layer reads is its own.
     let mut layers: BTreeMap<(Option<u32>, Option<RowId>), (u64, RowId)> = BTreeMap::new();
     for row in &rows {
         let key = (row.layer, row.layer.is_none().then_some(row.id));
         let entry = layers.entry(key).or_insert((0, row.id));
         entry.0 += row.per_token();
     }
-    let thinnest = layers.values().map(|(b, _)| *b).min().unwrap_or(1).max(1);
-    let slot = |tokens: u32| -> u64 {
-        align_up(
-            rows.iter()
-                .map(|r| align_up(u64::from(tokens) * r.per_token(), align))
-                .sum(),
-            align,
-        )
-    };
+    layers
+}
+
+/// A slot's bytes of `tokens` of each of `rows`, each run aligned.
+fn slot_bytes(rows: &[&TokenRow], tokens: u32, align: u64) -> u64 {
+    align_up(
+        rows.iter()
+            .map(|r| align_up(u64::from(tokens) * r.per_token(), align))
+            .sum(),
+        align,
+    )
+}
+
+/// The kv page size `T` every list shares (the kv list's and each window
+/// list's): the fewest tokens, a multiple of `base`, at which every layer of
+/// every list runs [`MIN_RUN`] bytes, unless a list's slot would outgrow
+/// `most`; then the most tokens at which every list's slot fits.
+fn page_tokens<'a>(
+    lists: impl Iterator<Item = &'a [&'a TokenRow]>,
+    base: u32,
+    most: u64,
+    align: u64,
+) -> u32 {
+    let lists: Vec<&[&TokenRow]> = lists.collect();
     let base = base.max(1);
-    let need = u32::try_from(MIN_RUN.div_ceil(thinnest))
-        .unwrap_or(u32::MAX)
-        .div_ceil(base)
-        .max(1)
-        * base;
-    let mut tokens = need;
-    if slot(tokens) > most {
-        tokens = base;
-        while tokens + base < need && slot(tokens + base) <= most {
-            tokens += base;
-        }
+    let need = lists
+        .iter()
+        .map(|rows| {
+            u32::try_from(MIN_RUN.div_ceil(thinnest(rows)))
+                .unwrap_or(u32::MAX)
+                .div_ceil(base)
+                .max(1)
+                * base
+        })
+        .max()
+        .unwrap_or(base);
+    let fits = |tokens: u32| {
+        lists
+            .iter()
+            .all(|rows| slot_bytes(rows, tokens, align) <= most)
+    };
+    if fits(need) {
+        return need;
     }
+    let mut tokens = base;
+    while tokens + base < need && fits(tokens + base) {
+        tokens += base;
+    }
+    tokens
+}
+
+/// A token slot of `tokens` of each of `rows`, layer-major: its bytes, the
+/// runs, and the layers whose run is under [`MIN_RUN`].
+fn token_layout(rows: &[&TokenRow], tokens: u32, align: u64) -> (u64, Vec<TokenRun>, Vec<RowId>) {
+    let mut sorted: Vec<&TokenRow> = rows.to_vec();
+    sorted.sort_by_key(|r| (r.layer.unwrap_or(u32::MAX), r.id));
     let mut at = 0u64;
-    let runs = rows
+    let runs = sorted
         .iter()
         .map(|r| {
             let offset = at;
@@ -1024,12 +1021,12 @@ fn token_layout(
             }
         })
         .collect();
-    let short = layers
+    let short = layers(rows)
         .values()
         .filter(|(bytes, _)| u64::from(tokens) * bytes < MIN_RUN)
         .map(|(_, first)| *first)
         .collect();
-    (tokens, slot(tokens), runs, short)
+    (slot_bytes(rows, tokens, align), runs, short)
 }
 
 /// An rs-list slot of `tokens` tokens: its bytes, and a token's bytes of
@@ -1194,7 +1191,7 @@ fn pick_fixed(rows: &[FixedRow], record: u64, chunk: u64, align: u64) -> Option<
 }
 
 /// What a working set takes at the profile's context with chunks of `chunk`
-/// bytes, and what of that holds nothing: its kv list and rings, its rs list
+/// bytes, and what of that holds nothing: its kv and window lists, its rs list
 /// at [`EXPECTED_UNFOLDED`] tokens, its own fixed record, and its share of
 /// the pool's `cow` copy-on-write records over the profile's concurrency.
 fn weigh(
@@ -1218,10 +1215,11 @@ fn weigh(
         let slots = shape.slots_per_ws(context);
         let per_token: u64 = shape.runs().iter().map(|r| r.per_token).sum();
         match shape {
-            SlotLayout::List { .. } => {
-                let held = u64::from(context) * per_token;
+            SlotLayout::List { window, .. } => {
+                let tokens = window.map_or(context, |w| w.min(context));
+                let held = u64::from(tokens) * per_token;
                 waste.state += held;
-                waste.list_tail += slots * shape.bytes() - held;
+                waste.list_tail += (slots * shape.bytes()).saturating_sub(held);
             }
             _ => waste.state += slots * shape.bytes(),
         }

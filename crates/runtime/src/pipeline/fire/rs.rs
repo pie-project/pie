@@ -152,11 +152,16 @@ pub struct PreparedRs {
     pub page_copy_lanes: Vec<usize>,
     pub buffer_slot_ids: Vec<u32>,
     pub verbs: Vec<engine::fire::RsVerb>,
-    /// A ring model's rows: each lane's windowed page ids, aligned with
-    /// the page indexes its row translates, and the windowed pages copied
-    /// `(src, dst)` before the fire runs.
+    /// A windowed model's rows: each lane's window pages (in a shared pool,
+    /// window sets; 0 where it holds none), aligned with the page indexes its
+    /// row translates, and the window pages a lane writes into after a fork
+    /// shared them, copied `(src, dst)` before the fire runs: in a shared
+    /// pool each lane's own `Lane::slot_copies` of every window list
+    /// (CONTRACT-BC 19), else the pre-launch copy's windowed pages.
     pub window: Vec<Vec<u32>>,
     pub window_copies: Vec<(u32, u32)>,
+    /// The lane each of `window_copies` is its row's.
+    pub window_copy_lanes: Vec<usize>,
     pub snapshots: Vec<RsSnapshot>,
     pub txn: Option<RsTxn>,
     /// The state slots are a shared pool's records: a lane names them by
@@ -238,10 +243,17 @@ impl PreparedRs {
                 })
                 .collect();
         }
-        if let Some(lane) = request.lanes.first_mut()
-            && !self.window_copies.is_empty()
-        {
-            lane.kv.window_copies.clone_from(&self.window_copies);
+    }
+
+    /// The window pages the pre-launch copy moves `(src, dst)` before the
+    /// fire, in the engine's own numbering: an engine on today's pools only.
+    /// A shared pool states them as each lane's `Lane::slot_copies`.
+    #[must_use]
+    pub fn windowed_copies(&self) -> Vec<(u32, u32)> {
+        if self.shared {
+            Vec::new()
+        } else {
+            self.window_copies.clone()
         }
     }
 }
@@ -252,7 +264,9 @@ impl PreparedRs {
 /// writes buffered rows into a slot it shares); nothing where `shared` is
 /// `None`. The legacy fields stay as they are. A lane's list table is its
 /// translation where one is stated, else its pages (the list shape's slot
-/// refs either way), its ring table its window refs; its fixed records the
+/// refs either way), each window list's table its window sets' refs of that
+/// list (0 where trimmed) and the window pages it copies first among its
+/// `Lane::slot_copies` (CONTRACT-BC 19); its fixed records the
 /// `[run, cow]` [`PreparedRs::run_cow`] names, a snapshot the slot ref of its
 /// record's first piece and, where the record takes more than one, every
 /// piece.
@@ -272,6 +286,17 @@ pub fn apply_shared(
             &lane.kv.translation
         };
         lane.tables = pool.lane_tables(list, &lane.kv.window);
+        let window_copies: Vec<(u32, u32)> = rs
+            .filter(|rs| rs.shared)
+            .map(|rs| {
+                rs.window_copy_lanes
+                    .iter()
+                    .zip(&rs.window_copies)
+                    .filter(|&(&at, _)| at == row)
+                    .map(|(_, &pair)| pair)
+                    .collect()
+            })
+            .unwrap_or_default();
         let records = rs.filter(|rs| rs.shared).and_then(|rs| rs.run_cow(row));
         lane.fixed = records.map_or_else(Vec::new, |(run, cow)| pool.lane_fixed(run, cow));
         lane.slot_copies = rs
@@ -289,6 +314,11 @@ pub fn apply_shared(
             })
             .filter(|(_, pairs)| !pairs.is_empty())
             .into_iter()
+            .chain(
+                pool.window_copies(&window_copies)
+                    .into_iter()
+                    .filter(|(_, pairs)| !pairs.is_empty()),
+            )
             .collect();
         if records.is_some() {
             for snap in &mut lane.rs_snapshots {
@@ -345,7 +375,10 @@ fn prepare_ring_rows(
             working_sets.len()
         ));
     }
-    let mut out = PreparedRs::default();
+    let mut out = PreparedRs {
+        shared: store.is_shared(),
+        ..PreparedRs::default()
+    };
     let mut prepared_rows: Vec<RsPreparedWrite> = Vec::with_capacity(rows.len());
     for (index, (&ws, row)) in working_sets.iter().zip(rows).enumerate() {
         match store.prepare_ring(ws, &row.pages, granted.as_deref_mut()) {
@@ -356,12 +389,12 @@ fn prepare_ring_rows(
             }
         }
     }
-    for prepared in &prepared_rows {
-        out.window_copies.extend(
-            prepared
-                .buffer_copy_plan()
-                .map(|(src, dst)| (store.engine_id(src), store.engine_id(dst))),
-        );
+    for (lane, prepared) in prepared_rows.iter().enumerate() {
+        for (src, dst) in prepared.buffer_copy_plan() {
+            out.window_copies
+                .push((store.engine_id(src), store.engine_id(dst)));
+            out.window_copy_lanes.push(lane);
+        }
     }
     let (published, folds) = store
         .publish_batch(prepared_rows)

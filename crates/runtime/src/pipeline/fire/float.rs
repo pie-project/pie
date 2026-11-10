@@ -307,6 +307,7 @@ pub(crate) async fn fire_float_lane<C: FireContext>(
         completion.clone(),
         Vec::new(),
         Vec::new(),
+        Vec::new(),
         rs_copy,
         frame,
         lora_program,

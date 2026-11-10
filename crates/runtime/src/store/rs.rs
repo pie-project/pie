@@ -308,9 +308,9 @@ impl RsStore {
         let host = pages.max(1);
         Self::build(
             ShapePool::new(ShapeKind::Fixed, 0, 0, 0),
-            ShapePool::new(ShapeKind::Ring, page_bytes, 1, pages.saturating_sub(1)),
+            ShapePool::new(ShapeKind::List, page_bytes, 1, pages.saturating_sub(1)),
             ShapePool::new(ShapeKind::Fixed, 0, host, 0),
-            ShapePool::new(ShapeKind::Ring, page_bytes, host, host_pages),
+            ShapePool::new(ShapeKind::List, page_bytes, host, host_pages),
             0,
             Some(geom),
         )
@@ -341,30 +341,33 @@ impl RsStore {
         }
     }
 
-    /// The store an engine's shared pool backs: a window ring of the ring
-    /// shape's slot refs where there is a window (ref 0, in the null chunk,
-    /// is never handed out), else the pool's fixed records as state slots
+    /// The store an engine's shared pool backs: where there are window lists,
+    /// the pool's window sets (a slot of every window list, ids from 1: id 0
+    /// reads as the null chunk) as the window's pages, kept through the
+    /// widest window (CONTRACT-BC 19); else the pool's fixed records as state slots
     /// and the rs list's slot refs as buffer pages (ids from past the
     /// records', an engine id the slot ref; CONTRACT-BC 18). A pool with no
     /// rs list buffers nothing.
     pub fn shared(shared: &Shared) -> Self {
-        let (ring, fixed, rs_list) = {
+        let (window, fixed, rs_list) = {
             let pool = shared.lock().unwrap();
-            (pool.ring(), !pool.fixed().is_empty(), pool.rs_list())
+            let window = pool
+                .windows()
+                .last()
+                .map(|widest| (widest.window, widest.tokens));
+            (window, !pool.fixed().is_empty(), pool.rs_list())
         };
-        if let Some(ring) = ring {
-            let pages = ShapePool::shared(shared, ring);
+        if let Some((tokens, page_size)) = window {
+            let pages = ShapePool::window_sets(shared, 0);
             let host = pages.ids_end().max(1);
+            let bytes = pages.slot_bytes();
             return Self::build(
                 ShapePool::new(ShapeKind::Fixed, 0, 0, 0),
                 pages,
                 ShapePool::new(ShapeKind::Fixed, 0, host, 0),
-                ShapePool::new(ShapeKind::Ring, ring.slot_bytes, host, 0),
+                ShapePool::new(ShapeKind::List, bytes, host, 0),
                 0,
-                Some(RingGeometry {
-                    tokens: ring.window,
-                    page_size: ring.tokens,
-                }),
+                Some(RingGeometry { tokens, page_size }),
             );
         }
         let slots = if fixed {
@@ -578,7 +581,7 @@ impl RsStore {
             if tail.is_empty() {
                 continue;
             }
-            let at = u64::from(ws.frozen).saturating_sub(1);
+            let at = u64::from(Self::position(ws)).saturating_sub(1);
             if crate::policy::pressure::may_drop(keys.key_at(entry.owner, at)) {
                 droppable.insert(entry.snapshot);
             } else {
@@ -786,6 +789,12 @@ impl RsStore {
         self.decref_all(&ids)
     }
 
+    /// The tokens a set's state stands at: a window's committed position,
+    /// else the count its state holds.
+    fn position(entry: &RsEntry) -> u32 {
+        entry.ring.map_or(entry.frozen, |ring| ring.committed)
+    }
+
     fn slots(entry: &RsEntry) -> impl Iterator<Item = RsSlotId> + '_ {
         entry
             .folded
@@ -832,7 +841,7 @@ impl RsStore {
             .filter(|entry| sharing.contains(&entry.snapshot))
             .filter(|entry| {
                 self.working_sets.get(entry.snapshot).is_some_and(|ws| {
-                    let at = u64::from(ws.frozen).saturating_sub(1);
+                    let at = u64::from(Self::position(ws)).saturating_sub(1);
                     crate::policy::pressure::may_drop(keys.key_at(entry.owner, at))
                 })
             })
@@ -879,7 +888,7 @@ impl RsStore {
                 continue;
             };
             if Self::slots(ws).any(|id| !live.contains(&id)) {
-                let at = u64::from(ws.frozen).saturating_sub(1);
+                let at = u64::from(Self::position(ws)).saturating_sub(1);
                 let group = groups
                     .entry((entry.owner, keys.key_at(entry.owner, at)))
                     .or_insert_with(|| (Vec::new(), entry.last_use));
@@ -925,7 +934,9 @@ impl RsStore {
     }
 
     /// Not when a fire on its way still writes it, or a suspend took it to the
-    /// host.
+    /// host. A window's checkpoint is its pages within the window, shared by
+    /// refcount like the kv list's (CONTRACT-BC 19); another state's, its
+    /// folded state.
     pub fn checkpoint(
         &mut self,
         ws: RsWorkingSetId,
@@ -933,11 +944,11 @@ impl RsStore {
         owner: Option<ProcessId>,
     ) -> Result<bool, RsError> {
         let entry = self.entry(ws)?;
-        if entry.ring.is_some()
-            || entry.folded.is_none()
-            || self.holds_host(entry)
-            || self.unsettled(ws)
-        {
+        let empty = match entry.ring {
+            Some(ring) => ring.committed == 0 || entry.buffer.iter().all(Option::is_none),
+            None => entry.folded.is_none(),
+        };
+        if empty || self.holds_host(entry) || self.unsettled(ws) {
             return Ok(false);
         }
         let snapshot = self.fork(ws)?;
@@ -1031,7 +1042,9 @@ impl RsStore {
     pub fn adopt_checkpoint(&mut self, ws: RsWorkingSetId, key: &Hash256) -> Result<bool, RsError> {
         let fresh = {
             let entry = self.entry(ws)?;
-            entry.folded.is_none() && entry.buffer.iter().all(Option::is_none)
+            entry.folded.is_none()
+                && entry.buffer.iter().all(Option::is_none)
+                && entry.ring.is_none_or(|ring| ring.committed == 0)
         };
         let Some(snapshot) = self
             .checkpoints
@@ -1050,6 +1063,7 @@ impl RsStore {
         entry.buffer = from.buffer;
         entry.base = from.base;
         entry.frozen = from.frozen;
+        entry.ring = from.ring;
         if let Some(entry) = self.checkpoints.get_mut(key) {
             entry.last_use = Instant::now();
         }
@@ -1061,6 +1075,7 @@ impl RsStore {
             let entry = self.entry_mut(ws)?;
             entry.base = 0;
             entry.frozen = 0;
+            entry.ring = entry.ring.map(|_| RingState::default());
             (entry.folded.take(), std::mem::take(&mut entry.buffer))
         };
         for id in folded.into_iter().chain(buffer.into_iter().flatten()) {

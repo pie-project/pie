@@ -2553,8 +2553,10 @@ pub async fn submit_pass_stamped<C: FireContext>(
                 ))
             })
             .flatten();
+        // A window's pages are checkpointed like a folded state: a fork
+        // the prefix cache keeps, sharing them by refcount (CONTRACT-BC 19).
         let state = match rs_ws_ids.as_slice() {
-            [rs] if !ring => Some(*rs),
+            [rs] => Some(*rs),
             _ => None,
         };
         let attach = if !cuttable || !keyable || !plain_rows(&full) {
@@ -2652,7 +2654,12 @@ pub async fn submit_pass_stamped<C: FireContext>(
         };
         // An engine that lands a lane's state at rows inside a fire is cut only
         // past as many as it lands at once.
-        let snapshots = crate::model::model().eta_caps().rs_snapshots as usize;
+        // A window's are landed at fire ends only.
+        let snapshots = if ring {
+            0
+        } else {
+            crate::model::model().eta_caps().rs_snapshots as usize
+        };
         let forced: Vec<u32> = checkpoints
             .iter()
             .skip(snapshots)
@@ -2931,6 +2938,7 @@ pub async fn submit_pass_stamped<C: FireContext>(
                     .map(|snap| at_row(snap.snapshot, slots.start + u64::from(snap.row), true)),
             );
             let rs_copy = rs_prepared.state_copy();
+            let windowed = rs_prepared.windowed_copies();
             let rstxns = RsTxnsGuard::new(model, engine, rs_prepared.txn);
             let completion = ctx
                 .resources()
@@ -2955,6 +2963,7 @@ pub async fn submit_pass_stamped<C: FireContext>(
                     completion.clone(),
                     copy_src,
                     copy_dst,
+                    windowed,
                     rs_copy,
                     piece_frames[at],
                     adapted,
@@ -3992,6 +4001,7 @@ async fn fire_device_geometry<C: FireContext>(
         completion.clone(),
         copy_src,
         copy_dst,
+        rs_prepared.windowed_copies(),
         rs_copy,
         frame,
         lora_program,

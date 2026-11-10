@@ -1181,8 +1181,21 @@ impl Engine for Cuda {
         }
         let page_size = self.loaded_mut()?.paging().page_size;
         let moves = copy.runs(page_size)?;
+        // Windowed pages a write into a shared one copies first ride the
+        // pre-launch copy beside the kv list's (CONTRACT-BC 19).
+        let windowed: Vec<engine::transfer::KvRun> = copy
+            .windowed
+            .iter()
+            .map(|&(src, dst)| engine::transfer::KvRun {
+                src_page: src,
+                src_token: 0,
+                dst_page: dst,
+                dst_token: 0,
+                tokens: page_size,
+            })
+            .collect();
         self.loaded_mut()?
-            .copy_kv(&moves, !copy.moves.is_empty())
+            .copy_kv_with(&moves, &windowed, !copy.moves.is_empty())
             .map_err(fault)
     }
 }
@@ -1255,7 +1268,6 @@ impl Cuda {
                     kv_less: lane.kv_less,
                     translation: &lane.kv.translation,
                     window: &lane.kv.window,
-                    window_copies: &lane.kv.window_copies,
                     mask: lane.mask.as_ref(),
                     adapter: lane_adapters[at].or(lane.adapter),
                     rs: lane.rs.clone(),

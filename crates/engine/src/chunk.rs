@@ -3,7 +3,8 @@
 //! shrink and rearrange it.
 //!
 //! - A **slot** is what the runtime hands out and refcounts: one kv page of
-//!   a list shape, one ring page, one piece of a fixed record.
+//!   a list shape (the kv list, a window list, the rs list), one piece of a
+//!   fixed record.
 //! - A **chunk** holds the slots of one slot shape, `slots_per_chunk` of
 //!   them; every shape's chunks come from one id space, kv and state alike.
 //!   Slot `i` of chunk `c` is named by its slot ref `c * slots_per_chunk + i`
@@ -109,8 +110,8 @@ pub enum Growth {
 /// What a reserved chunk is for.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Reserved {
-    /// Chunk 0: what a ring slot wholly behind its window, or an unset
-    /// table entry, reads. Replaces the windowed pool's page 0.
+    /// Chunk 0: what a window list's slot trimmed behind its window, or an
+    /// unset table entry, reads (ref 0). Replaces the windowed pool's page 0.
     Null,
     /// Where padding lanes write, so a fire of a fixed lane count never
     /// writes a live slot. Replaces XLA's and Cerebras' one-past sink.
@@ -164,11 +165,18 @@ pub enum SlotKind {
     /// Per-token state that grows with the sequence (full-attention kv,
     /// compressed pools): a slot holds `tokens` tokens, of which the model
     /// keeps one row every `rate` (`tokens // rate` rows a slot).
-    List { tokens: u32, rate: u32 },
-    /// Per-token state read through a sliding `window`; a slot holds
-    /// `tokens` tokens and slots wholly behind the window read the null
-    /// chunk.
-    Ring { window: u32, tokens: u32 },
+    ///
+    /// With a `window`, a **window list** (CONTRACT-BC 19): the rows of the
+    /// layers read through that sliding window, `tokens` the kv page size.
+    /// A lane's table for it is as long as its full table, in token order;
+    /// a slot the runtime trimmed (wholly behind `committed_end - window`)
+    /// is ref 0, the null chunk.
+    List {
+        tokens: u32,
+        rate: u32,
+        #[serde(default)]
+        window: Option<u32>,
+    },
 }
 
 /// One slot shape: the unit of every chunk that holds its slots.
@@ -200,8 +208,8 @@ pub struct SlotShape {
 /// What a slot shape holds beside its kind.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum SlotRole {
-    /// The state its kind names: kv for a list, a window for a ring, a
-    /// record for a fixed shape.
+    /// The state its kind names: kv for a list (a window's for a window
+    /// list), a record for a fixed shape.
     #[default]
     State,
     /// The rs buffer (a list shape only): a slot holds `tokens` unfolded
@@ -236,6 +244,15 @@ impl SlotKind {
     #[must_use]
     pub const fn per_token(self) -> bool {
         !matches!(self, SlotKind::Fixed { .. })
+    }
+
+    /// The rows a window list retains; `None` for every other kind.
+    #[must_use]
+    pub const fn window(self) -> Option<u32> {
+        match self {
+            SlotKind::List { window, .. } => window,
+            SlotKind::Fixed { .. } => None,
+        }
     }
 }
 
@@ -330,8 +347,8 @@ impl ChunkFacts {
 
     /// States today's pools as chunks, one slot a chunk, each pool a pinned
     /// run whose slots keep today's ids: chunk 0 null, then the kv pages
-    /// (a list shape), the windowed pages but the null page 0 (a ring
-    /// shape, ids from 1), the state slots and the rs buffer pages (fixed
+    /// (a list shape), the windowed pages but the null page 0 (a window
+    /// list, ids from 1), the state slots and the rs buffer pages (fixed
     /// shapes). The host and disk tiers are pinned alike, ids from 0. One
     /// segment, whole from the load; activation lives apart.
     #[must_use]
@@ -385,6 +402,7 @@ impl ChunkFacts {
             SlotKind::List {
                 tokens: pools.kv_page_size,
                 rate: 1,
+                window: None,
             },
             bytes.kv_page,
             pools.kv_pages,
@@ -394,9 +412,10 @@ impl ChunkFacts {
         );
         push(
             DEGENERATE_WINDOW,
-            SlotKind::Ring {
-                window: pools.window_tokens,
+            SlotKind::List {
                 tokens: pools.kv_page_size,
+                rate: 1,
+                window: Some(pools.window_tokens),
             },
             bytes.window_page,
             pools.window_pages.saturating_sub(1),
@@ -457,13 +476,27 @@ impl ChunkFacts {
             let slots = |run: ChunkRun| run.chunks.saturating_mul(shape.slots_per_chunk);
             let (device, host) = (slots(pinned.device), slots(pinned.host));
             match (shape.id, shape.kind) {
-                (DEGENERATE_KV, SlotKind::List { tokens, .. }) => {
+                (
+                    DEGENERATE_KV,
+                    SlotKind::List {
+                        tokens,
+                        window: None,
+                        ..
+                    },
+                ) => {
                     counts.kv_page_size = tokens;
                     counts.kv_pages = device;
                     counts.host_kv_pages = host;
                     counts.disk_kv_pages = slots(pinned.disk);
                 }
-                (DEGENERATE_WINDOW, SlotKind::Ring { window, tokens }) => {
+                (
+                    DEGENERATE_WINDOW,
+                    SlotKind::List {
+                        tokens,
+                        window: Some(window),
+                        ..
+                    },
+                ) => {
                     counts.kv_page_size = tokens;
                     counts.window_tokens = window;
                     counts.window_pages = device.saturating_add(pinned.ids_from);
@@ -545,7 +578,9 @@ impl ChunkFacts {
                 SlotKind::Fixed { pieces: 0 }
                 | SlotKind::List { tokens: 0, .. }
                 | SlotKind::List { rate: 0, .. }
-                | SlotKind::Ring { tokens: 0, .. } => {
+                | SlotKind::List {
+                    window: Some(0), ..
+                } => {
                     return invalid(format!(
                         "shape {}'s kind {:?} is empty",
                         shape.id, shape.kind
@@ -553,11 +588,40 @@ impl ChunkFacts {
                 }
                 _ => {}
             }
-            if shape.role == SlotRole::RsBuffer && !matches!(shape.kind, SlotKind::List { .. }) {
+            if shape.role == SlotRole::RsBuffer
+                && !matches!(shape.kind, SlotKind::List { window: None, .. })
+            {
                 return invalid(format!(
-                    "shape {} buffers rs rows as {:?}; the rs buffer is a list shape",
+                    "shape {} buffers rs rows as {:?}; the rs buffer is a list shape of no window",
                     shape.id, shape.kind
                 ));
+            }
+            if let Some(window) = shape.kind.window() {
+                if let Some(other) = self.shapes[..at]
+                    .iter()
+                    .find(|s| s.kind.window() == Some(window))
+                {
+                    return invalid(format!(
+                        "shapes {} and {} are both the window list of {window} rows",
+                        other.id, shape.id
+                    ));
+                }
+                let page = self.shapes.iter().find_map(|s| match s.kind {
+                    SlotKind::List {
+                        tokens,
+                        window: None,
+                        ..
+                    } if s.role == SlotRole::State => Some(tokens),
+                    _ => None,
+                });
+                if let (Some(page), SlotKind::List { tokens, .. }) = (page, shape.kind)
+                    && tokens != page
+                {
+                    return invalid(format!(
+                        "window list {} holds {tokens} tokens a slot, not the kv page's {page}",
+                        shape.id
+                    ));
+                }
             }
             if let Some(pinned) = shape.pinned {
                 if pinned.host.end() > u64::from(self.host_chunks)
@@ -667,12 +731,12 @@ impl DegenerateCounts {
     #[must_use]
     pub fn of(pools: &PoolFacts) -> DegenerateCounts {
         let kv = pools.kv_pages > 0 || pools.host_kv_pages > 0;
-        let ring = pools.window_pages > 1 || pools.host_window_pages > 0;
+        let window = pools.window_pages > 1 || pools.host_window_pages > 0;
         DegenerateCounts {
             kv_pages: pools.kv_pages,
-            kv_page_size: if kv || ring { pools.kv_page_size } else { 0 },
-            window_pages: if ring { pools.window_pages } else { 0 },
-            window_tokens: if ring { pools.window_tokens } else { 0 },
+            kv_page_size: if kv || window { pools.kv_page_size } else { 0 },
+            window_pages: if window { pools.window_pages } else { 0 },
+            window_tokens: if window { pools.window_tokens } else { 0 },
             state_slots: pools.state_slots,
             state_slot_bytes: if pools.state_slots > 0 || pools.host_state_slots > 0 {
                 pools.state_slot_bytes
@@ -781,7 +845,7 @@ pub struct Evacuation {
 }
 
 /// Slots of one shape copied between tiers or within one: whole slots
-/// `(src, dst)`, and for list and ring shapes token runs inside slots.
+/// `(src, dst)`, and for list shapes token runs inside slots.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SlotCopy {
     pub shape: ShapeId,
