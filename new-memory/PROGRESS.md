@@ -478,3 +478,18 @@ The `new-memory/` directory is bookkeeping and is removed before anything lands 
   Metal loads one window list (gemma4-26b-a4b-dflash refused there, as before).
 - Verified: cargo check --tests all crates/backends; chunk lib+golden; engine chunk 13; runtime store/fire/planner
   135 incl. two window lists trimming independently.
+
+### M34 — 2026-11-10: BC merged — CUDA on the real chunk pool (BC + RW complete)
+- `sc/l40s-bc` (0237b6d78, 19 commits on M33): two-ended VA with activation at a fixed top, state segments, slot-ref
+  lanes, chunk::fit (max_state_slots deleted), rs list from `Buffer.pages` + `slot_copies`, window lists
+  (`SlotKind::List { window }`, ring/Kind::Ring/fold_rings deleted), rs_ahead cleared on a Fold lane (pre-existing
+  MTP bug; unit test), compressor state rows in their keying row's pages (dsv4_pro expectation updated).
+- Verified on L40S sm_89: golden_logits (8), by_refs, buffered, submit_buffered, pair, pair_buffered, pair_by_refs all
+  bit-identical to base e536895fe; chunk unit + every_deployment; engine-cuda store:: + serve::prepare. IT round 3
+  (sm_120, shared mode): beam/ckpt/MTP/fork/resume tokens identical to degenerate.
+- Accepted interim limits: CUDA pages all windowed rows by one table -> one window list of the widest window
+  (`one_window` profile; narrower rows keep slots longer); CUDA T_w = kv page (16). Engine-internal gcd grain stride
+  stays (not ring addressing). Engine-level group probe skipped (IT covers it).
+- Gemma mini jump explained: single-lane prefill(n) vs prefill(n-1)+decode(1) moves the random-weight mini by 4-6.5
+  too; real gemma is bf16-noise only.
+- Next: IT rerun of the MTP reused-record repro on this build; PLE rebase; K2; tiers; ROCm; other backends.
