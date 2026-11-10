@@ -181,7 +181,8 @@ def layout(id, deploy):
             k_norm = weight([hd]) if d.qk_norm else None,
             mlp_norm = weight([hidden]),
             mlp = mlp(l),
-            kv = "kv.{}".format(l),
+            # Its keys and values, two planes of its kv heads a token.
+            kv = state([tokens, 2, d.kv_heads, hd], deploy.kv),
             lora_a = lora_a,
             lora_b = lora_b,
         )
@@ -194,13 +195,11 @@ def layout(id, deploy):
         head_dim = hd,
         rotary_dim = d.rotary_dim,
         q_width = q_width,
-        kv_width = kv_width,
         experts = d.experts,
         theta = d.theta,
         max_position = d.max_position,
         eps = d.norm_eps,
         sm_scale = f32(1.0 / f32(sqrt(hd))),
-        kv = deploy.kv,
         embed = weight([d.vocab, hidden], table),
         head = weight([d.vocab, hidden], table),
         layers = [layer(l) for l in range(d.layers)],
@@ -275,11 +274,6 @@ TRANSFORMERS = [
 # the routed experts a biased sigmoid picks, their weights renormalized and
 # scaled. A row with an adapter adds its LoRA correction to the attention's
 # output.
-
-def caches(m, c):
-    kv = c.kv_space(m.kv)
-    for w in m.layers:
-        c.kv(kv, w.kv, [m.kv_width, m.kv_width], m.head_dim, heads = True)
 
 def forward(m, inputs):
     positions = inputs.positions()
