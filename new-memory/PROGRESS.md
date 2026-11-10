@@ -647,3 +647,12 @@ The `new-memory/` directory is bookkeeping and is removed before anything lands 
 - BM5b: Metal gemma run-to-run nondeterminism = ANE compile refusals (ANECompilerService 4097) and serving before
   compiles finished. Fix d6132f473 / 87d2f7bfa: ANE compile retried up to 8x with backoff; fires that can use the ANE
   wait for their program. 4 forced-cold runs = warm output. Open: all 8 refused -> GPU keeps the work (logged).
+
+### Note — 2026-11-10: XLA chunk pool ready on sc/xla-chunk-pool (NOT merged — needs TPU)
+- One fixed u32 pool `[chunks*C/512, 128]` with per-plane bitcast views and affine slot maps; slot-ref lanes, rs list,
+  slot_copies, one window list (T_w = page), fixed shapes per block size; tiers (contract 22). Degenerate pools deleted.
+- Bitwise vs base on the CUDA PJRT plugin (Mosaic kernels off): qwen3-micro, qwen35-tiny, gemma mini past the window;
+  park/restore bitwise.
+- Held because: the Mosaic kv append is disabled for pool planes (plain HLO writes) and the bitcast views may cost a
+  TPU relayout — TPU decode/prefill speed unmeasured, while main is actively tuning TPU v5e/v6e. Needs a TPU owner to
+  run the bitwise gate + kernel tests listed in the agent report and measure speed. Weight streaming: design only.
