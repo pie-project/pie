@@ -18,6 +18,9 @@ const LIST: EngineShape = EngineShape(0);
 const RING: EngineShape = EngineShape(1);
 const GDN: EngineShape = EngineShape(2);
 const CONV: EngineShape = EngineShape(3);
+/// The rs buffer's list: 4 rows a slot.
+const RS: EngineShape = EngineShape(4);
+const RS_TOKENS: u32 = 4;
 /// Pool ids, in the facts' order.
 const LIST_POOL: ShapeId = 0;
 const RING_POOL: ShapeId = 1;
@@ -31,6 +34,7 @@ fn shape(id: EngineShape, kind: SlotKind, slot_bytes: u64) -> Facts {
         sets_per_working_set: kind.sets_per_working_set(),
         rows: Vec::new(),
         pinned: None,
+        role: SlotRole::State,
     }
 }
 
@@ -515,17 +519,62 @@ fn pinned_or_unready_facts_are_refused() {
     ));
     assert!(matches!(
         SharedPool::new(&two_lists, 1, 16),
-        Err(SharedError::Shapes { kind: "list", .. })
+        Err(SharedError::Shapes {
+            kind: "kv list",
+            ..
+        })
+    ));
+    // CONTRACT-BC 18: one kv list and one rs list stand together; a second
+    // rs list does not.
+    let rs_list = |id| Facts {
+        role: SlotRole::RsBuffer,
+        ..shape(
+            id,
+            SlotKind::List {
+                tokens: RS_TOKENS,
+                rate: 1,
+            },
+            MIB / 4,
+        )
+    };
+    let mut kv_and_rs = facts();
+    kv_and_rs.shapes.push(rs_list(EngineShape(5)));
+    let pool = SharedPool::new(&kv_and_rs, 1, 16).unwrap();
+    assert_eq!(pool.list().map(|list| list.id), Some(LIST));
+    assert_eq!(pool.rs_list().map(|list| list.id), Some(EngineShape(5)));
+    let mut two_rs = kv_and_rs;
+    two_rs.shapes.push(rs_list(EngineShape(6)));
+    assert!(matches!(
+        SharedPool::new(&two_rs, 1, 16),
+        Err(SharedError::Shapes {
+            kind: "rs list",
+            ..
+        })
     ));
 }
 
-/// The facts without the ring: a model whose state is fixed records.
+/// The facts without the ring: a model whose state is fixed records, its
+/// unfolded rows in an rs list (CONTRACT-BC 18), the shapes' last.
 fn fixed_facts() -> ChunkFacts {
     let mut facts = facts();
     facts.shapes.retain(|shape| shape.id != RING);
+    facts.shapes.push(Facts {
+        role: SlotRole::RsBuffer,
+        ..shape(
+            RS,
+            SlotKind::List {
+                tokens: RS_TOKENS,
+                rate: 1,
+            },
+            MIB / 4,
+        )
+    });
     facts.validate().unwrap();
     facts
 }
+
+/// `fixed_facts`' rs list's pool id: the shapes' last.
+const RS_POOL: ShapeId = 3;
 
 #[test]
 fn the_stores_take_list_refs_and_records_and_a_fork_names_its_cow() {
@@ -650,7 +699,7 @@ fn every_lane_of_a_group_names_the_record_the_group_writes() {
     use crate::pipeline::fire::rs::{
         GroupFold, GroupPlan, PreparedRs, RsPlan, apply_shared, prepare, prepare_many, settle,
     };
-    use crate::store::rs::{RsError, RsGeometry, UNFOLDED_ROWS};
+    use crate::store::rs::RsGeometry;
 
     let facts = fixed_facts();
     let shared: Shared = Arc::new(Mutex::new(SharedPool::new(&facts, 2, 256).unwrap()));
@@ -715,41 +764,16 @@ fn every_lane_of_a_group_names_the_record_the_group_writes() {
     assert_eq!(fixed(&out), vec![want.clone(), want.clone(), want]);
     settle(&mut rs, out.txn);
 
-    // A fork shares the record: buffering onto it copies it, for every lane.
+    // A fork shares the record: buffering onto it with nothing folding
+    // leaves the record alone (the rows are rs list slots), so every lane
+    // reads it in place.
     let fork = rs.fork(ws).unwrap();
     let out = prepare_many(&mut rs, &[fork; 3], &group(5..9, GroupFold::None), None).unwrap();
-    let copy = out.slot_ids[0];
-    assert_ne!(copy, cow);
-    let want = shared.lock().unwrap().lane_fixed(cow, copy);
+    assert_eq!(out.slot_ids[0], cow);
+    let want = shared.lock().unwrap().lane_fixed(cow, cow);
     assert_eq!(fixed(&out), vec![want.clone(), want.clone(), want]);
     settle(&mut rs, out.txn);
-
-    // A fire may leave at most UNFOLDED_ROWS rows past what the state holds.
-    let frozen = rs.frozen(ws).unwrap();
-    let most = frozen + UNFOLDED_ROWS;
-    let out = prepare_many(
-        &mut rs,
-        &[ws; 3],
-        &group(frozen..most, GroupFold::None),
-        None,
-    );
-    settle(&mut rs, out.unwrap().txn);
-    let past = group(frozen..most + 1, GroupFold::Host(1));
-    let error = RsError::Unfolded {
-        end: most + 1,
-        frozen,
-        most: UNFOLDED_ROWS,
-    }
-    .to_string();
-    assert_eq!(
-        crate::pipeline::fire::rs::demand(&rs, &[ws; 3], &past),
-        Err(error.clone())
-    );
-    let size = rs.buffer_size(ws);
-    let refused = prepare_many(&mut rs, &[ws; 3], &past, None).unwrap_err();
-    assert!(refused.ends_with(&error), "{refused}");
-    assert_eq!(rs.frozen(ws), Ok(frozen), "a refused fire folds nothing");
-    assert_eq!(rs.buffer_size(ws), size, "nor grows the buffer");
+    rs.release_working_set(fork);
 
     // A lone lane that folds writes its own record in place.
     let solo = rs.create_working_set(geom);
@@ -975,4 +999,226 @@ fn uncommitted_segments_are_not_pages_out() {
         kv.reserve_device_pages(3).unwrap()
     });
     assert_eq!(counts(), (1023, 3));
+}
+
+/// The rs list's slots the store holds now (CONTRACT-BC 18), checking that
+/// each of `refs` is one of them.
+fn rs_live(shared: &Shared, refs: &[u32]) -> u64 {
+    let pool = shared.lock().unwrap();
+    for &r in refs {
+        let chunk = pool.slot(RS_POOL, r).chunk;
+        assert_eq!(pool.pool().chunk_shape(chunk), Some(RS_POOL), "ref {r}");
+    }
+    pool.pool().shape_demand(RS_POOL).live
+}
+
+/// The lanes of `out` as a shared pool's engine gets them.
+fn shared_lanes(
+    out: &crate::pipeline::fire::rs::PreparedRs,
+    shared: &Shared,
+    lanes: u32,
+) -> Vec<Lane> {
+    let mut req = crate::engine::FireRequest {
+        lanes: (0..lanes)
+            .map(|row| crate::engine::fire::lane_of(row, vec![1], 0, Vec::new()))
+            .collect(),
+        ..crate::engine::FireRequest::default()
+    };
+    out.apply_to(&mut req);
+    crate::pipeline::fire::rs::apply_shared(&mut req, Some(shared), Some(out));
+    req.lanes
+}
+
+fn buffer_of(lane: &Lane) -> (Vec<u32>, u32, u32) {
+    match &lane.rs {
+        ::engine::fire::RsVerb::Buffer {
+            pages,
+            base,
+            folded,
+            ..
+        } => (pages.clone(), *base, *folded),
+        ::engine::fire::RsVerb::Fold => panic!("a buffering lane"),
+    }
+}
+
+/// CONTRACT-BC 18: beam lanes on one working set leave 36 rows unfolded
+/// (past the 16 a record once buffered), in rs list slots taken as the rows
+/// accumulate, `base` aligned to the slot; folding gives the slots wholly
+/// below the state back, and releasing the set the rest.
+#[test]
+fn beam_lanes_leave_their_rows_unfolded_in_rs_list_slots() {
+    use crate::pipeline::fire::rs::{
+        GroupFold, GroupPlan, RsPlan, demand, prepare, prepare_many, settle,
+    };
+    use crate::store::rs::{RsGeometry, RsUnits};
+
+    let facts = fixed_facts();
+    let shared: Shared = Arc::new(Mutex::new(SharedPool::new(&facts, 3, 256).unwrap()));
+    let stores = crate::store::registry::shared_stores(&shared, 16, 256);
+    let mut rs = stores.rs.lock().unwrap();
+    // The geometry's page is not the rs list's: the list's slot holds 4.
+    let ws = rs.create_working_set(RsGeometry {
+        state_size: 1024,
+        buffer_page_tokens: 16,
+    });
+    let first = prepare(&mut rs, ws, 5).unwrap();
+    settle(&mut rs, first.txn);
+    assert_eq!(rs_live(&shared, &[]), 0, "a folded state buffers nothing");
+
+    // Three lanes of twelve rows each past the state's five.
+    let plan = RsPlan::Groups(vec![GroupPlan {
+        lanes: vec![0, 1, 2],
+        writes: Some(5..41),
+        fold: GroupFold::None,
+        snapshots: Vec::new(),
+    }]);
+    assert_eq!(
+        demand(&rs, &[ws; 3], &plan),
+        Ok(RsUnits {
+            slots: 0,
+            pages: 10
+        }),
+        "rows 4..44 in slots of 4"
+    );
+    let out = prepare_many(&mut rs, &[ws; 3], &plan, None).unwrap();
+    let lanes = shared_lanes(&out, &shared, 3);
+    let (pages, base, folded) = buffer_of(&lanes[0]);
+    assert_eq!(
+        (base, folded),
+        (4, 5),
+        "base aligned to T_rs below the state"
+    );
+    assert_eq!(pages.len(), 10);
+    let distinct: BTreeSet<u32> = pages.iter().copied().collect();
+    assert_eq!(distinct.len(), 10);
+    for lane in &lanes {
+        assert_eq!(buffer_of(lane).0, pages, "every lane reads one buffer");
+        assert!(lane.slot_copies.is_empty(), "fresh slots copy nothing");
+        lane.validate_chunks(&facts).unwrap();
+    }
+    assert!(out.state_copy().is_none());
+    settle(&mut rs, out.txn);
+    assert_eq!(rs_live(&shared, &pages), 10);
+
+    // A fold of 30 of them: the slots wholly below row 35 go.
+    let fold = RsPlan::Groups(vec![GroupPlan {
+        lanes: vec![0],
+        writes: Some(41..42),
+        fold: GroupFold::Host(30),
+        snapshots: Vec::new(),
+    }]);
+    let out = prepare_many(&mut rs, &[ws], &fold, None).unwrap();
+    settle(&mut rs, out.txn);
+    assert_eq!(rs.frozen(ws), Ok(35));
+    assert_eq!(rs.base(ws), Ok(32));
+    assert_eq!(rs_live(&shared, &pages[7..]), 3);
+
+    rs.release_working_set(ws);
+    rs.retire_idle();
+    assert_eq!(rs_live(&shared, &[]), 0, "every slot back");
+}
+
+/// CONTRACT-BC 18: a fork shares its parent's rs list slots by refcount; a
+/// lane writing into a shared, partly filled tail slot names a fresh one
+/// the engine copies the shared one onto first (`Lane::slot_copies`), and
+/// one it holds alone it writes in place. Every reference comes back.
+#[test]
+fn a_fork_shares_rs_slots_and_copies_a_shared_tail_before_writing() {
+    use crate::pipeline::fire::rs::{
+        GroupFold, GroupPlan, RsPlan, demand, prepare, prepare_many, settle,
+    };
+    use crate::store::rs::{RsGeometry, RsUnits};
+
+    let facts = fixed_facts();
+    let shared: Shared = Arc::new(Mutex::new(SharedPool::new(&facts, 2, 256).unwrap()));
+    let stores = crate::store::registry::shared_stores(&shared, 16, 256);
+    let mut rs = stores.rs.lock().unwrap();
+    let ws = rs.create_working_set(RsGeometry {
+        state_size: 1024,
+        buffer_page_tokens: 4,
+    });
+    let first = prepare(&mut rs, ws, 4).unwrap();
+    settle(&mut rs, first.txn);
+    let write = |writes: std::ops::Range<u32>| {
+        RsPlan::Groups(vec![GroupPlan {
+            lanes: vec![0],
+            writes: Some(writes),
+            fold: GroupFold::None,
+            snapshots: Vec::new(),
+        }])
+    };
+    // Rows 4..10: a full slot and a partly filled tail.
+    let out = prepare_many(&mut rs, &[ws], &write(4..10), None).unwrap();
+    let parent = buffer_of(&shared_lanes(&out, &shared, 1)[0]).0;
+    settle(&mut rs, out.txn);
+    let [head, tail] = parent[..] else {
+        panic!("two slots");
+    };
+    assert_eq!(rs_live(&shared, &parent), 2);
+
+    let fork = rs.fork(ws).unwrap();
+    assert_eq!(rs_live(&shared, &[]), 2, "the fork shares them");
+    assert_eq!(
+        demand(&rs, &[fork], &write(10..11)),
+        Ok(RsUnits { slots: 0, pages: 1 }),
+        "a copy of the tail"
+    );
+    let out = prepare_many(&mut rs, &[fork], &write(10..11), None).unwrap();
+    let lane = shared_lanes(&out, &shared, 1).remove(0);
+    let (pages, base, _) = buffer_of(&lane);
+    let [shared_head, copy] = pages[..] else {
+        panic!("two slots");
+    };
+    assert_eq!(base, 4);
+    assert_eq!(shared_head, head, "the full slot stays shared");
+    assert_ne!(copy, tail);
+    assert_eq!(lane.slot_copies, vec![(RS, vec![[tail, copy]])]);
+    assert!(
+        lane.fixed
+            .iter()
+            .flat_map(|(_, pieces)| pieces)
+            .all(|[run, cow]| run == cow),
+        "the record is not copied for a buffered write"
+    );
+    lane.validate_chunks(&facts).unwrap();
+    settle(&mut rs, out.txn);
+    assert_eq!(rs_live(&shared, &[head, tail, copy]), 3);
+    assert_eq!(
+        rs.buffer_translation(ws),
+        Ok(parent.clone()),
+        "the parent keeps its own"
+    );
+
+    // The parent holds its tail alone now: it writes it in place.
+    assert_eq!(demand(&rs, &[ws], &write(10..11)), Ok(RsUnits::default()));
+    let out = prepare_many(&mut rs, &[ws], &write(10..11), None).unwrap();
+    let lane = shared_lanes(&out, &shared, 1).remove(0);
+    assert_eq!(buffer_of(&lane).0, parent);
+    assert!(lane.slot_copies.is_empty());
+    settle(&mut rs, out.txn);
+
+    // The fork grows a slot of its own past its copy.
+    let out = prepare_many(&mut rs, &[fork], &write(11..13), None).unwrap();
+    let lane = shared_lanes(&out, &shared, 1).remove(0);
+    let grown = buffer_of(&lane).0;
+    assert_eq!(grown[..2], [head, copy]);
+    assert!(lane.slot_copies.is_empty());
+    settle(&mut rs, out.txn);
+    assert_eq!(rs_live(&shared, &grown), 4);
+
+    // The parent folds past its head slot, which the fork still holds.
+    rs.fold(ws, 4);
+    rs.retire_idle();
+    assert_eq!(rs.buffer_translation(ws), Ok(vec![tail]));
+    assert_eq!(
+        rs_live(&shared, &[]),
+        4,
+        "the head stays: the fork holds it"
+    );
+    rs.release_working_set(fork);
+    rs.retire_idle();
+    assert_eq!(rs_live(&shared, &[tail]), 1, "the fork's three go");
+    rs.release_working_set(ws);
+    rs.retire_idle();
+    assert_eq!(rs_live(&shared, &[]), 0, "every reference back");
 }

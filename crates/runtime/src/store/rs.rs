@@ -86,13 +86,6 @@ pub enum RsError {
     UnknownWorkingSet,
     #[error("a fire writes slot {slot}, which its state already holds (it holds {frozen})")]
     BelowFrozen { slot: u32, frozen: u32 },
-    #[error(
-        "a fire writes buffered rows up to slot {end} of a state that holds {frozen}: {} rows \
-         unfolded, and a shared pool's record buffers at most {most}; fold what the state \
-         buffers before writing more past it, or write fewer rows a fire",
-        end - frozen
-    )]
-    Unfolded { end: u32, frozen: u32, most: u32 },
     #[error("rs batch contains the same working set more than once")]
     DuplicateWorkingSet,
     #[error("rs pools exhausted: requested {requested}, available {available}")]
@@ -105,15 +98,6 @@ pub enum RsError {
 }
 
 pub const RS_TRANSLATION_UNMAPPED: u32 = u32::MAX;
-
-/// The buffer page ids a shared pool's store keeps a record: the most rows
-/// a fire leaves unfolded, a page each at the smallest page, and as many
-/// again for a copy-on-write.
-const BUFFER_PAGES_PER_RECORD: u32 = 2 * UNFOLDED_ROWS;
-
-/// The most buffered rows a shared pool's record holds: a fire never leaves
-/// a working set's buffer writing past `frozen + UNFOLDED_ROWS`.
-pub use poem_compiler::chunk::UNFOLDED_ROWS;
 
 /// A count in each recurrent pool: state slots and buffer pages. Each is
 /// a fixed slot shape's slots, and in the degenerate mode a slot is a chunk,
@@ -262,6 +246,11 @@ pub struct RsStore {
     moving: HashSet<RsSlotId>,
     /// Where state gains memory as it is handed out, how far it has.
     extent: Option<StateExtent>,
+    /// The tokens an rs list slot holds, where the buffer pages are a
+    /// shared pool's rs list (CONTRACT-BC 18): a page holds that many rows,
+    /// whatever a set's geometry says, and the buffer starts at a multiple
+    /// of it.
+    rs_tokens: Option<u32>,
 }
 
 /// How far the state slots and buffer pages have memory under them; both
@@ -354,13 +343,14 @@ impl RsStore {
 
     /// The store an engine's shared pool backs: a window ring of the ring
     /// shape's slot refs where there is a window (ref 0, in the null chunk,
-    /// is never handed out), else the pool's fixed records as state slots.
-    /// The rs buffer's rows ride inside each record, so its pages take no
-    /// memory: they number the rows the store tracks, nothing more.
+    /// is never handed out), else the pool's fixed records as state slots
+    /// and the rs list's slot refs as buffer pages (ids from past the
+    /// records', an engine id the slot ref; CONTRACT-BC 18). A pool with no
+    /// rs list buffers nothing.
     pub fn shared(shared: &Shared) -> Self {
-        let (ring, fixed) = {
+        let (ring, fixed, rs_list) = {
             let pool = shared.lock().unwrap();
-            (pool.ring(), !pool.fixed().is_empty())
+            (pool.ring(), !pool.fixed().is_empty(), pool.rs_list())
         };
         if let Some(ring) = ring {
             let pages = ShapePool::shared(shared, ring);
@@ -383,16 +373,21 @@ impl RsStore {
             ShapePool::new(ShapeKind::Fixed, 0, 0, 0)
         };
         let records = slots.capacity();
-        let pages = records.saturating_mul(BUFFER_PAGES_PER_RECORD);
-        let host = records + pages;
-        Self::build(
+        let pages = rs_list.map_or_else(
+            || ShapePool::new(ShapeKind::List, 0, records, 0),
+            |list| ShapePool::shared_from(shared, list, records),
+        );
+        let host = pages.ids_end();
+        let mut store = Self::build(
             slots,
-            ShapePool::new(ShapeKind::Fixed, 0, records, pages),
+            pages,
             ShapePool::new(ShapeKind::Fixed, 0, host, 0),
-            ShapePool::new(ShapeKind::Fixed, 0, host, 0),
+            ShapePool::new(ShapeKind::List, 0, host, 0),
             records,
             None,
-        )
+        );
+        store.rs_tokens = rs_list.map(|list| list.tokens.max(1));
+        store
     }
 
     /// Whether the state slots are a shared pool's records.
@@ -424,6 +419,7 @@ impl RsStore {
             checkpoints: HashMap::new(),
             moving: HashSet::new(),
             extent: None,
+            rs_tokens: None,
         }
     }
 
@@ -565,6 +561,11 @@ impl RsStore {
     /// Answers how many went, and the slots past the limit those that stay
     /// read: room for them is the policy's to make.
     pub fn reclaim_tail(&mut self, keys: impl crate::policy::retention::Keys) -> (usize, u32) {
+        // A shared pool moves by its segments, not by a limit: no id is
+        // past one (an rs list's slot refs run over every chunk).
+        if self.is_shared() {
+            return (0, 0);
+        }
         let limit = self.limit();
         let past = |id: RsSlotId, store: &Self| store.engine_id(id) >= limit && !store.is_host(id);
         let mut kept: HashSet<RsSlotId> = HashSet::new();
@@ -1200,7 +1201,6 @@ impl RsStore {
     ) -> Result<RsUnits, RsError> {
         let entry = self.entry(ws)?;
         let targets = self.buffer_targets(entry, writes)?;
-        let write_state = write_state || self.buffer_writes_record(entry.folded, &targets);
         let state = write_state && (fresh || entry.folded.is_none_or(|id| self.ref_count(id) > 1));
         Ok(RsUnits {
             slots: u32::from(state),
@@ -1208,17 +1208,32 @@ impl RsStore {
         })
     }
 
-    /// Whether writing buffer `targets` writes a record another holder
-    /// shares: in a shared pool the buffer rows ride inside the record, so
-    /// the record is copied on write as the state is.
-    fn buffer_writes_record(
-        &self,
-        folded: Option<RsSlotId>,
-        targets: &[(u32, Option<RsSlotId>)],
-    ) -> bool {
-        self.slots.is_shared()
-            && !targets.is_empty()
-            && folded.is_some_and(|id| self.ref_count(id) > 1)
+    /// The rows a buffer page holds: an rs list slot's tokens in a shared
+    /// pool, else the set's geometry's.
+    fn page_tokens(&self, entry: &RsEntry) -> u32 {
+        self.rs_tokens
+            .unwrap_or(entry.geom.buffer_page_tokens)
+            .max(1)
+    }
+
+    /// Where an empty buffer starts: at the state's count, rounded down to
+    /// an rs list slot in a shared pool (CONTRACT-BC 18: `base` is aligned
+    /// to `T_rs`; the rows below the count in its first slot are folded and
+    /// never read).
+    fn empty_base(&self, frozen: u32) -> u32 {
+        match self.rs_tokens {
+            Some(tokens) => frozen - frozen % tokens,
+            None => frozen,
+        }
+    }
+
+    /// The slot the buffer's page 0 starts at.
+    fn buffer_base(&self, entry: &RsEntry) -> u32 {
+        if entry.buffer.is_empty() {
+            self.empty_base(entry.frozen)
+        } else {
+            entry.base
+        }
     }
 
     fn buffer_targets(
@@ -1235,22 +1250,8 @@ impl RsStore {
                 frozen: entry.frozen,
             });
         }
-        // A shared pool's record holds the buffer as its `[UNFOLDED_ROWS,
-        // width]` rows, row `s` at `s % UNFOLDED_ROWS`: rows further past
-        // the state than that would land on each other.
-        if self.slots.is_shared() && writes.end - entry.frozen > UNFOLDED_ROWS {
-            return Err(RsError::Unfolded {
-                end: writes.end,
-                frozen: entry.frozen,
-                most: UNFOLDED_ROWS,
-            });
-        }
-        let page = entry.geom.buffer_page_tokens.max(1);
-        let base = if entry.buffer.is_empty() {
-            entry.frozen
-        } else {
-            entry.base
-        };
+        let page = self.page_tokens(entry);
+        let base = self.buffer_base(entry);
         let first = (writes.start - base) / page;
         let last = (writes.end - 1 - base) / page;
         Ok((first..=last)
@@ -1267,15 +1268,15 @@ impl RsStore {
         writes: Option<std::ops::Range<u32>>,
         reserved: Option<&mut RsGrant>,
     ) -> Result<RsPreparedWrite, RsError> {
-        // Refused (below the state, or past what a record buffers) before
-        // the buffer grows.
+        // Refused (below the state) before the buffer grows.
         self.buffer_targets(self.entry(ws)?, writes.clone())?;
         if let Some(writes) = writes.as_ref().filter(|writes| !writes.is_empty()) {
+            let (base, page) = {
+                let entry = self.entry(ws)?;
+                (self.buffer_base(entry), self.page_tokens(entry))
+            };
             let entry = self.entry_mut(ws)?;
-            if entry.buffer.is_empty() {
-                entry.base = entry.frozen;
-            }
-            let page = entry.geom.buffer_page_tokens.max(1);
+            entry.base = base;
             let pages = writes.end.saturating_sub(entry.base).div_ceil(page) as usize;
             if entry.buffer.len() < pages {
                 entry.buffer.resize(pages, None);
@@ -1306,7 +1307,6 @@ impl RsStore {
             );
             entry.folded
         };
-        let write_state = write_state || self.buffer_writes_record(folded, &buffer_targets_src);
         let need = RsUnits {
             slots: u32::from(
                 write_state && (fresh || folded.is_none_or(|id| self.ref_count(id) > 1)),
@@ -1579,17 +1579,23 @@ impl RsStore {
 
     /// The buffer pages wholly below them go.
     pub fn fold(&mut self, ws: RsWorkingSetId, slots: u32) {
+        let Ok(page) = self.entry(ws).map(|entry| self.page_tokens(entry)) else {
+            return;
+        };
+        let rs_tokens = self.rs_tokens;
         let Ok(entry) = self.entry_mut(ws) else {
             return;
         };
         entry.frozen = entry.frozen.saturating_add(slots);
-        let page = entry.geom.buffer_page_tokens.max(1);
         let below = (entry.frozen.saturating_sub(entry.base) / page) as usize;
         let drop = below.min(entry.buffer.len());
         entry.base += drop as u32 * page;
         let dropped: Vec<RsSlotId> = entry.buffer.drain(..drop).flatten().collect();
         if entry.buffer.is_empty() {
-            entry.base = entry.frozen;
+            entry.base = match rs_tokens {
+                Some(tokens) => entry.frozen - entry.frozen % tokens,
+                None => entry.frozen,
+            };
         }
         for id in dropped {
             self.decref(id);
@@ -1601,12 +1607,7 @@ impl RsStore {
     }
 
     pub fn base(&self, ws: RsWorkingSetId) -> Result<u32, RsError> {
-        let entry = self.entry(ws)?;
-        Ok(if entry.buffer.is_empty() {
-            entry.frozen
-        } else {
-            entry.base
-        })
+        Ok(self.buffer_base(self.entry(ws)?))
     }
 
     #[cfg(test)]

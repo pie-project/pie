@@ -321,6 +321,7 @@ fn slot_refs_name_a_chunk_and_an_index() {
         sets_per_working_set: 1,
         rows: Vec::new(),
         pinned: None,
+        role: SlotRole::State,
     };
     assert_eq!(shape.slot_ref(3, 5), 53);
     assert_eq!(shape.chunk_of(53), 3);

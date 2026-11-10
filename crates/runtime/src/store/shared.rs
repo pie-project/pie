@@ -11,9 +11,11 @@
 //! - a window ring's pages are slot refs of the ring shape (ref 0, in the
 //!   null chunk, is never handed out and reads as the null page);
 //! - the rs store's state slots are **records**: one working set's fixed
-//!   state, a slot of every fixed shape for each of its pieces (the rs
-//!   buffer's `[P, width]` rows ride inside the record, so buffer pages take
-//!   no memory of their own).
+//!   state, a slot of every fixed shape for each of its pieces;
+//! - the rs store's buffer pages are slot refs of the **rs list** (a list
+//!   shape of role [`SlotRole::RsBuffer`], CONTRACT-BC 18): taken as
+//!   unfolded rows accumulate, refcounted by the store so forks share their
+//!   common unfolded prefix, and given back as rows fold.
 //!
 //! A lane names its slots in [`::engine::fire::Lane::tables`] (list and ring
 //! refs in token order) and [`::engine::fire::Lane::fixed`] (one `[run, cow]`
@@ -38,7 +40,7 @@ use std::sync::{Arc, Mutex};
 
 use ::engine::chunk::{
     ChunkFacts, Evacuation as EngineEvacuation, Growth as SegmentGrowth, ShapeId as EngineShape,
-    SlotKind,
+    SlotKind, SlotRole,
 };
 
 use super::chunks::STORE;
@@ -66,7 +68,7 @@ pub enum SharedError {
     #[error("the reserved chunks are not one run from chunk 0")]
     Reserved,
     #[error(
-        "{kind} shapes {shapes:?}: the stores hold one list and one ring shape until kv holds a table per shape"
+        "{kind} shapes {shapes:?}: the stores hold one kv list, one rs list and one ring shape until kv holds a table per shape"
     )]
     Shapes {
         kind: &'static str,
@@ -141,6 +143,8 @@ pub struct SharedPool {
     pool: SlotPool,
     growth: SegmentGrowth,
     list: Option<TokenShape>,
+    /// The rs buffer's list shape (CONTRACT-BC 18).
+    rs_list: Option<TokenShape>,
     ring: Option<TokenShape>,
     fixed: Vec<FixedShape>,
     /// The first weight shape's pool id; the weight shapes follow.
@@ -187,12 +191,18 @@ impl SharedPool {
             reserved += run.chunks;
         }
         let mut shapes = Vec::with_capacity(facts.shapes.len() + facts.weights.len());
-        let (mut lists, mut rings, mut fixed) = (Vec::new(), Vec::new(), Vec::new());
+        let (mut lists, mut rs_lists, mut rings, mut fixed) =
+            (Vec::new(), Vec::new(), Vec::new(), Vec::new());
         for shape in &facts.shapes {
             let pool = ShapeId::try_from(shapes.len()).expect("shapes fit a shape id");
             let kind = match shape.kind {
                 SlotKind::List { tokens, .. } => {
-                    lists.push(TokenShape {
+                    let found = if shape.role == SlotRole::RsBuffer {
+                        &mut rs_lists
+                    } else {
+                        &mut lists
+                    };
+                    found.push(TokenShape {
                         id: shape.id,
                         pool,
                         tokens,
@@ -229,7 +239,11 @@ impl SharedPool {
                 slots_per_chunk: shape.slots_per_chunk,
             });
         }
-        for (kind, found) in [("list", &lists), ("ring", &rings)] {
+        for (kind, found) in [
+            ("kv list", &lists),
+            ("rs list", &rs_lists),
+            ("ring", &rings),
+        ] {
             if found.len() > 1 {
                 return Err(SharedError::Shapes {
                     kind,
@@ -256,6 +270,7 @@ impl SharedPool {
             pool,
             growth: facts.segments.growth,
             list: lists.first().copied(),
+            rs_list: rs_lists.first().copied(),
             ring: rings.first().copied(),
             fixed,
             weights_first,
@@ -297,6 +312,12 @@ impl SharedPool {
     #[must_use]
     pub fn list(&self) -> Option<TokenShape> {
         self.list
+    }
+
+    /// The rs buffer's list shape, where the model buffers rs rows.
+    #[must_use]
+    pub fn rs_list(&self) -> Option<TokenShape> {
+        self.rs_list
     }
 
     #[must_use]
@@ -353,7 +374,8 @@ impl SharedPool {
     }
 
     /// Chunks one working set takes at `context` tokens: its list slots, a
-    /// ring's cap, and its record.
+    /// ring's cap, its record, and an rs list slot for the rows a fire
+    /// leaves unfolded.
     fn working_set_chunks(&self, context: u32) -> u32 {
         let per_chunk = |slots: u64, spc: u32| slots.div_ceil(u64::from(spc.max(1)));
         let list = self.list.map_or(0, |list| {
@@ -368,7 +390,8 @@ impl SharedPool {
                 ring.slots_per_chunk,
             )
         });
-        u32::try_from(list + ring + self.record_chunks(1)).unwrap_or(u32::MAX)
+        let rs = u64::from(self.rs_list.is_some());
+        u32::try_from(list + ring + rs + self.record_chunks(1)).unwrap_or(u32::MAX)
     }
 
     // ---- slot refs of the list and ring shapes ----

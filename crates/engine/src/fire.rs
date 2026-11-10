@@ -248,6 +248,15 @@ pub struct Lane {
     /// a snapshot restored, within the fire).
     #[serde(default)]
     pub fixed: Vec<(ShapeId, Vec<[u32; 2]>)>,
+    /// Whole-slot copies `[src, dst]` (logical slot refs) of each list
+    /// shape, made on the stream before the fire runs, after the fires
+    /// before it: today only the rs list, where a lane writes buffered rows
+    /// into a slot it shared with a fork (CONTRACT-BC 18). Its
+    /// `RsVerb::Buffer::pages` already name `dst`. Every lane's copies of
+    /// a fire land before any lane of it reads or writes; no two name the
+    /// same `dst`.
+    #[serde(default)]
+    pub slot_copies: Vec<(ShapeId, Vec<[u32; 2]>)>,
 }
 
 /// Pool pages `pages[i]` read into host kv slots `slots[i]` as the fire
@@ -360,7 +369,7 @@ impl Lane {
     }
 
     fn validate_chunk_refs(&self, serves: Serves) -> Result<()> {
-        if self.tables.is_empty() && self.fixed.is_empty() {
+        if self.tables.is_empty() && self.fixed.is_empty() && self.slot_copies.is_empty() {
             return Ok(());
         }
         if !serves.chunks {
@@ -411,9 +420,15 @@ impl Lane {
             .iter()
             .map(|(shape, pieces)| (*shape, pieces.iter().flatten().copied().collect()))
             .collect();
+        let copies: Vec<(ShapeId, Vec<u32>)> = self
+            .slot_copies
+            .iter()
+            .map(|(shape, pairs)| (*shape, pairs.iter().flatten().copied().collect()))
+            .collect();
         let refs = self
             .tables
             .iter()
+            .chain(&copies)
             .map(|(shape, refs)| (*shape, refs.as_slice(), false))
             .chain(
                 fixed
