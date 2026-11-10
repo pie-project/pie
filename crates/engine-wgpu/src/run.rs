@@ -147,8 +147,6 @@ pub struct Run<'c> {
 
     host: Option<&'c crate::experts::HostTier>,
 
-    pump: Option<&'c crate::experts::Pump>,
-
     /// The weight cache's row tables and routed experts, their host copies
     /// by param, the pool their slots lie in, the ids a fire's gathers read
     /// back, and the layer whose routed experts were staged last.
@@ -207,7 +205,6 @@ impl<'c> Run<'c> {
         tier: kernels_slang::Tier,
         rows: Option<&'c crate::experts::Gathered>,
         host: Option<&'c crate::experts::HostTier>,
-        pump: Option<&'c crate::experts::Pump>,
     ) -> Self {
         Self {
             ctx,
@@ -217,7 +214,6 @@ impl<'c> Run<'c> {
             weights,
             rows,
             host,
-            pump,
             row_caches: None,
             expert_caches: None,
             cached_planes: std::collections::BTreeMap::new(),
@@ -642,7 +638,7 @@ impl<'c> Run<'c> {
             Def::Weight(w) => {
                 let row = *w as usize;
                 match self.weights.0.get(row).copied().flatten() {
-                    Some(WeightRow::Dense(handle)) => self.pumped(handle),
+                    Some(WeightRow::Dense(handle)) => handle,
                     Some(WeightRow::Planes(_)) => panic!(
                         "value {at} is weight {row}, a split-plane bank; it resolves \
                          through `Run::planes`, never as one dense handle"
@@ -711,19 +707,14 @@ impl<'c> Run<'c> {
         };
         let row = *w as usize;
         match self.weights.0.get(row).copied().flatten() {
-            Some(WeightRow::Planes(bank)) => Some(Bank {
-                codes: self.pumped(bank.codes),
-                scales: self.pumped(bank.scales),
-                biases: bank.biases.map(|b| self.pumped(b)),
-                ..bank
-            }),
+            Some(WeightRow::Planes(bank)) => Some(Bank { ..bank }),
             Some(WeightRow::Dense(_)) => None,
             None => panic!("value {at} is weight {row}, which the shell has not bound"),
         }
     }
 
-    /// Weight value `id`'s split-plane bank as the load bound it, its
-    /// planes not pumped: the scheme a tabled kernel reads it at.
+    /// Weight value `id`'s split-plane bank as the load bound it: the
+    /// scheme a tabled kernel reads it at.
     pub(crate) fn scheme(&self, id: ValueId) -> Bank {
         let at = id.0 as usize;
         match &self.values[at].def {
@@ -737,24 +728,6 @@ impl<'c> Run<'c> {
                 panic!("value {at} is not a weight, and split-plane banks live in the weight table")
             }
         }
-    }
-
-    fn pumped(&self, plane: Tensor) -> Tensor {
-        let (Some(pump), Some(host)) = (self.pump, self.host) else {
-            return plane;
-        };
-        let Some(spilled) = host.plane(plane.buf) else {
-            return plane;
-        };
-        crate::probe::with_frame(|frame| pump.stage(frame, host.map(), spilled, plane))
-            .unwrap_or_else(|| {
-                panic!(
-                    "weight plane {} is pumped from the artifact and no frame is recording \
-                     on this thread",
-                    plane.buf
-                )
-            })
-            .unwrap_or_else(|fault| panic!("weight plane {} does not pump: {fault}", plane.buf))
     }
 
     /// This run with the weight cache's row tables and routed experts:

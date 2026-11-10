@@ -8,7 +8,7 @@ struct ConfigurationTests {
         let object = try JSONSerialization.jsonObject(with: JSONEncoder().encode(configuration)) as? [String: Any]
         #expect(Set(object?.keys ?? [:].keys) == [
             "device_memory_share", "max_forward_tokens", "max_forward_requests",
-            "max_state_slots", "max_model_len", "sandbox_memory_mb", "max_concurrent_processes",
+            "max_model_len", "sandbox_memory_mb", "max_concurrent_processes",
         ])
     }
 

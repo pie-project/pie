@@ -895,12 +895,6 @@ pub struct Conditionals<'a> {
     pub at: &'a Cell<u32>,
 }
 
-#[derive(Clone, Copy)]
-pub struct Pump<'a> {
-    pub rotor: &'a crate::rotate::Rotor,
-    pub compute: *mut core::ffi::c_void,
-}
-
 pub struct Cursor<'a> {
     at: u32,
     place: &'a At,
@@ -908,7 +902,6 @@ pub struct Cursor<'a> {
     recording: bool,
     cond: Option<Conditionals<'a>>,
     open: Option<(crate::device::conditional::Conditional, u32, bool)>,
-    pump: Option<Pump<'a>>,
     fault: Option<Fault>,
 }
 
@@ -918,7 +911,6 @@ impl core::fmt::Debug for Cursor<'_> {
             .field("at", &self.at)
             .field("recording", &self.recording)
             .field("conditionals", &self.cond.is_some())
-            .field("pump", &self.pump.is_some())
             .field("open", &self.open.is_some())
             .field("fault", &self.fault)
             .finish()
@@ -938,7 +930,6 @@ impl<'a> Cursor<'a> {
             recording: false,
             cond: None,
             open: None,
-            pump: None,
             fault: None,
         }
     }
@@ -964,7 +955,6 @@ impl<'a> Cursor<'a> {
             recording: false,
             cond: None,
             open: None,
-            pump: None,
             fault: None,
         }
     }
@@ -973,14 +963,6 @@ impl<'a> Cursor<'a> {
     pub fn conditionals(self, cond: Conditionals<'a>) -> Cursor<'a> {
         Cursor {
             cond: Some(cond),
-            ..self
-        }
-    }
-
-    #[must_use]
-    pub fn pumping(self, pump: Pump<'a>) -> Cursor<'a> {
-        Cursor {
-            pump: Some(pump),
             ..self
         }
     }
@@ -1109,12 +1091,6 @@ impl Sink for Cursor<'_> {
         } else {
             0
         });
-        if let Some(pump) = self.pump
-            && self.fault.is_none()
-            && let Err(fault) = pump.rotor.at(self.at, pump.compute)
-        {
-            self.fault = Some(fault);
-        }
         self.at += 1;
         if self.open.is_some() {
             return;

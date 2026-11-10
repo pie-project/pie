@@ -3,7 +3,7 @@ use std::cell::{Cell, RefCell};
 use std::collections::BTreeMap;
 
 use checkpoint::plan::{LoadPlan, StorageInstr};
-use engine::load::{Residency, Tiers};
+use engine::load::Tiers;
 use poem_ir::{Def, Operation, Trace, ValueId};
 
 use crate::device::ctx::Frame;
@@ -571,127 +571,6 @@ impl Seats {
     }
 }
 
-#[derive(Debug)]
-pub struct Pump {
-    slots: Vec<(Buffer, u32)>,
-
-    per: u64,
-
-    staging: Vec<Buffer>,
-    ring: Cell<usize>,
-    pending: Cell<usize>,
-
-    seated: std::cell::RefCell<BTreeMap<u32, u32>>,
-}
-
-const PUMP_MIN: usize = 3;
-
-const PUMP_MAX: usize = 64;
-
-impl Pump {
-    pub fn reserve(
-        device: &Context,
-        handles: &Handles,
-        widest: u64,
-        ring: u64,
-    ) -> Result<Option<Pump>> {
-        if widest == 0 {
-            return Ok(None);
-        }
-        let count = usize::try_from(ring / widest.max(1))
-            .unwrap_or(PUMP_MIN)
-            .clamp(PUMP_MIN, PUMP_MAX);
-        let mut slots = Vec::with_capacity(count);
-        let mut staging = Vec::with_capacity(count);
-        for _ in 0..count {
-            let buffer = Buffer::zeroed(device, widest)?;
-            let handle = handles.bind(&buffer, 0, widest)?;
-            slots.push((buffer, handle));
-            staging.push(Buffer::with(
-                device,
-                widest,
-                crate::device::alloc::Memory::Staging,
-            )?);
-        }
-        Ok(Some(Pump {
-            slots,
-            per: widest,
-            staging,
-            ring: Cell::new(0),
-            pending: Cell::new(0),
-            seated: std::cell::RefCell::new(BTreeMap::new()),
-        }))
-    }
-
-    #[must_use]
-    pub fn device_bytes(&self) -> u64 {
-        self.slots.iter().map(|(b, _)| b.bytes()).sum()
-    }
-
-    pub fn stage(
-        &self,
-        frame: &Frame,
-        map: &Mapping,
-        plane: &HostPlane,
-        like: Tensor,
-    ) -> Result<Tensor> {
-        if let Some(&handle) = self.seated.borrow().get(&like.buf) {
-            return Ok(Tensor::new(handle, like.rows, like.width, like.dtype));
-        }
-        if plane.bytes > self.per {
-            return Err(Fault::Ceiling {
-                what: "bytes of one spilled dense plane against the pump slot",
-                need: plane.bytes,
-                have: self.per,
-            });
-        }
-        if self.pending.get() >= self.slots.len() {
-            frame.flush()?;
-            self.pending.set(0);
-            self.seated.borrow_mut().clear();
-        }
-        let at = self.ring.get();
-        self.ring.set((at + 1) % self.slots.len());
-        self.pending.set(self.pending.get() + 1);
-        let staging = &self.staging[at];
-        let len = plane.bytes.next_multiple_of(4);
-        stage_rows(staging, 0, len, |base| copy_plane(map, plane, base))?;
-        let (slab, handle) = &self.slots[at];
-        record_copy(frame, staging, 0, slab, 0, len)?;
-        self.seated.borrow_mut().insert(like.buf, *handle);
-        Ok(Tensor::new(*handle, like.rows, like.width, like.dtype))
-    }
-}
-
-fn copy_plane(map: &Mapping, plane: &HostPlane, into: usize) -> Result<()> {
-    for &(virt, file, len) in plane.runs() {
-        let src = map.bytes(file, len).ok_or(Fault::Ceiling {
-            what: "bytes of the mapped artifact",
-            need: file + len,
-            have: map.len() as u64,
-        })?;
-        if virt.saturating_add(len) > plane.bytes {
-            return Err(Fault::Ceiling {
-                what: "bytes of a host-tier plane a run writes",
-                need: virt.saturating_add(len),
-                have: plane.bytes,
-            });
-        }
-
-        // SAFETY: `into` is a live staging view of at least `plane.bytes`
-        // (`Pump::stage`), and the run `[virt, virt + len)` was just checked to
-        // lie inside it; `src` is `len` bytes of the mapping, which no view aliases.
-        unsafe {
-            std::ptr::copy_nonoverlapping(
-                src.as_ptr(),
-                (into + virt as usize) as *mut u8,
-                len as usize,
-            );
-        }
-    }
-    Ok(())
-}
-
 fn copy_row_at(map: &Mapping, plane: &HostPlane, seat: usize, row: i32, into: usize) -> Result<()> {
     if row < 0 || row as u32 >= plane.rows {
         return Err(Fault::Ceiling {
@@ -915,10 +794,8 @@ impl Plan {
         &self,
         bytes: &[u64],
         planes: &BTreeMap<usize, Vec<usize>>,
-        pinned: &[bool],
         streamed: &[usize],
         device_cap: u64,
-        residency: Residency,
     ) -> Result<Layout> {
         let mut tier = vec![Tier::Device; bytes.len()];
         for &at in streamed {
@@ -947,55 +824,21 @@ impl Plan {
             .filter(|(at, _)| !grouped[*at])
             .map(|(_, b)| *b)
             .sum();
-        let cap = match residency.device_weight_budget {
-            Some(budget) => budget.min(device_cap),
-            None => device_cap,
-        };
-
-        let mut dense = dense;
-        let mut spilled = 0u64;
-        let mut pump = 0u64;
-        let mut slot = 0u64;
+        // Dense weights always live on the device: past it, nothing makes
+        // room for them.
+        let cap = device_cap;
         if dense > cap {
-            let ring = cap / 4;
-
-            let mut order: Vec<usize> = (0..bytes.len())
-                .filter(|at| !grouped[*at] && !pinned[*at])
-                .collect();
-            order.sort_by_key(|&at| bytes[at]);
-            let mut room = cap;
-            for at in order {
-                if bytes[at] > ring {
-                    continue;
-                }
-                slot = slot.max(bytes[at]);
-                pump = slot * PUMP_MIN as u64;
-                room = cap.saturating_sub(ring.max(pump));
-                if dense <= room {
-                    break;
-                }
-                tier[at] = Tier::Host;
-                dense -= bytes[at];
-                spilled += bytes[at];
-            }
-            if dense > room {
-                return Err(Fault::Ceiling {
-                    what: "bytes of device-local memory for the dense weight planes that \
-                           must stay resident — every plane a rotating slot can hold is \
-                           already pumped from the artifact, and the rest are each wider \
-                           than one slot",
-                    need: dense + pump,
-                    have: cap,
-                });
-            }
-            if spilled == 0 {
-                pump = 0;
-                slot = 0;
-            } else {
-                pump = ring.max(slot * PUMP_MIN as u64);
-            }
+            return Err(Fault::Residency(format!(
+                "this deployment's dense weights take {dense} bytes, and the device holds {cap} \
+                 for them under `[model] device_memory_share` once the working set and one \
+                 sequence's kv pages and state slots are down. Dense weights always live in \
+                 device memory (only routed experts and token-id tables leave it, through the \
+                 weight cache), so serve a quantized deployment of this model, split it across \
+                 devices with tensor parallelism, or raise `[model] device_memory_share` or \
+                 shorten `max_model_len`."
+            )));
         }
-        let mut device = dense + pump;
+        let mut device = dense;
         let mut host: u64 = streamed.iter().map(|&at| bytes[at]).sum();
         for members in &groups {
             let group: u64 = members.iter().map(|&m| bytes[m]).sum();
@@ -1008,23 +851,9 @@ impl Plan {
                 host += group;
             }
         }
-        let tiers = Tiers {
-            device,
-            host,
-
-            spilled,
-            sourced: spilled > 0,
-        };
-        residency
-            .admit_tiers(tiers)
-            .map_err(|why| Fault::Residency(why.to_string()))?;
+        let tiers = Tiers { device, host };
         admit_streaming(tiers)?;
-        Ok(Layout {
-            tier,
-            tiers,
-            slot,
-            ring: pump,
-        })
+        Ok(Layout { tier, tiers })
     }
 }
 
@@ -1035,14 +864,13 @@ fn admit_streaming(_tiers: Tiers) -> Result<()> {
 
 #[cfg(target_arch = "wasm32")]
 fn admit_streaming(tiers: Tiers) -> Result<()> {
-    if tiers.host == 0 && tiers.spilled == 0 {
+    if tiers.host == 0 {
         return Ok(());
     }
     Err(Fault::Residency(format!(
-        "this load would stream {} bytes of routed experts and {} bytes of spilled dense \
-         planes from the artifact between steps, and a browser host streams nothing: \
-         raise the device weight budget or serve a smaller checkpoint",
-        tiers.host, tiers.spilled
+        "this load would stream {} bytes of routed experts from the artifact between \
+         steps, and a browser host streams nothing: serve a smaller checkpoint",
+        tiers.host
     )))
 }
 
@@ -1158,10 +986,6 @@ impl Gathered {
 pub struct Layout {
     pub tier: Vec<Tier>,
     pub tiers: Tiers,
-
-    pub slot: u64,
-
-    pub ring: u64,
 }
 
 impl Layout {
@@ -1172,17 +996,13 @@ impl Layout {
             tiers: Tiers {
                 device: bytes.iter().sum(),
                 host: 0,
-                spilled: 0,
-                sourced: false,
             },
-            slot: 0,
-            ring: 0,
         }
     }
 
     #[must_use]
     pub fn streams(&self) -> bool {
-        self.tiers.host > 0 || self.tiers.spilled > 0
+        self.tiers.host > 0
     }
 }
 

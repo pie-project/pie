@@ -10,16 +10,14 @@ use checkpoint::file::zt;
 use checkpoint::plan::{LoadPlan, StorageTarget, compile, compile_streaming};
 use checkpoint::serving::Stamp;
 use checkpoint::types::{BackendKind, ScaleForm, TensorId};
-use engine::load::{Residency, Tiers};
+use engine::load::Tiers;
 use kernels_slang::Tensor;
 use poem_ir::{Dtype, ParamSource, Trace};
 
 use crate::device::alloc::Memory;
 use crate::device::{Buffer, Context, Handles};
 use crate::error::{Fault, Result};
-use crate::experts::{
-    Gathered, HostPlane, HostTier, Layout, Mapping, Plan, Pump, Tier, identity_runs,
-};
+use crate::experts::{Gathered, HostPlane, HostTier, Layout, Mapping, Plan, Tier, identity_runs};
 use crate::run::{WeightRow, WeightTable};
 use crate::weight_store::Store;
 
@@ -94,8 +92,6 @@ pub struct Weights {
 
     layout: Layout,
 
-    pump: Option<Pump>,
-
     rows: Option<Gathered>,
     table: WeightTable,
 
@@ -117,7 +113,6 @@ impl Weights {
         contract: &ModelContract,
         path: &Path,
         device_cap: u64,
-        residency: Residency,
         max_tokens: u32,
         streamed: &[usize],
     ) -> Result<Weights> {
@@ -156,25 +151,8 @@ impl Weights {
         }
         let plan = Plan::of(trace)?;
 
-        let pinned: Vec<bool> = trace
-            .params
-            .iter()
-            .map(|param| param.source != ParamSource::Checkpoint)
-            .collect();
-        let layout = plan.tiers(&reserved, &planes, &pinned, streamed, device_cap, residency)?;
-        if layout.tiers.spilled > 0 {
-            tracing::warn!(
-                spilled_mib = layout.tiers.spilled >> 20,
-                device_mib = layout.tiers.device >> 20,
-                device_cap_mib = device_cap >> 20,
-                "dense weight planes do not fit the device budget and will rotate through \
-                 a host-tier ring on every step; expect decode to run at bus speed. The \
-                 budget is what `[model] device_memory_share` of the device's memory \
-                 leaves once the working set and one sequence's kv pages and state slots \
-                 are down — raise the share or shorten `max_model_len` to keep the \
-                 weights resident"
-            );
-        } else if layout.tiers.host > 0 {
+        let layout = plan.tiers(&reserved, &planes, streamed, device_cap)?;
+        if layout.tiers.host > 0 {
             tracing::info!(
                 host_mib = layout.tiers.host >> 20,
                 device_mib = layout.tiers.device >> 20,
@@ -282,8 +260,6 @@ impl Weights {
             }));
         }
 
-        let pump = Pump::reserve(device, handles, layout.slot, layout.ring)?;
-
         let mut gathered_widest = [0u64; 3];
         for at in plan.gathered() {
             if places[at].tier != Tier::Host {
@@ -302,8 +278,7 @@ impl Weights {
                 None => {
                     return Err(Fault::Residency(format!(
                         "`{}` is a dense gathered table on the host tier, and only a \
-                         quantized one seats: import it quantized, or raise the device \
-                         weight budget so it stays resident",
+                         quantized one seats: import it quantized",
                         trace.params[at].name
                     )));
                 }
@@ -320,7 +295,6 @@ impl Weights {
             host,
             layout,
             rows,
-            pump,
             table: WeightTable(weight_table),
             banks: banks(trace, &places),
             decoded: Vec::new(),
@@ -331,11 +305,6 @@ impl Weights {
     #[must_use]
     pub fn gathered(&self) -> Option<&Gathered> {
         self.rows.as_ref()
-    }
-
-    #[must_use]
-    pub fn pump(&self) -> Option<&Pump> {
-        self.pump.as_ref()
     }
 
     #[must_use]
@@ -532,7 +501,6 @@ impl Weights {
     pub fn bytes(&self) -> u64 {
         self.store.bytes()
             + self.decoded.iter().map(Buffer::bytes).sum::<u64>()
-            + self.pump.as_ref().map_or(0, Pump::device_bytes)
             + self.rows.as_ref().map_or(0, Gathered::device_bytes)
     }
 
@@ -573,9 +541,9 @@ impl Weights {
 
     #[must_use]
     /// Whether this load streams weights by a tier of its own: planes on
-    /// the host besides the weight cache's, or spilled.
+    /// the host besides the weight cache's.
     pub fn streams(&self) -> bool {
-        self.layout.tiers.spilled > 0 || self.layout.tiers.host > self.cached_bytes
+        self.layout.tiers.host > self.cached_bytes
     }
 }
 

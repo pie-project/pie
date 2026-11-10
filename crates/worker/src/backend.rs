@@ -139,7 +139,6 @@ fn metal_geometry_is_stated(opts: &MetalEngineOptions) -> Result<()> {
         ("max_forward_requests", opts.max_forward_requests),
         ("kv_page_size", opts.kv_page_size),
         ("max_model_len", opts.max_model_len),
-        ("max_state_slots", opts.max_state_slots),
     ] {
         if value == Some(0) {
             anyhow::bail!("[engine] {key} must be > 0 when stated");
@@ -175,9 +174,9 @@ fn cuda_budgets(
         page_size,
         max_context,
         context_declared,
-        // Unstated, 0: the engine sizes the slab from its chip's profile
+        // The engine sizes the slab from its chip's profile
         // (`engine.state_slots_per_lane`), 256 where the profile says nothing.
-        slots: opts.max_state_slots.map_or(0, |slots| slots.max(1)),
+        slots: 0,
         max_patches: patch_ceilings.0,
         max_images: patch_ceilings.1,
         max_voxels: voxel_ceilings.0,
@@ -628,7 +627,7 @@ pub(crate) fn create_engine_backend(
                     page_size,
                     max_context,
                     context_declared: false,
-                    slots: opts.max_state_slots.map_or(0, |slots| slots.max(1)),
+                    slots: 0,
                     max_patches: patch_ceilings.0,
                     max_images: patch_ceilings.1,
                     max_voxels: voxel_ceilings.0,
@@ -671,7 +670,7 @@ pub(crate) fn create_engine_backend(
                     page_size: defaults.page_size,
                     max_context: opts.max_model_len.unwrap_or(defaults.max_context),
                     context_declared: false,
-                    slots: opts.max_state_slots.map_or(0, |slots| slots.max(1)),
+                    slots: 0,
                     max_patches: patch_ceilings.0,
                     max_images: patch_ceilings.1,
                     max_voxels: voxel_ceilings.0,
@@ -723,7 +722,7 @@ pub(crate) fn create_engine_backend(
                     page_size: defaults.page_size,
                     max_context: opts.max_model_len.unwrap_or(defaults.max_context),
                     context_declared: false,
-                    slots: opts.max_state_slots.map_or(0, |slots| slots.max(1)),
+                    slots: 0,
                     max_patches: patch_ceilings.0,
                     max_images: patch_ceilings.1,
                     max_voxels: voxel_ceilings.0,
@@ -773,7 +772,7 @@ pub(crate) fn create_engine_backend(
                         .unwrap_or(defaults.max_context)
                         .max(defaults.page_size),
                     context_declared: false,
-                    slots: opts.max_state_slots.map_or(0, |slots| slots.max(1)),
+                    slots: 0,
                     max_patches: patch_ceilings.0,
                     max_images: patch_ceilings.1,
                     max_voxels: voxel_ceilings.0,
@@ -874,7 +873,7 @@ pub(crate) fn create_engine_backend(
                         .unwrap_or(defaults.max_context)
                         .max(defaults.page_size),
                     context_declared: false,
-                    slots: opts.max_state_slots.map_or(0, |slots| slots.max(1)),
+                    slots: 0,
                     max_patches: patch_ceilings.0,
                     max_images: patch_ceilings.1,
                     max_voxels: voxel_ceilings.0,
@@ -941,29 +940,14 @@ mod tests {
     }
 
     fn the_pool_budget_seats_by_state_slots_not_pages() {
-        let mut opts = CudaEngineOptions {
+        let opts = CudaEngineOptions {
             kv_page_size: Some(16),
             ..Default::default()
         };
         let budgets = cuda_budgets(&opts, 0, (None, None), (None, None), None);
         assert_eq!(budgets.page_size, 16);
         assert_eq!(budgets.max_context, 4096);
-        assert_eq!(
-            budgets.slots, 0,
-            "unstated, the engine's chip sizes the slab"
-        );
-
-        opts.max_state_slots = Some(4);
-        assert_eq!(
-            cuda_budgets(&opts, 0, (None, None), (None, None), None).slots,
-            4
-        );
-
-        opts.max_state_slots = Some(0);
-        assert_eq!(
-            cuda_budgets(&opts, 0, (None, None), (None, None), None).slots,
-            1
-        );
+        assert_eq!(budgets.slots, 0, "the engine's chip sizes the slab");
     }
 
     fn an_engine_takes_an_artifact_or_a_snapshot_and_nothing_else() {

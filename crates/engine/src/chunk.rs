@@ -890,8 +890,8 @@ impl std::fmt::Display for FitShort {
             f,
             "the device has {} MiB for the state pool under `[model] device_memory_share`, and \
              one working set at the declared context beside the largest fire's activation takes \
-             {} MiB; raise the share, state a smaller `device_weight_budget`, or a shorter \
-             `max_model_len`",
+             {} MiB; raise the share, state a shorter `max_model_len`, or serve a quantized \
+             deployment of the model",
             self.room >> 20,
             self.least >> 20,
         )
