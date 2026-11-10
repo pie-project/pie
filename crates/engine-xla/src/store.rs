@@ -104,6 +104,14 @@ pub enum CachePool {
 #[derive(Clone, Debug, Default)]
 pub struct CacheTable(pub Vec<CachePool>, pub Vec<Option<usize>>);
 
+/// Slot refs of a lane the shell fires for itself ([`Pools::scratch`]).
+#[derive(Debug, Clone, Default)]
+pub struct Scratch {
+    pub pages: Vec<u32>,
+    pub window: Vec<u32>,
+    pub fixed: Vec<(ShapeId, Vec<[u32; 2]>)>,
+}
+
 /// Where one cache row lives.
 #[derive(Debug, Clone, Copy)]
 enum Seat {
@@ -332,7 +340,7 @@ fn layout_rows<'a>(
     });
     Ok((
         layout::Rows {
-            trace,
+            trace: Some(trace),
             page: paging.page_size,
             window: paging.window.map(|w| w.tokens),
             kv,
@@ -388,6 +396,10 @@ impl Pools {
             rows: pool_rows,
             width: 128,
         });
+        // A handle a plane: one pool backs them all, so a lowering lands
+        // one plane an emit (`crate::lower::lower_planes`), and the tracer
+        // refuses a plane landed off a pool another plane's write has since
+        // replaced.
         let mut views: Vec<(What, Tensor, Map)> = Vec::new();
         for shape in &layout.shapes {
             for plane in &shape.planes {
@@ -620,6 +632,44 @@ impl Pools {
         self.layout
             .shape(id)
             .map_or(0, |shape| narrow(self.layout.grain_of(shape, SINK_CHUNK, 0)))
+    }
+
+    /// Slot refs for a lane the shell fires for itself (the warm ladder, a
+    /// dry walk): `pages` of the kv list and of the window list, and a
+    /// record, laid from the first chunk past the reserved ones on and
+    /// wrapping over the pool. What such fires write is never read.
+    #[must_use]
+    pub fn scratch(&self, lane: u32, pages: usize) -> Scratch {
+        let room = u64::from(self.chunks.saturating_sub(RESERVED_CHUNKS).max(1));
+        let refs = |shape: &layout::Shape, n: usize, from: u64| -> Vec<u32> {
+            let spc = u64::from(self.layout.slots_per_chunk(shape).max(1));
+            (0..n as u64)
+                .map(|i| {
+                    let at = (from + i) % (room * spc);
+                    narrow((u64::from(RESERVED_CHUNKS) + at / spc) * spc + at % spc)
+                })
+                .collect()
+        };
+        let from = u64::from(lane) * pages as u64;
+        Scratch {
+            pages: self
+                .layout
+                .kv()
+                .map_or_else(Vec::new, |s| refs(s, pages, from)),
+            window: self
+                .layout
+                .window()
+                .map_or_else(Vec::new, |s| refs(s, pages, from)),
+            fixed: self
+                .layout
+                .fixed()
+                .map(|s| {
+                    let pieces = s.pieces() as usize;
+                    let r = refs(s, pieces, u64::from(lane) * pieces as u64);
+                    (s.id, r.into_iter().map(|r| [r, r]).collect())
+                })
+                .collect(),
+        }
     }
 
     /// The kv list's shape, the window list's, the rs list's.
@@ -872,11 +922,11 @@ impl Pools {
         let spans: Vec<(u64, i64, i64)> = evacuation
             .moves
             .iter()
-            .map(|m| {
+            .map(|&(from, to)| {
                 (
                     rows,
-                    i64::from(m.from) * rows as i64,
-                    i64::from(m.to) * rows as i64,
+                    i64::from(from) * rows as i64,
+                    i64::from(to) * rows as i64,
                 )
             })
             .collect();

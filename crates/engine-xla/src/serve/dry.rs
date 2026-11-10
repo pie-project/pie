@@ -53,8 +53,7 @@ pub fn landing(facts: &Facts, classes: &poem_ir::ClassTable) -> Vec<Vec<Request>
 struct Owned {
     word: u64,
     tokens: Vec<u32>,
-    pages: Vec<u32>,
-    window: Vec<u32>,
+    scratch: crate::store::Scratch,
     mask: Option<Masking>,
     adapter: Option<u32>,
     inputs: Vec<(u32, Vec<u8>)>,
@@ -174,8 +173,9 @@ impl Shell {
                 word: lane_owned.word,
                 tokens: &lane_owned.tokens,
             });
-            seated.pages = &lane_owned.pages;
-            seated.window = &lane_owned.window;
+            seated.pages = &lane_owned.scratch.pages;
+            seated.window = &lane_owned.scratch.window;
+            seated.fixed = &lane_owned.scratch.fixed;
             seated.held = Some(0);
             seated.mask = lane_owned.mask.as_ref();
             seated.adapter = lane_owned.adapter;
@@ -237,16 +237,7 @@ impl Shell {
         };
         let page_size = self.paging().page_size.max(1);
         let per = rows.div_ceil(page_size).max(1);
-        let pages: Vec<u32> = (lane * per..(lane + 1) * per).collect();
-        let windowed = self.paging().window_pages().saturating_sub(1).max(1);
-        let window = if self.pools.has_windowed() {
-            pages
-                .iter()
-                .map(|&page| 1 + u32::try_from(u64::from(page) % windowed).unwrap_or(0))
-                .collect()
-        } else {
-            Vec::new()
-        };
+        let scratch = self.pools.scratch(lane, per as usize);
         let inputs = dit
             .dry_inputs(class)
             .into_iter()
@@ -263,8 +254,7 @@ impl Shell {
         Ok(Owned {
             word,
             tokens: vec![0; rows as usize],
-            pages,
-            window,
+            scratch,
             // The shell checks each against the arms the class runs.
             mask: self
                 .masked

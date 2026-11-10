@@ -244,6 +244,10 @@ struct State {
     sums: BTreeMap<u32, Val>,
     /// The pool value each pool handle was last read from or written as.
     view_reads: BTreeMap<u32, Val>,
+    /// Each pool value read at another element and width, once: two planes
+    /// of one view read the same value, so a kernel that scatters into both
+    /// chains the second onto the first.
+    views: Vec<((Val, Dtype, u32), Val)>,
 }
 
 impl<'h> Tracer<'h> {
@@ -260,6 +264,7 @@ impl<'h> Tracer<'h> {
                 written: BTreeMap::new(),
                 sums: BTreeMap::new(),
                 view_reads: BTreeMap::new(),
+                views: Vec::new(),
             }),
         }
     }
@@ -432,6 +437,7 @@ struct Lens<'a> {
     written: &'a mut BTreeMap<u32, ()>,
     sums: &'a mut BTreeMap<u32, Val>,
     view_reads: &'a mut BTreeMap<u32, Val>,
+    views: &'a mut Vec<((Val, Dtype, u32), Val)>,
 }
 
 impl Lens<'_> {
@@ -464,7 +470,17 @@ impl Env for Lens<'_> {
             self.view_reads.insert(t.buf, whole);
         }
         let rows = view_rows(r, t)?;
-        let whole = reinterpret(f, whole, r, t)?;
+        let key = (whole, t.dtype, t.width);
+        let whole = match self.views.iter().find(|(held, _)| *held == key) {
+            Some(&(_, v)) if r.source.persistent() => v,
+            _ => {
+                let v = reinterpret(f, whole, r, t)?;
+                if r.source.persistent() && (t.width != r.width || t.dtype != r.dtype) {
+                    self.views.push((key, v));
+                }
+                v
+            }
+        };
         if offset == 0 && t.rows == rows {
             return Ok(whole);
         }
@@ -657,6 +673,7 @@ impl Emit for Tracer<'_> {
             pack_len,
             sums,
             view_reads,
+            views,
         } = &mut *state;
         let mut lens = Lens {
             handles: self.handles,
@@ -666,8 +683,69 @@ impl Emit for Tracer<'_> {
             written,
             sums,
             view_reads,
+            views,
         };
         let mut cx = Cx::new(func, &mut lens).with_tuning(self.tuning);
         body(&mut cx)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn pool(handles: &Handles) -> Tensor {
+        handles.root(Root {
+            source: Source::Pool { row: 0, plane: 0 },
+            dtype: Dtype::U32,
+            rows: 64,
+            width: 128,
+        })
+    }
+
+    #[test]
+    fn a_plane_reads_the_pool_as_its_own_rows_and_lands_back_whole() {
+        let handles = Handles::new();
+        let root = pool(&handles);
+        let keys = handles.view(root, Dtype::Bf16, 256).expect("a view");
+        assert_eq!(keys.rows, 64 * 128 * 4 / (256 * 2));
+        let tracer = Tracer::new(&handles);
+        tracer
+            .emit(&mut |cx| {
+                let v = cx.read(keys)?;
+                assert_eq!(cx.dims(v), &[64, 256]);
+                cx.write(keys, v)
+            })
+            .expect("a whole view lands");
+        let (text, sig) = tracer.finish(&[]);
+        assert_eq!(sig.results.len(), 1, "the pool is the one result");
+        assert!(text.contains("bitcast_convert"), "{text}");
+    }
+
+    #[test]
+    fn a_plane_landed_off_a_pool_another_plane_replaced_is_refused() {
+        let handles = Handles::new();
+        let root = pool(&handles);
+        let keys = handles.view(root, Dtype::Bf16, 256).expect("a view");
+        let values = handles.view(root, Dtype::Bf16, 256).expect("a view");
+        let tracer = Tracer::new(&handles);
+        let refused = tracer.emit(&mut |cx| {
+            let k = cx.read(keys)?;
+            let v = cx.read(values)?;
+            assert_eq!(k, v, "one view of one pool value is read once");
+            cx.write(keys, k)?;
+            cx.write(values, v)
+        });
+        assert!(refused.is_err(), "the second plane's stale value lands nowhere");
+        // Read after the first write, it lands.
+        let tracer = Tracer::new(&handles);
+        tracer
+            .emit(&mut |cx| {
+                let k = cx.read(keys)?;
+                cx.write(keys, k)?;
+                let v = cx.read(values)?;
+                cx.write(values, v)
+            })
+            .expect("a plane read after the other's write lands");
     }
 }

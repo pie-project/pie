@@ -1255,7 +1255,7 @@ impl Run<'_> {
                 // The pool append that files these entries bounds its rows
                 // by the ratio they closed at.
                 self.boundaries.push((*boundary_pos, *ratio));
-                let Some([state_kv, state_score]) = self.pool_state(*pages) else {
+                let Some(([state_kv, state_score], state_maps)) = self.pool_state(*pages) else {
                     return Err(kernels_xla::Error::Unsupported {
                         op: "attn.pool_gather",
                     });
@@ -1283,7 +1283,7 @@ impl Run<'_> {
                 head_dim,
                 ratio,
             } => {
-                let Some([state_kv, state_score]) = self.pool_state(*pages) else {
+                let Some(([state_kv, state_score], state_maps)) = self.pool_state(*pages) else {
                     return Err(kernels_xla::Error::Unsupported {
                         op: "attn.pool_state_write",
                     });

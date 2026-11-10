@@ -1373,7 +1373,7 @@ impl Shell {
         let mut cache_rows: Vec<i32> = Vec::with_capacity(rows as usize);
         // Per lane its index, and per record piece each lane's and each
         // row's slot (grain index).
-        let mut slot_ids: Vec<i32> = Vec::with_capacity(submitted.len());
+        let mut lane_at: Vec<i32> = Vec::with_capacity(submitted.len());
         let mut record_ids: Vec<Vec<i32>> = vec![Vec::with_capacity(submitted.len()); records.len()];
         let mut request_of_token: Vec<i32> = Vec::with_capacity(rows as usize);
         let mut record_rows: Vec<Vec<i32>> = vec![Vec::with_capacity(rows as usize); records.len()];
@@ -1385,7 +1385,7 @@ impl Shell {
 
         for row in composition.lanes() {
             let source = row.source as usize;
-            let at_lane = slot_ids.len() as i32;
+            let at_lane = lane_at.len() as i32;
             if source >= real {
                 // A padding lane: the sink page and the sink slot, nothing else.
                 let pages = u64::from(row.rows)
@@ -1406,7 +1406,7 @@ impl Shell {
                     rows: row.rows,
                     wide: false,
                 });
-                slot_ids.push(at_lane);
+                lane_at.push(at_lane);
                 let read_only = !(row.rows == 1
                     && real > 0
                     && lanes.iter().all(|s| s.lane.tokens.len() == 1));
@@ -1446,12 +1446,6 @@ impl Shell {
                         have: self.held.len() as u64,
                     })?,
             };
-            let fresh = match seated.rs_reset {
-                engine::fire::RsReset::Inferred => have == 0,
-                engine::fire::RsReset::Fresh => true,
-                engine::fire::RsReset::Held => false,
-            };
-            let _ = fresh;
             let seat = Seat {
                 slot: lane.slot,
                 have,
@@ -1543,7 +1537,7 @@ impl Shell {
                 rs_plan.gathers = trimmed;
             }
             rs_plans.push(rs_plan);
-            slot_ids.push(at_lane);
+            lane_at.push(at_lane);
             for (r, &slot) in lane_records[source].iter().enumerate() {
                 record_ids[r].push(slot as i32);
                 record_rows[r].extend(std::iter::repeat_n(slot as i32, row.rows as usize));
@@ -1565,7 +1559,6 @@ impl Shell {
                 request_of_token.push(at_lane);
             }
         }
-        let _ = slot_ids;
 
         let indptr_host = kv::indptr(&seats)?;
         let table_refs: Vec<&[u32]> = tables.iter().map(Vec::as_slice).collect();

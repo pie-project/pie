@@ -179,7 +179,7 @@ pub fn kv_append(
     write_offset: Tensor,
 ) -> Result<Option<Appended>, Error> {
     let mut read = None;
-    lower(ctx, |l| {
+    crate::lower::lower_planes(ctx, &[pool.keys, pool.values], |l| {
         let wp = l.read(write_page)?;
         let wo = l.read(write_offset)?;
         let kv = l.read(k)?;
@@ -187,13 +187,12 @@ pub fn kv_append(
         let vv = l.read(v)?;
         let values = l.read(pool.values)?;
         // A prompt-tall fire's rows, which its prefill may read fresh.
-        if Appended::worth(kv) {
+        if read.is_none() && Appended::worth(kv) {
             read = Some(Appended::of(l.f(), kv, vv, wp, wo)?);
         }
         let tuning = l.tuning();
         let (keys, values) = paged::kv_append(l.f(), kv, vv, keys, values, pool, wp, wo, tuning)?;
-        l.land(pool.keys, keys)?;
-        l.land(pool.values, values)
+        Ok(vec![Some(keys), Some(values)])
     })?;
     Ok(read)
 }
@@ -507,7 +506,7 @@ pub mod mla {
         write_page: Tensor,
         write_offset: Tensor,
     ) -> Result<(), Error> {
-        lower(ctx, |l| {
+        crate::lower::lower_planes(ctx, &[pool.keys, pool.values], |l| {
             let wp = l.read(write_page)?;
             let wo = l.read(write_offset)?;
             let c = l.read(kv_c)?;
@@ -518,11 +517,7 @@ pub mod mla {
                 Some((l.read(k_pe)?, l.read(pool.values)?))
             };
             let (keys, pe) = mla::kv_append(l.f(), c, keys, rope, pool, wp, wo)?;
-            l.land(pool.keys, keys)?;
-            match pe {
-                Some(pe) => l.land(pool.values, pe),
-                None => Ok(()),
-            }
+            Ok(vec![Some(keys), pe])
         })
     }
 }
@@ -847,7 +842,7 @@ pub mod pool {
         state_kv: Tensor,
         state_score: Tensor,
     ) -> Result<(), Error> {
-        lower(ctx, |l| {
+        crate::lower::lower_planes(ctx, &[state_kv, state_score], |l| {
             let wp = l.read(write_page)?;
             let wo = l.read(write_offset)?;
             let k = l.read(kv)?;
@@ -855,8 +850,7 @@ pub mod pool {
             let sk = l.read(state_kv)?;
             let ss = l.read(state_score)?;
             let (kv, sc) = pool::state_write(l.f(), k, s, pages, wp, wo, head_dim, ratio, sk, ss)?;
-            l.land(state_kv, kv)?;
-            l.land(state_score, sc)
+            Ok(vec![Some(kv), Some(sc)])
         })
     }
 

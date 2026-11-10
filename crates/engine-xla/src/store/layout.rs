@@ -158,15 +158,19 @@ fn narrow(n: u64) -> u32 {
     u32::try_from(n).unwrap_or(u32::MAX)
 }
 
+/// A kv row's `(keys width, values width (None where shared), dtype,
+/// windowed)`.
+pub type KvRow = (u32, Option<u32>, Dtype, bool);
+
 /// What the layout is built from: the trace's rows as the store reads them.
 pub struct Rows<'a> {
-    pub trace: &'a Trace,
+    pub trace: Option<&'a Trace>,
     /// The kv page: the tokens of a kv, window and rs list slot.
     pub page: u32,
     /// The window the window list retains, when windowed rows live apart.
     pub window: Option<u32>,
-    /// Each kv row's `(keys, values)` widths, values `None` where shared.
-    pub kv: Vec<Option<(u32, Option<u32>, Dtype, bool)>>,
+    /// Each kv row's planes.
+    pub kv: Vec<Option<KvRow>>,
     /// Each state row's `(per, width, dtype)` block.
     pub state: Vec<Option<(u32, u32, Dtype)>>,
     /// Each compressor's `(cache row, width)`, bf16 `[kv, score]`.
@@ -348,12 +352,12 @@ impl Layout {
     /// The invariants the views' block addressing stands on.
     fn check(&self) -> Result<()> {
         let c = self.chunk_bytes;
-        if c % TILE_BYTES != 0 {
+        if !c.is_multiple_of(TILE_BYTES) {
             return Err(bad(format!("chunk of {c} bytes is no whole tiles")));
         }
         for shape in &self.shapes {
             let s = shape.slot_bytes;
-            if s == 0 || s > c || s % ROW_BYTES != 0 {
+            if s == 0 || s > c || !s.is_multiple_of(ROW_BYTES) {
                 return Err(bad(format!(
                     "shape {} slot of {s} bytes in a {c}-byte chunk",
                     shape.id
@@ -362,9 +366,9 @@ impl Layout {
             for plane in &shape.planes {
                 let r = plane.run;
                 if r == 0
-                    || c % r != 0
-                    || s % r != 0
-                    || plane.offset % r != 0
+                    || !c.is_multiple_of(r)
+                    || !s.is_multiple_of(r)
+                    || !plane.offset.is_multiple_of(r)
                     || plane.offset + r > s
                 {
                     return Err(bad(format!(
@@ -381,11 +385,6 @@ impl Layout {
     #[must_use]
     pub fn shape(&self, id: ShapeId) -> Option<&Shape> {
         self.shapes.iter().find(|s| s.id == id)
-    }
-
-    #[must_use]
-    pub fn of_kind(&self, want: fn(Kind) -> bool) -> impl Iterator<Item = &Shape> {
-        self.shapes.iter().filter(move |s| want(s.kind))
     }
 
     #[must_use]
@@ -475,15 +474,15 @@ fn bad(why: String) -> Fault {
     }
 }
 
-fn cache_name(trace: &Trace, row: usize) -> &str {
-    match trace.caches.get(row) {
+fn cache_name(trace: Option<&Trace>, row: usize) -> &str {
+    match trace.and_then(|t| t.caches.get(row)) {
         Some(CacheRow::Kv { name, .. } | CacheRow::State { name, .. }) => name,
         None => "?",
     }
 }
 
 /// A list shape over `rows`, `tokens` a slot.
-fn list(id: ShapeId, kind: Kind, tokens: u32, rows: &[ListRow], trace: &Trace) -> Result<Shape> {
+fn list(id: ShapeId, kind: Kind, tokens: u32, rows: &[ListRow], trace: Option<&Trace>) -> Result<Shape> {
     let mut planes = Vec::new();
     let mut cache = Vec::new();
     for row in rows {
@@ -539,9 +538,9 @@ mod tests {
 
     #[test]
     fn every_run_lands_on_a_block_of_its_view_in_any_slot() {
-        let trace = Trace::default();
+
         let rows = Rows {
-            trace: &trace,
+            trace: None,
             page: 16,
             window: Some(64),
             kv: vec![
@@ -605,9 +604,9 @@ mod tests {
 
     #[test]
     fn a_record_larger_than_a_chunk_is_cut_between_blocks() {
-        let trace = Trace::default();
+
         let rows = Rows {
-            trace: &trace,
+            trace: None,
             page: 16,
             window: None,
             kv: Vec::new(),

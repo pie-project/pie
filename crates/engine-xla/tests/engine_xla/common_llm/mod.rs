@@ -197,35 +197,179 @@ pub fn bits(values: &[f32]) -> Vec<u32> {
     values.iter().map(|v| v.to_bits()).collect()
 }
 
-/// One sequence the gates drive: the slot the runtime seats it at and how
-/// many rows it holds.
-#[derive(Clone, Copy, Debug)]
+/// The runtime's part in a pool this load states shared (`ChunkFacts`
+/// shapes unpinned): chunks handed to shapes as they fill, slots taken from
+/// the top of each chunk down, so no slot sits where an identity map would
+/// put it.
+#[derive(Debug, Default)]
+pub struct Refs {
+    pub facts: Option<engine::chunk::ChunkFacts>,
+    next_chunk: u32,
+    open: std::collections::BTreeMap<u32, (u32, u32)>,
+}
+
+impl Refs {
+    pub fn of(model: &Model) -> Refs {
+        Refs::of_facts(model.loaded.caps.chunks.clone())
+    }
+
+    pub fn of_facts(facts: Option<engine::chunk::ChunkFacts>) -> Refs {
+        let facts = facts.filter(|facts| {
+            !facts.shapes.is_empty() && facts.shapes.iter().all(|s| s.pinned.is_none())
+        });
+        let next_chunk = facts.as_ref().map_or(0, |f| {
+            f.reserved
+                .iter()
+                .map(|r| r.first + r.chunks)
+                .max()
+                .unwrap_or(1)
+        });
+        Refs {
+            facts,
+            next_chunk,
+            open: Default::default(),
+        }
+    }
+
+    pub fn shared(&self) -> bool {
+        self.facts.is_some()
+    }
+
+    /// A fresh slot ref of shape `id`.
+    pub fn take(&mut self, id: engine::chunk::ShapeId) -> u32 {
+        let facts = self.facts.as_ref().expect("a shared pool");
+        let spc = facts.shape(id).expect("a stated shape").slots_per_chunk;
+        let (chunk, used) = match self.open.get(&id.0) {
+            Some(&(chunk, used)) if used < spc => (chunk, used),
+            _ => {
+                let chunk = self.next_chunk;
+                self.next_chunk += 1;
+                assert!(chunk < facts.total_chunks, "the pool ran out of chunks");
+                (chunk, 0)
+            }
+        };
+        self.open.insert(id.0, (chunk, used + 1));
+        chunk * spc + (spc - 1 - used)
+    }
+
+    pub fn shapes(
+        &self,
+        want: impl Fn(&engine::chunk::SlotShape) -> bool,
+    ) -> Vec<engine::chunk::SlotShape> {
+        self.facts.as_ref().map_or_else(Vec::new, |f| {
+            f.shapes.iter().filter(|s| want(s)).cloned().collect()
+        })
+    }
+}
+
+/// One sequence the gates drive: the slot the runtime seats it at, how
+/// many rows it holds and, in a shared pool, its slot refs.
+#[derive(Clone, Debug, Default)]
 pub struct Seq {
     pub slot: u32,
     pub held: u32,
+    kv: Vec<u32>,
+    window: Vec<u32>,
+    record: Vec<(engine::chunk::ShapeId, Vec<[u32; 2]>)>,
 }
 
 impl Seq {
-    pub fn lane(&self, model: &Model, tokens: Vec<u32>) -> Lane {
+    pub fn new(slot: u32) -> Seq {
+        Seq {
+            slot,
+            ..Seq::default()
+        }
+    }
+
+    pub fn lane(&mut self, model: &Model, refs: &mut Refs, tokens: Vec<u32>) -> Lane {
+        let word = model.word(tokens.len() as u32);
+        self.lane_of(model.context, word, refs, tokens)
+    }
+
+    /// The lane as the runtime fires it: legacy page ids in a degenerate
+    /// pool, slot refs (`tables`, `fixed`) in a shared one.
+    pub fn lane_of(&mut self, context: u32, word: u64, refs: &mut Refs, tokens: Vec<u32>) -> Lane {
+        use engine::chunk::{SlotKind, SlotRole};
         let rows = tokens.len() as u32;
         let after = self.held + rows;
-        let pages: Vec<u32> = (0..after.div_ceil(PAGE))
-            .map(|p| self.slot * (model.context / PAGE) + p)
-            .collect();
-        Lane {
+        let need = after.div_ceil(PAGE) as usize;
+        let mut lane = Lane {
             slot: self.slot,
-            word: model.word(rows),
+            word,
             tokens,
-            kv: engine::fire::KvDelta {
-                held: self.held,
-                pages,
-                translation: Vec::new(),
-                window: Vec::new(),
-            },
             readout: Readout::Last,
             rs_slot: Some(self.slot),
             ..Lane::default()
+        };
+        if !refs.shared() {
+            lane.kv = engine::fire::KvDelta {
+                held: self.held,
+                pages: (0..need as u32)
+                    .map(|p| self.slot * (context / PAGE) + p)
+                    .collect(),
+                translation: Vec::new(),
+                window: Vec::new(),
+            };
+            return lane;
         }
+        for list in refs.shapes(|s| {
+            matches!(s.kind, SlotKind::List { window: None, .. }) && s.role == SlotRole::State
+        }) {
+            while self.kv.len() < need {
+                let r = refs.take(list.id);
+                self.kv.push(r);
+            }
+            lane.tables.push((list.id, self.kv[..need].to_vec()));
+        }
+        for list in refs.shapes(|s| matches!(s.kind, SlotKind::List { window: Some(_), .. })) {
+            let SlotKind::List {
+                tokens,
+                window: Some(w),
+                ..
+            } = list.kind
+            else {
+                unreachable!()
+            };
+            let need = after.div_ceil(tokens) as usize;
+            while self.window.len() < need {
+                let r = refs.take(list.id);
+                self.window.push(r);
+            }
+            // Trimmed behind the window of the rows committed so far.
+            let table: Vec<u32> = (0..need)
+                .map(|i| {
+                    let last = (i as u32 + 1) * tokens - 1;
+                    if last + w < self.held {
+                        0
+                    } else {
+                        self.window[i]
+                    }
+                })
+                .collect();
+            lane.tables.push((list.id, table));
+        }
+        if self.record.is_empty() {
+            for fixed in refs.shapes(|s| matches!(s.kind, SlotKind::Fixed { .. })) {
+                let SlotKind::Fixed { pieces } = fixed.kind else {
+                    unreachable!()
+                };
+                let pairs = (0..pieces)
+                    .map(|_| {
+                        let r = refs.take(fixed.id);
+                        [r, r]
+                    })
+                    .collect();
+                self.record.push((fixed.id, pairs));
+            }
+        }
+        lane.fixed = self.record.clone();
+        lane.kv = engine::fire::KvDelta {
+            held: self.held,
+            pages: self.kv[..need.min(self.kv.len())].to_vec(),
+            translation: Vec::new(),
+            window: Vec::new(),
+        };
+        lane
     }
 }
 
@@ -235,47 +379,48 @@ impl Seq {
 pub fn scenario(model: &mut Model, long: Option<u32>) -> Vec<Vec<u32>> {
     let vocab = model.vocab;
     let mut out = Vec::new();
-    let mut a = Seq { slot: 0, held: 0 };
-    let mut b = Seq { slot: 1, held: 0 };
-    let mut c = Seq { slot: 2, held: 0 };
-    let lane = a.lane(model, tokens(1, 37, vocab));
+    let mut refs = Refs::of(model);
+    let mut a = Seq::new(0);
+    let mut b = Seq::new(1);
+    let mut c = Seq::new(2);
+    let lane = a.lane(model, &mut refs, tokens(1, 37, vocab));
     out.extend(model.fire(vec![lane]).iter().map(|v| bits(v)));
     a.held += 37;
-    let lane = b.lane(model, tokens(2, 20, vocab));
+    let lane = b.lane(model, &mut refs, tokens(2, 20, vocab));
     out.extend(model.fire(vec![lane]).iter().map(|v| bits(v)));
     b.held += 20;
     for step in 0..4u64 {
-        let la = a.lane(model, tokens(10 + step, 1, vocab));
-        let lb = b.lane(model, tokens(20 + step, 1, vocab));
+        let la = a.lane(model, &mut refs, tokens(10 + step, 1, vocab));
+        let lb = b.lane(model, &mut refs, tokens(20 + step, 1, vocab));
         out.extend(model.fire(vec![la, lb]).iter().map(|v| bits(v)));
         a.held += 1;
         b.held += 1;
     }
-    let la = a.lane(model, tokens(30, 1, vocab));
-    let lc = c.lane(model, tokens(3, 50, vocab));
+    let la = a.lane(model, &mut refs, tokens(30, 1, vocab));
+    let lc = c.lane(model, &mut refs, tokens(3, 50, vocab));
     out.extend(model.fire(vec![la, lc]).iter().map(|v| bits(v)));
     a.held += 1;
     c.held += 50;
     for step in 0..2u64 {
-        let la = a.lane(model, tokens(40 + step, 1, vocab));
-        let lc = c.lane(model, tokens(50 + step, 1, vocab));
+        let la = a.lane(model, &mut refs, tokens(40 + step, 1, vocab));
+        let lc = c.lane(model, &mut refs, tokens(50 + step, 1, vocab));
         out.extend(model.fire(vec![la, lc]).iter().map(|v| bits(v)));
         a.held += 1;
         c.held += 1;
     }
     if let Some(n) = long {
-        let mut d = Seq { slot: 3, held: 0 };
+        let mut d = Seq::new(3);
         // Prompted in two fires, then decoded beside `a`.
         let first = n / 2;
-        let lane = d.lane(model, tokens(60, first as usize, vocab));
+        let lane = d.lane(model, &mut refs, tokens(60, first as usize, vocab));
         out.extend(model.fire(vec![lane]).iter().map(|v| bits(v)));
         d.held += first;
-        let lane = d.lane(model, tokens(61, (n - first) as usize, vocab));
+        let lane = d.lane(model, &mut refs, tokens(61, (n - first) as usize, vocab));
         out.extend(model.fire(vec![lane]).iter().map(|v| bits(v)));
         d.held += n - first;
         for step in 0..3u64 {
-            let la = a.lane(model, tokens(70 + step, 1, vocab));
-            let ld = d.lane(model, tokens(80 + step, 1, vocab));
+            let la = a.lane(model, &mut refs, tokens(70 + step, 1, vocab));
+            let ld = d.lane(model, &mut refs, tokens(80 + step, 1, vocab));
             out.extend(model.fire(vec![la, ld]).iter().map(|v| bits(v)));
             a.held += 1;
             d.held += 1;
