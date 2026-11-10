@@ -26,6 +26,15 @@ Branch today: 432 commits ahead of main, 782 files, +86k / -13k. Main merged in 
 - B4: DECIDED: one broad verification sweep per backend right before the PR (all goldens + catalog chunk tests + IT
   e2e scenarios) is allowed.
 
+## P. Performance gate (user: no regression vs main, any backend)
+Each backend shows decode (c1 / c8 / c64 / c256), prefill (512 / 2048) and boot vs main on a quiet device, in-process
+medians. Known gaps to close:
+- XLA/TPU v6e (M77): prefill 512 -19%, 2048 -12%; qwen35 c64 -13%; MoE c1 -9%, c256 -12%, prefill -10%.
+- ROCm synth: flip only at parity (in progress).
+- CUDA: gemma-4-E2B decode 123 vs 136 tok/s seen once (IT r9) -> re-measure; budgeted/streaming modes compared to
+  main's equivalent.
+- Vulkan/wgpu, Metal: full comparison vs main not yet run.
+
 ## C. PR mechanics
 - C1: Delete remaining degenerate-only scaffolding wherever every engine of that path states real facts (runtime
   keeps degenerate only for engines that still need it, e.g. Spatial).
