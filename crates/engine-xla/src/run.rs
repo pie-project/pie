@@ -162,7 +162,7 @@ pub struct Run<'c> {
 
     place: &'c At,
 
-    compressor: Vec<(u32, [Tensor; 2])>,
+    compressor: Vec<(u32, [Tensor; 2], [crate::store::Map; 2])>,
 
     rs: Option<std::rc::Rc<crate::rs::Seat>>,
 
@@ -346,7 +346,10 @@ impl<'c> Run<'c> {
 
     /// Hands the walk the compressor planes of each cache row that has them.
     #[must_use]
-    pub fn with_compressor(mut self, compressor: Vec<(u32, [Tensor; 2])>) -> Self {
+    pub fn with_compressor(
+        mut self,
+        compressor: Vec<(u32, [Tensor; 2], [crate::store::Map; 2])>,
+    ) -> Self {
         self.compressor = compressor;
         self
     }
@@ -790,14 +793,32 @@ impl<'c> Run<'c> {
 
     /// The compressor state planes `[kv, score]` of the cache row `pages`
     /// names.
-    pub(crate) fn pool_state(&self, pages: ValueId) -> Option<[Tensor; 2]> {
+    pub(crate) fn pool_state(
+        &self,
+        pages: ValueId,
+    ) -> Option<([Tensor; 2], [crate::store::Map; 2])> {
         let Def::Cache(row) = self.values[pages.0 as usize].def else {
             return None;
         };
         self.compressor
             .iter()
-            .find(|(held, _)| *held == row)
-            .map(|(_, p)| *p)
+            .find(|(held, ..)| *held == row)
+            .map(|(_, planes, maps)| (*planes, *maps))
+    }
+
+    /// The record piece (`store::Pools::records`) the state row `id` lies in.
+    pub(crate) fn record_of(&self, id: ValueId) -> usize {
+        let at = id.0 as usize;
+        match &self.values[at].def {
+            Def::Cache(c) => self
+                .caches
+                .1
+                .get(*c as usize)
+                .copied()
+                .flatten()
+                .unwrap_or_else(|| panic!("value {at} is cache row {c}, which lies in no record")),
+            _ => panic!("value {at} is not a cache row"),
+        }
     }
 
     pub(crate) fn put(&mut self, id: ValueId, built: StructSlot) {

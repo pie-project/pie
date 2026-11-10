@@ -53,15 +53,29 @@ fn shell(name: &str) -> Shell {
 
 fn fire(shell: &mut Shell, what: &str, lanes: &[(u32, &[u32], &[u32], u32)]) {
     let facts = shell.trace().facts.clone();
+    // Page `p` is the `p`th slot of the pool's scratch run; each seat its
+    // own record.
+    let all = shell.pools().scratch(0, 64).pages;
+    let owned: Vec<(Vec<u32>, engine_xla::store::Scratch)> = lanes
+        .iter()
+        .map(|&(slot, _, pages, _)| {
+            (
+                pages.iter().map(|&p| all[p as usize]).collect(),
+                shell.pools().scratch(slot, 1),
+            )
+        })
+        .collect();
     let seated: Vec<Seated> = lanes
         .iter()
-        .map(|&(slot, tokens, pages, held)| {
+        .zip(&owned)
+        .map(|(&(slot, tokens, _, held), (pages, scratch))| {
             let mut s = Seated::of(Lane {
                 slot,
                 word: facts.word(&Request::new(tokens.len() as u32, false)),
                 tokens,
             });
             s.pages = pages;
+            s.fixed = &scratch.fixed;
             s.held = Some(held);
             s
         })

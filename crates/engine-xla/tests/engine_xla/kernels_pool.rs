@@ -275,7 +275,21 @@ fn the_compressor_files_its_state_and_pools_each_block() {
     let keys = b.zeros(Dtype::Bf16, CELLS as u32, hd as u32);
     let pages = kv_pool(&mut b, keys);
     if !b
-        .run(|ctx| pool::state_write(ctx, kvt, sct, &pages, wp, wo, hd as u32, 4, sk, ss))
+        .run(|ctx| {
+            pool::state_write(
+                ctx,
+                kvt,
+                sct,
+                &pages,
+                wp,
+                wo,
+                hd as u32,
+                4,
+                sk,
+                ss,
+                [kernels_xla::tensor::PageMap::IDENTITY; 2],
+            )
+        })
         .unwrap()
     {
         return;
@@ -319,6 +333,7 @@ fn the_compressor_files_its_state_and_pools_each_block() {
                 ratio as u32,
                 sk,
                 ss,
+                [kernels_xla::tensor::PageMap::IDENTITY; 2],
                 ape.then_some(at),
                 out,
             )

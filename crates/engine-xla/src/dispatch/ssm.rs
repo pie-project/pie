@@ -67,7 +67,7 @@ impl Run<'_> {
                 let ext_z = self.rs_extend(OP, &seat, *z)?;
                 let ext_y = self.rs_out(OP, &seat, *y)?;
                 let pool = self.recurrent(*state);
-                let committed = self.rs_committed(&seat);
+                let committed = self.rs_committed(&seat, *state);
                 lower(self.ctx(), |l| {
                     let xbc = l.read(ext_xbc)?;
                     let dt = l.read(ext_dt)?;
@@ -176,7 +176,7 @@ impl Run<'_> {
                 let ext_y = self.rs_out(OP, &seat, *y)?;
                 let pool = self.recurrent(*state);
                 conv_bank(OP, &pool)?;
-                let committed = self.rs_committed(&seat);
+                let committed = self.rs_committed(&seat, *state);
                 lower(self.ctx(), |l| {
                     let xv = l.read(ext_x)?;
                     let w = l.read(self.tensor(*weight))?;
@@ -243,7 +243,7 @@ impl Run<'_> {
                 let ext_gates = self.rs_ext_of(OP, &seat, *gates)?;
                 let ext_y = self.rs_out(OP, &seat, *y)?;
                 let pool = self.recurrent(*state);
-                let committed = self.rs_committed(&seat);
+                let committed = self.rs_committed(&seat, *state);
                 lower(self.ctx(), |l| {
                     let qkv = l.read(ext_qkv)?;
                     let gates = l.read(ext_gates)?;
@@ -303,7 +303,7 @@ impl Run<'_> {
                 let ext_b = self.rs_extend(OP, &seat, *b)?;
                 let ext_y = self.rs_out(OP, &seat, *y)?;
                 let pool = self.recurrent(*state);
-                let committed = self.rs_committed(&seat);
+                let committed = self.rs_committed(&seat, *state);
                 lower(self.ctx(), |l| {
                     let mixed = l.read(ext_mixed)?;
                     let forget = l.read(ext_f)?;

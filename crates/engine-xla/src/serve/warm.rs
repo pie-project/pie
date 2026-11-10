@@ -412,29 +412,18 @@ impl Shell {
     fn warm_fire(&mut self, shape: &[Want]) -> Result<()> {
         let slots = self.held.len().max(1) as u32;
         let page_size = self.paging().page_size.max(1);
-        let pool = u32::try_from(self.paging().pages())
-            .unwrap_or(u32::MAX)
-            .max(1);
-        let windowed = self.paging().window_pages().saturating_sub(1).max(1);
-        let has_window = self.pools.has_windowed();
-        // Every lane reads the same pages from 0: what warm fires write is
+        // Every lane reads the same scratch slots: what warm fires write is
         // never read back, and the pool need not hold a page per lane.
-        let owned: Vec<(Vec<u32>, Vec<u32>, Vec<u32>)> = shape
+        let owned: Vec<(Vec<u32>, crate::store::Scratch)> = shape
             .iter()
             .map(|want| {
                 let n = (held_of(want, page_size) + want.rows)
                     .div_ceil(page_size)
                     .max(1);
-                let pages: Vec<u32> = (0..n).map(|p| p % pool).collect();
-                let window = if has_window {
-                    pages
-                        .iter()
-                        .map(|&page| 1 + u32::try_from(u64::from(page) % windowed).unwrap_or(0))
-                        .collect()
-                } else {
-                    Vec::new()
-                };
-                (vec![0; want.rows as usize], pages, window)
+                (
+                    vec![0; want.rows as usize],
+                    self.pools.scratch(0, n as usize),
+                )
             })
             .collect();
         for slot in 0..(shape.len() as u32).min(slots) {
@@ -444,14 +433,15 @@ impl Shell {
             .iter()
             .zip(&owned)
             .enumerate()
-            .map(|(at, (want, (tokens, pages, window)))| {
+            .map(|(at, (want, (tokens, scratch)))| {
                 let mut seated = Seated::of(Lane {
                     slot: at as u32 % slots,
                     word: want.word,
                     tokens,
                 });
-                seated.pages = pages;
-                seated.window = window;
+                seated.pages = &scratch.pages;
+                seated.window = &scratch.window;
+                seated.fixed = &scratch.fixed;
                 seated.held = Some(held_of(want, page_size));
                 seated
             })

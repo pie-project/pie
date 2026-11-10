@@ -13,6 +13,32 @@ use crate::rs::{Seat, WindowInputs};
 use crate::run::Run;
 use crate::trace::{Root, Source};
 
+/// Buffer rows `q · tokens + token` (grain index `q`) as rows of a plane
+/// whose blocks `map` places: `(q · stride + offset) · tokens + token`. A
+/// dropped row (`rs::DROP`) stays out of range.
+fn plane_rows(
+    cx: &mut crate::emit::Cx<'_>,
+    rows: kernels_xla::hlo::Val,
+    map: crate::store::Map,
+    tokens: i64,
+) -> Result<kernels_xla::hlo::Val, Error> {
+    if map.stride == 1 && map.offset == 0 {
+        return Ok(rows);
+    }
+    let t = cx.like_i(rows, tokens);
+    let q = cx.div(rows, t)?;
+    let token = cx.rem(rows, t)?;
+    let stride = cx.like_i(rows, map.stride);
+    let offset = cx.like_i(rows, map.offset);
+    let block = cx.mul(q, stride)?;
+    let block = cx.add(block, offset)?;
+    let row = cx.mul(block, t)?;
+    let row = cx.add(row, token)?;
+    let drop = cx.like_i(rows, i64::from(crate::rs::DROP));
+    let dropped = cx.compare(kernels_xla::hlo::Cmp::Eq, rows, drop)?;
+    Ok(cx.select(dropped, rows, row)?)
+}
+
 impl Run<'_> {
     fn rs_window(&self, op: &'static str, seat: &Seat) -> Result<WindowInputs, Error> {
         let span = self.window().span;
@@ -35,11 +61,14 @@ impl Run<'_> {
         })
     }
 
-    pub(crate) fn rs_committed(&self, seat: &Seat) -> Committed {
+    /// The rollback tables of a recurrence over `state`'s row: each lane's
+    /// slot of the record piece that row lies in.
+    pub(crate) fn rs_committed(&self, seat: &Seat, state: ValueId) -> Committed {
+        let record = self.record_of(state);
         Committed {
             replay: seat.replay,
             commit: seat.commit,
-            slots: seat.slots,
+            slots: seat.slots[record],
             lane0: self.window().span.lane_offset,
         }
     }
@@ -64,7 +93,8 @@ impl Run<'_> {
         let spec = seat.layout.planes[plane];
         let ext = self.rs_temp(map.rows_ext, spec.width, spec.dtype);
         let own = self.tensor(value);
-        let buffer = seat.buffers[plane];
+        let (buffer, at) = seat.buffers[plane];
+        let tokens = i64::from(seat.page_tokens.max(1));
         self.ctx().emit(&mut |cx| {
             let buf = cx.read(buffer)?;
             let mine = cx.read(own)?;
@@ -77,6 +107,7 @@ impl Run<'_> {
             };
             let from_buffer = flat(cx, map.from_buffer, n)?;
             let buffer_row = flat(cx, map.buffer_row, n)?;
+            let buffer_row = plane_rows(cx, buffer_row, at, tokens)?;
             let own_row = flat(cx, map.own_row, n)?;
             let replayed = cx.take_rows(buf, buffer_row)?;
             let owned = cx.take_rows(mine, own_row)?;
@@ -88,6 +119,7 @@ impl Run<'_> {
             cx.write(ext, rows)?;
             let rows_own = i64::from(own.rows);
             let stash = flat(cx, map.stash, rows_own)?;
+            let stash = plane_rows(cx, stash, at, tokens)?;
             let next = cx.put_rows(buf, stash, mine, kernels_xla::hlo::Combine::Set)?;
             cx.write(buffer, next)
         })?;
