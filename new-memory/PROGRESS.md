@@ -825,3 +825,10 @@ The `new-memory/` directory is bookkeeping and is removed before anything lands 
   host-tier chunks on first use -> pre-pin the host tier (assigned).
 - Rotor (budgeted loads walk eagerly) scoped: recordable in principle (static per-fire copy plan; copy stream joins the
   capture via events); medium, risk in aligning body cuts with rotor regions. Scheduled after quantized banks.
+
+### M62 — 2026-11-10: host tier pre-pinned in the background (CUDA)
+- `sc/l40s-tier-prepin` (d747f46a0): `Shelf::pin_ahead` pins every host-tier chunk from seat_tier on (thread
+  "pie-host-tier-pin", lowest first); copies wait only for chunks not pinned yet; on failure fall back to inline.
+  copy_slots of 0.5 GB device->host: 265-430 ms -> 6.3-6.6 ms; golden_offload all same.
+- Behaviour change: the whole host_kv_budget is page-locked shortly after boot. Open: a budget larger than lockable
+  memory surfaces at the first copy that needs it (to be reported at boot instead).
