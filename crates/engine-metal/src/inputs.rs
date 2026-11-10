@@ -82,6 +82,10 @@ pub struct Handles {
     pub spaces: Vec<SpaceHandles>,
     pub slot_ids: Tensor,
     pub slot_of_row: Tensor,
+    /// Each band's lane and row tables of record piece ids
+    /// (`crate::store::Pools::bands`), `[lanes, width]` and `[rows, width]`.
+    pub lane_bands: Vec<Tensor>,
+    pub row_bands: Vec<Tensor>,
     pub row_valid: Tensor,
     pub adapter_routes: Option<Tensor>,
     pub request_of_token: Tensor,
@@ -99,6 +103,8 @@ pub struct Handles {
     pub rs_replay: Option<Tensor>,
     pub rs_commit: Option<Tensor>,
     pub rs_snaps: Option<Tensor>,
+    /// Each band's snapshot table, `[lanes, RS_SNAPSHOTS * (1 + width)]`.
+    pub rs_snap_bands: Vec<Tensor>,
     pub rs_pages: Option<Tensor>,
     pub group_of_lane: Option<Tensor>,
     pub packings: Vec<PackingHandles>,
@@ -197,6 +203,8 @@ pub struct Inputs {
     row_valid: u64,
     slot_ids: u64,
     slot_of_row: u64,
+    /// Each band's width: the piece ids a lane and a row hold for it.
+    bands: Vec<u32>,
     adapter_routes: u64,
     request_of_token: u64,
     readout_rows: u64,
@@ -292,7 +300,9 @@ impl Inputs {
         selections: usize,
         run_caps: &[u32],
         run_passes: &[u32],
+        bands: &[u32],
     ) -> Result<Inputs> {
+        let width = u64::from(bands.iter().sum::<u32>().max(1));
         let rows = u64::from(budget.max_tokens);
         let lanes = u64::from(budget.max_lanes);
         let pages = u64::from(budget.max_lanes) * u64::from(paging.pages_per_slot);
@@ -310,8 +320,8 @@ impl Inputs {
         let positions = take(rows * 4);
         let windows = take(window_ints * 4);
         let row_valid = take(rows);
-        let slot_ids = take(lanes * 4);
-        let slot_of_row = take(rows * 4);
+        let slot_ids = take(lanes * width * 4);
+        let slot_of_row = take(rows * width * 4);
         let adapter_routes = take(rows * 4);
         let request_of_token = take(rows * 4);
         let readout_rows = take(rows * 4);
@@ -377,7 +387,9 @@ impl Inputs {
         let mrope = mrope.then(|| take(rows * AXES * 4));
         let rs_replay = take(lanes * 4);
         let rs_commit = take(lanes * 4);
-        let rs_snaps = take(lanes * u64::from(SNAP_INTS) * 4);
+        let snap_ints =
+            u64::from(kernels_metal::ssm::RS_SNAPSHOTS) * (bands.len().max(1) as u64 + width);
+        let rs_snaps = take(lanes * snap_ints.max(u64::from(SNAP_INTS)) * 4);
         let rs_pages = take(lanes * u64::from(crate::rs::PAGE_INTS) * 4);
         let total = at;
 
@@ -391,6 +403,11 @@ impl Inputs {
             row_valid,
             slot_ids,
             slot_of_row,
+            bands: if bands.is_empty() {
+                vec![1]
+            } else {
+                bands.to_vec()
+            },
             adapter_routes,
             request_of_token,
             readout_rows,
@@ -507,7 +524,8 @@ impl Inputs {
 
     pub fn write(&mut self, handles: &crate::device::Handles, fire: &Fire<'_>) -> Result<Handles> {
         let rows = fire.tokens.len() as u32;
-        let lanes = fire.slot_ids.len() as u32;
+        let width = self.bands.iter().sum::<u32>().max(1);
+        let lanes = fire.slot_ids.len() as u32 / width;
 
         let valid = vec![1u8; rows as usize];
 
@@ -932,6 +950,8 @@ impl Inputs {
             spaces,
             slot_ids: i32s(handles, &self.store, self.slot_ids, lanes)?,
             slot_of_row: i32s(handles, &self.store, self.slot_of_row, rows)?,
+            lane_bands: bands(handles, &self.store, self.slot_ids, &self.bands, lanes)?,
+            row_bands: bands(handles, &self.store, self.slot_of_row, &self.bands, rows)?,
             adapter_routes: match adapter_routes {
                 None => None,
                 Some(rows) => Some(i32s(handles, &self.store, self.adapter_routes, rows)?),
@@ -1004,6 +1024,24 @@ impl Inputs {
             } else {
                 None
             },
+            rs_snap_bands: match fire.rs_snaps {
+                Some(snaps) => {
+                    let max = kernels_metal::ssm::RS_SNAPSHOTS;
+                    let per_lane: u32 = self.bands.iter().map(|&w| max * (1 + w)).sum();
+                    let lanes = snaps.len() as u32 / per_lane.max(1);
+                    let mut at = self.rs_snaps;
+                    self.bands
+                        .iter()
+                        .map(|&w| {
+                            let ints = lanes * max * (1 + w);
+                            let buf = handles.bind(&self.store, at, u64::from(ints.max(1)) * 4)?;
+                            at += u64::from(ints) * 4;
+                            Ok(Tensor::new(buf, ints.max(1), 1, Dtype::I32))
+                        })
+                        .collect::<Result<Vec<_>>>()?
+                }
+                None => Vec::new(),
+            },
             rs_snaps: match fire.rs_snaps {
                 Some(snaps) => Some(i32s(
                     handles,
@@ -1050,6 +1088,8 @@ impl Inputs {
                 .collect(),
             slot_ids: views.slot_ids,
             slot_of_row: views.slot_of_row,
+            lane_bands: views.lane_bands.clone(),
+            row_bands: views.row_bands.clone(),
         }
     }
 }
@@ -1073,6 +1113,25 @@ fn rows_table(into: &mut Vec<i32>, staged: &[i32], rows: u32) {
 fn i32s(handles: &crate::device::Handles, store: &Buffer, at: u64, rows: u32) -> Result<Tensor> {
     let buf = handles.bind(store, at, u64::from(rows) * 4)?;
     Ok(Tensor::new(buf, rows, 1, Dtype::I32))
+}
+
+/// Each band's table, `[count, width]` ints one after another from `at`.
+fn bands(
+    handles: &crate::device::Handles,
+    store: &Buffer,
+    mut at: u64,
+    widths: &[u32],
+    count: u32,
+) -> Result<Vec<Tensor>> {
+    widths
+        .iter()
+        .map(|&width| {
+            let bytes = u64::from(count) * u64::from(width) * 4;
+            let buf = handles.bind(store, at, bytes.max(4))?;
+            at += bytes;
+            Ok(Tensor::new(buf, count, width, Dtype::I32))
+        })
+        .collect()
 }
 
 fn u32s(handles: &crate::device::Handles, store: &Buffer, at: u64, rows: u32) -> Result<Tensor> {

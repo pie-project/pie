@@ -355,16 +355,8 @@ impl Engine for Metal {
         };
         let util = residency.device_memory_share;
         let slots = poem_compiler::state_slots(budgets.slots, &trace, DEFAULT_STATE_SLOTS);
-        let paging = crate::store::kv::Paging::of(
-            budgets.page_size,
-            budgets.max_context,
-            match slots {
-                0 => engine::fit::least_state_slots(1),
-                slots => engine::fit::least_state_slots(1).min(slots),
-            },
-            1,
-        )
-        .map_err(|error| fault(Fault::from(error)))?;
+        let paging = crate::store::kv::Paging::of(budgets.page_size, budgets.max_context, 1, 1)
+            .map_err(|error| fault(Fault::from(error)))?;
         // The pool the weights must leave room for: the stated budget,
         // or one sequence when the pool fills what is left.
         let kv_pool = match residency.device_kv_budget {
@@ -537,7 +529,7 @@ impl Engine for Metal {
 
         let paging = shell.paging();
         let pools = shell.pool_facts(disk_kv_pages);
-        let chunks = shell.chunk_facts(&pools).map_err(fault)?;
+        let chunks = shell.chunk_facts().map_err(fault)?;
         shell.log_chunk_recipe(&chunks);
 
         let caps = Capabilities {
@@ -626,24 +618,24 @@ impl Engine for Metal {
             .map_err(fault)
     }
 
-    fn commit_pool(&mut self, kv_pages: u32) -> EngineResult<()> {
-        self.loaded_mut()?.commit_pool(kv_pages).map_err(fault)
-    }
-
     fn release_scratch(&mut self) -> EngineResult<()> {
         self.loaded_mut()?.release_scratch().map_err(fault)
     }
 
-    fn release_pool(&mut self, kv_pages: u32) -> EngineResult<()> {
-        self.loaded_mut()?.release_pool(kv_pages).map_err(fault)
+    fn commit_segments(&mut self, segments: u32) -> EngineResult<()> {
+        self.loaded_mut()?.commit_segments(segments).map_err(fault)
     }
 
-    fn commit_state(&mut self, slots: u32) -> EngineResult<()> {
-        self.loaded_mut()?.commit_state(slots).map_err(fault)
+    fn release_segments(&mut self, segments: u32) -> EngineResult<()> {
+        self.loaded_mut()?.release_segments(segments).map_err(fault)
     }
 
-    fn release_state(&mut self, slots: u32) -> EngineResult<()> {
-        self.loaded_mut()?.release_state(slots).map_err(fault)
+    fn evacuate(&mut self, evacuation: &engine::chunk::Evacuation) -> EngineResult<()> {
+        self.loaded_mut()?.evacuate(evacuation).map_err(fault)
+    }
+
+    fn copy_slots(&mut self, copy: &engine::chunk::SlotCopy) -> EngineResult<()> {
+        self.loaded_mut()?.copy_slots(copy).map_err(fault)
     }
 
     fn submit(&mut self, frame: &FrameSubmission) -> EngineResult<FrameTicket> {
@@ -1045,6 +1037,59 @@ impl Metal {
                 ))
             })?;
         }
+        // A lane stating its slot tables names its kv pages and its state
+        // record there; until the runtime states them, the legacy fields
+        // carry the same slot refs.
+        let mut pages_of: Vec<Option<Vec<u32>>> = Vec::with_capacity(submission.lanes.len());
+        let mut record_of: Vec<Option<Vec<u32>>> = Vec::with_capacity(submission.lanes.len());
+        let mut run_of: Vec<Option<Vec<u32>>> = Vec::with_capacity(submission.lanes.len());
+        let mut window_of: Vec<Option<Vec<u32>>> = Vec::with_capacity(submission.lanes.len());
+        let mut forks: Vec<(u32, u32)> = Vec::new();
+        for lane in &submission.lanes {
+            pages_of.push(
+                lane.tables
+                    .iter()
+                    .find(|(shape, _)| *shape == crate::store::layout::LIST)
+                    .map(|(_, refs)| refs.clone()),
+            );
+            window_of.push(
+                lane.tables
+                    .iter()
+                    .find(|(shape, _)| *shape == crate::store::layout::WINDOW)
+                    .map(|(_, refs)| refs.clone()),
+            );
+            let fixed = lane
+                .fixed
+                .iter()
+                .find(|(shape, _)| *shape == crate::store::layout::FIXED);
+            run_of.push(fixed.and_then(|(_, pieces)| {
+                pieces
+                    .iter()
+                    .any(|&[run, cow]| run != cow)
+                    .then(|| pieces.iter().map(|&[run, _]| run).collect())
+            }));
+            record_of.push(fixed.map(|(_, pieces)| {
+                // `cow != run`: the record is copied before the fire, once
+                // for every lane of a group naming the same pair.
+                for &[run, cow] in pieces {
+                    if run != cow && !forks.contains(&(run, cow)) {
+                        forks.push((run, cow));
+                    }
+                }
+                pieces.iter().map(|&[_, cow]| cow).collect()
+            }));
+        }
+        if !forks.is_empty() {
+            shell.copy_state(&forks).map_err(fault)?;
+        }
+        // Tail copies (an rs-list or kv slot a fork shares) land before any
+        // lane of the fire reads or writes (CONTRACT-BC 20).
+        let slot_copies: Vec<_> = submission
+            .lanes
+            .iter()
+            .flat_map(|lane| lane.slot_copies.iter().cloned())
+            .collect();
+        shell.copy_slot_pairs(&slot_copies).map_err(fault)?;
         let seated: Vec<Seated<'_>> = submission
             .lanes
             .iter()
@@ -1058,8 +1103,9 @@ impl Metal {
                     },
                     group: lane.group,
                     inputs: &lane.inputs,
-                    pages: &lane.kv.pages,
-                    held: (!lane.kv.pages.is_empty()).then_some(lane.kv.held),
+                    pages: pages_of[at].as_deref().unwrap_or(&lane.kv.pages),
+                    held: (!lane.kv.pages.is_empty() || pages_of[at].is_some())
+                        .then_some(lane.kv.held),
                     mask: lane.mask.as_ref(),
                     kv_less: lane.kv_less,
                     adapter: lane_adapters[at].or(lane.adapter),
@@ -1073,6 +1119,10 @@ impl Metal {
                     rs_reset: lane.rs_reset,
                     rs_slot: lane.rs_slot,
                     rs_snapshots: &lane.rs_snapshots,
+                    refs: true,
+                    record: record_of[at].as_deref(),
+                    record_run: run_of[at].as_deref(),
+                    window: window_of[at].as_deref().unwrap_or(&lane.kv.window),
                 })
             })
             .collect::<EngineResult<Vec<_>>>()?;

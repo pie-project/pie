@@ -16,7 +16,7 @@
 //!   never has to encode a wait;
 //! * a rule, not a mechanism, for the unmap direction: tiles are taken
 //!   away only when the caller has drained every frame that could read
-//!   them. `Pools::release` states that precondition; nothing here can
+//!   them. `Pool::release_segments` states that precondition; nothing here can
 //!   check it, because the legacy queue signals nothing.
 //!
 //! Absent on a device without `MTLGPUFamilyMetal4` — [`Sparse::open`]

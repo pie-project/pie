@@ -37,6 +37,11 @@ pub struct CacheTable {
     pub pools: Vec<CachePool>,
     /// The compressor state beside each kv space a pool gather reads.
     pub compressed: Vec<(u32, PoolSlabs)>,
+    /// Each cache row's lane table of record piece ids (its band's), for
+    /// the committed scans that index a state by lane.
+    pub lane_slots: Vec<Option<Tensor>>,
+    /// Each cache row's band, for the snapshot table it reads.
+    pub band_of: Vec<Option<usize>>,
 }
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -128,6 +133,9 @@ pub struct FireBindings {
     /// The fire's recurrent snapshot table, when a lane snapshots
     /// (`kernels_metal::ssm::Snapshots`).
     pub rs_snaps: Option<Tensor>,
+    /// Each band's snapshot table (`crate::store::Pools::bands`), when a lane
+    /// of the fire snapshots.
+    pub rs_snap_bands: Vec<Tensor>,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -1328,9 +1336,18 @@ impl<'c> Run<'c> {
 
     /// Where this window's prompt scans land the state as of rows inside a
     /// lane, when a lane of the fire snapshots.
-    pub(crate) fn rs_snapshots(&self) -> Option<kernels_metal::ssm::Snapshots> {
+    /// The snapshot table of the state `state` reads: its band's, each
+    /// snapshot naming the record's pieces that band holds.
+    pub(crate) fn rs_snapshots(&self, state: ValueId) -> Option<kernels_metal::ssm::Snapshots> {
+        let band = match &self.values[state.0 as usize].def {
+            Def::Cache(row) => self.caches.band_of.get(*row as usize).copied().flatten(),
+            _ => None,
+        };
         self.fire
-            .rs_snaps
+            .rs_snap_bands
+            .get(band.unwrap_or(0))
+            .copied()
+            .or(self.fire.rs_snaps)
             .map(|table| kernels_metal::ssm::Snapshots {
                 table,
                 lane0: self.window().span.lane_offset,
@@ -1927,6 +1944,14 @@ impl<'c> Run<'c> {
                 "value {} is a recurrent state space, and this op walks a paged kv pool",
                 id.0
             ),
+        }
+    }
+
+    /// The lane table of record piece ids cache row `id`'s state reads.
+    pub(crate) fn lane_slots(&self, id: ValueId) -> Option<Tensor> {
+        match &self.values[id.0 as usize].def {
+            Def::Cache(row) => self.caches.lane_slots.get(*row as usize).copied().flatten(),
+            _ => None,
         }
     }
 
