@@ -52,6 +52,90 @@ const PLATFORMS: [Platform; 6] = [
 
 pub fn run(args: AdoptArgs) -> Result<crate::ui::Answer> {
     let (dir, origin, hollow) = resolve(&args.source)?;
+    let (report, code) = evaluate(&dir, &origin, hollow, &args)?;
+    Ok(crate::ui::Answer::report(report).with_code(code))
+}
+
+/// What `pie model import` does with a checkpoint no listed deployment
+/// claims: adopts it, as `pie model adopt` would, and says so in a line.
+pub(crate) enum Behind {
+    /// Adopted: the line to print, before the import carries on.
+    Adopted(String),
+    /// Not adopted, and why.
+    Refused(String),
+}
+
+/// Adopts the downloaded checkpoint at `dir` (`source` as the user named it)
+/// for an import that found no deployment claiming it.
+pub(crate) fn behind_the_scenes(dir: &Path, source: &str) -> Result<Behind> {
+    let args = AdoptArgs {
+        source: source.to_string(),
+        id: None,
+        dry_run: false,
+        show: false,
+        force: false,
+        verbose: false,
+    };
+    let (report, _) = evaluate(dir, source, false, &args)?;
+    if let Some(a) = report.adoption.as_ref().filter(|a| a.written.is_some()) {
+        let family = report.kin.iter().find(|k| k.package == a.family);
+        let changed: Vec<String> = family
+            .map(|f| {
+                f.departing
+                    .iter()
+                    .map(|v| {
+                        format!(
+                            "{} {} → {}",
+                            v.key,
+                            number(v.built),
+                            v.stated.map_or("unstated".to_string(), number)
+                        )
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        return Ok(Behind::Adopted(format!(
+            "adopted {source} as {} on the {} family{}",
+            a.id,
+            a.family,
+            if changed.is_empty() {
+                String::new()
+            } else {
+                format!(" ({})", changed.join(", "))
+            }
+        )));
+    }
+    let why = if report.unknown.is_some() {
+        "no installed model family matches its tensor names".to_string()
+    } else if let Some(why) = &report.refused {
+        why.split("; and ")
+            .map(|said| {
+                let (family, why) = refusal(said);
+                if family.is_empty() {
+                    why
+                } else {
+                    format!("{family}: {why}")
+                }
+            })
+            .collect::<Vec<_>>()
+            .join("; ")
+    } else if let Some(why) = report.adoption.as_ref().and_then(|a| a.tokenizer.as_ref()) {
+        format!("its tokenizer is not supported: {}", reason(why))
+    } else {
+        "no deployment of its family reads it".to_string()
+    };
+    Ok(Behind::Refused(why))
+}
+
+/// The report on the checkpoint at `dir`, adopting it unless `args` says
+/// only to look, and the exit code it is answered with.
+fn evaluate(
+    dir: &Path,
+    origin: &str,
+    hollow: bool,
+    args: &AdoptArgs,
+) -> Result<(Report, std::process::ExitCode)> {
+    let (dir, origin) = (dir.to_path_buf(), origin.to_string());
     let config = configuration(&dir)?;
     let src = runtime::engine::load::open_source(&dir)?;
     let metadata = runtime::engine::load::checkpoint_metadata(&dir)?;
@@ -75,14 +159,14 @@ pub fn run(args: AdoptArgs) -> Result<crate::ui::Answer> {
 
     if kin.is_empty() {
         report.unknown = Some(Unknown::of(&metadata, &config));
-        return Ok(crate::ui::Answer::report(report).with_code(std::process::ExitCode::from(2)));
+        return Ok((report, std::process::ExitCode::from(2)));
     }
     if kin[0].nearest.departing.is_empty()
         && let Some((name, _)) =
             runtime::engine::load::conversion_contract(&src, &metadata, platform)
     {
         report.served = Some(name);
-        return Ok(crate::ui::Answer::report(report));
+        return Ok((report, std::process::ExitCode::SUCCESS));
     }
     if !kin.iter().any(|k| k.adopts) {
         report.refused = Some(format!(
@@ -90,7 +174,7 @@ pub fn run(args: AdoptArgs) -> Result<crate::ui::Answer> {
              another's numbers from config.json",
             kin[0].package.name()
         ));
-        return Ok(crate::ui::Answer::report(report).with_code(std::process::ExitCode::from(2)));
+        return Ok((report, std::process::ExitCode::from(2)));
     }
 
     let id = match &args.id {
@@ -131,7 +215,7 @@ pub fn run(args: AdoptArgs) -> Result<crate::ui::Answer> {
     }
     let Some((family, adopted)) = chosen else {
         report.refused = Some(refusals.join("; and "));
-        return Ok(crate::ui::Answer::report(report).with_code(std::process::ExitCode::from(2)));
+        return Ok((report, std::process::ExitCode::from(2)));
     };
     report.passed_over = refusals;
 
@@ -199,7 +283,7 @@ pub fn run(args: AdoptArgs) -> Result<crate::ui::Answer> {
     } else {
         std::process::ExitCode::from(2)
     };
-    Ok(crate::ui::Answer::report(report).with_code(code))
+    Ok((report, code))
 }
 
 /// The checkpoint `source` names: a directory as it is, or a Hugging Face

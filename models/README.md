@@ -38,7 +38,9 @@ def adopt(id, config, special):
 ```
 
 Every field of the returned struct rebinds the package global of that name.
-`pie model adopt <owner/name | dir>` finds the family whose formats recognize
+`pie model import` adopts a checkpoint no listed deployment claims, and
+`pie model adopt <owner/name | dir>` explains one without importing it: each
+finds the family whose formats recognize
 the checkpoint's tensor names, shows where it departs from the nearest listed
 model, and writes `$PIE_HOME/models/adopted_<id>.poem`: the family's text as
 it shipped, the configuration it read, and the rebinding. The written package
