@@ -725,3 +725,11 @@ The `new-memory/` directory is bookkeeping and is removed before anything lands 
   - Idle prefix cache demotes host -> disk (journaled) under a waiter's want before anything is dropped; restart
     takes back 750 pages, hits bitwise. Limit: pages already on host are not pushed to disk when host fills.
 - Verified: runtime store/planner/completion/fire 154 pass; e2e repros on sm_120 all identical to unconstrained.
+
+### M53 — 2026-11-10: Vulkan/wgpu window lists, on-device tiers / CoW / slot_copies, PLE rows
+- `sc/vk2` (2679c5848, 67de88455, 0341ec670, 1f35b185d): up to 4 window lists with own T_w (compiler: a stated kv page
+  fixes T_w only for single-table backends); trimmed = untrimmed bitwise (gemma l1/l6, two-window variant). Tiers
+  (contract 22) offload probe bitwise on 3 models; contract 15 group CoW and slot_copies (rs + window tail forks)
+  bitwise with negative controls. PLE rows streamed (misses: flush + read token ids + host-visible stage —
+  synchronous on fires with misses; all-resident fast path, Vulkan command-buffer recording kept).
+- Snapshots not served (rs_snapshots 0) -> parity gap. Experts not started. Runtime e2e not run.
