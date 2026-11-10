@@ -1,20 +1,11 @@
-//! Driving the CSL compiler (`cslc`) from Rust.
+//! The Cerebras toolchain a build links with: the CSL compiler (`cslc`) and `cs-readelf`, run
+//! as the SDK image lays them out.
 //!
-//! `cslc` is a Python front-end that runs `cslc-driver` (and, with
-//! `--memcpy`, the east/west memcpy layouts) and writes ELFs plus
-//! `bin/out_rpc.json` into the output directory. It is spawned directly with
-//! the SDK's bundled Python; no container is needed once the `/cb` and
-//! `/cbcore` paths resolve (see the module docs of [`super`]).
-//!
-//! Locations come from the environment when set, otherwise from the
-//! standard image layout:
-//! - the `cslc` switch: the front-end script (default: the single
-//!   `/cb/toolchains/cslang/rel-sdk-*/*/bin/cslc`);
-//! - the `python` switch: the interpreter (default
-//!   `/python/python-x86_64/bin/python3`);
-//! - the `sdk_lib` switch: shared with [`super::Sdk`] (default `/cbcore/lib`;
-//!   its parent is the image's `/cbcore`);
-//! - the `cslang_root` switch: where the default `cslc` is looked for.
+//! `cslc` is a Python front-end that runs `cslc-driver` (and, with `--memcpy`, the east / west
+//! memcpy layouts) and writes ELFs plus `bin/out_rpc.json` into the output directory. It is
+//! spawned with the SDK's bundled Python; no container is needed once the `/cb` and `/cbcore`
+//! paths resolve. Where they live is the [`Toolchain`] config (every field defaults to the
+//! image's layout).
 //!
 //! A memcpy program's fabric is [`memcpy_fabric`]'s halo around it.
 
@@ -37,12 +28,36 @@ impl Arch {
     }
 }
 
-impl From<super::Target> for Arch {
-    fn from(t: super::Target) -> Self {
-        match t {
-            super::Target::Wse2 => Arch::Wse2,
-            super::Target::Wse3 => Arch::Wse3,
-        }
+/// Where the toolchain lives: the `[engine.toolchain]` table. Unset fields take the SDK image's
+/// layout.
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Toolchain {
+    /// The `cslc` front-end (default: the newest `<cslang_root>/rel-*/*/bin/cslc`).
+    pub cslc: Option<PathBuf>,
+    /// Where the default `cslc` is looked for (default `/cb/toolchains/cslang`).
+    pub cslang_root: Option<PathBuf>,
+    /// The interpreter `cslc` runs under (default `/python/python-x86_64/bin/python3`).
+    pub python: Option<PathBuf>,
+    /// The SDK's libraries (default `/cbcore/lib`); its parent is the image's `/cbcore`.
+    pub sdk_lib: Option<PathBuf>,
+    /// Seconds a compile may run before it is killed (default 3600).
+    pub compile_timeout: Option<u64>,
+}
+
+impl Toolchain {
+    /// The SDK's library directory.
+    pub fn sdk_lib(&self) -> PathBuf {
+        self.sdk_lib
+            .clone()
+            .unwrap_or_else(|| PathBuf::from("/cbcore/lib"))
+    }
+
+    /// The image's `/cbcore` (the library directory's parent).
+    fn cbcore(&self) -> PathBuf {
+        self.sdk_lib()
+            .parent()
+            .map_or_else(|| PathBuf::from("/cbcore"), Path::to_path_buf)
     }
 }
 
@@ -67,6 +82,9 @@ pub struct Compile {
     pub import_paths: Vec<PathBuf>,
     /// Output directory (`-o`), created if missing.
     pub out: PathBuf,
+    /// The 16-bit float type `f16` names: IEEE (`false`; the wafer program's kernels assume it)
+    /// or brain float (`--fp16-format=bf16`).
+    pub bf16: bool,
 }
 
 impl Compile {
@@ -92,6 +110,7 @@ impl Compile {
             channels: h.clamp(1, 16),
             import_paths: Vec::new(),
             out: out.into(),
+            bf16: false,
         }
     }
 
@@ -131,18 +150,21 @@ impl std::error::Error for Error {}
 pub struct Cslc {
     python: PathBuf,
     frontend: PathBuf,
+    cbcore: PathBuf,
     lib_dir: PathBuf,
+    timeout: std::time::Duration,
 }
 
 impl Cslc {
-    /// Finds the compiler from the environment or the standard image layout.
-    pub fn find() -> Result<Self, Error> {
-        let python = crate::switches::get("python")
-            .map(PathBuf::from)
+    /// Finds the compiler where `tc` says (else the image's layout).
+    pub fn find(tc: &Toolchain) -> Result<Self, Error> {
+        let python = tc
+            .python
+            .clone()
             .unwrap_or_else(|| PathBuf::from("/python/python-x86_64/bin/python3"));
-        let frontend = match crate::switches::get("cslc") {
-            Some(p) => PathBuf::from(p),
-            None => default_frontend()?,
+        let frontend = match &tc.cslc {
+            Some(p) => p.clone(),
+            None => default_frontend(tc.cslang_root.as_deref())?,
         };
         for (what, p) in [("python", &python), ("cslc", &frontend)] {
             if !p.is_file() {
@@ -155,13 +177,10 @@ impl Cslc {
         Ok(Cslc {
             python,
             frontend,
-            lib_dir: super::Sdk::default_lib_dir(),
+            cbcore: tc.cbcore(),
+            lib_dir: tc.sdk_lib(),
+            timeout: std::time::Duration::from_secs(tc.compile_timeout.unwrap_or(3600)),
         })
-    }
-
-    /// Whether the toolchain is present on this box.
-    pub fn available() -> bool {
-        Self::find().is_ok()
     }
 
     fn cslang_top(&self) -> Option<&Path> {
@@ -191,10 +210,7 @@ impl Cslc {
                 .arg("--channels")
                 .arg(compile.channels.to_string());
         }
-        // The 16-bit float type (`f16`) is brain float: the models' half
-        // format, and what the host rounds bf16 handles to. (A program with
-        // `F16` > 0 computes in IEEE f16: its host writes f16 weights.)
-        if !compile.params.iter().any(|(k, v)| k == "F16" && v != "0") {
+        if compile.bf16 {
             cmd.arg("--fp16-format=bf16");
         }
         for (k, v) in &compile.params {
@@ -205,11 +221,7 @@ impl Cslc {
         }
 
         // The environment the SDK image's entry script would set up.
-        let cbcore = self
-            .lib_dir
-            .parent()
-            .map(Path::to_path_buf)
-            .unwrap_or_else(|| PathBuf::from("/cbcore"));
+        let cbcore = &self.cbcore;
         let mut path = vec![cbcore.join("bin")];
         if let Some(top) = self.cslang_top() {
             path.push(top.join("bin"));
@@ -234,19 +246,15 @@ impl Cslc {
                 py_root.join("cerebras").display()
             ),
         )
-        .env("CBCORE", &cbcore)
+        .env("CBCORE", cbcore)
         .env("LC_ALL", "C");
         if let Some(top) = self.cslang_top() {
             cmd.env("CSLANG_TOP", top);
         }
         cmd.env_remove("PYTHONHOME").env_remove("VIRTUAL_ENV");
 
-        // The compiler is bounded (the `compile_timeout` switch, seconds;
-        // 1800 by default): a hung front end or linker must not hold a
-        // fire forever.
-        let timeout = std::time::Duration::from_secs(
-            crate::switches::parse("compile_timeout").unwrap_or(1800),
-        );
+        // The compiler is bounded: a hung front end or linker must not hold a load forever.
+        let timeout = self.timeout;
         cmd.stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped());
         let mut child = cmd.spawn().map_err(|e| Error::Spawn(e.to_string()))?;
@@ -296,6 +304,68 @@ impl Cslc {
     }
 }
 
+impl Cslc {
+    /// The `cslc` front-end this toolchain runs (its path names the SDK release).
+    pub fn frontend(&self) -> &Path {
+        &self.frontend
+    }
+
+    /// The toolchain's `cs-readelf` (the image's `/cbcore/bin`).
+    fn readelf(&self) -> PathBuf {
+        self.cbcore.join("bin/cs-readelf")
+    }
+
+    /// The least stack room of any PE image under a compile's `out` directory: the bytes between
+    /// an image's used memory (`cs-readelf -m`: code, data and the task table) and `0xC000`, where
+    /// the stack, which the linker does not count, grows down from. Every chunk of an image holds
+    /// the same program, so one a image is read.
+    pub fn stack_room(&self, out: &Path) -> Result<u32, Error> {
+        let mut images: std::collections::BTreeMap<u32, PathBuf> = Default::default();
+        let bin = out.join("bin");
+        for entry in std::fs::read_dir(&bin).map_err(|e| Error::Spawn(format!("{}: {e}", bin.display())))? {
+            let path = entry.map_err(|e| Error::Spawn(e.to_string()))?.path();
+            let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
+            let Some(rest) = name.strip_prefix("out_").and_then(|r| r.strip_suffix(".elf")) else {
+                continue;
+            };
+            let Some((image, chunk)) = rest.split_once('_') else {
+                continue;
+            };
+            let (Ok(image), true) = (image.parse(), chunk.bytes().all(|b| b.is_ascii_digit())) else {
+                continue;
+            };
+            let slot = images.entry(image).or_insert_with(|| path.clone());
+            if path < *slot {
+                *slot = path;
+            }
+        }
+        let mut least: Option<u32> = None;
+        for path in images.values() {
+            let text = Command::new(self.readelf())
+                .arg("-m")
+                .arg(path)
+                .env("LD_LIBRARY_PATH", &self.lib_dir)
+                .output()
+                .map_err(|e| Error::Spawn(format!("cs-readelf: {e}")))?;
+            let text = String::from_utf8_lossy(&text.stdout);
+            let used = text
+                .lines()
+                .filter_map(|l| {
+                    // "(4, 1): 16992 bytes (8496 words)"
+                    let (_, tail) = l.split_once("):")?;
+                    let mut words = tail.split_whitespace();
+                    let n = words.next()?.parse::<u32>().ok()?;
+                    (words.next()? == "bytes").then_some(n)
+                })
+                .max()
+                .unwrap_or(0);
+            let room = 0xC000u32.saturating_sub(used);
+            least = Some(least.map_or(room, |l| l.min(room)));
+        }
+        least.ok_or_else(|| Error::Toolchain(format!("{}: no PE images", out.display())))
+    }
+}
+
 /// The smallest fabric a memcpy program of `w` x `h` PEs fits, and its
 /// offset: the memcpy layouts take 7 extra columns and 2 extra rows, the
 /// program placed at (4, 1).
@@ -304,10 +374,8 @@ pub fn memcpy_fabric(w: u32, h: u32) -> ((u32, u32), (u32, u32)) {
     ((w + 7, h + 2), (4, 1))
 }
 
-fn default_frontend() -> Result<PathBuf, Error> {
-    let root = crate::switches::get("cslang_root")
-        .map_or_else(|| PathBuf::from("/cb/toolchains/cslang"), PathBuf::from);
-    let root = root.as_path();
+fn default_frontend(root: Option<&Path>) -> Result<PathBuf, Error> {
+    let root = root.unwrap_or(Path::new("/cb/toolchains/cslang"));
     let mut found = Vec::new();
     for release in read_dirs(root) {
         for build in read_dirs(&release) {

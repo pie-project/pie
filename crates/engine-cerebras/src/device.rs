@@ -18,7 +18,7 @@ use kernels_cerebras::phase::{BankSplit, ColPlane, HostOp, Reduce, Segment};
 
 use crate::error::{Fault, Result};
 use crate::fabric::{HostPhase, Manifest};
-use crate::sdk::{Arch, Compile, Cslc, Target};
+use crate::sdk::{Arch, Compile, Target};
 use crate::trace::Signature;
 
 mod host;
@@ -301,7 +301,7 @@ pub(crate) fn disk_cache() -> PathBuf {
 impl Device {
     /// A device that compiles and runs programs on `platform`.
     pub fn open(platform: Platform) -> Result<Device> {
-        if !Cslc::available() {
+        if !crate::sdk::cslc().is_ok() {
             return Err(Fault::NoDevice {
                 detail: "the Cerebras SDK compiler (cslc) is not on this box".to_string(),
             });
@@ -335,7 +335,7 @@ impl Device {
     /// handed is kept ([`Device::dry_texts`]); with `compile`, each text is
     /// compiled with `cslc` too, but never run.
     pub fn dry(compile: bool) -> Result<Device> {
-        if compile && !Cslc::available() {
+        if compile && !crate::sdk::cslc().is_ok() {
             return Err(Fault::NoDevice {
                 detail: "the Cerebras SDK compiler (cslc) is not on this box".to_string(),
             });
@@ -490,7 +490,8 @@ impl Device {
                 if system {
                     compile.fabric_dims = wafer_dims(self.platform.target());
                 }
-                if let Err(e) = Cslc::find().and_then(|cslc| cslc.compile(&compile)) {
+                compile.bf16 = true;
+                if let Err(e) = crate::sdk::cslc().and_then(|cslc| cslc.compile(&compile)) {
                     let _ = std::fs::remove_dir_all(&out);
                     return Err(Fault::Compile { why: e.to_string() });
                 }

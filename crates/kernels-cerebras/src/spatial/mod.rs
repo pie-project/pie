@@ -12,6 +12,7 @@
 pub mod abi;
 pub mod artifact;
 pub mod block;
+pub mod build;
 pub mod emit;
 pub mod fabric;
 pub mod family;
@@ -21,6 +22,8 @@ pub mod npy;
 pub mod plan;
 pub mod program;
 pub mod role;
+pub mod sources;
 pub mod target;
+pub mod toolchain;
 pub mod weights;
 pub mod wiring;

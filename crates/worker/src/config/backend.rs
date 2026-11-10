@@ -191,7 +191,7 @@ pub struct CerebrasEngineOptions {
     pub prewarm: bool,
     /// The spatial engine (the model forward as a resident wafer program,
     /// instead of the phase programs) on this compiled wafer program's
-    /// output directory (kernels-cerebras `wafer-compile`, `link.sh`), run on
+    /// output directory (kernels-cerebras `wafer-compile build`, then `link`), run on
     /// `cmaddr` (else the simulator). Omit for the cerebras shell.
     pub spatial_program: Option<String>,
     /// Steps a greedy lane's token loop runs past its row in one wafer

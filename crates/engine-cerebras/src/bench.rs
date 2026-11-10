@@ -14,7 +14,7 @@ use kernels_cerebras::plan::Plan;
 use kernels_cerebras::{Cx, Emit, Error, Tensor};
 
 use crate::fabric::{Emitting, Fabric, Operands, Placed, Planner, Program, Rendered};
-use crate::sdk::{Arch, Compile, Cslc, Sdk};
+use crate::sdk::{Arch, Compile, Sdk};
 
 /// One simulator at a time on this box: runs are serialised across threads
 /// here and each one gets its own `fabric-run` process, because the SDK's
@@ -135,7 +135,7 @@ impl Bench {
         self.last = Some(rendered);
         self.phases = phases.clone();
 
-        if !Cslc::available() {
+        if !crate::sdk::cslc().is_ok() {
             return Ok(false);
         }
         if !Sdk::available() {
@@ -149,7 +149,7 @@ impl Bench {
             .tempdir()
             .map_err(|e| e.to_string())?;
         let root = dir.path().to_path_buf();
-        let cslc = Cslc::find().map_err(|e| e.to_string())?;
+        let cslc = crate::sdk::cslc().map_err(|e| e.to_string())?;
         let mut compiled = Vec::new();
         for (at, r) in phases.iter().enumerate() {
             if r.manifest.host.is_some() {
@@ -162,7 +162,8 @@ impl Bench {
             std::fs::write(pdir.join("pe.csl"), &r.pe).map_err(|e| e.to_string())?;
             let out = pdir.join("out");
             let (w, h) = r.manifest.rect;
-            let compile = Compile::memcpy(Arch::Wse3, pdir.join("gather.csl"), w, h, &out);
+            let mut compile = Compile::memcpy(Arch::Wse3, pdir.join("gather.csl"), w, h, &out);
+            compile.bf16 = true;
             cslc.compile(&compile)
                 .map_err(|e| format!("{e}\n--- layout.csl\n{}\n--- pe.csl\n{}", r.layout, r.pe))?;
             compiled.push((out, r.manifest.clone()));

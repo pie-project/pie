@@ -50,10 +50,35 @@
 #![allow(unsafe_code)]
 
 pub(crate) mod abi;
-pub mod cslc;
 pub mod sys;
 
-pub use cslc::{Arch, Compile, Cslc};
+pub use kernels_cerebras::spatial::toolchain::{Arch, Compile, Cslc, Toolchain};
+
+/// The toolchain as the switches place it (the phase engine's).
+pub fn toolchain() -> Toolchain {
+    let path = |k: &str| crate::switches::get(k).map(std::path::PathBuf::from);
+    Toolchain {
+        cslc: path("cslc"),
+        cslang_root: path("cslang_root"),
+        python: path("python"),
+        sdk_lib: path("sdk_lib"),
+        compile_timeout: crate::switches::parse("compile_timeout"),
+    }
+}
+
+/// The compiler where the switches place it.
+pub fn cslc() -> std::result::Result<Cslc, kernels_cerebras::spatial::toolchain::Error> {
+    Cslc::find(&toolchain())
+}
+
+impl From<Target> for Arch {
+    fn from(t: Target) -> Self {
+        match t {
+            Target::Wse2 => Arch::Wse2,
+            Target::Wse3 => Arch::Wse3,
+        }
+    }
+}
 
 use abi::{
     ArtifactsMem, CxxString, CxxVecU32, MemcpyOptions, RuntimeMem, SimPlatform, SystemPlatformMem,

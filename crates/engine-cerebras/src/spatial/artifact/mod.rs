@@ -1,6 +1,6 @@
 //! The wafer program in process ([`ArtifactModel`]): tokens at positions, a launch of S passes, the
 //! wafer token loop's out-token ring. The program is an [`Artifact`] (`kernels_cerebras::spatial`:
-//! the host's map of the wafer, every copy onto it, every PE's rcfg words), which `link.sh` puts in
+//! the host's map of the wafer, every copy onto it, every PE's rcfg words), which `wafer-compile link` puts in
 //! the compiled program's `artifact/`; nothing here names a model or builds anything.
 //!
 //! The program keeps one sequence's KV and GDN state on the wafer, by
@@ -77,7 +77,7 @@ pub fn read(program: &Path) -> R<Artifact> {
     let dir = program.join(ARTIFACT);
     if !dir.join("program.json").exists() {
         return Err(format!(
-            "{}: no artifact (wafer-compile build --plan <plan.json> --out <dir>, then link.sh <dir>)",
+            "{}: no artifact (wafer-compile build --plan <plan.json> --out <dir>, then wafer-compile link --build <dir>)",
             dir.display()
         ));
     }

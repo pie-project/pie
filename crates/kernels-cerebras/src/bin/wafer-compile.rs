@@ -8,6 +8,7 @@
 //!                [--positions N] --out <dir>
 //! wafer-compile build --plan <plan.json> --out <dir> [--emit floor,rcfg,kernels,layout,host,plan,
 //!                 bindings,program] [--levers K:V,...] [--kernels <programs/wafer dir>]
+//! wafer-compile link --build <dir>
 //! ```
 //!
 //! `plan` writes `<dir>/plan.json` (the [`Plan`]) and `<dir>/tiling.json` (the family's
@@ -18,44 +19,26 @@
 //! `--positions` the positions the program must serve (else as many as the preset holds). The
 //! preset carries the kernel levers its program ships with; `build --levers` sets more over them.
 //!
-//! `build` writes, under `<dir>`:
-//! - `floor.json`: units (rects, cx / cy, layers), relays, head block, stores, and the kind
-//!   rectangles (`Floor::rects_by_kind`);
-//! - `rcfg.npy` (u32, [h][w][words], zero-padded to the longest; idle PEs all zero), `rcfg_n.npy`
-//!   (u32, [h][w]: each PE's word count) and `rcfg.txt` (`emit::rcfg::dump`);
-//! - `kernels.json`: each role kind's source, owned symbols and params (levers applied);
-//! - `layout/`: `layout.csl` and the per-kind sources (`emit::layout::write`), with the
-//!   `params.txt` and `dims.env` `link.sh` reads;
-//! - `host.json`: `emit::host::HostLayout`;
-//! - `plan.json`: the plan it built;
-//! - `bindings.json`: every copy onto the wafer in placement order (`Program::bindings`), which the
-//!   Python runners execute (`tools/wafer/compiler.py`'s `place`);
-//! - `program.json`: the artifact's header (`artifact::Header`: the model facts and the plan).
-//!   With `host.json`, `bindings.json` and the rcfg arrays it is the `artifact::Artifact` the
-//!   engine runs.
-//!
-//! The kernel sources default to `$WAFER_KERNELS`, else this crate's `programs/wafer`.
+//! `build` writes everything the plan builds into `<dir>` (`spatial::build::emit`: the sources,
+//! the artifact, what the Python tools read), its kernels the embedded ones unless `--kernels`
+//! names a directory; `link` compiles a build directory with cslc into `<dir>/out`, checks every
+//! PE image's stack room and puts the artifact beside it (`<dir>/out/artifact`, what the engine
+//! opens). `link` runs where the SDK image's toolchain is (`/cb`, `/cbcore`).
 
 use std::path::{Path, PathBuf};
 
-use kernels_cerebras::spatial::artifact::Artifact;
-use kernels_cerebras::spatial::emit::params::{Levers, kernels};
-use kernels_cerebras::spatial::emit::{layout, rcfg};
+use kernels_cerebras::spatial::build::{self, EMITS};
+use kernels_cerebras::spatial::emit::params::Levers;
 use kernels_cerebras::spatial::family;
-use kernels_cerebras::spatial::floor::{HeadBlock, Rect, StoreBlock, Unit};
 use kernels_cerebras::spatial::plan::{Plan, Shape};
 use kernels_cerebras::spatial::program::Program;
-use kernels_cerebras::spatial::role::Kind;
+use kernels_cerebras::spatial::toolchain::{Arch, Cslc, Toolchain};
 use kernels_cerebras::spatial::target::{self, Ask};
-use serde::Serialize;
-
-const EMITS: [&str; 8] = [
-    "floor", "rcfg", "kernels", "layout", "host", "plan", "bindings", "program",
-];
 
 const USAGE: &str = "usage: wafer-compile plan (--model <deployment> | --shape <shape.json>) \
      [--preset <name>] [--set K=V,...] [--positions N] --out <dir>\n       wafer-compile build --plan <plan.json> \
-     --out <dir> [--emit a,b] [--levers K:V,...] [--kernels <dir>]";
+     --out <dir> [--emit a,b] [--levers K:V,...] [--kernels <dir>]\n       wafer-compile link \
+     --build <dir>";
 
 fn main() {
     if let Err(e) = run() {
@@ -87,26 +70,10 @@ fn read<T: for<'de> serde::Deserialize<'de>>(p: &str) -> Result<T, String> {
     serde_json::from_str(&text).map_err(|e| format!("{p}: {e}"))
 }
 
-/// `floor.json`: the floor without its per-PE role grid (the kind rectangles stand for it).
-#[derive(Serialize)]
-struct FloorFile<'a> {
-    w: u32,
-    h: u32,
-    units: &'a [Unit],
-    relays: &'a [Rect],
-    head: &'a HeadBlock,
-    stores: &'a [StoreBlock],
-    kinds: Vec<(Kind, Rect)>,
-}
-
-fn write(dir: &Path, name: &str, bytes: &[u8]) -> Result<(), String> {
-    let p = dir.join(name);
-    std::fs::write(&p, bytes).map_err(|e| format!("{}: {e}", p.display()))
-}
-
-fn json(dir: &Path, name: &str, v: &impl Serialize) -> Result<(), String> {
+fn json(dir: &Path, name: &str, v: &impl serde::Serialize) -> Result<(), String> {
     let s = serde_json::to_string_pretty(v).map_err(|e| format!("{name}: {e}"))?;
-    write(dir, name, format!("{s}\n").as_bytes())
+    let p = dir.join(name);
+    std::fs::write(&p, format!("{s}\n")).map_err(|e| format!("{}: {e}", p.display()))
 }
 
 fn mkdir(dir: &Path) -> Result<(), String> {
@@ -158,61 +125,18 @@ fn build(args: &[String]) -> Result<(), String> {
     let plan: Plan = read(get(&f, "--plan").ok_or(USAGE)?)?;
     let out = PathBuf::from(get(&f, "--out").ok_or(USAGE)?);
     let emit: Vec<&str> = get(&f, "--emit").map_or(EMITS.to_vec(), |e| e.split(',').collect());
-    if let Some(e) = emit.iter().find(|e| !EMITS.contains(e)) {
-        return Err(format!("--emit {e}: of {}", EMITS.join(",")));
-    }
     let levers = Levers::of(&plan.levers, get(&f, "--levers").unwrap_or(""))?;
-    let kdir = get(&f, "--kernels")
-        .map(PathBuf::from)
-        .or_else(|| std::env::var_os("WAFER_KERNELS").map(PathBuf::from))
-        .unwrap_or_else(|| Path::new(env!("CARGO_MANIFEST_DIR")).join("programs/wafer"));
     let prog = Program::of(plan)?;
-    mkdir(&out)?;
-    let want = |w: &str| emit.contains(&w);
-    if want("floor") {
-        let f = &prog.floor;
-        json(
-            &out,
-            "floor.json",
-            &FloorFile {
-                w: f.w,
-                h: f.h,
-                units: &f.units,
-                relays: &f.relays,
-                head: &f.head,
-                stores: &f.stores,
-                kinds: f.rects_by_kind(),
-            },
-        )?;
-    }
-    if ["rcfg", "host", "bindings", "program"]
-        .iter()
-        .any(|w| want(w))
-    {
-        let art = Artifact::of(&prog)?;
-        if want("rcfg") {
-            art.write_rcfg(&out)?;
-            write(&out, "rcfg.txt", rcfg::dump(&prog)?.as_bytes())?;
-        }
-        if want("host") {
-            art.write_host(&out)?;
-        }
-        if want("bindings") {
-            art.write_bindings(&out)?;
-        }
-        if want("program") {
-            art.write_header(&out)?;
-        }
-    }
-    if want("kernels") {
-        json(&out, "kernels.json", &kernels(&prog, &levers)?)?;
-    }
-    if want("layout") {
-        layout::write(&prog, &levers, &kdir, &out.join("layout"))?;
-    }
-    if want("plan") {
-        json(&out, "plan.json", &prog.plan)?;
-    }
+    build::emit(&prog, &levers, get(&f, "--kernels").map(Path::new), &out, &emit)
+}
+
+/// `link`: a build directory compiled, checked and its artifact put beside it.
+fn link(args: &[String]) -> Result<(), String> {
+    let f = flags(args, &["--build"])?;
+    let dir = PathBuf::from(get(&f, "--build").ok_or(USAGE)?);
+    let cslc = Cslc::find(&Toolchain::default()).map_err(|e| e.to_string())?;
+    let room = build::link(&dir, &cslc, Arch::Wse3)?;
+    println!("STACK_ROOM min {room} B; need >= {}: ok", build::STACK_ROOM);
     Ok(())
 }
 
@@ -221,6 +145,7 @@ fn run() -> Result<(), String> {
     match args.first().map(String::as_str) {
         Some("plan") => plan(&args[1..]),
         Some("build") => build(&args[1..]),
+        Some("link") => link(&args[1..]),
         _ => Err(USAGE.to_string()),
     }
 }

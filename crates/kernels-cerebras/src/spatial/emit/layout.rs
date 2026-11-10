@@ -17,6 +17,7 @@ use crate::spatial::abi::{Kernels, Params};
 use crate::spatial::floor::{Coord, Rect};
 use crate::spatial::program::Program;
 use crate::spatial::role::Kind;
+use crate::spatial::sources;
 
 use super::params::{Levers, kernels, tile};
 
@@ -169,13 +170,13 @@ pub fn layout_text(prog: &Program, kinds: &Kernels) -> Result<String, String> {
     Ok(s)
 }
 
-/// Writes `<out>/layout.csl` and one `<kind>.csl` a role kind (the kernel source with the other
-/// kinds' exported names as one-word dummies), as `build*.py` do, plus what `link.sh` reads:
-/// `dims.env` (the rectangle and fabric dims).
+/// Writes `<out>/layout.csl` and one `<kind>.csl` a role kind (the kernel source, embedded or from
+/// `kernels_dir`, with the other kinds' exported names as one-word dummies), plus `dims.env` (the
+/// rectangle and fabric dims, for the Python runners).
 pub fn write(
     prog: &Program,
     levers: &Levers,
-    kernels_dir: &Path,
+    kernels_dir: Option<&Path>,
     out: &Path,
 ) -> Result<(), String> {
     let kinds = kernels(prog, levers)?;
@@ -190,8 +191,16 @@ pub fn write(
         let body = if kb.source.is_empty() {
             FILLER.to_string()
         } else {
-            let src = kernels_dir.join(kb.source);
-            std::fs::read_to_string(&src).map_err(|e| format!("{}: {e}", src.display()))?
+            match kernels_dir {
+                Some(dir) => {
+                    let src = dir.join(kb.source);
+                    std::fs::read_to_string(&src)
+                        .map_err(|e| format!("{}: {e}", src.display()))?
+                }
+                None => sources::get(kb.source)
+                    .ok_or_else(|| format!("no kernel {}", kb.source))?
+                    .to_string(),
+            }
         };
         wr(
             &format!("{}.csl", k.stem),

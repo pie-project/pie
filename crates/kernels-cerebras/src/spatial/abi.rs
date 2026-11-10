@@ -24,7 +24,7 @@ pub enum Value {
 }
 
 impl Value {
-    /// As the layout and `link.sh` write it.
+    /// As the layout writes it.
     pub fn render(&self) -> String {
         match self {
             Value::Int(n) => n.to_string(),
@@ -83,7 +83,7 @@ impl From<Lit> for Value {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize)]
 pub struct Param(pub &'static str);
 
-/// An ordered `K:V` list (order kept: `link.sh` / cslc command lines and `params.txt` are
+/// An ordered `K:V` list (order kept: cslc command lines and `params.txt` are
 /// compared byte for byte).
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize)]
 pub struct Params {
@@ -107,7 +107,7 @@ impl Params {
         self.get(k).is_some()
     }
 
-    /// `K:V,K:V` as `link.sh` passes it.
+    /// `K:V,K:V`, as cslc takes params.
     pub fn render(&self) -> String {
         self.items
             .iter()
