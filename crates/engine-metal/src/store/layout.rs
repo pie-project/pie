@@ -21,7 +21,7 @@
 //! after the null chunk.
 
 use engine::chunk::{
-    ChunkFacts, Growth, Reserved, ReservedRun, SegmentFacts, ShapeId, SlotKind, SlotShape,
+    ChunkFacts, Growth, Reserved, ReservedRun, SegmentFacts, ShapeId, SlotKind, SlotRole, SlotShape,
 };
 
 use crate::error::{Fault, Result};
@@ -29,6 +29,7 @@ use crate::error::{Fault, Result};
 pub const LIST: ShapeId = ShapeId(0);
 pub const FIXED: ShapeId = ShapeId(1);
 pub const WINDOW: ShapeId = ShapeId(2);
+pub const RS: ShapeId = ShapeId(3);
 
 /// The chunk an on-device Metal recipe aims at.
 pub const TARGET_CHUNK: u64 = 2 << 20;
@@ -103,6 +104,10 @@ pub struct Layout {
     /// `window_rows`; slots trimmed behind the window are the null chunk.
     pub window: Option<Slots>,
     pub window_rows: u32,
+    /// The rs list (CONTRACT-BC 18, 20): `rs_tokens` unfolded rows of every
+    /// recurrent layer's rs planes a slot.
+    pub rs: Option<Slots>,
+    pub rs_tokens: u32,
     /// The seats seat-addressed lanes take.
     pub seats: u32,
 }
@@ -132,6 +137,8 @@ impl Layout {
             fixed: Slots::of(FIXED, fixed, chunk_bytes),
             window: None,
             window_rows: 0,
+            rs: None,
+            rs_tokens: 0,
             seats,
         };
         if let Some(shape) = layout.shapes().find(|s| s.per_chunk == 0) {
@@ -178,8 +185,32 @@ impl Layout {
         Ok(self)
     }
 
+    /// This layout with an rs list of `bytes` slots of `tokens` rows; its
+    /// seat run, `pages_per_seat` slots a seat, after the others.
+    pub fn with_rs(mut self, bytes: u64, tokens: u32, pages_per_seat: u32) -> Result<Layout> {
+        let Some(mut rs) = Slots::of(RS, bytes, self.chunk_bytes) else {
+            return Ok(self);
+        };
+        if rs.per_chunk == 0 {
+            return Err(Fault::Ceiling {
+                what: "bytes of a pool chunk",
+                need: bytes,
+                have: self.chunk_bytes,
+            });
+        }
+        rs.seat_chunk = 1 + self.seat_chunks();
+        rs.seat_slots = self.seats.saturating_mul(pages_per_seat);
+        self.rs = Some(rs);
+        self.rs_tokens = tokens;
+        Ok(self)
+    }
+
     pub fn shapes(&self) -> impl Iterator<Item = &Slots> {
-        self.list.iter().chain(&self.fixed).chain(&self.window)
+        self.list
+            .iter()
+            .chain(&self.fixed)
+            .chain(&self.window)
+            .chain(&self.rs)
     }
 
     #[must_use]
@@ -193,12 +224,19 @@ impl Layout {
         self.shapes().map(Slots::seat_chunks).sum()
     }
 
-    /// What an rs buffer row's unit counts: `gcd(chunk, fixed slot)`, so a
+    /// What a folded window's page id counts: `gcd(chunk, fixed slot)`, so a
     /// fixed slot's first byte is a whole number of them from the base.
     #[must_use]
     pub fn buffer_stride(&self) -> u64 {
         self.fixed
             .map_or(256, |f| gcd(self.chunk_bytes, f.slot_bytes))
+    }
+
+    /// What an rs-list page id counts: `gcd(chunk, rs slot)`.
+    #[must_use]
+    pub fn rs_stride(&self) -> u64 {
+        self.rs
+            .map_or(256, |rs| gcd(self.chunk_bytes, rs.slot_bytes))
     }
 
     /// The chunks one working set at `pages` kv pages takes beside the null
@@ -229,6 +267,7 @@ impl Layout {
             sets_per_working_set: kind.sets_per_working_set(),
             rows: rows.clone(),
             pinned: None,
+            role: SlotRole::State,
         };
         let mut shapes = Vec::new();
         if let Some(list) = &self.list {
@@ -252,6 +291,19 @@ impl Layout {
                 },
                 &Vec::new(),
             ));
+        }
+        if let Some(rs) = &self.rs {
+            shapes.push(SlotShape {
+                role: SlotRole::RsBuffer,
+                ..shape(
+                    rs,
+                    SlotKind::List {
+                        tokens: self.rs_tokens,
+                        rate: 1,
+                    },
+                    &Vec::new(),
+                )
+            });
         }
         if let Some(fixed) = &self.fixed {
             shapes.push(shape(

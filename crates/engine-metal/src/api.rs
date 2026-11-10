@@ -1082,6 +1082,14 @@ impl Metal {
         if !forks.is_empty() {
             shell.copy_state(&forks).map_err(fault)?;
         }
+        // Tail copies (an rs-list or kv slot a fork shares) land before any
+        // lane of the fire reads or writes (CONTRACT-BC 20).
+        let slot_copies: Vec<_> = submission
+            .lanes
+            .iter()
+            .flat_map(|lane| lane.slot_copies.iter().cloned())
+            .collect();
+        shell.copy_slot_pairs(&slot_copies).map_err(fault)?;
         let seated: Vec<Seated<'_>> = submission
             .lanes
             .iter()

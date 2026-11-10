@@ -9,7 +9,7 @@ use kernels_metal::{KvPool, RecurrentPool, StateMap, Tensor};
 use poem_compiler::chunk::{ChunkRecipe, RowId, SlotLayout};
 use poem_ir::{CacheRow, Dtype, Trace};
 
-use super::layout::{FIXED, LIST, Layout, Slots, WINDOW, gcd};
+use super::layout::{FIXED, LIST, Layout, RS, Slots, WINDOW, gcd};
 use super::pool::Pool;
 use super::{
     STATE_MAP_BYTES, Seats, SpaceSeat, Spill, compressed_spaces, elem_bytes, elem_size, narrow,
@@ -137,17 +137,13 @@ fn kv_cells(
     })
 }
 
-/// Where the rs buffer lies in a record (the recipe's `RsLayout`): every
-/// rs row cut alike into `pieces` pieces of `tokens_per_piece` tokens,
-/// piece `p` in record slot `slots[p]`, and each of the shell's rs planes'
-/// offset in a piece (its `tokens_per_piece` rows one after another).
-/// Buffered row `s` lies in piece `(s % 16) / tokens_per_piece`, row
-/// `(s % 16) % tokens_per_piece` of it.
+/// The rs list's slot as this shell reads it: `tokens` rows of each rs
+/// plane, each of the shell's planes at `plane_at` in the slot (its
+/// `tokens` rows one after another).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RsRows {
-    pub pieces: u32,
-    pub tokens_per_piece: u32,
-    pub slots: Vec<u32>,
+    pub tokens: u32,
+    pub bytes: u64,
     pub plane_at: Vec<u64>,
 }
 
@@ -432,7 +428,7 @@ impl Rows {
         }
         let rs = match rs {
             None => None,
-            Some(layout) => Some(rs_rows(recipe, fixed_runs, layout)?),
+            Some(layout) => Some(rs_rows(recipe, layout)?),
         };
         let mut side = 0usize;
         let mut side_bytes = 0u64;
@@ -469,33 +465,22 @@ impl Rows {
     }
 }
 
-/// The rs planes' places in a record piece, read off the recipe's
-/// `RsLayout`: each rs row's planes one after another past its offset, each
-/// plane `tokens_per_piece` rows; the shell's planes matched by the values
-/// they buffer.
-fn rs_rows(
-    recipe: &ChunkRecipe,
-    runs: &[poem_compiler::chunk::FixedRun],
-    layout: &crate::rs::Layout,
-) -> Result<RsRows> {
+/// The rs planes' places in an rs-list slot, read off the recipe's
+/// `RsLayout`: each rs row's run, its planes one after another, each plane
+/// `tokens` rows; the shell's planes matched by the values they buffer.
+fn rs_rows(recipe: &ChunkRecipe, layout: &crate::rs::Layout) -> Result<RsRows> {
     let rs = &recipe.rs;
-    let rows16 = poem_compiler::chunk::UNFOLDED_ROWS;
-    let tokens = u32::try_from(rs.tokens_per_piece).unwrap_or(u32::MAX);
-    // The rs buffer becomes a list shape of its own (CONTRACT-BC 18); until
-    // then this shell reads only whole rs rows inside the record.
-    if rs.pieces != 1 || tokens != rows16 {
-        return Err(disagree(format!(
-            "cuts the rs rows into {} pieces of {} tokens, where this shell reads them whole \
-             until the rs buffer is a list shape of its own",
-            rs.pieces, rs.tokens_per_piece
-        )));
+    if rs.is_empty() {
+        return Err(disagree(
+            "states no rs list, where this shell buffers rs rows".to_string(),
+        ));
     }
+    let tokens = u64::from(rs.tokens);
     let mut plane_at: Vec<Option<u64>> = vec![None; layout.planes.len()];
     for (id, row) in &rs.rows {
-        let run = runs
-            .iter()
-            .find(|run| run.row == *id)
-            .ok_or_else(|| disagree(format!("lays no record slot for rs row {id:?}")))?;
+        let run = rs
+            .run(*id)
+            .ok_or_else(|| disagree(format!("lays no run for rs row {id:?}")))?;
         for (at, plane) in row.planes.iter().enumerate() {
             let Some(&mine) = layout.in_of.get(&plane.value.0) else {
                 return Err(disagree(format!(
@@ -509,7 +494,7 @@ fn rs_rows(
                     plane.value.0, plane.bytes, layout.planes[mine].row_bytes
                 )));
             }
-            let offset = run.offset + row.plane_at(at, rs.tokens_per_piece);
+            let offset = run.offset + row.plane_at(at, tokens);
             match plane_at[mine] {
                 Some(held) if held != offset => {
                     return Err(disagree(format!(
@@ -535,9 +520,8 @@ fn rs_rows(
         })
         .collect::<Result<Vec<_>>>()?;
     Ok(RsRows {
-        pieces: rs.pieces,
-        tokens_per_piece: tokens,
-        slots: rs.slots.clone(),
+        tokens: rs.tokens,
+        bytes: rs.bytes,
         plane_at,
     })
 }
@@ -684,20 +668,28 @@ impl Pools {
         self.rs.as_ref()
     }
 
-    /// The unit (`Layout::buffer_stride`) the rs rows of the record whose
-    /// physical pieces are `record` start at.
-    pub fn rs_unit(&self, record: &[u32]) -> Result<u32> {
-        let rs = self.rs.as_ref().ok_or_else(|| Fault::Unbound {
-            what: "the rs buffer rows of a load that buffers none".to_string(),
-        })?;
-        let fixed = *self.shape(FIXED)?;
-        let piece = *record.get(rs.slots[0] as usize).ok_or(Fault::Ceiling {
-            what: "pieces of a record",
-            need: u64::from(rs.slots[0]) + 1,
-            have: record.len() as u64,
-        })?;
-        let at = slot_at(&self.layout, &fixed, piece);
-        Ok(u32::try_from(at / self.layout.buffer_stride()).unwrap_or(u32::MAX))
+    /// A lane's rs-list pages as kernels address them, in token order from
+    /// the verb's base: `refs` (rs-list slot refs) as units of
+    /// [`Layout::rs_stride`], or, seat-addressed, seat `seat`'s run.
+    pub fn rs_pages(&self, refs: &[u32], seat: Option<u32>) -> Result<Vec<u32>> {
+        let rs = *self.shape(RS)?;
+        let stride = self.layout.rs_stride();
+        refs.iter()
+            .enumerate()
+            .map(|(at, &r)| {
+                let slot = match seat {
+                    Some(seat) => {
+                        let per = self.paging.pages_per_slot;
+                        rs.seat_ref(seat * per + u32::try_from(at).unwrap_or(u32::MAX))?
+                    }
+                    None => r,
+                };
+                let offset = self.slot_offset(RS, slot)?;
+                self.pool
+                    .admit(u32::try_from(offset / self.layout.chunk_bytes).unwrap_or(u32::MAX))?;
+                Ok(u32::try_from(offset / stride).unwrap_or(u32::MAX))
+            })
+            .collect()
     }
 
     #[must_use]
@@ -1243,6 +1235,12 @@ impl Pools {
             return Ok(());
         }
         self.copy_whole(frame, FIXED, moves)
+    }
+
+    /// Copies whole slots of shape `id` (slot refs) `(src, dst)` on the
+    /// device: a fire's stated tail copies.
+    pub fn copy_shape(&self, frame: &mut Frame, id: ShapeId, moves: &[(u32, u32)]) -> Result<()> {
+        self.copy_whole(frame, id, moves)
     }
 
     /// Copies whole slots of `id` (slot refs) `(src, dst)` on the device.

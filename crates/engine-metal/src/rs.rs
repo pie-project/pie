@@ -315,17 +315,15 @@ pub struct Buffers {
 }
 
 impl Buffers {
-    /// The rs buffer as rows of the records in the state pool `slab`: each
-    /// plane's 16 rows at `plane_at` in a record's slot, a lane's buffered
-    /// row `s` at row `s % 16`; a lane's "page" is its record's slot,
-    /// counted in units of `stride` from the pool's base.
+    /// The rs buffer as the state pool's rs list (`slab`): each plane's
+    /// `page_tokens` rows at `plane_at` in an rs-list slot, a lane's page ids
+    /// counting `stride` bytes from the pool's base.
     #[must_use]
-    pub fn in_pool(layout: &Layout, plane_at: Vec<u64>, slab: Buffer, stride: u64) -> Buffers {
-        let _ = layout;
+    pub fn in_pool(plane_at: Vec<u64>, page_tokens: u32, slab: Buffer, stride: u64) -> Buffers {
         Buffers {
             slots: u32::try_from(slab.bytes() / stride.max(1)).unwrap_or(u32::MAX),
             slab,
-            page_tokens: poem_compiler::chunk::UNFOLDED_ROWS,
+            page_tokens: page_tokens.max(1),
             page_bytes: stride,
             stride,
             plane_at,

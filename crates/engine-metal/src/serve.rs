@@ -699,7 +699,12 @@ impl PreparedLoad<'_> {
                 boot.slots,
                 seated.pages_per_slot,
             )?
-            .with_window(rows.ring_bytes, rows.ring_window, seated.pages_per_slot)?;
+            .with_window(rows.ring_bytes, rows.ring_window, seated.pages_per_slot)?
+            .with_rs(
+                rows.rs.as_ref().map_or(0, |rs| rs.bytes),
+                rows.rs.as_ref().map_or(0, |rs| rs.tokens),
+                seated.pages_per_slot,
+            )?;
             let pages = u64::from(layout.list.map_or(0, |list| list.per_chunk)) * u64::from(total);
             (
                 paging_at(pages, boot.slots)?,
@@ -750,12 +755,12 @@ impl PreparedLoad<'_> {
         let mut pools = Pools::reserve(&device, rows, layout, paging)?;
         // The null chunk and the floor stand from the load on.
         pools.commit_segments(1)?;
-        let rs_buffers = rs_layout.as_deref().zip(rs_at).map(|(rs, at)| {
+        let rs_buffers = rs_at.map(|at| {
             crate::rs::Buffers::in_pool(
-                rs,
                 at.plane_at,
+                at.tokens,
                 pools.view().clone(),
-                layout.buffer_stride(),
+                layout.rs_stride(),
             )
         });
         let scratch = Scratch::reserve(
@@ -1058,6 +1063,26 @@ impl Shell {
         let mut frame = self.device.frame()?;
         self.pools.evacuate(&mut frame, evacuation)?;
         frame.commit()
+    }
+
+    /// Whole-slot copies a fire states (`Lane::slot_copies`), each
+    /// `[src, dst]` of its shape: they land before any lane of the fire
+    /// reads or writes.
+    pub fn copy_slot_pairs(
+        &mut self,
+        copies: &[(engine::chunk::ShapeId, Vec<[u32; 2]>)],
+    ) -> Result<()> {
+        if copies.iter().all(|(_, pairs)| pairs.is_empty()) {
+            return Ok(());
+        }
+        self.drain()?;
+        let mut frame = self.device.frame()?;
+        for (shape, pairs) in copies {
+            let moves: Vec<(u32, u32)> = pairs.iter().map(|&[src, dst]| (src, dst)).collect();
+            self.pools.copy_shape(&mut frame, *shape, &moves)?;
+        }
+        self.grafted = Some(frame.commit_async(None)?);
+        Ok(())
     }
 
     /// See `Engine::copy_slots`.
@@ -1694,13 +1719,10 @@ impl Shell {
         self.rs_layout.is_some()
     }
 
-    /// The rs buffer's bytes in a record: 16 rows of every replayed plane;
-    /// none where nothing buffers.
+    /// An rs-list slot's bytes; none where nothing buffers.
     #[must_use]
     pub fn buffer_bytes(&self) -> u64 {
-        self.rs_layout.as_ref().map_or(0, |layout| {
-            u64::from(poem_compiler::chunk::UNFOLDED_ROWS) * layout.token_bytes
-        })
+        self.pools.layout().rs.map_or(0, |rs| rs.slot_bytes)
     }
 
     /// Seat `slot`'s state rows, one after another.
@@ -2832,35 +2854,22 @@ impl Shell {
             let first = stated
                 .and_then(|slots| slots.first().copied())
                 .unwrap_or(have);
-            // The buffer's rows live in the record the fire writes: buffered
-            // row `s` at row `s % 16`; the verb's pages are bookkeeping.
+            // The buffer's rows live in the rs list: the verb's pages, in
+            // token order from its base (CONTRACT-BC 18).
             let rs = match seated.rs {
                 engine::fire::RsVerb::Buffer {
-                    pages: _,
+                    pages,
                     base,
                     folded,
                     fold,
-                } => {
-                    let rows16 = poem_compiler::chunk::UNFOLDED_ROWS;
-                    let end = first.saturating_add(row.rows);
-                    if base % rows16 != 0 || end.saturating_sub(*folded) > rows16 {
-                        return Err(Fault::program(
-                            "serve::rs",
-                            format!(
-                                "lane {source} buffers rows {folded}..{end} from base {base}; a \
-                                 record holds {rows16} unfolded rows, from a base on a \
-                                 {rows16}-row boundary"
-                            ),
-                        ));
-                    }
-                    let unit = self.pools.rs_unit(&record)?;
-                    engine::fire::RsVerb::Buffer {
-                        pages: vec![unit; (end - base).div_ceil(rows16) as usize + 1],
-                        base: *base,
-                        folded: *folded,
-                        fold: *fold,
-                    }
-                }
+                } => engine::fire::RsVerb::Buffer {
+                    pages: self
+                        .pools
+                        .rs_pages(pages, (!seated.refs).then_some(lane.slot))?,
+                    base: *base,
+                    folded: *folded,
+                    fold: *fold,
+                },
                 verb => verb.clone(),
             };
             let plan = engine::rs::LanePlan::of(
