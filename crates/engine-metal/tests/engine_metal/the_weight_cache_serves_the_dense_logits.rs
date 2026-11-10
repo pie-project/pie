@@ -603,3 +603,10 @@ fn a_mixtures_quantized_experts_serve_the_whole_logits_mxfp4() {
 fn quantized_per_layer_tables_serve_the_whole_logits() {
     quantized("gemma4-e4b-mini-l6-u4g64-kv-bf16", WeightKind::Rows);
 }
+
+/// Affine u2/128 experts (and a u4/32 n-gram table, u4/64 and u8/64 dense
+/// planes).
+#[test]
+fn a_mixtures_quantized_experts_serve_the_whole_logits_affine_u2() {
+    quantized("qwen38-flash-next-mini-u4g64-u2g128-kv-bf16", WeightKind::Expert);
+}
