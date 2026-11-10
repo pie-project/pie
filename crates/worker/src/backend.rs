@@ -861,6 +861,17 @@ pub(crate) fn create_engine_backend(
             reason = "`EngineOptions` has no variants in this build"
         )
     )]
+    // A wafer program serves the language model alone: a checkpoint carrying a vision tower
+    // is served as its text deployment.
+    #[cfg(feature = "cerebras")]
+    let text_only;
+    #[cfg(feature = "cerebras")]
+    let overrides = if platform == poem_ir::Platform::Cerebras {
+        text_only = without_vision(snapshot_dir, overrides);
+        &text_only
+    } else {
+        overrides
+    };
     let (loaded, deployment, disk_kv_dir) = land(
         &mut backend,
         snapshot_dir,
@@ -882,6 +893,30 @@ pub(crate) fn create_engine_backend(
         disk_kv_dir,
         backend,
     })
+}
+
+/// `overrides` with the checkpoint's vision part left off, where its deployment carries one and
+/// the config does not already leave it off; else `overrides` as they are.
+#[cfg(feature = "cerebras")]
+fn without_vision(
+    snapshot_dir: &Path,
+    overrides: &runtime::engine::load::Overrides,
+) -> runtime::engine::load::Overrides {
+    use runtime::engine::load::{Platform, compose, identify};
+    if overrides.off.iter().any(|part| part == "vision") {
+        return overrides.clone();
+    }
+    let mut text = overrides.clone();
+    text.off.push("vision".into());
+    match identify(snapshot_dir, Platform::Cerebras)
+        .and_then(|base| compose(&base, &text, Platform::Cerebras))
+    {
+        Ok(name) => {
+            tracing::info!(deployment = name, "cerebras: the vision part left off");
+            text
+        }
+        Err(_) => overrides.clone(),
+    }
 }
 
 #[cfg(test)]
