@@ -297,41 +297,7 @@ fn write_package(models: &Path, files: &[(String, String)]) -> Result<()> {
 fn json_file(path: &Path) -> Result<serde_json::Value> {
     let text =
         std::fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?;
-    serde_json::from_str(&finite(&text)).with_context(|| format!("parsing {}", path.display()))
-}
-
-/// `text` with the `Infinity`, `-Infinity` and `NaN` Python's json writes
-/// (and JSON does not) spelled as JSON can read them: the largest finite
-/// double either way, and null.
-fn finite(text: &str) -> String {
-    let mut out = String::with_capacity(text.len());
-    let mut in_string = false;
-    let mut escaped = false;
-    let mut rest = text;
-    while let Some(c) = rest.chars().next() {
-        if in_string {
-            in_string = !(c == '"' && !escaped);
-            escaped = c == '\\' && !escaped;
-        } else if c == '"' {
-            in_string = true;
-        } else {
-            let spelled = [
-                ("-Infinity", "-1.7976931348623157e308"),
-                ("Infinity", "1.7976931348623157e308"),
-                ("NaN", "null"),
-            ]
-            .into_iter()
-            .find(|(word, _)| rest.starts_with(word));
-            if let Some((word, json)) = spelled {
-                out.push_str(json);
-                rest = &rest[word.len()..];
-                continue;
-            }
-        }
-        out.push(c);
-        rest = &rest[c.len_utf8()..];
-    }
-    out
+    checkpoint::file::json::parse(&text).with_context(|| format!("parsing {}", path.display()))
 }
 
 /// What a family's `adopt` is handed as the checkpoint's configuration: its
@@ -1289,18 +1255,6 @@ mod tests {
             "adopted_llama_3_2_1b_instruct"
         );
         assert_eq!(package_name("qwen3-4b"), "adopted_qwen3_4b");
-    }
-
-    #[test]
-    fn a_configuration_python_wrote_reads() {
-        let read: serde_json::Value = serde_json::from_str(&finite(
-            r#"{"a": [0.0, Infinity, -Infinity, NaN], "b": "NaN \"Infinity"}"#,
-        ))
-        .unwrap();
-        assert_eq!(read["a"][1], serde_json::json!(f64::MAX));
-        assert_eq!(read["a"][2], serde_json::json!(-f64::MAX));
-        assert!(read["a"][3].is_null());
-        assert_eq!(read["b"], "NaN \"Infinity");
     }
 
     #[test]

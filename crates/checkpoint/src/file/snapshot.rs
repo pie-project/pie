@@ -112,7 +112,7 @@ fn containers(path: &Path) -> Result<Vec<PathBuf>, Error> {
 fn json_file(path: &Path) -> Result<Value, Error> {
     let text = std::fs::read_to_string(path)
         .map_err(|why| Error::Checkpoint(format!("cannot read {}: {why}", path.display())))?;
-    let json: serde_json::Value = serde_json::from_str(&text)
+    let json: serde_json::Value = crate::file::json::parse(&text)
         .map_err(|why| Error::Checkpoint(format!("{} is not valid JSON: {why}", path.display())))?;
     Ok(cbor(&json))
 }

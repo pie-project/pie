@@ -1,5 +1,6 @@
 pub mod diffusers;
 pub mod emit;
+pub mod json;
 pub mod meta;
 pub mod read;
 pub mod serve;

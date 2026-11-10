@@ -47,7 +47,7 @@ pub fn components(dir: &Path) -> Result<Vec<Component>, Error> {
     let index = dir.join(PIPELINE_INDEX);
     let text = std::fs::read_to_string(&index)
         .map_err(|err| Error::Checkpoint(format!("cannot read {}: {err}", index.display())))?;
-    let value: serde_json::Value = serde_json::from_str(&text).map_err(|err| {
+    let value: serde_json::Value = crate::file::json::parse(&text).map_err(|err| {
         Error::Checkpoint(format!("{} is not valid JSON: {err}", index.display()))
     })?;
     let object = value
@@ -146,7 +146,7 @@ fn subdirectories(dir: &Path) -> Vec<PathBuf> {
 fn shards_from_index(dir: &Path, index: &Path) -> Result<Vec<PathBuf>, Error> {
     let text = std::fs::read_to_string(index)
         .map_err(|err| Error::Checkpoint(format!("cannot read {}: {err}", index.display())))?;
-    let value: serde_json::Value = serde_json::from_str(&text).map_err(|err| {
+    let value: serde_json::Value = crate::file::json::parse(&text).map_err(|err| {
         Error::Checkpoint(format!("{} is not valid JSON: {err}", index.display()))
     })?;
     let weight_map = value

@@ -16,7 +16,7 @@ pub fn discover_safetensors_files(snapshot_dir: &Path) -> Result<Vec<PathBuf>, E
     if index.is_file() {
         let text = std::fs::read_to_string(&index)
             .map_err(|err| Error::Checkpoint(format!("cannot read {}: {err}", index.display())))?;
-        let value: serde_json::Value = serde_json::from_str(&text).map_err(|err| {
+        let value: serde_json::Value = crate::file::json::parse(&text).map_err(|err| {
             Error::Checkpoint(format!("{} is not valid JSON: {err}", index.display()))
         })?;
         let weight_map = value
