@@ -233,6 +233,8 @@ impl ExpertShape {
             count: self.count,
             floor_slots: self.floor,
             name: self.name.clone(),
+            // The runtime places every expert; the load seats none.
+            seated: None,
         }
     }
 
