@@ -23,6 +23,8 @@ pub mod gdn;
 pub mod head;
 pub mod moe;
 pub mod ple;
+pub mod head_groups;
+pub mod row_runs;
 pub mod segments;
 pub mod shared_kv;
 pub mod token_loop;
