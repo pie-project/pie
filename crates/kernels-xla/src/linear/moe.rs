@@ -2517,6 +2517,16 @@ pub fn experts(
     let hidden = f.convert(hidden, Elem::Bf16);
     let down_rows = tiles_of(f, dn, &down_bank, &sorted, hidden)?;
     let n = i64::from(routed.width);
+    // (A wide prompt's fire: a decode's lanes, and a fire of 640 rows, sum
+    // by the one-hot dot, whose cells grow as the square of its tokens:
+    // v6e, Qwen3.6-35B-A3B's 557-token Raw prompt 3% slower through the
+    // blocks.)
+    if tuning.moe_segment_tokens > 0
+        && t >= 8 * tuning.moe_segment_tokens
+        && let Some(y) = segment_sum(f, &sorted, up, up_fan, down_rows, r, valid, tuning)?
+    {
+        return Ok(Some(y));
+    }
     if rows * t > tuning.moe_costs.onehot_cells {
         // Each pair's (weighted) row picked back out and summed per token.
         let dest = dest(f, &sorted, p)?;
@@ -2560,6 +2570,99 @@ pub fn experts(
         Elem::F32,
         false,
     )?))
+}
+
+/// Each token's rows of `ys` (`[rows, n]`, in `sorted`'s tile order) summed
+/// a block of the profile's tokens at a time (`moe_gmm::SegmentSum`): each
+/// block's pairs per expert, from the routes, place its run of each
+/// expert's rows. `None` where the kernel's buffers do not fit.
+fn segment_sum(
+    f: &mut Func,
+    sorted: &Sorted,
+    spec: crate::linear::moe_gmm::Gmm,
+    fan: Fan,
+    ys: Val,
+    r: Val,
+    valid: Val,
+    tuning: Tuning,
+) -> Result<Option<Val>, Error> {
+    use crate::linear::moe_gmm::SegmentSum;
+    let (p, e, t, k, tm) = (fan.pairs(), fan.experts, fan.tokens, fan.top_k, spec.tm);
+    let (tb, chunk) = (tuning.moe_segment_tokens, 16);
+    let (rows, n) = (spec.tiles * tm, f.dims(ys)[1]);
+    let nb = (t + tb - 1) / tb;
+    let seg = SegmentSum {
+        rows,
+        n,
+        experts: e,
+        blocks: nb,
+        tb,
+        chunk,
+        depth: SegmentSum::depth_of(tb, k, e, chunk),
+        vmem_cap: tuning.vmem_cap(),
+    };
+    // (The cuts it is measured on: 32 experts, rows 2048 and 2816 wide.)
+    if !seg.fits() || n % 128 != 0 || n > 4096 || e > 32 || tm % chunk != 0 {
+        return Ok(None);
+    }
+    // Each block's pairs per expert (the pairs are token-major: block `b`
+    // holds pairs `b·tb·k ..`), and the pairs of the blocks before it.
+    let top = f.const_i(Elem::I32, e, &[p]);
+    let key = f.select(valid, r, top)?;
+    let key = if nb * tb * k > p {
+        let none = f.const_i(Elem::I32, e, &[]);
+        f.pad(key, none, &[0], &[nb * tb * k - p], &[0])?
+    } else {
+        key
+    };
+    let key = f.reshape(key, &[nb, tb * k])?;
+    let counts = {
+        let ks = f.broadcast(key, &[nb, tb * k, e], &[0, 1])?;
+        let es = f.iota(Elem::I32, &[nb, tb * k, e], 2);
+        let hit = f.compare(Cmp::Eq, ks, es)?;
+        let one = f.const_i(Elem::I32, 1, &[nb, tb * k, e]);
+        let none = f.const_i(Elem::I32, 0, &[nb, tb * k, e]);
+        let hit = f.select(hit, one, none)?;
+        f.reduce(hit, &[1], Fold::Sum)?
+    };
+    let before = f.scan(counts, 0, Fold::Sum)?;
+    let before = f.sub(before, counts)?;
+    // A block's run of an expert's rows, from the expert's first tile.
+    let first = f.sub(sorted.tend, sorted.per)?;
+    let tt = f.const_i(Elem::I32, tm, &[e]);
+    let first = f.mul(first, tt)?;
+    let first = f.broadcast(first, &[nb, e], &[1])?;
+    let lo = f.add(first, before)?;
+    let hi = f.add(lo, counts)?;
+    // Whole chunks of rows from the one holding the run's first.
+    let cc = f.const_i(Elem::I32, chunk, &[nb, e]);
+    let start = f.div(lo, cc)?;
+    let start = f.mul(start, cc)?;
+    let more = f.const_i(Elem::I32, chunk - 1, &[nb, e]);
+    let span = f.sub(hi, start)?;
+    let span = f.add(span, more)?;
+    let span = f.div(span, cc)?;
+    let zero = f.const_i(Elem::I32, 0, &[nb, e]);
+    let any = f.compare(Cmp::Gt, counts, zero)?;
+    let cnt = f.select(any, span, zero)?;
+    let off = f.scan(cnt, 1, Fold::Sum)?;
+    let off = f.sub(off, cnt)?;
+    let off = f.mul(off, cc)?;
+    let start = f.reshape(start, &[nb * e])?;
+    let cnt = f.reshape(cnt, &[nb * e])?;
+    let off = f.reshape(off, &[nb * e])?;
+    // Each row's token (-1 where no pair holds the row), a lane tile wide.
+    let pp = f.const_i(Elem::I32, p, &[rows]);
+    let pair = f.compare(Cmp::Lt, sorted.held, pp)?;
+    let none = f.const_i(Elem::I32, -1, &[rows]);
+    let tok = f.select(pair, sorted.src, none)?;
+    let tok = f.broadcast(tok, &[rows, 128], &[0])?;
+    let out = seg.kernel()?.call(f, &[start, cnt, off, tok, ys])?[0];
+    Ok(Some(if nb * tb > t {
+        f.slice_axis(out, 0, 0, t)?
+    } else {
+        out
+    }))
 }
 
 /// A dense (bf16) bank: `bank` holds `[experts, N * K]` (any row shape).

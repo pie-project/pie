@@ -68,6 +68,13 @@ pub struct MoeGmmRun(pub u32);
 #[decision(id = "kernel.moe.gmm_block_mib", constant(range(1..=64)), default = 12, tune = search)]
 pub struct MoeGmmBlockMib(pub u32);
 
+/// Tokens a block of a routed MLP's sum takes (0: one one-hot dot over every
+/// row): each block copies the runs its tokens hold of each expert's rows
+/// and sums them by its own dot (`moe_gmm::SegmentSum`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Decision)]
+#[decision(id = "kernel.moe.segment_tokens", constant(set(0, 128)), default = 0, tune = search)]
+pub struct MoeSegmentTokens(pub u32);
+
 macro_rules! moe_costs {
     ($($ty:ident = $id:literal, $lo:literal ..= $hi:literal, $default:literal, $doc:literal;)*) => {
         $(
@@ -176,6 +183,13 @@ pub struct SsmChunk(pub u32);
 #[decision(id = "kernel.ssm.long_chunk", constant(set(64, 128, 256)), default = 128, tune = search)]
 pub struct SsmLongChunk(pub u32);
 
+/// From this many lanes a GDN decode step takes each head's `q·S` and
+/// `k·S` and its `k ⊗ δ` update through the MXU, a lane's state stored back
+/// while the next lane steps (three state buffers). 0 never does.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Decision)]
+#[decision(id = "kernel.ssm.step_mxu", constant(set(0, 8, 16, 32, 64)), default = 0, tune = search)]
+pub struct SsmStepMxu(pub u32);
+
 /// Tokens per chunk of the per-channel-decay (KDA) chunked scan, whose
 /// intra-chunk decay is a `[C, C, d]` product.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Decision)]
@@ -190,6 +204,7 @@ pub fn register(registry: &mut Registry) {
         .add::<MoeGmmTm>()
         .add::<MoeGmmRun>()
         .add::<MoeGmmBlockMib>()
+        .add::<MoeSegmentTokens>()
         .add::<MoeDenseAllMi>()
         .add::<MoeSliceMib>()
         .add::<MoeSlicePairs>()
@@ -209,7 +224,8 @@ pub fn register(registry: &mut Registry) {
         .add::<AttnUnrolledBlocks>()
         .add::<SsmChunk>()
         .add::<SsmLongChunk>()
-        .add::<SsmKdaChunk>();
+        .add::<SsmKdaChunk>()
+        .add::<SsmStepMxu>();
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -256,6 +272,9 @@ pub struct SsmChunks {
     pub chunk: i64,
     pub long_chunk: i64,
     pub kda_chunk: i64,
+    /// The lanes from which a GDN decode step runs through the MXU
+    /// ([`SsmStepMxu`]).
+    pub step_mxu: i64,
 }
 
 /// The kernel decisions one load runs under, and the device's VMEM.
@@ -267,6 +286,7 @@ pub struct Tuning {
     pub moe_gmm_tm: i64,
     pub moe_gmm_run: i64,
     pub moe_gmm_block_bytes: i64,
+    pub moe_segment_tokens: i64,
     pub moe_costs: MoeCosts,
     pub grouped: Grouped,
     pub attn_per_row_max: i64,
@@ -287,6 +307,7 @@ impl Tuning {
         moe_gmm_tm: 16,
         moe_gmm_run: 1,
         moe_gmm_block_bytes: 12 << 20,
+        moe_segment_tokens: 0,
         moe_costs: MoeCosts {
             dense_all: 1 << 27,
             slice_bytes: 18 << 20,
@@ -316,6 +337,7 @@ impl Tuning {
             chunk: 64,
             long_chunk: 128,
             kda_chunk: 16,
+            step_mxu: 0,
         },
         vmem_bytes: Self::V6E_VMEM,
     };
@@ -330,6 +352,7 @@ impl Tuning {
             moe_gmm_tm: n(profile.get::<MoeGmmTm>().0),
             moe_gmm_run: n(profile.get::<MoeGmmRun>().0),
             moe_gmm_block_bytes: n(profile.get::<MoeGmmBlockMib>().0) << 20,
+            moe_segment_tokens: n(profile.get::<MoeSegmentTokens>().0),
             moe_costs: MoeCosts {
                 dense_all: n(profile.get::<MoeDenseAllMi>().0) << 20,
                 slice_bytes: n(profile.get::<MoeSliceMib>().0) << 20,
@@ -368,6 +391,7 @@ impl Tuning {
                 chunk: n(profile.get::<SsmChunk>().0),
                 long_chunk: n(profile.get::<SsmLongChunk>().0),
                 kda_chunk: n(profile.get::<SsmKdaChunk>().0),
+                step_mxu: n(profile.get::<SsmStepMxu>().0),
             },
             vmem_bytes,
         }
