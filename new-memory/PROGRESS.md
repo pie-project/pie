@@ -758,3 +758,14 @@ The `new-memory/` directory is bookkeeping and is removed before anything lands 
   `source`. Host `live` excludes parked idle cache (spillable vs real state visible to policy).
 - Verified: runtime store/planner/policy::pressure 151 pass; e2e Qwen3 (640 MiB device, 512/256 MiB host, persistent
   disk): restart takes back 750 / 875 pages, P now hits after restart (M52: cold); suspend regression identical.
+
+### M56 — 2026-11-10: held as a hint; load seats weights and arms (fixes "bodies armed 0 of 0")
+- `sc/l40s-held-hint` (1ae41d5ca): M54's deferred arming made the pool fit take the whole card (no room left for
+  bodies -> real models decoded eager). Now a held load seats every atom in pool slots at load (from the serving file,
+  chunks from 1, shape by shape) and arms at load; `WeightShape.seated: Option<u32>` states where (atom a -> slot
+  first + a). The first residency re-points (refill from file, logged) if it names other slots; a non-held / partial
+  first residency pins a miss copy from the file (free-memory refusal) and re-arms. MADV_DONTNEED after file copies.
+- L40S: nemotron mini told held + adopted seating: boot 5.2 s / 5.4 s (256 / 5120 tokens) vs 19.6 / 266 s, logits =
+  base; off-by-one-chunk and auto-undersized cases = untold results bitwise.
+- Next: runtime adopts `seated` at boot (RWS). Known: engine-wgpu without features fails to build (VK2 rows.rs
+  `write_shared` on the stub buffer) — VK3 to fix.
