@@ -182,3 +182,113 @@ fn zz_compile_shapes() {
         );
     }
 }
+
+/// Scratch: after the warm ladder, which prompt fires still trace a new program. ZZ_PF = comma list of
+/// NxR (N fresh prompts of R rows each) or NxR+DxP (and D decodes at P pages); ZZ_LANES sets the load.
+#[test]
+fn zz_ladder_misses() {
+    use engine_xla::{Lane, Seated};
+    use poem::Request;
+    let Ok(list) = std::env::var("ZZ_PF") else { return };
+    let name = std::env::var("ZZ_NAME").unwrap_or_else(|_| "qwen35-d0.8b-bf16-kv-bf16".into());
+    let lanes_cap: u32 = std::env::var("ZZ_LANES").ok().and_then(|p| p.parse().ok()).unwrap_or(256);
+    let (page, context, slots) = (16u32, 2048u32, 512u32);
+    let deployment = poem_compiler::catalog::deployment(&name).expect("the deployment is listed");
+    let trace = deployment.trace(Platform::Xla);
+    let paging = engine_xla::store::kv::Paging::of(page, context, slots, u64::from(slots * context / page)).unwrap();
+    let kv_budget = engine_xla::store::pool_demand(&trace, paging).unwrap();
+    let contract = checkpoint::contract::ModelContract { alignment: 1, tensors: Vec::new(), groups: Vec::new() };
+    let mut shell = Shell::load_dry(
+        Boot {
+            trace,
+            contract: &contract,
+            checkpoint: Path::new("/dev/null"),
+            budget: Budget { max_lanes: lanes_cap, max_tokens: 2048, buckets: Vec::new(), max_adapters: 0, readouts_per_lane: poem_compiler::arena::READOUTS_PER_LANE },
+            patches: None,
+            page_size: page,
+            context,
+            slots,
+            kv_budget: Some(kv_budget),
+            memory_share: engine::load::DEFAULT_DEVICE_MEMORY_SHARE,
+            device: &DeviceBoot::default(),
+        },
+        None,
+        false,
+    )
+    .expect("the dry shell loads");
+    shell.prewarm().expect("the ladder fires");
+    let facts = shell.trace().facts.clone();
+    let pages: Vec<u32> = (0..context / page).collect();
+    let tokens = vec![7u32; 2048];
+    // ZZ_PF=sweep:<n>:<lo>:<hi>: n random fires of prompts of lo..hi rows each, as many as fit 2048 rows
+    let list = if let Some(rest) = list.strip_prefix("sweep:") {
+        let v: Vec<u32> = rest.split(':').map(|x| x.parse().unwrap()).collect();
+        let mut seed = 12345u64;
+        let mut rnd = |m: u32| {
+            seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            ((seed >> 33) % u64::from(m)) as u32
+        };
+        let mut items = Vec::new();
+        for _ in 0..v[0] {
+            // prompts as the runtime packs them: until the next would pass 2048 rows (or a random stop)
+            let mut rows = Vec::new();
+            let mut total = 0;
+            let stop = rnd(3) == 0;
+            let cap = if stop { 1 + rnd(40) } else { 1000 };
+            loop {
+                let r = v[1] + rnd(v[2] - v[1] + 1);
+                if total + r > 2048 || rows.len() as u32 >= cap.min(lanes_cap.saturating_sub(16)) {
+                    break;
+                }
+                total += r;
+                rows.push(r.to_string());
+            }
+            if !rows.is_empty() {
+                items.push(rows.join("/"));
+            }
+        }
+        items.join(",")
+    } else {
+        list
+    };
+    let mut misses = 0;
+    for item in list.split(',') {
+        let (pf, dec) = item.split_once('+').map_or((item, None), |(a, b)| (a, Some(b)));
+        let rows: Vec<u32> = if let Some((n, r)) = pf.split_once('x') {
+            vec![r.parse().unwrap(); n.parse().unwrap()]
+        } else {
+            pf.split('/').map(|x| x.parse().unwrap()).collect()
+        };
+        let n = rows.len() as u32;
+        let (d, p): (u32, u32) = dec.map_or((0, 0), |x| {
+            let (a, b) = x.split_once('x').unwrap();
+            (a.parse().unwrap(), b.parse().unwrap())
+        });
+        for s in 0..n + d {
+            shell.open(s % slots).unwrap();
+        }
+        let mut seated: Vec<Seated<'_>> = (0..d)
+            .map(|lane| {
+                let mut s = Seated::of(Lane { slot: (n + lane) % slots, word: facts.word(&Request::new(1, false)), tokens: &tokens[..1] });
+                s.pages = &pages[..p as usize];
+                s.held = Some(p * page - 1);
+                s
+            })
+            .collect();
+        for lane in 0..n {
+            let r = rows[lane as usize];
+            let mut s = Seated::of(Lane { slot: lane % slots, word: facts.word(&Request::new(r, false)), tokens: &tokens[..r as usize] });
+            s.pages = &pages[..r.div_ceil(page) as usize];
+            s.held = Some(0);
+            seated.push(s);
+        }
+        let before = shell.device().dry_texts().len();
+        let ok = shell.fire_full(&seated).is_ok();
+        let texts = shell.device().dry_texts();
+        if texts.len() > before {
+            misses += 1;
+            eprintln!("ZZM {} lanes {} rows: ok={ok} new texts {}", n, rows.iter().sum::<u32>(), texts.len() - before);
+        }
+    }
+    eprintln!("ZZM misses {misses} of {}", list.split(',').count());
+}
