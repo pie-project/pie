@@ -40,13 +40,6 @@ impl FrameShell for Shell {
         Self: 'a,
     {
         let _ = prev;
-        if self.weights_awaited {
-            return Err(Fault::Unbound {
-                what: "a fire before the first weight residency: this load holds its \
-                       streamable weights in the pool alone, and no slot is filled yet"
-                    .to_string(),
-            });
-        }
         let StepView {
             lanes,
             attachments,

@@ -2064,6 +2064,10 @@ fn served_experts(fixture: &Fixture, cache: &Path, rows: Rows) -> Vec<Vec<f32>> 
     served_experts_as(fixture, cache, rows, false)
 }
 
+/// Whether a told load's held set names other slots than the load seated
+/// its weights in ([`served_experts_as`]).
+static MOVED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
 /// [`served_experts`], the load told at the start that its weights are held
 /// (`told`: a deployment that streams nothing says so in its load request),
 /// so it keeps no host copy and arms at the residency.
@@ -2093,8 +2097,12 @@ fn served_experts_as(fixture: &Fixture, cache: &Path, rows: Rows, told: bool) ->
     let mut resident = Vec::new();
     // Each shape's slots in chunks of its own, from the pool's first chunk
     // on, as a runtime's allocator lays them: where this load's own fires
-    // seated their pages.
-    let mut first = 1;
+    // seated their pages. A load told its weights are held seated them
+    // itself and says where (`WeightShape::seated`): a held set adopts
+    // that, or ([`MOVED`]) starts a chunk on, so every atom moves into a
+    // slot another may lie in.
+    let moved = MOVED.load(std::sync::atomic::Ordering::Relaxed);
+    let mut first = if told && moved { 2 } else { 1 };
     // A deployment that streams nothing holds every weight shape whole, the
     // row-streamed tables' too; the other two lay the experts alone.
     let named: Vec<_> = facts
@@ -2111,12 +2119,24 @@ fn served_experts_as(fixture: &Fixture, cache: &Path, rows: Rows, told: bool) ->
                 Rows::Mixed => atom % 2 == 0,
             })
             .collect();
+        let adopted = shape
+            .seated
+            .filter(|_| told && rows == Rows::Cached && !moved);
+        if told {
+            assert!(
+                shape.seated.is_some(),
+                "a load told its weights are held states where it seated them"
+            );
+        }
         resident.extend(cached.iter().enumerate().map(|(at, &atom)| ResidentWeight {
             atom: WeightAtom {
                 shape: shape.id,
                 atom,
             },
-            slot: first * shape.slots_per_chunk + at as u32,
+            slot: match adopted {
+                Some(seated) => seated + atom,
+                None => first * shape.slots_per_chunk + at as u32,
+            },
         }));
         first += (cached.len() as u32).div_ceil(shape.slots_per_chunk);
         if shape.kind == WeightKind::Expert {
@@ -2236,6 +2256,20 @@ fn golden_experts() {
             hash(&cached),
             "{model} told its weights are held"
         );
+        // And with the runtime's set a chunk off the load's seating: every
+        // atom is filled again where it is named.
+        MOVED.store(true, std::sync::atomic::Ordering::Relaxed);
+        let moved = served_experts_as(&serving, &cache, Rows::Cached, true);
+        MOVED.store(false, std::sync::atomic::Ordering::Relaxed);
+        println!(
+            "golden {model} all {:016x} (Cached, told held, moved)",
+            hash(&moved)
+        );
+        assert_eq!(
+            hash(&moved),
+            hash(&cached),
+            "{model} told its weights are held, its atoms named elsewhere"
+        );
         for rows in [Rows::Host, Rows::Mixed] {
             let steps = served_experts(&fixture, &cache, rows);
             let most = steps
@@ -2259,6 +2293,20 @@ fn golden_experts() {
                     hash(&steps),
                     hash(&cached),
                     "{model} with its experts {rows:?}"
+                );
+            }
+            // A load told its weights are held, which the runtime then
+            // streams (its pool does not seat them all): the engine makes
+            // its miss copy at the residency, arms again, and serves the
+            // same.
+            if rows == Rows::Mixed {
+                let serving = fixture_as(&model, &cache, true);
+                let late = served_experts_as(&serving, &cache, rows, true);
+                println!("golden {model} all {:016x} (Mixed, told held)", hash(&late));
+                assert_eq!(
+                    hash(&late),
+                    hash(&steps),
+                    "{model} told its weights are held and streamed after all"
                 );
             }
         }

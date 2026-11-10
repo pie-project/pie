@@ -547,6 +547,15 @@ pub struct Pools {
     /// The caches' host copies are the serving file's mapping, which no
     /// fire may read in place ([`Pools::file_weights`]).
     weights_filed: bool,
+    /// The pinned copy misses are read from, where the load left the
+    /// weights in the file and the runtime streams them after all.
+    miss_copy: Option<crate::device::Pinned>,
+    /// The spans of the serving file's mapping copied out of it since the
+    /// pages were last let go ([`Pools::release_file_pages`]).
+    file_spans: Vec<(u64, usize)>,
+    /// The load seated every weight atom in slots of its own choosing
+    /// ([`Pools::preseat_weights`]), until the runtime's first residency.
+    preseated: bool,
     /// Each record a lane named by slot refs, by its first piece's ref: the
     /// refs of all its pieces.
     records: std::collections::HashMap<u32, Vec<u32>>,
@@ -928,6 +937,9 @@ impl Pools {
             weights_held: false,
             hosts_dropped: false,
             weights_filed: false,
+            miss_copy: None,
+            preseated: false,
+            file_spans: Vec::new(),
             records: std::collections::HashMap::new(),
             id_lanes: 1,
             snap_entries: 1,
@@ -2055,7 +2067,7 @@ impl Pools {
             .flat_map(|cache| {
                 cache.planes.iter().map(move |bank| {
                     let first = (bank.layer * cache.shape.experts) as usize;
-                    let located = self.weights_held
+                    let located = (self.weights_held || self.preseated)
                         && cache.slots[first..first + cache.shape.experts as usize]
                             .iter()
                             .all(Option::is_some);
@@ -2188,7 +2200,7 @@ impl Pools {
                     .filter(|resident| resident.atom.shape == shape)
                     .count()
             };
-            let short = self
+            let whole = self
                 .row_caches
                 .iter()
                 .map(|cache| (cache.shape.id, cache.slots.len()))
@@ -2197,22 +2209,47 @@ impl Pools {
                         .iter()
                         .map(|cache| (cache.shape.id, cache.slots.len())),
                 )
-                .find(|&(shape, atoms)| named(shape) < atoms);
-            if !residency.held || short.is_some() {
-                return Err(Fault::Unbound {
-                    what: format!(
-                        "a weight residency that {} on a load told its weights are held: \
-                         it kept no copy a miss could be read from",
-                        match short {
-                            Some((shape, atoms)) =>
-                                format!("names {} of shape {shape}'s {atoms} atoms", named(shape)),
-                            None => "is not held".to_string(),
-                        }
-                    ),
-                });
+                .all(|(shape, atoms)| named(shape) >= atoms);
+            if !residency.held || !whole {
+                // The load was told its weights would be held, and the
+                // runtime streams them after all (its pool does not seat
+                // every atom): the copy a miss is read from is made now.
+                self.pin_weight_hosts()?;
             }
         }
         let before = located(self);
+        // An atom the load seated that the runtime names another slot for
+        // is filled there again: said, since a runtime that adopted the
+        // load's seating moves none.
+        if self.preseated {
+            let moved = residency
+                .resident
+                .iter()
+                .filter(|resident| {
+                    self.row_caches
+                        .iter()
+                        .map(|cache| (cache.shape.id, &cache.slots))
+                        .chain(
+                            self.expert_caches
+                                .iter()
+                                .map(|cache| (cache.shape.id, &cache.slots)),
+                        )
+                        .find(|(id, _)| *id == resident.atom.shape)
+                        .and_then(|(_, slots)| slots.get(resident.atom.atom as usize))
+                        .is_some_and(|held| *held != Some(resident.slot))
+                })
+                .count();
+            if moved > 0 {
+                eprintln!(
+                    "engine-cuda: the first weight residency names {moved} of {} atoms a slot \
+                     other than the one the load seated them in (`WeightShape::seated`); each \
+                     is read from the serving file again",
+                    residency.resident.len()
+                );
+            }
+        }
+        // The runtime's set stands from here on, the load's own no longer.
+        self.preseated = false;
         self.weights_held = residency.held;
         for at in 0..self.row_caches.len() {
             let shape = self.row_caches[at].shape.clone();
@@ -2339,7 +2376,7 @@ impl Pools {
 
     /// Fills weight slots from the host copies, `(slot, host, bytes)` each.
     fn fill_weights(
-        &self,
+        &mut self,
         stream: *mut core::ffi::c_void,
         fills: &[(u64, u64, usize)],
     ) -> Result<()> {
@@ -2354,6 +2391,7 @@ impl Pools {
             // Pageable memory: a copy a span, staged by the runtime.
             for &(slot, file, bytes) in fills {
                 crate::device::copy_any(stream, slot, file, bytes)?;
+                self.file_spans.push((file, bytes));
             }
             return Ok(());
         }
@@ -2361,10 +2399,172 @@ impl Pools {
     }
 
     /// The caches' host copies are the serving file's mapping: a slot is
-    /// filled from it, and no atom is read where it lies, so a residency
-    /// names every atom and holds them.
+    /// filled from it, and no atom is read where it lies. A residency that
+    /// does not hold every atom makes the copy a miss is read from first
+    /// ([`Pools::pin_weight_hosts`]).
     pub fn file_weights(&mut self) {
         self.weights_filed = true;
+    }
+
+    /// Whether a span of the serving file's mapping was copied out since
+    /// its pages were last let go.
+    #[must_use]
+    pub fn copied_from_file(&self) -> bool {
+        !self.file_spans.is_empty()
+    }
+
+    /// Lets go of the pages of the serving file's mapping that were copied
+    /// out of it (into pool slots, or the pinned copy): they are read again
+    /// only to fill a slot, from the page cache. The copies have landed
+    /// (the caller synchronized the stream that carried them).
+    pub fn release_file_pages(&mut self) {
+        const PAGE: u64 = 4096;
+        for (at, bytes) in std::mem::take(&mut self.file_spans) {
+            let first = at.next_multiple_of(PAGE);
+            let end = (at + bytes as u64) / PAGE * PAGE;
+            if end > first {
+                // SAFETY: whole pages inside a read-only file mapping the
+                // weight store holds for the load's life; the advice drops
+                // their resident copies, which a later read faults back in.
+                unsafe {
+                    libc::madvise(
+                        first as *mut core::ffi::c_void,
+                        (end - first) as usize,
+                        libc::MADV_DONTNEED,
+                    );
+                }
+            }
+        }
+    }
+
+    /// The residency a load seats its weights by before the runtime names
+    /// any slot: every atom of every shape, each shape's in chunks of its
+    /// own from the pool's first on. `None` where the pool cannot hold them
+    /// all.
+    #[must_use]
+    pub fn preseat_plan(&self) -> Option<engine::chunk::WeightResidency> {
+        let shapes = self
+            .row_caches
+            .iter()
+            .map(|cache| (cache.shape.id, cache.shape.per_chunk, cache.slots.len()))
+            .chain(
+                self.expert_caches
+                    .iter()
+                    .map(|cache| (cache.shape.id, cache.shape.per_chunk, cache.slots.len())),
+            );
+        let mut first = 1u32;
+        let mut resident = Vec::new();
+        for (shape, per_chunk, atoms) in shapes {
+            let per_chunk = per_chunk.max(1);
+            resident.extend((0..atoms as u32).map(|atom| engine::chunk::ResidentWeight {
+                atom: engine::chunk::WeightAtom { shape, atom },
+                slot: first * per_chunk + atom,
+            }));
+            first = first.checked_add((atoms as u32).div_ceil(per_chunk))?;
+        }
+        (first < self.chunks.total()).then_some(engine::chunk::WeightResidency {
+            staging: Vec::new(),
+            resident,
+            held: true,
+        })
+    }
+
+    /// Seats the load's weights by `plan` ([`Pools::preseat_plan`]): the
+    /// slots' segments backed, each filled from the serving file, the
+    /// tables located. The load arms over them; the runtime's first
+    /// residency then names the slots it chose, and an atom it puts
+    /// elsewhere is filled there again.
+    pub fn preseat_weights(
+        &mut self,
+        stream: *mut core::ffi::c_void,
+        plan: &engine::chunk::WeightResidency,
+    ) -> Result<()> {
+        let segment = self.chunks.layout().segment_chunks.max(1);
+        let last = self.weight_chunks(plan).into_iter().max().unwrap_or(0);
+        self.commit_segments((last + 1).div_ceil(segment))?;
+        self.weight_residency(stream, plan)?;
+        self.weights_held = false;
+        self.preseated = true;
+        Ok(())
+    }
+
+    /// Gives the caches a copy a fire can read a miss from, out of the
+    /// serving file's mapping they were left in: the mapping itself where
+    /// the device faults mapped pages in, else a pinned copy of every
+    /// streamed table and bank, refused where the machine has not the
+    /// memory for it.
+    pub fn pin_weight_hosts(&mut self) -> Result<()> {
+        self.weights_filed = false;
+        if crate::experts::pageable_access() {
+            return Ok(());
+        }
+        let align = |bytes: u64| bytes.next_multiple_of(crate::weights::ALIGN);
+        // Each copy's place in the pinned span, its source and its bytes.
+        let mut spans: Vec<(u64, u64, u64)> = Vec::new();
+        let mut total = 0u64;
+        let mut lay = |file: u64, bytes: u64, total: &mut u64| {
+            spans.push((*total, file, bytes));
+            *total += align(bytes);
+        };
+        for cache in &self.row_caches {
+            lay(
+                cache.host,
+                cache.shape.rows * cache.shape.row_bytes,
+                &mut total,
+            );
+        }
+        for cache in &self.expert_caches {
+            for bank in &cache.planes {
+                lay(
+                    bank.host,
+                    u64::from(cache.shape.experts) * bank.plane.bytes,
+                    &mut total,
+                );
+            }
+        }
+        let have = crate::weights::available_memory();
+        if total > have {
+            return Err(Fault::Residency(format!(
+                "the runtime streams this load's weights, which needs a pinned host copy of \
+                 them, {:.1} GiB, and this machine has {:.1} GiB of memory left for it. Give \
+                 the pool room to hold them all (`weight_streaming = \"off\"` with a larger \
+                 device share), or use a device with pageable memory access (HMM).",
+                total as f64 / f64::from(1u32 << 30),
+                have as f64 / f64::from(1u32 << 30),
+            )));
+        }
+        let pinned =
+            crate::device::Pinned::mapped_uninit(usize::try_from(total).unwrap_or(usize::MAX))?;
+        for &(at, file, bytes) in &spans {
+            let len = usize::try_from(bytes).unwrap_or(usize::MAX);
+            // SAFETY: `file` and `bytes` are a plane of the serving file's
+            // mapping the weight store bound and holds for the load's life.
+            let plane = unsafe { core::slice::from_raw_parts(file as *const u8, len) };
+            if !pinned.write(usize::try_from(at).unwrap_or(usize::MAX), plane) {
+                return Err(Fault::program(
+                    "store::weights",
+                    "a streamed weight does not fit the pinned copy sized for it",
+                ));
+            }
+            self.file_spans.push((file, len));
+        }
+        let base = pinned.device();
+        let mut copies = spans.iter().map(|&(at, _, _)| base + at);
+        for cache in &mut self.row_caches {
+            cache.host = copies.next().unwrap_or(cache.host);
+        }
+        for cache in &mut self.expert_caches {
+            for bank in &mut cache.planes {
+                bank.host = copies.next().unwrap_or(bank.host);
+            }
+        }
+        eprintln!(
+            "engine-cuda: the runtime streams weights this load was told it would hold; {} \
+             MiB of them pinned on the host from the serving file, for misses",
+            total >> 20
+        );
+        self.miss_copy = Some(pinned);
+        Ok(())
     }
 
     /// The params whose host copies no fire reads and no fill needs again:
@@ -2392,6 +2592,13 @@ impl Pools {
     /// The host copies are gone: nothing is filled from them again.
     pub fn drop_weight_hosts(&mut self) {
         self.hosts_dropped = true;
+    }
+
+    /// Whether every streamed bank's table is located: each expert in a
+    /// slot of a set that is held.
+    #[must_use]
+    pub fn weights_located(&self) -> bool {
+        self.expert_tables().iter().all(|(_, table)| table.located)
     }
 
     /// The row-streamed tables' blocks named a slot, and all of them.
@@ -2490,6 +2697,22 @@ impl Pools {
         let mut facts = self
             .chunks
             .facts(max_tokens, spare, !elastic::mapped_on_demand());
+        // Where the load seated the weights itself, for a runtime to adopt.
+        if self.preseated {
+            for shape in &mut facts.weights {
+                shape.seated = self
+                    .row_caches
+                    .iter()
+                    .map(|cache| (cache.shape.id, &cache.slots))
+                    .chain(
+                        self.expert_caches
+                            .iter()
+                            .map(|cache| (cache.shape.id, &cache.slots)),
+                    )
+                    .find(|(id, _)| *id == shape.id)
+                    .and_then(|(_, slots)| slots.first().copied().flatten());
+            }
+        }
         facts.host_chunks = self.tier_chunks();
         facts.disk_chunks = self.disk_chunks();
         facts.disk_kept = self.disk_kept();

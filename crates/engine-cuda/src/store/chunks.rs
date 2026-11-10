@@ -657,6 +657,7 @@ impl Chunks {
                     count: rows.blocks,
                     floor_slots: rows.floor.min(rows.blocks),
                     name: format!("param {}", rows.param),
+                    seated: None,
                 })
                 .chain(
                     layout
@@ -677,6 +678,7 @@ impl Chunks {
                                     .and_then(|l| l.first())
                                     .map_or(0, |p| p.param)
                             ),
+                            seated: None,
                         }),
                 )
                 .collect(),

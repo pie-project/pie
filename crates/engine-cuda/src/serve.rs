@@ -99,9 +99,6 @@ pub struct Shell {
     tiers: record::Tiers,
     landing: Vec<Vec<poem_ir::Request>>,
     armed: Option<Armed>,
-    /// The load left weights in the serving file: no fire runs, and the
-    /// lattice is not armed, until a weight residency fills their slots.
-    weights_awaited: bool,
     media: poem_ir::ClassSet,
     shifted: Vec<bool>,
     lane_shifted: Vec<bool>,

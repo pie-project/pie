@@ -49,6 +49,15 @@ pub struct WeightShape {
     /// The trace's name for the weight, for logs.
     #[serde(default)]
     pub name: String,
+    /// Where the load itself seated the shape's atoms, if it did: atom `a`
+    /// lies in slot ref `seated + a`, filled and read by the engine's fires
+    /// from the load on (its chunks are `seated / slots_per_chunk` through
+    /// `(seated + count - 1) / slots_per_chunk`, the shape's alone). A
+    /// runtime that holds the weights claims exactly these slots and names
+    /// them in its first residency, so no atom moves; one it names
+    /// elsewhere the engine fills again.
+    #[serde(default)]
+    pub seated: Option<u32>,
 }
 
 impl WeightShape {
