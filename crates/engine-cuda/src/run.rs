@@ -2175,6 +2175,22 @@ impl<'c> Run<'c> {
         }
     }
 
+    /// The table a packed bank's select reads its experts through, where
+    /// the weight cache streams the bank (an entry an expert its codes,
+    /// scales and third plane); the contiguous bank's otherwise.
+    #[cfg(feature = "cuda")]
+    pub(crate) fn bank_table(&self, id: ValueId) -> ExpertTable {
+        let Def::Weight(w) = &self.values[id.0 as usize].def else {
+            return ExpertTable::RESIDENT;
+        };
+        self.fire
+            .tables
+            .expert_tables
+            .iter()
+            .find(|(param, _)| *param == *w)
+            .map_or(ExpertTable::RESIDENT, |(_, table)| *table)
+    }
+
     pub(crate) fn expert_bank(&self, id: ValueId) -> (Tensor, ExpertTable) {
         let at = id.0 as usize;
         let Def::Weight(w) = &self.values[at].def else {

@@ -2101,13 +2101,31 @@ impl Pools {
     /// Opens the cache of each expert shape: `hosts` gives each bank's
     /// mapped host copy by its param. No expert is cached yet; each is read
     /// from the host copy.
-    pub fn seat_experts(&mut self, hosts: &[(u32, u64)]) -> Result<()> {
+    ///
+    /// `groups` names each packed bank by its codes' param with the params
+    /// of its planes in the order its select's table lists them (the codes
+    /// first; `None` a plane the bank lacks): one table for the bank, an
+    /// expert's entry a plane. A plane in no group is a dense bank, a table
+    /// of its own.
+    pub fn seat_experts(
+        &mut self,
+        hosts: &[(u32, u64)],
+        groups: &[(u32, Vec<Option<u32>>)],
+    ) -> Result<()> {
         self.expert_caches.clear();
         for shape in &self.chunks.layout().experts {
             let experts = shape.experts as usize;
-            let mut planes = Vec::new();
+            let mut planes: Vec<ExpertBank> = Vec::new();
             for (layer, bank) in shape.banks.iter().enumerate() {
-                for (at, plane) in bank.iter().enumerate() {
+                let first = planes.len();
+                // A companion plane is read through its bank's table alone.
+                let companion = |param: u32| {
+                    groups.iter().any(|(codes, members)| {
+                        *codes != param && members.iter().any(|member| *member == Some(param))
+                    })
+                };
+                let mut counted = false;
+                for plane in bank {
                     let Some(&(_, host)) = hosts.iter().find(|(param, _)| *param == plane.param)
                     else {
                         return Err(Fault::program(
@@ -2118,18 +2136,56 @@ impl Pools {
                             ),
                         ));
                     };
+                    let head = !companion(plane.param);
+                    // The planes its table lists, as places among the
+                    // layer's (resolved below, once all are known).
+                    let members = match groups.iter().find(|(codes, _)| *codes == plane.param) {
+                        Some((_, members)) => members.clone(),
+                        None => vec![Some(plane.param)],
+                    };
                     planes.push(ExpertBank {
                         plane: *plane,
                         layer: layer as u32,
                         host,
-                        table: crate::device::Buffer::zeroed(experts * 8)?,
+                        head,
+                        members: members
+                            .iter()
+                            .map(|member| member.map(|param| param as usize))
+                            .collect(),
+                        table: crate::device::Buffer::zeroed(experts * members.len().max(1) * 8)?,
                         // A layer's reads are counted at its first bank.
-                        hits: if at == 0 {
+                        hits: if head && !std::mem::replace(&mut counted, true) {
                             Some(crate::device::Buffer::zeroed(experts * 4)?)
                         } else {
                             None
                         },
                     });
+                }
+                // Each member's param to its place among the cache's planes.
+                let places: Vec<(usize, usize)> = planes[first..]
+                    .iter()
+                    .enumerate()
+                    .map(|(at, held)| (held.plane.param as usize, first + at))
+                    .collect();
+                for held in &mut planes[first..] {
+                    for member in &mut held.members {
+                        if let Some(param) = *member {
+                            let place = places
+                                .iter()
+                                .find(|(held, _)| *held == param)
+                                .map(|&(_, place)| place)
+                                .ok_or_else(|| {
+                                    Fault::program(
+                                        "store::experts",
+                                        format!(
+                                            "param {param} is a plane of a bank whose experts \
+                                             the recipe does not lay it with"
+                                        ),
+                                    )
+                                })?;
+                            *member = Some(place);
+                        }
+                    }
                 }
             }
             self.expert_caches.push(ExpertCache {
@@ -2148,20 +2204,33 @@ impl Pools {
             for bank in 0..self.expert_caches[at].planes.len() {
                 let cache = &self.expert_caches[at];
                 let held = &cache.planes[bank];
+                if !held.head {
+                    continue;
+                }
                 let first = (held.layer * cache.shape.experts) as usize;
-                let mut entries = Vec::with_capacity(cache.shape.experts as usize * 8);
+                let mut entries =
+                    Vec::with_capacity(cache.shape.experts as usize * held.members.len() * 8);
                 for expert in 0..cache.shape.experts as usize {
-                    let address = match cache.slots[first + expert] {
-                        Some(slot) => {
-                            self.chunks.weight_slot(
-                                cache.shape.per_chunk,
-                                cache.shape.slot_bytes,
-                                slot,
-                            )? + held.plane.offset
-                        }
-                        None => held.host + expert as u64 * held.plane.bytes,
+                    let slot = match cache.slots[first + expert] {
+                        Some(slot) => Some(self.chunks.weight_slot(
+                            cache.shape.per_chunk,
+                            cache.shape.slot_bytes,
+                            slot,
+                        )?),
+                        None => None,
                     };
-                    entries.extend_from_slice(&address.to_le_bytes());
+                    // An expert's entry a plane of the bank, in the order
+                    // its select lists them; 0 a plane the bank lacks.
+                    for member in &held.members {
+                        let address = match member.map(|place| &cache.planes[place]) {
+                            None => 0,
+                            Some(plane) => match slot {
+                                Some(slot) => slot + plane.plane.offset,
+                                None => plane.host + expert as u64 * plane.plane.bytes,
+                            },
+                        };
+                        entries.extend_from_slice(&address.to_le_bytes());
+                    }
                 }
                 let held = &mut self.expert_caches[at].planes[bank];
                 if stream.is_null() {
@@ -2185,22 +2254,26 @@ impl Pools {
         self.expert_caches
             .iter()
             .flat_map(|cache| {
-                cache.planes.iter().map(move |bank| {
-                    let first = (bank.layer * cache.shape.experts) as usize;
-                    let located = (self.weights_held || self.preseated)
-                        && cache.slots[first..first + cache.shape.experts as usize]
-                            .iter()
-                            .all(Option::is_some);
-                    (
-                        bank.plane.param,
-                        kernels_cuda::linear::moe::ExpertTable {
-                            table: bank.table.ptr(),
-                            hits: bank.hits.as_ref().map_or(0, crate::device::Buffer::ptr),
-                            located,
-                            window: if located { window } else { (0, 0) },
-                        },
-                    )
-                })
+                cache
+                    .planes
+                    .iter()
+                    .filter(|bank| bank.head)
+                    .map(move |bank| {
+                        let first = (bank.layer * cache.shape.experts) as usize;
+                        let located = (self.weights_held || self.preseated)
+                            && cache.slots[first..first + cache.shape.experts as usize]
+                                .iter()
+                                .all(Option::is_some);
+                        (
+                            bank.plane.param,
+                            kernels_cuda::linear::moe::ExpertTable {
+                                table: bank.table.ptr(),
+                                hits: bank.hits.as_ref().map_or(0, crate::device::Buffer::ptr),
+                                located,
+                                window: if located { window } else { (0, 0) },
+                            },
+                        )
+                    })
             })
             .collect()
     }
@@ -3866,6 +3939,13 @@ struct ExpertBank {
     plane: layout::ExpertPlane,
     layer: u32,
     host: u64,
+    /// Whether a select reads this plane as its bank (a dense bank, or a
+    /// packed bank's codes): it has the table. A packed bank's other planes
+    /// are read through that table.
+    head: bool,
+    /// The planes an expert's table entry lists, as places among the
+    /// cache's planes; `None` one the bank lacks.
+    members: Vec<Option<usize>>,
     /// A u64 address an expert.
     table: crate::device::Buffer,
     /// A u32 counter an expert.

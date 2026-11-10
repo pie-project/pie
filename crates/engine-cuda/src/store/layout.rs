@@ -294,15 +294,45 @@ impl ExpertShape {
     }
 }
 
+/// The planes an expert's entry of a packed bank's table lists
+/// (`kernels_cuda::linear::moe::Planes`), by the bank's codes: an MXFP4
+/// bank's `[codes, scales, bias]`, `None` a plane the bank lacks. Empty for
+/// a param that is no packed bank this engine streams.
+#[must_use]
+pub fn packed_planes(trace: &poem_ir::Trace, codes: usize) -> Vec<Option<u32>> {
+    let Some(param) = trace.params.get(codes) else {
+        return Vec::new();
+    };
+    if param.dtype != poem_ir::Dtype::Mxfp4 {
+        return Vec::new();
+    }
+    let leads = poem_ir::residency::leads(trace);
+    let companions: Vec<usize> = (0..trace.params.len())
+        .filter(|at| *at != codes && leads[*at] == codes)
+        .collect();
+    let scales = poem::declare::scales_name(&param.name);
+    // Its scales and nothing else: a companion this table has no entry for
+    // leaves the bank dense.
+    match companions.as_slice() {
+        [at] if trace.params[*at].name == scales => {
+            vec![Some(codes as u32), Some(*at as u32), None]
+        }
+        _ => Vec::new(),
+    }
+}
+
 /// The routed banks of `trace` this engine streams an expert at a time:
 /// planes out of the checkpoint read only at the `bank` port of a plain
-/// routed select (no bias, no quantization), the select whose kernels read
-/// an expert table.
+/// routed select with no bias, the select whose kernels read an expert
+/// table: a dense bank, or (off tcgen05, whose grouped GEMM reads no table,
+/// and off the HIP build) an MXFP4 bank against bf16 activations, with its
+/// scales.
 #[must_use]
 pub fn streamed_experts(trace: &poem_ir::Trace) -> Vec<usize> {
     use poem_ir::residency::{Residency, residency};
     use poem_ir::{Def, Linear, Operands, Operation};
     let classes = residency(trace);
+    let packs = !cfg!(feature = "rocm") && !packed_unread();
     let mut out = Vec::new();
     let mut inputs = Vec::new();
     'params: for (at, param) in trace.params.iter().enumerate() {
@@ -312,6 +342,7 @@ pub fn streamed_experts(trace: &poem_ir::Trace) -> Vec<usize> {
         {
             continue;
         }
+        let planes = packed_planes(trace, at);
         let mut read = false;
         for node in &trace.nodes {
             inputs.clear();
@@ -335,11 +366,38 @@ pub fn streamed_experts(trace: &poem_ir::Trace) -> Vec<usize> {
                 {
                     read = true;
                 }
+                Operation::Linear(Linear::MoeSelect {
+                    bank,
+                    bias: None,
+                    quantized: true,
+                    quant: None,
+                    ..
+                }) if packs
+                    && !planes.is_empty()
+                    && matches!(trace.values.get(bank.0 as usize).map(|d| &d.def),
+                        Some(Def::Weight(w)) if *w as usize == at) =>
+                {
+                    read = true;
+                }
                 _ => continue 'params,
             }
         }
-        if read {
+        if !read {
+            continue;
+        }
+        // A packed bank streams with every plane of it, each an expert's.
+        let companions: Vec<usize> = planes
+            .iter()
+            .flatten()
+            .map(|plane| *plane as usize)
+            .filter(|plane| *plane != at)
+            .collect();
+        if companions.iter().all(|plane| {
+            matches!(classes[*plane], Residency::Expert(_))
+                && trace.params[*plane].source == poem_ir::ParamSource::Checkpoint
+        }) {
             out.push(at);
+            out.extend(companions);
         }
     }
     // A layer's banks stream together or not at all, and so do the layers
@@ -366,6 +424,19 @@ pub fn streamed_experts(trace: &poem_ir::Trace) -> Vec<usize> {
     whole.sort_unstable();
     whole.dedup();
     whole
+}
+
+/// Whether this device's selects of a packed bank read no expert table: the
+/// grouped tcgen05 GEMM.
+fn packed_unread() -> bool {
+    #[cfg(feature = "cuda")]
+    {
+        kernels_cuda::linear::gemm_sm100::supported()
+    }
+    #[cfg(not(feature = "cuda"))]
+    {
+        true
+    }
 }
 
 /// The tables of `trace` this engine streams by their rows: read only by the

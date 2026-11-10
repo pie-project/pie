@@ -1584,9 +1584,13 @@ impl Run<'_> {
                 ..
             } => {
                 let (codes, scales, biases, seat) = self.planes(bank);
+                // A bank the weight cache streams is read through its table,
+                // by the selects that take one whose every expert is seated.
+                let table = self.bank_table(bank);
                 if seat.streams()
                     || self.scales_in_atoms(bank)
-                    || crate::device::alloc::is_host_pointer(codes.ptr)
+                    || table.streams()
+                    || (!table.tabled() && crate::device::alloc::is_host_pointer(codes.ptr))
                 {
                     return None;
                 }
@@ -1610,7 +1614,7 @@ impl Run<'_> {
                         bias: None,
                     },
                 };
-                (x, routes, sy, bank, ExpertTable::RESIDENT)
+                (x, routes, sy, bank, table)
             }
             // An NVFP4 bank against NVFP4 activations (W4A4), its scales laid
             // in atoms and its input scales stated.
@@ -1993,6 +1997,34 @@ impl Run<'_> {
             return Ok(());
         }
         per_tensor_e4m3_is_a_table("linear.moe_select", codes)?;
+        // A bank the weight cache streams: each expert where its table says,
+        // none staged by this fire.
+        let table = self.bank_table(bank);
+        if table.tabled() {
+            // Its selects count no expert's reads; a set the runtime may
+            // change is counted here.
+            #[cfg(feature = "cuda")]
+            if table.streams() {
+                linear::moe::note_routes(
+                    self.ctx(),
+                    "linear.moe_select",
+                    routes,
+                    codes.rows,
+                    table.hits,
+                )?;
+            }
+            return linear::moe::matmul_select_quant(
+                self.ctx(),
+                x,
+                codes,
+                scales,
+                biases,
+                routes,
+                &mut self.tensor(y),
+                seat,
+                table,
+            );
+        }
         if codes.dtype == Dtype::Nvfp4 {
             let tensor_scales = tensor_scales("linear.moe_select", biases)?;
             let (codes, scales, tensor_scales, routes, seat) =

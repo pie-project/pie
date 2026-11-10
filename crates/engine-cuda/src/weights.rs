@@ -1433,7 +1433,13 @@ impl Weights {
             }
             let rows: u64 = shape[..shape.len() - 2].iter().product();
             let k = shape[shape.len() - 2] * 32;
+            // A bank off the device (the weight cache's, or a tier's) has
+            // no copy: its mapped planes are no device pointer.
             if seat.streams()
+                || self
+                    .experts
+                    .as_ref()
+                    .is_some_and(|tier| tier.offloaded_at(at).is_some())
                 || crate::device::alloc::is_host_pointer(codes.ptr)
                 || crate::device::alloc::is_host_pointer(scales.ptr)
                 || rows == 0
@@ -1558,7 +1564,13 @@ impl Weights {
             }
             let rows: u64 = shape[..shape.len() - 2].iter().product();
             let k = shape[shape.len() - 2] * 32;
+            // A bank off the device (the weight cache's, or a tier's) has
+            // no copy: its mapped planes are no device pointer.
             if seat.streams()
+                || self
+                    .experts
+                    .as_ref()
+                    .is_some_and(|tier| tier.offloaded_at(at).is_some())
                 || crate::device::alloc::is_host_pointer(codes.ptr)
                 || crate::device::alloc::is_host_pointer(scales.ptr)
                 || rows == 0

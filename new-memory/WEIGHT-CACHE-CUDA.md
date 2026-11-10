@@ -18,6 +18,7 @@ Two kinds are built:
 | --- | --- | --- | --- |
 | `Rows` | a block of a table's rows | a bf16 table read only by the plain `Gather::Embed`, alone in its recipe slot | `gather::embed_tabled` (`RowTable`) |
 | `Expert` | one expert of one MoE layer, its plane of every bank of the layer | dense banks read only at the `bank` port of a plain `MoeSelect` (no bias, not quantized) | every dense select, through `ExpertTable` |
+| `Expert` | the same, the layer's planes being each bank's codes and scales | MXFP4 banks read only by a plain quantized `MoeSelect` of bf16 activations (no bias, no activation quantization), off tcgen05 | the MXFP4 selects, through an `ExpertTable` of `Planes::Mxfp4` entries |
 
 Everything else stays dense on the device and is not stated.
 
@@ -70,6 +71,24 @@ non-held residency after a held one is refused.
 `Pools::weight_uses` reads and zeroes the counters and reports
 `WeightUses::held` (resident and host atoms per shape).
 
+### Packed banks (MXFP4, `sc/l40s-wc-quant-engine`)
+
+- `layout::packed_planes(trace, codes)` names the planes an expert's table
+  entry lists (`[codes, scales, none]`); `streamed_experts` returns the codes
+  and the scales together, and nothing where `gemm_sm100::supported()` or
+  under the `rocm` feature.
+- `Ranking::caching` takes a cached packed bank's group off the sequence the
+  plan cuts; each plane is then hosted or filed like a dense bank.
+- One table a bank, at the codes' param: expert `e`'s entries at
+  `table[e * 3 ..]`, the third 0. The scales have no table of their own.
+- `Run::bank_table` hands it to `select_quant` and to the fused select-GLU
+  (`routed_bank`); a bank with a table is never staged by the fire
+  (`staged_experts`) and keeps no bf16 or fp8 copy.
+- No MXFP4 kernel counts an expert's reads. While the set may change (the
+  table is not `located`) the dispatch launches `linear::moe::note_routes`
+  before the select, which adds the fire's routes to the bank's counters. A
+  held set of MXFP4 banks records no use.
+
 ## What was measured
 
 `golden_experts` (engine-cuda `tests/engine_cuda/golden_logits.rs`), each
@@ -83,6 +102,8 @@ miniature over the probe's 12-step script, against the base engine's hashes
 | mimo26-flash-mini | bitwise base | 0.051 | 0.051 |
 | dots3-note-mini | bitwise base | 0.27 | 0.27 |
 | dsv4-flash-mini | bitwise base | 0.61 | 0.61 |
+
+| dsv4-flash-mini-bf16-mxfp4-kv-bf16 | bitwise the dense serve (`8b85965b6c94d3fa`; the base engine was not run on it) | 0.51 | 0.51 |
 
 No step's top token changed in any case. Cached and held runs the kernels the
 base engine runs (checked on Nemotron with `PIE_CUDA_TRACE_FIRES=1`: the same
@@ -100,9 +121,12 @@ stated), so they still compare the engine's other paths with base.
 
 ## Not built, and known gaps
 
-- Quantized banks (MXFP4, NVFP4, affine u4, block FP8, biased selects): the
-  dispatch passes `ExpertTable::RESIDENT` for all of them. They stay dense or
-  on the engine's own tier.
+- Quantized banks other than MXFP4 W4A16 (NVFP4, affine u4, block FP8,
+  MXFP4 against quantized activations, biased selects): the dispatch passes
+  `ExpertTable::RESIDENT` for all of them. They stay dense or on the engine's
+  own tier.
+- MXFP4 banks were run on sm_89 only. The Hopper wgmma arms take the same
+  table argument and were not run.
 - sm_100: the grouped tcgen05 GEMM for MXFP4 / affine-u4 / NVFP4 W4A16 reads
   no table (`select_fp4.rs`), and a tabled block-FP8 bank needs whole 128-row
   atom blocks an expert. Those banks must not be stated as weight shapes there

@@ -2312,10 +2312,20 @@ fn served_experts_as(fixture: &Fixture, cache: &Path, rows: Rows, told: bool) ->
         held, want,
         "the record counts the experts by where they lie"
     );
+    // A packed bank's selects count no read themselves: the engine counts a
+    // fire's routes only while the set may change, so a held set of packed
+    // banks alone records none.
+    let packed = fixture
+        .trace
+        .params
+        .iter()
+        .any(|param| param.dtype == poem_ir::Dtype::Mxfp4);
     assert!(
-        uses.uses
-            .iter()
-            .any(|(atom, reads)| shapes.iter().any(|s| s.id == atom.shape) && *reads > 0),
+        (packed && rows == Rows::Cached)
+            || uses
+                .uses
+                .iter()
+                .any(|(atom, reads)| shapes.iter().any(|s| s.id == atom.shape) && *reads > 0),
         "the fires read no expert the record counted"
     );
     steps
