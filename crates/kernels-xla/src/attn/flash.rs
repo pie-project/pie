@@ -32,7 +32,7 @@
 use crate::error::Error;
 use crate::hlo::{Branch, Built, Cmp, Elem, Fold, Func, Malformed, Ty, Val};
 use crate::mosaic::{Body, Compiled, Grid, ICmp, Kernel, MTy, Sem, Space, V, Window};
-use crate::tensor::Operand;
+use crate::tensor::{Operand, PageMap};
 
 use super::paged::{Flashed, Geom, Heads, cmp_i, read_rows_i32, round_up, with_i};
 
@@ -573,6 +573,7 @@ pub(crate) fn attend(
     scale: f64,
     vmem_cap: i64,
     walk: Walk<'_>,
+    maps: [PageMap; 2],
 ) -> Built<Flashed> {
     let r = f.dims(q4)[0];
     let Some(s) = shape(r, h, scale, vmem_cap) else {
@@ -581,7 +582,7 @@ pub(crate) fn attend(
     let (start, p0) = segments(f, lane, qpos)?;
     let live = cmp_i(f, Cmp::Ge, qpos, 0)?;
     let old = older(
-        f, geom, slots, planes, lane, qpos, lo, p0, start, live, window,
+        f, geom, slots, planes, lane, qpos, lo, p0, start, live, window, maps,
     )?;
     // Filed in its lane's slot (not the sink, the plane's last page).
     let ps = geom.ps;
@@ -596,7 +597,9 @@ pub(crate) fn attend(
     let got = f.add(got, ap.off)?;
     let filed = f.compare(Cmp::Eq, got, want)?;
     let inside = cmp_i(f, Cmp::Ge, ap.page, 0)?;
-    let below = cmp_i(f, Cmp::Lt, ap.page, slots / ps - 1)?;
+    // the sink is the keys plane's last page, in its own pages
+    let plane_page = maps[0].apply(f, ap.page)?;
+    let below = cmp_i(f, Cmp::Lt, plane_page, slots / ps - 1)?;
     let filed = f.and(filed, inside)?;
     let filed = f.and(filed, below)?;
     let upto = with_i(f, qpos, 1, Func::add)?;
@@ -653,8 +656,11 @@ pub(crate) fn attend(
 /// `OLD_PAGES` whole pages, and each row's range `[klo, khi)` in it.
 #[derive(Clone, Copy)]
 struct Older {
-    /// The pages, `[OLD_PAGES]` (the sink page past the ones read).
+    /// The keys plane's pages, `[OLD_PAGES]` (the sink page past the ones
+    /// read).
     pages: Val,
+    /// The values plane's (its own `PageMap`; `pages` when the maps agree).
+    values_pages: Val,
     /// How many pages the rows read (i32 scalar).
     total: Val,
     klo: Val,
@@ -675,13 +681,18 @@ impl Older {
             index_vector_dim: 1,
             ..crate::hlo::GatherDims::default()
         };
-        let one = |f: &mut Func, plane: Val| -> Built<Val> {
+        let at_v = if self.values_pages == self.pages {
+            at
+        } else {
+            f.reshape(self.values_pages, &[n, 1])?
+        };
+        let one = |f: &mut Func, plane: Val, at: Val| -> Built<Val> {
             let (slots, w) = (f.dims(plane)[0], f.dims(plane)[1]);
             let paged = f.reshape(plane, &[slots / self.ps, self.ps, w])?;
             let g = f.gather(paged, at, &dims, &[1, self.ps, w])?;
             f.reshape(g, &[n * self.ps, w])
         };
-        Ok((one(f, self.planes.0)?, one(f, self.planes.1)?))
+        Ok((one(f, self.planes.0, at)?, one(f, self.planes.1, at_v)?))
     }
 }
 
@@ -700,6 +711,7 @@ fn older(
     start: Val,
     live: Val,
     window: i64,
+    maps: [PageMap; 2],
 ) -> Built<Older> {
     let r = f.dims(qpos)[0];
     let ps = geom.ps;
@@ -764,13 +776,24 @@ fn older(
     let ol = super::paged::clamp_i(f, owner_lane, 0, geom.lanes - 1)?;
     let at = with_i(f, ol, geom.pages, Func::mul)?;
     let at = f.add(at, pix)?;
-    let page = super::paged::take(f, geom.pt, at)?;
+    let raw = super::paged::take(f, geom.pt, at)?;
     let used = cmp_i(f, Cmp::Ge, owner_lane, 0)?;
-    let sink = f.like_i(page, slots / ps - 1);
-    let page = f.select(used, page, sink)?;
-    let page = super::paged::clamp_i(f, page, 0, slots / ps - 1)?;
+    let sink = f.like_i(raw, slots / ps - 1);
+    // each plane's own pages (the sink is either plane's last page)
+    let plane_pages = |f: &mut Func, map: PageMap| -> Built<Val> {
+        let page = map.apply(f, raw)?;
+        let page = f.select(used, page, sink)?;
+        super::paged::clamp_i(f, page, 0, slots / ps - 1)
+    };
+    let page = plane_pages(f, maps[0])?;
+    let values_pages = if maps[1] == maps[0] {
+        page
+    } else {
+        plane_pages(f, maps[1])?
+    };
     Ok(Older {
         pages: page,
+        values_pages,
         total,
         klo,
         khi,

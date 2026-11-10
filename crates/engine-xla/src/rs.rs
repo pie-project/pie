@@ -308,14 +308,15 @@ pub const DROP: i32 = i32::MAX;
 
 impl WindowMap {
     /// The map of the window covering lanes `lane0..lane0 + lanes` whose own
-    /// rows are cut by `indptr` (window-local), for buffers of
-    /// `page_tokens`-row pages.
+    /// rows are cut by `indptr` (window-local), for rs list slots of
+    /// `page_tokens` rows. A buffer row is `q · page_tokens + token` of the
+    /// slot's grain index `q` (each plane maps `q` to its own block before
+    /// it reads or writes, `dispatch/rs.rs`).
     pub fn of(
         plans: &[LanePlan],
         indptr: &[i32],
         lane0: u32,
         page_tokens: u32,
-        pool_slots: u32,
     ) -> Result<WindowMap> {
         let mut map = WindowMap::default();
         let rows_own = indptr.last().copied().unwrap_or(0).max(0) as usize;
@@ -328,14 +329,15 @@ impl WindowMap {
                 need: u64::from(page) + 1,
                 have: run.pages.len() as u64,
             })?;
-            if slot >= pool_slots {
-                return Err(Fault::Ceiling {
-                    what: "recurrent buffer page slots",
-                    need: u64::from(slot) + 1,
-                    have: u64::from(pool_slots),
-                });
-            }
-            Ok((slot * page_tokens + token % page_tokens) as i32)
+            let row = u64::from(slot) * u64::from(page_tokens) + u64::from(token % page_tokens);
+            i32::try_from(row)
+                .ok()
+                .filter(|&r| r != DROP)
+                .ok_or(Fault::Ceiling {
+                    what: "rs list rows an i32 addresses",
+                    need: row,
+                    have: i32::MAX as u64 - 1,
+                })
         };
         for r in 0..indptr.len().saturating_sub(1) {
             let start = indptr[r].max(0) as u32;
@@ -391,10 +393,14 @@ pub struct Seat {
     pub plans: Vec<LanePlan>,
     pub replay: crate::handle::Tensor,
     pub commit: crate::handle::Tensor,
-    pub slots: crate::handle::Tensor,
+    /// Each lane's slot (grain index) of each record piece
+    /// (`store::Pools::records`).
+    pub slots: Vec<crate::handle::Tensor>,
     pub layout: std::sync::Arc<Layout>,
-    /// The buffer plane of each layout plane.
-    pub buffers: Vec<crate::handle::Tensor>,
+    /// The rs list plane of each layout plane, and its map.
+    pub buffers: Vec<(crate::handle::Tensor, crate::store::Map)>,
+    /// The rows a slot of the rs list holds.
+    pub page_tokens: u32,
     /// By window `(lane_offset, lanes, row_offset, rows)`.
     pub maps: HashMap<(u32, u32, u32, u32), WindowInputs>,
     /// Extended outputs landed by an earlier op of the current window.

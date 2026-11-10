@@ -9,6 +9,7 @@
 
 use std::path::Path;
 
+use crate::common_llm::{Refs, Seq};
 use engine_xla::{Boot, DeviceBoot, Lane, Seated, Shell};
 use poem::{Platform, Request};
 use poem_compiler::Budget;
@@ -60,7 +61,8 @@ fn shell(name: &str) -> Shell {
 /// prompt ends on a page).
 fn prefill(shell: &mut Shell, n: u32) {
     let facts = shell.trace().facts.clone();
-    let pages: Vec<u32> = (0..n.div_ceil(PAGE)).collect();
+    let mut refs = Refs::of_facts(Some(shell.chunk_facts()));
+    let mut seq = Seq::new(0);
     let cut = n / PAGE * PAGE;
     let tokens = vec![7u32; n as usize];
     let mut pieces = vec![(0, cut)];
@@ -72,15 +74,31 @@ fn prefill(shell: &mut Shell, n: u32) {
     }
     shell.open(0).expect("the slot opens");
     for (from, to) in pieces {
-        let mut seated = Seated::of(Lane {
-            slot: 0,
-            word: facts.word(&Request::new(to - from, false)),
-            tokens: &tokens[from as usize..to as usize],
-        });
-        seated.pages = &pages[..to.div_ceil(PAGE) as usize];
+        let word = facts.word(&Request::new(to - from, false));
+        let lane = seq.lane_of(CONTEXT, word, &mut refs, vec![0; (to - from) as usize]);
+        let mut seated = seated(&lane, word, &tokens[from as usize..to as usize], to);
         seated.held = Some(from);
         shell.fire_full(&[seated]).expect("the piece fires");
+        seq.held = to;
     }
+}
+
+/// `lane`'s slot refs as the shell seats them, reaching `after` rows.
+fn seated<'a>(
+    lane: &'a engine::fire::Lane,
+    word: u64,
+    tokens: &'a [u32],
+    after: u32,
+) -> Seated<'a> {
+    let mut seated = Seated::of(Lane {
+        slot: lane.slot,
+        word,
+        tokens,
+    });
+    let pages = after.div_ceil(PAGE) as usize;
+    seated.pages = &lane.kv.pages[..pages.min(lane.kv.pages.len())];
+    seated.fixed = &lane.fixed;
+    seated
 }
 
 #[test]
@@ -104,6 +122,17 @@ fn prompts_of_nearby_lengths_trace_no_new_program() {
 #[test]
 fn the_slots_a_request_lands_in_trace_no_new_program() {
     let mut shell = shell("qwen35-d0.8b-bf16-kv-bf16");
+    let facts = shell.chunk_facts();
+    let mut refs = Refs::of_facts(Some(facts.clone()));
+    let kv = facts.shapes[0].id;
+    let fixed = facts
+        .shapes
+        .iter()
+        .find(|s| matches!(s.kind, engine::chunk::SlotKind::Fixed { .. }))
+        .expect("a hybrid states a record")
+        .id;
+    let pages: Vec<u32> = (0..120).map(|_| refs.take(kv)).collect();
+    let records: Vec<u32> = (0..SLOTS).map(|_| refs.take(fixed)).collect();
     let run = |src_page, dst_page| engine::transfer::KvRun {
         src_page,
         src_token: 0,
@@ -111,34 +140,43 @@ fn the_slots_a_request_lands_in_trace_no_new_program() {
         dst_token: 0,
         tokens: PAGE,
     };
-    shell.open(0).expect("the slot opens");
-    shell.copy_state(0, 1).expect("the state copies");
+    let part = |src_page, dst_page| engine::transfer::KvRun {
+        src_page,
+        src_token: 3,
+        dst_page,
+        dst_token: 3,
+        tokens: 5,
+    };
     shell
-        .copy_kv(&[run(0, 9), run(1, 10), run(2, 11)])
+        .copy_slots(&[(fixed, records[0], records[1])])
+        .expect("the record copies");
+    shell
+        .copy_kv(&[run(pages[0], pages[9]), run(pages[1], pages[10])])
         .expect("the kv copies");
+    shell
+        .copy_kv(&[part(pages[2], pages[11])])
+        .expect("a partial page copies");
     let first = shell.device().dry_texts().len();
-    for slot in 1..SLOTS {
-        shell.open(slot).expect("the slot opens");
+    for slot in 1..SLOTS as usize {
         shell
-            .copy_state(slot, (slot + 3) % SLOTS)
-            .expect("the state copies");
+            .copy_slots(&[(fixed, records[slot], records[(slot + 3) % SLOTS as usize])])
+            .expect("the record copies");
         let page = slot * 8;
         shell
             .copy_kv(&[
-                run(page, page + 40),
-                run(page + 1, page + 41),
-                run(page + 2, page + 2 + 41),
+                run(pages[page], pages[page + 40]),
+                run(pages[page + 1], pages[page + 41]),
             ])
             .expect("the kv copies");
         shell
-            .copy_kv(&[run(page, page + 40), run(page + 3, page + 50)])
-            .expect("the kv copies");
+            .copy_kv(&[part(pages[page + 2], pages[page + 42])])
+            .expect("a partial page copies");
     }
     let texts = shell.device().dry_texts();
     assert_eq!(
         texts.len(),
-        first + 1,
-        "{} programs past the first slot's {first} and the four-run copy's one",
+        first,
+        "{} programs past the first request's {first}",
         texts.len() - first
     );
 }
@@ -146,16 +184,24 @@ fn the_slots_a_request_lands_in_trace_no_new_program() {
 /// The text of a decode of `lanes` lanes, each at 300 rows.
 fn decode_text(shell: &mut Shell, lanes: u32) -> usize {
     let facts = shell.trace().facts.clone();
-    let pages: Vec<u32> = (0..CONTEXT / PAGE).collect();
+    let mut refs = Refs::of_facts(Some(shell.chunk_facts()));
     let token = [7u32];
-    let seated: Vec<Seated<'_>> = (0..lanes)
+    let word = facts.word(&Request::new(1, false));
+    // Lanes share the seats' slots (`lane % SLOTS`), as the old test did.
+    let seats: Vec<engine::fire::Lane> = (0..SLOTS)
+        .map(|slot| {
+            let mut seq = Seq::new(slot);
+            seq.held = 300;
+            seq.lane_of(CONTEXT, word, &mut refs, vec![7])
+        })
+        .collect();
+    let held: Vec<engine::fire::Lane> = (0..lanes)
+        .map(|lane| seats[(lane % SLOTS) as usize].clone())
+        .collect();
+    let seated: Vec<Seated<'_>> = held
+        .iter()
         .map(|lane| {
-            let mut seated = Seated::of(Lane {
-                slot: lane % SLOTS,
-                word: facts.word(&Request::new(1, false)),
-                tokens: &token,
-            });
-            seated.pages = &pages[..301u32.div_ceil(PAGE) as usize];
+            let mut seated = seated(lane, word, &token, 301);
             seated.held = Some(300);
             seated
         })

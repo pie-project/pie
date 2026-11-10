@@ -37,6 +37,34 @@ impl Lower<'_, '_> {
         })
     }
 
+    /// A slot table `t` of a recurrent pool whose slots lie where `map`
+    /// puts them ([`kernels_xla::tensor::PageMap`]): each slot as its block
+    /// of the pool's plane, the `-(s) - 1` encoding kept. The identity reads
+    /// `t` as it is.
+    pub fn read_slots(
+        &mut self,
+        t: Tensor,
+        map: kernels_xla::tensor::PageMap,
+    ) -> Result<Operand, Error> {
+        let o = self.read(t)?;
+        if map.is_identity() {
+            return Ok(o);
+        }
+        let f = self.cx.func();
+        let v = f.convert(o.val, kernels_xla::hlo::Elem::I32);
+        let v = map.apply(f, v)?;
+        Ok(Operand {
+            val: v,
+            dtype: dtype::Dtype::I32,
+            ..o
+        })
+    }
+
+    /// A recurrent pool's slot table, mapped ([`Lower::read_slots`]).
+    pub fn slots(&mut self, pool: &crate::handle::RecurrentPool) -> Result<Operand, Error> {
+        self.read_slots(pool.slots, pool.map)
+    }
+
     /// `t`'s current value, when there is a `t`.
     pub fn read_opt(&mut self, t: Option<Tensor>) -> Result<Option<Operand>, Error> {
         t.map(|t| self.read(t)).transpose()
@@ -128,6 +156,38 @@ impl Lower<'_, '_> {
 }
 
 pub mod attn;
+
+/// Lowers a kernel call that lands several pool planes: once a plane, each
+/// time reading its operands afresh and landing only that plane (the others'
+/// results are dead and dropped), since every plane is a view of one pool
+/// and a whole-plane result read before another plane's write would land
+/// without it. Planes that are one handle land in one pass, chained as the
+/// kernel chains them. `body` answers one value a plane, `None` where the
+/// call lands nothing there.
+pub fn lower_planes(
+    ctx: &Ctx<'_>,
+    planes: &[Tensor],
+    mut body: impl FnMut(&mut Lower<'_, '_>) -> Result<Vec<Option<Val>>, Error>,
+) -> Result<(), Error> {
+    let one = planes.windows(2).all(|w| w[0].buf == w[1].buf);
+    if one {
+        return lower(ctx, |l| {
+            for (plane, v) in planes.iter().zip(body(l)?) {
+                if let Some(v) = v {
+                    l.land(*plane, v)?;
+                }
+            }
+            Ok(())
+        });
+    }
+    for (at, plane) in planes.iter().enumerate() {
+        lower(ctx, |l| match body(l)?.get(at).copied().flatten() {
+            Some(v) => l.land(*plane, v),
+            None => Ok(()),
+        })?;
+    }
+    Ok(())
+}
 
 /// Lowers one kernel call into `ctx`'s function.
 pub fn lower(

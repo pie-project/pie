@@ -10,7 +10,7 @@ use dtype::Dtype;
 
 use super::paged::{
     Heads, KeyList, Planes, Rows, Rule, blocked, per_row, pool_paging, read_geometry,
-    read_rows_i32, scatter_slots, with_i,
+    read_rows_i32, scatter_slots_mapped, with_i,
 };
 use crate::check::expect;
 use crate::elemwise::norm::inv_rms_rows;
@@ -361,13 +361,16 @@ pub fn kv_append(
         ));
     }
     let mut pairs = vec![(kv_c, keys)];
+    let mut maps = vec![pool.keys_map];
     if let Some(r) = rope {
         pairs.push(r);
+        maps.push(pool.values_map);
     }
-    let planes = scatter_slots(
+    let planes = scatter_slots_mapped(
         f,
         OP,
         &pairs,
+        &maps,
         pool.page_size,
         write_page,
         write_offset,
@@ -440,6 +443,8 @@ impl<T: Stored> MlaCall<T> {
                 max_pages: pool.max_pages,
                 seq_stride: pool.seq_stride,
                 head_stride: pool.head_stride,
+                keys_map: pool.keys_map,
+                values_map: pool.values_map,
             },
         ))
     }
@@ -566,6 +571,8 @@ pub fn flash_with(
         values,
         geom,
         latent: true,
+        keys_map: pool.keys_map,
+        values_map: pool.values_map,
     };
     let scale = f64::from(sm_scale);
     let per = sel.is_some() || decode || r <= per_row_max * geom.lanes;

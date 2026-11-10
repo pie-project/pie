@@ -386,7 +386,19 @@ impl Engine for Xla {
         let paging = shell.paging();
         let drafter = shell.trace().drafter;
         let pools = shell.pool_facts();
-        let chunks = shell.chunk_facts(&pools).map_err(fault)?;
+        shell
+            .seat_tiers(
+                residency.host_kv_budget,
+                residency.disk_kv_dir.as_deref().map(|dir| {
+                    (
+                        dir,
+                        residency.disk_kv_budget.unwrap_or(0),
+                        residency.disk_kv_persistent,
+                    )
+                }),
+            )
+            .map_err(fault)?;
+        let chunks = shell.tiered_facts();
         shell.log_chunk_recipe(&chunks);
         let caps = Capabilities {
             device: DeviceFacts {
@@ -633,47 +645,121 @@ impl Engine for Xla {
                 engine: "xla",
             });
         }
-        let page_size = self.loaded_mut()?.paging().page_size;
+        let shell = self.loaded_mut()?;
+        let page_size = shell.paging().page_size;
         let moves = copy.runs(page_size)?;
-        // Windowed pages a write into a shared one copies first ride the
-        // pre-launch copy beside the kv list's (CONTRACT-BC 19).
-        let windowed: Vec<engine::transfer::KvRun> = copy
-            .windowed
-            .iter()
-            .map(|&(src, dst)| engine::transfer::KvRun {
-                src_page: src,
-                src_token: 0,
-                dst_page: dst,
-                dst_token: 0,
-                tokens: page_size,
-            })
-            .collect();
-        self.loaded_mut()?
-            .copy_kv_with(&moves, &windowed)
-            .map_err(fault)
+        shell.copy_kv(&moves).map_err(fault)?;
+        // Windowed slots a write into a shared one copies first, whole
+        // (CONTRACT-BC 21, degenerate form; a pool states them as
+        // `Lane::slot_copies`).
+        if let Some(id) = shell.pools().window_shape() {
+            let pairs: Vec<(engine::chunk::ShapeId, u32, u32)> = copy
+                .windowed
+                .iter()
+                .map(|&(src, dst)| (id, src, dst))
+                .collect();
+            shell.copy_slots(&pairs).map_err(fault)?;
+        }
+        Ok(())
     }
 
+    /// A record is copied by naming a copy-on-write slot in `Lane::fixed`
+    /// (CONTRACT-BC 8); no state moves by ids outside the pool.
     fn copy_state(&mut self, copy: &StateCopy) -> EngineResult<()> {
-        copy.device_only("xla")?;
-        for (at, move_) in copy.moves.iter().enumerate() {
-            if move_.src_token_offset != 0 || move_.dst_token_offset != 0 {
-                return Err(Error::Invalid(format!(
-                    "state move {at} names a token offset; this engine moves whole slots"
-                )));
-            }
+        if copy.moves.is_empty() && copy.pages.is_empty() {
+            return Ok(());
         }
+        Err(Error::Unsupported {
+            verb: "`copy_state` (records copy by `Lane::fixed` copy-on-write slots, rs list \
+                   slots by `Lane::slot_copies`)",
+            engine: "xla",
+        })
+    }
+
+    /// The pool is fixed at load: one segment, committed whole.
+    fn commit_segments(&mut self, segments: u32) -> EngineResult<()> {
+        if segments <= 1 {
+            return Ok(());
+        }
+        Err(Error::Invalid(format!(
+            "this pool is one segment fixed at load; {segments} cannot be committed"
+        )))
+    }
+
+    fn release_segments(&mut self, segments: u32) -> EngineResult<()> {
+        if segments >= 1 {
+            return Ok(());
+        }
+        Err(Error::Invalid(
+            "this pool is one segment fixed at load and is never released".into(),
+        ))
+    }
+
+    /// Moves chunks within the fixed pool (the runtime does not ask it of a
+    /// `Growth::Fixed` pool; served for a defragmenting caller).
+    fn evacuate(&mut self, evacuation: &engine::chunk::Evacuation) -> EngineResult<()> {
+        self.loaded_mut()?.evacuate(evacuation).map_err(fault)
+    }
+
+    /// Whole-slot copies on the device. HOST/DISK TIERS HOOK: a copy whose
+    /// source or destination is a host or disk chunk (`SlotCopy`'s tier,
+    /// from sc/tier-shared's contract) lands here; until that contract is
+    /// merged only device-to-device copies are served.
+    fn copy_slots(&mut self, copy: &engine::chunk::SlotCopy) -> EngineResult<()> {
+        use crate::serve::Tier;
+        let device = self.caps.as_ref().map(|caps| caps.device.domain);
+        let tier = |domain| match domain {
+            MemoryDomain::HostPinned => Some(Tier::Host),
+            MemoryDomain::LocalDisk => Some(Tier::Disk),
+            d if Some(d) == device => Some(Tier::Device),
+            _ => None,
+        };
+        let (Some(from), Some(to)) = (tier(copy.src), tier(copy.dst)) else {
+            return Err(Error::Unsupported {
+                verb: "`copy_slots` to or from a domain other than the device, the host tier \
+                       and the slot file",
+                engine: "xla",
+            });
+        };
         let shell = self.loaded_mut()?;
-        for move_ in &copy.moves {
-            shell
-                .copy_state(move_.src_slot_id, move_.dst_slot_id)
-                .map_err(fault)?;
+        if from != Tier::Device || to != Tier::Device {
+            // Between tiers (CONTRACT-BC 22): whole slots, laid alike.
+            if !copy.runs.is_empty() {
+                return Err(Error::Invalid(
+                    "token runs move within the device; between tiers a slot moves whole".into(),
+                ));
+            }
+            return shell
+                .copy_tier(copy.shape, from, to, &copy.slots)
+                .map_err(fault);
         }
-        let pages: Vec<(u32, u32)> = copy
-            .pages
+        let pairs: Vec<(engine::chunk::ShapeId, u32, u32)> = copy
+            .slots
             .iter()
-            .map(|m| (m.src_slot_id, m.dst_slot_id))
+            .map(|&(src, dst)| (copy.shape, src, dst))
             .collect();
-        shell.copy_pages(&pages).map_err(fault)
+        shell.copy_slots(&pairs).map_err(fault)?;
+        if copy.runs.is_empty() {
+            return Ok(());
+        }
+        if shell.pools().kv_shape() != Some(copy.shape) {
+            return Err(Error::Unsupported {
+                verb: "`copy_slots` token runs outside the kv list",
+                engine: "xla",
+            });
+        }
+        let runs: Vec<engine::transfer::KvRun> = copy
+            .runs
+            .iter()
+            .map(|r| engine::transfer::KvRun {
+                src_page: r.src,
+                src_token: r.src_token,
+                dst_page: r.dst,
+                dst_token: r.dst_token,
+                tokens: r.tokens,
+            })
+            .collect();
+        shell.copy_kv(&runs).map_err(fault)
     }
 }
 
@@ -736,6 +822,10 @@ impl Xla {
             .as_ref()
             .map_or(1, |shell| shell.paging().page_size)
             .max(1);
+        let window_shape = self
+            .shell
+            .as_ref()
+            .and_then(|shell| shell.pools().window_shape());
         for attached in &submission.attachments {
             if self.programs.geometry_of(attached.instance) != Some(GeometryClass::DeviceGeometry) {
                 continue;
@@ -802,12 +892,13 @@ impl Xla {
                             .collect::<EngineResult<Vec<u32>>>()?;
                         // The windowed ids are aligned with the translation:
                         // the same relative index picks a page's windowed id.
-                        let window = (!lane.kv.window.is_empty()).then(|| {
+                        let windows = window_shape
+                            .and_then(|id| table_of(lane, id))
+                            .unwrap_or(&[]);
+                        let window = (!windows.is_empty()).then(|| {
                             relative
                                 .iter()
-                                .map(|&page| {
-                                    lane.kv.window.get(page as usize).copied().unwrap_or(0)
-                                })
+                                .map(|&page| windows.get(page as usize).copied().unwrap_or(0))
                                 .collect::<Vec<u32>>()
                         });
                         let writes = (
@@ -1144,6 +1235,9 @@ impl Xla {
                 *slot = Some(bound.slot);
             }
         }
+        let (kv_shape, window_shape) = self.shell.as_ref().map_or((None, None), |shell| {
+            (shell.pools().kv_shape(), shell.pools().window_shape())
+        });
         let shell = self.loaded_mut()?;
         let mut words: Vec<u64> = submission.lanes.iter().map(|lane| lane.word).collect();
         for (at, slot) in lane_adapters.iter().enumerate() {
@@ -1175,7 +1269,9 @@ impl Xla {
                     Some(DeviceLane {
                         pages: Some(pages), ..
                     }) => pages,
-                    _ => &lane.kv.pages,
+                    _ => kv_shape
+                        .and_then(|id| table_of(lane, id))
+                        .unwrap_or(&lane.kv.pages),
                 },
                 held: match &device[at] {
                     Some(DeviceLane {
@@ -1218,8 +1314,12 @@ impl Xla {
                         ..
                     }) => window,
                     Some(DeviceLane { pages: Some(_), .. }) => &[],
-                    _ => &lane.kv.window,
+                    _ => window_shape
+                        .and_then(|id| table_of(lane, id))
+                        .unwrap_or(&[]),
                 },
+                fixed: &lane.fixed,
+                copies: &lane.slot_copies,
             })
             .collect();
         let clips: Vec<crate::serve::Clips<'_>> = submission
@@ -1360,4 +1460,13 @@ fn readouts_of(settle: &StepSettle) -> EngineResult<Vec<LaneReadout>> {
             })
         })
         .collect()
+}
+
+/// Lane `lane`'s table of list shape `id` (`Lane::tables`), when it states
+/// one.
+fn table_of(lane: &engine::fire::Lane, id: engine::chunk::ShapeId) -> Option<&[u32]> {
+    lane.tables
+        .iter()
+        .find(|(held, _)| *held == id)
+        .map(|(_, table)| table.as_slice())
 }

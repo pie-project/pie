@@ -1,35 +1,41 @@
-//! The pools as chunks, as they stand today: one buffer per plane fixed at
-//! load, each pool a pinned run of one-slot chunks (`ChunkFacts::degenerate`),
-//! and past them the sink page and slot a fire's padding lanes write.
+//! The pool as the load states it: one buffer of chunks fixed at load
+//! (`store::Pools::facts`), every shape's slots drawn from it, and today's
+//! pool counts beside them for what still reads them.
 //!
 //! Beside the facts the load logs, at debug, the chunk recipe the compiler
-//! would pack this trace into on a TPU: informational, for the pool switch.
+//! packs this trace into on a TPU, for comparison with the layout this
+//! engine lays (`store::layout`), whose runs every plane's view addresses
+//! as whole blocks.
 
 use engine::caps::PoolFacts;
-use engine::chunk::{ChunkFacts, Reserved, ReservedRun};
+use engine::chunk::ChunkFacts;
 use poem_compiler::chunk::{ChunkProfile, human};
 use poem_compiler::{Budgets, DeviceProfile};
 
-use crate::error::Result;
 use crate::serve::Shell;
 
 impl Shell {
-    /// Today's pools, as the load states them.
+    /// The pool's counts as the pre-chunk facts state them: the kv list's
+    /// slots as kv pages, a record's bytes as a state slot's.
     #[must_use]
     pub fn pool_facts(&self) -> PoolFacts {
+        let pools = self.pools();
         let paging = self.paging();
+        let facts = pools.facts();
+        let slots = |id: Option<engine::chunk::ShapeId>| {
+            id.and_then(|id| facts.shape(id))
+                .map_or(0, |shape| shape.device_slots(&facts))
+        };
         PoolFacts {
-            kv_pages: u32::try_from(paging.pages()).unwrap_or(u32::MAX),
+            kv_pages: u32::try_from(slots(pools.kv_shape())).unwrap_or(u32::MAX),
             kv_page_size: paging.page_size,
-            state_slots: if self.has_state() { paging.slots } else { 0 },
-            buffer_pages: self.buffer_pages(),
-            state_slot_bytes: self.state_slot_bytes(),
+            state_slots: 0,
+            buffer_pages: 0,
+            state_slot_bytes: pools.state_slot_bytes(),
             adapter_banks: u32::try_from(self.banks().len()).unwrap_or(u32::MAX),
             elastic_page_bytes: 0,
             elastic_budget_pages: 0,
-            window_pages: paging.window.map_or(0, |_| {
-                u32::try_from(paging.window_pages()).unwrap_or(u32::MAX)
-            }),
+            window_pages: u32::try_from(slots(pools.window_shape())).unwrap_or(u32::MAX),
             window_tokens: paging.window.map_or(0, |window| window.tokens),
             seated_first: self.seats()[0],
             seat_to_end: self.seats()[1],
@@ -38,17 +44,15 @@ impl Shell {
         }
     }
 
-    /// `pools` as degenerate chunks, the sink page of each kv pool and the
-    /// sink slot of the state slabs reserved past them.
-    pub fn chunk_facts(&self, pools: &PoolFacts) -> Result<ChunkFacts> {
-        let bytes = crate::store::page_bytes(self.trace(), self.paging())?;
-        let sinks = u32::from(pools.kv_pages > 0 && bytes.kv_page > 0)
-            + u32::from(pools.window_pages > 0 && bytes.window_page > 0)
-            + u32::from(pools.state_slots > 0);
-        Ok(with_sinks(ChunkFacts::degenerate(pools, &bytes), sinks))
+    /// The pool as chunks: one segment fixed at load (`Growth::Fixed`; XLA
+    /// buffers are program parameters, sized before anything traces), the
+    /// null and sink chunks reserved, every shape shared.
+    #[must_use]
+    pub fn chunk_facts(&self) -> ChunkFacts {
+        self.tiered_facts()
     }
 
-    /// Logs, at debug, beside the degenerate `facts`, the chunk recipe
+    /// Logs, at debug, beside `facts`, the chunk recipe
     /// `poem_compiler::chunk::plan` packs this trace into on a TPU.
     pub fn log_chunk_recipe(&self, facts: &ChunkFacts) {
         if !tracing::enabled!(tracing::Level::DEBUG) {
@@ -64,8 +68,8 @@ impl Shell {
                 backend = "xla",
                 profile = "tpu",
                 chunk = %human(recipe.chunk_bytes),
-                degenerate_chunks = facts.total_chunks,
-                degenerate_chunk = %human(facts.chunk_bytes),
+                pool_chunks = facts.total_chunks,
+                pool_chunk = %human(facts.chunk_bytes),
                 shapes = %recipe.shapes(),
                 chunks_per_working_set = recipe.chunks_per_ws(),
                 waste_percent = recipe.waste.percent(),
@@ -74,27 +78,10 @@ impl Shell {
             Err(error) => tracing::debug!(
                 backend = "xla",
                 %error,
-                degenerate_chunks = facts.total_chunks,
-                degenerate_chunk = %human(facts.chunk_bytes),
+                pool_chunks = facts.total_chunks,
+                pool_chunk = %human(facts.chunk_bytes),
                 "this trace packs into no chunk recipe"
             ),
         }
     }
-}
-
-/// `facts` with `sinks` chunks reserved past its pool for padding lanes,
-/// the one segment grown over them.
-#[must_use]
-pub fn with_sinks(mut facts: ChunkFacts, sinks: u32) -> ChunkFacts {
-    if sinks == 0 {
-        return facts;
-    }
-    facts.reserved.push(ReservedRun {
-        what: Reserved::Sink,
-        first: facts.total_chunks,
-        chunks: sinks,
-    });
-    facts.total_chunks += sinks;
-    facts.segment_chunks = facts.total_chunks;
-    facts
 }

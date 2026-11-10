@@ -29,6 +29,97 @@ fn cell(req: usize, pos: usize) -> usize {
     PAGES[req][pos / PS] as usize * PS + pos % PS
 }
 
+/// Index pages at `3p + 1` of the plane, garbage between.
+const KEY_MAP: kernels_xla::tensor::PageMap = kernels_xla::tensor::PageMap {
+    stride: 3,
+    offset: 1,
+};
+
+/// The plane pages a `map` lays the pool's 5 pages over, one more as a sink.
+fn laid_pages(map: kernels_xla::tensor::PageMap) -> usize {
+    if map.is_identity() {
+        5
+    } else {
+        map.page(4) as usize + 2
+    }
+}
+
+/// `plane` (5 pages of `w`) with page `p` at `map(p)`, garbage elsewhere.
+fn lay(plane: &[f32], w: usize, map: kernels_xla::tensor::PageMap) -> Vec<f32> {
+    let mut out = vec![64.0f32; laid_pages(map) * PS * w];
+    for p in 0..5 {
+        let at = map.page(p as i64) as usize * PS * w;
+        out[at..at + PS * w].copy_from_slice(&plane[p * PS * w..(p + 1) * PS * w]);
+    }
+    out
+}
+
+/// A laid plane read back as its 5 pages, and whether the garbage stood.
+fn unlay(laid: &[f32], w: usize, map: kernels_xla::tensor::PageMap) -> (Vec<f32>, bool) {
+    let mut out = vec![0.0f32; 5 * PS * w];
+    let mut held = vec![false; laid_pages(map)];
+    for p in 0..5 {
+        let at = map.page(p as i64) as usize;
+        held[at] = true;
+        out[p * PS * w..(p + 1) * PS * w].copy_from_slice(&laid[at * PS * w..(at + 1) * PS * w]);
+    }
+    let clean = held.iter().enumerate().all(|(at, &h)| {
+        h || laid[at * PS * w..(at + 1) * PS * w]
+            .iter()
+            .all(|&x| x == 64.0)
+    });
+    (out, clean)
+}
+
+/// Index keys filed into, and block-averaged out of, a keys plane laid by a
+/// page map: the identity plane's bits.
+#[test]
+fn a_mapped_index_plane_files_and_averages_what_the_identity_one_does() {
+    let hd = 8usize;
+    let mut rng = Rng(5);
+    let keys0 = rng.bf16s(CELLS * hd, 1.0);
+    let k = rng.bf16s(4 * hd, 1.0);
+    let wpage = [2u32, u32::MAX, 4, 0];
+    let woff = [3u32, 0, 1, 2];
+    let bpos = [3i32, -1, 11, 1, 7];
+    let breq = [0i32, 0, 0, 1, 1];
+    let run = |map: kernels_xla::tensor::PageMap| -> Option<(Vec<f32>, bool, Vec<f32>)> {
+        let mut b = Bench::new();
+        let kt = b.bf16(4, hd as u32, &k);
+        let rows = (laid_pages(map) * PS) as u32;
+        let keys = b.bf16(rows, hd as u32, &lay(&keys0, hd, map));
+        let wp = b.u32(4, 1, &wpage);
+        let wo = b.u32(4, 1, &woff);
+        let bp = b.i32(5, 1, &bpos);
+        let br = b.i32(5, 1, &breq);
+        let out = b.zeros(Dtype::Bf16, 5, hd as u32);
+        let pool = KvPool {
+            keys_map: map,
+            values_map: map,
+            ..kv_pool(&mut b, keys)
+        };
+        if !b
+            .run(|ctx| {
+                index::kv_append(ctx, kt, &pool, wp, wo)?;
+                index::block_mean(ctx, bp, br, &pool, hd as u32, 4, out)
+            })
+            .unwrap()
+        {
+            return None;
+        }
+        let (plane, clean) = unlay(&b.read_f32(keys), hd, map);
+        Some((plane, clean, b.read_f32(out)))
+    };
+    let Some(want) = run(kernels_xla::tensor::PageMap::IDENTITY) else {
+        return;
+    };
+    let got = run(KEY_MAP).expect("the device ran once");
+    let bits = |v: &[f32]| v.iter().map(|x| x.to_bits()).collect::<Vec<_>>();
+    assert_eq!(bits(&got.0), bits(&want.0), "the filed plane");
+    assert!(got.1, "a key landed outside a page");
+    assert_eq!(bits(&got.2), bits(&want.2), "the block means");
+}
+
 fn kv_pool(b: &mut Bench, keys: Tensor) -> KvPool {
     let indices: Vec<u32> = PAGES.iter().flat_map(|p| p.iter().copied()).collect();
     let pi = b.u32(indices.len() as u32, 1, &indices);
@@ -42,6 +133,8 @@ fn kv_pool(b: &mut Bench, keys: Tensor) -> KvPool {
         max_pages: 3,
         seq_stride: u64::from(keys.width),
         head_stride: u64::from(keys.width),
+        keys_map: kernels_xla::tensor::PageMap::IDENTITY,
+        values_map: kernels_xla::tensor::PageMap::IDENTITY,
     }
 }
 
