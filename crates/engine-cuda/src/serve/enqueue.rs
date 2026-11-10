@@ -700,6 +700,7 @@ impl FireCtx<'_> {
                 .collect(),
             inputs: staged.inputs.clone(),
             geometry,
+            geometry_of: self.pools.geometry_map(),
             schedules,
             plan_values: facts.plans.len(),
             tables: FireTables {

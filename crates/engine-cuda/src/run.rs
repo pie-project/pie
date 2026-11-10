@@ -325,7 +325,10 @@ pub struct FireBindings {
     pub group_masks: Vec<crate::inputs::GroupMaskHandles>,
     pub inputs: Vec<InputBinding>,
 
+    /// The fire's page tables, one a kv shape.
     pub geometry: Vec<CacheGeometry>,
+    /// The page table each kv space of the trace reads: its shape's.
+    pub geometry_of: Vec<u32>,
 
     pub schedules: Vec<Option<ScheduleSeat>>,
     pub plan_values: usize,
@@ -1564,7 +1567,7 @@ impl<'c> Run<'c> {
             .as_ref()
             .expect("`compacted` is reached only through a gathered window");
         if let Def::Input(RuntimeInput::Geometry { space, kind }) = &self.values[at].def {
-            let Some(space) = gathered.spaces.get(*space as usize) else {
+            let Some(space) = gathered.spaces.get(self.geometry_at(*space)) else {
                 return handle;
             };
             return match kind {
@@ -2162,7 +2165,7 @@ impl<'c> Run<'c> {
             CachePool::Kv { space, pool } => {
                 let window = self.window().span();
                 if let Some(gathered) = &self.window().gathered {
-                    let seat = gathered.spaces.get(*space as usize);
+                    let seat = gathered.spaces.get(self.geometry_at(*space));
                     return KvPool {
                         page_indptr: seat.map_or(pool.page_indptr, |seat| seat.page_indptr),
                         page_indices: seat.map_or(pool.page_indices, |seat| seat.page_indices),
@@ -2203,7 +2206,12 @@ impl<'c> Run<'c> {
             let CachePool::Kv { space, .. } = self.cache(id) else {
                 return None;
             };
-            let seat = self.fire.geometry.get(*space as usize)?.planning.as_ref()?;
+            let seat = self
+                .fire
+                .geometry
+                .get(self.geometry_at(*space))?
+                .planning
+                .as_ref()?;
             u32::try_from(*seat.kv_indptr.get(lane as usize)?).ok()
         };
         let pages = window
@@ -2357,8 +2365,16 @@ impl<'c> Run<'c> {
         }
     }
 
+    /// The page table of the fire's that kv space `space` reads.
+    fn geometry_at(&self, space: u32) -> usize {
+        self.fire
+            .geometry_of
+            .get(space as usize)
+            .map_or(0, |&at| at as usize)
+    }
+
     fn geometry(&self, at: usize, space: u32) -> &CacheGeometry {
-        let space = space as usize;
+        let space = self.geometry_at(space);
         self.fire.geometry.get(space).unwrap_or_else(|| {
             panic!(
                 "value {at} names cache space {space}, and this fire binds {} geometry spaces",
@@ -2430,7 +2446,7 @@ impl<'c> Run<'c> {
         let (kv_indptr, kv_len) = match window
             .gathered
             .as_ref()
-            .and_then(|g| g.spaces.get(*space as usize))
+            .and_then(|g| g.spaces.get(self.geometry_at(*space)))
         {
             Some(gathered) => (
                 gathered.page_indptr_host.as_slice(),
