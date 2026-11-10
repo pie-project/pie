@@ -90,6 +90,14 @@ pub struct WeightResidency {
     pub staging: Vec<(ShapeId, Vec<u32>)>,
     /// The resident atoms, by atom.
     pub resident: Vec<ResidentWeight>,
+    /// Whether the set is held for the load's life: every atom named here
+    /// stays where it is named, and none is evicted (a deployment that does
+    /// not stream its weights). An engine may then read a weight whose
+    /// atoms are all named as it reads one that never left the device, and
+    /// drop the copy it would refill an evicted atom from. A held set is
+    /// never followed by one that names fewer atoms.
+    #[serde(default)]
+    pub held: bool,
 }
 
 /// How often fires read each atom since the engine last said, misses

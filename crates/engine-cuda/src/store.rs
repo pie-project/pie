@@ -564,6 +564,14 @@ pub struct Pools {
     chunks: chunks::Chunks,
     /// The row-streamed tables' caches, a shape each ([`Pools::seat_rows`]).
     row_caches: Vec<RowCache>,
+    /// The routed experts' caches, a shape each ([`Pools::seat_experts`]).
+    expert_caches: Vec<ExpertCache>,
+    /// Whether the runtime holds the weights' resident set for the load's
+    /// life (`WeightResidency::held`).
+    weights_held: bool,
+    /// Whether the host copies the caches fill from are gone
+    /// ([`Pools::drop_weight_hosts`]).
+    hosts_dropped: bool,
     /// Each record a lane named by slot refs, by its first piece's ref: the
     /// refs of all its pieces.
     records: std::collections::HashMap<u32, Vec<u32>>,
@@ -757,10 +765,11 @@ impl Pools {
         activation: u64,
         chunk_bytes: Option<u64>,
         packed: bool,
+        experts: &[usize],
     ) -> Result<Pools> {
         let packed = packed || PACKED_KERNELS;
         let pool = PhysicalPool::open(device, utilization)?;
-        let mut layout = lay(trace, &paging, budgets, chunk_bytes)?;
+        let mut layout = lay(trace, &paging, budgets, chunk_bytes, experts)?;
         let mut shapes = Vec::with_capacity(trace.caches.len());
 
         for (index, row) in trace.caches.iter().enumerate() {
@@ -907,6 +916,9 @@ impl Pools {
             pool,
             chunks,
             row_caches: Vec::new(),
+            expert_caches: Vec::new(),
+            weights_held: false,
+            hosts_dropped: false,
             records: std::collections::HashMap::new(),
             id_lanes: 1,
             snap_entries: 1,
@@ -1907,8 +1919,127 @@ impl Pools {
     ) -> Result<()> {
         self.fence_all_swaps(stream)?;
         self.chunks.evacuate(stream, evacuation)?;
-        // A cached block's chunk may have moved: its table entry with it.
-        self.stage_row_tables(stream)
+        // A cached atom's chunk may have moved: its table entry with it.
+        self.stage_row_tables(stream)?;
+        self.stage_expert_tables(stream)
+    }
+
+    /// The params of the routed banks streamed an expert at a time.
+    #[must_use]
+    pub fn expert_params(&self) -> Vec<u32> {
+        self.chunks
+            .layout()
+            .experts
+            .iter()
+            .flat_map(|shape| shape.banks.iter().flatten().map(|plane| plane.param))
+            .collect()
+    }
+
+    /// Opens the cache of each expert shape: `hosts` gives each bank's
+    /// mapped host copy by its param. No expert is cached yet; each is read
+    /// from the host copy.
+    pub fn seat_experts(&mut self, hosts: &[(u32, u64)]) -> Result<()> {
+        self.expert_caches.clear();
+        for shape in &self.chunks.layout().experts {
+            let experts = shape.experts as usize;
+            let mut planes = Vec::new();
+            for (layer, bank) in shape.banks.iter().enumerate() {
+                for (at, plane) in bank.iter().enumerate() {
+                    let Some(&(_, host)) = hosts.iter().find(|(param, _)| *param == plane.param)
+                    else {
+                        return Err(Fault::program(
+                            "store::experts",
+                            format!(
+                                "param {} streams by its experts and has no host copy",
+                                plane.param
+                            ),
+                        ));
+                    };
+                    planes.push(ExpertBank {
+                        plane: *plane,
+                        layer: layer as u32,
+                        host,
+                        table: crate::device::Buffer::zeroed(experts * 8)?,
+                        // A layer's reads are counted at its first bank.
+                        hits: if at == 0 {
+                            Some(crate::device::Buffer::zeroed(experts * 4)?)
+                        } else {
+                            None
+                        },
+                    });
+                }
+            }
+            self.expert_caches.push(ExpertCache {
+                shape: shape.clone(),
+                planes,
+                slots: vec![None; shape.count() as usize],
+            });
+        }
+        self.stage_expert_tables(core::ptr::null_mut())
+    }
+
+    /// Each bank's table as its experts now lie, written behind what
+    /// `stream` holds (a null stream: at once, before any fire).
+    fn stage_expert_tables(&mut self, stream: *mut core::ffi::c_void) -> Result<()> {
+        for at in 0..self.expert_caches.len() {
+            for bank in 0..self.expert_caches[at].planes.len() {
+                let cache = &self.expert_caches[at];
+                let held = &cache.planes[bank];
+                let first = (held.layer * cache.shape.experts) as usize;
+                let mut entries = Vec::with_capacity(cache.shape.experts as usize * 8);
+                for expert in 0..cache.shape.experts as usize {
+                    let address = match cache.slots[first + expert] {
+                        Some(slot) => {
+                            self.chunks.weight_slot(
+                                cache.shape.per_chunk,
+                                cache.shape.slot_bytes,
+                                slot,
+                            )? + held.plane.offset
+                        }
+                        None => held.host + expert as u64 * held.plane.bytes,
+                    };
+                    entries.extend_from_slice(&address.to_le_bytes());
+                }
+                let held = &mut self.expert_caches[at].planes[bank];
+                if stream.is_null() {
+                    held.table.write(0, &entries)?;
+                } else {
+                    held.table.stage(stream, 0, &entries)?;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// The expert table of each streamed bank, by its param: what its
+    /// select reads its experts through. A bank whose experts all lie in
+    /// pool slots the runtime holds for the load's life is located, any
+    /// select's; any other may name the host copy by the next fire, and is
+    /// the plain-load selects' (a recorded body keeps the select it chose).
+    #[must_use]
+    pub fn expert_tables(&self) -> Vec<(u32, kernels_cuda::linear::moe::ExpertTable)> {
+        let window = (self.chunks.base(), self.chunks.bytes());
+        self.expert_caches
+            .iter()
+            .flat_map(|cache| {
+                cache.planes.iter().map(move |bank| {
+                    let first = (bank.layer * cache.shape.experts) as usize;
+                    let located = self.weights_held
+                        && cache.slots[first..first + cache.shape.experts as usize]
+                            .iter()
+                            .all(Option::is_some);
+                    (
+                        bank.plane.param,
+                        kernels_cuda::linear::moe::ExpertTable {
+                            table: bank.table.ptr(),
+                            hits: bank.hits.as_ref().map_or(0, crate::device::Buffer::ptr),
+                            located,
+                            window: if located { window } else { (0, 0) },
+                        },
+                    )
+                })
+            })
+            .collect()
     }
 
     /// Opens the cache of each row-streamed table: `hosts` gives each
@@ -1996,12 +2127,30 @@ impl Pools {
     /// See `Engine::weight_residency`: the blocks newly named a slot are
     /// filled from the host copy and every table rewritten, on `stream`
     /// behind the fires it holds and before the next. A block no longer
-    /// named is read from the host copy again.
+    /// named is read from the host copy again. Returns whether a bank's
+    /// table became located or stopped being so: the selects a recorded
+    /// body chose for it are then not the ones a fire would choose.
     pub fn weight_residency(
         &mut self,
         stream: *mut core::ffi::c_void,
         residency: &engine::chunk::WeightResidency,
-    ) -> Result<()> {
+    ) -> Result<bool> {
+        if self.weights_held && !residency.held {
+            return Err(Fault::Unbound {
+                what: "a weight residency that is not held after one that was: a held set \
+                       is the load's for life"
+                    .to_string(),
+            });
+        }
+        let located = |pools: &Pools| -> Vec<bool> {
+            pools
+                .expert_tables()
+                .iter()
+                .map(|(_, table)| table.located)
+                .collect()
+        };
+        let before = located(self);
+        self.weights_held = residency.held;
         for at in 0..self.row_caches.len() {
             let shape = self.row_caches[at].shape.clone();
             let mut named: Vec<Option<u32>> = vec![None; shape.blocks as usize];
@@ -2036,10 +2185,100 @@ impl Pools {
                     usize::try_from(bytes).unwrap_or(0),
                 ));
             }
-            crate::device::copy_batch(stream, false, &fills)?;
+            self.fill_weights(stream, &fills)?;
             self.row_caches[at].slots = named;
         }
-        self.stage_row_tables(stream)
+        for at in 0..self.expert_caches.len() {
+            let shape = self.expert_caches[at].shape.clone();
+            let mut named: Vec<Option<u32>> = vec![None; shape.count() as usize];
+            for resident in residency
+                .resident
+                .iter()
+                .filter(|resident| resident.atom.shape == shape.id)
+            {
+                let Some(seat) = named.get_mut(resident.atom.atom as usize) else {
+                    return Err(Fault::Ceiling {
+                        what: "experts of a streamed shape",
+                        need: u64::from(resident.atom.atom) + 1,
+                        have: u64::from(shape.count()),
+                    });
+                };
+                *seat = Some(resident.slot);
+            }
+            let mut fills = Vec::new();
+            for (atom, slot) in named.iter().enumerate() {
+                let Some(slot) = *slot else { continue };
+                if self.expert_caches[at].slots[atom] == Some(slot) {
+                    continue;
+                }
+                let (layer, expert) = (
+                    atom as u32 / shape.experts,
+                    u64::from(atom as u32 % shape.experts),
+                );
+                let to = self
+                    .chunks
+                    .weight_slot(shape.per_chunk, shape.slot_bytes, slot)?;
+                for bank in self.expert_caches[at]
+                    .planes
+                    .iter()
+                    .filter(|bank| bank.layer == layer)
+                {
+                    fills.push((
+                        to + bank.plane.offset,
+                        bank.host + expert * bank.plane.bytes,
+                        usize::try_from(bank.plane.bytes).unwrap_or(0),
+                    ));
+                }
+            }
+            self.fill_weights(stream, &fills)?;
+            self.expert_caches[at].slots = named;
+        }
+        self.stage_row_tables(stream)?;
+        self.stage_expert_tables(stream)?;
+        Ok(before != located(self))
+    }
+
+    /// Fills weight slots from the host copies, `(slot, host, bytes)` each.
+    fn fill_weights(
+        &self,
+        stream: *mut core::ffi::c_void,
+        fills: &[(u64, u64, usize)],
+    ) -> Result<()> {
+        if self.hosts_dropped && !fills.is_empty() {
+            return Err(Fault::Unbound {
+                what: "a weight atom named a new slot after the held set's host copy was \
+                       dropped: a held atom stays where it was named"
+                    .to_string(),
+            });
+        }
+        crate::device::copy_batch(stream, false, fills)
+    }
+
+    /// The params whose host copies no fire reads and no fill needs again:
+    /// every streamed table and bank, where the runtime holds the set for
+    /// the load's life and it names every atom. Empty otherwise.
+    #[must_use]
+    pub fn held_weights(&self) -> Vec<usize> {
+        let whole = self.weights_held
+            && self
+                .row_caches
+                .iter()
+                .map(|cache| &cache.slots)
+                .chain(self.expert_caches.iter().map(|cache| &cache.slots))
+                .all(|slots| slots.iter().all(Option::is_some));
+        if !whole {
+            return Vec::new();
+        }
+        self.row_params()
+            .into_iter()
+            .chain(self.expert_params())
+            .map(|param| param as usize)
+            .collect()
+    }
+
+    /// The host copies are gone: nothing is filled from them again.
+    pub fn drop_weight_hosts(&mut self) {
+        self.hosts_dropped = true;
     }
 
     /// The row-streamed tables' blocks named a slot, and all of them.
@@ -2078,15 +2317,44 @@ impl Pools {
                 }
             }
         }
+        for cache in &mut self.expert_caches {
+            let experts = cache.shape.experts as usize;
+            for bank in &mut cache.planes {
+                let Some(hits) = bank.hits.as_mut() else {
+                    continue;
+                };
+                let mut counted = vec![0u8; experts * 4];
+                hits.read_on(stream, 0, &mut counted)?;
+                hits.zero_span_on(stream, 0, experts * 4)?;
+                for (expert, reads) in counted.as_chunks::<4>().0.iter().enumerate() {
+                    let reads = u32::from_le_bytes(*reads);
+                    if reads > 0 {
+                        uses.push((
+                            engine::chunk::WeightAtom {
+                                shape: cache.shape.id,
+                                atom: bank.layer * cache.shape.experts + expert as u32,
+                            },
+                            reads,
+                        ));
+                    }
+                }
+            }
+        }
         let held = self
             .row_caches
             .iter()
-            .map(|cache| {
-                let resident = cache.slots.iter().flatten().count() as u32;
+            .map(|cache| (cache.shape.id, &cache.slots))
+            .chain(
+                self.expert_caches
+                    .iter()
+                    .map(|cache| (cache.shape.id, &cache.slots)),
+            )
+            .map(|(shape, slots)| {
+                let resident = slots.iter().flatten().count() as u32;
                 engine::chunk::WeightHeld {
-                    shape: cache.shape.id,
+                    shape,
                     resident,
-                    host: cache.slots.len() as u32 - resident,
+                    host: slots.len() as u32 - resident,
                 }
             })
             .collect();
@@ -2910,6 +3178,7 @@ fn lay(
     paging: &Paging,
     budgets: &poem_compiler::Budgets,
     chunk_bytes: Option<u64>,
+    experts: &[usize],
 ) -> Result<layout::Layout> {
     let context = if paging.window.is_some() {
         paging.context()
@@ -2928,7 +3197,13 @@ fn lay(
         poem_compiler::chunk::plan(trace, budgets, &profile).map_err(|why| Fault::Unbound {
             what: format!("a chunk recipe for this load's cache rows: {why}"),
         })?;
-    layout::Layout::of(&recipe, &layout::streamed_rows(trace))
+    let banks: Vec<(usize, u64)> = if experts.is_empty() {
+        Vec::new()
+    } else {
+        let bytes = crate::weights::plane_bytes(trace)?;
+        experts.iter().map(|&param| (param, bytes[param])).collect()
+    };
+    layout::Layout::of(&recipe, &layout::streamed_rows(trace), &banks)
 }
 
 /// Whether this build's kernels step a plane's pages one right after another
@@ -3021,6 +3296,30 @@ struct RowCache {
     /// A u32 counter a block.
     hits: crate::device::Buffer,
     /// The slot ref each block is cached in.
+    slots: Vec<Option<u32>>,
+}
+
+/// One bank of an expert shape's cache: its plane in an expert's slot, the
+/// layer it is of, its mapped host copy, the device table its select reads
+/// its experts through, and (a layer's first bank) each expert's reads.
+#[derive(Debug)]
+struct ExpertBank {
+    plane: layout::ExpertPlane,
+    layer: u32,
+    host: u64,
+    /// A u64 address an expert.
+    table: crate::device::Buffer,
+    /// A u32 counter an expert.
+    hits: Option<crate::device::Buffer>,
+}
+
+/// An expert shape's cache: where each expert of each layer lies (a pool
+/// slot the runtime named, or the mapped host copy).
+#[derive(Debug)]
+struct ExpertCache {
+    shape: layout::ExpertShape,
+    planes: Vec<ExpertBank>,
+    /// The slot ref each atom is cached in.
     slots: Vec<Option<u32>>,
 }
 

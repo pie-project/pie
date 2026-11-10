@@ -393,7 +393,13 @@ impl Chunks {
     /// The address of weight slot `slot` (a slot ref) of the row-streamed
     /// table `rows`, where its chunk is backed.
     pub fn row_slot(&self, rows: &crate::store::layout::RowsShape, slot: u32) -> Result<u64> {
-        let logical = slot / rows.per_chunk;
+        self.weight_slot(rows.per_chunk, rows.slot_bytes, slot)
+    }
+
+    /// The address of weight slot `slot` (a slot ref) of a weight shape of
+    /// `per_chunk` slots of `slot_bytes` a chunk, where its chunk is backed.
+    pub fn weight_slot(&self, per_chunk: u32, slot_bytes: u64, slot: u32) -> Result<u64> {
+        let logical = slot / per_chunk;
         let physical = self.table.physical(logical).ok_or(Fault::Ceiling {
             what: "chunks of the state pool",
             need: u64::from(logical) + 1,
@@ -401,8 +407,8 @@ impl Chunks {
         })?;
         self.range.span(
             u64::from(physical) * self.layout.chunk_bytes
-                + u64::from(slot % rows.per_chunk) * rows.slot_bytes,
-            rows.slot_bytes,
+                + u64::from(slot % per_chunk) * slot_bytes,
+            slot_bytes,
         )
     }
 
@@ -575,6 +581,27 @@ impl Chunks {
                     floor_slots: rows.floor.min(rows.blocks),
                     name: format!("param {}", rows.param),
                 })
+                .chain(
+                    layout
+                        .experts
+                        .iter()
+                        .map(|experts| engine::chunk::WeightShape {
+                            id: experts.id,
+                            kind: engine::chunk::WeightKind::Expert,
+                            slot_bytes: experts.slot_bytes,
+                            slots_per_chunk: experts.per_chunk,
+                            count: experts.count(),
+                            floor_slots: experts.floor.min(experts.count()),
+                            name: format!(
+                                "experts of param {}",
+                                experts
+                                    .banks
+                                    .first()
+                                    .and_then(|l| l.first())
+                                    .map_or(0, |p| p.param)
+                            ),
+                        }),
+                )
                 .collect(),
         }
     }

@@ -114,6 +114,14 @@ pub(super) fn bake(boot: &mut Boot<'_>) -> Result<Baked> {
     if boot.residency.host_rows(&boot.trace, &streamed)? > 0 {
         boot.deferred_tier = false;
     }
+    // So do the routed banks it streams an expert at a time, where the
+    // load's own weight budget seats no expert itself.
+    if boot.residency.banks().is_empty() {
+        let banks = crate::store::layout::streamed_experts(&boot.trace);
+        if boot.residency.host_experts(&boot.trace, &banks)? > 0 {
+            boot.deferred_tier = false;
+        }
+    }
     boot.slots = poem_compiler::state_slots(boot.slots, &boot.trace, DEFAULT_STATE_SLOTS);
 
     kernels_cuda::disk::install(boot.cache_dir);
@@ -884,6 +892,7 @@ impl Shell {
             arena_bytes,
             boot.knobs.diagnostics.chunk_bytes,
             boot.knobs.diagnostics.packed_pages,
+            boot.residency.cached_experts(),
         )?;
         if boot.knobs.diagnostics.arm_trace {
             eprintln!(
@@ -903,6 +912,16 @@ impl Shell {
             })
             .collect();
         pools.seat_rows(&hosts)?;
+        // And each expert shape's, over its banks' host copies.
+        let hosts: Vec<(u32, u64)> = pools
+            .expert_params()
+            .into_iter()
+            .filter_map(|param| match weights.table().0.get(param as usize) {
+                Some(Some(crate::run::WeightRow::Dense(bank))) => Some((param, bank.ptr)),
+                _ => None,
+            })
+            .collect();
+        pools.seat_experts(&hosts)?;
         // Committed whole: a fire reading out past one row a lane (a verify
         // reads every row) would otherwise grow it outside the fit.
         let mut arena = Arena::reserve(arena_bytes);
