@@ -71,6 +71,16 @@ fn write_checkpoint(path: &Path, trace: &Trace) {
                     .flat_map(|_| value(next()).to_le_bytes())
                     .collect(),
             ),
+            // A hash-routing table: each row names experts 0.. of its width.
+            Dtype::I64 => {
+                let width = param.shape.last().copied().unwrap_or(1).max(1);
+                (
+                    ztensor::Leaf::I64,
+                    (0..count as u64)
+                        .flat_map(|at| (at % width).to_le_bytes())
+                        .collect(),
+                )
+            }
             other => panic!(
                 "`{}` is {other:?}, not a dtype the fixture seeds",
                 param.name
