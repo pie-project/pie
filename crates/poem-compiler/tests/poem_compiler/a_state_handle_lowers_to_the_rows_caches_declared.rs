@@ -84,15 +84,34 @@ fn deepseek_v4(path: &str, _row: &CacheRow) -> String {
 }
 
 fn gemma_4(path: &str, _row: &CacheRow) -> String {
-    path.to_string()
+    match parts(path)[..] {
+        ["layers", l, "attn", "kv"] => format!("kv.{l}"),
+        ["draft", "attn", "kv"] => "kv.mtp".to_string(),
+        ["dflash", "blocks", b, "attn", "kv"] => format!("kv.dflash.{b}"),
+        _ => path.to_string(),
+    }
 }
 
 fn qwen_3(path: &str, _row: &CacheRow) -> String {
-    path.to_string()
+    match parts(path)[..] {
+        ["layers", l, "attn", "kv"] => format!("kv.{l}"),
+        ["layers", l, "gdn", "conv_state"] => format!("conv.{l}"),
+        ["layers", l, "gdn", "delta_state"] => format!("delta.{l}"),
+        ["mtp", "attn", "kv"] => "kv.mtp".to_string(),
+        ["draft_kv"] => "kv.draft".to_string(),
+        ["dflash", "blocks", b, "attn", "kv"] => format!("kv.dflash.{b}"),
+        _ => path.to_string(),
+    }
 }
 
 fn glm_5(path: &str, _row: &CacheRow) -> String {
-    path.to_string()
+    match parts(path)[..] {
+        ["layers", l, "attn", "kv"] => format!("kv.{l}"),
+        ["layers", l, "attn", "indexer", "keys"] => format!("index.{l}"),
+        ["mtp", "attn", "kv"] => "kv.mtp".to_string(),
+        ["mtp", "attn", "indexer", "keys"] => "index.mtp".to_string(),
+        _ => path.to_string(),
+    }
 }
 
 /// Every listed deployment of `package`, at one rank and at each count of
@@ -134,8 +153,23 @@ fn kept_whole(package: &str, name: &str) -> bool {
     }
 }
 
-fn renamed(package: &str, trace: &Trace, rename: Renaming) -> Vec<CacheRow> {
+/// Whether `caches()` declared `deployment` a space 0 no row is in: a
+/// one-layer Gemma 4 of a sliding layer alone, whose row sat in space 1
+/// behind the global layers' empty space. A space now is made only for the
+/// rows in it.
+fn left_space_zero_empty(deployment: &str) -> bool {
+    deployment.starts_with("gemma4-e4b-mini-l1-")
+}
+
+fn renamed(package: &str, deployment: &str, trace: &Trace, rename: Renaming) -> Vec<CacheRow> {
     let mut rows = trace.caches.clone();
+    if left_space_zero_empty(deployment) {
+        for row in &mut rows {
+            if let CacheRow::Kv { space, .. } = row {
+                *space += 1;
+            }
+        }
+    }
     for row in &mut rows {
         let was = row.clone();
         let (CacheRow::Kv { name, .. } | CacheRow::State { name, .. }) = row;
@@ -176,7 +210,7 @@ fn holds(package: &str, rename: Renaming) {
             format!(
                 "{} {:016x}",
                 d.name,
-                digest(&renamed(package, &trace, rename))
+                digest(&renamed(package, &d.name, &trace, rename))
             )
         })
         .collect();

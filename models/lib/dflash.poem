@@ -53,11 +53,12 @@ def selector(rank, top_k):
 def markov(rank, top_k):
     return struct(kind = "markov", rank = rank, top_k = top_k)
 
-def declare(head, prefix, hidden, vocab, norm_eps, w, dense, blocks_w = None):
+def declare(head, prefix, hidden, vocab, norm_eps, w, dense, blocks_w = None, kv = None):
     """The drafter `head` describes, its weights under `prefix`, over a
     trunk of `hidden` and `vocab` whose norms take `norm_eps`, its banks
     stored as `w` (its blocks' projections as `blocks_w`, when given) and its
-    vectors as `dense`."""
+    vectors as `dense`. With `kv`, each block's keys and values are a state
+    of that dtype; without, rows `caches` names."""
     bw = blocks_w if blocks_w != None else w
     dq, dkv, hd = head.q_heads, head.kv_heads, head.head_dim
     inter = head.inter
@@ -99,7 +100,7 @@ def declare(head, prefix, hidden, vocab, norm_eps, w, dense, blocks_w = None):
                 k_bias = bias("k_bias", dkv * hd),
                 v_bias = bias("v_bias", dkv * hd),
                 o_bias = bias("o_bias", hidden),
-                kv = "kv.dflash.{}".format(l),
+                kv = state([tokens, 2, dkv, hd], kv) if kv != None else "kv.dflash.{}".format(l),
             ),
             mlp_norm = weight([hidden]),
             mlp_norm_eps = norm_eps,
@@ -199,6 +200,7 @@ def bind_aux(d, reads, norm):
 # them, its proposals read out of the trunk's own head.
 
 def caches(d, c, space):
+    """The blocks' rows, where `declare` was given no kv dtype."""
     for b in d.blocks:
         a = b.attn
         plane = a.kv_heads * a.head_dim
