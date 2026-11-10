@@ -32,15 +32,17 @@ def layout(id, deploy):
             v = weight([32, 64]),
             o = weight([64, 64]),
             conv = weight([64, 4]),
+            k_conv = weight([32, 4]),
             window = window,
             kv = state([tokens, 2, 2, 16], deploy.kv),
+            k_taps = state([4, 32], dtype.bf16),
             taps = state([4, 64], dtype.bf16),
         )
     return struct(
         embed = weight([16, 64]),
         head = weight([16, 64]),
         layers = [layer(None), layer(8), layer(None)],
-        spare = state([tokens, 2, 2, 16], deploy.kv),
+        spare = state([tokens, [32, 32]], deploy.kv),
     )
 
 def forward(m, inputs):
@@ -48,6 +50,7 @@ def forward(m, inputs):
 
     def block(l, w, y):
         q, k, v = ops.linear.matmul(y, w.q), ops.linear.matmul(y, w.k), ops.linear.matmul(y, w.v)
+        k = ops.ssm.causal_conv1d(k, w.k_conv, w.k_taps, 4)
         ops.attn.kv_append(k, v, w.kv)
         o = ops.attn.attend(q, inputs, w.kv, 4, 2, 16, 0.25, window = w.window)
         y = ops.elemwise.residual_add(ops.linear.matmul(o, w.o), y)
@@ -100,12 +103,17 @@ fn a_state_is_named_by_its_path_and_laid_out_by_its_readers() {
         rows,
         [
             "layers.0.kv kv [32, 32] space 0 window None head 16 true",
-            "layers.0.taps slab [4, 64] cut 1",
+            // its channels feed the heads: cut as they are
+            "layers.0.k_taps slab [4, 32] cut 1",
+            // over the residual stream: whole on every rank
+            "layers.0.taps slab [4, 64] whole",
             "layers.1.kv kv [32, 32] space 1 window Some(8) head 16 true",
-            "layers.1.taps slab [4, 64] cut 1",
+            "layers.1.k_taps slab [4, 32] cut 1",
+            "layers.1.taps slab [4, 64] whole",
             "layers.2.kv kv [32, 32] space 0 window None head 16 true",
-            "layers.2.taps slab [4, 64] cut 1",
-            // no op reads it: laid out as the rows of its shape one does
+            "layers.2.k_taps slab [4, 32] cut 1",
+            "layers.2.taps slab [4, 64] whole",
+            // no op reads it: laid out as the rows of its planes one does
             "spare kv [32, 32] space 0 window None head 16 true",
         ],
         "{rows:#?}"
@@ -135,4 +143,24 @@ fn a_pool_keeps_its_share_of_a_tokens_row() {
         why.contains("no attention reads the per-token state `spare`"),
         "{why}"
     );
+}
+
+#[test]
+fn a_row_format_states_the_dims_it_encodes() {
+    let source = MODEL.replace(
+        "spare = state([tokens, [32, 32]], deploy.kv)",
+        "spare = state([tokens // 4, 256], kv_rows.v4)",
+    );
+    let why = format!("{:#}", traced(&source).expect_err("v4 rows of 256 dims"));
+    assert!(
+        why.contains("kv_rows.v4 rows encode 512 dims, not 256"),
+        "{why}"
+    );
+}
+
+#[test]
+fn only_a_per_token_state_lists_its_planes() {
+    let source = MODEL.replace("state([4, 64]", "state([[4, 64]]");
+    let why = format!("{:#}", traced(&source).expect_err("a listed slab"));
+    assert!(why.contains("a per-token state lists its planes"), "{why}");
 }

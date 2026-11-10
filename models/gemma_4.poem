@@ -5,7 +5,7 @@
 
 load("//pie/codec.poem", "nvfp4_bank", read_fused = "fused")
 load("//lib/adapters.poem", "banks", "corrected")
-load("//lib/dflash.poem", "bind_aux", "arm", "block_rows", "plant_readout", "tap", dflash_caches = "caches", dflash_head = "head", dflash_declare = "declare")
+load("//lib/dflash.poem", "bind_aux", "arm", "block_rows", "plant_readout", "tap", dflash_head = "head", dflash_declare = "declare")
 load("//lib/media.poem", "budget_resize")
 load("//lib/reads.poem", "flattened")
 
@@ -256,6 +256,13 @@ def layout(id, deploy):
     glob = struct(head_dim = d.global_head_dim, kv_heads = d.global_kv_heads,
                   rotary_dim = d.global_rotary_dim, theta = d.theta_global)
 
+    # Each layer's keys and values, two planes of its kv heads a token; a
+    # layer of the shared tail reads its owner's.
+    def kv_state(at):
+        return state([tokens, 2, at.kv_heads, at.head_dim], deploy.kv)
+
+    kvs = {l: kv_state(glob if full_at(l) else sliding) for l in range(d.layers) if not shared_at(l)}
+
     def layer(l):
         norm = lambda s, length: weight([length])
         lora_a, lora_b = banks(hidden)
@@ -301,7 +308,7 @@ def layout(id, deploy):
                 sm_scale = d.sm_scale,
                 q_norm = norm("q_norm", head_dim),
                 q_norm_eps = d.norm_eps,
-                kv = "kv.{}".format(owner(l)),
+                kv = kvs[owner(l)],
                 banks = attn_banks,
                 reading = reading,
             ),
@@ -400,7 +407,7 @@ def layout(id, deploy):
                 sm_scale = d.sm_scale,
                 q_norm = anorm("q_norm", hd),
                 q_norm_eps = d.norm_eps,
-                kv = "kv.mtp",
+                kv = kv_state(glob),
                 banks = struct(
                     shared = False,
                     q = weight([q_w, hidden], w),
@@ -440,7 +447,7 @@ def layout(id, deploy):
                     sm_scale = d.sm_scale,
                     q_norm = norm("q_norm", hd),
                     q_norm_eps = d.norm_eps,
-                    kv = "kv.{}".format(last(reading == GLOBAL)),
+                    kv = kvs[last(reading == GLOBAL)],
                     banks = struct(shared = True, q_proj = weight([q_w, ah], w)),
                     reading = reading,
                 ),
@@ -505,7 +512,6 @@ def layout(id, deploy):
         sliding = sliding,
         glob = glob,
         tower = tower,
-        kv = deploy.kv,
         softcap = d.softcap,
         embed = embed,
         ple = ple,
@@ -515,7 +521,7 @@ def layout(id, deploy):
         draft = draft,
         assistant = assistant,
         self_cond = self_cond_block,
-        dflash = dflash_declare(DFLASH_26B_A4B, "aux", hidden, d.vocab, d.norm_eps, w, dense) if drafter == "dflash" else None,
+        dflash = dflash_declare(DFLASH_26B_A4B, "aux", hidden, d.vocab, d.norm_eps, w, dense, kv = deploy.kv) if drafter == "dflash" else None,
     )
 
 # How a Gemma 4 checkpoint is laid out: transformers', mlx_lm's and GGUF's
@@ -813,20 +819,6 @@ def gguf(m, reads):
 # self-conditioning, and each drafter's proposals.
 
 FRAC_1_SQRT_2 = 0.70710677
-
-def caches(m, c):
-    kv = c.kv_space(m.kv)
-    spaces = [c.kv_space(m.kv, m.sliding.window), kv]
-    for w in m.layers:
-        if not w.attn.banks.shared:
-            head_dim, kv_heads, _ = geometry(m, w.attn.reading)
-            plane = kv_heads * head_dim
-            c.kv(spaces[w.attn.reading], w.attn.kv, [plane, plane], head_dim, heads = True)
-    if m.draft != None:
-        plane = m.glob.kv_heads * m.glob.head_dim
-        c.kv(kv, m.draft.attn.kv, [plane, plane], m.glob.head_dim, heads = True)
-    if m.dflash != None:
-        dflash_caches(m.dflash, c, kv)
 
 def geometry(m, reading):
     if reading == SLIDING:
