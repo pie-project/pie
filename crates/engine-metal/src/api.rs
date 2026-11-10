@@ -643,9 +643,7 @@ impl Engine for Metal {
     }
 
     fn release_segments(&mut self, segments: u32) -> EngineResult<()> {
-        self.loaded_mut()?
-            .release_segments(segments)
-            .map_err(fault)
+        self.loaded_mut()?.release_segments(segments).map_err(fault)
     }
 
     fn evacuate(&mut self, evacuation: &engine::chunk::Evacuation) -> EngineResult<()> {

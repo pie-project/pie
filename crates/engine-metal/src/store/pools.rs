@@ -14,7 +14,7 @@ use poem_ir::{CacheRow, Dtype, Trace};
 use super::layout::{self, BUFFER, FIXED, LIST, Layout, Slots};
 use super::pool::Pool;
 use super::{
-    Planes, STATE_MAP_BYTES, SpaceSeat, Seats, Spill, compressed_spaces, elem_bytes, elem_size,
+    Planes, STATE_MAP_BYTES, Seats, SpaceSeat, Spill, compressed_spaces, elem_bytes, elem_size,
     narrow, row_stride, split, state_dtype,
 };
 use crate::device::ctx::Frame;
@@ -756,8 +756,9 @@ impl Pools {
             }
             for (at, &cell) in sides.iter().enumerate() {
                 for plane in [&self.side[2 * at], &self.side[2 * at + 1]] {
-                    let cell_at =
-                        |page: u32, token: u32| (u64::from(page) * page_size + u64::from(token)) * cell;
+                    let cell_at = |page: u32, token: u32| {
+                        (u64::from(page) * page_size + u64::from(token)) * cell
+                    };
                     let (from, to) = (cell_at(src, span.src_token), cell_at(dst, span.dst_token));
                     if from != to {
                         frame.copy_span(plane, from, plane, to, u64::from(span.tokens) * cell)?;
@@ -794,8 +795,10 @@ impl Pools {
         for &(src, dst) in moves {
             let from = self.slot_offset(id, src)?;
             let to = self.slot_offset(id, dst)?;
-            self.pool.admit(u32::try_from(from / self.layout.chunk_bytes).unwrap_or(u32::MAX))?;
-            self.pool.admit(u32::try_from(to / self.layout.chunk_bytes).unwrap_or(u32::MAX))?;
+            self.pool
+                .admit(u32::try_from(from / self.layout.chunk_bytes).unwrap_or(u32::MAX))?;
+            self.pool
+                .admit(u32::try_from(to / self.layout.chunk_bytes).unwrap_or(u32::MAX))?;
             if from != to {
                 frame.copy_span(view, from, view, to, shape.slot_bytes)?;
             }
@@ -891,9 +894,15 @@ impl Pools {
             let staged = &mut spill.stage.as_mut_slice()[..usize::try_from(bytes).unwrap_or(0)];
             if to_disk {
                 self.pool.read(at, staged)?;
-                spill.file.write(slot, spill.stage.as_mut_slice()).map_err(super::slot_file)?;
+                spill
+                    .file
+                    .write(slot, spill.stage.as_mut_slice())
+                    .map_err(super::slot_file)?;
             } else {
-                spill.file.read(slot, spill.stage.as_mut_slice()).map_err(super::slot_file)?;
+                spill
+                    .file
+                    .read(slot, spill.stage.as_mut_slice())
+                    .map_err(super::slot_file)?;
                 let staged = &spill.stage.as_mut_slice()[..usize::try_from(bytes).unwrap_or(0)];
                 self.pool.write(at, staged)?;
             }
@@ -1000,7 +1009,8 @@ impl Pools {
             && self.has_state()
             && let Some(fixed) = self.layout.fixed
         {
-            self.pool.admit((demand.state_slots - 1) / fixed.per_chunk)?;
+            self.pool
+                .admit((demand.state_slots - 1) / fixed.per_chunk)?;
         }
         Ok(())
     }

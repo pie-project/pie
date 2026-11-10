@@ -404,7 +404,7 @@ fn write_case(rig: &mut Rig, head_dim: usize) {
 /// outright refused) loads correctly.
 #[test]
 fn the_pre_estimate_sizes_packed_kv_exactly_at_any_head_dim() {
-    use engine_metal::store::Pools;
+    use engine_metal::store::Planes as Pools;
     use engine_metal::store::kv::{Facts, SpaceFacts};
 
     eprintln!("=== C2b(C): pool_demand sizes packed KvU4 exactly at any head_dim ===");

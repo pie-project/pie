@@ -17,9 +17,9 @@
 
 use engine::chunk::{ChunkTable, Evacuation, Growth};
 
+use crate::device::ctx::Frame;
 #[cfg(target_vendor = "apple")]
 use crate::device::elastic;
-use crate::device::ctx::Frame;
 use crate::device::{Buffer, Context};
 use crate::error::{Fault, Result};
 
@@ -387,7 +387,11 @@ mod tests {
         }
         assert_eq!(pool.growth(), Growth::Bottom);
         assert_eq!(pool.committed_chunks(), 0);
-        assert_eq!(pool.committed_bytes(), 0, "a sparse pool maps nothing at load");
+        assert_eq!(
+            pool.committed_bytes(),
+            0,
+            "a sparse pool maps nothing at load"
+        );
         assert!(pool.admit(0).is_err());
 
         pool.commit_segments(2).expect("two segments");
@@ -414,11 +418,18 @@ mod tests {
         frame.commit().expect("the blits land");
         assert_eq!(pool.physical(5).unwrap(), 2);
         assert_eq!(pool.physical(4).unwrap(), 0);
-        assert_eq!(pool.physical(2).unwrap(), 5, "the free chunk took its place");
+        assert_eq!(
+            pool.physical(2).unwrap(),
+            5,
+            "the free chunk took its place"
+        );
         for chunk in [1u32, 4, 5] {
             let mut back = vec![0u8; C as usize];
             pool.read(pool.offset(chunk).unwrap(), &mut back).unwrap();
-            assert!(back == pattern(chunk), "logical chunk {chunk} kept its bytes");
+            assert!(
+                back == pattern(chunk),
+                "logical chunk {chunk} kept its bytes"
+            );
         }
 
         // The top segment holds nothing held now: it goes back, and what is
@@ -430,7 +441,10 @@ mod tests {
         for chunk in [1u32, 4, 5] {
             let mut back = vec![0u8; C as usize];
             pool.read(pool.offset(chunk).unwrap(), &mut back).unwrap();
-            assert!(back == pattern(chunk), "logical chunk {chunk} survives the release");
+            assert!(
+                back == pattern(chunk),
+                "logical chunk {chunk} survives the release"
+            );
         }
         // A move onto an unbacked chunk is refused, the table untouched.
         let mut frame = device.frame().expect("a frame");

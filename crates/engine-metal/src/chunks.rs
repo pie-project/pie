@@ -113,10 +113,10 @@ pub fn recipe_chunk(trace: &poem_ir::Trace, budgets: &Budgets) -> u64 {
         chunk: ChunkProfile::ON_DEVICE_METAL,
         ..DeviceProfile::default()
     };
-    poem_compiler::chunk::plan(trace, budgets, &profile).map_or(
-        crate::store::layout::TARGET_CHUNK,
-        |recipe| recipe.chunk_bytes,
-    )
+    poem_compiler::chunk::plan(trace, budgets, &profile)
+        .map_or(crate::store::layout::TARGET_CHUNK, |recipe| {
+            recipe.chunk_bytes
+        })
 }
 
 /// `facts` of a pool that maps its pages and slots as they are committed:

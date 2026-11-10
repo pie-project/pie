@@ -23,8 +23,8 @@ use crate::run::{CacheGeometry, CacheTable, FireBindings, FireTables, Run, SlotT
 use crate::scratch::Scratch;
 use crate::settle::{Airborne, Arms, Done};
 use crate::store::Pools;
-use crate::store::layout::Layout;
 use crate::store::kv::{self, Paging, Seat};
+use crate::store::layout::Layout;
 use crate::weights::{AdapterPlane, Weights};
 use crate::window::Windows;
 
@@ -651,7 +651,8 @@ impl PreparedLoad<'_> {
                 u64::from(paging_at(1, boot.slots)?.pages_per_slot),
                 accounting(0).pool,
                 |pages, slots| {
-                    demand_at(slots).map_or(u64::MAX, |demand| demand.bytes_binding(pages, max_buffer))
+                    demand_at(slots)
+                        .map_or(u64::MAX, |demand| demand.bytes_binding(pages, max_buffer))
                 },
             )
             .map_err(|short| Fault::Residency(short.to_string()))?;
@@ -1039,6 +1040,12 @@ impl Shell {
     #[must_use]
     pub fn pool_chunk_facts(&self) -> Option<engine::chunk::ChunkFacts> {
         (!self.pools.is_legacy()).then(|| self.pools.chunk_facts())
+    }
+
+    /// The chunk pool's layout; `None` for the per-plane pools of before.
+    #[must_use]
+    pub fn pool_layout(&self) -> Option<Layout> {
+        (!self.pools.is_legacy()).then(|| *self.pools.layout())
     }
 
     /// See `Engine::commit_segments`.
@@ -3002,7 +3009,8 @@ impl Shell {
                         Some((slots, offsets)) => {
                             for (&page, &off) in slots.iter().zip(offsets) {
                                 let page = self.pools.kv_page(page)?;
-                                writes.push(Some((narrow(u64::from(page)), narrow(u64::from(off)))));
+                                writes
+                                    .push(Some((narrow(u64::from(page)), narrow(u64::from(off)))));
                             }
                         }
                         None => writes.extend(std::iter::repeat_n(None, rows_here)),

@@ -8,6 +8,7 @@ mod a_fenced_frame_lands_both_sides;
 mod a_gate_and_an_up_apart_land_what_they_land_packed;
 mod a_prompt_scan_lands_its_snapshots;
 mod a_scattered_kv_pool_is_the_dense_one;
+mod a_scattered_pool_serves_the_same_logits;
 mod a_scattered_state_bank_is_the_slab;
 mod a_ternary_decode_in_dot_answers_the_host_decoder;
 mod a_tower_region_reads_the_patch_window;
