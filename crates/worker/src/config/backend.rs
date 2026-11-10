@@ -158,6 +158,9 @@ pub struct XlaEngineOptions {
     /// Trace and compile the fire shapes a server meets first at load, so
     /// no early request waits on a compile. Slower to load.
     pub prewarm: bool,
+    /// Device memory the load leaves past its weights and kv pool for XLA's
+    /// scratch. Omit for the chip's own (1/16 of its HBM).
+    pub device_headroom: Option<ByteSize>,
 }
 
 impl XlaEngineOptions {
