@@ -4,7 +4,7 @@
 
 load("//lib/spoken.poem", "QWEN_STOP")
 load("//lib/dit.poem", "adaln_order", "attend", "biased", "chunks", "linear", "reordered", "run_linear")
-load("//lib/qwen3_encoder.poem", "encoder", "qwen3_caches", "qwen3_encode", "te_read")
+load("//lib/qwen3_encoder.poem", "encoder", "qwen3_encode", "te_read")
 
 CHATML = template("chatml", thinking = True, tools = True, stop = QWEN_STOP)
 TOKENIZER = tokenizer(markers = [QWEN_STOP])
@@ -119,7 +119,6 @@ def layout(id, deploy):
         fail("the three rotary axes cover {} of a {}-wide head".format(rotary, d.head_dim))
     dim = d.dim
     return struct(
-        kv = dtype.bf16,
         dims = d,
         sm_scale = f32(1.0 / f32(sqrt(d.head_dim))),
         rope_dims = [2 * d.rope_freqs, 2 * d.rope_freqs, 2 * d.rope_freqs, 0],
@@ -142,7 +141,7 @@ def layout(id, deploy):
             video_out = linear(VIDEO_FEATURES, dim, banks),
             audio_out = linear(AUDIO_CHANNELS, dim, banks),
         ),
-        te = encoder(TE, TE_LAYERS, banks) if id == "minimax-h3-fl2va" else None,
+        te = encoder(TE, TE_LAYERS, banks, deploy.kv) if id == "minimax-h3-fl2va" else None,
         rope = struct(
             four = weight([1], dtype.f32, values = [4.0]),
             five = weight([1], dtype.f32, values = [5.0]),
@@ -273,10 +272,6 @@ ROPE_THETA = 10000.0
 # The modality whose adaLN modulates a stream, and its timestep's slot.
 MODALITY = {"latents": 0, "reference": 0, "audio": 2, "context": 1}
 SLOT = {"latents": 0, "context": 0, "reference": 1, "audio": 2}
-
-def caches(m, c):
-    if m.te != None:
-        qwen3_caches(m.te, c, m.kv)
 
 def forward(m, inputs):
     switch("reading", (["text"] if m.te != None else []) + ["denoise"])

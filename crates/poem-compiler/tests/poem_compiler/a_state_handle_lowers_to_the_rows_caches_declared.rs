@@ -230,7 +230,10 @@ fn z_image(path: &str, _row: &CacheRow) -> String {
 }
 
 fn minimax_h3(path: &str, _row: &CacheRow) -> String {
-    path.to_string()
+    match parts(path)[..] {
+        ["te", "layers", l, "kv"] => format!("te.kv.{l}"),
+        _ => path.to_string(),
+    }
 }
 
 fn hunyuan_image_3(path: &str, _row: &CacheRow) -> String {
