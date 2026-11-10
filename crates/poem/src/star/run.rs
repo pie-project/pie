@@ -6,7 +6,7 @@ use std::cell::RefCell;
 
 use checkpoint::contract::ModelContract;
 
-use crate::{Dtype, ForwardHybrid, HybridSpec, Input, Platform, Precision, Trace};
+use crate::{Dtype, ForwardHybrid, Input, Platform, Precision, StateRows, Trace};
 use starlark::environment::Module;
 use starlark::eval::Evaluator;
 use starlark::values::ValueLike;
@@ -286,7 +286,7 @@ impl Package {
                 );
             }
             let trace = if states.is_empty() {
-                traced(name, HybridSpec::default(), &mut eval, run, m, platform)?
+                traced(name, StateRows::default(), &mut eval, run, m, platform)?
             } else {
                 let first = crate::star::state::provisional(&states)?;
                 let first = traced(name, first, &mut eval, run, m, platform)?;
@@ -310,7 +310,7 @@ impl Package {
 /// the cache rows `spec` declares.
 fn traced<'v, 'e>(
     name: &str,
-    spec: HybridSpec,
+    spec: StateRows,
     eval: &mut Evaluator<'v, 'e, 'e>,
     run: Star<'v>,
     m: Star<'v>,
@@ -352,7 +352,7 @@ fn stretched(trace: &Trace) -> bool {
 
 /// A package's forward, as the DSL traces a model.
 struct Model<'a, 'v, 'e> {
-    spec: HybridSpec,
+    spec: StateRows,
     eval: RefCell<&'a mut Evaluator<'v, 'e, 'e>>,
     run: Star<'v>,
     m: Star<'v>,
@@ -360,7 +360,7 @@ struct Model<'a, 'v, 'e> {
 }
 
 impl ForwardHybrid for Model<'_, '_, '_> {
-    fn caches(&self) -> HybridSpec {
+    fn states(&self) -> StateRows {
         self.spec.clone()
     }
 

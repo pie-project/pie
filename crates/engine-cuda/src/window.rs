@@ -85,11 +85,11 @@ pub struct Gathered {
     pub runs: Vec<MaskSpan>,
     pub rows_host: Vec<i32>,
     pub rows: Tensor,
-    pub spaces: Vec<GatheredSpace>,
+    pub page_tables: Vec<GatheredTable>,
 }
 
 #[derive(Debug, Clone)]
-pub struct GatheredSpace {
+pub struct GatheredTable {
     pub page_indptr_host: Vec<i32>,
     pub page_indices_host: Vec<i32>,
     pub last_page_lens_host: Vec<i32>,
@@ -104,7 +104,7 @@ pub struct GatheredSpace {
 pub struct Copies<'a> {
     pub bucket: u32,
     pub enabled: bool,
-    pub spaces: &'a [Geometry],
+    pub page_tables: &'a [Geometry],
 }
 
 impl Copies<'_> {
@@ -113,7 +113,7 @@ impl Copies<'_> {
         Copies {
             bucket: 0,
             enabled: false,
-            spaces: &[],
+            page_tables: &[],
         }
     }
 }
@@ -139,14 +139,14 @@ impl Slots {
         segs: u32,
         gathered: usize,
         rows: u64,
-        spaces: usize,
+        page_tables: usize,
         pages: u64,
     ) -> Slots {
         Slots {
             stride: lanes + 1 + 2 * u64::from(segs.max(1)),
             slots: (classes * (classes + 1) / 2 + 1 + gathered) as u64,
             gathered: gathered as u64,
-            gathered_stride: rows + spaces as u64 * (3 * lanes + 1 + pages),
+            gathered_stride: rows + page_tables as u64 * (3 * lanes + 1 + pages),
         }
     }
 
@@ -250,11 +250,11 @@ fn copyable(trace: &Trace, region: &Region) -> bool {
                 trace.caches.get(*c as usize),
                 Some(poem_ir::CacheRow::Kv { .. })
             ),
-            Def::Input(RuntimeInput::Geometry { kind, .. }) => matches!(
+            Def::Input(RuntimeInput::Geometry { kind }) => matches!(
                 kind,
                 GeomKind::Indptr | GeomKind::Indices | GeomKind::LastPageLen | GeomKind::KvLen
             ),
-            Def::Input(RuntimeInput::Mask { .. }) => false,
+            Def::Input(RuntimeInput::Mask) => false,
             _ => match &decl.ty {
                 Ty::Struct(_) => true,
                 Ty::Tensor { shape, .. } => match shape.first() {
@@ -347,7 +347,7 @@ impl Windows {
                 && fallback::copies(compiled, axis, &region.mask, copies.bucket)
                 && copyable(trace, region)
             {
-                let mut gathered = gather_of(&spans, indptr_host, copies.spaces);
+                let mut gathered = gather_of(&spans, indptr_host, copies.page_tables);
                 gathered.spans[poem_ir::RowAxis::Patches] = patch;
                 gathered.spans[poem_ir::RowAxis::Voxels] = voxel;
                 seats(slots, &gathered)?;
@@ -456,11 +456,11 @@ impl Windows {
         {
             open(&mut out, self.slots.gathered_at(which as u64));
             out.extend_from_slice(&gathered.rows_host);
-            for space in &gathered.spaces {
-                out.extend_from_slice(&space.page_indptr_host);
-                out.extend_from_slice(&space.page_indices_host);
-                out.extend_from_slice(&space.last_page_lens_host);
-                out.extend_from_slice(&space.kv_len_host);
+            for table in &gathered.page_tables {
+                out.extend_from_slice(&table.page_indptr_host);
+                out.extend_from_slice(&table.page_indices_host);
+                out.extend_from_slice(&table.last_page_lens_host);
+                out.extend_from_slice(&table.kv_len_host);
             }
         }
         out
@@ -486,11 +486,11 @@ impl Windows {
         {
             let mut at = base + slots.gathered_at(which as u64) * 4;
             gathered.rows = take(&mut at, gathered.rows_host.len(), 1);
-            for space in &mut gathered.spaces {
-                space.page_indptr = take(&mut at, space.page_indptr_host.len(), 1);
-                space.page_indices = take(&mut at, space.page_indices_host.len(), 1);
-                space.last_page_lens = take(&mut at, space.last_page_lens_host.len(), 1);
-                space.kv_len = take(&mut at, space.kv_len_host.len(), 1);
+            for table in &mut gathered.page_tables {
+                table.page_indptr = take(&mut at, table.page_indptr_host.len(), 1);
+                table.page_indices = take(&mut at, table.page_indices_host.len(), 1);
+                table.last_page_lens = take(&mut at, table.last_page_lens_host.len(), 1);
+                table.kv_len = take(&mut at, table.kv_len_host.len(), 1);
             }
         }
     }
@@ -789,7 +789,7 @@ fn insert(windows: &mut Vec<Window>, window: Window) -> u32 {
     index as u32
 }
 
-fn gather_of(runs: &[MaskSpan], indptr_host: &[i32], spaces: &[Geometry]) -> Window {
+fn gather_of(runs: &[MaskSpan], indptr_host: &[i32], page_tables: &[Geometry]) -> Window {
     let mut rows_host: Vec<i32> = Vec::new();
     let mut lanes: Vec<usize> = Vec::new();
     let mut bounds: Vec<i32> = vec![0];
@@ -808,23 +808,23 @@ fn gather_of(runs: &[MaskSpan], indptr_host: &[i32], spaces: &[Geometry]) -> Win
         }
     }
 
-    let gathered_spaces = spaces
+    let gathered_tables = page_tables
         .iter()
-        .map(|space| {
+        .map(|table| {
             let mut page_indptr_host: Vec<i32> = vec![0];
             let mut page_indices_host: Vec<i32> = Vec::new();
             let mut last_page_lens_host: Vec<i32> = Vec::new();
             let mut kv_len_host: Vec<i32> = Vec::new();
             for &lane in &lanes {
-                let start = space.indptr.get(lane).copied().unwrap_or(0).max(0) as usize;
-                let end = space.indptr.get(lane + 1).copied().unwrap_or(0).max(0) as usize;
-                let pages = space.indices.get(start..end).unwrap_or(&[]);
+                let start = table.indptr.get(lane).copied().unwrap_or(0).max(0) as usize;
+                let end = table.indptr.get(lane + 1).copied().unwrap_or(0).max(0) as usize;
+                let pages = table.indices.get(start..end).unwrap_or(&[]);
                 page_indices_host.extend_from_slice(pages);
                 page_indptr_host.push(page_indices_host.len() as i32);
-                last_page_lens_host.push(space.last_page_len.get(lane).copied().unwrap_or(0));
-                kv_len_host.push(space.kv_len.get(lane).copied().unwrap_or(0));
+                last_page_lens_host.push(table.last_page_len.get(lane).copied().unwrap_or(0));
+                kv_len_host.push(table.kv_len.get(lane).copied().unwrap_or(0));
             }
-            GatheredSpace {
+            GatheredTable {
                 page_indptr_host,
                 page_indices_host,
                 last_page_lens_host,
@@ -857,7 +857,7 @@ fn gather_of(runs: &[MaskSpan], indptr_host: &[i32], spaces: &[Geometry]) -> Win
             runs: runs.to_vec(),
             rows: Tensor::new(0, 0, 1, Dtype::I32),
             rows_host,
-            spaces: gathered_spaces,
+            page_tables: gathered_tables,
         }),
     }
 }

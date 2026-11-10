@@ -28,6 +28,21 @@ pub(crate) fn fact(bit: u8) -> Guard {
     Guard::Fact(bit)
 }
 
+/// A distinct row input of `width` bf16 columns, the `id`th the trace
+/// states.
+fn guest(trace: &mut Trace, id: u32, width: u64) -> RuntimeInput {
+    trace.inputs.push(poem_ir::GuestInput {
+        name: format!("in{id}"),
+        rows: None,
+    });
+    RuntimeInput::Guest {
+        id,
+        axis: poem_ir::InputAxis::Row,
+        width: u32::try_from(width).unwrap_or(u32::MAX),
+        dtype: Dtype::Bf16,
+    }
+}
+
 impl Build {
     pub(crate) fn new() -> Build {
         Build {
@@ -59,9 +74,7 @@ impl Build {
 
     pub(crate) fn input(&mut self, width: u64) -> ValueId {
         self.inputs += 1;
-        let which = RuntimeInput::Mask {
-            space: self.inputs - 1,
-        };
+        let which = guest(&mut self.trace, self.inputs - 1, width);
         self.value(Def::Input(which), act(width))
     }
 

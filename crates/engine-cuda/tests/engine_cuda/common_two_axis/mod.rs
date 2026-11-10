@@ -19,7 +19,7 @@ use eta_ir::types::{Dtype as EtaDtype, Shape};
 use poem::fact;
 use poem::ops::conv::{self, ConvShape};
 use poem::{
-    Dtype, ForwardHybrid, HybridSpec, Input, ModulateForm, Platform, RaggedMask, Request, RopeForm,
+    Dtype, ForwardHybrid, Input, ModulateForm, Platform, RaggedMask, Request, RopeForm, StateRows,
     Trace, Weight, ops, trace_hybrid,
 };
 use poem_ir::InputAxis;
@@ -37,8 +37,8 @@ pub const NAME: &str = "two-axis-mini";
 pub struct TwoAxis;
 
 impl ForwardHybrid for TwoAxis {
-    fn caches(&self) -> HybridSpec {
-        HybridSpec::new()
+    fn states(&self) -> StateRows {
+        StateRows::new()
     }
     fn forward(&self, inputs: Input) {
         inputs

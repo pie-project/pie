@@ -1194,7 +1194,7 @@ impl FrameShell for Shell {
         };
         super::btrace::mark("lanes");
         let page_size = u64::from(self.pools.paging().page_size).max(1);
-        let kv_less = self.spaces == 0;
+        let kv_less = self.page_tables == 0;
         let demand = Demand {
             kv_pages: if kv_less {
                 0
@@ -1280,9 +1280,9 @@ impl FrameShell for Shell {
         let indptr_host = kv::indptr(&seats)?;
         let table_refs: Vec<&[u32]> = tables.iter().map(std::convert::AsRef::as_ref).collect();
         let window_refs: Vec<&[u32]> = window_tables.iter().map(Vec::as_slice).collect();
-        let mut geometries = (0..self.spaces)
-            .map(|space| {
-                if self.pools.windowed_geometry(space) {
+        let mut geometries = (0..self.page_tables)
+            .map(|table| {
+                if self.pools.windowed_geometry(table) {
                     kv::geometry_with(&paging, &seats, &window_refs)
                 } else {
                     kv::geometry_with(&paging, &seats, &table_refs)
@@ -1301,8 +1301,8 @@ impl FrameShell for Shell {
                     })
                     .unwrap_or(0)
             };
-            for (space, geometry) in geometries.iter_mut().enumerate() {
-                let windowed = self.pools.windowed_geometry(space);
+            for (table, geometry) in geometries.iter_mut().enumerate() {
+                let windowed = self.pools.windowed_geometry(table);
                 for (row, stated) in writes.iter().enumerate() {
                     let Some((page, offset)) = *stated else {
                         continue;
@@ -1351,8 +1351,8 @@ impl FrameShell for Shell {
         // The tables as the kernels read them: each page by the id of the
         // slot it is seated on in the state pool.
         let mut device_geometries = geometries.clone();
-        for (space, geometry) in device_geometries.iter_mut().enumerate() {
-            let windowed = self.pools.windowed_geometry(space);
+        for (table, geometry) in device_geometries.iter_mut().enumerate() {
+            let windowed = self.pools.windowed_geometry(table);
             self.pools.page_ids(windowed, &mut geometry.indices)?;
             self.pools.page_ids(windowed, &mut geometry.write_page)?;
         }
@@ -1418,7 +1418,7 @@ impl FrameShell for Shell {
                     crate::window::Copies {
                         bucket,
                         enabled: copies_here,
-                        spaces: &device_geometries,
+                        page_tables: &device_geometries,
                     },
                     self.inputs.window_slots(),
                 )?;
@@ -1581,7 +1581,7 @@ impl FrameShell for Shell {
                 live: if bodied { windows.live() } else { &[] },
                 slot_ids: &slot_ids,
                 state_ids: &device_slot_ids,
-                spaces: &device_geometries,
+                page_tables: &device_geometries,
                 mask: staged.as_ref(),
                 adapter_routes: any_adapter.then_some(adapter_routes.as_slice()),
                 live_rows: rows,
@@ -1607,7 +1607,7 @@ impl FrameShell for Shell {
             0
         };
         let placed = match geometries.as_slice() {
-            [space] if !self.pools.windowed_geometry(0) => Some(space),
+            [table] if !self.pools.windowed_geometry(0) => Some(table),
             _ => None,
         };
         let kv_reports: Vec<super::KvReport> = composition
@@ -1631,7 +1631,7 @@ impl FrameShell for Shell {
                     fold,
                     fold_at: fold_at[row.source as usize].filter(|_| fold.is_none()),
                 };
-                let Some(space) = placed else {
+                let Some(table) = placed else {
                     return report;
                 };
                 let unsigned = |values: &[i32]| values.iter().map(|&v| v as u32).collect();
@@ -1642,8 +1642,8 @@ impl FrameShell for Shell {
                 super::KvReport {
                     tokens: (!fed).then(|| unsigned(&tokens[span.clone()])),
                     positions: unsigned(&positions[span.clone()]),
-                    pages: unsigned(&space.write_page[span.clone()]),
-                    offsets: unsigned(&space.write_offset[span]),
+                    pages: unsigned(&table.write_page[span.clone()]),
+                    offsets: unsigned(&table.write_offset[span]),
                     ..report
                 }
             })

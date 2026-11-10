@@ -58,7 +58,6 @@ fn state_dtype(declared: Dtype) -> Dtype {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Shape {
     Kv {
-        space: u32,
         head_dim: u32,
         kv_heads: u32,
         dtype: Dtype,
@@ -78,7 +77,7 @@ enum Shape {
 }
 
 #[derive(Debug, Clone, Copy)]
-pub struct SpaceSeat {
+pub struct TableSeat {
     pub page_indptr: Tensor,
 
     pub page_indices: Tensor,
@@ -96,7 +95,7 @@ pub struct Seats {
 
     pub pages: u32,
 
-    pub spaces: Vec<SpaceSeat>,
+    pub page_tables: Vec<TableSeat>,
 
     pub slot_ids: Tensor,
 
@@ -138,7 +137,6 @@ impl Pools {
                     name,
                     planes,
                     dtype,
-                    space,
                     ..
                 } => {
                     let planes = split(name, planes)?;
@@ -175,7 +173,6 @@ impl Pools {
                         plane + if own_values { values_bytes } else { 0 },
                     )?);
                     shapes.push(Shape::Kv {
-                        space: *space,
                         head_dim: u32::try_from(head_dim).unwrap_or(u32::MAX),
                         kv_heads: u32::try_from(kv_heads).unwrap_or(u32::MAX),
                         dtype: *dtype,
@@ -285,7 +282,6 @@ impl Pools {
         for (slab, shape) in self.slabs.iter().zip(&self.shapes) {
             rows.push(match *shape {
                 Shape::Kv {
-                    space,
                     head_dim,
                     kv_heads,
                     dtype,
@@ -294,15 +290,10 @@ impl Pools {
                     values_width,
                     values_bytes,
                 } => {
-                    let seat = seats
-                        .spaces
-                        .get(space as usize)
-                        .ok_or_else(|| Fault::Unbound {
-                            what: format!(
-                                "cache space {space}, for which this fire wrote no \
-                                     geometry"
-                            ),
-                        })?;
+                    // The one page table every kv row reads here.
+                    let seat = seats.page_tables.first().ok_or_else(|| Fault::Unbound {
+                        what: "the page table, which this fire staged none of".to_string(),
+                    })?;
                     let cells = self.pages * u64::from(self.paging.page_size);
                     let plane = |at: u64, bytes: u64, width: u64| -> Result<Tensor> {
                         Ok(Tensor::new(
@@ -926,7 +917,6 @@ mod tests {
         let mut pools = Pools {
             slabs: vec![Buffer::zeroed(&device, 2 * plane).expect("a kv slab")],
             shapes: vec![Shape::Kv {
-                space: 0,
                 head_dim: 3,
                 kv_heads: 1,
                 dtype: STATE_DTYPE,
@@ -1017,7 +1007,6 @@ mod tests {
             ],
             shapes: vec![
                 Shape::Kv {
-                    space: 0,
                     head_dim: 3,
                     kv_heads: 1,
                     dtype: STATE_DTYPE,

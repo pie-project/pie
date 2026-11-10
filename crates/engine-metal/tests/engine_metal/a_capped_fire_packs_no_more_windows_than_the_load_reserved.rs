@@ -26,8 +26,8 @@ const LATTICE: [u32; 2] = [1024, 4096];
 /// The row ceiling every fire in this file stands at.
 const ROWS: u32 = 4096;
 
-/// One kv space, which is what the reservation is told to carve for.
-const SPACES: usize = 1;
+/// One page table, which is what the reservation is told to carve for.
+const PAGE_TABLES: usize = 1;
 
 /// A deployment of `lanes` lanes at the row ceiling. One lane is the shape
 /// that overran in production: the base term pays `lanes + 1` per window, so
@@ -178,7 +178,7 @@ fn reserved(
     window_ints(
         budget,
         paging(),
-        SPACES,
+        PAGE_TABLES,
         compiled.classes.classes.len(),
         max_runs(compiled),
         gathers(trace, compiled),
@@ -187,13 +187,13 @@ fn reserved(
     )
 }
 
-/// One gathered window's payload: the row tables and the per-space pool
+/// One gathered window's payload: the row tables and the per-table pool
 /// tables `Windows::packed` writes AFTER the window's own boundaries.
 fn per_gathered(budget: &Budget) -> u64 {
     let rows = u64::from(budget.max_tokens);
     let lanes = u64::from(budget.max_lanes);
     let pages = u64::from(budget.max_lanes) * u64::from(paging().pages_per_slot);
-    3 * rows + SPACES as u64 * (2 * lanes + (lanes + 1) + pages)
+    3 * rows + PAGE_TABLES as u64 * (2 * lanes + (lanes + 1) + pages)
 }
 
 /// What `Inputs::reserve` carved before the cut and the passes were counted.
@@ -387,9 +387,18 @@ fn two_regions_under_one_cap_take_one_chunk_group_and_fit() {
     // count shows only where the run bound is the smaller factor. That needs
     // a class table narrow enough for the clamp to bite, not the baked one.
     let narrow = 2usize;
-    let base = window_ints(&budget, paging(), SPACES, narrow, 2, 0, &[], &[]);
-    let alone = window_ints(&budget, paging(), SPACES, narrow, 2, 0, &[8], &[0]);
-    let shared = window_ints(&budget, paging(), SPACES, narrow, 2, 0, &[8, 8], &[0, 0]);
+    let base = window_ints(&budget, paging(), PAGE_TABLES, narrow, 2, 0, &[], &[]);
+    let alone = window_ints(&budget, paging(), PAGE_TABLES, narrow, 2, 0, &[8], &[0]);
+    let shared = window_ints(
+        &budget,
+        paging(),
+        PAGE_TABLES,
+        narrow,
+        2,
+        0,
+        &[8, 8],
+        &[0, 0],
+    );
     assert!(
         shared > alone,
         "a second region under the same cap left the reservation at {shared}; \
@@ -550,8 +559,8 @@ fn an_uncapped_load_reserves_exactly_what_it_always_did() {
     // payload AND a boundary vector. Pure arithmetic on the public expression.
     let classes = compiled.classes.classes.len();
     let lanes = u64::from(budget.max_lanes);
-    let none = window_ints(&budget, paging(), SPACES, classes, 1, 0, &[], &[]);
-    let one = window_ints(&budget, paging(), SPACES, classes, 1, 1, &[], &[]);
+    let none = window_ints(&budget, paging(), PAGE_TABLES, classes, 1, 0, &[], &[]);
+    let one = window_ints(&budget, paging(), PAGE_TABLES, classes, 1, 1, &[], &[]);
     assert_eq!(
         one - none - per_gathered(&budget),
         lanes + 1,
@@ -645,7 +654,7 @@ fn a_wide_class_table_reserves_by_the_run_bound_and_not_by_interval_count() {
     let pieces = u64::from(ROWS).div_ceil(8);
     assert_eq!(pieces, 512);
     let chunk_loose = intervals * pieces * (lanes + 1) * 4;
-    let chunk_tight = window_ints(&budget, paging(), SPACES, classes, 1, 0, &[8], &[0]) * 4;
+    let chunk_tight = window_ints(&budget, paging(), PAGE_TABLES, classes, 1, 0, &[8], &[0]) * 4;
     assert_eq!(chunk_loose, 276_889_600);
     assert!(
         chunk_tight < 2 * base,
@@ -660,7 +669,16 @@ fn a_wide_class_table_reserves_by_the_run_bound_and_not_by_interval_count() {
     let caps = vec![8u32; 60];
     let passes = vec![16u32; 60];
     let pass_loose = intervals * 60 * 16 * (lanes + 1) * 4;
-    let pass_tight = window_ints(&budget, paging(), SPACES, classes, 1, 0, &caps, &passes) * 4;
+    let pass_tight = window_ints(
+        &budget,
+        paging(),
+        PAGE_TABLES,
+        classes,
+        1,
+        0,
+        &caps,
+        &passes,
+    ) * 4;
     assert_eq!(pass_loose, 519_168_000);
     assert!(
         pass_tight < 2 * base,

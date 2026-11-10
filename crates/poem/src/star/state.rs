@@ -8,9 +8,8 @@
 //! that read and write it. What the ops say of it (the window an attention
 //! reads it through, its head width, the axis its heads or channels lie on)
 //! is not declared but read off a first trace of the forward, and the state
-//! is then lowered to the cache rows a trace declares: a per-token state to
-//! a kv row in the space of its dtype and window, a fixed one to a state
-//! row.
+//! is then lowered to the rows a trace declares: a per-token state to a kv
+//! row retained through its readers' window, a fixed one to a state row.
 //!
 //! What the ops say, by op: a grouped-query attention (decode, prefill, a
 //! score capture, a sink window) its window and head width, and that the
@@ -37,7 +36,7 @@ use starlark::values::{Heap, NoSerialize, StarlarkValue, Value as Star, ValueLik
 use starlark_derive::{starlark_module, starlark_value};
 
 use crate::star::values::{DtypeValue, word};
-use crate::{Dtype, HybridSpec, KvSpace};
+use crate::{Dtype, StateRows};
 use poem_ir::{Attn, Def, Gather, Operands, Operation, Ssm, Trace, ValueId};
 
 /// The token axis a per-token state's shape starts with: one row every
@@ -348,12 +347,6 @@ struct Reads {
     heads: bool,
     /// A pool gathers its entries from the whole row: no rank holds a part.
     whole: bool,
-    /// An attention reads it through a plan of the forward's rows.
-    planned: bool,
-    /// A pool appends entries to it at its own positions: it pages alone.
-    pooled: bool,
-    /// An indexer's keys: scored, not attended.
-    index: bool,
     /// The slab axis its heads or channels lie on: from the end where
     /// `Err`, `Ok` from the front.
     split: Option<Result<u32, u32>>,
@@ -550,7 +543,6 @@ fn reads(trace: &Trace) -> anyhow::Result<Vec<Reads>> {
                     out[i].window(&name(i), *window)?;
                     out[i].head_dim(&name(i), *head_dim)?;
                     out[i].heads = true;
-                    out[i].planned = true;
                 }
             }
             Operation::Attn(Attn::ScoreCapture {
@@ -559,7 +551,6 @@ fn reads(trace: &Trace) -> anyhow::Result<Vec<Reads>> {
                 if let Some(i) = row(*cache) {
                     out[i].head_dim(&name(i), *head_dim)?;
                     out[i].heads = true;
-                    out[i].planned = true;
                 }
             }
             // a sink attention reads its window without a plan
@@ -593,7 +584,6 @@ fn reads(trace: &Trace) -> anyhow::Result<Vec<Reads>> {
                 if let Some(i) = row(*cache) {
                     out[i].window(&name(i), *window)?;
                     out[i].latent(&name(i), *kv_lora_rank)?;
-                    out[i].planned = true;
                 }
             }
             // keys and values a padded split cut out, each head zero past
@@ -617,12 +607,6 @@ fn reads(trace: &Trace) -> anyhow::Result<Vec<Reads>> {
             Operation::Attn(Attn::IndexTopk { keys, head_dim, .. }) => {
                 if let Some(i) = row(*keys) {
                     out[i].keys_dim(*head_dim);
-                    out[i].index = true;
-                }
-            }
-            Operation::Attn(Attn::IndexKvAppend { keys, .. }) => {
-                if let Some(i) = row(*keys) {
-                    out[i].index = true;
                 }
             }
             Operation::Attn(Attn::PoolLse {
@@ -643,11 +627,6 @@ fn reads(trace: &Trace) -> anyhow::Result<Vec<Reads>> {
                 if let Some(i) = row(*pages) {
                     out[i].keys_dim(*head_dim);
                     out[i].whole = true;
-                }
-            }
-            Operation::Attn(Attn::PoolKvAppend { pool, .. }) => {
-                if let Some(i) = row(*pool) {
-                    out[i].pooled = true;
                 }
             }
             // a conv's state holds its taps by channel: where the channels
@@ -710,13 +689,13 @@ fn planes(s: &StateDecl, rate: u32) -> anyhow::Result<Vec<u64>> {
 
 /// The cache rows `states` lower to before the forward has been traced:
 /// their attentions' heads and windows, their cuts not yet known.
-pub(crate) fn provisional(states: &[StateDecl]) -> anyhow::Result<HybridSpec> {
+pub(crate) fn provisional(states: &[StateDecl]) -> anyhow::Result<StateRows> {
     lower(states, &vec![Reads::default(); states.len()])
 }
 
 /// The cache rows `states` lower to, as the ops of `first`, a trace of the
 /// forward over [`provisional`]'s rows, read them.
-pub(crate) fn lowered(states: &[StateDecl], first: &Trace) -> anyhow::Result<HybridSpec> {
+pub(crate) fn lowered(states: &[StateDecl], first: &Trace) -> anyhow::Result<StateRows> {
     let by_row = reads(first)?;
     let mut read: Vec<Reads> = states
         .iter()
@@ -753,60 +732,16 @@ pub(crate) fn lowered(states: &[StateDecl], first: &Trace) -> anyhow::Result<Hyb
     lower(states, &read)
 }
 
-/// What parts per-token rows into spaces: their dtype, window and rate, and
-/// what reads them: attentions or an indexer (`Ok(index)`), or, appending
-/// its own entries, a pool alone (`Err(the state)`).
-type SpaceKey = (Dtype, Option<u32>, u32, Result<bool, usize>);
-
-/// The order spaces are numbered in: those an attention reads through a
-/// plan of the forward's rows first (the whole sequence's before a
-/// window's), then every other.
-fn rank(r: &Reads) -> u8 {
-    match (r.planned, r.window.flatten()) {
-        (true, None) => 0,
-        (true, Some(_)) => 1,
-        (false, _) => 2,
-    }
-}
-
-fn lower(states: &[StateDecl], read: &[Reads]) -> anyhow::Result<HybridSpec> {
-    let key = |i: usize, rate: u32| -> SpaceKey {
-        let r = &read[i];
-        let class = if r.pooled { Err(i) } else { Ok(r.index) };
-        (states[i].dtype, r.window.flatten(), rate, class)
-    };
-    // every space, in the order its first row is declared, then by rank
-    let mut keys: Vec<(SpaceKey, u8)> = Vec::new();
-    for (i, s) in states.iter().enumerate() {
-        if let Some(rate) = s.per_token {
-            let k = key(i, rate);
-            if !keys.iter().any(|(seen, _)| *seen == k) {
-                keys.push((k, rank(&read[i])));
-            }
-        }
-    }
-    keys.sort_by_key(|(_, rank)| *rank);
-    let mut spec = HybridSpec::new();
-    let spaces: Vec<(SpaceKey, KvSpace)> = keys
-        .into_iter()
-        .map(|(k, _)| {
-            let space = match k.1 {
-                Some(w) => spec.windowed_kv_space(k.0, w),
-                None => spec.kv_space(k.0),
-            };
-            (k, space)
-        })
-        .collect();
-    for (i, (s, r)) in states.iter().zip(read).enumerate() {
+fn lower(states: &[StateDecl], read: &[Reads]) -> anyhow::Result<StateRows> {
+    let mut spec = StateRows::new();
+    for (s, r) in states.iter().zip(read) {
         match s.per_token {
             Some(rate) => {
-                let k = key(i, rate);
-                let space = spaces
-                    .iter()
-                    .find_map(|(seen, space)| (*seen == k).then_some(*space))
-                    .expect("every per-token state's space is made");
                 let head_dim = r.heads_of(s.dims()).unwrap_or(0);
-                let mut row = spec.kv(space, s.name.clone(), planes(s, rate)?, head_dim);
+                let mut row = spec.kv(s.name.clone(), s.dtype, planes(s, rate)?, head_dim);
+                if let Some(window) = r.window.flatten() {
+                    row.window(window);
+                }
                 if let Some(format) = s.rows {
                     row.rows(format.rows(s.dims())?);
                 }

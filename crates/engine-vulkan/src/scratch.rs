@@ -73,7 +73,7 @@ struct CopyRoom {
 
 #[derive(Clone, Copy, Debug)]
 struct Pool {
-    space: u32,
+    row: u32,
     state_kv: Room,
     state_score: Room,
 }
@@ -288,8 +288,8 @@ impl Scratch {
 
         let pool: Vec<Pool> = pool_state(trace, paging)
             .into_iter()
-            .map(|(space, cells, width)| Pool {
-                space,
+            .map(|(row, cells, width)| Pool {
+                row,
                 state_kv: Room::lay(&mut at, cells, width, Dtype::Bf16),
                 state_score: Room::lay(&mut at, cells, width, Dtype::Bf16),
             })
@@ -427,8 +427,8 @@ impl Scratch {
         })())
     }
 
-    pub fn pool_state(&self, handles: &Handles, space: u32) -> Option<Result<PoolSlabs>> {
-        let rooms = *self.pool.iter().find(|held| held.space == space)?;
+    pub fn pool_state(&self, handles: &Handles, row: u32) -> Option<Result<PoolSlabs>> {
+        let rooms = *self.pool.iter().find(|held| held.row == row)?;
         let mint = || {
             Ok(PoolSlabs {
                 state_kv: rooms.state_kv.bind(handles, &self.plane)?,
@@ -470,7 +470,7 @@ fn pool_state(trace: &Trace, paging: Paging) -> Vec<(u32, u64, u64)> {
     if cells == 0 {
         return Vec::new();
     }
-    let mut spaces: Vec<(u32, u64)> = Vec::new();
+    let mut rows: Vec<(u32, u64)> = Vec::new();
     for node in &trace.nodes {
         let Operation::Attn(Attn::PoolGather {
             pages,
@@ -481,21 +481,20 @@ fn pool_state(trace: &Trace, paging: Paging) -> Vec<(u32, u64, u64)> {
         else {
             continue;
         };
-        let Some(Def::Cache(space)) = trace.values.get(pages.0 as usize).map(|v| &v.def) else {
+        let Some(Def::Cache(row)) = trace.values.get(pages.0 as usize).map(|v| &v.def) else {
             continue;
         };
         let width = compressor_coff(*ratio) * u64::from(*head_dim);
         if width == 0 {
             continue;
         }
-        match spaces.iter_mut().find(|(held, _)| *held == *space) {
+        match rows.iter_mut().find(|(held, _)| *held == *row) {
             Some((_, held)) => *held = (*held).max(width),
-            None => spaces.push((*space, width)),
+            None => rows.push((*row, width)),
         }
     }
-    spaces
-        .into_iter()
-        .map(|(space, width)| (space, cells, width))
+    rows.into_iter()
+        .map(|(row, width)| (row, cells, width))
         .collect()
 }
 

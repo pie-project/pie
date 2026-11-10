@@ -8,7 +8,7 @@ use std::path::{Path, PathBuf};
 use engine_xla::serve::{Clips, Seated};
 use engine_xla::{Boot, DeviceBoot, Lane, Shell};
 use poem::ops::conv::{self, ConvShape};
-use poem::{Dtype, ForwardHybrid, HybridSpec, Input, Platform, Weight, trace_hybrid};
+use poem::{Dtype, ForwardHybrid, Input, Platform, StateRows, Weight, trace_hybrid};
 use poem_compiler::{Budget, VoxelLadder};
 use poem_ir::InputAxis;
 
@@ -57,8 +57,8 @@ impl Decoder {
 }
 
 impl ForwardHybrid for Decoder {
-    fn caches(&self) -> HybridSpec {
-        HybridSpec::new()
+    fn states(&self) -> StateRows {
+        StateRows::new()
     }
     fn forward(&self, inputs: Input) {
         let g = inputs.grid();
@@ -545,8 +545,8 @@ impl Causal {
 }
 
 impl ForwardHybrid for Causal {
-    fn caches(&self) -> HybridSpec {
-        let mut spec = HybridSpec::new();
+    fn states(&self) -> StateRows {
+        let mut spec = StateRows::new();
         spec.state(
             "conv.cache",
             [(FRAMES * PLANE_MAX) as u64, C_IN as u64],

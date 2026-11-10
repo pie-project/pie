@@ -79,7 +79,7 @@ pub use serve::{
 pub use settle::{Airborne, Arms, Done};
 pub use store::Pools;
 pub use weights::{AdapterPlane, BankSeat, Weights};
-pub use window::{Copies, Gathered, GatheredSpace, Window, Windows};
+pub use window::{Copies, Gathered, GatheredTable, Window, Windows};
 
 /// The fusions this backend implements: the compiler runs these rules alone.
 pub static FUSIONS: std::sync::LazyLock<Vec<poem_compiler::fuse::Rule>> =

@@ -1,5 +1,5 @@
 use poem::ops::conv::{self, ConvShape};
-use poem::{Dtype, ForwardHybrid, HybridSpec, Input, Platform, Weight, trace_hybrid};
+use poem::{Dtype, ForwardHybrid, Input, Platform, StateRows, Weight, trace_hybrid};
 use poem_ir::{Dim, Operands, ParamLayout, Ty};
 
 const C_IN: u32 = 8;
@@ -39,8 +39,8 @@ impl Decoder {
 }
 
 impl ForwardHybrid for Decoder {
-    fn caches(&self) -> HybridSpec {
-        HybridSpec::new()
+    fn states(&self) -> StateRows {
+        StateRows::new()
     }
     fn forward(&self, inputs: Input) {
         let g = inputs.grid();
@@ -152,8 +152,8 @@ fn the_decoder_traces_and_its_grids_are_values() {
 struct Patchifier;
 
 impl ForwardHybrid for Patchifier {
-    fn caches(&self) -> HybridSpec {
-        HybridSpec::new()
+    fn states(&self) -> StateRows {
+        StateRows::new()
     }
     fn forward(&self, inputs: Input) {
         let g = inputs.grid();
@@ -187,8 +187,8 @@ fn the_patchify_pair_crosses_the_axis_and_back() {
 struct NaturalWeight;
 
 impl ForwardHybrid for NaturalWeight {
-    fn caches(&self) -> HybridSpec {
-        HybridSpec::new()
+    fn states(&self) -> StateRows {
+        StateRows::new()
     }
     fn forward(&self, inputs: Input) {
         let g = inputs.grid();

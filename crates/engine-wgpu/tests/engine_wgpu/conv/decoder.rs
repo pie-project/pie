@@ -10,7 +10,7 @@ use engine_wgpu::api::DeviceBoot;
 use engine_wgpu::serve::{Boot, Clips, Lane, Seated, Shell};
 use poem::ops::attn;
 use poem::ops::conv::{self, ConvShape};
-use poem::{Dtype, ForwardHybrid, HybridSpec, Input, Platform, Weight, trace_hybrid};
+use poem::{Dtype, ForwardHybrid, Input, Platform, StateRows, Weight, trace_hybrid};
 use poem_compiler::{Budget, VoxelLadder};
 
 const C_IN: usize = 8;
@@ -63,8 +63,8 @@ impl Decoder {
 }
 
 impl ForwardHybrid for Decoder {
-    fn caches(&self) -> HybridSpec {
-        HybridSpec::new()
+    fn states(&self) -> StateRows {
+        StateRows::new()
     }
 
     fn forward(&self, inputs: Input) {

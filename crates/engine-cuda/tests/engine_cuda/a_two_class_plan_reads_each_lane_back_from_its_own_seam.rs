@@ -8,7 +8,7 @@ use eta_ir::registry::Stage;
 use eta_ir::types::{Dtype as EtaDtype, Shape};
 use poem::fact;
 use poem::{
-    Dtype, ForwardHybrid, HybridSpec, Input, ModulateForm, Platform, Trace, Weight, ops,
+    Dtype, ForwardHybrid, Input, ModulateForm, Platform, StateRows, Trace, Weight, ops,
     trace_hybrid,
 };
 use poem_ir::InputAxis;
@@ -21,8 +21,8 @@ const EMB_SCALE: f32 = 0.75;
 struct TwoClasses;
 
 impl ForwardHybrid for TwoClasses {
-    fn caches(&self) -> HybridSpec {
-        HybridSpec::new()
+    fn states(&self) -> StateRows {
+        StateRows::new()
     }
     fn forward(&self, inputs: Input) {
         inputs.recorder().declare_switch(

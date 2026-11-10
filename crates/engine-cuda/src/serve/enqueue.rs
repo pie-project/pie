@@ -607,8 +607,8 @@ impl FireCtx<'_> {
         let handles = &staged.handles;
 
         let mut geometry = Vec::with_capacity(p.geometries.len());
-        for (space, host) in p.geometries.iter().enumerate() {
-            let seat = handles.spaces[space];
+        for (table, host) in p.geometries.iter().enumerate() {
+            let seat = handles.page_tables[table];
             geometry.push(CacheGeometry {
                 indptr: Some(seat.indptr),
                 indices: Some(seat.indices),
@@ -685,7 +685,7 @@ impl FireCtx<'_> {
                 .collect(),
             inputs: staged.inputs.clone(),
             geometry,
-            geometry_of: self.pools.geometry_map(),
+            window_table: self.pools.window_table() as u32,
             schedules,
             plan_values: facts.plans.len(),
             tables: FireTables {

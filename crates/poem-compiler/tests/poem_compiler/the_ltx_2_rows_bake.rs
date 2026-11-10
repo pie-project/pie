@@ -423,7 +423,6 @@ fn the_modulation_is_a_per_lane_f32_vector_over_a_bf16_trunk() {
             assert_eq!(
                 plan.values[lanes.0 as usize].def,
                 Def::Input(RuntimeInput::Geometry {
-                    space: 0,
                     kind: GeomKind::RequestOfToken
                 }),
                 "{deployment}: the broadcast is the fire's token->lane table"

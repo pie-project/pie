@@ -1,6 +1,6 @@
 use poem::fact;
 use poem::{
-    Dtype, ForwardHybrid, HybridSpec, Input, Platform, Predicate, RaggedMask, Request, Selection,
+    Dtype, ForwardHybrid, Input, Platform, Predicate, RaggedMask, Request, Selection, StateRows,
     Trace, Weight, ops, trace_hybrid,
 };
 use poem_ir::{Attn, Def, Gather, GeomKind, Guard, Operation, RuntimeInput};
@@ -13,8 +13,8 @@ const HEADS: u64 = 4;
 struct CrossAttention;
 
 impl ForwardHybrid for CrossAttention {
-    fn caches(&self) -> HybridSpec {
-        HybridSpec::new()
+    fn states(&self) -> StateRows {
+        StateRows::new()
     }
 
     fn forward(&self, inputs: Input) {
@@ -93,7 +93,7 @@ fn a_ragged_attention_joins_two_arms_every_case() {
 }
 
 fn queries_off_one_arm_and_keys_off_another_trace_under_the_or_of_both(trace: &Trace) {
-    assert!(trace.caches.is_empty(), "a denoiser declares no kv space");
+    assert!(trace.caches.is_empty(), "a denoiser declares no kv row");
 
     let audio = cond_of(trace, &fact::switch_is("stream", "audio"));
     let video = Guard::and(
@@ -147,10 +147,9 @@ fn queries_off_one_arm_and_keys_off_another_trace_under_the_or_of_both(trace: &T
 
     let selection = |id: poem_ir::ValueId| match &trace.values[id.0 as usize].def {
         Def::Input(RuntimeInput::Geometry {
-            space: 0,
             kind: GeomKind::LaneIndptr { select },
         }) => *select,
-        other => panic!("a CSR is a lane indptr in the token space, not {other:?}"),
+        other => panic!("a CSR is a lane indptr on the All axis, not {other:?}"),
     };
     assert_eq!(selection(*q_indptr), Selection::of(&audio).unwrap());
     assert_eq!(selection(*kv_indptr), Selection::of(&video).unwrap());
@@ -169,8 +168,8 @@ fn queries_off_one_arm_and_keys_off_another_trace_under_the_or_of_both(trace: &T
 struct TwoArmsIntoOneAdd;
 
 impl ForwardHybrid for TwoArmsIntoOneAdd {
-    fn caches(&self) -> HybridSpec {
-        HybridSpec::new()
+    fn states(&self) -> StateRows {
+        StateRows::new()
     }
     fn forward(&self, inputs: Input) {
         inputs

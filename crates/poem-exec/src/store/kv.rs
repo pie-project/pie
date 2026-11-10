@@ -1,4 +1,4 @@
-use poem_ir::{Attn, CacheRow, Def, Dim, Operation, Trace, Ty, ValueId};
+use poem_ir::{Attn, CacheRow, Def, Dim, GeomKind, Operation, Trace, Ty, ValueId};
 
 use crate::store::{Fault, Result};
 
@@ -188,14 +188,13 @@ pub fn row_of(trace: &Trace, cache: ValueId) -> Option<usize> {
     }
 }
 
+/// The window of the list a fire's geometry input `kind` pages: a write
+/// descriptor's own row's; `None`, the All axis, for every other kind.
 #[must_use]
-pub fn space_of(trace: &Trace, cache: ValueId) -> Option<u32> {
-    let Def::Cache(row) = trace.values.get(cache.0 as usize)?.def else {
-        return None;
-    };
-    match trace.caches.get(row as usize)? {
-        CacheRow::Kv { space, .. } => Some(*space),
-        CacheRow::State { .. } => None,
+pub fn geometry_window(kind: GeomKind) -> Option<u32> {
+    match kind {
+        GeomKind::WritePage { window } | GeomKind::WriteOffset { window } => window,
+        _ => None,
     }
 }
 
@@ -240,7 +239,7 @@ pub struct Paging {
     pub window: Option<Windowed>,
 }
 
-/// The windowed kv spaces' paging: `tokens` is the widest window a
+/// The window list's paging: `tokens` is the widest window a
 /// windowed row is read through, `fire_pages` the most one fire's rows add
 /// past the windows of the lanes they land in.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -286,7 +285,7 @@ impl Paging {
         })
     }
 
-    /// The paging with windowed spaces read through `tokens` and fires of
+    /// The paging with windowed rows read through `tokens` and fires of
     /// at most `max_tokens` rows. A window that spans the context holds
     /// every page, so it is no window at all.
     #[must_use]
@@ -498,7 +497,7 @@ pub fn geometry_with(paging: &Paging, seats: &[Seat], tables: &[&[u32]]) -> Resu
     Ok(out)
 }
 
-/// A lane's table in a windowed space, as long as its table in the full
+/// A lane's table in the window list, as long as its table in the full
 /// one so the lengths, schedules and mask columns read the same: a page
 /// wholly behind the window of the lane's first row reads the null page 0,
 /// the rest the windowed ids the lane was handed (`ids`, aligned with

@@ -30,7 +30,7 @@ use crate::error::{Fault, Result};
 use crate::inputs::Inputs;
 use crate::run::{CacheGeometry, FireBindings, FireTables, Run, SlotTable};
 use crate::store::kv::{self, Paging, Seat};
-use crate::store::{Pools, SpaceSeat};
+use crate::store::{Pools, TableSeat};
 use crate::trace::{Handles, Root, Source, Tracer};
 use crate::weights::Weights;
 use crate::window::Windows;
@@ -220,7 +220,6 @@ pub struct Shell {
     budgets: Budgets,
     weights: Weights,
     pools: Pools,
-    spaces: usize,
     /// The outputs the plan's classes write, and per class the one its
     /// lanes read back to the host: the last float row or voxel output.
     exports: Vec<poem_exec::feeds::ClassOutput>,
@@ -586,17 +585,6 @@ impl Shell {
         )?;
         handles.seal();
 
-        let spaces = boot
-            .trace
-            .caches
-            .iter()
-            .filter_map(|row| match row {
-                poem_ir::CacheRow::Kv { space, .. } => Some(*space as usize + 1),
-                poem_ir::CacheRow::State { .. } => None,
-            })
-            .max()
-            .unwrap_or(0);
-
         let exports = poem_exec::feeds::class_outputs(&boot.trace, &compiled)
             .map_err(|why| Fault::Unbound { what: why })?;
         if exports.is_empty() {
@@ -684,7 +672,6 @@ impl Shell {
             budgets,
             weights,
             pools,
-            spaces,
             exports,
             readback,
             dit,
@@ -1221,7 +1208,7 @@ impl Shell {
 
         let mut seats: Vec<Seat> = Vec::with_capacity(submitted.len());
         let mut tables: Vec<Vec<u32>> = Vec::with_capacity(submitted.len());
-        // Each lane's table in the windowed spaces, as long as `tables`.
+        // Each lane's table in the windowed pool, as long as `tables`.
         let mut window_tables: Vec<Vec<u32>> = Vec::with_capacity(submitted.len());
         let mut tokens: Vec<i32> = Vec::with_capacity(rows as usize);
         let mut positions: Vec<i32> = Vec::with_capacity(rows as usize);
@@ -1328,7 +1315,7 @@ impl Shell {
             }
             let after = u64::from(have) + u64::from(row.rows);
             let pages = after.div_ceil(u64::from(paging.page_size)).max(1);
-            demand_pages = demand_pages.max(if self.spaces == 0 || seated.kv_less {
+            demand_pages = demand_pages.max(if self.pools.tables().is_empty() || seated.kv_less {
                 0
             } else if seated.pages.is_empty() {
                 paging.base(lane.slot).saturating_add(pages)
@@ -1449,10 +1436,8 @@ impl Shell {
         let indptr_host = kv::indptr(&seats)?;
         let table_refs: Vec<&[u32]> = tables.iter().map(Vec::as_slice).collect();
         let window_refs: Vec<&[u32]> = window_tables.iter().map(Vec::as_slice).collect();
-        let space_windowed: Vec<bool> = (0..self.spaces)
-            .map(|space| self.pools.windowed_space(space as u32))
-            .collect();
-        let mut geometries = space_windowed
+        let table_windowed = self.pools.tables();
+        let mut geometries = table_windowed
             .iter()
             .map(|&in_window| {
                 kv::geometry_with(
@@ -1482,10 +1467,10 @@ impl Shell {
                     ),
                 });
             }
-            for (g, &in_window) in geometries.iter_mut().zip(&space_windowed) {
+            for (g, &in_window) in geometries.iter_mut().zip(&table_windowed) {
                 for (i, (&page, &offset)) in pages.iter().zip(offsets).enumerate() {
                     let at = row.row_offset as usize + i;
-                    // A windowed space writes the windowed id of the page
+                    // A windowed table writes the windowed id of the page
                     // the lane holds at the same table position.
                     let page = if in_window {
                         let held = tables[lane_at].iter().position(|&held| held == page);
@@ -1663,16 +1648,16 @@ impl Shell {
         let row_valid: Vec<i32> = (0..rows).map(|_| 1).collect();
         let row_valid_t = inputs.i32s(handles, &row_valid, 1);
 
-        let mut space_seats = Vec::with_capacity(self.spaces);
-        let mut geometry = Vec::with_capacity(self.spaces);
-        for (g, &in_window) in geometries.iter().zip(&space_windowed) {
+        let mut table_seats = Vec::with_capacity(table_windowed.len());
+        let mut geometry = Vec::with_capacity(table_windowed.len());
+        for (g, &in_window) in geometries.iter().zip(&table_windowed) {
             let mut indices = g.indices.clone();
             let padded = (lane_count as usize) * (max_pages as usize);
             let sink = if in_window { window_sink } else { sink_page };
             indices.resize(padded.max(indices.len()), sink as i32);
             let indptr = inputs.i32s(handles, &g.indptr, 1);
             let indices = inputs.i32s(handles, &indices, 1);
-            space_seats.push(SpaceSeat {
+            table_seats.push(TableSeat {
                 page_indptr: indptr,
                 page_indices: indices,
                 max_pages,
@@ -1690,15 +1675,15 @@ impl Shell {
             });
         }
         if geometry.is_empty() {
-            // A plan with no KV space still reads the token space's tables
-            // (`request_of_token`, `row_valid`): space 0 binds them alone.
+            // A plan with no kv row still reads the All axis's token tables
+            // (`request_of_token`, `row_valid`): table 0 binds them alone.
             geometry.push(CacheGeometry {
                 row_valid: Some(row_valid_t),
                 request_of_token: Some(request_t),
                 ..CacheGeometry::default()
             });
         }
-        let caches = self.pools.table(&space_seats, slot_of_row_t)?;
+        let caches = self.pools.table(&table_seats, slot_of_row_t)?;
 
         let rs_seat = match (&self.rs_layout, rs_active) {
             (Some(layout), true) => {
@@ -1770,6 +1755,7 @@ impl Shell {
             patches: patch_bindings,
             clip_slots,
             geometry,
+            window_table: self.pools.table_of(true),
             tables: FireTables {
                 request_of_token: request_t,
                 mask,

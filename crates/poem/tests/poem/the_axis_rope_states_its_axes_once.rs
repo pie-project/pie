@@ -1,4 +1,4 @@
-use poem::{Dtype, ForwardHybrid, HybridSpec, Input, Platform, RopeForm, ops, trace_hybrid};
+use poem::{Dtype, ForwardHybrid, Input, Platform, RopeForm, StateRows, ops, trace_hybrid};
 use poem_ir::{Def, Dim, Elemwise, InputAxis, Operands, Operation, RuntimeInput, Ty};
 
 struct OneRope {
@@ -12,8 +12,8 @@ struct OneRope {
 const HEADS: u32 = 2;
 
 impl ForwardHybrid for OneRope {
-    fn caches(&self) -> HybridSpec {
-        HybridSpec::new()
+    fn states(&self) -> StateRows {
+        StateRows::new()
     }
     fn forward(&self, inputs: Input) {
         let q = inputs.input(

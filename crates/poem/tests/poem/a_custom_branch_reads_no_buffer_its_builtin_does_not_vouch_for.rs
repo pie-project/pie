@@ -1,7 +1,7 @@
 //! A buffer a lane may not carry is read only on rows a runtime switch says carry it.
 
 use poem::{
-    Dtype, ForwardHybrid, HybridSpec, Input, Platform, Predicate, Value, Weight, fact, ops, switch,
+    Dtype, ForwardHybrid, Input, Platform, Predicate, StateRows, Value, Weight, fact, ops, switch,
     trace_hybrid,
 };
 
@@ -12,8 +12,8 @@ struct Probe {
 }
 
 impl ForwardHybrid for Probe {
-    fn caches(&self) -> HybridSpec {
-        HybridSpec::new()
+    fn states(&self) -> StateRows {
+        StateRows::new()
     }
 
     fn forward(&self, inputs: Input) {

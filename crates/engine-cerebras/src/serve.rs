@@ -29,7 +29,7 @@ use crate::error::{Fault, Result};
 use crate::inputs::Inputs;
 use crate::run::{CacheGeometry, FireBindings, FireTables, Run, SlotTable};
 use crate::store::kv::{self, Paging, Seat};
-use crate::store::{Pools, SpaceSeat};
+use crate::store::{Pools, TableSeat};
 use crate::trace::{Handles, Root, Source, Tracer};
 use crate::weights::Weights;
 use crate::window::Windows;
@@ -219,7 +219,6 @@ pub struct Shell {
     budgets: Budgets,
     weights: Weights,
     pools: Pools,
-    spaces: usize,
     /// The outputs the plan's classes write, and per class the one its
     /// lanes read back to the host: the last float row or voxel output.
     exports: Vec<poem_exec::feeds::ClassOutput>,
@@ -605,17 +604,6 @@ impl Shell {
         )?;
         handles.seal();
 
-        let spaces = boot
-            .trace
-            .caches
-            .iter()
-            .filter_map(|row| match row {
-                poem_ir::CacheRow::Kv { space, .. } => Some(*space as usize + 1),
-                poem_ir::CacheRow::State { .. } => None,
-            })
-            .max()
-            .unwrap_or(0);
-
         let exports = poem_exec::feeds::class_outputs(&boot.trace, &compiled)
             .map_err(|why| Fault::Unbound { what: why })?;
         if exports.is_empty() {
@@ -701,7 +689,6 @@ impl Shell {
             budgets,
             weights,
             pools,
-            spaces,
             exports,
             readback,
             dit,

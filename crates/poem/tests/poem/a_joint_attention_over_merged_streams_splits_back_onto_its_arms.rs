@@ -1,6 +1,6 @@
 use poem::fact;
 use poem::{
-    Dtype, ForwardHybrid, HybridSpec, Input, Platform, RaggedMask, Request, Value, Weight, ops,
+    Dtype, ForwardHybrid, Input, Platform, RaggedMask, Request, StateRows, Value, Weight, ops,
     trace_hybrid,
 };
 use poem_ir::{Attn, Def, Elemwise, GeomKind, Guard, Operation, RuntimeInput, Selection};
@@ -11,8 +11,8 @@ const HEAD_DIM: u32 = 8;
 struct DoubleBlock;
 
 impl ForwardHybrid for DoubleBlock {
-    fn caches(&self) -> HybridSpec {
-        HybridSpec::new()
+    fn states(&self) -> StateRows {
+        StateRows::new()
     }
     fn forward(&self, inputs: Input) {
         inputs
@@ -94,7 +94,6 @@ fn the_joint_attention_traces_and_its_answer_splits_back_onto_the_arms() {
     assert_eq!(
         trace.values[q_indptr.0 as usize].def,
         Def::Input(RuntimeInput::Geometry {
-            space: 0,
             kind: GeomKind::GroupIndptr {
                 select: Selection::ALL
             }

@@ -5,7 +5,7 @@ use poem_ir::Dtype;
 
 use crate::device::{Buffer, Context};
 use crate::error::{Fault, Result};
-use crate::store::SpaceSeat;
+use crate::store::TableSeat;
 use crate::store::kv::{Geometry, Paging};
 
 const ALIGN: u64 = 256;
@@ -65,7 +65,7 @@ struct PatchAt {
 }
 
 #[derive(Debug, Clone, Copy)]
-struct SpaceAt {
+struct TableAt {
     indptr: u64,
     indices: u64,
     last_page_len: u64,
@@ -79,7 +79,7 @@ pub struct Handles {
     pub tokens: Tensor,
     pub positions: Tensor,
     pub windows: u32,
-    pub spaces: Vec<SpaceHandles>,
+    pub page_tables: Vec<TableHandles>,
     pub slot_ids: Tensor,
     pub slot_of_row: Tensor,
     /// Each band's lane and row tables of record piece ids
@@ -137,7 +137,7 @@ pub struct PatchHandles {
 }
 
 #[derive(Debug, Clone, Copy)]
-pub struct SpaceHandles {
+pub struct TableHandles {
     pub indptr: Tensor,
     pub indices: Tensor,
     pub last_page_len: Tensor,
@@ -156,7 +156,7 @@ pub struct Fire<'a> {
     pub adapter_routes: Option<&'a [i32]>,
     pub request_of_token: &'a [i32],
     pub readout_rows: &'a [i32],
-    pub spaces: &'a [Geometry],
+    pub page_tables: &'a [Geometry],
     pub mask: Option<&'a crate::mask::Staged>,
     pub patches: Option<PatchFire<'a>>,
     pub voxels: Option<VoxelFire<'a>>,
@@ -219,7 +219,7 @@ pub struct Inputs {
     seats: Vec<SeatAt>,
     voxels: Option<VoxelAt>,
     mask_stride: u32,
-    spaces: Vec<SpaceAt>,
+    page_tables: Vec<TableAt>,
     patch: Option<PatchAt>,
     mrope: Option<u64>,
     rs_replay: u64,
@@ -246,7 +246,7 @@ pub struct GroupMaskHandles {
 pub fn window_ints(
     budget: &Budget,
     paging: Paging,
-    spaces: usize,
+    page_tables: usize,
     classes: usize,
     max_runs: u32,
     gathered: usize,
@@ -257,7 +257,7 @@ pub fn window_ints(
     let lanes = u64::from(budget.max_lanes);
     let pages = u64::from(budget.max_lanes) * u64::from(paging.pages_per_slot);
     let intervals = (classes * (classes + 1) / 2) as u64;
-    let per_gathered = 3 * rows + spaces as u64 * (2 * lanes + (lanes + 1) + pages);
+    let per_gathered = 3 * rows + page_tables as u64 * (2 * lanes + (lanes + 1) + pages);
     let runs = u64::from(max_runs);
 
     let mut cut = 0u64;
@@ -289,7 +289,7 @@ impl Inputs {
         device: &Context,
         budget: &Budget,
         paging: Paging,
-        spaces: usize,
+        page_tables: usize,
         classes: usize,
         max_runs: u32,
         gathered: usize,
@@ -306,8 +306,8 @@ impl Inputs {
         let width = u64::from(bands.iter().sum::<u32>().max(1));
         let rows = u64::from(budget.max_tokens);
         let lanes = u64::from(budget.max_lanes);
-        // A space's page table holds the most pages a lane's table does in
-        // any space: a window list of `T_w`-token slots takes more pages
+        // A table's page table holds the most pages a lane's table does in
+        // any table: a window list of `T_w`-token slots takes more pages
         // than the kv list where `T_w` is the smaller.
         let paged = Paging {
             pages_per_slot: paging.pages_per_slot.max(pages_per_lane),
@@ -315,7 +315,14 @@ impl Inputs {
         };
         let pages = u64::from(budget.max_lanes) * u64::from(paged.pages_per_slot);
         let window_ints = window_ints(
-            budget, paged, spaces, classes, max_runs, gathered, run_caps, run_passes,
+            budget,
+            paged,
+            page_tables,
+            classes,
+            max_runs,
+            gathered,
+            run_caps,
+            run_passes,
         );
 
         let mut at = 0u64;
@@ -341,8 +348,8 @@ impl Inputs {
         let mask_plane_bytes = rows * context;
         let mask_planes = take(mask_plane_bytes);
         let mask_enabled = take(rows);
-        let spaces: Vec<SpaceAt> = (0..spaces)
-            .map(|_| SpaceAt {
+        let page_tables: Vec<TableAt> = (0..page_tables)
+            .map(|_| TableAt {
                 indptr: take((lanes + 1) * 4),
                 indices: take(pages * 4),
                 last_page_len: take(lanes * 4),
@@ -430,7 +437,7 @@ impl Inputs {
             seats,
             voxels,
             mask_stride,
-            spaces,
+            page_tables,
             patch,
             mrope,
             rs_replay,
@@ -925,8 +932,8 @@ impl Inputs {
             }
         };
 
-        let mut spaces = Vec::with_capacity(self.spaces.len());
-        for (at, geometry) in self.spaces.iter().zip(fire.spaces) {
+        let mut page_tables = Vec::with_capacity(self.page_tables.len());
+        for (at, geometry) in self.page_tables.iter().zip(fire.page_tables) {
             self.store.write(at.indptr, bytes_of(&geometry.indptr))?;
             self.store.write(at.indices, bytes_of(&geometry.indices))?;
             self.store
@@ -936,7 +943,7 @@ impl Inputs {
                 .write(at.write_page, bytes_of(&geometry.write_page))?;
             self.store
                 .write(at.write_offset, bytes_of(&geometry.write_offset))?;
-            spaces.push(SpaceHandles {
+            page_tables.push(TableHandles {
                 indptr: i32s(handles, &self.store, at.indptr, lanes + 1)?,
                 indices: i32s(
                     handles,
@@ -955,7 +962,7 @@ impl Inputs {
             tokens: i32s(handles, &self.store, self.tokens, rows)?,
             positions: i32s(handles, &self.store, self.positions, rows)?,
             windows: handles.bind(&self.store, self.windows, fire.windows.len() as u64 * 4)?,
-            spaces,
+            page_tables,
             slot_ids: i32s(handles, &self.store, self.slot_ids, lanes)?,
             slot_of_row: i32s(handles, &self.store, self.slot_of_row, rows)?,
             lane_bands: bands(handles, &self.store, self.slot_ids, &self.bands, lanes)?,
@@ -1084,13 +1091,13 @@ impl Inputs {
             lanes,
             rows,
             pages,
-            spaces: views
-                .spaces
+            page_tables: views
+                .page_tables
                 .iter()
-                .map(|space| SpaceSeat {
-                    page_indptr: space.indptr,
-                    page_indices: space.indices,
-                    last_page_lens: space.last_page_len,
+                .map(|table| TableSeat {
+                    page_indptr: table.indptr,
+                    page_indices: table.indices,
+                    last_page_lens: table.last_page_len,
                     row_valid: views.row_valid,
                 })
                 .collect(),

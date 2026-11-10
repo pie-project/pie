@@ -407,7 +407,7 @@ impl<'c> Run<'c> {
         }
         if matches!(
             self.values[at].def,
-            Def::Input(RuntimeInput::Mask { .. })
+            Def::Input(RuntimeInput::Mask)
                 | Def::Input(RuntimeInput::Geometry {
                     kind: GeomKind::Indices,
                     ..
@@ -449,15 +449,15 @@ impl<'c> Run<'c> {
             .gathered
             .as_ref()
             .expect("`compacted` is reached only through a gathered window");
-        if let Def::Input(RuntimeInput::Geometry { space, kind }) = &self.values[at].def {
-            let Some(space) = gathered.spaces.get(*space as usize) else {
+        if let Def::Input(RuntimeInput::Geometry { kind }) = &self.values[at].def {
+            let Some(table) = gathered.page_tables.first() else {
                 return handle;
             };
             return match kind {
-                GeomKind::Indptr => space.page_indptr,
-                GeomKind::Indices => space.page_indices,
-                GeomKind::LastPageLen => space.last_page_lens,
-                GeomKind::KvLen => space.kv_len,
+                GeomKind::Indptr => table.page_indptr,
+                GeomKind::Indices => table.page_indices,
+                GeomKind::LastPageLen => table.last_page_lens,
+                GeomKind::KvLen => table.kv_len,
 
                 _ => handle,
             };
@@ -527,7 +527,7 @@ impl<'c> Run<'c> {
             Def::Input(RuntimeInput::ReadoutRows) => self.fire.readout_rows,
             Def::Input(RuntimeInput::Positions) => self.fire.positions,
 
-            Def::Input(RuntimeInput::Mask { space: _ }) => self.fire.tables.mask,
+            Def::Input(RuntimeInput::Mask) => self.fire.tables.mask,
 
             Def::Input(RuntimeInput::AdapterRoutes) => {
                 self.fire.adapter_routes.unwrap_or_else(|| {
@@ -612,14 +612,10 @@ impl<'c> Run<'c> {
                     panic!("value {at} reads the token side of the patchify pair, which this load carved none of")
                 })
             }
-            Def::Input(RuntimeInput::Geometry { space, kind }) => {
-                let space = *space as usize;
-                let seat = self.fire.geometry.get(space).unwrap_or_else(|| {
-                    panic!(
-                        "value {at} names cache space {space}, and this fire binds \
-                         {} geometry spaces",
-                        self.fire.geometry.len()
-                    )
+            Def::Input(RuntimeInput::Geometry { kind }) => {
+                // One page table: the All axis's and every write's.
+                let seat = self.fire.geometry.first().unwrap_or_else(|| {
+                    panic!("value {at} reads a page table, and this fire binds none")
                 });
                 let bound = match kind {
                     GeomKind::Indptr => seat.indptr,
@@ -629,15 +625,15 @@ impl<'c> Run<'c> {
                     GeomKind::KvLen => seat.kv_len,
                     GeomKind::RowValid => seat.row_valid,
                     GeomKind::RequestOfToken => seat.request_of_token,
-                    GeomKind::WritePage => seat.write_page,
-                    GeomKind::WriteOffset => seat.write_offset,
+                    GeomKind::WritePage { .. } => seat.write_page,
+                    GeomKind::WriteOffset { .. } => seat.write_offset,
                     GeomKind::GroupOfLane
                     | GeomKind::GroupIndptr { .. }
                     | GeomKind::LaneIndptr { .. } => None,
                 };
                 bound.unwrap_or_else(|| {
                     panic!(
-                        "value {at} reads {kind:?} of cache space {space}, which this \
+                        "value {at} reads {kind:?} of the page table, which this \
                          fire left unbound"
                     )
                 })
@@ -660,7 +656,7 @@ impl<'c> Run<'c> {
                 })
             }
             Def::Cache(_) => panic!(
-                "value {at} is a cache space; it resolves to a pool through `Run::pool`, \
+                "value {at} is a cache row; it resolves to a pool through `Run::pool`, \
                  never to a tensor"
             ),
         }
@@ -916,12 +912,12 @@ impl<'c> Run<'c> {
 
     pub(crate) fn pool_state(&self, pages: ValueId) -> Option<PoolSlabs> {
         let at = pages.0 as usize;
-        let Some(Def::Cache(space)) = self.values.get(at).map(|v| &v.def) else {
-            panic!("value {at} is not a cache space; the pooled state is keyed by one")
+        let Some(Def::Cache(row)) = self.values.get(at).map(|v| &v.def) else {
+            panic!("value {at} is not a cache row; the pooled state is keyed by one")
         };
         Some(
             self.scratch
-                .pool_state(self.handles, *space)?
+                .pool_state(self.handles, *row)?
                 .unwrap_or_else(|fault| {
                     panic!("the compressor state this load reserved does not mint: {fault}")
                 }),
@@ -961,7 +957,7 @@ impl<'c> Run<'c> {
         match self.cache(id) {
             CachePool::Kv(pool) => pool,
             CachePool::Recurrent(_) => panic!(
-                "value {} is a recurrent state space, and this op walks a paged kv pool",
+                "value {} is a recurrent state row, and this op walks a paged kv pool",
                 id.0
             ),
         }
@@ -974,7 +970,7 @@ impl<'c> Run<'c> {
                 ..*pool
             },
             CachePool::Kv(_) => panic!(
-                "value {} is a paged kv space, and this op scans a recurrent state pool",
+                "value {} is a paged kv row, and this op scans a recurrent state pool",
                 id.0
             ),
         }
@@ -987,12 +983,12 @@ impl<'c> Run<'c> {
                 let row = *c as usize;
                 self.caches.0.get(row).unwrap_or_else(|| {
                     panic!(
-                        "value {at} is cache space {row}, and the shell binds {} pools",
+                        "value {at} is cache row {row}, and the shell binds {} pools",
                         self.caches.0.len()
                     )
                 })
             }
-            _ => panic!("value {at} is not a cache space; tensors resolve through `Run::tensor`"),
+            _ => panic!("value {at} is not a cache row; tensors resolve through `Run::tensor`"),
         }
     }
 

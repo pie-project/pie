@@ -1,5 +1,5 @@
 use poem::{
-    Dtype, ForwardHybrid, HybridSpec, Input, Platform, Predicate, Value, Weight, ops, trace_hybrid,
+    Dtype, ForwardHybrid, Input, Platform, Predicate, StateRows, Value, Weight, ops, trace_hybrid,
 };
 use poem_ir::{Elemwise, Operands, Operation, Trace, ValueId};
 
@@ -14,8 +14,8 @@ struct Stack {
 }
 
 impl ForwardHybrid for Stack {
-    fn caches(&self) -> HybridSpec {
-        HybridSpec::new()
+    fn states(&self) -> StateRows {
+        StateRows::new()
     }
     fn forward(&self, inputs: Input) {
         inputs
@@ -44,8 +44,8 @@ impl ForwardHybrid for Stack {
 struct TwoArms;
 
 impl ForwardHybrid for TwoArms {
-    fn caches(&self) -> HybridSpec {
-        HybridSpec::new()
+    fn states(&self) -> StateRows {
+        StateRows::new()
     }
     fn forward(&self, inputs: Input) {
         inputs

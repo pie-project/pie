@@ -288,7 +288,7 @@ fn the_refiners_attend_within_a_lane_and_the_trunk_within_the_group() {
         let plan = trace(deployment, Platform::Cuda);
         let d = dims(deployment);
         let selection_of = |id: ValueId| match &plan.values[id.0 as usize].def {
-            Def::Input(RuntimeInput::Geometry { kind, .. }) => match kind {
+            Def::Input(RuntimeInput::Geometry { kind }) => match kind {
                 GeomKind::GroupIndptr { select } => ("group", *select),
                 GeomKind::LaneIndptr { select } => ("lane", *select),
                 other => panic!("{deployment}: a ragged CSR that is no indptr: {other:?}"),
@@ -481,7 +481,6 @@ fn the_modulation_is_a_per_lane_f32_scale_over_a_bf16_trunk() {
                     assert_eq!(
                         plan.values[lanes.0 as usize].def,
                         Def::Input(RuntimeInput::Geometry {
-                            space: 0,
                             kind: GeomKind::RequestOfToken
                         })
                     );

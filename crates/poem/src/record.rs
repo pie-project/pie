@@ -408,9 +408,7 @@ fn unguarded_read(plan: &Trace) -> Option<String> {
         node.op.inputs(&mut ins);
         for id in &ins {
             let (builtin, what) = match &plan.values[id.0 as usize].def {
-                Def::Input(RuntimeInput::Mask { .. }) => {
-                    (poem_ir::Builtin::Masked, "fact.has(fact.Mask)")
-                }
+                Def::Input(RuntimeInput::Mask) => (poem_ir::Builtin::Masked, "fact.has(fact.Mask)"),
                 Def::Input(RuntimeInput::AdapterRoutes) => {
                     (poem_ir::Builtin::Adapted, "fact.has(fact.Adapter)")
                 }

@@ -1,5 +1,5 @@
 use poem::{
-    Dtype, ForwardHybrid, HybridSpec, Input, Platform, Precision, Weight, ops, trace_hybrid,
+    Dtype, ForwardHybrid, Input, Platform, Precision, StateRows, Weight, ops, trace_hybrid,
 };
 use poem_ir::{ActQuant, Def, Linear, Operation, Trace};
 
@@ -10,8 +10,8 @@ const VOCAB: u32 = 512;
 struct OneProduct(Precision);
 
 impl ForwardHybrid for OneProduct {
-    fn caches(&self) -> HybridSpec {
-        HybridSpec::new()
+    fn states(&self) -> StateRows {
+        StateRows::new()
     }
 
     fn forward(&self, inputs: Input) {

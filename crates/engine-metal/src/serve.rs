@@ -181,7 +181,7 @@ pub struct Seated<'a> {
     /// (CONTRACT-BC 15).
     pub record_run: Option<&'a [u32]>,
     /// The lane's window-list slot refs, one a kv page in token order (0 a
-    /// slot trimmed behind the window), for the windowed spaces; empty
+    /// slot trimmed behind the window), for the windowed rows; empty
     /// seat-addresses them.
     pub window: &'a [u32],
 }
@@ -295,7 +295,7 @@ pub struct Shell {
     nan_flags: Option<Buffer>,
     #[allow(dead_code)]
     facts: kv::Facts,
-    spaces: usize,
+    page_tables: usize,
 
     patch_seat: Option<crate::inputs::PatchSeat>,
     voxel_seat: Option<crate::inputs::VoxelSeat>,
@@ -775,16 +775,7 @@ impl PreparedLoad<'_> {
             paging,
             &tuning,
         )?;
-        let spaces = boot
-            .trace
-            .caches
-            .iter()
-            .filter_map(|row| match row {
-                poem_ir::CacheRow::Kv { space, .. } => Some(*space as usize + 1),
-                poem_ir::CacheRow::State { .. } => None,
-            })
-            .max()
-            .unwrap_or(0);
+        let page_tables = pools.tables().len();
         let arms = boot.runahead.frames().max(1);
         let gathers = fallback::gathers(&boot.trace, &compiled);
         let patch_seat = boot.patches.as_ref().and_then(|ladder| {
@@ -862,7 +853,7 @@ impl PreparedLoad<'_> {
                     &device,
                     &boot.budget,
                     paging,
-                    spaces,
+                    page_tables,
                     compiled.classes.classes.len(),
                     poem_exec::fire::max_runs(&compiled),
                     gathers,
@@ -985,7 +976,7 @@ impl PreparedLoad<'_> {
             gathers_readout,
             feeds,
             facts,
-            spaces,
+            page_tables,
             copies: false,
             last: FireCost::default(),
             masked,
@@ -3034,18 +3025,18 @@ impl Shell {
         let indptr_host = kv::indptr(&seats)?;
         let table_refs: Vec<&[u32]> = tables.iter().map(std::convert::AsRef::as_ref).collect();
         let window_refs: Vec<&[u32]> = window_tables.iter().map(Vec::as_slice).collect();
-        let mut geometries = Vec::with_capacity(self.spaces);
-        for space in 0..self.spaces {
-            geometries.push(match self.pools.space_paging(space) {
-                crate::store::SpacePaging::List => kv::geometry_with(&paging, &seats, &table_refs)?,
-                crate::store::SpacePaging::Window => {
+        let mut geometries = Vec::with_capacity(self.page_tables);
+        for &paging_of in self.pools.tables() {
+            geometries.push(match paging_of {
+                crate::store::TablePaging::List => kv::geometry_with(&paging, &seats, &table_refs)?,
+                crate::store::TablePaging::Window => {
                     kv::geometry_with(&self.pools.window_paging(), &seats, &window_refs)?
                 }
             });
         }
         if writes.iter().any(Option::is_some) {
-            for (space, geometry) in geometries.iter_mut().enumerate() {
-                if self.pools.space_paging(space) != crate::store::SpacePaging::List {
+            for (geometry, &paging_of) in geometries.iter_mut().zip(self.pools.tables()) {
+                if paging_of != crate::store::TablePaging::List {
                     continue;
                 }
                 for (row, stated) in writes.iter().enumerate() {
@@ -3092,7 +3083,7 @@ impl Shell {
             crate::window::Copies {
                 bucket,
                 enabled: self.copies && masks.iter().all(|lane| lane.mask.is_none()),
-                spaces: &geometries,
+                page_tables: &geometries,
                 positions: &positions,
                 request_of_token: &request_of_token,
             },
@@ -3446,7 +3437,7 @@ impl Shell {
                 rs_pages: rs_pages.as_deref(),
                 request_of_token: &request_of_token,
                 adapter_routes: any_adapter.then_some(adapter_routes.as_slice()),
-                spaces: &geometries,
+                page_tables: &geometries,
                 mask: staged.as_ref(),
                 patches: (patch_rows > 0).then_some(crate::inputs::PatchFire {
                     payload: &patch_payload,
@@ -3492,9 +3483,9 @@ impl Shell {
             self.tuning.kv_q8(),
         )?;
 
-        let mut geometry = Vec::with_capacity(self.spaces);
-        for space in 0..self.spaces {
-            let seat = bound.spaces[space];
+        let mut geometry = Vec::with_capacity(self.page_tables);
+        for table in 0..self.page_tables {
+            let seat = bound.page_tables[table];
             geometry.push(CacheGeometry {
                 indptr: Some(seat.indptr),
                 indices: Some(seat.indices),
@@ -3544,6 +3535,7 @@ impl Shell {
             voxels: bound.voxels,
             inputs: bound.inputs,
             geometry,
+            window_table: self.pools.table_of(crate::store::TablePaging::Window),
             tables: FireTables {
                 request_of_token: bound.request_of_token,
                 readout_positions: bound.readout_positions,

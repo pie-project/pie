@@ -79,13 +79,12 @@ fn a_state_is_named_by_its_path_and_laid_out_by_its_readers() {
             CacheRow::Kv {
                 name,
                 planes,
-                space,
                 window,
                 head_dim,
                 shard,
                 ..
             } => format!(
-                "{name} kv {planes:?} space {space} window {window:?} head {head_dim} {}",
+                "{name} kv {planes:?} window {window:?} head {head_dim} {}",
                 matches!(shard, Shard::Cut { axis: 0, .. })
             ),
             CacheRow::State {
@@ -102,19 +101,19 @@ fn a_state_is_named_by_its_path_and_laid_out_by_its_readers() {
     assert_eq!(
         rows,
         [
-            "layers.0.kv kv [32, 32] space 0 window None head 16 true",
+            "layers.0.kv kv [32, 32] window None head 16 true",
             // its channels feed the heads: cut as they are
             "layers.0.k_taps slab [4, 32] cut 1",
             // over the residual stream: whole on every rank
             "layers.0.taps slab [4, 64] whole",
-            "layers.1.kv kv [32, 32] space 1 window Some(8) head 16 true",
+            "layers.1.kv kv [32, 32] window Some(8) head 16 true",
             "layers.1.k_taps slab [4, 32] cut 1",
             "layers.1.taps slab [4, 64] whole",
-            "layers.2.kv kv [32, 32] space 0 window None head 16 true",
+            "layers.2.kv kv [32, 32] window None head 16 true",
             "layers.2.k_taps slab [4, 32] cut 1",
             "layers.2.taps slab [4, 64] whole",
             // no op reads it: laid out as the rows of its planes one does
-            "spare kv [32, 32] space 0 window None head 16 true",
+            "spare kv [32, 32] window None head 16 true",
         ],
         "{rows:#?}"
     );

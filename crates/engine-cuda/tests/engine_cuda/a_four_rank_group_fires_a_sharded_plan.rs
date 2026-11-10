@@ -17,7 +17,7 @@ use eta_ir::op::Op;
 use eta_ir::registry::{GeometryClass, Stage};
 use eta_ir::types::{Dtype as EtaDtype, Shape};
 use poem::{
-    Dtype, ForwardHybrid, HybridSpec, Input, Platform, RaggedMask, Trace, Weight, ops, trace_hybrid,
+    Dtype, ForwardHybrid, Input, Platform, RaggedMask, StateRows, Trace, Weight, ops, trace_hybrid,
 };
 use poem_ir::InputAxis;
 
@@ -29,8 +29,8 @@ struct Sharded {
 }
 
 impl ForwardHybrid for Sharded {
-    fn caches(&self) -> HybridSpec {
-        HybridSpec::new()
+    fn states(&self) -> StateRows {
+        StateRows::new()
     }
     fn forward(&self, inputs: Input) {
         let mine = u64::from(HEADS * HEAD_DIM / self.tp);

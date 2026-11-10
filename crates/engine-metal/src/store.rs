@@ -5,7 +5,7 @@ pub mod layout;
 pub mod pool;
 mod pools;
 
-pub use pools::{Pools, Rows, RsRows, SpacePaging};
+pub use pools::{Pools, Rows, RsRows, TablePaging};
 
 use kernels_metal::{StateMap, Tensor};
 use poem_ir::{Attn, Def, Dtype, Operation, Trace};
@@ -45,7 +45,7 @@ fn state_dtype(declared: Dtype) -> Dtype {
 }
 
 #[derive(Debug, Clone, Copy)]
-pub struct SpaceSeat {
+pub struct TableSeat {
     pub page_indptr: Tensor,
     pub page_indices: Tensor,
     pub last_page_lens: Tensor,
@@ -57,7 +57,7 @@ pub struct Seats {
     pub lanes: u32,
     pub rows: u32,
     pub pages: u32,
-    pub spaces: Vec<SpaceSeat>,
+    pub page_tables: Vec<TableSeat>,
     pub slot_ids: Tensor,
     pub slot_of_row: Tensor,
     /// Each band's lane and row tables (`Pools::bands`).
@@ -135,10 +135,10 @@ impl PoolDemand {
     }
 }
 
-/// Each kv space a pool gather compresses, with the widest state row its
+/// Each kv row a pool gather compresses, with the widest state row its
 /// gathers keep per cell (`ratio` 4 overlaps two windows, so twice the head).
-fn compressed_spaces(trace: &Trace) -> Vec<(u32, u64)> {
-    let mut spaces: Vec<(u32, u64)> = Vec::new();
+fn compressed_rows(trace: &Trace) -> Vec<(u32, u64)> {
+    let mut rows: Vec<(u32, u64)> = Vec::new();
     for node in &trace.nodes {
         let Operation::Attn(Attn::PoolGather {
             pages,
@@ -149,19 +149,19 @@ fn compressed_spaces(trace: &Trace) -> Vec<(u32, u64)> {
         else {
             continue;
         };
-        let Some(Def::Cache(space)) = trace.values.get(pages.0 as usize).map(|v| &v.def) else {
+        let Some(Def::Cache(row)) = trace.values.get(pages.0 as usize).map(|v| &v.def) else {
             continue;
         };
         let width = if *ratio == 4 { 2 } else { 1 } * u64::from(*head_dim);
         if width == 0 {
             continue;
         }
-        match spaces.iter_mut().find(|(held, _)| *held == *space) {
+        match rows.iter_mut().find(|(held, _)| *held == *row) {
             Some((_, held)) => *held = (*held).max(width),
-            None => spaces.push((*space, width)),
+            None => rows.push((*row, width)),
         }
     }
-    spaces
+    rows
 }
 
 /// The bytes `trace`'s kv and state rows wire at `paging`.

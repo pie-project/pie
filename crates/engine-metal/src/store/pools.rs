@@ -12,7 +12,7 @@ use poem_ir::{CacheRow, Dtype, Trace};
 use super::layout::{FIXED, LIST, Layout, RS, Slots, WINDOW, gcd};
 use super::pool::Pool;
 use super::{
-    STATE_MAP_BYTES, Seats, SpaceSeat, Spill, compressed_spaces, elem_bytes, elem_size, narrow,
+    STATE_MAP_BYTES, Seats, Spill, TableSeat, compressed_rows, elem_bytes, elem_size, narrow,
     row_stride, split, state_dtype,
 };
 use crate::device::ctx::Frame;
@@ -27,7 +27,8 @@ enum Row {
     /// A kv row: its key run and value run in a list slot (one run when the
     /// trace shares one plane), `page_size` tokens of `*_cell` bytes each.
     Kv {
-        space: u32,
+        /// The list its slots lie in, so the page table it reads.
+        paging: TablePaging,
         head_dim: u32,
         kv_heads: u32,
         dtype: Dtype,
@@ -49,11 +50,11 @@ enum Row {
         piece_atoms: u32,
         map: usize,
     },
-    /// The compressor state a pool gather keeps beside kv space `space`:
+    /// The compressor state a pool gather keeps beside kv row `row`:
     /// side planes `kv` and `score`, a cell a token of every physical list
     /// slot.
     Compressed {
-        space: u32,
+        row: u32,
         width: u64,
         kv: usize,
         score: usize,
@@ -62,7 +63,6 @@ enum Row {
 
 /// One kv row's geometry as this shell stores it.
 struct KvCells {
-    space: u32,
     head_dim: u32,
     kv_heads: u32,
     dtype: Dtype,
@@ -80,7 +80,6 @@ fn kv_cells(
     name: &str,
     planes: &[u64],
     dtype: Dtype,
-    space: u32,
     trace_head_dim: u32,
     facts: &Facts,
 ) -> Result<KvCells> {
@@ -122,7 +121,6 @@ fn kv_cells(
     };
     let block = restated.map(|seat| seat.head_dim).or(row_head_dim);
     Ok(KvCells {
-        space,
         head_dim: u32::try_from(head_dim).unwrap_or(u32::MAX),
         kv_heads: u32::try_from(kv_heads).unwrap_or(u32::MAX),
         dtype,
@@ -147,10 +145,10 @@ pub struct RsRows {
     pub plane_at: Vec<u64>,
 }
 
-/// How a kv space's rows are paged: the kv list or the window list
-/// (CONTRACT-BC 19).
+/// The list a kv row's slots lie in, so the page table it reads: the kv
+/// list or the window list (CONTRACT-BC 19).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum SpacePaging {
+pub enum TablePaging {
     List,
     Window,
 }
@@ -173,8 +171,9 @@ pub struct Rows {
     pub window_bytes: u64,
     pub window_rows: u32,
     pub window_tokens: u32,
-    /// How each kv space is paged, by space.
-    pub spaces: Vec<SpacePaging>,
+    /// The page tables a fire stages, by the list each pages: the kv
+    /// list's first (the All axis's), then the window list's.
+    pub tables: Vec<TablePaging>,
     /// What one physical list slot's tokens take in the side planes.
     pub side_bytes: u64,
     /// Each distinct set of record slots a state row's pieces lie in.
@@ -205,11 +204,10 @@ impl Rows {
                     name,
                     planes,
                     dtype,
-                    space,
                     head_dim,
                     ..
                 } => {
-                    let kv = kv_cells(index, name, planes, *dtype, *space, *head_dim, &facts)?;
+                    let kv = kv_cells(index, name, planes, *dtype, *head_dim, &facts)?;
                     token += kv.keys_cell + if kv.own_values { kv.values_cell } else { 0 };
                 }
                 CacheRow::State {
@@ -220,7 +218,7 @@ impl Rows {
                 }
             }
         }
-        let side = compressed_spaces(trace)
+        let side = compressed_rows(trace)
             .iter()
             .map(|(_, width)| 2 * u64::from(page_size) * width * u64::from(elem_size(Dtype::Bf16)))
             .sum();
@@ -284,7 +282,7 @@ impl Rows {
                  kv pages, where a window list's slot holds no more than a kv page"
             )));
         }
-        let mut spaces: Vec<Option<SpacePaging>> = Vec::new();
+        let mut tables: Vec<TablePaging> = Vec::new();
         let mut rows = Vec::with_capacity(trace.caches.len());
         let mut bands: Vec<Vec<u32>> = Vec::new();
         let mut maps = 0usize;
@@ -297,20 +295,19 @@ impl Rows {
                     name,
                     planes,
                     dtype,
-                    space,
                     head_dim,
                     ..
                 } => {
-                    let kv = kv_cells(index, name, planes, *dtype, *space, *head_dim, facts)?;
+                    let kv = kv_cells(index, name, planes, *dtype, *head_dim, facts)?;
                     let per_token = kv.keys_cell + if kv.own_values { kv.values_cell } else { 0 };
                     // Where the row lies: a kv list slot or a window list
                     // slot, and the tokens a run holds.
                     let (paging, offset, stated, run_tokens) =
                         if let Some(run) = runs.iter().find(|run| run.row == id) {
-                            (SpacePaging::List, run.offset, run.per_token, tokens)
+                            (TablePaging::List, run.offset, run.per_token, tokens)
                         } else if let Some(run) = window_runs.iter().find(|run| run.row == id) {
                             (
-                                SpacePaging::Window,
+                                TablePaging::Window,
                                 run.offset,
                                 run.per_token,
                                 window_tokens,
@@ -324,19 +321,8 @@ impl Rows {
                              stores {per_token}"
                         )));
                     }
-                    let at = *space as usize;
-                    if spaces.len() <= at {
-                        spaces.resize(at + 1, None);
-                    }
-                    match spaces[at] {
-                        None => spaces[at] = Some(paging),
-                        Some(held) if held == paging => {}
-                        Some(held) => {
-                            return Err(disagree(format!(
-                                "pages kv space {space}'s rows apart ({held:?} and {paging:?}), \
-                                 where one table pages a space"
-                            )));
-                        }
+                    if !tables.contains(&paging) {
+                        tables.push(paging);
                     }
                     let keys = offset;
                     let values = if kv.own_values {
@@ -346,7 +332,7 @@ impl Rows {
                     };
                     kv_rows.push(u32::try_from(index).unwrap_or(u32::MAX));
                     rows.push(Row::Kv {
-                        space: kv.space,
+                        paging,
                         head_dim: kv.head_dim,
                         kv_heads: kv.kv_heads,
                         dtype: kv.dtype,
@@ -413,10 +399,10 @@ impl Rows {
         };
         let mut side = 0usize;
         let mut side_bytes = 0u64;
-        for (space, width) in compressed_spaces(trace) {
+        for (row, width) in compressed_rows(trace) {
             side_bytes += 2 * u64::from(tokens) * width * u64::from(elem_size(Dtype::Bf16));
             rows.push(Row::Compressed {
-                space,
+                row,
                 width,
                 kv: side,
                 score: side + 1,
@@ -433,10 +419,11 @@ impl Rows {
             window_bytes,
             window_rows,
             window_tokens,
-            spaces: spaces
-                .into_iter()
-                .map(|paging| paging.unwrap_or(SpacePaging::List))
-                .collect(),
+            // The kv list's table first: the All axis reads it.
+            tables: {
+                tables.sort_by_key(|paging| *paging != TablePaging::List);
+                tables
+            },
             side_bytes,
             bands,
             rs,
@@ -522,8 +509,8 @@ pub struct Pools {
     /// Each distinct set of record slots a state row's pieces lie in.
     bands: Vec<Vec<u32>>,
     rs: Option<RsRows>,
-    /// How each kv space is paged.
-    spaces: Vec<SpacePaging>,
+    /// The page tables a fire stages, by the list each pages.
+    tables: Vec<TablePaging>,
     disk: Option<Spill>,
     parked: Option<Spill>,
 }
@@ -570,7 +557,7 @@ impl Pools {
                 rows.bands
             },
             rs: rows.rs,
-            spaces: rows.spaces,
+            tables: rows.tables,
             rows: rows.rows,
             pool,
             layout,
@@ -750,10 +737,20 @@ impl Pools {
         refs.iter().map(|&r| self.physical(LIST, r)).collect()
     }
 
-    /// How kv space `space` is paged.
+    /// The page tables a fire stages, by the list each pages: the kv
+    /// list's first, the All axis's.
     #[must_use]
-    pub fn space_paging(&self, space: usize) -> SpacePaging {
-        self.spaces.get(space).copied().unwrap_or(SpacePaging::List)
+    pub fn tables(&self) -> &[TablePaging] {
+        &self.tables
+    }
+
+    /// The page table the rows paged in `paging`'s list read.
+    #[must_use]
+    pub fn table_of(&self, paging: TablePaging) -> usize {
+        self.tables
+            .iter()
+            .position(|&held| held == paging)
+            .unwrap_or(0)
     }
 
     /// The window list's paging: `T_w` tokens a page (CONTRACT-BC 21),
@@ -979,7 +976,7 @@ impl Pools {
         for row in &self.rows {
             pools.push(match *row {
                 Row::Compressed {
-                    space,
+                    row,
                     width,
                     kv,
                     score,
@@ -994,7 +991,7 @@ impl Pools {
                         ))
                     };
                     compressed.push((
-                        space,
+                        row,
                         PoolSlabs {
                             state_kv: plane(kv)?,
                             state_score: plane(score)?,
@@ -1003,7 +1000,7 @@ impl Pools {
                     continue;
                 }
                 Row::Kv {
-                    space,
+                    paging,
                     head_dim,
                     kv_heads,
                     dtype,
@@ -1012,15 +1009,11 @@ impl Pools {
                     values_width,
                     ..
                 } => {
-                    let seat: &SpaceSeat =
-                        seats
-                            .spaces
-                            .get(space as usize)
-                            .ok_or_else(|| Fault::Unbound {
-                                what: format!(
-                                    "cache space {space}, for which this fire wrote no geometry"
-                                ),
-                            })?;
+                    let table = self.table_of(paging);
+                    let seat: &TableSeat =
+                        seats.page_tables.get(table).ok_or_else(|| Fault::Unbound {
+                            what: format!("page table {table}, which this fire staged none of"),
+                        })?;
                     let plane = |width: u64| -> Result<Tensor> {
                         Ok(Tensor::new(
                             handles.bind(view, 0, view.bytes())?,
@@ -1031,9 +1024,9 @@ impl Pools {
                     };
                     lane_slots.push(None);
                     band_of.push(None);
-                    let (stride, page_size) = match self.space_paging(space as usize) {
-                        SpacePaging::List => (list_bytes, self.paging.page_size),
-                        SpacePaging::Window => {
+                    let (stride, page_size) = match paging {
+                        TablePaging::List => (list_bytes, self.paging.page_size),
+                        TablePaging::Window => {
                             (self.window_stride(), self.window_paging().page_size)
                         }
                     };

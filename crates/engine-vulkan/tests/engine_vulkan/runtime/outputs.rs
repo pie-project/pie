@@ -17,7 +17,7 @@ use eta_ir::container::{ChanDType, ChannelDecl, HostRole, StageProgram, TraceCon
 use eta_ir::op::Op;
 use eta_ir::registry::{Axis, EngineCaps, GeometryClass, OutputDecl, Stage};
 use eta_ir::types::{Dtype as EtaDtype, Shape};
-use poem::{Dtype, ForwardHybrid, HybridSpec, Input, Platform, Request, Trace, Weight, ops};
+use poem::{Dtype, ForwardHybrid, Input, Platform, Request, StateRows, Trace, Weight, ops};
 use poem_ir::InputAxis;
 
 const NAME: &str = "outputs-mini";
@@ -29,8 +29,8 @@ const THETA: f32 = 10_000.0;
 struct Outputs;
 
 impl ForwardHybrid for Outputs {
-    fn caches(&self) -> HybridSpec {
-        HybridSpec::new()
+    fn states(&self) -> StateRows {
+        StateRows::new()
     }
     fn forward(&self, inputs: Input) {
         let t = inputs.input("t", Dtype::F32, InputAxis::Lane, 1, None);

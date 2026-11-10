@@ -90,7 +90,7 @@ pub struct Shell {
     predicate: crate::store::rs::Predicate,
     inputs: Inputs,
     facts: kv::Facts,
-    spaces: usize,
+    page_tables: usize,
     masked: poem_ir::ClassSet,
     wide: poem_ir::ClassSet,
     feeds: crate::exports::Feeds,
