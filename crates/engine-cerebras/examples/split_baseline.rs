@@ -38,6 +38,9 @@ struct Rec {
     /// (y, x) -> the PE's last rcfg words
     rcfg: BTreeMap<(u32, u32), Vec<u32>>,
     calls: Vec<String>,
+    /// `SPLIT_BASELINE_LOGITS=1`: reads of `x` / `lgt` return fixed non-zero values (the logits
+    /// step's host math is then compared too).
+    fill: bool,
 }
 
 impl Rec {
@@ -100,6 +103,12 @@ impl Device for Rec {
             r.x, r.y, r.w, r.h
         ));
         out.fill(0);
+        if self.fill && (s == "x" || s == "lgt") {
+            for (i, v) in out.iter_mut().enumerate() {
+                let k = (i * 7 + r.x as usize * 3 + r.y as usize) % 13;
+                *v = (0.25 + k as f32 / 16.0).to_bits();
+            }
+        }
         Ok(())
     }
     fn memcpy_h2d_rowbcast(
@@ -220,7 +229,11 @@ fn main() {
     let vocab: usize = a[4].parse().unwrap();
     let out = std::path::Path::new(&a[5]);
     std::fs::create_dir_all(out).unwrap();
-    let rec = std::rc::Rc::new(std::cell::RefCell::new(Rec::default()));
+    let logits = std::env::var("SPLIT_BASELINE_LOGITS").is_ok_and(|v| v == "1");
+    let rec = std::rc::Rc::new(std::cell::RefCell::new(Rec {
+        fill: logits,
+        ..Rec::default()
+    }));
     let t0 = std::time::Instant::now();
     let mut derived = serde_json::Map::new();
     match SplitModel::open(Box::new(Shared(rec.clone())), &spec, vocab) {
@@ -238,6 +251,27 @@ fn main() {
             derived.insert("launches".into(), m.launches.into());
             derived.insert("steps".into(), m.steps.into());
             derived.insert("fed".into(), format!("{:?}", m.fed).into());
+            if logits {
+                rec.borrow_mut()
+                    .calls
+                    .push("-- forward [5, 6] logits".into());
+                let start = m.fed.len();
+                match m.forward(&[5, 6], start, true) {
+                    Ok((am, l)) => {
+                        let l = l.unwrap_or_default();
+                        let bits: Vec<u32> = l.iter().map(|v| v.to_bits()).collect();
+                        derived.insert("logits_argmax".into(), format!("{am:?}").into());
+                        derived.insert("logits_sha".into(), sha(&bits).into());
+                        derived.insert(
+                            "logits_head".into(),
+                            format!("{:?}", &l[..l.len().min(4)]).into(),
+                        );
+                    }
+                    Err(e) => {
+                        derived.insert("logits_error".into(), e.into());
+                    }
+                }
+            }
         }
         Err(e) => {
             derived.insert("open_error".into(), e.into());

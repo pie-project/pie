@@ -97,7 +97,8 @@ impl SplitSpec {
     }
 }
 
-/// The role-split model on a loaded program.
+/// The role-split model on a loaded program. Everything program-specific comes from its
+/// [`emit::host::HostLayout`]; nothing here names a family.
 pub struct SplitModel {
     pub dev: Box<dyn Device>,
     pub vocab: usize,
@@ -109,49 +110,22 @@ pub struct SplitModel {
     pub fed: Vec<u32>,
     pub launches: u64,
     pub steps: u64,
-    wl: bool,
-    /// The head's embedding tiles (untied heads; Gemma 12B reads `embed`).
-    hemb: Option<Npy>,
-    hr: u32,
-    hc: u32,
-    vr: u32,
-    hdc: u32,
-    hcc: u32,
-    py: u32,
-    yc: u32,
-    x_cx: u32,
-    hctl: u32,
-    /// The last unit's CX column (the final residual x, the head's input).
-    last_cx: (u32, u32),
+    hl: emit::host::HostLayout,
+    /// Every CX row's x offset in the placed hidden vector ([`emit::host::HostLayout::x_offsets`]).
+    x_off: Vec<usize>,
+    embed: Embed,
     eps: f32,
+    /// `lgt`'s prescale (the prep's `HSCALE`: the band head's 2^15 logits; 1 without one).
+    lgt_scale: f32,
     /// Prompt rows forced through the token loop (`PIE_CEREBRAS_SPLIT_FORCE=1`).
     force: bool,
-    /// The head control root (ring, force, nforce).
-    root: (u32, u32),
-    /// Unit 0's top row (Gemma's and gpt-oss's units sit off the origin).
-    x_y0: u32,
-    /// gpt-oss: the head band (its control row's x0, y, count) and lm_head's prescale (`lgt` = 2^15 logits).
-    band: Option<(u32, u32, u32)>,
-    hscale: f32,
-    /// Gemma 4: the per-layer-input words of a launch's first token, its softcap.
-    gemma: Option<GemmaPle>,
-    /// Gemma 4 12B: the CX rows' dims (attention / plain rows), the embedding table, the softcap.
-    g12: Option<G12Rows>,
 }
 
-/// Gemma 4 12B's x layout: runs of CX rows of one width (the attention rows' Hc A, the plain rows' Hc W) on one
-/// side of the CY row, each row's first dim; the embedding table (bf16 [V][H]); the final logit softcap.
-pub struct G12Rows {
-    /// (r0, r1, Hc, the run's first wafer-row offset from the unit's top)
-    runs: Vec<(u32, u32, u32, u32)>,
-    off: Vec<usize>,
-    embed: Npy,
-    softcap: f32,
-}
-
-/// Gemma 4's host side (its step-0 PLE words come from the storage PEs): the final logit softcap.
-pub struct GemmaPle {
-    softcap: f32,
+/// Where a token's embedding row comes from: the head's tiles (`hemb`, the head's layout:
+/// `words` a head PE), else (a tied head with no tiles) the embedding table `embed` (bf16 [V][H]).
+enum Embed {
+    Tiles { hemb: Npy, words: u32 },
+    Table(Npy),
 }
 
 impl SplitModel {
@@ -178,42 +152,18 @@ impl SplitModel {
         dev.call("init", &[]).map_err(|e| format!("init: {e}"))?;
         // A launch can return before every PE ran it: a read from every PE
         // waits for each one's init.
-        dev.get(
-            "rcfg",
-            Rect {
-                x: 0,
-                y: 0,
-                w: hl.w as i32,
-                h: hl.h as i32,
-            },
-            1,
-        )?;
+        dev.get("rcfg", rect(&floor::Rect::new(0, 0, hl.w, hl.h)), 1)?;
         let shape = &prog.plan.shape;
-        let family = prog.plan.shape.family;
-        let softcap = shape.head.final_softcap;
-        // the head's embedding tiles, else (Gemma 12B's tied head) the embedding table read by
-        // CX row runs
-        let hemb = if spec.has("hemb") {
-            Some(spec.npy("hemb")?)
+        let embed = if spec.has("hemb") {
+            let hemb = spec.npy("hemb")?;
+            let words = if hl.band.is_none() && hl.vocab_rows > 0 {
+                hemb.shape[2] as u32 / hl.vocab_rows
+            } else {
+                hl.hemb_words
+            };
+            Embed::Tiles { hemb, words }
         } else {
-            None
-        };
-        let g12 = if hemb.is_none() {
-            Some(G12Rows {
-                runs: hl.x_runs.clone(),
-                off: hl.x_offsets(),
-                embed: spec.npy("embed")?,
-                softcap: softcap.unwrap_or(30.0),
-            })
-        } else {
-            None
-        };
-        let gemma = (family == plan::FamilyId::Gemma).then(|| GemmaPle {
-            softcap: softcap.unwrap_or(30.0),
-        });
-        let hdc = match &hemb {
-            Some(h) if hl.band.is_none() && hl.vocab_rows > 0 => h.shape[2] as u32 / hl.vocab_rows,
-            _ => hl.hemb_words,
+            Embed::Table(spec.npy("embed")?)
         };
         Ok(SplitModel {
             vocab: vocab.min(shape.vocab as usize),
@@ -223,129 +173,73 @@ impl SplitModel {
             fed: Vec::new(),
             launches: 0,
             steps: 0,
-            wl: hl.token_loop,
-            hr: hl.head_rows,
-            hc: hl.head_cols,
-            vr: hl.vocab_rows,
-            hdc,
-            hcc: hl.row_dims,
-            py: hl.rows,
-            yc: hl.cy_row,
-            x_cx: hl.first_cx.x,
-            last_cx: (hl.last_cx.x, hl.last_cx.y),
-            force: std::env::var("PIE_CEREBRAS_SPLIT_FORCE").is_ok_and(|v| v == "1"),
+            x_off: hl.x_offsets(),
+            embed,
             eps: shape.norm.eps,
-            hctl: hl.head_ctl.x,
-            root: (hl.root.x, hl.root.y),
-            x_y0: hl.first_cx.y,
-            band: hl.band,
-            hscale: if family == plan::FamilyId::GptOss {
-                spec.meta
-                    .get("HSCALE")
-                    .and_then(|v| v.as_f64())
-                    .unwrap_or(32768.0) as f32
-            } else {
-                1.0
-            },
-            hemb,
-            gemma,
-            g12,
+            lgt_scale: meta.float("HSCALE").unwrap_or(1.0) as f32,
+            force: std::env::var("PIE_CEREBRAS_SPLIT_FORCE").is_ok_and(|v| v == "1"),
+            hl,
             dev,
         })
     }
 
-    /// Gemma: the launch's first token id to the head control column (`tin`): its storage PEs look up and send
-    /// its PLE words on the launch-start TB word (one copy a launch).
-    fn put_pl(&mut self, v: u32, _pos: usize) -> R<()> {
-        if self.gemma.is_none() {
+    /// The launch's first token id to the PLE storage's lookup (`tin`), where the program has
+    /// one: its storage PEs send its per-layer-input words on the launch-start word.
+    fn put_token(&mut self, v: u32) -> R<()> {
+        let Some(r) = self.hl.token_in else {
             return Ok(());
-        }
-        let words = vec![v; self.hr as usize];
-        self.dev.put(
-            "tin",
-            Rect {
-                x: self.hctl as i32,
-                y: 0,
-                w: 1,
-                h: self.hr as i32,
-            },
-            1,
-            &words,
-        )
+        };
+        let words = vec![v; (r.w * r.h) as usize];
+        self.dev.put("tin", rect(&r), 1, &words)
     }
 
-    /// Token `v`'s embedding row (bf16 bits), from the head's tiles.
+    /// Token `v`'s embedding row (bf16 bits), from the head's tiles or the table.
     pub fn embedding(&self, v: u32) -> R<Vec<u32>> {
-        if let Some((_, _, hvc)) = self.band {
-            // gpt-oss: [dims-row][vocab column][VR][Hc]
-            let (j, k) = (v / self.vr, v % self.vr);
-            let mut out = Vec::with_capacity((self.py * self.hcc) as usize);
-            let he = self.hemb.as_ref().ok_or("split: no embedding tiles")?;
-            for i in 0..self.py as usize {
-                he.words(
-                    ((i * hvc as usize + j as usize) * self.vr as usize + k as usize)
-                        * self.hcc as usize,
-                    self.hcc as usize,
-                    &mut out,
-                )?;
+        let (hemb, words) = match &self.embed {
+            Embed::Tiles { hemb, words } => (hemb, *words as usize),
+            Embed::Table(t) => {
+                let mut out = Vec::with_capacity(self.hidden);
+                t.words(v as usize * self.hidden, self.hidden, &mut out)?;
+                return Ok(out);
             }
-            return Ok(out);
-        }
-        let (r, j) = (v / self.vr, v % self.vr);
-        let per = (self.vr * self.hdc) as usize;
-        let mut out = Vec::with_capacity((self.hc * self.hdc) as usize);
-        for c in 0..self.hc as usize {
-            self.hemb
-                .as_ref()
-                .ok_or("split: no embedding tiles")?
-                .words(
-                    (r as usize * self.hc as usize + c) * per + (j * self.hdc) as usize,
-                    self.hdc as usize,
-                    &mut out,
-                )?;
+        };
+        let vr = self.hl.vocab_rows;
+        let (q, k) = ((v / vr) as usize, (v % vr) as usize);
+        let mut out = Vec::new();
+        match self.hl.band {
+            // the band's tiles: [dims row][vocabulary column][VR][dims]
+            Some((_, _, cols)) => {
+                let hc = self.hl.row_dims as usize;
+                for i in 0..self.hl.rows as usize {
+                    let at = ((i * cols as usize + q) * vr as usize + k) * hc;
+                    hemb.words(at, hc, &mut out)?;
+                }
+            }
+            // a column head's tiles: [vocabulary row][dims column][VR][words]
+            None => {
+                let cols = self.hl.head_cols as usize;
+                for c in 0..cols {
+                    let at = (q * cols + c) * vr as usize * words + k * words;
+                    hemb.words(at, words, &mut out)?;
+                }
+            }
         }
         Ok(out)
     }
 
-    /// `v`'s embedding into unit 0's CX column (the next pass's x).
+    /// `v`'s embedding into unit 0's CX column (the next pass's x), by the x runs.
     fn put_x(&mut self, v: u32) -> R<()> {
-        if let Some(gr) = &self.g12 {
-            let h = self.hidden;
-            let mut raw = Vec::with_capacity(h);
-            gr.embed.words(v as usize * h, h, &mut raw)?;
-            let mut e: Vec<u32> = raw.into_iter().map(|b| b << 16).collect();
-            e.resize(*gr.off.last().unwrap(), 0);
-            for &(r0, r1, hc, ly0) in &gr.runs {
-                let (a, b) = (gr.off[r0 as usize], gr.off[r1 as usize]);
-                self.dev.put(
-                    "x",
-                    Rect {
-                        x: self.x_cx as i32,
-                        y: (self.x_y0 + ly0) as i32,
-                        w: 1,
-                        h: (r1 - r0) as i32,
-                    },
-                    hc as usize,
-                    &e[a..b],
-                )?;
-            }
-            return Ok(());
+        let mut e: Vec<u32> = self.embedding(v)?.into_iter().map(|b| b << 16).collect();
+        let total = *self.x_off.last().unwrap();
+        if e.len() < total {
+            // (a padded hidden's dims past the model's are 0)
+            e.resize(total, 0);
         }
-        let e: Vec<u32> = self.embedding(v)?.into_iter().map(|b| b << 16).collect();
-        let hc = self.hcc as usize;
-        for (r0, r1) in [(0, self.yc), (self.yc, self.py)] {
-            let y0 = self.x_y0 + r0 + u32::from(r0 >= self.yc);
-            self.dev.put(
-                "x",
-                Rect {
-                    x: self.x_cx as i32,
-                    y: y0 as i32,
-                    w: 1,
-                    h: (r1 - r0) as i32,
-                },
-                hc,
-                &e[r0 as usize * hc..r1 as usize * hc],
-            )?;
+        let cx = self.hl.first_cx;
+        for &(r0, r1, dims, ly) in &self.hl.x_runs {
+            let (a, b) = (self.x_off[r0 as usize], self.x_off[r1 as usize]);
+            let r = floor::Rect::new(cx.x, cx.y + ly, 1, r1 - r0);
+            self.dev.put("x", rect(&r), dims as usize, &e[a..b])?;
         }
         Ok(())
     }
@@ -383,7 +277,7 @@ impl SplitModel {
 
     /// `tokens` at `start..` one pass a launch (no reads).
     fn feed(&mut self, tokens: &[u32], start: usize) -> R<()> {
-        if self.force && self.wl && tokens.len() > 1 {
+        if self.force && self.hl.token_loop && tokens.len() > 1 {
             for (i, chunk) in tokens.chunks(self.cap).enumerate() {
                 self.forced(chunk, start + i * self.cap, 0, false)?;
             }
@@ -391,7 +285,7 @@ impl SplitModel {
         }
         for (i, &t) in tokens.iter().enumerate() {
             self.put_x(t)?;
-            self.put_pl(t, start + i)?;
+            self.put_token(t)?;
             self.launch(1, start + i)?;
             self.fed.push(t);
         }
@@ -405,14 +299,9 @@ impl SplitModel {
     /// ring's first `n + extra` words when `read`.
     fn forced(&mut self, tokens: &[u32], start: usize, extra: usize, read: bool) -> R<Vec<u32>> {
         let n = tokens.len();
-        let root = Rect {
-            x: self.root.0 as i32,
-            y: self.root.1 as i32,
-            w: 1,
-            h: 1,
-        };
+        let root = rect(&floor::Rect::new(self.hl.root.x, self.hl.root.y, 1, 1));
         self.put_x(tokens[0])?;
-        self.put_pl(tokens[0], start)?;
+        self.put_token(tokens[0])?;
         if n > 1 {
             self.dev.put("force", root, n - 1, &tokens[1..])?;
             self.dev.put("nforce", root, 1, &[(n - 1) as u32])?;
@@ -434,16 +323,8 @@ impl SplitModel {
     /// head row: the prep pads with the last real row so none can win) is
     /// refused rather than handed on.
     fn ring(&mut self, n: usize) -> R<Vec<u32>> {
-        let ring = self.dev.get(
-            "ring",
-            Rect {
-                x: self.root.0 as i32,
-                y: self.root.1 as i32,
-                w: 1,
-                h: 1,
-            },
-            n,
-        )?;
+        let root = floor::Rect::new(self.hl.root.x, self.hl.root.y, 1, 1);
+        let ring = self.dev.get("ring", rect(&root), n)?;
         if let Some(&id) = ring.iter().find(|&&id| id as usize >= self.vocab) {
             return Err(format!(
                 "split: the token loop chose id {id}, past the vocabulary ({}): a padded head row \
@@ -458,7 +339,7 @@ impl SplitModel {
     /// the argmax before (one launch on the wafer). The argmax after each
     /// row (rows before the feed's last: 0, unknown).
     pub fn greedy(&mut self, tokens: &[u32], start: usize, extra: usize) -> R<Vec<u32>> {
-        if !self.wl {
+        if !self.hl.token_loop {
             return Err("split: the token loop wants a WL build".into());
         }
         let n = tokens.len();
@@ -479,7 +360,7 @@ impl SplitModel {
         self.feed(&tokens[..n - 1], start)?;
         let last = start + n - 1;
         self.put_x(tokens[n - 1])?;
-        self.put_pl(tokens[n - 1], last)?;
+        self.put_token(tokens[n - 1])?;
         self.launch(1 + extra, last)?;
         self.fed.push(tokens[n - 1]);
         let ring = self.ring(1 + extra)?;
@@ -502,65 +383,16 @@ impl SplitModel {
         if !logits {
             return Ok((vec![0; tokens.len()], None));
         }
-        let lr = match self.band {
-            // gpt-oss: the control row, one vocabulary column a PE
-            Some((x0, y, n)) => Rect {
-                x: x0 as i32,
-                y: y as i32,
-                w: n as i32,
-                h: 1,
-            },
-            None => Rect {
-                x: self.hctl as i32,
-                y: 0,
-                w: 1,
-                h: self.hr as i32,
-            },
-        };
-        let w = self.dev.get("lgt", lr, self.vr as usize)?;
+        let w = self
+            .dev
+            .get("lgt", rect(&self.hl.logits), self.hl.vocab_rows as usize)?;
         // `lgt` leaves out the final norm's 1/rms (argmax needs no scale):
         // the rms of the head's input, the last unit's x.
-        let hc = self.hcc as usize;
         let mut ss = 0f64;
-        let mut runs: Vec<(u32, u32, usize, u32)> = Vec::new();
-        if let Some(gr) = &self.g12 {
-            runs.extend(
-                gr.runs
-                    .iter()
-                    .map(|&(r0, r1, h, ly0)| (r0, r1, h as usize, ly0)),
-            );
-        }
-        for &(r0, r1, h, ly0) in &runs {
-            let x = self.dev.get(
-                "x",
-                Rect {
-                    x: self.last_cx.0 as i32,
-                    y: (self.last_cx.1 + ly0) as i32,
-                    w: 1,
-                    h: (r1 - r0) as i32,
-                },
-                h,
-            )?;
-            ss += x
-                .iter()
-                .map(|&b| f64::from(f32::from_bits(b)).powi(2))
-                .sum::<f64>();
-        }
-        for (r0, r1) in [(0, self.yc), (self.yc, self.py)] {
-            if self.g12.is_some() {
-                break;
-            }
-            let y0 = self.last_cx.1 + r0 + u32::from(r0 >= self.yc);
-            let x = self.dev.get(
-                "x",
-                Rect {
-                    x: self.last_cx.0 as i32,
-                    y: y0 as i32,
-                    w: 1,
-                    h: (r1 - r0) as i32,
-                },
-                hc,
-            )?;
+        let cx = self.hl.last_cx;
+        for &(r0, r1, dims, ly) in &self.hl.x_runs {
+            let r = floor::Rect::new(cx.x, cx.y + ly, 1, r1 - r0);
+            let x = self.dev.get("x", rect(&r), dims as usize)?;
             ss += x
                 .iter()
                 .map(|&b| f64::from(f32::from_bits(b)).powi(2))
@@ -568,17 +400,11 @@ impl SplitModel {
         }
         // (over the model's hidden size: a padded hidden's dims past it hold 0)
         let n = self.hidden as f64;
-        let scale = (1.0 / (ss / n + f64::from(self.eps)).sqrt()) as f32 / self.hscale;
+        let scale = (1.0 / (ss / n + f64::from(self.eps)).sqrt()) as f32 / self.lgt_scale;
         let mut l: Vec<f32> = w.into_iter().map(|b| f32::from_bits(b) * scale).collect();
         // the head's padded rows (ids >= vocab) never reach sampling or the argmax
         l.truncate(self.vocab);
-        let cap = self
-            .gemma
-            .as_ref()
-            .map(|gp| gp.softcap)
-            .or(self.g12.as_ref().map(|gr| gr.softcap));
-        if let Some(c) = cap {
-            // Gemma's final logit softcap (monotone: the argmax is the wafer's)
+        if let Some(c) = self.hl.softcap {
             for v in l.iter_mut() {
                 *v = c * (*v / c).tanh();
             }
@@ -588,6 +414,16 @@ impl SplitModel {
             *am.last_mut().unwrap() = best;
         }
         Ok((am, Some(l)))
+    }
+}
+
+/// The SDK's rectangle of a floor rectangle.
+fn rect(r: &floor::Rect) -> Rect {
+    Rect {
+        x: r.x as i32,
+        y: r.y as i32,
+        w: r.w as i32,
+        h: r.h as i32,
     }
 }
 

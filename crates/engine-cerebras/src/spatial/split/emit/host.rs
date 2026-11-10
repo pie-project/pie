@@ -1,7 +1,7 @@
-//! What the host driver needs to find on the wafer: the PEs it reads and writes and the shapes
-//! of what it moves. Replaces the geometry-derived fields of `mod.rs::SplitModel` (`hr`, `hc`,
-//! `vr`, `hdc`, `hcc`, `py`, `yc`, `x_cx`, `hctl`, `last_cx`, `root`, `x_y0`, `band`, the
-//! `G12Rows` runs) and their per-family computation in `SplitModel::open*`.
+//! What the host driver needs to find on the wafer: the PEs it reads and writes, the shapes of
+//! what it moves and the host's share of the model's math (the logit softcap). Everything
+//! `mod.rs::SplitModel` does that depends on the program is read from here: the host names no
+//! family.
 
 use serde::Serialize;
 
@@ -44,6 +44,13 @@ pub struct HostLayout {
     /// A head whose control line is a row (gpt-oss): the logits are read along it,
     /// (x0, y, count).
     pub band: Option<(u32, u32, u32)>,
+    /// Where `lgt` is read (the head's control line: a column, or the band's row).
+    pub logits: Rect,
+    /// Where a launch's first token id goes (`tin`) when per-layer-input storage PEs look it up
+    /// (the plan's PLE): the head control line.
+    pub token_in: Option<Rect>,
+    /// The final logit softcap the host applies (monotone: the wafer's argmax stands).
+    pub softcap: Option<f32>,
 }
 
 /// A unit's CX column.
@@ -117,6 +124,15 @@ impl HostLayout {
         // the band's rows)
         let dims_split = if band.is_some() { head_rows } else { head_cols };
         let hemb_words = hidden.checked_div(dims_split).unwrap_or(0);
+        let logits = match band {
+            Some((x, y, n)) => Rect { x, y, w: n, h: 1 },
+            None => Rect {
+                x: head_ctl.x,
+                y: 0,
+                w: 1,
+                h: head_rows,
+            },
+        };
         Ok(HostLayout {
             w: f.w,
             h: f.h,
@@ -137,6 +153,9 @@ impl HostLayout {
             head_rows,
             head_cols,
             band,
+            logits,
+            token_in: prog.plan.shape.ple.map(|_| logits),
+            softcap: prog.plan.shape.head.final_softcap,
         })
     }
 
