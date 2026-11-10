@@ -637,6 +637,12 @@ struct HostKv {
 /// The bytes a host shelf pins at a time.
 const SHELF_CHUNK: u64 = 256 << 20;
 
+/// The bytes the shared host tier pins at a time: its thread locks pages
+/// while fires and copies are enqueued, and a call into the device runtime
+/// waits out a lock in progress, so each is kept short (a 256 MiB lock
+/// holds the enqueueing thread a quarter of a second).
+const TIER_PIN: u64 = 32 << 20;
+
 /// One kind of host slot, pinned a chunk of slots at a time as a copy first
 /// touches it. A chunk lays its slots out plane by plane, so a run of slots
 /// within one chunk is one span a plane.
@@ -646,15 +652,32 @@ struct Shelf {
     slots: u32,
     per_chunk: u32,
     chunks: Vec<Option<crate::device::Pinned>>,
-    /// The chunks a background thread pins ahead of the copies, in order,
-    /// each as it lands ([`Shelf::pin_ahead`]); `None` where one failed.
+    /// The chunks a background thread pins ahead of the copies, each as it
+    /// lands ([`Shelf::pin_ahead`]); `None` where one failed.
     ahead: Option<std::sync::mpsc::Receiver<(usize, Option<crate::device::Pinned>)>>,
+    /// Wakes that thread, once a chunk put on `queue`.
+    wanted: Option<std::sync::mpsc::Sender<()>>,
+    /// The chunks that thread is yet to pin, in order; a copy that cannot
+    /// wait for one takes it back and pins it itself.
+    queue: std::sync::Arc<std::sync::Mutex<std::collections::VecDeque<usize>>>,
+    /// The chunks asked of it so far.
+    asked: Vec<bool>,
 }
+
+/// The bytes of a host shelf kept page-locked past the chunks its copies
+/// have touched: what one large offload takes, so it locks no page itself.
+/// The rest of the shelf is locked as the copies reach it, not at seating.
+const SHELF_AHEAD: u64 = 512 << 20;
 
 impl Shelf {
     fn new(planes: Vec<u64>, slots: u32) -> Shelf {
+        Shelf::pinned_by(planes, slots, SHELF_CHUNK)
+    }
+
+    /// A shelf pinned `pin` bytes at a time (a slot at least).
+    fn pinned_by(planes: Vec<u64>, slots: u32, pin: u64) -> Shelf {
         let slot: u64 = planes.iter().sum();
-        let per_chunk = (SHELF_CHUNK / slot.max(1)).clamp(1, u64::from(slots.max(1)));
+        let per_chunk = (pin / slot.max(1)).clamp(1, u64::from(slots.max(1)));
         let per_chunk = u32::try_from(per_chunk).unwrap_or(u32::MAX);
         Shelf {
             planes,
@@ -662,6 +685,9 @@ impl Shelf {
             per_chunk,
             chunks: (0..slots.div_ceil(per_chunk)).map(|_| None).collect(),
             ahead: None,
+            wanted: None,
+            queue: std::sync::Arc::default(),
+            asked: Vec::new(),
         }
     }
 
@@ -672,11 +698,17 @@ impl Shelf {
         usize::try_from(u64::from(held) * slot_bytes).unwrap_or(usize::MAX)
     }
 
-    /// Starts a thread that pins every chunk, lowest first, so a copy finds
+    /// Starts a thread that pins chunks ahead of the copies, so a copy finds
     /// its chunk pinned and page-locks nothing itself: locking a chunk takes
-    /// a quarter of a second, on the thread every fire is enqueued from. A
-    /// copy that needs a chunk not yet pinned waits for it. Without a device
-    /// to bind, or a thread, the chunks are pinned as copies touch them.
+    /// a quarter of a second, on the thread every fire is enqueued from. It
+    /// pins the first [`SHELF_AHEAD`] bytes now and, as copies touch chunks,
+    /// that much past each one ([`Shelf::ask_ahead`]): a shelf is locked as
+    /// far as it is used, never whole at seating. Past the first, it rests
+    /// four times as long as each lock took: a lock in progress holds every
+    /// call into the device runtime, the fires' too. A copy that needs a
+    /// chunk being pinned waits for it, and pins one still queued itself.
+    /// Without a device to bind, or a thread, the chunks are pinned as
+    /// copies touch them.
     fn pin_ahead(&mut self) {
         let Ok(ordinal) = crate::device::ctx::current() else {
             return;
@@ -685,28 +717,37 @@ impl Shelf {
             .map(|chunk| self.chunk_bytes(chunk))
             .collect();
         let (send, pinned) = std::sync::mpsc::channel();
+        let (want, wanted) = std::sync::mpsc::channel::<()>();
+        let queue = self.queue.clone();
+        let chunk_bytes = self.chunk_bytes(0).max(1) as u64;
+        let first = SHELF_AHEAD.div_ceil(chunk_bytes) as usize;
         let spawned = std::thread::Builder::new()
             .name("pie-host-tier-pin".to_string())
             .spawn(move || {
                 if crate::device::ctx::bind_thread(ordinal).is_err() {
                     return;
                 }
-                let asked: usize = sizes.iter().sum();
                 let mut locked = 0usize;
-                for (chunk, bytes) in sizes.into_iter().enumerate() {
+                // Ends when the shelf is dropped, or a chunk does not lock.
+                while wanted.recv().is_ok() {
+                    let next = queue.lock().ok().and_then(|mut queue| queue.pop_front());
+                    let Some(chunk) = next else {
+                        continue;
+                    };
+                    let began = std::time::Instant::now();
+                    let bytes = sizes[chunk];
                     let held = huge_tier(bytes)
                         .or_else(|| crate::device::Pinned::mapped_uninit(bytes).ok());
                     let failed = held.is_none();
                     if failed {
                         eprintln!(
-                            "engine-cuda: WARNING: the host tier could page-lock {} MiB of the \
-                             {} MiB it was seated with; chunk {chunk} ({} MiB) did not lock. A \
-                             slot copy to the host tier past what is locked will fail. Lower \
-                             the host budget or give the machine (its container) more \
-                             memory.",
+                            "engine-cuda: WARNING: the host tier's chunk {chunk} ({} MiB) did \
+                             not page-lock, with {} MiB of the tier locked ahead of its \
+                             copies so far. A slot copy to the host tier past what locks \
+                             will fail. Lower the host budget or give the machine (its \
+                             container) more memory.",
+                            bytes >> 20,
                             locked >> 20,
-                            asked >> 20,
-                            bytes >> 20
                         );
                     } else {
                         locked += bytes;
@@ -714,10 +755,40 @@ impl Shelf {
                     if send.send((chunk, held)).is_err() || failed {
                         return;
                     }
+                    if chunk >= first {
+                        std::thread::sleep(4 * began.elapsed());
+                    }
                 }
             });
         if spawned.is_ok() {
             self.ahead = Some(pinned);
+            self.wanted = Some(want);
+            self.asked = vec![false; self.chunks.len()];
+            self.ask_ahead(None);
+        }
+    }
+
+    /// Asks the thread for chunk `touched` (first, where a copy waits on
+    /// it) and for the [`SHELF_AHEAD`] bytes of chunks after it; with none
+    /// touched, for the shelf's first.
+    fn ask_ahead(&mut self, touched: Option<u32>) {
+        let Some(want) = self.wanted.as_ref() else {
+            return;
+        };
+        let chunk_bytes = self.chunk_bytes(0).max(1) as u64;
+        let ahead = SHELF_AHEAD.div_ceil(chunk_bytes) as usize;
+        let from = touched.map_or(0, |chunk| chunk as usize);
+        let until = (from + usize::from(touched.is_some()) + ahead).min(self.chunks.len());
+        for chunk in from..until {
+            if !self.asked[chunk] && self.chunks[chunk].is_none() {
+                self.asked[chunk] = true;
+                if let Ok(mut queue) = self.queue.lock() {
+                    queue.push_back(chunk);
+                }
+                if want.send(()).is_err() {
+                    break;
+                }
+            }
         }
     }
 
@@ -755,6 +826,7 @@ impl Shelf {
         }
         if closed {
             self.ahead = None;
+            self.wanted = None;
         }
     }
 
@@ -771,8 +843,20 @@ impl Shelf {
                 });
             }
             let chunk = slot / self.per_chunk;
-            if self.chunks[chunk as usize].is_none() {
-                self.take_pinned(Some(chunk));
+            // The thread keeps a lookahead past every chunk a copy touches.
+            self.ask_ahead(Some(chunk));
+            // One it is pinning now is waited for; one still queued behind
+            // others is taken back and pinned here.
+            if self.chunks[chunk as usize].is_none()
+                && self.asked.get(chunk as usize) == Some(&true)
+            {
+                let queued = self.queue.lock().ok().is_some_and(|mut queue| {
+                    let at = queue.iter().position(|next| *next == chunk as usize);
+                    at.and_then(|at| queue.remove(at)).is_some()
+                });
+                if !queued {
+                    self.take_pinned(Some(chunk));
+                }
             }
             if self.chunks[chunk as usize].is_none() {
                 let held = (self.slots - chunk * self.per_chunk).min(self.per_chunk);
@@ -2958,9 +3042,10 @@ impl Pools {
     }
 
     /// Seats the host tier of `budget` bytes: as many whole chunks of the
-    /// state pool's size, pinned a [`SHELF_CHUNK`] at a time by a thread of
-    /// its own from the seating on ([`Shelf::pin_ahead`]), so the whole
-    /// budget is page-locked soon after and no copy locks a page itself.
+    /// state pool's size, pinned a [`TIER_PIN`] at a time by a thread of
+    /// its own that keeps [`SHELF_AHEAD`] bytes locked past what the copies
+    /// have touched ([`Shelf::pin_ahead`]): the tier is locked as far as it
+    /// is used, and a copy locks a page itself only where it outruns that.
     pub fn seat_tier(&mut self, budget: u64) {
         // No more than the machine has free to page-lock, known now (the
         // device runtime's pinned allocations answer to no lock limit). A
@@ -2982,7 +3067,7 @@ impl Pools {
         let chunk = self.chunks.layout().chunk_bytes;
         let chunks = u32::try_from(budget.checked_div(chunk).unwrap_or(0)).unwrap_or(u32::MAX);
         self.tier = (chunks > 0).then(|| {
-            let mut shelf = Shelf::new(vec![chunk], chunks);
+            let mut shelf = Shelf::pinned_by(vec![chunk], chunks, TIER_PIN);
             shelf.pin_ahead();
             shelf
         });
