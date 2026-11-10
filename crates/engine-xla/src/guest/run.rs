@@ -184,6 +184,13 @@ impl Stages {
                 }
             }
         }
+        tracing::info!(
+            at,
+            lanes = batch.lanes,
+            reads = ?batch.reads.iter().map(|r| (r.rows, r.width)).collect::<Vec<_>>(),
+            shapes = shapes.len(),
+            "xla guest stage not warm"
+        );
         let threads = std::thread::available_parallelism()
             .map_or(1, |n| n.get())
             .clamp(1, shapes.len().min(8));
