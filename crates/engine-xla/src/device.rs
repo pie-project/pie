@@ -384,9 +384,34 @@ impl Device {
                 programs = self.cache.lock().map_or(0, |c| c.len()),
                 "xla device memory");
         }
+        static SEEN: std::sync::Mutex<Option<std::collections::HashSet<usize>>> = std::sync::Mutex::new(None);
+        let first = SEEN
+            .lock()
+            .map(|mut seen| seen.get_or_insert_with(Default::default).insert(exe as *const _ as usize))
+            .unwrap_or(false);
+        let before = first
+            .then(|| self.client.as_ref().zip(self.device().ok()))
+            .flatten()
+            .and_then(|(client, device)| client.memory_stats(device).ok());
         let at = profile::before(self.api());
         let (outs, done) = exe.execute(self.device()?, args)?;
-        if wait || at.is_some() {
+        if let Some(before) = before {
+            done.wait()?;
+            if let (Some(client), Ok(device)) = (self.client.as_ref(), self.device())
+                && let Ok(after) = client.memory_stats(device)
+            {
+                let (temp, out, _, code) = exe.memory().unwrap_or_default();
+                tracing::info!(
+                    delta_mib = (after.bytes_in_use - before.bytes_in_use) >> 20,
+                    in_use_mib = after.bytes_in_use >> 20,
+                    code_mib = code >> 20,
+                    out_mib = out >> 20,
+                    temp_mib = temp >> 20,
+                    bytes = program.text_bytes,
+                    "xla first run"
+                );
+            }
+        } else if wait || at.is_some() {
             done.wait()?;
         }
         if let Some(at) = at {
