@@ -37,7 +37,10 @@ where
     fn poll(self: std::pin::Pin<&mut Self>, cx: &mut std::task::Context<'_>) -> std::task::Poll<T> {
         let this = self.get_mut();
         let observed = match (this.check)() {
-            Readiness::Ready(v) => return std::task::Poll::Ready(v),
+            Readiness::Ready(v) => {
+                this.release();
+                return std::task::Poll::Ready(v);
+            }
             Readiness::Pending { observed_epoch } => observed_epoch,
         };
         if !this.table.register(this.slot, cx.waker(), observed) {
@@ -47,8 +50,7 @@ where
         this.registered = Some(cx.waker().clone());
         match (this.check)() {
             Readiness::Ready(v) => {
-                this.table.deregister_waker(this.slot, cx.waker());
-                this.registered = None;
+                this.release();
                 std::task::Poll::Ready(v)
             }
             Readiness::Pending { .. } => std::task::Poll::Pending,
@@ -56,10 +58,22 @@ where
     }
 }
 
+impl<F> WaitFuture<'_, F> {
+    /// Takes back this future's registration. The slot keeps one entry a
+    /// task, so another future of the same task may have been relying on
+    /// it: the task is woken to poll that one again (at worst a spurious
+    /// poll).
+    fn release(&mut self) {
+        if let Some(waker) = self.registered.take()
+            && self.table.deregister_waker(self.slot, &waker)
+        {
+            waker.wake();
+        }
+    }
+}
+
 impl<F> Drop for WaitFuture<'_, F> {
     fn drop(&mut self) {
-        if let Some(waker) = self.registered.take() {
-            self.table.deregister_waker(self.slot, &waker);
-        }
+        self.release();
     }
 }

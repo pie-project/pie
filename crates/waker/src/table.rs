@@ -220,16 +220,21 @@ impl WakerTable {
     }
 
     /// Drops `waker`'s registration on the slot, leaving every other task
-    /// waiting on it registered.
-    pub fn deregister_waker(&self, id: WakerSlotId, waker: &Waker) {
+    /// waiting on it registered. Says whether there was one to drop: the
+    /// entry stands for every future of that task waiting on the slot
+    /// (`register` keeps one a task), so a caller that took one back wakes
+    /// its task, for any other future of it still waiting to be polled
+    /// again.
+    #[must_use]
+    pub fn deregister_waker(&self, id: WakerSlotId, waker: &Waker) -> bool {
         let (generation, index) = split_id(id);
         let Some(slot) = self.slot(index) else {
-            return;
+            return false;
         };
         let removed = {
             let mut state = slot.state.lock().expect("lock poisoned");
             if !Self::is_live(&state, generation) {
-                return;
+                return false;
             }
             let removed: Vec<Waker> = {
                 let mut kept = Vec::with_capacity(state.wakers.len());
@@ -249,7 +254,7 @@ impl WakerTable {
             }
             removed
         };
-        drop(removed);
+        !removed.is_empty()
     }
 
     pub fn deregister(&self, id: WakerSlotId) {

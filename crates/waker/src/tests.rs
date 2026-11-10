@@ -24,6 +24,70 @@ fn tests_every_case() {
     spurious_wakes_are_harmless();
     sweep_on_abort_resolves_blocked_take_to_err_b12();
     every_task_waiting_on_a_slot_is_woken();
+    one_future_done_leaves_its_task_woken_for_the_others();
+    a_dropped_future_leaves_its_task_woken_for_the_others();
+}
+
+fn ready_when(flag: &AtomicBool) -> impl FnMut() -> Readiness<()> + Unpin + '_ {
+    move || {
+        if flag.load(std::sync::atomic::Ordering::SeqCst) {
+            Readiness::Ready(())
+        } else {
+            Readiness::Pending { observed_epoch: 0 }
+        }
+    }
+}
+
+/// Two futures of one task wait on one slot (a host may poll its lanes
+/// under one waker): their registrations are one entry. The condition turns
+/// true and one future, polled before the wake comes, takes the entry back
+/// as it finishes: the other still has to be polled again, so the task is
+/// woken rather than left asleep with nothing registered.
+fn one_future_done_leaves_its_task_woken_for_the_others() {
+    use std::future::Future;
+    let t = WakerTable::new();
+    let id = t.alloc();
+    let done = AtomicBool::new(false);
+    let (task, waker) = flag_waker();
+    let mut cx = std::task::Context::from_waker(&waker);
+    let mut a = WaitFuture::new(&t, id, ready_when(&done));
+    let mut b = WaitFuture::new(&t, id, ready_when(&done));
+    assert!(std::pin::Pin::new(&mut b).poll(&mut cx).is_pending());
+    assert!(std::pin::Pin::new(&mut a).poll(&mut cx).is_pending());
+    done.store(true, std::sync::atomic::Ordering::SeqCst);
+    assert!(std::pin::Pin::new(&mut a).poll(&mut cx).is_ready());
+    t.wake(id);
+    assert!(
+        task.0.load(std::sync::atomic::Ordering::SeqCst),
+        "b's task is woken to see the slot ready"
+    );
+    assert!(std::pin::Pin::new(&mut b).poll(&mut cx).is_ready());
+}
+
+/// As above, the first future dropped while pending (a `select!` another
+/// branch won).
+fn a_dropped_future_leaves_its_task_woken_for_the_others() {
+    use std::future::Future;
+    let t = WakerTable::new();
+    let id = t.alloc();
+    let done = AtomicBool::new(false);
+    let (task, waker) = flag_waker();
+    let mut cx = std::task::Context::from_waker(&waker);
+    let a = {
+        let mut a = WaitFuture::new(&t, id, ready_when(&done));
+        assert!(std::pin::Pin::new(&mut a).poll(&mut cx).is_pending());
+        a
+    };
+    let mut b = WaitFuture::new(&t, id, ready_when(&done));
+    assert!(std::pin::Pin::new(&mut b).poll(&mut cx).is_pending());
+    drop(a);
+    done.store(true, std::sync::atomic::Ordering::SeqCst);
+    t.wake(id);
+    assert!(
+        task.0.load(std::sync::atomic::Ordering::SeqCst),
+        "b's task is woken to see the slot ready"
+    );
+    assert!(std::pin::Pin::new(&mut b).poll(&mut cx).is_ready());
 }
 
 fn alloc_register_wake_roundtrip() {
@@ -197,7 +261,7 @@ fn every_task_waiting_on_a_slot_is_woken() {
     let (d, wd) = flag_waker();
     assert!(t.register(id, &wc, 0));
     assert!(t.register(id, &wd, 0));
-    t.deregister_waker(id, &wc);
+    assert!(t.deregister_waker(id, &wc), "c was registered");
     assert_eq!(t.wake(id), WakeOutcome::Woken);
     assert!(
         !c.0.load(std::sync::atomic::Ordering::SeqCst),
