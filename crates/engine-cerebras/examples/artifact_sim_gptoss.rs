@@ -96,6 +96,6 @@ fn main() {
         s[0] - s[1],
         l.len()
     );
-    println!("SPLIT_SIM {}", if ok { "ok" } else { "FAILED" });
+    println!("ARTIFACT_SIM {}", if ok { "ok" } else { "FAILED" });
     std::process::exit(if ok { 0 } else { 1 });
 }

@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """mk_tiny_gemma.py <out dir> [seed] [ntok]: a random tiny Gemma 4 (text, HF Gemma4ForCausalLM) in the E2B mapping's
-shape for the tiny wafer program simulation (`wafer-compile --geometry gemma:tiny`: units 8 x 8, Hc 3, K 5, 5 units, units 3-4
+shape for the tiny wafer program simulation (the `tiny` preset of `wafer-compile plan`: units 8 x 8, Hc 3, K 5, 5 units, units 3-4
 shared-KV): hidden 24, 25 layers (every 5th global), 4 q heads / 1 kv head, sliding head 8, global head 16
 (proportional RoPE 25%), MLP 32 (64 on the shared layers), PLE 8 a layer, vocab 512, window 16, tied, softcap 30.
 Saves bf16 safetensors + config, and golden.json: HF f32 greedy (prompt + ntok tokens) with top-2 margins."""
