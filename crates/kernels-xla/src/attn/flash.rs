@@ -157,8 +157,11 @@ fn shape(r: i64, h: &Heads, scale: f64, vmem_cap: i64) -> Option<Shape> {
     if h.d % 128 != 0 || h.dv % 128 != 0 || r < BK || r % 16 != 0 || h.g < 1 {
         return None;
     }
+    // Whole row blocks only: a partial last block's copies reach past the
+    // fire's rows (gemma-4-31B's 640-row fires faulted the chip).
     [BQ, BQ / 2]
         .into_iter()
+        .filter(|&bq| r % bq == 0)
         .map(|bq| Shape::of(r, h, scale, bq))
         .find(|s| s.vmem() <= vmem_cap)
 }
@@ -838,8 +841,7 @@ fn run(
         Ok((lo_blk, f.select(any, hi_blk, minus)?))
     };
     let (lo_blk, hi_blk) = blocks(f, klo, khi)?;
-    // The rows themselves are not padded: the last row block is a partial
-    // one, its rows past the fire never written back.
+    // The rows are whole row blocks (`shape`), so none is padded.
     let klo = f.reshape(klo, &[1, r])?;
     let khi = f.reshape(khi, &[1, r])?;
     let (olo, ohi) = blocks(f, old.klo, old.khi)?;
@@ -876,7 +878,7 @@ mod tests {
             d: 128,
             dv: 128,
         };
-        let s = shape(1616, &h, 0.1, 110 << 20).unwrap();
+        let s = shape(1792, &h, 0.1, 110 << 20).unwrap();
         assert_eq!((s.rp, s.bq, s.bk, s.gf, s.gc), (1792, 256, 256, 2, 1));
         let c = kernel(&s, 110 << 20, 256).unwrap();
         assert!(c.module.contains("iteration_bounds = array<i64: 7>"));
