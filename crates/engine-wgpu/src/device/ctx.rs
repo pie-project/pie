@@ -580,15 +580,6 @@ impl Context {
         }
     }
 
-    /// Invocations and workgroup memory bytes.
-    #[must_use]
-    pub fn workgroup_limits(&self) -> (u32, u32) {
-        (
-            self.core.limits.max_compute_invocations_per_workgroup,
-            self.core.limits.max_compute_workgroup_storage_size,
-        )
-    }
-
     #[must_use]
     pub fn storage_buffers(&self) -> u32 {
         self.core.limits.max_storage_buffers_per_shader_stage
