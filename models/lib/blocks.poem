@@ -3,8 +3,9 @@
 # `kv_heads`, `head_dim`, `theta`, `sm_scale`, `eps`); `w` a layer's
 # weights under their usual names.
 
-def attention(x, inputs, m, w, positions, rotary_dim = None, scaling = None, qk_norm = None, biased = False):
-    """Grouped-query attention over `w.kv`, out through `w.o`. `biased` adds
+def attention(x, inputs, m, w, positions, rotary_dim = None, scaling = None, qk_norm = None, biased = False, window = None):
+    """Grouped-query attention over `w.kv`, out through `w.o`, each query
+    reading at most its last `window` keys where one is given. `biased` adds
     `w.q_bias`, `w.k_bias` and `w.v_bias`; `qk_norm` norms q and k by
     `w.q_norm` and `w.k_norm`, each head on its own ("head") or across its
     full width ("width"); `rotary_dim` rotates only that many leading dims
@@ -26,7 +27,7 @@ def attention(x, inputs, m, w, positions, rotary_dim = None, scaling = None, qk_
 
     # Each lane by its kind; a lane may bring its own mask. A lane capturing
     # scores reads them out too.
-    o = ops.attn.attend(q, inputs, w.kv, m.q_heads, m.kv_heads, d, m.sm_scale, mask = True, scores = True)
+    o = ops.attn.attend(q, inputs, w.kv, m.q_heads, m.kv_heads, d, m.sm_scale, window = window, mask = True, scores = True)
     return ops.linear.matmul(o, w.o)
 
 def swiglu(x, w):
