@@ -2,14 +2,17 @@
 """Handles on a real engine: resume, fork, eviction, quota, every SDK.
 
     PIE_HOME=/tmp/pie-test python3 tests/handles/e2e.py --log /tmp/e.log \\
-        --ctx 512 --slots 12 --kv-budget 216MiB
+        --ctx 512 --kv-budget 176MiB
 
 Build first: `pie` for the engine, `working-set-handles` for wasm32-wasip3 in
 examples/, and `--example handles` of pie-client for t_clients. A token here is drawn by position, so a turn split across
-processes must draw exactly what one process does. `--slots 4` with
-`--kv-budget 116MiB --only t_quota,t_close` reaches the host's limit. A policy
-gets its own runs: `--policy keep-handles --only t_keep --ctx 512 --slots 12
---kv-budget 216MiB`, and `--only t_weak --ctx 512 --slots 4 --kv-budget 116MiB`.
+processes must draw exactly what one process does. A working set on the device
+takes its kv pages, an rs list slot and its fixed record from one pool: on
+Qwen3.5-0.8B 176MiB holds 9 or so of t_evict's 470-token sets, short of its 11.
+A policy gets its own runs: `--policy keep-handles --only t_keep --ctx 512
+--kv-budget 136MiB` (8 or so 300-token sets), and `--policy keep-handles --only
+t_weak --ctx 512 --kv-budget 116MiB`. The host's limit (t_quota, t_close,
+t_weak's discard) is the host tier, which `--kv-budget` does not reach.
 """
 import argparse, asyncio, json, os, re, signal, socket, subprocess, sys, time, traceback
 from pathlib import Path
@@ -23,13 +26,10 @@ HOME = Path(os.environ["PIE_HOME"])  # a home of its own: `pie config init`, the
 EX = ROOT / "examples/target/wasm32-wasip3/release"
 a = argparse.ArgumentParser()
 a.add_argument("--model", default="Qwen/Qwen3.5-0.8B")
-a.add_argument("--ctx", type=int, default=0); a.add_argument("--slots", type=int, default=0)
+a.add_argument("--ctx", type=int, default=0)
 a.add_argument("--kv-budget", default=""); a.add_argument("--log", required=True)
 a.add_argument("--only", default=""); a.add_argument("--policy", default="")
 args = a.parse_args()
-if args.slots:
-    sys.exit("--slots: max_state_slots was removed (state slots share the device budget with kv "
-             "pages); size the pool with --kv-budget")
 PROMPT = list(range(1000, 1060))
 results = []
 def check(name, cond, detail=""):
