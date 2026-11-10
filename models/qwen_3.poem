@@ -6,7 +6,7 @@
 
 load("//pie/codec.poem", "bank", "kept", read_fused = "fused", read_weight = "weight")
 load("//lib/adapters.poem", "banks", "corrected")
-load("//lib/dflash.poem", "bind_aux", "arm", "block_rows", "plant_readout", "tap", "markov", "selector", dflash_caches = "caches", dflash_declare = "declare", dflash_head = "head")
+load("//lib/dflash.poem", "bind_aux", "arm", "block_rows", "plant_readout", "tap", "markov", "selector", dflash_declare = "declare", dflash_head = "head")
 load("//lib/media.poem", "smart_resize")
 load("//lib/qwen.poem", "SMALL", "MEDIUM", "LARGE", "PATCH", "MERGE", "tower", "read_tower", "run_tower", "scatter", "positions", "rope", "routed", "draft_attn", "norm_of")
 load("//lib/reads.poem", "squeezed")
@@ -209,7 +209,7 @@ UNTURNED = struct(hidden = lambda w: w, ssm = lambda w: w, ffn_down = lambda w: 
 
 def gated_attn(d, w, kv, t = UNTURNED):
     """Gated attention over `d`'s heads, its projections at `w` (stored
-    against `t`'s turns), caching in `kv`."""
+    against `t`'s turns), its keys and values the state `kv`."""
     hd = d.head_dim
     return struct(
         rotary_dim = d.rotary_dim,
@@ -533,6 +533,8 @@ def layout(id, deploy):
             ffn_down = sign(BONSAI_WIDTHS.ffn_down),
         )
     t = turns(signs) if bonsai else UNTURNED
+    # An attention's keys and values, two planes of its kv heads a token.
+    kv = lambda: state([tokens, 2, d.kv_heads, d.head_dim], deploy.kv)
 
     def layer(l):
         n = lambda s: "layer.{}.{}".format(l, s)
@@ -541,13 +543,18 @@ def layout(id, deploy):
         attn = None
         delta = None
         if attn_at(l):
-            attn = gated_attn(d, proj, "kv.{}".format(l), t)
+            attn = gated_attn(d, proj, kv(), t)
         else:
             # Ternary-Bonsai stores the GDN beta/alpha projections in bf16,
             # not ternary: they are served as stored.
             # The FP8 release keeps them unquantized, as does its router.
             ba = dense if bonsai or fp8 or mix != None else proj
-            delta = gdn(d, proj, ba, dense, "conv.{}".format(l), "delta.{}".format(l), t)
+            # The convolution's last taps over the q, k and v channels, and
+            # the recurrence's state a value head.
+            qkv = 2 * d.k_heads * d.k_dim + d.v_heads * d.v_dim
+            conv_state = state([d.conv_kernel, qkv], dtype.bf16)
+            delta_state = state([d.v_heads, d.k_dim, d.v_dim], dtype.bf16)
+            delta = gdn(d, proj, ba, dense, conv_state, delta_state, t)
         if d.mlp.routed:
             mlp = routed(n, hidden, d.mlp, experts, mlp_at, gate)
         else:
@@ -582,7 +589,7 @@ def layout(id, deploy):
             fc_hidden = weight([hidden, hidden], w),
             mixer_norm = weight([hidden]),
             mixer_norm_eps = d.norm_eps,
-            attn = gated_attn(d, w, "kv.mtp"),
+            attn = gated_attn(d, w, kv()),
             mlp_norm = weight([hidden]),
             mlp_norm_eps = d.norm_eps,
             mlp = dense_mlp(w, hidden, inter, p),
@@ -591,7 +598,8 @@ def layout(id, deploy):
         )
     dflash = None
     if d.draft in blocks:
-        dflash = dflash_declare(d.dflash_head, "aux", hidden, d.vocab, d.norm_eps, w, dense, blocks_w = proj)
+        dflash = dflash_declare(d.dflash_head, "aux", hidden, d.vocab, d.norm_eps, w, dense, blocks_w = proj,
+                                kv = deploy.kv)
 
     # Ternary-Bonsai's token embedding is gathered whole, which no ternary
     # kernel does: it is served decoded.
@@ -606,7 +614,6 @@ def layout(id, deploy):
         kv_heads = d.kv_heads,
         head_dim = d.head_dim,
         rotate_kv = d.rotate_kv,
-        kv = deploy.kv,
         # The native 262144 tokens a deployment's YaRN stretches (the cards:
         # factor 4 toward a million).
         rope = yarn(deploy, 262144),
@@ -617,6 +624,9 @@ def layout(id, deploy):
         final_norm_eps = d.norm_eps,
         tower = visual,
         mtp = mtp,
+        # A dense deployment ending in an attention, drafting by itself,
+        # keeps the rows a draft layer's keys and values would take.
+        draft_kv = kv() if mtp == None and dflash == None and attn_at(d.layers - 1) and not d.mlp.routed else None,
         dflash = dflash,
         bonsai = signs,
     )
@@ -1093,23 +1103,6 @@ def run_moe(x, f):
     gate, up = ops.linear.matmul(x, f.shared.gate), ops.linear.matmul(x, f.shared.up)
     shared = ops.linear.matmul(ops.linear.glu(gate, gating.swiglu(), up = up), f.shared_down)
     return ops.linear.moe_sigmoid_gate_add(routed, shared, ops.linear.matmul(x, f.shared_gate))
-
-def caches(m, c):
-    kv = c.kv_space(m.kv)
-    plane = m.kv_heads * m.head_dim
-    for w in m.layers:
-        if w.attn != None:
-            c.kv(kv, w.attn.kv, [plane, plane], m.head_dim, heads = True)
-        else:
-            g = w.gdn
-            c.state(g.conv_state, [g.conv_kernel, g.qkv_width], dtype.bf16, split = 1)
-            c.state(g.delta_state, [g.v_heads, g.k_dim, g.v_dim], dtype.bf16, split = 0)
-    if m.mtp != None:
-        c.kv(kv, m.mtp.attn.kv, [plane, plane], m.head_dim, heads = True)
-    elif m.dflash == None and m.layers[-1].attn != None and not m.layers[-1].mlp.routed:
-        c.kv(kv, "kv.draft", [plane, plane], m.head_dim, heads = True)
-    if m.dflash != None:
-        dflash_caches(m.dflash, c, kv)
 
 def forward(m, inputs):
     dr = m.dflash
