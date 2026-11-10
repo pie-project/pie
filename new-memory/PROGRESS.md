@@ -281,3 +281,16 @@ The `new-memory/` directory is bookkeeping and is removed before anything lands 
   and DeepSeek compressor state slabs; engine copies treat a plane-page as one stride-sized block (layer-major layout
   will need separate stride and length). sm90/sm100 kernels compile-checked only.
 - Verified: `cargo check` kernels-cuda + engine-cuda (with tests) on new-memory.
+
+### M17 — 2026-11-10: MG-B, MG-D merged (23 models on state handles)
+- `sc/mg-d` (8 commits): mimo_v2 (48 traces), muse_glimmer (20), muse_spark (44), qwen3_asr (8), qwen3_tts (12),
+  gpt_oss (44) on handles; `live` inferred from `split_qkv_padded` (no hint); lib/dflash `caches()` path deleted
+  (`declare(kv=)` required). Accepted differences: mimo space order; muse_glimmer/muse_spark/gpt_oss sliding rows now
+  window-retained; qwen3_tts codec prenet rows get their 72-token window (latent bug fixed).
+- `sc/mg-b` (6 commits): wan_2 (12), ltx_2 (12, space order), hunyuan_image_3 (11), flux_2 (10), z_image (11) on
+  handles; VAE frame caches are `state([front*plane, c_in], bf16)` read by both arms; `lib/dit.held_text_encoder`
+  bridges lib/qwen3_encoder until minimax_h3 (MG-C) migrates it. Needed fix (applied on new-memory): a deployment
+  that declares no state traces with an empty spec whether or not `caches()` exists (crates/poem/src/star/run.rs).
+- Merge note: MG-B and MG-D both added a space-order hook; unified as `window_space_first` (mimo_v2, ltx_2).
+- Verified: `cargo check` poem-compiler (tests); `moved::ltx_2` and `moved::mimo_v2` after the unification.
+- Remaining: MG-C (kimi_k3, glm_5_next, hy_4, minimax_m3, minimax_h3, qwen_4), then delete the old caches() API.
