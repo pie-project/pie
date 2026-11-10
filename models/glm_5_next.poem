@@ -4,7 +4,7 @@
 load("//pie/codec.poem", "bank", "dequantized", "kept", read_weight = "weight", landed = "land")
 load("//lib/adapters.poem", "banks", "corrected")
 load("//lib/hyper.poem", "hyper", "mix", "gate", "predict_route")
-load("//lib/kda.poem", "kda", "kda_qkv", "kda_conv", "kda_gate", "kda_caches", "run_kda")
+load("//lib/kda.poem", "kda", "kda_qkv", "kda_conv", "kda_gate", "run_kda")
 load("//lib/media.poem", "smart_resize")
 load("//lib/mla.poem", "named", "attend", "boundaries")
 load("//lib/mtp.poem", "draft")
@@ -67,8 +67,8 @@ DEPLOYMENTS = [
 
 def attention(n, d, hidden, weights, norms, eps, kv, theta = None, gated = False, side = None, **extra):
     """The latent attention named by `n`, its projections in `weights` (its
-    `kv_b` and gate in `side`, where given) and its norms in `norms`, caching
-    under `kv`. Its rope part is rotated at `theta`, or left as it is with
+    `kv_b` and gate in `side`, where given) and its norms in `norms`, its
+    latent rows the state `kv`. Its rope part is rotated at `theta`, or left as it is with
     none; `gated` adds a sigmoid gate on its output. `extra` rides along (an
     indexer, say)."""
     side = side if side != None else weights
@@ -172,6 +172,15 @@ def layout(id, deploy):
     a = d.mla
     k = d.kda
     index_width = d.index_heads * d.index_head_dim
+    # An attention's latent rows: the latent and its rotated dims a token, as
+    # vLLM's standard fp8 rows (a byte a dim, one plane) on an e4m3 kv. The
+    # index keys stay at bf16 there. An attention with no rotated dims keeps
+    # its latent alone, a plane a token.
+    fp8_kv = deploy.kv == dtype.e4m3
+    widths = [a.kv_lora_rank, a.qk_rope_head_dim] if a.qk_rope_head_dim else [a.kv_lora_rank]
+    latent = lambda: (state([tokens, a.kv_lora_rank + a.qk_rope_head_dim], kv_rows.fp8) if fp8_kv
+                      else state([tokens, widths], deploy.kv))
+    index_keys = lambda: state([tokens, d.index_head_dim], dtype.bf16 if fp8_kv else deploy.kv)
 
     def mla_at(prefix, kv, keys):
         n = lambda s: "{}.{}".format(prefix, s)
@@ -234,13 +243,12 @@ def layout(id, deploy):
         norm = lambda s, width: weight([width])
         lora_a, lora_b = banks(hidden)
         if (l + 1) % d.full_attn_every == 0:
-            mixer = mla_at("layer.{}".format(l), "kv.{}".format(l), "index.{}".format(l))
+            mixer = mla_at("layer.{}".format(l), latent(), index_keys())
             mixer_kind = "mla"
         else:
             mixer_kind = "kda"
             mixer = kda(
                 n,
-                l,
                 k,
                 hidden,
                 weights = side,
@@ -284,7 +292,7 @@ def layout(id, deploy):
             h_proj = weight([hidden, hidden], dtype.bf16),
             mixer_norm = weight([hidden]),
             mixer_norm_eps = d.norm_eps,
-            attn = mla_at("mtp", "kv.mtp", "index.mtp"),
+            attn = mla_at("mtp", latent(), index_keys()),
             mlp_norm = weight([hidden]),
             mlp_norm_eps = d.norm_eps,
             mlp = routed_at("mtp", draft),
@@ -298,7 +306,6 @@ def layout(id, deploy):
         act = dense,
         heads = a.heads,
         kv_lora_rank = a.kv_lora_rank,
-        kv = deploy.kv,
         hyper = hyper(streams, d.norm_eps, d.gate_eps, d.alpha, d.sinkhorn),
         # mlx stores its table and head at four bits; the release, unquantized.
         embed = weight([d.vocab, hidden], table),
@@ -624,15 +631,6 @@ def summed(streams, hidden, count):
         y = ops.elemwise.residual_add(stream, y)
     return ops.elemwise.residual_add(rest, y) * f32(1.0 / count)
 
-def cache(c, space, a, fp8):
-    """`a`'s latent rows in the kv `space`: an e4m3 kv deployment's as vLLM's
-    standard fp8 rows (the latent and rotated dims' e4m3 codes under one
-    scale of 1 in a u8 plane)."""
-    if fp8:
-        c.kv(space, a.kv, [a.kv_lora_rank + a.qk_rope_head_dim], a.qk_rope_head_dim, rows = "fp8")
-        return
-    c.kv(space, a.kv, [a.kv_lora_rank, a.qk_rope_head_dim], a.qk_rope_head_dim)
-
 def run_attention(x, inputs, a, positions = None, select = None, prefill_only = False):
     """Latent attention of the rows `x`. `select(q_a)`, if given, picks the
     keys each query reads; `positions` default to the rows' own."""
@@ -673,24 +671,6 @@ def run_attention(x, inputs, a, positions = None, select = None, prefill_only = 
             rotary.partial(a.qk_rope_head_dim),
         )
     return attend(x, inputs, q_nope, q_pe, a, selection, prefill_only)
-
-def caches(m, c):
-    fp8 = m.kv == dtype.e4m3
-    kv = c.kv_space(dtype.u8 if fp8 else m.kv)
-    keys = dtype.bf16 if fp8 else m.kv
-    for w in m.layers:
-        a = w.mixer
-        if w.mixer_kind == "mla":
-            index = c.kv_space(keys)
-            cache(c, kv, a, fp8)
-            c.kv(index, a.indexer.keys, [a.indexer.head_dim], a.indexer.head_dim)
-        else:
-            kda_caches(c, a)
-    if m.mtp != None:
-        a = m.mtp.attn
-        index = c.kv_space(keys)
-        cache(c, kv, a, fp8)
-        c.kv(index, a.indexer.keys, [a.indexer.head_dim], a.indexer.head_dim)
 
 def forward(m, inputs):
     hy = m.hyper

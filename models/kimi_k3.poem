@@ -5,7 +5,7 @@
 
 load("//pie/codec.poem", read_fused = "fused")
 load("//lib/adapters.poem", "banks", "corrected")
-load("//lib/kda.poem", "kda", "kda_qkv", "kda_conv", "kda_gate", "kda_caches", "run_kda")
+load("//lib/kda.poem", "kda", "kda_qkv", "kda_conv", "kda_gate", "run_kda")
 load("//lib/mla.poem", "named")
 load("//lib/reads.poem", "product")
 
@@ -38,7 +38,7 @@ DEPLOYMENTS = [
 
 def attention(n, d, hidden, weights, norms, eps, kv, theta = None, gated = False, **extra):
     """The latent attention named by `n`, its projections in `weights` and
-    its norms in `norms`, caching under `kv`. Its rope part is rotated at
+    its norms in `norms`, its latent rows the state `kv`. Its rope part is rotated at
     `theta`, or left as it is with none; `gated` adds a sigmoid gate on its
     output. `extra` rides along (an indexer, say)."""
     qk_head_dim = d.qk_nope_head_dim + d.qk_rope_head_dim
@@ -198,14 +198,13 @@ def layout(id, deploy):
                 weights = weights,
                 norms = weights,
                 eps = d.norm_eps,
-                kv = "kv.{}".format(l),
+                kv = state([tokens, [a.kv_lora_rank, a.qk_rope_head_dim]], deploy.kv),
                 gated = True,
                 mla = True,
             )
         else:
             mixer = kda(
                 n,
-                l,
                 k,
                 hidden,
                 weights = weights,
@@ -277,7 +276,6 @@ def layout(id, deploy):
         res_block = d.res_block,
         mla_heads = a.heads,
         kv_lora_rank = a.kv_lora_rank,
-        kv = deploy.kv,
         embed = weight([d.vocab, hidden], weights),
         head = weight([d.vocab, hidden], weights),
         layers = [layer(l) for l in range(d.layers)],
@@ -509,10 +507,6 @@ def gguf(m, reads):
 # The forward of Kimi-K3: each layer's mixer (MLA or KDA) and MLP read a
 # blend of the residual stream's closed AttnRes blocks.
 
-def cache(c, space, a):
-    """`a`'s latent rows in the kv `space`."""
-    c.kv(space, a.kv, [a.kv_lora_rank, a.qk_rope_head_dim], a.qk_rope_head_dim)
-
 def plans(inputs, heads, kv_lora_rank):
     """The decode and prefill arms' plans over `inputs`."""
     one = fact.single_token()
@@ -548,15 +542,6 @@ def arm(decode, q_nope, plan, q_pe, selection, pages, a):
     score = ops.attn.mla_decode if decode else ops.attn.mla_prefill
     scored = score(q, plan, q_pe, pages, a.heads, a.kv_lora_rank, a.sm_scale, selection = selection)
     return ops.attn.mla_absorb_out(scored, a.kv_b_proj, a.heads, a.kv_lora_rank, a.qk_nope_head_dim, a.v_head_dim)
-
-def caches(m, c):
-    kv = c.kv_space(m.kv)
-    for w in m.layers:
-        a = w.mixer
-        if a.mla:
-            cache(c, kv, a)
-        else:
-            kda_caches(c, a)
 
 def opens_block(m, l):
     return l % m.res_block == 0
