@@ -383,6 +383,33 @@ impl Engine for Cerebras {
         if boot.prewarm {
             shell.prewarm().map_err(fault)?;
         }
+        // The tiers below the pool (CONTRACT-BC 22). The pool is host memory
+        // already, so host chunks are seated only where a budget says so.
+        shell
+            .pool_mut()
+            .seat_host(residency.host_kv_budget.unwrap_or(0));
+        if let Some(dir) = residency.disk_kv_dir.as_deref() {
+            let slot = shell
+                .pool()
+                .shape(LIST)
+                .map_or(0, |list| list.slot_words * 4);
+            let paging = shell.paging();
+            let budget = residency.disk_kv_budget.unwrap_or_else(|| {
+                engine::disk::unstated_budget(
+                    dir,
+                    0,
+                    0,
+                    paging.pages(),
+                    u64::from(budgets.max_lanes) * u64::from(paging.pages_per_slot),
+                    slot,
+                )
+            });
+            let name = shell.trace().name.clone();
+            shell
+                .pool_mut()
+                .seat_disk(dir, budget, residency.disk_kv_persistent.then_some(&*name))
+                .map_err(fault)?;
+        }
         let trace_name = shell.trace().name.clone();
         let (weight_bytes, pool_bytes) = shell.footprint();
         let paging = shell.paging();
@@ -642,7 +669,8 @@ impl Engine for Cerebras {
             .is_some_and(|caps| copy.src == caps.device.domain && copy.dst == caps.device.domain);
         if !served {
             return Err(Error::Unsupported {
-                verb: "`copy_kv` between domains other than this load's device",
+                verb: "`copy_kv` between domains other than this load's device: the host and \
+                       disk tiers of its shared shapes move through `copy_slots`",
                 engine: "cerebras",
             });
         }
@@ -685,29 +713,15 @@ impl Engine for Cerebras {
     }
 
     fn copy_slots(&mut self, copy: &engine::chunk::SlotCopy) -> EngineResult<()> {
-        let device = self.caps.as_ref().map(|caps| caps.device.domain);
-        if device.is_none_or(|device| copy.src != device || copy.dst != device) {
-            // The host and disk tiers of the shared shapes (the tier work's
-            // `copy_slots` direction) land here: this pool is host memory
-            // already, so a host tier is a second pool beside it.
-            return Err(Error::Unsupported {
-                verb: "`copy_slots` between tiers: this load states no host or disk chunks",
-                engine: "cerebras",
-            });
-        }
-        let pool = self.loaded_mut()?.pool_mut();
-        let pairs: Vec<(u32, u32)> = copy.slots.clone();
-        pool.copy_slots(copy.shape, &pairs).map_err(fault)?;
-        for run in &copy.runs {
-            pool.copy_rows(
-                copy.shape,
-                (run.src, run.src_token),
-                (run.dst, run.dst_token),
-                run.tokens,
-            )
-            .map_err(fault)?;
-        }
-        Ok(())
+        let device = self
+            .caps
+            .as_ref()
+            .map(|caps| caps.device.domain)
+            .ok_or_else(|| Error::Load("the cerebras engine has no model loaded".into()))?;
+        self.loaded_mut()?
+            .pool_mut()
+            .copy_tiers(copy, device)
+            .map_err(fault)
     }
 
     /// Weights live whole on the host, every fire uploading what its
