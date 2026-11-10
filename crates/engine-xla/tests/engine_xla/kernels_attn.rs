@@ -1335,6 +1335,57 @@ fn kv_append_writes_a_prefill_by_pages() {
 /// The fresh rows handed over are another append's (to a twin pool), so a
 /// fresh read is told from a walk by what it answers.
 #[test]
+fn a_tall_wide_prefill_lays_its_kv_in_parts() {
+    // 1792 rows of 16 kv heads of 256: past one kernel's VMEM, laid in two
+    // parts; lane a's page 56 holds rows of both.
+    let mut rng = Rng(23);
+    let (ps, kvh, d, pages) = (16usize, 16usize, 256usize, 130usize);
+    let pool = Pool::new(&mut rng, ps, kvh, d, pages, vec![vec![0]], 1);
+    let w = kvh * d;
+    let (mut page, mut off) = (Vec::new(), Vec::new());
+    for kp in 5..905 {
+        page.push((kp / ps * 2) as i32);
+        off.push((kp % ps) as i32);
+    }
+    for kp in 0..880 {
+        page.push((kp / ps * 2 + 1) as i32);
+        off.push((kp % ps) as i32);
+    }
+    while page.len() % ps != 0 {
+        page.push(i32::MAX);
+        off.push(0);
+    }
+    let n = page.len();
+    assert_eq!(n, 1792);
+    let k = rng.bf16s(n * w, 1.0);
+    let v = rng.bf16s(n * w, 1.0);
+    let mut bench = Bench::new();
+    let kv = pool.bind(&mut bench);
+    let kt = bench.bf16(n as u32, w as u32, &k);
+    let vt = bench.bf16(n as u32, w as u32, &v);
+    let pt = bench.i32(n as u32, 1, &page);
+    let ot = bench.i32(n as u32, 1, &off);
+    if !bench
+        .run(|ctx| low::kv_append(ctx, kt, vt, &kv, pt, ot).map(|_| ()))
+        .unwrap()
+    {
+        return;
+    }
+    let mut want_k = pool.keys.clone();
+    let mut want_v = pool.values.clone();
+    for i in 0..n {
+        if page[i] < 0 || page[i] as usize >= pages {
+            continue;
+        }
+        let slot = page[i] as usize * ps + off[i] as usize;
+        want_k[slot * w..(slot + 1) * w].copy_from_slice(&k[i * w..(i + 1) * w]);
+        want_v[slot * w..(slot + 1) * w].copy_from_slice(&v[i * w..(i + 1) * w]);
+    }
+    assert_close(&bench.read_f32(kv.keys), &want_k, 0.0, 0.0);
+    assert_close(&bench.read_f32(kv.values), &want_v, 0.0, 0.0);
+}
+
+#[test]
 fn a_prefill_reads_the_rows_it_appended_fresh() {
     let mut rng = Rng(31);
     let (qh, kvh, d, ps) = (4usize, 2usize, 128usize, 16usize);

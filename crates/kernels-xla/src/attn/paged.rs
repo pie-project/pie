@@ -2487,7 +2487,6 @@ pub(crate) fn scatter_slots(
     // Two bf16 planes of 16-row pages: a prompt's runs (few of them
     // partial) are laid by one Mosaic kernel.
     let w = i64::from(pairs[0].1.width);
-    let m = f.dims(runs.page)[0];
     if let [(k, keys), (v, values)] = pairs
         && keys.val != values.val
         && keys.width == values.width
@@ -2496,24 +2495,61 @@ pub(crate) fn scatter_slots(
         && f.elem(keys.val) == Elem::Bf16
         && f.elem(values.val) == Elem::Bf16
         && let Some(vmem_cap) = vmem_cap
-        && super::append::fits(i64::from(n), w, slots, ps, m, vmem_cap)
+        && let Some(parts) = [1, 2, 4].into_iter().find(|&p| {
+            let rows = i64::from(n) / p;
+            i64::from(n) % (p * ps) == 0
+                && super::append::fits(rows, w, slots, ps, rows / ps + 64, vmem_cap)
+        })
     {
         let (k, v, keys, values) = (*k, *v, *keys, *values);
         let rows: crate::hlo::Branch<'_> =
             Box::new(move |f: &mut Func| slot_rows(f, pairs, ps, page, off));
+        // A fire too tall for the kernel's VMEM (a 1792-row prefill of 16
+        // kv heads of 256) lays its rows in equal parts, one kernel a part,
+        // each over the planes the one before it wrote: a page two parts
+        // share takes the first's rows before the second's.
         let kernel: crate::hlo::Branch<'_> = Box::new(move |f: &mut Func| {
-            let total = f.reshape(runs.total, &[1])?;
-            let page = clamp_i(f, runs.page, 0, slots / ps - 1)?;
-            super::append::write(
-                f,
-                k.val,
-                v.val,
-                keys.val,
-                values.val,
-                [runs.start, runs.first, runs.len, page],
-                total,
-                vmem_cap,
-            )
+            if parts == 1 {
+                let total = f.reshape(runs.total, &[1])?;
+                let page = clamp_i(f, runs.page, 0, slots / ps - 1)?;
+                return super::append::write(
+                    f,
+                    k.val,
+                    v.val,
+                    keys.val,
+                    values.val,
+                    [runs.start, runs.first, runs.len, page],
+                    total,
+                    vmem_cap,
+                );
+            }
+            let rows = i64::from(n) / parts;
+            let mut planes = vec![keys.val, values.val];
+            for at in 0..parts {
+                let (lo, hi) = (at * rows, (at + 1) * rows);
+                let (pp, po) = (
+                    f.slice_axis(page, 0, lo, hi)?,
+                    f.slice_axis(off, 0, lo, hi)?,
+                );
+                let part = page_runs(f, rows, ps, slots / ps, pp, po)?;
+                let total = f.reshape(part.total, &[1])?;
+                let pg = clamp_i(f, part.page, 0, slots / ps - 1)?;
+                let (kp, vp) = (
+                    f.slice_axis(k.val, 0, lo, hi)?,
+                    f.slice_axis(v.val, 0, lo, hi)?,
+                );
+                planes = super::append::write(
+                    f,
+                    kp,
+                    vp,
+                    planes[0],
+                    planes[1],
+                    [part.start, part.first, part.len, pg],
+                    total,
+                    vmem_cap,
+                )?;
+            }
+            Ok(planes)
         });
         let pages: crate::hlo::Branch<'_> =
             Box::new(move |f: &mut Func| page_writes(f, pairs, ps, slots / ps, &runs, None));
