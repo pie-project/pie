@@ -247,20 +247,6 @@ impl Bench {
         self.time_with(iters, &[], false, body)
     }
 
-    /// `time` as the engine runs a pool: every handle in `in_place` that the
-    /// body reads and writes is donated to its result (`input_output_alias`),
-    /// so XLA updates it in place, and each run consumes the previous run's
-    /// result. The runs are enqueued back to back and waited for once, so
-    /// the mean excludes the per-run host round trip.
-    pub fn time_in_place(
-        &mut self,
-        iters: u32,
-        in_place: &[Tensor],
-        body: impl FnOnce(&crate::emit::Ctx<'_>) -> Result<(), kernels_xla::Error>,
-    ) -> Result<Option<f64>, String> {
-        self.time_with(iters, in_place, true, body)
-    }
-
     fn time_with(
         &mut self,
         iters: u32,

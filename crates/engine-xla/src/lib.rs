@@ -33,7 +33,7 @@ pub mod window;
 pub use api::{ContractFor, DeviceBoot, Xla};
 pub use boot::open;
 pub use error::{Fault, Result, kernel};
-pub use serve::{Boot, FireCost, Fired, Lane, Media, Seated, Shell};
+pub use serve::{Boot, Fired, Lane, Media, Seated, Shell};
 
 /// The fusions this backend implements: the routed MLP on one sort
 /// (`kernels_xla::linear::moe::experts`), its parts run one by one where the
