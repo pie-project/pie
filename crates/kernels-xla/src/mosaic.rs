@@ -595,6 +595,21 @@ impl Body {
     }
 
     /// `r` without its leading unit axis.
+    /// `r` (a 2-D reference, any memory) read as `elem`: the second-minor
+    /// axis scales by the width ratio, a tile of `u32 [8, 128]` becoming
+    /// `bf16 [16, 128]` (the chunk pool's packed rows order). How a kernel
+    /// reads a pool plane straight out of the `u32` pool.
+    pub fn ref_bitcast(&mut self, r: V, elem: Elem) -> Built<V> {
+        let out = match self.ty(r).clone() {
+            MTy::Ref(rd, e, sp) if rd.len() == 2 && e.bits() >= elem.bits() => {
+                let k = i64::from(e.bits() / elem.bits());
+                MTy::Ref(vec![rd[0] * k, rd[1]], elem, sp)
+            }
+            t => return bad(format!("a {} bitcast of {t}", elem.mlir())),
+        };
+        Ok(self.op1("tpu.memref_bitcast", &[r], "", out))
+    }
+
     pub fn ref_squeeze(&mut self, r: V) -> Built<V> {
         let out = match self.ty(r).clone() {
             MTy::Ref(rd, e, sp) if rd.first() == Some(&1) => MTy::Ref(rd[1..].to_vec(), e, sp),

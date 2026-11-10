@@ -350,6 +350,16 @@ impl<'h> Tracer<'h> {
             func.alias(param, result);
         }
         let text = func.module("fire", &results);
+        if !func.materialized().is_empty() {
+            // A view of the pool with no row rewrite: correct, but a copy of
+            // the pool each fire. `PIE_XLA_VIEW_STRICT=1` refuses it (tests).
+            let what = func.materialized().join("; ");
+            assert!(
+                std::env::var("PIE_XLA_VIEW_STRICT").as_deref() != Ok("1"),
+                "a fire materializes pool views: {what}"
+            );
+            tracing::warn!("a fire materializes pool views (a pool copy each): {what}");
+        }
         (
             text,
             Signature {
@@ -603,8 +613,18 @@ fn view_rows(root: Root, t: Tensor) -> Result<u32, kernels_xla::Error> {
     }
 }
 
+/// The chunk pool: the one `u32 [R, 128]` root every plane views.
+fn is_pool(root: Root) -> bool {
+    root.source.persistent()
+        && root.dtype == Dtype::U32
+        && root.width == kernels_xla::hlo::POOL_LANES as u32
+}
+
 /// A view's whole value back as its root's: the inverse of [`reinterpret`].
 fn unview(f: &mut Func, v: Val, root: Root) -> Result<Val, kernels_xla::Error> {
+    if is_pool(root) {
+        return Ok(f.pool_of(v, f.elem(v))?);
+    }
     let want =
         storage(root.dtype, root.rows, root.width).ok_or_else(|| kernels_xla::Error::Backend {
             op: "trace",
@@ -628,6 +648,13 @@ fn reinterpret(f: &mut Func, v: Val, root: Root, t: Tensor) -> Result<Val, kerne
         return Ok(v);
     }
     let want = storage(t.dtype, view_rows(root, t)?, t.width);
+    if is_pool(root)
+        && let Some(ty) = &want
+    {
+        // Never the whole pool at another element: a lazy view whose reads
+        // and writes go by pool rows (`kernels_xla::hlo` view).
+        return Ok(f.pool_view(v, ty.elem, &ty.dims)?);
+    }
     match want {
         Some(ty)
             if ty.elements() * i64::from(ty.elem.bits())
@@ -718,7 +745,8 @@ mod tests {
             .expect("a whole view lands");
         let (text, sig) = tracer.finish(&[]);
         assert_eq!(sig.results.len(), 1, "the pool is the one result");
-        assert!(text.contains("bitcast_convert"), "{text}");
+        // A lazy view: nothing of the whole pool is reinterpreted.
+        assert!(!text.contains("bitcast_convert"), "{text}");
     }
 
     #[test]
@@ -732,6 +760,11 @@ mod tests {
             let k = cx.read(keys)?;
             let v = cx.read(values)?;
             assert_eq!(k, v, "one view of one pool value is read once");
+            // keys change a row (a write of an unchanged view lands nothing)
+            let f = cx.func();
+            let row = f.slice(k, &[1, 0], &[2, 256], &[1, 1])?;
+            let zero = f.const_i(Elem::I32, 0, &[]);
+            let k = f.dynamic_update_slice(k, row, &[zero, zero])?;
             cx.write(keys, k)?;
             cx.write(values, v)
         });

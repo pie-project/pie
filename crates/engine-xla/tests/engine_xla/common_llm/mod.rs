@@ -133,12 +133,21 @@ impl Model {
         let facts = trace.facts.clone();
         let mut engine = Xla::new(DeviceBoot::default(), contract_for);
         let residency = Residency {
+            // `PIE_XLA_TEST_EXTRA_MIB` grows the pool past what the
+            // scenario needs: readouts must not depend on the pool's size.
             device_kv_budget: crate::common::kv_budget(
                 &trace,
                 context,
                 SLOTS,
                 SLOTS * context / PAGE,
-            ),
+            )
+            .map(|bytes| {
+                bytes
+                    + std::env::var("PIE_XLA_TEST_EXTRA_MIB")
+                        .ok()
+                        .and_then(|v| v.parse::<u64>().ok())
+                        .map_or(0, |mib| mib << 20)
+            }),
             disk_kv_dir: disk.map(std::path::Path::to_path_buf),
             disk_kv_budget: disk.map(|_| 64 << 20),
             ..Residency::default()

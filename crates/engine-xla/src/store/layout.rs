@@ -5,7 +5,10 @@
 //! The pool is one u32 buffer, `[chunks · C / 512, 128]` (the tiled
 //! `[chunks, rows, 128]` realization, its two major axes merged). A kernel
 //! reads a plane through a view of the whole pool at the plane's own element
-//! and width (`[pool bytes / row bytes, width]`), so a plane's run — its
+//! and width (`[pool bytes / row bytes, width]`) — a lazy view that is never
+//! built: its reads and writes go by pool rows, the elements of a row in the
+//! packed rows order a Mosaic kernel's bitcast sees (`kernels_xla::hlo`
+//! `pool_view`), so every run covers whole 512-byte rows — and a plane's run — its
 //! `per` rows of one slot: `T` tokens of a kv or rs plane, one working
 //! set's block of a state row — is a block of that view wherever it starts
 //! at a multiple of its own bytes. The layout guarantees that for every slot
@@ -376,7 +379,10 @@ impl Layout {
             }
             for plane in &shape.planes {
                 let r = plane.run;
+                // Whole pool rows: a row holds one plane's elements in the
+                // packed rows order (`kernels_xla::hlo` pool views).
                 if r == 0
+                    || !r.is_multiple_of(ROW_BYTES)
                     || !c.is_multiple_of(r)
                     || !s.is_multiple_of(r)
                     || !plane.offset.is_multiple_of(r)
