@@ -1193,6 +1193,198 @@ fn scale_codes(b: &mut Body, w: V, s: V, groups: i64, cols: i64) -> Built<V> {
     b.convert_f(f, Elem::Bf16)
 }
 
+/// Each token's rows of a grouped matmul's result summed, `tb` tokens a
+/// grid step. An expert's rows lie in token order, so the rows a block's
+/// tokens hold are one run per expert: the step copies those runs into
+/// VMEM in whole chunks of rows (the next block's while it sums this one)
+/// and sums them into its tokens by one one-hot dot. A one-hot sum over
+/// every row reads `rows · tokens` cells: at a 1792-token fire of
+/// Gemma-4-26B's 32-expert cut, 288 us a layer (v6e).
+///
+/// Operands: `start`, `count`, `off` i32 `[blocks · experts]` (SMEM): the
+/// first row a block copies of each expert's run (a chunk boundary), the
+/// chunks it copies, and its first buffer row; `tok` i32 `[rows, 128]`,
+/// each row's token in all 128 lanes (-1 for a row no pair holds); `ys`
+/// `[rows, n]` bf16. The result is `[blocks · tb, n]` f32.
+#[derive(Clone, Copy, Debug)]
+pub struct SegmentSum {
+    pub rows: i64,
+    pub n: i64,
+    pub experts: i64,
+    pub blocks: i64,
+    /// Tokens a block: the one-hot's 128 lanes.
+    pub tb: i64,
+    /// Rows a copy moves (whole bf16 sublane tiles).
+    pub chunk: i64,
+    /// Buffer rows a block copies at most.
+    pub depth: i64,
+    pub vmem_cap: i64,
+}
+
+impl SegmentSum {
+    /// The buffer rows a block of `tb` tokens at fan-out `top_k` copies at
+    /// most: its pairs, and up to a chunk short of whole chunks at each end
+    /// of each expert's run.
+    #[must_use]
+    pub fn depth_of(tb: i64, top_k: i64, experts: i64, chunk: i64) -> i64 {
+        (tb * top_k + 2 * experts * (chunk - 1) + chunk - 1) / chunk * chunk
+    }
+
+    fn vmem(&self) -> i64 {
+        let (r, n, tb) = (self.depth, self.n, self.tb);
+        2 * r * n * 2 + 2 * r * 128 * 4 + r * tb * 2 + r * n * 2 + 3 * tb * n * 4
+    }
+
+    /// Whether the kernel's buffers fit VMEM.
+    #[must_use]
+    pub fn fits(&self) -> bool {
+        self.vmem() + (8 << 20) <= self.vmem_cap
+    }
+
+    pub fn kernel(&self) -> Built<Compiled> {
+        let (rows, n, e, nb, tb, c, r) = (
+            self.rows,
+            self.n,
+            self.experts,
+            self.blocks,
+            self.tb,
+            self.chunk,
+            self.depth,
+        );
+        if tb != 128 || c % 16 != 0 || r % c != 0 || n % 128 != 0 || rows % c != 0 || !self.fits()
+        {
+            return bad(format!("{self:?}"));
+        }
+        let any = |array: Vec<i64>, elem: Elem| Operand {
+            array: array.clone(),
+            elem,
+            block: array,
+            window: Window::Any,
+            index: Box::new(|b: &mut Body, _: &Grid| Ok(vec![b.i32(0), b.i32(0)])),
+        };
+        let out = Operand {
+            array: vec![nb * tb, n],
+            elem: Elem::F32,
+            block: vec![tb, n],
+            window: Window::Blocked,
+            index: Box::new(|b: &mut Body, g: &Grid| Ok(vec![g.ids[0], b.i32(0)])),
+        };
+        let limit = (self.vmem() + (16 << 20)).min(self.vmem_cap);
+        let kernel = Kernel {
+            name: "segment_sum".into(),
+            grid: vec![nb],
+            semantics: vec![Sem::Arbitrary],
+            prefetch: vec![vec![nb * e], vec![nb * e], vec![nb * e]],
+            ins: vec![any(vec![rows, 128], Elem::I32), any(vec![rows, n], Elem::Bf16)],
+            outs: vec![out],
+            vmem_limit: Some(limit as u64),
+            scratch: vec![
+                MTy::Ref(vec![2, r, n], Elem::Bf16, Space::Vmem),
+                MTy::Ref(vec![2, r, 128], Elem::I32, Space::Vmem),
+                MTy::Sem(vec![2]),
+                MTy::Sem(vec![2]),
+            ],
+        };
+        kernel.build(|b, blk| {
+            let (ybuf, tbuf, ysems, tsems) =
+                (blk.scratch[0], blk.scratch[1], blk.scratch[2], blk.scratch[3]);
+            let (tok, ys) = (blk.ins[0], blk.ins[1]);
+            let pre = &blk.grid.prefetch;
+            let s = blk.grid.ids[0];
+            // Block `at`'s copies into slot `slot`, started or waited for.
+            let copies = |b: &mut Body, at: V, slot: V, wait: bool| -> Built<()> {
+                let z = b.i32(0);
+                let ee = b.i32(e);
+                let one = b.i32(1);
+                b.for_range(z, ee, one, |b, x| {
+                    let ne = b.i32(e);
+                    let i = b.muli(at, ne)?;
+                    let i = b.addi(i, x)?;
+                    let i = b.as_index(i)?;
+                    let first = b.load(pre[0], &[i])?;
+                    let cnt = b.load(pre[1], &[i])?;
+                    let off = b.load(pre[2], &[i])?;
+                    let z = b.i32(0);
+                    let one = b.i32(1);
+                    b.for_range(z, cnt, one, |b, q| {
+                        let cc = b.i32(c);
+                        let qc = b.muli(q, cc)?;
+                        let from = b.addi(first, qc)?;
+                        let from = b.assume_multiple(from, c)?;
+                        let to = b.addi(off, qc)?;
+                        let to = b.assume_multiple(to, c)?;
+                        let z = b.i32(0);
+                        let ysrc = b.ref_slice(ys, &[from, z], &[c, n])?;
+                        let ydst = b.ref_slice(ybuf, &[slot, to, z], &[1, c, n])?;
+                        let ydst = b.ref_squeeze(ydst)?;
+                        let ysem = b.ref_slice(ysems, &[slot], &[1])?;
+                        let ysem = b.ref_squeeze(ysem)?;
+                        let tsrc = b.ref_slice(tok, &[from, z], &[c, 128])?;
+                        let tdst = b.ref_slice(tbuf, &[slot, to, z], &[1, c, 128])?;
+                        let tdst = b.ref_squeeze(tdst)?;
+                        let tsem = b.ref_slice(tsems, &[slot], &[1])?;
+                        let tsem = b.ref_squeeze(tsem)?;
+                        if wait {
+                            b.dma_wait(ysem, ysrc, ydst)?;
+                            b.dma_wait(tsem, tsrc, tdst)
+                        } else {
+                            b.dma_start(ysrc, ydst, ysem)?;
+                            b.dma_start(tsrc, tdst, tsem)
+                        }
+                    })
+                })
+            };
+            let z = b.i32(0);
+            let two = b.i32(2);
+            let slot = b.remsi(s, two)?;
+            let at0 = b.cmpi(ICmp::Eq, s, z)?;
+            // The buffers start zeroed: a row no block copied yet holds no
+            // NaN for the one-hot's zeros to meet.
+            b.when(at0, |b| {
+                let zy = b.splat_f(&[1, r, n], Elem::Bf16, 0.0)?;
+                let zt = b.splat_i(&[1, r, 128], -1)?;
+                for slot in 0..2 {
+                    let at = b.index(slot);
+                    let zi = b.index(0);
+                    b.vstore(zy, ybuf, &[at, zi, zi])?;
+                    b.vstore(zt, tbuf, &[at, zi, zi])?;
+                }
+                let z = b.i32(0);
+                copies(b, z, z, false)
+            })?;
+            copies(b, s, slot, true)?;
+            let one = b.i32(1);
+            let next = b.addi(s, one)?;
+            let last = b.i32(nb);
+            let more = b.cmpi(ICmp::Slt, next, last)?;
+            b.when(more, |b| {
+                let one = b.i32(1);
+                let other = b.subi(one, slot)?;
+                copies(b, next, other, false)
+            })?;
+            let z = b.i32(0);
+            let held = b.ref_slice(tbuf, &[slot, z, z], &[1, r, 128])?;
+            let held = b.ref_squeeze(held)?;
+            let toks = b.vload_all(held)?;
+            let tbb = b.i32(tb);
+            let base = b.muli(s, tbb)?;
+            let base = b.broadcast_i(base, &[r, 128])?;
+            let rel = b.subi(toks, base)?;
+            let lanes = b.iota(&[r, 128], 1);
+            let hit = b.cmpi(ICmp::Eq, rel, lanes)?;
+            let on = b.splat_f(&[r, 128], Elem::Bf16, 1.0)?;
+            let off = b.splat_f(&[r, 128], Elem::Bf16, 0.0)?;
+            let hot = b.select(hit, on, off)?;
+            let rows = b.ref_slice(ybuf, &[slot, z, z], &[1, r, n])?;
+            let rows = b.ref_squeeze(rows)?;
+            let rows = b.vload_all(rows)?;
+            let acc = b.splat_f(&[tb, n], Elem::F32, 0.0)?;
+            let y = b.matmul_tl(hot, rows, acc)?;
+            b.vstore_all(y, blk.outs[0])
+        })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
