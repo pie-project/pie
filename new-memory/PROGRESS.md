@@ -991,3 +991,14 @@ The `new-memory/` directory is bookkeeping and is removed before anything lands 
   full cargo check matrix after merge.
 - Left (follow-up commit, L40S): engine-cuda's now-unreachable legacy expert tier and Residency.deferred_tier /
   host_weight_deferred -> delete. tests/handles/e2e.py --slots runs need new sizing.
+
+### Note — 2026-11-10: e2e handles run on the shared pool (sc/e2e-handles-sizing) — BUGS FOUND
+- tests/handles/e2e.py sized by --kv-budget only (176 / 136 / 116 MiB runs). Default run 56/60.
+- BUG (engine, correctness): device_kv_budget <= 2 GiB -> "bodies armed 0 of 112", and Qwen3.5 resume (second process
+  right after the first) produces wrong tokens from its 3rd token, deterministic. Armed (>= 4 GiB) is correct. -> EAGER.
+- BUG (runtime): host tier full -> launch fails NoEligibleVictim instead of quota; a parked resume then waits forever,
+  shortfall 2.78 GB for a 2-token turn (matches the engine's "fire wants 2776596480 bytes of the state pool").
+- GAP: named snapshots (t_snapshot, t_long_snapshot) fail on the shared pool: take_host returns None (byte reads of
+  host refs not stated, contract 22) -> must work before the PR.
+- GAP (policy): keep-handles `Retain::upto(head)` covers kv tokens only; the record keeps key -1 and goes first.
+- t_quota / t_close: launch-time state quota removed (4cb817555); host limit needs host_kv_budget in the script.
