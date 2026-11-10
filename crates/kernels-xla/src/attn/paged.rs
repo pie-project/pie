@@ -26,7 +26,7 @@ use dtype::Dtype;
 use super::{DecodePlan, PrefillPlan};
 use crate::check::expect;
 use crate::error::{Error, refuse};
-use crate::hlo::{Built, Cmp, Elem, Fold, Func, GatherDims, Malformed, Ty, Val};
+use crate::hlo::{Built, Cmp, Combine, Elem, Fold, Func, GatherDims, Malformed, Ty, Val};
 use crate::tensor::{KvPool, Landing, Operand, RaggedTensor, Stored};
 use crate::tuning::Chunks;
 use crate::tuning::Tuning;
@@ -1999,17 +1999,65 @@ pub fn attend_fresh(
             )?
         }
         (Walk::Blocked, None) => {
-            let walk = |f: &mut Func| {
-                blocked(
+            // A fire's decode rows (one row a lane) beside its prompts walk
+            // their own lanes' keys apart from the row blocks: in a block
+            // each visits a chunk of its lane that the whole block multiplies.
+            let apart = geom.lanes >= APART_LANES
+                && call.causal
+                && rule.rel.is_none()
+                && rule.rbias.is_none()
+                && !matches!(planes, Planes::Paged { latent: true, .. });
+            let walk = move |f: &mut Func| -> Built<Flashed> {
+                if !apart {
+                    return blocked(
+                        f,
+                        &planes,
+                        &heads,
+                        &rule,
+                        &rs,
+                        geom.lanes * geom.span,
+                        scale,
+                        ch,
+                    );
+                }
+                let a = singles(f, lane, qpos, geom.lanes)?;
+                let z = f.like_i(rs.lo, 0);
+                let mut rb = rs;
+                rb.lo = f.select(a.taken, z, rs.lo)?;
+                rb.hi = f.select(a.taken, z, rs.hi)?;
+                let b = blocked(
                     f,
                     &planes,
                     &heads,
                     &rule,
-                    &rs,
+                    &rb,
                     geom.lanes * geom.span,
                     scale,
                     ch,
-                )
+                )?;
+                let mut own = Rows::new(q4, lo, hi);
+                own.lane = Some(lane);
+                own.enabled = rs.enabled;
+                own.mask = rs.mask;
+                let mut own = own.map(f, &mut |f, v| pick_rows(f, v, a.idx))?;
+                let z = f.like_i(own.lo, 0);
+                own.lo = f.select(a.used, own.lo, z)?;
+                own.hi = f.select(a.used, own.hi, z)?;
+                if let Some(en) = own.enabled {
+                    own.enabled = Some(f.select(a.used, en, z)?);
+                }
+                let rule_own = Rule {
+                    kp_span: None,
+                    ..rule
+                };
+                let d = own_rows(
+                    f, &planes, &heads, &rule_own, &own, keys, values, &geom, scale, tuning,
+                )?;
+                Ok(Flashed {
+                    o: put_back(f, b.o, d.o, a.idx)?,
+                    m: put_back(f, b.m, d.m, a.idx)?,
+                    l: put_back(f, b.l, d.l, a.idx)?,
+                })
             };
             let cap_v = tuning.vmem_cap();
             // Causal rows with no relative bias read nothing past themselves
@@ -2042,60 +2090,9 @@ pub fn attend_fresh(
                 None => walk(f)?,
             }
         }
-        (Walk::PerRow, None)
-            if ch.decode_pages > 0
-                && r >= ch.decode_pages
-                // narrow kv heads read so little a row that the kernel's
-                // per-row work costs more than the walk's reads (v6e
-                // gemma-4-E2B c256, one 256-wide kv head: 13.8k -> 9.2k tok/s)
-                && heads.kvh * heads.d >= 1024
-                && rule.rel.is_none()
-                && rule.rbias.is_none()
-                && !matches!(planes, Planes::Paged { latent: true, .. })
-                && f.elem(keys) == Elem::Bf16
-                && f.elem(values) == Elem::Bf16
-                && super::pages::fits(geom.span, &heads, tuning.vmem_cap()) =>
-        {
-            // A decode's rows copy their own pages; a fire whose rows carry
-            // a custom mask walks them as before.
-            let vmem = tuning.vmem_cap();
-            let copied = move |f: &mut Func| -> Built<Flashed> {
-                super::pages::attend(
-                    f, rs.q, keys, values, geom.pt, lane, rs.lo, rs.hi, geom.pages, geom.ps,
-                    &heads, scale, vmem,
-                )
-            };
-            match rs.enabled {
-                None => copied(f)?,
-                Some(en) => {
-                    let on = cmp_i(f, Cmp::Ne, en, 0)?;
-                    let any = f.reduce(on, &[0], Fold::Or)?;
-                    let at = f.convert(any, Elem::I32);
-                    let o = f.dims(rs.q).to_vec();
-                    let stat = Ty::new(Elem::F32, &o[..3]);
-                    let outs = [
-                        Ty::new(Elem::F32, &[o[0], o[1], o[2], heads.dv]),
-                        stat.clone(),
-                        stat,
-                    ];
-                    let plain: crate::hlo::Branch<'_> = Box::new(move |f: &mut Func| {
-                        let fl = copied(f)?;
-                        Ok(vec![fl.o, fl.m, fl.l])
-                    });
-                    let walked: crate::hlo::Branch<'_> = Box::new(move |f: &mut Func| {
-                        let fl =
-                            per_row(f, &planes, &heads, &rule, &rs, KeyList::Range, scale, ch)?;
-                        Ok(vec![fl.o, fl.m, fl.l])
-                    });
-                    let out = f.case(at, &outs, vec![plain, walked])?;
-                    Flashed {
-                        o: out[0],
-                        m: out[1],
-                        l: out[2],
-                    }
-                }
-            }
-        }
+        (Walk::PerRow, None) => own_rows(
+            f, &planes, &heads, &rule, &rs, keys, values, &geom, scale, tuning,
+        )?,
         _ => per_row(f, &planes, &heads, &rule, &rs, KeyList::Range, scale, ch)?,
     };
     let lse = match call.lse {
@@ -2103,6 +2100,145 @@ pub fn attend_fresh(
         None => None,
     };
     Ok((flashed.o, lse))
+}
+
+/// From this many lanes a blocked fire's decode rows walk apart (see
+/// [`singles`]).
+const APART_LANES: i64 = 32;
+
+/// A fire's rows that are their lane's only row (a decode beside prompts):
+/// `idx` their row numbers, `[lanes]`, the unused slots past the fire's `r`
+/// rows (each its own); `used` the slots that hold one; `taken`, per row,
+/// whether it is one.
+struct Singles {
+    idx: Val,
+    used: Val,
+    taken: Val,
+}
+
+fn singles(f: &mut Func, lane: Val, qpos: Val, lanes: i64) -> Built<Singles> {
+    let r = f.dims(lane)[0];
+    let fill = f.const_i(Elem::I32, -1, &[]);
+    let head = f.slice_axis(lane, 0, 0, r - 1)?;
+    let prev = f.pad(head, fill, &[1], &[0], &[0])?;
+    let tail = f.slice_axis(lane, 0, 1, r)?;
+    let next = f.pad(tail, fill, &[0], &[1], &[0])?;
+    let a = f.compare(Cmp::Ne, lane, prev)?;
+    let b = f.compare(Cmp::Ne, lane, next)?;
+    let live = cmp_i(f, Cmp::Ge, qpos, 0)?;
+    let one = f.and(a, b)?;
+    let one = f.and(one, live)?;
+    let n = f.convert(one, Elem::I32);
+    let at = f.scan_steps(n, 0, Fold::Sum)?;
+    let at = with_i(f, at, 1, Func::sub)?;
+    let room = cmp_i(f, Cmp::Lt, at, lanes)?;
+    let taken = f.and(one, room)?;
+    let io = f.iota(Elem::I32, &[r], 0);
+    let off = with_i(f, io, lanes, Func::add)?;
+    let at = f.select(taken, at, off)?;
+    let slots = f.iota(Elem::I32, &[lanes], 0);
+    let idx = with_i(f, slots, r, Func::add)?;
+    let idx = f.reshape(idx, &[lanes, 1])?;
+    let rows = f.reshape(io, &[r, 1])?;
+    let idx = f.put_rows_hinted(idx, at, rows, Combine::Set, true)?;
+    let idx = f.reshape(idx, &[lanes])?;
+    let used = cmp_i(f, Cmp::Lt, idx, r)?;
+    Ok(Singles { idx, used, taken })
+}
+
+/// Rows `idx` of `v` (clamped), along axis 0.
+fn pick_rows(f: &mut Func, v: Val, idx: Val) -> Built<Val> {
+    let mut d = f.dims(v).to_vec();
+    let w: i64 = d[1..].iter().product();
+    let flat = f.reshape(v, &[d[0], w])?;
+    let i = clamp_i(f, idx, 0, d[0] - 1)?;
+    let g = f.take_rows(flat, i)?;
+    d[0] = f.dims(idx)[0];
+    f.reshape(g, &d)
+}
+
+/// `whole` with rows `idx` (those in range) replaced by `part`'s.
+fn put_back(f: &mut Func, whole: Val, part: Val, idx: Val) -> Built<Val> {
+    let d = f.dims(whole).to_vec();
+    let w: i64 = d[1..].iter().product();
+    let n = f.dims(part)[0];
+    let flat = f.reshape(whole, &[d[0], w])?;
+    let part = f.reshape(part, &[n, w])?;
+    let part = f.convert(part, f.elem(flat));
+    let out = f.put_rows_hinted(flat, idx, part, Combine::Set, true)?;
+    f.reshape(out, &d)
+}
+
+/// The attention of rows that each walk their own lane's keys (`lo`/`hi`
+/// positions in the lane): a decode's rows copy their own pages where the
+/// kernel takes them; a fire whose rows carry a custom mask walks them as
+/// before.
+fn own_rows(
+    f: &mut Func,
+    planes: &Planes,
+    heads: &Heads,
+    rule: &Rule,
+    rs: &Rows,
+    keys: Val,
+    values: Val,
+    geom: &Geom,
+    scale: f64,
+    tuning: Tuning,
+) -> Built<Flashed> {
+    let ch = tuning.chunks;
+    let r = f.dims(rs.q)[0];
+    let (Some(lane), true) = (
+        rs.lane,
+        ch.decode_pages > 0
+            && r >= ch.decode_pages
+            // narrow kv heads read so little a row that the kernel's
+            // per-row work costs more than the walk's reads (v6e
+            // gemma-4-E2B c256, one 256-wide kv head: 13.8k -> 9.2k tok/s)
+            && heads.kvh * heads.d >= 1024
+            && rule.rel.is_none()
+            && rule.rbias.is_none()
+            && !matches!(planes, Planes::Paged { latent: true, .. })
+            && f.elem(keys) == Elem::Bf16
+            && f.elem(values) == Elem::Bf16
+            && super::pages::fits(geom.span, heads, tuning.vmem_cap()),
+    ) else {
+        return per_row(f, planes, heads, rule, rs, KeyList::Range, scale, ch);
+    };
+    let (planes, heads, rule, rs, geom) = (*planes, *heads, *rule, *rs, *geom);
+    let vmem = tuning.vmem_cap();
+    let copied = move |f: &mut Func| -> Built<Flashed> {
+        super::pages::attend(
+            f, rs.q, keys, values, geom.pt, lane, rs.lo, rs.hi, geom.pages, geom.ps, &heads, scale,
+            vmem,
+        )
+    };
+    let Some(en) = rs.enabled else {
+        return copied(f);
+    };
+    let on = cmp_i(f, Cmp::Ne, en, 0)?;
+    let any = f.reduce(on, &[0], Fold::Or)?;
+    let at = f.convert(any, Elem::I32);
+    let o = f.dims(rs.q).to_vec();
+    let stat = Ty::new(Elem::F32, &o[..3]);
+    let outs = [
+        Ty::new(Elem::F32, &[o[0], o[1], o[2], heads.dv]),
+        stat.clone(),
+        stat,
+    ];
+    let plain: crate::hlo::Branch<'_> = Box::new(move |f: &mut Func| {
+        let fl = copied(f)?;
+        Ok(vec![fl.o, fl.m, fl.l])
+    });
+    let walked: crate::hlo::Branch<'_> = Box::new(move |f: &mut Func| {
+        let fl = per_row(f, &planes, &heads, &rule, &rs, KeyList::Range, scale, ch)?;
+        Ok(vec![fl.o, fl.m, fl.l])
+    });
+    let out = f.case(at, &outs, vec![plain, walked])?;
+    Ok(Flashed {
+        o: out[0],
+        m: out[1],
+        l: out[2],
+    })
 }
 
 /// The key positions a block selection names, per row: the named blocks
