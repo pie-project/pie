@@ -807,6 +807,14 @@ impl Bodies {
         self.map.seal();
     }
 
+    /// Drops every recorded body and what was refused, unsealed: what the
+    /// bodies captured (a kernel chosen for where a weight lay) no longer
+    /// holds, and the lattice is armed again.
+    pub fn forget_bodies(&mut self) {
+        self.map = BodyMap::default();
+        self.recorder.sealed_seen.clear();
+    }
+
     #[must_use]
     pub fn body_refused(&self, key: &BodyKey) -> bool {
         self.map.refused(key)

@@ -148,6 +148,9 @@ pub struct FireTables {
 
     /// The row table of each table streamed by its rows, by its param.
     pub row_tables: Vec<(u32, kernels_cuda::linear::moe::RowTable)>,
+
+    /// The expert table of each bank streamed by its experts, by its param.
+    pub expert_tables: Vec<(u32, ExpertTable)>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -2178,7 +2181,17 @@ impl<'c> Run<'c> {
         };
         let row = *w as usize;
         match self.weights.0.get(row).copied().flatten() {
-            Some(WeightRow::Dense(handle)) => (self.cut(id, handle), ExpertTable::RESIDENT),
+            // A bank the weight cache streams reads its experts through the
+            // cache's table; any other is the contiguous bank.
+            Some(WeightRow::Dense(handle)) => (
+                self.cut(id, handle),
+                self.fire
+                    .tables
+                    .expert_tables
+                    .iter()
+                    .find(|(param, _)| *param == *w)
+                    .map_or(ExpertTable::RESIDENT, |(_, table)| *table),
+            ),
             Some(WeightRow::Streamed {
                 slab,
                 table,

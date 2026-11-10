@@ -1408,7 +1408,7 @@ impl Run<'_> {
                 routes,
                 &mut out,
                 Some(Glu::Relu2),
-                linear::moe::ExpertTable::RESIDENT,
+                experts,
             );
         }
         // The profile first: a tcgen05 device with its grouped GEMM off resolves nothing.

@@ -195,6 +195,9 @@ pub struct Plan {
     /// Host bytes of the planes `host_declared` moved: fixed mapped
     /// addresses, read in place, so a recorded body may hold them.
     declared_bytes: u64,
+    /// The routed banks the weight cache streams an expert at a time
+    /// ([`Plan::host_experts`]).
+    cached: Vec<usize>,
 }
 
 #[derive(Debug, Clone)]
@@ -472,6 +475,7 @@ impl Plan {
             host_bytes,
             spill_bytes,
             declared_bytes: 0,
+            cached: Vec::new(),
         })
     }
 
@@ -549,6 +553,25 @@ impl Plan {
             freed += reserved;
         }
         Ok(freed)
+    }
+
+    /// [`Plan::host_rows`] for the routed banks `params` the weight cache
+    /// streams an expert at a time, which the plan then names
+    /// ([`Plan::cached_experts`]).
+    pub fn host_experts(&mut self, trace: &Trace, params: &[usize]) -> Result<u64> {
+        let freed = self.host_rows(trace, params)?;
+        self.cached = params
+            .iter()
+            .copied()
+            .filter(|param| self.pinned(*param))
+            .collect();
+        Ok(freed)
+    }
+
+    /// The routed banks the weight cache streams an expert at a time.
+    #[must_use]
+    pub fn cached_experts(&self) -> &[usize] {
+        &self.cached
     }
 
     #[must_use]
@@ -1247,6 +1270,26 @@ impl Tier {
     #[must_use]
     pub fn host(&self) -> &Pinned {
         &self.host
+    }
+
+    /// Frees the pinned host image where it holds only `held`: the copies
+    /// of weights the runtime holds whole in the pool for the load's life,
+    /// which no fire reads and nothing is refilled from. Returns the bytes
+    /// freed; 0 where the image also holds a plane read in place, or a seat
+    /// the tier fills.
+    pub fn release_host(&mut self, held: &[usize]) -> u64 {
+        if held.is_empty()
+            || self.host.bytes() == 0
+            || !self.seats.is_empty()
+            || self.refill.is_some()
+            || self.image.is_some()
+            || !self.wholes.iter().all(|whole| held.contains(&whole.param))
+        {
+            return 0;
+        }
+        let bytes = self.host.bytes() as u64;
+        self.host = Pinned::empty();
+        bytes
     }
 
     #[must_use]

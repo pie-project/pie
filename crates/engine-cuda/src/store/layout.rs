@@ -181,6 +181,8 @@ pub struct Layout {
     pub rs: Option<RsShape>,
     /// The tables the weight cache streams by their rows, a shape each.
     pub rows: Vec<RowsShape>,
+    /// The routed experts the weight cache streams, a shape a layer size.
+    pub experts: Vec<ExpertShape>,
 }
 
 /// The first weight shape's id; the shapes after it follow.
@@ -203,6 +205,117 @@ pub struct RowsShape {
     pub blocks: u32,
     /// The blocks one fire may read: what the cache never drops below.
     pub floor: u32,
+}
+
+/// One plane of a routed expert: the bank `param`, an expert's `bytes` of
+/// it `offset` into the expert's slot.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ExpertPlane {
+    pub param: u32,
+    pub offset: u64,
+    pub bytes: u64,
+}
+
+/// The routed experts of the MoE layers of one size: a slot holds one
+/// expert of one layer, its plane of each bank the layer's selects read.
+/// Atom `layer * experts + expert` is expert `expert` of `banks[layer]`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExpertShape {
+    pub id: ShapeId,
+    pub slot_bytes: u64,
+    pub per_chunk: u32,
+    /// Experts a layer.
+    pub experts: u32,
+    /// Each layer's planes.
+    pub banks: Vec<Vec<ExpertPlane>>,
+    /// The slots a fire's routes may read: what the cache never drops below.
+    pub floor: u32,
+}
+
+impl ExpertShape {
+    /// The atoms there are.
+    #[must_use]
+    pub fn count(&self) -> u32 {
+        self.banks.len() as u32 * self.experts
+    }
+}
+
+/// The routed banks of `trace` this engine streams an expert at a time:
+/// planes out of the checkpoint read only at the `bank` port of a plain
+/// routed select (no bias, no quantization), the select whose kernels read
+/// an expert table.
+#[must_use]
+pub fn streamed_experts(trace: &poem_ir::Trace) -> Vec<usize> {
+    use poem_ir::residency::{Residency, residency};
+    use poem_ir::{Def, Linear, Operands, Operation};
+    // The HIP selects take no table that names a pool slot yet.
+    if cfg!(feature = "rocm") {
+        return Vec::new();
+    }
+    let classes = residency(trace);
+    let mut out = Vec::new();
+    let mut inputs = Vec::new();
+    'params: for (at, param) in trace.params.iter().enumerate() {
+        if !matches!(classes[at], Residency::Expert(_))
+            || param.shape.len() < 2
+            || param.source != poem_ir::ParamSource::Checkpoint
+        {
+            continue;
+        }
+        let mut read = false;
+        for node in &trace.nodes {
+            inputs.clear();
+            node.op.inputs(&mut inputs);
+            let reads = inputs.iter().any(|v| {
+                matches!(trace.values.get(v.0 as usize).map(|d| &d.def),
+                    Some(Def::Weight(w)) if *w as usize == at)
+            });
+            if !reads {
+                continue;
+            }
+            match &node.op {
+                Operation::Linear(Linear::MoeSelect {
+                    bank,
+                    bias: None,
+                    quantized: false,
+                    quant: None,
+                    ..
+                }) if matches!(trace.values.get(bank.0 as usize).map(|d| &d.def),
+                    Some(Def::Weight(w)) if *w as usize == at) =>
+                {
+                    read = true;
+                }
+                _ => continue 'params,
+            }
+        }
+        if read {
+            out.push(at);
+        }
+    }
+    // A layer's banks stream together or not at all, and so do the layers
+    // the recipe lays in one shape: an atom is an expert of every bank of
+    // its layer. The grouping is the recipe's, whatever its chunk.
+    let profile = poem_compiler::DeviceProfile {
+        chunk: poem_compiler::chunk::ChunkProfile::SERVER_CUDA,
+        ..poem_compiler::DeviceProfile::default()
+    };
+    let budgets = poem_compiler::Budgets::of(poem_compiler::Budget::default());
+    let Ok(recipe) = poem_compiler::chunk::plan(trace, &budgets, &profile) else {
+        return Vec::new();
+    };
+    let mut whole = Vec::new();
+    for slot in &recipe.weights {
+        if slot.kind != poem_compiler::chunk::WeightKind::Expert {
+            continue;
+        }
+        let params = || slot.banks.iter().flat_map(|bank| bank.params.iter());
+        if params().all(|param| out.contains(&(*param as usize))) {
+            whole.extend(params().map(|param| *param as usize));
+        }
+    }
+    whole.sort_unstable();
+    whole.dedup();
+    whole
 }
 
 /// The tables of `trace` this engine streams by their rows: read only by the
@@ -397,7 +510,12 @@ impl Layout {
     /// The recipe's token shapes. This engine pages every windowed row by one
     /// table, so a recipe with two window lists is refused, and by its kv
     /// page, so a window list of another page size is.
-    pub fn of(recipe: &ChunkRecipe, streamed: &[usize]) -> Result<Layout> {
+    ///
+    /// `streamed` are the tables streamed by their rows and `banks` the
+    /// routed banks streamed an expert at a time, each with its plane's
+    /// bytes; a weight slot the recipe lays with a plane outside them stays
+    /// as the load seats it, no atom of it cached.
+    pub fn of(recipe: &ChunkRecipe, streamed: &[usize], banks: &[(usize, u64)]) -> Result<Layout> {
         let chunk_bytes = recipe.chunk_bytes;
         let list = recipe
             .list()
@@ -475,6 +593,56 @@ impl Layout {
                 floor: u32::try_from(slot.floor).unwrap_or(u32::MAX),
             });
         }
+        let mut experts = Vec::new();
+        for slot in &recipe.weights {
+            if slot.kind != poem_compiler::chunk::WeightKind::Expert
+                || slot.pieces != 1
+                || slot.atoms_per_slot != 1
+            {
+                continue;
+            }
+            let Some(count) = slot.banks.first().map(|bank| bank.atoms) else {
+                continue;
+            };
+            let mut layers = Vec::with_capacity(slot.banks.len());
+            for bank in &slot.banks {
+                let mut at = 0u64;
+                let mut planes = Vec::with_capacity(bank.params.len());
+                for &param in &bank.params {
+                    let Some(&(_, bytes)) = banks.iter().find(|(held, _)| *held == param as usize)
+                    else {
+                        break;
+                    };
+                    if bank.atoms != count || count == 0 || !bytes.is_multiple_of(count) {
+                        break;
+                    }
+                    planes.push(ExpertPlane {
+                        param,
+                        offset: at,
+                        bytes: bytes / count,
+                    });
+                    at += bytes / count;
+                }
+                if planes.len() == bank.params.len() && at <= slot.bytes {
+                    layers.push(planes);
+                }
+            }
+            // Every layer of the shape or none: an atom's number is its
+            // layer's place among them.
+            if layers.len() != slot.banks.len() {
+                continue;
+            }
+            experts.push(ExpertShape {
+                id: ShapeId(WEIGHTS + (rows.len() + experts.len()) as u32),
+                slot_bytes: slot.bytes,
+                per_chunk: u32::try_from(chunk_bytes / slot.bytes.max(1))
+                    .unwrap_or(u32::MAX)
+                    .max(1),
+                experts: u32::try_from(count).unwrap_or(u32::MAX),
+                banks: layers,
+                floor: u32::try_from(slot.floor).unwrap_or(u32::MAX),
+            });
+        }
         Ok(Layout {
             chunk_bytes,
             segment_chunks: u32::try_from(segment_chunks).unwrap_or(u32::MAX).max(1),
@@ -483,6 +651,7 @@ impl Layout {
             fixed,
             rs,
             rows,
+            experts,
         })
     }
 
@@ -563,6 +732,7 @@ mod tests {
             fixed: None,
             rs: None,
             rows: Vec::new(),
+            experts: Vec::new(),
         }
     }
 

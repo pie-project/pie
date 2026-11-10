@@ -512,7 +512,11 @@ impl WeightCache {
     /// The whole resident set, as the engine takes it.
     #[must_use]
     pub fn residency(&self, pool: &SlotPool) -> WeightResidency {
-        let mut residency = WeightResidency::default();
+        // Not streaming, every atom is pinned in its slot for good.
+        let mut residency = WeightResidency {
+            held: !self.streaming,
+            ..WeightResidency::default()
+        };
         for kept in &self.shapes {
             residency.staging.push((
                 kept.facts.id,

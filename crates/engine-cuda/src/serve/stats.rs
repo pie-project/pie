@@ -186,7 +186,35 @@ impl Shell {
         &mut self,
         residency: &engine::chunk::WeightResidency,
     ) -> crate::Result<()> {
-        self.pools.weight_residency(self.device.stream(), residency)
+        if self
+            .pools
+            .weight_residency(self.device.stream(), residency)?
+        {
+            // A recorded body keeps the select it chose for where a bank's
+            // experts lay: the lattice is recorded again over where they
+            // lie now.
+            self.device.synchronize()?;
+            self.cache.forget_bodies();
+            self.arm_bodies()?;
+        }
+        // A set held whole for the load's life is read from the pool alone:
+        // its pinned host copy goes.
+        let held = self.pools.held_weights();
+        if !held.is_empty()
+            && let Some(tier) = self.weights.experts_mut()
+        {
+            self.device.synchronize()?;
+            let freed = tier.release_host(&held);
+            if freed > 0 {
+                self.pools.drop_weight_hosts();
+                eprintln!(
+                    "engine-cuda: the weights the pool holds whole are read from it alone; \
+                     {} MiB of their pinned host copy freed",
+                    freed >> 20
+                );
+            }
+        }
+        Ok(())
     }
 
     /// The row-streamed tables' blocks named a slot, and all of them: the

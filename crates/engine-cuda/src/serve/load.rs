@@ -108,11 +108,16 @@ pub(super) fn bake(boot: &mut Boot<'_>) -> Result<Baked> {
             );
         }
     }
-    // The tables the weight cache streams by their rows keep their copy on
-    // the pinned host tier: a row not cached is read from it in place.
-    let streamed = crate::store::layout::streamed_rows(&boot.trace);
-    if boot.residency.host_rows(&boot.trace, &streamed)? > 0 {
-        boot.deferred_tier = false;
+    // So do the routed banks it streams an expert at a time, where the
+    // load's own weight budget seats no expert itself.
+    if boot.residency.banks().is_empty()
+        && !boot.knobs.diagnostics.dense_weights
+        && !boot.knobs.diagnostics.dense_experts
+    {
+        let banks = crate::store::layout::streamed_experts(&boot.trace);
+        if boot.residency.host_experts(&boot.trace, &banks)? > 0 {
+            boot.deferred_tier = false;
+        }
     }
     boot.slots = poem_compiler::state_slots(boot.slots, &boot.trace, DEFAULT_STATE_SLOTS);
 
@@ -184,6 +189,16 @@ pub(super) fn bake(boot: &mut Boot<'_>) -> Result<Baked> {
     } else {
         std::collections::BTreeMap::new()
     };
+    // The tables the weight cache streams by their rows keep their copy on
+    // the pinned host tier: a row not cached is read from it in place. Told
+    // of the trace as the load runs it: a table whose gather a rewrite
+    // above folded into another op is read whole, and stays on the device.
+    if !boot.knobs.diagnostics.dense_weights {
+        let streamed = crate::store::layout::streamed_rows(&boot.trace);
+        if boot.residency.host_rows(&boot.trace, &streamed)? > 0 {
+            boot.deferred_tier = false;
+        }
+    }
     if boot.knobs.diagnostics.trace_census {
         let mut census: std::collections::BTreeMap<&'static str, usize> =
             std::collections::BTreeMap::new();
@@ -884,6 +899,8 @@ impl Shell {
             arena_bytes,
             boot.knobs.diagnostics.chunk_bytes,
             boot.knobs.diagnostics.packed_pages,
+            boot.residency.cached_experts(),
+            !boot.knobs.diagnostics.dense_weights,
         )?;
         if boot.knobs.diagnostics.arm_trace {
             eprintln!(
@@ -903,6 +920,16 @@ impl Shell {
             })
             .collect();
         pools.seat_rows(&hosts)?;
+        // And each expert shape's, over its banks' host copies.
+        let hosts: Vec<(u32, u64)> = pools
+            .expert_params()
+            .into_iter()
+            .filter_map(|param| match weights.table().0.get(param as usize) {
+                Some(Some(crate::run::WeightRow::Dense(bank))) => Some((param, bank.ptr)),
+                _ => None,
+            })
+            .collect();
+        pools.seat_experts(&hosts)?;
         // Committed whole: a fire reading out past one row a lane (a verify
         // reads every row) would otherwise grow it outside the fit.
         let mut arena = Arena::reserve(arena_bytes);

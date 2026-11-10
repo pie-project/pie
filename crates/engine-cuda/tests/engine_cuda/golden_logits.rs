@@ -246,6 +246,18 @@ fn cache_dir() -> PathBuf {
 }
 
 fn load(fixture: &Fixture, cache: &Path) -> Shell {
+    load_with(fixture, cache, knobs())
+}
+
+/// The model loaded with the weight cache's shapes stated: every atom read
+/// from the host copy until a residency names it a slot.
+fn load_cached(fixture: &Fixture, cache: &Path) -> Shell {
+    let mut knobs = knobs();
+    knobs.diagnostics.dense_weights = false;
+    load_with(fixture, cache, knobs)
+}
+
+fn load_with(fixture: &Fixture, cache: &Path, knobs: engine_cuda::Knobs) -> Shell {
     Shell::load(Boot {
         trace: fixture.trace.clone(),
         contract: &fixture.contract,
@@ -259,7 +271,7 @@ fn load(fixture: &Fixture, cache: &Path) -> Shell {
         kv_budget: None,
         memory_share: engine::load::DEFAULT_DEVICE_MEMORY_SHARE,
         ordinal: 0,
-        knobs: knobs(),
+        knobs,
         cache_dir: Some(cache),
         runahead: engine::runahead::Runahead::F1,
         residency: engine_cuda::experts::Plan::default(),
@@ -282,6 +294,10 @@ fn knobs() -> engine_cuda::Knobs {
         knobs.diagnostics.chunk_bytes = Some(bytes.parse().expect("PIE_GOLDEN_CHUNK is bytes"));
     }
     knobs.diagnostics.packed_pages = std::env::var_os("PIE_GOLDEN_PACKED").is_some();
+    // No weight shape stated: the tables and routed banks dense on the
+    // device, as the base engine seats them. The weight cache's own probes
+    // load with its shapes ([`load_cached`]).
+    knobs.diagnostics.dense_weights = true;
     knobs
 }
 
@@ -1509,7 +1525,12 @@ enum Rows {
 /// the engine's use record counts them.
 fn served_rows(fixture: &Fixture, cache: &Path, rows: Rows) -> (Vec<(u64, u32)>, usize) {
     use engine::chunk::{ResidentWeight, WeightAtom, WeightResidency};
-    let mut shell = load(fixture, cache);
+    // The table's rows alone: the model's routed experts dense, as the
+    // base engine seats them.
+    let mut knobs = knobs();
+    knobs.diagnostics.dense_weights = false;
+    knobs.diagnostics.dense_experts = true;
+    let mut shell = load_with(fixture, cache, knobs);
     let facts = shell.chunk_facts().expect("the pool states its chunks");
     facts.validate().expect("the engine's chunk facts hold");
     let table = facts
@@ -1545,6 +1566,7 @@ fn served_rows(fixture: &Fixture, cache: &Path, rows: Rows) -> (Vec<(u64, u32)>,
             .weight_residency(&WeightResidency {
                 staging: Vec::new(),
                 resident,
+                held: false,
             })
             .expect("the blocks are cached");
     }
@@ -1564,7 +1586,14 @@ fn served_rows(fixture: &Fixture, cache: &Path, rows: Rows) -> (Vec<(u64, u32)>,
         steps.push((hash_logits(&logits), top));
     }
     let uses = shell.weight_uses().expect("the use record reads");
-    let read: u64 = uses.uses.iter().map(|(_, reads)| u64::from(*reads)).sum();
+    // The table's reads and its blocks, apart from any other weight shape's
+    // (a model's routed experts).
+    let of_table: Vec<_> = uses
+        .uses
+        .iter()
+        .filter(|(atom, _)| atom.shape == table.id)
+        .collect();
+    let read: u64 = of_table.iter().map(|(_, reads)| u64::from(*reads)).sum();
     assert_eq!(
         read,
         u64::from(fed),
@@ -1577,14 +1606,14 @@ fn served_rows(fixture: &Fixture, cache: &Path, rows: Rows) -> (Vec<(u64, u32)>,
         Rows::Mixed => table.count.div_ceil(2),
     };
     assert_eq!(
-        uses.held,
-        vec![engine::chunk::WeightHeld {
+        uses.held.iter().find(|held| held.shape == table.id),
+        Some(&engine::chunk::WeightHeld {
             shape: table.id,
             resident: cached,
             host: table.count - cached,
-        }]
+        })
     );
-    (steps, uses.uses.len())
+    (steps, of_table.len())
 }
 
 /// The row-cache probe: `PIE_GOLDEN_MODELS` (the models with a row-streamed
@@ -1666,7 +1695,10 @@ fn golden_rows_resident() {
     for model in models {
         let fixture = fixture(&model, &cache);
         for resident in [false, true, false, true] {
-            let mut shell = load(&fixture, &cache);
+            let mut knobs = knobs();
+            knobs.diagnostics.dense_weights = false;
+            knobs.diagnostics.dense_experts = true;
+            let mut shell = load_with(&fixture, &cache, knobs);
             let facts = shell.chunk_facts().expect("the pool states its chunks");
             let (_, blocks) = shell.row_blocks();
             assert!(blocks > 0, "{model} streams no table by its rows");
@@ -1691,6 +1723,7 @@ fn golden_rows_resident() {
                     .weight_residency(&WeightResidency {
                         staging: Vec::new(),
                         resident: named,
+                        held: false,
                     })
                     .expect("the blocks are cached");
                 assert_eq!(
@@ -1707,6 +1740,181 @@ fn golden_rows_resident() {
                 "decode-time {model} {}: median {median} us, mean {mean} us",
                 if resident { "resident" } else { "host" }
             );
+        }
+    }
+}
+
+/// [`served`] with the model's routed experts laid as `rows` says (every
+/// expert read from the mapped host copy, every one cached in a pool slot,
+/// or every other one): each step's logits. Checks the use record's counts
+/// of where the experts lie.
+fn served_experts(fixture: &Fixture, cache: &Path, rows: Rows) -> Vec<Vec<f32>> {
+    use engine::chunk::{ResidentWeight, WeightAtom, WeightKind, WeightResidency};
+    let mut shell = load_cached(fixture, cache);
+    let facts = shell.chunk_facts().expect("the pool states its chunks");
+    facts.validate().expect("the engine's chunk facts hold");
+    let shapes: Vec<_> = facts
+        .weights
+        .iter()
+        .filter(|shape| shape.kind == WeightKind::Expert)
+        .cloned()
+        .collect();
+    assert!(
+        !shapes.is_empty(),
+        "{} streams no routed expert",
+        fixture.model
+    );
+    let _ = shell.weight_uses().expect("the use record reads");
+    let mut want = Vec::new();
+    let mut resident = Vec::new();
+    // Each shape's slots in chunks of its own, from the second segment on.
+    let mut first = facts.segment_chunks;
+    // A deployment that streams nothing holds every weight shape whole, the
+    // row-streamed tables' too; the other two lay the experts alone.
+    let named: Vec<_> = facts
+        .weights
+        .iter()
+        .filter(|shape| rows == Rows::Cached || shape.kind == WeightKind::Expert)
+        .cloned()
+        .collect();
+    for shape in &named {
+        let cached: Vec<u32> = (0..shape.count)
+            .filter(|atom| match rows {
+                Rows::Host => false,
+                Rows::Cached => true,
+                Rows::Mixed => atom % 2 == 0,
+            })
+            .collect();
+        resident.extend(cached.iter().enumerate().map(|(at, &atom)| ResidentWeight {
+            atom: WeightAtom {
+                shape: shape.id,
+                atom,
+            },
+            slot: first * shape.slots_per_chunk + at as u32,
+        }));
+        first += (cached.len() as u32).div_ceil(shape.slots_per_chunk);
+        if shape.kind == WeightKind::Expert {
+            want.push(engine::chunk::WeightHeld {
+                shape: shape.id,
+                resident: cached.len() as u32,
+                host: shape.count - cached.len() as u32,
+            });
+        }
+    }
+    if !resident.is_empty() {
+        shell
+            .commit_segments(first.div_ceil(facts.segment_chunks))
+            .expect("the experts' segments commit");
+        shell
+            .weight_residency(&WeightResidency {
+                staging: Vec::new(),
+                resident,
+                // A set that holds every expert is a deployment's that
+                // streams nothing.
+                held: rows == Rows::Cached,
+            })
+            .expect("the experts are cached");
+    }
+    shell.open(0).expect("slot 0 opens");
+    let mut fed = 0u32;
+    let mut last = None;
+    let mut steps = Vec::with_capacity(SCRIPT.len());
+    for step in SCRIPT {
+        let tokens: Vec<u32> = match *step {
+            Step::Prefill(rows) => (fed..fed + rows).map(|t| (t * 7 + 11) % 1000).collect(),
+            Step::Decode => vec![last.expect("a decode follows a step")],
+        };
+        fed += u32::try_from(tokens.len()).expect("a count");
+        let logits = fire(&mut shell, &fixture.trace, &tokens);
+        last = Some(argmax(&logits));
+        steps.push(logits);
+    }
+    let uses = shell.weight_uses().expect("the use record reads");
+    let held: Vec<_> = uses
+        .held
+        .iter()
+        .filter(|held| shapes.iter().any(|shape| shape.id == held.shape))
+        .copied()
+        .collect();
+    assert_eq!(
+        held, want,
+        "the record counts the experts by where they lie"
+    );
+    assert!(
+        uses.uses
+            .iter()
+            .any(|(atom, reads)| shapes.iter().any(|s| s.id == atom.shape) && *reads > 0),
+        "the fires read no expert the record counted"
+    );
+    steps
+}
+
+/// The expert-cache probe: `PIE_GOLDEN_MODELS` (the MoE miniatures whose
+/// banks stream; Nemotron's by default) served with every routed expert
+/// cached in the pool, read from the host copy, and half and half. The
+/// cached serving is compared with `PIE_GOLDEN_CHECK` as [`golden_logits`]
+/// is: a load that streams nothing reads the experts as the dense bank's
+/// arm does. The other two are printed against it (a bank with an expert on
+/// the host copy runs its select's plain-load arm), and asserted only where
+/// `PIE_GOLDEN_STRICT` is set.
+#[test]
+#[ignore = "a probe run by hand: see the module's doc"]
+fn golden_experts() {
+    if !engine_cuda::device::present() {
+        eprintln!("skipping: no CUDA device on this machine");
+        return;
+    }
+    let cache = cache_dir();
+    let models = std::env::var("PIE_GOLDEN_MODELS")
+        .map_or_else(|_| vec!["nemotron3-nano-mini".to_string()], |_| models());
+    let want = std::env::var_os("PIE_GOLDEN_CHECK").map(|path| {
+        std::fs::read_to_string(&path)
+            .unwrap_or_else(|why| panic!("{}: {why}", Path::new(&path).display()))
+    });
+    let strict = std::env::var_os("PIE_GOLDEN_STRICT").is_some();
+    for model in models {
+        let fixture = fixture(&model, &cache);
+        // The warming serving: every product's algorithm picked and kept.
+        let _ = served_experts(&fixture, &cache, Rows::Cached);
+        let cached = served_experts(&fixture, &cache, Rows::Cached);
+        let hash = |steps: &[Vec<f32>]| {
+            steps.iter().fold(FNV, |all, logits| {
+                fnv_bytes(all, &hash_logits(logits).to_le_bytes())
+            })
+        };
+        let line = format!("golden {model} all {:016x}", hash(&cached));
+        println!("{line} (Cached)");
+        if let Some(want) = &want {
+            assert!(
+                want.lines().any(|held| held == line),
+                "{model} with every expert cached: the logits moved ({line})"
+            );
+        }
+        for rows in [Rows::Host, Rows::Mixed] {
+            let steps = served_experts(&fixture, &cache, rows);
+            let most = steps
+                .iter()
+                .zip(&cached)
+                .flat_map(|(a, b)| a.iter().zip(b).map(|(a, b)| (a - b).abs()))
+                .fold(0f32, f32::max);
+            let tops = steps
+                .iter()
+                .zip(&cached)
+                .filter(|(a, b)| argmax(a) != argmax(b))
+                .count();
+            println!(
+                "golden {model} all {:016x} ({rows:?}: most |diff| {most:e} from cached, \
+                 {tops} of {} steps' top tokens differ)",
+                hash(&steps),
+                steps.len()
+            );
+            if strict {
+                assert_eq!(
+                    hash(&steps),
+                    hash(&cached),
+                    "{model} with its experts {rows:?}"
+                );
+            }
         }
     }
 }

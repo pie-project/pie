@@ -43,7 +43,18 @@ fn an_exported_kv_stays_mapped() {
     let paging = Paging::of(PAGE, CONTEXT, SLOTS, u64::from(SLOTS * CONTEXT / PAGE))
         .expect("a pool of four full sequences");
     let mut pools = Pools::reserve(
-        0, 0.5, &trace, paging, None, &facts, &budgets, 0, None, false,
+        0,
+        0.5,
+        &trace,
+        paging,
+        None,
+        &facts,
+        &budgets,
+        0,
+        None,
+        false,
+        &[],
+        true,
     )
     .expect("the pool reserves");
     let exported = pools
