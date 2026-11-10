@@ -415,3 +415,10 @@ The `new-memory/` directory is bookkeeping and is removed before anything lands 
   22.84 -> 30.72 (oversized 25M record per 48M chunk, pre-existing), kimik3 Metal 5.61 -> 12.15 (extra open chunk).
 - Engines must set `SlotRole::RsBuffer` on the rs list when building facts from the recipe (BC / BM).
 - Verified: cargo check compiler/runtime/engine/worker after merge; chunk lib + golden tests on the branch.
+
+### Note — 2026-11-10: IT divergence localized (sc/it-rw-bc 5483ae4fe, new-memory/it-divergence/ on that branch)
+- Qwen3.5 48+48: degenerate submits two 1-lane fires, shared submits one 2-lane fire; every lane's verbs equal
+  (ids/tables/fixed differ only). Lane 1 bit-identical, lane 0 ~1 ulp off -> engine batch-composition dependence in
+  the hybrid prefill path, not a runtime/BC addressing bug. L40S asked to confirm and name the kernel arm.
+- Open: the degenerate runtime never co-batches fresh hybrid working sets (Qwen3 does) — explains why the old build
+  never showed this.
