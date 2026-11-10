@@ -326,8 +326,9 @@ impl Shell {
         to: crate::store::Tier,
         pairs: &[(u32, u32)],
     ) -> crate::Result<()> {
+        let swap = (!super::diag::on().tier_inline).then(|| self.device.swap_stream());
         self.pools
-            .copy_tier_slots(self.device.stream(), shape, from, to, pairs)
+            .copy_tier_slots(self.device.stream(), swap, shape, from, to, pairs)
     }
 
     /// Copies whole slots and token runs of a kv shape (`windowed`: the windowed

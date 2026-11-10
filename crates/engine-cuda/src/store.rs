@@ -607,6 +607,9 @@ struct Swap {
     landed: crate::device::graph::Event,
     paged: Vec<u32>,
     host: Vec<u32>,
+    /// It holds slots a fire names by no kv run (a window list's, a
+    /// record's, the rs list's): every fire waits for it.
+    wide: bool,
 }
 
 /// The slot file kv is suspended into below host memory, and the pinned
@@ -1507,6 +1510,8 @@ impl Pools {
             return Ok(());
         }
         let (from, to) = (self.ensure_record(src)?, self.ensure_record(dst)?);
+        // A record moving to or from the host tier lands first.
+        self.fence_all_swaps(stream)?;
         let bytes = self.fixed()?.slot.slot_bytes;
         for (&from, &to) in from.iter().zip(&to) {
             crate::device::copy_d2d(
@@ -1946,6 +1951,8 @@ impl Pools {
 
     /// See `Engine::release_segments`: the activation's span stays.
     pub fn release_segments(&mut self, segments: u32) -> Result<()> {
+        // No move still landing reads or writes a chunk that goes.
+        self.settle_swaps()?;
         self.chunks.release_segments(&mut self.pool, segments)
     }
 
@@ -2910,9 +2917,15 @@ impl Pools {
     /// kv list slot of the slot file. A slot is laid the same on every
     /// tier, so each moves as one span. What goes to disk is written once
     /// the stream has it; what comes from disk is read first.
+    ///
+    /// Between the device and the host tier the copy rides `swap` where one
+    /// is given: behind what `stream` has enqueued (the fires that wrote
+    /// the slots), beside the fires after, of which one that names a slot it
+    /// holds waits for it ([`Pools::fence_swaps`]).
     pub fn copy_tier_slots(
         &mut self,
         stream: *mut core::ffi::c_void,
+        swap: Option<*mut core::ffi::c_void>,
         shape: engine::chunk::ShapeId,
         from: Tier,
         to: Tier,
@@ -2950,8 +2963,7 @@ impl Pools {
                 _ => None,
             })
             .collect();
-        self.seat_pages(kind, device)?;
-        self.fence_all_swaps(stream)?;
+        self.seat_pages(kind, device.iter().copied())?;
         match (from, to) {
             (Tier::Device, Tier::Host) | (Tier::Host, Tier::Device) => {
                 let to_host = to == Tier::Host;
@@ -2966,9 +2978,32 @@ impl Pools {
                         (on_device, on_host, len)
                     });
                 }
-                crate::device::copy_batch(stream, to_host, &spans)
+                let Some(swap) = swap else {
+                    self.fence_all_swaps(stream)?;
+                    return crate::device::copy_batch(stream, to_host, &spans);
+                };
+                // Behind the fires that wrote the slots, and behind every
+                // move before it (the swap stream's own order).
+                let written = crate::device::graph::Event::new()?;
+                written.record(stream)?;
+                written.wait(swap)?;
+                crate::device::copy_batch(swap, to_host, &spans)?;
+                let landed = crate::device::graph::Event::new()?;
+                landed.record(swap)?;
+                self.swaps.push(Swap {
+                    landed,
+                    paged: if kind == Kind::List {
+                        device.iter().map(|&slot| slot as u32).collect()
+                    } else {
+                        Vec::new()
+                    },
+                    host: Vec::new(),
+                    wide: kind != Kind::List,
+                });
+                Ok(())
             }
             (Tier::Device, Tier::Disk) | (Tier::Disk, Tier::Device) => {
+                self.fence_all_swaps(stream)?;
                 let to_disk = to == Tier::Disk;
                 let (device, disk): (Vec<u32>, Vec<u32>) = pairs
                     .iter()
@@ -2980,7 +3015,8 @@ impl Pools {
             }
             (Tier::Host, Tier::Disk) | (Tier::Disk, Tier::Host) => {
                 let to_disk = to == Tier::Disk;
-                // A copy still on the stream may read or write a host slot.
+                // A copy still on a stream may read or write a host slot.
+                self.settle_swaps()?;
                 crate::device::ctx::sync(stream)?;
                 let (host, disk): (Vec<u32>, Vec<u32>) = pairs
                     .iter()
@@ -3252,6 +3288,7 @@ impl Pools {
             landed,
             paged: device.to_vec(),
             host: host.to_vec(),
+            wide: false,
         });
         Ok(())
     }
@@ -3271,6 +3308,7 @@ impl Pools {
             landed,
             paged,
             host,
+            wide: false,
         });
         Ok(())
     }
@@ -3303,9 +3341,17 @@ impl Pools {
                     .iter()
                     .any(|&(first, count)| first <= page && page < first + count)
             });
-            if holds {
+            if holds || swap.wide {
                 swap.landed.wait(stream)?;
             }
+        }
+        Ok(())
+    }
+
+    /// Waits, on the host, for every move still landing.
+    pub fn settle_swaps(&mut self) -> Result<()> {
+        for swap in self.swaps.drain(..) {
+            swap.landed.settle()?;
         }
         Ok(())
     }

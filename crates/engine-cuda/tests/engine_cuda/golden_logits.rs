@@ -372,6 +372,8 @@ fn knobs() -> engine_cuda::Knobs {
     }
     // `PIE_GOLDEN_ONE_WINDOW`: every windowed row in one window list.
     knobs.diagnostics.one_window = std::env::var_os("PIE_GOLDEN_ONE_WINDOW").is_some();
+    // `PIE_GOLDEN_TIER_INLINE`: tier copies ride the compute stream.
+    knobs.diagnostics.tier_inline = std::env::var_os("PIE_GOLDEN_TIER_INLINE").is_some();
     // No weight shape stated: the tables and routed banks dense on the
     // device, as the base engine seats them. The weight cache's own probes
     // load with its shapes ([`load_cached`]).
@@ -801,6 +803,30 @@ fn served_offloaded(fixture: &Fixture, cache: &Path, offload: bool) -> Vec<(u64,
             u32::try_from(tokens.len()).expect("a count"),
             false,
         ));
+        // `PIE_GOLDEN_BULK=<slots>`: before the sixth step, that many kv
+        // slots this lane does not name go out to the host tier, and the
+        // step is timed: beside the move where it rides the swap stream,
+        // behind it where it rides the compute stream.
+        let bulk = std::env::var("PIE_GOLDEN_BULK")
+            .ok()
+            .and_then(|slots| slots.parse::<u32>().ok())
+            .filter(|_| at == 5);
+        if let (Some(slots), Some(shape)) = (bulk, list) {
+            let out: Vec<(u32, u32)> = (0..slots)
+                .map(|_| (refs.take(shape), host.take(&facts, shape)))
+                .collect();
+            let began = std::time::Instant::now();
+            shell
+                .copy_tier_slots(facts.shapes[shape].id, Tier::Device, Tier::Host, &out)
+                .expect("the slots go out");
+            println!(
+                "bulk {}: {slots} slots of {} bytes enqueued in {:.1} ms",
+                fixture.model,
+                facts.shapes[shape].slot_bytes,
+                began.elapsed().as_secs_f64() * 1e3
+            );
+        }
+        let fired = std::time::Instant::now();
         let seated = Seated {
             pages: &pages,
             held: Some(fed),
@@ -815,6 +841,13 @@ fn served_offloaded(fixture: &Fixture, cache: &Path, offload: bool) -> Vec<(u64,
         let mut rows = shell
             .fire_media(&[seated], &[], &[])
             .expect("the step fires");
+        if bulk.is_some() {
+            println!(
+                "bulk {}: the step beside it took {:.1} ms",
+                fixture.model,
+                fired.elapsed().as_secs_f64() * 1e3
+            );
+        }
         let logits = rows.swap_remove(0);
         fed = after;
         if let Some(retained) = window_list.and_then(|shape| facts.shapes[shape].kind.window()) {
