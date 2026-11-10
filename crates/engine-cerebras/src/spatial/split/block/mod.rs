@@ -22,7 +22,9 @@ pub mod band;
 pub mod gdn;
 pub mod head;
 pub mod moe;
+pub mod ple;
 pub mod segments;
+pub mod shared_kv;
 pub mod token_loop;
 pub mod units;
 
@@ -37,6 +39,12 @@ pub trait Block: Send + Sync {
 
     /// Lays this block's links.
     fn wire(&self, _plan: &Plan, _floor: &Floor, _w: &mut Wiring) -> R<()> {
+        Ok(())
+    }
+
+    /// Refines the floor once every link is laid (a block whose PEs are wherever links cross:
+    /// Gemma's route-only PEs).
+    fn settle(&self, _plan: &Plan, _w: &Wiring, _floor: &mut Floor) -> R<()> {
         Ok(())
     }
 

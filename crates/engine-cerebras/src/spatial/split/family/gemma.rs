@@ -1,44 +1,34 @@
-//! Gemma 4 E2B / E4B: explicit unit origins in unit columns, the PLE storage blocks above each
-//! unit column (token word `TB`, per-column bus `PB`, store PEs' levels), the shared-KV line
-//! (`KVS`) from the KV source unit to its sharers, handoffs of 2 Hc + 1 words, the sliding /
-//! global KV entries (`NES` / `NEG`) and the KV rows (`PYW`: E4B keeps KV on 128 of 160 rows so
-//! the 512 window is an exact ring).
-//!
-//! Kernels: `weight_gemma.csl` (18 route slots), `ctl_cx_gemma.csl`, `ctl_cy_gemma.csl`,
-//! `head_pe.csl`, `head_ctl_gemma.csl`, `ple_gemma.csl` (the store kernel: storage PEs and the
-//! route-only PEs).
+//! Gemma 4 E2B / E4B: units at explicit origins in two unit columns (the arrangement a unit
+//! shape names), the scores segments a half row, the PLE storage above each unit column
+//! ([`Ple`]), the shared-KV line from the KV source unit to its sharers ([`SharedKv`]), the head
+//! east of the units and the token loop. The sliding / global KV entries (`NES` / `NEG`) and the
+//! KV rows (`PYW`: E4B keeps KV on 128 of 160 rows so the 512 window is an exact ring) are in the
+//! plan. Kernels: [`gemma`].
 
 use std::collections::BTreeMap;
 
-use crate::spatial::split::abi::{KernelBuild, Kernels, Overrides};
-use crate::spatial::split::block::head::{HeadCopies, Hemb};
-use crate::spatial::split::block::units::UnitCopies;
-use crate::spatial::split::block::{self, Block, Legacy, Whole, head, segments, token_loop, units};
+use crate::spatial::split::abi::Kernels;
+use crate::spatial::split::block::Block;
+use crate::spatial::split::block::head::{HeadCopies, HeadEast, Hemb};
+use crate::spatial::split::block::ple::{Ple, PleColumn};
+use crate::spatial::split::block::segments::Scores;
+use crate::spatial::split::block::shared_kv::SharedKv;
+use crate::spatial::split::block::token_loop::TokenLoop;
+use crate::spatial::split::block::units::{UnitCopies, Units};
 use crate::spatial::split::emit::meta::Meta;
-use crate::spatial::split::fabric::{Colour, Palette};
 use crate::spatial::split::family::Family;
-use crate::spatial::split::floor::{
-    Coord, CtlLine, Dir, Floor, FloorBuilder, Rect, StoreBlock, Unit, UnitGrid, UnitLayout, skip,
-};
-use crate::spatial::split::kernels::Pe;
-use crate::spatial::split::kernels::common::{self as abi, CT5, CT6, CxIo, HeadIo};
+use crate::spatial::split::floor::{UnitGrid, UnitLayout};
+use crate::spatial::split::kernels::gemma;
 use crate::spatial::split::plan::{
     Act, AttnSpec, Contract, FamilyId, HeadPartition, HeadSpec, KvEntries, LayerKind, MlpSpec,
     NormSpec, Partition, Plan, PleSpec, ReduceGroups, RopeSpec, RowRun, Segments, Shape,
 };
 use crate::spatial::split::program::Program;
-use crate::spatial::split::role::{Kind, PeRole, Place};
-use crate::spatial::split::weights::{Binding, Copies, Slice, Transform, chunks, from};
-use crate::spatial::split::wiring::{self, Class, Link, Port, Turn, Wiring};
+use crate::spatial::split::weights::{Slice, Transform, from};
+
+type R<T> = Result<T, String>;
 
 pub struct Gemma;
-
-/// The PLE storage PEs and the route-only PEs west of the head (`ple_gemma.csl`).
-pub const STORE: Kind = Kind::new("ple", "ple");
-
-/// The PLE token word along each storage row, the shared-KV line.
-pub const PLE_TOKEN: Class = Class::new("TB");
-pub const SHARED_KV: Class = Class::new("KVS");
 
 // ------------------------------------------------------------------ arrangements
 
@@ -133,7 +123,7 @@ const ARRANGEMENTS: &[((u32, u32, u32), Arrangement)] = &[
 ];
 
 impl Arrangement {
-    fn of(plan: &Plan) -> Result<&'static Arrangement, String> {
+    fn of(plan: &Plan) -> R<&'static Arrangement> {
         let p = &plan.partition;
         let key = (p.cols, p.rows, p.units);
         ARRANGEMENTS
@@ -149,7 +139,7 @@ impl Arrangement {
     }
 
     /// Unit origins in unit order, for units of `uw` x `uh` PEs.
-    fn origins(&self, uw: u32, uh: u32) -> Result<Vec<(u32, u32)>, String> {
+    fn origins(&self, uw: u32, uh: u32) -> R<Vec<(u32, u32)>> {
         let n = self.a_units.len() + self.b_units.len();
         let mut o = vec![None; n];
         let mut ya = BTreeMap::new();
@@ -253,75 +243,16 @@ pub fn geometry(name: &str) -> Result<serde_json::Value, String> {
     }))
 }
 
-// ------------------------------------------------------------------ the plan's Gemma facts
+impl Family for Gemma {
+    fn id(&self) -> FamilyId {
+        FamilyId::Gemma
+    }
 
-/// The KV-sharing units: the source unit (its CY row sends KVS) and the sharers (units whose
-/// layers read another layer's KV).
-fn kv_units(plan: &Plan) -> (Option<u32>, Vec<u32>) {
-    let k = plan.partition.layers_per_unit;
-    let layers = &plan.shape.layers;
-    let dst: Vec<u32> = (0..plan.partition.units)
-        .filter(|&u| matches!(layers[(u * k) as usize], LayerKind::SharedKv { .. }))
-        .collect();
-    let src = layers.iter().find_map(|l| match *l {
-        LayerKind::SharedKv { from, .. } => Some(from / k),
-        _ => None,
-    });
-    (src, dst)
-}
-
-/// Handoff words: x | the pending term p | its row's |h|^2.
-fn hand_n(plan: &Plan) -> u32 {
-    2 * plan.partition.row_dims[0].dims + 1
-}
-
-/// Store bus words of a column of `units` units.
-fn levels(plan: &Plan, units: usize) -> u32 {
-    plan.partition.layers_per_unit * units as u32
-}
-
-/// The largest staged PLE file (`prep_gemma.py`'s `MAXB`).
-const PLE_FILE_MAX: u64 = 1900 * 1024 * 1024;
-
-/// A storage block's staged files `pt<col>_<n>`: their row ranges (`prep_gemma.py`'s split).
-fn ple_files(rows: u32, px: u32, tokens: u32, lv: u32) -> Vec<(u32, u32)> {
-    let per = (PLE_FILE_MAX / (px as u64 * tokens as u64 * lv as u64 * 2)).max(1) as u32;
-    (0..rows)
-        .step_by(per as usize)
-        .map(|r0| (r0, (r0 + per).min(rows)))
-        .collect()
-}
-
-fn unit_containing(floor: &Floor, c: Coord) -> Option<&Unit> {
-    floor.units.iter().find(|u| u.rect.contains(c))
-}
-
-/// The store block a PE of the storage area belongs to (its index is its bus).
-fn store_of(floor: &Floor, c: Coord) -> Option<usize> {
-    floor.stores.iter().position(|s| s.rect.contains(c))
-}
-
-/// The store column serving unit `u`: (its index, the unit's place top to bottom, bus words).
-fn column_of(floor: &Floor, plan: &Plan, u: u32) -> Option<(usize, u32, u32)> {
-    floor.stores.iter().enumerate().find_map(|(i, s)| {
-        s.units
-            .iter()
-            .position(|&v| v == u)
-            .map(|ui| (i, ui as u32, levels(plan, s.units.len())))
-    })
-}
-
-/// The PLE bus down storage column `i`'s unit column (`PB`).
-fn bus(i: usize) -> Class {
-    Class::at("PB", i as u8)
-}
-
-impl Gemma {
     /// From `prep_gemma.py`'s meta: units of K layers (S .. S G, KM's bits the global layers),
     /// units at or past NO the shared-KV units (their layers read unit NO - 1's last layer of the
     /// same kind); the sliding window NES PYW exactly (WIN 0) or WIN with every row a KV row.
     /// `geo` (the arrangement's name) only picks the reduction groups' defaults, as before.
-    fn plan(&self, meta: &Meta) -> Result<Plan, String> {
+    fn plan(&self, meta: &Meta) -> R<Plan> {
         let px = meta.need("PX")?;
         let py = meta.need("PY")?;
         let hcc = meta.need("Hc")?;
@@ -454,758 +385,77 @@ impl Gemma {
         })
     }
 
-    /// The arrangement's units, the head east of them (HC + 1 columns, HR rows), the storage
-    /// blocks above each unit column; every non-unit PE west of the head that a route crosses
-    /// runs the store kernel with no storage (`pass_pes`), the rest are idle.
-    fn floor(&self, plan: &Plan) -> Result<Floor, String> {
+    /// The arrangement's units, the scores segments a half row, the PLE storage of each unit
+    /// column, the shared-KV line, the head east of the units (fed the embedding inline), the
+    /// token loop.
+    fn blocks(&self, plan: &Plan) -> R<Vec<Box<dyn Block>>> {
         let arr = Arrangement::of(plan)?;
         let p = &plan.partition;
         let (px, py) = (p.cols, p.rows);
-        let (uw, uh) = (px + 1, py + 1);
-        let (xc, yc) = (px / 2, py / 2);
-        let origins = arr.origins(uw, uh)?;
-        let (hc, hr) = (p.head.cols, p.head.rows);
-        let grid = UnitGrid {
-            cols: px,
-            rows: py,
-            cx: xc,
-            cy: yc,
-            layout: UnitLayout::Explicit {
-                origins: origins.clone(),
-            },
-            layers_per_unit: p.layers_per_unit,
-        };
-        let mut fb = FloorBuilder::units(&grid, (0, 0))?;
-        let hx0 = fb.w;
-        let head = fb.head_east(hx0, hc, hr, true);
-        // the storage blocks, directly above each column's top unit
-        for (x, units, st) in arr.columns(uw) {
-            let top = origins[units[0] as usize].1;
-            let y0 = top
-                .checked_sub(st.rows)
-                .ok_or("split gemma: the storage runs off the wafer's top")?;
-            let rect = Rect {
-                x,
-                y: y0,
-                w: uw,
-                h: st.rows,
-            };
-            let lv = levels(plan, units.len());
-            for y in y0..top {
-                for lx in 0..uw {
-                    let store = if lx == xc {
-                        // the block's CX column: routes only
-                        PASS_PE
-                    } else {
-                        Place::Store {
-                            first: (y - y0) * st.tokens,
-                            count: st.tokens,
-                            level: lv,
-                            top: y == y0,
-                        }
-                    };
-                    fb.set_role(Coord::new(x + lx, y), PeRole::new(STORE, store));
-                }
-            }
-            fb.stores.push(StoreBlock {
-                rect,
-                units,
-                tokens_per_pe: st.tokens,
-            });
-        }
-        let mut floor = fb.finish(head);
-        // the route-only PEs: non-unit, non-storage PEs west of the head a link crosses
-        let wiring = self.wire(plan, &floor)?;
-        for c in touched(&wiring) {
-            if c.x < hx0
-                && floor.roles.get(c).is_idle()
-                && unit_containing(&floor, c).is_none()
-                && store_of(&floor, c).is_none()
-            {
-                *floor.roles.get_mut(c) = PeRole::new(STORE, PASS_PE);
-            }
-        }
-        Ok(floor)
-    }
-
-    /// The generic unit wiring (chains, loop-backs, handoffs, the head rows, the token loop and
-    /// the embedding's return), the scores segments on every weight row, the head input from the
-    /// last unit, then Gemma's own: the PLE token word (TB) along each storage row, the PLE bus (PB)
-    /// down each weight column of a unit column, the shared-KV line (KVS) north from the source
-    /// unit's CY row through its sharers.
-    fn wire(&self, plan: &Plan, floor: &Floor) -> Result<Wiring, String> {
-        let mut w = Wiring::default();
-        block::standard_units(plan, floor, &mut w)?;
-        let p = &plan.partition;
-        for unit in &floor.units {
-            for r in 0..p.rows {
-                let pts: Vec<Coord> = (0..p.cols)
-                    .map(|c| Coord::new(unit.col_x(c), unit.row_y(r)))
-                    .collect();
-                wiring::segments(
-                    &pts,
-                    p.segments.scores,
-                    true,
-                    (segments::SCORE_L1, segments::SCORE_CAST, segments::SEGMENT),
-                    &mut w,
-                )?;
-            }
-        }
-        head::head_input(plan, floor, &mut w)?;
-        ple_token(floor, &mut w)?;
-        ple_bus(plan, floor, &mut w)?;
-        shared_kv(plan, floor, &mut w)?;
-        Ok(w)
-    }
-
-    /// The base colours, the PLE token word (`TB`), the shared-KV line (`KVS`) and the
-    /// arrangement's PLE buses.
-    fn palette(&self, plan: &Plan) -> Palette {
-        let mut own = vec![(PLE_TOKEN, 0), (SHARED_KV, 10)];
-        if let Ok(arr) = Arrangement::of(plan) {
-            own.extend(
-                arr.stores
-                    .iter()
-                    .enumerate()
-                    .map(|(i, st)| (bus(i), st.bus)),
-            );
-        }
-        block::standard_palette(&own)
-    }
-
-    /// `mkfull_gemma.py`'s kernels: each kind's source, the symbols it owns, its tile-code params
-    /// as the plan states them, plus the lever defaults (`PD`). `SH` and `Ic` are the KV-owning
-    /// units'; the KV-sharing units' (SH 1, their wider MLP) and the route-only store PEs' NTW 1
-    /// follow from their roles ([`crate::spatial::split::block::legacy_overrides`]).
-    fn kinds(&self, prog: &Program) -> Result<BTreeMap<Kind, KernelBuild>, String> {
-        let plan = &prog.plan;
-        let p = &plan.partition;
-        let s = &plan.shape;
-        let k = p.layers_per_unit;
-        let km: u32 = (0..k)
-            .filter(|&l| matches!(s.layers[l as usize], LayerKind::Global))
-            .map(|l| 1 << l)
-            .sum();
-        let hcc = p.row_dims[0].dims;
-        let qh = s.attn.q_heads / 2;
-        let dcs = s.attn.head_dim / (p.cols / 2);
-        let hdg = s.attn.global_head_dim.unwrap_or(s.attn.head_dim);
-        let dcg = hdg / (p.cols / 2);
-        let ic = s.mlp.intermediate / p.cols;
-        let window = s
-            .layers
-            .iter()
-            .find_map(|l| match *l {
-                LayerKind::Sliding { window } => Some(window),
-                _ => None,
-            })
-            .unwrap_or(0);
-        let nes = p.kv_entries.sliding.unwrap_or(0);
-        let win = if nes * p.kv_rows == window { 0 } else { window };
-        let neg = p.kv_entries.global.unwrap_or(0);
-        let ntw = prog
-            .floor
-            .stores
-            .iter()
-            .map(|st| st.tokens_per_pe * levels(plan, st.units.len()))
-            .max()
-            .unwrap_or(0);
-        let mut out = BTreeMap::new();
-        out.insert(
-            Kind::WEIGHT,
-            KernelBuild::ints(
-                "weight_gemma.csl",
-                &["w", "rcfg", "tdbg", "kvlog"],
-                &[
-                    ("K", k),
-                    ("Hc", hcc),
-                    ("Ic", ic),
-                    ("MV", 1),
-                    ("KM", km),
-                    ("SH", 0),
-                    ("Qh", qh),
-                    ("DcS", dcs),
-                    ("DcG", dcg),
-                    ("NES", nes),
-                    ("NEG", neg),
-                    ("PYW", p.kv_rows),
-                    ("HDS", s.attn.head_dim),
-                    ("HDG", hdg),
-                    ("WIN", win),
-                    ("WSPEC", 0),
-                    ("PLOG", 0),
-                    ("DIAG", 0),
-                    ("FIFOW", 32),
-                    ("ATTL", 2),
-                    ("TSTAMP", 0),
-                ],
-            ),
-        );
-        out.insert(
-            Kind::CX,
-            KernelBuild::ints(
-                "ctl_cx_gemma.csl",
-                &["x", "gam", "rcfg", "xdbg", "tdbg", "xred"],
-                &[
-                    ("K", k),
-                    ("Hc", hcc),
-                    ("DIAG", 0),
-                    ("FIFOW", 32),
-                    ("XKEEP", 0),
-                ],
-            ),
-        );
-        out.insert(
-            Kind::CY,
-            KernelBuild::ints(
-                "ctl_cy_gemma.csl",
-                &["qkw", "rot", "tab", "pl", "plog", "rcfg", "tdbg"],
-                &[
-                    ("K", k),
-                    ("KM", km),
-                    ("SH", 0),
-                    ("Qh", qh),
-                    ("DcS", dcs),
-                    ("DcG", dcg),
-                    ("Ic", ic),
-                    ("HR", s.hidden),
-                    ("DIAG", 0),
-                    ("FIFOW", 32),
-                    ("ATTL", 2),
-                    ("TSTAMP", 0),
-                    ("HDS", s.attn.head_dim),
-                    ("HDG", hdg),
-                    ("PLOG", 0),
-                ],
-            ),
-        );
-        out.insert(
-            Kind::HEAD,
-            KernelBuild::ints(
-                "head_pe.csl",
-                &["hw", "hg", "rcfg", "hemb", "tdbg"],
-                &[
-                    ("VR", p.head.vocab_rows),
-                    ("HDc", 2 * hcc),
-                    ("NPX", 1),
-                    ("HACC16", 0),
-                ],
-            ),
-        );
-        out.insert(
-            Kind::HEAD_CTL,
-            KernelBuild::ints(
-                "head_ctl_gemma.csl",
-                &[
-                    "res", "rcfg", "tdbg", "ring", "lgt", "force", "nforce", "tin",
-                ],
-                &[
-                    ("VR", p.head.vocab_rows),
-                    ("FIFOW", 32),
-                    ("WFORCE", 0),
-                    ("WFN", p.head.rows),
-                ],
-            ),
-        );
-        out.insert(
-            STORE,
-            KernelBuild::ints(
-                "ple_gemma.csl",
-                &["ptab", "rcfg", "psend"],
-                &[("NTW", ntw), ("DLY", 1500)],
-            ),
-        );
-        Ok(out)
-    }
-
-    /// The placement, in order: per unit its four weight quadrants (rcfg, then the
-    /// weights in blocks of 16 rows), its CX halves (rcfg, gammas), its CY halves (rcfg, q / k
-    /// norm weights, RoPE tables); the PLE storage per column and staged file (rcfg, then the
-    /// tiles padded to NTW words, in blocks of 16 rows) and the route-only PEs' rcfg by row runs;
-    /// the head halves in blocks of 64 rows (rcfg, hw, hg, hemb); the head control column's rcfg.
-    fn bindings(&self, prog: &Program) -> Result<Vec<Binding>, String> {
-        let plan = &prog.plan;
-        let floor = &prog.floor;
-        let p = &plan.partition;
-        let (px, xc) = (p.cols, p.cols / 2);
-        let mut out = Copies::default();
-        let units = UnitCopies {
-            cols: px,
-            rows: p.rows,
-            w_from: Vec::new(),
-            gam_b16: false,
-            gam_from: Vec::new(),
-            cy: &[("qkw", true), ("rot", false)],
-            cy_optional: false,
-        };
-        for unit in &floor.units {
-            units.put(&mut out, unit);
-        }
-        // PLE storage, the tiles padded to NTW words
-        let ntw = floor
-            .stores
-            .iter()
-            .map(|st| st.tokens_per_pe * levels(plan, st.units.len()))
-            .max()
-            .unwrap_or(0);
-        for (ci, st) in floor.stores.iter().enumerate() {
-            let lv = levels(plan, st.units.len());
-            let files = ple_files(st.rect.h, px, st.tokens_per_pe, lv);
-            for (n, (fr0, fr1)) in files.into_iter().enumerate() {
-                for (c0, c1) in [(0, xc), (xc, px)] {
-                    for (rb, re) in chunks(fr0, fr1, 16) {
-                        let rect =
-                            Rect::new(st.rect.x + skip(c0, xc), st.rect.y + rb, c1 - c0, re - rb);
-                        out.rcfg(rect);
-                        let dims = vec![(rb - fr0, re - fr0), (c0, c1)];
-                        out.slice(
-                            "ptab",
-                            rect,
-                            Slice::of(&format!("pt{ci}_{n}"), None, dims).pad_to(ntw),
-                            true,
-                            from("embed_tokens_per_layer, per_layer_model_projection"),
-                        );
-                    }
-                }
-            }
-        }
-        // the route-only store PEs (storage blocks' CX columns, the pass PEs), by row runs
-        let mut rows: BTreeMap<u32, Vec<u32>> = BTreeMap::new();
-        for (c, r) in floor.roles.iter() {
-            if r.kind == STORE && matches!(r.place, Place::Store { count: 0, .. }) {
-                rows.entry(c.y).or_default().push(c.x);
-            }
-        }
-        for (y, mut xs) in rows {
-            xs.sort_unstable();
-            for run in xs.chunk_by(|a, b| b == &(a + 1)) {
-                out.rcfg(Rect::new(run[0], y, run.len() as u32, 1));
-            }
-        }
-        let hr = p.head.rows;
-        HeadCopies {
-            cols: p.head.cols,
-            rows: hr,
-            hw: |_, rows, cols| Slice::of("hw", None, vec![rows, cols]),
-            hw_from: vec![(
-                "embed_tokens".into(),
-                vec![Transform::PadLastRow {
-                    to: hr * p.head.vocab_rows,
-                }],
-            )],
-            hg_from: from("norm"),
-            hemb: Hemb::Inline(Vec::new()),
-        }
-        .put(&mut out, floor.head.rect.x);
-        Ok(out.0)
-    }
-}
-
-// ------------------------------------------------------------------ Gemma's links
-
-/// Every PE a link crosses.
-fn touched(w: &Wiring) -> Vec<Coord> {
-    let mut out = Vec::new();
-    for l in &w.links {
-        match l {
-            Link::Chain(c) => out.extend_from_slice(&c.pts),
-            Link::Multicast(m) => out.extend_from_slice(&m.pts),
-            Link::Path(p) => out.extend_from_slice(&p.pts),
-            Link::Turn(t) => out.push(t.at),
-        }
-    }
-    out
-}
-
-fn turn(w: &mut Wiring, at: Coord, class: Class, from: Port, to: Vec<Port>) {
-    w.turn(Turn {
-        at,
-        class,
-        from,
-        to,
-    });
-}
-
-/// TB: one stream a storage row, west from the head control column to the westmost storage block
-/// on the row; every storage PE (not a block's CX column) takes a copy.
-fn ple_token(floor: &Floor, w: &mut Wiring) -> Result<(), String> {
-    let CtlLine::Column(ctl) = floor.head.ctl else {
-        return Err("split gemma: no head control column".into());
-    };
-    let mut rows: BTreeMap<u32, Vec<&StoreBlock>> = BTreeMap::new();
-    for st in &floor.stores {
-        for y in st.rect.y..st.rect.y + st.rect.h {
-            rows.entry(y).or_default().push(st);
-        }
-    }
-    for (y, blocks) in rows {
-        let xw = blocks.iter().map(|b| b.rect.x).min().unwrap_or(0);
-        let xs: Vec<u32> = (xw..=ctl).rev().collect();
-        for (i, &x) in xs.iter().enumerate() {
-            let from = if i == 0 {
-                Port::Ramp
-            } else {
-                Port::Dir(Dir::E)
-            };
-            let mut to = Vec::new();
-            if i + 1 < xs.len() {
-                to.push(Port::Dir(Dir::W));
-            }
-            let takes = x < floor.head.rect.x
-                && blocks.iter().any(|b| {
-                    let cx = b.rect.x + floor_xc(floor);
-                    b.rect.x <= x && x < b.rect.x + b.rect.w && x != cx
-                });
-            if takes {
-                to.push(Port::Ramp);
-            }
-            turn(w, Coord::new(x, y), PLE_TOKEN, from, to);
-        }
-    }
-    Ok(())
-}
-
-/// The units' CX column (local x), the same in every unit.
-fn floor_xc(floor: &Floor) -> u32 {
-    floor.units.first().map_or(0, |u| u.cx)
-}
-
-/// PB: a bus a unit column, down each weight column from the storage block through the column's
-/// units (and the gaps between them); each unit's CY PE takes a copy, the last unit's ends it.
-fn ple_bus(plan: &Plan, floor: &Floor, w: &mut Wiring) -> Result<(), String> {
-    let p = &plan.partition;
-    for (i, st) in floor.stores.iter().enumerate() {
-        let units: Vec<&Unit> =
-            st.units
-                .iter()
-                .map(|&u| {
-                    floor.units.iter().find(|v| v.index == u).ok_or_else(|| {
-                        format!("split gemma: store column unit {u} not on the floor")
+        let (hr, vr) = (p.head.rows, p.head.vocab_rows);
+        Ok(vec![
+            Box::new(Units {
+                grid: UnitGrid {
+                    cols: px,
+                    rows: py,
+                    cx: px / 2,
+                    cy: py / 2,
+                    layout: UnitLayout::Explicit {
+                        origins: arr.origins(px + 1, py + 1)?,
+                    },
+                    layers_per_unit: p.layers_per_unit,
+                },
+                copies: UnitCopies {
+                    cols: px,
+                    rows: py,
+                    w_from: Vec::new(),
+                    gam_b16: false,
+                    gam_from: Vec::new(),
+                    cy: &[("qkw", true), ("rot", false)],
+                    cy_optional: false,
+                },
+            }),
+            Box::new(Scores {
+                width: p.segments.scores,
+            }),
+            Box::new(Ple {
+                columns: arr
+                    .columns(px + 1)
+                    .into_iter()
+                    .map(|(_, units, st)| PleColumn {
+                        units,
+                        rows: st.rows,
+                        tokens: st.tokens,
+                        bus: st.bus,
                     })
-                })
-                .collect::<Result<_, _>>()?;
-        let (y0, y1) = (st.rect.y, st.rect.y + st.rect.h);
-        if units.first().map(|u| u.rect.y) != Some(y1) {
-            return Err(
-                "split gemma: the storage sits directly above the column's top unit".into(),
-            );
-        }
-        for c in 0..p.cols {
-            let x = st.rect.x + skip(c, floor_xc(floor));
-            for y in y0..y1 {
-                let from = if y == y0 {
-                    Port::Ramp
-                } else {
-                    Port::Dir(Dir::N)
-                };
-                turn(w, Coord::new(x, y), bus(i), from, vec![Port::Dir(Dir::S)]);
-            }
-            let mut prev_end = y1;
-            for (ui, unit) in units.iter().enumerate() {
-                let uy = unit.rect.y;
-                let lastu = ui + 1 == units.len();
-                for y in prev_end..uy {
-                    turn(
-                        w,
-                        Coord::new(x, y),
-                        bus(i),
-                        Port::Dir(Dir::N),
-                        vec![Port::Dir(Dir::S)],
-                    );
-                }
-                prev_end = uy + unit.rect.h;
-                for ly in 0..unit.rect.h {
-                    let at = Coord::new(x, uy + ly);
-                    if ly == unit.cy {
-                        let mut to = vec![Port::Ramp];
-                        if !lastu {
-                            to.push(Port::Dir(Dir::S));
-                        }
-                        turn(w, at, bus(i), Port::Dir(Dir::N), to);
-                        if lastu {
-                            break;
-                        }
-                    } else {
-                        turn(w, at, bus(i), Port::Dir(Dir::N), vec![Port::Dir(Dir::S)]);
-                    }
-                }
-            }
-        }
-    }
-    Ok(())
-}
-
-/// KVS: the source unit's CY row north through the sharer units above it in its column (sharer
-/// weight PEs take a copy; the source's weight PEs and the sharers' CY PEs pass it).
-fn shared_kv(plan: &Plan, floor: &Floor, w: &mut Wiring) -> Result<(), String> {
-    let (Some(src), dst) = kv_units(plan) else {
-        return Ok(());
-    };
-    let unit = |u: u32| {
-        floor
-            .units
-            .iter()
-            .find(|v| v.index == u)
-            .ok_or_else(|| format!("split gemma: KV unit {u} not on the floor"))
-    };
-    let s = unit(src)?;
-    let mut ytop = u32::MAX;
-    for &u in &dst {
-        let d = unit(u)?;
-        if d.rect.x != s.rect.x || d.rect.y >= s.rect.y {
-            return Err("split gemma: the KVS consumers sit above the source in its column".into());
-        }
-        ytop = ytop.min(d.rect.y);
-    }
-    if dst.is_empty() {
-        return Ok(());
-    }
-    for c in 0..plan.partition.cols {
-        let x = s.col_x(c);
-        let ysrc = s.cy_y();
-        turn(
-            w,
-            Coord::new(x, ysrc),
-            SHARED_KV,
-            Port::Ramp,
-            vec![Port::Dir(Dir::N)],
-        );
-        for y in (ytop..ysrc).rev() {
-            let at = Coord::new(x, y);
-            let u = unit_containing(floor, at)
-                .ok_or_else(|| format!("split gemma: KVS crosses a gap at ({x}, {y})"))?;
-            let take = dst.contains(&u.index) && y - u.rect.y != u.cy;
-            let mut to = Vec::new();
-            if take {
-                to.push(Port::Ramp);
-            }
-            if y > ytop {
-                to.push(Port::Dir(Dir::N));
-            }
-            turn(w, at, SHARED_KV, Port::Dir(Dir::S), to);
-        }
-    }
-    Ok(())
-}
-
-// ------------------------------------------------------------------ rcfg
-
-impl Gemma {
-    fn route_slots(kind: Kind) -> usize {
-        match kind {
-            Kind::WEIGHT => 18,
-            STORE => 8,
-            Kind::RELAY => 4,
-            _ => 12,
-        }
+                    .collect(),
+            }),
+            Box::new(SharedKv),
+            Box::new(HeadEast {
+                cols: p.head.cols,
+                rows: hr,
+                token_loop: true,
+                copies: HeadCopies {
+                    cols: p.head.cols,
+                    rows: hr,
+                    hw: |_, rows, cols| Slice::of("hw", None, vec![rows, cols]),
+                    hw_from: vec![(
+                        "embed_tokens".into(),
+                        vec![Transform::PadLastRow { to: hr * vr }],
+                    )],
+                    hg_from: from("norm"),
+                    hemb: Hemb::Inline(Vec::new()),
+                },
+            }),
+            Box::new(TokenLoop),
+        ])
     }
 
-    /// The shared words ([`abi`]) with Gemma's: a weight PE's flags (column 0 sends the deferred
-    /// scalar 1, a KVS consumer 2, the flush unit 4) and the KVS colour; the last CX's flush
-    /// flags (8 | 16); a CY's PLE flags (on a bus 1, the KVS source 2, the flush unit 4), its bus
-    /// colour, place in its column, bus words, the KVS colour; a head control row's PLE token
-    /// flag and the TB colour; the store PEs.
-    fn rcfg(&self, prog: &Program, at: Coord) -> Result<Vec<u32>, String> {
-        let plan = &prog.plan;
-        let pe = Pe::new(prog, at);
-        let last = plan.partition.units - 1;
-        let kvs = pe.c(SHARED_KV)?;
-        match prog.floor.roles.get(at).place {
-            Place::Weight { unit, row, col } => {
-                let fl = u32::from(col == 0)
-                    | if kv_units(plan).1.contains(&unit) {
-                        2
-                    } else {
-                        0
-                    }
-                    | if unit == last { 4 } else { 0 };
-                let relays = [pe.turn(units::RELAY_PRE), pe.turn(units::RELAY_POST)];
-                abi::weight(&pe, 18, row, [fl, kvs], hand_n(plan), relays)
-            }
-            Place::Cx {
-                first,
-                last: is_last,
-                ..
-            } => {
-                let x = CxIo {
-                    first,
-                    inn: pe.colour(units::X_IN),
-                    out: pe.colour(units::X_OUT),
-                    emb: pe.colour(token_loop::EMB_IN),
-                    flags: if is_last { 8 | 16 } else { 0 },
-                    ..CxIo::default()
-                };
-                abi::cx(&pe, x, 3, &CT5)
-            }
-            Place::Cy { unit, .. } => {
-                let mut w = abi::cy(&pe, None)?;
-                let col = column_of(&prog.floor, plan, unit);
-                let fl = u32::from(col.is_some())
-                    | if kv_units(plan).0 == Some(unit) { 2 } else { 0 }
-                    | if unit == last { 4 } else { 0 };
-                let (pb, ui, lv) = match col {
-                    Some((i, ui, lv)) => (pe.c(bus(i))?, ui, lv),
-                    None => (0, 0, 0),
-                };
-                w.extend_from_slice(&[fl, pb, ui, lv, kvs]);
-                Ok(w)
-            }
-            Place::Head { col: c, .. } => {
-                let (u0, ul) = match (prog.floor.units.first(), prog.floor.units.last()) {
-                    (Some(a), Some(b)) => (a, b),
-                    _ => return Err("split gemma: no units".into()),
-                };
-                let xr = if at.y == ul.row_y(2 * c) {
-                    2
-                } else if at.y == ul.row_y(2 * c + 1) {
-                    1
-                } else {
-                    0
-                };
-                let tr = u32::from(at.y == 0)
-                    | if at.y == u0.row_y(2 * c) { 2 } else { 0 }
-                    | if at.y == u0.row_y(2 * c + 1) { 4 } else { 0 };
-                let h = HeadIo {
-                    row: at.y,
-                    role: xr,
-                    relay_north: true,
-                    turns: tr,
-                    token_loop: true,
-                };
-                abi::head(&pe, h)
-            }
-            Place::HeadCtl { .. } => {
-                let mut w = abi::hctl(&pe, at.y * plan.partition.head.vocab_rows, true)?;
-                let tb = prog
-                    .floor
-                    .stores
-                    .iter()
-                    .any(|s| at.y >= s.rect.y && at.y < s.rect.y + s.rect.h);
-                w.extend_from_slice(&[u32::from(tb), pe.c(PLE_TOKEN)?]);
-                Ok(w)
-            }
-            Place::Store {
-                first,
-                count,
-                level,
-                top,
-            } => store(&pe, (first, count, level, top)),
-            Place::None => Err(format!("{at:?}: no Gemma rcfg for this PE")),
-        }
-    }
-}
-
-/// A store PE's words: the route table (8 slots), the flags (a storage PE 1, takes TB 2, the
-/// column's top 4), its first token, tokens, bus words, bus colour, TB's queue, a spare colour.
-fn store(pe: &Pe, (first, count, level, top): (u32, u32, u32, bool)) -> Result<Vec<u32>, String> {
-    let tb = pe.c(PLE_TOKEN)?;
-    let mut w = pe.routes(8)?;
-    let stored = count > 0;
-    let tb_in = pe
-        .prog
-        .fabric
-        .route(pe.at, Colour(tb as u8))
-        .is_some_and(|r| r.to_ramp());
-    let pk = pe.parks(2)?;
-    let fl = u32::from(stored) | if tb_in { 2 } else { 0 } | if stored && top { 4 } else { 0 };
-    let tbq = if tb_in { tb } else { pk[0] };
-    let pb = if stored {
-        let i = store_of(&pe.prog.floor, pe.at)
-            .ok_or_else(|| format!("{:?}: a storage PE off the storage", pe.at))?;
-        pe.c(bus(i))?
-    } else {
-        pk[1]
-    };
-    let (first, tokens, level) = if stored {
-        (first, count, level)
-    } else {
-        (0, 0, 0)
-    };
-    w.extend_from_slice(&[fl, first, tokens, level, pb, tbq]);
-    w.push(pe.spare(&[tbq], &CT6)?);
-    Ok(w)
-}
-
-/// A route-only PE of the store kernel (a storage block's CX column, a pass PE).
-const PASS_PE: Place = Place::Store {
-    first: 0,
-    count: 0,
-    level: 0,
-    top: false,
-};
-
-impl Whole for Gemma {
-    fn floor(&self, plan: &Plan) -> Result<Floor, String> {
-        Gemma::floor(self, plan)
-    }
-
-    fn wire(&self, plan: &Plan, floor: &Floor) -> Result<Wiring, String> {
-        Gemma::wire(self, plan, floor)
-    }
-
-    fn palette(&self, plan: &Plan) -> Palette {
-        Gemma::palette(self, plan)
-    }
-
-    fn overrides(&self, prog: &Program, o: &mut Overrides) -> Result<(), String> {
-        block::legacy_overrides(prog, &|_| None, o)
-    }
-
-    fn bindings(&self, prog: &Program) -> Result<Vec<Binding>, String> {
-        Gemma::bindings(self, prog)
-    }
-}
-
-impl Family for Gemma {
-    fn id(&self) -> FamilyId {
-        FamilyId::Gemma
-    }
-
-    fn plan(&self, meta: &Meta) -> Result<Plan, String> {
-        Gemma::plan(self, meta)
-    }
-
-    fn blocks(&self, plan: &Plan) -> Result<Vec<Box<dyn Block>>, String> {
-        Ok(vec![Box::new(Legacy::new(Gemma, plan))])
-    }
-
-    fn kernels(&self, prog: &Program) -> Result<Kernels, String> {
-        Ok(block::legacy_kernels(
-            self.kinds(prog)?,
-            Gemma::route_slots,
-            |pe| Gemma.rcfg(pe.prog, pe.at),
-        ))
+    fn kernels(&self, prog: &Program) -> R<Kernels> {
+        gemma::kernels(prog)
     }
 
     fn symbols(&self) -> &'static [(&'static str, &'static str)] {
-        SYMBOLS
+        gemma::SYMBOLS
     }
 }
-
-/// Every name the kernels export, in export order (`mkfull_gemma.py`'s `NAMES`).
-const SYMBOLS: &[(&str, &str)] = &[
-    ("w", "u16"),
-    ("rcfg", "u32"),
-    ("tdbg", "u32"),
-    ("kvlog", "f32"),
-    ("x", "f32"),
-    ("xdbg", "f32"),
-    ("xred", "f32"),
-    ("gam", "f32"),
-    ("qkw", "f32"),
-    ("rot", "f32"),
-    ("tab", "u32"),
-    ("pl", "f32"),
-    ("plog", "f32"),
-    ("hw", "u16"),
-    ("hg", "f32"),
-    ("hemb", "u16"),
-    ("res", "f32"),
-    ("ring", "u32"),
-    ("lgt", "f32"),
-    ("force", "u32"),
-    ("nforce", "u32"),
-    ("ptab", "u16"),
-    ("psend", "u32"),
-    ("tin", "u32"),
-];

@@ -5,7 +5,9 @@
 //! - [`common`]: the word layouts every family's weight, CX, CY, head and head control kernels
 //!   share (their leading words), with the codes the kernels read named;
 //! - [`q35`]: Qwen3.5 / Qwen3's kernels (`weight_q35.csl`, `ctl_cx.csl`, `ctl_cy_q35.csl`,
-//!   `head_pe.csl`, `head_ctl.csl`, `relay.csl`).
+//!   `head_pe.csl`, `head_ctl.csl`, `relay.csl`);
+//! - [`gemma`]: Gemma 4 E2B / E4B's (`weight_gemma.csl`, `ctl_cx_gemma.csl`, `ctl_cy_gemma.csl`,
+//!   `head_ctl_gemma.csl`, `ple_gemma.csl`; `head_pe.csl`).
 
 use super::fabric::{ChainMember, Colour, Endpoint, PeIo, RootQueues};
 use super::floor::Coord;
@@ -15,6 +17,7 @@ use super::wiring::{Class, NoteKey, Slot};
 
 pub mod common;
 pub mod gptoss;
+pub mod gemma;
 pub mod head;
 pub mod q35;
 

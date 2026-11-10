@@ -33,9 +33,9 @@ impl Program {
     }
 
     /// The physical build of a plan: validate it; each block places its PEs, then lays its
-    /// links; the palette is the blocks' colours; lay the fabric and validate it (its
-    /// invariants); the family's kernels, every PE's routes within its kernel's route table;
-    /// the blocks' param overrides. Pure (no device, no files).
+    /// links, then settles the floor on them; the palette is the blocks' colours; lay the fabric
+    /// and validate it (its invariants); the family's kernels, every PE's routes within its
+    /// kernel's route table; the blocks' param overrides. Pure (no device, no files).
     pub fn build(family: Box<dyn Family>, plan: Plan) -> Result<Program, String> {
         plan.validate()?;
         let blocks = family.blocks(&plan)?;
@@ -43,10 +43,13 @@ impl Program {
         for b in &blocks {
             b.floor(&plan, &mut fb)?;
         }
-        let floor = fb.build()?;
+        let mut floor = fb.build()?;
         let mut wiring = Wiring::default();
         for b in &blocks {
             b.wire(&plan, &floor, &mut wiring)?;
+        }
+        for b in &blocks {
+            b.settle(&plan, &wiring, &mut floor)?;
         }
         let palette = Palette::of(blocks.iter().flat_map(|b| b.colours()));
         let fabric = Fabric::lay(&floor, &wiring, &palette)?;
