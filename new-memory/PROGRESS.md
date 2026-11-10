@@ -577,3 +577,8 @@ The `new-memory/` directory is bookkeeping and is removed before anything lands 
   base; runtime store::weights 24; rocm check.
 - Open: quantized banks; engine per-expert tier (ROCm's only streaming today) is a second path for dense CUDA banks;
   streaming off arms the lattice twice at boot; runtime boot with held untested e2e (IT).
+
+### Note — 2026-11-10: main merged into new-memory (21 commits, XLA/TPU v5e/v6e by a teammate)
+- One conflict (engine-xla api.rs PoolFacts): new-memory's `shell.pool_facts()` now carries main's seat fields
+  (seated_first / seat_to_end / seat_spread). engine-xla lib 7/8: the v6e tuning test fails identically on main.
+- Main is actively changing engine-xla / kernels-xla; the XLA chunk-pool port must rebase often.
