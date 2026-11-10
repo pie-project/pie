@@ -16,7 +16,6 @@ gemm.fp8_shadow = true
 [engine]
 prefill_lattice_from = 160  # 1.0% faster end to end
 # two recurrent-state slots a lane, as on the H200
-state_slots_per_lane = 2
 
 [compiler]
 dag_streams = true  # 2.6% faster end to end

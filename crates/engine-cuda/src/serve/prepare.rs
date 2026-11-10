@@ -1282,7 +1282,7 @@ impl FrameShell for Shell {
         let window_refs: Vec<&[u32]> = window_tables.iter().map(Vec::as_slice).collect();
         let mut geometries = (0..self.spaces)
             .map(|space| {
-                if self.pools.windowed_space(space as u32) {
+                if self.pools.windowed_geometry(space) {
                     kv::geometry_with(&paging, &seats, &window_refs)
                 } else {
                     kv::geometry_with(&paging, &seats, &table_refs)
@@ -1302,7 +1302,7 @@ impl FrameShell for Shell {
                     .unwrap_or(0)
             };
             for (space, geometry) in geometries.iter_mut().enumerate() {
-                let windowed = self.pools.windowed_space(space as u32);
+                let windowed = self.pools.windowed_geometry(space);
                 for (row, stated) in writes.iter().enumerate() {
                     let Some((page, offset)) = *stated else {
                         continue;
@@ -1352,7 +1352,7 @@ impl FrameShell for Shell {
         // slot it is seated on in the state pool.
         let mut device_geometries = geometries.clone();
         for (space, geometry) in device_geometries.iter_mut().enumerate() {
-            let windowed = self.pools.windowed_space(space as u32);
+            let windowed = self.pools.windowed_geometry(space);
             self.pools.page_ids(windowed, &mut geometry.indices)?;
             self.pools.page_ids(windowed, &mut geometry.write_page)?;
         }
@@ -1607,7 +1607,7 @@ impl FrameShell for Shell {
             0
         };
         let placed = match geometries.as_slice() {
-            [space] if !self.pools.windowed_space(0) => Some(space),
+            [space] if !self.pools.windowed_geometry(0) => Some(space),
             _ => None,
         };
         let kv_reports: Vec<super::KvReport> = composition

@@ -27,7 +27,6 @@ prefill_lattice_from = 4096
 host_planes = true
 one_frame_when_short = true
 seated_first = true
-state_slots_per_lane = 2
 forward_tokens = 16384
 walk_fire_rows = 4096
 
@@ -60,7 +59,6 @@ measured = [
   "engine.lattice_steps",
   "engine.one_frame_when_short",
   "engine.seated_first",
-  "engine.state_slots_per_lane",
   "engine.walk_fire_rows",
   "engine.working_set_percent",
 ]

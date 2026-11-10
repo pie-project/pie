@@ -14,7 +14,6 @@ use crate::run::{CachePool, CacheTable, PoolSlabs};
 use crate::settle::Airborne;
 use crate::store::kv::{Facts, Paging};
 use crate::store::layout::Kind;
-pub use engine::fit::{balanced_state_slots, least_state_slots, pages_within, state_slots_within};
 
 impl From<poem_exec::store::Fault> for Fault {
     fn from(fault: poem_exec::store::Fault) -> Fault {
@@ -102,9 +101,9 @@ impl Accounting {
     }
 }
 
-/// What `Pools::fit_the_card` did when the declared pool was larger than
-/// the card: the page count asked, the count it was sized to, the bytes the
-/// card had for the cache rows, and what was held back from them.
+/// What `Pools::fit_the_card` sized the pool to: the kv pages asked, the
+/// pages its chunks would hold were every one the kv rows', the chunks it
+/// has, the bytes the card had for them, and what was held back from them.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Fitted {
     pub asked: u64,
@@ -113,7 +112,7 @@ pub struct Fitted {
     pub held: u64,
     pub bodies: u64,
     pub spare: u64,
-    pub slots: u32,
+    pub chunks: u32,
 }
 
 /// The least `[engine] bodies_mem` is held down to on a card with little
@@ -409,22 +408,11 @@ pub fn window_fire_bytes(trace: &Trace, paging: Paging) -> Result<u64> {
     Ok(bytes)
 }
 
-/// One sequence's cache rows: its kv pages at the declared context and the
-/// recurrent slabs of the least state slots, the least `Pools::fit_the_card`
-/// seats before refusing.
+/// One working set's cache rows: its kv pages at the declared context and
+/// its recurrent record, the least `Pools::fit_the_card` seats before
+/// refusing.
 pub fn least_sequence_bytes(trace: &Trace, paging: Paging) -> Result<u64> {
-    let mut state: u64 = 0;
-    for row in &trace.caches {
-        if let CacheRow::State {
-            name, slab, dtype, ..
-        } = row
-        {
-            let stride: u64 = slab.iter().product();
-            state = state.saturating_add(stride * elem_bytes(name, *dtype)?);
-        }
-    }
-    let slots = u64::from(engine::fit::least_state_slots(1));
-    Ok(one_slot_bytes(trace, paging)?.saturating_add(state.saturating_mul(slots)))
+    one_slot_bytes(trace, paging)
 }
 
 pub fn admit_the_card(
@@ -589,9 +577,8 @@ pub struct Pools {
     /// `[model] device_kv_budget`: the bytes the cache rows take, never cut
     /// to fit; `None` fills what the card hands out.
     budget: Option<u64>,
-    /// The state slots `fit_the_card` keeps whatever the declared context
-    /// seats (`keep_slots`).
-    kept_slots: u32,
+    /// The chunks the fit left the cache rows, of the range's.
+    fitted: u32,
     airborne: Option<Airborne>,
     committed_kv_pages: u32,
     committed_state_slots: u32,
@@ -920,7 +907,7 @@ impl Pools {
             asked: paging.pages(),
             ceiling: paging.pages(),
             budget,
-            kept_slots: 0,
+            fitted: total,
             airborne: None,
             committed_kv_pages: 0,
             committed_state_slots: 0,
@@ -929,13 +916,6 @@ impl Pools {
             whole: false,
             swaps: Vec::new(),
         })
-    }
-
-    /// The state slots the fit keeps while the pages beside them seat one
-    /// sequence at the declared context, rather than cut them to the
-    /// sequences the pages seat there: a slot for each lane a fire batches.
-    pub fn keep_slots(&mut self, slots: u32) {
-        self.kept_slots = slots;
     }
 
     pub fn watch(&mut self, airborne: Airborne) {
@@ -986,40 +966,20 @@ impl Pools {
         self.chunks.bytes()
     }
 
+    /// The watermark the pool reaches: the chunks the fit left it, as the
+    /// map units the range backs them in.
     #[must_use]
     pub fn declared_bytes(&self) -> u64 {
-        self.declared_at(self.paging.pages())
+        self.chunk_bytes(self.fitted)
     }
 
-    /// The watermark the cache rows reach with `pages` kv pages declared and
-    /// the paging's state slots, as the map units their arenas back.
-    #[must_use]
-    pub fn declared_at(&self, pages: u64) -> u64 {
-        self.declared_reshaped(pages, self.paging.slots)
-    }
-
-    /// The watermark with `pages` kv pages and `slots` state slots: the
-    /// chunks they take.
-    fn declared_reshaped(&self, pages: u64, slots: u32) -> u64 {
-        // Backed in the range's map units: the last one whole.
-        let layout = self.chunks.layout();
+    /// The bytes `chunks` chunks take backed: the last map unit whole.
+    fn chunk_bytes(&self, chunks: u32) -> u64 {
         let unit = self.chunks.map_unit().max(1);
-        u64::from(chunks_at(layout, &self.paging, pages, slots))
-            .saturating_mul(layout.chunk_bytes)
+        u64::from(chunks)
+            .saturating_mul(self.chunks.layout().chunk_bytes)
             .div_ceil(unit)
             .saturating_mul(unit)
-    }
-
-    /// Re-reserves the kv planes and compressor slabs for a pool of `pages`,
-    /// so each maps in the unit its size earns rather than the one the asked
-    /// count gave it. Only before anything is committed to them: a mapped
-    /// unit has a base a table may already hold.
-    fn reshape(&mut self, pages: u64, slots: u32) -> Result<()> {
-        self.ceiling = pages;
-        self.paging.pages = pages;
-        self.paging.slots = slots;
-        let total = chunks_at(self.chunks.layout(), &self.paging, pages, slots);
-        self.chunks.reshape(&mut self.pool, total)
     }
 
     #[must_use]
@@ -1044,23 +1004,17 @@ impl Pools {
         Ok(live.saturating_sub(reserve).max(live.min(room)))
     }
 
-    /// Sizes the declared pool to the card. The page count arrives from the
-    /// operator's config (or its 256-slot default) knowing nothing of the
-    /// device, and the watermark it declares is what `spare_bytes` holds back
-    /// and what the runtime admits frames against, so a pool declared past
-    /// what the card can back turns every growth into a refusal the runtime's
-    /// static admission has already forbidden. The fit is against the elastic
-    /// budget as it stands now, so it is called once everything else this
-    /// load puts on the device is resident, and again after arming, when the
-    /// bodies have taken what they take and the rest is the cache rows' to
-    /// declare. `programs` is held for the guests' programs throughout;
-    /// `bodies` is the configured allowance, which `bodies_allowance` holds
-    /// down to what the room affords, and both yield before one sequence at
-    /// the declared context does, since a pool under one sequence is no
-    /// deployment. While nothing is committed to the planes, a pool the
-    /// asked count's map unit would leave under a sequence is re-reserved
-    /// in the finer unit its own size earns. `resident` spells what is on
-    /// the device already, for the refusal when not even that sequence fits.
+    /// Sizes the pool to the card: every whole chunk the card has room for,
+    /// each any shape's to take, provided they seat one working set at the
+    /// declared context ([`engine::chunk::fit`]). The room is the elastic
+    /// budget as it stands now, so the fit is called once everything else
+    /// this load puts on the device is resident, and again after arming,
+    /// when the bodies have taken what they take and the rest is the pool's.
+    /// `programs` is held for the guests' programs throughout; `bodies` is
+    /// the configured allowance, which `bodies_allowance` holds down to what
+    /// the room affords, and both yield before that one working set does,
+    /// since a pool under it is no deployment. `resident` spells what is on
+    /// the device already, for the refusal when not even that fits.
     pub fn fit_the_card(
         &mut self,
         bodies: u64,
@@ -1071,128 +1025,70 @@ impl Pools {
             .pool
             .spare_bytes(0)?
             .saturating_add(self.committed_bytes());
-        let fresh = self.chunks.fresh();
+        let layout = self.chunks.layout();
+        let chunk = layout.chunk_bytes;
+        // One working set at the declared context beside the null chunk:
+        // its kv pages, its windowed pages and its recurrent record.
         let one_slot = u64::from(self.paging.pages_per_slot).min(self.ceiling);
-        let mut need = if fresh {
-            self.declared_at(one_slot)
-                .min(self.declared_reshaped(one_slot, self.paging.slots))
-        } else {
-            self.declared_at(one_slot)
-        };
-        // A stated budget is the rows' before the bodies and programs are
-        // held anything; with none, one sequence is.
+        let slots = u32::from(self.has_state());
+        let least = chunks_at(layout, &self.paging, one_slot, slots);
+        let need = self.chunk_bytes(least);
+        // A stated budget is the pool's before the bodies and programs are
+        // held anything; with none, one working set is.
         let claim = self.budget.unwrap_or(need);
-        let configured = bodies;
-        let asked_programs = programs;
-        let (mut bodies, mut programs) =
-            holds_within(configured, asked_programs, live.saturating_sub(claim));
-        let mut held = programs.saturating_add(bodies);
-        let mut room = live.saturating_sub(held);
+        let (bodies, programs) = holds_within(bodies, programs, live.saturating_sub(claim));
+        let held = programs.saturating_add(bodies);
+        let room = live.saturating_sub(held);
         if let Some(budget) = self.budget.filter(|&budget| budget > room) {
             return Err(Fault::Residency(
                 engine::fit::Short::Budget { budget, room }.to_string(),
             ));
         }
-        let limit = self.budget.unwrap_or(room);
-        let mut fit = pages_within(self.ceiling, limit, |pages| self.declared_at(pages));
-        if fresh && fit < self.ceiling {
-            let slots = self.paging.slots;
-            let fine = pages_within(self.ceiling, limit, |pages| {
-                self.declared_reshaped(pages, slots)
-            });
-            if fine > fit {
-                // The planes are reserved for what the rows reach once the
-                // bodies' allowance comes back after arming (the second fit
-                // sizes the pages to the room then), not only for this
-                // pass's: reserved at this pass's pages, the later fit could
-                // never pass them.
-                let reach = match self.budget {
-                    Some(_) => fine,
-                    None => pages_within(self.ceiling, live.saturating_sub(programs), |pages| {
-                        self.declared_reshaped(pages, slots)
-                    })
-                    .max(fine),
-                };
-                self.reshape(reach, slots)?;
-                fit = pages_within(self.ceiling, limit, |pages| self.declared_at(pages));
+        // Whole map units of the room, in whole chunks, of the range's.
+        let unit = self.chunks.map_unit().max(1);
+        let limit = self.budget.unwrap_or(room) / unit * unit;
+        let fitted = match engine::chunk::fit(limit, chunk, 0, least) {
+            Ok(chunks) => chunks.min(self.chunks.total()),
+            Err(_) if self.budget.is_some() => {
+                return Err(Fault::Residency(
+                    engine::fit::Short::Sequence {
+                        budget: self.budget.unwrap_or(0),
+                        least: need,
+                    }
+                    .to_string(),
+                ));
             }
-        }
-        // A hybrid declares a recurrent slab for every state slot, whatever
-        // the pool seats: a heavy slab can take the room its lanes' pages
-        // needed, and on a short card the slab alone can be the refusal.
-        // Where the pages that fit seat fewer sequences at the declared
-        // context than there are slots, the slots are cut to where the two
-        // seat alike, never under what leaves the pages their half of the
-        // room past one sequence.
-        let one = one_slot.max(1);
-        let seats = u64::from(self.paging.slots);
-        if fit / one < seats && fresh && self.has_state() && self.budget.is_none() {
-            let one_sequence = self.declared_reshaped(one_slot, 0);
-            // What the fires were asked and the uncut slab left no room to
-            // hold is held after the cut, so the slots leave it too.
-            let cut = room.saturating_sub(asked_programs.saturating_sub(programs));
-            let floor = state_slots_within(self.paging.slots, cut, one_sequence, |slots| {
-                self.declared_reshaped(0, slots)
-            });
-            // The kept slots (`keep_slots`) stay while the pages beside them
-            // still seat one sequence, as TensorRT-LLM's state pool holds a
-            // slot for each of `max_batch_size` and its kv takes the rest.
-            let kept = self.kept_slots.min(self.paging.slots);
-            let floor = if kept > floor
-                && pages_within(self.ceiling, cut, |pages| {
-                    self.declared_reshaped(pages, kept)
-                }) >= one_slot
-            {
-                kept
+            Err(_) => {
+                return Err(Fault::Residency(format!(
+                    "the card does not hold this deployment: {resident}; under `[model] \
+                     device_memory_share` that leaves {room} bytes for the state pool, and one \
+                     working set at the declared context needs {need}. Lower `[engine] \
+                     max_model_len`, raise `[model] device_memory_share`, state a `[model] \
+                     device_weight_budget` that streams the weight tier down, or free what \
+                     else holds the device."
+                )));
+            }
+        };
+        self.fitted = fitted;
+        // The kv pages the shell's own seats may name: what the chunks hold
+        // were every one the kv rows'.
+        let layout = self.chunks.layout();
+        let (mut fits, mut over) = (one_slot, self.ceiling.saturating_add(1));
+        while over - fits > 1 {
+            let mid = fits + (over - fits) / 2;
+            if chunks_at(layout, &self.paging, mid, 0) <= fitted {
+                fits = mid;
             } else {
-                floor
-            };
-            let slots = balanced_state_slots(self.paging.slots, floor, one_slot, |slots| {
-                pages_within(self.ceiling, cut, |pages| {
-                    self.declared_reshaped(pages, slots)
-                })
-            });
-            let pages = pages_within(self.ceiling, cut, |pages| {
-                self.declared_reshaped(pages, slots)
-            });
-            if pages >= one_slot && slots < self.paging.slots {
-                self.reshape(pages, slots)?;
-                need = self.declared_at(one_slot);
-                // The slab the slots gave back is room the bodies were
-                // refused when the allowance was struck; strike it again.
-                (bodies, programs) =
-                    holds_within(configured, asked_programs, live.saturating_sub(need));
-                held = programs.saturating_add(bodies);
-                room = live.saturating_sub(held);
-                fit = pages_within(self.ceiling, room, |pages| self.declared_at(pages));
+                over = mid;
             }
         }
-        if let Some(budget) = self.budget.filter(|_| fit < one_slot) {
-            return Err(Fault::Residency(
-                engine::fit::Short::Sequence {
-                    budget,
-                    least: need,
-                }
-                .to_string(),
-            ));
+        self.paging.pages = fits;
+        // A flat range is one allocation made on its first commit: of the
+        // fitted chunks, not of every chunk the asked count reserved.
+        if !elastic::mapped_on_demand() && self.chunks.fresh() {
+            self.chunks.reshape(&mut self.pool, fitted)?;
         }
-        if fit < one_slot {
-            return Err(Fault::Residency(format!(
-                "the card does not hold this deployment: {resident}; under `[model] \
-                 device_memory_share` that leaves {room} bytes for the cache rows, and one \
-                 sequence at the declared context, beside the declared state slots, needs \
-                 {need} across them. Lower `[engine] max_model_len` or `[engine] \
-                 max_state_slots`, raise `[model] device_memory_share`, state a `[model] \
-                 device_weight_budget` that streams the weight tier down, or free what \
-                 else holds the device."
-            )));
-        }
-        self.paging.pages = fit;
-        // A flat arena allocates its whole range on its first commit, so its
-        // range is the fitted one, not the one the asked count reserved.
-        if !elastic::mapped_on_demand() && self.committed_bytes() == 0 {
-            self.reshape(fit, self.paging.slots)?;
-        }
+        self.chunks.limit(fitted);
         // The runtime admits frames against this watermark, so the pool is
         // pledged it beside what its other arenas hold now: a frame inside
         // it is a frame the fit already sized the card for, and what a fire
@@ -1202,15 +1098,15 @@ impl Pools {
             .committed_pages()
             .saturating_sub(elastic::pages_for_bytes(self.committed_bytes()));
         self.pool
-            .pledge(elastic::pages_for_bytes(self.declared_at(fit)).saturating_add(others));
+            .pledge(elastic::pages_for_bytes(self.chunk_bytes(fitted)).saturating_add(others));
         Ok(Fitted {
             asked: self.asked,
-            fit,
+            fit: fits,
             room,
             held,
             bodies,
             spare: live.saturating_sub(need).saturating_sub(programs),
-            slots: self.paging.slots,
+            chunks: fitted,
         })
     }
 
@@ -1288,6 +1184,49 @@ impl Pools {
         self.shapes.iter().any(
             |shape| matches!(shape, Shape::Kv { space: at, windowed: true, .. } if *at == space),
         )
+    }
+
+    /// The page tables a fire stages: one a kv shape, the list's and then
+    /// the ring's. Every kv row of a shape reads its shape's.
+    #[must_use]
+    pub fn geometries(&self) -> usize {
+        let layout = self.chunks.layout();
+        usize::from(layout.list.is_some()) + usize::from(layout.ring.is_some())
+    }
+
+    /// Whether page table `at` of a fire's is the ring's.
+    #[must_use]
+    pub fn windowed_geometry(&self, at: usize) -> bool {
+        let layout = self.chunks.layout();
+        layout.ring.is_some() && at == usize::from(layout.list.is_some())
+    }
+
+    /// The page table of a fire's the kv rows of `space` read: their
+    /// shape's.
+    #[must_use]
+    pub fn geometry_of(&self, space: u32) -> usize {
+        if self.windowed_space(space) {
+            usize::from(self.chunks.layout().list.is_some())
+        } else {
+            0
+        }
+    }
+
+    /// [`Pools::geometry_of`] for every kv space the trace numbers.
+    #[must_use]
+    pub fn geometry_map(&self) -> Vec<u32> {
+        let spaces = self
+            .shapes
+            .iter()
+            .filter_map(|shape| match shape {
+                Shape::Kv { space, .. } => Some(*space + 1),
+                Shape::State { .. } => None,
+            })
+            .max()
+            .unwrap_or(0);
+        (0..spaces)
+            .map(|space| self.geometry_of(space) as u32)
+            .collect()
     }
 
     #[must_use]
@@ -1383,15 +1322,14 @@ impl Pools {
                     live,
                     offsets,
                 } => {
-                    let seat = seats
-                        .spaces
-                        .get(space as usize)
-                        .ok_or_else(|| Fault::Unbound {
+                    let seat = seats.spaces.get(self.geometry_of(space)).ok_or_else(|| {
+                        Fault::Unbound {
                             what: format!(
                                 "cache space {space}, for which this fire wrote no \
                                      geometry"
                             ),
-                        })?;
+                        }
+                    })?;
                     let pages = if windowed {
                         self.paging.window_pages()
                     } else {
@@ -1942,13 +1880,7 @@ impl Pools {
 
     /// The chunks the fit left the cache rows, of the range's.
     fn fitted_chunks(&self) -> u32 {
-        chunks_at(
-            self.chunks.layout(),
-            &self.paging,
-            self.paging.pages(),
-            self.paging.slots,
-        )
-        .min(self.chunks.total())
+        self.fitted.min(self.chunks.total())
     }
 
     /// See `Engine::evacuate`.
