@@ -175,6 +175,12 @@ impl Shell {
         self.pools.chunk_facts(self.budget().max_tokens)
     }
 
+    /// Names the recurrent record whose pieces lie in the slot refs
+    /// `pieces`: the slot a lane then names it by (its first).
+    pub fn name_record(&mut self, pieces: &[u32]) -> crate::Result<u32> {
+        self.pools.name_record(pieces)
+    }
+
     /// From here on lanes name their slots by slot ref.
     pub fn take_refs(&mut self) {
         self.pools.take_refs();

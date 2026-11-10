@@ -42,7 +42,7 @@ fn an_exported_kv_stays_mapped() {
     let facts = kv::probe(&trace).expect("the micro trace's cache rows probe");
     let paging = Paging::of(PAGE, CONTEXT, SLOTS, u64::from(SLOTS * CONTEXT / PAGE))
         .expect("a pool of four full sequences");
-    let mut pools = Pools::reserve(0, 0.5, &trace, paging, None, &facts, &budgets, 0)
+    let mut pools = Pools::reserve(0, 0.5, &trace, paging, None, &facts, &budgets, 0, None)
         .expect("the pool reserves");
     let exported = pools
         .export_kv(0)

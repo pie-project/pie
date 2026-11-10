@@ -19,6 +19,10 @@ pub struct Diagnostics {
     pub gumbel_direct: bool,
     /// What a fire that waits for the device does (`crate::device::guard`).
     pub sync_guard: Option<SyncGuard>,
+    /// The chunk size the state pool's recipe aims near, in place of the
+    /// device profile's: a small one cuts a miniature's records into the
+    /// pieces only a full model's take.
+    pub chunk_bytes: Option<u64>,
 }
 
 /// The sync guard's answer to a fire that waited for the device.
@@ -49,6 +53,7 @@ impl Default for Diagnostics {
             fuse_chains: true,
             gumbel_direct: true,
             sync_guard: None,
+            chunk_bytes: None,
         }
     }
 }
@@ -100,6 +105,9 @@ impl Diagnostics {
             Some(SyncGuard::Panic) => words.push("sync-guard=panic".to_string()),
             None => {}
         }
+        if let Some(bytes) = self.chunk_bytes {
+            words.push(format!("chunk-bytes={bytes}"));
+        }
         (!words.is_empty()).then(|| words.join(","))
     }
 }
@@ -118,7 +126,7 @@ const WORDS: &str = "`golden-probe`, `arm-trace`, \
      `ptr-trace=<key substring>`, `graph-dot=<dir>`, `grid-trace=<key substring>`, \
      `plan-trace=<rows|all>`, `arm-bench=<key>`, `capture-serial`, `boundary-trace`, `reap-trace`, \
      `trace-census`, `nan-check`, `fuse-chains=off`, `gumbel-direct=off`, \
-     `sync-guard[=panic]`";
+     `sync-guard[=panic]`, `chunk-bytes=<bytes>`";
 
 impl std::str::FromStr for Diagnostics {
     type Err = String;
@@ -149,6 +157,13 @@ impl std::str::FromStr for Diagnostics {
                         "panic" => Some(SyncGuard::Panic),
                         _ => switch(word, value)?.then_some(SyncGuard::Report),
                     }
+                }
+                "chunk-bytes" => {
+                    diag.chunk_bytes = Some(value.parse().map_err(|_| {
+                        format!(
+                            "`chunk-bytes` takes a byte count: `chunk-bytes=<bytes>`, not `{value}`"
+                        )
+                    })?);
                 }
                 "ptr-trace" | "grid-trace" | "plan-trace" | "graph-dot" | "arm-bench" => {
                     if value.is_empty() {

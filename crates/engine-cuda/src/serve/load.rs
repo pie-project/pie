@@ -893,6 +893,7 @@ impl Shell {
             &facts,
             &budgets,
             arena_bytes,
+            boot.knobs.diagnostics.chunk_bytes,
         )?;
         if boot.knobs.diagnostics.arm_trace {
             eprintln!(

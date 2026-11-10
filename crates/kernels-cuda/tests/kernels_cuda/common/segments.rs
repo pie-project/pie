@@ -139,6 +139,7 @@ impl Scattered {
             seg_chunks: self.seg_chunks as u32,
             pieces: self.pieces as u32,
             piece_off: OFF as i64 + skew,
+            piece_atoms: 0,
         }
     }
 
