@@ -1316,7 +1316,9 @@ impl Cuda {
         if by_refs {
             shell.take_refs();
         }
-        let mut records: Vec<Option<u32>> = Vec::with_capacity(submission.lanes.len());
+        // Each lane's record: the one it reads and the one its fire writes.
+        let mut records: Vec<Option<(u32, u32)>> = Vec::with_capacity(submission.lanes.len());
+        let mut forked: Vec<(u32, u32)> = Vec::new();
         for lane in &submission.lanes {
             let record = match lane.fixed.as_slice() {
                 [] => None,
@@ -1325,10 +1327,12 @@ impl Cuda {
                     let written: Vec<u32> = pieces.iter().map(|[_, written]| *written).collect();
                     let run = shell.name_record(&runs).map_err(fault)?;
                     let written = shell.name_record(&written).map_err(fault)?;
-                    if run != written {
+                    // The lanes of one working set name one pair: copied once.
+                    if run != written && !forked.contains(&(run, written)) {
                         shell.fork_state(run, written).map_err(fault)?;
+                        forked.push((run, written));
                     }
-                    Some(written)
+                    Some((run, written))
                 }
                 _ => {
                     return Err(Error::Invalid(format!(
@@ -1392,7 +1396,8 @@ impl Cuda {
                     adapter: lane_adapters[at].or(lane.adapter),
                     rs: lane.rs.clone(),
                     rs_reset: lane.rs_reset,
-                    rs_slot: records[at].or(lane.rs_slot),
+                    rs_slot: records[at].map(|(_, written)| written).or(lane.rs_slot),
+                    rs_read: records[at].map(|(run, _)| run),
                     rs_snapshots: &lane.rs_snapshots,
                     readout: match &lane.readout {
                         Readout::Rows(rows) => Some(rows.as_slice()),
