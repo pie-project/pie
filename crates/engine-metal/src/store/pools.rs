@@ -756,6 +756,10 @@ impl Pools {
     /// list shape) as physical pages, or, seat-addressed, seat `seat`'s
     /// `pages` pages.
     pub fn kv_pages(&self, refs: &[u32], seat: Option<(u32, u32)>) -> Result<Vec<u32>> {
+        // A load whose every kv row is windowed pages nothing in a list.
+        if self.layout.list.is_none() {
+            return Ok(Vec::new());
+        }
         if let Some((slot, pages)) = seat
             && refs.is_empty()
         {
