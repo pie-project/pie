@@ -185,10 +185,106 @@ def ranks(d, l):
     """Whether layer `l` runs an indexer of its own."""
     return max(l - d.index_offset + 1, 0) % d.index_freq == 0
 
+def resized(d, layers, experts):
+    """`d` cut to its first `layers` layers and `experts` routed experts."""
+    fields = {k: getattr(d, k) for k in dir(d)}
+    fields.update(layers = layers, experts = experts, top_k = min(d.top_k, experts))
+    return struct(**fields)
+
+def adopt(id, config, special):
+    if config.get("model_type") != "glm_moe_dsa":
+        fail("the config's model_type is {}; this family is glm_moe_dsa".format(config.get("model_type")))
+    if config.get("hidden_act", "silu") != "silu":
+        fail("its MLPs gate by {}; this family's SwiGLU gates by silu".format(config["hidden_act"]))
+    if config.get("attention_bias", False):
+        fail("its attention projections carry biases, which this family's do not")
+    if config.get("tie_word_embeddings", False):
+        fail("it reads out through its embedding (tied); this family reads a head of its own")
+    rope = config.get("rope_parameters") or {}
+    if config.get("rope_scaling") != None or rope.get("rope_type", "default") != "default":
+        fail("its config scales its rope ({}); this family turns it unscaled".format(config.get("rope_scaling") or rope))
+    if not config.get("indexer_rope_interleave", True):
+        fail("its indexers rotate neox halves; this family's rotate adjacent pairs")
+    if config.get("scoring_func", "sigmoid") != "sigmoid" or config.get("topk_method", "noaux_tc") != "noaux_tc":
+        fail("its router scores by {} ({}); this family's by a biased sigmoid".format(config.get("scoring_func"), config.get("topk_method")))
+    if config.get("n_group", 1) != config.get("topk_group", 1):
+        fail("it routes within {} of {} expert groups; this family routes over all its experts".format(config.get("topk_group"), config.get("n_group")))
+    if config.get("moe_layer_freq", 1) != 1:
+        fail("its routed layers come one in {}; this family routes every layer after its dense ones".format(config["moe_layer_freq"]))
+    shared = config.get("n_shared_experts", 1)
+    if shared < 1:
+        fail("it has no shared expert; this family runs one beside its routed experts")
+    if config.get("index_topk_pattern") != None:
+        fail("its indexers rank by a pattern ({}); this family ranks one layer in a fixed few".format(config["index_topk_pattern"]))
+    vocab = config["vocab_size"]
+    if vocab != 154880:
+        fail("its vocabulary is {} tokens; this family speaks GLM-5's 154880".format(vocab))
+    layers = config["num_hidden_layers"]
+    dense_layers = config.get("first_k_dense_replace", 0)
+    mlps = config.get("mlp_layer_types")
+    if mlps != None and mlps != ["dense" if l < dense_layers else "sparse" for l in range(layers)]:
+        fail("its dense and routed layers ({}) are not its first {} and then the rest".format(mlps, dense_layers))
+    moe_inter = config["moe_intermediate_size"]
+    experts = config["n_routed_experts"]
+    d = struct(
+        hidden = config["hidden_size"],
+        layers = layers,
+        dense_layers = dense_layers,
+        heads = config["num_attention_heads"],
+        q_lora_rank = config["q_lora_rank"],
+        kv_lora_rank = config["kv_lora_rank"],
+        qk_nope_head_dim = config["qk_nope_head_dim"],
+        qk_rope_head_dim = config["qk_rope_head_dim"],
+        v_head_dim = config["v_head_dim"],
+        theta = float(config.get("rope_theta", rope.get("rope_theta", 10000.0))),
+        interleaved = config.get("rope_interleave", False),
+        index_heads = config["index_n_heads"],
+        index_head_dim = config["index_head_dim"],
+        index_top_k = config["index_topk"],
+        index_freq = config.get("index_topk_freq", 1),
+        index_offset = config.get("index_skip_topk_offset", 0),
+        index_weights_from = "hidden",
+        index_norm_eps = 1e-6,
+        dense_inter = config["intermediate_size"],
+        experts = experts,
+        top_k = config["num_experts_per_tok"],
+        moe_inter = moe_inter,
+        shared_inter = moe_inter * shared,
+        router_bias = True,
+        norm_weights = config.get("norm_topk_prob", True),
+        scaling = float(config.get("routed_scaling_factor", 1.0)),
+        vocab = vocab,
+        norm_eps = float(config.get("rms_norm_eps", 1e-5)),
+    )
+    indexers = config.get("indexer_types")
+    if indexers != None and indexers != ["full" if ranks(d, l) else "shared" for l in range(layers)]:
+        fail("its indexers ({}) do not rank one layer in {} after its first {}".format(indexers, d.index_freq, d.index_offset))
+    drafts = config.get("num_nextn_predict_layers", 0)
+    if drafts > 1:
+        fail("it stores {} draft layers; this family drafts through one".format(drafts))
+    rows = [
+        deployment(id, weights = BF, kv = BF),
+        deployment(id, weights = [BF, U4], kv = BF),
+        deployment(id, weights = F8, kv = BF),
+        deployment(id, weights = F8, kv = dtype.e4m3),
+        deployment(id, weights = [BF, NV4], kv = BF),
+        deployment(id, weights = [BF, NV4, F8], kv = BF),
+        deployment(id, weights = [BF, NV4W], kv = BF),
+        deployment(id, weights = [BF, NV4W, F8], kv = BF),
+        deployment(id, weights = [BF, NV4, F8], kv = dtype.e4m3),
+    ]
+    if drafts == 1:
+        rows.append(deployment(id, weights = [BF, U4, U4], kv = BF, drafter = "mtp"))
+    return struct(
+        MODELS = [model(id, template = GLM, tokenizer = GLM_TOKENIZER, drafters = ["mtp"] if drafts == 1 else [], arch = "glm_moe_dsa", layers = layers, vocab = vocab)],
+        DIMS = {id: d},
+        DEPLOYMENTS = rows,
+    )
+
 def layout(id, deploy):
     d = DIMS[id]
     if deploy.layers or deploy.experts:
-        d = glm53(layers = deploy.layers or d.layers, experts = deploy.experts or d.experts)
+        d = resized(d, deploy.layers or d.layers, deploy.experts or d.experts)
     mtp = deploy.drafter == "mtp"
     ws = deploy.weights
     if mtp and len(ws) == 3:
@@ -363,7 +459,11 @@ def named(a, at):
     return out
 
 def formats(m):
-    return [format("huggingface", read = lambda reads: huggingface(m, reads))]
+    return [format(
+        "huggingface",
+        recognizes = lambda checkpoint: has("model.layers.0.self_attn.kv_a_proj_with_mqa.weight") and has("model.layers.0.self_attn.indexer.wk.weight"),
+        read = lambda reads: huggingface(m, reads),
+    )]
 
 def huggingface(m, reads):
     reads.read(m.embed, "model.embed_tokens.weight")

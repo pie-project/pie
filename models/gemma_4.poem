@@ -104,17 +104,19 @@ ASSISTANT_INTER = 8192
 ASSISTANT_READINGS = [SLIDING, SLIDING, SLIDING, GLOBAL]
 
 def trunk(hidden, layers, q_heads, kv_heads, global_kv_heads, inter, window, shared_tail = None, ple_dim = None, moe = None,
-          full_every = 6, wide_tail = False):
+          full_every = 6, wide_tail = False, head_dim = 256, global_head_dim = 512, global_rotary_dim = 128,
+          theta_local = 10000.0, theta_global = 1000000.0, vocab = 262144, softcap = 30.0, norm_eps = 1e-6):
     """`full_every`: every that many layers one reads globally, the last of
     each run. `wide_tail`: the layers that borrow their kv run an MLP twice as
-    wide (E2B's `use_double_wide_mlp`)."""
+    wide (E2B's `use_double_wide_mlp`). The rest every release lists shares;
+    an adopted checkpoint may state its own."""
     return struct(
         hidden = hidden, layers = layers, q_heads = q_heads, kv_heads = kv_heads,
         global_kv_heads = global_kv_heads, inter = inter, window = window,
         shared_tail = shared_tail, ple_dim = ple_dim, moe = moe, wide_tail = wide_tail,
-        full_every = full_every, head_dim = 256, global_head_dim = 512, global_rotary_dim = 128,
-        theta_local = 10000.0, theta_global = 1000000.0, sm_scale = 1.0, vocab = 262144,
-        softcap = 30.0, norm_eps = 1e-6,
+        full_every = full_every, head_dim = head_dim, global_head_dim = global_head_dim,
+        global_rotary_dim = global_rotary_dim, theta_local = theta_local, theta_global = theta_global,
+        sm_scale = 1.0, vocab = vocab, softcap = softcap, norm_eps = norm_eps,
     )
 
 def e4b(layers):
@@ -163,10 +165,10 @@ SOFT_TOKENS = 280
 
 VIDEO_SOFT_TOKENS = 70
 
-def vision_tower(depth, hidden, heads, inter, clipped, standardize):
+def vision_tower(depth, hidden, heads, inter, clipped, standardize, positions = 10240, theta = 100.0, norm_eps = 1e-6):
     return struct(depth = depth, hidden = hidden, heads = heads, inter = inter, clipped = clipped,
                   standardize = standardize, patch = PATCH, patch_width = 3 * PATCH * PATCH, pool = POOL,
-                  positions = 10240, theta = 100.0, norm_eps = 1e-6, sm_scale = 1.0)
+                  positions = positions, theta = theta, norm_eps = norm_eps, sm_scale = 1.0)
 
 def media(id, deploy):
     """How a still is spoken: framed within the soft-token budget, cut into
@@ -198,6 +200,131 @@ DFLASH_26B_A4B = dflash_head(
     block = 16,
     mask_token = 4,
 )
+
+def adopt(id, config, special):
+    if config.get("model_type") not in ["gemma4", "gemma4_unified"]:
+        fail("the config's model_type is {}; this family is gemma4".format(config.get("model_type")))
+    t = config.get("text_config")
+    if t == None:
+        fail("it states no text_config; this family reads a Gemma 4 checkpoint as transformers' conditional-generation model saves it")
+    if t.get("model_type") not in ["gemma4_text", "gemma4_unified_text"]:
+        fail("its text model's model_type is {}; this family's is gemma4_text".format(t.get("model_type")))
+    if t.get("hidden_activation", "gelu_pytorch_tanh") != "gelu_pytorch_tanh":
+        fail("its MLP gates by {}; this family's GeGLU gates by gelu_pytorch_tanh".format(t["hidden_activation"]))
+    if t.get("attention_bias", False):
+        fail("its projections carry biases, which this family's do not")
+    if not t.get("tie_word_embeddings", config.get("tie_word_embeddings", True)):
+        fail("its head is apart from its embedding; this family's reads the embedding back")
+    if t.get("query_pre_attn_scalar") != None:
+        fail("it scales its queries by query_pre_attn_scalar; this family's normed queries attend unscaled")
+    if t.get("use_bidirectional_attention") not in [None, "vision"]:
+        fail("it attends bidirectionally over {}; this family attends causally, an image's tokens among themselves".format(t["use_bidirectional_attention"]))
+    softcap = t.get("final_logit_softcapping")
+    if softcap == None:
+        fail("it states no final_logit_softcapping; this family's logits are capped")
+    rope = t.get("rope_parameters") or {}
+    local = rope.get("sliding_attention") or {}
+    glob = rope.get("full_attention") or {}
+    if local.get("rope_type", "default") != "default":
+        fail("its sliding layers turn their rope {}; this family's turn it unscaled".format(local["rope_type"]))
+    if glob.get("rope_type") != "proportional":
+        fail("its global layers turn their rope {}; this family's turn it proportionally".format(glob.get("rope_type")))
+    layers = t["num_hidden_layers"]
+    kinds = t.get("layer_types")
+    if kinds == None or "full_attention" not in kinds:
+        fail("it states no layer_types with a global layer among them")
+    full_every = kinds.index("full_attention") + 1
+    if kinds != ["full_attention" if l % full_every == full_every - 1 else "sliding_attention" for l in range(layers)]:
+        fail("its layers do not read globally once every {}, the last of each run, as this family's do".format(full_every))
+    vocab = t["vocab_size"]
+    ple_dim = t.get("hidden_size_per_layer_input") or None
+    if ple_dim != None and t.get("vocab_size_per_layer_input", vocab) != vocab:
+        fail("its per-layer embeddings span {} tokens, not its {}".format(t["vocab_size_per_layer_input"], vocab))
+    moe = None
+    if t.get("enable_moe_block", False):
+        moe = struct(
+            experts = t["num_experts"],
+            top_k = t["top_k_experts"],
+            inter = t.get("moe_intermediate_size") or t["expert_intermediate_size"],
+        )
+    kv_heads = t["num_key_value_heads"]
+    global_head_dim = t["global_head_dim"]
+    rotary = float(glob.get("partial_rotary_factor", 1.0)) * global_head_dim
+    if rotary != int(rotary):
+        fail("its global layers turn {} of {} dims, not a whole number".format(rotary, global_head_dim))
+    d = trunk(
+        hidden = t["hidden_size"],
+        layers = layers,
+        q_heads = t["num_attention_heads"],
+        kv_heads = kv_heads,
+        global_kv_heads = t.get("num_global_key_value_heads") or kv_heads,
+        inter = t["intermediate_size"],
+        window = t["sliding_window"],
+        shared_tail = t.get("num_kv_shared_layers") or None,
+        ple_dim = ple_dim,
+        moe = moe,
+        full_every = full_every,
+        wide_tail = t.get("use_double_wide_mlp", False),
+        head_dim = t["head_dim"],
+        global_head_dim = global_head_dim,
+        global_rotary_dim = int(rotary),
+        theta_local = float(local.get("rope_theta", 10000.0)),
+        theta_global = float(glob["rope_theta"]),
+        vocab = vocab,
+        softcap = float(softcap),
+        norm_eps = float(t.get("rms_norm_eps", 1e-6)),
+    )
+    towers = {}
+    v = config.get("vision_config")
+    if v != None and v.get("model_type") == "gemma4_vision":
+        heads = v["num_attention_heads"]
+        for key, want in [
+            ("hidden_activation", "gelu_pytorch_tanh"),
+            ("attention_bias", False),
+            ("num_key_value_heads", heads),
+            ("head_dim", v["hidden_size"] // heads),
+            ("patch_size", PATCH),
+            ("pooling_kernel_size", POOL),
+            ("default_output_length", SOFT_TOKENS),
+        ]:
+            if v.get(key, want) != want:
+                fail("its vision tower's {} is {}, where this family's tower runs {}".format(key, v[key], want))
+        if config.get("vision_soft_tokens_per_image", SOFT_TOKENS) != SOFT_TOKENS:
+            fail("it speaks a still in {} soft tokens; this family frames one in {}".format(config["vision_soft_tokens_per_image"], SOFT_TOKENS))
+        turn = v.get("rope_parameters") or {}
+        if turn.get("rope_type", "default") != "default":
+            fail("its vision tower turns its rope {}; this family's turns it unscaled".format(turn["rope_type"]))
+        towers[id] = vision_tower(
+            depth = v["num_hidden_layers"],
+            hidden = v["hidden_size"],
+            heads = heads,
+            inter = v["intermediate_size"],
+            clipped = v.get("use_clipped_linears", False),
+            standardize = v.get("standardize", False),
+            positions = v["position_embedding_size"],
+            theta = float(turn.get("rope_theta", 100.0)),
+            norm_eps = float(v.get("rms_norm_eps", 1e-6)),
+        )
+    parts = ["vision"] if towers else []
+    deployments = [
+        deployment(id, weights = BF, kv = BF),
+        deployment(id, weights = U4, kv = BF),
+        deployment(id, weights = BF, kv = dtype.e4m3),
+        deployment(id, weights = U4, kv = dtype.e4m3),
+        deployment(id, weights = [BF, dtype.nvfp4], kv = dtype.e4m3),
+    ]
+    if moe != None:
+        deployments.append(deployment(id, weights = [BF, dtype.nvfp4a4], kv = dtype.e4m3))
+    if towers:
+        deployments.append(deployment(id, weights = BF, kv = BF, parts = parts))
+        deployments.append(deployment(id, weights = U4, kv = BF, parts = parts))
+    return struct(
+        MODELS = [model(id, template = GEMMA if ple_dim != None else GEMMA_THOUGHT, tokenizer = TOKENIZER, parts = parts,
+                        arch = "gemma4", layers = layers, vocab = vocab)],
+        TRUNKS = {id: d},
+        TOWERS = towers,
+        DEPLOYMENTS = deployments,
+    )
 
 def modelopt(d, weights):
     """Whether `weights` is modelopt's NVFP4 export as nvidia ships it and
