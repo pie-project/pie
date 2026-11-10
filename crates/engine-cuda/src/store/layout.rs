@@ -663,45 +663,6 @@ impl Layout {
         }
     }
 
-    /// Makes `kind`'s pages step `packed` bytes, the step of kernels that
-    /// read a plane's pages one right after another (the HIP kernels: a page
-    /// id times a page's rows of the plane). `strides` are the packed page
-    /// strides of every plane in the shape's slot. One table names a slot
-    /// for all of them, so they must agree, and a slot and a chunk must be
-    /// whole numbers of the step for every slot to have a page id.
-    pub fn pack(&mut self, kind: Kind, strides: &[u64]) -> Result<()> {
-        let chunk_bytes = self.chunk_bytes;
-        let Some(&packed) = strides.first() else {
-            return Ok(());
-        };
-        let shape = match kind {
-            Kind::List => self.list.as_mut(),
-            Kind::Window => self.window.as_mut(),
-            Kind::Fixed | Kind::Rs => None,
-        };
-        let Some(shape) = shape else {
-            return Ok(());
-        };
-        if packed == 0
-            || strides.iter().any(|&stride| stride != packed)
-            || !shape.slot_bytes.is_multiple_of(packed)
-            || !chunk_bytes.is_multiple_of(packed)
-        {
-            return Err(Fault::Unbound {
-                what: format!(
-                    "{}s whose planes step {strides:?} bytes a page in slots of {} bytes and \
-                     chunks of {chunk_bytes}: this backend's kernels step every plane of a \
-                     page table by one packed page, which a slot and a chunk must be whole \
-                     numbers of",
-                    kind.name(),
-                    shape.slot_bytes
-                ),
-            });
-        }
-        shape.grain = packed;
-        Ok(())
-    }
-
     /// The chunks `slots` slots of a shape take.
     #[must_use]
     pub fn chunks_for(&self, kind: Kind, slots: u64) -> u64 {
@@ -720,54 +681,6 @@ fn gcd(mut a: u64, mut b: u64) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    fn layout_of(list: SlotShape, chunk_bytes: u64) -> Layout {
-        Layout {
-            chunk_bytes,
-            segment_chunks: 1,
-            list: Some(list),
-            window: None,
-            fixed: None,
-            rs: None,
-            rows: Vec::new(),
-            experts: Vec::new(),
-        }
-    }
-
-    #[test]
-    fn a_packed_shape_steps_its_pages_by_a_plane_and_refuses_planes_that_disagree() {
-        // Four planes of 3 units a page in a slot of 12, sixteen slots a chunk.
-        let unit = 256u64;
-        let chunk = 192 * unit;
-        let list = SlotShape {
-            id: LIST,
-            tokens: 16,
-            slot_bytes: 12 * unit,
-            per_chunk: 16,
-            grain: gcd(chunk, 12 * unit),
-            window: None,
-            rows: vec![(0, 0), (1, 6 * unit)],
-            pools: Vec::new(),
-        };
-        let mut layout = layout_of(list.clone(), chunk);
-        layout
-            .pack(Kind::List, &[3 * unit; 4])
-            .expect("the planes pack");
-        let packed = layout.list.as_ref().unwrap();
-        assert_eq!(packed.grain, 3 * unit);
-        for (chunk_id, index) in [(1u32, 0u32), (1, 5), (7, 15)] {
-            // A plane `at` bytes into the slot: its page id's packed step
-            // lands on the slot.
-            let q = packed.page_id(chunk, chunk_id, index);
-            assert_eq!(q * 3 * unit, packed.slot_at(chunk, chunk_id, index));
-        }
-        // Planes of two widths share no page id.
-        let mut layout = layout_of(list.clone(), chunk);
-        assert!(layout.pack(Kind::List, &[3 * unit, 6 * unit]).is_err());
-        // Nor does a slot that is no whole number of the step.
-        let mut layout = layout_of(list, chunk);
-        assert!(layout.pack(Kind::List, &[5 * unit; 2]).is_err());
-    }
 
     #[test]
     fn a_list_slot_is_read_by_its_slot_ref_and_a_window_slot_by_its_grain() {

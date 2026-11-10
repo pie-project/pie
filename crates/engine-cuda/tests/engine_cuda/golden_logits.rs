@@ -285,15 +285,12 @@ fn load_with(fixture: &Fixture, cache: &Path, knobs: engine_cuda::Knobs) -> Shel
 
 /// The load's knobs: `PIE_GOLDEN_CHUNK` (bytes) sets the chunk size the
 /// state pool aims near, so a miniature's records are cut into pieces as a
-/// full model's are; `PIE_GOLDEN_PACKED` lays the pool as a ROCm build does
-/// (pages stepped packed, records whole). The logits are the same either
-/// way, where the model loads.
+/// full model's are. The logits are the same either way.
 fn knobs() -> engine_cuda::Knobs {
     let mut knobs = engine_cuda::Knobs::default();
     if let Ok(bytes) = std::env::var("PIE_GOLDEN_CHUNK") {
         knobs.diagnostics.chunk_bytes = Some(bytes.parse().expect("PIE_GOLDEN_CHUNK is bytes"));
     }
-    knobs.diagnostics.packed_pages = std::env::var_os("PIE_GOLDEN_PACKED").is_some();
     // No weight shape stated: the tables and routed banks dense on the
     // device, as the base engine seats them. The weight cache's own probes
     // load with its shapes ([`load_cached`]).
