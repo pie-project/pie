@@ -24,6 +24,8 @@ pub struct PlannerStats {
     pub d2h_pages: AtomicU64,
     pub h2d_pages: AtomicU64,
     pub disk_write_pages: AtomicU64,
+    /// Of `disk_write_pages`, those that went on down from the host.
+    pub host_disk_pages: AtomicU64,
     pub disk_read_pages: AtomicU64,
     pub disk_write_us: AtomicU64,
     pub disk_read_us: AtomicU64,

@@ -309,19 +309,24 @@ pub fn stores(tier: Tier) -> Option<Bytes> {
                 }
             }
             Tier::Host => {
-                let (capacity, free) =
+                let (capacity, free, cached) =
                     store_registry::with_kv_lock(&stores.kv, "policy-pressure", |kv| {
-                        (kv.host_swap_capacity(), kv.host_swap_available())
+                        (
+                            kv.host_swap_capacity(),
+                            kv.host_swap_available(),
+                            kv.host_cache_pages(),
+                        )
                     });
                 let rs = stores.rs.lock().unwrap();
                 let (slots, free_slots) = (rs.host_capacity().slots, rs.host_available().slots);
                 drop(rs);
                 let state = page(u64::from(capacity).saturating_sub(free as u64))
                     .saturating_add(slot(slots.saturating_sub(free_slots)));
+                // Idle cache parked on the host is cache, not live.
                 Bytes {
                     total: page(u64::from(capacity)).saturating_add(slot(slots)),
                     state,
-                    live: state,
+                    live: state.saturating_sub(page(u64::from(cached))),
                     wanted: state,
                     act: 0,
                 }

@@ -368,6 +368,7 @@ async fn read_state(
                 out: true,
                 device,
                 slots,
+                source: None,
             };
             let completion = scheduler::copy_tier_tracked(engine, &copy)
                 .map_err(|error| failed("copying state to the host", error))?;

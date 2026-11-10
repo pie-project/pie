@@ -206,6 +206,11 @@ impl ResidencyPlanner {
             (Rs | RsPages | Window | RsSlots(_), _, false) => (&stats.h2d_rs_slots, None),
         };
         count.fetch_add(copy.device.len() as u64, Ordering::Relaxed);
+        if copy.source.is_some() {
+            stats
+                .host_disk_pages
+                .fetch_add(copy.device.len() as u64, Ordering::Relaxed);
+        }
         if let Some(us) = us {
             let micros = u64::try_from(elapsed.as_micros()).unwrap_or(u64::MAX);
             us.fetch_add(micros, Ordering::Relaxed);

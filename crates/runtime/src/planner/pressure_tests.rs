@@ -427,3 +427,105 @@ async fn state_short_on_a_shared_pool_is_kv_for_the_planner_to_park() {
     assert_eq!(own.rs_as_pages(RsUnits::of(0, 5)), 0);
     parked.abort();
 }
+
+/// A device and host of idle cache, and what the planner asked to move of
+/// it: `("spill" | "demote", room)` in order.
+struct TieredPool {
+    host: (u32, u32),
+    disk: (u32, u32),
+    asked: parking_lot::Mutex<Vec<(&'static str, usize)>>,
+}
+
+impl PoolPort for TieredPool {
+    fn chunk_stats(&self) -> ChunkStats {
+        ChunkStats {
+            pages: (0, 64),
+            rs: Default::default(),
+        }
+    }
+    fn host_stats(&self) -> (u32, u32) {
+        self.host
+    }
+    fn disk_stats(&self) -> (u32, u32) {
+        self.disk
+    }
+    fn rs_host_stats(&self) -> (RsUnits, RsUnits) {
+        Default::default()
+    }
+    fn reclaim_idle(&self) -> u32 {
+        0
+    }
+    fn reclaimable_idle(&self) -> u32 {
+        0
+    }
+    fn suspend_capable(&self) -> bool {
+        true
+    }
+    fn locus(&self) -> (usize, usize) {
+        (usize::MAX, 0)
+    }
+    fn reserve_device(&self, _count: u32) -> Option<Vec<PhysicalKvPageId>> {
+        None
+    }
+    fn reserve_device_up_to(&self, _count: u32) -> Vec<PhysicalKvPageId> {
+        Vec::new()
+    }
+    fn release_device(&self, _pages: Vec<PhysicalKvPageId>) {}
+    fn reserve_rs(&self, _need: RsUnits) -> Option<crate::store::rs::RsGrant> {
+        None
+    }
+    fn release_rs(&self, _grant: crate::store::rs::RsGrant) {}
+    fn reclaim_sharing(&self, _working_sets: &[crate::store::rs::RsWorkingSetId]) -> usize {
+        0
+    }
+    fn prepare_sweep(
+        &self,
+        _keep: &HashSet<crate::store::kv::page_table::WorkingSetId>,
+        _room: usize,
+        _order: &[(crate::store::kv::page_table::WorkingSetId, u64)],
+        _wanted: usize,
+    ) -> Option<crate::store::kv::KvResidencyTxn> {
+        None
+    }
+    fn prepare_demote(&self, room: usize) -> Option<crate::store::kv::KvResidencyTxn> {
+        self.asked.lock().push(("demote", room));
+        None
+    }
+    fn prepare_spill(&self, room: usize) -> Option<crate::store::kv::KvSpillTxn> {
+        self.asked.lock().push(("spill", room));
+        None
+    }
+}
+
+/// A host with no room past its reserve is under pressure: its own idle
+/// cache is asked to go on down to disk (a reserve's worth, at least)
+/// before the device's is demoted past it. A host with room is not.
+#[test]
+fn a_host_short_of_room_spills_its_cache_to_disk_before_the_device_demotes() {
+    let asked = |host: (u32, u32), disk: (u32, u32)| {
+        let pool = Arc::new(TieredPool {
+            host,
+            disk,
+            asked: Default::default(),
+        });
+        let planner = Arc::new(ResidencyPlanner::new(pool.clone() as Arc<dyn PoolPort>));
+        assert!(!planner.demote_idle(), "nothing moves: none was offered");
+        std::mem::take(&mut *pool.asked.lock())
+    };
+    // 80 host slots keep 10 back: 8 free is short of room.
+    assert_eq!(
+        asked((8, 80), (20, 64)),
+        [("spill", 10), ("demote", 20)],
+        "the host's cache first; the device's then past the host"
+    );
+    assert_eq!(
+        asked((50, 80), (20, 64)),
+        [("demote", 60)],
+        "a host with room takes the device's"
+    );
+    assert_eq!(
+        asked((8, 80), (0, 64)),
+        [],
+        "nothing goes where neither tier has room"
+    );
+}

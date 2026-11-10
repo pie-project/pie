@@ -1589,6 +1589,33 @@ impl KvPageTable {
         roots: &[NodeId],
         above: &[NodeId],
     ) -> Vec<(TriePageLocation, PhysicalKvPageId)> {
+        self.cache_only(roots, above, |backing| match backing {
+            KvPageBacking::Resident(id) => Some(id),
+            _ => None,
+        })
+    }
+
+    /// What only the cache reads of `roots` and is parked on the host: it
+    /// can go on down to disk.
+    pub fn cache_only_host_slots(
+        &self,
+        roots: &[NodeId],
+        above: &[NodeId],
+    ) -> Vec<(TriePageLocation, HostKvSlotId)> {
+        self.cache_only(roots, above, |backing| match backing {
+            KvPageBacking::Swapped(slot) => Some(slot),
+            _ => None,
+        })
+    }
+
+    /// The pages of `roots` no working set, pin, move or root of `above`
+    /// reads, as `pick` takes their backings.
+    fn cache_only<T>(
+        &self,
+        roots: &[NodeId],
+        above: &[NodeId],
+        pick: impl Fn(KvPageBacking) -> Option<T>,
+    ) -> Vec<(TriePageLocation, T)> {
         if roots.is_empty() {
             return Vec::new();
         }
@@ -1615,7 +1642,7 @@ impl KvPageTable {
                 {
                     return;
                 }
-                if let Ok(KvPageBacking::Resident(id)) = self.backing_at(&location) {
+                if let Some(id) = self.backing_at(&location).ok().and_then(&pick) {
                     pages.push((location, id));
                 }
             });
@@ -1634,11 +1661,21 @@ impl KvPageTable {
     }
 
     pub fn holds_resident(&self, root: NodeId) -> bool {
+        self.holds(root, |backing| {
+            matches!(backing, KvPageBacking::Resident(_))
+        })
+    }
+
+    /// Whether any page on `root`'s path is parked on the host.
+    pub fn holds_on_host(&self, root: NodeId) -> bool {
+        self.holds(root, |backing| matches!(backing, KvPageBacking::Swapped(_)))
+    }
+
+    fn holds(&self, root: NodeId, backed: impl Fn(&KvPageBacking) -> bool) -> bool {
         self.path_nodes(root).into_iter().any(|node| {
             matches!(
                 self.nodes.get(node).map(|n| &n.pages),
-                Some(Pages::Owned { backings, .. })
-                    if backings.iter().any(|backing| matches!(backing, KvPageBacking::Resident(_)))
+                Some(Pages::Owned { backings, .. }) if backings.iter().any(&backed)
             )
         })
     }

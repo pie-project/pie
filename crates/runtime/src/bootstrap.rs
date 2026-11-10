@@ -656,7 +656,7 @@ async fn bootstrap_inner(config: Config) -> Result<BootstrapHandle> {
                      hogs={} starved={} restarted={} salvaged={} swapfull={}/{} e6_relax={} rshort={} \
                      lock_n={} lock_wait_ms={} lock_hold_ms={} lock_wmax_us={} lock_hmax_us={} \
                      d2h_pages={} h2d_pages={} d2h_rs={} h2d_rs={} d2h_ms={} h2d_ms={} \
-                     disk_free={}/{} disk_w_pages={} disk_r_pages={} disk_w_ms={} disk_r_ms={} \
+                     disk_free={}/{} disk_w_pages={} host_disk_pages={} disk_r_pages={} disk_w_ms={} disk_r_ms={} \
                      resident={} evicting={} evicted={} restoring={} admitted={} \
                      runners=[{}]",
                     d.queue.len(),
@@ -703,6 +703,7 @@ async fn bootstrap_inner(config: Config) -> Result<BootstrapHandle> {
                     d.disk_slots_free,
                     d.disk_slots_total,
                     d.disk_write_pages_total,
+                    d.host_disk_pages_total,
                     d.disk_read_pages_total,
                     d.disk_write_us_total / 1000,
                     d.disk_read_us_total / 1000,
