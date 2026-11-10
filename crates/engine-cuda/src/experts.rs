@@ -330,6 +330,20 @@ impl Ranking {
                 self.floor_bytes += whole(&bank);
             }
         }
+        // A packed bank the cache takes, each plane of it: off the sequence
+        // the plan cuts.
+        for group in std::mem::take(&mut self.sequence) {
+            if group.routed && cached.contains(&group.param) {
+                self.cached.extend(
+                    group
+                        .planes
+                        .iter()
+                        .map(|plane| (plane.param, plane.reserved)),
+                );
+            } else {
+                self.sequence.push(group);
+            }
+        }
         self
     }
 

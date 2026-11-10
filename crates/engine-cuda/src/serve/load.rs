@@ -1014,10 +1014,20 @@ impl Shell {
             .into_iter()
             .filter_map(|param| match weights.table().0.get(param as usize) {
                 Some(Some(crate::run::WeightRow::Dense(bank))) => Some((param, bank.ptr)),
+                Some(Some(crate::run::WeightRow::Planes { codes, .. })) => Some((param, codes.ptr)),
                 _ => None,
             })
             .collect();
-        pools.seat_experts(&hosts)?;
+        // A packed bank's planes share its codes' table.
+        let groups: Vec<(u32, Vec<Option<u32>>)> = pools
+            .expert_params()
+            .into_iter()
+            .filter_map(|param| {
+                let planes = crate::store::layout::packed_planes(&boot.trace, param as usize);
+                (!planes.is_empty()).then_some((param, planes))
+            })
+            .collect();
+        pools.seat_experts(&hosts, &groups)?;
         // Committed whole: a fire reading out past one row a lane (a verify
         // reads every row) would otherwise grow it outside the fit.
         let mut arena = Arena::reserve(arena_bytes);
