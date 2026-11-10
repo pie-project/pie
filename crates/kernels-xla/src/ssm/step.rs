@@ -80,6 +80,7 @@ fn kernel(t: i64, g: i64, hv: i64, rows: i64, per: i64) -> Built<crate::mosaic::
     let state = per * dv;
     // the two state buffers and a few f32 copies of a state as it steps
     let nb: i64 = super::step_bufs_n();
+    let heads = super::step_heads_on();
     let vmem = nb * state * 2 + 6 * state * 4 + 2 * 6 * g * hv * 128 * 4 + (8 << 20);
     let k = Kernel {
         name: "gdn_step".into(),
@@ -168,41 +169,93 @@ fn kernel(t: i64, g: i64, hv: i64, rows: i64, per: i64) -> Built<crate::mosaic::
                 let x = b.vload(x, &[ri, i0, i0], &[1, hv, w])?;
                 b.shape_cast(x, &[hv, w])
             };
-            let st = b.vload(buf, &[si, i0, i0], &[1, per, dv])?;
-            let st = b.convert_f(st, Elem::F32)?;
-            let st = b.shape_cast(st, &[hv, dk, dv])?;
-            let full = [hv, dk, dv];
-            let a = at(b, a_r, dv)?;
-            let a = b.shape_cast(a, &[hv, 1, dv])?;
-            let a = b.broadcast(a, &full)?;
-            let s1 = b.mulf(st, a)?;
-            let column = |b: &mut Body, x: V| -> Built<V> {
-                let x = at(b, x, dk)?;
-                let x = b.shape_cast(x, &[hv, dk, 1])?;
-                b.broadcast(x, &full)
-            };
-            let qb = column(b, q_r)?;
-            let kb = column(b, k_r)?;
-            let sq = b.mulf(s1, qb)?;
-            let sq = b.reduce_sum(sq, 1)?;
-            let mem = b.mulf(s1, kb)?;
-            let mem = b.reduce_sum(mem, 1)?;
-            let v = at(b, v_r, dv)?;
-            let beta = at(b, b_r, dv)?;
-            let qk = at(b, qk_r, dv)?;
-            let delta = b.subf(v, mem)?;
-            let delta = b.mulf(beta, delta)?;
-            let dy = b.mulf(delta, qk)?;
-            let y = b.addf(sq, dy)?;
-            let y = b.shape_cast(y, &[1, hv, dv])?;
-            b.vstore(y, y_r, &[ri, i0, i0])?;
-            let d = b.shape_cast(delta, &[hv, 1, dv])?;
-            let d = b.broadcast(d, &full)?;
-            let upd = b.mulf(kb, d)?;
-            let s2 = b.addf(s1, upd)?;
-            let s2 = b.convert_f(s2, Elem::Bf16)?;
-            let s2 = b.shape_cast(s2, &[1, per, dv])?;
-            b.vstore(s2, buf, &[si, i0, i0])?;
+            if heads {
+                // a head at a time: each head's state, its columns of q and
+                // k and its products stay a few vregs, not whole-state
+                // temporaries in VMEM
+                let a = at(b, a_r, dv)?;
+                let q = at(b, q_r, dk)?;
+                let k = at(b, k_r, dk)?;
+                let v = at(b, v_r, dv)?;
+                let beta = at(b, b_r, dv)?;
+                let qk = at(b, qk_r, dv)?;
+                let full = [1, dk, dv];
+                for h in 0..hv {
+                    let off = b.index(h * dk);
+                    let st = b.vload(buf, &[si, off, i0], &[1, dk, dv])?;
+                    let st = b.convert_f(st, Elem::F32)?;
+                    let row = |b: &mut Body, x: V, w: i64| b.slice(x, &[h, 0], &[1, w]);
+                    let column = |b: &mut Body, x: V| -> Built<V> {
+                        let x = row(b, x, dk)?;
+                        let x = b.shape_cast(x, &[1, dk, 1])?;
+                        b.broadcast(x, &full)
+                    };
+                    let qb = column(b, q)?;
+                    let kb = column(b, k)?;
+                    let ah = row(b, a, dv)?;
+                    let sq = b.mulf(st, qb)?;
+                    let sq = b.reduce_sum(sq, 1)?;
+                    let sq = b.mulf(sq, ah)?;
+                    let mem = b.mulf(st, kb)?;
+                    let mem = b.reduce_sum(mem, 1)?;
+                    let mem = b.mulf(mem, ah)?;
+                    let vh = row(b, v, dv)?;
+                    let bh = row(b, beta, dv)?;
+                    let qkh = row(b, qk, dv)?;
+                    let delta = b.subf(vh, mem)?;
+                    let delta = b.mulf(bh, delta)?;
+                    let dy = b.mulf(delta, qkh)?;
+                    let y = b.addf(sq, dy)?;
+                    let y = b.shape_cast(y, &[1, 1, dv])?;
+                    let hi = b.index(h);
+                    b.vstore(y, y_r, &[ri, hi, i0])?;
+                    let a3 = b.shape_cast(ah, &[1, 1, dv])?;
+                    let a3 = b.broadcast(a3, &full)?;
+                    let s1 = b.mulf(st, a3)?;
+                    let d3 = b.shape_cast(delta, &[1, 1, dv])?;
+                    let d3 = b.broadcast(d3, &full)?;
+                    let upd = b.mulf(kb, d3)?;
+                    let s2 = b.addf(s1, upd)?;
+                    let s2 = b.convert_f(s2, Elem::Bf16)?;
+                    b.vstore(s2, buf, &[si, off, i0])?;
+                }
+            } else {
+                let st = b.vload(buf, &[si, i0, i0], &[1, per, dv])?;
+                let st = b.convert_f(st, Elem::F32)?;
+                let st = b.shape_cast(st, &[hv, dk, dv])?;
+                let full = [hv, dk, dv];
+                let a = at(b, a_r, dv)?;
+                let a = b.shape_cast(a, &[hv, 1, dv])?;
+                let a = b.broadcast(a, &full)?;
+                let s1 = b.mulf(st, a)?;
+                let column = |b: &mut Body, x: V| -> Built<V> {
+                    let x = at(b, x, dk)?;
+                    let x = b.shape_cast(x, &[hv, dk, 1])?;
+                    b.broadcast(x, &full)
+                };
+                let qb = column(b, q_r)?;
+                let kb = column(b, k_r)?;
+                let sq = b.mulf(s1, qb)?;
+                let sq = b.reduce_sum(sq, 1)?;
+                let mem = b.mulf(s1, kb)?;
+                let mem = b.reduce_sum(mem, 1)?;
+                let v = at(b, v_r, dv)?;
+                let beta = at(b, b_r, dv)?;
+                let qk = at(b, qk_r, dv)?;
+                let delta = b.subf(v, mem)?;
+                let delta = b.mulf(beta, delta)?;
+                let dy = b.mulf(delta, qk)?;
+                let y = b.addf(sq, dy)?;
+                let y = b.shape_cast(y, &[1, hv, dv])?;
+                b.vstore(y, y_r, &[ri, i0, i0])?;
+                let d = b.shape_cast(delta, &[hv, 1, dv])?;
+                let d = b.broadcast(d, &full)?;
+                let upd = b.mulf(kb, d)?;
+                let s2 = b.addf(s1, upd)?;
+                let s2 = b.convert_f(s2, Elem::Bf16)?;
+                let s2 = b.shape_cast(s2, &[1, per, dv])?;
+                b.vstore(s2, buf, &[si, i0, i0])?;
+            }
             copy(b, row, s, true, false)?;
             let last = b.i32(t - 1);
             let fin = b.cmpi(ICmp::Eq, row, last)?;

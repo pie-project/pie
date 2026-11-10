@@ -80,6 +80,20 @@ pub(crate) fn step_bufs_n() -> i64 {
     .clamp(2, 4)
 }
 
+static STEP_HEADS: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(2);
+
+/// Scratch: the step kernel a head at a time (`None`: `PIE_GDN_STEP_HEADS=1`).
+pub fn step_heads(on: Option<bool>) {
+    STEP_HEADS.store(on.map_or(2, u8::from), std::sync::atomic::Ordering::Relaxed);
+}
+
+pub(crate) fn step_heads_on() -> bool {
+    match STEP_HEADS.load(std::sync::atomic::Ordering::Relaxed) {
+        2 => std::env::var("PIE_GDN_STEP_HEADS").is_ok_and(|v| v == "1"),
+        v => v == 1,
+    }
+}
+
 fn step_kernel_on() -> bool {
     match STEP_KERNEL.load(std::sync::atomic::Ordering::Relaxed) {
         2 => !std::env::var("PIE_GDN_STEP_KERNEL").is_ok_and(|v| v == "0"),
