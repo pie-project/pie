@@ -294,3 +294,12 @@ The `new-memory/` directory is bookkeeping and is removed before anything lands 
 - Merge note: MG-B and MG-D both added a space-order hook; unified as `window_space_first` (mimo_v2, ltx_2).
 - Verified: `cargo check` poem-compiler (tests); `moved::ltx_2` and `moved::mimo_v2` after the unification.
 - Remaining: MG-C (kimi_k3, glm_5_next, hy_4, minimax_m3, minimax_h3, qwen_4), then delete the old caches() API.
+
+### M18 — 2026-11-10: MG-C merged (28 of 29 models on state handles)
+- `sc/mg-c`: minimax_m3 (40 traces), hy_4 (40), kimi_k3 (24), glm_5_next (48), qwen_4 (48) on handles;
+  lib/mla `FP8_ROW`/`fp8_rows`/`cache` deleted; lib/kda `kda()` declares its own conv/delta states (`kda_caches`
+  deleted). Accepted differences: index keys share one space per dtype (was one space per layer); glm_5_next's
+  zero-width rope plane becomes one 512-wide latent plane (MLA reads 0 rope bytes; confirm on GPU).
+- Not migrated: minimax_h3 — its rows come from lib/qwen3_encoder (`encoder()` + `qwen3_caches`), shared with
+  flux_2/z_image (which use the temporary `lib/dit.held_text_encoder`). Final cleanup package FC handles it.
+- Verified: `cargo check` poem-compiler (tests); `moved::glm_5_next`, `moved::qwen_4`.
