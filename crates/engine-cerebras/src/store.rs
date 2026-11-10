@@ -22,6 +22,7 @@
 pub mod kv;
 pub mod pool;
 pub mod stage;
+pub mod tier;
 
 use engine::transfer::KvRun;
 use kernels_cerebras::{KvPool, RecurrentPool, Tensor};

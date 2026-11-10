@@ -265,6 +265,8 @@ pub struct HostPool {
     committed: u32,
     table: ChunkTable,
     dry: bool,
+    /// The host chunks and the kv slot file below the pool.
+    pub(super) tiers: super::tier::Tiers,
 }
 
 impl HostPool {
@@ -279,6 +281,7 @@ impl HostPool {
             table: ChunkTable::identity(layout.total_chunks),
             layout,
             dry,
+            tiers: super::tier::Tiers::default(),
         };
         pool.commit(max)
             .expect("a pool commits the segments it lays out");
@@ -342,6 +345,10 @@ impl HostPool {
                     role: shape.role,
                 })
                 .collect(),
+            host_chunks: self.host_chunks(),
+            disk_chunks: self.disk_chunks(),
+            disk_persistent: self.disk_persistent(),
+            disk_kept: self.disk_kept(),
             ..ChunkFacts::default()
         }
     }
