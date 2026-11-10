@@ -45,12 +45,21 @@ pub enum Source {
     Pack,
     /// An activation computed by this fire; zeros until written.
     Temp,
+    /// A streamed weight (`crate::store::streamed`): it lives in the pool,
+    /// read through per-fire tables, never as a parameter of its own.
+    Streamed { param: u32 },
+    /// An activation an earlier segment of a cut fire computed
+    /// ([`Tracer::cut`]): root `root`'s value as that segment landed it.
+    Carried { root: u32 },
 }
 
 impl Source {
     #[must_use]
     pub const fn on_device(self) -> bool {
-        !matches!(self, Source::Temp | Source::Packed { .. })
+        !matches!(
+            self,
+            Source::Temp | Source::Packed { .. } | Source::Streamed { .. }
+        )
     }
 
     #[must_use]
@@ -234,7 +243,20 @@ pub struct Tracer<'h> {
 /// Where the pack's own parameter is kept among the traced roots.
 const PACK_ROOT: u32 = u32::MAX;
 
+/// One segment of a fire cut by [`Tracer::cut`]: its program, and the
+/// activation roots whose values it returns after its pool results, in
+/// order.
+#[derive(Debug, Clone)]
+pub struct Segment {
+    pub text: String,
+    pub sig: Signature,
+    pub carried: Vec<u32>,
+}
+
 struct State {
+    /// Segments a cut closed, and the activation roots they carry.
+    segments: Vec<Segment>,
+    carried: std::collections::BTreeSet<u32>,
     pack_len: u32,
     func: Func,
     current: BTreeMap<u32, Val>,
@@ -257,6 +279,8 @@ impl<'h> Tracer<'h> {
             tuning: kernels_xla::tuning::Tuning::DEFAULT,
             handles,
             state: RefCell::new(State {
+                segments: Vec::new(),
+                carried: std::collections::BTreeSet::new(),
                 pack_len: 0,
                 func: Func::new("main"),
                 current: BTreeMap::new(),
@@ -295,10 +319,19 @@ impl<'h> Tracer<'h> {
             current,
             params,
             pack_len,
+            carried,
             ..
         } = &mut *state;
         let (root, _) = self.locate(t)?;
-        root_value(self.handles, func, current, params, *pack_len, root)
+        root_value(
+            self.handles,
+            func,
+            current,
+            params,
+            *pack_len,
+            carried,
+            root,
+        )
     }
 
     /// Runs `f` against the function under construction.
@@ -325,11 +358,66 @@ impl<'h> Tracer<'h> {
             written,
             ..
         } = self.state.into_inner();
+        close(self.handles, func, &current, params, &written, extra)
+    }
+
+    /// [`Tracer::finish`], and the segments cuts closed before it.
+    pub fn finish_segments(self, extra: &[Val]) -> (Vec<Segment>, String, Signature) {
+        let segments = std::mem::take(&mut self.state.borrow_mut().segments);
+        let (text, sig) = self.finish(extra);
+        (segments, text, sig)
+    }
+
+    /// Closes the program traced so far as a segment of its own: its pool
+    /// results, then the value of every activation root it wrote, which the
+    /// next segment reads as a parameter (`Source::Carried`). What is traced
+    /// next starts a new program over the pool that segment leaves. Values
+    /// a caller holds of the closed program mean nothing after.
+    pub fn cut(&self) {
+        let mut state = self.state.borrow_mut();
+        let rope_flat = self.tuning.rope_flat_rows;
+        let mut func = Func::new("main");
+        func.set_rope_flat_rows(rope_flat);
+        let func = std::mem::replace(&mut state.func, func);
+        let current = std::mem::take(&mut state.current);
+        let params = std::mem::take(&mut state.params);
+        let written = std::mem::take(&mut state.written);
+        state.sums.clear();
+        state.view_reads.clear();
+        state.views.clear();
+        let carried: Vec<u32> = written
+            .keys()
+            .copied()
+            .filter(|&root| {
+                matches!(
+                    self.handles.root_of(root).source,
+                    Source::Temp | Source::Carried { .. }
+                )
+            })
+            .collect();
+        let extra: Vec<Val> = carried.iter().map(|root| current[root]).collect();
+        let (text, sig) = close(self.handles, func, &current, params, &written, &extra);
+        state.carried.extend(carried.iter().copied());
+        state.segments.push(Segment { text, sig, carried });
+    }
+}
+
+/// A traced function as a module: pool roots written become aliased
+/// results, then `extra` values.
+fn close(
+    handles: &Handles,
+    func: Func,
+    current: &BTreeMap<u32, Val>,
+    params: Vec<(u32, Source)>,
+    written: &BTreeMap<u32, ()>,
+    extra: &[Val],
+) -> (String, Signature) {
+    {
         let mut results: Vec<Val> = Vec::new();
         let mut sig_results = Vec::new();
         let mut aliases: Vec<(usize, u32)> = Vec::new();
-        for (&root, ()) in &written {
-            let source = self.handles.root_of(root).source;
+        for (&root, ()) in written {
+            let source = handles.root_of(root).source;
             if !source.persistent() {
                 continue;
             }
@@ -376,12 +464,30 @@ fn root_value(
     current: &mut BTreeMap<u32, Val>,
     params: &mut Vec<(u32, Source)>,
     pack_len: u32,
+    carried: &std::collections::BTreeSet<u32>,
     root: u32,
 ) -> Result<Val, kernels_xla::Error> {
     if let Some(&v) = current.get(&root) {
         return Ok(v);
     }
     let r = handles.root_of(root);
+    if let Source::Streamed { param } = r.source {
+        return Err(kernels_xla::Error::Backend {
+            op: "trace",
+            detail: format!(
+                "weight {param} streams through the pool and is read only through its \
+                 tables, never whole"
+            ),
+        });
+    }
+    let r = if r.source == Source::Temp && carried.contains(&root) {
+        Root {
+            source: Source::Carried { root },
+            ..r
+        }
+    } else {
+        r
+    };
     let ty = storage(r.dtype, r.rows, r.width).ok_or_else(|| kernels_xla::Error::Backend {
         op: "trace",
         detail: format!("root {root} is {:?}, which has no storage form", r.dtype),
@@ -442,6 +548,7 @@ fn root_value(
 struct Lens<'a> {
     handles: &'a Handles,
     pack_len: u32,
+    carried: &'a std::collections::BTreeSet<u32>,
     current: &'a mut BTreeMap<u32, Val>,
     params: &'a mut Vec<(u32, Source)>,
     written: &'a mut BTreeMap<u32, ()>,
@@ -474,6 +581,7 @@ impl Env for Lens<'_> {
             self.current,
             self.params,
             self.pack_len,
+            self.carried,
             root,
         )?;
         if r.source.persistent() {
@@ -548,6 +656,7 @@ impl Env for Lens<'_> {
                 self.current,
                 self.params,
                 self.pack_len,
+                self.carried,
                 root,
             )?;
             let at = f.const_i(Elem::I32, i64::from(offset), &[]);
@@ -696,6 +805,11 @@ impl Emit for Tracer<'_> {
         self.state.borrow_mut().func.set_scope(Some(name));
     }
 
+    fn cut(&self) -> bool {
+        Tracer::cut(self);
+        true
+    }
+
     fn emit(
         &self,
         body: &mut dyn FnMut(&mut Cx<'_>) -> Result<(), kernels_xla::Error>,
@@ -710,10 +824,13 @@ impl Emit for Tracer<'_> {
             sums,
             view_reads,
             views,
+            carried,
+            ..
         } = &mut *state;
         let mut lens = Lens {
             handles: self.handles,
             pack_len: *pack_len,
+            carried,
             current,
             params,
             written,

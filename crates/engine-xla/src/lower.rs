@@ -97,6 +97,37 @@ impl Lower<'_, '_> {
         })
     }
 
+    /// A streamed bank (`crate::store::streamed`) as the dense
+    /// `[experts · rows, width]` value the base build reads: expert `e`'s
+    /// rows gathered from the pool view at `loc[e]`.
+    pub fn streamed_bank(
+        &mut self,
+        bank: crate::store::streamed::Bank,
+        width: u32,
+    ) -> Result<Operand, Error> {
+        use kernels_xla::hlo::Elem;
+        let view = self.read(bank.view)?;
+        let loc = self.read(bank.loc)?;
+        let (e, r) = (i64::from(bank.experts), i64::from(bank.view_rows));
+        let f = self.cx.func();
+        let loc = f.reshape(loc.val, &[e])?;
+        let loc = f.broadcast(loc, &[e, r], &[0])?;
+        let iota = f.iota(Elem::I32, &[e, r], 1);
+        let idx = f.add(loc, iota)?;
+        let idx = f.reshape(idx, &[e * r])?;
+        let val = f.take_rows(view.val, idx)?;
+        let val = f.reshape(
+            val,
+            &[i64::from(bank.experts * bank.rows), i64::from(width)],
+        )?;
+        Ok(Operand {
+            val,
+            rows: bank.experts * bank.rows,
+            width,
+            dtype: dtype::Dtype::Bf16,
+        })
+    }
+
     /// A ragged tensor's data, then its indptr.
     pub fn ragged(
         &mut self,

@@ -56,7 +56,40 @@ pub fn run_program(
     inputs: &Inputs,
     wait: bool,
 ) -> Result<Vec<Buffer>> {
-    bind_and_run(device, &program.sig, program, weights, pools, inputs, wait)
+    bind_and_run(
+        device,
+        &program.sig,
+        program,
+        weights,
+        pools,
+        inputs,
+        None,
+        wait,
+    )
+}
+
+/// Runs a segment of a cut fire (`crate::trace::Tracer::cut`) or the last
+/// one: its carried parameters from `carried` (activation root -> the
+/// buffer an earlier segment returned for it).
+pub fn run_carried(
+    device: &Device,
+    program: &crate::device::Program,
+    weights: Option<&Weights>,
+    pools: &mut Pools,
+    inputs: &Inputs,
+    carried: &std::collections::BTreeMap<u32, Buffer>,
+    wait: bool,
+) -> Result<Vec<Buffer>> {
+    bind_and_run(
+        device,
+        &program.sig,
+        program,
+        weights,
+        pools,
+        inputs,
+        Some(carried),
+        wait,
+    )
 }
 
 /// A maintenance program: pools and `inputs` in, nothing out.
@@ -69,6 +102,7 @@ pub fn maintain(
     run(device, tracer, &[], None, pools, inputs, false).map(|_| ())
 }
 
+#[allow(clippy::too_many_arguments)]
 fn bind_and_run(
     device: &Device,
     sig: &Signature,
@@ -76,6 +110,7 @@ fn bind_and_run(
     weights: Option<&Weights>,
     pools: &mut Pools,
     inputs: &Inputs,
+    carried: Option<&std::collections::BTreeMap<u32, Buffer>>,
     wait: bool,
 ) -> Result<Vec<Buffer>> {
     if device.is_dry() {
@@ -116,7 +151,8 @@ fn bind_and_run(
             Source::Pool { row, plane } => pools.get(row, plane),
             Source::Input { input } => uploaded.iter().find(|(i, _)| *i == input).map(|(_, b)| b),
             Source::Pack => pack.as_ref(),
-            Source::Temp | Source::Packed { .. } => None,
+            Source::Carried { root } => carried.and_then(|c| c.get(&root)),
+            Source::Temp | Source::Packed { .. } | Source::Streamed { .. } => None,
         }
         .ok_or_else(|| Fault::Unbound {
             what: format!("parameter {at} ({source:?}), which nothing on this device holds"),

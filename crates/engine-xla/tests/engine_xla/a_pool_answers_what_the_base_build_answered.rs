@@ -2,7 +2,10 @@
 //! readout of a fixed scenario, bit for bit. With `PIE_XLA_GOLDEN_DUMP=<dir>`
 //! the readouts are written there (one file a model); with
 //! `PIE_XLA_GOLDEN=<dir>` they are compared against what a build wrote
-//! there. Skipped without a PJRT plugin.
+//! there. `PIE_XLA_WEIGHTS_HELD=1` loads told the weights are held (a
+//! deployment that does not stream: nothing streams, and every program is
+//! the base build's, which `PIE_XLA_DUMP` dumps show). Skipped without a
+//! PJRT plugin.
 
 use crate::common_llm::{Model, scenario};
 
@@ -25,7 +28,12 @@ fn run(name: &str, layers: Option<u32>, context: u32, long: Option<u32>) {
     let Some(_device) = crate::common_dit::device() else {
         return;
     };
-    let mut model = Model::load(name, layers, context, 7);
+    let held = std::env::var("PIE_XLA_WEIGHTS_HELD").is_ok_and(|v| v == "1");
+    let mut model = if held {
+        Model::load_held(name, layers, context, 7)
+    } else {
+        Model::load(name, layers, context, 7)
+    };
     let readouts = scenario(&mut model, long);
     assert!(
         readouts.iter().all(|r| !r.is_empty()),
@@ -73,6 +81,11 @@ fn a_routed_model_answers_bit_for_bit() {
 #[test]
 fn a_windowed_model_answers_bit_for_bit_past_its_window() {
     run("gemma4-e4b-mini-l1", None, 1024, Some(700));
+}
+
+#[test]
+fn a_routed_model_answers_bit_for_bit() {
+    run("qwen3-30b-a3b-mini", None, 256, None);
 }
 
 /// Prompts a sequence, decodes two steps, then decodes on: with `park`, its

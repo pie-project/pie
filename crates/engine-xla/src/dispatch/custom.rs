@@ -109,12 +109,24 @@ impl Run<'_> {
         {
             return Ok(false);
         }
+        let (up_streamed, down_streamed) =
+            (self.streamed_bank(up_bank), self.streamed_bank(down_bank));
+        if let Some(b) = up_streamed.or(down_streamed) {
+            self.cut_for(b, routes).map_err(crate::error::kernel)?;
+        }
+        let (up_t, down_t) = (self.tensor(up_bank), self.tensor(down_bank));
         let mut fused = false;
         crate::lower::lower(self.ctx(), |l| {
             let x_v = l.read(self.tensor(x))?;
-            let up_v = l.read(self.tensor(up_bank))?;
+            let up_v = match up_streamed {
+                Some(b) => l.streamed_bank(b, up_t.width)?,
+                None => l.read(up_t)?,
+            };
             let routes_v = l.read(self.tensor(routes))?;
-            let down_v = l.read(self.tensor(down_bank))?;
+            let down_v = match down_streamed {
+                Some(b) => l.streamed_bank(b, down_t.width)?,
+                None => l.read(down_t)?,
+            };
             let weights_v = l.read(self.tensor(*weights))?;
             let o_y = self.tensor(*y);
             let tuning = l.tuning();

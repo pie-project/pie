@@ -196,6 +196,13 @@ pub struct Rows<'a> {
 impl Layout {
     /// The layout of `rows`, its chunk near `target` bytes.
     pub fn of(rows: &Rows<'_>, target: u64) -> Result<Layout> {
+        Layout::of_with(rows, target, 1, 0)
+    }
+
+    /// [`Layout::of`] with a chunk that is also a multiple of `unit` and no
+    /// smaller than `least` bytes: what the streamed weights' slots need
+    /// (`crate::store::streamed`). `(1, 0)` is [`Layout::of`].
+    pub fn of_with(rows: &Rows<'_>, target: u64, unit: u64, least: u64) -> Result<Layout> {
         let page = rows.page.max(1);
         let mut kv_rows: Vec<ListRow> = Vec::new();
         let mut window_rows: Vec<ListRow> = Vec::new();
@@ -291,8 +298,8 @@ impl Layout {
         // The chunk: a multiple of every run, of a tile, and of the kv list
         // slot where that costs nothing past the target; never smaller than
         // a list slot or a state block.
-        let mut grain = TILE_BYTES;
-        let mut least = 0u64;
+        let mut grain = lcm(TILE_BYTES, unit.max(1));
+        let mut least = least;
         for shape in shapes.iter().chain(rs_shape.as_ref()) {
             least = least.max(shape.slot_bytes);
             for plane in &shape.planes {
