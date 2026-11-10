@@ -623,3 +623,10 @@ The `new-memory/` directory is bookkeeping and is removed before anything lands 
   fires stage named slots into per-fire planes and copy back; one window list (widest) interim; weights always host
   -> no weight shapes. 124 lib tests incl. host-simulation word-for-word checks. Unverified on CS hardware.
   Behavior: recurrent models' lanes per fire <= state slots. Wafer `Spatial` engine still degenerate.
+
+### M44 — 2026-11-10: Cerebras tiers (contract 22)
+- `sc/cb-chunk-pool` (97a8139ce, 1a0f80b7a): host chunks (seated only with host_kv_budget; pool is host memory) and
+  a kv slot file on disk (persistent with meta/layout check); copy_slots in every direction. 127 lib tests.
+- Wafer `Spatial` engine keeps degenerate facts: kv pages are fixed wafer locations, recurrent state is replayed (not
+  addressable), and the unmerged `cerebras-model-support` branch owns those files. Follow-up for its owner after
+  that branch merges: a kv-only shared pool for batched paged builds. Details in BACKENDS.md.
