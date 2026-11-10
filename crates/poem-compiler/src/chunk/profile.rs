@@ -31,6 +31,10 @@ pub struct ChunkProfile {
     pub concurrency: u32,
     /// The context length a working set is expected to reach, in tokens.
     pub context: u32,
+    /// Whether a routed expert larger than the chunk is cut into pieces
+    /// along its banks' output axis ([`super::weights`]); otherwise the
+    /// chunk is never smaller than an expert.
+    pub cut_experts: bool,
 }
 
 impl ChunkProfile {
@@ -45,6 +49,7 @@ impl ChunkProfile {
         tile_bytes: 0,
         concurrency: 128,
         context: 32 * 1024,
+        cut_experts: false,
     };
 
     /// An on-device Metal GPU: chunks of a couple of MiB out of 64 MiB
@@ -58,6 +63,7 @@ impl ChunkProfile {
         tile_bytes: 0,
         concurrency: 4,
         context: 8 * 1024,
+        cut_experts: true,
     };
 
     /// A TPU pool fixed at load, realized as `[chunks, rows, 128]` u32 tiles.
@@ -70,6 +76,7 @@ impl ChunkProfile {
         tile_bytes: 8 * 128 * 4,
         concurrency: 128,
         context: 32 * 1024,
+        cut_experts: false,
     };
 
     /// What every row offset and slot size aligns to.
