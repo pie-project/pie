@@ -684,7 +684,6 @@ impl Process {
     ) -> Self {
         let task = Self::run(
             process_id,
-            username.clone(),
             program.clone(),
             input.clone(),
             files.clone(),
@@ -748,7 +747,6 @@ impl Process {
     #[allow(clippy::too_many_arguments)]
     async fn run(
         process_id: ProcessId,
-        username: String,
         program: Program,
         input: String,
         files: Arc<client_api::Files>,
@@ -781,7 +779,7 @@ impl Process {
             } else {
                 OutputMode::Discard
             };
-            let (mut store, instance) = linker::instantiate(process_id, username, &program, output)
+            let (mut store, instance) = linker::instantiate(process_id, &program, output)
                 .await
                 .map_err(|e| e.to_string())?;
             instantiate_us = duration_us(instantiate_start.elapsed());

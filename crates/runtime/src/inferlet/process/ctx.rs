@@ -26,7 +26,6 @@ pub enum OutputMode {
 
 pub struct ProcessCtx {
     id: ProcessId,
-    username: String,
 
     wasi_ctx: WasiCtx,
     resource_table: ResourceTable,
@@ -126,7 +125,6 @@ impl ProcessCtx {
 
     pub async fn new(
         id: ProcessId,
-        username: String,
         output: OutputMode,
         policy: &InstancePolicy,
         script: Option<Arc<Script>>,
@@ -205,7 +203,6 @@ impl ProcessCtx {
 
         Ok(ProcessCtx {
             id,
-            username,
             wasi_ctx,
             resource_table: ResourceTable::new(),
             #[cfg(not(target_arch = "wasm32"))]
@@ -328,10 +325,6 @@ impl ProcessCtx {
 
     pub(crate) fn admission_wait_us(&self) -> u64 {
         self.admission_wait_us
-    }
-
-    pub fn get_username(&self) -> String {
-        self.username.clone()
     }
 
     pub(crate) fn residency_pipelines(&self) -> Vec<crate::pipeline::fire::PendingFires> {
