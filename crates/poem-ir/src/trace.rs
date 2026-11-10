@@ -100,7 +100,9 @@ pub enum ParamLayout {
 
 /// Where a plane may be served from. `Host`: read only by row gathers (a
 /// hashed table), so a card whose profile asks serves it from pinned,
-/// device-mapped host memory; otherwise it lives in device memory.
+/// device-mapped host memory; otherwise it lives in device memory. Inferred
+/// from the ops that read the plane ([`crate::residency::placement`]), never
+/// declared.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub enum ParamPlacement {
     #[default]

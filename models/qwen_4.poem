@@ -396,9 +396,10 @@ def build(mix, kv, rope, d, hashes, draft, vision):
         offsets = hashes.offsets,
         padded_vocab = padded,
         shards = shards,
-        # Read only by the n-gram gather, a few rows a token: a card whose
-        # profile says so serves it from pinned host memory.
-        table = weight([padded, hidden // heads], mix.table).host(),
+        # Read only by the n-gram gather, a few rows a token: the compiler
+        # infers so, and a card whose profile says so serves it from pinned
+        # host memory.
+        table = weight([padded, hidden // heads], mix.table),
         key_proj = weight([sh, hidden], proj),
         value_proj = weight([hidden, hidden], proj),
         norm_key = weight([sh]),
