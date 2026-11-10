@@ -136,7 +136,10 @@ fn muse_spark(path: &str, _row: &CacheRow) -> String {
 }
 
 fn qwen3_asr(path: &str, _row: &CacheRow) -> String {
-    path.to_string()
+    match parts(path)[..] {
+        ["text", "layers", l, "kv"] => format!("kv.{l}"),
+        _ => path.to_string(),
+    }
 }
 
 fn qwen3_tts(path: &str, _row: &CacheRow) -> String {

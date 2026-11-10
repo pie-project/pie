@@ -123,7 +123,7 @@ def thinker(c, banks):
             gate = weight([inter, hidden], banks),
             up = weight([inter, hidden], banks),
             down = weight([hidden, inter], banks),
-            kv = "kv.{}".format(l),
+            kv = state([tokens, 2, c.kv_heads, hd], dtype.bf16),
         )
 
     return struct(
@@ -144,7 +144,6 @@ def thinker(c, banks):
 
 def layout(id, deploy):
     return struct(
-        kv = dtype.bf16,
         audio_out = AUDIO.out,
         audio = tower(AUDIO),
         text = thinker(TEXT, roles(deploy, "text").text),
@@ -253,13 +252,6 @@ def heads(x, width, count):
         out.append(head)
     out.append(x)
     return out
-
-def caches(m, c):
-    t = m.text
-    space = c.kv_space(m.kv)
-    plane = t.kv_heads * t.head_dim
-    for layer in t.layers:
-        c.kv(space, layer.kv, [plane, plane], t.head_dim, heads = True)
 
 def forward(m, inputs):
     switch("reading", ["text", "audio.conv", "audio.encode"])
