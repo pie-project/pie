@@ -170,6 +170,104 @@ def ranks(l):
     ranking ("shared"): the first, then every fourth from the second."""
     return l == 0 or (l - 1) % 4 == 0
 
+def adopt(id, config, special):
+    if config.get("model_type") != "hy_v4":
+        fail("the config's model_type is {}; this family is hy_v4".format(config.get("model_type")))
+    q = config.get("quantization_config")
+    if q != None and (q.get("quant_method") != "modelopt" or (q.get("quantization") or q).get("quant_algo") != "MXFP8"):
+        fail("it is released quantized ({} {}); this family reads a bf16 release or modelopt's MXFP8".format(q.get("quant_method"), (q.get("quantization") or q).get("quant_algo")))
+    if config.get("hidden_act", "silu") != "silu":
+        fail("its MLP gates by {}; this family's SwiGLU gates by silu".format(config["hidden_act"]))
+    if config.get("attention_bias", False):
+        fail("its attention projections carry biases, which this family's do not")
+    for key in ["use_mla", "use_dsa", "gated_mla", "learnable_sink", "enable_ihc"]:
+        if not config.get(key, False):
+            fail("its config turns off {}, which this family's forward always runs".format(key))
+    if config.get("gating_type", "elementwise") != "elementwise":
+        fail("its attention is gated {}; this family gates it elementwise".format(config["gating_type"]))
+    if config.get("tie_word_embeddings", False):
+        fail("it ties its head to its embedding; this family reads a head of its own")
+    if config.get("scoring_func", "sigmoid") != "sigmoid":
+        fail("its router scores by {}; this family's by sigmoid".format(config["scoring_func"]))
+    if config.get("n_group", 1) != 1 or config.get("topk_group", 1) != 1:
+        fail("its router picks experts within groups; this family's picks over the whole bank")
+    if config.get("n_shared_experts", 1) != 1:
+        fail("it has {} shared experts; this family has one".format(config.get("n_shared_experts")))
+    rope = config.get("rope_parameters") or {}
+    if rope.get("rope_type", "default") != "default" or config.get("rope_scaling") != None:
+        fail("it scales its rope ({}); this family turns it unscaled".format(rope.get("rope_type") or config.get("rope_scaling")))
+    layers = config["num_hidden_layers"]
+    if any([t != "deepseek_sparse_attention" for t in config.get("layer_types", [])]):
+        fail("some of its layers attend other than through the sparse indexer; this family's every layer does")
+    if config.get("indexer_types", [("full" if ranks(l) else "shared") for l in range(layers)]) != [("full" if ranks(l) else "shared") for l in range(layers)]:
+        fail("its layers rank their keys in another pattern than the first and every fourth from the second")
+    kinds = config.get("mlp_layer_types", ["dense"] + ["sparse"] * (layers - 1))
+    dense_layers = len(kinds)
+    for l, kind in enumerate(kinds):
+        if kind != "dense":
+            dense_layers = l
+            break
+    if len(kinds) != layers or any([k != "sparse" for k in kinds[dense_layers:]]):
+        fail("its dense and routed layers ({}) are not a run of dense layers then routed ones".format(kinds))
+    nope, rot = config["qk_nope_head_dim"], config["qk_rope_head_dim"]
+    if config.get("qk_head_dim", nope + rot) != nope + rot:
+        fail("its query head ({}) is not its unrotated and rotated parts ({} + {})".format(config["qk_head_dim"], nope, rot))
+    experts = config["n_routed_experts"]
+    moe_inter = config["moe_intermediate_size"]
+    d = struct(
+        hidden = config["hidden_size"],
+        layers = layers,
+        dense_layers = dense_layers,
+        mla = struct(
+            heads = config["num_attention_heads"],
+            q_lora_rank = config["q_lora_rank"],
+            kv_lora_rank = config["kv_lora_rank"],
+            qk_nope_head_dim = nope,
+            qk_rope_head_dim = rot,
+            v_head_dim = config["v_head_dim"],
+            theta = float(rope.get("rope_theta", config.get("rope_theta", 10000000.0))),
+        ),
+        index_heads = config["index_n_heads"],
+        index_head_dim = config["index_head_dim"],
+        index_top_k = config["index_topk"],
+        index_norm_eps = 1e-6,
+        streams = config["hc_mult"],
+        gate_eps = float(config.get("hc_eps", 1e-6)),
+        alpha = float(config.get("hc_magnitude", 2.0)),
+        dense_inter = config["intermediate_size"],
+        moe = struct(
+            experts = experts,
+            top_k = config["num_experts_per_tok"],
+            inter = moe_inter,
+            shared_inter = moe_inter,
+            renorm = config.get("norm_topk_prob", True),
+            scaling = float(config.get("routed_scaling_factor", 1.0)),
+        ),
+        swiglu_limit = float(config["swiglu_limit"]),
+        vocab = config["vocab_size"],
+        norm_eps = float(config.get("rms_norm_eps", 1e-5)),
+    )
+    mtp = config.get("num_nextn_predict_layers", 0)
+    if mtp not in [0, 1]:
+        fail("it ships {} draft layers; this family's draft head is one".format(mtp))
+    deployments = [
+        deployment(id, weights = BF, kv = BF),
+        deployment(id, weights = MX8, kv = BF),
+        deployment(id, weights = [U4, U2], kv = BF),
+        deployment(id, weights = [U4, U2], kv = dtype.e4m3),
+    ]
+    if mtp:
+        deployments += [
+            deployment(id, weights = [BF, BF, BF], kv = BF, drafter = "mtp"),
+            deployment(id, weights = [MX8, MX8, MX8], kv = BF, drafter = "mtp"),
+            deployment(id, weights = [U4, U2, U4], kv = BF, drafter = "mtp"),
+        ]
+    return struct(
+        MODELS = [model(id, template = HY, tokenizer = TOKENIZER, drafters = ["mtp"] if mtp else [], arch = "hy_v4", layers = layers, vocab = d.vocab)],
+        DIMS = {id: d},
+        DEPLOYMENTS = deployments,
+    )
+
 def layout(id, deploy):
     if deploy.drafter == "mtp":
         if len(deploy.weights) != 3:
@@ -339,7 +437,11 @@ def rope_first(heads, head_dim, rope_dim):
     return rows
 
 def formats(m):
-    return [format("huggingface", read = lambda reads: huggingface(m, reads))]
+    return [format(
+        "huggingface",
+        recognizes = lambda checkpoint: has("model.hc_head.hc_head_fn") and has("model.layers.0.self_attn.learnable_sink_param"),
+        read = lambda reads: huggingface(m, reads),
+    )]
 
 def huggingface(m, reads):
     reads.read(m.embed, "model.embed_tokens.weight")

@@ -25,8 +25,8 @@ DEPLOYMENTS = [
 # Muse Glimmer: a dense decoder of sliding-window layers with a full-attention
 # layer every fourth, gated attention and sandwich norms.
 
-def dims(layers = 52):
-    return struct(
+def dims(layers = 52, **over):
+    d = dict(
         hidden = 6656,
         layers = layers,
         full_every = 4,
@@ -43,6 +43,14 @@ def dims(layers = 52):
         norm_eps = 1e-5,
         post_norm_eps = 1e-8,
     )
+    d.update(over)
+    return struct(**d)
+
+def cut(d, layers):
+    """The dims `d` at the depth of a miniature cut `layers` deep."""
+    fields = {k: getattr(d, k) for k in dir(d)}
+    fields["layers"] = layers
+    return struct(**fields)
 
 DIMS = {
     "muse-glimmer-30b": dims(),
@@ -50,11 +58,65 @@ DIMS = {
     "muse-glimmer-30b-mini-l8": dims(layers = 8),
 }
 
+def adopt(id, config, special):
+    if config.get("model_type") != "muse_glimmer":
+        fail("the config's model_type is {}; this family is muse_glimmer".format(config.get("model_type")))
+    t = config["text_config"]
+    if t.get("model_type", "muse_glimmer_text") != "muse_glimmer_text":
+        fail("its text model is {}; this family's is muse_glimmer_text".format(t["model_type"]))
+    if t.get("attention_bias", False):
+        fail("its attention projections carry biases, which this family's do not")
+    if t.get("hidden_activation", t.get("hidden_act", "silu")) != "silu":
+        fail("its MLP gates by {}; this family's SwiGLU gates by silu".format(t.get("hidden_activation", t.get("hidden_act"))))
+    if t.get("tie_word_embeddings", False):
+        fail("it ties its head to its embedding; this family reads a head of its own")
+    if t.get("final_logit_softcapping") == None:
+        fail("it does not cap its logits; this family caps them")
+    rope = t.get("rope_parameters") or {}
+    if rope.get("rope_type", "default") != "default" or t.get("rope_scaling") != None:
+        fail("it scales its rope ({}); this family turns it unscaled".format(rope.get("rope_type") or t.get("rope_scaling")))
+    theta = float(rope.get("rope_theta", t.get("rope_theta", 500000.0)))
+    layers = t["num_hidden_layers"]
+    kinds = t["layer_types"]
+    full = [l for l, k in enumerate(kinds) if k == "full_attention"]
+    if len(kinds) != layers or not full:
+        fail("its layer_types ({}) are not a sliding or full attention a layer, some full".format(kinds))
+    every = full[0] + 1
+    if kinds != [("full_attention" if l % every == every - 1 else "sliding_attention") for l in range(layers)]:
+        fail("its full-attention layers ({}) are not every {}th".format(full, every))
+    if t.get("layer_rope_theta", [0 if l in full else theta for l in range(layers)]) != [0 if l in full else theta for l in range(layers)]:
+        fail("its layers' rope bases ({}) are not {} on its sliding layers and none on its full ones".format(t["layer_rope_theta"], theta))
+    d = dims(
+        layers,
+        hidden = t["hidden_size"],
+        full_every = every,
+        q_heads = t["num_attention_heads"],
+        kv_heads = t["num_key_value_heads"],
+        head_dim = t["head_dim"],
+        inter = t["intermediate_size"],
+        vocab = t["vocab_size"],
+        window = t["sliding_window"],
+        theta = theta,
+        qk_scale = float(t["qk_scale_factor"]),
+        softcap = float(t["final_logit_softcapping"]),
+        output_multiplier = float(t["output_multiplier"]),
+        norm_eps = float(t.get("rms_norm_eps", 1e-5)),
+        post_norm_eps = float(t.get("post_norm_eps", 1e-8)),
+    )
+    return struct(
+        MODELS = [model(id, template = ATEM, tokenizer = TOKENIZER, arch = "muse_glimmer", layers = layers, vocab = d.vocab)],
+        DIMS = {id: d},
+        DEPLOYMENTS = [
+            deployment(id, weights = dtype.bf16, kv = dtype.bf16),
+            deployment(id, weights = dtype.u4g64, kv = dtype.bf16),
+        ],
+    )
+
 def layout(id, deploy):
     w = roles(deploy, "w", exact = True).w
     d = DIMS[id]
     if deploy.layers:
-        d = dims(layers = deploy.layers)
+        d = cut(d, deploy.layers)
     proj = w
     hidden = d.hidden
     hd = d.head_dim
@@ -127,7 +189,7 @@ def safetensors_format(m, name):
     layout = LAYOUTS[name]
     return format(
         name,
-        recognizes = lambda checkpoint: has(layout.trunk + "embed_tokens.weight"),
+        recognizes = lambda checkpoint: has(layout.trunk + "embed_tokens.weight") and has(layout.trunk + "layers.0.mlp.gate_proj.weight"),
         read = lambda reads: mapped(reads, m, rows(layout), quantized = "read"),
     )
 

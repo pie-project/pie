@@ -83,6 +83,81 @@ DIMS = {
     "inkling-small-mini-l7-e8": small(layers = 7, experts = 8),
 }
 
+def adopt(id, config, special):
+    if config.get("model_type") != "inkling_mm_model":
+        fail("the config's model_type is {}; this family is inkling_mm_model".format(config.get("model_type")))
+    if config.get("quantization_config") != None:
+        fail("it is released quantized ({}); this family reads a bf16 release".format(config["quantization_config"].get("quant_method")))
+    t = config["text_config"]
+    if t.get("q_bias", False) or t.get("o_bias", False):
+        fail("its attention projections carry biases, which this family's do not")
+    for key in ["use_embed_norm", "use_sconv", "shared_expert_sink", "use_gate_bias", "norm_after_topk", "use_global_scale"]:
+        if not t.get(key, False):
+            fail("its text_config turns off {}, which this family's forward always runs".format(key))
+    if t.get("hidden_act", "silu") != "silu":
+        fail("its MLPs gate by {}; this family's SwiGLU gates by silu".format(t["hidden_act"]))
+    if t.get("gate_activation", "sigmoid") != "sigmoid":
+        fail("its router scores by {}; this family's by sigmoid".format(t["gate_activation"]))
+    if t.get("final_logit_softcapping") != None:
+        fail("it caps its logits ({}); this family does not".format(t["final_logit_softcapping"]))
+    heads, head_dim = t["num_attention_heads"], t["head_dim"]
+    if t.get("swa_num_attention_heads", heads) != heads or t.get("swa_head_dim", head_dim) != head_dim:
+        fail("its sliding layers' query heads ({} of {}) are not its others' ({} of {})".format(t.get("swa_num_attention_heads"), t.get("swa_head_dim"), heads, head_dim))
+    layers = t["num_hidden_layers"]
+    local = t["local_layer_ids"]
+    longer = [l for l in range(layers) if l not in local]
+    if not longer:
+        fail("none of its layers reaches past the window; this family's every few do")
+    every = longer[0] + 1
+    if longer != [l for l in range(layers) if (l + 1) % every == 0]:
+        fail("its longer-reaching layers ({}) are not every {}th".format(longer, every))
+    kinds = t.get("layer_types")
+    if kinds != None and kinds != [("hybrid_sliding" if l in local else "hybrid") for l in range(layers)]:
+        fail("its layer_types ({}) do not say what its local_layer_ids do".format(kinds))
+    dense = t["dense_mlp_idx"]
+    mlps = t.get("mlp_layer_types")
+    if mlps != None and mlps != ["dense"] * dense + ["sparse"] * (layers - dense):
+        fail("its MLPs ({}) are not its first {} dense, then routed".format(mlps, dense))
+    if "moe_intermediate_size" in t:
+        moe_inter, dense_inter = t["moe_intermediate_size"], t["intermediate_size"]
+    else:
+        moe_inter, dense_inter = t["intermediate_size"], t["dense_intermediate_size"]
+    experts = t["n_routed_experts"]
+    d = dims(
+        layers,
+        experts,
+        hidden = t["hidden_size"],
+        vocab = t["vocab_size"],
+        head_rows = t.get("unpadded_vocab_size", t["vocab_size"]),
+        heads = heads,
+        head_dim = head_dim,
+        local_kv_heads = t["swa_num_key_value_heads"],
+        global_kv_heads = t["num_key_value_heads"],
+        d_rel = t["d_rel"],
+        window = t["sliding_window_size"],
+        global_extent = t["rel_extent"],
+        conv_width = t["sconv_kernel_size"] if "sconv_kernel_size" in t else t["conv_kernel_size"],
+        global_every = every,
+        dense_layers = dense,
+        dense_inter = dense_inter,
+        top_k = t["num_experts_per_tok"],
+        sink = t["n_shared_experts"],
+        moe_inter = moe_inter,
+        route_scale = float(t["route_scale"]),
+        mup = float(t["logits_mup_width_multiplier"]),
+        norm_eps = float(t.get("rms_norm_eps", 1e-6)),
+        log_floor = t["log_scaling_n_floor"],
+        log_alpha = float(t["log_scaling_alpha"]),
+    )
+    return struct(
+        MODELS = [model(id, template = INKLING, tokenizer = TOKENIZER, arch = "inkling", layers = layers, vocab = d.head_rows)],
+        DIMS = {id: d},
+        DEPLOYMENTS = [
+            deployment(id, weights = dtype.bf16, kv = dtype.bf16),
+            deployment(id, weights = dtype.bf16, kv = dtype.e4m3),
+        ],
+    )
+
 LOCAL = 0
 GLOBAL = 1
 
@@ -186,7 +261,11 @@ def layout(id, deploy):
 TRUNK = "model.llm."
 
 def formats(m):
-    return [format("huggingface", read = lambda reads: huggingface(m, reads))]
+    return [format(
+        "huggingface",
+        recognizes = lambda checkpoint: has(TRUNK + "layers.0.attn.rel_logits_proj.proj"),
+        read = lambda reads: huggingface(m, reads),
+    )]
 
 def huggingface(m, reads):
     at = lambda leaf: TRUNK + leaf
