@@ -262,10 +262,10 @@ fn a_family_refuses_what_its_forward_does_not_run() {
         "num_key_value_heads": 2,
         "intermediate_size": 128,
         "vocab_size": 128256,
-        "rope_scaling": {"rope_type": "yarn", "factor": 4.0},
+        "rope_scaling": {"rope_type": "mrope", "mrope_section": [4, 2, 2]},
     });
     let src = checkpoint(
-        "yarn",
+        "mrope",
         &trunk(Trunk {
             hidden: 64,
             layers: 2,
@@ -288,13 +288,82 @@ fn a_family_refuses_what_its_forward_does_not_run() {
     let why = catalog
         .adopt(
             llama,
-            "adopted_llama_yarn",
-            "llama-yarn",
+            "adopted_llama_mrope",
+            "llama-mrope",
             &reading(&src, &config),
             Platform::Cuda,
         )
         .err()
         .expect("the family refuses a rope it does not turn")
         .to_string();
-    assert!(why.contains("scales its rope as yarn"), "{why}");
+    assert!(why.contains("rope scaling of type `mrope`"), "{why}");
 }
+
+#[test]
+fn a_llama_family_adopts_a_sliding_window_and_a_scaled_rope() {
+    let config = serde_json::json!({
+        "model_type": "mistral",
+        "hidden_size": 64,
+        "num_hidden_layers": 2,
+        "num_attention_heads": 4,
+        "num_key_value_heads": 2,
+        "intermediate_size": 128,
+        "vocab_size": 128256,
+        "max_position_embeddings": 64,
+        "sliding_window": 16,
+        "rope_parameters": {
+            "rope_type": "yarn",
+            "rope_theta": 1000000.0,
+            "factor": 4.0,
+            "original_max_position_embeddings": 16,
+        },
+    });
+    let src = checkpoint(
+        "windowed",
+        &trunk(Trunk {
+            hidden: 64,
+            layers: 2,
+            q: 4,
+            kv: 2,
+            head_dim: 16,
+            inter: 128,
+            vocab: 128256,
+            qk_norm: false,
+            tied: false,
+        }),
+        &config,
+    );
+    let catalog = repository();
+    let kin = catalog.kin(&src, Platform::Cuda);
+    let llama = kin
+        .iter()
+        .find(|k| k.package.name() == "llama_3")
+        .expect("Llama 3's formats recognize it");
+    let adopted = catalog
+        .adopt(
+            llama,
+            "adopted_mistral_windowed",
+            "mistral-windowed",
+            &reading(&src, &config),
+            Platform::Cuda,
+        )
+        .expect("the family adopts a window and a yarn rope it turns");
+    assert!(
+        adopted.adoption.block.contains("\"sliding_window\": 16"),
+        "the adoption records the window it read"
+    );
+    assert!(
+        adopted.adoption.block.contains("\"rope_theta\": 1000000.0"),
+        "the theta transformers 5 states under rope_parameters is read"
+    );
+    let (deployment, read) = adopted
+        .deployments
+        .iter()
+        .find(|(_, read)| read.is_ok())
+        .expect("a deployment reads the checkpoint");
+    assert!(read.is_ok());
+    deployment
+        .try_trace(Platform::Cuda)
+        .expect("the windowed, yarn-scaled model traces");
+}
+

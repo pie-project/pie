@@ -70,6 +70,10 @@ def dims(hidden, layers, q_heads, inter):
         rope_low_freq_factor = 1.0,
         rope_high_freq_factor = 4.0,
         rope_original_max_position = 8192,
+        # A scaling other than llama3's, as config.json states it.
+        rope_scaling = None,
+        max_position = None,
+        window = None,
         norm_eps = 1e-5,
         tied = False,
     )
@@ -84,9 +88,10 @@ def adopt(id, config, special):
     kind = config.get("model_type", "llama")
     if kind not in ["llama", "mistral"]:
         fail("the config's model_type is {}; this family is llama (and mistral, which is llama-shaped)".format(kind))
+    max_position = config.get("max_position_embeddings")
     window = config.get("sliding_window")
-    if window != None and window < config.get("max_position_embeddings", 0):
-        fail("it attends through a {}-token sliding window; this family attends in full".format(window))
+    if window != None and max_position != None and window >= max_position:
+        window = None
     if config.get("hidden_act", "silu") != "silu":
         fail("its MLP gates by {}; this family's SwiGLU gates by silu".format(config["hidden_act"]))
     if config.get("attention_bias", False) or config.get("mlp_bias", False):
@@ -94,8 +99,15 @@ def adopt(id, config, special):
     hidden = config["hidden_size"]
     q_heads = config["num_attention_heads"]
     scaling = config.get("rope_scaling")
-    if scaling != None and scaling.get("rope_type", scaling.get("type")) != "llama3":
-        fail("it scales its rope as {}; this family turns it unscaled or llama3-scaled".format(scaling.get("rope_type", scaling.get("type"))))
+    kind = None if scaling == None else scaling.get("rope_type", scaling.get("type"))
+    if kind in [None, "default"]:
+        scaling = None
+    other = None
+    if scaling != None and kind != "llama3":
+        # Linear, dynamic NTK, YaRN or LongRoPE: turned as stated, and a type
+        # pie does not turn is refused here, by name.
+        rope_scaling(scaling, max_position = max_position)
+        other, scaling = scaling, None
     head_dim = config.get("head_dim", hidden // q_heads)
     if head_dim * q_heads != hidden and config.get("head_dim") == None:
         fail("its heads do not divide its width")
@@ -113,6 +125,9 @@ def adopt(id, config, special):
         rope_low_freq_factor = None if scaling == None else float(scaling.get("low_freq_factor", 1.0)),
         rope_high_freq_factor = None if scaling == None else float(scaling.get("high_freq_factor", 4.0)),
         rope_original_max_position = None if scaling == None else scaling.get("original_max_position_embeddings", 8192),
+        rope_scaling = other,
+        max_position = max_position,
+        window = window,
         norm_eps = float(config.get("rms_norm_eps", 1e-5)),
         tied = config.get("tie_word_embeddings", False),
     )
@@ -206,6 +221,8 @@ def layout(id, deploy):
             high_freq_factor = d.rope_high_freq_factor,
             original_max_position = d.rope_original_max_position,
         ),
+        rope_other = None if d.rope_scaling == None else struct(scaling = d.rope_scaling, max_position = d.max_position),
+        window = d.window,
         eps = d.norm_eps,
         sm_scale = f32(1.0 / f32(sqrt(hd))),
         kv = deploy.kv,
@@ -228,7 +245,8 @@ def configured(m):
         config("rope_scaling.high_freq_factor", m.rope.high_freq_factor),
         config("rope_scaling.original_max_position_embeddings", m.rope.original_max_position),
     ]
-    return scaled + [
+    windowed = [] if m.window == None else [config("sliding_window", m.window)]
+    return scaled + windowed + [
         config("hidden_size", m.hidden),
         config("vocab_size", m.vocab),
         config("num_attention_heads", m.q_heads),
@@ -316,13 +334,15 @@ def forward(m, inputs):
         "high_freq_factor": m.rope.high_freq_factor,
         "original_max_position_embeddings": m.rope.original_max_position,
     })
+    if m.rope_other != None:
+        scaling = rope_scaling(m.rope_other.scaling, max_position = m.rope_other.max_position)
     y = ops.gather.embed(inputs.tokens(), m.embed, m.vocab)
     routes = inputs.adapter_routes()
 
     def block(l, w, carried):
         y, fused = carried
         x = ops.elemwise.rmsnorm(y, w.attn_norm, m.eps)
-        o = attention(x, inputs, m, w, positions, scaling = scaling)
+        o = attention(x, inputs, m, w, positions, scaling = scaling, window = m.window)
         y = ops.elemwise.residual_add(corrected(x, o, w, routes), y)
         x = ops.elemwise.rmsnorm(y, w.mlp_norm, m.eps)
         y = ops.elemwise.residual_add(swiglu(x, w), y)
