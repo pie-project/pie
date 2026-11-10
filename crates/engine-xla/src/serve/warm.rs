@@ -341,7 +341,24 @@ impl Shell {
         for (at, slot) in slots.into_iter().enumerate() {
             programs[at] = slot.into_inner().ok().flatten();
         }
-        let parked = parked.load(SeqCst);
+        // A parked program the host's free memory holds once the compiles are
+        // done (two compiles' room kept) loads from the disk cache here, at
+        // load, not in the first fire that takes its shape (v5e Qwen3-0.6B
+        // c256: 13 parked loads stalled a 43 s round 3-5 s).
+        let mut parked = parked.load(SeqCst);
+        for (at, (text, sig)) in texts.iter().enumerate() {
+            if parked == 0 {
+                break;
+            }
+            if programs[at].is_some() || !device.on_disk(text) {
+                continue;
+            }
+            if available_memory().is_none_or(|b| b < hold_bytes(text) + 2 * need) {
+                break;
+            }
+            programs[at] = Some(device.program(text, (*sig).clone()));
+            parked -= 1;
+        }
         if parked > 0 {
             tracing::warn!(
                 parked,
