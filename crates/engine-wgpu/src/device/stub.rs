@@ -126,6 +126,10 @@ pub struct Frame {
 }
 
 impl Frame {
+    pub fn flush_settled(&self) -> Result<()> {
+        self.flush()
+    }
+
     pub fn flush(&self) -> Result<()> {
         Err(Fault::Deviceless)
     }
@@ -227,6 +231,10 @@ impl Buffer {
     }
 
     pub fn write(&mut self, _offset: u64, _bytes: &[u8]) -> Result<()> {
+        match self.never {}
+    }
+
+    pub(crate) fn write_shared(&self, _offset: u64, _bytes: &[u8]) -> Result<()> {
         match self.never {}
     }
 

@@ -819,6 +819,13 @@ impl Frame {
         self.dispatches.get()
     }
 
+    /// [`Frame::flush`]: the queue orders a write after every submission
+    /// before it (WebGPU's queue timeline), so landing this frame settles
+    /// what the host writes next through the queue.
+    pub fn flush_settled(&self) -> Result<()> {
+        self.flush()
+    }
+
     pub fn flush(&self) -> Result<()> {
         self.close_pass();
         let core = &self.inner.core;

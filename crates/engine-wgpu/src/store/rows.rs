@@ -307,7 +307,8 @@ impl RowCaches {
         })
     }
 
-    /// Takes `residency` as the whole set: fills each slot newly named from
+    /// Takes `residency` as the whole set (its atoms of these shapes): fills
+    /// each slot newly named from
     /// the host (`host`, the tables' planes by param in `planes`) through
     /// `frame`s of its own, and rewrites the blocks' entries. The caller has
     /// drained every fire.
@@ -330,12 +331,7 @@ impl RowCaches {
                 .iter()
                 .position(|c| c.shape.id == resident.atom.shape)
             else {
-                return Err(Fault::Unbound {
-                    what: format!(
-                        "weight shape {}, which this load does not state",
-                        resident.atom.shape
-                    ),
-                });
+                continue;
             };
             let cache = &self.caches[at];
             let block = resident.atom.atom as usize;
@@ -556,7 +552,7 @@ impl RowCaches {
         if missing {
             let mut held = read.borrow_mut();
             if held.as_ref().is_none_or(|(buf, _)| *buf != ids.buf) {
-                crate::probe::with_frame(Frame::flush).ok_or_else(|| {
+                crate::probe::with_frame(Frame::flush_settled).ok_or_else(|| {
                     Fault::Residency("no frame is recording on this thread".into())
                 })??;
                 let raw = handles.read(ids.buf, u64::from(rows) * 4)?;

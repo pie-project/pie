@@ -1543,6 +1543,19 @@ impl Frame {
         self.dispatches.get()
     }
 
+    /// [`Frame::flush`], then the queue idle: every frame submitted before
+    /// this one has landed too (an earlier fire still in flight among them),
+    /// so the host may rewrite memory any of them reads.
+    pub fn flush_settled(&self) -> Result<()> {
+        self.flush()?;
+        let core = &self.inner.core;
+        let queue = core.queue.lock().expect("queue lock poisoned");
+        // SAFETY: the queue is this device's, and its lock is the external
+        // sync `vkQueueWaitIdle` needs.
+        unsafe { core.device.queue_wait_idle(*queue) }
+            .map_err(|e| core.fault("vkQueueWaitIdle", e))
+    }
+
     pub fn flush(&self) -> Result<()> {
         let core = &self.inner.core;
         let d = &core.device;

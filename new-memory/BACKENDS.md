@@ -14,7 +14,7 @@ Legend: ✅ verified on hardware · 🟡 in progress / compile-only · 🔴 not 
 | Window lists (own T_w, trimmed) | ✅ tables per list M51 (T_w = page; 2-window untested) | ✅ goldens (one list) | ✅ up to 4 lists M50 | ✅ up to 4 lists, own T_w M53 | ✅ M53 | 🟡 XLA | 🟡 one list, T_w=page |
 | Multi-piece records end to end | ✅ engine (L40S) · ✅ runtime boot (IT r5, 18 pieces) | ✅ records in pieces (chunk goldens); rows cut across pieces kernel-tested | ✅ M50 | ✅ M48 (4 pieces bitwise) | ✅ M48 | 🟡 XLA | 🟡 host sim |
 | Weight streaming: PLE rows | ✅ M35/M36/M41 | ✅ M43 golden_rows | ✅ M50 | ✅ M53 (rows, grouped tables) | ✅ M53 | 🟡 XLA | — weights on host |
-| Weight streaming: experts | 🟡 dense bf16 M40; quantized next | ✅ dense M47; quantized after CUDA | ✅ dense M50; quantized next | 🔴 VK3 | 🔴 VK3 | 🟡 XLA | — weights on host |
+| Weight streaming: experts | 🟡 dense bf16 M40; quantized next | ✅ dense M47; quantized after CUDA | ✅ dense M50; quantized next | ✅ VK3 dense + affine + MXFP4, every arm (engine tier deleted) | ✅ VK3 | 🟡 XLA | — weights on host |
 | Host/disk tiers of shared shapes (copy_slots) | ✅ engine probe M43 · ✅ e2e M52 | ✅ golden_offload 8/8 (MI300X) | ✅ M50 offload probe | ✅ M53 offload (dense, hybrid, window) | ✅ M53 | 🔴 XLA | 🟡 CB (host sim) |
 | Snapshots (rs_snapshots) | ✅ | ✅ | ✅ | 🔴 not served (rs_snapshots 0) VK3 | 🔴 VK3 | 🔴 XLA | — |
 | K2 (no kv spaces) | ✅ M39 | ✅ | ✅ M42 | compile | compile | compile | compile |
@@ -68,8 +68,32 @@ resident no fire flushes or stages, and on Vulkan fires record again (a residenc
 recording). Seat-addressed fires are refused while a weight slot lies in the seats' chunks (M41). Verified: a
 gather copies, so all-resident (held, after an evacuation of every weight chunk), none resident and every other
 block resident land the same bits, and all-resident = the build before the cache bit for bit (gemma4-e4b-mini-l1,
-both engines; -l6 grouped tables within the build). Routed experts (expert table) not built on these engines yet:
-the engines' own expert tier (`device_weight_budget`, pump, gathered seats) still serves MoE banks.
+both engines; -l6 grouped tables within the build). Routed experts: see the next paragraph.
+
+Vulkan / wgpu routed experts (VK3, `sc/vk3`): every routed bank streams an expert at a time. Every checkpoint plane the
+residency census reads an expert at a time, read only by a routed select (bank or expert bias; dense bf16, affine
+64/8, 64/4, {32,64,128}/2, MXFP4) or a routed bias sum, is a `WeightKind::Expert` shape from the recipe (ids after
+the row shapes): an atom = one expert of one layer, its plane of every bank of the layer back to back (each from a
+word) in one slot; the profile no longer cuts experts (`cut_experts: false`: the chunk is never smaller than an
+expert, so a table entry names one place). The banks stay on the host (the mapped artifact); `weight_residency` fills
+newly named slots in batched uploads and rewrites a u32 atom -> pool-unit table (evacuation rewrites it). Every
+routed kernel on every arm (per-route select SPIR-V + WGSL subgroup, sorted tiles baseline + cooperative matrix,
+bias sum) has a `PIE_TABLED` twin (`prim/experts.slang`) that picks the expert's segment once and reads the same
+elements in the same order. Non-resident entry: STAGING, not a host-visible bank: before the first select of a layer
+with a routed expert in no slot, the frame lands, the routes are read back, and each such expert is copied from the
+mmap into a seat of a host-visible stage (Vulkan: host memory read in place; wgpu: written through the queue) the
+kernels bind. Binding the whole bank host-visible would pin a second host copy of every expert (M49 problem 2) and
+wgpu cannot bind mapped memory to a kernel at all. Uses: one atomic a route at the layer's first bank; `weight_uses`
+reports them and `WeightUses.held`. Held fast path: every atom resident -> no flush, no stage (the stage buffer is
+given back), Vulkan fires record again. M41: a seat-addressed fire is refused while an expert slot lies in the seats'
+chunks. The engines' own expert tier is deleted (routed groups in `Plan::tiers`, `Seats` for routed banks,
+`Run::staged`, the expert-bias seat kind); what remains of `experts.rs` is the host mapping, the n-gram `Gathered`
+seats and the dense-plane pump. Verified (RTX PRO 4500): qwen3-30b-a3b-mini, glm45-air-mini (both engines) and
+qwen36-35b-a3b-mini (Vulkan; wgpu does not serve it before or after) held = base (the build before, its own
+expert tier, e2971507c) bit for bit, and none resident (every expert staged) / every other expert resident = held bit for bit
+(`tests/*/experts.rs`); quantized schemes kernel-level: tabled = contiguous bit for bit for every scheme, a route at
+a time and in sorted tiles, slots in two segments + a staged seat (`tests/*/linear/moe/table.rs`). No quantized MoE
+mini serves end to end here (the bf16 fixture writer; gpt-oss traces only quantized).
 
 Pre-existing parity gaps (not memory, but in scope for parity): ROCm synth codegen, ROCm graph replay with >= 2 MoE layers (AMD d); (concat_cols, FP8 m33 fixed M43);
 sm_100 tcgen05 W4A16 arms read no expert table; Metal MLA prefill unsupported.

@@ -62,7 +62,9 @@ pub fn profile(page_size: u32, context: u32, binding: u64, target: Option<u64>) 
         tile_bytes: 0,
         concurrency: 4,
         context,
-        cut_experts: true,
+        // An expert is one slot (the expert table names one place an
+        // expert): the chunk is never smaller than an expert.
+        cut_experts: false,
         state_f32: true,
         token_slot: Some(page_size),
         one_window: false,

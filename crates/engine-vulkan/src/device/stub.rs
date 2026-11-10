@@ -125,6 +125,10 @@ pub struct Frame {
 }
 
 impl Frame {
+    pub fn flush_settled(&self) -> Result<()> {
+        self.flush()
+    }
+
     pub fn flush(&self) -> Result<()> {
         Err(Fault::Deviceless)
     }

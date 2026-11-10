@@ -1,10 +1,10 @@
 #![allow(unsafe_code)]
 use std::cell::{Cell, RefCell};
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeMap;
 
 use checkpoint::plan::{LoadPlan, StorageInstr};
 use engine::load::{Residency, Tiers};
-use poem_ir::{Def, Linear, Operation, Trace, ValueId};
+use poem_ir::{Def, Operation, Trace, ValueId};
 
 use crate::device::ctx::Frame;
 use crate::device::{Buffer, Context, Handles};
@@ -360,18 +360,16 @@ pub enum Kind {
     Codes,
     Scales,
     Biases,
-    Dense,
 }
 
 impl Kind {
-    const ALL: [Kind; 4] = [Kind::Codes, Kind::Scales, Kind::Biases, Kind::Dense];
+    const ALL: [Kind; 3] = [Kind::Codes, Kind::Scales, Kind::Biases];
 
     const fn at(self) -> usize {
         match self {
             Kind::Codes => 0,
             Kind::Scales => 1,
             Kind::Biases => 2,
-            Kind::Dense => 3,
         }
     }
 }
@@ -380,13 +378,13 @@ impl Kind {
 pub struct Seats {
     slabs: Vec<(Kind, Buffer)>,
 
-    seat: [Option<(u32, u64)>; 4],
+    seat: [Option<(u32, u64)>; 3],
     capacity: u32,
     routes: Buffer,
     routes_handle: u32,
 
     staging: Vec<Buffer>,
-    kind_off: [u64; 4],
+    kind_off: [u64; 3],
     ring: Cell<usize>,
     pending: Cell<usize>,
 }
@@ -395,15 +393,15 @@ impl Seats {
     pub fn reserve(
         device: &Context,
         handles: &Handles,
-        widest: [u64; 4],
+        widest: [u64; 3],
         capacity: u32,
     ) -> Result<Option<Seats>> {
         if widest.iter().all(|&b| b == 0) || capacity == 0 {
             return Ok(None);
         }
         let mut slabs = Vec::new();
-        let mut seat = [None; 4];
-        let mut kind_off = [0u64; 4];
+        let mut seat = [None; 3];
+        let mut kind_off = [0u64; 3];
         let mut slot_bytes = 0u64;
         for kind in Kind::ALL {
             let per = widest[kind.at()];
@@ -787,12 +785,10 @@ pub enum Tier {
     Host,
 }
 
+/// The gathered tables a load seats a fire's rows of (hashed n-gram
+/// tables the host keeps), and the rows a token reads of them.
 #[derive(Debug, Default, Clone)]
 pub struct Plan {
-    routed: Vec<usize>,
-
-    router_of: BTreeMap<usize, u32>,
-
     gathered: BTreeMap<usize, u32>,
 
     rows_per_token: u32,
@@ -800,8 +796,6 @@ pub struct Plan {
 
 impl Plan {
     pub fn of(trace: &Trace) -> Result<Plan> {
-        let mut routed = BTreeSet::new();
-        let mut router_of = BTreeMap::new();
         let mut gathered = BTreeMap::new();
         let mut rows_per_token = 0u32;
         for node in &trace.nodes {
@@ -828,46 +822,8 @@ impl Plan {
             {
                 rows_per_token = rows_per_token.max(*heads_per_ngram);
             }
-            let Operation::Linear(op) = &node.op else {
-                continue;
-            };
-            let (routes, indexed): (ValueId, Vec<ValueId>) = match op {
-                Linear::MoeSelect {
-                    bank,
-                    routes,
-                    bias: None,
-                    quantized: false,
-                    quant: None,
-                    ..
-                }
-                | Linear::MoeSelect {
-                    bank,
-                    routes,
-                    bias: None,
-                    quantized: true,
-                    quant: None,
-                    ..
-                } => (*routes, vec![*bank]),
-                Linear::MoeSelect {
-                    bank,
-                    bias: Some(bias),
-                    routes,
-                    quantized: false,
-                    quant: None,
-                    ..
-                } => (*routes, vec![*bank, *bias]),
-                Linear::MoeBiasSum { bias, routes, .. } => (*routes, vec![*bias]),
-                _ => continue,
-            };
-            for id in indexed {
-                let at = weight_of(trace, id)?;
-                routed.insert(at);
-                router_of.insert(at, routes.0);
-            }
         }
         Ok(Plan {
-            routed: routed.into_iter().collect(),
-            router_of,
             gathered,
             rows_per_token,
         })
@@ -891,19 +847,10 @@ impl Plan {
         max_tokens.saturating_mul(self.rows_per_token.max(1))
     }
 
-    #[must_use]
-    pub fn is_routed(&self, param: usize) -> bool {
-        self.router_of.contains_key(&param)
-    }
-
-    #[must_use]
-    pub fn routed(&self) -> &[usize] {
-        &self.routed
-    }
-
-    /// Where each plane lies; `streamed` (the tables the weight cache
-    /// streams by their rows, [`crate::store::rows`]) on the host, their
-    /// rows read from the artifact into pool slots.
+    /// Where each plane lies; `streamed` (the tables and routed banks the
+    /// weight cache streams, [`crate::store::rows`],
+    /// [`crate::store::experts`]) on the host, their rows and experts read
+    /// from the artifact into pool slots.
     pub fn tiers(
         &self,
         bytes: &[u64],
@@ -920,7 +867,7 @@ impl Plan {
 
         let mut by_router: BTreeMap<u32, Vec<usize>> = BTreeMap::new();
         let mut grouped = vec![false; bytes.len()];
-        for (&at, &router) in self.router_of.iter().chain(self.gathered.iter()) {
+        for (&at, &router) in &self.gathered {
             let members = by_router.entry(router).or_default();
             members.push(at);
             members.extend(planes.get(&at).into_iter().flatten().copied());
@@ -1040,7 +987,7 @@ impl Gathered {
     pub fn reserve(
         device: &Context,
         handles: &Handles,
-        widest: [u64; 4],
+        widest: [u64; 3],
         capacity: u32,
     ) -> Result<Option<Gathered>> {
         Ok(
@@ -1165,7 +1112,7 @@ fn weight_of(trace: &Trace, id: ValueId) -> Result<usize> {
         Some(Def::Weight(w)) => Ok(*w as usize),
         _ => Err(Fault::Param {
             name: format!("value {}", id.0),
-            why: "is read at a routed matmul's expert-indexed port and is not a weight",
+            why: "is read as a gathered table and is not a weight",
         }),
     }
 }

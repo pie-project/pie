@@ -349,6 +349,8 @@ pub struct Shell {
     pools: Pools,
     /// The weight cache's row tables (PLE), streamed through pool slots.
     row_caches: crate::store::rows::RowCaches,
+    /// The weight cache's routed experts, streamed through pool slots.
+    expert_caches: crate::store::experts::ExpertCaches,
 
     scratch: Scratch,
 
@@ -585,9 +587,19 @@ impl Shell {
             &recipe,
             &crate::store::rows::streamed(&boot.trace),
         )?;
+        // Every routed bank streams an expert at a time through weight
+        // slots of the pool; the banks stay on the host.
+        let expert_shapes = crate::store::experts::ExpertShape::of(
+            &boot.trace,
+            &recipe,
+            &crate::store::experts::streamed(&boot.trace),
+            crate::store::rows::WEIGHTS + u32::try_from(row_shapes.len()).unwrap_or(u32::MAX),
+            boot.budget.max_tokens,
+        )?;
         let streamed: Vec<usize> = row_shapes
             .iter()
             .flat_map(|shape| shape.tables.iter().map(|table| table.param))
+            .chain(expert_shapes.iter().flat_map(|shape| shape.params()))
             .collect();
         let page_size = if rows.tokens > 0 {
             rows.tokens
@@ -975,6 +987,8 @@ impl Shell {
         let mut pools = Pools::reserve(&device, rows, layout, paging, host_chunks)?;
         let row_caches =
             crate::store::rows::RowCaches::new(&device, row_shapes, boot.budget.max_tokens, chunk)?;
+        let expert_caches =
+            crate::store::experts::ExpertCaches::new(&device, expert_shapes, chunk)?;
         // The null chunk's segment stands from the load on.
         pools.commit_segments(&device, 1)?;
         let rs_buffers =
@@ -995,6 +1009,7 @@ impl Shell {
             arena,
             pools,
             row_caches,
+            expert_caches,
             scratch,
             inputs,
             readout,
@@ -1163,7 +1178,12 @@ impl Shell {
     #[must_use]
     pub fn pool_chunk_facts(&self) -> engine::chunk::ChunkFacts {
         engine::chunk::ChunkFacts {
-            weights: self.row_caches.facts(),
+            weights: self
+                .row_caches
+                .facts()
+                .into_iter()
+                .chain(self.expert_caches.facts())
+                .collect(),
             ..self.pools.chunk_facts()
         }
     }
@@ -1172,21 +1192,28 @@ impl Shell {
     /// the host before the next fire, every block's entry rewritten.
     pub fn weight_residency(&mut self, residency: &engine::chunk::WeightResidency) -> Result<()> {
         self.drain()?;
-        if self.row_caches.is_empty() {
+        if self.row_caches.is_empty() && self.expert_caches.is_empty() {
             return Ok(());
         }
         let host = self.weights.host().ok_or_else(|| Fault::Unbound {
-            what: "the host copy of the row tables".to_string(),
+            what: "the host copy of the weight cache's tables and banks".to_string(),
         })?;
-        let planes = self.weights.row_planes(&self.row_caches);
+        let planes = self
+            .weights
+            .cached_planes(|at| self.row_caches.streams(at) || self.expert_caches.streams(at));
         self.row_caches
+            .residency(&self.device, &self.pools, host, &planes, residency)?;
+        self.expert_caches
             .residency(&self.device, &self.pools, host, &planes, residency)
     }
 
     /// See `Engine::weight_uses`.
     pub fn weight_uses(&mut self) -> Result<engine::chunk::WeightUses> {
         self.drain()?;
-        let (uses, held) = self.row_caches.uses()?;
+        let (mut uses, mut held) = self.row_caches.uses()?;
+        let (more, also) = self.expert_caches.uses()?;
+        uses.extend(more);
+        held.extend(also);
         Ok(engine::chunk::WeightUses { uses, held })
     }
 
@@ -1223,12 +1250,13 @@ impl Shell {
         }
         let mut frame = self.device.frame()?;
         let (moved, pages) = self.pools.evacuate(&mut frame, evacuation)?;
-        // The row tables' entries name physical units: those in moved chunks
-        // are rewritten once every fire reading them has landed.
-        if !self.row_caches.is_empty() {
+        // The weight cache's entries name physical units: those in moved
+        // chunks are rewritten once every fire reading them has landed.
+        if !self.row_caches.is_empty() || !self.expert_caches.is_empty() {
             frame.commit()?;
             self.drain()?;
             self.row_caches.restage(&self.pools)?;
+            self.expert_caches.restage(&self.pools)?;
             frame = self.device.frame()?;
         }
         // The compressor side planes hold a cell a token of every physical
@@ -1971,9 +1999,12 @@ impl Shell {
         // A seat-addressed lane writes the seats' runs, which the weight
         // cache's slots must not share (they hold rows a fire reads).
         if lanes.iter().any(|seated| !seated.refs)
-            && self
+            && (self
                 .row_caches
                 .holds_in(1..1 + self.pools.layout().seat_chunks())
+                || self
+                    .expert_caches
+                    .holds_in(1..1 + self.pools.layout().seat_chunks()))
         {
             return Err(program(
                 "serve::stage",
@@ -2774,14 +2805,16 @@ impl Shell {
                 } else {
                     kernels_slang::Tier::Baseline
                 },
-                self.weights.seats(),
                 self.weights.gathered(),
                 self.weights.host(),
                 self.weights.pump(),
             )
-            .with_rows(
+            .with_cache(
                 &self.row_caches,
-                self.weights.row_planes(&self.row_caches),
+                &self.expert_caches,
+                self.weights.cached_planes(|at| {
+                    self.row_caches.streams(at) || self.expert_caches.streams(at)
+                }),
                 self.pools.segments(&self.handles)?,
             );
             walk(
