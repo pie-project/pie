@@ -129,6 +129,7 @@ impl Run<'_> {
                     self.ctx(),
                     self.tensor(*ids),
                     bank,
+                    self.bank_rows(*table),
                     *vocab,
                     self.tensor(*y),
                 ),

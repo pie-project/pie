@@ -400,7 +400,8 @@ impl Shell {
                 shape,
                 |param| match weights.table().0.get(param).copied().flatten() {
                     Some(crate::run::WeightRow::Dense(plane)) => Some(plane.buf),
-                    _ => None,
+                    Some(crate::run::WeightRow::Planes(bank)) => Some(bank.codes.buf),
+                    None => None,
                 },
                 |param| weights.filed(param),
             )?;
@@ -416,7 +417,113 @@ impl Shell {
             }
             caches.push(cache);
         }
+        Shell::bank_tables(weights, trace, &caches)?;
         Ok(caches)
+    }
+
+    /// Each quantized routed bank the caches stream reads its planes (codes,
+    /// scales, zero points, its select's expert bias) through one
+    /// `BankTable`, at its codes param.
+    fn bank_tables(
+        weights: &mut Weights,
+        trace: &Trace,
+        caches: &[crate::store::streamed::Cache],
+    ) -> Result<()> {
+        use crate::store::streamed::Streamed;
+        let mut planes = BTreeMap::new();
+        let mut rows = BTreeMap::new();
+        for cache in caches {
+            for (param, table) in cache.tables() {
+                match table {
+                    Streamed::Experts(table) => {
+                        planes.insert(param, table);
+                    }
+                    Streamed::Rows(table) => {
+                        rows.insert(param, table);
+                    }
+                    Streamed::Bank(_) | Streamed::BankRows(_) => {}
+                }
+            }
+        }
+        let named = |name: String| trace.params.iter().position(|p| p.name == name);
+        // A quantized table's planes, a block of rows at a time.
+        for (&codes, &table) in &rows {
+            let Some(crate::run::WeightRow::Planes(_)) =
+                weights.table().0.get(codes).copied().flatten()
+            else {
+                continue;
+            };
+            let name = &trace.params[codes].name;
+            let plane = |suffix: &str| {
+                named(format!("{name}{suffix}"))
+                    .and_then(|p| rows.get(&p).copied())
+                    .ok_or_else(|| Fault::Unbound {
+                        what: format!(
+                            "the `{suffix}` plane of streamed table `{name}`, which no cache streams"
+                        ),
+                    })
+            };
+            let (scales, biases) = (plane(poem_ir::SCALES)?, plane(poem_ir::BIASES)?);
+            weights.read_through(
+                codes,
+                Streamed::BankRows(kernels_metal::gather::BankRows {
+                    codes: table.at,
+                    scales: scales.at,
+                    biases: biases.at,
+                    block_rows: table.block_rows,
+                    hits: table.hits.or(scales.hits).or(biases.hits),
+                }),
+            );
+        }
+        let weight_of = |id: ValueId| match trace.values.get(id.0 as usize).map(|d| &d.def) {
+            Some(poem_ir::Def::Weight(w)) => Some(*w as usize),
+            _ => None,
+        };
+        for (&codes, &table) in &planes {
+            let Some(crate::run::WeightRow::Planes(_)) =
+                weights.table().0.get(codes).copied().flatten()
+            else {
+                continue;
+            };
+            let name = &trace.params[codes].name;
+            let missing = |what: &str| Fault::Unbound {
+                what: format!("the {what} of streamed routed bank `{name}`, which no cache streams"),
+            };
+            let at = |param: Option<usize>, what: &str| -> Result<Option<kernels_metal::Tensor>> {
+                param
+                    .map(|p| planes.get(&p).map(|t| t.at).ok_or_else(|| missing(what)))
+                    .transpose()
+            };
+            let scales = at(Some(named(format!("{name}{}", poem_ir::SCALES)).ok_or_else(|| missing("scales"))?), "scales")?
+                .ok_or_else(|| missing("scales"))?;
+            let biases = at(named(format!("{name}{}", poem_ir::BIASES)), "zero points")?;
+            let bias = trace.nodes.iter().find_map(|node| match &node.op {
+                Operation::Linear(poem_ir::Linear::MoeSelect {
+                    bank,
+                    bias: Some(bias),
+                    ..
+                }) if weight_of(*bank) == Some(codes) => weight_of(*bias),
+                _ => None,
+            });
+            let bias = at(bias, "expert bias")?;
+            let hits = [Some(codes), named(format!("{name}{}", poem_ir::SCALES)), named(format!("{name}{}", poem_ir::BIASES))]
+                .into_iter()
+                .flatten()
+                .find_map(|p| planes.get(&p).and_then(|t| t.hits));
+            weights.read_through(
+                codes,
+                Streamed::Bank(kernels_metal::linear::moe::BankTable {
+                    codes: table.at,
+                    scales,
+                    biases,
+                    bias,
+                    pieces: table.pieces,
+                    piece_rows: table.piece_rows,
+                    hits,
+                }),
+            );
+        }
+        Ok(())
     }
 
     pub fn load(boot: Boot<'_>) -> Result<Shell> {

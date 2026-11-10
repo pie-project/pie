@@ -76,8 +76,20 @@ enum Mode {
     Reseated,
 }
 
+/// Whether the fixture's container is a serving artifact already (a
+/// quantized deployment's: it loads from nothing else).
+fn is_serving(fixture: &Fixture) -> bool {
+    fixture
+        .container
+        .to_string_lossy()
+        .ends_with(".serving.zt")
+}
+
 /// The fixture's planes as a serving artifact beside its checkpoint.
 fn serving(fixture: &Fixture) -> std::path::PathBuf {
+    if is_serving(fixture) {
+        return fixture.container.clone();
+    }
     let path = fixture.container.with_extension("serving.zt");
     if !path.exists() {
         super::a_scattered_pool_serves_the_same_logits::write_serving(&path, &fixture.trace);
@@ -129,7 +141,11 @@ fn serve(fixture: &Fixture, mode: Mode) -> (Vec<Vec<f32>>, u64) {
         started.elapsed().as_millis(),
         shell.weights_warm()
     );
-    assert_eq!(shell.weights_warm(), warm, "{mode:?}: the road the load took");
+    assert_eq!(
+        shell.weights_warm(),
+        warm || is_serving(fixture),
+        "{mode:?}: the road the load took"
+    );
     let facts = shell.pool_chunk_facts();
     for shape in &facts.weights {
         assert_eq!(
@@ -334,8 +350,12 @@ fn check(model: &str) {
         eprintln!("skipping: no Metal device");
         return;
     }
-    let fixture = fixture_of(model, None);
-    let (whole, _) = serve(&fixture, Mode::Whole);
+    check_fixture(model, &fixture_of(model, None));
+}
+
+fn check_fixture(model: &str, fixture: &Fixture) {
+    let fixture = fixture;
+    let (whole, _) = serve(fixture, Mode::Whole);
     for mode in [
         Mode::Host,
         Mode::Resident,
@@ -346,7 +366,7 @@ fn check(model: &str) {
         Mode::Seated { warm: true },
         Mode::Reseated,
     ] {
-        let (got, _) = serve(&fixture, mode);
+        let (got, _) = serve(fixture, mode);
         same(
             &format!("{model}: rows {mode:?} against whole"),
             &got,
@@ -540,4 +560,46 @@ fn a_held_warm_load_probe() {
         memory_mib(),
         argmax(&last[0]),
     );
+}
+
+/// A quantized deployment's routed banks (their codes, scales, zero points
+/// and expert biases, an expert at a time) or tables (a block of rows at a
+/// time), out of the test kit's serving artifact.
+fn quantized(name: &str, kind: WeightKind) {
+    if !engine_metal::device::present() {
+        eprintln!("skipping: no Metal device");
+        return;
+    }
+    let fixture = super::a_scattered_pool_serves_the_same_logits::deployed_fixture(name);
+    let shell = load(&fixture, false);
+    let facts = shell.pool_chunk_facts();
+    drop(shell);
+    assert!(
+        facts.weights.iter().any(|shape| shape.kind == kind),
+        "{name} streams no {kind:?} shape: {:?}",
+        facts
+            .weights
+            .iter()
+            .map(|shape| (shape.id, shape.kind, &shape.name))
+            .collect::<Vec<_>>()
+    );
+    check_fixture(name, &fixture);
+}
+
+/// Affine u4/64 experts (and dense planes).
+#[test]
+fn a_mixtures_quantized_experts_serve_the_whole_logits_affine() {
+    quantized("qwen3-30b-a3b-mini-u4g64-kv-bf16", WeightKind::Expert);
+}
+
+/// MXFP4 experts (bf16 dense planes).
+#[test]
+fn a_mixtures_quantized_experts_serve_the_whole_logits_mxfp4() {
+    quantized("dsv41-flash-mini-bf16-mxfp4-kv-bf16", WeightKind::Expert);
+}
+
+/// Affine 4-bit per-layer tables, their rows a block at a time.
+#[test]
+fn quantized_per_layer_tables_serve_the_whole_logits() {
+    quantized("gemma4-e4b-mini-l6-u4g64-kv-bf16", WeightKind::Rows);
 }

@@ -64,6 +64,12 @@ use kernels_metal::linear::moe::ExpertTable;
 pub enum Streamed {
     Rows(RowTable),
     Experts(ExpertTable),
+    /// A quantized routed bank's planes (codes, scales, zero points, its
+    /// select's bias), at its codes param.
+    Bank(kernels_metal::linear::moe::BankTable),
+    /// A quantized table's planes (codes, scales, zero points), at its
+    /// codes param.
+    BankRows(kernels_metal::gather::BankRows),
 }
 use poem_compiler::chunk::ChunkRecipe;
 use poem_ir::{Def, Operands, Operation, Trace};
@@ -102,18 +108,21 @@ fn read_only_by(trace: &Trace, at: usize, reads: impl Fn(&Operation) -> bool) ->
 }
 
 /// The tables of `trace` this engine streams by their rows: read only by the
-/// plain embedding gather, a bf16 plane of its own with no companion, out
-/// of the checkpoint (as `engine-cuda`'s `layout::streamed_rows`).
+/// plain embedding gather, out of the checkpoint (as `engine-cuda`'s
+/// `layout::streamed_rows`): a bf16 plane of its own with no companion, or
+/// affine 4/8-bit codes (the gather `embed_gather.metal` reads through a
+/// table) with their scales and zero points.
 #[must_use]
 pub fn streamed_rows(trace: &Trace) -> Vec<usize> {
     use poem_ir::Gather;
-    use poem_ir::residency::{Residency, residency};
+    use poem_ir::residency::{Residency, leads, residency};
+    use poem_ir::Dtype;
     let classes = residency(trace);
-    (0..trace.params.len())
+    let mut tables: Vec<usize> = (0..trace.params.len())
         .filter(|&at| {
             let param = &trace.params[at];
             matches!(classes[at], Residency::Rows(_))
-                && param.dtype == poem_ir::Dtype::Bf16
+                && matches!(param.dtype, Dtype::Bf16 | Dtype::U4g64 | Dtype::U4g32 | Dtype::U8g64)
                 && param.shape.len() == 2
                 && param.source == poem_ir::ParamSource::Checkpoint
                 && read_only_by(trace, at, |op| {
@@ -126,38 +135,102 @@ pub fn streamed_rows(trace: &Trace) -> Vec<usize> {
                     }) if u64::from(*vocab) == param.shape[0])
                 })
         })
-        .collect()
+        .collect();
+    let lead = leads(trace);
+    let companions: Vec<usize> = (0..trace.params.len())
+        .filter(|&at| {
+            lead[at] != at
+                && tables.contains(&lead[at])
+                && trace.params[lead[at]].dtype != Dtype::Bf16
+                && matches!(classes[at], Residency::Rows(_))
+                && trace.params[at].source == poem_ir::ParamSource::Checkpoint
+        })
+        .collect();
+    tables.extend(companions);
+    tables.sort_unstable();
+    tables
+}
+
+/// Whether a routed bank stored as `dtype` is one every routed arm reads
+/// through an expert table: affine codes at 64/{2,4,8}, 32/2, 128/2 and
+/// MXFP4 (`kernels_metal::linear::moe::BankTable`).
+fn tabled_codes(dtype: poem_ir::Dtype) -> bool {
+    use poem_ir::Dtype;
+    matches!(
+        dtype,
+        Dtype::U4g64 | Dtype::U8g64 | Dtype::U2g64 | Dtype::U2g32 | Dtype::U2g128 | Dtype::Mxfp4
+    )
 }
 
 /// The routed banks of `trace` this engine streams an expert at a time:
-/// dense bf16 planes out of the checkpoint read only at the `bank` port of a
-/// plain routed select (no bias, no quantization), the select whose kernel
-/// reads an expert table (as `engine-cuda`'s `layout::streamed_experts`,
-/// before its recipe grouping, which [`Shape::experts`] applies).
+/// planes out of the checkpoint read only at the `bank` port of a routed
+/// select whose kernels read an expert table (as `engine-cuda`'s
+/// `layout::streamed_experts`, before its recipe grouping, which
+/// [`Shape::experts`] applies): a dense bf16 bank of a plain select (no
+/// bias, not quantized), or a quantized bank ([`tabled_codes`]) of any
+/// select of no `quant` scheme; with each quantized bank its companions
+/// (scales, zero points) and its select's expert bias.
 #[must_use]
 pub fn streamed_experts(trace: &Trace) -> Vec<usize> {
     use poem_ir::Linear;
-    use poem_ir::residency::{Residency, residency};
+    use poem_ir::residency::{Residency, leads, residency};
     let classes = residency(trace);
-    (0..trace.params.len())
+    let weight = |id: &poem_ir::ValueId, at: usize| {
+        matches!(trace.values.get(id.0 as usize).map(|d| &d.def),
+            Some(Def::Weight(w)) if *w as usize == at)
+    };
+    let expert = |at: usize| {
+        let param = &trace.params[at];
+        matches!(classes[at], Residency::Expert(_))
+            && param.shape.len() >= 2
+            && param.source == poem_ir::ParamSource::Checkpoint
+    };
+    let mut banks: Vec<usize> = (0..trace.params.len())
         .filter(|&at| {
-            let param = &trace.params[at];
-            matches!(classes[at], Residency::Expert(_))
-                && param.dtype == poem_ir::Dtype::Bf16
-                && param.shape.len() >= 2
-                && param.source == poem_ir::ParamSource::Checkpoint
-                && read_only_by(trace, at, |op| {
-                    matches!(op, Operation::Linear(Linear::MoeSelect {
+            let dtype = trace.params[at].dtype;
+            expert(at)
+                && (dtype == poem_ir::Dtype::Bf16 || tabled_codes(dtype))
+                && read_only_by(trace, at, |op| match op {
+                    Operation::Linear(Linear::MoeSelect {
                         bank,
-                        bias: None,
-                        quantized: false,
+                        bias,
+                        quantized,
                         quant: None,
                         ..
-                    }) if matches!(trace.values.get(bank.0 as usize).map(|d| &d.def),
-                        Some(Def::Weight(w)) if *w as usize == at))
+                    }) if weight(bank, at) => {
+                        tabled_codes(dtype) || (bias.is_none() && !*quantized)
+                    }
+                    _ => false,
                 })
         })
-        .collect()
+        .collect();
+    // A quantized bank's companions, and its selects' expert biases.
+    let quantized: Vec<usize> = banks
+        .iter()
+        .copied()
+        .filter(|&at| tabled_codes(trace.params[at].dtype))
+        .collect();
+    let lead = leads(trace);
+    for at in 0..trace.params.len() {
+        if !expert(at) || banks.contains(&at) {
+            continue;
+        }
+        let companion = lead[at] != at && quantized.contains(&lead[at]);
+        let bias = trace.params[at].dtype == poem_ir::Dtype::Bf16
+            && read_only_by(trace, at, |op| {
+                matches!(op, Operation::Linear(Linear::MoeSelect {
+                    bank,
+                    bias: Some(bias),
+                    quant: None,
+                    ..
+                }) if weight(bias, at) && quantized.iter().any(|&b| weight(bank, b)))
+            });
+        if companion || bias {
+            banks.push(at);
+        }
+    }
+    banks.sort_unstable();
+    banks
 }
 
 /// Every param [`streamed_rows`] or [`streamed_experts`] names: the ones a
@@ -295,7 +368,12 @@ impl Shape {
         let mut planes = Vec::with_capacity(params.len());
         let mut used = 0u64;
         for (k, &param) in params.iter().enumerate() {
-            let row = trace.params[param].shape[1] * 2;
+            // A row's stored bytes (codes at their packed width).
+            let full = poem_compiler::chunk::weights::plane_bytes(&trace.params[param]);
+            let row = full.checked_div(rows)?;
+            if row * rows != full {
+                return None;
+            }
             let stride = u64::from(block_rows) * row;
             planes.push(Plane {
                 param,
@@ -354,6 +432,10 @@ impl Shape {
                 return None;
             }
             let mut used = 0u64;
+            let layer_quantized = bank
+                .params
+                .iter()
+                .any(|&p| poem_compiler::chunk::weights::packed(trace.params[p as usize].dtype));
             for (k, &param) in bank.params.iter().enumerate() {
                 let param = param as usize;
                 let held = &trace.params[param];
@@ -361,9 +443,34 @@ impl Shape {
                     return None;
                 }
                 let rows = *held.shape.get(1)?;
-                let row = held.shape[2..].iter().product::<u64>() * 2;
-                let piece_rows = rows.div_ceil(u64::from(pieces));
+                // A row's stored bytes: the plane's over its experts' rows
+                // (codes at their packed width).
+                let full = poem_compiler::chunk::weights::plane_bytes(held);
+                let row = full.checked_div(experts * rows)?;
+                if row * experts * rows != full {
+                    return None;
+                }
+                // As the recipe cuts it: a layer holding a packed plane on
+                // whole tiles of every routed arm.
+                let grain = if layer_quantized {
+                    poem_compiler::chunk::weights::PIECE_ROW_GRAIN
+                } else {
+                    1
+                };
+                let piece_rows =
+                    poem_compiler::chunk::weights::piece_rows(rows, u64::from(pieces), grain);
                 let piece = piece_rows * row;
+                // A quantized plane lies 16-byte aligned, and its pieces hold
+                // whole tiles (or every row).
+                if layer_quantized
+                    && (!used.is_multiple_of(16)
+                        || (piece_rows < rows
+                            && !piece_rows.is_multiple_of(u64::from(
+                                kernels_metal::linear::moe::BankTable::ROWS,
+                            ))))
+                {
+                    return None;
+                }
                 planes.push(Plane {
                     param,
                     atom: u32::try_from(layer).ok()?.checked_mul(entries)?,

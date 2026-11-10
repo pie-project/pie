@@ -137,6 +137,7 @@ moe.tile_rows = [{ when = "per_expert >= 64", value = 64 }, { value = 32 }]
                     "the routed matmul",
                     at(3, tokens, k, Dtype::Bf16),
                     bank,
+                    None,
                     biased.then(|| at(2, experts, n, Dtype::Bf16)),
                     at(4, tokens, top_k, Dtype::I32),
                     experts,

@@ -72,9 +72,27 @@ fn seeded(trace: &Trace) -> Vec<(String, Vec<u64>, ztensor::Leaf, Vec<u8>)> {
         .iter()
         .filter(|param| param.source == ParamSource::Checkpoint)
         .collect();
+    // A packed plane's scales and zero points are made with it when the
+    // import quantizes it: the container holds none of their own.
+    let made: std::collections::BTreeSet<String> = planes
+        .iter()
+        .filter(|param| packed(param.dtype))
+        .flat_map(|param| {
+            [
+                poem::scales_name(&param.name),
+                poem::biases_name(&param.name),
+                poem::global_scales_name(&param.name),
+                poem::input_scales_name(&param.name),
+            ]
+        })
+        .collect();
+    planes.retain(|param| !made.contains(&param.name));
     planes.sort_by(|a, b| a.name.cmp(&b.name));
     for param in planes {
-        let count = param.shape.iter().product::<u64>() as usize;
+        // The shape before the import packs it: a packed plane's codes are
+        // stored narrower than the values they hold.
+        let shape = poem::Weight::of_plane(param).shape;
+        let count = shape.iter().product::<u64>() as usize;
         let norm = param.name.ends_with("norm");
         let mut seed = fnv(&param.name);
         let mut next = || {
@@ -90,6 +108,7 @@ fn seeded(trace: &Trace) -> Vec<(String, Vec<u64>, ztensor::Leaf, Vec<u8>)> {
             }
         };
         let (leaf, bytes): (ztensor::Leaf, Vec<u8>) = match param.dtype {
+            // A packed plane as the bf16 it is quantized from.
             Dtype::Bf16 => (
                 ztensor::Leaf::BF16,
                 (0..count)
@@ -112,14 +131,106 @@ fn seeded(trace: &Trace) -> Vec<(String, Vec<u64>, ztensor::Leaf, Vec<u8>)> {
                         .collect(),
                 )
             }
+            other if packed(other) => (
+                ztensor::Leaf::BF16,
+                (0..count)
+                    .flat_map(|_| ((value(next()).to_bits() >> 16) as u16).to_le_bytes())
+                    .collect(),
+            ),
+            // Block scale exponents (near one) and byte planes, as served.
+            Dtype::E8m0 => (
+                ztensor::Leaf::E8M0,
+                (0..count).map(|_| (118 + next() % 6) as u8).collect(),
+            ),
+            Dtype::U8 => (
+                ztensor::Leaf::U8,
+                (0..count).map(|_| next() as u8).collect(),
+            ),
             other => panic!(
                 "`{}` is {other:?}, not a dtype the fixture seeds",
                 param.name
             ),
         };
-        out.push((param.name.clone(), param.shape.clone(), leaf, bytes));
+        out.push((param.name.clone(), shape, leaf, bytes));
     }
     out
+}
+
+/// Whether a plane stored as `dtype` is packed codes the import quantizes
+/// from bf16.
+fn packed(dtype: Dtype) -> bool {
+    matches!(
+        dtype,
+        Dtype::Mxfp4
+            | Dtype::Nvfp4
+            | Dtype::E4m3tensor
+            | Dtype::U4g64
+            | Dtype::U8g64
+            | Dtype::U4g32
+            | Dtype::U4g64tiled
+            | Dtype::U2g32
+            | Dtype::U2g64
+            | Dtype::U2g128
+    )
+}
+
+/// The fixture of catalog deployment `name` (listed, or spelled): a
+/// deployment with packed planes loads from a serving artifact alone, which
+/// the test kit's import writes from the seeded floats (a load converts
+/// nothing).
+pub(super) fn deployed_fixture(name: &str) -> Fixture {
+    let trace = poem_compiler::catalog::deployment(name)
+        .cloned()
+        .or_else(|| poem_compiler::catalog::repository().parse(name))
+        .unwrap_or_else(|| panic!("no package spells `{name}`"))
+        .trace(Platform::Metal);
+    let encoded = trace
+        .params
+        .iter()
+        .any(|param| param.source == ParamSource::Checkpoint && packed(param.dtype));
+    if !encoded {
+        return fixture_from(trace, name);
+    }
+    let dir = std::env::var_os("PIE_FIXTURE_DIR").map_or_else(
+        || std::env::temp_dir().join(format!("pie-bm-pool-{}", std::process::id())),
+        std::path::PathBuf::from,
+    );
+    std::fs::create_dir_all(&dir).expect("the fixture dir");
+    let floats = dir.join(format!("{name}.floats.zt"));
+    if !floats.exists() {
+        write_checkpoint(&floats, &trace);
+    }
+    let source = ztensor::Source::open(&floats).expect("the seeded floats open");
+    let imported = poem::import::own_contract(&source, &trace.params, 1, Platform::Metal)
+        .expect("the seeded floats are read by the plan's own names");
+    drop(source);
+    let container = dir.join(format!("{name}.serving.zt"));
+    if !container.exists() {
+        let tiled: Vec<&str> = trace
+            .params
+            .iter()
+            .filter(|param| param.dtype == Dtype::U4g64tiled)
+            .map(|param| param.name.as_str())
+            .collect();
+        checkpoint::testkit::artifact::import(
+            &floats,
+            &imported,
+            &checkpoint::serving::Stamp::of(trace.platform.backend(), &trace.name),
+            &tiled,
+            &container,
+        )
+        .unwrap_or_else(|why| panic!("{name} imports: {why}"));
+    }
+    // The load reads the artifact's planes as stored.
+    let source = ztensor::Source::open(&container).expect("the artifact opens");
+    let contract = poem::import::own_contract(&source, &trace.params, 1, Platform::Metal)
+        .expect("the artifact is read by the plan's own names");
+    drop(source);
+    Fixture {
+        trace,
+        contract,
+        container,
+    }
 }
 
 pub(super) struct Fixture {

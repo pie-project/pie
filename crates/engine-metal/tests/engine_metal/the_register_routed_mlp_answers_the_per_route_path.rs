@@ -352,13 +352,13 @@ fn the_register_routed_mlp_answers_the_per_route_path() {
 
                 let frame = device.frame().expect("frame");
                 let sink = Sink::new(&device, &frame, &pipelines, &handles);
-                moe::matmul_select_quant(&sink, xt, gate_up, rt, pt).expect("gate-up");
+                moe::matmul_select_quant(&sink, xt, gate_up, None, rt, pt).expect("gate-up");
                 mlp::swiglu(&sink, pt, INTER, ht).expect("swiglu");
-                moe::matmul_select_quant(&sink, ht, down, rt, yt).expect("down");
+                moe::matmul_select_quant(&sink, ht, down, None, rt, yt).expect("down");
                 moe::weighted_sum(&sink, yt, wt, ft).expect("fold");
-                moe::matmul_select_quant(&sink, xt, shared_gate_up, zt, opt).expect("own gate-up");
+                moe::matmul_select_quant(&sink, xt, shared_gate_up, None, zt, opt).expect("own gate-up");
                 mlp::swiglu(&sink, opt, INTER, oht).expect("own swiglu");
-                moe::matmul_select_quant(&sink, oht, shared_down, zt, ot).expect("own down");
+                moe::matmul_select_quant(&sink, oht, shared_down, None, zt, ot).expect("own down");
                 qmm::matmul(
                     &sink,
                     &tuning,
@@ -383,6 +383,7 @@ fn the_register_routed_mlp_answers_the_per_route_path() {
                 moe::register_glu(
                     &sink,
                     gate_up,
+                    None,
                     own_banks(shared_gate_up),
                     HIDDEN,
                     INTER,
@@ -395,6 +396,7 @@ fn the_register_routed_mlp_answers_the_per_route_path() {
                 moe::register_down(
                     &sink,
                     down,
+                    None,
                     own_banks(shared_down),
                     INTER,
                     HIDDEN,
@@ -609,6 +611,7 @@ fn the_eight_bit_routed_select_answers_f64() {
         &sink,
         Tensor::new(bind(&xb), TOKENS, K, Dtype::Bf16),
         bank,
+        None,
         Tensor::new(bind(&rb), TOKENS, 1, Dtype::I32),
         Tensor::new(bind(&yb), TOKENS, N, Dtype::Bf16),
     )

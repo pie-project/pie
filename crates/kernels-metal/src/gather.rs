@@ -19,6 +19,20 @@ pub struct RowTable {
     pub hits: Option<Tensor>,
 }
 
+/// Where the blocks of a quantized table's rows lie, for
+/// [`embed_gather_mb_4bit`]: one address table a plane (codes, scales, zero
+/// points), one GPU address a block of `block_rows` rows each, laid as in
+/// the plane; `hits`, where stated, a `u32` a block each row read adds one
+/// to.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct BankRows {
+    pub codes: Tensor,
+    pub scales: Tensor,
+    pub biases: Tensor,
+    pub block_rows: u32,
+    pub hits: Option<Tensor>,
+}
+
 pub fn embed(
     ctx: &Ctx<'_>,
     ids: Tensor,
@@ -157,7 +171,7 @@ pub fn embed_concat_mb_4bit(
     const OP: &str = "gather.embed";
     debug_assert_eq!(ids.dtype, Dtype::I32, "`{OP}` gathers by i32 token ids");
     let (slices, width) = concat_slices(OP, ids, y)?;
-    gather_mb_4bit(ctx, OP, ids, table, vocab, y, slices, width)
+    gather_mb_4bit(ctx, OP, ids, table, None, vocab, y, slices, width)
 }
 
 pub fn split_qkv(
@@ -336,6 +350,7 @@ pub fn embed_gather_mb_4bit(
     ctx: &Ctx<'_>,
     ids: Tensor,
     table: Bank,
+    rows: Option<BankRows>,
     vocab: u32,
     y: Tensor,
 ) -> Result<(), Error> {
@@ -344,7 +359,7 @@ pub fn embed_gather_mb_4bit(
         ids.rows, y.rows,
         "the token ids handed over are the rows this gather lands"
     );
-    gather_mb_4bit(ctx, OP, ids, table, vocab, y, y.rows, y.width)
+    gather_mb_4bit(ctx, OP, ids, table, rows, vocab, y, y.rows, y.width)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -353,6 +368,7 @@ fn gather_mb_4bit(
     op: &'static str,
     ids: Tensor,
     table: Bank,
+    rows: Option<BankRows>,
     vocab: u32,
     y: Tensor,
     slices: u32,
@@ -395,6 +411,29 @@ fn gather_mb_4bit(
             y.arg_mut(),
             stated(op, width)?.arg(),
             stated(op, vocab)?.arg(),
+            match rows {
+                Some(rows) => rows.codes.arg(),
+                None => ctx.absent()?,
+            },
+            match rows {
+                Some(rows) => rows.scales.arg(),
+                None => ctx.absent()?,
+            },
+            match rows {
+                Some(rows) => rows.biases.arg(),
+                None => ctx.absent()?,
+            },
+            match rows {
+                Some(rows) => {
+                    stated(op, nonzero(op, "a row table's rows a block", rows.block_rows)?)?.arg()
+                }
+                None => 0i32.arg(),
+            },
+            match rows.and_then(|rows| rows.hits) {
+                Some(hits) => hits.arg_mut(),
+                None => ctx.absent()?,
+            },
+            i32::from(rows.is_some_and(|rows| rows.hits.is_some())).arg(),
         ],
     )
 }
@@ -876,6 +915,7 @@ mod tests {
             &probe,
             Tensor::new(3, 8, 1, Dtype::I32),
             u4_bank(4096, 64),
+            None,
             0,
             bf16(2, 8, 64),
         )
