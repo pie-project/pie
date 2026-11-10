@@ -826,9 +826,38 @@ fn served_offloaded(fixture: &Fixture, cache: &Path, offload: bool) -> Vec<(u64,
     use engine::chunk::SlotKind;
     use engine_cuda::store::Tier;
     let mut shell = load(fixture, cache);
+    // `PIE_GOLDEN_HOST_MIB`: the host tier's budget (1 GiB otherwise), and
+    // the process's resident and locked memory printed before it is seated
+    // and two seconds after, when what the tier locks ahead has landed.
+    let stated = std::env::var("PIE_GOLDEN_HOST_MIB")
+        .ok()
+        .and_then(|mib| mib.parse::<u64>().ok());
+    let resident = |when: &str| {
+        let status = std::fs::read_to_string("/proc/self/status").unwrap_or_default();
+        let mib = |key: &str| {
+            status
+                .lines()
+                .find_map(|line| line.strip_prefix(key))
+                .and_then(|rest| rest.split_whitespace().next()?.parse::<u64>().ok())
+                .map_or(0, |kib| kib >> 10)
+        };
+        println!(
+            "host tier {} {when}: resident {} MiB, locked {} MiB",
+            fixture.model,
+            mib("VmRSS:"),
+            mib("VmLck:")
+        );
+    };
+    if stated.is_some() {
+        resident("before it is seated");
+    }
     shell
-        .seat_host_kv(Some(1 << 30), 1, CONTEXT, 1)
+        .seat_host_kv(Some(stated.map_or(1 << 30, |mib| mib << 20)), 1, CONTEXT, 1)
         .expect("the host tier seats");
+    if stated.is_some() {
+        std::thread::sleep(std::time::Duration::from_secs(2));
+        resident("two seconds after");
+    }
     let dir = tempfile::tempdir().expect("a disk tier's dir");
     shell
         .seat_disk_kv(
