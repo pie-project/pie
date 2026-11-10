@@ -72,15 +72,22 @@ pub struct Wafer {
     pub positions: usize,
     pub vocab: usize,
     pub hidden: usize,
-    /// The program's posted-loop length (its plan's; `PIE_CEREBRAS_POSTED_LOOP` overrides it).
+    /// The program's posted-loop length (its plan's; the config's `posted_loop` overrides it).
     pub posted_loop: usize,
 }
 
 impl Wafer {
-    /// Loads the compiled `program` (its [`artifact`]) on `platform`, places the prep's tiles
-    /// (`PIE_CEREBRAS_WEIGHTS`) and returns once the model answers; `vocab`: the trace's.
-    pub fn open(program: PathBuf, platform: Platform, vocab: usize) -> R<Wafer> {
-        let weights = artifact::Weights::from_env()?;
+    /// Loads the compiled `program` (its [`artifact`]) on `platform` through the SDK in
+    /// `sdk_lib`, places `weights` and returns once the model answers; `vocab`: the trace's;
+    /// `force_prompt`: the prompt through the token loop.
+    pub fn open(
+        program: PathBuf,
+        platform: Platform,
+        vocab: usize,
+        weights: artifact::Weights,
+        sdk_lib: PathBuf,
+        force_prompt: bool,
+    ) -> R<Wafer> {
         let art = artifact::read(&program)?;
         let posted_loop = art.host.loop_len as usize;
         let (job_tx, job_rx) = mpsc::channel::<Job>();
@@ -91,14 +98,16 @@ impl Wafer {
             .name("spatial-wafer".into())
             .spawn(move || {
                 let open = || -> R<ArtifactModel> {
-                    let sdk = Sdk::open().map_err(|e| e.to_string())?;
+                    let sdk = Sdk::open_at(&sdk_lib).map_err(|e| e.to_string())?;
                     let mut rt = Runtime::new(sdk, &program, platform, "WARNING")
                         .map_err(|e| e.to_string())?;
                     let t0 = Instant::now();
                     rt.load();
                     rt.run();
                     tracing::info!(s = t0.elapsed().as_secs_f64(), "artifact: program loaded");
-                    ArtifactModel::open(Box::new(rt), &weights, &art, vocab)
+                    let mut m = ArtifactModel::open(Box::new(rt), &weights, &art, vocab)?;
+                    m.force = force_prompt;
+                    Ok(m)
                 };
                 let mut m = match open() {
                     Ok(m) => {

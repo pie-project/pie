@@ -166,8 +166,9 @@ impl XlaEngineOptions {
     }
 }
 
-/// The Cerebras engine: the fabric simulator, or a CS system reached by
-/// `cmaddr`, driving one wafer.
+/// The Cerebras engine: the model forward as a wafer program on a CS system reached by `cmaddr`,
+/// or the fabric simulator. A load plans the model's trace, compiles the program and cuts the
+/// checkpoint for it (both cached under the engine cache), so the model is all it needs.
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct CerebrasEngineOptions {
@@ -176,7 +177,7 @@ pub struct CerebrasEngineOptions {
     pub target: String,
     /// The CS system's `host:port`. Omit to run the fabric simulator.
     pub cmaddr: Option<String>,
-    /// Host threads the simulator and the host-side staging use.
+    /// Host threads the simulator uses.
     pub num_threads: u32,
     /// The most tokens one fire carries. Omit for the engine's own.
     pub max_forward_tokens: Option<u32>,
@@ -184,26 +185,28 @@ pub struct CerebrasEngineOptions {
     pub max_forward_requests: Option<u32>,
     /// Recurrent-state seats (hybrid models).
     pub max_state_slots: Option<u32>,
-    /// The longest sequence (prompt + output) one lane holds, in tokens.
-    /// Omit for the engine default (4096).
+    /// The longest sequence (prompt + output) one lane holds, in tokens: the positions the wafer
+    /// program is built to serve. Omit for as many as the program holds.
     pub max_model_len: Option<u32>,
-    /// Trace and compile the first fire shapes at load.
-    pub prewarm: bool,
-    /// The spatial engine (the model forward as a resident wafer program,
-    /// instead of the phase programs) on this compiled wafer program's
-    /// output directory (kernels-cerebras `wafer-compile build`, then `link`), run on
-    /// `cmaddr` (else the simulator). Omit for the cerebras shell.
-    pub spatial_program: Option<String>,
-    /// Steps a greedy lane's token loop runs past its row in one wafer
-    /// launch (0: off); omit for the engine's default.
-    pub spatial_lookahead: Option<u32>,
-    /// Whether the spatial engine settles frames asynchronously (each step
-    /// lands once its epilogue ran); omit for the engine's default (off).
-    pub spatial_async: Option<bool>,
-    /// The engine's switches (`[cerebras.switches]`: placement, serving,
-    /// toolchain; `engine-cerebras` `switches`), each winning over its old
-    /// `PIE_CEREBRAS_*` variable.
-    pub switches: Option<toml::Table>,
+    /// Steps a greedy lane's token loop runs past its row in one wafer launch (0: off); omit
+    /// for the engine's default.
+    pub lookahead: Option<u32>,
+    /// Whether frames settle asynchronously (each step lands once its epilogue ran); omit for
+    /// the engine's default (off).
+    #[serde(rename = "async")]
+    pub asynchronous: Option<bool>,
+    /// Steps a posted token loop runs past its row; omit for the program's own.
+    pub posted_loop: Option<u32>,
+    /// `[engine.wafer]`: `preset` (the family's preset by name, else the first that builds),
+    /// `build` (`"on_load"`, or `"never"`: refuse a program not compiled before), `tiles`
+    /// (`"cache"`, or `"memory"`: cut for each load). Checked by the engine at boot.
+    pub wafer: Option<toml::Table>,
+    /// `[engine.toolchain]`: where the SDK image's toolchain is when off its default layout
+    /// (`cslc`, `cslang_root`, `python`, `sdk_lib`, `compile_timeout`).
+    pub toolchain: Option<toml::Table>,
+    /// `[engine.debug]`: bench and experiment settings (`program`, `weights`, `set`, `levers`,
+    /// `force_prompt`, `posted`, `loop_room`); a load with any logs them.
+    pub debug: Option<toml::Table>,
 }
 
 impl Default for CerebrasEngineOptions {
@@ -216,11 +219,12 @@ impl Default for CerebrasEngineOptions {
             max_forward_requests: None,
             max_state_slots: None,
             max_model_len: None,
-            prewarm: false,
-            spatial_program: None,
-            spatial_lookahead: None,
-            spatial_async: None,
-            switches: None,
+            lookahead: None,
+            asynchronous: None,
+            posted_loop: None,
+            wafer: None,
+            toolchain: None,
+            debug: None,
         }
     }
 }

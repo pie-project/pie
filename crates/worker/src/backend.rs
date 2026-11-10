@@ -786,47 +786,45 @@ pub(crate) fn create_engine_backend(
         }
         #[cfg(feature = "cerebras")]
         EngineOptions::Cerebras(opts) => {
-            let mut boot_doc = format!(
-                "[cerebras]\ntarget = {:?}\nnum_threads = {}\nprewarm = {}\n",
-                opts.target, opts.num_threads, opts.prewarm,
+            // The engine's `[cerebras]` table: compiled programs and cut tiles cache under the
+            // PIE home, as wasmtime's do.
+            let mut cerebras = toml::Table::new();
+            cerebras.insert("target".into(), opts.target.clone().into());
+            cerebras.insert("num_threads".into(), i64::from(opts.num_threads).into());
+            cerebras.insert(
+                "cache_dir".into(),
+                crate::disk::engine_cache_dir(home)
+                    .join("cerebras")
+                    .display()
+                    .to_string()
+                    .into(),
             );
-            // Compiled programs cache under the PIE home, as wasmtime's do.
-            boot_doc.push_str(&format!(
-                "cache_dir = {}\n",
-                toml::Value::String(
-                    crate::disk::engine_cache_dir(home)
-                        .join("cerebras")
-                        .display()
-                        .to_string()
-                )
-            ));
             if let Some(cmaddr) = &opts.cmaddr {
-                boot_doc.push_str(&format!(
-                    "cmaddr = {}\n",
-                    toml::Value::String(cmaddr.clone())
-                ));
+                cerebras.insert("cmaddr".into(), cmaddr.clone().into());
             }
-            if let Some(program) = &opts.spatial_program {
-                boot_doc.push_str("[cerebras.spatial]\n");
-                boot_doc.push_str(&format!(
-                    "program = {}\n",
-                    toml::Value::String(program.clone())
-                ));
-                if let Some(lookahead) = opts.spatial_lookahead {
-                    boot_doc.push_str(&format!("lookahead = {lookahead}\n"));
-                }
-                if let Some(asynchronous) = opts.spatial_async {
-                    boot_doc.push_str(&format!("async = {asynchronous}\n"));
+            for (key, value) in [
+                ("lookahead", opts.lookahead),
+                ("posted_loop", opts.posted_loop),
+            ] {
+                if let Some(v) = value {
+                    cerebras.insert(key.into(), i64::from(v).into());
                 }
             }
-            if let Some(switches) = &opts.switches {
-                let mut cerebras = toml::Table::new();
-                cerebras.insert("switches".into(), toml::Value::Table(switches.clone()));
-                let mut doc = toml::Table::new();
-                doc.insert("cerebras".into(), toml::Value::Table(cerebras));
-                boot_doc.push('\n');
-                boot_doc.push_str(&toml::to_string(&doc)?);
+            if let Some(asynchronous) = opts.asynchronous {
+                cerebras.insert("async".into(), asynchronous.into());
             }
+            for (key, table) in [
+                ("wafer", &opts.wafer),
+                ("toolchain", &opts.toolchain),
+                ("debug", &opts.debug),
+            ] {
+                if let Some(t) = table {
+                    cerebras.insert(key.into(), toml::Value::Table(t.clone()));
+                }
+            }
+            let mut doc = toml::Table::new();
+            doc.insert("cerebras".into(), toml::Value::Table(cerebras));
+            let boot_doc = toml::to_string(&doc)?;
             let backend = runtime::engine::backend::open::cerebras(boot_doc.as_bytes())?;
             let defaults = engine::Budgets::default();
             let (max_lanes, max_tokens) =
@@ -844,7 +842,8 @@ pub(crate) fn create_engine_backend(
                         .filter(|&len| len > 0)
                         .unwrap_or(defaults.max_context)
                         .max(defaults.page_size),
-                    context_declared: false,
+                    // a stated length is the positions the wafer program is built for
+                    context_declared: opts.max_model_len.is_some_and(|len| len > 0),
                     slots: opts.max_state_slots.map_or(0, |slots| slots.max(1)),
                     max_patches: patch_ceilings.0,
                     max_images: patch_ceilings.1,

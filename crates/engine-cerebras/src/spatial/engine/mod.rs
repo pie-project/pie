@@ -1,5 +1,6 @@
 //! The engine layer: PIE's `Engine` over the wafer program. It loads the
-//! model (opens the compiled program, places the prep's tiles), then serves
+//! model (plans its trace, builds or finds the program, cuts or finds the
+//! checkpoint's tiles, opens the program and places them), then serves
 //! fires: each lane's rows through the program's one-sequence cache (brought
 //! to the lane's history first), the guest passes in the host interpreter,
 //! the lanes' readouts.
@@ -8,8 +9,6 @@ mod fire;
 mod kv;
 mod launch;
 mod posted;
-
-use std::path::Path;
 
 use engine::Engine;
 use engine::caps::{Capabilities, DeviceFacts, FireLimits, KvCopyDomains, PoolFacts};
@@ -21,23 +20,23 @@ use engine::program::{BoundInstance, InstanceBinding, InstanceId, ProgramId, Pro
 use engine::transfer::MemoryDomain;
 use eta_ir::registry::{GeometryClass, PortMask};
 
-use super::SpatialBoot;
 use kv::Kv;
 
-use super::{artifact, wafer};
+use super::config::{Config, Debug, Target};
+use super::facts::Facts;
+use super::{prepare, wafer};
 
-use crate::api::{ContractFor, DeviceBoot, bake_budgets, fault, patch_ladder, refusal};
-use crate::serve::{Boot, Shell};
+use crate::api::{ContractFor, refusal};
 
 /// The spatial engine: the model forward in the wafer program, guest
 /// programs on the host.
 pub struct Spatial {
     programs: crate::program::Plane,
-    boot: DeviceBoot,
-    spatial: SpatialBoot,
+    cfg: Config,
+    debug: Debug,
     contract_for: ContractFor,
-    /// A dry shell: the trace, its classes, paging and readout, no device.
-    shell: Option<Shell>,
+    /// The trace's classes, inputs, readout and paging.
+    facts: Option<Facts>,
     caps: Option<Capabilities>,
     readout: Option<(String, u32)>,
     model: Option<wafer::Wafer>,
@@ -62,13 +61,13 @@ pub struct Spatial {
 
 impl Spatial {
     #[must_use]
-    pub fn new(boot: DeviceBoot, spatial: SpatialBoot, contract_for: ContractFor) -> Spatial {
+    pub fn new(cfg: Config, contract_for: ContractFor) -> Spatial {
         Spatial {
             programs: crate::program::Plane::default(),
-            boot,
-            spatial,
+            debug: cfg.debug(),
+            cfg,
             contract_for,
-            shell: None,
+            facts: None,
             caps: None,
             readout: None,
             model: None,
@@ -93,6 +92,9 @@ impl Spatial {
     }
 }
 
+/// Recurrent-state seats when the budgets state none.
+const DEFAULT_STATE_SLOTS: u32 = 4;
+
 impl Engine for Spatial {
     fn kind(&self) -> &'static str {
         "cerebras-spatial"
@@ -103,7 +105,7 @@ impl Engine for Spatial {
     }
 
     fn load(&mut self, request: LoadRequest) -> EngineResult<Loaded> {
-        if self.shell.is_some() {
+        if self.facts.is_some() {
             return Err(Error::Load(
                 "this spatial engine already has a model loaded".into(),
             ));
@@ -112,7 +114,7 @@ impl Engine for Spatial {
             trace,
             checkpoint,
             budgets,
-            residency,
+            residency: _,
             ordinal: _,
             frames_in_flight: _,
         } = request;
@@ -121,62 +123,41 @@ impl Engine for Spatial {
                 "the spatial engine loads a checkpoint path".into(),
             ));
         };
-        // The dry shell reads neither contract nor checkpoint; it wants one.
         let contract = (self.contract_for)(&trace, &path).map_err(Error::Load)?;
-        let patches = patch_ladder(&trace, &budgets);
-        let voxels = poem_compiler::VoxelLadder::of(
-            &trace,
-            budgets.max_voxels,
-            budgets.max_clips,
-            budgets.max_lanes,
-        );
-        let slots =
-            poem_compiler::state_slots(budgets.slots, &trace, crate::api::DEFAULT_STATE_SLOTS);
-        let shell = Shell::load_dry(
-            Boot {
-                patches,
-                trace,
-                contract: &contract,
-                checkpoint: &path,
-                budget: bake_budgets(&budgets),
-                page_size: budgets.page_size,
-                context: budgets.max_context,
-                slots,
-                kv_budget: residency.device_kv_budget,
-                memory_share: residency.device_memory_share,
-                device: &self.boot,
-            },
-            voxels,
-            false,
-        )
-        .map_err(fault)?;
-        self.readout = shell.readout_output();
-        // The wafer program: compiled outside the engine, its artifact beside it.
-        let program = Path::new(&self.spatial.program);
-        if !artifact::is_artifact_program(program) {
-            return Err(Error::Load(format!(
-                "{}: not a compiled wafer program (no artifact/program.json): wafer-compile \
-                 build --plan <plan.json> --out <dir>, then link.sh <dir>",
-                program.display()
-            )));
-        }
-        let platform = match &self.boot.cmaddr {
+        // the program serves the context the config states (else as many positions as it holds)
+        let positions = budgets.context_declared.then_some(budgets.max_context);
+        let prepared = prepare::prepare(&self.cfg, &trace, &contract, &path, positions)
+            .map_err(|e| Error::Load(format!("the wafer program: {e}")))?;
+        let slots = poem_compiler::state_slots(budgets.slots, &trace, DEFAULT_STATE_SLOTS);
+        let facts = Facts::of(trace, &budgets, slots).map_err(Error::Load)?;
+        self.readout = facts.readout();
+        let platform = match &self.cfg.cmaddr {
             Some(cmaddr) => crate::sdk::Platform::System {
                 cmaddr: cmaddr.clone(),
             },
             None => crate::sdk::Platform::Simulator(crate::sdk::Simulator {
-                num_threads: self.boot.num_threads,
-                ..crate::sdk::Simulator::new(self.boot.target)
+                num_threads: self.cfg.num_threads,
+                ..crate::sdk::Simulator::new(match self.cfg.target {
+                    Target::Wse2 => crate::sdk::Target::Wse2,
+                    Target::Wse3 => crate::sdk::Target::Wse3,
+                })
             }),
         };
         let vocab = self
             .readout
             .as_ref()
             .map_or(usize::MAX, |(_, w)| *w as usize);
-        let w = wafer::Wafer::open(program.to_path_buf(), platform, vocab)
-            .map_err(|e| Error::Load(format!("the spatial wafer model: {e}")))?;
+        let w = wafer::Wafer::open(
+            prepared.program.clone(),
+            platform,
+            vocab,
+            prepared.weights.clone(),
+            self.cfg.toolchain.sdk_lib(),
+            self.debug.force_prompt,
+        )
+        .map_err(|e| Error::Load(format!("the spatial wafer model: {e}")))?;
         tracing::info!(
-            program = %program.display(),
+            program = %prepared.program.display(),
             vocab = w.vocab,
             hidden = w.hidden,
             "spatial wafer model loaded"
@@ -186,14 +167,14 @@ impl Engine for Spatial {
         self.model = Some(w);
         self.kv = Kv::default();
 
-        let trace_name = shell.trace().name.clone();
-        let paging = shell.paging();
+        let trace_name = facts.trace().name.clone();
+        let paging = facts.paging();
         self.kv.page_size = paging.page_size;
-        let state_rows = shell.has_state();
+        let state_rows = facts.has_state();
         let caps = Capabilities {
             device: DeviceFacts {
                 backend: "cerebras".to_string(),
-                domain: MemoryDomain::CerebrasDevice(self.boot.ordinal),
+                domain: MemoryDomain::CerebrasDevice(0),
                 sms: 1,
                 unified_memory: false,
                 fp8_native: false,
@@ -207,8 +188,9 @@ impl Engine for Spatial {
                 kv_pages: u32::try_from(paging.pages()).unwrap_or(u32::MAX),
                 kv_page_size: paging.page_size,
                 state_slots: if state_rows { paging.slots } else { 0 },
-                buffer_pages: shell.buffer_pages(),
-                state_slot_bytes: shell.state_slot_bytes(),
+                // recurrent state replays from tokens: no buffered verbs
+                buffer_pages: 0,
+                state_slot_bytes: facts.state_slot_bytes(),
                 adapter_banks: 0,
                 ..PoolFacts::default()
             },
@@ -240,15 +222,15 @@ impl Engine for Spatial {
             kv_handle: None,
             media_encode: false,
             device_channel_commit: true,
-            rs_verbs: shell.serves_rs_verbs(),
+            rs_verbs: false,
             rs_snapshots: 0,
             bidirectional_attention: false,
             adapter_attachments: false,
-            facts: shell.trace().facts.clone(),
-            inputs: shell.input_decls(),
-            classes: shell.classes(),
+            facts: facts.trace().facts.clone(),
+            inputs: facts.input_decls(),
+            classes: facts.classes(),
         };
-        self.shell = Some(shell);
+        self.facts = Some(facts);
         self.caps = Some(caps.clone());
         Ok(Loaded {
             facts: LoadFacts {

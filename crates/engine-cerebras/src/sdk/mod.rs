@@ -20,8 +20,8 @@
 //! ```
 //!
 //! No container, PRoot or environment variables are needed after that.
-//! [`Sdk::open`] looks for the libraries in the `sdk_lib` switch, then
-//! `/cbcore/lib`, and prepends the sibling `bin/` directory to `PATH` because
+//! [`Sdk::open_at`] loads the libraries from a directory (the toolchain
+//! config's `sdk_lib`, by default `/cbcore/lib`) and prepends the sibling `bin/` directory to `PATH` because
 //! the runtime shells out to helpers such as `cself_default`.
 //!
 //! # What is and is not covered
@@ -52,24 +52,7 @@
 pub(crate) mod abi;
 pub mod sys;
 
-pub use kernels_cerebras::spatial::toolchain::{Arch, Compile, Cslc, Toolchain};
-
-/// The toolchain as the switches place it (the phase engine's).
-pub fn toolchain() -> Toolchain {
-    let path = |k: &str| crate::switches::get(k).map(std::path::PathBuf::from);
-    Toolchain {
-        cslc: path("cslc"),
-        cslang_root: path("cslang_root"),
-        python: path("python"),
-        sdk_lib: path("sdk_lib"),
-        compile_timeout: crate::switches::parse("compile_timeout"),
-    }
-}
-
-/// The compiler where the switches place it.
-pub fn cslc() -> std::result::Result<Cslc, kernels_cerebras::spatial::toolchain::Error> {
-    Cslc::find(&toolchain())
-}
+pub use kernels_cerebras::spatial::toolchain::Arch;
 
 impl From<Target> for Arch {
     fn from(t: Target) -> Self {
@@ -159,11 +142,9 @@ pub struct Sdk {
 }
 
 impl Sdk {
-    /// Default library directory: the `sdk_lib` switch, or `/cbcore/lib`.
+    /// Default library directory: the SDK image's `/cbcore/lib`.
     pub fn default_lib_dir() -> PathBuf {
-        crate::switches::get("sdk_lib")
-            .map(PathBuf::from)
-            .unwrap_or_else(|| PathBuf::from("/cbcore/lib"))
+        kernels_cerebras::spatial::toolchain::Toolchain::default().sdk_lib()
     }
 
     pub fn open() -> Result<Arc<Self>> {

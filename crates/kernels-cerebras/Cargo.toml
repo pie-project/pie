@@ -3,7 +3,7 @@ name = "kernels-cerebras"
 version.workspace = true
 edition = "2024"
 authors = ["In Gim <in.gim@icloud.com>"]
-description = "Cerebras kernels: the CSL kernel library, with a census naming every kernel and its argument formats, and per-op entries that emit device work (phases of kernel calls over placed buffers); and the wafer program's build (plan, blocks, floor, fabric, kernel ABI, weight bindings) as an artifact the engine runs. The engine owns where data lives and when it runs."
+description = "The Cerebras wafer program compiler: plans a model's trace onto the wafer (poem's spatial pass), builds the program (blocks, floor, fabric, kernel ABI, the CSL kernels), links it with the SDK toolchain and cuts the checkpoint into its tiles, as an artifact the engine runs."
 license = "Apache-2.0"
 repository = "https://github.com/pie-project/pie"
 
@@ -13,7 +13,6 @@ path = "src/lib.rs"
 
 [dependencies]
 blake3 = "1"
-dtype = { package = "pie-dtype", path = "../dtype" }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1"
 poem-compiler = { package = "pie-poem-compiler", path = "../poem-compiler" }

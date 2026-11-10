@@ -144,23 +144,22 @@ impl Spatial {
                     .max(ahead.map_or(0, |fires| (fires as usize).min(lookahead)));
                 c.next_loop
             };
-            // A loop runs no further than the lane's pages (`PIE_CEREBRAS_LOOP_ROOM=off`:
-            // the lookahead alone): the rows past a sequence's end are waste.
+            // A loop runs no further than the lane's pages (debug `loop_room = false`: the
+            // lookahead alone): the rows past a sequence's end are waste.
             let room = (pages.len() as u32 * self.kv.page_size)
                 .saturating_sub(start + tokens.len() as u32) as usize;
             let bounded = !posting
-                && std::env::var("PIE_CEREBRAS_LOOP_ROOM").map_or(true, |v| v != "off")
+                && self.debug.loop_room.unwrap_or(true)
                 && !pages.is_empty();
             let steps = if bounded { steps.min(room) } else { steps };
-            // With the prompt forced through the loop (PIE_CEREBRAS_FORCE_PROMPT=1),
-            // the waited-for launch is the prompt alone: its first token right
-            // after the prefill, every later loop posted.
-            let steps =
-                if posting && std::env::var("PIE_CEREBRAS_FORCE_PROMPT").is_ok_and(|v| v == "1") {
-                    0
-                } else {
-                    steps
-                };
+            // With the prompt forced through the loop (debug `force_prompt`), the
+            // waited-for launch is the prompt alone: its first token right after the
+            // prefill, every later loop posted.
+            let steps = if posting && self.debug.force_prompt {
+                0
+            } else {
+                steps
+            };
             tracing::info!(
                 rows = tokens.len(),
                 steps,
@@ -204,12 +203,12 @@ impl Spatial {
         ))
     }
 
-    /// Whether greedy loops are posted back to back (`PIE_CEREBRAS_POSTED=0`:
-    /// one loop at a time).
+    /// Whether greedy loops are posted back to back (debug `posted = false`: one
+    /// loop at a time).
     fn loop_posting(&self) -> bool {
         self.model.is_some()
             && self.lookahead() > 0
-            && std::env::var("PIE_CEREBRAS_POSTED").map_or(true, |v| v != "0")
+            && self.debug.posted.unwrap_or(true)
     }
 
     /// The posted loop's rows into the cache (waiting for it, or only if it
@@ -256,15 +255,11 @@ impl Spatial {
         }
         let start = c.tokens.len();
         // A loop's rows come back when it ends: the request's last rows wait
-        // for its whole loop, so posted loops stay short
-        // (`PIE_CEREBRAS_POSTED_LOOP`, else the program plan's loop, else 32
-        // steps past the row).
+        // for its whole loop, so posted loops stay short (the config's
+        // `posted_loop`, else the program plan's loop).
         let plan_loop = self.model()?.posted_loop;
         let c = &mut self.kv.cached;
-        let most = std::env::var("PIE_CEREBRAS_POSTED_LOOP")
-            .ok()
-            .and_then(|v| v.parse::<usize>().ok())
-            .unwrap_or(plan_loop);
+        let most = self.cfg.posted_loop.unwrap_or(plan_loop);
         c.next_loop = (c.next_loop.max(FIRST_LOOP) * 2)
             .min(lookahead)
             .min(most.max(1));
@@ -284,7 +279,7 @@ impl Spatial {
     /// the config's `lookahead`, else 32 once a model is loaded.
     pub(super) fn lookahead(&self) -> usize {
         let default = if self.model.is_some() { 32 } else { 0 };
-        self.spatial.lookahead.unwrap_or(default)
+        self.cfg.lookahead.unwrap_or(default)
     }
 
     /// Refuses a lane whose attention is not causal over its own history:

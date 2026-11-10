@@ -3,11 +3,10 @@
 //! and everything else stays as the cerebras engine has it: guest (eta)
 //! programs in the host interpreter, channels, the runtime's frames.
 //!
-//! The program is compiled outside the engine (kernels-cerebras
-//! `wafer-compile`: the plan from the model's trace, the build, `link.sh`)
-//! and carries its [`artifact`]: the host's map of the wafer, every copy onto
-//! it, every PE's route words. The engine opens it and nothing else; no model
-//! is named here.
+//! The program is compiled by kernels-cerebras (the plan from the model's
+//! trace, the build, the link) and carries its [`artifact`]: the host's map
+//! of the wafer, every copy onto it, every PE's route words. No model is
+//! named here.
 //!
 //! The program holds one sequence's KV cache. The engine keeps every lane's
 //! cache as the tokens that made it (by slot, and by page for `copy_kv`):
@@ -19,20 +18,22 @@
 //! lane whose mask says otherwise is refused, as is a program reading
 //! attention scores.
 //!
-//! Selected by `[cerebras.spatial]` in the engine config (`program`: the
-//! compiled program's output directory). The program runs on the
-//! `[cerebras]` platform (`cmaddr`, else the simulator); its weights are the
-//! prep's tiles (`PIE_CEREBRAS_WEIGHTS`).
+//! A load plans the model's trace, builds (or finds in the cache) the program and cuts (or
+//! finds) the checkpoint's tiles for it ([`prepare`]); the program runs on the configured
+//! system (`cmaddr`, else the simulator). [`Config`] is the whole configuration.
 //!
 //! - [`artifact`]: the program on a [`device::Device`], placed and driven;
 //! - [`wafer`]: that model on a thread of its own;
+//! - [`prepare`]: the plan, the program and the tiles of a load, cached;
 //! - `engine`: PIE's `Engine` over it ([`Spatial`]).
 
 pub mod artifact;
-mod config;
+pub mod config;
 pub mod device;
 mod engine;
+mod facts;
+pub mod prepare;
 pub mod wafer;
 
-pub use config::SpatialBoot;
+pub use config::Config;
 pub use engine::Spatial;

@@ -3,7 +3,7 @@ name = "engine-cerebras"
 version.workspace = true
 edition = "2024"
 authors = ["In Gim <in.gim@icloud.com>"]
-description = "The Cerebras engine: a pure-Rust host driver for the Cerebras SDK runtime (libsdkruntime, dlopened at runtime) that will answer every Dispatch* trait by assembling the device work kernels-cerebras entries emit into CSL programs, compiling them with cslc and running them on the WSE simulator or a CS system."
+description = "The Cerebras engine: PIE's engine over a wafer program. A load plans the model's trace, builds and links the program (kernels-cerebras) and cuts the checkpoint for it, both cached, then drives it through a pure-Rust binding of the Cerebras SDK runtime (libsdkruntime, dlopened at runtime) on a CS system or the fabric simulator; guest programs run in the host interpreter."
 license = "Apache-2.0"
 repository = "https://github.com/pie-project/pie"
 

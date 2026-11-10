@@ -8,8 +8,8 @@
 //! their state). The host keeps the tokens the wafer has taken, so a run
 //! that starts behind them (a fork, a rejected row) replays from 0.
 //!
-//! The weights are the prep's tiles: `PIE_CEREBRAS_WEIGHTS=<prep dir>:<prefix>`
-//! (`<prefix>w<u>.npy`, ...; built by the prep step from the checkpoint for the program's plan).
+//! The weights are the checkpoint's cut for the program's plan ([`Weights`]: `<dir>/<prefix><name>.npy`,
+//! `kernels_cerebras::spatial::tiles`).
 
 pub mod place;
 
@@ -28,7 +28,7 @@ type R<T> = std::result::Result<T, String>;
 /// The artifact's directory in a compiled program.
 pub const ARTIFACT: &str = "artifact";
 
-/// `PIE_CEREBRAS_WEIGHTS`: where the prep's tiles are, and their file prefix.
+/// Where a cut's tiles are, and their file prefix (`<dir>` or `<dir>:<prefix>`).
 #[derive(Clone, Debug)]
 pub struct Weights {
     pub prep: PathBuf,
@@ -36,17 +36,10 @@ pub struct Weights {
 }
 
 impl Weights {
-    pub fn from_env() -> R<Weights> {
-        match std::env::var("PIE_CEREBRAS_WEIGHTS") {
-            Ok(v) if !v.is_empty() => Weights::parse(&v),
-            _ => Err("PIE_CEREBRAS_WEIGHTS (<prep dir>:<prefix>) is unset".into()),
-        }
-    }
-
     pub fn parse(v: &str) -> R<Weights> {
         let (prep, prefix) = v.split_once(':').unwrap_or((v, ""));
         if prefix.contains(':') {
-            return Err(format!("PIE_CEREBRAS_WEIGHTS {v}: <prep dir>:<prefix>"));
+            return Err(format!("weights {v}: <dir>:<prefix>"));
         }
         Ok(Weights {
             prep: PathBuf::from(prep),
@@ -104,8 +97,8 @@ pub struct ArtifactModel {
     eps: f32,
     /// `lgt`'s prescale (the plan's: the band head's 2^15 logits; 1 without one).
     lgt_scale: f32,
-    /// Prompt rows forced through the token loop (`PIE_CEREBRAS_FORCE_PROMPT=1`).
-    force: bool,
+    /// Prompt rows forced through the token loop (the debug `force_prompt`).
+    pub force: bool,
 }
 
 /// Where a token's embedding row comes from: the head's tiles (`hemb`, the head's layout:
@@ -155,7 +148,7 @@ impl ArtifactModel {
             embed,
             eps: model.eps,
             lgt_scale: model.logit_scale,
-            force: std::env::var("PIE_CEREBRAS_FORCE_PROMPT").is_ok_and(|v| v == "1"),
+            force: false,
             hl,
             dev,
         })

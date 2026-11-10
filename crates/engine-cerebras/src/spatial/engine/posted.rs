@@ -19,7 +19,7 @@ pub(super) struct Posted {
 impl Spatial {
     /// Whether frames settle asynchronously: `async` when set, else not.
     pub(super) fn asynchronous(&self) -> bool {
-        self.spatial.asynchronous.unwrap_or(false)
+        self.cfg.asynchronous.unwrap_or(false)
     }
 
     /// Whether this engine runs asynchronously now: the runtime asked
