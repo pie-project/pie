@@ -16,11 +16,11 @@ Branch today: 432 commits ahead of main, 782 files, +86k / -13k. Main merged in 
 | A9 | dsv41 two-window mini cannot fire on sm_89/sm_120 (fused.lse_sink kernel gap) -> two-window CUDA unverified | L40S | queued |
 
 ## B. Decide before the PR (user)
-- B1: ROCm anchored (GEMM-epilogue) synth and other pre-existing parity gaps: block the PR, or follow-up?
+- B1: DECIDED: ROCm anchored (GEMM-epilogue) synth is IN the PR (AMD, A4 of their synth plan).
 - B2: Recordable rotor (budgeted loads decode ~10x slower): block, or follow-up?
-- B3: `new-memory/` notes folder: ship as docs (e.g. docs/memory/) trimmed to SPEC + CONTRACT + BACKENDS, or drop.
-- B4: Verification sweep before the PR: allow one broader run per backend (all goldens + catalog chunk tests + IT
-  e2e scenarios), as an exception to targeted-tests-only.
+- B3: DECIDED: all `new-memory/` docs are excluded from the PR (delete the folder from the PR branch at the end).
+- B4: DECIDED: one broad verification sweep per backend right before the PR (all goldens + catalog chunk tests + IT
+  e2e scenarios) is allowed.
 
 ## C. PR mechanics
 - C1: Delete remaining degenerate-only scaffolding wherever every engine of that path states real facts (runtime
