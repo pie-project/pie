@@ -398,12 +398,11 @@ impl Input {
 
     /// Whether a decode attention takes readout rows for its queries, each
     /// attending as the token it reads out. Metal seats each readout's
-    /// position and lane beside the tokens', and XLA gathers them from the
-    /// tokens' at the readout rows; the other backends attend only token
-    /// rows, so a forward keeps every row for them.
+    /// position and lane beside the tokens'; the other backends attend only
+    /// token rows, so a forward keeps every row for them.
     #[must_use]
     pub fn readout_attention(&self) -> bool {
-        matches!(self.rec.platform(), Platform::Metal | Platform::Xla)
+        self.rec.platform() == Platform::Metal
     }
 
     #[must_use]

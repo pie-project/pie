@@ -75,6 +75,14 @@ pub struct MoeGmmBlockMib(pub u32);
 #[decision(id = "kernel.moe.segment_tokens", constant(set(0, 128)), default = 0, tune = search)]
 pub struct MoeSegmentTokens(pub u32);
 
+/// The fewest tokens a fire holds for its routed MLP's sum to take the
+/// blocks (`kernel.moe.segment_tokens`): below them the one-hot dot or the
+/// pick is cheaper (v5e: Qwen3.6-35B-A3B's 16-expert cut at 1024 tokens
+/// 625 -> 659 us through the blocks, at 2048 1213 -> 1095).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Decision)]
+#[decision(id = "kernel.moe.segment_from", constant(set(1024, 2048)), default = 1024, tune = search)]
+pub struct MoeSegmentFrom(pub u32);
+
 /// Whether a routed MLP's gate-up grouped matmul lands its rows' GLU, each
 /// times its weight, in the kernel (1), or its packed halves for the GLU
 /// after (0).
@@ -212,6 +220,7 @@ pub fn register(registry: &mut Registry) {
         .add::<MoeGmmRun>()
         .add::<MoeGmmBlockMib>()
         .add::<MoeSegmentTokens>()
+        .add::<MoeSegmentFrom>()
         .add::<MoeGmmGlu>()
         .add::<MoeDenseAllMi>()
         .add::<MoeSliceMib>()
@@ -295,6 +304,7 @@ pub struct Tuning {
     pub moe_gmm_run: i64,
     pub moe_gmm_block_bytes: i64,
     pub moe_segment_tokens: i64,
+    pub moe_segment_from: i64,
     pub moe_gmm_glu: bool,
     pub moe_costs: MoeCosts,
     pub grouped: Grouped,
@@ -317,6 +327,7 @@ impl Tuning {
         moe_gmm_run: 1,
         moe_gmm_block_bytes: 12 << 20,
         moe_segment_tokens: 0,
+        moe_segment_from: 1024,
         moe_gmm_glu: false,
         moe_costs: MoeCosts {
             dense_all: 1 << 27,
@@ -363,6 +374,7 @@ impl Tuning {
             moe_gmm_run: n(profile.get::<MoeGmmRun>().0),
             moe_gmm_block_bytes: n(profile.get::<MoeGmmBlockMib>().0) << 20,
             moe_segment_tokens: n(profile.get::<MoeSegmentTokens>().0),
+            moe_segment_from: n(profile.get::<MoeSegmentFrom>().0),
             moe_gmm_glu: profile.get::<MoeGmmGlu>().0 == 1,
             moe_costs: MoeCosts {
                 dense_all: n(profile.get::<MoeDenseAllMi>().0) << 20,

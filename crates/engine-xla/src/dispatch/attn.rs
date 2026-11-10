@@ -273,18 +273,6 @@ impl Run<'_> {
                     *sm_scale,
                     self.tensor(*o),
                 )?;
-                if self.reads_out(*q) {
-                    let fire = self.bindings();
-                    return crate::lower::attn::attend_readouts(
-                        self.ctx(),
-                        call,
-                        pool,
-                        self.fresh(*cache),
-                        self.readouts(),
-                        fire.cache_rows,
-                        fire.tables.request_of_token,
-                    );
-                }
                 crate::lower::attn::attend(self.ctx(), call, pool)
             }
 
