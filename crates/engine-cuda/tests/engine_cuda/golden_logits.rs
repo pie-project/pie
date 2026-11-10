@@ -1448,3 +1448,43 @@ fn golden_submit_buffered() {
         );
     }
 }
+
+/// The split probe: each of `PIE_GOLDEN_MODELS`' last-row logits after one
+/// prefill of `n` tokens against a prefill of `n - 1` and a decode of the
+/// last. The two take different kernel arms over the same tokens, so what
+/// they differ by is the model's own amplification of a reduction's order:
+/// printed, never asserted.
+#[test]
+#[ignore = "a probe run by hand: see the module's doc"]
+fn golden_split() {
+    if !engine_cuda::device::present() {
+        eprintln!("skipping: no CUDA device on this machine");
+        return;
+    }
+    let cache = cache_dir();
+    for model in models() {
+        let fixture = fixture(&model, &cache);
+        for n in [37u32, 48, 250] {
+            let tokens: Vec<u32> = (0..n).map(|t| (t * 7 + 11) % 1000).collect();
+            let mut whole = load(&fixture, &cache);
+            whole.open(0).expect("slot 0 opens");
+            let one = fire(&mut whole, &fixture.trace, &tokens);
+            drop(whole);
+            let mut split = load(&fixture, &cache);
+            split.open(0).expect("slot 0 opens");
+            let _ = fire(&mut split, &fixture.trace, &tokens[..tokens.len() - 1]);
+            let two = fire(&mut split, &fixture.trace, &tokens[tokens.len() - 1..]);
+            let most = one
+                .iter()
+                .zip(&two)
+                .map(|(a, b)| (a - b).abs())
+                .fold(0f32, f32::max);
+            let span = one.iter().fold(0f32, |m, v| m.max(v.abs()));
+            println!(
+                "split {model} n={n}: most |diff| {most:.4} of logits up to {span:.2}, top {} vs {}",
+                argmax(&one),
+                argmax(&two)
+            );
+        }
+    }
+}
