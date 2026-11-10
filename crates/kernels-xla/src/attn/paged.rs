@@ -2719,7 +2719,7 @@ fn scatter_slots_one_map(
         && src.width == plane.width
         && f.elem(src.val) == Elem::Bf16
         && let Some(vmem_cap) = vmem_cap
-        && super::append::fits(i64::from(n), w, slots, ps, m, vmem_cap)
+        && super::append::fits(i64::from(n), w, slots, ps, f.dims(runs.page)[0], vmem_cap)
     {
         let (src, plane) = (*src, *plane);
         let kernel: crate::hlo::Branch<'_> = Box::new(move |f: &mut Func| {
