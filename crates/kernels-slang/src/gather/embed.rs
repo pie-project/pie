@@ -61,8 +61,9 @@ pub fn embed(
 /// A table the weight cache streams by its rows, as [`embed_tabled`] reads
 /// it: block `b` (`block_rows` rows) lies in pool unit `blocks[b]` (a slot,
 /// `unit_words` words a unit) or, `u32::MAX`, is not held, its rows this
-/// fire's `stage` rows (`staged[n]` row `n`'s, `u32::MAX` none). In a slot
-/// the table's row of id `i` starts `origin + (i % block_rows) *
+/// fire's `stage` rows (`staged[first + n]` row `n`'s, `u32::MAX` none: a
+/// stage laid by the fire's rows, read by a gather of rows from `first`).
+/// In a slot the table's row of id `i` starts `origin + (i % block_rows) *
 /// atom_words` words in. `hits` counts a read a row of its block.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct RowTable {
@@ -75,6 +76,7 @@ pub struct RowTable {
     pub unit_words: u32,
     pub origin: u32,
     pub atom_words: u32,
+    pub first: u32,
 }
 
 /// `y[n] = table[ids[n]]` through a row table: each row from the pool slot
@@ -119,6 +121,7 @@ pub fn embed_tabled(
                 table.unit_words.arg(),
                 table.origin.arg(),
                 table.atom_words.arg(),
+                table.first.arg(),
             ],
         ]
         .concat(),

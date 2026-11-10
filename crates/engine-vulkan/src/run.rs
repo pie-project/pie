@@ -113,6 +113,9 @@ pub struct FireBindings {
     /// The fire's token ids as the host wrote them, where no lane's token
     /// is fed on the device: a gather of them reads its ids from here.
     pub tokens_host: Option<std::sync::Arc<[i32]>>,
+    /// The fire arm whose row-table stage the host laid this fire's token
+    /// rows in ([`crate::store::rows::RowCaches::prestage`]), where it did.
+    pub row_ring: Option<usize>,
 
     pub group_of_lane: Option<Tensor>,
     pub packings: Vec<(poem_ir::Selection, crate::inputs::PackingHandles)>,
@@ -895,14 +898,13 @@ impl<'c> Run<'c> {
     ) -> Result<Option<kernels_slang::gather::embed::RowTable>, kernels_slang::Error> {
         let ids = self.tensor(ids_value);
         // The fire's own token ids, this window's rows of them: the host
-        // knows them, so a miss stages without reading them back.
-        let known = match &self.values[ids_value.0 as usize].def {
-            Def::Input(RuntimeInput::Tokens) if self.window().gathered.is_none() => {
-                self.fire.tokens_host.as_deref().and_then(|tokens| {
-                    let span = self.window().span;
-                    tokens.get(span.row_offset as usize..(span.row_offset + span.rows) as usize)
-                })
-            }
+        // staged their misses in the arm's stage before the fire, which the
+        // gather reads from the window's first row.
+        let ring = match &self.values[ids_value.0 as usize].def {
+            Def::Input(RuntimeInput::Tokens) if self.window().gathered.is_none() => self
+                .fire
+                .row_ring
+                .map(|arm| (arm, self.window().span.row_offset)),
             _ => None,
         };
         let (Some(rows), Some(pool), Some(host)) = (self.row_caches, self.cache_pool, self.host)
@@ -922,7 +924,7 @@ impl<'c> Run<'c> {
             plane,
             param,
             ids,
-            known,
+            ring,
             &self.row_ids,
             pool,
         )

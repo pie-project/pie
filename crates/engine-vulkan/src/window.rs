@@ -100,6 +100,15 @@ pub struct Windows {
     of_region: Vec<(u32, u32)>,
 }
 
+impl Windows {
+    /// Whether a window gathers its rows (a gather of token ids there reads
+    /// them compacted, not as the fire lays them).
+    #[must_use]
+    pub fn gathers(&self) -> bool {
+        self.windows.iter().any(|w| w.gathered.is_some())
+    }
+}
+
 fn seat(windows: &mut Vec<Window>, window: Window) -> u32 {
     let same = |held: &Window| {
         held.span == window.span

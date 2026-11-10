@@ -86,8 +86,9 @@ void main(uint3 gid : SV_DispatchThreadID) {
 // the pool unit of (its slot) or `NOT_HELD`. A held block's rows lie in
 // its slot, `atom_words` a row apart from word `origin` (a token id's rows
 // of every table sharing the slot side by side); a row of a block not
-// held was staged for this fire, `staged[n]` its row of `stage`. Each
-// row read counts one use of its block in `hits`.
+// held was staged for this fire, `staged[first + n]` its row of `stage`
+// (a stage laid by the fire's rows, this gather reading those from
+// `first`). Each row read counts one use of its block in `hits`.
 
 #define NOT_HELD 0xffffffffu
 
@@ -107,6 +108,7 @@ struct Params {
     uint unit_words;
     uint origin;
     uint atom_words;
+    uint first;
 };
 PIE_PARAMS(10, Params, params);
 PIE_POOL_READ(uint, params.seg_words)
@@ -131,7 +133,7 @@ void main(uint3 gid : SV_DispatchThreadID) {
         y[n * words + c] = pie_pool_get(
             unit * params.unit_words + params.origin + (id % params.block_rows) * params.atom_words + c);
     } else {
-        uint at = staged[n];
+        uint at = staged[params.first + n];
         y[n * words + c] = at != NOT_HELD ? stage[at * words + c] : 0u;
     }
 }

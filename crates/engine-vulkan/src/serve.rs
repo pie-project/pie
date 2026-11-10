@@ -964,7 +964,14 @@ impl Shell {
         let rs_at = rows.rs.clone();
         let mut pools = Pools::reserve(&device, rows, layout, paging, host_chunks)?;
         let row_caches =
-            crate::store::rows::RowCaches::new(&device, row_shapes, boot.budget.max_tokens, chunk)?;
+            crate::store::rows::RowCaches::new(
+                &device,
+                &boot.trace,
+                row_shapes,
+                boot.budget.max_tokens,
+                chunk,
+                arms,
+            )?;
         let expert_caches =
             crate::store::experts::ExpertCaches::new(&device, expert_shapes, chunk)?;
         // The null chunk's segment stands from the load on.
@@ -977,10 +984,11 @@ impl Shell {
 
         let weights_stream =
             weights.streams() || weights.gathered().is_some() || weights.pump().is_some();
-        // Recorded fires replay no staging: the weight cache records once
-        // every row block and expert of it is resident
-        // ([`Shell::weight_residency`]).
-        let rows_stream = !row_caches.is_empty() || !expert_caches.is_empty();
+        // A recorded fire replays no expert staging: the weight cache records
+        // once every expert is resident ([`Shell::weight_residency`]). A row
+        // table's misses are staged by the host before the fire, so it
+        // records whatever is resident.
+        let rows_stream = !expert_caches.is_empty();
 
         let mut shell = Shell {
             preseated: Vec::new(),
@@ -1322,7 +1330,9 @@ impl Shell {
         }
         // Recordings stand while the cache stays wholly resident: a slot
         // moved is an entry rewritten in a table they bind, not a binding.
-        let records = !self.own_stream && self.row_caches.whole() && self.expert_caches.whole();
+        // A row table's misses are staged by the host before a fire of its
+        // token ids, in the arm's stage: such a fire records too.
+        let records = !self.own_stream && self.expert_caches.whole();
         if records != self.recorder.records() {
             self.recorder = if self.own_stream {
                 crate::record::Recorder::refusing("the weights plane streams")
@@ -3175,8 +3185,24 @@ impl Shell {
             None
         };
         let patch_seats = bound.patches;
+        // The rows a gather of the fire's token ids reads of a block no slot
+        // holds are laid in the arm's stage now: the fire binds buffers that
+        // stand across fires, and records.
+        let row_ring = (feeds.is_empty()
+            && !self.row_caches.is_empty()
+            && self.row_caches.by_tokens()
+            && !windows.gathers())
+        .then_some(arm);
+        if row_ring.is_some() && !self.row_caches.whole() {
+            let host = self.weights.host().ok_or_else(|| Fault::Unbound {
+                what: "the host copy of the weight cache's tables".to_string(),
+            })?;
+            let planes = self.weights.cached_planes(|at| self.row_caches.streams(at));
+            self.row_caches.prestage(arm, host, &planes, &tokens)?;
+        }
         let bindings = FireBindings {
             rs_snaps,
+            row_ring,
             tokens_host: feeds
                 .is_empty()
                 .then(|| std::sync::Arc::from(tokens.as_slice())),
@@ -3648,7 +3674,8 @@ impl engine::frame::Shell for Shell {
         // A fire landing snapshots binds a table of its own: not recorded.
         let key = (self.recorder.records()
             && prepared.bindings.group_masks.is_empty()
-            && prepared.bindings.rs_snaps.is_none())
+            && prepared.bindings.rs_snaps.is_none()
+            && (prepared.bindings.row_ring.is_some() || self.row_caches.whole()))
         .then(|| self.record_key(&prepared));
 
         let replayable = key

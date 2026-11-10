@@ -93,6 +93,11 @@ fn served(model: &str, layers: Option<u32>, held: Held) -> Option<(Vec<Vec<f32>>
         "{model}: {held:?} resident: the script took {:?}",
         started.elapsed()
     );
+    // A miss is staged by the host in the fire's arm before the fire: the
+    // fires record whatever is resident.
+    let (recorded, replayed) = shell.recordings();
+    eprintln!("{model}: {held:?} resident: {recorded} fires recorded, {replayed} replayed");
+    assert!(recorded > 0, "{model}: {held:?} resident: the fires record");
     let uses = shell.weight_uses().expect("the uses read");
     Some((rows, uses))
 }

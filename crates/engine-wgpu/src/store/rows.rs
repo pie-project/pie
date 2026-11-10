@@ -653,6 +653,8 @@ impl RowCaches {
             unit_words: u32::try_from(cache.unit / 4).unwrap_or(u32::MAX),
             origin: u32::try_from(table.origin / 4).unwrap_or(u32::MAX),
             atom_words: u32::try_from(cache.shape.atom_bytes / 4).unwrap_or(u32::MAX),
+            // Staged a gather at a time, from its first row.
+            first: 0,
         }))
     }
 }
