@@ -1259,6 +1259,11 @@ impl FrameShell for Shell {
             .flat_map(|(table, _)| table.iter().map(|&page| u64::from(page)))
             .collect();
         self.pools.commit_frame(demand, &kv_ranges, &window_pages)?;
+        // The state slots as the kernels read them: each by the id of the
+        // slot it is seated on in the state pool.
+        let mut device_slot_ids = slot_ids.clone();
+        self.pools.state_ids(&mut device_slot_ids)?;
+        self.pools.state_ids(&mut snapshots.slots)?;
         self.pools
             .fence_swaps(self.device.stream(), &kv_ranges, &window_pages)?;
         super::btrace::mark("commit_frame");
@@ -1565,7 +1570,7 @@ impl FrameShell for Shell {
                 readout_live,
                 qo_absolute: &qo_absolute,
                 live: if bodied { windows.live() } else { &[] },
-                slot_ids: &slot_ids,
+                slot_ids: &device_slot_ids,
                 spaces: &device_geometries,
                 mask: staged.as_ref(),
                 adapter_routes: any_adapter.then_some(adapter_routes.as_slice()),

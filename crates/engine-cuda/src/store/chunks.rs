@@ -11,7 +11,7 @@ use engine::chunk::{ChunkTable, Evacuation};
 
 use crate::device::elastic::{Commit, PhysicalPool, Range};
 use crate::error::{Fault, Result};
-use crate::store::layout::{Layout, TokenShape};
+use crate::store::layout::{Kind, Layout, SlotShape};
 
 const UNSEATED: u32 = u32::MAX;
 
@@ -28,26 +28,37 @@ struct Seating {
 pub struct Chunks {
     range: Range,
     layout: Layout,
+    /// The chunks state may take: the pool's but the activation's.
     total: u32,
+    /// The chunks under the range's end a fire's activation takes.
+    act: u32,
     table: ChunkTable,
-    seated: [Seating; 2],
+    seated: [Seating; 3],
     /// The lowest chunk no shape has opened; chunk 0 is the null chunk.
     next: u32,
     null_zeroed: bool,
 }
 
 impl Chunks {
-    /// Reserves `total` chunks of addresses; nothing is backed yet.
-    pub fn reserve(pool: &PhysicalPool, layout: Layout, total: u32) -> Result<Chunks> {
+    /// Reserves `total` chunks of addresses for state and, above them, the
+    /// chunks `act_bytes` of activation take; nothing is backed yet.
+    pub fn reserve(
+        pool: &PhysicalPool,
+        layout: Layout,
+        total: u32,
+        act_bytes: u64,
+    ) -> Result<Chunks> {
         let total = total.max(1);
-        let bytes = u64::from(total) * layout.chunk_bytes;
+        let act = u32::try_from(act_bytes.div_ceil(layout.chunk_bytes.max(1))).unwrap_or(u32::MAX);
+        let bytes = (u64::from(total) + u64::from(act)) * layout.chunk_bytes;
         let segment = u64::from(layout.segment_chunks) * layout.chunk_bytes;
         Ok(Chunks {
             range: Range::reserve(pool, bytes, segment, "bytes of the state pool")?,
             layout,
             total,
-            table: ChunkTable::identity(total),
-            seated: [Seating::default(), Seating::default()],
+            act,
+            table: ChunkTable::identity(total.saturating_add(act)),
+            seated: [Seating::default(), Seating::default(), Seating::default()],
             next: 1,
             null_zeroed: false,
         })
@@ -73,9 +84,72 @@ impl Chunks {
         self.range.bytes()
     }
 
+    /// The bytes the committed segments back; the activation's are apart.
     #[must_use]
     pub fn committed_bytes(&self) -> u64 {
-        self.range.committed_bytes()
+        self.range.segment_bytes_committed()
+    }
+
+    /// The chunks a fire's activation takes, under the range's end.
+    #[must_use]
+    pub fn act_chunks(&self) -> u32 {
+        self.act
+    }
+
+    /// Where a fire's activation starts: the range's end less its chunks.
+    #[must_use]
+    pub fn activation_base(&self) -> u64 {
+        self.range.base() + u64::from(self.total) * self.layout.chunk_bytes
+    }
+
+    /// Backs the first `bytes` of the activation's span, and keeps them
+    /// backed; `beside` the pool's budget where it refuses them.
+    pub fn hold_activation(
+        &mut self,
+        pool: &mut PhysicalPool,
+        bytes: u64,
+        beside: bool,
+    ) -> Result<Commit> {
+        let from = u64::from(self.total) * self.layout.chunk_bytes;
+        let room = u64::from(self.act) * self.layout.chunk_bytes;
+        if bytes > room {
+            return Err(Fault::Ceiling {
+                what: "bytes of activation under the state pool's end",
+                need: bytes,
+                have: room,
+            });
+        }
+        let held = self.range.held().1.max(bytes);
+        self.range.hold(pool, from, held, beside)
+    }
+
+    /// Reserves the range anew for `total` chunks of state, before any
+    /// segment is backed: the activation's span is backed again where it
+    /// then lies.
+    pub fn reshape(&mut self, pool: &mut PhysicalPool, total: u32) -> Result<()> {
+        if !self.fresh() {
+            return Err(Fault::program(
+                "store::chunks",
+                "the state pool reshaped under committed chunks",
+            ));
+        }
+        let held = self.range.held().1;
+        self.range.release_all(pool);
+        let act_bytes = u64::from(self.act) * self.layout.chunk_bytes;
+        let mut fresh = Chunks::reserve(pool, self.layout.clone(), total, act_bytes)?;
+        if held > 0 {
+            match fresh.hold_activation(pool, held, true)? {
+                Commit::Committed => {}
+                _ => {
+                    return Err(Fault::program(
+                        "store::chunks",
+                        "the activation's span was refused the room it held",
+                    ));
+                }
+            }
+        }
+        *self = fresh;
+        Ok(())
     }
 
     #[must_use]
@@ -88,15 +162,16 @@ impl Chunks {
         self.range.committed_segments()
     }
 
+    /// The segments the state's chunks lie in.
     #[must_use]
     pub fn segments(&self) -> u32 {
-        self.range.segments()
+        self.segments_for(u64::from(self.total))
     }
 
-    /// Whether anything of the range is backed.
+    /// Whether no segment is backed yet.
     #[must_use]
     pub fn fresh(&self) -> bool {
-        self.range.committed_bytes() == 0
+        self.range.committed_segments() == 0
     }
 
     /// The segments that hold the first `chunks` chunks.
@@ -132,14 +207,11 @@ impl Chunks {
         self.range.release_segments(pool, segments)
     }
 
-    fn shape(&self, ring: bool) -> Result<&TokenShape> {
-        self.layout.shape(ring).ok_or_else(|| {
+    fn shape(&self, kind: Kind) -> Result<&SlotShape> {
+        self.layout.shape(kind).ok_or_else(|| {
             Fault::program(
                 "store::chunks",
-                format!(
-                    "a {} page named in a load that lays none",
-                    if ring { "windowed" } else { "kv" }
-                ),
+                format!("a {} named in a load that lays none", kind.name()),
             )
         })
     }
@@ -147,12 +219,12 @@ impl Chunks {
     /// Seats page `id` of today's ids on a slot, opening the lowest free
     /// chunk for its shape where the one being filled is full. The windowed
     /// id 0 is the null slot. Returns the logical chunk the slot lies in.
-    pub fn seat(&mut self, ring: bool, id: u32) -> Result<u32> {
-        if ring && id == 0 {
+    pub fn seat(&mut self, kind: Kind, id: u32) -> Result<u32> {
+        if kind == Kind::Ring && id == 0 {
             return Ok(0);
         }
-        let per_chunk = self.shape(ring)?.per_chunk;
-        let seating = &mut self.seated[usize::from(ring)];
+        let per_chunk = self.shape(kind)?.per_chunk;
+        let seating = &mut self.seated[kind as usize];
         if let Some(&slot) = seating.refs.get(id as usize)
             && slot != UNSEATED
         {
@@ -187,11 +259,11 @@ impl Chunks {
     }
 
     /// The slot ref page `id` is seated on.
-    pub fn slot_ref(&self, ring: bool, id: u32) -> Result<u32> {
-        if ring && id == 0 {
+    pub fn slot_ref(&self, kind: Kind, id: u32) -> Result<u32> {
+        if kind == Kind::Ring && id == 0 {
             return Ok(0);
         }
-        self.seated[usize::from(ring)]
+        self.seated[kind as usize]
             .refs
             .get(id as usize)
             .copied()
@@ -199,18 +271,15 @@ impl Chunks {
             .ok_or_else(|| {
                 Fault::program(
                     "store::chunks",
-                    format!(
-                        "{} page {id} is read before it is seated",
-                        if ring { "windowed" } else { "kv" }
-                    ),
+                    format!("{} {id} is read before it is seated", kind.name()),
                 )
             })
     }
 
     /// The physical chunk and the index in it of page `id`'s slot.
-    fn place(&self, ring: bool, id: u32) -> Result<(u32, u32)> {
-        let shape = self.shape(ring)?;
-        let slot = self.slot_ref(ring, id)?;
+    fn place(&self, kind: Kind, id: u32) -> Result<(u32, u32)> {
+        let shape = self.shape(kind)?;
+        let slot = self.slot_ref(kind, id)?;
         let logical = slot / shape.per_chunk;
         let physical = self.table.physical(logical).ok_or(Fault::Ceiling {
             what: "chunks of the state pool",
@@ -221,23 +290,23 @@ impl Chunks {
     }
 
     /// Bytes from the pool's base to page `id`'s slot.
-    pub fn slot_at(&self, ring: bool, id: u32) -> Result<u64> {
-        let (chunk, index) = self.place(ring, id)?;
+    pub fn slot_at(&self, kind: Kind, id: u32) -> Result<u64> {
+        let (chunk, index) = self.place(kind, id)?;
         Ok(self
-            .shape(ring)?
+            .shape(kind)?
             .slot_at(self.layout.chunk_bytes, chunk, index))
     }
 
     /// The address of `len` bytes at `offset` of page `id`'s slot.
-    pub fn span(&self, ring: bool, id: u32, offset: u64, len: u64) -> Result<u64> {
-        self.range.span(self.slot_at(ring, id)? + offset, len)
+    pub fn span(&self, kind: Kind, id: u32, offset: u64, len: u64) -> Result<u64> {
+        self.range.span(self.slot_at(kind, id)? + offset, len)
     }
 
     /// The id a paged kernel reads page `id`'s slot by.
-    pub fn page_id(&self, ring: bool, id: u32) -> Result<i32> {
-        let (chunk, index) = self.place(ring, id)?;
+    pub fn page_id(&self, kind: Kind, id: u32) -> Result<i32> {
+        let (chunk, index) = self.place(kind, id)?;
         let q = self
-            .shape(ring)?
+            .shape(kind)?
             .page_id(self.layout.chunk_bytes, chunk, index);
         i32::try_from(q).map_err(|_| Fault::Ceiling {
             what: "page ids of the state pool",
@@ -248,10 +317,10 @@ impl Chunks {
 
     /// Rewrites today's page ids in `ids` as the ids the kernels read; an id
     /// under zero (a row that writes nothing) stays.
-    pub fn page_ids(&self, ring: bool, ids: &mut [i32]) -> Result<()> {
+    pub fn page_ids(&self, kind: Kind, ids: &mut [i32]) -> Result<()> {
         for id in ids {
             if *id >= 0 {
-                *id = self.page_id(ring, *id as u32)?;
+                *id = self.page_id(kind, *id as u32)?;
             }
         }
         Ok(())

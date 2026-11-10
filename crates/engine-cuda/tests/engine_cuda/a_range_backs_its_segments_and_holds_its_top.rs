@@ -39,7 +39,9 @@ fn a_range_backs_its_segments_and_holds_its_top() {
 
     let before = free_bytes();
     assert_eq!(
-        range.hold_top(&mut pool, top).expect("the top"),
+        range
+            .hold(&mut pool, bytes - top, top, false)
+            .expect("the top"),
         Commit::Committed
     );
     assert_eq!(
@@ -136,4 +138,7 @@ fn a_range_backs_its_segments_and_holds_its_top() {
         .expect("all but the top");
     assert!(range.span(bytes - top, top).is_ok(), "the top is held");
     assert!(range.span(0, 1).is_err());
+    assert_eq!(range.segment_bytes_committed(), 0);
+    range.release_all(&mut pool);
+    assert!(range.span(bytes - top, top).is_err(), "and then it is not");
 }
