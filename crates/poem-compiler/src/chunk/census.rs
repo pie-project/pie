@@ -96,8 +96,9 @@ pub struct Census {
     pub fixed: Vec<FixedRow>,
 }
 
-/// Reads every row `trace` remembers.
-pub fn census(trace: &Trace) -> Result<Census, ChunkError> {
+/// Reads every row `trace` remembers; with `state_f32`, a state row takes
+/// four bytes an element but an integer one (the backend widens it).
+pub fn census(trace: &Trace, state_f32: bool) -> Result<Census, ChunkError> {
     let readers = readers(trace);
     let mut out = Census::default();
     for (at, row) in trace.caches.iter().enumerate() {
@@ -128,7 +129,12 @@ pub fn census(trace: &Trace) -> Result<Census, ChunkError> {
                 dtype,
                 shard,
             } => {
-                let bytes = slab.iter().product::<u64>() * element(name, *dtype)?;
+                let element = if state_f32 && *dtype != poem_ir::Dtype::I32 {
+                    4
+                } else {
+                    element(name, *dtype)?
+                };
+                let bytes = slab.iter().product::<u64>() * element;
                 let atom = atom(slab, bytes, read, shard);
                 out.fixed.push(FixedRow {
                     id,

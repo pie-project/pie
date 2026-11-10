@@ -565,7 +565,7 @@ pub fn plan(
     let device = profile.chunk;
     let align = device.align();
     let (lo, hi) = device.range();
-    let census = census::census(trace)?;
+    let census = census::census(trace, device.state_f32)?;
     let cow = cow_sets(budgets);
     let weight_groups = weights::census(trace, budgets.tokens.max_tokens);
     // Where experts are not cut, no chunk is smaller than one.

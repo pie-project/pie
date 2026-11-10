@@ -179,8 +179,9 @@ fn overlaps(recipe: &ChunkRecipe, rows: &[FixedRun], bytes: u64, slots: u32) -> 
 
 #[test]
 fn a_row_past_the_slot_is_cut_on_heads_into_equal_pieces_at_one_offset() {
-    // 12 layers of a 6 MiB f32 state [96 heads, 64, 256] and a 64 KiB conv,
-    // on a device whose chunks hold at most 4 MiB.
+    // 12 layers of a 6 MiB f32 state [96 heads, 64, 256] and a bf16 conv
+    // Metal keeps in f32 (128 KiB), on a device whose chunks hold at most
+    // 4 MiB.
     let mut caches = Vec::new();
     for l in 0..12 {
         caches.push(state(&format!("ssm.{l}"), vec![96, 64, 256], Dtype::F32));
@@ -201,7 +202,7 @@ fn a_row_past_the_slot_is_cut_on_heads_into_equal_pieces_at_one_offset() {
     else {
         panic!("no fixed shape")
     };
-    assert_eq!(*record, 12 * ((6 << 20) + (64 << 10)));
+    assert_eq!(*record, 12 * ((6 << 20) + (128 << 10)));
     assert!(*bytes <= recipe.chunk_bytes && *bytes >= MIN_PIECE);
     assert!(u64::from(*pieces_per_ws) * bytes >= *record);
     assert_eq!(rows.len(), 24);
