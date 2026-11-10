@@ -30,6 +30,7 @@ mod an_adopted_family_reads_a_checkpoint_it_lists_no_model_of;
 mod an_elementwise_chain_lowers_to_one_region;
 mod an_expert_parallel_rank_dispatches_its_tokens_to_the_experts;
 mod attend_is_the_dispatch_a_model_wrote_by_hand;
+mod every_adopting_family_reproduces_its_listed_models;
 mod every_catalog_row_bakes;
 mod every_deployment_resolves_its_request_classes;
 mod every_deployment_ships_whole;
