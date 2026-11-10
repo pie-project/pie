@@ -112,6 +112,10 @@ fn fixture(model: &str) -> Fixture {
 }
 
 fn load(fixture: &Fixture) -> Shell {
+    load_with(fixture, CONTEXT)
+}
+
+fn load_with(fixture: &Fixture, context: u32) -> Shell {
     Shell::load(Boot {
         trace: fixture.trace.clone(),
         contract: &fixture.contract,
@@ -121,7 +125,7 @@ fn load(fixture: &Fixture) -> Shell {
         voxels: None,
         profile: None,
         page_size: PAGE,
-        context: CONTEXT,
+        context,
         slots: SEATS,
         kv_budget: None,
         memory_share: engine::load::DEFAULT_DEVICE_MEMORY_SHARE,
@@ -489,4 +493,95 @@ fn a_reserved_hybrid_pool_states_shared_chunks() {
     // SAFETY: nothing ran on this pool.
     unsafe { pools.release_segments(1) }.expect("one goes back");
     assert_eq!(pools.chunk_facts().segments.committed, 1);
+}
+
+/// A window list the runtime trims (CONTRACT-BC 19, 21): pages wholly behind
+/// the window read the null chunk (ref 0). One lane of a 1-layer windowed
+/// miniature prefills past its 512-row window and decodes on; its logits are
+/// the same bits whether the window list holds every page (seat-addressed)
+/// or only the window's, scattered over chunks by slot ref and trimmed as
+/// the runtime trims, each step.
+#[test]
+fn a_trimmed_window_list_reads_as_the_whole_one() {
+    use engine_metal::store::layout::WINDOW;
+
+    if !engine_metal::device::present() {
+        eprintln!("skipping: no Metal device");
+        return;
+    }
+    let fixture = fixture("gemma4-e4b-mini-l1");
+    let context = 1024;
+    let prompt: Vec<u32> = (0..700u32).map(|at| (at * 37 + 11) % 256).collect();
+    const STEPS: usize = 24;
+    let run = |trimmed: bool| -> Vec<Vec<f32>> {
+        let mut shell = load_with(&fixture, context);
+        let facts = shell.pool_chunk_facts();
+        let layout = shell.pool_layout();
+        let window = facts.shape(WINDOW).expect("a window list");
+        let engine::chunk::SlotKind::List {
+            tokens,
+            window: Some(rows),
+            ..
+        } = window.kind
+        else {
+            panic!("the window list states its window: {:?}", window.kind);
+        };
+        let per = window.slots_per_chunk;
+        let first =
+            (1 + layout.seat_chunks()).div_ceil(facts.segment_chunks) * facts.segment_chunks;
+        let pages = context.div_ceil(tokens);
+        let commit = (first + pages.div_ceil(per) + 1).div_ceil(facts.segment_chunks);
+        shell.commit_segments(commit).expect("the segments commit");
+        // Page k of the lane in chunk first + k / per, slots strided in it.
+        let slot_ref = |k: u32| (first + k / per) * per + (k * 7 + 3) % per;
+        let mut rows_out = Vec::new();
+        let mut held = 0u32;
+        let mut fed: Vec<u32> = prompt.clone();
+        for step in 0..=STEPS {
+            let chunks: Vec<Vec<u32>> = if step == 0 {
+                fed.chunks(256).map(<[u32]>::to_vec).collect()
+            } else {
+                vec![fed.clone()]
+            };
+            let mut last = Vec::new();
+            for tokens_in in chunks {
+                let n = tokens_in.len() as u32;
+                let after = held + n;
+                // Trimmed as the runtime trims: a page whose last row lies
+                // below `committed_end - window` reads the null chunk.
+                let table: Vec<u32> = (0..after.div_ceil(tokens))
+                    .map(|k| {
+                        let last_row = (k + 1) * tokens - 1;
+                        if trimmed && last_row + rows < held {
+                            0
+                        } else {
+                            slot_ref(k)
+                        }
+                    })
+                    .collect();
+                let seated = Seated {
+                    held: Some(held),
+                    refs: trimmed,
+                    window: if trimmed { &table } else { &[] },
+                    ..Seated::of(Lane {
+                        slot: 0,
+                        word: word(&fixture.trace, n),
+                        tokens: &tokens_in,
+                    })
+                };
+                last = shell.fire_seated(&[seated]).expect("the fire lands");
+                held = after;
+            }
+            fed = vec![argmax(&last[0])];
+            rows_out.extend(last);
+        }
+        rows_out
+    };
+    let whole = run(false);
+    let trimmed = run(true);
+    same(
+        "gemma4-e4b-mini-l1: trimmed against whole",
+        &trimmed,
+        &whole,
+    );
 }
