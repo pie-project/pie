@@ -59,6 +59,8 @@ pub struct Buffers {
     /// growth waits for none of them.
     scratch: Arena,
     planes: Planes,
+    /// Each buffered layer's rs rows, among the record's.
+    rows: Vec<u32>,
     ext_row_bytes: u64,
 }
 
@@ -78,8 +80,17 @@ impl Buffers {
             return Ok(None);
         };
         let block = u64::from(ROWS) * per_token * ELEMENT;
+        // The record's rs rows of a layer's block, in the layers' order; a
+        // row of another size buffers what this engine does not (an n-gram
+        // window's ids).
         let held = pools.rs_rows();
-        if held.len() != layers as usize || held.iter().any(|&bytes| bytes != block) {
+        let rows: Vec<u32> = (0u32..)
+            .zip(&held)
+            .filter(|&(_, &bytes)| bytes == block)
+            .map(|(at, _)| at)
+            .take(layers as usize)
+            .collect();
+        if rows.len() != layers as usize {
             return Err(Fault::program(
                 "store::rs",
                 format!(
@@ -98,6 +109,7 @@ impl Buffers {
         Ok(Some(Buffers {
             scratch: pools.reserve_arena(reach, SCRATCH)?,
             planes,
+            rows,
             ext_row_bytes,
         }))
     }
@@ -414,9 +426,18 @@ impl Buffers {
                 have: u64::from(ROWS),
             });
         }
+        let layer = self
+            .rows
+            .get(plane.layer as usize)
+            .copied()
+            .ok_or(Fault::Ceiling {
+                what: "recurrent layers the rs buffer holds rows of",
+                need: u64::from(plane.layer) + 1,
+                have: self.rows.len() as u64,
+            })?;
         pools.rs_span(
             key,
-            plane.layer,
+            layer,
             (plane.at + u64::from(row) * plane.width) * ELEMENT,
             u64::from(rows) * plane.width * ELEMENT,
         )
