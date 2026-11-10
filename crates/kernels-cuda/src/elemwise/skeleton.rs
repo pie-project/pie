@@ -45,8 +45,10 @@ pub struct Plane {
 /// skeletons' alike: a result's columns from `from` up to `to` (every one
 /// where `to` is 0) landing from its plane row's first element, `head` of
 /// every `stride` where `head` is set; or, paged, at the cache row
-/// `page[r] · page_size + slot[r]` (none where the slot lies past the page
-/// or `valid[r]` is 0), as e4m3 elements `e4m3(x / scale)` where `e4m3`.
+/// `slot[r]` of page `page[r]` (none where the slot lies past the page or
+/// `valid[r]` is 0), a page's rows `page_stride` elements after the page
+/// before's (0: right after its `page_size` rows), as e4m3 elements
+/// `e4m3(x / scale)` where `e4m3`.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Store {
     page: u64,
@@ -60,6 +62,8 @@ pub struct Store {
     /// A head-major window's head and stride (0: whole).
     head: u32,
     stride: u32,
+    /// The plane's elements between two pages' rows (0: packed).
+    page_stride: u32,
 }
 
 impl Store {
@@ -74,13 +78,14 @@ impl Store {
         scale: 1.0,
         head: 0,
         stride: 0,
+        page_stride: 0,
     };
 
     /// Window `w`'s columns (a head-major one's heads, one after another),
     /// at the row `cache`'s page and slot name where it lands in one.
     pub(crate) fn of(w: kernels_ir::Window, cache: Option<&Cache>) -> Store {
-        let c = cache.map_or((0, 0, 0, 0, None), |c| {
-            (c.page, c.slot, c.valid, c.page_size, c.e4m3)
+        let c = cache.map_or((0, 0, 0, 0, None, 0), |c| {
+            (c.page, c.slot, c.valid, c.page_size, c.e4m3, c.page_stride)
         });
         Store {
             page: c.0,
@@ -93,6 +98,7 @@ impl Store {
             scale: c.4.unwrap_or(1.0),
             head: w.head,
             stride: w.stride,
+            page_stride: c.5,
         }
     }
 
@@ -105,7 +111,7 @@ impl Store {
             u64::from(self.from) | u64::from(self.to) << 32,
             u64::from(self.page_size) | u64::from(u32::from(self.e4m3)) << 32,
             u64::from(self.scale.to_bits()) | u64::from(self.head) << 32,
-            u64::from(self.stride),
+            u64::from(self.stride) | u64::from(self.page_stride) << 32,
         ]
     }
 }
@@ -123,6 +129,9 @@ pub struct Cache {
     pub valid: u64,
     pub page_size: u32,
     pub e4m3: Option<f32>,
+    /// The plane's elements from one page's rows to the next page's; 0
+    /// where the pages lie one right after another.
+    pub page_stride: u32,
 }
 
 impl Plane {

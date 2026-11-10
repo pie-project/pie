@@ -883,6 +883,7 @@ impl Shell {
             paging,
             boot.kv_budget,
             &facts,
+            &budgets,
         )?;
         if boot.knobs.diagnostics.arm_trace {
             eprintln!(

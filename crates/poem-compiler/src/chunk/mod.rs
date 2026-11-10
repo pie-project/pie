@@ -711,17 +711,32 @@ pub fn plan(
     let mut token_shapes = Vec::new();
     let mut fixed_rows: Vec<FixedRow> = census.fixed;
 
+    // A window that holds a whole working set is none.
+    let mut token_rows = census.tokens;
+    for row in &mut token_rows {
+        if row
+            .window
+            .is_some_and(|w| device.full_from.is_some_and(|full| w >= full))
+        {
+            row.window = None;
+        }
+    }
+    if device.one_ring
+        && let Some(widest) = token_rows.iter().filter_map(|r| r.window).max()
+    {
+        for row in token_rows.iter_mut().filter(|r| r.window.is_some()) {
+            row.window = Some(widest);
+        }
+    }
+
     // One list shape: every full-retention row, of every space.
-    let full: Vec<&TokenRow> = census
-        .tokens
-        .iter()
-        .filter(|r| r.window.is_none())
-        .collect();
+    let full: Vec<&TokenRow> = token_rows.iter().filter(|r| r.window.is_none()).collect();
     if !full.is_empty() {
         let base = full
             .iter()
             .fold(TOKEN_GRAIN, |base, r| census::lcm(base, r.ratio));
-        let (tokens, bytes, rows, short) = token_layout(&full, base, device.most(), align);
+        let (tokens, bytes, rows, short) =
+            token_layout(&full, base, device.most(), align, device.token_slot);
         short_runs.extend(short);
         token_shapes.push(SlotLayout::List {
             tokens,
@@ -732,7 +747,7 @@ pub fn plan(
 
     // A ring shape a window, unless its whole cap is smaller than a piece.
     let mut windows: BTreeMap<u32, Vec<&TokenRow>> = BTreeMap::new();
-    for row in census.tokens.iter().filter(|r| r.window.is_some()) {
+    for row in token_rows.iter().filter(|r| r.window.is_some()) {
         windows
             .entry(row.window.unwrap_or(0))
             .or_default()
@@ -746,7 +761,7 @@ pub fn plan(
             fire_rows,
         };
         let per_token: u64 = rows.iter().map(|r| r.per_token()).sum();
-        if u64::from(cap.tokens()) * per_token <= MIN_PIECE {
+        if device.fold_rings && u64::from(cap.tokens()) * per_token <= MIN_PIECE {
             for row in rows {
                 let extent = u64::from(cap.tokens());
                 folded.push((row.id, cap.tokens()));
@@ -770,7 +785,8 @@ pub fn plan(
         let base = rows
             .iter()
             .fold(TOKEN_GRAIN, |base, r| census::lcm(base, r.ratio));
-        let (tokens, bytes, runs, short) = token_layout(&rows, base, device.most(), align);
+        let (tokens, bytes, runs, short) =
+            token_layout(&rows, base, device.most(), align, device.token_slot);
         short_runs.extend(short);
         token_shapes.push(SlotLayout::Ring {
             tokens,
@@ -780,7 +796,7 @@ pub fn plan(
             rows: runs,
         });
     }
-    for row in census.tokens.iter().chain(&census.rs_rows) {
+    for row in token_rows.iter().chain(&census.rs_rows) {
         shards.insert(row.id, row.shard.clone());
     }
 
@@ -972,12 +988,13 @@ pub fn plan(
 /// A token slot of `rows`, layer-major: the fewest tokens, a multiple of
 /// `base`, at which every layer's rows run [`MIN_RUN`] bytes, unless the slot
 /// would outgrow `most`; then the most tokens that fit, and the layers left
-/// short.
+/// short. `stated` tokens are taken as they are.
 fn token_layout(
     rows: &[&TokenRow],
     base: u32,
     most: u64,
     align: u64,
+    stated: Option<u32>,
 ) -> (u32, u64, Vec<TokenRun>, Vec<RowId>) {
     let mut rows: Vec<&TokenRow> = rows.to_vec();
     rows.sort_by_key(|r| (r.layer.unwrap_or(u32::MAX), r.id));
@@ -1003,8 +1020,8 @@ fn token_layout(
         .div_ceil(base)
         .max(1)
         * base;
-    let mut tokens = need;
-    if slot(tokens) > most {
+    let mut tokens = stated.filter(|&tokens| tokens > 0).unwrap_or(need);
+    if stated.is_none() && slot(tokens) > most {
         tokens = base;
         while tokens + base < need && slot(tokens + base) <= most {
             tokens += base;

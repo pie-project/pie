@@ -1,5 +1,7 @@
 #![allow(unsafe_code)]
+pub mod chunks;
 pub mod kv;
+pub mod layout;
 pub mod rs;
 
 use engine::transfer::KvRun;
@@ -489,6 +491,9 @@ enum Shape {
         values_plane: usize,
         head_stride: u64,
         live: Option<[u32; 2]>,
+        /// Where the key plane and the value plane start in the row's slot
+        /// of the state pool.
+        offsets: [u64; 2],
     },
     State {
         stride: u64,
@@ -497,10 +502,9 @@ enum Shape {
 }
 
 impl Shape {
-    /// The bytes from one page's rows to the next in a kv row's plane
-    /// `plane` (0 keys, else values), the stride its kernels step pages by:
-    /// each plane its own arena, page after page.
-    fn page_stride(&self, plane: usize, page_size: u32) -> u64 {
+    /// The bytes one page holds in a kv row's plane `plane` (0 keys, else
+    /// values).
+    fn page_bytes(&self, plane: usize, page_size: u32) -> u64 {
         match *self {
             Shape::Kv {
                 dtype,
@@ -563,6 +567,9 @@ impl Seats {
 #[derive(Debug)]
 pub struct Pools {
     pool: PhysicalPool,
+    /// The state pool: the kv rows' pages, a slot each.
+    chunks: chunks::Chunks,
+    /// The recurrent rows' slabs, an arena each; a kv row has none.
     rows: Vec<Vec<Arena>>,
     shapes: Vec<Shape>,
     pooled: Vec<PoolRow>,
@@ -578,12 +585,6 @@ pub struct Pools {
     airborne: Option<Airborne>,
     committed_kv_pages: u32,
     committed_state_slots: u32,
-    backed_pages: Vec<u64>,
-    /// The windowed pages backed so far, a bit each: the windowed rows and
-    /// the compressor slabs their pages key are backed a page at a time, as
-    /// the fires' windowed tables (and the windowed moves) first touch it.
-    backed_windowed: Vec<u64>,
-    windowed_backed: bool,
     buffered: (u64, u64),
     host: Option<HostKv>,
     disk: Option<DiskKv>,
@@ -651,10 +652,6 @@ impl Shelf {
             per_chunk,
             chunks: (0..slots.div_ceil(per_chunk)).map(|_| None).collect(),
         }
-    }
-
-    fn same_chunk(&self, a: u32, b: u32) -> bool {
-        a / self.per_chunk == b / self.per_chunk
     }
 
     /// Pins the chunks that hold `slots`.
@@ -754,8 +751,10 @@ impl Pools {
         paging: Paging,
         budget: Option<u64>,
         facts: &Facts,
+        budgets: &poem_compiler::Budgets,
     ) -> Result<Pools> {
         let pool = PhysicalPool::open(device, utilization)?;
+        let layout = lay(trace, &paging, budgets)?;
         let mut rows: Vec<Vec<Arena>> = Vec::with_capacity(trace.caches.len());
         let mut shapes = Vec::with_capacity(trace.caches.len());
 
@@ -773,12 +772,6 @@ impl Pools {
                 } => {
                     let element = elem_bytes(name, *dtype)?;
                     let windowed = window.is_some() && paging.window.is_some();
-                    let pages = if windowed {
-                        paging.window_pages()
-                    } else {
-                        paging.pages()
-                    };
-                    let cells = pages * u64::from(paging.page_size);
                     let (keys_width, values_width, values_plane) = match planes.as_slice() {
                         [plane] => (*plane, *plane, 0),
                         [keys, values] => (*keys, *values, 1),
@@ -829,16 +822,19 @@ impl Pools {
                             });
                         }
                     }
-                    let mut planes_of_row = Vec::with_capacity(planes.len());
-                    for width in planes {
-                        planes_of_row.push(Arena::reserve(
-                            &pool,
-                            cells * width * element,
-                            "bytes of a kv plane",
-                        )?);
-                    }
-                    rows.push(planes_of_row);
+                    let at = layout
+                        .shape(windowed)
+                        .and_then(|shape| shape.offset_of(index as u32))
+                        .ok_or_else(|| {
+                            Fault::program(
+                                "store::reserve",
+                                format!("cache `{name}` has no run in the chunk recipe's slot"),
+                            )
+                        })?;
+                    let keys = u64::from(paging.page_size) * keys_width * element;
+                    rows.push(Vec::new());
                     shapes.push(Shape::Kv {
+                        offsets: [at, at + if values_plane == 0 { 0 } else { keys }],
                         space: *space,
                         windowed,
                         dtype: *dtype,
@@ -892,8 +888,11 @@ impl Pools {
                 .collect::<Result<Vec<Arena>>>()?;
             pooled.push(PoolRow { planes, ..row });
         }
+        let total = chunks_at(&layout, &paging, paging.pages());
+        let chunks = chunks::Chunks::reserve(&pool, layout, total)?;
         Ok(Pools {
             pool,
+            chunks,
             rows,
             shapes,
             pooled,
@@ -905,9 +904,6 @@ impl Pools {
             airborne: None,
             committed_kv_pages: 0,
             committed_state_slots: 0,
-            backed_pages: Vec::new(),
-            backed_windowed: Vec::new(),
-            windowed_backed: false,
             buffered: (0, 1),
             host: None,
             disk: None,
@@ -978,7 +974,7 @@ impl Pools {
 
     #[must_use]
     pub fn bytes(&self) -> u64 {
-        self.arenas().map(elastic::Arena::max_bytes).sum()
+        self.arenas().map(elastic::Arena::max_bytes).sum::<u64>() + self.chunks.bytes()
     }
 
     #[must_use]
@@ -1044,7 +1040,12 @@ impl Pools {
             .saturating_mul(slot_bytes)
             .div_ceil(unit)
             .saturating_mul(unit);
-        rows.saturating_add(pooled).saturating_add(buffered)
+        let layout = self.chunks.layout();
+        let chunks = u64::from(chunks_at(layout, &self.paging, u64::from(pages)))
+            .saturating_mul(layout.chunk_bytes);
+        rows.saturating_add(pooled)
+            .saturating_add(buffered)
+            .saturating_add(chunks)
     }
 
     /// Re-reserves the kv planes and compressor slabs for a pool of `pages`,
@@ -1092,8 +1093,15 @@ impl Pools {
         self.ceiling = pages;
         self.paging.pages = pages;
         self.paging.slots = slots;
-        self.windowed_backed = false;
-        self.backed_windowed.clear();
+        if !self.chunks.fresh() {
+            return Err(Fault::program(
+                "store::reshape",
+                "the state pool reshaped under committed chunks",
+            ));
+        }
+        let layout = self.chunks.layout().clone();
+        let total = chunks_at(&layout, &self.paging, pages);
+        self.chunks = chunks::Chunks::reserve(&self.pool, layout, total)?;
         Ok(())
     }
 
@@ -1151,7 +1159,8 @@ impl Pools {
             .iter()
             .flatten()
             .chain(self.pooled.iter().flat_map(|row| row.planes.iter()))
-            .all(|arena| arena.committed_bytes() == 0);
+            .all(|arena| arena.committed_bytes() == 0)
+            && self.chunks.fresh();
         let one_slot = u64::from(self.paging.pages_per_slot).min(self.ceiling);
         let mut need = if fresh {
             self.declared_at(one_slot)
@@ -1317,12 +1326,18 @@ impl Pools {
 
     #[must_use]
     pub fn committed_bytes(&self) -> u64 {
-        self.arenas().map(elastic::Arena::committed_bytes).sum()
+        self.arenas()
+            .map(elastic::Arena::committed_bytes)
+            .sum::<u64>()
+            + self.chunks.committed_bytes()
     }
 
     #[must_use]
     pub fn high_water_bytes(&self) -> u64 {
-        self.arenas().map(elastic::Arena::high_water_bytes).sum()
+        self.arenas()
+            .map(elastic::Arena::high_water_bytes)
+            .sum::<u64>()
+            + self.chunks.high_water_bytes()
     }
 
     #[must_use]
@@ -1367,48 +1382,53 @@ impl Pools {
             .any(|shape| matches!(shape, Shape::Kv { windowed: true, .. }))
     }
 
-    /// Zeroes page 0 of the windowed rows once they are backed: every page
-    /// behind a window reads it, and a masked column still multiplies its
-    /// value, so it must hold no NaN.
-    fn zero_null_page(&mut self) -> Result<()> {
-        if self.windowed_backed || !self.has_windowed() {
+    /// Seats the kv pages `pages` (the windowed ones, `ring`) on slots of
+    /// the state pool and backs the segments their chunks lie in.
+    fn seat_pages(&mut self, ring: bool, pages: impl IntoIterator<Item = u64>) -> Result<()> {
+        let mut highest = None;
+        for page in pages {
+            let page = u32::try_from(page).map_err(|_| Fault::Ceiling {
+                what: "kv pages",
+                need: page,
+                have: u64::from(u32::MAX),
+            })?;
+            let chunk = self.chunks.seat(ring, page)?;
+            highest = highest.max(Some(chunk));
+        }
+        let Some(highest) = highest else {
+            return Ok(());
+        };
+        let segments = self.chunks.segments_for(u64::from(highest) + 1);
+        if segments <= self.chunks.committed_segments() {
             return Ok(());
         }
-        for (arena, bytes) in self.windowed_planes() {
-            crate::device::zero_span(arena.span(0, bytes)?, usize::try_from(bytes).unwrap_or(0))?;
+        match self.chunks.commit_segments(&mut self.pool, segments)? {
+            Commit::Committed => Ok(()),
+            refusal => Err(refuse(&self.pool, refusal)),
         }
-        self.windowed_backed = true;
-        Ok(())
     }
 
-    /// Backs the not-yet-backed windowed pages `pages` (and the null page behind a
-    /// window) in the windowed rows and compressor slabs: the pool grows on first
-    /// use, costing only the windows the seated sequences hold.
+    /// Backs the windowed pages `pages` (and the null page behind a
+    /// window): their slots in the state pool, and their rows of the
+    /// compressor slabs their pages key.
     pub fn ensure_windowed(&mut self, pages: impl IntoIterator<Item = u64>) -> Result<()> {
         if !self.has_windowed() {
             return Ok(());
         }
         let capacity = self.paging.window_pages();
-        let mut fresh: Vec<u64> = core::iter::once(0)
-            .chain(pages)
-            .filter(|&page| {
-                !self
-                    .backed_windowed
-                    .get((page / 64) as usize)
-                    .is_some_and(|word| word & (1u64 << (page % 64)) != 0)
-            })
-            .collect();
+        let mut fresh: Vec<u64> = core::iter::once(0).chain(pages).collect();
         fresh.sort_unstable();
         fresh.dedup();
-        if fresh.is_empty() {
-            return Ok(());
-        }
         if let Some(&page) = fresh.iter().find(|&&page| page >= capacity) {
             return Err(Fault::Ceiling {
                 what: "windowed kv pages",
                 need: page + 1,
                 have: capacity,
             });
+        }
+        self.seat_pages(true, fresh.iter().copied())?;
+        if !self.pooled.iter().any(|row| row.windowed) {
+            return Ok(());
         }
         // Runs of consecutive pages, a range each.
         let mut runs: Vec<(u64, u64)> = Vec::new();
@@ -1419,59 +1439,33 @@ impl Pools {
             }
         }
         let page_size = u64::from(self.paging.page_size);
-        let Pools {
-            pool,
-            rows,
-            shapes,
-            pooled,
-            ..
-        } = self;
+        let Pools { pool, pooled, .. } = self;
         let mut targets = Vec::new();
-        let ranges = |page_bytes: u64| {
-            elastic::Want::Ranges(
-                runs.iter()
-                    .map(|&(first, count)| (first * page_bytes, count * page_bytes))
-                    .collect(),
-            )
-        };
-        for (planes, shape) in rows.iter_mut().zip(shapes.iter()) {
-            if !matches!(shape, Shape::Kv { windowed: true, .. }) {
-                continue;
-            }
-            for (at, arena) in planes.iter_mut().enumerate() {
-                let page_bytes = watermark_bytes(shape, at, 0, 1, 0, self.paging.page_size);
-                targets.push(elastic::Target {
-                    arena,
-                    want: ranges(page_bytes),
-                });
-            }
-        }
         for row in pooled.iter_mut().filter(|row| row.windowed) {
             let page_bytes = page_size * row.width * u64::from(elem_size(POOL_STATE));
             for arena in row.planes.iter_mut() {
                 targets.push(elastic::Target {
                     arena,
-                    want: ranges(page_bytes),
+                    want: elastic::Want::Ranges(
+                        runs.iter()
+                            .map(|&(first, count)| (first * page_bytes, count * page_bytes))
+                            .collect(),
+                    ),
                 });
             }
         }
         match elastic::commit_atomically(pool, &mut targets)? {
-            Commit::Committed => {}
-            refusal => return Err(refuse(&self.pool, refusal)),
+            Commit::Committed => Ok(()),
+            refusal => Err(refuse(&self.pool, refusal)),
         }
-        for &page in &fresh {
-            let (word, bit) = ((page / 64) as usize, page % 64);
-            if self.backed_windowed.len() <= word {
-                self.backed_windowed.resize(word + 1, 0);
-            }
-            self.backed_windowed[word] |= 1u64 << bit;
-        }
-        self.zero_null_page()
     }
 
     #[must_use]
     pub fn bases(&self) -> Vec<u64> {
-        self.arenas().map(elastic::Arena::base).collect()
+        self.arenas()
+            .map(elastic::Arena::base)
+            .chain(core::iter::once(self.chunks.base()))
+            .collect()
     }
 
     pub fn table(&self, seats: &Seats) -> Result<CacheTable> {
@@ -1487,6 +1481,7 @@ impl Pools {
                     values_plane,
                     head_stride,
                     live,
+                    offsets,
                 } => {
                     let seat = seats
                         .spaces
@@ -1503,9 +1498,17 @@ impl Pools {
                         self.paging.pages()
                     };
                     let cells = pages * u64::from(self.paging.page_size);
+                    // A plane's pointer carries its offset in a page's
+                    // slot; the pages step by the shape's grain.
+                    let grain = self
+                        .chunks
+                        .layout()
+                        .shape(windowed)
+                        .map_or(0, |shape| shape.grain);
+                    let _ = values_plane;
                     let plane = |at: usize, width: u64| {
                         Tensor::new(
-                            planes.get(at).map_or(0, elastic::Arena::base),
+                            self.chunks.base() + offsets[at],
                             u32::try_from(cells).unwrap_or(u32::MAX),
                             u32::try_from(width).unwrap_or(u32::MAX),
                             dtype,
@@ -1515,7 +1518,7 @@ impl Pools {
                         space,
                         pool: KvPool {
                             keys: plane(0, keys_width),
-                            values: plane(values_plane, values_width),
+                            values: plane(1, values_width),
                             bf16_keys: Tensor::new(0, 0, 0, dtype),
                             bf16_values: Tensor::new(0, 0, 0, dtype),
                             key_scales: Tensor::new(0, 0, 0, Dtype::U8),
@@ -1536,10 +1539,7 @@ impl Pools {
                             max_pages_per_request: narrow(u64::from(self.paging.pages_per_slot)),
                             pages_in_batch: narrow(u64::from(seats.pages)),
                             live: live.unwrap_or([0, 0]),
-                            page_stride: [
-                                shape.page_stride(0, self.paging.page_size),
-                                shape.page_stride(1, self.paging.page_size),
-                            ],
+                            page_stride: [grain, grain],
                         },
                     }
                 }
@@ -1656,18 +1656,26 @@ impl Pools {
         for span in moves {
             highest = highest.max(u64::from(span.src_page.max(span.dst_page)) + 1);
         }
-        self.ensure_kv(u32::try_from(highest).unwrap_or(u32::MAX))?;
+        self.kv_within(highest)?;
+        self.seat_pages(
+            false,
+            moves
+                .iter()
+                .flat_map(|span| [u64::from(span.src_page), u64::from(span.dst_page)]),
+        )?;
         self.ensure_windowed(
             windowed
                 .iter()
                 .flat_map(|span| [u64::from(span.src_page), u64::from(span.dst_page)]),
         )?;
-        for (planes, shape) in self.rows.iter().zip(&self.shapes) {
+        for shape in &self.shapes {
             let Shape::Kv {
                 windowed: in_window,
                 dtype,
                 keys_width,
                 values_width,
+                values_plane,
+                offsets,
                 ..
             } = *shape
             else {
@@ -1675,24 +1683,23 @@ impl Pools {
             };
             let element = u64::from(elem_size(dtype));
             let moves = if in_window { windowed } else { moves };
-            for (at, arena) in planes.iter().enumerate() {
+            for (at, &offset) in offsets.iter().enumerate().take(values_plane + 1) {
                 let width = if at == 0 { keys_width } else { values_width };
                 let cell = width * element;
-                let stride = shape.page_stride(at, self.paging.page_size);
                 for span in moves {
                     if span.tokens == 0 {
                         continue;
                     }
                     let bytes = u64::from(span.tokens) * cell;
-                    let src = u64::from(span.src_page) * stride + u64::from(span.src_token) * cell;
-                    let dst = u64::from(span.dst_page) * stride + u64::from(span.dst_token) * cell;
-                    if src == dst {
+                    let src = offset + u64::from(span.src_token) * cell;
+                    let dst = offset + u64::from(span.dst_token) * cell;
+                    if span.src_page == span.dst_page && src == dst {
                         continue;
                     }
                     crate::device::copy_d2d(
                         stream,
-                        arena.span(dst, bytes)?,
-                        arena.span(src, bytes)?,
+                        self.chunks.span(in_window, span.dst_page, dst, bytes)?,
+                        self.chunks.span(in_window, span.src_page, src, bytes)?,
                         usize::try_from(bytes).unwrap_or(0),
                     )?;
                 }
@@ -1704,7 +1711,7 @@ impl Pools {
     /// The paged planes a kv page spans and the bytes it holds in each: the
     /// full-context rows' key and value planes and the compressor slabs
     /// indexed by the same pages. Windowed rows name their own pages.
-    fn paged_planes(&self) -> Vec<(&Arena, u64)> {
+    fn paged_planes(&self) -> Vec<(PlaneAt<'_>, u64)> {
         let mut planes = self.kv_planes(false);
         planes.extend(self.pooled_planes(false));
         planes
@@ -1712,21 +1719,23 @@ impl Pools {
 
     /// The compressor slabs keyed by a windowed space's pages (or not), and
     /// the bytes a page holds in each.
-    fn pooled_planes(&self, windowed: bool) -> Vec<(&Arena, u64)> {
+    fn pooled_planes(&self, windowed: bool) -> Vec<(PlaneAt<'_>, u64)> {
         let page_size = u64::from(self.paging.page_size);
         self.pooled
             .iter()
             .filter(|row| row.windowed == windowed)
             .flat_map(|row| {
                 let bytes = page_size * row.width * u64::from(elem_size(POOL_STATE));
-                row.planes.iter().map(move |arena| (arena, bytes))
+                row.planes
+                    .iter()
+                    .map(move |arena| (PlaneAt::Dense(arena), bytes))
             })
             .collect()
     }
 
     /// The windowed planes a windowed page spans: the windowed kv rows' and
     /// the compressor slabs their pages key.
-    fn windowed_planes(&self) -> Vec<(&Arena, u64)> {
+    fn windowed_planes(&self) -> Vec<(PlaneAt<'_>, u64)> {
         let mut planes = self.kv_planes(true);
         planes.extend(self.pooled_planes(true));
         planes
@@ -1734,11 +1743,13 @@ impl Pools {
 
     /// The planes of the kv rows that are (or are not) `windowed`, and the
     /// bytes a page holds in each.
-    fn kv_planes(&self, windowed: bool) -> Vec<(&Arena, u64)> {
+    fn kv_planes(&self, windowed: bool) -> Vec<(PlaneAt<'_>, u64)> {
         let mut planes = Vec::new();
-        for (arenas, shape) in self.rows.iter().zip(&self.shapes) {
+        for shape in &self.shapes {
             let Shape::Kv {
                 windowed: in_window,
+                values_plane,
+                offsets,
                 ..
             } = *shape
             else {
@@ -1747,13 +1758,46 @@ impl Pools {
             if in_window != windowed {
                 continue;
             }
-            // A plane's pages lie page after page, so a page holds its
-            // stride's bytes.
-            for (at, arena) in arenas.iter().enumerate() {
-                planes.push((arena, shape.page_stride(at, self.paging.page_size)));
+            for (at, &offset) in offsets.iter().enumerate().take(values_plane + 1) {
+                planes.push((
+                    PlaneAt::Slot {
+                        ring: windowed,
+                        offset,
+                    },
+                    shape.page_bytes(at, self.paging.page_size),
+                ));
             }
         }
         planes
+    }
+
+    /// The address of page `page`'s `bytes` in `plane`; the page is seated
+    /// and backed by the caller.
+    fn plane_span(&self, plane: PlaneAt<'_>, page: u32, bytes: u64) -> Result<u64> {
+        match plane {
+            PlaneAt::Dense(arena) => arena.span(u64::from(page) * bytes, bytes),
+            PlaneAt::Slot { ring, offset } => self.chunks.span(ring, page, offset, bytes),
+        }
+    }
+
+    /// Rewrites the page ids of a fire's table (the windowed rows', `ring`)
+    /// as the ids the paged kernels read their slots by; the fire's commit
+    /// has seated them.
+    pub fn page_ids(&self, ring: bool, ids: &mut [i32]) -> Result<()> {
+        self.chunks.page_ids(ring, ids)
+    }
+
+    /// Refuses a page count past the pool's.
+    fn kv_within(&self, pages: u64) -> Result<()> {
+        let capacity = self.paging.pages();
+        if pages > capacity {
+            return Err(Fault::Ceiling {
+                what: "kv pages",
+                need: pages,
+                have: capacity,
+            });
+        }
+        Ok(())
     }
 
     /// Backs every page and slot the pools declare, at load, and keeps them
@@ -1772,7 +1816,13 @@ impl Pools {
             Commit::Committed => {}
             refusal => return Err(refuse(&self.pool, refusal)),
         }
-        self.note_backed(&[(0, u64::from(pages))]);
+        match self
+            .chunks
+            .commit_segments(&mut self.pool, self.chunks.segments())?
+        {
+            Commit::Committed => {}
+            refusal => return Err(refuse(&self.pool, refusal)),
+        }
         self.ensure_windowed(0..self.paging.window_pages())?;
         self.whole = true;
         Ok(())
@@ -1795,13 +1845,31 @@ impl Pools {
         }
         let pages = u32::try_from(self.paging.pages()).unwrap_or(u32::MAX);
         let mut regions = Vec::new();
-        for (arena, page_bytes) in self.paged_planes() {
-            let len = u64::from(pages) * page_bytes;
-            regions.push(engine::KvRegion {
-                base: arena.span(0, len)?,
-                len,
-                page_stride: page_bytes,
-                domain: engine::MemoryDomain::CudaDevice(ordinal),
+        // A kv plane's region is the pool from the plane's offset in a
+        // slot on: the page a slot ref `r` names starts `r` strides in,
+        // while its chunk lies where it was opened.
+        let grain = self
+            .chunks
+            .layout()
+            .shape(false)
+            .map_or(0, |shape| shape.grain);
+        for (plane, page_bytes) in self.paged_planes() {
+            regions.push(match plane {
+                PlaneAt::Dense(arena) => {
+                    let len = u64::from(pages) * page_bytes;
+                    engine::KvRegion {
+                        base: arena.span(0, len)?,
+                        len,
+                        page_stride: page_bytes,
+                        domain: engine::MemoryDomain::CudaDevice(ordinal),
+                    }
+                }
+                PlaneAt::Slot { offset, .. } => engine::KvRegion {
+                    base: self.chunks.base() + offset,
+                    len: self.chunks.bytes().saturating_sub(offset),
+                    page_stride: grain,
+                    domain: engine::MemoryDomain::CudaDevice(ordinal),
+                },
             });
         }
         let (layers, heads, head_dim, dtype) = self
@@ -1871,7 +1939,7 @@ impl Pools {
         row_bytes: u64,
     ) -> Result<()> {
         let rows = if row_bytes == 0 { 0 } else { rows };
-        let planes = |planes: Vec<(&Arena, u64)>| planes.into_iter().map(|(_, b)| b).collect();
+        let planes = |planes: Vec<(PlaneAt<'_>, u64)>| planes.into_iter().map(|(_, b)| b).collect();
         let host = HostKv {
             paged: Shelf::new(planes(self.paged_planes()), pages),
             windowed: Shelf::new(planes(self.windowed_planes()), window_pages),
@@ -1988,8 +2056,7 @@ impl Pools {
                 have,
             });
         }
-        let highest = device.iter().map(|&page| page + 1).max().unwrap_or(0);
-        self.ensure_kv(highest)?;
+        self.ensure_kv_pages(device)?;
         let Some(mut spill) = self.disk.take() else {
             return Ok(());
         };
@@ -2021,8 +2088,8 @@ impl Pools {
                 spill.file.read(slot, staged()).map_err(slot_file)?;
             }
             let mut offset = 0u64;
-            for &(arena, page_bytes) in &planes {
-                let on_device = arena.span(u64::from(page) * page_bytes, page_bytes)?;
+            for &(plane, page_bytes) in &planes {
+                let on_device = self.plane_span(plane, page, page_bytes)?;
                 let on_host = stage as u64 + offset;
                 let (dst, src) = if to_disk {
                     (on_host, on_device)
@@ -2057,8 +2124,7 @@ impl Pools {
         windowed: &[(u32, u32)],
     ) -> Result<()> {
         let paged: Vec<(u32, u32)> = device.iter().copied().zip(host.iter().copied()).collect();
-        let highest = device.iter().map(|&page| page + 1).max().unwrap_or(0);
-        self.ensure_kv(highest)?;
+        self.ensure_kv_pages(device)?;
         self.ensure_windowed(windowed.iter().map(|&(page, _)| u64::from(page)))?;
         let Some(tier) = self.host.as_mut() else {
             return match (host.first(), windowed.first()) {
@@ -2085,28 +2151,17 @@ impl Pools {
             (self.paged_planes(), &paged[..], &tier.paged),
             (self.windowed_planes(), windowed, &tier.windowed),
         ] {
-            let mut runs: Vec<(u32, u32, u32)> = Vec::new();
-            for &(d, h) in pairs {
-                match runs.last_mut() {
-                    Some((d0, h0, n))
-                        if *d0 + *n == d && *h0 + *n == h && shelf.same_chunk(*h0, h) =>
-                    {
-                        *n += 1;
-                    }
-                    _ => runs.push((d, h, 1)),
-                }
-            }
-            for (plane, (arena, page_bytes)) in planes.into_iter().enumerate() {
-                for &(d, h, n) in &runs {
-                    let bytes = u64::from(n) * page_bytes;
-                    let on_device = arena.span(u64::from(d) * page_bytes, bytes)?;
-                    let on_host = shelf.at(h, plane)?;
+            // A page's planes lie apart in its slot, so each is a span.
+            for (at, (plane, page_bytes)) in planes.into_iter().enumerate() {
+                for &(d, h) in pairs {
+                    let on_device = self.plane_span(plane, d, page_bytes)?;
+                    let on_host = shelf.at(h, at)?;
                     let (dst, src) = if to_host {
                         (on_host, on_device)
                     } else {
                         (on_device, on_host)
                     };
-                    spans.push((dst, src, usize::try_from(bytes).unwrap_or(0)));
+                    spans.push((dst, src, usize::try_from(page_bytes).unwrap_or(0)));
                 }
             }
         }
@@ -2257,15 +2312,14 @@ impl Pools {
     /// The cache row of each paged plane, in a host slot's order.
     fn paged_plane_rows(&self) -> Vec<usize> {
         let mut rows = Vec::new();
-        for (row, (arenas, shape)) in self.rows.iter().zip(&self.shapes).enumerate() {
-            if matches!(
-                shape,
-                Shape::Kv {
-                    windowed: false,
-                    ..
-                }
-            ) {
-                rows.extend(std::iter::repeat_n(row, arenas.len()));
+        for (row, shape) in self.shapes.iter().enumerate() {
+            if let Shape::Kv {
+                windowed: false,
+                values_plane,
+                ..
+            } = *shape
+            {
+                rows.extend(std::iter::repeat_n(row, values_plane + 1));
             }
         }
         rows
@@ -2314,7 +2368,7 @@ impl Pools {
         device: &[u32],
         host: &[u32],
     ) -> Result<TapSpans> {
-        self.ensure_kv(device.iter().map(|&page| page + 1).max().unwrap_or(0))?;
+        self.ensure_kv_pages(device)?;
         let Some(tier) = self.host.as_mut() else {
             return Err(Fault::Ceiling {
                 what: "host kv pages",
@@ -2329,9 +2383,9 @@ impl Pools {
         let mut lands = Vec::with_capacity(planes.len() * device.len());
         for (&d, &h) in device.iter().zip(host) {
             for &plane in planes {
-                let (arena, bytes) = all[plane];
+                let (at, bytes) = all[plane];
                 let on_host = shelf.at(h, plane)?;
-                let on_device = arena.span(u64::from(d) * bytes, bytes)?;
+                let on_device = self.plane_span(at, d, bytes)?;
                 let len = usize::try_from(bytes).unwrap_or(0);
                 copies.push((on_host, on_device, len));
                 lands.push((on_host, len));
@@ -2496,19 +2550,22 @@ impl Pools {
         Ok(())
     }
 
-    fn ensure_kv(&mut self, pages: u32) -> Result<()> {
-        let capacity = self.paging.pages();
-        if u64::from(pages) > capacity {
-            return Err(Fault::Ceiling {
-                what: "kv pages",
-                need: u64::from(pages),
-                have: capacity,
-            });
+    /// Seats and backs the kv pages `pages`, and the compressor slabs' rows
+    /// under them.
+    fn ensure_kv_pages(&mut self, pages: &[u32]) -> Result<()> {
+        let highest = pages.iter().map(|&page| u64::from(page) + 1).max();
+        let Some(highest) = highest else {
+            return Ok(());
+        };
+        self.kv_within(highest)?;
+        self.seat_pages(false, pages.iter().map(|&page| u64::from(page)))?;
+        if self.pooled.iter().any(|row| !row.windowed) {
+            match self.commit_to(u32::try_from(highest).unwrap_or(u32::MAX), 0)? {
+                Commit::Committed => {}
+                refusal => return Err(refuse(&self.pool, refusal)),
+            }
         }
-        match self.commit_to(pages, 0)? {
-            Commit::Committed => Ok(()),
-            refusal => Err(refuse(&self.pool, refusal)),
-        }
+        Ok(())
     }
 
     fn ensure_state(&mut self, slots: u32) -> Result<()> {
@@ -2528,38 +2585,22 @@ impl Pools {
         kv_ranges: &[(u64, u64)],
         window_pages: &[u64],
     ) -> Result<()> {
-        if !(demand.kv_pages <= self.committed_kv_pages
-            && demand.state_slots <= self.committed_state_slots
-            && kv_ranges
+        self.seat_pages(
+            false,
+            kv_ranges
                 .iter()
-                .all(|&(first, count)| self.pages_backed(first, count)))
+                .flat_map(|&(first, count)| first..first.saturating_add(count)),
+        )?;
+        let slabs = self.pooled.iter().any(|row| !row.windowed);
+        if demand.state_slots > self.committed_state_slots
+            || (slabs && demand.kv_pages > self.committed_kv_pages)
         {
-            match self.commit_ranges(demand.kv_pages, demand.state_slots, Some(kv_ranges))? {
-                Commit::Committed => self.note_backed(kv_ranges),
+            match self.commit_ranges(demand.kv_pages, demand.state_slots, None)? {
+                Commit::Committed => {}
                 refusal => return Err(refuse(&self.pool, refusal)),
             }
         }
         self.ensure_windowed(window_pages.iter().copied())
-    }
-
-    fn pages_backed(&self, first: u64, count: u64) -> bool {
-        (first..first.saturating_add(count)).all(|page| {
-            self.backed_pages
-                .get((page / 64) as usize)
-                .is_some_and(|word| word & (1u64 << (page % 64)) != 0)
-        })
-    }
-
-    fn note_backed(&mut self, ranges: &[(u64, u64)]) {
-        for &(first, count) in ranges {
-            for page in first..first.saturating_add(count) {
-                let (word, bit) = ((page / 64) as usize, page % 64);
-                if self.backed_pages.len() <= word {
-                    self.backed_pages.resize(word + 1, 0);
-                }
-                self.backed_pages[word] |= 1u64 << bit;
-            }
-        }
     }
 
     fn commit_ranges(
@@ -2582,20 +2623,11 @@ impl Pools {
         let mut targets = Vec::new();
         for (planes, shape) in rows.iter_mut().zip(shapes.iter()) {
             for (at, arena) in planes.iter_mut().enumerate() {
-                let want = match (shape, kv_ranges) {
-                    // The windowed pool backs its pages as they are first
-                    // used (`ensure_windowed`).
-                    (Shape::Kv { windowed: true, .. }, _) => continue,
-                    (Shape::Kv { .. }, Some(ranges)) => {
-                        let page_bytes = watermark_bytes(shape, at, 1, 0, 0, page_size);
-                        elastic::Want::Ranges(
-                            ranges
-                                .iter()
-                                .map(|&(first, count)| (first * page_bytes, count * page_bytes))
-                                .collect(),
-                        )
-                    }
-                    _ => elastic::Want::Prefix(watermark_bytes(
+                let _ = kv_ranges;
+                let want = match shape {
+                    // A kv row's pages are slots of the state pool.
+                    Shape::Kv { .. } => continue,
+                    Shape::State { .. } => elastic::Want::Prefix(watermark_bytes(
                         shape,
                         at,
                         kv_pages,
@@ -2623,6 +2655,45 @@ impl Pools {
         }
         Ok(outcome)
     }
+}
+
+/// How `trace`'s kv rows sit in the state pool's chunks: the compiler's
+/// recipe for a server card, its token slots this paging's pages. Where the
+/// paging keeps no window (the widest spans the context) every row is a list
+/// row.
+fn lay(trace: &Trace, paging: &Paging, budgets: &poem_compiler::Budgets) -> Result<layout::Layout> {
+    let context = if paging.window.is_some() {
+        paging.context()
+    } else {
+        0
+    };
+    let profile = poem_compiler::DeviceProfile {
+        chunk: poem_compiler::chunk::ChunkProfile::SERVER_CUDA.paged(paging.page_size, context),
+        ..poem_compiler::DeviceProfile::default()
+    };
+    let recipe =
+        poem_compiler::chunk::plan(trace, budgets, &profile).map_err(|why| Fault::Unbound {
+            what: format!("a chunk recipe for this load's cache rows: {why}"),
+        })?;
+    layout::Layout::of(&recipe)
+}
+
+/// The chunks a pool of `pages` kv pages takes: the null chunk, the pages'
+/// and the windowed pages beside them.
+fn chunks_at(layout: &layout::Layout, paging: &Paging, pages: u64) -> u32 {
+    let chunks = 1
+        + layout.chunks_for(false, pages)
+        + layout.chunks_for(true, paging.window_pages_at(pages));
+    u32::try_from(chunks).unwrap_or(u32::MAX)
+}
+
+/// One plane a page holds bytes in.
+#[derive(Debug, Clone, Copy)]
+enum PlaneAt<'a> {
+    /// A compressor slab: page after page in an arena of its own.
+    Dense(&'a Arena),
+    /// A kv row's plane, `offset` into each page's slot of the state pool.
+    Slot { ring: bool, offset: u64 },
 }
 
 const POOL_STATE: Dtype = Dtype::Bf16;
@@ -2693,16 +2764,10 @@ fn watermark_bytes(
     page_size: u32,
 ) -> u64 {
     match *shape {
-        Shape::Kv {
-            windowed,
-            dtype,
-            keys_width,
-            values_width,
-            ..
-        } => {
-            let width = if plane == 0 { keys_width } else { values_width };
-            let pages = if windowed { window_pages } else { kv_pages };
-            u64::from(pages) * u64::from(page_size) * width * u64::from(elem_size(dtype))
+        // A kv row's pages are slots of the state pool, not an arena's.
+        Shape::Kv { .. } => {
+            let _ = (plane, kv_pages, window_pages, page_size);
+            0
         }
         Shape::State { stride, dtype } => {
             u64::from(state_slots) * stride * u64::from(elem_size(dtype))

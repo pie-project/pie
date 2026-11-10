@@ -39,11 +39,26 @@ pub use kernels_ir::anchor::{
 
 /// Where a paged epilogue's cache rows live, past each result's own plane
 /// (a cache's, `outs[k]`): which of the fire's rows are live (`valid`, a
-/// byte a row, or 0: every one) and a page's rows.
+/// byte a row, or 0: every one), a page's rows, and the bytes from one
+/// page's rows to the next page's in the key plane and in the value plane
+/// (0: the pages lie one right after another).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Paging {
     pub valid: u64,
     pub page_size: u32,
+    pub page_stride: [u64; 2],
+}
+
+impl Paging {
+    /// The elements of `paged`'s plane between two pages' rows.
+    fn stride_of(&self, paged: &Paged) -> u32 {
+        let bytes = self.page_stride[usize::from(paged.plane == CachePlane::Values)];
+        let element = match paged.dtype {
+            CacheDtype::E4m3 { .. } => 1,
+            CacheDtype::Bf16 => 2,
+        };
+        u32::try_from(bytes / element).unwrap_or(0)
+    }
 }
 use kernels_ir::{Binary, Literal, Op, Region, Shape};
 
@@ -653,6 +668,7 @@ impl Epilogue {
                 } else {
                     None
                 },
+                page_stride: paging.stride_of(&p),
             });
             words.extend(Store::of(*w, cache.as_ref()).words());
         }
@@ -1353,6 +1369,7 @@ impl RowLeg {
                                 valid: paging.valid,
                                 page_size: paging.page_size,
                                 e4m3,
+                                page_stride: paging.stride_of(&paged),
                             },
                             land.from,
                             width,
