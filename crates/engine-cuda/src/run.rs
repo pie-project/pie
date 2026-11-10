@@ -4,7 +4,7 @@ use kernels_cuda::attn::plan::{
     DecodePlan, Device, Live, MlaPlan, PrefillPlan, Shape, Toggles, Workspace,
 };
 use kernels_cuda::linear::lora::Segments;
-use kernels_cuda::linear::moe::{ExpertTable, GroupSeat};
+use kernels_cuda::linear::moe::ExpertTable;
 use kernels_cuda::{Ctx, KvPool, Pad, RaggedTensor, RecurrentPool, Tensor};
 use poem_exec::fire::MaskSpan;
 use poem_ir::{Def, Dim, GeomKind, Node, RuntimeInput, StructKind, Ty, ValueDecl, ValueId};
@@ -21,7 +21,6 @@ pub enum WeightRow {
         codes: Tensor,
         scales: Tensor,
         biases: Option<Tensor>,
-        seat: GroupSeat,
         repacked: bool,
         /// The scales lie in the tcgen05 GEMM's atoms, laid there at load
         /// for a low-precision product, not row-major.
@@ -29,12 +28,6 @@ pub enum WeightRow {
         /// An mxfp4 bank in the matrix core's lane order (ROCm:
         /// `linear::moe::mxfp4_lanes`), which only routed selects read.
         lanes: bool,
-    },
-
-    Streamed {
-        slab: Tensor,
-        table: u64,
-        counts: u64,
     },
 
     /// A resident plane in the matrix core's order, which only the products
@@ -1727,7 +1720,7 @@ impl<'c> Run<'c> {
             Some(Def::Op(_) | Def::Merge(_)) => self.arena.0.get(at).copied().flatten().is_some(),
             Some(Def::Weight(w)) => matches!(
                 self.weights.0.get(*w as usize).copied().flatten(),
-                Some(WeightRow::Dense(_) | WeightRow::Streamed { .. } | WeightRow::Ordered(_))
+                Some(WeightRow::Dense(_) | WeightRow::Ordered(_))
             ),
             _ => false,
         }
@@ -1895,11 +1888,7 @@ impl<'c> Run<'c> {
             Def::Weight(w) => {
                 let row = *w as usize;
                 match self.weights.0.get(row).copied().flatten() {
-                    Some(
-                        WeightRow::Dense(handle)
-                        | WeightRow::Streamed { slab: handle, .. }
-                        | WeightRow::Ordered(handle),
-                    ) => handle,
+                    Some(WeightRow::Dense(handle) | WeightRow::Ordered(handle)) => handle,
                     Some(WeightRow::Planes { .. }) => panic!(
                         "value {at} is weight {row}, a split-plane bank; it resolves \
                          through `Run::planes`, never as one dense handle"
@@ -1971,10 +1960,7 @@ impl<'c> Run<'c> {
             )
     }
 
-    pub(crate) fn maybe_planes(
-        &self,
-        id: ValueId,
-    ) -> Option<(Tensor, Tensor, Option<Tensor>, GroupSeat)> {
+    pub(crate) fn maybe_planes(&self, id: ValueId) -> Option<(Tensor, Tensor, Option<Tensor>)> {
         let at = id.0 as usize;
         let Def::Weight(w) = &self.values[at].def else {
             return None;
@@ -1984,11 +1970,10 @@ impl<'c> Run<'c> {
                 codes,
                 scales,
                 biases,
-                seat,
                 repacked: false,
                 atoms: false,
                 lanes: false,
-            }) => Some((codes, scales, biases, seat)),
+            }) => Some((codes, scales, biases)),
             _ => None,
         }
     }
@@ -2047,10 +2032,7 @@ impl<'c> Run<'c> {
             .filter(|c| c.dtype == poem_ir::Dtype::Bf16)
     }
 
-    pub(crate) fn maybe_tiled_planes(
-        &self,
-        id: ValueId,
-    ) -> Option<(Tensor, Tensor, Tensor, GroupSeat)> {
+    pub(crate) fn maybe_tiled_planes(&self, id: ValueId) -> Option<(Tensor, Tensor, Tensor)> {
         let at = id.0 as usize;
         let Def::Weight(w) = &self.values[at].def else {
             return None;
@@ -2060,11 +2042,10 @@ impl<'c> Run<'c> {
                 codes,
                 scales,
                 biases: Some(biases),
-                seat,
                 repacked: true,
                 atoms: false,
                 lanes: _,
-            }) => Some((codes, scales, biases, seat)),
+            }) => Some((codes, scales, biases)),
             _ => None,
         }
     }
@@ -2098,7 +2079,7 @@ impl<'c> Run<'c> {
         ))
     }
 
-    pub(crate) fn planes(&self, id: ValueId) -> (Tensor, Tensor, Option<Tensor>, GroupSeat) {
+    pub(crate) fn planes(&self, id: ValueId) -> (Tensor, Tensor, Option<Tensor>) {
         let at = id.0 as usize;
         let Def::Weight(w) = &self.values[at].def else {
             panic!("value {at} is not a weight, and split-plane banks live in the weight table");
@@ -2109,12 +2090,11 @@ impl<'c> Run<'c> {
                 codes,
                 scales,
                 biases,
-                seat,
                 repacked: _,
                 atoms: _,
                 lanes: _,
-            }) => (codes, scales, biases, seat),
-            Some(WeightRow::Dense(_) | WeightRow::Streamed { .. } | WeightRow::Ordered(_)) => {
+            }) => (codes, scales, biases),
+            Some(WeightRow::Dense(_) | WeightRow::Ordered(_)) => {
                 panic!(
                     "value {at} is weight {row}, bound as one dense handle, and this op reads \
                  a split-plane bank"
@@ -2209,18 +2189,6 @@ impl<'c> Run<'c> {
                     .iter()
                     .find(|(param, _)| *param == *w)
                     .map_or(ExpertTable::RESIDENT, |(_, table)| *table),
-            ),
-            Some(WeightRow::Streamed {
-                slab,
-                table,
-                counts,
-            }) => (
-                self.cut(id, slab),
-                ExpertTable {
-                    table,
-                    hits: counts,
-                    ..ExpertTable::RESIDENT
-                },
             ),
             Some(WeightRow::Planes { .. }) => panic!(
                 "value {at} is weight {row}, a split-plane bank; a dense routed select \

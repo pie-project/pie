@@ -135,10 +135,6 @@ impl Shell {
             return Err(fault);
         }
 
-        if let Some(tier) = self.weights.experts() {
-            let _ = tier.drain(self.device.notify_stream());
-        }
-
         let recycler = self.settlement.recycler();
         let posted = self.device.host_fn(Box::new(move || {
             // Read before the event goes back: its tap is the next step's then.

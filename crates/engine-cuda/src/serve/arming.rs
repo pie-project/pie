@@ -1198,12 +1198,8 @@ impl Shell {
                                 layout.join(" "),
                                 after.misses - before.misses,
                                 after.sealed_declines - before.sealed_declines,
-                                (after.eager_hosted
-                                    + after.eager_buffered
-                                    + after.eager_copy_world)
-                                    - (before.eager_hosted
-                                        + before.eager_buffered
-                                        + before.eager_copy_world)
+                                (after.eager_buffered + after.eager_copy_world)
+                                    - (before.eager_buffered + before.eager_copy_world)
                             ),
                             Err(why) => eprintln!("[arm-bench] {key} {what} refused: {why}"),
                         }

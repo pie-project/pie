@@ -562,7 +562,7 @@ impl Run<'_> {
                 logits: false,
                 ..
             } => match self.maybe_tiled_planes(*w) {
-                Some((codes, scales, biases, seat)) => {
+                Some((codes, scales, biases)) => {
                     let act = self.tensor(*act);
                     let entry = if act.rows >= self.ctx().tuning().qmm_gemm_from {
                         linear::affine::tiled::matmul
@@ -576,7 +576,7 @@ impl Run<'_> {
                         scales,
                         biases,
                         &mut self.tensor(*y),
-                        seat,
+                        GroupSeat::RESIDENT,
                     )
                 }
                 None => self.row_major_matmul(act, w, y),
@@ -589,7 +589,7 @@ impl Run<'_> {
                 logits: true,
                 ..
             } => match self.maybe_tiled_planes(*w) {
-                Some((codes, scales, biases, seat)) => {
+                Some((codes, scales, biases)) => {
                     let act = self.tensor(*act);
                     let entry = if act.rows >= self.ctx().tuning().qmm_gemm_from {
                         linear::affine::tiled::lm_head
@@ -603,7 +603,7 @@ impl Run<'_> {
                         scales,
                         biases,
                         &mut self.tensor(*y),
-                        seat,
+                        GroupSeat::RESIDENT,
                     )
                 }
                 None => self.row_major_lm_head(act, w, y),
@@ -1209,7 +1209,7 @@ impl Run<'_> {
                 quant: None,
                 ..
             } => {
-                let (codes, scales, affine, seat) = self.planes(*bank);
+                let (codes, scales, affine) = self.planes(*bank);
                 // A wide fire on the bank's bf16 copy (`kernel.moe.mxfp4_bf16_from`).
                 #[cfg(feature = "cuda")]
                 if let Some(copy) = self.mxfp4_bf16_bank(*bank)
@@ -1249,7 +1249,7 @@ impl Run<'_> {
                     self.tensor(*bias),
                     self.tensor(*routes),
                     &mut self.tensor(*y),
-                    seat,
+                    GroupSeat::RESIDENT,
                     linear::moe::ExpertTable::RESIDENT,
                 )
             }
@@ -1552,12 +1552,8 @@ impl Run<'_> {
                 quant: None,
                 ..
             } => {
-                let (codes, scales, affine, seat) = self.planes(bank);
-                if codes.dtype == Dtype::Nvfp4
-                    || affine.is_some()
-                    || seat.streams()
-                    || self.scales_in_atoms(bank)
-                {
+                let (codes, scales, affine) = self.planes(bank);
+                if codes.dtype == Dtype::Nvfp4 || affine.is_some() || self.scales_in_atoms(bank) {
                     return None;
                 }
                 let bias = Some(self.tensor(bias));
@@ -1583,12 +1579,11 @@ impl Run<'_> {
                 quant: None,
                 ..
             } => {
-                let (codes, scales, biases, seat) = self.planes(bank);
+                let (codes, scales, biases) = self.planes(bank);
                 // A bank the weight cache streams is read through its table,
                 // by the selects that take one whose every expert is seated.
                 let table = self.bank_table(bank);
-                if seat.streams()
-                    || self.scales_in_atoms(bank)
+                if self.scales_in_atoms(bank)
                     || table.streams()
                     || (!table.tabled() && crate::device::alloc::is_host_pointer(codes.ptr))
                 {
@@ -1628,9 +1623,8 @@ impl Run<'_> {
                 bias: None,
                 quantized: true,
             } => {
-                let (codes, atoms, biases, seat) = self.planes(bank);
+                let (codes, atoms, biases) = self.planes(bank);
                 if codes.dtype != Dtype::Nvfp4
-                    || seat.streams()
                     || !self.scales_in_atoms(bank)
                     || crate::device::alloc::is_host_pointer(codes.ptr)
                 {
@@ -1662,10 +1656,9 @@ impl Run<'_> {
                 bias: None,
                 quantized: true,
             } => {
-                let (codes, atoms, biases, seat) = self.planes(bank);
+                let (codes, atoms, biases) = self.planes(bank);
                 if !matches!(codes.dtype, Dtype::Mxfp4 | Dtype::U8 | Dtype::E4m3)
                     || biases.is_some()
-                    || seat.streams()
                     || !self.scales_in_atoms(bank)
                     || crate::device::alloc::is_host_pointer(codes.ptr)
                 {
@@ -1975,7 +1968,7 @@ impl Run<'_> {
         routes: ValueId,
         y: ValueId,
     ) -> Result<(), kernels_cuda::Error> {
-        let (codes, scales, biases, seat) = self.planes(bank);
+        let (codes, scales, biases) = self.planes(bank);
         let routes = self.tensor(routes);
         // A wide fire on an MXFP4 bank's bf16 copy (`kernel.moe.mxfp4_bf16_from`).
         #[cfg(feature = "cuda")]
@@ -2021,18 +2014,18 @@ impl Run<'_> {
                 biases,
                 routes,
                 &mut self.tensor(y),
-                seat,
+                GroupSeat::RESIDENT,
                 table,
             );
         }
         if codes.dtype == Dtype::Nvfp4 {
             let tensor_scales = tensor_scales("linear.moe_select", biases)?;
-            let (codes, scales, tensor_scales, routes, seat) =
+            let (codes, scales, tensor_scales, routes) =
                 match self.staged_experts(codes, scales, Some(tensor_scales), routes) {
                     Some((codes, scales, Some(tensor_scales), routes)) => {
-                        (codes, scales, tensor_scales, routes, GroupSeat::RESIDENT)
+                        (codes, scales, tensor_scales, routes)
                     }
-                    _ => (codes, scales, tensor_scales, routes, seat),
+                    _ => (codes, scales, tensor_scales, routes),
                 };
             return linear::moe::select_nvfp4(
                 self.ctx(),
@@ -2042,17 +2035,13 @@ impl Run<'_> {
                 tensor_scales,
                 routes,
                 &mut self.tensor(y),
-                seat,
+                GroupSeat::RESIDENT,
                 linear::moe::ExpertTable::RESIDENT,
             );
         }
-        let (codes, scales, biases, routes, seat) =
-            match self.staged_experts(codes, scales, biases, routes) {
-                Some((codes, scales, biases, routes)) => {
-                    (codes, scales, biases, routes, GroupSeat::RESIDENT)
-                }
-                None => (codes, scales, biases, routes, seat),
-            };
+        let (codes, scales, biases, routes) = self
+            .staged_experts(codes, scales, biases, routes)
+            .unwrap_or((codes, scales, biases, routes));
         linear::moe::matmul_select_quant(
             self.ctx(),
             x,
@@ -2061,7 +2050,7 @@ impl Run<'_> {
             biases,
             routes,
             &mut self.tensor(y),
-            seat,
+            GroupSeat::RESIDENT,
             linear::moe::ExpertTable::RESIDENT,
         )
     }
@@ -2108,11 +2097,10 @@ impl Run<'_> {
         if !linear::gemm_sm100::supported() {
             // An MXFP4 bank against e4m3 rows, as the release asks, on the
             // consumer Blackwells' block-scaled mma.sync (`kernel.moe.mxfp4_w4a8_from`).
-            let (codes, scales, biases, seat) = self.planes(bank);
+            let (codes, scales, biases) = self.planes(bank);
             if let ActQuant::E4m3 { gran } = quant
                 && matches!(codes.dtype, Dtype::Mxfp4 | Dtype::U8)
                 && biases.is_none()
-                && !seat.streams()
                 && !crate::device::alloc::is_host_pointer(codes.ptr)
                 && linear::moe::select_mxfp4_w4a8(
                     self.ctx(),
@@ -2132,7 +2120,6 @@ impl Run<'_> {
             if let ActQuant::Nvfp4 = quant
                 && codes.dtype == Dtype::Nvfp4
                 && let (Some(tensor_scales), Some(input_scales)) = (biases, input_scales)
-                && !seat.streams()
                 && !crate::device::alloc::is_host_pointer(codes.ptr)
                 && linear::moe::select_nvfp4_w4a4(
                     self.ctx(),
@@ -2150,9 +2137,9 @@ impl Run<'_> {
             }
             return self.select_a16(OP, x, bank, routes, y);
         }
-        let (codes, scales, biases, seat) = self.planes(bank);
+        let (codes, scales, biases) = self.planes(bank);
         per_tensor_e4m3_is_a_table(OP, codes)?;
-        if seat.streams() || crate::device::alloc::is_host_pointer(codes.ptr) {
+        if crate::device::alloc::is_host_pointer(codes.ptr) {
             return Err(kernels_cuda::Error::Backend {
                 op: OP,
                 detail: "a low-precision select reads a resident bank, and this one is \
@@ -2352,15 +2339,7 @@ impl Run<'_> {
         if let Some(block_scales) = block_scales {
             return self.fp8_block_matmul(act, w, quant, block_scales, y);
         }
-        let (codes, scales, _, seat) = self.planes(w);
-        if seat.streams() {
-            return Err(kernels_cuda::Error::Backend {
-                op: OP,
-                detail: "a low-precision projection reads resident planes, and these are \
-                         seated by a streaming tier"
-                    .to_string(),
-            });
-        }
+        let (codes, scales, _) = self.planes(w);
         if !self.scales_in_atoms(w) {
             return Err(unlaid(OP));
         }
@@ -2425,7 +2404,7 @@ impl Run<'_> {
         routes: ValueId,
         y: ValueId,
     ) -> Result<(), kernels_cuda::Error> {
-        let (codes, scales, _, seat) = self.planes(bank);
+        let (codes, scales, _) = self.planes(bank);
         match codes.dtype {
             Dtype::Nvfp4 | Dtype::Mxfp4 | Dtype::U8 => {
                 let x = self.tensor(x);
@@ -2477,7 +2456,7 @@ impl Run<'_> {
                 let Some(gran) = fp8_bank_gran(scales, self.tensor(x).width) else {
                     return Err(unlaid(op));
                 };
-                if seat.streams() || crate::device::alloc::is_host_pointer(codes.ptr) {
+                if crate::device::alloc::is_host_pointer(codes.ptr) {
                     return Err(kernels_cuda::Error::Backend {
                         op,
                         detail: "a W8A16 select reads a resident bank, and this one is seated \
@@ -2743,7 +2722,7 @@ impl Run<'_> {
             per_tensor_e4m3_is_a_table("linear.matmul", codes)?;
         }
         match self.maybe_planes(*w) {
-            Some((codes, scales, biases, seat)) if codes.dtype == Dtype::Nvfp4 => {
+            Some((codes, scales, biases)) if codes.dtype == Dtype::Nvfp4 => {
                 linear::dequant::nvfp4_matmul(
                     self.ctx(),
                     "linear.matmul",
@@ -2752,18 +2731,17 @@ impl Run<'_> {
                     scales,
                     tensor_scales("linear.matmul", biases)?,
                     &mut self.tensor(*y),
-                    seat,
+                    GroupSeat::RESIDENT,
                 )
             }
-            Some((codes, scales, biases, seat)) => {
+            Some((codes, scales, biases)) => {
                 let act = self.tensor(*act);
                 let held = self.decoded_tile_holds(self.tensor(*y).width, act.width);
-                let entry =
-                    if act.rows >= self.ctx().tuning().qmm_gemm_from && !seat.streams() && held {
-                        linear::dequant::matmul_via_dense
-                    } else {
-                        linear::affine::matmul
-                    };
+                let entry = if act.rows >= self.ctx().tuning().qmm_gemm_from && held {
+                    linear::dequant::matmul_via_dense
+                } else {
+                    linear::affine::matmul
+                };
                 entry(
                     self.ctx(),
                     act,
@@ -2773,7 +2751,7 @@ impl Run<'_> {
                     biases,
                     Dtype::Bf16,
                     &mut self.tensor(*y),
-                    seat,
+                    GroupSeat::RESIDENT,
                 )
             }
             None => match self.maybe_stored(*w) {
@@ -2803,7 +2781,7 @@ impl Run<'_> {
             per_tensor_e4m3_is_a_table("linear.matmul", codes)?;
         }
         match self.maybe_planes(*w) {
-            Some((codes, scales, biases, seat)) if codes.dtype == Dtype::Nvfp4 => {
+            Some((codes, scales, biases)) if codes.dtype == Dtype::Nvfp4 => {
                 linear::dequant::nvfp4_matmul(
                     self.ctx(),
                     "linear.matmul",
@@ -2812,18 +2790,17 @@ impl Run<'_> {
                     scales,
                     tensor_scales("linear.matmul", biases)?,
                     &mut self.tensor(*y),
-                    seat,
+                    GroupSeat::RESIDENT,
                 )
             }
-            Some((codes, scales, biases, seat)) => {
+            Some((codes, scales, biases)) => {
                 let act = self.tensor(*act);
                 let held = self.decoded_tile_holds(self.tensor(*y).width, act.width);
-                let entry =
-                    if act.rows >= self.ctx().tuning().qmm_gemm_from && !seat.streams() && held {
-                        linear::dequant::lm_head_via_dense
-                    } else {
-                        linear::affine::lm_head
-                    };
+                let entry = if act.rows >= self.ctx().tuning().qmm_gemm_from && held {
+                    linear::dequant::lm_head_via_dense
+                } else {
+                    linear::affine::lm_head
+                };
                 entry(
                     self.ctx(),
                     act,
@@ -2833,7 +2810,7 @@ impl Run<'_> {
                     biases,
                     Dtype::Bf16,
                     &mut self.tensor(*y),
-                    seat,
+                    GroupSeat::RESIDENT,
                 )
             }
             None => match self.maybe_stored(*w) {

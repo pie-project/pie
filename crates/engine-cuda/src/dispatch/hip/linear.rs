@@ -279,7 +279,7 @@ impl Run<'_> {
                 logits: false,
                 ..
             } => match self.maybe_tiled_planes(*w) {
-                Some((codes, scales, biases, seat)) => {
+                Some((codes, scales, biases)) => {
                     let act = self.tensor(*act);
                     // The GEMV lands one 16-row tile; past it the GEMM, whatever
                     // the dense arm's threshold.
@@ -297,7 +297,7 @@ impl Run<'_> {
                         scales,
                         biases,
                         &mut self.tensor(*y),
-                        seat,
+                        GroupSeat::RESIDENT,
                     )
                 }
                 None => self.row_major_matmul(act, w, y),
@@ -310,7 +310,7 @@ impl Run<'_> {
                 logits: true,
                 ..
             } => match self.maybe_tiled_planes(*w) {
-                Some((codes, scales, biases, seat)) => {
+                Some((codes, scales, biases)) => {
                     let act = self.tensor(*act);
                     // The GEMV lands one 16-row tile; past it the GEMM, whatever
                     // the dense arm's threshold.
@@ -328,7 +328,7 @@ impl Run<'_> {
                         scales,
                         biases,
                         &mut self.tensor(*y),
-                        seat,
+                        GroupSeat::RESIDENT,
                     )
                 }
                 None => self.row_major_lm_head(act, w, y),
@@ -476,7 +476,7 @@ impl Run<'_> {
                 // The routes' rows read x's rows, so x's rows are what quantize.
                 // An fp8 bank (f32 factors) reads e4m3 rows under f32 scales
                 // a 1x128 block; any other bank, ue8m0 ones.
-                let (codes, scales, biases, _) = self.planes(*bank);
+                let (codes, scales, biases) = self.planes(*bank);
                 let fp8_bank = biases.is_none()
                     && linear::moe::fp8_tiles(self.tensor(*x), codes, scales, &self.tensor(*y));
                 match *quant {
@@ -903,7 +903,7 @@ impl Run<'_> {
                 quant: None,
                 ..
             } => {
-                let (codes, scales, affine, seat) = self.planes(*bank);
+                let (codes, scales, affine) = self.planes(*bank);
                 debug_assert!(
                     affine.is_none(),
                     "the biased select is the mxfp4 gate/up leg's; an affine bank's \
@@ -917,7 +917,7 @@ impl Run<'_> {
                     self.tensor(*bias),
                     self.tensor(*routes),
                     &mut self.tensor(*y),
-                    seat,
+                    GroupSeat::RESIDENT,
                     // The engine streams no experts on ROCm yet.
                     linear::moe::ExpertTable::RESIDENT,
                 )
@@ -1008,7 +1008,7 @@ impl Run<'_> {
         routes: ValueId,
         y: ValueId,
     ) -> Result<(), kernels_cuda::Error> {
-        let (codes, scales, biases, seat) = self.planes(bank);
+        let (codes, scales, biases) = self.planes(bank);
         let routes = self.tensor(routes);
         if self.planes_in_lanes(bank) {
             return linear::moe::matmul_select_mxfp4_lanes(
@@ -1021,13 +1021,9 @@ impl Run<'_> {
                 linear::moe::ExpertTable::RESIDENT,
             );
         }
-        let (codes, scales, biases, routes, seat) =
-            match self.staged_experts(codes, scales, biases, routes) {
-                Some((codes, scales, biases, routes)) => {
-                    (codes, scales, biases, routes, GroupSeat::RESIDENT)
-                }
-                None => (codes, scales, biases, routes, seat),
-            };
+        let (codes, scales, biases, routes) = self
+            .staged_experts(codes, scales, biases, routes)
+            .unwrap_or((codes, scales, biases, routes));
         linear::moe::matmul_select_quant(
             self.ctx(),
             x,
@@ -1036,7 +1032,7 @@ impl Run<'_> {
             biases,
             routes,
             &mut self.tensor(y),
-            seat,
+            GroupSeat::RESIDENT,
             linear::moe::ExpertTable::RESIDENT,
         )
     }
@@ -1104,12 +1100,11 @@ impl Run<'_> {
     ) -> Result<(), kernels_cuda::Error> {
         let (q, act_scales) = self.fp8_quantized("linear.moe_select", x, false)?;
         let x = self.tensor(x);
-        let (codes, scales, biases, seat) = self.planes(bank);
+        let (codes, scales, biases) = self.planes(bank);
         let routes = self.tensor(routes);
-        let (codes, scales, routes, seat) = match self.staged_experts(codes, scales, biases, routes)
-        {
-            Some((codes, scales, _, routes)) => (codes, scales, routes, GroupSeat::RESIDENT),
-            None => (codes, scales, routes, seat),
+        let (codes, scales, routes) = match self.staged_experts(codes, scales, biases, routes) {
+            Some((codes, scales, _, routes)) => (codes, scales, routes),
+            None => (codes, scales, routes),
         };
         linear::moe::matmul_select_fp8_quantized(
             self.ctx(),
@@ -1120,7 +1115,7 @@ impl Run<'_> {
             scales,
             routes,
             &mut self.tensor(y),
-            seat,
+            GroupSeat::RESIDENT,
             linear::moe::ExpertTable::RESIDENT,
         )
     }
@@ -1210,15 +1205,14 @@ impl Run<'_> {
         y: &ValueId,
     ) -> Result<(), kernels_cuda::Error> {
         match self.maybe_planes(*w) {
-            Some((codes, scales, biases, seat)) => {
+            Some((codes, scales, biases)) => {
                 let act = self.tensor(*act);
                 let held = self.decoded_tile_holds(self.tensor(*y).width, act.width);
-                let entry =
-                    if act.rows >= self.ctx().tuning().qmm_gemm_from && !seat.streams() && held {
-                        linear::dequant::matmul_via_dense
-                    } else {
-                        linear::affine::matmul
-                    };
+                let entry = if act.rows >= self.ctx().tuning().qmm_gemm_from && held {
+                    linear::dequant::matmul_via_dense
+                } else {
+                    linear::affine::matmul
+                };
                 entry(
                     self.ctx(),
                     act,
@@ -1228,7 +1222,7 @@ impl Run<'_> {
                     biases,
                     Dtype::Bf16,
                     &mut self.tensor(*y),
-                    seat,
+                    GroupSeat::RESIDENT,
                 )
             }
             None => linear::gemm::matmul(
@@ -1247,15 +1241,14 @@ impl Run<'_> {
         y: &ValueId,
     ) -> Result<(), kernels_cuda::Error> {
         match self.maybe_planes(*w) {
-            Some((codes, scales, biases, seat)) => {
+            Some((codes, scales, biases)) => {
                 let act = self.tensor(*act);
                 let held = self.decoded_tile_holds(self.tensor(*y).width, act.width);
-                let entry =
-                    if act.rows >= self.ctx().tuning().qmm_gemm_from && !seat.streams() && held {
-                        linear::dequant::lm_head_via_dense
-                    } else {
-                        linear::affine::lm_head
-                    };
+                let entry = if act.rows >= self.ctx().tuning().qmm_gemm_from && held {
+                    linear::dequant::lm_head_via_dense
+                } else {
+                    linear::affine::lm_head
+                };
                 entry(
                     self.ctx(),
                     act,
@@ -1265,7 +1258,7 @@ impl Run<'_> {
                     biases,
                     Dtype::Bf16,
                     &mut self.tensor(*y),
-                    seat,
+                    GroupSeat::RESIDENT,
                 )
             }
             None => {

@@ -72,7 +72,6 @@ fn shell(trace: poem::Trace, path: &Path, runahead: Runahead) -> Shell {
     let contract = contract_for(&trace, path).expect("the random planes fit the trace");
     let mut shell = Shell::load(Boot {
         voxels: None,
-        deferred_tier: false,
         residency: engine_cuda::experts::Plan::default(),
         trace,
         contract: &contract,

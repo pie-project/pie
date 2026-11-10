@@ -562,17 +562,9 @@ pub struct ModelConfig {
     /// not for a model with recurrent state or a window.
     #[serde(default)]
     pub disk_kv_persistent: bool,
-    /// Whether a warm boot builds the pinned host copy of the weights in the
-    /// background. On (the default) T1's planes are verified where they lie in the artifact and served from
-    /// there while a background thread builds the page-locked copy, so the
-    /// load answers sooner and the first fires take page faults until the
-    /// fill lands. `false` is the eager arm: the page-locked image is built
-    /// before the load answers.
-    ///
-    /// Needs a device that reports `pageableMemoryAccess` (CUDA 12.2+ HMM);
-    /// where it does not, the eager path is what happens whatever this says.
-    #[serde(default = "default_true")]
-    pub host_weight_deferred: bool,
+    /// Removed: the engine tier it deferred is gone.
+    #[serde(default, skip_serializing)]
+    pub host_weight_deferred: Removed<removed::HostWeightDeferred>,
     /// The most patch rows one fire may carry, over every image of every lane
     /// in it. Omit it: a vision deployment derives a ceiling from the checkpoint's
     /// own shapes, and a text-only deployment wants no ladder at all.
@@ -704,7 +696,6 @@ impl ModelConfig {
     #[must_use]
     pub fn residency(&self) -> engine::Residency {
         engine::Residency {
-            deferred_tier: self.host_weight_deferred,
             device_kv_budget: self.device_kv_budget.map(|b| b.as_bytes()),
             device_memory_share: self.device_memory_share,
             host_kv_budget: self.host_kv_budget.map(|b| b.as_bytes()),
@@ -1203,6 +1194,13 @@ device = ["metal:0"]
     }
 
     fn a_removed_key_is_refused_with_why() {
+        let err = Config::parse(&MINIMAL_METAL.replace(
+            "source = \"Qwen/Qwen3-0.6B\"",
+            "source = \"Qwen/Qwen3-0.6B\"\nhost_weight_deferred = false",
+        ))
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("`host_weight_deferred` was removed"), "{err}");
         for key in ["device_weight_budget", "host_weight_budget"] {
             let toml = MINIMAL_METAL.replace(
                 "source = \"Qwen/Qwen3-0.6B\"",

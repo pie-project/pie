@@ -104,6 +104,8 @@ removed_keys! {
         "dense weights always live in device memory; only routed experts and token-id tables leave it, through the weight cache. A model whose dense weights do not fit the device needs a quantized deployment or tensor parallelism";
     HostWeightBudget = "host_weight_budget":
         "dense weights always live in device memory; only routed experts and token-id tables leave it, through the weight cache, which sizes its host copy itself";
+    HostWeightDeferred = "host_weight_deferred":
+        "the engine's own weight tier it deferred is gone: dense weights always live in device memory, and the weight cache fills its own host copy";
     MaxStateSlots = "max_state_slots":
         "state now shares the device budget with kv pages";
 }

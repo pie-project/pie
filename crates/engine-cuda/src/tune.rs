@@ -40,7 +40,6 @@ fn serve(artifact: &Path, deployment: &str, chip: Profile) -> Result<Serving, St
     let residency = crate::experts::Plan::cut(&prospect.ranking);
     let mut shell = crate::Shell::load(crate::Boot {
         voxels: None,
-        deferred_tier: false,
         trace: trace.clone(),
         contract: &contract,
         checkpoint: artifact,
