@@ -202,6 +202,31 @@ impl Shell {
                 }
             }
         }
+        // A full fire's many prompts beside more decodes than the lanes they
+        // leave hold at the decodes' rung: the decodes pad to the lanes left
+        // (`canonical_pads`), at the widest rows and the top (v6e gpt-oss
+        // c256: 17 prompts beside 239 decodes compiled mid-run, 23 s).
+        if widest >= 4096 && top > widest {
+            for h in [32u32, 64, 128] {
+                let left = max_lanes.saturating_sub(h);
+                // The fewest decodes whose rung passes the lanes left.
+                let mut below = 1;
+                while pad.next(below) <= left {
+                    below = pad.next(below);
+                }
+                let (d, n) = (below + 1, h / 2);
+                if d > left || d + n > lanes_cap {
+                    continue;
+                }
+                let ones = (left - d) + (h - 1 - n);
+                for rows in [widest / 2, widest - d - ones] {
+                    let mut lanes = vec![fresh(decode, 1); d as usize];
+                    lanes.extend(std::iter::repeat_n(fresh(prefill, rows / n), n as usize));
+                    lanes[d as usize].rows += rows % n;
+                    shapes.push(lanes);
+                }
+            }
+        }
         let started = std::time::Instant::now();
         // Trace every shape (nothing runs), then compile the new programs
         // side by side: a compile is host work, one core each.

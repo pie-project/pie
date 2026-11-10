@@ -1163,11 +1163,22 @@ impl Shell {
             2
         };
         let mut pads: Vec<(u32, u64)> = Vec::new();
+        // A full fire's decodes, past the lanes its prompts leave at their
+        // rung, pad to those lanes (v6e gpt-oss c256: 17 prompts beside 239
+        // decodes fired at their own lane counts, a program compiled mid-run
+        // twice a round, 23 s each).
+        let left = self
+            .budgets
+            .tokens
+            .max_lanes
+            .saturating_sub(pad.rung(by[host].2 + 1).max(host_floor));
         for (at, &(_, word, n, _)) in by.iter().enumerate() {
-            let want = if at != host {
-                pad.rung(n)
-            } else {
+            let want = if at == host {
                 pad.rung(n + 1).max(host_floor) - 1
+            } else if by.len() == 2 && pad.rung(n) > left && n <= left {
+                left
+            } else {
+                pad.rung(n)
             };
             pads.extend(std::iter::repeat_n((1u32, word), (want - n) as usize));
         }
