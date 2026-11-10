@@ -187,3 +187,18 @@ The `new-memory/` directory is bookkeeping and is removed before anything lands 
   lightning+full, windowed/full), 12 hashed steps each; base hashes in GOLDEN-LOGITS-BASE.txt. Determinism proven for
   qwen3/qwen35 across processes; other six recorded once. Baseline failures (partial) in BASELINE-FAILURES.md.
 - Running: P4 (CUDA kv stride), R2 (stores on SlotPool), WC1 (compiler streamability), WC3 (CUDA expert table).
+
+### M10 — 2026-11-10: R2 merged (runtime stores on SlotPools)
+- `sc/r2-stores-on-slots` (ba706c77c..6137440e4): kv and rs stores take device ids from SlotPools built from
+  `Capabilities.chunks` (else degenerate facts); each pinned shape is a one-shape `ShapePool` (lowest free first,
+  epoch recycle kept), so engines see exactly the old ids (randomized old-vs-new id test, 40 seeds x 600 ops).
+  `SeatBook`, `Extent`, `ExtentPool` deleted; `store/grow.rs` (`Grow`) implements the governor's `PoolTarget`;
+  `PoolPort::{chunk_stats, grow}`; `SlotMeter` exact byte attrs (now incl. rs buffer pages); fixed-set rule
+  corrected in slots.rs (`COW_SETS_PER_LANE = 1`); suspended checkpoints keep their cache hold across the move.
+- E2E (separate processes, CUDA): Qwen3-0.6B and Qwen3.5-0.8B — same tokens and all 132 lane lines identical
+  (page ids, seats, state slots).
+- Left: holders partial (kv cache entries/snapshots not per-holder yet); seat reuse order is lowest-first (was
+  most-recently-freed); `Grow` still splits bytes kv/state with 1-byte segments and no evacuation; `RsUnits` and
+  old stats views remain as thin views; shared-pool / pieced facts are refused at boot until engines report them.
+- Verified on new-memory: `cargo check` runtime + worker; `runtime --lib store::` 63/63.
+- Running: P4 (CUDA kv stride), WC1 (compiler streamability), WC3 (CUDA expert table).
