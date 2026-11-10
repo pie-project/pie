@@ -178,9 +178,9 @@ pub struct SlotShape {
     pub kind: SlotKind,
     pub slot_bytes: u64,
     pub slots_per_chunk: u32,
-    /// The sets of a fixed shape's slots one working set holds: the running
-    /// set and the one a fire writes copy-on-write (2). 1 for list and ring
-    /// shapes, whose slots a working set holds as it grows.
+    /// The sets of a shape's slots one working set holds: 1 for every kind.
+    /// A fixed shape's copy-on-write record is not the working set's: the
+    /// runtime holds one a lane a fire runs.
     pub sets_per_working_set: u32,
     /// The trace's cache rows the slot lays out, in order (layer-major);
     /// empty where the engine does not say.
@@ -208,13 +208,11 @@ pub struct Pinned {
 }
 
 impl SlotKind {
-    /// Two sets for a fixed shape, one for the others.
+    /// One set a working set, of every kind: a fixed shape's copy-on-write
+    /// reserve is a record a running lane, held by the runtime.
     #[must_use]
     pub const fn sets_per_working_set(self) -> u32 {
-        match self {
-            SlotKind::Fixed { .. } => 2,
-            SlotKind::List { .. } | SlotKind::Ring { .. } => 1,
-        }
+        1
     }
 
     #[must_use]
