@@ -826,6 +826,8 @@ fn envelope_update_appended() {
                     ArgValue::I32(page_size as i32),
                     ArgValue::I32(kv_heads as i32),
                     ArgValue::I32(head_dim as i32),
+                    // pages packed: a page's tokens apart
+                    ArgValue::I64((page_size * token) as i64),
                     ctx.stage(),
                 ],
             )
