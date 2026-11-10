@@ -746,6 +746,7 @@ pub struct ExportedKv {
 }
 
 impl Pools {
+    #[allow(clippy::too_many_arguments)]
     pub fn reserve(
         device: i32,
         utilization: f64,

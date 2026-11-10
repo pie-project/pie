@@ -144,7 +144,7 @@ impl SlotShape {
             bytes,
             record,
             pieces_per_ws,
-            pieces,
+            rows,
             ..
         } = layout
         else {
@@ -168,10 +168,10 @@ impl SlotShape {
             per_chunk: per_chunk.max(1),
             grain: gcd(chunk_bytes, *bytes),
             window: None,
-            rows: pieces
+            rows: rows
                 .iter()
-                .filter_map(|piece| match piece.row {
-                    RowId::Cache(row) => Some((row, piece.offset)),
+                .filter_map(|run| match run.row {
+                    RowId::Cache(row) => Some((row, run.offset)),
                     RowId::Rs(_) | RowId::Pool(_) => None,
                 })
                 .collect(),
