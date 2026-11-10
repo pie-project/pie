@@ -134,10 +134,6 @@ pub(super) fn fixture_from(trace: Trace, name: &str) -> Fixture {
     }
 }
 
-fn load(fixture: &Fixture) -> Shell {
-    load_with(fixture, CONTEXT)
-}
-
 pub(super) fn load_with(fixture: &Fixture, context: u32) -> Shell {
     load_near(fixture, context, None)
 }
