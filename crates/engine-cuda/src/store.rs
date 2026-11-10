@@ -691,10 +691,26 @@ impl Shelf {
                 if crate::device::ctx::bind_thread(ordinal).is_err() {
                     return;
                 }
+                let asked: usize = sizes.iter().sum();
+                let mut locked = 0usize;
                 for (chunk, bytes) in sizes.into_iter().enumerate() {
                     let held = huge_tier(bytes)
                         .or_else(|| crate::device::Pinned::mapped_uninit(bytes).ok());
                     let failed = held.is_none();
+                    if failed {
+                        eprintln!(
+                            "engine-cuda: WARNING: the host tier could page-lock {} MiB of the \
+                             {} MiB it was seated with; chunk {chunk} ({} MiB) did not lock. A \
+                             slot copy to the host tier past what is locked will fail. Lower \
+                             the host budget or give the machine (its container) more \
+                             memory.",
+                            locked >> 20,
+                            asked >> 20,
+                            bytes >> 20
+                        );
+                    } else {
+                        locked += bytes;
+                    }
                     if send.send((chunk, held)).is_err() || failed {
                         return;
                     }
@@ -2946,6 +2962,23 @@ impl Pools {
     /// its own from the seating on ([`Shelf::pin_ahead`]), so the whole
     /// budget is page-locked soon after and no copy locks a page itself.
     pub fn seat_tier(&mut self, budget: u64) {
+        // No more than the machine has free to page-lock, known now (the
+        // device runtime's pinned allocations answer to no lock limit). A
+        // tier stated larger would fail at the first copy past what locks,
+        // mid-serve.
+        let lockable = crate::weights::available_memory();
+        let budget = if budget > lockable {
+            eprintln!(
+                "engine-cuda: WARNING: the host tier's budget of {} MiB is more than this \
+                 machine has free to page-lock ({} MiB); the tier is seated with {} MiB",
+                budget >> 20,
+                lockable >> 20,
+                lockable >> 20
+            );
+            lockable
+        } else {
+            budget
+        };
         let chunk = self.chunks.layout().chunk_bytes;
         let chunks = u32::try_from(budget.checked_div(chunk).unwrap_or(0)).unwrap_or(u32::MAX);
         self.tier = (chunks > 0).then(|| {
