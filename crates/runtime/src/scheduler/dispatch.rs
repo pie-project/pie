@@ -121,7 +121,7 @@ pub(crate) enum TierKind {
     Rs,
     /// Recurrent buffer pages.
     RsPages,
-    /// A ring's pages, moved through the windowed kv planes.
+    /// A window list's pages, moved through the windowed kv planes.
     Window,
 }
 

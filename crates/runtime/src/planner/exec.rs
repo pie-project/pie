@@ -171,7 +171,7 @@ impl Move {
             .collect();
         if let Some(rs) = rs.as_ref() {
             let plan = rs.copy_plan();
-            let pages = if rs.is_ring() {
+            let pages = if rs.is_window() {
                 TierKind::Window
             } else {
                 TierKind::RsPages

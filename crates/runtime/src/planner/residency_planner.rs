@@ -239,7 +239,11 @@ impl ResidencyPlanner {
         let (_, slots) = stores.rs.lock().unwrap().reclaim_tail(Installed);
         let bytes = self.bytes_of(Reclaim {
             pages: kv,
-            rs: RsUnits { slots, pages: 0 },
+            rs: RsUnits {
+                slots,
+                pages: 0,
+                ..RsUnits::default()
+            },
         });
         let tail = if kv == 0 && slots == 0 { 0 } else { bytes };
         self.short.lock().note_tail(tail);
@@ -624,6 +628,7 @@ impl ResidencyPlanner {
                 RsUnits {
                     slots: proc.peak.1.slots.max(rs.slots),
                     pages: proc.peak.1.pages.max(rs.pages),
+                    ..RsUnits::default()
                 },
             );
         }
@@ -869,6 +874,7 @@ impl ResidencyPlanner {
             rs: RsUnits {
                 slots: u32::MAX,
                 pages: u32::MAX,
+                ..RsUnits::default()
             },
         };
         let (picks, unhostable) =

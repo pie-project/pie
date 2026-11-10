@@ -202,7 +202,7 @@ pub fn shared_stores(shared: &Shared, kv_page_size: u32, max_context: usize) -> 
         kv.set_domain(identity.domain());
     }
     let rs = RsStore::shared(shared);
-    kv.set_keeps(kv_sharing() && records == 0 && !rs.is_ring());
+    kv.set_keeps(kv_sharing() && records == 0 && !rs.is_window());
     kv.set_page_size(kv_page_size);
     Stores {
         kv: Arc::new(parking_lot::Mutex::new(kv)),

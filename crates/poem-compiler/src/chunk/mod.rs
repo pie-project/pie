@@ -5,10 +5,11 @@
 //! Three slot shapes. A **list** slot holds `T` tokens of every
 //! full-retention kv row, layer-major (each row a contiguous run of
 //! `T x row bytes`). A **window list** is a list of the window rows sharing
-//! one window, one a distinct window, its slots of the same `T` (the kv page
-//! size): a working set holds slots in token order like the kv list and
-//! drops each once it lies wholly behind the window, so it holds about
-//! `ceil(window / T) + 1` of them. An **rs list** slot holds `T_rs` tokens
+//! one window, one a distinct window, its slots of `T_w` tokens of its own
+//! (a power of two no larger than the kv page `T`, chosen by waste): a
+//! working set holds slots in token order like the kv list and drops each
+//! once it lies wholly behind the window, so it holds about
+//! `ceil(window / T_w) + 1` of them. An **rs list** slot holds `T_rs` tokens
 //! of the rs buffer (a deferred-commit recurrence's unfolded inputs, an
 //! n-gram id window's unfolded ids), every row's planes, layer-major like
 //! the list ([`RsLayout`]); a lane holds as many as its unfolded tokens
@@ -163,7 +164,7 @@ pub enum SlotLayout {
     /// `tokens` tokens of each row, layer-major. With a `window`, a window
     /// list: its rows retain `window` tokens, and a working set's slots
     /// wholly behind them are dropped (the table keeps its token-order
-    /// length, a dropped slot the null ref); `tokens` is the kv list's.
+    /// length, a dropped slot the null ref); `tokens` is its own `T_w`.
     List {
         tokens: u32,
         bytes: u64,
@@ -696,47 +697,80 @@ pub fn plan(
     let mut token_shapes = Vec::new();
     let mut fixed_rows: Vec<FixedRow> = census.fixed;
 
-    // The kv list (every full-retention row, of every space), then a window
-    // list a distinct window, narrowest first: each slot `T` tokens, the kv
-    // page size, one for every list.
-    let mut groups: Vec<(Option<u32>, Vec<&TokenRow>)> = Vec::new();
+    // The kv list: every full-retention row, of every space, `T` tokens a
+    // slot (the kv page size).
     let full: Vec<&TokenRow> = census
         .tokens
         .iter()
         .filter(|r| r.window.is_none())
         .collect();
-    if !full.is_empty() {
-        groups.push((None, full));
-    }
     let mut windows: BTreeMap<u32, Vec<&TokenRow>> = BTreeMap::new();
     for row in &census.tokens {
         if let Some(window) = row.window {
             windows.entry(window).or_default().push(row);
         }
     }
-    groups.extend(windows.into_iter().map(|(w, rows)| (Some(w), rows)));
-    if !groups.is_empty() {
-        let base = census
-            .tokens
-            .iter()
-            .fold(TOKEN_GRAIN, |base, r| census::lcm(base, r.ratio));
-        let tokens = page_tokens(
-            groups.iter().map(|(_, rows)| rows.as_slice()),
+    let base = census
+        .tokens
+        .iter()
+        .fold(TOKEN_GRAIN, |base, r| census::lcm(base, r.ratio));
+    // The kv page; with no kv list, the page every window list's rows would
+    // run [`MIN_RUN`] at, the most tokens a window slot is weighed at.
+    let page = if full.is_empty() {
+        page_tokens(
+            windows.values().map(Vec::as_slice),
             base,
             device.most(),
             align,
-        );
-        for (window, rows) in &groups {
-            let (bytes, runs, short) = token_layout(rows, tokens, align);
-            short_runs.extend(short);
-            token_shapes.push(SlotLayout::List {
-                tokens,
-                bytes,
-                rows: runs,
-                window: *window,
-            });
-        }
+        )
+    } else {
+        page_tokens(
+            core::iter::once(full.as_slice()),
+            base,
+            device.most(),
+            align,
+        )
+    };
+    if !full.is_empty() {
+        let (bytes, runs, short) = token_layout(&full, page, align);
+        short_runs.extend(short);
+        token_shapes.push(SlotLayout::List {
+            tokens: page,
+            bytes,
+            rows: runs,
+            window: None,
+        });
     }
+    // A window list a distinct window, narrowest first, each slot `T_w`
+    // tokens of its own: the slot sizes weighed are the powers of two from
+    // [`TOKEN_GRAIN`] (a multiple of its rows' compression) to the kv page,
+    // chosen per chunk by what a trimmed list holds past its window
+    // ([`pick_window`]). A short window's runs may stay under
+    // [`MIN_RUN`]: a fire reads a window's few slots.
+    let window_shapes: Vec<Vec<SlotLayout>> = windows
+        .iter()
+        .map(|(&window, rows)| {
+            let grain = rows
+                .iter()
+                .fold(TOKEN_GRAIN, |base, r| census::lcm(base, r.ratio));
+            core::iter::successors(Some(grain.min(page)), |t| t.checked_mul(2))
+                .take_while(|&t| t <= page)
+                .chain(core::iter::once(page))
+                .filter(|t| t % grain == 0 || *t == page)
+                .collect::<std::collections::BTreeSet<u32>>()
+                .into_iter()
+                .map(|tokens| {
+                    let (bytes, runs, _) = token_layout(rows, tokens, align);
+                    SlotLayout::List {
+                        tokens,
+                        bytes,
+                        rows: runs,
+                        window: Some(window),
+                    }
+                })
+                .collect()
+        })
+        .collect();
     for row in census.tokens.iter().chain(&census.rs_rows) {
         shards.insert(row.id, row.shard.clone());
     }
@@ -784,6 +818,11 @@ pub fn plan(
     let least = token_shapes
         .iter()
         .map(SlotLayout::bytes)
+        .chain(
+            window_shapes
+                .iter()
+                .filter_map(|c| c.iter().map(SlotLayout::bytes).min()),
+        )
         .chain(whole.map(|(_, bytes)| bytes))
         .chain(rs_token)
         .chain(expert)
@@ -826,22 +865,37 @@ pub fn plan(
         if rs.is_none() && !rs_shapes.is_empty() {
             continue;
         }
+        let Some(lists) = window_shapes
+            .iter()
+            .map(|c| pick_window(c, chunk, device.context))
+            .collect::<Option<Vec<SlotLayout>>>()
+        else {
+            continue;
+        };
         let Some(slots) = weights::layout(&weight_groups, chunk, align, device.cut_experts) else {
             continue;
         };
-        weighed.push((chunk, pick, rs, weights::tail(&slots, chunk)));
+        weighed.push((chunk, pick, rs, lists, weights::tail(&slots, chunk)));
     }
     let fill = weighed
         .iter()
         .map(|(.., tail)| *tail)
         .fold(f64::INFINITY, f64::min);
-    let mut best: Option<(u64, Waste, Option<FixedPick>, Option<RsShape>)> = None;
-    for (chunk, pick, rs, tail) in weighed {
+    type Best = (
+        u64,
+        Waste,
+        Option<FixedPick>,
+        Option<RsShape>,
+        Vec<SlotLayout>,
+    );
+    let mut best: Option<Best> = None;
+    for (chunk, pick, rs, lists, tail) in weighed {
         if tail > fill + WEIGHT_TAIL_SLACK {
             continue;
         }
+        let shapes: Vec<SlotLayout> = token_shapes.iter().chain(&lists).cloned().collect();
         let waste = weigh(
-            &token_shapes,
+            &shapes,
             rs.as_ref(),
             pick.as_ref(),
             record,
@@ -861,11 +915,11 @@ pub fn plan(
             }
         };
         if better {
-            best = Some((chunk, waste, pick, rs));
+            best = Some((chunk, waste, pick, rs, lists));
         }
     }
-    let (chunk_bytes, mut waste, pick, rs_pick) =
-        best.unwrap_or((least, Waste::default(), None, None));
+    let (chunk_bytes, mut waste, pick, rs_pick, lists) =
+        best.unwrap_or((least, Waste::default(), None, None, Vec::new()));
     let weights = weights::layout(&weight_groups, chunk_bytes, align, device.cut_experts)
         .ok_or_else(|| ChunkError::Expert {
             bytes: weight_groups
@@ -905,6 +959,7 @@ pub fn plan(
             },
         );
     }
+    slots.extend(lists);
     if let Some(pick) = pick {
         let (pieces_per_ws, rows) =
             fixed::pack(&fixed_rows, pick.packing(align), true).unwrap_or((0, Vec::new()));
@@ -964,8 +1019,8 @@ fn slot_bytes(rows: &[&TokenRow], tokens: u32, align: u64) -> u64 {
     )
 }
 
-/// The kv page size `T` every list shares (the kv list's and each window
-/// list's): the fewest tokens, a multiple of `base`, at which every layer of
+/// The kv page size `T` of `lists` (the kv list's; with no kv list, every
+/// window list's, the most a window slot is weighed at): the fewest tokens, a multiple of `base`, at which every layer of
 /// every list runs [`MIN_RUN`] bytes, unless a list's slot would outgrow
 /// `most`; then the most tokens at which every list's slot fits.
 fn page_tokens<'a>(
@@ -1027,6 +1082,36 @@ fn token_layout(rows: &[&TokenRow], tokens: u32, align: u64) -> (u64, Vec<TokenR
         .map(|(_, first)| *first)
         .collect();
     (slot_bytes(rows, tokens, align), runs, short)
+}
+
+/// What a working set's slots of window list `shape` hold past the rows
+/// its window retains at `context` (a trimmed list holds about
+/// `ceil(window / T_w) + 1` slots), and its share of the room past the last
+/// whole slot of chunks of `chunk` bytes.
+fn window_waste(shape: &SlotLayout, chunk: u64, context: u32) -> u64 {
+    let bytes = shape.bytes().max(1);
+    let per = (chunk / bytes).max(1);
+    let slots = shape.slots_per_ws(context);
+    let per_token: u64 = shape.runs().iter().map(|r| r.per_token).sum();
+    let held = u64::from(shape.window().unwrap_or(context).min(context)) * per_token;
+    (slots * bytes).saturating_sub(held) + slots * (chunk.saturating_sub(per * bytes)) / per
+}
+
+/// The window list's slot for chunks of `chunk` bytes: of the `shapes` a
+/// chunk holds, the one that wastes least ([`window_waste`]), the more
+/// tokens on a tie (a shorter table).
+fn pick_window(shapes: &[SlotLayout], chunk: u64, context: u32) -> Option<SlotLayout> {
+    shapes
+        .iter()
+        .filter(|s| s.bytes() <= chunk)
+        .min_by_key(|s| {
+            let tokens = match s {
+                SlotLayout::List { tokens, .. } => *tokens,
+                _ => 0,
+            };
+            (window_waste(s, chunk, context), core::cmp::Reverse(tokens))
+        })
+        .cloned()
 }
 
 /// An rs-list slot of `tokens` tokens: its bytes, and a token's bytes of

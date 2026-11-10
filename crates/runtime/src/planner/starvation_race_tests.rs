@@ -215,7 +215,11 @@ fn a_head_short_of_state_beside_free_pages_is_funded_by_eviction() {
     }
     planner.with_inner(|inner| {
         for (pid, kv_pages, slots) in [(head, 0, 2), (younger, 1, 0)] {
-            let rs = RsUnits { slots, pages: 0 };
+            let rs = RsUnits {
+                slots,
+                pages: 0,
+                ..RsUnits::default()
+            };
             inner.enqueue(pid, allocation(Demand { kv_pages, rs }));
         }
     });
@@ -224,7 +228,11 @@ fn a_head_short_of_state_beside_free_pages_is_funded_by_eviction() {
         victims.deficit,
         Reclaim {
             pages: 0,
-            rs: RsUnits { slots: 1, pages: 0 }
+            rs: RsUnits {
+                slots: 1,
+                pages: 0,
+                ..RsUnits::default()
+            }
         }
     );
     assert_eq!(victims.members.len(), 1);
@@ -243,7 +251,11 @@ fn a_wedged_head_short_of_state_alone_still_reclaims_by_restart() {
         .rs
         .lock()
         .unwrap()
-        .reserve(RsUnits { slots: 2, pages: 0 })
+        .reserve(RsUnits {
+            slots: 2,
+            pages: 0,
+            ..RsUnits::default()
+        })
         .unwrap();
     let pool = Arc::new(RacePool {
         rs_model: Some(model),
@@ -254,7 +266,11 @@ fn a_wedged_head_short_of_state_alone_still_reclaims_by_restart() {
     let mut keys = Vec::new();
     planner.with_inner(|inner| {
         for (pid, kv_pages, slots) in [(head, 0, 1), (younger, 1, 0)] {
-            let rs = RsUnits { slots, pages: 0 };
+            let rs = RsUnits {
+                slots,
+                pages: 0,
+                ..RsUnits::default()
+            };
             let seq = inner.next_seq;
             inner.next_seq += 1;
             let mut proc = Proc::new(seq);
@@ -895,7 +911,11 @@ async fn a_lane_holding_the_whole_state_pool_is_told_so() {
             pid,
             Demand {
                 kv_pages: 0,
-                rs: RsUnits { slots: 1, pages: 0 },
+                rs: RsUnits {
+                    slots: 1,
+                    pages: 0,
+                    ..RsUnits::default()
+                },
             },
         )
         .await
@@ -911,9 +931,9 @@ async fn a_lane_holding_the_whole_state_pool_is_told_so() {
     );
 }
 
-/// A ring model's store: a window of 32 tokens over 16-token pages,
-/// 8 windowed page ids of which 0 is the null page.
-fn ring_model() -> usize {
+/// A windowed model's store: a window of 32 tokens over 16-token slots,
+/// 8 window slot ids of which 0 is the null page.
+fn window_model() -> usize {
     crate::store::registry::register_model_with_swap(
         16,
         &[64],
@@ -928,13 +948,13 @@ fn ring_model() -> usize {
     )
 }
 
-/// The pages a fire of `rows` tokens from `held` writes, and how it
-/// moves its ring when it commits them all.
-fn ring_fire(held: u32, rows: u32) -> (Vec<u32>, crate::store::rs::RingAdvance) {
+/// The rows a fire of `rows` tokens from `held` lands, and how it moves
+/// its window when it commits them all.
+fn window_fire(held: u32, rows: u32) -> (std::ops::Range<u32>, crate::store::rs::WindowAdvance) {
     let end = held + rows;
     (
-        (held / 16..=(end - 1) / 16).collect(),
-        crate::store::rs::RingAdvance {
+        held..end,
+        crate::store::rs::WindowAdvance {
             positioned: true,
             settled: held,
             reach: held,
@@ -945,21 +965,21 @@ fn ring_fire(held: u32, rows: u32) -> (Vec<u32>, crate::store::rs::RingAdvance) 
     )
 }
 
-fn ring_demand(
+fn window_demand(
     stores: &crate::store::registry::Stores,
     ws: crate::store::rs::RsWorkingSetId,
     held: u32,
     rows: u32,
 ) -> Demand {
-    let (pages, _) = ring_fire(held, rows);
+    let (rows, _) = window_fire(held, rows);
     Demand {
         kv_pages: 0,
-        rs: stores.rs.lock().unwrap().ring_demand(ws, &pages).unwrap(),
+        rs: stores.rs.lock().unwrap().window_demand(ws, rows).unwrap(),
     }
 }
 
 /// Fires from the grant; the published write is settled unless `hold`.
-fn ring_write(
+fn window_write(
     stores: &crate::store::registry::Stores,
     ws: crate::store::rs::RsWorkingSetId,
     held: u32,
@@ -967,13 +987,13 @@ fn ring_write(
     mut grant: AllocationGrant,
     hold: bool,
 ) -> Option<crate::store::rs::write::RsPublished> {
-    let (pages, advance) = ring_fire(held, rows);
+    let (rows, advance) = window_fire(held, rows);
     let mut rs = stores.rs.lock().unwrap();
     let prepared = rs
-        .prepare_ring(ws, &pages, Some(grant.lend_rs()))
+        .prepare_window(ws, rows, Some(grant.lend_rs()))
         .expect("the grant covers the claim");
     let published = rs.publish_prepared(prepared).unwrap();
-    rs.ring_advance(ws, advance, &(0..64).collect::<Vec<u32>>());
+    rs.window_advance(ws, advance);
     if hold {
         return Some(published);
     }
@@ -987,7 +1007,7 @@ fn ring_write(
 #[tokio::test(flavor = "current_thread")]
 async fn a_fire_short_of_windowed_pages_waits_for_a_window_to_move_on() {
     let _schedule = crate::policy::schedule::TEST_LOCK.read().await;
-    let model = ring_model();
+    let model = window_model();
     let stores = crate::store::registry::get(model, 0);
     let geom = crate::store::rs::RsGeometry {
         state_size: 0,
@@ -1010,9 +1030,9 @@ async fn a_fire_short_of_windowed_pages_waits_for_a_window_to_move_on() {
         _ => panic!("a grant"),
     };
 
-    let prefill = ring_demand(&stores, a, 0, 96);
+    let prefill = window_demand(&stores, a, 0, 96);
     assert_eq!(prefill.rs.pages, 6);
-    let in_flight = ring_write(
+    let in_flight = window_write(
         &stores,
         a,
         0,
@@ -1021,7 +1041,7 @@ async fn a_fire_short_of_windowed_pages_waits_for_a_window_to_move_on() {
         true,
     );
 
-    let short = ring_demand(&stores, b, 0, 64);
+    let short = window_demand(&stores, b, 0, 64);
     assert_eq!(short.rs.pages, 4);
     let p = planner.clone();
     let parked = crate::rt::spawn(async move { p.acquire(pb, pb, short).await });
@@ -1049,7 +1069,7 @@ async fn a_fire_short_of_windowed_pages_waits_for_a_window_to_move_on() {
     );
     let grant = granted(parked.await.expect("the parked task"));
     assert_eq!(grant.remaining_rs().pages, 4);
-    ring_write(&stores, b, 0, 64, grant, false);
+    window_write(&stores, b, 0, 64, grant, false);
 }
 
 // A lone sequence is served by the pages its own window moved past,
@@ -1060,7 +1080,7 @@ async fn a_lone_window_is_served_by_what_it_moved_past_or_told_it_never_fits() {
     let _schedule = crate::policy::schedule::TEST_LOCK.read().await;
     use crate::inferlet::process::residency::{ProcessResidency, register_residency};
 
-    let model = ring_model();
+    let model = window_model();
     let stores = crate::store::registry::get(model, 0);
     let ws = stores
         .rs
@@ -1087,11 +1107,11 @@ async fn a_lone_window_is_served_by_what_it_moved_past_or_told_it_never_fits() {
         let planner = planner.clone();
         let stores = stores.clone();
         async move {
-            let demand = ring_demand(&stores, ws, held, rows);
+            let demand = window_demand(&stores, ws, held, rows);
             let Acquired::Granted(grant) = planner.acquire(pid, pid, demand).await? else {
                 panic!("a resident process is never yielded");
             };
-            ring_write(&stores, ws, held, rows, grant, false);
+            window_write(&stores, ws, held, rows, grant, false);
             Ok::<(), PlannerError>(())
         }
     };
@@ -1124,13 +1144,22 @@ fn a_seated_lane_grows_before_a_prompt_waiting_to_be_seated() {
         planner.register(pid);
         planner.note_admitted(pid);
     }
-    let ring = RsUnits { slots: 0, pages: 2 };
-    let prompt = RsUnits { slots: 0, pages: 3 };
+    let ring = RsUnits {
+        slots: 0,
+        pages: 2,
+        ..RsUnits::default()
+    };
+    let prompt = RsUnits {
+        slots: 0,
+        pages: 3,
+        ..RsUnits::default()
+    };
     planner.with_inner(|inner| {
         inner.procs.get_mut(&seated).unwrap().seated = true;
         let roomy = RsUnits {
             slots: 0,
             pages: 320,
+            ..RsUnits::default()
         };
         assert_eq!(
             inner.seating_reserve(older, ring, prompt, roomy),
@@ -1144,10 +1173,15 @@ fn a_seated_lane_grows_before_a_prompt_waiting_to_be_seated() {
                 prompt,
                 RsUnits {
                     slots: 0,
-                    pages: 32
+                    pages: 32,
+                    ..RsUnits::default()
                 }
             ),
-            RsUnits { slots: 0, pages: 1 },
+            RsUnits {
+                slots: 0,
+                pages: 1,
+                ..RsUnits::default()
+            },
             "and the growth holds back at most a thirty-second of the ring"
         );
         assert!(inner.seating_reserve(seated, ring, prompt, roomy).is_zero());
@@ -1214,10 +1248,12 @@ impl PoolPort for RingPool {
             RsUnits {
                 slots: 0,
                 pages: free,
+                ..RsUnits::default()
             },
             RsUnits {
                 slots: 0,
                 pages: self.total,
+                ..RsUnits::default()
             },
         )
     }
@@ -1237,7 +1273,11 @@ impl PoolPort for RingPool {
         (0, 0)
     }
     fn rs_growth(&self) -> RsUnits {
-        RsUnits { slots: 0, pages: 2 }
+        RsUnits {
+            slots: 0,
+            pages: 2,
+            ..RsUnits::default()
+        }
     }
     fn reserve_device(&self, _count: u32) -> Option<Vec<PhysicalKvPageId>> {
         Some(Vec::new())
@@ -1295,6 +1335,7 @@ fn prompts_seated_at_once_leave_the_seated_lanes_their_growth() {
         rs: RsUnits {
             slots: 0,
             pages: PROMPT,
+            ..RsUnits::default()
         },
     };
     let start = std::sync::Barrier::new(pids.len());

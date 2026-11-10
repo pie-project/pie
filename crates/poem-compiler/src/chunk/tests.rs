@@ -138,15 +138,18 @@ fn full_rows_of_every_space_share_one_list_and_a_window_lists_at_its_page() {
         unreachable!()
     };
     assert_eq!(*retained, 1024);
-    assert_eq!(*tokens, page, "a window list's slot is the kv page");
+    assert!(
+        tokens.is_power_of_two() && *tokens >= TOKEN_GRAIN && *tokens <= page,
+        "a window list's slot is a power of two up to the kv page: {tokens}"
+    );
     assert_eq!(rows.len(), 8);
     // A working set holds the slots its window covers and the one its
     // oldest row retires from, never more than its context fills.
     assert_eq!(
         windows[0].slots_per_ws(1 << 20),
-        u64::from(1024u32.div_ceil(page) + 1)
+        u64::from(1024u32.div_ceil(*tokens) + 1)
     );
-    assert_eq!(windows[0].slots_per_ws(page), 1);
+    assert_eq!(windows[0].slots_per_ws(*tokens), 1);
     assert_eq!(
         recipe.chunk_bytes % bytes,
         0,
@@ -323,9 +326,9 @@ fn a_tiled_profile_aligns_every_row_and_slot_to_its_tile() {
 }
 
 #[test]
-fn every_distinct_window_is_a_window_list_of_the_kv_page_however_small() {
+fn every_distinct_window_is_a_window_list_of_its_own_slot_however_small() {
     let caches = vec![
-        kv("kv.0", 512, None),
+        kv("kv.0", 32, None),
         kv("swa.0", 64, Some(64)),
         kv("swa.1", 64, Some(64)),
         kv("swa.2", 128, Some(4096)),
@@ -347,8 +350,18 @@ fn every_distinct_window_is_a_window_list_of_the_kv_page_however_small() {
             _ => unreachable!(),
         })
         .collect();
-    assert_eq!(windows, vec![(Some(64), *page, 2), (Some(4096), *page, 1)]);
-    assert!(recipe.shapes().contains(&format!("W64:{page}x")));
+    assert_eq!(windows.len(), 2);
+    assert_eq!((windows[0].0, windows[0].2), (Some(64), 2));
+    assert_eq!((windows[1].0, windows[1].2), (Some(4096), 1));
+    for &(_, tokens, _) in &windows {
+        assert!(tokens.is_power_of_two() && tokens <= *page);
+    }
+    // A short window takes a short slot: 64 rows in 16-token slots hold
+    // 80 of them, in slots of the kv page (or more) far more.
+    assert!(windows[0].1 < *page, "{windows:?} beside a page of {page}");
+    let narrow = recipe.windows().next().unwrap();
+    assert!(recipe.shapes().contains(&format!("W64:{}x", windows[0].1)));
+    assert!(narrow.slots_per_ws(1 << 20) <= u64::from(64u32.div_ceil(windows[0].1) + 1));
 }
 
 #[test]

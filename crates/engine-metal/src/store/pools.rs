@@ -167,10 +167,12 @@ pub struct Rows {
     pub tokens: u32,
     pub fixed_bytes: u64,
     pub pieces: u32,
-    /// The window list's slot bytes (CONTRACT-BC 19) and the rows its
-    /// window retains; zero where nothing is windowed.
+    /// The window list's slot bytes (CONTRACT-BC 19), the rows its window
+    /// retains and the tokens (`T_w`) a slot holds (CONTRACT-BC 21); zero
+    /// where nothing is windowed.
     pub window_bytes: u64,
     pub window_rows: u32,
+    pub window_tokens: u32,
     /// How each kv space is paged, by space.
     pub spaces: Vec<SpacePaging>,
     /// What one physical list slot's tokens take in the side planes.
@@ -276,10 +278,10 @@ impl Rows {
         } else {
             tokens
         };
-        if window_bytes > 0 && window_tokens != tokens {
+        if window_bytes > 0 && (window_tokens == 0 || window_tokens > tokens) {
             return Err(disagree(format!(
                 "pages windowed rows {window_tokens} tokens a window slot beside {tokens}-token \
-                 kv pages, where a window list's slot is one kv page"
+                 kv pages, where a window list's slot holds no more than a kv page"
             )));
         }
         let mut spaces: Vec<Option<SpacePaging>> = Vec::new();
@@ -430,6 +432,7 @@ impl Rows {
             pieces,
             window_bytes,
             window_rows,
+            window_tokens,
             spaces: spaces
                 .into_iter()
                 .map(|paging| paging.unwrap_or(SpacePaging::List))
@@ -753,6 +756,18 @@ impl Pools {
         self.spaces.get(space).copied().unwrap_or(SpacePaging::List)
     }
 
+    /// The window list's paging: `T_w` tokens a page (CONTRACT-BC 21),
+    /// as many pages a seat as its context fills.
+    #[must_use]
+    pub fn window_paging(&self) -> Paging {
+        let tokens = self.layout.window_tokens.max(1);
+        Paging {
+            page_size: tokens,
+            pages_per_slot: self.paging.context().div_ceil(tokens).max(1),
+            ..self.paging
+        }
+    }
+
     /// What a window page id counts: `gcd(chunk, window slot)` bytes.
     fn window_stride(&self) -> u64 {
         self.layout.window.map_or(256, |window| {
@@ -760,8 +775,8 @@ impl Pools {
         })
     }
 
-    /// A lane's window pages as kernels address them, one a kv page in
-    /// token order: `refs` (window slot refs, 0 a slot trimmed behind the
+    /// A lane's window pages as kernels address them, one a window slot
+    /// (`T_w` tokens) in token order: `refs` (window slot refs, 0 a slot trimmed behind the
     /// window: the null chunk) as units of [`Pools::window_stride`], or,
     /// seat-addressed, seat `seat`'s run, `pages` of them.
     pub fn window_pages(&self, refs: &[u32], seat: Option<(u32, u32)>) -> Result<Vec<u32>> {
@@ -779,7 +794,7 @@ impl Pools {
         if let Some((slot, pages)) = seat
             && refs.is_empty()
         {
-            let first = u64::from(slot) * u64::from(self.paging.pages_per_slot);
+            let first = u64::from(slot) * u64::from(self.window_paging().pages_per_slot);
             return (0..pages)
                 .map(|page| {
                     let id = u32::try_from(first + u64::from(page)).unwrap_or(u32::MAX);
@@ -1018,7 +1033,9 @@ impl Pools {
                     band_of.push(None);
                     let (stride, page_size) = match self.space_paging(space as usize) {
                         SpacePaging::List => (list_bytes, self.paging.page_size),
-                        SpacePaging::Window => (self.window_stride(), self.paging.page_size),
+                        SpacePaging::Window => {
+                            (self.window_stride(), self.window_paging().page_size)
+                        }
                     };
                     CachePool::Kv(KvPool {
                         keys: plane(u64::from(kv_heads) * u64::from(head_dim))?,

@@ -99,11 +99,13 @@ pub struct Layout {
     pub pieces: u32,
     pub list: Option<Slots>,
     pub fixed: Option<Slots>,
-    /// The window list (CONTRACT-BC 19): `page_size` tokens a slot of the
-    /// windowed rows, a full-length token-order table a lane, read through
-    /// `window_rows`; slots trimmed behind the window are the null chunk.
+    /// The window list (CONTRACT-BC 19, 21): `window_tokens` (`T_w`) tokens
+    /// a slot of the windowed rows, a table in its own token order a lane,
+    /// read through `window_rows`; slots trimmed behind the window are the
+    /// null chunk.
     pub window: Option<Slots>,
     pub window_rows: u32,
+    pub window_tokens: u32,
     /// The rs list (CONTRACT-BC 18, 20): `rs_tokens` unfolded rows of every
     /// recurrent layer's rs planes a slot.
     pub rs: Option<Slots>,
@@ -137,6 +139,7 @@ impl Layout {
             fixed: Slots::of(FIXED, fixed, chunk_bytes),
             window: None,
             window_rows: 0,
+            window_tokens: 0,
             rs: None,
             rs_tokens: 0,
             seats,
@@ -163,10 +166,16 @@ impl Layout {
         Ok(layout)
     }
 
-    /// This layout with a window list of `bytes` slots read through
-    /// `rows` rows; its seat run, `pages_per_seat` slots a seat, after the
-    /// others.
-    pub fn with_window(mut self, bytes: u64, rows: u32, pages_per_seat: u32) -> Result<Layout> {
+    /// This layout with a window list of `bytes` slots of `tokens` rows,
+    /// read through `rows` rows; its seat run, `pages_per_seat` slots a
+    /// seat, after the others.
+    pub fn with_window(
+        mut self,
+        bytes: u64,
+        rows: u32,
+        tokens: u32,
+        pages_per_seat: u32,
+    ) -> Result<Layout> {
         let Some(mut window) = Slots::of(WINDOW, bytes, self.chunk_bytes) else {
             return Ok(self);
         };
@@ -182,6 +191,7 @@ impl Layout {
         window.seat_slots = seats.saturating_mul(pages_per_seat);
         self.window = Some(window);
         self.window_rows = rows;
+        self.window_tokens = tokens;
         Ok(self)
     }
 
@@ -273,13 +283,13 @@ impl Layout {
                 &rows[0],
             ));
         }
-        // The window list: a list of the kv page with its window
-        // (CONTRACT-BC 19).
+        // The window list: a list of its own slot with its window
+        // (CONTRACT-BC 19, 21).
         if let Some(window) = &self.window {
             shapes.push(shape(
                 window,
                 SlotKind::List {
-                    tokens: self.page_size,
+                    tokens: self.window_tokens,
                     rate: 1,
                     window: Some(self.window_rows),
                 },

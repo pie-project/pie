@@ -265,7 +265,7 @@ fn kv_demand(
     .map_err(|error| format!("pipeline: KV demand: {error}"))
 }
 
-/// `windowed`: the fire reads ring pages, which come back only once every
+/// `windowed`: the fire reads window slots, which come back only once every
 /// fire that read them settles, so a fire that would park settles its own
 /// tail first rather than hold back the pages parked fires wait on.
 async fn acquire_grant<C: FireContext>(
@@ -355,38 +355,28 @@ fn bound_rs_working_sets<C: FireContext>(
     Ok(Ok(ids))
 }
 
-/// The ring plan of a host fire on a model whose state is a window: each
-/// lane writes the pages its tokens land on from `held`, which every
-/// earlier token of its sequence precedes, and reads through its own pages.
-fn host_ring_plan(
+/// The window plan of a host fire on a model whose state is window lists:
+/// each lane lands its rows from `held`, which every earlier token of its
+/// sequence precedes, and reads its tables through them.
+fn host_window_plan(
     req: &crate::engine::FireRequest,
-    page_size: u32,
     fold: &geometry::Fold,
     ids: &[crate::store::rs::RsWorkingSetId],
 ) -> Result<rs::RsPlan, String> {
     if ids.is_empty() {
         return Ok(rs::RsPlan::Groups(Vec::new()));
     }
-    let page_size = page_size.max(1);
-    Ok(rs::RsPlan::Ring(
+    Ok(rs::RsPlan::Window(
         req.lanes
             .iter()
             .enumerate()
             .map(|(row, lane)| {
                 let rows = u32::try_from(lane.tokens.len()).unwrap_or(u32::MAX);
                 let end = lane.kv.held.saturating_add(rows);
-                let pages = if rows == 0 {
-                    Vec::new()
-                } else {
-                    let first = (lane.kv.held / page_size) as usize;
-                    let last = ((end - 1) / page_size) as usize;
-                    let held = lane.kv.pages.len();
-                    lane.kv.pages[first.min(held)..(last + 1).min(held)].to_vec()
-                };
-                rs::RingRow {
-                    pages,
-                    translate: lane.kv.pages.clone(),
-                    advance: crate::store::rs::RingAdvance {
+                rs::WindowRow {
+                    writes: lane.kv.held..end,
+                    reads: end,
+                    advance: crate::store::rs::WindowAdvance {
                         positioned: true,
                         settled: lane.kv.held,
                         reach: lane.kv.held,
@@ -1859,13 +1849,14 @@ fn stamp_lane_translation(
     Ok(())
 }
 
-/// The ring plan of a device-geometry fire: every row writes the pages
-/// the fire's write indexes name and reads through the working set's mapped
-/// pages. The device decides where its tokens land, so the ring keeps every
-/// page it writes and commits nothing; what it retires is behind the first
+/// The window plan of a device-geometry fire: every row lands its rows in
+/// the kv pages the fire's write indexes name (each window list's slots
+/// over them) and reads its tables through the working set's mapped pages.
+/// The device decides where its tokens land, so the windows keep every slot
+/// it writes and commit nothing; what each list retires is behind the first
 /// page it writes, where every row lands past, so a decode loop that never
-/// states its positions still holds a window and not its whole sequence.
-fn device_ring_plan(
+/// states its positions still holds its windows and not its whole sequence.
+fn device_window_plan(
     stores: &crate::store::registry::Stores,
     ws: crate::store::kv::page_table::WorkingSetId,
     write_indexes: &[u64],
@@ -1877,26 +1868,26 @@ fn device_ring_plan(
     let mapped =
         crate::store::registry::with_kv_lock(&stores.kv, "host-other", |kv| kv.mapped_len(ws))
             .map_err(|error| error.to_string())?;
-    let written: Vec<u32> = write_indexes
-        .iter()
-        .map(|&index| u32::try_from(index).unwrap_or(u32::MAX))
-        .collect();
-    let last = written.iter().copied().max();
-    let reach = written
-        .iter()
-        .copied()
-        .min()
-        .map_or(0, |first| first.saturating_mul(stores.kv_page_size));
+    let page = stores.kv_page_size.max(1);
+    let index = |at: u64| u32::try_from(at).unwrap_or(u32::MAX);
+    let first = write_indexes.iter().copied().min().map(index);
+    let last = write_indexes.iter().copied().max().map(index);
+    let reach = first.map_or(0, |first| first.saturating_mul(page));
+    let writes = match (first, last) {
+        (Some(first), Some(last)) => {
+            first.saturating_mul(page)..last.saturating_add(1).saturating_mul(page)
+        }
+        _ => 0..0,
+    };
     let extent = u32::try_from(mapped)
         .unwrap_or(u32::MAX)
         .max(last.map_or(0, |last| last.saturating_add(1)));
-    let translate: Vec<u32> = (0..extent).collect();
-    Ok(rs::RsPlan::Ring(
+    Ok(rs::RsPlan::Window(
         (0..ids.len())
-            .map(|_| rs::RingRow {
-                pages: written.clone(),
-                translate: translate.clone(),
-                advance: crate::store::rs::RingAdvance {
+            .map(|_| rs::WindowRow {
+                writes: writes.clone(),
+                reads: extent.saturating_mul(page),
+                advance: crate::store::rs::WindowAdvance {
                     positioned: false,
                     settled: 0,
                     reach,
@@ -2507,7 +2498,7 @@ pub async fn submit_pass_stamped<C: FireContext>(
                 Ok(ids) => ids,
                 Err(error) => return Ok(Err(error)),
             };
-        let ring = crate::model::model().rs_caps().window_tokens > 0;
+        let windowed = crate::model::model().rs_caps().window_tokens > 0;
         // A long host pass runs as several fires; all but the last run the
         // model's forward alone. A recurrent state folding all its rows, or
         // none, folds each fire's rows in turn.
@@ -2532,7 +2523,7 @@ pub async fn submit_pass_stamped<C: FireContext>(
             && !prologue_moves
             && (!adapted || crate::model::model().eta_caps().adapter_attachments)
             && !fire_wide_mask
-            && !ring
+            && !windowed
             && folds_all;
         let mut full = req;
         let keyed = if keyable { keyed_rows(&full) } else { 0 };
@@ -2655,7 +2646,7 @@ pub async fn submit_pass_stamped<C: FireContext>(
         // An engine that lands a lane's state at rows inside a fire is cut only
         // past as many as it lands at once.
         // A window's are landed at fire ends only.
-        let snapshots = if ring {
+        let snapshots = if windowed {
             0
         } else {
             crate::model::model().eta_caps().rs_snapshots as usize
@@ -2710,8 +2701,8 @@ pub async fn submit_pass_stamped<C: FireContext>(
             if switched.rows_read {
                 why.push("it reads out an output of rows a cut fire would not hold");
             }
-            if ring {
-                why.push("its model keeps a window ring");
+            if windowed {
+                why.push("its model keeps window lists");
             }
             if !folds_all {
                 why.push("it states where its recurrent state folds");
@@ -2814,8 +2805,8 @@ pub async fn submit_pass_stamped<C: FireContext>(
                 .map(|&group| (&group_sets[group], Written::Span(spans[group].1.clone())))
                 .collect();
             let rs_plan = || {
-                if ring {
-                    host_ring_plan(&req, page_size, &fold, &rs_ws_ids)
+                if windowed {
+                    host_window_plan(&req, &fold, &rs_ws_ids)
                 } else {
                     host_rs_plan(&stores, &rs_ws_ids, &groups, &req, &fold, &inside)
                 }
@@ -2828,7 +2819,7 @@ pub async fn submit_pass_stamped<C: FireContext>(
                 &sets,
                 &rs_ws_ids,
                 rs_plan,
-                ring,
+                windowed,
             )
             .await;
             let Reserved {
@@ -2900,7 +2891,7 @@ pub async fn submit_pass_stamped<C: FireContext>(
                 };
                 let lanes = &groups[group].1;
                 let reach = Some(u64::from(landings[lanes[0]].end()));
-                let rs = rs_ws_ids.get(lanes[0]).copied().filter(|_| !ring);
+                let rs = rs_ws_ids.get(lanes[0]).copied().filter(|_| !windowed);
                 let by = fold_at(
                     &pass_lanes,
                     lanes,
@@ -2938,7 +2929,7 @@ pub async fn submit_pass_stamped<C: FireContext>(
                     .map(|snap| at_row(snap.snapshot, slots.start + u64::from(snap.row), true)),
             );
             let rs_copy = rs_prepared.state_copy();
-            let windowed = rs_prepared.windowed_copies();
+            let window_copies = rs_prepared.windowed_copies();
             let rstxns = RsTxnsGuard::new(model, engine, rs_prepared.txn);
             let completion = ctx
                 .resources()
@@ -2963,7 +2954,7 @@ pub async fn submit_pass_stamped<C: FireContext>(
                     completion.clone(),
                     copy_src,
                     copy_dst,
-                    windowed,
+                    window_copies,
                     rs_copy,
                     piece_frames[at],
                     adapted,
@@ -3757,10 +3748,10 @@ async fn fire_device_geometry<C: FireContext>(
         Ok(ids) => ids,
         Err(error) => return Ok(Err(error)),
     };
-    let ring = crate::model::model().rs_caps().window_tokens > 0;
-    if ring && groups.len() > 1 {
+    let windowed = crate::model::model().rs_caps().window_tokens > 0;
+    if windowed && groups.len() > 1 {
         return Ok(Err(
-            "pipeline: on a model with a window ring, a pass whose rows land where the device \
+            "pipeline: on a model with window lists, a pass whose rows land where the device \
              says writes one working set"
                 .to_string(),
         ));
@@ -3771,8 +3762,8 @@ async fn fire_device_geometry<C: FireContext>(
         .map(|(set, indexes)| (set, Written::Pages(indexes.clone())))
         .collect();
     let rs_plan = || {
-        if ring {
-            device_ring_plan(&stores, ws.id, &write_indexes[0], &rs_ws_ids)
+        if windowed {
+            device_window_plan(&stores, ws.id, &write_indexes[0], &rs_ws_ids)
         } else {
             device_rs_plan(&stores, &rs_ws_ids, &groups, &pass_lanes, &fold)
         }
@@ -3785,7 +3776,7 @@ async fn fire_device_geometry<C: FireContext>(
         &sets,
         &rs_ws_ids,
         rs_plan,
-        ring,
+        windowed,
     )
     .await;
     let Reserved {
@@ -3966,7 +3957,7 @@ async fn fire_device_geometry<C: FireContext>(
         };
         // Where the rows land is the device's: the fold is placed when the
         // fire settles.
-        let rs = rs_ws_ids.get(lanes[0]).copied().filter(|_| !ring);
+        let rs = rs_ws_ids.get(lanes[0]).copied().filter(|_| !windowed);
         let by = fold_at(
             &pass_lanes,
             lanes,

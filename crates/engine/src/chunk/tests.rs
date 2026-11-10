@@ -329,17 +329,16 @@ fn window_lists(page: u32, windows: &[(u32, u32)]) -> ChunkFacts {
     }
 }
 
-/// CONTRACT-BC 19: a window list is a list shape of the kv page with its
-/// window, one a distinct window; its table may name the null ref 0 where
-/// the runtime trimmed a slot, its copies never.
+/// CONTRACT-BC 19, 21: a window list is a list shape with its window and
+/// its own tokens a slot, one a distinct window; its table may name the
+/// null ref 0 where the runtime trimmed a slot, its copies never.
 #[test]
-fn a_window_list_is_a_list_of_the_kv_page_one_a_window() {
-    window_lists(16, &[(128, 16), (1_024, 16)])
+fn a_window_list_is_a_list_of_its_own_page_one_a_window() {
+    window_lists(64, &[(128, 16), (1_024, 64)])
         .validate()
         .unwrap();
     for bad in [
-        window_lists(16, &[(128, 16), (128, 16)]),
-        window_lists(16, &[(128, 32)]),
+        window_lists(16, &[(128, 16), (128, 32)]),
         window_lists(16, &[(0, 16)]),
     ] {
         assert!(bad.validate().is_err(), "{bad:?}");
