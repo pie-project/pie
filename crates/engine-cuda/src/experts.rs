@@ -236,6 +236,9 @@ pub struct Ranking {
     floor_bytes: u64,
     sequence: Vec<GroupPlan>,
     banks: Vec<BankPlan>,
+    /// The bytes of the routed banks the weight cache takes
+    /// ([`Ranking::caching`]): on no tier this plan cuts.
+    cached_bytes: u64,
 }
 
 impl Ranking {
@@ -301,7 +304,30 @@ impl Ranking {
             floor_bytes,
             sequence: spillable.into_iter().chain(packed).collect(),
             banks,
+            cached_bytes: 0,
         })
+    }
+
+    /// The ranking of a load whose weight cache streams the routed banks
+    /// `cached` an expert at a time: the plan seats no expert itself. A
+    /// cached bank is on no tier the plan cuts (its experts lie in the
+    /// pool's slots, or in the copy a miss is read from), and a dense
+    /// routed bank the cache does not take stays whole on the device,
+    /// beside the planes that cannot move.
+    #[must_use]
+    pub fn caching(mut self, cached: &[usize]) -> Ranking {
+        let whole = |bank: &BankPlan| {
+            (u64::from(bank.experts) * bank.stride).next_multiple_of(crate::weights::ALIGN)
+        };
+        for bank in std::mem::take(&mut self.banks) {
+            if cached.contains(&bank.param) {
+                self.cached_bytes += whole(&bank);
+            } else {
+                self.floor.push(bank.param);
+                self.floor_bytes += whole(&bank);
+            }
+        }
+        self
     }
 
     #[must_use]
@@ -357,7 +383,8 @@ impl Plan {
                 ..Plan::default()
             });
         };
-        if budget >= full {
+        // The banks the weight cache takes are the pool's, not the budget's.
+        if budget >= full.saturating_sub(ranking.cached_bytes) {
             return Ok(Plan {
                 device_bytes: full,
                 ..Plan::default()
@@ -440,8 +467,11 @@ impl Plan {
             "the floor check above proved one slot fits"
         );
 
+        // A cached bank's bytes come off when the load moves it off the
+        // device (`Plan::host_experts`, `Plan::file_weights`).
         let device_bytes = dense
             + seated
+            + ranking.cached_bytes
             + found
                 .iter()
                 .map(|bank| {
