@@ -4,15 +4,20 @@
 // where the row allows it.
 
 #include "prim/device.hip"
+#include "linear/table.hip"
 
 namespace pie::layout {
 
 // y[n] = table[ids[n]] (an id outside the vocabulary reads row 0). One
-// thread per element, or per 8 elements when VEC.
+// thread per element, or per 8 elements when VEC. `rows_table` (a row
+// table, `linear/table.hip`) names where each block of `block_rows` rows
+// lies, null for the contiguous table; `hits` counts the rows read a block,
+// null where nobody asks.
 template <bool VEC>
 __global__ void embed(const i32* __restrict__ ids, const bf16* __restrict__ table,
                       bf16* __restrict__ y, int hidden, int vocab, int rows, int per_row,
-                      const u32* __restrict__ win) {
+                      const u32* __restrict__ win, const u64* __restrict__ rows_table, int block_rows,
+                      u32* __restrict__ hits) {
     const long long idx = static_cast<long long>(blockIdx.x) * blockDim.x + threadIdx.x;
     if (idx >= static_cast<long long>(rows) * per_row) return;
     const Window window{win};
@@ -20,12 +25,14 @@ __global__ void embed(const i32* __restrict__ ids, const bf16* __restrict__ tabl
     if (!window.live(n)) return;
     const long long row = window.plane(n);
     const int h = static_cast<int>(idx % per_row);
-    const i32 id = ids[row];
-    const long long src = static_cast<long long>(id >= 0 && id < vocab ? id : 0) * hidden;
+    const i32 raw = ids[row];
+    const int id = raw >= 0 && raw < vocab ? raw : 0;
+    const bf16* src = ::pie::linear::table_row(table, hidden, rows_table, 1, 0, block_rows, id);
+    if (hits != nullptr && h == 0) atomicAdd(&hits[id / block_rows], 1u);
     if constexpr (VEC) {
-        reinterpret_cast<b128*>(y + row * hidden)[h] = reinterpret_cast<const b128*>(table + src)[h];
+        reinterpret_cast<b128*>(y + row * hidden)[h] = reinterpret_cast<const b128*>(src)[h];
     } else {
-        y[row * hidden + h] = table[src + h];
+        y[row * hidden + h] = src[h];
     }
 }
 

@@ -33,31 +33,15 @@ fn vectorisable(hidden: u32, table: u64, y: u64) -> bool {
     hidden.is_multiple_of(VEC_WIDTH) && aligned16(table) && aligned16(y)
 }
 
-/// [`embed`] over a table whose row blocks lie where `rows_at` says. The HIP
-/// gather reads the contiguous table only: a located table is refused.
+/// [`embed`] over a table whose row blocks lie where `rows_at` says (the
+/// weight cache's: a block in a pool slot, or in the mapped host copy), each
+/// read a plain load, and each block's reads counted where `rows_at` counts.
+/// A null row table is the contiguous `table`.
 pub fn embed_tabled(
     ctx: &Ctx,
     ids: Tensor,
     table: Tensor,
     rows_at: crate::linear::moe::RowTable,
-    vocab: u32,
-    y: &mut Tensor,
-) -> Result<(), Error> {
-    if rows_at.streams() {
-        return Err(refuse(
-            "gather.embed",
-            "a table read through a row table, which the HIP gather does not read: its \
-             rows lie contiguous"
-                .to_string(),
-        ));
-    }
-    embed(ctx, ids, table, vocab, y)
-}
-
-pub fn embed(
-    ctx: &Ctx,
-    ids: Tensor,
-    table: Tensor,
     vocab: u32,
     y: &mut Tensor,
 ) -> Result<(), Error> {
@@ -71,7 +55,13 @@ pub fn embed(
     let vocab = stated(OP, nonzero(OP, "the embedding table's row count", vocab)?)?;
     let hidden = stated(OP, nonzero(OP, "the embedded row's width", y.width)?)?;
     let rows = stated(OP, nonzero(OP, "rows", y.rows)?)?;
+    let block_rows = stated(
+        OP,
+        nonzero(OP, "a row table's rows a block", rows_at.block_rows)?,
+    )?;
 
+    // A located block starts on a slot or a host page, both 16-byte aligned,
+    // so only the contiguous table's own start is checked.
     let vec = vectorisable(y.width, table.ptr, y.ptr);
     let per_row = if vec { y.width / VEC_WIDTH } else { y.width };
     let total = u64::from(y.rows) * u64::from(per_row);
@@ -94,7 +84,27 @@ pub fn embed(
             rows.arg(),
             stated(OP, per_row)?.arg(),
             ctx.stage(),
+            crate::jit::ArgValue::Ptr(rows_at.table),
+            block_rows.arg(),
+            crate::jit::ArgValue::Ptr(rows_at.hits),
         ],
+    )
+}
+
+pub fn embed(
+    ctx: &Ctx,
+    ids: Tensor,
+    table: Tensor,
+    vocab: u32,
+    y: &mut Tensor,
+) -> Result<(), Error> {
+    embed_tabled(
+        ctx,
+        ids,
+        table,
+        crate::linear::moe::RowTable::RESIDENT,
+        vocab,
+        y,
     )
 }
 

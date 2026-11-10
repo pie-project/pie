@@ -327,10 +327,6 @@ pub fn streamed_experts(trace: &poem_ir::Trace) -> Vec<usize> {
 pub fn streamed_rows(trace: &poem_ir::Trace) -> Vec<usize> {
     use poem_ir::residency::{Residency, residency};
     use poem_ir::{Def, Gather, Operands, Operation};
-    // The HIP gather reads a table's rows contiguous: none streams there.
-    if cfg!(feature = "rocm") {
-        return Vec::new();
-    }
     let classes = residency(trace);
     let mut out = Vec::new();
     let mut inputs = Vec::new();

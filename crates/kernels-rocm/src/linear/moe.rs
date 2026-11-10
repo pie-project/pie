@@ -392,8 +392,8 @@ impl ExpertTable {
 }
 
 /// Where a token-id-gathered table's row blocks lie, as the CUDA kernels
-/// take it. The HIP gather reads only the contiguous table
-/// ([`RowTable::RESIDENT`]) and refuses any other.
+/// take it: a u64 address a block of `block_rows` rows (null: the
+/// contiguous table), and a u32 read counter a block (`hits`, or 0).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct RowTable {
     pub table: u64,
