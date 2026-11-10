@@ -414,18 +414,17 @@ impl Shell {
 
     #[must_use]
     pub fn host_buffer_pages(&self) -> u32 {
-        self.buffers
-            .as_ref()
-            .map_or(0, |_| self.pools.host_rows().0)
+        // The rs buffer's rows ride the record: no page is parked apart.
+        0
     }
 
     #[must_use]
     pub fn buffer_pages(&self) -> u32 {
-        self.buffers.as_ref().map_or(0, Buffers::pages)
+        0
     }
 
     fn state_row_bytes(&self) -> u64 {
-        self.pools.state_slot_bytes() + self.buffers.as_ref().map_or(0, Buffers::slot_bytes)
+        self.pools.state_slot_bytes()
     }
 
     pub fn copy_state_host(&mut self, to_host: bool, moves: &[(u32, u32)]) -> Result<()> {
@@ -441,13 +440,13 @@ impl Shell {
         self.device.synchronize()
     }
 
-    /// Where in the host rows `slots`' state, then `pages`' buffers, lie.
-    fn state_spans(&self, slots: &[u32], pages: &[u32]) -> Vec<(u32, u64, u64)> {
+    /// Where in the host rows `slots`' records lie: their recurrent rows
+    /// and the rs buffer's rows with them. A buffer page parked apart is
+    /// refused: the record holds its rows.
+    fn state_spans(&self, slots: &[u32], pages: &[u32]) -> Result<Vec<(u32, u64, u64)>> {
+        no_buffer_pages(pages.len())?;
         let state = self.pools.state_slot_bytes();
-        let page = self.buffers.as_ref().map_or(0, Buffers::slot_bytes);
-        let slots = slots.iter().map(|&slot| (slot, 0, state));
-        let pages = pages.iter().map(|&row| (row, state, page));
-        slots.chain(pages).collect()
+        Ok(slots.iter().map(|&slot| (slot, 0, state)).collect())
     }
 
     /// The state is a window: its pages are host windowed pages, and it
@@ -461,7 +460,7 @@ impl Shell {
         if self.ring() && slots.is_empty() {
             return self.pools.read_host_window(pages);
         }
-        let spans = self.state_spans(slots, pages);
+        let spans = self.state_spans(slots, pages)?;
         self.pools.read_host_rows(&spans)
     }
 
@@ -470,47 +469,21 @@ impl Shell {
         if self.ring() && slots.is_empty() {
             return self.pools.write_host_window(pages, bytes);
         }
-        let spans = self.state_spans(slots, pages);
+        let spans = self.state_spans(slots, pages)?;
         self.pools.write_host_rows(&spans, bytes)
     }
 
-    pub fn copy_pages_host(&mut self, to_host: bool, moves: &[(u32, u32)]) -> Result<()> {
-        let stream = self.device.stream();
-        let state_bytes = self.pools.state_slot_bytes();
-        for &(page, host) in moves {
-            let (span, bytes) = self.page_span(page)?;
-            let at = self.pools.host_row(host)? + state_bytes;
-            let (dst, src) = if to_host { (at, span) } else { (span, at) };
-            crate::device::copy_any(stream, dst, src, bytes as usize)?;
-        }
-        self.device.synchronize()
+    /// A buffer page moved to or from the host tier: there is none, the rs
+    /// buffer's rows moving with the record that holds them.
+    pub fn copy_pages_host(&mut self, _to_host: bool, moves: &[(u32, u32)]) -> Result<()> {
+        no_buffer_pages(moves.len())
     }
 
+    /// As [`Self::copy_pages_host`], within the device.
     pub fn copy_pages(&mut self, moves: &[(u32, u32)]) -> Result<()> {
-        let stream = self.device.stream();
-        for &(src, dst) in moves {
-            let (from, bytes) = self.page_span(src)?;
-            let (to, _) = self.page_span(dst)?;
-            crate::device::copy_any(stream, to, from, bytes as usize)?;
-        }
-        self.device.synchronize()
+        no_buffer_pages(moves.len())
     }
 
-    fn page_span(&mut self, page: u32) -> Result<(u64, u64)> {
-        let Some(buffers) = self.buffers.as_mut() else {
-            return Err(Fault::Ceiling {
-                what: "rs buffer pages",
-                need: u64::from(page) + 1,
-                have: 0,
-            });
-        };
-        buffers.ensure(&mut self.pools, page + 1)?;
-        buffers.page_span(page).ok_or(Fault::Ceiling {
-            what: "rs buffer pages",
-            need: u64::from(page) + 1,
-            have: u64::from(buffers.pages()),
-        })
-    }
     /// Copies full pages and token cells in the full kv rows. A windowed
     /// row's pages are named by the fire that reads them, so cells moved
     /// between pages here would leave its copy behind.
@@ -1070,8 +1043,8 @@ pub struct StepView<'a> {
 }
 
 #[derive(Debug, Default, Clone)]
-struct RsFire<'a> {
-    moves: Vec<RsMove<'a>>,
+struct RsFire {
+    moves: Vec<RsMove>,
     lens: Vec<i32>,
     order: Vec<u32>,
     write_state: bool,
@@ -1147,7 +1120,7 @@ pub struct Prepared<'a> {
     geometries: Vec<kv::Geometry>,
     pages: u32,
     fresh: Vec<u32>,
-    rs: RsFire<'a>,
+    rs: RsFire,
     demand: Demand,
     slot: Option<crate::inputs::SlotGuard>,
     lengths: crate::inputs::Staged,
@@ -1187,4 +1160,16 @@ impl EnqueuedPhase for Enqueued<'_> {
     fn launches(&self) -> u32 {
         self.launches
     }
+}
+
+/// Refuses a move or a read of rs buffer pages: a lane's unfolded rows lie in
+/// its working set's record and move with it.
+fn no_buffer_pages(named: usize) -> Result<()> {
+    if named == 0 {
+        return Ok(());
+    }
+    Err(Fault::Unsupported(format!(
+        "{named} rs buffer page(s) named apart from their records: this engine keeps a lane's \
+         unfolded rows in its working set's record, and moves them with it"
+    )))
 }

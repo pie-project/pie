@@ -42,10 +42,16 @@ impl Planes {
     }
 }
 
+/// The rows a lane buffers unfolded a recurrent layer: the state's record
+/// holds this many (`poem_compiler::chunk::UNFOLDED_ROWS`), slot `s` of the
+/// sequence in row `s % ROWS`.
+pub const ROWS: u32 = poem_compiler::chunk::UNFOLDED_ROWS;
+
+/// The rs buffer: the rows a lane lands past its state before they fold. A
+/// lane's rows lie in its working set's record ([`Pools::rs_span`]), a
+/// block a recurrent layer, each buffered plane [`ROWS`] rows of it.
 #[derive(Debug)]
 pub struct Buffers {
-    arena: Arena,
-    committed_pages: u32,
     /// The extended run's scratch: a fire's rows and the buffered slots its
     /// lanes replay ahead of them, a row each at the widest recurrence's
     /// width. Backed beside the pool as fires reach further, as a kernel's
@@ -53,48 +59,45 @@ pub struct Buffers {
     /// growth waits for none of them.
     scratch: Arena,
     planes: Planes,
-    page_tokens: u32,
-    slots: u32,
-    per_page: u64,
-    layers: u32,
     ext_row_bytes: u64,
 }
 
 impl Buffers {
-    /// Reserves the page slots `paging` names, and the scratch's range for
-    /// fires of up to `max_rows` rows beside every page slot replayed once.
-    /// A flat arena backs its whole range on its first commit, so its
-    /// scratch is reserved when a fire first asks, for what it asks.
+    /// The buffered planes of `trace`, checked against the rs rows the
+    /// record holds, and the scratch's range for fires of up to `max_rows`
+    /// rows beside every seated lane's buffered rows replayed once. A flat
+    /// arena backs its whole range on its first commit, so its scratch is
+    /// reserved when a fire first asks, for what it asks.
     pub fn reserve(
         trace: &Trace,
         paging: Paging,
         max_rows: u32,
         pools: &Pools,
     ) -> Result<Option<Buffers>> {
-        let Some((planes, per_token, layers)) = read(trace, paging.page_size)? else {
+        let Some((planes, per_token, layers)) = read(trace, ROWS)? else {
             return Ok(None);
         };
-        let per_page = u64::from(paging.page_size) * per_token;
+        let block = u64::from(ROWS) * per_token * ELEMENT;
+        let held = pools.rs_rows();
+        if held.len() != layers as usize || held.iter().any(|&bytes| bytes != block) {
+            return Err(Fault::program(
+                "store::rs",
+                format!(
+                    "the plan buffers {layers} recurrent layer(s) of {block} bytes, and the \
+                     chunk recipe's record holds rs rows of {held:?}"
+                ),
+            ));
+        }
         let ext_row_bytes = ext_row_bytes(trace)?;
-        let bytes = per_page
-            .saturating_mul(u64::from(paging.slots))
-            .saturating_mul(u64::from(layers))
-            .saturating_mul(ELEMENT);
         let reach = if elastic::mapped_on_demand() {
-            let rows = max_rows.saturating_add(paging.slots.saturating_mul(paging.page_size));
+            let rows = max_rows.saturating_add(paging.slots.saturating_mul(ROWS));
             RsScratch::need(rows, ext_row_bytes)
         } else {
             0
         };
         Ok(Some(Buffers {
-            arena: pools.reserve_arena(bytes, "rs buffered activations")?,
-            committed_pages: 0,
             scratch: pools.reserve_arena(reach, SCRATCH)?,
             planes,
-            page_tokens: paging.page_size,
-            slots: paging.slots,
-            per_page,
-            layers,
             ext_row_bytes,
         }))
     }
@@ -372,55 +375,6 @@ impl Buffers {
         &self.planes
     }
 
-    #[must_use]
-    pub fn page_tokens(&self) -> u32 {
-        self.page_tokens
-    }
-
-    #[must_use]
-    pub fn bytes(&self) -> u64 {
-        self.arena.committed_bytes()
-    }
-
-    #[must_use]
-    pub fn capacity_bytes(&self) -> u64 {
-        self.slot_bytes().saturating_mul(u64::from(self.slots))
-    }
-
-    #[must_use]
-    pub fn pages(&self) -> u32 {
-        self.slots
-    }
-
-    #[must_use]
-    pub fn slot_bytes(&self) -> u64 {
-        self.per_page
-            .saturating_mul(u64::from(self.layers))
-            .saturating_mul(ELEMENT)
-    }
-
-    #[must_use]
-    pub fn map_unit(&self) -> u64 {
-        self.arena.map_unit()
-    }
-
-    pub fn ensure(&mut self, pools: &mut Pools, pages: u32) -> Result<()> {
-        if pages <= self.committed_pages {
-            return Ok(());
-        }
-        if pages > self.slots {
-            return Err(Fault::Ceiling {
-                what: "rs buffer page slots",
-                need: u64::from(pages),
-                have: u64::from(self.slots),
-            });
-        }
-        let bytes = u64::from(pages).saturating_mul(self.slot_bytes());
-        pools.commit_arena(&mut self.arena, bytes)?;
-        self.committed_pages = pages;
-        Ok(())
-    }
-
     /// Whether the scratch's range holds an extended run of `rows_ext`
     /// rows. Past it [`Buffers::ensure_scratch`] reserves the scratch anew,
     /// at a base the fires in flight do not hold, so they land first.
@@ -450,40 +404,22 @@ impl Buffers {
         (self.scratch.base(), self.scratch.committed_bytes())
     }
 
-    /// The page `slot` names across the layers, when it is backed.
-    #[must_use]
-    pub fn page_span(&self, slot: u32) -> Option<(u64, u64)> {
-        (slot < self.committed_pages).then(|| {
-            let bytes = self.slot_bytes();
-            (self.arena.base() + u64::from(slot) * bytes, bytes)
-        })
-    }
-
-    pub fn row(&self, plane: Plane, page_slot: u32, row: u32) -> Result<u64> {
-        if page_slot >= self.slots {
+    /// The address of `rows` rows of `plane` from row `row` of the record
+    /// `key` names: sequence slot `s` lies in row `s % ROWS`.
+    pub fn row(&self, pools: &Pools, key: u32, plane: Plane, row: u32, rows: u32) -> Result<u64> {
+        if row + rows > ROWS {
             return Err(Fault::Ceiling {
-                what: "rs buffer page slots",
-                need: u64::from(page_slot) + 1,
-                have: u64::from(self.slots),
+                what: "rs rows a record buffers a layer",
+                need: u64::from(row + rows),
+                have: u64::from(ROWS),
             });
         }
-        if row >= self.page_tokens {
-            return Err(Fault::Ceiling {
-                what: "rs buffer page tokens",
-                need: u64::from(row) + 1,
-                have: u64::from(self.page_tokens),
-            });
-        }
-        if page_slot >= self.committed_pages {
-            return Err(Fault::Ceiling {
-                what: "rs buffer pages committed before this fire",
-                need: u64::from(page_slot) + 1,
-                have: u64::from(self.committed_pages),
-            });
-        }
-        let block = (u64::from(page_slot) * u64::from(self.layers) + u64::from(plane.layer))
-            * self.per_page;
-        Ok(self.arena.base() + (block + plane.at + u64::from(row) * plane.width) * ELEMENT)
+        pools.rs_span(
+            key,
+            plane.layer,
+            (plane.at + u64::from(row) * plane.width) * ELEMENT,
+            u64::from(rows) * plane.width * ELEMENT,
+        )
     }
 }
 
@@ -603,7 +539,8 @@ pub struct Predicate {
 }
 
 impl Predicate {
-    pub fn reserve(max_lanes: u32, snapshots: bool) -> Result<Predicate> {
+    /// `ids` ids name a record a snapshot lands in (`Pools::ids_a_lane`).
+    pub fn reserve(max_lanes: u32, snapshots: bool, ids: u32) -> Result<Predicate> {
         let lanes = u64::from(max_lanes);
         let mut at = 0u64;
         let mut take = |bytes: u64| {
@@ -619,7 +556,11 @@ impl Predicate {
         let at_len = take(lanes * 4);
         let at_snap = snapshots.then(|| {
             let entries = lanes * u64::from(SNAPSHOTS);
-            [take((lanes + 1) * 4), take(entries * 4), take(entries * 4)]
+            [
+                take((lanes + 1) * 4),
+                take(entries * 4),
+                take(entries * 4 * u64::from(ids.max(1))),
+            ]
         });
         let mut region = Buffer::zeroed(usize::try_from(at).unwrap_or(usize::MAX))?;
         region.write(at_one, &1u32.to_le_bytes())?;

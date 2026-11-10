@@ -442,7 +442,12 @@ impl Chunks {
             ));
         }
         if let Some(fixed) = &layout.fixed {
-            shapes.push(shape(fixed, SlotKind::Fixed { pieces: 1 }));
+            shapes.push(shape(
+                &fixed.slot,
+                SlotKind::Fixed {
+                    pieces: fixed.pieces,
+                },
+            ));
         }
         let total = self.total.saturating_add(self.act);
         let max = u32::try_from(u64::from(total).div_ceil(u64::from(layout.segment_chunks.max(1))))

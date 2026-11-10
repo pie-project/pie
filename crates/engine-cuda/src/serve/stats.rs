@@ -5,7 +5,6 @@ use super::{Graphs, Shell};
 
 use crate::record;
 use crate::store::kv::Paging;
-use crate::store::rs::Buffers;
 
 impl Shell {
     #[must_use]
@@ -97,12 +96,13 @@ impl Shell {
 
     #[must_use]
     pub fn buffer_bytes(&self) -> u64 {
-        self.buffers.as_ref().map_or(0, Buffers::bytes)
+        // The rs buffer's rows are the records', in the state pool.
+        0
     }
 
     #[must_use]
     pub fn buffer_capacity_bytes(&self) -> u64 {
-        self.buffers.as_ref().map_or(0, Buffers::capacity_bytes)
+        0
     }
 
     #[must_use]

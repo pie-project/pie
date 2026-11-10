@@ -805,8 +805,7 @@ impl FrameShell for Shell {
         let mut writes: Vec<Option<(i32, i32)>> = Vec::with_capacity(rows as usize);
         let mut slot_ids: Vec<i32> = Vec::with_capacity(lanes.len());
         let mut fresh: Vec<u32> = Vec::new();
-        let mut rs_pages_named = 0u32;
-        let mut rs_moves: Vec<RsMove<'a>> = Vec::with_capacity(lanes.len());
+        let mut rs_moves: Vec<RsMove> = Vec::with_capacity(lanes.len());
         let mut rs_reads: Vec<Vec<std::ops::Range<u32>>> = vec![Vec::new(); lanes.len()];
         let mut rs_folded: Vec<Option<u32>> = vec![None; lanes.len()];
         let mut rs_lens: Vec<i32> = Vec::with_capacity(lanes.len());
@@ -993,17 +992,10 @@ impl FrameShell for Shell {
             let fire_lane = rs_moves.len();
             rs_order[row.source as usize] = fire_lane as u32;
             let port = envelope_of[source].and_then(|(held, _)| resolved[held].fold.as_deref());
-            if let RsVerb::Buffer { pages, .. } = &seated.rs {
-                rs_pages_named =
-                    rs_pages_named.max(pages.iter().copied().max().map_or(0, |page| page + 1));
-            }
             let (verb, folded) = match &seated.rs {
                 RsVerb::Fold => (RsMove::None, row.rows),
                 RsVerb::Buffer {
-                    pages,
-                    base,
-                    folded,
-                    fold,
+                    base, folded, fold, ..
                 } => {
                     // A device-counted fold not yet settled left the state
                     // past the runtime's length.
@@ -1033,6 +1025,17 @@ impl FrameShell for Shell {
                             ),
                         ));
                     }
+                    // The record holds a layer's unfolded rows a ring of
+                    // `ROWS`: a fire that would leave more unfolded has no
+                    // row to land its last in.
+                    let unfolded = (first + row.rows).saturating_sub(*folded);
+                    if unfolded > crate::store::rs::ROWS {
+                        return Err(Fault::Ceiling {
+                            what: "rows a lane holds unfolded past its recurrent state",
+                            need: u64::from(unfolded),
+                            have: u64::from(crate::store::rs::ROWS),
+                        });
+                    }
                     let reads = engine::fire::buffered_reads(masking, *folded, first, row.rows)
                         .map_err(|error| {
                             Fault::program("serve::rs", format!("lane {}: {error}", row.source))
@@ -1057,7 +1060,8 @@ impl FrameShell for Shell {
                         .collect();
                     (
                         RsMove::Scatter {
-                            pages: pages.as_slice(),
+                            key: slot,
+                            base: *base,
                             at: first - base,
                             fold,
                         },
@@ -1073,11 +1077,6 @@ impl FrameShell for Shell {
                         row.source
                     ),
                 });
-            }
-            if verb != RsMove::None
-                && let Some(buffers) = self.buffers.as_mut()
-            {
-                buffers.ensure(&mut self.pools, rs_pages_named)?;
             }
             rs_moves.push(verb);
             rs_lens.push(narrow(u64::from(folded)));
@@ -1261,11 +1260,10 @@ impl FrameShell for Shell {
             .flat_map(|(table, _)| table.iter().map(|&page| u64::from(page)))
             .collect();
         self.pools.commit_frame(demand, &kv_ranges, &window_pages)?;
-        // The state slots as the kernels read them: each by the id of the
-        // slot it is seated on in the state pool.
-        let mut device_slot_ids = slot_ids.clone();
-        self.pools.state_ids(&mut device_slot_ids)?;
-        self.pools.state_ids(&mut snapshots.slots)?;
+        // The records as the kernels read them: each row's pieces by the
+        // ids of the slots they lie in, table after table.
+        let device_slot_ids = self.pools.state_tables(&slot_ids)?;
+        snapshots.slots = self.pools.snapshot_tables(&snapshots.slots)?;
         self.pools
             .fence_swaps(self.device.stream(), &kv_ranges, &window_pages)?;
         super::btrace::mark("commit_frame");
@@ -1572,7 +1570,8 @@ impl FrameShell for Shell {
                 readout_live,
                 qo_absolute: &qo_absolute,
                 live: if bodied { windows.live() } else { &[] },
-                slot_ids: &device_slot_ids,
+                slot_ids: &slot_ids,
+                state_ids: &device_slot_ids,
                 spaces: &device_geometries,
                 mask: staged.as_ref(),
                 adapter_routes: any_adapter.then_some(adapter_routes.as_slice()),

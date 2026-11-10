@@ -499,8 +499,9 @@ enum Shape {
     State {
         stride: u64,
         dtype: Dtype,
-        /// Where the row starts in a working set's slot of the state pool.
-        offset: u64,
+        /// The row's place in a working set's record: its index among the
+        /// fixed shape's rows.
+        run: usize,
     },
 }
 
@@ -573,6 +574,13 @@ pub struct Pools {
     /// The state pool: the kv rows' pages and the working sets' recurrent
     /// records, a slot each.
     chunks: chunks::Chunks,
+    /// Each record a lane named by slot refs, by its first piece's ref: the
+    /// refs of all its pieces.
+    records: std::collections::HashMap<u32, Vec<u32>>,
+    /// The lanes a fire's staged id tables are laid for, and the entries its
+    /// snapshot table is ([`Pools::seat_tables`]).
+    id_lanes: u32,
+    snap_entries: u32,
     shapes: Vec<Shape>,
     pooled: Vec<PoolRow>,
     paging: Paging,
@@ -587,7 +595,6 @@ pub struct Pools {
     airborne: Option<Airborne>,
     committed_kv_pages: u32,
     committed_state_slots: u32,
-    buffered: (u64, u64),
     host: Option<HostKv>,
     disk: Option<DiskKv>,
     /// Every declared page and slot is backed ([`Pools::back_whole`]), and
@@ -851,9 +858,10 @@ impl Pools {
                     name, slab, dtype, ..
                 } => {
                     let stride: u64 = slab.iter().product();
-                    let offset = layout
-                        .shape(Kind::Fixed)
-                        .and_then(|shape| shape.offset_of(index as u32))
+                    let run = layout
+                        .fixed
+                        .as_ref()
+                        .and_then(|fixed| fixed.rows.iter().position(|run| run.row == index as u32))
                         .ok_or_else(|| {
                             Fault::program(
                                 "store::reserve",
@@ -863,7 +871,7 @@ impl Pools {
                     shapes.push(Shape::State {
                         stride,
                         dtype: *dtype,
-                        offset,
+                        run,
                     });
                 }
             }
@@ -902,6 +910,9 @@ impl Pools {
         Ok(Pools {
             pool,
             chunks,
+            records: std::collections::HashMap::new(),
+            id_lanes: 1,
+            snap_entries: 1,
             shapes,
             pooled,
             paging,
@@ -912,18 +923,11 @@ impl Pools {
             airborne: None,
             committed_kv_pages: 0,
             committed_state_slots: 0,
-            buffered: (0, 1),
             host: None,
             disk: None,
             whole: false,
             swaps: Vec::new(),
         })
-    }
-
-    /// A fire commits rs buffered pages by slot, so the fit seats them with
-    /// the slots rather than leave them growth past what it sized.
-    pub fn seat_buffered(&mut self, slot_bytes: u64, unit: u64) {
-        self.buffered = (slot_bytes, unit.max(1));
     }
 
     /// The state slots the fit keeps while the pages beside them seat one
@@ -994,17 +998,10 @@ impl Pools {
     }
 
     /// The watermark with `pages` kv pages and `slots` state slots: the
-    /// chunks they take, and the rs buffer's pages beside the pool.
+    /// chunks they take.
     fn declared_reshaped(&self, pages: u64, slots: u32) -> u64 {
-        let (slot_bytes, unit) = self.buffered;
-        let buffered = u64::from(slots)
-            .saturating_mul(slot_bytes)
-            .div_ceil(unit)
-            .saturating_mul(unit);
         let layout = self.chunks.layout();
-        let chunks = u64::from(chunks_at(layout, &self.paging, pages, slots))
-            .saturating_mul(layout.chunk_bytes);
-        buffered.saturating_add(chunks)
+        u64::from(chunks_at(layout, &self.paging, pages, slots)).saturating_mul(layout.chunk_bytes)
     }
 
     /// Re-reserves the kv planes and compressor slabs for a pool of `pages`,
@@ -1230,17 +1227,6 @@ impl Pools {
         Arena::reserve(&self.pool, max_bytes, label)
     }
 
-    pub(crate) fn commit_arena(&mut self, arena: &mut Arena, bytes: u64) -> Result<()> {
-        let mut targets = [elastic::Target {
-            arena,
-            want: elastic::Want::Prefix(bytes),
-        }];
-        match elastic::commit_atomically(&mut self.pool, &mut targets)? {
-            Commit::Committed => Ok(()),
-            refusal => Err(refuse(&self.pool, refusal)),
-        }
-    }
-
     /// Backs a prefix of `bytes` of an arena beside the pool's budget
     /// (`elastic::commit_beside`).
     pub(crate) fn commit_beside(&self, arena: &mut Arena, bytes: u64) -> Result<()> {
@@ -1275,7 +1261,13 @@ impl Pools {
                 Shape::State { stride, dtype, .. } => stride * u64::from(elem_size(dtype)),
                 Shape::Kv { .. } => 0,
             })
-            .sum()
+            .sum::<u64>()
+            + self
+                .chunks
+                .layout()
+                .fixed
+                .as_ref()
+                .map_or(0, |fixed| fixed.rs.iter().map(|rs| rs.bytes).sum())
     }
 
     #[must_use]
@@ -1443,38 +1435,56 @@ impl Pools {
                         },
                     }
                 }
-                Shape::State {
-                    stride,
-                    dtype,
-                    offset,
-                } => {
-                    // A lane's id names its slot a grain at a time; the
-                    // row lies `offset` into it.
-                    let grain = self
-                        .chunks
-                        .layout()
-                        .shape(Kind::Fixed)
-                        .map_or(0, |shape| shape.grain);
-                    let step = wide(grain / u64::from(elem_size(dtype)).max(1));
+                Shape::State { stride, dtype, run } => {
+                    // A lane names each piece's slot a grain at a time, in
+                    // the id table the row's pieces share; a piece lies
+                    // `offset` into its slot.
+                    let fixed = self.chunks.layout().fixed.as_ref().ok_or_else(|| {
+                        Fault::program("store::table", "a recurrent row and no fixed shape")
+                    })?;
+                    let row = &fixed.rows[run];
+                    let element = u64::from(elem_size(dtype)).max(1);
+                    let step = wide(fixed.slot.grain / element);
                     let slab = Tensor::new(
-                        self.chunks.base() + offset,
-                        u32::try_from(self.chunks.bytes() / grain.max(1)).unwrap_or(u32::MAX),
+                        self.chunks.base(),
+                        u32::try_from(self.chunks.bytes() / fixed.slot.grain.max(1))
+                            .unwrap_or(u32::MAX),
                         narrow(stride) as u32,
                         dtype,
                     );
+                    let column = u64::from(row.column);
+                    let mut snapshots = seats.snapshots;
+                    if !snapshots.slots.is_absent() {
+                        snapshots.slots.ptr += column * u64::from(self.snap_entries) * 4;
+                    }
                     CachePool::Recurrent(RecurrentPool {
                         write_state: seats.write_state,
                         write_state_mask: seats.write_state_mask,
                         commit_len: seats.commit_len,
                         begin_at: seats.begin_at,
                         fused_decay: false,
-                        snapshots: seats.snapshots,
+                        snapshots,
                         slab,
-                        slot_ids: seats.slot_ids,
+                        slot_ids: Tensor::new(
+                            seats.slot_ids.ptr + column * u64::from(self.id_lanes) * 4,
+                            seats.slot_ids.rows,
+                            row.pieces,
+                            Dtype::I32,
+                        ),
                         slot_stride_elems: step,
                         conv_slab: slab,
                         conv_stride: step,
-                        segments: kernels_cuda::Segments::ONE,
+                        segments: kernels_cuda::Segments {
+                            table: Tensor::ABSENT,
+                            seg_chunks: 0,
+                            pieces: row.pieces,
+                            piece_off: wide(row.offset / element),
+                            piece_atoms: if row.pieces > 1 {
+                                u32::try_from(row.atoms_per_piece).unwrap_or(u32::MAX)
+                            } else {
+                                0
+                            },
+                        },
                     })
                 }
             });
@@ -1490,6 +1500,8 @@ impl Pools {
         self.zero_slot(Some(stream), slot)
     }
 
+    /// Copies the record `src` names onto the one `dst` names, slot for
+    /// slot: its recurrent rows and the rs buffer's rows with them.
     pub fn copy_slot(&mut self, stream: *mut core::ffi::c_void, src: u32, dst: u32) -> Result<()> {
         for slot in [src, dst] {
             if !self.state_row(slot)? {
@@ -1499,56 +1511,209 @@ impl Pools {
         if src == dst {
             return Ok(());
         }
-        self.ensure_state_slots(&[src, dst])?;
-        for (offset, bytes) in self.state_rows() {
+        let (from, to) = (self.ensure_record(src)?, self.ensure_record(dst)?);
+        let bytes = self.fixed()?.slot.slot_bytes;
+        for (&from, &to) in from.iter().zip(&to) {
             crate::device::copy_d2d(
                 stream,
-                self.chunks.span(Kind::Fixed, dst, offset, bytes)?,
-                self.chunks.span(Kind::Fixed, src, offset, bytes)?,
+                self.chunks.span(Kind::Fixed, to, 0, bytes)?,
+                self.chunks.span(Kind::Fixed, from, 0, bytes)?,
                 usize::try_from(bytes).unwrap_or(0),
             )?;
         }
         Ok(())
     }
 
-    /// Where each recurrent row starts in a working set's slot, and its
-    /// bytes.
-    fn state_rows(&self) -> Vec<(u64, u64)> {
-        self.shapes
-            .iter()
-            .filter_map(|shape| match *shape {
-                Shape::State {
-                    stride,
-                    dtype,
-                    offset,
-                } => Some((offset, stride * u64::from(elem_size(dtype)))),
-                Shape::Kv { .. } => None,
-            })
-            .collect()
+    fn fixed(&self) -> Result<&layout::FixedShape> {
+        self.chunks
+            .layout()
+            .fixed
+            .as_ref()
+            .ok_or_else(|| Fault::program("store::state", "a record named and no fixed shape"))
     }
 
-    /// Seats the state slots `slots` on slots of the state pool and backs
-    /// the segments their chunks lie in.
-    fn ensure_state_slots(&mut self, slots: &[u32]) -> Result<()> {
-        self.seat_pages(Kind::Fixed, slots.iter().map(|&slot| u64::from(slot)))
+    /// The lanes a fire's id tables are staged for and the entries of its
+    /// snapshot table: where each row's ids start in them.
+    pub fn seat_tables(&mut self, id_lanes: u32, snap_entries: u32) {
+        self.id_lanes = id_lanes.max(1);
+        self.snap_entries = snap_entries.max(1);
     }
 
-    /// Rewrites the state slots a fire's lanes name in `ids` as the ids the
-    /// recurrent kernels read their slots by, seating and backing each.
-    pub fn state_ids(&mut self, ids: &mut [i32]) -> Result<()> {
+    /// The ids a fire stages a lane for the recurrent rows.
+    #[must_use]
+    pub fn ids_a_lane(&self) -> u32 {
+        self.chunks
+            .layout()
+            .fixed
+            .as_ref()
+            .map_or(1, |fixed| fixed.ids_a_lane().max(1))
+    }
+
+    /// Names the record whose pieces lie in the slot refs `pieces`, for the
+    /// fires and copies that name it by its first.
+    pub fn name_record(&mut self, pieces: &[u32]) -> Result<u32> {
+        let want = self.fixed()?.pieces as usize;
+        let Some(&key) = pieces.first().filter(|_| pieces.len() == want) else {
+            return Err(Fault::program(
+                "store::state",
+                format!(
+                    "a record named by {} slot refs, and this load's takes {want}",
+                    pieces.len()
+                ),
+            ));
+        };
+        if want > 1 {
+            self.records.insert(key, pieces.to_vec());
+        }
+        Ok(key)
+    }
+
+    /// The slots of the record `key` names, in the record's order: the
+    /// refs a lane named it by, or, where lanes name state slots, the
+    /// slot's own run.
+    fn record(&self, key: u32) -> Result<Vec<u32>> {
+        let pieces = self.fixed()?.pieces;
+        if !self.chunks.by_refs() {
+            return Ok((0..pieces).map(|piece| key * pieces + piece).collect());
+        }
+        if pieces == 1 {
+            return Ok(vec![key]);
+        }
+        self.records.get(&key).cloned().ok_or_else(|| {
+            Fault::program(
+                "store::state",
+                format!("the record at slot ref {key} is read before a lane names its pieces"),
+            )
+        })
+    }
+
+    /// The record `key` names, its slots seated and backed.
+    fn ensure_record(&mut self, key: u32) -> Result<Vec<u32>> {
+        let slots = self.record(key)?;
+        self.seat_pages(Kind::Fixed, slots.iter().map(|&slot| u64::from(slot)))?;
+        Ok(slots)
+    }
+
+    /// The record's bytes as the host holds them, `(slot of the record,
+    /// offset, bytes)` in order: each recurrent row piece after piece, then
+    /// the rs buffer's rows.
+    fn record_spans(&self) -> Vec<(u32, u64, u64)> {
+        let Some(fixed) = self.chunks.layout().fixed.as_ref() else {
+            return Vec::new();
+        };
+        let mut spans = Vec::new();
+        for shape in &self.shapes {
+            let Shape::State { run, .. } = *shape else {
+                continue;
+            };
+            let row = &fixed.rows[run];
+            for (piece, &slot) in row.slots.iter().enumerate() {
+                spans.push((slot, row.offset, row.piece_bytes(piece as u32)));
+            }
+        }
+        spans.extend(fixed.rs.iter().map(|rs| (rs.slot, rs.offset, rs.bytes)));
+        spans
+    }
+
+    /// The staged id tables of a fire whose lanes name the records `keys`
+    /// (under zero: none): each table's block `id_lanes` lanes long, a
+    /// lane's ids its pieces' slots as the recurrent kernels read them.
+    /// Seats and backs each record.
+    pub fn state_tables(&mut self, keys: &[i32]) -> Result<Vec<i32>> {
         if !self.has_state() {
-            return Ok(());
+            return Ok(keys.to_vec());
         }
-        let slots: Vec<u32> = ids
-            .iter()
-            .filter(|&&id| id >= 0)
-            .map(|&id| id as u32)
-            .collect();
-        if let Some(&highest) = slots.iter().max() {
-            self.state_row(highest)?;
+        let fixed = self.fixed()?.clone();
+        let lanes = self.id_lanes as usize;
+        self.expand(&fixed, keys, lanes)
+    }
+
+    /// A fire's snapshot slots, as [`Pools::state_tables`] lays a fire's
+    /// lanes: an entry a record a snapshot lands in.
+    pub fn snapshot_tables(&mut self, keys: &[i32]) -> Result<Vec<i32>> {
+        if !self.has_state() || keys.is_empty() {
+            return Ok(keys.to_vec());
         }
-        self.ensure_state_slots(&slots)?;
-        self.chunks.page_ids(Kind::Fixed, ids)
+        let fixed = self.fixed()?.clone();
+        let entries = self.snap_entries as usize;
+        self.expand(&fixed, keys, entries)
+    }
+
+    fn expand(
+        &mut self,
+        fixed: &layout::FixedShape,
+        keys: &[i32],
+        rows: usize,
+    ) -> Result<Vec<i32>> {
+        if keys.len() > rows {
+            return Err(Fault::Ceiling {
+                what: "records a fire's id tables name",
+                need: keys.len() as u64,
+                have: rows as u64,
+            });
+        }
+        // One table of one piece: the ids as the keys lie, no padding.
+        let single = fixed.tables.len() == 1 && fixed.tables[0].len() == 1;
+        let mut out = if single {
+            vec![-1i32; keys.len()]
+        } else {
+            vec![-1i32; rows * fixed.ids_a_lane() as usize]
+        };
+        // A table's block is `rows` lanes long: where it starts.
+        let block = if single { 0 } else { rows };
+        for (lane, &key) in keys.iter().enumerate() {
+            if key < 0 {
+                continue;
+            }
+            self.state_row(key as u32)?;
+            let record = self.ensure_record(key as u32)?;
+            let mut column = 0usize;
+            for table in &fixed.tables {
+                for (piece, &slot) in table.iter().enumerate() {
+                    out[column * block + lane * table.len() + piece] =
+                        self.chunks.page_id(Kind::Fixed, record[slot as usize])?;
+                }
+                column += table.len();
+            }
+        }
+        Ok(out)
+    }
+
+    /// The bytes of each recurrent layer's rs rows in a record.
+    #[must_use]
+    pub fn rs_rows(&self) -> Vec<u64> {
+        self.chunks
+            .layout()
+            .fixed
+            .as_ref()
+            .map_or_else(Vec::new, |fixed| {
+                fixed.rs.iter().map(|rs| rs.bytes).collect()
+            })
+    }
+
+    /// The address of `bytes` at `offset` of recurrent layer `layer`'s rs
+    /// buffer rows in the record `key` names.
+    pub fn rs_span(&self, key: u32, layer: u32, offset: u64, bytes: u64) -> Result<u64> {
+        let fixed = self.fixed()?;
+        let rows = fixed.rs.get(layer as usize).ok_or(Fault::Ceiling {
+            what: "recurrent layers whose rs rows the record holds",
+            need: u64::from(layer) + 1,
+            have: fixed.rs.len() as u64,
+        })?;
+        if offset + bytes > rows.bytes {
+            return Err(Fault::Ceiling {
+                what: "bytes of a layer's rs rows in the record",
+                need: offset + bytes,
+                have: rows.bytes,
+            });
+        }
+        let record = self.record(key)?;
+        self.chunks.span(
+            Kind::Fixed,
+            record[rows.slot as usize],
+            rows.offset + offset,
+            bytes,
+        )
     }
 
     /// The state rows of `slot`, backed first; none when the load keeps no state.
@@ -1556,10 +1721,16 @@ impl Pools {
         if !self.state_row(slot)? {
             return Ok(Vec::new());
         }
-        self.ensure_state_slots(&[slot])?;
-        self.state_rows()
+        let record = self.ensure_record(slot)?;
+        self.record_spans()
             .into_iter()
-            .map(|(offset, bytes)| Ok((self.chunks.span(Kind::Fixed, slot, offset, bytes)?, bytes)))
+            .map(|(piece, offset, bytes)| {
+                Ok((
+                    self.chunks
+                        .span(Kind::Fixed, record[piece as usize], offset, bytes)?,
+                    bytes,
+                ))
+            })
             .collect()
     }
 
@@ -2494,16 +2665,11 @@ impl Pools {
         if !self.state_row(slot)? {
             return Ok(Vec::new());
         }
-        self.ensure_state_slots(&[slot])?;
         let mut out = Vec::new();
-        for (offset, bytes) in self.state_rows() {
-            let at = out.len();
-            out.resize(at + usize::try_from(bytes).unwrap_or(0), 0);
-            crate::device::copy_d2h_on(
-                stream,
-                self.chunks.span(Kind::Fixed, slot, offset, bytes)?,
-                &mut out[at..],
-            )?;
+        for (at, bytes) in self.state_spans(slot)? {
+            let from = out.len();
+            out.resize(from + usize::try_from(bytes).unwrap_or(0), 0);
+            crate::device::copy_d2h_on(stream, at, &mut out[from..])?;
         }
         Ok(out)
     }
@@ -2512,9 +2678,10 @@ impl Pools {
         if !self.state_row(slot)? {
             return Ok(());
         }
-        self.ensure_state_slots(&[slot])?;
-        for (offset, bytes) in self.state_rows() {
-            let at = self.chunks.span(Kind::Fixed, slot, offset, bytes)?;
+        let record = self.ensure_record(slot)?;
+        let bytes = self.fixed()?.slot.slot_bytes;
+        for piece in record {
+            let at = self.chunks.span(Kind::Fixed, piece, 0, bytes)?;
             let len = usize::try_from(bytes).unwrap_or(0);
             match stream {
                 Some(stream) => crate::device::zero_span_on(stream, at, len)?,
@@ -2614,7 +2781,14 @@ fn chunks_at(layout: &layout::Layout, paging: &Paging, pages: u64, slots: u32) -
     let chunks = 1
         + layout.chunks_for(Kind::List, pages)
         + layout.chunks_for(Kind::Ring, paging.window_pages_at(pages))
-        + layout.chunks_for(Kind::Fixed, u64::from(slots));
+        + layout.chunks_for(
+            Kind::Fixed,
+            u64::from(slots)
+                * layout
+                    .fixed
+                    .as_ref()
+                    .map_or(1, |fixed| u64::from(fixed.pieces)),
+        );
     u32::try_from(chunks).unwrap_or(u32::MAX)
 }
 

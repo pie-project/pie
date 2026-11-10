@@ -136,49 +136,6 @@ impl SlotShape {
             .map(|&(_, offset)| offset)
     }
 
-    /// The fixed shape: a working set's record of the recurrent rows, each
-    /// where the recipe puts it. A record the recipe cuts into pieces is
-    /// refused: this engine's state tables name one slot a lane.
-    fn fixed(layout: &SlotLayout, chunk_bytes: u64) -> Result<SlotShape> {
-        let SlotLayout::Fixed {
-            bytes,
-            record,
-            pieces_per_ws,
-            rows,
-            ..
-        } = layout
-        else {
-            return Err(Fault::program(
-                "store::layout",
-                "a token slot read as the fixed slot",
-            ));
-        };
-        if *pieces_per_ws != 1 {
-            return Err(Fault::Unbound {
-                what: format!(
-                    "a recurrent record of {record} bytes whole in one chunk of                      {chunk_bytes}: the chunk recipe cuts it into {pieces_per_ws} pieces,                      which this engine's state tables do not name yet"
-                ),
-            });
-        }
-        let per_chunk = u32::try_from(chunk_bytes / (*bytes).max(1)).unwrap_or(u32::MAX);
-        Ok(SlotShape {
-            id: FIXED,
-            tokens: 0,
-            slot_bytes: *bytes,
-            per_chunk: per_chunk.max(1),
-            grain: gcd(chunk_bytes, *bytes),
-            window: None,
-            rows: rows
-                .iter()
-                .filter_map(|run| match run.row {
-                    RowId::Cache(row) => Some((row, run.offset)),
-                    RowId::Rs(_) | RowId::Pool(_) => None,
-                })
-                .collect(),
-            pools: Vec::new(),
-        })
-    }
-
     /// Where cache row `row`'s run starts in a slot.
     #[must_use]
     pub fn offset_of(&self, row: u32) -> Option<u64> {
@@ -214,7 +171,156 @@ pub struct Layout {
     pub segment_chunks: u32,
     pub list: Option<SlotShape>,
     pub ring: Option<SlotShape>,
-    pub fixed: Option<SlotShape>,
+    pub fixed: Option<FixedShape>,
+}
+
+/// One recurrent row of a working set's record: `pieces` equal pieces of
+/// `atoms_per_piece` atoms (the last padded past the row's `atoms`), each
+/// `offset` bytes into a slot of its own.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FixedRow {
+    /// The cache row.
+    pub row: u32,
+    pub pieces: u32,
+    pub atoms_per_piece: u64,
+    pub atoms: u64,
+    pub atom_bytes: u64,
+    pub offset: u64,
+    /// The record's slots its pieces lie in, one a piece.
+    pub slots: Vec<u32>,
+    /// Where its ids start among a lane's staged ids ([`FixedShape::tables`]).
+    pub column: u32,
+}
+
+impl FixedRow {
+    /// The bytes piece `piece` holds of the row.
+    #[must_use]
+    pub fn piece_bytes(&self, piece: u32) -> u64 {
+        let start = (u64::from(piece) * self.atoms_per_piece).min(self.atoms);
+        ((start + self.atoms_per_piece).min(self.atoms) - start) * self.atom_bytes
+    }
+}
+
+/// A recurrent layer's rs buffer rows in the record: `bytes` at `offset` of
+/// the record's slot `slot`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RsRows {
+    pub slot: u32,
+    pub offset: u64,
+    pub bytes: u64,
+}
+
+/// The fixed shape: a working set's record of every recurrent row and of the
+/// rs buffer's rows, `pieces` slots of it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FixedShape {
+    pub slot: SlotShape,
+    /// The slots a record takes.
+    pub pieces: u32,
+    pub rows: Vec<FixedRow>,
+    /// The rs buffer's rows, a recurrent layer each, in the layers' order.
+    pub rs: Vec<RsRows>,
+    /// The id tables a fire stages a lane: each a run of the record's slots
+    /// some row's pieces lie in, the rows that share a run sharing a table.
+    pub tables: Vec<Vec<u32>>,
+}
+
+impl FixedShape {
+    fn of(recipe: &ChunkRecipe, layout: &SlotLayout) -> Result<FixedShape> {
+        let chunk_bytes = recipe.chunk_bytes;
+        let SlotLayout::Fixed {
+            bytes,
+            pieces_per_ws,
+            rows: runs,
+            ..
+        } = layout
+        else {
+            return Err(Fault::program(
+                "store::layout",
+                "a token slot read as the fixed slot",
+            ));
+        };
+        let per_chunk = u32::try_from(chunk_bytes / (*bytes).max(1)).unwrap_or(u32::MAX);
+        let mut tables: Vec<Vec<u32>> = Vec::new();
+        let mut columns: Vec<u32> = Vec::new();
+        let mut rows = Vec::new();
+        let mut rs = Vec::new();
+        for run in runs {
+            let atom = recipe.atoms.get(&run.row).ok_or_else(|| {
+                Fault::program(
+                    "store::layout",
+                    format!("the chunk recipe states no atom for {:?}", run.row),
+                )
+            })?;
+            match run.row {
+                RowId::Cache(row) => {
+                    let table = match tables.iter().position(|held| *held == run.slots) {
+                        Some(at) => at,
+                        None => {
+                            columns.push(tables.iter().map(|t| t.len() as u32).sum());
+                            tables.push(run.slots.clone());
+                            tables.len() - 1
+                        }
+                    };
+                    rows.push(FixedRow {
+                        row,
+                        pieces: run.pieces,
+                        atoms_per_piece: run.atoms_per_piece,
+                        atoms: atom.extent,
+                        atom_bytes: atom.bytes,
+                        offset: run.offset,
+                        slots: run.slots.clone(),
+                        column: columns[table],
+                    });
+                }
+                RowId::Rs(_) => {
+                    let [slot] = run.slots.as_slice() else {
+                        return Err(Fault::Unbound {
+                            what: format!(
+                                "an rs buffer's rows whole in one slot of the record: the \
+                                 chunk recipe cuts them into {} pieces",
+                                run.pieces
+                            ),
+                        });
+                    };
+                    rs.push(RsRows {
+                        slot: *slot,
+                        offset: run.offset,
+                        bytes: atom.extent * atom.bytes,
+                    });
+                }
+                RowId::Pool(_) => {}
+            }
+        }
+        Ok(FixedShape {
+            slot: SlotShape {
+                id: FIXED,
+                tokens: 0,
+                slot_bytes: *bytes,
+                per_chunk: per_chunk.max(1),
+                grain: gcd(chunk_bytes, *bytes),
+                window: None,
+                rows: Vec::new(),
+                pools: Vec::new(),
+            },
+            pieces: (*pieces_per_ws).max(1),
+            rows,
+            rs,
+            tables,
+        })
+    }
+
+    /// Cache row `row`'s place in the record.
+    #[must_use]
+    pub fn row(&self, row: u32) -> Option<&FixedRow> {
+        self.rows.iter().find(|held| held.row == row)
+    }
+
+    /// The ids a fire stages a lane: every table's.
+    #[must_use]
+    pub fn ids_a_lane(&self) -> u32 {
+        self.tables.iter().map(|table| table.len() as u32).sum()
+    }
 }
 
 impl Layout {
@@ -240,7 +346,7 @@ impl Layout {
         }
         let fixed = recipe
             .fixed()
-            .map(|layout| SlotShape::fixed(layout, chunk_bytes))
+            .map(|layout| FixedShape::of(recipe, layout))
             .transpose()?;
         let (_, segment_chunks) = recipe.profile.segment(chunk_bytes);
         Ok(Layout {
@@ -257,7 +363,7 @@ impl Layout {
         match kind {
             Kind::List => self.list.as_ref(),
             Kind::Ring => self.ring.as_ref(),
-            Kind::Fixed => self.fixed.as_ref(),
+            Kind::Fixed => self.fixed.as_ref().map(|fixed| &fixed.slot),
         }
     }
 
