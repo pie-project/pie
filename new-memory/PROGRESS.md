@@ -910,3 +910,11 @@ The `new-memory/` directory is bookkeeping and is removed before anything lands 
 - BUG (runtime): 768 MiB device kv -> "pool starved with no reclaim path ... NoEligibleVictim" without parking idle
   sessions first (1 GiB parks and passes). Assigned to RT3.
 - To look at: gemma decode 123 vs 136 tok/s (measured once); gemma boot peak 7.2 GB on both builds.
+
+### M69 — 2026-11-10: planner counts only the room weights and activation leave (RT3)
+- `sc/rt3-starved`: on a shared pool the planner's kv total counted chunks the held weights pin, so an ask that could
+  never fit waited and failed as NoEligibleVictim (IT r9 at 768 MiB: 67 chunks = 40 weights + 25 activation + 1 null,
+  1 left = 144 pages; one 3,000-token session needs 188). `SharedPool::room()` caps totals (hog check, starvation,
+  admission, diagnostics); new `PlannerError::PastPool` names the split and the shortfall.
+- e2e: 768 MiB refuses s0 with the clear message; 1 GiB identical to unconstrained.
+- Follow-up: the weight cache's 8-chunk staging floor stays pinned under held (nothing streams) -> release it.
