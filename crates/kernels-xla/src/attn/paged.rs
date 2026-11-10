@@ -2603,10 +2603,13 @@ fn scatter_slots_one_map(
     let which = with_i(f, skip, 1, Func::add)?;
     let which = f.mul(which, runs.ok)?;
     // Two bf16 planes of 16-row pages: a prompt's runs (few of them
-    // partial) are laid by one Mosaic kernel.
+    // partial) are laid by one Mosaic kernel. Not on mapped planes: there
+    // they are views of one pool buffer, which two aliased outputs of the
+    // kernel cannot both update.
     let w = i64::from(pairs[0].1.width);
     let m = f.dims(runs.page)[0];
     if let [(k, keys), (v, values)] = pairs
+        && map.is_identity()
         && keys.val != values.val
         && keys.width == values.width
         && k.width == keys.width
