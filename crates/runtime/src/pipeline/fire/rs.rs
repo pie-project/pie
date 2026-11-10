@@ -417,13 +417,19 @@ pub fn prepare_many(
             }
         };
         // The first lane writes the state; the others read what it held, or
-        // the zeros it starts from.
+        // the zeros it starts from. In a shared pool the buffer rows ride
+        // inside the record, and the group's lanes are rows of one working
+        // set in one fire whose buffered rows all land in the record it
+        // writes: each names that record, `[run, cow]` as the first does.
         for (at, &lane) in group.lanes.iter().enumerate() {
             out.bound[lane] = true;
             match (at, write.state(), held) {
                 (_, Some(state), None) if at > 0 => {
                     out.slot_ids[lane] = state.slot.0;
                     out.slot_flags[lane] = crate::engine::RS_FLAG_RESET;
+                }
+                (_, Some(state), Some(_)) if at > 0 && out.shared => {
+                    out.slot_ids[lane] = state.slot.0;
                 }
                 (0, Some(state), _) => {
                     out.slot_ids[lane] = state.slot.0;

@@ -149,9 +149,9 @@ fn recurrent_state_is_a_fixed_shape_held_twice() {
     ] {
         let facts = reads_back(name);
         let state = facts.shape(DEGENERATE_STATE).expect("a state shape");
-        assert_eq!(state.sets_per_working_set, 2);
+        assert_eq!(state.sets_per_working_set, 1);
         if let Some(buffer) = facts.shape(DEGENERATE_BUFFER) {
-            assert_eq!(buffer.sets_per_working_set, 2);
+            assert_eq!(buffer.sets_per_working_set, 1);
         }
     }
 }

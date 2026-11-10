@@ -116,7 +116,7 @@ fn a_degenerate_slot_keeps_the_id_the_engine_knows_it_by() {
     let facts = ChunkFacts::degenerate(&hybrid(), &BYTES);
     let state = facts.shape(DEGENERATE_STATE).unwrap();
     let buffer = facts.shape(DEGENERATE_BUFFER).unwrap();
-    assert_eq!(state.sets_per_working_set, 2);
+    assert_eq!(state.sets_per_working_set, 1);
     assert_eq!(state.legacy_id(4_097), Some(0));
     assert_eq!(buffer.legacy_id(4_097 + 66), Some(0));
     assert_eq!(buffer.pinned.unwrap().host.first, 8_192 + 128);

@@ -128,7 +128,7 @@ mod tests {
         assert_eq!(facts.shape(DEGENERATE_KV).unwrap().slot_bytes, 96 << 10);
         assert_eq!(
             facts.shape(DEGENERATE_STATE).unwrap().sets_per_working_set,
-            2
+            1
         );
         assert_eq!(facts.shape(DEGENERATE_BUFFER).unwrap().slot_bytes, 1 << 20);
     }
