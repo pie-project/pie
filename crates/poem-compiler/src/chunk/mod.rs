@@ -11,6 +11,11 @@
 //! rows), whole when it fits in a chunk, else cut into equal pieces on the
 //! atoms its readers let a piece cut.
 //!
+//! Beside the states, a **weight** slot holds read-only weights a device may
+//! stream ([`weights`]): a routed expert of an MoE layer, or a block of
+//! token-id-gathered table rows; the chunk size weighs how whole experts
+//! fill it too.
+//!
 //! The pass reads today's IR ([`poem_ir::CacheRow`]): spaces, windows,
 //! planes and slabs from the rows, layers, compression ratios, atoms and the
 //! rs buffer from the ops that read them.
@@ -18,6 +23,7 @@
 pub mod census;
 mod fixed;
 pub mod profile;
+pub mod weights;
 
 use std::collections::BTreeMap;
 use std::ops::Range;
@@ -26,6 +32,7 @@ use poem_ir::{Shard, Trace};
 
 pub use census::{Atom, Contract, MOST_RANKS, UNFOLDED_ROWS};
 pub use profile::ChunkProfile;
+pub use weights::{WeightBank, WeightKind, WeightSlot};
 
 use crate::{Budgets, DeviceProfile};
 use census::{FixedRow, TokenRow};
@@ -64,6 +71,10 @@ pub fn cow_sets(budgets: &Budgets) -> u32 {
 /// The least bytes a fixed slot takes: a record of a few bytes shares a chunk
 /// with a thousand-odd others.
 pub const FIXED_SLOT_FLOOR: u64 = 1 << 10;
+
+/// How much more of the chunks the weight slots fill may hold nothing than
+/// at the best-filling size, for the states to choose among the sizes.
+const WEIGHT_TAIL_SLACK: f64 = 0.01;
 
 /// The most chunk sizes the plan weighs.
 const MOST_CANDIDATES: u64 = 128;
@@ -204,6 +215,9 @@ pub struct Waste {
     pub open_chunks: u64,
     /// The working set's share of each segment's room past its last chunk.
     pub segment_tail: u64,
+    /// Not a working set's: the room past the last whole weight slot of
+    /// every chunk the weight slots fill, all of them held.
+    pub weight_tail: u64,
 }
 
 impl Waste {
@@ -242,6 +256,9 @@ pub struct ChunkRecipe {
     pub cow_sets: u32,
     pub waste: Waste,
     pub profile: ChunkProfile,
+    /// The weight slot shapes: routed experts and gathered table rows the
+    /// pool may hold read-only, one shape each kind of atom.
+    pub weights: Vec<WeightSlot>,
 }
 
 impl ChunkRecipe {
@@ -295,6 +312,41 @@ impl ChunkRecipe {
         self.slots
             .iter()
             .find(|s| matches!(s, SlotLayout::Fixed { .. }))
+    }
+
+    /// The bytes the weight floor holds: each MoE shape's top-k experts of
+    /// two layers, each table group's rows of one fire.
+    #[must_use]
+    pub fn weight_floor_bytes(&self) -> u64 {
+        self.weights.iter().map(WeightSlot::floor_bytes).sum()
+    }
+
+    /// The chunks the weight floor takes.
+    #[must_use]
+    pub fn weight_floor_chunks(&self) -> u64 {
+        self.weights
+            .iter()
+            .map(|w| w.floor_chunks(self.chunk_bytes))
+            .sum()
+    }
+
+    /// The chunks every streamable weight takes, held whole.
+    #[must_use]
+    pub fn weight_chunks(&self) -> u64 {
+        self.weights
+            .iter()
+            .map(|w| w.chunks(self.chunk_bytes))
+            .sum()
+    }
+
+    /// The weight shapes in a line ([`WeightSlot::shape`]).
+    #[must_use]
+    pub fn weight_shapes(&self) -> String {
+        self.weights
+            .iter()
+            .map(WeightSlot::shape)
+            .collect::<Vec<_>>()
+            .join(" ")
     }
 
     /// The chunks a working set takes at the profile's context, its share of
@@ -413,6 +465,8 @@ pub enum ChunkError {
     UnsizedRs,
     #[error("{row:?} is {bytes} bytes that no piece may cut, past the {most}-byte binding")]
     Uncuttable { row: RowId, bytes: u64, most: u64 },
+    #[error("an expert of {bytes} bytes fits no chunk of at most {most} bytes, whole or cut")]
+    Expert { bytes: u64, most: u64 },
 }
 
 /// Decides how `trace`'s states pack into chunks on the device `profile`
@@ -427,6 +481,22 @@ pub fn plan(
     let (lo, hi) = device.range();
     let census = census::census(trace)?;
     let cow = cow_sets(budgets);
+    let weight_groups = weights::census(trace, budgets.tokens.max_tokens);
+    // Where experts are not cut, no chunk is smaller than one.
+    let expert = weight_groups
+        .iter()
+        .filter(|g| g.is_expert())
+        .map(|g| g.whole(align))
+        .max()
+        .filter(|_| !device.cut_experts);
+    if let Some(bytes) = expert
+        && bytes > device.most()
+    {
+        return Err(ChunkError::Expert {
+            bytes,
+            most: device.most(),
+        });
+    }
 
     let draft = crate::arena::readouts_per_lane(trace)
         .min(budgets.tokens.readouts_per_lane.max(1))
@@ -537,6 +607,7 @@ pub fn plan(
         .iter()
         .map(SlotLayout::bytes)
         .chain(whole.map(|(_, bytes)| bytes))
+        .chain(expert)
         .fold(lo, u64::max);
     if let Some((row, bytes)) = whole
         && bytes > device.max_binding_bytes
@@ -556,7 +627,9 @@ pub fn plan(
         .map(|m| m * unit)
         .collect();
 
-    let mut best: Option<(u64, Waste, Option<FixedPick>)> = None;
+    // Weight slots first: of the sizes whose chunks the weights fill within
+    // a point of the best, the one the states waste least in.
+    let mut weighed = Vec::new();
     for chunk in candidates {
         let pick = if fixed_rows.is_empty() {
             None
@@ -566,6 +639,20 @@ pub fn plan(
                 None => continue,
             }
         };
+        let Some(slots) = weights::layout(&weight_groups, chunk, align, device.cut_experts) else {
+            continue;
+        };
+        weighed.push((chunk, pick, weights::tail(&slots, chunk)));
+    }
+    let fill = weighed
+        .iter()
+        .map(|(_, _, tail)| *tail)
+        .fold(f64::INFINITY, f64::min);
+    let mut best: Option<(u64, Waste, Option<FixedPick>)> = None;
+    for (chunk, pick, tail) in weighed {
+        if tail > fill + WEIGHT_TAIL_SLACK {
+            continue;
+        }
         let waste = weigh(&token_shapes, pick.as_ref(), record, cow, chunk, &device);
         let better = match &best {
             None => true,
@@ -582,7 +669,20 @@ pub fn plan(
             best = Some((chunk, waste, pick));
         }
     }
-    let (chunk_bytes, waste, pick) = best.unwrap_or((least, Waste::default(), None));
+    let (chunk_bytes, mut waste, pick) = best.unwrap_or((least, Waste::default(), None));
+    let weights = weights::layout(&weight_groups, chunk_bytes, align, device.cut_experts)
+        .ok_or_else(|| ChunkError::Expert {
+            bytes: weight_groups
+                .iter()
+                .map(|g| g.whole(align))
+                .max()
+                .unwrap_or(0),
+            most: chunk_bytes,
+        })?;
+    waste.weight_tail = weights
+        .iter()
+        .map(|w| w.chunks(chunk_bytes) * chunk_bytes - w.total_bytes())
+        .sum();
 
     let mut slots = token_shapes;
     if let Some(pick) = pick {
@@ -605,6 +705,7 @@ pub fn plan(
         cow_sets: cow,
         waste,
         profile: device,
+        weights,
     })
 }
 
