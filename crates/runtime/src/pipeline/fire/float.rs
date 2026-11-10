@@ -346,7 +346,7 @@ pub(crate) async fn fire_float_lane<C: FireContext>(
                 .zip(leases)
                 .map(|(ws, lease)| FireWs {
                     ws: ws.id,
-                    kvtxn: None,
+                    kvtxn: super::KvTxnGuard::new(model, engine, None),
                     log: None,
                     lease,
                     fold: None,

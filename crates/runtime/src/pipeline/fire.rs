@@ -138,19 +138,46 @@ fn stale_demand_error() -> String {
 
 const STALE_DEMAND_ATTEMPTS: usize = 3;
 
+/// A kv epoch a fire holds: settled by whoever finishes the fire, or, let go
+/// unsettled, when dropped — at once while the fire was never submitted,
+/// else once the engine has run it ([`Self::retire_on`]). A pending fire
+/// dropped unfinalized (its process gone) would otherwise hold the epoch
+/// open for good, and every id freed after it would wait on it.
 struct KvTxnGuard {
     model: usize,
     engine: usize,
     txn: Option<kv::KvTxn>,
+    submitted: Option<crate::engine::WorkItemCompletion>,
 }
 
 impl KvTxnGuard {
     fn new(model: usize, engine: usize, txn: Option<kv::KvTxn>) -> Self {
-        Self { model, engine, txn }
+        Self {
+            model,
+            engine,
+            txn,
+            submitted: None,
+        }
     }
 
     fn into_inner(mut self) -> Option<kv::KvTxn> {
         self.txn.take()
+    }
+
+    /// The fire is submitted: dropped unsettled, it settles once
+    /// `completion` resolves, not sooner.
+    fn retire_on(&mut self, completion: &crate::engine::WorkItemCompletion) {
+        self.submitted = Some(completion.clone());
+    }
+
+    fn settle(model: usize, engine: usize, txn: kv::KvTxn) {
+        let stores = crate::store::registry::get(model, engine);
+        crate::store::registry::with_kv_lock(&stores.kv, "host-other", |store| {
+            kv::settle(store, txn);
+        });
+        if let Some(planner) = crate::planner::planner_for(model, engine) {
+            planner.pages_freed();
+        }
     }
 }
 
@@ -159,12 +186,10 @@ impl Drop for KvTxnGuard {
         let Some(txn) = self.txn.take() else {
             return;
         };
-        let stores = crate::store::registry::get(self.model, self.engine);
-        crate::store::registry::with_kv_lock(&stores.kv, "host-other", |store| {
-            kv::settle(store, txn);
-        });
-        if let Some(planner) = crate::planner::planner_for(self.model, self.engine) {
-            planner.pages_freed();
+        let (model, engine) = (self.model, self.engine);
+        match self.submitted.take() {
+            Some(completion) => completion.on_settled(move || Self::settle(model, engine, txn)),
+            None => Self::settle(model, engine, txn),
         }
     }
 }
@@ -189,12 +214,12 @@ impl FireEpoch {
     /// Closes the epoch once the engine has run the fire `completion`
     /// waits on: no sooner, since what it frees may still be read, and no
     /// later than that, since a pass may not settle its fires for long.
+    /// Not by awaiting it: the completion wakes one waiter, and the pass
+    /// that finalizes the fire awaits it too, so a second waiter here lost
+    /// its wakeup and held the epoch, and every id freed after it, open
+    /// until shutdown.
     fn retire_on(self, completion: &crate::engine::WorkItemCompletion) {
-        let completion = completion.clone();
-        crate::rt::spawn(async move {
-            let _ = completion.await;
-            drop(self);
-        });
+        completion.on_settled(move || drop(self));
     }
 }
 
@@ -1347,7 +1372,7 @@ pub(crate) fn test_pending_op_stub() -> PendingOp {
 
 struct FireWs {
     ws: crate::store::kv::page_table::WorkingSetId,
-    kvtxn: Option<kv::KvTxn>,
+    kvtxn: KvTxnGuard,
     log: Option<LogFire>,
     lease: KvFireLease,
     fold: Option<FoldAt>,
@@ -2910,7 +2935,7 @@ pub async fn submit_pass_stamped<C: FireContext>(
                 );
                 parts.push(FireWs {
                     ws: set.id,
-                    kvtxn: kvtxn.into_inner(),
+                    kvtxn,
                     log: Some(LogFire { seq, rows }),
                     lease,
                     fold: by.map(|by| FoldAt {
@@ -2973,6 +2998,9 @@ pub async fn submit_pass_stamped<C: FireContext>(
                 return Ok(Err(reason));
             }
             epoch.retire_on(&completion);
+            for part in &mut parts {
+                part.kvtxn.retire_on(&completion);
+            }
             if let Some(reservation) = ticket_reservation {
                 reservation.commit();
             }
@@ -3508,7 +3536,7 @@ async fn finalize_fire_await(fire: PendingFire) -> Anyhow<FinalizeOutcome> {
         let mut folds = Vec::with_capacity(kv.len());
         let mut reported = std::collections::HashMap::new();
         for part in kv {
-            if let Some(kvtxn) = part.kvtxn {
+            if let Some(kvtxn) = part.kvtxn.into_inner() {
                 crate::store::registry::with_kv_lock(&stores.kv, "host-other", |kv_store| {
                     kv::settle(kv_store, kvtxn);
                 });
@@ -3976,7 +4004,7 @@ async fn fire_device_geometry<C: FireContext>(
         );
         parts.push(FireWs {
             ws: set.id,
-            kvtxn: kvtxn.into_inner(),
+            kvtxn,
             log: Some(LogFire { seq: log_seq, rows }),
             lease,
             fold: by.map(|by| FoldAt {
@@ -4010,6 +4038,9 @@ async fn fire_device_geometry<C: FireContext>(
         return Ok(Err(reason));
     }
     epoch.retire_on(&completion);
+    for part in &mut parts {
+        part.kvtxn.retire_on(&completion);
+    }
     ticket_reservation.commit();
     advance_shadow(ctx, &fwd)?;
     advance_cursors(&pass_lanes, None, &[], &fold, &settles);
@@ -4118,7 +4149,7 @@ pub(crate) mod lifecycle_tests {
                 checkpoints: Vec::new(),
                 kv: vec![FireWs {
                     ws: id,
-                    kvtxn: Some(txn),
+                    kvtxn: KvTxnGuard::new(model, 0, Some(txn)),
                     log: None,
                     lease: ws.fire_lease().expect("lease the submitted working set"),
                     fold: None,
