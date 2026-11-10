@@ -186,16 +186,44 @@ impl Shell {
         &mut self,
         residency: &engine::chunk::WeightResidency,
     ) -> crate::Result<()> {
+        // The pages this shell seats for its lanes itself stay clear of the
+        // chunks the runtime lays weights in. One already there is let go
+        // with every other, which only a shell holding no lane's rows may.
+        let chunks = self.pools.weight_chunks(residency);
+        if self.pools.seated_in(&chunks) {
+            if let Some(slot) = self.held.iter().position(|&held| held > 0) {
+                return Err(crate::error::Fault::Unbound {
+                    what: format!(
+                        "a weight slot in a chunk this shell seated lane pages in, while \
+                         slot {slot} holds rows: the pages cannot move"
+                    ),
+                });
+            }
+            self.device.synchronize()?;
+        }
+        self.pools.keep_clear(chunks);
         if self
             .pools
             .weight_residency(self.device.stream(), residency)?
         {
-            // A recorded body keeps the select it chose for where a bank's
-            // experts lay: the lattice is recorded again over where they
-            // lie now.
-            self.device.synchronize()?;
-            self.cache.forget_bodies();
-            self.arm_bodies()?;
+            if self.pools.by_refs() {
+                // The lattice fires lanes this shell seats itself, which a
+                // pool whose slots the runtime hands out no longer has: the
+                // recorded bodies keep the plain-load select they chose,
+                // which reads a located table as well.
+                eprintln!(
+                    "engine-cuda: a held weight set arrived after lanes named slot refs; \
+                     the recorded bodies keep the per-route select (send the set before \
+                     the first fire)"
+                );
+            } else {
+                // A recorded body keeps the select it chose for where a
+                // bank's experts lay: the lattice is recorded again over
+                // where they lie now.
+                self.device.synchronize()?;
+                self.cache.forget_bodies();
+                self.arm_bodies()?;
+            }
         }
         // A set held whole for the load's life is read from the pool alone:
         // its pinned host copy goes.

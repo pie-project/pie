@@ -1541,12 +1541,12 @@ fn served_rows(fixture: &Fixture, cache: &Path, rows: Rows) -> (Vec<(u64, u32)>,
     // What the load's own fires read is not the script's.
     let _ = shell.weight_uses().expect("the use record reads");
     if rows != Rows::Host {
-        // The table's slots from the second segment on, clear of the chunks
-        // the seats' pages open in the first.
+        // The table's slots from the pool's first chunk on, as a runtime's
+        // allocator lays them: where this load's own fires seated pages.
         let cached: Vec<u32> = (0..table.count)
             .filter(|atom| rows == Rows::Cached || atom % 2 == 0)
             .collect();
-        let first = facts.segment_chunks;
+        let first = 1;
         let chunks = (cached.len() as u32).div_ceil(table.slots_per_chunk);
         shell
             .commit_segments((first + chunks).div_ceil(facts.segment_chunks))
@@ -1703,8 +1703,9 @@ fn golden_rows_resident() {
             let (_, blocks) = shell.row_blocks();
             assert!(blocks > 0, "{model} streams no table by its rows");
             if resident {
-                // Every shape's blocks, each a slot, from the second segment.
-                let mut first = facts.segment_chunks;
+                // Every shape's blocks, each a slot, from the pool's first
+                // chunk on, as a runtime's allocator lays them.
+                let mut first = 1;
                 let mut named = Vec::new();
                 for table in &facts.weights {
                     named.extend((0..table.count).map(|atom| ResidentWeight {
@@ -1767,8 +1768,10 @@ fn served_experts(fixture: &Fixture, cache: &Path, rows: Rows) -> Vec<Vec<f32>> 
     let _ = shell.weight_uses().expect("the use record reads");
     let mut want = Vec::new();
     let mut resident = Vec::new();
-    // Each shape's slots in chunks of its own, from the second segment on.
-    let mut first = facts.segment_chunks;
+    // Each shape's slots in chunks of its own, from the pool's first chunk
+    // on, as a runtime's allocator lays them: where this load's own fires
+    // seated their pages.
+    let mut first = 1;
     // A deployment that streams nothing holds every weight shape whole, the
     // row-streamed tables' too; the other two lay the experts alone.
     let named: Vec<_> = facts
