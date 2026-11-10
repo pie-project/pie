@@ -30,7 +30,7 @@ impl Run<'_> {
             } => attn::score::capture(
                 self.ctx(),
                 self.ragged(*q),
-                self.prefill_plan(*plan),
+                &self.prefill_plan_over(*plan, *cache),
                 self.pool(*cache),
                 *head_dim,
                 *kv_heads,

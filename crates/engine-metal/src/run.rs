@@ -42,6 +42,8 @@ pub struct CacheTable {
     pub lane_slots: Vec<Option<Tensor>>,
     /// Each cache row's band, for the snapshot table it reads.
     pub band_of: Vec<Option<usize>>,
+    /// Each kv cache row's page table (its list's) among the fire's.
+    pub tables: Vec<Option<usize>>,
 }
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -1629,34 +1631,7 @@ impl<'c> Run<'c> {
                 ..
             }) => self.fire.tables.request_of_token,
             Def::Input(RuntimeInput::Geometry { kind }) => {
-                let table = self.table_of(*kind);
-                let seat = self.fire.geometry.get(table).unwrap_or_else(|| {
-                    panic!(
-                        "value {at} reads page table {table}, and this fire binds {} \
-                         page tables",
-                        self.fire.geometry.len()
-                    )
-                });
-                let bound = match kind {
-                    GeomKind::Indptr => seat.indptr,
-                    GeomKind::Indices => seat.indices,
-                    GeomKind::SeqLens => seat.seq_lens,
-                    GeomKind::LastPageLen => seat.last_page_len,
-                    GeomKind::KvLen => seat.kv_len,
-                    GeomKind::RowValid => seat.row_valid,
-                    GeomKind::WritePage { .. } => seat.write_page,
-                    GeomKind::WriteOffset { .. } => seat.write_offset,
-                    GeomKind::RequestOfToken
-                    | GeomKind::GroupOfLane
-                    | GeomKind::GroupIndptr { .. }
-                    | GeomKind::LaneIndptr { .. } => None,
-                };
-                bound.unwrap_or_else(|| {
-                    panic!(
-                        "value {at} reads {kind:?} of page table {table}, which this \
-                         fire left unbound"
-                    )
-                })
+                self.geometry_of(at, *kind, self.table_of(*kind))
             }
             Def::Weight(w) => {
                 let row = *w as usize;
@@ -1751,6 +1726,69 @@ impl<'c> Run<'c> {
         match poem_exec::store::kv::geometry_window(kind) {
             Some(_) => self.fire.window_table,
             None => 0,
+        }
+    }
+
+    /// Geometry input `at` (of `kind`) as page table `table` states it.
+    fn geometry_of(&self, at: usize, kind: GeomKind, table: usize) -> Tensor {
+        let seat = self.fire.geometry.get(table).unwrap_or_else(|| {
+            panic!(
+                "value {at} reads page table {table}, and this fire binds {} \
+                 page tables",
+                self.fire.geometry.len()
+            )
+        });
+        let bound = match kind {
+            GeomKind::Indptr => seat.indptr,
+            GeomKind::Indices => seat.indices,
+            GeomKind::SeqLens => seat.seq_lens,
+            GeomKind::LastPageLen => seat.last_page_len,
+            GeomKind::KvLen => seat.kv_len,
+            GeomKind::RowValid => seat.row_valid,
+            GeomKind::WritePage { .. } => seat.write_page,
+            GeomKind::WriteOffset { .. } => seat.write_offset,
+            GeomKind::RequestOfToken
+            | GeomKind::GroupOfLane
+            | GeomKind::GroupIndptr { .. }
+            | GeomKind::LaneIndptr { .. } => None,
+        };
+        bound.unwrap_or_else(|| {
+            panic!(
+                "value {at} reads {kind:?} of page table {table}, which this \
+                 fire left unbound"
+            )
+        })
+    }
+
+    /// Prefill plan `plan` as cache row `cache` reads it: its last-page
+    /// lengths are the ones `cache`'s own page table states. A plan reads
+    /// the All axis's table (the kv list's), and a window list whose slot is
+    /// smaller than the kv page counts another last page.
+    pub(crate) fn prefill_plan_over(&self, plan: ValueId, cache: ValueId) -> PrefillPlan {
+        let built = *self.prefill_plan(plan);
+        let Some(Def::Cache(row)) = self.values.get(cache.0 as usize).map(|v| &v.def) else {
+            return built;
+        };
+        let Some(table) = self.caches.tables.get(*row as usize).copied().flatten() else {
+            return built;
+        };
+        if table == 0 {
+            return built;
+        }
+        let last_page_len = match &self.window().gathered {
+            Some(gathered) => gathered
+                .page_tables
+                .get(table)
+                .map_or(built.last_page_len, |seat| seat.last_page_lens),
+            None => {
+                let lens = self.geometry_of(cache.0 as usize, GeomKind::LastPageLen, table);
+                let span = self.window().span;
+                self.slice(lens, span.lane_offset, span.lanes)
+            }
+        };
+        PrefillPlan {
+            last_page_len,
+            ..built
         }
     }
 

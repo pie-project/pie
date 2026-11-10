@@ -71,6 +71,16 @@ fn write_checkpoint(path: &Path, trace: &Trace) {
                     .flat_map(|_| value(next()).to_le_bytes())
                     .collect(),
             ),
+            // A hash-routing table: each row names experts 0.. of its width.
+            Dtype::I64 => {
+                let width = param.shape.last().copied().unwrap_or(1).max(1);
+                (
+                    ztensor::Leaf::I64,
+                    (0..count as u64)
+                        .flat_map(|at| (at % width).to_le_bytes())
+                        .collect(),
+                )
+            }
             other => panic!(
                 "`{}` is {other:?}, not a dtype the fixture seeds",
                 param.name
@@ -522,6 +532,20 @@ fn a_trimmed_window_list_of_smaller_slots_reads_as_the_whole_one() {
     trimmed_window("muse-glimmer-30b-mini-l8", Some(4), 2560, 2200);
 }
 
+/// As [`a_trimmed_window_list_reads_as_the_whole_one`], a latent model's
+/// 128-row window list of 16-token slots beside its 128-token kv pages,
+/// its plans reading the kv list's geometry.
+///
+/// Fails on device, at M38 as at M39: the logits part from the
+/// seat-addressed run's from the first fire whenever the window list is
+/// read by slot ref, trimmed or not (the kv list by slot ref alone lands the
+/// same bits). Its windowed rows are the ones a pool gather compresses.
+#[test]
+#[ignore = "dsv4's windowed rows by slot ref part from seat-addressed (see doc)"]
+fn a_trimmed_window_list_beside_a_compressed_kv_list_reads_as_the_whole_one() {
+    trimmed_window("dsv4-flash-mini", None, 1024, 700);
+}
+
 fn trimmed_window(model: &str, layers: Option<u32>, context: u32, prompt: u32) {
     use engine_metal::store::layout::WINDOW;
 
@@ -557,10 +581,24 @@ fn trimmed_window(model: &str, layers: Option<u32>, context: u32, prompt: u32) {
         let first =
             (1 + layout.seat_chunks()).div_ceil(facts.segment_chunks) * facts.segment_chunks;
         let pages = context.div_ceil(tokens);
-        let commit = (first + pages.div_ceil(per) + 1).div_ceil(facts.segment_chunks);
+        let window_chunks = pages.div_ceil(per);
+        // A kv list beside the window list: its pages in the chunks above
+        // the window list's.
+        let list = facts.shape(LIST).map(|list| {
+            let engine::chunk::SlotKind::List { tokens, .. } = list.kind else {
+                panic!("the kv list is a list: {:?}", list.kind);
+            };
+            (tokens, list.slots_per_chunk)
+        });
+        let list_chunks = list.map_or(0, |(t, per)| context.div_ceil(t).div_ceil(per));
+        let commit = (first + window_chunks + list_chunks + 1).div_ceil(facts.segment_chunks);
         shell.commit_segments(commit).expect("the segments commit");
         // Page k of the lane in chunk first + k / per, slots strided in it.
         let slot_ref = |k: u32| (first + k / per) * per + (k * 7 + 3) % per;
+        let list_ref = |k: u32| {
+            let (_, per) = list.expect("a kv list");
+            (first + window_chunks + k / per) * per + (k * 5 + 1) % per
+        };
         let mut rows_out = Vec::new();
         let mut held = 0u32;
         let mut fed: Vec<u32> = prompt.clone();
@@ -586,9 +624,14 @@ fn trimmed_window(model: &str, layers: Option<u32>, context: u32, prompt: u32) {
                         }
                     })
                     .collect();
+                let list_pages: Vec<u32> = match list {
+                    Some((t, _)) if trimmed => (0..after.div_ceil(t)).map(list_ref).collect(),
+                    _ => Vec::new(),
+                };
                 let seated = Seated {
                     held: Some(held),
                     refs: trimmed,
+                    pages: &list_pages,
                     window: if trimmed { &table } else { &[] },
                     ..Seated::of(Lane {
                         slot: 0,

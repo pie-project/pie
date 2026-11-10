@@ -973,6 +973,7 @@ impl Pools {
         let mut state_row = 0u64;
         let mut lane_slots = Vec::with_capacity(self.rows.len());
         let mut band_of = Vec::with_capacity(self.rows.len());
+        let mut tables = Vec::with_capacity(self.rows.len());
         for row in &self.rows {
             pools.push(match *row {
                 Row::Compressed {
@@ -1024,6 +1025,7 @@ impl Pools {
                     };
                     lane_slots.push(None);
                     band_of.push(None);
+                    tables.push(Some(table));
                     let (stride, page_size) = match paging {
                         TablePaging::List => (list_bytes, self.paging.page_size),
                         TablePaging::Window => {
@@ -1071,6 +1073,7 @@ impl Pools {
                     );
                     state_row += 1;
                     band_of.push(Some(band));
+                    tables.push(None);
                     lane_slots.push(Some(
                         seats
                             .lane_bands
@@ -1097,6 +1100,7 @@ impl Pools {
             compressed,
             lane_slots,
             band_of,
+            tables,
         })
     }
 
