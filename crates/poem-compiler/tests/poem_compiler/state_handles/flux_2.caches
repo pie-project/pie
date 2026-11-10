@@ -1,0 +1,10 @@
+flux2-klein-4b-bf16-kv-bf16 26f5e48f148c203b
+flux2-klein-4b-bf16-kv-bf16-tp2 94d4629cbce950f7
+flux2-klein-4b-bf16-kv-bf16-tp4 16eedd7dec27ec03
+flux2-klein-4b-bf16-kv-bf16-tp8 40e3a355d54f65a7
+flux2-klein-4b-u4g64-kv-bf16 26f5e48f148c203b
+flux2-klein-4b-u4g64-kv-bf16-tp2 94d4629cbce950f7
+flux2-klein-4b-u4g64-kv-bf16-tp4 16eedd7dec27ec03
+flux2-klein-4b-u4g64-kv-bf16-tp8 40e3a355d54f65a7
+flux2-mini-bf16-kv-bf16 09612b07b5ecb5a5
+flux2-mini-bf16-kv-bf16-tp2 09612b07b5ecb5a5

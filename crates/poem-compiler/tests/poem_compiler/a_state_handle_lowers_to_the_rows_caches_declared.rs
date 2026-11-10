@@ -114,6 +114,45 @@ fn glm_5(path: &str, _row: &CacheRow) -> String {
     }
 }
 
+/// A VAE conv's frames, by the conv's place in the decoder (`vae.`) or the
+/// encoder (`vae.enc.`).
+fn wan_2(path: &str, _row: &CacheRow) -> String {
+    let conv = match parts(path)[..] {
+        ["vae", "enc", "down", b, "resnets", r, conv, "cache"] => {
+            format!("enc.down.{b}.res.{r}.{conv}")
+        }
+        ["vae", "enc", "down", b, "downsampler", conv, "cache"] => format!("enc.down.{b}.{conv}"),
+        ["vae", "up", b, "resnets", r, conv, "cache"] => format!("up.{b}.res.{r}.{conv}"),
+        ["vae", "up", b, "upsampler", conv, "cache"] => format!("up.{b}.{conv}"),
+        ["vae", "enc", res, conv, "cache"] if res.starts_with("mid_res") => {
+            format!("enc.mid.res.{}.{conv}", &res[7..])
+        }
+        ["vae", res, conv, "cache"] if res.starts_with("mid_res") => {
+            format!("mid.res.{}.{conv}", &res[7..])
+        }
+        ["vae", "enc", conv, "cache"] => format!("enc.{conv}"),
+        ["vae", conv, "cache"] => conv.to_string(),
+        _ => return path.to_string(),
+    };
+    format!("vae.{conv}.frames")
+}
+
+fn ltx_2(path: &str, _row: &CacheRow) -> String {
+    path.to_string()
+}
+
+fn flux_2(path: &str, _row: &CacheRow) -> String {
+    path.to_string()
+}
+
+fn z_image(path: &str, _row: &CacheRow) -> String {
+    path.to_string()
+}
+
+fn hunyuan_image_3(path: &str, _row: &CacheRow) -> String {
+    path.to_string()
+}
+
 /// Every listed deployment of `package`, at one rank and at each count of
 /// [`RANKS`] it traces at.
 fn deployments(package: &str) -> Vec<Deployment> {
@@ -259,5 +298,10 @@ mod moved {
         gemma_4,
         qwen_3,
         glm_5,
+        wan_2,
+        ltx_2,
+        flux_2,
+        z_image,
+        hunyuan_image_3,
     );
 }
