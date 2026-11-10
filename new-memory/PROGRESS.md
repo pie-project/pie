@@ -842,3 +842,13 @@ The `new-memory/` directory is bookkeeping and is removed before anything lands 
   base on the plugin; ssm not re-run on base this round).
 - TPU: new-memory/XLA-TPU-CHECKLIST.md (bitwise gate commands, TPU-only kernel tests, v5e/v6e speed vs main incl.
   Mosaic kv append and bitcast relayout cost). Weight streaming on XLA: design only.
+
+### M64 — 2026-11-10: quantized fixture writer (all backends)
+- `sc/l40s-wc-quant` (c29148c53): `checkpoint::testkit::artifact::import(source, contract, stamp, tiled, out)` runs
+  what `pie model import` does into a serving artifact; feed packed weights as bf16 at the unpacked shape (scales made
+  by the encode), plain E4m3 / E8m0 / U8 planes as served bytes. Tested: dsv41-flash-mini-dspark (Mxfp4 banks, block
+  FP8, NVFP4 kv) imports and loads on CUDA. Untested: affine U4/U2, tiled banks, other platforms.
+- Fix: under `one-window`, rows go to the list the recipe lays them in; write tables found by the declared window.
+  golden_logits_by_refs = base in both layouts on 4 single-window minis.
+- Two-window mini loads (2 window lists) but cannot fire on L40S (sm_89 kernel gap for its fp8 compressed rows) ->
+  bitwise two-lists vs one-window comparison to run on sm_120.
