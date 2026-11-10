@@ -4,78 +4,46 @@ runs the wafer token loop: every launch the host writes step 0's input (the embe
 head control root's force table (prompt / teacher forcing) and launches S steps; the ring holds each step's argmax.
   run_gemma12.py --name <out> [--cmaddr A] --report r.json --prep <dir> [--prefix p] [--ntok N] [--greedy 1]
              [--force 1|2] [--wloop S] [--reps R]"""
-import argparse, json, os, sys, time
+import json, os, sys, time
 import numpy as np
-from cerebras.sdk.runtime.sdkruntimepybind import MemcpyDataType, MemcpyOrder, SdkRuntime  # pylint: disable=no-name-in-module
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-import compiler
+import host
 
-ap = argparse.ArgumentParser()
-ap.add_argument("--name"); ap.add_argument("--cmaddr"); ap.add_argument("--report", default="g.json")
-ap.add_argument("--prep"); ap.add_argument("--prefix", default=""); ap.add_argument("--ntok", type=int, default=0)
-ap.add_argument("--greedy", type=int, default=0); ap.add_argument("--force", type=int, default=2)
-ap.add_argument("--wloop", type=int, default=0); ap.add_argument("--reps", type=int, default=1)
-ap.add_argument("--override", default="")
-ap.add_argument("--xdbg", type=int, default=0, help="read every CX's x after each layer after each launch (XKEEP 1 builds)")
-ap.add_argument("--tdbg", type=int, default=0)
-ap.add_argument("--fine", type=int, default=0)
-ap.add_argument("--golden", default="golden.json", help="the golden in the prep dir (after the prefix)")
+ap = host.parser(__doc__)
+ap.add_argument("--wloop", type=int, default=0); ap.add_argument("--fine", type=int, default=0)
 ap.add_argument("--placeonly", type=int, default=0, help="(checks) stop after the placement (the mock runtime's copy log)")
-ap.add_argument("--compiled", default=os.path.join(os.path.dirname(os.path.abspath(__file__)), "compiled"), help="wafer-compile's output for this prep (build_gemma12.py writes it)")
 a = ap.parse_args()
-t00 = time.time()
-M = json.load(open(os.path.join(a.prep, a.prefix + "meta.json")))
-for kv in filter(None, a.override.split(",")):
-    k, v = kv.split("="); M[k] = int(v)
-def npy(n):
-    return np.load(os.path.join(a.prep, a.prefix + n + ".npy"), mmap_mode="r")
-g = compiler.load(a.compiled)
-PX, PY, XC, YC, NU, K, RA = g.PX, g.PY, g.XC, g.YC, g.units(), M["K"], g.RA
+h = host.Host(a)
+M, g, npy, put, get = h.meta, h.g, h.npy, h.put, h.get
+PY, XC, YC, NU, K = g.PY, g.XC, g.YC, g.units(), M["K"]
+HX0, HXC, HR = g.HX0, g.HXC, g.HR
 OFF = np.concatenate([[0], np.cumsum([g.hc(r) for r in range(PY)])]).astype(int)
-LAST = NU - 1
-runner = SdkRuntime(a.name, cmaddr=a.cmaddr)
-runner.load(); runner.run()
-t_load = time.time() - t00
-k32 = dict(streaming=False, data_type=MemcpyDataType.MEMCPY_32BIT, order=MemcpyOrder.ROW_MAJOR, nonblock=False)
-k16 = dict(streaming=False, data_type=MemcpyDataType.MEMCPY_16BIT, order=MemcpyOrder.ROW_MAJOR, nonblock=False)
-ID = {}
-def sym(s):
-    if s not in ID: ID[s] = runner.get_id(s)
-    return ID[s]
-def put(s, x0, y0, w, h, arr, b16=False):
-    if w * h == 0: return
-    arr = np.array(arr, copy=True)
-    if b16: arr = arr.view(np.uint16).astype(np.uint32)
-    n = arr.size // (w * h)
-    runner.memcpy_h2d(sym(s), arr.reshape(-1), x0, y0, w, h, n, **(k16 if b16 else k32))
-def get(s, x0, y0, w, h, n, dt=np.float32):
-    b = np.zeros(w * h * n, dt)
-    runner.memcpy_d2h(b, sym(s), x0, y0, w, h, n, **k32)
-    return b.reshape(h, w, n)
-t0 = time.time()
-# every copy as wafer-compile's bindings state them (the Rust family's placement, in its order)
-compiler.place(put, npy, g, lambda n: os.path.exists(os.path.join(a.prep, a.prefix + n + ".npy")))
-t_place = time.time() - t0
+h.place()
 if a.placeonly:
-    print(json.dumps({"placed_s": round(t_place, 1)}), flush=True)
+    print(json.dumps({"placed_s": round(h.t_place, 1)}), flush=True)
     sys.exit(0)
-runner.launch("init", nonblock=False)
-_bar = np.zeros(g.W * g.H, np.uint32)
-runner.memcpy_d2h(_bar, sym("rcfg"), 0, 0, g.W, g.H, 1, **k32)
-print(json.dumps({"load_s": round(t_load, 1), "place_s": round(t_place, 1)}), flush=True)
+h.init()
+t_load, t_place = h.t_load, h.t_place
+
+
+def rowblocks():
+    """Runs of CX rows of one dims count, split at the CY row: (first row, end, dims)."""
+    r0 = 0
+    for r in range(1, PY + 1):
+        if r == PY or r == YC or g.hc(r) != g.hc(r0):
+            yield r0, r, g.hc(r0)
+            r0 = r
+
 
 def put_step0(tok, pos):
     e = np.zeros(OFF[-1], np.float32)
     e[:M["H"]] = (np.asarray(FE[tok]).astype(np.uint32) << 16).view(np.float32)
     U0 = g.unit_origin(0)
-    for (r0, r1, kd) in rowblocks():
-        hc = g.hc(r0)
+    for (r0, r1, hc) in rowblocks():
         put("x", U0[0] + XC, U0[1] + g.wl(r0, YC), 1, r1 - r0, e[OFF[r0]:OFF[r1]].reshape(r1 - r0, 1, hc))
 FE = npy("embed")
 CAP = 256
-ring = np.zeros(CAP, np.uint32)
-rep_out = []
-gold = json.load(open(os.path.join(a.prep, a.prefix + a.golden)))
+gold = h.golden()
 ids = gold["prompt_ids"] + gold["tokens"]
 NP = len(gold["prompt_ids"])
 ntok = a.ntok or len(gold["tokens"])
@@ -99,16 +67,15 @@ for rep in range(a.reps):
         put("force", HX0 + HXC, HR // 2, 1, 1, np.array(fl + [0] * (CAP - len(fl)), np.uint32))
         put("nforce", HX0 + HXC, HR // 2, 1, 1, np.array([len(fl)], np.uint32))
         tw = time.time()
-        runner.launch("compute", np.uint32(S_), np.uint32(t), nonblock=False)
-        runner.memcpy_d2h(ring, sym("ring"), HX0 + HXC, HR // 2, 1, 1, CAP, **k32)
+        h.launch(S_, t)
+        ring = get("ring", HX0 + HXC, HR // 2, 1, 1, CAP, np.uint32)[0, 0]
         walls += [(time.time() - tw) / S_] * S_
         if a.xdbg:
             ux = []
             for u in range(NU):
                 X0, Y0 = g.unit_origin(u)
                 xl = np.zeros((K, OFF[-1]), np.float32)
-                for (r0, r1, kd) in rowblocks():
-                    hc = g.hc(r0)
+                for (r0, r1, hc) in rowblocks():
                     v = get("xdbg", X0 + XC, Y0 + g.wl(r0, YC), 1, r1 - r0, K * hc)[:, 0].reshape(r1 - r0, K, hc)
                     xl[:, OFF[r0]:OFF[r1]] = v.transpose(1, 0, 2).reshape(K, -1)
                 ux.append(xl[:, :M["H"]].tolist())
@@ -146,7 +113,7 @@ if a.tdbg:
             ph[f"u{u}_{nm}"] = [int(v) for v in (b_ - int(b_[0])) % (1 << 32)]
     times["phases"] = ph
     print("TIMES " + json.dumps(times), flush=True)
-runner.stop()
+h.stop()
 if xd:
     json.dump(xd, open(a.report.replace(".json", "_xd.json"), "w"))
 r = reps[-1]

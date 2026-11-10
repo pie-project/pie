@@ -234,7 +234,7 @@ program without an artifact is refused.
   says.
 - `tools/wafer/build.py <out> <plan.json> [levers]` is the build directory of any family (the
   `build_{gemma,gemma12,gptoss}.py` add their runner); `link.sh` links it, checks stack room and
-  puts the artifact beside the compiled program; the `gotiny.sh` scripts run a tiny prep on the
+  puts the artifact beside the compiled program; `gotiny.sh` runs a tiny prep on the
   simulator; `regen.sh` rebuilds the shipping programs (README there).
 
 ## Verification

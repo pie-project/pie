@@ -23,13 +23,6 @@ pub enum FamilyId {
 }
 
 impl FamilyId {
-    pub const ALL: [FamilyId; 4] = [
-        FamilyId::Qwen,
-        FamilyId::GptOss,
-        FamilyId::Gemma,
-        FamilyId::Gemma12,
-    ];
-
     /// The family's name (the plan's record, error messages).
     pub fn name(self) -> &'static str {
         match self {
@@ -38,10 +31,6 @@ impl FamilyId {
             FamilyId::Gemma => "gemma",
             FamilyId::Gemma12 => "gemma12",
         }
-    }
-
-    pub fn of_name(name: &str) -> Option<FamilyId> {
-        FamilyId::ALL.into_iter().find(|f| f.name() == name)
     }
 }
 

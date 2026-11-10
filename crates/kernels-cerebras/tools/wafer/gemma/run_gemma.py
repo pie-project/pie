@@ -6,67 +6,27 @@ and launches S steps; the ring holds each step's argmax.
   run_gemma.py --name <out> [--cmaddr A] --report r.json --prep <dir> [--prefix p] [--ntok N] [--greedy 1]
                [--force 1|2] [--wloop S] [--reps R] [--probe L]  (DIAG 1 builds: L launches of S forced random ids,
                checks the PLE words every CY got and the KVS words every consumer weight PE got)"""
-import argparse, json, os, sys, time
+import json, os, sys, time
 import numpy as np
-from cerebras.sdk.runtime.sdkruntimepybind import MemcpyDataType, MemcpyOrder, SdkRuntime  # pylint: disable=no-name-in-module
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-import compiler
+import host
 
-ap = argparse.ArgumentParser()
-ap.add_argument("--name"); ap.add_argument("--cmaddr"); ap.add_argument("--report", default="g.json")
-ap.add_argument("--prep"); ap.add_argument("--prefix", default=""); ap.add_argument("--ntok", type=int, default=0)
-ap.add_argument("--greedy", type=int, default=0); ap.add_argument("--force", type=int, default=2)
-ap.add_argument("--wloop", type=int, default=0); ap.add_argument("--reps", type=int, default=1)
-ap.add_argument("--probe", type=int, default=0); ap.add_argument("--kvseq", type=int, default=0, help="(PLOG full-model probes) check only the KVS sequence words"); ap.add_argument("--override", default="")
-ap.add_argument("--xdbg", type=int, default=0, help="read every CX's x after each layer after each launch (XKEEP 1 builds)")
-ap.add_argument("--tdbg", type=int, default=0)
-ap.add_argument("--fine", type=int, default=0)
-ap.add_argument("--notb", type=int, default=0, help="(bisect) the head control rows send no TB, the storage PEs read none")
-ap.add_argument("--golden", default="golden.json", help="the golden in the prep dir (after the prefix)")
-ap.add_argument("--compiled", default=os.path.join(os.path.dirname(os.path.abspath(__file__)), "compiled"), help="wafer-compile's output for this prep (build_gemma.py writes it)")
+ap = host.parser(__doc__)
+ap.add_argument("--wloop", type=int, default=0); ap.add_argument("--fine", type=int, default=0)
+ap.add_argument("--probe", type=int, default=0)
+ap.add_argument("--kvseq", type=int, default=0, help="(PLOG full-model probes) check only the KVS sequence words")
 ap.add_argument("--placeonly", type=int, default=0, help="(checks) stop after the placement (the mock runtime's copy log)")
 a = ap.parse_args()
-t00 = time.time()
-M = json.load(open(os.path.join(a.prep, a.prefix + "meta.json")))
-for kv in filter(None, a.override.split(",")):
-    k, v = kv.split("="); M[k] = int(v)
-def npy(n):
-    return np.load(os.path.join(a.prep, a.prefix + n + ".npy"), mmap_mode="r")
-g = compiler.load(a.compiled)
-if a.notb:
-    sys.exit("--notb: rebuild the geometry with the head control rows' TB off (wafer-compile) instead")
+h = host.Host(a)
+M, g, npy, put, get = h.meta, h.g, h.npy, h.put, h.get
 PX, PY, XC, YC, NU, Hc, K = g.PX, g.PY, g.XC, g.YC, g.units(), M["Hc"], M["K"]
-LAST = NU - 1
-runner = SdkRuntime(a.name, cmaddr=a.cmaddr)
-runner.load(); runner.run()
-t_load = time.time() - t00
-k32 = dict(streaming=False, data_type=MemcpyDataType.MEMCPY_32BIT, order=MemcpyOrder.ROW_MAJOR, nonblock=False)
-k16 = dict(streaming=False, data_type=MemcpyDataType.MEMCPY_16BIT, order=MemcpyOrder.ROW_MAJOR, nonblock=False)
-ID = {}
-def sym(s):
-    if s not in ID: ID[s] = runner.get_id(s)
-    return ID[s]
-def put(s, x0, y0, w, h, arr, b16=False):
-    if w * h == 0: return
-    arr = np.array(arr, copy=True)
-    if b16: arr = arr.view(np.uint16).astype(np.uint32)
-    n = arr.size // (w * h)
-    runner.memcpy_h2d(sym(s), arr.reshape(-1), x0, y0, w, h, n, **(k16 if b16 else k32))
-def get(s, x0, y0, w, h, n, dt=np.float32):
-    b = np.zeros(w * h * n, dt)
-    runner.memcpy_d2h(b, sym(s), x0, y0, w, h, n, **k32)
-    return b.reshape(h, w, n)
-t0 = time.time()
-# every copy as wafer-compile's bindings state them (the Rust family's placement, in its order)
-compiler.place(put, npy, g, lambda n: os.path.exists(os.path.join(a.prep, a.prefix + n + ".npy")))
-t_place = time.time() - t0
+HX0, HXC, HR = g.HX0, g.HXC, g.HR
+h.place()
 if a.placeonly:
-    print(json.dumps({"placed_s": round(t_place, 1)}), flush=True)
+    print(json.dumps({"placed_s": round(h.t_place, 1)}), flush=True)
     sys.exit(0)
-runner.launch("init", nonblock=False)
-_bar = np.zeros(g.W * g.H, np.uint32)
-runner.memcpy_d2h(_bar, sym("rcfg"), 0, 0, g.W, g.H, 1, **k32)
-print(json.dumps({"load_s": round(t_load, 1), "place_s": round(t_place, 1)}), flush=True)
+h.init()
+t_load, t_place = h.t_load, h.t_place
 
 def ple_words(ci, tok):
     col = M["cols"][ci]
@@ -85,8 +45,6 @@ def put_step0(tok, pos):
     put("tin", HX0 + HXC, 0, 1, HR, np.full((HR, 1, 1), tok, np.uint32))
 FE = npy("embed")
 CAP = 256
-ring = np.zeros(CAP, np.uint32)
-rep_out = []
 if a.probe:
     # DIAG 1 builds: launches of S forced random ids; check every CY's PLE words and every consumer's KVS words
     S_ = a.wloop or 64
@@ -94,15 +52,16 @@ if a.probe:
     bad_p, bad_k, nchk = [], [], 0
     pos = 0
     ids = rng.integers(0, M["V"], size=a.probe * S_ + 1).tolist()
+    PT = {f["name"]: npy(f["name"]) for col in M["cols"] for f in col["files"]}
     for L in range(a.probe):
         put_step0(ids[pos], pos)
         fl = [ids[pos + k + 1] for k in range(S_)]
         put("force", HX0 + HXC, HR // 2, 1, 1, np.array(fl + [0] * (CAP - len(fl)), np.uint32))
         put("nforce", HX0 + HXC, HR // 2, 1, 1, np.array([S_], np.uint32))
         tl = time.time()
-        runner.launch("compute", np.uint32(S_), np.uint32(pos), nonblock=False)
+        h.launch(S_, pos)
         dt = time.time() - tl
-        runner.memcpy_d2h(ring, sym("ring"), HX0 + HXC, HR // 2, 1, 1, CAP, **k32)
+        ring = get("ring", HX0 + HXC, HR // 2, 1, 1, CAP, np.uint32)[0, 0]
         ns = min(S_, 64)
         for ci, col in enumerate(M["cols"]):
             for ui, u in enumerate(col["units"]):
@@ -121,8 +80,6 @@ if a.probe:
             lg = get("kvlog", X0, Y0, g.UW, g.UH, 128)
             for s in range(ns):
                 p_ = pos + s
-                for (r0, r1), (c0, c1) in quads():
-                    pass
                 for ly in range(g.UH):
                     if ly == YC: continue
                     for lx in range(g.UW):
@@ -131,17 +88,16 @@ if a.probe:
                         nchk += 1
                         if (not a.kvseq and sm != 8 * p_ + 120) or sq != p_ + 1:
                             if len(bad_k) < 20: bad_k.append(dict(L=L, s=s, u=u, lx=lx, ly=ly, sum=float(sm), seq=float(sq), pos=p_))
-        ring_ok = [int(ring[k]) for k in range(S_)] == [ids[pos + k] for k in range(S_)] or True
         print(json.dumps({"launch": L, "pos": pos, "steps": S_, "s": round(dt, 3), "bad_ple": len(bad_p), "bad_kvs": len(bad_k)}), flush=True)
         pos += S_
-    runner.stop()
+    h.stop()
     rep = dict(probe=a.probe, steps=S_, checks=nchk, bad_ple=bad_p, bad_kvs=bad_k, passed=not bad_p and not bad_k,
                load_s=round(t_load, 1), place_s=round(t_place, 1))
     json.dump(rep, open(a.report, "w"), indent=1)
     print("PROBE " + json.dumps({k: v for k, v in rep.items()}), flush=True)
     sys.exit(0 if rep["passed"] else 1)
 
-gold = json.load(open(os.path.join(a.prep, a.prefix + a.golden)))
+gold = h.golden()
 ids = gold["prompt_ids"] + gold["tokens"]
 NP = len(gold["prompt_ids"])
 ntok = a.ntok or len(gold["tokens"])
@@ -165,8 +121,8 @@ for rep in range(a.reps):
         put("force", HX0 + HXC, HR // 2, 1, 1, np.array(fl + [0] * (CAP - len(fl)), np.uint32))
         put("nforce", HX0 + HXC, HR // 2, 1, 1, np.array([len(fl)], np.uint32))
         tw = time.time()
-        runner.launch("compute", np.uint32(S_), np.uint32(t), nonblock=False)
-        runner.memcpy_d2h(ring, sym("ring"), HX0 + HXC, HR // 2, 1, 1, CAP, **k32)
+        h.launch(S_, t)
+        ring = get("ring", HX0 + HXC, HR // 2, 1, 1, CAP, np.uint32)[0, 0]
         walls += [(time.time() - tw) / S_] * S_
         if a.xdbg:
             ux = []
@@ -209,7 +165,7 @@ if a.tdbg:
             ph[f"u{u}_{nm}"] = [int(v) for v in (b_ - int(b_[0])) % (1 << 32)]
     times["phases"] = ph
     print("TIMES " + json.dumps(times), flush=True)
-runner.stop()
+h.stop()
 if xd:
     json.dump(xd, open(a.report.replace(".json", "_xd.json"), "w"))
 r = reps[-1]

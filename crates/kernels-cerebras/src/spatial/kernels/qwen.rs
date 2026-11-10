@@ -18,8 +18,7 @@ use super::head::{HEAD_CTL, HEAD_PE, HeadCtl, HeadPe};
 
 type R<T> = Result<T, String>;
 
-/// Every name the Qwen kernels export, with its element type, in export order (`build.py`'s
-/// `NAMES`): the ABI between the kernels and the host's memcpy.
+/// Every name the Qwen kernels export, with its element type, in export order: the ABI between the kernels and the host's memcpy.
 pub const SYMBOLS: &[(&str, &str)] = &[
     ("w", "u16"),
     ("rcfg", "u32"),

@@ -7,8 +7,7 @@
 # which puts the artifact the engine runs in <out root>/<config>/build/out/artifact.
 #
 # The staged preps keep their tiles: the plans cut them as they were cut (the 9B / 4B / 0.8B at RLV 4, as their RoPE
-# tables were staged). What they no longer serve is the programs built before artifacts: a program now carries its
-# artifact, and the engine opens nothing else. The preps these programs place (BENCH_JOB, default spatial/bench-job):
+# tables were staged). A program carries its artifact, and the engine opens nothing else. The preps these programs place (BENCH_JOB, default spatial/bench-job):
 #   s9b (s9b_), s9b5 (s9b5_), s4b (s4b_), s08b (s08b_)   Qwen3.5 9B, 9B at RLV 5, 4B, 0.8B
 #   q8p4 (q84_)                                          Qwen3-8B
 #   ge2 (ge2_), ge4 (ge4_)                               Gemma 4 E2B, E4B

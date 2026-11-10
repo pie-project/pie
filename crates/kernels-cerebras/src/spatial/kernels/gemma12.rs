@@ -18,7 +18,7 @@ use super::head::{HEAD_CTL, HeadCtl, HeadPe};
 
 type R<T> = Result<T, String>;
 
-/// Every name the kernels export, in export order (`build_gemma12.py`'s `NAMES`).
+/// Every name the kernels export, in export order: the ABI between the kernels and the host's memcpy.
 pub const SYMBOLS: &[(&str, &str)] = &[
     ("w", "u16"),
     ("rcfg", "u32"),

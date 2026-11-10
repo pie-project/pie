@@ -64,7 +64,7 @@ def build(plan, out, emit=None, levers="", kernels=None):
 
 class Compiled:
     """What wafer-compile wrote: floor, host, kernels, plan (dicts), rcfg ([H][W][n] u32), bindings (list).
-    The attributes the runners used from the old Python geometries (PX, PY, XC, YC, UW, UH, origins, HX0, HXC,
+    The attributes the runners read (PX, PY, XC, YC, UW, UH, origins, HX0, HXC,
     HC, HR, unit_origin, wl, hx, hc) are derived from the floor and the host layout."""
 
     def __init__(self, out):

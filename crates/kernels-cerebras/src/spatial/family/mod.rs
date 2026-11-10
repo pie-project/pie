@@ -79,16 +79,6 @@ pub fn units_of(layers: &[LayerKind], k: u32, family: &str) -> R<u32> {
     Ok(n / k)
 }
 
-/// The global layers of the first unit as a mask (`KM`): bit l for its layer l.
-pub fn global_mask(layers: &[LayerKind], k: u32) -> u32 {
-    layers[..k as usize]
-        .iter()
-        .enumerate()
-        .filter(|(_, l)| matches!(l, LayerKind::Global))
-        .map(|(i, _)| 1 << i)
-        .sum()
-}
-
 /// `n / d` rounded up to a multiple of `m`.
 pub fn ceil_to(n: u32, d: u32, m: u32) -> u32 {
     n.div_ceil(d).div_ceil(m) * m

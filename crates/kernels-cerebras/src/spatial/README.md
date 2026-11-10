@@ -247,7 +247,7 @@ Both reuse the wafer program machinery (the generic chains, segments, handoffs, 
 with their own kernels and a family each (`family/gemma.rs`, `family/gptoss.rs`: presets, blocks, kernels). The
 model's shape selects the family (`family::serving`): experts take gpt-oss's, per-layer inputs or shared KV Gemma's,
 sliding layers otherwise the 12B's. Tools: `tools/wafer/gemma`,
-`tools/wafer/gptoss` (prep, `build_*.py`, `run_*.py` bare runner, `gotiny.sh` tiny simulation), `tools/emu/tf_gemma.py`
+`tools/wafer/gptoss` (prep, `run_*.py` bare runner on `host.py`; `build.py` adds the plan's runner, `gotiny.sh` runs a tiny one), `tools/emu/tf_gemma.py`
 and `tf_gptoss.py` (teacher-forced emulation of the kernels' number formats).
 
 **Gemma 4** (`*_gemma.csl`, E2B and E4B; 12B below).

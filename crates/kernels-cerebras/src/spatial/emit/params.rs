@@ -1,7 +1,6 @@
 //! Kernel comptime params: each kind's `K:V` list (its [`KernelBuild`] from the family, the
 //! build's levers on top), and each PE's own list (its kind's, then the blocks'
-//! [`super::super::abi::Overrides`] at that PE). Replaces the shape half of `build.py`,
-//! `gemma/build_gemma.py`, `gemma12/build_gemma12.py`, `gptoss/build_gptoss.py`.
+//! [`super::super::abi::Overrides`] at that PE).
 
 use std::collections::BTreeMap;
 

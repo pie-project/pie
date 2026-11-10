@@ -113,50 +113,9 @@ impl Device for Rec {
         }
         Ok(())
     }
-    fn memcpy_h2d_rowbcast(
-        &mut self,
-        s: &str,
-        d: &[u32],
-        r: Rect,
-        n: usize,
-        dt: DataType,
-    ) -> sdk::Result<()> {
-        self.calls.push(format!(
-            "rowbcast {s} {} {} {} {} {n} {:?} {}",
-            r.x,
-            r.y,
-            r.w,
-            r.h,
-            dt as u8,
-            sha(d)
-        ));
-        Ok(())
-    }
-    fn memcpy_h2d_nonblock(
-        &mut self,
-        s: &str,
-        d: Vec<u32>,
-        r: Rect,
-        n: usize,
-        o: Order,
-        dt: DataType,
-    ) -> sdk::Result<()> {
-        self.h2d(s, &d, r, n, o, dt);
-        Ok(())
-    }
     fn launch(&mut self, name: &str, args: &[u32]) -> sdk::Result<()> {
         self.calls.push(format!("launch {name} {args:?}"));
         Ok(())
-    }
-    fn launch_nonblock(&mut self, name: &str, args: &[u32]) -> sdk::Result<()> {
-        self.calls.push(format!("launch_nb {name} {args:?}"));
-        Ok(())
-    }
-    fn wait_pending(&mut self) {
-        self.calls.push("wait".into());
-    }
-    fn has_symbol(&self, _: &str) -> bool {
-        true
     }
 }
 
@@ -186,38 +145,8 @@ impl Device for Shared {
     ) -> sdk::Result<()> {
         self.0.borrow_mut().memcpy_d2h(s, out, r, n, o, dt)
     }
-    fn memcpy_h2d_rowbcast(
-        &mut self,
-        s: &str,
-        d: &[u32],
-        r: Rect,
-        n: usize,
-        dt: DataType,
-    ) -> sdk::Result<()> {
-        self.0.borrow_mut().memcpy_h2d_rowbcast(s, d, r, n, dt)
-    }
-    fn memcpy_h2d_nonblock(
-        &mut self,
-        s: &str,
-        d: Vec<u32>,
-        r: Rect,
-        n: usize,
-        o: Order,
-        dt: DataType,
-    ) -> sdk::Result<()> {
-        self.0.borrow_mut().memcpy_h2d_nonblock(s, d, r, n, o, dt)
-    }
     fn launch(&mut self, name: &str, args: &[u32]) -> sdk::Result<()> {
         self.0.borrow_mut().launch(name, args)
-    }
-    fn launch_nonblock(&mut self, name: &str, args: &[u32]) -> sdk::Result<()> {
-        self.0.borrow_mut().launch_nonblock(name, args)
-    }
-    fn wait_pending(&mut self) {
-        self.0.borrow_mut().wait_pending()
-    }
-    fn has_symbol(&self, _: &str) -> bool {
-        true
     }
 }
 

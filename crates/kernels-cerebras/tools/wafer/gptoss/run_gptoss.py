@@ -7,78 +7,36 @@ force table (prompt / teacher forcing) and launches S steps; the ring holds each
 --force 2: teacher-forced (every step's next token from the golden); 1: the prompt forced, then greedy.
 --hostck 1: S 1 launches, every control PE's res read: the host argmax over the columns' maxima vs the ring.
 --xdbg 1 (XKEEP 1 builds): every unit's x after each layer, each launch (dump json)."""
-import argparse, json, os, sys, time
+import json, os, sys, time
 import numpy as np
-from cerebras.sdk.runtime.sdkruntimepybind import MemcpyDataType, MemcpyOrder, SdkRuntime  # pylint: disable=no-name-in-module
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-import compiler
+import host
 
-ap = argparse.ArgumentParser()
-ap.add_argument("--name"); ap.add_argument("--cmaddr"); ap.add_argument("--report", default="g.json")
-ap.add_argument("--prep"); ap.add_argument("--prefix", default=""); ap.add_argument("--ntok", type=int, default=0)
-ap.add_argument("--greedy", type=int, default=0); ap.add_argument("--force", type=int, default=2)
-ap.add_argument("--wloop", type=int, default=8); ap.add_argument("--reps", type=int, default=1)
-ap.add_argument("--hostck", type=int, default=0); ap.add_argument("--xdbg", type=int, default=0)
-ap.add_argument("--tdbg", type=int, default=0); ap.add_argument("--override", default="")
-ap.add_argument("--golden", default="golden.json")
+ap = host.parser(__doc__)
+ap.add_argument("--wloop", type=int, default=8); ap.add_argument("--hostck", type=int, default=0)
 ap.add_argument("--steps0", type=int, default=0, help="(bisect) one launch of 0 steps, then a d2h")
 ap.add_argument("--prof", default="", help="(TSTAMP 1 builds) units (comma) whose PEs' phase stamps to read (last step); also in the report")
 ap.add_argument("--d2h-delay", type=float, default=0.0, help="(bisect) seconds a step to wait after a launch before the ring's read (no pending d2h during the loop)")
 ap.add_argument("--noweights", type=int, default=0, help="(probes) no weight / head tiles placed (zeros): routes, roles and tables only")
-ap.add_argument("--compiled", default=os.path.join(os.path.dirname(os.path.abspath(__file__)), "compiled"), help="wafer-compile's output for this prep (build_gptoss.py writes it)")
 a = ap.parse_args()
-t00 = time.time()
-M = json.load(open(os.path.join(a.prep, a.prefix + "meta.json")))
-for kv in filter(None, a.override.split(",")):
-    k, v = kv.split("="); M[k] = int(v)
-def npy(n):
-    return np.load(os.path.join(a.prep, a.prefix + n + ".npy"), mmap_mode="r")
-tiny = M["preset"] == "tiny"
-g = compiler.load(a.compiled)
+h = host.Host(a)
+M, g, npy, put, get = h.meta, h.g, h.npy, h.put, h.get
 PY, AX, MXc, XC, YC, NU, Hc, K = g.PY, g.AX, g.MXc, g.XC, g.YC, g.units(), M["Hc"], M["K"]
-HB0, HXC, HVC, VR = g.HB0, g.HXC, g.HVC, M["VR"]
-runner = SdkRuntime(a.name, cmaddr=a.cmaddr)
-runner.load(); runner.run()
-t_load = time.time() - t00
-k32 = dict(streaming=False, data_type=MemcpyDataType.MEMCPY_32BIT, order=MemcpyOrder.ROW_MAJOR, nonblock=False)
-k16 = dict(streaming=False, data_type=MemcpyDataType.MEMCPY_16BIT, order=MemcpyOrder.ROW_MAJOR, nonblock=False)
-ID = {}
-def sym(s):
-    if s not in ID: ID[s] = runner.get_id(s)
-    return ID[s]
-def put(s, x0, y0, w, h, arr, b16=False):
-    if w * h == 0: return
-    arr = np.array(arr, copy=True)
-    if b16: arr = arr.view(np.uint16).astype(np.uint32)
-    n = arr.size // (w * h)
-    runner.memcpy_h2d(sym(s), arr.reshape(-1), x0, y0, w, h, n, **(k16 if b16 else k32))
-def get(s, x0, y0, w, h, n, dt=np.float32):
-    b = np.zeros(w * h * n, dt)
-    runner.memcpy_d2h(b, sym(s), x0, y0, w, h, n, **k32)
-    return b.reshape(h, w, n)
+HB0, HXC, HVC = g.HB0, g.HXC, g.HVC
 HALF = ((0, YC), (YC, PY))
-RB = 16 if not tiny else PY
-t0 = time.time()
-# every copy as wafer-compile's bindings state them (the Rust family's placement, in its order); --noweights
-# leaves the weight and head tiles out
-WSYMS = ("w", "wx", "wr", "hw", "hemb")
-def put_w(s, *r):
-    if not (a.noweights and s in WSYMS): put(s, *r)
-compiler.place(put_w, npy, g, lambda n: os.path.exists(os.path.join(a.prep, a.prefix + n + ".npy")))
+# --noweights leaves the weight and head tiles out
+h.place(skip=("w", "wx", "wr", "hw", "hemb") if a.noweights else ())
+h.init()
+t_load, t_place = h.t_load, h.t_place
 yc = HB0 + HXC
-t_place = time.time() - t0
-runner.launch("init", nonblock=False)
-_bar = np.zeros(g.W * g.H, np.uint32)
-runner.memcpy_d2h(_bar, sym("rcfg"), 0, 0, g.W, g.H, 1, **k32)
-print(json.dumps({"load_s": round(t_load, 1), "place_s": round(t_place, 1)}), flush=True)
 if a.steps0:
-    runner.launch("compute", np.uint32(0), np.uint32(0), nonblock=False)
-    runner.memcpy_d2h(_bar, sym("rcfg"), 0, 0, g.W, g.H, 1, **k32)
+    h.launch(0, 0)
+    h.barrier()
     print("STEPS0 ok", flush=True)
-    runner.stop()
+    h.stop()
     sys.exit(0)
 
-gold = json.load(open(os.path.join(a.prep, a.prefix + a.golden)))
+gold = h.golden()
 emb = npy("embrows")                                    # [the golden's ids][H] bf16 bits
 ids = gold["prompt_ids"] + gold["tokens"]
 ntok = a.ntok or len(gold["tokens"])
@@ -86,7 +44,6 @@ NP = len(gold["prompt_ids"])
 U0 = g.unit_origin(0)
 ROOT = (HVC // 2, yc)
 CAP = 256
-ring = np.zeros(CAP, np.uint32)
 WLS = 1 if a.hostck else a.wloop
 reps, dumps, ring_bad, diverged = [], [], [], []
 def xread(u):
@@ -122,11 +79,11 @@ for rep in range(a.reps):
             put("force", *ROOT, 1, 1, np.array(fl + [0] * (CAP - len(fl)), np.uint32))
         put("nforce", *ROOT, 1, 1, np.array([len(fl)], np.uint32))
         tw = time.time()
-        runner.launch("compute", np.uint32(S_), np.uint32(t), nonblock=False)
+        h.launch(S_, t)
         if a.d2h_delay > 0:
             time.sleep(a.d2h_delay * S_)
         # (a launch returns before the PEs finish it: the ring's read waits for the root's last step)
-        runner.memcpy_d2h(ring, sym("ring"), *ROOT, 1, 1, CAP, **k32)
+        ring = get("ring", *ROOT, 1, 1, CAP, np.uint32)[0, 0]
         walls += [(time.time() - tw) / S_] * S_
         if a.hostck:
             rr = get("res", 0, yc, HVC, 1, 4).reshape(HVC, 4)
@@ -195,7 +152,7 @@ if a.prof:
         PROF["cx_rows"][f"u{u}"] = rows_
     PROF["redo"] = [[int(v) for v in pe(g.unit_origin(u)[0], g.unit_origin(u)[1] + YC, 1 + 4 * K)[1 + 3 * K:]] for u in range(NU)]
     PROFLINE[0] = "PROF " + json.dumps({k: v for k, v in PROF.items() if k.endswith("_cx_r0") or k.endswith("_cx_r159") or k == "redo"}, separators=(",", ":"))
-runner.stop()
+h.stop()
 if dumps:
     json.dump(dumps, open(a.report.replace(".json", "_dump.json"), "w"))
 rep = {"prof": PROF, "diverged": diverged[:4], "force": a.force, "greedy": a.greedy, "wloop": WLS, "ntok": ntok, "reps": reps, "ring_bad": ring_bad[:20],
