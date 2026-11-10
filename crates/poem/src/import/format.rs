@@ -274,8 +274,21 @@ pub fn stated(src: &ztensor::Source, path: &str) -> Option<f64> {
         .and_then(number)
 }
 
+/// The value at the dotted `path`. A `rope_theta` or `rope_scaling.*` the
+/// configuration does not state where it used to is read where transformers
+/// 5 writes it, under `rope_parameters`.
 fn at_path<'v>(value: &'v Value, path: &str) -> Option<&'v Value> {
-    path.split('.').try_fold(value, |at, key| at.get(key))
+    let walk = |path: &str| path.split('.').try_fold(value, |at, key| at.get(key));
+    walk(path).or_else(|| {
+        let moved = if let Some(prefix) = path.strip_suffix("rope_theta") {
+            format!("{prefix}rope_parameters.rope_theta")
+        } else if path.contains("rope_scaling.") {
+            path.replacen("rope_scaling.", "rope_parameters.", 1)
+        } else {
+            return None;
+        };
+        walk(&moved)
+    })
 }
 
 fn number(value: &Value) -> Option<f64> {
@@ -295,6 +308,23 @@ fn same(found: f64, want: f64) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_rope_stated_under_rope_parameters_is_read_where_it_used_to_be() {
+        let config = ztensor::format::cbor::map([(
+            "rope_parameters",
+            ztensor::format::cbor::map([
+                ("rope_theta", Value::Float(5e6)),
+                ("factor", Value::Float(8.0)),
+            ]),
+        )]);
+        assert_eq!(at_path(&config, "rope_theta").and_then(number), Some(5e6));
+        assert_eq!(
+            at_path(&config, "rope_scaling.factor").and_then(number),
+            Some(8.0)
+        );
+        assert!(at_path(&config, "hidden_size").is_none());
+    }
 
     fn has(src: &ztensor::Source, name: &str) -> bool {
         src.get(name).is_some()

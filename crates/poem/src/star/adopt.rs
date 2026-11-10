@@ -70,6 +70,7 @@ impl Package {
                 "`{name}` is no package name: lowercase letters, digits and `_`"
             )));
         }
+        let config = &lifted(config);
         let call = format!(
             "{ADOPTION} = {ADOPT}({}, {}, {})\n",
             literal(&serde_json::Value::String(id.to_string()), 0),
@@ -181,6 +182,54 @@ impl Package {
             family: self.name().to_string(),
             reason: reason.into(),
         }
+    }
+}
+
+/// `config` with transformers 5's `rope_parameters` also stated where a hook
+/// reads it, at the top and in a `text_config`: its `rope_theta` and
+/// `partial_rotary_factor` as themselves, and a scaling other than the
+/// default as `rope_scaling`. A key the configuration states is kept.
+fn lifted(config: &serde_json::Value) -> serde_json::Value {
+    let mut config = config.clone();
+    lift(&mut config);
+    if let Some(text) = config.get_mut("text_config") {
+        lift(text);
+    }
+    config
+}
+
+fn lift(config: &mut serde_json::Value) {
+    let Some(map) = config.as_object_mut() else {
+        return;
+    };
+    let Some(params) = map
+        .get("rope_parameters")
+        .and_then(serde_json::Value::as_object)
+        .cloned()
+    else {
+        return;
+    };
+    for key in ["rope_theta", "partial_rotary_factor"] {
+        if let (false, Some(value)) = (map.contains_key(key), params.get(key)) {
+            map.insert(key.to_string(), value.clone());
+        }
+    }
+    let kind = params
+        .get("rope_type")
+        .or_else(|| params.get("type"))
+        .and_then(serde_json::Value::as_str);
+    if map
+        .get("rope_scaling")
+        .is_none_or(serde_json::Value::is_null)
+        && kind.is_some_and(|kind| kind != "default")
+    {
+        let mut scaling = params;
+        scaling.remove("rope_theta");
+        scaling.remove("partial_rotary_factor");
+        map.insert(
+            "rope_scaling".to_string(),
+            serde_json::Value::Object(scaling),
+        );
     }
 }
 
@@ -331,6 +380,28 @@ def adopt(id, config, special):
                 )
                 .is_err()
         );
+    }
+
+    #[test]
+    fn a_transformers_5_configuration_states_its_rope_where_a_hook_reads_it() {
+        let config = serde_json::json!({
+            "rope_parameters": {"rope_type": "llama3", "rope_theta": 500000.0, "factor": 8.0},
+            "text_config": {"rope_parameters": {"rope_type": "default", "rope_theta": 1000000.0}},
+        });
+        let lifted = lifted(&config);
+        assert_eq!(lifted["rope_theta"], 500000.0);
+        assert_eq!(lifted["rope_scaling"]["rope_type"], "llama3");
+        assert_eq!(lifted["rope_scaling"]["factor"], 8.0);
+        assert!(lifted["rope_scaling"].get("rope_theta").is_none());
+        assert_eq!(lifted["text_config"]["rope_theta"], 1000000.0);
+        assert!(lifted["text_config"].get("rope_scaling").is_none());
+        let stated =
+            serde_json::json!({"rope_theta": 10000.0, "rope_parameters": {"rope_theta": 1.0}});
+        assert_eq!(lifted_theta(&stated), 10000.0);
+    }
+
+    fn lifted_theta(config: &serde_json::Value) -> f64 {
+        lifted(config)["rope_theta"].as_f64().expect("a theta")
     }
 
     #[test]
