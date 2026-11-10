@@ -57,8 +57,12 @@ impl Shell {
         }
     }
 
-    /// `pools` as degenerate chunks.
+    /// The pool as chunks: the chunk pool's own facts, or (the per-plane
+    /// pools of before) `pools` as degenerate chunks.
     pub fn chunk_facts(&self, pools: &PoolFacts) -> Result<ChunkFacts> {
+        if let Some(facts) = self.pool_chunk_facts() {
+            return Ok(facts);
+        }
         let facts = ChunkFacts::degenerate(pools, &self.degenerate_bytes()?);
         if pools.elastic_page_bytes == 0 {
             return Ok(facts);
@@ -98,6 +102,21 @@ impl Shell {
             ),
         }
     }
+}
+
+/// The chunk the compiler's on-device Metal recipe packs `trace` into
+/// under `budgets`; [`crate::store::layout::TARGET_CHUNK`] where it packs
+/// into none.
+#[must_use]
+pub fn recipe_chunk(trace: &poem_ir::Trace, budgets: &Budgets) -> u64 {
+    let profile = DeviceProfile {
+        chunk: ChunkProfile::ON_DEVICE_METAL,
+        ..DeviceProfile::default()
+    };
+    poem_compiler::chunk::plan(trace, budgets, &profile).map_or(
+        crate::store::layout::TARGET_CHUNK,
+        |recipe| recipe.chunk_bytes,
+    )
 }
 
 /// `facts` of a pool that maps its pages and slots as they are committed:

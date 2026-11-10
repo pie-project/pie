@@ -638,6 +638,24 @@ impl Engine for Metal {
         self.loaded_mut()?.release_pool(kv_pages).map_err(fault)
     }
 
+    fn commit_segments(&mut self, segments: u32) -> EngineResult<()> {
+        self.loaded_mut()?.commit_segments(segments).map_err(fault)
+    }
+
+    fn release_segments(&mut self, segments: u32) -> EngineResult<()> {
+        self.loaded_mut()?
+            .release_segments(segments)
+            .map_err(fault)
+    }
+
+    fn evacuate(&mut self, evacuation: &engine::chunk::Evacuation) -> EngineResult<()> {
+        self.loaded_mut()?.evacuate(evacuation).map_err(fault)
+    }
+
+    fn copy_slots(&mut self, copy: &engine::chunk::SlotCopy) -> EngineResult<()> {
+        self.loaded_mut()?.copy_slots(copy).map_err(fault)
+    }
+
     fn commit_state(&mut self, slots: u32) -> EngineResult<()> {
         self.loaded_mut()?.commit_state(slots).map_err(fault)
     }
@@ -1045,6 +1063,44 @@ impl Metal {
                 ))
             })?;
         }
+        // A lane stating its slot tables names its kv pages and its state
+        // record there; until the runtime states them, the legacy fields
+        // carry the same slot refs.
+        let mut pages_of: Vec<Option<Vec<u32>>> = Vec::with_capacity(submission.lanes.len());
+        let mut state_of: Vec<Option<u32>> = Vec::with_capacity(submission.lanes.len());
+        let mut forks: Vec<(u32, u32)> = Vec::new();
+        for lane in &submission.lanes {
+            pages_of.push(
+                lane.tables
+                    .iter()
+                    .find(|(shape, _)| *shape == crate::store::layout::LIST)
+                    .map(|(_, refs)| refs.clone()),
+            );
+            let fixed = lane
+                .fixed
+                .iter()
+                .find(|(shape, _)| *shape == crate::store::layout::FIXED);
+            state_of.push(match fixed {
+                None => None,
+                Some((shape, pieces)) => {
+                    let &[[run, cow]] = pieces.as_slice() else {
+                        return Err(Error::Invalid(format!(
+                            "lane in slot {} names {} pieces of fixed shape {shape}, whose \
+                             records this engine keeps whole",
+                            lane.slot,
+                            pieces.len()
+                        )));
+                    };
+                    if run != cow {
+                        forks.push((run, cow));
+                    }
+                    Some(cow)
+                }
+            });
+        }
+        if !forks.is_empty() {
+            shell.copy_state(&forks).map_err(fault)?;
+        }
         let seated: Vec<Seated<'_>> = submission
             .lanes
             .iter()
@@ -1058,8 +1114,9 @@ impl Metal {
                     },
                     group: lane.group,
                     inputs: &lane.inputs,
-                    pages: &lane.kv.pages,
-                    held: (!lane.kv.pages.is_empty()).then_some(lane.kv.held),
+                    pages: pages_of[at].as_deref().unwrap_or(&lane.kv.pages),
+                    held: (!lane.kv.pages.is_empty() || pages_of[at].is_some())
+                        .then_some(lane.kv.held),
                     mask: lane.mask.as_ref(),
                     kv_less: lane.kv_less,
                     adapter: lane_adapters[at].or(lane.adapter),
@@ -1071,8 +1128,9 @@ impl Metal {
                     translation: &lane.kv.translation,
                     rs: &lane.rs,
                     rs_reset: lane.rs_reset,
-                    rs_slot: lane.rs_slot,
+                    rs_slot: state_of[at].or(lane.rs_slot),
                     rs_snapshots: &lane.rs_snapshots,
+                    refs: true,
                 })
             })
             .collect::<EngineResult<Vec<_>>>()?;

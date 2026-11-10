@@ -23,6 +23,7 @@ use crate::run::{CacheGeometry, CacheTable, FireBindings, FireTables, Run, SlotT
 use crate::scratch::Scratch;
 use crate::settle::{Airborne, Arms, Done};
 use crate::store::Pools;
+use crate::store::layout::Layout;
 use crate::store::kv::{self, Paging, Seat};
 use crate::weights::{AdapterPlane, Weights};
 use crate::window::Windows;
@@ -168,6 +169,10 @@ pub struct Seated<'a> {
     /// its own (`Lane::rs_snapshots`).
     pub rs_snapshots: &'a [engine::fire::RsSnapshot],
     pub translation: &'a [u32],
+    /// The lane's pages, state slots and buffer pages are the runtime's
+    /// slot refs; else (a caller firing directly) they are seat-addressed:
+    /// seat `lane.slot`'s own runs of the pool.
+    pub refs: bool,
 }
 
 impl<'a> Seated<'a> {
@@ -190,6 +195,7 @@ impl<'a> Seated<'a> {
             rs_reset: engine::fire::RsReset::Inferred,
             rs_slot: None,
             rs_snapshots: &[],
+            refs: false,
         }
     }
 
@@ -632,39 +638,91 @@ impl PreparedLoad<'_> {
                 pool,
             )
         };
-        // Each plane is one buffer, so no more pages than the device binds in
-        // one, whatever the room allows.
-        let max_buffer = device.max_buffer();
-        let (pages, slots) = engine::fit::pool_for(
-            boot.kv_budget,
-            boot.slots,
-            u64::from(paging_at(1, boot.slots)?.pages_per_slot),
-            accounting(0).pool,
-            |pages, slots| {
-                demand_at(slots).map_or(u64::MAX, |demand| demand.bytes_binding(pages, max_buffer))
-            },
-        )
-        .map_err(|short| Fault::Residency(short.to_string()))?;
-        let demand = demand_at(slots)?;
-        // A stated budget is never cut: one buffer stopping short of it is a
-        // refusal, as the room is.
-        if let Some(budget) = boot.kv_budget
-            && demand.bytes_binding(pages + 1, max_buffer) == u64::MAX
-            && demand.bytes(pages + 1) <= budget
-        {
-            return Err(Fault::Residency(format!(
-                "`[model] device_kv_budget` states {} MiB, and a cache plane is one buffer, \
-                 which this device binds up to {} MiB of: {pages} pages fill it at {} MiB. \
-                 State a budget of at most that",
-                budget >> 20,
-                max_buffer >> 20,
-                demand.bytes(pages) >> 20,
-            )));
-        }
-        let paging = paging_at(pages, slots)?;
+        // One chunk pool holds every kv page, recurrent record and rs buffer
+        // page; `crate::store::legacy_planes` keeps the per-plane pools of
+        // before while the switch is verified.
+        let (paging, pool_bytes, sized) = if crate::store::legacy_planes() {
+            // Each plane is one buffer, so no more pages than the device binds in
+            // one, whatever the room allows.
+            let max_buffer = device.max_buffer();
+            let (pages, slots) = engine::fit::pool_for(
+                boot.kv_budget,
+                boot.slots,
+                u64::from(paging_at(1, boot.slots)?.pages_per_slot),
+                accounting(0).pool,
+                |pages, slots| {
+                    demand_at(slots).map_or(u64::MAX, |demand| demand.bytes_binding(pages, max_buffer))
+                },
+            )
+            .map_err(|short| Fault::Residency(short.to_string()))?;
+            let demand = demand_at(slots)?;
+            // A stated budget is never cut: one buffer stopping short of it is a
+            // refusal, as the room is.
+            if let Some(budget) = boot.kv_budget
+                && demand.bytes_binding(pages + 1, max_buffer) == u64::MAX
+                && demand.bytes(pages + 1) <= budget
+            {
+                return Err(Fault::Residency(format!(
+                    "`[model] device_kv_budget` states {} MiB, and a cache plane is one buffer, \
+                     which this device binds up to {} MiB of: {pages} pages fill it at {} MiB. \
+                     State a budget of at most that",
+                    budget >> 20,
+                    max_buffer >> 20,
+                    demand.bytes(pages) >> 20,
+                )));
+            }
+            let paging = paging_at(pages, slots)?;
+
+            (paging, demand.bytes(pages), None)
+        } else {
+            let seated = paging_at(1, boot.slots)?;
+            let rows = crate::store::Rows::plan(&boot.trace, boot.page_size, &facts)?;
+            let buffer = rs_layout.as_deref().map_or(0, |layout| {
+                crate::rs::Buffers::page_layout(layout, boot.page_size).1
+            });
+            let bytes = [rows.list_bytes, rows.fixed_bytes, buffer];
+            let chunk = Layout::chunk_bytes(
+                rows.list_bytes,
+                rows.fixed_bytes,
+                buffer,
+                crate::chunks::recipe_chunk(&boot.trace, &budgets),
+            );
+            let least = Layout::least_chunks(chunk, bytes, seated.pages_per_slot);
+            // The compressor side planes hold a cell a token of every list
+            // slot the pool could hold: a chunk costs its share of them.
+            let side = rows.side_bytes * chunk.checked_div(rows.list_bytes).unwrap_or(0);
+            let room = boot.kv_budget.unwrap_or_else(|| accounting(0).pool);
+            let total = engine::chunk::fit(room, chunk + side, 0, least)
+                .map_err(|short| Fault::Residency(short.to_string()))?;
+            // The pool is one buffer.
+            let binds = u32::try_from(device.max_buffer() / chunk).unwrap_or(u32::MAX);
+            if binds < least {
+                return Err(Fault::Residency(format!(
+                    "one working set takes {least} chunks of {chunk} bytes, and this device \
+                     binds one buffer of {} MiB",
+                    device.max_buffer() >> 20
+                )));
+            }
+            let total = total.min(binds);
+            let layout = Layout::new(
+                chunk,
+                total,
+                crate::store::pool::segment_chunks(chunk),
+                boot.page_size,
+                bytes,
+                boot.slots,
+                seated.pages_per_slot,
+            )?;
+            let pages = u64::from(layout.list.map_or(0, |list| list.per_chunk)) * u64::from(total);
+            (
+                paging_at(pages, boot.slots)?,
+                (chunk + side) * u64::from(total),
+                Some((rows, layout)),
+            )
+        };
 
         {
-            let acct = accounting(demand.bytes(pages));
+            let acct = accounting(pool_bytes);
             acct.admit(Some(weights.bytes()), boot.memory_share)?;
             // A bank read out of the artifact's own mapping is already in the
             // weights, as the windows that span it: only what lies outside them
@@ -701,10 +759,34 @@ impl PreparedLoad<'_> {
         }
         let arena = Arena::reserve(&device, &compiled.arena)?;
         let arena_ladder = poem_compiler::arena_ladder(&boot.trace, &budgets, &compiled)?;
-        let pools = Pools::reserve(&device, &boot.trace, paging, &facts)?;
-        let rs_buffers = match &rs_layout {
-            Some(layout) => Some(crate::rs::Buffers::reserve(&device, layout, paging)?),
-            None => None,
+        let (pools, rs_buffers) = match sized {
+            None => {
+                let planes = crate::store::Planes::reserve(&device, &boot.trace, paging, &facts)?;
+                let rs_buffers = match &rs_layout {
+                    Some(layout) => Some(crate::rs::Buffers::reserve(&device, layout, paging)?),
+                    None => None,
+                };
+                (Pools::legacy(planes, &device)?, rs_buffers)
+            }
+            Some((rows, layout)) => {
+                let rs_rows = rs_layout.as_deref().map_or_else(Vec::new, |rs| {
+                    let mut rows: Vec<u32> = rs.planes.iter().map(|plane| plane.cache).collect();
+                    rows.dedup();
+                    rows
+                });
+                let mut pools = Pools::reserve(&device, rows, layout, paging, rs_rows)?;
+                // The null chunk and the floor stand from the load on.
+                pools.commit_segments(1)?;
+                let rs_buffers = rs_layout.as_deref().map(|rs| {
+                    crate::rs::Buffers::in_pool(
+                        rs,
+                        boot.page_size,
+                        pools.view().clone(),
+                        layout.buffer_stride(),
+                    )
+                });
+                (pools, rs_buffers)
+            }
         };
         let scratch = Scratch::reserve(
             &device,
@@ -944,11 +1026,65 @@ impl PreparedLoad<'_> {
 }
 
 impl Shell {
+    /// The physical fixed slot a lane's state sits in: the slot ref the
+    /// runtime stated, else its seat's.
+    fn state_id(&self, seated: &Seated<'_>) -> Result<u32> {
+        match seated.rs_slot {
+            Some(slot) => self.pools.state_slot(slot, !seated.refs),
+            None => self.pools.state_slot(seated.lane.slot, true),
+        }
+    }
+
+    /// The chunk pool's facts; `None` for the per-plane pools of before.
+    #[must_use]
+    pub fn pool_chunk_facts(&self) -> Option<engine::chunk::ChunkFacts> {
+        (!self.pools.is_legacy()).then(|| self.pools.chunk_facts())
+    }
+
+    /// See `Engine::commit_segments`.
+    pub fn commit_segments(&mut self, segments: u32) -> Result<()> {
+        self.pools.commit_segments(segments)
+    }
+
+    /// See `Engine::release_segments`: every frame drains first.
+    #[allow(unsafe_code)]
+    pub fn release_segments(&mut self, segments: u32) -> Result<()> {
+        self.drain()?;
+        // SAFETY: drained just above, on the one thread that submits; the
+        // runtime evacuated the segments' chunks before asking.
+        unsafe { self.pools.release_segments(segments) }
+    }
+
+    /// See `Engine::evacuate`: the moved chunks' bytes land, and the chunk
+    /// table changes, before any later fire is encoded.
+    pub fn evacuate(&mut self, evacuation: &engine::chunk::Evacuation) -> Result<()> {
+        if evacuation.moves.is_empty() {
+            return Ok(());
+        }
+        self.drain()?;
+        let mut frame = self.device.frame()?;
+        self.pools.evacuate(&mut frame, evacuation)?;
+        frame.commit()
+    }
+
+    /// See `Engine::copy_slots`.
+    pub fn copy_slots(&mut self, copy: &engine::chunk::SlotCopy) -> Result<()> {
+        if copy.slots.is_empty() && copy.runs.is_empty() {
+            return Ok(());
+        }
+        self.drain()?;
+        let mut frame = self.device.frame()?;
+        self.pools.copy_slots(&mut frame, copy)?;
+        self.grafted = Some(frame.commit_async(None)?);
+        Ok(())
+    }
+
     pub fn open(&mut self, slot: u32) -> Result<()> {
         if self.pools.has_state() {
             self.drain()?;
         }
-        self.pools.clear(slot)?;
+        let state = self.pools.state_slot(slot, true)?;
+        self.pools.clear(state)?;
         let seats = self.held.len() as u64;
         let held = self.held.get_mut(slot as usize).ok_or(Fault::Ceiling {
             what: "slots",
@@ -1043,6 +1179,12 @@ impl Shell {
             return Ok(());
         }
         self.drain()?;
+        if !self.pools.is_legacy() {
+            let mut frame = self.device.frame()?;
+            self.pools.copy_buffer_pages(&mut frame, moves)?;
+            self.grafted = Some(frame.commit_async(None)?);
+            return Ok(());
+        }
         let (slab, bytes) = self
             .rs_buffers
             .as_mut()
@@ -1655,9 +1797,13 @@ impl Shell {
     ) -> Result<Vec<Vec<f32>>> {
         use engine::frame::Shell as FrameShell;
         // A caller firing directly has no runtime to commit ahead of it.
-        let paging = self.pools.paging();
-        self.commit_pool(u32::try_from(paging.pages()).unwrap_or(u32::MAX))?;
-        self.commit_state(paging.slots)?;
+        if self.pools.is_legacy() {
+            let paging = self.pools.paging();
+            self.commit_pool(u32::try_from(paging.pages()).unwrap_or(u32::MAX))?;
+            self.commit_state(paging.slots)?;
+        } else {
+            self.pools.commit_seats()?;
+        }
         let prepared = FrameShell::prepare(
             self,
             StepView {
@@ -1710,9 +1856,11 @@ impl Shell {
             .map_or(0, crate::rs::Buffers::bytes)
     }
 
+    /// Seat `slot`'s state rows, one after another.
     pub fn state_bytes(&mut self, slot: u32) -> Result<Vec<u8>> {
         self.drain()?;
-        self.pools.read_slot(slot)
+        let state = self.pools.state_slot(slot, true)?;
+        self.pools.read_slot(state)
     }
 
     /// Each lane's read-back row, by its output's name.
@@ -2664,8 +2812,9 @@ impl Shell {
                 engine::fire::RsReset::Fresh => true,
                 engine::fire::RsReset::Held => false,
             };
+            let state_id = self.state_id(seated)?;
             if fresh {
-                beginning.push(seated.rs_slot.unwrap_or(lane.slot));
+                beginning.push(state_id);
             }
             seats.push(Seat {
                 slot: lane.slot,
@@ -2674,8 +2823,19 @@ impl Shell {
             });
             kv_less.push(seated.kv_less);
             tables.push(match &device_pages[source] {
-                Some(pages) => std::borrow::Cow::Owned(pages.clone()),
-                None => std::borrow::Cow::Borrowed(seated.pages),
+                Some(pages) => std::borrow::Cow::Owned(self.pools.kv_pages(pages, None)?),
+                None if self.pools.is_legacy() || seated.kv_less => {
+                    std::borrow::Cow::Borrowed(seated.pages)
+                }
+                None => {
+                    let after = u64::from(have) + u64::from(row.rows);
+                    let page_size = u64::from(self.pools.paging().page_size.max(1));
+                    let pages = u32::try_from(after.div_ceil(page_size).max(1)).unwrap_or(u32::MAX);
+                    std::borrow::Cow::Owned(
+                        self.pools
+                            .kv_pages(seated.pages, Some((lane.slot, pages)))?,
+                    )
+                }
             });
             // A kv-less lane's mask goes to its group-packed attention, not the paged prefill.
             let masking = if seated.kv_less {
@@ -2723,7 +2883,7 @@ impl Shell {
                     .map_or(-1, |id| i32::try_from(id).unwrap_or(-1));
                 adapter_routes.extend(std::iter::repeat_n(id, row.rows as usize));
             }
-            slot_ids.push(seated.rs_slot.unwrap_or(lane.slot) as i32);
+            slot_ids.push(state_id as i32);
             let at_lane = slot_ids.len() as i32 - 1;
             {
                 const MAX: usize = kernels_metal::ssm::RS_SNAPSHOTS as usize;
@@ -2755,8 +2915,9 @@ impl Shell {
                     let mut entry = [0i32; 2 * MAX];
                     for (at, snap) in snaps.iter().enumerate() {
                         entry[at] = narrow(u64::from(snap.row));
-                        entry[MAX + at] = narrow(u64::from(snap.slot));
-                        snap_slots = snap_slots.max(snap.slot.saturating_add(1));
+                        let slot = self.pools.state_slot(snap.slot, !seated.refs)?;
+                        entry[MAX + at] = narrow(u64::from(slot));
+                        snap_slots = snap_slots.max(slot.saturating_add(1));
                     }
                     rs_snaps.extend(entry);
                 }
@@ -2780,8 +2941,22 @@ impl Shell {
             let first = stated
                 .and_then(|slots| slots.first().copied())
                 .unwrap_or(have);
+            let rs = match seated.rs {
+                engine::fire::RsVerb::Buffer {
+                    pages,
+                    base,
+                    folded,
+                    fold,
+                } if !self.pools.is_legacy() => engine::fire::RsVerb::Buffer {
+                    pages: self.pools.buffer_pages(pages, !seated.refs)?,
+                    base: *base,
+                    folded: *folded,
+                    fold: *fold,
+                },
+                verb => verb.clone(),
+            };
             let plan = engine::rs::LanePlan::of(
-                seated.rs,
+                &rs,
                 row.rows,
                 first,
                 masking,
@@ -2825,15 +3000,16 @@ impl Shell {
                     rotations.extend(stated);
                     match &device_writes[source] {
                         Some((slots, offsets)) => {
-                            writes.extend(slots.iter().zip(offsets).map(|(&page, &off)| {
-                                Some((narrow(u64::from(page)), narrow(u64::from(off))))
-                            }));
+                            for (&page, &off) in slots.iter().zip(offsets) {
+                                let page = self.pools.kv_page(page)?;
+                                writes.push(Some((narrow(u64::from(page)), narrow(u64::from(off)))));
+                            }
                         }
                         None => writes.extend(std::iter::repeat_n(None, rows_here)),
                     }
                     for _ in 0..rows_here {
                         request_of_token.push(at_lane);
-                        slot_of_row.push(seated.rs_slot.unwrap_or(lane.slot) as i32);
+                        slot_of_row.push(state_id as i32);
                     }
                 }
                 None => {
@@ -2849,7 +3025,7 @@ impl Shell {
                         positions.push(if self.states_mrope { row } else { stated });
                         rotations.push(stated);
                         request_of_token.push(at_lane);
-                        slot_of_row.push(seated.rs_slot.unwrap_or(lane.slot) as i32);
+                        slot_of_row.push(state_id as i32);
                     }
                     writes.extend(std::iter::repeat_n(None, rows_here));
                 }
@@ -3196,7 +3372,7 @@ impl Shell {
                         narrow(u64::from(offset)),
                     ]);
                     let seated = &lanes[row.source as usize];
-                    voxel_slots.push(seated.rs_slot.unwrap_or(seated.lane.slot) as i32);
+                    voxel_slots.push(self.state_id(seated)? as i32);
                     let voxels = boxed[0].saturating_mul(boxed[1]).saturating_mul(boxed[2]);
                     offset = offset.saturating_add(voxels);
                     if let Some(p) = token_patch {

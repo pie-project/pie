@@ -207,7 +207,7 @@ fn a_reserved_hybrid_pool_states_its_pages_as_chunks() {
         .trace(Platform::Metal);
     let device = engine_metal::Context::bind().expect("the system device");
     let paging = engine_metal::store::kv::Paging::of(PAGE, 2048, 4, 512).expect("a paging");
-    let mut pools = engine_metal::Pools::reserve(
+    let mut pools = engine_metal::store::Planes::reserve(
         &device,
         &trace,
         paging,
@@ -215,7 +215,7 @@ fn a_reserved_hybrid_pool_states_its_pages_as_chunks() {
     )
     .expect("the pools reserve");
     let page = pools.page_bytes().expect("a kv page's bytes");
-    let facts_of = |pools: &engine_metal::Pools| {
+    let facts_of = |pools: &engine_metal::store::Planes| {
         let stated = engine::caps::PoolFacts {
             kv_pages: 512,
             kv_page_size: PAGE,

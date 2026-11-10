@@ -310,12 +310,48 @@ pub struct Buffers {
     #[cfg(target_vendor = "apple")]
     store: Option<(elastic::Arena, elastic::Elastic)>,
     page_tokens: u32,
+    /// The page ids the slab holds: pages of its own, or units of `stride`
+    /// across the state pool it lives in.
     slots: u32,
     page_bytes: u64,
+    /// What a page id steps by: a page of its own slab, or
+    /// `gcd(chunk, page)` in the state pool.
+    stride: u64,
     plane_at: Vec<u64>,
 }
 
 impl Buffers {
+    /// Each plane's offset in a page of `page_size` tokens, and the page's
+    /// bytes: the buffer shape's slot in the state pool.
+    #[must_use]
+    pub fn page_layout(layout: &Layout, page_size: u32) -> (Vec<u64>, u64) {
+        let (plane_at, page_bytes, _) = Self::geometry(
+            layout,
+            Paging {
+                slots: 1,
+                ..Paging::of(page_size.max(1), 1, 1, 1).expect("a page size of one at least")
+            },
+        );
+        (plane_at, page_bytes)
+    }
+
+    /// The buffers as pages of the state pool `slab`, page ids counting
+    /// `stride` bytes from its base.
+    #[must_use]
+    pub fn in_pool(layout: &Layout, page_tokens: u32, slab: Buffer, stride: u64) -> Buffers {
+        let (plane_at, page_bytes) = Self::page_layout(layout, page_tokens);
+        Buffers {
+            slots: u32::try_from(slab.bytes() / stride.max(1)).unwrap_or(u32::MAX),
+            slab,
+            #[cfg(target_vendor = "apple")]
+            store: None,
+            page_tokens: page_tokens.max(1),
+            page_bytes,
+            stride,
+            plane_at,
+        }
+    }
+
     /// The bytes `reserve` takes for `layout` at `paging`: the load's memory
     /// check counts them before anything is allocated.
     #[must_use]
@@ -363,6 +399,7 @@ impl Buffers {
             page_tokens,
             slots,
             page_bytes,
+            stride: page_bytes,
             plane_at,
         })
     }
@@ -598,7 +635,7 @@ impl Seat {
             layout: Arc::clone(layout),
             plane_at: buffers.plane_at.clone(),
             page_tokens: buffers.page_tokens,
-            page_bytes: buffers.page_bytes,
+            page_bytes: buffers.stride,
             pool_slots: buffers.slots,
             ext_in,
             ext_out,

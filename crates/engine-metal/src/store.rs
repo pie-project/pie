@@ -1,6 +1,25 @@
 #![allow(unsafe_code)]
 pub mod accounting;
 pub mod kv;
+pub mod layout;
+pub mod pool;
+mod pools;
+
+pub use pools::{Pools, Rows};
+
+static LEGACY_PLANES: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Whether a load lays the per-plane pools of before instead of the chunk
+/// pool: verification scaffolding for the pool switch, off by default.
+#[must_use]
+pub fn legacy_planes() -> bool {
+    LEGACY_PLANES.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Sets [`legacy_planes`] for the loads that follow.
+pub fn set_legacy_planes(on: bool) {
+    LEGACY_PLANES.store(on, std::sync::atomic::Ordering::Relaxed);
+}
 
 use engine::transfer::KvRun;
 use kernels_metal::{KvPool, RecurrentPool, StateMap, Tensor};
@@ -173,7 +192,7 @@ pub enum Backing {
 }
 
 #[derive(Debug)]
-pub struct Pools {
+pub struct Planes {
     planes: Vec<Plane>,
     shapes: Vec<Shape>,
     paging: Paging,
@@ -307,16 +326,16 @@ struct RowPlan {
     planes: Vec<u64>,
 }
 
-impl Pools {
+impl Planes {
     pub fn reserve(
         device: &Context,
         trace: &Trace,
         paging: Paging,
         facts: &Facts,
-    ) -> Result<Pools> {
+    ) -> Result<Planes> {
         let mut planes = Vec::with_capacity(2 * trace.caches.len());
         let mut shapes = Vec::with_capacity(trace.caches.len());
-        let rows = Pools::plan(trace, paging, facts)?;
+        let rows = Planes::plan(trace, paging, facts)?;
 
         #[cfg(target_vendor = "apple")]
         let sparse = device.sparse()?;
@@ -357,7 +376,7 @@ impl Pools {
             shapes.push(row.shape);
         }
         let maps = state_maps(device, &shapes)?;
-        Ok(Pools {
+        Ok(Planes {
             planes,
             shapes,
             paging,
@@ -1220,7 +1239,7 @@ impl PoolDemand {
             widest: 0,
         };
         let one_page = Paging { pages: 1, ..paging };
-        for row in Pools::plan(trace, one_page, &Facts::default())? {
+        for row in Planes::plan(trace, one_page, &Facts::default())? {
             let bytes: u64 = row.planes.iter().sum();
             if matches!(row.shape, Shape::State { .. }) {
                 demand.fixed = demand.fixed.saturating_add(bytes);
@@ -1298,20 +1317,20 @@ pub fn pool_bytes(trace: &Trace, paging: Paging) -> Result<u64> {
     Ok(PoolDemand::of(trace, paging, rs.as_ref())?.bytes(paging.pages()))
 }
 
-struct Planes {
+struct Widths {
     keys: u64,
     values: u64,
     shared: bool,
 }
 
-fn split(name: &str, planes: &[u64]) -> Result<Planes> {
+fn split(name: &str, planes: &[u64]) -> Result<Widths> {
     match planes {
-        [shared] => Ok(Planes {
+        [shared] => Ok(Widths {
             keys: *shared,
             values: *shared,
             shared: true,
         }),
-        [keys, values] => Ok(Planes {
+        [keys, values] => Ok(Widths {
             keys: *keys,
             values: *values,
             shared: false,
@@ -1405,14 +1424,14 @@ fn narrow(n: u64) -> i32 {
 mod tests {
     use super::*;
 
-    fn state_pools(device: &Context, slots: u32, stride: u64) -> Pools {
+    fn state_pools(device: &Context, slots: u32, stride: u64) -> Planes {
         let bytes = stride * u64::from(slots) * u64::from(elem_size(STATE_DTYPE));
         let shapes = vec![Shape::State {
             stride,
             dtype: STATE_DTYPE,
             plane: 0,
         }];
-        Pools {
+        Planes {
             planes: vec![Plane::Fixed(
                 Buffer::zeroed(device, bytes).expect("a state slab"),
             )],
@@ -1463,7 +1482,7 @@ mod tests {
     }
 
     /// A two-plane kv pool of four pages, fixed or elastic.
-    fn kv_pools(device: &Context, backing: Backing) -> Pools {
+    fn kv_pools(device: &Context, backing: Backing) -> Planes {
         let paging = Paging {
             pages: 4,
             ..paging(1)
@@ -1512,7 +1531,7 @@ mod tests {
                 unreachable!("no sparse buffers off Apple");
             }
         }
-        Pools {
+        Planes {
             planes,
             shapes,
             paging,
@@ -1742,7 +1761,7 @@ mod tests {
 
     fn an_attention_only_plan_answers_ok() {
         let Some(device) = device() else { return };
-        let mut pools = Pools {
+        let mut pools = Planes {
             planes: Vec::new(),
             shapes: Vec::new(),
             paging: paging(2),

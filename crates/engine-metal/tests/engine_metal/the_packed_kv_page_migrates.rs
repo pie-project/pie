@@ -20,7 +20,7 @@ use engine_metal::device::{Buffer, Context, Handles, Pipelines};
 use engine_metal::encode::Sink;
 use engine_metal::run::CachePool;
 use engine_metal::store::kv::{Facts, Paging, SpaceFacts};
-use engine_metal::store::{Pools, Seats, SpaceSeat};
+use engine_metal::store::{Planes as Pools, Seats, SpaceSeat};
 use kernels_metal::Tensor;
 use poem_ir::{CacheRow, Dtype, Platform, Trace};
 
