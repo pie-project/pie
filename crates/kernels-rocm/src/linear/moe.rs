@@ -380,6 +380,44 @@ impl ExpertTable {
     }
 }
 
+/// Where a token-id-gathered table's row blocks lie, as the CUDA kernels
+/// take it. The HIP gather reads only the contiguous table
+/// ([`RowTable::RESIDENT`]) and refuses any other.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct RowTable {
+    pub table: u64,
+    pub block_rows: u32,
+    pub hits: u64,
+}
+
+impl RowTable {
+    pub const RESIDENT: RowTable = RowTable {
+        table: 0,
+        block_rows: 1,
+        hits: 0,
+    };
+
+    #[must_use]
+    pub const fn located(table: u64, block_rows: u32) -> RowTable {
+        RowTable {
+            table,
+            block_rows,
+            hits: 0,
+        }
+    }
+
+    #[must_use]
+    pub const fn counting(mut self, hits: u64) -> RowTable {
+        self.hits = hits;
+        self
+    }
+
+    #[must_use]
+    pub const fn streams(&self) -> bool {
+        self.table != 0
+    }
+}
+
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct GroupSeat {
     pub cell: u64,

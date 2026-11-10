@@ -1,6 +1,6 @@
 use crate::error::Error;
 use crate::jit::{Arg, Ctx, Fire, Launch, count, dtype_dispatch, kernel, refuse, stated};
-use crate::tensor::Tensor;
+use crate::tensor::{RecurrentPool, Tensor};
 use crate::voxels::{flat_elements, lanes_of};
 use dtype::Dtype;
 
@@ -46,7 +46,7 @@ fn check(
     Ok((lanes, frames, c, stride, total, blocks))
 }
 
-pub fn cache_gather(
+pub fn cache_gather_slab(
     ctx: &Ctx,
     slab: Tensor,
     slot_ids: Tensor,
@@ -77,7 +77,7 @@ pub fn cache_gather(
 
 /// `x_base`: the row `grid` addresses `x`'s row 0 at.
 #[allow(clippy::too_many_arguments)]
-pub fn cache_store(
+pub fn cache_store_slab(
     ctx: &Ctx,
     x: Tensor,
     cache: Tensor,
@@ -111,4 +111,54 @@ pub fn cache_store(
             total.arg(),
         ],
     )
+}
+
+/// The slab the HIP frame cache reads `pool`'s rows in: a row whole in its
+/// slot, slots a row apart. Rows cut into pieces, a segment table, or slots
+/// further apart than a row are the chunk pool's layout, which these kernels
+/// do not address.
+fn whole_slab(op: &'static str, pool: &RecurrentPool) -> Result<Tensor, Error> {
+    let slab = pool.slab;
+    let apart = pool.slot_stride_elems;
+    if !pool.segments.whole() || (apart != 0 && apart != i64::from(slab.width)) {
+        return Err(refuse(
+            op,
+            format!(
+                "a frame cache laid in {} piece(s) a row, slots {apart} elements apart for \
+                 rows of {}: the HIP kernels read a row whole in its slot, slots a row apart",
+                pool.segments.pieces.max(1),
+                slab.width
+            ),
+        ));
+    }
+    Ok(slab)
+}
+
+/// [`cache_gather_slab`] over `pool`'s rows, as an engine states them.
+pub fn cache_gather(
+    ctx: &Ctx,
+    pool: &RecurrentPool,
+    slot_ids: Tensor,
+    grid: Tensor,
+    frames: u32,
+    cache: &mut Tensor,
+) -> Result<(), Error> {
+    let slab = whole_slab("conv.cache_gather", pool)?;
+    cache_gather_slab(ctx, slab, slot_ids, grid, frames, cache)
+}
+
+/// [`cache_store_slab`] over `pool`'s rows, as an engine states them.
+#[allow(clippy::too_many_arguments)]
+pub fn cache_store(
+    ctx: &Ctx,
+    x: Tensor,
+    cache: Tensor,
+    pool: &RecurrentPool,
+    slot_ids: Tensor,
+    grid: Tensor,
+    frames: u32,
+    x_base: u32,
+) -> Result<(), Error> {
+    let mut slab = whole_slab("conv.cache_store", pool)?;
+    cache_store_slab(ctx, x, cache, slot_ids, grid, frames, &mut slab, x_base)
 }

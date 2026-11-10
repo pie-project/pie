@@ -33,6 +33,27 @@ fn vectorisable(hidden: u32, table: u64, y: u64) -> bool {
     hidden.is_multiple_of(VEC_WIDTH) && aligned16(table) && aligned16(y)
 }
 
+/// [`embed`] over a table whose row blocks lie where `rows_at` says. The HIP
+/// gather reads the contiguous table only: a located table is refused.
+pub fn embed_tabled(
+    ctx: &Ctx,
+    ids: Tensor,
+    table: Tensor,
+    rows_at: crate::linear::moe::RowTable,
+    vocab: u32,
+    y: &mut Tensor,
+) -> Result<(), Error> {
+    if rows_at.streams() {
+        return Err(refuse(
+            "gather.embed",
+            "a table read through a row table, which the HIP gather does not read: its \
+             rows lie contiguous"
+                .to_string(),
+        ));
+    }
+    embed(ctx, ids, table, vocab, y)
+}
+
 pub fn embed(
     ctx: &Ctx,
     ids: Tensor,
