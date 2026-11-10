@@ -429,3 +429,287 @@ fn rows_landed_twice_keep_the_last() {
         );
     }
 }
+
+/// A word of the large pool, by place.
+fn word(r: i64, l: i64) -> u32 {
+    let x = (r as u64)
+        .wrapping_mul(0x9E37_79B9)
+        .wrapping_add(l as u64 * 0x85EB_CA6B);
+    // normal bf16 halves
+    ((x as u32) & 0x3F3F_3F3F) | 0x2020_2020
+}
+
+fn read_pages_of(rows: i64, w: i64, ids: &[i32]) {
+    // 3 GiB: block reads past 2 GiB (the DMA path on a TPU) land the bits
+    // the packed rows order puts there.
+    let Some(client) = client() else { return };
+    let dev = client.device(0).expect("a device");
+    let t = 16i64;
+    let per = t * w * 2 / 512; // pool rows a page
+    let pages = rows / per;
+    let mut f = Func::new("main");
+    let p = f.param(Ty::new(Elem::U32, &[rows, 128]), None);
+    let at = f.param(Ty::new(Elem::I32, &[ids.len() as i64]), None);
+    let v = f.pool_view(p, Elem::Bf16, &[pages, t, w]).unwrap();
+    let idx = f.reshape(at, &[ids.len() as i64, 1]).unwrap();
+    let got = f
+        .gather(
+            v,
+            idx,
+            &GatherDims {
+                offset_dims: vec![1, 2],
+                collapsed_slice_dims: vec![0],
+                start_index_map: vec![0],
+                index_vector_dim: 1,
+                ..GatherDims::default()
+            },
+            &[1, t, w],
+        )
+        .unwrap();
+    let text = f.module("far", &[got]);
+    let exe = client.compile(&text).unwrap_or_else(|e| panic!("{e}"));
+    let mut host = Vec::with_capacity((rows * 512) as usize);
+    for r in 0..rows {
+        for l in 0..128 {
+            host.extend_from_slice(&word(r, l).to_le_bytes());
+        }
+    }
+    let pb = client
+        .upload(dev, &host, ElementType::U32, &[rows, 128])
+        .unwrap();
+    drop(host);
+    let ib: Vec<u8> = ids.iter().flat_map(|x| x.to_le_bytes()).collect();
+    let ib = client
+        .upload(dev, &ib, ElementType::S32, &[ids.len() as i64])
+        .unwrap();
+    let (outs, done) = exe
+        .execute(dev, vec![Arg::Keep(&pb), Arg::Keep(&ib)])
+        .unwrap();
+    done.wait().unwrap();
+    let out = outs[0].download().unwrap();
+    // element e of page p: pool row p·per + e / 256, half (e / 128) % 2,
+    // lane e % 128
+    let mut bad = 0usize;
+    for (b, &p) in ids.iter().enumerate() {
+        // a gather clamps its start into the view
+        let p = i64::from(p).clamp(0, pages - 1);
+        for e in 0..t * w {
+            let r = p * per + e / 256;
+            let half = (e / 128) % 2;
+            let want = (word(r, e % 128) >> (16 * half)) as u16;
+            let at = ((b as i64 * t * w + e) * 2) as usize;
+            let got = u16::from_le_bytes([out[at], out[at + 1]]);
+            if got != want {
+                bad += 1;
+            }
+        }
+    }
+    assert_eq!(bad, 0, "elements read wrong ({rows} rows, {w} wide)");
+}
+
+#[test]
+fn pages_read_far_into_a_large_pool() {
+    let rows: i64 = 6 << 20;
+    let pages = rows / 64;
+    read_pages_of(
+        rows,
+        1024,
+        &[
+            0,
+            1,
+            (pages / 2) as i32,
+            (pages * 3 / 4) as i32,
+            (pages - 1) as i32,
+        ],
+    );
+}
+
+#[test]
+fn pages_read_as_a_routed_model_reads_them() {
+    // the routed mini's kv plane at a 1 GiB pool: pages of 16 x 512, padded
+    // ids clamped
+    let rows: i64 = 2_138_112;
+    let pages = rows / 32;
+    let mut ids: Vec<i32> = (0..24).map(|i| i * 7).collect();
+    ids.extend([
+        i32::MAX,
+        i32::MAX - 1,
+        -1,
+        -5,
+        (pages - 1) as i32,
+        pages as i32,
+    ]);
+    read_pages_of(rows, 512, &ids);
+}
+
+#[test]
+fn pages_written_far_into_a_large_pool() {
+    // 3 GiB: block writes past 2 GiB (the DMA path on a TPU) land where the
+    // packed rows order puts them, and nowhere else.
+    let Some(client) = client() else { return };
+    let dev = client.device(0).expect("a device");
+    let rows: i64 = 6 << 20;
+    let (t, w) = (16i64, 1024i64);
+    let per = t * w * 2 / 512;
+    let pages = rows / per;
+    let ids: Vec<i32> = vec![
+        1,
+        (pages / 2) as i32,
+        (pages * 3 / 4) as i32,
+        (pages - 1) as i32,
+    ];
+    let n = ids.len() as i64;
+    let mut f = Func::new("main");
+    let p = f.param(Ty::new(Elem::U32, &[rows, 128]), Some(0));
+    let at = f.param(Ty::new(Elem::I32, &[n]), None);
+    let v = f.pool_view(p, Elem::Bf16, &[pages, t, w]).unwrap();
+    // fresh rows: page b all `0x3F81 + b` as bf16 bits (normal floats)
+    let fill = f.iota(Elem::I32, &[n, t, w], 0);
+    let one = f.like_i(fill, 0x3F81);
+    let fill = f.add(fill, one).unwrap();
+    let fill = f.convert(fill, Elem::U16);
+    let fill = f.bitcast(fill, Elem::Bf16).unwrap();
+    let idx = f.reshape(at, &[n, 1]).unwrap();
+    let out = f
+        .scatter_hinted(
+            v,
+            idx,
+            fill,
+            &kernels_xla::hlo::ScatterDims {
+                update_window_dims: vec![1, 2],
+                inserted_window_dims: vec![0],
+                scatter_dims_to_operand_dims: vec![0],
+                index_vector_dim: 1,
+                ..kernels_xla::hlo::ScatterDims::default()
+            },
+            kernels_xla::hlo::Combine::Set,
+            true,
+        )
+        .unwrap();
+    let pool = f.pool_of(out, Elem::Bf16).unwrap();
+    let text = f.module("far", &[pool]);
+    let exe = client.compile(&text).unwrap_or_else(|e| panic!("{e}"));
+    let mut host = Vec::with_capacity((rows * 512) as usize);
+    for r in 0..rows {
+        for l in 0..128 {
+            host.extend_from_slice(&word(r, l).to_le_bytes());
+        }
+    }
+    let pb = client
+        .upload(dev, &host, ElementType::U32, &[rows, 128])
+        .unwrap();
+    let ib: Vec<u8> = ids.iter().flat_map(|x| x.to_le_bytes()).collect();
+    let ib = client.upload(dev, &ib, ElementType::S32, &[n]).unwrap();
+    let (outs, done) = exe
+        .execute(dev, vec![Arg::Donate(pb), Arg::Keep(&ib)])
+        .unwrap();
+    done.wait().unwrap();
+    let got = outs[0].download().unwrap();
+    let mut written = vec![None; pages as usize];
+    for (b, &p) in ids.iter().enumerate() {
+        written[p as usize] = Some(b as u32 + 0x3F81);
+    }
+    let mut bad = Vec::new();
+    for r in 0..rows {
+        let page = (r / per) as usize;
+        for l in 0..128 {
+            let want = match written[page] {
+                Some(x) => x | (x << 16),
+                None => word(r, l),
+            };
+            let at = ((r * 128 + l) * 4) as usize;
+            let g = u32::from_le_bytes([got[at], got[at + 1], got[at + 2], got[at + 3]]);
+            if g != want && bad.len() < 4 {
+                bad.push((r, l, g, want));
+            }
+        }
+    }
+    assert!(
+        bad.is_empty(),
+        "pool words wrong (row, lane, got, want): {bad:x?}"
+    );
+}
+
+#[test]
+fn rows_landed_then_their_pages_read_in_one_fire() {
+    // A decode on a 1 GiB pool: token rows (2 pool rows each, 512 wide)
+    // landed by block, then their pages read back by block, in one program.
+    let Some(client) = client() else { return };
+    let dev = client.device(0).expect("a device");
+    let rows: i64 = 2_138_112;
+    let (t, w) = (16i64, 512i64);
+    let per = t * w * 2 / 512;
+    let pages = rows / per;
+    let page_ids: Vec<i32> = vec![3, 70, (pages - 2) as i32];
+    // one token at row 5 of each page
+    let tok: Vec<i32> = page_ids.iter().map(|&p| p * t as i32 + 5).collect();
+    let n = tok.len() as i64;
+    let mut f = Func::new("main");
+    let p = f.param(Ty::new(Elem::U32, &[rows, 128]), Some(0));
+    let at = f.param(Ty::new(Elem::I32, &[n]), None);
+    let pg = f.param(Ty::new(Elem::I32, &[n]), None);
+    let flat = f.pool_view(p, Elem::Bf16, &[pages * t, w]).unwrap();
+    let fill = f.iota(Elem::I32, &[n, w], 0);
+    let base = f.like_i(fill, 0x3F81);
+    let fill = f.add(fill, base).unwrap();
+    let fill = f.convert(fill, Elem::U16);
+    let fill = f.bitcast(fill, Elem::Bf16).unwrap();
+    let flat = f
+        .put_rows_hinted(flat, at, fill, kernels_xla::hlo::Combine::Set, true)
+        .unwrap();
+    let paged = f.reshape(flat, &[pages, t, w]).unwrap();
+    let idx = f.reshape(pg, &[n, 1]).unwrap();
+    let got = f
+        .gather(
+            paged,
+            idx,
+            &GatherDims {
+                offset_dims: vec![1, 2],
+                collapsed_slice_dims: vec![0],
+                start_index_map: vec![0],
+                index_vector_dim: 1,
+                ..GatherDims::default()
+            },
+            &[1, t, w],
+        )
+        .unwrap();
+    let pool = f.pool_of(paged, Elem::Bf16).unwrap();
+    let text = f.module("land_read", &[pool, got]);
+    let exe = client.compile(&text).unwrap_or_else(|e| panic!("{e}"));
+    let host: Vec<u8> = (0..rows * 128)
+        .flat_map(|i| word(i / 128, i % 128).to_le_bytes())
+        .collect();
+    let pb = client
+        .upload(dev, &host, ElementType::U32, &[rows, 128])
+        .unwrap();
+    let up = |v: &[i32]| {
+        let b: Vec<u8> = v.iter().flat_map(|x| x.to_le_bytes()).collect();
+        client
+            .upload(dev, &b, ElementType::S32, &[v.len() as i64])
+            .unwrap()
+    };
+    let (ab, gb) = (up(&tok), up(&page_ids));
+    let (outs, done) = exe
+        .execute(dev, vec![Arg::Donate(pb), Arg::Keep(&ab), Arg::Keep(&gb)])
+        .unwrap();
+    done.wait().unwrap();
+    let out = outs[1].download().unwrap();
+    let mut bad = Vec::new();
+    for (b, &p) in page_ids.iter().enumerate() {
+        for e in 0..t * w {
+            let (row, j) = (e / w, e % w);
+            let want = if row == 5 {
+                0x3F81 + b as u16
+            } else {
+                let r = i64::from(p) * per + e / 256;
+                (word(r, e % 128) >> (16 * ((e / 128) % 2))) as u16
+            };
+            let at = ((b as i64 * t * w + e) * 2) as usize;
+            let g = u16::from_le_bytes([out[at], out[at + 1]]);
+            if g != want && bad.len() < 6 {
+                bad.push((b, row, j, g, want));
+            }
+        }
+    }
+    assert!(bad.is_empty(), "(page, row, col, got, want): {bad:x?}");
+}

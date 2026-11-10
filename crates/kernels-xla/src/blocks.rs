@@ -56,6 +56,11 @@ pub fn gather(f: &mut Func, pool: Val, at: Val, nr: i64, elem: Elem) -> Built<Va
         let one = bd.i32(1);
         let copy = |bd: &mut Body, j: V, wait: bool| -> Built<()> {
             let id = bd.load(ids, &[j])?;
+            // into the pool, as a gather clamps
+            let z = bd.i32(0);
+            let top = bd.i32(rows / nr - 1);
+            let id = bd.maxsi(id, z)?;
+            let id = bd.minsi(id, top)?;
             let erv = bd.i32(er);
             let from = bd.muli(id, erv)?;
             let to = bd.muli(j, erv)?;
