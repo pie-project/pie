@@ -2506,13 +2506,6 @@ pub(crate) fn scatter_slots_mapped(
             vmem_cap,
         );
     }
-    // Planes of one pool, each by its own map (keys and values of the chunk
-    // pool): the runs once, over the slot pages themselves, each plane's
-    // writes at its own pages.
-    if let Some(v) = scatter_slots_by_maps(f, op, pairs, maps, page_size, write_page, write_offset)?
-    {
-        return Ok(v);
-    }
     let mut out: Vec<Val> = Vec::with_capacity(pairs.len());
     for (at, (&(src, plane), &map)) in pairs.iter().zip(maps).enumerate() {
         let table = match at.checked_sub(1) {
@@ -2550,116 +2543,6 @@ pub(crate) fn scatter_slots_mapped(
         }
     }
     Ok(out)
-}
-
-/// [`scatter_slots_one_map`] for planes each with a map of its own and one
-/// shape (a fire tall enough to write whole pages): the runs and the choice
-/// between rows, pages and fresh pages made once, each plane landed at its
-/// own pages. `None` where the planes differ in rows, or the fire is short
-/// (rows are written plane by plane then, as cheap).
-#[allow(clippy::too_many_arguments)]
-fn scatter_slots_by_maps(
-    f: &mut Func,
-    op: &'static str,
-    pairs: &[(Operand, Operand)],
-    maps: &[PageMap],
-    page_size: i32,
-    write_page: Operand,
-    write_offset: Operand,
-) -> Result<Option<Vec<Val>>, Error> {
-    let Some(&(first, _)) = pairs.first() else {
-        return Ok(None);
-    };
-    let n = first.rows;
-    let ps = i64::from(page_size);
-    let slots = i64::from(pairs[0].1.rows);
-    let tall = i64::from(n) >= PAGE_WRITE_ROWS
-        && ps >= 8
-        && slots % ps == 0
-        && i64::from(n) % ps == 0
-        && pairs.iter().all(|(src, plane)| {
-            plane.rows == pairs[0].1.rows
-                && plane.val != pairs[0].1.val
-                && src.rows == n
-                && f.elem(src.val) == Elem::Bf16
-        })
-        && maps.iter().all(|m| m.stride > 0 && m.offset >= 0);
-    if !tall || pairs.len() < 2 {
-        return Ok(None);
-    }
-    let page = read_rows_i32(f, op, write_page, n)?;
-    let off = read_rows_i32(f, op, write_offset, n)?;
-    // Slot pages every plane holds whole.
-    let pages = maps
-        .iter()
-        .map(|m| (slots / ps - m.offset) / m.stride)
-        .min()
-        .unwrap_or(0);
-    let runs = page_runs(f, i64::from(n), ps, pages, page, off)?;
-    let few = (i64::from(n) / ps + 64) / 4;
-    let skip = cmp_i(f, Cmp::Le, runs.partial, few)?;
-    let skip = f.convert(skip, Elem::I32);
-    let which = with_i(f, skip, 1, Func::add)?;
-    let which = f.mul(which, runs.ok)?;
-    // Each plane's pages and runs by its map (a dropped row's page stays
-    // out of every plane's range).
-    let mut mapped = Vec::with_capacity(pairs.len());
-    for &m in maps {
-        let p = m.apply(f, page)?;
-        let r = Runs {
-            page: m.apply(f, runs.page)?,
-            ..runs
-        };
-        mapped.push((p, r));
-    }
-    // Every plane a view of one pool: each written onto what the one
-    // before left, and the case yields the last pool.
-    let Some((pool0, _)) = f.view_parts(pairs[0].1.val) else {
-        return Ok(None);
-    };
-    if pairs
-        .iter()
-        .any(|(_, plane)| f.view_parts(plane.val).map(|(p, _)| p) != Some(pool0))
-    {
-        return Ok(None);
-    }
-    let last = pairs[pairs.len() - 1].1.val;
-    let outs = vec![f.ty(last).clone()];
-    let chain = |f: &mut Func, write: &dyn Fn(&mut Func, usize, Operand) -> Built<Val>| {
-        let mut prev: Option<Val> = None;
-        for (i, &(_, plane)) in pairs.iter().enumerate() {
-            let val = match prev {
-                Some(p) => rebase(f, plane.val, p)?,
-                None => plane.val,
-            };
-            prev = Some(write(f, i, Operand { val, ..plane })?);
-        }
-        Ok(vec![prev.unwrap_or(last)])
-    };
-    let all = slots / ps;
-    let mapped_r = mapped.clone();
-    let rows: crate::hlo::Branch<'_> = Box::new(move |f: &mut Func| {
-        chain(f, &|f, i, plane| {
-            Ok(slot_rows(f, &[(pairs[i].0, plane)], ps, mapped_r[i].0, off)?[0])
-        })
-    });
-    let mapped_p = mapped.clone();
-    let pages_b: crate::hlo::Branch<'_> = Box::new(move |f: &mut Func| {
-        chain(f, &|f, i, plane| {
-            Ok(page_writes(f, &[(pairs[i].0, plane)], ps, all, &mapped_p[i].1, None)?[0])
-        })
-    });
-    let fresh: crate::hlo::Branch<'_> = Box::new(move |f: &mut Func| {
-        chain(f, &|f, i, plane| {
-            Ok(page_writes(f, &[(pairs[i].0, plane)], ps, all, &mapped[i].1, Some(few))?[0])
-        })
-    });
-    let done = f.case(which, &outs, vec![rows, pages_b, fresh])?[0];
-    let out = pairs
-        .iter()
-        .map(|(_, plane)| rebase(f, plane.val, done))
-        .collect::<Built<Vec<Val>>>()?;
-    Ok(Some(out))
 }
 
 /// `plane` (a view of the chunk pool) as a view of the pool `onto` (a view)
@@ -2781,10 +2664,11 @@ fn scatter_slots_one_map(
                 let page = clamp_i(f, runs.page, 0, slots / ps - 1)?;
                 return super::append::write(
                     f,
-                    k.val,
-                    v.val,
-                    keys.val,
-                    values.val,
+                    &[k.val, v.val],
+                    super::append::Planes::Two {
+                        keys: keys.val,
+                        values: values.val,
+                    },
                     [runs.start, runs.first, runs.len, page],
                     total,
                     vmem_cap,
@@ -2807,10 +2691,11 @@ fn scatter_slots_one_map(
                 );
                 planes = super::append::write(
                     f,
-                    kp,
-                    vp,
-                    planes[0],
-                    planes[1],
+                    &[kp, vp],
+                    super::append::Planes::Two {
+                        keys: planes[0],
+                        values: planes[1],
+                    },
                     [part.start, part.first, part.len, pg],
                     total,
                     vmem_cap,
@@ -2826,6 +2711,37 @@ fn scatter_slots_one_map(
         Box::new(move |f: &mut Func| slot_rows(f, pairs, ps, page, off));
     let pages: crate::hlo::Branch<'_> =
         Box::new(move |f: &mut Func| page_writes(f, pairs, ps, slots / ps, &runs, None));
+    // One plane of the chunk pool (a view): a prompt's runs laid by the
+    // Mosaic kernel straight into the pool, at the plane's pages (already
+    // mapped), a page `[16, w]` as the pool lays it.
+    if let [(src, plane)] = pairs
+        && let Some((pool, Elem::Bf16)) = f.view_parts(plane.val)
+        && src.width == plane.width
+        && f.elem(src.val) == Elem::Bf16
+        && let Some(vmem_cap) = vmem_cap
+        && super::append::fits(i64::from(n), w, slots, ps, m, vmem_cap)
+    {
+        let (src, plane) = (*src, *plane);
+        let kernel: crate::hlo::Branch<'_> = Box::new(move |f: &mut Func| {
+            let total = f.reshape(runs.total, &[1])?;
+            let page = clamp_i(f, runs.page, 0, slots / ps - 1)?;
+            let laid = super::append::write(
+                f,
+                &[src.val],
+                super::append::Planes::Pool {
+                    pool,
+                    maps: vec![PageMap::IDENTITY],
+                    slots,
+                },
+                [runs.start, runs.first, runs.len, page],
+                total,
+                vmem_cap,
+            )?;
+            let dims = f.dims(plane.val).to_vec();
+            Ok(vec![f.pool_view(laid[0], Elem::Bf16, &dims)?])
+        });
+        return Ok(f.case(which, &outs, vec![rows, pages, kernel])?);
+    }
     let fresh: crate::hlo::Branch<'_> =
         Box::new(move |f: &mut Func| page_writes(f, pairs, ps, slots / ps, &runs, Some(few)));
     Ok(f.case(which, &outs, vec![rows, pages, fresh])?)
