@@ -387,6 +387,21 @@ impl Engine for Group {
             loaded.caps.kv_copy.device_to_host &= tiers.host_kv_pages > 0;
             loaded.caps.kv_copy.host_to_device &= tiers.host_kv_pages > 0;
         }
+        // The shared pool's tiers (CONTRACT-BC 22): what every rank holds.
+        let least = |of: fn(&engine::chunk::ChunkFacts) -> u32| {
+            answers
+                .iter()
+                .filter_map(|loaded| loaded.caps.chunks.as_ref().map(of))
+                .min()
+                .unwrap_or(0)
+        };
+        let (host_chunks, disk_chunks) = (least(|c| c.host_chunks), least(|c| c.disk_chunks));
+        for loaded in &mut answers {
+            if let Some(chunks) = loaded.caps.chunks.as_mut() {
+                chunks.host_chunks = host_chunks;
+                chunks.disk_chunks = disk_chunks;
+            }
+        }
         // a rank's facts (codegen backend, pools) exist only once it has loaded;
         // the snapshot taken at open was empty, and a group that keeps it says
         // "no codegen backend" to the host, which then emits no kernels and
@@ -548,30 +563,6 @@ impl Engine for Group {
                 })
                 .collect(),
         })
-    }
-
-    /// Rank after rank, as kv is.
-    fn read_host_state(&mut self, slots: &[u32], pages: &[u32]) -> EngineResult<Vec<u8>> {
-        let mut out = Vec::new();
-        for rank in 0..self.ranks.len() {
-            out.extend(self.on(rank, |shell| shell.read_host_state(slots, pages))?);
-        }
-        Ok(out)
-    }
-
-    fn write_host_state(&mut self, slots: &[u32], pages: &[u32], bytes: &[u8]) -> EngineResult<()> {
-        let ranks = self.ranks.len();
-        if ranks == 0 || !bytes.len().is_multiple_of(ranks) {
-            return Err(Error::Device(format!(
-                "{} bytes of host state do not split across {ranks} ranks",
-                bytes.len()
-            )));
-        }
-        let share = bytes.len() / ranks;
-        for (rank, bytes) in bytes.chunks(share).enumerate() {
-            self.on(rank, |shell| shell.write_host_state(slots, pages, bytes))?;
-        }
-        Ok(())
     }
 
     /// Rank after rank: each holds its own heads of every slot.

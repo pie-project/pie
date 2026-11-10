@@ -406,18 +406,6 @@ impl Shell {
         self.seat_spread
     }
 
-    /// Host rs rows: a state slot and a buffer page each, parked apart.
-    #[must_use]
-    pub fn host_state_slots(&self) -> u32 {
-        self.pools.host_rows().0
-    }
-
-    #[must_use]
-    pub fn host_buffer_pages(&self) -> u32 {
-        // The rs buffer's rows ride the record: no page is parked apart.
-        0
-    }
-
     #[must_use]
     pub fn buffer_pages(&self) -> u32 {
         0
@@ -427,59 +415,8 @@ impl Shell {
         self.pools.state_slot_bytes()
     }
 
-    pub fn copy_state_host(&mut self, to_host: bool, moves: &[(u32, u32)]) -> Result<()> {
-        let stream = self.device.stream();
-        for &(slot, host) in moves {
-            let mut at = self.pools.host_row(host)?;
-            for (span, bytes) in self.pools.state_spans(slot)? {
-                let (dst, src) = if to_host { (at, span) } else { (span, at) };
-                crate::device::copy_any(stream, dst, src, bytes as usize)?;
-                at += bytes;
-            }
-        }
-        self.device.synchronize()
-    }
-
-    /// Where in the host rows `slots`' records lie: their recurrent rows
-    /// and the rs buffer's rows with them. A buffer page parked apart is
-    /// refused: the record holds its rows.
-    fn state_spans(&self, slots: &[u32], pages: &[u32]) -> Result<Vec<(u32, u64, u64)>> {
-        no_buffer_pages(pages.len())?;
-        let state = self.pools.state_slot_bytes();
-        Ok(slots.iter().map(|&slot| (slot, 0, state)).collect())
-    }
-
-    /// The state is a window: its pages are host windowed pages, and it
-    /// holds no slots.
-    fn windowed(&self) -> bool {
-        self.pools.paging().window.is_some()
-    }
-
-    pub fn read_host_state(&mut self, slots: &[u32], pages: &[u32]) -> Result<Vec<u8>> {
-        self.device.synchronize()?;
-        if self.windowed() && slots.is_empty() {
-            return self.pools.read_host_window(pages);
-        }
-        let spans = self.state_spans(slots, pages)?;
-        self.pools.read_host_rows(&spans)
-    }
-
-    pub fn write_host_state(&mut self, slots: &[u32], pages: &[u32], bytes: &[u8]) -> Result<()> {
-        self.device.synchronize()?;
-        if self.windowed() && slots.is_empty() {
-            return self.pools.write_host_window(pages, bytes);
-        }
-        let spans = self.state_spans(slots, pages)?;
-        self.pools.write_host_rows(&spans, bytes)
-    }
-
-    /// A buffer page moved to or from the host tier: there is none, the rs
-    /// buffer's rows moving with the record that holds them.
-    pub fn copy_pages_host(&mut self, _to_host: bool, moves: &[(u32, u32)]) -> Result<()> {
-        no_buffer_pages(moves.len())
-    }
-
-    /// As [`Self::copy_pages_host`], within the device.
+    /// A buffer page moved within the device: there is none, the rs list's
+    /// slots moving by `copy_slots`.
     pub fn copy_pages(&mut self, moves: &[(u32, u32)]) -> Result<()> {
         no_buffer_pages(moves.len())
     }
@@ -554,11 +491,13 @@ impl Shell {
     /// ([`Self::seat_host_kv`]).
     pub const HOST_POOLS: u64 = 4;
 
-    /// Seats this rank's host pool, pinned as it is first used: one rs row
-    /// per device slot, then kv pages, then windowed pages, from `stated`
-    /// bytes shared by `ranks`, within the host memory the load left.
-    /// Unstated, it holds `seats` sequences at `context` tokens, and at least
-    /// one device pool's worth of each.
+    /// Seats this rank's host tier (CONTRACT-BC 22), pinned as it is first
+    /// used, from `stated` bytes shared by `ranks`, within the host memory
+    /// the load left: whole chunks of the state pool's size, every shape's
+    /// slots parking in them, and as many host kv slots for byte reads
+    /// ([`Self::read_host_kv`], a tap's read-out). Unstated, it holds `seats`
+    /// sequences at `context` tokens beside every state row, and at least
+    /// one device pool's worth.
     pub fn seat_host_kv(
         &mut self,
         stated: Option<u64>,
@@ -600,20 +539,12 @@ impl Shell {
                 .max(seated.min(whole.saturating_mul(Self::HOST_POOLS)))
                 .min(free / 2),
         };
-        let (rows, pages, window_pages) =
-            crate::store::host_pool(budget, rows, row, pages, page, window_pages, window_page);
-        self.pools.seat_host(pages, window_pages, rows, row)?;
-        // The shared pool's host tier from the same budget: what a runtime
-        // naming slot refs parks state in (CONTRACT-BC 22). Pinned as it is
-        // first touched, so the shelves a load does not move through cost
-        // nothing.
+        // Both from the one budget, pinned as they are first touched: the
+        // shelf a load does not move through costs nothing.
+        self.pools
+            .seat_host(u32::try_from(budget.checked_div(page).unwrap_or(0)).unwrap_or(u32::MAX));
         self.pools.seat_tier(budget);
         Ok(self.pools.host_pages())
-    }
-
-    #[must_use]
-    pub fn host_window_pages(&self) -> u32 {
-        self.pools.host_window_pages()
     }
     /// Opens this rank's share of `budget` disk kv bytes under `dir`.
     /// Seats this rank's disk tier; `persistent` keeps its slot file for the
@@ -687,20 +618,13 @@ impl Shell {
         self.pools.write_host_kv(slots, bytes)
     }
 
-    pub fn swap_kv(
-        &mut self,
-        to_host: bool,
-        device: &[u32],
-        host: &[u32],
-        windowed: &[(u32, u32)],
-    ) -> Result<()> {
+    pub fn swap_kv(&mut self, to_host: bool, device: &[u32], host: &[u32]) -> Result<()> {
         self.pools.swap_kv(
             self.device.stream(),
             self.device.swap_stream(),
             to_host,
             device,
             host,
-            windowed,
         )
     }
 
@@ -1177,14 +1101,14 @@ impl EnqueuedPhase for Enqueued<'_> {
     }
 }
 
-/// Refuses a move or a read of rs buffer pages: a lane's unfolded rows lie in
-/// its working set's record and move with it.
+/// Refuses a move of rs buffer pages by page id: the rs list's slots move
+/// by `copy_slots` (CONTRACT-BC 18, 22).
 fn no_buffer_pages(named: usize) -> Result<()> {
     if named == 0 {
         return Ok(());
     }
     Err(Fault::Unsupported(format!(
-        "{named} rs buffer page(s) named apart from their records: this engine keeps a lane's \
-         unfolded rows in its working set's record, and moves them with it"
+        "{named} rs buffer page(s) named by page id: this engine moves the rs list's slots by \
+         copy_slots"
     )))
 }

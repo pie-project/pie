@@ -1273,8 +1273,7 @@ impl FrameShell for Shell {
         // ids of the slots they lie in, table after table.
         let device_slot_ids = self.pools.state_tables(&slot_ids)?;
         snapshots.slots = self.pools.snapshot_tables(&snapshots.slots)?;
-        self.pools
-            .fence_swaps(self.device.stream(), &kv_ranges, &window_pages)?;
+        self.pools.fence_swaps(self.device.stream(), &kv_ranges)?;
         super::btrace::mark("commit_frame");
 
         let indptr_host = kv::indptr(&seats)?;

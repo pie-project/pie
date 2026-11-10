@@ -840,14 +840,6 @@ impl Engine for Rank {
         self.with(|cuda| cuda.write_host_kv(slots, bytes))
     }
 
-    fn read_host_state(&mut self, slots: &[u32], pages: &[u32]) -> EngineResult<Vec<u8>> {
-        self.with(|cuda| cuda.read_host_state(slots, pages))
-    }
-
-    fn write_host_state(&mut self, slots: &[u32], pages: &[u32], bytes: &[u8]) -> EngineResult<()> {
-        self.with(|cuda| cuda.write_host_state(slots, pages, bytes))
-    }
-
     fn disconnect(&self, message: &str) {
         self.group.poison(message);
     }

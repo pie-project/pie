@@ -706,9 +706,11 @@ impl Engine for Cuda {
                 }),
                 window_tokens: paging.window.map_or(0, |window| window.tokens),
                 host_kv_pages,
-                host_window_pages: shell.host_window_pages(),
-                host_state_slots: shell.host_state_slots(),
-                host_buffer_pages: shell.host_buffer_pages(),
+                // State parks in the host tier's chunks (CONTRACT-BC 22),
+                // stated in `chunks`, not in host rows of its own.
+                host_window_pages: 0,
+                host_state_slots: 0,
+                host_buffer_pages: 0,
                 disk_kv_pages,
                 disk_kv_persistent: residency.disk_kv_persistent && disk_kv_pages > 0,
                 disk_kv_kept: shell.disk_kv_kept(),
@@ -1175,32 +1177,18 @@ impl Engine for Cuda {
                 .collect()
         };
         let (states, pages) = (pairs(&copy.moves), pairs(&copy.pages));
-        let to_host = match copy.direction {
-            StateDirection::DeviceToDevice => {
-                for &(src, dst) in &states {
-                    shell.copy_state(src, dst).map_err(fault)?;
-                }
-                return shell.copy_pages(&pages).map_err(fault);
-            }
-            StateDirection::DeviceToHost => true,
-            StateDirection::HostToDevice => false,
-        };
-        let device_host = |pairs: Vec<(u32, u32)>| -> Vec<(u32, u32)> {
-            if to_host {
-                pairs
-            } else {
-                pairs
-                    .into_iter()
-                    .map(|(host, device)| (device, host))
-                    .collect()
-            }
-        };
-        shell
-            .copy_state_host(to_host, &device_host(states))
-            .map_err(fault)?;
-        shell
-            .copy_pages_host(to_host, &device_host(pages))
-            .map_err(fault)
+        if copy.direction != StateDirection::DeviceToDevice {
+            // Records, rs list slots and window list slots park by
+            // `copy_slots` (CONTRACT-BC 22).
+            return Err(Error::Unsupported {
+                verb: "copy_state to or from the host: state moves between tiers by copy_slots",
+                engine: "cuda",
+            });
+        }
+        for &(src, dst) in &states {
+            shell.copy_state(src, dst).map_err(fault)?;
+        }
+        shell.copy_pages(&pages).map_err(fault)
     }
 
     fn host_kv_layout(&self) -> Option<state::PageLayout> {
@@ -1214,18 +1202,6 @@ impl Engine for Cuda {
     fn write_host_kv(&mut self, slots: &[u32], bytes: &[u8]) -> EngineResult<()> {
         self.loaded_mut()?
             .write_host_kv(slots, bytes)
-            .map_err(fault)
-    }
-
-    fn read_host_state(&mut self, slots: &[u32], pages: &[u32]) -> EngineResult<Vec<u8>> {
-        self.loaded_mut()?
-            .read_host_state(slots, pages)
-            .map_err(fault)
-    }
-
-    fn write_host_state(&mut self, slots: &[u32], pages: &[u32], bytes: &[u8]) -> EngineResult<()> {
-        self.loaded_mut()?
-            .write_host_state(slots, pages, bytes)
             .map_err(fault)
     }
 
@@ -1252,23 +1228,18 @@ impl Engine for Cuda {
             _ => copy.clone(),
         };
         if let Some((tier, out, pages, slots)) = device.and_then(|device| copy.tier_move(device)) {
-            // The windowed pairs are stated in the copy's direction; the pool
-            // takes them as (device, host).
-            let windowed: Vec<(u32, u32)> = copy
-                .windowed
-                .iter()
-                .map(|&(src, dst)| if out { (src, dst) } else { (dst, src) })
-                .collect();
-            if tier == MemoryDomain::LocalDisk && !windowed.is_empty() {
+            // A window list's slots park by `copy_slots` (CONTRACT-BC 22).
+            if !copy.windowed.is_empty() {
                 return Err(Error::Unsupported {
-                    verb: "windowed kv pages to or from disk",
+                    verb: "windowed kv pages to or from a tier by copy_kv: window list slots \
+                           move by copy_slots",
                     engine: "cuda",
                 });
             }
             let shell = self.loaded_mut()?;
             return match tier {
                 MemoryDomain::LocalDisk => shell.spill_kv(out, pages, slots),
-                _ => shell.swap_kv(out, pages, slots, &windowed),
+                _ => shell.swap_kv(out, pages, slots),
             }
             .map_err(fault);
         }
