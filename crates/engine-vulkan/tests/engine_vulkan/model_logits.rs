@@ -7,7 +7,9 @@
 use std::path::{Path, PathBuf};
 
 use checkpoint::contract::ModelContract;
+use engine::chunk::Evacuation;
 use engine_vulkan::serve::Seated;
+use engine_vulkan::store::layout::{FIXED, LIST};
 use engine_vulkan::{Boot, Lane, Shell};
 use poem::{Dtype, Platform, Request};
 use poem_compiler::Budget;
@@ -228,4 +230,195 @@ fn a_hybrid_miniature_serves_two_lanes() {
 #[test]
 fn a_windowed_miniature_serves_two_lanes() {
     seats("gemma4-e4b-mini-l1", None);
+}
+
+/// Panics at the first row whose logits differ in a bit.
+fn same(what: &str, got: &[Vec<f32>], want: &[Vec<f32>]) {
+    assert_eq!(got.len(), want.len(), "{what}: rows");
+    for (at, (got, want)) in got.iter().zip(want).enumerate() {
+        let differ = got
+            .iter()
+            .zip(want)
+            .filter(|(a, b)| a.to_bits() != b.to_bits())
+            .count();
+        assert!(
+            differ == 0 && got.len() == want.len(),
+            "{what}: row {at} differs in {differ} of {} logits (argmax {} against {})",
+            want.len(),
+            argmax(got),
+            argmax(want)
+        );
+    }
+}
+
+/// Slot refs the runtime would name: pages strided over chunks `first ..
+/// first + 3` from the top down, lane `l`'s record in chunk `first + 3 + l`.
+struct Refs {
+    first: u32,
+    per_list: u32,
+    per_fixed: u32,
+}
+
+impl Refs {
+    fn page(&self, lane: u32, page: u32) -> u32 {
+        let chunk = self.first + 2 - (page % 3);
+        let index = (7 * page + 3 + 61 * lane) % self.per_list;
+        chunk * self.per_list + index
+    }
+
+    fn record(&self, lane: u32) -> u32 {
+        (self.first + 3 + lane) * self.per_fixed + (lane * 3 + 1) % self.per_fixed
+    }
+
+    /// The chunks these refs hold: three of pages and two of records.
+    const HELD: u32 = 5;
+}
+
+/// As [`serve_seats`], every lane addressed by slot refs; after
+/// `evacuate_at` decodes, `between` runs (an evacuation).
+fn serve_refs(
+    shell: &mut Shell,
+    trace: &Trace,
+    refs: &Refs,
+    steps: usize,
+    evacuate_at: usize,
+    between: &mut dyn FnMut(&mut Shell),
+) -> Vec<Vec<f32>> {
+    let mut held = [0u32; 2];
+    let mut fed: [Vec<u32>; 2] = prompts();
+    let page = shell.paging().page_size;
+    let records = [[refs.record(0)], [refs.record(1)]];
+    let mut rows = Vec::new();
+    let table = |lane: usize, upto: u32| -> Vec<u32> {
+        (0..upto.div_ceil(page))
+            .map(|p| refs.page(lane as u32, p))
+            .collect()
+    };
+    let fire = |shell: &mut Shell, lanes: &[(usize, &[u32], u32)]| -> Vec<Vec<f32>> {
+        let tables: Vec<Vec<u32>> = lanes
+            .iter()
+            .map(|&(lane, tokens, have)| table(lane, have + tokens.len() as u32))
+            .collect();
+        let seated: Vec<Seated<'_>> = lanes
+            .iter()
+            .zip(&tables)
+            .map(|(&(lane, tokens, have), pages)| Seated {
+                pages,
+                held: Some(have),
+                refs: true,
+                record: Some(&records[lane][..]),
+                ..Seated::of(Lane {
+                    slot: lane as u32,
+                    word: word(trace, tokens.len() as u32),
+                    tokens,
+                })
+            })
+            .collect();
+        shell.fire_seated(&seated).expect("the fire lands")
+    };
+    for lane in 0..2usize {
+        let got = fire(shell, &[(lane, &fed[lane], held[lane])]);
+        held[lane] += fed[lane].len() as u32;
+        fed[lane] = vec![argmax(&got[0])];
+        rows.extend(got);
+    }
+    for step in 0..steps {
+        if step == evacuate_at {
+            between(shell);
+        }
+        let got = fire(shell, &[(0, &fed[0], held[0]), (1, &fed[1], held[1])]);
+        for lane in 0..2 {
+            held[lane] += 1;
+            fed[lane] = vec![argmax(&got[lane])];
+        }
+        rows.extend(got);
+    }
+    rows
+}
+
+/// A model served out of the chunk pool lands the same logits, bit for bit,
+/// wherever its slots sit: in the seats' own runs, or scattered over chunks
+/// the runtime names by slot refs in a segment of their own, those chunks
+/// evacuated mid-decode below it and that segment given back, the decode
+/// running on through the moved chunks.
+fn scattered(model: &str) {
+    const STEPS: usize = 12;
+    let fixture = fixture(model, None);
+    let Some(mut shell) = load(&fixture, CONTEXT) else {
+        return;
+    };
+    let seats = serve_seats(&mut shell, &fixture.trace, STEPS);
+    drop(shell);
+
+    let mut shell = load(&fixture, CONTEXT).expect("loaded before");
+    let facts = shell.pool_chunk_facts();
+    facts.validate().expect("the facts hang together");
+    eprintln!(
+        "{model}: {} chunks of {} B, {} a segment, segments {:?}, shapes {:?}",
+        facts.total_chunks,
+        facts.chunk_bytes,
+        facts.segment_chunks,
+        facts.segments,
+        facts
+            .shapes
+            .iter()
+            .map(|s| (s.id.0, s.kind, s.slot_bytes, s.slots_per_chunk))
+            .collect::<Vec<_>>()
+    );
+    assert!(facts.shapes.iter().all(|s| s.pinned.is_none()));
+    let layout = shell.pool_layout();
+    let segment = facts.segment_chunks;
+    let low = 1 + layout.seat_chunks();
+    let per = |id| facts.shape(id).map_or(1, |s| s.slots_per_chunk);
+    let kept = (low + Refs::HELD).div_ceil(segment);
+    let first = kept * segment;
+    let commit = (first + Refs::HELD).div_ceil(segment);
+    assert!(
+        facts.segments.max >= commit,
+        "{model}: the pool spans {commit} segments, it has {}",
+        facts.segments.max
+    );
+    let refs = Refs {
+        first,
+        per_list: per(LIST),
+        per_fixed: per(FIXED),
+    };
+    shell.commit_segments(commit).expect("the segments commit");
+    let scattered = serve_refs(
+        &mut shell,
+        &fixture.trace,
+        &refs,
+        STEPS,
+        STEPS / 2,
+        &mut |shell| {
+            let moves = (0..Refs::HELD).map(|at| (first + at, low + at)).collect();
+            shell
+                .evacuate(&Evacuation { moves })
+                .expect("the evacuation lands");
+            shell
+                .release_segments(kept)
+                .expect("the top segments go back");
+            assert_eq!(shell.pool_chunk_facts().segments.committed, kept);
+        },
+    );
+    same(
+        &format!("{model}: scattered and evacuated slots against the seats' runs"),
+        &scattered,
+        &seats,
+    );
+}
+
+#[test]
+fn a_scattered_dense_pool_serves_the_same_logits() {
+    scattered("qwen3-micro-text");
+}
+
+#[test]
+fn a_scattered_hybrid_pool_serves_the_same_logits() {
+    scattered("qwen35-tiny");
+}
+
+#[test]
+fn a_scattered_windowed_pool_serves_the_same_logits() {
+    scattered("gemma4-e4b-mini-l1");
 }
