@@ -976,21 +976,12 @@ impl Func {
     pub fn shr(&mut self, a: Val, b: Val) -> Built<Val> {
         self.binary("shift_right_logical", a, b)
     }
-    pub fn sar(&mut self, a: Val, b: Val) -> Built<Val> {
-        self.binary("shift_right_arithmetic", a, b)
-    }
-    pub fn atan2(&mut self, a: Val, b: Val) -> Built<Val> {
-        self.binary("atan2", a, b)
-    }
 
     pub fn neg(&mut self, x: Val) -> Val {
         self.unary("negate", x)
     }
     pub fn exp(&mut self, x: Val) -> Val {
         self.unary("exponential", x)
-    }
-    pub fn expm1(&mut self, x: Val) -> Val {
-        self.unary("exponential_minus_one", x)
     }
     pub fn log(&mut self, x: Val) -> Val {
         self.unary("log", x)
@@ -1022,9 +1013,6 @@ impl Func {
     pub fn ceil(&mut self, x: Val) -> Val {
         self.unary("ceil", x)
     }
-    pub fn round_even(&mut self, x: Val) -> Val {
-        self.unary("round_nearest_even", x)
-    }
     pub fn sin(&mut self, x: Val) -> Val {
         self.unary("sine", x)
     }
@@ -1033,9 +1021,6 @@ impl Func {
     }
     pub fn not(&mut self, x: Val) -> Val {
         self.unary("not", x)
-    }
-    pub fn popcnt(&mut self, x: Val) -> Val {
-        self.unary("popcnt", x)
     }
     pub fn is_finite(&mut self, x: Val) -> Val {
         let ty = self.ty(x).with_elem(Elem::Pred);
@@ -1183,18 +1168,6 @@ impl Func {
     /// Broadcasts a scalar over `dims`.
     pub fn splat(&mut self, x: Val, dims: &[i64]) -> Built<Val> {
         self.broadcast(x, dims, &[])
-    }
-
-    /// Broadcasts `x` to `dims` by matching its axes to the trailing ones
-    /// (numpy rule), for a same-rank or lower-rank `x`.
-    pub fn broadcast_to(&mut self, x: Val, dims: &[i64]) -> Built<Val> {
-        let r = self.ty(x).rank();
-        if r > dims.len() {
-            return malformed("broadcast_in_dim", format!("{} onto {dims:?}", self.ty(x)));
-        }
-        let off = (dims.len() - r) as i64;
-        let map: Vec<i64> = (0..r as i64).map(|i| i + off).collect();
-        self.broadcast(x, dims, &map)
     }
 
     pub fn slice(&mut self, x: Val, start: &[i64], limit: &[i64], strides: &[i64]) -> Built<Val> {

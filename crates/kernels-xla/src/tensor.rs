@@ -27,11 +27,6 @@ impl Operand {
         f.convert(self.val, Elem::F32)
     }
 
-    /// The value converted to `elem`.
-    pub fn as_elem(self, f: &mut Func, elem: Elem) -> Val {
-        f.convert(self.val, elem)
-    }
-
     /// Where a result that replaces this operand lands.
     #[must_use]
     pub const fn landing(self) -> Landing {

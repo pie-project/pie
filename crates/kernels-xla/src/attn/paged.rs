@@ -2528,39 +2528,6 @@ pub(crate) fn scatter_slots_mapped(
     Ok(out)
 }
 
-/// Appends `src` rows into the one plane `plane` at `map(write_page) ·
-/// page_size + write_offset` (a row whose page or offset is out of range
-/// is dropped): the new plane. A lowering on the shared chunk pool lands
-/// one plane per call, as every plane is a view of one root.
-pub fn plane_append(
-    f: &mut Func,
-    op: &'static str,
-    src: Operand,
-    plane: Operand,
-    map: PageMap,
-    page_size: i32,
-    write_page: Operand,
-    write_offset: Operand,
-) -> Result<Val, Error> {
-    if page_size <= 0 {
-        return Err(refuse(op, "the kv page size is zero"));
-    }
-    if plane.width != src.width {
-        return Err(refuse(op, "the appended rows are not as wide as the plane"));
-    }
-    let out = scatter_slots_one_map(
-        f,
-        op,
-        &[(src, plane)],
-        map,
-        page_size,
-        write_page,
-        write_offset,
-        None,
-    )?;
-    Ok(out[0])
-}
-
 fn scatter_slots_one_map(
     f: &mut Func,
     op: &'static str,
