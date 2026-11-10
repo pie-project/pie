@@ -426,7 +426,7 @@ impl Buffers {
     pub fn commit(&mut self, pages: u32) -> Result<()> {
         #[cfg(target_vendor = "apple")]
         if let Some((_, buffer)) = &mut self.store {
-            let bytes = elastic::pages_up(u64::from(pages) * self.page_bytes);
+            let bytes = elastic::pages_up(u64::from(pages) * self.page_bytes).min(buffer.len());
             elastic::grow_all(&mut [elastic::Target { buffer, bytes }])?;
         }
         #[cfg(not(target_vendor = "apple"))]
@@ -439,7 +439,7 @@ impl Buffers {
     pub fn release(&mut self, pages: u32) -> Result<()> {
         #[cfg(target_vendor = "apple")]
         if let Some((_, buffer)) = &mut self.store {
-            let bytes = elastic::pages_up(u64::from(pages) * self.page_bytes);
+            let bytes = elastic::pages_up(u64::from(pages) * self.page_bytes).min(buffer.len());
             // SAFETY: the caller's contract, `Engine::release_state`: no
             // frame reads the pages released.
             unsafe { elastic::shrink_all(&mut [elastic::Target { buffer, bytes }])? };
