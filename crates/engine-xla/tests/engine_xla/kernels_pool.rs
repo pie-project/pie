@@ -29,6 +29,154 @@ fn cell(req: usize, pos: usize) -> usize {
     PAGES[req][pos / PS] as usize * PS + pos % PS
 }
 
+/// Compressor kv pages at `3p + 1` of the plane, garbage between.
+const KV_MAP: kernels_xla::tensor::PageMap = kernels_xla::tensor::PageMap {
+    stride: 3,
+    offset: 1,
+};
+
+/// The plane pages a `map` lays the pool's 5 pages over, one more as a sink.
+fn laid_pages(map: kernels_xla::tensor::PageMap) -> usize {
+    if map.is_identity() {
+        5
+    } else {
+        map.page(4) as usize + 2
+    }
+}
+
+/// `plane` (5 pages of `w`) with page `p` at `map(p)`, garbage elsewhere.
+fn lay(plane: &[f32], w: usize, map: kernels_xla::tensor::PageMap) -> Vec<f32> {
+    let mut out = vec![64.0f32; laid_pages(map) * PS * w];
+    for p in 0..5 {
+        let at = map.page(p as i64) as usize * PS * w;
+        out[at..at + PS * w].copy_from_slice(&plane[p * PS * w..(p + 1) * PS * w]);
+    }
+    out
+}
+
+/// A laid plane read back as its 5 pages, and whether the garbage stood.
+fn unlay(laid: &[f32], w: usize, map: kernels_xla::tensor::PageMap) -> (Vec<f32>, bool) {
+    let mut out = vec![0.0f32; 5 * PS * w];
+    let mut held = vec![false; laid_pages(map)];
+    for p in 0..5 {
+        let at = map.page(p as i64) as usize;
+        held[at] = true;
+        out[p * PS * w..(p + 1) * PS * w].copy_from_slice(&laid[at * PS * w..(at + 1) * PS * w]);
+    }
+    let clean = held.iter().enumerate().all(|(at, &h)| {
+        h || laid[at * PS * w..(at + 1) * PS * w]
+            .iter()
+            .all(|&x| x == 64.0)
+    });
+    (out, clean)
+}
+
+/// Compressor score pages at `2p + 3`.
+const SCORE_MAP: kernels_xla::tensor::PageMap = kernels_xla::tensor::PageMap {
+    stride: 2,
+    offset: 3,
+};
+
+/// The compressor's kv and score planes laid by maps of their own: each
+/// plane filed one at a time (`state_write_plane`) lands what the
+/// two-plane write lands on identity planes, and the block gather reads
+/// both through their own maps to the identity planes' bits.
+#[test]
+fn mapped_compressor_planes_file_and_pool_what_identity_ones_do() {
+    use kernels_xla::tensor::PageMap;
+    let hd = 6usize;
+    let width = 2 * hd;
+    let pitch = width + 4;
+    let rows = 5usize;
+    let mut rng = Rng(8);
+    let kv = rng.bf16s(rows * width, 1.0);
+    let sc = rng.bf16s(rows * width, 2.0);
+    let wpage = [3u32, u32::MAX, 0, 2, 1];
+    let woff = [1u32, 0, 3, 2, 0];
+    let sk0 = rng.bf16s(CELLS * pitch, 1.0);
+    let ss0 = rng.bf16s(CELLS * pitch, 1.0);
+    let bpos = [7i32, -1, 3, 11, 5];
+    let breq = [0i32, 0, 1, 0, 1];
+    type Ran = Option<(Vec<f32>, Vec<f32>, bool, Vec<f32>)>;
+    let run = |maps: [PageMap; 2]| -> Ran {
+        let mut b = Bench::new();
+        let kvt = b.bf16(rows as u32, width as u32, &kv);
+        let sct = b.bf16(rows as u32, width as u32, &sc);
+        let wp = b.u32(rows as u32, 1, &wpage);
+        let wo = b.u32(rows as u32, 1, &woff);
+        let pages_k = (laid_pages(maps[0]) * PS) as u32;
+        let pages_s = (laid_pages(maps[1]) * PS) as u32;
+        let sk = b.bf16(pages_k, pitch as u32, &lay(&sk0, pitch, maps[0]));
+        let ss = b.bf16(pages_s, pitch as u32, &lay(&ss0, pitch, maps[1]));
+        let bp = b.i32(5, 1, &bpos);
+        let br = b.i32(5, 1, &breq);
+        let out = b.zeros(Dtype::Bf16, 5, hd as u32);
+        let keys = b.zeros(Dtype::Bf16, CELLS as u32, hd as u32);
+        let pages = kv_pool(&mut b, keys);
+        let ran = b
+            .run(|ctx| {
+                for (src, state, map) in [(kvt, sk, maps[0]), (sct, ss, maps[1])] {
+                    engine_xla::lower::lower(ctx, |l| {
+                        let s = l.read(src)?;
+                        let wpv = l.read(wp)?;
+                        let wov = l.read(wo)?;
+                        let st = l.read(state)?;
+                        let v = kernels_xla::attn::pool::state_write_plane(
+                            l.f(),
+                            s,
+                            &pages,
+                            wpv,
+                            wov,
+                            st,
+                            map,
+                        )?;
+                        l.land(state, v)
+                    })?;
+                }
+                engine_xla::lower::lower(ctx, |l| {
+                    let pi = l.read(pages.page_indices)?;
+                    let pp = l.read(pages.page_indptr)?;
+                    let bpv = l.read(bp)?;
+                    let brv = l.read(br)?;
+                    let skv = l.read(sk)?;
+                    let ssv = l.read(ss)?;
+                    let y = kernels_xla::attn::pool::gather(
+                        l.f(),
+                        bpv,
+                        brv,
+                        pi,
+                        pp,
+                        &pages,
+                        hd as u32,
+                        4,
+                        skv,
+                        ssv,
+                        None,
+                        out.landing(),
+                        maps,
+                    )?;
+                    l.land(out, y)
+                })
+            })
+            .unwrap();
+        if !ran {
+            return None;
+        }
+        let (k, ck) = unlay(&b.read_f32(sk), pitch, maps[0]);
+        let (s, cs) = unlay(&b.read_f32(ss), pitch, maps[1]);
+        Some((k, s, ck && cs, b.read_f32(out)))
+    };
+    let Some(want) = run([PageMap::IDENTITY; 2]) else {
+        return;
+    };
+    let got = run([KV_MAP, SCORE_MAP]).expect("the device ran once");
+    let bits = |v: &[f32]| v.iter().map(|x| x.to_bits()).collect::<Vec<_>>();
+    assert_eq!(bits(&got.0), bits(&want.0), "the kv state");
+    assert_eq!(bits(&got.1), bits(&want.1), "the score state");
+    assert!(got.2, "a state row landed outside a page");
+    assert_eq!(bits(&got.3), bits(&want.3), "the pooled entries");
+}
+
 fn kv_pool(b: &mut Bench, keys: Tensor) -> KvPool {
     let indices: Vec<u32> = PAGES.iter().flat_map(|p| p.iter().copied()).collect();
     let indptr = [0u32, 3, 5];
@@ -43,6 +191,8 @@ fn kv_pool(b: &mut Bench, keys: Tensor) -> KvPool {
         max_pages: 3,
         seq_stride: u64::from(keys.width),
         head_stride: u64::from(keys.width),
+        keys_map: kernels_xla::tensor::PageMap::IDENTITY,
+        values_map: kernels_xla::tensor::PageMap::IDENTITY,
     }
 }
 

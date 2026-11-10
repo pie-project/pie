@@ -18,6 +18,7 @@
 
 use crate::hlo::{Built, Elem, Func, Malformed, Val};
 use crate::mosaic::{Body, Compiled, Grid, ICmp, Kernel, MTy, Operand, Sem, Space, V, Window};
+use crate::tensor::PageMap;
 
 use super::paged::{Flashed, Heads};
 
@@ -52,6 +53,9 @@ struct Shape {
     slots: i64,
     h: Heads,
     scale: f64,
+    /// Where the keys and values planes' pages lie (`PageMap`): table page
+    /// `p` is plane page `p · stride + offset` of each.
+    maps: [PageMap; 2],
 }
 
 impl Shape {
@@ -86,6 +90,7 @@ fn kernel(s: &Shape, vmem_cap: i64) -> Built<Compiled> {
         slots,
         h,
         scale,
+        maps,
     } = *s;
     let (qh, gq, d, dv, kvh) = (h.qh(), h.g, h.d, h.dv, h.kvh);
     let (w, wv) = (kvh * d, kvh * dv);
@@ -165,11 +170,22 @@ fn kernel(s: &Shape, vmem_cap: i64) -> Built<Compiled> {
                 let page = b.load(pt, &[at])?;
                 let psv = b.i32(ps);
                 let src_row = b.muli(page, psv)?;
+                // each plane's own row of the page (its map; the identity
+                // reads `page · ps` for both)
+                let mut src_rows = [src_row; 2];
+                if maps.iter().any(|m| !m.is_identity()) {
+                    for (at, m) in maps.iter().enumerate() {
+                        let by = b.i32(m.stride * ps);
+                        let from = b.i32(m.offset * ps);
+                        let row = b.muli(page, by)?;
+                        src_rows[at] = b.addi(row, from)?;
+                    }
+                }
                 let dp = b.subi(p, p0)?;
                 let dst_row = b.muli(dp, psv)?;
                 let z = b.i32(0);
                 for (plane, buf, width, which) in [(kp, kbuf, w, 0), (vp, vbuf, wv, 1)] {
-                    let src = b.ref_slice(plane, &[src_row, z], &[ps, width])?;
+                    let src = b.ref_slice(plane, &[src_rows[which as usize], z], &[ps, width])?;
                     let dst = b.ref_slice(buf, &[slot, dst_row, z], &[1, ps, width])?;
                     let dst = b.ref_squeeze(dst)?;
                     let wh = b.i32(which);
@@ -377,6 +393,7 @@ pub(crate) fn attend(
     h: &Heads,
     scale: f64,
     vmem_cap: i64,
+    maps: [PageMap; 2],
 ) -> Built<Flashed> {
     let r = f.dims(q)[0];
     let span = pages * ps;
@@ -393,6 +410,7 @@ pub(crate) fn attend(
         slots: f.dims(keys)[0],
         h: *h,
         scale,
+        maps,
     };
     let qh = h.qh();
     let pad_i = |f: &mut Func, x: Val| -> Built<Val> {
@@ -458,6 +476,7 @@ mod tests {
             slots: 20000 * 16,
             h,
             scale: 0.1,
+            maps: [PageMap::IDENTITY; 2],
         };
         let c = kernel(&s, 100 << 20).unwrap();
         assert!(c.module.contains("tpu.enqueue_dma"));
@@ -466,5 +485,49 @@ mod tests {
         if let Some(p) = std::env::var_os("PAGES_DUMP") {
             std::fs::write(p, &c.module).unwrap();
         }
+    }
+
+    /// The keys and values planes' pages by maps of their own: the copies
+    /// read each plane at `page · stride + offset` pages, and the identity
+    /// emits the kernel it always did. (Module text only: the kernel runs on
+    /// a TPU, where `kernels_attn::a_mapped_pool_reads_what_the_identity_
+    /// pool_reads` exercises it; unverified off a TPU.)
+    #[test]
+    fn the_kernel_copies_each_planes_pages_by_its_map() {
+        let h = Heads {
+            kvh: 8,
+            g: 2,
+            d: 128,
+            dv: 128,
+        };
+        let shape = |maps| Shape {
+            rp: 256,
+            span: 512,
+            ps: 16,
+            table: 256 * 32,
+            pages: 32,
+            slots: 20000 * 16,
+            h,
+            scale: 0.1,
+            maps,
+        };
+        let plain = kernel(&shape([PageMap::IDENTITY; 2]), 100 << 20).unwrap();
+        let mapped = [
+            PageMap {
+                stride: 3,
+                offset: 1,
+            },
+            PageMap {
+                stride: 3,
+                offset: 2,
+            },
+        ];
+        let laid = kernel(&shape(mapped), 100 << 20).unwrap();
+        assert_ne!(plain.module, laid.module);
+        // `3 · 16` rows a table page, then `16` and `32` rows past it
+        for c in ["48 : i32", "16 : i32", "32 : i32"] {
+            assert!(laid.module.contains(c), "{c}");
+        }
+        assert_eq!(laid.operands.len(), plain.operands.len());
     }
 }

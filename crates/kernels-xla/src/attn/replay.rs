@@ -232,6 +232,8 @@ mod tests {
             max_pages: 3,
             seq_stride: u64::from(d),
             head_stride: u64::from(d),
+            keys_map: crate::tensor::PageMap::IDENTITY,
+            values_map: crate::tensor::PageMap::IDENTITY,
         };
         let o = arg(&mut f, Dtype::Bf16, rows, heads * d);
         let lse = arg(&mut f, Dtype::F32, rows, heads);

@@ -4,6 +4,7 @@ use dtype::Dtype;
 use engine_xla::bench::{Bench, assert_close, round_bf16};
 use engine_xla::handle::{KvPool, RaggedTensor};
 use engine_xla::lower::attn::mla;
+use kernels_xla::tensor::PageMap;
 
 struct Rng(u64);
 
@@ -157,6 +158,44 @@ struct Pool {
     kpe: Vec<f32>,
     slots: usize,
     max_pages: u32,
+    /// Where `bind` lays the latent and rope planes' pages.
+    maps: (PageMap, PageMap),
+}
+
+/// Latent pages at `3p + 1`, rope pages at `2p + 3`, garbage between.
+const MAPPED: (PageMap, PageMap) = (
+    PageMap {
+        stride: 3,
+        offset: 1,
+    },
+    PageMap {
+        stride: 2,
+        offset: 3,
+    },
+);
+
+const IDENTITY: (PageMap, PageMap) = (PageMap::IDENTITY, PageMap::IDENTITY);
+
+/// `plane` laid with page `p` at `map(p)` of `pages_out` pages, garbage
+/// elsewhere.
+fn lay(plane: &[f32], ps: usize, w: usize, map: PageMap, pages_out: usize) -> Vec<f32> {
+    let pages = plane.len() / (ps * w);
+    let mut out = vec![64.0f32; pages_out * ps * w];
+    for p in 0..pages {
+        let at = map.page(p as i64) as usize * ps * w;
+        out[at..at + ps * w].copy_from_slice(&plane[p * ps * w..(p + 1) * ps * w]);
+    }
+    out
+}
+
+/// A laid plane read back as `pages` identity pages.
+fn unlay(laid: &[f32], ps: usize, w: usize, map: PageMap, pages: usize) -> Vec<f32> {
+    let mut out = vec![0.0f32; pages * ps * w];
+    for p in 0..pages {
+        let at = map.page(p as i64) as usize * ps * w;
+        out[p * ps * w..(p + 1) * ps * w].copy_from_slice(&laid[at..at + ps * w]);
+    }
+    out
 }
 
 impl Pool {
@@ -164,9 +203,30 @@ impl Pool {
         self.lanes[lane][kp / self.ps] as usize * self.ps + kp % self.ps
     }
 
+    /// The pages a bound plane holds: past the last page either map lays,
+    /// one more when mapped (the pool's sink).
+    fn plane_pages(&self) -> usize {
+        let pages = self.slots / self.ps;
+        if self.maps == IDENTITY {
+            return pages;
+        }
+        let last = |m: PageMap| m.page(pages as i64 - 1) as usize + 1;
+        last(self.maps.0).max(last(self.maps.1)) + 1
+    }
+
     fn bind(&self, b: &mut Bench) -> KvPool {
-        let keys = b.bf16(self.slots as u32, self.rank as u32, &self.ckv);
-        let values = b.bf16(self.slots as u32, self.rope as u32, &self.kpe);
+        let out = self.plane_pages();
+        let rows = (out * self.ps) as u32;
+        let keys = b.bf16(
+            rows,
+            self.rank as u32,
+            &lay(&self.ckv, self.ps, self.rank, self.maps.0, out),
+        );
+        let values = b.bf16(
+            rows,
+            self.rope as u32,
+            &lay(&self.kpe, self.ps, self.rope, self.maps.1, out),
+        );
         let mut indptr = vec![0i32];
         let mut indices = Vec::new();
         for l in &self.lanes {
@@ -182,6 +242,8 @@ impl Pool {
             max_pages: self.max_pages,
             seq_stride: self.rank as u64,
             head_stride: self.rank as u64,
+            keys_map: self.maps.0,
+            values_map: self.maps.1,
         }
     }
 }
@@ -236,6 +298,24 @@ fn mla_ref(
 
 #[test]
 fn mla_attention_reads_latents_through_pages() {
+    mla_attention_case(IDENTITY);
+}
+
+/// Latent and rope planes laid by their own page maps answer the identity
+/// pool's bits, prefill and decode, dense and selected.
+#[test]
+fn mla_attention_through_mapped_planes_answers_the_same_bits() {
+    let want = mla_attention_case(IDENTITY);
+    let got = mla_attention_case(MAPPED);
+    for (i, (a, b)) in want.iter().zip(&got).enumerate() {
+        assert!(
+            a.iter().zip(b).all(|(x, y)| x.to_bits() == y.to_bits()),
+            "output {i} differs under the page maps"
+        );
+    }
+}
+
+fn mla_attention_case(maps: (PageMap, PageMap)) -> Vec<Vec<f32>> {
     let mut rng = Rng(3);
     let (heads, rank, rope, ps) = (4usize, 64usize, 16usize, 8usize);
     let pages = 9usize;
@@ -249,6 +329,7 @@ fn mla_attention_reads_latents_through_pages() {
         kpe: rng.bf16s(slots * rope, 1.0),
         slots,
         max_pages: 4,
+        maps,
     };
     // Prefill: 7 rows of lane 0, 4 of lane 1, 1 of lane 2, one padded row.
     let mut rows: Vec<(usize, i32)> = (0..7).map(|i| (0, 24 + i)).collect();
@@ -297,7 +378,7 @@ fn mla_attention_reads_latents_through_pages() {
         })
         .unwrap()
     {
-        return;
+        return Vec::new();
     }
     let dense = |r: usize| -> Vec<usize> {
         let (lane, qpos) = rows[r];
@@ -333,10 +414,21 @@ fn mla_attention_reads_latents_through_pages() {
             8e-3,
         );
     }
+    outs.iter().map(|&o| b.read_f32(o)).collect()
 }
 
 #[test]
 fn mla_kv_append_writes_both_planes_and_drops_padding() {
+    mla_kv_append_case(IDENTITY);
+}
+
+/// The latent and rope rows land at each plane's own mapped cells.
+#[test]
+fn mla_kv_append_lands_each_plane_at_its_mapped_cells() {
+    mla_kv_append_case(MAPPED);
+}
+
+fn mla_kv_append_case(maps: (PageMap, PageMap)) {
     let mut rng = Rng(4);
     let (rank, rope, ps, pages) = (32usize, 8usize, 4usize, 3usize);
     let slots = ps * pages;
@@ -349,6 +441,7 @@ fn mla_kv_append_writes_both_planes_and_drops_padding() {
         kpe: rng.bf16s(slots * rope, 1.0),
         slots,
         max_pages: 1,
+        maps,
     };
     let n = 4usize;
     let c = rng.bf16s(n * rank, 1.0);
@@ -377,6 +470,8 @@ fn mla_kv_append_writes_both_planes_and_drops_padding() {
         want_c[s * rank..(s + 1) * rank].copy_from_slice(&c[i * rank..(i + 1) * rank]);
         want_p[s * rope..(s + 1) * rope].copy_from_slice(&p[i * rope..(i + 1) * rope]);
     }
-    assert_close(&b.read_f32(kv.keys), &want_c, 0.0, 0.0);
-    assert_close(&b.read_f32(kv.values), &want_p, 0.0, 0.0);
+    let got_c = unlay(&b.read_f32(kv.keys), ps, rank, maps.0, pages);
+    let got_p = unlay(&b.read_f32(kv.values), ps, rope, maps.1, pages);
+    assert_close(&got_c, &want_c, 0.0, 0.0);
+    assert_close(&got_p, &want_p, 0.0, 0.0);
 }

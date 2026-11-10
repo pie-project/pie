@@ -23,6 +23,7 @@ fn pool(state: Tensor, slots: Tensor) -> RecurrentPool {
         slots,
         conv_state: state,
         new_conv_state: state,
+        map: kernels_xla::tensor::PageMap::IDENTITY,
     }
 }
 

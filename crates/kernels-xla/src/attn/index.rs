@@ -204,7 +204,7 @@ pub fn kv_append(
     let (n, ps) = (i64::from(rows), i64::from(keys.page_size));
     let wp = flat_i32(f, write_page)?;
     let wo = flat_i32(f, write_offset)?;
-    let at = write_cell(f, wp, wo, n, ps)?;
+    let at = write_cell(f, wp, wo, n, ps, keys.keys_map)?;
     Ok(put_cols(f, plane.val, at, k.val)?)
 }
 
@@ -250,6 +250,7 @@ pub fn block_mean(
             planes.page_indices,
             planes.page_indptr,
             keys.page_size,
+            keys.keys_map,
         )?;
         let bpos = flat_i32(f, boundary_pos)?;
         let breq = flat_i32(f, boundary_req)?;
@@ -347,6 +348,7 @@ pub fn topk(
             planes.page_indices,
             planes.page_indptr,
             keys.page_size,
+            keys.keys_map,
         )?;
         let qv = q.val;
         let w = weights.map(|w| w.f32(f));
@@ -521,6 +523,7 @@ pub fn topk_block_max(
         planes.page_indices,
         planes.page_indptr,
         keys.page_size,
+        keys.keys_map,
     )?;
     let table = planes.keys.val;
     let qv = f.slice_axis(q.val, 0, 0, n)?;

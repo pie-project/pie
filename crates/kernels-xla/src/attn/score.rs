@@ -166,6 +166,8 @@ pub fn capture(
         values: keys,
         geom,
         latent: false,
+        keys_map: pool.keys_map,
+        values_map: pool.keys_map,
     };
     let c = {
         let width = (h.kvh * h.d).max(ob * h.qh());

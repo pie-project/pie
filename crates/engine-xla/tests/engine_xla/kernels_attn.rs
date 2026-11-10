@@ -5,6 +5,7 @@ use engine_xla::bench::{Bench, assert_close, round_bf16};
 use engine_xla::handle::{DecodePlan, KvPool, PrefillPlan, RaggedTensor, Tensor};
 use engine_xla::lower::attn as low;
 use kernels_xla::attn::{self, arbiter};
+use kernels_xla::tensor::PageMap;
 
 // ------------------------------------------------------------------ fixtures
 
@@ -88,6 +89,35 @@ struct Pool {
     keys: Vec<f32>,
     values: Vec<f32>,
     max_pages: u32,
+    /// Where `bind` lays each plane's pages (the pool's maps).
+    keys_map: PageMap,
+    values_map: PageMap,
+}
+
+/// The two maps a mapped run lays its planes by: keys at plane page
+/// `3p + 1`, values at `2p + 3`, garbage between.
+const MAPPED: (PageMap, PageMap) = (
+    PageMap {
+        stride: 3,
+        offset: 1,
+    },
+    PageMap {
+        stride: 2,
+        offset: 3,
+    },
+);
+
+const IDENTITY: (PageMap, PageMap) = (PageMap::IDENTITY, PageMap::IDENTITY);
+
+/// `plane` (`pages · ps` rows of `w`) laid with page `p` at plane page
+/// `map(p)` and a loud garbage value everywhere else, `rows` rows in all.
+fn lay(plane: &[f32], ps: usize, w: usize, pages: usize, map: PageMap, rows: usize) -> Vec<f32> {
+    let mut out = vec![64.0f32; rows * w];
+    for p in 0..pages {
+        let at = map.page(p as i64) as usize * ps * w;
+        out[at..at + ps * w].copy_from_slice(&plane[p * ps * w..(p + 1) * ps * w]);
+    }
+    out
 }
 
 impl Pool {
@@ -110,7 +140,50 @@ impl Pool {
             values: rng.bf16s(slots * kvh * d, 1.0),
             lanes,
             max_pages,
+            keys_map: PageMap::IDENTITY,
+            values_map: PageMap::IDENTITY,
         }
+    }
+
+    /// The same pool laid by `maps` (keys, values) when bound.
+    fn with_maps(mut self, maps: (PageMap, PageMap)) -> Self {
+        self.keys_map = maps.0;
+        self.values_map = maps.1;
+        self
+    }
+
+    /// Rows a bound plane holds: past the last page either map lays, and
+    /// one page more when mapped (the pool keeps its last page a sink, as
+    /// the prefill page writer reads the plane's last page as one).
+    fn plane_rows(&self) -> usize {
+        let pages = (self.slots / self.ps) as i64;
+        if self.keys_map.is_identity() && self.values_map.is_identity() {
+            return self.slots;
+        }
+        let last = |m: PageMap| m.page(pages - 1) as usize + 1;
+        (last(self.keys_map).max(last(self.values_map)) + 1) * self.ps
+    }
+
+    /// A bound plane read back (`laid`) as the identity pool's pages, and
+    /// whether every row no page lies in still holds the garbage it was
+    /// laid with.
+    fn unlay(&self, laid: &[f32], map: PageMap) -> (Vec<f32>, bool) {
+        let w = self.kvh * self.d;
+        let pages = self.slots / self.ps;
+        let mut out = vec![0.0f32; self.slots * w];
+        let mut held = vec![false; laid.len() / w / self.ps];
+        for p in 0..pages {
+            let at = map.page(p as i64) as usize;
+            held[at] = true;
+            out[p * self.ps * w..(p + 1) * self.ps * w]
+                .copy_from_slice(&laid[at * self.ps * w..(at + 1) * self.ps * w]);
+        }
+        let clean = held.iter().enumerate().all(|(at, &h)| {
+            h || laid[at * self.ps * w..(at + 1) * self.ps * w]
+                .iter()
+                .all(|&x| x == 64.0)
+        });
+        (out, clean)
     }
 
     fn slot(&self, lane: usize, kp: usize) -> usize {
@@ -123,8 +196,19 @@ impl Pool {
 
     fn bind(&self, b: &mut Bench) -> KvPool {
         let w = (self.kvh * self.d) as u32;
-        let keys = b.bf16(self.slots as u32, w, &self.keys);
-        let values = b.bf16(self.slots as u32, w, &self.values);
+        let rows = self.plane_rows();
+        let pages = self.slots / self.ps;
+        let (ps, wu) = (self.ps, w as usize);
+        let keys = b.bf16(
+            rows as u32,
+            w,
+            &lay(&self.keys, ps, wu, pages, self.keys_map, rows),
+        );
+        let values = b.bf16(
+            rows as u32,
+            w,
+            &lay(&self.values, ps, wu, pages, self.values_map, rows),
+        );
         let mut indptr = vec![0i32];
         let mut indices = Vec::new();
         for l in &self.lanes {
@@ -142,6 +226,8 @@ impl Pool {
             max_pages: self.max_pages,
             seq_stride: w as u64,
             head_stride: self.d as u64,
+            keys_map: self.keys_map,
+            values_map: self.values_map,
         }
     }
 }
@@ -297,6 +383,10 @@ fn check_rows(got: &[f32], want: &[f32], width: usize, rows: usize, atol: f32) {
 
 #[test]
 fn decode_reads_each_rows_lane_through_its_pages() {
+    decode_case(IDENTITY);
+}
+
+fn decode_case(maps: (PageMap, PageMap)) -> Vec<Vec<f32>> {
     let mut rng = Rng(7);
     let (qh, kvh, d) = (6, 2, 48);
     let pool = Pool::new(
@@ -307,7 +397,8 @@ fn decode_reads_each_rows_lane_through_its_pages() {
         9,
         vec![vec![5, 1, 7], vec![2], vec![0, 6, 8]],
         4,
-    );
+    )
+    .with_maps(maps);
     // Three live rows and one padded row (position -1).
     let fire = Fire::plain(&[(0, 9), (1, 2), (2, 11), (0, -1)]);
     let rows = fire.positions.len();
@@ -335,7 +426,7 @@ fn decode_reads_each_rows_lane_through_its_pages() {
         })
         .unwrap()
     {
-        return;
+        return Vec::new();
     }
     let (want, want_lse) = sdpa(
         &q,
@@ -373,6 +464,7 @@ fn decode_reads_each_rows_lane_through_its_pages() {
         &unit,
     );
     check_rows(&b.read_f32(ow), &want, qh * d, rows, 1e-3);
+    vec![b.read_f32(o), b.read_f32(lse), b.read_f32(ow)]
 }
 
 /// Ragged prefill rows: `(lane, first position, count)` runs, then `pad`
@@ -409,6 +501,16 @@ fn a_wide_headed_prefill_walks_each_kv_head_alone() {
 }
 
 fn prefill_alike(qh: usize, kvh: usize, d: usize, n0: i32) {
+    prefill_case(qh, kvh, d, n0, IDENTITY);
+}
+
+fn prefill_case(
+    qh: usize,
+    kvh: usize,
+    d: usize,
+    n0: i32,
+    maps: (PageMap, PageMap),
+) -> Vec<Vec<f32>> {
     let mut rng = Rng(11);
     let lane0: Vec<i32> = (0..45).map(|i| (i * 7 + 3) % 50).collect();
     let pool = Pool::new(
@@ -419,7 +521,8 @@ fn prefill_alike(qh: usize, kvh: usize, d: usize, n0: i32) {
         52,
         vec![lane0, vec![50, 45], vec![46, 51, 47]],
         45,
-    );
+    )
+    .with_maps(maps);
     let runs = [(0, 720 - n0, n0), (1, 20, 5), (2, 33, 1)];
     let fire = Fire::plain(&prefill_rows(&runs, 2));
     let rows = fire.positions.len();
@@ -468,7 +571,7 @@ fn prefill_alike(qh: usize, kvh: usize, d: usize, n0: i32) {
         })
         .unwrap()
     {
-        return;
+        return Vec::new();
     }
     let (want, want_lse) = sdpa(
         &q,
@@ -508,6 +611,12 @@ fn prefill_alike(qh: usize, kvh: usize, d: usize, n0: i32) {
         &unit,
     );
     check_rows(&b.read_f32(o_win), &want, qh * d, live, 1e-3);
+    vec![
+        b.read_f32(o_blocked),
+        b.read_f32(lse),
+        b.read_f32(o_rows),
+        b.read_f32(o_win),
+    ]
 }
 
 #[test]
@@ -597,6 +706,40 @@ fn a_window_walk_bounded_by_its_rows_reach_answers_the_same_bits() {
 
 /// A batched decode through the page-copy kernel (`kernel.attn.decode_pages`)
 /// answers the reference as the walk does.
+/// Whether the device is a TPU: the Mosaic kernels (`tpu_custom_call`) run
+/// nowhere else.
+pub fn on_tpu() -> bool {
+    engine_xla::bench::client().is_some_and(|c| {
+        let c = c.lock().expect("the client");
+        c.device(0)
+            .and_then(|d| c.device_kind(d).ok())
+            .is_some_and(|k| k.to_ascii_lowercase().contains("tpu"))
+    })
+}
+
+/// TPU ONLY (skipped elsewhere; unverified off a TPU): the page-copy decode
+/// kernel copies each plane's pages by its own map, keys and values apart,
+/// and answers the identity pool's bits.
+#[test]
+fn the_page_copy_kernel_reads_mapped_planes_tpu_only() {
+    if !on_tpu() {
+        eprintln!("skipped: the page-copy kernel runs on a TPU");
+        return;
+    }
+    let mut tuning = kernels_xla::tuning::Tuning::DEFAULT;
+    tuning.chunks.decode_pages = 8;
+    for (qh, kvh, d, window) in [(16usize, 8usize, 128usize, None), (8, 2, 256, Some(512))] {
+        let want = long_decode_case(qh, kvh, d, window, tuning, IDENTITY);
+        let got = long_decode_case(qh, kvh, d, window, tuning, MAPPED);
+        assert!(
+            want.iter()
+                .zip(&got)
+                .all(|(a, b)| a.to_bits() == b.to_bits()),
+            "{qh}x{kvh}x{d} {window:?}: the mapped planes answered other bits"
+        );
+    }
+}
+
 #[test]
 fn a_batched_decode_through_the_page_copy_kernel_answers_the_reference() {
     let mut tuning = kernels_xla::tuning::Tuning::DEFAULT;
@@ -629,6 +772,17 @@ fn long_decode_with(
     window: Option<u32>,
     tuning: kernels_xla::tuning::Tuning,
 ) {
+    long_decode_case(qh, kvh, d, window, tuning, IDENTITY);
+}
+
+fn long_decode_case(
+    qh: usize,
+    kvh: usize,
+    d: usize,
+    window: Option<u32>,
+    tuning: kernels_xla::tuning::Tuning,
+    maps: (PageMap, PageMap),
+) -> Vec<f32> {
     let mut rng = Rng(5);
     let ps = 16;
     // 64 lanes over 90 pages; lane l holds 1 + (l * 37) % 80 pages of a
@@ -636,7 +790,7 @@ fn long_decode_with(
     let lanes: Vec<Vec<i32>> = (0..64)
         .map(|l| (0..1 + (l * 37) % 80).map(|p| (p * 13 + l) % 90).collect())
         .collect();
-    let pool = Pool::new(&mut rng, ps, kvh, d, 90, lanes, 80);
+    let pool = Pool::new(&mut rng, ps, kvh, d, 90, lanes, 80).with_maps(maps);
     let rows: Vec<(i32, i32)> = (0..64)
         .map(|l| (l as i32, (pool.capacity(l) as i32) - 1 - (l as i32 % 5)))
         .collect();
@@ -659,7 +813,7 @@ fn long_decode_with(
         })
         .unwrap()
     {
-        return;
+        return Vec::new();
     }
     let (want, _) = sdpa(
         &q,
@@ -676,6 +830,7 @@ fn long_decode_with(
         &unit,
     );
     check_rows(&b.read_f32(o), &want, qh * d, n, 1e-3);
+    b.read_f32(o)
 }
 
 #[test]
@@ -1336,6 +1491,19 @@ fn kv_append_writes_a_prefill_by_pages() {
 /// fresh read is told from a walk by what it answers.
 #[test]
 fn a_prefill_reads_the_rows_it_appended_fresh() {
+    prefill_fresh_case(IDENTITY);
+}
+
+/// The fresh-row read over planes laid by their own page maps: the flash
+/// kernel (a TPU's; the CUDA plugin runs this with it off, through the
+/// walk) reads each plane's older pages by its map and answers the
+/// reference as the identity pool does.
+#[test]
+fn a_prefill_reads_its_fresh_rows_over_mapped_planes() {
+    prefill_fresh_case(MAPPED);
+}
+
+fn prefill_fresh_case(maps: (PageMap, PageMap)) {
     let mut rng = Rng(31);
     let (qh, kvh, d, ps) = (4usize, 2usize, 128usize, 16usize);
     let lanes: Vec<Vec<i32>> = vec![
@@ -1344,7 +1512,7 @@ fn a_prefill_reads_the_rows_it_appended_fresh() {
         (48..52).collect(),
         (52..56).collect(),
     ];
-    let mut pool = Pool::new(&mut rng, ps, kvh, d, 60, lanes, 40);
+    let mut pool = Pool::new(&mut rng, ps, kvh, d, 60, lanes, 40).with_maps(maps);
     let runs = [(0, 0, 600), (1, 0, 100), (2, 0, 1), (3, 0, 51)];
     let fire = Fire::plain(&prefill_rows(&runs, 16));
     let rows = fire.positions.len();
@@ -1532,6 +1700,118 @@ fn a_prefill_reads_the_rows_it_appended_fresh() {
                 1e-4,
             );
         }
+    }
+}
+
+/// Planes laid by non-identity page maps (keys at `3p + 1`, values at
+/// `2p + 3`, garbage between) read through `KvPool::keys_map` and
+/// `values_map` answer the identity pool's bits: a decode per row, a
+/// prefill by row blocks, per row and windowed, head by head, and a long
+/// decode by whole pages (`fetch_pages`), windowed too.
+#[test]
+fn a_mapped_pool_reads_what_the_identity_pool_reads() {
+    let same = |what: &str, a: Vec<Vec<f32>>, b: Vec<Vec<f32>>| {
+        assert_eq!(a.len(), b.len(), "{what}");
+        for (i, (x, y)) in a.iter().zip(&b).enumerate() {
+            assert!(
+                x.iter().zip(y).all(|(p, q)| p.to_bits() == q.to_bits()),
+                "{what}: output {i} differs under the page maps"
+            );
+        }
+    };
+    same("decode", decode_case(IDENTITY), decode_case(MAPPED));
+    same(
+        "prefill",
+        prefill_case(4, 2, 32, 300, IDENTITY),
+        prefill_case(4, 2, 32, 300, MAPPED),
+    );
+    same(
+        "wide prefill",
+        prefill_case(8, 2, 128, 620, IDENTITY),
+        prefill_case(8, 2, 128, 620, MAPPED),
+    );
+    for window in [None, Some(100)] {
+        same(
+            "long decode",
+            vec![long_decode_case(
+                8,
+                2,
+                64,
+                window,
+                kernels_xla::tuning::Tuning::DEFAULT,
+                IDENTITY,
+            )],
+            vec![long_decode_case(
+                8,
+                2,
+                64,
+                window,
+                kernels_xla::tuning::Tuning::DEFAULT,
+                MAPPED,
+            )],
+        );
+    }
+}
+
+/// Appended rows land at their mapped cells, keys and values each by its
+/// own map, the row path and the page path alike; padded rows drop, and
+/// no row lands outside a mapped page.
+#[test]
+fn kv_append_lands_rows_at_each_planes_mapped_cells() {
+    for n in [6usize, 144] {
+        let mut rng = Rng(23);
+        let (ps, kvh, d, pages) = (16usize, 2usize, 64usize, 12usize);
+        let pool = Pool::new(&mut rng, ps, kvh, d, pages, vec![vec![0]], 1).with_maps(MAPPED);
+        let w = kvh * d;
+        let (mut page, mut off) = (Vec::new(), Vec::new());
+        if n == 6 {
+            page.extend([3, 0, 11, -1, 1, 5]);
+            off.extend([1, 15, 0, 0, 2, 7]);
+        } else {
+            let a = [3, 7, 2, 9, 0];
+            let b = [1, 8, 4, 6];
+            for kp in 5..80 {
+                page.push(a[kp / ps]);
+                off.push((kp % ps) as i32);
+            }
+            for kp in 0..53 {
+                page.push(b[kp / ps]);
+                off.push((kp % ps) as i32);
+            }
+            while page.len() < n {
+                page.push(-1);
+                off.push(0);
+            }
+        }
+        let k = rng.bf16s(n * w, 1.0);
+        let v = rng.bf16s(n * w, 1.0);
+        let mut bench = Bench::new();
+        let kv = pool.bind(&mut bench);
+        let kt = bench.bf16(n as u32, w as u32, &k);
+        let vt = bench.bf16(n as u32, w as u32, &v);
+        let pt = bench.i32(n as u32, 1, &page);
+        let ot = bench.i32(n as u32, 1, &off);
+        if !bench
+            .run(|ctx| low::kv_append(ctx, kt, vt, &kv, pt, ot).map(|_| ()))
+            .unwrap()
+        {
+            return;
+        }
+        let mut want_k = pool.keys.clone();
+        let mut want_v = pool.values.clone();
+        for i in 0..n {
+            if page[i] < 0 {
+                continue;
+            }
+            let slot = page[i] as usize * ps + off[i] as usize;
+            want_k[slot * w..(slot + 1) * w].copy_from_slice(&k[i * w..(i + 1) * w]);
+            want_v[slot * w..(slot + 1) * w].copy_from_slice(&v[i * w..(i + 1) * w]);
+        }
+        let (got_k, clean_k) = pool.unlay(&bench.read_f32(kv.keys), MAPPED.0);
+        let (got_v, clean_v) = pool.unlay(&bench.read_f32(kv.values), MAPPED.1);
+        assert_close(&got_k, &want_k, 0.0, 0.0);
+        assert_close(&got_v, &want_v, 0.0, 0.0);
+        assert!(clean_k && clean_v, "{n} rows: a row landed outside a page");
     }
 }
 

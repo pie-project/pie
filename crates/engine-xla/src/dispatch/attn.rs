@@ -1269,6 +1269,7 @@ impl Run<'_> {
                     *ratio,
                     state_kv,
                     state_score,
+                    state_maps,
                     ape.map(|id| self.tensor(id)),
                     self.tensor(*entries),
                 )
@@ -1299,6 +1300,7 @@ impl Run<'_> {
                     *ratio,
                     state_kv,
                     state_score,
+                    state_maps,
                 )
             }
             Attn::PoolKvAppend {

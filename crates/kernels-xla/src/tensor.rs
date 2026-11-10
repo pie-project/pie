@@ -1,6 +1,6 @@
 use dtype::Dtype;
 
-use crate::hlo::{Elem, Func, Val};
+use crate::hlo::{Built, Cmp, Elem, Func, Val};
 
 /// An operand as a kernel reads it: the value the engine read (`[rows,
 /// width]` of the dtype's storage element) and the shape and dtype it is
@@ -143,6 +143,73 @@ impl<T> RaggedTensor<T> {
     }
 }
 
+/// Where a plane's pages (or a state plane's slot blocks) lie in the plane
+/// it is read from: page `p` of a fire's tables is the plane's own page
+/// `p * stride + offset`. In the shared chunk pool every plane is a view of
+/// the whole pool, and a plane's run of a slot starts at a multiple of its
+/// own run, so a slot ref becomes the plane's page by this affine map
+/// (`addr = base + slot * stride + offset`); the degenerate pools are the
+/// identity.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct PageMap {
+    pub stride: i64,
+
+    pub offset: i64,
+}
+
+impl Default for PageMap {
+    fn default() -> Self {
+        Self::IDENTITY
+    }
+}
+
+impl PageMap {
+    pub const IDENTITY: PageMap = PageMap {
+        stride: 1,
+        offset: 0,
+    };
+
+    #[must_use]
+    pub const fn is_identity(self) -> bool {
+        self.stride == 1 && self.offset == 0
+    }
+
+    /// The plane's page of each id (i32, any shape): `x * stride + offset`
+    /// for `x >= 0`; a negative id (`-(s) - 1`, a slot that reads but does
+    /// not write, or `-1`, a dropped row) keeps its encoding over the mapped
+    /// page: `-((-x - 1) * stride + offset) - 1`. An id too large to map
+    /// without overflowing i32 (a padded row's `i32::MAX`) stays as it is,
+    /// out of every plane's range. The identity emits nothing.
+    pub fn apply(self, f: &mut Func, ids: Val) -> Built<Val> {
+        if self.is_identity() {
+            return Ok(ids);
+        }
+        let most = (i64::from(i32::MAX) - self.offset.abs()) / self.stride.max(1);
+        let zero = f.like_i(ids, 0);
+        let real = f.compare(Cmp::Ge, ids, zero)?;
+        let neg_one = f.like_i(ids, -1);
+        let flip = f.sub(neg_one, ids)?;
+        let base = f.select(real, ids, flip)?;
+        let top = f.like_i(base, most);
+        let fits = f.compare(Cmp::Le, base, top)?;
+        let stride = f.like_i(base, self.stride);
+        let mapped = f.mul(base, stride)?;
+        let offset = f.like_i(mapped, self.offset);
+        let mapped = f.add(mapped, offset)?;
+        let neg_one = f.like_i(mapped, -1);
+        let back = f.sub(neg_one, mapped)?;
+        let mapped = f.select(real, mapped, back)?;
+        f.select(fits, mapped, ids)
+    }
+
+    /// The id a plane page `x` maps back from, on the host, for tests and
+    /// engines laying a pool: `x * stride + offset`.
+    #[must_use]
+    pub const fn page(self, x: i64) -> i64 {
+        x * self.stride + self.offset
+    }
+}
+
 /// A paged kv space: `keys`/`values` are `[pages * page_size, kv_heads *
 /// head_dim]` planes (values may be narrower), paged by the CSR
 /// `page_indptr`/`page_indices` of the fire.
@@ -166,6 +233,12 @@ pub struct KvPool<T> {
     pub seq_stride: u64,
 
     pub head_stride: u64,
+
+    /// Where the keys plane's pages lie ([`PageMap`]).
+    pub keys_map: PageMap,
+
+    /// Where the values plane's pages lie.
+    pub values_map: PageMap,
 }
 
 /// A recurrent state space: `state` holds one row per slot, `slots` the slot
@@ -179,6 +252,10 @@ pub struct RecurrentPool<T> {
     pub conv_state: T,
 
     pub new_conv_state: T,
+
+    /// Where each slot's block of rows lies in `state` (and the conv
+    /// planes, the same plane): slot `s` is block `map(s)` ([`PageMap`]).
+    pub map: PageMap,
 }
 
 /// A quantized weight: codes with per-group scales (and zero points when
