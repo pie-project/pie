@@ -265,3 +265,19 @@ The `new-memory/` directory is bookkeeping and is removed before anything lands 
   change and sm_89-only arms. Branches `sc/l40s-<package>`; New Pie merges.
   New Pie keeps poem/compiler migration (MG-B..D), old caches() API removal, K2 IR kv-space removal, runtime wiring,
   Metal. P4 and WC3 (CUDA kernels) still finishing here.
+
+### M16 — 2026-11-10: P4 CUDA kv page stride merged
+- `sc/p4-cuda-kv-stride` (401269dd4, 4e9dabc9b, 96ea7767e): `KvPool.page_stride: [u64; 2]` (bytes per page, key and
+  value planes) passed to every pointer-addressed paged-KV kernel (FA2 decode/prefill, decode_gqa, appends incl.
+  qkv/envelope/dequant/rope, score, selected, MLA appends+decodes+wgmma+expand, compressed decode/pools/stores,
+  index top-k/block max/FP4 store, norm_rope append); per-plane base offset rides in the pointer; engine sets the
+  stride via `Shape::page_stride` (also used by copy_kv and host swap/export). Kernels that keep a cell index in
+  shared memory pack `page << 16 | offset` (refuse/fall back at >= 65,536 positions per page).
+- Bitwise: writers (`attn::strided`, 5 tests) and readers (fa2, selected, score, mla_lse, mla_sparse, compressed,
+  index) identical between packed and spread (layer-major structs, shuffled pages, garbage gaps); wrong layer offset
+  changes the result. engine-cuda tests not run (speed rule).
+- Still dense-only: tcgen05 TMA passes (sm100 prefill, compressed sparse prefill, MLA sparse, index logits) accept
+  packed pools only and otherwise fall back to the pointer kernels; legacy scaled schemes (unused); envelope planes
+  and DeepSeek compressor state slabs; engine copies treat a plane-page as one stride-sized block (layer-major layout
+  will need separate stride and length). sm90/sm100 kernels compile-checked only.
+- Verified: `cargo check` kernels-cuda + engine-cuda (with tests) on new-memory.
