@@ -313,6 +313,13 @@ impl Buffer {
         out
     }
 
+    /// [`Buffer::write`] through a shared reference: the queue orders it
+    /// before the work submitted next.
+    pub(crate) fn write_shared(&self, offset: u64, bytes: &[u8]) -> Result<()> {
+        self.span(offset, bytes.len() as u64)?;
+        self.slab.write(offset, bytes)
+    }
+
     pub fn zero_span(&mut self, offset: u64, len: u64) -> Result<()> {
         self.span(offset, len)?;
         self.slab.zero(offset, len)

@@ -146,6 +146,13 @@ pub struct Run<'c> {
 
     stage: std::cell::RefCell<StageCache>,
 
+    /// The weight cache's row tables, their host copies by param, the pool
+    /// their slots lie in, and the ids a fire's gathers read back.
+    row_caches: Option<&'c crate::store::rows::RowCaches>,
+    row_planes: std::collections::BTreeMap<usize, &'c crate::experts::HostPlane>,
+    row_pool: Option<kernels_slang::Segments>,
+    row_ids: std::cell::RefCell<Option<(u32, Vec<i32>)>>,
+
     arena: &'c SlotTable,
 
     caches: &'c CacheTable,
@@ -213,6 +220,10 @@ impl<'c> Run<'c> {
             host,
             pump,
             stage: std::cell::RefCell::new(StageCache::default()),
+            row_caches: None,
+            row_planes: std::collections::BTreeMap::new(),
+            row_pool: None,
+            row_ids: std::cell::RefCell::new(None),
             arena,
             caches,
             structs: vec![None; values.len() * windows.max_runs() as usize],
@@ -875,6 +886,48 @@ impl<'c> Run<'c> {
             None => bias,
         };
         Ok(Some((out_bank, out_bias, seats.routes(routes))))
+    }
+
+    /// This run with the weight cache's row tables: `planes` their host
+    /// copies by param, `pool` the pool their slots lie in.
+    #[must_use]
+    pub fn with_rows(
+        mut self,
+        rows: &'c crate::store::rows::RowCaches,
+        planes: std::collections::BTreeMap<usize, &'c crate::experts::HostPlane>,
+        pool: kernels_slang::Segments,
+    ) -> Self {
+        if !rows.is_empty() {
+            self.row_caches = Some(rows);
+            self.row_planes = planes;
+            self.row_pool = Some(pool);
+        }
+        self
+    }
+
+    /// Weight value `table`'s row table where the weight cache streams it,
+    /// for a gather of `ids`.
+    pub(crate) fn row_table(
+        &self,
+        table: ValueId,
+        ids: Tensor,
+    ) -> Result<Option<kernels_slang::gather::embed::RowTable>, kernels_slang::Error> {
+        let (Some(rows), Some(pool), Some(host)) = (self.row_caches, self.row_pool, self.host)
+        else {
+            return Ok(None);
+        };
+        let Def::Weight(w) = &self.values[table.0 as usize].def else {
+            return Ok(None);
+        };
+        let param = *w as usize;
+        let Some(plane) = self.row_planes.get(&param) else {
+            return Ok(None);
+        };
+        rows.table(self.handles, host, plane, param, ids, &self.row_ids, pool)
+            .map_err(|why| kernels_slang::Error::Backend {
+                op: "gather.embed",
+                detail: why.to_string(),
+            })
     }
 
     pub(crate) fn gathered_table(

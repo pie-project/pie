@@ -98,6 +98,18 @@ impl HostPlane {
         }
     }
 
+    /// Row `row` of this plane, `per` bytes, into `out`.
+    pub(crate) fn row_into(&self, map: &Mapping, row: u64, out: &mut [u8]) -> Result<()> {
+        if (out.len() as u64) < self.per {
+            return Err(Fault::Ceiling {
+                what: "bytes a host-tier row lands in",
+                need: self.per,
+                have: out.len() as u64,
+            });
+        }
+        self.copy_row(map, row, out.as_mut_ptr())
+    }
+
     fn copy_row(&self, map: &Mapping, row: u64, into: *mut u8) -> Result<()> {
         let start = row * self.per;
         let end = start + self.per;
@@ -889,15 +901,22 @@ impl Plan {
         &self.routed
     }
 
+    /// Where each plane lies; `streamed` (the tables the weight cache
+    /// streams by their rows, [`crate::store::rows`]) on the host, their
+    /// rows read from the artifact into pool slots.
     pub fn tiers(
         &self,
         bytes: &[u64],
         planes: &BTreeMap<usize, Vec<usize>>,
         pinned: &[bool],
+        streamed: &[usize],
         device_cap: u64,
         residency: Residency,
     ) -> Result<Layout> {
         let mut tier = vec![Tier::Device; bytes.len()];
+        for &at in streamed {
+            tier[at] = Tier::Host;
+        }
 
         let mut by_router: BTreeMap<u32, Vec<usize>> = BTreeMap::new();
         let mut grouped = vec![false; bytes.len()];
@@ -911,6 +930,9 @@ impl Plan {
             for &m in members {
                 grouped[m] = true;
             }
+        }
+        for &at in streamed {
+            grouped[at] = true;
         }
         let dense: u64 = bytes
             .iter()
@@ -967,7 +989,7 @@ impl Plan {
             }
         }
         let mut device = dense + pump;
-        let mut host = 0u64;
+        let mut host: u64 = streamed.iter().map(|&at| bytes[at]).sum();
         for members in &groups {
             let group: u64 = members.iter().map(|&m| bytes[m]).sum();
             if device + group <= cap {

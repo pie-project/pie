@@ -359,6 +359,8 @@ pub struct Shell {
     weights: Weights,
     arena: Arena,
     pools: Pools,
+    /// The weight cache's row tables (PLE), streamed through pool slots.
+    row_caches: crate::store::rows::RowCaches,
 
     scratch: Scratch,
 
@@ -427,6 +429,8 @@ pub struct Shell {
     pixel_out: Vec<Buffer>,
 
     recorder: crate::record::Recorder,
+    /// The load streams weights by a tier of its own: no fire records.
+    own_stream: bool,
 }
 
 impl Shell {
@@ -541,6 +545,17 @@ impl Shell {
             boot.device.chunk_bytes,
         )?;
         let rows = crate::store::Rows::plan(&boot.trace, &recipe, &facts, rs_layout.as_deref())?;
+        // The tables a plain token-id gather alone reads stream by their
+        // rows through weight slots of the pool; they stay on the host.
+        let row_shapes = crate::store::rows::RowsShape::of(
+            &boot.trace,
+            &recipe,
+            &crate::store::rows::streamed(&boot.trace),
+        )?;
+        let streamed: Vec<usize> = row_shapes
+            .iter()
+            .flat_map(|shape| shape.tables.iter().map(|table| table.param))
+            .collect();
         let page_size = if rows.tokens > 0 {
             rows.tokens
         } else {
@@ -594,6 +609,7 @@ impl Shell {
             device_cap,
             boot.residency,
             boot.budget.max_tokens,
+            &streamed,
         )?;
 
         weights.decode_absorbed(&device, &handles, &boot.trace)?;
@@ -923,6 +939,8 @@ impl Shell {
             host_kv_budget.map_or(0, |bytes| u32::try_from(bytes / chunk).unwrap_or(u32::MAX));
         let rs_at = rows.rs.clone();
         let mut pools = Pools::reserve(&device, rows, layout, paging, host_chunks)?;
+        let row_caches =
+            crate::store::rows::RowCaches::new(&device, row_shapes, boot.budget.max_tokens, chunk)?;
         // The null chunk's segment stands from the load on.
         pools.commit_segments(&device, 1)?;
         let rs_buffers =
@@ -935,6 +953,9 @@ impl Shell {
             || weights.seats().is_some()
             || weights.gathered().is_some()
             || weights.pump().is_some();
+        // Recorded fires replay no staging: a row table records once every
+        // block of it is resident ([`Shell::weight_residency`]).
+        let rows_stream = !row_caches.is_empty();
 
         Ok(Shell {
             tuning,
@@ -947,6 +968,7 @@ impl Shell {
             weights,
             arena,
             pools,
+            row_caches,
             scratch,
             inputs,
             readout,
@@ -994,8 +1016,11 @@ impl Shell {
                 .collect(),
             pixel_out,
 
+            own_stream: weights_stream,
             recorder: if weights_stream {
                 crate::record::Recorder::refusing("the weights plane streams")
+            } else if rows_stream {
+                crate::record::Recorder::refusing("a row table is not wholly resident")
             } else {
                 crate::record::Recorder::new()
             },
@@ -1118,7 +1143,40 @@ impl Shell {
     /// The pool as the runtime counts it.
     #[must_use]
     pub fn pool_chunk_facts(&self) -> engine::chunk::ChunkFacts {
-        self.pools.chunk_facts()
+        engine::chunk::ChunkFacts {
+            weights: self.row_caches.facts(),
+            ..self.pools.chunk_facts()
+        }
+    }
+
+    /// See `Engine::weight_residency`: every slot newly named filled from
+    /// the host before the next fire, every block's entry rewritten.
+    pub fn weight_residency(&mut self, residency: &engine::chunk::WeightResidency) -> Result<()> {
+        self.drain()?;
+        if self.row_caches.is_empty() {
+            return Ok(());
+        }
+        let host = self.weights.host().ok_or_else(|| Fault::Unbound {
+            what: "the host copy of the row tables".to_string(),
+        })?;
+        let planes = self.weights.row_planes(&self.row_caches);
+        self.row_caches
+            .residency(&self.device, &self.pools, host, &planes, residency)?;
+        self.recorder = if self.own_stream {
+            crate::record::Recorder::refusing("the weights plane streams")
+        } else if self.row_caches.whole() {
+            crate::record::Recorder::new()
+        } else {
+            crate::record::Recorder::refusing("a row table is not wholly resident")
+        };
+        Ok(())
+    }
+
+    /// See `Engine::weight_uses`.
+    pub fn weight_uses(&mut self) -> Result<engine::chunk::WeightUses> {
+        self.drain()?;
+        let (uses, held) = self.row_caches.uses()?;
+        Ok(engine::chunk::WeightUses { uses, held })
     }
 
     #[must_use]
@@ -1156,6 +1214,14 @@ impl Shell {
         }
         let mut frame = self.device.frame()?;
         let (moved, pages) = self.pools.evacuate(&mut frame, evacuation)?;
+        // The row tables' entries name physical units: those in moved chunks
+        // are rewritten once every fire reading them has landed.
+        if !self.row_caches.is_empty() {
+            frame.commit()?;
+            self.drain()?;
+            self.row_caches.restage(&self.pools)?;
+            frame = self.device.frame()?;
+        }
         // The compressor side planes hold a cell a token of every physical
         // list page: each moved chunk's pages move with it.
         let tokens = u64::from(self.pools.paging().page_size);
@@ -2124,6 +2190,18 @@ impl Shell {
         let rows = composition.rows();
         let lane_count = composition.lane_count();
 
+        // A seat-addressed lane writes the seats' runs, which the weight
+        // cache's slots must not share (they hold rows a fire reads).
+        if lanes.iter().any(|seated| !seated.refs)
+            && self
+                .row_caches
+                .holds_in(1..1 + self.pools.layout().seat_chunks())
+        {
+            return Err(program(
+                "serve::stage",
+                "a seat-addressed lane beside weight slots in the seats' chunks".to_string(),
+            ));
+        }
         let mut seats: Vec<Seat> = Vec::with_capacity(lanes.len());
         let mut kv_less: Vec<bool> = Vec::with_capacity(lanes.len());
 
@@ -2981,6 +3059,11 @@ impl Shell {
                 self.weights.gathered(),
                 self.weights.host(),
                 self.weights.pump(),
+            )
+            .with_rows(
+                &self.row_caches,
+                self.weights.row_planes(&self.row_caches),
+                self.pools.segments(&self.handles)?,
             );
             if split {
                 run.flush_between_layers();

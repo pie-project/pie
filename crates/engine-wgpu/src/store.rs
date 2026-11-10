@@ -5,6 +5,7 @@
 pub mod kv;
 pub mod layout;
 pub mod pool;
+pub mod rows;
 
 use engine::chunk::{ChunkFacts, Evacuation, ShapeId, SlotCopy};
 use engine::transfer::{KvRun, MemoryDomain};
@@ -624,6 +625,28 @@ impl Pools {
         let (chunk, index) = self.place(&shape, slot)?;
         self.pool.admit(chunk)?;
         Ok(u64::from(chunk) * self.layout.chunk_bytes + u64::from(index) * shape.slot_bytes)
+    }
+
+    /// The virtual byte weight slot ref `slot` (of a shape `per_chunk`
+    /// slots of `slot_bytes` a chunk) starts at, its chunk committed.
+    pub fn weight_slot(&self, per_chunk: u32, slot_bytes: u64, slot: u32) -> Result<u64> {
+        let per = per_chunk.max(1);
+        let (chunk, index) = (slot / per, slot % per);
+        if chunk == 0 || chunk >= self.layout.total_chunks {
+            return Err(Fault::Ceiling {
+                what: "chunks a weight slot ref may name (past the null chunk)",
+                need: u64::from(chunk) + 1,
+                have: u64::from(self.layout.total_chunks),
+            });
+        }
+        let chunk = self.pool.physical(chunk)?;
+        self.pool.admit(chunk)?;
+        Ok(u64::from(chunk) * self.layout.chunk_bytes + u64::from(index) * slot_bytes)
+    }
+
+    /// The segment buffer virtual byte `at` lies in, and its offset there.
+    pub fn locate(&self, at: u64) -> Result<(&Buffer, u64)> {
+        self.pool.locate(at)
     }
 
     /// What one id of shape `id` counts as kernels address it: the slot

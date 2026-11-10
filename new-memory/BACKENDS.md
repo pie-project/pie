@@ -13,7 +13,7 @@ Legend: ✅ verified on hardware · 🟡 in progress / compile-only · 🔴 not 
 | rs list + slot_copies | ✅ M34 | ✅ golden_buffered (MI300X) | ✅ M37 | ✅ VK2 (rs tail fork, engine) | ✅ VK2 (rs tail fork, engine) | 🟡 XLA | 🟡 M43 (host sim) |
 | Window lists (own T_w, trimmed) | 🟡 one list, T_w=page (L40S: tables per list) | ✅ goldens (one list) | 🟡 one list (BM) | ✅ up to 4 lists, own T_w (VK2) | ✅ up to 4 lists, own T_w (VK2) | 🟡 XLA | 🟡 one list, T_w=page |
 | Multi-piece records end to end | ✅ engine (L40S) · 🟡 runtime boot (IT r5) | ✅ records in pieces (chunk goldens); rows cut across pieces kernel-tested | 🔴 on device (BM) | ✅ M48 (4 pieces bitwise) | ✅ M48 (4 pieces bitwise) | 🟡 XLA | 🟡 host sim |
-| Weight streaming: PLE rows | ✅ M35/M36/M41 | ✅ M43 golden_rows | 🔴 BM | 🔴 VK | 🔴 VK | 🟡 XLA | — weights on host |
+| Weight streaming: PLE rows | ✅ M35/M36/M41 | ✅ M43 golden_rows | 🔴 BM | ✅ VK2 (rows, grouped tables) | ✅ VK2 (rows, grouped tables) | 🟡 XLA | — weights on host |
 | Weight streaming: experts | 🟡 dense bf16 M40; quantized next | ✅ dense M47; quantized after CUDA | 🔴 BM | 🔴 VK | 🔴 VK | 🟡 XLA | — weights on host |
 | Host/disk tiers of shared shapes (copy_slots) | ✅ engine probe M43 · 🟡 e2e | ✅ golden_offload 8/8 (MI300X) | 🟡 M43 compile (BM) | ✅ VK2 offload (dense, hybrid, window) | ✅ VK2 offload (dense, hybrid, window) | 🔴 XLA | 🟡 CB (host sim) |
 | K2 (no kv spaces) | ✅ M39 | ✅ | ✅ M42 | compile | compile | compile | compile |
@@ -53,6 +53,22 @@ contract 15 (a group `[run, cow]`, the folding lane writing the copy, the buffer
 untouched) = two ungrouped lanes bit for bit; a fork's rs-list and window-list tail slot copied by `slot_copies`
 lands its parent's row bit for bit. Each has a negative control that fails (restore skipped, cow unfilled, tail
 not copied).
+
+Vulkan / wgpu weight cache (VK2): row tables only. The tables a plain token-id gather alone reads (PLE) stay on
+the host (the mapped artifact) and are stated as `WeightKind::Rows` shapes (ids from 8; tables the recipe groups
+share an atom, a token id's row of each, so gemma4-e4b's per-layer tables are one shape, unlike CUDA's one table a
+shape). `weight_residency` fills newly named slots from the host in batched uploads (one copy of merged regions a
+segment), rewrites a u32 block -> pool-unit table; evacuation rewrites it. `gather_embed_tabled` (Slang, SPIR-V and
+WGSL) reads a resident block from the pool and a block not resident from rows staged for that fire: the engine
+flushes the frame, reads the ids back, copies the missing rows from the host into a host-visible stage both
+backends can bind (wgpu: through the queue). Uses: one atomic a row read into a per-block counter (the group's
+first table), `weight_uses` reads and zeroes them and reports `WeightUses.held`. Held fast path: with every block
+resident no fire flushes or stages, and on Vulkan fires record again (a residency not wholly resident refuses
+recording). Seat-addressed fires are refused while a weight slot lies in the seats' chunks (M41). Verified: a
+gather copies, so all-resident (held, after an evacuation of every weight chunk), none resident and every other
+block resident land the same bits, and all-resident = the build before the cache bit for bit (gemma4-e4b-mini-l1,
+both engines; -l6 grouped tables within the build). Routed experts (expert table) not built on these engines yet:
+the engines' own expert tier (`device_weight_budget`, pump, gathered seats) still serves MoE banks.
 
 Pre-existing parity gaps (not memory, but in scope for parity): ROCm synth codegen, ROCm graph replay with >= 2 MoE layers (AMD d); (concat_cols, FP8 m33 fixed M43);
 sm_100 tcgen05 W4A16 arms read no expert table; Metal MLA prefill unsupported.
