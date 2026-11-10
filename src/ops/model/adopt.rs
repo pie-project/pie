@@ -845,6 +845,20 @@ fn layer_suffix(name: &str) -> Option<(u64, String)> {
     Some((index, parts[at + 2..].join(".")))
 }
 
+/// A family's refusal split into the family and what it said:
+/// "`llama_3`'s `adopt` refuses it: the config's ..." reads as
+/// (`llama_3`, "the config's ...").
+fn refusal(said: &str) -> (String, String) {
+    let said = reason(said);
+    let Some(rest) = said.strip_prefix('`') else {
+        return (String::new(), said);
+    };
+    let Some((family, why)) = rest.split_once("`'s `adopt` refuses it: ") else {
+        return (String::new(), said);
+    };
+    (family.to_string(), why.to_string())
+}
+
 /// A precision as people name it: `bf16`, `fp8`, `nvfp4`, `int4`.
 fn label(word: &str) -> String {
     let word = word.to_ascii_lowercase();
@@ -932,7 +946,7 @@ fn backend(name: &str) -> &str {
 }
 
 /// Key–value rows under a section, the keys in one column.
-const KEY: usize = 16;
+const KEY: usize = 18;
 
 fn section(p: &Palette, title: &str) {
     println!();
@@ -987,6 +1001,25 @@ impl crate::ui::Report for Report {
                 "Family",
                 format!("{no} no installed family matches these tensor names"),
             ),
+            Some(_) if self.refused.is_some() => {
+                row(
+                    p,
+                    "Family",
+                    format!("{no} no installed family runs this architecture"),
+                );
+                row(
+                    p,
+                    "Considered",
+                    p.dim(format!(
+                        "{} (tensor names match)",
+                        self.kin
+                            .iter()
+                            .map(|k| k.package.as_str())
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    )),
+                );
+            }
             Some(f) => {
                 row(p, "Family", format!("{} {}", ok, f.package));
                 let total = f.agreeing.len() + f.departing.len();
@@ -1072,12 +1105,18 @@ impl crate::ui::Report for Report {
         if let Some(why) = &self.refused {
             section(p, "RESULT");
             row(p, "Status", format!("{no} Not supported"));
-            for (i, why) in why.split("; and ").enumerate() {
-                let why = reason(why);
-                if i == 0 {
-                    row(p, "Reason", why);
+            let refusals: Vec<(String, String)> = why.split("; and ").map(refusal).collect();
+            let width = refusals.iter().map(|(f, _)| f.len()).max().unwrap_or(0);
+            for (i, (family, why)) in refusals.iter().enumerate() {
+                let said = if family.is_empty() {
+                    why.clone()
                 } else {
-                    more(p, why);
+                    format!("{}  {why}", p.dim(format!("{family:<width$}")))
+                };
+                if i == 0 {
+                    row(p, "Why", said);
+                } else {
+                    more(p, said);
                 }
             }
             return;
@@ -1275,6 +1314,18 @@ mod tests {
         assert_eq!(label("u4g64"), "int4");
         assert_eq!(label("nvfp4a4"), "nvfp4");
         assert_eq!(label("bf16"), "bf16");
+    }
+
+    #[test]
+    fn a_refusal_names_its_family() {
+        assert_eq!(
+            refusal("`llama_3`'s `adopt` refuses it: the config's model_type is phi"),
+            (
+                "llama_3".to_string(),
+                "the config's model_type is phi".to_string()
+            )
+        );
+        assert_eq!(refusal("plain").0, "");
     }
 
     #[test]
