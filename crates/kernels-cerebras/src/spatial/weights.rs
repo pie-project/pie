@@ -1,18 +1,19 @@
 //! Weights and per-PE data onto the wafer: what goes where ([`Binding`]). A binding names a staged
 //! array (or a generated one: rcfg, tables), the rectangle it covers and the PE symbol it lands
-//! in; the engine's placer turns a program's bindings into device copies in a fixed order.
+//! in; the engine's placer turns a program's bindings ([`super::artifact::Artifact`]) into device
+//! copies in a fixed order.
 //!
 //! The tile-making half (`prep.rs` and the Python preps) stays outside for now (ARCHITECTURE.md:
 //! the [`Transform`]s are its future home).
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 use super::floor::Rect;
 use super::npy::Npy;
 
 /// Where a copy's words come from. The words are row-major over the binding's rectangle, one
 /// PE's after another; the per-PE count is their number over the rectangle's PEs.
-#[derive(Clone, Debug, PartialEq, Serialize)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub enum Source {
     /// A staged npy (`<prefix><name>.npy`), a block of it: its leading index range and the
     /// per-PE word count.
@@ -44,7 +45,7 @@ pub enum Source {
 /// = `dims: [rows, cols]`, `RowsAcross { rows }` = `dims: [rows], across: rect.w`; D `Slice` with
 /// `across: 1, optional: false`; E `Block { ranges, repeat_rows }` = `dims: ranges`,
 /// `repeat: rect.h` when `repeat_rows`.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Slice {
     pub name: String,
     pub lead: Option<u32>,
@@ -160,7 +161,7 @@ impl Slice {
 
 /// The transforms a prep applies to a checkpoint tensor before it is staged (declared here so a
 /// binding states them; the preps implement them today).
-#[derive(Clone, Debug, PartialEq, Serialize)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub enum Transform {
     /// Zero-pad a dim to `to` (Qwen3-8B's hidden 4,096 -> 4,104).
     PadZero {
@@ -178,10 +179,10 @@ pub enum Transform {
 }
 
 /// One copy onto the wafer.
-#[derive(Clone, Debug, PartialEq, Serialize)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct Binding {
     /// The PE symbol it lands in (`w`, `rcfg`, `hw`, `cw`, ...).
-    pub sym: &'static str,
+    pub sym: String,
     pub rect: Rect,
     pub source: Source,
     /// 16-bit words (`put16`).
@@ -212,7 +213,7 @@ impl Copies {
     pub fn push(&mut self, sym: &'static str, rect: Rect, source: Source, b16: bool, from: From) {
         if !rect.is_empty() {
             self.0.push(Binding {
-                sym,
+                sym: sym.to_string(),
                 rect,
                 source,
                 b16,

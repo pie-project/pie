@@ -14,7 +14,8 @@
 //!
 //! [`spatial`] is the other half: the role-split wafer program's build (a plan
 //! to the floor, links, kernels and weight bindings of a whole-wafer program,
-//! `programs/split`), which the engine places and drives.
+//! `programs/split`), written as an [`spatial::artifact::Artifact`] the engine
+//! loads and runs.
 
 pub mod attn;
 pub mod conv;

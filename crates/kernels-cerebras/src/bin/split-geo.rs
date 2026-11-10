@@ -3,7 +3,7 @@
 //!
 //! ```text
 //! split-geo <prep dir> <prefix> [k=v,...] --out <dir>
-//!           [--what floor,rcfg,kernels,layout,host,meta,bindings]
+//!           [--what floor,rcfg,kernels,layout,host,meta,bindings,program]
 //!           [--levers K:V,...] [--kernels <programs/split dir>]
 //! split-geo --plan <plan.json> --out <dir> [...]
 //! split-geo --geometry <qwen|gptoss|gemma|gemma12>:<name>
@@ -24,14 +24,18 @@
 //!   `params.txt` and `geo.env` `link.sh` reads;
 //! - `host.json`: `emit::host::HostLayout`;
 //! - `meta.json`: the meta the plan states;
-//! - `bindings.json`: every copy onto the wafer in placement order (`Family::bindings`), which the
-//!   Python runners execute (`tools/split/splitgeo.py`'s `place`) instead of placing on their own.
+//! - `bindings.json`: every copy onto the wafer in placement order (`Program::bindings`), which the
+//!   Python runners execute (`tools/split/splitgeo.py`'s `place`) instead of placing on their own;
+//! - `program.json`: the artifact's header (`artifact::Header`: the model facts, the meta it was
+//!   built from). With `host.json`, `bindings.json` and the rcfg arrays it is the
+//!   `artifact::Artifact` the engine runs (`PIE_CEREBRAS_SPLIT_ARTIFACT`, or
+//!   `<prep>/<prefix>program/`).
 //!
 //! The kernel sources default to `$SPLIT_SRC`, else this crate's `programs/split`.
 
 use std::path::{Path, PathBuf};
 
-use kernels_cerebras::spatial::emit::host::HostLayout;
+use kernels_cerebras::spatial::artifact::Artifact;
 use kernels_cerebras::spatial::emit::meta::Meta;
 use kernels_cerebras::spatial::emit::params::{Levers, kernels};
 use kernels_cerebras::spatial::emit::{layout, rcfg};
@@ -42,8 +46,8 @@ use kernels_cerebras::spatial::program::Program;
 use kernels_cerebras::spatial::role::Kind;
 use serde::Serialize;
 
-const WHATS: [&str; 7] = [
-    "floor", "rcfg", "kernels", "layout", "host", "meta", "bindings",
+const WHATS: [&str; 8] = [
+    "floor", "rcfg", "kernels", "layout", "host", "meta", "bindings", "program",
 ];
 
 fn main() {
@@ -136,27 +140,6 @@ fn json(dir: &Path, name: &str, v: &impl Serialize) -> Result<(), String> {
     write(dir, name, format!("{s}\n").as_bytes())
 }
 
-/// A little-endian u32 npy of `shape` (version 1.0 header, padded to 64 bytes).
-fn npy_u32(shape: &[usize], data: &[u32]) -> Vec<u8> {
-    let dims = shape
-        .iter()
-        .map(|d| d.to_string())
-        .collect::<Vec<_>>()
-        .join(", ");
-    let mut h = format!("{{'descr': '<u4', 'fortran_order': False, 'shape': ({dims},), }}");
-    let total = 10 + h.len() + 1;
-    h.push_str(&" ".repeat(total.next_multiple_of(64) - total));
-    h.push('\n');
-    let mut b = Vec::with_capacity(10 + h.len() + data.len() * 4);
-    b.extend_from_slice(b"\x93NUMPY\x01\x00");
-    b.extend_from_slice(&(h.len() as u16).to_le_bytes());
-    b.extend_from_slice(h.as_bytes());
-    for w in data {
-        b.extend_from_slice(&w.to_le_bytes());
-    }
-    b
-}
-
 /// `--geometry <family>:<name>`: the named geometry (see the module doc).
 fn geometry(spec: &str) -> Result<serde_json::Value, String> {
     let (fam, name) = spec
@@ -179,13 +162,16 @@ fn run() -> Result<(), String> {
         return Ok(());
     }
     let a = args()?;
-    let prog = match (&a.prep, &a.plan) {
-        (Some((dir, prefix, ov)), _) => Program::from_meta(&Meta::read(dir, prefix, ov)?)?,
+    let (prog, meta) = match (&a.prep, &a.plan) {
+        (Some((dir, prefix, ov)), _) => {
+            let meta = Meta::read(dir, prefix, ov)?;
+            (Program::from_meta(&meta)?, Some(meta))
+        }
         (None, Some(p)) => {
             let text = std::fs::read_to_string(p).map_err(|e| format!("{}: {e}", p.display()))?;
             let plan: Plan =
                 serde_json::from_str(&text).map_err(|e| format!("{}: {e}", p.display()))?;
-            Program::build(family::of(plan.shape.family), plan)?
+            (Program::build(family::of(plan.shape.family), plan)?, None)
         }
         (None, None) => return Err(usage()),
     };
@@ -207,34 +193,28 @@ fn run() -> Result<(), String> {
             },
         )?;
     }
-    if want("rcfg") {
-        let g = rcfg::all(&prog)?;
-        let (w, h) = (prog.floor.w as usize, prog.floor.h as usize);
-        let n = g
-            .iter()
-            .filter_map(|(_, v)| v.as_ref().map(Vec::len))
-            .max()
-            .unwrap_or(0);
-        let mut data = vec![0u32; w * h * n];
-        for (c, v) in g.iter() {
-            if let Some(v) = v {
-                let at = (c.y as usize * w + c.x as usize) * n;
-                data[at..at + v.len()].copy_from_slice(v);
-            }
+    let art = if ["rcfg", "host", "bindings", "program"]
+        .iter()
+        .any(|w| want(w))
+    {
+        Some(Artifact::of(&prog, meta.as_ref())?)
+    } else {
+        None
+    };
+    if let Some(art) = &art {
+        if want("rcfg") {
+            art.write_rcfg(&a.out)?;
+            write(&a.out, "rcfg.txt", rcfg::dump(&prog)?.as_bytes())?;
         }
-        let lens: Vec<u32> = (0..h * w)
-            .map(|i| {
-                g.get(kernels_cerebras::spatial::floor::Coord::new(
-                    (i % w) as u32,
-                    (i / w) as u32,
-                ))
-                .as_ref()
-                .map_or(0, |v| v.len() as u32)
-            })
-            .collect();
-        write(&a.out, "rcfg.npy", &npy_u32(&[h, w, n], &data))?;
-        write(&a.out, "rcfg_n.npy", &npy_u32(&[h, w], &lens))?;
-        write(&a.out, "rcfg.txt", rcfg::dump(&prog)?.as_bytes())?;
+        if want("host") {
+            art.write_host(&a.out)?;
+        }
+        if want("bindings") {
+            art.write_bindings(&a.out)?;
+        }
+        if want("program") {
+            art.write_header(&a.out)?;
+        }
     }
     if want("kernels") {
         json(&a.out, "kernels.json", &kernels(&prog, &a.levers)?)?;
@@ -242,14 +222,8 @@ fn run() -> Result<(), String> {
     if want("layout") {
         layout::write(&prog, &a.levers, &a.kernels, &a.out.join("layout"))?;
     }
-    if want("host") {
-        json(&a.out, "host.json", &HostLayout::of(&prog)?)?;
-    }
     if want("meta") {
         json(&a.out, "meta.json", &Meta::of_plan(&prog.plan))?;
-    }
-    if want("bindings") {
-        json(&a.out, "bindings.json", &prog.bindings()?)?;
     }
     Ok(())
 }

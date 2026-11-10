@@ -2,7 +2,9 @@
 
 A role-split program is a list of **blocks** over a logical **plan**. A family turns a model and
 a chosen geometry into the plan and names the blocks it composes; the core runs every build step
-over the blocks in order and knows no model, no family and no block's vocabulary.
+over the blocks in order and knows no model, no family and no block's vocabulary. The build lives
+here (`kernels-cerebras`); the engine (`engine-cerebras`) runs its **artifact** and knows none of
+it (below).
 
 ```
 model dims + geometry ─Family::plan─▶ Plan ─Family::blocks─▶ [Block]
@@ -17,7 +19,7 @@ model dims + geometry ─Family::plan─▶ Plan ─Family::blocks─▶ [Block]
                                                                │ blocks' overrides ─▶ Overrides (per-PE params)
                                                                ▼
                                emit::{rcfg (Kernel::rcfg over a Pe), params + layout, host, meta}
-                               Program::bindings (blocks' copies) ─▶ weights::place
+                               Program::bindings (blocks' copies) ─▶ artifact::Artifact ─▶ engine
 ```
 
 | Layer | Module | Holds | Knows |
@@ -145,7 +147,7 @@ weight FIFO) in that kind only; a lever no kernel takes is an error.
 
 `layout.csl` is written from the floor: each maximal rectangle of PEs with one kind and one
 resolved param list is one loop nest, every param a literal, so `link.sh` passes no shape params
-(the layout's `SPLIT_GEO` param marks such a build; `mod.rs::is_split` finds it in `out.json`).
+(the layout's `SPLIT_GEO` param marks such a build; the engine's `split::is_split` finds it in `out.json`).
 The per-kind sources are the kernels', with one-word dummies for the family's other exported
 symbols (`Family::symbols`, export order).
 
@@ -196,15 +198,27 @@ and the `Contract`. Everything after `Plan` stays as it is.
 `Program::bindings` lists every copy, the blocks' in order: a symbol, a rectangle and a `Source`
 (`Staged` leading-range blocks, `Slice` for any sub-array: column ranges, per-PE padding, a row
 repeated down or across a rectangle, optional tables; `Rcfg`) with the `Transform`s the prep
-applied. `weights::place` executes them on a `Device`; `tools/split/splitgeo.py` executes the same
-`bindings.json` on the appliance runners. The preps keep every staged file under the 2 GiB a
+applied. The engine's placer (`engine-cerebras` `spatial::split::place`) executes an artifact's
+bindings on a `Device`; `tools/split/splitgeo.py` executes the same `bindings.json` on the appliance
+runners. The preps keep every staged file under the 2 GiB a
 transfer may take (split head tiles, `ple`'s 1,900 MiB storage files).
+
+## The artifact (what the engine runs)
+
+`artifact::Artifact` is the built program as the host needs it: the `HostLayout` (the PEs it reads
+and writes, the x runs, the head and the token loop's root, the softcap), the bindings in placement
+order, every PE's rcfg words, and the model facts of the host's math (`Header::model`: vocabulary,
+hidden size, eps, `lgt`'s prescale), with the meta it was built from. `split-geo` writes it
+(`program.json`, `host.json`, `bindings.json`, `rcfg.npy`, `rcfg_n.npy`); the engine's
+`SplitModel` reads it from `PIE_CEREBRAS_SPLIT_ARTIFACT` or `<prep>/<prefix>program/`, checks its
+meta against the prep's, and places and drives the program from it alone. A prep staged without one
+is built at open (`Artifact::build`, the compat path).
 
 ## Tools
 
 - `split-geo <prep> <prefix> [k=v,..] --out <dir> [--what ..] [--levers ..]` writes `floor.json`,
-  `rcfg.npy`, `kernels.json`, `layout/` (with `params.txt`, `geo.env`), `host.json`, `meta.json` and
-  `bindings.json`; `--plan <plan.json>` builds from a plan instead of a meta; `--geometry
+  `rcfg.npy`, `kernels.json`, `layout/` (with `params.txt`, `geo.env`), `host.json`, `meta.json`,
+  `bindings.json` and `program.json` (the artifact's header); `--plan <plan.json>` builds from a plan instead of a meta; `--geometry
   <family>:<name>` prints a named geometry (what a prep needs before its meta exists).
 - `tools/split/mkfull.py <out> <prep> <prefix> [overrides] [levers]` is the build directory of any
   family (the `mkfull_{gemma,g12,gptoss}.py` add their runner); `link.sh` links it and checks stack

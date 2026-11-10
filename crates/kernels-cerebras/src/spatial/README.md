@@ -4,8 +4,9 @@ The role-split program runs one bf16 model on a CS-3 wafer at batch 1. It is a s
 next to `serve8b_region`. It is built for Qwen3.5 (9B, 4B and 0.8B), Qwen3-8B, Gemma 4 (E2B, E4B) and gpt-oss-20b
 (section 7). This file covers its design, results, build and run, the parameters and environment variables, the
 metrics, and open items.
-Serving is Rust only: `SplitModel` in this module behind the engine's `Wafer`. The Python under
-`crates/engine-cerebras/tools/` runs at build time only.
+Serving is Rust only: the engine's `spatial::split::SplitModel` behind its `Wafer` runs the build's
+artifact (`artifact.rs`; this module is the build). The Python under `crates/kernels-cerebras/tools/`
+and `crates/engine-cerebras/tools/emu` runs at build time only.
 
 ## 1. Design
 
@@ -19,7 +20,7 @@ of every collective move onto a few control PEs.
 (PX + 1) x (PY + 1) PEs. Each unit runs K layers. The units are visited as a snake: down unit
 column 0, then up column 1, and so on.
 
-- **Weight PE** (`csl/split/weight_q35.csl`). Holds its K layers' four tiles: the row's x chunk
+- **Weight PE** (`programs/split/weight_q35.csl`). Holds its K layers' four tiles: the row's x chunk
   (Hc dims) by the column's outputs, as f16 bits. A layer runs as:
   1. x from CX's row multicast
   2. the qkv partial goes into the column reduction to CY
@@ -112,8 +113,9 @@ Notes on the table:
 
 ## 3. Build and run
 
-All tools are under `crates/engine-cerebras/tools/`. Set `CSL_SDK` to the SDK directory, which holds
-`cslc` and `cs_readelf`.
+The build tools are under `crates/kernels-cerebras/tools/` (`tools/split`), the numerics gates under
+`crates/engine-cerebras/tools/emu`. Set `CSL_SDK` to the SDK directory, which holds `cslc` and
+`cs_readelf`.
 
 1. **Prep** (checkpoint -> tiles): writes `<prefix>meta.json`, `w<u>.npy`, `hw`, `hemb`, ... (and
    `params.txt`). The build reads the meta; the geometry is Rust's (`split-geo`, `ARCHITECTURE.md`).
@@ -125,20 +127,22 @@ All tools are under `crates/engine-cerebras/tools/`. Set `CSL_SDK` to the SDK di
    serve8b_region's levers on Qwen3-8B: `tools/emu/tf_qwen3_8b.py`.
 3. **Sources**: `tools/split/mkfull.py <build dir> <prep> <prefix> [overrides k=v,..] [levers K:V,..]`
    writes `layout.csl` (every PE's kernel and params resolved), one source a PE kind and `geo/`
-   (`split-geo`'s files: rcfg, floor, host, bindings). Overrides are the meta's (as
+   (`split-geo`'s files: rcfg, floor, host, bindings, and `program.json`: with the host, bindings
+   and rcfg files it is the artifact the engine runs; copy `geo/` to `<prep>/<prefix>program/`, or
+   point `PIE_CEREBRAS_SPLIT_ARTIFACT` at it). Overrides are the meta's (as
    `PIE_CEREBRAS_SPLIT` takes them: `G2=16,WL=1`); levers set kernel params (`CYV:2`, `SLW:1`; a
-   `<kind>.` prefix scopes one: `w.FIFOW:16`). It reads `src/spatial/csl/split`, or `$SPLIT_SRC`.
+   `<kind>.` prefix scopes one: `w.FIFOW:16`). It reads `programs/split`, or `$SPLIT_SRC`.
 4. **Link and check**: `tools/split/link.sh <build dir>`. This is a full local link at the chip's
    fabric dims, followed by the stack-room check. Run it on every build before a chip request. Name
    the chip payload `*_ieee`.
 5. **Tiny end-to-end on the simulator** (no chip):
    1. `tools/split/mk_tinyhf.py <dir> t08` (or `t4`) builds a tiny HF checkpoint and its golden.
    2. `prep_q35.py` on it, then `mkfull.py <build> <prep> "" G2=2,WL=1,G2W=2` and `link.sh`.
-   3. `split_sim <build>/out <prep> "" G2=2,WL=1,G2W=2 5` (`--example split_sim`; `SPLIT_NTOK` caps
+   3. `split_sim <build>/out <prep> "" G2=2,WL=1,G2W=2 5` (engine-cerebras `--example split_sim`; `SPLIT_NTOK` caps
       the tokens) runs `SplitModel` against the golden: two sequences, a rollback and a logits row.
       Run it where the SDK runtime libraries are: inside the SDK container, through the container's
       glibc loader for a host-built binary, or with `PIE_CEREBRAS_SDK_LIB`.
-   4. `examples/split_place.rs` dumps a placement copy by copy (sha256 each), so two hosts or
+   4. engine-cerebras `examples/split_place.rs` dumps a placement copy by copy (sha256 each), so two hosts or
       builds can be compared.
 6. **Serve**: `pie serve` with the cerebras engine and `PIE_CEREBRAS_SPLIT=<prep dir>:<prefix>:G2=16,WL=1`.
    The 0.8B uses `G2=16,G2Y=8,WL=1`. Pie config: `frame_size 4`, `frame_dispatch_depth 63`,

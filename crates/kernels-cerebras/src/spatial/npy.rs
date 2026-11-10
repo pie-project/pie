@@ -1,5 +1,6 @@
 //! A `.npy` file read in slices (`pread`, no mapping): little-endian `u2`
-//! and `f4` arrays in C order, as the prep writes them.
+//! and `f4` arrays in C order, as the prep writes them; and the u32 arrays the
+//! build writes ([`u32_bytes`]).
 
 use std::fs::File;
 use std::os::unix::fs::FileExt;
@@ -128,4 +129,25 @@ fn field(h: &str, key: &str) -> Option<String> {
     let rest = h[at + key.len() + 3..].trim_start();
     let end = rest.find(',')?;
     Some(rest[..end].trim().to_string())
+}
+
+/// A little-endian u32 npy of `shape` (version 1.0 header, padded to 64 bytes).
+pub fn u32_bytes(shape: &[usize], data: &[u32]) -> Vec<u8> {
+    let dims = shape
+        .iter()
+        .map(|d| d.to_string())
+        .collect::<Vec<_>>()
+        .join(", ");
+    let mut h = format!("{{'descr': '<u4', 'fortran_order': False, 'shape': ({dims},), }}");
+    let total = 10 + h.len() + 1;
+    h.push_str(&" ".repeat(total.next_multiple_of(64) - total));
+    h.push('\n');
+    let mut b = Vec::with_capacity(10 + h.len() + data.len() * 4);
+    b.extend_from_slice(b"\x93NUMPY\x01\x00");
+    b.extend_from_slice(&(h.len() as u16).to_le_bytes());
+    b.extend_from_slice(h.as_bytes());
+    for w in data {
+        b.extend_from_slice(&w.to_le_bytes());
+    }
+    b
 }

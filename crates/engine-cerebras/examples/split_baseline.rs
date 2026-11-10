@@ -1,5 +1,6 @@
-//! The role-split host's whole output for one prep, on a recording device: what
-//! `SplitModel::open` places (every PE's words of every symbol, rcfg in full),
+//! The role-split host's whole output for one prep, on a recording device: the
+//! prep's artifact built, written and read back (`kernels_cerebras::spatial::artifact`), then what
+//! `SplitModel::open_artifact` places (every PE's words of every symbol, rcfg in full),
 //! the calls it makes, the values it derives, and one greedy launch's host
 //! traffic. Two runs (before and after a change) compare file for file
 //! (`crates/kernels-cerebras/tools/split/baseline`).
@@ -17,6 +18,8 @@ use std::io::Write;
 use engine_cerebras::sdk::{self, DataType, Order, Rect};
 use engine_cerebras::spatial::device::Device;
 use engine_cerebras::spatial::split::{SplitModel, SplitSpec};
+use kernels_cerebras::spatial::artifact::Artifact;
+use kernels_cerebras::spatial::emit::meta::Meta;
 use sha2::{Digest, Sha256};
 
 fn hex(d: &[u8]) -> String {
@@ -236,7 +239,18 @@ fn main() {
     }));
     let t0 = std::time::Instant::now();
     let mut derived = serde_json::Map::new();
-    match SplitModel::open(Box::new(Shared(rec.clone())), &spec, vocab) {
+    // the artifact through its files, as the engine reads one
+    let art = || -> Result<Artifact, String> {
+        let meta = Meta {
+            map: spec.meta.clone().into_iter().collect(),
+        };
+        let dir = tempfile::tempdir().map_err(|e| e.to_string())?;
+        Artifact::build(&meta)?.write(dir.path())?;
+        Artifact::read(dir.path())
+    };
+    let opened = art()
+        .and_then(|a| SplitModel::open_artifact(Box::new(Shared(rec.clone())), &spec, &a, vocab));
+    match opened {
         Ok(mut m) => {
             derived.insert("vocab".into(), m.vocab.into());
             derived.insert("hidden".into(), m.hidden.into());

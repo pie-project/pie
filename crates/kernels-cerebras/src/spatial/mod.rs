@@ -3,9 +3,13 @@
 //! model and how it is cut, no coordinates) through the [`family`]'s [`block`]s to the
 //! [`floor`], [`wiring`] and laid [`fabric`], every kernel's [`abi`] ([`kernels`]), the build's
 //! outputs ([`emit`]) and the weight [`weights`] bindings; `ARCHITECTURE.md` walks the layers.
-//! The engine (`engine-cerebras`, `spatial::split`) places and drives a built program.
+//!
+//! What the engine runs is the [`artifact::Artifact`]: the host's map of the program, every copy
+//! onto the wafer and every PE's rcfg words. `split-geo` writes it beside the program's sources;
+//! the engine names no model.
 
 pub mod abi;
+pub mod artifact;
 pub mod block;
 pub mod emit;
 pub mod fabric;

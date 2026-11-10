@@ -8,10 +8,7 @@
 //! (no cmaddr: the simulator).
 
 use engine_cerebras::sdk::{Platform, Runtime, Sdk, Simulator, Target};
-use engine_cerebras::spatial::split::{SplitModel, SplitSpec, argmax};
-use kernels_cerebras::spatial::emit::host::HostLayout;
-use kernels_cerebras::spatial::emit::meta::Meta;
-use kernels_cerebras::spatial::program::Program;
+use engine_cerebras::spatial::split::{SplitModel, SplitSpec, argmax, artifact};
 
 fn f16(h: u16) -> f32 {
     let s = if h >> 15 == 1 { -1.0 } else { 1.0 };
@@ -111,10 +108,7 @@ fn main() {
         // Gemma's tied head has its own tile layout: the argmax check above is the test
         println!("LOGITS host reference: Qwen3.5 preps only");
     } else {
-        let meta = Meta {
-            map: spec.meta.clone().into_iter().collect(),
-        };
-        let hl = HostLayout::of(&Program::from_meta(&meta).unwrap()).unwrap();
+        let hl = artifact(&spec).unwrap().host;
         let (cx, ly) = (hl.last_cx.x, hl.last_cx.y);
         let hc = spec.int("Hc").unwrap() as usize;
         let (py, yc) = (hl.rows, hl.cy_row);

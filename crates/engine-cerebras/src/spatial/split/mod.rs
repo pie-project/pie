@@ -1,6 +1,7 @@
 //! The role-split wafer program in process ([`SplitModel`]): tokens at positions, a launch of S
-//! passes, the wafer token loop's out-token ring. The program's build (its plan, blocks, floor,
-//! fabric, kernels and bindings) is `kernels_cerebras::spatial`; [`place`] places it.
+//! passes, the wafer token loop's out-token ring. The program is an
+//! [`Artifact`] (`kernels_cerebras::spatial`: the host's map of the wafer, every copy onto it,
+//! every PE's rcfg words); nothing here names a model.
 //!
 //! The program keeps one sequence's KV and GDN state on the wafer, by
 //! position; a pass at position 0 starts a new sequence (the kernels zero
@@ -9,15 +10,20 @@
 //!
 //! Selected by `PIE_CEREBRAS_SPLIT=<prep dir>:<prefix>[:k=v,...]`: the
 //! prepared tiles (`<prefix>meta.json`, `<prefix>w<u>.npy`, ...; built by
-//! the prep step from the checkpoint) and the geometry's overrides (the
-//! build's `G2`, `WL`, `CAP`).
+//! the prep step from the checkpoint) and the build's overrides (`G2`, `WL`,
+//! `CAP`). The artifact is `PIE_CEREBRAS_SPLIT_ARTIFACT`, else
+//! `<prep dir>/<prefix>program/` ([`artifact`]).
 
 pub mod place;
 
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
+use kernels_cerebras::spatial::artifact::Artifact;
+use kernels_cerebras::spatial::emit::host::HostLayout;
+use kernels_cerebras::spatial::emit::meta::Meta;
+use kernels_cerebras::spatial::floor;
 use kernels_cerebras::spatial::npy::Npy;
-use kernels_cerebras::spatial::{emit, floor, program};
 
 use super::device::Device;
 use crate::sdk::Rect;
@@ -84,7 +90,7 @@ impl SplitSpec {
 }
 
 /// The role-split model on a loaded program. Everything program-specific comes from its
-/// [`emit::host::HostLayout`]; nothing here names a family.
+/// [`HostLayout`]; nothing here names a family.
 pub struct SplitModel {
     pub dev: Box<dyn Device>,
     pub vocab: usize,
@@ -96,8 +102,8 @@ pub struct SplitModel {
     pub fed: Vec<u32>,
     pub launches: u64,
     pub steps: u64,
-    hl: emit::host::HostLayout,
-    /// Every CX row's x offset in the placed hidden vector ([`emit::host::HostLayout::x_offsets`]).
+    hl: HostLayout,
+    /// Every CX row's x offset in the placed hidden vector ([`HostLayout::x_offsets`]).
     x_off: Vec<usize>,
     embed: Embed,
     eps: f32,
@@ -114,32 +120,70 @@ enum Embed {
     Table(Npy),
 }
 
+/// The program's artifact for `spec`: `PIE_CEREBRAS_SPLIT_ARTIFACT`, else
+/// `<prep>/<prefix>program/`, checked against the prep's meta. A prep staged before artifacts
+/// has none: compat, the artifact is built here from its meta (`split-geo <prep> <prefix>
+/// [overrides] --out <prep>/<prefix>program` writes it once).
+pub fn artifact(spec: &SplitSpec) -> R<Artifact> {
+    let dir = std::env::var_os("PIE_CEREBRAS_SPLIT_ARTIFACT")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| spec.file("program"));
+    let meta: BTreeMap<String, serde_json::Value> = spec.meta.clone().into_iter().collect();
+    if !dir.join("program.json").exists() {
+        tracing::warn!(
+            dir = %dir.display(),
+            "split: no artifact; building it from the prep's meta (compat)"
+        );
+        return Artifact::build(&Meta { map: meta });
+    }
+    let art = Artifact::read(&dir)?;
+    if let Some(built) = &art.header.meta
+        && *built != meta
+    {
+        let keys: Vec<&String> = built
+            .keys()
+            .chain(meta.keys())
+            .filter(|k| built.get(*k) != meta.get(*k))
+            .collect();
+        return Err(format!(
+            "{}: built from another meta (keys {keys:?} differ): rebuild it with split-geo",
+            dir.display()
+        ));
+    }
+    Ok(art)
+}
+
 impl SplitModel {
-    /// Places the prep on `dev` (a loaded, running program) and runs init: the meta's
-    /// [`program::Program`] (any family, `ARCHITECTURE.md`), placed by its bindings
-    /// ([`place::place`]), the host's map of it ([`emit::host::HostLayout`]).
-    pub fn open(mut dev: Box<dyn Device>, spec: &SplitSpec, vocab: usize) -> R<SplitModel> {
+    /// Places the prep on `dev` (a loaded, running program) and runs init, by the program's
+    /// [`artifact`].
+    pub fn open(dev: Box<dyn Device>, spec: &SplitSpec, vocab: usize) -> R<SplitModel> {
         let t0 = std::time::Instant::now();
-        let meta = emit::meta::Meta {
-            map: spec.meta.clone().into_iter().collect(),
-        };
-        let prog = program::Program::from_meta(&meta)?;
-        let hl = emit::host::HostLayout::of(&prog)?;
+        let art = artifact(spec)?;
         tracing::info!(
             ms = t0.elapsed().as_millis() as u64,
-            w = hl.w,
-            h = hl.h,
-            family = prog.plan.shape.family.name(),
-            "split: program built"
+            w = art.host.w,
+            h = art.host.h,
+            "split: program read"
         );
+        SplitModel::open_artifact(dev, spec, &art, vocab)
+    }
+
+    /// Places the prep on `dev` by `art`'s bindings ([`place::place`]) and runs init.
+    pub fn open_artifact(
+        mut dev: Box<dyn Device>,
+        spec: &SplitSpec,
+        art: &Artifact,
+        vocab: usize,
+    ) -> R<SplitModel> {
+        let hl = art.host.clone();
         let t1 = std::time::Instant::now();
-        place::place(dev.as_mut(), &prog, &spec.prep, &spec.prefix)?;
+        place::place(dev.as_mut(), art, &spec.prep, &spec.prefix)?;
         tracing::info!(s = t1.elapsed().as_secs_f64(), "split: placed");
         dev.call("init", &[]).map_err(|e| format!("init: {e}"))?;
         // A launch can return before every PE ran it: a read from every PE
         // waits for each one's init.
         dev.get("rcfg", rect(&floor::Rect::new(0, 0, hl.w, hl.h)), 1)?;
-        let shape = &prog.plan.shape;
+        let model = &art.header.model;
         let embed = if spec.has("hemb") {
             let hemb = spec.npy("hemb")?;
             let words = if hl.band.is_none() && hl.vocab_rows > 0 {
@@ -152,8 +196,8 @@ impl SplitModel {
             Embed::Table(spec.npy("embed")?)
         };
         Ok(SplitModel {
-            vocab: vocab.min(shape.vocab as usize),
-            hidden: shape.hidden as usize,
+            vocab: vocab.min(model.vocab as usize),
+            hidden: model.hidden as usize,
             cap: hl.cap as usize,
             positions: hl.positions as usize,
             fed: Vec::new(),
@@ -161,8 +205,8 @@ impl SplitModel {
             steps: 0,
             x_off: hl.x_offsets(),
             embed,
-            eps: shape.norm.eps,
-            lgt_scale: meta.float("HSCALE").unwrap_or(1.0) as f32,
+            eps: model.eps,
+            lgt_scale: model.lgt_scale,
             force: std::env::var("PIE_CEREBRAS_SPLIT_FORCE").is_ok_and(|v| v == "1"),
             hl,
             dev,
@@ -425,14 +469,15 @@ pub fn argmax(l: &[f32]) -> Option<u32> {
 }
 
 /// A compiled split program: the env names a prep and the program's
-/// out.json has the unit grid.
+/// out.json has a role-split layout's params (the layered build's
+/// `SPLIT_GEO`; the unit grid, or the layouts compiled before it).
 pub fn is_split(program: &Path) -> bool {
     std::env::var("PIE_CEREBRAS_SPLIT").is_ok_and(|v| !v.is_empty())
         && std::fs::read_to_string(program.join("out.json")).is_ok_and(|s| {
-            (s.contains("\"UNX\"") && s.contains("\"UNY\""))
-                || (s.contains("\"NTW\"") && s.contains("\"Ic1\"")) // Gemma's layout (mkfull_gemma.py)
-                || (s.contains("\"NEX\"") && s.contains("\"QO\"")) // gpt-oss's (mkfull_gptoss.py)
-                || (s.contains("\"HcA\"") && s.contains("\"HcW\"")) // Gemma 12B's (mkfull_g12.py)
-                || s.contains("\"SPLIT_GEO\"") // the layered build's (emit::layout)
+            s.contains("\"SPLIT_GEO\"")
+                || (s.contains("\"UNX\"") && s.contains("\"UNY\""))
+                || (s.contains("\"NTW\"") && s.contains("\"Ic1\""))
+                || (s.contains("\"NEX\"") && s.contains("\"QO\""))
+                || (s.contains("\"HcA\"") && s.contains("\"HcW\""))
         })
 }

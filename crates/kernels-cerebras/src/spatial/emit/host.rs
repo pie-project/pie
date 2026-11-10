@@ -1,15 +1,15 @@
 //! What the host driver needs to find on the wafer: the PEs it reads and writes, the shapes of
-//! what it moves and the host's share of the model's math (the logit softcap). Everything
-//! `mod.rs::SplitModel` does that depends on the program is read from here: the host names no
-//! family.
+//! what it moves and the host's share of the model's math (the logit softcap). Everything the
+//! engine's `SplitModel` does that depends on the program is read from here (through the
+//! [`super::super::artifact::Artifact`]): the host names no family.
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 use crate::spatial::floor::{Coord, CtlLine, Rect, Unit};
 use crate::spatial::program::Program;
 
 /// The host's map of the program.
-#[derive(Clone, Debug, PartialEq, Serialize)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct HostLayout {
     pub w: u32,
     pub h: u32,

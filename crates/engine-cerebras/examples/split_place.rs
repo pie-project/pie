@@ -8,9 +8,7 @@ use std::io::Write;
 
 use engine_cerebras::sdk::{self, DataType, Order, Rect};
 use engine_cerebras::spatial::device::Device;
-use engine_cerebras::spatial::split::{SplitSpec, place};
-use kernels_cerebras::spatial::emit::meta::Meta;
-use kernels_cerebras::spatial::program::Program;
+use engine_cerebras::spatial::split::{SplitSpec, artifact, place};
 use sha2::{Digest, Sha256};
 
 struct Log(std::io::BufWriter<std::fs::File>);
@@ -96,19 +94,16 @@ fn main() {
     let a: Vec<String> = std::env::args().collect();
     let spec = SplitSpec::parse(&format!("{}:{}:{}", a[1], a[2], a[3])).unwrap();
     let t0 = std::time::Instant::now();
-    let meta = Meta {
-        map: spec.meta.clone().into_iter().collect(),
-    };
-    let prog = Program::from_meta(&meta).unwrap();
+    let art = artifact(&spec).unwrap();
     eprintln!(
         "program {:.1} s ({} x {})",
         t0.elapsed().as_secs_f64(),
-        prog.floor.w,
-        prog.floor.h
+        art.host.w,
+        art.host.h
     );
     let mut log = Log(std::io::BufWriter::new(
         std::fs::File::create(&a[4]).unwrap(),
     ));
-    place::place(&mut log, &prog, &spec.prep, &spec.prefix).unwrap();
+    place::place(&mut log, &art, &spec.prep, &spec.prefix).unwrap();
     eprintln!("placed {:.1} s", t0.elapsed().as_secs_f64());
 }

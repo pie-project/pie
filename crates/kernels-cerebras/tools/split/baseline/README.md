@@ -13,7 +13,7 @@ that must not change behaviour can be checked file for file against the tree bef
   - tiny: Qwen3.5 t08 and t4, Qwen3 dense with and without a gap slot, Gemma, Gemma 12B, gpt-oss.
 - `capture.py <out> [names]`: per config (see its docstring for the files):
   - `host/`: the Rust host through its public entry point (`SplitSpec::parse` + `SplitModel::open`, then one
-    `greedy` launch) on a recording device, `examples/split_baseline.rs`:
+    `greedy` launch) on a recording device, engine-cerebras `examples/split_baseline.rs`:
     - `pe.tsv`: every PE's words of every symbol, hashed;
     - `rcfg.txt`: every PE's rcfg in full;
     - `calls.log`: the device calls in order;
@@ -44,8 +44,9 @@ python3 tools/split/baseline/compare.py scratch/refactor/baseline/a4c1f516d /tmp
 ```
 
 Entry points the harness relies on (keep them, or adapt the harness in the same commit and say so):
-- `examples/split_baseline.rs`: `SplitSpec::parse("<prep>:<prefix>:<k=v,..>")`, `SplitModel::open(Box<dyn Device>,
-  &spec, vocab)`, `SplitModel::{greedy, vocab, hidden, cap, positions, launches, steps, fed}`, the `Device`
+- engine-cerebras `examples/split_baseline.rs`: `SplitSpec::parse("<prep>:<prefix>:<k=v,..>")`, the artifact
+  round trip (`Artifact::build` / `write` / `read`), `SplitModel::open_artifact(Box<dyn Device>, &spec, &artifact,
+  vocab)`, `SplitModel::{greedy, vocab, hidden, cap, positions, launches, steps, fed}`, the `Device`
   trait;
 - each family's mkfull CLI (`configs.json`'s `mkfull`), writing `layout.csl` and one `.csl` a PE kind into
   the out dir;
