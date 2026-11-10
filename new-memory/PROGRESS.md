@@ -349,3 +349,14 @@ The `new-memory/` directory is bookkeeping and is removed before anything lands 
 - Follow-up: the 1 MiB min-piece rule comes from a CUDA prefill-GDN observation; measure on Metal and move the floor
   into DeviceProfile (smaller on Metal would recover these regressions).
 - Verified: `pie-poem-compiler --lib chunk`.
+
+### M23 — 2026-11-10: IT (RW + BC on sm_120) results; contract 14-17
+- IT merged sc/l40s-bc 912a75bf7 onto new-memory and ran e2e vs plain new-memory on the RTX PRO 4500: Qwen3-0.6B and
+  gemma-4-E2B (list + ring) identical in tokens and top-4 logit bits across single prompt, resumed turns, fork, prefix
+  reuse, long prompt + fork, sequential prompts, segment growth, and a 2-3 chunk evacuation mid-decode (3004 steps).
+- Found: engine boot over-commit without a kv budget; engine `seat_pages` checks logical chunk ids against committed
+  segments (must map through the table); state opened in an unbacked part of the activation's segment (contract 14);
+  runtime waiters never grew the shared pool (fixed, cherry-picked as d7ad71dcf); runtime drains/recycles on a kv
+  epoch that does not advance per fire (contract 17, to fix).
+- L40S finished BC leftovers (pieces from P3fix2 runs, rs buffer rows inside the record at s % 16, snapshots per
+  piece) at 9d9bb109e and found the multi-lane group fold race -> contract 15.

@@ -51,3 +51,15 @@ Proposed by the L40S session (branch `sc/l40s-bc`), accepted by New Pie. Runtime
     (cow record if cow != run, else run). The runtime guarantees `writes.end - folded <= 16` (RW follow-up: enforce);
     the engine refuses otherwise. No page copies in shared mode: a buffered write onto a shared record forces record
     CoW, so `Lane.fixed`'s run -> cow copy carries the buffer rows.
+14. **Activation segment backing.** The engine backs the whole segment that contains the activation's start (from
+    that segment's first chunk), so the runtime's "top segments committed from load" model holds and state opened
+    below the activation inside that segment is backed.
+15. **Multi-lane group folds (supersedes the in-place part of 12).** CUDA runs a fire's lanes concurrently. A lane
+    whose fire folds nothing reads its state from `run` and lands its rows in `written`; a folding lane reads and
+    writes `written` after the single run -> written copy. Therefore a multi-lane group in which any lane folds names
+    `[src, dst]` with `dst != src` on EVERY lane (a CoW record from the reserve); `[x, x]` on a multi-lane group only
+    when no lane folds. Single-lane fires: in place stays in place.
+16. **Snapshots per piece.** `RsSnapshot.pieces: Vec<u32>` (serde default; `slot` = first piece) — the runtime fills
+    `pieces` when a record has more than one piece.
+17. **Epochs.** Draining an evacuated segment and recycling freed slots are fenced by a per-fire epoch that advances
+    on every fire (not only on copy-on-write / explicit writes).
