@@ -77,7 +77,7 @@ pub(crate) fn step_bufs_n() -> i64 {
         0 => std::env::var("PIE_GDN_STEP_BUFS").ok().and_then(|v| v.parse().ok()).unwrap_or(2),
         v => i64::from(v),
     }
-    .clamp(2, 3)
+    .clamp(2, 4)
 }
 
 fn step_kernel_on() -> bool {

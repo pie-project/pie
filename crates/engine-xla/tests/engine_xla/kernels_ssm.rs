@@ -2423,14 +2423,14 @@ fn step_against_xla(g: &Gdn, rows: usize, seed: u64) {
 fn zz_gdn_step_timing() {
     for (hv, hk) in [(16usize, 16usize), (48, 16)] {
         let g = Gdn { hk, hv, dk: 128, dv: 128 };
-        for (rows, spare) in [(64usize, 1usize), (256, 1), (256, 3)] {
+        for (rows, spare) in [(256usize, 1usize)] {
             let slots = spare * rows + 1;
             let sink = (slots - 1) as i32;
             let slot_of: Vec<i32> = (0..rows as i32).map(|l| (l * 7 + 3) % sink).collect();
             let mut rng = Rng(77);
             let (qkv, gates) = gdn_inputs(&mut rng, &g, rows);
             let bank0: Vec<f32> = rng.f32s(slots * g.stride(), -0.5, 0.5).into_iter().map(round_bf16).collect();
-            for (kernel, nb) in [(true, 2u8), (true, 3), (false, 2)] {
+            for (kernel, nb) in [(true, 2u8), (true, 3), (true, 4)] {
                 kernels_xla::ssm::step_bufs(Some(nb));
                 kernels_xla::ssm::step_kernel(Some(kernel));
                 let mut b = Bench::new();
