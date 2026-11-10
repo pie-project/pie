@@ -2498,12 +2498,15 @@ pub fn experts(
     let ws = sorted
         .ws
         .ok_or_else(|| refuse(OP, "the sort carried no weights"))?;
-    // The GLU and the weight in the gate-up kernel, its rows half as wide.
+    // The GLU and the weight in the gate-up kernel, its rows half as wide,
+    // where an expert's tile holds 64 rows or more (at 16, a 64-lane decode
+    // of Qwen3.6-35B-A3B's cut: 323 -> 340 us; at 64, 256 lanes: 359 -> 337).
     let inside = crate::linear::moe_gmm::Gmm {
         glu: Some(glu),
         ..up
     };
     let hidden = if tuning.moe_gmm_glu
+        && up.tm >= 64
         && up.stepping()
         && up.orient == crate::linear::moe_gmm::Orient::NMajor
         && inside.kernel().is_ok()
