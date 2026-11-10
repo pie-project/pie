@@ -367,6 +367,7 @@ impl Shell {
             crate::chip::SHELF.tell_untuned(device.kind(), &chip_report);
         }
         let tpu = crate::chip::Tpu::of(device.kind());
+        let headroom = boot.device.headroom.unwrap_or_else(|| tpu.headroom());
         if !tpu.known() {
             tracing::warn!(
                 "TPU kind {:?} is not one pie knows: running untuned, sized as a v6e",
@@ -423,7 +424,7 @@ impl Shell {
             ((bytes as f64 * boot.memory_share) as u64)
                 .saturating_sub(device.held())
                 .saturating_sub(weight_floor)
-                .saturating_sub(tpu.headroom())
+                .saturating_sub(headroom)
                 / 2
         });
         let mut budgets = poem_compiler::fit_voxels(&boot.trace, budgets, &profile, room);
@@ -523,7 +524,7 @@ impl Shell {
         };
         let room_at = |floor: u64| {
             working.map_or(u64::MAX, |working| {
-                working.saturating_sub(floor).saturating_sub(tpu.headroom())
+                working.saturating_sub(floor).saturating_sub(headroom)
             })
         };
         let room = room_at(weight_floor);
@@ -571,7 +572,7 @@ impl Shell {
         let device_cap = working.map_or(u64::MAX, |working| {
             working
                 .saturating_sub(demand(fit, slots))
-                .saturating_sub(tpu.headroom())
+                .saturating_sub(headroom)
         });
         let weights = if device.is_dry() {
             // A device of the target's size would pre-scale an mxfp4 bank
