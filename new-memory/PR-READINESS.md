@@ -23,6 +23,7 @@ Branch today: 432 commits ahead of main, 782 files, +86k / -13k. Main merged in 
 | A17 | Guest panic under admission waits: bench barrier bug fixed (sc/sdk-wakeup) | SDK agent | done; A19 left |
 | A19 | A restartable process whose own demand exceeds the pool restarts forever (should fail with the starvation error); bind hangs waiting for state slots at 96 MiB | RT7 | in progress |
 | A18 | Idle cache demoted only when PLEX keys it above the floor | RT6 | done M90 |
+| A20 | Window-only models never reuse a prefix (no auto checkpoint; main reused full window pages) -> auto checkpoints at page-aligned fire ends holding window slot refs | RT8 | in progress |
 | A9 | dsv41 two-window mini cannot fire on sm_89/sm_120 (fused.lse_sink kernel gap) -> two-window CUDA unverified | L40S | queued |
 
 ## B. Decide before the PR (user)
@@ -40,7 +41,7 @@ medians. Known gaps to close:
 - ROCm synth: flip only at parity (in progress).
 - CUDA (L40S, pageable host tier, server-level medians of 3; all models arm fully; end RSS 5.3-7.5 GB except
   Qwen3-8B's demotion, which the keyed-demote gate removes): remaining gaps, flat across runs:
-  gpt-oss-20b prefill 2048 -25%; gemma-4-E2B prefill 512 -8.6%, c64 -4.1%, c256 -5.6%; Qwen3-8B c256 -3.3%,
+  gpt-oss-20b prefill 2048 -25% (= missed prefix reuse, A20); gemma-4-E2B prefill 512 -8.6%, c64 -4.1%, c256 -5.6%; Qwen3-8B c256 -3.3%,
   prefill 2048 +4%; Qwen3.5-0.8B c256 -3.8%, c64 -1.7%. At parity or faster: Qwen3.5-9B; c1/c8 everywhere; gpt-oss
   c64/c256 +24/+29%; Qwen3.5-0.8B prefill.
 - ROCm: default config arms 0 bodies on new-memory (flat range takes the spare) -> speed table waits for the fix.
