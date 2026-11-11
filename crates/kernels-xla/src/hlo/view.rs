@@ -32,6 +32,10 @@ use super::{Built, Cmp, Combine, Elem, Func, GatherDims, ScatterDims, Ty, Val, m
 /// Lanes of a pool row.
 pub const LANES: i64 = 128;
 
+/// The most bytes a read of whole blocks takes by XLA's gather rather than
+/// a DMA kernel call.
+const SMALL_BY_XLA: i64 = 2 << 20;
+
 /// A view's pool and element.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) struct View {
@@ -258,6 +262,30 @@ impl Func {
         )
     }
 
+    /// `x` (`k` elements a u32, `k · 128 · rows` of them in packed rows
+    /// order) as the pool's `u32 [rows, 128]`.
+    /// For 16-bit elements, by arithmetic on the even and odd rows (no
+    /// minor axis of 2, whose layout XLA may carry onto the pool a write
+    /// lands in).
+    pub fn pack_rows(&mut self, x: Val, rows: i64) -> Built<Val> {
+        let k = i64::from(32 / self.elem(x).bits());
+        if k != 2 {
+            return self.pack(x, rows, k);
+        }
+        let x = self.reshape(x, &[rows, 2, LANES])?;
+        let x = self.bitcast(x, Elem::U16)?;
+        let half = |f: &mut Func, at: i64| -> Built<Val> {
+            let h = f.slice(x, &[0, at, 0], &[rows, at + 1, LANES], &[1, 1, 1])?;
+            let h = f.reshape(h, &[rows, LANES])?;
+            Ok(f.convert(h, Elem::U32))
+        };
+        let lo = half(self, 0)?;
+        let hi = half(self, 1)?;
+        let sixteen = self.like_i(hi, 16);
+        let hi = self.shl(hi, sixteen)?;
+        self.or(hi, lo)
+    }
+
     /// `[B · n]` pool rows: `n` from each of the `[B]` starts.
     fn rows_of(&mut self, start: Val, batch: i64, n: i64) -> Built<Val> {
         if n == 1 {
@@ -358,7 +386,15 @@ impl Func {
             };
             (rc, Some(off))
         };
-        if aligned && g % len == 0 && k > 1 && crate::blocks::on() && !self.xla_reads {
+        // A small read of whole blocks goes by XLA's block gather: a kernel
+        // call costs its launch on the host and the device (v6e MoE decode
+        // of one lane: two 512 KiB page reads a layer by DMA, 29 us a step
+        // of the host's execute prologue).
+        let small = aligned
+            && g % len == 0
+            && self.blocked(rows_total, nr)
+            && batch * nr * LANES * 4 <= SMALL_BY_XLA;
+        if aligned && g % len == 0 && k > 1 && crate::blocks::on() && !self.xla_reads && !small {
             // Whole blocks by DMA, any number of rows: no element
             // reinterpreted (`crate::blocks`).
             let at = self.block_of(row, nr)?;
