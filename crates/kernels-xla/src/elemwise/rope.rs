@@ -522,12 +522,19 @@ fn turn_tall(f: &mut Func, x: Val, pos: Val, t: &Turn) -> Result<Option<Val>, Er
     let (rows, width) = (dims[0], dims[1]);
     let unit = t.unit;
     let half = unit / 2;
+    // Each lane and its partner half a head on turn together, or both pass
+    // through (a partial rotation's rest: no angle, so the table's cosine is
+    // one and its sine zero there).
     let halves = (0..half).all(|i| {
-        t.partner[i] == (i + half) as i64
+        let paired = t.partner[i] == (i + half) as i64
             && t.partner[i + half] == i as i64
             && t.sign[i] == -1.0
             && t.sign[i + half] == 1.0
-            && t.freq.iter().all(|fq| fq[i] == fq[i + half])
+            && t.freq.iter().all(|fq| fq[i] == fq[i + half]);
+        let still = t.partner[i] == i as i64
+            && t.partner[i + half] == (i + half) as i64
+            && t.freq.iter().all(|fq| fq[i] == 0.0 && fq[i + half] == 0.0);
+        paired || still
     });
     if std::env::var("PIE_XLA_ROPE_KERNEL").is_ok_and(|v| v == "0")
         || f.elem(x) != Elem::Bf16
