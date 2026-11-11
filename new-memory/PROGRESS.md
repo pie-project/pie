@@ -1209,3 +1209,10 @@ The `new-memory/` directory is bookkeeping and is removed before anything lands 
   weights, 106728 pages (= M93).
 - Open (AMD, MI300X fill test): on a flat range the fit still counts held weight (expert) chunks as cache room —
   30B declares 106728 pages but only ~70k fit (38 x 31.4k seqs starve; main sizes 69120). Fix in progress.
+
+### M98 — 2026-11-11: runtime per-fire epoch hooks batched (CUDA c64 runtime overhead)
+- `sc/rt-perf` (b4c7f7fbe, RTP): each fire's FireEpoch release spawned its own tokio task (64 spawns per decode step
+  at c64, ~150 us); settle_batched runs a landing's hooks in order from one task. Qwen3.5-0.8B c64 (sm_120): main 11756,
+  new-memory 11236 (-4.4%), with fix 11825 (+0.6%); c256 all within 1%. runtime lib 297 pass.
+- Found: gemma-4-E2B fails to boot on new-memory (CUDA 700 preparing the last wide bucket 4096) since between M67 and
+  M92 (rt5); M67 build boots. Owner assigned (bisect).
