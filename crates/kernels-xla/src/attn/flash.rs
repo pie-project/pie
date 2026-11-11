@@ -667,12 +667,46 @@ struct Older {
     khi: Val,
     planes: (Val, Val),
     ps: i64,
+    /// The pages unmapped (`blocks::SINK` where the sink is read), and each
+    /// plane's map and sink: on a pool the DMA gather maps them itself.
+    raw: Val,
+    maps: [PageMap; 2],
+    sink: i64,
 }
 
 impl Older {
     /// The rectangle's keys and values, `[OLD_PAGES · ps, w]` each.
     fn gather(&self, f: &mut Func) -> Built<(Val, Val)> {
         let n = OLD_PAGES;
+        // Both planes of the chunk pool: the pages by DMA, each plane's map
+        // applied in the kernel (the unmapped ids one computation a fire).
+        if let (Some((pool, Elem::Bf16)), Some((pool_v, Elem::Bf16))) =
+            (f.view_parts(self.planes.0), f.view_parts(self.planes.1))
+            && pool == pool_v
+            && crate::blocks::on()
+        {
+            let mut planes = Vec::with_capacity(2);
+            for (plane, map) in [(self.planes.0, self.maps[0]), (self.planes.1, self.maps[1])] {
+                let (slots, w) = (f.dims(plane)[0], f.dims(plane)[1]);
+                let bytes = self.ps * w * 2;
+                if bytes % 512 == 0 && (bytes / 256) % 16 == 0 {
+                    planes.push((bytes / 512, map, self.sink, slots / self.ps - 1));
+                }
+            }
+            let mut out = Vec::with_capacity(2);
+            if planes.len() == 2 {
+                // both planes in one kernel call
+                let got =
+                    crate::blocks::gather_paged_planes(f, pool, self.raw, Elem::Bf16, &planes)?;
+                for (g, plane) in got.into_iter().zip([self.planes.0, self.planes.1]) {
+                    let w = f.dims(plane)[1];
+                    out.push(f.reshape(g, &[n * self.ps, w])?);
+                }
+            }
+            if out.len() == 2 {
+                return Ok((out[0], out[1]));
+            }
+        }
         let at = f.reshape(self.pages, &[n, 1])?;
         let dims = crate::hlo::GatherDims {
             offset_dims: vec![1, 2],
@@ -791,6 +825,8 @@ fn older(
     } else {
         plane_pages(f, maps[1])?
     };
+    let sentinel = f.like_i(raw, i64::from(crate::blocks::SINK));
+    let raw = f.select(used, raw, sentinel)?;
     Ok(Older {
         pages: page,
         values_pages,
@@ -799,6 +835,9 @@ fn older(
         khi,
         planes,
         ps,
+        raw,
+        maps,
+        sink: slots / ps - 1,
     })
 }
 

@@ -219,6 +219,20 @@ impl Func {
             .collect()
     }
 
+    /// The block of `nr` rows a pool row `row` (`[B]` i32, never negative)
+    /// starts: an unsigned division, which a power-of-two `nr` makes a
+    /// shift (a signed one carries a sign fix-up of selects, a launch's
+    /// worth of ops ahead of every DMA call).
+    fn block_of(&mut self, row: Val, nr: i64) -> Built<Val> {
+        if nr == 1 {
+            return Ok(row);
+        }
+        let u = self.convert(row, Elem::U32);
+        let d = self.like_i(u, nr);
+        let q = self.div(u, d)?;
+        Ok(self.convert(q, Elem::I32))
+    }
+
     /// Whether blocks of `nr` pool rows go as blocks of a `[R / nr, nr, 128]`
     /// pool: a reshape that keeps (8, 128) tiles whole.
     fn blocked(&self, rows: i64, nr: i64) -> bool {
@@ -347,8 +361,7 @@ impl Func {
         if aligned && g % len == 0 && k > 1 && crate::blocks::on() {
             // Whole blocks by DMA, any number of rows: no element
             // reinterpreted (`crate::blocks`).
-            let per = self.like_i(row, nr);
-            let at = self.div(row, per)?;
+            let at = self.block_of(row, nr)?;
             let got = crate::blocks::gather(self, view.pool, at, nr, view.elem)?;
             let got = self.reshape(got, &[batch, nr * e])?;
             let check = std::env::var("PIE_XLA_POOL_DMA_CHECK").ok();
@@ -633,8 +646,7 @@ impl Func {
             if g % len == 0 && k > 1 && crate::blocks::on() {
                 // whole blocks by DMA (`crate::blocks`), any number of rows:
                 // a row scatter pays for every pool row it is handed
-                let per = self.like_i(row, nr);
-                let at = self.div(row, per)?;
+                let at = self.block_of(row, nr)?;
                 let ups = self.reshape(ups, &[batch * nr * k, LANES])?;
                 return Ok(Some(crate::blocks::scatter(self, view.pool, at, ups, nr)?));
             }
