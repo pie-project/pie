@@ -1296,3 +1296,11 @@ The `new-memory/` directory is bookkeeping and is removed before anything lands 
 - `sc/metal-gate` (ab5e7172b, 693c5321a): state record lookups divide by multiply-high (exact for every u32);
   decode attention page strides as Metal function constants. M1 Max c1 vs main: Qwen3-0.6B +0.3%, gemma -0.3%,
   Qwen3.5 -0.5% (c8 +1.1%). Rest of Qwen3.5's ~45 us/fire is inside the state kernels (needs a GPU timeline).
+
+### M106 — 2026-11-11: window models cut long passes
+- `sc/window-cut` (0783d49e2, RT8): window-list models go through the pass cutter (page-boundary pieces, each its
+  own fire writing every window list and trimming behind its committed end; a piece short of window slots settles
+  the tail first; checkpoints via checkpoint_at/keep). gpt-oss 1 x 31.4k 2.48 s (main 2.55), 8 x 31.4k 20.3 s
+  (main 20.6), p2048 122.4 ms (main 126.0); gemma 31.4k now serves (main refuses: window ring). runtime 194 pass.
+- Found: under heavy oversubscription (24 x 31.4k past a 32 GB card) new-memory suspends/restores with ~10 s engine
+  stalls: gpt-oss 297 s vs main 62 s; dense Qwen3-0.6B 730 s vs 31.7 s (15 stalls). Planner/scheduler; owner assigned.
