@@ -76,8 +76,20 @@ fn rmsnorm_and_its_per_head_plus_one_form_answer_the_host() {
 
 #[test]
 fn a_tall_fires_per_head_norm_answers_the_host() {
-    // 1024 rows: the heads' sums and roots go through the MXU.
-    let (rows, width, head) = (1024u32, 2048u32, 256u32);
+    // A tall fire's heads go through the norm kernel (600 rows: a partial
+    // last block; 16384 wide: half blocks); with it off, 1024 rows of 32
+    // heads through the MXU.
+    for (rows, width, head) in [
+        (1024u32, 2048u32, 256u32),
+        (600, 2048, 512),
+        (1792, 16384, 512),
+        (1024, 8192, 256),
+    ] {
+        tall_per_head_norm(rows, width, head);
+    }
+}
+
+fn tall_per_head_norm(rows: u32, width: u32, head: u32) {
     let xs = data((rows * width) as usize, 6);
     let hs = data(head as usize, 7);
     let mut b = Bench::new();
