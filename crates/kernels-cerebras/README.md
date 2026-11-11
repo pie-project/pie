@@ -312,7 +312,7 @@ layers and a 2 GB tied head fill 98% of the wafer, which only fits with a row-ro
   (the weight PE stores it v-normalised). The sliding ring is 8 x 128 entries, exactly the 1024 window, so `RING 1`
   runs a sliding layer's mixer over the whole ring with fixed-length vector ops (no window mask). The
   global context is 32 x 128 = 4,096.
-- Head: 54 columns + control (its tiles in two files, `hw0` / `hw1`: one is over the 2 GiB a staged file may take), tied (`head_gemma12.csl` reads the winner's embedding from its f16 lm_head tile). A head
+- Head: 54 columns + control (its tiles in two files, `hw0` / `hw1`: one is over the 2 GiB a staged file may take), tied (`head_pe.csl` with head groups, GRP 1, reads the winner's embedding from its f16 lm_head tile). A head
   column takes a group of CX rows: attention rows in sixes, plain rows in fives, no group across the CY row. The
   group's CX PEs chain their x to the group's root on the last unit's CX column, and the root sends it east. The
   wafer loop's embedding returns to unit 0's root row and down the same chain.

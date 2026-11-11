@@ -27,7 +27,15 @@
 // Queues: iq2 / iq3 the row reduction's inputs (level 1 / FIFO end), iq4 HX, iq5 HN, iq6 HM, iq7 the
 // row word; oq2 the row reduction's send, oq3 HN / HM, oq4 VA, oq5 VS, oq6 HE, oq7 HS.
 //
-// Params. VR, HDc (shape). NPX: x in NPX f16 parts (x = p0 + p1 + ...) with f32 accumulation (1:
+// Head groups (GRP 1): a head column takes x's dims of a group of consecutive CX rows (NX <= HDc
+// words, rcfg [17]; the rest of its HDc dims are padding with zero weights): the group's root CX
+// sends them along its row (HX) to the head PE on that row (x role 2), which multicasts the HDc
+// words up and down the column (HM); the other PEs take the multicast (x role 0). The embedding is
+// the head tile itself (tied: f16 [HDc][VR], the winner's row read with stride VR, widened); the
+// token loop sends its NX dims north on VA to row 0, south on VS to the group's root row (te),
+// west on HE into unit 0's CX (the group's root; the chain spreads them).
+//
+// Params. VR, HDc (shape). GRP (head groups). NPX: x in NPX f16 parts (x = p0 + p1 + ...) with f32 accumulation (1:
 // the shipped build; 2 the exact-x form). HACC16 (measurement, default off): the partials
 // accumulate in f16 (@fmach) and widen once (-1.7k cycles a token on the 9B, but it halves the
 // golden's tightest margin).
@@ -36,6 +44,7 @@ param VR: u16;
 param HDc: u16;
 param NPX: u16 = 1;    // x's f16 parts
 param HACC16: u16 = 0; // 1 (measurement): the logit partials accumulate in f16 (y16), then widen once
+param GRP: u16 = 0;    // 1: head groups and the tied embedding (see the header)
 
 const sys_mod = @import_module("<memcpy/memcpy>", memcpy_params);
 const fab = @import_module("ops/fabric.csl", .{ .NQ = 6 });
@@ -78,13 +87,16 @@ const ut_b = @get_ut_id(5);
 const rr = @import_module("ops/red.csl", .{ .fab = fab, .IN1 = q_ra, .IN2 = q_rb, .OUT = q_ro, .UT1 = ut_a, .UT2 = ut_b, .FIFOW = 32 });
 const NR: u16 = 12;
 const RQ: u16 = 1 + 2 * NR;
-var rcfg = @zeros([RQ + 17]u32);   // (see the header)
+var rcfg = @zeros([RQ + 17 + GRP]u32);   // (see the header)
 var rcfg_ptr: [*]u32 = &rcfg;
 var role_x: u16 = 0;
+var nx: u16 = 0;   // (GRP 1) the group's x words
 
 fn init() void {
-  ebw_d = @set_dsd_stride(@set_dsd_base_addr(@set_dsd_length(ebh_d, HDc), @ptrcast([*]u16, &eb)), 2);
-  ebw_d = @increment_dsd_offset(ebw_d, 1, u16);
+  if (GRP == 0) {
+    ebw_d = @set_dsd_stride(@set_dsd_base_addr(@set_dsd_length(ebh_d, HDc), @ptrcast([*]u16, &eb)), 2);
+    ebw_d = @increment_dsd_offset(ebw_d, 1, u16);
+  }
   fab.routes(&rcfg);
   var fq = [6]u16 { @as(u16, rcfg[RQ]), @as(u16, rcfg[RQ + 1]), @as(u16, rcfg[RQ + 2]), @as(u16, rcfg[RQ + 3]), @as(u16, rcfg[RQ + 4]), @as(u16, rcfg[RQ + 10]) };
   fab.bind_iqs(&fq, @as(u16, rcfg[RQ + 9]));
@@ -96,6 +108,7 @@ fn init() void {
   timestamp.enable_tsc();
   rr.role = @as(u16, rcfg[RQ + 7]);
   role_x = @as(u16, rcfg[RQ + 8]);
+  if (GRP == 1) { nx = @as(u16, rcfg[RQ + 17]); }
   sys_mod.unblock_cmd_stream();
 }
 
@@ -106,23 +119,27 @@ fn recv_x() void {
   const H2: u16 = HDc / 2;
   if (role_x == 0) {
     @fmovs(x_d, fab.fin(q_hm, HDc));
-  } else if (role_x == 1) {
+  } else if (GRP == 0 and role_x == 1) {
     @fmovs(fab.fout(q_xo, H2), fab.fin(q_hx, H2));
     @fmovs(x_d, fab.fin(q_hm, HDc));   // B's multicast passes this PE too
   } else {
-    @fmovs(@set_dsd_length(x_d, H2), fab.fin(q_hx, H2));
-    @fmovs(@set_dsd_length(@increment_dsd_offset(x_d, @as(i16, H2), f32), H2), fab.fin(q_hn, H2));
+    if (GRP == 1) {
+      @fmovs(@set_dsd_length(x_d, nx), fab.fin(q_hx, nx));
+    } else {
+      @fmovs(@set_dsd_length(x_d, H2), fab.fin(q_hx, H2));
+      @fmovs(@set_dsd_length(@increment_dsd_offset(x_d, @as(i16, H2), f32), H2), fab.fin(q_hn, H2));
+    }
     @fmovs(fab.fout(q_xo, HDc), x_d);
   }
 }
 fn send_r() void { rr.send(y_d, VR); }
 
 // ---------------------------------------------------------------- the wafer token loop
-var hemb = @zeros([VR * HDc + 1]u16);
+var hemb = @zeros([if (GRP == 0) VR * HDc + 1 else 1]u16);
 var hemb_ptr: [*]u16 = &hemb;
 var eb: [HDc]f32 align(16) = @zeros([HDc]f32);
 const eb_d = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{HDc} -> eb[i] });
-const ebh_d = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{HDc} -> hemb[i] });
+const ebh_d = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{if (GRP == 0) HDc else 1} -> hemb[i] });
 var ebw_d = ebh_d;
 var wfl: u16 = 0;
 var va_addr: u16 = 0;
@@ -151,22 +168,37 @@ fn hloop() void {
   if (w >= 0.0) {
     wrow = @as(u16, rcfg[RQ + 12]);
     const j = @as(u16, w);
-    // row j of the tile, bf16 bits into the high halves of f32 words
-    @fmovs(eb_d, 0.0);
-    @mov16(ebw_d, @increment_dsd_offset(ebh_d, @as(i16, j * HDc), u16));
+    if (GRP == 1) {
+      // row j of the tied tile (dim-major: stride VR), f16 widened
+      var d: u16 = 0;
+      while (d < nx) : (d += 1) { eb[d] = @as(f32, @bitcast(@fp16(), hw[d * VR + j])); }
+    } else {
+      // row j of the tile, bf16 bits into the high halves of f32 words
+      @fmovs(eb_d, 0.0);
+      @mov16(ebw_d, @increment_dsd_offset(ebh_d, @as(i16, j * HDc), u16));
+    }
     if (sink and te) {
-      @fmovs(fab.fout(q_he, H2), @set_dsd_length(eb_d, H2));
-      @fmovs(fab.fout(q_hs, H2), @set_dsd_length(@increment_dsd_offset(eb_d, @as(i16, H2), f32), H2));
+      if (GRP == 1) {
+        @fmovs(fab.fout(q_he, nx), @set_dsd_length(eb_d, nx));
+      } else {
+        @fmovs(fab.fout(q_he, H2), @set_dsd_length(eb_d, H2));
+        @fmovs(fab.fout(q_hs, H2), @set_dsd_length(@increment_dsd_offset(eb_d, @as(i16, H2), f32), H2));
+      }
     } else if (sink) {
-      @fmovs(fab.fout(q_vs, HDc), eb_d);
+      if (GRP == 1) { @fmovs(fab.fout(q_vs, nx), @set_dsd_length(eb_d, nx)); } else { @fmovs(fab.fout(q_vs, HDc), eb_d); }
     } else {
       const r = @get_config(va_addr, tgt.color_addr_range) & 0xff00;
       @set_config(va_addr, r | 0x80 | (va_orig & 0x1f), tgt.color_addr_range);
       va_dirty = true;
-      @fmovs(fab.fout(q_va, HDc), eb_d);
+      if (GRP == 1) { @fmovs(fab.fout(q_va, nx), @set_dsd_length(eb_d, nx)); } else { @fmovs(fab.fout(q_va, HDc), eb_d); }
     }
   } else {
     wrow = @as(u16, -w - 1.0);
+  }
+  if (GRP == 1) {
+    if (sink and !te and wrow != 0) { @fmovs(fab.fout(q_vs, nx), fab.fin(q_hn, nx)); }   // (iq5: VA here)
+    if (te and !(sink and wrow == 0)) { @fmovs(fab.fout(q_he, nx), fab.fin(q_hm, nx)); }  // (iq6: VS, or VA at row 0)
+    return;
   }
   if (sink and !te and wrow != 0) { @fmovs(fab.fout(q_vs, HDc), fab.fin(q_hn, HDc)); }   // (iq5: VA here)
   if (te and !(sink and wrow == 0)) {

@@ -41,10 +41,6 @@ pub const KERNELS: &[(&str, &str)] = &[
         "head_ctl.csl",
         include_str!("../programs/wafer/head_ctl.csl"),
     ),
-    (
-        "head_gemma12.csl",
-        include_str!("../programs/wafer/head_gemma12.csl"),
-    ),
     ("head_pe.csl", include_str!("../programs/wafer/head_pe.csl")),
     (
         "head_pe_gptoss.csl",

@@ -1,4 +1,4 @@
-//! Gemma 4 12B: `weight_gemma12.csl`, `ctl_cx_gemma12.csl`, `ctl_cy_gemma12.csl`, `head_gemma12.csl`, with the
+//! Gemma 4 12B: `weight_gemma12.csl`, `ctl_cx_gemma12.csl`, `ctl_cy_gemma12.csl`, `head_pe.csl` (GRP 1), with the
 //! shared head control ([`super::head::HEAD_CTL`]). Their params from the plan ([`kernels`]) and
 //! their rcfg writers.
 
@@ -14,7 +14,7 @@ use crate::role::{Kind, Place};
 
 use super::Pe;
 use super::common::{self, CT6, CX_EMB, CX_NO_OUTPUT, CxIo, HeadIo};
-use super::head::{HEAD_CTL, HeadCtl, HeadPe};
+use super::head::{HEAD_CTL, HeadCtl, HeadPeGroups};
 
 type R<T> = Result<T, String>;
 
@@ -89,10 +89,11 @@ pub const CTL_CY_GEMMA12: Kernel = Kernel {
     rcfg: Some(cy),
 };
 
+/// `head_pe.csl` with head groups and the tied embedding.
 pub const HEAD_GEMMA12: Kernel = Kernel {
-    source: "head_gemma12.csl",
+    source: "head_pe.csl",
     owns: &["hw", "hg", "rcfg", "hemb", "tdbg"],
-    params: HeadPe::NAMES,
+    params: HeadPeGroups::NAMES,
     route_slots: 12,
     rcfg: Some(head),
 };
@@ -172,7 +173,7 @@ fn cy(pe: &Pe) -> R<Vec<u32>> {
 /// north), then its group's dims.
 fn head(pe: &Pe) -> R<Vec<u32>> {
     let Place::Head { row, col } = pe.role().place else {
-        return Err(format!("{:?}: head_gemma12 off a head PE", pe.at));
+        return Err(format!("{:?}: a grouped head kernel off a head PE", pe.at));
     };
     let h = HeadIo {
         row,
@@ -365,11 +366,12 @@ pub fn kernels(prog: &Program) -> R<Kernels> {
         Kind::HEAD,
         KernelBuild::of(
             &HEAD_GEMMA12,
-            HeadPe {
+            HeadPeGroups {
                 VR: vr,
                 HDc: d.hdc,
                 NPX: 1,
                 HACC16: 0,
+                GRP: 1,
             },
         )?,
     );

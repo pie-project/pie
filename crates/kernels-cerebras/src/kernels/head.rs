@@ -19,6 +19,11 @@ params! {
 }
 
 params! {
+    /// [`HeadPe`]'s with head groups and the tied embedding (`GRP` 1).
+    pub struct HeadPeGroups { VR: u32, HDc: u32, NPX: u32, HACC16: u32, GRP: u32 }
+}
+
+params! {
     /// `head_ctl.csl`'s params: vocabulary rows a PE, the FIFO depth, forced tokens, the head
     /// rows the forced token is multicast over.
     pub struct HeadCtl { VR: u32, FIFOW: u32, WFORCE: u32, WFN: u32 }
