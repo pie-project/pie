@@ -459,10 +459,49 @@ struct WorkItemCompletionState {
 
 type SettledHook = Box<dyn FnOnce() + Send>;
 
+std::thread_local! {
+    /// Hooks gathered by [`settle_batched`] on this thread, run together
+    /// once it ends.
+    static BATCHED: std::cell::RefCell<Option<Vec<SettledHook>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// Runs `body`, the hooks of every completion it resolves going off the
+/// caller's stack together once it ends, as one task: a landing resolves a
+/// fire a lane, and a task each (spawned from the lane's own thread) cost
+/// that thread ~150 us a step at 64 lanes.
+pub(crate) fn settle_batched<T>(body: impl FnOnce() -> T) -> T {
+    let outer = BATCHED.with(|batch| batch.borrow().is_some());
+    if outer {
+        return body();
+    }
+    BATCHED.with(|batch| *batch.borrow_mut() = Some(Vec::new()));
+    struct Flush;
+    impl Drop for Flush {
+        fn drop(&mut self) {
+            let hooks = BATCHED.with(|batch| batch.borrow_mut().take().unwrap_or_default());
+            run_settled(hooks);
+        }
+    }
+    let _flush = Flush;
+    body()
+}
+
 /// Runs `hooks` off the caller's stack where a runtime is up: a resolution
-/// may come under a store's lock its hooks take.
-fn run_settled(hooks: Vec<SettledHook>) {
+/// may come under a store's lock its hooks take. Within [`settle_batched`]
+/// they wait for its end.
+fn run_settled(mut hooks: Vec<SettledHook>) {
     if hooks.is_empty() {
+        return;
+    }
+    let deferred = BATCHED.with(|batch| match batch.borrow_mut().as_mut() {
+        Some(batch) => {
+            batch.append(&mut hooks);
+            true
+        }
+        None => false,
+    });
+    if deferred {
         return;
     }
     if crate::rt::has_runtime() {
@@ -812,23 +851,25 @@ impl Landed {
         } else {
             TERMINAL_OUTCOME_SUCCESS
         };
-        for LandingStep {
-            cells,
-            completions,
-            wakes,
-        } in self.steps
-        {
-            settle(&cells, code);
-            // Each fire resolves as its step lands, so what waits on it goes
-            // on a step later rather than once the frame retires.
-            for completion in &completions {
-                completion.resolve_landed("step settle");
+        settle_batched(|| {
+            for LandingStep {
+                cells,
+                completions,
+                wakes,
+            } in self.steps
+            {
+                settle(&cells, code);
+                // Each fire resolves as its step lands, so what waits on it
+                // goes on a step later rather than once the frame retires.
+                for completion in &completions {
+                    completion.resolve_landed("step settle");
+                }
+                for wait_id in &wakes {
+                    let outcome = waker::WakerTable::global().wake(*wait_id);
+                    tracing::debug!(wait_id, ?outcome, "published to a waiter");
+                }
             }
-            for wait_id in &wakes {
-                let outcome = waker::WakerTable::global().wake(*wait_id);
-                tracing::debug!(wait_id, ?outcome, "published to a waiter");
-            }
-        }
+        });
         if let Some((cell, wait_id, epoch)) = self.frame {
             settle(&[cell], code);
             broker.notify(wait_id, epoch);
@@ -1009,5 +1050,38 @@ mod tests {
         abandoned.on_settled(move || flag.store(true, Ordering::Release));
         drop(abandoned);
         assert!(eventually(&ran).await, "an abandoned completion's hook ran");
+    }
+
+    /// Completions resolved together (a landing's fires) run every hook,
+    /// once the batch ends and not before, from one task.
+    #[tokio::test]
+    async fn hooks_of_completions_resolved_together_run_once_the_batch_ends() {
+        use std::sync::atomic::AtomicUsize;
+        let completions: Vec<WorkItemCompletion> = (0..64)
+            .map(|_| WorkItemCompletion::deferred_with_guard(None))
+            .collect();
+        let ran = Arc::new(AtomicUsize::new(0));
+        for completion in &completions {
+            let ran = ran.clone();
+            completion.on_settled(move || {
+                ran.fetch_add(1, Ordering::AcqRel);
+            });
+        }
+        super::settle_batched(|| {
+            for completion in &completions {
+                completion.reject("done");
+                assert!(completion.is_settled(), "resolved at once");
+            }
+            assert_eq!(ran.load(Ordering::Acquire), 0, "hooks wait for the batch");
+        });
+        let all = Arc::new(AtomicBool::new(false));
+        for _ in 0..200 {
+            if ran.load(Ordering::Acquire) == completions.len() {
+                all.store(true, Ordering::Release);
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(all.load(Ordering::Acquire), "every hook ran");
     }
 }

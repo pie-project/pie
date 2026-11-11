@@ -2351,13 +2351,15 @@ impl BatchScheduler {
                         request.completion.mark_native_retired();
                     }
                     // A fire its step resolved as it landed is resolved.
-                    for request in retired
-                        .requests
-                        .iter()
-                        .filter(|r| !r.completion.is_settled())
-                    {
-                        request.completion.resolve_landed("frame settle");
-                    }
+                    crate::engine::completion::settle_batched(|| {
+                        for request in retired
+                            .requests
+                            .iter()
+                            .filter(|r| !r.completion.is_settled())
+                        {
+                            request.completion.resolve_landed("frame settle");
+                        }
+                    });
                     stats::record_fire_stats(
                         stats,
                         retired.started.elapsed(),
