@@ -2591,16 +2591,16 @@ pub async fn submit_pass_stamped<C: FireContext>(
             && groups.len() == 1
             && !adapted
             && !fire_wide_mask;
-        // A window's pass runs as one fire (its lists land at fire ends), but
-        // may still start from a prefix the cache holds.
-        let resumable = decode_envelope.is_none()
+        // A pass that may start from a prefix the cache holds may be cut, a
+        // window's too: each piece lands its rows in the window lists and
+        // trims behind them as a fire of its own.
+        let cuttable = decode_envelope.is_none()
             && !wide
             && plain
             && !prologue_moves
             && (!adapted || crate::model::model().eta_caps().adapter_attachments)
             && !fire_wide_mask
             && folds_all;
-        let cuttable = resumable && !windowed;
         let mut full = req;
         let keyed = if keyable { keyed_rows(&full) } else { 0 };
         let mut pass_slots = (keyed > 0)
@@ -2626,7 +2626,7 @@ pub async fn submit_pass_stamped<C: FireContext>(
             [rs] => Some(*rs),
             _ => None,
         };
-        let attach = if !resumable || !keyable || !plain_rows(&full) {
+        let attach = if !cuttable || !keyable || !plain_rows(&full) {
             Attach::No
         } else if rs_ws_ids.is_empty() {
             Attach::Kv
@@ -2720,8 +2720,9 @@ pub async fn submit_pass_stamped<C: FireContext>(
             None => Vec::new(),
         };
         // An engine that lands a lane's state at rows inside a fire is cut only
-        // past as many as it lands at once.
-        // A window's are landed at fire ends only.
+        // past as many as it lands at once. A window's piece keeps the
+        // furthest row inside it as of that row (checkpoint_at), so it forces
+        // no cut.
         let snapshots = if windowed {
             0
         } else {
@@ -2729,6 +2730,7 @@ pub async fn submit_pass_stamped<C: FireContext>(
         };
         let forced: Vec<u32> = checkpoints
             .iter()
+            .filter(|_| !windowed)
             .skip(snapshots)
             .step_by(snapshots + 1)
             .map(|&row| (row - held) as u32)
@@ -2776,9 +2778,6 @@ pub async fn submit_pass_stamped<C: FireContext>(
             }
             if switched.rows_read {
                 why.push("it reads out an output of rows a cut fire would not hold");
-            }
-            if windowed {
-                why.push("its model keeps window lists");
             }
             if !folds_all {
                 why.push("it states where its recurrent state folds");
@@ -2864,9 +2863,9 @@ pub async fn submit_pass_stamped<C: FireContext>(
                     window_at: None,
                 }
             };
-            // A window pass is one fire: it keeps the furthest of its rows,
-            // which its windows stand at once it lands, or reach back to
-            // from its end (the slots that window touches retire no earlier).
+            // A window's piece keeps the furthest of its rows, which its
+            // windows stand at once it lands, or reach back to from its end
+            // (the slots that window touches retire no earlier).
             let window_at = checkpoints
                 .iter()
                 .copied()
