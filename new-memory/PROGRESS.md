@@ -1039,3 +1039,18 @@ The `new-memory/` directory is bookkeeping and is removed before anything lands 
 - Recorded pre-existing: two models on one ROCm device (flat arenas on main too).
 - OPEN (blocker): ROCm at DEFAULT config arms 0 bodies on new-memory (main 89/89): the flat chunk range takes all the
   spare before bodies -> EAGER agent fixing in shared code.
+
+### M80 — 2026-11-11: dead-code sweep (~5,000 lines)
+- `sc/dead-code` (21 commits): engine-metal ICB plane / recording walk / descriptor ABI survey (~2,700 lines),
+  kernels-metal icb_rebind, engine-xla serve::dry, FireCost on every engine, runtime EngineConfig fields and dead
+  counters, `Capabilities::chunks` no longer optional (worker's degenerate fallback gone), `copy_state` removed from
+  shared-pool engines (only the Cerebras wafer engine keeps it), engine-cuda one_frame_when_short decision, etc.
+- Merge fixes: kernels-xla `plane_append` dropped beside the TPU session's `rebase`; runtime `engine::load::sequence`
+  (the import's artifact order by the now-deleted tier ranking, M78) removed with its `merge_order` parameter; three
+  stale imports in engine-cuda dispatch/custom.rs.
+- Verified: cargo check --all-targets for the workspace, engine-cuda cuda / rocm, runtime all engines (0 warnings);
+  lib tests runtime 278, engine 40, worker 12, kernels-xla 18, engine-xla 14; DC's CUDA goldens byte-identical.
+- Listed, not deleted: pinned-pool host tiers (TierKind::Rs / RsPages / Window) that only the wafer engine could
+  reach; host/disk branches in shared-pool copy_kv; Cerebras Unified; Vulkan/wgpu profiling hooks; worker
+  set_draining; test-only APIs (incl. the runtime's rung API: SharedPool::raise_rung / lower_rung / steer — no
+  production caller -> check whether the governor's rung shrink is wired).
