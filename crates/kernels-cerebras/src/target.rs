@@ -853,6 +853,25 @@ mod tests {
         Program::of(p.plan).unwrap();
     }
 
+    /// The search proposes only plans that cut: gpt-oss's pick (its moves of the attention
+    /// columns and segments) cuts from the trace's params.
+    #[test]
+    fn the_searchs_pick_cuts() {
+        let t = trace("gptoss-20b-bf16-mxfp4-kv-bf16");
+        let s = shape(&t).unwrap();
+        let shapes = |n: &str| {
+            t.params
+                .iter()
+                .find(|q| q.name == n)
+                .map(|q| q.shape.clone())
+        };
+        for found in crate::search::search(&s, &crate::search::Asked::default(), 3).unwrap() {
+            family::of(found.plan().family)
+                .tiles(found.plan(), &shapes)
+                .unwrap_or_else(|e| panic!("{}: {e}", found.planned.preset.name));
+        }
+    }
+
     /// A combination no kernel runs is refused by name: q / k / v biases with head norms on the
     /// MoE halves.
     #[test]
