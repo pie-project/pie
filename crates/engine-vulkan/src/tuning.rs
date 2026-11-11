@@ -10,6 +10,8 @@ pub const FACTS: &[Var] = &[
     // Multiprocessors or compute units; absent where no extension says.
     Var::fixed("cores", Domain::COUNT),
     Var::fixed("coopmat", Domain::Bool),
+    // A discrete GPU (`VK_PHYSICAL_DEVICE_TYPE_DISCRETE_GPU`).
+    Var::fixed("discrete", Domain::Bool),
 ];
 
 pub const AXES: &[&str] = &["rows"];

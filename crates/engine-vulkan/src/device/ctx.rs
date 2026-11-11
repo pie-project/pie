@@ -132,6 +132,7 @@ pub(crate) struct Core {
     pub(crate) cores: Option<u32>,
     pub(crate) device_local: u64,
     pub(crate) vendor_id: u32,
+    pub(crate) discrete: bool,
     pub(crate) api_version: u32,
     pub(crate) features: Enabled,
 }
@@ -936,6 +937,7 @@ impl Context {
             cores,
             device_local,
             vendor_id: props.vendor_id,
+            discrete: props.device_type == vk::PhysicalDeviceType::DISCRETE_GPU,
             api_version: props.api_version,
             features: enabled,
         });
@@ -1036,6 +1038,7 @@ impl Context {
             subgroup: self.core.subgroup_min,
             cores: self.core.cores,
             coopmat: self.core.features.coopmat,
+            discrete: self.core.discrete,
         }
     }
 
