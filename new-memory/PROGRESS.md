@@ -1157,3 +1157,13 @@ The `new-memory/` directory is bookkeeping and is removed before anything lands 
 - Probes (sm_120, 128 / 96 MiB): restart loops -> clear errors in 0.01-0.12 s; c2 batches still serve. Runtime
   planner/store/inferlet/policy 208 pass. Open: ~1,600 restarts in 2 s before the error in one 96 MiB case
   (fleet_stalled marks a process stalled while other lanes have fires in flight).
+
+### M92 — 2026-11-11: the governor's rung shrink moves the activation boundary (A14)
+- `sc/rt5-rung` (670f591d6): poem_compiler::arena_rung carves the arena for fires up to 256 / 1024 / 4096 tokens,
+  each carve at the top of the activation span (fixed addresses: bodies stay valid at every rung their fire fits);
+  CUDA states rungs in ChunkFacts and re-reserves the range to the fit when rungs exist. Runtime RungWalk: down = cap
+  fires, wait for wider fires to retire, lower_rung; up = evacuate state out of the larger span, apply_rung, lift the
+  cap; governor shrink_rung / restore_rung step it. PIE_PRESSURE_FILE test hook; tests/handles/rung.py.
+- Verified: runtime 214, poem-compiler 34, e2e rung.py 6/6 (Qwen3.5, induced critical pressure), CUDA golden_logits /
+  by_refs / offload = base after merge. Limits: raise evacuation proven by unit test only; one decode differs at the
+  smaller rung (finer prefill cuts, unconfirmed); only CUDA states rungs (A21: Metal / Vulkan / wgpu / XLA).
