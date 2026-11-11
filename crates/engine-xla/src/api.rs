@@ -691,6 +691,23 @@ impl Engine for Xla {
         self.loaded_mut()?.evacuate(evacuation).map_err(fault)
     }
 
+    fn read_tier_slots(
+        &mut self,
+        slots: &[(engine::chunk::ShapeId, Vec<u32>)],
+    ) -> EngineResult<Vec<u8>> {
+        self.loaded_mut()?.read_tier_slots(slots).map_err(fault)
+    }
+
+    fn write_tier_slots(
+        &mut self,
+        slots: &[(engine::chunk::ShapeId, Vec<u32>)],
+        bytes: &[u8],
+    ) -> EngineResult<()> {
+        self.loaded_mut()?
+            .write_tier_slots(slots, bytes)
+            .map_err(fault)
+    }
+
     /// Whole-slot copies on the device. HOST/DISK TIERS HOOK: a copy whose
     /// source or destination is a host or disk chunk (`SlotCopy`'s tier,
     /// from sc/tier-shared's contract) lands here; until that contract is

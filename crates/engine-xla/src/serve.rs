@@ -1012,6 +1012,66 @@ impl Shell {
         Ok(())
     }
 
+    /// Where each of `slots` (host tier refs, shape by shape) lies in the
+    /// host chunks, and its bytes, in order.
+    fn tier_spans(&self, slots: &[(engine::chunk::ShapeId, Vec<u32>)]) -> Result<Vec<(u64, u64)>> {
+        let facts = self.pools.facts();
+        let chunk = facts.chunk_bytes;
+        let mut spans = Vec::new();
+        for (id, refs) in slots {
+            let shape = facts.shape(*id).ok_or_else(|| Fault::Unbound {
+                what: format!("slot shape {id}, which this load does not state"),
+            })?;
+            for &slot in refs {
+                spans.push((shape.tier_offset(chunk, slot), shape.slot_bytes));
+            }
+        }
+        Ok(spans)
+    }
+
+    /// See `Engine::read_tier_slots`: host tier slots' bytes, shape by
+    /// shape, each as `copy_tier` lays it (the device slot's bytes). Copies
+    /// into the host tier land before `copy_tier` returns.
+    pub fn read_tier_slots(&self, slots: &[(engine::chunk::ShapeId, Vec<u32>)]) -> Result<Vec<u8>> {
+        let spans = self.tier_spans(slots)?;
+        let total: u64 = spans.iter().map(|&(_, len)| len).sum();
+        let mut out = Vec::with_capacity(usize::try_from(total).unwrap_or(0));
+        for (offset, len) in spans {
+            out.extend_from_slice(self.host.read(offset, len)?);
+        }
+        Ok(out)
+    }
+
+    /// See `Engine::write_tier_slots`: `bytes`, laid out as
+    /// [`Self::read_tier_slots`] returns them, into host tier slots; refused
+    /// whole when the byte count differs.
+    pub fn write_tier_slots(
+        &mut self,
+        slots: &[(engine::chunk::ShapeId, Vec<u32>)],
+        bytes: &[u8],
+    ) -> Result<()> {
+        let spans = self.tier_spans(slots)?;
+        let need: u64 = spans.iter().map(|&(_, len)| len).sum();
+        if bytes.len() as u64 != need {
+            return Err(Fault::Ceiling {
+                what: "bytes of host tier slots",
+                need,
+                have: bytes.len() as u64,
+            });
+        }
+        // every span inside the tier before any lands
+        for &(offset, len) in &spans {
+            self.host.read(offset, len)?;
+        }
+        let mut at = 0usize;
+        for (offset, len) in spans {
+            let len = usize::try_from(len).unwrap_or(usize::MAX);
+            self.host.write(offset, &bytes[at..at + len])?;
+            at += len;
+        }
+        Ok(())
+    }
+
     pub fn register_adapter(
         &mut self,
         id: u32,
