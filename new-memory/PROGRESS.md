@@ -1075,3 +1075,12 @@ The `new-memory/` directory is bookkeeping and is removed before anything lands 
   New probe golden_eager_resume. t_resume correct and 112/112 armed at 216 MiB / 1 GiB / 2 GiB / none; CUDA goldens
   = base (re-run after merge).
 - Merge fix: enqueue.rs eager_walk (M78 removed hosts_experts) + eager_unbodied reason; stale deferred_tier in a probe.
+
+### M83 — 2026-11-11: dead-code sweep 2 (~1,100 lines)
+- `sc/dead-code-2` (4970e5a76, 31c158fa1, ef1a08ced, 0dda02e7f): Cerebras Unified; shared-pool copy_kv host/disk
+  branches (CUDA spill_kv path, Metal disk branch, KvCopy::tier_move, Metal copy_pages); CUDA Pinning::uninit;
+  pinned-pool host tiers TierKind::Rs / RsPages / Window, StateCopy::direction, degenerate window / host-state runs.
+  Matrix 0 warnings incl. pie cuda / rocm; runtime 279 lib tests; CUDA goldens byte-identical.
+- FOUND (A14): the governor's rung shrink under critical pressure is not wired: SharedGrow::shrink_rung / restore_rung
+  are no-ops ("the scheduler does not cap a fire's tokens by rung yet"); raise_rung / lower_rung / steer exist unused.
+  SPEC decision 6's activation boundary never moves.

@@ -17,6 +17,7 @@ Branch today: 432 commits ahead of main, 782 files, +86k / -13k. Main merged in 
 | A11 | Eager path wrong tokens; nothing arms at small budgets | EAGER | done M82 (ROCm verify pending) |
 | A12 | Named snapshots on the shared pool (take_host None); host-full resume hang + shortfall miscount; keep-handles key must cover the record | RT agent | in progress |
 | A13 | Record rs-buffered fires (MTP / spec decode on hybrids walk eagerly; same on main) — graph capture rule | L40S | after perf fixes |
+| A14 | Wire the rung shrink: scheduler caps a fire's tokens by the activation rung; SharedGrow shrink/restore_rung move the boundary (SPEC 6) | RT | queued |
 | A9 | dsv41 two-window mini cannot fire on sm_89/sm_120 (fused.lse_sink kernel gap) -> two-window CUDA unverified | L40S | queued |
 
 ## B. Decide before the PR (user)
