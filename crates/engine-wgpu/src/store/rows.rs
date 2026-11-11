@@ -40,6 +40,9 @@ pub const WEIGHTS: u32 = 8;
 /// Bytes one fill moves through its host-visible upload at most.
 const UPLOAD: u64 = 64 << 20;
 
+/// The threads that lay a fill's rows.
+const FILL_THREADS: usize = 16;
+
 /// The tables a plain token-id gather alone reads: bf16, two axes, from
 /// the checkpoint, every reader a `Gather::Embed` with no weights, scales or
 /// concat over the table's own rows.
@@ -391,6 +394,7 @@ impl RowCaches {
     ) -> Result<()> {
         fills.sort_unstable();
         let mut start = 0usize;
+        let mut image = Vec::new();
         while start < fills.len() {
             let mut bytes = 0u64;
             let mut end = start;
@@ -403,33 +407,9 @@ impl RowCaches {
                 end += 1;
             }
             let mut upload = Buffer::host(device, bytes.max(4))?;
-            let mut at = 0u64;
-            let mut image = Vec::new();
-            for &(_, cache, block) in &fills[start..end] {
-                let shape = &self.caches[cache].shape;
-                image.clear();
-                image.resize(usize::try_from(shape.slot_bytes).unwrap_or(0), 0);
-                for k in 0..u64::from(shape.block_rows) {
-                    let id = u64::from(block) * u64::from(shape.block_rows) + k;
-                    if id >= shape.rows {
-                        break;
-                    }
-                    for table in &shape.tables {
-                        let plane = planes.get(&table.param).ok_or_else(|| Fault::Unbound {
-                            what: format!(
-                                "row table param {}, which the host tier does not hold",
-                                table.param
-                            ),
-                        })?;
-                        let from = usize::try_from(k * shape.atom_bytes + table.origin)
-                            .unwrap_or(usize::MAX);
-                        let len = usize::try_from(table.row_bytes).unwrap_or(0);
-                        plane.row_into(host.map(), id, &mut image[from..from + len])?;
-                    }
-                }
-                upload.write(at, &image)?;
-                at += shape.slot_bytes;
-            }
+            image.resize(usize::try_from(bytes).unwrap_or(0), 0);
+            self.lay(&mut image, host, planes, &fills[start..end])?;
+            upload.write(0, &image)?;
             // One copy of many regions a segment, slots side by side merged.
             let mut frame = device.frame()?;
             let mut at = 0u64;
@@ -464,6 +444,77 @@ impl RowCaches {
             start = end;
         }
         Ok(())
+    }
+
+    /// Lays the rows of `fills`' blocks side by side in `image` (each slot
+    /// whole: rows past the table's last and any gap between tables zero),
+    /// split over [`FILL_THREADS`] threads.
+    fn lay(
+        &self,
+        image: &mut [u8],
+        host: &HostTier,
+        planes: &BTreeMap<usize, &HostPlane>,
+        fills: &[(u64, usize, u32)],
+    ) -> Result<()> {
+        let mut seats: Vec<(&mut [u8], usize, u32)> = Vec::with_capacity(fills.len());
+        let mut rest = image;
+        for &(_, cache, block) in fills {
+            let len = usize::try_from(self.caches[cache].shape.slot_bytes).unwrap_or(0);
+            let (seat, after) = rest.split_at_mut(len);
+            seats.push((seat, cache, block));
+            rest = after;
+        }
+        let threads = FILL_THREADS.min(seats.len()).max(1);
+        let chunk = seats.len().div_ceil(threads);
+        let map = host.map();
+        let laid: Vec<Result<()>> = std::thread::scope(|scope| {
+            seats
+                .chunks_mut(chunk)
+                .map(|seats| {
+                    scope.spawn(move || {
+                        for (image, cache, block) in seats.iter_mut() {
+                            let shape = &self.caches[*cache].shape;
+                            let block = *block;
+                            let whole = u64::from(block + 1) * u64::from(shape.block_rows)
+                                <= shape.rows
+                                && shape.tables.iter().map(|t| t.row_bytes).sum::<u64>()
+                                    == shape.atom_bytes
+                                && u64::from(shape.block_rows) * shape.atom_bytes
+                                    == shape.slot_bytes;
+                            if !whole {
+                                image.fill(0);
+                            }
+                            for k in 0..u64::from(shape.block_rows) {
+                                let id = u64::from(block) * u64::from(shape.block_rows) + k;
+                                if id >= shape.rows {
+                                    break;
+                                }
+                                for table in &shape.tables {
+                                    let plane = planes.get(&table.param).ok_or_else(|| {
+                                        Fault::Unbound {
+                                            what: format!(
+                                                "row table param {}, which the host tier does \
+                                                 not hold",
+                                                table.param
+                                            ),
+                                        }
+                                    })?;
+                                    let from = usize::try_from(k * shape.atom_bytes + table.origin)
+                                        .unwrap_or(usize::MAX);
+                                    let len = usize::try_from(table.row_bytes).unwrap_or(0);
+                                    plane.row_into(map, id, &mut image[from..from + len])?;
+                                }
+                            }
+                        }
+                        Ok(())
+                    })
+                })
+                .collect::<Vec<_>>()
+                .into_iter()
+                .map(|worker| worker.join().expect("a fill worker does not panic"))
+                .collect()
+        });
+        laid.into_iter().collect()
     }
 
     /// Rewrites every block's entry from its slot ref through the pool's
