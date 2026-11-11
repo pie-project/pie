@@ -346,17 +346,15 @@ impl ProcessCtx {
             .remove(&(model, engine, id));
     }
 
-    pub(crate) fn register_rs_working_set(
-        &self,
-        model: usize,
-        engine: crate::engine::EngineId,
-        id: RsWorkingSetId,
-    ) {
+    pub(crate) fn register_rs_working_set(&self, ws: &crate::store::rs::working_set::RsWorkingSet) {
         self.residency
             .lock()
             .unwrap()
             .rs_working_sets
-            .insert((model, engine, id));
+            .insert((ws.model, ws.engine, ws.id));
+        if let Some(departure) = &self.departure {
+            ws.hold_departure(departure.clone());
+        }
     }
 
     pub(crate) fn unregister_rs_working_set(
