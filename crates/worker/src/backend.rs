@@ -174,8 +174,7 @@ fn cuda_budgets(
         page_size,
         max_context,
         context_declared,
-        // The engine sizes the slab from its chip's profile
-        // (`engine.state_slots_per_lane`), 256 where the profile says nothing.
+        // Unstated, 0: the engine seats a slot a lane (`max_lanes`).
         slots: 0,
         max_patches: patch_ceilings.0,
         max_images: patch_ceilings.1,
