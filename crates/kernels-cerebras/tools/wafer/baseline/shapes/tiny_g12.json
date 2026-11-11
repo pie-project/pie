@@ -1,0 +1,98 @@
+{
+ "attn": {
+  "global_head_dim": 28,
+  "head_dim": 14,
+  "kv_heads": 2,
+  "output_gate": false,
+  "q_heads": 4,
+  "qk_norm": true,
+  "sinks": false
+ },
+ "gdn": null,
+ "head": {
+  "final_softcap": 30.0,
+  "tied": true
+ },
+ "hidden": 20,
+ "layers": [
+  {
+   "Sliding": {
+    "window": 9
+   }
+  },
+  {
+   "Sliding": {
+    "window": 9
+   }
+  },
+  "Global",
+  {
+   "Sliding": {
+    "window": 9
+   }
+  },
+  {
+   "Sliding": {
+    "window": 9
+   }
+  },
+  "Global",
+  {
+   "Sliding": {
+    "window": 9
+   }
+  },
+  {
+   "Sliding": {
+    "window": 9
+   }
+  },
+  "Global",
+  {
+   "Sliding": {
+    "window": 9
+   }
+  },
+  {
+   "Sliding": {
+    "window": 9
+   }
+  },
+  "Global"
+ ],
+ "mlp": {
+  "act": "GeluTanh",
+  "intermediate": 30,
+  "layer_widths": [
+   30,
+   30,
+   30,
+   30,
+   30,
+   30,
+   30,
+   30,
+   30,
+   30,
+   30,
+   30
+  ]
+ },
+ "moe": null,
+ "norm": {
+  "eps": 1e-06,
+  "sandwich": true,
+  "unit_offset": false
+ },
+ "ple": null,
+ "rope": {
+  "global": {
+   "rotary_dims": 6,
+   "span": 14,
+   "theta": 1000000.0
+  },
+  "rotary_dims": 14,
+  "theta": 10000.0
+ },
+ "vocab": 512
+}

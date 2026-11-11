@@ -1751,7 +1751,6 @@ dependencies = [
  "libloading 0.9.0",
  "pie-dtype",
  "pie-eta-ir",
- "pie-poem",
  "pie-poem-compiler",
  "pie-poem-exec",
  "pie-poem-ir",
@@ -1761,8 +1760,6 @@ dependencies = [
  "tempfile",
  "toml",
  "tracing",
- "ztensor",
- "ztensor-compat",
 ]
 
 [[package]]
@@ -3030,7 +3027,11 @@ dependencies = [
 name = "kernels-cerebras"
 version = "0.6.0"
 dependencies = [
- "pie-dtype",
+ "blake3",
+ "pie-poem-compiler",
+ "pie-poem-ir",
+ "serde",
+ "serde_json",
 ]
 
 [[package]]

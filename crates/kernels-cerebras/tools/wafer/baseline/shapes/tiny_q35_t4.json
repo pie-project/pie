@@ -1,0 +1,74 @@
+{
+ "attn": {
+  "global_head_dim": null,
+  "head_dim": 32,
+  "kv_heads": 2,
+  "output_gate": true,
+  "q_heads": 4,
+  "qk_norm": true,
+  "sinks": false
+ },
+ "gdn": {
+  "key_dim": 8,
+  "key_heads": 4,
+  "value_dim": 16,
+  "value_heads": 8
+ },
+ "head": {
+  "final_softcap": null,
+  "tied": true
+ },
+ "hidden": 48,
+ "layers": [
+  "Gdn",
+  "Gdn",
+  "Gdn",
+  "Global",
+  "Gdn",
+  "Gdn",
+  "Gdn",
+  "Global",
+  "Gdn",
+  "Gdn",
+  "Gdn",
+  "Global",
+  "Gdn",
+  "Gdn",
+  "Gdn",
+  "Global"
+ ],
+ "mlp": {
+  "act": "Silu",
+  "intermediate": 64,
+  "layer_widths": [
+   64,
+   64,
+   64,
+   64,
+   64,
+   64,
+   64,
+   64,
+   64,
+   64,
+   64,
+   64,
+   64,
+   64,
+   64,
+   64
+  ]
+ },
+ "moe": null,
+ "norm": {
+  "eps": 1e-06,
+  "sandwich": false,
+  "unit_offset": true
+ },
+ "ple": null,
+ "rope": {
+  "rotary_dims": 8,
+  "theta": 10000.0
+ },
+ "vocab": 144
+}
