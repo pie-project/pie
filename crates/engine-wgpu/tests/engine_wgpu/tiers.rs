@@ -185,10 +185,13 @@ enum Tier {
     Disk,
 }
 
-/// Host and disk refs handed out in order.
+/// Host and disk refs handed out in order; `bytes`: a slot parked on the
+/// host comes back through its bytes (`read_tier_slots`), written into other
+/// host slots (`write_tier_slots`), as a snapshot restores.
 struct Parked {
     host: Refs,
     disk: u32,
+    bytes: bool,
 }
 
 /// Moves `slots` (0: trimmed, kept) of `shape` to `tier` and back into
@@ -226,6 +229,29 @@ fn park(
             runs: Vec::new(),
         })
         .expect("the slots park");
+    let away = if parked.bytes && tier == Tier::Host && !away.is_empty() {
+        let read = shell
+            .read_tier_slots(&[(shape, away.clone())])
+            .expect("the host slots read");
+        assert_eq!(
+            read.len() as u64,
+            away.len() as u64 * shell.pool_chunk_facts().shape(shape).expect("stated").slot_bytes,
+            "a host slot reads as its device slot's bytes"
+        );
+        let again: Vec<u32> = away.iter().map(|_| parked.host.take(shape)).collect();
+        assert!(
+            shell
+                .write_tier_slots(&[(shape, again.clone())], &read[1..])
+                .is_err(),
+            "a byte count that differs is refused"
+        );
+        shell
+            .write_tier_slots(&[(shape, again.clone())], &read)
+            .expect("the host slots write");
+        again
+    } else {
+        away
+    };
     let fresh: Vec<u32> = held.iter().map(|_| refs.take(shape)).collect();
     shell
         .copy_slots(&SlotCopy {
@@ -273,6 +299,7 @@ fn served_offloaded(
     context: u32,
     prompt: u32,
     offload: bool,
+    bytes: bool,
 ) -> Option<Vec<Vec<f32>>> {
     let residency = engine::load::Residency {
         host_kv_budget: Some(64 << 20),
@@ -300,6 +327,7 @@ fn served_offloaded(
     let mut parked = Parked {
         host: Refs::of(&facts, 0, facts.host_chunks),
         disk: 0,
+        bytes,
     };
     let trace = &fixture.trace;
     let mut held = Held::new(&facts, &mut refs);
@@ -342,13 +370,21 @@ fn served_offloaded(
 
 fn offloaded(model: &str, layers: Option<u32>, page: u32, context: u32, prompt: u32) {
     let fixture = fixture(model, layers);
-    let Some(kept) = served_offloaded(&fixture, page, context, prompt, false) else {
+    let Some(kept) = served_offloaded(&fixture, page, context, prompt, false, false) else {
         return;
     };
-    let moved = served_offloaded(&fixture, page, context, prompt, true).expect("loaded before");
+    let moved =
+        served_offloaded(&fixture, page, context, prompt, true, false).expect("loaded before");
     same(
         &format!("{model}: parked on the host and the disk against kept"),
         &moved,
+        &kept,
+    );
+    let restored =
+        served_offloaded(&fixture, page, context, prompt, true, true).expect("loaded before");
+    same(
+        &format!("{model}: restored through host slot bytes against kept"),
+        &restored,
         &kept,
     );
 }
