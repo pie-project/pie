@@ -60,8 +60,7 @@ const q_ho = @get_output_queue(4);
 const C_PARK: color = @get_color(16);
 const ut_a = @get_ut_id(4);
 const ut_b = @get_ut_id(5);
-var fifo_buf = @zeros([FIFOW]f32);
-const fifo = @allocate_fifo(fifo_buf);
+const red = @import_module("ops/red.csl", .{ .fab = fab, .IN1 = q_e, .IN2 = q_w, .OUT = q_lo, .LOOP = q_lb, .UT1 = ut_a, .UT2 = ut_b, .FIFOW = FIFOW });
 const NR: u16 = 12;
 const RQ: u16 = 1 + 2 * NR;
 var rcfg = @zeros([RQ + 10]u32);   // ctl_cx's; [RQ+7] flags: bit 0 first unit, 1 no handoff out, 2 the wafer loop's
@@ -76,9 +75,7 @@ fn init() void {
 }
 
 fn reduce(n: u16) void {
-  @fmovs(fifo, fab.fin(q_e, n), .{ .async = true, .ut_id = ut_a });
-  @fadds(fab.fout(q_lo, n), fab.fin(q_w, n), fifo, .{ .async = true, .ut_id = ut_b });
-  @fmovs(@set_dsd_length(t1_d, n), fab.fin(q_lb, n));
+  red.root(@set_dsd_length(t1_d, n), n);
 }
 fn dot(a: [*]f32, b: [*]f32) f32 {
   var s: f32 = 0.0;

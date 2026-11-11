@@ -47,8 +47,6 @@ const q_ww = @get_output_queue(4);   // the row word
 const ut_a = @get_ut_id(4);
 const ut_b = @get_ut_id(5);
 param FIFOW: u16 = 32;
-var fifo_buf = @zeros([FIFOW]f32);
-const fifo = @allocate_fifo(fifo_buf);
 const NR: u16 = 12;
 const RQ: u16 = 1 + 2 * NR;
 var rcfg = @zeros([RQ + 15]u32);   // [RQ..RQ+4) iq2, iq3, iq4, oq2; [RQ+4] this row's first vocabulary id; [RQ+5] spare;
@@ -85,6 +83,7 @@ var wrole: u16 = 0;              // 0 chain start, 1 add-forward, 2 group end, 3
 var wl_on = false;
 var tb_on = false;
 const q_tb = @get_output_queue(5);
+const red = @import_module("ops/red.csl", .{ .fab = fab, .IN1 = q_e, .IN2 = q_w, .OUT = q_lo, .LOOP = q_lb, .UT1 = ut_a, .UT2 = ut_b, .FIFOW = FIFOW });
 var tbw = @zeros([1]f32);
 var tin = @zeros([1]u32);          // (TB rows) the launch's first token id, host-written: its PLE words come from the storage
 var tin_ptr: [*]u32 = &tin;
@@ -133,9 +132,7 @@ task pass_task() void {
   while (s < n_steps) : (s += 1) {
     if (s == 0 and tb_on) { tbw[0] = @as(f32, tin[0]); @fmovs(fab.fout(q_tb, 1), tbw_d); }
     stamp(0);
-    @fmovs(fifo, fab.fin(q_e, VR), .{ .async = true, .ut_id = ut_a });
-    @fadds(fab.fout(q_lo, VR), fab.fin(q_w, VR), fifo, .{ .async = true, .ut_id = ut_b });
-    @fmovs(t_d, fab.fin(q_lb, VR));
+    red.root(t_d, VR);
     stamp(66);
     var best: f32 = t[0];
     var bi: u16 = 0;

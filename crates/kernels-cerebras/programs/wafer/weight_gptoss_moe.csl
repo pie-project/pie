@@ -33,6 +33,7 @@ param FIFOW: u16 = 32;
 
 const sys_mod = @import_module("<memcpy/memcpy>", memcpy_params);
 const fab = @import_module("ops/fabric.csl", .{ .NQ = 6 });
+const matvec = @import_module("ops/mv.csl");
 const tile_config = @import_module("<tile_config>");
 const color_config = tile_config.color_config;
 const tgt = tile_config.target;
@@ -85,16 +86,12 @@ const ut_a = @get_ut_id(4);
 const ut_b = @get_ut_id(5);
 const ut_xa = @get_ut_id(2);
 const ut_xb = @get_ut_id(3);
-var fifo_buf = @zeros([FIFOW]f32);
-const fifo = @allocate_fifo(fifo_buf);
-var fifo_xbuf = @zeros([FIFOW]f32);
-const fifo_x = @allocate_fifo(fifo_xbuf);
+const rx = @import_module("ops/red.csl", .{ .fab = fab, .IN1 = q_xa, .IN2 = q_xb, .OUT = q_xo, .UT1 = ut_xa, .UT2 = ut_xb, .FIFOW = FIFOW });
+const ry = @import_module("ops/red.csl", .{ .fab = fab, .IN1 = q_ya, .IN2 = q_yb, .OUT = q_yo, .UT1 = ut_a, .UT2 = ut_b, .FIFOW = FIFOW });
 const NR: u16 = 16;
 const RQ: u16 = 1 + 2 * NR;
 var rcfg = @zeros([RQ + 26]u32);
 var rcfg_ptr: [*]u32 = &rcfg;
-var role_x: u16 = 0;
-var role_y: u16 = 0;
 var rwc: u16 = 0;
 fn init() void {
   fab.routes(&rcfg);
@@ -102,44 +99,20 @@ fn init() void {
   fab.bind_iqs(&fq, @as(u16, rcfg[RQ + 24]));
   fab.oqc(5, rcfg[RQ + 6]);
   fab.oqc(3, rcfg[RQ + 7]);
-  role_x = @as(u16, rcfg[RQ + 8]);
-  role_y = @as(u16, rcfg[RQ + 9]);
+  rx.role = @as(u16, rcfg[RQ + 8]);
+  ry.role = @as(u16, rcfg[RQ + 9]);
   rwc = @as(u16, rcfg[RQ + 11]);
   timestamp.enable_tsc();
   sys_mod.unblock_cmd_stream();
 }
-fn send_x(n: u16) void {
-  const d = yv(0, n);
-  const A = .{ .async = true, .ut_id = ut_xb };
-  if (role_x == 0) { @fmovs(fab.fout(q_xo, n), d, A); }
-  else if (role_x == 2) {
-    @fadds(fifo_x, fab.fin(q_xa, n), d, .{ .async = true, .ut_id = ut_xa });
-    @fadds(fab.fout(q_xo, n), fab.fin(q_xb, n), fifo_x, A);
-  } else { @fadds(fab.fout(q_xo, n), fab.fin(q_xa, n), d, A); }
-}
-fn send_y(n: u16) void {
-  const d = yv(0, n);
-  const A = .{ .async = true, .ut_id = ut_b };
-  if (role_y == 0) { @fmovs(fab.fout(q_yo, n), d, A); }
-  else if (role_y == 2) {
-    @fadds(fifo, fab.fin(q_ya, n), d, .{ .async = true, .ut_id = ut_a });
-    @fadds(fab.fout(q_yo, n), fab.fin(q_yb, n), fifo, A);
-  } else { @fadds(fab.fout(q_yo, n), fab.fin(q_ya, n), d, A); }
-}
+fn send_x(n: u16) void { rx.send(yv(0, n), n); }
+fn send_y(n: u16) void { ry.send(yv(0, n), n); }
 
 // ---------------------------------------------------------------- matvecs
-const mv_dest = @get_dsr(dsr_dest, 1);
-const mv_src0 = @get_dsr(dsr_src0, 1);
-const mv_src1 = @get_dsr(dsr_src1, 1);
-fn mvh_step(xv: @fp16()) void { @fmach(mv_dest, mv_src0, mv_src1, xv); }
 // y16[0..N) = dec (R rows of N) x xh[xo..xo+R), f16 accumulation
 fn mvd(R: u16, N: u16, xo: u16) void {
   const yh = @set_dsd_length(y16_d, N);
-  @fmovh(yh, @as(@fp16(), 0.0));
-  @load_to_dsr(mv_dest, yh, .{ .save_address = false });
-  @load_to_dsr(mv_src0, yh, .{ .save_address = false });
-  @load_to_dsr(mv_src1, @set_dsd_length(dec_d, N), .{ .save_address = true });
-  @map(mvh_step, @set_dsd_length(@increment_dsd_offset(xh_d, @as(i16, xo), @fp16()), R));
+  matvec.tile16(yh, @set_dsd_length(dec_d, N), @set_dsd_length(@increment_dsd_offset(xh_d, @as(i16, xo), @fp16()), R));
 }
 // decode n u16 words at wx[o] into dec[d0..d0 + 2n): high bytes, then low bytes
 fn dec2(o: u16, n: u16, d0: u16) void {

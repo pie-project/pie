@@ -1,0 +1,44 @@
+// wafer/ops/red.csl: one two-level chain reduction (README.md: the row and column reductions, the
+// head's), as a member PE or its root runs it. A chain's members add their partial to what
+// comes in and send it on; a group end merges level 1 and level 2 (level 1 through a FIFO); the
+// root merges the two last ends and sends the sum to its own loopback, which hands it back.
+//
+// A member's role (`role`, a host word): 0 the chain's start, 2 a group end, 1 / 3 add-forward.
+// Each reduction its own FIFO: a FIFO shared across the row reduction, the column reduction and a
+// segment gave wrong two-level row sums in unit 1's attention layer on the CS-3 (0730). A weight
+// PE's row reduction runs its async ops on microthreads 2 / 3, the ids of its input queues, as the
+// column's run on 4 / 5 (the two-level row reduction went wrong on the CS-3 with 4 / 5, 0727).
+//
+// Params: fab (ops/fabric.csl), IN1 a member's input (the root: level 1's end), IN2 a group
+// end's level 2 input (the root: level 2's end), OUT the send, LOOP the root's loopback, UT1 /
+// UT2 the FIFO op's and the send's microthreads (an async op runs on its queue id's microthread,
+// shared by iq N and oq N), FIFOW the FIFO's depth.
+param fab: imported_module;
+param IN1: input_queue;
+param IN2: input_queue;
+param OUT: output_queue;
+param LOOP: input_queue = IN2;
+param UT1: ut_id;
+param UT2: ut_id;
+param FIFOW: u16 = 32;
+
+var fifo_buf = @zeros([FIFOW]f32);
+const fifo = @allocate_fifo(fifo_buf);
+var role: u16 = 0;
+
+// A member's partial d (n words) into the chain.
+inline fn send(d: mem1d_dsd, n: u16) void {
+  const A = .{ .async = true, .ut_id = UT2 };
+  if (role == 0) { @fmovs(fab.fout(OUT, n), d, A); }
+  else if (role == 2) {
+    @fadds(fifo, fab.fin(IN1, n), d, .{ .async = true, .ut_id = UT1 });
+    @fadds(fab.fout(OUT, n), fab.fin(IN2, n), fifo, A);
+  } else { @fadds(fab.fout(OUT, n), fab.fin(IN1, n), d, A); }
+}
+
+// The root: the chain's sum (n words) into d.
+inline fn root(d: mem1d_dsd, n: u16) void {
+  @fmovs(fifo, fab.fin(IN1, n), .{ .async = true, .ut_id = UT1 });
+  @fadds(fab.fout(OUT, n), fab.fin(IN2, n), fifo, .{ .async = true, .ut_id = UT2 });
+  @fmovs(d, fab.fin(LOOP, n));
+}

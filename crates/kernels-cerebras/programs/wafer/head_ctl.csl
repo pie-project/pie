@@ -66,8 +66,7 @@ const q_wo = @get_output_queue(3);   // the chain's send (the root: the winner m
 const q_ww = @get_output_queue(4);   // the row word
 const ut_a = @get_ut_id(4);
 const ut_b = @get_ut_id(5);
-var fifo_buf = @zeros([FIFOW]f32);
-const fifo = @allocate_fifo(fifo_buf);
+const red = @import_module("ops/red.csl", .{ .fab = fab, .IN1 = q_e, .IN2 = q_w, .OUT = q_lo, .LOOP = q_lb, .UT1 = ut_a, .UT2 = ut_b, .FIFOW = FIFOW });
 const NR: u16 = 12;
 const RQ: u16 = 1 + 2 * NR;
 var rcfg = @zeros([RQ + 13]u32);   // (see the header)
@@ -138,9 +137,7 @@ task pass_task() void {
   var s: u32 = 0;
   while (s < n_steps) : (s += 1) {
     stamp(0);
-    @fmovs(fifo, fab.fin(q_e, VR), .{ .async = true, .ut_id = ut_a });
-    @fadds(fab.fout(q_lo, VR), fab.fin(q_w, VR), fifo, .{ .async = true, .ut_id = ut_b });
-    @fmovs(t_d, fab.fin(q_lb, VR));
+    red.root(t_d, VR);
     stamp(66);
     var best: f32 = t[0];
     var bi: u16 = 0;

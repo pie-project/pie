@@ -83,10 +83,14 @@ pub const KERNELS: &[(&str, &str)] = &[
 
 /// Every op module of `programs/wafer/ops`, by file name: the ops a role kernel imports with
 /// comptime params (`@import_module("ops/<name>", ..)`). A build writes them all beside the kinds.
-pub const OPS: &[(&str, &str)] = &[(
-    "fabric.csl",
-    include_str!("../programs/wafer/ops/fabric.csl"),
-)];
+pub const OPS: &[(&str, &str)] = &[
+    (
+        "fabric.csl",
+        include_str!("../programs/wafer/ops/fabric.csl"),
+    ),
+    ("mv.csl", include_str!("../programs/wafer/ops/mv.csl")),
+    ("red.csl", include_str!("../programs/wafer/ops/red.csl")),
+];
 
 /// The source of the kernel file `name`.
 pub fn get(name: &str) -> Option<&'static str> {

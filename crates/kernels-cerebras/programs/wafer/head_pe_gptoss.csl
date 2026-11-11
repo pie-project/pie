@@ -30,6 +30,7 @@ param HDc: u16;
 
 const sys_mod = @import_module("<memcpy/memcpy>", memcpy_params);
 const fab = @import_module("ops/fabric.csl", .{ .NQ = 6 });
+const matvec = @import_module("ops/mv.csl");
 const tile_config = @import_module("<tile_config>");
 const color_config = tile_config.color_config;
 const tgt = tile_config.target;
@@ -62,13 +63,11 @@ const q_vo = @get_output_queue(5);
 const C_PARK: color = @get_color(16);
 const ut_a = @get_ut_id(4);
 const ut_b = @get_ut_id(5);
-var fifo_buf = @zeros([32]f32);
-const fifo = @allocate_fifo(fifo_buf);
+const rr = @import_module("ops/red.csl", .{ .fab = fab, .IN1 = q_ra, .IN2 = q_rb, .OUT = q_ro, .UT1 = ut_a, .UT2 = ut_b, .FIFOW = 32 });
 const NR: u16 = 12;
 const RQ: u16 = 1 + 2 * NR;
 var rcfg = @zeros([RQ + 15]u32);
 var rcfg_ptr: [*]u32 = &rcfg;
-var role_r: u16 = 0;
 var role_x: u16 = 0;
 
 // ---------------------------------------------------------------- the wafer token loop
@@ -97,16 +96,12 @@ fn init() void {
   wfl = @as(u16, rcfg[RQ + 11]);
   he_addr = cc0 + @as(u16, rcfg[RQ + 13]);
   he_orig = @get_config(he_addr, tgt.color_addr_range) & 0xff;
-  role_r = @as(u16, rcfg[RQ + 8]);
+  rr.role = @as(u16, rcfg[RQ + 8]);
   role_x = @as(u16, rcfg[RQ + 9]);
   timestamp.enable_tsc();
   sys_mod.unblock_cmd_stream();
 }
 
-const mv_dest = @get_dsr(dsr_dest, 1);
-const mv_src0 = @get_dsr(dsr_src0, 1);
-const mv_src1 = @get_dsr(dsr_src1, 1);
-fn mvs_step(xv: @fp16()) void { @fmachs(mv_dest, mv_src0, mv_src1, xv); }
 
 fn recv_x() void {
   if (role_x == 0) {
@@ -116,14 +111,7 @@ fn recv_x() void {
     @fmovs(fab.fout(q_xo, HDc), x_d);
   }
 }
-fn send_r() void {
-  const A = .{ .async = true, .ut_id = ut_b };
-  if (role_r == 0) { @fmovs(fab.fout(q_ro, VR), y_d, A); }
-  else if (role_r == 2) {
-    @fadds(fifo, fab.fin(q_ra, VR), y_d, .{ .async = true, .ut_id = ut_a });
-    @fadds(fab.fout(q_ro, VR), fab.fin(q_rb, VR), fifo, A);
-  } else { @fadds(fab.fout(q_ro, VR), fab.fin(q_ra, VR), y_d, A); }
-}
+fn send_r() void { rr.send(y_d, VR); }
 fn he_restore() void {
   if (!he_dirty) { return; }
   while ((tile_config.output_queue_status.get_raw() & 0x1000) == 0) {}   // oq4 empty
@@ -177,10 +165,7 @@ task pass_task() void {
     @fs2h(xp_d, xr_d);
     @fmovs(y_d, 0.0);
     const a = @set_dsd_base_addr(a_d, @ptrcast([*]@fp16(), &hw[0]));
-    @load_to_dsr(mv_dest, y_d, .{ .save_address = false });
-    @load_to_dsr(mv_src0, y_d, .{ .save_address = false });
-    @load_to_dsr(mv_src1, a, .{ .save_address = true });
-    @map(mvs_step, xp_d);
+    matvec.mac32(y_d, a, xp_d);
     @fmuls(y_d, y_d, @bitcast(f32, @as(u32, @as(u16, 127 + e)) << 23));
     stamp(2);
     send_r();
