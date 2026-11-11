@@ -1270,11 +1270,17 @@ fn scale_codes(b: &mut Body, w: V, s: V, groups: i64, cols: i64) -> Built<V> {
 /// every row reads `rows · tokens` cells: at a 1792-token fire of
 /// Gemma-4-26B's 32-expert cut, 288 us a layer (v6e).
 ///
+/// The rows' tokens land in VMEM once, at the first step, and each chunk's
+/// are copied beside its rows by the vector unit: a step's copies are
+/// issued one by one, and at two copies a chunk issuing them cost more than
+/// moving their bytes (v6e, Qwen3.6-35B-A3B's cut, 1792 tokens: 127 of the
+/// sum's 148 us). A step waits its copies out on one descriptor.
+///
 /// Operands: `start`, `count`, `off` i32 `[blocks · experts]` (SMEM): the
 /// first row a block copies of each expert's run (a chunk boundary), the
 /// chunks it copies, and its first buffer row; `tok` i32 `[rows, 128]`,
 /// each row's token in all 128 lanes (-1 for a row no pair holds); `ys`
-/// `[rows, n]` bf16. The result is `[blocks · tb, n]` f32.
+/// `[rows, n]` bf16. The result is `[blocks · tb, n]` in `out`.
 #[derive(Clone, Copy, Debug)]
 pub struct SegmentSum {
     pub rows: i64,
@@ -1288,6 +1294,8 @@ pub struct SegmentSum {
     /// Buffer rows a block copies at most.
     pub depth: i64,
     pub vmem_cap: i64,
+    /// The result's element: f32, or the f32 sum rounded to bf16 once.
+    pub out: Elem,
 }
 
 impl SegmentSum {
@@ -1301,7 +1309,14 @@ impl SegmentSum {
 
     fn vmem(&self) -> i64 {
         let (r, n, tb) = (self.depth, self.n, self.tb);
-        2 * r * n * 2 + 2 * r * 128 * 4 + r * tb * 2 + r * n * 2 + 3 * tb * n * 4
+        let ob = i64::from(self.out.bits()) / 8;
+        self.rows * 128 * 4
+            + 2 * r * n * 2
+            + 2 * r * 128 * 4
+            + r * tb * 2
+            + r * n * 2
+            + tb * n * 4
+            + 2 * tb * n * ob
     }
 
     /// Whether the kernel's buffers fit VMEM.
@@ -1320,7 +1335,14 @@ impl SegmentSum {
             self.chunk,
             self.depth,
         );
-        if tb != 128 || c % 16 != 0 || r % c != 0 || n % 128 != 0 || rows % c != 0 || !self.fits() {
+        if tb != 128
+            || c % 16 != 0
+            || r % c != 0
+            || n % 128 != 0
+            || rows % c != 0
+            || !matches!(self.out, Elem::F32 | Elem::Bf16)
+            || !self.fits()
+        {
             return bad(format!("{self:?}"));
         }
         let any = |array: Vec<i64>, elem: Elem| Operand {
@@ -1330,9 +1352,10 @@ impl SegmentSum {
             window: Window::Any,
             index: Box::new(|b: &mut Body, _: &Grid| Ok(vec![b.i32(0), b.i32(0)])),
         };
+        let out_elem = self.out;
         let out = Operand {
             array: vec![nb * tb, n],
-            elem: Elem::F32,
+            elem: out_elem,
             block: vec![tb, n],
             window: Window::Blocked,
             index: Box::new(|b: &mut Body, g: &Grid| Ok(vec![g.ids[0], b.i32(0)])),
@@ -1353,21 +1376,24 @@ impl SegmentSum {
                 MTy::Ref(vec![2, r, n], Elem::Bf16, Space::Vmem),
                 MTy::Ref(vec![2, r, 128], Elem::I32, Space::Vmem),
                 MTy::Sem(vec![2]),
-                MTy::Sem(vec![2]),
+                MTy::Ref(vec![rows, 128], Elem::I32, Space::Vmem),
+                MTy::Sem(vec![1]),
             ],
         };
         kernel.build(|b, blk| {
-            let (ybuf, tbuf, ysems, tsems) = (
+            let (ybuf, tbuf, ysems, tokv, tsem) = (
                 blk.scratch[0],
                 blk.scratch[1],
                 blk.scratch[2],
                 blk.scratch[3],
+                blk.scratch[4],
             );
             let (tok, ys) = (blk.ins[0], blk.ins[1]);
             let pre = &blk.grid.prefetch;
             let s = blk.grid.ids[0];
-            // Block `at`'s copies into slot `slot`, started or waited for.
-            let copies = |b: &mut Body, at: V, slot: V, wait: bool| -> Built<()> {
+            // Block `at`'s copies into slot `slot`: its rows' chunks started,
+            // and their tokens copied from VMEM.
+            let copies = |b: &mut Body, at: V, slot: V| -> Built<()> {
                 let z = b.i32(0);
                 let ee = b.i32(e);
                 let one = b.i32(1);
@@ -1394,19 +1420,40 @@ impl SegmentSum {
                         let ydst = b.ref_squeeze(ydst)?;
                         let ysem = b.ref_slice(ysems, &[slot], &[1])?;
                         let ysem = b.ref_squeeze(ysem)?;
-                        let tsrc = b.ref_slice(tok, &[from, z], &[c, 128])?;
-                        let tdst = b.ref_slice(tbuf, &[slot, to, z], &[1, c, 128])?;
-                        let tdst = b.ref_squeeze(tdst)?;
-                        let tsem = b.ref_slice(tsems, &[slot], &[1])?;
-                        let tsem = b.ref_squeeze(tsem)?;
-                        if wait {
-                            b.dma_wait(ysem, ysrc, ydst)?;
-                            b.dma_wait(tsem, tsrc, tdst)
-                        } else {
-                            b.dma_start(ysrc, ydst, ysem)?;
-                            b.dma_start(tsrc, tdst, tsem)
-                        }
+                        b.dma_start(ysrc, ydst, ysem)?;
+                        let fi = b.as_index(from)?;
+                        let zi = b.index(0);
+                        let t = b.vload(tokv, &[fi, zi], &[c, 128])?;
+                        let t = b.shape_cast(t, &[1, c, 128])?;
+                        let si = b.as_index(slot)?;
+                        let ti = b.as_index(to)?;
+                        b.vstore(t, tbuf, &[si, ti, zi])
                     })
+                })
+            };
+            // Block `at`'s copies into slot `slot` waited for: as many chunks
+            // as it started, on one chunk's descriptor.
+            let waits = |b: &mut Body, at: V, slot: V| -> Built<()> {
+                let ne = b.i32(e);
+                let one = b.i32(1);
+                let last = b.addi(at, one)?;
+                let last = b.muli(last, ne)?;
+                let last = b.subi(last, one)?;
+                let li = b.as_index(last)?;
+                let cnt = b.load(pre[1], &[li])?;
+                let off = b.load(pre[2], &[li])?;
+                let cc = b.i32(c);
+                let total = b.divsi(off, cc)?;
+                let total = b.addi(total, cnt)?;
+                let z = b.i32(0);
+                b.for_range(z, total, one, |b, _| {
+                    let z = b.i32(0);
+                    let ysrc = b.ref_slice(ys, &[z, z], &[c, n])?;
+                    let ydst = b.ref_slice(ybuf, &[slot, z, z], &[1, c, n])?;
+                    let ydst = b.ref_squeeze(ydst)?;
+                    let ysem = b.ref_slice(ysems, &[slot], &[1])?;
+                    let ysem = b.ref_squeeze(ysem)?;
+                    b.dma_wait(ysem, ysrc, ydst)
                 })
             };
             let z = b.i32(0);
@@ -1414,8 +1461,11 @@ impl SegmentSum {
             let slot = b.remsi(s, two)?;
             let at0 = b.cmpi(ICmp::Eq, s, z)?;
             // The buffers start zeroed: a row no block copied yet holds no
-            // NaN for the one-hot's zeros to meet.
+            // NaN for the one-hot's zeros to meet. The rows' tokens land
+            // whole.
             b.when(at0, |b| {
+                let sem = b.ref_squeeze(tsem)?;
+                b.dma_start(tok, tokv, sem)?;
                 let zy = b.splat_f(&[1, r, n], Elem::Bf16, 0.0)?;
                 let zt = b.splat_i(&[1, r, 128], -1)?;
                 for slot in 0..2 {
@@ -1424,10 +1474,11 @@ impl SegmentSum {
                     b.vstore(zy, ybuf, &[at, zi, zi])?;
                     b.vstore(zt, tbuf, &[at, zi, zi])?;
                 }
+                b.dma_wait(sem, tok, tokv)?;
                 let z = b.i32(0);
-                copies(b, z, z, false)
+                copies(b, z, z)
             })?;
-            copies(b, s, slot, true)?;
+            waits(b, s, slot)?;
             let one = b.i32(1);
             let next = b.addi(s, one)?;
             let last = b.i32(nb);
@@ -1435,7 +1486,7 @@ impl SegmentSum {
             b.when(more, |b| {
                 let one = b.i32(1);
                 let other = b.subi(one, slot)?;
-                copies(b, next, other, false)
+                copies(b, next, other)
             })?;
             let z = b.i32(0);
             let held = b.ref_slice(tbuf, &[slot, z, z], &[1, r, 128])?;
@@ -1455,6 +1506,7 @@ impl SegmentSum {
             let rows = b.vload_all(rows)?;
             let acc = b.splat_f(&[tb, n], Elem::F32, 0.0)?;
             let y = b.matmul_tl(hot, rows, acc)?;
+            let y = b.convert_f(y, out_elem)?;
             b.vstore_all(y, blk.outs[0])
         })
     }
