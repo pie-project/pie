@@ -50,6 +50,20 @@ impl Rig {
         h
     }
 
+    /// `v` uploaded: a handle on the whole buffer, and one bound at each of
+    /// `offsets` into it (a plane bound at its rows of page 0).
+    fn upload_at(&self, v: &[u8], offsets: &[u64]) -> (u32, Vec<u32>) {
+        let mut b = Buffer::zeroed(&self.dev, (v.len() as u64).max(16)).unwrap();
+        b.write(0, v).unwrap();
+        let whole = self.handles.bind(&b, 0, b.bytes()).unwrap();
+        let at = offsets
+            .iter()
+            .map(|&offset| self.handles.bind(&b, offset, b.bytes() - offset).unwrap())
+            .collect();
+        self.keep.borrow_mut().push(b);
+        (whole, at)
+    }
+
     fn tensor(&self, v: &[u8], rows: usize, width: usize, dtype: Dtype) -> Tensor {
         Tensor::new(self.upload(v), rows as u32, width as u32, dtype)
     }
@@ -160,7 +174,6 @@ fn agree(
         head_stride: d as u64,
         q8: kind == Kind::Q8,
         page_stride: [0; 2],
-        plane_offset: [0; 2],
     };
     // Today's pool: a buffer a plane, pages packed from its origin.
     let dense_k = rig.upload(&vec![POISON; (page_bytes * pages as u64) as usize]);
@@ -168,14 +181,17 @@ fn agree(
     let dense = base_pool(dense_k, dense_v).paged_densely();
     assert_eq!(dense.page_stride, [page_bytes, page_bytes]);
     // One buffer: page `p`'s keys at `GAP + p * stride`, its values a page
-    // and a gap later, a gap after them.
+    // and a gap later, a gap after them; each plane bound at its rows of
+    // page 0.
     let stride = 2 * page_bytes + 3 * GAP;
     let slab_bytes = stride * pages as u64 + GAP;
-    let slab = rig.upload(&vec![POISON; slab_bytes as usize]);
+    let (slab, planes) = rig.upload_at(
+        &vec![POISON; slab_bytes as usize],
+        &[GAP, 2 * GAP + page_bytes],
+    );
     let scattered = KvPool {
         page_stride: [stride, stride],
-        plane_offset: [GAP, 2 * GAP + page_bytes],
-        ..base_pool(slab, slab)
+        ..base_pool(planes[0], planes[1])
     };
 
     let what = format!("{kind:?} d={d} m={m} page={page}");

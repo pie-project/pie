@@ -63,13 +63,16 @@ pub struct KvPool {
     pub q8: bool,
 
     /// Bytes from one page to the next, keys then values
-    /// (`kernels/prim/kv_page.h`).
+    /// (`kernels/prim/kv_page.h`). Each plane's tensor is bound at its rows
+    /// of page 0 (a layer's offset into a page is the binding's offset).
     pub page_stride: [u64; 2],
-
-    /// Bytes from each bound plane's origin to this pool's rows of page 0,
-    /// keys then values.
-    pub plane_offset: [u64; 2],
 }
+
+/// The plane offset every paged kernel takes after the page strides: always
+/// 0, since a pool binds each plane at its offset into a page
+/// (`setBuffer:offset:`). A runtime offset applied inside the kernels cost
+/// paged decode attention ~1.4% of a gemma-4-e4b decode token (M1 Max).
+pub const PLANE_AT_BINDING: u64 = 0;
 
 impl KvPool {
     /// The page stride of a plane that is its own run of `page_size`-row
@@ -94,20 +97,19 @@ impl KvPool {
                 Self::dense_page_stride(self.keys, self.page_size, self.head_stride),
                 Self::dense_page_stride(self.values, self.page_size, self.head_stride),
             ],
-            plane_offset: [0, 0],
             ..self
         }
     }
 
     /// The four arguments every paged kernel takes last: each plane's page
-    /// stride, then each plane's offset.
+    /// stride, then each plane's offset ([`PLANE_AT_BINDING`]).
     #[must_use]
     pub fn page_args(&self) -> [ArgValue; 4] {
         [
             ArgValue::Usize(self.page_stride[0]),
             ArgValue::Usize(self.page_stride[1]),
-            ArgValue::Usize(self.plane_offset[0]),
-            ArgValue::Usize(self.plane_offset[1]),
+            ArgValue::Usize(PLANE_AT_BINDING),
+            ArgValue::Usize(PLANE_AT_BINDING),
         ]
     }
 }
