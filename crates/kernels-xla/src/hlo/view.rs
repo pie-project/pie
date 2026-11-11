@@ -358,7 +358,7 @@ impl Func {
             };
             (rc, Some(off))
         };
-        if aligned && g % len == 0 && k > 1 && crate::blocks::on() {
+        if aligned && g % len == 0 && k > 1 && crate::blocks::on() && !self.xla_reads {
             // Whole blocks by DMA, any number of rows: no element
             // reinterpreted (`crate::blocks`).
             let at = self.block_of(row, nr)?;
