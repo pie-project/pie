@@ -4,6 +4,7 @@
 
 use super::abi::{Kernels, Overrides};
 use super::block::Block;
+use super::compose::{self, Needs};
 use super::fabric::{Fabric, Palette};
 use super::family::{self, Family};
 use super::floor::{Floor, FloorBuilder};
@@ -34,9 +35,24 @@ impl Program {
     /// links, then settles the floor on them; the palette is the blocks' colours; lay the fabric
     /// and validate it (its invariants); the family's kernels, every PE's routes within its
     /// kernel's route table; the blocks' param overrides. Pure (no device, no files).
+    /// The blocks are the composer's ([`compose`]) from what the layers need, the family's
+    /// where the composer has none for a need yet.
     pub fn build(family: Box<dyn Family>, plan: Plan) -> Result<Program, String> {
         plan.validate()?;
-        let blocks = family.blocks(&plan)?;
+        let blocks = match compose::blocks(&plan, &Needs::of_shape(&plan.shape))? {
+            Some(b) => b,
+            None => family.blocks(&plan)?,
+        };
+        Program::build_with(blocks, family, plan)
+    }
+
+    /// The physical build of a plan over `blocks` ([`Program::build`]).
+    pub fn build_with(
+        blocks: Vec<Box<dyn Block>>,
+        family: Box<dyn Family>,
+        plan: Plan,
+    ) -> Result<Program, String> {
+        plan.validate()?;
         let mut fb = FloorBuilder::default();
         for b in &blocks {
             b.floor(&plan, &mut fb)?;

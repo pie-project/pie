@@ -18,6 +18,7 @@ pub mod abi;
 pub mod artifact;
 pub mod block;
 pub mod build;
+pub mod compose;
 pub mod emit;
 pub mod fabric;
 pub mod family;

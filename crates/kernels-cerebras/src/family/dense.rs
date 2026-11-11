@@ -10,6 +10,7 @@ use crate::block::head::{HeadCopies, HeadEast, Hemb};
 use crate::block::segments::{Onorm, Scores};
 use crate::block::token_loop::TokenLoop;
 use crate::block::units::{UnitCopies, Units};
+use crate::compose::snake_gap;
 use crate::family::{Family, MadeFor, Row, table, units_of};
 use crate::floor::{UnitGrid, UnitLayout};
 use crate::kernels::dense;
@@ -26,19 +27,6 @@ mod cut;
 type R<T> = Result<T, String>;
 
 pub struct Dense;
-
-/// The unit slots' gap: none when the units fill the grid; one slot short, the last column's
-/// row-1 slot stays out of the snake (the last unit still ends on row 0, the token loop's
-/// return), on an even number of unit columns below the turn row.
-fn gap(units: u32, (unx, uny): (u32, u32)) -> R<Option<(u32, u32)>> {
-    match (unx * uny).checked_sub(units) {
-        Some(0) => Ok(None),
-        Some(1) if unx % 2 == 0 && uny >= 3 => Ok(Some((unx - 1, 1))),
-        _ => Err(format!(
-            "dense: {units} units on {unx} x {uny} slots (at most one gap slot, on an even number of unit columns, below the turn row)"
-        )),
-    }
-}
 
 /// The presets: weight columns and rows a unit (PX, PY), the unit slots (UNX x UNY; the units are
 /// the layers over K, one short of the slots leaves a gap slot), layers a unit (K), the head's rows
@@ -118,7 +106,7 @@ impl Family for Dense {
         let (px, py, k) = (pr.need("PX")?, pr.need("PY")?, pr.need("K")?);
         let unit_grid = (pr.need("UNX")?, pr.need("UNY")?);
         let units = units_of(&s.layers, k, "dense")?;
-        gap(units, unit_grid)?;
+        snake_gap(units, unit_grid)?;
         let pattern = &s.layers[..k as usize];
         if s.layers.chunks(k as usize).any(|u| u != pattern) {
             return Err("dense: every unit the same layer kinds".into());
@@ -262,7 +250,7 @@ impl Family for Dense {
                     unx: ug.0,
                     uny: ug.1,
                     up_first: false,
-                    gaps: gap(p.units, ug)?.into_iter().collect(),
+                    gaps: snake_gap(p.units, ug)?.into_iter().collect(),
                 },
                 layers_per_unit: p.layers_per_unit,
             },
