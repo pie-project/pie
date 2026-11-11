@@ -5,6 +5,8 @@ pub enum StarveCause {
     NoSwapRoom,
     NoEligibleVictim,
     NoRsSlots,
+    /// The victim alone holds what the pool holds, and nothing of it runs.
+    SoleHolder,
 }
 
 impl StarveCause {
@@ -16,6 +18,12 @@ impl StarveCause {
             StarveCause::NoEligibleVictim => {
                 "no evictable victim — every page is held by a process OLDER \
                  than the head, which FCFS anti-thrash forbids evicting"
+            }
+            StarveCause::SoleHolder => {
+                "this process alone holds what the pool holds and nothing of it is running \
+                 to free any: its parked ask cannot be placed beside what it holds, and a \
+                 restart would replay the same asks into the same wall — run fewer lanes at \
+                 once or raise device_kv_budget"
             }
             StarveCause::NoRsSlots => {
                 "every RS folded slot is held and no admitted process is still \

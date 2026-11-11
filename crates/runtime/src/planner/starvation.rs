@@ -124,6 +124,12 @@ impl ResidencyPlanner {
         let Some(victim_key) = self.pick_starvation_victim(cause) else {
             return;
         };
+        // A victim that alone holds anything in the pool, with nothing of
+        // it running, replays into the same stall: it fails, not restarts.
+        let cause = match self.with_inner(|inner| inner.queue.get(&victim_key).map(|w| w.pid)) {
+            Some(victim) if self.sole_holder(victim) => StarveCause::SoleHolder,
+            _ => cause,
+        };
         let (rs_free, rs_total) = self.port.rs_stats();
         let notify = self.with_inner(|inner| {
             let (_, head) = inner.unmet_head()?;
@@ -166,7 +172,8 @@ impl ResidencyPlanner {
         });
         if let Some((notify, victim_pid)) = notify {
             self.stats.starvations.fetch_add(1, Ordering::Relaxed);
-            let restarting = crate::inferlet::process::request_restart(victim_pid);
+            let restarting = cause != StarveCause::SoleHolder
+                && crate::inferlet::process::request_restart(victim_pid);
             if restarting {
                 self.stats
                     .starvation_restarts
@@ -185,6 +192,29 @@ impl ResidencyPlanner {
             }
             notify.notify_waiters();
         }
+    }
+
+    /// `pid` holds all that is held in the pool: no other process holds kv
+    /// pages or state, none is on its way back, and no idle cache could go.
+    /// Stalled (nothing of it in flight), it is stuck on what it holds
+    /// itself, and a restart frees only that to ask for the same again.
+    pub(super) fn sole_holder(&self, pid: ProcessId) -> bool {
+        let (model, engine) = self.port.locus();
+        let (others, quiet) = self.with_inner(|inner| {
+            let others: Vec<ProcessId> = inner
+                .procs
+                .keys()
+                .filter(|other| **other != pid)
+                .copied()
+                .collect();
+            (others, inner.evicting.is_empty())
+        });
+        quiet
+            && self.port.reclaimable_idle() == 0
+            && others.into_iter().all(|other| {
+                held_page_count(other, model, engine) == 0
+                    && held_rs_units(other, model, engine).is_zero()
+            })
     }
 
     fn pick_starvation_victim(&self, cause: StarveCause) -> Option<EntryKey> {

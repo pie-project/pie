@@ -1607,3 +1607,164 @@ fn a_process_whose_own_asks_fit_the_pool_is_not_failed_as_overcommitted() {
     assert_eq!(unfailed(&planner, &keys), 2);
     drop(terminate(&planner, process));
 }
+
+/// text-completion-bench, 96 MiB, a 5,000-token lane beside seven short
+/// ones: the short lanes' fires ran while the long lane parked, and a
+/// process with any lane parked read as stalled. The fleet looked wedged,
+/// and the process was reclaimed and replayed some 1,600 times before the
+/// long ask parked with nothing else running and failed. A process with a
+/// fire of its own in flight is making progress: its parked lane waits for
+/// that fire to settle, and only then is the process stalled.
+#[test]
+fn a_parked_lane_beside_its_process_s_fires_in_flight_is_no_wedge() {
+    let _schedule = crate::policy::schedule::TEST_LOCK.blocking_read();
+    let model = crate::store::registry::register_model(16, &[64], &[2]);
+    let planner = Arc::new(ResidencyPlanner::new(departure_pool(model)));
+    let process = leaving(&planner, model, false);
+    let pid = process.pid;
+    crate::inferlet::process::declare_restartable(pid);
+    let keys = park_asks(&planner, pid, &[4]);
+    let fire = planner.fire_in_flight(pid);
+    assert!(!planner.is_wedged(), "its peer lane's fire is running");
+    planner.check_starvation(StarveCause::NoSwapRoom);
+    assert_eq!(
+        unfailed(&planner, &keys),
+        1,
+        "nothing is reclaimed meanwhile"
+    );
+    assert_eq!(
+        planner.stats.starvation_restarts.load(Ordering::Relaxed),
+        0,
+        "no restart while it runs"
+    );
+    // The fire settles: nothing of the process runs, and the settling's own
+    // poke finds the parked ask a wedge as before.
+    drop(fire);
+    assert_eq!(unfailed(&planner, &keys), 0, "the settling looks again");
+    drop(terminate(&planner, process));
+}
+
+/// A fire can wait on its guest (a host-written input) while the guest waits
+/// on the parked lane. A fire standing unsettled past `FIRE_PROGRESS`
+/// counts for nothing, so such a process is stalled as before rather than
+/// waited on forever; the parked waiters' own clock tells the planner once.
+#[test]
+fn a_fire_unsettled_past_its_progress_window_no_longer_holds_the_wedge_off() {
+    let _schedule = crate::policy::schedule::TEST_LOCK.blocking_read();
+    let model = crate::store::registry::register_model(16, &[64], &[2]);
+    let planner = Arc::new(ResidencyPlanner::new(departure_pool(model)));
+    let process = leaving(&planner, model, false);
+    let pid = process.pid;
+    park_asks(&planner, pid, &[4]);
+    let fire = planner.fire_in_flight(pid);
+    assert!(!planner.is_wedged());
+    let lapsed = crate::rt::Instant::now()
+        .checked_sub(super::in_flight::FIRE_PROGRESS + Duration::from_millis(1))
+        .expect("the clock reaches back that far");
+    planner.with_inner(|inner| inner.procs.get_mut(&pid).unwrap().fired_at = lapsed);
+    assert!(
+        planner.is_wedged(),
+        "a fire that does not settle is no progress"
+    );
+    planner.note_lapsed_fires();
+    assert!(
+        planner.with_inner(|inner| inner.procs[&pid].fire_lapsed),
+        "told once"
+    );
+    drop(fire);
+    assert!(
+        planner.with_inner(|inner| !inner.procs[&pid].fire_lapsed && inner.procs[&pid].fires == 0),
+        "a settling starts its clock again"
+    );
+    drop(terminate(&planner, process));
+}
+
+/// A fire begun for a process the planner does not know, or that leaves
+/// while it runs, counts nothing and leaves nothing behind.
+#[test]
+fn a_fire_of_a_process_unknown_or_gone_counts_nothing() {
+    let planner = Arc::new(ResidencyPlanner::new(Arc::new(RacePool::new(8))));
+    let stranger = ProcessId::new_v4();
+    drop(planner.fire_in_flight(stranger));
+    let pid = ProcessId::new_v4();
+    planner.register(pid);
+    let fire = planner.fire_in_flight(pid);
+    let again = planner.fire_in_flight(pid);
+    assert_eq!(planner.with_inner(|inner| inner.procs[&pid].fires), 2);
+    drop(again);
+    assert_eq!(planner.with_inner(|inner| inner.procs[&pid].fires), 1);
+    planner.unregister(pid);
+    drop(fire);
+    assert!(planner.with_inner(|inner| !inner.procs.contains_key(&pid)));
+}
+
+/// text-completion-bench, 96 MiB, a 5,000-token lane beside seven short
+/// ones: once nothing of the process ran, its sixth short lane parked for a
+/// state slot its own five held sets and scattered pages left no chunk for.
+/// It held all the pool held, so the restart freed only its own and the
+/// replay stalled in the same place, hundreds of times a minute. A stalled
+/// victim that alone holds anything fails instead, saying so.
+#[test]
+fn a_stalled_process_that_alone_holds_the_pool_fails_instead_of_restarting() {
+    let _schedule = crate::policy::schedule::TEST_LOCK.blocking_read();
+    let model = crate::store::registry::register_model(16, &[64], &[2]);
+    let planner = Arc::new(ResidencyPlanner::new(departure_pool(model)));
+    let process = leaving(&planner, model, false);
+    let pid = process.pid;
+    crate::inferlet::process::declare_restartable(pid);
+    let keys = park_asks(&planner, pid, &[4]);
+    assert!(planner.sole_holder(pid));
+    planner.check_starvation(StarveCause::NoSwapRoom);
+    planner.with_inner(|inner| {
+        let WaitKind::Allocation {
+            outcome: Some(Err(error)),
+            ..
+        } = &inner.queue[&keys[0]].kind
+        else {
+            panic!("the parked ask fails");
+        };
+        assert!(
+            matches!(
+                error,
+                PlannerError::Starved {
+                    cause: StarveCause::SoleHolder,
+                    ..
+                }
+            ),
+            "{error}"
+        );
+        assert!(
+            error.to_string().contains("this process alone holds"),
+            "{error}"
+        );
+    });
+    assert_eq!(
+        planner.stats.starvation_restarts.load(Ordering::Relaxed),
+        0,
+        "no replay into the same wall"
+    );
+    drop(terminate(&planner, process));
+}
+
+/// Where another process holds pages, the reclaim keeps its say: a restart
+/// of the youngest frees what the others may then take.
+#[test]
+fn a_stalled_process_beside_another_holder_is_still_reclaimed_by_restart() {
+    let _schedule = crate::policy::schedule::TEST_LOCK.blocking_read();
+    let model = crate::store::registry::register_model(16, &[64], &[2]);
+    let planner = Arc::new(ResidencyPlanner::new(departure_pool(model)));
+    let older = leaving(&planner, model, false);
+    let younger = leaving(&planner, model, false);
+    crate::inferlet::process::declare_restartable(younger.pid);
+    park_asks(&planner, older.pid, &[3]);
+    park_asks(&planner, younger.pid, &[3]);
+    assert!(!planner.sole_holder(younger.pid));
+    planner.check_starvation(StarveCause::NoSwapRoom);
+    assert_eq!(
+        planner.stats.starvation_restarts.load(Ordering::Relaxed),
+        1,
+        "the younger holder is reclaimed"
+    );
+    drop(terminate(&planner, younger));
+    drop(terminate(&planner, older));
+}
