@@ -1216,3 +1216,13 @@ The `new-memory/` directory is bookkeeping and is removed before anything lands 
   new-memory 11236 (-4.4%), with fix 11825 (+0.6%); c256 all within 1%. runtime lib 297 pass.
 - Found: gemma-4-E2B fails to boot on new-memory (CUDA 700 preparing the last wide bucket 4096) since between M67 and
   M92 (rt5); M67 build boots. Owner assigned (bisect).
+
+### M99 — 2026-11-11: window models reuse prefixes at any length (A20)
+- `sc/rt8-window-prefix` (0aaf75a29, RT8): automatic checkpoint at a page-aligned pass end (eac8052c6); a pass
+  ending inside a page checkpoints at the last page boundary via RsStore::checkpoint_at, holding the window slots
+  [b - w, b) (WindowAdvance::keep stops the fire trimming them); resumes copy shared tails via slot_copies.
+- gpt-oss-20b (sm_120) p2048 after a shared 512 prefix: 93-97 ms vs main 96-97 ms (was 117 ms, -25%); cold 2048
+  ~4% faster than main; no unrecorded fires. gemma-4-E2B (pre-merge): 67.5 -> 55 ms with prefix, main reuses none.
+  runtime store 126 / planner 51 / pipeline 16 pass.
+- Open: gpt-oss resumed tokens differ from cold in 3-4/6 seeds (likely split-prefill MoE near-ties; main reuse
+  control pending).
