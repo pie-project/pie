@@ -464,15 +464,20 @@ impl Shell {
             };
             let name = &trace.params[codes].name;
             let missing = |what: &str| Fault::Unbound {
-                what: format!("the {what} of streamed routed bank `{name}`, which no cache streams"),
+                what: format!(
+                    "the {what} of streamed routed bank `{name}`, which no cache streams"
+                ),
             };
             let at = |param: Option<usize>, what: &str| -> Result<Option<kernels_metal::Tensor>> {
                 param
                     .map(|p| planes.get(&p).map(|t| t.at).ok_or_else(|| missing(what)))
                     .transpose()
             };
-            let scales = at(Some(named(format!("{name}{}", poem_ir::SCALES)).ok_or_else(|| missing("scales"))?), "scales")?
-                .ok_or_else(|| missing("scales"))?;
+            let scales = at(
+                Some(named(format!("{name}{}", poem_ir::SCALES)).ok_or_else(|| missing("scales"))?),
+                "scales",
+            )?
+            .ok_or_else(|| missing("scales"))?;
             let biases = at(named(format!("{name}{}", poem_ir::BIASES)), "zero points")?;
             let bias = trace.nodes.iter().find_map(|node| match &node.op {
                 Operation::Linear(poem_ir::Linear::MoeSelect {
@@ -483,10 +488,14 @@ impl Shell {
                 _ => None,
             });
             let bias = at(bias, "expert bias")?;
-            let hits = [Some(codes), named(format!("{name}{}", poem_ir::SCALES)), named(format!("{name}{}", poem_ir::BIASES))]
-                .into_iter()
-                .flatten()
-                .find_map(|p| planes.get(&p).and_then(|t| t.hits));
+            let hits = [
+                Some(codes),
+                named(format!("{name}{}", poem_ir::SCALES)),
+                named(format!("{name}{}", poem_ir::BIASES)),
+            ]
+            .into_iter()
+            .flatten()
+            .find_map(|p| planes.get(&p).and_then(|t| t.hits));
             weights.read_through(
                 codes,
                 Streamed::Bank(kernels_metal::linear::moe::BankTable {
@@ -741,13 +750,7 @@ impl PreparedLoad<'_> {
         let weight_caches = if boot.residency.whole_weights() {
             Vec::new()
         } else {
-            Shell::weight_caches(
-                &device,
-                &handles,
-                &mut weights,
-                &boot.trace,
-                &recipe,
-            )?
+            Shell::weight_caches(&device, &handles, &mut weights, &boot.trace, &recipe)?
         };
         // A weight kept apart that no cache takes is read whole, in place.
         let claimed: std::collections::BTreeSet<usize> = weight_caches
@@ -1318,6 +1321,25 @@ impl Shell {
         self.pools.copy_slots(&mut frame, copy)?;
         self.grafted = Some(frame.commit_async(None)?);
         Ok(())
+    }
+
+    /// See `Engine::read_tier_slots`: every frame and copy lands first.
+    pub fn read_tier_slots(
+        &mut self,
+        slots: &[(engine::chunk::ShapeId, Vec<u32>)],
+    ) -> Result<Vec<u8>> {
+        self.drain()?;
+        self.pools.read_tier_slots(slots)
+    }
+
+    /// See `Engine::write_tier_slots`: every frame and copy lands first.
+    pub fn write_tier_slots(
+        &mut self,
+        slots: &[(engine::chunk::ShapeId, Vec<u32>)],
+        bytes: &[u8],
+    ) -> Result<()> {
+        self.drain()?;
+        self.pools.write_tier_slots(slots, bytes)
     }
 
     pub fn open(&mut self, slot: u32) -> Result<()> {
@@ -4321,4 +4343,3 @@ fn covers(ceiling: &FireRows, fire: &FireRows) -> bool {
         && fire.clips <= ceiling.clips
         && fire.readouts <= ceiling.readouts
 }
-

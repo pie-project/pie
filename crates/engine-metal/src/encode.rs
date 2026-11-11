@@ -210,7 +210,8 @@ impl<'a> Sink<'a> {
             };
             let event =
                 objc2::runtime::ProtocolObject::<dyn objc2_metal::MTLEvent>::from_ref(&**event);
-            self.frame.fence(event, stamp, signal)
+            self.frame
+                .fence(event, stamp, signal)
                 .map_err(|fault| Error::Backend {
                     op,
                     detail: fault.to_string(),

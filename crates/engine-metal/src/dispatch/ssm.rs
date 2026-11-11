@@ -20,12 +20,12 @@ impl Run<'_> {
     fn ssm(&mut self, op: &Ssm) -> Result<(), kernels_metal::Error> {
         match op {
             // The committed walk's conv takes no bias.
-            Ssm::CausalConv1d { bias: Some(_), x, .. }
-            | Ssm::CausalConv1dChunked { bias: Some(_), x, .. }
-                if self.rs_buffers(*x) =>
-            {
-                Err(kernels_metal::Error::Unsupported { op: op.name() })
+            Ssm::CausalConv1d {
+                bias: Some(_), x, ..
             }
+            | Ssm::CausalConv1dChunked {
+                bias: Some(_), x, ..
+            } if self.rs_buffers(*x) => Err(kernels_metal::Error::Unsupported { op: op.name() }),
             Ssm::Mamba2 { .. } | Ssm::Mamba2Chunked { .. } if self.rs_seat().is_some() => {
                 Err(kernels_metal::Error::Unsupported { op: op.name() })
             }

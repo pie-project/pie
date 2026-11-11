@@ -114,15 +114,18 @@ fn read_only_by(trace: &Trace, at: usize, reads: impl Fn(&Operation) -> bool) ->
 /// table) with their scales and zero points.
 #[must_use]
 pub fn streamed_rows(trace: &Trace) -> Vec<usize> {
+    use poem_ir::Dtype;
     use poem_ir::Gather;
     use poem_ir::residency::{Residency, leads, residency};
-    use poem_ir::Dtype;
     let classes = residency(trace);
     let mut tables: Vec<usize> = (0..trace.params.len())
         .filter(|&at| {
             let param = &trace.params[at];
             matches!(classes[at], Residency::Rows(_))
-                && matches!(param.dtype, Dtype::Bf16 | Dtype::U4g64 | Dtype::U4g32 | Dtype::U8g64)
+                && matches!(
+                    param.dtype,
+                    Dtype::Bf16 | Dtype::U4g64 | Dtype::U4g32 | Dtype::U8g64
+                )
                 && param.shape.len() == 2
                 && param.source == poem_ir::ParamSource::Checkpoint
                 && read_only_by(trace, at, |op| {

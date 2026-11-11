@@ -1190,10 +1190,7 @@ impl<'c> Run<'c> {
     pub(crate) fn region_nodes(&self) -> Option<(std::ops::Range<u32>, bool)> {
         let region = self.regions?.get(self.place.region.get() as usize)?;
         let window = self.window();
-        Some((
-            region.nodes.clone(),
-            window.gathered.is_none(),
-        ))
+        Some((region.nodes.clone(), window.gathered.is_none()))
     }
 
     pub(crate) fn ane(&self) -> Option<&'c crate::ane::Ane> {
@@ -1700,10 +1697,7 @@ impl<'c> Run<'c> {
 
     /// The tables a quantized routed bank `id` is read through, where the
     /// weight cache streams it an expert at a time.
-    pub(crate) fn bank_table(
-        &self,
-        id: ValueId,
-    ) -> Option<kernels_metal::linear::moe::BankTable> {
+    pub(crate) fn bank_table(&self, id: ValueId) -> Option<kernels_metal::linear::moe::BankTable> {
         match self.streamed(id)? {
             crate::store::streamed::Streamed::Bank(table) => Some(table),
             _ => None,

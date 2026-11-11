@@ -1,18 +1,18 @@
 //! engine-metal's integration tests, one binary: each module was a test file.
 
 mod a_buffered_fold_is_the_fold_it_replaces;
-mod a_fire_packs_no_more_windows_than_the_load_reserved;
 mod a_column_cut_of_a_bank_multiplies_as_its_copy;
 mod a_copied_window_is_one_encode_over_the_same_rows;
 mod a_fenced_frame_lands_both_sides;
+mod a_fire_packs_no_more_windows_than_the_load_reserved;
 mod a_gate_and_an_up_apart_land_what_they_land_packed;
 mod a_parked_lane_serves_the_never_parked_logits;
 mod a_prompt_scan_lands_its_snapshots;
 mod a_scattered_kv_pool_is_the_dense_one;
 mod a_scattered_pool_serves_the_same_logits;
-mod a_tabled_routed_bank_reads_as_its_contiguous_bank;
 mod a_scattered_state_bank_is_the_slab;
 mod a_score_capture_reads_its_own_lists_last_page;
+mod a_tabled_routed_bank_reads_as_its_contiguous_bank;
 mod a_ternary_decode_in_dot_answers_the_host_decoder;
 mod a_tower_region_reads_the_patch_window;
 mod a_verify_walk_is_the_committed_walk;
