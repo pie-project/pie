@@ -344,13 +344,13 @@ impl Sink<'_> {
                         ));
                     }
                     let range = u64::from(self.device.core.limits.max_storage_buffer_range);
-                    storage_view_fits(infos.len(), remaining, range)
+                    let view = storage_view(infos.len(), remaining, binding.extent(), range)
                         .map_err(|detail| Sink::backend(fire, detail))?;
                     infos.push(
                         vk::DescriptorBufferInfo::default()
                             .buffer(binding.slab().buffer)
                             .offset(binding.offset())
-                            .range(remaining),
+                            .range(view),
                     );
                     writes_at.push(mutable);
                     extents.push(binding.extent());
@@ -616,31 +616,37 @@ pub(crate) fn qmm_ladder(
         .collect()
 }
 
-/// Whether argument `at`'s view of `bytes` fits one storage descriptor. A
-/// range past `maxStorageBufferRange` is invalid usage that drivers answer
-/// by binding a truncated view, so it is refused here.
+/// The range argument `at` binds: the `remaining` bytes of its slab from its
+/// offset, or, where those run past `maxStorageBufferRange` (a range drivers
+/// answer by binding a truncated view) and the `extent` it states fits, the
+/// largest range the device binds, which holds every byte the kernel reads.
+/// A view whose own extent is past the limit is refused: no descriptor
+/// holds it, so its slab must be split.
 #[cfg_attr(not(feature = "vulkan"), allow(dead_code))]
-fn storage_view_fits(at: usize, bytes: u64, limit: u64) -> Result<(), String> {
-    if bytes <= limit {
-        return Ok(());
+fn storage_view(at: usize, remaining: u64, extent: u64, limit: u64) -> Result<u64, String> {
+    if remaining <= limit {
+        return Ok(remaining);
+    }
+    if extent <= limit {
+        return Ok(limit);
     }
     Err(format!(
-        "argument {at} binds a {bytes}-byte view, past this device's \
-         maxStorageBufferRange of {limit} bytes; a view is never clamped, so \
-         the slab must be split to fit the binding"
+        "argument {at} binds a {extent}-byte view, past this device's \
+         maxStorageBufferRange of {limit} bytes; the slab must be split to fit \
+         the binding"
     ))
 }
 
 #[cfg(test)]
 mod tests {
-    use super::storage_view_fits;
+    use super::storage_view;
 
     #[test]
     fn a_view_past_the_storage_range_is_refused_with_its_sizes() {
         const LIMIT: u64 = 128 << 20;
-        assert_eq!(storage_view_fits(0, 4, LIMIT), Ok(()));
-        assert_eq!(storage_view_fits(1, LIMIT, LIMIT), Ok(()));
-        let why = storage_view_fits(5, LIMIT + 1, LIMIT).unwrap_err();
+        assert_eq!(storage_view(0, 4, 4, LIMIT), Ok(4));
+        assert_eq!(storage_view(1, LIMIT, 4, LIMIT), Ok(LIMIT));
+        let why = storage_view(5, LIMIT + 1, LIMIT + 1, LIMIT).unwrap_err();
         assert!(why.contains("argument 5"), "got: {why}");
         assert!(
             why.contains(&format!("{}-byte view", LIMIT + 1)),
@@ -648,5 +654,14 @@ mod tests {
         );
         assert!(why.contains(&format!("of {LIMIT} bytes")), "got: {why}");
         assert!(why.contains("maxStorageBufferRange"), "got: {why}");
+    }
+
+    /// A small tensor early in a slab past the limit (the arena of a large
+    /// MoE) binds the largest range, which holds it.
+    #[test]
+    fn a_small_view_in_a_slab_past_the_range_binds_the_limit() {
+        const LIMIT: u64 = 128 << 20;
+        assert_eq!(storage_view(5, 6 * LIMIT, 4096, LIMIT), Ok(LIMIT));
+        assert_eq!(storage_view(5, 6 * LIMIT, LIMIT, LIMIT), Ok(LIMIT));
     }
 }

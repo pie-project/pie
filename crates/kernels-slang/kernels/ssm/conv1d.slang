@@ -120,23 +120,23 @@ void y_put(uint row, uint chans, uint c, float2 v) {
 // A slot's history lies in the slot, so in one segment: found once.
 void past_load(Column at, int hist, out float2 past[HIST_MAX]) {
     uint seg, first;
-    pie_pool_at(params.state_origin + at.slab, seg, first);
+    pie_pool_find(params.state_origin + at.slab, seg, first);
 #define CONV_PAST_LOAD(buf_) \
     for (int s = 0; s < hist; s++) { \
         uint i = first + uint(s) * at.pitch + at.col; \
         past[s] = float2(buf_[i], buf_[i + 1u]); \
     }
-    PIE_POOL_ON_RW(seg, CONV_PAST_LOAD)
+    PIE_POOL_BRANCH(seg, CONV_PAST_LOAD)
 }
 
 void past_put(Column at, int s, float2 v) {
     uint seg, first;
-    pie_pool_at(params.state_origin + at.slab, seg, first);
+    pie_pool_find(params.state_origin + at.slab, seg, first);
     uint i = first + uint(s) * at.pitch + at.col;
 #define CONV_PAST_PUT(buf_) \
     buf_[i] = v.x; \
     buf_[i + 1u] = v.y;
-    PIE_POOL_ON_RW(seg, CONV_PAST_PUT)
+    PIE_POOL_BRANCH(seg, CONV_PAST_PUT)
 }
 
 #if defined(PIE_COMMITTED) || defined(PIE_CHUNKED)
