@@ -1,5 +1,6 @@
-//! The wafer program's CSL kernels, compiled into the crate: a build needs no source tree, and
-//! their digest keys every compiled program ([`super::cache::ProgramKey`]).
+//! The wafer program's CSL kernels and the op modules they import, compiled into the crate: a
+//! build needs no source tree, and their digest keys every compiled program
+//! ([`super::build::ProgramKey`]).
 
 /// Every kernel source of `programs/wafer`, by file name.
 pub const KERNELS: &[(&str, &str)] = &[
@@ -80,6 +81,13 @@ pub const KERNELS: &[(&str, &str)] = &[
     ),
 ];
 
+/// Every op module of `programs/wafer/ops`, by file name: the ops a role kernel imports with
+/// comptime params (`@import_module("ops/<name>", ..)`). A build writes them all beside the kinds.
+pub const OPS: &[(&str, &str)] = &[(
+    "fabric.csl",
+    include_str!("../programs/wafer/ops/fabric.csl"),
+)];
+
 /// The source of the kernel file `name`.
 pub fn get(name: &str) -> Option<&'static str> {
     KERNELS.iter().find(|(n, _)| *n == name).map(|(_, s)| *s)
@@ -87,16 +95,26 @@ pub fn get(name: &str) -> Option<&'static str> {
 
 #[cfg(test)]
 mod tests {
-    /// The table is the directory: a kernel added there and not here would not build.
-    #[test]
-    fn every_kernel_is_embedded() {
-        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("programs/wafer");
+    /// The csl files of `programs/wafer/<sub>`, sorted.
+    fn files(sub: &str) -> Vec<String> {
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join(sub);
         let mut files: Vec<String> = std::fs::read_dir(dir)
-            .unwrap()
-            .map(|e| e.unwrap().file_name().into_string().unwrap())
-            .collect();
+            .map(|d| {
+                d.map(|e| e.unwrap().file_name().into_string().unwrap())
+                    .filter(|n| n.ends_with(".csl"))
+                    .collect()
+            })
+            .unwrap_or_default();
         files.sort();
+        files
+    }
+
+    /// The tables are the directories: a kernel or op added there and not here would not build.
+    #[test]
+    fn every_kernel_and_op_is_embedded() {
         let names: Vec<&str> = super::KERNELS.iter().map(|(n, _)| *n).collect();
-        assert_eq!(files, names);
+        assert_eq!(files("programs/wafer"), names);
+        let ops: Vec<&str> = super::OPS.iter().map(|(n, _)| *n).collect();
+        assert_eq!(files("programs/wafer/ops"), ops);
     }
 }

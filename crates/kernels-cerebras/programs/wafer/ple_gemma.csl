@@ -11,6 +11,7 @@ param NTW: u16 = 1;     // table words (NT LV)
 param DLY: u16 = 1500;
 
 const sys_mod = @import_module("<memcpy/memcpy>", memcpy_params);
+const fab = @import_module("ops/fabric.csl", .{});
 const tile_config = @import_module("<tile_config>");
 const color_config = tile_config.color_config;
 const tgt = tile_config.target;
@@ -26,12 +27,6 @@ const tb_d = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{64} -> tbl[i] });
 const q_tb = @get_input_queue(2);
 const q_pb = @get_output_queue(2);
 const C_PARK: color = @get_color(16);
-fn fout(comptime q: output_queue, n: u16) fabout_dsd {
-  return @set_dsd_length(@get_dsd(fabout_dsd, .{ .extent = 1, .output_queue = q }), n);
-}
-fn fin(comptime q: input_queue, n: u16) fabin_dsd {
-  return @set_dsd_length(@get_dsd(fabin_dsd, .{ .extent = 1, .input_queue = q }), n);
-}
 const NR: u16 = 8;
 const RQ: u16 = 1 + 2 * NR;
 var rcfg = @zeros([RQ + 7]u32);   // [RQ] flags (bit 0 storage, 1 takes TB, 2 the column's top), t0, NT, LV, PB, TB, spare
@@ -46,31 +41,16 @@ var dirty = false;
 var tsc = @zeros([3]u16);
 var sends = @zeros([2]u32);       // (diagnostics) steps this PE sent, the last id
 var sends_ptr: [*]u32 = &sends;
-fn iqc(comptime qid: u16, c: u32) void {
-  const addr = tile_config.input_queue_config.get_input_queue_config_addr(qid);
-  const v: u16 = @get_config(addr, tile_config.input_queue_config.in_queue_addr_range);
-  @set_config(addr, (v & 0xffe0) | @as(u16, c), tile_config.input_queue_config.in_queue_addr_range);
-}
-fn oqc(comptime qid: u16, c: u32) void {
-  const addr = tile_config.output_queue_config.get_output_queue_config_addr(qid);
-  const v: u16 = @get_config(addr, tile_config.output_queue_config.out_queue_addr_range);
-  @set_config(addr, (v & 0xfe0f) | (@as(u16, c) << 4), tile_config.output_queue_config.out_queue_addr_range);
-}
 fn init() void {
   const cc0 = color_config.get_color_config_addr(@get_color(0));
-  var k: u16 = 0;
-  while (k < @as(u16, rcfg[0])) : (k += 1) {
-    const addr = cc0 + @as(u16, rcfg[1 + 2 * k]);
-    const r = @get_config(addr, tgt.color_addr_range) & 0xff00;
-    @set_config(addr, r | @as(u16, rcfg[2 + 2 * k]), tgt.color_addr_range);
-  }
+  fab.routes(&rcfg);
   pfl = @as(u16, rcfg[RQ]);
   t0 = rcfg[RQ + 1];
   nt = rcfg[RQ + 2];
   lv = @as(u16, rcfg[RQ + 3]);
-  iqc(2, rcfg[RQ + 5]);
+  fab.iqc(2, rcfg[RQ + 5]);
   if ((pfl & 1) != 0) {
-    oqc(2, rcfg[RQ + 4]);
+    fab.oqc(2, rcfg[RQ + 4]);
     pb_addr = cc0 + @as(u16, rcfg[RQ + 4]);
     pb_orig = @get_config(pb_addr, tgt.color_addr_range) & 0xff;
   }
@@ -96,7 +76,7 @@ fn wait(n: u16) void {
 
 // one TB word: restore a switched route, and send this token's words if it is ours (seq: their pass's position + 1)
 fn take_tb(seq: u32) void {
-  @fmovs(tw_d, fin(q_tb, 1));
+  @fmovs(tw_d, fab.fin(q_tb, 1));
   restore();
   const tv = tw[0];
   if ((pfl & 1) == 0 or tv < 0.0) { return; }
@@ -113,7 +93,7 @@ fn take_tb(seq: u32) void {
     @set_config(pb_addr, r | 0x80 | (pb_orig & 0x1f), tgt.color_addr_range);
     dirty = true;
   }
-  @fmovs(fout(q_pb, lv + 1), @set_dsd_length(ob_d, lv + 1));
+  @fmovs(fab.fout(q_pb, lv + 1), @set_dsd_length(ob_d, lv + 1));
   sends[0] += 1;
   sends[1] = t;
 }

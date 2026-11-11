@@ -170,8 +170,9 @@ pub fn layout_text(prog: &Program, kinds: &Kernels) -> Result<String, String> {
     Ok(s)
 }
 
-/// Writes `<out>/layout.csl` and one `<kind>.csl` a role kind (the kernel source, embedded or from
-/// `kernels_dir`, with the other kinds' exported names as one-word dummies).
+/// Writes `<out>/layout.csl`, one `<kind>.csl` a role kind (the kernel source, embedded or from
+/// `kernels_dir`, with the other kinds' exported names as one-word dummies) and the op modules
+/// under `<out>/ops`.
 pub fn write(
     prog: &Program,
     levers: &Levers,
@@ -207,6 +208,21 @@ pub fn write(
     }
     if !kinds.contains_key(&Kind::IDLE) {
         wr("filler.csl", &kind_source(FILLER, syms, &[])?)?;
+    }
+    // the op modules the kinds import (`ops/<name>`)
+    let ops = out.join("ops");
+    if !sources::OPS.is_empty() {
+        std::fs::create_dir_all(&ops).map_err(|e| format!("{}: {e}", ops.display()))?;
+    }
+    for (name, src) in sources::OPS {
+        let text = match kernels_dir {
+            Some(dir) => {
+                let p = dir.join("ops").join(name);
+                std::fs::read_to_string(&p).map_err(|e| format!("{}: {e}", p.display()))?
+            }
+            None => (*src).to_string(),
+        };
+        wr(&format!("ops/{name}"), &text)?;
     }
     wr("layout.csl", &layout_text(prog, &kinds)?)?;
     Ok(())

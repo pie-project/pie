@@ -32,6 +32,7 @@ param TSTAMP: u16 = 0;
 param FIFOW: u16 = 32;
 
 const sys_mod = @import_module("<memcpy/memcpy>", memcpy_params);
+const fab = @import_module("ops/fabric.csl", .{ .NQ = 6 });
 const tile_config = @import_module("<tile_config>");
 const color_config = tile_config.color_config;
 const tgt = tile_config.target;
@@ -88,12 +89,6 @@ var fifo_buf = @zeros([FIFOW]f32);
 const fifo = @allocate_fifo(fifo_buf);
 var fifo_xbuf = @zeros([FIFOW]f32);
 const fifo_x = @allocate_fifo(fifo_xbuf);
-fn fout(comptime q: output_queue, n: u16) fabout_dsd {
-  return @set_dsd_length(@get_dsd(fabout_dsd, .{ .extent = 1, .output_queue = q }), n);
-}
-fn fin(comptime q: input_queue, n: u16) fabin_dsd {
-  return @set_dsd_length(@get_dsd(fabin_dsd, .{ .extent = 1, .input_queue = q }), n);
-}
 const NR: u16 = 16;
 const RQ: u16 = 1 + 2 * NR;
 var rcfg = @zeros([RQ + 26]u32);
@@ -101,58 +96,12 @@ var rcfg_ptr: [*]u32 = &rcfg;
 var role_x: u16 = 0;
 var role_y: u16 = 0;
 var rwc: u16 = 0;
-fn iqc(comptime qid: u16, c: u32) void {
-  const addr = tile_config.input_queue_config.get_input_queue_config_addr(qid);
-  const v: u16 = @get_config(addr, tile_config.input_queue_config.in_queue_addr_range);
-  @set_config(addr, (v & 0xffe0) | @as(u16, c), tile_config.input_queue_config.in_queue_addr_range);
-}
-fn oqc(comptime qid: u16, c: u32) void {
-  const addr = tile_config.output_queue_config.get_output_queue_config_addr(qid);
-  const v: u16 = @get_config(addr, tile_config.output_queue_config.out_queue_addr_range);
-  @set_config(addr, (v & 0xfe0f) | (@as(u16, c) << 4), tile_config.output_queue_config.out_queue_addr_range);
-}
-var qcur = [6]u16 { 13, 14, 17, 18, 19, 20 };
-fn iq_any(q: u16, c: u16) void {
-  if (q == 0) { iqc(2, c); }
-  else if (q == 1) { iqc(3, c); }
-  else if (q == 2) { iqc(4, c); }
-  else if (q == 3) { iqc(5, c); }
-  else if (q == 4) { iqc(6, c); }
-  else if (q == 5) { iqc(7, c); }
-}
-fn bind_iqs(fq: *[6]u16, tmp: u16) void {
-  var done = @zeros([6]u16);
-  var left: u16 = 6;
-  var guard: u16 = 0;
-  while (left > 0 and guard < 32) : (guard += 1) {
-    var prog = false;
-    var i: u16 = 0;
-    while (i < 6) : (i += 1) {
-      if (done[i] != 0) { continue; }
-      var clash = false;
-      var j: u16 = 0;
-      while (j < 6) : (j += 1) { if (j != i and done[j] == 0 and qcur[j] == fq.*[i]) { clash = true; } }
-      if (!clash) { iq_any(i, fq.*[i]); qcur[i] = fq.*[i]; done[i] = 1; left -= 1; prog = true; }
-    }
-    if (!prog) {
-      i = 0;
-      while (i < 6 and done[i] != 0) : (i += 1) {}
-      iq_any(i, tmp); qcur[i] = tmp;
-    }
-  }
-}
 fn init() void {
-  const cc0 = color_config.get_color_config_addr(@get_color(0));
-  var k: u16 = 0;
-  while (k < @as(u16, rcfg[0])) : (k += 1) {
-    const addr = cc0 + @as(u16, rcfg[1 + 2 * k]);
-    const r = @get_config(addr, tgt.color_addr_range) & 0xff00;
-    @set_config(addr, r | @as(u16, rcfg[2 + 2 * k]), tgt.color_addr_range);
-  }
+  fab.routes(&rcfg);
   var fq = [6]u16 { @as(u16, rcfg[RQ]), @as(u16, rcfg[RQ + 1]), @as(u16, rcfg[RQ + 2]), @as(u16, rcfg[RQ + 3]), @as(u16, rcfg[RQ + 4]), @as(u16, rcfg[RQ + 5]) };
-  bind_iqs(&fq, @as(u16, rcfg[RQ + 24]));
-  oqc(5, rcfg[RQ + 6]);
-  oqc(3, rcfg[RQ + 7]);
+  fab.bind_iqs(&fq, @as(u16, rcfg[RQ + 24]));
+  fab.oqc(5, rcfg[RQ + 6]);
+  fab.oqc(3, rcfg[RQ + 7]);
   role_x = @as(u16, rcfg[RQ + 8]);
   role_y = @as(u16, rcfg[RQ + 9]);
   rwc = @as(u16, rcfg[RQ + 11]);
@@ -162,20 +111,20 @@ fn init() void {
 fn send_x(n: u16) void {
   const d = yv(0, n);
   const A = .{ .async = true, .ut_id = ut_xb };
-  if (role_x == 0) { @fmovs(fout(q_xo, n), d, A); }
+  if (role_x == 0) { @fmovs(fab.fout(q_xo, n), d, A); }
   else if (role_x == 2) {
-    @fadds(fifo_x, fin(q_xa, n), d, .{ .async = true, .ut_id = ut_xa });
-    @fadds(fout(q_xo, n), fin(q_xb, n), fifo_x, A);
-  } else { @fadds(fout(q_xo, n), fin(q_xa, n), d, A); }
+    @fadds(fifo_x, fab.fin(q_xa, n), d, .{ .async = true, .ut_id = ut_xa });
+    @fadds(fab.fout(q_xo, n), fab.fin(q_xb, n), fifo_x, A);
+  } else { @fadds(fab.fout(q_xo, n), fab.fin(q_xa, n), d, A); }
 }
 fn send_y(n: u16) void {
   const d = yv(0, n);
   const A = .{ .async = true, .ut_id = ut_b };
-  if (role_y == 0) { @fmovs(fout(q_yo, n), d, A); }
+  if (role_y == 0) { @fmovs(fab.fout(q_yo, n), d, A); }
   else if (role_y == 2) {
-    @fadds(fifo, fin(q_ya, n), d, .{ .async = true, .ut_id = ut_a });
-    @fadds(fout(q_yo, n), fin(q_yb, n), fifo, A);
-  } else { @fadds(fout(q_yo, n), fin(q_ya, n), d, A); }
+    @fadds(fifo, fab.fin(q_ya, n), d, .{ .async = true, .ut_id = ut_a });
+    @fadds(fab.fout(q_yo, n), fab.fin(q_yb, n), fifo, A);
+  } else { @fadds(fab.fout(q_yo, n), fab.fin(q_ya, n), d, A); }
 }
 
 // ---------------------------------------------------------------- matvecs
@@ -214,7 +163,7 @@ fn moe(l: u16) void {
   @fmuls(yv(0, 2 * TK * Ic), yv(0, 2 * TK * Ic), xf[Hc]);
   send_y(2 * TK * Ic);
   stamp(3 + 4 * l);
-  @fs2h(@set_dsd_length(xh_d, TK * Ic), fin(q_ym, TK * Ic));
+  @fs2h(@set_dsd_length(xh_d, TK * Ic), fab.fin(q_ym, TK * Ic));
   k = 0;
   while (k < TK) : (k += 1) {
     const e = @as(u16, rt[k]);
@@ -228,30 +177,30 @@ fn moe(l: u16) void {
 
 fn layer(l: u16) void {
   // the attention half's x: not this half's
-  @fmovs(@set_dsd_length(xf_d, Hc + 2), fin(q_xm, Hc + 2));
+  @fmovs(@set_dsd_length(xf_d, Hc + 2), fab.fin(q_xm, Hc + 2));
   stamp(1 + 4 * l);
   if ((DIAG & 4) != 0) { return; }
-  @fmovs(xf_d, fin(q_xm, Hc + 2));
+  @fmovs(xf_d, fab.fin(q_xm, Hc + 2));
   @fs2h(@set_dsd_length(xh_d, Hc), @set_dsd_length(xf_d, Hc));
   racc[0] = 0.0;
   @map(rstep, @set_dsd_length(xf_d, Hc), @set_dsd_length(@set_dsd_base_addr(xf_d, @ptrcast([*]f32, &wr[l * Hc])), Hc));
   y[0] = racc[0] * xf[Hc];
   y[1] = xf[Hc + 1];
   send_y(2);
-  @fmovs(rt_d, fin(q_ym, 2 * TK));
+  @fmovs(rt_d, fab.fin(q_ym, 2 * TK));
   stamp(2 + 4 * l);
   moe(l);
   stamp(4 + 4 * l);
 }
 
-fn qmode0() void { iqc(6, rcfg[RQ + 4]); iqc(7, rcfg[RQ + 5]); }
+fn qmode0() void { fab.iqc(6, rcfg[RQ + 4]); fab.iqc(7, rcfg[RQ + 5]); }
 fn relay(o: u16) void {
   const n = @as(u16, rcfg[RQ + o]);
   if (n == 0) { return; }
   while ((tile_config.output_queue_status.get_raw() & 0x1000) == 0) {}
-  iqc(6, rcfg[RQ + o + 1]);
-  oqc(4, rcfg[RQ + o + 2]);
-  @fmovs(fout(q_ao, n), fin(q_xm, n));
+  fab.iqc(6, rcfg[RQ + o + 1]);
+  fab.oqc(4, rcfg[RQ + o + 2]);
+  @fmovs(fab.fout(q_ao, n), fab.fin(q_xm, n));
   while ((tile_config.output_queue_status.get_raw() & 0x1000) == 0) {}
   qmode0();
 }

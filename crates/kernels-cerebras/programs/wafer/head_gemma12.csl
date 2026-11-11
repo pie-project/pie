@@ -14,6 +14,7 @@ param NPX: u16 = 1;    // x's f16 parts
 param HACC16: u16 = 0; // 1 (measurement): the logit partials accumulate in f16 (y16), then widen once
 
 const sys_mod = @import_module("<memcpy/memcpy>", memcpy_params);
+const fab = @import_module("ops/fabric.csl", .{ .NQ = 6 });
 const tile_config = @import_module("<tile_config>");
 const color_config = tile_config.color_config;
 const tgt = tile_config.target;
@@ -51,74 +52,19 @@ const ut_a = @get_ut_id(4);
 const ut_b = @get_ut_id(5);
 var fifo_buf = @zeros([32]f32);
 const fifo = @allocate_fifo(fifo_buf);
-fn fout(comptime q: output_queue, n: u16) fabout_dsd {
-  return @set_dsd_length(@get_dsd(fabout_dsd, .{ .extent = 1, .output_queue = q }), n);
-}
-fn fin(comptime q: input_queue, n: u16) fabin_dsd {
-  return @set_dsd_length(@get_dsd(fabin_dsd, .{ .extent = 1, .input_queue = q }), n);
-}
 const NR: u16 = 12;
 const RQ: u16 = 1 + 2 * NR;
 var rcfg = @zeros([RQ + 18]u32);   // head_pe's; [RQ+17] NX
 var rcfg_ptr: [*]u32 = &rcfg;
 var role_r: u16 = 0;
 var role_x: u16 = 0;
-fn iqc(comptime qid: u16, c: u32) void {
-  const addr = tile_config.input_queue_config.get_input_queue_config_addr(qid);
-  const v: u16 = @get_config(addr, tile_config.input_queue_config.in_queue_addr_range);
-  @set_config(addr, (v & 0xffe0) | @as(u16, c), tile_config.input_queue_config.in_queue_addr_range);
-}
-fn oqc(comptime qid: u16, c: u32) void {
-  const addr = tile_config.output_queue_config.get_output_queue_config_addr(qid);
-  const v: u16 = @get_config(addr, tile_config.output_queue_config.out_queue_addr_range);
-  @set_config(addr, (v & 0xfe0f) | (@as(u16, c) << 4), tile_config.output_queue_config.out_queue_addr_range);
-}
-// Input-queue colours from the host without a transient duplicate (the fabric refuses two input
-// queues on one colour, even for a moment): a queue takes its colour only when no other queue still
-// holds it; a cycle goes through the host's spare colour (rcfg's tmp word).
-var qcur = [6]u16 { 13, 14, 17, 18, 19, 20 };
-fn iq_any(q: u16, c: u16) void {
-  if (q == 0) { iqc(2, c); }
-  else if (q == 1) { iqc(3, c); }
-  else if (q == 2) { iqc(4, c); }
-  else if (q == 3) { iqc(5, c); }
-  else if (q == 4) { iqc(6, c); }
-  else if (q == 5) { iqc(7, c); }
-}
-fn bind_iqs(fin: *[6]u16, tmp: u16) void {
-  var done = @zeros([6]u16);
-  var left: u16 = 6;
-  var guard: u16 = 0;
-  while (left > 0 and guard < 32) : (guard += 1) {
-    var prog = false;
-    var i: u16 = 0;
-    while (i < 6) : (i += 1) {
-      if (done[i] != 0) { continue; }
-      var clash = false;
-      var j: u16 = 0;
-      while (j < 6) : (j += 1) { if (j != i and done[j] == 0 and qcur[j] == fin.*[i]) { clash = true; } }
-      if (!clash) { iq_any(i, fin.*[i]); qcur[i] = fin.*[i]; done[i] = 1; left -= 1; prog = true; }
-    }
-    if (!prog) {
-      i = 0;
-      while (i < 6 and done[i] != 0) : (i += 1) {}
-      iq_any(i, tmp); qcur[i] = tmp;
-    }
-  }
-}
 
 fn init() void {
-  const cc0 = color_config.get_color_config_addr(@get_color(0));
-  var k: u16 = 0;
-  while (k < @as(u16, rcfg[0])) : (k += 1) {
-    const addr = cc0 + @as(u16, rcfg[1 + 2 * k]);
-    const r = @get_config(addr, tgt.color_addr_range) & 0xff00;
-    @set_config(addr, r | @as(u16, rcfg[2 + 2 * k]), tgt.color_addr_range);
-  }
+  fab.routes(&rcfg);
   var fq = [6]u16 { @as(u16, rcfg[RQ]), @as(u16, rcfg[RQ + 1]), @as(u16, rcfg[RQ + 2]), @as(u16, rcfg[RQ + 3]), @as(u16, rcfg[RQ + 4]), @as(u16, rcfg[RQ + 10]) };
-  bind_iqs(&fq, @as(u16, rcfg[RQ + 9]));
-  oqc(2, rcfg[RQ + 5]); oqc(3, rcfg[RQ + 6]);
-  oqc(4, rcfg[RQ + 13]); oqc(5, rcfg[RQ + 14]); oqc(6, rcfg[RQ + 15]); oqc(7, rcfg[RQ + 16]);
+  fab.bind_iqs(&fq, @as(u16, rcfg[RQ + 9]));
+  fab.oqc(2, rcfg[RQ + 5]); fab.oqc(3, rcfg[RQ + 6]);
+  fab.oqc(4, rcfg[RQ + 13]); fab.oqc(5, rcfg[RQ + 14]); fab.oqc(6, rcfg[RQ + 15]); fab.oqc(7, rcfg[RQ + 16]);
   wfl = @as(u16, rcfg[RQ + 11]);
   va_addr = color_config.get_color_config_addr(@get_color(0)) + @as(u16, rcfg[RQ + 13]);
   va_orig = @get_config(va_addr, tgt.color_addr_range) & 0xff;
@@ -140,19 +86,19 @@ const yh_d = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{if (HACC16 == 1) VR els
 var nx: u16 = 0;
 fn recv_x() void {
   if (role_x == 0) {
-    @fmovs(x_d, fin(q_hm, HDc));
+    @fmovs(x_d, fab.fin(q_hm, HDc));
   } else {
-    @fmovs(@set_dsd_length(x_d, nx), fin(q_hx, nx));
-    @fmovs(fout(q_xo, HDc), x_d);
+    @fmovs(@set_dsd_length(x_d, nx), fab.fin(q_hx, nx));
+    @fmovs(fab.fout(q_xo, HDc), x_d);
   }
 }
 fn send_r() void {
   const A = .{ .async = true, .ut_id = ut_b };
-  if (role_r == 0) { @fmovs(fout(q_ro, VR), y_d, A); }
-  else if (role_r == 1) { @fadds(fout(q_ro, VR), fin(q_ra, VR), y_d, A); }
+  if (role_r == 0) { @fmovs(fab.fout(q_ro, VR), y_d, A); }
+  else if (role_r == 1) { @fadds(fab.fout(q_ro, VR), fab.fin(q_ra, VR), y_d, A); }
   else {
-    @fadds(fifo, fin(q_ra, VR), y_d, .{ .async = true, .ut_id = ut_a });
-    @fadds(fout(q_ro, VR), fin(q_rb, VR), fifo, A);
+    @fadds(fifo, fab.fin(q_ra, VR), y_d, .{ .async = true, .ut_id = ut_a });
+    @fadds(fab.fout(q_ro, VR), fab.fin(q_rb, VR), fifo, A);
   }
 }
 
@@ -177,7 +123,7 @@ fn va_restore() void {
   va_dirty = false;
 }
 fn hloop() void {
-  @fmovs(ww_d, fin(q_w, 1));
+  @fmovs(ww_d, fab.fin(q_w, 1));
   const w = ww[0];
   if (w < -1.0e8) { return; }
   const sink = (wfl & 2) != 0;
@@ -191,20 +137,20 @@ fn hloop() void {
     while (d < nx) : (d += 1) { eb[d] = @as(f32, @bitcast(@fp16(), hw[d * VR + j])); }
     const e = @set_dsd_length(eb_d, nx);
     if (sink and te) {
-      @fmovs(fout(q_he, nx), e);
+      @fmovs(fab.fout(q_he, nx), e);
     } else if (sink) {
-      @fmovs(fout(q_vs, nx), e);
+      @fmovs(fab.fout(q_vs, nx), e);
     } else {
       const r = @get_config(va_addr, tgt.color_addr_range) & 0xff00;
       @set_config(va_addr, r | 0x80 | (va_orig & 0x1f), tgt.color_addr_range);
       va_dirty = true;
-      @fmovs(fout(q_va, nx), e);
+      @fmovs(fab.fout(q_va, nx), e);
     }
   } else {
     wrow = @as(u16, -w - 1.0);
   }
-  if (sink and !te and wrow != 0) { @fmovs(fout(q_vs, nx), fin(q_hn, nx)); }   // (iq5: VA here)
-  if (te and !(sink and wrow == 0)) { @fmovs(fout(q_he, nx), fin(q_hm, nx)); }  // (iq6: VS, or VA at row 0)
+  if (sink and !te and wrow != 0) { @fmovs(fab.fout(q_vs, nx), fab.fin(q_hn, nx)); }   // (iq5: VA here)
+  if (te and !(sink and wrow == 0)) { @fmovs(fab.fout(q_he, nx), fab.fin(q_hm, nx)); }  // (iq6: VS, or VA at row 0)
 }
 
 const timestamp = @import_module("<time>");

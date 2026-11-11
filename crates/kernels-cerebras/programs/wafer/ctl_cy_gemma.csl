@@ -30,6 +30,7 @@ param HDG: u16 = 512;
 param PLOG: u16 = 0;     // 1: the full model logs each step's PLE words too (plog: the hang-localizing probe with real ordering)
 
 const sys_mod = @import_module("<memcpy/memcpy>", memcpy_params);
+const fab = @import_module("ops/fabric.csl", .{ .NQ = 6 });
 const tile_config = @import_module("<tile_config>");
 const color_config = tile_config.color_config;
 const tgt = tile_config.target;
@@ -95,12 +96,6 @@ const ut_b = @get_ut_id(5);
 const ut_p = @get_ut_id(6);
 var fifo_buf = @zeros([FIFOW]f32);
 const fifo = @allocate_fifo(fifo_buf);
-fn fout(comptime q: output_queue, n: u16) fabout_dsd {
-  return @set_dsd_length(@get_dsd(fabout_dsd, .{ .extent = 1, .output_queue = q }), n);
-}
-fn fin(comptime q: input_queue, n: u16) fabin_dsd {
-  return @set_dsd_length(@get_dsd(fabin_dsd, .{ .extent = 1, .input_queue = q }), n);
-}
 const NR: u16 = 12;
 const RQ: u16 = 1 + 2 * NR;
 var rcfg = @zeros([RQ + 16]u32);   // ctl_cy_dense's; [RQ+11] flags (bit 0 on a PLE bus, 1 the KVS source, 2 flush unit),
@@ -108,62 +103,16 @@ var rcfg_ptr: [*]u32 = &rcfg;      // [RQ+12] PB colour, [RQ+13] this unit's pla
 var cfl: u16 = 0;
 var pui: u16 = 0;
 var plv: u16 = 0;
-fn iqc(comptime qid: u16, c: u32) void {
-  const addr = tile_config.input_queue_config.get_input_queue_config_addr(qid);
-  const v: u16 = @get_config(addr, tile_config.input_queue_config.in_queue_addr_range);
-  @set_config(addr, (v & 0xffe0) | @as(u16, c), tile_config.input_queue_config.in_queue_addr_range);
-}
-fn oqc(comptime qid: u16, c: u32) void {
-  const addr = tile_config.output_queue_config.get_output_queue_config_addr(qid);
-  const v: u16 = @get_config(addr, tile_config.output_queue_config.out_queue_addr_range);
-  @set_config(addr, (v & 0xfe0f) | (@as(u16, c) << 4), tile_config.output_queue_config.out_queue_addr_range);
-}
-var qcur = [6]u16 { 13, 14, 17, 18, 19, 20 };
-fn iq_any(q: u16, c: u16) void {
-  if (q == 0) { iqc(2, c); }
-  else if (q == 1) { iqc(3, c); }
-  else if (q == 2) { iqc(4, c); }
-  else if (q == 3) { iqc(5, c); }
-  else if (q == 4) { iqc(6, c); }
-  else if (q == 5) { iqc(7, c); }
-}
-fn bind_iqs(fin: *[6]u16, tmp: u16) void {
-  var done = @zeros([6]u16);
-  var left: u16 = 6;
-  var guard: u16 = 0;
-  while (left > 0 and guard < 32) : (guard += 1) {
-    var prog = false;
-    var i: u16 = 0;
-    while (i < 6) : (i += 1) {
-      if (done[i] != 0) { continue; }
-      var clash = false;
-      var j: u16 = 0;
-      while (j < 6) : (j += 1) { if (j != i and done[j] == 0 and qcur[j] == fin.*[i]) { clash = true; } }
-      if (!clash) { iq_any(i, fin.*[i]); qcur[i] = fin.*[i]; done[i] = 1; left -= 1; prog = true; }
-    }
-    if (!prog) {
-      i = 0;
-      while (i < 6 and done[i] != 0) : (i += 1) {}
-      iq_any(i, tmp); qcur[i] = tmp;
-    }
-  }
-}
 fn init() void {
-  const cc0 = color_config.get_color_config_addr(@get_color(0));
-  var k: u16 = 0;
-  while (k < @as(u16, rcfg[0])) : (k += 1) {
-    const addr = cc0 + @as(u16, rcfg[1 + 2 * k]);
-    const r = @get_config(addr, tgt.color_addr_range) & 0xff00;
-    @set_config(addr, r | @as(u16, rcfg[2 + 2 * k]), tgt.color_addr_range);
-  }
+  fab.routes(&rcfg);
   cfl = @as(u16, rcfg[RQ + 11]);
   pui = @as(u16, rcfg[RQ + 13]);
   plv = @as(u16, rcfg[RQ + 14]);
   const q6 = if ((cfl & 1) != 0) @as(u16, rcfg[RQ + 12]) else @as(u16, rcfg[RQ + 8]);
   var fq = [6]u16 { @as(u16, rcfg[RQ]), @as(u16, rcfg[RQ + 1]), @as(u16, rcfg[RQ + 2]), @as(u16, rcfg[RQ + 3]), q6, @as(u16, rcfg[RQ + 9]) };
-  bind_iqs(&fq, @as(u16, rcfg[RQ + 10]));
-  oqc(2, rcfg[RQ + 4]); oqc(3, rcfg[RQ + 5]); oqc(4, rcfg[RQ + 6]);
-  if ((cfl & 2) != 0) { oqc(5, rcfg[RQ + 15]); }
+  fab.bind_iqs(&fq, @as(u16, rcfg[RQ + 10]));
+  fab.oqc(2, rcfg[RQ + 4]); fab.oqc(3, rcfg[RQ + 5]); fab.oqc(4, rcfg[RQ + 6]);
+  if ((cfl & 2) != 0) { fab.oqc(5, rcfg[RQ + 15]); }
   timestamp.enable_tsc();
   vinit();
   vinit2();
@@ -173,11 +122,11 @@ fn init() void {
 }
 
 fn reduce(n: u16) void {
-  @fmovs(fifo, fin(q_s, n), .{ .async = true, .ut_id = ut_a });
-  @fadds(fout(q_lo, n), fin(q_n, n), fifo, .{ .async = true, .ut_id = ut_b });
-  @fmovs(tv(0, n), fin(q_lb, n));
+  @fmovs(fifo, fab.fin(q_s, n), .{ .async = true, .ut_id = ut_a });
+  @fadds(fab.fout(q_lo, n), fab.fin(q_n, n), fifo, .{ .async = true, .ut_id = ut_b });
+  @fmovs(tv(0, n), fab.fin(q_lb, n));
 }
-fn mcast(n: u16) void { @fmovs(fout(q_mc, n), uv(0, n)); }
+fn mcast(n: u16) void { @fmovs(fab.fout(q_mc, n), uv(0, n)); }
 
 // ---------------------------------------------------------------- scalar math (ctl_cy_dense's)
 fn rsqrt(v: f32) f32 {
@@ -553,7 +502,7 @@ fn attk(l: u16, comptime g: bool) void {
   }
   u[QD + 2 * dc] = posf;
   u[QD + 2 * dc + 3 + Qh] = s;
-  @fmovs(fout(q_mc, AB), uc(0, AB));
+  @fmovs(fab.fout(q_mc, AB), uc(0, AB));
   stamp(1 + 6 * cl + 1);
   if ((cfl & 2) != 0 and (l == LS or l == LG)) {
     // KVS: [k | v | |k|^2 | |v|^2] (sliding first, then global + the sequence word)
@@ -563,7 +512,7 @@ fn attk(l: u16, comptime g: bool) void {
     u[QD + 2 * dc] = ksv;
     u[QD + 2 * dc + 1] = vsv;
     u[QD + 2 * dc + 2] = posf1;
-    @fmovs(fout(q_kv, 2 * dc + 2 + (if (l == LG) @as(u16, 1) else 0)), uv(QD, 2 * dc + 2 + (if (l == LG) @as(u16, 1) else 0)));
+    @fmovs(fab.fout(q_kv, 2 * dc + 2 + (if (l == LG) @as(u16, 1) else 0)), uv(QD, 2 * dc + 2 + (if (l == LG) @as(u16, 1) else 0)));
   }
   var pass: u16 = 0;
   while (pass < 8) : (pass += 1) {
@@ -582,12 +531,12 @@ fn attk(l: u16, comptime g: bool) void {
       u[QD + 1 + h] = if (bad == 0.0) 0.0 else ln1(lh);
     }
     u[QD] = bad;
-    @fmovs(fout(q_mc, QD + 1 + Qh), uc(0, QD + 1 + Qh));
+    @fmovs(fab.fout(q_mc, QD + 1 + Qh), uc(0, QD + 1 + Qh));
     stamp(1 + 6 * cl + 3);
     if (bad == 0.0) {   // (ATTL 2) the logs off the path
       h = 0;
       while (h < Qh) : (h += 1) { u[h] = ln1(t[h * (dc + 1) + dc]); }
-      @fmovs(fout(q_mc, Qh), uc(0, Qh));
+      @fmovs(fab.fout(q_mc, Qh), uc(0, Qh));
       pass = 8;
     }
   }
@@ -599,7 +548,7 @@ fn mlp() void {
   if (GELUT == 0) { vgelu0(uv(0, Ic), tv(0, Ic), Ic); } else if (GELUT == 2) { vgeluc2(); } else { vgeluc(); }
   @fmuls(uc(0, Ic), uc(0, Ic), tc(Ic, Ic));
   u[Ic] = s1;
-  @fmovs(fout(q_mc, Ic + 1), uc(0, Ic + 1));
+  @fmovs(fab.fout(q_mc, Ic + 1), uc(0, Ic + 1));
 }
 var chk = @zeros([1]f32);
 fn pl_wait(pos: u32) void {
@@ -611,7 +560,7 @@ fn pl_wait(pos: u32) void {
 }
 fn pl_post() void {
   pl[plv] = -1.0;
-  @fmovs(@set_dsd_length(@get_dsd(mem1d_dsd, .{ .tensor_access = |i|{64} -> pl[i] }), plv + 1), fin(q_pl, plv + 1), .{ .async = true, .ut_id = ut_p });
+  @fmovs(@set_dsd_length(@get_dsd(mem1d_dsd, .{ .tensor_access = |i|{64} -> pl[i] }), plv + 1), fab.fin(q_pl, plv + 1), .{ .async = true, .ut_id = ut_p });
 }
 fn ple(l: u16) void {
   reduce(6);
@@ -643,8 +592,8 @@ task pass_task() void {
         var i: u16 = 0;
         while (i < 16) : (i += 1) { u[i] = @as(f32, tab[0]) * 0.5 + @as(f32, i); }
         u[16] = @as(f32, tab[0] + 1);
-        @fmovs(fout(q_kv, 6), uv(0, 6));
-        @fmovs(fout(q_kv, 11), uv(6, 11));
+        @fmovs(fab.fout(q_kv, 6), uv(0, 6));
+        @fmovs(fab.fout(q_kv, 11), uv(6, 11));
       }
     } else {
       var l: u16 = 0;

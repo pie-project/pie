@@ -31,6 +31,7 @@ param XKEEP: u16 = 0;
 param XDLY: u16 = 0;   // (diagnostics) cycles unit 0's CX waits after the token loop's embedding chunk arrives
 
 const sys_mod = @import_module("<memcpy/memcpy>", memcpy_params);
+const fab = @import_module("ops/fabric.csl", .{ .NQ = 5 });
 const tile_config = @import_module("<tile_config>");
 const color_config = tile_config.color_config;
 const tgt = tile_config.target;
@@ -73,66 +74,15 @@ const q_lo = @get_output_queue(2);
 const q_mc = @get_output_queue(3);
 const q_ho = @get_output_queue(4);
 const C_PARK: color = @get_color(16);
-fn fout(comptime q: output_queue, n: u16) fabout_dsd {
-  return @set_dsd_length(@get_dsd(fabout_dsd, .{ .extent = 1, .output_queue = q }), n);
-}
-fn fin(comptime q: input_queue, n: u16) fabin_dsd {
-  return @set_dsd_length(@get_dsd(fabin_dsd, .{ .extent = 1, .input_queue = q }), n);
-}
 const NR: u16 = 12;
 const RQ: u16 = 1 + 2 * NR;
 var rcfg = @zeros([RQ + 10]u32);
 var rcfg_ptr: [*]u32 = &rcfg;
-fn iqc(comptime qid: u16, c: u32) void {
-  const addr = tile_config.input_queue_config.get_input_queue_config_addr(qid);
-  const v: u16 = @get_config(addr, tile_config.input_queue_config.in_queue_addr_range);
-  @set_config(addr, (v & 0xffe0) | @as(u16, c), tile_config.input_queue_config.in_queue_addr_range);
-}
-fn oqc(comptime qid: u16, c: u32) void {
-  const addr = tile_config.output_queue_config.get_output_queue_config_addr(qid);
-  const v: u16 = @get_config(addr, tile_config.output_queue_config.out_queue_addr_range);
-  @set_config(addr, (v & 0xfe0f) | (@as(u16, c) << 4), tile_config.output_queue_config.out_queue_addr_range);
-}
-var qcur = [5]u16 { 13, 14, 17, 18, 19 };
-fn iq_any(q: u16, c: u16) void {
-  if (q == 0) { iqc(2, c); }
-  else if (q == 1) { iqc(3, c); }
-  else if (q == 2) { iqc(4, c); }
-  else if (q == 3) { iqc(5, c); }
-  else if (q == 4) { iqc(6, c); }
-}
-fn bind_iqs(fq: *[5]u16, tmp: u16) void {
-  var done = @zeros([5]u16);
-  var left: u16 = 5;
-  var guard: u16 = 0;
-  while (left > 0 and guard < 32) : (guard += 1) {
-    var prog = false;
-    var i: u16 = 0;
-    while (i < 5) : (i += 1) {
-      if (done[i] != 0) { continue; }
-      var clash = false;
-      var j: u16 = 0;
-      while (j < 5) : (j += 1) { if (j != i and done[j] == 0 and qcur[j] == fq.*[i]) { clash = true; } }
-      if (!clash) { iq_any(i, fq.*[i]); qcur[i] = fq.*[i]; done[i] = 1; left -= 1; prog = true; }
-    }
-    if (!prog) {
-      i = 0;
-      while (i < 5 and done[i] != 0) : (i += 1) {}
-      iq_any(i, tmp); qcur[i] = tmp;
-    }
-  }
-}
 fn init() void {
-  const cc0 = color_config.get_color_config_addr(@get_color(0));
-  var k: u16 = 0;
-  while (k < @as(u16, rcfg[0])) : (k += 1) {
-    const addr = cc0 + @as(u16, rcfg[1 + 2 * k]);
-    const r = @get_config(addr, tgt.color_addr_range) & 0xff00;
-    @set_config(addr, r | @as(u16, rcfg[2 + 2 * k]), tgt.color_addr_range);
-  }
+  fab.routes(&rcfg);
   var fq = [5]u16 { @as(u16, rcfg[RQ]), @as(u16, rcfg[RQ + 1]), @as(u16, rcfg[RQ + 2]), @as(u16, rcfg[RQ + 3]), @as(u16, rcfg[RQ + 9]) };
-  bind_iqs(&fq, @as(u16, rcfg[RQ + 8]));
-  oqc(2, rcfg[RQ + 4]); oqc(3, rcfg[RQ + 5]); oqc(4, rcfg[RQ + 6]);
+  fab.bind_iqs(&fq, @as(u16, rcfg[RQ + 8]));
+  fab.oqc(2, rcfg[RQ + 4]); fab.oqc(3, rcfg[RQ + 5]); fab.oqc(4, rcfg[RQ + 6]);
   timestamp.enable_tsc();
   sys_mod.unblock_cmd_stream();
 }
@@ -155,7 +105,7 @@ fn norm_send(g: [*]f32) void {
   @fmuls(u_d, u_d, down);
   u[Hc] = @bitcast(f32, @as(u32, @as(u16, 127 + e)) << 23);
   u[Hc + 1] = ss;
-  @fmovs(fout(q_mc, Hc + 2), u2_d);
+  @fmovs(fab.fout(q_mc, Hc + 2), u2_d);
 }
 
 var n_steps: u32 = 0;
@@ -163,9 +113,9 @@ const pass_id: local_task_id = @get_local_task_id(8);
 task pass_task() void {
   var s: u32 = 0;
   while (s < n_steps) : (s += 1) {
-    if (HOSTX == 0 and (rcfg[RQ + 7] & 1) == 0) { @fmovs(x_d, fin(q_hi, Hc)); }
+    if (HOSTX == 0 and (rcfg[RQ + 7] & 1) == 0) { @fmovs(x_d, fab.fin(q_hi, Hc)); }
     else if (s > 0 and (rcfg[RQ + 7] & 4) != 0) {
-      @fmovs(x_d, fin(q_em, Hc));
+      @fmovs(x_d, fab.fin(q_em, Hc));
       if (XDLY > 0) {
         timestamp.get_timestamp(&tsc);
         const t0 = @as(u32, tsc[0]) | (@as(u32, tsc[1]) << 16);
@@ -178,7 +128,7 @@ task pass_task() void {
     while ((DIAG & 1) == 0 and l < (if ((DIAG & 2) != 0) 1 else K)) : (l += 1) {
       norm_send(@ptrcast([*]f32, &gam[2 * l * Hc]));
       stamp(K + 2 + 4 * l);
-      @fmovs(t_d, fin(q_w, Hc));
+      @fmovs(t_d, fab.fin(q_w, Hc));
       stamp(K + 3 + 4 * l);
       keep_red(2 * l);
       @fadds(x_d, x_d, t_d);
@@ -186,7 +136,7 @@ task pass_task() void {
       if ((DIAG & 4) == 0) {
         norm_send(@ptrcast([*]f32, &gam[(2 * l + 1) * Hc]));
         stamp(K + 4 + 4 * l);
-        @fmovs(t2_d, fin(q_e, Hc + 2 * TK));
+        @fmovs(t2_d, fab.fin(q_e, Hc + 2 * TK));
         stamp(K + 5 + 4 * l);
         keep_red(2 * l + 1);
         @fadds(x_d, x_d, t_d);
@@ -199,7 +149,7 @@ task pass_task() void {
       if (XKEEP == 1) { @fmovs(@set_dsd_length(@increment_dsd_offset(@get_dsd(mem1d_dsd, .{ .tensor_access = |i|{if (XKEEP == 1) K * Hc else 1} -> xdbg[i] }), @as(i16, l * Hc), f32), Hc), x_d); }
       stamp(l + 1);
     }
-    if (HOSTX == 0 and (rcfg[RQ + 7] & 2) == 0) { @fmovs(fout(q_ho, Hc), x_d); }
+    if (HOSTX == 0 and (rcfg[RQ + 7] & 2) == 0) { @fmovs(fab.fout(q_ho, Hc), x_d); }
     stamp(K + 1);
   }
   sys_mod.unblock_cmd_stream();

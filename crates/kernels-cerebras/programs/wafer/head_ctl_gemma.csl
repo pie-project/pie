@@ -14,6 +14,7 @@ param memcpy_params;
 param VR: u16;
 
 const sys_mod = @import_module("<memcpy/memcpy>", memcpy_params);
+const fab = @import_module("ops/fabric.csl", .{ .NQ = 6 });
 const tile_config = @import_module("<tile_config>");
 const color_config = tile_config.color_config;
 const tgt = tile_config.target;
@@ -48,77 +49,22 @@ const ut_b = @get_ut_id(5);
 param FIFOW: u16 = 32;
 var fifo_buf = @zeros([FIFOW]f32);
 const fifo = @allocate_fifo(fifo_buf);
-fn fout(comptime q: output_queue, n: u16) fabout_dsd {
-  return @set_dsd_length(@get_dsd(fabout_dsd, .{ .extent = 1, .output_queue = q }), n);
-}
-fn fin(comptime q: input_queue, n: u16) fabin_dsd {
-  return @set_dsd_length(@get_dsd(fabin_dsd, .{ .extent = 1, .input_queue = q }), n);
-}
 const NR: u16 = 12;
 const RQ: u16 = 1 + 2 * NR;
 var rcfg = @zeros([RQ + 15]u32);   // [RQ..RQ+4) iq2, iq3, iq4, oq2; [RQ+4] this row's first vocabulary id; [RQ+5] spare;
 // [RQ+6..9) iq5..iq7, [RQ+9] oq3, [RQ+10] oq4, [RQ+11] the max-reduce role, [RQ+12] WL
 var rcfg_ptr: [*]u32 = &rcfg;
-fn iqc(comptime qid: u16, c: u32) void {
-  const addr = tile_config.input_queue_config.get_input_queue_config_addr(qid);
-  const v: u16 = @get_config(addr, tile_config.input_queue_config.in_queue_addr_range);
-  @set_config(addr, (v & 0xffe0) | @as(u16, c), tile_config.input_queue_config.in_queue_addr_range);
-}
-fn oqc(comptime qid: u16, c: u32) void {
-  const addr = tile_config.output_queue_config.get_output_queue_config_addr(qid);
-  const v: u16 = @get_config(addr, tile_config.output_queue_config.out_queue_addr_range);
-  @set_config(addr, (v & 0xfe0f) | (@as(u16, c) << 4), tile_config.output_queue_config.out_queue_addr_range);
-}
-// Input-queue colours from the host without a transient duplicate (the fabric refuses two input
-// queues on one colour, even for a moment): a queue takes its colour only when no other queue still
-// holds it; a cycle goes through the host's spare colour (rcfg's tmp word).
-var qcur = [6]u16 { 13, 14, 17, 18, 19, 20 };
-fn iq_any(q: u16, c: u16) void {
-  if (q == 0) { iqc(2, c); }
-  else if (q == 1) { iqc(3, c); }
-  else if (q == 2) { iqc(4, c); }
-  else if (q == 3) { iqc(5, c); }
-  else if (q == 4) { iqc(6, c); }
-  else if (q == 5) { iqc(7, c); }
-}
-fn bind_iqs(fin: *[6]u16, tmp: u16) void {
-  var done = @zeros([6]u16);
-  var left: u16 = 6;
-  var guard: u16 = 0;
-  while (left > 0 and guard < 32) : (guard += 1) {
-    var prog = false;
-    var i: u16 = 0;
-    while (i < 6) : (i += 1) {
-      if (done[i] != 0) { continue; }
-      var clash = false;
-      var j: u16 = 0;
-      while (j < 6) : (j += 1) { if (j != i and done[j] == 0 and qcur[j] == fin.*[i]) { clash = true; } }
-      if (!clash) { iq_any(i, fin.*[i]); qcur[i] = fin.*[i]; done[i] = 1; left -= 1; prog = true; }
-    }
-    if (!prog) {
-      i = 0;
-      while (i < 6 and done[i] != 0) : (i += 1) {}
-      iq_any(i, tmp); qcur[i] = tmp;
-    }
-  }
-}
 
 fn init() void {
-  const cc0 = color_config.get_color_config_addr(@get_color(0));
-  var k: u16 = 0;
-  while (k < @as(u16, rcfg[0])) : (k += 1) {
-    const addr = cc0 + @as(u16, rcfg[1 + 2 * k]);
-    const r = @get_config(addr, tgt.color_addr_range) & 0xff00;
-    @set_config(addr, r | @as(u16, rcfg[2 + 2 * k]), tgt.color_addr_range);
-  }
+  fab.routes(&rcfg);
   var fq = [6]u16 { @as(u16, rcfg[RQ]), @as(u16, rcfg[RQ + 1]), @as(u16, rcfg[RQ + 2]),
                     @as(u16, rcfg[RQ + 6]), @as(u16, rcfg[RQ + 7]), @as(u16, rcfg[RQ + 8]) };
-  bind_iqs(&fq, @as(u16, rcfg[RQ + 5])); oqc(2, rcfg[RQ + 3]);
-  oqc(3, rcfg[RQ + 9]); oqc(4, rcfg[RQ + 10]);
+  fab.bind_iqs(&fq, @as(u16, rcfg[RQ + 5])); fab.oqc(2, rcfg[RQ + 3]);
+  fab.oqc(3, rcfg[RQ + 9]); fab.oqc(4, rcfg[RQ + 10]);
   wrole = @as(u16, rcfg[RQ + 11]);
   wl_on = rcfg[RQ + 12] != 0;
   tb_on = rcfg[RQ + 13] != 0;
-  if (tb_on) { oqc(5, rcfg[RQ + 14]); }
+  if (tb_on) { fab.oqc(5, rcfg[RQ + 14]); }
   timestamp.enable_tsc();
   sys_mod.unblock_cmd_stream();
 }
@@ -156,18 +102,18 @@ fn wloop(s: u32, best: f32, id: f32) void {
   wm[0] = best;
   wm[1] = id;
   if ((wrole & 4) != 0) {
-    if ((wrole & 8) != 0) { @fmovs(wr_d, fin(q_w1, 2)); wmerge(); }
-    if ((wrole & 16) != 0) { @fmovs(wr_d, fin(q_w2, 2)); wmerge(); }
+    if ((wrole & 8) != 0) { @fmovs(wr_d, fab.fin(q_w1, 2)); wmerge(); }
+    if ((wrole & 16) != 0) { @fmovs(wr_d, fab.fin(q_w2, 2)); wmerge(); }
     if (s < CAP) { ring[s] = @as(u32, wm[1]); }   // the argmax (also under a forced step: teacher-forced checks)
     if (WFORCE != 0) { wm[1] = @as(f32, (s * WFORCE + 7) % (@as(u32, VR) * @as(u32, WFN))); }   // (diagnostics) a forced winner sequence
     if (s < nforce[0] and s < CAP) { wm[1] = @as(f32, force[s]); }   // the host's forced tokens (a prompt in the same launch)
     if (s < 64) { stamp(2 + @as(u16, s)); }
-    @fmovs(fout(q_wo, 2), wm_d);
+    @fmovs(fab.fout(q_wo, 2), wm_d);
   } else {
-    if (wrole != 0) { @fmovs(wr_d, fin(q_w1, 2)); wmerge(); }
-    if (wrole == 2) { @fmovs(wr_d, fin(q_w2, 2)); wmerge(); }
-    @fmovs(fout(q_wo, 2), wm_d);
-    @fmovs(wm_d, fin(q_wm, 2));
+    if (wrole != 0) { @fmovs(wr_d, fab.fin(q_w1, 2)); wmerge(); }
+    if (wrole == 2) { @fmovs(wr_d, fab.fin(q_w2, 2)); wmerge(); }
+    @fmovs(fab.fout(q_wo, 2), wm_d);
+    @fmovs(wm_d, fab.fin(q_wm, 2));
   }
   stamp(68);
   const win = @as(u32, wm[1]);
@@ -175,8 +121,8 @@ fn wloop(s: u32, best: f32, id: f32) void {
   if (s + 1 >= n_steps) { wo[0] = -1.0e9; }
   else if (win >= base and win < base + @as(u32, VR)) { wo[0] = @as(f32, win - base); }
   else { wo[0] = -(1.0 + @as(f32, win / @as(u32, VR))); }
-  @fmovs(fout(q_ww, 1), wo_d);
-  if (tb_on) { tbw[0] = if (s + 1 >= n_steps) -1.0 else @as(f32, win); @fmovs(fout(q_tb, 1), tbw_d); }
+  @fmovs(fab.fout(q_ww, 1), wo_d);
+  if (tb_on) { tbw[0] = if (s + 1 >= n_steps) -1.0 else @as(f32, win); @fmovs(fab.fout(q_tb, 1), tbw_d); }
   stamp(69);
 }
 
@@ -185,11 +131,11 @@ const pass_id: local_task_id = @get_local_task_id(8);
 task pass_task() void {
   var s: u32 = 0;
   while (s < n_steps) : (s += 1) {
-    if (s == 0 and tb_on) { tbw[0] = @as(f32, tin[0]); @fmovs(fout(q_tb, 1), tbw_d); }
+    if (s == 0 and tb_on) { tbw[0] = @as(f32, tin[0]); @fmovs(fab.fout(q_tb, 1), tbw_d); }
     stamp(0);
-    @fmovs(fifo, fin(q_e, VR), .{ .async = true, .ut_id = ut_a });
-    @fadds(fout(q_lo, VR), fin(q_w, VR), fifo, .{ .async = true, .ut_id = ut_b });
-    @fmovs(t_d, fin(q_lb, VR));
+    @fmovs(fifo, fab.fin(q_e, VR), .{ .async = true, .ut_id = ut_a });
+    @fadds(fab.fout(q_lo, VR), fab.fin(q_w, VR), fifo, .{ .async = true, .ut_id = ut_b });
+    @fmovs(t_d, fab.fin(q_lb, VR));
     stamp(66);
     var best: f32 = t[0];
     var bi: u16 = 0;

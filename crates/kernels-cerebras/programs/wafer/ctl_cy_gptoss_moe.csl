@@ -31,6 +31,7 @@ param GLUV: u16 = 0;   // 1: glu = max(g, g e) / (1 + e), e = exp(-SWA |g|), the
                        // steps (ctl_cy_dense.csl vsiluq's arithmetic) as vector ops; 0: e = exp(-SWA g), a scalar recip a word
 
 const sys_mod = @import_module("<memcpy/memcpy>", memcpy_params);
+const fab = @import_module("ops/fabric.csl", .{ .NQ = 6 });
 const tile_config = @import_module("<tile_config>");
 const color_config = tile_config.color_config;
 const tgt = tile_config.target;
@@ -96,69 +97,17 @@ const ut_a = @get_ut_id(4);
 const ut_b = @get_ut_id(5);
 var fifo_buf = @zeros([FIFOW]f32);
 const fifo = @allocate_fifo(fifo_buf);
-fn fout(comptime q: output_queue, n: u16) fabout_dsd {
-  return @set_dsd_length(@get_dsd(fabout_dsd, .{ .extent = 1, .output_queue = q }), n);
-}
-fn fin(comptime q: input_queue, n: u16) fabin_dsd {
-  return @set_dsd_length(@get_dsd(fabin_dsd, .{ .extent = 1, .input_queue = q }), n);
-}
 const NR: u16 = 12;
 const RQ: u16 = 1 + 2 * NR;
 var rcfg = @zeros([RQ + 12]u32);
 var rcfg_ptr: [*]u32 = &rcfg;
 var role_s: u16 = 0;
 var rout: u16 = 0;
-fn iqc(comptime qid: u16, c: u32) void {
-  const addr = tile_config.input_queue_config.get_input_queue_config_addr(qid);
-  const v: u16 = @get_config(addr, tile_config.input_queue_config.in_queue_addr_range);
-  @set_config(addr, (v & 0xffe0) | @as(u16, c), tile_config.input_queue_config.in_queue_addr_range);
-}
-fn oqc(comptime qid: u16, c: u32) void {
-  const addr = tile_config.output_queue_config.get_output_queue_config_addr(qid);
-  const v: u16 = @get_config(addr, tile_config.output_queue_config.out_queue_addr_range);
-  @set_config(addr, (v & 0xfe0f) | (@as(u16, c) << 4), tile_config.output_queue_config.out_queue_addr_range);
-}
-var qcur = [6]u16 { 13, 14, 17, 18, 19, 20 };
-fn iq_any(q: u16, c: u16) void {
-  if (q == 0) { iqc(2, c); }
-  else if (q == 1) { iqc(3, c); }
-  else if (q == 2) { iqc(4, c); }
-  else if (q == 3) { iqc(5, c); }
-  else if (q == 4) { iqc(6, c); }
-  else if (q == 5) { iqc(7, c); }
-}
-fn bind_iqs(fq: *[6]u16, tmp: u16) void {
-  var done = @zeros([6]u16);
-  var left: u16 = 6;
-  var guard: u16 = 0;
-  while (left > 0 and guard < 32) : (guard += 1) {
-    var prog = false;
-    var i: u16 = 0;
-    while (i < 6) : (i += 1) {
-      if (done[i] != 0) { continue; }
-      var clash = false;
-      var j: u16 = 0;
-      while (j < 6) : (j += 1) { if (j != i and done[j] == 0 and qcur[j] == fq.*[i]) { clash = true; } }
-      if (!clash) { iq_any(i, fq.*[i]); qcur[i] = fq.*[i]; done[i] = 1; left -= 1; prog = true; }
-    }
-    if (!prog) {
-      i = 0;
-      while (i < 6 and done[i] != 0) : (i += 1) {}
-      iq_any(i, tmp); qcur[i] = tmp;
-    }
-  }
-}
 fn init() void {
-  const cc0 = color_config.get_color_config_addr(@get_color(0));
-  var k: u16 = 0;
-  while (k < @as(u16, rcfg[0])) : (k += 1) {
-    const addr = cc0 + @as(u16, rcfg[1 + 2 * k]);
-    const r = @get_config(addr, tgt.color_addr_range) & 0xff00;
-    @set_config(addr, r | @as(u16, rcfg[2 + 2 * k]), tgt.color_addr_range);
-  }
+  fab.routes(&rcfg);
   var fq = [6]u16 { @as(u16, rcfg[RQ]), @as(u16, rcfg[RQ + 1]), @as(u16, rcfg[RQ + 2]), @as(u16, rcfg[RQ + 3]), @as(u16, rcfg[RQ + 8]), @as(u16, rcfg[RQ + 9]) };
-  bind_iqs(&fq, @as(u16, rcfg[RQ + 10]));
-  oqc(2, rcfg[RQ + 4]); oqc(3, rcfg[RQ + 5]); oqc(4, rcfg[RQ + 6]);
+  fab.bind_iqs(&fq, @as(u16, rcfg[RQ + 10]));
+  fab.oqc(2, rcfg[RQ + 4]); fab.oqc(3, rcfg[RQ + 5]); fab.oqc(4, rcfg[RQ + 6]);
   role_s = @as(u16, rcfg[RQ + 7]);
   rout = @as(u16, rcfg[RQ + 11]);
   vpl = @set_dsd_stride(@set_dsd_base_addr(vk_d, @ptrcast([*]u16, &vb)), 2);
@@ -167,9 +116,9 @@ fn init() void {
   sys_mod.unblock_cmd_stream();
 }
 fn reduce(n: u16) void {
-  @fmovs(fifo, fin(q_s, n), .{ .async = true, .ut_id = ut_a });
-  @fadds(fout(q_lo, n), fin(q_n, n), fifo, .{ .async = true, .ut_id = ut_b });
-  @fmovs(tv(0, n), fin(q_lb, n));
+  @fmovs(fifo, fab.fin(q_s, n), .{ .async = true, .ut_id = ut_a });
+  @fadds(fab.fout(q_lo, n), fab.fin(q_n, n), fifo, .{ .async = true, .ut_id = ut_b });
+  @fmovs(tv(0, n), fab.fin(q_lb, n));
 }
 // the control row's segment all-reduce of g (n words): roles 0 chain start, 1 add-forward, 4 root of two
 // halves, 6 root of one half, 5 alone; the root multicasts on q_so, the others take it on q_sm
@@ -177,13 +126,13 @@ fn seg_ar(n: u16) void {
   const d = @set_dsd_length(g_d, n);
   if (role_s == 5) { return; }
   if (role_s == 4 or role_s == 6) {
-    @fadds(d, d, fin(q_si, n));
-    if (role_s == 4) { @fadds(d, d, fin(q_s2, n)); }
-    @fmovs(fout(q_so, n), d);
+    @fadds(d, d, fab.fin(q_si, n));
+    if (role_s == 4) { @fadds(d, d, fab.fin(q_s2, n)); }
+    @fmovs(fab.fout(q_so, n), d);
     return;
   }
-  if (role_s == 0) { @fmovs(fout(q_so, n), d); } else { @fadds(fout(q_so, n), fin(q_si, n), d); }
-  @fmovs(d, fin(q_sm, n));
+  if (role_s == 0) { @fmovs(fab.fout(q_so, n), d); } else { @fadds(fab.fout(q_so, n), fab.fin(q_si, n), d); }
+  @fmovs(d, fab.fin(q_sm, n));
 }
 
 fn rsqrt(v: f32) f32 {
@@ -288,7 +237,7 @@ fn router(l: u16) void {
     u[k] = @as(f32, sel[k]);
     u[TK + k] = wsel[k];
   }
-  @fmovs(fout(q_mc, 2 * TK), uv(0, 2 * TK));
+  @fmovs(fab.fout(q_mc, 2 * TK), uv(0, 2 * TK));
   stamp(2 + 3 * l);
   // gate|up: t = [k][gate Ic | up Ic]
   reduce(TN);
@@ -345,7 +294,7 @@ fn router(l: u16) void {
     const pb = (l * NEX + sel[k]) * 2;
     @fmuls(uv(k * Ic, Ic), uv(k * Ic, Ic), wsel[k] * ps[pb + 1]);
   }
-  @fmovs(fout(q_mc, NG), U);
+  @fmovs(fab.fout(q_mc, NG), U);
   stamp(3 + 3 * l);
 }
 

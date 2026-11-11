@@ -38,6 +38,7 @@ param TSTAMP: u16 = 0;
 param FIFOW: u16 = 32;
 
 const sys_mod = @import_module("<memcpy/memcpy>", memcpy_params);
+const fab = @import_module("ops/fabric.csl", .{ .NQ = 6, .DONE_GLOBAL = true });
 const tile_config = @import_module("<tile_config>");
 const color_config = tile_config.color_config;
 const tgt = tile_config.target;
@@ -140,12 +141,6 @@ var fifo_buf = @zeros([FIFOW]f32);
 const fifo = @allocate_fifo(fifo_buf);
 var fifo_xbuf = @zeros([FIFOW]f32);
 const fifo_x = @allocate_fifo(fifo_xbuf);
-fn fout(comptime q: output_queue, n: u16) fabout_dsd {
-  return @set_dsd_length(@get_dsd(fabout_dsd, .{ .extent = 1, .output_queue = q }), n);
-}
-fn fin(comptime q: input_queue, n: u16) fabin_dsd {
-  return @set_dsd_length(@get_dsd(fabin_dsd, .{ .extent = 1, .input_queue = q }), n);
-}
 
 // rcfg: weight_dense's words; [RQ+11] flags (bit 0 column 0, bit 1 KVS
 // consumer, bit 2 the flush unit), [RQ+12] the KVS colour
@@ -159,63 +154,15 @@ var role_s: u16 = 0;
 var myrow: u16 = 0;
 var wfl: u16 = 0;
 
-fn iqc(comptime qid: u16, c: u32) void {
-  const addr = tile_config.input_queue_config.get_input_queue_config_addr(qid);
-  const v: u16 = @get_config(addr, tile_config.input_queue_config.in_queue_addr_range);
-  @set_config(addr, (v & 0xffe0) | @as(u16, c), tile_config.input_queue_config.in_queue_addr_range);
-}
-fn oqc(comptime qid: u16, c: u32) void {
-  const addr = tile_config.output_queue_config.get_output_queue_config_addr(qid);
-  const v: u16 = @get_config(addr, tile_config.output_queue_config.out_queue_addr_range);
-  @set_config(addr, (v & 0xfe0f) | (@as(u16, c) << 4), tile_config.output_queue_config.out_queue_addr_range);
-}
-var qcur = [6]u16 { 13, 14, 17, 18, 19, 20 };
-fn iq_any(q: u16, c: u16) void {
-  if (q == 0) { iqc(2, c); }
-  else if (q == 1) { iqc(3, c); }
-  else if (q == 2) { iqc(4, c); }
-  else if (q == 3) { iqc(5, c); }
-  else if (q == 4) { iqc(6, c); }
-  else if (q == 5) { iqc(7, c); }
-}
-var done = @zeros([6]u16);
 var fq = @zeros([6]u16);
-fn bind_iqs(fin: *[6]u16, tmp: u16) void {
-  var z: u16 = 0;
-  while (z < 6) : (z += 1) { done[z] = 0; }
-  var left: u16 = 6;
-  var guard: u16 = 0;
-  while (left > 0 and guard < 32) : (guard += 1) {
-    var prog = false;
-    var i: u16 = 0;
-    while (i < 6) : (i += 1) {
-      if (done[i] != 0) { continue; }
-      var clash = false;
-      var j: u16 = 0;
-      while (j < 6) : (j += 1) { if (j != i and done[j] == 0 and qcur[j] == fin.*[i]) { clash = true; } }
-      if (!clash) { iq_any(i, fin.*[i]); qcur[i] = fin.*[i]; done[i] = 1; left -= 1; prog = true; }
-    }
-    if (!prog) {
-      i = 0;
-      while (i < 6 and done[i] != 0) : (i += 1) {}
-      iq_any(i, tmp); qcur[i] = tmp;
-    }
-  }
-}
 
 fn init() void {
-  const cc0 = color_config.get_color_config_addr(@get_color(0));
-  var k: u16 = 0;
-  while (k < @as(u16, rcfg[0])) : (k += 1) {
-    const addr = cc0 + @as(u16, rcfg[1 + 2 * k]);
-    const r = @get_config(addr, tgt.color_addr_range) & 0xff00;
-    @set_config(addr, r | @as(u16, rcfg[2 + 2 * k]), tgt.color_addr_range);
-  }
+  fab.routes(&rcfg);
   var q: u16 = 0;
   while (q < 6) : (q += 1) { fq[q] = @as(u16, rcfg[RQ + q]); }
-  bind_iqs(&fq, @as(u16, rcfg[RQ + 24]));
-  oqc(5, rcfg[RQ + 6]);
-  oqc(3, rcfg[RQ + 7]);
+  fab.bind_iqs(&fq, @as(u16, rcfg[RQ + 24]));
+  fab.oqc(5, rcfg[RQ + 6]);
+  fab.oqc(3, rcfg[RQ + 7]);
   role_x = @as(u16, rcfg[RQ + 8]);
   role_y = @as(u16, rcfg[RQ + 9]);
   role_s = @as(u16, rcfg[RQ + 10]);
@@ -230,20 +177,20 @@ fn init() void {
 fn send_x(n: u16) void {
   const d = @set_dsd_length(y_d, n);
   const A = .{ .async = true, .ut_id = ut_xb };
-  if (role_x == 0) { @fmovs(fout(q_xo, n), d, A); }
+  if (role_x == 0) { @fmovs(fab.fout(q_xo, n), d, A); }
   else if (role_x == 2) {
-    @fadds(fifo_x, fin(q_xa, n), d, .{ .async = true, .ut_id = ut_xa });
-    @fadds(fout(q_xo, n), fin(q_xb, n), fifo_x, A);
-  } else { @fadds(fout(q_xo, n), fin(q_xa, n), d, A); }   // roles 1, 3
+    @fadds(fifo_x, fab.fin(q_xa, n), d, .{ .async = true, .ut_id = ut_xa });
+    @fadds(fab.fout(q_xo, n), fab.fin(q_xb, n), fifo_x, A);
+  } else { @fadds(fab.fout(q_xo, n), fab.fin(q_xa, n), d, A); }   // roles 1, 3
 }
 fn send_y(n: u16) void {
   const d = @set_dsd_length(y_d, n);
   const A = .{ .async = true, .ut_id = ut_b };
-  if (role_y == 0) { @fmovs(fout(q_yo, n), d, A); }
+  if (role_y == 0) { @fmovs(fab.fout(q_yo, n), d, A); }
   else if (role_y == 2) {
-    @fadds(fifo, fin(q_ya, n), d, .{ .async = true, .ut_id = ut_a });
-    @fadds(fout(q_yo, n), fin(q_yb, n), fifo, A);
-  } else { @fadds(fout(q_yo, n), fin(q_ya, n), d, A); }   // roles 1, 3
+    @fadds(fifo, fab.fin(q_ya, n), d, .{ .async = true, .ut_id = ut_a });
+    @fadds(fab.fout(q_yo, n), fab.fin(q_yb, n), fifo, A);
+  } else { @fadds(fab.fout(q_yo, n), fab.fin(q_ya, n), d, A); }   // roles 1, 3
 }
 
 // ---------------------------------------------------------------- matvec
@@ -286,11 +233,11 @@ fn kvmv(p: [*]u16, R: u16, N: u16, xo: u16, yo: u16) void {
 }
 // A deferred phase: [a | b | 4 sums] in, [W a | W b | sums] out (2 N + 4 words)
 fn mv2(off: u16, N: u16) void {
-  @fs2h(@set_dsd_length(xh_d, Hc), fin(q_xm, Hc));
+  @fs2h(@set_dsd_length(xh_d, Hc), fab.fin(q_xm, Hc));
   mv(off, Hc, N, 0);
-  @fs2h(@set_dsd_length(xh_d, Hc), fin(q_xm, Hc));
+  @fs2h(@set_dsd_length(xh_d, Hc), fab.fin(q_xm, Hc));
   mv(off, Hc, N, N);
-  @fmovs(@set_dsd_length(@increment_dsd_offset(y_d, @as(i16, 2 * N), f32), 4), fin(q_xm, 4));
+  @fmovs(@set_dsd_length(@increment_dsd_offset(y_d, @as(i16, 2 * N), f32), 4), fab.fin(q_xm, 4));
   send_y(2 * N + 4);
 }
 // the row partial with the deferred scalar as its last word (column 0's PE only)
@@ -303,10 +250,10 @@ fn send_row(sv: f32) void {
 fn qmode(m: u16) void {
   while ((tile_config.output_queue_status.get_raw() & 0x1000) == 0) {}   // oq4 empty
   if (m == 0) {
-    iqc(6, rcfg[RQ + 4]); iqc(7, rcfg[RQ + 5]);
+    fab.iqc(6, rcfg[RQ + 4]); fab.iqc(7, rcfg[RQ + 5]);
   } else {
-    iqc(7, rcfg[RQ + 13]); oqc(4, rcfg[RQ + 15]);
-    iqc(6, if (role_s == 4) rcfg[RQ + 14] else rcfg[RQ + 16]);
+    fab.iqc(7, rcfg[RQ + 13]); fab.oqc(4, rcfg[RQ + 15]);
+    fab.iqc(6, if (role_s == 4) rcfg[RQ + 14] else rcfg[RQ + 16]);
   }
 }
 var sx = @zeros([NS]f32);
@@ -315,17 +262,17 @@ fn seg_ar(n: u16) void {
   const d = @set_dsd_length(sx_d, n);
   qmode(2);
   if (role_s == 4) {
-    @fadds(d, d, fin(q_ym, n));
-    @fadds(d, d, fin(q_xm, n));
-    @fmovs(fout(q_ao, n), d);
+    @fadds(d, d, fab.fin(q_ym, n));
+    @fadds(d, d, fab.fin(q_xm, n));
+    @fmovs(fab.fout(q_ao, n), d);
   } else if (role_s == 6) {
-    @fadds(d, d, fin(q_ym, n));
-    @fmovs(fout(q_ao, n), d);
+    @fadds(d, d, fab.fin(q_ym, n));
+    @fmovs(fab.fout(q_ao, n), d);
   } else {
     const A = .{ .async = true, .ut_id = ut_b };
-    if (role_s == 0) { @fmovs(fout(q_ao, n), d, A); }
-    else { @fadds(fout(q_ao, n), fin(q_ym, n), d, A); }
-    @fmovs(d, fin(q_xm, n));
+    if (role_s == 0) { @fmovs(fab.fout(q_ao, n), d, A); }
+    else { @fadds(fab.fout(q_ao, n), fab.fin(q_ym, n), d, A); }
+    @fmovs(d, fab.fin(q_xm, n));
   }
   qmode(0);
 }
@@ -471,8 +418,8 @@ var kvlog = @zeros([if (DIAG != 0 or PLOG == 1) 2 * 64 else 1]f32);   // (DIAG 1
 var kvlog_ptr: [*]f32 = &kvlog;
 fn kv_post() void {
   kvb[16] = -1.0;
-  iqc(7, rcfg[RQ + 12]);
-  @fmovs(kvb_d, fin(q_ym, 17), .{ .async = true, .ut_id = ut_k });
+  fab.iqc(7, rcfg[RQ + 12]);
+  @fmovs(kvb_d, fab.fin(q_ym, 17), .{ .async = true, .ut_id = ut_k });
 }
 var chk = @zeros([1]f32);
 fn kv_take(pos: u32, s: u32) void {
@@ -482,7 +429,7 @@ fn kv_take(pos: u32, s: u32) void {
   const sd = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{1} -> kvb[@as(i16, 16) + i] });
   @fmovs(cd, sd);
   while (chk[0] != want) { @fmovs(cd, sd); }   // (a DSD read each turn: the async receive writes kvb)
-  iqc(7, rcfg[RQ + 5]);
+  fab.iqc(7, rcfg[RQ + 5]);
   if (DIAG != 0 or PLOG == 1) {
     var t: f32 = 0.0;
     var i: u16 = 0;
@@ -516,7 +463,7 @@ fn attm(l: u16, pos_out: *u32, comptime g: u16) void {
   const c = cache_of(l);
   const ne: u16 = if (g == 2) cne(c) else if (g == 1) NEG else NES;
   const ihd: f32 = if (isg(l)) IHDG else IHDS;   // (reciprocals: no runtime f32 divide)
-  @fmovs(@set_dsd_length(ab_d, AB), fin(q_ym, AB));
+  @fmovs(@set_dsd_length(ab_d, AB), fab.fin(q_ym, AB));
   const pos = @as(u32, ab[QD + 2 * dc]);
   pos_out.* = pos;
   s_att = ab[QD + 2 * dc + Qh + 3];
@@ -583,8 +530,8 @@ fn attm(l: u16, pos_out: *u32, comptime g: u16) void {
     h = 0;
     while (h < Qh) : (h += 1) { kvmv(@ptrcast([*]u16, &vc[1 + vb]), NEl, dc + 1, h * NEl, h * (dc + 1)); }
     send_y(Qh * (dc + 1));
-    @fs2h(@set_dsd_length(xh_d, QD), fin(q_ym, QD));
-    @fmovs(@set_dsd_length(sx_d, 1 + Qh), fin(q_ym, 1 + Qh));
+    @fs2h(@set_dsd_length(xh_d, QD), fab.fin(q_ym, QD));
+    @fmovs(@set_dsd_length(sx_d, 1 + Qh), fab.fin(q_ym, 1 + Qh));
     if (sx[0] == 0.0) {
       lpa = l + 1;                 // (ATTL 2) the logs come in a Qh-word multicast after o: read after the o_proj send
       apass = 8;
@@ -599,7 +546,7 @@ var lpa: u16 = 0;
 fn lse_late() void {
   if (lpa == 0) { return; }
   const l = lpa - 1;
-  @fmovs(@set_dsd_length(sx_d, Qh), fin(q_ym, Qh));
+  @fmovs(@set_dsd_length(sx_d, Qh), fab.fin(q_ym, Qh));
   var h: u16 = 0;
   while (h < Qh) : (h += 1) { mref[l * Qh + h] += sx[h]; }
   lpa = 0;
@@ -628,8 +575,8 @@ fn layer(l: u16, b: u16) u16 {
   const bg = bo + QO * Hc;
   mv2(bg, 2 * Ic);
   stamp(4 + 9 * l);
-  @fs2h(@set_dsd_length(xh_d, Ic), fin(q_ym, Ic));
-  @fmovs(@set_dsd_length(sv2_d, 1), fin(q_ym, 1));
+  @fs2h(@set_dsd_length(xh_d, Ic), fab.fin(q_ym, Ic));
+  @fmovs(@set_dsd_length(sv2_d, 1), fab.fin(q_ym, 1));
   stamp(5 + 9 * l);
   const bd = bg + Hc * 2 * Ic;
   mv(bd, Ic, Hc, 0);
@@ -638,7 +585,7 @@ fn layer(l: u16, b: u16) u16 {
   // PLE: the gate (deferred), z | the post-FFN scalar, the projection
   const bp = bd + Ic * Hc;
   mv2(bp, 1);
-  @fmovs(sv2_d, fin(q_ym, 2));
+  @fmovs(sv2_d, fab.fin(q_ym, 2));
   xh[0] = @as(@fp16(), sv2[0]);
   stamp(7 + 9 * l);
   mv(bp + Hc, 1, Hc, 0);
@@ -648,9 +595,9 @@ fn layer(l: u16, b: u16) u16 {
 }
 // the last unit's flush: the last layer's post-PLE scalar back to CX
 fn flush() void {
-  @fmovs(@set_dsd_length(y_d, 4), fin(q_xm, 4));
+  @fmovs(@set_dsd_length(y_d, 4), fab.fin(q_xm, 4));
   send_y(4);
-  @fmovs(@set_dsd_length(sv2_d, 1), fin(q_ym, 1));
+  @fmovs(@set_dsd_length(sv2_d, 1), fab.fin(q_ym, 1));
   y[0] = if ((wfl & 1) != 0) sv2[0] else 0.0;
   send_x(1);
 }
@@ -659,11 +606,11 @@ fn relay(o: u16) void {
   const n = @as(u16, rcfg[RQ + o]);
   if (n == 0) { return; }
   while ((tile_config.output_queue_status.get_raw() & 0x1000) == 0) {}
-  iqc(6, rcfg[RQ + o + 1]);
-  oqc(4, rcfg[RQ + o + 2]);
-  @fmovs(fout(q_ao, n), fin(q_xm, n));
+  fab.iqc(6, rcfg[RQ + o + 1]);
+  fab.oqc(4, rcfg[RQ + o + 2]);
+  @fmovs(fab.fout(q_ao, n), fab.fin(q_xm, n));
   // iq6 only: iq7 may hold the KVS receive posted for the next pass (qmode(0) rebinding it here hung the KVS line)
-  iqc(6, rcfg[RQ + 4]);
+  fab.iqc(6, rcfg[RQ + 4]);
 }
 
 var n_steps: u32 = 0;

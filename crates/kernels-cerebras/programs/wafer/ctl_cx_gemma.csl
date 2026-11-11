@@ -17,6 +17,7 @@ param XKEEP: u16 = 0;
 param FIFOW: u16 = 32;
 
 const sys_mod = @import_module("<memcpy/memcpy>", memcpy_params);
+const fab = @import_module("ops/fabric.csl", .{ .NQ = 5 });
 const tile_config = @import_module("<tile_config>");
 const color_config = tile_config.color_config;
 const tgt = tile_config.target;
@@ -61,74 +62,23 @@ const ut_a = @get_ut_id(4);
 const ut_b = @get_ut_id(5);
 var fifo_buf = @zeros([FIFOW]f32);
 const fifo = @allocate_fifo(fifo_buf);
-fn fout(comptime q: output_queue, n: u16) fabout_dsd {
-  return @set_dsd_length(@get_dsd(fabout_dsd, .{ .extent = 1, .output_queue = q }), n);
-}
-fn fin(comptime q: input_queue, n: u16) fabin_dsd {
-  return @set_dsd_length(@get_dsd(fabin_dsd, .{ .extent = 1, .input_queue = q }), n);
-}
 const NR: u16 = 12;
 const RQ: u16 = 1 + 2 * NR;
 var rcfg = @zeros([RQ + 10]u32);   // ctl_cx's; [RQ+7] flags: bit 0 first unit, 1 no handoff out, 2 the wafer loop's
 var rcfg_ptr: [*]u32 = &rcfg;      // embedding in (iq6), 3 the flush unit
-fn iqc(comptime qid: u16, c: u32) void {
-  const addr = tile_config.input_queue_config.get_input_queue_config_addr(qid);
-  const v: u16 = @get_config(addr, tile_config.input_queue_config.in_queue_addr_range);
-  @set_config(addr, (v & 0xffe0) | @as(u16, c), tile_config.input_queue_config.in_queue_addr_range);
-}
-fn oqc(comptime qid: u16, c: u32) void {
-  const addr = tile_config.output_queue_config.get_output_queue_config_addr(qid);
-  const v: u16 = @get_config(addr, tile_config.output_queue_config.out_queue_addr_range);
-  @set_config(addr, (v & 0xfe0f) | (@as(u16, c) << 4), tile_config.output_queue_config.out_queue_addr_range);
-}
-var qcur = [5]u16 { 13, 14, 17, 18, 19 };
-fn iq_any(q: u16, c: u16) void {
-  if (q == 0) { iqc(2, c); }
-  else if (q == 1) { iqc(3, c); }
-  else if (q == 2) { iqc(4, c); }
-  else if (q == 3) { iqc(5, c); }
-  else if (q == 4) { iqc(6, c); }
-}
-fn bind_iqs(fin: *[5]u16, tmp: u16) void {
-  var done = @zeros([5]u16);
-  var left: u16 = 5;
-  var guard: u16 = 0;
-  while (left > 0 and guard < 32) : (guard += 1) {
-    var prog = false;
-    var i: u16 = 0;
-    while (i < 5) : (i += 1) {
-      if (done[i] != 0) { continue; }
-      var clash = false;
-      var j: u16 = 0;
-      while (j < 5) : (j += 1) { if (j != i and done[j] == 0 and qcur[j] == fin.*[i]) { clash = true; } }
-      if (!clash) { iq_any(i, fin.*[i]); qcur[i] = fin.*[i]; done[i] = 1; left -= 1; prog = true; }
-    }
-    if (!prog) {
-      i = 0;
-      while (i < 5 and done[i] != 0) : (i += 1) {}
-      iq_any(i, tmp); qcur[i] = tmp;
-    }
-  }
-}
 fn init() void {
-  const cc0 = color_config.get_color_config_addr(@get_color(0));
-  var k: u16 = 0;
-  while (k < @as(u16, rcfg[0])) : (k += 1) {
-    const addr = cc0 + @as(u16, rcfg[1 + 2 * k]);
-    const r = @get_config(addr, tgt.color_addr_range) & 0xff00;
-    @set_config(addr, r | @as(u16, rcfg[2 + 2 * k]), tgt.color_addr_range);
-  }
+  fab.routes(&rcfg);
   var fq = [5]u16 { @as(u16, rcfg[RQ]), @as(u16, rcfg[RQ + 1]), @as(u16, rcfg[RQ + 2]), @as(u16, rcfg[RQ + 3]), @as(u16, rcfg[RQ + 9]) };
-  bind_iqs(&fq, @as(u16, rcfg[RQ + 8]));
-  oqc(2, rcfg[RQ + 4]); oqc(3, rcfg[RQ + 5]); oqc(4, rcfg[RQ + 6]);
+  fab.bind_iqs(&fq, @as(u16, rcfg[RQ + 8]));
+  fab.oqc(2, rcfg[RQ + 4]); fab.oqc(3, rcfg[RQ + 5]); fab.oqc(4, rcfg[RQ + 6]);
   timestamp.enable_tsc();
   sys_mod.unblock_cmd_stream();
 }
 
 fn reduce(n: u16) void {
-  @fmovs(fifo, fin(q_e, n), .{ .async = true, .ut_id = ut_a });
-  @fadds(fout(q_lo, n), fin(q_w, n), fifo, .{ .async = true, .ut_id = ut_b });
-  @fmovs(@set_dsd_length(t1_d, n), fin(q_lb, n));
+  @fmovs(fifo, fab.fin(q_e, n), .{ .async = true, .ut_id = ut_a });
+  @fadds(fab.fout(q_lo, n), fab.fin(q_w, n), fifo, .{ .async = true, .ut_id = ut_b });
+  @fmovs(@set_dsd_length(t1_d, n), fab.fin(q_lb, n));
 }
 fn dot(a: [*]f32, b: [*]f32) f32 {
   var s: f32 = 0.0;
@@ -139,14 +89,14 @@ fn dot(a: [*]f32, b: [*]f32) f32 {
 // a phase's row multicast: g x, g p (g at gam[go], or ones when go is 0xffff), then the sums (r2 first)
 fn send(go: u16, fromt: bool, full: bool) void {
   if (go == 0xffff) {
-    @fmovs(fout(q_mc, Hc), x_d);
-    @fmovs(fout(q_mc, Hc), p_d);
+    @fmovs(fab.fout(q_mc, Hc), x_d);
+    @fmovs(fab.fout(q_mc, Hc), p_d);
   } else {
     const g = @increment_dsd_offset(g_d, @as(i16, go), f32);
     @fmuls(ab_d, x_d, g);
-    @fmovs(fout(q_mc, Hc), ab_d);
+    @fmovs(fab.fout(q_mc, Hc), ab_d);
     @fmuls(ab_d, p_d, g);
-    @fmovs(fout(q_mc, Hc), ab_d);
+    @fmovs(fab.fout(q_mc, Hc), ab_d);
   }
   const tp = @ptrcast([*]f32, &t[0]);
   sc[0] = if (fromt) dot(tp, tp) else x[2 * Hc];
@@ -159,7 +109,7 @@ fn send(go: u16, fromt: bool, full: bool) void {
   } else {
     sc[1] = 0.0; sc[2] = 0.0; sc[3] = 0.0;
   }
-  @fmovs(fout(q_mc, 4), sc_d);
+  @fmovs(fab.fout(q_mc, 4), sc_d);
 }
 // the reduction back (t): x += s p, then p = g r
 fn take(go: u16, i: u16) void {
@@ -175,9 +125,9 @@ task pass_task() void {
   var s: u32 = 0;
   while (s < n_steps) : (s += 1) {
     const fl = rcfg[RQ + 7];
-    if (HOSTX == 0 and (fl & 1) == 0) { @fmovs(xw_d, fin(q_hi, HW)); }
+    if (HOSTX == 0 and (fl & 1) == 0) { @fmovs(xw_d, fab.fin(q_hi, HW)); }
     else {
-      if (s > 0 and (fl & 4) != 0) { @fmovs(x_d, fin(q_em, Hc)); }   // the wafer loop's next token (else the host's x)
+      if (s > 0 and (fl & 4) != 0) { @fmovs(x_d, fab.fin(q_em, Hc)); }   // the wafer loop's next token (else the host's x)
       @fmuls(x_d, x_d, gam[K * GL]);                                 // the embedding scale
       @fmovs(p_d, 0.0);
       x[2 * Hc] = 0.0;
@@ -202,14 +152,14 @@ task pass_task() void {
     if ((DIAG & 1) == 0) { const tq = @ptrcast([*]f32, &t[0]); x[2 * Hc] = dot(tq, tq); }   // the last PLE's |h|^2
     if ((DIAG & 1) == 0 and (fl & 8) != 0) {
       sc[0] = x[2 * Hc]; sc[1] = 0.0; sc[2] = 0.0; sc[3] = 0.0;
-      @fmovs(fout(q_mc, 4), sc_d);
+      @fmovs(fab.fout(q_mc, 4), sc_d);
       reduce(1);
       @fmacs(x_d, x_d, p_d, t[0]);
       @fmovs(p_d, 0.0);
       x[2 * Hc] = 0.0;
-      if (HOSTX == 0 and (fl & 2) == 0) { @fmovs(fout(q_ho, Hc), x_d); }
+      if (HOSTX == 0 and (fl & 2) == 0) { @fmovs(fab.fout(q_ho, Hc), x_d); }
     } else if (HOSTX == 0 and (fl & 2) == 0) {
-      @fmovs(fout(q_ho, if ((fl & 16) != 0) Hc else HW), xw_d);
+      @fmovs(fab.fout(q_ho, if ((fl & 16) != 0) Hc else HW), xw_d);
     }
     stamp(K + 1);
   }

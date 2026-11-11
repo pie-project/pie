@@ -220,7 +220,7 @@ impl ProgramKey {
         toolchain: &Path,
     ) -> R<ProgramKey> {
         let mut k = blake3::Hasher::new();
-        for (name, src) in sources::KERNELS {
+        for (name, src) in sources::KERNELS.iter().chain(sources::OPS) {
             k.update(name.as_bytes())
                 .update(&[0])
                 .update(src.as_bytes())

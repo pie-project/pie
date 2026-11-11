@@ -29,6 +29,7 @@ param VR: u16;
 param HDc: u16;
 
 const sys_mod = @import_module("<memcpy/memcpy>", memcpy_params);
+const fab = @import_module("ops/fabric.csl", .{ .NQ = 6 });
 const tile_config = @import_module("<tile_config>");
 const color_config = tile_config.color_config;
 const tgt = tile_config.target;
@@ -63,58 +64,12 @@ const ut_a = @get_ut_id(4);
 const ut_b = @get_ut_id(5);
 var fifo_buf = @zeros([32]f32);
 const fifo = @allocate_fifo(fifo_buf);
-fn fout(comptime q: output_queue, n: u16) fabout_dsd {
-  return @set_dsd_length(@get_dsd(fabout_dsd, .{ .extent = 1, .output_queue = q }), n);
-}
-fn fin(comptime q: input_queue, n: u16) fabin_dsd {
-  return @set_dsd_length(@get_dsd(fabin_dsd, .{ .extent = 1, .input_queue = q }), n);
-}
 const NR: u16 = 12;
 const RQ: u16 = 1 + 2 * NR;
 var rcfg = @zeros([RQ + 15]u32);
 var rcfg_ptr: [*]u32 = &rcfg;
 var role_r: u16 = 0;
 var role_x: u16 = 0;
-fn iqc(comptime qid: u16, c: u32) void {
-  const addr = tile_config.input_queue_config.get_input_queue_config_addr(qid);
-  const v: u16 = @get_config(addr, tile_config.input_queue_config.in_queue_addr_range);
-  @set_config(addr, (v & 0xffe0) | @as(u16, c), tile_config.input_queue_config.in_queue_addr_range);
-}
-fn oqc(comptime qid: u16, c: u32) void {
-  const addr = tile_config.output_queue_config.get_output_queue_config_addr(qid);
-  const v: u16 = @get_config(addr, tile_config.output_queue_config.out_queue_addr_range);
-  @set_config(addr, (v & 0xfe0f) | (@as(u16, c) << 4), tile_config.output_queue_config.out_queue_addr_range);
-}
-var qcur = [6]u16 { 13, 14, 17, 18, 19, 20 };
-fn iq_any(q: u16, c: u16) void {
-  if (q == 0) { iqc(2, c); }
-  else if (q == 1) { iqc(3, c); }
-  else if (q == 2) { iqc(4, c); }
-  else if (q == 3) { iqc(5, c); }
-  else if (q == 4) { iqc(6, c); }
-  else if (q == 5) { iqc(7, c); }
-}
-fn bind_iqs(fq: *[6]u16, tmp: u16) void {
-  var done = @zeros([6]u16);
-  var left: u16 = 6;
-  var guard: u16 = 0;
-  while (left > 0 and guard < 32) : (guard += 1) {
-    var prog = false;
-    var i: u16 = 0;
-    while (i < 6) : (i += 1) {
-      if (done[i] != 0) { continue; }
-      var clash = false;
-      var j: u16 = 0;
-      while (j < 6) : (j += 1) { if (j != i and done[j] == 0 and qcur[j] == fq.*[i]) { clash = true; } }
-      if (!clash) { iq_any(i, fq.*[i]); qcur[i] = fq.*[i]; done[i] = 1; left -= 1; prog = true; }
-    }
-    if (!prog) {
-      i = 0;
-      while (i < 6 and done[i] != 0) : (i += 1) {}
-      iq_any(i, tmp); qcur[i] = tmp;
-    }
-  }
-}
 
 // ---------------------------------------------------------------- the wafer token loop
 var hemb = @zeros([VR * HDc + 1]u16);
@@ -134,16 +89,11 @@ fn init() void {
   ebw_d = @set_dsd_stride(@set_dsd_base_addr(@set_dsd_length(ebh_d, HDc), @ptrcast([*]u16, &eb)), 2);
   ebw_d = @increment_dsd_offset(ebw_d, 1, u16);
   const cc0 = color_config.get_color_config_addr(@get_color(0));
-  var k: u16 = 0;
-  while (k < @as(u16, rcfg[0])) : (k += 1) {
-    const addr = cc0 + @as(u16, rcfg[1 + 2 * k]);
-    const r = @get_config(addr, tgt.color_addr_range) & 0xff00;
-    @set_config(addr, r | @as(u16, rcfg[2 + 2 * k]), tgt.color_addr_range);
-  }
+  fab.routes(&rcfg);
   var fq = [6]u16 { @as(u16, rcfg[RQ]), @as(u16, rcfg[RQ + 1]), @as(u16, rcfg[RQ + 2]), @as(u16, rcfg[RQ + 3]), @as(u16, rcfg[RQ + 4]), @as(u16, rcfg[RQ + 5]) };
-  bind_iqs(&fq, @as(u16, rcfg[RQ + 10]));
-  oqc(2, rcfg[RQ + 6]); oqc(3, rcfg[RQ + 7]);
-  oqc(4, rcfg[RQ + 13]); oqc(5, rcfg[RQ + 14]);
+  fab.bind_iqs(&fq, @as(u16, rcfg[RQ + 10]));
+  fab.oqc(2, rcfg[RQ + 6]); fab.oqc(3, rcfg[RQ + 7]);
+  fab.oqc(4, rcfg[RQ + 13]); fab.oqc(5, rcfg[RQ + 14]);
   wfl = @as(u16, rcfg[RQ + 11]);
   he_addr = cc0 + @as(u16, rcfg[RQ + 13]);
   he_orig = @get_config(he_addr, tgt.color_addr_range) & 0xff;
@@ -160,19 +110,19 @@ fn mvs_step(xv: @fp16()) void { @fmachs(mv_dest, mv_src0, mv_src1, xv); }
 
 fn recv_x() void {
   if (role_x == 0) {
-    @fmovs(x_d, fin(q_hm, HDc));
+    @fmovs(x_d, fab.fin(q_hm, HDc));
   } else {
-    @fmovs(x_d, fin(q_hx, HDc));
-    @fmovs(fout(q_xo, HDc), x_d);
+    @fmovs(x_d, fab.fin(q_hx, HDc));
+    @fmovs(fab.fout(q_xo, HDc), x_d);
   }
 }
 fn send_r() void {
   const A = .{ .async = true, .ut_id = ut_b };
-  if (role_r == 0) { @fmovs(fout(q_ro, VR), y_d, A); }
+  if (role_r == 0) { @fmovs(fab.fout(q_ro, VR), y_d, A); }
   else if (role_r == 2) {
-    @fadds(fifo, fin(q_ra, VR), y_d, .{ .async = true, .ut_id = ut_a });
-    @fadds(fout(q_ro, VR), fin(q_rb, VR), fifo, A);
-  } else { @fadds(fout(q_ro, VR), fin(q_ra, VR), y_d, A); }
+    @fadds(fifo, fab.fin(q_ra, VR), y_d, .{ .async = true, .ut_id = ut_a });
+    @fadds(fab.fout(q_ro, VR), fab.fin(q_rb, VR), fifo, A);
+  } else { @fadds(fab.fout(q_ro, VR), fab.fin(q_ra, VR), y_d, A); }
 }
 fn he_restore() void {
   if (!he_dirty) { return; }
@@ -182,7 +132,7 @@ fn he_restore() void {
   he_dirty = false;
 }
 fn hloop() void {
-  @fmovs(ww_d, fin(q_w, 1));
+  @fmovs(ww_d, fab.fin(q_w, 1));
   const w = ww[0];
   if (w < -1.0e8) { return; }
   const busend = (wfl & 2) != 0;
@@ -191,15 +141,15 @@ fn hloop() void {
     @fmovs(eb_d, 0.0);
     @mov16(ebw_d, @increment_dsd_offset(ebh_d, @as(i16, j * HDc), u16));
     if (busend) {
-      @fmovs(fout(q_vo, HDc), eb_d);
+      @fmovs(fab.fout(q_vo, HDc), eb_d);
     } else {
       const r = @get_config(he_addr, tgt.color_addr_range) & 0xff00;
       @set_config(he_addr, r | 0x80 | (he_orig & 0x1f), tgt.color_addr_range);
       he_dirty = true;
-      @fmovs(fout(q_bo, HDc), eb_d);
+      @fmovs(fab.fout(q_bo, HDc), eb_d);
     }
   } else if (busend) {
-    @fmovs(fout(q_vo, HDc), fin(q_he, HDc));
+    @fmovs(fab.fout(q_vo, HDc), fab.fin(q_he, HDc));
   }
 }
 

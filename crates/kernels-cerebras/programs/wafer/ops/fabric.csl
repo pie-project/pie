@@ -1,0 +1,87 @@
+// wafer/ops/fabric.csl: a PE's fabric plumbing, every role kernel's (README.md). The fabric DSDs
+// of a queue, the input / output queue colour words, the host's routes (rcfg's leading words) and
+// the input queues' colours bound without a transient duplicate.
+//
+// Params: NQ, the input queues bind_iqs binds (iq2 .. iq(1 + NQ), 0: none); DONE_GLOBAL, its
+// bookkeeping in memory instead of on the stack (a PE short of stack).
+param NQ: u16 = 0;
+param DONE_GLOBAL: bool = false;
+
+const tile_config = @import_module("<tile_config>");
+const color_config = tile_config.color_config;
+const tgt = tile_config.target;
+
+fn fout(comptime q: output_queue, n: u16) fabout_dsd {
+  return @set_dsd_length(@get_dsd(fabout_dsd, .{ .extent = 1, .output_queue = q }), n);
+}
+fn fin(comptime q: input_queue, n: u16) fabin_dsd {
+  return @set_dsd_length(@get_dsd(fabin_dsd, .{ .extent = 1, .input_queue = q }), n);
+}
+
+fn iqc(comptime qid: u16, c: u32) void {
+  const addr = tile_config.input_queue_config.get_input_queue_config_addr(qid);
+  const v: u16 = @get_config(addr, tile_config.input_queue_config.in_queue_addr_range);
+  @set_config(addr, (v & 0xffe0) | @as(u16, c), tile_config.input_queue_config.in_queue_addr_range);
+}
+fn oqc(comptime qid: u16, c: u32) void {
+  const addr = tile_config.output_queue_config.get_output_queue_config_addr(qid);
+  const v: u16 = @get_config(addr, tile_config.output_queue_config.out_queue_addr_range);
+  @set_config(addr, (v & 0xfe0f) | (@as(u16, c) << 4), tile_config.output_queue_config.out_queue_addr_range);
+}
+
+// The host's routes: rcfg[0] of them, then (colour, low route byte) pairs.
+fn routes(rcfg: [*]u32) void {
+  const cc0 = color_config.get_color_config_addr(@get_color(0));
+  var k: u16 = 0;
+  while (k < @as(u16, rcfg[0])) : (k += 1) {
+    const addr = cc0 + @as(u16, rcfg[1 + 2 * k]);
+    const r = @get_config(addr, tgt.color_addr_range) & 0xff00;
+    @set_config(addr, r | @as(u16, rcfg[2 + 2 * k]), tgt.color_addr_range);
+  }
+}
+
+// Input-queue colours from the host without a transient duplicate (the fabric refuses two input
+// queues on one colour, even for a moment): a queue takes its colour only when no other queue still
+// holds it; a cycle goes through the host's spare colour (rcfg's tmp word). The queues start
+// parked on 13, 14, 17, 18, 19, 20 (the kernels' comptime queue colours).
+const QN: u16 = if (NQ == 0) 1 else NQ;
+var qcur = if (NQ == 5) [5]u16 { 13, 14, 17, 18, 19 } else [6]u16 { 13, 14, 17, 18, 19, 20 };
+var done_g = @zeros([if (DONE_GLOBAL) QN else 1]u16);
+fn iq_any(q: u16, c: u16) void {
+  if (q == 0) { iqc(2, c); }
+  else if (q == 1) { iqc(3, c); }
+  else if (q == 2) { iqc(4, c); }
+  else if (q == 3) { iqc(5, c); }
+  else if (q == 4) { iqc(6, c); }
+  else if (NQ > 5 and q == 5) { iqc(7, c); }
+}
+fn bind_iqs(fin_: *[QN]u16, tmp: u16) void {
+  if (DONE_GLOBAL) {
+    var z: u16 = 0;
+    while (z < QN) : (z += 1) { done_g[z] = 0; }
+    bind(fin_, &done_g, tmp);
+  } else {
+    var done = @zeros([QN]u16);
+    bind(fin_, &done, tmp);
+  }
+}
+fn bind(fin_: *[QN]u16, done: *[QN]u16, tmp: u16) void {
+  var left: u16 = QN;
+  var guard: u16 = 0;
+  while (left > 0 and guard < 32) : (guard += 1) {
+    var prog = false;
+    var i: u16 = 0;
+    while (i < QN) : (i += 1) {
+      if (done.*[i] != 0) { continue; }
+      var clash = false;
+      var j: u16 = 0;
+      while (j < QN) : (j += 1) { if (j != i and done.*[j] == 0 and qcur[j] == fin_.*[i]) { clash = true; } }
+      if (!clash) { iq_any(i, fin_.*[i]); qcur[i] = fin_.*[i]; done.*[i] = 1; left -= 1; prog = true; }
+    }
+    if (!prog) {
+      i = 0;
+      while (i < QN and done.*[i] != 0) : (i += 1) {}
+      iq_any(i, tmp); qcur[i] = tmp;
+    }
+  }
+}
