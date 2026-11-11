@@ -2714,6 +2714,10 @@ fn append_pool_planes(
     ]))
 }
 
+/// The most rows a plane of a fire writes in place, one by one, rather than
+/// by a DMA kernel call.
+const ROWS_IN_PLACE: i64 = 2;
+
 /// Both pool planes' rows, each by itself, as one block scatter: row `i` of
 /// plane `x` to page `maps[x](page[i])` at offset `off[i]` (a row whose
 /// page or offset is out of range dropped); the pool's new view.
@@ -2753,6 +2757,34 @@ fn pool_rows(
     }
     let ids = f.concat(&ids, 0)?;
     let ups = f.concat(&srcs, 0)?;
+    if n64 <= ROWS_IN_PLACE {
+        // A lane or two (a decode's): each row read, kept where dropped,
+        // and written back in place: no kernel call, whose launch costs the
+        // host and the device more than these few rows (v6e MoE decode of
+        // one lane: a 2 KiB scatter call a layer).
+        let packed = f.pack_rows(ups, 2 * n64 * token_rows)?;
+        let blocks = f.dims(pool)[0] / token_rows;
+        let mut pool = pool;
+        for i in 0..2 * n64 {
+            let id = f.slice(ids, &[i], &[i + 1], &[1])?;
+            let id = f.reshape(id, &[])?;
+            let lo = f.like_i(id, 0);
+            let hi = f.like_i(id, blocks);
+            let a = f.compare(Cmp::Ge, id, lo)?;
+            let b = f.compare(Cmp::Lt, id, hi)?;
+            let ok = f.and(a, b)?;
+            let tr = f.like_i(id, token_rows);
+            let row = f.mul(id, tr)?;
+            let z = f.like_i(id, 0);
+            let cur = f.dynamic_slice(pool, &[row, z], &[token_rows, 128])?;
+            let r0 = i * token_rows;
+            let new = f.slice(packed, &[r0, 0], &[r0 + token_rows, 128], &[1, 1])?;
+            let ok = f.broadcast(ok, &[token_rows, 128], &[])?;
+            let put = f.select(ok, new, cur)?;
+            pool = f.dynamic_update_slice(pool, put, &[row, z])?;
+        }
+        return Ok(vec![f.pool_view(pool, Elem::Bf16, dims)?]);
+    }
     let ups = f.reshape(ups, &[2 * n64 * w / 128, 128])?;
     let laid = crate::blocks::scatter(f, pool, ids, ups, token_rows)?;
     Ok(vec![f.pool_view(laid, Elem::Bf16, dims)?])

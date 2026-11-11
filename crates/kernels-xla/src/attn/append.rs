@@ -90,10 +90,17 @@ pub(crate) fn write(
             detail: format!("{np} source planes for {} written", maps.len()),
         });
     }
-    let tile = if pooled.is_some() {
-        vec![PS * kk, 128]
+    // `direct`: the pool's pages built as its own u32 rows (each row a pair
+    // of a page row's 128-lane blocks, low and high) and laid by sublane
+    // strided stores, with no relayout of the page in VMEM.
+    let direct = pooled.is_some() && kk % 2 == 0;
+    let half = kk / 2;
+    let (tile, laid_elem) = if direct {
+        (vec![PS * half, 128], Elem::I32)
+    } else if pooled.is_some() {
+        (vec![PS * kk, 128], Elem::Bf16)
     } else {
-        vec![PS, w]
+        (vec![PS, w], Elem::Bf16)
     };
     let (ins, outs) = match pooled {
         None => (
@@ -117,16 +124,8 @@ pub(crate) fn write(
         vmem_limit: Some(u64::try_from(limit).unwrap_or(0)),
         scratch: vec![
             MTy::Ref(vec![np as i64, n, w], Elem::Bf16, Space::Vmem),
-            MTy::Ref(
-                vec![np as i64, m, tile[0], tile[1]],
-                Elem::Bf16,
-                Space::Vmem,
-            ),
-            MTy::Ref(
-                vec![np as i64, m, tile[0], tile[1]],
-                Elem::Bf16,
-                Space::Vmem,
-            ),
+            MTy::Ref(vec![np as i64, m, tile[0], tile[1]], laid_elem, Space::Vmem),
+            MTy::Ref(vec![np as i64, m, tile[0], tile[1]], laid_elem, Space::Vmem),
             MTy::Sem(vec![4]),
         ],
     };
@@ -135,8 +134,9 @@ pub(crate) fn write(
         // each plane's source and destination: the pool read as bf16 rows
         // of 128 for both
         let (src_planes, dst_planes) = if pooled.is_some() {
-            let i = b.ref_bitcast(blk.ins[np], Elem::Bf16)?;
-            let o = b.ref_bitcast(blk.outs[0], Elem::Bf16)?;
+            let as_ = if direct { Elem::I32 } else { Elem::Bf16 };
+            let i = b.ref_bitcast(blk.ins[np], as_)?;
+            let o = b.ref_bitcast(blk.outs[0], as_)?;
             (vec![i; np], vec![o; np])
         } else {
             (vec![blk.ins[2], blk.ins[3]], vec![blk.outs[0], blk.outs[1]])
@@ -265,34 +265,111 @@ pub(crate) fn write(
             let laid = b.andi(ge, lt)?;
             let p = partial(b, j)?;
             let at = b.as_index(t0)?;
-            for x in 0..np as i64 {
-                let src = plane_rows(b, x)?;
-                let win = b.vload(src, &[at, i0], &[2 * PS, w])?;
-                let win = b.convert_f(win, Elem::F32)?;
-                let win = b.rotate(win, by, 0)?;
-                let tile = b.rows(win, 0, PS)?;
-                let tile = b.convert_f(tile, Elem::Bf16)?;
-                let tile = as_laid(b, tile)?;
-                let dst = slot_ref(b, stage, x, j)?;
-                b.vstore_all(tile, dst)?;
-            }
-            b.when(p, |b| {
-                for x in 0..np as i64 {
-                    let src = page_ref(b, src_planes[x as usize], x, j)?;
+            if direct {
+                // the old page lands first where the run covers part of it
+                b.when(p, |b| {
+                    for x in 0..np as i64 {
+                        let src = page_ref(b, src_planes[x as usize], x, j)?;
+                        let held = slot_ref(b, old, x, j)?;
+                        let s = sem(b, 2)?;
+                        b.dma_wait(s, src, held)?;
+                    }
+                    Ok(())
+                })?;
+                let rr = b.iota(&[PS, 128], 0);
+                let lo = b.broadcast_i(f0, &[PS, 128])?;
+                let hi = b.broadcast_i(end, &[PS, 128])?;
+                let ge = b.cmpi(ICmp::Sge, rr, lo)?;
+                let lt = b.cmpi(ICmp::Slt, rr, hi)?;
+                let laid = b.andi(ge, lt)?;
+                let sixteen_v = b.splat_i(&[PS, 128], 16)?;
+                let high_v = b.splat_i(&[PS, 128], i64::from(0xFFFF_0000u32 as i32))?;
+                // a page's f32 rows [PS, w] as the pool's u32 rows into the
+                // stage, over the old rows where `merge`
+                let pack = |b: &mut Body, tile: V, x: i64, merge: bool| -> Built<()> {
                     let held = slot_ref(b, old, x, j)?;
-                    let s = sem(b, 2)?;
-                    b.dma_wait(s, src, held)?;
-                    let o = b.vload_all(held)?;
-                    let o = as_page(b, o)?;
                     let dst = slot_ref(b, stage, x, j)?;
-                    let t = b.vload_all(dst)?;
-                    let t = as_page(b, t)?;
-                    let merged = b.select(laid, t, o)?;
-                    let merged = as_laid(b, merged)?;
-                    b.vstore_all(merged, dst)?;
+                    for c in 0..half {
+                        // u32 row 4p + c of the page: bf16 lane blocks 2c
+                        // (low) and 2c + 1 (high) of page row p; a bf16's
+                        // bits are its f32's top half
+                        let a = b.slice(tile, &[0, 256 * c], &[PS, 128])?;
+                        let a = b.bitcast_v(a, Elem::I32)?;
+                        let a = b.shrui(a, sixteen_v)?;
+                        let h = b.slice(tile, &[0, 256 * c + 128], &[PS, 128])?;
+                        let h = b.bitcast_v(h, Elem::I32)?;
+                        let h = b.andi(h, high_v)?;
+                        let mut u = b.ori(h, a)?;
+                        let ci = b.index(c);
+                        if merge {
+                            let o = b.strided_load(held, &[ci, i0], &[half, 1], &[PS, 128])?;
+                            u = b.select(laid, u, o)?;
+                        }
+                        b.strided_store(u, dst, &[ci, i0], &[half, 1])?;
+                    }
+                    Ok(())
+                };
+                // A whole page from a page-aligned fire row: its rows as
+                // they are (every run of a prompt from a page's start).
+                let r16 = b.remsi(s0, sixteen)?;
+                let off = b.cmpi(ICmp::Ne, r16, zero)?;
+                let un = b.select(p, p, off)?;
+                let t1 = b.i32(1);
+                let t1 = b.cmpi(ICmp::Ne, t1, zero)?;
+                let no = b_false(b)?;
+                let al = b.select(un, no, t1)?;
+                b.when(al, |b| {
+                    let s0a = b.assume_multiple(s0, PS)?;
+                    let sa = b.as_index(s0a)?;
+                    for x in 0..np as i64 {
+                        let src = plane_rows(b, x)?;
+                        let tile = b.vload(src, &[sa, i0], &[PS, w])?;
+                        let tile = b.convert_f(tile, Elem::F32)?;
+                        pack(b, tile, x, false)?;
+                    }
+                    Ok(())
+                })?;
+                b.when(un, |b| {
+                    for x in 0..np as i64 {
+                        let src = plane_rows(b, x)?;
+                        let win = b.vload(src, &[at, i0], &[2 * PS, w])?;
+                        let win = b.convert_f(win, Elem::F32)?;
+                        let win = b.rotate(win, by, 0)?;
+                        let tile = b.rows(win, 0, PS)?;
+                        pack(b, tile, x, true)?;
+                    }
+                    Ok(())
+                })?;
+            } else {
+                for x in 0..np as i64 {
+                    let src = plane_rows(b, x)?;
+                    let win = b.vload(src, &[at, i0], &[2 * PS, w])?;
+                    let win = b.convert_f(win, Elem::F32)?;
+                    let win = b.rotate(win, by, 0)?;
+                    let tile = b.rows(win, 0, PS)?;
+                    let tile = b.convert_f(tile, Elem::Bf16)?;
+                    let tile = as_laid(b, tile)?;
+                    let dst = slot_ref(b, stage, x, j)?;
+                    b.vstore_all(tile, dst)?;
                 }
-                Ok(())
-            })?;
+                b.when(p, |b| {
+                    for x in 0..np as i64 {
+                        let src = page_ref(b, src_planes[x as usize], x, j)?;
+                        let held = slot_ref(b, old, x, j)?;
+                        let s = sem(b, 2)?;
+                        b.dma_wait(s, src, held)?;
+                        let o = b.vload_all(held)?;
+                        let o = as_page(b, o)?;
+                        let dst = slot_ref(b, stage, x, j)?;
+                        let t = b.vload_all(dst)?;
+                        let t = as_page(b, t)?;
+                        let merged = b.select(laid, t, o)?;
+                        let merged = as_laid(b, merged)?;
+                        b.vstore_all(merged, dst)?;
+                    }
+                    Ok(())
+                })?;
+            }
             for x in 0..np as i64 {
                 let src = slot_ref(b, stage, x, j)?;
                 let dst = page_ref(b, dst_planes[x as usize], x, j)?;
@@ -323,6 +400,12 @@ pub(crate) fn write(
             c.call_aliased(f, &ops, &[(0, 5 + np)])
         }
     }
+}
+
+/// An i1 false.
+fn b_false(b: &mut Body) -> Built<V> {
+    let z = b.i32(0);
+    b.cmpi(ICmp::Ne, z, z)
 }
 
 #[cfg(test)]
