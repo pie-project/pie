@@ -18,7 +18,7 @@ Branch today: 432 commits ahead of main, 782 files, +86k / -13k. Main merged in 
 | A12 | Shared-pool snapshots; host-full hang + miscount; keep-handles key covers the record | RT | done M84 (other engines: A15) |
 | A13 | Record rs-buffered fires (MTP / spec decode on hybrids walk eagerly; same on main) — graph capture rule | L40S | after perf fixes |
 | A14 | Wire the rung shrink (SPEC 6) | RT | done M92 (CUDA) |
-| A21 | Activation rungs on Metal / Vulkan / wgpu / XLA (only CUDA states rungs; the walk is a no-op elsewhere) | backend owners | queued |
+| A21 | Activation rungs on Metal / Vulkan / wgpu / XLA (only CUDA states rungs; the walk is a no-op elsewhere) | backend owners | XLA: not applicable (activation is PJRT scratch outside the single fixed pool; no rungs stated, walk no-op — decided 2026-11-11). XLA A15 done on sc/xla-tier (TPU). Metal / Vulkan / wgpu open |
 | A15 | read_tier_slots / write_tier_slots (snapshots on shared pools) on Metal, Vulkan, wgpu, XLA (CUDA in sc/rt4; Cerebras out of scope) | Metal agent, VKP, TPU | queued |
 | A16 | Held weights flip to streaming on ROCm 30B MoE (body reservation) | EAGER | done M89; M93 flat-fit (flat range counted as room); MI300X verify pending; arm-after-residency next |
 | A17 | Guest panic under admission waits: bench barrier bug fixed (sc/sdk-wakeup) | SDK agent | done; A19 left |
