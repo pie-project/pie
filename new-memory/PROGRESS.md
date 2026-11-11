@@ -1104,3 +1104,13 @@ The `new-memory/` directory is bookkeeping and is removed before anything lands 
   order), so page-locking fresh memory could not keep pace -> Qwen3-8B prefill 2048 492 -> 151 ms (main 145).
 - Merge fix: rt4's read/write_tier_slots go through HostTier::slice (waits for landings); HostTier::chunk_bytes.
 - Verified: golden_offload + golden_logits (sm_120) = base; build matrix clean.
+
+### M86 — 2026-11-11: XLA pool parity work (TPU session)
+- `sc/xla-tpu` (8977ec8ce..65a075593): a prompt's kv append lands both pool planes in one write; DMA gathers unrolled
+  with one wait; warm-ladder seal (fires outside the ladder counted; PIE_XLA_WARM_STRICT=1 fails); pool-native Mosaic
+  conv step for decode.
+- v6e (in-process medians): qwen35 c64 13.7k -> 15.3k (base 15.1k, parity); prefill 512 above base; MoE prefill above
+  base. Conv kernel: state bitwise vs base, output ulp-level (base XLA clones the in-projection matmul into the conv
+  fusion) -> explained matmul-arm difference (PIE_XLA_CONV_KERNEL=0 restores bitwise). Accepted.
+- Open: qwen3 c256 -4% (pool-native decode page copy next), prefill 2048 -7.5%, MoE c1 -3%; sc/xla2 rebased
+  (snapshots bitwise on TPU, PLE rows bitwise; streamed experts open).
