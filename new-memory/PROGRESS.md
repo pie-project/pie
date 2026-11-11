@@ -1178,3 +1178,10 @@ The `new-memory/` directory is bookkeeping and is removed before anything lands 
 - Verified: workspace / engine-cuda cuda+rocm+featureless / pie cuda+rocm / runtime all-features check clean;
   runtime 235 pass; CUDA golden_logits / by_refs / eager_resume / offload = base. Pending: L40S Qwen3-8B
   c64/c256 confirm on the combined fit; AMD MI300X 30B verify.
+
+### M94 — 2026-11-11: Vulkan/wgpu speed pass 1 (A15 for Vulkan/wgpu)
+- `sc/vk-perf` (fb898ea56): per-row segment lookup in Vulkan sdpa/gdn/conv; record-key fix (more replays);
+  expert-miss fires recorded via segmented command buffers; read/write_tier_slots on Vulkan and wgpu. Logits
+  bitwise-unchanged. Checks: engine-vulkan (vulkan), engine-wgpu, pie vulkan+wgpu clean; engine-vulkan lib 18 pass.
+- Open (VK6): split_rows=32 keeps >=32-row fires unrecorded on desktop; descriptor indexing; wgpu c1 host work;
+  gemma c64/boot; Qwen3-30B 6.57 GB embed view past 4 GiB; trimmed-window model_logits test.
