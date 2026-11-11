@@ -12,6 +12,14 @@ using namespace metal;
 // points at that layer's rows. The offsets stay in the arguments (always 0,
 // `kernels_metal::tensor::PLANE_AT_BINDING`). Every paged kernel takes the
 // four as its last arguments, in this order.
+// The page strides as function constants where the pipeline was specialized
+// on them (`Fire::page_strides`): fixed for a loaded model, so a kernel
+// folds them; else the arguments' runtime values.
+constant ulong pie_fc_k_page [[function_constant(0)]];
+constant ulong pie_fc_v_page [[function_constant(1)]];
+constant bool pie_fc_pages = is_function_constant_defined(pie_fc_k_page) &&
+                             is_function_constant_defined(pie_fc_v_page);
+
 struct pie_kv_layout {
   ulong k_page;
   ulong v_page;

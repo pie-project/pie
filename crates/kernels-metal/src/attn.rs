@@ -471,10 +471,12 @@ fn vector(
     }
     args.extend(pool.page_args());
     ctx.fire(
-        Fire::at(FILE, entry).apply(Grid::of(
-            vector_grid(op, shape.q_heads, shape.rows)?,
-            [SDPA_THREADS, 1, 1],
-        )),
+        Fire::at(FILE, entry)
+            .page_strides(pool.page_stride)
+            .apply(Grid::of(
+                vector_grid(op, shape.q_heads, shape.rows)?,
+                [SDPA_THREADS, 1, 1],
+            )),
         &args,
     )
 }
