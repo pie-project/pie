@@ -28,6 +28,8 @@ pub struct Fire<'a> {
     pub ceilings: Ceilings<'a>,
     /// [`BodyKey::islands`] as prepared for this fire.
     pub islands: &'a [u8],
+    /// [`BodyKey::rs`] as prepared for this fire.
+    pub rs: RsBody,
 }
 #[derive(Default)]
 pub struct Bodies {
@@ -394,6 +396,28 @@ pub struct Tiers {
     pub plain: poem_ir::ClassSet,
 }
 
+/// How a fire's lanes treat their recurrent rows, which picks the kernels a
+/// body launches: a fire whose lanes fold all they land, one whose lanes
+/// buffer rows past their state but replay none, and one where a lane
+/// replays buffered rows ahead of its own (every recurrence then runs over
+/// the extended rows). Where a lane's rows land and which it replays are
+/// data the body reads (`inputs::RsHandles`), not part of the key.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash)]
+pub enum RsBody {
+    #[default]
+    Folds,
+    Buffers,
+    Replays,
+}
+
+impl RsBody {
+    /// Whether a lane of the fire buffers rows.
+    #[must_use]
+    pub fn buffers(self) -> bool {
+        self != RsBody::Folds
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct BodyKey {
     pub bucket: u32,
@@ -404,6 +428,8 @@ pub struct BodyKey {
     /// a whole one at the same bucket and classes, and a body is only
     /// replayable for the admissibility it was recorded under.
     pub islands: Box<[u8]>,
+    /// How the fire's lanes treat their recurrent rows.
+    pub rs: RsBody,
 }
 
 impl BodyKey {
@@ -421,6 +447,7 @@ impl BodyKey {
             classes: Ladder::of(classes, bucket, decoding, lane_ceiling, tiers),
             patch: None,
             islands: Box::default(),
+            rs: RsBody::Folds,
         }
     }
 
@@ -438,7 +465,15 @@ impl BodyKey {
             classes: Ladder::of(classes, bucket, decoding, lane_ceiling, tiers),
             patch: patch.map(|(classes, bucket)| AxisKey::of(classes, bucket)),
             islands: Box::default(),
+            rs: RsBody::Folds,
         }
+    }
+
+    /// The same key, for a fire whose lanes treat their recurrent rows so.
+    #[must_use]
+    pub fn with_rs(mut self, rs: RsBody) -> BodyKey {
+        self.rs = rs;
+        self
     }
 
     /// The same key, carrying which regions `admits` keeps out of a graph.
@@ -557,6 +592,11 @@ impl core::fmt::Display for BodyKey {
             for byte in self.islands.iter().rev() {
                 write!(f, "{byte:02x}")?;
             }
+        }
+        match self.rs {
+            RsBody::Folds => {}
+            RsBody::Buffers => f.write_str("~rs")?,
+            RsBody::Replays => f.write_str("~rsx")?,
         }
         Ok(())
     }
@@ -866,6 +906,7 @@ impl Bodies {
             )),
         );
         key.islands = at.islands.into();
+        key.rs = at.rs;
 
         crate::serve::btrace::mark("key");
         let at_seq = self.recorder.at_seq;
@@ -1001,6 +1042,9 @@ impl Bodies {
         // device would wait on the launch that holds back.
         let fence = |run: &Run<'_>| run.ep_rank().map_or(Ok(()), |ep| ep.fence(at.stream));
         fence(run)?;
+        // The capture walks the fire again: what the warm walk laid in the
+        // rs scratch (each window's extended layout) is laid again inside it.
+        run.rs_rewind();
         let mut steps: Vec<Step> = Vec::with_capacity(script.len());
         let mut nodes = 0;
         let mut edges = 0;
@@ -1466,6 +1510,7 @@ mod tests {
             classes: Ladder::single(0, Ladder::rung(0, 8, &decoding, LANES)),
             patch: None,
             islands: Box::default(),
+            rs: RsBody::Folds,
         };
         assert_eq!(armed, fired, "the armed key must be the fired key");
     }
@@ -1476,6 +1521,7 @@ mod tests {
             classes: Ladder::single(0, bucket),
             patch: None,
             islands: Box::default(),
+            rs: RsBody::Folds,
         }
     }
 

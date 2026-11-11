@@ -177,6 +177,38 @@ pub struct Handles {
     pub group_of_lane: Option<Tensor>,
     pub packings: Vec<PackingHandles>,
     pub lane_of_row: Tensor,
+    /// The fire's rs tables, when it buffers recurrent rows.
+    pub rs: Option<RsHandles>,
+}
+
+/// Where a fire's staged rs tables lie on the device: a
+/// [`kernels_cuda::runtime::channel::RsLane`] a lane (padded lanes inert),
+/// the slot address of each lane's rs buffer pages, and each replayed row's
+/// buffer token. Fixed for the load, so a recorded body reads whatever slots
+/// the fire it serves names.
+#[derive(Debug, Clone, Copy)]
+pub struct RsHandles {
+    pub lanes: u64,
+    pub pages: u64,
+    pub replay_tok: u64,
+}
+
+/// A buffering fire's rs tables, as `write_host` stages them.
+#[derive(Debug, Clone, Copy)]
+pub struct RsFire<'a> {
+    pub lanes: &'a [kernels_cuda::runtime::channel::RsLane],
+    pub pages: &'a [u64],
+    pub replay_tok: &'a [u32],
+}
+
+/// The rs section's offsets and capacities.
+#[derive(Debug, Clone, Copy)]
+struct RsAt {
+    lanes: u64,
+    pages: u64,
+    pages_cap: u64,
+    replay_tok: u64,
+    replay_cap: u64,
 }
 
 const AXES: u64 = 3;
@@ -271,6 +303,8 @@ pub struct Fire<'a> {
     pub lane_reach: u32,
     pub group_of_lane: &'a [i32],
     pub packings: &'a [PackingFire<'a>],
+    /// The rs tables of a fire whose lanes buffer recurrent rows.
+    pub rs: Option<RsFire<'a>>,
 }
 
 #[derive(Debug)]
@@ -358,6 +392,8 @@ pub struct Staged {
     /// The ids staged for the recurrent rows.
     state_ids: u32,
     packed: bool,
+    /// The rs tables' pages and replayed rows staged, when it buffers.
+    rs: Option<(u32, u32)>,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -522,6 +558,7 @@ pub struct Inputs {
     group_of_lane: u64,
     packings: Vec<PackingAt>,
     page_tables: Vec<TableAt>,
+    rs: Option<RsAt>,
     max_lanes: u32,
     max_rows: u32,
     plans: Vec<Option<Workspace>>,
@@ -565,6 +602,7 @@ impl Inputs {
         masked: bool,
         schedule_streams: &[Option<u32>],
         state_ids: u32,
+        rs_page_tokens: Option<u32>,
     ) -> Result<Inputs> {
         let rows = u64::from(budget.max_tokens);
         let lanes = u64::from(crate::window::lane_capacity(budget.max_lanes));
@@ -619,6 +657,20 @@ impl Inputs {
                 permutation: take(rows * 4),
             })
             .collect();
+        // A lane's replayed rows past `REPLAYED` widen no body and are rare:
+        // the tables hold every staged row replayed once more and that many
+        // a lane beside, and the pages they lie in.
+        let rs = rs_page_tokens.map(|tokens| {
+            let replay_cap = rows + lanes * u64::from(crate::store::rs::REPLAYED);
+            let pages_cap = (replay_cap + rows).div_ceil(u64::from(tokens.max(1))) + 2 * lanes;
+            RsAt {
+                lanes: take(lanes * 16),
+                pages: take(pages_cap * 8),
+                pages_cap,
+                replay_tok: take(replay_cap * 4),
+                replay_cap,
+            }
+        });
         let stage_bytes = take(0);
         let seats: Vec<SeatAt> = seats
             .iter()
@@ -710,6 +762,7 @@ impl Inputs {
             group_of_lane,
             packings,
             page_tables,
+            rs,
             max_lanes: crate::window::lane_capacity(budget.max_lanes),
             max_rows: budget.max_tokens,
             inject_runs: None,
@@ -1006,6 +1059,54 @@ impl Inputs {
             }
         }
 
+        let rs = match (fire.rs, self.rs) {
+            (None, _) => None,
+            (Some(_), None) => {
+                return Err(crate::error::Fault::program(
+                    "inputs::write_host",
+                    "a fire buffers recurrent rows on a load that carved no rs tables",
+                ));
+            }
+            (Some(tables), Some(at)) => {
+                if tables.pages.len() as u64 > at.pages_cap
+                    || tables.replay_tok.len() as u64 > at.replay_cap
+                {
+                    return Err(crate::error::Fault::Ceiling {
+                        what: "rs buffer pages and replayed rows staged",
+                        need: (tables.pages.len() as u64).max(tables.replay_tok.len() as u64),
+                        have: at.pages_cap.min(at.replay_cap),
+                    });
+                }
+                let mut lanes_tab = tables.lanes.to_vec();
+                lanes_tab.resize(
+                    (table_lanes as usize).max(tables.lanes.len()),
+                    kernels_cuda::runtime::channel::RsLane::INERT,
+                );
+                // SAFETY: `RsLane` is plain `repr(C)` data, read as its bytes.
+                let raw = unsafe {
+                    core::slice::from_raw_parts(
+                        lanes_tab.as_ptr().cast::<u8>(),
+                        lanes_tab.len() * 16,
+                    )
+                };
+                put(at.lanes, raw, "staged rs lanes")?;
+                // SAFETY: plain integers, read as their bytes.
+                let pages = unsafe {
+                    core::slice::from_raw_parts(
+                        tables.pages.as_ptr().cast::<u8>(),
+                        tables.pages.len() * 8,
+                    )
+                };
+                put(at.pages, pages, "staged rs pages")?;
+                put(
+                    at.replay_tok,
+                    u32_bytes_of(tables.replay_tok),
+                    "staged rs replay rows",
+                )?;
+                Some((tables.pages.len() as u32, tables.replay_tok.len() as u32))
+            }
+        };
+
         let mut table_indices = Vec::with_capacity(self.page_tables.len());
         for (at, geometry) in self.page_tables.iter().zip(fire.page_tables) {
             put(at.indptr, bytes_of(&geometry.indptr), "staged kv indptr")?;
@@ -1046,6 +1147,7 @@ impl Inputs {
             table_lanes,
             state_ids,
             packed,
+            rs,
         })
     }
 
@@ -1192,6 +1294,7 @@ impl Inputs {
             table_lanes,
             state_ids,
             packed,
+            rs,
         } = staged;
         let readouts = *readouts;
         let (rows, lanes) = (*rows, *lanes);
@@ -1210,6 +1313,7 @@ impl Inputs {
         let at_lane_of_row = self.lane_of_row;
         let at_group_of_lane = self.group_of_lane;
         let packing_places: Vec<PackingAt> = self.packings.clone();
+        let rs_at = self.rs;
         let stream = device.stream();
         let Inputs {
             store,
@@ -1290,6 +1394,20 @@ impl Inputs {
             });
         }
 
+        let rs = match (rs, rs_at) {
+            (Some((pages, toks)), Some(at)) => {
+                copy(at.lanes, table_lanes.max(lanes) as usize * 16)?;
+                copy(at.pages, *pages as usize * 8)?;
+                copy(at.replay_tok, *toks as usize * 4)?;
+                Some(RsHandles {
+                    lanes: base + at.lanes,
+                    pages: base + at.pages,
+                    replay_tok: base + at.replay_tok,
+                })
+            }
+            _ => None,
+        };
+
         // SAFETY: the sources are the slot's pinned bytes, held until the `SlotGuard` drops.
         unsafe { store.stage_batch_from(stream, &spans)? };
 
@@ -1321,6 +1439,7 @@ impl Inputs {
             group_of_lane: packed.then(|| i32s(base + at_group_of_lane, table_lanes)),
             packings,
             lane_of_row: i32s(base + at_lane_of_row, rows),
+            rs,
         })
     }
 

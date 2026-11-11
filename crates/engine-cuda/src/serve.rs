@@ -122,6 +122,9 @@ pub struct Shell {
     arming: bool,
     golden_arm: Golden,
     armed_body: Option<record::BodyKey>,
+    /// How the arming fire's lanes treat their recurrent rows: a buffering
+    /// treatment is recorded with lanes that land and replay nothing.
+    arm_rs: record::RsBody,
     /// The lattice waits for the starting weight residency: the load
     /// streams its weights, and bodies armed over the host copy would read
     /// every expert over the bus (`Staged::finish`).
@@ -974,8 +977,10 @@ struct RsFire<'a> {
     write_state: bool,
     predicated: bool,
     truncates: bool,
-    buffered: bool,
-    reads: Vec<Vec<std::ops::Range<u32>>>,
+    /// How its lanes treat their recurrent rows.
+    body: record::RsBody,
+    /// Each lane's replayed buffer rows.
+    replays: Vec<u32>,
     rows_ext: u32,
     snapshots: crate::store::rs::SnapTable,
 }

@@ -156,15 +156,29 @@ pub(crate) fn landing_requests(
     landing
 }
 
+/// The classes the lattice keys and arms: those a plain request lands in,
+/// and those a request lands in that is plain but for reading its pass's
+/// drafts (a speculative decoder's verify and its prompt).
 #[must_use]
 pub(crate) fn plain_of(landing: &[Vec<poem_ir::Request>]) -> poem_ir::ClassSet {
     poem_ir::ClassSet::of(
         landing
             .iter()
             .enumerate()
-            .filter(|(_, requests)| requests.iter().any(poem_ir::Request::plain))
+            .filter(|(_, requests)| {
+                requests
+                    .iter()
+                    .any(|request| request.plain() || drafts_only(request))
+            })
             .map(|(class, _)| class),
     )
+}
+
+/// Whether only its query length and its reading the pass's drafts set
+/// this request apart.
+#[must_use]
+pub(crate) fn drafts_only(request: &poem_ir::Request) -> bool {
+    request.drafts() && request.departures() == usize::from(request.query_len() != 1) + 1
 }
 
 #[must_use]

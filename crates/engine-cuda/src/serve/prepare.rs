@@ -1290,6 +1290,51 @@ impl FrameShell for Shell {
         self.pools.commit_frame(demand, &kv_ranges, &window_pages)?;
         // The rs buffer pages the lanes name, seated before a row lands.
         self.pools.seat_rs(&rs_pages)?;
+        // How the lanes treat their recurrent rows (the body's key) and the
+        // tables its kernels address them through: where each lane's rows
+        // land (its pages' slots) and which buffered rows it replays. An
+        // arming fire states the treatment it records, its lanes landing
+        // and replaying nothing.
+        let rs_replays: Vec<u32> = rs_reads
+            .iter()
+            .map(|reads| crate::run::replayed(reads))
+            .collect();
+        let rs_lands = rs_moves.iter().any(|verb| !matches!(verb, RsMove::None));
+        let rs_body = match self.arm_rs {
+            armed if arming && armed.buffers() => armed,
+            _ if rs_replays.iter().any(|replay| *replay > 0) => record::RsBody::Replays,
+            _ if rs_lands => record::RsBody::Buffers,
+            _ => record::RsBody::Folds,
+        };
+        let mut rs_lanes: Vec<kernels_cuda::runtime::channel::RsLane> = Vec::new();
+        let mut rs_slots: Vec<u64> = Vec::new();
+        let mut rs_tokens: Vec<u32> = Vec::new();
+        if rs_body.buffers() {
+            let buffers = self.buffers.as_ref().ok_or_else(|| Fault::Unbound {
+                what: "the rs buffer of a fire whose lanes buffer recurrent rows, against a \
+                       plan that declares no chunked recurrence to buffer"
+                    .to_string(),
+            })?;
+            for (fire_lane, verb) in rs_moves.iter().enumerate() {
+                let RsMove::Scatter { pages, at, .. } = verb else {
+                    rs_lanes.push(kernels_cuda::runtime::channel::RsLane::INERT);
+                    continue;
+                };
+                let replay_off = rs_tokens.len() as u32;
+                for span in &rs_reads[fire_lane] {
+                    rs_tokens.extend(span.clone());
+                }
+                rs_lanes.push(kernels_cuda::runtime::channel::RsLane {
+                    at: *at,
+                    replay: rs_replays[fire_lane],
+                    replay_off,
+                    page_off: rs_slots.len() as u32,
+                });
+                for &page in pages.iter() {
+                    rs_slots.push(buffers.slot(&self.pools, page)?);
+                }
+            }
+        }
         // The records as the kernels read them: each row's pieces by the
         // ids of the slots they lie in, table after table.
         let device_slot_ids = self.pools.state_tables(&slot_ids)?;
@@ -1411,7 +1456,8 @@ impl FrameShell for Shell {
             lane_ceiling,
             &self.tiers,
             self.towered.then_some((&patches.classes, patches.bucket)),
-        );
+        )
+        .with_rs(rs_body);
         let copies_here = copies
             && key.classes.rungs().iter().all(|(class, _)| {
                 !self.masked.contains(*class as usize) && !self.wide.contains(*class as usize)
@@ -1504,7 +1550,14 @@ impl FrameShell for Shell {
         // ends on the stream.
         let bodied = records_bodies
             && !tapped
-            && !rs_moves.iter().any(|verb| !matches!(verb, RsMove::None))
+            // A body's extended rows hold its own rows twice and at least
+            // `REPLAYED` replayed (`Run::rs_layout`): a fire whose lanes
+            // replay more walks.
+            && (rs_replays.iter().sum::<u32>() <= crate::store::rs::REPLAYED
+                || composition
+                    .lanes()
+                    .iter()
+                    .all(|row| rs_replays[rs_order[row.source as usize] as usize] <= row.rows))
             && snapshots.rows.len() <= crate::store::rs::SNAPSHOTS as usize
             && Self::keyable_units(&self.compiled)
             && world
@@ -1612,20 +1665,25 @@ impl FrameShell for Shell {
                 lane_of_row: &lane_of_row,
                 group_of_lane: &group_of_lane,
                 packings: &packing_fires,
+                rs: rs_body.buffers().then_some(crate::inputs::RsFire {
+                    lanes: &rs_lanes,
+                    pages: &rs_slots,
+                    replay_tok: &rs_tokens,
+                }),
             },
         )?;
 
-        let rs_replays: Vec<u32> = rs_reads
-            .iter()
-            .map(|reads| crate::run::replayed(reads))
-            .collect();
-        let rs_truncates = rs_lens
-            .iter()
-            .zip(&seats)
-            .zip(&rs_replays)
-            .any(|((len, seat), replay)| *len < narrow(u64::from(seat.rows) + u64::from(*replay)));
-        let rs_rows_ext = if rs_replays.iter().any(|replay| *replay > 0) {
-            rows.saturating_add(rs_replays.iter().sum::<u32>())
+        // A buffering fire's recurrences take its commit lengths and its
+        // fold predicate whatever its lanes fold, so one body serves every
+        // fold; its extended rows reach a body's ceiling (`Run::rs_layout`).
+        let rs_rows_ext = if rs_body == record::RsBody::Replays {
+            // Each window's region holds its own rows twice and at least
+            // `REPLAYED` more.
+            let own = launched.max(rows);
+            let regions = u32::try_from(windows.len()).unwrap_or(u32::MAX).max(1);
+            own.saturating_mul(2)
+                .saturating_add(regions.saturating_mul(crate::store::rs::REPLAYED))
+                .saturating_add(rs_replays.iter().sum::<u32>())
         } else {
             0
         };
@@ -1713,25 +1771,20 @@ impl FrameShell for Shell {
             fresh,
             demand,
             rs: RsFire {
-                write_state: rs_moves
-                    .iter()
-                    .any(|verb| !matches!(verb, RsMove::Scatter { fold: 0, .. })),
-                predicated: {
-                    let scatters = rs_moves
+                write_state: rs_body.buffers()
+                    || rs_moves
                         .iter()
-                        .filter(|verb| matches!(verb, RsMove::Scatter { fold: 0, .. }))
-                        .count();
-                    let prologue = attachments.iter().any(|attached| {
+                        .any(|verb| !matches!(verb, RsMove::Scatter { fold: 0, .. })),
+                predicated: rs_body.buffers()
+                    || attachments.iter().any(|attached| {
                         !attached.adapter_only && self.programs.prologue_runs(attached.instance)
-                    });
-                    (scatters != 0 && scatters != rs_moves.len()) || prologue
-                },
-                truncates: rs_truncates,
-                buffered: rs_moves.iter().any(|verb| !matches!(verb, RsMove::None)),
+                    }),
+                truncates: rs_body.buffers(),
+                body: rs_body,
                 moves: rs_moves,
                 lens: rs_lens,
                 order: rs_order,
-                reads: rs_reads,
+                replays: rs_replays,
                 rows_ext: rs_rows_ext,
                 snapshots,
             },

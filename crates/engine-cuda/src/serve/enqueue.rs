@@ -788,22 +788,35 @@ impl FireCtx<'_> {
         let rs_scratch = (p.rs.rows_ext > 0)
             .then(|| {
                 self.rs_scratch
-                    .map(|(ptr, bytes)| crate::run::RsScratch::new(ptr, bytes))
+                    .zip(self.buffers)
+                    .map(|((ptr, bytes), buffers)| {
+                        crate::run::RsScratch::new(ptr, bytes, buffers.ext_row_bytes())
+                    })
             })
             .flatten();
-        if p.rs.buffered
-            && let Some(pool) = self.buffers
+        if p.rs.body.buffers()
+            && let Some(buffers) = self.buffers
         {
+            let tables = staged.handles.rs.ok_or_else(|| Fault::Unbound {
+                what: "the rs tables of a fire whose lanes buffer recurrent rows, which it \
+                       staged none of"
+                    .to_string(),
+            })?;
             run = run.buffered(RsSeat {
-                buffers: pool,
-                pools: self.pools,
-                lanes: &p.rs.moves,
-                reads: &p.rs.reads,
+                buffers,
+                tables: kernels_cuda::runtime::channel::RsTables {
+                    lanes: tables.lanes,
+                    pages: tables.pages,
+                    replay_tok: tables.replay_tok,
+                    page_tokens: buffers.page_tokens(),
+                },
+                extended: p.rs.body == record::RsBody::Replays,
+                replays: &p.rs.replays,
                 scratch: rs_scratch.as_ref(),
             });
         }
         super::btrace::mark("run_new");
-        let records = self.graphs.records() && !p.rs.buffered;
+        let records = self.graphs.records();
         let walked = if records {
             if self.arming && !p.bodied {
                 Ok(())
@@ -826,10 +839,12 @@ impl FireCtx<'_> {
                     towered: p.towered,
                     ceilings,
                     islands: &p.islands,
+                    rs: p.rs.body,
                 };
 
                 self.cache.fire_body(&fire, &mut run, &place)
             } else {
+                self.cache.eager_walk(p.rs.body.buffers());
                 self.cache
                     .eager_unbodied("its composition is one a body does not carry");
                 let mut cursor = Cursor::new(&place);
@@ -844,16 +859,6 @@ impl FireCtx<'_> {
                 .map_err(Fault::from)
             }
         } else {
-            if self.graphs.records() {
-                self.cache.eager_walk(p.rs.buffered);
-                if !self.arming {
-                    self.cache.eager_unbodied(if p.rs.buffered {
-                        "its lanes buffer recurrent rows"
-                    } else {
-                        "no recorded body holds its composition"
-                    });
-                }
-            }
             let mut cursor = Cursor::new(&place);
             walk(
                 self.trace,

@@ -1141,6 +1141,7 @@ impl Shell {
             !masked.is_empty() || !wide.is_empty(),
             &schedule_streams(&boot.trace, &compiled),
             pools.ids_a_lane(),
+            buffers.as_ref().map(crate::store::rs::Buffers::page_tokens),
         )?;
 
         let exports = Exports::of(&boot.trace, &compiled)?;
@@ -1223,6 +1224,7 @@ impl Shell {
             decoded_tiles: Vec::new(),
             arming: false,
             armed_body: None,
+            arm_rs: crate::record::RsBody::Folds,
             arm_deferred: false,
             segments: std::collections::HashMap::new(),
             windows_memo: Vec::new(),

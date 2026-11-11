@@ -195,6 +195,9 @@ struct Deployment {
     patch_points: Vec<u32>,
     decoders: Vec<usize>,
     prefilling: Vec<usize>,
+    /// The classes keyed only for a speculative decoder's fires (plain but
+    /// for reading the drafts): armed alone, never beside another class.
+    drafting: Vec<usize>,
     media: Vec<usize>,
     wide: Vec<usize>,
     decoding: poem_ir::ClassSet,
@@ -261,9 +264,10 @@ fn prefill_keys(deployment: &Deployment, into: &mut Targets) {
 }
 
 fn mixed_keys(deployment: &Deployment, into: &mut Targets) {
+    let alone = |class: &usize| !deployment.drafting.contains(class);
     for point in deployment.buckets.iter().copied() {
-        for decode in deployment.decoders.iter().copied() {
-            for class in deployment.prefilling.iter().copied() {
+        for decode in deployment.decoders.iter().copied().filter(alone) {
+            for class in deployment.prefilling.iter().copied().filter(alone) {
                 let rows = (point >= 2 && deployment.seats >= 2)
                     .then(|| {
                         Shell::spread(
@@ -330,6 +334,7 @@ fn wide_keys(deployment: &Deployment, into: &mut Targets) {
             .wide
             .iter()
             .copied()
+            .filter(|class| !deployment.drafting.contains(class))
             .filter(|class| deployment.decoding.contains(*class))
             .take(seats)
             .collect();
@@ -337,6 +342,7 @@ fn wide_keys(deployment: &Deployment, into: &mut Targets) {
             .wide
             .iter()
             .copied()
+            .filter(|class| !deployment.drafting.contains(class))
             .filter(|class| !deployment.decoding.contains(*class))
             .take(seats.saturating_sub(decoders.len()))
             .collect();
@@ -1019,6 +1025,9 @@ impl Shell {
                         && self.tiers.plain.contains(*class)
                 })
                 .collect(),
+            drafting: (0..classes)
+                .filter(|class| !self.landing[*class].iter().any(poem_ir::Request::plain))
+                .collect(),
             decoding: self.decoding.clone(),
             seats,
             context,
@@ -1049,6 +1058,31 @@ impl Shell {
         if targets.is_empty() {
             return Ok(());
         }
+        // A load that buffers recurrent rows serves a spec-decoding fire
+        // from a body too: each one-class composition (a verify's lanes, the
+        // prompts beside them) is recorded once more for lanes that buffer
+        // rows, and once more for lanes that replay them (`record::RsBody`),
+        // right after its folding body.
+        let buffering = self.buffers.is_some();
+        let targets: Vec<(u32, BodySynth, record::RsBody)> = targets
+            .into_iter()
+            .flat_map(|(bucket, target)| {
+                let buffers = buffering && matches!(target.kind(), Kind::Decode | Kind::Prefill);
+                let treatments: &[record::RsBody] = if buffers {
+                    &[
+                        record::RsBody::Folds,
+                        record::RsBody::Buffers,
+                        record::RsBody::Replays,
+                    ]
+                } else {
+                    &[record::RsBody::Folds]
+                };
+                treatments
+                    .iter()
+                    .map(move |rs| (bucket, target.clone(), *rs))
+                    .collect::<Vec<_>>()
+            })
+            .collect();
 
         let mut armed = 0usize;
         let mut wanted = 0usize;
@@ -1063,7 +1097,8 @@ impl Shell {
         let mut peer_stopped = false;
         let unit_margin = self.pools.map_unit_bytes().saturating_mul(16);
         let mut ballot = Ballot::open(&self.device);
-        for (bucket, target) in targets {
+        for (bucket, target, rs) in targets {
+            self.arm_rs = rs;
             let spent = self.cache.body_stats();
             let room = (self.bodies_mem as u64).saturating_sub(spent.census.bytes as u64);
             let spare = self.pools.spare_bytes_for_bodies(room).unwrap_or(u64::MAX);
@@ -1268,6 +1303,7 @@ impl Shell {
             }
         }
 
+        self.arm_rs = record::RsBody::Folds;
         let stats = self.cache.body_stats();
         // An expert-parallel rank never captures past arming, whatever armed:
         // its peers fire other steps beside its, and an instantiation (a
