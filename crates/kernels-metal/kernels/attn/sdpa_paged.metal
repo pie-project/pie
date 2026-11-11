@@ -127,10 +127,13 @@ inline void sdpa_paged_decode_body(
   v_pages = pie_kv_plane(v_pages, kv.v_offset);
   constexpr size_t kv_unit = PACKED ? 1 : sizeof(T);
   constexpr size_t kv_head_width = PACKED ? size_t(sdpa_kv_u4_bytes<D>()) : size_t(D);
-  const size_t k_page = size_t(kv.k_page) / kv_unit;
-  const size_t v_page = size_t(kv.v_page) / kv_unit;
-  const size_t k_row = size_t(n_kv_heads) * kv_head_width;
-  const size_t v_row = k_row;
+  // A page and a row are each under 4 GiB: a cell is a 32x32 -> 64-bit
+  // product (the page's start) plus a 32-bit offset into the page, not a
+  // 64-bit product a token.
+  const uint k_page = uint(kv.k_page / kv_unit);
+  const uint v_page = uint(kv.v_page / kv_unit);
+  const uint k_row = uint(n_kv_heads) * uint(kv_head_width);
+  const uint v_row = k_row;
 
   typedef float U;
   thread U q[qk_per_thread];
@@ -166,8 +169,8 @@ inline void sdpa_paged_decode_body(
   const bool masked = mask_word != 0;
 
   auto absorb = [&](uint page, uint off) {
-    const size_t kcell = size_t(page) * k_page + size_t(off) * k_row;
-    const size_t vcell = size_t(page) * v_page + size_t(off) * v_row;
+    const size_t kcell = size_t(page) * k_page + (off * k_row);
+    const size_t vcell = size_t(page) * v_page + (off * v_row);
     if constexpr (PACKED) {
       // Byte-index the lane's slice of the packed 130-byte block: read the K and
       // V per-block fp16 scales once, then dequantize this lane's own elements
