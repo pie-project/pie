@@ -10,6 +10,7 @@
 //! - `kernels.json`: each role kind's source, owned symbols and params (levers applied);
 //! - `layout/`: `layout.csl` and the per-kind sources (`emit::layout::write`);
 //! - `host.json`, `bindings.json`, `program.json`: the [`Artifact`] (with the rcfg arrays);
+//! - `stamps.json` (a `TSTAMP:1` build only): the phase-stamp probes ([`stamps`]);
 //! - `plan.json`: the plan it built;
 //!
 //! and after [`link`]: `out/` (cslc's: the PE images, `out.json`) and `out/artifact/`, the
@@ -21,7 +22,7 @@ use serde::Serialize;
 
 use super::artifact::Artifact;
 use super::emit::params::{Levers, kernels};
-use super::emit::{layout, rcfg};
+use super::emit::{layout, rcfg, stamps};
 use super::floor::{HeadBlock, Rect, StoreBlock, Unit};
 use super::plan::Plan;
 use super::program::Program;
@@ -116,6 +117,10 @@ pub fn emit(
         }
         if want("host") {
             art.write_host(out)?;
+            let kinds = kernels(prog, levers)?;
+            if stamps::on(&kinds) {
+                json(out, stamps::FILE, &stamps::probes(prog, &kinds)?)?;
+            }
         }
         if want("bindings") {
             art.write_bindings(out)?;
@@ -198,6 +203,10 @@ pub fn link(dir: &Path, cslc: &Cslc, arch: Arch, fabric: Fabric) -> R<u32> {
     std::fs::create_dir_all(&art).map_err(|e| format!("{}: {e}", art.display()))?;
     for f in ARTIFACT {
         std::fs::copy(dir.join(f), art.join(f)).map_err(|e| format!("{f}: {e}"))?;
+    }
+    if dir.join(stamps::FILE).exists() {
+        std::fs::copy(dir.join(stamps::FILE), art.join(stamps::FILE))
+            .map_err(|e| format!("{}: {e}", stamps::FILE))?;
     }
     Ok(room)
 }
