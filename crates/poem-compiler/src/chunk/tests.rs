@@ -126,7 +126,9 @@ fn full_rows_share_one_list_and_a_window_lists_at_its_page() {
     };
     assert_eq!(rows.len(), 4);
     assert_eq!(tokens % TOKEN_GRAIN, 0);
-    assert_eq!(*bytes, u64::from(*tokens) * 4 * 4096);
+    // The rows' bytes, the stride an odd number of skew steps.
+    assert_eq!(*bytes, skew(u64::from(*tokens) * 4 * 4096, recipe.profile.align()));
+    assert_eq!((*bytes / SLOT_SKEW) % 2, 1);
     assert!(u64::from(*tokens) * 4096 >= MIN_RUN);
     let page = *tokens;
     let windows: Vec<&SlotLayout> = recipe.windows().collect();
@@ -485,7 +487,9 @@ fn an_rs_slot_lays_its_rows_layer_major_and_a_token_lands_by_its_page() {
         )]
         .into(),
     };
-    assert_eq!(layout.bytes, 2560 + 4096);
+    // The runs' bytes, the stride an odd number of skew steps.
+    assert_eq!(layout.bytes, skew(2560 + 4096, 256));
+    assert_eq!(layout.bytes, 7 << 10);
     // Token 13 of a table from 8: page 1, token 1; plane 1 past 4 tokens of
     // plane 0.
     assert_eq!(
@@ -493,4 +497,19 @@ fn an_rs_slot_lays_its_rows_layer_major_and_a_token_lands_by_its_page() {
         Some((1, 2560 + 4 * 400 + 600))
     );
     assert_eq!(layout.at(RowId::Rs(1), 0, 7, 8), None);
+}
+
+#[test]
+fn a_token_slots_stride_is_an_odd_number_of_skew_steps() {
+    // Under two steps a slot keeps its aligned bytes.
+    assert_eq!(skew(700, 256), 768);
+    assert_eq!(skew(SLOT_SKEW, 256), SLOT_SKEW);
+    // An even number of steps takes one more; an odd number stays.
+    assert_eq!(skew(192 << 10, 256), 193 << 10);
+    assert_eq!(skew(193 << 10, 256), 193 << 10);
+    // Bytes past a step round up to the next odd number of steps.
+    assert_eq!(skew((192 << 10) + 256, 256), 193 << 10);
+    assert_eq!(skew((193 << 10) + 256, 256), 195 << 10);
+    // An alignment past the step is the step.
+    assert_eq!(skew(64 << 10, 16 << 10), 80 << 10);
 }

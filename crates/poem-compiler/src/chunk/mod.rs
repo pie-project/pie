@@ -515,7 +515,7 @@ impl ChunkRecipe {
         for shape in &self.slots {
             let bytes = match shape {
                 SlotLayout::List { tokens, rows, .. } | SlotLayout::RsList { tokens, rows, .. } => {
-                    align_up(
+                    skew(
                         rows.iter()
                             .map(|r| {
                                 align_up(
@@ -1038,12 +1038,40 @@ fn layers(rows: &[&TokenRow]) -> BTreeMap<(Option<u32>, Option<RowId>), (u64, Ro
 
 /// A slot's bytes of `tokens` of each of `rows`, each run aligned.
 fn slot_bytes(rows: &[&TokenRow], tokens: u32, align: u64) -> u64 {
-    align_up(
+    skew(
         rows.iter()
             .map(|r| align_up(u64::from(tokens) * r.per_token(), align))
             .sum(),
         align,
     )
+}
+
+/// The step a token slot's stride is an odd number of: a paged kernel reads
+/// one layer's run of every slot it names, all at one offset into slots a
+/// stride apart, and a stride of many whole steps lands those reads on a
+/// few of the memory's channels.
+pub const SLOT_SKEW: u64 = 1 << 10;
+
+/// A token slot's stride: `bytes` aligned, and, where it is two skew steps
+/// or more, an odd number of them. L40S, one layer's kv runs of 4400 pages
+/// read a launch a layer, against the same bytes laid layer-major: slots of
+/// 3 to 36 layers of 4 to 32 KiB pages read 1.12 to 1.49 slower where the
+/// stride is three times a power of two (a 12-channel bus), and at most
+/// 1.02 slower at an odd number of KiB (2, 4 and 8 KiB steps: 1.06, 1.07,
+/// 1.14). A smaller slot's stride spreads its reads already.
+#[must_use]
+pub fn skew(bytes: u64, align: u64) -> u64 {
+    let step = SLOT_SKEW.max(align.max(1));
+    let aligned = align_up(bytes, align);
+    if aligned < 2 * step {
+        return aligned;
+    }
+    let stepped = align_up(aligned, step);
+    if (stepped / step) % 2 == 0 {
+        stepped + step
+    } else {
+        stepped
+    }
 }
 
 /// The kv page size `T` of `lists` (the kv list's; with no kv list, every
@@ -1154,7 +1182,7 @@ impl RsShape {
     fn of(rows: &[TokenRow], tokens: u32, align: u64) -> RsShape {
         RsShape {
             tokens,
-            bytes: align_up(
+            bytes: skew(
                 rows.iter()
                     .map(|r| align_up(u64::from(tokens) * r.per_token(), align))
                     .sum(),
