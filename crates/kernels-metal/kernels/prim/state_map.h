@@ -15,17 +15,27 @@ using namespace metal;
 //                     or Mamba-2, a channel of a conv, a frame of a frame
 //                     cache); a piece never cuts an atom
 //   [5] pieces        pieces one record is cut into
-//   [6 + s]           segment s's first element
+//   [6] [7] [8]       chunk_slots, seg_chunks and piece_atoms as divisor
+//                     words (`kernels_metal::tensor::divisor_word`): every
+//                     division a lookup takes is a multiply-high and two
+//                     shifts, not a runtime integer division
+//   [9 + s]           segment s's first element
 //
 // A record's ids are `pieces` consecutive ids, one a piece: a lane's row of
 // the slot table is `slots + lane * pieces`, a snapshot's
 // `snap + PIE_RS_SNAPSHOTS + n * pieces`.
 //
-// The degenerate table, `{stride, 1, stride, ~0u, ~0u, 1, 0}` (one segment,
+// The degenerate table, `{stride, 1, stride, ~0u, ~0u, 1, ..., 0}` (one segment,
 // a chunk a slot, one piece a record), puts slot `id` at `id * stride` with
 // its atoms in order: the slab every kernel read before, bit for bit.
 
-#define PIE_STATE_MAP_HEAD 6
+#define PIE_STATE_MAP_HEAD 9
+
+// `n / d` from `d`'s divisor word (exact for every `n`).
+inline uint pie_div(uint n, ulong word) {
+  const uint t = mulhi(n, uint(word));
+  return (t + ((n - t) >> (uint(word >> 32) & 0xffu))) >> (uint(word >> 40) & 0xffu);
+}
 
 inline uint pie_state_pieces(const device ulong* map) {
   return uint(map[5]);
@@ -37,12 +47,10 @@ inline uint pie_state_piece_atoms(const device ulong* map) {
 
 // The first element of the slot `id` names.
 inline ulong pie_state_slot(const device ulong* map, uint id) {
-  const uint chunk_slots = uint(map[1]);
-  const uint seg_chunks = uint(map[3]);
-  const uint chunk = id / chunk_slots;
-  const uint seg = chunk / seg_chunks;
-  return map[PIE_STATE_MAP_HEAD + seg] + ulong(chunk % seg_chunks) * map[2] +
-         ulong(id % chunk_slots) * map[0];
+  const uint chunk = pie_div(id, map[6]);
+  const uint seg = pie_div(chunk, map[7]);
+  return map[PIE_STATE_MAP_HEAD + seg] + ulong(chunk - seg * uint(map[3])) * map[2] +
+         ulong(id - chunk * uint(map[1])) * map[0];
 }
 
 // The first element of atom `atom` (each `atom_elems` long, atoms outermost
@@ -50,8 +58,9 @@ inline ulong pie_state_slot(const device ulong* map, uint id) {
 template <typename I>
 inline ulong pie_state_atom(const device ulong* map, const device I* ids, uint atom,
                             ulong atom_elems) {
-  const uint per = pie_state_piece_atoms(map);
-  return pie_state_slot(map, uint(ids[atom / per])) + ulong(atom % per) * atom_elems;
+  const uint piece = pie_div(atom, map[8]);
+  return pie_state_slot(map, uint(ids[piece])) +
+         ulong(atom - piece * pie_state_piece_atoms(map)) * atom_elems;
 }
 
 // Where atom `atom` of a record whose atom axis is innermost (a conv's
@@ -68,8 +77,9 @@ template <typename I>
 inline pie_state_column pie_state_inner(const device ulong* map, const device I* ids, uint atom,
                                         uint atoms) {
   const uint per = pie_state_piece_atoms(map);
-  return pie_state_column{pie_state_slot(map, uint(ids[atom / per])), min(per, atoms),
-                          atom % per};
+  const uint piece = pie_div(atom, map[8]);
+  return pie_state_column{pie_state_slot(map, uint(ids[piece])), min(per, atoms),
+                          atom - piece * per};
 }
 
 // A lane's row of a snapshot table: `PIE_RS_SNAPSHOTS` rows into the lane,

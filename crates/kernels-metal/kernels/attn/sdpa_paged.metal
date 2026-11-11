@@ -130,8 +130,8 @@ inline void sdpa_paged_decode_body(
   // A page and a row are each under 4 GiB: a cell is a 32x32 -> 64-bit
   // product (the page's start) plus a 32-bit offset into the page, not a
   // 64-bit product a token.
-  const uint k_page = uint(kv.k_page / kv_unit);
-  const uint v_page = uint(kv.v_page / kv_unit);
+  const uint k_page = uint((pie_fc_pages ? pie_fc_k_page : kv.k_page) / kv_unit);
+  const uint v_page = uint((pie_fc_pages ? pie_fc_v_page : kv.v_page) / kv_unit);
   const uint k_row = uint(n_kv_heads) * uint(kv_head_width);
   const uint v_row = k_row;
 

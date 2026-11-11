@@ -103,6 +103,11 @@ pub struct Fire {
     /// earlier fire of the frame; one that cannot launches `lanes`, which the
     /// kernel takes as well.
     pub indirect: Option<Indirect>,
+
+    /// The kv planes' page strides in bytes, keys then values, as function
+    /// constants 0 and 1 (`kernels/prim/kv_page.h`): fixed for a loaded
+    /// model, so the pipeline is specialized once and the kernel folds them.
+    pub page_strides: Option<[u64; 2]>,
 }
 
 /// Three u32 threadgroup counts at `offset` bytes into the buffer `buf` binds.
@@ -122,7 +127,16 @@ impl Fire {
             lanes: [0, 0, 0],
             group: [0, 0, 0],
             indirect: None,
+            page_strides: None,
         }
+    }
+
+    /// Specializes the pipeline on the kv planes' page strides
+    /// ([`Fire::page_strides`]).
+    #[must_use]
+    pub const fn page_strides(mut self, strides: [u64; 2]) -> Self {
+        self.page_strides = Some(strides);
+        self
     }
 
     /// Launches the threadgroup counts `buf` holds at `offset` where the

@@ -21,10 +21,13 @@ pub(crate) type Pipeline = Retained<ProtocolObject<dyn MTLComputePipelineState>>
 #[cfg(not(target_vendor = "apple"))]
 pub(crate) type Pipeline = ();
 
+/// A pipeline's file, entrypoint, stamp and page-stride specialization.
+type PipelineKey = (&'static str, &'static str, &'static str, Option<[u64; 2]>);
+
 #[derive(Default)]
 pub struct Pipelines {
     libraries: RefCell<HashMap<(&'static str, &'static str), Library>>,
-    pipelines: RefCell<HashMap<(&'static str, &'static str, &'static str), Pipeline>>,
+    pipelines: RefCell<HashMap<PipelineKey, Pipeline>>,
     compiles: std::cell::Cell<u64>,
 }
 
@@ -59,14 +62,30 @@ impl Pipelines {
         device: &ProtocolObject<dyn MTLDevice>,
         fire: kernels_metal::Fire,
     ) -> Result<Pipeline> {
-        let key = (fire.file, fire.entrypoint, fire.stamp);
+        let key = (fire.file, fire.entrypoint, fire.stamp, fire.page_strides);
         if let Some(pipeline) = self.pipelines.borrow().get(&key) {
             return Ok(pipeline.clone());
         }
         let library = self.library(device, fire)?;
         let name = super::ctx::nsstring(fire.entrypoint);
+        // Function constants every library may declare (`kv_page.h`): set
+        // where the fire states them, else left undefined.
+        let constants = objc2_metal::MTLFunctionConstantValues::new();
+        if let Some(strides) = fire.page_strides {
+            for (index, stride) in strides.iter().enumerate() {
+                // SAFETY: a ulong constant at this index, read from a live u64.
+                unsafe {
+                    constants.setConstantValue_type_atIndex(
+                        std::ptr::NonNull::from(stride).cast(),
+                        objc2_metal::MTLDataType::ULong,
+                        index,
+                    );
+                }
+            }
+        }
         let function = library
-            .newFunctionWithName(&name)
+            .newFunctionWithName_constantValues_error(&name, &constants)
+            .ok()
             .ok_or_else(|| Fault::Shader {
                 file: fire.file,
                 entrypoint: fire.entrypoint,
