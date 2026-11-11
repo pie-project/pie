@@ -524,6 +524,28 @@ impl Shell {
                 .windowed(window, boot.budget.max_tokens)
                 .seated(boot.budget.max_lanes))
         };
+        let rs_layout = crate::rs::Layout::read(&boot.trace)?.map(std::sync::Arc::new);
+        // The chunk the compiler picks for this trace on a TPU, where it
+        // packs one; the store lays its own runs around it.
+        let target = poem_compiler::chunk::plan(
+            &boot.trace,
+            &budgets,
+            &poem_compiler::DeviceProfile {
+                chunk: poem_compiler::chunk::ChunkProfile::TPU.paged(boot.page_size, boot.context),
+                ..poem_compiler::DeviceProfile::default()
+            },
+        )
+        .map_or(crate::store::layout::TARGET_CHUNK, |recipe| {
+            recipe.chunk_bytes
+        });
+        // The null and sink chunks the pool lays past its pages, which a
+        // budget of kv pages and state slots does not pay for: off the room.
+        let reserved = crate::store::reserved_bytes(
+            &boot.trace,
+            paging_at(u64::from(boot.context.div_ceil(boot.page_size.max(1))), boot.slots)?,
+            rs_layout.as_deref(),
+            target,
+        )?;
         // The pool buffers are program parameters, so the pages are fixed
         // before anything traces: what the budget buys, or with none what
         // the share leaves past what others held at open, the weights (at
@@ -543,7 +565,10 @@ impl Shell {
         };
         let room_at = |floor: u64| {
             working.map_or(u64::MAX, |working| {
-                working.saturating_sub(floor).saturating_sub(headroom)
+                working
+                    .saturating_sub(floor)
+                    .saturating_sub(headroom)
+                    .saturating_sub(reserved)
             })
         };
         let room = room_at(weight_floor);
@@ -605,6 +630,7 @@ impl Shell {
         let device_cap = working.map_or(u64::MAX, |working| {
             working
                 .saturating_sub(demand(fit, slots))
+                .saturating_sub(reserved)
                 .saturating_sub(headroom)
         });
         let weights = if device.is_dry() {
@@ -628,20 +654,6 @@ impl Shell {
                 &engine,
             )?
         };
-        let rs_layout = crate::rs::Layout::read(&boot.trace)?.map(std::sync::Arc::new);
-        // The chunk the compiler picks for this trace on a TPU, where it
-        // packs one; the store lays its own runs around it.
-        let target = poem_compiler::chunk::plan(
-            &boot.trace,
-            &budgets,
-            &poem_compiler::DeviceProfile {
-                chunk: poem_compiler::chunk::ChunkProfile::TPU.paged(boot.page_size, boot.context),
-                ..poem_compiler::DeviceProfile::default()
-            },
-        )
-        .map_or(crate::store::layout::TARGET_CHUNK, |recipe| {
-            recipe.chunk_bytes
-        });
         let pools = Pools::reserve(
             &device,
             &handles,
