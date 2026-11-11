@@ -193,7 +193,7 @@ pub fn shape(trace: &Trace) -> R<Shape> {
         .take(first_layer.unwrap_or(trace.nodes.len()))
         .filter(|(_, n)| matches!(n.op, Operation::Gather(Gather::Embed { weights: None, .. })))
         .map(|(at, _)| at)
-        .last();
+        .next_back();
     for (at, node) in trace.nodes.iter().enumerate() {
         let name = node.op.name();
         match analysis.layers[at] {
