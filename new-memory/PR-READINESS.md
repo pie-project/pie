@@ -19,6 +19,9 @@ Branch today: 432 commits ahead of main, 782 files, +86k / -13k. Main merged in 
 | A13 | Record rs-buffered fires (MTP / spec decode on hybrids walk eagerly; same on main) — graph capture rule | L40S | after perf fixes |
 | A14 | Wire the rung shrink: scheduler caps a fire's tokens by the activation rung; SharedGrow shrink/restore_rung move the boundary (SPEC 6) | RT | queued |
 | A15 | read_tier_slots / write_tier_slots (snapshots on shared pools) on Metal, Vulkan, wgpu, XLA, Cerebras (CUDA in sc/rt4) | Metal agent, VKP, TPU, (Cerebras: assign) | queued |
+| A16 | eager-fix regression: held weights flip to streaming on ROCm 30B MoE (body reservation) and stall | EAGER (sc/eager-fix-2) | in progress |
+| A17 | Inferlet SDK guest panic (wit-bindgen inter-task-wakeup) when requests wait for admission at small budgets | SDK agent | in progress |
+| A18 | Idle cache demoted only when PLEX keys it above the floor (user decision) | RT6 | in progress |
 | A9 | dsv41 two-window mini cannot fire on sm_89/sm_120 (fused.lse_sink kernel gap) -> two-window CUDA unverified | L40S | queued |
 
 ## B. Decide before the PR (user)
