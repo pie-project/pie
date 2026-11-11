@@ -858,6 +858,23 @@ mod tests {
         assert_eq!((p.hidden, p.head.vocab, p.head.tied), (4096, 128256, false));
     }
 
+    /// Qwen3.5's GDN layer: in_qkvz and in_ba one matvec (they read the same x), the conv,
+    /// gates, delta rule and gated norm one mixer. gpt-oss's: biases at the roots, the sinks with
+    /// the attention, the router's gather, the experts' banks, their combine at the rows.
+    #[test]
+    fn gdn_and_routed_layers_have_their_phases() {
+        let q = program("qwen35-d0.8b-bf16-kv-bf16").unwrap();
+        assert_eq!(
+            form(q.body(0)),
+            "Rr1 Cr Mr2 Cc X4 Mc1 Rr2 Cr Mr1 Rc1 Cc Mc1 Rr1"
+        );
+        let g = program("gptoss-20b-bf16-mxfp4-kv-bf16").unwrap();
+        assert_eq!(
+            form(g.body(0)),
+            "Rr1 Cr Mr1 Rc2 Cc X3 Mc1 Rr3 Cr Mr1 Rc1 Sc Rc1 Mr1 Rc1 Cc Mc1 Rr3"
+        );
+    }
+
     /// Every shipping model and the Qwen3 MoE miniature lower; their bodies.
     #[test]
     fn shipping_models_lower() {
