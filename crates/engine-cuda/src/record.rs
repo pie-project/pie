@@ -93,6 +93,22 @@ impl Bodies {
     pub fn eager_copy_world(&mut self) {
         self.recorder.eager_copy_world();
     }
+
+    /// A serving fire of a load that records bodies walked with none:
+    /// counted, and warned of at the first and every power of two after,
+    /// so an unrecorded serving path cannot hide.
+    pub fn eager_unbodied(&mut self, why: &str) {
+        let tally = &mut self.recorder.bstats;
+        tally.eager_unbodied += 1;
+        let count = tally.eager_unbodied;
+        if count.is_power_of_two() {
+            eprintln!(
+                "engine-cuda: WARNING: a serving fire ran with no recorded body ({why}); \
+                 {count} such fire(s) so far (BodyTally::eager_unbodied). Every serving \
+                 composition of a load that records bodies should replay one"
+            );
+        }
+    }
 }
 
 impl Recorder {
@@ -700,6 +716,10 @@ pub struct BodyTally {
     pub sealed_short: u64,
     pub eager_buffered: u64,
     pub eager_copy_world: u64,
+    /// Serving fires walked with no body under a load that records them:
+    /// their composition was never armed (and not captured as it served)
+    /// or is one a body cannot carry. Each is warned of at a power of two.
+    pub eager_unbodied: u64,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -942,7 +962,7 @@ impl Bodies {
                     "the resident body is empty"
                 };
                 eprintln!(
-                    "engine-cuda: the sealed map holds no body for {key} ({why}) — \
+                    "engine-cuda: WARNING: the sealed map holds no body for {key} ({why}) — \
                      this shape walks eagerly for the life of the load \
                      (BodyTally::sealed_declines counts each such fire; {declines} so far) {}",
                     self.body_stats()
@@ -1077,8 +1097,12 @@ impl Bodies {
                 }
             }
         }
-        let seated = self.insert_body(
-            key.clone(),
+        // The warm walk above served this fire; a capture launches nothing.
+        // The body is not launched again here: a fire that folds rows into
+        // a recurrent state (or appends to anything in place) would fold
+        // them twice.
+        self.insert_body(
+            key,
             Body {
                 script: steps.into_boxed_slice(),
                 grids,
@@ -1088,17 +1112,6 @@ impl Bodies {
                 pinned: false,
             },
         );
-        if seated && let Some(body) = self.map.bodies.get_mut(&key) {
-            for step in body.script.iter() {
-                match step {
-                    Step::Exec { exec, .. } => exec.launch(at.stream)?,
-                    Step::Island(cut) => {
-                        walk_capture_cut(at, run, place, Streams::Serial, *cut)?;
-                    }
-                }
-            }
-            body.launched_at = at_seq;
-        }
         Ok(())
     }
 

@@ -829,6 +829,8 @@ impl FireCtx<'_> {
 
                 self.cache.fire_body(&fire, &mut run, &place)
             } else {
+                self.cache
+                    .eager_unbodied("its composition is one a body does not carry");
                 let mut cursor = Cursor::new(&place);
                 walk(
                     self.trace,
@@ -843,6 +845,13 @@ impl FireCtx<'_> {
         } else {
             if self.graphs.records() {
                 self.cache.eager_walk(p.rs.buffered);
+                if !self.arming {
+                    self.cache.eager_unbodied(if p.rs.buffered {
+                        "its lanes buffer recurrent rows"
+                    } else {
+                        "no recorded body holds its composition"
+                    });
+                }
             }
             let mut cursor = Cursor::new(&place);
             walk(

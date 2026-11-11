@@ -143,6 +143,14 @@ impl Chunks {
         self.act
     }
 
+    /// The bytes of the activation's span not yet held backed: what a
+    /// fire's activation will still take beside the state's chunks.
+    #[must_use]
+    pub fn activation_unheld_bytes(&self) -> u64 {
+        let chunk = self.layout.chunk_bytes;
+        (u64::from(self.act) * chunk).saturating_sub(self.range.held(u64::from(self.total) * chunk))
+    }
+
     /// Where a fire's activation starts: the range's end less its chunks.
     #[must_use]
     pub fn activation_base(&self) -> u64 {
@@ -347,6 +355,12 @@ impl Chunks {
             self.next = 1;
         }
         self.weights = chunks;
+    }
+
+    /// The chunks under `chunks` the runtime named weight slots in.
+    #[must_use]
+    pub fn weight_chunks_under(&self, chunks: u32) -> u32 {
+        u32::try_from(self.weights.range(..chunks).count()).unwrap_or(u32::MAX)
     }
 
     /// Whether lanes name slot refs.

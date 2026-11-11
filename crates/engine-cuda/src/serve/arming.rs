@@ -429,8 +429,18 @@ impl Shell {
     }
 
     fn synthetic_lanes_with(&self, lanes: &[LaneRows], media: &[LaneMedia]) -> Vec<Synthetic> {
-        let slots = self.held.len().max(1) as u32;
         let page_size = u64::from(self.pools.paging().page_size).max(1);
+        // What the lanes name, inside the chunks the fit left the pool: a
+        // stated kv budget may hold fewer records and pages than the
+        // lattice's widest fire names, and a synthetic lane's rows are never
+        // read back, so its lanes share them there. The pool seats what a
+        // fire names for good, so every fire of the lattice folds into one
+        // room: the widest fire's.
+        let lanes_most = self.budget.max_lanes.max(1);
+        let (slots, room, windowed) = self.pools.synthetic_room(
+            (self.held.len().max(1) as u32).min(lanes_most),
+            u64::from(self.budget.max_tokens).div_ceil(page_size) + u64::from(lanes_most),
+        );
         let mut next_page = 0u64;
         let row_bytes = self.patch_seat.map_or(0, |seat| seat.row_bytes) as usize;
         let fold = (self.patch_fold as usize).max(1);
@@ -452,7 +462,7 @@ impl Shell {
                     pages: {
                         let pages = u64::from(rows).div_ceil(page_size).max(1);
                         let table: Vec<u32> = (next_page..next_page + pages)
-                            .map(|page| u32::try_from(page).unwrap_or(u32::MAX))
+                            .map(|page| u32::try_from(page % room).unwrap_or(u32::MAX))
                             .collect();
                         next_page += pages;
                         table
@@ -496,7 +506,13 @@ impl Shell {
             .map(|mut lane| {
                 // A synthetic lane's content is never read back, so its
                 // pages fold into the windowed pool past the null page.
-                let windowed = self.pools.paging().window_pages().saturating_sub(1).max(1);
+                let windowed = self
+                    .pools
+                    .paging()
+                    .window_pages()
+                    .min(windowed)
+                    .saturating_sub(1)
+                    .max(1);
                 if self.pools.has_windowed() {
                     lane.window = lane
                         .pages
@@ -1285,6 +1301,27 @@ impl Shell {
             seal,
         };
         eprintln!("engine-cuda: {report}");
+        // A load that records bodies serves every composition it fires from
+        // one: one that armed none, or stopped arming for want of room, would
+        // serve eagerly, which is never what a deployment asked for.
+        let attempted = wanted + never;
+        if records && !verify && !group && attempted > 0 && (armed == 0 || starved.is_some()) {
+            return Err(Fault::Residency(format!(
+                "the card does not hold this deployment's graph bodies: {} of {attempted} \
+                 compositions armed{}. A load that records bodies serves every composition \
+                 from one rather than eagerly. Lower `[engine] max_model_len` or the fire \
+                 rows, state a smaller `[model] device_kv_budget`, raise `[model] \
+                 device_memory_share`, or free what else holds the device. ({report})",
+                armed,
+                match starved {
+                    Some(spare) => format!(
+                        ", arming stopped with {} MiB spare under the ceiling",
+                        spare >> 20
+                    ),
+                    None => String::new(),
+                },
+            )));
+        }
         if super::diag::on().arm_trace {
             let slabs = kernels_cuda::jit::Slabs::census();
             let total: usize = slabs.iter().map(|(_, bytes)| *bytes).sum();
