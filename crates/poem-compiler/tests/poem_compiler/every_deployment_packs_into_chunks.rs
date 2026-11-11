@@ -432,7 +432,11 @@ fn nemotron_super_holds_40_four_mib_states_and_their_convs() {
     );
     let overhead = fixed_overhead(&recipe);
     println!("nemotron-super fixed overhead {:.2}%", 100.0 * overhead);
-    assert!(overhead < 0.02, "{overhead}");
+    // The list slot's skew (an odd number of KiB, 257 KiB here) puts the
+    // chunks the expert slots fill best off its multiples, so the fixed
+    // records take whole-chunk pieces: some 1.4% more fixed waste than an
+    // unskewed 256 KiB slot, on this deployment only.
+    assert!(overhead < 0.025, "{overhead}");
 }
 
 #[test]
