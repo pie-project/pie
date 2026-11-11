@@ -1,4 +1,4 @@
-// wafer/head_pe_gptoss.csl: the wafer program head PE of the gpt-oss program. Design: src/spatial/README.md
+// wafer/head_pe_gptoss.csl: the wafer program head PE of the gpt-oss program. Design: README.md
 // (gpt-oss).
 //
 // Role. The head is a band of HDR dims-rows (HDc = the units' Hc dims each, fed by the last unit's CX row of

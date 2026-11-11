@@ -1,5 +1,5 @@
 // wafer/ctl_cy_dense.csl: the wafer program column control PE for Qwen3.5 (CY_c). Design and build:
-// src/spatial/README.md.
+// README.md.
 //
 // Role. One a unit column, on the unit's middle row: the root of the column reductions of the
 // column's weight PEs (weight_dense.csl) and all of the layer's column-local element-wise work:
@@ -617,8 +617,7 @@ fn att(a: u16) void {
   }
 }
 
-// The MLP's SiLU in f16 (silu16, the f32-scaled form: s g log2e and s u ln2 in f32, rounded once;
-// tools/emu/silu16.py emulates it bit for bit, tools/emu/tf_q35.py's _s16 mode)
+// The MLP's SiLU in f16 (silu16, the f32-scaled form: s g log2e and s u ln2 in f32, rounded once)
 var hg = @zeros([2 * Ic]@fp16());   // G | U
 var ht = @zeros([Ic]@fp16());
 var hm = @zeros([Ic]@fp16());

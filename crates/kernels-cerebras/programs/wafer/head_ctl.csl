@@ -1,5 +1,5 @@
 // wafer/head_ctl.csl: the wafer program head's control PE (one a head row, the head's middle column).
-// Design and build: src/spatial/README.md.
+// Design and build: README.md.
 //
 // Role. The root of its row's logit reduction (both halves at once through a FIFO, back over a
 // loop-back colour), then the row's argmax over its VR vocabulary rows: res = [max, the winning

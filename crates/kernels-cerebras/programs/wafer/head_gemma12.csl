@@ -1,5 +1,5 @@
 // wafer/head_gemma12.csl: the wafer program head weight PE for Gemma 4 12B (head_pe.csl with a tied head and head groups;
-// src/spatial/README.md, Gemma 4 12B). A head column takes x's dims of a group of consecutive CX rows (NX <= HDc words,
+// README.md, Gemma 4 12B). A head column takes x's dims of a group of consecutive CX rows (NX <= HDc words,
 // [RQ+17]; the rest of its HDc dims are padding with zero weights): the group's root CX sends them along its row
 // (HX) to the head PE on that row (x role 2), which multicasts the HDc words up and down the column (HM); the other
 // PEs take the multicast (x role 0).

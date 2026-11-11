@@ -1,4 +1,4 @@
-// wafer/ctl_cx.csl: the wafer program row control PE (CX_r). Design and build: src/spatial/README.md.
+// wafer/ctl_cx.csl: the wafer program row control PE (CX_r). Design and build: README.md.
 //
 // Role. One a unit row, on the unit's middle column: the row's x chunk (Hc f32), the residuals,
 // the RMSNorm gammas, the root of the row reductions (the o_proj / out_proj and down partials of

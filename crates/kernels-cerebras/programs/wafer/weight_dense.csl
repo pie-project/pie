@@ -1,5 +1,5 @@
 // wafer/weight_dense.csl: the wafer program weight PE of the unit snake (Gated DeltaNet and attention
-// layers: Qwen3.5, Qwen3, Llama 3). Design and build: src/spatial/README.md.
+// layers: Qwen3.5, Qwen3, Llama 3). Design and build: README.md.
 //
 // Role. A unit is PX x PY weight PEs plus a control column (CX, ctl_cx.csl: one PE a row, the
 // root of the row reductions) and a control row (CY, ctl_cy_dense.csl: one PE a column, the root of

@@ -1,5 +1,5 @@
 // wafer/weight_gptoss_moe.csl: the wafer program MoE weight PE for gpt-oss (the unit's east half). Design:
-// src/spatial/README.md (gpt-oss).
+// README.md (gpt-oss).
 //
 // Role. MoE PE (r, c) holds, for each of the unit's K layers, a slice of all NEX experts (its row's x chunk,
 // Hc dims, by its column's Ic intermediate dims) and router output (c mod NEX) over its x chunk, and runs:

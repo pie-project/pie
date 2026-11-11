@@ -1,4 +1,4 @@
-// wafer/weight_gptoss_att.csl: the wafer program attention weight PE for gpt-oss. Design: src/spatial/README.md
+// wafer/weight_gptoss_att.csl: the wafer program attention weight PE for gpt-oss. Design: README.md
 // and the gpt-oss section there (attention columns | CX | MoE columns).
 //
 // Role. A gpt-oss unit is [AX attention columns | CX | MX MoE columns] by PY weight rows (+ the CY row).

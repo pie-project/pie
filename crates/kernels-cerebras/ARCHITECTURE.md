@@ -26,6 +26,8 @@ engine (`engine-cerebras`) runs its **artifact** and knows none of it (below).
                                     Program::bindings (blocks' copies) ─▶ artifact::Artifact ─▶ engine
 ```
 
+Modules are under `src/`.
+
 | Layer | Module | Holds | Knows |
 |---|---|---|---|
 | Plan | `plan.rs` | `Shape` (the model's facts), `Partition` (counts, split factors), `Contract` (positions, CAP, LOOP, WL, the logits' prescale), the family; `Preset` (a family's named choices with overrides); serde, so a plan is a file | nothing physical: the seam to poem's spatial pass (below) |
@@ -205,7 +207,7 @@ is. `poem-compiler/SPATIAL.md` has the target-neutral half.
 `Program::bindings` lists every copy, the blocks' in order: a symbol, a rectangle and a `Source`
 (`Staged` leading-range blocks, `Slice` for any sub-array: column ranges, per-PE padding, a row
 repeated down or across a rectangle, optional tables; `Rcfg`) with the `Transform`s the cut
-applied. The engine's placer (`engine-cerebras` `spatial::artifact::place`) executes an artifact's
+applied. The engine's placer (`engine-cerebras` `artifact::place`) executes an artifact's
 bindings on a `Device`. The cut keeps every staged file under the 2 GiB a transfer may take (split
 head tiles, `ple`'s 1,900 MiB storage files).
 
@@ -238,9 +240,9 @@ alone; a program without an artifact is refused.
 
 ## Building in the engine
 
-A load (`engine-cerebras` `spatial::prepare`) runs the same library calls as the tools: `target::plan` (the
+A load (`engine-cerebras` `prepare`) runs the same library calls as the tools: `target::plan` (the
 positions the serving context asks for), `build::emit` and `build::link` with the configured toolchain (the CSL
-kernels embedded in the crate, `spatial::sources`), and `tiles::stage` over the checkpoint's params landed
+kernels embedded in the crate, `sources`), and `tiles::stage` over the checkpoint's params landed
 through the runtime's import contract. The program is cached by its `ProgramKey` (plan, levers, every kernel
 source, the build `FORMAT`, the compiler version, the toolchain and the architecture), the cut by the plan's
 shape, partition and contract and the checkpoint; each model keeps one of each.

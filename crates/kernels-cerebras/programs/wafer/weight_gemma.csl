@@ -1,4 +1,4 @@
-// wafer/weight_gemma.csl: the wafer program weight PE for Gemma 4 (src/spatial/README.md 7; weight_dense.csl
+// wafer/weight_gemma.csl: the wafer program weight PE for Gemma 4 (README.md 7; weight_dense.csl
 // without GDN). Every layer is attention (KM bit l: global, else sliding), then the MLP, then the per-layer
 // embedding (PLE) round. Per layer, its tiles: [qkv Hc x NQ][o QO x Hc][gate|up Hc x 2Ic][down Ic x Hc]
 // [PLE gate Hc x 1][PLE projection 1 x Hc] (f16 bits; NQ = Qh Dc q (+ Dc k + Dc v unless SH), QO = Qh Dc, Dc by kind).

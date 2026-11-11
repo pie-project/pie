@@ -1,5 +1,5 @@
 // wafer/ctl_cx_gemma12.csl: the wafer program row control PE for Gemma 4 12B (ctl_cx_gemma.csl without the PLE phase;
-// src/spatial/README.md, Gemma 4 12B). The residual is x plus a pending term p whose scalar s (a sandwich norm's
+// README.md, Gemma 4 12B). The residual is x plus a pending term p whose scalar s (a sandwich norm's
 // 1 / rms) is not known here yet. A layer's two phases each send the row's weight PEs [a = g x | b = g p | 4 partial
 // sums] (Hc + Hc + 4 f32 words; sums: the pending |r|^2 for s, |x|^2, x.p, |p|^2, so CY gets rms(x + s p)) and take
 // back [the reduction (Hc) | s] (the PE in column 0 adds s):

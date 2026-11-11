@@ -3,9 +3,9 @@
 The wafer program runs one bf16 model on a CS-3 wafer at batch 1. It is built for Qwen3.5 (9B, 4B and 0.8B),
 Qwen3-8B, Llama 3.1 8B, Gemma 4 (E2B, E4B, 12B) and gpt-oss-20b (section 7). This file covers its design, results, build and run, the parameters and environment variables, the
 metrics, and open items.
-Serving is Rust only: the engine's `spatial::artifact::ArtifactModel` behind its `Wafer` runs the build's
-artifact (`artifact.rs`; this module is the build). The Python under `crates/kernels-cerebras/tools/`
-and `crates/engine-cerebras/tools/emu` runs at build time only.
+Serving is Rust only: the engine's `artifact::ArtifactModel` behind its `Wafer` runs the build's
+artifact (`src/artifact.rs`; this crate is the build). The Python under `tools/` makes tiny test
+checkpoints and runs the output baseline; nothing serving needs it.
 
 ## 1. Design
 
@@ -70,9 +70,8 @@ violations; the chip did not.
 
 **Numerics.** IEEE f16 weights and x, with f16 accumulation on each PE and f32 across PEs. The MLP's
 SiLU is in f16; the KV cache and the softmax probabilities are in f16. The KV matvecs accumulate in
-f32. Every lever was gated in host emulation before it went to the chip
-(`tools/emu/tf_q35.py`, teacher-forced against the HF f32 golden): it ships only if it keeps 0
-mismatches. Two levers were left out on that basis: xg16, which flips a near tie on the 9B, and
+f32. Every lever was gated in host emulation of its number formats before it went to the chip
+(teacher-forced against the HF f32 golden): it ships only if it keeps 0 mismatches. Two levers were left out on that basis: xg16, which flips a near tie on the 9B, and
 one-pass bf16 x.
 
 ## 2. Results (CS-3, B1 greedy, all golden)
@@ -143,10 +142,10 @@ async = true
 ```
 
 A load plans the model's trace (the family its shape needs, the preset, the positions), builds and links the
-program, and cuts the checkpoint for it (`engine-cerebras` `spatial::prepare`). Both are kept in the engine cache
+program, and cuts the checkpoint for it (`engine-cerebras` `prepare`). Both are kept in the engine cache
 (`<PIE_HOME>/.../cerebras/wafer`, `p-<model>-<key>` and `t-<model>-<key>`), keyed by everything they follow from,
 so a second load compiles and cuts nothing; a whole-wafer compile takes minutes. Pie config: `frame_size 4`,
-`frame_dispatch_depth 63`. Every family's checkpoint is cut in Rust (`spatial::tiles`: the family states its
+`frame_dispatch_depth 63`. Every family's checkpoint is cut in Rust (`tiles`: the family states its
 layout, one tiler makes it); `[engine.debug] weights` serves tiles staged elsewhere instead.
 
 **Build by hand** (no SDK needed until the link):
@@ -170,9 +169,7 @@ layout, one tiler makes it); `[engine.debug] weights` serves tiles staged elsewh
    the tiles a load cuts (`tiles::stage`: the family's [`tiles::spec`] statement of its layout, made by the one
    tiler `tiles::cut`). `wafer-stage --plan <plan.json> --landed <params.safetensors> --out <dir>` cuts params
    already landed under the trace's names (a tiny checkpoint's: `tools/wafer/baseline/landed.py`).
-5. **Numerics gate** (before any new lever): `tools/emu/tf_q35.py <model> <golden> <meta.json>
-   ref,f16acc_s16_kv16 256 <out>`. This needs `torch` and `transformers` with Qwen3.5.
-6. **Tiny end-to-end on the simulator** (no chip):
+5. **Tiny end-to-end on the simulator** (no chip):
    1. `tools/wafer/dense/mk_tiny_qwen.py <dir> t08` (or `t4`; `mk_tiny_llama.py <dir>` a tiny Llama 3) builds a
       tiny HF checkpoint and its golden.
    2. `wafer-compile plan --shape <its shape.json> --preset tiny-t08 --out <plan>`; `baseline/landed.py <ckpt>
@@ -206,7 +203,7 @@ default is the shipped build. Each kernel's header describes its own params and 
 | `force` / `nforce` | head_ctl (symbols) | - | the host forces the first `nforce` steps' tokens: a whole prompt through the loop in one launch (`[engine.debug] force_prompt`), and teacher-forced checks |
 | `HACC16` | head_pe | 0 | measurement: f16 head accumulation, about -1.7k cycles. It halves the 9B golden's tightest margin and, stacked with other levers, flipped it. |
 | `FIFOW` | all | 32 | the reductions' FIFO depth |
-| `SLW` | CY | 0 | the f16 SiLU without its subnormal flush (the tail to 2^-24). Qwen3-8B needs it (`tools/emu/silu16.py`'s `silu16w`): the flush costs 2 golden tokens in emulation. |
+| `SLW` | CY | 0 | the f16 SiLU without its subnormal flush (the tail to 2^-24). Qwen3-8B needs it: the flush costs 2 golden tokens in emulation. |
 | `GATE` | CY | 1 | attention's q_proj carries the output gate (Qwen3.5). Qwen3 (dense): 0, NQA = Qh Dc + 2 Dc. |
 | `QKN` | weight | 1 | the q / k heads are RMS-normed (Qwen3.5, Qwen3): their rms scales the scores. 0 (Llama 3): no q / k norm; `qkw` holds q's 1/sqrt(head dim) alone. From the shape (`qk_norm`). |
 | `EPS` | CY | 1e-6 | the RMSNorms' eps (hidden and GDN's gated norm; Llama 3: 1e-5). From the shape (`norm.eps`). GDN's q / k l2 norms keep 1e-6. |
@@ -274,9 +271,7 @@ They match HF f32 logprobs to within 0.004 on the chosen token.
 Both reuse the wafer program machinery (the generic chains, segments, handoffs, head and token loop; `head_ctl.csl`)
 with their own kernels and a family each (`family/gemma.rs`, `family/gptoss.rs`: presets, blocks, kernels). The
 model's shape selects the family (`family::serving`): experts take gpt-oss's, per-layer inputs or shared KV Gemma's,
-sliding layers otherwise the 12B's. Tools: `tools/wafer/gemma`,
-`tools/wafer/gptoss` (the tiny fixture), `tools/emu/tf_gemma.py`
-and `tf_gptoss.py` (teacher-forced emulation of the kernels' number formats).
+sliding layers otherwise the 12B's. Tiny fixtures: `tools/wafer/gemma`, `tools/wafer/gemma12`, `tools/wafer/gptoss`.
 
 **Gemma 4** (`*_gemma.csl`, E2B and E4B; 12B below).
 - Units at explicit origins: 7 units (E2B 256 x 128, Hc 12, K 5; E4B 256 x 160, Hc 16, K 6) placed around the
@@ -325,7 +320,7 @@ layers and a 2 GB tied head fill 98% of the wafer, which only fits with a row-ro
   64 columns (kv head h on 8 columns, Dc 8), with sinks and YaRN RoPE on its CY; MoE 288 columns (Ic 10) with a
   vector top-4 router in f32 on its CY (a max tree, only the taken leaf's path redone).
 - Head: 201,088 untied rows in a band below the units; logits are prescaled (`HSCALE`, 2^15) and the host divides.
-- Pass criterion: the bf16 golden, with mismatches classified by `tools/emu/classify_tf.py` (bf16 top-1 tie, router
-  tie at the step or before it); the f32 reference is secondary.
+- Pass criterion: the bf16 golden, with mismatches classified as a bf16 top-1 tie or a router
+  tie at the step or before it; the f32 reference is secondary.
 - Serving build (the `full` preset's levers): `GLUV 1` (SwiGLU as vector ops), `CYV 2` (the attention CY's exp as a vector
   op, bit-identical). `CYV 1` / `3` and the stamps (`TSTAMP`) are opt-in.

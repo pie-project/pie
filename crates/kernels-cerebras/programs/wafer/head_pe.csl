@@ -1,4 +1,4 @@
-// wafer/head_pe.csl: the wafer program head weight PE. Design and build: src/spatial/README.md.
+// wafer/head_pe.csl: the wafer program head weight PE. Design and build: README.md.
 //
 // Role. The head block is HC columns of HDc hidden dims (plus a control column, head_ctl.csl, in
 // the middle) by HR rows of VR vocabulary rows each. A head PE holds its VR x HDc tile of lm_head

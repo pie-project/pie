@@ -1,4 +1,4 @@
-// wafer/ctl_cx_gptoss.csl: the wafer program row control PE (CX_r) of a gpt-oss unit. Design: src/spatial/README.md
+// wafer/ctl_cx_gptoss.csl: the wafer program row control PE (CX_r) of a gpt-oss unit. Design: README.md
 // (gpt-oss).
 //
 // Role. One a unit row, between the unit's attention columns (west) and MoE columns (east): the row's x

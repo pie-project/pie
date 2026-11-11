@@ -1,5 +1,5 @@
 // wafer/ctl_cy_gptoss_moe.csl: the wafer program column control PE (CY_c) of a gpt-oss MoE column. Design:
-// src/spatial/README.md (gpt-oss).
+// README.md (gpt-oss).
 //
 // Role. One a MoE column, on the unit's middle row. A layer:
 //   router reduction [partial | ssq] -> logit c mod NEX = partial x rsqrt(ssq / HR + eps) + bias, f32 end to

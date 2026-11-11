@@ -40,7 +40,7 @@ The physical build then lowers `SpatialPlan<Partition>` to the device. That buil
 - The partition is the unit grid, the rows and columns a unit's dims split over, segment widths, two-level reduction groups, and the head's cut. These are the `Partition` fields of a wafer program plan.
 - The flows become handoffs between units.
 - The target's own build lays them onto the fabric: floor, wiring, colours and kernels.
-- Its `Plan` comes from this pass: `kernels-cerebras`'s `spatial::target` reads the `Shape` off the trace, and the serving family's presets are the candidates (the first that builds is kept).
+- Its `Plan` comes from this pass: `kernels-cerebras`'s `target` reads the `Shape` off the trace, and the serving family's presets are the candidates (the first that builds is kept).
 
 **A mesh of cores with a network-on-chip and device DRAM.**
 - Each core runs a small program over tiles, streamed from DRAM or held in core SRAM.

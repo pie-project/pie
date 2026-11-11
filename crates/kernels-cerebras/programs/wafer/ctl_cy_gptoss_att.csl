@@ -1,5 +1,5 @@
 // wafer/ctl_cy_gptoss_att.csl: the wafer program column control PE (CY_c) of a gpt-oss attention column.
-// Design: src/spatial/README.md (gpt-oss).
+// Design: README.md (gpt-oss).
 //
 // Role. One an attention column, on the unit's middle row: the root of the column's reductions and the
 // column-local attention element-wise work. A layer:

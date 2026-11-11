@@ -1,4 +1,4 @@
-// wafer/relay.csl: a PE of the gap slot (src/spatial/README.md: an odd unit count on an even number of
+// wafer/relay.csl: a PE of the gap slot (README.md: an odd unit count on an even number of
 // unit columns leaves one slot out of the snake). It holds no tiles and runs nothing; init sets the routes the
 // host's rcfg names, compute returns.
 param memcpy_params;
