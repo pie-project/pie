@@ -494,8 +494,20 @@ pub(crate) fn rotate_all(
     Ok(out)
 }
 
-/// Rows a prompt-tall rotation takes a block (`turn_tall`).
+/// Rows a prompt-tall rotation takes a block at most (`turn_tall`).
 const TALL_ROWS: i64 = 256;
+
+/// The rows a row-blocked kernel takes a step for `rows` rows: the most of
+/// `most`, 128, 64, 32 and 16 that divides them, so no block reaches past
+/// the last row (a partial last block's copies read and write past the
+/// array: a v5e gemma-4-E2B c256 hung on the shared tail's 272 readout rows
+/// turned as two blocks of 256). `None` when no such block divides them.
+pub(crate) fn whole_rows(rows: i64, most: i64) -> Option<i64> {
+    [most, 128, 64, 32, 16]
+        .into_iter()
+        .filter(|&r| r <= most)
+        .find(|&r| rows % r == 0)
+}
 
 /// A prompt's bf16 rows turned by one Mosaic kernel, a block of rows a step
 /// and each head in place, when `t` turns whole heads a lane tile wide or
@@ -543,11 +555,14 @@ fn turn_tall(f: &mut Func, x: Val, pos: Val, t: &Turn) -> Result<Option<Val>, Er
     let sign = f.broadcast(sign, &[rows, u], &[1])?;
     let s = f.mul(s, sign)?;
     let heads = width / u;
-    let nb = (rows + TALL_ROWS - 1) / TALL_ROWS;
+    let Some(tr) = whole_rows(rows, TALL_ROWS) else {
+        return Ok(None);
+    };
+    let nb = rows / tr;
     let block = |w: i64, elem: Elem| Block {
         array: vec![rows, w],
         elem,
-        block: vec![TALL_ROWS, w],
+        block: vec![tr, w],
         window: Window::Blocked,
         index: Box::new(|b: &mut Body, g: &Grid| Ok(vec![g.ids[0], b.i32(0)])),
     };
@@ -564,9 +579,7 @@ fn turn_tall(f: &mut Func, x: Val, pos: Val, t: &Turn) -> Result<Option<Val>, Er
         outs: vec![block(width, Elem::Bf16)],
         // Two buffers of each block, with room: 32 heads of 256 (gemma-4-31B's
         // `q`) hold 17.8 MB, past a v5e's 16 MB default.
-        vmem_limit: Some(
-            u64::try_from(8 * TALL_ROWS * width + 16 * TALL_ROWS * u + (4 << 20)).unwrap_or(0),
-        ),
+        vmem_limit: Some(u64::try_from(8 * tr * width + 16 * tr * u + (4 << 20)).unwrap_or(0)),
         scratch: vec![],
     };
     let c_ = k
@@ -577,7 +590,7 @@ fn turn_tall(f: &mut Func, x: Val, pos: Val, t: &Turn) -> Result<Option<Val>, Er
             let by = b.i32(u / 2);
             for h in 0..heads {
                 let col = b.index(h * u);
-                let xh = b.vload(blk.ins[0], &[i0, col], &[TALL_ROWS, u])?;
+                let xh = b.vload(blk.ins[0], &[i0, col], &[tr, u])?;
                 let xh = b.convert_f(xh, Elem::F32)?;
                 let xp = b.rotate(xh, by, 1)?;
                 let a = b.mulf(xh, cs)?;
@@ -801,4 +814,16 @@ pub fn yarn(
     let t = t.scaled(attention_factor);
     let v = rotate_all(f, OP, &[q, k], positions, 1, &t)?;
     Ok([v[0], v[1]])
+}
+
+#[cfg(test)]
+mod row_block_tests {
+    #[test]
+    fn row_blocks_are_whole() {
+        assert_eq!(super::whole_rows(1792, 256), Some(256));
+        assert_eq!(super::whole_rows(640, 256), Some(128));
+        assert_eq!(super::whole_rows(272, 256), Some(16));
+        assert_eq!(super::whole_rows(2176, 256), Some(128));
+        assert_eq!(super::whole_rows(600, 256), None);
+    }
 }
