@@ -586,6 +586,7 @@ impl Streamed {
                 }
             }
         }
+        packed_rows(&mut out);
         Ok(out)
     }
 
@@ -799,5 +800,32 @@ impl Fire {
             .iter()
             .find(|(p, _)| *p == param)
             .map(|&(_, bank)| bank)
+    }
+}
+
+/// Bf16 bytes in their natural order laid as the pool holds them: each pool
+/// row of 512 bytes in the packed rows order (`kernels_xla::hlo` pool
+/// views), word `l` holding elements `l` (low half) and `l + 128`.
+fn packed_rows(bytes: &mut [u8]) {
+    let mut row = [0u8; 512];
+    for chunk in bytes.chunks_exact_mut(512) {
+        row.copy_from_slice(chunk);
+        for l in 0..128 {
+            chunk[4 * l..4 * l + 2].copy_from_slice(&row[2 * l..2 * l + 2]);
+            chunk[4 * l + 2..4 * l + 4].copy_from_slice(&row[2 * (l + 128)..2 * (l + 128) + 2]);
+        }
+    }
+}
+
+#[cfg(test)]
+mod packed {
+    #[test]
+    fn a_pool_row_holds_its_elements_l_and_l_plus_128_a_word() {
+        let mut b: Vec<u8> = (0..256u16).flat_map(|e| e.to_le_bytes()).collect();
+        super::packed_rows(&mut b);
+        let w = |l: usize| u32::from_le_bytes([b[4 * l], b[4 * l + 1], b[4 * l + 2], b[4 * l + 3]]);
+        assert_eq!(w(0), 128 << 16);
+        assert_eq!(w(5), 5 | (133 << 16));
+        assert_eq!(w(127), 127 | (255 << 16));
     }
 }
