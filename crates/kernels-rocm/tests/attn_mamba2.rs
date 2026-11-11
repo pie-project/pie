@@ -8,7 +8,7 @@ mod common;
 use common::{Gpu, STATE, bf16s, close_abs, indptr_of, round_bf16, values};
 use dtype::Dtype;
 use kernels_rocm::ssm::{self, Mamba2};
-use kernels_rocm::{RaggedTensor, RecurrentPool, Tensor};
+use kernels_rocm::{RaggedTensor, RecurrentPool, Snapshots, Tensor};
 
 const H: usize = 4;
 const G: usize = 2;
@@ -17,7 +17,7 @@ const N: usize = 128;
 const INNER: usize = H * P;
 const WIDTH: usize = INNER + 2 * G * N;
 const HEAD: usize = P * N;
-const SLOTS: usize = 4;
+const SLOTS: usize = 6;
 const EPS: f32 = 1e-5;
 
 struct Case {
@@ -130,12 +130,20 @@ fn attn_mamba2_step() {
 fn attn_mamba2_scan() {
     let Some(gpu) = Gpu::open() else { return };
     let ctx = gpu.ctx();
-    let lens = [5u32, 1, 40];
-    let slots = [1i32, 3, 0];
+    // The last lane snapshots mid-chunk and at its last row.
+    let lens = [5u32, 1, 40, 97];
+    let slots = [1i32, 3, 0, 2];
+    let snaps = [(20usize, 4usize), (97, 5)];
     let indptr = indptr_of(&lens);
     let rows = *indptr.last().unwrap() as usize;
     let case = Case::new(rows);
-    let (m, [xbc, dt, z], pool) = case.upload(&gpu, rows as u32, &slots);
+    let (m, [xbc, dt, z], mut pool) = case.upload(&gpu, rows as u32, &slots);
+    pool.snapshots = Snapshots {
+        indptr: gpu.column(&[0i32, 0, 0, 0, snaps.len() as i32]),
+        rows: gpu.column(&snaps.map(|s| s.0 as i32)),
+        slots: gpu.column(&snaps.map(|s| s.1 as i32)),
+        count: snaps.len() as u32,
+    };
     let xbc = RaggedTensor {
         data: xbc,
         indptr: gpu.column(&indptr),
@@ -153,6 +161,11 @@ fn attn_mamba2_scan() {
                 &want,
                 3e-2,
             );
+            let done = row + 1 - indptr[r] as usize;
+            for &(_, to) in snaps.iter().filter(|s| r == lens.len() - 1 && s.0 == done) {
+                let from = slot as usize * H * HEAD;
+                state.copy_within(from..from + H * HEAD, to * H * HEAD);
+            }
         }
     }
     close_abs("scan state", &gpu.read(&pool.slab), &state, 1e-3);

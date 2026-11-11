@@ -1687,8 +1687,9 @@ pub fn mamba2(
     m.norm(ctx, OP, y)
 }
 
-/// A prompt's Mamba-2 walk, token by token: a block a (request, head) lands
-/// `(C S + D x) * silu(z)` for each row, then the group norm.
+/// A prompt's Mamba-2 walk in 32-row chunks on the matrix core: a block a
+/// (request, head) lands `(C S + D x) * silu(z)` for each row, then the
+/// group norm.
 #[allow(clippy::too_many_arguments)]
 pub fn mamba2_chunked(
     ctx: &Ctx,

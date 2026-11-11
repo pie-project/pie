@@ -2515,8 +2515,54 @@ __global__ __launch_bounds__(256) void ssm_mamba2_step(
     for (int q = 0; q < M2_Q; ++q) st[m2_run(q)] = s[q];
 }
 
-// Prefill, token by token: grid (lanes, H), the head's state in registers
-// across the walk.
+// Prefill in 32-row chunks on the matrix core: grid (lanes, H), a block a
+// (request, head), wavefront w the head's dims [16w, 16w + 16), its state
+// as eight Sᵀ tiles (n by p) in f32 in the D layout, each the B operand of
+// C·Sᵀ as it stands. With G the running sum of the steps' log decays down a
+// chunk, the chunk lands y_i = exp(G_i)·C_i·S + Σ_{j≤i} (C_i·B_j)·exp(G_i −
+// G_j)·dt_j·x_j + D·x_i, gated, and folds S ← exp(G_L)·S + Σ_j exp(G_L −
+// G_j)·dt_j·x_j·B_jᵀ. Every f32 operand enters as a bf16 pair (hi + lo),
+// so the sums keep the token walk's f32 precision. A snapshot row ends a
+// chunk. The next chunk's rows load while this one computes.
+constexpr int M2_CH = 32, M2_LDN = M2_N + 4, M2_LDJ = M2_CH + 4;
+
+// Chunk j of a lane: its first row, its rows, and the snapshot its end lands
+// (−1: none); a snapshot at the lane's last row ends its last chunk.
+__device__ __forceinline__ GdnChunk m2_chunk(const GdnLane& ln, int j, const int* snap_rows) {
+    int a = 0;
+    for (int e = ln.sn.e0; e < ln.sn.e1; ++e) {
+        const int b = snap_rows[e];
+        if (b > ln.T) break;
+        const int n = (b - a + M2_CH - 1) / M2_CH;
+        if (j < n) return {ln.t0 + a + j * M2_CH, min(M2_CH, b - a - j * M2_CH), j == n - 1 ? e : -1};
+        j -= n;
+        a = b;
+    }
+    return {ln.t0 + a + j * M2_CH, min(M2_CH, ln.T - a - j * M2_CH), -1};
+}
+
+__device__ __forceinline__ int m2_chunks(const GdnLane& ln, const int* snap_rows) {
+    int a = 0, n = 0;
+    for (int e = ln.sn.e0; e < ln.sn.e1 && snap_rows[e] <= ln.T; ++e) {
+        n += (snap_rows[e] - a + M2_CH - 1) / M2_CH;
+        a = snap_rows[e];
+    }
+    return n + (ln.T - a + M2_CH - 1) / M2_CH;
+}
+
+// A matrix-core operand's four bf16 values.
+struct M2Quad {
+    bf16 v[4];
+};
+
+__device__ __forceinline__ M2Quad m2_quad(mfma_ab a) { return __builtin_bit_cast(M2Quad, a); }
+
+// v − hi, the low half of an f32 quad whose high half is hi.
+__device__ __forceinline__ mfma_ab m2_lo(mfma_cd v, mfma_ab hi) {
+    const M2Quad h = m2_quad(hi);
+    return pack4(v[0] - to_f32(h.v[0]), v[1] - to_f32(h.v[1]), v[2] - to_f32(h.v[2]), v[3] - to_f32(h.v[3]));
+}
+
 __global__ __launch_bounds__(256) void ssm_mamba2_scan(
     const bf16* __restrict__ xbc, const bf16* __restrict__ dt, const bf16* __restrict__ z,
     const float* __restrict__ a_log, const float* __restrict__ dt_bias, const float* __restrict__ D,
@@ -2524,40 +2570,217 @@ __global__ __launch_bounds__(256) void ssm_mamba2_scan(
     long long slot_stride, const int* __restrict__ commit_len, const int* __restrict__ begin_at, bool write_state,
     const u8* __restrict__ mask, const int* __restrict__ snap, const int* __restrict__ snap_rows,
     const i32* __restrict__ snap_slots, bf16* __restrict__ y, int H, int G, const u32* __restrict__ win) {
+    constexpr int CH = M2_CH, N = M2_N, P = M2_P, LDN = M2_LDN, LDJ = M2_LDJ;
+    static_assert(CH == 32 && P == 64 && N == 128, "four wavefronts of 16 dims, a chunk of two row tiles");
+    __shared__ alignas(16) bf16 sC[CH * LDN];  // C, row-major
+    __shared__ alignas(16) bf16 sB[CH * LDN];  // B, row-major
+    __shared__ alignas(16) bf16 sXT[P * LDJ];  // xᵀ
+    __shared__ alignas(16) float sP[CH * LDJ];  // C_i·B_j·exp(G_i − G_j), j ≤ i
+    __shared__ alignas(16) float sG[CH];
+    __shared__ alignas(16) float sdt[CH];
+
     const int r = blockIdx.x, h = blockIdx.y;
     if (win != nullptr && r >= static_cast<int>(win[2])) return;
-    const int rl = win != nullptr ? r + static_cast<int>(win[3]) : r;
+    const GdnLane ln = gdn_lane(r, indptr, slot_ids, commit_len, begin_at, snap, win);
+    if (ln.T <= 0 || ln.slot < 0) return;
     const long long row0 = win != nullptr ? static_cast<long long>(win[1]) : 0;
-    const Span sp = span_of(indptr, r, rl, commit_len, begin_at);
-    if (sp.n <= 0) return;
-    const int slot = slot_ids[rl];
-    if (slot < 0) return;
-    const long long head = static_cast<long long>(h) * M2_P * M2_N;
-    f32x4* st = reinterpret_cast<f32x4*>(state_base + static_cast<long long>(slot) * slot_stride + head);
-    f32x4 s[M2_Q];
-#pragma unroll
-    for (int q = 0; q < M2_Q; ++q) s[q] = st[m2_run(q)];
-    const int inner = H * M2_P, g = h / (H / G);
-    const long long width = inner + 2 * G * M2_N;
+    const int tid = threadIdx.x, w = tid / kWave, l = lane();
+    const int pl = 16 * w + l % 16, k4 = 4 * (l / 16);
+    const int inner = H * P, g = h / (H / G);
+    const long long width = inner + 2 * G * N;
     const float neg_a = -__expf(a_log[h]), bias = dt_bias[h], skip = D[h];
-    const bool fold = folds(write_state, mask, rl);
-    Snaps sn = snaps_of(snap, rl);
-    for (int t = 0; t < sp.n; ++t) {
-        const long long row = sp.t0 + t + row0;
-        const float step = m2_dt(to_f32(dt[row * H + h]), bias);
-        m2_token(s, xbc + row * width, z + row * inner, y + row * inner, step, __expf(neg_a * step), skip, h, inner,
-                 g, G);
-        if (sn.e0 < sn.e1 && snap_rows[sn.e0] == t + 1) {
-            f32x4* at = reinterpret_cast<f32x4*>(state_base + static_cast<long long>(snap_slots[sn.e0]) * slot_stride + head);
-            if (fold)
+    const bool fold = folds(write_state, mask, ln.rl);
+    const long long head = static_cast<long long>(h) * P * N;
+    float* st = state_base + static_cast<long long>(ln.slot) * slot_stride + head;
+
+    // Sᵀ tile nb: the lane's S[pl][16nb + k4 + t].
+    mfma_cd s[N / 16];
 #pragma unroll
-                for (int q = 0; q < M2_Q; ++q) at[m2_run(q)] = s[q];
-            ++sn.e0;
+    for (int nb = 0; nb < N / 16; ++nb) s[nb] = *reinterpret_cast<const mfma_cd*>(st + pl * N + 16 * nb + k4);
+
+    // The chunk's rows in flight: B and C two 16-byte pieces a thread, x one,
+    // the raw dt, and z at the lane's output cells. Rows past the chunk read
+    // its last row again (no branch to wait at): their dt step is zero, so
+    // they add nothing, and their outputs are not stored.
+    b128 pb[2], pc[2], px;
+    bf16 pdt, pz[2][4], zc[2][4];
+    auto fetch = [&](const GdnChunk& c) {
+        const long long last = c.ta + c.L - 1 + row0;
+        auto row = [&](int i) {
+            const long long at = c.ta + i + row0;
+            return at < last ? at : last;
+        };
+#pragma unroll
+        for (int u = 0; u < 2; ++u) {
+            const int e = tid + 256 * u, i = e / (N / 8), col = (e % (N / 8)) * 8;
+            const bf16* at = xbc + row(i) * width + inner;
+            pb[u] = *reinterpret_cast<const b128*>(at + g * N + col);
+            pc[u] = *reinterpret_cast<const b128*>(at + (G + g) * N + col);
         }
+        const int i = tid / (P / 8), col = (tid % (P / 8)) * 8;
+        px = *reinterpret_cast<const b128*>(xbc + row(i) * width + h * P + col);
+        pdt = dt[row(tid) * H + h];
+#pragma unroll
+        for (int bi = 0; bi < 2; ++bi)
+#pragma unroll
+            for (int t = 0; t < 4; ++t) pz[bi][t] = z[row(16 * bi + k4 + t) * inner + h * P + pl];
+    };
+    // Into LDS (8-byte stores: the padded rows are 8-byte aligned), and on
+    // wavefront 0 the steps and their decays' running sum.
+    auto stage = [&](int L) {
+#pragma unroll
+        for (int u = 0; u < 2; ++u) {
+            const int e = tid + 256 * u, i = e / (N / 8), col = (e % (N / 8)) * 8;
+            u64* b8 = reinterpret_cast<u64*>(sB + i * LDN + col);
+            u64* c8 = reinterpret_cast<u64*>(sC + i * LDN + col);
+            const u64* pb8 = reinterpret_cast<const u64*>(&pb[u]);
+            const u64* pc8 = reinterpret_cast<const u64*>(&pc[u]);
+            b8[0] = pb8[0];
+            b8[1] = pb8[1];
+            c8[0] = pc8[0];
+            c8[1] = pc8[1];
+        }
+        {
+            const int i = tid / (P / 8), col = (tid % (P / 8)) * 8;
+            const bf16* xv = reinterpret_cast<const bf16*>(&px);
+#pragma unroll
+            for (int e = 0; e < 8; ++e) sXT[(col + e) * LDJ + i] = xv[e];
+        }
+        if (w == 0) {
+            const float step = l < L ? m2_dt(to_f32(pdt), bias) : 0.f;
+            float a = neg_a * step;
+#pragma unroll
+            for (int off = 1; off < CH; off <<= 1) {
+                const float v = __shfl_up(a, off, kWave);
+                if (l >= off) a += v;
+            }
+            if (l < CH) {
+                sG[l] = a;
+                sdt[l] = step;
+            }
+        }
+    };
+
+    const int chunks = m2_chunks(ln, snap_rows);
+    GdnChunk next = m2_chunk(ln, 0, snap_rows);
+    fetch(next);
+    for (int jc = 0; jc < chunks; ++jc) {
+        const GdnChunk ck = next;
+        const int L = ck.L;
+        stage(L);
+#pragma unroll
+        for (int bi = 0; bi < 2; ++bi)
+#pragma unroll
+            for (int t = 0; t < 4; ++t) zc[bi][t] = pz[bi][t];
+        if (jc + 1 < chunks) {
+            next = m2_chunk(ln, jc + 1, snap_rows);
+            fetch(next);
+        }
+        lds_barrier();
+
+        // exp(G_i)·C_i·S for the chunk's live row tiles: S as hi + lo.
+        const int tiles = (L + 15) / 16;
+        mfma_cd acc[2] = {mfma_zero(), mfma_zero()};
+#pragma unroll
+        for (int nb = 0; nb < N / 16; ++nb) {
+            const mfma_ab hi = pack4(s[nb][0], s[nb][1], s[nb][2], s[nb][3]);
+            const mfma_ab lo = m2_lo(s[nb], hi);
+#pragma unroll
+            for (int bi = 0; bi < 2; ++bi) {
+                if (bi >= tiles) continue;
+                const mfma_ab a = load4(sC + (16 * bi + l % 16) * LDN + 16 * nb + k4);
+                acc[bi] = mfma16(a, lo, mfma16(a, hi, acc[bi]));
+            }
+        }
+#pragma unroll
+        for (int bi = 0; bi < 2; ++bi) {
+            const f32x4 gi = *reinterpret_cast<const f32x4*>(sG + 16 * bi + k4);
+#pragma unroll
+            for (int t = 0; t < 4; ++t) acc[bi][t] *= __expf(gi[t]);
+        }
+
+        // The causal scores, a wavefront a tile: (0, 0), (1, 0), (1, 1).
+        if (w < 3) {
+            const int bi = w == 0 ? 0 : 1, bj = w == 2 ? 1 : 0;
+            if (bi < tiles) {
+                mfma_cd sc = mfma_zero();
+#pragma unroll
+                for (int kb = 0; kb < N / 16; ++kb)
+                    sc = mfma16(load4(sC + (16 * bi + l % 16) * LDN + 16 * kb + k4),
+                                load4(sB + (16 * bj + l % 16) * LDN + 16 * kb + k4), sc);
+                const int j = 16 * bj + l % 16;
+#pragma unroll
+                for (int t = 0; t < 4; ++t) {
+                    const int i = 16 * bi + k4 + t;
+                    sP[i * LDJ + j] = j <= i && i < L ? sc[t] * __expf(sG[i] - sG[j]) : 0.f;
+                }
+            }
+        }
+        lds_barrier();
+
+        // + Σ_{j≤i} P_ij·dt_j·x_j, then + D·x_i, gated, for the live rows.
+#pragma unroll
+        for (int bi = 0; bi < 2; ++bi) {
+            if (bi >= tiles) continue;
+#pragma unroll
+            for (int bj = 0; bj <= bi; ++bj) {
+                const mfma_cd pv = *reinterpret_cast<const mfma_cd*>(sP + (16 * bi + l % 16) * LDJ + 16 * bj + k4);
+                const mfma_ab ph = pack4(pv[0], pv[1], pv[2], pv[3]);
+                const mfma_ab pl_ = m2_lo(pv, ph);
+                const mfma_ab xa = load4(sXT + pl * LDJ + 16 * bj + k4);
+                const f32x4 d4 = *reinterpret_cast<const f32x4*>(sdt + 16 * bj + k4);
+                const M2Quad xq = m2_quad(xa);
+                const mfma_cd u = {d4[0] * to_f32(xq.v[0]), d4[1] * to_f32(xq.v[1]), d4[2] * to_f32(xq.v[2]),
+                                   d4[3] * to_f32(xq.v[3])};
+                const mfma_ab uh = pack4(u[0], u[1], u[2], u[3]);
+                const mfma_ab ul = m2_lo(u, uh);
+                acc[bi] = mfma16(pl_, uh, mfma16(ph, ul, mfma16(ph, uh, acc[bi])));
+            }
+            const M2Quad xq = m2_quad(load4(sXT + pl * LDJ + 16 * bi + k4));
+#pragma unroll
+            for (int t = 0; t < 4; ++t) {
+                const int i = 16 * bi + k4 + t;
+                if (i >= L) continue;
+                const long long o = (ck.ta + i + row0) * inner + h * P + pl;
+                y[o] = from_f32<bf16>((acc[bi][t] + skip * to_f32(xq.v[t])) * silu(to_f32(zc[bi][t])));
+            }
+        }
+
+        // The fold: S ← exp(G_L)·S + Bᵀ·(exp(G_L − G)·dt·x), Bᵀ's A operand
+        // read down sB's columns.
+        const float gl = sG[CH - 1], decay = __expf(gl);
+#pragma unroll
+        for (int nb = 0; nb < N / 16; ++nb) s[nb] = s[nb] * decay;
+        const u16* sBu = reinterpret_cast<const u16*>(sB);
+#pragma unroll
+        for (int jb = 0; jb < 2; ++jb) {
+            if (jb >= tiles) continue;
+            const f32x4 d4 = *reinterpret_cast<const f32x4*>(sdt + 16 * jb + k4);
+            const f32x4 g4 = *reinterpret_cast<const f32x4*>(sG + 16 * jb + k4);
+            const M2Quad xq = m2_quad(load4(sXT + pl * LDJ + 16 * jb + k4));
+            mfma_cd u;
+#pragma unroll
+            for (int t = 0; t < 4; ++t) u[t] = __expf(gl - g4[t]) * d4[t] * to_f32(xq.v[t]);
+            const mfma_ab uh = pack4(u[0], u[1], u[2], u[3]);
+            const mfma_ab ul = m2_lo(u, uh);
+#pragma unroll
+            for (int nb = 0; nb < N / 16; ++nb) {
+                const u16* col = sBu + (16 * jb + k4) * LDN + 16 * nb + l % 16;
+                const mfma_ab a = {static_cast<short>(col[0]), static_cast<short>(col[LDN]),
+                                   static_cast<short>(col[2 * LDN]), static_cast<short>(col[3 * LDN])};
+                s[nb] = mfma16(a, ul, mfma16(a, uh, s[nb]));
+            }
+        }
+        if (ck.snap >= 0 && fold) {
+            float* at = state_base + static_cast<long long>(snap_slots[ck.snap]) * slot_stride + head;
+#pragma unroll
+            for (int nb = 0; nb < N / 16; ++nb) *reinterpret_cast<mfma_cd*>(at + pl * N + 16 * nb + k4) = s[nb];
+        }
+        lds_barrier();
     }
     if (!fold) return;
 #pragma unroll
-    for (int q = 0; q < M2_Q; ++q) st[m2_run(q)] = s[q];
+    for (int nb = 0; nb < N / 16; ++nb) *reinterpret_cast<mfma_cd*>(st + pl * N + 16 * nb + k4) = s[nb];
 }
 
 }  // namespace pie::attn
