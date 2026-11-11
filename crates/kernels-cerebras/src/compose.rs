@@ -18,7 +18,7 @@ use crate::block::segments::{Onorm, Scores};
 use crate::block::token_loop::TokenLoop;
 use crate::block::units::{UnitCopies, Units};
 use crate::floor::{UnitGrid, UnitLayout};
-use crate::plan::{LayerKind, Plan, Shape};
+use crate::plan::{Act, LayerKind, Plan, Shape};
 use crate::weights::{From, Slice, Transform, from};
 
 type R<T> = Result<T, String>;
@@ -39,6 +39,9 @@ pub struct Needs {
     pub side_in: bool,
     /// A routed bank of experts.
     pub experts: bool,
+    /// A norm on a mixer's or the MLP's output before its residual add (sandwich norms): the
+    /// next input norm waits on its scalar.
+    pub deferred_norm: bool,
 }
 
 impl Needs {
@@ -69,6 +72,14 @@ impl Needs {
                 Phase::Matvec {
                     experts: Some(_), ..
                 } => n.experts = true,
+                Phase::Root { ops, .. } => {
+                    let at = |op: &str| ops.iter().position(|o| o.op == op);
+                    if let (Some(norm), Some(add)) =
+                        (at("elemwise.rmsnorm"), at("elemwise.residual_add"))
+                    {
+                        n.deferred_norm |= norm < add;
+                    }
+                }
                 _ => {}
             }
         }
@@ -91,6 +102,7 @@ impl Needs {
             shared_cache: any(|k| matches!(k, LayerKind::SharedKv { .. })),
             side_in: s.ple.is_some(),
             experts: s.moe.is_some(),
+            deferred_norm: s.norm.sandwich,
         }
     }
 
@@ -104,6 +116,52 @@ impl Needs {
         ]
         .into_iter()
         .find_map(|(n, what)| n.then_some(what))
+    }
+}
+
+/// The role kernels' layer phases (weight, CX and CY's comptime `NRM`, `MIXK`, `ACT`, `PLE`, `KVS`),
+/// from what the layers need and the MLP's activation: one image a role over every layer program.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Schedule {
+    /// The input phases' norm: 0 direct, 1 deferred (sandwich norms), 2 scaled (attention / MoE
+    /// halves).
+    pub nrm: u32,
+    /// The mixer kind: 0 own-cache attention / GDN, 1 sliding / global and shared caches, 2 an
+    /// attention half's (its MoE half's is [`Schedule::moe`]).
+    pub mixk: u32,
+    /// The MLP's activation: 0 SiLU, 1 GELU-tanh (a MoE half's is its own).
+    pub act: u32,
+    /// 1: a per-layer embedding phase after the MLP.
+    pub ple: u32,
+    /// 1: the shared caches' KVS line.
+    pub kvs: u32,
+}
+
+impl Schedule {
+    /// The phases of layers that need `needs`, their MLP's activation `act`.
+    #[must_use]
+    pub fn of(needs: &Needs, act: Act) -> Schedule {
+        Schedule {
+            nrm: if needs.experts {
+                2
+            } else {
+                u32::from(needs.deferred_norm)
+            },
+            mixk: if needs.experts {
+                2
+            } else {
+                u32::from(needs.sliding || needs.shared_cache)
+            },
+            act: u32::from(act == Act::GeluTanh),
+            ple: u32::from(needs.side_in),
+            kvs: u32::from(needs.shared_cache),
+        }
+    }
+
+    /// A MoE half's mixer kind.
+    #[must_use]
+    pub fn moe(&self) -> u32 {
+        self.mixk + 1
     }
 }
 
@@ -271,6 +329,33 @@ mod tests {
             assert_eq!(
                 Needs::of(&program(&t)),
                 Needs::of_shape(&shape(&t).unwrap()),
+                "{name}"
+            );
+        }
+    }
+
+    /// The role kernels' phases read off each shipping model's layer program: what its family's
+    /// kernels were built with.
+    #[test]
+    fn a_layer_program_schedules_its_family_kernels() {
+        for (name, nrm, mixk, act, ple, kvs) in [
+            ("qwen35-d9b-bf16-kv-bf16", 0, 0, 0, 0, 0),
+            ("llama31-8b-bf16-kv-bf16", 0, 0, 0, 0, 0),
+            ("gemma4-e4b-bf16-kv-bf16", 1, 1, 1, 1, 1),
+            ("gemma4-12b-bf16-kv-bf16", 1, 1, 1, 0, 0),
+            ("gptoss-20b-bf16-mxfp4-kv-bf16", 2, 2, 0, 0, 0),
+        ] {
+            let t = trace(name);
+            let sc = Schedule::of(&Needs::of(&program(&t)), shape(&t).unwrap().mlp.act);
+            assert_eq!(
+                sc,
+                Schedule {
+                    nrm,
+                    mixk,
+                    act,
+                    ple,
+                    kvs
+                },
                 "{name}"
             );
         }

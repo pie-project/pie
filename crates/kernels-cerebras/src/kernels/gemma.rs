@@ -264,6 +264,7 @@ fn store(pe: &Pe) -> R<Vec<u32>> {
 /// `SH` / `Ic` (the sharers' are [`shared_kv::SharedKv`]'s overrides), the store PEs' `NTW` the
 /// largest column's (the route-only PEs': [`ple::Ple`]'s).
 pub fn kernels(prog: &Program) -> R<Kernels> {
+    let sc = prog.schedule;
     let plan = &prog.plan;
     let (s, p) = (&plan.shape, &plan.partition);
     let k = p.layers_per_unit;
@@ -314,9 +315,9 @@ pub fn kernels(prog: &Program) -> R<Kernels> {
                 FIFOW: 32,
                 ATTL: 2,
                 TSTAMP: 0,
-                NRM: 1,
-                MIXK: 1,
-                PLE: 1,
+                NRM: sc.nrm,
+                MIXK: sc.mixk,
+                PLE: sc.ple,
                 NR: WEIGHT_GEMMA.route_slots as u32,
                 DONEG: 1,
                 XHI: 1,
@@ -334,8 +335,8 @@ pub fn kernels(prog: &Program) -> R<Kernels> {
                 DIAG: 0,
                 FIFOW: 32,
                 XKEEP: 0,
-                NRM: 1,
-                PLE: 1,
+                NRM: sc.nrm,
+                PLE: sc.ple,
             },
         )?,
     );
@@ -359,11 +360,11 @@ pub fn kernels(prog: &Program) -> R<Kernels> {
                 HDS: hds,
                 HDG: hdg,
                 PLOG: 0,
-                NRM: 1,
-                MIXK: 1,
-                ACT: 1,
-                PLE: 1,
-                KVS: 1,
+                NRM: sc.nrm,
+                MIXK: sc.mixk,
+                ACT: sc.act,
+                PLE: sc.ple,
+                KVS: sc.kvs,
             },
         )?,
     );

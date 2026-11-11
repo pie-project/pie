@@ -111,6 +111,8 @@ The hardware lessons of the bring-up, made checks:
 | `row_runs::RowRuns { grid, copies }` | units as `Units` | `unit_chains`; scores segments on the attention runs' rows only | `HC`, `ATT` (`ATT_ROW`, `PLAIN_ROW`) overrides: a weight / CX PE's run's dims, a weight PE's run's role | `RunCopies` per unit and run block (`w{u}a` / `w{u}w`, `gama` / `gamw`, the CY tables) |
 | `head_groups::HeadGroups { cols, rows, copies }` | the head east of the units (token loop on) | `head_rows`; per group the x chain north on the last unit (`HEAD_GROUP`), its root east, the column multicast; the embedding back up, down, west into unit 0 and down the chain; the max-reduce | `HEAD_GROUP`; slots `CHAIN_IN`, `CHAIN_OUT`, `CAST`; notes `FORWARD`, `head::ROLE`, `token_loop::TURN` | `HeadCopies` |
 
+The role kernels' layer phases come from what the layers need (`compose::Schedule`: `NRM` from a deferred norm or the expert halves, `MIXK` from the mixers, `ACT` from the MLP's activation, `PLE` from a side input, `KVS` from a shared cache), on `Program::schedule`; every family's kernels read them there. Row roles (`AROW`), head groups (`HG`) and k = v layers (`KEV`) are still their family's.
+
 Compositions: the composer (`compose.rs`) picks the blocks from what the layers need (`compose::Needs`, read off the layer program or a shape): attention over a layer's own cache takes `Scores`, GDN takes `Gdn` + `Onorm`, every program the head and the token loop. It places the unit snake's programs today. A need it has no block for yet (a side input, a cache read across layers, a sliding window, routed experts) leaves the program to its family's `blocks` (`family/*.rs`):
 
 | Family | Blocks | Kernels |

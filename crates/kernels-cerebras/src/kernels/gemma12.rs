@@ -296,6 +296,7 @@ impl Dims {
 /// `Hc` and `ATT` are the plain rows' here; [`crate::block::row_runs`] sets each
 /// PE's).
 pub fn kernels(prog: &Program) -> R<Kernels> {
+    let sc = prog.schedule;
     let plan = &prog.plan;
     let p = &plan.partition;
     let d = Dims::of(plan)?;
@@ -327,8 +328,8 @@ pub fn kernels(prog: &Program) -> R<Kernels> {
                 DIAG: 0,
                 FIFOW: 32,
                 TSTAMP: 0,
-                NRM: 1,
-                MIXK: 1,
+                NRM: sc.nrm,
+                MIXK: sc.mixk,
                 KEV: 1,
                 NR: WEIGHT_GEMMA12.route_slots as u32,
                 DONEG: 1,
@@ -345,7 +346,7 @@ pub fn kernels(prog: &Program) -> R<Kernels> {
                 DIAG: 0,
                 FIFOW: 32,
                 XKEEP: 0,
-                NRM: 1,
+                NRM: sc.nrm,
                 HG: 1,
             },
         )?,
@@ -368,9 +369,9 @@ pub fn kernels(prog: &Program) -> R<Kernels> {
                 TSTAMP: 0,
                 HDS: d.hds,
                 HDG: d.hdg,
-                NRM: 1,
-                MIXK: 1,
-                ACT: 1,
+                NRM: sc.nrm,
+                MIXK: sc.mixk,
+                ACT: sc.act,
                 KEV: 1,
                 GELUT: 1,
             },

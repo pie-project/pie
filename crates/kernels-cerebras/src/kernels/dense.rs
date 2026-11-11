@@ -50,13 +50,13 @@ params! {
     pub struct WeightDense {
         K: u32, Hc: u32, QO: u32, Ic: u32, MV: u32, KM: u32, NQA: u32, NQG: u32, GDN: u32,
         ATT: u32, DV: u32, DK: u32, Qh: u32, Dc: u32, NE: u32, PYW: u32, HD: u32, DIAG: u32,
-        FIFOW: u32, GDEC: u32, ATTL: u32, TSTAMP: u32, QKN: u32,
+        FIFOW: u32, GDEC: u32, ATTL: u32, TSTAMP: u32, QKN: u32, NRM: u32, MIXK: u32,
     }
 }
 
 params! {
     /// `cx.csl` (NRM 0): layers a unit, x's dims a row, the levers' defaults.
-    pub struct CtlCx { K: u32, Hc: u32, HOSTX: u32, XG16: u32, DIAG: u32, FIFOW: u32, XKEEP: u32 }
+    pub struct CtlCx { K: u32, Hc: u32, HOSTX: u32, XG16: u32, DIAG: u32, FIFOW: u32, XKEEP: u32, NRM: u32 }
 }
 
 params! {
@@ -67,7 +67,7 @@ params! {
         K: u32, KM: u32, NQA: u32, NQG: u32, Qh: u32, Dc: u32, DK: u32, DV: u32, Ic: u32,
         HR: u32, CONV: u32, NROT: u32, HK: u32, HV: u32, DIAG: u32, FIFOW: u32, SILU16: u32,
         CONVQK: u32, ATTV: u32, GDEC: u32, ATTL: u32, TSTAMP: u32, GATE: u32, SLW: u32,
-        RLV: u32, RBITS: u32, EPS: Lit,
+        RLV: u32, RBITS: u32, EPS: Lit, NRM: u32, MIXK: u32, ACT: u32,
     }
 }
 
@@ -140,6 +140,7 @@ fn cy(pe: &Pe) -> R<Vec<u32>> {
 
 /// Every kind's kernel of a Qwen program, its params from the plan.
 pub fn kernels(prog: &Program) -> R<Kernels> {
+    let sc = prog.schedule;
     let plan = &prog.plan;
     let (s, p) = (&plan.shape, &plan.partition);
     let k = p.layers_per_unit;
@@ -192,6 +193,8 @@ pub fn kernels(prog: &Program) -> R<Kernels> {
                 ATTL: 2,
                 TSTAMP: 0,
                 QKN: u32::from(s.attn.qk_norm),
+                NRM: sc.nrm,
+                MIXK: sc.mixk,
             },
         )?,
     );
@@ -207,6 +210,7 @@ pub fn kernels(prog: &Program) -> R<Kernels> {
                 DIAG: 0,
                 FIFOW: 32,
                 XKEEP: 0,
+                NRM: sc.nrm,
             },
         )?,
     );
@@ -242,6 +246,9 @@ pub fn kernels(prog: &Program) -> R<Kernels> {
                 RLV: plan.contract.rope_levels,
                 RBITS: plan.contract.rope_bits,
                 EPS: Lit::f32(s.norm.eps),
+                NRM: sc.nrm,
+                MIXK: sc.mixk,
+                ACT: sc.act,
             },
         )?,
     );

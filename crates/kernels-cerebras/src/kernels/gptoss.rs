@@ -213,6 +213,7 @@ impl Dims {
 /// defaults (`DIAG` / `TSTAMP` / `XKEEP` / `XDLY` / `PFTZ` / `WFORCE` 0, `GLUV` 1, `CYV` 2,
 /// `FIFOW` 32).
 pub fn kernels(prog: &Program) -> R<Kernels> {
+    let sc = prog.schedule;
     let plan = &prog.plan;
     let (s, p) = (&plan.shape, &plan.partition);
     let d = Dims::of(plan)?;
@@ -234,7 +235,7 @@ pub fn kernels(prog: &Program) -> R<Kernels> {
         DIAG: 0,
         TSTAMP: 0,
         FIFOW: 32,
-        MIXK: 2,
+        MIXK: sc.mixk,
         RCW: 26,
     };
     out.insert(WA, KernelBuild::of(&WEIGHT_ATT, att)?);
@@ -247,7 +248,7 @@ pub fn kernels(prog: &Program) -> R<Kernels> {
         DIAG: 0,
         TSTAMP: 0,
         FIFOW: 32,
-        MIXK: 3,
+        MIXK: sc.moe(),
         RCW: 26,
     };
     out.insert(WM, KernelBuild::of(&WEIGHT_MOE, moe)?);
@@ -259,7 +260,7 @@ pub fn kernels(prog: &Program) -> R<Kernels> {
         DIAG: 0,
         XKEEP: 0,
         XDLY: 0,
-        NRM: 2,
+        NRM: sc.nrm,
     };
     out.insert(Kind::CX, KernelBuild::of(&CTL_CX, cx)?);
     let cya = CyAtt {
@@ -275,8 +276,8 @@ pub fn kernels(prog: &Program) -> R<Kernels> {
         DIAG: 0,
         TSTAMP: 0,
         FIFOW: 32,
-        NRM: 2,
-        MIXK: 2,
+        NRM: sc.nrm,
+        MIXK: sc.mixk,
         EPS: Lit::f32(s.norm.eps),
     };
     out.insert(CYA, KernelBuild::of(&CY_ATT, cya)?);
@@ -290,8 +291,8 @@ pub fn kernels(prog: &Program) -> R<Kernels> {
         DIAG: 0,
         TSTAMP: 0,
         FIFOW: 32,
-        NRM: 2,
-        MIXK: 3,
+        NRM: sc.nrm,
+        MIXK: sc.moe(),
         EPS: Lit::f32(s.norm.eps),
     };
     out.insert(CYM, KernelBuild::of(&CY_MOE, cym)?);

@@ -4,7 +4,7 @@
 
 use super::abi::{Kernels, Overrides};
 use super::block::Block;
-use super::compose::{self, Needs};
+use super::compose::{self, Needs, Schedule};
 use super::fabric::{Fabric, Palette};
 use super::family::{self, Family};
 use super::floor::{Floor, FloorBuilder};
@@ -23,6 +23,8 @@ pub struct Program {
     pub kernels: Kernels,
     pub overrides: Overrides,
     pub family: Box<dyn Family>,
+    /// The role kernels' layer phases, from what the plan's layers need.
+    pub schedule: Schedule,
 }
 
 impl Program {
@@ -77,6 +79,7 @@ impl Program {
         let palette = Palette::of(blocks.iter().flat_map(|b| b.colours()));
         let fabric = Fabric::lay(&floor, &wiring, &palette)?;
         fabric.validate(&floor)?;
+        let schedule = Schedule::of(&Needs::of_shape(&plan.shape), plan.shape.mlp.act);
         let mut prog = Program {
             plan,
             blocks,
@@ -87,6 +90,7 @@ impl Program {
             kernels: Kernels::new(),
             overrides: Overrides::default(),
             family,
+            schedule,
         };
         prog.kernels = prog.family.kernels(&prog)?;
         prog.fabric.check_route_slots(&prog.floor, &|k| {
