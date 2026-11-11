@@ -3741,12 +3741,6 @@ impl Pools {
         })
     }
 
-    /// Bytes one host kv slot holds across the paged planes.
-    #[must_use]
-    pub fn host_kv_slot_bytes(&self) -> u64 {
-        self.paged_planes().iter().map(|&(_, bytes)| bytes).sum()
-    }
-
     /// The cache row of each paged plane, in a host slot's order.
     fn paged_plane_rows(&self) -> Vec<usize> {
         let mut rows = Vec::new();

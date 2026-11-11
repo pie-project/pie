@@ -5,7 +5,7 @@ use std::path::Path;
 use checkpoint::contract::ModelContract;
 use engine::Engine;
 use engine::adapter::AdapterRegistration;
-use engine::caps::{Capabilities, DeviceFacts, FireLimits, KvCopyDomains};
+use engine::caps::{Capabilities, DeviceFacts, FireLimits};
 use engine::channel::{ChannelId, ChannelRegistration, RegisteredChannel};
 use engine::error::{Error, Result as EngineResult};
 use engine::fire::{
@@ -15,7 +15,7 @@ use engine::load::{Budgets as LoadBudgets, Checkpoint, LoadFacts, LoadRequest, L
 use engine::program::{
     BindExtents, BoundInstance, InstanceBinding, InstanceId, ProgramId, ProgramRegistration,
 };
-use engine::transfer::{KvCopy, MemoryDomain, StateCopy, StateDirection};
+use engine::transfer::{KvCopy, MemoryDomain};
 use eta_ir::registry::{GeometryClass, Port, PortMask};
 use poem_compiler::{Budget, DeviceProfile, PATCH_LATTICE_FLOOR, PatchLadder};
 use poem_ir::Trace;
@@ -524,7 +524,7 @@ impl Engine for Metal {
                 codegen_backend: Some("metal".to_string()),
             },
             pools,
-            chunks: Some(chunks),
+            chunks,
             limits: FireLimits {
                 max_lanes: budgets.max_lanes,
                 max_tokens: budgets.max_tokens,
@@ -547,12 +547,6 @@ impl Engine for Metal {
                 .with(Port::AttnMask)
                 .with(Port::Fold),
             geometry: GeometryClass::DeviceGeometry,
-            kv_copy: KvCopyDomains {
-                device_to_device: true,
-                device_to_host: false,
-                host_to_device: false,
-                host_to_host: false,
-            },
             kv_handle: None,
             media_encode: false,
             device_channel_commit: false,
@@ -867,37 +861,6 @@ impl Engine for Metal {
         let page_size = self.loaded_mut()?.paging().page_size;
         let moves = copy.runs(page_size)?;
         self.loaded_mut()?.copy_kv(&moves).map_err(fault)
-    }
-
-    fn copy_state(&mut self, copy: &StateCopy) -> EngineResult<()> {
-        for (at, move_) in copy.moves.iter().enumerate() {
-            if move_.src_token_offset != 0 || move_.dst_token_offset != 0 {
-                return Err(Error::Invalid(format!(
-                    "state move {at} names a token offset, and a recurrent bank is a folded \
-                     summary of a prefix rather than an array of per-token entries — this \
-                     engine moves whole slots"
-                )));
-            }
-        }
-        let ends = |moves: &[engine::transfer::StateMove]| -> (Vec<u32>, Vec<u32>) {
-            moves.iter().map(|m| (m.src_slot_id, m.dst_slot_id)).unzip()
-        };
-        let ((src, dst), (page_src, page_dst)) = (ends(&copy.moves), ends(&copy.pages));
-        let shell = self.loaded_mut()?;
-        let copied: crate::error::Result<()> = match copy.direction {
-            StateDirection::DeviceToDevice => shell
-                .copy_state(&src.into_iter().zip(dst).collect::<Vec<_>>())
-                .and_then(|()| {
-                    shell.copy_pages(&page_src.into_iter().zip(page_dst).collect::<Vec<_>>())
-                }),
-            StateDirection::DeviceToHost => shell
-                .park_state(true, &src, &dst)
-                .and_then(|()| shell.park_pages(true, &page_src, &page_dst)),
-            StateDirection::HostToDevice => shell
-                .park_state(false, &dst, &src)
-                .and_then(|()| shell.park_pages(false, &page_dst, &page_src)),
-        };
-        copied.map_err(fault)
     }
 }
 

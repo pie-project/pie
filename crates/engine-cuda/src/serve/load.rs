@@ -18,7 +18,7 @@ use crate::store::kv::{self, Paging};
 use crate::store::rs::Buffers;
 use crate::weights::Weights;
 
-use super::{Boot, FireCost, Golden, Graphs, Released, Shell};
+use super::{Boot, Golden, Graphs, Released, Shell};
 
 /// The least `max_forward_tokens` is served at when the card is short: one
 /// prefill chunk a frame, which serves, and under it the halving stops.
@@ -1194,7 +1194,6 @@ impl Shell {
             exports,
             graphs: engine.graphs,
             copies: engine.copies,
-            one_frame_when_short: engine.one_frame_when_short,
             seated_first: engine.seated_first,
             seat_to_end: engine.seat_to_end,
             seat_spread: engine.seat_spread,
@@ -1208,7 +1207,6 @@ impl Shell {
             armed_body: None,
             segments: std::collections::HashMap::new(),
             windows_memo: Vec::new(),
-            last: FireCost::default(),
             cache: {
                 let mut cache = GraphCache::new();
                 cache.watch(airborne.clone());

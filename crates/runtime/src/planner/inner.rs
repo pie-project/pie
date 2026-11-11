@@ -333,11 +333,7 @@ impl Inner {
             }
             let kv = accum.donate(demand.kv_pages);
             debug_assert!(outcome.is_none(), "an unmet waiter carries no outcome");
-            *outcome = Some(Ok(AllocationGrant::new(
-                demand,
-                kv,
-                RsSlotReservation::empty(),
-            )));
+            *outcome = Some(Ok(AllocationGrant::new(kv, RsSlotReservation::empty())));
             wake.push((key, demand.kv_pages, notify.clone()));
         }
         wake

@@ -92,7 +92,7 @@ fn parked(name: &str, park: bool, disk: Option<&std::path::Path>) -> Vec<Vec<u32
         a.held += 1;
     }
     if park {
-        let facts = model.loaded.caps.chunks.clone().expect("chunk facts");
+        let facts = model.loaded.caps.chunks.clone();
         assert!(facts.host_chunks > 0, "{name}: a host tier");
         let kv = facts.shapes[0].id;
         let copy = |model: &mut Model, shape, src, dst, slots: Vec<(u32, u32)>| {

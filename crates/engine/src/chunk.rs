@@ -482,57 +482,6 @@ impl ChunkFacts {
         }
     }
 
-    /// The pinned shapes' counts read back as today's pools: what
-    /// [`ChunkFacts::degenerate`] was built from.
-    #[must_use]
-    pub fn degenerate_counts(&self) -> DegenerateCounts {
-        let mut counts = DegenerateCounts::default();
-        for shape in &self.shapes {
-            let Some(pinned) = shape.pinned else { continue };
-            let slots = |run: ChunkRun| run.chunks.saturating_mul(shape.slots_per_chunk);
-            let (device, host) = (slots(pinned.device), slots(pinned.host));
-            match (shape.id, shape.kind) {
-                (
-                    DEGENERATE_KV,
-                    SlotKind::List {
-                        tokens,
-                        window: None,
-                        ..
-                    },
-                ) => {
-                    counts.kv_page_size = tokens;
-                    counts.kv_pages = device;
-                    counts.host_kv_pages = host;
-                    counts.disk_kv_pages = slots(pinned.disk);
-                }
-                (
-                    DEGENERATE_WINDOW,
-                    SlotKind::List {
-                        tokens,
-                        window: Some(window),
-                        ..
-                    },
-                ) => {
-                    counts.kv_page_size = tokens;
-                    counts.window_tokens = window;
-                    counts.window_pages = device.saturating_add(pinned.ids_from);
-                    counts.host_window_pages = host;
-                }
-                (DEGENERATE_STATE, SlotKind::Fixed { .. }) => {
-                    counts.state_slots = device;
-                    counts.state_slot_bytes = shape.slot_bytes;
-                    counts.host_state_slots = host;
-                }
-                (DEGENERATE_BUFFER, SlotKind::Fixed { .. }) => {
-                    counts.buffer_pages = device;
-                    counts.host_buffer_pages = host;
-                }
-                _ => {}
-            }
-        }
-        counts
-    }
-
     /// Checks the facts hang together: chunk 0 null, reserved and pinned
     /// runs inside the pool and apart, shapes distinct and fitting a chunk,
     /// every slot ref a `u32`, rungs ascending, segments that cover the
@@ -705,51 +654,6 @@ pub struct DegenerateBytes {
     pub kv_page: u64,
     pub window_page: u64,
     pub buffer_page: u64,
-}
-
-/// Today's pool counts, as [`ChunkFacts::degenerate_counts`] reads them back.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub struct DegenerateCounts {
-    pub kv_pages: u32,
-    pub kv_page_size: u32,
-    pub window_pages: u32,
-    pub window_tokens: u32,
-    pub state_slots: u32,
-    pub state_slot_bytes: u64,
-    pub buffer_pages: u32,
-    pub host_kv_pages: u32,
-    pub host_window_pages: u32,
-    pub host_state_slots: u32,
-    pub host_buffer_pages: u32,
-    pub disk_kv_pages: u32,
-}
-
-impl DegenerateCounts {
-    /// The counts `pools` states, for comparing with a read-back. A page
-    /// size or window that no pool carries is not stated.
-    #[must_use]
-    pub fn of(pools: &PoolFacts) -> DegenerateCounts {
-        let kv = pools.kv_pages > 0 || pools.host_kv_pages > 0;
-        let window = pools.window_pages > 1 || pools.host_window_pages > 0;
-        DegenerateCounts {
-            kv_pages: pools.kv_pages,
-            kv_page_size: if kv || window { pools.kv_page_size } else { 0 },
-            window_pages: if window { pools.window_pages } else { 0 },
-            window_tokens: if window { pools.window_tokens } else { 0 },
-            state_slots: pools.state_slots,
-            state_slot_bytes: if pools.state_slots > 0 || pools.host_state_slots > 0 {
-                pools.state_slot_bytes
-            } else {
-                0
-            },
-            buffer_pages: pools.buffer_pages,
-            host_kv_pages: pools.host_kv_pages,
-            host_window_pages: pools.host_window_pages,
-            host_state_slots: pools.host_state_slots,
-            host_buffer_pages: pools.host_buffer_pages,
-            disk_kv_pages: if kv { pools.disk_kv_pages } else { 0 },
-        }
-    }
 }
 
 /// Where the engine keeps each logical chunk: the runtime names logical

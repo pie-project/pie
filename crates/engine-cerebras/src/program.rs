@@ -305,11 +305,6 @@ impl Plane {
         )
     }
 
-    #[must_use]
-    pub fn device_forms(&self) -> (usize, usize) {
-        self.forms.tally()
-    }
-
     pub fn close_instance(&mut self, id: InstanceId) -> Result<(), Refusal> {
         self.instances
             .remove(&id)

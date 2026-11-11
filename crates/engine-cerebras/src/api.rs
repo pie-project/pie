@@ -25,7 +25,7 @@ use std::path::Path;
 use checkpoint::contract::ModelContract;
 use engine::Engine;
 use engine::adapter::AdapterRegistration;
-use engine::caps::{Capabilities, DeviceFacts, FireLimits, KvCopyDomains};
+use engine::caps::{Capabilities, DeviceFacts, FireLimits};
 use engine::channel::{ChannelId, ChannelRegistration, RegisteredChannel};
 use engine::error::{Error, Result as EngineResult};
 use engine::fire::{
@@ -33,7 +33,7 @@ use engine::fire::{
 };
 use engine::load::{Budgets as LoadBudgets, Checkpoint, LoadFacts, LoadRequest, Loaded};
 use engine::program::{BoundInstance, InstanceBinding, InstanceId, ProgramId, ProgramRegistration};
-use engine::transfer::{KvCopy, MemoryDomain, StateCopy};
+use engine::transfer::{KvCopy, MemoryDomain};
 use eta_ir::registry::{GeometryClass, PortMask, Stage};
 use poem_compiler::{Budget, PATCH_LATTICE_FLOOR, PatchLadder};
 use poem_ir::Trace;
@@ -438,7 +438,7 @@ impl Engine for Cerebras {
                 codegen_backend: None,
             },
             pools,
-            chunks: Some(chunks),
+            chunks,
             limits: FireLimits {
                 max_lanes,
                 max_tokens: budgets.max_tokens,
@@ -462,12 +462,6 @@ impl Engine for Cerebras {
                 .with(eta_ir::registry::Port::AttnMask)
                 .with(eta_ir::registry::Port::Fold),
             geometry: GeometryClass::DeviceGeometry,
-            kv_copy: KvCopyDomains {
-                device_to_device: true,
-                device_to_host: false,
-                host_to_device: false,
-                host_to_host: false,
-            },
             kv_handle: None,
             media_encode: false,
             device_channel_commit: true,
@@ -681,16 +675,6 @@ impl Engine for Cerebras {
         self.loaded_mut()?
             .copy_kv_with(&moves, &copy.windowed)
             .map_err(fault)
-    }
-
-    fn copy_state(&mut self, copy: &StateCopy) -> EngineResult<()> {
-        let _ = copy;
-        Err(Error::Unsupported {
-            verb: "`copy_state`: this engine's records are slot refs of its fixed shape, \
-                   copied as a lane's `[run, cow]` (`Lane::fixed`), and its rs rows an rs \
-                   list's slots (`Lane::slot_copies`)",
-            engine: "cerebras",
-        })
     }
 
     fn commit_segments(&mut self, segments: u32) -> EngineResult<()> {
@@ -1188,7 +1172,7 @@ impl Cerebras {
         let facts = self
             .caps
             .as_ref()
-            .and_then(|caps| caps.chunks.clone())
+            .map(|caps| caps.chunks.clone())
             .ok_or_else(|| Error::Load("the cerebras engine has no model loaded".into()))?;
         let shell = self.loaded_mut()?;
         let mut words: Vec<u64> = submission.lanes.iter().map(|lane| lane.word).collect();

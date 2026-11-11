@@ -1,6 +1,6 @@
 use std::fs::File;
 
-use crate::device::alloc::{FileWriter, Memory};
+use crate::device::alloc::Memory;
 use crate::device::{Buffer, Context, Handles};
 use crate::error::{Fault, Result};
 
@@ -131,15 +131,6 @@ impl Store {
                 .write_from_file(file, &local, threads)?;
         }
         Ok(())
-    }
-
-    pub fn file_writers(&mut self, jobs: &[Job]) -> Result<Vec<(FileWriter, Vec<Job>)>> {
-        let mut out = Vec::new();
-        for (at, local) in self.group(jobs)? {
-            let writer = self.chunks[at].buffer.file_writer(&local)?;
-            out.push((writer, local));
-        }
-        Ok(out)
     }
 
     #[must_use]

@@ -17,14 +17,6 @@ pub struct DeviceFacts {
     pub codegen_backend: Option<String>,
 }
 
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
-pub struct KvCopyDomains {
-    pub device_to_device: bool,
-    pub device_to_host: bool,
-    pub host_to_device: bool,
-    pub host_to_host: bool,
-}
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct FireLimits {
     pub max_lanes: u32,
@@ -94,12 +86,6 @@ pub struct PoolFacts {
     /// found with the meta this load would write.
     #[serde(default)]
     pub disk_kv_kept: bool,
-    /// The engine would rather post one frame a lane than seat fewer lanes
-    /// than it batches when its state slots are short: the runtime then
-    /// dispatches one frame deep, so a lane holds one slot. False keeps the
-    /// configured depth whatever the slots seat.
-    #[serde(default)]
-    pub one_frame_when_short: bool,
     /// The engine would rather a lane already decoding claim its next pages
     /// before a prompt waiting to be seated does, and a prompt wait for a
     /// lane to finish rather than suspend one. False keeps the runtime's
@@ -138,15 +124,12 @@ impl PoolFacts {
 pub struct Capabilities {
     pub device: DeviceFacts,
     pub pools: PoolFacts,
-    /// The pools as chunks, where the engine states them; `None` keeps
-    /// `pools` the only word. Beside `pools` until every backend reports
-    /// chunks.
+    /// The pools as chunks.
     #[serde(default)]
-    pub chunks: Option<ChunkFacts>,
+    pub chunks: ChunkFacts,
     pub limits: FireLimits,
     pub ports: PortMask,
     pub geometry: GeometryClass,
-    pub kv_copy: KvCopyDomains,
     pub kv_handle: Option<KvHandle>,
     pub media_encode: bool,
     #[serde(default)]

@@ -28,14 +28,12 @@ pub fn spawn(engine: &Engine, fs: FsPolicy, network: NetworkPolicy, memory_limit
 
 pub async fn instantiate(
     process_id: ProcessId,
-    username: String,
     program: &Program,
     output: OutputMode,
 ) -> Result<(Store<ProcessCtx>, Instance)> {
     let (tx, rx) = oneshot::channel();
     SERVICE.send(Message::Instantiate {
         process_id,
-        username,
         program: program.clone(),
         output,
         response: tx,
@@ -121,21 +119,12 @@ impl Linker {
         }
     }
 
-    #[allow(
-        clippy::too_many_arguments,
-        reason = "one instantiation's whole context: the engine and policy to build \
-                  under, the two caches it must hit rather than rebuild, and the \
-                  process identity it is being built FOR (id, user, program, output \
-                  mode). Folding them into a struct would re-list the same eight \
-                  fields and add a lifetime to the two cache handles"
-    )]
     async fn instantiate(
         engine: Engine,
         policy: InstancePolicy,
         base_linker_cache: BaseLinkerCache,
         instance_pre_cache: InstancePreCache,
         process_id: ProcessId,
-        username: String,
         program: &Program,
         output: OutputMode,
     ) -> Result<(Store<ProcessCtx>, Instance)> {
@@ -146,8 +135,7 @@ impl Linker {
         let component = main.component;
         let language = main.script.is_some();
 
-        let process_ctx =
-            ProcessCtx::new(process_id, username, output, &policy, main.script).await?;
+        let process_ctx = ProcessCtx::new(process_id, output, &policy, main.script).await?;
         let mut store = Store::new(&engine, process_ctx);
         store.limiter(|ctx| ctx.limits());
 
@@ -204,7 +192,6 @@ impl Linker {
 enum Message {
     Instantiate {
         process_id: ProcessId,
-        username: String,
         program: Program,
         output: OutputMode,
         response: oneshot::Sender<Result<(Store<ProcessCtx>, Instance)>>,
@@ -221,7 +208,6 @@ impl ServiceHandler for Linker {
         match msg {
             Message::Instantiate {
                 process_id,
-                username,
                 program,
                 output,
                 response,
@@ -232,8 +218,7 @@ impl ServiceHandler for Linker {
                 let pre_cache = Arc::clone(&self.instance_pre_cache);
                 crate::rt::spawn(async move {
                     let result = Linker::instantiate(
-                        engine, policy, base_cache, pre_cache, process_id, username, &program,
-                        output,
+                        engine, policy, base_cache, pre_cache, process_id, &program, output,
                     )
                     .await;
                     let _ = response.send(result);

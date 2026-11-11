@@ -5,7 +5,7 @@ use std::sync::Arc;
 
 use checkpoint::contract::ModelContract;
 use engine::Engine;
-use engine::caps::{Capabilities, DeviceFacts, FireLimits, KvCopyDomains, PoolFacts};
+use engine::caps::{Capabilities, DeviceFacts, FireLimits, PoolFacts};
 use engine::channel::{ChannelId, ChannelRegistration, HostMirror, RegisteredChannel};
 use engine::error::{Error, Result as EngineResult};
 use engine::fire::{
@@ -15,7 +15,7 @@ use engine::load::{Budgets as LoadBudgets, Checkpoint, LoadFacts, LoadRequest, L
 use engine::program::{
     BindExtents, BoundInstance, InstanceBinding, InstanceId, ProgramId, ProgramRegistration,
 };
-use engine::transfer::{KvCopy, MemoryDomain, StateCopy, StateDirection};
+use engine::transfer::{KvCopy, MemoryDomain};
 use eta_ir::registry::{GeometryClass, Port, PortMask};
 use poem_compiler::{Budget, PATCH_LATTICE_FLOOR, PatchLadder};
 use poem_ir::Trace;
@@ -716,12 +716,11 @@ impl Engine for Cuda {
                 disk_kv_pages,
                 disk_kv_persistent: residency.disk_kv_persistent && disk_kv_pages > 0,
                 disk_kv_kept: shell.disk_kv_kept(),
-                one_frame_when_short: shell.one_frame_when_short(),
                 seated_first: shell.seated_first(),
                 seat_to_end: shell.seat_to_end(),
                 seat_spread: shell.seat_spread(),
             },
-            chunks: Some(chunk_facts),
+            chunks: chunk_facts,
             limits: FireLimits {
                 max_lanes: shell.budget().max_lanes,
                 max_tokens: shell.budget().max_tokens,
@@ -742,12 +741,6 @@ impl Engine for Cuda {
                 .with(Port::AttnMask)
                 .with(Port::Fold),
             geometry: GeometryClass::DeviceGeometry,
-            kv_copy: KvCopyDomains {
-                device_to_device: true,
-                device_to_host: host_kv_pages > 0,
-                host_to_device: host_kv_pages > 0,
-                host_to_host: false,
-            },
             kv_handle,
             media_encode: false,
             device_channel_commit: true,
@@ -1159,38 +1152,6 @@ impl Engine for Cuda {
         channel: u32,
     ) -> EngineResult<Option<Vec<u8>>> {
         self.instance(instance)?.take(channel).map_err(fault)
-    }
-
-    fn copy_state(&mut self, copy: &StateCopy) -> EngineResult<()> {
-        for (at, move_) in copy.moves.iter().enumerate() {
-            if move_.src_token_offset != 0 || move_.dst_token_offset != 0 {
-                return Err(Error::Invalid(format!(
-                    "state move {at} names a token offset, and a recurrent bank is a folded \
-                     summary of a prefix rather than an array of per-token entries — this \
-                     engine moves whole slots"
-                )));
-            }
-        }
-        let shell = self.loaded_mut()?;
-        let pairs = |moves: &[engine::transfer::StateMove]| -> Vec<(u32, u32)> {
-            moves
-                .iter()
-                .map(|m| (m.src_slot_id, m.dst_slot_id))
-                .collect()
-        };
-        let (states, pages) = (pairs(&copy.moves), pairs(&copy.pages));
-        if copy.direction != StateDirection::DeviceToDevice {
-            // Records, rs list slots and window list slots park by
-            // `copy_slots` (CONTRACT-BC 22).
-            return Err(Error::Unsupported {
-                verb: "copy_state to or from the host: state moves between tiers by copy_slots",
-                engine: "cuda",
-            });
-        }
-        for &(src, dst) in &states {
-            shell.copy_state(src, dst).map_err(fault)?;
-        }
-        shell.copy_pages(&pages).map_err(fault)
     }
 
     fn host_kv_layout(&self) -> Option<state::PageLayout> {

@@ -10,7 +10,6 @@
 //! too; one lane holding the rest otherwise). A padding lane reads and writes
 //! only the sink page and the sink slot.
 
-pub mod dry;
 mod warm;
 
 use std::collections::BTreeMap;
@@ -225,14 +224,6 @@ pub(crate) struct Deferred {
     probed: Vec<ValueId>,
 }
 
-/// What one fire cost the host, for the bench.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub struct FireCost {
-    pub nodes: u32,
-    pub compiled: bool,
-    pub text_bytes: usize,
-}
-
 /// Fields drop in order: every buffer (weights, pools) goes before the
 /// device whose client made it.
 pub struct Shell {
@@ -277,7 +268,6 @@ pub struct Shell {
     /// program which of them its trailing outputs hold.
     probes: Vec<ValueId>,
     probed: std::collections::HashMap<[u8; 32], Vec<ValueId>>,
-    last: FireCost,
     /// Programs by the fire shape that traced them: a fire whose shape was
     /// seen skips the walk and runs what the first one compiled.
     traced: std::collections::HashMap<[u8; 32], std::sync::Arc<crate::device::Program>>,
@@ -774,7 +764,6 @@ impl Shell {
             token_feeds: Vec::new(),
             probes: Vec::new(),
             probed: std::collections::HashMap::new(),
-            last: FireCost::default(),
             traced: std::collections::HashMap::new(),
             shaped: std::collections::HashMap::new(),
             deferred: None,
@@ -806,15 +795,6 @@ impl Shell {
     #[must_use]
     pub fn device(&self) -> &Device {
         &self.device
-    }
-
-    /// The width of the float output read at the readout rows, when the plan
-    /// reads one.
-    #[must_use]
-    pub fn readout_width(&self) -> Option<u32> {
-        (self.exports.iter())
-            .find(|out| out.decl.readout && matches!(out.decl.dtype, Dtype::Bf16 | Dtype::F32))
-            .map(|out| out.decl.width)
     }
 
     /// The patch element the plan's image tower reads, if it has one.
@@ -870,11 +850,6 @@ impl Shell {
     }
 
     #[must_use]
-    pub fn last_fire(&self) -> FireCost {
-        self.last
-    }
-
-    #[must_use]
     pub fn footprint(&self) -> (u64, u64) {
         (self.weights.bytes(), self.pools.bytes())
     }
@@ -910,11 +885,6 @@ impl Shell {
     /// Copies whole slots `(shape, src ref, dst ref)`, in order.
     pub fn copy_slots(&mut self, copies: &[(engine::chunk::ShapeId, u32, u32)]) -> Result<()> {
         self.pools.copy(&self.device, &self.handles, copies)
-    }
-
-    /// Zeros whole slots `(shape, ref)`.
-    pub fn zero_slots(&mut self, slots: &[(engine::chunk::ShapeId, u32)]) -> Result<()> {
-        self.pools.zero(&self.device, &self.handles, slots)
     }
 
     /// Moves chunks as the runtime asks, then places them by the table.
@@ -1143,12 +1113,6 @@ impl Shell {
     /// rows its readout asked for.
     pub fn fire_seated(&mut self, lanes: &[Seated<'_>]) -> Result<Vec<Vec<f32>>> {
         self.fire_full(lanes).map(|fired| fired.rows)
-    }
-
-    /// Like `fire_full`, with the outputs left on the device: `rows` comes
-    /// back empty and `kept` holds the planes.
-    pub fn fire_kept(&mut self, lanes: &[Seated<'_>]) -> Result<Fired> {
-        self.fire_kept_with(lanes, &[])
     }
 
     /// Makes the next fire read these lanes' tokens off the device: lane

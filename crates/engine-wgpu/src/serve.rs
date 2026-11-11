@@ -261,13 +261,6 @@ pub struct Attached {
     pub adapter_only: bool,
 }
 
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub struct FireCost {
-    pub launches: u32,
-
-    pub copied: u32,
-}
-
 fn adapter_fact(classes: &poem_ir::ClassTable, corrected: &poem_ir::ClassSet) -> Option<u32> {
     classes.adapter_fact(corrected)
 }
@@ -385,9 +378,6 @@ pub struct Shell {
 
     landed: BTreeMap<u64, Vec<Vec<f32>>>,
 
-    #[allow(dead_code)]
-    facts: kv::Facts,
-
     page_tables: usize,
 
     patch_seat: Option<crate::inputs::PatchSeat>,
@@ -401,8 +391,6 @@ pub struct Shell {
     gathers_readout: bool,
 
     copies: bool,
-
-    last: FireCost,
 
     masked: poem_ir::ClassSet,
 
@@ -1039,11 +1027,9 @@ impl Shell {
             drops_patch_rows,
             states_mrope,
             gathers_readout,
-            facts,
             page_tables,
 
             copies: false,
-            last: FireCost::default(),
             masked,
             token_gridded,
             corrected,
@@ -1479,11 +1465,6 @@ impl Shell {
     }
 
     #[must_use]
-    pub fn weight_tiers(&self) -> engine::load::Tiers {
-        self.weights.tiers()
-    }
-
-    #[must_use]
     pub fn weights_stream(&self) -> bool {
         self.weights.streams()
     }
@@ -1499,18 +1480,9 @@ impl Shell {
         )
     }
 
-    pub fn set_copies(&mut self, copies: bool) {
-        self.copies = copies;
-    }
-
     #[must_use]
     pub fn copies(&self) -> bool {
         self.copies
-    }
-
-    #[must_use]
-    pub fn last_fire(&self) -> FireCost {
-        self.last
     }
 
     pub fn fire(&mut self, lanes: &[Lane<'_>]) -> Result<Vec<Vec<f32>>> {
@@ -1673,11 +1645,6 @@ impl Shell {
 
     pub fn mount_adapters(&mut self, root: Option<std::path::PathBuf>) {
         self.blobs.mount(root);
-    }
-
-    #[must_use]
-    pub fn blob_store(&self) -> &crate::blob::Store {
-        &self.blobs
     }
 
     #[must_use]
@@ -2581,10 +2548,6 @@ impl Shell {
             &[],
             &[],
         )?;
-        self.last = FireCost {
-            launches: windows.launches(),
-            copied: windows.copied(),
-        };
         let boundaries = windows.packed();
 
         let staged = crate::mask::stage(&masks)?;

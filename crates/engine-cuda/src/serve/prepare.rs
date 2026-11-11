@@ -9,8 +9,8 @@ use crate::store::kv::{self, Seat};
 use crate::window::Windows;
 
 use super::{
-    Enqueued, FireCost, InputFeedPlan, MROPE_COORDS, Media, MergeLand, PATCH_ROUTE_DROP, Prepared,
-    RsFire, Settled, Shell, StepView, VoxelFeedPlan,
+    Enqueued, InputFeedPlan, MROPE_COORDS, Media, MergeLand, PATCH_ROUTE_DROP, Prepared, RsFire,
+    Settled, Shell, StepView, VoxelFeedPlan,
 };
 
 const WINDOWS_MEMO: usize = 8;
@@ -1468,12 +1468,6 @@ impl FrameShell for Shell {
                 (windows, packed)
             }
         };
-        if !arming {
-            self.last = FireCost {
-                launches: windows.launches(),
-                copied: windows.copied(),
-            };
-        }
         super::btrace::mark("windows_of");
 
         let staged = crate::mask::stage(&masks)?;

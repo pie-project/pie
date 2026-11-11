@@ -251,21 +251,8 @@ impl<'c> Run<'c> {
         self.window().indptr
     }
 
-    #[allow(dead_code)]
     pub(crate) fn qo_indptr_host(&self) -> &'c [i32] {
         &self.window().indptr_host
-    }
-
-    #[allow(dead_code)]
-    pub(crate) fn total_tokens(&self) -> u32 {
-        self.window().span.rows
-    }
-
-    #[allow(dead_code)]
-    pub(crate) fn multi_token(&self) -> bool {
-        self.qo_indptr_host()
-            .windows(2)
-            .any(|pair| pair[1] - pair[0] > 1)
     }
 
     pub(crate) fn cut_rows(&self, handle: Tensor) -> Tensor {

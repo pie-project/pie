@@ -61,7 +61,7 @@ fn shell(name: &str) -> Shell {
 /// prompt ends on a page).
 fn prefill(shell: &mut Shell, n: u32) {
     let facts = shell.trace().facts.clone();
-    let mut refs = Refs::of_facts(Some(shell.chunk_facts()));
+    let mut refs = Refs::of_facts(shell.chunk_facts());
     let mut seq = Seq::new(0);
     let cut = n / PAGE * PAGE;
     let tokens = vec![7u32; n as usize];
@@ -123,7 +123,7 @@ fn prompts_of_nearby_lengths_trace_no_new_program() {
 fn the_slots_a_request_lands_in_trace_no_new_program() {
     let mut shell = shell("qwen35-d0.8b-bf16-kv-bf16");
     let facts = shell.chunk_facts();
-    let mut refs = Refs::of_facts(Some(facts.clone()));
+    let mut refs = Refs::of_facts(facts.clone());
     let kv = facts.shapes[0].id;
     let fixed = facts
         .shapes
@@ -184,7 +184,7 @@ fn the_slots_a_request_lands_in_trace_no_new_program() {
 /// The text of a decode of `lanes` lanes, each at 300 rows.
 fn decode_text(shell: &mut Shell, lanes: u32) -> usize {
     let facts = shell.trace().facts.clone();
-    let mut refs = Refs::of_facts(Some(shell.chunk_facts()));
+    let mut refs = Refs::of_facts(shell.chunk_facts());
     let token = [7u32];
     let word = facts.word(&Request::new(1, false));
     // Lanes share the seats' slots (`lane % SLOTS`), as the old test did.

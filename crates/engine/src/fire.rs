@@ -499,8 +499,8 @@ pub struct Serves {
     pub rs_verbs: bool,
     pub adapter_attachments: bool,
     pub rs_snapshots: u32,
-    /// The engine states [`crate::chunk::ChunkFacts`] and reads a lane's
-    /// slot tables.
+    /// The engine has loaded: it states [`crate::chunk::ChunkFacts`] and
+    /// reads a lane's slot tables.
     pub chunks: bool,
 }
 
@@ -520,7 +520,7 @@ impl Serves {
             rs_verbs: caps.rs_verbs,
             adapter_attachments: caps.adapter_attachments,
             rs_snapshots: caps.rs_snapshots,
-            chunks: caps.chunks.is_some(),
+            chunks: true,
         }
     }
 }

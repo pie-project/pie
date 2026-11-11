@@ -235,7 +235,6 @@ pub struct SharedPool {
     records: Vec<Option<Vec<Vec<Slot>>>>,
     free_records: BTreeSet<u32>,
     records_capacity: u32,
-    cow_lanes: u32,
     /// Chunks one working set takes at the longest context.
     least_chunks: u32,
 }
@@ -254,11 +253,10 @@ impl SharedPool {
         !facts.shapes.is_empty() && facts.shapes.iter().all(|shape| shape.pinned.is_none())
     }
 
-    /// The pool `facts` state, a copy-on-write reserve of `cow_lanes` records
-    /// for the lanes one fire runs, and `max_context` tokens the longest a
+    /// The pool `facts` state, and `max_context` tokens the longest a
     /// working set holds. The rung starts at the largest: state never takes
     /// the top span until a rung is lowered.
-    pub fn new(facts: &ChunkFacts, cow_lanes: u32, max_context: u32) -> Result<Self, SharedError> {
+    pub fn new(facts: &ChunkFacts, max_context: u32) -> Result<Self, SharedError> {
         facts
             .validate()
             .map_err(|error| SharedError::Facts(error.to_string()))?;
@@ -272,7 +270,7 @@ impl SharedPool {
             }
             reserved += run.chunks;
         }
-        Self::build(facts, reserved, cow_lanes, max_context)
+        Self::build(facts, reserved, max_context)
     }
 
     /// A tier below the device (CONTRACT-BC 22): `chunks` chunks of the
@@ -302,15 +300,10 @@ impl SharedPool {
             weights: Vec::new(),
             ..facts.clone()
         };
-        Self::build(&tier, 0, 0, 0).map(Some)
+        Self::build(&tier, 0, 0).map(Some)
     }
 
-    fn build(
-        facts: &ChunkFacts,
-        reserved: u32,
-        cow_lanes: u32,
-        max_context: u32,
-    ) -> Result<Self, SharedError> {
+    fn build(facts: &ChunkFacts, reserved: u32, max_context: u32) -> Result<Self, SharedError> {
         let mut shapes = Vec::with_capacity(facts.shapes.len() + facts.weights.len());
         let (mut lists, mut rs_lists, mut windows, mut fixed) =
             (Vec::new(), Vec::new(), Vec::new(), Vec::new());
@@ -396,7 +389,6 @@ impl SharedPool {
             records: Vec::new(),
             free_records: BTreeSet::new(),
             records_capacity: 0,
-            cow_lanes,
             least_chunks: 0,
         };
         // Under the smallest rung state may take every chunk but the
@@ -551,16 +543,6 @@ impl SharedPool {
                     .unwrap_or(u32::MAX)
             }),
             list_tokens: self.list.map_or(0, |list| list.tokens),
-        }
-    }
-
-    /// Copy-on-write records kept back for the lanes of one fire.
-    #[must_use]
-    pub fn cow_reserve(&self) -> u32 {
-        if self.fixed.is_empty() {
-            0
-        } else {
-            self.cow_lanes
         }
     }
 
@@ -1084,12 +1066,6 @@ impl SharedPool {
                 least_cut: self.segment_bytes(),
             },
         }
-    }
-
-    /// The holder record slots are taken under.
-    #[must_use]
-    pub const fn store_holder() -> Holder {
-        STORE
     }
 }
 

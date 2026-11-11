@@ -34,7 +34,6 @@ impl Shell {
                 .min()
                 .unwrap_or(0),
             disk_kv_pages,
-            one_frame_when_short: false,
             seated_first: false,
             seat_to_end: false,
             seat_spread: false,

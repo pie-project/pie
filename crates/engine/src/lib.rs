@@ -27,7 +27,7 @@ pub mod runahead;
 pub mod transfer;
 
 pub use adapter::{AdapterPlane, AdapterRegistration};
-pub use caps::{Capabilities, DeviceFacts, FireLimits, KvCopyDomains, PoolFacts};
+pub use caps::{Capabilities, DeviceFacts, FireLimits, PoolFacts};
 pub use channel::{
     ChannelId, ChannelRegistration, ChannelSeed, HostMirror, RegisteredChannel, Ticket,
 };

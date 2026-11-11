@@ -173,7 +173,7 @@ impl ResidencyPlanner {
                             unreachable!("ServeAllocation only targets allocation entries");
                         };
                         debug_assert!(outcome.is_none(), "unserved head carries no outcome");
-                        *outcome = Some(Ok(AllocationGrant::new(demand, kv, rs)));
+                        *outcome = Some(Ok(AllocationGrant::new(kv, rs)));
                         ServeOutcome::Served(notify.clone())
                     });
                     match outcome {

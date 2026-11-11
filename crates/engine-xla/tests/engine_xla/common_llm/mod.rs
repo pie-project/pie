@@ -277,8 +277,8 @@ impl Refs {
         Refs::of_facts(model.loaded.caps.chunks.clone())
     }
 
-    pub fn of_facts(facts: Option<engine::chunk::ChunkFacts>) -> Refs {
-        let facts = facts.filter(|facts| {
+    pub fn of_facts(facts: engine::chunk::ChunkFacts) -> Refs {
+        let facts = Some(facts).filter(|facts| {
             !facts.shapes.is_empty() && facts.shapes.iter().all(|s| s.pinned.is_none())
         });
         let next_chunk = 0;

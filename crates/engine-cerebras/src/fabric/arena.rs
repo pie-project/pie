@@ -129,12 +129,6 @@ impl Table {
         }
         reach.saturating_sub(lo).max(1)
     }
-
-    /// Words the PE's arena arrays take together.
-    #[must_use]
-    pub fn data_words(&self) -> u64 {
-        (0..self.chunks()).map(|c| self.chunk_words(c)).sum::<u64>() + u64::from(self.ops_words)
-    }
 }
 
 /// What every class of a model agrees on so their whole-fire programs are

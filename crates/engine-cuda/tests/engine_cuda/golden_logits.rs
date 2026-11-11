@@ -1730,11 +1730,7 @@ fn submitted_buffered(fixture: &Fixture, cache: &Path) -> Vec<(u64, u32)> {
             frames_in_flight: 1,
         })
         .unwrap_or_else(|why| panic!("{} loads: {why}", fixture.model));
-    let facts = loaded
-        .caps
-        .chunks
-        .clone()
-        .expect("the engine states chunks");
+    let facts = loaded.caps.chunks.clone();
     facts.validate().expect("the engine's chunk facts hold");
     let shape = |want: fn(&engine::chunk::SlotShape) -> bool| {
         facts

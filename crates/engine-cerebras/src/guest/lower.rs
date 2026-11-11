@@ -147,16 +147,6 @@ impl Layout {
         !self.outputs.is_empty()
     }
 
-    /// The buffer name of input slot `k`.
-    #[must_use]
-    pub fn input_name(&self, k: usize) -> String {
-        if self.inputs[k].direct {
-            format!("in{k}")
-        } else {
-            "pack".to_string()
-        }
-    }
-
     /// The buffer name of output slot `k`.
     #[must_use]
     pub fn output_name(&self, k: usize) -> String {

@@ -17,15 +17,13 @@ sdpa.selected_mma = true
 sdpa.selected_cluster = 8
 moe.mxfp4_f16 = true
 
-# Two state slots a lane (one frame a lane where they seat fewer lanes than
-# the engine batches), host-mapped `host` planes, 16384-row fires, a decoding
+# Host-mapped `host` planes, 16384-row fires, a decoding
 # lane's pages before a waiting prompt, a lattice bucket between powers of
 # two (four from 4096 rows), and a gated delta fire at most 4096 rows.
 [engine]
 lattice_steps = 2
 prefill_lattice_from = 4096
 host_planes = true
-one_frame_when_short = true
 seated_first = true
 forward_tokens = 16384
 walk_fire_rows = 4096
@@ -57,7 +55,6 @@ measured = [
   "engine.forward_tokens",
   "engine.host_planes",
   "engine.lattice_steps",
-  "engine.one_frame_when_short",
   "engine.seated_first",
   "engine.walk_fire_rows",
   "engine.working_set_percent",

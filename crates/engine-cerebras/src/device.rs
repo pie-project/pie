@@ -537,18 +537,6 @@ impl Device {
         self.run_with(program, args, false)
     }
 
-    /// `run`; a `resident` program stays loaded in a `fabric-run --serve`
-    /// of its own between runs (the simulator only; a system runs a phase
-    /// a process as before).
-    /// Queues page moves for the next run's table (kept pools): the host
-    /// no longer edits those pools, the device moves the rows.
-    pub fn queue_moves(&self, moves: Vec<PoolMove>) {
-        self.moves
-            .lock()
-            .expect("moves lock poisoned")
-            .extend(moves);
-    }
-
     pub fn run_with(
         &self,
         program: &Program,

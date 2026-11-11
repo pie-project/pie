@@ -284,10 +284,7 @@ struct PendingSubmissionCompletion {
 #[derive(Clone)]
 enum SubmissionCompletionKind {
     ReadyOk,
-    ReadyErr(String),
     Pending(Arc<PendingSubmissionCompletion>),
-
-    All(Arc<Vec<SubmissionCompletion>>),
 }
 
 #[derive(Clone)]
@@ -311,28 +308,10 @@ impl SubmissionCompletion {
         }
     }
 
-    pub fn failed(message: impl Into<String>) -> Self {
-        Self {
-            kind: SubmissionCompletionKind::ReadyErr(message.into()),
-        }
-    }
-
-    pub fn all(parts: Vec<SubmissionCompletion>) -> Self {
-        match parts.len() {
-            0 => Self::ready(),
-            1 => parts.into_iter().next().expect("one part"),
-            _ => Self {
-                kind: SubmissionCompletionKind::All(Arc::new(parts)),
-            },
-        }
-    }
-
     pub fn wait_id(&self) -> u64 {
         match &self.kind {
             SubmissionCompletionKind::Pending(pending) => pending.state.slot,
-            SubmissionCompletionKind::ReadyOk
-            | SubmissionCompletionKind::ReadyErr(_)
-            | SubmissionCompletionKind::All(_) => {
+            SubmissionCompletionKind::ReadyOk => {
                 panic!("only pending submission completions expose a wait id")
             }
         }
@@ -341,9 +320,7 @@ impl SubmissionCompletion {
     pub fn target_epoch(&self) -> u64 {
         match &self.kind {
             SubmissionCompletionKind::Pending(pending) => pending.state.target_epoch,
-            SubmissionCompletionKind::ReadyOk
-            | SubmissionCompletionKind::ReadyErr(_)
-            | SubmissionCompletionKind::All(_) => {
+            SubmissionCompletionKind::ReadyOk => {
                 panic!("only pending submission completions expose a target epoch")
             }
         }
@@ -352,9 +329,7 @@ impl SubmissionCompletion {
     pub fn terminal_cell_ptr(&self) -> Option<CellPtr> {
         match &self.kind {
             SubmissionCompletionKind::Pending(pending) => pending.state.terminal_cell_ptr(),
-            SubmissionCompletionKind::ReadyOk
-            | SubmissionCompletionKind::ReadyErr(_)
-            | SubmissionCompletionKind::All(_) => None,
+            SubmissionCompletionKind::ReadyOk => None,
         }
     }
 
@@ -363,13 +338,7 @@ impl SubmissionCompletion {
             SubmissionCompletionKind::Pending(pending) => {
                 pending.state.close(pending.broker.table, message);
             }
-            SubmissionCompletionKind::All(parts) => {
-                let message = message.into();
-                for part in parts.iter() {
-                    part.close(message.clone());
-                }
-            }
-            SubmissionCompletionKind::ReadyOk | SubmissionCompletionKind::ReadyErr(_) => {}
+            SubmissionCompletionKind::ReadyOk => {}
         }
     }
 
@@ -380,18 +349,6 @@ impl SubmissionCompletion {
     pub fn check(&self) -> Option<Result<()>> {
         match &self.kind {
             SubmissionCompletionKind::ReadyOk => Some(Ok(())),
-            SubmissionCompletionKind::ReadyErr(message) => Some(Err(anyhow!(message.clone()))),
-            SubmissionCompletionKind::All(parts) => {
-                let mut first_error = None;
-                for part in parts.iter() {
-                    match part.check() {
-                        None => return None,
-                        Some(Err(error)) if first_error.is_none() => first_error = Some(error),
-                        Some(_) => {}
-                    }
-                }
-                Some(first_error.map_or(Ok(()), Err))
-            }
             SubmissionCompletionKind::Pending(pending) => {
                 if pending.state.closed.load(Ordering::Acquire) {
                     return Some(pending.state.close_error());
@@ -452,28 +409,6 @@ impl std::future::Future for SubmissionCompletion {
         let this = self.get_mut();
         match &this.kind {
             SubmissionCompletionKind::ReadyOk => Poll::Ready(Ok(())),
-            SubmissionCompletionKind::ReadyErr(message) => {
-                Poll::Ready(Err(anyhow!(message.clone())))
-            }
-            SubmissionCompletionKind::All(parts) => {
-                let mut first_error = None;
-                let mut pending = false;
-                for part in parts.iter() {
-                    let mut part = part.clone();
-                    match std::pin::Pin::new(&mut part).poll(cx) {
-                        Poll::Pending => pending = true,
-                        Poll::Ready(Err(error)) if first_error.is_none() => {
-                            first_error = Some(error);
-                        }
-                        Poll::Ready(_) => {}
-                    }
-                }
-                if pending {
-                    Poll::Pending
-                } else {
-                    Poll::Ready(first_error.map_or(Ok(()), Err))
-                }
-            }
             SubmissionCompletionKind::Pending(pending) => {
                 let slot = pending.state.slot;
                 let table = pending.broker.table;

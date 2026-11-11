@@ -40,7 +40,7 @@ pub mod window;
 pub use api::{Cerebras, ContractFor, DeviceBoot};
 pub use boot::{open, open_engine};
 pub use error::{Fault, Result, kernel};
-pub use serve::{Boot, FireCost, Fired, Lane, Media, Seated, Shell};
+pub use serve::{Boot, Fired, Lane, Media, Seated, Shell};
 
 /// The fusions this backend implements: none, so the compiler forms no
 /// fused op here.

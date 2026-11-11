@@ -90,11 +90,6 @@ impl Shell {
     }
 
     #[must_use]
-    pub fn buffer_capacity_bytes(&self) -> u64 {
-        0
-    }
-
-    #[must_use]
     pub fn mode(&self) -> Graphs {
         self.graphs
     }

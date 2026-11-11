@@ -5,7 +5,7 @@ use poem_exec::store::arena::rect;
 use poem_ir::ValueId;
 
 use crate::device::{Buffer, Context, Handles};
-use crate::error::{Fault, Result};
+use crate::error::Result;
 use crate::run::SlotTable;
 
 /// Scratch is sized for the widest fire and most fires are narrow. Held in
@@ -105,27 +105,6 @@ impl Arena {
             return sparse.read_into(offset, into);
         }
         self.store.read(offset, into)
-    }
-
-    pub fn read_view(
-        &self,
-        handles: &Handles,
-        handle: u32,
-        skip: u64,
-        into: &mut [u8],
-    ) -> Result<()> {
-        let at = {
-            let row = handles.get(handle).ok_or_else(|| Fault::Unbound {
-                what: format!("handle {handle}, which this load minted no row for"),
-            })?;
-            row.offset()
-        };
-        let at = at.checked_add(skip).ok_or(Fault::Ceiling {
-            what: "bytes into the arena",
-            need: u64::MAX,
-            have: self.store.bytes(),
-        })?;
-        self.read(at, into)
     }
 }
 

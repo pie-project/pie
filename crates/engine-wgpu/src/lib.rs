@@ -53,9 +53,7 @@ pub use run::{
     StructSlot, WeightRow, WeightTable,
 };
 pub use scratch::Scratch;
-pub use serve::{
-    Attached, Boot, Enqueued, FireCost, Landed, Lane, Prepared, Seated, Shell, StepView,
-};
+pub use serve::{Attached, Boot, Enqueued, Landed, Lane, Prepared, Seated, Shell, StepView};
 pub use settle::{Airborne, Arms, Done};
 pub use store::Pools;
 pub use weights::{AdapterPlane, BankSeat, Weights};

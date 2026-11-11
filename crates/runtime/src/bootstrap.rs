@@ -139,8 +139,7 @@ pub struct EngineConfig {
     pub weights_fit: bool,
     pub total_pages: usize,
     /// The pools as chunks: what the engine states
-    /// ([`::engine::Capabilities::chunks`]), else today's pools as the
-    /// degenerate mode's pinned shapes.
+    /// ([`::engine::Capabilities::chunks`]).
     pub chunks: ::engine::chunk::ChunkFacts,
     /// Bytes a kv page takes where the pool can change size; zero: it cannot.
     pub resizable_kv_page_bytes: u64,
@@ -152,17 +151,10 @@ pub struct EngineConfig {
     pub window_pages: u32,
     pub window_tokens: u32,
     pub cpu_pages: usize,
-    pub cpu_window_pages: u32,
     pub disk_pages: u32,
     /// The disk tier is kept for the next run (`disk_kv_persistent`).
     pub disk_kept: Option<KeptDisk>,
-    pub kv_copy: ::engine::caps::KvCopyDomains,
-    pub backend_kind: String,
-    pub rs_cache_required: bool,
     pub rs_cache_slots: usize,
-    /// The engine asks for one frame a lane when its slots seat fewer lanes
-    /// than it batches (`PoolFacts::one_frame_when_short`).
-    pub one_frame_when_short: bool,
     /// The engine asks the planner to serve a decoding lane's pages before a
     /// prompt waiting to be seated (`PoolFacts::seated_first`).
     pub seated_first: bool,
@@ -173,9 +165,6 @@ pub struct EngineConfig {
     /// to the end at once over a life (`PoolFacts::seat_spread`).
     pub seat_spread: bool,
     pub rs_cache_slot_bytes: u64,
-    pub rs_host_slots: usize,
-    pub rs_buffer_pages: u32,
-    pub rs_host_buffer_pages: u32,
     pub draft_block: u32,
     pub draft_mask_token: u32,
     pub draft_proposals_from: u32,
@@ -220,7 +209,6 @@ pub struct TelemetryConfig {
 
 pub struct BootstrapHandle {
     pub port: u16,
-    pub model_idx: usize,
     shutdown: Option<RuntimeShutdown>,
 }
 
@@ -449,7 +437,6 @@ async fn bootstrap_inner(config: Config) -> Result<BootstrapHandle> {
                 );
                 let pool = crate::store::shared::SharedPool::new(
                     &d.chunks,
-                    d.limits.max_forward_requests as u32,
                     u32::try_from(d.limits.max_context).unwrap_or(u32::MAX),
                 )
                 .map_err(|error| anyhow::anyhow!("engine pools: {error}"))?;
@@ -525,7 +512,6 @@ async fn bootstrap_inner(config: Config) -> Result<BootstrapHandle> {
             let id = engine::register_engine_backend(
                 engine::EngineSpec {
                     device_domain: ::engine::MemoryDomain::HostPinned,
-                    num_kv_pages: d.total_pages,
                     limits: d.limits,
                     device_geometry_port_mask: d.device_geometry_port_mask,
                 },
@@ -755,7 +741,6 @@ async fn bootstrap_inner(config: Config) -> Result<BootstrapHandle> {
     active_guard.disarm();
     Ok(BootstrapHandle {
         port: bound_port,
-        model_idx: arena_model_idx,
         shutdown: Some(RuntimeShutdown {
             scheduler: scheduler_shutdown,
             engine_ids: engines,

@@ -58,22 +58,6 @@ impl SharedRing {
         self.counters.cursor()
     }
 
-    #[must_use]
-    pub fn cell_bytes(&self) -> usize {
-        self.shape.cell_bytes()
-    }
-
-    #[must_use]
-    pub fn cell_stride(&self) -> usize {
-        self.shape.cell_stride()
-    }
-
-    #[must_use]
-    pub fn cell_offset(&self, sequence: u64) -> u64 {
-        let cells = u64::from(self.shape.capacity) + 1;
-        (sequence % cells) * self.cell_stride() as u64
-    }
-
     pub fn bump_head(&self) {
         self.counters.bump_head();
     }

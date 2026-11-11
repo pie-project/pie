@@ -16,12 +16,6 @@ impl Shell {
         self.fire_full(lanes).map(|fired| fired.rows)
     }
 
-    /// Like `fire_full`, with the outputs left on the device: `rows` comes
-    /// back empty and `kept` holds the planes.
-    pub fn fire_kept(&mut self, lanes: &[Seated<'_>]) -> Result<Fired> {
-        self.fire_kept_with(lanes, &[])
-    }
-
     /// Makes the next fire read these lanes' tokens off the device: lane
     /// `lane`'s `i`th token is word `words[i]` of `src` (a `u32` array a
     /// guest pass wrote). The tokens the lane was seated with stand in on

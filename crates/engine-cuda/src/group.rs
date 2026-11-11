@@ -10,7 +10,7 @@ use engine::fire::MediaEncode;
 use engine::fire::{FrameSubmission, FrameTicket, Step};
 use engine::load::{LoadRequest, Loaded};
 use engine::program::{BoundInstance, InstanceBinding, InstanceId, ProgramId, ProgramRegistration};
-use engine::transfer::{KvCopy, KvHandle, StateCopy};
+use engine::transfer::{KvCopy, KvHandle};
 use eta_ir::container::HostRole;
 
 use crate::api::{ContractFor, Cuda, DeviceBoot, World};
@@ -384,23 +384,19 @@ impl Engine for Group {
             pools.disk_kv_pages = tiers.disk_kv_pages;
             pools.disk_kv_persistent = tiers.disk_kv_persistent;
             pools.disk_kv_kept = tiers.disk_kv_kept;
-            loaded.caps.kv_copy.device_to_host &= tiers.host_kv_pages > 0;
-            loaded.caps.kv_copy.host_to_device &= tiers.host_kv_pages > 0;
         }
         // The shared pool's tiers (CONTRACT-BC 22): what every rank holds.
         let least = |of: fn(&engine::chunk::ChunkFacts) -> u32| {
             answers
                 .iter()
-                .filter_map(|loaded| loaded.caps.chunks.as_ref().map(of))
+                .map(|loaded| of(&loaded.caps.chunks))
                 .min()
                 .unwrap_or(0)
         };
         let (host_chunks, disk_chunks) = (least(|c| c.host_chunks), least(|c| c.disk_chunks));
         for loaded in &mut answers {
-            if let Some(chunks) = loaded.caps.chunks.as_mut() {
-                chunks.host_chunks = host_chunks;
-                chunks.disk_chunks = disk_chunks;
-            }
+            loaded.caps.chunks.host_chunks = host_chunks;
+            loaded.caps.chunks.disk_chunks = disk_chunks;
         }
         // a rank's facts (codegen backend, pools) exist only once it has loaded;
         // the snapshot taken at open was empty, and a group that keeps it says
@@ -533,11 +529,6 @@ impl Engine for Group {
     fn copy_kv(&mut self, copy: &KvCopy) -> EngineResult<()> {
         let copy = copy.clone();
         self.lead(move |rank| rank.copy_kv(&copy))
-    }
-
-    fn copy_state(&mut self, copy: &StateCopy) -> EngineResult<()> {
-        let copy = copy.clone();
-        self.lead(move |rank| rank.copy_state(&copy))
     }
 
     /// Each rank moves its band of every slot to and from its own tiers

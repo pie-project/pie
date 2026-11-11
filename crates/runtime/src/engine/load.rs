@@ -579,45 +579,6 @@ pub fn request(
     })
 }
 
-#[cfg(feature = "engine-cuda")]
-#[must_use]
-pub fn sequence(trace: &Trace) -> Option<Vec<String>> {
-    let at: std::collections::BTreeMap<&str, usize> = trace
-        .params
-        .iter()
-        .enumerate()
-        .map(|(at, param)| (param.name.as_str(), at))
-        .collect();
-    let mut pairings = engine_cuda::experts::Attachments::new();
-    for (codes, param) in trace.params.iter().enumerate() {
-        let mut companions = Vec::new();
-        if let Some(&scales) = at.get(poem::scales_name(&param.name).as_str()) {
-            companions.push(scales);
-        }
-        if let Some(&biases) = at.get(poem::biases_name(&param.name).as_str()) {
-            companions.push(biases);
-        }
-        if !companions.is_empty() {
-            pairings.insert(codes, companions);
-        }
-    }
-    let ranking = engine_cuda::experts::Ranking::of(trace, &pairings).ok()?;
-    Some(
-        ranking
-            .images()
-            .into_iter()
-            .filter_map(|(param, ..)| trace.params.get(param as usize))
-            .map(|param| param.name.clone())
-            .collect(),
-    )
-}
-
-#[cfg(not(feature = "engine-cuda"))]
-#[must_use]
-pub fn sequence(_trace: &Trace) -> Option<Vec<String>> {
-    None
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;

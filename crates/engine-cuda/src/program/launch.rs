@@ -51,8 +51,6 @@ pub const INTRINSIC_STORAGE_RAW_I32: u32 = 3;
 
 pub const BOOL_STORAGE_NATIVE_BYTES: u32 = 0;
 
-pub const BOOL_STORAGE_WIRE_PACKED: u32 = 1;
-
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 #[repr(C)]
 pub struct CudaOpParams {

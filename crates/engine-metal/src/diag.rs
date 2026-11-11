@@ -47,7 +47,6 @@ pub struct Diagnostics {
     pub streamed_trace: bool,
     pub kernel_profile: Profile,
     pub kernel_dump: Option<PathBuf>,
-    pub route_dump: Option<PathBuf>,
     pub keepalive: bool,
     pub scratch_no_zero: bool,
     pub host_rows: bool,
@@ -75,7 +74,6 @@ impl Default for Diagnostics {
             streamed_trace: false,
             kernel_profile: Profile::Off,
             kernel_dump: None,
-            route_dump: None,
             keepalive: true,
             scratch_no_zero: false,
             host_rows: false,
@@ -119,7 +117,7 @@ fn number<T: std::str::FromStr>(word: &str, value: &str) -> std::result::Result<
 
 const WORDS: &str = "`tier-trace`, `rs-trace`, `fire-trace`, \
      `region-trace`, `streamed-trace`, `kernel-profile[=1|2]`, \
-     `nan-check`, `nan-limit=<float>`, `kernel-dump=<dir>`, `route-dump=<file>`, \
+     `nan-check`, `nan-limit=<float>`, `kernel-dump=<dir>`, \
      `keepalive=off`, `scratch-no-zero`, `host-rows`, `prefault`, `copy-resident`, \
      `keepalive-iters=<n>`, \
      `window-ceiling=<bytes>`, `streamed-groups=<n>`, `streamed-repeat=<n>`, \
@@ -188,14 +186,11 @@ impl std::str::FromStr for Diagnostics {
                         }
                     });
                 }
-                "kernel-dump" | "route-dump" => {
+                "kernel-dump" => {
                     if value.is_empty() {
                         return Err(format!("`{word}` takes a path: `{word}=<path>`"));
                     }
-                    match word {
-                        "kernel-dump" => diag.kernel_dump = Some(PathBuf::from(value)),
-                        _ => diag.route_dump = Some(PathBuf::from(value)),
-                    }
+                    diag.kernel_dump = Some(PathBuf::from(value));
                 }
                 "keepalive-iters" => diag.keepalive_iters = Some(number(word, value)?),
                 "window-ceiling" => {

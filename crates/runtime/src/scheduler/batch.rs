@@ -17,7 +17,6 @@ pub(crate) struct StepBuild {
     pub(crate) member_lane_indptr: Vec<u32>,
     pub(crate) terminal_cells: Vec<CellPtr>,
     pub(crate) completions: Vec<crate::engine::WorkItemCompletion>,
-    pub(crate) logical_fire_ids: Vec<u64>,
 }
 
 #[derive(Debug, Clone, Copy, Default)]
@@ -138,7 +137,6 @@ pub(crate) fn build_batch_request(
         let mut boundary_programs = Vec::with_capacity(requests.len());
         let mut terminal_cells = Vec::with_capacity(requests.len());
         let mut completions = Vec::with_capacity(requests.len());
-        let mut logical_fire_ids = Vec::with_capacity(requests.len());
         let mut member_lane_indptr = Vec::with_capacity(requests.len() + 1);
         member_lane_indptr.push(0);
         let mut media: Vec<engine::fire::StepMedia> = Vec::new();
@@ -153,7 +151,6 @@ pub(crate) fn build_batch_request(
             instance_ids.push(req.instance_id);
             terminal_cells.push(req.completion.terminal_cell_ptr());
             completions.push(req.completion.clone());
-            logical_fire_ids.push(req.logical_fire_id);
             let base = u32::try_from(lanes.len()).unwrap_or(u32::MAX);
             let mut own: Vec<u32> = Vec::new();
             lanes.extend(req.request.lanes.iter().cloned().map(|mut lane| {
@@ -187,7 +184,6 @@ pub(crate) fn build_batch_request(
             member_lane_indptr,
             terminal_cells,
             completions,
-            logical_fire_ids,
         }
     })
 }
@@ -313,7 +309,6 @@ pub(crate) fn build_frame_submission(
             terminal_cells: build.terminal_cells,
             completions: build.completions,
             instances,
-            logical_fire_ids: build.logical_fire_ids,
         });
         flattened.extend(group);
     }

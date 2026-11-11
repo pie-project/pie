@@ -376,13 +376,6 @@ fn attn_tiles(
     ])
 }
 
-/// A Gated DeltaNet grid's state words a PE for lane slot `b`: its conv
-/// window (`cst`) and its recurrent state row (`st`), lane-major.
-#[must_use]
-pub fn state_symbols(h: &Hybrid) -> [(&'static str, usize); 2] {
-    [("cst", h.window_words()), ("st", h.state_words())]
-}
-
 #[cfg(test)]
 mod tests {
     use crate::spatial::codegen::Design;

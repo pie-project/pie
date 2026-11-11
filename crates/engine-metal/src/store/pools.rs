@@ -1093,11 +1093,6 @@ impl Pools {
         self.pool.high_water_bytes()
     }
 
-    #[must_use]
-    pub fn is_elastic(&self) -> bool {
-        self.pool.is_sparse()
-    }
-
     /// The cache table one fire binds; `q8` reads every kv pool through the
     /// 8-bit attention kernels.
     pub fn table(&self, handles: &Handles, seats: &Seats, q8: bool) -> Result<CacheTable> {
@@ -1517,12 +1512,6 @@ impl Pools {
     /// file, `pages[i]` with `slots[i]`.
     pub fn spill_kv(&mut self, to_disk: bool, pages: &[u32], slots: &[u32]) -> Result<()> {
         self.spill(LIST, to_disk, pages, slots)
-    }
-
-    /// Copies whole record pieces (slot refs) between the pool and the
-    /// slot file.
-    pub fn park_state(&mut self, out: bool, device: &[u32], rows: &[u32]) -> Result<()> {
-        self.spill(FIXED, out, device, rows)
     }
 
     /// Checks what a fire touches is committed: `demand`'s kv pages and

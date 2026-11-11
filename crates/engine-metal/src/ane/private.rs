@@ -85,7 +85,6 @@ pub struct Private {
     /// How many MLPs have been handed to the Neural Engine.
     splits: AtomicU64,
     /// How many projections have.
-    column_splits: AtomicU64,
     /// The fewest rows handed over (`kernel.ane.min_rows`).
     min_rows: u32,
     _buffers: Vec<Buffer>,
@@ -523,7 +522,6 @@ pub fn load(
         keys,
         status: status_host,
         splits: AtomicU64::new(0),
-        column_splits: AtomicU64::new(0),
         _buffers: keep,
     }))
 }
@@ -566,12 +564,6 @@ impl Private {
     #[must_use]
     pub fn splits(&self) -> u64 {
         self.splits.load(Ordering::Acquire)
-    }
-
-    /// How many projections it has.
-    #[must_use]
-    pub fn column_splits(&self) -> u64 {
-        self.column_splits.load(Ordering::Acquire)
     }
 
     /// The leading rows of a fire the Neural Engine takes an MLP's share of:
@@ -723,7 +715,6 @@ impl Private {
             let binding = &program.evaluations[plan.evaluation].1[(plan.layer & 1) as usize];
             self.handoff
                 .start(ctx, &program.program, binding, plan.at)?;
-            self.column_splits.fetch_add(1, Ordering::AcqRel);
         }
         Ok(())
     }

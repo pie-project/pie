@@ -1,9 +1,7 @@
-use kernels_cuda::Tensor;
 use kernels_cuda::attn::qkv_append;
-use kernels_cuda::synth::Plane;
 use poem_exec::{DispatchFused, KernelError};
 use poem_ir::{Fused, Operands};
-use poem_ir::{NormAxis, NormWeight, ValueId};
+use poem_ir::{NormAxis, NormWeight};
 
 use crate::run::Run;
 

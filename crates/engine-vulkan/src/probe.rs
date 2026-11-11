@@ -18,12 +18,6 @@ fn slot() -> &'static Mutex<Option<PathBuf>> {
     DIR.get_or_init(|| Mutex::new(None))
 }
 
-pub fn dump_to(dir: impl Into<PathBuf>) {
-    let dir = dir.into();
-    let _ = std::fs::create_dir_all(&dir);
-    *slot().lock().expect("lock poisoned") = Some(dir);
-}
-
 pub fn stop() {
     *slot().lock().expect("lock poisoned") = None;
 }

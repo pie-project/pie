@@ -25,7 +25,7 @@ use std::path::{Path, PathBuf};
 use checkpoint::contract::ModelContract;
 use engine::Engine;
 use engine::adapter::AdapterRegistration;
-use engine::caps::{Capabilities, DeviceFacts, FireLimits, KvCopyDomains};
+use engine::caps::{Capabilities, DeviceFacts, FireLimits};
 use engine::channel::{ChannelId, ChannelRegistration, RegisteredChannel};
 use engine::error::{Error, Result as EngineResult};
 use engine::fire::{
@@ -33,7 +33,7 @@ use engine::fire::{
 };
 use engine::load::{Budgets as LoadBudgets, Checkpoint, LoadFacts, LoadRequest, Loaded};
 use engine::program::{BoundInstance, InstanceBinding, InstanceId, ProgramId, ProgramRegistration};
-use engine::transfer::{KvCopy, MemoryDomain, StateCopy};
+use engine::transfer::{KvCopy, MemoryDomain};
 use eta_ir::registry::{GeometryClass, PortMask, Stage};
 use poem_compiler::{Budget, PATCH_LATTICE_FLOOR, PatchLadder};
 use poem_ir::Trace;
@@ -413,7 +413,7 @@ impl Engine for Xla {
                 codegen_backend: None,
             },
             pools,
-            chunks: Some(chunks),
+            chunks,
             limits: FireLimits {
                 max_lanes: budgets.max_lanes,
                 max_tokens: budgets.max_tokens,
@@ -434,12 +434,6 @@ impl Engine for Xla {
                 .with(eta_ir::registry::Port::AttnMask)
                 .with(eta_ir::registry::Port::Fold),
             geometry: GeometryClass::DeviceGeometry,
-            kv_copy: KvCopyDomains {
-                device_to_device: true,
-                device_to_host: false,
-                host_to_device: false,
-                host_to_host: false,
-            },
             kv_handle: None,
             media_encode: false,
             device_channel_commit: true,
@@ -661,19 +655,6 @@ impl Engine for Xla {
             shell.copy_slots(&pairs).map_err(fault)?;
         }
         Ok(())
-    }
-
-    /// A record is copied by naming a copy-on-write slot in `Lane::fixed`
-    /// (CONTRACT-BC 8); no state moves by ids outside the pool.
-    fn copy_state(&mut self, copy: &StateCopy) -> EngineResult<()> {
-        if copy.moves.is_empty() && copy.pages.is_empty() {
-            return Ok(());
-        }
-        Err(Error::Unsupported {
-            verb: "`copy_state` (records copy by `Lane::fixed` copy-on-write slots, rs list \
-                   slots by `Lane::slot_copies`)",
-            engine: "xla",
-        })
     }
 
     /// The pool is fixed at load: one segment, committed whole.

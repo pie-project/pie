@@ -708,11 +708,6 @@ impl Pools {
         &self.records
     }
 
-    /// The fixed shapes and their pieces.
-    pub fn fixed_shapes(&self) -> impl Iterator<Item = (ShapeId, u32)> + '_ {
-        self.layout.fixed().map(|s| (s.id, s.pieces()))
-    }
-
     /// The page tables a fire stages, by whether each pages the window
     /// list: the kv list's first (the All axis's), then the window list's.
     /// A model keeping only windowed rows reads its All axis off the window
