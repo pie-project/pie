@@ -361,6 +361,15 @@ impl Body {
         Ok(self.op1("math.exp", &[v], "fastmath = #arith.fastmath<none>", t))
     }
 
+    /// `1 / √v` elementwise.
+    pub fn rsqrt(&mut self, v: V) -> Built<V> {
+        let t = self.ty(v).clone();
+        if !matches!(&t, MTy::Vector(_, e) if e.is_float()) {
+            return bad(format!("rsqrt of {t}"));
+        }
+        Ok(self.op1("math.rsqrt", &[v], "fastmath = #arith.fastmath<none>", t))
+    }
+
     /// `v` rotated along `axis` by the i32 `by` (`tpu.dynamic_rotate`):
     /// element `i` moves to `(i + by) mod n`.
     pub fn rotate(&mut self, v: V, by: V, axis: usize) -> Built<V> {

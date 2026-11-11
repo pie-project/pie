@@ -11,7 +11,7 @@ use crate::hlo::{Built, Cmp, Elem, Fold, Func, Val};
 use crate::lanes::{Lanes, ci, clamp_i, cmp_i, count_le, full_i, iota, take};
 use crate::mosaic::{Grid, ICmp, Kernel, MTy, Operand, Sem, Space, Window};
 
-use super::{DeltaIn, GDN_EPS, Raw, Segs, l2norm};
+use super::{DeltaIn, GDN_EPS, Raw, Segs};
 
 /// `(y, slab)` over the lanes of a ragged fire, or `None` where the kernel
 /// does not apply: the GDN's heads must be 128 wide on both sides and the
@@ -101,8 +101,11 @@ pub(super) fn gdn_chunks(
     let row = f.reshape(row, &[sr])?;
     let valid = f.reshape(valid, &[sr])?;
 
-    // The chunk rows' heads: `q`, `k` per key head (normed, `q` scaled),
-    // `v`, the log decay and `β` per value head, blank rows zero.
+    // The chunk rows' `q | k | v`, f32, blank rows zero, laid as the rows
+    // are: the kernel takes each head off its rows (normed, `q` scaled), so
+    // no head-major plane is laid out for it (v5e Qwen3.5-0.8B: six layout
+    // copies a layer, 1.1 ms of a 640-row fire beside the kernel's 2.2), and
+    // the decay and `β` per value head.
     let qkv = f.take_rows(raw.rows[0], row)?;
     let qkv = f.convert(qkv, Elem::F32);
     let gates = f.take_rows(raw.rows[1], row)?;
@@ -114,19 +117,9 @@ pub(super) fn gdn_chunks(
         f.select(vb, x, zero)
     };
     let keys = hk * dk;
-    let qk = f.slice_axis(qkv, 1, 0, 2 * keys)?;
-    let qk = f.reshape(qk, &[sr, 2 * hk, dk])?;
-    let qk = l2norm(f, qk, GDN_EPS, 1.0)?;
-    let qk = blank(f, qk)?;
-    let q = f.slice_axis(qk, 1, 0, hk)?;
-    let q = f.scale(q, 1.0 / (dk as f64).sqrt())?;
-    let k = f.slice_axis(qk, 1, hk, 2 * hk)?;
-    let q = f.transpose(q, &[1, 0, 2])?;
-    let k = f.transpose(k, &[1, 0, 2])?;
-    let v = f.slice_axis(qkv, 1, 2 * keys, 2 * keys + hv * dv)?;
-    let v = f.reshape(v, &[sr, hv, dv])?;
-    let v = blank(f, v)?;
-    let v = f.transpose(v, &[1, 0, 2])?;
+    let width = 2 * keys + hv * dv;
+    let qkv = f.slice_axis(qkv, 1, 0, width)?;
+    let qkv = blank(f, qkv)?;
     let g = f.slice_axis(gates, 1, 0, hv)?;
     let g = blank(f, g)?;
     let beta = f.slice_axis(gates, 1, hv, 2 * hv)?;
@@ -139,8 +132,8 @@ pub(super) fn gdn_chunks(
     let compiled = kernel(hk, hv, dk, dv, c, nc, rows)?;
     let out = compiled.call_aliased(
         f,
-        &[first_i, last_i, slot_n, q, k, v, gcum, beta, slab],
-        &[(1, 8)],
+        &[first_i, last_i, slot_n, qkv, gcum, beta, slab],
+        &[(1, 6)],
     )?;
     let o = out[0];
 
@@ -160,8 +153,6 @@ pub(super) fn gdn_chunks(
     let pos = f.mul(ch, cvt)?;
     let pos = f.add(pos, within)?;
     let pos = clamp_i(f, pos, 0, sr - 1)?;
-    let o = f.transpose(o, &[1, 0, 2])?;
-    let o = f.reshape(o, &[sr, hv * dv])?;
     let y = f.take_rows(o, pos)?;
     let y = f.reshape(y, &[t, hv, dv])?;
     Ok(Some((y, out[1])))
@@ -179,17 +170,13 @@ fn kernel(
 ) -> Built<crate::mosaic::Compiled> {
     let sr = nc * c;
     let per = hv * dk;
-    let chunk = |array: Vec<i64>, block: Vec<i64>, at: usize, elem: Elem| Operand {
-        array,
-        elem,
-        block,
+    // A chunk's rows at a step, `w` f32 lanes a row.
+    let rowed = |w: i64| Operand {
+        array: vec![sr, w],
+        elem: Elem::F32,
+        block: vec![c, w],
         window: Window::Blocked,
-        index: Box::new(move |b, g: &Grid| {
-            let z = b.i32(0);
-            let mut idx = vec![z; 3];
-            idx[at] = g.ids[0];
-            Ok(idx)
-        }),
+        index: Box::new(|b, g: &Grid| Ok(vec![g.ids[0], b.i32(0)])),
     };
     let bank = || Operand {
         array: vec![rows, dv],
@@ -211,18 +198,8 @@ fn kernel(
         grid: vec![nc],
         semantics: vec![Sem::Arbitrary],
         prefetch: vec![vec![nc], vec![nc], vec![nc]],
-        ins: vec![
-            chunk(vec![hk, sr, dk], vec![hk, c, dk], 1, Elem::F32),
-            chunk(vec![hk, sr, dk], vec![hk, c, dk], 1, Elem::F32),
-            chunk(vec![hv, sr, dv], vec![hv, c, dv], 1, Elem::F32),
-            tokens(),
-            tokens(),
-            bank(),
-        ],
-        outs: vec![
-            chunk(vec![hv, sr, dv], vec![hv, c, dv], 1, Elem::F32),
-            bank(),
-        ],
+        ins: vec![rowed(2 * hk * dk + hv * dv), tokens(), tokens(), bank()],
+        outs: vec![rowed(hv * dv), bank()],
         vmem_limit: Some(96 << 20),
         scratch: vec![
             MTy::Ref(vec![hv, dk, dv], Elem::F32, Space::Vmem),
@@ -232,9 +209,7 @@ fn kernel(
     };
     let rep = hv / hk;
     kernel.build(|b, blk| {
-        let (q_r, k_r, v_r, g_r, b_r, bank_r) = (
-            blk.ins[0], blk.ins[1], blk.ins[2], blk.ins[3], blk.ins[4], blk.ins[5],
-        );
+        let (x_r, g_r, b_r, bank_r) = (blk.ins[0], blk.ins[1], blk.ins[2], blk.ins[3]);
         let (o_r, bank_o) = (blk.outs[0], blk.outs[1]);
         let (st, sb, sems) = (blk.scratch[0], blk.scratch[1], blk.scratch[2]);
         let n = blk.grid.ids[0];
@@ -261,9 +236,41 @@ fn kernel(
         })?;
 
         let s0 = b.vload_all(st)?;
-        let q = b.vload_all(q_r)?;
-        let k = b.vload_all(k_r)?;
-        let v = b.vload_all(v_r)?;
+        // Each head off the chunk's rows; `q`, `k` normed (each row's sum
+        // of squares across its lanes through the MXU, against ones, full
+        // precision), `q` scaled.
+        let x = b.vload_all(x_r)?;
+        let ones = b.splat_f(&[dk, dk], Elem::F32, 1.0)?;
+        let zero_cd = b.splat_f(&[c, dk], Elem::F32, 0.0)?;
+        let eps = b.splat_f(&[c, dk], Elem::F32, GDN_EPS)?;
+        let qs = b.splat_f(&[c, dk], Elem::F32, 1.0 / (dk as f64).sqrt())?;
+        let heads = |b: &mut crate::mosaic::Body,
+                     n: i64,
+                     at: i64,
+                     d: i64,
+                     norm: bool,
+                     scale: Option<crate::mosaic::V>|
+         -> Built<crate::mosaic::V> {
+            let mut hs = Vec::with_capacity(n as usize);
+            for h in 0..n {
+                let mut xh = b.slice(x, &[0, at + h * d], &[c, d])?;
+                if norm {
+                    let sq = b.mulf(xh, xh)?;
+                    let ss = b.matmul_g(sq, ones, zero_cd, 1, 0, true)?;
+                    let ss = b.addf(ss, eps)?;
+                    let inv = b.rsqrt(ss)?;
+                    xh = b.mulf(xh, inv)?;
+                }
+                if let Some(sc) = scale {
+                    xh = b.mulf(xh, sc)?;
+                }
+                hs.push(b.shape_cast(xh, &[1, c, d])?);
+            }
+            b.concat(&hs, 0)
+        };
+        let q = heads(b, hk, 0, dk, true, Some(qs))?;
+        let k = heads(b, hk, hk * dk, dk, true, None)?;
+        let v = heads(b, hv, 2 * hk * dk, dv, false, None)?;
         // The chunk's decay sums and `β`, a row per token and a lane per
         // head, turned to a row per head: as a lane-wide column per token
         // (`[H, C, 1]` stretched) and as the row itself.
@@ -331,7 +338,12 @@ fn kernel(
         let p = b.select(lower, p, zero_sq)?;
         let o2 = b.matmul_g(p, u, zero_cv, 2, 1, false)?;
         let o = b.addf(oq, o2)?;
-        b.vstore_all(o, o_r)?;
+        for h in 0..hv {
+            let oh = b.slice(o, &[h, 0, 0], &[1, c, dv])?;
+            let oh = b.shape_cast(oh, &[c, dv])?;
+            let (r0, col) = (b.index(0), b.index(h * dv));
+            b.vstore(oh, o_r, &[r0, col])?;
+        }
 
         // The state after the chunk: decayed to its end, plus `kᵀ u` with
         // each row's decay to the end.
