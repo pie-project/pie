@@ -149,7 +149,10 @@ impl ResidencyPlanner {
             if outcome.is_some() {
                 return None;
             }
-            let state = (cause == StarveCause::NoRsSlots).then_some((demand.rs, rs_free, rs_total));
+            // A shared pool routes a state shortfall as kv pages to park: an
+            // ask whose pages stand free lacked the state, and says so.
+            let state = (cause == StarveCause::NoRsSlots || !rs_free.covers(demand.rs))
+                .then_some((demand.rs, rs_free, rs_total));
             *outcome = Some(Err(PlannerError::Starved {
                 need: demand.kv_pages,
                 free,
