@@ -865,6 +865,24 @@ __device__ __forceinline__ void fp4_group_tile(const bf16* __restrict__ act, con
 #pragma unroll
         for (int nb = 0; nb < TN; ++nb) batch_hold(eset[nb]);
         u32 pairs[TN][16];
+#if defined(__gfx950__)
+        // gfx950 converts a byte's two codes (k 2j, 2j + 1: the plane's own
+        // order, which `mxfp4_lanes` keeps there) to a bf16 pair under the
+        // block's scale in one step, exactly.
+#pragma unroll
+        for (int nb = 0; nb < TN; ++nb) {
+            const u32 e = static_cast<u32>(eset[nb][0]) & 0xFFu;
+            const float sc = __builtin_bit_cast(float, e == 0 ? 0x00400000u : e << 23);
+#pragma unroll
+            for (int d = 0; d < 4; ++d) {
+                const u32 w = static_cast<u32>(wset[nb][d]);
+                pairs[nb][4 * d + 0] = __builtin_bit_cast(u32, __builtin_amdgcn_cvt_scalef32_pk_bf16_fp4(w, sc, 0));
+                pairs[nb][4 * d + 1] = __builtin_bit_cast(u32, __builtin_amdgcn_cvt_scalef32_pk_bf16_fp4(w, sc, 1));
+                pairs[nb][4 * d + 2] = __builtin_bit_cast(u32, __builtin_amdgcn_cvt_scalef32_pk_bf16_fp4(w, sc, 2));
+                pairs[nb][4 * d + 3] = __builtin_bit_cast(u32, __builtin_amdgcn_cvt_scalef32_pk_bf16_fp4(w, sc, 3));
+            }
+        }
+#else
 #pragma unroll
         for (int nb = 0; nb < TN; ++nb) {
             // The block's table: each magnitude's bf16 under its exponent
@@ -895,6 +913,7 @@ __device__ __forceinline__ void fp4_group_tile(const bf16* __restrict__ act, con
                 pairs[nb][4 * d + 3] = __builtin_amdgcn_perm(hh, lh, 0x07030602u);  // k 6, 7
             }
         }
+#endif
 #if defined(__gfx950__)
         // Two k-steps a step of the 16 x 16 x 32 core: the pair's 16 bytes
         // of a route row are one LDS read.
@@ -975,7 +994,8 @@ __device__ __forceinline__ void fp4_group_tile(const bf16* __restrict__ act, con
 // bytes 16·(l / 16) .. +16 of row l % 16 in the unit (its 32 k, one block),
 // and 64 bytes of exponents, lane l's the block l / 16 of row l % 16; each
 // 4-byte word's codes k 0 .. 3 in its bytes' low nibbles, k 4 .. 7 in their
-// high ones. A thread a 16-byte chunk of codes and its lane's exponent.
+// high ones (on gfx950 as the plane holds them, k 2j and 2j + 1 in byte j).
+// A thread a 16-byte chunk of codes and its lane's exponent.
 __global__ __launch_bounds__(256) void mxfp4_lanes(const u8* __restrict__ codes, u8* __restrict__ out_codes,
                                                    const u8* __restrict__ scales, u8* __restrict__ out_scales,
                                                    i32 rows, i32 k) {
@@ -986,8 +1006,9 @@ __global__ __launch_bounds__(256) void mxfp4_lanes(const u8* __restrict__ codes,
         const int l = static_cast<int>(c % 64);
         const long long row = strip * 16 + l % 16;
         uint4 v = *reinterpret_cast<const uint4*>(codes + row * (k / 2) + u * 64 + 16 * (l / 16));
+#if !defined(__gfx950__)
         // Each word's eight codes (k 2j low, 2j + 1 high in byte j) repacked
-        // as k j low, j + 4 high.
+        // as k j low, j + 4 high (gfx950 converts them as they are).
         u32* wv = reinterpret_cast<u32*>(&v);
 #pragma unroll
         for (int d = 0; d < 4; ++d) {
@@ -1000,6 +1021,7 @@ __global__ __launch_bounds__(256) void mxfp4_lanes(const u8* __restrict__ codes,
             }
             wv[d] = o;
         }
+#endif
         *reinterpret_cast<uint4*>(out_codes + 16 * c) = v;
         out_scales[c] = scales[row * (k / 32) + u * 4 + l / 16];
     }
