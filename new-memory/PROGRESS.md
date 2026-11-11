@@ -1256,3 +1256,23 @@ The `new-memory/` directory is bookkeeping and is removed before anything lands 
   main 3.42); hazard tracking ruled out for gemma c1 -2.1% (bisect next). Greedy tokens unchanged.
 - Held back: sc/rocm-fit and sc/e2b-fix wait for L40S's fix of the M93 combined fit (Qwen3-8B on L40S: 7196 pages
   vs pool-fit 9275 / main 9216, c64 -19%).
+
+### M103 — 2026-11-11: CUDA fit with rungs, gemma-4-E2B boots, golden_rows, Metal c1, Vulkan prefill
+- `sc/l40s-fit-rungs` (53d9f8850, L40S): a mapped range's stage reshape (rt5-rung's fit_range_whole) reserves the
+  stage fit + unheld activation + bodies' allowance, so the settled fit can take the unheld span (Qwen3-8B on L40S:
+  7196 -> 9303 pages, c64 644.9 / c256 678.8 vs main 649.2 / 687.8). Flat range unchanged (EF3). Includes
+  `sc/rocm-fit` (b9174fb11, AMD): a held load's weight chunks are out of the kv pages (MI300X 30B 106728 -> 69864
+  pages, main 69120; 34 x 31.4k fills complete; no-op on CUDA models tested).
+- `sc/e2b-fix` (b55cfba59): a captured fire's readout padding capped at its bucket (M92 put the forked carve at the
+  reservation's end; mixed bucket-256 padded 512 readout rows past a 256-row carve -> CUDA 700). gemma-4-E2B boots
+  136/136 armed.
+- `sc/rows-fix` (a08357e53): arming zeroes the weight-use reads its synthetic fires made (EF3 arms streaming loads
+  inside weight_residency; golden_rows read 1570 vs 546).
+- `sc/metal-gate` (0b853430e/dfd8f524e, ac4c6e2e2): paged planes bind at their offset into a page; in-page cell math
+  in 32-bit. Metal c1 vs main: Qwen3-0.6B -0.1%, gemma -0.7..-1.7%, Qwen3.5 -0.8%.
+- `sc/vk6` (2a7c24da8): one-segment twins of Vulkan prefill attention (serving binds one segment): Qwen3-0.6B
+  p2048 9712 vs main 9510 (+2.1%), p512 +5.6%. Vulkan 16/16 + wgpu 14/14 bitwise. A21 not applicable on
+  Vulkan / wgpu (activation arena outside the pool).
+- Verified (sm_120, release): golden_logits / by_refs / held_small / offload = base; golden_rows host/cached/mixed
+  546 reads = base; golden_buffered / submit_buffered = buffered reference; engine-cuda cuda/rocm + pie cuda +
+  workspace check clean.
