@@ -111,13 +111,13 @@ The hardware lessons of the bring-up, made checks:
 | `row_runs::RowRuns { grid, copies }` | units as `Units` | `unit_chains`; scores segments on the attention runs' rows only | `HC`, `ATT` (`ATT_ROW`, `PLAIN_ROW`) overrides: a weight / CX PE's run's dims, a weight PE's run's role | `RunCopies` per unit and run block (`w{u}a` / `w{u}w`, `gama` / `gamw`, the CY tables) |
 | `head_groups::HeadGroups { cols, rows, copies }` | the head east of the units (token loop on) | `head_rows`; per group the x chain north on the last unit (`HEAD_GROUP`), its root east, the column multicast; the embedding back up, down, west into unit 0 and down the chain; the max-reduce | `HEAD_GROUP`; slots `CHAIN_IN`, `CHAIN_OUT`, `CAST`; notes `FORWARD`, `head::ROLE`, `token_loop::TURN` | `HeadCopies` |
 
-Compositions (`family/*.rs::blocks`):
+Compositions: the composer (`compose.rs`) picks the blocks from what the layers need (`compose::Needs`, read off the layer program or a shape): attention over a layer's own cache takes `Scores`, GDN takes `Gdn` + `Onorm`, every program the head and the token loop. It places the unit snake's programs today. A need it has no block for yet (a side input, a cache read across layers, a sliding window, routed experts) leaves the program to its family's `blocks` (`family/*.rs`):
 
 | Family | Blocks | Kernels |
 |---|---|---|
-| Dense (Qwen3.5, Qwen3, Llama 3) | `Units` (snake, at most one gap slot), `Scores` when any layer attends, `Gdn` + `Onorm` when any layer is GDN, `HeadEast`, `TokenLoop` under the contract's token loop | `kernels::dense` (`weight_dense`, `ctl_cx`, `ctl_cy_dense`) + `head` + `common::RELAY` |
+| Dense (Qwen3.5, Qwen3, Llama 3; composed) | `Units` (snake, at most one gap slot), `Scores` when any layer attends, `Gdn` + `Onorm` when any layer is GDN, `HeadEast`, `TokenLoop` under the contract's token loop | `kernels::dense` (`weight_dense`, `ctl_cx`, `ctl_cy_dense`) + `head` + `common::RELAY` |
 | gpt-oss | `MoeUnits` (a snake starting upward), `AttnScores`, `Router`, `Band`, `BandLoop` | `kernels::gptoss` (`wa`, `wm`, `cx`, `cya`, `cym`, the band head; `head_ctl.csl` with the bus reserved) |
-| Gemma 4 E2B / E4B | `Units` (explicit origins: the arrangement its unit shape names), `Scores` (a half row), `Ple`, `SharedKv`, `HeadEast`, `TokenLoop` | `kernels::gemma` (`weight_gemma`, `ctl_cx_gemma`, `ctl_cy_gemma`, `head_ctl_gemma`, `ple_gemma`) + `head::HEAD_PE` |
+| Gemma 4 E2B / E4B | `Units` (explicit origins: the arrangement its unit shape names), `Scores` (a half row), `Ple`, `SharedKv`, `HeadEast`, `TokenLoop` | `kernels::gemma` (`weight_gemma`, `ctl_cx_gemma`, `ctl_cy_gemma`, `head_ctl` (token bus on), `ple_gemma`) + `head::HEAD_PE` |
 | Gemma 4 12B | `RowRuns` (explicit origins, attention / plain row runs), `HeadGroups` | `kernels::gemma12` (`weight_gemma12`, `ctl_cx_gemma12`, `ctl_cy_gemma12`, `head_gemma12`) + `head::HEAD_CTL` |
 
 ## Kernels and their ABI
