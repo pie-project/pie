@@ -753,7 +753,7 @@ fn host_cache_goes_on_down_to_disk_and_a_restart_brings_it_back_bitwise() {
         pages.into_iter().map(KvPageBacking::Resident).collect(),
     ));
     // The device wants room: it goes to the host, not journaled.
-    let txn = kv.prepare_demote(64, |_| 0).unwrap().expect("a demote");
+    let txn = kv.prepare_demote(64, |_| 1).unwrap().expect("a demote");
     for (tier, copy) in kv_copies(&txn, true) {
         assert_eq!(tier, MemoryDomain::HostPinned);
         bytes.copy(&copy);
@@ -765,7 +765,7 @@ fn host_cache_goes_on_down_to_disk_and_a_restart_brings_it_back_bitwise() {
     assert_eq!(kv.host_cache_pages(), 3);
 
     // The host is short: it goes on down to disk.
-    let txn = kv.prepare_spill(1, |_| 0).expect("a spill");
+    let txn = kv.prepare_spill(1, |_| 1).expect("a spill");
     assert_eq!(txn.shape(), LIST);
     let (host, disk) = txn.copy_plan();
     let copy = TierMove {

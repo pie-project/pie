@@ -20,7 +20,7 @@ use page_table::{
 use write::{KvPreparedWrite, PageCommit, PreparedTarget};
 
 use crate::inferlet::process::ProcessId;
-use crate::policy::retention::Keys;
+use crate::policy::retention::{self, Keys};
 use crate::policy::{By, Event};
 use crate::rt::Instant;
 use crate::store::chunks::{ShapePool, ShapeRun};
@@ -946,7 +946,9 @@ impl KvStore {
     /// Moves idle cache off the device, host first and what the host
     /// cannot take to disk (as a suspend's pages go), lowest retention key
     /// first: one group, up to `room` pages. A persistent disk tier keeps
-    /// what lands on disk as its copies, journaled.
+    /// what lands on disk as its copies, journaled. Only cache keyed above
+    /// the retention floor ([`retention::above_floor`]) moves: the rest is
+    /// dropped when its room is wanted, never copied down.
     pub fn prepare_demote(
         &mut self,
         room: usize,
@@ -963,6 +965,9 @@ impl KvStore {
         for last in [false, true] {
             let mut later = Vec::new();
             for (key, ids) in std::mem::take(&mut groups) {
+                if !retention::above_floor(key) {
+                    continue;
+                }
                 if !last && !self.table.frees_device_pages(&self.roots(&ids)) {
                     later.push((key, ids));
                     continue;
@@ -1089,8 +1094,10 @@ impl KvStore {
     /// tier a group goes whole or not at all (a run split over host and
     /// disk would leave its disk tail an orphan at restart), so more than
     /// `wanted` may go; what lands is journaled. Only a shared pool's kv
-    /// list moves host -> disk (CONTRACT-BC 22). `None` when nothing is
-    /// left to copy.
+    /// list moves host -> disk (CONTRACT-BC 22), and only cache keyed above
+    /// the retention floor is copied: floor-keyed cache on the host is
+    /// dropped when the host's room is wanted (`prepare_suspend`). `None`
+    /// when nothing is left to copy.
     pub fn prepare_spill(&mut self, wanted: usize, keys: impl Keys) -> Option<KvSpillTxn> {
         let shape = self.shape?;
         let mut room = self.disk_pool.available();
@@ -1108,7 +1115,7 @@ impl KvStore {
             let mut group = self.table.cache_only_host_slots(&self.roots(&ids), &above);
             group.retain(|(location, _)| !taken.contains(location));
             self.settle_host_on_disk(&mut group);
-            if group.is_empty() {
+            if group.is_empty() || !retention::above_floor(key) {
                 continue;
             }
             let kept = self.demote_records(&ids, group.iter().map(|&(at, _)| at), key);
