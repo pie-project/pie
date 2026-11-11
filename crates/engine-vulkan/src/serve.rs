@@ -3739,6 +3739,28 @@ impl engine::frame::Shell for Shell {
             && prepared.seats.iter().map(|seat| seat.rows).sum::<u32>() >= split_rows)
             || prepared.bindings.voxels.is_some();
         let keep = key.filter(|_| !split && self.recorder.has_room());
+        // TEMP-RECSTAT
+        {
+            use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
+            static WALKS: AtomicU64 = AtomicU64::new(0);
+            static UNREC: AtomicU64 = AtomicU64::new(0);
+            static UNKEYED: AtomicU64 = AtomicU64::new(0);
+            let n = WALKS.fetch_add(1, Relaxed) + 1;
+            if keep.is_none() {
+                UNREC.fetch_add(1, Relaxed);
+            }
+            if key.is_none() {
+                UNKEYED.fetch_add(1, Relaxed);
+            }
+            if n % 64 == 0 && std::env::var_os("PIE_VK_RECSTAT").is_some() {
+                let (rec, rep) = self.recorder.counts();
+                eprintln!(
+                    "recstat: walks {n} unrecorded {} unkeyed {} recorded {rec} replayed {rep}",
+                    UNREC.load(Relaxed),
+                    UNKEYED.load(Relaxed)
+                );
+            }
+        }
         let walked = self.walk_once(&prepared, keep.is_some(), split)?;
         let mut frame = walked.frame.expect("the walk opened a frame");
 
