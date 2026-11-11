@@ -708,11 +708,6 @@ impl Engine for Cuda {
                 }),
                 window_tokens: paging.window.map_or(0, |window| window.tokens),
                 host_kv_pages,
-                // State parks in the host tier's chunks (CONTRACT-BC 22),
-                // stated in `chunks`, not in host rows of its own.
-                host_window_pages: 0,
-                host_state_slots: 0,
-                host_buffer_pages: 0,
                 disk_kv_pages,
                 disk_kv_persistent: residency.disk_kv_persistent && disk_kv_pages > 0,
                 disk_kv_kept: shell.disk_kv_kept(),
@@ -1165,13 +1160,13 @@ impl Engine for Cuda {
     fn write_host_kv(&mut self, slots: &[u32], bytes: &[u8]) -> EngineResult<()> {
         self.loaded_mut()?
             .write_host_kv(slots, bytes)
-        // The host and disk tiers move through `copy_slots` (CONTRACT-BC
-        // 22): a kv copy is within the device.
             .map_err(fault)
     }
 
     fn copy_kv(&mut self, copy: &KvCopy) -> EngineResult<()> {
         copy.validate()?;
+        // The host and disk tiers move through `copy_slots` (CONTRACT-BC
+        // 22): a kv copy is within the device.
         let device = self.caps.as_ref().map(|caps| caps.device.domain);
         if device.is_none_or(|device| copy.src != device || copy.dst != device) {
             return Err(Error::Unsupported {

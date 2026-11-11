@@ -648,7 +648,7 @@ mod tests {
     }
 
     fn first_fire_resets_then_continues_in_place() {
-        let mut store = RsStore::new(4, 4, 0, 0);
+        let mut store = RsStore::new(4, 4);
         let ws = store.create_working_set(geom());
 
         let out = prepare(&mut store, ws, 6).unwrap();
@@ -668,7 +668,7 @@ mod tests {
     }
 
     fn rows_past_the_state_are_buffered_at_their_slots() {
-        let mut store = RsStore::new(8, 8, 0, 0);
+        let mut store = RsStore::new(8, 8);
         let ws = warm(&mut store, 5);
         let out = prepare_many(
             &mut store,
@@ -698,7 +698,7 @@ mod tests {
     }
 
     fn a_host_fold_freezes_when_the_fire_publishes() {
-        let mut store = RsStore::new(8, 8, 0, 0);
+        let mut store = RsStore::new(8, 8);
         let ws = warm(&mut store, 4);
         let out = prepare_many(
             &mut store,
@@ -724,7 +724,7 @@ mod tests {
     }
 
     fn lanes_sharing_a_working_set_read_the_state_one_of_them_folds() {
-        let mut store = RsStore::new(8, 8, 0, 0);
+        let mut store = RsStore::new(8, 8);
         let ws = warm(&mut store, 4);
         let held = store.folded_slot(ws).unwrap().unwrap();
         let out = prepare_many(
@@ -763,7 +763,7 @@ mod tests {
     }
 
     fn a_device_fold_lowers_to_its_port_and_waits_for_its_report() {
-        let mut store = RsStore::new(8, 8, 0, 0);
+        let mut store = RsStore::new(8, 8);
         let ws = warm(&mut store, 4);
         let out = prepare_many(
             &mut store,
@@ -790,7 +790,7 @@ mod tests {
     }
 
     fn demand_counts_the_state_copy_and_the_pages() {
-        let mut store = RsStore::new(8, 8, 0, 0);
+        let mut store = RsStore::new(8, 8);
         let ws = warm(&mut store, 4);
         let shared = group(vec![0, 1], 4..12, GroupFold::Host(2));
         assert_eq!(
@@ -815,7 +815,7 @@ mod tests {
     }
 
     fn a_forked_state_lowers_its_copy_as_the_lane_row() {
-        let mut store = RsStore::new(16, 16, 0, 0);
+        let mut store = RsStore::new(16, 16);
         let parent = warm(&mut store, 2);
         let child = store.fork(parent).unwrap();
 

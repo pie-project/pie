@@ -220,14 +220,11 @@ impl RsGrant {
     }
 }
 
-/// In the engine's numbering: each kind from 0. A shared pool's move is
-/// stated by slot shape instead (CONTRACT-BC 22): `shared` holds, for each
-/// shape, the `(device, host)` slot refs it moves, a record's every piece
-/// of every fixed shape, and `slots`/`pages` are empty.
+/// A move between a shared pool and its host tier, stated by slot shape
+/// (CONTRACT-BC 22): for each shape, the `(device, host)` slot refs it
+/// moves, a record's every piece of every fixed shape.
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct RsCopyPlan {
-    pub slots: Vec<(u32, u32)>,
-    pub pages: Vec<(u32, u32)>,
     pub shared: Vec<(::engine::chunk::ShapeId, Vec<(u32, u32)>)>,
 }
 
@@ -263,17 +260,11 @@ pub struct RsResidencyTxn {
     scope: Vec<RsWorkingSetId>,
     moves: Vec<(RsSlotId, RsSlotId)>,
     plan: RsCopyPlan,
-    window: bool,
 }
 
 impl RsResidencyTxn {
     pub fn copy_plan(&self) -> &RsCopyPlan {
         &self.plan
-    }
-
-    /// The moves are windowed kv pages, copied through the kv planes.
-    pub fn is_window(&self) -> bool {
-        self.window
     }
 }
 
@@ -340,26 +331,19 @@ struct RsCheckpoint {
 
 impl RsStore {
     #[cfg(test)]
-    pub fn new(slots: u32, pages: u32, host_slots: u32, host_pages: u32) -> Self {
-        Self::fixed(0, slots, 0, pages, host_slots, host_pages)
+    pub fn new(slots: u32, pages: u32) -> Self {
+        Self::fixed(0, slots, 0, pages)
     }
 
     /// The fixed shapes' pools: state slots of `slot_bytes` and buffer
-    /// pages of `page_bytes`, on the device and the host.
-    fn fixed(
-        slot_bytes: u64,
-        slots: u32,
-        page_bytes: u64,
-        pages: u32,
-        host_slots: u32,
-        host_pages: u32,
-    ) -> Self {
+    /// pages of `page_bytes`, on the device alone.
+    fn fixed(slot_bytes: u64, slots: u32, page_bytes: u64, pages: u32) -> Self {
         let host = slots + pages;
         Self::build(
             ShapePool::new(ShapeKind::Fixed, slot_bytes, 0, slots),
             ShapePool::new(ShapeKind::Fixed, page_bytes, slots, pages),
-            ShapePool::new(ShapeKind::Fixed, slot_bytes, host, host_slots),
-            ShapePool::new(ShapeKind::Fixed, page_bytes, host + host_slots, host_pages),
+            ShapePool::new(ShapeKind::Fixed, slot_bytes, host, 0),
+            ShapePool::new(ShapeKind::Fixed, page_bytes, host, 0),
             slots,
             Vec::new(),
             Vec::new(),
@@ -367,49 +351,31 @@ impl RsStore {
     }
 
     /// A store for a model whose state is one window list of `geom`:
-    /// `pages` window pages (0 the null page every page behind a window
-    /// reads) and `host_pages` host ones a suspended window parks on.
+    /// `pages` window pages, 0 the null page every page behind a window
+    /// reads.
     #[cfg(test)]
-    pub fn new_window(geom: WindowGeometry, pages: u32, host_pages: u32) -> Self {
-        Self::windowed(geom, 0, pages, host_pages)
-    }
-
-    fn windowed(geom: WindowGeometry, page_bytes: u64, pages: u32, host_pages: u32) -> Self {
+    pub fn new_window(geom: WindowGeometry, pages: u32) -> Self {
         let host = pages.max(1);
         Self::build(
             ShapePool::new(ShapeKind::Fixed, 0, 0, 0),
-            ShapePool::new(ShapeKind::List, page_bytes, 1, pages.saturating_sub(1)),
+            ShapePool::new(ShapeKind::List, 0, 1, pages.saturating_sub(1)),
             ShapePool::new(ShapeKind::Fixed, 0, host, 0),
-            ShapePool::new(ShapeKind::List, page_bytes, host, host_pages),
+            ShapePool::new(ShapeKind::List, 0, host, 0),
             0,
             vec![geom],
             Vec::new(),
         )
     }
 
-    /// The store `pools` states: a window list where there is a window,
-    /// else the state slots and buffer pages.
+    /// The store pinned pools state: the state slots and buffer pages, on
+    /// the device alone (the one engine on pinned pools parks no state).
     pub fn of(pools: &StorePools) -> Self {
-        if pools.window_tokens > 0 {
-            Self::windowed(
-                WindowGeometry {
-                    window: pools.window_tokens,
-                    tokens: pools.page_size,
-                },
-                pools.window.slot_bytes,
-                pools.window_pages(),
-                pools.window.host,
-            )
-        } else {
-            Self::fixed(
-                pools.state.slot_bytes,
-                pools.state.device,
-                pools.buffer.slot_bytes,
-                pools.buffer.device,
-                pools.state.host,
-                pools.buffer.host,
-            )
-        }
+        Self::fixed(
+            pools.state.slot_bytes,
+            pools.state.device,
+            pools.buffer.slot_bytes,
+            pools.buffer.device,
+        )
     }
 
     /// The store an engine's shared pool backs: where there are window lists,
@@ -2212,6 +2178,8 @@ impl RsStore {
         working_sets: &HashSet<RsWorkingSetId>,
         moves: Vec<(RsSlotId, RsSlotId)>,
     ) -> RsResidencyTxn {
+        // Only a shared pool has host rows to move to (CONTRACT-BC 22).
+        debug_assert!(self.is_shared() || moves.is_empty());
         let mut plan = RsCopyPlan::default();
         for &(from, to) in &moves {
             let (device, host) = if self.is_host(from) {
@@ -2219,34 +2187,24 @@ impl RsStore {
             } else {
                 (from, to)
             };
-            if self.is_shared() {
-                let host_refs = self.host_pool_of(host).slot_refs(host);
-                for ((shape, device), (_, host)) in self
-                    .pool_of(device)
-                    .slot_refs(device)
-                    .into_iter()
-                    .zip(host_refs)
-                {
-                    let pairs: Vec<(u32, u32)> = device.into_iter().zip(host).collect();
-                    match plan.shared.iter_mut().find(|(at, _)| *at == shape) {
-                        Some((_, all)) => all.extend(pairs),
-                        None => plan.shared.push((shape, pairs)),
-                    }
+            let host_refs = self.host_pool_of(host).slot_refs(host);
+            for ((shape, device), (_, host)) in self
+                .pool_of(device)
+                .slot_refs(device)
+                .into_iter()
+                .zip(host_refs)
+            {
+                let pairs: Vec<(u32, u32)> = device.into_iter().zip(host).collect();
+                match plan.shared.iter_mut().find(|(at, _)| *at == shape) {
+                    Some((_, all)) => all.extend(pairs),
+                    None => plan.shared.push((shape, pairs)),
                 }
-                continue;
-            }
-            let pair = (self.engine_id(device), self.engine_id(host));
-            if self.is_page(device) {
-                plan.pages.push(pair);
-            } else {
-                plan.slots.push(pair);
             }
         }
         RsResidencyTxn {
             scope: working_sets.iter().copied().collect(),
             moves,
             plan,
-            window: self.is_window(),
         }
     }
 

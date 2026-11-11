@@ -1380,17 +1380,6 @@ impl Shell {
         self.pools.seat_tier(budget);
     }
 
-    #[must_use]
-    pub fn parked_state_slots(&self) -> u32 {
-        self.pools.parked_slots()
-    }
-
-    /// No rs buffer pages: the buffer's rows live in the records.
-    #[must_use]
-    pub fn parked_buffer_pages(&self) -> u32 {
-        0
-    }
-
     /// No rs buffer pages: the buffer's rows live in the records.
     #[must_use]
     pub fn buffer_pages(&self) -> u32 {

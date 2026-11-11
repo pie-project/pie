@@ -64,19 +64,11 @@ pub struct PoolFacts {
     #[serde(default)]
     pub window_tokens: u32,
     /// The tiers below the device: host pages kv can be suspended into by
-    /// `kv_copy`, host windowed pages for a ring's pages, the state slots and
-    /// buffer pages a `StateCopy` may park in (host memory, or slot files on
-    /// an engine with no host tier), and slot-file pages `kv_copy` serves to
-    /// and from `MemoryDomain::LocalDisk`. Zero means the engine serves no
-    /// such copies.
+    /// `kv_copy`, and slot-file pages `kv_copy` serves to and from
+    /// `MemoryDomain::LocalDisk`. Zero means the engine serves no such
+    /// copies.
     #[serde(default)]
     pub host_kv_pages: u32,
-    #[serde(default)]
-    pub host_window_pages: u32,
-    #[serde(default)]
-    pub host_state_slots: u32,
-    #[serde(default)]
-    pub host_buffer_pages: u32,
     #[serde(default)]
     pub disk_kv_pages: u32,
     /// The slot files are kept across runs (`disk_kv_persistent`).
@@ -110,9 +102,6 @@ impl PoolFacts {
     pub fn least_tiers(&mut self, ranks: impl Iterator<Item = PoolFacts>) {
         for rank in ranks {
             self.host_kv_pages = self.host_kv_pages.min(rank.host_kv_pages);
-            self.host_window_pages = self.host_window_pages.min(rank.host_window_pages);
-            self.host_state_slots = self.host_state_slots.min(rank.host_state_slots);
-            self.host_buffer_pages = self.host_buffer_pages.min(rank.host_buffer_pages);
             self.disk_kv_pages = self.disk_kv_pages.min(rank.disk_kv_pages);
             self.disk_kv_persistent &= rank.disk_kv_persistent;
             self.disk_kv_kept &= rank.disk_kv_kept;

@@ -235,37 +235,12 @@ pub struct StateMove {
     pub token_count: u32,
 }
 
-/// Host ids index `host_state_slots` and `host_buffer_pages`, wherever the
-/// engine keeps them.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
-pub enum StateDirection {
-    #[default]
-    DeviceToDevice,
-    DeviceToHost,
-    HostToDevice,
-}
-
 #[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub struct StateCopy {
     pub moves: Vec<StateMove>,
     /// Buffer pages, moved whole: the ids name pages.
     #[serde(default)]
     pub pages: Vec<StateMove>,
-    #[serde(default)]
-    pub direction: StateDirection,
-}
-
-impl StateCopy {
-    /// Refuses a copy to or from host slots on `engine`, which reserves none.
-    pub fn device_only(&self, engine: &'static str) -> crate::Result<()> {
-        if self.direction == StateDirection::DeviceToDevice {
-            return Ok(());
-        }
-        Err(crate::Error::Unsupported {
-            verb: "`copy_state` to or from host slots, which this load does not reserve",
-            engine,
-        })
-    }
 }
 
 #[cfg(test)]

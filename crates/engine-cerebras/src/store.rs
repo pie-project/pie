@@ -229,10 +229,9 @@ pub fn pool_demand(trace: &Trace, paging: Paging) -> Result<u64> {
     Ok(total)
 }
 
-/// One page's bytes in each pool [`pool_demand`] counts, its arithmetic per
-/// page: a kv page across the full pool's planes (compressor planes too),
-/// a windowed page across the windowed pool's, an rs buffer page across
-/// the recurrent-verb planes.
+/// One page's bytes in the pools the degenerate facts state: a kv page
+/// across the full pool's planes (compressor planes too), an rs buffer page
+/// across the recurrent-verb planes.
 pub fn page_bytes(trace: &Trace, paging: Paging) -> Result<engine::chunk::DegenerateBytes> {
     let page = u64::from(paging.page_size);
     let mut bytes = engine::chunk::DegenerateBytes::default();
@@ -254,9 +253,7 @@ pub fn page_bytes(trace: &Trace, paging: Paging) -> Result<engine::chunk::Degene
             planes.values
         };
         let row = page * (planes.keys + values) * elem_bytes(name, *dtype)?;
-        if windowed_row(paging, *window) {
-            bytes.window_page += row;
-        } else {
+        if !windowed_row(paging, *window) {
             bytes.kv_page += row;
         }
     }

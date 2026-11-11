@@ -363,10 +363,9 @@ impl ChunkFacts {
 
     /// States today's pools as chunks, one slot a chunk, each pool a pinned
     /// run whose slots keep today's ids: chunk 0 null, then the kv pages
-    /// (a list shape), the windowed pages but the null page 0 (a window
-    /// list, ids from 1), the state slots and the rs buffer pages (fixed
-    /// shapes). The host and disk tiers are pinned alike, ids from 0. One
-    /// segment, whole from the load; activation lives apart.
+    /// (a list shape, with its host and disk tiers pinned alike, ids from
+    /// 0), the state slots and the rs buffer pages (fixed shapes, device
+    /// only). One segment, whole from the load; activation lives apart.
     #[must_use]
     pub fn degenerate(pools: &PoolFacts, bytes: &DegenerateBytes) -> ChunkFacts {
         let mut device = 1u32;
@@ -427,24 +426,11 @@ impl ChunkFacts {
             0,
         );
         push(
-            DEGENERATE_WINDOW,
-            SlotKind::List {
-                tokens: pools.kv_page_size,
-                rate: 1,
-                window: Some(pools.window_tokens),
-            },
-            bytes.window_page,
-            pools.window_pages.saturating_sub(1),
-            pools.host_window_pages,
-            ChunkRun::default(),
-            1,
-        );
-        push(
             DEGENERATE_STATE,
             SlotKind::Fixed { pieces: 1 },
             pools.state_slot_bytes,
             pools.state_slots,
-            pools.host_state_slots,
+            0,
             ChunkRun::default(),
             0,
         );
@@ -453,7 +439,7 @@ impl ChunkFacts {
             SlotKind::Fixed { pieces: 1 },
             bytes.buffer_page,
             pools.buffer_pages,
-            pools.host_buffer_pages,
+            0,
             ChunkRun::default(),
             0,
         );
@@ -642,17 +628,14 @@ impl ChunkFacts {
 /// The shapes [`ChunkFacts::degenerate`] states today's pools as, each
 /// present only where its pool holds a slot on some tier.
 pub const DEGENERATE_KV: ShapeId = ShapeId(0);
-pub const DEGENERATE_WINDOW: ShapeId = ShapeId(1);
 pub const DEGENERATE_STATE: ShapeId = ShapeId(2);
 pub const DEGENERATE_BUFFER: ShapeId = ShapeId(3);
 
 /// What [`ChunkFacts::degenerate`] needs beside the pool facts: the bytes
-/// of a kv page, a windowed page and an rs buffer page, which `PoolFacts`
-/// does not state.
+/// of a kv page and an rs buffer page, which `PoolFacts` does not state.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct DegenerateBytes {
     pub kv_page: u64,
-    pub window_page: u64,
     pub buffer_page: u64,
 }
 
