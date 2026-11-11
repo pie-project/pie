@@ -18,7 +18,7 @@ use common::{Gpu, bf16s, values};
 use dtype::Dtype;
 use expert_pool::{Plane, degenerate, fill, garble, mixed, scatter, swapped, table};
 use kernels_rocm::hip::lt_grouped;
-use kernels_rocm::linear::moe::{self, ExpertTable, GroupSeat};
+use kernels_rocm::linear::moe::{self, ExpertTable};
 use kernels_rocm::tuning::Tuning;
 use kernels_rocm::{Ctx, Error, Tensor};
 
@@ -396,16 +396,11 @@ fn an_fp4_or_affine_select_lands_the_same_bits_through_any_table() {
             };
             same_bits(&g, &case, &ctx, Some(&stream), |at, tables| {
                 let mut y = y;
-                let seat = GroupSeat::RESIDENT;
                 if bits == 0 && biased {
-                    moe::matmul_select_bias(
-                        at, x, codes, scales, third, rt, &mut y, seat, tables[0],
-                    )
+                    moe::matmul_select_bias(at, x, codes, scales, third, rt, &mut y, tables[0])
                 } else {
                     let zeros = (bits != 0).then_some(third);
-                    moe::matmul_select_quant(
-                        at, x, codes, scales, zeros, rt, &mut y, seat, tables[0],
-                    )
+                    moe::matmul_select_quant(at, x, codes, scales, zeros, rt, &mut y, tables[0])
                 }
                 .map(|()| true)
             });
@@ -502,17 +497,7 @@ fn a_lane_order_or_fp8_select_lands_the_same_bits_through_any_table() {
         };
         same_bits(&g, &case, &ctx, None, |at, tables| {
             let mut y = y;
-            moe::matmul_select_fp8_mfma(
-                at,
-                x,
-                codes,
-                factors,
-                rt,
-                &mut y,
-                GroupSeat::RESIDENT,
-                tables[0],
-            )
-            .map(|()| true)
+            moe::matmul_select_fp8_mfma(at, x, codes, factors, rt, &mut y, tables[0]).map(|()| true)
         });
     }
 }

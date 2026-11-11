@@ -11,7 +11,6 @@ use common::{Gpu, f16, from_f16, round_bf16, values};
 use dtype::Dtype;
 use kernels_rocm::Tensor;
 use kernels_rocm::linear::affine::{self, OffsetKind, tiled};
-use kernels_rocm::linear::moe::GroupSeat;
 use kernels_rocm::linear::{cast, dequant};
 
 /// The activation and factor element type.
@@ -190,18 +189,7 @@ fn run(gpu: &Gpu, c: &Case, seed: u64) {
         .collect();
     let xt = gpu.tensor(&x, c.rows, c.k, c.e.dtype());
     let mut y = gpu.zeros(c.rows, c.n, c.e.dtype());
-    affine::matmul(
-        &ctx,
-        xt,
-        codes,
-        scales,
-        c.offset,
-        offs,
-        c.e.dtype(),
-        &mut y,
-        GroupSeat::RESIDENT,
-    )
-    .unwrap();
+    affine::matmul(&ctx, xt, codes, scales, c.offset, offs, c.e.dtype(), &mut y).unwrap();
     let (want, scale) = reference(&x, &w, c.rows as usize);
     check(
         &format!(
@@ -314,10 +302,9 @@ fn linear_quant_stream_and_tile() {
     }
 }
 
-/// A window caps the rows a launch lands; a streaming seat moves the planes
-/// the fire reads to wherever the tier put them.
+/// A window caps the rows a launch lands.
 #[test]
-fn linear_quant_window_and_seat() {
+fn linear_quant_window() {
     let Some(gpu) = Gpu::open() else { return };
     let ctx = gpu.ctx();
     let e = Elem::Bf16;
@@ -331,45 +318,25 @@ fn linear_quant_window_and_seat() {
         let xt = gpu.tensor(&x, rows, k, e.dtype());
         let (want, scale) = reference(&x, &w, rows as usize);
 
-        // The planes the fire binds are decoys; the seat names the real ones.
-        let decoy = |t: Tensor| {
-            gpu.upload(
-                &vec![0u8; (t.rows * t.width) as usize],
-                t.rows,
-                t.width,
-                Dtype::U8,
-            )
-        };
-        let (dc, ds, db) = (decoy(codes), decoy(scales), decoy(offs.unwrap()));
-        let seat = gpu.upload(
-            &[codes.ptr, scales.ptr, offs.unwrap().ptr, 0],
-            1,
-            32,
-            Dtype::U8,
-        );
         let win = gpu.ints(&[live, 0, 0, 0].map(|v| v as i32));
         let mut y = gpu.zeros(rows, n, e.dtype());
         ctx.arm_stage(win.ptr);
         affine::matmul(
             &ctx,
             xt,
-            dc,
-            ds,
+            codes,
+            scales,
             OffsetKind::Post,
-            Some(db),
+            offs,
             Dtype::Bf16,
             &mut y,
-            GroupSeat {
-                cell: seat.ptr,
-                hits: 0,
-            },
         )
         .unwrap();
         ctx.disarm_stage();
         let got = gpu.read(&y);
         let cut = (live * n) as usize;
         check(
-            &format!("windowed seat {rows}x{n}x{k}"),
+            &format!("windowed {rows}x{n}x{k}"),
             &got[..cut],
             &want[..cut],
             &scale[..cut],
@@ -427,18 +394,8 @@ fn linear_quant_decoded() {
             .collect();
         let xt = gpu.tensor(&x, rows, k, Elem::Bf16.dtype());
         let mut y = gpu.zeros(rows, n, Elem::Bf16.dtype());
-        dequant::matmul_via_dense(
-            &ctx,
-            xt,
-            codes,
-            scales,
-            offset,
-            offs,
-            Dtype::Bf16,
-            &mut y,
-            GroupSeat::RESIDENT,
-        )
-        .unwrap();
+        dequant::matmul_via_dense(&ctx, xt, codes, scales, offset, offs, Dtype::Bf16, &mut y)
+            .unwrap();
         let (want, scale) = reference(&x, &w, rows as usize);
         check(
             &format!("via dense u{bits} g{group} {offset:?}"),
@@ -581,7 +538,7 @@ fn linear_quant_tiled() {
             } else {
                 tiled::matmul_gemv
             };
-            entry(&ctx, xt, tc, ts, tb, &mut y, GroupSeat::RESIDENT).unwrap();
+            entry(&ctx, xt, tc, ts, tb, &mut y).unwrap();
             ctx.disarm_stage();
             let (want, scale) = reference(&x, &w, rows as usize);
             let cut = (live.unwrap_or(rows) * n) as usize;
@@ -607,7 +564,7 @@ fn linear_quant_tiled() {
                 .collect();
             let xt = gpu.tensor(&x, rows, k, e.dtype());
             let mut y = gpu.zeros(rows, n, e.dtype());
-            tiled::matmul_with(&ctx, xt, tc, ts, tb, &mut y, GroupSeat::RESIDENT, tuple).unwrap();
+            tiled::matmul_with(&ctx, xt, tc, ts, tb, &mut y, tuple).unwrap();
             let (want, scale) = reference(&x, &w, rows as usize);
             check(
                 &format!("tiled {tuple:?} g{group}"),

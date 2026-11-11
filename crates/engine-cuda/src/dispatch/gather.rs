@@ -96,6 +96,7 @@ impl Run<'_> {
                             .to_string(),
                     })
                 }
+                #[cfg(not(feature = "rocm"))]
                 Some((codes, scales, biases)) => kernels_cuda::gather::embed_mlx_affine(
                     self.ctx(),
                     self.tensor(*ids),
@@ -104,6 +105,16 @@ impl Run<'_> {
                     biases,
                     *vocab,
                     kernels_cuda::linear::moe::GroupSeat::RESIDENT,
+                    &mut self.tensor(*y),
+                ),
+                #[cfg(feature = "rocm")]
+                Some((codes, scales, biases)) => kernels_cuda::gather::embed_mlx_affine(
+                    self.ctx(),
+                    self.tensor(*ids),
+                    codes,
+                    scales,
+                    biases,
+                    *vocab,
                     &mut self.tensor(*y),
                 ),
                 None if self.tensor(*table).rows < *vocab => gather::embed_vocab_shard(
@@ -166,6 +177,7 @@ impl Run<'_> {
                         &mut self.tensor(*y),
                     )
                 }
+                #[cfg(not(feature = "rocm"))]
                 Some((codes, scales, biases)) => kernels_cuda::gather::embed_concat_mlxu4(
                     self.ctx(),
                     self.tensor(*ids),
@@ -174,6 +186,16 @@ impl Run<'_> {
                     biases,
                     *vocab,
                     kernels_cuda::linear::moe::GroupSeat::RESIDENT,
+                    &mut self.tensor(*y),
+                ),
+                #[cfg(feature = "rocm")]
+                Some((codes, scales, biases)) => kernels_cuda::gather::embed_concat_mlxu4(
+                    self.ctx(),
+                    self.tensor(*ids),
+                    codes,
+                    scales,
+                    biases,
+                    *vocab,
                     &mut self.tensor(*y),
                 ),
                 None => kernels_cuda::gather::embed_concat(

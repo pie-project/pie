@@ -17,7 +17,6 @@ use kernels_rocm::gather::scatter_live_rows;
 use kernels_rocm::gather::{embed_concat, embed_concat_mlxu4, embed_mlx_affine};
 use kernels_rocm::gather::{grid_taps, pixels};
 use kernels_rocm::gather::{merge_rows, pool_rows};
-use kernels_rocm::linear::moe::GroupSeat;
 use kernels_rocm::{ArgValue, Ctx, Fire, Launch, Tensor, gather, kernel, sampling};
 
 /// bf16 values as the bytes of a u8 plane [rows, 2·width].
@@ -442,17 +441,7 @@ fn hashed_affine_and_weighted_embeds() {
         let tok = [4i32, 0, 29, 31, 17];
         let tok_t = gpu.column(&tok);
         let mut y = gpu.zeros(tok.len() as u32, width, Dtype::Bf16);
-        embed_mlx_affine(
-            &ctx,
-            tok_t,
-            c_t,
-            s_t,
-            Some(b_t),
-            vocab,
-            GroupSeat::RESIDENT,
-            &mut y,
-        )
-        .unwrap();
+        embed_mlx_affine(&ctx, tok_t, c_t, s_t, Some(b_t), vocab, &mut y).unwrap();
         let want: Vec<f32> = tok
             .iter()
             .flat_map(|&id| {
@@ -469,17 +458,7 @@ fn hashed_affine_and_weighted_embeds() {
 
         if bits == 4 {
             let mut y = gpu.zeros(rows, heads * width, Dtype::Bf16);
-            embed_concat_mlxu4(
-                &ctx,
-                ids,
-                c_t,
-                s_t,
-                Some(b_t),
-                vocab,
-                GroupSeat::RESIDENT,
-                &mut y,
-            )
-            .unwrap();
+            embed_concat_mlxu4(&ctx, ids, c_t, s_t, Some(b_t), vocab, &mut y).unwrap();
             let want: Vec<f32> = idv
                 .iter()
                 .flat_map(|&id| {

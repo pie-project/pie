@@ -1432,6 +1432,7 @@ impl Run<'_> {
                     kernels_cuda::linear::moe::GroupSeat::RESIDENT,
                 )
             }
+            #[cfg(not(feature = "rocm"))]
             Some((codes, scales, biases)) => kernels_cuda::linear::dequant::decoded_plane(
                 self.ctx(),
                 op,
@@ -1443,6 +1444,18 @@ impl Run<'_> {
                 n,
                 k,
                 kernels_cuda::linear::moe::GroupSeat::RESIDENT,
+            ),
+            #[cfg(feature = "rocm")]
+            Some((codes, scales, biases)) => kernels_cuda::linear::dequant::decoded_plane(
+                self.ctx(),
+                op,
+                codes,
+                scales,
+                kernels_cuda::linear::affine::OffsetKind::Post,
+                biases,
+                poem_ir::Dtype::Bf16,
+                n,
+                k,
             ),
             None => Ok(self.tensor(w)),
         }

@@ -42,34 +42,16 @@ __global__ void embed_concat(const i32* __restrict__ ids, const T* __restrict__ 
         id < 0 || id >= vocab || local < 0 || local >= held ? from_f32<T>(0.f) : table[static_cast<long long>(local) * width + at.w];
 }
 
-// The three planes of an MLX affine table a streamed group seats: where a
-// seat is named, its bases replace the launch's own.
-struct alignas(16) EmbedTableBases {
-    const u8* codes;
-    const u8* scales;
-    const u8* biases;
-    const u8* pad;
-};
-
 // An MLX affine table, BITS (4 or 8) per code and one bf16 scale and bias
 // per `group` columns: v = code·scale + bias. `offset` moves the ids into a
-// vocab band's own rows (`vocab` of them); `hits` counts the launches that
-// ran.
+// vocab band's own rows (`vocab` of them).
 template <class T, int BITS>
 __device__ __forceinline__ void embed_affine(const i32* __restrict__ ids, const u8* codes, const u8* scales,
                                              const u8* biases, T* __restrict__ y, int rows, int heads,
                                              int width, int group, int vocab, int offset,
-                                             const EmbedTableBases* __restrict__ bases,
-                                             u32* __restrict__ hits, const u32* __restrict__ win) {
-    if (hits != nullptr && blockIdx.x == 0 && threadIdx.x == 0) atomicAdd(hits, 1u);
+                                             const u32* __restrict__ win) {
     ConcatAt at;
     if (!concat_at(rows, heads, width, win, at)) return;
-    if (bases != nullptr) {
-        const EmbedTableBases seat = *bases;
-        codes = seat.codes;
-        scales = seat.scales;
-        biases = seat.biases;
-    }
     const long long slot = at.row * heads + at.head;
     const int id = ids[slot] - offset;
     T* dst = y + slot * width + at.w;
@@ -94,20 +76,16 @@ template <class T>
 __global__ void embed_concat_mlxu4(const i32* __restrict__ ids, const u8* __restrict__ codes,
                                    const u8* __restrict__ scales, const u8* __restrict__ biases,
                                    T* __restrict__ y, int rows, int heads, int width, int group, int vocab,
-                                   int offset, const EmbedTableBases* __restrict__ bases,
-                                   u32* __restrict__ hits, const u32* __restrict__ win) {
-    embed_affine<T, 4>(ids, codes, scales, biases, y, rows, heads, width, group, vocab, offset, bases, hits,
-                       win);
+                                   int offset, const u32* __restrict__ win) {
+    embed_affine<T, 4>(ids, codes, scales, biases, y, rows, heads, width, group, vocab, offset, win);
 }
 
 template <class T>
 __global__ void embed_concat_mlxu8(const i32* __restrict__ ids, const u8* __restrict__ codes,
                                    const u8* __restrict__ scales, const u8* __restrict__ biases,
                                    T* __restrict__ y, int rows, int heads, int width, int group, int vocab,
-                                   int offset, const EmbedTableBases* __restrict__ bases,
-                                   u32* __restrict__ hits, const u32* __restrict__ win) {
-    embed_affine<T, 8>(ids, codes, scales, biases, y, rows, heads, width, group, vocab, offset, bases, hits,
-                       win);
+                                   int offset, const u32* __restrict__ win) {
+    embed_affine<T, 8>(ids, codes, scales, biases, y, rows, heads, width, group, vocab, offset, win);
 }
 
 // An MXFP8 table: e4m3 codes under one ue8m0 exponent a 1x32 block, v =

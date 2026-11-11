@@ -731,7 +731,6 @@ fn moe_matmul_mxfp4() {
                     bias_t,
                     rt,
                     &mut y,
-                    moe::GroupSeat::RESIDENT,
                     moe::ExpertTable::RESIDENT,
                 )
                 .unwrap();
@@ -744,7 +743,6 @@ fn moe_matmul_mxfp4() {
                     None,
                     rt,
                     &mut y,
-                    moe::GroupSeat::RESIDENT,
                     moe::ExpertTable::RESIDENT,
                 )
                 .unwrap();
@@ -958,7 +956,6 @@ fn moe_matmul_affine() {
                     Some(bt),
                     rt,
                     &mut y,
-                    moe::GroupSeat::RESIDENT,
                     moe::ExpertTable::RESIDENT,
                 )
                 .unwrap();
@@ -1049,7 +1046,6 @@ fn moe_matmul_f16() {
             None,
             rt,
             &mut y,
-            moe::GroupSeat::RESIDENT,
             moe::ExpertTable::RESIDENT,
         )
         .unwrap();
@@ -1088,7 +1084,6 @@ fn moe_matmul_f16() {
             Some(bt),
             rt,
             &mut y,
-            moe::GroupSeat::RESIDENT,
             moe::ExpertTable::RESIDENT,
         )
         .unwrap();
@@ -1182,7 +1177,6 @@ fn moe_matmul_windowed_grouped() {
             None,
             rt,
             &mut y,
-            moe::GroupSeat::RESIDENT,
             moe::ExpertTable::RESIDENT,
         )
         .unwrap();
