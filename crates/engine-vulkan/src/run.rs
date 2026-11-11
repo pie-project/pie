@@ -110,9 +110,6 @@ pub struct FireBindings {
     /// a lane of the fire snapshots (CONTRACT-BC 16).
     pub rs_snaps: Option<Tensor>,
 
-    /// The fire's token ids as the host wrote them, where no lane's token
-    /// is fed on the device: a gather of them reads its ids from here.
-    pub tokens_host: Option<std::sync::Arc<[i32]>>,
     /// The fire arm whose row-table stage the host laid this fire's token
     /// rows in ([`crate::store::rows::RowCaches::prestage`]), where it did.
     pub row_ring: Option<usize>,

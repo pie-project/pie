@@ -3175,9 +3175,6 @@ impl Shell {
         let bindings = FireBindings {
             rs_snaps,
             row_ring,
-            tokens_host: feeds
-                .is_empty()
-                .then(|| std::sync::Arc::from(tokens.as_slice())),
             group_masks,
             tokens: bound.tokens,
             positions: bound.positions,
@@ -3285,7 +3282,9 @@ impl Shell {
         key.hashed(&p.caches);
         key.shown(&p.bindings);
         key.shown(&p.windows);
-        key.shown(&p.demand);
+        // Not the fire's demand: the pool only checks it against what is
+        // committed (a commit forgets every recording), so a recording reads
+        // it nowhere, and the kv refs it counts climb as lanes grow.
 
         for lane in p.lanes {
             key.shown(&lane.readout);
