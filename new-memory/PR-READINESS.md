@@ -44,7 +44,10 @@ medians. Known gaps to close:
   warm boot +13% (154 vs 85 compositions armed); Qwen3.5-0.8B c64 -2.0%, c256 -3.4%; Qwen3-8B c256 -1.4%;
   gpt-oss prefill 2048 (A20, window checkpoint). Parity or faster elsewhere (gpt-oss c64/c256 +25/+30%; Qwen3.5
   prefill and boot faster; Qwen3-8B end RSS 3.6 vs 2.5 GB after the keyed-demote gate).
-- ROCm: default config arms 0 bodies on new-memory (flat range takes the spare) -> speed table waits for the fix.
+- ROCm (MI300X, M93 vs main f0364015, 89/89 armed): Qwen3-8B / Qwen3.5-9B decode+prefill at parity or better;
+  regressions: boot +4.2 s (8B), +9.6 s (30B), +6.1 s (gemma); gemma decode c1 -4.2%, c8 -5.5%, c64 -3.1% (likely A3
+  region flip vs main's hand fusions); 30B c8 -4%. 30B c256 stalls at ~512 tok/s on main too (pre-existing, noted).
+  AMD fixing: EF3 flat over-count check -> gemma per-rule A/B -> boot breakdown -> 30B c8.
 - Vulkan/wgpu, Metal: full comparison vs main not yet run.
 
 ## C. PR mechanics
