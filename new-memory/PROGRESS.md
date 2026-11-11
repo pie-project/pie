@@ -1276,3 +1276,12 @@ The `new-memory/` directory is bookkeeping and is removed before anything lands 
 - Verified (sm_120, release): golden_logits / by_refs / held_small / offload = base; golden_rows host/cached/mixed
   546 reads = base; golden_buffered / submit_buffered = buffered reference; engine-cuda cuda/rocm + pie cuda +
   workspace check clean.
+
+### M104 — 2026-11-11: CUDA lane seats = max_lanes; XLA kv budget and program key
+- `sc/prefill-mix` (a9250e860): with nothing stated, a CUDA load seats boot.budget.max_lanes slots (the chunk pool
+  had dropped engine.state_slots_per_lane and fallen back to 256). gemma-4-E2B arms 144/144 = main's key set; c512
+  fires reach 512 lanes; c256 11368 vs main 11171. golden_logits / by_refs = base; runtime 299 pass.
+- `sc/xla-tier` (945ea9b67, 414cb19b4): kv budget buys pages (null + sink past it; MoE decode:8 no longer panics);
+  full program key only on a shape-key miss.
+- Open: gemma-4-E2B c64 -1.5..2.5% — not prefill packing (identical scheduler and fire mix); per-fire GPU time jumps
+  ~165 us mid-run and disappears with a 3 GiB pool -> likely kv page placement (test against L40S's slot padding).
