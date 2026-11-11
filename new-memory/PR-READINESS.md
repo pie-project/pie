@@ -20,9 +20,9 @@ Branch today: 432 commits ahead of main, 782 files, +86k / -13k. Main merged in 
 | A14 | Wire the rung shrink (SPEC 6) | RT | done M92 (CUDA) |
 | A21 | Activation rungs on Metal / Vulkan / wgpu / XLA (only CUDA states rungs; the walk is a no-op elsewhere) | backend owners | queued |
 | A15 | read_tier_slots / write_tier_slots (snapshots on shared pools) on Metal, Vulkan, wgpu, XLA (CUDA in sc/rt4; Cerebras out of scope) | Metal agent, VKP, TPU | queued |
-| A16 | Held weights flip to streaming on ROCm 30B MoE (body reservation) | EAGER | done M89 (MI300X verify pending; arm-after-residency for streaming loads next) |
+| A16 | Held weights flip to streaming on ROCm 30B MoE (body reservation) | EAGER | done M89; M93 flat-fit (flat range counted as room); MI300X verify pending; arm-after-residency next |
 | A17 | Guest panic under admission waits: bench barrier bug fixed (sc/sdk-wakeup) | SDK agent | done; A19 left |
-| A19 | A restartable process whose own demand exceeds the pool restarts forever (should fail with the starvation error); bind hangs waiting for state slots at 96 MiB | RT7 | done M91 (residual churn left) |
+| A19 | A restartable process whose own demand exceeds the pool restarts forever (should fail with the starvation error); bind hangs waiting for state slots at 96 MiB | RT7 | done M91 + M93 (rt7b: churn closed) |
 | A18 | Idle cache demoted only when PLEX keys it above the floor | RT6 | done M90 |
 | A20 | Window-only models never reuse a prefix (no auto checkpoint; main reused full window pages) -> auto checkpoints at page-aligned fire ends holding window slot refs | RT8 | in progress |
 | A9 | dsv41 two-window mini cannot fire on sm_89/sm_120 (fused.lse_sink kernel gap) -> two-window CUDA unverified | L40S | queued |

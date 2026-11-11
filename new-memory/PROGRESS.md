@@ -1167,3 +1167,14 @@ The `new-memory/` directory is bookkeeping and is removed before anything lands 
 - Verified: runtime 214, poem-compiler 34, e2e rung.py 6/6 (Qwen3.5, induced critical pressure), CUDA golden_logits /
   by_refs / offload = base after merge. Limits: raise evacuation proven by unit test only; one decode differs at the
   smaller rung (finer prefill cuts, unconfirmed); only CUDA states rungs (A21: Metal / Vulkan / wgpu / XLA).
+
+### M93 — 2026-11-11: combined fit (pool-fit + flat-fit) and no churn for stalled sole holders
+- `sc/l40s-pool-fit`: the fit after arming (settled) subtracts only the activation span a fire backed
+  (activation_unheld_bytes), giving the rest to cache rows -> recovers the c64 -19% left by eager-fix.
+- `sc/flat-fit`: the fit counts a flat range's whole backing as room (ROCm Qwen3-30B no longer flips to streaming
+  on that miscount). Combined in fit_the_card: live = spare + backed - (settled ? act - unheld : act).
+- `sc/rt7b`: a process with fires in flight is not stalled; a stalled sole holder fails instead of restarting
+  (closes the A19 residual churn).
+- Verified: workspace / engine-cuda cuda+rocm+featureless / pie cuda+rocm / runtime all-features check clean;
+  runtime 235 pass; CUDA golden_logits / by_refs / eager_resume / offload = base. Pending: L40S Qwen3-8B
+  c64/c256 confirm on the combined fit; AMD MI300X 30B verify.
