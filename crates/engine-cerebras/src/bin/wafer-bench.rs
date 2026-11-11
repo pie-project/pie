@@ -6,21 +6,28 @@
 //!
 //! ```text
 //! wafer-bench --program <program out dir> --weights <dir>[:<prefix>] --golden <golden.json>
-//!             [--steps N] [--tokens N] [--cmaddr <addr>] [--logits <out.json>]
+//!             [--steps N] [--tokens N] [--cmaddr <addr>] [--logits <out.json>] [--times <out.json>]
 //! ```
 //!
 //! `--steps`: tokens a launch (default 8); `--tokens`: the golden's first N (default all);
 //! `--logits`: where to write the prompt's last logits row (a JSON array).
+//! A program built with `TSTAMP:1` (its artifact's `stamps.json`) also gets a third sequence
+//! with every probe's `tdbg` read after each launch: `TIMES` prints the cycles (each unit's
+//! layers and send, each probe's phases from its pass start (`null`: a phase that path never
+//! stamps), the token loop's steps), also written to `--times`.
 //! Prints `WAFER_BENCH ok` and exits 0 when every check holds.
 
 use std::collections::HashMap;
 use std::path::Path;
 
 use engine_cerebras::artifact::{ArtifactModel, Weights, argmax, read};
-use engine_cerebras::sdk::{Platform, Runtime, Sdk, Simulator, Target};
+use engine_cerebras::sdk::{Platform, Rect, Runtime, Sdk, Simulator, Target};
+use kernels_cerebras::emit::stamps::{self, Probe, Read};
+use serde_json::{Value, json};
 
 const USAGE: &str = "usage: wafer-bench --program <dir> --weights <dir>[:<prefix>] --golden \
-                     <golden.json> [--steps N] [--tokens N] [--cmaddr <addr>] [--logits <out.json>]";
+                     <golden.json> [--steps N] [--tokens N] [--cmaddr <addr>] [--logits <out.json>] \
+                     [--times <out.json>]";
 
 fn main() {
     match run() {
@@ -56,6 +63,120 @@ fn greedy(
     }
     got.truncate(n);
     Ok(got)
+}
+
+/// `b[i] - b[0]` for each word, modulo the 32-bit stamp (`None`: a word no pass stamped, still 0).
+fn since(b: &[u32]) -> Vec<Option<f64>> {
+    b.iter()
+        .enumerate()
+        .map(|(i, &v)| (i == 0 || v != 0).then(|| v.wrapping_sub(b[0]) as f64))
+        .collect()
+}
+
+/// The element-wise mean of equal-length rows of stamps, over the rows that have each one.
+fn mean_of(rows: &[Vec<Option<f64>>]) -> Vec<Option<f64>> {
+    (0..rows.first().map_or(0, Vec::len))
+        .map(|i| {
+            let v: Vec<f64> = rows.iter().filter_map(|r| r[i]).collect();
+            (!v.is_empty()).then(|| (v.iter().sum::<f64>() / v.len() as f64).round())
+        })
+        .collect()
+}
+
+/// Consecutive differences, modulo the 32-bit stamp.
+fn diffs(b: &[u32]) -> Vec<f64> {
+    b.windows(2)
+        .map(|w| w[1].wrapping_sub(w[0]) as f64)
+        .collect()
+}
+
+/// The element-wise mean of equal-length rows.
+fn mean(rows: &[Vec<f64>]) -> Vec<f64> {
+    let n = rows.len().max(1) as f64;
+    let mut m = vec![0.0; rows.first().map_or(0, Vec::len)];
+    for r in rows {
+        for (a, v) in m.iter_mut().zip(r) {
+            *a += v / n;
+        }
+    }
+    m.iter().map(|v| v.round()).collect()
+}
+
+/// A greedy sequence as [`greedy`], every probe's `tdbg` read after each launch; the cycles of
+/// the launches after the first (the prompt's), averaged.
+fn stamped(
+    m: &mut ArtifactModel,
+    probes: &[Probe],
+    prompt: &[u32],
+    n: usize,
+    steps: usize,
+) -> Result<Value, String> {
+    let mut reads: Vec<Vec<Vec<u32>>> = Vec::new();
+    let mut feed = prompt.to_vec();
+    let (mut start, mut made, mut last_extra) = (0, 0, 0);
+    while made < n {
+        let extra = (steps - 1).min(n - made - 1);
+        let a = m.greedy(&feed, start, extra)?;
+        let new = &a[feed.len() - 1..];
+        start += feed.len() + new.len() - 1;
+        made += new.len();
+        feed = vec![*new.last().ok_or("a launch made no token")?];
+        let mut r = Vec::new();
+        for p in probes {
+            let at = Rect {
+                x: p.at.x as i32,
+                y: p.at.y as i32,
+                w: 1,
+                h: 1,
+            };
+            r.push(m.dev.get("tdbg", at, p.words as usize)?);
+        }
+        reads.push(r);
+        last_extra = extra;
+    }
+    let decode = if reads.len() > 1 {
+        &reads[1..]
+    } else {
+        &reads[..]
+    };
+    let (mut layers, mut units, mut send) = (Vec::new(), Vec::new(), Vec::new());
+    let mut phases = serde_json::Map::new();
+    let mut lp = Value::Null;
+    for (i, p) in probes.iter().enumerate() {
+        let rows: Vec<&Vec<u32>> = decode.iter().map(|r| &r[i]).collect();
+        match p.read {
+            Read::Layers { layers: k } => {
+                let d: Vec<Vec<f64>> = rows.iter().map(|b| diffs(&b[..k as usize + 2])).collect();
+                let d = mean(&d);
+                units.push(d[..k as usize].iter().sum::<f64>());
+                send.push(d[k as usize]);
+                layers.push(d[..k as usize].to_vec());
+            }
+            Read::Phases => {
+                let d: Vec<_> = rows.iter().map(|b| since(b)).collect();
+                phases.insert(p.name.clone(), json!(mean_of(&d)));
+            }
+            Read::Loop => {
+                let at = [0, 66, 67, 68, 69];
+                let d: Vec<_> = rows
+                    .iter()
+                    .map(|b| since(&at.iter().map(|&j| b[j]).collect::<Vec<_>>()))
+                    .collect();
+                phases.insert(p.name.clone(), json!(mean_of(&d)));
+                let last = rows.last().ok_or("no launch read")?;
+                let s = (last_extra + 1).min(64);
+                lp = json!(diffs(&last[2..2 + s]));
+            }
+        }
+    }
+    Ok(json!({
+        "launches": decode.len(),
+        "layer_cycles_mean": layers,
+        "unit_cycles_mean": units,
+        "send_cycles_mean": send,
+        "phases_mean": phases,
+        "loop_cycles": lp,
+    }))
 }
 
 fn run() -> Result<bool, String> {
@@ -132,6 +253,13 @@ fn run() -> Result<bool, String> {
             &want[2..4],
             if good { "ok" } else { "BAD" }
         );
+    }
+    if let Some(probes) = stamps::read(&Path::new(&program).join("artifact"))? {
+        let times = stamped(&mut m, &probes, &prompt, n, steps)?;
+        println!("TIMES {times}");
+        if let Some(path) = get.get("times") {
+            std::fs::write(path, times.to_string()).map_err(|e| format!("{path}: {e}"))?;
+        }
     }
     let (_, l) = m.forward(&prompt, 0, true)?;
     let l = l.ok_or("no logits row")?;
