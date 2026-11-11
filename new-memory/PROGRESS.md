@@ -1149,3 +1149,11 @@ The `new-memory/` directory is bookkeeping and is removed before anything lands 
 - Verified: runtime store/planner/policy 192; e2e t_keep 10/10, default 63/65 (t_clients unbuilt); keyed prefix
   (keep-session) survives a restart via disk (125 pages), unkeyed control dropped; Qwen3-8B 4 x 256 concurrent waves
   1810-2097 tok/s flat, 0 idle demotion, RSS 9.2 GB (only preemption traffic remains).
+
+### M91 — 2026-11-11: no infinite restart when a process's own demand exceeds the pool (A19)
+- `sc/rt7` (1e0fc42ed, d0cd87bdf): check_overcommit (held kv + parked asks + state counted in kv pages vs the pool)
+  fails the process's asks with PlannerError::Overcommit instead of restarting forever; ShortRs releases pages
+  gathered past the head's need on a shared pool; departures count state; starved-ask errors name missing state.
+- Probes (sm_120, 128 / 96 MiB): restart loops -> clear errors in 0.01-0.12 s; c2 batches still serve. Runtime
+  planner/store/inferlet/policy 208 pass. Open: ~1,600 restarts in 2 s before the error in one 96 MiB case
+  (fleet_stalled marks a process stalled while other lanes have fires in flight).
