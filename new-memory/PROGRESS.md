@@ -1084,3 +1084,13 @@ The `new-memory/` directory is bookkeeping and is removed before anything lands 
 - FOUND (A14): the governor's rung shrink under critical pressure is not wired: SharedGrow::shrink_rung / restore_rung
   are no-ops ("the scheduler does not cap a fire's tokens by rung yet"); raise_rung / lower_rung / steer exist unused.
   SPEC decision 6's activation boundary never moves.
+
+### M84 — 2026-11-11: shared-pool snapshots, host-full handling, head key covers state (A12)
+- `sc/rt4` (aaf68fdab, abda894ba): tier-pressure shortfall measured in the shared pool's own slot sizes (was ~24x:
+  the 2.78 GB for a 2-token turn); host-short heads wait on policy and fail `Short{Host}` ("quota: the host tier is
+  full (host_kv_budget) …"); restores fail after SEAT_WAIT instead of hanging; a launch leaves one set's state room
+  on the host. Snapshots: new `Engine::read_tier_slots` / `write_tier_slots` (host-tier slots by shape and ref, as
+  copy_slots lays them); CUDA implemented (TP too); others answer unsupported (A15). A set at rest ranks by its
+  highest key (keep-handles head protects record / rs list / window). tests/handles/e2e.py --host-budget.
+- e2e sm_120: t_snapshot / t_long_snapshot pass, t_quota / t_close pass, t_keep head-key check passes (9 pages, was
+  19). Runtime lib 279+; build matrix clean.
