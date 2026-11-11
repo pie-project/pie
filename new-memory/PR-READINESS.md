@@ -22,7 +22,7 @@ Branch today: 432 commits ahead of main, 782 files, +86k / -13k. Main merged in 
 | A16 | Held weights flip to streaming on ROCm 30B MoE (body reservation) | EAGER | done M89 (MI300X verify pending; arm-after-residency for streaming loads next) |
 | A17 | Guest panic under admission waits: bench barrier bug fixed (sc/sdk-wakeup) | SDK agent | done; A19 left |
 | A19 | A restartable process whose own demand exceeds the pool restarts forever (should fail with the starvation error); bind hangs waiting for state slots at 96 MiB | RT7 | in progress |
-| A18 | Idle cache demoted only when PLEX keys it above the floor (user decision) | RT6 | in progress |
+| A18 | Idle cache demoted only when PLEX keys it above the floor | RT6 | done M90 |
 | A9 | dsv41 two-window mini cannot fire on sm_89/sm_120 (fused.lse_sink kernel gap) -> two-window CUDA unverified | L40S | queued |
 
 ## B. Decide before the PR (user)

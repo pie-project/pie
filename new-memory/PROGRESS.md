@@ -1141,3 +1141,11 @@ The `new-memory/` directory is bookkeeping and is removed before anything lands 
 - Open: arming over the host copy after a flip to streaming is very slow (8-28 s per prefill body) -> arm after the
   starting residency (EAGER, next); MoE mini t_resume diverges from token 5 (pre-existing) -> EAGER to investigate.
   MI300X verification pending (AMD).
+
+### M90 — 2026-11-11: idle cache demoted only when keyed above the floor (A18, user decision)
+- `sc/rt6-keyed-demote` (1082c3799): `retention::FLOOR` (= 0, the key of uncovered KV) and `above_floor`;
+  `pressure::may_drop` = not above the floor; prepare_demote and prepare_spill skip floor-keyed groups, which
+  reclaim_idle drops as on main. Suspend / sweep / preempt moves unchanged.
+- Verified: runtime store/planner/policy 192; e2e t_keep 10/10, default 63/65 (t_clients unbuilt); keyed prefix
+  (keep-session) survives a restart via disk (125 pages), unkeyed control dropped; Qwen3-8B 4 x 256 concurrent waves
+  1810-2097 tok/s flat, 0 idle demotion, RSS 9.2 GB (only preemption traffic remains).
