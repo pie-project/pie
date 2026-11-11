@@ -1,26 +1,40 @@
 //! The composer: a program's blocks from what its layers need, not from a family. Each phase a
-//! layer program has ([`poem_compiler::spatial::layer`]) asks for the blocks that run it: the
-//! units for the matvecs and the roots, a scores segment for attention over a layer's own cache,
-//! the delta rule's (k, q) multicast and o-norm segments for GDN; the head and the token loop
-//! close every program. The partition says how big each is.
+//! layer program has ([`poem_compiler::spatial::layer`]) asks for the blocks that run it, the
+//! partition says how big each is:
 //!
-//! The composer places the unit snake's phases today: attention over a layer's own cache, GDN,
-//! the MLP. Side inputs, caches read across layers, sliding windows and routed experts are
-//! placed by their families' blocks still ([`Program::build`](crate::program::Program::build)
-//! falls back to them) until their blocks join it.
+//! - the units hold the matvecs and the roots: a snake of units; stacked unit columns with a
+//!   side input's storage above them ([`stacked`]) where the layers read a per-token input or a
+//!   cache across layers; two runs of rows (attention rows, plain rows) in a U of two unit
+//!   columns where the layers attend over windows; attention | MoE halves in a snake of two
+//!   unit columns from the band where they route experts;
+//! - the mixers' segments: the scores for attention, the delta rule's (k, q) multicast and its
+//!   o-norm for GDN, the router's for experts; the side input's storage and bus; the shared
+//!   caches' line;
+//! - the head (east of the units, by row groups of the runs, or a band below a MoE snake) and the
+//!   token loop close the program.
+//!
+//! What the family's kernels read off each block's PEs (their ABI with the host) is the
+//! family's still: [`KernelCopies`].
+
+pub mod stacked;
 
 use poem_compiler::spatial::layer::{LayerProgram, Mixer, Phase};
 use poem_ir::GluAct;
 
 use crate::block::Block;
+use crate::block::band::{Band, BandLoop};
 use crate::block::gdn::Gdn;
-use crate::block::head::{HeadCopies, HeadEast, Hemb};
+use crate::block::head::{HeadCopies, HeadEast};
+use crate::block::head_groups::HeadGroups;
+use crate::block::moe::{AttnScores, MoeCopies, MoeUnits, Router};
+use crate::block::ple::{Ple, PleColumn};
+use crate::block::row_runs::{RowRuns, RunCopies};
 use crate::block::segments::{Onorm, Scores};
+use crate::block::shared_kv::SharedKv;
 use crate::block::token_loop::TokenLoop;
 use crate::block::units::{UnitCopies, Units};
 use crate::floor::{UnitGrid, UnitLayout};
 use crate::plan::Plan;
-use crate::weights::{From, Slice, Transform, from};
 
 type R<T> = Result<T, String>;
 
@@ -84,18 +98,6 @@ impl Needs {
             }
         }
         n
-    }
-
-    /// The first need the composer has no block for, if any.
-    fn unplaced(&self) -> Option<&'static str> {
-        [
-            (self.sliding, "a sliding window"),
-            (self.shared_cache, "a cache read across layers"),
-            (self.side_in, "a per-token side input"),
-            (self.experts, "routed experts"),
-        ]
-        .into_iter()
-        .find_map(|(n, what)| n.then_some(what))
     }
 }
 
@@ -164,113 +166,217 @@ pub fn snake_gap(units: u32, (unx, uny): (u32, u32)) -> R<Option<(u32, u32)>> {
     }
 }
 
-/// The blocks of `plan` for layers that need `needs`, in order (the units first, then what is
-/// placed against them), or `None` where a need has no block of the composer's yet.
-pub fn blocks(plan: &Plan, needs: &Needs) -> R<Option<Vec<Box<dyn Block>>>> {
-    if needs.unplaced().is_some() {
-        return Ok(None);
+/// What a family's kernels read off the PEs of the blocks the composer places: the copies onto
+/// each kind (the kernels' ABI with the host, a family's until one kernel set serves every layer
+/// program). A kind the kernels have no copies for is a kind they do not run.
+#[derive(Default)]
+pub struct KernelCopies {
+    pub units: Option<UnitCopies>,
+    pub runs: Option<RunCopies>,
+    pub moe: Option<MoeCopies>,
+    pub head: Option<HeadCopies>,
+}
+
+fn take<T>(c: Option<T>, what: &str) -> R<T> {
+    c.ok_or_else(|| format!("compose: the kernels place no {what}"))
+}
+
+/// The unit grid of `plan` laid as `layout`, its control column and row through the middle.
+fn grid(plan: &Plan, layout: UnitLayout) -> UnitGrid {
+    let p = &plan.partition;
+    UnitGrid {
+        cols: p.cols,
+        rows: p.rows,
+        cx: p.cols / 2,
+        cy: p.rows / 2,
+        layout,
+        layers_per_unit: p.layers_per_unit,
     }
-    let (s, p) = (&plan.shape, &plan.partition);
+}
+
+/// A unit snake: the units in the plan's slots (UNX x UNY), every segment within a half of a
+/// unit's columns, the head's columns half the rows.
+fn snake(plan: &Plan) -> R<UnitGrid> {
+    let p = &plan.partition;
     let ug = p
         .unit_grid
         .ok_or("dense: the plan has no unit grid (UNX, UNY)")?;
-    let (cols, rows) = (p.cols, p.rows);
     // a segment within a half of the unit's columns (none spans the control column)
     for (n, sw) in [
         ("SWA", p.segments.scores),
         ("SWG", p.segments.gdn),
         ("SWV", p.segments.onorm),
     ] {
-        if sw == 0 || (cols / 2) % sw != 0 {
+        if sw == 0 || (p.cols / 2) % sw != 0 {
             return Err(format!(
                 "dense: {n} {sw} does not divide XC {} (a segment would span the control column)",
-                cols / 2
+                p.cols / 2
             ));
         }
     }
-    if p.head.cols * 2 != rows {
+    if p.head.cols * 2 != p.rows {
         return Err("dense: head columns = CX rows / 2".into());
     }
-    // a hidden that the row split does not divide is zero-padded to it
-    let placed = p.hidden_placed();
-    let pad = |t: &str| -> From {
-        let tr = if placed != s.hidden {
-            vec![Transform::PadZero { dim: 1, to: placed }]
-        } else {
-            vec![]
-        };
-        vec![(t.to_string(), tr)]
-    };
-    let mut out: Vec<Box<dyn Block>> = vec![Box::new(Units {
-        grid: UnitGrid {
-            cols,
-            rows,
-            cx: cols / 2,
-            cy: rows / 2,
-            layout: UnitLayout::Snake {
-                unx: ug.0,
-                uny: ug.1,
-                up_first: false,
-                gaps: snake_gap(p.units, ug)?.into_iter().collect(),
+    Ok(grid(
+        plan,
+        UnitLayout::Snake {
+            unx: ug.0,
+            uny: ug.1,
+            up_first: false,
+            gaps: snake_gap(p.units, ug)?.into_iter().collect(),
+        },
+    ))
+}
+
+/// Two unit columns, the first visited down, the second up: unit 0 and the last side by side on
+/// row 0 (the token loop's return).
+fn u_columns(plan: &Plan) -> R<UnitGrid> {
+    let p = &plan.partition;
+    let n = p.units;
+    if n == 0 || !n.is_multiple_of(2) {
+        return Err(format!(
+            "gemma12: {n} units (two unit columns, unit 0 and the last on row 0)"
+        ));
+    }
+    let (uw, uh, uny) = (p.cols + 1, p.rows + 1, n / 2);
+    let origins = (0..n)
+        .map(|u| {
+            if u < uny {
+                (0, uh * u)
+            } else {
+                (uw, uh * (n - 1 - u))
+            }
+        })
+        .collect();
+    Ok(grid(plan, UnitLayout::Explicit { origins }))
+}
+
+/// Attention | MoE halves (CX after the attention columns) in a snake of two unit columns that
+/// starts upward, so the first and the last unit sit on the band.
+fn split_snake(plan: &Plan) -> R<UnitGrid> {
+    let p = &plan.partition;
+    let ax = p.attn_cols.ok_or("gpt-oss plan: no attention columns")?;
+    if ax >= p.cols {
+        return Err("gpt-oss plan: no MoE columns".into());
+    }
+    if !p.units.is_multiple_of(2) {
+        return Err("gpt-oss: an even unit count (the last unit next to the band)".into());
+    }
+    Ok(UnitGrid {
+        cx: ax,
+        ..grid(
+            plan,
+            UnitLayout::Snake {
+                unx: 2,
+                uny: p.units / 2,
+                up_first: true,
+                gaps: Vec::new(),
             },
-            layers_per_unit: p.layers_per_unit,
-        },
-        copies: UnitCopies {
-            cols,
-            rows,
-            w_from: pad("layers.*.{q,k,v,o,gate,up,down}_proj, linear_attn.*"),
-            gam_b16: true,
-            gam_from: pad("layers.*.{input,post_attention}_layernorm, norm"),
-            cy: &[
-                ("cw", true),
-                ("gpar", true),
-                ("gnw", true),
-                ("qkw", true),
-                ("rot", true),
-            ],
-            cy_optional: true,
-        },
-    })];
-    if needs.attention {
+        )
+    })
+}
+
+/// The blocks of `plan` for layers that need `needs`, in order (the units first, then what is
+/// placed against them), each block's copies the kernels' (`copies`).
+pub fn blocks(plan: &Plan, needs: &Needs, copies: KernelCopies) -> R<Vec<Box<dyn Block>>> {
+    let p = &plan.partition;
+    let token_loop = plan.contract.token_loop;
+    let mut out: Vec<Box<dyn Block>> = Vec::new();
+    if needs.experts {
+        out.push(Box::new(MoeUnits {
+            grid: split_snake(plan)?,
+            copies: take(copies.moe, "MoE units")?,
+        }));
+        out.push(Box::new(AttnScores {
+            width: p.segments.scores,
+        }));
+        out.push(Box::new(Router {
+            width: p
+                .segments
+                .router
+                .ok_or("gpt-oss plan: no router segments")?,
+        }));
+        out.push(Box::new(Band {
+            cols: p.head.cols,
+            rows: p.head.rows,
+            vocab_rows: p.head.vocab_rows,
+        }));
+        if token_loop {
+            out.push(Box::new(BandLoop));
+        }
+        return Ok(out);
+    }
+    if needs.side_in || needs.shared_cache {
+        let arr = stacked::Arrangement::of(plan)?;
+        out.push(Box::new(Units {
+            grid: grid(
+                plan,
+                UnitLayout::Explicit {
+                    origins: arr.origins(p.cols + 1, p.rows + 1)?,
+                },
+            ),
+            copies: take(copies.units, "units")?,
+        }));
         out.push(Box::new(Scores {
             width: p.segments.scores,
         }));
-    }
-    if needs.gdn
-        && let Some(g) = Gdn::of(plan)
-    {
-        out.push(Box::new(g));
-        out.push(Box::new(Onorm {
-            width: p.segments.onorm,
+        if needs.side_in {
+            out.push(Box::new(Ple {
+                columns: arr
+                    .columns(p.cols + 1)
+                    .into_iter()
+                    .map(|(_, units, st)| PleColumn {
+                        units,
+                        rows: st.rows,
+                        tokens: st.tokens,
+                        bus: st.bus,
+                    })
+                    .collect(),
+            }));
+        }
+        if needs.shared_cache {
+            out.push(Box::new(SharedKv));
+        }
+    } else if needs.sliding {
+        out.push(Box::new(RowRuns {
+            grid: u_columns(plan)?,
+            copies: take(copies.runs, "row runs")?,
         }));
+        out.push(Box::new(HeadGroups {
+            cols: p.head.cols,
+            rows: p.head.rows,
+            copies: take(copies.head, "head")?,
+        }));
+        return Ok(out);
+    } else {
+        out.push(Box::new(Units {
+            grid: snake(plan)?,
+            copies: take(copies.units, "units")?,
+        }));
+        if needs.attention {
+            out.push(Box::new(Scores {
+                width: p.segments.scores,
+            }));
+        }
+        if needs.gdn
+            && let Some(g) = Gdn::of(plan)
+        {
+            out.push(Box::new(g));
+            out.push(Box::new(Onorm {
+                width: p.segments.onorm,
+            }));
+        }
     }
-    let token_loop = plan.contract.token_loop;
     out.push(Box::new(HeadEast {
         cols: p.head.cols,
         rows: p.head.rows,
         token_loop,
-        copies: HeadCopies {
-            cols: p.head.cols,
-            rows: p.head.rows,
-            hw: |_, rows, cols| Slice::of("hw", None, vec![rows, cols]),
-            hw_from: vec![(
-                "lm_head".into(),
-                vec![Transform::PadLastRow {
-                    to: p.head.rows * p.head.vocab_rows,
-                }],
-            )],
-            hg_from: from("norm"),
-            hemb: if token_loop {
-                Hemb::After(from(&format!("embed_tokens ({} rows)", s.vocab)))
-            } else {
-                Hemb::None
-            },
-        },
+        copies: take(copies.head, "head")?,
     }));
     if token_loop {
         out.push(Box::new(TokenLoop));
     }
-    Ok(Some(out))
+    Ok(out)
 }
 
 #[cfg(test)]
@@ -279,7 +385,7 @@ mod tests {
     use crate::emit;
     use crate::family;
     use crate::program::Program;
-    use crate::target::{Ask, plan, plan_shape, shape};
+    use crate::target::{Ask, plan, plan_shape};
 
     fn trace(name: &str) -> poem_ir::Trace {
         poem_compiler::catalog::repository()
@@ -333,37 +439,43 @@ mod tests {
         )
     }
 
-    /// The composer's blocks make what the unit snake family's made, for every one of its presets.
+    /// The composer's blocks make what every family's made, for every shipping model's preset
+    /// and every tiny one.
     #[test]
-    fn the_composer_reproduces_the_unit_snake() {
-        let dense = family::of(crate::plan::FamilyId::Dense);
-        let mut composed = 0;
+    fn the_composer_reproduces_every_family() {
+        let check = |p: crate::plan::Plan, what: &str| {
+            let fam = family::of(p.family);
+            let theirs =
+                Program::build_with(fam.blocks(&p).unwrap(), family::of(p.family), p.clone())
+                    .unwrap();
+            let needs = Needs::of(&crate::layers::of(&p.shape));
+            let ours = blocks(&p, &needs, fam.copies(&p).unwrap()).unwrap();
+            let comp = Program::build_with(ours, family::of(p.family), p).unwrap();
+            assert_eq!(made(&theirs), made(&comp), "{what}");
+        };
         for (name, preset) in [
             ("qwen35-d9b-bf16-kv-bf16", "9b"),
             ("qwen35-d4b-bf16-kv-bf16", "4b"),
             ("qwen35-d0.8b-bf16-kv-bf16", "0.8b"),
             ("qwen3-8b-bf16-kv-bf16", "q3-8b"),
             ("llama31-8b-bf16-kv-bf16", "l3-8b"),
+            ("gemma4-e2b-bf16-kv-bf16", "e2b"),
+            ("gemma4-e4b-bf16-kv-bf16", "e4b"),
+            ("gemma4-e4b-bf16-kv-bf16", "e4b-meta"),
+            ("gemma4-12b-bf16-kv-bf16", "g12"),
+            ("gptoss-20b-bf16-mxfp4-kv-bf16", "full"),
         ] {
-            let t = trace(name);
-            let p = plan(&t, &Ask::preset(preset)).unwrap().plan;
-            let fam =
-                Program::build_with(dense.blocks(&p).unwrap(), family::of(p.family), p.clone())
-                    .unwrap();
-            let blocks = blocks(&p, &Needs::of(&program(&t)))
-                .unwrap()
-                .expect("composed");
-            let comp = Program::build_with(blocks, family::of(p.family), p).unwrap();
-            assert_eq!(made(&fam), made(&comp), "{name}");
-            composed += 1;
+            check(plan(&trace(name), &Ask::preset(preset)).unwrap().plan, name);
         }
-        // the tiny ones, from their shapes
         for (file, preset) in [
             ("tiny_q35_t08", "tiny-t08"),
             ("tiny_q35_t4", "tiny-t4"),
             ("tiny_q3", "tiny-q3"),
             ("tiny_q3_gap", "tiny-q3-gap"),
             ("tiny_llama", "tiny-q3"),
+            ("tiny_gemma", "tiny"),
+            ("tiny_g12", "tiny"),
+            ("tiny_gptoss", "tiny"),
         ] {
             let path = format!(
                 "{}/tools/wafer/baseline/shapes/{file}.json",
@@ -371,24 +483,7 @@ mod tests {
             );
             let s: crate::plan::Shape =
                 serde_json::from_str(&std::fs::read_to_string(path).unwrap()).unwrap();
-            let p = plan_shape(s, &Ask::preset(preset)).unwrap().plan;
-            let fam =
-                Program::build_with(dense.blocks(&p).unwrap(), family::of(p.family), p.clone())
-                    .unwrap();
-            let blocks = blocks(&p, &Needs::of(&crate::layers::of(&p.shape)))
-                .unwrap()
-                .unwrap();
-            let comp = Program::build_with(blocks, family::of(p.family), p).unwrap();
-            assert_eq!(made(&fam), made(&comp), "{file}");
+            check(plan_shape(s, &Ask::preset(preset)).unwrap().plan, file);
         }
-        assert_eq!(composed, 5);
-    }
-
-    /// Needs the composer has no block for leave the program to its family.
-    #[test]
-    fn what_the_composer_cannot_place_is_its_familys() {
-        let t = trace("gemma4-e2b-bf16-kv-bf16");
-        let p = plan(&t, &Ask::default()).unwrap().plan;
-        assert!(blocks(&p, &Needs::of(&program(&t))).unwrap().is_none());
     }
 }

@@ -6,7 +6,6 @@
 //! plan. Kernels: [`gemma`].
 
 use crate::tiles::spec::Spec;
-use std::collections::BTreeMap;
 
 use crate::abi::Kernels;
 use crate::block::Block;
@@ -16,6 +15,8 @@ use crate::block::segments::Scores;
 use crate::block::shared_kv::SharedKv;
 use crate::block::token_loop::TokenLoop;
 use crate::block::units::{UnitCopies, Units};
+use crate::compose::KernelCopies;
+use crate::compose::stacked::Arrangement;
 use crate::family::{Family, MadeFor, Row, ceil_to, table};
 use crate::floor::{UnitGrid, UnitLayout};
 use crate::kernels::gemma;
@@ -31,149 +32,6 @@ mod cut;
 type R<T> = Result<T, String>;
 
 pub struct Gemma;
-
-// ------------------------------------------------------------------ arrangements
-
-/// A PLE storage block's size: rows above its column's top unit, tokens a storage PE, bus colour.
-struct StoreSpec {
-    rows: u32,
-    tokens: u32,
-    bus: u8,
-}
-
-/// A hand-made Gemma floorplan: unit column A at
-/// x 0 holds `a_units` top to bottom, stacked from row `a_top`; unit column B, east of it, holds
-/// each of `b_units` level with a column-A unit; above each column's top unit its PLE storage
-/// block. Unit index order is the handoff order (unit 0 takes the embedding). The head sits east
-/// of column B.
-struct Arrangement {
-    a_top: u32,
-    a_units: &'static [u32],
-    /// (unit, the column-A unit it sits level with), top to bottom.
-    b_units: &'static [(u32, u32)],
-    /// Column A's storage, column B's.
-    stores: [StoreSpec; 2],
-}
-
-/// The arrangements, by unit shape (weight columns, rows, units). A new Gemma size adds one.
-const ARRANGEMENTS: &[((u32, u32, u32), Arrangement)] = &[
-    // the tiny simulation: E2B's arrangement in small (unit 0 shares the last unit's rows, as the
-    // head's turns need)
-    (
-        (8, 8, 5),
-        Arrangement {
-            a_top: 4,
-            a_units: &[4, 3, 2],
-            b_units: &[(0, 4), (1, 2)],
-            stores: [
-                StoreSpec {
-                    rows: 4,
-                    tokens: 128,
-                    bus: 17,
-                },
-                StoreSpec {
-                    rows: 2,
-                    tokens: 256,
-                    bus: 10,
-                },
-            ],
-        },
-    ),
-    // E2B: column A units 6 .. 2 down to the wafer's last row (1153), column B units 0 (level
-    // with 6) and 1 (level with 2)
-    (
-        (256, 128, 7),
-        Arrangement {
-            a_top: 1153 - 129 * 5,
-            a_units: &[6, 5, 4, 3, 2],
-            b_units: &[(0, 6), (1, 2)],
-            stores: [
-                StoreSpec {
-                    rows: 345,
-                    tokens: 760,
-                    bus: 17,
-                },
-                StoreSpec {
-                    rows: 138,
-                    tokens: 1900,
-                    bus: 10,
-                },
-            ],
-        },
-    ),
-    // E4B: column A units 6 .. 3, column B units 0, 1, 2 level with 6, 5, 3
-    (
-        (256, 160, 7),
-        Arrangement {
-            a_top: 1153 - 161 * 4,
-            a_units: &[6, 5, 4, 3],
-            b_units: &[(0, 6), (1, 5), (2, 3)],
-            stores: [
-                StoreSpec {
-                    rows: 332,
-                    tokens: 791,
-                    bus: 17,
-                },
-                StoreSpec {
-                    rows: 249,
-                    tokens: 1055,
-                    bus: 10,
-                },
-            ],
-        },
-    ),
-];
-
-impl Arrangement {
-    fn of(plan: &Plan) -> R<&'static Arrangement> {
-        let p = &plan.partition;
-        let key = (p.cols, p.rows, p.units);
-        ARRANGEMENTS
-            .iter()
-            .find(|(k, _)| *k == key)
-            .map(|(_, a)| a)
-            .ok_or_else(|| {
-                format!(
-                    "gemma: no arrangement for {} x {} units x {}",
-                    p.cols, p.rows, p.units
-                )
-            })
-    }
-
-    /// Unit origins in unit order, for units of `uw` x `uh` PEs.
-    fn origins(&self, uw: u32, uh: u32) -> R<Vec<(u32, u32)>> {
-        let n = self.a_units.len() + self.b_units.len();
-        let mut o = vec![None; n];
-        let mut ya = BTreeMap::new();
-        for (i, &u) in self.a_units.iter().enumerate() {
-            let y = self.a_top + i as u32 * uh;
-            ya.insert(u, y);
-            o[u as usize] = Some((0, y));
-        }
-        for &(u, level) in self.b_units {
-            let y = *ya
-                .get(&level)
-                .ok_or_else(|| format!("gemma: unit {u} level with {level}, not in A"))?;
-            o[u as usize] = Some((uw, y));
-        }
-        o.into_iter()
-            .enumerate()
-            .map(|(u, v)| v.ok_or_else(|| format!("gemma: unit {u} unplaced")))
-            .collect()
-    }
-
-    /// The unit columns: (x, units top to bottom, storage).
-    fn columns(&self, uw: u32) -> [(u32, Vec<u32>, &StoreSpec); 2] {
-        [
-            (0, self.a_units.to_vec(), &self.stores[0]),
-            (
-                uw,
-                self.b_units.iter().map(|&(u, _)| u).collect(),
-                &self.stores[1],
-            ),
-        ]
-    }
-}
 
 /// The presets: the unit shape that picks the arrangement (weight columns, rows, units), the head's
 /// rows, the global KV entries a KV row (NEG; the context is NEG x the KV rows), the reduction
@@ -302,6 +160,36 @@ impl Family for Gemma {
     /// The arrangement's units, the scores segments a half row, the PLE storage of each unit
     /// column, the shared-KV line, the head east of the units (fed the embedding inline), the
     /// token loop.
+    fn copies(&self, plan: &Plan) -> R<KernelCopies> {
+        let p = &plan.partition;
+        let hr = p.head.rows;
+        Ok(KernelCopies {
+            units: Some(UnitCopies {
+                cols: p.cols,
+                rows: p.rows,
+                w_from: Vec::new(),
+                gam_b16: false,
+                gam_from: Vec::new(),
+                cy: &[("qkw", true), ("rot", false)],
+                cy_optional: false,
+            }),
+            head: Some(HeadCopies {
+                cols: p.head.cols,
+                rows: hr,
+                hw: |_, rows, cols| Slice::of("hw", None, vec![rows, cols]),
+                hw_from: vec![(
+                    "embed_tokens".into(),
+                    vec![Transform::PadLastRow {
+                        to: hr * p.head.vocab_rows,
+                    }],
+                )],
+                hg_from: from("norm"),
+                hemb: Hemb::Inline(Vec::new()),
+            }),
+            ..Default::default()
+        })
+    }
+
     fn blocks(&self, plan: &Plan) -> R<Vec<Box<dyn Block>>> {
         let arr = Arrangement::of(plan)?;
         let p = &plan.partition;

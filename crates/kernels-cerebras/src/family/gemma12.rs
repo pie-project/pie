@@ -10,6 +10,7 @@ use crate::block::Block;
 use crate::block::head::{HeadCopies, Hemb};
 use crate::block::head_groups::HeadGroups;
 use crate::block::row_runs::{RowRuns, RunCopies};
+use crate::compose::KernelCopies;
 use crate::family::{Family, MadeFor, Row, ceil_to, table};
 use crate::floor::{UnitGrid, UnitLayout};
 use crate::kernels::gemma12::{self, Dims};
@@ -188,6 +189,42 @@ impl Family for Gemma12 {
     /// weights (bf16 -> f16) and gammas, its CY row's q / k norms and RoPE tables; the head in
     /// its two halves' files (one is over the 2 GiB a staged file may take), its rows padded with
     /// the embedding's last.
+    fn copies(&self, plan: &Plan) -> R<KernelCopies> {
+        let p = &plan.partition;
+        let f16 = vec![
+            "self_attn.{q,k,v,o}_proj.weight",
+            "mlp.{gate,up,down}_proj.weight",
+        ]
+        .into_iter()
+        .map(|n| (n.to_string(), vec![Transform::Bf16ToF16]))
+        .collect();
+        Ok(KernelCopies {
+            runs: Some(RunCopies {
+                w_from: f16,
+                cy: &[("qkw", true), ("rot", false)],
+            }),
+            head: Some(HeadCopies {
+                cols: p.head.cols,
+                rows: p.head.rows,
+                hw: |i, rows, (c0, c1)| {
+                    Slice::of(&format!("hw{i}"), None, vec![rows, (0, c1 - c0)])
+                },
+                hw_from: vec![(
+                    "embed_tokens.weight".into(),
+                    vec![
+                        Transform::PadLastRow {
+                            to: p.head.rows * p.head.vocab_rows,
+                        },
+                        Transform::Bf16ToF16,
+                    ],
+                )],
+                hg_from: from("norm.weight"),
+                hemb: Hemb::None,
+            }),
+            ..Default::default()
+        })
+    }
+
     fn blocks(&self, plan: &Plan) -> R<Vec<Box<dyn Block>>> {
         let p = &plan.partition;
         let f16 = vec![

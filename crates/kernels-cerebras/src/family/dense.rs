@@ -10,7 +10,7 @@ use crate::block::head::{HeadCopies, HeadEast, Hemb};
 use crate::block::segments::{Onorm, Scores};
 use crate::block::token_loop::TokenLoop;
 use crate::block::units::{UnitCopies, Units};
-use crate::compose::snake_gap;
+use crate::compose::{KernelCopies, snake_gap};
 use crate::family::{Family, MadeFor, Row, table, units_of};
 use crate::floor::{UnitGrid, UnitLayout};
 use crate::kernels::dense;
@@ -206,6 +206,55 @@ impl Family for Dense {
             partition,
             contract,
             levers: pr.levers.clone(),
+        })
+    }
+
+    fn copies(&self, plan: &Plan) -> R<KernelCopies> {
+        let (s, p) = (&plan.shape, &plan.partition);
+        // Qwen3-8B's hidden zero-padded to the row split
+        let placed = p.hidden_placed();
+        let pad = |t: &str| -> From {
+            let tr = if placed != s.hidden {
+                vec![Transform::PadZero { dim: 1, to: placed }]
+            } else {
+                vec![]
+            };
+            vec![(t.to_string(), tr)]
+        };
+        Ok(KernelCopies {
+            units: Some(UnitCopies {
+                cols: p.cols,
+                rows: p.rows,
+                w_from: pad("layers.*.{q,k,v,o,gate,up,down}_proj, linear_attn.*"),
+                gam_b16: true,
+                gam_from: pad("layers.*.{input,post_attention}_layernorm, norm"),
+                cy: &[
+                    ("cw", true),
+                    ("gpar", true),
+                    ("gnw", true),
+                    ("qkw", true),
+                    ("rot", true),
+                ],
+                cy_optional: true,
+            }),
+            head: Some(HeadCopies {
+                cols: p.head.cols,
+                rows: p.head.rows,
+                hw: |_, rows, cols| Slice::of("hw", None, vec![rows, cols]),
+                hw_from: vec![(
+                    "lm_head".into(),
+                    vec![Transform::PadLastRow {
+                        to: p.head.rows * p.head.vocab_rows,
+                    }],
+                )],
+                hg_from: from("norm"),
+                hemb: if plan.contract.token_loop {
+                    Hemb::After(from(&format!("embed_tokens ({} rows)", s.vocab)))
+                } else {
+                    Hemb::None
+                },
+            }),
+            ..Default::default()
         })
     }
 

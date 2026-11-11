@@ -12,8 +12,8 @@
 use crate::plan::{LayerKind, Plan};
 use crate::tiles::spec::{Elem, File, Fill, Gather, Grid, Head, Map, Part, Ple, Rope, Spec, range};
 
-use super::Arrangement;
 use crate::block::ple::FILE_MAX;
+use crate::compose::stacked::Arrangement;
 
 type R<T> = Result<T, String>;
 

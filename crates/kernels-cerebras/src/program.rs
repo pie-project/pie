@@ -38,14 +38,12 @@ impl Program {
     /// links, then settles the floor on them; the palette is the blocks' colours; lay the fabric
     /// and validate it (its invariants); the family's kernels, every PE's routes within its
     /// kernel's route table; the blocks' param overrides. Pure (no device, no files).
-    /// The blocks are the composer's ([`compose`]) from what the layers need, the family's
-    /// where the composer has none for a need yet.
+    /// The blocks are the composer's ([`compose`]) from what the layers need; their copies the
+    /// family kernels'.
     pub fn build(family: Box<dyn Family>, plan: Plan) -> Result<Program, String> {
         plan.validate()?;
-        let blocks = match compose::blocks(&plan, &Needs::of(&layers::of(&plan.shape)))? {
-            Some(b) => b,
-            None => family.blocks(&plan)?,
-        };
+        let needs = Needs::of(&layers::of(&plan.shape));
+        let blocks = compose::blocks(&plan, &needs, family.copies(&plan)?)?;
         Program::build_with(blocks, family, plan)
     }
 

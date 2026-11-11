@@ -6,6 +6,7 @@
 
 use super::abi::Kernels;
 use super::block::Block;
+use super::compose::KernelCopies;
 use super::plan::{FamilyId, LayerKind, Plan, Preset, Shape};
 use super::program::Program;
 use super::tiles::spec::Spec;
@@ -29,6 +30,9 @@ pub trait Family: Send + Sync {
     /// The blocks the plan composes, in order: the units first, then what is placed against
     /// them. Floor, wiring, palette, overrides and copies run over them in this order.
     fn blocks(&self, plan: &Plan) -> R<Vec<Box<dyn Block>>>;
+
+    /// What the family's kernels read off the PEs of each block kind the composer places.
+    fn copies(&self, plan: &Plan) -> R<KernelCopies>;
 
     /// Each kind's kernel and its params (levers applied by [`super::emit::params::kernels`]).
     fn kernels(&self, prog: &Program) -> R<Kernels>;

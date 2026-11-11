@@ -9,6 +9,7 @@ use crate::abi::Kernels;
 use crate::block::Block;
 use crate::block::band::{Band, BandLoop};
 use crate::block::moe::{AttnScores, MoeCopies, MoeUnits, Router};
+use crate::compose::KernelCopies;
 use crate::family::{Family, MadeFor, Row, ceil_to, table};
 use crate::floor::{UnitGrid, UnitLayout};
 use crate::kernels::gptoss::{self, Dims};
@@ -138,6 +139,27 @@ impl Family for GptOss {
             partition,
             contract,
             levers: pr.levers.clone(),
+        })
+    }
+
+    fn copies(&self, plan: &Plan) -> R<KernelCopies> {
+        let d = Dims::of(plan)?;
+        let k = d.k;
+        let lwa = d.hcc * d.nqa + d.qo * d.hcc;
+        Ok(KernelCopies {
+            moe: Some(MoeCopies {
+                w: k * lwa,
+                wx: k * d.nex * d.xe,
+                wr: k * d.hcc,
+                cx: [2 * k * d.hcc, k * d.hcc, k * d.nex * d.hcc],
+                cya: [k * d.nqa, k * d.qh, d.nlv * 8 * 2 * d.nrot],
+                cym: [k, k * d.nex * 2 * d.ic, k * d.nex * 2],
+                wx_from: vec![(
+                    "model.layers.*.mlp.experts.{gate_up,down}_proj_blocks".to_string(),
+                    vec![Transform::Mxfp4ToE5m2],
+                )],
+            }),
+            ..Default::default()
         })
     }
 
