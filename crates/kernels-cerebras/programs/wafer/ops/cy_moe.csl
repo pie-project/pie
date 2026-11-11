@@ -8,6 +8,10 @@
 //   gate|up reduction (TK x [gate Ic | up Ic]) -> x 2^Pg[e] rsqrt, + biases, gate <= limit, up in
 //   [-limit, limit], act = (up + 1) gate sigmoid(alpha gate), x w_k 2^Pd[e] -> multicast act' (TK Ic)
 //
+// Variants (comptime, from the layer program): RB (1: the router's bias), GB (1: the gate / up biases),
+// PSC (1: the experts' powers of two, MXFP4's; 0: 16-bit experts, ps unread), GLU (0: the clamped SwiGLU
+// above; 1: SiLU's, act = up g sigmoid(g), unclamped (SWA 1)).
+//
 // Interface: rb (f32 [layer] the router bias of this column's output), gb (f32 [layer][NEX][2 Ic] gate |
 // up biases), ps (f32 [layer][NEX][2]: 2^Pg, 2^Pd); this column's router output is the core's word (a
 // runtime role).
@@ -27,6 +31,10 @@ param TK: u16 = 4;
 param SWL: f32 = 7.0;
 param SWA: f32 = 1.702;
 param GLUV: u16 = 0;
+param RB: u16 = 1;
+param GB: u16 = 1;
+param PSC: u16 = 1;
+param GLU: u16 = 0;
 
 fn fmax(a: f32, b: f32) f32 { return if (b > a) b else a; }
 const G2: u16 = 2 * Ic;
@@ -78,7 +86,7 @@ fn layer(l: u16) void {
   pe.stamp(1 + 3 * l);
   const rr = math.rsqrt(pe.t[1] / pe.HID + pe.EPS);
   @fmovs(g_d, 0.0);
-  g[pe.word] = pe.t[0] * rr + rb[l];
+  g[pe.word] = if (RB == 1) pe.t[0] * rr + rb[l] else pe.t[0] * rr;
   pe.seg_ar(g_d, NEX);
   pe.stamp(1 + 3 * K + l);
   // top TK: the pairwise-maximum tree once (blocks of 2, 4, 8, then over the NEX / 8 blocks); a round takes the
@@ -127,8 +135,8 @@ fn layer(l: u16) void {
   while (k < TK) : (k += 1) {
     const e2 = sel[k];
     const pb = (l * NEX + e2) * 2;
-    @fmuls(pe.tv(k * G2, G2), pe.tv(k * G2, G2), ps[pb] * rr);
-    @fadds(pe.tv(k * G2, G2), pe.tv(k * G2, G2), @set_dsd_base_addr(gb_d, @ptrcast([*]f32, &gb[(l * NEX + e2) * G2])));
+    @fmuls(pe.tv(k * G2, G2), pe.tv(k * G2, G2), if (PSC == 1) ps[pb] * rr else rr);
+    if (GB == 1) { @fadds(pe.tv(k * G2, G2), pe.tv(k * G2, G2), @set_dsd_base_addr(gb_d, @ptrcast([*]f32, &gb[(l * NEX + e2) * G2]))); }
     @fmovs(@set_dsd_length(@increment_dsd_offset(sg_d, @as(i16, k * Ic), f32), Ic), pe.tv(k * G2, Ic));
     @fmovs(pe.uv(k * Ic, Ic), pe.tv(k * G2 + Ic, Ic));
   }
@@ -136,8 +144,10 @@ fn layer(l: u16) void {
   const G = @set_dsd_length(sg_d, NG);
   const U = pe.uv(0, NG);
   // gate <= SWL: -max(-g, -SWL); up in [-SWL, SWL]
-  @fnegs(G, G); @fmaxs(G, G, -SWL); @fnegs(G, G);
-  @fmaxs(U, U, -SWL); @fnegs(U, U); @fmaxs(U, U, -SWL); @fnegs(U, U);
+  if (GLU == 0) {
+    @fnegs(G, G); @fmaxs(G, G, -SWL); @fnegs(G, G);
+    @fmaxs(U, U, -SWL); @fnegs(U, U); @fmaxs(U, U, -SWL); @fnegs(U, U);
+  }
   const E = pe.tv(0, NG);
   if (GLUV == 1) {
     // e = exp(-SWA |g|) (the sign bit set on the high halves), d = 1 + e in (1, 2], r = 1 / d
@@ -169,12 +179,12 @@ fn layer(l: u16) void {
     while (i < NG) : (i += 1) { pe.t[i] = math.recip(1.0 + pe.t[i]); }
     @fmuls(G, G, E);            // glu = g sigmoid(SWA g)
   }
-  @fadds(U, U, 1.0);
-  @fmuls(U, U, G);              // act = (up + 1) glu
+  if (GLU == 0) { @fadds(U, U, 1.0); }
+  @fmuls(U, U, G);              // act = (up + 1) glu (GLU 1: up glu)
   k = 0;
   while (k < TK) : (k += 1) {
     const pb = (l * NEX + sel[k]) * 2;
-    @fmuls(pe.uv(k * Ic, Ic), pe.uv(k * Ic, Ic), wsel[k] * ps[pb + 1]);
+    @fmuls(pe.uv(k * Ic, Ic), pe.uv(k * Ic, Ic), if (PSC == 1) wsel[k] * ps[pb + 1] else wsel[k]);
   }
   @fmovs(fab.fout(pe.q_mc, NG), U);
   pe.stamp(3 + 3 * l);

@@ -55,7 +55,13 @@ impl<'a> Cache<'a> {
                 .params
                 .get(name)
                 .ok_or_else(|| format!("no param {name}"))?;
-            let w = p.shape.iter().skip(1).product::<u64>() as usize;
+            // a row: a matrix's (its dims past the first); a bank of matrices (three dims or
+            // more) its last dim's, rows running over the leading ones
+            let w = if p.shape.len() >= 3 {
+                p.shape.last().copied().unwrap_or(1) as usize
+            } else {
+                p.shape.iter().skip(1).product::<u64>() as usize
+            };
             if *width.get_or_insert(w) != w {
                 return Err(format!("{key}: stacked params of different widths"));
             }

@@ -19,6 +19,9 @@ type R<T> = Result<T, String>;
 /// The bytes the memory model may be off by: kept free past the stack room.
 pub const MARGIN: f64 = 512.0;
 
+/// The refusals the repair follows a step.
+const BEAM: usize = 96;
+
 /// Keys that are not the partition's (the contract's levels and loop, the head's scale).
 const FIXED: &[&str] = &["CTX", "LOOP", "NLV", "HSCALE", "RLV", "RBITS", "CAP", "WL"];
 
@@ -203,16 +206,36 @@ impl Search<'_> {
 }
 
 impl Search<'_> {
+    /// How far a plan that plans is from serving: (positions short, the memory short of the
+    /// room the search keeps, the vocabulary rows short); all zero where it fits.
+    fn short(&self, plan: &Plan) -> (u64, i64, u64) {
+        let h = &plan.partition.head;
+        let held = u64::from(h.rows.max(h.cols)) * u64::from(h.vocab_rows);
+        let room = memory::room(plan, self.anchor);
+        (
+            u64::from(self.positions.saturating_sub(plan.contract.positions)),
+            (f64::from(STACK_ROOM) + MARGIN - room).max(0.0) as i64,
+            u64::from(self.shape.vocab).saturating_sub(held),
+        )
+    }
+
     /// A seed that does not plan (or fit), moved one key at a time to one that does: each move
-    /// that gets the plan past the check it failed (its refusal changes) is followed, a few deep.
+    /// that gets the plan past the check it failed (its refusal names another check) is followed, a
+    /// few deep
+    /// (the first [`BEAM`] a step);
+    /// from the partitions that plan but do not fit, the moves that bring them nearest a fit
+    /// ([`Search::short`]) are followed.
     fn repair(&self, seed: &Preset, keys: &[String]) -> Option<(Preset, Scored)> {
         let why = |p: &Preset| match self.fam.plan(self.shape, p) {
             Ok(_) => "fit".to_string(),
             Err(e) => e,
         };
+        // the check a refusal names: its text past the numbers
+        let check = |e: &str| e.replace(|c: char| c.is_ascii_digit(), "");
         let mut frontier = vec![(seed.clone(), why(seed))];
         let mut seen: BTreeSet<String> = BTreeSet::new();
-        for _ in 0..6 {
+        let mut planned: Vec<Preset> = Vec::new();
+        for _ in 0..10 {
             let mut next = Vec::new();
             let mut found: Option<(Preset, Scored)> = None;
             for (p, err) in &frontier {
@@ -228,7 +251,9 @@ impl Search<'_> {
                             continue;
                         }
                         let e = why(&q);
-                        if e != *err && seen.insert(e.clone()) {
+                        if e == "fit" {
+                            planned.push(q);
+                        } else if check(&e) != check(err) && seen.insert(e.clone()) {
                             next.push((q, e));
                         }
                     }
@@ -238,9 +263,45 @@ impl Search<'_> {
                 return found;
             }
             if next.is_empty() {
-                return None;
+                break;
             }
+            // (a beam: the first refusals reached, each a different check's or value's)
+            next.truncate(BEAM);
             frontier = next;
+        }
+        self.climb(planned, keys)
+    }
+
+    /// From partitions that plan but do not fit, the single key moves that keep them planning
+    /// and bring them nearest a fit, a step at a time, until one fits and builds.
+    fn climb(&self, mut from: Vec<Preset>, keys: &[String]) -> Option<(Preset, Scored)> {
+        let near = |p: &Preset| self.fam.plan(self.shape, p).ok().map(|pl| self.short(&pl));
+        from.sort_by_key(|p| near(p));
+        from.dedup_by_key(|p| key(p));
+        let mut seen: BTreeSet<String> = BTreeSet::new();
+        for start in from.into_iter().take(4) {
+            let mut at = start;
+            for _ in 0..40 {
+                if let Some(s) = self.score(&at).filter(|s| builds(&s.planned.plan)) {
+                    return Some((at, s));
+                }
+                let cur = near(&at)?;
+                let best = keys
+                    .iter()
+                    .flat_map(|k| ladder(at.keys[k]).into_iter().map(move |v| (k, v)))
+                    .map(|(k, v)| with(&at, k, v))
+                    .filter(|q| !seen.contains(&key(q)))
+                    .filter_map(|q| near(&q).map(|n| (n, q)))
+                    .filter(|(n, _)| *n < cur)
+                    .min_by_key(|(n, _)| *n);
+                match best {
+                    Some((_, q)) => {
+                        seen.insert(key(&q));
+                        at = q;
+                    }
+                    None => break,
+                }
+            }
         }
         None
     }
@@ -259,7 +320,8 @@ fn with(p: &Preset, k: &str, v: f64) -> Preset {
     q
 }
 
-/// The values a key moves to from `v`: its neighbours, ratios of it, and small counts.
+/// The values a key moves to from `v`: its neighbours, ratios of it, small counts and the powers of
+/// two around it.
 fn ladder(v: f64) -> Vec<f64> {
     let mut out = BTreeSet::new();
     let v = v.round() as i64;
@@ -281,6 +343,11 @@ fn ladder(v: f64) -> Vec<f64> {
     }
     if v <= 16 {
         out.extend(1..=16);
+    }
+    // the powers of two around it (the dims a hidden of a power of two splits into)
+    if v > 0 {
+        let lo = 1i64 << (63 - v.leading_zeros());
+        out.extend([lo, lo * 2]);
     }
     out.into_iter()
         .filter(|&x| (1..=4096).contains(&x) && x != v)

@@ -217,6 +217,16 @@ pub struct Schedule {
     pub kvs: u32,
     /// 1: x leaves the last unit for the head by row groups ([`Layout::Runs`]).
     pub hg: u32,
+    /// (attention halves) 1: the q / k / v biases; 1: the sinks; 1: the q / k head norms.
+    pub qb: u32,
+    pub snk: u32,
+    pub qkn: u32,
+    /// (MoE halves) 1: the output projection's bias; 1: the router's bias; 1: the experts' biases.
+    pub ob: u32,
+    pub rb: u32,
+    pub xb: u32,
+    /// (MoE halves) the experts' GLU: 0 the clamped SwiGLU, 1 SiLU's.
+    pub glu: u32,
 }
 
 impl Schedule {
@@ -243,6 +253,13 @@ impl Schedule {
             ple: u32::from(needs.side_in),
             kvs: u32::from(needs.shared_cache),
             hg: u32::from(Layout::of(needs) == Layout::Runs),
+            qb: u32::from(needs.attn_bias),
+            snk: u32::from(needs.sinks),
+            qkn: u32::from(needs.qk_norm),
+            ob: u32::from(needs.o_bias),
+            rb: u32::from(needs.router_bias),
+            xb: u32::from(needs.expert_bias),
+            glu: u32::from(program.bodies.iter().any(|b| b.glu == Some(GluAct::Swiglu))),
         }
     }
 
@@ -515,15 +532,20 @@ mod tests {
             let t = trace(name);
             let sc = Schedule::of(&program(&t));
             assert_eq!(
-                sc,
-                Schedule {
-                    nrm,
-                    mixk,
-                    act,
-                    ple,
-                    kvs,
-                    hg
-                },
+                (sc.nrm, sc.mixk, sc.act, sc.ple, sc.kvs, sc.hg),
+                (nrm, mixk, act, ple, kvs, hg),
+                "{name}"
+            );
+        }
+        // the MoE halves' variants: gpt-oss's biases and sinks, the mini's head norms and SiLU
+        for (name, want) in [
+            ("gptoss-20b-bf16-mxfp4-kv-bf16", (1, 1, 0, 1, 1, 1, 0)),
+            ("qwen3-30b-a3b-mini-bf16-kv-bf16", (0, 0, 1, 0, 0, 0, 1)),
+        ] {
+            let sc = Schedule::of(&program(&trace(name)));
+            assert_eq!(
+                (sc.qb, sc.snk, sc.qkn, sc.ob, sc.rb, sc.xb, sc.glu),
+                want,
                 "{name}"
             );
         }

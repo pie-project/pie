@@ -11,7 +11,10 @@
 // Params: pe (ops/wpe.csl), fab, math (ops/math.csl), ON (false: another mixer kind's unit), K,
 // KM, Qh (q heads a column), Dc (kv dims a column), NE (entries a row a full layer), QO (o dims a
 // column), PYW (the weight rows), WIN (the sliding window), PFTZ (1: f16 subnormal probabilities
-// and o values flushed to 0 before their matvecs).
+// and o values flushed to 0 before their matvecs), QKN (1: the q / k heads RMS-normed: CY's multicast
+// carries the raw sums of squares of q's heads and k after the position; they ride the scores'
+// all-reduce, the scores times each head's 1 / rms(q) and the entry's 1 / rms(k), kept a live entry),
+// HD (the head dim: the norms' mean), EPS.
 param pe: imported_module;
 param fab: imported_module;
 param math: imported_module;
@@ -25,6 +28,9 @@ param QO: u16;
 param PYW: u16;
 param WIN: u16;
 param PFTZ: u16;
+param QKN: u16 = 0;
+param HD: u16 = 64;
+param EPS: f32 = 1.0e-6;
 
 fn mx(a: u16, b: u16) u16 { return if (a > b) a else b; }
 fn nla() u16 { var n: u16 = 0; var l: u16 = 0; while (l < K) : (l += 1) { if (((KM >> l) & 1) == 1) { n += 1; } } return n; }
@@ -65,7 +71,13 @@ fn ftz(n: u16) void {
 }
 const qt_d = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{NQT} -> qt[i] });
 const QD: u16 = Qh * Dc;
-const AB: u16 = if (ON) QD + 2 * Dc + 1 else 1;
+const AB: u16 = if (ON) QD + 2 * Dc + 1 + (if (QKN == 1) Qh + 1 else 0) else 1;
+const SQ: u16 = QD + 2 * Dc + 1;   // (QKN 1) the raw sums of squares' offset in CY's multicast
+// (QKN 1) 1 / rms(k) of every live entry (full layers [a][e], then a sliding layer's one), 1 / rms(q) a head
+var kinv = @zeros([if (ON and QKN == 1) NLA * NE + NLS else 1]f32);
+var rq = @zeros([if (ON and QKN == 1) Qh else 1]f32);
+const rq_d = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{if (ON and QKN == 1) Qh else 1} -> rq[i] });
+const HDF: f32 = @as(f32, HD);
 var ab = @zeros([AB]f32);
 const NSX: u16 = if (ON) NS + 1 + Qh else 1;
 var sx = @zeros([NSX]f32);
@@ -131,7 +143,24 @@ fn mix(l: u16, full: bool, a: u16, s: u16) void {
         pe.mvx(@ptrcast([*]u16, &qt), Dc, Qh, xk, e * Qh);
       }
       @fmovs(@set_dsd_length(sx_d, nsl), yv(0, nsl));
-      if (pe.seg.role != 5) { seg_ar(nsl); }
+      if (QKN == 1) {
+        h = 0;
+        while (h < Qh) : (h += 1) { sx[nsl + h] = ab[SQ + h]; }
+        sx[nsl + Qh] = if (mine) ab[SQ + Qh] else 0.0;
+      }
+      if (pe.seg.role != 5) { seg_ar(if (QKN == 1) nsl + Qh + 1 else nsl); }
+      if (QKN == 1) {
+        const k0: u16 = if (full) a * NE else NLA * NE + s;
+        if (mine) { kinv[k0 + (if (full) e0 else 0)] = math.rsqrt(sx[nsl + Qh] / HDF + EPS); }
+        h = 0;
+        while (h < Qh) : (h += 1) { rq[h] = math.rsqrt(sx[nsl + h] / HDF + EPS); }
+        e = 0;
+        while (e < nel) : (e += 1) {
+          const se = @set_dsd_length(@increment_dsd_offset(sx_d, @as(i16, e * Qh), f32), Qh);
+          @fmuls(se, se, rq_d);
+          @fmuls(se, se, kinv[k0 + e]);
+        }
+      }
       const mr = @set_dsd_length(@increment_dsd_offset(@get_dsd(mem1d_dsd, .{ .tensor_access = |i|{if (ON) K * Qh else 1} -> mref[i] }), @as(i16, l * Qh), f32), Qh);
       e = 0;
       while (e < nel) : (e += 1) {

@@ -219,6 +219,18 @@
    "vocab": 100,
    "levers": "",
    "source": ""
+  },
+  {
+   "name": "tiny_qwen3moe",
+   "kind": "tiny",
+   "shape": "shapes/tiny_qwen3moe.json",
+   "preset": "tiny",
+   "set": "MX=16,SWR=16,HVC=40",
+   "ckpt": "qwen3moe/tiny/s2",
+   "prefix": "",
+   "vocab": 100,
+   "levers": "",
+   "source": "tools/wafer/qwen3moe/mk_tiny_qwen3moe.py (seed 2)"
   }
  ]
 }

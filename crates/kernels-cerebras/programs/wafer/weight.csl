@@ -73,7 +73,7 @@ param PYW: u16 = 208;  // the attention rows (position p lives on row p % PYW)
 param HD: u16 = 256;   // (MIXK 0) the head dim (the q/k RMSNorm's mean)
 param HDS: u16 = 256;  // (MIXK 1) head dims: sliding, global
 param HDG: u16 = 512;
-param QKN: u16 = 1;    // (MIXK 0) 1: the q / k heads are RMS-normed
+param QKN: u16 = 1;    // (MIXK 0 / 2) 1: the q / k heads are RMS-normed
 param SH: u16 = 0;     // (MIXK 1) 1: a shared-KV unit (q-only projections, the two shared caches)
 param AROW: u16 = 1;   // (MIXK 1) 1 an attention row, 2 a plain row
 param KEV: u16 = 0;    // (MIXK 1) 1: a global layer's projection is q | raw k
@@ -84,6 +84,8 @@ param XHI: u16 = 0;    // (MIXK 1) 1: the scores clamped at ln(65504) (ops/kv.cs
 param PFTZ: u16 = 0;   // (MIXK 2) 1: f16 subnormal probabilities and o values flushed to 0
 param NEX: u16 = 32;   // (MIXK 3) experts, experts a token
 param TK: u16 = 4;
+param XF: u16 = 0;     // (MIXK 3) the experts' format: 0 E5M2 pairs (MXFP4's), 1 f16
+param EPS: f32 = 1.0e-6; // (MIXK 2, QKN 1) the q / k norms' eps
 param GDEC: u16 = 1;   // 1: S^T k / S^T q of the undecayed state (CY scales them)
 param ATTL: u16 = 2;   // 2: CY sends the heads' log-sum-exp steps after o, read after the o_proj send
 param SSQL: u16 = 1;   // (NRM 0) 1: x's sum of squares arrives after x: taken after the matvec
@@ -130,8 +132,9 @@ const NQM: u16 = Qh * DcG + (if (SH == 1) 0 else 2 * DcG);
 const NS1: u16 = Qh * NEM + Qh + 2;
 
 // MIXK 2: per layer [qkv Hc x NQA][o QO x Hc]; MIXK 3: per layer, per expert [gate|up Hc/2 x 2Ic][down Ic/2 x Hc]
+// (XF 1: [gate|up Hc x 2Ic][down Ic x Hc])
 const LW2: u16 = Hc * NQA + QO * Hc;
-const XE: u16 = (Hc / 2) * 2 * Ic + (Ic / 2) * Hc;
+const XE: u16 = if (XF == 1) Hc * 2 * Ic + Ic * Hc else (Hc / 2) * 2 * Ic + (Ic / 2) * Hc;
 
 const WN: u32 = if (MIXK == 0) @as(u32, NLA) * LWA + @as(u32, NLG) * LWG else if (MIXK == 1) wtot()
                 else if (MIXK == 2) @as(u32, K) * LW2 else @as(u32, K) * NEX * XE - 1;
@@ -160,8 +163,9 @@ const kv = @import_module("ops/kv.csl", .{ .pe = pe, .fab = fab, .math = math, .
   .WSPEC = WSPEC, .RING = RING, .WIN = WIN, .XHI = XHI, .PLOG = PLOG, .DIAG = DIAG });
 var kvlog_ptr: [*]f32 = &kv.kvlog;
 const swa = @import_module("ops/swa.csl", .{ .pe = pe, .fab = fab, .math = math, .ON = MIXK == 2, .K = K, .KM = KM, .Qh = Qh,
-  .Dc = Dc, .NE = NE, .QO = QO, .PYW = PYW, .WIN = WIN, .PFTZ = PFTZ });
-const moe = @import_module("ops/moe.csl", .{ .pe = pe, .fab = fab, .ON = MIXK == 3, .K = K, .Hc = Hc, .Ic = Ic, .NEX = NEX, .TK = TK });
+  .Dc = Dc, .NE = NE, .QO = QO, .PYW = PYW, .WIN = WIN, .PFTZ = PFTZ, .QKN = QKN, .HD = HD, .EPS = EPS });
+const moe = @import_module("ops/moe.csl", .{ .pe = pe, .fab = fab, .ON = MIXK == 3, .K = K, .Hc = Hc, .Ic = Ic, .NEX = NEX, .TK = TK,
+  .XF = XF });
 var wr_ptr: [*]f32 = &moe.wr;
 
 fn init() void {

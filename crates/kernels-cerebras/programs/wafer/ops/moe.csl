@@ -11,10 +11,12 @@
 // Experts are FP8 E5M2 (the high byte of the f16), the exact MXFP4 values times 2^-P (one power of two a
 // layer / expert / matrix; CY applies it). A u16 holds two: gate|up rows i < Hc/2 in the high bytes, rows
 // Hc/2.. in the low (one 2 Ic row each, gate then up); down rows i < Ic/2 high, the rest low (Hc each).
-// A decode is two 16-bit ops a tile (and 0xff00, shift left 8).
+// A decode is two 16-bit ops a tile (and 0xff00, shift left 8). XF 1: 16-bit experts (the checkpoint's own
+// values in f16, CY's powers of two unread), a tile copied as it is: gate|up Hc rows of 2 Ic, down Ic rows of Hc.
 //
 // Params: pe (ops/wpe.csl: pe.w per layer, per expert [gate|up Hc/2 x 2Ic][down Ic/2 x Hc]), fab, ON
-// (false: another mixer kind's unit), K, Hc, Ic, NEX (experts), TK (experts a token).
+// (false: another mixer kind's unit), K, Hc, Ic, NEX (experts), TK (experts a token), XF (the experts' format:
+// 0 E5M2 pairs, 1 f16).
 param pe: imported_module;
 param fab: imported_module;
 param ON: bool = true;
@@ -23,10 +25,11 @@ param Hc: u16;
 param Ic: u16;
 param NEX: u16;
 param TK: u16;
+param XF: u16 = 0;
 
 fn mx(a: u16, b: u16) u16 { return if (a > b) a else b; }
-const XG: u16 = (Hc / 2) * 2 * Ic;   // u16 words of an expert's gate|up
-const XD: u16 = (Ic / 2) * Hc;       // ... of its down
+const XG: u16 = if (XF == 1) Hc * 2 * Ic else (Hc / 2) * 2 * Ic;   // u16 words of an expert's gate|up
+const XD: u16 = if (XF == 1) Ic * Hc else (Ic / 2) * Hc;             // ... of its down
 const XE: u16 = XG + XD;
 var wr = @zeros([if (ON) K * Hc else 1]f32);
 const NXF: u16 = if (ON) Hc + 2 else 1;
@@ -46,9 +49,11 @@ fn mvd(R: u16, N: u16, xo: u16) void {
   pe.matvec.tile16(yh, @set_dsd_length(dec_d, N), @set_dsd_length(@increment_dsd_offset(pe.xh_d, @as(i16, xo), @fp16()), R));
 }
 // decode n u16 words at w[o] into dec[d0..d0 + 2n): high bytes, then low bytes
+// (XF 1: the n words copied to dec[d0..d0 + n))
 fn dec2(o: u16, n: u16, d0: u16) void {
   const src = @set_dsd_length(@set_dsd_base_addr(pe.a_d, @ptrcast([*]u16, &pe.w[o])), n);
   const lo = @set_dsd_length(@increment_dsd_offset(dec_d, @as(i16, d0), @fp16()), n);
+  if (XF == 1) { @mov16(lo, src); return; }
   @and16(lo, src, @as(u16, 0xff00));
   @sll16(@increment_dsd_offset(lo, @as(i16, n), @fp16()), src, 8);
 }

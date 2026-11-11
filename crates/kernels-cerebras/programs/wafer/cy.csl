@@ -29,7 +29,8 @@
 //
 // Params. The layer program: K, KM, NRM, MIXK, ACT, PLE; shapes: NQA, NQG, Qh, Dc / DcS / DcG, DK, DV,
 // Ic, HR (hidden), CONV, NROT, HK, HV, NLV, QSC, NEX, TK; the mixers' variants: GATE, SH, KEV, KVS,
-// SWL, SWA, EPS (the norms' eps). Levers (default = the shipped 9B build): CONVQK 1, ATTV 1, GDEC 1,
+// SWL, SWA, EPS (the norms' eps); MIXK 2: QB, SNK, QKN (ops/cy_swa.csl); MIXK 3: RB, GB, PSC, GLU
+// (ops/cy_moe.csl). Levers (default = the shipped 9B build): CONVQK 1, ATTV 1, GDEC 1,
 // ROPEP 1, SILU16 1, SILUQ 1, ATTL 2, SLW 0, RLV / RBITS, GELUT 2, CYV 0, GLUV 0. Diagnostics (default
 // off): TSTAMP, DIAG (as weight.csl's; MIXK 1: 1 the PLE words and the KVS line alone (probes, logged
 // in plog), 32 no PLE words, 64 no KVS), PLOG; FIFOW: the reduction's FIFO depth. (HDS, HDG: unused.)
@@ -81,6 +82,13 @@ param RBITS: u16 = 3;
 param GELUT: u16 = 2;  // (ACT 1) GELU's form (ops/act.csl)
 param CYV: u16 = 0;    // (MIXK 2) the sinks' reciprocal's form (ops/cy_swa.csl)
 param GLUV: u16 = 0;   // (MIXK 3) the GLU's form (ops/cy_moe.csl)
+param QB: u16 = 1;     // (MIXK 2) 1: the q / k / v biases
+param SNK: u16 = 1;    // (MIXK 2) 1: the sinks
+param QKN: u16 = 0;    // (MIXK 2) 1: the q / k heads RMS-normed
+param RB: u16 = 1;     // (MIXK 3) 1: the router's bias
+param GB: u16 = 1;     // (MIXK 3) 1: the gate / up biases
+param PSC: u16 = 1;    // (MIXK 3) 1: the experts' powers of two (MXFP4's scales); 0: 16-bit experts
+param GLU: u16 = 0;    // (MIXK 3) 0: the clamped SwiGLU, (up + 1) g sigmoid(SWA g); 1: SiLU's, up g sigmoid(g)
 param EPS: f32 = 1.0e-6; // the RMSNorms' eps
 param PLOG: u16 = 0;   // (PLE 1) 1: the full model logs each step's PLE words too
 param TSTAMP: u16 = 0; // 1 (diagnostics): phase stamps into tdbg (on the critical path)
@@ -102,7 +110,8 @@ const NQM: u16 = QOM + (if (SH == 1) 0 else 2 * DcG);
 const TN: u16 = if (MIXK == 0) mx(mx(mx(NQA + 1, NQG + 1), mx(2 * Ic + 1, 2 * DV + 3)), Qh * Dc + 2 * Dc + 2 + Qh)
                 else if (MIXK == 1) mx(mx(2 * NQM + 4, 4 * Ic + 4), mx(QOM + 2 * DcG + Qh + 4, Qh * (DcG + 1) + 1))
                 else if (MIXK == 2) mx(NQA + 1, Qh * (Dc + 1)) else TK * 2 * Ic;
-const UN: u16 = if (MIXK <= 1) TN else if (MIXK == 2) mx(Qh * Dc + 2 * Dc + 1, Qh * Dc + 1 + Qh) else mx(TK * Ic, 2 * TK);
+const UN: u16 = if (MIXK <= 1) TN else if (MIXK == 2) mx(Qh * Dc + 2 * Dc + 1 + (if (QKN == 1) Qh + 1 else 0), Qh * Dc + 1 + Qh)
+                else mx(TK * Ic, 2 * TK);
 const NTD: u16 = if (MIXK <= 1) 1 + 6 * K else 1 + 4 * K;
 const RCW: u16 = if (MIXK == 0) 11 else if (MIXK == 1) 16 else 12;
 const pe = @import_module("ops/cpe.csl", .{ .fab = fab, .math = math, .TN = TN, .UN = UN, .RCW = RCW, .NTD = NTD,
@@ -128,11 +137,11 @@ const ple = @import_module("ops/cy_ple.csl", .{ .pe = pe, .fab = fab, .math = ma
 var pl_ptr: [*]f32 = &ple.pl;
 var plog_ptr: [*]f32 = &ple.plog;
 const swa = @import_module("ops/cy_swa.csl", .{ .pe = pe, .math = math, .ON = MIXK == 2, .K = K, .NQA = NQA, .Qh = Qh,
-  .Dc = Dc, .NROT = NROT, .NLV = NLV, .QSC = QSC, .CYV = CYV });
+  .Dc = Dc, .NROT = NROT, .NLV = NLV, .QSC = QSC, .CYV = CYV, .QB = QB, .SNK = SNK, .QKN = QKN });
 var qb_ptr: [*]f32 = &swa.qb;
 var snk_ptr: [*]f32 = &swa.snk;
 const moe = @import_module("ops/cy_moe.csl", .{ .pe = pe, .fab = fab, .math = math, .ON = MIXK == 3, .K = K, .Ic = Ic,
-  .NEX = NEX, .TK = TK, .SWL = SWL, .SWA = SWA, .GLUV = GLUV });
+  .NEX = NEX, .TK = TK, .SWL = SWL, .SWA = SWA, .GLUV = GLUV, .RB = RB, .GB = GB, .PSC = PSC, .GLU = GLU });
 var rb_ptr: [*]f32 = &moe.rb;
 var gb_ptr: [*]f32 = &moe.gb;
 var ps_ptr: [*]f32 = &moe.ps;

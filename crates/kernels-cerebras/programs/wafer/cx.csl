@@ -54,6 +54,8 @@ param PLE: u16 = 0;    // (NRM 1) 1: a PLE gate phase after the MLP
 param HG: u16 = 0;     // (NRM 1) 1: x leaves for the head by head groups
 param NEX: u16 = 32;   // (NRM 2) experts, experts a token
 param TK: u16 = 4;
+param BO: u16 = 1;     // (NRM 2) 1: the output projection's bias
+param BD: u16 = 1;     // (NRM 2) 1: the experts' down biases
 param HOSTX: u16 = 0;  // 1 (simulator tests): x is the host's (memcpy), no handoff
 param XG16: u16 = 0;   // (NRM 0) 1: f16(x) f16(g) in f16 (TRM 512); 0: x g in f32
 param SSQL: u16 = 1;   // (NRM 0) 1: x g goes first, the sum of squares (only CY needs it) last
@@ -331,7 +333,7 @@ fn layer2(l: u16) void {
   stamp(K + 3 + 4 * l);
   keep_red(2 * l);
   @fadds(x_d, x_d, t_d);
-  @fadds(x_d, x_d, fv(@ptrcast([*]f32, &bo[l * Hc])));
+  if (BO == 1) { @fadds(x_d, x_d, fv(@ptrcast([*]f32, &bo[l * Hc]))); }
   if ((DIAG & 4) == 0) {
     norm_send2(@ptrcast([*]f32, &gam32[(2 * l + 1) * Hc]));
     stamp(K + 4 + 4 * l);
@@ -340,7 +342,7 @@ fn layer2(l: u16) void {
     keep_red(2 * l + 1);
     @fadds(x_d, x_d, t_d);
     var k: u16 = 0;
-    while (k < TK) : (k += 1) {
+    while (BD == 1 and k < TK) : (k += 1) {
       const e = @as(u16, t[Hc + k]);
       @fmacs(x_d, x_d, fv(@ptrcast([*]f32, &bd[(l * NEX + e) * Hc])), t[Hc + TK + k]);
     }

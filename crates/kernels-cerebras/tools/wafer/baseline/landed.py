@@ -80,6 +80,20 @@ def main():
             put(n("mlp.down"), M + "experts.down_proj_blocks")
             put(n("mlp.down.scales"), M + "experts.down_proj_scales")
             put(n("mlp.down_bias"), M + "experts.down_proj_bias")
+        elif arch.startswith("Qwen3Moe"):
+            # Qwen3 MoE: q / k / v rows stacked, each expert's gate / up rows stacked, the experts stacked
+            A, M = L + "self_attn.", L + "mlp."
+            put(n("attn_norm"), L + "input_layernorm.weight")
+            put(n("mlp_norm"), L + "post_attention_layernorm.weight")
+            cat(n("qkv"), [A + f"{x}_proj.weight" for x in "qkv"])
+            put(n("q_norm"), A + "q_norm.weight")
+            put(n("k_norm"), A + "k_norm.weight")
+            put(n("o"), A + "o_proj.weight")
+            put(n("router"), M + "gate.weight")
+            E = tc["num_experts"]
+            ex = lambda e, leg: T[M + f"experts.{e}.{leg}_proj.weight"]
+            out[n("gate_up")] = ("BF16", np.stack([np.concatenate([ex(e, "gate")[1], ex(e, "up")[1]], 0) for e in range(E)]))
+            out[n("down")] = ("BF16", np.stack([ex(e, "down")[1] for e in range(E)]))
         elif arch.startswith("Gemma4"):
             A, M = L + "self_attn.", L + "mlp."
             for name, key in (("attn_norm", "input_layernorm"), ("post_attn_norm", "post_attention_layernorm"),

@@ -103,6 +103,14 @@ impl Family for GptOss {
                 moe.experts
             ));
         }
+        // a router segment holds every expert's output once (its words index the experts)
+        if pr.need("SWR")? != moe.experts {
+            return Err(format!(
+                "gpt-oss: router segments of {} columns for {} experts",
+                pr.need("SWR")?,
+                moe.experts
+            ));
+        }
         if !moe.experts.is_multiple_of(8) || moe.top_k == 0 || moe.top_k > moe.experts {
             return Err(format!(
                 "gpt-oss: top {} of {} experts (the pick tree takes blocks of 8)",
@@ -181,10 +189,17 @@ impl Family for GptOss {
                 cx: [2 * k * d.hcc, k * d.hcc, k * d.nex * d.hcc],
                 cya: [k * d.nqa, k * d.qh, d.nlv * 8 * 2 * d.nrot],
                 cym: [k, k * d.nex * 2 * d.ic, k * d.nex * 2],
-                wx_from: vec![(
-                    "model.layers.*.mlp.experts.{gate_up,down}_proj_blocks".to_string(),
-                    vec![Transform::Mxfp4ToE5m2],
-                )],
+                wx_from: if plan.shape.moe.is_some_and(|m| m.quantized) {
+                    vec![(
+                        "model.layers.*.mlp.experts.{gate_up,down}_proj_blocks".to_string(),
+                        vec![Transform::Mxfp4ToE5m2],
+                    )]
+                } else {
+                    vec![(
+                        "model.layers.*.mlp.experts.*.{gate_proj,up_proj,down_proj}".to_string(),
+                        vec![Transform::Bf16ToF16],
+                    )]
+                },
             }),
             ..Default::default()
         })
@@ -202,26 +217,25 @@ impl Family for GptOss {
         gptoss::SYMBOLS
     }
 
-    /// The attention and MoE halves run gpt-oss's layer only: q / k / v and output biases,
-    /// sinks, no q / k norms, a biased router, biased MXFP4 experts and the clamped SwiGLU.
+    /// The attention and MoE halves run full and sliding-window attention with or without q / k
+    /// / v and output biases, sinks or q / k head norms (not head norms and biases at once: the
+    /// biases' words hold the norms' weights), a router with or without its bias, MXFP4 or
+    /// 16-bit experts with or without biases, and the clamped SwiGLU or SiLU's GLU.
     fn runs(&self, s: &Shape) -> R<()> {
         let a = &s.attn;
-        let moe = s.moe.ok_or("gpt-oss: no experts")?;
         let unmet = [
-            (!a.bias, "attention without q / k / v biases"),
-            (!a.o_bias, "an output projection without its bias"),
-            (!a.sinks, "attention without sinks"),
-            (a.qk_norm, "q / k head norms"),
-            (!moe.router_bias, "a router without its bias"),
-            (!moe.expert_bias, "experts without their biases"),
             (
-                !moe.quantized,
-                "16-bit experts (the kernels decode MXFP4's)",
+                a.bias && a.qk_norm,
+                "q / k / v biases together with q / k head norms",
             ),
+            (a.output_gate, "an attention output gate"),
             (
-                s.mlp.act != Act::SwigluOai,
-                "an expert activation other than the clamped SwiGLU",
+                !matches!(s.mlp.act, Act::SwigluOai | Act::Silu),
+                "an expert activation other than the clamped SwiGLU or SiLU's",
             ),
+            (s.ple.is_some(), "per-layer inputs"),
+            (s.norm.sandwich, "sandwich norms"),
+            (s.head.final_softcap.is_some(), "a final logit softcap"),
         ];
         match unmet.iter().find(|(on, _)| *on) {
             Some((_, what)) => Err(format!("the MoE kernels run no {what}")),

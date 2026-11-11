@@ -55,7 +55,8 @@ params! {
     /// q / KV shapes a column, the KV entries and rows, the sliding window, the levers' defaults.
     pub struct WeightAtt {
         K: u32, KM: u32, Hc: u32, NQA: u32, QO: u32, Qh: u32, Dc: u32, NE: u32, PYW: u32,
-        WIN: u32, PFTZ: u32, DIAG: u32, TSTAMP: u32, FIFOW: u32, MIXK: u32, RCW: u32,
+        WIN: u32, PFTZ: u32, DIAG: u32, TSTAMP: u32, FIFOW: u32, MIXK: u32, RCW: u32, QKN: u32,
+        HD: u32, EPS: Lit,
     }
 }
 
@@ -64,13 +65,16 @@ params! {
     /// experts and top-k, the levers' defaults.
     pub struct WeightMoe {
         K: u32, Hc: u32, Ic: u32, NEX: u32, TK: u32, DIAG: u32, TSTAMP: u32, FIFOW: u32, MIXK: u32, RCW: u32,
+        XF: u32,
     }
 }
 
 params! {
     /// `cx.csl` (NRM 2): layers a unit, x's dims a row, the experts and top-k, the levers'
     /// defaults.
-    pub struct CtlCx { K: u32, Hc: u32, NEX: u32, TK: u32, DIAG: u32, XKEEP: u32, XDLY: u32, NRM: u32 }
+    pub struct CtlCx {
+        K: u32, Hc: u32, NEX: u32, TK: u32, DIAG: u32, XKEEP: u32, XDLY: u32, NRM: u32, BO: u32, BD: u32,
+    }
 }
 
 params! {
@@ -78,7 +82,7 @@ params! {
     /// table levels, the scores' scale, the levers' defaults.
     pub struct CyAtt {
         K: u32, NQA: u32, Qh: u32, Dc: u32, NROT: u32, HR: u32, NLV: u32, QSC: Lit, CYV: u32,
-        DIAG: u32, TSTAMP: u32, FIFOW: u32, NRM: u32, MIXK: u32, EPS: Lit,
+        DIAG: u32, TSTAMP: u32, FIFOW: u32, NRM: u32, MIXK: u32, EPS: Lit, QB: u32, SNK: u32, QKN: u32,
     }
 }
 
@@ -87,7 +91,7 @@ params! {
     /// defaults.
     pub struct CyMoe {
         K: u32, Ic: u32, NEX: u32, TK: u32, HR: u32, GLUV: u32, DIAG: u32, TSTAMP: u32, FIFOW: u32,
-        NRM: u32, MIXK: u32, EPS: Lit,
+        NRM: u32, MIXK: u32, EPS: Lit, RB: u32, GB: u32, PSC: u32, GLU: u32, SWA: Lit,
     }
 }
 
@@ -202,7 +206,11 @@ impl Dims {
             tk: moe.top_k,
             nqa: qh * dc + 2 * dc,
             qo: qh * dc,
-            xe: (hcc / 2) * 2 * ic + (ic / 2) * hcc,
+            xe: if moe.quantized {
+                (hcc / 2) * 2 * ic + (ic / 2) * hcc
+            } else {
+                hcc * 2 * ic + ic * hcc
+            },
             nlv: plan.contract.rope_levels,
             win,
         })
@@ -237,6 +245,9 @@ pub fn kernels(prog: &Program) -> R<Kernels> {
         FIFOW: 32,
         MIXK: sc.mixk,
         RCW: 26,
+        QKN: sc.qkn,
+        HD: s.attn.head_dim,
+        EPS: Lit::f32(s.norm.eps),
     };
     out.insert(WA, KernelBuild::of(&WEIGHT_ATT, att)?);
     let moe = WeightMoe {
@@ -250,6 +261,7 @@ pub fn kernels(prog: &Program) -> R<Kernels> {
         FIFOW: 32,
         MIXK: sc.moe(),
         RCW: 26,
+        XF: u32::from(!s.moe.is_some_and(|m| m.quantized)),
     };
     out.insert(WM, KernelBuild::of(&WEIGHT_MOE, moe)?);
     let cx = CtlCx {
@@ -261,6 +273,8 @@ pub fn kernels(prog: &Program) -> R<Kernels> {
         XKEEP: 0,
         XDLY: 0,
         NRM: sc.nrm,
+        BO: sc.ob,
+        BD: sc.xb,
     };
     out.insert(Kind::CX, KernelBuild::of(&CTL_CX, cx)?);
     let cya = CyAtt {
@@ -279,6 +293,9 @@ pub fn kernels(prog: &Program) -> R<Kernels> {
         NRM: sc.nrm,
         MIXK: sc.mixk,
         EPS: Lit::f32(s.norm.eps),
+        QB: sc.qb,
+        SNK: sc.snk,
+        QKN: sc.qkn,
     };
     out.insert(CYA, KernelBuild::of(&CY_ATT, cya)?);
     let cym = CyMoe {
@@ -294,6 +311,12 @@ pub fn kernels(prog: &Program) -> R<Kernels> {
         NRM: sc.nrm,
         MIXK: sc.moe(),
         EPS: Lit::f32(s.norm.eps),
+        RB: sc.rb,
+        GB: sc.xb,
+        PSC: u32::from(s.moe.is_some_and(|m| m.quantized)),
+        GLU: sc.glu,
+        // the GLU's alpha: gpt-oss's 1.702, SiLU's 1
+        SWA: Lit::f64(if sc.glu == 1 { 1.0 } else { 1.702 }),
     };
     out.insert(CYM, KernelBuild::of(&CY_MOE, cym)?);
     let hp = HeadPe { VR: vr, HDc: d.hcc };
