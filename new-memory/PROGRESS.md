@@ -1191,3 +1191,9 @@ The `new-memory/` directory is bookkeeping and is removed before anything lands 
   counts / overruns whole; park test restores qwen3-micro and qwen35-tiny through host-slot bytes, bitwise on v6e.
   engine-xla 14 + kernels-xla 18 lib pass; pie --features xla checks clean.
 - A21 on XLA: activation is PJRT scratch outside the single fixed pool -> no rungs stated, walk stays a no-op.
+
+### M96 — 2026-11-11: dead rung APIs removed
+- `sc/dead-code-3` (06ffda2ec): SharedPool::raise_rung, ::steer, SegmentPort, RungError::Engine deleted (only
+  tests called them since M92's RungWalk). Tests now drive the live walks (walk_segments, walk_raise); the raise
+  evacuation test runs against RungWalk::step + apply_rung. runtime store:: 124 pass; runtime rocm / default check clean.
+- MI300X: M93 verified by AMD (30B holds weights, 89/89 armed on 4 models, 9 ROCm goldens equal).
