@@ -22,8 +22,14 @@
 // max-reduce's level-1 / level-2 inputs (a root: its low / high half), iq7 the winner multicast,
 // oq3 the chain's send (the root: the winner multicast), oq4 the row word.
 //
+// A token bus (TB 1: a per-token side input's storage reads the token's table rows): a storage
+// row's control PE (rcfg [13] on, [14] the colour) sends the winning id west on queue 5 after its
+// row word, -1 on a launch's last step; before a launch's first step, the launch's first token
+// (`tin`, host-written).
+//
 // Params. VR (vocabulary rows a head row), CAP (ring and force length), VARG (2: block maxima of
-// 8 and a two-level first-match scan; 0: the scalar scan; both give the first maximum), FIFOW.
+// 8 and a two-level first-match scan; 0: the scalar scan; both give the first maximum), FIFOW,
+// TB (the token bus).
 // Diagnostics (default off): WFORCE != 0 makes the root's winner (s WFORCE + 7) % (VR WFN), a
 // forced winner sequence that exercises every head row's return path.
 param memcpy_params;
@@ -33,6 +39,7 @@ param CAP: u16 = 256;   // the ring / force length (steps a launch)
 param WFORCE: u32 = 0;  // (diagnostics) != 0: the root's winner is (s WFORCE + 7) % (VR WFN), not the argmax
 param WFN: u32 = 1;
 param FIFOW: u16 = 32;  // the reduction's FIFO depth (words)
+param TB: u16 = 0;      // 1: the token bus (see the header)
 
 const sys_mod = @import_module("<memcpy/memcpy>", memcpy_params);
 const fab = @import_module("ops/fabric.csl", .{ .NQ = 6 });
@@ -66,7 +73,7 @@ const ut_b = @get_ut_id(5);
 const red = @import_module("ops/red.csl", .{ .fab = fab, .IN1 = q_e, .IN2 = q_w, .OUT = q_lo, .LOOP = q_lb, .UT1 = ut_a, .UT2 = ut_b, .FIFOW = FIFOW });
 const NR: u16 = 12;
 const RQ: u16 = 1 + 2 * NR;
-var rcfg = @zeros([RQ + 13]u32);   // (see the header)
+var rcfg = @zeros([RQ + 13 + 2 * TB]u32);   // (see the header)
 var rcfg_ptr: [*]u32 = &rcfg;
 
 fn init() void {
@@ -77,6 +84,10 @@ fn init() void {
   fab.oqc(3, rcfg[RQ + 9]); fab.oqc(4, rcfg[RQ + 10]);
   wrole = @as(u16, rcfg[RQ + 11]);
   wl_on = rcfg[RQ + 12] != 0;
+  if (TB == 1) {
+    tb_on = rcfg[RQ + 13] != 0;
+    if (tb_on) { fab.oqc(5, rcfg[RQ + 14]); }
+  }
   timestamp.enable_tsc();
   sys_mod.unblock_cmd_stream();
 }
@@ -98,6 +109,13 @@ var wo = @zeros([1]f32);         // the row word
 const wm_d = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{2} -> wm[i] });
 const wr_d = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{2} -> wr[i] });
 const wo_d = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{1} -> wo[i] });
+// the token bus (TB 1)
+var tb_on = false;
+const q_tb = @get_output_queue(5);
+var tbw = @zeros([1]f32);
+var tin = @zeros([1]u32);           // the launch's first token id, host-written
+var tin_ptr: [*]u32 = &tin;
+const tbw_d = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{1} -> tbw[i] });
 fn wmerge() void {
   if (wr[0] > wm[0] or (wr[0] == wm[0] and wr[1] < wm[1])) { wm[0] = wr[0]; wm[1] = wr[1]; }
 }
@@ -125,6 +143,9 @@ fn wloop(s: u32, best: f32, id: f32) void {
   else if (win >= base and win < base + @as(u32, VR)) { wo[0] = @as(f32, win - base); }
   else { wo[0] = -(1.0 + @as(f32, win / @as(u32, VR))); }
   @fmovs(fab.fout(q_ww, 1), wo_d);
+  if (TB == 1) {
+    if (tb_on) { tbw[0] = if (s + 1 >= n_steps) -1.0 else @as(f32, win); @fmovs(fab.fout(q_tb, 1), tbw_d); }
+  }
   stamp(69);
 }
 
@@ -133,6 +154,9 @@ const pass_id: local_task_id = @get_local_task_id(8);
 task pass_task() void {
   var s: u32 = 0;
   while (s < n_steps) : (s += 1) {
+    if (TB == 1) {
+      if (s == 0 and tb_on) { tbw[0] = @as(f32, tin[0]); @fmovs(fab.fout(q_tb, 1), tbw_d); }
+    }
     stamp(0);
     red.root(t_d, VR);
     stamp(66);
@@ -162,7 +186,9 @@ comptime {
   @initialize_queue(q_wm, .{ .color = @get_color(20) });
   @initialize_queue(q_wo, .{ .color = @get_color(16) });
   @initialize_queue(q_ww, .{ .color = @get_color(16) });
+  if (TB == 1) { @initialize_queue(q_tb, .{ .color = @get_color(16) }); }
   @export_symbol(ring_ptr, "ring");
+  if (TB == 1) { @export_symbol(tin_ptr, "tin"); }
   @export_symbol(force_ptr, "force");
   @export_symbol(nforce_ptr, "nforce");
   @export_symbol(t_ptr, "lgt");

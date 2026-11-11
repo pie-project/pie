@@ -7,7 +7,7 @@
 //! - [`dense`]: the unit snake's kernels (Qwen3.5, Qwen3, Llama 3) (`weight_dense.csl`, `ctl_cx.csl`, `ctl_cy_dense.csl`,
 //!   `head_pe.csl`, `head_ctl.csl`, `relay.csl`);
 //! - [`gemma`]: Gemma 4 E2B / E4B's (`weight_gemma.csl`, `ctl_cx_gemma.csl`, `ctl_cy_gemma.csl`,
-//!   `head_ctl_gemma.csl`, `ple_gemma.csl`; `head_pe.csl`).
+//!   `head_ctl.csl` (TB 1), `ple_gemma.csl`; `head_pe.csl`).
 
 use super::fabric::{ChainMember, Colour, Endpoint, PeIo, RootQueues};
 use super::floor::Coord;

@@ -1,5 +1,5 @@
 //! Gemma 4 E2B / E4B: `weight_gemma.csl` (18 route slots), `ctl_cx_gemma.csl`,
-//! `ctl_cy_gemma.csl`, `head_ctl_gemma.csl`, `ple_gemma.csl` (the PLE store), with the shared
+//! `ctl_cy_gemma.csl`, `head_ctl.csl` with the token bus, `ple_gemma.csl` (the PLE store), with the shared
 //! head PE ([`super::head::HEAD_PE`]). Their params from the plan ([`kernels`]) and their rcfg
 //! writers.
 
@@ -15,7 +15,7 @@ use crate::role::{Kind, Place};
 
 use super::Pe;
 use super::common::{self, CT5, CT6, CxIo};
-use super::head::{HEAD_PE, HeadCtl, HeadPe};
+use super::head::{HEAD_PE, HeadCtlTb, HeadPe};
 
 type R<T> = Result<T, String>;
 
@@ -102,12 +102,13 @@ pub const CTL_CY_GEMMA: Kernel = Kernel {
     rcfg: Some(cy),
 };
 
+/// `head_ctl.csl` with the token bus to the PLE storage.
 pub const HEAD_CTL_GEMMA: Kernel = Kernel {
-    source: "head_ctl_gemma.csl",
+    source: "head_ctl.csl",
     owns: &[
         "res", "rcfg", "tdbg", "ring", "lgt", "force", "nforce", "tin",
     ],
-    params: HeadCtl::NAMES,
+    params: HeadCtlTb::NAMES,
     route_slots: 12,
     rcfg: Some(head_ctl),
 };
@@ -365,11 +366,12 @@ pub fn kernels(prog: &Program) -> R<Kernels> {
         Kind::HEAD_CTL,
         KernelBuild::of(
             &HEAD_CTL_GEMMA,
-            HeadCtl {
+            HeadCtlTb {
                 VR: p.head.vocab_rows,
                 FIFOW: 32,
                 WFORCE: 0,
                 WFN: p.head.rows,
+                TB: 1,
             },
         )?,
     );

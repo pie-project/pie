@@ -24,6 +24,12 @@ params! {
     pub struct HeadCtl { VR: u32, FIFOW: u32, WFORCE: u32, WFN: u32 }
 }
 
+params! {
+    /// [`HeadCtl`]'s with the token bus on (`TB` 1: a per-token side input's storage reads the
+    /// winning token's rows).
+    pub struct HeadCtlTb { VR: u32, FIFOW: u32, WFORCE: u32, WFN: u32, TB: u32 }
+}
+
 pub const HEAD_PE: Kernel = Kernel {
     source: "head_pe.csl",
     owns: &["hw", "hg", "rcfg", "hemb", "tdbg"],
