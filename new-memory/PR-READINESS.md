@@ -18,14 +18,11 @@ Branch today: 432 commits ahead of main, 782 files, +86k / -13k. Main merged in 
 | A12 | Shared-pool snapshots; host-full hang + miscount; keep-handles key covers the record | RT | done M84 (other engines: A15) |
 | A13 | Record rs-buffered fires (MTP / spec decode on hybrids walk eagerly; same on main) — graph capture rule | L40S | after perf fixes |
 | A14 | Wire the rung shrink: scheduler caps a fire's tokens by the activation rung; SharedGrow shrink/restore_rung move the boundary (SPEC 6) | RT | queued |
-<<<<<<< HEAD
 | A15 | read_tier_slots / write_tier_slots (snapshots on shared pools) on Metal, Vulkan, wgpu, XLA (CUDA in sc/rt4; Cerebras out of scope) | Metal agent, VKP, TPU | queued |
 | A16 | eager-fix regression: held weights flip to streaming on ROCm 30B MoE (body reservation) and stall | EAGER (sc/eager-fix-2) | in progress |
-| A17 | Inferlet SDK guest panic (wit-bindgen inter-task-wakeup) when requests wait for admission at small budgets | SDK agent | in progress |
+| A17 | Guest panic under admission waits: bench barrier bug fixed (sc/sdk-wakeup) | SDK agent | done; A19 left |
+| A19 | A restartable process whose own demand exceeds the pool restarts forever (should fail with the starvation error); bind hangs waiting for state slots at 96 MiB | RT7 | in progress |
 | A18 | Idle cache demoted only when PLEX keys it above the floor (user decision) | RT6 | in progress |
-=======
-| A15 | read_tier_slots / write_tier_slots (snapshots on shared pools) on Metal, Vulkan, wgpu, XLA, Cerebras (CUDA in sc/rt4) | Metal agent, VKP, TPU, (Cerebras: assign) | queued |
->>>>>>> origin/sc/sdk-wakeup
 | A9 | dsv41 two-window mini cannot fire on sm_89/sm_120 (fused.lse_sink kernel gap) -> two-window CUDA unverified | L40S | queued |
 
 ## B. Decide before the PR (user)
