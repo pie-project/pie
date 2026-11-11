@@ -13,10 +13,10 @@
 
 use std::path::PathBuf;
 
-use engine_cerebras::spatial::prepare::{Landed, land};
-use kernels_cerebras::spatial::plan::Plan;
-use kernels_cerebras::spatial::target::{self, Ask};
-use kernels_cerebras::spatial::tiles;
+use engine_cerebras::prepare::{Landed, land};
+use kernels_cerebras::plan::Plan;
+use kernels_cerebras::target::{self, Ask};
+use kernels_cerebras::tiles;
 
 const USAGE: &str = "usage: wafer-stage --model <deployment> --checkpoint <dir> --out <dir> \
                      [--preset <name>] [--set K=V,...] [--positions N]\n       \

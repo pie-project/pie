@@ -52,7 +52,7 @@
 pub(crate) mod abi;
 pub mod sys;
 
-pub use kernels_cerebras::spatial::toolchain::Arch;
+pub use kernels_cerebras::toolchain::Arch;
 
 impl From<Target> for Arch {
     fn from(t: Target) -> Self {
@@ -144,7 +144,7 @@ pub struct Sdk {
 impl Sdk {
     /// Default library directory: the SDK image's `/cbcore/lib`.
     pub fn default_lib_dir() -> PathBuf {
-        kernels_cerebras::spatial::toolchain::Toolchain::default().sdk_lib()
+        kernels_cerebras::toolchain::Toolchain::default().sdk_lib()
     }
 
     pub fn open() -> Result<Arc<Self>> {

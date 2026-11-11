@@ -16,7 +16,7 @@
 //! `--positions` the positions the program must serve (else as many as the preset holds). The
 //! preset carries the kernel levers its program ships with; `build --levers` sets more over them.
 //!
-//! `build` writes everything the plan builds into `<dir>` (`spatial::build::emit`: the sources,
+//! `build` writes everything the plan builds into `<dir>` (`build::emit`: the sources,
 //! the artifact), its kernels the embedded ones unless `--kernels`
 //! names a directory; `link` compiles a build directory with cslc into `<dir>/out` (against the
 //! smallest fabric that holds it, or with `--fabric system` a CS system's whole wafer), checks
@@ -25,12 +25,12 @@
 
 use std::path::{Path, PathBuf};
 
-use kernels_cerebras::spatial::build::{self, EMITS, Fabric};
-use kernels_cerebras::spatial::emit::params::Levers;
-use kernels_cerebras::spatial::plan::{Plan, Shape};
-use kernels_cerebras::spatial::program::Program;
-use kernels_cerebras::spatial::target::{self, Ask};
-use kernels_cerebras::spatial::toolchain::{Arch, Cslc, Toolchain};
+use kernels_cerebras::build::{self, EMITS, Fabric};
+use kernels_cerebras::emit::params::Levers;
+use kernels_cerebras::plan::{Plan, Shape};
+use kernels_cerebras::program::Program;
+use kernels_cerebras::target::{self, Ask};
+use kernels_cerebras::toolchain::{Arch, Cslc, Toolchain};
 
 const USAGE: &str = "usage: wafer-compile plan (--model <deployment> | --shape <shape.json>) \
      [--preset <name>] [--set K=V,...] [--positions N] --out <dir>\n       wafer-compile build --plan <plan.json> \

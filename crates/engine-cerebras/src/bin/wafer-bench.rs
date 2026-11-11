@@ -16,8 +16,8 @@
 use std::collections::HashMap;
 use std::path::Path;
 
+use engine_cerebras::artifact::{ArtifactModel, Weights, argmax, read};
 use engine_cerebras::sdk::{Platform, Runtime, Sdk, Simulator, Target};
-use engine_cerebras::spatial::artifact::{ArtifactModel, Weights, argmax, read};
 
 const USAGE: &str = "usage: wafer-bench --program <dir> --weights <dir>[:<prefix>] --golden \
                      <golden.json> [--steps N] [--tokens N] [--cmaddr <addr>] [--logits <out.json>]";

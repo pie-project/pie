@@ -15,10 +15,10 @@
 use std::collections::BTreeMap;
 use std::io::Write;
 
+use engine_cerebras::artifact::{ArtifactModel, Weights};
+use engine_cerebras::device::Device;
 use engine_cerebras::sdk::{self, DataType, Order, Rect};
-use engine_cerebras::spatial::artifact::{ArtifactModel, Weights};
-use engine_cerebras::spatial::device::Device;
-use kernels_cerebras::spatial::artifact::Artifact;
+use kernels_cerebras::artifact::Artifact;
 use sha2::{Digest, Sha256};
 
 fn hex(d: &[u8]) -> String {
