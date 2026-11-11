@@ -156,7 +156,8 @@ impl Shell {
     /// ([`crate::store::Pools::chunk_facts`]).
     pub fn chunk_facts(&mut self) -> crate::Result<engine::chunk::ChunkFacts> {
         let max_tokens = self.budget().max_tokens;
-        self.pools.chunk_facts(max_tokens)
+        let rungs = self.arena.rungs(self.compiled.arena_forked.as_ref());
+        self.pools.chunk_facts(max_tokens, &rungs)
     }
 
     /// Names the recurrent record whose pieces lie in the slot refs

@@ -177,6 +177,35 @@ impl Chunks {
         self.range.hold(pool, from, bytes, beside)
     }
 
+    /// Backs the `spare` chunks just under the activation, beside the
+    /// pool's budget: what a smaller activation rung hands state first.
+    pub fn hold_spare(&mut self, pool: &mut PhysicalPool, spare: u32) -> Result<Commit> {
+        let chunk = self.layout.chunk_bytes;
+        let from = u64::from(self.total.saturating_sub(spare)) * chunk;
+        self.range.hold(pool, from, u64::from(spare) * chunk, true)
+    }
+
+    /// Backs `bytes` of the activation's span from `offset` into it, and
+    /// keeps them backed: where a carve laid at the span's top starts.
+    pub fn hold_activation_at(
+        &mut self,
+        pool: &mut PhysicalPool,
+        offset: u64,
+        bytes: u64,
+        beside: bool,
+    ) -> Result<Commit> {
+        let from = u64::from(self.total) * self.layout.chunk_bytes;
+        let room = u64::from(self.act) * self.layout.chunk_bytes;
+        if offset.saturating_add(bytes) > room {
+            return Err(Fault::Ceiling {
+                what: "bytes of activation under the state pool's end",
+                need: offset.saturating_add(bytes),
+                have: room,
+            });
+        }
+        self.range.hold(pool, from + offset, bytes, beside)
+    }
+
     /// Backs the state's chunks of the segment the runtime's activation
     /// span starts in, and keeps them backed: the runtime counts that
     /// segment committed from the load and opens state below the activation
@@ -577,7 +606,13 @@ impl Chunks {
     /// allocations took after the range was reserved): they are stated with
     /// the activation's, so state stays below them.
     #[must_use]
-    pub fn facts(&self, max_tokens: u32, spare: u32, flat: bool) -> engine::chunk::ChunkFacts {
+    pub fn facts(
+        &self,
+        max_tokens: u32,
+        spare: u32,
+        flat: bool,
+        rungs: &[(u32, u32)],
+    ) -> engine::chunk::ChunkFacts {
         use engine::chunk::{
             ChunkFacts, Growth, Reserved, ReservedRun, SegmentFacts, SlotKind, SlotShape,
         };
@@ -655,7 +690,15 @@ impl Chunks {
                 chunks: 1,
             }],
             shapes,
-            act_chunks: vec![(max_tokens, self.act.saturating_add(spare))],
+            act_chunks: rungs
+                .iter()
+                .filter(|&&(tokens, chunks)| tokens < max_tokens && chunks < self.act)
+                .map(|&(tokens, chunks)| (tokens, chunks.saturating_add(spare)))
+                .chain(std::iter::once((
+                    max_tokens,
+                    self.act.saturating_add(spare),
+                )))
+                .collect(),
             host_chunks: 0,
             disk_chunks: 0,
             disk_persistent: false,
