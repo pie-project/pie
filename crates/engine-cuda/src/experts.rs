@@ -169,6 +169,44 @@ impl Ranking {
     }
 }
 
+/// The order an import lays a deployment's planes in its serving file
+/// (`pie model import`): the dense planes a fire reads, in the order the
+/// model's schedule reads them first, then each packed routed bank's planes
+/// as a group, then the dense routed banks. Registered planes (adapter
+/// banks, written at load) are not in the file's order.
+pub fn serving_order(trace: &Trace, planes: &Attachments) -> Result<Vec<usize>> {
+    let bytes = crate::weights::plane_bytes(trace)?;
+    let (banks, packed) = routed(trace, planes, &bytes)?;
+    let routed: BTreeSet<usize> = banks
+        .iter()
+        .map(|bank| bank.param)
+        .chain(
+            packed
+                .iter()
+                .flat_map(|group| group.planes.iter().map(|plane| plane.param)),
+        )
+        .collect();
+    let rank: BTreeMap<usize, usize> = poem_compiler::prefetch::Schedule::of(trace)
+        .order()
+        .into_iter()
+        .enumerate()
+        .map(|(at, param)| (param, at))
+        .collect();
+    let mut dense: Vec<usize> = (0..trace.params.len())
+        .filter(|at| !routed.contains(at) && trace.params[*at].source != ParamSource::Registered)
+        .collect();
+    dense.sort_by_key(|at| (rank.get(at).copied().unwrap_or(usize::MAX), *at));
+    Ok(dense
+        .into_iter()
+        .chain(
+            packed
+                .iter()
+                .flat_map(|group| group.planes.iter().map(|plane| plane.param)),
+        )
+        .chain(banks.iter().map(|bank| bank.param))
+        .collect())
+}
+
 impl Plan {
     pub fn of(trace: &Trace, planes: &Attachments) -> Result<Plan> {
         Ok(Plan::cut(&Ranking::of(trace, planes)?))
@@ -828,6 +866,41 @@ mod tests {
     fn experts_every_case() {
         a_packed_bank_the_plan_pairs_no_scales_with_is_refused_by_name();
         a_host_declared_table_leaves_the_device_and_nothing_else_does();
+        the_serving_order_names_every_plane_once_routed_banks_last();
+    }
+
+    fn the_serving_order_names_every_plane_once_routed_banks_last() {
+        let trace = gpt_oss();
+        let order = serving_order(&trace, &scales_of(&trace)).expect("orders");
+        let mut seen = order.clone();
+        seen.sort_unstable();
+        seen.dedup();
+        assert_eq!(seen.len(), order.len(), "no plane twice");
+        let wanted: Vec<usize> = (0..trace.params.len())
+            .filter(|at| trace.params[*at].source != ParamSource::Registered)
+            .collect();
+        assert_eq!(seen, wanted, "every plane the file holds");
+        let routed = routed(
+            &trace,
+            &scales_of(&trace),
+            &crate::weights::plane_bytes(&trace).unwrap(),
+        )
+        .expect("routes")
+        .1;
+        let first_routed = order
+            .iter()
+            .position(|at| {
+                routed
+                    .iter()
+                    .any(|group| group.planes.iter().any(|p| p.param == *at))
+            })
+            .expect("a routed plane");
+        assert!(
+            order[first_routed..].iter().all(|at| routed
+                .iter()
+                .any(|group| group.planes.iter().any(|p| p.param == *at))),
+            "the routed banks' planes come after every dense one"
+        );
     }
 
     fn a_host_declared_table_leaves_the_device_and_nothing_else_does() {

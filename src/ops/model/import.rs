@@ -357,11 +357,13 @@ pub fn run(mut args: ImportArgs, global: &crate::args::GlobalArgs) -> Result<cra
 
     let stamp = stamp_of_deployment(deployment, platform)?;
     let trace = runtime::engine::load::trace(deployment, platform)?;
+    let ranked = runtime::engine::load::sequence(&trace);
     let groups = groups_of(&landing, &trace)?;
     let entries = merge_order(
         plan.as_ref(),
         &split.copies,
         &meta,
+        ranked.as_deref(),
         &groups,
     );
     let ordered = plan.as_ref().is_none_or(|plan| {
@@ -657,8 +659,9 @@ fn overlay_onto_artifact(
     let copy_bytes: u64 = copies.iter().map(|copy| copy.raw.span_bytes).sum();
     let stamp = stamp_of_deployment(deployment, platform)?;
     let trace = runtime::engine::load::trace(deployment, platform)?;
+    let ranked = runtime::engine::load::sequence(&trace);
     let groups = groups_of(&landing, &trace)?;
-    let entries = merge_order(plan.as_ref(), &copies, &[], &groups);
+    let entries = merge_order(plan.as_ref(), &copies, &[], ranked.as_deref(), &groups);
     let ordered = plan.as_ref().is_none_or(|plan| {
         let asked: Vec<&str> = entries
             .iter()
@@ -1850,6 +1853,7 @@ fn merge_order<'a>(
     plan: Option<&'a LoadPlan>,
     copies: &'a [Copy<'a>],
     meta: &'a [(String, Vec<u8>)],
+    ranked: Option<&[String]>,
     groups: &[Group],
 ) -> Vec<(&'a str, From<'a>)> {
     let mut entries: Vec<(&'a str, From<'a>)> = Vec::new();
@@ -1868,6 +1872,12 @@ fn merge_order<'a>(
     for (name, bytes) in meta {
         entries.push((name.as_str(), From::Meta(bytes)));
     }
+    let rank: BTreeMap<&str, usize> = ranked
+        .into_iter()
+        .flatten()
+        .enumerate()
+        .map(|(at, name)| (name.as_str(), at))
+        .collect();
     let member: BTreeMap<&str, (&str, usize)> = groups
         .iter()
         .flat_map(|group| {
@@ -1880,7 +1890,7 @@ fn merge_order<'a>(
         .collect();
     entries.sort_by_key(|(name, _)| {
         let (head, at) = member.get(name).copied().unwrap_or((name, 0));
-        (head, at)
+        (rank.get(head).copied().unwrap_or(usize::MAX), head, at)
     });
     entries
 }
