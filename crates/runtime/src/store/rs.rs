@@ -82,6 +82,9 @@ pub(crate) struct WindowAdvance {
     pub(crate) fold: Option<u32>,
     pub(crate) commit_end: u32,
     pub(crate) head: Option<u32>,
+    /// A checkpoint the fire lands inside it, at this position: no slot its
+    /// windows reach from there retires with this fire.
+    pub(crate) keep: Option<u32>,
 }
 
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
@@ -1181,6 +1184,56 @@ impl RsStore {
         Ok(true)
     }
 
+    /// A window's checkpoint as of position `at`, at or behind where its
+    /// windows stand: the slots each list's window reaches from `at` (those
+    /// `[at - window, at)` touches), shared by refcount. A slot holding rows
+    /// past `at` too is shared as it is; a resume writing into it copies it
+    /// first (the tail rule of [`Self::prepare_window`]). None when a slot it
+    /// needs has retired, or as [`Self::checkpoint`]; at the windows' own
+    /// position, [`Self::checkpoint`]. Another state checkpoints only there.
+    pub fn checkpoint_at(
+        &mut self,
+        ws: RsWorkingSetId,
+        key: Hash256,
+        owner: Option<ProcessId>,
+        at: u32,
+    ) -> Result<bool, RsError> {
+        let entry = self.entry(ws)?;
+        let Some(window) = entry.window else {
+            return self.checkpoint(ws, key, owner);
+        };
+        if at == window.committed {
+            return self.checkpoint(ws, key, owner);
+        }
+        if at == 0 || at > window.committed || self.holds_host(entry) || self.unsettled(ws) {
+            return Ok(false);
+        }
+        let mut snapshot = entry.clone();
+        let mut state = WindowState {
+            committed: at,
+            head: at,
+            ..window
+        };
+        for (list, (geom, table)) in self.window.iter().zip(&mut snapshot.windows).enumerate() {
+            let tokens = geom.tokens.max(1);
+            let first = (at.saturating_sub(geom.window) / tokens) as usize;
+            let end = at.div_ceil(tokens) as usize;
+            if table.len() < end || table[first..end].iter().any(Option::is_none) {
+                return Ok(false);
+            }
+            table.truncate(end);
+            table[..first].iter_mut().for_each(|slot| *slot = None);
+            state.retired[list] = first as u32;
+        }
+        snapshot.window = Some(state);
+        for id in Self::slots(&snapshot) {
+            *self.refs.entry(id).or_insert(1) += 1;
+        }
+        let snapshot = self.working_sets.insert(snapshot);
+        self.keep(snapshot, key, owner);
+        Ok(true)
+    }
+
     /// Keeps `snapshot`, a hidden working set no process holds, as `key`.
     pub fn keep(&mut self, snapshot: RsWorkingSetId, key: Hash256, owner: Option<ProcessId>) {
         let kept = RsCheckpoint {
@@ -1538,7 +1591,8 @@ impl RsStore {
             window.committed
         } else {
             advance.reach
-        };
+        }
+        .min(advance.keep.unwrap_or(u32::MAX));
         let mut dropped: Vec<RsSlotId> = Vec::new();
         for (list, geom) in lists.iter().enumerate() {
             let first = reach.saturating_sub(geom.window) / geom.tokens.max(1);

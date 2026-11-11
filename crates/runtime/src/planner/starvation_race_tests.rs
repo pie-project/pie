@@ -995,6 +995,7 @@ fn window_fire(held: u32, rows: u32) -> (std::ops::Range<u32>, crate::store::rs:
             fold: Some(u32::MAX),
             commit_end: end,
             head: Some(end),
+            keep: None,
         },
     )
 }
