@@ -1,0 +1,74 @@
+// wafer/ops/math.csl: the scalar and vector elementwise math of the CY roots and the weight PEs'
+// attention (README.md): rsqrt (Newton from the bit guess), exp (2^k by the exponent bits and a
+// polynomial on r), recip (by rsqrt: v v overflows past 1.8e19, e.g. 1 + e^87 in a sigmoid), ln,
+// the sigmoid, silu, softplus and tanh-GELU; and exp over a vector (exp_fast's form).
+fn rsqrt(v: f32) f32 {
+  var y = @bitcast(f32, @as(u32, 0x5f3759df) - (@bitcast(u32, v) >> 1));
+  y = y * (1.5 - 0.5 * v * y * y);
+  y = y * (1.5 - 0.5 * v * y * y);
+  y = y * (1.5 - 0.5 * v * y * y);
+  return y;
+}
+fn exp1(x0: f32) f32 {
+  var x: f32 = if (x0 < -87.0) -87.0 else if (x0 > 88.0) 88.0 else x0;
+  var k: f32 = x * 1.4426950408889634 + 12582912.0;
+  k = k - 12582912.0;
+  const r = x - k * 0.6931471805599453;
+  var p: f32 = 0.0013888889;
+  p = p * r + 0.008333334;
+  p = p * r + 0.041666668;
+  p = p * r + 0.16666667;
+  p = p * r + 0.5;
+  p = p * r + 1.0;
+  p = p * r + 1.0;
+  const ki = @as(i16, k) + 127;
+  const s = @bitcast(f32, @as(u32, @as(u16, ki)) << 23);
+  return p * s;
+}
+fn recip(v: f32) f32 { const a = if (v < 0.0) -v else v; const r = rsqrt(a); return if (v < 0.0) -(r * r) else r * r; }
+fn sigm(x: f32) f32 { return recip(1.0 + exp1(-x)); }
+fn silu(x: f32) f32 { return x * sigm(x); }
+// ln(x), x > 0: exponent bits plus 2 atanh((m - 1) / (m + 1)) to the 7th power
+fn ln1(x: f32) f32 {
+  const b = @bitcast(u32, x);
+  const e = @as(f32, @as(i16, @as(u16, (b >> 23) & 0xff)) - 127);
+  const m = @bitcast(f32, (b & 0x007fffff) | 0x3f800000);
+  const z = (m - 1.0) * recip(m + 1.0);
+  const z2 = z * z;
+  const p = z * (2.0 + z2 * (0.6666667 + z2 * (0.4 + z2 * 0.2857143)));
+  return e * 0.6931471805599453 + p;
+}
+fn softplus(x: f32) f32 { return if (x > 20.0) x else ln1(1.0 + exp1(x)); }
+fn gelu1(x: f32) f32 {
+  const y = 1.5957691216057308 * x * (1.0 + 0.044715 * x * x);
+  return x * recip(1.0 + exp1(-y));
+}
+
+// exp(buf) over a vector, buf clamped to [-87, hi] first (past 88 2^k's exponent bits wrap: a
+// reference swung low by an empty attention pass sends unwritten entries' 0 - mref up). Scratch:
+// p (f32, the vector's length), kk (u16, k's bits), pl (p's low halves: u16 with stride 2 over p).
+// The result is left in p, and copied back into buf when `back`.
+const ex_a = [3]f32 { 12582912.0, -12582912.0, 12582912.0 };   // t, then k as a float, then t again (k in the low bits)
+const ex_c = [4]f32 { 0.16790908575057983, 0.5000435709953308, 0.9999634027481079, 0.9999992847442627 };   // region_pe (trm 8)
+inline fn vexp(buf: mem1d_dsd, p: mem1d_dsd, kk: mem1d_dsd, pl: mem1d_dsd, comptime hi: f32, comptime back: bool) void {
+  const ph = @increment_dsd_offset(pl, 1, u16);
+  @fmaxs(buf, buf, -87.0);
+  @fnegs(buf, buf);
+  @fmaxs(buf, buf, -hi);
+  @fnegs(buf, buf);
+  @fmuls(p, buf, 1.4426950408889634);
+  var c: u16 = 0;
+  while (c < 3) : (c += 1) {
+    @fadds(p, p, ex_a[c]);
+    if (c == 1) { @fmacs(buf, buf, p, -0.6931471805599453); }
+  }
+  @sll16(kk, pl, 7);
+  @fmuls(p, buf, 0.041458580642938614);
+  c = 0;
+  while (c < 4) : (c += 1) {
+    if (c > 0) { @fmuls(p, p, buf); }
+    @fadds(p, p, ex_c[c]);
+  }
+  @add16(ph, ph, kk);
+  if (back) { @fmovs(buf, p); }
+}

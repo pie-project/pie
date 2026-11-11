@@ -88,6 +88,7 @@ pub const OPS: &[(&str, &str)] = &[
         "fabric.csl",
         include_str!("../programs/wafer/ops/fabric.csl"),
     ),
+    ("math.csl", include_str!("../programs/wafer/ops/math.csl")),
     ("mv.csl", include_str!("../programs/wafer/ops/mv.csl")),
     ("red.csl", include_str!("../programs/wafer/ops/red.csl")),
 ];

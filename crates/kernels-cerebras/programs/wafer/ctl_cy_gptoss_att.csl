@@ -33,6 +33,7 @@ param CYV: u16 = 0;   // (2: the vector exp, the scalar recip; 3: the scalar exp
 
 const sys_mod = @import_module("<memcpy/memcpy>", memcpy_params);
 const fab = @import_module("ops/fabric.csl", .{ .NQ = 6 });
+const math = @import_module("ops/math.csl");
 const tile_config = @import_module("<tile_config>");
 const color_config = tile_config.color_config;
 const tgt = tile_config.target;
@@ -127,55 +128,10 @@ fn reduce(n: u16) void {
 }
 fn mcast(n: u16) void { @fmovs(fab.fout(q_mc, n), uv(0, n)); }
 
-fn rsqrt(v: f32) f32 {
-  var y = @bitcast(f32, @as(u32, 0x5f3759df) - (@bitcast(u32, v) >> 1));
-  y = y * (1.5 - 0.5 * v * y * y);
-  y = y * (1.5 - 0.5 * v * y * y);
-  y = y * (1.5 - 0.5 * v * y * y);
-  return y;
-}
-fn exp1(x0: f32) f32 {
-  var x: f32 = if (x0 < -87.0) -87.0 else if (x0 > 88.0) 88.0 else x0;
-  var k: f32 = x * 1.4426950408889634 + 12582912.0;
-  k = k - 12582912.0;
-  const r = x - k * 0.6931471805599453;
-  var p: f32 = 0.0013888889;
-  p = p * r + 0.008333334;
-  p = p * r + 0.041666668;
-  p = p * r + 0.16666667;
-  p = p * r + 0.5;
-  p = p * r + 1.0;
-  p = p * r + 1.0;
-  const ki = @as(i16, k) + 127;
-  const s = @bitcast(f32, @as(u32, @as(u16, ki)) << 23);
-  return p * s;
-}
-fn recip(v: f32) f32 { const a = if (v < 0.0) -v else v; const r = rsqrt(a); return if (v < 0.0) -(r * r) else r * r; }
-const ex_a = [3]f32 { 12582912.0, -12582912.0, 12582912.0 };
-const ex_c = [4]f32 { 0.16790908575057983, 0.5000435709953308, 0.9999634027481079, 0.9999992847442627 };
 // ve = exp(ve) (Qh words; ctl_cy_gptoss_moe.csl vexp's arithmetic; p in vp, k's bits in vk)
 fn vexpq() void {
   const pl = @set_dsd_stride(@set_dsd_base_addr(vk_d, @ptrcast([*]u16, &vp)), 2);
-  const ph = @increment_dsd_offset(pl, 1, u16);
-  @fmaxs(ve_d, ve_d, -87.0);
-  @fnegs(ve_d, ve_d);
-  @fmaxs(ve_d, ve_d, -88.0);
-  @fnegs(ve_d, ve_d);
-  @fmuls(vp_d, ve_d, 1.4426950408889634);
-  var c: u16 = 0;
-  while (c < 3) : (c += 1) {
-    @fadds(vp_d, vp_d, ex_a[c]);
-    if (c == 1) { @fmacs(ve_d, ve_d, vp_d, -0.6931471805599453); }
-  }
-  @sll16(vk_d, pl, 7);
-  @fmuls(vp_d, ve_d, 0.041458580642938614);
-  c = 0;
-  while (c < 4) : (c += 1) {
-    if (c > 0) { @fmuls(vp_d, vp_d, ve_d); }
-    @fadds(vp_d, vp_d, ex_c[c]);
-  }
-  @add16(ph, ph, vk_d);
-  @fmovs(ve_d, vp_d);
+  math.vexp(ve_d, vp_d, vk_d, pl, 88.0, true);
 }
 // ilh = 1 / ve (ve > 0, normal): ve = m 2^e, m in [1, 2) (vp), 2^(1 - e) (vs: the exponent field 255 - E, by an xor
 // with 0x7f80), r = 1 / m by the quadratic and two Newton steps (ctl_cy_gptoss_moe GLUV's), x 2^(1 - e) x 0.5
@@ -198,15 +154,6 @@ fn vrecipq() void {
   }
   @fmuls(ilh_d, ilh_d, vs_d);
   @fmuls(ilh_d, ilh_d, 0.5);
-}
-fn ln1(x: f32) f32 {
-  const b = @bitcast(u32, x);
-  const e = @as(f32, @as(i16, @as(u16, (b >> 23) & 0xff)) - 127);
-  const m = @bitcast(f32, (b & 0x007fffff) | 0x3f800000);
-  const z = (m - 1.0) * recip(m + 1.0);
-  const z2 = z * z;
-  const p = z * (2.0 + z2 * (0.6666667 + z2 * (0.4 + z2 * 0.2857143)));
-  return e * 0.6931471805599453 + p;
 }
 
 var rope_at: u32 = 0xffffffff;
@@ -254,7 +201,7 @@ fn rope_v() void {
 fn att(l: u16, pos: u32) void {
   reduce(NQA + 1);
   stamp(1 + 3 * l);
-  const rr = rsqrt(t[NQA] / HID + EPS);
+  const rr = math.rsqrt(t[NQA] / HID + EPS);
   @fmuls(tv(0, NQA), tv(0, NQA), rr);
   @fadds(tv(0, NQA), tv(0, NQA), @set_dsd_base_addr(qb_d, @ptrcast([*]f32, &qb[l * NQA])));
   rope_tables_at(pos);
@@ -277,9 +224,9 @@ fn att(l: u16, pos: u32) void {
     if (CYV != 0) {
       @fmovs(lh_d, lst_d);
       @fsubs(ve_d, @increment_dsd_offset(snk_d, @as(i16, l * Qh), f32), @increment_dsd_offset(mref_d, @as(i16, l * Qh), f32));
-      if (CYV == 3) { h = 0; while (h < Qh) : (h += 1) { ve[h] = exp1(ve[h]); } } else { vexpq(); }
+      if (CYV == 3) { h = 0; while (h < Qh) : (h += 1) { ve[h] = math.exp1(ve[h]); } } else { vexpq(); }
       @fadds(ve_d, lh_d, ve_d);
-      if (CYV == 2) { h = 0; while (h < Qh) : (h += 1) { ilh[h] = recip(ve[h]); } } else { vrecipq(); }
+      if (CYV == 2) { h = 0; while (h < Qh) : (h += 1) { ilh[h] = math.recip(ve[h]); } } else { vrecipq(); }
       h = 0;
       while (h < Qh) : (h += 1) {
         const lv = lh[h];
@@ -293,7 +240,7 @@ fn att(l: u16, pos: u32) void {
         lh[h] = lv;
         if (lv < 0.00390625 or lv >= 32768.0) { bad = 1.0; }   // the f16 probabilities' window
         const sk = snk[l * Qh + h] - mref[l * Qh + h];
-        ilh[h] = recip(lv + exp1(sk));
+        ilh[h] = math.recip(lv + math.exp1(sk));
         @fmuls(uv(h * Dc, Dc), tv(h * (Dc + 1), Dc), ilh[h]);
       }
     }
@@ -301,7 +248,7 @@ fn att(l: u16, pos: u32) void {
     mcast(QD + 1);
     h = 0;
     while (h < Qh) : (h += 1) {
-      const st = ln1(if (lh[h] > 1.0e-30) lh[h] else 1.0e-30);
+      const st = math.ln1(if (lh[h] > 1.0e-30) lh[h] else 1.0e-30);
       u[h] = st;
       mref[l * Qh + h] += st;
     }

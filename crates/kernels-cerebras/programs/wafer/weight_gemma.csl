@@ -39,6 +39,7 @@ param FIFOW: u16 = 32;
 
 const sys_mod = @import_module("<memcpy/memcpy>", memcpy_params);
 const fab = @import_module("ops/fabric.csl", .{ .NQ = 6, .DONE_GLOBAL = true });
+const math = @import_module("ops/math.csl");
 const matvec = @import_module("ops/mv.csl");
 const tile_config = @import_module("<tile_config>");
 const color_config = tile_config.color_config;
@@ -240,8 +241,6 @@ fn seg_ar(n: u16) void {
   }
   qmode(0);
 }
-const ex_a = [3]f32 { 12582912.0, -12582912.0, 12582912.0 };
-const ex_c = [4]f32 { 0.16790908575057983, 0.5000435709953308, 0.9999634027481079, 0.9999992847442627 };
 // the scores' clamp from above: ln(65504) less 7e-5, so exp(XHI) rounds to the f16 max (65504) and a larger score's
 // probability is the f16 max as min(exp(s), 65504) gave (the probabilities only reach the PE as f16)
 const XHI: f32 = 11.0898;
@@ -250,25 +249,7 @@ fn exp_v(buf: mem1d_dsd, n: u16) void {
   const p = @set_dsd_length(y_d, n);
   const kk = @set_dsd_length(@set_dsd_base_addr(@get_dsd(mem1d_dsd, .{ .tensor_access = |i|{YN} -> w[i] }), @ptrcast([*]u16, &y16)), n);
   const pl = @set_dsd_length(@set_dsd_stride(@set_dsd_base_addr(kk, @ptrcast([*]u16, &y)), 2), n);
-  const ph = @increment_dsd_offset(pl, 1, u16);
-  @fmaxs(buf, buf, -87.0);
-  @fnegs(buf, buf);
-  @fmaxs(buf, buf, -XHI);
-  @fnegs(buf, buf);
-  @fmuls(p, buf, 1.4426950408889634);
-  var c: u16 = 0;
-  while (c < 3) : (c += 1) {
-    @fadds(p, p, ex_a[c]);
-    if (c == 1) { @fmacs(buf, buf, p, -0.6931471805599453); }
-  }
-  @sll16(kk, pl, 7);
-  @fmuls(p, buf, 0.041458580642938614);
-  c = 0;
-  while (c < 4) : (c += 1) {
-    if (c > 0) { @fmuls(p, p, buf); }
-    @fadds(p, p, ex_c[c]);
-  }
-  @add16(ph, ph, kk);
+  math.vexp(buf, p, kk, pl, XHI, false);
 }
 // (WSPEC 2) exp_v on the whole sliding ring's scores (Qh NES): fixed-length views, the u16 ones built once at init
 const NFR: u16 = Qh * NES;
@@ -290,31 +271,24 @@ fn exp_fr() void {
   @fmaxs(fS, fS, -XHI);
   @fnegs(fS, fS);
   @fmuls(fP, fS, 1.4426950408889634);
-  @fadds(fP, fP, ex_a[0]);
-  @fadds(fP, fP, ex_a[1]);
+  @fadds(fP, fP, math.ex_a[0]);
+  @fadds(fP, fP, math.ex_a[1]);
   @fmacs(fS, fS, fP, -0.6931471805599453);
-  @fadds(fP, fP, ex_a[2]);
+  @fadds(fP, fP, math.ex_a[2]);
   @sll16(fK, fPL, 7);
   @fmuls(fP, fS, 0.041458580642938614);
-  @fadds(fP, fP, ex_c[0]);
+  @fadds(fP, fP, math.ex_c[0]);
   @fmuls(fP, fP, fS);
-  @fadds(fP, fP, ex_c[1]);
+  @fadds(fP, fP, math.ex_c[1]);
   @fmuls(fP, fP, fS);
-  @fadds(fP, fP, ex_c[2]);
+  @fadds(fP, fP, math.ex_c[2]);
   @fmuls(fP, fP, fS);
-  @fadds(fP, fP, ex_c[3]);
+  @fadds(fP, fP, math.ex_c[3]);
   @add16(fPH, fPH, fK);
   @fs2h(fH, fP);
 }
 const IHDS: f32 = 1.0 / @as(f32, HDS);
 const IHDG: f32 = 1.0 / @as(f32, HDG);
-fn rsq(v: f32) f32 {
-  var r = @bitcast(f32, @as(u32, 0x5f3759df) - (@bitcast(u32, v) >> 1));
-  r = r * (1.5 - 0.5 * v * r * r);
-  r = r * (1.5 - 0.5 * v * r * r);
-  r = r * (1.5 - 0.5 * v * r * r);
-  return r;
-}
 
 // ---------------------------------------------------------------- caches
 // the step's position: its row (pos % PYW), entry (pos / PYW) and pos + 1 as f32, worked out once a step and from the
@@ -367,8 +341,8 @@ fn cache_put(c: u16, pos: u32, k: [*]f32, v: [*]f32, ks: f32, vs: f32) void {
 fn cache_fin(c: u16, pos: u32, kss: f32, vss: f32, ihd: f32) void {
   const e = cslot(c, pos);
   const dc = cdc(c);
-  kinv[eoff(c) + e] = rsq(kss * ihd + 1.0e-6);
-  const vi = rsq(vss * ihd + 1.0e-6);
+  kinv[eoff(c) + e] = math.rsqrt(kss * ihd + 1.0e-6);
+  const vi = math.rsqrt(vss * ihd + 1.0e-6);
   var d: u16 = 0;
   while (d < dc) : (d += 1) { vc[1 + voff(c) + e * (dc + 1) + d] = @bitcast(u16, @as(@fp16(), pv[c * DcG + d] * vi)); }
   vc[1 + voff(c) + e * (dc + 1) + dc] = 0x3c00;
@@ -473,7 +447,7 @@ fn attm(l: u16, pos_out: *u32, comptime g: u16) void {
     while (h < Qh) : (h += 1) {
       const sh = @set_dsd_length(@increment_dsd_offset(sx_d, @as(i16, h * NEl), f32), NEl);
       @fmuls(sh, sh, @set_dsd_length(@increment_dsd_offset(ki, @as(i16, e0), f32), NEl));
-      @fmuls(sh, sh, rsq(sx[Qh * NEl + h] * ihd + 1.0e-6));
+      @fmuls(sh, sh, math.rsqrt(sx[Qh * NEl + h] * ihd + 1.0e-6));
       @fsubs(sh, sh, mref[l * Qh + h]);
       if (FR and nseen < ne) {   // (FR) entries not yet written score -1e30: exp -> 0, f16 0: they add exact zeros
         @fmovs(@set_dsd_length(@increment_dsd_offset(sx_d, @as(i16, h * NEl + nseen), f32), ne - nseen), -1.0e30);

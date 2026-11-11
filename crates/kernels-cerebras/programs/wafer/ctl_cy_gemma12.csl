@@ -26,6 +26,7 @@ param HDG: u16 = 512;
 
 const sys_mod = @import_module("<memcpy/memcpy>", memcpy_params);
 const fab = @import_module("ops/fabric.csl", .{ .NQ = 6 });
+const math = @import_module("ops/math.csl");
 const tile_config = @import_module("<tile_config>");
 const color_config = tile_config.color_config;
 const tgt = tile_config.target;
@@ -111,48 +112,11 @@ fn reduce(n: u16) void {
 fn mcast(n: u16) void { @fmovs(fab.fout(q_mc, n), uv(0, n)); }
 
 // ---------------------------------------------------------------- scalar math (ctl_cy_dense's)
-fn rsqrt(v: f32) f32 {
-  var y = @bitcast(f32, @as(u32, 0x5f3759df) - (@bitcast(u32, v) >> 1));
-  y = y * (1.5 - 0.5 * v * y * y);
-  y = y * (1.5 - 0.5 * v * y * y);
-  y = y * (1.5 - 0.5 * v * y * y);
-  return y;
-}
-fn exp1(x0: f32) f32 {
-  var x: f32 = if (x0 < -87.0) -87.0 else if (x0 > 88.0) 88.0 else x0;
-  var k: f32 = x * 1.4426950408889634 + 12582912.0;
-  k = k - 12582912.0;
-  const r = x - k * 0.6931471805599453;
-  var p: f32 = 0.0013888889;
-  p = p * r + 0.008333334;
-  p = p * r + 0.041666668;
-  p = p * r + 0.16666667;
-  p = p * r + 0.5;
-  p = p * r + 1.0;
-  p = p * r + 1.0;
-  const ki = @as(i16, k) + 127;
-  const s = @bitcast(f32, @as(u32, @as(u16, ki)) << 23);
-  return p * s;
-}
-fn recip(v: f32) f32 { const a = if (v < 0.0) -v else v; const r = rsqrt(a); return if (v < 0.0) -(r * r) else r * r; }
-fn ln1(x: f32) f32 {
-  const b = @bitcast(u32, x);
-  const e = @as(f32, @as(i16, @as(u16, (b >> 23) & 0xff)) - 127);
-  const m = @bitcast(f32, (b & 0x007fffff) | 0x3f800000);
-  const z = (m - 1.0) * recip(m + 1.0);
-  const z2 = z * z;
-  const p = z * (2.0 + z2 * (0.6666667 + z2 * (0.4 + z2 * 0.2857143)));
-  return e * 0.6931471805599453 + p;
-}
-fn gelu1(x: f32) f32 {
-  const y = 1.5957691216057308 * x * (1.0 + 0.044715 * x * x);
-  return x * recip(1.0 + exp1(-y));
-}
 // the deferred combine: s, the true rms; t[0..n) = rr (t[0..n) + s t[n..2n)); returns s
 fn combine(n: u16) f32 {
-  const s = rsqrt(t[2 * n] * IHID + EPS);
+  const s = math.rsqrt(t[2 * n] * IHID + EPS);
   const ss = t[2 * n + 1] + 2.0 * s * t[2 * n + 2] + s * s * t[2 * n + 3];
-  const rr = rsqrt(ss * IHID + EPS);
+  const rr = math.rsqrt(ss * IHID + EPS);
   @fmacs(tv(0, n), tv(0, n), tv(n, n), s);
   @fmuls(tv(0, n), tv(0, n), rr);
   return s;
@@ -169,32 +133,11 @@ const vc_d = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{TN} -> vcr[i] });
 const vk_d = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{TN} -> vk[i] });
 var vpl = vk_d;
 fn vinit() void { vpl = @set_dsd_stride(@set_dsd_base_addr(vk_d, @ptrcast([*]u16, &vb)), 2); }
-const ex_a = [3]f32 { 12582912.0, -12582912.0, 12582912.0 };
-const ex_c = [4]f32 { 0.16790908575057983, 0.5000435709953308, 0.9999634027481079, 0.9999992847442627 };
 fn vexp(buf: mem1d_dsd, n: u16) void {
   const p = @set_dsd_length(vb_d, n);
   const kk = @set_dsd_length(vk_d, n);
   const pl_ = @set_dsd_length(vpl, n);
-  const ph = @increment_dsd_offset(pl_, 1, u16);
-  @fmaxs(buf, buf, -87.0);
-  @fnegs(buf, buf);
-  @fmaxs(buf, buf, -88.0);
-  @fnegs(buf, buf);
-  @fmuls(p, buf, 1.4426950408889634);
-  var c: u16 = 0;
-  while (c < 3) : (c += 1) {
-    @fadds(p, p, ex_a[c]);
-    if (c == 1) { @fmacs(buf, buf, p, -0.6931471805599453); }
-  }
-  @sll16(kk, pl_, 7);
-  @fmuls(p, buf, 0.041458580642938614);
-  c = 0;
-  while (c < 4) : (c += 1) {
-    if (c > 0) { @fmuls(p, p, buf); }
-    @fadds(p, p, ex_c[c]);
-  }
-  @add16(ph, ph, kk);
-  @fmovs(buf, p);
+  math.vexp(buf, p, kk, pl_, 88.0, true);
 }
 // dst = gelu_tanh(src) = max(x, x e) / (1 + e), e = exp(-|y|), y = 1.5958 x (1 + 0.044715 x^2) (dst != src)
 fn vgelu0(dst: mem1d_dsd, src: mem1d_dsd, n: u16) void {
@@ -260,19 +203,19 @@ fn vgeluc() void {
   @or16(gAH, gAH, 0x8000);              // -|y|
   @fmaxs(gE, gE, -87.0);
   @fmuls(gP, gE, 1.4426950408889634);
-  @fadds(gP, gP, ex_a[0]);
-  @fadds(gP, gP, ex_a[1]);
+  @fadds(gP, gP, math.ex_a[0]);
+  @fadds(gP, gP, math.ex_a[1]);
   @fmacs(gE, gE, gP, -0.6931471805599453);
-  @fadds(gP, gP, ex_a[2]);
+  @fadds(gP, gP, math.ex_a[2]);
   @sll16(gK, gPL, 7);
   @fmuls(gP, gE, 0.041458580642938614);
-  @fadds(gP, gP, ex_c[0]);
+  @fadds(gP, gP, math.ex_c[0]);
   @fmuls(gP, gP, gE);
-  @fadds(gP, gP, ex_c[1]);
+  @fadds(gP, gP, math.ex_c[1]);
   @fmuls(gP, gP, gE);
-  @fadds(gP, gP, ex_c[2]);
+  @fadds(gP, gP, math.ex_c[2]);
   @fmuls(gP, gP, gE);
-  @fadds(gP, gP, ex_c[3]);
+  @fadds(gP, gP, math.ex_c[3]);
   @add16(gPH, gPH, gK);                 // p = exp(-|y|)
   @fadds(gD, gP, 1.0);
   @fmuls(gR, gD, 0.323112507040746);
@@ -308,7 +251,7 @@ fn vgelu(dst: mem1d_dsd, src: mem1d_dsd, n: u16) void {
   @fmuls(p, e, 1.4426950408889634);
   var c: u16 = 0;
   while (c < 3) : (c += 1) {
-    @fadds(p, p, ex_a[c]);
+    @fadds(p, p, math.ex_a[c]);
     if (c == 1) { @fmacs(e, e, p, -0.6931471805599453); }
   }
   @sll16(kk, pl_, 7);
@@ -316,7 +259,7 @@ fn vgelu(dst: mem1d_dsd, src: mem1d_dsd, n: u16) void {
   c = 0;
   while (c < 4) : (c += 1) {
     if (c > 0) { @fmuls(p, p, e); }
-    @fadds(p, p, ex_c[c]);
+    @fadds(p, p, math.ex_c[c]);
   }
   @add16(ph, ph, kk);                       // p = exp(-|y|)
   @fadds(d, p, 1.0);
@@ -373,9 +316,9 @@ var ilh = @zeros([Qh]f32);
 fn tc(comptime o: u16, comptime n: u16) mem1d_dsd { return @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{n} -> t[@as(i16, o) + i] }); }
 fn uc(comptime o: u16, comptime n: u16) mem1d_dsd { return @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{n} -> u[@as(i16, o) + i] }); }
 fn combinec(comptime n: u16) f32 {
-  const s = rsqrt(t[2 * n] * IHID + EPS);
+  const s = math.rsqrt(t[2 * n] * IHID + EPS);
   const ss = t[2 * n + 1] + 2.0 * s * t[2 * n + 2] + s * s * t[2 * n + 3];
-  const rr = rsqrt(ss * IHID + EPS);
+  const rr = math.rsqrt(ss * IHID + EPS);
   @fmacs(tc(0, n), tc(0, n), tc(n, n), s);
   @fmuls(tc(0, n), tc(0, n), rr);
   return s;
@@ -439,20 +382,20 @@ fn attk(l: u16, comptime g: bool) void {
     while (h < Qh) : (h += 1) {
       const lsum = t[h * (dc + 1) + dc];
       if (lsum < 0.00390625 or lsum >= 32768.0) { bad = 1.0; }
-      ilh[h] = recip(lsum);
+      ilh[h] = math.recip(lsum);
       @fmuls(uv(h * dc, dc), tv(h * (dc + 1), dc), ilh[h]);
     }
     h = 0;
     while (h < Qh) : (h += 1) {
       const lh = t[h * (dc + 1) + dc];
-      u[QD + 1 + h] = if (bad == 0.0) 0.0 else ln1(lh);
+      u[QD + 1 + h] = if (bad == 0.0) 0.0 else math.ln1(lh);
     }
     u[QD] = bad;
     @fmovs(fab.fout(q_mc, QD + 1 + Qh), uc(0, QD + 1 + Qh));
     stamp(1 + 6 * cl + 3);
     if (bad == 0.0) {   // (ATTL 2) the logs off the path
       h = 0;
-      while (h < Qh) : (h += 1) { u[h] = ln1(t[h * (dc + 1) + dc]); }
+      while (h < Qh) : (h += 1) { u[h] = math.ln1(t[h * (dc + 1) + dc]); }
       @fmovs(fab.fout(q_mc, Qh), uc(0, Qh));
       pass = 8;
     }
@@ -490,7 +433,7 @@ task pass_task() void {
       }
       if ((cfl & 4) != 0) {
         reduce(4);
-        u[0] = rsqrt(t[0] * IHID + EPS);
+        u[0] = math.rsqrt(t[0] * IHID + EPS);
         mcast(1);
       }
     }

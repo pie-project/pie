@@ -63,6 +63,7 @@ param EPS: f32 = 1.0e-6; // the RMSNorms' eps (the hidden norms and GDN's gated 
 
 const sys_mod = @import_module("<memcpy/memcpy>", memcpy_params);
 const fab = @import_module("ops/fabric.csl", .{ .NQ = 6 });
+const math = @import_module("ops/math.csl");
 const tile_config = @import_module("<tile_config>");
 const color_config = tile_config.color_config;
 const tgt = tile_config.target;
@@ -146,7 +147,7 @@ fn init() void {
   vinit();
   vinit2();
   var g: u16 = 0;
-  while (CONVQK == 1 and g < NLG) : (g += 1) { gpar[2 * g] = -exp1(gpar[2 * g]); }
+  while (CONVQK == 1 and g < NLG) : (g += 1) { gpar[2 * g] = -math.exp1(gpar[2 * g]); }
   sys_mod.unblock_cmd_stream();
 }
 
@@ -172,43 +173,6 @@ fn seg_ar(n: u16) void {
 }
 
 // ---------------------------------------------------------------- scalar math
-fn rsqrt(v: f32) f32 {
-  var y = @bitcast(f32, @as(u32, 0x5f3759df) - (@bitcast(u32, v) >> 1));
-  y = y * (1.5 - 0.5 * v * y * y);
-  y = y * (1.5 - 0.5 * v * y * y);
-  y = y * (1.5 - 0.5 * v * y * y);
-  return y;
-}
-fn exp1(x0: f32) f32 {
-  var x: f32 = if (x0 < -87.0) -87.0 else if (x0 > 88.0) 88.0 else x0;
-  var k: f32 = x * 1.4426950408889634 + 12582912.0;
-  k = k - 12582912.0;
-  const r = x - k * 0.6931471805599453;
-  var p: f32 = 0.0013888889;
-  p = p * r + 0.008333334;
-  p = p * r + 0.041666668;
-  p = p * r + 0.16666667;
-  p = p * r + 0.5;
-  p = p * r + 1.0;
-  p = p * r + 1.0;
-  const ki = @as(i16, k) + 127;
-  const s = @bitcast(f32, @as(u32, @as(u16, ki)) << 23);
-  return p * s;
-}
-fn recip(v: f32) f32 { const a = if (v < 0.0) -v else v; const r = rsqrt(a); return if (v < 0.0) -(r * r) else r * r; }   // (not rsqrt(v v): v v overflows past 1.8e19, e.g. 1 + e^87 in a sigmoid)
-fn sigm(x: f32) f32 { return recip(1.0 + exp1(-x)); }
-fn silu(x: f32) f32 { return x * sigm(x); }
-fn ln1(x: f32) f32 {
-  // ln(x), x > 0: exponent bits plus 2 atanh((m - 1) / (m + 1)) to the 7th power
-  const b = @bitcast(u32, x);
-  const e = @as(f32, @as(i16, @as(u16, (b >> 23) & 0xff)) - 127);
-  const m = @bitcast(f32, (b & 0x007fffff) | 0x3f800000);
-  const z = (m - 1.0) * recip(m + 1.0);
-  const z2 = z * z;
-  const p = z * (2.0 + z2 * (0.6666667 + z2 * (0.4 + z2 * 0.2857143)));
-  return e * 0.6931471805599453 + p;
-}
-fn softplus(x: f32) f32 { return if (x > 20.0) x else ln1(1.0 + exp1(x)); }
 
 // ---------------------------------------------------------------- vector element-wise (f32 DSD ops)
 var va: [TN]f32 align(16) = @zeros([TN]f32);
@@ -221,33 +185,12 @@ const vc_d = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{TN} -> vcr[i] });
 const vk_d = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{TN} -> vk[i] });
 var vpl = vk_d;
 fn vinit() void { vpl = @set_dsd_stride(@set_dsd_base_addr(vk_d, @ptrcast([*]u16, &vb)), 2); }
-const ex_a = [3]f32 { 12582912.0, -12582912.0, 12582912.0 };
-const ex_c = [4]f32 { 0.16790908575057983, 0.5000435709953308, 0.9999634027481079, 0.9999992847442627 };
 // buf = exp(buf), buf in [-87, 88] (exp_fast's form; p in vb, k's bits in vk)
 fn vexp(buf: mem1d_dsd, n: u16) void {
   const p = @set_dsd_length(vb_d, n);
   const kk = @set_dsd_length(vk_d, n);
   const pl = @set_dsd_length(vpl, n);
-  const ph = @increment_dsd_offset(pl, 1, u16);
-  @fmaxs(buf, buf, -87.0);
-  @fnegs(buf, buf);
-  @fmaxs(buf, buf, -88.0);
-  @fnegs(buf, buf);
-  @fmuls(p, buf, 1.4426950408889634);
-  var c: u16 = 0;
-  while (c < 3) : (c += 1) {
-    @fadds(p, p, ex_a[c]);
-    if (c == 1) { @fmacs(buf, buf, p, -0.6931471805599453); }
-  }
-  @sll16(kk, pl, 7);
-  @fmuls(p, buf, 0.041458580642938614);
-  c = 0;
-  while (c < 4) : (c += 1) {
-    if (c > 0) { @fmuls(p, p, buf); }
-    @fadds(p, p, ex_c[c]);
-  }
-  @add16(ph, ph, kk);
-  @fmovs(buf, p);
+  math.vexp(buf, p, kk, pl, 88.0, true);
 }
 // dst = silu(src) = max(x, x e) / (1 + e), e = exp(-|x|) (dst != src)
 fn vsilu(dst: mem1d_dsd, src: mem1d_dsd, n: u16) void {
@@ -292,7 +235,7 @@ fn vsiluq(dst: mem1d_dsd, src: mem1d_dsd, n: u16) void {
   @fmuls(p, x, 1.4426950408889634);
   var c: u16 = 0;
   while (c < 3) : (c += 1) {
-    @fadds(p, p, ex_a[c]);
+    @fadds(p, p, math.ex_a[c]);
     if (c == 1) { @fmacs(x, x, p, -0.6931471805599453); }
   }
   @sll16(kk, pl, 7);
@@ -300,7 +243,7 @@ fn vsiluq(dst: mem1d_dsd, src: mem1d_dsd, n: u16) void {
   c = 0;
   while (c < 4) : (c += 1) {
     if (c > 0) { @fmuls(p, p, x); }
-    @fadds(p, p, ex_c[c]);
+    @fadds(p, p, math.ex_c[c]);
   }
   @add16(ph, ph, kk);                       // p = e
   @fadds(x, p, 1.0);                        // d
@@ -346,7 +289,7 @@ fn gdn_pre0(g: u16) f32 {
   const N = NQG + 1;
   reduce(N);
   stamp(1 + 6 * cl + 0);
-  const rr = rsqrt(t[NQG] / HID + EPS);
+  const rr = math.rsqrt(t[NQG] / HID + EPS);
   @fmuls(tv(0, NQG), tv(0, NQG), rr);
   // conv1d over the window and the new value (vector ops over the column's channels), SiLU
   const wb = g * (CONV - 1) * NCH;
@@ -368,8 +311,8 @@ fn gdn_pre0(g: u16) f32 {
   @fmovs(@increment_dsd_offset(cwn, @as(i16, wb + (CONV - 2) * NCH), f32), tv(0, NCH));
   vsilu(tv(0, NCH), cv, NCH);
   // gates
-  const bt = sigm(t[2 * DK + 2 * DV]);
-  const dec = exp1(-exp1(gpar[2 * g]) * softplus(t[2 * DK + 2 * DV + 1] + gpar[2 * g + 1]));
+  const bt = math.sigm(t[2 * DK + 2 * DV]);
+  const dec = math.exp1(-math.exp1(gpar[2 * g]) * math.softplus(t[2 * DK + 2 * DV + 1] + gpar[2 * g + 1]));
   gdec = dec;
   @fmovs(uv(0, DK), tv(DK, DK));          // k
   @fmovs(uv(DK, DK), tv(0, DK));          // q
@@ -392,25 +335,25 @@ fn gdn_pre1(g: u16) f32 {
   const N = NQG + 1;
   reduce(N);
   stamp(1 + 6 * cl + 0);
-  const rr = rsqrt(t[NQG] / HID + EPS);
+  const rr = math.rsqrt(t[NQG] / HID + EPS);
   // on the path to the multicast: q / k's rms scale, conv and SiLU, the decay (v, z, beta after it)
   @fmuls(tv(0, 2 * DK), tv(0, 2 * DK), rr);
   conv(g, 0, 2 * DK);
   vsil(tv(0, 2 * DK), uv(0, 2 * DK), 2 * DK);
-  if (GDEC == 0) { gdec = exp1(gpar[2 * g] * softplus(t[2 * DK + 2 * DV + 1] * rr + gpar[2 * g + 1])); }   // gpar[2 g] = -exp(A) (init)
+  if (GDEC == 0) { gdec = math.exp1(gpar[2 * g] * math.softplus(t[2 * DK + 2 * DV + 1] * rr + gpar[2 * g + 1])); }   // gpar[2 g] = -exp(A) (init)
   @fmovs(uv(0, DK), tv(DK, DK));          // k
   @fmovs(uv(DK, DK), tv(0, DK));          // q
   u[2 * DK] = if (GDEC == 0) gdec else 0.0;
   u[2 * DK + 1] = if (tab[0] == 0) 1.0 else 0.0;   // position 0: the weight PEs zero this layer's state
   mcast(2 * DK + 2);
   stamp(1 + 6 * cl + 1);
-  if (GDEC == 1) { gdec = exp1(gpar[2 * g] * softplus(t[2 * DK + 2 * DV + 1] * rr + gpar[2 * g + 1])); }   // (off the path: see gdn_post)
+  if (GDEC == 1) { gdec = math.exp1(gpar[2 * g] * math.softplus(t[2 * DK + 2 * DV + 1] * rr + gpar[2 * g + 1])); }   // (off the path: see gdn_post)
   @fmuls(tv(2 * DK, NQG - 2 * DK), tv(2 * DK, NQG - 2 * DK), rr);
   conv(g, 2 * DK, DV);
   // conv(v) | z side by side in u, one SiLU pass into v | z
   @fmovs(uv(2 * DK + DV, DV), tv(2 * DK + DV, DV));
   vsil(vz_d, uv(2 * DK, 2 * DV), 2 * DV);
-  const bt = sigm(t[2 * DK + 2 * DV]);
+  const bt = math.sigm(t[2 * DK + 2 * DV]);
   return bt;
 }
 // GDEC 1: the weight PEs send S^T k / S^T q of the undecayed state; the decay scales the sums here and
@@ -422,10 +365,10 @@ fn gdn_post(g: u16, bt: f32) void {
   reduce(2 * DV + 3);
   stamp(1 + 6 * cl + 2);
   if (GDEC == 1) { @fmuls(tv(0, 2 * DV), tv(0, 2 * DV), gdec); }
-  const ik = rsqrt(t[2 * DV] + L2EPS);
-  const iq0 = rsqrt(t[2 * DV + 1] + L2EPS);
+  const ik = math.rsqrt(t[2 * DV] + L2EPS);
+  const iq0 = math.rsqrt(t[2 * DV + 1] + L2EPS);
   const kq = t[2 * DV + 2] * ik * iq0;
-  const iq = iq0 * rsqrt(@as(f32, HK));
+  const iq = iq0 * math.rsqrt(@as(f32, HK));
   const vsd = @set_dsd_length(@get_dsd(mem1d_dsd, .{ .tensor_access = |i|{DV} -> vz[i] }), DV);
   const dl = uv(DV, DV);
   const o = uv(0, DV);
@@ -433,14 +376,14 @@ fn gdn_post(g: u16, bt: f32) void {
   @fsubs(dl, vsd, dl);
   @fmuls(dl, dl, bt);                      // delta
   @fmuls(o, tv(DV, DV), iq);
-  @fmacs(o, o, dl, kq * rsqrt(@as(f32, HK)));
+  @fmacs(o, o, dl, kq * math.rsqrt(@as(f32, HK)));
   @fmuls(dl, dl, ik);                      // delta / |k| (the state update's)
   var ss: f32 = 0.0;
   var i: u16 = 0;
   while (i < DV) : (i += 1) { const v = u[i]; ss += v * v; }
   gsc[2] = ss;
   seg_ar(1);
-  const on = rsqrt(gsc[2] / @as(f32, HV) + EPS);
+  const on = math.rsqrt(gsc[2] / @as(f32, HV) + EPS);
   @fmuls(o, o, on);
   @fmuls(o, o, @set_dsd_length(@increment_dsd_offset(@get_dsd(mem1d_dsd, .{ .tensor_access = |i|{DV} -> gnw[i] }), @as(i16, g * DV), f32), DV));
   @fmuls(o, o, zd);
@@ -489,7 +432,7 @@ fn att(a: u16) void {
   const QD: u16 = Qh * Dc;
   reduce(N);
   stamp(1 + 6 * cl + 0);
-  const rr = rsqrt(t[NQA] / HID + EPS);
+  const rr = math.rsqrt(t[NQA] / HID + EPS);
   @fmuls(tv(0, NQA), tv(0, NQA), rr);
   const qkb = a * (QD + Dc);
   // the raw q / k sums of squares a head (the weight PEs' segment all-reduce completes them)
@@ -519,7 +462,7 @@ fn att(a: u16) void {
   stamp(1 + 6 * cl + 1);
   if (ROPEP == 1 and NLA == 1) { rope_tables_at(tab[0] + 1); }   // (one attention layer a unit: the next pass's tables)
   var gi: u16 = 0;   // the output gate's sigmoid while the weight PEs run the scores
-  while (GATE == 1 and gi < QD) : (gi += 1) { gate[gi] = sigm(gate[gi]); }
+  while (GATE == 1 and gi < QD) : (gi += 1) { gate[gi] = math.sigm(gate[gi]); }
   var pass: u16 = 0;
   while (pass < 8) : (pass += 1) {
     reduce(Qh * (Dc + 1));
@@ -528,7 +471,7 @@ fn att(a: u16) void {
     while (h < Qh) : (h += 1) {
       const l = t[h * (Dc + 1) + Dc];
       if (l < 0.00390625 or l >= 32768.0) { bad = 1.0; }   // the f16 probabilities' window
-      ilh[h] = recip(l);
+      ilh[h] = math.recip(l);
       if (ATTV == 0) {
         var d: u16 = 0;
         while (d < Dc) : (d += 1) { u[h * Dc + d] = t[h * (Dc + 1) + d] * ilh[h] * (if (GATE == 1) gate[h * Dc + d] else 1.0); }
@@ -546,14 +489,14 @@ fn att(a: u16) void {
     h = 0;
     while (h < Qh) : (h += 1) {
       const lh = t[h * (Dc + 1) + Dc];
-      u[QD + 1 + h] = if (ATTL == 2 and bad == 0.0) 0.0 else ln1(lh);
+      u[QD + 1 + h] = if (ATTL == 2 and bad == 0.0) 0.0 else math.ln1(lh);
     }
     u[QD] = bad;
     mcast(QD + 1 + Qh);
     stamp(1 + 6 * cl + 3);
     if (ATTL == 2 and bad == 0.0) {   // the logs off the path (CY waits for the gate / up reduction next)
       h = 0;
-      while (h < Qh) : (h += 1) { u[h] = ln1(t[h * (Dc + 1) + Dc]); }
+      while (h < Qh) : (h += 1) { u[h] = math.ln1(t[h * (Dc + 1) + Dc]); }
       mcast(Qh);
     }
     if (bad == 0.0) { pass = 8; }
@@ -618,7 +561,7 @@ fn silu16(rr: f32) void {
 fn mlp() void {
   reduce(2 * Ic + 1);
   stamp(1 + 6 * cl + 4);
-  const rr = rsqrt(t[2 * Ic] / HID + EPS);
+  const rr = math.rsqrt(t[2 * Ic] / HID + EPS);
   if (SILU16 == 1) {
     silu16(rr);
     @fh2s(fab.fout(q_mc, Ic), HP);

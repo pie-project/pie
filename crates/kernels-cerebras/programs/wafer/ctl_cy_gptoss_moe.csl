@@ -32,6 +32,7 @@ param GLUV: u16 = 0;   // 1: glu = max(g, g e) / (1 + e), e = exp(-SWA |g|), the
 
 const sys_mod = @import_module("<memcpy/memcpy>", memcpy_params);
 const fab = @import_module("ops/fabric.csl", .{ .NQ = 6 });
+const math = @import_module("ops/math.csl");
 const tile_config = @import_module("<tile_config>");
 const color_config = tile_config.color_config;
 const tgt = tile_config.target;
@@ -132,33 +133,7 @@ fn seg_ar(n: u16) void {
   @fmovs(d, fab.fin(q_sm, n));
 }
 
-fn rsqrt(v: f32) f32 {
-  var y = @bitcast(f32, @as(u32, 0x5f3759df) - (@bitcast(u32, v) >> 1));
-  y = y * (1.5 - 0.5 * v * y * y);
-  y = y * (1.5 - 0.5 * v * y * y);
-  y = y * (1.5 - 0.5 * v * y * y);
-  return y;
-}
-fn exp1(x0: f32) f32 {
-  var x: f32 = if (x0 < -87.0) -87.0 else if (x0 > 88.0) 88.0 else x0;
-  var k: f32 = x * 1.4426950408889634 + 12582912.0;
-  k = k - 12582912.0;
-  const r = x - k * 0.6931471805599453;
-  var p: f32 = 0.0013888889;
-  p = p * r + 0.008333334;
-  p = p * r + 0.041666668;
-  p = p * r + 0.16666667;
-  p = p * r + 0.5;
-  p = p * r + 1.0;
-  p = p * r + 1.0;
-  const ki = @as(i16, k) + 127;
-  const s = @bitcast(f32, @as(u32, @as(u16, ki)) << 23);
-  return p * s;
-}
-fn recip(v: f32) f32 { const a = if (v < 0.0) -v else v; const r = rsqrt(a); return if (v < 0.0) -(r * r) else r * r; }
 
-const ex_a = [3]f32 { 12582912.0, -12582912.0, 12582912.0 };
-const ex_c = [4]f32 { 0.16790908575057983, 0.5000435709953308, 0.9999634027481079, 0.9999992847442627 };
 var vpl = vk_d;
 var eh_d = vk_d;
 // buf = exp(buf) (n words; exp_fast's form; p in vb, k's bits in vk)
@@ -166,32 +141,13 @@ fn vexp(buf: mem1d_dsd, n: u16) void {
   const p = @set_dsd_length(vb_d, n);
   const kk = @set_dsd_length(vk_d, n);
   const pl = @set_dsd_length(vpl, n);
-  const ph = @increment_dsd_offset(pl, 1, u16);
-  @fmaxs(buf, buf, -87.0);
-  @fnegs(buf, buf);
-  @fmaxs(buf, buf, -88.0);
-  @fnegs(buf, buf);
-  @fmuls(p, buf, 1.4426950408889634);
-  var c: u16 = 0;
-  while (c < 3) : (c += 1) {
-    @fadds(p, p, ex_a[c]);
-    if (c == 1) { @fmacs(buf, buf, p, -0.6931471805599453); }
-  }
-  @sll16(kk, pl, 7);
-  @fmuls(p, buf, 0.041458580642938614);
-  c = 0;
-  while (c < 4) : (c += 1) {
-    if (c > 0) { @fmuls(p, p, buf); }
-    @fadds(p, p, ex_c[c]);
-  }
-  @add16(ph, ph, kk);
-  @fmovs(buf, p);
+  math.vexp(buf, p, kk, pl, 88.0, true);
 }
 
 fn router(l: u16) void {
   reduce(2);
   stamp(1 + 3 * l);
-  const rr = rsqrt(t[1] / HID + EPS);
+  const rr = math.rsqrt(t[1] / HID + EPS);
   @fmovs(g_d, 0.0);
   g[rout] = t[0] * rr + rb[l];
   seg_ar(NEX);
@@ -226,8 +182,8 @@ fn router(l: u16) void {
   const m0 = g[sel[0]];
   var sum: f32 = 0.0;
   k = 0;
-  while (k < TK) : (k += 1) { wsel[k] = exp1(g[sel[k]] - m0); sum += wsel[k]; }
-  const is = recip(sum);
+  while (k < TK) : (k += 1) { wsel[k] = math.exp1(g[sel[k]] - m0); sum += wsel[k]; }
+  const is = math.recip(sum);
   k = 0;
   while (k < TK) : (k += 1) {
     wsel[k] = wsel[k] * is;
@@ -281,7 +237,7 @@ fn router(l: u16) void {
     @fmuls(E, G, -SWA);
     vexp(E, NG);
     var i: u16 = 0;
-    while (i < NG) : (i += 1) { t[i] = recip(1.0 + t[i]); }
+    while (i < NG) : (i += 1) { t[i] = math.recip(1.0 + t[i]); }
     @fmuls(G, G, E);            // glu = g sigmoid(SWA g)
   }
   @fadds(U, U, 1.0);
