@@ -2190,11 +2190,14 @@ fn the_committed_mamba2_lands_the_state_after_the_commit() {
 /// The chunked rule over 128-wide heads and a slot-blocked bf16 bank takes
 /// the fused Mosaic chunk kernel on a TPU (`ssm::chunk`): its rows and landed
 /// states against the XLA form's (the token walk is reported beside them),
-/// over 64-row chunks of grouped heads and 128-row chunks of one head each.
+/// over 64-row chunks of grouped heads, 128-row chunks of one head each and
+/// 32-row chunks of 48 heads.
 #[test]
 fn the_fused_chunk_kernel_matches_the_xla_form() {
     // Lanes of 70 (two chunks), 0, 5, 1 and 130 rows, then 3 padded rows;
-    // then one lane of 300 rows (three 128-row chunks) and 20 padded rows.
+    // then one lane of 300 rows (three 128-row chunks) and 20 padded rows;
+    // then Qwen3.6-27B's 48 value heads over two lanes of 150 and 140 rows
+    // (32-row chunks, four heads to a row of the blocks' inverses).
     for (g, indptr, rows, lane_slot, seed) in [
         (
             Gdn {
@@ -2219,6 +2222,18 @@ fn the_fused_chunk_kernel_matches_the_xla_form() {
             320usize,
             vec![1i32],
             36u64,
+        ),
+        (
+            Gdn {
+                hk: 16,
+                hv: 48,
+                dk: 128,
+                dv: 128,
+            },
+            vec![0i32, 150, 290],
+            300usize,
+            vec![2i32, 1],
+            37u64,
         ),
     ] {
         fused_against_xla(&g, &indptr, rows, &lane_slot, seed);

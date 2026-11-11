@@ -80,6 +80,13 @@ pub(super) fn gdn_chunks(
     let c0 = cmp_i(f, Cmp::Ne, cap_n, 0)?;
     let last_n = f.and(jl, c0)?;
     let last_n = f.and(last_n, live_n)?;
+    // Each chunk's rows of its lane (none past the fire's live chunks).
+    let cn = full_i(f, c, nc);
+    let done = f.mul(j, cn)?;
+    let left = f.sub(len_n, done)?;
+    let left = clamp_i(f, left, 0, c)?;
+    let none = full_i(f, 0, nc);
+    let nvalid = f.select(live_n, left, none)?;
     let first_i = f.convert(first_n, Elem::I32);
     let last_i = f.convert(last_n, Elem::I32);
     let slot_n = take(f, lanes.slot, lane_n)?;
@@ -101,13 +108,14 @@ pub(super) fn gdn_chunks(
     let row = f.reshape(row, &[sr])?;
     let valid = f.reshape(valid, &[sr])?;
 
-    // The chunk rows' `q | k | v`, f32, blank rows zero, laid as the rows
-    // are: the kernel takes each head off its rows (normed, `q` scaled), so
-    // no head-major plane is laid out for it (v5e Qwen3.5-0.8B: six layout
-    // copies a layer, 1.1 ms of a 640-row fire beside the kernel's 2.2), and
-    // the decay and `β` per value head.
+    // The chunk rows' `q | k | v` as they are stored (the kernel widens
+    // them, and zeroes the `q` of the rows past its chunk's lane: f32 rows
+    // blanked here cost a v5e Qwen3.5-0.8B 1792-row fire 18% of its GDN),
+    // laid as the rows are: the kernel takes each head off its rows (normed,
+    // `q` scaled), so no head-major plane is laid out for it (v5e: six
+    // layout copies a layer, 1.1 ms of a 640-row fire beside the kernel's
+    // 2.2), and the decay and `β` per value head, blank rows zero.
     let qkv = f.take_rows(raw.rows[0], row)?;
-    let qkv = f.convert(qkv, Elem::F32);
     let gates = f.take_rows(raw.rows[1], row)?;
     let gates = f.convert(gates, Elem::F32);
     let blank = |f: &mut Func, x: Val| -> Built<Val> {
@@ -119,7 +127,7 @@ pub(super) fn gdn_chunks(
     let keys = hk * dk;
     let width = 2 * keys + hv * dv;
     let qkv = f.slice_axis(qkv, 1, 0, width)?;
-    let qkv = blank(f, qkv)?;
+    let stored = f.elem(qkv);
     let g = f.slice_axis(gates, 1, 0, hv)?;
     let g = blank(f, g)?;
     let beta = f.slice_axis(gates, 1, hv, 2 * hv)?;
@@ -129,11 +137,11 @@ pub(super) fn gdn_chunks(
     let gcum = f.scan_steps(g3, 1, Fold::Sum)?;
     let gcum = f.reshape(gcum, &[sr, hv])?;
 
-    let compiled = kernel(hk, hv, dk, dv, c, nc, rows)?;
+    let compiled = kernel(hk, hv, dk, dv, c, nc, rows, stored)?;
     let out = compiled.call_aliased(
         f,
-        &[first_i, last_i, slot_n, qkv, gcum, beta, slab],
-        &[(1, 6)],
+        &[first_i, last_i, slot_n, nvalid, qkv, gcum, beta, slab],
+        &[(1, 7)],
     )?;
     let o = out[0];
 
@@ -167,13 +175,14 @@ fn kernel(
     c: i64,
     nc: i64,
     rows: i64,
+    stored: Elem,
 ) -> Built<crate::mosaic::Compiled> {
     let sr = nc * c;
     let per = hv * dk;
-    // A chunk's rows at a step, `w` f32 lanes a row.
-    let rowed = |w: i64| Operand {
+    // A chunk's rows at a step, `w` lanes a row.
+    let rowed = |w: i64, elem: Elem| Operand {
         array: vec![sr, w],
-        elem: Elem::F32,
+        elem,
         block: vec![c, w],
         window: Window::Blocked,
         index: Box::new(|b, g: &Grid| Ok(vec![g.ids[0], b.i32(0)])),
@@ -197,9 +206,14 @@ fn kernel(
         name: "gdn_chunks".to_string(),
         grid: vec![nc],
         semantics: vec![Sem::Arbitrary],
-        prefetch: vec![vec![nc], vec![nc], vec![nc]],
-        ins: vec![rowed(2 * hk * dk + hv * dv), tokens(), tokens(), bank()],
-        outs: vec![rowed(hv * dv), bank()],
+        prefetch: vec![vec![nc], vec![nc], vec![nc], vec![nc]],
+        ins: vec![
+            rowed(2 * hk * dk + hv * dv, stored),
+            tokens(),
+            tokens(),
+            bank(),
+        ],
+        outs: vec![rowed(hv * dv, Elem::F32), bank()],
         vmem_limit: Some(96 << 20),
         scratch: vec![
             MTy::Ref(vec![hv, dk, dv], Elem::F32, Space::Vmem),
@@ -237,10 +251,18 @@ fn kernel(
 
         let s0 = b.vload_all(st)?;
         // Each head off the chunk's rows; `q`, `k` normed (each row's sum
-        // of squares across its lanes through the MXU, against ones, full
-        // precision), `q` scaled.
+        // of squares across its lanes through the MXU, against ones, as a
+        // bf16 head and its bf16 rest: two passes, not full precision's
+        // six), `q` scaled.
         let x = b.vload_all(x_r)?;
-        let ones = b.splat_f(&[dk, dk], Elem::F32, 1.0)?;
+        let x = b.convert_f(x, Elem::F32)?;
+        // A row past the chunk's lane reads its `q` as zero, so its output
+        // is zero (its `β` and decay come blank: it moves no state).
+        let nv = b.load(blk.grid.prefetch[3], &[n])?;
+        let nv = b.broadcast_i(nv, &[c, dk])?;
+        let rid = b.iota(&[c, dk], 0);
+        let in_lane = b.cmpi(ICmp::Slt, rid, nv)?;
+        let ones = b.splat_f(&[dk, dk], Elem::Bf16, 1.0)?;
         let zero_cd = b.splat_f(&[c, dk], Elem::F32, 0.0)?;
         let eps = b.splat_f(&[c, dk], Elem::F32, GDN_EPS)?;
         let qs = b.splat_f(&[c, dk], Elem::F32, 1.0 / (dk as f64).sqrt())?;
@@ -254,9 +276,17 @@ fn kernel(
             let mut hs = Vec::with_capacity(n as usize);
             for h in 0..n {
                 let mut xh = b.slice(x, &[0, at + h * d], &[c, d])?;
+                if scale.is_some() {
+                    xh = b.select(in_lane, xh, zero_cd)?;
+                }
                 if norm {
                     let sq = b.mulf(xh, xh)?;
-                    let ss = b.matmul_g(sq, ones, zero_cd, 1, 0, true)?;
+                    let hi = b.convert_f(sq, Elem::Bf16)?;
+                    let wide = b.convert_f(hi, Elem::F32)?;
+                    let lo = b.subf(sq, wide)?;
+                    let lo = b.convert_f(lo, Elem::Bf16)?;
+                    let ss = b.matmul_g(hi, ones, zero_cd, 1, 0, false)?;
+                    let ss = b.matmul_g(lo, ones, ss, 1, 0, false)?;
                     let ss = b.addf(ss, eps)?;
                     let inv = b.rsqrt(ss)?;
                     xh = b.mulf(xh, inv)?;
@@ -325,7 +355,11 @@ fn kernel(
         let vb = b.mulf(v, beta)?;
         let kbe = b.mulf(kb, e)?;
         let rhs = b.concat(&[vb, kbe], 2)?;
-        let uw = solve_unit_lower(b, tm, rhs, hv, c)?;
+        let uw = if 128 % c == 0 && c >= 16 && hv % (128 / c) == 0 {
+            solve_lanes(b, tm, rhs, hv, c)?
+        } else {
+            solve_unit_lower(b, tm, rhs, hv, c)?
+        };
         let u = b.slice(uw, &[0, 0, 0], &[hv, c, dv])?;
         let w = b.slice(uw, &[0, 0, dv], &[hv, c, dk])?;
         let zero_cv = b.splat_f(&[hv, c, dv], Elem::F32, 0.0)?;
@@ -425,4 +459,148 @@ fn solve_unit_lower(
     } else {
         b.concat(&blocks, 1)
     }
+}
+
+/// `X = T⁻¹ R` for a unit lower-triangular `T` `[H, C, C]` and `R`
+/// `[H, C, N]` (f32), `C` 16, 32, 64 or 128 and `H` a multiple of `128 / C`.
+/// Every head's 16-row diagonal blocks are inverted at once, side by side in
+/// the lanes (lane `16 i + n` holds a block's column `n`; narrow chunks put
+/// `128 / C` heads in a row), a column of the inverses at a pass of
+/// lane-wise products over all their rows; then `R' = D⁻¹ R` and
+/// `M = D⁻¹ E` (`E` the part of `T` below the blocks) through the MXU, and
+/// `X = (I + M)⁻¹ R'` block by block, as vLLM-TPU's GDN kernel forms its
+/// inverse (its products at one bf16 pass, as theirs). The row-at-a-time
+/// substitution (`solve_unit_lower`) relaid a `[H, 1, q]` row of
+/// coefficients per row: a GDN layer of a 1792-row fire, with the rows'
+/// bf16 input, v5e Qwen3.5-0.8B 539 -> 292 us, Qwen3.6-27B's 48 heads 1183
+/// -> 703; v6e 335 -> 186 (pf256-512 135.5k -> 173.7k tok/s), 777 -> 386.
+fn solve_lanes(
+    b: &mut crate::mosaic::Body,
+    t: crate::mosaic::V,
+    r: crate::mosaic::V,
+    h: i64,
+    c: i64,
+) -> Built<crate::mosaic::V> {
+    use crate::mosaic::V;
+    let n = match b.ty(r) {
+        MTy::Vector(d, _) => d[2],
+        _ => unreachable!("a vector"),
+    };
+    let bs = 16;
+    let nb = c / bs;
+    let sl = [h, bs, c];
+    // rsum[h, q, 16 i + j] = T[h, 16 i + q, 16 i + j]
+    let lane3 = b.iota(&sl, 2);
+    let zero3 = b.splat_f(&sl, Elem::F32, 0.0)?;
+    let sixteen3 = b.splat_i(&sl, bs)?;
+    let grp3 = b.divsi(lane3, sixteen3)?;
+    let mut rsum: Option<V> = None;
+    for i in 0..nb {
+        let slab = b.slice(t, &[0, i * bs, 0], &sl)?;
+        let gi = b.splat_i(&sl, i)?;
+        let m = b.cmpi(ICmp::Eq, grp3, gi)?;
+        let part = b.select(m, slab, zero3)?;
+        rsum = Some(match rsum {
+            None => part,
+            Some(acc) => b.addf(acc, part)?,
+        });
+    }
+    let rsum = rsum.expect("blocks");
+    // Narrow chunks pack `hs` heads side by side in the lanes.
+    let hs = 128 / c;
+    let hp = h / hs;
+    let rsum = if hs == 1 {
+        rsum
+    } else {
+        let r4 = b.shape_cast(rsum, &[hp, hs, bs, c])?;
+        let mut pieces = Vec::with_capacity(hs as usize);
+        for si in 0..hs {
+            let pc = b.slice(r4, &[0, si, 0, 0], &[hp, 1, bs, c])?;
+            pieces.push(b.shape_cast(pc, &[hp, bs, c])?);
+        }
+        b.concat(&pieces, 2)?
+    };
+    let (h_all, c_all) = (h, c);
+    let (h, c) = (hp, 128);
+    // The blocks' inverses, every row at once (`[h, 16, c]`, a row of
+    // every block a sublane, lanes `16 i + n`), column by column: once row
+    // `j` is done, the rows below it less column `j`'s coefficients (spread
+    // over their blocks' lanes) times row `j`.
+    let sl2 = [h, bs, c];
+    let lane = b.iota(&sl2, 2);
+    let row = b.iota(&sl2, 1);
+    let sixteen = b.splat_i(&sl2, bs)?;
+    let lg = b.remsi(lane, sixteen)?;
+    let zero = b.splat_f(&sl2, Elem::F32, 0.0)?;
+    let one = b.splat_f(&sl2, Elem::F32, 1.0)?;
+    let diag = b.cmpi(ICmp::Eq, lg, row)?;
+    let mut x3 = b.select(diag, one, zero)?;
+    for j in 0..bs - 1 {
+        let jj = b.splat_i(&sl2, j)?;
+        let at_j = b.cmpi(ICmp::Eq, lg, jj)?;
+        let below = b.cmpi(ICmp::Sgt, row, jj)?;
+        let v = b.select(at_j, rsum, zero)?;
+        let mut v = if j == 0 {
+            v
+        } else {
+            let by = b.i32(c - j);
+            b.rotate(v, by, 2)?
+        };
+        for k in [1, 2, 4, 8] {
+            let by = b.i32(k);
+            let w = b.rotate(v, by, 2)?;
+            v = b.addf(v, w)?;
+        }
+        let v = b.select(below, v, zero)?;
+        let xj = b.slice(x3, &[0, j, 0], &[h, 1, c])?;
+        let xj = b.broadcast(xj, &sl2)?;
+        let prod = b.mulf(v, xj)?;
+        x3 = b.subf(x3, prod)?;
+    }
+    let (h, c) = (h_all, c_all);
+    let x3 = if hs == 1 {
+        x3
+    } else {
+        let mut pieces = Vec::with_capacity(hs as usize);
+        for si in 0..hs {
+            let pc = b.slice(x3, &[0, 0, si * c], &[hp, bs, c])?;
+            pieces.push(b.shape_cast(pc, &[hp, 1, bs, c])?);
+        }
+        let x4 = b.concat(&pieces, 1)?;
+        b.shape_cast(x4, &[h, bs, c])?
+    };
+    let mut dparts = Vec::with_capacity(nb as usize);
+    for i in 0..nb {
+        let gi = b.splat_i(&sl, i)?;
+        let m = b.cmpi(ICmp::Eq, grp3, gi)?;
+        dparts.push(b.select(m, x3, zero3)?);
+    }
+    let dinv = b.concat(&dparts, 1)?;
+    // E: T below the diagonal blocks.
+    let sq = [h, c, c];
+    let ri = b.iota(&sq, 1);
+    let cj = b.iota(&sq, 2);
+    let s16 = b.splat_i(&sq, bs)?;
+    let rb = b.divsi(ri, s16)?;
+    let cb = b.divsi(cj, s16)?;
+    let below = b.cmpi(ICmp::Sgt, rb, cb)?;
+    let zsq = b.splat_f(&sq, Elem::F32, 0.0)?;
+    let e = b.select(below, t, zsq)?;
+    let zr = b.splat_f(&[h, c, n], Elem::F32, 0.0)?;
+    let rp = b.matmul_g(dinv, r, zr, 2, 1, false)?;
+    let m = b.matmul_g(dinv, e, zsq, 2, 1, false)?;
+    let mut blocks: Vec<V> = Vec::with_capacity(nb as usize);
+    for i in 0..nb {
+        let lo = i * bs;
+        let mut x = b.slice(rp, &[0, lo, 0], &[h, bs, n])?;
+        if i > 0 {
+            let above = b.concat(&blocks, 1)?;
+            let coupling = b.slice(m, &[0, lo, 0], &[h, bs, lo])?;
+            let z = b.splat_f(&[h, bs, n], Elem::F32, 0.0)?;
+            let carried = b.matmul_g(coupling, above, z, 2, 1, false)?;
+            x = b.subf(x, carried)?;
+        }
+        blocks.push(x);
+    }
+    b.concat(&blocks, 1)
 }
