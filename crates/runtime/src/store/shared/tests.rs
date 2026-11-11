@@ -9,6 +9,7 @@ use ::engine::chunk::{
 use ::engine::fire::Lane;
 
 use super::*;
+use crate::governor::Retarget;
 
 const MIB: u64 = 1 << 20;
 const CHUNK: u64 = 16 * MIB;
@@ -157,7 +158,11 @@ impl FakeEngine {
     }
 }
 
-impl SegmentPort for FakeEngine {
+/// The engine's side of a pool move, as the scheduler's [`PoolOp`]s reach
+/// it from [`SharedGrow`].
+///
+/// [`PoolOp`]: crate::scheduler::worker::PoolOp
+impl FakeEngine {
     fn commit_segments(&mut self, segments: u32) -> ::engine::Result<()> {
         if self.refuse {
             return Err(::engine::Error::invalid("refused"));
@@ -189,6 +194,63 @@ impl SegmentPort for FakeEngine {
         self.calls.push(Call::Evacuate(evacuation.moves.clone()));
         Ok(())
     }
+}
+
+/// The segment walk of [`SharedGrow`] (target.rs) against `engine`: steps
+/// toward `target` mapped segments until there, or until a move has to wait;
+/// the fire at `epoch` is the last that may read what an evacuation moves.
+fn walk_segments(
+    pool: &mut SharedPool,
+    target: u32,
+    epoch: u64,
+    engine: &mut FakeEngine,
+) -> Retarget {
+    loop {
+        match pool.next_move(target, epoch) {
+            None | Some(SegmentMove::Wait) => return Retarget::Reached,
+            Some(SegmentMove::NoRoom) => {
+                return Retarget::NoRoom {
+                    held: u64::from(pool.mapped_segments()),
+                };
+            }
+            Some(SegmentMove::Commit { prefix }) => {
+                if engine.commit_segments(prefix).is_err() {
+                    return Retarget::Reached;
+                }
+                pool.committed(prefix);
+            }
+            Some(SegmentMove::Evacuate { evacuation }) => {
+                let _ = engine.evacuate(&evacuation);
+                return Retarget::Reached;
+            }
+            Some(SegmentMove::Release { prefix }) => {
+                engine.release_segments(prefix).unwrap();
+            }
+        }
+    }
+}
+
+/// The rung walk's raise of [`SharedGrow`] (target.rs) against `engine`:
+/// the engine copies the evacuation first, and the pool takes the rung only
+/// once it has, the chunks moved off closed until the fire at `epoch`
+/// retires. `Ok(false)`: the walk does not raise.
+fn walk_raise(
+    walk: &mut RungWalk,
+    pool: &mut SharedPool,
+    engine: &mut FakeEngine,
+    epoch: u64,
+) -> ::engine::Result<bool> {
+    let step = walk
+        .step(pool, u32::MAX, u32::MAX, u32::MAX, epoch, epoch)
+        .unwrap();
+    let RungStep::Raise { evacuation, .. } = step else {
+        return Ok(false);
+    };
+    if !evacuation.moves.is_empty() {
+        engine.evacuate(&SharedPool::rung_moves(&evacuation))?;
+    }
+    pool.apply_rung(&evacuation, epoch).unwrap();
+    Ok(true)
 }
 
 fn physical(pool: &SharedPool, shape: ShapeId, slot_ref: u32) -> u32 {
@@ -337,7 +399,10 @@ fn raising_the_rung_moves_state_out_of_the_activation_before_the_next_fire() {
     let mut engine = FakeEngine::new();
     // Back everything below the top span, then let state into the top span
     // by lowering the rung.
-    assert_eq!(pool.steer(8, 0, &mut engine), Retarget::Reached);
+    assert_eq!(
+        walk_segments(&mut pool, 8, 0, &mut engine),
+        Retarget::Reached
+    );
     assert_eq!(engine.prefix, 6);
     pool.lower_rung(16).unwrap();
     assert_eq!(pool.pool().state_limit(), TOTAL - 1);
@@ -356,15 +421,18 @@ fn raising_the_rung_moves_state_out_of_the_activation_before_the_next_fire() {
     };
     assert!(in_way(&pool) > 0, "state sits in the largest rung's span");
     // The engine refuses: nothing moves, the rung stays.
+    let mut walk = RungWalk::default();
+    let table = pool.pool().chunk_table().to_vec();
     engine.refuse = true;
-    assert!(matches!(
-        pool.raise_rung(2048, 3, &mut engine),
-        Err(RungError::Engine(_))
-    ));
+    assert!(walk_raise(&mut walk, &mut pool, &mut engine, 3).is_err());
     assert_eq!(pool.pool().act_reserved(), 1);
+    assert_eq!(pool.rung(), 16);
+    assert_eq!(pool.pool().chunk_table(), &table[..]);
+    assert!(in_way(&pool) > 0);
     engine.refuse = false;
-    pool.raise_rung(2048, 3, &mut engine).unwrap();
+    assert!(walk_raise(&mut walk, &mut pool, &mut engine, 3).unwrap());
     assert!(matches!(engine.calls.last(), Some(Call::Evacuate(_))));
+    assert_eq!(pool.rung(), 2048);
     assert_eq!(pool.pool().act_reserved(), 12);
     assert_eq!(in_way(&pool), 0);
     assert_eq!(engine.table.as_slice(), pool.pool().chunk_table());
@@ -377,9 +445,9 @@ fn raising_the_rung_moves_state_out_of_the_activation_before_the_next_fire() {
         };
         engine.fire(&facts, &lane, 12);
     }
-    // Raising to a rung already set aside moves nothing more.
+    // At the largest rung the walk raises no further and moves nothing.
     let calls = engine.calls.len();
-    pool.raise_rung(256, 4, &mut engine).unwrap();
+    assert!(!walk_raise(&mut walk, &mut pool, &mut engine, 4).unwrap());
     assert_eq!(engine.calls.len(), calls);
 }
 
@@ -394,9 +462,15 @@ fn segments_commit_ahead_as_a_prefix_and_shrink_by_evacuating_the_highest() {
         target, 6,
         "19 free, 30 and the 4 ahead wanted: two segments more"
     );
-    assert_eq!(pool.steer(target, 0, &mut engine), Retarget::Reached);
+    assert_eq!(
+        walk_segments(&mut pool, target, 0, &mut engine),
+        Retarget::Reached
+    );
     assert_eq!(engine.calls, [Call::Commit(3), Call::Commit(4)]);
-    assert_eq!(pool.steer(8, 0, &mut engine), Retarget::Reached);
+    assert_eq!(
+        walk_segments(&mut pool, 8, 0, &mut engine),
+        Retarget::Reached
+    );
     assert_eq!(
         engine.calls,
         [
@@ -421,7 +495,10 @@ fn segments_commit_ahead_as_a_prefix_and_shrink_by_evacuating_the_highest() {
     assert!(pool.pool().segments().used(5) > 0);
     // Shrink by one segment: the highest of the prefix evacuates first.
     engine.calls.clear();
-    assert_eq!(pool.steer(7, 9, &mut engine), Retarget::Reached);
+    assert_eq!(
+        walk_segments(&mut pool, 7, 9, &mut engine),
+        Retarget::Reached
+    );
     let [Call::Evacuate(moves)] = &engine.calls[..] else {
         panic!("{:?}", engine.calls);
     };
@@ -429,10 +506,16 @@ fn segments_commit_ahead_as_a_prefix_and_shrink_by_evacuating_the_highest() {
     assert_eq!(pool.pool().segments().used(5), 0);
     assert_eq!(engine.table.as_slice(), pool.pool().chunk_table());
     // Released only once the fire carrying the copy retires.
-    assert_eq!(pool.steer(7, 9, &mut engine), Retarget::Reached);
+    assert_eq!(
+        walk_segments(&mut pool, 7, 9, &mut engine),
+        Retarget::Reached
+    );
     assert_eq!(engine.prefix, 6, "still draining");
     pool.pool_mut().retire_through(9);
-    assert_eq!(pool.steer(7, 9, &mut engine), Retarget::Reached);
+    assert_eq!(
+        walk_segments(&mut pool, 7, 9, &mut engine),
+        Retarget::Reached
+    );
     assert_eq!(engine.prefix, 5);
     assert_eq!(pool.mapped_segments(), 7);
     // A shrink with no room below says so and drops nothing.
@@ -441,7 +524,7 @@ fn segments_commit_ahead_as_a_prefix_and_shrink_by_evacuating_the_highest() {
         .unwrap();
     assert!(!rest.is_empty());
     assert!(matches!(
-        pool.steer(4, 10, &mut engine),
+        walk_segments(&mut pool, 4, 10, &mut engine),
         Retarget::NoRoom { held: 7 }
     ));
     // The top span never goes.
@@ -455,7 +538,10 @@ fn a_refused_commit_hands_out_nothing_of_the_segment() {
     let mut engine = FakeEngine::new();
     engine.refuse = true;
     let before = pool.pool().available(LIST_POOL);
-    assert_eq!(pool.steer(5, 0, &mut engine), Retarget::Reached);
+    assert_eq!(
+        walk_segments(&mut pool, 5, 0, &mut engine),
+        Retarget::Reached
+    );
     assert_eq!(pool.pool().available(LIST_POOL), before);
     assert_eq!(pool.pool().segments().state(2), SegmentState::Uncommitted);
 }
@@ -926,7 +1012,10 @@ fn a_drained_segment_goes_once_the_next_fire_retires() {
     let mut pool = pool();
     let mut engine = FakeEngine::new();
     let mut kv = crate::store::kv::KvStore::new(8, [7u8; 32]);
-    assert_eq!(pool.steer(8, 0, &mut engine), Retarget::Reached);
+    assert_eq!(
+        walk_segments(&mut pool, 8, 0, &mut engine),
+        Retarget::Reached
+    );
     let held = pool.take_refs(LIST_POOL, 16 * 44).unwrap();
     let keep: Vec<u32> = held
         .chunks(16)
@@ -940,7 +1029,7 @@ fn a_drained_segment_goes_once_the_next_fire_retires() {
     let decode = kv.begin_fire();
     let walk = |pool: &mut SharedPool, kv: &crate::store::kv::KvStore, engine: &mut FakeEngine| {
         pool.pool_mut().retire_through(kv.retired_through());
-        pool.steer(7, kv.current_epoch() + 1, engine)
+        walk_segments(pool, 7, kv.current_epoch() + 1, engine)
     };
     engine.calls.clear();
     assert_eq!(walk(&mut pool, &kv, &mut engine), Retarget::Reached);
@@ -1779,7 +1868,10 @@ fn the_rung_walk_caps_fires_then_lowers_and_raises_back_with_an_evacuation() {
     let facts = facts();
     let mut pool = pool();
     let mut engine = FakeEngine::new();
-    assert_eq!(pool.steer(8, 0, &mut engine), Retarget::Reached);
+    assert_eq!(
+        walk_segments(&mut pool, 8, 0, &mut engine),
+        Retarget::Reached
+    );
     let mut walk = RungWalk::default();
     assert_eq!(pool.rungs(), [16, 256, 2048]);
     assert_eq!(pool.rung(), 2048);
@@ -1837,7 +1929,6 @@ fn the_rung_walk_caps_fires_then_lowers_and_raises_back_with_an_evacuation() {
     };
     assert_eq!(rung, 2048);
     assert!(!evacuation.moves.is_empty(), "state in the span moves out");
-    use super::SegmentPort;
     engine
         .evacuate(&SharedPool::rung_moves(&evacuation))
         .unwrap();

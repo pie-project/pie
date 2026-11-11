@@ -31,8 +31,9 @@
 //!
 //! Position (CONTRACT-BC item 2): state lies below `total - act_chunks(rung)`;
 //! raising the rung first moves state out of the new activation span
-//! ([`SharedPool::raise_rung`]), the engine copying it by
-//! [`::engine::Engine::evacuate`] before the next fire. The top
+//! ([`RungWalk`], [`SharedPool::plan_raise`]), the engine copying it by
+//! [`::engine::Engine::evacuate`] before the next fire
+//! ([`SharedPool::apply_rung`] once it has). The top
 //! `act_chunks_max` span is committed from the load and counts as held from
 //! then on. Segments commit as a prefix (`commit_segments(n)`) ahead of need,
 //! off the fire path; a shrink evacuates the highest committed segment of
@@ -53,7 +54,7 @@ use super::slots::{
     Demand, Holder, RungEvacuation, ShapeId, ShapeKind, Slot, SlotError, SlotPool, SlotPoolFacts,
     SlotShape,
 };
-use crate::governor::{Demand as Asked, Growth, Retarget};
+use crate::governor::{Demand as Asked, Growth};
 
 /// The pool behind an engine's stores, shared by every store and the
 /// governor; each call takes the lock for itself, innermost of every store
@@ -330,28 +331,6 @@ pub enum SegmentMove {
     NoRoom,
     /// A drained segment waits for the fire carrying its copy.
     Wait,
-}
-
-/// The engine side of the pool: what a segment move and a rung raise ask of
-/// it. Every engine answers; one that does not grow answers unsupported.
-pub trait SegmentPort {
-    fn commit_segments(&mut self, segments: u32) -> ::engine::Result<()>;
-    fn release_segments(&mut self, segments: u32) -> ::engine::Result<()>;
-    fn evacuate(&mut self, evacuation: &EngineEvacuation) -> ::engine::Result<()>;
-}
-
-impl<E: ::engine::Engine + ?Sized> SegmentPort for E {
-    fn commit_segments(&mut self, segments: u32) -> ::engine::Result<()> {
-        ::engine::Engine::commit_segments(self, segments)
-    }
-
-    fn release_segments(&mut self, segments: u32) -> ::engine::Result<()> {
-        ::engine::Engine::release_segments(self, segments)
-    }
-
-    fn evacuate(&mut self, evacuation: &EngineEvacuation) -> ::engine::Result<()> {
-        ::engine::Engine::evacuate(self, evacuation)
-    }
 }
 
 /// See the module docs.
@@ -1020,28 +999,6 @@ impl SharedPool {
 
     // ---- rungs ----
 
-    /// Sets the activation aside for fires of up to `rung` tokens. A rung
-    /// no larger than now takes nothing more; a larger one first moves the
-    /// state in its span down: the engine copies it before the next fire
-    /// (`port.evacuate`), and the chunks moved off stay closed until the
-    /// fire at `epoch` retires. Nothing moves when the port refuses.
-    pub fn raise_rung(
-        &mut self,
-        rung: u32,
-        epoch: u64,
-        port: &mut dyn SegmentPort,
-    ) -> Result<(), RungError> {
-        if self.pool.act_chunks(rung) <= self.pool.act_reserved() {
-            return self.pool.set_rung(rung).map_err(RungError::Pool);
-        }
-        let evacuation = self.pool.plan_rung(rung).map_err(RungError::Pool)?;
-        if !evacuation.moves.is_empty() {
-            port.evacuate(&engine_moves(&evacuation.moves))
-                .map_err(|error| RungError::Engine(error.to_string()))?;
-        }
-        self.apply_rung(&evacuation, epoch)
-    }
-
     /// Carries out `evacuation` (planned by [`Self::plan_raise`], copied by
     /// the engine) and takes its rung; the chunks moved off stay closed
     /// until the fire at `epoch` retires.
@@ -1181,38 +1138,6 @@ impl SharedPool {
         self.mapped_segments() + wanted.len() as u32
     }
 
-    /// Steps toward `target` mapped segments through `port` until there, or
-    /// until a shrink finds no room or waits on a fire; the fire at `epoch`
-    /// is the last that may read what an evacuation moves. A move the port
-    /// refuses stops the walk; what the pool applied stands, as the engine
-    /// would have it once the port does.
-    pub fn steer(&mut self, target: u32, epoch: u64, port: &mut dyn SegmentPort) -> Retarget {
-        loop {
-            match self.next_move(target, epoch) {
-                None => return Retarget::Reached,
-                Some(SegmentMove::Commit { prefix }) => {
-                    if port.commit_segments(prefix).is_err() {
-                        return Retarget::Reached;
-                    }
-                    self.committed(prefix);
-                }
-                Some(SegmentMove::Evacuate { evacuation }) => {
-                    let _ = port.evacuate(&evacuation);
-                    return Retarget::Reached;
-                }
-                Some(SegmentMove::Release { prefix }) => {
-                    let _ = port.release_segments(prefix);
-                }
-                Some(SegmentMove::Wait) => return Retarget::Reached,
-                Some(SegmentMove::NoRoom) => {
-                    return Retarget::NoRoom {
-                        held: u64::from(self.mapped_segments()),
-                    };
-                }
-            }
-        }
-    }
-
     // ---- governor ----
 
     /// What is asked of the pool, in bytes: the slots held and wanted, the
@@ -1269,8 +1194,6 @@ impl SharedPool {
 pub enum RungError {
     #[error("{0}")]
     Pool(SlotError),
-    #[error("the engine refused the evacuation: {0}")]
-    Engine(String),
 }
 
 #[cfg(test)]
