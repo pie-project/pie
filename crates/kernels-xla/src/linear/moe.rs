@@ -2468,7 +2468,11 @@ pub fn experts(
     if up.tm != dn.tm || up.tiles != dn.tiles || !flat(up)? || !flat(dn)? {
         return Ok(None);
     }
-    let run = tuning.moe_gmm_run;
+    let run = if up_fan.tokens >= tuning.moe_gmm_run_from {
+        tuning.moe_gmm_run
+    } else {
+        1
+    };
     let stepped = |s: crate::linear::moe_gmm::Gmm| crate::linear::moe_gmm::Gmm { run, ..s };
     let (up, dn) = if run > 1 && stepped(up).stepping() && stepped(dn).stepping() {
         let slack = |s: crate::linear::moe_gmm::Gmm| crate::linear::moe_gmm::Gmm {

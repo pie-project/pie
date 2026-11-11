@@ -38,6 +38,12 @@ ssm.step_mxu = 16
 # Qwen3.6-35B-A3B's 16-expert cut 995 -> 936); at 1088 Qwen's pick is cheaper (690 vs 725)
 moe.segment_tokens = 128
 moe.segment_from = 1280
+# a routed MLP's prompt of 1024 tokens and more takes two of an expert's row tiles a grid step, its gate-up
+# kernel landing the GLU: Qwen3.6-35B-A3B's 16-expert cut 2176 tokens 1043 -> 959 us, 1792 819 -> 802;
+# Gemma-4-26B-A4B's 32-expert cut 1792 1702 -> 1532, 1024 984 -> 931 (at four a step its gate-up is twice as slow)
+moe.gmm_run = 2
+moe.gmm_run_from = 1024
+moe.gmm_glu = 1
 
 [provenance]
 measured = [
@@ -49,6 +55,9 @@ measured = [
   "kernel.attn.decode_pages",
   "kernel.attn.unrolled_blocks",
   "kernel.moe.cost.onehot_mi",
+  "kernel.moe.gmm_glu",
+  "kernel.moe.gmm_run",
+  "kernel.moe.gmm_run_from",
   "kernel.moe.segment_from",
   "kernel.moe.segment_tokens",
   "kernel.ssm.step_mxu",
