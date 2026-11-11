@@ -119,10 +119,12 @@ pub fn matmul_select(
         let tiled = fan.route_count >= BF16_GEMM_FROM
             && x.width.is_multiple_of(64)
             && fan.route_count.div_ceil(bank.rows.max(1)) > 12;
-        if !crate::linear::gemm_sm100::supported()
+        // A streamed bank's table may name mapped host memory, which the
+        // tcgen05 GEMM's TMA cannot read: it takes the tiled GEMM anywhere,
+        // whose loads go through the table as global addresses.
+        if (!crate::linear::gemm_sm100::supported() || experts.streams())
             && tiled
             && bank.dtype == Dtype::Bf16
-            && !experts.streams()
             && select_bf16_held(ctx, OP, x, bank.ptr, bank.rows, routes, y, None, experts)?
         {
             return Ok(());

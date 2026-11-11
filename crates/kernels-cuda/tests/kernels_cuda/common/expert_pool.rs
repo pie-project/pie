@@ -159,3 +159,45 @@ pub fn garble(g: &Gpu, experts: usize, planes: &[Plane]) {
         g.fill(p.base, 0x5a ^ i as u8, bytes as usize);
     }
 }
+
+/// `entries` with every other expert's planes (from expert 0) copied into
+/// mapped host memory and named there, uploaded: a streamed table whose
+/// experts lie half on the host copy, half in the pool. The host copy is
+/// held for the process's life.
+pub fn half_on_host(g: &mut Gpu, entries: &[u64], planes: &[Plane]) -> u64 {
+    let count = planes.len();
+    let mut mixed = entries.to_vec();
+    for (slot, entry) in mixed.iter_mut().enumerate() {
+        let (e, p) = (slot / count, planes[slot % count]);
+        if e % 2 != 0 || *entry == 0 {
+            continue;
+        }
+        let _legacy = super::legacy();
+        let mut host: *mut core::ffi::c_void = core::ptr::null_mut();
+        // SAFETY: a live out-parameter; the allocation is never freed (a
+        // test's mapped host copy, held for the process).
+        let code = unsafe { rt::cudaHostAlloc(&raw mut host, p.bytes as usize, 2) };
+        assert_eq!(code, rt::cudaError::cudaSuccess, "`cudaHostAlloc` mapped");
+        // SAFETY: `host` is `p.bytes` of pinned memory just allocated, and
+        // `entry` names `p.bytes` of live device memory.
+        let code = unsafe {
+            rt::cudaMemcpy(
+                host,
+                *entry as *const core::ffi::c_void,
+                p.bytes as usize,
+                rt::cudaMemcpyKind::cudaMemcpyDeviceToHost,
+            )
+        };
+        assert_eq!(code, rt::cudaError::cudaSuccess, "`cudaMemcpy D2H`");
+        let mut device: *mut core::ffi::c_void = core::ptr::null_mut();
+        // SAFETY: `host` is a mapped allocation; the call writes `device`.
+        let code = unsafe { rt::cudaHostGetDevicePointer(&raw mut device, host, 0) };
+        assert_eq!(
+            code,
+            rt::cudaError::cudaSuccess,
+            "`cudaHostGetDevicePointer`"
+        );
+        *entry = device as u64;
+    }
+    g.up(&mixed)
+}

@@ -223,8 +223,10 @@ pub fn select_bf16_held(
     let act_div = if fan.by_token { fan.top_k } else { 1 };
     // A prefill's routes on Hopper's warp-specialized wgmma GEMM, an
     // expert's slice 128 of them by 256 weight rows (128 gate and their up
-    // rows with a GLU), the GLU in its epilogue.
+    // rows with a GLU), the GLU in its epilogue. A streamed table stays on
+    // the mma.sync kernels below, whose loads go through it.
     if hopper_wgmma()
+        && !table.streams()
         && fan.route_count >= BF16_GEMM_FROM
         && fan.route_count.div_ceil(experts) >= BF16_WSGEMM_FROM
         && x.width.is_multiple_of(64)
