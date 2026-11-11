@@ -134,7 +134,7 @@ impl Weights {
         // that only a miss opens: a held set seats it in the pool, a
         // streaming one reads a few atoms of it at a time.
         let apart: std::collections::BTreeSet<usize> = if !plan.whole_weights() {
-            crate::store::streamed::streamed(trace)
+            crate::store::streamed::streamed(trace, plan.rows_streamed())
                 .into_iter()
                 .collect()
         } else {
@@ -170,9 +170,10 @@ impl Weights {
 
         // The row-streamed tables land in allocations of their own, out of
         // the store, which packs the other planes as before.
-        let own: std::collections::BTreeSet<usize> = crate::store::streamed::streamed(trace)
-            .into_iter()
-            .collect();
+        let own: std::collections::BTreeSet<usize> =
+            crate::store::streamed::streamed(trace, plan.rows_streamed())
+                .into_iter()
+                .collect();
         let places = {
             let mut packed = places;
             let mut at = 0u64;

@@ -153,7 +153,11 @@ fn serve(fixture: &Fixture, mode: Mode) -> (Vec<Vec<f32>>, u64) {
         );
     }
     facts.validate().expect("the facts hang together");
-    if mode == Mode::Whole {
+    // A load told held reads its token-id tables in place (unified memory:
+    // no pool copy); a miniature that streams only such tables then states
+    // no shape and serves as the whole load does.
+    let in_place = told && facts.weights.is_empty();
+    if mode == Mode::Whole || in_place {
         assert!(facts.weights.is_empty(), "a whole-weights load states none");
     } else {
         assert!(
@@ -185,6 +189,7 @@ fn serve(fixture: &Fixture, mode: Mode) -> (Vec<Vec<f32>>, u64) {
     let commit = (first + 2 * span).div_ceil(segment);
     shell.commit_segments(commit).expect("the segments commit");
     let named = match mode {
+        _ if in_place => None,
         Mode::Seated { .. } => Some((
             facts
                 .weights
@@ -231,7 +236,7 @@ fn serve(fixture: &Fixture, mode: Mode) -> (Vec<Vec<f32>>, u64) {
         assert_eq!(shell.weight_atoms().0, count, "{mode:?}: the blocks named");
         assert_eq!(
             shell.weights_given_back(),
-            mode == Mode::Held || told,
+            mode == Mode::Held || (told && !in_place),
             "{mode:?}: the tables' own copies go only under a held set naming every block"
         );
     }

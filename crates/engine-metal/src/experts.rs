@@ -46,6 +46,18 @@ impl Plan {
         self.weights_held
     }
 
+    /// Whether the token-id tables (PLE rows) go through the weight cache:
+    /// only where the runtime may stream them. A held table is read in
+    /// place: memory is unified, so the table's own pages (the mapped
+    /// serving file, or its allocation on a cold load) are device memory
+    /// already, and a pool copy of it would cost its bytes twice and its
+    /// seating at load. The table is then a dense weight, counted with
+    /// the weights, outside the pool (see [`rows_streamed`]).
+    #[must_use]
+    pub fn rows_streamed(&self) -> bool {
+        rows_streamed(self.weights_held)
+    }
+
     /// This plan's pool aiming its chunk near `bytes` (see `chunk_bytes`).
     #[must_use]
     pub fn with_chunk_bytes(mut self, bytes: u64) -> Plan {
@@ -57,4 +69,11 @@ impl Plan {
     pub fn chunk_bytes(&self) -> Option<u64> {
         self.chunk_bytes
     }
+}
+
+/// Whether a load whose runtime holds the weights (`held`) states its
+/// token-id tables as weight shapes ([`Plan::rows_streamed`]).
+#[must_use]
+pub fn rows_streamed(held: bool) -> bool {
+    !held
 }
