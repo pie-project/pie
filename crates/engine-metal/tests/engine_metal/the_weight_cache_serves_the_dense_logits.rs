@@ -79,10 +79,7 @@ enum Mode {
 /// Whether the fixture's container is a serving artifact already (a
 /// quantized deployment's: it loads from nothing else).
 fn is_serving(fixture: &Fixture) -> bool {
-    fixture
-        .container
-        .to_string_lossy()
-        .ends_with(".serving.zt")
+    fixture.container.to_string_lossy().ends_with(".serving.zt")
 }
 
 /// The fixture's planes as a serving artifact beside its checkpoint.
@@ -608,5 +605,8 @@ fn quantized_per_layer_tables_serve_the_whole_logits() {
 /// planes).
 #[test]
 fn a_mixtures_quantized_experts_serve_the_whole_logits_affine_u2() {
-    quantized("qwen38-flash-next-mini-u4g64-u2g128-kv-bf16", WeightKind::Expert);
+    quantized(
+        "qwen38-flash-next-mini-u4g64-u2g128-kv-bf16",
+        WeightKind::Expert,
+    );
 }

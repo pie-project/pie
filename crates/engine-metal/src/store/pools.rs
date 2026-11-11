@@ -572,21 +572,39 @@ struct HostTier {
 }
 
 impl HostTier {
-    /// The bytes of host ref `slot` of `shape`, its chunk allocated first.
-    fn slot(&mut self, shape: &Slots, slot: u32) -> Result<&mut [u8]> {
+    /// Host ref `slot` of `shape`: its chunk and the byte range in it.
+    fn place(&self, shape: &Slots, slot: u32) -> Result<(usize, std::ops::Range<usize>)> {
         let per_chunk = shape.per_chunk.max(1);
         let chunk = (slot / per_chunk) as usize;
-        let have = self.chunks.len();
-        let held = self.chunks.get_mut(chunk).ok_or(Fault::Ceiling {
-            what: "chunks of the host tier",
-            need: chunk as u64 + 1,
-            have: have as u64,
-        })?;
-        let bytes = usize::try_from(self.chunk_bytes).unwrap_or(usize::MAX);
-        let held = held.get_or_insert_with(|| vec![0u8; bytes].into_boxed_slice());
+        if chunk >= self.chunks.len() {
+            return Err(Fault::Ceiling {
+                what: "chunks of the host tier",
+                need: chunk as u64 + 1,
+                have: self.chunks.len() as u64,
+            });
+        }
         let at = usize::try_from(u64::from(slot % per_chunk) * shape.slot_bytes).unwrap_or(0);
         let len = usize::try_from(shape.slot_bytes).unwrap_or(0);
-        Ok(&mut held[at..at + len])
+        Ok((chunk, at..at + len))
+    }
+
+    /// The bytes of host ref `slot` of `shape`, its chunk allocated first.
+    fn slot(&mut self, shape: &Slots, slot: u32) -> Result<&mut [u8]> {
+        let (chunk, range) = self.place(shape, slot)?;
+        let bytes = usize::try_from(self.chunk_bytes).unwrap_or(usize::MAX);
+        let held = self.chunks[chunk].get_or_insert_with(|| vec![0u8; bytes].into_boxed_slice());
+        Ok(&mut held[range])
+    }
+
+    /// Copies host ref `slot` of `shape` into `into`: zeros where no copy
+    /// has touched its chunk yet (nothing is allocated for a read).
+    fn read(&self, shape: &Slots, slot: u32, into: &mut [u8]) -> Result<()> {
+        let (chunk, range) = self.place(shape, slot)?;
+        match &self.chunks[chunk] {
+            Some(held) => into.copy_from_slice(&held[range]),
+            None => into.fill(0),
+        }
+        Ok(())
     }
 }
 
@@ -796,6 +814,74 @@ impl Pools {
                 self.pool.read(at, slot)?;
             } else {
                 self.pool.write(at, slot)?;
+            }
+        }
+        Ok(())
+    }
+
+    /// See [`engine::Engine::read_tier_slots`]: the bytes of host tier
+    /// slots, shape by shape, each laid out as `copy_slots` moves it (the
+    /// device slot's bytes). Unified memory: the host tier is plain host
+    /// memory, so this is one memcpy a slot, no staging. The caller has
+    /// drained every frame.
+    pub fn read_tier_slots(&self, slots: &[(ShapeId, Vec<u32>)]) -> Result<Vec<u8>> {
+        let tier = self.tier.as_ref().ok_or(Fault::Ceiling {
+            what: "chunks of the host tier",
+            need: 1,
+            have: 0,
+        })?;
+        let mut total = 0u64;
+        for (id, refs) in slots {
+            total += self.shape(*id)?.slot_bytes * refs.len() as u64;
+        }
+        let mut out = vec![0u8; usize::try_from(total).unwrap_or(usize::MAX)];
+        let mut at = 0usize;
+        for (id, refs) in slots {
+            let shape = *self.shape(*id)?;
+            let len = usize::try_from(shape.slot_bytes).unwrap_or(usize::MAX);
+            for &slot in refs {
+                tier.read(&shape, slot, &mut out[at..at + len])?;
+                at += len;
+            }
+        }
+        Ok(out)
+    }
+
+    /// See [`engine::Engine::write_tier_slots`]: `bytes`, laid out as
+    /// [`Self::read_tier_slots`] returns them, into host tier slots; refused
+    /// whole when the byte count differs or a ref lies past the tier. The
+    /// caller has drained every frame.
+    pub fn write_tier_slots(&mut self, slots: &[(ShapeId, Vec<u32>)], bytes: &[u8]) -> Result<()> {
+        let mut need = 0u64;
+        for (id, refs) in slots {
+            let shape = *self.shape(*id)?;
+            need += shape.slot_bytes * refs.len() as u64;
+            if let Some(tier) = self.tier.as_ref() {
+                for &slot in refs {
+                    tier.place(&shape, slot)?;
+                }
+            }
+        }
+        if bytes.len() as u64 != need {
+            return Err(Fault::Ceiling {
+                what: "bytes of host tier slots",
+                need,
+                have: bytes.len() as u64,
+            });
+        }
+        let mut at = 0usize;
+        for (id, refs) in slots {
+            let shape = *self.shape(*id)?;
+            let len = usize::try_from(shape.slot_bytes).unwrap_or(usize::MAX);
+            for &slot in refs {
+                let tier = self.tier.as_mut().ok_or(Fault::Ceiling {
+                    what: "chunks of the host tier",
+                    need: 1,
+                    have: 0,
+                })?;
+                tier.slot(&shape, slot)?
+                    .copy_from_slice(&bytes[at..at + len]);
+                at += len;
             }
         }
         Ok(())
@@ -1642,7 +1728,11 @@ impl Pools {
         // An atom the load seated that the runtime names another slot for
         // is filled there again: said, since a runtime that adopted the
         // load's seating moves none.
-        if self.weight_caches.iter().any(super::streamed::Cache::preseated) {
+        if self
+            .weight_caches
+            .iter()
+            .any(super::streamed::Cache::preseated)
+        {
             let moved = residency
                 .resident
                 .iter()
@@ -1710,8 +1800,7 @@ impl Pools {
                 let first = list[at].0;
                 let mut end = at + 1;
                 let mut last = first + list[at].2;
-                while end < list.len() && list[end].0 == last && last + list[end].2 - first <= RUN
-                {
+                while end < list.len() && list[end].0 == last && last + list[end].2 - first <= RUN {
                     last += list[end].2;
                     end += 1;
                 }
@@ -1728,9 +1817,7 @@ impl Pools {
                         .entry(physical)
                         .or_insert_with(|| self.pool.chunk_host(physical).ok());
                     match base {
-                        Some(base)
-                            if within + len <= usize::try_from(chunk_bytes).unwrap_or(0) =>
-                        {
+                        Some(base) if within + len <= usize::try_from(chunk_bytes).unwrap_or(0) => {
                             // SAFETY: `within + len` bytes inside the chunk
                             // the address names, committed (`chunk_host`
                             // admits it), which no frame in flight reads
@@ -1765,7 +1852,9 @@ impl Pools {
     pub fn preseat_plan(&self) -> Option<engine::chunk::WeightResidency> {
         let segment = self.layout.segment_chunks.max(1);
         let above = (1 + self.layout.seat_chunks()).div_ceil(segment) * segment;
-        [above, 1].into_iter().find_map(|first| self.preseat_from(first))
+        [above, 1]
+            .into_iter()
+            .find_map(|first| self.preseat_from(first))
     }
 
     /// Every atom of every shape from chunk `first` on, each shape in chunks

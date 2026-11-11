@@ -154,9 +154,7 @@ mod tests {
         let without = Accounting::of(ws, 0, util, 11 * GIB, 4 * GIB);
         assert!(without.admit(util).is_ok());
         let with = Accounting::with_scratch(ws, 0, util, 11 * GIB, 6 * GIB, 4 * GIB);
-        let why = with
-            .admit(util)
-            .expect_err("11 + 6 + 4 GiB is over ~19.6");
+        let why = with.admit(util).expect_err("11 + 6 + 4 GiB is over ~19.6");
         let said = format!("{why}");
         assert!(
             said.contains("max_forward_tokens"),
@@ -169,14 +167,9 @@ mod tests {
         let ws = 21_800 * (GIB / 1000);
         let util = DEFAULT_DEVICE_MEMORY_SHARE;
         let ok = Accounting::of(ws, 0, util, 11 * GIB, 4 * GIB);
-        assert!(
-            ok.admit(util).is_ok(),
-            "11 + 4 GiB fits under ~19.6"
-        );
+        assert!(ok.admit(util).is_ok(), "11 + 4 GiB fits under ~19.6");
         let over = Accounting::of(ws, 0, util, 18 * GIB, 4 * GIB);
-        let why = over
-            .admit(util)
-            .expect_err("18 + 4 GiB over the ceiling");
+        let why = over.admit(util).expect_err("18 + 4 GiB over the ceiling");
         let said = format!("{why}");
         for needle in [
             "recommendedMaxWorkingSetSize",

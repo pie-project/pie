@@ -39,7 +39,10 @@ impl Scheme {
         match self {
             Scheme::Affine { bits: 8, .. } => Dtype::U8g64,
             Scheme::Affine { bits: 2, group: 32 } => Dtype::U2g32,
-            Scheme::Affine { bits: 2, group: 128 } => Dtype::U2g128,
+            Scheme::Affine {
+                bits: 2,
+                group: 128,
+            } => Dtype::U2g128,
             Scheme::Affine { bits: 2, .. } => Dtype::U2g64,
             Scheme::Affine { .. } | Scheme::Mxfp4 => Dtype::U4g64,
         }
@@ -291,7 +294,9 @@ fn run(scheme: Scheme, arm: Arm, biased: bool, pieces: u32) -> (Vec<u8>, Vec<u8>
         .flat_map(|at| bf16((f32::from(noise(u64::from(at) ^ 0xabcd)) - 127.0) * 0.02))
         .collect();
     let routes: Vec<u8> = (0..tokens)
-        .flat_map(|t| (0..top_k).flat_map(move |s| ((t * 3 + s * 5 + t / 7) % experts).to_le_bytes()))
+        .flat_map(|t| {
+            (0..top_k).flat_map(move |s| ((t * 3 + s * 5 + t / 7) % experts).to_le_bytes())
+        })
         .collect();
     let sorted = moe::sorted_rows(pairs, experts, &tuning).max(pairs);
     let output = u64::from(pairs) * u64::from(n) * 2;
@@ -369,7 +374,9 @@ fn run(scheme: Scheme, arm: Arm, biased: bool, pieces: u32) -> (Vec<u8>, Vec<u8>
     let whole = fire(None);
     scribble(&mut store);
     let tabled = fire(Some(table));
-    let counted = handles.read(hits.buf, u64::from(experts) * 4).expect("hits");
+    let counted = handles
+        .read(hits.buf, u64::from(experts) * 4)
+        .expect("hits");
     let mut want = vec![0u32; experts as usize];
     for e in routes.chunks(4) {
         want[i32::from_le_bytes([e[0], e[1], e[2], e[3]]) as usize] += 1;
@@ -387,13 +394,18 @@ fn check(scheme: Scheme, arm: Arm, biased: bool) {
         return;
     }
     if matches!(arm, Arm::Batched(_))
-        && !Context::bind().expect("the system device").supports_elastic()
+        && !Context::bind()
+            .expect("the system device")
+            .supports_elastic()
     {
         return;
     }
     for pieces in [1, 2] {
         let (whole, tabled) = run(scheme, arm, biased, pieces);
-        assert!(whole.iter().any(|&b| b != 0), "{scheme:?} {arm:?}: rows landed");
+        assert!(
+            whole.iter().any(|&b| b != 0),
+            "{scheme:?} {arm:?}: rows landed"
+        );
         assert!(
             whole == tabled,
             "{scheme:?} {arm:?} biased={biased} pieces={pieces}: the tabled bank lands other bits"
@@ -407,7 +419,10 @@ const AFFINE: [Scheme; 5] = [
     Scheme::Affine { bits: 8, group: 64 },
     Scheme::Affine { bits: 2, group: 64 },
     Scheme::Affine { bits: 2, group: 32 },
-    Scheme::Affine { bits: 2, group: 128 },
+    Scheme::Affine {
+        bits: 2,
+        group: 128,
+    },
 ];
 
 #[test]
@@ -462,14 +477,35 @@ fn the_register_tiles_read_tabled_banks_as_their_contiguous_banks() {
         let mut down_store = store(&device, &down_planes, EXPERTS, HIDDEN, pieces);
         // As a checkpoint's experts land: an expert a row of codes.
         let expert_rows = |bank: Bank, columns: u32| Bank {
-            codes: Tensor::new(bank.codes.buf, EXPERTS, columns * bank.codes.width, bank.codes.dtype),
+            codes: Tensor::new(
+                bank.codes.buf,
+                EXPERTS,
+                columns * bank.codes.width,
+                bank.codes.dtype,
+            ),
             ld: columns * bank.codes.width,
             ..bank
         };
-        let (gate_up, _, gate_table) =
-            bank_of(&handles, &gate_store, scheme, EXPERTS, 2 * INTER, HIDDEN, pieces, None);
-        let (down, _, down_table) =
-            bank_of(&handles, &down_store, scheme, EXPERTS, HIDDEN, INTER, pieces, None);
+        let (gate_up, _, gate_table) = bank_of(
+            &handles,
+            &gate_store,
+            scheme,
+            EXPERTS,
+            2 * INTER,
+            HIDDEN,
+            pieces,
+            None,
+        );
+        let (down, _, down_table) = bank_of(
+            &handles,
+            &down_store,
+            scheme,
+            EXPERTS,
+            HIDDEN,
+            INTER,
+            pieces,
+            None,
+        );
         let (gate_up, down) = (expert_rows(gate_up, 2 * INTER), expert_rows(down, HIDDEN));
         let plane = |bytes: u64| Buffer::zeroed(&device, bytes.max(4)).expect("a plane");
         let bind = |b: &Buffer| handles.bind(b, 0, b.bytes()).expect("bind");
@@ -485,7 +521,12 @@ fn the_register_tiles_read_tabled_banks_as_their_contiguous_banks() {
             .flat_map(|at| bf16((f32::from(noise(u64::from(at) ^ 0x77)) - 127.0) / 64.0))
             .collect();
         let xb = upload(&x);
-        let rb = upload(&routes.iter().flat_map(|e| e.to_le_bytes()).collect::<Vec<u8>>());
+        let rb = upload(
+            &routes
+                .iter()
+                .flat_map(|e| e.to_le_bytes())
+                .collect::<Vec<u8>>(),
+        );
         let xt = Tensor::new(bind(&xb), TOKENS, HIDDEN, Dtype::Bf16);
         let rt = Tensor::new(bind(&rb), TOKENS, TOP_K, Dtype::I32);
         let tiles = moe::register_tiles(TOKENS, TOP_K, EXPERTS, false);
@@ -503,7 +544,11 @@ fn the_register_tiles_read_tabled_banks_as_their_contiguous_banks() {
         let mid_width = u64::from(tiles) * moe::register_table_width(INTER);
         let (_f, hidden_t) = room(mid_width, Dtype::Bf16, mid_width * 2);
         let out_bytes = u64::from(tiles) * 8 * u64::from(HIDDEN) * 2;
-        let (_y, y_t) = room(u64::from(tiles) * 8 * u64::from(HIDDEN), Dtype::Bf16, out_bytes);
+        let (_y, y_t) = room(
+            u64::from(tiles) * 8 * u64::from(HIDDEN),
+            Dtype::Bf16,
+            out_bytes,
+        );
         let (_m, mix_t) = room(
             u64::from(moe::REGISTER_MIX),
             Dtype::F32,
@@ -528,8 +573,17 @@ fn the_register_tiles_read_tabled_banks_as_their_contiguous_banks() {
         let fire = |tables: Option<(BankTable, BankTable)>| {
             let frame = device.frame().expect("frame");
             let sink = Sink::new(&device, &frame, &pipelines, &handles);
-            moe::register_group(&sink, xt, rt, EXPERTS, false, None, cut.groups(INTER, HIDDEN), rooms)
-                .expect("group");
+            moe::register_group(
+                &sink,
+                xt,
+                rt,
+                EXPERTS,
+                false,
+                None,
+                cut.groups(INTER, HIDDEN),
+                rooms,
+            )
+            .expect("group");
             moe::register_glu(
                 &sink,
                 gate_up,
@@ -559,7 +613,9 @@ fn the_register_tiles_read_tabled_banks_as_their_contiguous_banks() {
             drop(sink);
             frame.commit().expect("commit");
             (
-                handles.read(rooms.hidden.buf, mid_width * 2).expect("hidden"),
+                handles
+                    .read(rooms.hidden.buf, mid_width * 2)
+                    .expect("hidden"),
                 handles.read(rooms.y.buf, out_bytes).expect("rows"),
             )
         };
@@ -568,8 +624,14 @@ fn the_register_tiles_read_tabled_banks_as_their_contiguous_banks() {
         scribble(&mut down_store);
         let tabled = fire(Some((gate_table, down_table)));
         assert!(whole.1.iter().any(|&b| b != 0), "rows landed");
-        assert!(whole.0 == tabled.0, "pieces={pieces}: the gate-up lands other bits");
-        assert!(whole.1 == tabled.1, "pieces={pieces}: the down lands other bits");
+        assert!(
+            whole.0 == tabled.0,
+            "pieces={pieces}: the gate-up lands other bits"
+        );
+        assert!(
+            whole.1 == tabled.1,
+            "pieces={pieces}: the down lands other bits"
+        );
         eprintln!("register tiles pieces={pieces}: tabled = contiguous");
     }
 }

@@ -286,13 +286,7 @@ impl Inputs {
             ..paging
         };
         let pages = u64::from(budget.max_lanes) * u64::from(paged.pages_per_slot);
-        let window_ints = window_ints(
-            budget,
-            paged,
-            page_tables,
-            classes,
-            gathered,
-        );
+        let window_ints = window_ints(budget, paged, page_tables, classes, gathered);
 
         let mut at = 0u64;
         let mut take = |bytes: u64| {

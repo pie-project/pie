@@ -356,7 +356,8 @@ fn the_register_routed_mlp_answers_the_per_route_path() {
                 mlp::swiglu(&sink, pt, INTER, ht).expect("swiglu");
                 moe::matmul_select_quant(&sink, ht, down, None, rt, yt).expect("down");
                 moe::weighted_sum(&sink, yt, wt, ft).expect("fold");
-                moe::matmul_select_quant(&sink, xt, shared_gate_up, None, zt, opt).expect("own gate-up");
+                moe::matmul_select_quant(&sink, xt, shared_gate_up, None, zt, opt)
+                    .expect("own gate-up");
                 mlp::swiglu(&sink, opt, INTER, oht).expect("own swiglu");
                 moe::matmul_select_quant(&sink, oht, shared_down, None, zt, ot).expect("own down");
                 qmm::matmul(

@@ -114,15 +114,18 @@ fn read_only_by(trace: &Trace, at: usize, reads: impl Fn(&Operation) -> bool) ->
 /// table) with their scales and zero points.
 #[must_use]
 pub fn streamed_rows(trace: &Trace) -> Vec<usize> {
+    use poem_ir::Dtype;
     use poem_ir::Gather;
     use poem_ir::residency::{Residency, leads, residency};
-    use poem_ir::Dtype;
     let classes = residency(trace);
     let mut tables: Vec<usize> = (0..trace.params.len())
         .filter(|&at| {
             let param = &trace.params[at];
             matches!(classes[at], Residency::Rows(_))
-                && matches!(param.dtype, Dtype::Bf16 | Dtype::U4g64 | Dtype::U4g32 | Dtype::U8g64)
+                && matches!(
+                    param.dtype,
+                    Dtype::Bf16 | Dtype::U4g64 | Dtype::U4g32 | Dtype::U8g64
+                )
                 && param.shape.len() == 2
                 && param.source == poem_ir::ParamSource::Checkpoint
                 && read_only_by(trace, at, |op| {
@@ -598,6 +601,8 @@ pub struct Cache {
     /// each counting plane's handle on its groups.
     hits: Buffer,
     hit_handles: Vec<Option<u32>>,
+    /// Each group's counter as the last [`Cache::uses`] read it.
+    seen: Vec<u32>,
     /// The slot ref each atom is named, if any.
     slots: Vec<Option<u32>>,
     /// The load seated every atom itself (`WeightShape::seated`), until the
@@ -659,6 +664,7 @@ impl Cache {
             tables,
             hits,
             hit_handles,
+            seen: Vec::new(),
             preseated: false,
             hosts_resident: false,
         };
@@ -918,19 +924,22 @@ impl Cache {
         }
     }
 
-    /// Each atom's reads since the last call, zeroed. The caller has
-    /// drained every frame.
-    /// Each atom's reads since the last call, zeroed: a group's count for
-    /// every piece of it (a route reads every piece of its expert). The
-    /// caller has drained every frame.
+    /// Each atom's reads since the last call: a group's count for every
+    /// piece of it (a route reads every piece of its expert). The counters
+    /// only grow (wrapping) and are never written by the host, so this reads
+    /// them while frames are in flight (unified memory) and reports what
+    /// each grew by since the last read; a read a fire in flight has not
+    /// reached yet counts toward the next call.
     pub fn uses(&mut self, into: &mut Vec<(WeightAtom, u32)>) -> Result<()> {
         let pieces = self.shape.pieces.max(1);
         let groups = self.slots.len() / pieces as usize;
         let mut counted = vec![0u8; groups * 4];
         self.hits.read(0, &mut counted)?;
-        self.hits.write(0, &vec![0u8; groups * 4])?;
+        self.seen.resize(groups, 0);
         for (group, reads) in counted.as_chunks::<4>().0.iter().enumerate() {
-            let reads = u32::from_le_bytes(*reads);
+            let now = u32::from_le_bytes(*reads);
+            let reads = now.wrapping_sub(self.seen[group]);
+            self.seen[group] = now;
             if reads == 0 {
                 continue;
             }

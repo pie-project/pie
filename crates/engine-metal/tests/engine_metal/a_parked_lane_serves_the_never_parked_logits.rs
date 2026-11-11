@@ -6,7 +6,10 @@
 //! tier after step 2; the kv list pages through the slot file, the rest
 //! through the host tier, after step 6) lands the never-parked lane's logits
 //! bit for bit, in one process (as `engine-cuda`'s `golden_offload`). A
-//! negative control parks the record and brings back another lane's.
+//! negative control parks the record and brings back another lane's. With
+//! `Offload::Bytes`, every slot parked on the host comes back through its
+//! bytes (`read_tier_slots`), written into other host slots
+//! (`write_tier_slots`), as a shared-pool snapshot restores.
 
 use engine::chunk::{ShapeId, SlotCopy, SlotKind};
 use engine::transfer::MemoryDomain;
@@ -56,6 +59,7 @@ fn park(
     shape: ShapeId,
     per: u32,
     slots: &[u32],
+    bytes: bool,
 ) -> Vec<u32> {
     let out: Vec<(u32, u32)> = slots
         .iter()
@@ -79,6 +83,45 @@ fn park(
             runs: Vec::new(),
         })
         .expect("the slots park");
+    let out: Vec<(u32, u32)> = if bytes && tier == MemoryDomain::HostPinned && !out.is_empty() {
+        let away: Vec<u32> = out.iter().map(|&(_, parked)| parked).collect();
+        let read = shell
+            .read_tier_slots(&[(shape, away.clone())])
+            .expect("the host slots read");
+        let slot_bytes = shell
+            .pool_chunk_facts()
+            .shape(shape)
+            .expect("stated")
+            .slot_bytes;
+        assert_eq!(
+            read.len() as u64,
+            away.len() as u64 * slot_bytes,
+            "a host slot reads as its device slot's bytes"
+        );
+        let again: Vec<u32> = away.iter().map(|_| host.take(shape, per)).collect();
+        assert!(
+            shell
+                .write_tier_slots(&[(shape, again.clone())], &read[1..])
+                .is_err(),
+            "a byte count that differs is refused"
+        );
+        shell
+            .write_tier_slots(&[(shape, again.clone())], &read)
+            .expect("the host slots write");
+        assert_eq!(
+            shell
+                .read_tier_slots(&[(shape, again.clone())])
+                .expect("the written slots read"),
+            read,
+            "written host slots read back as written"
+        );
+        out.iter()
+            .zip(again)
+            .map(|(&(slot, _), parked)| (slot, parked))
+            .collect()
+    } else {
+        out
+    };
     let fresh: Vec<u32> = slots
         .iter()
         .map(|&slot| {
@@ -111,6 +154,9 @@ fn park(
 enum Offload {
     Never,
     Parked,
+    /// As `Parked`, each host slot read out as bytes and written back into
+    /// other host slots before it returns.
+    Bytes,
     /// The record comes back from another record's parked copy.
     Swapped,
 }
@@ -258,6 +304,7 @@ fn serve(fixture: &Fixture, offload: Offload) -> Vec<Vec<f32>> {
                     LIST,
                     per,
                     &pages,
+                    offload == Offload::Bytes,
                 );
             }
             for (table, &(id, per, _, _)) in tables.iter_mut().zip(&windows) {
@@ -270,6 +317,7 @@ fn serve(fixture: &Fixture, offload: Offload) -> Vec<Vec<f32>> {
                     id,
                     per,
                     table,
+                    offload == Offload::Bytes,
                 );
             }
             if let Some(per) = fixed {
@@ -287,6 +335,7 @@ fn serve(fixture: &Fixture, offload: Offload) -> Vec<Vec<f32>> {
                     FIXED,
                     per,
                     parked,
+                    offload == Offload::Bytes,
                 );
             }
         }
@@ -305,6 +354,13 @@ fn check(model: &str) {
     let parked = serve(&fixture, Offload::Parked);
     same(&format!("{model}: parked against kept"), &parked, &kept);
     eprintln!("{model}: parked = kept over {} rows", kept.len());
+    let bytes = serve(&fixture, Offload::Bytes);
+    same(
+        &format!("{model}: parked through bytes against kept"),
+        &bytes,
+        &kept,
+    );
+    eprintln!("{model}: parked through tier bytes = kept");
     if fixture
         .trace
         .caches

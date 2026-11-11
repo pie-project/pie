@@ -199,9 +199,9 @@ impl Layout {
             .nodes
             .iter()
             .filter_map(|node| match &node.op {
-                Operation::Ssm(Ssm::GatedDelta { qkv, .. } | Ssm::GatedDeltaChunked { qkv, .. }) => {
-                    Some(qkv.0)
-                }
+                Operation::Ssm(
+                    Ssm::GatedDelta { qkv, .. } | Ssm::GatedDeltaChunked { qkv, .. },
+                ) => Some(qkv.0),
                 Operation::Ssm(Ssm::Kda { mixed, .. } | Ssm::KdaChunked { mixed, .. }) => {
                     Some(mixed.0)
                 }

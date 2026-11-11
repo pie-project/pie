@@ -133,14 +133,13 @@ impl Weights {
         // windows, read out of the serving file through a window of its own
         // that only a miss opens: a held set seats it in the pool, a
         // streaming one reads a few atoms of it at a time.
-        let apart: std::collections::BTreeSet<usize> =
-            if !plan.whole_weights() {
-                crate::store::streamed::streamed(trace)
-                    .into_iter()
-                    .collect()
-            } else {
-                std::collections::BTreeSet::new()
-            };
+        let apart: std::collections::BTreeSet<usize> = if !plan.whole_weights() {
+            crate::store::streamed::streamed(trace)
+                .into_iter()
+                .collect()
+        } else {
+            std::collections::BTreeSet::new()
+        };
 
         match warm(
             device,
@@ -1090,7 +1089,10 @@ fn warm(
     let placeholder = Buffer::zeroed(device, ALIGN).map_err(|why| Some(why.to_string()))?;
     for (index, seat) in seats.iter().enumerate() {
         let Seat::Apart(offset) = *seat else { continue };
-        filed.insert(index, (std::sync::Arc::clone(&map), offset, places[index].full));
+        filed.insert(
+            index,
+            (std::sync::Arc::clone(&map), offset, places[index].full),
+        );
     }
     let row = |index: usize| -> std::result::Result<Tensor, Option<String>> {
         let place = &places[index];
@@ -1355,8 +1357,7 @@ mod tests {
         let trace = poem_compiler::catalog::deployment("qwen35-d0.8b-bf16-kv-bf16")
             .expect("the catalog ships the deployment")
             .trace(Platform::Metal);
-        let places = places(&trace)
-            .expect("every param of a bf16 deployment has an element size");
+        let places = places(&trace).expect("every param of a bf16 deployment has an element size");
 
         assert_eq!(places.len(), trace.params.len());
         let mut end = 0u64;

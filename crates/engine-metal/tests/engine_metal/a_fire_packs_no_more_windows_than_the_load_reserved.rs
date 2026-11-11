@@ -261,4 +261,3 @@ fn a_region_past_its_run_bound_is_refused_before_any_window_is_packed() {
         Err(other) => panic!("the fire was refused, but not as fragmented: {other:?}"),
     }
 }
-
