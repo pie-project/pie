@@ -186,19 +186,34 @@ void token(uint tid, uint t, uint hv, uint hk, uint state_base) {
 }
 
 #if defined(PIE_DK_REG)
+// A lane's state row lies in one slot, so in one segment: found once.
 void reg_load(uint tid, uint base) {
     uint dk = uint(params.k_dim);
-    [ForceUnroll] for (uint i = 0; i < uint(PIE_DK_REG); i++) {
-        st[i] = tid < uint(params.v_dim) ? rstate[base + tid * dk + i] : 0.0;
+    if (tid >= uint(params.v_dim)) {
+        [ForceUnroll] for (uint i = 0; i < uint(PIE_DK_REG); i++) {
+            st[i] = 0.0;
+        }
+        return;
     }
+    uint seg, at;
+    pie_pool_at(params.state_origin + base + tid * dk, seg, at);
+#define GDN_REG_LOAD(buf_) \
+    [ForceUnroll] for (uint i = 0; i < uint(PIE_DK_REG); i++) { \
+        st[i] = buf_[at + i]; \
+    }
+    PIE_POOL_ON(seg, GDN_REG_LOAD)
 }
 
 void reg_store(uint tid, uint base) {
     uint dk = uint(params.k_dim);
     if (tid < uint(params.v_dim)) {
-        [ForceUnroll] for (uint i = 0; i < uint(PIE_DK_REG); i++) {
-            rstate[base + tid * dk + i] = st[i];
+        uint seg, at;
+        pie_pool_at(params.state_origin + base + tid * dk, seg, at);
+#define GDN_REG_STORE(buf_) \
+        [ForceUnroll] for (uint i = 0; i < uint(PIE_DK_REG); i++) { \
+            buf_[at + i] = st[i]; \
         }
+        PIE_POOL_ON(seg, GDN_REG_STORE)
     }
 }
 #endif

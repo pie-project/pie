@@ -28,9 +28,12 @@ enum Held {
     All,
 }
 
-/// Serves the seats' script under `held`; the logits, and the uses the
-/// engine reports after.
-fn served(model: &str, fixture: &Fixture, held: Held) -> Option<(Vec<Vec<f32>>, WeightUses)> {
+/// The logits of a script, the uses the engine reports after, and the
+/// fires it recorded and replayed.
+type Served = (Vec<Vec<f32>>, WeightUses, (u64, u64));
+
+/// Serves the seats' script under `held`.
+fn served(model: &str, fixture: &Fixture, held: Held) -> Option<Served> {
     let mut shell = load(fixture, CONTEXT)?;
     let facts = shell.pool_chunk_facts();
     facts.validate().expect("the facts hang together");
@@ -102,8 +105,19 @@ fn served(model: &str, fixture: &Fixture, held: Held) -> Option<(Vec<Vec<f32>>, 
         "{model}: {held:?} resident: the script took {:?}",
         started.elapsed()
     );
+    // A miss is staged by the host between the segments of a recording,
+    // one cut a layer it stages at: the fires record whatever is resident.
+    let recordings = shell.recordings();
+    eprintln!(
+        "{model}: {held:?} resident: {} fires recorded, {} replayed",
+        recordings.0, recordings.1
+    );
+    assert!(
+        recordings.0 > 0,
+        "{model}: {held:?} resident: the fires record"
+    );
     let uses = shell.weight_uses().expect("the uses read");
-    Some((rows, uses))
+    Some((rows, uses, recordings))
 }
 
 /// The most any logit of `got` lies from `want`'s, and the steps whose
@@ -156,14 +170,18 @@ fn every_residency(model: &str) {
 fn every_residency_quantized(model: &str, weights: &[Dtype]) {
     let fixture = fixture_weighed(model, weights);
     let label: String = std::iter::once(model.to_string())
-        .chain(weights.iter().map(|dtype| format!("{dtype:?}").to_lowercase()))
+        .chain(
+            weights
+                .iter()
+                .map(|dtype| format!("{dtype:?}").to_lowercase()),
+        )
         .collect::<Vec<_>>()
         .join("-");
     every_residency_of(&label, &fixture);
 }
 
 fn every_residency_of(model: &str, fixture: &Fixture) {
-    let Some((all, uses)) = served(model, fixture, Held::All) else {
+    let Some((all, uses, recorded)) = served(model, fixture, Held::All) else {
         return;
     };
     assert!(
@@ -177,17 +195,27 @@ fn every_residency_of(model: &str, fixture: &Fixture) {
         same(&format!("{model}: all resident against base"), &all, base);
         eprintln!("{model}: all resident and held = base, bit for bit");
     }
-    let (none, uses) = served(model, fixture, Held::None).expect("loaded before");
+    let (none, uses, none_recorded) = served(model, fixture, Held::None).expect("loaded before");
     assert!(
         uses.held.iter().all(|h| h.resident == 0),
         "{model}: no expert resident: {:?}",
         uses.held
     );
-    let (half, uses) = served(model, fixture, Held::Half).expect("loaded before");
+    let (half, uses, half_recorded) = served(model, fixture, Held::Half).expect("loaded before");
     assert!(
         uses.held.iter().all(|h| h.resident > 0 && h.host > 0),
         "{model}: half resident: {:?}",
         uses.held
+    );
+    // A fire with misses records and replays as one with none: the replays
+    // stage the misses again between the recording's segments.
+    assert_eq!(
+        none_recorded, recorded,
+        "{model}: none resident records as all"
+    );
+    assert_eq!(
+        half_recorded, recorded,
+        "{model}: half resident records as all"
     );
     for (what, got) in [("none", &none), ("half", &half)] {
         let (most, flips) = apart(got, &all);
@@ -305,7 +333,10 @@ pub fn mapped_kib(file: &std::path::Path) -> u64 {
         if first.contains('-') && first.chars().all(|c| c.is_ascii_hexdigit() || c == '-') {
             ours = line.ends_with(name.as_ref());
         } else if ours && first == "Rss:" {
-            kib += words.next().and_then(|n| n.parse::<u64>().ok()).unwrap_or(0);
+            kib += words
+                .next()
+                .and_then(|n| n.parse::<u64>().ok())
+                .unwrap_or(0);
         }
     }
     kib
@@ -366,7 +397,11 @@ pub fn a_held_load_seats_its_weights(model: &str, fixture: &Fixture, all: &[Vec<
         loaded >> 10
     );
     let early = serve_seats(&mut shell, &fixture.trace, 12);
-    same(&format!("{model}: seated by the load against all"), &early, all);
+    same(
+        &format!("{model}: seated by the load against all"),
+        &early,
+        all,
+    );
     let uses = shell.weight_uses().expect("the uses read");
     assert!(
         uses.held.iter().all(|h| h.host == 0),
@@ -393,10 +428,17 @@ pub fn a_held_load_seats_its_weights(model: &str, fixture: &Fixture, all: &[Vec<
         again, recorded,
         "{model}: the adoption keeps every recording, so none is recorded again"
     );
-    assert!(replayed_after > replayed, "{model}: the second pass replays");
+    assert!(
+        replayed_after > replayed,
+        "{model}: the second pass replays"
+    );
     // The seating stands: the facts no longer state it, the runtime's own.
     assert!(
-        shell.pool_chunk_facts().weights.iter().all(|w| w.seated.is_none()),
+        shell
+            .pool_chunk_facts()
+            .weights
+            .iter()
+            .all(|w| w.seated.is_none()),
         "{model}: the runtime's residency stands in the load's seating's place"
     );
     eprintln!(

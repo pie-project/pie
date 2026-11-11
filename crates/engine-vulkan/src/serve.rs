@@ -430,8 +430,6 @@ pub struct Shell {
     pixel_out: Vec<Buffer>,
 
     recorder: crate::record::Recorder,
-    /// The load streams weights by a tier of its own: no fire records.
-    own_stream: bool,
 }
 
 impl Shell {
@@ -950,15 +948,14 @@ impl Shell {
             host_kv_budget.map_or(0, |bytes| u32::try_from(bytes / chunk).unwrap_or(u32::MAX));
         let rs_at = rows.rs.clone();
         let mut pools = Pools::reserve(&device, rows, layout, paging, host_chunks)?;
-        let row_caches =
-            crate::store::rows::RowCaches::new(
-                &device,
-                &boot.trace,
-                row_shapes,
-                boot.budget.max_tokens,
-                chunk,
-                arms,
-            )?;
+        let row_caches = crate::store::rows::RowCaches::new(
+            &device,
+            &boot.trace,
+            row_shapes,
+            boot.budget.max_tokens,
+            chunk,
+            arms,
+        )?;
         let expert_caches =
             crate::store::experts::ExpertCaches::new(&device, expert_shapes, chunk)?;
         // The null chunk's segment stands from the load on.
@@ -969,13 +966,10 @@ impl Shell {
         let adapter_fact = adapter_fact(&compiled.classes, &corrected);
         let adapter_slots = crate::adapter::Slots::new(weights.adapter_seats());
 
-        let weights_stream =
-            weights.streams() || weights.gathered().is_some();
-        // A recorded fire replays no expert staging: the weight cache records
-        // once every expert is resident ([`Shell::weight_residency`]). A row
-        // table's misses are staged by the host before the fire, so it
-        // records whatever is resident.
-        let rows_stream = !expert_caches.is_empty();
+        let weights_stream = weights.streams() || weights.gathered().is_some();
+        // Every fire records whatever is resident: a row table's misses are
+        // staged by the host before the fire, a routed expert's between the
+        // segments of the recording its stage cut ([`Kept::replay_cut`]).
 
         let mut shell = Shell {
             preseated: Vec::new(),
@@ -1037,11 +1031,8 @@ impl Shell {
                 .collect(),
             pixel_out,
 
-            own_stream: weights_stream,
             recorder: if weights_stream {
                 crate::record::Recorder::refusing("the weights plane streams")
-            } else if rows_stream {
-                crate::record::Recorder::refusing("the weight cache is not wholly resident")
             } else {
                 crate::record::Recorder::new()
             },
@@ -1303,29 +1294,29 @@ impl Shell {
         let planes = self
             .weights
             .cached_planes(|at| self.row_caches.streams(at) || self.expert_caches.streams(at));
-        let filled = self
-            .row_caches
-            .residency(&self.device, &self.pools, host, &planes, residency)?
-            + self
-                .expert_caches
-                .residency(&self.device, &self.pools, host, &planes, residency)?;
+        let staged = self.expert_caches.staged_layers();
+        let filled =
+            self.row_caches
+                .residency(&self.device, &self.pools, host, &planes, residency)?
+                + self.expert_caches.residency(
+                    &self.device,
+                    &self.pools,
+                    host,
+                    &planes,
+                    residency,
+                )?;
         // The fills have landed: the pages they read are let go.
         if filled > 0 {
             host.map().release();
         }
-        // Recordings stand while the cache stays wholly resident: a slot
-        // moved is an entry rewritten in a table they bind, not a binding.
-        // A row table's misses are staged by the host before a fire of its
-        // token ids, in the arm's stage: such a fire records too.
-        let records = !self.own_stream && self.expert_caches.whole();
-        if records != self.recorder.records() {
-            self.recorder = if self.own_stream {
-                crate::record::Recorder::refusing("the weights plane streams")
-            } else if records {
-                crate::record::Recorder::new()
-            } else {
-                crate::record::Recorder::refusing("the weight cache is not wholly resident")
-            };
+        // Recordings stand across a residency: a slot moved is an entry
+        // rewritten in a table they bind, not a binding. A row table's misses
+        // are staged by the host before a fire of its token ids, in the arm's
+        // stage; a routed expert's between a recording's segments, one cut a
+        // layer with an expert in no slot, so a recording stands only while
+        // those layers do (and the stage they bind with them).
+        if self.expert_caches.staged_layers() != staged {
+            self.recorder.forget();
         }
         Ok(())
     }
@@ -3296,7 +3287,7 @@ impl Shell {
         self.land_merges(frame.as_mut().expect("just opened"), p)?;
         // The sink borrows the frame, which leaves in `Walked`, so it ends
         // with this block.
-        {
+        let cuts = {
             let sink = Encoded::Live(Sink::new(
                 &self.device,
                 frame.as_ref().expect("the walk opened a frame"),
@@ -3338,12 +3329,17 @@ impl Shell {
                 &mut Cursor::new(&place),
                 Filter::default(),
             )?;
-        }
+            run.take_cuts()
+        };
 
         let launches = (0..self.compiled.template().len() as u32)
             .map(|region| p.windows.runs(region).max(1))
             .sum();
-        Ok(Walked { frame, launches })
+        Ok(Walked {
+            frame,
+            launches,
+            cuts,
+        })
     }
 
     fn advance(&mut self, p: &Prepared<'_>) {
@@ -3362,6 +3358,9 @@ const SETTLED_RING: usize = 2 * Runahead::STEPS_MAX as usize;
 
 struct Walked {
     frame: Option<Frame>,
+
+    /// The host step of each segment the walk's expert stages cut.
+    cuts: Vec<crate::store::experts::Cut>,
 
     launches: u32,
 }
@@ -3650,24 +3649,46 @@ impl engine::frame::Shell for Shell {
             let seq = self.airborne.enter();
             let counts = self.airborne.clone();
             let done = prepared.done.take();
-            let pending = self
+            let recording = self
                 .recorder
                 .get(key)
-                .expect("the recording was there a line ago")
-                .kept
-                .replay(Some(Box::new(move |refused: Option<String>| {
-                    counts.leave();
-                    if let Some(done) = done.as_ref() {
-                        let outcome = match &refused {
-                            None => engine::StepOutcome::Committed,
-                            Some(why) => engine::StepOutcome::Faulted(format!(
-                                "vulkan replay for frame {} step {}: {why}",
-                                done.at.frame, done.at.step
-                            )),
-                        };
-                        (done.sink)(done.at, outcome);
+                .expect("the recording was there a line ago");
+            // The segments an expert stage cut, each landed before its stage.
+            let staged = if recording.cuts.is_empty() {
+                Ok(())
+            } else {
+                match self.weights.host() {
+                    None => Err(Fault::Unbound {
+                        what: "the host copy of the weight cache's banks".to_string(),
+                    }),
+                    Some(host) => {
+                        let planes = self.weights.cached_planes(|at| {
+                            self.row_caches.streams(at) || self.expert_caches.streams(at)
+                        });
+                        recording.cuts.iter().enumerate().try_for_each(|(at, cut)| {
+                            recording.kept.replay_cut(at)?;
+                            self.expert_caches.stage_cut(host, &planes, cut)
+                        })
                     }
-                })));
+                }
+            };
+            let pending = staged.and_then(|()| {
+                recording
+                    .kept
+                    .replay(Some(Box::new(move |refused: Option<String>| {
+                        counts.leave();
+                        if let Some(done) = done.as_ref() {
+                            let outcome = match &refused {
+                                None => engine::StepOutcome::Committed,
+                                Some(why) => engine::StepOutcome::Faulted(format!(
+                                    "vulkan replay for frame {} step {}: {why}",
+                                    done.at.frame, done.at.step
+                                )),
+                            };
+                            (done.sink)(done.at, outcome);
+                        }
+                    })))
+            });
             let pending = match pending {
                 Ok(pending) => pending,
                 Err(fault) => {
@@ -3798,13 +3819,19 @@ impl engine::frame::Shell for Shell {
                 }
             });
 
+        let cuts = walked.cuts;
         let pending = match keep {
             Some(key) => frame.into_kept().and_then(|kept| {
                 let pending = kept.replay(Some(on_done))?;
-                self.recorder.insert(
-                    key,
-                    crate::record::Recording::new(kept, layout.clone(), walked.launches),
-                );
+                // Each segment a flush cut must have an expert stage's host
+                // step to replay after it; a flush of anything else would
+                // not repeat, so such a fire is not kept.
+                if kept.cuts() == cuts.len() {
+                    self.recorder.insert(
+                        key,
+                        crate::record::Recording::new(kept, layout.clone(), walked.launches, cuts),
+                    );
+                }
                 Ok(pending)
             }),
             None => frame.commit_async(Some(on_done)),

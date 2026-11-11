@@ -156,7 +156,7 @@ pub struct Run<'c> {
     cached_planes: std::collections::BTreeMap<usize, &'c crate::experts::HostPlane>,
     cache_pool: Option<kernels_slang::Segments>,
     row_ids: std::cell::RefCell<Option<(u32, Vec<i32>)>>,
-    staged_layer: std::cell::RefCell<Option<crate::store::experts::StageKey>>,
+    staged_layer: std::cell::RefCell<crate::store::experts::Staged>,
 
     arena: &'c SlotTable,
 
@@ -219,7 +219,7 @@ impl<'c> Run<'c> {
             cached_planes: std::collections::BTreeMap::new(),
             cache_pool: None,
             row_ids: std::cell::RefCell::new(None),
-            staged_layer: std::cell::RefCell::new(None),
+            staged_layer: std::cell::RefCell::new(crate::store::experts::Staged::default()),
             arena,
             caches,
             structs: vec![None; values.len() * windows.max_runs() as usize],
@@ -847,6 +847,12 @@ impl<'c> Run<'c> {
                 op,
                 detail: why.to_string(),
             })
+    }
+
+    /// The host steps of the expert stages this walk made, in order: one
+    /// for each segment a kept frame's flushes cut.
+    pub(crate) fn take_cuts(&self) -> Vec<crate::store::experts::Cut> {
+        std::mem::take(&mut self.staged_layer.borrow_mut().cuts)
     }
 
     /// Weight value `table`'s row table where the weight cache streams it,

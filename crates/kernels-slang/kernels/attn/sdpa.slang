@@ -217,8 +217,6 @@ struct Params {
 };
 PIE_PARAMS(PIE_PARAMS_AT, Params, params);
 PIE_POOL_READ(SDPA_KV, SDPA_KV_SCALE * params.seg_words)
-PIE_POOL_VIEW_RO(k_pages, SDPA_KV, SDPA_KV_SCALE * params.k_origin)
-PIE_POOL_VIEW_RO(v_pages, SDPA_KV, SDPA_KV_SCALE * params.v_origin)
 
 // The bf16 element key `kp` of request `req` starts at in its plane: its
 // page, `page_stride` words a page, then the token's row in it.
@@ -317,10 +315,21 @@ void main(uint3 group : SV_GroupID, uint3 local : SV_GroupThreadID) {
         bool take = live && keeps(row, kp, q_pos, start);
         uint base = 0u;
         float partial = 0.0;
+        uint k_seg = 0u, k_at = 0u, v_seg = 0u, v_at = 0u;
         if (take) {
             base = page_row(req, kp) + uint(kv_head) * uint(PIE_HEAD_DIM);
+            pie_pool_at(SDPA_KV_SCALE * params.k_origin + (base >> 1), k_seg, k_at);
+            pie_pool_at(SDPA_KV_SCALE * params.v_origin + (base >> 1), v_seg, v_at);
+            // The row's words first, from its one segment; then the sum as
+            // the pool view read it.
+            uint kw[PAIRS_PER_LANE];
+#define SDPA_TILE_K(buf_) \
+            for (uint i = 0u; i < PAIRS_PER_LANE; i++) { \
+                kw[i] = buf_[k_at + lane + i * LANES_PER_ROW]; \
+            }
+            PIE_POOL_ON(k_seg, SDPA_TILE_K)
             for (uint i = 0u; i < PAIRS_PER_LANE; i++) {
-                partial += dot(qv[i], word_pair(k_pages[(base + 2u * (lane + i * LANES_PER_ROW)) >> 1]));
+                partial += dot(qv[i], word_pair(kw[i]));
             }
         }
 #if defined(PIE_SUBGROUP)
@@ -349,8 +358,14 @@ void main(uint3 group : SV_GroupID, uint3 local : SV_GroupThreadID) {
         if (take) {
             float hist, w;
             online_update(score, max_score, sum_exp, hist, w);
+            uint vw[PAIRS_PER_LANE];
+#define SDPA_TILE_V(buf_) \
+            for (uint i = 0u; i < PAIRS_PER_LANE; i++) { \
+                vw[i] = buf_[v_at + lane + i * LANES_PER_ROW]; \
+            }
+            PIE_POOL_ON(v_seg, SDPA_TILE_V)
             for (uint i = 0u; i < PAIRS_PER_LANE; i++) {
-                acc[i] = acc[i] * hist + w * word_pair(v_pages[(base + 2u * (lane + i * LANES_PER_ROW)) >> 1]);
+                acc[i] = acc[i] * hist + w * word_pair(vw[i]);
             }
         }
 #if !defined(PIE_SUBGROUP)
@@ -456,20 +471,41 @@ void decode_walk(uint row, uint q_head, uint tid, int k_lo, int k_hi, int q_pos,
                 continue;
             }
             uint base = page_row(req, kp) + uint(kv_head) * uint(PIE_HEAD_DIM);
+            uint k_seg, k_at, v_seg, v_at;
+            pie_pool_at(SDPA_KV_SCALE * params.k_origin + base, k_seg, k_at);
+            pie_pool_at(SDPA_KV_SCALE * params.v_origin + base, v_seg, v_at);
+            // The row's elements first, from its one segment; then the sum
+            // as the pool view read it.
+            uint16_t kh[DPL];
+#define SDPA_DECODE_K(buf_) \
+            [ForceUnroll] for (uint j = 0u; j < uint(DPL); j++) { \
+                uint dd = lane + j * width; \
+                if (j < per_lane && dd < uint(PIE_HEAD_DIM)) { kh[j] = buf_[k_at + dd]; } else { kh[j] = uint16_t(0); } \
+            }
+            PIE_POOL_ON(k_seg, SDPA_DECODE_K)
+            // The fused forms the driver contracted the pool view's sums to,
+            // stated: the loads moved, the bits stay.
             float partial = 0.0;
             [ForceUnroll] for (uint j = 0u; j < uint(DPL); j++) {
                 uint dd = lane + j * width;
                 if (j < per_lane && dd < uint(PIE_HEAD_DIM)) {
-                    partial += qreg[j] * bf16_of(k_pages[base + dd]);
+                    partial = fma(qreg[j], bf16_of(kh[j]), partial);
                 }
             }
             float score = WaveActiveSum(partial);
             float hist, w;
             online_update(score, max_score, sum_exp, hist, w);
+            uint16_t vh[DPL];
+#define SDPA_DECODE_V(buf_) \
+            [ForceUnroll] for (uint j = 0u; j < uint(DPL); j++) { \
+                uint dd = lane + j * width; \
+                if (j < per_lane && dd < uint(PIE_HEAD_DIM)) { vh[j] = buf_[v_at + dd]; } else { vh[j] = uint16_t(0); } \
+            }
+            PIE_POOL_ON(v_seg, SDPA_DECODE_V)
             [ForceUnroll] for (uint j = 0u; j < uint(DPL); j++) {
                 uint dd = lane + j * width;
                 if (j < per_lane && dd < uint(PIE_HEAD_DIM)) {
-                    acc[j] = acc[j] * hist + w * bf16_of(v_pages[base + dd]);
+                    acc[j] = fma(acc[j], hist, w * bf16_of(vh[j]));
                 }
             }
         }
@@ -637,12 +673,24 @@ void decode_walk(uint row, uint q_head, uint tid, int k_lo, int k_hi, int q_pos,
 #endif
         uint base = 0u;
         float partial = 0.0;
+        uint k_seg = 0u, k_at = 0u, v_seg = 0u, v_at = 0u;
         if (take) {
             base = page_row(req, kp) + uint(kv_head) * uint(PIE_HEAD_DIM);
+            pie_pool_at(SDPA_KV_SCALE * params.k_origin + (base >> 1), k_seg, k_at);
+            pie_pool_at(SDPA_KV_SCALE * params.v_origin + (base >> 1), v_seg, v_at);
+            // The row's words first, from its one segment; then the sum as
+            // the pool view read it.
+            uint kw[PPL];
+#define SDPA_WORDS_K(buf_) \
+            [ForceUnroll] for (uint j = 0u; j < uint(PPL); j++) { \
+                uint pp = lane + j * width; \
+                if (j < per_lane && pp < pairs) { kw[j] = buf_[k_at + pp]; } else { kw[j] = 0u; } \
+            }
+            PIE_POOL_ON(k_seg, SDPA_WORDS_K)
             [ForceUnroll] for (uint j = 0u; j < uint(PPL); j++) {
                 uint pp = lane + j * width;
                 if (j < per_lane && pp < pairs) {
-                    partial += dot(qreg[j], word_pair(k_pages[(base >> 1) + pp]));
+                    partial += dot(qreg[j], word_pair(kw[j]));
                 }
             }
         }
@@ -659,10 +707,17 @@ void decode_walk(uint row, uint q_head, uint tid, int k_lo, int k_hi, int q_pos,
         if (take) {
             float hist, w;
             online_update(score, max_score, sum_exp, hist, w);
+            uint vw[PPL];
+#define SDPA_WORDS_V(buf_) \
+            [ForceUnroll] for (uint j = 0u; j < uint(PPL); j++) { \
+                uint pp = lane + j * width; \
+                if (j < per_lane && pp < pairs) { vw[j] = buf_[v_at + pp]; } else { vw[j] = 0u; } \
+            }
+            PIE_POOL_ON(v_seg, SDPA_WORDS_V)
             [ForceUnroll] for (uint j = 0u; j < uint(PPL); j++) {
                 uint pp = lane + j * width;
                 if (j < per_lane && pp < pairs) {
-                    acc[j] = acc[j] * hist + w * word_pair(v_pages[(base >> 1) + pp]);
+                    acc[j] = acc[j] * hist + w * word_pair(vw[j]);
                 }
             }
         }

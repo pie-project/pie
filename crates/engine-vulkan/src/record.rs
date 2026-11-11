@@ -10,12 +10,21 @@ pub(crate) struct Recording {
 
     pub(crate) layout: Vec<crate::serve::ReadSpan>,
     pub(crate) launches: u32,
+
+    /// The host step after each segment but the last, in order.
+    pub(crate) cuts: Vec<crate::store::experts::Cut>,
 }
 
 impl Recording {
-    pub(crate) fn new(kept: Kept, layout: Vec<crate::serve::ReadSpan>, launches: u32) -> Recording {
+    pub(crate) fn new(
+        kept: Kept,
+        layout: Vec<crate::serve::ReadSpan>,
+        launches: u32,
+        cuts: Vec<crate::store::experts::Cut>,
+    ) -> Recording {
         Recording {
             kept,
+            cuts,
             used: std::cell::Cell::new(0),
             layout,
             launches,

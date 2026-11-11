@@ -138,6 +138,11 @@ impl Frame {
         match self.never {}
     }
 
+    #[must_use]
+    pub fn cuts(&self) -> usize {
+        match self.never {}
+    }
+
     pub fn commit(self) -> Result<()> {
         match self.never {}
     }
@@ -188,6 +193,15 @@ pub struct Kept {
 }
 
 impl Kept {
+    #[must_use]
+    pub fn cuts(&self) -> usize {
+        match self.never {}
+    }
+
+    pub fn replay_cut(&self, _at: usize) -> Result<()> {
+        match self.never {}
+    }
+
     pub fn replay(
         &self,
         _on_done: Option<Box<dyn Fn(Option<String>) + Send + 'static>>,
@@ -334,6 +348,10 @@ impl Binding {
     #[must_use]
     pub fn extent(&self) -> u64 {
         0
+    }
+
+    pub fn read(&self, _len: u64) -> Result<Vec<u8>> {
+        Err(Fault::Deviceless)
     }
 }
 
