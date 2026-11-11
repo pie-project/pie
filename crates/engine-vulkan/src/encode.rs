@@ -443,10 +443,12 @@ impl Sink<'_> {
             // while `infos` is untouched; `sets` is cleared before `infos`
             // changes again on the next fire, and no one reads it in between.
             let info: &'static vk::DescriptorBufferInfo = unsafe { std::mem::transmute(info) };
+            let (binding, element) = pipeline.slots[at];
             scratch.sets.push(
                 vk::WriteDescriptorSet::default()
                     .dst_set(set)
-                    .dst_binding(at as u32)
+                    .dst_binding(binding)
+                    .dst_array_element(element)
                     .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
                     .buffer_info(std::slice::from_ref(info)),
             );

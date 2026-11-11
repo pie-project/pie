@@ -17,6 +17,9 @@ pub struct Pipeline {
 
     pub bindings: u32,
 
+    /// Where descriptor `at` lies: its binding and its element there.
+    pub slots: Vec<(u32, u32)>,
+
     pub used: Vec<bool>,
 
     pub writable: Vec<bool>,
@@ -105,13 +108,30 @@ fn build(
     };
     let words = spirv::words(code).map_err(shader)?;
     let declared = spirv::declared(&words).map_err(shader)?;
+    let array_of = |at: u32| {
+        declared
+            .arrays
+            .iter()
+            .find(|&&(binding, n)| (binding..binding + n).contains(&at))
+            .copied()
+    };
+    let slots: Vec<(u32, u32)> = (0..declared.bindings)
+        .map(|at| array_of(at).map_or((at, 0), |(binding, _)| (binding, at - binding)))
+        .collect();
     let bindings: Vec<vk::DescriptorSetLayoutBinding> = (0..declared.bindings)
-        .map(|i| {
-            vk::DescriptorSetLayoutBinding::default()
-                .binding(i)
-                .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
-                .descriptor_count(1)
-                .stage_flags(vk::ShaderStageFlags::COMPUTE)
+        .filter_map(|i| {
+            let count = match array_of(i) {
+                Some((binding, n)) if binding == i => n,
+                Some(_) => return None,
+                None => 1,
+            };
+            Some(
+                vk::DescriptorSetLayoutBinding::default()
+                    .binding(i)
+                    .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
+                    .descriptor_count(count)
+                    .stage_flags(vk::ShaderStageFlags::COMPUTE),
+            )
         })
         .collect();
     let d = &core.device;
@@ -177,6 +197,7 @@ fn build(
                 layout,
                 set_layout,
                 bindings: declared.bindings,
+                slots,
                 used: declared.used,
                 writable: declared.writable,
                 push_bytes: declared.push_bytes,

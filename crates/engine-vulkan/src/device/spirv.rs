@@ -29,7 +29,12 @@ const STORAGE_PUSH_CONSTANT: u32 = 9;
 pub struct Declared {
     pub local: [u32; 3],
 
+    /// Descriptors, a kernel argument each: binding `b` is descriptor `b`,
+    /// and an array of `n` buffers at binding `b` (the pool's segments) is
+    /// descriptors `b..b + n`, its elements in order.
     pub bindings: u32,
+    /// `(binding, n)` of each array binding.
+    pub arrays: Vec<(u32, u32)>,
     pub used: Vec<bool>,
 
     pub writable: Vec<bool>,
@@ -82,6 +87,7 @@ pub fn declared(words: &[u32]) -> Result<Declared, Malformed> {
     let mut constants: HashMap<u32, u32> = HashMap::new();
     let mut pointers: HashMap<u32, u32> = HashMap::new();
     let mut push_variables: Vec<u32> = Vec::new();
+    let mut variables: HashMap<u32, u32> = HashMap::new();
     let mut offsets: HashMap<u32, Vec<(u32, u32)>> = HashMap::new();
     let mut types: HashMap<u32, (u32, Vec<u32>)> = HashMap::new();
     let mut strides: HashMap<u32, (Option<u32>, Option<u32>)> = HashMap::new();
@@ -123,6 +129,9 @@ pub fn declared(words: &[u32]) -> Result<Declared, Malformed> {
             OP_VARIABLE if count >= 4 && w[3] == STORAGE_PUSH_CONSTANT => {
                 push_variables.push(w[1]);
             }
+            OP_VARIABLE if count >= 4 => {
+                variables.insert(w[2], w[1]);
+            }
             OP_TYPE_INT
             | OP_TYPE_FLOAT
             | OP_TYPE_BOOL
@@ -143,13 +152,37 @@ pub fn declared(words: &[u32]) -> Result<Declared, Malformed> {
         i = end;
     }
 
-    let bindings = highest.map_or(0, |h| h + 1);
+    // A variable whose type is an array of buffers takes a descriptor an
+    // element.
+    let elements = |variable: u32| -> u32 {
+        variables
+            .get(&variable)
+            .and_then(|pointer| pointers.get(pointer))
+            .and_then(|pointee| types.get(pointee))
+            .filter(|(op, _)| *op == OP_TYPE_ARRAY)
+            .and_then(|(_, operands)| constants.get(operands.get(1)?))
+            .copied()
+            .unwrap_or(1)
+            .max(1)
+    };
+    let mut arrays = Vec::new();
+    let mut bindings = highest.map_or(0, |h| h + 1);
+    for &(variable, binding) in &bound {
+        let n = elements(variable);
+        if n > 1 {
+            arrays.push((binding, n));
+            bindings = bindings.max(binding + n);
+        }
+    }
+    arrays.sort_unstable();
     let mut used = vec![false; bindings as usize];
     let mut writable = vec![false; bindings as usize];
     for &(variable, binding) in &bound {
-        used[binding as usize] = true;
-        if !non_writable.contains(&variable) {
-            writable[binding as usize] = true;
+        for at in binding..binding + elements(variable) {
+            used[at as usize] = true;
+            if !non_writable.contains(&variable) {
+                writable[at as usize] = true;
+            }
         }
     }
 
@@ -170,6 +203,7 @@ pub fn declared(words: &[u32]) -> Result<Declared, Malformed> {
     Ok(Declared {
         local: local.ok_or(Malformed::NoLocalSize)?,
         bindings,
+        arrays,
         used,
         writable,
         push_bytes,

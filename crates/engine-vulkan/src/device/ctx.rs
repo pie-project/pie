@@ -791,6 +791,14 @@ impl Context {
                 ),
             });
         }
+        if f12.shader_storage_buffer_array_non_uniform_indexing != vk::TRUE {
+            bail!(Fault::NoDevice {
+                detail: format!(
+                    "{name} lacks shaderStorageBufferArrayNonUniformIndexing, which every \
+                     kernel reading the chunk pool's segments needs"
+                ),
+            });
+        }
         let mut e11 = vk::PhysicalDeviceVulkan11Features::default()
             .storage_buffer16_bit_access(enabled.storage_16bit)
             .uniform_and_storage_buffer16_bit_access(
@@ -804,7 +812,8 @@ impl Context {
                 f12.uniform_and_storage_buffer8_bit_access == vk::TRUE,
             )
             .vulkan_memory_model(f12.vulkan_memory_model == vk::TRUE)
-            .vulkan_memory_model_device_scope(f12.vulkan_memory_model_device_scope == vk::TRUE);
+            .vulkan_memory_model_device_scope(f12.vulkan_memory_model_device_scope == vk::TRUE)
+            .shader_storage_buffer_array_non_uniform_indexing(true);
         let mut e13 = vk::PhysicalDeviceVulkan13Features::default()
             .subgroup_size_control(enabled.subgroup_size_control)
             .synchronization2(f13.synchronization2 == vk::TRUE);

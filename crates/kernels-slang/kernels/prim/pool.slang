@@ -8,9 +8,11 @@
 // slot's chunk anywhere in the pool.
 //
 // The segments sit at four consecutive bindings after the kernel's own
-// buffers (a segment the pool does not have is bound to the engine's dummy);
-// one binding a segment, chosen by comparisons, since WGSL has no arrays of
-// buffers. Offsets and strides come from the host in u32 words; a kernel
+// buffers (a segment the pool does not have is bound to the engine's dummy).
+// On Vulkan they are one binding, an array of four storage buffers
+// (descriptor indexing), so a read indexes its segment with no branch; WGSL
+// has no arrays of buffers, so there they are four bindings, one chosen by
+// comparisons. Offsets and strides come from the host in u32 words; a kernel
 // reading bf16 halves scales them by 2.
 //
 //   PIE_POOL_SEGMENTS(StructuredBuffer, uint16_t, 9)
@@ -19,6 +21,8 @@
 //   PIE_POOL_VIEW_RO(k_pages, uint16_t, 2u * params.k_origin)
 //
 // after which `k_pages[i]` reads virtual element `k_origin + i`.
+
+#if defined(PIE_WGSL)
 
 #define PIE_POOL_SEGMENTS(access_, type_, binding_) \
     [[vk::binding(binding_)]] access_<type_> pie_seg0; \
@@ -38,25 +42,11 @@
     } \
     /* The segment virtual element `v` lies in, and its index there: what */ \
     /* `pie_pool_get` reads, found once for a span inside one segment. */ \
+    /* WGSL reads the four bindings slower through a branch than through */ \
+    /* the chain an element, so here the index stays virtual and */ \
+    /* `PIE_POOL_ON` reads the chain. */ \
     void pie_pool_at(uint v, out uint seg, out uint local) { \
-        uint s = (seg_); \
         seg = 0u; \
-        if (PIE_POOL_CHAINED) { \
-            local = v; \
-            return; \
-        } \
-        if (v >= s) { \
-            v -= s; \
-            seg = 1u; \
-            if (v >= s) { \
-                v -= s; \
-                seg = 2u; \
-                if (v >= s) { \
-                    v -= s; \
-                    seg = 3u; \
-                } \
-            } \
-        } \
         local = v; \
     } \
     struct pie_pool_chain_ro { \
@@ -68,23 +58,9 @@
 
 // `body_(buffer)` with the segment `seg_` names as `buffer`: a span that
 // lies in one segment (a page never straddles a chunk, nor a chunk two
-// segments) reads it with no comparison chain an element. WGSL reads the
-// four bindings slower through a branch than through the chain an element,
-// so there `pie_pool_at` keeps the virtual index and the body reads the
-// chain (`PIE_POOL_ON_RW` for a body that writes too).
-#if defined(PIE_WGSL)
-#define PIE_POOL_CHAINED true
+// segments); on WGSL the chain (`PIE_POOL_ON_RW` for a body that writes too).
 #define PIE_POOL_ON(seg_, body_) { body_(pie_pool_chain) }
 #define PIE_POOL_ON_RW(seg_, body_) { body_(pie_pool_chain_rw) }
-#else
-#define PIE_POOL_CHAINED false
-#define PIE_POOL_ON(seg_, body_) \
-    if ((seg_) == 0u) { body_(pie_seg0) } \
-    else if ((seg_) == 1u) { body_(pie_seg1) } \
-    else if ((seg_) == 2u) { body_(pie_seg2) } \
-    else { body_(pie_seg3) }
-#define PIE_POOL_ON_RW(seg_, body_) PIE_POOL_ON(seg_, body_)
-#endif
 
 #define PIE_POOL_WRITE(type_, seg_) \
     void pie_pool_set(uint v, type_ x) { \
@@ -103,6 +79,52 @@
         } \
     }; \
     static pie_pool_chain_rw_t pie_pool_chain_rw;
+
+#else
+
+#define PIE_POOL_SEGMENTS(access_, type_, binding_) \
+    [[vk::binding(binding_)]] access_<type_> pie_segs[4];
+
+// The segment of virtual element `v` and its index there, by comparisons
+// (no division).
+#define PIE_POOL_FIND(v_, s_, seg_) \
+    seg_ = 0u; \
+    if (v_ >= s_) { v_ -= s_; seg_ = 1u; } \
+    if (v_ >= s_) { v_ -= s_; seg_ = 2u; } \
+    if (v_ >= s_) { v_ -= s_; seg_ = 3u; }
+
+#define PIE_POOL_READ(type_, seg_) \
+    type_ pie_pool_get(uint v) { \
+        uint s = (seg_); \
+        uint at; \
+        PIE_POOL_FIND(v, s, at) \
+        return pie_segs[NonUniformResourceIndex(at)][v]; \
+    } \
+    /* The segment virtual element `v` lies in, and its index there: what */ \
+    /* `pie_pool_get` reads, found once for a span inside one segment. */ \
+    void pie_pool_at(uint v, out uint seg, out uint local) { \
+        uint s = (seg_); \
+        uint at; \
+        PIE_POOL_FIND(v, s, at) \
+        seg = at; \
+        local = v; \
+    }
+
+// `body_(buffer)` with the segment `seg_` names as `buffer`: a span that
+// lies in one segment (a page never straddles a chunk, nor a chunk two
+// segments) indexes it, with no comparison an element.
+#define PIE_POOL_ON(seg_, body_) { body_(pie_segs[NonUniformResourceIndex(seg_)]) }
+#define PIE_POOL_ON_RW(seg_, body_) PIE_POOL_ON(seg_, body_)
+
+#define PIE_POOL_WRITE(type_, seg_) \
+    void pie_pool_set(uint v, type_ x) { \
+        uint s = (seg_); \
+        uint at; \
+        PIE_POOL_FIND(v, s, at) \
+        pie_segs[NonUniformResourceIndex(at)][v] = x; \
+    }
+
+#endif
 
 // A record cut into pieces (SPEC 4: a fixed row larger than a slot is cut on
 // its atom axis into equal pieces, each in a slot of its own at one common

@@ -60,6 +60,7 @@ void pie_xt_count(uint e, uint atom_first) {
 // Word `i` of the current expert's slot.
 uint pie_xt_word(uint i) {
     uint at = pie_xt_base + i;
+#if defined(PIE_WGSL)
     if (pie_xt_which == 0u) {
         return pie_seg0[at];
     }
@@ -72,6 +73,11 @@ uint pie_xt_word(uint i) {
     if (pie_xt_which == 3u) {
         return pie_seg3[at];
     }
+#else
+    if (pie_xt_which < 4u) {
+        return pie_segs[NonUniformResourceIndex(pie_xt_which)][at];
+    }
+#endif
     if (pie_xt_which == 4u) {
         return pie_xt_stage[at];
     }
