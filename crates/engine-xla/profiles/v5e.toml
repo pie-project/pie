@@ -33,6 +33,10 @@ attn.decode_pages = 64
 # heads took 896 us a layer (482 now), Qwen3.6-27B's 48 heads 2464 (1285); under 16 lanes the VPU's is
 # as fast
 ssm.step_mxu = 16
+# a prefill's flash kernel takes 128 query rows a block for 128-wide heads, not 256: fewer key blocks
+# past a row block's own prompt where a fire's prompts meet, and the v5e's softmax holds its VPU
+# (Qwen3-0.6B pf256-512 1792-row fires: 106.1k -> 108.2k tok/s; a v6e loses 10%, so it stays at 256)
+attn.flash_narrow_rows = 128
 # a routed MLP's prompt of 1280 tokens and more sums each block of 128 tokens' runs of expert rows by its
 # own dot, as on v6e, not by the pick (Gemma-4-26B-A4B's 32-expert cut, 1664 tokens: 2132 -> 1734 us;
 # Qwen3.6-35B-A3B's 16-expert cut 995 -> 936); at 1088 Qwen's pick is cheaper (690 vs 725)
@@ -56,6 +60,7 @@ measured = [
   "engine.seat_to_end",
   "engine.seated_first",
   "kernel.attn.decode_pages",
+  "kernel.attn.flash_narrow_rows",
   "kernel.attn.unrolled_blocks",
   "kernel.moe.cost.onehot_mi",
   "kernel.moe.gmm_fuse_from",
