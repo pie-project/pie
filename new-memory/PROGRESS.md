@@ -1114,3 +1114,12 @@ The `new-memory/` directory is bookkeeping and is removed before anything lands 
   fusion) -> explained matmul-arm difference (PIE_XLA_CONV_KERNEL=0 restores bitwise). Accepted.
 - Open: qwen3 c256 -4% (pool-native decode page copy next), prefill 2048 -7.5%, MoE c1 -3%; sc/xla2 rebased
   (snapshots bitwise on TPU, PLE rows bitwise; streamed experts open).
+
+### M87 — 2026-11-11: main's Cerebras wafer-program backend (#1435) merged
+- `sc/merge-main-cerebras` (b64cc6509): main deleted the host-traced Cerebras engine and replaced it with a
+  wafer-program backend; new-memory's host chunk pool / tiers for the old engine (M43/M44) were dropped with it. The
+  new backend states `ChunkFacts::degenerate` (kv pages = host token lists replayed into the program; state slots),
+  refuses copy_state / copy_slots / tier verbs / disk_kv_dir, weights placed whole. Worker keeps M76's removals and
+  adds main's new Cerebras options. Build matrix clean; worker / engine-cerebras lib tests pass.
+- Cerebras north-star follow-up (A8 replaced): multi-sequence on-wafer kv as a real shared pool (segments, evacuate),
+  host / disk tiers, record copies, weight streaming. Needs the backend's owner / hardware.

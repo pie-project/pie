@@ -12,7 +12,7 @@ Branch today: 432 commits ahead of main, 782 files, +86k / -13k. Main merged in 
 | A5 | ROCm generated region kernels: flip + delete hand rules (b8/b64 in-process numbers pending) | AMD | in progress |
 | A6 | XLA: Mosaic page copy / flash / kv append on the pool; speed vs main; MoE result varies with pool chunk count (CUDA plugin) | TPU | in progress |
 | A7 | XLA weight streaming + snapshots (sc/xla2, partial) | TPU | queued |
-| A8 | Cerebras wafer `Spatial` engine still states degenerate facts (owner's unmerged branch) | Cerebras owner | blocked |
+| A8 | Cerebras: main's new wafer-program backend (#1435, merged M87) states degenerate facts; pool / tiers / record copies / weight streaming need its owner + hardware | Cerebras owner | blocked |
 | A10 | Delete device/host weight budgets, dense rotor, dense host tier; max_state_slots | L40S, Metal, VK5 | done M76 (dead legacy tier cleanup left) |
 | A11 | Eager path wrong tokens; nothing arms at small budgets | EAGER | done M82 (ROCm verify pending) |
 | A12 | Shared-pool snapshots; host-full hang + miscount; keep-handles key covers the record | RT | done M84 (other engines: A15) |
