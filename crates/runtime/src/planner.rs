@@ -10,6 +10,7 @@ mod exec;
 mod global;
 mod grant;
 mod holdings;
+mod in_flight;
 mod inner;
 mod lock;
 mod plan;
@@ -42,6 +43,7 @@ pub use global::{
     planners, rekey_holders, release, wake,
 };
 pub use grant::{AllocationGrant, Demand};
+pub use in_flight::FireInFlight;
 pub use pool::{ChunkStats, PoolPort, RegistryPool};
 pub use residency_planner::ResidencyPlanner;
 pub use short::WeightShed;
