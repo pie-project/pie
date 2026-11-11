@@ -25,7 +25,7 @@ Branch today: 432 commits ahead of main, 782 files, +86k / -13k. Main merged in 
 | A19 | A restartable process whose own demand exceeds the pool restarts forever (should fail with the starvation error); bind hangs waiting for state slots at 96 MiB | RT7 | done M91 + M93 (rt7b: churn closed) |
 | A18 | Idle cache demoted only when PLEX keys it above the floor | RT6 | done M90 |
 | A20 | Window-only models never reuse a prefix (no auto checkpoint; main reused full window pages) -> auto checkpoints at page-aligned fire ends holding window slot refs | RT8 | done M99 (gpt-oss p2048 parity with main) |
-| A22 | Metal perf vs main (M1 Max, M100): Qwen3-0.6B p2048 fixed (+2.8%); open: gemma c1 -2.4%, p512 -4%, p2048 -2%; Qwen c1 -0.8..0.9%. (Metal serving encodes live on main too; ICB recording not required — user 2026-11-11) | Metal agent (sc/metal-gate) | in progress |
+| A22 | Metal perf vs main (M1 Max, M100): Qwen3-0.6B p2048 fixed (+2.8%); gemma prefill + boot fixed (M101); open: gemma c1 -2.4% (GPU, hazard tracking suspect), Qwen c1 -0.8..0.9%. (Metal serving encodes live on main too; ICB recording not required — user 2026-11-11) | Metal agent (sc/metal-gate) | in progress |
 | A9 | dsv41 two-window mini cannot fire on sm_89/sm_120 (fused.lse_sink kernel gap) -> two-window CUDA unverified | L40S | queued |
 
 ## B. Decide before the PR (user)

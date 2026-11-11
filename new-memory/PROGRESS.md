@@ -1235,3 +1235,9 @@ The `new-memory/` directory is bookkeeping and is removed before anything lands 
 - M1 Max vs main: Qwen3-0.6B p2048 +2.8% (was -2.4%), p512 +6%, c1 -0.8%; Qwen3.5-0.8B prefill +6..23%, c1 -0.9%;
   gemma-4-e4b c1 -2.4%, p512 -4.2%, p2048 -2.0%; Qwen3.6-35B-A3B boots in 14 s (main: not within 600 s).
   Greedy tokens identical to pre-change on 3 models x 3 prompts. Open: gemma decode/prefill, Qwen c1 small gap.
+
+### M101 — 2026-11-11: Metal held-weight seating 2.4x faster (gemma boot / prefill parity)
+- `sc/metal-gate` (5e9f63f7d): PLE row seating at load described as runs, chunk addresses looked up once, windowed
+  reads over 8 threads, slot positions computed once (1440 -> 590 ms). gemma-4-e4b (M1 Max) vs main: boot 1.95 s vs
+  3.27, p512 +1.8%, p2048 +0.3%, c1 -2.4% (open: +0.38 ms GPU per fire; suspect per-buffer hazard tracking on the
+  single pool buffer). Greedy tokens unchanged; weight-cache engine tests pass on the Mac.
