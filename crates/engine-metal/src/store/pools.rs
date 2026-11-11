@@ -1503,17 +1503,6 @@ impl Pools {
         Ok(Spill::slots(self.disk.as_ref()))
     }
 
-    #[must_use]
-    pub fn parked_slots(&self) -> u32 {
-        Spill::slots(self.parked.as_ref())
-    }
-
-    /// Copies whole kv pages (slot refs) between the pool and the slot
-    /// file, `pages[i]` with `slots[i]`.
-    pub fn spill_kv(&mut self, to_disk: bool, pages: &[u32], slots: &[u32]) -> Result<()> {
-        self.spill(LIST, to_disk, pages, slots)
-    }
-
     /// Checks what a fire touches is committed: `demand`'s kv pages and
     /// state slots are one past the highest physical page and slot it
     /// names. An unmapped tile read by a kernel faults the whole queue.

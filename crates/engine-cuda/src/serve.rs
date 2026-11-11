@@ -558,12 +558,6 @@ impl Shell {
         self.pools.disk_kept()
     }
 
-    pub fn spill_kv(&mut self, to_disk: bool, device: &[u32], disk: &[u32]) -> Result<()> {
-        self.pools.fence_all_swaps(self.device.stream())?;
-        self.pools
-            .spill_kv(self.device.stream(), to_disk, device, disk)
-    }
-
     #[must_use]
     pub fn host_kv_layout(&self, ranks: u32) -> Option<state::PageLayout> {
         self.pools.host_kv_layout(ranks)

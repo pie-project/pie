@@ -1165,47 +1165,14 @@ impl Engine for Cuda {
     fn write_host_kv(&mut self, slots: &[u32], bytes: &[u8]) -> EngineResult<()> {
         self.loaded_mut()?
             .write_host_kv(slots, bytes)
+        // The host and disk tiers move through `copy_slots` (CONTRACT-BC
+        // 22): a kv copy is within the device.
             .map_err(fault)
     }
 
     fn copy_kv(&mut self, copy: &KvCopy) -> EngineResult<()> {
         copy.validate()?;
         let device = self.caps.as_ref().map(|caps| caps.device.domain);
-        // A tensor-parallel group names its device by its first rank's
-        // ordinal; to each rank, a move between "the device" and a host or
-        // disk tier is a move out of or into its own.
-        let tier = |domain| matches!(domain, MemoryDomain::HostPinned | MemoryDomain::LocalDisk);
-        let own = |domain| match (domain, device) {
-            (MemoryDomain::CudaDevice(_), Some(device)) => device,
-            _ => domain,
-        };
-        let copy = &match (copy.src, copy.dst) {
-            (src, dst) if tier(dst) && !tier(src) => KvCopy {
-                src: own(src),
-                ..copy.clone()
-            },
-            (src, dst) if tier(src) && !tier(dst) => KvCopy {
-                dst: own(dst),
-                ..copy.clone()
-            },
-            _ => copy.clone(),
-        };
-        if let Some((tier, out, pages, slots)) = device.and_then(|device| copy.tier_move(device)) {
-            // A window list's slots park by `copy_slots` (CONTRACT-BC 22).
-            if !copy.windowed.is_empty() {
-                return Err(Error::Unsupported {
-                    verb: "windowed kv pages to or from a tier by copy_kv: window list slots \
-                           move by copy_slots",
-                    engine: "cuda",
-                });
-            }
-            let shell = self.loaded_mut()?;
-            return match tier {
-                MemoryDomain::LocalDisk => shell.spill_kv(out, pages, slots),
-                _ => shell.swap_kv(out, pages, slots),
-            }
-            .map_err(fault);
-        }
         if device.is_none_or(|device| copy.src != device || copy.dst != device) {
             return Err(Error::Unsupported {
                 verb: kv_copy_direction(copy.src, copy.dst),

@@ -224,24 +224,6 @@ impl KvCopy {
         }
         Ok(runs)
     }
-
-    /// A whole-page move between `device` and a tier below it: the tier,
-    /// whether the pages leave the device, and the page ids on the device
-    /// and in the tier. `None` for any other copy.
-    #[must_use]
-    pub fn tier_move(&self, device: MemoryDomain) -> Option<(MemoryDomain, bool, &[u32], &[u32])> {
-        let tier = |domain| matches!(domain, MemoryDomain::HostPinned | MemoryDomain::LocalDisk);
-        if !self.moves.is_empty() {
-            return None;
-        }
-        if self.src == device && tier(self.dst) {
-            Some((self.dst, true, &self.src_page_ids, &self.dst_page_ids))
-        } else if tier(self.src) && self.dst == device {
-            Some((self.src, false, &self.dst_page_ids, &self.src_page_ids))
-        } else {
-            None
-        }
-    }
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
