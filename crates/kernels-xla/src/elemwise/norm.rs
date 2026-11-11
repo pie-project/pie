@@ -33,10 +33,58 @@ pub(crate) fn inv_rms_rows(
         ));
     }
     let heads = width / axis;
+    if tall(rows, heads, axis) {
+        return Ok(inv_rms_tall(f, x, rows, heads, axis, eps)?);
+    }
     let x3 = f.reshape(x, &[rows, heads, axis])?;
     let sq = f.mul(x3, x3)?;
     let sum = f.reduce(sq, &[2], Fold::Sum)?;
     rows_by_sums(f, x3, sum, eps)
+}
+
+/// The rows from which a per-head norm stays `[rows, width]`: a fire this
+/// tall lays a `[rows, heads, axis]` f32 view of its rows out apart from
+/// them, a copy there and one back a norm (v5e gemma-4-31B's 1792-row
+/// fires: 0.36 ms each beside its 0.1 ms of arithmetic).
+const TALL_ROWS: i64 = 1024;
+
+/// Whether a per-head norm takes the tall form: 32 heads of 256 and wider
+/// (gemma-4-31B's `q`). Fewer or narrower heads lay out cheaply enough that
+/// the MXU's full-precision sums cost more (v5e gemma-4-E2B c256, 8 heads:
+/// 7.44k -> 7.09k tok/s; Qwen3-0.6B's 128-wide heads: prompts 1% slower).
+fn tall(rows: i64, heads: i64, axis: i64) -> bool {
+    heads >= 32 && rows >= TALL_ROWS && axis >= 256
+}
+
+/// [`inv_rms_rows`] for a tall fire: each head's sum of squares through
+/// the MXU against a 0/1 map of lanes to heads (`[width, heads]`, full
+/// f32), so the rows never leave their layout; the inverse roots, a few a
+/// row, broadcast back over the heads' lanes.
+fn inv_rms_tall(
+    f: &mut Func,
+    x: Val,
+    rows: i64,
+    heads: i64,
+    axis: i64,
+    eps: f32,
+) -> crate::hlo::Built<Val> {
+    let width = heads * axis;
+    let lane = f.iota(Elem::I32, &[width, heads], 0);
+    let head = f.iota(Elem::I32, &[width, heads], 1);
+    let ax = f.const_i(Elem::I32, axis, &[width, heads]);
+    let of = f.div(lane, ax)?;
+    let mine = f.compare(crate::hlo::Cmp::Eq, of, head)?;
+    let one = f.const_f(Elem::F32, 1.0, &[width, heads]);
+    let zero = f.const_f(Elem::F32, 0.0, &[width, heads]);
+    let map = f.select(mine, one, zero)?;
+    let sq = f.mul(x, x)?;
+    let sum = f.dot_general(sq, map, &[], &[], &[1], &[0], Elem::F32)?;
+    let mean = f.scale(sum, 1.0 / axis as f64)?;
+    let mean = f.offset(mean, f64::from(eps))?;
+    let inv = f.rsqrt(mean);
+    let inv = f.broadcast(inv, &[rows, heads, axis], &[0, 1])?;
+    let inv = f.reshape(inv, &[rows, width])?;
+    f.mul(x, inv)
 }
 
 /// `x3 / rms` for `[rows, heads, axis]` under each head's f32 sum of squares
@@ -90,6 +138,12 @@ fn gain(f: &mut Func, weight: Val, rows: i64, width: i64, plus_one: bool) -> Res
     let w = f.reshape(w, &[n])?;
     let w = if plus_one { f.offset(w, 1.0)? } else { w };
     let heads = width / n;
+    if tall(rows, heads, n) {
+        // The row of gains laid once, then over the rows (see `TALL_ROWS`).
+        let w = f.broadcast(w, &[heads, n], &[1])?;
+        let w = f.reshape(w, &[width])?;
+        return Ok(f.broadcast(w, &[rows, width], &[1])?);
+    }
     let w = f.broadcast(w, &[rows, heads, n], &[2])?;
     Ok(f.reshape(w, &[rows, width])?)
 }
