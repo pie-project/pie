@@ -1255,10 +1255,27 @@ impl Pools {
         self.paging.pages = fits;
         // A flat range is one allocation made on its first commit: of the
         // fitted chunks, not of every chunk the asked count reserved.
-        let reshape =
-            !elastic::mapped_on_demand() || (self.whole_fit && fitted < self.chunks.total());
+        // A range mapped on demand reserved anew before the activation is
+        // settled keeps room for what the settled fit may yet give the cache
+        // rows: the activation's span no fire backs, and the bodies'
+        // allowance past what arming holds. Reserved to this fit alone, the
+        // settled one could never grow past it.
+        let flat = !elastic::mapped_on_demand();
+        let reshape = flat || (self.whole_fit && fitted < self.chunks.total());
         if reshape && self.chunks.fresh() {
-            self.chunks.reshape(&mut self.pool, fitted)?;
+            let reserved = if flat || settled {
+                fitted
+            } else {
+                let more = self
+                    .chunks
+                    .activation_unheld_bytes()
+                    .saturating_add(bodies)
+                    / chunk;
+                fitted
+                    .saturating_add(u32::try_from(more).unwrap_or(u32::MAX))
+                    .min(self.chunks.total())
+            };
+            self.chunks.reshape(&mut self.pool, reserved)?;
         }
         self.chunks.limit(fitted);
         // The runtime admits frames against this watermark, so the pool is
