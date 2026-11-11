@@ -400,7 +400,7 @@ mod tests {
         want.chunks.decode_pages = 64;
         want.rope_flat_rows = 1024;
         want.moe_gmm_run = 4;
-        want.moe_segment_tokens = 128;
+        want.moe_segment_tokens = 256;
         want.moe_gmm_glu = true;
         want.moe_gmm_fuse_from = 1024;
         assert_eq!(
