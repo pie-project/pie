@@ -656,4 +656,30 @@ mod tests {
             check(plan_shape(s, &Ask::preset(preset)).unwrap().plan, file);
         }
     }
+
+    /// A reduction group need not divide its chain: the last group of each half is short. Tiny
+    /// q35 with G2 / G2Y 3 over 8 and tiny gpt-oss with G2 3 run the golden in the simulator;
+    /// the chip runs that went wrong at G2Y 10 over 128 and G2 24 over 160 were greedy runs
+    /// leaving the golden at a near-tie, not wrong sums.
+    #[test]
+    fn a_short_last_reduction_group_composes() {
+        for (file, preset, set) in [
+            ("tiny_q35_t08", "tiny-t08", "G2=3"),
+            ("tiny_q35_t08", "tiny-t08", "G2Y=3"),
+            ("tiny_gptoss", "tiny-gptoss", "G2=3"),
+        ] {
+            let path = format!(
+                "{}/tools/wafer/baseline/shapes/{file}.json",
+                env!("CARGO_MANIFEST_DIR")
+            );
+            let s: crate::plan::Shape =
+                serde_json::from_str(&std::fs::read_to_string(path).unwrap()).unwrap();
+            let ask = Ask {
+                set: set.into(),
+                ..Ask::preset(preset)
+            };
+            Program::of(plan_shape(s, &ask).unwrap().plan)
+                .unwrap_or_else(|e| panic!("{file} {set}: {e}"));
+        }
+    }
 }

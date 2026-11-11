@@ -7,10 +7,15 @@
 //! ```text
 //! wafer-bench --program <program out dir> --weights <dir>[:<prefix>] --golden <golden.json>
 //!             [--steps N] [--tokens N] [--cmaddr <addr>] [--logits <out.json>] [--times <out.json>]
+//!             [--forced N]
 //! ```
 //!
 //! `--steps`: tokens a launch (default 8); `--tokens`: the golden's first N (default all);
 //! `--logits`: where to write the prompt's last logits row (a JSON array).
+//! A greedy sequence's mismatches count every token past where it left the golden (`from`): one
+//! flipped near-tie diverges the rest. `--forced N` also feeds the golden's first N tokens one a
+//! launch (teacher-forced) and prints each step whose argmax is not the golden's next token, with
+//! how far the golden's token is behind (`FORCED`; informational, not a check).
 //! A program built with `TSTAMP:1` (its artifact's `stamps.json`) also gets a third sequence
 //! with every probe's `tdbg` read after each launch: `TIMES` prints the cycles (each unit's
 //! layers and send, each probe's phases from its pass start (`null`: a phase that path never
@@ -28,7 +33,7 @@ use serde_json::{Value, json};
 
 const USAGE: &str = "usage: wafer-bench --program <dir> --weights <dir>[:<prefix>] --golden \
                      <golden.json> [--steps N] [--tokens N] [--cmaddr <addr>] [--logits <out.json>] \
-                     [--times <out.json>]";
+                     [--times <out.json>] [--forced N]";
 
 fn main() {
     match run() {
@@ -64,6 +69,30 @@ fn greedy(
     }
     got.truncate(n);
     Ok(got)
+}
+
+/// The golden's first `n` tokens fed one a launch after `prompt`: each step whose argmax is not
+/// the next golden token, as (step, got, want, the logit gap got - want).
+fn forced(
+    m: &mut ArtifactModel,
+    prompt: &[u32],
+    want: &[u32],
+    n: usize,
+) -> Result<Vec<(usize, u32, u32, f32)>, String> {
+    let mut miss = Vec::new();
+    for i in 0..n {
+        let (_, l) = if i == 0 {
+            m.forward(prompt, 0, true)?
+        } else {
+            m.forward(&want[i - 1..i], prompt.len() + i - 1, true)?
+        };
+        let l = l.ok_or("no logits row")?;
+        let got = argmax(&l).ok_or("an empty logits row")?;
+        if got != want[i] {
+            miss.push((i, got, want[i], l[got as usize] - l[want[i] as usize]));
+        }
+    }
+    Ok(miss)
 }
 
 /// `b[i] - b[0]` for each word, modulo the 32-bit stamp (`None`: a word no pass stamped, still 0).
@@ -242,9 +271,11 @@ fn run() -> Result<bool, String> {
         let t0 = std::time::Instant::now();
         let got = greedy(&mut m, &prompt, n, steps)?;
         let mis = got.iter().zip(&want).filter(|(g, w)| g != w).count();
+        let from = got.iter().zip(&want).position(|(g, w)| g != w);
         ok &= mis == 0;
         println!(
-            "SEQ {rep}: {mis} mismatches of {n}, {:.3} ms a token, launches {} steps {} got {:?}",
+            "SEQ {rep}: {mis} mismatches of {n}{}, {:.3} ms a token, launches {} steps {} got {:?}",
+            from.map_or(String::new(), |i| format!(" from {i}")),
             t0.elapsed().as_secs_f64() * 1e3 / (prompt.len() + n) as f64,
             m.launches,
             m.steps,
@@ -261,6 +292,20 @@ fn run() -> Result<bool, String> {
             "ROLLBACK to {at}: {a2:?} want {:?} {}",
             &want[2..4],
             if good { "ok" } else { "BAD" }
+        );
+    }
+    let nf = num("forced", 0)?.min(n);
+    if nf > 0 {
+        let miss = forced(&mut m, &prompt, &want, nf)?;
+        let at: Vec<String> = miss
+            .iter()
+            .map(|(i, g, w, d)| format!("{i}: {g} want {w} ({d:+.4})"))
+            .collect();
+        println!(
+            "FORCED {} mismatches of {nf}{}{}",
+            miss.len(),
+            if at.is_empty() { "" } else { ": " },
+            at.join(", ")
         );
     }
     if let Some(probes) = stamps::read(&Path::new(&program).join("artifact"))? {
