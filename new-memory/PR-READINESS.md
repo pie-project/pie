@@ -19,7 +19,7 @@ Branch today: 432 commits ahead of main, 782 files, +86k / -13k. Main merged in 
 | A13 | Record rs-buffered fires (MTP / spec decode on hybrids walk eagerly; same on main) — graph capture rule | L40S | after perf fixes |
 | A14 | Wire the rung shrink (SPEC 6) | RT | done M92 (CUDA) |
 | A21 | Activation rungs on Metal / Vulkan / wgpu / XLA (only CUDA states rungs; the walk is a no-op elsewhere) | backend owners | XLA: not applicable (activation is PJRT scratch outside the single fixed pool; no rungs stated, walk no-op — decided 2026-11-11). XLA A15 done on sc/xla-tier (TPU). Metal / Vulkan / wgpu open |
-| A15 | read_tier_slots / write_tier_slots (snapshots on shared pools) on Metal, Vulkan, wgpu, XLA (CUDA in sc/rt4; Cerebras out of scope) | Metal agent, VKP, TPU | queued |
+| A15 | read_tier_slots / write_tier_slots (snapshots on shared pools) on Metal, Vulkan, wgpu, XLA (CUDA in sc/rt4; Cerebras out of scope) | Metal agent, VKP, TPU | Vulkan+wgpu done M94, XLA done M95; Metal in progress |
 | A16 | Held weights flip to streaming on ROCm 30B MoE (body reservation) | EAGER | done M89 + M93 flat-fit; MI300X verified 2026-11-11 (30B holds weights, 106728 cache pages, 89/89 bodies armed on 4 models, 9 ROCm goldens equal); arm-after-residency (eager-fix-3) next |
 | A17 | Guest panic under admission waits: bench barrier bug fixed (sc/sdk-wakeup) | SDK agent | done; A19 left |
 | A19 | A restartable process whose own demand exceeds the pool restarts forever (should fail with the starvation error); bind hangs waiting for state slots at 96 MiB | RT7 | done M91 + M93 (rt7b: churn closed) |
