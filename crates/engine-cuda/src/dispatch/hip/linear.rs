@@ -9,11 +9,43 @@ use crate::run::Run;
 
 impl DispatchLinear for Run<'_> {
     fn dispatch(&mut self, op: &Linear) -> Result<(), KernelError> {
-        self.linear(op).map_err(crate::error::kernel)
+        self.linear(op).map_err(crate::error::kernel)?;
+        // A hash table may pick an expert past the bank (DeepSeek-V4's
+        // leading layers in a miniature that keeps a few experts): every
+        // select skips that route, and its row lands zero, as on CUDA, so
+        // DeepSeek's plain sum of the routes adds nothing for it.
+        if let Linear::MoeSelect { routes, y, .. } = op
+            && let Some(experts) = self.hash_experts(*routes)
+        {
+            let routes = self.tensor(*routes);
+            return linear::moe_route::zero_dropped(
+                self.ctx(),
+                routes,
+                experts,
+                &mut self.tensor(*y),
+            )
+            .map_err(crate::error::kernel);
+        }
+        Ok(())
     }
 }
 
 impl Run<'_> {
+    /// The expert count of the hash route `routes` is, if a hash route lands it.
+    fn hash_experts(&self, routes: ValueId) -> Option<u32> {
+        let poem_ir::Def::Op(at) = self.values()[routes.0 as usize].def else {
+            return None;
+        };
+        match &self.nodes().get(at as usize)?.op {
+            poem_ir::Operation::Linear(Linear::MoeRoute {
+                experts,
+                score: poem_ir::RouteScore::Hash { .. },
+                ..
+            }) => Some(*experts),
+            _ => None,
+        }
+    }
+
     pub(super) fn fused_linear(&mut self, op: &Fused) -> Result<(), kernels_cuda::Error> {
         match op {
             Fused::MatmulGlu {
