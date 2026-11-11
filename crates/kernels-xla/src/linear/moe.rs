@@ -2502,14 +2502,15 @@ pub fn experts(
     // where an expert's tile holds 64 rows or more (at 16, a 64-lane decode
     // of Qwen3.6-35B-A3B's cut: 323 -> 340 us; at 64, 256 lanes: 359 -> 337)
     // and each half is whole lane tiles (Gemma-4-26B-A4B's 704: c64 3136 ->
-    // 3096 tok/s).
+    // 3096 tok/s), or the tile holds 128 rows (a prompt's: Gemma-4-26B-A4B's
+    // 2176-row fire: 854 -> 776 us, its GLU's own pass gone).
     let inside = crate::linear::moe_gmm::Gmm {
         glu: Some(glu),
         ..up
     };
     let hidden = if tuning.moe_gmm_glu
         && up.tm >= 64
-        && intermediate % 128 == 0
+        && (intermediate % 128 == 0 || up.tm >= 128)
         && up.stepping()
         && up.orient == crate::linear::moe_gmm::Orient::NMajor
         && inside.kernel().is_ok()
