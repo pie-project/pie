@@ -1540,6 +1540,136 @@ fn a_fork_and_a_checkpoint_share_window_slots_and_all_come_back() {
     assert_eq!(window_live(&shared), (0, 0), "every reference back");
 }
 
+/// (c2) A window-only model's pass keeps a checkpoint at its page-aligned
+/// end unasked: refs to each window list's last slots beside its sealed kv
+/// pages, no copy. A later fresh pass sharing the prefix resumes from it
+/// (kv pages mapped in, windows adopted); at the floor it is the runtime's
+/// to drop under pressure, and every slot comes back.
+#[test]
+fn a_window_pass_keeps_its_prefix_unasked_and_a_later_pass_resumes_it() {
+    use crate::pipeline::fire::rs::settle;
+    use crate::pipeline::fire::{TakeCheckpoint, checkpoint_rows, resume, take_checkpoint};
+    use crate::policy::retention::FLOOR;
+    let (_, shared, stores) = windowed_stores();
+    let tokens: Vec<u32> = (0..96).map(|t| 700 + t).collect();
+    let keys_of = |kv: &crate::store::kv::KvStore, ws, rows: usize| {
+        let slots = kv.slot_hashes(ws, 0, &tokens[..rows], 16).unwrap().unwrap();
+        (kv.page_keys(ws, 0, &slots, 16).unwrap().unwrap(), slots)
+    };
+
+    // Pass A: 64 rows, its kv pages written and sealed, its windows landed.
+    let (kv_a, keys) = {
+        let mut kv = stores.kv.lock();
+        assert!(!kv.keeps(), "kv alone resumes no windowed model");
+        let ws = kv.create_working_set();
+        kv.reserve(ws, 4).unwrap();
+        let indexes: Vec<u64> = (0..4).collect();
+        let need = kv.write_demand(ws, &indexes).unwrap();
+        let mut granted = kv.reserve_device_pages(need).unwrap();
+        let prepared = kv
+            .prepare_write_reserved(ws, &indexes, &mut granted)
+            .unwrap();
+        let commits: Vec<crate::store::kv::write::PageCommit> = (0..4)
+            .map(|_| crate::store::kv::write::PageCommit {
+                token_hashes: Vec::new(),
+                page_hash: None,
+            })
+            .collect();
+        let seq = kv.publish_prepared(prepared, &commits).unwrap();
+        kv.settle(seq);
+        let (keys, slots) = keys_of(&kv, ws, 64);
+        assert_eq!(kv.seal_rows(ws, 0, &slots, 16).unwrap(), 4);
+        (ws, keys)
+    };
+    let mut rs = stores.rs.lock().unwrap();
+    let rs_a = rs.create_working_set(window_geometry());
+    let out = window_fire(&mut rs, rs_a, 0..64, None);
+    settle(&mut rs, out.txn);
+    rs.retire_idle();
+    assert_eq!(window_live(&shared), (3, 4));
+    drop(rs);
+
+    // Unasked, the pass keeps its end, a page's; not an end inside a page,
+    // and nothing for a model with no windows.
+    assert_eq!(checkpoint_rows(&[], 0..64, 16, keys.len(), true), [64]);
+    assert!(checkpoint_rows(&[], 0..60, 16, 3, true).is_empty());
+    assert!(checkpoint_rows(&[], 0..64, 16, 4, false).is_empty());
+    assert_eq!(checkpoint_rows(&[40, 33], 0..64, 16, 4, true), [32, 64]);
+    assert!(
+        checkpoint_rows(&[], 0..64, 16, 3, true).is_empty(),
+        "past the pages it keys"
+    );
+    take_checkpoint(
+        &stores,
+        &TakeCheckpoint {
+            kv: kv_a,
+            rs: rs_a,
+            snapshot: false,
+            pages: 4,
+            key: keys[3],
+        },
+        true,
+    );
+    let mut rs = stores.rs.lock().unwrap();
+    assert!(rs.has_checkpoint(&keys[3]));
+    assert_eq!(window_live(&shared), (3, 4), "refs, not copies");
+    rs.release_working_set(rs_a);
+    rs.retire_idle();
+    assert_eq!(
+        window_live(&shared),
+        (3, 4),
+        "the checkpoint holds its slots"
+    );
+    drop(rs);
+    {
+        let mut kv = stores.kv.lock();
+        let epoch = kv.current_epoch();
+        kv.release_working_set(kv_a, epoch);
+        kv.retire_idle();
+    }
+
+    // Pass B: 96 rows, the first 64 A's. It resumes from A's end.
+    let (kv_b, rs_b) = {
+        let mut kv = stores.kv.lock();
+        let ws = kv.create_working_set();
+        kv.reserve(ws, 6).unwrap();
+        (
+            ws,
+            stores
+                .rs
+                .lock()
+                .unwrap()
+                .create_working_set(window_geometry()),
+        )
+    };
+    let keys_b = keys_of(&stores.kv.lock(), kv_b, 96).0;
+    assert_eq!(keys_b[..4], keys[..], "B's prefix keys are A's");
+    assert_eq!(resume(&stores, kv_b, rs_b, &keys_b, 5, 16), 4);
+    assert_eq!(stores.kv.lock().mapped_len(kv_b).unwrap(), 4);
+    let mut rs = stores.rs.lock().unwrap();
+    assert_eq!(rs.window_positions(rs_b), Ok(Some((64, 64))));
+    // B writes on past the prefix; the shared slots stay the checkpoint's.
+    let out = window_fire(&mut rs, rs_b, 64..96, None);
+    settle(&mut rs, out.txn);
+    rs.release_working_set(rs_b);
+    rs.retire_idle();
+    assert_eq!(window_live(&shared), (3, 4), "only the checkpoint's left");
+
+    // Idle and at the floor, the runtime drops it under pressure; keyed
+    // above the floor by a policy, it stays.
+    assert_eq!(rs.reclaim_droppable(|_| FLOOR + 1), 0);
+    assert!(rs.has_checkpoint(&keys[3]));
+    assert_eq!(rs.reclaim_droppable(|_| FLOOR), 7, "its seven slots go");
+    rs.retire_idle();
+    assert!(!rs.has_checkpoint(&keys[3]));
+    assert_eq!(window_live(&shared), (0, 0), "every reference back");
+    drop(rs);
+    let mut kv = stores.kv.lock();
+    let epoch = kv.current_epoch();
+    kv.release_working_set(kv_b, epoch);
+    kv.retire_idle();
+}
+
 /// (d) Rows of a fire still being decided (spec drafts) never count as
 /// committed: each window trims behind what the fires commit only.
 #[test]
