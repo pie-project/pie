@@ -834,6 +834,11 @@ impl Pools {
         }
     }
 
+    /// Every fixed shape and its pieces a record.
+    pub fn fixed_shapes(&self) -> impl Iterator<Item = (ShapeId, u32)> + '_ {
+        self.layout.fixed().map(|s| (s.id, s.pieces()))
+    }
+
     /// The kv list's shape, the window list's, the rs list's.
     #[must_use]
     pub fn kv_shape(&self) -> Option<ShapeId> {

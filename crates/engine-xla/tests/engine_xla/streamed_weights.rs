@@ -93,7 +93,7 @@ fn served(
     held: Held,
 ) -> (Vec<u8>, engine::chunk::WeightUses, u32) {
     let mut model = Model::load(name, None, context, 7);
-    let facts = model.loaded.caps.chunks.clone().expect("chunk facts");
+    let facts = model.loaded.caps.chunks.clone();
     let chunks: u32 = facts
         .weights
         .iter()
@@ -213,7 +213,7 @@ fn a_held_load_states_no_weight_shape() {
     };
     for name in ["gemma4-e4b-mini-l1", "qwen3-30b-a3b-mini"] {
         let model = Model::load_held(name, None, 256, 7);
-        let facts = model.loaded.caps.chunks.clone().expect("chunk facts");
+        let facts = model.loaded.caps.chunks.clone();
         assert!(facts.weights.is_empty(), "{name}: {:?}", facts.weights);
     }
 }

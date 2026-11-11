@@ -18,7 +18,7 @@ type Record = Vec<(ShapeId, Vec<u32>)>;
 
 /// The fixed shapes a record lies in, and their pieces.
 fn fixed_shapes(model: &Model) -> Vec<(ShapeId, u32)> {
-    let facts = model.loaded.caps.chunks.clone().expect("chunk facts");
+    let facts = model.loaded.caps.chunks.clone();
     facts
         .shapes
         .iter()

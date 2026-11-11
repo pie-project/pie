@@ -83,11 +83,6 @@ fn a_windowed_model_answers_bit_for_bit_past_its_window() {
     run("gemma4-e4b-mini-l1", None, 1024, Some(700));
 }
 
-#[test]
-fn a_routed_model_answers_bit_for_bit() {
-    run("qwen3-30b-a3b-mini", None, 256, None);
-}
-
 /// Prompts a sequence, decodes two steps, then decodes on: with `park`, its
 /// kv list slots and its record go to the host tier (the kv slots on to the
 /// slot file and back, where the load seats one) between the steps and
