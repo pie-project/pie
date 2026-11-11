@@ -87,9 +87,13 @@ fn inv_rms_tall(
     f.mul(x, inv)
 }
 
-/// Rows a per-head norm kernel takes a step (`heads_kernel`), and the least
-/// a fire has for it.
+/// Rows a per-head norm kernel takes a step (`heads_kernel`).
 const KERNEL_ROWS: i64 = 256;
+
+/// The least rows a fire's per-head norm takes the kernel from: a prompt's
+/// fire; a batch's mixed fires (a few hundred rows) keep XLA's norm (v5e
+/// gemma-4-31B c32: 1.98k -> 1.95k tok/s through the kernel).
+const KERNEL_FROM: i64 = 640;
 
 /// `x`'s bf16 `[rows, width]` rows normed per `axis`-wide head by one Mosaic
 /// kernel, a block of rows a step and each head in place, times `gain` (an
@@ -98,7 +102,8 @@ const KERNEL_ROWS: i64 = 256;
 /// `[rows, heads, axis]` f32 view of them out and back (v5e gemma-4-31B's
 /// 1792-row fires: q, k and v ~0.9 ms a sliding layer of copies, broadcasts
 /// and sums). `None` where it does not apply: heads narrower than 256,
-/// fewer than two, short fires (`PIE_XLA_NORM_KERNEL=0` turns it off).
+/// fewer than two, fires under `KERNEL_FROM` rows (`PIE_XLA_NORM_KERNEL=0`
+/// turns it off).
 fn heads_kernel(
     f: &mut Func,
     x: Val,
@@ -111,7 +116,7 @@ fn heads_kernel(
     let (rows, width) = (dims[0], dims[1]);
     if std::env::var("PIE_XLA_NORM_KERNEL").is_ok_and(|v| v == "0")
         || f.elem(x) != Elem::Bf16
-        || rows < KERNEL_ROWS
+        || rows < KERNEL_FROM
         || axis < 256
         || axis % 128 != 0
         || width % axis != 0

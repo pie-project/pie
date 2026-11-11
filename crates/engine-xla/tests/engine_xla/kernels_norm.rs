@@ -76,12 +76,12 @@ fn rmsnorm_and_its_per_head_plus_one_form_answer_the_host() {
 
 #[test]
 fn a_tall_fires_per_head_norm_answers_the_host() {
-    // A tall fire's heads go through the norm kernel (600 rows: a partial
+    // A tall fire's heads go through the norm kernel (680 rows: a partial
     // last block; 16384 wide: half blocks); with it off, 1024 rows of 32
     // heads through the MXU.
     for (rows, width, head) in [
         (1024u32, 2048u32, 256u32),
-        (600, 2048, 512),
+        (680, 2048, 512),
         (1792, 16384, 512),
         (1024, 8192, 256),
     ] {
