@@ -127,7 +127,7 @@ What each block's PEs hold is the family kernels' (`Family::copies`). The famili
 | Family | Composed as | Kernels |
 |---|---|---|
 | Dense (Qwen3.5, Qwen3, Llama 3) | the snake | `kernels::dense` (`weight` (NRM 0, MIXK 0), `cx` (NRM 0), `cy` (MIXK 0, NRM 0)) + `head` + `common::RELAY` |
-| gpt-oss | routed experts | `kernels::gptoss` (`wa`, `wm`: `weight` (MIXK 2, 3), `cx`, `cya`, `cym`, the band head; `head_ctl.csl` with the bus reserved) |
+| gpt-oss (and any MoE model: Qwen3 MoE) | routed experts | `kernels::gptoss` (`wa`, `wm`: `weight` (MIXK 2, 3), `cx`, `cya`, `cym`, the band head; `head_ctl.csl` with the bus reserved) |
 | Gemma 4 E2B / E4B | a side input and shared caches | `kernels::gemma` (`weight` (NRM 1, MIXK 1, PLE 1), `cx` (NRM 1, PLE 1), `cy` (NRM 1, MIXK 1, PLE 1, KVS 1), `head_ctl` (token bus on), `ple_gemma`) + `head::HEAD_PE` |
 | Gemma 4 12B | sliding windows | `kernels::gemma12` (`weight` (NRM 1, MIXK 1, row roles by `AROW`), `cx` (NRM 1, HG 1), `cy` (NRM 1, MIXK 1, KEV 1), `head_pe` with head groups) + `head::HEAD_CTL` |
 
@@ -192,16 +192,16 @@ them all to `layout/ops`.
 | `att` | attention over a layer's own cache (keys dim-major, the ones column, the log-sum-exp reference, redo passes) | `weight` (MIXK 0) |
 | `gdn` | the Gated DeltaNet state slice: the (k, q) exchange, the column partials, the update | `weight` (MIXK 0) |
 | `kv` | attention over sliding rings and global caches, shared-KV units (the KVS line), plain rows | `weight` (MIXK 1) |
-| `swa` | full and sliding-window attention with keys entry-major (sinks by CY) | `weight` (MIXK 2) |
-| `moe` | routed experts: the router's partial, E5M2 tiles decoded, the TK experts' gate / up and downs | `weight` (MIXK 3) |
+| `swa` | full and sliding-window attention with keys entry-major (sinks by CY; QKN: the q / k head norms' scalars on the scores) | `weight` (MIXK 2) |
+| `moe` | routed experts: the router's partial, E5M2 tiles decoded (XF 1: f16 tiles), the TK experts' gate / up and downs | `weight` (MIXK 3) |
 | `cpe` | a column control PE's core: the reduction's sum and the multicast's words, queues, the reduction root, the control row's segment all-reduce, the deferred norm's combine, stamps | `cy` |
 | `act` | vector exp, SiLU (lean and f16 forms), GELU-tanh (trimmed forms) | `cy` (the MLP, GDN) |
 | `cy_att` | the own-cache attention's column work: rms, q / k norm weights, partial RoPE, o / l with the gate, redo and log-sum-exp steps | `cy` (MIXK 0) |
 | `cy_gdn` | GDN's column work: conv1d ring, SiLU, gates, decay, delta, the gated norm | `cy` (MIXK 0) |
 | `cy_kv` | sliding / global attention's column work after the deferred norm (k = v layers, shared-KV q-only units, the KVS line) | `cy` (MIXK 1) |
 | `cy_ple` | the PLE bus and the per-layer embedding gate | `cy` (PLE 1) |
-| `cy_swa` | entry-major attention's column work: biases, vector RoPE, the sinks' reciprocal | `cy` (MIXK 2) |
-| `cy_moe` | the router (segment all-reduce, top-k, softmax) and the experts' clamped GLU | `cy` (MIXK 3) |
+| `cy_swa` | entry-major attention's column work: biases (QB), q / k head norms (QKN), vector RoPE, the sinks' reciprocal (SNK) | `cy` (MIXK 2) |
+| `cy_moe` | the router (segment all-reduce, top-k, softmax) and the experts' GLU: clamped SwiGLU or SiLU's (GLU), biases (RB, GB), MXFP4's scales (PSC) | `cy` (MIXK 3) |
 
 The three role kernels of a unit (`weight`, `cx`, `cy`) are each one image over every layer program: the
 phase order is theirs, the mixer and norm kinds comptime params (`NRM`, `MIXK`, `ACT`, `PLE`). What is still
