@@ -1230,12 +1230,23 @@ impl Pools {
         };
         self.fitted = fitted;
         // The kv pages the shell's own seats may name: what the chunks hold
-        // were every one the kv rows'.
+        // were every one the kv rows', but those a held load's weights take.
+        // The fit claimed every weight the pool holds (the card holds them
+        // with one working set and the programs), so the runtime holds them
+        // for the load's life and no kv row ever takes their chunks; counted
+        // as the rows', they are pages admission hands out that no chunk
+        // backs, and a load filling them starves with nothing to discard.
+        let weight_chunks = if self.budget.is_none() && claim == whole {
+            u32::try_from(self.weight_pool_bytes() / chunk).unwrap_or(u32::MAX)
+        } else {
+            0
+        };
+        let kv_chunks = fitted.saturating_sub(weight_chunks).max(least);
         let layout = self.chunks.layout();
         let (mut fits, mut over) = (one_slot, self.ceiling.saturating_add(1));
         while over - fits > 1 {
             let mid = fits + (over - fits) / 2;
-            if chunks_at(layout, &self.paging, mid, 0) <= fitted {
+            if chunks_at(layout, &self.paging, mid, 0) <= kv_chunks {
                 fits = mid;
             } else {
                 over = mid;
@@ -1244,10 +1255,27 @@ impl Pools {
         self.paging.pages = fits;
         // A flat range is one allocation made on its first commit: of the
         // fitted chunks, not of every chunk the asked count reserved.
-        let reshape =
-            !elastic::mapped_on_demand() || (self.whole_fit && fitted < self.chunks.total());
+        // A range mapped on demand reserved anew before the activation is
+        // settled keeps room for what the settled fit may yet give the cache
+        // rows: the activation's span no fire backs, and the bodies'
+        // allowance past what arming holds. Reserved to this fit alone, the
+        // settled one could never grow past it.
+        let flat = !elastic::mapped_on_demand();
+        let reshape = flat || (self.whole_fit && fitted < self.chunks.total());
         if reshape && self.chunks.fresh() {
-            self.chunks.reshape(&mut self.pool, fitted)?;
+            let reserved = if flat || settled {
+                fitted
+            } else {
+                let more = self
+                    .chunks
+                    .activation_unheld_bytes()
+                    .saturating_add(bodies)
+                    / chunk;
+                fitted
+                    .saturating_add(u32::try_from(more).unwrap_or(u32::MAX))
+                    .min(self.chunks.total())
+            };
+            self.chunks.reshape(&mut self.pool, reserved)?;
         }
         self.chunks.limit(fitted);
         // The runtime admits frames against this watermark, so the pool is
