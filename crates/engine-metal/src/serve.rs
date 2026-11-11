@@ -1248,7 +1248,10 @@ impl Shell {
 
     /// See `Engine::weight_uses`: each atom's reads since the last call.
     pub fn weight_uses(&mut self) -> Result<engine::chunk::WeightUses> {
-        self.drain()?;
+        // No drain: the counters only grow, and a read takes what landed so
+        // far (a fire still in flight counts toward the next read). The
+        // runtime asks every governor tick; draining here stalled the frame
+        // pipeline four times a second.
         self.pools.weight_uses()
     }
 

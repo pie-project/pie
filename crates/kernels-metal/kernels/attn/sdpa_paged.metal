@@ -582,6 +582,7 @@ inline void sdpa_paged_tiled_body(
     threadgroup T* vtile,
     threadgroup T* qtile,
     threadgroup float* ptile,
+    threadgroup ulong* cells,
     uint3 tid,
     uint3 tpg,
     uint simd_gid,
@@ -680,13 +681,23 @@ inline void sdpa_paged_tiled_body(
       const int cnt = min(KT, kp_hi + 1 - base);
 
       threadgroup_barrier(mem_flags::mem_threadgroup);
+      // Each staged token's place in the K and V planes (its head's first
+      // unit), found once a token rather than once an element: the page
+      // lookup, the division by the page size and the 64-bit strides stay
+      // out of the element loop.
+      if (int(lid) < cnt) {
+        const int kp = base + int(lid);
+        const ulong page = ulong(kv_page_indices[page_base + kp / page_size]);
+        const ulong off = ulong(kp % page_size);
+        cells[lid] = page * k_page + off * k_row + ulong(kv_head) * kv_head_width;
+        cells[KT + lid] = page * v_page + off * v_row + ulong(kv_head) * kv_head_width;
+      }
+      threadgroup_barrier(mem_flags::mem_threadgroup);
       for (int e = int(lid); e < cnt * D; e += 1024) {
         const int kk = e / D;
         const int d  = e - kk * D;
-        const int kp = base + kk;
-        const int page = int(kv_page_indices[page_base + kp / page_size]);
-        const size_t kcell = size_t(page) * k_page + size_t(kp % page_size) * k_row;
-        const size_t vcell = size_t(page) * v_page + size_t(kp % page_size) * v_row;
+        const size_t kcell = cells[kk];
+        const size_t vcell = cells[KT + kk];
         if constexpr (PACKED) {
           // C2c-2 — the packed 4-bit KV staging load. This lane stages element
           // `d` of the block for cached token `kk`: byte-index the token's
@@ -700,18 +711,16 @@ inline void sdpa_paged_tiled_body(
               "the packed 4-bit KV tiled read stages whole even-width heads (block == head_dim)");
           constexpr uint nib = uint(D) / 2u;
           constexpr uint blk_bytes = sdpa_kv_u4_bytes<D>();
-          const device uchar* kblk =
-              (const device uchar*)k_pages + kcell + size_t(kv_head) * blk_bytes;
-          const device uchar* vblk =
-              (const device uchar*)v_pages + vcell + size_t(kv_head) * blk_bytes;
+          const device uchar* kblk = (const device uchar*)k_pages + kcell;
+          const device uchar* vblk = (const device uchar*)v_pages + vcell;
           float kdq, vdq;
           sdpa_kv_u4_lane(kblk, uint(d), 1, sdpa_kv_u4_scale(kblk, nib), &kdq);
           sdpa_kv_u4_lane(vblk, uint(d), 1, sdpa_kv_u4_scale(vblk, nib), &vdq);
           ktile[kk * kstride + d] = static_cast<T>(kdq);
           vtile[e] = static_cast<T>(vdq);
         } else {
-          ktile[kk * kstride + d] = k_pages[kcell + size_t(kv_head) * D + d];
-          vtile[e] = v_pages[vcell + size_t(kv_head) * D + d];
+          ktile[kk * kstride + d] = k_pages[kcell + d];
+          vtile[e] = v_pages[vcell + d];
         }
       }
       threadgroup_barrier(mem_flags::mem_threadgroup);
@@ -853,13 +862,14 @@ template <typename T, int D, int V = D, bool WITH_SINK = false, bool KEY_PER_LAN
   threadgroup T vtile[sdpa_kt<D>() * D];
   threadgroup T qtile[sdpa_kq<D, KEY_PER_LANE>()];
   threadgroup float ptile[sdpa_kp_tile<D, KEY_PER_LANE>()];
+  threadgroup ulong cells[2 * sdpa_kt<D>()];
   sdpa_paged_tiled_body<T, D, V, WITH_SINK, KEY_PER_LANE, false>(
       queries, k_pages, v_pages, out, gqa_factor, position_ids, req_of_token,
       kv_page_indices, kv_page_indptr, page_size, PIE_KV_LAYOUT_ARGS, n_kv_heads, scale,
       attention_mask, attention_mask_stride, attention_mask_enabled, window,
       sinks, nullptr, n_rows,
       0, 0,
-      ktile, vtile, qtile, ptile, tid, tpg, simd_gid, simd_lid);
+      ktile, vtile, qtile, ptile, cells, tid, tpg, simd_gid, simd_lid);
 }
 
 template <typename T, int D, int V = D, bool KEY_PER_LANE = false>
@@ -895,13 +905,14 @@ template <typename T, int D, int V = D, bool KEY_PER_LANE = false>
   threadgroup T vtile[sdpa_kt<D>() * D];
   threadgroup T qtile[sdpa_kq<D, KEY_PER_LANE>()];
   threadgroup float ptile[sdpa_kp_tile<D, KEY_PER_LANE>()];
+  threadgroup ulong cells[2 * sdpa_kt<D>()];
   sdpa_paged_tiled_body<T, D, V, false, KEY_PER_LANE, true>(
       queries, k_pages, v_pages, out, gqa_factor, position_ids, req_of_token,
       kv_page_indices, kv_page_indptr, page_size, PIE_KV_LAYOUT_ARGS, n_kv_heads, scale,
       attention_mask, attention_mask_stride, attention_mask_enabled, window,
       sinks, lse, n_rows,
       0, 0,
-      ktile, vtile, qtile, ptile, tid, tpg, simd_gid, simd_lid);
+      ktile, vtile, qtile, ptile, cells, tid, tpg, simd_gid, simd_lid);
 }
 
 // C2c-2 — the TILED read over a PACKED 4-bit KV cache, covering prefill and the
@@ -944,13 +955,14 @@ template <typename T, int D, int V = D>
   threadgroup T vtile[sdpa_kt<D>() * D];
   threadgroup T qtile[sdpa_kq<D, false>()];
   threadgroup float ptile[sdpa_kp_tile<D, false>()];
+  threadgroup ulong cells[2 * sdpa_kt<D>()];
   sdpa_paged_tiled_body<T, D, V, false, false, false, true>(
       queries, k_pages, v_pages, out, gqa_factor, position_ids, req_of_token,
       kv_page_indices, kv_page_indptr, page_size, PIE_KV_LAYOUT_ARGS, n_kv_heads, scale,
       attention_mask, attention_mask_stride, attention_mask_enabled, window,
       sinks, nullptr, n_rows,
       0, 0,
-      ktile, vtile, qtile, ptile, tid, tpg, simd_gid, simd_lid);
+      ktile, vtile, qtile, ptile, cells, tid, tpg, simd_gid, simd_lid);
 }
 
 // C2c-2 — the TILED read with a published log-sum-exp (prefill_lse) over a PACKED
@@ -991,13 +1003,14 @@ template <typename T, int D, int V = D>
   threadgroup T vtile[sdpa_kt<D>() * D];
   threadgroup T qtile[sdpa_kq<D, false>()];
   threadgroup float ptile[sdpa_kp_tile<D, false>()];
+  threadgroup ulong cells[2 * sdpa_kt<D>()];
   sdpa_paged_tiled_body<T, D, V, false, false, true, true>(
       queries, k_pages, v_pages, out, gqa_factor, position_ids, req_of_token,
       kv_page_indices, kv_page_indptr, page_size, PIE_KV_LAYOUT_ARGS, n_kv_heads, scale,
       attention_mask, attention_mask_stride, attention_mask_enabled, window,
       sinks, lse, n_rows,
       0, 0,
-      ktile, vtile, qtile, ptile, tid, tpg, simd_gid, simd_lid);
+      ktile, vtile, qtile, ptile, cells, tid, tpg, simd_gid, simd_lid);
 }
 
 #define instantiate_sdpa_tiled_impl(fn, name, itype, d, v, sink, kpl)      \
