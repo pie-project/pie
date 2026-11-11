@@ -90,6 +90,13 @@ pub struct MoeSegmentFrom(pub u32);
 #[decision(id = "kernel.moe.gmm_glu", constant(set(0, 1)), default = 0, tune = search)]
 pub struct MoeGmmGlu(pub u32);
 
+/// The fewest tokens a fire holds for its routed MLP's two legs to run as
+/// one kernel (`moe_gmm::Gmm::mlp_kernel`, its GLU rows kept in VMEM between
+/// them); 0: never.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Decision)]
+#[decision(id = "kernel.moe.gmm_fuse_from", constant(range(0..=8192)), default = 0, tune = search)]
+pub struct MoeGmmFuseFrom(pub u32);
+
 macro_rules! moe_costs {
     ($($ty:ident = $id:literal, $lo:literal ..= $hi:literal, $default:literal, $doc:literal;)*) => {
         $(
@@ -222,6 +229,7 @@ pub fn register(registry: &mut Registry) {
         .add::<MoeSegmentTokens>()
         .add::<MoeSegmentFrom>()
         .add::<MoeGmmGlu>()
+        .add::<MoeGmmFuseFrom>()
         .add::<MoeDenseAllMi>()
         .add::<MoeSliceMib>()
         .add::<MoeSlicePairs>()
@@ -306,6 +314,7 @@ pub struct Tuning {
     pub moe_segment_tokens: i64,
     pub moe_segment_from: i64,
     pub moe_gmm_glu: bool,
+    pub moe_gmm_fuse_from: i64,
     pub moe_costs: MoeCosts,
     pub grouped: Grouped,
     pub attn_per_row_max: i64,
@@ -329,6 +338,7 @@ impl Tuning {
         moe_segment_tokens: 0,
         moe_segment_from: 1024,
         moe_gmm_glu: false,
+        moe_gmm_fuse_from: 0,
         moe_costs: MoeCosts {
             dense_all: 1 << 27,
             slice_bytes: 18 << 20,
@@ -376,6 +386,7 @@ impl Tuning {
             moe_segment_tokens: n(profile.get::<MoeSegmentTokens>().0),
             moe_segment_from: n(profile.get::<MoeSegmentFrom>().0),
             moe_gmm_glu: profile.get::<MoeGmmGlu>().0 == 1,
+            moe_gmm_fuse_from: n(profile.get::<MoeGmmFuseFrom>().0),
             moe_costs: MoeCosts {
                 dense_all: n(profile.get::<MoeDenseAllMi>().0) << 20,
                 slice_bytes: n(profile.get::<MoeSliceMib>().0) << 20,
