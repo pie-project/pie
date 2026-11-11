@@ -1230,12 +1230,23 @@ impl Pools {
         };
         self.fitted = fitted;
         // The kv pages the shell's own seats may name: what the chunks hold
-        // were every one the kv rows'.
+        // were every one the kv rows', but those a held load's weights take.
+        // The fit claimed every weight the pool holds (the card holds them
+        // with one working set and the programs), so the runtime holds them
+        // for the load's life and no kv row ever takes their chunks; counted
+        // as the rows', they are pages admission hands out that no chunk
+        // backs, and a load filling them starves with nothing to discard.
+        let weight_chunks = if self.budget.is_none() && claim == whole {
+            u32::try_from(self.weight_pool_bytes() / chunk).unwrap_or(u32::MAX)
+        } else {
+            0
+        };
+        let kv_chunks = fitted.saturating_sub(weight_chunks).max(least);
         let layout = self.chunks.layout();
         let (mut fits, mut over) = (one_slot, self.ceiling.saturating_add(1));
         while over - fits > 1 {
             let mid = fits + (over - fits) / 2;
-            if chunks_at(layout, &self.paging, mid, 0) <= fitted {
+            if chunks_at(layout, &self.paging, mid, 0) <= kv_chunks {
                 fits = mid;
             } else {
                 over = mid;
