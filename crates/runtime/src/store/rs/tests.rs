@@ -84,6 +84,7 @@ fn a_window_is_a_list_of_slots_trimmed_behind_its_commit() {
         fold,
         commit_end: end,
         head: Some(end),
+        keep: None,
     };
     let fire = |s: &mut RsStore, ws, slots: &[u32], advance| {
         let prepared = s.prepare_window(ws, rows(slots), None).unwrap();
@@ -147,6 +148,7 @@ fn a_window_is_a_list_of_slots_trimmed_behind_its_commit() {
         fold: None,
         commit_end: end,
         head: Some(end),
+        keep: None,
     };
     fire(&mut s, ws, &[7], device(0, 128));
     assert_eq!(s.window_positions(ws), Ok(Some((101, 128))));
@@ -164,6 +166,7 @@ fn a_window_is_a_list_of_slots_trimmed_behind_its_commit() {
         fold: None,
         commit_end: 0,
         head: None,
+        keep: None,
     };
     fire(&mut s, ws, &[2], lease);
     assert_eq!(s.window_positions(ws), Ok(Some((128, 144))));

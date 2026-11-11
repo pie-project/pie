@@ -383,10 +383,13 @@ fn bound_rs_working_sets<C: FireContext>(
 /// The window plan of a host fire on a model whose state is window lists:
 /// each lane lands its rows from `held`, which every earlier token of its
 /// sequence precedes, and reads its tables through them.
+/// `keep`: the position a checkpoint inside the fire lands at, whose slots
+/// stay past it.
 fn host_window_plan(
     req: &crate::engine::FireRequest,
     fold: &geometry::Fold,
     ids: &[crate::store::rs::RsWorkingSetId],
+    keep: Option<u32>,
 ) -> Result<rs::RsPlan, String> {
     if ids.is_empty() {
         return Ok(rs::RsPlan::Groups(Vec::new()));
@@ -408,6 +411,7 @@ fn host_window_plan(
                         fold: fold.of(row),
                         commit_end: end,
                         head: (rows > 0).then_some(end),
+                        keep,
                     },
                 }
             })
@@ -820,9 +824,8 @@ fn keyed_rows(req: &crate::engine::FireRequest) -> u32 {
 }
 
 /// The rows a pass over `rows` keeps its state at: those the inferlet asks
-/// for (`asked`), floored to whole pages, and with `auto` the pass's end where
-/// it is a page's (a fire's end, where a window lands), each within the
-/// `keyed` pages the pass keys.
+/// for (`asked`), and with `auto` the pass's end, each floored to whole pages
+/// and within the `keyed` pages the pass keys.
 pub(crate) fn checkpoint_rows(
     asked: &[u32],
     rows: std::ops::Range<u64>,
@@ -834,7 +837,7 @@ pub(crate) fn checkpoint_rows(
     let mut at: Vec<u64> = asked
         .iter()
         .map(|&row| u64::from(row) / page * page)
-        .chain((auto && rows.end.is_multiple_of(page)).then_some(rows.end))
+        .chain(auto.then_some(rows.end / page * page))
         .filter(|&row| rows.start < row && row <= rows.end && row / page <= keyed as u64)
         .collect();
     at.sort_unstable();
@@ -1511,11 +1514,11 @@ pub(crate) fn take_checkpoint(
             .keep(checkpoint.rs, checkpoint.key, owner);
         Ok(true)
     } else {
-        stores
-            .rs
-            .lock()
-            .unwrap()
-            .checkpoint(checkpoint.rs, checkpoint.key, owner)
+        let mut rs = stores.rs.lock().unwrap();
+        match checkpoint.window_at {
+            Some(at) => rs.checkpoint_at(checkpoint.rs, checkpoint.key, owner, at),
+            None => rs.checkpoint(checkpoint.rs, checkpoint.key, owner),
+        }
     };
     match taken {
         Ok(true) => {
@@ -1565,6 +1568,8 @@ pub(crate) struct TakeCheckpoint {
     pub(crate) snapshot: bool,
     pub(crate) pages: u64,
     pub(crate) key: crate::store::kv::hash::Hash256,
+    /// A window's, as of this position, at or behind the fire's end.
+    pub(crate) window_at: Option<u32>,
 }
 
 pub struct PendingFire {
@@ -1948,6 +1953,7 @@ fn device_window_plan(
                     fold: None,
                     commit_end: 0,
                     head: None,
+                    keep: None,
                 },
             })
             .collect(),
@@ -2683,7 +2689,7 @@ pub async fn submit_pass_stamped<C: FireContext>(
         let held = u64::from(full.lanes[0].kv.held);
         let reach = held + full.lanes[0].tokens.len() as u64;
         // A model whose only state beside its kv is window lists keeps one at
-        // the pass's end unasked: the refs to its lists' last slots are all a
+        // the pass's last page boundary unasked: the refs to its lists' last slots are all a
         // later prompt sharing the prefix needs, where kv alone resumed it
         // before windows were trimmed. A recurrent state's would hold its
         // record, which the pass's next write copies whole: it keeps one
@@ -2841,13 +2847,30 @@ pub async fn submit_pass_stamped<C: FireContext>(
                     snapshot,
                     pages,
                     key: keys[pages as usize - 1],
+                    window_at: None,
                 }
             };
-            let mut checkpoints_here: Vec<TakeCheckpoint> = state
-                .filter(|_| checkpoints.contains(&slots.end))
-                .map(|rs| at_row(rs, slots.end, false))
-                .into_iter()
-                .collect();
+            // A window pass is one fire: it keeps the furthest of its rows,
+            // which its windows stand at once it lands, or reach back to
+            // from its end (the slots that window touches retire no earlier).
+            let window_at = checkpoints
+                .iter()
+                .copied()
+                .filter(|&row| windowed && slots.start < row && row <= slots.end)
+                .max();
+            let mut checkpoints_here: Vec<TakeCheckpoint> = match (state, window_at) {
+                (Some(rs), Some(row)) => vec![TakeCheckpoint {
+                    window_at: u32::try_from(row).ok(),
+                    ..at_row(rs, row, false)
+                }],
+                (Some(rs), None) if checkpoints.contains(&slots.end) => {
+                    vec![at_row(rs, slots.end, false)]
+                }
+                _ => Vec::new(),
+            };
+            let keep = window_at
+                .filter(|&row| row < slots.end)
+                .and_then(|row| u32::try_from(row).ok());
             // The furthest the engine lands of those inside the fire.
             let mut inside: Vec<u32> = checkpoints
                 .iter()
@@ -2862,7 +2885,7 @@ pub async fn submit_pass_stamped<C: FireContext>(
                 .collect();
             let rs_plan = || {
                 if windowed {
-                    host_window_plan(&req, &fold, &rs_ws_ids)
+                    host_window_plan(&req, &fold, &rs_ws_ids, keep)
                 } else {
                     host_rs_plan(&stores, &rs_ws_ids, &groups, &req, &fold, &inside)
                 }
