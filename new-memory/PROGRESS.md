@@ -1185,3 +1185,9 @@ The `new-memory/` directory is bookkeeping and is removed before anything lands 
   bitwise-unchanged. Checks: engine-vulkan (vulkan), engine-wgpu, pie vulkan+wgpu clean; engine-vulkan lib 18 pass.
 - Open (VK6): split_rows=32 keeps >=32-row fires unrecorded on desktop; descriptor indexing; wgpu c1 host work;
   gemma c64/boot; Qwen3-30B 6.57 GB embed view past 4 GiB; trimmed-window model_logits test.
+
+### M95 — 2026-11-11: XLA tier slot copies (A15 on XLA); A21 not applicable on XLA
+- `sc/xla-tier` (0a109def3, TPU): read/write_tier_slots at SlotShape::tier_offset per shape; refuses wrong byte
+  counts / overruns whole; park test restores qwen3-micro and qwen35-tiny through host-slot bytes, bitwise on v6e.
+  engine-xla 14 + kernels-xla 18 lib pass; pie --features xla checks clean.
+- A21 on XLA: activation is PJRT scratch outside the single fixed pool -> no rungs stated, walk stays a no-op.
