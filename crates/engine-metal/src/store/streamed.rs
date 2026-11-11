@@ -562,13 +562,60 @@ struct Host {
     opened: bool,
 }
 
-/// Slots filled on the host from the serving file: `(from, to, bytes)`
-/// each, `bytes` at `from` in the file to `to` bytes into the pool, in the
-/// file's order.
+/// Slots filled on the host from the serving file, in the file's order:
+/// runs of `count` entries of `len` bytes each, read one after another from
+/// `from` in the file and written `stride` bytes apart from `to` in the pool
+/// (a plane's entries go to consecutive slots of a chunk, a slot apart).
 #[derive(Debug, Clone)]
 pub struct FileFills {
     pub file: std::sync::Arc<crate::mapping::Mapping>,
-    pub fills: Vec<(u64, u64, u64)>,
+    pub runs: Vec<FileRun>,
+}
+
+/// One run of [`FileFills`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FileRun {
+    pub from: u64,
+    pub to: u64,
+    pub len: u64,
+    pub count: u64,
+    pub stride: u64,
+}
+
+impl FileRun {
+    /// Appends the entry `(from, to, len)` to the last run of `runs` where it
+    /// continues it (the next bytes of the file, `stride` past the last
+    /// entry in the pool), else opens a run.
+    pub fn push(runs: &mut Vec<FileRun>, from: u64, to: u64, len: u64) {
+        if let Some(run) = runs.last_mut()
+            && run.len == len
+            && run.from + run.count * run.len == from
+        {
+            let last = run.to + (run.count - 1) * run.stride;
+            if run.count == 1 && to > last {
+                run.stride = to - last;
+                run.count = 2;
+                return;
+            }
+            if run.count > 1 && to == last + run.stride {
+                run.count += 1;
+                return;
+            }
+        }
+        runs.push(FileRun {
+            from,
+            to,
+            len,
+            count: 1,
+            stride: len,
+        });
+    }
+
+    /// The file bytes the run reads.
+    #[must_use]
+    pub fn bytes(&self) -> u64 {
+        self.count * self.len
+    }
 }
 
 impl FileFills {
@@ -576,10 +623,13 @@ impl FileFills {
     /// mapping).
     pub fn read(&self, from: u64, bytes: u64, into: &mut Vec<u8>) -> Result<()> {
         use std::os::unix::fs::FileExt;
-        into.resize(usize::try_from(bytes).unwrap_or(usize::MAX), 0);
+        let bytes = usize::try_from(bytes).unwrap_or(usize::MAX);
+        if into.len() < bytes {
+            into.resize(bytes, 0);
+        }
         self.file
             .file()
-            .read_exact_at(into, from)
+            .read_exact_at(&mut into[..bytes], from)
             .map_err(|why| Fault::Mapped {
                 step: "read",
                 what: self.file.path().display().to_string(),
@@ -710,15 +760,24 @@ impl Cache {
     /// `pool` (base address and the byte offset of a slot ref), the others
     /// read their weight in place. The caller has drained every frame.
     fn stage(&mut self, pool: Option<(u64, SlotAt<'_>)>) -> Result<()> {
+        // Each atom's slot's address in the pool, found once for every
+        // plane that reads it.
+        let mut placed: Vec<Option<u64>> = vec![None; self.slots.len()];
+        if let Some((base, offset)) = pool {
+            for (at, slot) in self.slots.iter().enumerate() {
+                if let Some(slot) = *slot {
+                    placed[at] = Some(base + offset(slot)?);
+                }
+            }
+        }
         for (k, (table, _)) in self.tables.iter_mut().enumerate() {
             let plane = &self.shape.planes[k];
             let host = self.hosts[k].as_ref();
             let mut bytes = Vec::with_capacity(plane.entries as usize * 8);
             for entry in 0..plane.entries {
-                let slot = self.slots[(plane.atom + entry) as usize];
-                let address = match (slot, pool) {
-                    (Some(slot), Some((base, offset))) => base + offset(slot)? + plane.at,
-                    _ => {
+                let address = match placed[(plane.atom + entry) as usize] {
+                    Some(at) => at + plane.at,
+                    None => {
                         let Some(host) = host else {
                             return Err(Fault::Unbound {
                                 what: format!(
@@ -787,7 +846,12 @@ impl Cache {
                     continue;
                 }
                 if let Some((_, at)) = &host.file {
-                    file_fills.push((at + plane.entry_at(entry), to + plane.at, bytes));
+                    FileRun::push(
+                        &mut file_fills,
+                        at + plane.entry_at(entry),
+                        to + plane.at,
+                        bytes,
+                    );
                     continue;
                 }
                 frame.copy(
@@ -806,7 +870,7 @@ impl Cache {
             {
                 fills.push(FileFills {
                     file: std::sync::Arc::clone(file),
-                    fills: file_fills,
+                    runs: file_fills,
                 });
             }
         }
@@ -1001,5 +1065,58 @@ mod tests {
         assert_eq!(expert.entry_at(5), 80 + 24);
         assert_eq!(expert.entry_bytes(3), 8, "the last piece holds one row");
         assert_eq!(expert.entry_bytes(7), 8);
+    }
+
+    #[test]
+    fn file_runs_fold_entries_a_slot_apart_and_break_where_either_side_jumps() {
+        let mut runs = Vec::new();
+        // Three entries of 16 bytes, read back to back, written 100 apart.
+        for k in 0..3u64 {
+            FileRun::push(&mut runs, 1000 + 16 * k, 5000 + 100 * k, 16);
+        }
+        // The pool jumps (the next chunk): a new run.
+        FileRun::push(&mut runs, 1048, 9000, 16);
+        // The file jumps: a new run.
+        FileRun::push(&mut runs, 2000, 9100, 16);
+        // A shorter last entry: a new run.
+        FileRun::push(&mut runs, 2016, 9200, 8);
+        assert_eq!(
+            runs,
+            vec![
+                FileRun {
+                    from: 1000,
+                    to: 5000,
+                    len: 16,
+                    count: 3,
+                    stride: 100
+                },
+                FileRun {
+                    from: 1048,
+                    to: 9000,
+                    len: 16,
+                    count: 1,
+                    stride: 16
+                },
+                FileRun {
+                    from: 2000,
+                    to: 9100,
+                    len: 16,
+                    count: 1,
+                    stride: 16
+                },
+                FileRun {
+                    from: 2016,
+                    to: 9200,
+                    len: 8,
+                    count: 1,
+                    stride: 8
+                },
+            ]
+        );
+        let entries: Vec<(u64, u64)> = runs
+            .iter()
+            .flat_map(|r| (0..r.count).map(move |k| (r.from + k * r.len, r.to + k * r.stride)))
+            .collect();
+        assert_eq!(entries[..3], [(1000, 5000), (1016, 5100), (1032, 5200)]);
     }
 }
