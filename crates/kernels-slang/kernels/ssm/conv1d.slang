@@ -117,17 +117,26 @@ void y_put(uint row, uint chans, uint c, float2 v) {
 }
 
 // The slot's `hist` rows of channels `c`, `c + 1` (column `at.col`).
+// A slot's history lies in the slot, so in one segment: found once.
 void past_load(Column at, int hist, out float2 past[HIST_MAX]) {
-    for (int s = 0; s < hist; s++) {
-        uint i = at.slab + uint(s) * at.pitch + at.col;
-        past[s] = float2(state[i], state[i + 1u]);
+    uint seg, first;
+    pie_pool_at(params.state_origin + at.slab, seg, first);
+#define CONV_PAST_LOAD(buf_) \
+    for (int s = 0; s < hist; s++) { \
+        uint i = first + uint(s) * at.pitch + at.col; \
+        past[s] = float2(buf_[i], buf_[i + 1u]); \
     }
+    PIE_POOL_ON_RW(seg, CONV_PAST_LOAD)
 }
 
 void past_put(Column at, int s, float2 v) {
-    uint i = at.slab + uint(s) * at.pitch + at.col;
-    state[i] = v.x;
-    state[i + 1u] = v.y;
+    uint seg, first;
+    pie_pool_at(params.state_origin + at.slab, seg, first);
+    uint i = first + uint(s) * at.pitch + at.col;
+#define CONV_PAST_PUT(buf_) \
+    buf_[i] = v.x; \
+    buf_[i + 1u] = v.y;
+    PIE_POOL_ON_RW(seg, CONV_PAST_PUT)
 }
 
 #if defined(PIE_COMMITTED) || defined(PIE_CHUNKED)

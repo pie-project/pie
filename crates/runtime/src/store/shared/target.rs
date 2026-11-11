@@ -9,7 +9,7 @@ use std::time::Duration;
 
 use tokio::sync::Notify;
 
-use super::{SegmentMove, Shared};
+use super::{RungStep, RungWalk, SegmentMove, Shared, SharedPool};
 use crate::governor::{Demand, Growth, PoolTarget, Retarget};
 use crate::scheduler::worker::PoolOp;
 use crate::store::registry;
@@ -29,6 +29,10 @@ pub struct SharedGrow {
     refused: Arc<AtomicBool>,
     /// The last shrink found no room.
     no_room: Arc<AtomicBool>,
+    /// The activation rung the governor wants, in tokens (`u32::MAX`: the
+    /// largest), and the walk toward it (SPEC decision 6).
+    rung_goal: Arc<AtomicU32>,
+    rung_walk: Arc<std::sync::Mutex<RungWalk>>,
 }
 
 impl SharedGrow {
@@ -44,6 +48,109 @@ impl SharedGrow {
             wake: Arc::new(Notify::new()),
             refused: Arc::new(AtomicBool::new(false)),
             no_room: Arc::new(AtomicBool::new(false)),
+            rung_goal: Arc::new(AtomicU32::new(u32::MAX)),
+            rung_walk: Arc::new(std::sync::Mutex::new(RungWalk::default())),
+        }
+    }
+
+    /// The rung the governor wants: the next smaller than it wants now
+    /// (`down`), or the largest.
+    fn want_rung(&self, down: bool) {
+        let goal = if down {
+            let pool = self.shared.lock().unwrap();
+            let now = self.rung_goal.load(Ordering::Acquire).min(pool.rung());
+            let rungs = pool.rungs();
+            rungs
+                .iter()
+                .copied()
+                .filter(|&rung| rung < now)
+                .max()
+                .unwrap_or_else(|| rungs.first().copied().unwrap_or(u32::MAX))
+        } else {
+            u32::MAX
+        };
+        if self.rung_goal.swap(goal, Ordering::AcqRel) != goal {
+            tracing::debug!(engine = self.engine, goal, "the activation rung's goal");
+            self.wake.notify_one();
+        }
+    }
+
+    /// Steps the activation rung toward the governor's goal until there or
+    /// until a step has to wait: caps fires, lowers the pool's rung once no
+    /// wider fire is in flight, or raises it, the engine first copying the
+    /// state out of the larger span.
+    async fn walk_rung(&self) {
+        loop {
+            let goal = self.rung_goal.load(Ordering::Acquire);
+            let (current, retired) = self.epochs();
+            let step = {
+                let mut pool = self.shared.lock().unwrap();
+                pool.pool_mut().retire_through(retired);
+                self.rung_walk.lock().unwrap().step(
+                    &pool,
+                    goal,
+                    super::fire_cap(self.engine),
+                    super::rung_granted(self.engine),
+                    current,
+                    retired,
+                )
+            };
+            let step = match step {
+                Ok(step) => step,
+                Err(error) => {
+                    tracing::debug!(engine = self.engine, %error, "the activation rung waits");
+                    return;
+                }
+            };
+            match step {
+                RungStep::Wait => return,
+                RungStep::Cap(tokens) => {
+                    tracing::info!(
+                        engine = self.engine,
+                        tokens,
+                        "fires cut to the activation rung"
+                    );
+                    super::set_fire_cap(self.engine, tokens);
+                }
+                RungStep::Lower(rung) => {
+                    let lowered = self.shared.lock().unwrap().lower_rung(rung);
+                    if let Err(error) = lowered {
+                        tracing::warn!(engine = self.engine, %error, "the activation rung stays");
+                        return;
+                    }
+                    tracing::info!(engine = self.engine, rung, "the activation rung is lowered");
+                    if let Some(planner) = crate::planner::planner_for(self.model, self.engine) {
+                        planner.pages_freed();
+                    }
+                }
+                RungStep::Raise { rung, evacuation } => {
+                    if !evacuation.moves.is_empty() {
+                        let moves = SharedPool::rung_moves(&evacuation);
+                        let copied =
+                            crate::scheduler::pool(self.engine, PoolOp::Evacuate(moves)).await;
+                        if let Err(error) = copied {
+                            tracing::warn!(engine = self.engine, %error, "a rung's evacuation was refused");
+                            return;
+                        }
+                    }
+                    let (current, _) = self.epochs();
+                    let applied = self
+                        .shared
+                        .lock()
+                        .unwrap()
+                        .apply_rung(&evacuation, current.saturating_add(1));
+                    if let Err(error) = applied {
+                        tracing::warn!(engine = self.engine, %error, "the activation rung stays");
+                        return;
+                    }
+                    tracing::info!(
+                        engine = self.engine,
+                        rung,
+                        moved = evacuation.moves.len(),
+                        "the activation rung is raised"
+                    );
+                }
+            }
         }
     }
 
@@ -130,6 +237,7 @@ impl SharedGrow {
 
     /// Steps toward the goal until there, or until a move has to wait.
     async fn walk(&self) {
+        self.walk_rung().await;
         loop {
             let goal = self.goal();
             let (current, retired) = self.epochs();
@@ -239,11 +347,14 @@ impl PoolTarget for SharedGrow {
         self.refused.swap(false, Ordering::AcqRel)
     }
 
-    /// Fires keep the largest rung: the scheduler does not cap a fire's
-    /// tokens by rung yet, so state never takes the top span and no rung
-    /// moves. [`super::SharedPool::lower_rung`] and
-    /// [`super::SharedPool::raise_rung`] are ready for when it does.
-    fn shrink_rung(&mut self) {}
+    /// Critical: fires take the next smaller activation rung, the walk
+    /// capping them first and lowering the pool's rung behind them.
+    fn shrink_rung(&mut self) {
+        self.want_rung(true);
+    }
 
-    fn restore_rung(&mut self) {}
+    /// Settled: back to the largest rung.
+    fn restore_rung(&mut self) {
+        self.want_rung(false);
+    }
 }

@@ -481,6 +481,23 @@ impl Engine for Vulkan {
         self.loaded_mut()?.copy_slots(copy).map_err(fault)
     }
 
+    fn read_tier_slots(
+        &mut self,
+        slots: &[(engine::chunk::ShapeId, Vec<u32>)],
+    ) -> EngineResult<Vec<u8>> {
+        self.loaded_mut()?.read_tier_slots(slots).map_err(fault)
+    }
+
+    fn write_tier_slots(
+        &mut self,
+        slots: &[(engine::chunk::ShapeId, Vec<u32>)],
+        bytes: &[u8],
+    ) -> EngineResult<()> {
+        self.loaded_mut()?
+            .write_tier_slots(slots, bytes)
+            .map_err(fault)
+    }
+
     fn weight_residency(&mut self, residency: &engine::chunk::WeightResidency) -> EngineResult<()> {
         self.loaded_mut()?
             .weight_residency(residency)

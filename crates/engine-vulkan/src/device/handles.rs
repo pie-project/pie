@@ -18,6 +18,13 @@ impl Binding {
         &self.slab
     }
 
+    /// The first `len` bytes this binding names, read back.
+    pub fn read(&self, len: u64) -> Result<Vec<u8>> {
+        let mut out = vec![0u8; usize::try_from(len).unwrap_or(usize::MAX)];
+        self.slab.read(self.offset, &mut out)?;
+        Ok(out)
+    }
+
     #[must_use]
     pub fn offset(&self) -> u64 {
         self.offset
@@ -97,9 +104,7 @@ impl Handles {
         let binding = self.get(handle).ok_or_else(|| Fault::Unbound {
             what: format!("handle {handle}, which no row answers"),
         })?;
-        let mut out = vec![0u8; usize::try_from(len).unwrap_or(usize::MAX)];
-        binding.slab().read(binding.offset(), &mut out)?;
-        Ok(out)
+        binding.read(len)
     }
 
     pub fn cut(&self, handle: u32, skip: u64, len: u64) -> Result<u32> {

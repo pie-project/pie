@@ -5,6 +5,8 @@ pub enum StarveCause {
     NoSwapRoom,
     NoEligibleVictim,
     NoRsSlots,
+    /// The victim alone holds what the pool holds, and nothing of it runs.
+    SoleHolder,
 }
 
 impl StarveCause {
@@ -16,6 +18,12 @@ impl StarveCause {
             StarveCause::NoEligibleVictim => {
                 "no evictable victim — every page is held by a process OLDER \
                  than the head, which FCFS anti-thrash forbids evicting"
+            }
+            StarveCause::SoleHolder => {
+                "this process alone holds what the pool holds and nothing of it is running \
+                 to free any: its parked ask cannot be placed beside what it holds, and a \
+                 restart would replay the same asks into the same wall — run fewer lanes at \
+                 once or raise device_kv_budget"
             }
             StarveCause::NoRsSlots => {
                 "every RS folded slot is held and no admitted process is still \
@@ -42,6 +50,18 @@ pub enum PlannerError {
     Hog {
         need: u32,
         held: u32,
+        total: u32,
+    },
+    /// One process's pages and its parked asks together past the pool:
+    /// what it waits on is only its own, so no eviction of others and no
+    /// restart (which asks for the same again) makes the room.
+    /// `held` and `need` are kv pages; `state` is the kv pages the chunks
+    /// of its state, held and asked, would hold on a shared pool (else 0).
+    Overcommit {
+        asks: u32,
+        need: u32,
+        held: u32,
+        state: u32,
         total: u32,
     },
     Starved {
@@ -87,6 +107,32 @@ impl std::fmt::Display for PlannerError {
                 "KV pool exhausted by this process alone: it holds {held} pages and asks \
                  {need} more of a {total}-page pool — no eviction of others can cover it"
             ),
+            PlannerError::Overcommit {
+                asks,
+                need,
+                held,
+                state,
+                total,
+            } => {
+                let sum = held.saturating_add(*need).saturating_add(*state);
+                write!(
+                    f,
+                    "KV pool too small for this process's concurrent asks: it holds {held} kv \
+                     pages and its {asks} parked ask(s) need {need} more"
+                )?;
+                if *state > 0 {
+                    write!(
+                        f,
+                        ", and its state (held and asked) takes {state} pages' worth"
+                    )?;
+                }
+                write!(
+                    f,
+                    ": {sum} of a {total}-page pool even with every other holder evicted, so no \
+                     eviction or restart (which asks for the same again) can make room — run \
+                     fewer lanes at once or raise device_kv_budget"
+                )
+            }
             PlannerError::Starved {
                 need,
                 free,

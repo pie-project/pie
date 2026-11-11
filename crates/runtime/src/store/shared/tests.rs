@@ -2014,3 +2014,110 @@ fn a_shared_pools_scale_is_its_list_slot_and_its_record() {
     );
     assert_eq!(SharedPool::scale_of(&ChunkFacts::default()), None);
 }
+
+/// SPEC decision 6, the governor's rung shrink: under critical pressure the
+/// walk caps fires to the smaller rung first, lowers the pool's rung only
+/// once the scheduler has no wider step in flight and every fire handed out
+/// by then has retired, and state may then take the span above it. Settled,
+/// it moves that state back out (the engine copying it before the next
+/// fire), takes the largest rung and lifts the cap.
+#[test]
+fn the_rung_walk_caps_fires_then_lowers_and_raises_back_with_an_evacuation() {
+    let facts = facts();
+    let mut pool = pool();
+    let mut engine = FakeEngine::new();
+    assert_eq!(pool.steer(8, 0, &mut engine), Retarget::Reached);
+    let mut walk = RungWalk::default();
+    assert_eq!(pool.rungs(), [16, 256, 2048]);
+    assert_eq!(pool.rung(), 2048);
+    // Down to 256: the cap comes first.
+    assert_eq!(
+        walk.step(&pool, 256, u32::MAX, u32::MAX, 5, 5).unwrap(),
+        RungStep::Cap(256)
+    );
+    // A wider step may still be in flight: wait for the scheduler's grant.
+    assert_eq!(
+        walk.step(&pool, 256, 256, u32::MAX, 5, 5).unwrap(),
+        RungStep::Wait
+    );
+    // Granted at fire 7: wait until fire 7 retires.
+    assert_eq!(
+        walk.step(&pool, 256, 256, 256, 7, 5).unwrap(),
+        RungStep::Wait
+    );
+    assert_eq!(
+        walk.step(&pool, 256, 256, 256, 8, 6).unwrap(),
+        RungStep::Wait
+    );
+    assert_eq!(
+        walk.step(&pool, 256, 256, 256, 9, 7).unwrap(),
+        RungStep::Lower(256)
+    );
+    pool.lower_rung(256).unwrap();
+    assert_eq!(pool.rung(), 256);
+    assert_eq!(
+        pool.pool().state_limit(),
+        TOTAL - 4,
+        "state may take the span above"
+    );
+    assert_eq!(
+        walk.step(&pool, 256, 256, 256, 9, 9).unwrap(),
+        RungStep::Wait
+    );
+    // State takes the span the larger rung's fires would touch.
+    let all = pool
+        .take_records(pool.records_available() as usize)
+        .unwrap();
+    let kept: Vec<u32> = all[all.len() - 6..].to_vec();
+    pool.give_records(&all[..all.len() - 6]);
+    let in_way = |pool: &SharedPool| {
+        kept.iter()
+            .flat_map(|&r| pool.record_slots(r))
+            .filter(|slot| pool.pool().physical(slot.chunk).unwrap() >= TOTAL - 12)
+            .count()
+    };
+    assert!(in_way(&pool) > 0);
+    // Settled: raise, the evacuation first, then lift the cap.
+    let RungStep::Raise { rung, evacuation } = walk.step(&pool, u32::MAX, 256, 256, 9, 9).unwrap()
+    else {
+        panic!("a raise");
+    };
+    assert_eq!(rung, 2048);
+    assert!(!evacuation.moves.is_empty(), "state in the span moves out");
+    use super::SegmentPort;
+    engine
+        .evacuate(&SharedPool::rung_moves(&evacuation))
+        .unwrap();
+    pool.apply_rung(&evacuation, 10).unwrap();
+    assert_eq!(pool.rung(), 2048);
+    assert_eq!(in_way(&pool), 0);
+    assert_eq!(engine.table.as_slice(), pool.pool().chunk_table());
+    for &record in &kept {
+        let lane = Lane {
+            tokens: vec![1],
+            fixed: pool.lane_fixed(record, record),
+            ..Lane::default()
+        };
+        engine.fire(&facts, &lane, 12);
+    }
+    assert_eq!(
+        walk.step(&pool, u32::MAX, 256, 256, 10, 9).unwrap(),
+        RungStep::Cap(u32::MAX),
+        "the largest rung: no cap"
+    );
+    assert_eq!(
+        walk.step(&pool, u32::MAX, u32::MAX, u32::MAX, 10, 10)
+            .unwrap(),
+        RungStep::Wait
+    );
+    // A goal between rungs takes the rung under it; below the smallest, the
+    // smallest.
+    assert_eq!(
+        walk.step(&pool, 300, u32::MAX, u32::MAX, 10, 10).unwrap(),
+        RungStep::Cap(256)
+    );
+    assert_eq!(
+        walk.step(&pool, 1, u32::MAX, u32::MAX, 10, 10).unwrap(),
+        RungStep::Cap(16)
+    );
+}

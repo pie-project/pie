@@ -35,7 +35,56 @@
         v -= s; \
         if (v < s) { return pie_seg2[v]; } \
         return pie_seg3[v - s]; \
-    }
+    } \
+    /* The segment virtual element `v` lies in, and its index there: what */ \
+    /* `pie_pool_get` reads, found once for a span inside one segment. */ \
+    void pie_pool_at(uint v, out uint seg, out uint local) { \
+        uint s = (seg_); \
+        seg = 0u; \
+        if (PIE_POOL_CHAINED) { \
+            local = v; \
+            return; \
+        } \
+        if (v >= s) { \
+            v -= s; \
+            seg = 1u; \
+            if (v >= s) { \
+                v -= s; \
+                seg = 2u; \
+                if (v >= s) { \
+                    v -= s; \
+                    seg = 3u; \
+                } \
+            } \
+        } \
+        local = v; \
+    } \
+    struct pie_pool_chain_ro { \
+        __subscript(uint i)->type_ { \
+            get { return pie_pool_get(i); } \
+        } \
+    }; \
+    static pie_pool_chain_ro pie_pool_chain;
+
+// `body_(buffer)` with the segment `seg_` names as `buffer`: a span that
+// lies in one segment (a page never straddles a chunk, nor a chunk two
+// segments) reads it with no comparison chain an element. WGSL reads the
+// four bindings slower through a branch than through the chain an element,
+// so there `pie_pool_at` keeps the virtual index and the body reads the
+// chain (`PIE_POOL_ON_RW` for a body that writes too).
+#if defined(PIE_WGSL)
+#define PIE_POOL_CHAINED true
+#define PIE_POOL_ON(seg_, body_) { body_(pie_pool_chain) }
+#define PIE_POOL_ON_RW(seg_, body_) { body_(pie_pool_chain_rw) }
+#else
+#define PIE_POOL_CHAINED false
+#define PIE_POOL_ON(seg_, body_) \
+    if ((seg_) == 0u) { body_(pie_seg0) } \
+    else if ((seg_) == 1u) { body_(pie_seg1) } \
+    else if ((seg_) == 2u) { body_(pie_seg2) } \
+    else { body_(pie_seg3) }
+#define PIE_POOL_ON_RW(seg_, body_) PIE_POOL_ON(seg_, body_)
+#endif
 
 #define PIE_POOL_WRITE(type_, seg_) \
     void pie_pool_set(uint v, type_ x) { \
@@ -46,7 +95,14 @@
         v -= s; \
         if (v < s) { pie_seg2[v] = x; return; } \
         pie_seg3[v - s] = x; \
-    }
+    } \
+    struct pie_pool_chain_rw_t { \
+        __subscript(uint i)->type_ { \
+            get { return pie_pool_get(i); } \
+            set { pie_pool_set(i, newValue); } \
+        } \
+    }; \
+    static pie_pool_chain_rw_t pie_pool_chain_rw;
 
 // A record cut into pieces (SPEC 4: a fixed row larger than a slot is cut on
 // its atom axis into equal pieces, each in a slot of its own at one common

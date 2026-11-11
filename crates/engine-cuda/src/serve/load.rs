@@ -1012,14 +1012,33 @@ impl Shell {
         pools.seat_experts(&hosts, &groups)?;
         // Committed whole: a fire reading out past one row a lane (a verify
         // reads every row) would otherwise grow it outside the fit.
-        let mut arena = Arena::reserve(arena_bytes);
         let unscored = compiled.arena.scores_from(&boot.trace).max(
             compiled
                 .arena_forked
                 .as_ref()
                 .map_or(0, |forked| forked.scores_from(&boot.trace)),
         );
+        // The activation rungs a pool may drop to (SPEC decision 6), each a
+        // bucket's carve laid at the reservation's end.
+        let rungs = activation_rungs(&boot.trace, &budgets, &compiled)?;
+        eprintln!(
+            "engine-cuda: activation rungs {:?} under an arena of {arena_bytes} bytes",
+            rungs
+                .iter()
+                .map(|(tokens, map)| (*tokens, map.bytes))
+                .collect::<Vec<_>>(),
+        );
+        // What each carve laid at the end reads before its scores.
+        let prefixes: Vec<(u64, u64)> = std::iter::once(&compiled.arena)
+            .chain(compiled.arena_forked.as_ref())
+            .chain(rungs.iter().map(|(_, map)| map))
+            .map(|map| (map.bytes, map.scores_from(&boot.trace)))
+            .collect();
+        let mut arena = Arena::reserve(arena_bytes).with_rungs(rungs, prefixes);
         arena.ensure(&mut pools, unscored)?;
+        if arena.has_rungs() {
+            pools.fit_range_whole();
+        }
         let predicate = crate::store::rs::Predicate::reserve(
             boot.budget.max_lanes,
             crate::store::rs::snapshots(&boot.trace, |k_dim| {
@@ -1352,8 +1371,12 @@ impl Shell {
         let fitted = shell.pools.fit_the_card(
             bodies,
             held_for_fires.saturating_add(scratch_growth),
+            false,
             &resident,
         )?;
+        // The carves laid at the activation's end, backed where the range
+        // now lies (the fit may have reserved it anew).
+        shell.arena.ensure_rungs(&mut shell.pools)?;
         if fitted.bodies < bodies {
             eprintln!(
                 "engine-cuda: [engine] bodies_mem {} MiB is held down to {} MiB on this card: \
@@ -1416,7 +1439,12 @@ impl Staged {
         }
         shell.arm_bodies()?;
         let resident = footprint(&shell, device_total, free_before);
-        let fitted = shell.pools.fit_the_card(0, held_for_fires, &resident)?;
+        // Arming fired every composition, so the activation is at its high
+        // water; a load that records no bodies has fired none yet.
+        let settled = shell.records_bodies();
+        let fitted = shell
+            .pools
+            .fit_the_card(0, held_for_fires, settled, &resident)?;
         if arm_trace {
             eprintln!(
                 "[arm-trace] cache rows sized to {} pages ({} MiB, {} sequences at the declared \
@@ -1800,4 +1828,37 @@ fn walk_fire_fit(trace: &poem_ir::Trace, rows: u32, sms: u32) -> Option<u32> {
         })
         .max()?;
     Some((sms / heads.max(1)).max(1) * rows)
+}
+
+/// The activation rungs below the largest (SPEC decision 6): for each of
+/// [`poem_compiler::ACTIVATION_RUNGS`], the largest bucket at most that
+/// many tokens and its carve, where that carve is smaller than the arena
+/// for every fire. Smallest first.
+fn activation_rungs(
+    trace: &poem_ir::Trace,
+    budgets: &Budgets,
+    compiled: &CompiledModel,
+) -> Result<Vec<(u32, poem_compiler::ArenaMap)>> {
+    let max = budgets.tokens.max_tokens;
+    let mut tokens: Vec<u32> = poem_compiler::ACTIVATION_RUNGS
+        .iter()
+        .filter_map(|&rung| {
+            budgets
+                .tokens
+                .buckets
+                .iter()
+                .copied()
+                .filter(|&bucket| bucket <= rung && bucket < max)
+                .max()
+        })
+        .collect();
+    tokens.dedup();
+    let mut rungs = Vec::new();
+    for rung in tokens {
+        let map = poem_compiler::arena_rung(trace, budgets, compiled, rung)?;
+        if map.bytes < compiled.arena.bytes {
+            rungs.push((rung, map));
+        }
+    }
+    Ok(rungs)
 }

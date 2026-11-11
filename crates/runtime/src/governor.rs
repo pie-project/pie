@@ -57,9 +57,27 @@ impl System for Silent {
     }
 }
 
+/// A test hook: while the file `PIE_PRESSURE_FILE` names says `critical`,
+/// `congested` or `calm`, that is how the system is read, so a test can
+/// induce pressure mid-run; anything else reads calm.
+struct Told(std::path::PathBuf);
+
+impl System for Told {
+    fn read(&mut self) -> Pressure {
+        match std::fs::read_to_string(&self.0).as_deref().map(str::trim) {
+            Ok("critical") => Pressure::Critical,
+            Ok("congested") => Pressure::Congested,
+            _ => Pressure::Calm,
+        }
+    }
+}
+
 /// This platform's reader.
 #[must_use]
 pub fn system() -> Box<dyn System> {
+    if let Some(path) = std::env::var_os("PIE_PRESSURE_FILE") {
+        return Box::new(Told(path.into()));
+    }
     #[cfg(target_os = "macos")]
     return Box::<macos::Watch>::default();
     #[cfg(not(target_os = "macos"))]

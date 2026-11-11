@@ -25,6 +25,13 @@
 //! staging is the one road on both engines. A fire with every expert
 //! resident flushes and stages nothing, and the stage is given back.
 //!
+//! A staged fire records like any other (Vulkan): each flush of a kept frame
+//! ends a segment of the recording, and the stage's host step ([`Cut`]: the
+//! routes it read, the layer it staged) is kept beside it, so a replay
+//! submits a segment, waits, stages that layer's misses again and goes on.
+//! The stage and its table are buffers that stand across fires; a recording
+//! stands while the layers with an expert in no slot do.
+//!
 //! Each route counts a use of its expert (at the layer's first bank), which
 //! [`ExpertCaches::uses`] reports.
 
@@ -282,6 +289,25 @@ impl Cache {
 /// width, cache, layer, region, run)`.
 pub type StageKey = (u32, u32, u32, usize, usize, u32, u32);
 
+/// A walk's expert stages: the layer staged last (once a layer of a fire),
+/// and, in order, each stage's host step, which a recorded fire's replay
+/// repeats between the segments its flushes cut.
+#[derive(Default)]
+pub struct Staged {
+    pub last: Option<StageKey>,
+    pub cuts: Vec<Cut>,
+}
+
+/// One stage's host step: the routes of layer `layer` of cache `cache`,
+/// `bytes` of them where `routes` lies.
+#[derive(Clone)]
+pub struct Cut {
+    cache: usize,
+    layer: usize,
+    routes: crate::device::Binding,
+    bytes: u64,
+}
+
 /// The load's routed experts.
 #[derive(Debug)]
 pub struct ExpertCaches {
@@ -339,10 +365,19 @@ impl ExpertCaches {
         self.caches.iter().map(|c| c.shape.facts()).collect()
     }
 
-    /// Whether every expert of every shape is resident: no fire stages.
+    /// Each layer of each shape with an expert no slot holds: a fire stages
+    /// at those, a recording cut a segment at each.
     #[must_use]
-    pub fn whole(&self) -> bool {
-        self.caches.iter().all(|c| !c.slots.contains(&NOT_HELD))
+    pub fn staged_layers(&self) -> Vec<bool> {
+        self.caches
+            .iter()
+            .flat_map(|c| {
+                c.shape.layers.iter().map(|layer| {
+                    let first = layer.first as usize;
+                    c.slots[first..first + layer.experts as usize].contains(&NOT_HELD)
+                })
+            })
+            .collect()
     }
 
     #[must_use]
@@ -653,7 +688,7 @@ impl ExpertCaches {
         planes: [Option<usize>; 4],
         routes: Tensor,
         at: (u32, u32),
-        read: &std::cell::RefCell<Option<StageKey>>,
+        read: &std::cell::RefCell<Staged>,
         pool: kernels_slang::Segments,
     ) -> Result<Option<ExpertTable>> {
         let Some(lead) = planes.iter().flatten().next() else {
@@ -689,9 +724,11 @@ impl ExpertCaches {
         let missing = cache.slots[first..first + layer.experts as usize].contains(&NOT_HELD);
         if missing {
             let key: StageKey = (routes.buf, routes.rows, routes.width, c, l, at.0, at.1);
-            if *read.borrow() != Some(key) {
-                self.stage(handles, host, host_planes, cache, layer, routes)?;
-                *read.borrow_mut() = Some(key);
+            if read.borrow().last != Some(key) {
+                let cut = self.stage(handles, host, host_planes, (c, l), routes)?;
+                let mut read = read.borrow_mut();
+                read.last = Some(key);
+                read.cuts.push(cut);
             }
         }
         let bind = |buffer: &Buffer, len: u64| -> Result<Tensor> {
@@ -723,23 +760,56 @@ impl ExpertCaches {
     }
 
     /// Lands the frame so far, reads `routes` back and stages each expert
-    /// of `layer` they name that no slot holds, a seat each.
+    /// of layer `at` (cache, layer) they name that no slot holds, a seat
+    /// each. The step's [`Cut`], for a replay to repeat.
     fn stage(
         &self,
         handles: &Handles,
         host: &HostTier,
         host_planes: &BTreeMap<usize, &HostPlane>,
-        cache: &Cache,
-        layer: &Layer,
+        at: (usize, usize),
         routes: Tensor,
+    ) -> Result<Cut> {
+        crate::probe::with_frame(Frame::flush_settled)
+            .ok_or_else(|| Fault::Residency("no frame is recording on this thread".into()))??;
+        let binding = handles.get(routes.buf).ok_or_else(|| Fault::Unbound {
+            what: format!("handle {}, the routes of a staged layer", routes.buf),
+        })?;
+        let cut = Cut {
+            cache: at.0,
+            layer: at.1,
+            routes: binding.clone(),
+            bytes: u64::from(routes.rows) * u64::from(routes.width) * 4,
+        };
+        drop(binding);
+        self.stage_cut(host, host_planes, &cut)?;
+        Ok(cut)
+    }
+
+    /// The host step of `cut`: reads its routes and stages each expert of
+    /// its layer they name that no slot holds. Every fire that reads the
+    /// stage has landed (the caller flushed, or waited on the segment
+    /// before).
+    pub fn stage_cut(
+        &self,
+        host: &HostTier,
+        host_planes: &BTreeMap<usize, &HostPlane>,
+        cut: &Cut,
     ) -> Result<()> {
+        let cache = self.caches.get(cut.cache).ok_or_else(|| Fault::Unbound {
+            what: format!("expert shape {} of a recorded stage", cut.cache),
+        })?;
+        let layer = cache
+            .shape
+            .layers
+            .get(cut.layer)
+            .ok_or_else(|| Fault::Unbound {
+                what: format!("layer {} of a recorded stage", cut.layer),
+            })?;
         let stage = cache.stage.as_ref().ok_or_else(|| Fault::Unbound {
             what: "the stage of an expert shape not wholly resident".into(),
         })?;
-        crate::probe::with_frame(Frame::flush_settled)
-            .ok_or_else(|| Fault::Residency("no frame is recording on this thread".into()))??;
-        let n = u64::from(routes.rows) * u64::from(routes.width);
-        let raw = handles.read(routes.buf, n * 4)?;
+        let raw = cut.routes.read(cut.bytes)?;
         let mut seated: BTreeMap<u32, u32> = BTreeMap::new();
         for word in raw.as_chunks::<4>().0 {
             let e = i32::from_le_bytes(*word);

@@ -724,3 +724,144 @@ async fn a_short_restore_fails_at_the_seat_deadline_instead_of_waiting_forever()
     assert!(!said.lock().is_empty(), "it said so while it waited");
     assert_eq!(planner.diagnostics().queue.len(), 0, "off the queue");
 }
+
+/// text-completion-bench, Qwen3.5 at 128 MiB: on a shared pool a lane's
+/// state takes chunks its kv would, and eight lanes' state and prompts were
+/// past the 450 pages the pool leaves while each ask alone fit. A process's
+/// asks are weighed with their state in the pages its chunks hold.
+#[test]
+fn a_process_whose_lanes_state_is_past_a_shared_pool_is_overcommitted() {
+    let _schedule = crate::policy::schedule::TEST_LOCK.blocking_read();
+    const MIB: u64 = 1 << 20;
+    let room = crate::store::shared::PoolRoom {
+        chunk_bytes: 10 * MIB,
+        total_chunks: 12,
+        reserved_chunks: 1,
+        act_chunks: 1,
+        weight_chunks: 0,
+        state_chunks: 10,
+        list_slots: 100,
+        list_tokens: 16,
+    };
+    // A state slot takes 30 pages' worth of chunks.
+    let slots = |slots| RsUnits {
+        slots,
+        ..RsUnits::default()
+    };
+    let pool = Arc::new(
+        KeptPool::new(0, 100, usize::MAX)
+            .dividing(room)
+            .sharing_state((slots(0), slots(3)), 30),
+    );
+    let planner = Arc::new(ResidencyPlanner::new(pool.clone() as Arc<dyn PoolPort>));
+    let pid = ProcessId::new_v4();
+    planner.register(pid);
+    planner.note_admitted(pid);
+    let lane = Demand {
+        kv_pages: 10,
+        rs: slots(1),
+    };
+    let park = || {
+        planner.with_inner(|inner| {
+            inner.enqueue(
+                pid,
+                super::wait::WaitKind::Allocation {
+                    demand: lane,
+                    notify: Arc::new(tokio::sync::Notify::new()),
+                    outcome: None,
+                    yielded: false,
+                },
+            )
+        })
+    };
+    park();
+    park();
+    assert!(!planner.check_overcommit(), "two lanes: 20 + 60 of 100");
+    let third = park();
+    assert!(planner.check_overcommit(), "three lanes: 30 + 90 of 100");
+    planner.with_inner(|inner| {
+        let super::wait::WaitKind::Allocation {
+            outcome: Some(Err(error)),
+            ..
+        } = &inner.queue[&third].kind
+        else {
+            panic!("the lanes' asks fail");
+        };
+        assert_eq!(
+            *error,
+            PlannerError::Overcommit {
+                asks: 3,
+                need: 30,
+                held: 0,
+                state: 90,
+                total: 100,
+            }
+        );
+        let said = error.to_string();
+        assert!(
+            said.contains(
+                "its state (held and asked) takes 90 pages' worth: 120 of a 100-page pool"
+            ),
+            "{said}"
+        );
+    });
+}
+
+/// text-completion-bench, 128 MiB: a restarted process's long lane had
+/// gathered 153 pages when it went, and every replay's first ask (three
+/// pages and a state slot) found them still gathered: covered in kv, short
+/// of state whose chunks those pages held, it was read as a wedge and
+/// restarted again, thousands of times. On a shared pool what is gathered
+/// past the head's own kv need goes back before it is funded otherwise.
+#[test]
+fn pages_gathered_past_the_head_s_need_go_back_for_its_state() {
+    let _schedule = crate::policy::schedule::TEST_LOCK.blocking_read();
+    let room = crate::store::shared::PoolRoom {
+        chunk_bytes: 1 << 20,
+        total_chunks: 4,
+        reserved_chunks: 1,
+        act_chunks: 1,
+        weight_chunks: 0,
+        state_chunks: 2,
+        list_slots: 6,
+        list_tokens: 16,
+    };
+    let slots = |slots| RsUnits {
+        slots,
+        ..RsUnits::default()
+    };
+    let pool = Arc::new(
+        KeptPool::new(6, 0, usize::MAX)
+            .dividing(room)
+            .sharing_state((slots(0), slots(2)), 3),
+    );
+    let port = pool.clone() as Arc<dyn PoolPort>;
+    let planner = Arc::new(ResidencyPlanner::new(port.clone()));
+    let pid = ProcessId::new_v4();
+    planner.register(pid);
+    planner.note_admitted(pid);
+    planner.with_inner(|inner| {
+        // What an earlier head gathered: every page.
+        let pages = port.reserve_device(6).expect("six free pages");
+        inner.accum = super::grant::DevicePageReservation::new(pages, port.clone());
+        inner.enqueue(
+            pid,
+            super::wait::WaitKind::Allocation {
+                demand: Demand {
+                    kv_pages: 2,
+                    rs: slots(1),
+                },
+                notify: Arc::new(tokio::sync::Notify::new()),
+                outcome: None,
+                yielded: false,
+            },
+        );
+    });
+    planner.plan();
+    assert_eq!(
+        planner.with_inner(|inner| inner.accum.len()),
+        2,
+        "the head's own pages stay gathered"
+    );
+    assert_eq!(pool.device_stats().0, 4, "the rest are free for its state");
+}
