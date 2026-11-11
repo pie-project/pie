@@ -140,7 +140,6 @@ impl Xla {
         &self.boot
     }
 
-    #[must_use]
     /// Programs built after the warm ladder ran (`[engine] prewarm`): each a
     /// serving fire that missed the ladder.
     #[must_use]
@@ -148,6 +147,7 @@ impl Xla {
         self.shell().map_or(0, |s| s.device().misses())
     }
 
+    #[must_use]
     pub fn shell(&self) -> Option<&Shell> {
         self.shell.as_ref()
     }
