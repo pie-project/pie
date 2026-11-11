@@ -1306,3 +1306,7 @@ The `new-memory/` directory is bookkeeping and is removed before anything lands 
   no stalls. The earlier 730 s / 297 s runs had accepted launch batches + a tracked kv copy uncompleted for 10-190 s
   from the first fires (not planner pressure) -- likely environmental or the rare engine hang also seen on main;
   looping under a stack probe to catch a recurrence.
+- gemma-4-E2B c64 on sm_120 (after M105): decode GPU work per fire identical to main per kernel (time-weighted ratio
+  0.998, same launches); ~1% mean gap (main ~6283 / 7 runs, new ~6215 / 5 runs; single runs overlap) comes from the
+  per-round prefill bucket mix (same armed key set as main) and per-run clock level under the 200 W cap. Closed as
+  noise-level; no kernel fix.
