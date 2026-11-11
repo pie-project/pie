@@ -1513,7 +1513,11 @@ impl FrameShell for Shell {
         super::btrace::mark("cuttable");
         // A class reading out readout rows reads its lanes' last rows; one
         // reading a row output reads every row of its rung, as the eager
-        // ceiling above lets it.
+        // ceiling above lets it. Every readout names one of the fire's rows,
+        // so the rows read out never pass its bucket: the rungs summed over
+        // the classes do (a mixed bucket-256 fire's two classes rung 256
+        // each), and the carve a fire of the bucket takes (the forked arena,
+        // an activation rung) holds no more readout rows than its tokens.
         let (last_rows, every_row) =
             ladder
                 .rungs()
@@ -1525,7 +1529,7 @@ impl FrameShell for Shell {
                         _ => (last + rung.min(lane_ceiling), every),
                     }
                 });
-        let readout_ceiling = last_rows.min(max_lanes) + every_row;
+        let readout_ceiling = (last_rows.min(max_lanes) + every_row).min(composition.bucket());
         let bodied = bodied
             && readout_rows.len() <= readout_ceiling as usize
             && composition.lane_count() <= crate::window::lane_capacity(max_lanes);
