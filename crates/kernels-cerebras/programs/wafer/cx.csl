@@ -1,0 +1,410 @@
+// wafer/cx.csl: the wafer program row control PE (CX_r) of the unit snake (README.md). One image
+// serves every unit row of every layer program: roles and colours are runtime words from the host
+// (rcfg), the layer's phases comptime params from the plan.
+//
+// Role. One a unit row: the row's x chunk (Hc f32, the residual), the norms' gammas, the root of the
+// row reductions (the row's weight PEs' o-projection and down partials), and the unit handoff of x
+// (in from the unit before, out to the next). In the wafer token loop, unit 0's CX rows take the
+// next token's embedding chunk (iq6) instead of the host's x after the first step. A layer's phases
+// by the input norm (NRM, as weight.csl's):
+// - NRM 0, direct: [x g1 | x's sum of squares] multicast (CY applies the rms scale after the column
+//   reduction); the o reduction in (both halves merged word by word through a FIFO and taken back
+//   over a loop-back colour) -> x += o; [x g2 | ssq] multicast; the down reduction in -> x += d.
+// - NRM 1, deferred (sandwich norms): the residual is x plus a pending term p whose scalar s (a
+//   sandwich norm's 1 / rms) is not known here yet. A layer's phases (attention, MLP, PLE 1: the PLE
+//   gate) each send the row's weight PEs [a = g x | b = g p | 4 partial sums] (Hc + Hc + 4 f32 words;
+//   sums: the pending |r|^2 for s, |x|^2, x.p, |p|^2, so CY gets rms(x + s p)) and take back [the
+//   reduction (Hc) | s] (the PE in column 0 adds s):
+//     attention:  g = input_layernorm;     back: o, s (the previous layer's):  x += s p, p = g_pa o
+//     MLP:        g = pre_feedforward;     back: d, s1:                     x += s1 p, p = g_pff d
+//     PLE gate:   g = 1 (sums [|d|^2, 0, 0, 0]); back: h, s2:              x += s2 p, p = g_ple h
+//   then x, p *= lambda. The handoff carries [x | p | |r|^2] (2 Hc + 1). The flush unit (the last)
+//   sends [|r|^2, 0, 0, 0] after its last layer, takes s back and sends x alone to the head (HG 1:
+//   by head groups: a group's members send their Hc words toward its root on a chain (oq5), each
+//   forwarding the words of the members beyond it (iq7, NFX words); the root sends its own and the
+//   forwarded words east; the token loop's embedding comes back the same way: the root keeps its Hc
+//   and forwards NFE words down the chain).
+// - NRM 2, scaled (an attention half west, a MoE half east): [x g 2^-S | 2^S | ssq] multicast to both
+//   halves (S = the exponent of the chunk's largest |x g| less 7, so the weight PEs' f16 copy cannot
+//   overflow); the o reduction in from the west -> x += o + bo; the down reduction in from the east,
+//   Hc words + [e | w] -> x += d + sum_k w_k bd[e_k].
+//
+// Interface. Exports x (f32 [Hc]; NRM 1 [x | p | |r|^2]), gam (NRM 0: f16 [layer][g1 | g2][Hc], the
+// host's 1 + w; NRM 1: f32 [layer][the phases' gammas | lambda] + the embedding scale; NRM 2: f32
+// [layer][g1 | g2][Hc]), (NRM 2) bo (f32 [layer][Hc]), bd (f32 [layer][expert][Hc]), xdbg / xred
+// (XKEEP 1: x after each layer, each reduction's sum), rcfg, tdbg, init, compute(steps, start_pos).
+// rcfg: [0] routes n, [1..1+2n); from RQ: [0..4) iq2..iq5, [4..7) oq2..oq4, [7] flags (bit 0 the
+// first unit: x from the host; bit 1 no handoff out; bit 2 the embedding return of the token loop;
+// NRM 1: bit 3 the flush unit, bit 4 x leaves alone, bit 5 a head-group root, bit 6 a member, bit 7
+// the embedding by the chain), [8] the spare colour, [9] iq6; (HG 1) [10] iq7, [11] oq5, [12] NFX,
+// [13] NFE.
+// Queues: iq2 / iq3 the west / east halves' level-2 streams, oq2 their merge on the loop-back
+// colour, iq4 its return; oq3 the row multicast; iq5 / oq4 the handoff in / out; iq6 the token
+// loop's embedding chunk; (HG 1) iq7 / oq5 the head-group chain.
+//
+// Params. The layer program: K, NRM, PLE, HG; shapes: Hc, NEX, TK. Levers (default = the shipped 9B
+// build): SSQL 1, XG16 0 (1: x g in f16, TRM 512's form). Diagnostics (default off): XKEEP, DIAG,
+// HOSTX (simulator tests: x is the host's, no handoff), XDLY. FIFOW: the FIFO depth.
+param memcpy_params;
+param DIAG: u16 = 0;   // 1 (diagnostics): no layers (handoffs, head and I/O only)
+param K: u16;          // layers on the unit
+param Hc: u16;         // x dims a row
+param NRM: u16 = 0;    // the input phases' norm: 0 direct, 1 deferred, 2 scaled (attention / MoE halves)
+param PLE: u16 = 0;    // (NRM 1) 1: a PLE gate phase after the MLP
+param HG: u16 = 0;     // (NRM 1) 1: x leaves for the head by head groups
+param NEX: u16 = 32;   // (NRM 2) experts, experts a token
+param TK: u16 = 4;
+param HOSTX: u16 = 0;  // 1 (simulator tests): x is the host's (memcpy), no handoff
+param XG16: u16 = 0;   // (NRM 0) 1: f16(x) f16(g) in f16 (TRM 512); 0: x g in f32
+param SSQL: u16 = 1;   // (NRM 0) 1: x g goes first, the sum of squares (only CY needs it) last
+param XKEEP: u16 = 0;  // 1 (diagnostics): copies of each reduction's sum (xred) and of x after each layer (xdbg)
+param XDLY: u16 = 0;   // (NRM 2, diagnostics) cycles unit 0's CX waits after the token loop's embedding chunk arrives
+param FIFOW: u16 = 32; // the reductions' FIFO depth (words)
+
+const sys_mod = @import_module("<memcpy/memcpy>", memcpy_params);
+const fab = @import_module("ops/fabric.csl", .{ .NQ = if (HG == 1) 6 else 5 });
+const tile_config = @import_module("<tile_config>");
+const timestamp = @import_module("<time>");
+// TSC stamps of the last pass (host-read): the pass start (x in), each layer's end, after x out (NRM 2: then a layer's
+// x sent, o reduction in, x2 sent, down reduction in)
+var tdbg = @zeros([if (NRM == 2) K + 2 + 4 * K else K + 2]u32);
+var tdbg_ptr: [*]u32 = &tdbg;
+var tsc = @zeros([3]u16);
+fn stamp(i: u16) void { timestamp.get_timestamp(&tsc); tdbg[i] = @as(u32, tsc[0]) | (@as(u32, tsc[1]) << 16); }
+
+// ---------------------------------------------------------------- buffers
+const HW: u16 = if (NRM == 1) 2 * Hc + 1 else Hc;   // x's words (the handoff's)
+var x = @zeros([HW]f32);
+var x_ptr: [*]f32 = &x;
+const NRED: u16 = if (NRM == 1) 3 else 2;            // reductions a layer
+const NDBG: u16 = if (NRM == 0 or XKEEP == 1) K * Hc else 1;
+var xdbg = @zeros([NDBG]f32);                        // x after each layer of the last pass (diagnostics, host-read)
+var xdbg_ptr: [*]f32 = &xdbg;
+const NXRED: u16 = if (NRM == 0 or XKEEP == 1) NRED * K * Hc else 1;
+var xred = @zeros([NXRED]f32);                       // each row reduction's sum of the last pass (diagnostics)
+var xred_ptr: [*]f32 = &xred;
+const GL: u16 = if (PLE == 1) 5 * Hc + 1 else 4 * Hc + 1;   // (NRM 1) a layer's gammas: input, post-attention, pre-FFN, post-FFN(, post-PLE); lambda
+var gam16 = @zeros([if (NRM == 0) 2 * K * Hc else 1]@fp16());   // (NRM 0) [layer][g1 | g2], the host's f16 gammas (1 + w)
+var gam32 = @zeros([if (NRM == 1) K * GL + 1 else if (NRM == 2) 2 * K * Hc else 1]f32);   // (NRM 1: + the embedding scale)
+var gam_ptr: [*]@fp16() = &gam16;
+var gam32_ptr: [*]f32 = &gam32;
+var bo = @zeros([if (NRM == 2) K * Hc else 1]f32);
+var bo_ptr: [*]f32 = &bo;
+var bd = @zeros([if (NRM == 2) K * NEX * Hc else 1]f32);
+var bd_ptr: [*]f32 = &bd;
+const NT: u16 = if (NRM == 2) Hc + 2 * TK else Hc + 1;
+var t = @zeros([NT]f32);                             // the reduction's sum; NRM 0: then the multicast's words
+const x_d = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{Hc} -> x[i] });
+const xw_d = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{HW} -> x[i] });
+const t_d = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{Hc} -> t[i] });
+const t1_d = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{NT} -> t[i] });
+fn keep_red(i: u16) void { if (XKEEP == 0) { return; } @fmovs(@set_dsd_length(@increment_dsd_offset(@get_dsd(mem1d_dsd, .{ .tensor_access = |j|{NXRED} -> xred[j] }), @as(i16, i * Hc), f32), Hc), t_d); }
+fn keep_x(l: u16) void { if (XKEEP == 0) { return; } @fmovs(@set_dsd_length(@increment_dsd_offset(@get_dsd(mem1d_dsd, .{ .tensor_access = |i|{NDBG} -> xdbg[i] }), @as(i16, l * Hc), f32), Hc), x_d); }
+
+// ---------------------------------------------------------------- fabric (queues: see the header)
+const q_w = @get_input_queue(2);
+const q_e = @get_input_queue(3);
+const q_lb = @get_input_queue(4);
+const q_hi = @get_input_queue(5);
+const q_em = @get_input_queue(6);   // the wafer loop: the next token's embedding chunk (unit 0, flags bit 2)
+const q_ci = @get_input_queue(7);   // (HG 1) the head-group chain in
+const q_lo = @get_output_queue(2);
+const q_mc = @get_output_queue(3);
+const q_ho = @get_output_queue(4);
+const q_co = @get_output_queue(5);  // (HG 1) the head-group chain out
+const C_PARK: color = @get_color(16);
+const ut_a = @get_ut_id(4);
+const ut_b = @get_ut_id(5);
+const red = @import_module("ops/red.csl", .{ .fab = fab, .IN1 = q_e, .IN2 = q_w, .OUT = q_lo, .LOOP = q_lb, .UT1 = ut_a, .UT2 = ut_b, .FIFOW = FIFOW });
+
+// rcfg: see the header (runtime words, so every unit shares the image)
+const NR: u16 = 12;
+const RQ: u16 = 1 + 2 * NR;
+var rcfg = @zeros([if (HG == 1) RQ + 14 else RQ + 10]u32);
+var rcfg_ptr: [*]u32 = &rcfg;
+
+fn init() void {
+  fab.routes(&rcfg);
+  if (HG == 1) {
+    var fq = [6]u16 { @as(u16, rcfg[RQ]), @as(u16, rcfg[RQ + 1]), @as(u16, rcfg[RQ + 2]), @as(u16, rcfg[RQ + 3]), @as(u16, rcfg[RQ + 9]), @as(u16, rcfg[RQ + 10]) };
+    fab.bind_iqs(&fq, @as(u16, rcfg[RQ + 8]));
+  } else {
+    var fq = [5]u16 { @as(u16, rcfg[RQ]), @as(u16, rcfg[RQ + 1]), @as(u16, rcfg[RQ + 2]), @as(u16, rcfg[RQ + 3]), @as(u16, rcfg[RQ + 9]) };
+    fab.bind_iqs(&fq, @as(u16, rcfg[RQ + 8]));
+  }
+  fab.oqc(2, rcfg[RQ + 4]); fab.oqc(3, rcfg[RQ + 5]); fab.oqc(4, rcfg[RQ + 6]);
+  if (HG == 1) { fab.oqc(5, rcfg[RQ + 11]); }
+  timestamp.enable_tsc();
+  sys_mod.unblock_cmd_stream();
+}
+
+// ---------------------------------------------------------------- NRM 0: direct norms
+var th = @zeros([if (NRM == 0 and XG16 == 1) Hc else 1]@fp16());
+const th_d = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{if (NRM == 0 and XG16 == 1) Hc else 1} -> th[i] });
+var g_d = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{if (NRM == 0) Hc else 1} -> gam16[i] });
+// x g (f16 gammas) and the sum of squares of x, multicast along the row (Hc + 1 f32 words).
+fn norm_send(gi: u16) void {
+  var ss: f32 = 0.0;
+  var i: u16 = 0;
+  if (SSQL == 0) { while (i < Hc) : (i += 1) { const v = x[i]; ss += v * v; } }
+  const g = @increment_dsd_offset(g_d, @as(i16, gi * Hc), @fp16());
+  if (XG16 == 1) {
+    @fs2h(th_d, x_d);
+    @fmulh(th_d, th_d, g);
+    @fh2s(t_d, th_d);
+  } else {
+    @fh2s(t_d, g);
+    @fmuls(t_d, t_d, x_d);
+  }
+  if (SSQL == 1) {
+    @fmovs(fab.fout(q_mc, Hc), t_d);
+    while (i < Hc) : (i += 1) { const v = x[i]; ss += v * v; }
+    t[Hc] = ss;
+    @fmovs(fab.fout(q_mc, 1), @increment_dsd_offset(@set_dsd_length(t1_d, 1), @as(i16, Hc), f32));
+    return;
+  }
+  t[Hc] = ss;
+  @fmovs(fab.fout(q_mc, Hc + 1), @set_dsd_length(t1_d, Hc + 1));
+}
+fn layer0(l: u16) void {
+  norm_send(2 * l);
+  if ((DIAG & 8) == 0) {
+    red.root(t_d, Hc);
+    keep_red(2 * l);
+    @fadds(x_d, x_d, t_d);
+  }
+  if ((DIAG & 4) == 0) {
+    norm_send(2 * l + 1);
+    red.root(t_d, Hc);
+    keep_red(2 * l + 1);
+    @fadds(x_d, x_d, t_d);
+  }
+  if (XKEEP == 1) { @fmovs(@set_dsd_length(@increment_dsd_offset(@get_dsd(mem1d_dsd, .{ .tensor_access = |i|{NDBG} -> xdbg[i] }), @as(i16, l * Hc), f32), Hc), x_d); }
+}
+
+// ---------------------------------------------------------------- NRM 1: deferred norms
+const NAB: u16 = if (NRM == 1) Hc else 1;
+var ab = @zeros([NAB]f32);
+var sc = @zeros([4]f32);
+const p_d = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{Hc} -> x[@as(i16, if (NRM == 1) Hc else 0) + i] });
+const ab_d = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{NAB} -> ab[i] });
+const sc_d = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{4} -> sc[i] });
+const g32_d = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{if (NRM == 0) 1 else Hc} -> gam32[i] });
+fn reduce(n: u16) void { red.root(@set_dsd_length(t1_d, n), n); }
+fn dot(a: [*]f32, b: [*]f32) f32 {
+  var s: f32 = 0.0;
+  var i: u16 = 0;
+  while (i < Hc) : (i += 1) { s += a[i] * b[i]; }
+  return s;
+}
+// a phase's row multicast: g x, g p (g at gam[go], or ones when go is 0xffff), then the sums (r2 first)
+fn send(go: u16, fromt: bool, full: bool) void {
+  if (go == 0xffff) {
+    @fmovs(fab.fout(q_mc, Hc), x_d);
+    @fmovs(fab.fout(q_mc, Hc), p_d);
+  } else {
+    const g = @increment_dsd_offset(g32_d, @as(i16, go), f32);
+    @fmuls(ab_d, x_d, g);
+    @fmovs(fab.fout(q_mc, Hc), ab_d);
+    @fmuls(ab_d, p_d, g);
+    @fmovs(fab.fout(q_mc, Hc), ab_d);
+  }
+  const tp = @ptrcast([*]f32, &t[0]);
+  sc[0] = if (fromt) dot(tp, tp) else x[2 * Hc];
+  if (full) {
+    const xp = @ptrcast([*]f32, &x[0]);
+    const pp = @ptrcast([*]f32, &x[Hc]);
+    sc[1] = dot(xp, xp);
+    sc[2] = dot(xp, pp);
+    sc[3] = dot(pp, pp);
+  } else {
+    sc[1] = 0.0; sc[2] = 0.0; sc[3] = 0.0;
+  }
+  @fmovs(fab.fout(q_mc, 4), sc_d);
+}
+// the reduction back (t): x += s p, then p = g r
+fn take(go: u16, i: u16) void {
+  reduce(Hc + 1);
+  keep_red(i);
+  @fmacs(x_d, x_d, p_d, t[Hc]);
+  @fmuls(p_d, t_d, @increment_dsd_offset(g32_d, @as(i16, go), f32));
+}
+// the unit's x in: the host's or the handoff's (2 Hc + 1), or (unit 0) the token loop's embedding, scaled
+fn x_in1(s: u32, fl: u32) void {
+  if (HOSTX == 0 and (fl & 1) == 0) { @fmovs(xw_d, fab.fin(q_hi, HW)); return; }
+  if (s > 0 and (fl & 4) != 0) {     // the wafer loop's next token (else the host's x)
+    if (HG == 1) {
+      const nfe = @as(u16, rcfg[RQ + 13]);
+      if ((fl & 128) != 0) {
+        @fmovs(x_d, fab.fin(q_ci, Hc));
+        if (nfe > 0) { @fmovs(fab.fout(q_co, nfe), fab.fin(q_ci, nfe)); }
+      } else {
+        @fmovs(x_d, fab.fin(q_em, Hc));
+        if (nfe > 0) { @fmovs(fab.fout(q_co, nfe), fab.fin(q_em, nfe)); }
+      }
+    } else {
+      @fmovs(x_d, fab.fin(q_em, Hc));
+    }
+  }
+  @fmuls(x_d, x_d, gam32[K * GL]);                                 // the embedding scale
+  @fmovs(p_d, 0.0);
+  x[2 * Hc] = 0.0;
+}
+fn layer1(l: u16) void {
+  const gb = l * GL;
+  send(gb, l > 0, true);
+  take(gb + Hc, NRED * l);
+  // (diagnostics) x is now the previous layer's output (its last scalar resolved): xdbg[l]
+  keep_x(l);
+  send(gb + 2 * Hc, true, true);
+  take(gb + 3 * Hc, NRED * l + 1);
+  if (PLE == 1) {
+    send(0xffff, true, false);
+    take(gb + 4 * Hc, NRED * l + 2);
+  }
+  const lam = gam32[gb + (GL - 1)];
+  @fmuls(x_d, x_d, lam);
+  @fmuls(p_d, p_d, lam);
+}
+// x to the head (the flush unit, HG 1): a member sends its Hc and forwards NFX words on the chain, a root sends its
+// Hc and the forwarded words east
+fn xout(fl: u32) void {
+  const nfx = @as(u16, rcfg[RQ + 12]);
+  if ((fl & 64) != 0) {
+    @fmovs(fab.fout(q_co, Hc), x_d);
+    if (nfx > 0) { @fmovs(fab.fout(q_co, nfx), fab.fin(q_ci, nfx)); }
+  } else if ((fl & 2) == 0) {
+    @fmovs(fab.fout(q_ho, Hc), x_d);
+    if (nfx > 0) { @fmovs(fab.fout(q_ho, nfx), fab.fin(q_ci, nfx)); }
+  }
+}
+// the pass's end: the last phase's |r|^2; the flush unit resolves its scalar and sends x to the head, the others hand
+// [x | p | |r|^2] on
+fn x_out1(fl: u32) void {
+  if ((DIAG & 1) == 0) { const tq = @ptrcast([*]f32, &t[0]); x[2 * Hc] = dot(tq, tq); }
+  if ((DIAG & 1) == 0 and (fl & 8) != 0) {
+    sc[0] = x[2 * Hc]; sc[1] = 0.0; sc[2] = 0.0; sc[3] = 0.0;
+    @fmovs(fab.fout(q_mc, 4), sc_d);
+    reduce(1);
+    @fmacs(x_d, x_d, p_d, t[0]);
+    @fmovs(p_d, 0.0);
+    x[2 * Hc] = 0.0;
+    if (HG == 1) { if (HOSTX == 0) { xout(fl); } }
+    else if (HOSTX == 0 and (fl & 2) == 0) { @fmovs(fab.fout(q_ho, Hc), x_d); }
+  } else if (HG == 1 and HOSTX == 0 and (fl & 8) != 0) {
+    xout(fl);                     // (DIAG 1: the flush unit's x as is)
+  } else if (HOSTX == 0 and (fl & 2) == 0) {
+    @fmovs(fab.fout(q_ho, if (HG == 0 and (fl & 16) != 0) Hc else HW), xw_d);
+  }
+}
+
+// ---------------------------------------------------------------- NRM 2: scaled x (attention / MoE halves)
+const NU: u16 = if (NRM == 2) Hc + 2 else 1;
+var u = @zeros([NU]f32);
+const u_d = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{if (NRM == 2) Hc else 1} -> u[i] });
+const u2_d = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{NU} -> u[i] });
+fn fv(p: [*]f32) mem1d_dsd { return @set_dsd_base_addr(g32_d, p); }
+// [x g 2^-S | 2^S | ssq] on the row multicast
+fn norm_send2(g: [*]f32) void {
+  @fmuls(u_d, x_d, fv(g));
+  var mb: u32 = 0;
+  var ss: f32 = 0.0;
+  var i: u16 = 0;
+  while (i < Hc) : (i += 1) {
+    const b = @bitcast(u32, u[i]) & 0x7fffffff;
+    if (b > mb) { mb = b; }
+    ss += x[i] * x[i];
+  }
+  // S = exponent(max) - 7 (0 for an all-zero chunk); 2^-S and 2^S exactly as f32 exponent fields
+  var e: i16 = if (mb == 0) 0 else @as(i16, @as(u16, mb >> 23)) - 127 - 7;
+  if (e < -100) { e = -100; }
+  const down = @bitcast(f32, @as(u32, @as(u16, 127 - e)) << 23);
+  @fmuls(u_d, u_d, down);
+  u[Hc] = @bitcast(f32, @as(u32, @as(u16, 127 + e)) << 23);
+  u[Hc + 1] = ss;
+  @fmovs(fab.fout(q_mc, Hc + 2), u2_d);
+}
+fn layer2(l: u16) void {
+  norm_send2(@ptrcast([*]f32, &gam32[2 * l * Hc]));
+  stamp(K + 2 + 4 * l);
+  @fmovs(t_d, fab.fin(q_w, Hc));
+  stamp(K + 3 + 4 * l);
+  keep_red(2 * l);
+  @fadds(x_d, x_d, t_d);
+  @fadds(x_d, x_d, fv(@ptrcast([*]f32, &bo[l * Hc])));
+  if ((DIAG & 4) == 0) {
+    norm_send2(@ptrcast([*]f32, &gam32[(2 * l + 1) * Hc]));
+    stamp(K + 4 + 4 * l);
+    @fmovs(@set_dsd_length(t1_d, Hc + 2 * TK), fab.fin(q_e, Hc + 2 * TK));
+    stamp(K + 5 + 4 * l);
+    keep_red(2 * l + 1);
+    @fadds(x_d, x_d, t_d);
+    var k: u16 = 0;
+    while (k < TK) : (k += 1) {
+      const e = @as(u16, t[Hc + k]);
+      @fmacs(x_d, x_d, fv(@ptrcast([*]f32, &bd[(l * NEX + e) * Hc])), t[Hc + TK + k]);
+    }
+  }
+  keep_x(l);
+}
+// (XDLY) unit 0's wait after the token loop's embedding chunk
+fn xdly() void {
+  if (XDLY == 0) { return; }
+  timestamp.get_timestamp(&tsc);
+  const t0 = @as(u32, tsc[0]) | (@as(u32, tsc[1]) << 16);
+  var tn: u32 = t0;
+  while (tn - t0 < @as(u32, XDLY)) { timestamp.get_timestamp(&tsc); tn = @as(u32, tsc[0]) | (@as(u32, tsc[1]) << 16); }
+}
+
+// ---------------------------------------------------------------- a pass
+var n_steps: u32 = 0;
+const pass_id: local_task_id = @get_local_task_id(8);
+task pass_task() void {
+  var s: u32 = 0;
+  while (s < n_steps) : (s += 1) {
+    const fl = rcfg[RQ + 7];
+    if (NRM == 1) { x_in1(s, fl); }
+    else if (HOSTX == 0 and (fl & 1) == 0) { @fmovs(x_d, fab.fin(q_hi, Hc)); }
+    else if (s > 0 and (fl & 4) != 0) { @fmovs(x_d, fab.fin(q_em, Hc)); if (NRM == 2) { xdly(); } }   // the wafer loop's next token
+    stamp(0);
+    var l: u16 = 0;
+    while ((DIAG & 1) == 0 and l < (if ((DIAG & 2) != 0) 1 else K)) : (l += 1) {
+      if (NRM == 0) { layer0(l); } else if (NRM == 1) { layer1(l); } else { layer2(l); }
+      stamp(l + 1);
+    }
+    if (NRM == 1) { x_out1(fl); }
+    else if (HOSTX == 0 and (fl & 2) == 0) { @fmovs(fab.fout(q_ho, Hc), x_d); }
+    stamp(K + 1);
+  }
+  sys_mod.unblock_cmd_stream();
+}
+fn compute(steps: u32, start_pos: u32) void {
+  n_steps = steps;
+  @activate(pass_id);
+}
+
+comptime {
+  @bind_local_task(pass_task, pass_id);
+  @initialize_queue(q_w, .{ .color = @get_color(13) });   // parked (distinct a queue)
+  @initialize_queue(q_e, .{ .color = @get_color(14) });
+  @initialize_queue(q_lb, .{ .color = @get_color(17) });
+  @initialize_queue(q_hi, .{ .color = @get_color(18) });
+  @initialize_queue(q_em, .{ .color = @get_color(19) });
+  if (HG == 1) {
+    @initialize_queue(q_ci, .{ .color = @get_color(20) });
+    @initialize_queue(q_co, .{ .color = C_PARK });
+  }
+  @initialize_queue(q_lo, .{ .color = C_PARK });
+  @initialize_queue(q_mc, .{ .color = C_PARK });
+  @initialize_queue(q_ho, .{ .color = C_PARK });
+  @export_symbol(x_ptr, "x");
+  @export_symbol(xdbg_ptr, "xdbg");
+  @export_symbol(xred_ptr, "xred");
+  @export_symbol(tdbg_ptr, "tdbg");
+  if (NRM == 0) { @export_symbol(gam_ptr, "gam"); } else { @export_symbol(gam32_ptr, "gam"); }
+  if (NRM == 2) { @export_symbol(bo_ptr, "bo"); @export_symbol(bd_ptr, "bd"); }
+  @export_symbol(rcfg_ptr, "rcfg");
+  @export_symbol(init);
+  @export_symbol(compute);
+}
+//@@ dummies

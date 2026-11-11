@@ -1,4 +1,4 @@
-//! Gemma 4 12B: `weight.csl` (deferred norms, sliding / global caches, plain rows), `ctl_cx_gemma12.csl`, `ctl_cy_gemma12.csl`, `head_pe.csl` (GRP 1), with the
+//! Gemma 4 12B: `weight.csl` (deferred norms, sliding / global caches, plain rows), `cx.csl` (deferred norms, head groups), `ctl_cy_gemma12.csl`, `head_pe.csl` (GRP 1), with the
 //! shared head control ([`super::head::HEAD_CTL`]). Their params from the plan ([`kernels`]) and
 //! their rcfg writers.
 
@@ -53,8 +53,8 @@ params! {
 }
 
 params! {
-    /// `ctl_cx_gemma12.csl`: layers a unit, x's dims a row (by override per row run), the levers'.
-    pub struct CtlCxGemma12 { K: u32, Hc: u32, DIAG: u32, FIFOW: u32, XKEEP: u32 }
+    /// `cx.csl` (NRM 1, HG 1): layers a unit, x's dims a row (by override per row run), the levers'.
+    pub struct CtlCxGemma12 { K: u32, Hc: u32, DIAG: u32, FIFOW: u32, XKEEP: u32, NRM: u32, HG: u32 }
 }
 
 params! {
@@ -74,7 +74,7 @@ pub const WEIGHT_GEMMA12: Kernel = Kernel {
 };
 
 pub const CTL_CX_GEMMA12: Kernel = Kernel {
-    source: "ctl_cx_gemma12.csl",
+    source: "cx.csl",
     owns: &["x", "gam", "rcfg", "xdbg", "tdbg", "xred"],
     params: CtlCxGemma12::NAMES,
     route_slots: 12,
@@ -128,7 +128,7 @@ fn weight(pe: &Pe) -> R<Vec<u32>> {
 /// forwards along it.
 fn cx(pe: &Pe) -> R<Vec<u32>> {
     let Place::Cx { first, last, .. } = pe.role().place else {
-        return Err(format!("{:?}: ctl_cx_gemma12 off a CX PE", pe.at));
+        return Err(format!("{:?}: cx off a CX PE", pe.at));
     };
     let pk = pe.parks(4)?;
     let (cin, cout) = (pe.colour(CHAIN_IN), pe.colour(CHAIN_OUT));
@@ -343,6 +343,8 @@ pub fn kernels(prog: &Program) -> R<Kernels> {
                 DIAG: 0,
                 FIFOW: 32,
                 XKEEP: 0,
+                NRM: 1,
+                HG: 1,
             },
         )?,
     );

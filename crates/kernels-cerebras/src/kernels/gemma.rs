@@ -1,4 +1,4 @@
-//! Gemma 4 E2B / E4B: `weight.csl` (18 route slots), `ctl_cx_gemma.csl`,
+//! Gemma 4 E2B / E4B: `weight.csl` (18 route slots), `cx.csl` (deferred norms, the PLE phase),
 //! `ctl_cy_gemma.csl`, `head_ctl.csl` with the token bus, `ple_gemma.csl` (the PLE store), with the shared
 //! head PE ([`super::head::HEAD_PE`]). Their params from the plan ([`kernels`]) and their rcfg
 //! writers.
@@ -62,8 +62,8 @@ params! {
 }
 
 params! {
-    /// `ctl_cx_gemma.csl`: layers a unit, x's dims a row, the levers' defaults.
-    pub struct CtlCxGemma { K: u32, Hc: u32, DIAG: u32, FIFOW: u32, XKEEP: u32 }
+    /// `cx.csl` (NRM 1, PLE 1): layers a unit, x's dims a row, the levers' defaults.
+    pub struct CtlCxGemma { K: u32, Hc: u32, DIAG: u32, FIFOW: u32, XKEEP: u32, NRM: u32, PLE: u32 }
 }
 
 params! {
@@ -89,7 +89,7 @@ pub const WEIGHT_GEMMA: Kernel = Kernel {
 };
 
 pub const CTL_CX_GEMMA: Kernel = Kernel {
-    source: "ctl_cx_gemma.csl",
+    source: "cx.csl",
     owns: &["x", "gam", "rcfg", "xdbg", "tdbg", "xred"],
     params: CtlCxGemma::NAMES,
     route_slots: 12,
@@ -165,7 +165,7 @@ fn weight(pe: &Pe) -> R<Vec<u32>> {
 /// A CX PE: the shared words, the last unit's flush bits.
 fn cx(pe: &Pe) -> R<Vec<u32>> {
     let Place::Cx { first, last, .. } = pe.role().place else {
-        return Err(format!("{:?}: ctl_cx_gemma off a CX PE", pe.at));
+        return Err(format!("{:?}: cx off a CX PE", pe.at));
     };
     let x = CxIo {
         first,
@@ -333,6 +333,8 @@ pub fn kernels(prog: &Program) -> R<Kernels> {
                 DIAG: 0,
                 FIFOW: 32,
                 XKEEP: 0,
+                NRM: 1,
+                PLE: 1,
             },
         )?,
     );

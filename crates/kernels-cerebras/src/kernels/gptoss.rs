@@ -1,5 +1,5 @@
 //! gpt-oss: the attention / MoE weight halves (`weight.csl`, its entry-major attention and routed experts),
-//! CX (`ctl_cx_gptoss.csl`), the CY halves (`ctl_cy_gptoss_att.csl`, `ctl_cy_gptoss_moe.csl`), the
+//! CX (`cx.csl`, NRM 2), the CY halves (`ctl_cy_gptoss_att.csl`, `ctl_cy_gptoss_moe.csl`), the
 //! band's head (`head_pe_gptoss.csl`) and control row ([`super::head::HEAD_CTL`]'s source). Their
 //! params from the plan ([`kernels`]) and their rcfg writers.
 
@@ -68,9 +68,9 @@ params! {
 }
 
 params! {
-    /// `ctl_cx_gptoss.csl`: layers a unit, x's dims a row, the experts and top-k, the levers'
+    /// `cx.csl` (NRM 2): layers a unit, x's dims a row, the experts and top-k, the levers'
     /// defaults.
-    pub struct CtlCx { K: u32, Hc: u32, NEX: u32, TK: u32, DIAG: u32, XKEEP: u32, XDLY: u32 }
+    pub struct CtlCx { K: u32, Hc: u32, NEX: u32, TK: u32, DIAG: u32, XKEEP: u32, XDLY: u32, NRM: u32 }
 }
 
 params! {
@@ -111,7 +111,7 @@ pub const WEIGHT_MOE: Kernel = Kernel {
 };
 
 pub const CTL_CX: Kernel = Kernel {
-    source: "ctl_cx_gptoss.csl",
+    source: "cx.csl",
     owns: &["x", "gam", "bo", "bd", "rcfg", "xdbg", "tdbg", "xred"],
     params: CtlCx::NAMES,
     route_slots: 12,
@@ -257,6 +257,7 @@ pub fn kernels(prog: &Program) -> R<Kernels> {
         DIAG: 0,
         XKEEP: 0,
         XDLY: 0,
+        NRM: 2,
     };
     out.insert(Kind::CX, KernelBuild::of(&CTL_CX, cx)?);
     let cya = CyAtt {
@@ -353,7 +354,7 @@ fn distinct(pe: &Pe, what: &str, q: &[u32]) -> R<()> {
 /// loop-back, the multicast, x out, the flags, a spare colour, the embedding queue.
 fn cx(pe: &Pe) -> R<Vec<u32>> {
     let Place::Cx { first, .. } = pe.role().place else {
-        return Err(format!("{:?}: ctl_cx_gptoss off a CX PE", pe.at));
+        return Err(format!("{:?}: cx off a CX PE", pe.at));
     };
     let wl = pe.prog.plan.contract.token_loop;
     let pk = pe.parks(4)?;

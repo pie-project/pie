@@ -4,19 +4,6 @@
 
 /// Every kernel source of `programs/wafer`, by file name.
 pub const KERNELS: &[(&str, &str)] = &[
-    ("ctl_cx.csl", include_str!("../programs/wafer/ctl_cx.csl")),
-    (
-        "ctl_cx_gemma.csl",
-        include_str!("../programs/wafer/ctl_cx_gemma.csl"),
-    ),
-    (
-        "ctl_cx_gemma12.csl",
-        include_str!("../programs/wafer/ctl_cx_gemma12.csl"),
-    ),
-    (
-        "ctl_cx_gptoss.csl",
-        include_str!("../programs/wafer/ctl_cx_gptoss.csl"),
-    ),
     (
         "ctl_cy_dense.csl",
         include_str!("../programs/wafer/ctl_cy_dense.csl"),
@@ -37,6 +24,7 @@ pub const KERNELS: &[(&str, &str)] = &[
         "ctl_cy_gptoss_moe.csl",
         include_str!("../programs/wafer/ctl_cy_gptoss_moe.csl"),
     ),
+    ("cx.csl", include_str!("../programs/wafer/cx.csl")),
     (
         "head_ctl.csl",
         include_str!("../programs/wafer/head_ctl.csl"),

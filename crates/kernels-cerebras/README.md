@@ -36,7 +36,7 @@ column 0, then up column 1, and so on.
   The PE also holds the mixer's per-PE parts:
   - GDN: its slice of the recurrent state.
   - Attention: NE KV entries a row; position p lives on row p % PY.
-- **CX** (`ctl_cx.csl`). Holds x's chunk, the residuals and the norms' gammas. It is the root of the
+- **CX** (`cx.csl`, every family's). Holds x's chunk, the residuals and the norms' gammas. It is the root of the
   row reductions and does the unit handoff.
 - **CY** (`ctl_cy_dense.csl`). The root of the column reductions. It does the rms scale, the GDN conv,
   SiLU, gates, delta and the gated norm, RoPE and the q/k norms, the softmax's o / l with its redo

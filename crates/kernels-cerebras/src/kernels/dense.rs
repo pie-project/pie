@@ -1,5 +1,5 @@
 //! Qwen3.5 (GDN layers + gated full attention), Qwen3 and Llama 3 (dense attention, no output gate):
-//! `weight.csl` (direct norms, own-cache attention / GDN mixers), `ctl_cx.csl`, `ctl_cy_dense.csl`, with the head's and the relay's
+//! `weight.csl` (direct norms, own-cache attention / GDN mixers), `cx.csl`, `ctl_cy_dense.csl`, with the head's and the relay's
 //! ([`super::head`], [`super::common::RELAY`]). Their params from the plan ([`kernels`]) and
 //! their rcfg writers.
 
@@ -55,7 +55,7 @@ params! {
 }
 
 params! {
-    /// `ctl_cx.csl`: layers a unit, x's dims a row, the levers' defaults.
+    /// `cx.csl` (NRM 0): layers a unit, x's dims a row, the levers' defaults.
     pub struct CtlCx { K: u32, Hc: u32, HOSTX: u32, XG16: u32, DIAG: u32, FIFOW: u32, XKEEP: u32 }
 }
 
@@ -80,7 +80,7 @@ pub const WEIGHT_QWEN: Kernel = Kernel {
 };
 
 pub const CTL_CX: Kernel = Kernel {
-    source: "ctl_cx.csl",
+    source: "cx.csl",
     owns: &["x", "gam", "rcfg", "xdbg", "tdbg", "xred"],
     params: CtlCx::NAMES,
     route_slots: 12,
@@ -121,7 +121,7 @@ fn weight(pe: &Pe) -> R<Vec<u32>> {
 /// A CX PE: the shared words, its x in / out and the token loop's embedding.
 fn cx(pe: &Pe) -> R<Vec<u32>> {
     let Place::Cx { first, .. } = pe.role().place else {
-        return Err(format!("{:?}: ctl_cx off a CX PE", pe.at));
+        return Err(format!("{:?}: cx off a CX PE", pe.at));
     };
     let x = CxIo {
         first,
