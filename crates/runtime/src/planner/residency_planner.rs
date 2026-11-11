@@ -8,7 +8,7 @@ use crate::store::rs::RsUnits;
 
 use super::departure::Departure;
 use super::grant::{AllocationGrant, Demand, DevicePageReservation, RsSlotReservation};
-use super::holdings::held_page_count;
+use super::holdings::{held_page_count, held_rs_units};
 use super::inner::Inner;
 use super::pool::PoolPort;
 use super::proc::{Proc, Residency};
@@ -1065,6 +1065,7 @@ impl ResidencyPlanner {
     pub fn unregister(self: &Arc<Self>, pid: ProcessId) {
         let (model, engine) = self.port.locus();
         let held = held_page_count(pid, model, engine);
+        let held_rs = held_rs_units(pid, model, engine);
         // A seat taken again after the process ended goes back.
         crate::inferlet::process::vacate_seat(pid);
         let (signal, removed, charged) = self.with_inner(|inner| {
@@ -1094,7 +1095,9 @@ impl ResidencyPlanner {
             inner.settle_eviction(pid);
             // Its holds outlive it only while one lives; the last one's drop
             // settles this, and cannot have run before it is put here.
-            if held > 0
+            // Its state is on its way back as its pages are: a pool dry of
+            // the slots its sets still hold is not wedged.
+            if (held > 0 || !held_rs.is_zero())
                 && departed
                     .as_ref()
                     .is_some_and(|proc| proc.departure.strong_count() > 0)
@@ -1103,7 +1106,7 @@ impl ResidencyPlanner {
                     pid,
                     Reclaim {
                         pages: held,
-                        rs: RsUnits::default(),
+                        rs: held_rs,
                     },
                 );
             }

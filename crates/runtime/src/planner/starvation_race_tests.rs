@@ -1456,3 +1456,154 @@ fn a_handle_at_rest_off_the_device_is_no_contention() {
     planner.register_holder(ProcessId::new_v4(), Some(Demand::default()));
     planner.with_inner(|inner| assert_eq!(inner.nonresident_count(), 0));
 }
+
+/// A process leaving while its sets still hold state slots (and no kv
+/// pages) left nothing on its way back: only pages were counted, so the
+/// next ask finding the state pool dry with no one registered holding it
+/// read a wedge and was reclaimed. A departure's state is on its way back
+/// as its pages are, until its last state set is released.
+#[test]
+fn a_departure_s_state_is_waited_for_until_its_set_is_released() {
+    let _schedule = crate::policy::schedule::TEST_LOCK.blocking_read();
+    use crate::inferlet::process::residency::{
+        ProcessResidency, register_residency, unregister_residency,
+    };
+    use crate::store::rs::RsGeometry;
+    use crate::store::rs::working_set::RsWorkingSet;
+
+    let model = crate::store::registry::register_model(16, &[64], &[2]);
+    let stores = crate::store::registry::get(model, 0);
+    let geom = RsGeometry {
+        state_size: 64,
+        buffer_page_tokens: 4,
+    };
+    let id = {
+        let mut rs = stores.rs.lock().unwrap();
+        let ws = rs.create_working_set(geom);
+        let folded = rs.prepare_group(ws, true, false, None, None, None).unwrap();
+        let published = rs.publish_prepared(folded).unwrap();
+        rs.settle(published);
+        ws
+    };
+    let planner = Arc::new(ResidencyPlanner::new(departure_pool(model)));
+    let keys = dry_pool_two_asks(&planner);
+    let pid = ProcessId::new_v4();
+    let residency = Arc::new(std::sync::Mutex::new(ProcessResidency::default()));
+    residency
+        .lock()
+        .unwrap()
+        .rs_working_sets
+        .insert((model, 0, id));
+    register_residency(pid, Arc::downgrade(&residency));
+    planner.register(pid);
+    planner.note_admitted(pid);
+    let ws = RsWorkingSet::new(model, 0, id, geom);
+    let departure = planner.departure(pid).expect("a registered process");
+    ws.hold_departure(departure.clone());
+
+    planner.unregister(pid);
+    drop(departure);
+    unregister_residency(pid);
+    drop(residency);
+    assert_eq!(
+        planner.with_inner(|inner| inner.evicting.get(&pid).map(|mark| mark.rs.slots)),
+        Some(1),
+        "its state slot is on its way back"
+    );
+    assert!(!planner.is_wedged());
+    planner.check_starvation(StarveCause::NoSwapRoom);
+    assert_eq!(
+        unfailed(&planner, &keys),
+        2,
+        "nothing fails while it comes back"
+    );
+    drop(ws);
+    assert_eq!(on_its_way_back(&planner, pid), None, "its set is released");
+}
+
+fn park_asks(planner: &ResidencyPlanner, pid: ProcessId, asks: &[u32]) -> Vec<EntryKey> {
+    planner.with_inner(|inner| {
+        asks.iter()
+            .map(|&kv_pages| {
+                inner.enqueue(
+                    pid,
+                    allocation(Demand {
+                        kv_pages,
+                        rs: RsUnits::default(),
+                    }),
+                )
+            })
+            .collect()
+    })
+}
+
+/// text-completion-bench, 128 MiB: one restartable process whose lanes
+/// together asked for more than the pool (eight 1,500-token prompts in 450
+/// pages) held what it could and parked the rest. Each ask fit beside what
+/// the process held, so no hog check fired, and the starvation reclaim
+/// restarted it: the restart asked for the same again, thousands of times
+/// a minute, and the request never finished. Its own pages and its parked
+/// asks together past the pool fail those asks instead, naming the numbers.
+#[test]
+fn a_process_whose_own_asks_are_past_the_pool_fails_instead_of_restarting() {
+    let _schedule = crate::policy::schedule::TEST_LOCK.blocking_read();
+    let model = crate::store::registry::register_model(16, &[64], &[2]);
+    let planner = Arc::new(ResidencyPlanner::new(departure_pool(model)));
+    // It holds two of the pool's eight pages and parks two asks of four.
+    let process = leaving(&planner, model, false);
+    let pid = process.pid;
+    crate::inferlet::process::declare_restartable(pid);
+    let keys = park_asks(&planner, pid, &[4, 4]);
+    assert!(planner.is_wedged());
+    planner.check_starvation(StarveCause::NoSwapRoom);
+    planner.with_inner(|inner| {
+        for key in &keys {
+            let WaitKind::Allocation {
+                outcome: Some(Err(error)),
+                ..
+            } = &inner.queue[key].kind
+            else {
+                panic!("every parked ask of the process fails");
+            };
+            assert_eq!(
+                *error,
+                PlannerError::Overcommit {
+                    asks: 2,
+                    need: 8,
+                    held: 2,
+                    state: 0,
+                    total: 8,
+                }
+            );
+            let said = error.to_string();
+            assert!(
+                said.contains(
+                    "it holds 2 kv pages and its 2 parked ask(s) need 8 more: 10 of a 8-page pool"
+                ),
+                "{said}"
+            );
+        }
+    });
+    let stats = &planner.stats;
+    assert_eq!(
+        stats.starvation_restarts.load(Ordering::Relaxed),
+        0,
+        "no restart"
+    );
+    assert_eq!(stats.starvations.load(Ordering::Relaxed), 0);
+    drop(terminate(&planner, process));
+}
+
+/// Asks that fit beside what the process holds are no overcommit: the
+/// reclaim keeps its say.
+#[test]
+fn a_process_whose_own_asks_fit_the_pool_is_not_failed_as_overcommitted() {
+    let _schedule = crate::policy::schedule::TEST_LOCK.blocking_read();
+    let model = crate::store::registry::register_model(16, &[64], &[2]);
+    let planner = Arc::new(ResidencyPlanner::new(departure_pool(model)));
+    let process = leaving(&planner, model, false);
+    let keys = park_asks(&planner, process.pid, &[3, 3]);
+    assert!(!planner.check_overcommit(), "2 held and 6 asked fit 8");
+    assert_eq!(unfailed(&planner, &keys), 2);
+    drop(terminate(&planner, process));
+}
