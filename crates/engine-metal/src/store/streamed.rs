@@ -239,8 +239,12 @@ pub fn streamed_experts(trace: &Trace) -> Vec<usize> {
 /// Every param [`streamed_rows`] or [`streamed_experts`] names: the ones a
 /// cold load lands in allocations of their own.
 #[must_use]
-pub fn streamed(trace: &Trace) -> Vec<usize> {
-    let mut all = streamed_rows(trace);
+pub fn streamed(trace: &Trace, rows: bool) -> Vec<usize> {
+    let mut all = if rows {
+        streamed_rows(trace)
+    } else {
+        Vec::new()
+    };
     all.extend(streamed_experts(trace));
     all.sort_unstable();
     all.dedup();
@@ -254,8 +258,13 @@ pub fn streamed(trace: &Trace) -> Vec<usize> {
 /// whole bytes, which a held set seats in pool slots and a streaming one
 /// reads a few atoms of at a time.
 #[must_use]
-pub fn resident_demand(trace: &Trace, recipe: &ChunkRecipe, plane_bytes: &[u64]) -> (u64, u64) {
-    let shapes = Shape::of(trace, recipe);
+pub fn resident_demand(
+    trace: &Trace,
+    recipe: &ChunkRecipe,
+    plane_bytes: &[u64],
+    rows: bool,
+) -> (u64, u64) {
+    let shapes = Shape::of(trace, recipe, rows);
     let streamed: std::collections::BTreeSet<usize> = shapes
         .iter()
         .flat_map(|shape| shape.planes.iter().map(|plane| plane.param))
@@ -338,9 +347,13 @@ impl Shape {
     /// A slot that holds a weight this engine does not stream is not
     /// stated, its weights read whole.
     #[must_use]
-    pub fn of(trace: &Trace, recipe: &ChunkRecipe) -> Vec<Shape> {
+    pub fn of(trace: &Trace, recipe: &ChunkRecipe, rows: bool) -> Vec<Shape> {
         let mut out = Vec::new();
-        let rows = streamed_rows(trace);
+        let rows = if rows {
+            streamed_rows(trace)
+        } else {
+            Vec::new()
+        };
         for slot in &recipe.weights {
             if slot.kind != poem_compiler::chunk::WeightKind::Rows || slot.pieces != 1 {
                 continue;
