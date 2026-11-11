@@ -1133,18 +1133,16 @@ impl Pools {
         programs: u64,
         resident: &dyn core::fmt::Display,
     ) -> Result<Fitted> {
-        // A flat range allocated whole before the fit is the pool's to
-        // reshape: its bytes count as room, less the activation it keeps.
-        // The activation's span a fire has not yet backed is the card's
-        // too: counted as room, the cache rows would take it, and the first
-        // fire's activation then the room held for the bodies (a flat range
-        // allocates its chunks and that span at once).
+        // The room is what the card has free plus every byte the range has
+        // backed (its committed segments and held spans; a flat range, once
+        // allocated, the whole of it: the chunks the kv rows have not yet
+        // taken are backed too, and so not free), less the activation's
+        // span, held or still to be, which the cache rows never take.
         let live = self
             .pool
             .spare_bytes(0)?
-            .saturating_add(self.committed_bytes())
-            .saturating_add(self.chunks.reclaimable_bytes())
-            .saturating_sub(self.chunks.activation_unheld_bytes());
+            .saturating_add(self.chunks.backed_bytes())
+            .saturating_sub(self.chunks.activation_bytes());
         let layout = self.chunks.layout();
         let chunk = layout.chunk_bytes;
         // One working set at the declared context beside the null chunk:
