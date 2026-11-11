@@ -1,0 +1,56 @@
+// wafer/ops/seg.csl: a weight PE's segment collectives (README.md): the scores' all-reduce over a
+// kv head's columns and GDN's (k, q) multicast. They run on their own colours (rcfg[RQ + 12 ..])
+// through iq6 (the row multicast), iq7 (the column multicast, idle then) and oq4; the reductions
+// keep iq2-iq5 (an async add-forward may still wait on its input: rebinding a live level-2 input
+// gave wrong two-level row sums on the CS-3). Mode 0 restores the multicasts' colours, 1 binds
+// GDN's exchange, 2 the all-reduce. A route or queue rebound for a send is restored only after
+// that output queue has drained (a send returns when its wavelets enter the queue).
+//
+// The all-reduce's role (`role`, a host word): 0-3 as a reduction member's, 4 its root (two
+// halves), 6 a one-half root, 5 alone; a root's multicast loops back to it.
+//
+// Params: fab (ops/fabric.csl), rcfg and RQ (the kernel's host words and where its queue words
+// start), XM / YM the row / column multicast queues (iq6, iq7), AO the segment send (oq4), UT a
+// non-root's send microthread, GDN whether mode 1 is used.
+param fab: imported_module;
+param rcfg: [*]u32;
+param RQ: u16;
+param XM: input_queue;
+param YM: input_queue;
+param AO: output_queue;
+param UT: ut_id;
+param GDN: bool = false;
+
+const tile_config = @import_module("<tile_config>");
+var role: u16 = 0;
+
+fn qmode(m: u16) void {
+  while ((tile_config.output_queue_status.get_raw() & 0x1000) == 0) {}   // oq4 empty
+  if (m == 0) {
+    fab.iqc(6, rcfg[RQ + 4]); fab.iqc(7, rcfg[RQ + 5]);
+  } else if (GDN and m == 1) {
+    fab.iqc(6, rcfg[RQ + 12]); fab.oqc(4, rcfg[RQ + 12]);
+  } else {
+    fab.iqc(7, rcfg[RQ + 13]); fab.oqc(4, rcfg[RQ + 15]);
+    fab.iqc(6, if (role == 4) rcfg[RQ + 14] else rcfg[RQ + 16]);
+  }
+}
+
+// The all-reduce of d (n words) over the segment, in place.
+inline fn all_reduce(d: mem1d_dsd, n: u16) void {
+  qmode(2);
+  if (role == 4) {            // a root of two halves: both into d (blocking), then the multicast
+    @fadds(d, d, fab.fin(YM, n));
+    @fadds(d, d, fab.fin(XM, n));
+    @fmovs(fab.fout(AO, n), d);
+  } else if (role == 6) {     // a root of one half
+    @fadds(d, d, fab.fin(YM, n));
+    @fmovs(fab.fout(AO, n), d);
+  } else {
+    const A = .{ .async = true, .ut_id = UT };
+    if (role == 0) { @fmovs(fab.fout(AO, n), d, A); }
+    else { @fadds(fab.fout(AO, n), fab.fin(YM, n), d, A); }
+    @fmovs(d, fab.fin(XM, n));
+  }
+  qmode(0);
+}

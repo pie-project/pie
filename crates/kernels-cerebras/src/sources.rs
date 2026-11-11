@@ -91,6 +91,7 @@ pub const OPS: &[(&str, &str)] = &[
     ("math.csl", include_str!("../programs/wafer/ops/math.csl")),
     ("mv.csl", include_str!("../programs/wafer/ops/mv.csl")),
     ("red.csl", include_str!("../programs/wafer/ops/red.csl")),
+    ("seg.csl", include_str!("../programs/wafer/ops/seg.csl")),
 ];
 
 /// The source of the kernel file `name`.

@@ -150,7 +150,7 @@ const NR: u16 = 16;
 const RQ: u16 = 1 + 2 * NR;
 var rcfg = @zeros([RQ + 25]u32);
 var rcfg_ptr: [*]u32 = &rcfg;
-var role_s: u16 = 0;    // the scores segment: 0-3 as a reduction member's, 4 its root (two halves), 6 a one-half root, 5 alone; a root's multicast loops back to it
+const seg = @import_module("ops/seg.csl", .{ .fab = fab, .rcfg = &rcfg, .RQ = RQ, .XM = q_xm, .YM = q_ym, .AO = q_ao, .UT = ut_b, .GDN = true });
 var myrow: u16 = 0;    // this PE's row in the unit's weight rows
 var gsrc: u16 = 0;      // GDN: bit 15 this PE owns k index r, bit 14 alone (the k head in one column), bits 0-7 its q/k dim
 
@@ -164,7 +164,7 @@ fn init() void {
   fab.oqc(3, rcfg[RQ + 7]);
   rx.role = @as(u16, rcfg[RQ + 8]);
   ry.role = @as(u16, rcfg[RQ + 9]);
-  role_s = @as(u16, rcfg[RQ + 10]);
+  seg.role = @as(u16, rcfg[RQ + 10]);
   gsrc = @as(u16, rcfg[RQ + 11]);
   myrow = @as(u16, rcfg[RQ + 17]);
   timestamp.enable_tsc();
@@ -194,22 +194,7 @@ fn mvp(p: [*]u16, R: u16, N: u16, xo: u16, yo: u16) void {
 }
 
 
-// ---------------------------------------------------------------- segment phases
-// The segment collectives (GDN's (k, q) multicast, the scores' all-reduce) run on their own colours
-// (rcfg[RQ + 12 ..]) through iq6 (the row multicast), iq7 (the column multicast, idle then) and oq4;
-// the reductions keep iq2-iq5 (an async add-forward may still wait on its input: rebinding a live
-// level-2 input gave wrong two-level row sums on the CS-3). Mode 0 restores the multicasts' colours.
-fn qmode(m: u16) void {
-  while ((tile_config.output_queue_status.get_raw() & 0x1000) == 0) {}   // oq4 empty
-  if (m == 0) {
-    fab.iqc(6, rcfg[RQ + 4]); fab.iqc(7, rcfg[RQ + 5]);
-  } else if (m == 1) {
-    fab.iqc(6, rcfg[RQ + 12]); fab.oqc(4, rcfg[RQ + 12]);
-  } else {
-    fab.iqc(7, rcfg[RQ + 13]); fab.oqc(4, rcfg[RQ + 15]);
-    fab.iqc(6, if (role_s == 4) rcfg[RQ + 14] else rcfg[RQ + 16]);
-  }
-}
+// ---------------------------------------------------------------- segment phases (ops/seg.csl)
 
 // ---------------------------------------------------------------- GDN
 var st = @zeros([if (GDN == 1) NLG * DV else 1]f32);
@@ -228,7 +213,7 @@ fn gdn_mix(g: u16) void {
     kq[0] = if ((gsrc & 0x8000) != 0) gb[j] else 0.0;
     kq[1] = if ((gsrc & 0x8000) != 0) gb[DK + j] else 0.0;
   } else {
-    qmode(1);
+    seg.qmode(1);
     if ((gsrc & 0x8000) != 0) {
       const j = gsrc & 0xff;
       kq[0] = gb[j]; kq[1] = gb[DK + j];
@@ -236,7 +221,7 @@ fn gdn_mix(g: u16) void {
     } else {
       @fmovs(kq_d, fab.fin(q_xm, 2));
     }
-    qmode(0);
+    seg.qmode(0);
   }
   const kr = kq[0];
   const qr = kq[1];
@@ -280,25 +265,7 @@ fn exp_v(buf: mem1d_dsd, n: u16) void {
   const pl = @set_dsd_length(@set_dsd_stride(@set_dsd_base_addr(kk, @ptrcast([*]u16, &y)), 2), n);
   math.vexp(buf, p, kk, pl, 88.0, true);
 }
-// The scores' segment all-reduce over the kv head's columns (its root: a weight PE).
-fn seg_ar(n: u16) void {
-  const d = @set_dsd_length(sx_d, n);
-  qmode(2);
-  if (role_s == 4) {            // a root of two halves: both into d (blocking), then the multicast
-    @fadds(d, d, fab.fin(q_ym, n));
-    @fadds(d, d, fab.fin(q_xm, n));
-    @fmovs(fab.fout(q_ao, n), d);
-  } else if (role_s == 6) {     // a root of one half
-    @fadds(d, d, fab.fin(q_ym, n));
-    @fmovs(fab.fout(q_ao, n), d);
-  } else {
-    const A = .{ .async = true, .ut_id = ut_b };
-    if (role_s == 0) { @fmovs(fab.fout(q_ao, n), d, A); }
-    else { @fadds(fab.fout(q_ao, n), fab.fin(q_ym, n), d, A); }
-    @fmovs(d, fab.fin(q_xm, n));
-  }
-  qmode(0);
-}
+fn seg_ar(n: u16) void { seg.all_reduce(@set_dsd_length(sx_d, n), n); }
 
 // CY's multicast: q (normed weights, RoPE, 1/sqrt(HD) applied) QD | k Dc | v Dc | position |
 // the column's partial sums of squares of the raw q a head (Qh) and of the raw k (1).
@@ -342,7 +309,7 @@ fn att_mix(a: u16) void {
       sx[Qh * NEl + h] = ab[QD + 2 * Dc + 1 + h];
     }
     sx[Qh * NEl + Qh] = if (mine) ab[QD + 2 * Dc + 1 + Qh] else 0.0;
-    if (role_s != 5) { seg_ar(nsl); }
+    if (seg.role != 5) { seg_ar(nsl); }
     if (QKN == 1 and mine) { kinv[a * NE + e0] = math.rsqrt(sx[Qh * NEl + Qh] / HDF + 1.0e-6); }
     const ki = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{NE} -> kinv[i] });
     h = 0;
@@ -460,7 +427,7 @@ fn relay(o: u16) void {
   fab.iqc(6, rcfg[RQ + o + 1]);
   fab.oqc(4, rcfg[RQ + o + 2]);
   @fmovs(fab.fout(q_ao, n), fab.fin(q_xm, n));
-  qmode(0);
+  seg.qmode(0);
 }
 
 var n_steps: u32 = 0;
