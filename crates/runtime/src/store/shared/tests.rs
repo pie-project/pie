@@ -1751,3 +1751,19 @@ fn weights_past_what_the_pool_can_grow_to_fail_off_and_stream_under_auto() {
     );
     assert_eq!(shared.pool().prefix_segments(), 1);
 }
+
+/// The planner counts a shared pool's shortfall in its own slots' bytes: a
+/// kv page is a kv list slot, a state slot a record. The engine's page and
+/// slot bytes are its pinned pools' (on Qwen3.5-0.8B a page 24 times the
+/// list slot, so a 2-token turn read as 2.78 GB short).
+#[test]
+fn a_shared_pools_scale_is_its_list_slot_and_its_record() {
+    let scale = SharedPool::scale_of(&facts()).expect("a shared pool");
+    assert_eq!(scale.kv_page_bytes, MIB, "the kv list slot");
+    assert_eq!(
+        scale.state_slot_bytes,
+        3 * 4 * MIB + (64 << 10),
+        "three GDN pieces and one conv"
+    );
+    assert_eq!(SharedPool::scale_of(&ChunkFacts::default()), None);
+}

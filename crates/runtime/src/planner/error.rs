@@ -114,6 +114,16 @@ impl std::fmt::Display for PlannerError {
                  {need} more of {total}, and no move of others can cover it"
             ),
             PlannerError::Short {
+                tier: crate::policy::pressure::Tier::Host,
+                bytes,
+                waited,
+            } => write!(
+                f,
+                "quota: the host tier is full (host_kv_budget): short by {bytes} bytes for \
+                 {waited:?} of room to park state, and no policy let a set at rest go; close a \
+                 set at rest or raise host_kv_budget"
+            ),
+            PlannerError::Short {
                 tier,
                 bytes,
                 waited,

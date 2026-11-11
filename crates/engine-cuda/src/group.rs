@@ -577,6 +577,37 @@ impl Engine for Group {
         Ok(())
     }
 
+    /// Rank after rank: each holds its own share of every slot.
+    fn read_tier_slots(
+        &mut self,
+        slots: &[(engine::chunk::ShapeId, Vec<u32>)],
+    ) -> EngineResult<Vec<u8>> {
+        let mut out = Vec::new();
+        for rank in 0..self.ranks.len() {
+            out.extend(self.on(rank, |shell| shell.read_tier_slots(slots))?);
+        }
+        Ok(out)
+    }
+
+    fn write_tier_slots(
+        &mut self,
+        slots: &[(engine::chunk::ShapeId, Vec<u32>)],
+        bytes: &[u8],
+    ) -> EngineResult<()> {
+        let ranks = self.ranks.len();
+        if ranks == 0 || !bytes.len().is_multiple_of(ranks) {
+            return Err(Error::Device(format!(
+                "{} bytes of host tier slots do not split across {ranks} ranks",
+                bytes.len()
+            )));
+        }
+        let share = bytes.len() / ranks;
+        for (rank, bytes) in bytes.chunks(share).enumerate() {
+            self.on(rank, |shell| shell.write_tier_slots(slots, bytes))?;
+        }
+        Ok(())
+    }
+
     fn encode(&mut self, plan: &mut MediaEncode) -> EngineResult<()> {
         self.on(0, |rank| rank.encode(plan))
     }

@@ -1387,6 +1387,15 @@ impl KvStore {
         self.host_pool.try_alloc_n(n)
     }
 
+    /// A shared pool's host slots for a read or a write none of the
+    /// planner's: kv list slots of its host tier, whose bytes the engine
+    /// reads and writes by those refs (`Engine::read_tier_slots`), not by
+    /// `read_host_kv`. `None` off a shared pool, or if the host lacks them.
+    pub fn alloc_tier_slots(&mut self, n: usize) -> Option<Vec<HostKvSlotId>> {
+        self.shape?;
+        self.host_pool.try_alloc_n(n)
+    }
+
     /// Gives reserved backings back to the pools they came from.
     fn release_backings(&mut self, backings: Vec<KvPageBacking>) {
         let (mut device, mut host, mut disk) = (Vec::new(), Vec::new(), Vec::new());
@@ -2338,6 +2347,29 @@ impl KvStore {
         order: &[(WorkingSetId, u64)],
         wanted: usize,
     ) -> Result<Option<KvResidencyTxn>, KvStoreError> {
+        self.prepare_sweep_with(keep, room, order, wanted, true)
+    }
+
+    /// [`Self::prepare_sweep`] of the tails alone: the heads `order` names
+    /// stay even when fewer pages than wanted move.
+    pub fn prepare_tail_sweep(
+        &mut self,
+        keep: &HashSet<WorkingSetId>,
+        room: usize,
+        order: &[(WorkingSetId, u64)],
+        wanted: usize,
+    ) -> Result<Option<KvResidencyTxn>, KvStoreError> {
+        self.prepare_sweep_with(keep, room, order, wanted, false)
+    }
+
+    fn prepare_sweep_with(
+        &mut self,
+        keep: &HashSet<WorkingSetId>,
+        room: usize,
+        order: &[(WorkingSetId, u64)],
+        wanted: usize,
+        spare_heads: bool,
+    ) -> Result<Option<KvResidencyTxn>, KvStoreError> {
         // In tokens as a policy states them, in pages here.
         let page = u64::from(self.page_size.max(1));
         let order: Vec<_> = order
@@ -2345,11 +2377,11 @@ impl KvStore {
             .map(|&(ws, tokens)| (ws, tokens.div_ceil(page)))
             .collect();
         let order = &order[..];
-        let mut pages = self.table.stranded_pages(keep, order, wanted);
+        let mut pages = self.table.stranded_pages(keep, order, wanted, spare_heads);
         if self.swap_available() < pages.len().min(room) {
             self.drop_entries_off_device();
             // Dropping can compact the pages just listed: list them again.
-            pages = self.table.stranded_pages(keep, order, wanted);
+            pages = self.table.stranded_pages(keep, order, wanted, spare_heads);
         }
         let available = self.make_swap_room(pages.len().min(room));
         pages.truncate(room.min(available));

@@ -2009,3 +2009,34 @@ fn a_commit_that_lands_after_a_cut_leaves_the_cut_standing() {
     assert_eq!(store.committed_pages(), 8);
     assert_eq!(store.mapped_pages(), 32, "the tail gives it back");
 }
+
+/// e2e handles, keep-handles `Retain::upto(head)`: a head short of state
+/// swept the tails of sets at rest and, wanting more, took the head a key
+/// kept as well (19 of 19 pages where 9 were the tail). A tail sweep moves
+/// the tails alone, however few pages that is.
+#[test]
+fn a_tail_sweep_leaves_a_kept_head_however_few_pages_move() {
+    let mut store = KvStore::new_with_swap(8, 8, 0, h(14));
+    let a = store.create_working_set();
+    commit_fresh(&mut store, a, 3, 1);
+    store.mark_suspended(&HashSet::from([a]));
+    let page = u64::from(store.page_size.max(1));
+    let sweep = store
+        .prepare_tail_sweep(&HashSet::new(), usize::MAX, &[(a, page)], usize::MAX)
+        .unwrap()
+        .expect("the tail moves");
+    assert_eq!(
+        sweep.page_count(),
+        2,
+        "the two pages past the head, not the head"
+    );
+    store.commit_suspend(sweep).unwrap();
+    assert_eq!(store.swapped_page_count(&HashSet::from([a])).unwrap(), 2);
+    assert!(
+        store
+            .prepare_tail_sweep(&HashSet::new(), usize::MAX, &[(a, page)], usize::MAX)
+            .unwrap()
+            .is_none(),
+        "nothing past the head is left"
+    );
+}

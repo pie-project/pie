@@ -17,6 +17,11 @@ pub(super) struct VictimSet {
     /// Of `deficit.pages`, those that stand for state the head lacks: kv
     /// that parks frees chunks any shape opens ([`super::PoolPort::rs_as_pages`]).
     pub(super) rs_pages: u32,
+    /// On a shared pool, the state the head lacks that `rs_pages` stands
+    /// for: what a victim must park on the host to free its chunks.
+    pub(super) rs_short: crate::store::rs::RsUnits,
+    /// The head is a restore: it may take the host's restore reserve.
+    pub(super) restore: bool,
     pub(super) members: Vec<Victim>,
 }
 

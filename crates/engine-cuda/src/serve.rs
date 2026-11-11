@@ -571,6 +571,29 @@ impl Shell {
         self.pools.read_host_kv(slots)
     }
 
+    /// Once every copy into the host tier has landed (the swap stream's and
+    /// the stream's own): see `Engine::read_tier_slots`.
+    pub fn read_tier_slots(
+        &mut self,
+        slots: &[(engine::chunk::ShapeId, Vec<u32>)],
+    ) -> Result<Vec<u8>> {
+        self.pools.settle_all_swaps()?;
+        crate::device::ctx::sync(self.device.stream())?;
+        self.pools.read_tier_slots(slots)
+    }
+
+    /// Behind every copy that touches the host tier: see
+    /// `Engine::write_tier_slots`.
+    pub fn write_tier_slots(
+        &mut self,
+        slots: &[(engine::chunk::ShapeId, Vec<u32>)],
+        bytes: &[u8],
+    ) -> Result<()> {
+        self.pools.settle_all_swaps()?;
+        crate::device::ctx::sync(self.device.stream())?;
+        self.pools.write_tier_slots(slots, bytes)
+    }
+
     /// Behind the moves and read-outs that touch `slots`, so none still
     /// reads or writes them; the fires beside them go on.
     pub fn write_host_kv(&mut self, slots: &[u32], bytes: &[u8]) -> Result<()> {

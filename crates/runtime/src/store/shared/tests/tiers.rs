@@ -950,3 +950,90 @@ fn host_chunks_touched_stay_the_held_working_set_over_many_cycles() {
         "the lowest chunks"
     );
 }
+
+/// A snapshot of a shared pool's set (CONTRACT-BC 22 byte reads): host rows
+/// of the host tier stand for its record and rs list slots, the device's
+/// copy into them moves shape by shape, and the refs the engine reads name
+/// every piece then every slot, in order. A load takes rows the same way
+/// to write into.
+#[test]
+fn a_snapshot_reads_a_records_state_through_host_tier_slots() {
+    use crate::pipeline::fire::rs::{GroupFold, GroupPlan, RsPlan, prepare, prepare_many, settle};
+    use crate::store::rs::RsGeometry;
+    let (shared, tiers, stores) = tiered(fixed_facts(), 0);
+    let mut rs = stores.rs.lock().unwrap();
+    let ws = rs.create_working_set(RsGeometry {
+        state_size: 1024,
+        buffer_page_tokens: 16,
+    });
+    let first = prepare(&mut rs, ws, 5).unwrap();
+    settle(&mut rs, first.txn);
+    let plan = RsPlan::Groups(vec![GroupPlan {
+        lanes: vec![0],
+        writes: Some(5..14),
+        fold: GroupFold::None,
+        snapshots: Vec::new(),
+    }]);
+    let out = prepare_many(&mut rs, &[ws], &plan, None).unwrap();
+    settle(&mut rs, out.txn);
+    rs.retire_idle();
+    let set = rs.export(ws).unwrap();
+    let held: Vec<_> = set.folded.iter().copied().collect();
+    let pages: Vec<_> = set.buffer.iter().flatten().copied().collect();
+    let mut bytes = Bytes::default();
+    let mut value = 0u64;
+    let mut want = Vec::new();
+    for (shape, refs) in shared.lock().unwrap().record_refs(rs.engine_id(held[0])) {
+        for r in refs {
+            value += 1;
+            bytes.set(shape, r, value);
+            want.push(value);
+        }
+    }
+    for &page in &pages {
+        value += 1;
+        bytes.set(RS, rs.engine_id(page), value);
+        want.push(value);
+    }
+
+    let rows = rs
+        .take_host(held.len(), pages.len())
+        .expect("host tier rows");
+    let moves: Vec<_> = held
+        .iter()
+        .chain(&pages)
+        .copied()
+        .zip(rows.iter().copied())
+        .collect();
+    for (shape, pairs) in rs.tier_copies(&moves) {
+        bytes.copy(&SlotCopy {
+            shape,
+            src: DEVICE,
+            dst: MemoryDomain::HostPinned,
+            slots: pairs,
+            runs: Vec::new(),
+        });
+    }
+    let refs = rs.tier_refs(&rows);
+    let read: Vec<u64> = refs
+        .iter()
+        .flat_map(|(shape, refs)| {
+            refs.iter()
+                .map(|&r| bytes.0[&(MemoryDomain::HostPinned, *shape, r)])
+                .collect::<Vec<_>>()
+        })
+        .collect();
+    assert_eq!(read, want, "every piece, then every rs list slot, in order");
+    assert_eq!(
+        (
+            host_live(&tiers, 1),
+            host_live(&tiers, 2),
+            host_live(&tiers, RS_POOL)
+        ),
+        (3, 1, 3),
+        "the read takes a host slot of each shape a piece"
+    );
+    rs.give_host(rows);
+    assert_eq!(host_live(&tiers, 1), 0, "and gives them back");
+    assert!(!rs.on_host(held[0]), "the set itself stays where it was");
+}

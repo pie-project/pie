@@ -183,6 +183,27 @@ pub(crate) async fn write_host_state(
         .map(drop)
 }
 
+/// The bytes of host tier slots, shape by shape, in order (CONTRACT-BC 22).
+pub(crate) async fn read_tier_slots(
+    engine_id: usize,
+    slots: Vec<(::engine::chunk::ShapeId, Vec<u32>)>,
+) -> Result<Vec<u8>> {
+    scheduler_handle(engine_id)?
+        .host_kv(worker::HostKvOp::ReadTier(slots))
+        .await
+}
+
+pub(crate) async fn write_tier_slots(
+    engine_id: usize,
+    slots: Vec<(::engine::chunk::ShapeId, Vec<u32>)>,
+    bytes: Vec<u8>,
+) -> Result<()> {
+    scheduler_handle(engine_id)?
+        .host_kv(worker::HostKvOp::WriteTier(slots, bytes))
+        .await
+        .map(drop)
+}
+
 pub(crate) async fn write_host_kv(engine_id: usize, slots: Vec<u32>, bytes: Vec<u8>) -> Result<()> {
     scheduler_handle(engine_id)?
         .host_kv(worker::HostKvOp::Write(slots, bytes))

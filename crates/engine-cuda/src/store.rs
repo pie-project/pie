@@ -3277,6 +3277,113 @@ impl Pools {
         Ok(tier.at(chunk, 0)? + u64::from(slot % per_chunk) * bytes)
     }
 
+    /// Where each of `refs`, host tier slots of `shape`, lies: its chunk of
+    /// the tier (backed) and its byte offset in that chunk; and a slot's
+    /// bytes.
+    fn tier_places(
+        &mut self,
+        shape: engine::chunk::ShapeId,
+        refs: &[u32],
+    ) -> Result<(u64, Vec<(u32, u64)>)> {
+        let kind = Self::kind_of(shape)?;
+        let facts = self.chunks.layout().shape(kind).ok_or_else(|| {
+            Fault::program(
+                "store::chunks",
+                format!("a host slot of a {} in a load that lays none", kind.name()),
+            )
+        })?;
+        let (per_chunk, bytes) = (facts.per_chunk.max(1), facts.slot_bytes);
+        let Some(tier) = self.tier.as_mut() else {
+            return Err(Fault::Ceiling {
+                what: "chunks of the host tier",
+                need: 1,
+                have: 0,
+            });
+        };
+        tier.back(
+            refs.iter().map(|&slot| slot / per_chunk),
+            "chunks of the host tier",
+        )?;
+        Ok((
+            bytes,
+            refs.iter()
+                .map(|&slot| (slot / per_chunk, u64::from(slot % per_chunk) * bytes))
+                .collect(),
+        ))
+    }
+
+    /// See `Engine::read_tier_slots`: the bytes of host tier slots, shape
+    /// by shape, each laid out as its device slot. The caller has settled
+    /// every copy into them.
+    pub fn read_tier_slots(
+        &mut self,
+        slots: &[(engine::chunk::ShapeId, Vec<u32>)],
+    ) -> Result<Vec<u8>> {
+        let mut out = Vec::new();
+        for (shape, refs) in slots {
+            let (bytes, places) = self.tier_places(*shape, refs)?;
+            let tier = self.tier.as_ref().expect("backed above");
+            for (chunk, offset) in places {
+                let (pinned, at) = tier.place(chunk, 0).expect("backed above");
+                out.extend_from_slice(pinned.view(at + offset, bytes).ok_or(Fault::Ceiling {
+                    what: "bytes of a host tier chunk",
+                    need: at + offset + bytes,
+                    have: 0,
+                })?);
+            }
+        }
+        Ok(out)
+    }
+
+    /// See `Engine::write_tier_slots`: `bytes`, as [`Self::read_tier_slots`]
+    /// lays them out, into host tier slots. The caller has settled every
+    /// copy that touches them.
+    pub fn write_tier_slots(
+        &mut self,
+        slots: &[(engine::chunk::ShapeId, Vec<u32>)],
+        bytes: &[u8],
+    ) -> Result<()> {
+        let mut spans = Vec::new();
+        for (shape, refs) in slots {
+            let (len, places) = self.tier_places(*shape, refs)?;
+            spans.extend(places.into_iter().map(|place| (place, len)));
+        }
+        let need: u64 = spans.iter().map(|&(_, len)| len).sum();
+        if bytes.len() as u64 != need {
+            return Err(Fault::Ceiling {
+                what: "bytes of host tier slots",
+                need,
+                have: bytes.len() as u64,
+            });
+        }
+        let tier = self.tier.as_ref().expect("backed above");
+        let mut from = 0usize;
+        for ((chunk, offset), len) in spans {
+            let (pinned, at) = tier.place(chunk, 0).expect("backed above");
+            let len = usize::try_from(len).unwrap_or(usize::MAX);
+            let at = usize::try_from(at + offset).unwrap_or(usize::MAX);
+            if !pinned.write(at, &bytes[from..from + len]) {
+                return Err(Fault::Ceiling {
+                    what: "bytes of a host tier chunk",
+                    need: (at + len) as u64,
+                    have: 0,
+                });
+            }
+            from += len;
+        }
+        Ok(())
+    }
+
+    /// Waits out every move between the device and the host tier still
+    /// landing: what a byte read or write of host tier slots stands behind.
+    pub fn settle_all_swaps(&mut self) -> Result<()> {
+        self.prune_swaps()?;
+        for swap in &self.swaps {
+            swap.landed.settle()?;
+        }
+        Ok(())
+    }
+
     /// Copies whole slots of `shape`, `(src, dst)`, from tier `from` to tier
     /// `to` (CONTRACT-BC 22), on `stream` behind every fire enqueued on it
     /// and ahead of every one after: a device ref is the runtime's (through

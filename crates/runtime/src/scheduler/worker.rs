@@ -321,6 +321,9 @@ pub(crate) enum HostKvOp {
     /// The bytes of host rs rows: state slots, then buffer pages.
     ReadState(Vec<u32>, Vec<u32>),
     WriteState(Vec<u32>, Vec<u32>, Vec<u8>),
+    /// The bytes of host tier slots, shape by shape (`Engine::read_tier_slots`).
+    ReadTier(Vec<(::engine::chunk::ShapeId, Vec<u32>)>),
+    WriteTier(Vec<(::engine::chunk::ShapeId, Vec<u32>)>, Vec<u8>),
     /// The engine's tap groups (`Engine::tap_groups`), as JSON.
     TapGroups,
     /// The weight cache's resident set (`Engine::weight_residency`), ahead

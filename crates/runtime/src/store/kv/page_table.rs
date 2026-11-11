@@ -1524,6 +1524,7 @@ impl KvPageTable {
         keep: &HashSet<WorkingSetId>,
         order: &[(WorkingSetId, u64)],
         wanted: usize,
+        spare_heads: bool,
     ) -> Vec<(TriePageLocation, PhysicalKvPageId)> {
         let mut running = FxHashSet::default();
         for (ws, entry) in self.working_sets.iter() {
@@ -1563,6 +1564,10 @@ impl KvPageTable {
             })
             .collect();
         for spare_kept in [false, true] {
+            // Tails only: what a head's key keeps stays, short or not.
+            if spare_kept && !spare_heads {
+                break;
+            }
             for &ws in &readers {
                 if pages.len() >= wanted {
                     return pages;

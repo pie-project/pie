@@ -610,3 +610,117 @@ fn an_ask_past_what_weights_and_activation_leave_fails_saying_so() {
         "served from the room"
     );
 }
+
+/// e2e handles, host tier full: a head short of state on a shared pool
+/// asked for kv pages to park; a set at rest whose own record the host had
+/// no rows for was picked for its kv alone, which parked and left its
+/// record on the device (nine such moves freed no state, and left those
+/// sets no one's victim). It is picked only for kv the head lacks itself.
+#[test]
+fn a_victim_whose_state_the_host_cannot_take_is_not_picked_for_state() {
+    use crate::store::kv::page_table::ReclaimQuote;
+    let (a, b) = (ProcessId::new_v4(), ProcessId::new_v4());
+    let record = RsUnits::of(1, 1);
+    let rs_quotes = [(record, 40), (record, 40)];
+    let quotes = || vec![Some(ReclaimQuote::Pages(4)), Some(ReclaimQuote::Pages(4))];
+    // The head lacks a record's worth of chunks: 40 pages, all of them state.
+    let deficit = super::reclaim::Reclaim {
+        pages: 40,
+        rs: RsUnits::default(),
+    };
+    let full = super::reclaim::Reclaim {
+        pages: 1000,
+        rs: RsUnits::default(),
+    };
+    let (picks, unhostable) =
+        ResidencyPlanner::pick_from_quotes(&[a, b], quotes(), &rs_quotes, deficit, full, 40);
+    assert!(
+        picks.is_empty() && unhostable.is_empty(),
+        "no kv-only move for state"
+    );
+    // Of a head short of kv besides, kv-only moves fund that kv.
+    let mixed = super::reclaim::Reclaim {
+        pages: 44,
+        rs: RsUnits::default(),
+    };
+    let (picks, _) =
+        ResidencyPlanner::pick_from_quotes(&[a, b], quotes(), &rs_quotes, mixed, full, 40);
+    assert_eq!(picks.len(), 1, "one set's kv covers the 4 kv pages");
+    // With host rows for the record, the set moves whole and funds the state.
+    let room = super::reclaim::Reclaim {
+        pages: 1000,
+        rs: record,
+    };
+    let (picks, _) =
+        ResidencyPlanner::pick_from_quotes(&[a, b], quotes(), &rs_quotes, deficit, room, 40);
+    assert_eq!(
+        picks,
+        [(
+            a,
+            super::reclaim::Reclaim {
+                pages: 4,
+                rs: record
+            }
+        )]
+    );
+}
+
+/// A head the host tier is short for fails at its deadline saying the host
+/// is full, by the name of its quota.
+#[test]
+fn a_host_shortfall_names_the_host_quota() {
+    let said = PlannerError::Short {
+        tier: Tier::Host,
+        bytes: 1 << 20,
+        waited: Duration::from_secs(10),
+    }
+    .to_string();
+    assert!(said.starts_with("quota:"), "{said}");
+    assert!(said.contains("host_kv_budget"), "{said}");
+    let device = PlannerError::Short {
+        tier: Tier::Device,
+        bytes: 1 << 20,
+        waited: Duration::from_secs(10),
+    }
+    .to_string();
+    assert!(device.starts_with("device memory short"), "{device}");
+}
+
+/// e2e handles: a set parked on the host whose way back only the policy
+/// could make waited forever, saying tier pressure every AGAIN for minutes.
+/// A restore short of room only the policy can make fails at the seat
+/// deadline as a parked allocation does, and leaves the queue owing what it
+/// did.
+#[tokio::test(flavor = "current_thread")]
+async fn a_short_restore_fails_at_the_seat_deadline_instead_of_waiting_forever() {
+    let _schedule = crate::policy::schedule::TEST_LOCK.read().await;
+    let pool = Arc::new(KeptPool::new(0, 4, usize::MAX));
+    let (sink, said) = recording();
+    let planner =
+        Arc::new(ResidencyPlanner::new(pool.clone() as Arc<dyn PoolPort>).pressure_sink(sink));
+    let pid = ProcessId::new_v4();
+    planner.register(pid);
+    planner.note_admitted(pid);
+    planner.owe(
+        pid,
+        Demand {
+            kv_pages: 2,
+            rs: RsUnits::default(),
+        },
+    );
+    let started = std::time::Instant::now();
+    let waited = tokio::time::timeout(
+        crate::pipeline::fire::SEAT_WAIT + Duration::from_secs(5),
+        planner.wait_resident(pid),
+    )
+    .await
+    .expect("it gives up at the deadline, not never");
+    let Err(PlannerError::Short { tier, bytes, .. }) = waited else {
+        panic!("a short restore fails short");
+    };
+    assert_eq!(tier, Tier::Device);
+    assert!(bytes > 0);
+    assert!(started.elapsed() >= crate::pipeline::fire::SEAT_WAIT);
+    assert!(!said.lock().is_empty(), "it said so while it waited");
+    assert_eq!(planner.diagnostics().queue.len(), 0, "off the queue");
+}

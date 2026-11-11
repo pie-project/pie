@@ -253,6 +253,38 @@ impl SharedPool {
         !facts.shapes.is_empty() && facts.shapes.iter().all(|shape| shape.pinned.is_none())
     }
 
+    /// What a shared pool's units take, in bytes, as the planner counts
+    /// them: a kv page is a kv list slot, a state slot one record (a slot of
+    /// each fixed shape a piece). `None` where the pool is not shared. The
+    /// engine's own page and slot bytes are its pinned pools', which a
+    /// shared pool's slots are not.
+    #[must_use]
+    pub fn scale_of(facts: &ChunkFacts) -> Option<crate::policy::pressure::Scale> {
+        if !Self::states_shared(facts) {
+            return None;
+        }
+        let kv_page_bytes = facts
+            .shapes
+            .iter()
+            .find(|shape| {
+                shape.role == SlotRole::State
+                    && matches!(shape.kind, SlotKind::List { window: None, .. })
+            })
+            .map_or(0, |shape| shape.slot_bytes);
+        let state_slot_bytes = facts
+            .shapes
+            .iter()
+            .filter_map(|shape| match shape.kind {
+                SlotKind::Fixed { pieces } => Some(u64::from(pieces) * shape.slot_bytes),
+                SlotKind::List { .. } => None,
+            })
+            .sum();
+        Some(crate::policy::pressure::Scale {
+            kv_page_bytes,
+            state_slot_bytes,
+        })
+    }
+
     /// The pool `facts` state, and `max_context` tokens the longest a
     /// working set holds. The rung starts at the largest: state never takes
     /// the top span until a rung is lowered.

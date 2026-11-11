@@ -836,6 +836,21 @@ impl Engine for Rank {
         self.with(|cuda| cuda.write_host_kv(slots, bytes))
     }
 
+    fn read_tier_slots(
+        &mut self,
+        slots: &[(engine::chunk::ShapeId, Vec<u32>)],
+    ) -> EngineResult<Vec<u8>> {
+        self.with(|cuda| cuda.read_tier_slots(slots))
+    }
+
+    fn write_tier_slots(
+        &mut self,
+        slots: &[(engine::chunk::ShapeId, Vec<u32>)],
+        bytes: &[u8],
+    ) -> EngineResult<()> {
+        self.with(|cuda| cuda.write_tier_slots(slots, bytes))
+    }
+
     fn disconnect(&self, message: &str) {
         self.group.poison(message);
     }

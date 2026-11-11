@@ -22,6 +22,7 @@ impl ResidencyPlanner {
         candidates: Vec<(ProcessId, Rank)>,
         deficit: Reclaim,
         room: Reclaim,
+        state_pages: u32,
         model: usize,
         engine: usize,
     ) -> (Vec<(ProcessId, Reclaim)>, Vec<ProcessId>) {
@@ -44,9 +45,16 @@ impl ResidencyPlanner {
                 (rs, self.port.rs_as_pages(rs))
             })
             .collect();
-        Self::pick_with_budget_escalation(&pids, &rs_quotes, deficit, room, |pids, budget| {
-            crate::inferlet::process::residency::kv_reclaim_quotes(pids, model, engine, budget)
-        })
+        Self::pick_with_budget_escalation(
+            &pids,
+            &rs_quotes,
+            deficit,
+            room,
+            state_pages,
+            |pids, budget| {
+                crate::inferlet::process::residency::kv_reclaim_quotes(pids, model, engine, budget)
+            },
+        )
     }
 
     fn pick_with_budget_escalation(
@@ -54,6 +62,7 @@ impl ResidencyPlanner {
         rs_quotes: &[(RsUnits, u32)],
         deficit: Reclaim,
         room: Reclaim,
+        state_pages: u32,
         quote: impl Fn(&[ProcessId], u32) -> Vec<Option<ReclaimQuote>>,
     ) -> (Vec<(ProcessId, Reclaim)>, Vec<ProcessId>) {
         // A pick moves its pages whole, so every candidate is quoted when
@@ -63,13 +72,26 @@ impl ResidencyPlanner {
         } else {
             deficit.pages
         };
-        let (picks, unhostable) =
-            Self::pick_from_quotes(pids, quote(pids, budget), rs_quotes, deficit, room);
+        let (picks, unhostable) = Self::pick_from_quotes(
+            pids,
+            quote(pids, budget),
+            rs_quotes,
+            deficit,
+            room,
+            state_pages,
+        );
         let covered = picks
             .iter()
             .fold(Reclaim::default(), |sum, &(_, pick)| sum.add(pick));
         if !covered.covers(deficit) && !unhostable.is_empty() {
-            return Self::pick_from_quotes(pids, quote(pids, u32::MAX), rs_quotes, deficit, room);
+            return Self::pick_from_quotes(
+                pids,
+                quote(pids, u32::MAX),
+                rs_quotes,
+                deficit,
+                room,
+                state_pages,
+            );
         }
         (picks, unhostable)
     }
@@ -81,13 +103,20 @@ impl ResidencyPlanner {
     /// still lacks stays. Each quote's rs comes with what it is worth in kv
     /// pages (on a shared pool the chunks it frees; else 0), which counts
     /// toward the head's pages.
-    fn pick_from_quotes(
+    ///
+    /// Of `deficit.pages`, `state_pages` stand for state the head lacks on a
+    /// shared pool. A victim whose own state the host cannot take would
+    /// park its kv and leave its record where it lies, freeing no chunk
+    /// that state opens: it is picked only for kv the head itself lacks.
+    pub(super) fn pick_from_quotes(
         pids: &[ProcessId],
         quotes: Vec<Option<ReclaimQuote>>,
         rs_quotes: &[(RsUnits, u32)],
         deficit: Reclaim,
         room: Reclaim,
+        state_pages: u32,
     ) -> (Vec<(ProcessId, Reclaim)>, Vec<ProcessId>) {
+        let kv_part = deficit.pages.saturating_sub(state_pages);
         let mut picks = Vec::new();
         let mut unhostable = Vec::new();
         let (mut covered, mut room) = (Reclaim::default(), room);
@@ -99,13 +128,19 @@ impl ResidencyPlanner {
                 Some(ReclaimQuote::Pages(pages)) => pages,
                 _ => 0,
             };
-            let (rs, worth) = if room.rs.covers(rs) {
-                (rs, worth)
-            } else {
+            let stranded = !rs.is_zero() && !room.rs.covers(rs);
+            let (rs, worth) = if stranded {
                 (RsUnits::default(), 0)
+            } else {
+                (rs, worth)
             };
             let frees = Reclaim { pages, rs };
-            let helps = (pages.saturating_add(worth) > 0 && covered.pages < deficit.pages)
+            let wanted = if stranded && state_pages > 0 {
+                kv_part
+            } else {
+                deficit.pages
+            };
+            let helps = (pages.saturating_add(worth) > 0 && covered.pages < wanted)
                 || (rs.slots > 0 && covered.rs.slots < deficit.rs.slots)
                 || (rs.pages > 0 && covered.rs.pages < deficit.rs.pages);
             if !helps {
@@ -146,11 +181,19 @@ impl ResidencyPlanner {
         };
         let (swap_free, swap_total) = self.swap_stats();
         let deficit = self.bytes_of(victims.deficit);
+        // A new ask leaves one set's state room on the host: a set at rest
+        // there comes back by parking another in its place, so what rests
+        // still resumes once the host is full.
+        let mut room = self.swap_room();
+        if !victims.restore {
+            room.rs = room.rs.sub(self.restore_reserve());
+        }
         // The host is short where it is the move's way out: its kv swap is
-        // full, or its rows cannot take the state the head lacks.
+        // full, or its rows cannot take the state the head lacks (on a
+        // shared pool, the state a victim must park to free its chunks).
+        let state = victims.deficit.rs.add(victims.rs_short);
         let host_short = self.port.suspend_capable()
-            && ((victims.deficit.pages > 0 && swap_free == 0)
-                || !self.swap_room().rs.covers(victims.deficit.rs));
+            && ((victims.deficit.pages > 0 && swap_free == 0) || !room.rs.covers(state));
         // Kv the head itself lacks waits on the supply first; kv that stands
         // for state it lacks moves now, as nothing else frees its chunks.
         let kv_deficit = victims.deficit.pages.saturating_sub(victims.rs_pages);
@@ -175,7 +218,8 @@ impl ResidencyPlanner {
         let (picks, unhostable) = self.quote_and_pick(
             victims.preferred(),
             victims.deficit,
-            self.swap_room(),
+            room,
+            victims.rs_pages,
             model,
             engine,
         );
@@ -276,6 +320,8 @@ impl ResidencyPlanner {
                     head_pid: waiter.pid,
                     deficit,
                     rs_pages: 0,
+                    rs_short: RsUnits::default(),
+                    restore: matches!(waiter.kind, WaitKind::Restore { .. }),
                     members,
                 },
                 spare,
@@ -286,6 +332,7 @@ impl ResidencyPlanner {
         // nothing for it and the policy is asked to discard instead.
         let as_pages = self.port.rs_as_pages(victims.deficit.rs);
         if as_pages > 0 {
+            victims.rs_short = victims.deficit.rs;
             victims.rs_pages = as_pages.saturating_sub(spare);
             victims.deficit.pages = victims.deficit.pages.saturating_add(victims.rs_pages);
             victims.deficit.rs = RsUnits::default();

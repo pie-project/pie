@@ -1163,6 +1163,23 @@ impl Engine for Cuda {
             .map_err(fault)
     }
 
+    fn read_tier_slots(
+        &mut self,
+        slots: &[(engine::chunk::ShapeId, Vec<u32>)],
+    ) -> EngineResult<Vec<u8>> {
+        self.loaded_mut()?.read_tier_slots(slots).map_err(fault)
+    }
+
+    fn write_tier_slots(
+        &mut self,
+        slots: &[(engine::chunk::ShapeId, Vec<u32>)],
+        bytes: &[u8],
+    ) -> EngineResult<()> {
+        self.loaded_mut()?
+            .write_tier_slots(slots, bytes)
+            .map_err(fault)
+    }
+
     fn copy_kv(&mut self, copy: &KvCopy) -> EngineResult<()> {
         copy.validate()?;
         // The host and disk tiers move through `copy_slots` (CONTRACT-BC

@@ -306,6 +306,31 @@ pub trait Engine: Send {
         Err(self.unsupported("write_host_state"))
     }
 
+    /// The bytes of host tier slots (CONTRACT-BC 22): for each `(shape,
+    /// refs)` in order, each ref's slot of that shape at
+    /// [`crate::chunk::SlotShape::tier_offset`] of the host chunks, laid out
+    /// as the device slot (what [`Engine::copy_slots`] moves whole), one
+    /// slot after another; once every copy into them has landed (the
+    /// runtime waits on that copy's completion first). What a shared pool's
+    /// snapshot reads of a set's state: its record's pieces and its rs list
+    /// or window slots, parked on the host.
+    fn read_tier_slots(&mut self, slots: &[(crate::chunk::ShapeId, Vec<u32>)]) -> Result<Vec<u8>> {
+        let _ = slots;
+        Err(self.unsupported("read_tier_slots"))
+    }
+
+    /// Writes `bytes`, laid out as [`Engine::read_tier_slots`] returns
+    /// them, into host tier slots `slots`; a later [`Engine::copy_slots`]
+    /// from the host tier reads them.
+    fn write_tier_slots(
+        &mut self,
+        slots: &[(crate::chunk::ShapeId, Vec<u32>)],
+        bytes: &[u8],
+    ) -> Result<()> {
+        let _ = (slots, bytes);
+        Err(self.unsupported("write_tier_slots"))
+    }
+
     fn disconnect(&self, message: &str) {
         let _ = message;
     }

@@ -338,7 +338,7 @@ impl ResidencyPlanner {
             .map(|proc| proc.resident.clone())
     }
 
-    pub async fn wait_resident(&self, pid: ProcessId) -> Result<(), PlannerError> {
+    pub async fn wait_resident(self: &Arc<Self>, pid: ProcessId) -> Result<(), PlannerError> {
         let mut left_pipeline = false;
         loop {
             let signal = {
@@ -357,6 +357,47 @@ impl ResidencyPlanner {
             }
             self.stats.gate_parks.fetch_add(1, Ordering::Relaxed);
             self.await_signal(&signal, || self.is_resident(pid)).await;
+            if let Some(error) = self.restore_expired(pid) {
+                tracing::warn!(%pid, %error, "planner: a short restore gives up");
+                return Err(error);
+            }
         }
+    }
+
+    /// A restore of `pid` short of room only the policy can make past the
+    /// seat deadline, as a parked allocation is: it leaves the queue owing
+    /// what it did (parked, as a holder's set is), and its error says what
+    /// was short. `None` while it may still wait.
+    fn restore_expired(self: &Arc<Self>, pid: ProcessId) -> Option<PlannerError> {
+        let key = self.with_inner(|inner| {
+            inner
+                .queue
+                .iter()
+                .find(|(_, waiter)| {
+                    waiter.pid == pid && matches!(waiter.kind, WaitKind::Restore { .. })
+                })
+                .map(|(key, _)| *key)
+        })?;
+        let error = self.short_expired(key)?;
+        let settled = self.with_inner(|inner| {
+            if let Some(super::wait::Waiter {
+                pid,
+                kind: WaitKind::Restore { demand },
+            }) = inner.queue.remove(&key)
+                && let Some(proc) = inner.procs.get_mut(&pid)
+                && proc.state == Residency::Evicted
+            {
+                proc.parked = Some(demand);
+                return true;
+            }
+            false
+        });
+        if !settled {
+            // Served or gone meanwhile: the loop reads where it stands.
+            return None;
+        }
+        self.note_short(key, 0, 0);
+        self.poke();
+        Some(error)
     }
 }
