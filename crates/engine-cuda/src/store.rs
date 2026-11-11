@@ -1339,15 +1339,15 @@ impl Pools {
         let need = self.chunk_bytes(least);
         // A stated budget is the pool's before the bodies and programs are
         // held anything; with none, one working set is, and beside it every
-        // weight the pool would hold, where the card holds them with the
-        // bodies' floor and the programs left: the bodies' allowance never
-        // turns weights that fit into weights that stream. A card short of
-        // that streams them (the runtime's call) and the bodies arm.
+        // weight the pool would hold wherever the card holds them with the
+        // programs (the activation's span already out of `live`): the
+        // bodies are held out of what is left after the weights, so their
+        // allowance never turns weights that fit into weights that stream.
+        // A card short of that streams them (the runtime's call).
         let whole = need.saturating_add(self.weight_pool_bytes());
-        let floor = bodies.min(BODIES_FLOOR_BYTES).saturating_add(programs);
         let claim = self
             .budget
-            .unwrap_or(if live >= whole.saturating_add(floor) {
+            .unwrap_or(if live >= whole.saturating_add(programs) {
                 whole
             } else {
                 need
