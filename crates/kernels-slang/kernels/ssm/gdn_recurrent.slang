@@ -201,7 +201,7 @@ void reg_load(uint tid, uint base) {
     [ForceUnroll] for (uint i = 0; i < uint(PIE_DK_REG); i++) { \
         st[i] = buf_[at + i]; \
     }
-    PIE_POOL_ON(seg, GDN_REG_LOAD)
+    PIE_POOL_ON_RW(seg, GDN_REG_LOAD)
 }
 
 void reg_store(uint tid, uint base) {
@@ -213,7 +213,7 @@ void reg_store(uint tid, uint base) {
         [ForceUnroll] for (uint i = 0; i < uint(PIE_DK_REG); i++) { \
             buf_[at + i] = st[i]; \
         }
-        PIE_POOL_ON(seg, GDN_REG_STORE)
+        PIE_POOL_ON_RW(seg, GDN_REG_STORE)
     }
 }
 #endif

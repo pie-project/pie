@@ -126,7 +126,7 @@ void past_load(Column at, int hist, out float2 past[HIST_MAX]) {
         uint i = first + uint(s) * at.pitch + at.col; \
         past[s] = float2(buf_[i], buf_[i + 1u]); \
     }
-    PIE_POOL_ON(seg, CONV_PAST_LOAD)
+    PIE_POOL_ON_RW(seg, CONV_PAST_LOAD)
 }
 
 void past_put(Column at, int s, float2 v) {
@@ -136,7 +136,7 @@ void past_put(Column at, int s, float2 v) {
 #define CONV_PAST_PUT(buf_) \
     buf_[i] = v.x; \
     buf_[i + 1u] = v.y;
-    PIE_POOL_ON(seg, CONV_PAST_PUT)
+    PIE_POOL_ON_RW(seg, CONV_PAST_PUT)
 }
 
 #if defined(PIE_COMMITTED) || defined(PIE_CHUNKED)
