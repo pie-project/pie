@@ -49,7 +49,7 @@ pub(crate) fn nvfp4_mma_worth(
     fan: &Selected,
 ) -> bool {
     nvfp4_mma_spans(ctx, fan.route_count)
-        && !experts.streams()
+        && (!experts.streams() || mma_streams_here())
         && x.dtype == Dtype::Bf16
         && y.dtype == Dtype::Bf16
         && x.width > 0
@@ -108,11 +108,25 @@ pub(crate) fn mxfp4_mma_worth(
 ) -> bool {
     mxfp4_mma_spans(ctx, fan.route_count, experts)
         && !seat.streams()
-        && !table.streams()
+        && (!table.streams() || mma_streams_here())
         && x.dtype == Dtype::Bf16
         && y.dtype == Dtype::Bf16
         && x.width > 0
         && x.width.is_multiple_of(32)
+}
+
+/// Whether this device's register-dequant MMA selects take a streamed
+/// table (one that may name mapped host memory): the Ampere and Ada
+/// kernels (`select_fp4_sm80.cu`) read their experts through it with plain
+/// and cp.async loads, which take a mapped host address as any global one;
+/// Hopper's wgmma slice and sm_120's pipe read by TMA, and tcgen05's by its
+/// own path, so a streamed table stays off them there.
+#[cfg(feature = "cuda")]
+pub(crate) fn mma_streams_here() -> bool {
+    matches!(
+        crate::jit::cache::arch(),
+        Some("sm_80" | "sm_86" | "sm_87" | "sm_89")
+    )
 }
 
 /// The fewest routes an expert averages that Hopper's staged wgmma select

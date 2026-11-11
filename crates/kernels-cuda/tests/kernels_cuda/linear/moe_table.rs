@@ -46,6 +46,23 @@ pub fn same_bits(
         got != want,
         "{what}: a table with two experts swapped landed the same bits"
     );
+    // Streamed (the table may name mapped host memory): the experts half on
+    // a mapped host copy land the pool's bits, and, where no tcgen05 GEMM
+    // takes the held bank, the held bank's.
+    let streamed = |table: u64| ExpertTable {
+        located: false,
+        ..ExpertTable::located(table, (0, 0))
+    };
+    let mixed = crate::common::expert_pool::half_on_host(g, &pool.entries, planes);
+    let pooled = run(g, streamed(pool.table));
+    let host = run(g, streamed(mixed));
+    assert!(host == pooled, "{what}: the streamed host experts moved a bit");
+    if !kernels_cuda::linear::gemm_sm100::supported() {
+        assert!(
+            pooled == want,
+            "{what}: a streamed table's select lands other bits than the held one's"
+        );
+    }
 }
 
 /// Routes that name every expert, experts 0 and 1 among the first.
