@@ -194,8 +194,6 @@ struct Params {
     uint k_origin;
     uint v_origin;
     uint page_stride;
-    // The pool's segments that hold a buffer (1: every page in segment 0).
-    uint segments;
     int gqa_factor;
     int page_size;
     int n_kv_heads;
@@ -326,8 +324,13 @@ void main(uint3 group : SV_GroupID, uint3 local : SV_GroupThreadID) {
             int page = kp / params.page_size;
             if (page != page_at) {
                 uint phys = kv_page_indices[kv_page_indptr[req] + uint(page)];
+#if defined(PIE_ONE_SEGMENT)
+                k_page = SDPA_KV_SCALE * params.k_origin + phys * params.page_stride;
+                v_page = SDPA_KV_SCALE * params.v_origin + phys * params.page_stride;
+#else
                 pie_pool_at(SDPA_KV_SCALE * params.k_origin + phys * params.page_stride, k_seg, k_page);
                 pie_pool_at(SDPA_KV_SCALE * params.v_origin + phys * params.page_stride, v_seg, v_page);
+#endif
                 page_at = page;
             }
             // The token's row in the page, then the head's: `page_row`'s
@@ -349,17 +352,18 @@ void main(uint3 group : SV_GroupID, uint3 local : SV_GroupThreadID) {
                 vw[i] = buf_[v_at + lane + i * LANES_PER_ROW]; \
             }
 #define SDPA_TILE_KV(buf_) SDPA_TILE_K(buf_) SDPA_TILE_V(buf_)
-            // A pool of one segment (the usual) reads it with no branch on
-            // the page: the condition is the fire's, so the loop is the
-            // compiler's to unswitch.
-            if (params.segments == 1u) {
-                SDPA_TILE_KV(pie_seg0)
-            } else if (k_seg == v_seg) {
+#if defined(PIE_ONE_SEGMENT)
+            // A pool of one segment (`_seg1`, which the host picks for one, SPIR-V)
+            // reads it with no copy of the loads a segment.
+            SDPA_TILE_KV(pie_seg0)
+#else
+            if (k_seg == v_seg) {
                 PIE_POOL_ON(k_seg, SDPA_TILE_KV)
             } else {
                 PIE_POOL_ON(k_seg, SDPA_TILE_K)
                 PIE_POOL_ON(v_seg, SDPA_TILE_V)
             }
+#endif
             [ForceUnroll] for (uint i = 0u; i < PAIRS_PER_LANE; i++) {
                 partial += dot(qv[i], word_pair(kw[i]));
             }
@@ -1018,3 +1022,44 @@ void main(uint3 group : SV_GroupID, uint3 local : SV_GroupThreadID) {
 // pie:instantiate attn_sdpa_tiled_lse_l16_r16_bf16_d_512 PIE_HEAD_DIM=512 PIE_TILED=1 PIE_LSE=1 PIE_TILE_LANES=16 PIE_TILE_ROWS=16 PIE_TIER=subgroup
 // pie:instantiate attn_sdpa_fold_bf16 PIE_FOLD=1 PIE_GROUP_X=256
 // pie:instantiate attn_sdpa_fold_lse_bf16 PIE_FOLD=1 PIE_LSE=1 PIE_GROUP_X=256
+
+// pie:instantiate attn_sdpa_tiled_seg1_bf16_d_64 PIE_HEAD_DIM=64 PIE_TILED=1 PIE_TILE_ROWS=32 PIE_TARGET=spirv PIE_ONE_SEGMENT=1
+// pie:instantiate attn_sdpa_tiled_r16_seg1_bf16_d_64 PIE_HEAD_DIM=64 PIE_TILED=1 PIE_TILE_ROWS=16 PIE_TARGET=spirv PIE_ONE_SEGMENT=1
+// pie:instantiate attn_sdpa_tiled_r8_seg1_bf16_d_64 PIE_HEAD_DIM=64 PIE_TILED=1 PIE_TILE_ROWS=8 PIE_TARGET=spirv PIE_ONE_SEGMENT=1
+// pie:instantiate attn_sdpa_tiled_lse_seg1_bf16_d_64 PIE_HEAD_DIM=64 PIE_TILED=1 PIE_LSE=1 PIE_TILE_ROWS=32 PIE_TARGET=spirv PIE_ONE_SEGMENT=1
+// pie:instantiate attn_sdpa_tiled_lse_r16_seg1_bf16_d_64 PIE_HEAD_DIM=64 PIE_TILED=1 PIE_LSE=1 PIE_TILE_ROWS=16 PIE_TARGET=spirv PIE_ONE_SEGMENT=1
+// pie:instantiate attn_sdpa_tiled_lse_r8_seg1_bf16_d_64 PIE_HEAD_DIM=64 PIE_TILED=1 PIE_LSE=1 PIE_TILE_ROWS=8 PIE_TARGET=spirv PIE_ONE_SEGMENT=1
+// pie:instantiate attn_sdpa_tiled_l16_r16_seg1_bf16_d_64 PIE_HEAD_DIM=64 PIE_TILED=1 PIE_TILE_LANES=16 PIE_TILE_ROWS=16 PIE_TARGET=spirv PIE_ONE_SEGMENT=1
+// pie:instantiate attn_sdpa_tiled_l16_r16_seg1_bf16_d_64 PIE_HEAD_DIM=64 PIE_TILED=1 PIE_TILE_LANES=16 PIE_TILE_ROWS=16 PIE_TIER=subgroup PIE_TARGET=spirv PIE_ONE_SEGMENT=1
+// pie:instantiate attn_sdpa_tiled_lse_l16_r16_seg1_bf16_d_64 PIE_HEAD_DIM=64 PIE_TILED=1 PIE_LSE=1 PIE_TILE_LANES=16 PIE_TILE_ROWS=16 PIE_TARGET=spirv PIE_ONE_SEGMENT=1
+// pie:instantiate attn_sdpa_tiled_lse_l16_r16_seg1_bf16_d_64 PIE_HEAD_DIM=64 PIE_TILED=1 PIE_LSE=1 PIE_TILE_LANES=16 PIE_TILE_ROWS=16 PIE_TIER=subgroup PIE_TARGET=spirv PIE_ONE_SEGMENT=1
+// pie:instantiate attn_sdpa_tiled_seg1_bf16_d_128 PIE_HEAD_DIM=128 PIE_TILED=1 PIE_TILE_ROWS=32 PIE_TARGET=spirv PIE_ONE_SEGMENT=1
+// pie:instantiate attn_sdpa_tiled_r16_seg1_bf16_d_128 PIE_HEAD_DIM=128 PIE_TILED=1 PIE_TILE_ROWS=16 PIE_TARGET=spirv PIE_ONE_SEGMENT=1
+// pie:instantiate attn_sdpa_tiled_r8_seg1_bf16_d_128 PIE_HEAD_DIM=128 PIE_TILED=1 PIE_TILE_ROWS=8 PIE_TARGET=spirv PIE_ONE_SEGMENT=1
+// pie:instantiate attn_sdpa_tiled_lse_seg1_bf16_d_128 PIE_HEAD_DIM=128 PIE_TILED=1 PIE_LSE=1 PIE_TILE_ROWS=32 PIE_TARGET=spirv PIE_ONE_SEGMENT=1
+// pie:instantiate attn_sdpa_tiled_lse_r16_seg1_bf16_d_128 PIE_HEAD_DIM=128 PIE_TILED=1 PIE_LSE=1 PIE_TILE_ROWS=16 PIE_TARGET=spirv PIE_ONE_SEGMENT=1
+// pie:instantiate attn_sdpa_tiled_lse_r8_seg1_bf16_d_128 PIE_HEAD_DIM=128 PIE_TILED=1 PIE_LSE=1 PIE_TILE_ROWS=8 PIE_TARGET=spirv PIE_ONE_SEGMENT=1
+// pie:instantiate attn_sdpa_tiled_l16_r16_seg1_bf16_d_128 PIE_HEAD_DIM=128 PIE_TILED=1 PIE_TILE_LANES=16 PIE_TILE_ROWS=16 PIE_TARGET=spirv PIE_ONE_SEGMENT=1
+// pie:instantiate attn_sdpa_tiled_l16_r16_seg1_bf16_d_128 PIE_HEAD_DIM=128 PIE_TILED=1 PIE_TILE_LANES=16 PIE_TILE_ROWS=16 PIE_TIER=subgroup PIE_TARGET=spirv PIE_ONE_SEGMENT=1
+// pie:instantiate attn_sdpa_tiled_lse_l16_r16_seg1_bf16_d_128 PIE_HEAD_DIM=128 PIE_TILED=1 PIE_LSE=1 PIE_TILE_LANES=16 PIE_TILE_ROWS=16 PIE_TARGET=spirv PIE_ONE_SEGMENT=1
+// pie:instantiate attn_sdpa_tiled_lse_l16_r16_seg1_bf16_d_128 PIE_HEAD_DIM=128 PIE_TILED=1 PIE_LSE=1 PIE_TILE_LANES=16 PIE_TILE_ROWS=16 PIE_TIER=subgroup PIE_TARGET=spirv PIE_ONE_SEGMENT=1
+// pie:instantiate attn_sdpa_tiled_seg1_bf16_d_256 PIE_HEAD_DIM=256 PIE_TILED=1 PIE_TILE_ROWS=32 PIE_TARGET=spirv PIE_ONE_SEGMENT=1
+// pie:instantiate attn_sdpa_tiled_r16_seg1_bf16_d_256 PIE_HEAD_DIM=256 PIE_TILED=1 PIE_TILE_ROWS=16 PIE_TARGET=spirv PIE_ONE_SEGMENT=1
+// pie:instantiate attn_sdpa_tiled_r8_seg1_bf16_d_256 PIE_HEAD_DIM=256 PIE_TILED=1 PIE_TILE_ROWS=8 PIE_TARGET=spirv PIE_ONE_SEGMENT=1
+// pie:instantiate attn_sdpa_tiled_lse_seg1_bf16_d_256 PIE_HEAD_DIM=256 PIE_TILED=1 PIE_LSE=1 PIE_TILE_ROWS=32 PIE_TARGET=spirv PIE_ONE_SEGMENT=1
+// pie:instantiate attn_sdpa_tiled_lse_r16_seg1_bf16_d_256 PIE_HEAD_DIM=256 PIE_TILED=1 PIE_LSE=1 PIE_TILE_ROWS=16 PIE_TARGET=spirv PIE_ONE_SEGMENT=1
+// pie:instantiate attn_sdpa_tiled_lse_r8_seg1_bf16_d_256 PIE_HEAD_DIM=256 PIE_TILED=1 PIE_LSE=1 PIE_TILE_ROWS=8 PIE_TARGET=spirv PIE_ONE_SEGMENT=1
+// pie:instantiate attn_sdpa_tiled_l16_r16_seg1_bf16_d_256 PIE_HEAD_DIM=256 PIE_TILED=1 PIE_TILE_LANES=16 PIE_TILE_ROWS=16 PIE_TARGET=spirv PIE_ONE_SEGMENT=1
+// pie:instantiate attn_sdpa_tiled_l16_r16_seg1_bf16_d_256 PIE_HEAD_DIM=256 PIE_TILED=1 PIE_TILE_LANES=16 PIE_TILE_ROWS=16 PIE_TIER=subgroup PIE_TARGET=spirv PIE_ONE_SEGMENT=1
+// pie:instantiate attn_sdpa_tiled_lse_l16_r16_seg1_bf16_d_256 PIE_HEAD_DIM=256 PIE_TILED=1 PIE_LSE=1 PIE_TILE_LANES=16 PIE_TILE_ROWS=16 PIE_TARGET=spirv PIE_ONE_SEGMENT=1
+// pie:instantiate attn_sdpa_tiled_lse_l16_r16_seg1_bf16_d_256 PIE_HEAD_DIM=256 PIE_TILED=1 PIE_LSE=1 PIE_TILE_LANES=16 PIE_TILE_ROWS=16 PIE_TIER=subgroup PIE_TARGET=spirv PIE_ONE_SEGMENT=1
+// pie:instantiate attn_sdpa_tiled_seg1_bf16_d_512 PIE_HEAD_DIM=512 PIE_TILED=1 PIE_TILE_ROWS=32 PIE_TARGET=spirv PIE_ONE_SEGMENT=1
+// pie:instantiate attn_sdpa_tiled_r16_seg1_bf16_d_512 PIE_HEAD_DIM=512 PIE_TILED=1 PIE_TILE_ROWS=16 PIE_TARGET=spirv PIE_ONE_SEGMENT=1
+// pie:instantiate attn_sdpa_tiled_r8_seg1_bf16_d_512 PIE_HEAD_DIM=512 PIE_TILED=1 PIE_TILE_ROWS=8 PIE_TARGET=spirv PIE_ONE_SEGMENT=1
+// pie:instantiate attn_sdpa_tiled_lse_seg1_bf16_d_512 PIE_HEAD_DIM=512 PIE_TILED=1 PIE_LSE=1 PIE_TILE_ROWS=32 PIE_TARGET=spirv PIE_ONE_SEGMENT=1
+// pie:instantiate attn_sdpa_tiled_lse_r16_seg1_bf16_d_512 PIE_HEAD_DIM=512 PIE_TILED=1 PIE_LSE=1 PIE_TILE_ROWS=16 PIE_TARGET=spirv PIE_ONE_SEGMENT=1
+// pie:instantiate attn_sdpa_tiled_lse_r8_seg1_bf16_d_512 PIE_HEAD_DIM=512 PIE_TILED=1 PIE_LSE=1 PIE_TILE_ROWS=8 PIE_TARGET=spirv PIE_ONE_SEGMENT=1
+// pie:instantiate attn_sdpa_tiled_l16_r16_seg1_bf16_d_512 PIE_HEAD_DIM=512 PIE_TILED=1 PIE_TILE_LANES=16 PIE_TILE_ROWS=16 PIE_TARGET=spirv PIE_ONE_SEGMENT=1
+// pie:instantiate attn_sdpa_tiled_l16_r16_seg1_bf16_d_512 PIE_HEAD_DIM=512 PIE_TILED=1 PIE_TILE_LANES=16 PIE_TILE_ROWS=16 PIE_TIER=subgroup PIE_TARGET=spirv PIE_ONE_SEGMENT=1
+// pie:instantiate attn_sdpa_tiled_lse_l16_r16_seg1_bf16_d_512 PIE_HEAD_DIM=512 PIE_TILED=1 PIE_LSE=1 PIE_TILE_LANES=16 PIE_TILE_ROWS=16 PIE_TARGET=spirv PIE_ONE_SEGMENT=1
+// pie:instantiate attn_sdpa_tiled_lse_l16_r16_seg1_bf16_d_512 PIE_HEAD_DIM=512 PIE_TILED=1 PIE_LSE=1 PIE_TILE_LANES=16 PIE_TILE_ROWS=16 PIE_TIER=subgroup PIE_TARGET=spirv PIE_ONE_SEGMENT=1
