@@ -1224,8 +1224,8 @@ The `new-memory/` directory is bookkeeping and is removed before anything lands 
 - gpt-oss-20b (sm_120) p2048 after a shared 512 prefix: 93-97 ms vs main 96-97 ms (was 117 ms, -25%); cold 2048
   ~4% faster than main; no unrecorded fires. gemma-4-E2B (pre-merge): 67.5 -> 55 ms with prefix, main reuses none.
   runtime store 126 / planner 51 / pipeline 16 pass.
-- Open: gpt-oss resumed tokens differ from cold in 3-4/6 seeds (likely split-prefill MoE near-ties; main reuse
-  control pending).
+- Closed: gpt-oss resumed tokens differ from cold in 3-4/6 seeds — main's own reuse diverges on the same seeds at the same
+  tokens (split-prefill MoE near-ties), cold outputs identical to main.
 
 ### M100 — 2026-11-11: Metal tier slot copies (A15) and first perf fixes; A21 n/a on Metal
 - `sc/metal-gate` (f6b70f094, e1b93e4da): read/write_tier_slots on Metal's host tier (one memcpy per slot, unwritten
