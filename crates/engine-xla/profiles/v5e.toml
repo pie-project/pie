@@ -37,6 +37,10 @@ ssm.step_mxu = 16
 # past a row block's own prompt where a fire's prompts meet, and the v5e's softmax holds its VPU
 # (Qwen3-0.6B pf256-512 1792-row fires: 106.1k -> 108.2k tok/s; a v6e loses 10%, so it stays at 256)
 attn.flash_narrow_rows = 128
+# a prompt fire of 2304 rows and more lays its GLU rows and gated-norm rows out before the dots that read
+# them: fused into the dots, they cost Qwen3.8-27B's mini8 cut's 2816-row fires 124.2 ms (the down
+# product at 68-75% of the MXU's rate), laid out 116.4 (96%); pf32-512 at 2816 rows 22.5k -> 23.9k tok/s
+linear.dot_barrier_rows = 2304
 # a routed MLP's prompt of 1280 tokens and more sums each block of 128 tokens' runs of expert rows by its
 # own dot, as on v6e, not by the pick (Gemma-4-26B-A4B's 32-expert cut, 1664 tokens: 2132 -> 1734 us;
 # Qwen3.6-35B-A3B's 16-expert cut 995 -> 936); at 1088 Qwen's pick is cheaper (690 vs 725)
@@ -68,6 +72,7 @@ measured = [
   "kernel.attn.decode_pages",
   "kernel.attn.flash_narrow_rows",
   "kernel.attn.unrolled_blocks",
+  "kernel.linear.dot_barrier_rows",
   "kernel.moe.cost.onehot_mi",
   "kernel.moe.gmm_fuse_from",
   "kernel.moe.gmm_glu",

@@ -268,6 +268,9 @@ pub struct Func {
     /// From this many rows a narrow-head rope turns the row as it lies
     /// (`tuning::RopeFlatRows`; 0 never).
     rope_flat_rows: i64,
+    /// From this many rows a dot's wide activation is laid out before it
+    /// (`tuning::DotBarrierRows`; 0 never).
+    dot_barrier_rows: i64,
 }
 
 fn list<T: fmt::Display>(xs: &[T]) -> String {
@@ -369,6 +372,7 @@ impl Func {
             row_major: Vec::new(),
             row_major_results: false,
             rope_flat_rows: 0,
+            dot_barrier_rows: 0,
         }
     }
 
@@ -380,6 +384,17 @@ impl Func {
     #[must_use]
     pub fn rope_flat_rows(&self) -> i64 {
         self.rope_flat_rows
+    }
+
+    /// Sets the row count from which a dot's wide activation is laid out
+    /// before it.
+    pub fn set_dot_barrier_rows(&mut self, rows: i64) {
+        self.dot_barrier_rows = rows;
+    }
+
+    #[must_use]
+    pub fn dot_barrier_rows(&self) -> i64 {
+        self.dot_barrier_rows
     }
 
     #[must_use]
