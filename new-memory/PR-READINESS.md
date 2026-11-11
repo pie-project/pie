@@ -39,11 +39,10 @@ Each backend shows decode (c1 / c8 / c64 / c256), prefill (512 / 2048) and boot 
 medians. Known gaps to close:
 - XLA/TPU v6e (M77): prefill 512 -19%, 2048 -12%; qwen35 c64 -13%; MoE c1 -9%, c256 -12%, prefill -10%.
 - ROCm synth: flip only at parity (in progress).
-- CUDA (L40S, pageable host tier, server-level medians of 3; all models arm fully; end RSS 5.3-7.5 GB except
-  Qwen3-8B's demotion, which the keyed-demote gate removes): remaining gaps, flat across runs:
-  gpt-oss-20b prefill 2048 -25% (= missed prefix reuse, A20); gemma-4-E2B prefill 512 -8.6%, c64 -4.1%, c256 -5.6%; Qwen3-8B c256 -3.3%,
-  prefill 2048 +4%; Qwen3.5-0.8B c256 -3.8%, c64 -1.7%. At parity or faster: Qwen3.5-9B; c1/c8 everywhere; gpt-oss
-  c64/c256 +24/+29%; Qwen3.5-0.8B prefill.
+- CUDA (L40S, tip + pool-fit fix, server-level medians): remaining gaps: gemma-4-E2B c64 -3.9%, c256 -5.9%,
+  warm boot +13% (154 vs 85 compositions armed); Qwen3.5-0.8B c64 -2.0%, c256 -3.4%; Qwen3-8B c256 -1.4%;
+  gpt-oss prefill 2048 (A20, window checkpoint). Parity or faster elsewhere (gpt-oss c64/c256 +25/+30%; Qwen3.5
+  prefill and boot faster; Qwen3-8B end RSS 3.6 vs 2.5 GB after the keyed-demote gate).
 - ROCm: default config arms 0 bodies on new-memory (flat range takes the spare) -> speed table waits for the fix.
 - Vulkan/wgpu, Metal: full comparison vs main not yet run.
 
