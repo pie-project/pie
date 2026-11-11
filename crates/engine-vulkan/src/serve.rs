@@ -1158,6 +1158,25 @@ impl Shell {
         Ok(())
     }
 
+    /// See `Engine::read_tier_slots`: every frame and copy lands first.
+    pub fn read_tier_slots(
+        &mut self,
+        slots: &[(engine::chunk::ShapeId, Vec<u32>)],
+    ) -> Result<Vec<u8>> {
+        self.drain()?;
+        self.pools.read_tier_slots(slots)
+    }
+
+    /// See `Engine::write_tier_slots`: every frame and copy lands first.
+    pub fn write_tier_slots(
+        &mut self,
+        slots: &[(engine::chunk::ShapeId, Vec<u32>)],
+        bytes: &[u8],
+    ) -> Result<()> {
+        self.drain()?;
+        self.pools.write_tier_slots(slots, bytes)
+    }
+
     /// The pool as the runtime counts it.
     #[must_use]
     pub fn pool_chunk_facts(&self) -> engine::chunk::ChunkFacts {
