@@ -678,12 +678,18 @@ impl Older {
     /// The rectangle's keys and values, `[OLD_PAGES · ps, w]` each.
     fn gather(&self, f: &mut Func) -> Built<(Val, Val)> {
         let n = OLD_PAGES;
-        // Both planes of the chunk pool: the pages by DMA, each plane's map
-        // applied in the kernel (the unmapped ids one computation a fire).
+        // Both planes of the chunk pool by DMA, each plane's map applied in
+        // the kernel (the unmapped ids one computation a fire), only with
+        // `PIE_XLA_OLDER_DMA=1`: the kernel call falls between the queries'
+        // projection and the flash, and XLA evicts the queries from fast
+        // memory around it (v6e qwen3-0.6b, 2048-token prefill: a 5.6 us
+        // copy and a flash 7 us slower a layer, against the XLA gather's
+        // 7 us). The XLA gather reads the pool's pages as blocks.
         if let (Some((pool, Elem::Bf16)), Some((pool_v, Elem::Bf16))) =
             (f.view_parts(self.planes.0), f.view_parts(self.planes.1))
             && pool == pool_v
             && crate::blocks::on()
+            && std::env::var("PIE_XLA_OLDER_DMA").is_ok_and(|v| v == "1")
         {
             let mut planes = Vec::with_capacity(2);
             for (plane, map) in [(self.planes.0, self.maps[0]), (self.planes.1, self.maps[1])] {
@@ -726,7 +732,7 @@ impl Older {
             let g = f.gather(paged, at, &dims, &[1, self.ps, w])?;
             f.reshape(g, &[n * self.ps, w])
         };
-        Ok((one(f, self.planes.0, at)?, one(f, self.planes.1, at_v)?))
+        f.with_xla_reads(|f| Ok((one(f, self.planes.0, at)?, one(f, self.planes.1, at_v)?)))
     }
 }
 

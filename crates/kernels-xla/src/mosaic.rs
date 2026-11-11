@@ -296,6 +296,86 @@ impl Body {
         self.int_binary("arith.andi", a, b, false)
     }
 
+    pub fn ori(&mut self, a: V, b: V) -> Built<V> {
+        self.int_binary("arith.ori", a, b, false)
+    }
+    /// Logical right shift.
+    pub fn shrui(&mut self, a: V, b: V) -> Built<V> {
+        self.int_binary("arith.shrui", a, b, false)
+    }
+
+    /// A vector's bits read as `elem` of the same width (`arith.bitcast`).
+    pub fn bitcast_v(&mut self, v: V, elem: Elem) -> Built<V> {
+        let (d, e) = self.vec_of(v)?;
+        if e.bits() != elem.bits() {
+            return bad(format!("a bitcast of {e:?} to {elem:?}"));
+        }
+        Ok(self.op1("arith.bitcast", &[v], "", MTy::Vector(d, elem)))
+    }
+
+    /// `dims` of VMEM ref `r` from `at`, every `strides[i]`-th along axis
+    /// `i` (`tpu.strided_load`).
+    pub fn strided_load(&mut self, r: V, at: &[V], strides: &[i64], dims: &[i64]) -> Built<V> {
+        let MTy::Ref(rd, elem, Space::Vmem) = self.ty(r).clone() else {
+            return bad(format!("a strided load from {}", self.ty(r)));
+        };
+        if rd.len() != at.len() || strides.len() != rd.len() || dims.len() != rd.len() {
+            return bad(format!("strided load of {dims:?} from {}", self.ty(r)));
+        }
+        let mut ops = vec![r];
+        for &i in at {
+            ops.push(self.as_index(i)?);
+        }
+        let st = strides
+            .iter()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>()
+            .join(", ");
+        Ok(self.op1(
+            "tpu.strided_load",
+            &ops,
+            &format!("strides = array<i32: {st}>"),
+            MTy::Vector(dims.to_vec(), elem),
+        ))
+    }
+
+    /// `v` into VMEM ref `r` from `at`, every `strides[i]`-th along axis
+    /// `i` (`tpu.strided_store`).
+    pub fn strided_store(&mut self, v: V, r: V, at: &[V], strides: &[i64]) -> Built<()> {
+        let (MTy::Vector(vd, ve), MTy::Ref(rd, re, Space::Vmem)) =
+            (self.ty(v).clone(), self.ty(r).clone())
+        else {
+            return bad(format!(
+                "strided store of {} into {}",
+                self.ty(v),
+                self.ty(r)
+            ));
+        };
+        if ve != re || vd.len() != rd.len() || at.len() != rd.len() || strides.len() != rd.len() {
+            return bad(format!(
+                "strided store of {} into {}",
+                self.ty(v),
+                self.ty(r)
+            ));
+        }
+        let mut ops = vec![v, r];
+        for &i in at {
+            ops.push(self.as_index(i)?);
+        }
+        let st = strides
+            .iter()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>()
+            .join(", ");
+        self.op(
+            "tpu.strided_store",
+            &ops,
+            &format!("strides = array<i32: {st}>"),
+            &[],
+        );
+        Ok(())
+    }
+
     pub fn cmpi(&mut self, p: ICmp, a: V, b: V) -> Built<V> {
         if self.ty(a) != self.ty(b) {
             return bad(format!("cmpi over {} and {}", self.ty(a), self.ty(b)));

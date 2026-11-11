@@ -279,6 +279,9 @@ pub struct Func {
     views: std::collections::HashMap<u32, view::View>,
     /// What views were materialized for (each a copy of the pool).
     materialized: Vec<String>,
+    /// Pool view reads by XLA's gather, not a DMA kernel call (see
+    /// [`Func::with_xla_reads`]).
+    xla_reads: bool,
 }
 
 fn list<T: fmt::Display>(xs: &[T]) -> String {
@@ -366,6 +369,16 @@ pub fn f16_bits(x: f32) -> u16 {
 pub type Branch<'a> = Box<dyn FnOnce(&mut Func) -> Built<Vec<Val>> + 'a>;
 
 impl Func {
+    /// `build` with pool view reads by XLA's gather rather than a DMA
+    /// kernel: a kernel call is a boundary XLA evicts fast-memory buffers
+    /// around, where the read sits between a producer and its consumer.
+    pub fn with_xla_reads<T>(&mut self, build: impl FnOnce(&mut Func) -> T) -> T {
+        let was = std::mem::replace(&mut self.xla_reads, true);
+        let out = build(self);
+        self.xla_reads = was;
+        out
+    }
+
     #[must_use]
     pub fn new(name: &str) -> Self {
         Self {
@@ -382,6 +395,7 @@ impl Func {
             rope_flat_rows: 0,
             views: std::collections::HashMap::new(),
             materialized: Vec::new(),
+            xla_reads: false,
         }
     }
 
