@@ -1697,3 +1697,74 @@ fn a_fire_of_a_process_unknown_or_gone_counts_nothing() {
     drop(fire);
     assert!(planner.with_inner(|inner| !inner.procs.contains_key(&pid)));
 }
+
+/// text-completion-bench, 96 MiB, a 5,000-token lane beside seven short
+/// ones: once nothing of the process ran, its sixth short lane parked for a
+/// state slot its own five held sets and scattered pages left no chunk for.
+/// It held all the pool held, so the restart freed only its own and the
+/// replay stalled in the same place, hundreds of times a minute. A stalled
+/// victim that alone holds anything fails instead, saying so.
+#[test]
+fn a_stalled_process_that_alone_holds_the_pool_fails_instead_of_restarting() {
+    let _schedule = crate::policy::schedule::TEST_LOCK.blocking_read();
+    let model = crate::store::registry::register_model(16, &[64], &[2]);
+    let planner = Arc::new(ResidencyPlanner::new(departure_pool(model)));
+    let process = leaving(&planner, model, false);
+    let pid = process.pid;
+    crate::inferlet::process::declare_restartable(pid);
+    let keys = park_asks(&planner, pid, &[4]);
+    assert!(planner.sole_holder(pid));
+    planner.check_starvation(StarveCause::NoSwapRoom);
+    planner.with_inner(|inner| {
+        let WaitKind::Allocation {
+            outcome: Some(Err(error)),
+            ..
+        } = &inner.queue[&keys[0]].kind
+        else {
+            panic!("the parked ask fails");
+        };
+        assert!(
+            matches!(
+                error,
+                PlannerError::Starved {
+                    cause: StarveCause::SoleHolder,
+                    ..
+                }
+            ),
+            "{error}"
+        );
+        assert!(
+            error.to_string().contains("this process alone holds"),
+            "{error}"
+        );
+    });
+    assert_eq!(
+        planner.stats.starvation_restarts.load(Ordering::Relaxed),
+        0,
+        "no replay into the same wall"
+    );
+    drop(terminate(&planner, process));
+}
+
+/// Where another process holds pages, the reclaim keeps its say: a restart
+/// of the youngest frees what the others may then take.
+#[test]
+fn a_stalled_process_beside_another_holder_is_still_reclaimed_by_restart() {
+    let _schedule = crate::policy::schedule::TEST_LOCK.blocking_read();
+    let model = crate::store::registry::register_model(16, &[64], &[2]);
+    let planner = Arc::new(ResidencyPlanner::new(departure_pool(model)));
+    let older = leaving(&planner, model, false);
+    let younger = leaving(&planner, model, false);
+    crate::inferlet::process::declare_restartable(younger.pid);
+    park_asks(&planner, older.pid, &[3]);
+    park_asks(&planner, younger.pid, &[3]);
+    assert!(!planner.sole_holder(younger.pid));
+    planner.check_starvation(StarveCause::NoSwapRoom);
+    assert_eq!(
+        planner.stats.starvation_restarts.load(Ordering::Relaxed),
+        1,
+        "the younger holder is reclaimed"
+    );
+    drop(terminate(&planner, younger));
+    drop(terminate(&planner, older));
+}
