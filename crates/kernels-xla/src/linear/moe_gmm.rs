@@ -348,7 +348,8 @@ impl Gmm {
         let vmem =
             2 * j * tm * k * 2 + 2 * k * n * wb + convert + j * tm * n * 4 + 2 * j * tm * wo * ob;
         let floor = (32 << 20).min(self.vmem_cap);
-        let limit = (vmem * 2 + (8 << 20)).clamp(floor, self.vmem_cap);
+        let full = std::env::var("PIE_GMM_FULL").unwrap_or_default();
+        let limit = if full == "both" || (full == "up" && glu.is_some()) || (full == "down" && glu.is_none()) { self.vmem_cap } else { (vmem * 2 + (8 << 20)).clamp(floor, self.vmem_cap) };
         let steps = self.steps();
         let kernel = Kernel {
             name: "gmm".into(),
@@ -1360,7 +1361,7 @@ impl SegmentSum {
             window: Window::Blocked,
             index: Box::new(|b: &mut Body, g: &Grid| Ok(vec![g.ids[0], b.i32(0)])),
         };
-        let limit = (self.vmem() + (16 << 20)).min(self.vmem_cap);
+        let limit = if std::env::var("PIE_SEG_FULL").is_ok() { self.vmem_cap } else { (self.vmem() + (16 << 20)).min(self.vmem_cap) };
         let kernel = Kernel {
             name: "segment_sum".into(),
             grid: vec![nb],
