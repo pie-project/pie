@@ -2553,7 +2553,21 @@ pub fn experts(
     // blocks.)
     if tuning.moe_segment_tokens > 0
         && t >= tuning.moe_segment_from
-        && let Some(y) = segment_sum(f, &sorted, up, up_fan, down_rows, r, valid, tuning)?
+        && let Some(y) = segment_sum(
+            f,
+            &sorted,
+            up,
+            up_fan,
+            down_rows,
+            r,
+            valid,
+            tuning,
+            if y.dtype == Dtype::Bf16 {
+                Elem::Bf16
+            } else {
+                Elem::F32
+            },
+        )?
     {
         return Ok(Some(y));
     }
@@ -2615,6 +2629,7 @@ fn segment_sum(
     r: Val,
     valid: Val,
     tuning: Tuning,
+    out: Elem,
 ) -> Result<Option<Val>, Error> {
     use crate::linear::moe_gmm::SegmentSum;
     let (p, e, t, k, tm) = (fan.pairs(), fan.experts, fan.tokens, fan.top_k, spec.tm);
@@ -2630,6 +2645,7 @@ fn segment_sum(
         chunk,
         depth: SegmentSum::depth_of(tb, k, e, chunk),
         vmem_cap: tuning.vmem_cap(),
+        out,
     };
     // (The cuts it is measured on: 32 experts, rows 2048 and 2816 wide.)
     if !seg.fits() || n % 128 != 0 || n > 4096 || e > 32 || tm % chunk != 0 {
