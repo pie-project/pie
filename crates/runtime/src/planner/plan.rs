@@ -120,7 +120,8 @@ impl ResidencyPlanner {
                     if self.port.grow_pages(count) {
                         return;
                     }
-                    // Idle cache moves down a tier before any is dropped.
+                    // Idle cache a policy keys above the floor moves down
+                    // a tier before any is dropped; the rest is dropped.
                     if self.demote_idle() {
                         return;
                     }
@@ -140,7 +141,8 @@ impl ResidencyPlanner {
                         return;
                     }
                     // On a shared pool the chunks idle cache holds open for
-                    // state too: it moves down a tier before any is dropped.
+                    // state too: what is keyed above the floor moves down a
+                    // tier before any is dropped.
                     let as_pages = self.port.rs_as_pages(need);
                     if as_pages > 0 && self.demote_idle() {
                         return;

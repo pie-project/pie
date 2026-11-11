@@ -353,8 +353,11 @@ impl ResidencyPlanner {
     }
 
     /// Idle cache the device is short of room for moves down a tier, host
-    /// first then disk, rather than being dropped: whether a move is on its
-    /// way (its landing frees the pages and pokes the planner). Only under
+    /// first then disk, rather than being dropped, where a policy keys it
+    /// above the retention floor (the stores gate it: floor-keyed cache is
+    /// dropped by [`Self::reclaim_idle_once`] instead, never copied): whether
+    /// a move is on its way (its landing frees the pages and pokes the
+    /// planner). Only under
     /// a waiter's want, never while pages stand free; what keeps back a
     /// share of the host for suspends ([`HOST_RESERVE_DIVISOR`]) is not
     /// spent on cache.
