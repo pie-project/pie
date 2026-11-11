@@ -91,7 +91,6 @@ fn mpp_attention_over_a_bf16_pool_matches_fp64() {
             head_stride: d as u64,
             q8: false,
             page_stride: [0; 2],
-            plane_offset: [0; 2],
         }
         .paged_densely();
         // mode 0 is plain causal, 1 a sparse mask, 2 a mask that also admits later keys.

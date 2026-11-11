@@ -153,7 +153,6 @@ fn a_score_capture_reads_its_own_lists_last_page() {
             head_stride: HEAD_DIM as u64,
             q8: false,
             page_stride: [0; 2],
-            plane_offset: [0; 2],
         }
         .paged_densely();
         let capture = |last_page_len: usize| -> Vec<f32> {

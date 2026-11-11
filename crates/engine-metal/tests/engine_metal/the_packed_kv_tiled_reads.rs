@@ -297,7 +297,6 @@ fn pool_over(rig: &mut Rig, keys: u32, values: u32, dtype: Dtype, head_dim: usiz
         head_stride: head_dim as u64,
         q8: false,
         page_stride: [0; 2],
-        plane_offset: [0; 2],
     }
     .paged_densely()
 }
