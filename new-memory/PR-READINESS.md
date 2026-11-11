@@ -12,13 +12,13 @@ Branch today: 432 commits ahead of main, 782 files, +86k / -13k. Main merged in 
 | A5 | ROCm generated region kernels: flip + delete hand rules (b8/b64 in-process numbers pending) | AMD | in progress |
 | A6 | XLA: Mosaic page copy / flash / kv append on the pool; speed vs main; MoE result varies with pool chunk count (CUDA plugin) | TPU | in progress |
 | A7 | XLA weight streaming + snapshots (sc/xla2, partial) | TPU | queued |
-| A8 | Cerebras: main's new wafer-program backend (#1435, merged M87) states degenerate facts; pool / tiers / record copies / weight streaming need its owner + hardware | Cerebras owner | blocked |
+| A8 | Cerebras: main's new wafer-program backend (#1435, merged M87) states degenerate facts; pool / tiers / record copies / weight streaming need its owner + hardware | — | OUT OF SCOPE for this PR (user); listed as a known limitation |
 | A10 | Delete device/host weight budgets, dense rotor, dense host tier; max_state_slots | L40S, Metal, VK5 | done M76 (dead legacy tier cleanup left) |
 | A11 | Eager path wrong tokens; nothing arms at small budgets | EAGER | done M82 (ROCm verify pending) |
 | A12 | Shared-pool snapshots; host-full hang + miscount; keep-handles key covers the record | RT | done M84 (other engines: A15) |
 | A13 | Record rs-buffered fires (MTP / spec decode on hybrids walk eagerly; same on main) — graph capture rule | L40S | after perf fixes |
 | A14 | Wire the rung shrink: scheduler caps a fire's tokens by the activation rung; SharedGrow shrink/restore_rung move the boundary (SPEC 6) | RT | queued |
-| A15 | read_tier_slots / write_tier_slots (snapshots on shared pools) on Metal, Vulkan, wgpu, XLA, Cerebras (CUDA in sc/rt4) | Metal agent, VKP, TPU, (Cerebras: assign) | queued |
+| A15 | read_tier_slots / write_tier_slots (snapshots on shared pools) on Metal, Vulkan, wgpu, XLA (CUDA in sc/rt4; Cerebras out of scope) | Metal agent, VKP, TPU | queued |
 | A16 | eager-fix regression: held weights flip to streaming on ROCm 30B MoE (body reservation) and stall | EAGER (sc/eager-fix-2) | in progress |
 | A17 | Inferlet SDK guest panic (wit-bindgen inter-task-wakeup) when requests wait for admission at small budgets | SDK agent | in progress |
 | A18 | Idle cache demoted only when PLEX keys it above the floor (user decision) | RT6 | in progress |
