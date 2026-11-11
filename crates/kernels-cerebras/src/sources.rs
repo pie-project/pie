@@ -85,6 +85,10 @@ pub const KERNELS: &[(&str, &str)] = &[
 /// comptime params (`@import_module("ops/<name>", ..)`). A build writes them all beside the kinds.
 pub const OPS: &[(&str, &str)] = &[
     (
+        "argmax.csl",
+        include_str!("../programs/wafer/ops/argmax.csl"),
+    ),
+    (
         "fabric.csl",
         include_str!("../programs/wafer/ops/fabric.csl"),
     ),
