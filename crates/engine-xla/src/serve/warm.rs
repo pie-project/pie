@@ -227,6 +227,21 @@ impl Shell {
                 }
             }
         }
+        // The host holds the programs in this order while its memory lasts
+        // and parks the rest (`compile_deferred`): a decode at a longer page
+        // bound waits on its lanes' contexts growing to it, so the shapes go
+        // by the bound their lanes reach (a prompt's at the floor's), and a
+        // v5e's 2048-row ladder parks its long decodes, not the mixed fires
+        // a c256 round takes.
+        let floor = pad.rung(pad.page_floor).min(cap);
+        shapes.sort_by_key(|shape| {
+            shape
+                .iter()
+                .map(|want| want.held_pages)
+                .max()
+                .unwrap_or(0)
+                .max(floor)
+        });
         let started = std::time::Instant::now();
         // Trace every shape (nothing runs), then compile the new programs
         // side by side: a compile is host work, one core each.
