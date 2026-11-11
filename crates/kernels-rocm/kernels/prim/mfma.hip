@@ -44,7 +44,15 @@ __device__ __forceinline__ mfma_ab2 load8(const bf16* p) {
 }
 
 __device__ __forceinline__ mfma_cd mfma16x2(mfma_ab2 a, mfma_ab2 b, mfma_cd c) {
+#if defined(__gfx950__)
+    // gfx950 doubles the 16-bit matrix rate only in the 16 x 16 x 32 form:
+    // the two steps as one, lane group g's eight k its group's k 8g..8g+7.
+    typedef __bf16 bf16x8 __attribute__((ext_vector_type(8)));
+    return __builtin_amdgcn_mfma_f32_16x16x32_bf16(__builtin_bit_cast(bf16x8, a), __builtin_bit_cast(bf16x8, b), c, 0,
+                                                   0, 0);
+#else
     return mfma16(a.hi, b.hi, mfma16(a.lo, b.lo, c));
+#endif
 }
 
 __device__ __forceinline__ mfma_cd mfma_zero() { return mfma_cd{0.f, 0.f, 0.f, 0.f}; }

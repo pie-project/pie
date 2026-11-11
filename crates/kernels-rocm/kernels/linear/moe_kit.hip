@@ -52,6 +52,29 @@ __device__ __forceinline__ mfma_cd mma16x16(u32 a0, u32 a1, u32 b0, u32 b1, mfma
     }
 }
 
+// Two 16 x 16 x 16 steps on one accumulator, (a0, a1 · b0, b1) then (a2, a3 ·
+// b2, b3): on gfx950, whose 16-bit matrix rate only the 16 x 16 x 32 form
+// doubles, one step of that form, the lane's eight k the two steps' four
+// each, alike in A and B.
+template <class T>
+__device__ __forceinline__ mfma_cd mma16x16x2(u32 a0, u32 a1, u32 a2, u32 a3, u32 b0, u32 b1, u32 b2, u32 b3,
+                                              mfma_cd c) {
+#if defined(__gfx950__)
+    const moe_u4 a{a0, a1, a2, a3}, b{b0, b1, b2, b3};
+    if constexpr (is_same<T, f16>::value) {
+        typedef _Float16 h8 __attribute__((ext_vector_type(8)));
+        return __builtin_amdgcn_mfma_f32_16x16x32_f16(__builtin_bit_cast(h8, a), __builtin_bit_cast(h8, b), c, 0, 0,
+                                                      0);
+    } else {
+        typedef __bf16 bf16x8 __attribute__((ext_vector_type(8)));
+        return __builtin_amdgcn_mfma_f32_16x16x32_bf16(__builtin_bit_cast(bf16x8, a), __builtin_bit_cast(bf16x8, b),
+                                                       c, 0, 0, 0);
+    }
+#else
+    return mma16x16<T>(a2, a3, b2, b3, mma16x16<T>(a0, a1, b0, b1, c));
+#endif
+}
+
 // The lane's own dot of WORDS dwords (2·WORDS elements) of `w` against as
 // many of `x`.
 template <class T, int WORDS>
@@ -701,6 +724,14 @@ __device__ __forceinline__ void grouped_tile(const T* __restrict__ act, const i3
 #pragma unroll
                 for (int mb = 0; mb < MB; ++mb)
                     xv[mb] = *reinterpret_cast<const b128*>(xt + swz(mb * 16 + r16, c0 + 2 * q));
+#if defined(__gfx950__)
+#pragma unroll
+                for (int nb = 0; nb < NB; ++nb)
+#pragma unroll
+                    for (int mb = 0; mb < MB; ++mb)
+                        acc[nb][mb] = mma16x16x2<T>(d[nb][q], d[nb][q + 1], d[nb][q + 2], d[nb][q + 3], xv[mb].w[0],
+                                                    xv[mb].w[1], xv[mb].w[2], xv[mb].w[3], acc[nb][mb]);
+#else
                 // The two k-steps of the read in separate sweeps, so no
                 // product waits on the one just before it.
 #pragma unroll
@@ -711,6 +742,7 @@ __device__ __forceinline__ void grouped_tile(const T* __restrict__ act, const i3
                         for (int mb = 0; mb < MB; ++mb)
                             acc[nb][mb] = mma16x16<T>(d[nb][q + h], d[nb][q + h + 1], xv[mb].w[h], xv[mb].w[h + 1],
                                                       acc[nb][mb]);
+#endif
             }
         }
     };
@@ -1227,8 +1259,7 @@ __device__ __forceinline__ void batch_tile(const T* __restrict__ act, const i32*
                         if (mb >= live_mb) continue;
                         const b128& x = xv[j][q][mb];
                         mfma_cd& c = C::kFold ? part[nb][mb] : acc[nb][mb];
-                        c = mma16x16<T>(x.w[0], x.w[1], d[0], d[1], c);
-                        c = mma16x16<T>(x.w[2], x.w[3], d[2], d[3], c);
+                        c = mma16x16x2<T>(x.w[0], x.w[1], x.w[2], x.w[3], d[0], d[1], d[2], d[3], c);
                     }
                 }
                 if constexpr (C::kFold) {
@@ -1236,8 +1267,7 @@ __device__ __forceinline__ void batch_tile(const T* __restrict__ act, const i32*
                     for (int mb = 0; mb < MB; ++mb) {
                         if (mb >= live_mb) continue;
                         const b128& x = xv[j][q][mb];
-                        xsum[mb] = mma16x16<T>(x.w[0], x.w[1], kOnes, kOnes, xsum[mb]);
-                        xsum[mb] = mma16x16<T>(x.w[2], x.w[3], kOnes, kOnes, xsum[mb]);
+                        xsum[mb] = mma16x16x2<T>(x.w[0], x.w[1], x.w[2], x.w[3], kOnes, kOnes, kOnes, kOnes, xsum[mb]);
                     }
                 }
             }
@@ -1440,6 +1470,18 @@ __device__ __forceinline__ void wide_tile(const T* __restrict__ act, unsigned lo
 #pragma unroll
             for (int nb = 0; nb < NB; ++nb)
                 wp[nb] = *reinterpret_cast<const b128*>(wl[buf] + (nb * 16 + r16) * PITCH + 16 * (4 * j + g));
+#if defined(__gfx950__)
+#pragma unroll
+            for (int mb = 0; mb < MB; ++mb) {
+                if (mb >= live) continue;
+                const i32x4& x = av[A][mb * KU + j];
+#pragma unroll
+                for (int nb = 0; nb < NB; ++nb)
+                    acc[nb][mb] = mma16x16x2<T>(wp[nb].w[0], wp[nb].w[1], wp[nb].w[2], wp[nb].w[3],
+                                                static_cast<u32>(x[0]), static_cast<u32>(x[1]), static_cast<u32>(x[2]),
+                                                static_cast<u32>(x[3]), acc[nb][mb]);
+            }
+#else
 #pragma unroll
             for (int h = 0; h < 4; h += 2)
 #pragma unroll
@@ -1451,6 +1493,7 @@ __device__ __forceinline__ void wide_tile(const T* __restrict__ act, unsigned lo
                         acc[nb][mb] = mma16x16<T>(wp[nb].w[h], wp[nb].w[h + 1], static_cast<u32>(x[h]),
                                                   static_cast<u32>(x[h + 1]), acc[nb][mb]);
                 }
+#endif
         }
     };
 

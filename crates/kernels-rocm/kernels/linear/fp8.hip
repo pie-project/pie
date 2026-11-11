@@ -380,6 +380,29 @@ __device__ __forceinline__ void bf16_gemm_tile8(const u8* __restrict__ act, cons
         for (int mb = 0; mb < 2; ++mb) acc[nb][mb] = fp8_f4{0.f, 0.f, 0.f, 0.f};
 
     auto compute = [&]() {
+#if defined(__gfx950__)
+        // Two k-steps a step of the 16 x 16 x 32 core.
+        static_assert(KC % 64 == 0, "whole pairs of k-steps a stage");
+#pragma unroll
+        for (int kp = 0; kp < KC / 64; ++kp) {
+            moe_u2 a[4][2], b[2][2];
+#pragma unroll
+            for (int h = 0; h < 2; ++h) {
+#pragma unroll
+                for (int nb = 0; nb < 4; ++nb)
+                    a[nb][h] = *reinterpret_cast<const moe_u2*>(wl + (wn * 64 + nb * 16 + r16) * PITCH + 64 * kp + 32 * h + 8 * g);
+#pragma unroll
+                for (int mb = 0; mb < 2; ++mb)
+                    b[mb][h] = *reinterpret_cast<const moe_u2*>(xl + (wm * 32 + mb * 16 + r16) * PITCH + 64 * kp + 32 * h + 8 * g);
+            }
+#pragma unroll
+            for (int nb = 0; nb < 4; ++nb)
+#pragma unroll
+                for (int mb = 0; mb < 2; ++mb)
+                    acc[nb][mb] = mma16x16x2<bf16>(a[nb][0][0], a[nb][0][1], a[nb][1][0], a[nb][1][1], b[mb][0][0],
+                                                   b[mb][0][1], b[mb][1][0], b[mb][1][1], acc[nb][mb]);
+        }
+#else
         // bf16: four elements a lane a 16-wide k-step, the same bytes.
 #pragma unroll
         for (int kk = 0; kk < KC / 32; ++kk) {
@@ -396,6 +419,7 @@ __device__ __forceinline__ void bf16_gemm_tile8(const u8* __restrict__ act, cons
                 for (int mb = 0; mb < 2; ++mb)
                     acc[nb][mb] = mma16x16<bf16>(a[nb][0], a[nb][1], b[mb][0], b[mb][1], acc[nb][mb]);
         }
+#endif
     };
 
     issue(Const<0>{}, s0);
@@ -871,6 +895,23 @@ __device__ __forceinline__ void fp4_group_tile(const bf16* __restrict__ act, con
                 pairs[nb][4 * d + 3] = __builtin_amdgcn_perm(hh, lh, 0x07030602u);  // k 6, 7
             }
         }
+#if defined(__gfx950__)
+        // Two k-steps a step of the 16 x 16 x 32 core: the pair's 16 bytes
+        // of a route row are one LDS read.
+#pragma unroll
+        for (int kp = 0; kp < 4; ++kp) {
+            moe_u4 bv[TM];
+#pragma unroll
+            for (int mb = 0; mb < TM; ++mb) bv[mb] = *reinterpret_cast<const moe_u4*>(xc + xat(mb * 16 + r16, 4 * g + kp));
+#pragma unroll
+            for (int nb = 0; nb < TN; ++nb)
+#pragma unroll
+                for (int mb = 0; mb < TM; ++mb)
+                    acc[nb][mb] = mma16x16x2<bf16>(pairs[nb][4 * kp], pairs[nb][4 * kp + 1], pairs[nb][4 * kp + 2],
+                                                   pairs[nb][4 * kp + 3], bv[mb][0], bv[mb][1], bv[mb][2], bv[mb][3],
+                                                   acc[nb][mb]);
+        }
+#else
 #pragma unroll
         for (int kk = 0; kk < 8; ++kk) {
             moe_u2 bv[TM];
@@ -886,6 +927,7 @@ __device__ __forceinline__ void fp4_group_tile(const bf16* __restrict__ act, con
                     acc[nb][mb] = mma16x16<bf16>(pairs[nb][2 * kk], pairs[nb][2 * kk + 1], bv[mb][0], bv[mb][1],
                                                  acc[nb][mb]);
         }
+#endif
         // Stage s + 1 landed; the stages past it may still be in flight.
         if (s + D < stages) vm_wait<(D - 1) * PER>(); else vm_wait<0>();
         lds_barrier();
