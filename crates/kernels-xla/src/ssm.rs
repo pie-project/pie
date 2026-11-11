@@ -1385,8 +1385,11 @@ impl DeltaIn {
             // extra steps short chunks take (v6e: a 1792-row fire of
             // Qwen3.8-27B's 48 heads 100 ms at 128 rows, 91 at 32; a 640-row
             // fire of Qwen3.6-35B-A3B's 32 heads 40.5 ms at 128, 34.9 at 32;
-            // Qwen3.5-0.8B's 16 heads lose 19% at 32 and keep 128).
-            Self::Gdn { hv, .. } if hv >= 32 => (c.chunk.min(32), c.long_chunk.min(32)),
+            // Qwen3.5-0.8B's 16 heads lose 19% at 32 and keep 128). Since the
+            // kernel inverts its blocks side by side in the lanes, 64 rows
+            // beat 32 (Qwen3.6-27B's GDN layer at 1792 rows: v6e 533 -> 386
+            // us, v5e 1301 -> 682).
+            Self::Gdn { hv, .. } if hv >= 32 => (c.chunk.min(64), c.long_chunk.min(64)),
             Self::Gdn { .. } | Self::Mamba2 { .. } => (c.chunk, c.long_chunk),
             Self::Kda { .. } => return c.kda_chunk,
         };
