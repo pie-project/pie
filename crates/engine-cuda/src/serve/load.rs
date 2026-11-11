@@ -1371,6 +1371,7 @@ impl Shell {
         let fitted = shell.pools.fit_the_card(
             bodies,
             held_for_fires.saturating_add(scratch_growth),
+            false,
             &resident,
         )?;
         // The carves laid at the activation's end, backed where the range
@@ -1438,7 +1439,12 @@ impl Staged {
         }
         shell.arm_bodies()?;
         let resident = footprint(&shell, device_total, free_before);
-        let fitted = shell.pools.fit_the_card(0, held_for_fires, &resident)?;
+        // Arming fired every composition, so the activation is at its high
+        // water; a load that records no bodies has fired none yet.
+        let settled = shell.records_bodies();
+        let fitted = shell
+            .pools
+            .fit_the_card(0, held_for_fires, settled, &resident)?;
         if arm_trace {
             eprintln!(
                 "[arm-trace] cache rows sized to {} pages ({} MiB, {} sequences at the declared \
