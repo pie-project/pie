@@ -155,9 +155,18 @@ __global__ __launch_bounds__(WAVES * 64) void ragged(
 #pragma unroll
         for (int kt = 0; kt < KT; ++kt) {
             s[kt] = mfma_zero();
+#if defined(__gfx950__)
+#pragma unroll
+            for (int st = 0; st + 1 < KS; st += 2)
+                s[kt] = mfma16_pair(load4(&ks[(kt * 16 + ln % 16) * KP + st * 16 + 4 * quad]), qf[st],
+                                    load4(&ks[(kt * 16 + ln % 16) * KP + st * 16 + 16 + 4 * quad]), qf[st + 1], s[kt]);
+            if constexpr (KS % 2 == 1)
+                s[kt] = mfma16(load4(&ks[(kt * 16 + ln % 16) * KP + (KS - 1) * 16 + 4 * quad]), qf[KS - 1], s[kt]);
+#else
 #pragma unroll
             for (int st = 0; st < KS; ++st)
                 s[kt] = mfma16(load4(&ks[(kt * 16 + ln % 16) * KP + st * 16 + 4 * quad]), qf[st], s[kt]);
+#endif
         }
         float tile_max = neg_inf();
 #pragma unroll
@@ -200,9 +209,18 @@ __global__ __launch_bounds__(WAVES * 64) void ragged(
 #pragma unroll
         for (int dt = 0; dt < KS; ++dt) {
             acc[dt] *= alpha;
+#if defined(__gfx950__)
+#pragma unroll
+            for (int kt = 0; kt + 1 < KT; kt += 2)
+                acc[dt] = mfma16_pair(load4(&vt[(dt * 16 + ln % 16) * VP + kt * 16 + 4 * quad]), pt[kt],
+                                      load4(&vt[(dt * 16 + ln % 16) * VP + kt * 16 + 16 + 4 * quad]), pt[kt + 1], acc[dt]);
+            if constexpr (KT % 2 == 1)
+                acc[dt] = mfma16(load4(&vt[(dt * 16 + ln % 16) * VP + (KT - 1) * 16 + 4 * quad]), pt[KT - 1], acc[dt]);
+#else
 #pragma unroll
             for (int kt = 0; kt < KT; ++kt)
                 acc[dt] = mfma16(load4(&vt[(dt * 16 + ln % 16) * VP + kt * 16 + 4 * quad]), pt[kt], acc[dt]);
+#endif
         }
         lds_barrier();
     }

@@ -935,8 +935,17 @@ __global__ __launch_bounds__(512) void paged_prefill_wide(const Paged p) {
 #pragma unroll
             for (int dt = 0; dt < KS; ++dt) {
                 o[dt] *= alpha;
+#if defined(__gfx950__)
+#pragma unroll
+                for (int kt = 0; kt + 1 < KT; kt += 2)
+                    o[dt] = mfma16_pair(load4(&vt[dt * 16 + ln % 16][kt * 16 + 4 * quad]), pt[kt],
+                                        load4(&vt[dt * 16 + ln % 16][kt * 16 + 16 + 4 * quad]), pt[kt + 1], o[dt]);
+                if constexpr (KT % 2 == 1)
+                    o[dt] = mfma16(load4(&vt[dt * 16 + ln % 16][(KT - 1) * 16 + 4 * quad]), pt[KT - 1], o[dt]);
+#else
 #pragma unroll
                 for (int kt = 0; kt < KT; ++kt) o[dt] = mfma16(load4(&vt[dt * 16 + ln % 16][kt * 16 + 4 * quad]), pt[kt], o[dt]);
+#endif
             }
         }
         lds_barrier();
@@ -1167,9 +1176,19 @@ __device__ __forceinline__ void paged_prefill_body(const Paged& p, const Prefill
 #pragma unroll
             for (int dt = 0; dt < DT; ++dt) {
                 o[dt] *= alpha;
+#if defined(__gfx950__)
+#pragma unroll
+                for (int kt = 0; kt + 1 < KT; kt += 2)
+                    o[dt] = mfma16_pair(load4(&vt[(dt * 16 + ln % 16) * VPAD + kt * 16 + 4 * quad]), pt[kt],
+                                        load4(&vt[(dt * 16 + ln % 16) * VPAD + kt * 16 + 16 + 4 * quad]), pt[kt + 1],
+                                        o[dt]);
+                if constexpr (KT % 2 == 1)
+                    o[dt] = mfma16(load4(&vt[(dt * 16 + ln % 16) * VPAD + (KT - 1) * 16 + 4 * quad]), pt[KT - 1], o[dt]);
+#else
 #pragma unroll
                 for (int kt = 0; kt < KT; ++kt)
                     o[dt] = mfma16(load4(&vt[(dt * 16 + ln % 16) * VPAD + kt * 16 + 4 * quad]), pt[kt], o[dt]);
+#endif
             }
         }
     }

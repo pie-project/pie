@@ -55,6 +55,12 @@ __device__ __forceinline__ mfma_cd mfma16x2(mfma_ab2 a, mfma_ab2 b, mfma_cd c) {
 #endif
 }
 
+// Two steps on one accumulator, (a0 · b0) then (a1 · b1), as mfma16x2 runs
+// them: one 16 x 16 x 32 step on gfx950.
+__device__ __forceinline__ mfma_cd mfma16_pair(mfma_ab a0, mfma_ab b0, mfma_ab a1, mfma_ab b1, mfma_cd c) {
+    return mfma16x2(mfma_ab2{a0, a1}, mfma_ab2{b0, b1}, c);
+}
+
 __device__ __forceinline__ mfma_cd mfma_zero() { return mfma_cd{0.f, 0.f, 0.f, 0.f}; }
 
 // One 16 x 16 tile of A · Bᵀ over K (a multiple of 16): A rows at a + m·lda,
