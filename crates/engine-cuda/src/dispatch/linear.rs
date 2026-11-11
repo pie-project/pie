@@ -1139,9 +1139,17 @@ impl Run<'_> {
                         poem_ir::Operation::Linear(Linear::GroupRoutes { groups: g, .. }) if *g == groups_nz
                     )
                 );
+                // A split-plane (affine, NVFP4) projection is read as its bf16,
+                // decoded into a scratch a fire; a dense one where it lies.
+                let bank_of = |run: &Self| match run.maybe_planes(*w) {
+                    Some((codes, ..)) => run
+                        .dense_or_decoded(OP, *w, codes.rows, x.width / groups_nz)
+                        .map(|bank| (bank, linear::moe::ExpertTable::RESIDENT)),
+                    None => Ok(run.expert_bank(*w)),
+                };
                 #[cfg(feature = "cuda")]
                 if trivial {
-                    let (bank, _) = self.expert_bank(*w);
+                    let (bank, _) = bank_of(self)?;
                     if bank.dtype == Dtype::Bf16 && x.dtype == Dtype::Bf16 && y.dtype == Dtype::Bf16
                     {
                         let mut y = y;
@@ -1159,7 +1167,7 @@ impl Run<'_> {
                     kernels_cuda::tensor::Tensor::new(x.ptr, rows, x.width / groups_nz, x.dtype);
                 let mut y =
                     kernels_cuda::tensor::Tensor::new(y.ptr, rows, y.width / groups_nz, y.dtype);
-                let (bank, experts) = self.expert_bank(*w);
+                let (bank, experts) = bank_of(self)?;
                 // One "expert" a group: the plane viewed `[groups, n * k]`, so
                 // a select that lays routes out by expert (the grouped and
                 // tcgen05 legs) counts groups, not the plane's rows.

@@ -1152,7 +1152,10 @@ pub(super) fn matmul_select_mlxu4(
             work,
             work_cap,
         } = route_order(ctx, op, routes, &fan, experts)?;
-        let wmma = x.dtype == Dtype::Bf16 && tuning.affine_wmma;
+        // The WMMA kernel widens a quad of code words (four u32s) under one
+        // factor: a group of fewer codes (2-bit codes in groups of 32) takes
+        // the CUDA-core kernel.
+        let wmma = x.dtype == Dtype::Bf16 && tuning.affine_wmma && group.is_multiple_of(128 / bits);
         let entry = if wmma {
             format!(
                 "::pie::linear::moe_matmul_select_mlxu4_wmma<::pie::i32({bits}), ::pie::i32({group})>"
