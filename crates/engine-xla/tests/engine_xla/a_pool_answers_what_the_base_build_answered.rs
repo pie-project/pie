@@ -85,8 +85,10 @@ fn a_windowed_model_answers_bit_for_bit_past_its_window() {
 /// Prompts a sequence, decodes two steps, then decodes on: with `park`, its
 /// kv list slots and its record go to the host tier (the kv slots on to the
 /// slot file and back, where the load seats one) between the steps and
-/// return to fresh device slots. Every readout.
-fn parked(name: &str, park: bool, disk: Option<&std::path::Path>) -> Vec<Vec<u32>> {
+/// return to fresh device slots. With `bytes`, every slot parked on the host
+/// comes back through its bytes (`read_tier_slots`) written into other host
+/// slots (`write_tier_slots`), as a snapshot restores. Every readout.
+fn parked(name: &str, park: bool, disk: Option<&std::path::Path>, bytes: bool) -> Vec<Vec<u32>> {
     use crate::common_llm::{Refs, Seq, bits, tokens};
     use engine::Engine;
     use engine::chunk::SlotCopy;
@@ -129,9 +131,65 @@ fn parked(name: &str, park: bool, disk: Option<&std::path::Path>) -> Vec<Vec<u32
                 .map(|(i, &r)| (r, i as u32))
                 .collect();
         copy(&mut model, kv, device, MemoryDomain::HostPinned, host);
+        let spc = facts.shapes[0].slots_per_chunk;
+        let mut chunk = (a.kv.len() as u32).div_ceil(spc);
+        // Through bytes: host slots `refs` of `shape` read, zeroed, and
+        // written back in reverse order (each slot's bytes at another ref);
+        // the refs each slot now lies at.
+        let through = |model: &mut Model, shape, refs: Vec<u32>| -> Vec<u32> {
+            if !bytes {
+                return refs;
+            }
+            let len = facts.shape(shape).expect("a fixed shape").slot_bytes as usize;
+            let read = model
+                .engine
+                .read_tier_slots(&[(shape, refs.clone())])
+                .expect("the host slots read");
+            assert_eq!(
+                read.len(),
+                refs.len() * len,
+                "{name}: a host slot reads as its device slot's bytes"
+            );
+            assert!(
+                model
+                    .engine
+                    .write_tier_slots(&[(shape, refs.clone())], &read[1..])
+                    .is_err(),
+                "{name}: a byte count that differs is refused"
+            );
+            let zeros = vec![0u8; read.len()];
+            model
+                .engine
+                .write_tier_slots(&[(shape, refs.clone())], &zeros)
+                .expect("the host slots write");
+            let again: Vec<u32> = refs.iter().rev().copied().collect();
+            model
+                .engine
+                .write_tier_slots(&[(shape, again.clone())], &read)
+                .expect("the host slots write");
+            assert_eq!(
+                model
+                    .engine
+                    .read_tier_slots(&[(shape, refs.clone())])
+                    .expect("the host slots read"),
+                read.chunks(len)
+                    .rev()
+                    .flatten()
+                    .copied()
+                    .collect::<Vec<u8>>(),
+                "{name}: written host slots read back"
+            );
+            // slot i's bytes now lie at again[i]
+            again
+        };
+        let kv_host = through(&mut model, kv, (0..a.kv.len() as u32).collect());
         let on_disk = facts.disk_chunks > 0;
         if on_disk {
-            let to: Vec<(u32, u32)> = (0..a.kv.len() as u32).map(|i| (i, i + 3)).collect();
+            let to: Vec<(u32, u32)> = kv_host
+                .iter()
+                .enumerate()
+                .map(|(i, &h)| (h, i as u32 + 3))
+                .collect();
             copy(
                 &mut model,
                 kv,
@@ -140,8 +198,6 @@ fn parked(name: &str, park: bool, disk: Option<&std::path::Path>) -> Vec<Vec<u32
                 to,
             );
         }
-        let spc = facts.shapes[0].slots_per_chunk;
-        let mut chunk = (a.kv.len() as u32).div_ceil(spc);
         let mut records = Vec::new();
         for (shape, pieces) in &a.record {
             let s = facts.shape(*shape).expect("a fixed shape");
@@ -153,7 +209,8 @@ fn parked(name: &str, park: bool, disk: Option<&std::path::Path>) -> Vec<Vec<u32
                 .map(|(i, p)| (p[0], base + i as u32))
                 .collect();
             copy(&mut model, *shape, device, MemoryDomain::HostPinned, pairs);
-            records.push((*shape, base, pieces.len()));
+            let held = (0..pieces.len() as u32).map(|i| base + i).collect();
+            records.push((*shape, through(&mut model, *shape, held)));
         }
         // In: fresh device slots.
         let fresh: Vec<u32> = (0..a.kv.len()).map(|_| refs.take(kv)).collect();
@@ -169,22 +226,14 @@ fn parked(name: &str, park: bool, disk: Option<&std::path::Path>) -> Vec<Vec<u32
         } else {
             (
                 MemoryDomain::HostPinned,
-                fresh
-                    .iter()
-                    .enumerate()
-                    .map(|(i, &r)| (i as u32, r))
-                    .collect(),
+                fresh.iter().zip(&kv_host).map(|(&r, &h)| (h, r)).collect(),
             )
         };
         copy(&mut model, kv, from, device, back);
         a.kv = fresh;
-        for (at, (shape, base, pieces)) in records.into_iter().enumerate() {
-            let fresh: Vec<u32> = (0..pieces).map(|_| refs.take(shape)).collect();
-            let back: Vec<(u32, u32)> = fresh
-                .iter()
-                .enumerate()
-                .map(|(i, &r)| (base + i as u32, r))
-                .collect();
+        for (at, (shape, held)) in records.into_iter().enumerate() {
+            let fresh: Vec<u32> = held.iter().map(|_| refs.take(shape)).collect();
+            let back: Vec<(u32, u32)> = held.iter().zip(&fresh).map(|(&h, &r)| (h, r)).collect();
             copy(&mut model, shape, MemoryDomain::HostPinned, device, back);
             a.record[at].1 = fresh.iter().map(|&r| [r, r]).collect();
         }
@@ -207,11 +256,16 @@ fn a_parked_working_set_decodes_on_as_it_would_have() {
     };
     let dir = std::env::temp_dir().join(format!("pie-xla-park-{}", std::process::id()));
     for name in ["qwen3-micro-text", "qwen35-tiny"] {
-        let stayed = parked(name, false, None);
-        let moved = parked(name, true, Some(&dir));
+        let stayed = parked(name, false, None, false);
+        let moved = parked(name, true, Some(&dir), false);
         assert!(
             stayed == moved,
             "{name}: the parked working set answers otherwise"
+        );
+        let snapped = parked(name, true, None, true);
+        assert!(
+            stayed == snapped,
+            "{name}: the working set restored through its host slots' bytes answers otherwise"
         );
         eprintln!(
             "{name}: {} readouts bit-identical after park and restore",
