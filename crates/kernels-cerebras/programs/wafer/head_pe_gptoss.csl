@@ -1,0 +1,268 @@
+// wafer/head_pe_gptoss.csl: the wafer program head PE of the gpt-oss program. Design: src/spatial/README.md
+// (gpt-oss).
+//
+// Role. The head is a band of HDR dims-rows (HDc = the units' Hc dims each, fed by the last unit's CX row of
+// the same index) by HVC vocabulary columns (VR rows of lm_head each), with a control row (head_ctl.csl) in
+// the middle of the band: a column's logits reduce along the column into its control PE. A head PE holds
+// its VR x HDc tile of 2^15 lm_head (f16 bits, [dim][vocab row]; the bf16 weights need the 2^15 to stay
+// out of f16's subnormals) and the final norm's w for its dims. x: the residual (f32); x w is scaled by 2^-S
+// (S = the exponent of its largest |value| less 7) into f16, the f32-accumulated partials are scaled back by
+// 2^S (every PE of a dims-row has the same x, so the same S). The final norm's rsqrt (a positive scalar of
+// the token) is left out: the greedy argmax does not need it (the host applies it to `lgt` rows).
+// x input roles: 0 take the row multicast (HM); 2 take x from the north (the last unit's relay column) and
+// multicast it along the row (HM) both ways.
+// The wafer token loop (flags bit 0): the PE also holds its VR x HDc tile of the embedding (bf16 bits,
+// [vocab row][dim]). After the logits, every PE takes its column's word from the control PE (iq7): the
+// winner's offset j (this column won), -(1 + the winner's column), or < -1e8 (a launch's last step). The
+// winner column's PEs send row j of their tile (widened to f32) west along their dims-row on the bus (HE:
+// their own HE route switched to their ramp for it) to column 0 (flags bit 1), which sends it east and north
+// (V1) to unit 0's MoE relay PE of its row. Column 0 itself sends straight on V1 when it is the winner. The
+// HE route goes back only after oq4 has drained and the next step's x is in.
+//
+// Interface. Exports hw (u16), hg (f32 w), hemb (u16), rcfg, tdbg, init, compute.
+// rcfg: from RQ: [0..6) iq2..iq7 (iq2 / iq3 the column reduction's level-1 / level-2 inputs, iq4 x from
+// the north, iq5 the bus end's input, iq6 HM, iq7 the column word), [6] oq2 (the reduction's send),
+// [7] oq3 (HM), [8] the reduction role, [9] the x role, [10] the spare colour, [11] loop flags, [12] -,
+// [13] oq4 (HE), [14] oq5 (V1).
+param memcpy_params;
+param VR: u16;
+param HDc: u16;
+
+const sys_mod = @import_module("<memcpy/memcpy>", memcpy_params);
+const tile_config = @import_module("<tile_config>");
+const color_config = tile_config.color_config;
+const tgt = tile_config.target;
+
+var hw = @zeros([VR * HDc + 1]u16);
+var hw_ptr: [*]u16 = &hw;
+var hg = @zeros([HDc]f32);
+var hg_ptr: [*]f32 = &hg;
+var x = @zeros([HDc]f32);
+var xr = @zeros([HDc]f32);
+var xp = @zeros([HDc]@fp16());
+var y: [VR]f32 align(16) = @zeros([VR]f32);
+const x_d = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{HDc} -> x[i] });
+const xr_d = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{HDc} -> xr[i] });
+const hg_d = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{HDc} -> hg[i] });
+const xp_d = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{HDc} -> xp[i] });
+const y_d = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{VR} -> y[i] });
+var a_d = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{VR} -> hw[i] });
+
+const q_ra = @get_input_queue(2);
+const q_rb = @get_input_queue(3);
+const q_hx = @get_input_queue(4);
+const q_he = @get_input_queue(5);
+const q_hm = @get_input_queue(6);
+const q_w = @get_input_queue(7);
+const q_ro = @get_output_queue(2);
+const q_xo = @get_output_queue(3);
+const q_bo = @get_output_queue(4);
+const q_vo = @get_output_queue(5);
+const C_PARK: color = @get_color(16);
+const ut_a = @get_ut_id(4);
+const ut_b = @get_ut_id(5);
+var fifo_buf = @zeros([32]f32);
+const fifo = @allocate_fifo(fifo_buf);
+fn fout(comptime q: output_queue, n: u16) fabout_dsd {
+  return @set_dsd_length(@get_dsd(fabout_dsd, .{ .extent = 1, .output_queue = q }), n);
+}
+fn fin(comptime q: input_queue, n: u16) fabin_dsd {
+  return @set_dsd_length(@get_dsd(fabin_dsd, .{ .extent = 1, .input_queue = q }), n);
+}
+const NR: u16 = 12;
+const RQ: u16 = 1 + 2 * NR;
+var rcfg = @zeros([RQ + 15]u32);
+var rcfg_ptr: [*]u32 = &rcfg;
+var role_r: u16 = 0;
+var role_x: u16 = 0;
+fn iqc(comptime qid: u16, c: u32) void {
+  const addr = tile_config.input_queue_config.get_input_queue_config_addr(qid);
+  const v: u16 = @get_config(addr, tile_config.input_queue_config.in_queue_addr_range);
+  @set_config(addr, (v & 0xffe0) | @as(u16, c), tile_config.input_queue_config.in_queue_addr_range);
+}
+fn oqc(comptime qid: u16, c: u32) void {
+  const addr = tile_config.output_queue_config.get_output_queue_config_addr(qid);
+  const v: u16 = @get_config(addr, tile_config.output_queue_config.out_queue_addr_range);
+  @set_config(addr, (v & 0xfe0f) | (@as(u16, c) << 4), tile_config.output_queue_config.out_queue_addr_range);
+}
+var qcur = [6]u16 { 13, 14, 17, 18, 19, 20 };
+fn iq_any(q: u16, c: u16) void {
+  if (q == 0) { iqc(2, c); }
+  else if (q == 1) { iqc(3, c); }
+  else if (q == 2) { iqc(4, c); }
+  else if (q == 3) { iqc(5, c); }
+  else if (q == 4) { iqc(6, c); }
+  else if (q == 5) { iqc(7, c); }
+}
+fn bind_iqs(fq: *[6]u16, tmp: u16) void {
+  var done = @zeros([6]u16);
+  var left: u16 = 6;
+  var guard: u16 = 0;
+  while (left > 0 and guard < 32) : (guard += 1) {
+    var prog = false;
+    var i: u16 = 0;
+    while (i < 6) : (i += 1) {
+      if (done[i] != 0) { continue; }
+      var clash = false;
+      var j: u16 = 0;
+      while (j < 6) : (j += 1) { if (j != i and done[j] == 0 and qcur[j] == fq.*[i]) { clash = true; } }
+      if (!clash) { iq_any(i, fq.*[i]); qcur[i] = fq.*[i]; done[i] = 1; left -= 1; prog = true; }
+    }
+    if (!prog) {
+      i = 0;
+      while (i < 6 and done[i] != 0) : (i += 1) {}
+      iq_any(i, tmp); qcur[i] = tmp;
+    }
+  }
+}
+
+// ---------------------------------------------------------------- the wafer token loop
+var hemb = @zeros([VR * HDc + 1]u16);
+var hemb_ptr: [*]u16 = &hemb;
+var eb: [HDc]f32 align(16) = @zeros([HDc]f32);
+const eb_d = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{HDc} -> eb[i] });
+const ebh_d = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{HDc} -> hemb[i] });
+var ebw_d = ebh_d;
+var wfl: u16 = 0;
+var he_addr: u16 = 0;
+var he_orig: u16 = 0;
+var he_dirty = false;
+var ww = @zeros([1]f32);
+const ww_d = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{1} -> ww[i] });
+
+fn init() void {
+  ebw_d = @set_dsd_stride(@set_dsd_base_addr(@set_dsd_length(ebh_d, HDc), @ptrcast([*]u16, &eb)), 2);
+  ebw_d = @increment_dsd_offset(ebw_d, 1, u16);
+  const cc0 = color_config.get_color_config_addr(@get_color(0));
+  var k: u16 = 0;
+  while (k < @as(u16, rcfg[0])) : (k += 1) {
+    const addr = cc0 + @as(u16, rcfg[1 + 2 * k]);
+    const r = @get_config(addr, tgt.color_addr_range) & 0xff00;
+    @set_config(addr, r | @as(u16, rcfg[2 + 2 * k]), tgt.color_addr_range);
+  }
+  var fq = [6]u16 { @as(u16, rcfg[RQ]), @as(u16, rcfg[RQ + 1]), @as(u16, rcfg[RQ + 2]), @as(u16, rcfg[RQ + 3]), @as(u16, rcfg[RQ + 4]), @as(u16, rcfg[RQ + 5]) };
+  bind_iqs(&fq, @as(u16, rcfg[RQ + 10]));
+  oqc(2, rcfg[RQ + 6]); oqc(3, rcfg[RQ + 7]);
+  oqc(4, rcfg[RQ + 13]); oqc(5, rcfg[RQ + 14]);
+  wfl = @as(u16, rcfg[RQ + 11]);
+  he_addr = cc0 + @as(u16, rcfg[RQ + 13]);
+  he_orig = @get_config(he_addr, tgt.color_addr_range) & 0xff;
+  role_r = @as(u16, rcfg[RQ + 8]);
+  role_x = @as(u16, rcfg[RQ + 9]);
+  timestamp.enable_tsc();
+  sys_mod.unblock_cmd_stream();
+}
+
+const mv_dest = @get_dsr(dsr_dest, 1);
+const mv_src0 = @get_dsr(dsr_src0, 1);
+const mv_src1 = @get_dsr(dsr_src1, 1);
+fn mvs_step(xv: @fp16()) void { @fmachs(mv_dest, mv_src0, mv_src1, xv); }
+
+fn recv_x() void {
+  if (role_x == 0) {
+    @fmovs(x_d, fin(q_hm, HDc));
+  } else {
+    @fmovs(x_d, fin(q_hx, HDc));
+    @fmovs(fout(q_xo, HDc), x_d);
+  }
+}
+fn send_r() void {
+  const A = .{ .async = true, .ut_id = ut_b };
+  if (role_r == 0) { @fmovs(fout(q_ro, VR), y_d, A); }
+  else if (role_r == 2) {
+    @fadds(fifo, fin(q_ra, VR), y_d, .{ .async = true, .ut_id = ut_a });
+    @fadds(fout(q_ro, VR), fin(q_rb, VR), fifo, A);
+  } else { @fadds(fout(q_ro, VR), fin(q_ra, VR), y_d, A); }
+}
+fn he_restore() void {
+  if (!he_dirty) { return; }
+  while ((tile_config.output_queue_status.get_raw() & 0x1000) == 0) {}   // oq4 empty
+  const r = @get_config(he_addr, tgt.color_addr_range) & 0xff00;
+  @set_config(he_addr, r | he_orig, tgt.color_addr_range);
+  he_dirty = false;
+}
+fn hloop() void {
+  @fmovs(ww_d, fin(q_w, 1));
+  const w = ww[0];
+  if (w < -1.0e8) { return; }
+  const busend = (wfl & 2) != 0;
+  if (w >= 0.0) {
+    const j = @as(u16, w);
+    @fmovs(eb_d, 0.0);
+    @mov16(ebw_d, @increment_dsd_offset(ebh_d, @as(i16, j * HDc), u16));
+    if (busend) {
+      @fmovs(fout(q_vo, HDc), eb_d);
+    } else {
+      const r = @get_config(he_addr, tgt.color_addr_range) & 0xff00;
+      @set_config(he_addr, r | 0x80 | (he_orig & 0x1f), tgt.color_addr_range);
+      he_dirty = true;
+      @fmovs(fout(q_bo, HDc), eb_d);
+    }
+  } else if (busend) {
+    @fmovs(fout(q_vo, HDc), fin(q_he, HDc));
+  }
+}
+
+const timestamp = @import_module("<time>");
+var tdbg = @zeros([6]u32);
+var tdbg_ptr: [*]u32 = &tdbg;
+var tsc = @zeros([3]u16);
+fn stamp(i: u16) void { timestamp.get_timestamp(&tsc); tdbg[i] = @as(u32, tsc[0]) | (@as(u32, tsc[1]) << 16); }
+var n_steps: u32 = 0;
+const pass_id: local_task_id = @get_local_task_id(8);
+task pass_task() void {
+  var s: u32 = 0;
+  while (s < n_steps) : (s += 1) {
+    stamp(0);
+    recv_x();
+    stamp(1);
+    he_restore();
+    @fmuls(xr_d, x_d, hg_d);
+    var mb: u32 = 0;
+    var i: u16 = 0;
+    while (i < HDc) : (i += 1) { const b = @bitcast(u32, xr[i]) & 0x7fffffff; if (b > mb) { mb = b; } }
+    var e: i16 = if (mb == 0) 0 else @as(i16, @as(u16, mb >> 23)) - 127 - 7;
+    if (e < -100) { e = -100; }
+    @fmuls(xr_d, xr_d, @bitcast(f32, @as(u32, @as(u16, 127 - e)) << 23));
+    @fs2h(xp_d, xr_d);
+    @fmovs(y_d, 0.0);
+    const a = @set_dsd_base_addr(a_d, @ptrcast([*]@fp16(), &hw[0]));
+    @load_to_dsr(mv_dest, y_d, .{ .save_address = false });
+    @load_to_dsr(mv_src0, y_d, .{ .save_address = false });
+    @load_to_dsr(mv_src1, a, .{ .save_address = true });
+    @map(mvs_step, xp_d);
+    @fmuls(y_d, y_d, @bitcast(f32, @as(u32, @as(u16, 127 + e)) << 23));
+    stamp(2);
+    send_r();
+    stamp(3);
+    if ((wfl & 1) != 0) { hloop(); }
+    stamp(4);
+  }
+  sys_mod.unblock_cmd_stream();
+}
+fn compute(steps: u32, start_pos: u32) void {
+  n_steps = steps;
+  @activate(pass_id);
+}
+
+comptime {
+  @bind_local_task(pass_task, pass_id);
+  @initialize_queue(q_ra, .{ .color = @get_color(13) });
+  @initialize_queue(q_rb, .{ .color = @get_color(14) });
+  @initialize_queue(q_hx, .{ .color = @get_color(17) });
+  @initialize_queue(q_he, .{ .color = @get_color(18) });
+  @initialize_queue(q_hm, .{ .color = @get_color(19) });
+  @initialize_queue(q_w, .{ .color = @get_color(20) });
+  @initialize_queue(q_ro, .{ .color = C_PARK });
+  @initialize_queue(q_xo, .{ .color = C_PARK });
+  @initialize_queue(q_bo, .{ .color = C_PARK });
+  @initialize_queue(q_vo, .{ .color = C_PARK });
+  @export_symbol(hemb_ptr, "hemb");
+  @export_symbol(tdbg_ptr, "tdbg");
+  @export_symbol(hw_ptr, "hw");
+  @export_symbol(hg_ptr, "hg");
+  @export_symbol(rcfg_ptr, "rcfg");
+  @export_symbol(init);
+  @export_symbol(compute);
+}
+//@@ dummies

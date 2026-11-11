@@ -1094,3 +1094,40 @@ The `new-memory/` directory is bookkeeping and is removed before anything lands 
   highest key (keep-handles head protects record / rs list / window). tests/handles/e2e.py --host-budget.
 - e2e sm_120: t_snapshot / t_long_snapshot pass, t_quota / t_close pass, t_keep head-key check passes (9 pages, was
   19). Runtime lib 279+; build matrix clean.
+
+### M85 — 2026-11-11: CUDA host tier is pageable memory behind a pinned staging ring
+- `sc/l40s-host-pageable` (36517dc0c): HostTier = one anonymous MAP_NORESERVE mapping (MADV_HUGEPAGE; RSS = data
+  written) + a 512 MiB pinned staging ring + landing threads (big batches split over 4). D2H into the ring on the swap
+  stream, landed into the tier after the event; H2D reads tier->ring in a stream host function, then ring->device.
+  Pin thread / lookahead / SHELF_AHEAD / TIER_PIN deleted. Contract 22 unchanged (fence_swaps).
+- Root cause it fixes: demoted cache grows the held host data monotonically (3,004 of 3,584 chunks first-touched in
+  order), so page-locking fresh memory could not keep pace -> Qwen3-8B prefill 2048 492 -> 151 ms (main 145).
+- Merge fix: rt4's read/write_tier_slots go through HostTier::slice (waits for landings); HostTier::chunk_bytes.
+- Verified: golden_offload + golden_logits (sm_120) = base; build matrix clean.
+
+### M86 — 2026-11-11: XLA pool parity work (TPU session)
+- `sc/xla-tpu` (8977ec8ce..65a075593): a prompt's kv append lands both pool planes in one write; DMA gathers unrolled
+  with one wait; warm-ladder seal (fires outside the ladder counted; PIE_XLA_WARM_STRICT=1 fails); pool-native Mosaic
+  conv step for decode.
+- v6e (in-process medians): qwen35 c64 13.7k -> 15.3k (base 15.1k, parity); prefill 512 above base; MoE prefill above
+  base. Conv kernel: state bitwise vs base, output ulp-level (base XLA clones the in-projection matmul into the conv
+  fusion) -> explained matmul-arm difference (PIE_XLA_CONV_KERNEL=0 restores bitwise). Accepted.
+- Open: qwen3 c256 -4% (pool-native decode page copy next), prefill 2048 -7.5%, MoE c1 -3%; sc/xla2 rebased
+  (snapshots bitwise on TPU, PLE rows bitwise; streamed experts open).
+
+### M87 — 2026-11-11: main's Cerebras wafer-program backend (#1435) merged
+- `sc/merge-main-cerebras` (b64cc6509): main deleted the host-traced Cerebras engine and replaced it with a
+  wafer-program backend; new-memory's host chunk pool / tiers for the old engine (M43/M44) were dropped with it. The
+  new backend states `ChunkFacts::degenerate` (kv pages = host token lists replayed into the program; state slots),
+  refuses copy_state / copy_slots / tier verbs / disk_kv_dir, weights placed whole. Worker keeps M76's removals and
+  adds main's new Cerebras options. Build matrix clean; worker / engine-cerebras lib tests pass.
+- Cerebras north-star follow-up (A8 replaced): multi-sequence on-wafer kv as a real shared pool (segments, evacuate),
+  host / disk tiers, record copies, weight streaming. Needs the backend's owner / hardware.
+
+### M88 — 2026-11-11: XLA decode at or above base (TPU session)
+- `sc/xla-tpu` (6822f26f5, 9c0a12282, d63a5cc97): main's decode page-copy kernel pool-native; the prefill's older
+  pages by one DMA call with PageMap / sink / clamp in the kernel; decode kv rows for both planes in one block
+  scatter. qwen3-0.6b c64 18.0k (base 16.5k), c256 22.6k (base 20.8k). New gate a_wide_decode_of_many_lanes bitwise.
+- Open: qwen3 prefill 2048 -5% (pooled append kernel's in-VMEM [16,1024]<->[128,128] relayout, inherent to packed
+  rows for w > 128); MoE c1 -3% (device time equal or lower; host runs ahead less — donated-pool wait suspected).
+- Merge fix: kernels-xla test Shape initializers gain `pooled: None`.

@@ -1,7 +1,5 @@
-//! The eta program plane: a guest program whose every stage lowers to a CSL
-//! phase program (`crate::guest`) runs its passes on the fabric, one lane
-//! per PE, reading the readout rows the host cut for it; any other runs in
-//! the host interpreter over the rows the fire read out.
+//! The eta program plane: guest programs run in the host interpreter over the
+//! rows a fire read out.
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
@@ -58,7 +56,6 @@ impl Instance {
 
 #[derive(Default)]
 pub(crate) struct Tally {
-    device: AtomicU64,
     interpreted: AtomicU64,
 }
 
@@ -91,10 +88,6 @@ pub struct Plane {
     next_instance: u64,
 
     tally: Arc<Tally>,
-    /// Which programs have a device form.
-    forms: crate::guest::Forms,
-    /// Compiled stages, by program content and batch shape.
-    stages: crate::guest::run::Stages,
 }
 
 impl Plane {
@@ -110,13 +103,7 @@ impl Plane {
         }
         self.next_program += 1;
         let id = ProgramId(self.next_program);
-        let on_device = self.forms.admit(id, &plan.package);
-        tracing::debug!(
-            program = id.0,
-            on_device,
-            refused = self.forms.refusal(id).map(ToString::to_string),
-            "guest program registered"
-        );
+        tracing::debug!(program = id.0, "guest program registered");
         self.programs.insert(id, Arc::new(plan));
         Ok(id)
     }
@@ -295,14 +282,6 @@ impl Plane {
             }
         }
         None
-    }
-
-    #[must_use]
-    pub fn device_form(&self, program: ProgramId) -> (bool, Option<String>) {
-        (
-            self.forms.get(program).is_some(),
-            self.forms.refusal(program).map(ToString::to_string),
-        )
     }
 
     pub fn close_instance(&mut self, id: InstanceId) -> Result<(), Refusal> {
@@ -596,180 +575,6 @@ impl Plane {
         }))
     }
 
-    /// Runs the guest passes of a fire's `attachments` (instance, first
-    /// lane): on the fabric when the program has a device form and every
-    /// output it reads is kept for its lane, else in the host interpreter
-    /// over the rows read out for them in `kept`. Returns, per attachment,
-    /// whether it ran on the device.
-    #[allow(clippy::too_many_lines)]
-    pub fn fire_guests(
-        &mut self,
-        device: &crate::device::Device,
-        attachments: &[(InstanceId, u32)],
-        kept: Option<&crate::readout::Kept>,
-        point: Stage,
-    ) -> Result<Vec<bool>, Refusal> {
-        use crate::guest::run::{Bound, OnDeviceMany, Unfit, bound, guest_lanes, prepare};
-        for &(instance, _) in attachments {
-            if let Some(seat) = self.instances.get_mut(&instance)
-                && seat.poisoned.load(Ordering::Acquire)
-            {
-                seat.inst.poisoned = true;
-            }
-        }
-        let mut first_error: Option<Refusal> = None;
-        let mut ran = vec![false; attachments.len()];
-        // The attachments the fabric takes, by program and the planes they
-        // read: the program has a device form and every output it reads
-        // binds there for the lane. Instances of one program step in
-        // lockstep, one program per stage carrying every lane (a PE row
-        // each).
-        struct Placed {
-            at: usize,
-            instance: InstanceId,
-            bound: Vec<Bound>,
-        }
-        type Planes = Vec<(String, u32, usize)>;
-        type Groups = BTreeMap<(ProgramId, Planes), (Arc<ExecPlan>, Vec<Placed>)>;
-        let mut groups: Groups = BTreeMap::new();
-        for (at, &(instance, lane)) in attachments.iter().enumerate() {
-            let Some(seat) = self.instances.get(&instance) else {
-                continue;
-            };
-            if self.forms.get(seat.program).is_none() {
-                continue;
-            }
-            let Some(bound) = bound(&seat.plan, kept, lane) else {
-                continue;
-            };
-            let planes: Planes = (bound.iter())
-                .map(|b| (b.name.clone(), b.lane, b.plane))
-                .collect();
-            let group = groups
-                .entry((seat.program, planes))
-                .or_insert_with(|| (Arc::clone(&seat.plan), Vec::new()));
-            // One pass per instance a fire: a repeated instance waits for the
-            // next batch of its program.
-            group.1.push(Placed {
-                at,
-                instance,
-                bound,
-            });
-        }
-        let cap = guest_lanes();
-        for ((program, _), (plan, placed)) in groups {
-            let mut batches: Vec<Vec<&Placed>> = Vec::new();
-            for p in &placed {
-                match batches
-                    .iter_mut()
-                    .find(|b| b.len() < cap && b.iter().all(|q| q.instance != p.instance))
-                {
-                    Some(b) => b.push(p),
-                    None => batches.push(vec![p]),
-                }
-            }
-            for batch in batches {
-                // Ready every stage first (the compiler is the judge of what
-                // fits a PE): a stage too big widens the spread; anything
-                // else takes the device form away. Neither faults a pass.
-                let readied = loop {
-                    let Some(form) = self.forms.get(program).copied() else {
-                        break None;
-                    };
-                    match prepare(
-                        device,
-                        &mut self.stages,
-                        &plan.package,
-                        form.key,
-                        form.cols,
-                        batch.len() as u32,
-                        kept,
-                        &batch[0].bound,
-                    ) {
-                        Ok(()) => break Some(form),
-                        Err(Unfit::Memory(why)) => {
-                            tracing::info!(program = program.0, cols = form.cols, %why, "a guest stage overflows the PE; widening");
-                            if self.forms.widen(program, &plan.package, &why).is_none() {
-                                break None;
-                            }
-                        }
-                        Err(Unfit::Other(why)) => {
-                            tracing::warn!(program = program.0, %why, "a guest program loses its device form");
-                            self.forms.demote(program, why);
-                            break None;
-                        }
-                    }
-                };
-                let Some(form) = readied else {
-                    continue;
-                };
-                let ids: Vec<InstanceId> = batch.iter().map(|p| p.instance).collect();
-                let mut held: Vec<(InstanceId, &mut InterpInstance)> = self
-                    .instances
-                    .iter_mut()
-                    .filter(|(id, _)| ids.contains(id))
-                    .map(|(id, seat)| (*id, &mut seat.inst))
-                    .collect();
-                held.sort_by_key(|(id, _)| ids.iter().position(|i| i == id));
-                let mut insts: Vec<&mut InterpInstance> =
-                    held.into_iter().map(|(_, inst)| inst).collect();
-                let bounds = batch.iter().map(|p| p.bound.clone()).collect();
-                let mut runner =
-                    OnDeviceMany::new(device, &mut self.stages, form.key, form.cols, kept, bounds);
-                let outcomes =
-                    eta_exec::step_many(&mut insts, &plan, &PassInputs::none(), &mut runner, point);
-                self.tally
-                    .device
-                    .fetch_add(batch.len() as u64, Ordering::AcqRel);
-                for (p, outcome) in batch.iter().zip(outcomes) {
-                    ran[p.at] = true;
-                    let instance = p.instance;
-                    let why = match outcome {
-                        StepOutcome::Committed => None,
-                        StepOutcome::Blocked(channel) => Some(format!(
-                            "instance {instance} (program {program}) blocked on channel {channel}"
-                        )),
-                        StepOutcome::Faulted(why) => Some(format!(
-                            "instance {instance} (program {program}) faulted: {why}"
-                        )),
-                    };
-                    if let Some(why) = why {
-                        first_error.get_or_insert(Refusal::Program(why));
-                    }
-                }
-            }
-        }
-        // The rest in the host interpreter over the rows read out for them.
-        for (at, &(instance, lane)) in attachments.iter().enumerate() {
-            if ran[at] {
-                continue;
-            }
-            let mut outputs: Vec<(String, u32, Value)> = Vec::new();
-            if let (Some(kept), Some(seat)) = (kept, self.instances.get(&instance)) {
-                for (name, k) in seat.plan.outputs() {
-                    let read = kept.lane_value(lane as usize + k as usize, name);
-                    if let Some(value) = read.map_err(Refusal::Program)? {
-                        outputs.push((name.to_string(), k, value));
-                    }
-                }
-            }
-            let outcome = self.fire_interpreted(instance, &outputs, point);
-            if let Err(why) = outcome {
-                first_error.get_or_insert(why);
-            }
-        }
-        match first_error {
-            Some(why) => Err(why),
-            None => Ok(ran),
-        }
-    }
-
-    /// Guest stage executions on the device and the lanes they carried.
-    #[must_use]
-    pub fn stage_runs(&self) -> (u64, u64) {
-        (self.stages.runs, self.stages.lanes)
-    }
-
     /// The outputs `instance`'s program reads from a fire: (name, the pass's
     /// lane). An engine running guests in the interpreter feeds these.
     #[must_use]
@@ -923,12 +728,10 @@ impl Plane {
         false
     }
 
+    /// Guest passes run in the interpreter.
     #[must_use]
-    pub fn tally(&self) -> (u64, u64) {
-        (
-            self.tally.device.load(Ordering::Acquire),
-            self.tally.interpreted.load(Ordering::Acquire),
-        )
+    pub fn tally(&self) -> u64 {
+        self.tally.interpreted.load(Ordering::Acquire)
     }
 
     fn instance_mut(&mut self, id: InstanceId) -> Result<&mut Instance, Refusal> {

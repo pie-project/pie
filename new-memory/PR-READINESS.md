@@ -12,13 +12,17 @@ Branch today: 432 commits ahead of main, 782 files, +86k / -13k. Main merged in 
 | A5 | ROCm generated region kernels: flip + delete hand rules (b8/b64 in-process numbers pending) | AMD | in progress |
 | A6 | XLA: Mosaic page copy / flash / kv append on the pool; speed vs main; MoE result varies with pool chunk count (CUDA plugin) | TPU | in progress |
 | A7 | XLA weight streaming + snapshots (sc/xla2, partial) | TPU | queued |
-| A8 | Cerebras wafer `Spatial` engine still states degenerate facts (owner's unmerged branch) | Cerebras owner | blocked |
+| A8 | Cerebras: main's new wafer-program backend (#1435, merged M87) states degenerate facts; pool / tiers / record copies / weight streaming need its owner + hardware | — | OUT OF SCOPE for this PR (user); listed as a known limitation |
 | A10 | Delete device/host weight budgets, dense rotor, dense host tier; max_state_slots | L40S, Metal, VK5 | done M76 (dead legacy tier cleanup left) |
 | A11 | Eager path wrong tokens; nothing arms at small budgets | EAGER | done M82 (ROCm verify pending) |
 | A12 | Shared-pool snapshots; host-full hang + miscount; keep-handles key covers the record | RT | done M84 (other engines: A15) |
 | A13 | Record rs-buffered fires (MTP / spec decode on hybrids walk eagerly; same on main) — graph capture rule | L40S | after perf fixes |
 | A14 | Wire the rung shrink: scheduler caps a fire's tokens by the activation rung; SharedGrow shrink/restore_rung move the boundary (SPEC 6) | RT | queued |
-| A15 | read_tier_slots / write_tier_slots (snapshots on shared pools) on Metal, Vulkan, wgpu, XLA, Cerebras (CUDA in sc/rt4) | Metal agent, VKP, TPU, (Cerebras: assign) | queued |
+| A15 | read_tier_slots / write_tier_slots (snapshots on shared pools) on Metal, Vulkan, wgpu, XLA (CUDA in sc/rt4; Cerebras out of scope) | Metal agent, VKP, TPU | queued |
+| A16 | eager-fix regression: held weights flip to streaming on ROCm 30B MoE (body reservation) and stall | EAGER (sc/eager-fix-2) | in progress |
+| A17 | Guest panic under admission waits: bench barrier bug fixed (sc/sdk-wakeup) | SDK agent | done; A19 left |
+| A19 | A restartable process whose own demand exceeds the pool restarts forever (should fail with the starvation error); bind hangs waiting for state slots at 96 MiB | RT7 | in progress |
+| A18 | Idle cache demoted only when PLEX keys it above the floor (user decision) | RT6 | in progress |
 | A9 | dsv41 two-window mini cannot fire on sm_89/sm_120 (fused.lse_sink kernel gap) -> two-window CUDA unverified | L40S | queued |
 
 ## B. Decide before the PR (user)
@@ -34,10 +38,11 @@ Each backend shows decode (c1 / c8 / c64 / c256), prefill (512 / 2048) and boot 
 medians. Known gaps to close:
 - XLA/TPU v6e (M77): prefill 512 -19%, 2048 -12%; qwen35 c64 -13%; MoE c1 -9%, c256 -12%, prefill -10%.
 - ROCm synth: flip only at parity (in progress).
-- CUDA (L40S, server-level, medians of 3, all models arm fully): regressions to fix, in order:
-  (1) Qwen3-8B prefill 2048 145 -> 492 ms (3.4x, rising per request); (2) gpt-oss-20b prefill 2048 -23%;
-  (3) gemma-4-E2B prefill 512 -15%; (4) c256 -4..-6% on Qwen3.5-0.8B, gemma, Qwen3-8B (c64 -1..-3%);
-  (5) Qwen3-8B warm boot +5%. At parity: Qwen3.5-9B (all), c1/c8 everywhere. gpt-oss c64/c256 +24/+28% (faster).
+- CUDA (L40S, pageable host tier, server-level medians of 3; all models arm fully; end RSS 5.3-7.5 GB except
+  Qwen3-8B's demotion, which the keyed-demote gate removes): remaining gaps, flat across runs:
+  gpt-oss-20b prefill 2048 -25%; gemma-4-E2B prefill 512 -8.6%, c64 -4.1%, c256 -5.6%; Qwen3-8B c256 -3.3%,
+  prefill 2048 +4%; Qwen3.5-0.8B c256 -3.8%, c64 -1.7%. At parity or faster: Qwen3.5-9B; c1/c8 everywhere; gpt-oss
+  c64/c256 +24/+29%; Qwen3.5-0.8B prefill.
 - ROCm: default config arms 0 bodies on new-memory (flat range takes the spare) -> speed table waits for the fix.
 - Vulkan/wgpu, Metal: full comparison vs main not yet run.
 

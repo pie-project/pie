@@ -142,6 +142,104 @@ fn sample(
     }
 }
 
+/// A batch's lanes step through their prologue together: every lane binds
+/// before any opens its pipeline, and every lane of a wave opens its pipeline,
+/// then submits its first frame, before any goes on. Each lane records the
+/// last step it reached, and a lane that returns, `Ok` or `Err`, is past every
+/// step, so a lane that fails never strands the others at a step it will not
+/// reach.
+///
+/// The calls between the steps are synchronous, so a step is a yield, not a
+/// sleep: a lane at a step returns to `drive_until`, which polls the other
+/// lanes up to it within the same poll of the task. No lane registers a waker
+/// at a step; the task may sleep only once every lane is past its prologue and
+/// parked on a host future (a channel take). A lane left at a step when the
+/// task sleeps has nothing that would wake it, which wit-bindgen refuses
+/// ("cannot sleep waiting only on Rust-originating events").
+struct Lockstep {
+    reached: Vec<std::cell::Cell<u8>>,
+}
+
+const BOUND: u8 = 1;
+const PIPED: u8 = 2;
+const SUBMITTED: u8 = 3;
+const FINISHED: u8 = u8::MAX;
+
+impl Lockstep {
+    fn new(lanes: usize) -> Self {
+        Self {
+            reached: (0..lanes).map(|_| std::cell::Cell::new(0)).collect(),
+        }
+    }
+
+    fn all(&self, lanes: std::ops::Range<usize>, step: u8) -> bool {
+        self.reached[lanes].iter().all(|r| r.get() >= step)
+    }
+
+    /// Records `lane` at `step`, then yields until every lane of `group` has
+    /// reached it.
+    async fn arrive(&self, lane: usize, step: u8, group: std::ops::Range<usize>) {
+        self.reached[lane].set(step);
+        let mut yielded = false;
+        std::future::poll_fn(|_| {
+            if yielded && self.all(group.clone(), step) {
+                std::task::Poll::Ready(())
+            } else {
+                yielded = true;
+                std::task::Poll::Pending
+            }
+        })
+        .await;
+    }
+}
+
+/// Marks a lane past every step when its `run_one` returns.
+struct Finished<'a>(&'a Lockstep, usize);
+
+impl Drop for Finished<'_> {
+    fn drop(&mut self) {
+        self.0.reached[self.1].set(FINISHED);
+    }
+}
+
+/// A batch lane's place in the lockstep: the lane and its wave.
+struct LaneStep<'a> {
+    lockstep: &'a Lockstep,
+    lane: usize,
+    wave: std::ops::Range<usize>,
+}
+
+type Lane<'a> = (
+    std::pin::Pin<Box<dyn std::future::Future<Output = Result<RunResult>> + 'a>>,
+    Option<Result<RunResult>>,
+);
+
+fn failed(lanes: &[Lane<'_>]) -> bool {
+    lanes.iter().any(|(_, res)| matches!(res, Some(Err(_))))
+}
+
+/// Polls `lanes` until `done()` holds or a lane fails. Each lane reaches its
+/// next step within one poll, and a returned lane is past every step, so this
+/// ends.
+async fn drive_until(lanes: &mut [Lane<'_>], done: impl Fn() -> bool) {
+    std::future::poll_fn(|cx| {
+        while !done() && !failed(lanes) {
+            for (fut, res) in lanes.iter_mut() {
+                if done() {
+                    break;
+                }
+                if res.is_none()
+                    && let std::task::Poll::Ready(r) = fut.as_mut().poll(cx)
+                {
+                    *res = Some(r);
+                }
+            }
+        }
+        std::task::Poll::Ready(())
+    })
+    .await;
+}
+
 struct RunResult {
     num_prompt_tokens: usize,
     num_output_tokens: usize,
@@ -160,13 +258,9 @@ async fn run_one(
     honor_wait_for_start: bool,
     rng_seed: u32,
     main_pre_us: Option<u64>,
-    bind_barrier: Option<(
-        &std::sync::atomic::AtomicUsize,
-        usize,
-        &std::sync::atomic::AtomicUsize,
-        usize,
-    )>,
+    lockstep: Option<LaneStep<'_>>,
 ) -> Result<RunResult> {
+    let _finished = lockstep.as_ref().map(|l| Finished(l.lockstep, l.lane));
     let mut prologue_us: Vec<u64> = Vec::new();
     if input.report_timing {
         prologue_us.push(main_pre_us.unwrap_or(0)); // [0] main_pre
@@ -332,50 +426,21 @@ async fn run_one(
     for _ in 0..first_decodes {
         first_slots.push(Some(fwd_d.as_ref().expect("decode pass exists")));
     }
-    if let Some((ready, total, _, _)) = bind_barrier {
+    if let Some(l) = &lockstep {
         fwd_p.bind().context("bind prefill program")?;
         if let Some(fwd) = &fwd_d {
             fwd.bind().context("bind decode program")?;
         }
-        ready.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-        let mut yielded = false;
-        std::future::poll_fn(|_cx| {
-            if !yielded || ready.load(std::sync::atomic::Ordering::SeqCst) < total {
-                yielded = true;
-                std::task::Poll::Pending
-            } else {
-                std::task::Poll::Ready(())
-            }
-        })
-        .await;
+        let batch = 0..l.lockstep.reached.len();
+        l.lockstep.arrive(l.lane, BOUND, batch).await;
     }
     let pipe = Pipeline::new();
-    if let Some((_, _, pipe_ready, pipe_target)) = bind_barrier {
-        pipe_ready.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-        let mut yielded = false;
-        std::future::poll_fn(|_cx| {
-            if !yielded || pipe_ready.load(std::sync::atomic::Ordering::SeqCst) < pipe_target {
-                yielded = true;
-                std::task::Poll::Pending
-            } else {
-                std::task::Poll::Ready(())
-            }
-        })
-        .await;
+    if let Some(l) = &lockstep {
+        l.lockstep.arrive(l.lane, PIPED, l.wave.clone()).await;
     }
     submit_frame(&pipe, &first_slots).context("first frame submit")?;
-    if let Some((_, _, pipe_ready, pipe_target)) = bind_barrier {
-        pipe_ready.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-        let mut yielded = false;
-        std::future::poll_fn(|_cx| {
-            if !yielded || pipe_ready.load(std::sync::atomic::Ordering::SeqCst) < 2 * pipe_target {
-                yielded = true;
-                std::task::Poll::Pending
-            } else {
-                std::task::Poll::Ready(())
-            }
-        })
-        .await;
+    if let Some(l) = &lockstep {
+        l.lockstep.arrive(l.lane, SUBMITTED, l.wave.clone()).await;
     }
     let mut submitted = first_decodes;
 
@@ -571,62 +636,46 @@ async fn main(input: Input) -> Result<Output> {
             .batch_concurrency
             .unwrap_or(batch_len)
             .clamp(1, batch_len);
-        let bind_ready = std::sync::atomic::AtomicUsize::new(0);
-        let pipe_ready = std::sync::atomic::AtomicUsize::new(0);
-        let mut waves = Vec::new();
-        let mut offset = 0usize;
-        while offset < batch_len {
-            let end = (offset + batch_concurrency).min(batch_len);
-            let futs: Vec<_> = (offset..end)
-                .map(|i| {
-                    let prompt = input
-                        .prompts
-                        .get(i)
-                        .map(String::as_str)
-                        .unwrap_or(input.prompt.as_str());
-                    let prompt_tokens = if !prepared_prompt_tokens.is_empty() {
-                        prepared_prompt_tokens.get(i).map(Vec::as_slice)
-                    } else {
-                        input.prompt_tokens_batch.get(i).map(Vec::as_slice)
-                    };
-                    (
-                        Box::pin(run_one(
-                            &input,
-                            prompt,
-                            prompt_tokens,
-                            &stop_tokens,
-                            false,
-                            0x51ed_0001u32.wrapping_add(i as u32),
-                            None,
-                            Some((&bind_ready, batch_len, &pipe_ready, end - offset)),
-                        )),
-                        None::<Result<RunResult>>,
-                    )
-                })
-                .collect();
-            waves.push((offset, end, futs));
-            offset = end;
-        }
-        std::future::poll_fn(|cx| {
-            while bind_ready.load(std::sync::atomic::Ordering::SeqCst) < batch_len {
-                let mut any_ready = false;
-                for (_, _, futs) in waves.iter_mut() {
-                    for (fut, res) in futs.iter_mut() {
-                        if res.is_none()
-                            && let std::task::Poll::Ready(r) = fut.as_mut().poll(cx)
-                        {
-                            *res = Some(r);
-                            any_ready = true;
-                        }
-                    }
-                }
-                if any_ready {
-                    break;
-                }
-            }
-            std::task::Poll::Ready(())
-        })
-        .await;
+        let lockstep = Lockstep::new(batch_len);
+        let waves: Vec<std::ops::Range<usize>> = (0..batch_len)
+            .step_by(batch_concurrency)
+            .map(|offset| offset..(offset + batch_concurrency).min(batch_len))
+            .collect();
+        let mut lanes: Vec<Lane<'_>> = waves
+            .iter()
+            .flat_map(|wave| wave.clone().map(move |i| (i, wave.clone())))
+            .map(|(i, wave)| {
+                let prompt = input
+                    .prompts
+                    .get(i)
+                    .map(String::as_str)
+                    .unwrap_or(input.prompt.as_str());
+                let prompt_tokens = if !prepared_prompt_tokens.is_empty() {
+                    prepared_prompt_tokens.get(i).map(Vec::as_slice)
+                } else {
+                    input.prompt_tokens_batch.get(i).map(Vec::as_slice)
+                };
+                let lane: Lane<'_> = (
+                    Box::pin(run_one(
+                        &input,
+                        prompt,
+                        prompt_tokens,
+                        &stop_tokens,
+                        false,
+                        0x51ed_0001u32.wrapping_add(i as u32),
+                        None,
+                        Some(LaneStep {
+                            lockstep: &lockstep,
+                            lane: i,
+                            wave,
+                        }),
+                    )),
+                    None,
+                );
+                lane
+            })
+            .collect();
+        drive_until(&mut lanes, || lockstep.all(0..batch_len, BOUND)).await;
         if input.wait_for_start {
             session::send("ready");
             let _ = session::receive().await;
@@ -634,32 +683,24 @@ async fn main(input: Input) -> Result<Output> {
         let mut request_prompt_tokens = Vec::with_capacity(batch_len);
         let mut request_output_tokens = Vec::with_capacity(batch_len);
         let mut first_tokens: Vec<u32> = Vec::new();
-        for (wave_offset, wave_end, futs) in &mut waves {
-            pipe_ready.store(0, std::sync::atomic::Ordering::SeqCst);
-            let wave_len = *wave_end - *wave_offset;
-            for target in [wave_len, 2 * wave_len] {
-                std::future::poll_fn(|cx| {
-                    while pipe_ready.load(std::sync::atomic::Ordering::SeqCst) < target {
-                        let mut any_ready = false;
-                        for (fut, res) in futs.iter_mut() {
-                            if res.is_none()
-                                && let std::task::Poll::Ready(r) = fut.as_mut().poll(cx)
-                            {
-                                *res = Some(r);
-                                any_ready = true;
-                            }
-                        }
-                        if any_ready {
-                            break;
-                        }
-                    }
-                    std::task::Poll::Ready(())
-                })
-                .await;
+        // A failed lane fails the batch at once: the lanes still running are
+        // dropped, which closes their pipelines and frees their pages, and
+        // none is left waiting at a step for lanes that will not come.
+        for wave in &waves {
+            if failed(&lanes) {
+                break;
             }
+            let wave_lanes = &mut lanes[wave.clone()];
+            drive_until(wave_lanes, || lockstep.all(wave.clone(), PIPED)).await;
+            drive_until(wave_lanes, || lockstep.all(wave.clone(), SUBMITTED)).await;
+            if failed(wave_lanes) {
+                break;
+            }
+            // Every lane of the wave is past its prologue: what is left
+            // waits on channel takes, host futures that wake the task.
             std::future::poll_fn(|cx| {
                 let mut all_done = true;
-                for (fut, res) in futs.iter_mut() {
+                for (fut, res) in wave_lanes.iter_mut() {
                     if res.is_none() {
                         if let std::task::Poll::Ready(r) = fut.as_mut().poll(cx) {
                             *res = Some(r);
@@ -668,7 +709,7 @@ async fn main(input: Input) -> Result<Output> {
                         }
                     }
                 }
-                if all_done {
+                if all_done || failed(wave_lanes) {
                     std::task::Poll::Ready(())
                 } else {
                     std::task::Poll::Pending
@@ -676,15 +717,21 @@ async fn main(input: Input) -> Result<Output> {
             })
             .await;
         }
-        for (wave_offset, _, futs) in waves {
-            for (j, (_, res)) in futs.into_iter().enumerate() {
-                let result = res.expect("wave future completed")?;
-                if wave_offset + j == 0 {
-                    first_tokens = result.tokens;
-                }
-                request_prompt_tokens.push(result.num_prompt_tokens);
-                request_output_tokens.push(result.num_output_tokens);
+        if let Some(Some(Err(error))) = lanes
+            .iter_mut()
+            .map(|(_, res)| res)
+            .find(|res| matches!(res, Some(Err(_))))
+            .map(Option::take)
+        {
+            return Err(error);
+        }
+        for (i, (_, res)) in lanes.into_iter().enumerate() {
+            let result = res.expect("lane completed")?;
+            if i == 0 {
+                first_tokens = result.tokens;
             }
+            request_prompt_tokens.push(result.num_prompt_tokens);
+            request_output_tokens.push(result.num_output_tokens);
         }
         let text = if input.return_text {
             model::decode(&first_tokens).unwrap_or_default()

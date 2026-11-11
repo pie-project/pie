@@ -59,6 +59,20 @@ fn a_gated_delta_hybrid_answers_bit_for_bit() {
 }
 
 #[test]
+fn a_wide_model_answers_bit_for_bit_past_a_tall_prompt() {
+    // kv rows of whole pool rows (8 heads of 128): the tall prompt's pages
+    // land by block and by the Mosaic kernel straight into the pool
+    run("qwen3-0.6b", Some(2), 1024, Some(700));
+}
+
+#[test]
+fn a_wide_hybrid_answers_bit_for_bit() {
+    // conv and delta state of real widths (6144 conv channels): the decode
+    // conv by the pool's Mosaic kernel, the delta step by its own
+    run("qwen35-d0.8b", Some(4), 512, None);
+}
+
+#[test]
 fn a_routed_model_answers_bit_for_bit() {
     run("qwen3-30b-a3b-mini", None, 256, None);
 }
@@ -205,4 +219,64 @@ fn a_parked_working_set_decodes_on_as_it_would_have() {
         );
     }
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// 64 prompts, then three decodes of all 64 lanes (a decode wide enough for
+/// the page-copy kernel): every readout.
+fn many_lanes(name: &str, layers: Option<u32>) -> Vec<Vec<u32>> {
+    use crate::common_llm::set_knob;
+    use crate::common_llm::{Refs, Seq, bits, tokens};
+    set_knob("SLOTS", 64);
+    set_knob("LANES", 64);
+    set_knob("TOKENS", 128);
+    let mut model = Model::load(name, layers, 256, 7);
+    set_knob("SLOTS", 4);
+    set_knob("LANES", 8);
+    let vocab = model.vocab;
+    let mut refs = Refs::of(&model);
+    let mut seqs: Vec<Seq> = (0..64).map(Seq::new).collect();
+    let mut out = Vec::new();
+    for (i, seq) in seqs.iter_mut().enumerate() {
+        let n = 17 + (i % 23);
+        let lane = seq.lane(&model, &mut refs, tokens(i as u64, n, vocab));
+        let r = model.fire(vec![lane]);
+        seq.held += n as u32;
+        out.push(bits(&r[0]));
+    }
+    for step in 0..3u32 {
+        let lanes: Vec<_> = seqs
+            .iter_mut()
+            .enumerate()
+            .map(|(i, seq)| seq.lane(&model, &mut refs, vec![(i as u32 * 31 + step) % vocab]))
+            .collect();
+        for r in model.fire(lanes) {
+            out.push(bits(&r));
+        }
+        for seq in &mut seqs {
+            seq.held += 1;
+        }
+    }
+    out
+}
+
+#[test]
+fn a_wide_decode_of_many_lanes_answers_bit_for_bit() {
+    let Some(_device) = crate::common_dit::device() else {
+        return;
+    };
+    let name = "qwen3-0.6b";
+    let bytes = encode(&many_lanes(name, Some(2)));
+    let tag = "qwen3-0.6b-many";
+    if let Ok(dir) = std::env::var("PIE_XLA_GOLDEN_DUMP") {
+        std::fs::create_dir_all(&dir).expect("the dump directory");
+        std::fs::write(file(&dir, tag), &bytes).expect("the dump writes");
+    }
+    if let Ok(dir) = std::env::var("PIE_XLA_GOLDEN") {
+        let want = std::fs::read(file(&dir, tag)).expect("the golden file reads");
+        assert!(
+            want == bytes,
+            "{tag}: the readouts differ from the golden build's"
+        );
+        eprintln!("{tag}: bit-identical");
+    }
 }

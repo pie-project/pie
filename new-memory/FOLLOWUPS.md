@@ -17,3 +17,8 @@ dedicated = 1.0 / never / false, aggressive = 0.9 / 4 / true, balanced = 0.8 / 2
 `[engine]` common max_batch_tokens / max_batch_sequences / max_context. Delete max_state_slots (still accepted by six
 backend option structs and named in fit.rs messages), kv_page_size, xla seat_tokens. Old keys refused with the new
 name.
+
+## F3. Async admission in the guest API
+The KV admission wait sits inside the synchronous `submit` WIT call, so a waiting lane blocks every lane of its guest
+and admitted lanes can't drain. Make `submit` async (or add an admission future) across every SDK. Until then,
+inferlets that batch should cap their in-flight lanes (text-completion-bench: batch_concurrency).
