@@ -194,6 +194,8 @@ struct Params {
     uint k_origin;
     uint v_origin;
     uint page_stride;
+    // The pool's segments that hold a buffer (1: every page in segment 0).
+    uint segments;
     int gqa_factor;
     int page_size;
     int n_kv_heads;
@@ -347,7 +349,12 @@ void main(uint3 group : SV_GroupID, uint3 local : SV_GroupThreadID) {
                 vw[i] = buf_[v_at + lane + i * LANES_PER_ROW]; \
             }
 #define SDPA_TILE_KV(buf_) SDPA_TILE_K(buf_) SDPA_TILE_V(buf_)
-            if (k_seg == v_seg) {
+            // A pool of one segment (the usual) reads it with no branch on
+            // the page: the condition is the fire's, so the loop is the
+            // compiler's to unswitch.
+            if (params.segments == 1u) {
+                SDPA_TILE_KV(pie_seg0)
+            } else if (k_seg == v_seg) {
                 PIE_POOL_ON(k_seg, SDPA_TILE_KV)
             } else {
                 PIE_POOL_ON(k_seg, SDPA_TILE_K)
@@ -491,8 +498,8 @@ void decode_walk(uint row, uint q_head, uint tid, int k_lo, int k_hi, int q_pos,
             }
             uint base = page_row(req, kp) + uint(kv_head) * uint(PIE_HEAD_DIM);
             uint k_seg, k_at, v_seg, v_at;
-            pie_pool_at(SDPA_KV_SCALE * params.k_origin + base, k_seg, k_at);
-            pie_pool_at(SDPA_KV_SCALE * params.v_origin + base, v_seg, v_at);
+            pie_pool_find(SDPA_KV_SCALE * params.k_origin + base, k_seg, k_at);
+            pie_pool_find(SDPA_KV_SCALE * params.v_origin + base, v_seg, v_at);
             // The row's elements first, from its one segment; then the sum
             // as the pool view read it.
             uint16_t kh[DPL];
@@ -501,7 +508,7 @@ void decode_walk(uint row, uint q_head, uint tid, int k_lo, int k_hi, int q_pos,
                 uint dd = lane + j * width; \
                 if (j < per_lane && dd < uint(PIE_HEAD_DIM)) { kh[j] = buf_[k_at + dd]; } else { kh[j] = uint16_t(0); } \
             }
-            PIE_POOL_ON(k_seg, SDPA_DECODE_K)
+            PIE_POOL_BRANCH(k_seg, SDPA_DECODE_K)
             // The fused forms the driver contracted the pool view's sums to,
             // stated: the loads moved, the bits stay.
             float partial = 0.0;
@@ -520,7 +527,7 @@ void decode_walk(uint row, uint q_head, uint tid, int k_lo, int k_hi, int q_pos,
                 uint dd = lane + j * width; \
                 if (j < per_lane && dd < uint(PIE_HEAD_DIM)) { vh[j] = buf_[v_at + dd]; } else { vh[j] = uint16_t(0); } \
             }
-            PIE_POOL_ON(v_seg, SDPA_DECODE_V)
+            PIE_POOL_BRANCH(v_seg, SDPA_DECODE_V)
             [ForceUnroll] for (uint j = 0u; j < uint(DPL); j++) {
                 uint dd = lane + j * width;
                 if (j < per_lane && dd < uint(PIE_HEAD_DIM)) {
@@ -695,8 +702,8 @@ void decode_walk(uint row, uint q_head, uint tid, int k_lo, int k_hi, int q_pos,
         uint k_seg = 0u, k_at = 0u, v_seg = 0u, v_at = 0u;
         if (take) {
             base = page_row(req, kp) + uint(kv_head) * uint(PIE_HEAD_DIM);
-            pie_pool_at(SDPA_KV_SCALE * params.k_origin + (base >> 1), k_seg, k_at);
-            pie_pool_at(SDPA_KV_SCALE * params.v_origin + (base >> 1), v_seg, v_at);
+            pie_pool_find(SDPA_KV_SCALE * params.k_origin + (base >> 1), k_seg, k_at);
+            pie_pool_find(SDPA_KV_SCALE * params.v_origin + (base >> 1), v_seg, v_at);
             // The row's words first, from its one segment; then the sum as
             // the pool view read it.
             uint kw[PPL];
@@ -705,7 +712,7 @@ void decode_walk(uint row, uint q_head, uint tid, int k_lo, int k_hi, int q_pos,
                 uint pp = lane + j * width; \
                 if (j < per_lane && pp < pairs) { kw[j] = buf_[k_at + pp]; } else { kw[j] = 0u; } \
             }
-            PIE_POOL_ON(k_seg, SDPA_WORDS_K)
+            PIE_POOL_BRANCH(k_seg, SDPA_WORDS_K)
             [ForceUnroll] for (uint j = 0u; j < uint(PPL); j++) {
                 uint pp = lane + j * width;
                 if (j < per_lane && pp < pairs) {
@@ -732,7 +739,7 @@ void decode_walk(uint row, uint q_head, uint tid, int k_lo, int k_hi, int q_pos,
                 uint pp = lane + j * width; \
                 if (j < per_lane && pp < pairs) { vw[j] = buf_[v_at + pp]; } else { vw[j] = 0u; } \
             }
-            PIE_POOL_ON(v_seg, SDPA_WORDS_V)
+            PIE_POOL_BRANCH(v_seg, SDPA_WORDS_V)
             [ForceUnroll] for (uint j = 0u; j < uint(PPL); j++) {
                 uint pp = lane + j * width;
                 if (j < per_lane && pp < pairs) {

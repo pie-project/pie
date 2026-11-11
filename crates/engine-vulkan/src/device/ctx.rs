@@ -57,23 +57,13 @@ pub fn present() -> bool {
         return false;
     };
     let _gate = instance_gate();
-    let app = vk::ApplicationInfo::default().api_version(vk::API_VERSION_1_2);
-    // SAFETY: a global query of the loaded entry, with no handles.
-    let exts = unsafe { entry.enumerate_instance_extension_properties(None) }.unwrap_or_default();
-    let (portability, flags) = portability(&exts);
-    let info = vk::InstanceCreateInfo::default()
-        .application_info(&app)
-        .flags(flags)
-        .enabled_extension_names(&portability);
-    // SAFETY: `info` and `app` outlive the call, and the gate serializes
-    // instance creation and destruction across the process. The instance is
-    // used only here, its physical devices come from it, and it is destroyed
-    // once, after its last use, with no child objects made.
+    let Ok((instance, _)) = shared_instance(&entry, false) else {
+        return false;
+    };
+    // SAFETY: the shared instance lives for the process; its physical
+    // devices come from it.
     unsafe {
-        let Ok(instance) = entry.create_instance(&info, None) else {
-            return false;
-        };
-        let found = instance
+        instance
             .enumerate_physical_devices()
             .map(|devices| {
                 devices.iter().any(|&physical| {
@@ -83,10 +73,76 @@ pub fn present() -> bool {
                         .any(|q| q.queue_flags.contains(vk::QueueFlags::COMPUTE))
                 })
             })
-            .unwrap_or(false);
-        instance.destroy_instance(None);
-        found
+            .unwrap_or(false)
     }
+}
+
+/// The process's instance (with the validation layer, or without), made
+/// on first use and never destroyed: every device is made from it. A
+/// driver may refuse instances past a count in one process however many
+/// were destroyed (NVIDIA 595.91 refuses the 27th: "Unable to find a Vulkan
+/// driver"), so loads made one after another (tests, reloads) share one.
+/// The caller holds the instance gate.
+fn shared_instance(
+    entry: &ash::Entry,
+    validated: bool,
+) -> std::result::Result<(ash::Instance, bool), Fault> {
+    static SHARED: Mutex<Vec<(bool, ash::Instance, bool)>> = Mutex::new(Vec::new());
+    let mut shared = SHARED.lock().expect("shared instance lock poisoned");
+    if let Some((_, instance, props2)) = shared.iter().find(|(v, ..)| *v == validated) {
+        return Ok((instance.clone(), *props2));
+    }
+    let app = vk::ApplicationInfo::default()
+        .application_name(c"pie")
+        .api_version(vk::API_VERSION_1_3);
+    let validation = c"VK_LAYER_KHRONOS_validation";
+    let enabled_layers: Vec<*const c_char> = if validated {
+        vec![validation.as_ptr()]
+    } else {
+        Vec::new()
+    };
+    let instance_exts =
+        // SAFETY: a global query of the loaded entry, with no handles.
+        unsafe { entry.enumerate_instance_extension_properties(None) }.unwrap_or_default();
+    let (mut enabled_exts, flags) = portability(&instance_exts);
+    if validated {
+        enabled_exts.push(ash::ext::debug_utils::NAME.as_ptr());
+    }
+    let props2 = has_extension(
+        &instance_exts,
+        ash::khr::get_physical_device_properties2::NAME,
+    );
+    let info = vk::InstanceCreateInfo::default()
+        .application_info(&app)
+        .flags(flags)
+        .enabled_layer_names(&enabled_layers)
+        .enabled_extension_names(&enabled_exts);
+    // SAFETY: `info` names only layers and extensions found above, its
+    // borrowed names and `app` outlive the call, and the gate is held.
+    let instance =
+        unsafe { entry.create_instance(&info, None) }.map_err(|e| Fault::NoDevice {
+            detail: format!("vkCreateInstance: {e}"),
+        })?;
+    if validated {
+        let debug = ash::ext::debug_utils::Instance::new(entry, &instance);
+        let create = vk::DebugUtilsMessengerCreateInfoEXT::default()
+            .message_severity(
+                vk::DebugUtilsMessageSeverityFlagsEXT::ERROR
+                    | vk::DebugUtilsMessageSeverityFlagsEXT::WARNING,
+            )
+            .message_type(
+                vk::DebugUtilsMessageTypeFlagsEXT::VALIDATION
+                    | vk::DebugUtilsMessageTypeFlagsEXT::GENERAL,
+            )
+            .pfn_user_callback(Some(on_validation));
+        // SAFETY: `debug_utils` is enabled on `instance` whenever
+        // `validated`, and `on_validation` matches the callback ABI and
+        // reads only what the layer passes it. The messenger lives as long
+        // as the instance, the process.
+        let _ = unsafe { debug.create_debug_utils_messenger(&create, None) };
+    }
+    shared.push((validated, instance.clone(), props2));
+    Ok((instance, props2))
 }
 
 pub(crate) const STAGING_BYTES: u64 = 256 << 20;
@@ -120,7 +176,6 @@ pub(crate) struct Core {
     pub(crate) memory: vk::PhysicalDeviceMemoryProperties,
     pub(crate) limits: vk::PhysicalDeviceLimits,
     pub(crate) transfer: Mutex<Transfer>,
-    messenger: Option<(ash::ext::debug_utils::Instance, vk::DebugUtilsMessengerEXT)>,
     pub(crate) allocated: AtomicU64,
     pub(crate) name: String,
     pub(crate) subgroup_size: u32,
@@ -132,6 +187,7 @@ pub(crate) struct Core {
     pub(crate) cores: Option<u32>,
     pub(crate) device_local: u64,
     pub(crate) vendor_id: u32,
+    pub(crate) discrete: bool,
     pub(crate) api_version: u32,
     pub(crate) features: Enabled,
 }
@@ -307,8 +363,7 @@ impl Drop for Core {
     fn drop(&mut self) {
         // SAFETY: this is the last `Arc<Core>`, so every slab, frame, cache and
         // pipeline that held one is gone; `device_wait_idle` retires any work
-        // still queued. Children are destroyed before the device and the
-        // device before its instance, under the instance gate.
+        // still queued. Children are destroyed before the device.
         unsafe {
             let _ = self.device.device_wait_idle();
             {
@@ -327,12 +382,8 @@ impl Drop for Core {
             for pool in pools.into_values() {
                 self.device.destroy_command_pool(pool, None);
             }
+            // The instance is the process's (`shared_instance`).
             self.device.destroy_device(None);
-            if let Some((debug, messenger)) = self.messenger.take() {
-                debug.destroy_debug_utils_messenger(messenger, None);
-            }
-            let _gate = instance_gate();
-            self.instance.destroy_instance(None);
         }
     }
 }
@@ -531,9 +582,6 @@ impl Context {
             detail: format!("no Vulkan loader: {e}"),
         })?;
         let _gate = instance_gate();
-        let app = vk::ApplicationInfo::default()
-            .application_name(c"pie")
-            .api_version(vk::API_VERSION_1_3);
         // SAFETY: a global query of the loaded entry, with no handles.
         let layers = unsafe { entry.enumerate_instance_layer_properties() }.unwrap_or_default();
         let validation = c"VK_LAYER_KHRONOS_validation";
@@ -541,70 +589,8 @@ impl Context {
             && layers
                 .iter()
                 .any(|l| l.layer_name_as_c_str().is_ok_and(|s| s == validation));
-        let enabled_layers: Vec<*const c_char> = if validated {
-            vec![validation.as_ptr()]
-        } else {
-            Vec::new()
-        };
-        let instance_exts =
-            // SAFETY: a global query of the loaded entry, with no handles.
-            unsafe { entry.enumerate_instance_extension_properties(None) }.unwrap_or_default();
-        let (mut enabled_exts, flags) = portability(&instance_exts);
-        if validated {
-            enabled_exts.push(ash::ext::debug_utils::NAME.as_ptr());
-        }
-        let props2 = has_extension(
-            &instance_exts,
-            ash::khr::get_physical_device_properties2::NAME,
-        );
-        let info = vk::InstanceCreateInfo::default()
-            .application_info(&app)
-            .flags(flags)
-            .enabled_layer_names(&enabled_layers)
-            .enabled_extension_names(&enabled_exts);
-        // SAFETY: `info` names only layers and extensions found above, its
-        // borrowed names and `app` outlive the call, and the gate is held.
-        let instance =
-            unsafe { entry.create_instance(&info, None) }.map_err(|e| Fault::NoDevice {
-                detail: format!("vkCreateInstance: {e}"),
-            })?;
-        let messenger = if validated {
-            let debug = ash::ext::debug_utils::Instance::new(&entry, &instance);
-            let create = vk::DebugUtilsMessengerCreateInfoEXT::default()
-                .message_severity(
-                    vk::DebugUtilsMessageSeverityFlagsEXT::ERROR
-                        | vk::DebugUtilsMessageSeverityFlagsEXT::WARNING,
-                )
-                .message_type(
-                    vk::DebugUtilsMessageTypeFlagsEXT::VALIDATION
-                        | vk::DebugUtilsMessageTypeFlagsEXT::GENERAL,
-                )
-                .pfn_user_callback(Some(on_validation));
-            // SAFETY: `debug_utils` is enabled on `instance` whenever
-            // `validated`, and `on_validation` matches the callback ABI and
-            // reads only what the layer passes it.
-            unsafe { debug.create_debug_utils_messenger(&create, None) }
-                .ok()
-                .map(|m| (debug, m))
-        } else {
-            None
-        };
-        match Self::finish(entry, instance, messenger, boot, share, props2) {
-            Ok(context) => Ok(context),
-            Err((fault, Some((instance, messenger)))) => {
-                // SAFETY: `finish` hands the instance back only when it made no
-                // device from it, so the messenger and then the instance are
-                // its last objects; the gate is still held.
-                unsafe {
-                    if let Some((debug, m)) = messenger {
-                        debug.destroy_debug_utils_messenger(m, None);
-                    }
-                    instance.destroy_instance(None);
-                }
-                Err(fault)
-            }
-            Err((fault, None)) => Err(fault),
-        }
+        let (instance, props2) = shared_instance(&entry, validated)?;
+        Self::finish(entry, instance, boot, share, props2)
     }
 
     #[allow(
@@ -615,14 +601,13 @@ impl Context {
     fn finish(
         entry: ash::Entry,
         instance: ash::Instance,
-        messenger: Option<(ash::ext::debug_utils::Instance, vk::DebugUtilsMessengerEXT)>,
         boot: &DeviceBoot,
         share: f64,
         _props2: bool,
-    ) -> std::result::Result<Context, (Fault, Option<Undone>)> {
+    ) -> Result<Context> {
         macro_rules! bail {
             ($fault:expr) => {
-                return Err(($fault, Some((instance, messenger))))
+                return Err($fault)
             };
         }
         // In this function every query takes a `physical` enumerated from
@@ -927,7 +912,6 @@ impl Context {
             memory,
             limits: props.limits,
             transfer: Mutex::new(transfer),
-            messenger,
             allocated: AtomicU64::new(0),
             name: name.clone(),
             subgroup_size: pinned.unwrap_or(subgroup.subgroup_size.max(1)),
@@ -936,6 +920,7 @@ impl Context {
             cores,
             device_local,
             vendor_id: props.vendor_id,
+            discrete: props.device_type == vk::PhysicalDeviceType::DISCRETE_GPU,
             api_version: props.api_version,
             features: enabled,
         });
@@ -943,10 +928,10 @@ impl Context {
         // Taken before this load allocates, so what the heap holds then is
         // other processes'.
         let working_set = ((device_local as f64 * share) as u64).saturating_sub(core.held());
-        let dummy = Raw::new(&core, DUMMY_BYTES, Memory::Device).map_err(|fault| (fault, None))?;
+        let dummy = Raw::new(&core, DUMMY_BYTES, Memory::Device)?;
         let pipeline_cache = Arc::new(
             PipelineCache::open(&core, boot.pipeline_cache.clone())
-                .map_err(|fault| (fault, None))?,
+                ?,
         );
         Ok(Context {
             core,
@@ -1036,6 +1021,7 @@ impl Context {
             subgroup: self.core.subgroup_min,
             cores: self.core.cores,
             coopmat: self.core.features.coopmat,
+            discrete: self.core.discrete,
         }
     }
 
@@ -1149,11 +1135,6 @@ impl Context {
         })
     }
 }
-
-type Undone = (
-    ash::Instance,
-    Option<(ash::ext::debug_utils::Instance, vk::DebugUtilsMessengerEXT)>,
-);
 
 fn pick_family(families: &[vk::QueueFamilyProperties]) -> Option<u32> {
     let dedicated = families.iter().position(|q| {

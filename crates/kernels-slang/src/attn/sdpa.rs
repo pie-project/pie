@@ -206,6 +206,7 @@ fn args(
         pool.origin[0].arg(),
         pool.origin[1].arg(),
         pool.page_stride[0].arg(),
+        (pool.pool.bufs.iter().filter(|&&buf| buf != crate::ABSENT).count() as u32).arg(),
         stated(op, shape.q_heads / shape.kv_heads)?.arg(),
         pool.page_size.arg(),
         stated(op, shape.kv_heads)?.arg(),

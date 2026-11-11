@@ -59,6 +59,24 @@
         } \
         local = v; \
     } \
+    /* `pie_pool_at` on every target, WGSL too: for `PIE_POOL_BRANCH`. */ \
+    void pie_pool_find(uint v, out uint seg, out uint local) { \
+        uint s = (seg_); \
+        seg = 0u; \
+        if (v >= s) { \
+            v -= s; \
+            seg = 1u; \
+            if (v >= s) { \
+                v -= s; \
+                seg = 2u; \
+                if (v >= s) { \
+                    v -= s; \
+                    seg = 3u; \
+                } \
+            } \
+        } \
+        local = v; \
+    } \
     struct pie_pool_chain_ro { \
         __subscript(uint i)->type_ { \
             get { return pie_pool_get(i); } \
@@ -85,6 +103,15 @@
     else { body_(pie_seg3) }
 #define PIE_POOL_ON_RW(seg_, body_) PIE_POOL_ON(seg_, body_)
 #endif
+
+// `PIE_POOL_ON` by a branch on every target, its segment from
+// `pie_pool_find`: a decode row, a few elements a lane, reads faster so on
+// WGSL too (the comparisons once a row, not an element).
+#define PIE_POOL_BRANCH(seg_, body_) \
+    if ((seg_) == 0u) { body_(pie_seg0) } \
+    else if ((seg_) == 1u) { body_(pie_seg1) } \
+    else if ((seg_) == 2u) { body_(pie_seg2) } \
+    else { body_(pie_seg3) }
 
 #define PIE_POOL_WRITE(type_, seg_) \
     void pie_pool_set(uint v, type_ x) { \

@@ -26,7 +26,7 @@ use poem_compiler::chunk::{ChunkRecipe, WeightKind as RecipeKind};
 use poem_ir::{Def, Dtype, Gather, Operands, Operation, ParamSource, Trace};
 
 use crate::device::ctx::Frame;
-use crate::device::{Buffer, Context, Handles};
+use crate::device::{Buffer, Context, Handles, Pending};
 use crate::error::{Fault, Result};
 use crate::experts::{HostPlane, HostTier};
 use crate::store::Pools;
@@ -42,6 +42,9 @@ pub const WEIGHTS: u32 = 8;
 
 /// Bytes one fill moves through its host-visible upload at most.
 const UPLOAD: u64 = 64 << 20;
+
+/// The threads that lay a fill's rows.
+const FILL_THREADS: usize = 16;
 
 /// The tables a plain token-id gather alone reads: bf16, two axes, from
 /// the checkpoint, every reader a `Gather::Embed` with no weights, scales or
@@ -499,7 +502,9 @@ impl RowCaches {
     }
 
     /// Fills the slots `fills` names (virtual byte, cache, block) with their
-    /// blocks' rows from the host, in uploads of [`UPLOAD`] bytes at most.
+    /// blocks' rows from the host, in uploads of [`UPLOAD`] bytes at most:
+    /// two host-visible uploads made once, the rows laid in one by
+    /// [`FILL_THREADS`] threads while the other's copy runs.
     fn fill(
         &self,
         device: &Context,
@@ -508,47 +513,36 @@ impl RowCaches {
         planes: &BTreeMap<usize, &HostPlane>,
         fills: &mut [(u64, usize, u32)],
     ) -> Result<()> {
+        if fills.is_empty() {
+            return Ok(());
+        }
         fills.sort_unstable();
+        let widest = fills
+            .iter()
+            .map(|&(_, cache, _)| self.caches[cache].shape.slot_bytes)
+            .max()
+            .unwrap_or(0);
+        let capacity = UPLOAD.max(widest).max(4);
+        let uploads = [Buffer::host(device, capacity)?, Buffer::host(device, capacity)?];
+        let mut pending: [Option<Pending>; 2] = [None, None];
+        let mut turn = 0usize;
         let mut start = 0usize;
         while start < fills.len() {
             let mut bytes = 0u64;
             let mut end = start;
             while end < fills.len() {
                 let slot = self.caches[fills[end].1].shape.slot_bytes;
-                if bytes > 0 && bytes + slot > UPLOAD {
+                if bytes > 0 && bytes + slot > capacity {
                     break;
                 }
                 bytes += slot;
                 end += 1;
             }
-            let mut upload = Buffer::host(device, bytes.max(4))?;
-            let mut at = 0u64;
-            let mut image = Vec::new();
-            for &(_, cache, block) in &fills[start..end] {
-                let shape = &self.caches[cache].shape;
-                image.clear();
-                image.resize(usize::try_from(shape.slot_bytes).unwrap_or(0), 0);
-                for k in 0..u64::from(shape.block_rows) {
-                    let id = u64::from(block) * u64::from(shape.block_rows) + k;
-                    if id >= shape.rows {
-                        break;
-                    }
-                    for table in &shape.tables {
-                        let plane = planes.get(&table.param).ok_or_else(|| Fault::Unbound {
-                            what: format!(
-                                "row table param {}, which the host tier does not hold",
-                                table.param
-                            ),
-                        })?;
-                        let from = usize::try_from(k * shape.atom_bytes + table.origin)
-                            .unwrap_or(usize::MAX);
-                        let len = usize::try_from(table.row_bytes).unwrap_or(0);
-                        plane.row_into(host.map(), id, &mut image[from..from + len])?;
-                    }
-                }
-                upload.write(at, &image)?;
-                at += shape.slot_bytes;
+            if let Some(copy) = pending[turn].take() {
+                copy.wait()?;
             }
+            let upload = &uploads[turn];
+            self.lay(upload, host, planes, &fills[start..end])?;
             // One copy of many regions a segment, slots side by side merged.
             let mut frame = device.frame()?;
             let mut at = 0u64;
@@ -560,7 +554,7 @@ impl RowCaches {
                 let segment = to - local;
                 if into.is_some_and(|(_, held)| held != segment) {
                     let (buffer, _) = into.take().expect("checked");
-                    frame.copy_regions(&upload, buffer, &regions)?;
+                    frame.copy_regions(upload, buffer, &regions)?;
                     regions.clear();
                 }
                 into = Some((buffer, segment));
@@ -573,12 +567,101 @@ impl RowCaches {
                 at += slot;
             }
             if let Some((buffer, _)) = into {
-                frame.copy_regions(&upload, buffer, &regions)?;
+                frame.copy_regions(upload, buffer, &regions)?;
             }
-            frame.commit()?;
+            pending[turn] = Some(frame.commit_async(None)?);
+            turn ^= 1;
             start = end;
         }
+        for copy in pending.into_iter().flatten() {
+            copy.wait()?;
+        }
         Ok(())
+    }
+
+    /// Lays the rows of `fills`' blocks side by side in `upload` (each slot
+    /// whole: rows past the table's last and any gap between tables zero),
+    /// split over threads; no pending copy reads `upload`.
+    #[allow(unsafe_code)]
+    fn lay(
+        &self,
+        upload: &Buffer,
+        host: &HostTier,
+        planes: &BTreeMap<usize, &HostPlane>,
+        fills: &[(u64, usize, u32)],
+    ) -> Result<()> {
+        let base = upload.mapped_ptr().ok_or_else(|| Fault::Unbound {
+            what: "a mapped upload for the weight cache's fills".to_string(),
+        })?;
+        let mut seats = Vec::with_capacity(fills.len());
+        let mut at = 0u64;
+        for &(_, cache, block) in fills {
+            seats.push((at, cache, block));
+            at += self.caches[cache].shape.slot_bytes;
+        }
+        upload.span(0, at)?;
+        let threads = FILL_THREADS.min(seats.len()).max(1);
+        let chunk = seats.len().div_ceil(threads);
+        let map = host.map();
+        let laid: Vec<Result<()>> = std::thread::scope(|scope| {
+            seats
+                .chunks(chunk)
+                .map(|seats| {
+                    scope.spawn(move || {
+                        for &(at, cache, block) in seats {
+                            let shape = &self.caches[cache].shape;
+                            let len = usize::try_from(shape.slot_bytes).unwrap_or(0);
+                            // SAFETY: `upload` is mapped and spans `at + len`
+                            // (checked above); each seat is a range of its own,
+                            // laid by this thread alone, and no pending copy
+                            // reads `upload` (its last one was waited on).
+                            let image = unsafe {
+                                std::slice::from_raw_parts_mut(
+                                    (base + usize::try_from(at).unwrap_or(usize::MAX))
+                                        as *mut u8,
+                                    len,
+                                )
+                            };
+                            let whole = u64::from(block + 1) * u64::from(shape.block_rows)
+                                <= shape.rows
+                                && shape.tables.iter().map(|t| t.row_bytes).sum::<u64>()
+                                    == shape.atom_bytes
+                                && u64::from(shape.block_rows) * shape.atom_bytes
+                                    == shape.slot_bytes;
+                            if !whole {
+                                image.fill(0);
+                            }
+                            for k in 0..u64::from(shape.block_rows) {
+                                let id = u64::from(block) * u64::from(shape.block_rows) + k;
+                                if id >= shape.rows {
+                                    break;
+                                }
+                                for table in &shape.tables {
+                                    let plane = planes.get(&table.param).ok_or_else(|| {
+                                        Fault::Unbound {
+                                            what: format!(
+                                                "row table param {}, which the host tier does \
+                                                 not hold",
+                                                table.param
+                                            ),
+                                        }
+                                    })?;
+                                    let from = usize::try_from(k * shape.atom_bytes + table.origin)
+                                        .unwrap_or(usize::MAX);
+                                    let len = usize::try_from(table.row_bytes).unwrap_or(0);
+                                    plane.row_into(map, id, &mut image[from..from + len])?;
+                                }
+                            }
+                        }
+                        Ok(())
+                    })
+                })
+                .collect::<Vec<_>>()
+                .into_iter()
+                .map(|worker| worker.join().expect("a fill worker does not panic"))
+                .collect()
+        });
+        laid.into_iter().collect()
     }
 
     /// Rewrites every block's entry from its slot ref through the pool's

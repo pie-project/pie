@@ -196,24 +196,24 @@ void reg_load(uint tid, uint base) {
         return;
     }
     uint seg, at;
-    pie_pool_at(params.state_origin + base + tid * dk, seg, at);
+    pie_pool_find(params.state_origin + base + tid * dk, seg, at);
 #define GDN_REG_LOAD(buf_) \
     [ForceUnroll] for (uint i = 0; i < uint(PIE_DK_REG); i++) { \
         st[i] = buf_[at + i]; \
     }
-    PIE_POOL_ON_RW(seg, GDN_REG_LOAD)
+    PIE_POOL_BRANCH(seg, GDN_REG_LOAD)
 }
 
 void reg_store(uint tid, uint base) {
     uint dk = uint(params.k_dim);
     if (tid < uint(params.v_dim)) {
         uint seg, at;
-        pie_pool_at(params.state_origin + base + tid * dk, seg, at);
+        pie_pool_find(params.state_origin + base + tid * dk, seg, at);
 #define GDN_REG_STORE(buf_) \
         [ForceUnroll] for (uint i = 0; i < uint(PIE_DK_REG); i++) { \
             buf_[at + i] = st[i]; \
         }
-        PIE_POOL_ON_RW(seg, GDN_REG_STORE)
+        PIE_POOL_BRANCH(seg, GDN_REG_STORE)
     }
 }
 #endif
@@ -300,19 +300,28 @@ void main(uint3 group : SV_GroupID, uint3 local : SV_GroupThreadID) {
     }
 #else
     uint state_base = (lane * uint(params.v_heads) + hv) * head;
+    // A row of the head's state lies in one segment: found once a row.
     for (uint c = tid; c < dv; c += uint(PIE_GROUP_X)) {
-        for (uint i = 0; i < dk; i++) {
-            work[state_base + c * dk + i] = rstate[bank + c * dk + i];
+        uint seg, at;
+        pie_pool_find(params.state_origin + bank + c * dk, seg, at);
+#define GDN_BANK_LOAD(buf_) \
+        for (uint i = 0; i < dk; i++) { \
+            work[state_base + c * dk + i] = buf_[at + i]; \
         }
+        PIE_POOL_BRANCH(seg, GDN_BANK_LOAD)
     }
     GroupMemoryBarrierWithGroupSync();
     for (int t = 0; t < span; t++) {
         token(tid, uint(begin + t), hv, hk, state_base);
         if (t + 1 == keep) {
             for (uint c = tid; c < dv; c += uint(PIE_GROUP_X)) {
-                for (uint i = 0; i < dk; i++) {
-                    rstate[bank + c * dk + i] = work[state_base + c * dk + i];
+                uint seg, at;
+                pie_pool_find(params.state_origin + bank + c * dk, seg, at);
+#define GDN_BANK_STORE(buf_) \
+                for (uint i = 0; i < dk; i++) { \
+                    buf_[at + i] = work[state_base + c * dk + i]; \
                 }
+                PIE_POOL_BRANCH(seg, GDN_BANK_STORE)
             }
         }
 #if defined(PIE_SNAPS)
