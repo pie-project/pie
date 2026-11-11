@@ -151,6 +151,18 @@ __device__ __forceinline__ b128 fp4_shuffle(b128 x) {
              __builtin_amdgcn_perm(x.w[1], x.w[0], 0x07060302u), __builtin_amdgcn_perm(x.w[3], x.w[2], 0x07060302u)}};
 }
 
+#if defined(__gfx950__)
+// gfx950 converts a byte's two codes to a bf16 pair under an f32 scale in
+// one step, exactly: a word's eight codes as four pairs in their own order,
+// (c0,c1) (c2,c3) (c4,c5) (c6,c7), so the activations stay as they are.
+__device__ __forceinline__ void fp4_word_cvt(u32 w, float scale, u32* d) {
+    d[0] = __builtin_bit_cast(u32, __builtin_amdgcn_cvt_scalef32_pk_bf16_fp4(w, scale, 0));
+    d[1] = __builtin_bit_cast(u32, __builtin_amdgcn_cvt_scalef32_pk_bf16_fp4(w, scale, 1));
+    d[2] = __builtin_bit_cast(u32, __builtin_amdgcn_cvt_scalef32_pk_bf16_fp4(w, scale, 2));
+    d[3] = __builtin_bit_cast(u32, __builtin_amdgcn_cvt_scalef32_pk_bf16_fp4(w, scale, 3));
+}
+#endif
+
 // The pointers a packed bank's seat names when its experts stream from a
 // group buffer instead of the resident planes.
 struct alignas(16) MoeGroupBases {
@@ -588,11 +600,21 @@ struct GroupMxfp4 {
         return {__builtin_nontemporal_load(reinterpret_cast<const moe_u4*>(p.codes) + u), p.scales[u]};
     }
     static __device__ __forceinline__ void decode(const Chunk& c, u32* d) {
+#if defined(__gfx950__)
+        const float scale = mxfp4_scale(c.scale & 0xFFu);
+#pragma unroll
+        for (int q = 0; q < 4; ++q) fp4_word_cvt(c.w[q], scale, d + 4 * q);
+#else
         const Fp4Tables t = fp4_tables_scaled(c.scale);
 #pragma unroll
         for (int q = 0; q < 4; ++q) fp4_word(c.w[q], t, d + 4 * q);
+#endif
     }
+#if defined(__gfx950__)
+    static __device__ __forceinline__ b128 shuffle(b128 x) { return x; }
+#else
     static __device__ __forceinline__ b128 shuffle(b128 x) { return fp4_shuffle(x); }
+#endif
 };
 
 // An affine bank in bf16: code·scale + bias rounded to bf16, as a
@@ -987,13 +1009,27 @@ struct BatchMxfp4 {
     }
     static __device__ __forceinline__ void tie_factors(Factors& f) { batch_hold(f.scale); }
     static __device__ __forceinline__ void stage_factors(const Factors&, u8*) {}
+#if defined(__gfx950__)
+    // The piece carries the block's f32 scale (fp4_word_cvt).
+    static __device__ __forceinline__ Piece prep(const Factors& f, int j) {
+        return {__builtin_bit_cast(u32, mxfp4_scale((static_cast<u32>(f.scale[0]) >> (8 * j)) & 0xffu)), 0u, 0u, 0u};
+    }
+    static __device__ __forceinline__ void decode(const Piece& t, const BatchPiece<16>& c, int q, u32* d) {
+        fp4_word_cvt(c.w[q], __builtin_bit_cast(float, t.h0), d);
+    }
+#else
     static __device__ __forceinline__ Piece prep(const Factors& f, int j) {
         return fp4_tables_scaled((static_cast<u32>(f.scale[0]) >> (8 * j)) & 0xffu);
     }
     static __device__ __forceinline__ void decode(const Piece& t, const BatchPiece<16>& c, int q, u32* d) {
         fp4_word(c.w[q], t, d);
     }
+#endif
+#if defined(__gfx950__)
+    static __device__ __forceinline__ b128 shuffle(b128 x) { return x; }
+#else
     static __device__ __forceinline__ b128 shuffle(b128 x) { return fp4_shuffle(x); }
+#endif
 };
 
 // A four-bit affine bank (MLX) in bf16: lane group g's piece j is codes
