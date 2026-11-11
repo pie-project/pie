@@ -351,6 +351,11 @@ impl Device {
         h.update(client.api().path().to_string_lossy().as_bytes());
         let (major, minor) = client.api().version();
         h.update(format!("{major}.{minor}|{}", self.kind).as_bytes());
+        // The compiler's own flags shape the program as much as its text.
+        for var in COMPILER_ENV {
+            h.update(b"|");
+            h.update(std::env::var_os(var).unwrap_or_default().as_encoded_bytes());
+        }
         Some(dir.join(format!("{}.pjrt", h.finalize().to_hex())))
     }
 
@@ -597,6 +602,11 @@ pub fn element_type(elem: kernels_xla::hlo::Elem) -> ElementType {
         Elem::U4 => ElementType::U4,
     }
 }
+
+/// The environment the plugin's compiler reads its flags from: part of a
+/// cached program's key, so a program compiled under other flags is not
+/// loaded in its place.
+const COMPILER_ENV: [&str; 2] = ["LIBTPU_INIT_ARGS", "XLA_FLAGS"];
 
 fn disk_cache() -> Option<PathBuf> {
     match std::env::var_os("PIE_XLA_CACHE") {
