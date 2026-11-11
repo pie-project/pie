@@ -347,7 +347,7 @@ pub fn kernels(prog: &Program) -> R<Kernels> {
                 FIFOW: 32,
                 XKEEP: 0,
                 NRM: sc.nrm,
-                HG: 1,
+                HG: sc.hg,
             },
         )?,
     );

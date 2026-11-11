@@ -101,6 +101,38 @@ impl Needs {
     }
 }
 
+/// How a program's units lie, from what its layers need: the one choice the blocks and the role
+/// kernels' phases both follow.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Layout {
+    /// A snake of units.
+    Snake,
+    /// Stacked unit columns, a side input's storage above them (a side input or a cache read
+    /// across layers).
+    Stacked,
+    /// Attention / plain row runs in a U of two unit columns, the head fed by row groups
+    /// (sliding windows).
+    Runs,
+    /// Attention | MoE halves in a snake of two unit columns from the band (routed experts).
+    Split,
+}
+
+impl Layout {
+    /// The layout layers that need `needs` take.
+    #[must_use]
+    pub fn of(needs: &Needs) -> Layout {
+        if needs.experts {
+            Layout::Split
+        } else if needs.side_in || needs.shared_cache {
+            Layout::Stacked
+        } else if needs.sliding {
+            Layout::Runs
+        } else {
+            Layout::Snake
+        }
+    }
+}
+
 /// The role kernels' layer phases (weight, CX and CY's comptime `NRM`, `MIXK`, `ACT`, `PLE`, `KVS`),
 /// from the layer program: what its layers need and its MLP's activation; one image a role over
 /// every layer program.
@@ -118,6 +150,8 @@ pub struct Schedule {
     pub ple: u32,
     /// 1: the shared caches' KVS line.
     pub kvs: u32,
+    /// 1: x leaves the last unit for the head by row groups ([`Layout::Runs`]).
+    pub hg: u32,
 }
 
 impl Schedule {
@@ -143,6 +177,7 @@ impl Schedule {
             act: u32::from(gelu),
             ple: u32::from(needs.side_in),
             kvs: u32::from(needs.shared_cache),
+            hg: u32::from(Layout::of(needs) == Layout::Runs),
         }
     }
 
@@ -281,8 +316,9 @@ fn split_snake(plan: &Plan) -> R<UnitGrid> {
 pub fn blocks(plan: &Plan, needs: &Needs, copies: KernelCopies) -> R<Vec<Box<dyn Block>>> {
     let p = &plan.partition;
     let token_loop = plan.contract.token_loop;
+    let layout = Layout::of(needs);
     let mut out: Vec<Box<dyn Block>> = Vec::new();
-    if needs.experts {
+    if layout == Layout::Split {
         out.push(Box::new(MoeUnits {
             grid: split_snake(plan)?,
             copies: take(copies.moe, "MoE units")?,
@@ -306,7 +342,7 @@ pub fn blocks(plan: &Plan, needs: &Needs, copies: KernelCopies) -> R<Vec<Box<dyn
         }
         return Ok(out);
     }
-    if needs.side_in || needs.shared_cache {
+    if layout == Layout::Stacked {
         let arr = stacked::Arrangement::of(plan)?;
         out.push(Box::new(Units {
             grid: grid(
@@ -337,7 +373,7 @@ pub fn blocks(plan: &Plan, needs: &Needs, copies: KernelCopies) -> R<Vec<Box<dyn
         if needs.shared_cache {
             out.push(Box::new(SharedKv));
         }
-    } else if needs.sliding {
+    } else if layout == Layout::Runs {
         out.push(Box::new(RowRuns {
             grid: u_columns(plan)?,
             copies: take(copies.runs, "row runs")?,
@@ -404,12 +440,12 @@ mod tests {
     /// kernels were built with.
     #[test]
     fn a_layer_program_schedules_its_family_kernels() {
-        for (name, nrm, mixk, act, ple, kvs) in [
-            ("qwen35-d9b-bf16-kv-bf16", 0, 0, 0, 0, 0),
-            ("llama31-8b-bf16-kv-bf16", 0, 0, 0, 0, 0),
-            ("gemma4-e4b-bf16-kv-bf16", 1, 1, 1, 1, 1),
-            ("gemma4-12b-bf16-kv-bf16", 1, 1, 1, 0, 0),
-            ("gptoss-20b-bf16-mxfp4-kv-bf16", 2, 2, 0, 0, 0),
+        for (name, nrm, mixk, act, ple, kvs, hg) in [
+            ("qwen35-d9b-bf16-kv-bf16", 0, 0, 0, 0, 0, 0),
+            ("llama31-8b-bf16-kv-bf16", 0, 0, 0, 0, 0, 0),
+            ("gemma4-e4b-bf16-kv-bf16", 1, 1, 1, 1, 1, 0),
+            ("gemma4-12b-bf16-kv-bf16", 1, 1, 1, 0, 0, 1),
+            ("gptoss-20b-bf16-mxfp4-kv-bf16", 2, 2, 0, 0, 0, 0),
         ] {
             let t = trace(name);
             let sc = Schedule::of(&program(&t));
@@ -420,7 +456,8 @@ mod tests {
                     mixk,
                     act,
                     ple,
-                    kvs
+                    kvs,
+                    hg
                 },
                 "{name}"
             );
