@@ -5,7 +5,8 @@
 //!
 //! Each kernel source's `tdbg` length is its own (a fact of the source, as its params are):
 //! - `weight.csl` (`TSTAMP` 1): `1 + 9 K` (MIXK 2 `1 + 6 K`, MIXK 3 `1 + 4 K`), from the pass start;
-//! - `cy.csl` (`TSTAMP` 1): `1 + 6 K` (MIXK 2 / 3 `1 + 4 K`), from the pass start;
+//! - `cy.csl` (`TSTAMP` 1): `1 + 6 K` (MIXK 2 / 3 `1 + 4 K`), from the pass start; MIXK 2's last `K`
+//!   words are counts, not stamps (each layer's redo passes over the launch, always on);
 //! - `cx.csl` (always on): `K + 2`, the pass start, each layer's end and the send (NRM 2: `5 K + 2`);
 //! - `head_ctl.csl` (always on): 70, the pass start, the argmax, the root's winner of each step
 //!   (`2 + s`, s < 64) and four phase ends (66 ..= 69);
@@ -43,7 +44,22 @@ pub struct Probe {
     pub name: String,
     pub at: Coord,
     pub words: u32,
+    /// The last words that count rather than stamp (read as they are).
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub counts: u32,
     pub read: Read,
+}
+
+fn is_zero(n: &u32) -> bool {
+    *n == 0
+}
+
+/// Of a PE's `tdbg` words, the trailing ones that are counts (cy.csl MIXK 2: the redo passes).
+pub fn counts(source: &str, p: &Params) -> u32 {
+    match source {
+        "cy.csl" if int(p, "MIXK") == Some(2) => int(p, "K").unwrap_or(0) as u32,
+        _ => 0,
+    }
 }
 
 fn int(p: &Params, k: &str) -> Option<i64> {
@@ -100,6 +116,7 @@ pub fn probes(prog: &Program, kinds: &Kernels) -> R<Vec<Probe>> {
                     name,
                     at,
                     words,
+                    counts: counts(kb.source, &p),
                     read,
                 });
             }

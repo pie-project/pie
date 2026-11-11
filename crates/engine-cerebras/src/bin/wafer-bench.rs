@@ -14,7 +14,8 @@
 //! A program built with `TSTAMP:1` (its artifact's `stamps.json`) also gets a third sequence
 //! with every probe's `tdbg` read after each launch: `TIMES` prints the cycles (each unit's
 //! layers and send, each probe's phases from its pass start (`null`: a phase that path never
-//! stamps), the token loop's steps), also written to `--times`.
+//! stamps; `<probe>.counts`: a kernel's counters, as read), the token loop's steps), also
+//! written to `--times`.
 //! Prints `WAFER_BENCH ok` and exits 0 when every check holds.
 
 use std::collections::HashMap;
@@ -153,8 +154,16 @@ fn stamped(
                 layers.push(d[..k as usize].to_vec());
             }
             Read::Phases => {
-                let d: Vec<_> = rows.iter().map(|b| since(b)).collect();
+                let n = (p.words - p.counts) as usize;
+                let d: Vec<_> = rows.iter().map(|b| since(&b[..n])).collect();
                 phases.insert(p.name.clone(), json!(mean_of(&d)));
+                if p.counts > 0 {
+                    let c: Vec<_> = rows
+                        .iter()
+                        .map(|b| b[n..].iter().map(|&v| Some(v as f64)).collect())
+                        .collect();
+                    phases.insert(format!("{}.counts", p.name), json!(mean_of(&c)));
+                }
             }
             Read::Loop => {
                 let at = [0, 66, 67, 68, 69];
