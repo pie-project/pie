@@ -478,3 +478,43 @@ fn deepseek_v4_splits_its_weighted_experts_dspark_and_kv_norm() {
         }
     }
 }
+
+/// The distribution is the pass's inference without its rewrite: it lists
+/// every collective the rewrite lands, after the node the rewrite lands it
+/// after, and holds the reduced projections' outputs as partial sums.
+#[test]
+fn the_distribution_names_the_collectives_the_rewrite_lands() {
+    let deployment = crate::catalog::deployment("qwen35-d0.8b-bf16-kv-bf16-tp2")
+        .expect("the catalog ships the row");
+    let mut trace = deployment
+        .package
+        .trace(
+            &deployment.model.id,
+            &deployment.deploy,
+            &deployment.name,
+            Platform::Cuda,
+        )
+        .expect("traces");
+    let shape = crate::pack::shape(&trace);
+    super::infer::resolve(&mut trace, 2);
+    let trace = crate::tile::tile(crate::pack::pack_as(trace, &shape));
+
+    let dist = super::distribution(trace.clone(), 2).expect("distributes");
+    let sharded = super::shard(trace.clone(), 2).expect("shards");
+    let landed = sharded
+        .nodes
+        .iter()
+        .filter(|node| matches!(node.op, poem_ir::Operation::Collective(_)))
+        .count();
+    assert_eq!(dist.collectives.len(), landed);
+    assert_eq!(dist.held.len(), trace.values.len());
+    let partial = dist
+        .held
+        .iter()
+        .filter(|h| **h == super::Held::Partial)
+        .count();
+    assert!(
+        partial >= 48,
+        "each mixer's and mlp's row-cut output is a partial sum"
+    );
+}

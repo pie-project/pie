@@ -783,78 +783,45 @@ pub(crate) fn create_engine_backend(
         }
         #[cfg(feature = "cerebras")]
         EngineOptions::Cerebras(opts) => {
-            let mut boot_doc = format!(
-                "[cerebras]\ntarget = {:?}\nnum_threads = {}\nprewarm = {}\n",
-                opts.target, opts.num_threads, opts.prewarm,
+            // The engine's `[cerebras]` table: compiled programs and cut tiles cache under the
+            // PIE home, as wasmtime's do.
+            let mut cerebras = toml::Table::new();
+            cerebras.insert("target".into(), opts.target.clone().into());
+            cerebras.insert("num_threads".into(), i64::from(opts.num_threads).into());
+            cerebras.insert(
+                "cache_dir".into(),
+                crate::disk::engine_cache_dir(home)
+                    .join("cerebras")
+                    .display()
+                    .to_string()
+                    .into(),
             );
-            // Compiled programs cache under the PIE home, as wasmtime's do.
-            boot_doc.push_str(&format!(
-                "cache_dir = {}\n",
-                toml::Value::String(
-                    crate::disk::engine_cache_dir(home)
-                        .join("cerebras")
-                        .display()
-                        .to_string()
-                )
-            ));
             if let Some(cmaddr) = &opts.cmaddr {
-                boot_doc.push_str(&format!(
-                    "cmaddr = {}\n",
-                    toml::Value::String(cmaddr.clone())
-                ));
+                cerebras.insert("cmaddr".into(), cmaddr.clone().into());
             }
-            if opts.spatial_program.is_some() || opts.spatial_serve.is_some() {
-                boot_doc.push_str("[cerebras.spatial]\n");
-                if let Some(program) = &opts.spatial_program {
-                    boot_doc.push_str(&format!(
-                        "program = {}\n",
-                        toml::Value::String(program.clone())
-                    ));
-                }
-                if let Some(guest) = &opts.spatial_guest {
-                    boot_doc.push_str(&format!("guest = {}\n", toml::Value::String(guest.clone())));
-                }
-                if let Some(lookahead) = opts.spatial_lookahead {
-                    boot_doc.push_str(&format!("lookahead = {lookahead}\n"));
-                }
-                if let Some(asynchronous) = opts.spatial_async {
-                    boot_doc.push_str(&format!("async = {asynchronous}\n"));
-                }
-                if let Some(ckpt) = &opts.spatial_ckpt {
-                    boot_doc.push_str(&format!("ckpt = {}\n", toml::Value::String(ckpt.clone())));
-                }
-                if let Some(cycles) = opts.spatial_token_cycles {
-                    boot_doc.push_str(&format!("token_cycles = {cycles}\n"));
-                }
-                if let Some(margin) = opts.spatial_pre_margin {
-                    boot_doc.push_str(&format!("pre_margin = {}\n", toml::Value::Float(margin)));
-                }
-                if let Some(fraction) = opts.spatial_main_fraction {
-                    boot_doc.push_str(&format!(
-                        "main_fraction = {}\n",
-                        toml::Value::Float(fraction)
-                    ));
+            for (key, value) in [
+                ("lookahead", opts.lookahead),
+                ("posted_loop", opts.posted_loop),
+            ] {
+                if let Some(v) = value {
+                    cerebras.insert(key.into(), i64::from(v).into());
                 }
             }
-            if let Some(switches) = &opts.switches {
-                let mut cerebras = toml::Table::new();
-                cerebras.insert("switches".into(), toml::Value::Table(switches.clone()));
-                let mut doc = toml::Table::new();
-                doc.insert("cerebras".into(), toml::Value::Table(cerebras));
-                boot_doc.push('\n');
-                boot_doc.push_str(&toml::to_string(&doc)?);
+            if let Some(asynchronous) = opts.asynchronous {
+                cerebras.insert("async".into(), asynchronous.into());
             }
-            if let Some(serve) = &opts.spatial_serve {
-                // Nested under [cerebras.spatial.serve], its own sub-tables too.
-                let mut spatial = toml::Table::new();
-                spatial.insert("serve".into(), toml::Value::Table(serve.clone()));
-                let mut cerebras = toml::Table::new();
-                cerebras.insert("spatial".into(), toml::Value::Table(spatial));
-                let mut doc = toml::Table::new();
-                doc.insert("cerebras".into(), toml::Value::Table(cerebras));
-                boot_doc.push('\n');
-                boot_doc.push_str(&toml::to_string(&doc)?);
+            for (key, table) in [
+                ("wafer", &opts.wafer),
+                ("toolchain", &opts.toolchain),
+                ("debug", &opts.debug),
+            ] {
+                if let Some(t) = table {
+                    cerebras.insert(key.into(), toml::Value::Table(t.clone()));
+                }
             }
+            let mut doc = toml::Table::new();
+            doc.insert("cerebras".into(), toml::Value::Table(cerebras));
+            let boot_doc = toml::to_string(&doc)?;
             let backend = runtime::engine::backend::open::cerebras(boot_doc.as_bytes())?;
             let defaults = engine::Budgets::default();
             let (max_lanes, max_tokens) =
@@ -872,7 +839,8 @@ pub(crate) fn create_engine_backend(
                         .filter(|&len| len > 0)
                         .unwrap_or(defaults.max_context)
                         .max(defaults.page_size),
-                    context_declared: false,
+                    // a stated length is the positions the wafer program is built for
+                    context_declared: opts.max_model_len.is_some_and(|len| len > 0),
                     slots: 0,
                     max_patches: patch_ceilings.0,
                     max_images: patch_ceilings.1,
@@ -890,6 +858,17 @@ pub(crate) fn create_engine_backend(
             reason = "`EngineOptions` has no variants in this build"
         )
     )]
+    // A wafer program serves the language model alone: a checkpoint carrying a vision tower
+    // is served as its text deployment.
+    #[cfg(feature = "cerebras")]
+    let text_only;
+    #[cfg(feature = "cerebras")]
+    let overrides = if platform == poem_ir::Platform::Cerebras {
+        text_only = without_vision(snapshot_dir, overrides);
+        &text_only
+    } else {
+        overrides
+    };
     let (loaded, deployment, disk_kv_dir) = land(
         &mut backend,
         snapshot_dir,
@@ -911,6 +890,30 @@ pub(crate) fn create_engine_backend(
         disk_kv_dir,
         backend,
     })
+}
+
+/// `overrides` with the checkpoint's vision part left off, where its deployment carries one and
+/// the config does not already leave it off; else `overrides` as they are.
+#[cfg(feature = "cerebras")]
+fn without_vision(
+    snapshot_dir: &Path,
+    overrides: &runtime::engine::load::Overrides,
+) -> runtime::engine::load::Overrides {
+    use runtime::engine::load::{Platform, compose, identify};
+    if overrides.off.iter().any(|part| part == "vision") {
+        return overrides.clone();
+    }
+    let mut text = overrides.clone();
+    text.off.push("vision".into());
+    match identify(snapshot_dir, Platform::Cerebras)
+        .and_then(|base| compose(&base, &text, Platform::Cerebras))
+    {
+        Ok(name) => {
+            tracing::info!(deployment = name, "cerebras: the vision part left off");
+            text
+        }
+        Err(_) => overrides.clone(),
+    }
 }
 
 #[cfg(test)]

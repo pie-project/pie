@@ -11,7 +11,15 @@ impl Runahead {
         self.frames_in_flight > 1
     }
 
+    /// The most frames an engine with a staging ring keeps in flight: its
+    /// ring's free set is one 64-bit word (`frames * STEPS_MAX + 1 <= 64`).
     pub const MAX_FRAMES: u8 = 15;
+
+    /// The most frames in flight for an engine without a staging ring, where
+    /// a posted frame is a host queue entry. An engine kind declares which
+    /// bound it takes; every depth up to [`Self::MAX_FRAMES`] means what it
+    /// always did.
+    pub const UNSTAGED_MAX_FRAMES: u8 = 127;
 
     pub const F1: Runahead = Runahead {
         frames_in_flight: 1,
@@ -25,6 +33,24 @@ impl Runahead {
             1
         } else if frames_in_flight > Runahead::MAX_FRAMES {
             Runahead::MAX_FRAMES
+        } else {
+            frames_in_flight
+        };
+        Runahead {
+            frames_in_flight: frames,
+        }
+    }
+
+    /// [`Runahead::of`] up to [`Runahead::UNSTAGED_MAX_FRAMES`]: the
+    /// runtime's view of the configured depth (validated against the
+    /// engine's own bound), equal to [`Runahead::of`] at every depth up to
+    /// [`Runahead::MAX_FRAMES`].
+    #[must_use]
+    pub const fn unstaged(frames_in_flight: u8) -> Runahead {
+        let frames = if frames_in_flight == 0 {
+            1
+        } else if frames_in_flight > Runahead::UNSTAGED_MAX_FRAMES {
+            Runahead::UNSTAGED_MAX_FRAMES
         } else {
             frames_in_flight
         };
@@ -81,5 +107,17 @@ mod tests {
         assert_eq!(Runahead::of(Runahead::MAX_FRAMES).staging_depth(), 61);
         assert_eq!(Runahead::of(u8::MAX).frames_in_flight, Runahead::MAX_FRAMES);
         assert_eq!(Runahead::of(0).frames_in_flight, 1);
+    }
+
+    #[test]
+    fn unstaged_is_of_up_to_the_staged_bound() {
+        for frames in 0..=Runahead::MAX_FRAMES {
+            assert_eq!(Runahead::unstaged(frames), Runahead::of(frames));
+        }
+        assert_eq!(Runahead::unstaged(31).frames_in_flight, 31);
+        assert_eq!(
+            Runahead::unstaged(u8::MAX).frames_in_flight,
+            Runahead::UNSTAGED_MAX_FRAMES
+        );
     }
 }

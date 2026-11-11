@@ -299,8 +299,10 @@ const DEFAULT_FRAME_SIZE: usize = 2;
 static FRAME_SIZE: AtomicUsize = AtomicUsize::new(0);
 
 pub fn configured_submit_depth() -> usize {
-    ::engine::runahead::Runahead::of(u8::try_from(configured_dispatch_depth()).unwrap_or(u8::MAX))
-        .submit_depth()
+    ::engine::runahead::Runahead::unstaged(
+        u8::try_from(configured_dispatch_depth()).unwrap_or(u8::MAX),
+    )
+    .submit_depth()
 }
 
 pub fn set_dispatch_depth(depth: usize) {
@@ -341,13 +343,17 @@ pub fn reconfigure(frame_size: usize, dispatch_depth: usize) -> Result<(), Recon
 }
 
 pub fn channel_capacity() -> usize {
-    ::engine::runahead::Runahead::of(u8::try_from(configured_dispatch_depth()).unwrap_or(u8::MAX))
-        .channel_capacity(configured_frame_size())
+    ::engine::runahead::Runahead::unstaged(
+        u8::try_from(configured_dispatch_depth()).unwrap_or(u8::MAX),
+    )
+    .channel_capacity(configured_frame_size())
 }
 
 pub fn run_ahead_window() -> usize {
-    ::engine::runahead::Runahead::of(u8::try_from(configured_dispatch_depth()).unwrap_or(u8::MAX))
-        .submit_depth()
+    ::engine::runahead::Runahead::unstaged(
+        u8::try_from(configured_dispatch_depth()).unwrap_or(u8::MAX),
+    )
+    .submit_depth()
         * configured_frame_size()
 }
 
