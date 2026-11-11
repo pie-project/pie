@@ -1061,7 +1061,10 @@ impl Shell {
             let room = (self.bodies_mem as u64).saturating_sub(spent.census.bytes as u64);
             let spare = self.pools.spare_bytes_for_bodies(room).unwrap_or(u64::MAX);
             let price = (2 * spent.census.bytes / spent.census.bodies.max(1)) as u64;
-            let margin = price.max(unit_margin);
+            // A map unit's margin never past a quarter of the allowance: an
+            // allowance the fit held under the margin would otherwise stop
+            // arming before its first body.
+            let margin = price.max(unit_margin.min(self.bodies_mem as u64 / 4));
             let headroom = spare < margin;
             let mine = !verify
                 && (spent.census.bodies >= record::MAX_BODIES
