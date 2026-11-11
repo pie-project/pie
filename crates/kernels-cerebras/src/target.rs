@@ -420,12 +420,29 @@ impl Wafer {
             .map_err(|e| format!("preset {}: {e}", c.preset.name))
     }
 
-    /// The first candidate in table order that builds.
+    /// The first candidate in table order that builds; with no preset named and none that
+    /// builds, the search's fastest partition ([`crate::search`]).
     pub fn choose(&self) -> R<Planned> {
         let mut why = Vec::new();
         for c in self.candidates() {
             match self.fit(&c) {
                 Ok(()) => return self.planned(c),
+                Err(e) => why.push(e),
+            }
+        }
+        self.searched(why)
+    }
+
+    /// With no preset named, the search's fastest partition ([`crate::search`]); else (or if the
+    /// search finds none) the refusal of `why`.
+    fn searched(&self, mut why: Vec<String>) -> R<Planned> {
+        if self.preset.is_none() {
+            let ask = crate::search::Asked {
+                positions: self.positions,
+                set: self.set.clone(),
+            };
+            match crate::search::search(&self.shape, &ask, 1) {
+                Ok(mut found) => return Ok(found.remove(0).planned),
                 Err(e) => why.push(e),
             }
         }
@@ -467,14 +484,14 @@ impl SpatialTarget for Wafer {
 }
 
 /// The plan of `trace` through poem's spatial pass: its shape, then the preset `ask` names (else
-/// the one made for its shape, else the first of the family's that builds) with its overrides
-/// and positions.
+/// the one made for its shape, else the first of the family's that builds, else the search's)
+/// with its overrides and positions.
 pub fn plan(trace: &Trace, ask: &Ask) -> R<Planned> {
     let wafer = ask.target(shape(trace)?)?;
     match poem_compiler::spatial::plan(trace, &wafer) {
         Ok(p) => wafer.planned(p.partition),
-        Err(poem_compiler::spatial::SpatialError::Unfit(why)) => Err(wafer.refused(why)),
-        Err(poem_compiler::spatial::SpatialError::NoCandidate) => Err(wafer.refused(Vec::new())),
+        Err(poem_compiler::spatial::SpatialError::Unfit(why)) => wafer.searched(why),
+        Err(poem_compiler::spatial::SpatialError::NoCandidate) => wafer.searched(Vec::new()),
         Err(e) => Err(format!("{}: {e}", trace.name)),
     }
 }
@@ -492,7 +509,7 @@ pub fn plans(trace: &Trace, ask: &Ask) -> R<Vec<Planned>> {
         }
     }
     if fit.is_empty() {
-        return Err(wafer.refused(why));
+        return wafer.searched(why).map(|p| vec![p]);
     }
     Ok(fit)
 }
@@ -708,11 +725,13 @@ mod tests {
     }
 
     /// A partition is refused where it cannot link or serve: wider than the wafer, a head's dims
-    /// not even over its columns, the MLP not even over the unit's.
+    /// not even over its columns, the MLP not even over the unit's (and the search, moving the
+    /// keys not set, finds none for the wider MLP either).
     #[test]
     fn fit_refuses_what_cannot_serve() {
         let t = trace("llama31-8b-bf16-kv-bf16");
         let ask = |set: &str| Ask {
+            preset: Some("l3-8b".into()),
             set: set.into(),
             ..Ask::default()
         };
@@ -726,5 +745,55 @@ mod tests {
         odd.mlp.intermediate += 64;
         let e = plan_shape(odd, &Ask::default()).unwrap_err();
         assert!(e.contains("the MLP's 14400 over 256 columns"), "{e}");
+    }
+
+    /// The cost model reads the chip's step of each measured model off its shipping plan, and
+    /// the search, walking from the presets, finds nothing it predicts faster for the 9B than the
+    /// preset made for it.
+    #[test]
+    fn the_search_keeps_the_9b_preset() {
+        let t = trace("qwen35-d9b-bf16-kv-bf16");
+        let s = shape(&t).unwrap();
+        let shipped = plan(&t, &Ask::default()).unwrap().plan;
+        let layer = crate::cost::time::layer(&s, Some(&shipped));
+        let ms = crate::cost::time::step(&shipped, layer);
+        assert!((ms - 0.5238).abs() < 1e-9, "{ms}");
+        let ask = crate::search::Asked {
+            positions: Some(shipped.contract.positions),
+            ..Default::default()
+        };
+        let best = crate::search::search(&s, &ask, 1).unwrap().remove(0);
+        assert!((best.ms - ms).abs() < 1e-9, "{} vs {ms}", best.ms);
+    }
+
+    /// A model no preset fits (Qwen3-30B-A3B mini: four layers, four KV heads, a 2,048 hidden)
+    /// is planned by the search, and its program builds.
+    #[test]
+    fn a_model_no_preset_fits_is_planned_by_the_search() {
+        let t = trace("qwen3-30b-a3b-mini-bf16-kv-bf16");
+        assert!(plans(&t, &Ask::preset("full")).is_err());
+        let p = plan(&t, &Ask::default()).unwrap();
+        assert!(p.preset.name.starts_with("search("), "{}", p.preset.name);
+        Program::of(p.plan).unwrap();
+    }
+
+    /// The memory model, anchored on one measured program, predicts another of the same kernels'
+    /// within the search's margin: Qwen3.5-4B's weight and head images off the 0.8B's link.
+    #[test]
+    fn memory_follows_the_partition_within_the_margin() {
+        use crate::cost::memory::{self, ANCHORS};
+        let small = ANCHORS.iter().find(|a| a.preset == "0.8b").unwrap();
+        let p = plan(&trace("qwen35-d4b-bf16-kv-bf16"), &Ask::default())
+            .unwrap()
+            .plan;
+        // the 4B as linked: weight 34,848 B, head 27,968 B, every other image's room 21,568 B
+        let want = (memory::PE_BYTES - 34848.0)
+            .min(memory::PE_BYTES - 27968.0)
+            .min(21568.0);
+        let got = memory::room(&p, small).min(21568.0);
+        assert!(
+            (got - want).abs() < crate::search::MARGIN,
+            "{got} vs {want}"
+        );
     }
 }

@@ -30,6 +30,7 @@ pub mod npy;
 pub mod plan;
 pub mod program;
 pub mod role;
+pub mod search;
 pub mod sources;
 pub mod target;
 pub mod tiles;

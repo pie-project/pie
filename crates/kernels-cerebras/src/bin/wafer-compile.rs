@@ -8,7 +8,12 @@
 //! wafer-compile build --plan <plan.json> --out <dir> [--emit floor,rcfg,kernels,layout,host,plan,
 //!                 bindings,program] [--levers K:V,...] [--kernels <programs/wafer dir>]
 //! wafer-compile link --build <dir> [--fabric simulator|system]
+//! wafer-compile cost --plan <plan.json>
+//! wafer-compile search --model <deployment> [--positions N] [--set K=V,...] [--keep N]
 //! ```
+//!
+//! `cost` prints a plan's cost features (`cost::Features`) and the bytes it moves on the weight
+//! and head PEs; `search` ranks a deployment's partitions by their predicted step (`search`).
 //!
 //! `plan` writes `<dir>/plan.json` (the [`Plan`]) and names the preset it took.
 //! `--model` names a catalog deployment (`qwen35-d9b-bf16-kv-bf16`); `--preset` one of the
@@ -35,7 +40,8 @@ use kernels_cerebras::toolchain::{Arch, Cslc, Toolchain};
 const USAGE: &str = "usage: wafer-compile plan (--model <deployment> | --shape <shape.json>) \
      [--preset <name>] [--set K=V,...] [--positions N] --out <dir>\n       wafer-compile build --plan <plan.json> \
      --out <dir> [--emit a,b] [--levers K:V,...] [--kernels <dir>]\n       wafer-compile link \
-     --build <dir> [--fabric simulator|system]";
+     --build <dir> [--fabric simulator|system]\n       wafer-compile cost --plan <plan.json>\n       \
+     wafer-compile search --model <deployment> [--positions N] [--set K=V,...] [--keep N]";
 
 fn main() {
     if let Err(e) = run() {
@@ -156,12 +162,72 @@ fn link(args: &[String]) -> Result<(), String> {
     Ok(())
 }
 
+/// `cost`: what a plan costs (its features, its step time, its images' memory), as JSON.
+fn cost(args: &[String]) -> Result<(), String> {
+    let f = flags(args, &["--plan"])?;
+    let plan: Plan = read(get(&f, "--plan").ok_or(USAGE)?)?;
+    let features = kernels_cerebras::cost::Features::of(&plan);
+    let moving = kernels_cerebras::cost::memory::Moving::of(&plan);
+    println!(
+        "{} {} {}",
+        serde_json::to_string(&features).map_err(|e| e.to_string())?,
+        moving.weight,
+        moving.head
+    );
+    Ok(())
+}
+
+/// `search`: a deployment's partitions ranked by their predicted step, with the preset made for
+/// it (if any) for comparison.
+fn search(args: &[String]) -> Result<(), String> {
+    let f = flags(args, &["--model", "--positions", "--set", "--keep"])?;
+    let name = get(&f, "--model").ok_or(USAGE)?;
+    let catalog = poem_compiler::catalog::repository();
+    let d = catalog
+        .parse(name)
+        .ok_or_else(|| format!("--model {name}: no such deployment"))?;
+    let trace = d
+        .try_trace(poem_ir::Platform::Cerebras)
+        .map_err(|e| format!("--model {name}: {e}"))?;
+    let shape = target::shape(&trace)?;
+    let ask = kernels_cerebras::search::Asked {
+        positions: get(&f, "--positions")
+            .map(|n| n.parse().map_err(|e| format!("--positions {n}: {e}")))
+            .transpose()?,
+        set: get(&f, "--set").unwrap_or("").to_string(),
+    };
+    let keep = get(&f, "--keep")
+        .map_or(Ok(5), str::parse)
+        .map_err(|e| format!("--keep: {e}"))?;
+    let fam = kernels_cerebras::family::of(kernels_cerebras::family::serving(&shape));
+    let made = fam
+        .presets()
+        .into_iter()
+        .find(|p| p.made_for == Some(shape.signature()));
+    for (i, c) in kernels_cerebras::search::search(&shape, &ask, keep)?
+        .iter()
+        .enumerate()
+    {
+        let moved = made.as_ref().map_or_else(
+            || format!("{:?}", c.planned.preset.keys),
+            |m| kernels_cerebras::search::moved(m, &c.planned.preset),
+        );
+        println!(
+            "{i} {} {:.4} ms {:.0} B [{}]",
+            c.planned.preset.name, c.ms, c.room, moved
+        );
+    }
+    Ok(())
+}
+
 fn run() -> Result<(), String> {
     let args: Vec<String> = std::env::args().skip(1).collect();
     match args.first().map(String::as_str) {
         Some("plan") => plan(&args[1..]),
         Some("build") => build(&args[1..]),
         Some("link") => link(&args[1..]),
+        Some("cost") => cost(&args[1..]),
+        Some("search") => search(&args[1..]),
         _ => Err(USAGE.to_string()),
     }
 }

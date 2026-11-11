@@ -250,9 +250,36 @@ first that builds kept (a named preset tries only itself; `--set` overrides its 
 with no catalog deployment states its shape in a file (`target::plan_shape`; the tiny test
 checkpoints' are `tools/wafer/baseline/shapes/`).
 
-What is left for the pass to own is the preset tables: a search that proposes the counts and split
-factors (and a cost model that ranks them) replaces them, and everything after `Plan` stays as it
-is. `poem-compiler/SPATIAL.md` has the target-neutral half.
+When no preset fits (and none is named), the search plans the model (`search`, below); the
+presets stay as the shipping overrides until the search reproduces each one on the chip.
+`poem-compiler/SPATIAL.md` has the target-neutral half.
+
+## Cost and search (`cost`, `search`)
+
+`cost::Features` reads what a decode step does off a plan: the weight elements the busiest PE of
+each phase multiplies, the reductions' hops within and between groups, the fabric distance the
+collectives cross, the KV elements a row reads, the head PE's elements. `cost::time` prices them:
+weight and KV elements at the PE's f16 FMAC rate (4 a cycle at 875 MHz), the rest at rates fitted
+to the chip (Qwen3.5 9B / 4B / 0.8B, the Qwen3-8B G2 and PY sweeps of requests 0954 / 0961: within
+2% of each), plus each layer's own cost, read off the measured step of the model's shipping plan
+(`time::MEASURED`; a model the chip has not run takes the median).
+
+`cost::memory` is the PE image model. The bytes a partition moves are the weight PE's (its K
+layers' tiles, its KV cache, its scores' buffers) and the head PE's (its vocabulary rows' tiles and
+embeddings); code and the small buffers move with the kernels' flags, not the partition. So an
+image is measured off an anchor (`cost/anchors.rs`: a link of the model's own program, else its
+family's widest), plus what the plan moves over the anchor's. Off the same kernels' anchor the
+model is within 380 B (Qwen3.5 4B from 0.8B); across kernel flags it is off by up to 2 KB, which
+is why a model anchors on its own link. `anchors.rs` is regenerated from links when the kernels
+change.
+
+`search::search` walks from each of the family's presets (the made-for one first), moving one key
+or two (a move another must follow: the positions, the units' grid) over a ladder of values; a
+seed that does not plan is repaired a key at a time, following each move that gets it past the
+check it failed. A candidate plans, serves the positions asked for (the made-for preset's, else
+4096), keeps its head over the vocabulary, leaves every image `STACK_ROOM` plus a 512 B margin
+and builds (`Program::build`). `wafer-compile search --model <m>` prints the ranking with the keys
+each candidate moved from the made-for preset.
 
 ## Weights
 
