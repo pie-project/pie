@@ -1190,6 +1190,68 @@ impl Pools {
         }
     }
 
+    /// Where each of `slots` (host tier slot refs, shape by shape) lies in
+    /// the host chunks, and its bytes, in order.
+    fn tier_spans(&self, slots: &[(ShapeId, Vec<u32>)]) -> Result<Vec<(u64, u64)>> {
+        let mut spans = Vec::new();
+        for (shape, refs) in slots {
+            let bytes = self.shape(*shape)?.slot_bytes;
+            for &slot in refs {
+                spans.push((self.host_offset(*shape, slot)?, bytes));
+            }
+        }
+        Ok(spans)
+    }
+
+    /// See [`engine::Engine::read_tier_slots`]: the bytes of host tier
+    /// slots, shape by shape, each laid out as `copy_slots` moves it. The
+    /// caller has drained every frame.
+    pub fn read_tier_slots(&self, slots: &[(ShapeId, Vec<u32>)]) -> Result<Vec<u8>> {
+        let spans = self.tier_spans(slots)?;
+        let host = self.host.as_ref().ok_or(Fault::Ceiling {
+            what: "host chunks of the state pool",
+            need: 1,
+            have: 0,
+        })?;
+        let total: u64 = spans.iter().map(|&(_, len)| len).sum();
+        let mut out = vec![0u8; usize::try_from(total).unwrap_or(usize::MAX)];
+        let mut at = 0usize;
+        for (offset, len) in spans {
+            let len = usize::try_from(len).unwrap_or(usize::MAX);
+            host.read(offset, &mut out[at..at + len])?;
+            at += len;
+        }
+        Ok(out)
+    }
+
+    /// See [`engine::Engine::write_tier_slots`]: `bytes`, laid out as
+    /// [`Self::read_tier_slots`] returns them, into host tier slots; refused
+    /// whole when the byte count differs. The caller has drained every
+    /// frame.
+    pub fn write_tier_slots(&mut self, slots: &[(ShapeId, Vec<u32>)], bytes: &[u8]) -> Result<()> {
+        let spans = self.tier_spans(slots)?;
+        let need: u64 = spans.iter().map(|&(_, len)| len).sum();
+        if bytes.len() as u64 != need {
+            return Err(Fault::Ceiling {
+                what: "bytes of host tier slots",
+                need,
+                have: bytes.len() as u64,
+            });
+        }
+        let host = self.host.as_mut().ok_or(Fault::Ceiling {
+            what: "host chunks of the state pool",
+            need: 1,
+            have: 0,
+        })?;
+        let mut at = 0usize;
+        for (offset, len) in spans {
+            let len = usize::try_from(len).unwrap_or(usize::MAX);
+            host.write(offset, &bytes[at..at + len])?;
+            at += len;
+        }
+        Ok(())
+    }
+
     /// Copies whole kv list slots (slot refs `ids`) and the slot file's
     /// `slots` the way `to_disk` says. The caller has drained every frame.
     fn spill(

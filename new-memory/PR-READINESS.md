@@ -17,12 +17,14 @@ Branch today: 432 commits ahead of main, 782 files, +86k / -13k. Main merged in 
 | A11 | Eager path wrong tokens; nothing arms at small budgets | EAGER | done M82 (ROCm verify pending) |
 | A12 | Shared-pool snapshots; host-full hang + miscount; keep-handles key covers the record | RT | done M84 (other engines: A15) |
 | A13 | Record rs-buffered fires (MTP / spec decode on hybrids walk eagerly; same on main) — graph capture rule | L40S | after perf fixes |
-| A14 | Wire the rung shrink: scheduler caps a fire's tokens by the activation rung; SharedGrow shrink/restore_rung move the boundary (SPEC 6) | RT | queued |
+| A14 | Wire the rung shrink (SPEC 6) | RT | done M92 (CUDA) |
+| A21 | Activation rungs on Metal / Vulkan / wgpu / XLA (only CUDA states rungs; the walk is a no-op elsewhere) | backend owners | queued |
 | A15 | read_tier_slots / write_tier_slots (snapshots on shared pools) on Metal, Vulkan, wgpu, XLA (CUDA in sc/rt4; Cerebras out of scope) | Metal agent, VKP, TPU | queued |
-| A16 | eager-fix regression: held weights flip to streaming on ROCm 30B MoE (body reservation) and stall | EAGER (sc/eager-fix-2) | in progress |
+| A16 | Held weights flip to streaming on ROCm 30B MoE (body reservation) | EAGER | done M89; M93 flat-fit (flat range counted as room); MI300X verify pending; arm-after-residency next |
 | A17 | Guest panic under admission waits: bench barrier bug fixed (sc/sdk-wakeup) | SDK agent | done; A19 left |
-| A19 | A restartable process whose own demand exceeds the pool restarts forever (should fail with the starvation error); bind hangs waiting for state slots at 96 MiB | RT7 | in progress |
-| A18 | Idle cache demoted only when PLEX keys it above the floor (user decision) | RT6 | in progress |
+| A19 | A restartable process whose own demand exceeds the pool restarts forever (should fail with the starvation error); bind hangs waiting for state slots at 96 MiB | RT7 | done M91 + M93 (rt7b: churn closed) |
+| A18 | Idle cache demoted only when PLEX keys it above the floor | RT6 | done M90 |
+| A20 | Window-only models never reuse a prefix (no auto checkpoint; main reused full window pages) -> auto checkpoints at page-aligned fire ends holding window slot refs | RT8 | in progress |
 | A9 | dsv41 two-window mini cannot fire on sm_89/sm_120 (fused.lse_sink kernel gap) -> two-window CUDA unverified | L40S | queued |
 
 ## B. Decide before the PR (user)
@@ -38,11 +40,10 @@ Each backend shows decode (c1 / c8 / c64 / c256), prefill (512 / 2048) and boot 
 medians. Known gaps to close:
 - XLA/TPU v6e (M77): prefill 512 -19%, 2048 -12%; qwen35 c64 -13%; MoE c1 -9%, c256 -12%, prefill -10%.
 - ROCm synth: flip only at parity (in progress).
-- CUDA (L40S, pageable host tier, server-level medians of 3; all models arm fully; end RSS 5.3-7.5 GB except
-  Qwen3-8B's demotion, which the keyed-demote gate removes): remaining gaps, flat across runs:
-  gpt-oss-20b prefill 2048 -25%; gemma-4-E2B prefill 512 -8.6%, c64 -4.1%, c256 -5.6%; Qwen3-8B c256 -3.3%,
-  prefill 2048 +4%; Qwen3.5-0.8B c256 -3.8%, c64 -1.7%. At parity or faster: Qwen3.5-9B; c1/c8 everywhere; gpt-oss
-  c64/c256 +24/+29%; Qwen3.5-0.8B prefill.
+- CUDA (L40S, tip + pool-fit fix, server-level medians): remaining gaps: gemma-4-E2B c64 -3.9%, c256 -5.9%,
+  warm boot +13% (154 vs 85 compositions armed); Qwen3.5-0.8B c64 -2.0%, c256 -3.4%; Qwen3-8B c256 -1.4%;
+  gpt-oss prefill 2048 (A20, window checkpoint). Parity or faster elsewhere (gpt-oss c64/c256 +25/+30%; Qwen3.5
+  prefill and boot faster; Qwen3-8B end RSS 3.6 vs 2.5 GB after the keyed-demote gate).
 - ROCm: default config arms 0 bodies on new-memory (flat range takes the spare) -> speed table waits for the fix.
 - Vulkan/wgpu, Metal: full comparison vs main not yet run.
 

@@ -550,6 +550,22 @@ impl SlotPool {
         self.act
     }
 
+    /// Every rung's tokens, ascending.
+    pub fn rungs(&self) -> Vec<u32> {
+        self.act_chunks.iter().map(|&(tokens, _)| tokens).collect()
+    }
+
+    /// The rung the activation is set aside for now: the largest whose
+    /// chunks it holds (0 where no rung is stated).
+    pub fn rung(&self) -> u32 {
+        self.act_chunks
+            .iter()
+            .filter(|&&(_, chunks)| chunks <= self.act)
+            .map(|&(tokens, _)| tokens)
+            .max()
+            .unwrap_or(0)
+    }
+
     /// The largest rung's activation chunks: the top span, committed from
     /// the load.
     pub fn act_max(&self) -> u32 {

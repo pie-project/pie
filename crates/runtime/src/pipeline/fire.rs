@@ -199,15 +199,26 @@ impl Drop for KvTxnGuard {
 /// submitted, when it is dropped. Every fire holds one, so the kv epoch
 /// that fences freed pages, the shared pool's freed slots and an evacuated
 /// segment's drain moves with every fire, not only with a copy-on-write.
+/// It counts the fire in flight for its process, too, until it closes: the
+/// count drops after the epoch's settling, so the planner never reads a
+/// fire in flight that has settled.
 struct FireEpoch {
     _txn: KvTxnGuard,
+    _in_flight: Option<crate::planner::FireInFlight>,
 }
 
 impl FireEpoch {
-    fn begin(model: usize, engine: usize, stores: &crate::store::registry::Stores) -> Self {
+    fn begin(
+        model: usize,
+        engine: usize,
+        stores: &crate::store::registry::Stores,
+        pid: crate::planner::ProcessId,
+    ) -> Self {
         let txn = crate::store::registry::with_kv_lock(&stores.kv, "fire-epoch", kv::begin_fire);
         Self {
             _txn: KvTxnGuard::new(model, engine, Some(txn)),
+            _in_flight: crate::planner::planner_for(model, engine)
+                .map(|planner| planner.fire_in_flight(pid)),
         }
     }
 
@@ -556,7 +567,10 @@ fn prefill_share(page: u32, engine: usize) -> u32 {
     }
     crate::engine::get_spec(engine).map_or(u32::MAX, |spec| {
         crate::inferlet::host::model::prefill_share(
-            crate::inferlet::host::model::prefill_budget(spec.limits),
+            // Within the pool's activation rung (SPEC decision 6).
+            crate::inferlet::host::model::prefill_budget(spec.limits)
+                .min(crate::store::shared::fire_cap(engine) as usize)
+                .max(1),
             crate::inferlet::process::live_count(),
             page as usize,
         )
@@ -1256,7 +1270,7 @@ async fn reserve<C: FireContext>(
                     copies,
                     kvtxns,
                     rs,
-                    epoch: FireEpoch::begin(model, engine, stores),
+                    epoch: FireEpoch::begin(model, engine, stores, ctx.process_id()),
                 });
             }
             Err(ReservedError::Stale) if attempts < STALE_DEMAND_ATTEMPTS => attempts += 1,

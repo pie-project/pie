@@ -2,13 +2,25 @@
 //!
 //! An entry keys a working-set's first `upto` tokens, or all of it, and a
 //! position takes the highest key among the entries covering it. One no entry
-//! covers is 0.
+//! covers is at the [`FLOOR`].
 
 use std::collections::HashMap;
 
 use parking_lot::RwLock;
 
 use crate::inferlet::process::ProcessId;
+
+/// The key of KV no entry covers: what every position takes with no policy
+/// installed. Idle cache at or below it is the runtime's to drop when its
+/// room is wanted; only cache keyed above it is worth a copy down a tier.
+pub const FLOOR: i64 = 0;
+
+/// Whether idle cache under `key` is kept above the floor: only such cache
+/// moves down a tier (device -> host -> disk) when its room is wanted; the
+/// rest is dropped. Suspended or parked working sets move whatever their key.
+pub const fn above_floor(key: i64) -> bool {
+    key > FLOOR
+}
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Table {
@@ -54,7 +66,7 @@ impl Keys for Installed {
     fn key_at(&self, owner: Option<ProcessId>, at: u64) -> i64 {
         owner
             .and_then(|owner| CURRENT.read().as_ref()?.key_at(owner, at))
-            .unwrap_or(0)
+            .unwrap_or(FLOOR)
     }
 
     fn steps(&self, owner: ProcessId) -> Vec<u64> {
@@ -87,7 +99,7 @@ mod tests {
         assert_eq!(Installed.key_at(Some(owner), 99), 5);
         assert_eq!(Installed.key_at(Some(owner), 100), -1);
         assert_eq!(Installed.steps(owner), [100]);
-        assert_eq!(Installed.key_at(Some(other), 0), 0, "unnamed");
+        assert_eq!(Installed.key_at(Some(other), 0), FLOOR, "unnamed");
         install(Some(Table::new(HashMap::from([(
             owner,
             vec![(Some(10), 3)],

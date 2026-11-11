@@ -1077,6 +1077,20 @@ impl BatchScheduler {
                 &mut frame_policy,
             );
             progress |= Self::retire_ready_control(&mut in_flight_control);
+            // A step's tokens stay within the pool's activation rung (SPEC
+            // decision 6): smaller while the system is critical.
+            let cap = crate::store::shared::fire_cap(engine_id);
+            let mut stepped = limits;
+            stepped.max_forward_tokens = stepped.max_forward_tokens.min(cap as usize).max(1);
+            // No launch past the cap is submitted from here (`post_frame`
+            // holds it): once none in flight is either, the pool may lower
+            // its rung.
+            if in_flight_launches
+                .iter()
+                .all(|batch| batch.total_tokens <= cap as usize)
+            {
+                crate::store::shared::grant_rung(engine_id, cap);
+            }
             let (dispatched, wait_hint) = Self::dispatch_ready_items(
                 &lane,
                 &mut replies,
@@ -1085,7 +1099,7 @@ impl BatchScheduler {
                 &mut in_flight_launches,
                 &mut in_flight_control,
                 page_size,
-                limits,
+                stepped,
                 &stats,
                 &mut frame_policy,
                 &mut scan_cache,
@@ -2219,6 +2233,13 @@ impl BatchScheduler {
         let mut collisions: Vec<(usize, Box<PendingRequest>)> = Vec::new();
         while let Some(item) = pending.pop_front() {
             match item {
+                // Past the pool's activation rung (SPEC decision 6): it waits
+                // until the rung is back.
+                QueuedItem::Launch(launch)
+                    if launch.request.request.tokens() > limits.max_forward_tokens =>
+                {
+                    kept.push_back(QueuedItem::Launch(launch));
+                }
                 QueuedItem::Launch(launch) => match slot_of.get(&launch.fire_id) {
                     Some(&(wave, position)) => {
                         let slot = &mut slot_buffer[wave][position];

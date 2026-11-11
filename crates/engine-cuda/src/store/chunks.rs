@@ -112,23 +112,11 @@ impl Chunks {
         self.range.segment_bytes_committed()
     }
 
-    /// The bytes a flat range allocated before any segment was committed
-    /// (the activation's first hold allocates every chunk at once) that
-    /// [`Chunks::reshape`] gives back: all of them but the activation's
-    /// span, which it holds again. Nothing for a mapped range, whose
-    /// backing is its committed segments and held span alone.
+    /// Every byte the range has backed: its committed segments and held
+    /// spans, or, a flat range once allocated, all of it.
     #[must_use]
-    pub fn reclaimable_bytes(&self) -> u64 {
-        if crate::device::elastic::mapped_on_demand() || !self.fresh() {
-            return 0;
-        }
-        let unit = self.range.map_unit().max(1);
-        let held = self
-            .range
-            .held(u64::from(self.total) * self.layout.chunk_bytes)
-            .div_ceil(unit)
-            .saturating_mul(unit);
-        self.range.committed_bytes().saturating_sub(held)
+    pub fn backed_bytes(&self) -> u64 {
+        self.range.committed_bytes()
     }
 
     /// The unit the range is backed in.
@@ -143,10 +131,21 @@ impl Chunks {
         self.act
     }
 
+    /// The bytes of the activation's span under the range's end.
+    #[must_use]
+    pub fn activation_bytes(&self) -> u64 {
+        u64::from(self.act) * self.layout.chunk_bytes
+    }
+
     /// The bytes of the activation's span not yet held backed: what a
-    /// fire's activation will still take beside the state's chunks.
+    /// fire's activation will still take beside the state's chunks. None on
+    /// a flat range once allocated: its one allocation backs the whole span,
+    /// held or not, so no byte of it is free for the cache rows.
     #[must_use]
     pub fn activation_unheld_bytes(&self) -> u64 {
+        if !crate::device::elastic::mapped_on_demand() && self.range.committed_bytes() > 0 {
+            return 0;
+        }
         let chunk = self.layout.chunk_bytes;
         (u64::from(self.act) * chunk).saturating_sub(self.range.held(u64::from(self.total) * chunk))
     }
@@ -175,6 +174,35 @@ impl Chunks {
             });
         }
         self.range.hold(pool, from, bytes, beside)
+    }
+
+    /// Backs the `spare` chunks just under the activation, beside the
+    /// pool's budget: what a smaller activation rung hands state first.
+    pub fn hold_spare(&mut self, pool: &mut PhysicalPool, spare: u32) -> Result<Commit> {
+        let chunk = self.layout.chunk_bytes;
+        let from = u64::from(self.total.saturating_sub(spare)) * chunk;
+        self.range.hold(pool, from, u64::from(spare) * chunk, true)
+    }
+
+    /// Backs `bytes` of the activation's span from `offset` into it, and
+    /// keeps them backed: where a carve laid at the span's top starts.
+    pub fn hold_activation_at(
+        &mut self,
+        pool: &mut PhysicalPool,
+        offset: u64,
+        bytes: u64,
+        beside: bool,
+    ) -> Result<Commit> {
+        let from = u64::from(self.total) * self.layout.chunk_bytes;
+        let room = u64::from(self.act) * self.layout.chunk_bytes;
+        if offset.saturating_add(bytes) > room {
+            return Err(Fault::Ceiling {
+                what: "bytes of activation under the state pool's end",
+                need: offset.saturating_add(bytes),
+                have: room,
+            });
+        }
+        self.range.hold(pool, from + offset, bytes, beside)
     }
 
     /// Backs the state's chunks of the segment the runtime's activation
@@ -577,7 +605,13 @@ impl Chunks {
     /// allocations took after the range was reserved): they are stated with
     /// the activation's, so state stays below them.
     #[must_use]
-    pub fn facts(&self, max_tokens: u32, spare: u32, flat: bool) -> engine::chunk::ChunkFacts {
+    pub fn facts(
+        &self,
+        max_tokens: u32,
+        spare: u32,
+        flat: bool,
+        rungs: &[(u32, u32)],
+    ) -> engine::chunk::ChunkFacts {
         use engine::chunk::{
             ChunkFacts, Growth, Reserved, ReservedRun, SegmentFacts, SlotKind, SlotShape,
         };
@@ -655,7 +689,15 @@ impl Chunks {
                 chunks: 1,
             }],
             shapes,
-            act_chunks: vec![(max_tokens, self.act.saturating_add(spare))],
+            act_chunks: rungs
+                .iter()
+                .filter(|&&(tokens, chunks)| tokens < max_tokens && chunks < self.act)
+                .map(|&(tokens, chunks)| (tokens, chunks.saturating_add(spare)))
+                .chain(std::iter::once((
+                    max_tokens,
+                    self.act.saturating_add(spare),
+                )))
+                .collect(),
             host_chunks: 0,
             disk_chunks: 0,
             disk_persistent: false,

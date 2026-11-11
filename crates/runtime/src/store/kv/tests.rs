@@ -90,6 +90,8 @@ fn tests_every_case() {
     a_suspend_short_of_host_room_drops_host_cache_first();
     a_tail_past_its_step_goes_before_another_head();
     a_demote_leaves_what_a_higher_key_covers();
+    floor_keyed_idle_cache_is_dropped_not_demoted();
+    a_suspend_parks_its_set_whatever_the_idle_cache_key();
     an_answer_goes_before_an_older_prompt();
     pages_another_worker_sealed_are_found_in_the_host_tier();
 }
@@ -1111,7 +1113,7 @@ fn idle_cache_goes_to_the_host_and_comes_back_on_a_hit() {
     let owner = ProcessId::from_u128(21);
     let tokens = kept_and_gone(&mut store, 12, 3, owner);
     let txn = store
-        .prepare_demote(8, |_| 0)
+        .prepare_demote(8, |_| 1)
         .unwrap()
         .expect("three cache-only pages");
     assert_eq!(txn.page_count(), 3);
@@ -1154,7 +1156,7 @@ fn idle_cache_goes_to_the_host_and_comes_back_on_a_hit() {
 fn a_suspend_short_of_host_room_drops_host_cache_first() {
     let mut store = KvStore::new_with_swap(8, 3, 4, h(32));
     kept_and_gone(&mut store, 13, 3, ProcessId::from_u128(22));
-    let txn = store.prepare_demote(8, |_| 0).unwrap().unwrap();
+    let txn = store.prepare_demote(8, |_| 1).unwrap().unwrap();
     store.commit_suspend(txn).unwrap();
     assert_eq!(store.host_swap_available(), 0);
     let running = store.create_working_set();
@@ -1209,9 +1211,10 @@ fn a_demote_leaves_what_a_higher_key_covers() {
     let a = ProcessId::from_u128(43);
     let tokens = prompt(17, 4);
     sealed_and_gone(&mut store, &tokens, a);
-    // KVFlow: the fixed prompt (two pages) above the suffix.
+    // KVFlow: the fixed prompt (two pages) above the suffix, both above the
+    // floor (the suffix below it would be dropped, not demoted).
     let keys = Steps {
-        entries: vec![(a, None, -1), (a, Some(32), 10)],
+        entries: vec![(a, None, 1), (a, Some(32), 10)],
     };
     let txn = store
         .prepare_demote(8, keys.clone())
@@ -1224,6 +1227,78 @@ fn a_demote_leaves_what_a_higher_key_covers() {
     );
     store.commit_suspend(txn).unwrap();
     assert_eq!(on_device(&mut store, &tokens), 2, "the head stays");
+}
+
+/// Idle cache no policy keys above the floor is not copied down a tier
+/// when the device wants its room: it is dropped, as without tiers. Keyed
+/// above the floor, the same cache goes to the host.
+fn floor_keyed_idle_cache_is_dropped_not_demoted() {
+    use crate::policy::retention::FLOOR;
+    let mut store = KvStore::new_with_swap(8, 8, 8, h(37));
+    let owner = ProcessId::from_u128(45);
+    let tokens = kept_and_gone(&mut store, 18, 3, owner);
+    assert!(
+        store.prepare_demote(8, |_| FLOOR).unwrap().is_none(),
+        "nothing moves at the floor"
+    );
+    assert!(
+        store.prepare_demote(8, |_| FLOOR - 1).unwrap().is_none(),
+        "nor below it"
+    );
+    assert_eq!(store.host_swap_available(), 8, "the host is untouched");
+    assert_eq!(
+        store.reclaim_droppable(store.current_epoch(), |_| FLOOR),
+        3,
+        "it is dropped"
+    );
+    assert_eq!(on_device(&mut store, &tokens), 0);
+    assert!(store.cached_working_sets().is_empty());
+
+    let tokens = kept_and_gone(&mut store, 19, 3, owner);
+    let txn = store
+        .prepare_demote(8, |_| FLOOR + 1)
+        .unwrap()
+        .expect("keyed above the floor, it moves");
+    use ::engine::transfer::MemoryDomain::HostPinned;
+    let tiers: Vec<_> = txn
+        .copy_plans()
+        .iter()
+        .map(|(tier, gpu, _)| (*tier, gpu.len()))
+        .collect();
+    assert_eq!(tiers, [(HostPinned, 3)], "host first");
+    store.commit_suspend(txn).unwrap();
+    store.retire_idle();
+    assert_eq!(on_device(&mut store, &tokens), 0);
+    let reader = store.create_working_set();
+    let keys = keys_ahead(&store, reader, 0, &tokens);
+    assert_eq!(
+        store.cached_run_any_tier(&keys).len(),
+        3,
+        "kept on the host"
+    );
+}
+
+/// A suspend is not idle cache: the set parks on the host whatever the
+/// keys, while floor-keyed idle cache beside it is not demoted.
+fn a_suspend_parks_its_set_whatever_the_idle_cache_key() {
+    use crate::policy::retention::FLOOR;
+    let mut store = KvStore::new_with_swap(8, 8, 0, h(38));
+    kept_and_gone(&mut store, 20, 2, ProcessId::from_u128(46));
+    assert!(store.prepare_demote(8, |_| FLOOR).unwrap().is_none());
+    let running = store.create_working_set();
+    commit_fresh(&mut store, running, 2, 1);
+    let Some(txn) = store.prepare_suspend(&HashSet::from([running])).unwrap() else {
+        panic!("two pages to park");
+    };
+    use ::engine::transfer::MemoryDomain::HostPinned;
+    let tiers: Vec<_> = txn
+        .copy_plans()
+        .iter()
+        .map(|(tier, gpu, _)| (*tier, gpu.len()))
+        .collect();
+    assert_eq!(tiers, [(HostPinned, 2)], "the set parks on the host");
+    assert_eq!(store.commit_suspend(txn).unwrap(), 2);
+    assert_eq!(store.host_swap_available(), 6, "only the set's pages");
 }
 
 fn an_answer_goes_before_an_older_prompt() {
@@ -1485,7 +1560,7 @@ fn demoted_cache_past_the_host_lands_on_disk_journaled_and_outlives_a_restart() 
         gpu.into_iter().map(KvPageBacking::Resident).collect(),
     ));
     let txn = store
-        .prepare_demote(8, |_| 0)
+        .prepare_demote(8, |_| 1)
         .unwrap()
         .expect("three idle pages to move");
     let tiers: Vec<_> = txn
@@ -1539,7 +1614,7 @@ fn demoted_cache_past_the_host_lands_on_disk_journaled_and_outlives_a_restart() 
         keys.clone(),
         gpu.into_iter().map(KvPageBacking::Resident).collect(),
     ));
-    let txn = store.prepare_demote(8, |_| 0).unwrap().unwrap();
+    let txn = store.prepare_demote(8, |_| 1).unwrap().unwrap();
     let tiers: Vec<_> = txn
         .copy_plans()
         .iter()
@@ -1575,7 +1650,7 @@ fn parked_on_host(store: &mut KvStore, run: &(Vec<Vec<Option<Hash256>>>, Vec<Has
         run.1.clone(),
         gpu.into_iter().map(KvPageBacking::Resident).collect(),
     ));
-    let txn = store.prepare_demote(8, |_| 0).unwrap().expect("a demote");
+    let txn = store.prepare_demote(8, |_| 1).unwrap().expect("a demote");
     let tiers: Vec<_> = txn.copy_plans().iter().map(|(tier, ..)| *tier).collect();
     assert_eq!(tiers, [HostPinned], "the host holds it whole");
     assert_eq!(store.commit_suspend(txn).unwrap(), run.1.len());
@@ -1605,7 +1680,7 @@ fn host_cache_goes_on_down_to_disk_oldest_whole_journaled_and_outlives_a_restart
     struct ByLength;
     impl Keys for ByLength {
         fn key_at(&self, _: Option<ProcessId>, at: u64) -> i64 {
-            i64::from(at < 8)
+            1 + i64::from(at < 8)
         }
     }
 
@@ -1686,14 +1761,14 @@ fn a_spill_keeps_groups_whole_on_a_persistent_tier_and_needs_a_shared_list() {
     );
     parked_on_host(&mut store, &run);
     assert!(
-        store.prepare_spill(3, |_| 0).is_none(),
+        store.prepare_spill(3, |_| 1).is_none(),
         "three do not fit two"
     );
     assert_eq!(store.host_swap_available(), 0);
 
     let mut store = store_for(2);
     parked_on_host(&mut store, &run);
-    let txn = store.prepare_spill(3, |_| 0).expect("what fits goes");
+    let txn = store.prepare_spill(3, |_| 1).expect("what fits goes");
     assert_eq!(txn.page_count(), 2);
     store.abort_spill(txn);
     assert_eq!(
@@ -1711,7 +1786,16 @@ fn a_spill_keeps_groups_whole_on_a_persistent_tier_and_needs_a_shared_list() {
     store.set_page_size(4);
     store.set_keeps(true);
     parked_on_host(&mut store, &run);
-    assert!(store.prepare_spill(3, |_| 0).is_none());
+    assert!(store.prepare_spill(3, |_| 1).is_none());
+
+    // Host cache the keys now leave at the floor is not copied down: a host
+    // short of room drops it (`prepare_suspend`) instead.
+    let mut store = store_for(8);
+    parked_on_host(&mut store, &run);
+    let floor = crate::policy::retention::FLOOR;
+    assert!(store.prepare_spill(3, |_| floor).is_none(), "at the floor");
+    assert_eq!(store.disk_swap_available(), 8, "nothing went to disk");
+    assert!(store.prepare_spill(3, |_| floor + 1).is_some(), "above it");
 }
 
 #[test]
@@ -1731,12 +1815,12 @@ fn a_suspend_short_of_host_room_spills_idle_cache_rather_than_dropping_it() {
     let sets = HashSet::from([ws]);
 
     let txn = store
-        .prepare_suspend_spill(&sets, |_| 0)
+        .prepare_suspend_spill(&sets, |_| 1)
         .expect("the host is short two");
     assert_eq!(txn.page_count(), 2, "only what the suspend lacks");
     assert_eq!(store.commit_spill(txn), 2);
     assert_eq!(store.host_swap_available(), 2);
-    assert!(store.prepare_suspend_spill(&sets, |_| 0).is_none());
+    assert!(store.prepare_suspend_spill(&sets, |_| 1).is_none());
 
     let txn = store.prepare_suspend(&sets).unwrap().expect("a suspend");
     let tiers: Vec<_> = txn

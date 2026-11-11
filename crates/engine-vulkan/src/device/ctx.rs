@@ -1131,7 +1131,8 @@ impl Context {
         Ok(Frame {
             inner: Arc::new(Inner {
                 core: Arc::clone(core),
-                cmd,
+                cmd: std::sync::atomic::AtomicU64::new(vk::Handle::as_raw(cmd)),
+                cuts: Mutex::new(Vec::new()),
                 cmd_pool: pool,
                 fence,
                 pools: Mutex::new(Vec::new()),
@@ -1141,6 +1142,7 @@ impl Context {
                 spare: Mutex::new(std::collections::HashMap::new()),
             }),
             open: true,
+            kept: !one_time,
             hazards: std::cell::RefCell::new(Hazards::default()),
             retained: std::cell::RefCell::new(std::collections::HashSet::new()),
             dispatches: std::cell::Cell::new(0),
@@ -1169,7 +1171,13 @@ fn pick_family(families: &[vk::QueueFamilyProperties]) -> Option<u32> {
 
 pub(crate) struct Inner {
     pub(crate) core: Arc<Core>,
-    pub(crate) cmd: vk::CommandBuffer,
+    /// The command buffer being recorded (a kept frame's last segment).
+    cmd: std::sync::atomic::AtomicU64,
+    /// A kept frame's segments before its last, in order: each ended where
+    /// the walk needed the frame so far landed before the host went on (an
+    /// expert stage); a replay submits each, waits, and lets its caller do
+    /// that host work before the next.
+    cuts: Mutex<Vec<vk::CommandBuffer>>,
 
     pub(crate) cmd_pool: vk::CommandPool,
     pub(crate) fence: vk::Fence,
@@ -1182,6 +1190,12 @@ pub(crate) struct Inner {
     pub(crate) timing: Mutex<Option<Timing>>,
 
     spare: Mutex<std::collections::HashMap<u64, Vec<vk::DescriptorSet>>>,
+}
+
+impl Inner {
+    pub(crate) fn cmd(&self) -> vk::CommandBuffer {
+        vk::Handle::from_raw(self.cmd.load(Ordering::Acquire))
+    }
 }
 
 pub(crate) struct Timing {
@@ -1219,14 +1233,15 @@ impl Drop for Inner {
                 .expect("pools lock poisoned")
                 .get(&std::thread::current().id())
                 == Some(&self.cmd_pool);
+            let mut buffers = std::mem::take(self.cuts.get_mut().expect("cuts lock poisoned"));
+            buffers.push(self.cmd());
             if owned {
-                d.free_command_buffers(self.cmd_pool, &[self.cmd]);
+                d.free_command_buffers(self.cmd_pool, &buffers);
             } else {
-                self.core
-                    .orphans
-                    .lock()
-                    .expect("orphans lock poisoned")
-                    .push((self.cmd_pool, self.cmd));
+                let mut orphans = self.core.orphans.lock().expect("orphans lock poisoned");
+                for cmd in buffers {
+                    orphans.push((self.cmd_pool, cmd));
+                }
             }
         }
         self.core.return_fence(self.fence);
@@ -1304,6 +1319,9 @@ impl Hazards {
 pub struct Frame {
     pub(crate) inner: Arc<Inner>,
     open: bool,
+    /// Opened by `frame_kept`: a flush cuts a segment rather than reusing
+    /// the command buffer, so the whole frame replays.
+    kept: bool,
     pub(crate) dispatches: std::cell::Cell<u64>,
 
     pub(crate) hazards: std::cell::RefCell<Hazards>,
@@ -1317,7 +1335,7 @@ impl Frame {
     }
 
     pub(crate) fn cmd(&self) -> vk::CommandBuffer {
-        self.inner.cmd
+        self.inner.cmd()
     }
 
     pub(crate) fn barrier_owed(&self, reads: &[Span], writes: &[Span]) -> bool {
@@ -1448,7 +1466,7 @@ impl Frame {
         }
         let (read_back, source, into) = (into.is_host(), source.slab(), into.slab());
         let d = &self.inner.core.device;
-        let cmd = self.inner.cmd;
+        let cmd = self.inner.cmd();
         // SAFETY: `&mut self` is the only recorder of this open frame's `cmd`.
         // Both slabs are live buffers of this device and every region was
         // checked to lie inside them; the frame retains both below until its
@@ -1500,7 +1518,7 @@ impl Frame {
         into.span(at, len)?;
         let into = into.slab();
         let d = &self.inner.core.device;
-        let cmd = self.inner.cmd;
+        let cmd = self.inner.cmd();
         // SAFETY: `&mut self` is the only recorder of this open frame's `cmd`;
         // the slab is live and retained below, and `span` bounds the fill. The
         // rounding of `len` to 4 stays inside the slab (a multiple of 4 long)
@@ -1543,6 +1561,12 @@ impl Frame {
         self.dispatches.get()
     }
 
+    /// The segments a kept frame's flushes have cut so far.
+    #[must_use]
+    pub fn cuts(&self) -> usize {
+        self.inner.cuts.lock().expect("cuts lock poisoned").len()
+    }
+
     /// [`Frame::flush`], then the queue idle: every frame submitted before
     /// this one has landed too (an earlier fire still in flight among them),
     /// so the host may rewrite memory any of them reads.
@@ -1558,7 +1582,7 @@ impl Frame {
     pub fn flush(&self) -> Result<()> {
         let core = &self.inner.core;
         let d = &core.device;
-        let cmd = self.inner.cmd;
+        let cmd = self.inner.cmd();
         // In `flush`, `Frame` is not `Sync`, so `&self` here is the only
         // thread using this frame's `cmd` and fence, and the frame is open:
         // every method that ends it consumes the frame.
@@ -1579,6 +1603,35 @@ impl Frame {
         // SAFETY: the wait returned success, so no submission names the fence.
         unsafe { d.reset_fences(&[self.inner.fence]) }
             .map_err(|e| core.fault("vkResetFences", e))?;
+        if self.kept {
+            // The segment stays for replays; the frame records on in a new
+            // buffer from the same (this thread's) pool.
+            // SAFETY: `cmd_pool` is the pool this frame's buffers came from,
+            // owned by this thread (frames record on the thread that opened
+            // them).
+            let next = unsafe {
+                d.allocate_command_buffers(
+                    &vk::CommandBufferAllocateInfo::default()
+                        .command_pool(self.inner.cmd_pool)
+                        .level(vk::CommandBufferLevel::PRIMARY)
+                        .command_buffer_count(1),
+                )
+            }
+            .map_err(|e| core.fault("vkAllocateCommandBuffers", e))?[0];
+            self.inner
+                .cuts
+                .lock()
+                .expect("cuts lock poisoned")
+                .push(cmd);
+            self.inner
+                .cmd
+                .store(vk::Handle::as_raw(next), Ordering::Release);
+            // SAFETY: `next` was just allocated, in the initial state.
+            unsafe { d.begin_command_buffer(next, &vk::CommandBufferBeginInfo::default()) }
+                .map_err(|e| core.fault("vkBeginCommandBuffer", e))?;
+            self.hazards_settled();
+            return Ok(());
+        }
         // SAFETY: the work is complete, so `cmd` is not pending; its pool was
         // made with `RESET_COMMAND_BUFFER`.
         unsafe { d.reset_command_buffer(cmd, vk::CommandBufferResetFlags::empty()) }
@@ -1604,14 +1657,14 @@ impl Frame {
         let core = &self.inner.core;
         // SAFETY: `open` was set, so `cmd` is recording; `&mut self` is its
         // only user.
-        unsafe { core.device.end_command_buffer(self.inner.cmd) }
+        unsafe { core.device.end_command_buffer(self.inner.cmd()) }
             .map_err(|e| core.fault("vkEndCommandBuffer", e))
     }
 
     fn submit(&mut self) -> Result<()> {
         self.end()?;
         let core = &self.inner.core;
-        let bufs = [self.inner.cmd];
+        let bufs = [self.inner.cmd()];
         let submits = [vk::SubmitInfo::default().command_buffers(&bufs)];
         let queue = core.queue.lock().expect("queue lock poisoned");
         // SAFETY: `cmd` was just ended and never submitted, the fence is the
@@ -1678,7 +1731,7 @@ impl Drop for Frame {
             // SAFETY: an open frame's `cmd` is recording and only this frame
             // records into it.
             unsafe {
-                let _ = self.inner.core.device.end_command_buffer(self.inner.cmd);
+                let _ = self.inner.core.device.end_command_buffer(self.inner.cmd());
             }
         }
     }
@@ -1695,6 +1748,55 @@ impl std::fmt::Debug for Kept {
 }
 
 impl Kept {
+    /// The segments before the last ([`Frame::cuts`] at `into_kept`).
+    #[must_use]
+    pub fn cuts(&self) -> usize {
+        self.inner.cuts.lock().expect("cuts lock poisoned").len()
+    }
+
+    /// Submits segment `at` (of [`Kept::cuts`]) and waits for it: with it
+    /// everything submitted before has landed (a fence's signal covers all
+    /// earlier submissions), so the host may rewrite what the next segment
+    /// reads. Segments replay in order, then [`Kept::replay`] the last.
+    pub fn replay_cut(&self, at: usize) -> Result<()> {
+        let core = &self.inner.core;
+        let d = &core.device;
+        let cmd = *self
+            .inner
+            .cuts
+            .lock()
+            .expect("cuts lock poisoned")
+            .get(at)
+            .ok_or_else(|| Fault::Unbound {
+                what: format!("segment {at} of a kept frame"),
+            })?;
+        if self.inner.submitted.load(Ordering::Acquire) {
+            // SAFETY: the fence is this kept frame's own.
+            unsafe { d.wait_for_fences(&[self.inner.fence], true, FENCE_TIMEOUT_NS) }
+                .map_err(|e| core.fault("vkWaitForFences", e))?;
+        }
+        // SAFETY: no pending submission names the fence (waited above, or
+        // the last one was a segment, waited and reset below).
+        unsafe { d.reset_fences(&[self.inner.fence]) }
+            .map_err(|e| core.fault("vkResetFences", e))?;
+        self.inner.submitted.store(false, Ordering::Release);
+        {
+            let bufs = [cmd];
+            let submits = [vk::SubmitInfo::default().command_buffers(&bufs)];
+            let queue = core.queue.lock().expect("queue lock poisoned");
+            // SAFETY: `cmd` is executable (ended when the next segment
+            // began) and not pending; the fence is unsignaled; the queue is
+            // held under its lock.
+            unsafe { d.queue_submit(*queue, &submits, self.inner.fence) }
+                .map_err(|e| core.fault("vkQueueSubmit", e))?;
+        }
+        // SAFETY: the fence is this frame's own, just submitted.
+        unsafe { d.wait_for_fences(&[self.inner.fence], true, FENCE_TIMEOUT_NS) }
+            .map_err(|e| core.fault("vkWaitForFences", e))?;
+        // SAFETY: the wait returned, so no submission names the fence.
+        unsafe { d.reset_fences(&[self.inner.fence]) }.map_err(|e| core.fault("vkResetFences", e))
+    }
+
     pub fn replay(
         &self,
         on_done: Option<Box<dyn Fn(Option<String>) + Send + 'static>>,
@@ -1719,7 +1821,7 @@ impl Kept {
             .map_err(|e| core.fault("vkResetFences", e))?;
         let at = crate::encode::profiling().then(std::time::Instant::now);
         {
-            let bufs = [self.inner.cmd];
+            let bufs = [self.inner.cmd()];
             let submits = [vk::SubmitInfo::default().command_buffers(&bufs)];
             let queue = core.queue.lock().expect("queue lock poisoned");
             // SAFETY: `cmd` is executable and no longer pending, the fence is

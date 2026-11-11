@@ -217,6 +217,7 @@ impl ResidencyPlanner {
                                 continue;
                             }
                             self.report_short();
+                            self.note_lapsed_fires();
                             let Some(error) = self.short_expired(key) else {
                                 continue;
                             };

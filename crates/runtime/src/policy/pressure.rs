@@ -219,10 +219,10 @@ pub fn reading(tier: Tier) -> Reading {
 }
 
 /// Whether the runtime may drop idle cache under `key` without asking the
-/// policy. Only a key at or below 0 says so; above it, room is asked for
-/// with `tier-pressure`.
+/// policy. Only a key at or below the retention floor says so; above it,
+/// room is asked for with `tier-pressure`.
 pub const fn may_drop(key: i64) -> bool {
-    key <= 0
+    !super::retention::above_floor(key)
 }
 
 /// Replaces the meter the worker policy reads bytes from.

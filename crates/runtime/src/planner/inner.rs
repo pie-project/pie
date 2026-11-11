@@ -355,7 +355,11 @@ impl Inner {
             }
         }
         self.procs.iter().all(|(pid, proc)| match proc.state {
-            Residency::Resident => !proc.admitted || proc.idle || parked.contains(pid),
+            // Parked, it is stalled only with no fire of its own in flight:
+            // one parked lane beside its peers' running fires waits for them.
+            Residency::Resident => {
+                !proc.admitted || proc.idle || (parked.contains(pid) && !proc.firing())
+            }
             Residency::Evicting | Residency::Restoring => false,
             Residency::Evicted => true,
         })

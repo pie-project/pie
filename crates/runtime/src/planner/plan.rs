@@ -18,6 +18,8 @@ enum Step {
     ShortRs {
         need: RsUnits,
         fund_by_eviction: bool,
+        /// Pages gathered past the head's own kv need.
+        surplus: u32,
     },
     ServeAllocation {
         key: EntryKey,
@@ -88,6 +90,7 @@ impl ResidencyPlanner {
                     return Step::ShortRs {
                         need: seated.sub(rs_free),
                         fund_by_eviction: !is_restore || inner.fleet_stalled(),
+                        surplus: (inner.accum.len() as u32).saturating_sub(waiter.kv_need()),
                     };
                 }
                 match demand {
@@ -120,7 +123,8 @@ impl ResidencyPlanner {
                     if self.port.grow_pages(count) {
                         return;
                     }
-                    // Idle cache moves down a tier before any is dropped.
+                    // Idle cache a policy keys above the floor moves down
+                    // a tier before any is dropped; the rest is dropped.
                     if self.demote_idle() {
                         return;
                     }
@@ -135,12 +139,30 @@ impl ResidencyPlanner {
                 Step::ShortRs {
                     need,
                     fund_by_eviction,
+                    surplus,
                 } => {
+                    // On a shared pool the pages gathered for an earlier head
+                    // (one that left, or a restart's) hold chunks this head's
+                    // state could take: they go back before anything moves.
+                    // Kept, they starved every replay of a restarted process
+                    // of the state slot its lanes asked for.
+                    if surplus > 0 && self.port.rs_as_pages(need) > 0 {
+                        let spare = self.with_inner(|inner| {
+                            let keep = inner.unmet_head().map_or(0, |(_, head)| head.kv_need());
+                            let spare = (inner.accum.len() as u32).saturating_sub(keep);
+                            inner.accum.donate(spare)
+                        });
+                        if spare.len() > 0 {
+                            drop(spare);
+                            continue;
+                        }
+                    }
                     if self.port.grow_rs(need) {
                         return;
                     }
                     // On a shared pool the chunks idle cache holds open for
-                    // state too: it moves down a tier before any is dropped.
+                    // state too: what is keyed above the floor moves down a
+                    // tier before any is dropped.
                     let as_pages = self.port.rs_as_pages(need);
                     if as_pages > 0 && self.demote_idle() {
                         return;

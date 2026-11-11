@@ -416,6 +416,12 @@ impl Shell {
         self.pools.copy_kv(self.device.stream(), moves, windowed)
     }
 
+    /// Lays every fire's arena at the span's start, no smaller rung stated:
+    /// what expert parallelism seats its buffers by.
+    pub fn drop_rungs(&mut self) {
+        self.arena.drop_rungs();
+    }
+
     /// Backs every page the pools declare ([`crate::store::Pools::back_whole`]).
     pub fn back_whole(&mut self) -> Result<()> {
         self.pools.back_whole()
