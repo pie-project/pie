@@ -2119,17 +2119,22 @@ impl Shell {
         let t1 = std::time::Instant::now();
         // Everything the program text depends on: the walk's windows and
         // descriptor, every input's shape, the page bound and the readout.
-        let key = *blake3::hash(
-            format!(
-                "{descriptor:?}|{windows:?}|{}|{max_pages}|{}|{}|{rs_active}|{dit_key}|{:?}",
-                inputs.shapes(),
-                readout_rows.len(),
-                self.gathers_readout,
-                self.probes
+        // Formatted only where the shape key misses: at 256 lanes the
+        // descriptor's text is a tenth of a decode's host time.
+        let gathers_readout = self.gathers_readout;
+        let full_key = |probes: &[ValueId]| -> [u8; 32] {
+            *blake3::hash(
+                format!(
+                    "{descriptor:?}|{windows:?}|{}|{max_pages}|{}|{}|{rs_active}|{dit_key}|{:?}",
+                    inputs.shapes(),
+                    readout_rows.len(),
+                    gathers_readout,
+                    probes
+                )
+                .as_bytes(),
             )
-            .as_bytes(),
-        )
-        .as_bytes();
+            .as_bytes()
+        };
         // A plain fire (no recurrent-state maps, media, clips or probes) is
         // also keyed by its shape alone, so lanes cut differently skip the
         // walk too.
@@ -2159,7 +2164,17 @@ impl Shell {
             .and_then(|k| self.shaped.get(&k))
             .map(std::sync::Arc::clone)
             .filter(|_| !shape_check());
-        let found = hit.or_else(|| self.traced.get(&key).map(std::sync::Arc::clone));
+        let mut key = None;
+        let found = match hit {
+            Some(program) => Some(program),
+            None => {
+                let k = full_key(&self.probes);
+                key = Some(k);
+                self.traced.get(&k).map(std::sync::Arc::clone)
+            }
+        };
+        // a miss, which every path below that reads it is, keyed it
+        let missed = |key: Option<[u8; 32]>| key.expect("a missed fire's key");
         if found.is_none() && self.deferred.is_some() {
             let (text, sig, probed) = self.trace_text(
                 &slots,
@@ -2177,7 +2192,7 @@ impl Shell {
             )?;
             if let Some(deferred) = self.deferred.as_mut() {
                 deferred.push(Deferred {
-                    key,
+                    key: missed(key),
                     shape_key,
                     text,
                     sig,
@@ -2207,6 +2222,7 @@ impl Shell {
                     pixels_seat.as_ref(),
                 )?;
                 let (program, probed) = program;
+                let key = missed(key);
                 self.probed.insert(key, probed);
                 self.traced.insert(key, std::sync::Arc::clone(&program));
                 program
@@ -2247,7 +2263,10 @@ impl Shell {
         // write, then a decoder's pixel plane and its grid, then the probes.
         let keep = self.keep_readout;
         let mut outs = outs;
-        let probed_ids = self.probed.get(&key).cloned().unwrap_or_default();
+        // A shape-key hit is a plain fire's, which probes nothing.
+        let probed_ids = key
+            .and_then(|key| self.probed.get(&key).cloned())
+            .unwrap_or_default();
         let mut probes = Vec::with_capacity(probed_ids.len());
         for value in probed_ids.iter().rev() {
             let Some(buffer) = outs.pop() else {
