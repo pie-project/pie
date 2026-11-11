@@ -182,7 +182,7 @@ pub struct PrefillFloor(pub u32);
 /// 128-row multiples: a 512-token prompt (with its template) runs a 640-row
 /// fire, not a 1024-row one. 1 keeps the ladder as `growth` lays it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Decision)]
-#[decision(id = "engine.pad.row_steps", constant(set(1, 2, 4)), default = 1, tune = search)]
+#[decision(id = "engine.pad.row_steps", constant(set(1, 2, 4, 8)), default = 1, tune = search)]
 pub struct PadRowSteps(pub u32);
 
 /// The rung halfway between two from 16 up to this one (24 below 32, 48
@@ -510,6 +510,17 @@ mod tests {
             vec![
                 1, 2, 4, 8, 16, 32, 64, 128, 256, 512, 640, 768, 896, 1024, 1280, 1536, 1792, 2048,
                 2176
+            ]
+        );
+        let eighths = Pad {
+            row_steps: 8,
+            ..pad
+        };
+        assert_eq!(
+            eighths.ladder(2176),
+            vec![
+                1, 2, 4, 8, 16, 32, 64, 128, 256, 512, 640, 768, 896, 1024, 1152, 1280, 1408, 1536,
+                1664, 1792, 1920, 2048, 2176
             ]
         );
         let halves = Pad {

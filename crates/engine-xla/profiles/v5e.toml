@@ -4,9 +4,9 @@ api = 1
 assumes = { generation = 5, hbm_gib = 16 }
 
 # as on v6e: on the powers-of-two ladder a 512-token prompt (and its template) ran a 1024-row fire;
-# 128-row rungs from 512 run it at 640
+# 128-row rungs from 512 run it at 640, and from 1024 three 553-token prompts at 1664 rows, not 1792
 [engine]
-pad.row_steps = 4
+pad.row_steps = 8
 # a process starts only while the pools hold the started ones to the pages a finished one held, a
 # decoding lane's pages before a waiting prompt's, the starts past them spread over a life: the engine
 # keeps no kv on the host, and gemma-4-E4B's 548 pages restarted the processes they ran short for
