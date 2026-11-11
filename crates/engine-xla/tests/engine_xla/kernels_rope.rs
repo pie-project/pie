@@ -284,6 +284,74 @@ fn a_prompt_tall_rope_turns_by_halves_in_one_kernel() {
     }
 }
 
+#[test]
+fn a_prompt_tall_partial_rope_turns_in_one_kernel() {
+    // gemma-4's global layers: 512-wide heads, the first 64 lanes turned
+    // with the ones half a head on, the rest passed through.
+    let (rows, hd, rot, span, theta) = (640usize, 512usize, 128usize, 256usize, 1e6f32);
+    let (qh, kh) = (4usize, 1usize);
+    let qs = data(rows * qh * hd, 7);
+    let ks = data(rows * kh * hd, 8);
+    let pos: Vec<i32> = (0..rows as i32).map(|r| (r * 7) % 2000).collect();
+    let mut b = Bench::new();
+    let q = b.bf16(rows as u32, (qh * hd) as u32, &qs);
+    let k = b.bf16(rows as u32, (kh * hd) as u32, &ks);
+    let p = b.i32(rows as u32, 1, &pos);
+    if !b
+        .run(|ctx| {
+            engine_xla::lower::lower(ctx, |l| {
+                let q_v = l.read(q)?;
+                let k_v = l.read(k)?;
+                let positions_v = l.read(p)?;
+                let vs = rope::partial(
+                    l.f(),
+                    q_v,
+                    k_v,
+                    positions_v,
+                    rot as u32,
+                    hd as u32,
+                    theta,
+                    span as u32,
+                )?;
+                if let Some(v) = vs[0] {
+                    l.land(q, v)?;
+                }
+                if let Some(v) = vs[1] {
+                    l.land(k, v)?;
+                }
+                Ok(())
+            })
+        })
+        .unwrap()
+    {
+        return;
+    }
+    let pf: Vec<f32> = pos.iter().map(|&v| v as f32).collect();
+    let pairs: Vec<Pair> = (0..rot / 2)
+        .map(|i| (i, i + span, 0, inv_freq(theta, i, 2 * span as u32)))
+        .collect();
+    assert_close(
+        &b.read_f32(q),
+        &turn_ref(&qs, qh * hd, hd, &pairs, &pf, 1, 1.0),
+        1e-2,
+        1e-2,
+    );
+    assert_close(
+        &b.read_f32(k),
+        &turn_ref(&ks, kh * hd, hd, &pairs, &pf, 1, 1.0),
+        1e-2,
+        1e-2,
+    );
+    // The lanes no pair turns pass through bit for bit.
+    let got = b.read_f32(q);
+    for (i, (&g, &x)) in got.iter().zip(&qs).enumerate() {
+        let lane = i % hd;
+        if !(lane < rot / 2 || (span..span + rot / 2).contains(&lane)) {
+            assert_eq!(g.to_bits(), x.to_bits(), "still lane element {i}");
+        }
+    }
+}
+
 fn ramp(head_dim: u32, theta: f32, fast: f32, slow: f32, orig: u32) -> (f32, f32) {
     let tau = std::f32::consts::TAU;
     let corr = |rot: f32| head_dim as f32 * (orig as f32 / (rot * tau)).ln() / (2.0 * theta.ln());
