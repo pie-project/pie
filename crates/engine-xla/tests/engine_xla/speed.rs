@@ -30,7 +30,8 @@ fn quiet(lane: &mut engine::fire::Lane) {
 
 /// Decode tok/s at `lanes` lanes, each holding `held` prompt rows.
 fn decode(name: &str, lanes: u32, held: u32, steps: u32) -> f64 {
-    let context = 1024;
+    // a lane holds `held` + 103 rows at most
+    let context = 512;
     warm();
     set("SLOTS", lanes.max(4));
     set("LANES", lanes.max(8));
