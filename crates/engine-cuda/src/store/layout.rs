@@ -314,7 +314,11 @@ pub fn packed_planes(trace: &poem_ir::Trace, codes: usize) -> Vec<Option<u32>> {
     };
     let scales = named(poem::declare::scales_name(&param.name));
     let third = match param.dtype {
-        Dtype::Mxfp4 => None,
+        // Its expert bias where its select adds one (gpt-oss).
+        Dtype::Mxfp4 => match select_bias(trace, codes) {
+            Some(bias) => bias,
+            None => return Vec::new(),
+        },
         Dtype::Nvfp4 => match named(poem::declare::global_scales_name(&param.name)) {
             Some(tensor_scales) => Some(tensor_scales),
             None => return Vec::new(),
@@ -332,6 +336,46 @@ pub fn packed_planes(trace: &poem_ir::Trace, codes: usize) -> Vec<Option<u32>> {
         Some(scales) => vec![Some(codes as u32), Some(scales), third],
         None => Vec::new(),
     }
+}
+
+/// The expert bias the routed selects of bank `codes` add: `Some(None)`
+/// where none adds one, `None` where they add different ones (no one table
+/// lists them all).
+fn select_bias(trace: &poem_ir::Trace, codes: usize) -> Option<Option<u32>> {
+    use poem_ir::{Def, Fused, Linear, Operation};
+    let weight = |v: poem_ir::ValueId| match trace.values.get(v.0 as usize).map(|d| &d.def) {
+        Some(Def::Weight(w)) => Some(*w),
+        _ => None,
+    };
+    // Every routed select, plain or inside the fused op a load folds it
+    // into (the trace a load seats its banks by is the fused one).
+    let selects = trace.nodes.iter().flat_map(|node| match &node.op {
+        Operation::Linear(select) => vec![select],
+        Operation::Fused(Fused::MoeSelectGlu { select, .. }) => vec![&**select],
+        Operation::Fused(
+            Fused::MoeExperts { select, down, .. } | Fused::MoeMega { select, down, .. },
+        ) => vec![&**select, &**down],
+        _ => Vec::new(),
+    });
+    let mut found: Option<Option<u32>> = None;
+    for select in selects {
+        let Linear::MoeSelect { bank, bias, .. } = select else {
+            continue;
+        };
+        let (bank, bias) = (*bank, *bias);
+        if weight(bank) != Some(codes as u32) {
+            continue;
+        }
+        let this = match bias {
+            Some(bias) => Some(weight(bias)?),
+            None => None,
+        };
+        match found {
+            Some(was) if was != this => return None,
+            _ => found = Some(this),
+        }
+    }
+    Some(found.flatten())
 }
 
 /// The planes a packed bank's expert slot carries that no op reads (an
@@ -424,6 +468,33 @@ pub fn streamed_experts(trace: &poem_ir::Trace) -> Vec<usize> {
                     ..
                 }) if matches!(trace.values.get(bank.0 as usize).map(|d| &d.def),
                     Some(Def::Weight(w)) if *w as usize == at) =>
+                {
+                    read = true;
+                }
+                // An expert bias summed into the routed rows (gpt-oss's
+                // down leg): a one-plane bank the sum reads through its
+                // table.
+                Operation::Linear(Linear::MoeBiasSum { bias, .. })
+                    if packs
+                        && planes.is_empty()
+                        && matches!(trace.values.get(bias.0 as usize).map(|d| &d.def),
+                            Some(Def::Weight(w)) if *w as usize == at) =>
+                {
+                    read = true;
+                }
+                // An MXFP4 bank's biased select: its bias is the third plane
+                // its table lists.
+                Operation::Linear(Linear::MoeSelect {
+                    bank,
+                    bias: Some(_),
+                    quantized: false,
+                    quant: None,
+                    ..
+                }) if packs
+                    && param.dtype == poem_ir::Dtype::Mxfp4
+                    && planes.get(2).is_some_and(Option::is_some)
+                    && matches!(trace.values.get(bank.0 as usize).map(|d| &d.def),
+                        Some(Def::Weight(w)) if *w as usize == at) =>
                 {
                     read = true;
                 }

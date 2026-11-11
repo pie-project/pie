@@ -165,3 +165,36 @@ fn a_streamed_bf16_select_reads_its_host_experts_through_the_table() {
         }
     }
 }
+
+/// The routed expert-bias sum (gpt-oss's down leg) reads each route's bias
+/// row through any table, held or streamed, landing the contiguous bank's
+/// bits.
+#[test]
+fn a_bias_sum_lands_the_same_bits_through_any_table() {
+    let mut g = Gpu::open();
+    let mut lcg = Lcg::seeded(0xb1a5);
+    for (experts, tokens, top, width) in [(8usize, 3usize, 2usize, 256usize), (32, 64, 4, 2880)] {
+        let (br, _) = lcg.row(experts * width);
+        let bias = g.up(&br);
+        let (xr, _) = lcg.row(tokens * width);
+        let x = t(g.up(&xr), tokens, width, Bf16);
+        let r = t(g.up(&routes(tokens, top, experts)), tokens, top, I32);
+        let w: Vec<f32> = tab(tokens * top, |i| 0.25 + (i % 7) as f32 / 8.0);
+        let wt = t(g.up(&w), tokens, top, dtype::Dtype::F32);
+        let y = g.zeros(tokens * width * 2);
+        let ctx = ctx_of(&g);
+        let what = format!("bias sum {experts}x{tokens}x{top} {width}");
+        same_bits(
+            &mut g,
+            &what,
+            experts,
+            &[Plane::of(bias, (width * 2) as u64)],
+            (y, tokens * width * 2),
+            |table| {
+                let mut yt = t(y, tokens, width, Bf16);
+                moe::bias_sum(&ctx, x, t(bias, experts, width, Bf16), r, wt, &mut yt, table)
+                    .expect("the sum fires");
+            },
+        );
+    }
+}

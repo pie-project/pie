@@ -1210,6 +1210,33 @@ impl Run<'_> {
                 ..
             } => {
                 let (codes, scales, affine) = self.planes(*bank);
+                // A bank the weight cache streams: each expert's codes, scales
+                // and bias where its table says, and no bf16 copy.
+                #[cfg(feature = "cuda")]
+                if let table = self.bank_table(*bank)
+                    && table.tabled()
+                {
+                    if table.streams() {
+                        linear::moe::note_routes(
+                            self.ctx(),
+                            "linear.moe_select",
+                            self.tensor(*routes),
+                            codes.rows,
+                            table.hits,
+                        )?;
+                    }
+                    return linear::moe::matmul_select_bias(
+                        self.ctx(),
+                        self.tensor(*x),
+                        codes,
+                        scales,
+                        self.tensor(*bias),
+                        self.tensor(*routes),
+                        &mut self.tensor(*y),
+                        GroupSeat::RESIDENT,
+                        table,
+                    );
+                }
                 // A wide fire on the bank's bf16 copy (`kernel.moe.mxfp4_bf16_from`).
                 #[cfg(feature = "cuda")]
                 if let Some(copy) = self.mxfp4_bf16_bank(*bank)
@@ -1299,14 +1326,19 @@ impl Run<'_> {
                 routes,
                 weights,
                 y,
-            } => linear::moe::bias_sum(
-                self.ctx(),
-                self.tensor(*x),
-                self.tensor(*bias),
-                self.tensor(*routes),
-                self.tensor(*weights),
-                &mut self.tensor(*y),
-            ),
+            } => {
+                // An expert's bias row where the weight cache's table says.
+                let (bias, table) = self.expert_bank(*bias);
+                linear::moe::bias_sum(
+                    self.ctx(),
+                    self.tensor(*x),
+                    bias,
+                    self.tensor(*routes),
+                    self.tensor(*weights),
+                    &mut self.tensor(*y),
+                    table,
+                )
+            }
             Linear::LoraCorrect {
                 x,
                 bank_a,
@@ -1556,6 +1588,11 @@ impl Run<'_> {
                 if codes.dtype == Dtype::Nvfp4 || affine.is_some() || self.scales_in_atoms(bank) {
                     return None;
                 }
+                // A bank the weight cache streams is read through its table.
+                let table = self.bank_table(bank);
+                if !table.tabled() && crate::device::alloc::is_host_pointer(codes.ptr) {
+                    return None;
+                }
                 let bias = Some(self.tensor(bias));
                 (
                     x,
@@ -1566,7 +1603,7 @@ impl Run<'_> {
                         scales,
                         bias,
                     },
-                    ExpertTable::RESIDENT,
+                    table,
                 )
             }
             Linear::MoeSelect {
@@ -1582,9 +1619,10 @@ impl Run<'_> {
                 let (codes, scales, biases) = self.planes(bank);
                 // A bank the weight cache streams is read through its table,
                 // by the selects that take one whose every expert is seated.
+                // A streamed table too: `select_glu` keeps it off the TMA and
+                // tcgen05 kernels, and declines it where only they take it.
                 let table = self.bank_table(bank);
                 if self.scales_in_atoms(bank)
-                    || table.streams()
                     || (!table.tabled() && crate::device::alloc::is_host_pointer(codes.ptr))
                 {
                     return None;

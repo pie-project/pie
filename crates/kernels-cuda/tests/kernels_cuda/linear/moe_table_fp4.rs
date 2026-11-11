@@ -192,6 +192,8 @@ fn an_fp4_select_lands_the_same_bits_through_any_table() {
         // MXFP4 per route (and lean), grouped WMMA and fp32, a bias.
         (K::Mx, d, [8, 3, 4, 96, 1024], tk),
         (K::Mx, lean, [8, 3, 4, 96, 1024], f),
+        (K::MxBias, d, [8, 3, 4, 96, 1024], tk),
+        (K::MxBias, d, [32, 3, 4, 2880, 2880], tk),
         (K::MxBias, d, [8, 64, 4, 256, 256], tk),
         (K::MxBias, fp32, [8, 48, 4, 200, 160], tk),
         // The register-dequant MMA kernel: one 8-route block (K split),
