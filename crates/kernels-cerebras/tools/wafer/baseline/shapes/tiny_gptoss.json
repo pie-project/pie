@@ -1,8 +1,10 @@
 {
  "attn": {
+  "bias": true,
   "global_head_dim": null,
   "head_dim": 8,
   "kv_heads": 2,
+  "o_bias": true,
   "output_gate": false,
   "q_heads": 4,
   "qk_norm": false,
@@ -39,8 +41,11 @@
   ]
  },
  "moe": {
+  "expert_bias": true,
   "expert_intermediate": 32,
   "experts": 8,
+  "quantized": true,
+  "router_bias": true,
   "top_k": 4
  },
  "norm": {

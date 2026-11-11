@@ -42,6 +42,7 @@ impl Program {
     /// family kernels'.
     pub fn build(family: Box<dyn Family>, plan: Plan) -> Result<Program, String> {
         plan.validate()?;
+        family.runs(&plan.shape)?;
         let needs = Needs::of(&layers::of(&plan.shape));
         let blocks = compose::blocks(&plan, &needs, family.copies(&plan)?)?;
         Program::build_with(blocks, family, plan)

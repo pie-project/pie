@@ -17,9 +17,22 @@ fn op(op: &'static str, width: u32) -> Op {
     }
 }
 
-/// The residual add after a mixer or the MLP; a sandwich norm on the output first.
-fn residual(s: &Shape, width: u32) -> Phase {
+/// `op` reading the layer's params `names` (a layer's number written `*`).
+fn with(op: &'static str, width: u32, names: &[&str]) -> Op {
+    Op {
+        op,
+        width,
+        params: names.iter().map(|n| format!("layers.*.{n}")).collect(),
+    }
+}
+
+/// The residual add after a mixer or the MLP; the output's bias (`bias`), then a sandwich norm
+/// on it first.
+fn residual(s: &Shape, width: u32, bias: Option<&str>) -> Phase {
     let mut ops = Vec::new();
+    if let Some(b) = bias {
+        ops.push(with("elemwise.add_bias", width, &[b]));
+    }
     if s.norm.sandwich {
         ops.push(op("elemwise.rmsnorm", width));
     }
@@ -94,6 +107,32 @@ fn body(s: &Shape, l: usize) -> LayerBody {
         Some(m) => (m.expert_intermediate, Some((m.experts, m.top_k))),
         None => (s.mlp.width(l as u32), None),
     };
+    let a = &s.attn;
+    // the q / k / v projections' biases and head norms at the column roots
+    let mut qk = Vec::new();
+    if a.bias {
+        qk.push(with(
+            "elemwise.add_bias",
+            0,
+            &["q_bias", "k_bias", "v_bias"],
+        ));
+    }
+    if a.qk_norm && !matches!(s.layers[l], LayerKind::Gdn) {
+        qk.push(with("elemwise.rmsnorm", 0, &["q_norm"]));
+        qk.push(with("elemwise.rmsnorm", 0, &["k_norm"]));
+    }
+    let mixed = if a.sinks && !matches!(s.layers[l], LayerKind::Gdn) {
+        vec![op("attn.sink", 0)]
+    } else {
+        Vec::new()
+    };
+    let leg = |name: &str| {
+        let bias = format!("{name}_bias");
+        match s.moe {
+            Some(m) if m.expert_bias => with("linear.matmul", width, &[name, &bias]),
+            _ => op("linear.matmul", width),
+        }
+    };
     let mut phases = vec![
         norm.clone(),
         Phase::Matvec {
@@ -103,9 +142,17 @@ fn body(s: &Shape, l: usize) -> LayerBody {
             weights: vec![op("linear.matmul", 0)],
             experts: None,
         },
+    ];
+    if !qk.is_empty() {
+        phases.push(Phase::Root {
+            axis: Axis::Col,
+            ops: qk,
+        });
+    }
+    phases.extend([
         Phase::Mixer {
             mixer: mixer(s, l),
-            ops: Vec::new(),
+            ops: mixed,
         },
         Phase::Matvec {
             from: Axis::Col,
@@ -114,13 +161,21 @@ fn body(s: &Shape, l: usize) -> LayerBody {
             weights: vec![op("linear.matmul", h)],
             experts: None,
         },
-        residual(s, h),
+        residual(s, h, a.o_bias.then_some("o_bias")),
         norm,
+    ]);
+    if s.moe.is_some_and(|m| m.router_bias) {
+        phases.push(Phase::Root {
+            axis: Axis::Col,
+            ops: vec![with("elemwise.add_bias", 0, &["router_bias"])],
+        });
+    }
+    phases.extend([
         Phase::Matvec {
             from: Axis::Row,
             to: Axis::Col,
             input: h,
-            weights: vec![op("linear.matmul", width)],
+            weights: vec![leg("gate")],
             experts,
         },
         Phase::Root {
@@ -131,11 +186,11 @@ fn body(s: &Shape, l: usize) -> LayerBody {
             from: Axis::Col,
             to: Axis::Row,
             input: width,
-            weights: vec![op("linear.matmul", h)],
+            weights: vec![leg("down")],
             experts,
         },
-        residual(s, h),
-    ];
+        residual(s, h, None),
+    ]);
     if let Some(p) = s.ple {
         phases.push(Phase::SideIn {
             ops: vec![op("gather.embed", p.width)],

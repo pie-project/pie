@@ -8,9 +8,10 @@
 use poem_compiler::spatial::{BlockKind, SpatialGraph, SpatialTarget};
 use poem_ir::{
     Attn, Def, Elemwise, Gather, GluAct, Guard, Linear, NormAxis, NormWeight, Operation, RopeFreqs,
-    Ssm, Trace, Turn, ValueId,
+    RouteScore, Ssm, Trace, Turn, ValueId,
 };
 
+use super::compose::BiasOn;
 use super::family;
 use super::plan::{
     Act, AttnSpec, FamilyId, GdnSpec, HeadSpec, LayerKind, MlpSpec, MoeSpec, NormSpec, Plan,
@@ -37,6 +38,13 @@ struct Layer {
     plus_one: bool,
     gate: bool,
     sink: bool,
+    /// Biases: q / k / v, the output projection, the router, the experts' legs.
+    bias: bool,
+    o_bias: bool,
+    router_bias: bool,
+    expert_bias: bool,
+    /// The experts' banks quantized.
+    quantized: bool,
     rope: Option<RopeSpec>,
 }
 
@@ -160,7 +168,59 @@ pub fn shape(trace: &Trace) -> R<Shape> {
             layers.resize_with(l + 1, Layer::default);
         }
         let y = &mut layers[l];
+        let refuse = |what: String| format!("{}: layer {l}: {what}", trace.name);
         match &node.op {
+            Operation::Elemwise(Elemwise::AddBias { bias, .. }) => {
+                let name = match trace.values.get(bias.0 as usize).map(|d| &d.def) {
+                    Some(Def::Weight(p)) => trace.params[*p as usize].name.as_str(),
+                    _ => "",
+                };
+                match crate::compose::bias_on(name) {
+                    Some(BiasOn::Qkv) => y.bias = true,
+                    Some(BiasOn::O) => y.o_bias = true,
+                    Some(BiasOn::Router) => y.router_bias = true,
+                    None => {
+                        return Err(refuse(format!(
+                            "elemwise.add_bias of {name}: no kernel adds that bias"
+                        )));
+                    }
+                }
+            }
+            Operation::Linear(Linear::MoeSelect {
+                bias, quantized, ..
+            }) => {
+                y.expert_bias |= bias.is_some();
+                y.quantized |= *quantized;
+            }
+            Operation::Linear(Linear::MoeBiasSum { .. }) => y.expert_bias = true,
+            Operation::Linear(Linear::MoeCombine {
+                shared: Some(_), ..
+            }) => {
+                return Err(refuse(
+                    "linear.moe_combine with a shared expert: no kernel adds one".into(),
+                ));
+            }
+            Operation::Linear(Linear::MoeRoute {
+                ids,
+                table,
+                bias,
+                scale,
+                hint,
+                score,
+                ..
+            }) if !matches!(score, RouteScore::Softmax)
+                || ids.is_some()
+                || table.is_some()
+                || bias.is_some()
+                || scale.is_some()
+                || hint.is_some() =>
+            {
+                return Err(refuse(format!(
+                    "linear.moe_route scored {score:?} (a pick bias, gain, hint or table: {}): \
+                     the router kernel runs a softmax over the top k only",
+                    bias.is_some() || scale.is_some() || hint.is_some() || table.is_some()
+                )));
+            }
             Operation::Attn(Attn::KvAppend { cache, .. }) => y.owns = Some(*cache),
             Operation::Attn(Attn::Decode {
                 plan,
@@ -276,6 +336,9 @@ pub fn shape(trace: &Trace) -> R<Shape> {
         experts,
         top_k,
         expert_intermediate: intermediate,
+        router_bias: layers.iter().any(|y| y.router_bias),
+        expert_bias: layers.iter().any(|y| y.expert_bias),
+        quantized: layers.iter().any(|y| y.quantized),
     });
     let mut rope = layers
         .iter()
@@ -310,6 +373,8 @@ pub fn shape(trace: &Trace) -> R<Shape> {
             output_gate: layers.iter().any(|y| y.gate),
             qk_norm: layers.iter().any(|y| y.head_norm),
             sinks: layers.iter().any(|y| y.sink),
+            bias: layers.iter().any(|y| y.bias),
+            o_bias: layers.iter().any(|y| y.o_bias),
         },
         mlp: MlpSpec {
             intermediate,
@@ -531,6 +596,7 @@ pub struct Ask {
 impl Ask {
     fn target(&self, shape: Shape) -> R<Wafer> {
         Preset::default().set(&self.set)?;
+        family::of(family::serving(&shape)).runs(&shape)?;
         Ok(Wafer {
             shape,
             preset: self.preset.clone(),
@@ -766,15 +832,13 @@ mod tests {
         assert!((best.ms - ms).abs() < 1e-9, "{} vs {ms}", best.ms);
     }
 
-    /// A model no preset fits (Qwen3-30B-A3B mini: four layers, four KV heads, a 2,048 hidden)
-    /// is planned by the search, and its program builds.
+    /// A model whose layers the MoE kernels do not run (Qwen3-30B-A3B mini: q / k head norms,
+    /// no biases or sinks, 16-bit experts) is refused by name, not planned without them.
     #[test]
-    fn a_model_no_preset_fits_is_planned_by_the_search() {
+    fn a_model_the_kernels_do_not_run_is_refused_by_name() {
         let t = trace("qwen3-30b-a3b-mini-bf16-kv-bf16");
-        assert!(plans(&t, &Ask::preset("full")).is_err());
-        let p = plan(&t, &Ask::default()).unwrap();
-        assert!(p.preset.name.starts_with("search("), "{}", p.preset.name);
-        Program::of(p.plan).unwrap();
+        let e = plan(&t, &Ask::default()).unwrap_err();
+        assert!(e.contains("the MoE kernels run no"), "{e}");
     }
 
     /// The memory model, anchored on one measured program, predicts another of the same kernels'

@@ -11,8 +11,8 @@ use crate::compose::KernelCopies;
 use crate::family::{Family, MadeFor, Row, ceil_to, table};
 use crate::kernels::gptoss::{self, Dims};
 use crate::plan::{
-    Contract, FamilyId, HeadPartition, KvEntries, Partition, Plan, Preset, ReduceGroups, RowRun,
-    Segments, Shape,
+    Act, Contract, FamilyId, HeadPartition, KvEntries, Partition, Plan, Preset, ReduceGroups,
+    RowRun, Segments, Shape,
 };
 use crate::program::Program;
 use crate::tiles::spec::Spec;
@@ -84,6 +84,36 @@ impl Family for GptOss {
         }
         if !s.hidden.is_multiple_of(py) {
             return Err(format!("gpt-oss: {} hidden over {py} rows", s.hidden));
+        }
+        // the cut's and the kernels' divisibility: a column's kv dims rotated pairs, its expert
+        // dims an even share of each expert, every expert's router output on its own columns,
+        // the router's pick tree over blocks of 8 experts, MXFP4's two codes a word
+        let moe = s.moe.ok_or("gpt-oss: no experts")?;
+        let (hd, hc, inter) = (s.attn.head_dim, s.hidden / py, moe.expert_intermediate);
+        let dc = hd / swa;
+        if !hd.is_multiple_of(swa) || dc % 2 != 0 || !s.attn.q_heads.is_multiple_of(s.attn.kv_heads)
+        {
+            return Err(format!(
+                "gpt-oss: head dim {hd} over {swa} columns a KV head (rotated pairs a column)"
+            ));
+        }
+        if mx == 0 || !inter.is_multiple_of(mx) || !mx.is_multiple_of(moe.experts) {
+            return Err(format!(
+                "gpt-oss: {inter} expert dims over {mx} MoE columns ({} experts' router outputs)",
+                moe.experts
+            ));
+        }
+        if !moe.experts.is_multiple_of(8) || moe.top_k == 0 || moe.top_k > moe.experts {
+            return Err(format!(
+                "gpt-oss: top {} of {} experts (the pick tree takes blocks of 8)",
+                moe.top_k, moe.experts
+            ));
+        }
+        if moe.quantized && (hc % 2 != 0 || (inter / mx) % 2 != 0) {
+            return Err(format!(
+                "gpt-oss: MXFP4 experts pack two rows a word ({hc} dims a row, {} a column)",
+                inter / mx
+            ));
         }
         let ne = pr.need("NE")?;
         let partition = Partition {
@@ -170,5 +200,32 @@ impl Family for GptOss {
 
     fn symbols(&self) -> &'static [(&'static str, &'static str)] {
         gptoss::SYMBOLS
+    }
+
+    /// The attention and MoE halves run gpt-oss's layer only: q / k / v and output biases,
+    /// sinks, no q / k norms, a biased router, biased MXFP4 experts and the clamped SwiGLU.
+    fn runs(&self, s: &Shape) -> R<()> {
+        let a = &s.attn;
+        let moe = s.moe.ok_or("gpt-oss: no experts")?;
+        let unmet = [
+            (!a.bias, "attention without q / k / v biases"),
+            (!a.o_bias, "an output projection without its bias"),
+            (!a.sinks, "attention without sinks"),
+            (a.qk_norm, "q / k head norms"),
+            (!moe.router_bias, "a router without its bias"),
+            (!moe.expert_bias, "experts without their biases"),
+            (
+                !moe.quantized,
+                "16-bit experts (the kernels decode MXFP4's)",
+            ),
+            (
+                s.mlp.act != Act::SwigluOai,
+                "an expert activation other than the clamped SwiGLU",
+            ),
+        ];
+        match unmet.iter().find(|(on, _)| *on) {
+            Some((_, what)) => Err(format!("the MoE kernels run no {what}")),
+            None => Ok(()),
+        }
     }
 }

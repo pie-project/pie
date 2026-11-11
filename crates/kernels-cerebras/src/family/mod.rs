@@ -39,6 +39,24 @@ pub trait Family: Send + Sync {
     /// The cut of the model's params into the tiles the plan's bindings place, as data
     /// ([`super::tiles::spec`]); `shapes` gives a param's shape where the trace holds it.
     fn tiles(&self, plan: &Plan, shapes: &dyn Fn(&str) -> Option<Vec<u64>>) -> R<Spec>;
+
+    /// Refuses, by name, what `shape` needs that the family's kernels do not run (else the
+    /// program would run the model without it). By default: no projection biases, no sinks.
+    fn runs(&self, shape: &Shape) -> R<()> {
+        let a = &shape.attn;
+        let missing = [
+            (a.bias, "q / k / v projection biases"),
+            (a.o_bias, "an output projection bias"),
+            (a.sinks, "attention sinks"),
+        ];
+        match missing.iter().find(|(on, _)| *on) {
+            Some((_, what)) => Err(format!(
+                "the {} kernels run no {what}",
+                serving(shape).name()
+            )),
+            None => Ok(()),
+        }
+    }
 }
 
 /// A family by its id.

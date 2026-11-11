@@ -56,6 +56,44 @@ pub struct Needs {
     /// A norm on a mixer's or the MLP's output before its residual add (sandwich norms): the
     /// next input norm waits on its scalar.
     pub deferred_norm: bool,
+    /// Attention sinks: a per-head logit in every softmax's sum.
+    pub sinks: bool,
+    /// RMSNorms over each q / k head.
+    pub qk_norm: bool,
+    /// Biases on the q / k / v projections.
+    pub attn_bias: bool,
+    /// A bias on the output projection.
+    pub o_bias: bool,
+    /// A bias on the router's logits.
+    pub router_bias: bool,
+    /// Biases on the experts' legs.
+    pub expert_bias: bool,
+}
+
+/// What a bias (`elemwise.add_bias`) of the param named `name` is on, by the param's last name:
+/// the q / k / v projections, the output projection, the router; `None`: none the kernels know.
+#[must_use]
+pub fn bias_on(name: &str) -> Option<BiasOn> {
+    match name.rsplit('.').next().unwrap_or(name) {
+        "q_bias" | "k_bias" | "v_bias" | "qkv_bias" => Some(BiasOn::Qkv),
+        "o_bias" => Some(BiasOn::O),
+        "router_bias" => Some(BiasOn::Router),
+        _ => None,
+    }
+}
+
+/// The projections a bias is on ([`bias_on`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum BiasOn {
+    Qkv,
+    O,
+    Router,
+}
+
+/// Whether the param named `name` is a q / k head norm's weight, by its last name.
+#[must_use]
+pub fn head_norm(name: &str) -> bool {
+    matches!(name.rsplit('.').next().unwrap_or(name), "q_norm" | "k_norm")
 }
 
 impl Needs {
@@ -72,8 +110,9 @@ impl Needs {
                             shared_from,
                             ..
                         },
-                    ..
+                    ops,
                 } => {
+                    n.sinks |= ops.iter().any(|o| o.op == "attn.sink");
                     n.attention |= shared_from.is_none();
                     n.shared_cache |= shared_from.is_some();
                     n.sliding |= window.is_some();
@@ -84,9 +123,35 @@ impl Needs {
                 } => n.gdn = true,
                 Phase::SideIn { .. } => n.side_in = true,
                 Phase::Matvec {
-                    experts: Some(_), ..
-                } => n.experts = true,
+                    experts: Some(_),
+                    weights,
+                    ..
+                } => {
+                    n.experts = true;
+                    // a routed leg's bias rides in its select
+                    n.expert_bias |= weights
+                        .iter()
+                        .any(|w| w.params.iter().any(|p| p.ends_with("bias")));
+                }
                 Phase::Root { ops, .. } => {
+                    for o in ops {
+                        match o.op {
+                            "elemwise.add_bias" => {
+                                for b in o.params.iter().filter_map(|p| bias_on(p)) {
+                                    match b {
+                                        BiasOn::Qkv => n.attn_bias = true,
+                                        BiasOn::O => n.o_bias = true,
+                                        BiasOn::Router => n.router_bias = true,
+                                    }
+                                }
+                            }
+                            "elemwise.rmsnorm" => {
+                                n.qk_norm |= o.params.iter().any(|p| head_norm(p));
+                            }
+                            "linear.moe_bias_sum" => n.expert_bias = true,
+                            _ => {}
+                        }
+                    }
                     let at = |op: &str| ops.iter().position(|o| o.op == op);
                     if let (Some(norm), Some(add)) =
                         (at("elemwise.rmsnorm"), at("elemwise.residual_add"))

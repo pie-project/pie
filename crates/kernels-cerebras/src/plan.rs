@@ -96,6 +96,16 @@ pub struct AttnSpec {
     pub qk_norm: bool,
     /// gpt-oss's attention sinks.
     pub sinks: bool,
+    /// Biases on the q / k / v projections.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub bias: bool,
+    /// A bias on the output projection.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub o_bias: bool,
+}
+
+fn is_false(b: &bool) -> bool {
+    !*b
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -131,6 +141,15 @@ pub struct MoeSpec {
     pub experts: u32,
     pub top_k: u32,
     pub expert_intermediate: u32,
+    /// A bias on the router's logits.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub router_bias: bool,
+    /// Biases on the experts' gate / up and down legs.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub expert_bias: bool,
+    /// The experts' banks quantized (gpt-oss's MXFP4); else 16-bit.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub quantized: bool,
 }
 
 /// Qwen3.5's gated delta net: its key / value heads and their dims (`linear_*` of the config).

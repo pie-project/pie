@@ -41,6 +41,7 @@ pub struct Asked {
 /// The candidates `shape` searched to, fastest first (at most `keep`), each built.
 pub fn search(shape: &Shape, ask: &Asked, keep: usize) -> R<Vec<Scored>> {
     let fam = family::of(family::serving(shape));
+    fam.runs(shape)?;
     let sig = shape.signature();
     let mut seeds = fam.presets();
     seeds.sort_by_key(|p| p.made_for != Some(sig));
