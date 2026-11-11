@@ -7,8 +7,8 @@
 
 use poem_compiler::spatial::{BlockKind, SpatialGraph, SpatialTarget};
 use poem_ir::{
-    Attn, Def, Elemwise, Gather, GluAct, Linear, NormAxis, NormWeight, Operation, RopeFreqs, Ssm,
-    Trace, Turn, ValueId,
+    Attn, Builtin, Def, Elemwise, Fact, Gather, GluAct, Guard, Linear, NormAxis, NormWeight,
+    Operands, Operation, RopeFreqs, Ssm, Trace, Turn, ValueId,
 };
 
 use super::family;
@@ -38,6 +38,71 @@ struct Layer {
     gate: bool,
     sink: bool,
     rope: Option<RopeSpec>,
+}
+
+/// The ops a decoder layer's nodes that run on the wafer ([`runs`]) may be: the ones the
+/// families' kernels run (read below, or implied: a residual add, a split of a fused
+/// projection's outputs).
+const LAYER_OPS: &[&str] = &[
+    "attn.decode",
+    "attn.kv_append",
+    "attn.sink",
+    "elemwise.act",
+    "elemwise.add_bias",
+    "elemwise.gate_sigmoid_mul",
+    "elemwise.residual_add",
+    "elemwise.rmsnorm",
+    "elemwise.rmsnorm_gated",
+    "elemwise.rope",
+    "gather.embed",
+    "gather.select",
+    "gather.split_q_gate",
+    "gather.split_qkv",
+    "gather.split_rows",
+    "linear.glu",
+    "linear.matmul",
+    "linear.moe_bias_sum",
+    "linear.moe_combine",
+    "linear.moe_route",
+    "linear.moe_select",
+    "ssm.causal_conv1d",
+    "ssm.gated_delta",
+    "ssm.gdn_gates",
+];
+
+/// The ops outside the layers, from the token embedding on: the embedding, the per-layer inputs'
+/// projection, the final norm, the head and its softcap, the argmax, and the attention plan.
+const OUTER_OPS: &[&str] = &[
+    "attn.plan_decode",
+    "elemwise.act",
+    "elemwise.rmsnorm",
+    "elemwise.softcap",
+    "gather.embed",
+    "gather.rows",
+    "linear.matmul",
+    "sampling.argmax",
+];
+
+/// Whether a node guarded by `g` runs on the wafer: every request it serves is one token at a
+/// time (the token loop), with no mask, adapter, media, drafts or score capture. A fact it does
+/// not fix (a fresh state, a switch) may take either value.
+fn runs(trace: &Trace, g: &Guard) -> bool {
+    let (mut word, mut free) = (0u64, Vec::new());
+    for bit in g.referenced_bits() {
+        match trace.facts.table.get(usize::from(bit)) {
+            Some(Fact::Builtin(Builtin::SingleToken)) => word |= 1 << bit,
+            Some(Fact::Builtin(Builtin::Fresh) | Fact::Switch { .. }) => free.push(bit),
+            _ => {}
+        }
+    }
+    (0..1u64 << free.len()).any(|a| {
+        let w = free
+            .iter()
+            .enumerate()
+            .filter(|(i, _)| a & (1 << i) != 0)
+            .fold(word, |w, (_, b)| w | 1 << b);
+        g.holds(w)
+    })
 }
 
 /// The node that makes `v`, if an op does.
@@ -110,14 +175,43 @@ fn rope(theta: f32, head_dim: u32, turn: &Turn, freqs: Option<&RopeFreqs>) -> R<
 
 /// The model's [`Shape`], read off its trace: the layers (GDN, attention over the whole sequence
 /// or a window, or over another layer's KV) and their dims, the MLP and its experts, the per-layer
-/// inputs, the head, RoPE and the norms.
+/// inputs, the head, RoPE and the norms. A node that runs on the wafer and is no op of
+/// [`LAYER_OPS`] / [`OUTER_OPS`] is refused by name, not dropped.
 pub fn shape(trace: &Trace) -> R<Shape> {
     let analysis =
         poem_compiler::analysis::analyze(trace).map_err(|e| format!("{}: {e}", trace.name))?;
     let (mut vocab, mut table, mut hidden) = (0, None, 0);
     let (mut tied, mut softcap, mut eps, mut ple) = (false, None, None, None);
     let mut layers: Vec<Layer> = Vec::new();
+    // Nodes before the token embedding are an encoder's (a multimodal deployment's vision tower):
+    // the wafer runs the language model only.
+    let first_layer = analysis.layers.iter().position(Option::is_some);
+    let embed_at = trace
+        .nodes
+        .iter()
+        .enumerate()
+        .take(first_layer.unwrap_or(trace.nodes.len()))
+        .filter(|(_, n)| matches!(n.op, Operation::Gather(Gather::Embed { weights: None, .. })))
+        .map(|(at, _)| at)
+        .last();
     for (at, node) in trace.nodes.iter().enumerate() {
+        let name = node.op.name();
+        match analysis.layers[at] {
+            _ if !runs(trace, &node.guard) => {}
+            Some(l) if !LAYER_OPS.contains(&name) => {
+                return Err(format!(
+                    "{}: layer {l} node {at}: {name} has no spatial lowering",
+                    trace.name
+                ));
+            }
+            None if embed_at.is_some_and(|e| at >= e) && !OUTER_OPS.contains(&name) => {
+                return Err(format!(
+                    "{}: node {at}: {name} has no spatial lowering",
+                    trace.name
+                ));
+            }
+            _ => {}
+        }
         let Some(l) = analysis.layers[at] else {
             match &node.op {
                 // The token embedding: the last plain (unweighted) gather before the first layer.
@@ -526,6 +620,14 @@ mod tests {
             .parse(name)
             .unwrap_or_else(|| panic!("{name} parses"))
             .trace(poem_ir::Platform::Cerebras)
+    }
+
+    /// An op no kernel runs is refused by name, not dropped: DeepSeek V4's attention.
+    #[test]
+    fn an_op_without_a_lowering_is_refused_by_name() {
+        let e = shape(&trace("dsv4-flash-mini-bf16-kv-bf16")).err().unwrap();
+        assert!(e.contains("has no spatial lowering"), "{e}");
+        assert!(e.contains("elemwise.hc_expand"), "{e}");
     }
 
     /// A multimodal deployment (what `pie serve` identifies from a checkpoint with its vision
