@@ -10,6 +10,7 @@
 //! falls back to them) until their blocks join it.
 
 use poem_compiler::spatial::layer::{LayerProgram, Mixer, Phase};
+use poem_ir::GluAct;
 
 use crate::block::Block;
 use crate::block::gdn::Gdn;
@@ -18,13 +19,12 @@ use crate::block::segments::{Onorm, Scores};
 use crate::block::token_loop::TokenLoop;
 use crate::block::units::{UnitCopies, Units};
 use crate::floor::{UnitGrid, UnitLayout};
-use crate::plan::{Act, LayerKind, Plan, Shape};
+use crate::plan::Plan;
 use crate::weights::{From, Slice, Transform, from};
 
 type R<T> = Result<T, String>;
 
-/// What a model's layers ask the program to place, read off its layer program ([`Needs::of`])
-/// or, for a plan stated as a shape, off the shape ([`Needs::of_shape`]).
+/// What a model's layers ask the program to place, read off its layer program ([`Needs::of`]).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct Needs {
     /// Attention over a layer's own cache.
@@ -86,26 +86,6 @@ impl Needs {
         n
     }
 
-    /// The needs of a shape's layers (a plan stated as a shape has no layer program).
-    #[must_use]
-    pub fn of_shape(s: &Shape) -> Needs {
-        let any = |f: fn(&LayerKind) -> bool| s.layers.iter().any(f);
-        Needs {
-            attention: any(|k| matches!(k, LayerKind::Global | LayerKind::Sliding { .. })),
-            gdn: s.gdn.is_some() && any(|k| matches!(k, LayerKind::Gdn)),
-            sliding: any(|k| {
-                matches!(
-                    k,
-                    LayerKind::Sliding { .. } | LayerKind::SharedKv { sliding: true, .. }
-                )
-            }),
-            shared_cache: any(|k| matches!(k, LayerKind::SharedKv { .. })),
-            side_in: s.ple.is_some(),
-            experts: s.moe.is_some(),
-            deferred_norm: s.norm.sandwich,
-        }
-    }
-
     /// The first need the composer has no block for, if any.
     fn unplaced(&self) -> Option<&'static str> {
         [
@@ -120,7 +100,8 @@ impl Needs {
 }
 
 /// The role kernels' layer phases (weight, CX and CY's comptime `NRM`, `MIXK`, `ACT`, `PLE`, `KVS`),
-/// from what the layers need and the MLP's activation: one image a role over every layer program.
+/// from the layer program: what its layers need and its MLP's activation; one image a role over
+/// every layer program.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct Schedule {
     /// The input phases' norm: 0 direct, 1 deferred (sandwich norms), 2 scaled (attention / MoE
@@ -138,9 +119,14 @@ pub struct Schedule {
 }
 
 impl Schedule {
-    /// The phases of layers that need `needs`, their MLP's activation `act`.
+    /// The phases of `program`'s layers.
     #[must_use]
-    pub fn of(needs: &Needs, act: Act) -> Schedule {
+    pub fn of(program: &LayerProgram) -> Schedule {
+        let needs = &Needs::of(program);
+        let gelu = program
+            .bodies
+            .iter()
+            .any(|b| b.glu == Some(GluAct::GegluTanh));
         Schedule {
             nrm: if needs.experts {
                 2
@@ -152,7 +138,7 @@ impl Schedule {
             } else {
                 u32::from(needs.sliding || needs.shared_cache)
             },
-            act: u32::from(act == Act::GeluTanh),
+            act: u32::from(gelu),
             ple: u32::from(needs.side_in),
             kvs: u32::from(needs.shared_cache),
         }
@@ -310,30 +296,6 @@ mod tests {
         .unwrap()
     }
 
-    /// A shape's needs are its layer program's, for every shipping model and the Qwen3 MoE
-    /// miniature.
-    #[test]
-    fn a_shape_needs_what_its_layer_program_needs() {
-        for name in [
-            "qwen35-d9b-bf16-kv-bf16",
-            "qwen35-d0.8b-bf16-kv-bf16",
-            "qwen3-8b-bf16-kv-bf16",
-            "llama31-8b-bf16-kv-bf16",
-            "gemma4-e2b-bf16-kv-bf16",
-            "gemma4-e4b-bf16-kv-bf16",
-            "gemma4-12b-bf16-kv-bf16",
-            "gptoss-20b-bf16-mxfp4-kv-bf16",
-            "qwen3-30b-a3b-mini-bf16-kv-bf16",
-        ] {
-            let t = trace(name);
-            assert_eq!(
-                Needs::of(&program(&t)),
-                Needs::of_shape(&shape(&t).unwrap()),
-                "{name}"
-            );
-        }
-    }
-
     /// The role kernels' phases read off each shipping model's layer program: what its family's
     /// kernels were built with.
     #[test]
@@ -346,7 +308,7 @@ mod tests {
             ("gptoss-20b-bf16-mxfp4-kv-bf16", 2, 2, 0, 0, 0),
         ] {
             let t = trace(name);
-            let sc = Schedule::of(&Needs::of(&program(&t)), shape(&t).unwrap().mlp.act);
+            let sc = Schedule::of(&program(&t));
             assert_eq!(
                 sc,
                 Schedule {
@@ -407,12 +369,15 @@ mod tests {
                 "{}/tools/wafer/baseline/shapes/{file}.json",
                 env!("CARGO_MANIFEST_DIR")
             );
-            let s: Shape = serde_json::from_str(&std::fs::read_to_string(path).unwrap()).unwrap();
+            let s: crate::plan::Shape =
+                serde_json::from_str(&std::fs::read_to_string(path).unwrap()).unwrap();
             let p = plan_shape(s, &Ask::preset(preset)).unwrap().plan;
             let fam =
                 Program::build_with(dense.blocks(&p).unwrap(), family::of(p.family), p.clone())
                     .unwrap();
-            let blocks = blocks(&p, &Needs::of_shape(&p.shape)).unwrap().unwrap();
+            let blocks = blocks(&p, &Needs::of(&crate::layers::of(&p.shape)))
+                .unwrap()
+                .unwrap();
             let comp = Program::build_with(blocks, family::of(p.family), p).unwrap();
             assert_eq!(made(&fam), made(&comp), "{file}");
         }

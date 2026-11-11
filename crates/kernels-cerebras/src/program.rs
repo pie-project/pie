@@ -8,6 +8,7 @@ use super::compose::{self, Needs, Schedule};
 use super::fabric::{Fabric, Palette};
 use super::family::{self, Family};
 use super::floor::{Floor, FloorBuilder};
+use super::layers;
 use super::plan::Plan;
 use super::toolchain::{Arch, memcpy_fabric};
 use super::weights::{Binding, Copies};
@@ -41,7 +42,7 @@ impl Program {
     /// where the composer has none for a need yet.
     pub fn build(family: Box<dyn Family>, plan: Plan) -> Result<Program, String> {
         plan.validate()?;
-        let blocks = match compose::blocks(&plan, &Needs::of_shape(&plan.shape))? {
+        let blocks = match compose::blocks(&plan, &Needs::of(&layers::of(&plan.shape)))? {
             Some(b) => b,
             None => family.blocks(&plan)?,
         };
@@ -79,7 +80,7 @@ impl Program {
         let palette = Palette::of(blocks.iter().flat_map(|b| b.colours()));
         let fabric = Fabric::lay(&floor, &wiring, &palette)?;
         fabric.validate(&floor)?;
-        let schedule = Schedule::of(&Needs::of_shape(&plan.shape), plan.shape.mlp.act);
+        let schedule = Schedule::of(&layers::of(&plan.shape));
         let mut prog = Program {
             plan,
             blocks,

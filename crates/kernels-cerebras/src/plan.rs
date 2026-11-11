@@ -86,6 +86,10 @@ pub struct AttnSpec {
     /// `head_dim` (Gemma 4: twice it).
     #[serde(default)]
     pub global_head_dim: Option<u32>,
+    /// The global layers' KV heads where they differ from the sliding layers' `kv_heads`
+    /// (Gemma 4 12B: one).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub global_kv_heads: Option<u32>,
     /// Qwen3.5's sigmoid output gate.
     pub output_gate: bool,
     /// RMSNorm over each q / k head before RoPE.

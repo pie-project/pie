@@ -266,6 +266,10 @@ pub fn shape(trace: &Trace) -> R<Shape> {
         .and(attention(false))
         .map(|(_, _, hd)| hd)
         .filter(|&hd| hd != head_dim);
+    let global_kv_heads = attention(true)
+        .and(attention(false))
+        .map(|(_, kv, _)| kv)
+        .filter(|&kv| kv != kv_heads);
     let first = &layers[0];
     let (intermediate, glu) = first.glu.ok_or("wafer: layer 0 has no MLP")?;
     let moe = first.moe.map(|(experts, top_k)| MoeSpec {
@@ -302,6 +306,7 @@ pub fn shape(trace: &Trace) -> R<Shape> {
             kv_heads,
             head_dim,
             global_head_dim,
+            global_kv_heads,
             output_gate: layers.iter().any(|y| y.gate),
             qk_norm: layers.iter().any(|y| y.head_norm),
             sinks: layers.iter().any(|y| y.sink),

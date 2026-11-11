@@ -19,8 +19,8 @@
 use std::collections::{HashMap, HashSet};
 
 use poem_ir::{
-    Attn, Builtin, Def, Dim, Fact, Gather, Guard, Linear, Operands, Operation, Ssm, Trace, Ty,
-    ValueId,
+    Attn, Builtin, Def, Dim, Fact, Gather, GluAct, Guard, Linear, Operands, Operation, Ssm, Trace,
+    Ty, ValueId,
 };
 use serde::Serialize;
 
@@ -116,6 +116,8 @@ pub enum Phase {
 #[derive(Clone, Debug, PartialEq, Serialize)]
 pub struct LayerBody {
     pub phases: Vec<Phase>,
+    /// The gate's activation of the layer's gated MLP (its experts' where they are routed).
+    pub glu: Option<GluAct>,
 }
 
 impl LayerBody {
@@ -316,6 +318,7 @@ struct Body<'r, 't> {
     cast: HashSet<ValueId>,
     /// The input of the last phase where it is a matvec (a matvec of the same input joins it).
     matvec_of: Option<ValueId>,
+    glu: Option<GluAct>,
 }
 
 impl Body<'_, '_> {
@@ -632,11 +635,12 @@ impl Body<'_, '_> {
             {
                 self.elementwise(op, &acts, &outs)
             }
+            Operation::Linear(Linear::Glu { act, .. }) => {
+                self.glu = Some(*act);
+                self.elementwise(op, &acts, &outs)
+            }
             Operation::Linear(
-                Linear::Glu { .. }
-                | Linear::MoeRoute { .. }
-                | Linear::MoeCombine { .. }
-                | Linear::MoeBiasSum { .. },
+                Linear::MoeRoute { .. } | Linear::MoeCombine { .. } | Linear::MoeBiasSum { .. },
             ) => self.elementwise(op, &acts, &outs),
             _ => Err(format!("{name} has no spatial lowering")),
         }
@@ -658,6 +662,7 @@ impl Body<'_, '_> {
         }
         Ok(LayerBody {
             phases: self.phases,
+            glu: self.glu,
         })
     }
 }
@@ -727,6 +732,7 @@ pub fn lower(
             made: HashMap::new(),
             cast: HashSet::new(),
             matvec_of: None,
+            glu: None,
         })
         .collect();
     let (mut prologue, mut epilogue, mut head) = (Vec::new(), Vec::new(), None);

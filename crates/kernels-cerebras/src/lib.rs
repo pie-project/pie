@@ -24,6 +24,7 @@ pub mod fabric;
 pub mod family;
 pub mod floor;
 pub mod kernels;
+pub mod layers;
 pub mod npy;
 pub mod plan;
 pub mod program;
