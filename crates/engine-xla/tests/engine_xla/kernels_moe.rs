@@ -1068,11 +1068,14 @@ fn the_grouped_matmul_kernel_answers_the_host() {
 /// to bf16 rounding (it weighs each row before the down leg, not after).
 #[test]
 fn the_routed_mlp_on_one_sort_answers_its_parts() {
-    let (e, h, i) = (8usize, 256usize, 128usize);
-    for (t, tk, glu) in [
-        (40usize, 4usize, moe::ExpertGlu::Swiglu),
-        (9, 2, moe::ExpertGlu::GegluTanh),
-        (1100, 4, moe::ExpertGlu::Swiglu),
+    let (e, h) = (8usize, 256usize);
+    for (t, tk, glu, i) in [
+        (40usize, 4usize, moe::ExpertGlu::Swiglu, 128usize),
+        (9, 2, moe::ExpertGlu::GegluTanh, 128),
+        (1100, 4, moe::ExpertGlu::Swiglu, 128),
+        // Halves of whole bf16 row tiles but not lane tiles (Gemma-4-26B-A4B's
+        // 704 in small), at a prompt's 128-row tiles.
+        (1100, 4, moe::ExpertGlu::GegluTanh, 176),
     ] {
         let x = data(t * h, 61);
         let wu: Vec<f32> = data(e * 2 * i * h, 62)
