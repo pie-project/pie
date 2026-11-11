@@ -194,7 +194,7 @@ impl Pool {
 
     /// The physical chunk logical chunk `logical` sits on.
     pub fn physical(&self, logical: u32) -> Result<u32> {
-        self.table.physical(logical).ok_or(Fault::Ceiling {
+        self.table.physical(logical).ok_or_else(|| Fault::Ceiling {
             what: "chunks of the state pool",
             need: u64::from(logical) + 1,
             have: u64::from(self.total_chunks),

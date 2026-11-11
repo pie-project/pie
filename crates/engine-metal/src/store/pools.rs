@@ -536,6 +536,9 @@ fn rs_rows(recipe: &ChunkRecipe, layout: &crate::rs::Layout) -> Result<RsRows> {
     })
 }
 
+/// File fills with no host address: `(to, bytes)` for the pool to write.
+type Unhosted = (u64, Vec<u8>);
+
 #[derive(Debug)]
 pub struct Pools {
     paging: Paging,
@@ -1785,57 +1788,124 @@ impl Pools {
         self.weight_caches = caches;
         taken?;
         // Slots filled from the serving file, on the host: no frame reads
-        // them (the caller drained every frame). Fills that follow one
-        // another in the file are read in one run, and a slot is written
-        // through its chunk's host address where the chunk has one.
+        // them (the caller drained every frame).
+        self.fill_from_files(&fills)
+    }
+
+    /// Writes `fills` into the pool on the host. The file is read a window
+    /// of up to 64 MiB at a time (a run's entries follow one another in the
+    /// file, and so do a plane's runs); each entry is written through its
+    /// chunk's host address where the chunk has one, else afterwards
+    /// through the pool. The planes are spread over threads: their entries
+    /// are small (a row block of one table) and land in disjoint bytes.
+    /// No frame in flight reads the pool.
+    fn fill_from_files(&mut self, fills: &[super::streamed::FileFills]) -> Result<()> {
         const RUN: u64 = 64 << 20;
+        if fills.is_empty() {
+            return Ok(());
+        }
         let chunk_bytes = self.layout.chunk_bytes;
-        let mut bytes = Vec::new();
-        let mut hosts: std::collections::HashMap<u32, Option<std::ptr::NonNull<u8>>> =
-            std::collections::HashMap::new();
-        for group in &fills {
-            let list = &group.fills;
-            let mut at = 0;
-            while at < list.len() {
-                let first = list[at].0;
-                let mut end = at + 1;
-                let mut last = first + list[at].2;
-                while end < list.len() && list[end].0 == last && last + list[end].2 - first <= RUN {
-                    last += list[end].2;
-                    end += 1;
-                }
-                group.read(first, last - first, &mut bytes)?;
-                for &(from, to, len) in &list[at..end] {
-                    let start = usize::try_from(from - first).unwrap_or(usize::MAX);
-                    let len = usize::try_from(len).unwrap_or(usize::MAX);
-                    let piece = &bytes[start..start + len];
-                    let physical = u32::try_from(to / chunk_bytes).unwrap_or(u32::MAX);
-                    let within = usize::try_from(to % chunk_bytes).unwrap_or(usize::MAX);
-                    // A chunk that spans two of the sparse pool's heaps has
-                    // no one host address: written a slot at a time.
-                    let base = *hosts
-                        .entry(physical)
-                        .or_insert_with(|| self.pool.chunk_host(physical).ok());
-                    match base {
-                        Some(base) if within + len <= usize::try_from(chunk_bytes).unwrap_or(0) => {
-                            // SAFETY: `within + len` bytes inside the chunk
-                            // the address names, committed (`chunk_host`
-                            // admits it), which no frame in flight reads
-                            // (the caller drained them); the source is this
-                            // function's own buffer.
-                            #[allow(unsafe_code)]
-                            unsafe {
-                                std::ptr::copy_nonoverlapping(
-                                    piece.as_ptr(),
-                                    base.as_ptr().add(within),
-                                    len,
-                                );
-                            }
-                        }
-                        _ => self.pool.write(to, piece)?,
+        let chunk_len = usize::try_from(chunk_bytes).unwrap_or(0);
+        // Every touched chunk's host address (as an integer, to cross
+        // threads), or none where the chunk spans two of the sparse pool's
+        // heaps.
+        let mut bases: Vec<Option<Option<usize>>> = vec![None; self.layout.total_chunks as usize];
+        for group in fills {
+            for run in &group.runs {
+                for to in [run.to, run.to + (run.count - 1) * run.stride] {
+                    let physical = usize::try_from(to / chunk_bytes).unwrap_or(usize::MAX);
+                    if let Some(seen) = bases.get_mut(physical)
+                        && seen.is_none()
+                    {
+                        *seen = Some(
+                            self.pool
+                                .chunk_host(u32::try_from(physical).unwrap_or(u32::MAX))
+                                .ok()
+                                .map(|base| base.as_ptr() as usize),
+                        );
                     }
                 }
-                at = end;
+            }
+        }
+        let bases = &bases;
+        // One group's entries; those with no host address come back as
+        // `(to, bytes)` for the pool to write.
+        let fill =
+            |group: &super::streamed::FileFills, bytes: &mut Vec<u8>| -> Result<Vec<Unhosted>> {
+                let mut left = Vec::new();
+                let (mut window, mut held) = (0u64, 0u64);
+                for (at, run) in group.runs.iter().enumerate() {
+                    let len = usize::try_from(run.len).unwrap_or(usize::MAX);
+                    for entry in 0..run.count {
+                        let from = run.from + entry * run.len;
+                        let to = run.to + entry * run.stride;
+                        if from < window || from + run.len > window + held {
+                            // The window: from here through the runs that
+                            // follow on in the file, at most `RUN` (or this
+                            // run's rest, if longer).
+                            let mut end = run.from + run.bytes();
+                            for next in &group.runs[at + 1..] {
+                                if next.from != end || end + next.bytes() - from > RUN {
+                                    break;
+                                }
+                                end += next.bytes();
+                            }
+                            group.read(from, end - from, bytes)?;
+                            (window, held) = (from, end - from);
+                        }
+                        let start = usize::try_from(from - window).unwrap_or(usize::MAX);
+                        let piece = &bytes[start..start + len];
+                        let within = usize::try_from(to % chunk_bytes).unwrap_or(usize::MAX);
+                        let physical = usize::try_from(to / chunk_bytes).unwrap_or(usize::MAX);
+                        match bases.get(physical).copied().flatten().flatten() {
+                            Some(base) if within + len <= chunk_len => {
+                                // SAFETY: `within + len` bytes inside the chunk
+                                // the address names, committed (`chunk_host`
+                                // admitted it), which no frame in flight reads;
+                                // each entry's bytes are its own (no other
+                                // entry of any group writes them).
+                                #[allow(unsafe_code)]
+                                unsafe {
+                                    std::ptr::copy_nonoverlapping(
+                                        piece.as_ptr(),
+                                        (base as *mut u8).add(within),
+                                        len,
+                                    );
+                                }
+                            }
+                            _ => left.push((to, piece.to_vec())),
+                        }
+                    }
+                }
+                Ok(left)
+            };
+        let threads = std::thread::available_parallelism()
+            .map_or(1, std::num::NonZeroUsize::get)
+            .clamp(1, 8)
+            .min(fills.len());
+        let per = fills.len().div_ceil(threads);
+        let left: Vec<Result<Vec<Unhosted>>> = std::thread::scope(|scope| {
+            let workers: Vec<_> = fills
+                .chunks(per)
+                .map(|part| {
+                    scope.spawn(move || -> Result<Vec<Unhosted>> {
+                        let mut left = Vec::new();
+                        let mut bytes = Vec::new();
+                        for group in part {
+                            left.extend(fill(group, &mut bytes)?);
+                        }
+                        Ok(left)
+                    })
+                })
+                .collect();
+            workers
+                .into_iter()
+                .map(|worker| worker.join().expect("a fill thread does not panic"))
+                .collect()
+        });
+        for part in left {
+            for (to, piece) in part? {
+                self.pool.write(to, &piece)?;
             }
         }
         Ok(())
