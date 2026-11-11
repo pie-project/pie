@@ -1241,3 +1241,18 @@ The `new-memory/` directory is bookkeeping and is removed before anything lands 
   reads over 8 threads, slot positions computed once (1440 -> 590 ms). gemma-4-e4b (M1 Max) vs main: boot 1.95 s vs
   3.27, p512 +1.8%, p2048 +0.3%, c1 -2.4% (open: +0.38 ms GPU per fire; suspect per-buffer hazard tracking on the
   single pool buffer). Greedy tokens unchanged; weight-cache engine tests pass on the Mac.
+
+### M102 — 2026-11-11: XLA speed pass, Vulkan/wgpu pass 2, Metal token table in place
+- `sc/xla-tier` (67e146592, TPU): pooled kv append builds u32 rows, sink pages from a zeroed VMEM block, prefill's
+  older pages by XLA gather, narrow decodes without kernel calls, block gather only up to 512 KiB. vs main:
+  qwen3-0.6b c8 +57%, c64 +7.7%, p512 +21%, p2048 -1.8% (was -5.5%); MoE c1 +1.3% (was -3%), c256 -3.8%;
+  qwen35-d0.8b p2048 +7.4%, c64 -4.1% (both c256 / c64 gaps present at the tip). Bitwise gate passes.
+- `sc/vk6` (82b3a35ff): desktop GPUs submit steps whole (c64 / prefill record; Adreno keeps split 32); a view in a
+  slab past 4 GiB binds the range when its tensor fits (30B first fire); threaded PLE fill (gemma boot 7.2 s vs main
+  9.0); one VkInstance per process (driver refuses the 27th: trimmed-window test fixed); WGSL rows find their segment
+  once. Vulkan 16/16 + wgpu 14/14 dumps bitwise. vs main: Qwen3-0.6B c64 862 vs 785; gemma c64 >= main; open:
+  Vulkan p2048 -1.8%, Qwen3.5 wgpu c1 (noisy, GPU time per fire at parity).
+- `sc/metal-gate` (e43834384): a held token-id table reads in place from the mapped weights (gemma boot 1.07 s vs
+  main 3.42); hazard tracking ruled out for gemma c1 -2.1% (bisect next). Greedy tokens unchanged.
+- Held back: sc/rocm-fit and sc/e2b-fix wait for L40S's fix of the M93 combined fit (Qwen3-8B on L40S: 7196 pages
+  vs pool-fit 9275 / main 9216, c64 -19%).
