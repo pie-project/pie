@@ -20,8 +20,8 @@
 //! ```
 //!
 //! No container, PRoot or environment variables are needed after that.
-//! [`Sdk::open`] looks for the libraries in the `sdk_lib` switch, then
-//! `/cbcore/lib`, and prepends the sibling `bin/` directory to `PATH` because
+//! [`Sdk::open_at`] loads the libraries from a directory (the toolchain
+//! config's `sdk_lib`, by default `/cbcore/lib`) and prepends the sibling `bin/` directory to `PATH` because
 //! the runtime shells out to helpers such as `cself_default`.
 //!
 //! # What is and is not covered
@@ -50,10 +50,18 @@
 #![allow(unsafe_code)]
 
 pub(crate) mod abi;
-pub mod cslc;
 pub mod sys;
 
-pub use cslc::{Arch, Compile, Cslc};
+pub use kernels_cerebras::spatial::toolchain::Arch;
+
+impl From<Target> for Arch {
+    fn from(t: Target) -> Self {
+        match t {
+            Target::Wse2 => Arch::Wse2,
+            Target::Wse3 => Arch::Wse3,
+        }
+    }
+}
 
 use abi::{
     ArtifactsMem, CxxString, CxxVecU32, MemcpyOptions, RuntimeMem, SimPlatform, SystemPlatformMem,
@@ -134,11 +142,9 @@ pub struct Sdk {
 }
 
 impl Sdk {
-    /// Default library directory: the `sdk_lib` switch, or `/cbcore/lib`.
+    /// Default library directory: the SDK image's `/cbcore/lib`.
     pub fn default_lib_dir() -> PathBuf {
-        crate::switches::get("sdk_lib")
-            .map(PathBuf::from)
-            .unwrap_or_else(|| PathBuf::from("/cbcore/lib"))
+        kernels_cerebras::spatial::toolchain::Toolchain::default().sdk_lib()
     }
 
     pub fn open() -> Result<Arc<Self>> {
@@ -671,6 +677,52 @@ impl Runtime {
         };
         self.finish(&mut task);
         IoStats::add(&mut self.io.h2d, t0, data.len());
+        Ok(())
+    }
+
+    /// [`Runtime::memcpy_h2d_rowbcast`] without waiting: queued ahead of
+    /// later calls, `data` kept until [`Runtime::wait_pending`].
+    pub fn memcpy_h2d_rowbcast_nonblock(
+        &mut self,
+        symbol: &str,
+        data: Vec<u32>,
+        rect: Rect,
+        elems_per_pe: usize,
+        data_type: DataType,
+    ) -> Result<()> {
+        let id = self.rpc.id(symbol, RpcKind::Var)?;
+        let expected = (rect.h.max(0) as usize) * elems_per_pe;
+        if data.len() != expected {
+            return Err(Error::Size {
+                symbol: symbol.into(),
+                expected,
+                actual: data.len(),
+            });
+        }
+        let rowbcast = self.api().memcpy_h2d_rowbcast.ok_or_else(|| {
+            Error::MissingSymbol(
+                "cerebras::SdkRuntime::memcpy_h2d_rowbcast".into(),
+                "this SDK has no row-broadcast copy (the batched builds' tables need it)".into(),
+            )
+        })?;
+        let opts = MemcpyOptions::new(false, data_type as i32, Order::RowMajor as i32, true);
+        let mut task = Task::empty();
+        // SAFETY: data moves into `pending` and lives until the task is waited on.
+        unsafe {
+            (rowbcast)(
+                &mut task,
+                self.this(),
+                id,
+                data.as_ptr() as *mut c_void,
+                rect.x,
+                rect.y,
+                rect.w,
+                rect.h,
+                elems_per_pe as i32,
+                &opts,
+            )
+        };
+        self.pending.push((task, data));
         Ok(())
     }
 
