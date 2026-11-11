@@ -125,9 +125,17 @@ fn heads_kernel(
         return Ok(None);
     }
     let heads = width / axis;
-    // Two buffers of the rows in and out: 8 bytes a cell of a block.
-    let r = if width > 8192 { KERNEL_ROWS / 2 } else { KERNEL_ROWS };
-    let nb = (rows + r - 1) / r;
+    // Two buffers of the rows in and out: 8 bytes a cell of a block; whole
+    // blocks only (`rope::whole_rows`).
+    let most = if width > 8192 {
+        KERNEL_ROWS / 2
+    } else {
+        KERNEL_ROWS
+    };
+    let Some(r) = super::rope::whole_rows(rows, most) else {
+        return Ok(None);
+    };
+    let nb = rows / r;
     let rowed = |w: i64| Block {
         array: vec![rows, w],
         elem: Elem::Bf16,

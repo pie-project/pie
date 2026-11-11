@@ -233,8 +233,12 @@ fn full_rope_turns_halves_and_interleaved_pairs() {
 /// halves in one kernel, 128- and 256-wide heads alike.
 #[test]
 fn a_prompt_tall_rope_turns_by_halves_in_one_kernel() {
-    for (qh, kvh, hd) in [(16usize, 8usize, 128usize), (8, 1, 256)] {
-        let rows = 600usize;
+    // 640 rows: five blocks of 128; 272 (a shared tail's readouts): of 16.
+    for (qh, kvh, hd, rows) in [
+        (16usize, 8usize, 128usize, 640usize),
+        (8, 1, 256, 640),
+        (8, 1, 256, 272),
+    ] {
         let theta = 1e6f32;
         let qs = data(rows * qh * hd, 5);
         let ks = data(rows * kvh * hd, 6);
@@ -284,7 +288,7 @@ fn a_prompt_tall_rope_turns_by_halves_in_one_kernel() {
 fn a_prompt_tall_partial_rope_turns_in_one_kernel() {
     // gemma-4's global layers: 512-wide heads, the first 64 lanes turned
     // with the ones half a head on, the rest passed through.
-    let (rows, hd, rot, span, theta) = (600usize, 512usize, 128usize, 256usize, 1e6f32);
+    let (rows, hd, rot, span, theta) = (640usize, 512usize, 128usize, 256usize, 1e6f32);
     let (qh, kh) = (4usize, 1usize);
     let qs = data(rows * qh * hd, 7);
     let ks = data(rows * kh * hd, 8);
