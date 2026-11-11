@@ -122,6 +122,10 @@ pub struct Shell {
     arming: bool,
     golden_arm: Golden,
     armed_body: Option<record::BodyKey>,
+    /// The lattice waits for the starting weight residency: the load
+    /// streams its weights, and bodies armed over the host copy would read
+    /// every expert over the bus (`Staged::finish`).
+    arm_deferred: bool,
     segments: std::collections::HashMap<record::BodyKey, Segmented>,
     windows_memo: Vec<prepare::WindowsMemo>,
     cache: GraphCache,

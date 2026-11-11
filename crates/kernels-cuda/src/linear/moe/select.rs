@@ -134,18 +134,20 @@ pub fn matmul_select(
         // Blackwell's, cuBLAS is not graph-capturable); the per-route GEMV
         // re-reads each expert once a route. The grouped mma.sync kernel reads
         // it once a slice.
+        // Its staging is cp.async through the expert table, which reads a
+        // streamed bank's mapped host entries as any global address: a
+        // streamed prefill reads each expert once a slice, not once a route.
         if bf16_mma_spans(ctx, fan.route_count)
             && fan.route_count > fan.top_k.unsigned_abs()
             && x.dtype == Dtype::Bf16
             && bank.dtype == Dtype::Bf16
-            && !experts.streams()
             && x.width.is_multiple_of(64)
             && y.width.is_multiple_of(8)
             && bank.rows >= 1
             && u64::from(bank.width) == u64::from(x.width) * u64::from(y.width)
         {
             // On Hopper, wgmma over the same staging (sm_90a).
-            if hopper_wgmma() && y.width.is_multiple_of(128) {
+            if hopper_wgmma() && y.width.is_multiple_of(128) && !experts.streams() {
                 return select_bf16_wgmma(ctx, OP, x, bank, routes, y, &fan, bank.rows, experts);
             }
             return select_bf16_mma(ctx, OP, x, bank, routes, y, &fan, bank.rows, experts);
