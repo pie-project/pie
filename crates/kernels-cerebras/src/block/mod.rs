@@ -1,9 +1,9 @@
 //! Blocks: the unit a wafer program is composed of. A block is one part of the model's
 //! dataflow as it sits on the wafer (the units and their chains, a segment kind, the head, the
 //! token loop, a storage column ...): it places its PEs, lays its links, declares the colours of
-//! the classes it owns, states per-PE param differences and copies its data. A family is a list
-//! of blocks ([`super::family::Family::blocks`]); [`super::program::Program::build`] runs each
-//! step over the list in order.
+//! the classes it owns, states per-PE param differences and copies its data. A program is a list
+//! of blocks, the ones its layers need ([`super::compose::blocks`]);
+//! [`super::program::Program::build`] runs each step over the list in order.
 //!
 //! A block owns its vocabulary: the [`Class`]es, [`super::wiring::Slot`]s and
 //! [`super::wiring::NoteKey`]s it lays are consts in its module, and the kernels' rcfg writers

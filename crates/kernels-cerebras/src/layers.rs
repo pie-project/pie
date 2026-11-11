@@ -1,7 +1,7 @@
 //! The plan's layer program: what the composer and the schedule read. A program is a function of
 //! its plan (the plan is what `plan.json` records and what a build's key digests), so the layer
 //! program the build reads is stated from the plan's [`Shape`] in the layer program's own terms
-//! ([`of`]); the shape is read off the trace, and [`tests`] pin what this states to what the
+//! ([`of`]); the shape is read off the trace, and the tests pin what this states to what the
 //! trace's lowering ([`poem_compiler::spatial::layer::lower`]) reads, for every shipping model.
 
 use poem_compiler::spatial::layer::{Axis, Head, LayerBody, LayerProgram, Mixer, Op, Phase};

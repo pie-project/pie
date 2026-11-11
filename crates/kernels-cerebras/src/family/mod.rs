@@ -1,11 +1,10 @@
-//! Program families: what a model's program is made of. A family turns the model's shape and a
-//! preset of its own into the plan, lists the blocks the plan composes, and builds each kind's
-//! kernel from the plan. Everything else (the floor, the wiring, the fabric, the emitters, the
+//! Program families: the kernels a model's program runs. A family turns the model's shape and a
+//! preset of its own into the plan, states what its kernels read off each block the composer
+//! places ([`super::compose`]), and builds each kind's kernel from the plan. Everything else (the floor, the wiring, the fabric, the emitters, the
 //! placer, the host) is generic over the blocks. Which family serves a model follows from what
 //! its shape needs ([`serving`]), never from its name.
 
 use super::abi::Kernels;
-use super::block::Block;
 use super::compose::KernelCopies;
 use super::plan::{FamilyId, LayerKind, Plan, Preset, Shape};
 use super::program::Program;
@@ -26,10 +25,6 @@ pub trait Family: Send + Sync {
     /// The plan of `shape` under `preset`: the partition and contract the preset's choices make
     /// for the model. Nothing physical is decided here.
     fn plan(&self, shape: &Shape, preset: &Preset) -> R<Plan>;
-
-    /// The blocks the plan composes, in order: the units first, then what is placed against
-    /// them. Floor, wiring, palette, overrides and copies run over them in this order.
-    fn blocks(&self, plan: &Plan) -> R<Vec<Box<dyn Block>>>;
 
     /// What the family's kernels read off the PEs of each block kind the composer places.
     fn copies(&self, plan: &Plan) -> R<KernelCopies>;

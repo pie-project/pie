@@ -4,15 +4,10 @@
 //! there are GDN layers, the head east of the units, the token loop. Kernels: [`dense`].
 
 use crate::abi::Kernels;
-use crate::block::Block;
-use crate::block::gdn::Gdn;
-use crate::block::head::{HeadCopies, HeadEast, Hemb};
-use crate::block::segments::{Onorm, Scores};
-use crate::block::token_loop::TokenLoop;
-use crate::block::units::{UnitCopies, Units};
+use crate::block::head::{HeadCopies, Hemb};
+use crate::block::units::UnitCopies;
 use crate::compose::{KernelCopies, snake_gap};
 use crate::family::{Family, MadeFor, Row, table, units_of};
-use crate::floor::{UnitGrid, UnitLayout};
 use crate::kernels::dense;
 use crate::plan::{
     Contract, FamilyId, HeadPartition, KvEntries, LayerKind, Partition, Plan, Preset, ReduceGroups,
@@ -256,107 +251,6 @@ impl Family for Dense {
             }),
             ..Default::default()
         })
-    }
-
-    fn blocks(&self, plan: &Plan) -> R<Vec<Box<dyn Block>>> {
-        let (s, p) = (&plan.shape, &plan.partition);
-        let ug = p
-            .unit_grid
-            .ok_or("dense: the plan has no unit grid (UNX, UNY)")?;
-        let (cols, rows) = (p.cols, p.rows);
-        for (n, sw) in [
-            ("SWA", p.segments.scores),
-            ("SWG", p.segments.gdn),
-            ("SWV", p.segments.onorm),
-        ] {
-            if sw == 0 || (cols / 2) % sw != 0 {
-                return Err(format!(
-                    "dense: {n} {sw} does not divide XC {} (a segment would span the control column)",
-                    cols / 2
-                ));
-            }
-        }
-        if p.head.cols * 2 != rows {
-            return Err("dense: head columns = CX rows / 2".into());
-        }
-        // Qwen3-8B's hidden zero-padded to the row split
-        let placed = p.hidden_placed();
-        let pad = |t: &str| -> From {
-            let tr = if placed != s.hidden {
-                vec![Transform::PadZero { dim: 1, to: placed }]
-            } else {
-                vec![]
-            };
-            vec![(t.to_string(), tr)]
-        };
-        let mut out: Vec<Box<dyn Block>> = vec![Box::new(Units {
-            grid: UnitGrid {
-                cols,
-                rows,
-                cx: cols / 2,
-                cy: rows / 2,
-                layout: UnitLayout::Snake {
-                    unx: ug.0,
-                    uny: ug.1,
-                    up_first: false,
-                    gaps: snake_gap(p.units, ug)?.into_iter().collect(),
-                },
-                layers_per_unit: p.layers_per_unit,
-            },
-            copies: UnitCopies {
-                cols,
-                rows,
-                w_from: pad("layers.*.{q,k,v,o,gate,up,down}_proj, linear_attn.*"),
-                gam_b16: true,
-                gam_from: pad("layers.*.{input,post_attention}_layernorm, norm"),
-                cy: &[
-                    ("cw", true),
-                    ("gpar", true),
-                    ("gnw", true),
-                    ("qkw", true),
-                    ("rot", true),
-                ],
-                cy_optional: true,
-            },
-        })];
-        if s.layers.iter().any(|k| !matches!(k, LayerKind::Gdn)) {
-            out.push(Box::new(Scores {
-                width: p.segments.scores,
-            }));
-        }
-        if let Some(g) = Gdn::of(plan) {
-            out.push(Box::new(g));
-            out.push(Box::new(Onorm {
-                width: p.segments.onorm,
-            }));
-        }
-        let token_loop = plan.contract.token_loop;
-        out.push(Box::new(HeadEast {
-            cols: p.head.cols,
-            rows: p.head.rows,
-            token_loop,
-            copies: HeadCopies {
-                cols: p.head.cols,
-                rows: p.head.rows,
-                hw: |_, rows, cols| Slice::of("hw", None, vec![rows, cols]),
-                hw_from: vec![(
-                    "lm_head".into(),
-                    vec![Transform::PadLastRow {
-                        to: p.head.rows * p.head.vocab_rows,
-                    }],
-                )],
-                hg_from: from("norm"),
-                hemb: if token_loop {
-                    Hemb::After(from(&format!("embed_tokens ({} rows)", s.vocab)))
-                } else {
-                    Hemb::None
-                },
-            },
-        }));
-        if token_loop {
-            out.push(Box::new(TokenLoop));
-        }
-        Ok(out)
     }
 
     fn kernels(&self, prog: &Program) -> R<Kernels> {

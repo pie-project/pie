@@ -1,8 +1,8 @@
 # The wafer program: architecture
 
 A wafer program is a list of **blocks** over a logical **plan**. poem's spatial pass reads the
-model's **shape** off its trace; the family the shape needs turns it and a **preset** into the plan
-and names the blocks it composes; the core runs every build step over the blocks in order and knows
+model's **shape** off its trace; the family the shape needs turns it and a **preset** into the plan;
+the composer picks the blocks from what the plan's layer program needs; the core runs every build step over the blocks in order and knows
 no model, no family and no block's vocabulary. The build lives here (`kernels-cerebras`); the
 engine (`engine-cerebras`) runs its **artifact** and knows none of it (below).
 
@@ -11,7 +11,7 @@ engine (`engine-cerebras`) runs its **artifact** and knows none of it (below).
  (or a shape file)               │                       │ presets (a named one, or the one made for the shape first)
                                  └──────────┬────────────┘
                                             ▼ Family::plan            (poem_compiler::spatial::plan:
-                                          Plan ─Family::blocks─▶ [Block]   the first of them that builds)
+                                          Plan ─compose::blocks─▶ [Block]  the first of them that builds)
                                             │                        │ floor   ─▶ Floor  (units, head, stores; a PeRole a PE)
                                             │                        │ wire    ─▶ Wiring (typed links over open Classes / Slots)
                                             │                        │ settle  ─▶ Floor  (PEs placed where links cross)
@@ -39,7 +39,9 @@ Modules are under `src/`.
 | Blocks | `block/` | the `Block` trait and the blocks (table below); each owns its classes, slots, notes, kinds and colours as consts | coordinates, its own vocabulary |
 | ABI | `abi.rs` | `Kernel` (source, owned symbols, params' names, route slots, rcfg writer), `params!` (a kernel's typed params struct), `words!` (an rcfg word layout), `KernelBuild`, `Kernels`, `Overrides` | the build's view of a kernel |
 | Kernels | `kernels/` | `Pe` (one PE as an rcfg writer sees it); `common` (the word layouts every family's weight / CX / CY / head / head control kernel shares, its codes named, the relay); `head` (`head_pe.csl`, `head_ctl.csl`); one module a family's own kernels: `dense`, `gptoss`, `gemma`, `gemma12` | the CSL kernels' ABI |
-| Families | `family/` | `serving` (the family a shape needs); `dense`, `gptoss`, `gemma`, `gemma12`: presets, the plan of a shape under a preset, the block list, the kernels, the cut's statement | the model's shape |
+| Layers | `layers.rs` | the plan's layer program (`poem_compiler::spatial::layer::LayerProgram`), stated from its shape; pinned to the trace's lowering | the shape |
+| Composer | `compose/` | `Needs` and `Schedule` (read off the layer program), `blocks` (the blocks a program's needs take), `KernelCopies` (what a family's kernels read off each block), `stacked` (the stacked unit columns' arrangements) | the blocks |
+| Families | `family/` | `serving` (the family a shape needs); `dense`, `gptoss`, `gemma`, `gemma12`: presets, the plan of a shape under a preset, the kernels and their copies, the cut's statement | the model's shape |
 | Emit | `emit/` | rcfg, kernel params (levers, overrides) and `layout.csl`, `HostLayout` (everything the host driver reads and writes on the wafer) | kernel builds |
 | Weights | `weights.rs` | `Binding`s (symbol, rect, source, transforms), `Copies`, the placer | the device |
 | Program | `program.rs` | `Program { plan, blocks, floor, wiring, palette, fabric, kernels, overrides, family }`, `build`, `bindings` | all of the above |
@@ -47,7 +49,7 @@ Modules are under `src/`.
 
 Rules:
 
-- **The block is the unit of extension.** A model is a family listing blocks; a new dataflow part
+- **The block is the unit of extension.** A model's blocks are what its layers need; a new dataflow part
   (a new segment kind, a storage column, a band head) is a new block. Nothing in the core names a
   family or a block's classes, slots, notes or kinds.
 - **A block owns its vocabulary.** Its `Class`es, `Slot`s, `NoteKey`s (and their value codes),
@@ -111,16 +113,23 @@ The hardware lessons of the bring-up, made checks:
 | `row_runs::RowRuns { grid, copies }` | units as `Units` | `unit_chains`; scores segments on the attention runs' rows only | `HC`, `ATT` (`ATT_ROW`, `PLAIN_ROW`) overrides: a weight / CX PE's run's dims, a weight PE's run's role | `RunCopies` per unit and run block (`w{u}a` / `w{u}w`, `gama` / `gamw`, the CY tables) |
 | `head_groups::HeadGroups { cols, rows, copies }` | the head east of the units (token loop on) | `head_rows`; per group the x chain north on the last unit (`HEAD_GROUP`), its root east, the column multicast; the embedding back up, down, west into unit 0 and down the chain; the max-reduce | `HEAD_GROUP`; slots `CHAIN_IN`, `CHAIN_OUT`, `CAST`; notes `FORWARD`, `head::ROLE`, `token_loop::TURN` | `HeadCopies` |
 
-The role kernels' layer phases come from what the layers need (`compose::Schedule`: `NRM` from a deferred norm or the expert halves, `MIXK` from the mixers, `ACT` from the MLP's activation, `PLE` from a side input, `KVS` from a shared cache), on `Program::schedule`; every family's kernels read them there. Row roles (`AROW`), head groups (`HG`) and k = v layers (`KEV`) are still their family's.
+The role kernels' layer phases come from the plan's layer program (`compose::Schedule`: `NRM` from a deferred norm or the expert halves, `MIXK` from the mixers, `ACT` from the MLP's gate activation, `PLE` from a side input, `KVS` from a shared cache), on `Program::schedule`; every family's kernels read them there. Row roles (`AROW`) and head groups (`HG`) follow the blocks the composer places; k = v layers (`KEV`, a checkpoint with no global `v_proj`: not a trace fact) and the GELU form (`GELUT`, a lever) are still their family's.
 
-Compositions: the composer (`compose.rs`) picks the blocks from what the layers need (`compose::Needs`, read off the layer program or a shape): attention over a layer's own cache takes `Scores`, GDN takes `Gdn` + `Onorm`, every program the head and the token loop. It places the unit snake's programs today. A need it has no block for yet (a side input, a cache read across layers, a sliding window, routed experts) leaves the program to its family's `blocks` (`family/*.rs`):
+Compositions: the composer (`compose/`) picks the blocks from what the layers need (`compose::Needs`, read off the plan's layer program, `layers.rs`):
 
-| Family | Blocks | Kernels |
+- routed experts: `MoeUnits` (attention | MoE halves, a snake of two unit columns starting upward), `AttnScores`, `Router`, `Band`, `BandLoop` under the token loop;
+- a side input or a cache read across layers: `Units` at the explicit origins of the stacked arrangement its unit shape names (`compose::stacked`), `Scores`, `Ple` for a side input, `SharedKv` for a shared cache, `HeadEast`, `TokenLoop`;
+- sliding windows (else): `RowRuns` (attention / plain row runs, a U of two unit columns), `HeadGroups`;
+- otherwise: `Units` (snake, at most one gap slot), `Scores` when any layer attends over its own cache, `Gdn` + `Onorm` when any is GDN, `HeadEast`, `TokenLoop` under the token loop.
+
+What each block's PEs hold is the family kernels' (`Family::copies`). The families' kernels:
+
+| Family | Composed as | Kernels |
 |---|---|---|
-| Dense (Qwen3.5, Qwen3, Llama 3; composed) | `Units` (snake, at most one gap slot), `Scores` when any layer attends, `Gdn` + `Onorm` when any layer is GDN, `HeadEast`, `TokenLoop` under the contract's token loop | `kernels::dense` (`weight` (NRM 0, MIXK 0), `cx` (NRM 0), `cy` (MIXK 0, NRM 0)) + `head` + `common::RELAY` |
-| gpt-oss | `MoeUnits` (a snake starting upward), `AttnScores`, `Router`, `Band`, `BandLoop` | `kernels::gptoss` (`wa`, `wm`: `weight` (MIXK 2, 3), `cx`, `cya`, `cym`, the band head; `head_ctl.csl` with the bus reserved) |
-| Gemma 4 E2B / E4B | `Units` (explicit origins: the arrangement its unit shape names), `Scores` (a half row), `Ple`, `SharedKv`, `HeadEast`, `TokenLoop` | `kernels::gemma` (`weight` (NRM 1, MIXK 1, PLE 1), `cx` (NRM 1, PLE 1), `cy` (NRM 1, MIXK 1, PLE 1, KVS 1), `head_ctl` (token bus on), `ple_gemma`) + `head::HEAD_PE` |
-| Gemma 4 12B | `RowRuns` (explicit origins, attention / plain row runs), `HeadGroups` | `kernels::gemma12` (`weight` (NRM 1, MIXK 1, row roles by `AROW`), `cx` (NRM 1, HG 1), `cy` (NRM 1, MIXK 1, KEV 1), `head_pe` with head groups) + `head::HEAD_CTL` |
+| Dense (Qwen3.5, Qwen3, Llama 3) | the snake | `kernels::dense` (`weight` (NRM 0, MIXK 0), `cx` (NRM 0), `cy` (MIXK 0, NRM 0)) + `head` + `common::RELAY` |
+| gpt-oss | routed experts | `kernels::gptoss` (`wa`, `wm`: `weight` (MIXK 2, 3), `cx`, `cya`, `cym`, the band head; `head_ctl.csl` with the bus reserved) |
+| Gemma 4 E2B / E4B | a side input and shared caches | `kernels::gemma` (`weight` (NRM 1, MIXK 1, PLE 1), `cx` (NRM 1, PLE 1), `cy` (NRM 1, MIXK 1, PLE 1, KVS 1), `head_ctl` (token bus on), `ple_gemma`) + `head::HEAD_PE` |
+| Gemma 4 12B | sliding windows | `kernels::gemma12` (`weight` (NRM 1, MIXK 1, row roles by `AROW`), `cx` (NRM 1, HG 1), `cy` (NRM 1, MIXK 1, KEV 1), `head_pe` with head groups) + `head::HEAD_CTL` |
 
 ## Kernels and their ABI
 

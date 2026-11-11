@@ -1,6 +1,6 @@
-//! Gemma 4 E2B / E4B: units at explicit origins in two unit columns (the arrangement a unit
+//! Gemma 4 E2B / E4B (composed by [`crate::compose`]): units at explicit origins in two unit columns (the arrangement a unit
 //! shape names), the scores segments a half row, the PLE storage above each unit column
-//! ([`Ple`]), the shared-KV line from the KV source unit to its sharers ([`SharedKv`]), the head
+//! ([`crate::block::ple::Ple`]), the shared-KV line from the KV source unit to its sharers ([`crate::block::shared_kv::SharedKv`]), the head
 //! east of the units and the token loop. The sliding / global KV entries (`NES` / `NEG`) and the
 //! KV rows (`PYW`: E4B keeps KV on 128 of 160 rows so the 512 window is an exact ring) are in the
 //! plan. Kernels: [`gemma`].
@@ -8,17 +8,10 @@
 use crate::tiles::spec::Spec;
 
 use crate::abi::Kernels;
-use crate::block::Block;
-use crate::block::head::{HeadCopies, HeadEast, Hemb};
-use crate::block::ple::{Ple, PleColumn};
-use crate::block::segments::Scores;
-use crate::block::shared_kv::SharedKv;
-use crate::block::token_loop::TokenLoop;
-use crate::block::units::{UnitCopies, Units};
+use crate::block::head::{HeadCopies, Hemb};
+use crate::block::units::UnitCopies;
 use crate::compose::KernelCopies;
-use crate::compose::stacked::Arrangement;
 use crate::family::{Family, MadeFor, Row, ceil_to, table};
-use crate::floor::{UnitGrid, UnitLayout};
 use crate::kernels::gemma;
 use crate::plan::{
     Contract, FamilyId, HeadPartition, KvEntries, LayerKind, Partition, Plan, Preset, ReduceGroups,
@@ -188,69 +181,6 @@ impl Family for Gemma {
             }),
             ..Default::default()
         })
-    }
-
-    fn blocks(&self, plan: &Plan) -> R<Vec<Box<dyn Block>>> {
-        let arr = Arrangement::of(plan)?;
-        let p = &plan.partition;
-        let (px, py) = (p.cols, p.rows);
-        let (hr, vr) = (p.head.rows, p.head.vocab_rows);
-        Ok(vec![
-            Box::new(Units {
-                grid: UnitGrid {
-                    cols: px,
-                    rows: py,
-                    cx: px / 2,
-                    cy: py / 2,
-                    layout: UnitLayout::Explicit {
-                        origins: arr.origins(px + 1, py + 1)?,
-                    },
-                    layers_per_unit: p.layers_per_unit,
-                },
-                copies: UnitCopies {
-                    cols: px,
-                    rows: py,
-                    w_from: Vec::new(),
-                    gam_b16: false,
-                    gam_from: Vec::new(),
-                    cy: &[("qkw", true), ("rot", false)],
-                    cy_optional: false,
-                },
-            }),
-            Box::new(Scores {
-                width: p.segments.scores,
-            }),
-            Box::new(Ple {
-                columns: arr
-                    .columns(px + 1)
-                    .into_iter()
-                    .map(|(_, units, st)| PleColumn {
-                        units,
-                        rows: st.rows,
-                        tokens: st.tokens,
-                        bus: st.bus,
-                    })
-                    .collect(),
-            }),
-            Box::new(SharedKv),
-            Box::new(HeadEast {
-                cols: p.head.cols,
-                rows: hr,
-                token_loop: true,
-                copies: HeadCopies {
-                    cols: p.head.cols,
-                    rows: hr,
-                    hw: |_, rows, cols| Slice::of("hw", None, vec![rows, cols]),
-                    hw_from: vec![(
-                        "embed_tokens".into(),
-                        vec![Transform::PadLastRow { to: hr * vr }],
-                    )],
-                    hg_from: from("norm"),
-                    hemb: Hemb::Inline(Vec::new()),
-                },
-            }),
-            Box::new(TokenLoop),
-        ])
     }
 
     fn kernels(&self, prog: &Program) -> R<Kernels> {

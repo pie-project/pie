@@ -3,16 +3,13 @@
 //! 0), their rows in two runs (attention rows `r < RA` with `Hc A` dims and the scores
 //! segments, 128 of them so the 1024 window is an exact ring; plain rows with `Hc W` dims), and
 //! the head east of them fed by groups of CX rows, the token loop's winner coming back the same
-//! way. Blocks: [`RowRuns`], [`HeadGroups`]. Kernels: [`gemma12`].
+//! way. Blocks (by [`crate::compose`]): `RowRuns`, `HeadGroups`. Kernels: [`gemma12`].
 
 use crate::abi::Kernels;
-use crate::block::Block;
 use crate::block::head::{HeadCopies, Hemb};
-use crate::block::head_groups::HeadGroups;
-use crate::block::row_runs::{RowRuns, RunCopies};
+use crate::block::row_runs::RunCopies;
 use crate::compose::KernelCopies;
 use crate::family::{Family, MadeFor, Row, ceil_to, table};
-use crate::floor::{UnitGrid, UnitLayout};
 use crate::kernels::gemma12::{self, Dims};
 use crate::plan::{
     Contract, FamilyId, HeadPartition, KvEntries, LayerKind, Partition, Plan, Preset, ReduceGroups,
@@ -60,37 +57,6 @@ pub fn groups_split(py: u32, yc: u32, ra: u32, ga: u32, gw: u32) -> Vec<Vec<u32>
         }
     }
     out
-}
-
-impl Gemma12 {
-    /// Units in two unit columns (down the first, up the second).
-    fn grid(plan: &Plan) -> R<UnitGrid> {
-        let p = &plan.partition;
-        let n = p.units;
-        if n == 0 || !n.is_multiple_of(2) {
-            return Err(format!(
-                "gemma12: {n} units (two unit columns, unit 0 and the last on row 0)"
-            ));
-        }
-        let (uw, uh, uny) = (p.cols + 1, p.rows + 1, n / 2);
-        let origins = (0..n)
-            .map(|u| {
-                if u < uny {
-                    (0, uh * u)
-                } else {
-                    (uw, uh * (n - 1 - u))
-                }
-            })
-            .collect();
-        Ok(UnitGrid {
-            cols: p.cols,
-            rows: p.rows,
-            cx: p.cols / 2,
-            cy: p.rows / 2,
-            layout: UnitLayout::Explicit { origins },
-            layers_per_unit: p.layers_per_unit,
-        })
-    }
 }
 
 impl Family for Gemma12 {
@@ -223,48 +189,6 @@ impl Family for Gemma12 {
             }),
             ..Default::default()
         })
-    }
-
-    fn blocks(&self, plan: &Plan) -> R<Vec<Box<dyn Block>>> {
-        let p = &plan.partition;
-        let f16 = vec![
-            "self_attn.{q,k,v,o}_proj.weight",
-            "mlp.{gate,up,down}_proj.weight",
-        ]
-        .into_iter()
-        .map(|n| (n.to_string(), vec![Transform::Bf16ToF16]))
-        .collect();
-        Ok(vec![
-            Box::new(RowRuns {
-                grid: Gemma12::grid(plan)?,
-                copies: RunCopies {
-                    w_from: f16,
-                    cy: &[("qkw", true), ("rot", false)],
-                },
-            }),
-            Box::new(HeadGroups {
-                cols: p.head.cols,
-                rows: p.head.rows,
-                copies: HeadCopies {
-                    cols: p.head.cols,
-                    rows: p.head.rows,
-                    hw: |i, rows, (c0, c1)| {
-                        Slice::of(&format!("hw{i}"), None, vec![rows, (0, c1 - c0)])
-                    },
-                    hw_from: vec![(
-                        "embed_tokens.weight".into(),
-                        vec![
-                            Transform::PadLastRow {
-                                to: p.head.rows * p.head.vocab_rows,
-                            },
-                            Transform::Bf16ToF16,
-                        ],
-                    )],
-                    hg_from: from("norm.weight"),
-                    hemb: Hemb::None,
-                },
-            }),
-        ])
     }
 
     fn kernels(&self, prog: &Program) -> R<Kernels> {

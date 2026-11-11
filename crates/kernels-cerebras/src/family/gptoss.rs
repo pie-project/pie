@@ -2,16 +2,13 @@
 //! snake of two unit columns that starts upward (so the first and the last unit sit on the
 //! band), the scores segments on the attention columns, the router's on the CY row's MoE
 //! columns, the head as a band below the units with its control row, the token loop over the
-//! band. Blocks: [`MoeUnits`], [`AttnScores`], [`Router`], [`Band`], [`BandLoop`]; kernels:
+//! band. Blocks (by [`crate::compose`]): `MoeUnits`, `AttnScores`, `Router`, `Band`, `BandLoop`; kernels:
 //! [`gptoss`].
 
 use crate::abi::Kernels;
-use crate::block::Block;
-use crate::block::band::{Band, BandLoop};
-use crate::block::moe::{AttnScores, MoeCopies, MoeUnits, Router};
+use crate::block::moe::MoeCopies;
 use crate::compose::KernelCopies;
 use crate::family::{Family, MadeFor, Row, ceil_to, table};
-use crate::floor::{UnitGrid, UnitLayout};
 use crate::kernels::gptoss::{self, Dims};
 use crate::plan::{
     Contract, FamilyId, HeadPartition, KvEntries, Partition, Plan, Preset, ReduceGroups, RowRun,
@@ -161,66 +158,6 @@ impl Family for GptOss {
             }),
             ..Default::default()
         })
-    }
-
-    fn blocks(&self, plan: &Plan) -> R<Vec<Box<dyn Block>>> {
-        let (p, d) = (&plan.partition, Dims::of(plan)?);
-        let ax = p.attn_cols.ok_or("gpt-oss plan: no attention columns")?;
-        if ax >= p.cols {
-            return Err("gpt-oss plan: no MoE columns".into());
-        }
-        if !p.units.is_multiple_of(2) {
-            return Err("gpt-oss: an even unit count (the last unit next to the band)".into());
-        }
-        let k = d.k;
-        let lwa = d.hcc * d.nqa + d.qo * d.hcc;
-        let mut out: Vec<Box<dyn Block>> = vec![
-            Box::new(MoeUnits {
-                grid: UnitGrid {
-                    cols: p.cols,
-                    rows: p.rows,
-                    cx: ax,
-                    cy: p.rows / 2,
-                    layout: UnitLayout::Snake {
-                        unx: 2,
-                        uny: p.units / 2,
-                        up_first: true,
-                        gaps: Vec::new(),
-                    },
-                    layers_per_unit: k,
-                },
-                copies: MoeCopies {
-                    w: k * lwa,
-                    wx: k * d.nex * d.xe,
-                    wr: k * d.hcc,
-                    cx: [2 * k * d.hcc, k * d.hcc, k * d.nex * d.hcc],
-                    cya: [k * d.nqa, k * d.qh, d.nlv * 8 * 2 * d.nrot],
-                    cym: [k, k * d.nex * 2 * d.ic, k * d.nex * 2],
-                    wx_from: vec![(
-                        "model.layers.*.mlp.experts.{gate_up,down}_proj_blocks".to_string(),
-                        vec![Transform::Mxfp4ToE5m2],
-                    )],
-                },
-            }),
-            Box::new(AttnScores {
-                width: p.segments.scores,
-            }),
-            Box::new(Router {
-                width: p
-                    .segments
-                    .router
-                    .ok_or("gpt-oss plan: no router segments")?,
-            }),
-            Box::new(Band {
-                cols: p.head.cols,
-                rows: p.head.rows,
-                vocab_rows: p.head.vocab_rows,
-            }),
-        ];
-        if plan.contract.token_loop {
-            out.push(Box::new(BandLoop));
-        }
-        Ok(out)
     }
 
     fn kernels(&self, prog: &Program) -> R<Kernels> {

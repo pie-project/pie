@@ -207,7 +207,7 @@ fn snake(plan: &Plan) -> R<UnitGrid> {
         ("SWG", p.segments.gdn),
         ("SWV", p.segments.onorm),
     ] {
-        if sw == 0 || (p.cols / 2) % sw != 0 {
+        if sw == 0 || !(p.cols / 2).is_multiple_of(sw) {
             return Err(format!(
                 "dense: {n} {sw} does not divide XC {} (a segment would span the control column)",
                 p.cols / 2
@@ -382,8 +382,6 @@ pub fn blocks(plan: &Plan, needs: &Needs, copies: KernelCopies) -> R<Vec<Box<dyn
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::emit;
-    use crate::family;
     use crate::program::Program;
     use crate::target::{Ask, plan, plan_shape};
 
@@ -429,29 +427,12 @@ mod tests {
         }
     }
 
-    /// What a program's blocks make: the floor, every PE's rcfg words, the layout and the copies.
-    fn made(prog: &Program) -> (String, String, String, String) {
-        (
-            format!("{:?}", prog.floor),
-            emit::rcfg::dump(prog).unwrap(),
-            emit::layout::layout_text(prog, &prog.kernels).unwrap(),
-            serde_json::to_string(&prog.bindings().unwrap()).unwrap(),
-        )
-    }
-
-    /// The composer's blocks make what every family's made, for every shipping model's preset
-    /// and every tiny one.
+    /// Every shipping model's preset and every tiny one composes and builds (the capture pins
+    /// what each makes).
     #[test]
-    fn the_composer_reproduces_every_family() {
+    fn every_preset_composes() {
         let check = |p: crate::plan::Plan, what: &str| {
-            let fam = family::of(p.family);
-            let theirs =
-                Program::build_with(fam.blocks(&p).unwrap(), family::of(p.family), p.clone())
-                    .unwrap();
-            let needs = Needs::of(&crate::layers::of(&p.shape));
-            let ours = blocks(&p, &needs, fam.copies(&p).unwrap()).unwrap();
-            let comp = Program::build_with(ours, family::of(p.family), p).unwrap();
-            assert_eq!(made(&theirs), made(&comp), "{what}");
+            Program::of(p).unwrap_or_else(|e| panic!("{what}: {e}"));
         };
         for (name, preset) in [
             ("qwen35-d9b-bf16-kv-bf16", "9b"),
