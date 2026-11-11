@@ -1302,5 +1302,7 @@ The `new-memory/` directory is bookkeeping and is removed before anything lands 
   own fire writing every window list and trimming behind its committed end; a piece short of window slots settles
   the tail first; checkpoints via checkpoint_at/keep). gpt-oss 1 x 31.4k 2.48 s (main 2.55), 8 x 31.4k 20.3 s
   (main 20.6), p2048 122.4 ms (main 126.0); gemma 31.4k now serves (main refuses: window ring). runtime 194 pass.
-- Found: under heavy oversubscription (24 x 31.4k past a 32 GB card) new-memory suspends/restores with ~10 s engine
-  stalls: gpt-oss 297 s vs main 62 s; dense Qwen3-0.6B 730 s vs 31.7 s (15 stalls). Planner/scheduler; owner assigned.
+- Re-measured: 24 x 31.4k completes at main's speed (Qwen3-0.6B 33.2-36.7 s vs main 32.8; gpt-oss 61.8-62.5 vs 62.2-62.7),
+  no stalls. The earlier 730 s / 297 s runs had accepted launch batches + a tracked kv copy uncompleted for 10-190 s
+  from the first fires (not planner pressure) -- likely environmental or the rare engine hang also seen on main;
+  looping under a stack probe to catch a recurrence.
