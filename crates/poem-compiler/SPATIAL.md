@@ -30,6 +30,21 @@ trace ─ analyze ─┤                                     lowerings, streams,
 
 The physical build then lowers `SpatialPlan<Partition>` to the device. That build is the target's code, not the compiler's.
 
+## The layer program
+
+`spatial::layer::lower` reads a trace as a grid of cores runs a decoded token: a vector lives on an axis (chunked over the grid's rows, where the residual stream is held, or over its columns), and every node that runs becomes a phase.
+
+| Phase | What runs |
+|---|---|
+| `Cast` | The roots of an axis multicast vectors to the tiles. |
+| `Matvec` | The tiles multiply, and the result is reduced into the other axis's roots: a matvec flips the axis. A routed bank carries its expert count and top k. |
+| `Root` | Elementwise ops at the roots of their inputs' axis (norms, RoPE, activations, residual adds, a router's choice). |
+| `Mixer` | A stateful mixer on the tiles: attention over the layer's own cache or another layer's, or the gated delta rule. |
+| `Segment` | A reduction across a row of roots (a router's gather). |
+| `SideIn` | A per-token input read from a table. |
+
+Layers with the same phases share a `LayerBody`. A node with no phase is refused by name (`<trace>: layer L node N: <op> has no spatial lowering`); nothing is dropped. Which nodes run is the caller's (`single_token`: one token a request). The phases' placement, kernels and tiling are the target's.
+
 ## How targets map onto it
 
 **A wafer of PEs with a routed fabric.**

@@ -12,6 +12,8 @@
 //! Coordinates, routes, kernels and memory placement are the target's, after
 //! the plan. `SPATIAL.md` beside this crate says how targets map onto it.
 
+pub mod layer;
+
 use std::fmt::Debug;
 
 use poem_ir::{Def, Operands, Trace, ValueId};
