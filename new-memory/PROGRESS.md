@@ -1197,3 +1197,15 @@ The `new-memory/` directory is bookkeeping and is removed before anything lands 
   tests called them since M92's RungWalk). Tests now drive the live walks (walk_segments, walk_raise); the raise
   evacuation test runs against RungWalk::step + apply_rung. runtime store:: 124 pass; runtime rocm / default check clean.
 - MI300X: M93 verified by AMD (30B holds weights, 89/89 armed on 4 models, 9 ROCm goldens equal).
+
+### M97 — 2026-11-11: streaming loads boot in seconds (A16 eager-fix-3)
+- `sc/eager-fix-3` (fc75cb91f, EAGER): a streaming load arms at its starting weight residency (deferred arm,
+  stand-in tables); streamed bf16 expert banks take the tiled mma.sync select (ordinary loads read host-mapped
+  experts; tcgen05 / Hopper wsgemm stay off streamed tables). qwen3-30b-a3b-mini share 0.11 on sm_120: b2048 body
+  48 s -> 466 ms, boot 2m45s -> ~21 s, 104/104 armed; held share 0.9 unchanged (139/139, 4.5 s). Flat range: the
+  settled fit no longer counts unheld activation as room (activation_unheld_bytes = 0 on a flat range).
+- Verified: new streamed-table bitwise test + 7 moe_table pass; CUDA golden_logits / by_refs = base, golden_held_small,
+  t_resume 4/4 112/112 armed; engine-cuda cuda/rocm/featureless + pie cuda/rocm check clean. MI300X (AMD): 30B holds
+  weights, 106728 pages (= M93).
+- Open (AMD, MI300X fill test): on a flat range the fit still counts held weight (expert) chunks as cache room —
+  30B declares 106728 pages but only ~70k fit (38 x 31.4k seqs starve; main sizes 69120). Fix in progress.
