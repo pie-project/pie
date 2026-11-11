@@ -157,11 +157,34 @@ resolved param list is one loop nest, every param a literal, so the link passes 
 The per-kind sources are the kernels', with one-word dummies for the family's other exported
 symbols (`Family::symbols`, export order).
 
+### Op modules (`programs/wafer/ops`)
+
+A role kernel runs its family's phase order; the ops it runs come from op modules it imports with
+comptime params (`@import_module("ops/<name>.csl", .{ .. })`). A module's code is emitted only where
+a kernel calls it; the per-step ones are `inline fn`, so a kernel compiles to the code it had.
+`sources::OPS` embeds them, `ProgramKey` digests them with the kernels and `layout::write` writes
+them all to `layout/ops`.
+
+| Module | Ops | Imported by |
+|---|---|---|
+| `fabric` | queue DSDs, queue colour words, the host's routes, input queues bound without a transient duplicate | every kernel |
+| `mv` | the tile matvec, f16 or f32 accumulation | weight and head PEs |
+| `red` | one two-level chain reduction: a member's send (start, add-forward, group end through its FIFO) or the root's merge and loopback | weight PEs (row, column), head PEs (row), CX, CY, head control roots |
+| `seg` | the weight PEs' segment queue modes and the scores all-reduce over a kv head's columns (GDN's (k, q) exchange mode) | the attention weight kernels |
+| `math` | rsqrt, exp, recip, ln, sigmoid, silu, softplus, tanh-GELU; exp over a vector | CY roots, attention weight PEs |
+| `rope` | a position's cos / sin from the per-level tables; a vector's pairs rotated | CY roots |
+| `argmax` | a head row's largest logit and first index (block maxima, halving tree or scan) | head control |
+
+What is still in the role kernels is their family's own: the layer's phase order, the attention
+mixers (KV store, redo passes, LSE steps), GDN, the vector activations' fused forms, the PLE bus,
+the token loop's winner merge and the handoff relays.
+
 ## Adding a model
 
-1. **Shape.** A model poem traces needs nothing here: `target::shape` reads it. A trace op the
-   reader does not know (a new mixer, a new activation) is refused by name; teach `target.rs` the op
-   and give the plan's `Shape` the field the blocks need.
+1. **Shape.** A model poem traces needs nothing here: `target::shape` reads it. A trace op that
+   runs on the wafer and that no kernel runs (a new mixer, a new activation) is refused by name
+   (`LAYER_OPS`, `OUTER_OPS`); teach `target.rs` the op and give the plan's `Shape` the field the
+   blocks need.
 2. **Family.** `family::serving` picks the family from what the shape needs. A model of an existing
    family is a new preset in the family's table (`family/dense.rs::PRESETS`, Gemma's presets and
    arrangements, gpt-oss's and 12B's): the counts and split factors the plan cannot derive from the
@@ -182,7 +205,8 @@ symbols (`Family::symbols`, export order).
    `token_loop::TURN`) instead of recomputing them in an rcfg writer.
 6. **Kernels** in `kernels/<family>.rs`: one `params!` struct and one `Kernel` const a CSL source,
    the writer over `Pe` using `common::*` for the shared words. Values that differ by PE are
-   `Block::overrides`.
+   `Block::overrides`. The CSL imports its ops from `programs/wafer/ops`; an op no module has is a
+   new module there (and a row in `sources::OPS`), not code in the kernel.
 7. **Copies** in each block's `bindings`, in placement order (the host's device protocol); the
    family's `tiles` states the arrays they copy (`family/<family>/cut.rs`).
 8. **Host.** Anything the driver must find goes in `HostLayout`, derived from the program.

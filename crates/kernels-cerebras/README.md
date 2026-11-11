@@ -15,6 +15,11 @@ fit. The wafer program layout gives PEs fixed roles. Most PEs hold only weights,
 kernel of about 8 KB, so about 40 KB of each PE holds weights. The element-wise work and the roots
 of every collective move onto a few control PEs.
 
+**Kernels and op modules.** Each role runs one kernel (`programs/wafer/<role>_<family>.csl`) in its
+family's phase order. The ops come from the modules under `programs/wafer/ops` (the fabric plumbing, the
+tile matvec, the chain reductions, the segment collectives, the elementwise math, RoPE and the head
+argmax; ARCHITECTURE.md), imported with comptime params.
+
 **Unit.** A unit is PX x PY weight PEs, a control column (CX) and a control row (CY), so it spans
 (PX + 1) x (PY + 1) PEs. Each unit runs K layers. The units are visited as a snake: down unit
 column 0, then up column 1, and so on.
