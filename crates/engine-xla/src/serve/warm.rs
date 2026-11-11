@@ -136,6 +136,23 @@ impl Shell {
                 }
             }
         }
+        // A hybrid's prompts filling the widest rows at every lane rung: `n - 1`
+        // lanes above fall a rung short of it (7 of 288 rows land 2048 rows,
+        // not 2304), and at a `max_forward_tokens` between the powers of two
+        // the prompts that fill it fire there (v6e Qwen3.6-35B-A3B pf256 at
+        // 2304: four 555-row prompts and their pads, 8 lanes, traced 812 ms a
+        // round, compiled 33 s on a fresh cache).
+        if hybrid {
+            for n in [4u32, 8, 16, 32, 64] {
+                let k = n - 1;
+                if n <= lanes_cap && widest / n >= 2 {
+                    let rows = widest - 1;
+                    let mut lanes = vec![fresh(prefill, rows / k); k as usize];
+                    lanes[0].rows += rows % k;
+                    shapes.push(lanes);
+                }
+            }
+        }
         // A hybrid's full fire: its prompts fill the widest rows and the lanes
         // they pad to push it onto the top rung (v6e Qwen3.8-27B mini20 c32:
         // 12 prompts of 2045 rows compiled mid-run, 12.7 s).
