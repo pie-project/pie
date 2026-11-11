@@ -1054,3 +1054,9 @@ The `new-memory/` directory is bookkeeping and is removed before anything lands 
   reach; host/disk branches in shared-pool copy_kv; Cerebras Unified; Vulkan/wgpu profiling hooks; worker
   set_draining; test-only APIs (incl. the runtime's rung API: SharedPool::raise_rung / lower_rung / steer — no
   production caller -> check whether the governor's rung shrink is wired).
+
+### Note — 2026-11-11: serving order restored (sc/l40s-serving-order 741c07c01)
+- M78 broke `pie --features cuda` (runtime engine::load::sequence called the deleted Ranking::images); M80 removed
+  sequence() outright, which changed artifact plane order. L40S's fix adds engine_cuda::experts::serving_order (same
+  order as before: dense planes by first read, then packed routed groups, then dense routed banks) and the import uses
+  it again, so serving-file layout is unchanged vs main. Merge check matrix now includes `pie --features cuda / rocm`.
