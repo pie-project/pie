@@ -1876,6 +1876,90 @@ fn a_window_checkpoint_behind_the_fire_end_holds_what_its_windows_reach() {
     assert_eq!(window_live(&shared), (0, 0), "every reference back");
 }
 
+/// (c4) A window pass cut into pieces, each prepared before the one ahead of
+/// it settles (as a cut pass submits them), lands its windows as one fire
+/// does: the same position, the same slots live once all settle, the same
+/// slots trimmed behind each window, and a checkpoint at its end. While the
+/// pieces run, no slot a later piece reads has gone.
+#[test]
+fn a_window_pass_cut_into_pieces_lands_as_one_fire_does() {
+    use crate::pipeline::fire::rs::settle;
+    let (facts, shared, stores) = windowed_stores();
+    let mut rs = stores.rs.lock().unwrap();
+
+    let whole = rs.create_working_set(window_geometry());
+    let out = window_fire(&mut rs, whole, 0..200, None);
+    settle(&mut rs, out.txn);
+    rs.retire_idle();
+    let after_whole = window_live(&shared);
+    assert_eq!(rs.window_positions(whole), Ok(Some((200, 200))));
+    let out = window_fire(&mut rs, whole, 200..201, None);
+    let (whole_narrow, whole_wide) = window_tables(&out, &shared);
+    settle(&mut rs, out.txn);
+    rs.release_working_set(whole);
+    rs.retire_idle();
+    assert_eq!(window_live(&shared), (0, 0));
+
+    // Pieces of 64 (page-aligned), the next prepared while the last runs.
+    let cut = rs.create_working_set(window_geometry());
+    let mut running = Vec::new();
+    for rows in [0..64, 64..128, 128..192, 192..200] {
+        // The last piece keeps the pass's checkpoint row, 192, as the
+        // runtime's does.
+        let keep = (rows.end == 200).then_some(192);
+        let out = window_fire_keeping(&mut rs, cut, rows.clone(), None, keep);
+        let (narrow, wide) = window_tables(&out, &shared);
+        // Every slot a row of this piece reads through its window is there.
+        let first =
+            |window: u32, tokens: u32| (rows.start.saturating_sub(window) / tokens) as usize;
+        assert!(narrow[first(24, 8)..].iter().all(|&r| r != 0), "{rows:?}");
+        assert!(wide[first(64, 16)..].iter().all(|&r| r != 0), "{rows:?}");
+        shared_lanes(&out, &shared, 1)
+            .remove(0)
+            .validate_chunks(&facts)
+            .unwrap();
+        running.push(out.txn);
+    }
+    for txn in running {
+        settle(&mut rs, txn);
+    }
+    rs.retire_idle();
+    assert_eq!(rs.window_positions(cut), Ok(Some((200, 200))));
+    assert_eq!(
+        window_live(&shared),
+        (after_whole.0 + 1, after_whole.1),
+        "one fire's slots, and the narrow one 192 reaches"
+    );
+    assert!(rs.checkpoint_at(cut, [9; 32], None, 192).unwrap());
+    // The next fire still reads the slot kept for 192 and trims it; the one
+    // after reads as the whole pass's next did.
+    let out = window_fire(&mut rs, cut, 200..201, None);
+    assert_eq!(
+        nulls(&window_tables(&out, &shared).0),
+        nulls(&whole_narrow) - 1
+    );
+    settle(&mut rs, out.txn);
+    let out = window_fire(&mut rs, cut, 201..202, None);
+    let (narrow, wide) = window_tables(&out, &shared);
+    assert_eq!(
+        (narrow.len(), nulls(&narrow), wide.len(), nulls(&wide)),
+        (
+            whole_narrow.len(),
+            nulls(&whole_narrow),
+            whole_wide.len(),
+            nulls(&whole_wide)
+        ),
+        "trimmed behind each window as one fire is"
+    );
+    settle(&mut rs, out.txn);
+    rs.release_working_set(cut);
+    rs.retire_idle();
+    assert!(rs.has_checkpoint(&[9; 32]));
+    assert!(rs.reclaim_cache(|_| 0) > 0);
+    rs.retire_idle();
+    assert_eq!(window_live(&shared), (0, 0), "every reference back");
+}
+
 /// (d) Rows of a fire still being decided (spec drafts) never count as
 /// committed: each window trims behind what the fires commit only.
 #[test]
