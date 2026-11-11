@@ -2921,6 +2921,23 @@ impl Pools {
         })
     }
 
+    /// Zeroes the use record on `stream`, behind the fires that counted:
+    /// what the shell's own synthetic fires read (arming the lattice) is
+    /// no use the runtime orders its weight cache by.
+    pub fn forget_weight_uses(&mut self, stream: *mut core::ffi::c_void) -> Result<()> {
+        for cache in &mut self.row_caches {
+            let blocks = cache.slots.len();
+            cache.hits.zero_span_on(stream, 0, blocks * 4)?;
+        }
+        for cache in &mut self.expert_caches {
+            let experts = cache.shape.experts as usize;
+            for hits in cache.planes.iter_mut().filter_map(|bank| bank.hits.as_mut()) {
+                hits.zero_span_on(stream, 0, experts * 4)?;
+            }
+        }
+        Ok(())
+    }
+
     /// See `Engine::weight_uses`: each block's reads since the last call,
     /// read on `stream` behind the fires that counted them, and zeroed.
     pub fn weight_uses(

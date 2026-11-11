@@ -884,8 +884,15 @@ impl Shell {
         }
     }
 
+    /// Arms the lattice over synthetic lanes. Their reads of the streamed
+    /// weights are the shell's, not a fire the runtime asked for: the use
+    /// record forgets them, so the runtime's first window orders the cache
+    /// by served tokens alone (a load arming at its starting residency arms
+    /// after the runtime last read the record).
     pub(super) fn arm_bodies(&mut self) -> Result<()> {
-        self.arm_lattice(false)
+        let armed = self.arm_lattice(false);
+        self.pools.forget_weight_uses(self.device.stream())?;
+        armed
     }
 
     /// Arms the lattice, an expert-parallel rank with its collectives
