@@ -17,6 +17,12 @@ pub fn on() -> bool {
     !std::env::var("PIE_XLA_POOL_DMA").is_ok_and(|v| v == "0")
 }
 
+/// Copies a step of a kernel's issue loop.
+const UNROLL: i64 = 8;
+
+/// The scoped VMEM a block kernel declares: it moves HBM to HBM.
+const VMEM: u64 = 1 << 20;
+
 fn any(array: Vec<i64>, elem: Elem) -> Operand {
     Operand {
         array,
@@ -34,6 +40,9 @@ pub fn gather(f: &mut Func, pool: Val, at: Val, nr: i64, elem: Elem) -> Built<Va
     let b = f.dims(at)[0];
     let k = i64::from(32 / elem.bits());
     let er = nr * k;
+    // one wait for every byte holds where each copy is whole (8k, 128)
+    // tiles of the element (a 2-row bf16 block hangs it)
+    let whole_tiles = er % (8 * k) == 0;
     let kern = Kernel {
         name: "pool_gather".into(),
         grid: vec![1],
@@ -41,7 +50,9 @@ pub fn gather(f: &mut Func, pool: Val, at: Val, nr: i64, elem: Elem) -> Built<Va
         prefetch: vec![vec![b]],
         ins: vec![any(vec![rows, 128], Elem::U32)],
         outs: vec![any(vec![b * er, 128], elem)],
-        vmem_limit: None,
+        // DMA only: no VMEM of its own, so none held from XLA's placement
+        // (the compiler's default scope would be)
+        vmem_limit: Some(VMEM),
         scratch: vec![MTy::Sem(vec![1])],
     };
     let c = kern.build(|bd, blk| {
@@ -73,8 +84,33 @@ pub fn gather(f: &mut Func, pool: Val, at: Val, nr: i64, elem: Elem) -> Built<Va
                 bd.dma_start(s, d, sem)
             }
         };
-        bd.for_range(z, n, one, |bd, j| copy(bd, j, false))?;
-        bd.for_range(z, n, one, |bd, j| copy(bd, j, true))
+        // The copies started UNROLL a loop step (the issue loop is scalar
+        // work), then one wait for every byte: each copy signals the one
+        // semaphore with its bytes, and every block lands (none dropped).
+        // Blocks of part of a tile are waited for one by one.
+        // v6e, 4096 blocks of 16 KiB: 103 us a wait a copy, 54 us so.
+        let groups = b / UNROLL;
+        if groups > 0 {
+            let g = bd.i32(groups);
+            bd.for_range(z, g, one, |bd, i| {
+                for u in 0..UNROLL {
+                    let base = bd.i32(UNROLL);
+                    let j = bd.muli(i, base)?;
+                    let du = bd.i32(u);
+                    let j = bd.addi(j, du)?;
+                    copy(bd, j, false)?;
+                }
+                Ok(())
+            })?;
+        }
+        let rest = bd.i32(groups * UNROLL);
+        bd.for_range(rest, n, one, |bd, j| copy(bd, j, false))?;
+        if whole_tiles {
+            bd.dma_wait(sem, out, out)
+        } else {
+            // copies of part of a tile are not counted as their bytes
+            bd.for_range(z, n, one, |bd, j| copy(bd, j, true))
+        }
     })?;
     Ok(c.call(f, &[at, pool])?[0])
 }
@@ -98,7 +134,9 @@ pub fn scatter(f: &mut Func, pool: Val, at: Val, ups: Val, nr: i64) -> Built<Val
             any(vec![rows, 128], Elem::U32),
         ],
         outs: vec![any(vec![rows, 128], Elem::U32)],
-        vmem_limit: None,
+        // DMA only: no VMEM of its own, so none held from XLA's placement
+        // (the compiler's default scope would be)
+        vmem_limit: Some(VMEM),
         scratch: vec![MTy::Sem(vec![1])],
     };
     let c = kern.build(|bd, blk| {
@@ -132,7 +170,24 @@ pub fn scatter(f: &mut Func, pool: Val, at: Val, ups: Val, nr: i64) -> Built<Val
                 }
             })
         };
-        bd.for_range(z, n, one, |bd, j| copy(bd, j, false))?;
+        // starts unrolled (see `gather`); a dropped block is not copied, so
+        // each copy is waited for by itself
+        let groups = b / UNROLL;
+        if groups > 0 {
+            let g = bd.i32(groups);
+            bd.for_range(z, g, one, |bd, i| {
+                for u in 0..UNROLL {
+                    let base = bd.i32(UNROLL);
+                    let j = bd.muli(i, base)?;
+                    let du = bd.i32(u);
+                    let j = bd.addi(j, du)?;
+                    copy(bd, j, false)?;
+                }
+                Ok(())
+            })?;
+        }
+        let rest = bd.i32(groups * UNROLL);
+        bd.for_range(rest, n, one, |bd, j| copy(bd, j, false))?;
         bd.for_range(z, n, one, |bd, j| copy(bd, j, true))
     })?;
     Ok(c.call_aliased(f, &[at, ups, pool], &[(0, 2)])?[0])

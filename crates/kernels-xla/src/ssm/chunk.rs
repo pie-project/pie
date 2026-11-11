@@ -134,7 +134,15 @@ pub(super) fn gdn_chunks(
     let compiled = kernel(hk, hv, dk, dv, c, nc, rows, pool.is_some())?;
     let out = compiled.call_aliased(
         f,
-        &[first_i, last_i, slot_n, qkv, gcum, beta, pool.unwrap_or(slab)],
+        &[
+            first_i,
+            last_i,
+            slot_n,
+            qkv,
+            gcum,
+            beta,
+            pool.unwrap_or(slab),
+        ],
         &[(1, 6)],
     )?;
     let bank = if pool.is_some() {

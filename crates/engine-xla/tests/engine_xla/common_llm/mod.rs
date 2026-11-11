@@ -163,7 +163,13 @@ impl Model {
             .and_then(|p| p.shape.first().copied())
             .map_or(1000, |v| u32::try_from(v).unwrap_or(1000));
         let facts = trace.facts.clone();
-        let mut engine = Xla::new(DeviceBoot::default(), contract_for);
+        // `PREWARM` 1: the warm ladder runs at load (the speed probe: serving
+        // fires then run only programs it prepared)
+        let boot = DeviceBoot {
+            prewarm: knob("PREWARM", 0) == 1,
+            ..DeviceBoot::default()
+        };
+        let mut engine = Xla::new(boot, contract_for);
         let residency = Residency {
             // `PIE_XLA_TEST_EXTRA_MIB` grows the pool past what the
             // scenario needs: readouts must not depend on the pool's size.

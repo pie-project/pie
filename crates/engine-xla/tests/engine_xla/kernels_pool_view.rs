@@ -713,3 +713,192 @@ fn rows_landed_then_their_pages_read_in_one_fire() {
     }
     assert!(bad.is_empty(), "(page, row, col, got, want): {bad:x?}");
 }
+
+#[test]
+fn a_decode_conv_rolls_its_windows_in_the_pool() {
+    // ssm::causal_conv1d on a pool view (the Mosaic conv step on a TPU):
+    // each lane's window rolled by its row lands where the lane writes, the
+    // rest of the pool stands; the output agrees with a host reference.
+    use dtype::Dtype;
+    use kernels_xla::{Landing, Operand};
+    let Some(client) = client() else { return };
+    let dev = client.device(0).expect("a device");
+    let rows: i64 = 4096;
+    let (c, taps, t) = (512i64, 4i64, 8i64);
+    let hist = taps; // dilation 1
+    let width = c;
+    let windows = rows * 2 * 128 / (hist * c);
+    let slots: Vec<i32> = vec![3, 9, 0, 17, 5, 40, 41, 2];
+    let mut seed = 7u64;
+    let mut next = || {
+        seed = seed.wrapping_mul(6_364_136_223_846_793_005).wrapping_add(1);
+        ((seed >> 40) as f32 / (1u64 << 24) as f32) - 0.5
+    };
+    let bf = |x: f32| (x.to_bits() >> 16) as u16;
+    let unbf = |h: u16| f32::from_bits(u32::from(h) << 16);
+    // the pool as bf16 elements in flat order, packed into rows
+    let flat: Vec<u16> = (0..rows * 256).map(|_| bf(next())).collect();
+    let mut pool = vec![0u8; (rows * 512) as usize];
+    for r in 0..rows as usize {
+        for l in 0..128 {
+            let lo = flat[r * 256 + l];
+            let hi = flat[r * 256 + 128 + l];
+            pool[(r * 128 + l) * 4..(r * 128 + l) * 4 + 2].copy_from_slice(&lo.to_le_bytes());
+            pool[(r * 128 + l) * 4 + 2..(r * 128 + l) * 4 + 4].copy_from_slice(&hi.to_le_bytes());
+        }
+    }
+    let x: Vec<u16> = (0..t * c).map(|_| bf(next())).collect();
+    let w: Vec<f32> = (0..c * taps).map(|_| next()).collect();
+    let mut f = Func::new("main");
+    let p = f.param(Ty::new(Elem::U32, &[rows, 128]), None);
+    let xv = f.param(Ty::new(Elem::Bf16, &[t, c]), None);
+    let wv = f.param(Ty::new(Elem::F32, &[c, taps]), None);
+    let sv = f.param(Ty::new(Elem::I32, &[t]), None);
+    let slab = f
+        .pool_view(p, Elem::Bf16, &[rows * 256 / width, width])
+        .unwrap();
+    let op = |val, rows: i64, width: i64, dtype| Operand {
+        val,
+        rows: rows as u32,
+        width: width as u32,
+        dtype,
+    };
+    let (y, slab) = kernels_xla::ssm::causal_conv1d(
+        &mut f,
+        op(xv, t, c, Dtype::Bf16),
+        op(wv, c, taps, Dtype::F32),
+        None,
+        op(slab, rows * 256 / width, width, Dtype::Bf16),
+        op(sv, t, 1, Dtype::I32),
+        taps as u32,
+        1,
+        Landing {
+            rows: t as u32,
+            width: c as u32,
+            dtype: Dtype::F32,
+        },
+    )
+    .unwrap();
+    let pool_out = f.pool_of(slab, Elem::Bf16).unwrap();
+    let y = f.convert(y, Elem::F32);
+    // The XLA form's own arithmetic over the same windows (read by XLA's
+    // gather off the pool as the plain view), for a bitwise comparison.
+    let whole = {
+        let x = f.bitcast(p, Elem::Bf16).unwrap();
+        let x = f.transpose(x, &[0, 2, 1]).unwrap();
+        f.reshape(x, &[rows * 256 / (hist * c), hist * c]).unwrap()
+    };
+    let past = f.take_rows(whole, sv).unwrap();
+    let x32 = f.convert(xv, Elem::F32);
+    let mut acc: Option<kernels_xla::hlo::Val> = None;
+    for k in 0..taps {
+        let pos = hist - 1 - (taps - 1 - k);
+        let tap = if pos + 1 == hist {
+            x32
+        } else {
+            let s = f.slice_axis(past, 1, (pos + 1) * c, (pos + 2) * c).unwrap();
+            f.convert(s, Elem::F32)
+        };
+        let wk = f.slice_axis(wv, 1, k, k + 1).unwrap();
+        let wk = f.reshape(wk, &[c]).unwrap();
+        let wk = f.broadcast(wk, &[t, c], &[1]).unwrap();
+        let term = f.mul(tap, wk).unwrap();
+        acc = Some(match acc {
+            None => term,
+            Some(a) => f.add(a, term).unwrap(),
+        });
+    }
+    let yx = f.silu(acc.unwrap()).unwrap();
+    let text = f.module("conv", &[y, pool_out, yx]);
+    let exe = client.compile(&text).unwrap_or_else(|e| panic!("{e}"));
+    let up = |b: &[u8], ty, d: &[i64]| client.upload(dev, b, ty, d).unwrap();
+    let pb = up(&pool, ElementType::U32, &[rows, 128]);
+    let xb: Vec<u8> = x.iter().flat_map(|v| v.to_le_bytes()).collect();
+    let xb = up(&xb, ElementType::Bf16, &[t, c]);
+    let wb: Vec<u8> = w.iter().flat_map(|v| v.to_le_bytes()).collect();
+    let wb = up(&wb, ElementType::F32, &[c, taps]);
+    let sb: Vec<u8> = slots.iter().flat_map(|v| v.to_le_bytes()).collect();
+    let sb = up(&sb, ElementType::S32, &[t]);
+    let (outs, done) = exe
+        .execute(
+            dev,
+            vec![
+                Arg::Keep(&pb),
+                Arg::Keep(&xb),
+                Arg::Keep(&wb),
+                Arg::Keep(&sb),
+            ],
+        )
+        .unwrap();
+    done.wait().unwrap();
+    let yo = outs[0].download().unwrap();
+    let po = outs[1].download().unwrap();
+    let yx = outs[2].download().unwrap();
+    let same = yo == yx;
+    let ndiff = yo
+        .chunks(4)
+        .zip(yx.chunks(4))
+        .filter(|(a, b)| a != b)
+        .count();
+    eprintln!(
+        "conv: the kernel's output = the XLA form's over the same windows: {same} ({ndiff} differ)"
+    );
+    let elem = |bytes: &[u8], e: usize| -> u16 {
+        let r = e / 256;
+        let (l, h) = ((e % 256) % 128, (e % 256) / 128);
+        let at = (r * 128 + l) * 4 + 2 * h;
+        u16::from_le_bytes([bytes[at], bytes[at + 1]])
+    };
+    let win = (hist * c) as usize;
+    let mut worst = 0f32;
+    let mut bad_state = Vec::new();
+    for (lane, &s) in slots.iter().enumerate() {
+        let base = s as usize * win;
+        let past: Vec<f32> = (0..win).map(|e| unbf(flat[base + e])).collect();
+        for ch in 0..c as usize {
+            let mut acc = 0f32;
+            for k in 0..taps as usize {
+                let pos = hist as usize - 1 - (taps as usize - 1 - k);
+                let tap = if pos + 1 == hist as usize {
+                    unbf(x[lane * c as usize + ch])
+                } else {
+                    past[(pos + 1) * c as usize + ch]
+                };
+                let term = tap * w[ch * taps as usize + k];
+                acc = if k == 0 { term } else { acc + term };
+            }
+            let want = acc / (1.0 + (-acc).exp());
+            let at = (lane * c as usize + ch) * 4;
+            let got = f32::from_le_bytes([yo[at], yo[at + 1], yo[at + 2], yo[at + 3]]);
+            worst = worst.max((got - want).abs());
+        }
+        // the window rolled: rows 1.. then x
+        for e in 0..win {
+            let want = if e < (hist as usize - 1) * c as usize {
+                flat[base + c as usize + e]
+            } else {
+                x[lane * c as usize + e - (hist as usize - 1) * c as usize]
+            };
+            let got = elem(&po, base + e);
+            if got != want && bad_state.len() < 4 {
+                bad_state.push((lane, e, got, want));
+            }
+        }
+    }
+    let untouched = (0..(rows * 256) as usize)
+        .filter(|e| !slots.iter().any(|&s| (e / win) as i32 == s))
+        .all(|e| elem(&po, e) == flat[e]);
+    eprintln!(
+        "conv: output within {worst} of the host's; windows {}",
+        windows
+    );
+    assert!(
+        bad_state.is_empty(),
+        "windows rolled wrong (lane, elem, got, want): {bad_state:x?}"
+    );
+    assert!(
+        untouched,
+        "the conv touched the pool outside its lanes' windows"
+    );
+    assert!(worst < 1e-3, "output off by {worst}");
+}

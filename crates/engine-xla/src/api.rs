@@ -140,6 +140,13 @@ impl Xla {
         &self.boot
     }
 
+    /// Programs built after the warm ladder ran (`[engine] prewarm`): each a
+    /// serving fire that missed the ladder.
+    #[must_use]
+    pub fn warm_misses(&self) -> u64 {
+        self.shell().map_or(0, |s| s.device().misses())
+    }
+
     #[must_use]
     pub fn shell(&self) -> Option<&Shell> {
         self.shell.as_ref()
@@ -380,6 +387,8 @@ impl Engine for Xla {
         let mut shell = shell;
         if boot.prewarm {
             shell.prewarm().map_err(fault)?;
+            // from here a program built is a fire the ladder missed
+            shell.device().seal();
         }
         let trace_name = shell.trace().name.clone();
         let (weight_bytes, pool_bytes) = shell.footprint();
