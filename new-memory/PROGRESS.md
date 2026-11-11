@@ -1065,3 +1065,13 @@ The `new-memory/` directory is bookkeeping and is removed before anything lands 
 - `sc/amd-groupseat` (111c8dfe): HIP quantized selects / gathers / dequant lose GroupSeat (always RESIDENT since M78);
   three shared engine-cuda call sites temporarily duplicated per backend (CUDA copy deleted with L40S's kernels-cuda
   GroupSeat removal). ROCm goldens all 8 + buffered bitwise; build matrix incl. pie cuda / rocm clean.
+
+### M82 — 2026-11-11: bodies always arm; capture fire runs once; unrecorded serving is loud (A11)
+- `sc/eager-fix` (97fc96139): arming's synthetic lanes took a record + fresh pages each (~269 chunks on Qwen3.5-0.8B)
+  and failed inside a budgeted pool -> they now share records/pages (Pools::synthetic_room); fit_the_card subtracts
+  unbacked activation (likely the ROCm 0/0 cause, AMD verifying); a load that arms nothing is refused. Wrong tokens:
+  on the fire that captured a body during serving, the step ran AND the new body launched -> recurrent rows folded
+  twice; extra launch removed. Unrecorded serving fires log WARNING (1st, 2nd, 4th, ...) and count eager_unbodied.
+  New probe golden_eager_resume. t_resume correct and 112/112 armed at 216 MiB / 1 GiB / 2 GiB / none; CUDA goldens
+  = base (re-run after merge).
+- Merge fix: enqueue.rs eager_walk (M78 removed hosts_experts) + eager_unbodied reason; stale deferred_tier in a probe.

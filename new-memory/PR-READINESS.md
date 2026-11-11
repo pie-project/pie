@@ -14,7 +14,7 @@ Branch today: 432 commits ahead of main, 782 files, +86k / -13k. Main merged in 
 | A7 | XLA weight streaming + snapshots (sc/xla2, partial) | TPU | queued |
 | A8 | Cerebras wafer `Spatial` engine still states degenerate facts (owner's unmerged branch) | Cerebras owner | blocked |
 | A10 | Delete device/host weight budgets, dense rotor, dense host tier; max_state_slots | L40S, Metal, VK5 | done M76 (dead legacy tier cleanup left) |
-| A11 | Eager path wrong tokens on a resumed hybrid; nothing arms at <= 2 GiB budget (e2e handles) | EAGER agent | in progress |
+| A11 | Eager path wrong tokens; nothing arms at small budgets | EAGER | done M82 (ROCm verify pending) |
 | A12 | Named snapshots on the shared pool (take_host None); host-full resume hang + shortfall miscount; keep-handles key must cover the record | RT agent | in progress |
 | A13 | Record rs-buffered fires (MTP / spec decode on hybrids walk eagerly; same on main) — graph capture rule | L40S | after perf fixes |
 | A9 | dsv41 two-window mini cannot fire on sm_89/sm_120 (fused.lse_sink kernel gap) -> two-window CUDA unverified | L40S | queued |
