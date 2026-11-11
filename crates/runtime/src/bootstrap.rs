@@ -405,9 +405,13 @@ async fn bootstrap_inner(config: Config) -> Result<BootstrapHandle> {
         .collect();
     let scales: Vec<crate::policy::pressure::Scale> = engine_configs
         .iter()
-        .map(|d| crate::policy::pressure::Scale {
-            kv_page_bytes: d.resizable_kv_page_bytes,
-            state_slot_bytes: d.rs_cache_slot_bytes,
+        .map(|d| {
+            crate::store::shared::SharedPool::scale_of(&d.chunks).unwrap_or(
+                crate::policy::pressure::Scale {
+                    kv_page_bytes: d.resizable_kv_page_bytes,
+                    state_slot_bytes: d.rs_cache_slot_bytes,
+                },
+            )
         })
         .collect();
     // Each engine's weight shapes and the chunks they may take.

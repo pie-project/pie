@@ -110,6 +110,18 @@ pub trait PoolPort: Send + Sync + 'static {
         wanted: usize,
     ) -> Option<crate::store::kv::KvResidencyTxn>;
     fn prepare_demote(&self, room: usize) -> Option<crate::store::kv::KvResidencyTxn>;
+    /// [`Self::prepare_sweep`] of the tails past the heads `order` names
+    /// alone: those heads stay however few pages move.
+    fn prepare_tail_sweep(
+        &self,
+        keep: &HashSet<crate::store::kv::page_table::WorkingSetId>,
+        room: usize,
+        order: &[(crate::store::kv::page_table::WorkingSetId, u64)],
+        wanted: usize,
+    ) -> Option<crate::store::kv::KvResidencyTxn> {
+        let _ = (keep, room, order, wanted);
+        None
+    }
     /// Idle cache parked on the host, up to `room` pages, going on down to
     /// disk, lowest key first. `None` where nothing goes.
     fn prepare_spill(&self, room: usize) -> Option<crate::store::kv::KvSpillTxn> {
@@ -411,6 +423,24 @@ impl PoolPort for RegistryPool {
         }
         self.with_kv_tagged("planner-sweep", |kv| {
             kv.prepare_sweep(keep, room, order, wanted)
+        })
+        .inspect_err(|error| tracing::warn!(%error, "planner: sweep prepare failed"))
+        .ok()
+        .flatten()
+    }
+
+    fn prepare_tail_sweep(
+        &self,
+        keep: &HashSet<crate::store::kv::page_table::WorkingSetId>,
+        room: usize,
+        order: &[(crate::store::kv::page_table::WorkingSetId, u64)],
+        wanted: usize,
+    ) -> Option<crate::store::kv::KvResidencyTxn> {
+        if !self.suspend_capable {
+            return None;
+        }
+        self.with_kv_tagged("planner-sweep", |kv| {
+            kv.prepare_tail_sweep(keep, room, order, wanted)
         })
         .inspect_err(|error| tracing::warn!(%error, "planner: sweep prepare failed"))
         .ok()

@@ -93,6 +93,13 @@ impl Shortfall {
         self.waiters.get(&id).map(|short| short.since)
     }
 
+    /// Whether waiter `id` lacks room on the host.
+    pub(super) fn host_short(&self, id: u64) -> bool {
+        self.waiters
+            .get(&id)
+            .is_some_and(|short| short.bytes[Tier::Host.index()] > 0)
+    }
+
     /// What waiter `id` lacks most of: the tier and its bytes.
     pub(super) fn worst(&self, id: u64) -> Option<(Tier, u64)> {
         let short = self.waiters.get(&id)?;

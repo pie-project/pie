@@ -126,6 +126,22 @@ impl ResidencyPlanner {
             .saturating_add(u64::from(units.rs.slots).saturating_mul(slot))
     }
 
+    /// The host rows one set's state takes, which a new ask leaves free for
+    /// a restore: a set parked on the host comes back by parking another in
+    /// its place, which needs that much room while both stand.
+    pub(super) fn restore_reserve(&self) -> RsUnits {
+        let (_, total) = self.port.rs_host_stats();
+        let mut windows = total.windows;
+        for list in &mut windows {
+            *list = (*list).min(1);
+        }
+        RsUnits {
+            slots: total.slots.min(1),
+            pages: total.pages.min(1),
+            windows,
+        }
+    }
+
     /// Waiter `key` lacks `device` bytes on the device and `host` on the
     /// host that the planner's own moves cannot give it; both 0 once it
     /// lacks nothing the policy must free.
@@ -150,6 +166,11 @@ impl ResidencyPlanner {
         };
         if self.short.lock().since(head.1).is_none() {
             return false;
+        }
+        // The host is what is short: the policy frees it by letting a set at
+        // rest go, and the head fails at its deadline if none does.
+        if self.short.lock().host_short(head.1) {
+            return true;
         }
         let (model, engine) = self.port.locus();
         resting
@@ -400,7 +421,10 @@ impl ResidencyPlanner {
 
     /// Not what the head and restores under way read: they would bring it
     /// straight back.
-    pub(super) fn sweep_stranded(self: &Arc<Self>, wanted: u32) -> bool {
+    /// With `tails_only`, only the tails past a head a key keeps go: a set
+    /// keyed whole stays as it is (what a head short of state reaches for,
+    /// as a whole set moves with its state instead).
+    pub(super) fn sweep_stranded(self: &Arc<Self>, wanted: u32, tails_only: bool) -> bool {
         if self.sweep_exhausted.load(Ordering::Acquire)
             || self.sweeping.swap(true, Ordering::AcqRel)
         {
@@ -412,7 +436,7 @@ impl ResidencyPlanner {
         // What rests goes in the order it would be evicted, and no more of
         // it than is wanted: a policy's keys hold here too, the head of a set
         // they keep going last.
-        let order: Vec<_> = self
+        let ordered: Vec<(crate::store::kv::page_table::WorkingSetId, u64)> = self
             .with_inner(|inner| {
                 let mut holders: Vec<_> = inner
                     .procs
@@ -431,7 +455,16 @@ impl ResidencyPlanner {
                     .map(move |ws| (ws, head))
             })
             .collect();
-        let keep: HashSet<_> = self
+        // Tails only: a set keyed whole stays where it is (a sweep moves
+        // every suspended set it is not told to keep).
+        let (order, whole): (Vec<_>, Vec<_>) = ordered
+            .into_iter()
+            .partition(|&(_, head)| !tails_only || head > 0);
+        if order.is_empty() && tails_only {
+            self.sweeping.store(false, Ordering::Release);
+            return false;
+        }
+        let mut keep: HashSet<_> = self
             .with_inner(|inner| {
                 let mut pids: Vec<ProcessId> = inner
                     .procs
@@ -447,10 +480,16 @@ impl ResidencyPlanner {
                 crate::inferlet::process::residency::kv_working_set_ids(pid, model, engine)
             })
             .collect();
+        keep.extend(whole.into_iter().map(|(ws, _)| ws));
         let txn = (room > 0)
             .then(|| {
-                self.port
-                    .prepare_sweep(&keep, room, &order, wanted as usize)
+                if tails_only {
+                    self.port
+                        .prepare_tail_sweep(&keep, room, &order, wanted as usize)
+                } else {
+                    self.port
+                        .prepare_sweep(&keep, room, &order, wanted as usize)
+                }
             })
             .flatten();
         let Some(txn) = txn else {
@@ -944,7 +983,7 @@ impl ResidencyPlanner {
             },
         };
         let (picks, unhostable) =
-            self.quote_and_pick(pausable, everything, self.swap_room(), model, engine);
+            self.quote_and_pick(pausable, everything, self.swap_room(), 0, model, engine);
         // No tier takes them: they keep running.
         ptrace!(
             "pause picks={} unhostable={} room={:?}",
@@ -1137,16 +1176,21 @@ impl ResidencyPlanner {
     }
 }
 
-/// What the whole of a holder keeps: a key on a prefix keeps only that prefix.
+/// What a holder ranks by as a victim. Moving it whole takes its state
+/// too (on a shared pool its record, rs list and window slots), which every
+/// token it keeps reads: so it ranks by the highest key on its set, the
+/// key on its head where a policy keeps one (`Retain::upto`). A tail the
+/// head's key does not cover goes first by itself ([`holder_head`], the
+/// sweep), its pages at the whole set's key.
 fn holder_key(pid: ProcessId) -> i64 {
     use crate::policy::retention::{Installed, Keys};
-    Installed.key_at(Some(pid), u64::MAX)
+    Installed.key_at(Some(pid), 0)
 }
 
 /// The tokens a holder's keys keep above the whole of it.
 fn holder_head(pid: ProcessId) -> u64 {
     use crate::policy::retention::{Installed, Keys};
-    let whole = holder_key(pid);
+    let whole = Installed.key_at(Some(pid), u64::MAX);
     Installed
         .steps(pid)
         .into_iter()

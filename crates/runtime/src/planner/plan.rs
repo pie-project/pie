@@ -127,7 +127,7 @@ impl ResidencyPlanner {
                     if self.reclaim_idle_once() {
                         continue;
                     }
-                    if self.sweep_stranded(count) {
+                    if self.sweep_stranded(count, false) {
                         return;
                     }
                     fund_by_eviction
@@ -141,11 +141,18 @@ impl ResidencyPlanner {
                     }
                     // On a shared pool the chunks idle cache holds open for
                     // state too: it moves down a tier before any is dropped.
-                    if self.port.rs_as_pages(need) > 0 && self.demote_idle() {
+                    let as_pages = self.port.rs_as_pages(need);
+                    if as_pages > 0 && self.demote_idle() {
                         return;
                     }
                     if self.reclaim_idle_once() || self.reclaim_head_sharing() {
                         continue;
+                    }
+                    // And the tails of sets at rest past what their keys
+                    // keep, lowest key first, before any set moves whole
+                    // (its state with it).
+                    if as_pages > 0 && self.sweep_stranded(as_pages, true) {
+                        return;
                     }
                     fund_by_eviction
                 }

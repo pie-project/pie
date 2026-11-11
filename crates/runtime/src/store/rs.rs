@@ -915,13 +915,11 @@ impl RsStore {
     /// Host rows for a read or a write that is none of the planner's: state
     /// slots first, then buffer pages. `None` if the host lacks either.
     ///
-    /// A shared pool's host rows are slot refs of its host tier, which the
-    /// engine's byte reads (`read_host_state`) do not name: none are given
-    /// out for those.
+    /// A shared pool's host rows are slot refs of its host tier: records
+    /// (a slot of each fixed shape a piece) and rs list or window slots,
+    /// whose bytes the engine reads and writes by those refs
+    /// ([`Self::tier_refs`], `Engine::read_tier_slots`).
     pub fn take_host(&mut self, slots: usize, pages: usize) -> Option<Vec<RsSlotId>> {
-        if self.is_shared() {
-            return None;
-        }
         let mut rows = self.host_slots.try_alloc_n(slots)?;
         let Some(buffer) = self.host_pages.try_alloc_n(pages) else {
             self.host_slots.release_reserved(rows);
@@ -933,6 +931,48 @@ impl RsStore {
 
     pub fn give_host(&mut self, rows: Vec<RsSlotId>) {
         self.release_host(rows);
+    }
+
+    /// A shared pool's host rows `rows` as the engine names them: for each
+    /// row in order, the refs of each shape it spans (a record's pieces, a
+    /// list slot), runs of one shape merged. The order the bytes of
+    /// `Engine::read_tier_slots` lie in.
+    pub fn tier_refs(&self, rows: &[RsSlotId]) -> Vec<(::engine::chunk::ShapeId, Vec<u32>)> {
+        let mut out: Vec<(::engine::chunk::ShapeId, Vec<u32>)> = Vec::new();
+        for &row in rows {
+            for (shape, refs) in self.host_pool_of(row).slot_refs(row) {
+                match out.last_mut() {
+                    Some((last, all)) if *last == shape => all.extend(refs),
+                    _ => out.push((shape, refs)),
+                }
+            }
+        }
+        out
+    }
+
+    /// A shared pool's copy of device rows to host rows, `(device, host)`
+    /// pairs, shape by shape: what `copy_slots` moves.
+    pub fn tier_copies(
+        &self,
+        moves: &[(RsSlotId, RsSlotId)],
+    ) -> Vec<(::engine::chunk::ShapeId, Vec<(u32, u32)>)> {
+        let mut out: Vec<(::engine::chunk::ShapeId, Vec<(u32, u32)>)> = Vec::new();
+        for &(device, host) in moves {
+            let host_refs = self.host_pool_of(host).slot_refs(host);
+            for ((shape, device), (_, host)) in self
+                .pool_of(device)
+                .slot_refs(device)
+                .into_iter()
+                .zip(host_refs)
+            {
+                let pairs = device.into_iter().zip(host);
+                match out.iter_mut().find(|(at, _)| *at == shape) {
+                    Some((_, all)) => all.extend(pairs),
+                    None => out.push((shape, pairs.collect())),
+                }
+            }
+        }
+        out
     }
 
     /// A set of its own on host rows, as `export` said one stood.

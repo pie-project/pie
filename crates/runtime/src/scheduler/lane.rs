@@ -830,6 +830,11 @@ impl Lane {
                         .write_host_state(&slots, &pages, &bytes)
                         .map(|()| Vec::new())
                         .map_err(Into::into),
+                    HostKvOp::ReadTier(slots) => engine.read_tier_slots(&slots).map_err(Into::into),
+                    HostKvOp::WriteTier(slots, bytes) => engine
+                        .write_tier_slots(&slots, &bytes)
+                        .map(|()| Vec::new())
+                        .map_err(Into::into),
                     HostKvOp::TapGroups => {
                         Ok(serde_json::to_vec(&engine.tap_groups()).unwrap_or_default())
                     }
