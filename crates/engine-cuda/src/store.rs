@@ -1338,8 +1338,20 @@ impl Pools {
         let least = chunks_at(layout, &self.paging, one_slot, slots);
         let need = self.chunk_bytes(least);
         // A stated budget is the pool's before the bodies and programs are
-        // held anything; with none, one working set is.
-        let claim = self.budget.unwrap_or(need);
+        // held anything; with none, one working set is, and beside it every
+        // weight the pool would hold, where the card holds them with the
+        // bodies' floor and the programs left: the bodies' allowance never
+        // turns weights that fit into weights that stream. A card short of
+        // that streams them (the runtime's call) and the bodies arm.
+        let whole = need.saturating_add(self.weight_pool_bytes());
+        let floor = bodies.min(BODIES_FLOOR_BYTES).saturating_add(programs);
+        let claim = self
+            .budget
+            .unwrap_or(if live >= whole.saturating_add(floor) {
+                whole
+            } else {
+                need
+            });
         let (bodies, programs) = holds_within(bodies, programs, live.saturating_sub(claim));
         let held = programs.saturating_add(bodies);
         let room = live.saturating_sub(held);
@@ -2772,6 +2784,25 @@ impl Pools {
         }
     }
 
+    /// The bytes every weight the caches state takes in the pool: each
+    /// shape's atoms in whole chunks of its own, as
+    /// [`Pools::preseat_plan`] seats them.
+    #[must_use]
+    pub fn weight_pool_bytes(&self) -> u64 {
+        let chunks: u64 = self
+            .row_caches
+            .iter()
+            .map(|cache| (cache.shape.per_chunk, cache.slots.len()))
+            .chain(
+                self.expert_caches
+                    .iter()
+                    .map(|cache| (cache.shape.per_chunk, cache.slots.len())),
+            )
+            .map(|(per_chunk, atoms)| (atoms as u64).div_ceil(u64::from(per_chunk.max(1))))
+            .sum();
+        chunks.saturating_mul(self.chunks.layout().chunk_bytes)
+    }
+
     /// The residency a load seats its weights by before the runtime names
     /// any slot: every atom of every shape, each shape's in chunks of its
     /// own from the pool's first on. `None` where the pool cannot hold them
@@ -2799,15 +2830,10 @@ impl Pools {
             }));
             first = first.checked_add((atoms as u32).div_ceil(per_chunk))?;
         }
-        // No more chunks than the pool will have once it is fitted: a stated
-        // `device_kv_budget` is all of it, and the fit limits the range to
-        // that, under whatever was seated past it.
-        let chunk = self.chunks.layout().chunk_bytes.max(1);
-        let most = self.budget.map_or(self.chunks.total(), |budget| {
-            u32::try_from(budget / chunk)
-                .unwrap_or(u32::MAX)
-                .min(self.chunks.total())
-        });
+        // No more chunks than the fit left the pool (a stated
+        // `device_kv_budget` is all of it): the range is limited to them,
+        // under whatever was seated past it.
+        let most = self.fitted_chunks();
         (first < most).then_some(engine::chunk::WeightResidency {
             staging: Vec::new(),
             resident,
