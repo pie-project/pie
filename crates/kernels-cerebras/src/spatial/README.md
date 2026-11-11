@@ -1,7 +1,7 @@
 # The wafer program (Cerebras CS-3)
 
 The wafer program runs one bf16 model on a CS-3 wafer at batch 1. It is built for Qwen3.5 (9B, 4B and 0.8B),
-Qwen3-8B, Llama 3.1 8B (on the simulator so far), Gemma 4 (E2B, E4B, 12B) and gpt-oss-20b (section 7). This file covers its design, results, build and run, the parameters and environment variables, the
+Qwen3-8B, Llama 3.1 8B, Gemma 4 (E2B, E4B, 12B) and gpt-oss-20b (section 7). This file covers its design, results, build and run, the parameters and environment variables, the
 metrics, and open items.
 Serving is Rust only: the engine's `spatial::artifact::ArtifactModel` behind its `Wafer` runs the build's
 artifact (`artifact.rs`; this module is the build). The Python under `crates/kernels-cerebras/tools/`
@@ -83,7 +83,7 @@ and Qwen3-8B.
 
 | model | layout | bare tok/s | Pie tok/s | notes |
 |---|---|---|---|---|
-| Llama 3.1 8B | wafer program, the 9B geometry (8 units 256 x 256, Hc 16, Ic 56, K 4; QKN 0) | not yet on chip | not yet on chip | tiny Llama golden on the simulator; forecast 2,029-2,057. The removed per-model layout ran 2,044 bare, ~2,000 Pie |
+| Llama 3.1 8B | wafer program, the 9B geometry with 32 KV entries a row (8 units 256 x 256, Hc 16, Ic 56, K 4, NE 32: 8,192 positions; QKN 0) | 2,028 (0.493 ms) | 2,002-2,015 (0.4966 ms/step, 98.8-99.4%) | greedy 512 golden bare (wafer-bench, two sequences, rollback, logits argmax) and in Pie (6 of 6 reps, 0989); preset `l3-8b`. The removed per-model layout: 2,044 bare, ~2,000 Pie |
 | Qwen3.5-9B | wafer program (wl11: 8 units 256 x 256, K 4) | 1,961 | 1,908 (0.5241 ms/step, 97.3%) | loop 381.7k cycles; GDN 11.1k / attention 11.45k a layer |
 | Qwen3.5-4B | wafer program, the 9B geometry (Hc 10, Ic 36) | 2,057 | 1,998 (0.5005 ms/step, 97.1%) | GDN 10.6k / attention 10.96k |
 | Qwen3.5-0.8B | wafer program, 6 units of 256 x 128 (Hc 8, Ic 14, NE 128) | 3,390 | 3,286 (0.3043 ms/step, 96.9%) | GDN 8.2k / attention 9.2k |
@@ -107,8 +107,9 @@ Notes on the table:
 - Gemma 4 and gpt-oss-20b serve with 64-step loops, their plan's `LOOP`. gpt-oss at a fixed L32 / L64 posted
   0.6634 / 0.6619 ms (1,511 tok/s); with the plan's doubling loops up to 64, 0.6569 ms. Pie's overhead in ms equals
   the previous gpt-oss build's (gpo6: 0.6779 / 0.6723 ms against 0.661 bare): the ratio fell because bare got faster.
-- Llama 3.1 8B: 32 dense layers without q / k norms on the 9B's 8 K4 units (the first preset that builds), its
-  rotation Llama 3's scaled frequencies from the trace, eps 1e-5. Not yet measured on the chip.
+- Llama 3.1 8B: 32 dense layers without q / k norms on the 9B's 8 K4 units, its rotation Llama 3's scaled
+  frequencies from the trace, eps 1e-5. Every layer attends, so the KV entries decide whether the weight PEs link:
+  the 9B's 64 a row ran out of PE memory; 48 / 32 / 16 leave 912 / 3,104 / 5,024 B of stack room. `l3-8b` keeps 32.
 
 ## 3. Serve, build and run
 
@@ -125,7 +126,7 @@ async = true
 # posted_loop = 32         # default: the plan's LOOP
 
 [engine.wafer]             # all optional
-# preset = "9b"            # else the first of the family's presets that builds
+# preset = "9b"            # else the preset made for the model's shape, else the first that builds
 # build = "never"          # refuse a program the cache does not hold (a chip session)
 # tiles = "memory"         # cut the checkpoint for each load instead of caching the cut
 
@@ -256,8 +257,8 @@ They match HF f32 logprobs to within 0.004 on the chosen token.
   identical text on the wafer program. The seed path was traced through the interpreter's
   RngKeyed and engine-cerebras's per-bind channel seeds, and no loss was found. It needs an A/B on
   a CUDA or Metal Pie.
-- **Llama 3.1 8B on the chip.** It runs on the simulator (the tiny Llama's golden); its cut on the full checkpoint,
-  a 256 / 512 golden run and the speed on the CS-3 are still to do.
+- **PE memory in the plan.** Fit checks the wafer's bounds and the Dense family's even splits, not PE memory: a
+  partition that runs out of it shows at link only, and a load then links the next plan in preference order.
 
 - **Gemma 4 12B speed.** 0.946 ms against a ~0.86 ms forecast. A sliding layer is ~13.3k cycles
   (0.982 ms and 14.1k before the exact ring). The attention-row PE has 1,776 B of stack room, too

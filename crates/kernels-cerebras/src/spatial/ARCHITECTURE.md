@@ -8,10 +8,10 @@ engine (`engine-cerebras`) runs its **artifact** and knows none of it (below).
 
 ```
 .poem trace ─target::shape─▶ Shape ─family::serving─▶ Family
- (or a shape file)               │                       │ presets (a named one, or each in order)
+ (or a shape file)               │                       │ presets (a named one, or the one made for the shape first)
                                  └──────────┬────────────┘
                                             ▼ Family::plan            (poem_compiler::spatial::plan:
-                                          Plan ─Family::blocks─▶ [Block]   the first preset that builds)
+                                          Plan ─Family::blocks─▶ [Block]   the first of them that builds)
                                             │                        │ floor   ─▶ Floor  (units, head, stores; a PeRole a PE)
                                             │                        │ wire    ─▶ Wiring (typed links over open Classes / Slots)
                                             │                        │ settle  ─▶ Floor  (PEs placed where links cross)
