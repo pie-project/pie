@@ -1,0 +1,129 @@
+// wafer/ops/cy_att.csl: a column control PE's attention phases over a layer's own cache (README.md;
+// the weight PEs' side: ops/att.csl). rms scale; the q / k norms' weights (their rms rides in the
+// weight PEs' score segment all-reduce); partial RoPE from RLV-level tables; multicast [q | k | v |
+// position | the raw sums of squares]; from the values reduction o / l, the redo flag (a sum outside
+// the f16 probabilities' window) and the log-sum-exp steps; o times sigmoid(gate); multicast [o |
+// redo | steps] (ATTL 2: the steps follow in a second multicast, off the path).
+//
+// Interface: qkw (q / k norm weights [layer][Qh Dc | Dc]), rot (RoPE tables [RLV][2^RBITS][cos | sin]
+// [NROT]: positions < 2^(RBITS RLV)).
+//
+// Params: pe (ops/cpe.csl), math (ops/math.csl), NL (attention layers on the unit), NQA (the
+// reduction's words before ssq: Qh Dc q (| Qh Dc gate) | Dc k | Dc v), Qh (q heads a column), Dc (kv
+// dims a column), NROT (rotated pairs a column), RLV / RBITS (the tables' levels and bits), GATE (1:
+// q_proj carries the output gate), ATTV (1: o / l times the gate as vector ops), ATTL (2: the steps
+// in a second multicast; 0: with o), ROPEP (1: the next position's tables after the multicast, one
+// attention layer a unit).
+param pe: imported_module;
+param math: imported_module;
+param NL: u16;
+param NQA: u16;
+param Qh: u16;
+param Dc: u16;
+param NROT: u16;
+param RLV: u16 = 4;
+param RBITS: u16 = 3;
+param GATE: u16 = 1;
+param ATTV: u16 = 1;
+param ATTL: u16 = 2;
+param ROPEP: u16 = 1;
+
+fn mx(a: u16, b: u16) u16 { return if (a > b) a else b; }
+const QD: u16 = Qh * Dc;
+const KO: u16 = (1 + GATE) * Qh * Dc;      // k's offset in the reduction (after q and the gate)
+var qkw = @zeros([if (NL > 0) NL * (Qh * Dc + Dc) else 1]f32);
+const RB: u16 = 1 << RBITS;
+var rot = @zeros([if (NL > 0) RLV * RB * 2 * NROT else 1]f32);
+var gate = @zeros([if (NL > 0 and GATE == 1) Qh * Dc else 1]f32);
+var rc = @zeros([mx(NROT, 1)]f32);
+var rs = @zeros([mx(NROT, 1)]f32);
+const rp = @import_module("ops/rope.csl", .{ .rot = &rot, .rc = &rc, .rs = &rs, .NROT = NROT, .LV = RLV, .BITS = RBITS });
+var ilh = @zeros([mx(Qh, 1)]f32);
+
+var rope_at: u32 = 0xffffffff;   // the position rc / rs hold
+fn rope_tables_at(p: u32) void {
+  // cos / sin of position p for each rotated pair: products of RLV table levels (its RBITS-bit digits)
+  if (rope_at == p) { return; }
+  rope_at = p;
+  rp.tables(p, 0, 0, NROT);
+}
+fn rope(o: u16) void {
+  // pairs (o + 2 j, o + 2 j + 1) of t: the host places each rotated pair's two halves adjacent
+  rp.rotate(&pe.t, o, 0, NROT);
+}
+
+// attention layer a (of the unit's attention layers)
+fn layer(a: u16) void {
+  const N = NQA + 1;
+  pe.reduce(N);
+  pe.stamp(1 + 6 * pe.cl + 0);
+  const rr = math.rsqrt(pe.t[NQA] / pe.HID + pe.EPS);
+  @fmuls(pe.tv(0, NQA), pe.tv(0, NQA), rr);
+  const qkb = a * (QD + Dc);
+  // the raw q / k sums of squares a head (the weight PEs' segment all-reduce completes them)
+  var h: u16 = 0;
+  while (h < Qh) : (h += 1) {
+    var ss: f32 = 0.0;
+    var d: u16 = 0;
+    while (d < Dc) : (d += 1) { const v = pe.t[h * Dc + d]; ss += v * v; }
+    pe.u[QD + 2 * Dc + 1 + h] = ss;
+  }
+  var ks: f32 = 0.0;
+  var d: u16 = 0;
+  while (d < Dc) : (d += 1) { const v = pe.t[KO + d]; ks += v * v; }
+  pe.u[QD + 2 * Dc + 1 + Qh] = ks;
+  const qw = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{QD} -> qkw[i] });
+  @fmuls(pe.tv(0, QD), pe.tv(0, QD), @set_dsd_length(@increment_dsd_offset(qw, @as(i16, qkb), f32), QD));
+  @fmuls(pe.tv(KO, Dc), pe.tv(KO, Dc), @set_dsd_length(@increment_dsd_offset(qw, @as(i16, qkb + QD), f32), Dc));
+  rope_tables_at(pe.tab[0]);
+  h = 0;
+  while (h < Qh) : (h += 1) { rope(h * Dc); }
+  rope(KO);
+  if (GATE == 1) { @fmovs(@set_dsd_length(@get_dsd(mem1d_dsd, .{ .tensor_access = |i|{QD} -> gate[i] }), QD), pe.tv(QD, QD)); }
+  @fmovs(pe.uv(0, QD), pe.tv(0, QD));
+  @fmovs(pe.uv(QD, 2 * Dc), pe.tv(KO, 2 * Dc));
+  pe.u[QD + 2 * Dc] = @as(f32, pe.tab[0]);
+  pe.mcast(QD + 2 * Dc + 2 + Qh);
+  pe.stamp(1 + 6 * pe.cl + 1);
+  if (ROPEP == 1 and NL == 1) { rope_tables_at(pe.tab[0] + 1); }   // (one attention layer a unit: the next pass's tables)
+  var gi: u16 = 0;   // the output gate's sigmoid while the weight PEs run the scores
+  while (GATE == 1 and gi < QD) : (gi += 1) { gate[gi] = math.sigm(gate[gi]); }
+  var pass: u16 = 0;
+  while (pass < 8) : (pass += 1) {
+    pe.reduce(Qh * (Dc + 1));
+    var bad: f32 = 0.0;
+    h = 0;
+    while (h < Qh) : (h += 1) {
+      const l = pe.t[h * (Dc + 1) + Dc];
+      if (l < 0.00390625 or l >= 32768.0) { bad = 1.0; }   // the f16 probabilities' window
+      ilh[h] = math.recip(l);
+      if (ATTV == 0) {
+        var dd: u16 = 0;
+        while (dd < Dc) : (dd += 1) { pe.u[h * Dc + dd] = pe.t[h * (Dc + 1) + dd] * ilh[h] * (if (GATE == 1) gate[h * Dc + dd] else 1.0); }
+      }
+    }
+    if (ATTV == 1) {
+      // o / l, then the gate: two vector ops a head (a mem4d form tripped cslc: "operand does not dominate")
+      const gd = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{Dc} -> gate[i] });
+      var hh: u16 = 0;
+      while (hh < Qh) : (hh += 1) {
+        @fmuls(pe.uv(hh * Dc, Dc), pe.tv(hh * (Dc + 1), Dc), ilh[hh]);
+        if (GATE == 1) { @fmuls(pe.uv(hh * Dc, Dc), pe.uv(hh * Dc, Dc), @increment_dsd_offset(gd, @as(i16, hh * Dc), f32)); }
+      }
+    }
+    h = 0;
+    while (h < Qh) : (h += 1) {
+      const lh = pe.t[h * (Dc + 1) + Dc];
+      pe.u[QD + 1 + h] = if (ATTL == 2 and bad == 0.0) 0.0 else math.ln1(lh);
+    }
+    pe.u[QD] = bad;
+    pe.mcast(QD + 1 + Qh);
+    pe.stamp(1 + 6 * pe.cl + 3);
+    if (ATTL == 2 and bad == 0.0) {   // the logs off the path (CY waits for the gate / up reduction next)
+      h = 0;
+      while (h < Qh) : (h += 1) { pe.u[h] = math.ln1(pe.t[h * (Dc + 1) + Dc]); }
+      pe.mcast(Qh);
+    }
+    if (bad == 0.0) { pass = 8; }
+  }
+}

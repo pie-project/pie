@@ -1,5 +1,5 @@
 //! gpt-oss: the attention / MoE weight halves (`weight.csl`, its entry-major attention and routed experts),
-//! CX (`cx.csl`, NRM 2), the CY halves (`ctl_cy_gptoss_att.csl`, `ctl_cy_gptoss_moe.csl`), the
+//! CX (`cx.csl`, NRM 2), the CY halves (`cy.csl` (MIXK 2, MIXK 3)), the
 //! band's head (`head_pe_gptoss.csl`) and control row ([`super::head::HEAD_CTL`]'s source). Their
 //! params from the plan ([`kernels`]) and their rcfg writers.
 
@@ -74,18 +74,20 @@ params! {
 }
 
 params! {
-    /// `ctl_cy_gptoss_att.csl`: the attention shapes, RoPE pairs, the hidden size, the RoPE
+    /// `cy.csl` (NRM 2, MIXK 2): the attention shapes, RoPE pairs, the hidden size, the RoPE
     /// table levels, the scores' scale, the levers' defaults.
     pub struct CyAtt {
         K: u32, NQA: u32, Qh: u32, Dc: u32, NROT: u32, HR: u32, NLV: u32, QSC: Lit, CYV: u32,
-        DIAG: u32, TSTAMP: u32, FIFOW: u32,
+        DIAG: u32, TSTAMP: u32, FIFOW: u32, NRM: u32, MIXK: u32, EPS: Lit,
     }
 }
 
 params! {
-    /// `ctl_cy_gptoss_moe.csl`: the expert shapes, the hidden size, the levers' defaults.
+    /// `cy.csl` (NRM 2, MIXK 3): the expert shapes, the hidden size, the norm's eps, the levers'
+    /// defaults.
     pub struct CyMoe {
         K: u32, Ic: u32, NEX: u32, TK: u32, HR: u32, GLUV: u32, DIAG: u32, TSTAMP: u32, FIFOW: u32,
+        NRM: u32, MIXK: u32, EPS: Lit,
     }
 }
 
@@ -119,7 +121,7 @@ pub const CTL_CX: Kernel = Kernel {
 };
 
 pub const CY_ATT: Kernel = Kernel {
-    source: "ctl_cy_gptoss_att.csl",
+    source: "cy.csl",
     owns: &["qb", "snk", "rot", "rcfg", "tdbg"],
     params: CyAtt::NAMES,
     route_slots: 12,
@@ -127,7 +129,7 @@ pub const CY_ATT: Kernel = Kernel {
 };
 
 pub const CY_MOE: Kernel = Kernel {
-    source: "ctl_cy_gptoss_moe.csl",
+    source: "cy.csl",
     owns: &["rb", "gb", "ps", "rcfg", "tdbg"],
     params: CyMoe::NAMES,
     route_slots: 12,
@@ -273,6 +275,9 @@ pub fn kernels(prog: &Program) -> R<Kernels> {
         DIAG: 0,
         TSTAMP: 0,
         FIFOW: 32,
+        NRM: 2,
+        MIXK: 2,
+        EPS: Lit::f32(s.norm.eps),
     };
     out.insert(CYA, KernelBuild::of(&CY_ATT, cya)?);
     let cym = CyMoe {
@@ -285,6 +290,9 @@ pub fn kernels(prog: &Program) -> R<Kernels> {
         DIAG: 0,
         TSTAMP: 0,
         FIFOW: 32,
+        NRM: 2,
+        MIXK: 3,
+        EPS: Lit::f32(s.norm.eps),
     };
     out.insert(CYM, KernelBuild::of(&CY_MOE, cym)?);
     let hp = HeadPe { VR: vr, HDc: d.hcc };

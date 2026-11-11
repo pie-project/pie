@@ -115,10 +115,10 @@ Compositions: the composer (`compose.rs`) picks the blocks from what the layers 
 
 | Family | Blocks | Kernels |
 |---|---|---|
-| Dense (Qwen3.5, Qwen3, Llama 3; composed) | `Units` (snake, at most one gap slot), `Scores` when any layer attends, `Gdn` + `Onorm` when any layer is GDN, `HeadEast`, `TokenLoop` under the contract's token loop | `kernels::dense` (`weight` (NRM 0, MIXK 0), `cx` (NRM 0), `ctl_cy_dense`) + `head` + `common::RELAY` |
+| Dense (Qwen3.5, Qwen3, Llama 3; composed) | `Units` (snake, at most one gap slot), `Scores` when any layer attends, `Gdn` + `Onorm` when any layer is GDN, `HeadEast`, `TokenLoop` under the contract's token loop | `kernels::dense` (`weight` (NRM 0, MIXK 0), `cx` (NRM 0), `cy` (MIXK 0, NRM 0)) + `head` + `common::RELAY` |
 | gpt-oss | `MoeUnits` (a snake starting upward), `AttnScores`, `Router`, `Band`, `BandLoop` | `kernels::gptoss` (`wa`, `wm`: `weight` (MIXK 2, 3), `cx`, `cya`, `cym`, the band head; `head_ctl.csl` with the bus reserved) |
-| Gemma 4 E2B / E4B | `Units` (explicit origins: the arrangement its unit shape names), `Scores` (a half row), `Ple`, `SharedKv`, `HeadEast`, `TokenLoop` | `kernels::gemma` (`weight` (NRM 1, MIXK 1, PLE 1), `cx` (NRM 1, PLE 1), `ctl_cy_gemma`, `head_ctl` (token bus on), `ple_gemma`) + `head::HEAD_PE` |
-| Gemma 4 12B | `RowRuns` (explicit origins, attention / plain row runs), `HeadGroups` | `kernels::gemma12` (`weight` (NRM 1, MIXK 1, row roles by `AROW`), `cx` (NRM 1, HG 1), `ctl_cy_gemma12`, `head_pe` with head groups) + `head::HEAD_CTL` |
+| Gemma 4 E2B / E4B | `Units` (explicit origins: the arrangement its unit shape names), `Scores` (a half row), `Ple`, `SharedKv`, `HeadEast`, `TokenLoop` | `kernels::gemma` (`weight` (NRM 1, MIXK 1, PLE 1), `cx` (NRM 1, PLE 1), `cy` (NRM 1, MIXK 1, PLE 1, KVS 1), `head_ctl` (token bus on), `ple_gemma`) + `head::HEAD_PE` |
+| Gemma 4 12B | `RowRuns` (explicit origins, attention / plain row runs), `HeadGroups` | `kernels::gemma12` (`weight` (NRM 1, MIXK 1, row roles by `AROW`), `cx` (NRM 1, HG 1), `cy` (NRM 1, MIXK 1, KEV 1), `head_pe` with head groups) + `head::HEAD_CTL` |
 
 ## Kernels and their ABI
 
@@ -183,9 +183,18 @@ them all to `layout/ops`.
 | `kv` | attention over sliding rings and global caches, shared-KV units (the KVS line), plain rows | `weight` (MIXK 1) |
 | `swa` | full and sliding-window attention with keys entry-major (sinks by CY) | `weight` (MIXK 2) |
 | `moe` | routed experts: the router's partial, E5M2 tiles decoded, the TK experts' gate / up and downs | `weight` (MIXK 3) |
+| `cpe` | a column control PE's core: the reduction's sum and the multicast's words, queues, the reduction root, the control row's segment all-reduce, the deferred norm's combine, stamps | `cy` |
+| `act` | vector exp, SiLU (lean and f16 forms), GELU-tanh (trimmed forms) | `cy` (the MLP, GDN) |
+| `cy_att` | the own-cache attention's column work: rms, q / k norm weights, partial RoPE, o / l with the gate, redo and log-sum-exp steps | `cy` (MIXK 0) |
+| `cy_gdn` | GDN's column work: conv1d ring, SiLU, gates, decay, delta, the gated norm | `cy` (MIXK 0) |
+| `cy_kv` | sliding / global attention's column work after the deferred norm (k = v layers, shared-KV q-only units, the KVS line) | `cy` (MIXK 1) |
+| `cy_ple` | the PLE bus and the per-layer embedding gate | `cy` (PLE 1) |
+| `cy_swa` | entry-major attention's column work: biases, vector RoPE, the sinks' reciprocal | `cy` (MIXK 2) |
+| `cy_moe` | the router (segment all-reduce, top-k, softmax) and the experts' clamped GLU | `cy` (MIXK 3) |
 
-What is still in the CY, head and PLE kernels is their family's own: the layer's phase order, the
-vector activations' fused forms, the PLE bus, the token loop's winner merge and the handoff relays.
+The three role kernels of a unit (`weight`, `cx`, `cy`) are each one image over every layer program: the
+phase order is theirs, the mixer and norm kinds comptime params (`NRM`, `MIXK`, `ACT`, `PLE`). What is still
+a family's own is in the head and PLE kernels: the token loop's winner merge and the handoff relays.
 
 ## Adding a model
 

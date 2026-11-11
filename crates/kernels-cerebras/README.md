@@ -38,9 +38,9 @@ column 0, then up column 1, and so on.
   - Attention: NE KV entries a row; position p lives on row p % PY.
 - **CX** (`cx.csl`, every family's). Holds x's chunk, the residuals and the norms' gammas. It is the root of the
   row reductions and does the unit handoff.
-- **CY** (`ctl_cy_dense.csl`). The root of the column reductions. It does the rms scale, the GDN conv,
-  SiLU, gates, delta and the gated norm, RoPE and the q/k norms, the softmax's o / l with its redo
-  flag and log-sum-exp steps, and the MLP SiLU.
+- **CY** (`cy.csl`, every family's). The root of the column reductions. It does the rms scale (or the
+  deferred norm's combine), the GDN conv, SiLU, gates, delta and the gated norm, RoPE and the q/k norms,
+  the softmax's o / l with its redo flag and log-sum-exp steps, and the MLP's activation.
 - **Head** (`head_pe.csl`, `head_ctl.csl`). HC columns of HDc dims by HR rows of VR vocabulary rows.
   The head holds lm_head and the embedding tiles of the same vocabulary slice. Each row's control
   PE reduces the logits and takes the row argmax. The head has HR x VR rows, more than the

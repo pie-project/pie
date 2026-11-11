@@ -4,27 +4,8 @@
 
 /// Every kernel source of `programs/wafer`, by file name.
 pub const KERNELS: &[(&str, &str)] = &[
-    (
-        "ctl_cy_dense.csl",
-        include_str!("../programs/wafer/ctl_cy_dense.csl"),
-    ),
-    (
-        "ctl_cy_gemma.csl",
-        include_str!("../programs/wafer/ctl_cy_gemma.csl"),
-    ),
-    (
-        "ctl_cy_gemma12.csl",
-        include_str!("../programs/wafer/ctl_cy_gemma12.csl"),
-    ),
-    (
-        "ctl_cy_gptoss_att.csl",
-        include_str!("../programs/wafer/ctl_cy_gptoss_att.csl"),
-    ),
-    (
-        "ctl_cy_gptoss_moe.csl",
-        include_str!("../programs/wafer/ctl_cy_gptoss_moe.csl"),
-    ),
     ("cx.csl", include_str!("../programs/wafer/cx.csl")),
+    ("cy.csl", include_str!("../programs/wafer/cy.csl")),
     (
         "head_ctl.csl",
         include_str!("../programs/wafer/head_ctl.csl"),
@@ -45,11 +26,34 @@ pub const KERNELS: &[(&str, &str)] = &[
 /// Every op module of `programs/wafer/ops`, by file name: the ops a role kernel imports with
 /// comptime params (`@import_module("ops/<name>", ..)`). A build writes them all beside the kinds.
 pub const OPS: &[(&str, &str)] = &[
+    ("act.csl", include_str!("../programs/wafer/ops/act.csl")),
     (
         "argmax.csl",
         include_str!("../programs/wafer/ops/argmax.csl"),
     ),
     ("att.csl", include_str!("../programs/wafer/ops/att.csl")),
+    ("cpe.csl", include_str!("../programs/wafer/ops/cpe.csl")),
+    (
+        "cy_att.csl",
+        include_str!("../programs/wafer/ops/cy_att.csl"),
+    ),
+    (
+        "cy_gdn.csl",
+        include_str!("../programs/wafer/ops/cy_gdn.csl"),
+    ),
+    ("cy_kv.csl", include_str!("../programs/wafer/ops/cy_kv.csl")),
+    (
+        "cy_moe.csl",
+        include_str!("../programs/wafer/ops/cy_moe.csl"),
+    ),
+    (
+        "cy_ple.csl",
+        include_str!("../programs/wafer/ops/cy_ple.csl"),
+    ),
+    (
+        "cy_swa.csl",
+        include_str!("../programs/wafer/ops/cy_swa.csl"),
+    ),
     (
         "fabric.csl",
         include_str!("../programs/wafer/ops/fabric.csl"),

@@ -1,0 +1,315 @@
+// wafer/ops/act.csl: a column control PE's vector activations (README.md): exp, SiLU (the lean and the
+// f16 forms), GELU-tanh (its trimmed forms), as f32 / f16 DSD ops over scratch vectors of AN words.
+// The MLP's forms read the column reduction's gate | up (pe.t) and write the multicast's act (pe.u).
+//
+// Params: pe (ops/cpe.csl), math (ops/math.csl), AN (the scratch vectors' words), Ic (the MLP width
+// a column), SILU (1: the f16 SiLU's buffers), GELU (1: GELU's comptime views over Ic), SILUQ (1: the
+// lean f32 SiLU), SLW (1: the f16 SiLU without the f16 subnormal flush), GELUT (GELU's form: 0 the
+// vexp-based one, 1 trimmed, 2 the cheaper f16 reciprocal).
+param pe: imported_module;
+param math: imported_module;
+param AN: u16;
+param Ic: u16;
+param SILU: u16 = 0;
+param GELU: u16 = 0;
+param SILUQ: u16 = 1;
+param SLW: u16 = 0;
+param GELUT: u16 = 2;
+
+var va: [AN]f32 align(16) = @zeros([AN]f32);
+var vb: [AN]f32 align(16) = @zeros([AN]f32);
+var vcr: [AN]f32 align(16) = @zeros([AN]f32);
+var vk = @zeros([AN]u16);
+const va_d = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{AN} -> va[i] });
+const vb_d = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{AN} -> vb[i] });
+const vc_d = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{AN} -> vcr[i] });
+const vk_d = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{AN} -> vk[i] });
+var vpl = vk_d;
+var vah = vk_d;
+fn init() void {
+  vpl = @set_dsd_stride(@set_dsd_base_addr(vk_d, @ptrcast([*]u16, &vb)), 2);
+  vah = @increment_dsd_offset(@set_dsd_stride(@set_dsd_base_addr(vk_d, @ptrcast([*]u16, &va)), 2), 1, u16);
+  if (GELU == 1) { ginit(); }
+}
+
+// buf = exp(buf), buf in [-87, 88] (exp_fast's form; p in vb, k's bits in vk)
+fn vexp(buf: mem1d_dsd, n: u16) void {
+  const p = @set_dsd_length(vb_d, n);
+  const kk = @set_dsd_length(vk_d, n);
+  const pl = @set_dsd_length(vpl, n);
+  math.vexp(buf, p, kk, pl, 88.0, true);
+}
+
+// ---------------------------------------------------------------- SiLU
+// dst = silu(src) = max(x, x e) / (1 + e), e = exp(-|x|) (dst != src)
+fn vsilu(dst: mem1d_dsd, src: mem1d_dsd, n: u16) void {
+  const e = @set_dsd_length(va_d, n);
+  const d = @set_dsd_length(vb_d, n);
+  const r = @set_dsd_length(vc_d, n);
+  @fnegs(dst, src);
+  @fmaxs(e, src, dst);
+  @fnegs(e, e);
+  vexp(e, n);
+  @fadds(d, e, 1.0);
+  @fmuls(r, d, 0.323112507040746);
+  @fadds(r, r, -1.4540415401729079);
+  @fmuls(r, r, d);
+  @fadds(r, r, 2.1207294161729284);
+  var k: u16 = 0;
+  while (k < 2) : (k += 1) {
+    @fmuls(dst, d, r);
+    @fsubs(dst, 2.0, dst);
+    @fmuls(r, r, dst);
+  }
+  @fmuls(dst, src, e);
+  @fmaxs(dst, dst, src);
+  @fmuls(dst, dst, r);
+}
+
+// dst = silu(src), the lean form (SILUQ 1): e = exp(-|x|) (the sign bit set by one or16 on the high
+// halves, a lower clamp only), 1 / (1 + e) by the quadratic and two Newton steps: vsilu's arithmetic
+// (bit-identical results; one step, ~1e-4, flipped a near tie on the 9B golden), fewer copies
+fn vsiluq(dst: mem1d_dsd, src: mem1d_dsd, n: u16) void {
+  const x = @set_dsd_length(va_d, n);       // -|x|, then d = 1 + e
+  const p = @set_dsd_length(vb_d, n);       // exp's p, then e
+  const r = @set_dsd_length(vc_d, n);
+  const kk = @set_dsd_length(vk_d, n);
+  const pl = @set_dsd_length(vpl, n);
+  const ph = @increment_dsd_offset(pl, 1, u16);
+  @fmovs(x, src);
+  @or16(@set_dsd_length(vah, n), @set_dsd_length(vah, n), 0x8000);   // -|x|
+  @fmaxs(x, x, -87.0);
+  @fmuls(p, x, 1.4426950408889634);
+  var c: u16 = 0;
+  while (c < 3) : (c += 1) {
+    @fadds(p, p, math.ex_a[c]);
+    if (c == 1) { @fmacs(x, x, p, -0.6931471805599453); }
+  }
+  @sll16(kk, pl, 7);
+  @fmuls(p, x, 0.041458580642938614);
+  c = 0;
+  while (c < 4) : (c += 1) {
+    if (c > 0) { @fmuls(p, p, x); }
+    @fadds(p, p, math.ex_c[c]);
+  }
+  @add16(ph, ph, kk);                       // p = e
+  @fadds(x, p, 1.0);                        // d
+  @fmuls(r, x, 0.323112507040746);
+  @fadds(r, r, -1.4540415401729079);
+  @fmuls(r, r, x);
+  @fadds(r, r, 2.1207294161729284);         // 1 / d to 1%
+  var k: u16 = 0;
+  while (k < 2) : (k += 1) {                // Newton: two steps (vsilu's)
+    @fmuls(dst, x, r);
+    @fsubs(dst, 2.0, dst);
+    @fmuls(r, r, dst);
+  }
+  @fmuls(dst, src, p);
+  @fmaxs(dst, dst, src);
+  @fmuls(dst, dst, r);
+}
+fn vsil(dst: mem1d_dsd, src: mem1d_dsd, n: u16) void { if (SILUQ == 1) { vsiluq(dst, src, n); } else { vsilu(dst, src, n); } }
+
+// The MLP's SiLU in f16 (silu16, the f32-scaled form: s g log2e and s u ln2 in f32, rounded once):
+// act (HP) = silu(rr g) rr u from pe.t's [g | u]
+const SN: u16 = if (SILU == 1) Ic else 1;
+var hg = @zeros([2 * SN]@fp16());   // G | U
+var ht = @zeros([SN]@fp16());
+var hm = @zeros([SN]@fp16());
+var hp = @zeros([SN]@fp16());
+var hq = @zeros([SN]@fp16());
+var hww = @zeros([SN]@fp16());
+var hu16 = @zeros([SN]u16);
+const h_d = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{2 * SN} -> hg[i] });
+const HG = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{SN} -> hg[i] });
+const HU = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{SN} -> hg[@as(i16, SN) + i] });
+const HT = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{SN} -> ht[i] });
+const HM = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{SN} -> hm[i] });
+const HP = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{SN} -> hp[i] });
+const HQ = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{SN} -> hq[i] });
+const HW = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{SN} -> hww[i] });
+const HB = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{SN} -> hu16[i] });
+fn hb(d: [*]@fp16()) mem1d_dsd { return @set_dsd_base_addr(HB, @ptrcast([*]u16, d)); }
+fn silu16(rr: f32) void {
+  @fmuls(pe.tv(0, Ic), pe.tv(0, Ic), rr * 1.4426950408889634);
+  @fmuls(pe.tv(Ic, Ic), pe.tv(Ic, Ic), rr * 0.6931471805599453);
+  @fs2h(h_d, pe.tv(0, 2 * Ic));
+  @or16(hb(&ht), hb(&hg), 0x8000);            // t = -|a'|
+  @fmaxh(HT, HT, @as(@fp16(), if (SLW == 1) -24.0 else -15.0));
+  @faddh(HM, HT, @as(@fp16(), 1536.0));       // m = t + 1536: round(t) in its low bits
+  @faddh(HP, HM, @as(@fp16(), -1536.0));      // n
+  @fsubh(HQ, HT, HP);                         // r = t - n in [-0.5, 0.5]
+  @fmulh(HP, HQ, @as(@fp16(), 0.05516966520599117));
+  @faddh(HP, HP, @as(@fp16(), 0.24260644929856207));
+  @fmulh(HP, HP, HQ);
+  @faddh(HP, HP, @as(@fp16(), 0.6932608957863087));
+  @fmulh(HP, HP, HQ);
+  @faddh(HP, HP, @as(@fp16(), 0.9999283788785166));   // 2^r
+  @add16(hb(&hm), hb(&hm), if (SLW == 1) 0x9a18 else 0x9a0f);   // n + 15 (1536's bits 0x6600); SLW: n + 24
+  @sll16(hb(&hm), hb(&hm), 10);               // 2^n (SLW: 2^(n + 9), normal for n >= -23)
+  @fmulh(HP, HP, HM);                         // e = exp(-|a|) (SLW: e' = e 2^9)
+  if (SLW == 1) {
+    @fmulh(HW, HP, @as(@fp16(), 0.001953125));
+    @faddh(HW, HW, @as(@fp16(), 1.0));
+  } else {
+    @faddh(HW, HP, @as(@fp16(), 1.0));        // d = 1 + e in (1, 2]
+  }
+  @fmulh(HQ, HW, @as(@fp16(), 0.323112507040746));
+  @faddh(HQ, HQ, @as(@fp16(), -1.4540415401729079));
+  @fmulh(HQ, HQ, HW);
+  @faddh(HQ, HQ, @as(@fp16(), 2.1207294161729284));   // 1/d to 1%
+  @fmulh(HW, HW, HQ);
+  @fsubh(HW, @as(@fp16(), 2.0), HW);
+  @fmulh(HQ, HQ, HW);                         // 1/d to 1e-4
+  @fmulh(HP, HP, HG);                         // a' e
+  if (SLW == 1) { @fmulh(HP, HP, @as(@fp16(), 0.001953125)); }   // (e' a') 2^-9
+  @fmaxh(HP, HP, HG);                         // a' (a >= 0) or a' e (a < 0)
+  @fmulh(HP, HP, HU);
+  @fmulh(HP, HP, HQ);
+}
+
+// ---------------------------------------------------------------- GELU-tanh
+// dst = gelu_tanh(src) = max(x, x e) / (1 + e), e = exp(-|y|), y = 1.5958 x (1 + 0.044715 x^2) (dst != src)
+fn vgelu0(dst: mem1d_dsd, src: mem1d_dsd, n: u16) void {
+  const e = @set_dsd_length(va_d, n);
+  const d = @set_dsd_length(vb_d, n);
+  const r = @set_dsd_length(vc_d, n);
+  @fmuls(e, src, src);
+  @fmuls(e, e, 0.044715);
+  @fadds(e, e, 1.0);
+  @fmuls(e, e, src);
+  @fmuls(e, e, 1.5957691216057308);   // y
+  @fnegs(dst, e);
+  @fmaxs(e, e, dst);                  // |y|
+  @fnegs(e, e);
+  vexp(e, n);
+  @fadds(d, e, 1.0);
+  @fmuls(r, d, 0.323112507040746);
+  @fadds(r, r, -1.4540415401729079);
+  @fmuls(r, r, d);
+  @fadds(r, r, 2.1207294161729284);
+  var k: u16 = 0;
+  while (k < 2) : (k += 1) {
+    @fmuls(dst, d, r);
+    @fsubs(dst, 2.0, dst);
+    @fmuls(r, r, dst);
+  }
+  @fmuls(dst, src, e);
+  @fmaxs(dst, dst, src);
+  @fmuls(dst, dst, r);
+}
+
+// The trimmed forms on the MLP's Ic (dst u, src t; GELUT 1, bit-identical to vexp-based GELUT 0: -|y| by
+// setting the sign bit, one clamp for a value <= 0, exp's result used in place of a copy): comptime f32
+// views, the u16 views built once (ginit), the constant loops unrolled
+const GN: u16 = if (GELU == 1) Ic else 1;
+const DN: u16 = if (GELU == 1) AN else 1;
+var vd: [DN]f32 align(16) = @zeros([DN]f32);
+const gE = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{GN} -> va[i] });
+const gP = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{GN} -> vb[i] });
+const gR = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{GN} -> vcr[i] });
+const gD = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{GN} -> vd[i] });
+const gK = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{GN} -> vk[i] });
+const gS = pe.tc(0, GN);
+const gO = pe.uc(0, GN);
+var gPL = vk_d;
+var gPH = vk_d;
+var gAH = vk_d;
+var gH = vk_d;
+var gA = vk_d;
+fn ginit() void {
+  gPL = @set_dsd_length(vpl, GN);
+  gPH = @increment_dsd_offset(gPL, 1, u16);
+  gAH = @set_dsd_length(vah, GN);
+  gH = @set_dsd_length(@set_dsd_base_addr(vk_d, @ptrcast([*]@fp16(), &vk)), GN);   // (GELUT 2: f16, after the exp)
+  gA = @set_dsd_length(@set_dsd_base_addr(vk_d, @ptrcast([*]@fp16(), &va)), GN);
+}
+// GELUT 2: the same function with fewer f32 multiplies (an f32 multiply costs a cycle a word an operand; f16 and
+// adds are cheap): y = x (c + c a x^2); t = -|y| log2 e, k = round(t), f = t - k (exact), 2^f a degree-4 minimax
+// (relative error 2.6e-6, as the exp's above); d = 1 + e; 1 / d from an f16 quartic in d - 1.5 (relative error
+// 3e-4 with the f16 rounding) and one f32 Newton step; out = max(x e, x) / d. Relative error against the exact
+// gelu_tanh 4.5e-6 (GELUT 1: 5.0e-6); 18-20% fewer cycles at Ic 24-48.
+const e2c = [5]f32 { 0.9999992847442627, 0.6931217908859253, 0.240247443318367, 0.05591786280274391, 0.009570096619427204 };
+const rqc = [5]f16 { 0.66650390625, -0.4423828125, 0.294921875, -0.2283935546875, 0.1522216796875 };
+fn vgeluc2() void {
+  @fmuls(gE, gS, gS);
+  @fmuls(gE, gE, 0.07135481627159043);
+  @fadds(gE, gE, 1.5957691216057308);
+  @fmuls(gE, gE, gS);                   // y
+  @or16(gAH, gAH, 0x8000);              // -|y|
+  @fmuls(gR, gE, 1.4426950408889634);   // t
+  @fmaxs(gR, gR, -126.0);
+  @fadds(gP, gR, math.ex_a[0]);         // k in the low mantissa bits
+  @sll16(gK, gPL, 7);
+  @fadds(gP, gP, math.ex_a[1]);         // k
+  @fsubs(gR, gR, gP);                   // f
+  @fmuls(gP, gR, e2c[4]);
+  @fadds(gP, gP, e2c[3]);
+  @fmuls(gP, gP, gR);
+  @fadds(gP, gP, e2c[2]);
+  @fmuls(gP, gP, gR);
+  @fadds(gP, gP, e2c[1]);
+  @fmuls(gP, gP, gR);
+  @fadds(gP, gP, e2c[0]);
+  @add16(gPH, gPH, gK);                 // p = e = exp(-|y|)
+  @fadds(gD, gP, 1.0);                  // d
+  @fadds(gR, gP, -0.5);                 // d - 1.5
+  @fs2h(gH, gR);
+  @fmulh(gA, gH, rqc[4]);
+  @faddh(gA, gA, rqc[3]);
+  @fmulh(gA, gA, gH);
+  @faddh(gA, gA, rqc[2]);
+  @fmulh(gA, gA, gH);
+  @faddh(gA, gA, rqc[1]);
+  @fmulh(gA, gA, gH);
+  @faddh(gA, gA, rqc[0]);
+  @fh2s(gR, gA);
+  @fmuls(gO, gD, gR);
+  @fsubs(gO, 2.0, gO);
+  @fmuls(gR, gR, gO);                   // 1 / d
+  @fmuls(gO, gS, gP);
+  @fmaxs(gO, gO, gS);
+  @fmuls(gO, gO, gR);
+}
+fn vgeluc() void {
+  @fmuls(gE, gS, gS);
+  @fmuls(gE, gE, 0.044715);
+  @fadds(gE, gE, 1.0);
+  @fmuls(gE, gE, gS);
+  @fmuls(gE, gE, 1.5957691216057308);   // y
+  @or16(gAH, gAH, 0x8000);              // -|y|
+  @fmaxs(gE, gE, -87.0);
+  @fmuls(gP, gE, 1.4426950408889634);
+  @fadds(gP, gP, math.ex_a[0]);
+  @fadds(gP, gP, math.ex_a[1]);
+  @fmacs(gE, gE, gP, -0.6931471805599453);
+  @fadds(gP, gP, math.ex_a[2]);
+  @sll16(gK, gPL, 7);
+  @fmuls(gP, gE, 0.041458580642938614);
+  @fadds(gP, gP, math.ex_c[0]);
+  @fmuls(gP, gP, gE);
+  @fadds(gP, gP, math.ex_c[1]);
+  @fmuls(gP, gP, gE);
+  @fadds(gP, gP, math.ex_c[2]);
+  @fmuls(gP, gP, gE);
+  @fadds(gP, gP, math.ex_c[3]);
+  @add16(gPH, gPH, gK);                 // p = exp(-|y|)
+  @fadds(gD, gP, 1.0);
+  @fmuls(gR, gD, 0.323112507040746);
+  @fadds(gR, gR, -1.4540415401729079);
+  @fmuls(gR, gR, gD);
+  @fadds(gR, gR, 2.1207294161729284);
+  @fmuls(gO, gD, gR);
+  @fsubs(gO, 2.0, gO);
+  @fmuls(gR, gR, gO);
+  @fmuls(gO, gD, gR);
+  @fsubs(gO, 2.0, gO);
+  @fmuls(gR, gR, gO);
+  @fmuls(gO, gS, gP);
+  @fmaxs(gO, gO, gS);
+  @fmuls(gO, gO, gR);
+}
+// act (pe.u[0..Ic)) = gelu_tanh(pe.t[0..Ic)), by GELUT's form
+fn gelu() void {
+  if (GELUT == 0) { vgelu0(pe.uv(0, Ic), pe.tv(0, Ic), Ic); } else if (GELUT == 2) { vgeluc2(); } else { vgeluc(); }
+}

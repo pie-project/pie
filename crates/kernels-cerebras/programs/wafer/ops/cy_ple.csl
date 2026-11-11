@@ -1,0 +1,51 @@
+// wafer/ops/cy_ple.csl: a column control PE's per-layer embedding (PLE) side input (README.md, Gemma 4).
+// The phase: [G a | G b | |d|^2 ..], s2, z = GELU(G a + s2 G b) ple (this column's PLE value of the
+// layer), multicast [z | s2]. The PLE words: the bus (PB, iq6) carries a token's values of every unit
+// in this unit column (5 a unit) + a sequence word; an async receive for step s + 1 is posted at the
+// end of step s (not the launch's last); step 0's words come from the host.
+//
+// Interface: pl (the PLE words of this unit column + the sequence word), plog ((DIAG 1 / PLOG 1) a
+// step's PLE value (this unit's first) and the sequence word).
+// rcfg past the core's: [12] PB colour, [13] this unit's place in the column, [14] bus words; the
+// core's word: bit 0 on a PLE bus.
+//
+// Params: pe (ops/cpe.csl), fab, math (ops/math.csl), ON (false: no PLE), K (layers a unit).
+param pe: imported_module;
+param fab: imported_module;
+param math: imported_module;
+param ON: bool = true;
+param K: u16;
+
+const PN: u16 = if (ON) 64 else 1;
+var pl = @zeros([PN]f32);
+var plog = @zeros([2 * PN]f32);
+var pui: u16 = 0;
+var plv: u16 = 0;
+var chk = @zeros([1]f32);
+fn on_bus() bool { return (pe.word & 1) != 0; }
+fn init() void {
+  pui = @as(u16, pe.rcfg[pe.RQ + 13]);
+  plv = @as(u16, pe.rcfg[pe.RQ + 14]);
+}
+fn wait(pos: u32) void {
+  const want = @as(f32, pos + 1);
+  const cd = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{1} -> chk[i] });
+  const sd = @increment_dsd_offset(@get_dsd(mem1d_dsd, .{ .tensor_access = |i|{1} -> pl[i] }), @as(i16, plv), f32);
+  @fmovs(cd, sd);
+  while (chk[0] != want) { @fmovs(cd, sd); }
+}
+fn post() void {
+  pl[plv] = -1.0;
+  @fmovs(@set_dsd_length(@get_dsd(mem1d_dsd, .{ .tensor_access = |i|{PN} -> pl[i] }), plv + 1), fab.fin(pe.q_sm, plv + 1), .{ .async = true, .ut_id = pe.ut_p });
+}
+fn log(s: u32) void {
+  if (on_bus() and s < 64) { plog[2 * @as(u16, s)] = pl[K * pui]; plog[2 * @as(u16, s) + 1] = pl[plv]; }
+}
+fn layer(l: u16) void {
+  pe.reduce(6);
+  const s2 = math.rsqrt(pe.t[2] * pe.IHID + pe.EPS);
+  const g = pe.t[0] + s2 * pe.t[1];
+  pe.u[0] = math.gelu1(g) * pl[K * pui + l];
+  pe.u[1] = s2;
+  pe.mcast(2);
+}

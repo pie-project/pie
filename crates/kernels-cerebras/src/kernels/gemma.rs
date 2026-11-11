@@ -1,5 +1,5 @@
 //! Gemma 4 E2B / E4B: `weight.csl` (18 route slots), `cx.csl` (deferred norms, the PLE phase),
-//! `ctl_cy_gemma.csl`, `head_ctl.csl` with the token bus, `ple_gemma.csl` (the PLE store), with the shared
+//! `cy.csl`, `head_ctl.csl` with the token bus, `ple_gemma.csl` (the PLE store), with the shared
 //! head PE ([`super::head::HEAD_PE`]). Their params from the plan ([`kernels`]) and their rcfg
 //! writers.
 
@@ -67,11 +67,12 @@ params! {
 }
 
 params! {
-    /// `ctl_cy_gemma.csl`: the layer mask and shapes as the weight kernel's, the hidden size
-    /// (`HR`), the levers' defaults.
+    /// `cy.csl` (NRM 1, MIXK 1, ACT 1, PLE 1, KVS 1): the layer mask and shapes as the weight
+    /// kernel's, the hidden size (`HR`), the levers' defaults.
     pub struct CtlCyGemma {
         K: u32, KM: u32, SH: u32, Qh: u32, DcS: u32, DcG: u32, Ic: u32, HR: u32, DIAG: u32,
-        FIFOW: u32, ATTL: u32, TSTAMP: u32, HDS: u32, HDG: u32, PLOG: u32,
+        FIFOW: u32, ATTL: u32, TSTAMP: u32, HDS: u32, HDG: u32, PLOG: u32, NRM: u32, MIXK: u32,
+        ACT: u32, PLE: u32, KVS: u32,
     }
 }
 
@@ -97,7 +98,7 @@ pub const CTL_CX_GEMMA: Kernel = Kernel {
 };
 
 pub const CTL_CY_GEMMA: Kernel = Kernel {
-    source: "ctl_cy_gemma.csl",
+    source: "cy.csl",
     owns: &["qkw", "rot", "tab", "pl", "plog", "rcfg", "tdbg"],
     params: CtlCyGemma::NAMES,
     route_slots: 12,
@@ -182,7 +183,7 @@ fn cx(pe: &Pe) -> R<Vec<u32>> {
 /// in the column, the bus words, the shared-KV colour.
 fn cy(pe: &Pe) -> R<Vec<u32>> {
     let Place::Cy { unit, .. } = pe.role().place else {
-        return Err(format!("{:?}: ctl_cy_gemma off a CY PE", pe.at));
+        return Err(format!("{:?}: cy off a CY PE", pe.at));
     };
     let plan = &pe.prog.plan;
     let mut w = common::cy(pe, None)?;
@@ -358,6 +359,11 @@ pub fn kernels(prog: &Program) -> R<Kernels> {
                 HDS: hds,
                 HDG: hdg,
                 PLOG: 0,
+                NRM: 1,
+                MIXK: 1,
+                ACT: 1,
+                PLE: 1,
+                KVS: 1,
             },
         )?,
     );

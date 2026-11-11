@@ -1,0 +1,289 @@
+// wafer/cy.csl: the wafer program column control PE (CY_c) of the unit snake (README.md). One image
+// serves every unit column of every layer program: roles and colours are runtime words from the host
+// (rcfg), the layer's phases comptime params from the plan.
+//
+// Role. One a unit column, on the unit's middle row: the root of the column reductions of the
+// column's weight PEs (weight.csl) and all of the layer's column-local element-wise work, as phases
+// over its core (ops/cpe.csl): each phase takes a column reduction into t, does its element-wise work
+// and multicasts u down the column. A layer's phases:
+//   mix   the layer's mixer (below)
+//   mlp   (MIXK 0 / 1) the input's norm (NRM 0: rms scale; NRM 1: the deferred combine), the
+//         activation (ACT 0: SiLU(g) u, SILU16 1 in f16 streamed into the multicast; ACT 1:
+//         GELU-tanh(g) u), multicast [act (| s1)]
+//   side  (PLE 1) the per-layer embedding gate (ops/cy_ple.csl)
+//   flush (NRM 1, the last unit: the core's word bit 2) [|h|^2 ..] -> multicast [s]
+// The mixers, by layer (KM bit l) and the unit's mixer kind (MIXK), as weight.csl's:
+// - MIXK 0: ops/cy_att.csl (attention over the layer's own cache, KM bit 1) and ops/cy_gdn.csl
+//   (Gated DeltaNet, KM bit 0); NRM 0;
+// - MIXK 1: ops/cy_kv.csl (attention over sliding (KM bit 0) and global (KM bit 1) caches); NRM 1;
+// - MIXK 2: ops/cy_swa.csl (full and sliding-window attention with sinks), an attention half's column
+//   (NRM 2: no MLP phase here);
+// - MIXK 3: ops/cy_moe.csl (the router, then the routed experts' activation), a MoE half's column.
+//
+// Interface. Exports rcfg, tdbg, init, compute(steps, start_pos), and the phase modules': MIXK 0 cw,
+// gpar, gnw, qkw, rot, tab; MIXK 1 qkw, rot, tab (PLE 1: pl, plog); MIXK 2 qb, snk, rot; MIXK 3 rb, gb,
+// ps. rcfg: ops/cpe.csl's (+ MIXK 1: [11] flags (bit 0 on a PLE bus, 1 the KVS source, 2 the flush
+// unit), [12] PB colour, [13] this unit's place in the column, [14] bus words, [15] KVS; MIXK 3: [11]
+// this column's router output).
+// Hardware rules: as weight.csl (own queue a flow, no transient duplicate colours, >= 768 B stack room).
+//
+// Params. The layer program: K, KM, NRM, MIXK, ACT, PLE; shapes: NQA, NQG, Qh, Dc / DcS / DcG, DK, DV,
+// Ic, HR (hidden), CONV, NROT, HK, HV, NLV, QSC, NEX, TK; the mixers' variants: GATE, SH, KEV, KVS,
+// SWL, SWA, EPS (the norms' eps). Levers (default = the shipped 9B build): CONVQK 1, ATTV 1, GDEC 1,
+// ROPEP 1, SILU16 1, SILUQ 1, ATTL 2, SLW 0, RLV / RBITS, GELUT 2, CYV 0, GLUV 0. Diagnostics (default
+// off): TSTAMP, DIAG (as weight.csl's; MIXK 1: 1 the PLE words and the KVS line alone (probes, logged
+// in plog), 32 no PLE words, 64 no KVS), PLOG; FIFOW: the reduction's FIFO depth. (HDS, HDG: unused.)
+param memcpy_params;
+param DIAG: u16 = 0;
+param K: u16;          // layers on the unit
+param KM: u16 = 0;     // bit l: layer l is attention (MIXK 0) / global (MIXK 1) / full (MIXK 2)
+param NRM: u16 = 0;    // the input phases' norm: 0 direct, 1 deferred, 2 scaled (the halves)
+param MIXK: u16 = 0;   // the mixer kind: 0 own-cache attention / GDN, 1 sliding / global caches, 2 an attention
+                       // half's, 3 a MoE half's
+param ACT: u16 = 0;    // the MLP's activation: 0 SiLU, 1 GELU-tanh
+param PLE: u16 = 0;    // 1: a per-layer embedding gate after the MLP
+param NQA: u16 = 1;    // (MIXK 0 / 2) attention reduction words before ssq
+param NQG: u16 = 1;    // (MIXK 0) GDN: DK q | DK k | DV v | DV z | b | a
+param Qh: u16 = 1;     // attention q heads a column
+param Dc: u16 = 1;     // (MIXK 0 / 2) kv dims a column
+param DcS: u16 = 2;    // (MIXK 1) kv dims a column: sliding, global
+param DcG: u16 = 2;
+param DK: u16 = 8;     // (MIXK 0) GDN q / k dims a column
+param DV: u16 = 1;     // (MIXK 0) GDN v dims a column
+param Ic: u16 = 1;     // the MLP width a column (MIXK 3: an expert's)
+param HR: u16;         // hidden size (RMSNorm)
+param CONV: u16 = 4;   // (MIXK 0) GDN's conv kernel
+param NROT: u16 = 1;   // (MIXK 0 / 2) rotated pairs a column (partial RoPE)
+param HK: u16 = 128;   // GDN head k dim (q scale 1/sqrt(HK))
+param HV: u16 = 128;   // GDN head v dim (the gated norm's mean)
+param HDS: u16 = 256;
+param HDG: u16 = 512;
+param NLV: u16 = 5;    // (MIXK 2) RoPE table levels
+param QSC: f32 = 0.125; // (MIXK 2) 1 / sqrt(head dim)
+param NEX: u16 = 32;   // (MIXK 3) experts, experts a token
+param TK: u16 = 4;
+param SWL: f32 = 7.0;  // (MIXK 3) the gate / up limit, the GLU's alpha
+param SWA: f32 = 1.702;
+param GATE: u16 = 1;   // (MIXK 0) 1: attention's q_proj carries the output gate (Qwen3.5); 0: none
+param SH: u16 = 0;     // (MIXK 1) 1: a shared-KV unit (q-only projections)
+param KEV: u16 = 0;    // (MIXK 1) 1: a global layer's projection is q | raw k
+param KVS: u16 = 0;    // (MIXK 1) 1: the KVS line (the shared caches' source unit)
+param CONVQK: u16 = 1; // 1: q / k's conv and SiLU before the multicast, v / z / beta after it, the window a ring
+param ATTV: u16 = 1;   // 1: attention's o / l times the gate as vector ops
+param GDEC: u16 = 1;   // 1: the decay scales the state reduction's sums here
+param ROPEP: u16 = 1;  // 1: the next position's RoPE tables after the multicast (one attention layer a unit)
+param SILU16: u16 = 1; // 1: the MLP's SiLU in f16
+param SILUQ: u16 = 1;  // 1: the lean f32 SiLU for GDN's q / k and v | z
+param ATTL: u16 = 2;   // 2: the log-sum-exp steps in a second multicast after o (off the path); 0: with o
+param SLW: u16 = 0;    // 1: silu16 without the f16 subnormal flush
+param RLV: u16 = 4;    // (MIXK 0) RoPE table levels: a position is RLV digits of RBITS bits
+param RBITS: u16 = 3;
+param GELUT: u16 = 2;  // (ACT 1) GELU's form (ops/act.csl)
+param CYV: u16 = 0;    // (MIXK 2) the sinks' reciprocal's form (ops/cy_swa.csl)
+param GLUV: u16 = 0;   // (MIXK 3) the GLU's form (ops/cy_moe.csl)
+param EPS: f32 = 1.0e-6; // the RMSNorms' eps
+param PLOG: u16 = 0;   // (PLE 1) 1: the full model logs each step's PLE words too
+param TSTAMP: u16 = 0; // 1 (diagnostics): phase stamps into tdbg (on the critical path)
+param FIFOW: u16 = 32; // the reduction's FIFO depth (words)
+
+const sys_mod = @import_module("<memcpy/memcpy>", memcpy_params);
+const fab = @import_module("ops/fabric.csl", .{ .NQ = 6 });
+const math = @import_module("ops/math.csl");
+const timestamp = @import_module("<time>");
+fn mx(a: u16, b: u16) u16 { return if (a > b) a else b; }
+fn isk(l: u16) bool { return ((KM >> l) & 1) == 1; }
+fn nla() u16 { var n: u16 = 0; var l: u16 = 0; while (l < K) : (l += 1) { if (isk(l)) { n += 1; } } return n; }
+const NLA: u16 = if (MIXK == 0) nla() else 0;
+const NLG: u16 = if (MIXK == 0) K - NLA else 0;
+
+// ---------------------------------------------------------------- the core's sizes, by the mixer kind
+const QOM: u16 = Qh * DcG;
+const NQM: u16 = QOM + (if (SH == 1) 0 else 2 * DcG);
+const TN: u16 = if (MIXK == 0) mx(mx(mx(NQA + 1, NQG + 1), mx(2 * Ic + 1, 2 * DV + 3)), Qh * Dc + 2 * Dc + 2 + Qh)
+                else if (MIXK == 1) mx(mx(2 * NQM + 4, 4 * Ic + 4), mx(QOM + 2 * DcG + Qh + 4, Qh * (DcG + 1) + 1))
+                else if (MIXK == 2) mx(NQA + 1, Qh * (Dc + 1)) else TK * 2 * Ic;
+const UN: u16 = if (MIXK <= 1) TN else if (MIXK == 2) mx(Qh * Dc + 2 * Dc + 1, Qh * Dc + 1 + Qh) else mx(TK * Ic, 2 * TK);
+const NTD: u16 = if (MIXK <= 1) 1 + 6 * K else 1 + 4 * K;
+const RCW: u16 = if (MIXK == 0) 11 else if (MIXK == 1) 16 else 12;
+const pe = @import_module("ops/cpe.csl", .{ .fab = fab, .math = math, .TN = TN, .UN = UN, .RCW = RCW, .NTD = NTD,
+  .TSTAMP = TSTAMP, .HR = HR, .EPS = EPS, .KVQ = if (MIXK == 1) KVS else 0, .FIFOW = FIFOW });
+var rcfg_ptr: [*]u32 = &pe.rcfg;
+var tdbg_ptr: [*]u32 = &pe.tdbg;
+var tab_ptr: [*]u32 = &pe.tab;
+
+// ---------------------------------------------------------------- the phases
+const act = @import_module("ops/act.csl", .{ .pe = pe, .math = math, .AN = if (MIXK <= 1) TN else 1, .Ic = Ic,
+  .SILU = if (MIXK <= 1 and ACT == 0 and SILU16 == 1) 1 else 0, .GELU = if (MIXK <= 1 and ACT == 1) 1 else 0,
+  .SILUQ = SILUQ, .SLW = SLW, .GELUT = GELUT });
+const gdn = @import_module("ops/cy_gdn.csl", .{ .pe = pe, .act = act, .math = math, .NL = NLG, .NQG = NQG, .DK = DK,
+  .DV = DV, .CONV = CONV, .HK = HK, .HV = HV, .CONVQK = CONVQK, .GDEC = GDEC });
+var cw_ptr: [*]f32 = &gdn.cw;
+var gpar_ptr: [*]f32 = &gdn.gpar;
+var gnw_ptr: [*]f32 = &gdn.gnw;
+const att = @import_module("ops/cy_att.csl", .{ .pe = pe, .math = math, .NL = NLA, .NQA = NQA, .Qh = Qh, .Dc = Dc,
+  .NROT = NROT, .RLV = RLV, .RBITS = RBITS, .GATE = GATE, .ATTV = ATTV, .ATTL = ATTL, .ROPEP = ROPEP });
+const kv = @import_module("ops/cy_kv.csl", .{ .pe = pe, .fab = fab, .math = math, .ON = MIXK == 1, .K = K, .KM = KM,
+  .Qh = Qh, .DcS = DcS, .DcG = DcG, .SH = SH, .KEV = KEV, .KVS = KVS });
+const ple = @import_module("ops/cy_ple.csl", .{ .pe = pe, .fab = fab, .math = math, .ON = PLE == 1, .K = K });
+var pl_ptr: [*]f32 = &ple.pl;
+var plog_ptr: [*]f32 = &ple.plog;
+const swa = @import_module("ops/cy_swa.csl", .{ .pe = pe, .math = math, .ON = MIXK == 2, .K = K, .NQA = NQA, .Qh = Qh,
+  .Dc = Dc, .NROT = NROT, .NLV = NLV, .QSC = QSC, .CYV = CYV });
+var qb_ptr: [*]f32 = &swa.qb;
+var snk_ptr: [*]f32 = &swa.snk;
+const moe = @import_module("ops/cy_moe.csl", .{ .pe = pe, .fab = fab, .math = math, .ON = MIXK == 3, .K = K, .Ic = Ic,
+  .NEX = NEX, .TK = TK, .SWL = SWL, .SWA = SWA, .GLUV = GLUV });
+var rb_ptr: [*]f32 = &moe.rb;
+var gb_ptr: [*]f32 = &moe.gb;
+var ps_ptr: [*]f32 = &moe.ps;
+var qkw_ptr: [*]f32 = if (MIXK == 1) &kv.qkw else &att.qkw;
+var rot_ptr: [*]f32 = if (MIXK == 1) &kv.rot else if (MIXK == 2) &swa.rot else &att.rot;
+
+fn init() void {
+  pe.init(PLE == 1);
+  if (MIXK == 1) { kv.init(); }
+  if (PLE == 1) { ple.init(); }
+  if (MIXK == 3) { moe.init(); }
+  timestamp.enable_tsc();
+  if (MIXK <= 1) { act.init(); }
+  if (MIXK == 0) { gdn.init(); }
+  if (PLE == 1 and ple.on_bus() and (DIAG & 32) == 0) { ple.post(); }   // step 0's words: the storage's, on the launch-start TB
+  sys_mod.unblock_cmd_stream();
+}
+
+// The MLP: [gate | up | ssq] (NRM 1: [W a | W b | sums]) -> act (| s1)
+fn mlp() void {
+  if (NRM == 1) {
+    pe.reduce(4 * Ic + 4);
+    pe.stamp(1 + 6 * pe.cl + 4);
+    const s1 = pe.combinec(2 * Ic);
+    act.gelu();
+    @fmuls(pe.uc(0, Ic), pe.uc(0, Ic), pe.tc(Ic, Ic));
+    pe.u[Ic] = s1;
+    @fmovs(fab.fout(pe.q_mc, Ic + 1), pe.uc(0, Ic + 1));
+    return;
+  }
+  pe.reduce(2 * Ic + 1);
+  pe.stamp(1 + 6 * pe.cl + 4);
+  const rr = math.rsqrt(pe.t[2 * Ic] / pe.HID + pe.EPS);
+  if (SILU16 == 1) {
+    act.silu16(rr);
+    @fh2s(fab.fout(pe.q_mc, Ic), act.HP);
+    return;
+  }
+  @fmuls(pe.tv(0, 2 * Ic), pe.tv(0, 2 * Ic), rr);
+  act.vsilu(pe.uv(0, Ic), pe.tv(0, Ic), Ic);
+  @fmuls(pe.uv(0, Ic), pe.uv(0, Ic), pe.tv(Ic, Ic));
+  pe.mcast(Ic);
+}
+// (NRM 1) the last unit's flush: [|h|^2 ..] -> [s]
+fn flush() void {
+  pe.reduce(4);
+  pe.u[0] = math.rsqrt(pe.t[0] * pe.IHID + pe.EPS);
+  pe.mcast(1);
+}
+// (MIXK 1, DIAG 1) the PLE words and the KVS line alone
+fn probes(s: u32) void {
+  if (PLE == 1) { ple.log(s); }
+  if (KVS == 1 and (pe.word & 2) != 0 and (DIAG & 64) == 0) {
+    var i: u16 = 0;
+    while (i < 16) : (i += 1) { pe.u[i] = @as(f32, pe.tab[0]) * 0.5 + @as(f32, i); }
+    pe.u[16] = @as(f32, pe.tab[0] + 1);
+    @fmovs(fab.fout(pe.q_kv, 6), pe.uv(0, 6));
+    @fmovs(fab.fout(pe.q_kv, 11), pe.uv(6, 11));
+  }
+}
+
+// ---------------------------------------------------------------- a pass
+var n_steps: u32 = 0;
+var pos0: u32 = 0;
+const pass_id: local_task_id = @get_local_task_id(8);
+task pass_task() void {
+  var s: u32 = 0;
+  while (s < n_steps) : (s += 1) {
+    const nl: u16 = if ((DIAG & 2) != 0) 1 else K;
+    var l: u16 = 0;
+    if (MIXK == 2) {
+      pe.stamp(0);
+      while ((DIAG & 1) == 0 and l < nl) : (l += 1) { swa.layer(l, pos0 + s); }
+    } else if (MIXK == 3) {
+      pe.stamp(0);
+      while ((DIAG & 1) == 0 and (DIAG & 4) == 0 and l < nl) : (l += 1) { moe.layer(l); }
+    } else if (MIXK == 0) {
+      pe.tab[0] = pos0 + s;   // the pass's position (launch argument)
+      gdn.pass_start();
+      pe.stamp(0);
+      var la: u16 = 0;
+      var lg: u16 = 0;
+      while ((DIAG & 1) == 0 and l < nl) : (l += 1) {
+        pe.cl = l;
+        if ((DIAG & 16) != 0) { continue; }
+        if ((DIAG & 8) != 0) { pe.reduce(if (isk(l)) NQA + 1 else NQG + 1); continue; }
+        if (isk(l)) { if (NLA > 0) { att.layer(la); } la += 1; }
+        else { if (NLG > 0) { gdn.layer(lg); } lg += 1; }
+        if ((DIAG & 4) == 0) { mlp(); }
+        pe.stamp(1 + 6 * l + 5);
+      }
+      gdn.pass_end();
+    } else {
+      pe.tab[0] = pos0 + s;
+      pe.stamp(0);
+      kv.pass_start(pe.tab[0]);
+      const bus = PLE == 1 and ple.on_bus() and (DIAG & 32) == 0;   // (DIAG 32: no PLE words; DIAG 64: no KVS)
+      if (bus) { ple.wait(pe.tab[0]); }
+      if (PLE == 1 and PLOG == 1) { ple.log(s); }
+      if ((DIAG & 1) != 0) {
+        probes(s);
+      } else {
+        while (l < nl) : (l += 1) {
+          pe.cl = l;
+          kv.layer(l);
+          mlp();
+          if (PLE == 1) { ple.layer(l); }
+          pe.stamp(1 + 6 * l + 5);
+        }
+        if ((pe.word & 4) != 0) { flush(); }
+      }
+      if (bus) { ple.post(); }   // (the next pass's, this launch's or the next one's)
+    }
+  }
+  sys_mod.unblock_cmd_stream();
+}
+fn compute(steps: u32, start_pos: u32) void {
+  if (MIXK == 2) { swa.launch(); }
+  n_steps = steps;
+  pos0 = start_pos;
+  @activate(pass_id);
+}
+
+comptime {
+  @bind_local_task(pass_task, pass_id);
+  if (MIXK == 0) {
+    @export_symbol(cw_ptr, "cw");
+    @export_symbol(gpar_ptr, "gpar");
+    @export_symbol(gnw_ptr, "gnw");
+  }
+  if (MIXK <= 1) {
+    @export_symbol(qkw_ptr, "qkw");
+    @export_symbol(tab_ptr, "tab");
+  }
+  if (MIXK <= 2) { @export_symbol(rot_ptr, "rot"); }
+  if (PLE == 1) {
+    @export_symbol(pl_ptr, "pl");
+    @export_symbol(plog_ptr, "plog");
+  }
+  if (MIXK == 2) {
+    @export_symbol(qb_ptr, "qb");
+    @export_symbol(snk_ptr, "snk");
+  }
+  if (MIXK == 3) {
+    @export_symbol(rb_ptr, "rb");
+    @export_symbol(gb_ptr, "gb");
+    @export_symbol(ps_ptr, "ps");
+  }
+  @export_symbol(tdbg_ptr, "tdbg");
+  @export_symbol(rcfg_ptr, "rcfg");
+  @export_symbol(init);
+  @export_symbol(compute);
+}
+//@@ dummies

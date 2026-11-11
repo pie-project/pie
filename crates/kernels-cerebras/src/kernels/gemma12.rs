@@ -1,4 +1,4 @@
-//! Gemma 4 12B: `weight.csl` (deferred norms, sliding / global caches, plain rows), `cx.csl` (deferred norms, head groups), `ctl_cy_gemma12.csl`, `head_pe.csl` (GRP 1), with the
+//! Gemma 4 12B: `weight.csl` (deferred norms, sliding / global caches, plain rows), `cx.csl` (deferred norms, head groups), `cy.csl`, `head_pe.csl` (GRP 1), with the
 //! shared head control ([`super::head::HEAD_CTL`]). Their params from the plan ([`kernels`]) and
 //! their rcfg writers.
 
@@ -58,10 +58,12 @@ params! {
 }
 
 params! {
-    /// `ctl_cy_gemma12.csl`: the weight kernel's shapes, the hidden size (`HR`), the levers'.
+    /// `cy.csl` (NRM 1, MIXK 1, ACT 1, KEV 1): the weight kernel's shapes, the hidden size
+    /// (`HR`), the levers' (`GELUT` 1).
     pub struct CtlCyGemma12 {
         K: u32, KM: u32, Qh: u32, DcS: u32, DcG: u32, Ic: u32, HR: u32, DIAG: u32, FIFOW: u32,
-        ATTL: u32, TSTAMP: u32, HDS: u32, HDG: u32,
+        ATTL: u32, TSTAMP: u32, HDS: u32, HDG: u32, NRM: u32, MIXK: u32, ACT: u32, KEV: u32,
+        GELUT: u32,
     }
 }
 
@@ -82,7 +84,7 @@ pub const CTL_CX_GEMMA12: Kernel = Kernel {
 };
 
 pub const CTL_CY_GEMMA12: Kernel = Kernel {
-    source: "ctl_cy_gemma12.csl",
+    source: "cy.csl",
     owns: &["qkw", "rot", "tab", "rcfg", "tdbg"],
     params: CtlCyGemma12::NAMES,
     route_slots: 12,
@@ -161,7 +163,7 @@ fn cx(pe: &Pe) -> R<Vec<u32>> {
 /// A CY PE: the shared words (no segment), its flag, four unused words.
 fn cy(pe: &Pe) -> R<Vec<u32>> {
     let Place::Cy { unit, .. } = pe.role().place else {
-        return Err(format!("{:?}: ctl_cy_gemma12 off a CY PE", pe.at));
+        return Err(format!("{:?}: cy off a CY PE", pe.at));
     };
     let mut w = common::cy(pe, None)?;
     let fl = if last_unit(pe, unit) { CY_LAST } else { 0 };
@@ -366,6 +368,11 @@ pub fn kernels(prog: &Program) -> R<Kernels> {
                 TSTAMP: 0,
                 HDS: d.hds,
                 HDG: d.hdg,
+                NRM: 1,
+                MIXK: 1,
+                ACT: 1,
+                KEV: 1,
+                GELUT: 1,
             },
         )?,
     );

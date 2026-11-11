@@ -4,9 +4,9 @@
 //!
 //! - [`common`]: the word layouts every family's weight, CX, CY, head and head control kernels
 //!   share (their leading words), with the codes the kernels read named;
-//! - [`dense`]: the unit snake's kernels (Qwen3.5, Qwen3, Llama 3) (`weight.csl`, `cx.csl`, `ctl_cy_dense.csl`,
+//! - [`dense`]: the unit snake's kernels (Qwen3.5, Qwen3, Llama 3) (`weight.csl`, `cx.csl`, `cy.csl`,
 //!   `head_pe.csl`, `head_ctl.csl`, `relay.csl`);
-//! - [`gemma`]: Gemma 4 E2B / E4B's (`weight.csl`, `cx.csl`, `ctl_cy_gemma.csl`,
+//! - [`gemma`]: Gemma 4 E2B / E4B's (`weight.csl`, `cx.csl`, `cy.csl`,
 //!   `head_ctl.csl` (TB 1), `ple_gemma.csl`; `head_pe.csl`).
 
 use super::fabric::{ChainMember, Colour, Endpoint, PeIo, RootQueues};

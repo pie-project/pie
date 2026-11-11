@@ -1,0 +1,152 @@
+// wafer/ops/cy_kv.csl: a column control PE's attention phases over sliding (KM bit 0) and global (KM
+// bit 1) caches (README.md, Gemma 4; the weight PEs' side: ops/kv.csl). The reduction [W a | W b |
+// |r|^2, |x|^2, x.p, |p|^2] (the deferred norm: pe.combinec), t = [q (Qh Dc) | k Dc | v Dc] (SH 1: q
+// only; KEV 1: a global layer has no v: v = the raw k, the weight PE stores it normalised, v_norm);
+// the raw |q_h|^2, |k|^2, |v|^2 partials; q / k norm weights; RoPE (sliding: theta 1e4 over the head;
+// global: proportional, 25%; Dc / 2 pairs a column, side by side); multicast [q | k | v | position |
+// |q_h|^2 | |k|^2 | |v|^2 | s]; (KVS 1) the source unit also sends [k | v | |k|^2 | |v|^2] of its last
+// sliding and its global layer north on KVS (+ a sequence word after the global); then the softmax
+// passes (o / l, the redo flag, the log-sum-exp steps; the steps after o, off the path).
+//
+// Interface: qkw (q / k norm weights [layer][Qh DcG | DcG]), rot (RoPE tables [kind][4][8][cos |
+// sin][DcG / 2]; the host's identity past a global column's rotated dims and on padded dims).
+//
+// Params: pe (ops/cpe.csl), fab, math (ops/math.csl), ON (false: another mixer kind's unit), K, KM, Qh (q
+// heads a column), DcS / DcG (kv dims a column: sliding, global), SH (1: a shared-KV unit, q-only
+// projections), KEV (1: a global layer's projection is q | raw k), KVS (1: the KVS line; its source
+// is the flags word's bit 1).
+param pe: imported_module;
+param fab: imported_module;
+param math: imported_module;
+param ON: bool = true;
+param K: u16;
+param KM: u16;
+param Qh: u16;
+param DcS: u16;
+param DcG: u16;
+param SH: u16 = 0;
+param KEV: u16 = 0;
+param KVS: u16 = 0;
+
+fn isg(l: u16) bool { return ((KM >> l) & 1) == 1; }
+fn lasts() u16 { var r: u16 = 0xff; var l: u16 = 0; while (l < K) : (l += 1) { if (!isg(l)) { r = l; } } return r; }
+fn lastg() u16 { var r: u16 = 0xff; var l: u16 = 0; while (l < K) : (l += 1) { if (isg(l)) { r = l; } } return r; }
+const LS: u16 = if (ON) lasts() else 0xff;
+const LG: u16 = if (ON) lastg() else 0xff;
+const QOM: u16 = Qh * DcG;
+const QKS: u16 = QOM + DcG;
+const NPM: u16 = DcG / 2;
+var qkw = @zeros([if (ON) K * QKS else 1]f32);
+var rot = @zeros([if (ON) 2 * 4 * 8 * 2 * NPM else 1]f32);
+var rc = @zeros([if (ON) 2 * NPM else 1]f32);
+var rs = @zeros([if (ON) 2 * NPM else 1]f32);
+var rope_at = [2]u32 { 0xffffffff, 0xffffffff };
+const rp = @import_module("ops/rope.csl", .{ .rot = &rot, .rc = &rc, .rs = &rs, .NROT = NPM, .LV = 4, .BITS = 3 });
+var ilh = @zeros([Qh]f32);
+var posf: f32 = 0.0;    // the step's position as f32 (and + 1), converted once a step
+var posf1: f32 = 0.0;
+
+// (KVS 1) the source unit's KVS colour: rcfg[RQ + 15]
+fn init() void {
+  if (KVS == 1 and (pe.word & 2) != 0) { fab.oqc(5, pe.rcfg[pe.RQ + 15]); }
+}
+fn rope_tables(kd: u16, p: u32) void {
+  if (rope_at[kd] == p) { return; }
+  rope_at[kd] = p;
+  rp.tables(p, kd * rp.SET, kd * NPM, (if (kd == 0) DcS / 2 else NPM));
+}
+fn ropec(comptime kd: u16, o: u16, comptime np: u16) void {
+  rp.rotate(&pe.t, o, kd * NPM, np);
+}
+// A pass's start (off the path: the first reduction is thousands of cycles out): the position, the tables.
+fn pass_start(p: u32) void {
+  posf = @as(f32, p);
+  if (KVS == 1) { posf1 = @as(f32, p + 1); }
+  if (LS != 0xff) { rope_tables(0, p); }
+  if (LG != 0xff) { rope_tables(1, p); }
+}
+
+fn layer(l: u16) void { if (isg(l)) { attk(l, true); } else { attk(l, false); } }
+// (comptime per layer kind: the vector views are comptime DSDs, the loops' bounds constants)
+fn attk(l: u16, comptime g: bool) void {
+  const dc: u16 = if (g) DcG else DcS;
+  const QD: u16 = Qh * dc;
+  const kv: bool = !(g and KEV == 1);       // the projection has its own v
+  const NQ: u16 = QD + (if (SH == 1) 0 else if (kv) 2 * dc else dc);
+  const kd: u16 = if (g) 1 else 0;
+  const np: u16 = dc / 2;
+  const AB: u16 = QD + 2 * dc + Qh + 4;
+  pe.reduce(2 * NQ + 4);
+  pe.stamp(1 + 6 * pe.cl + 0);
+  const s = pe.combinec(NQ);
+  const qkb = l * QKS;
+  var h: u16 = 0;
+  while (h < Qh) : (h += 1) {
+    var ss: f32 = 0.0;
+    var d: u16 = 0;
+    while (d < dc) : (d += 1) { const v = pe.t[h * dc + d]; ss += v * v; }
+    pe.u[QD + 2 * dc + 1 + h] = ss;
+  }
+  const qw = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{QKS} -> qkw[i] });
+  @fmuls(pe.tc(0, QD), pe.tc(0, QD), @set_dsd_length(@increment_dsd_offset(qw, @as(i16, qkb), f32), QD));
+  rope_tables(kd, pe.tab[0]);
+  h = 0;
+  while (h < Qh) : (h += 1) { ropec(kd, h * dc, np); }
+  @fmovs(pe.uc(0, QD), pe.tc(0, QD));
+  if (SH == 0) {
+    if (!kv) { @fmovs(pe.tc(QD + dc, dc), pe.tc(QD, dc)); }   // v = the raw k (attention_k_eq_v)
+    var ks: f32 = 0.0;
+    var vs: f32 = 0.0;
+    var d: u16 = 0;
+    while (d < dc) : (d += 1) { const a = pe.t[QD + d]; const b = pe.t[QD + dc + d]; ks += a * a; vs += b * b; }
+    pe.u[QD + 2 * dc + 1 + Qh] = ks;
+    pe.u[QD + 2 * dc + 2 + Qh] = vs;
+    @fmuls(pe.tc(QD, dc), pe.tc(QD, dc), @set_dsd_length(@increment_dsd_offset(qw, @as(i16, qkb + QD), f32), dc));
+    ropec(kd, QD, np);
+    @fmovs(pe.uc(QD, 2 * dc), pe.tc(QD, 2 * dc));
+  } else {
+    @fmovs(pe.uc(QD, 2 * dc), 0.0);
+    pe.u[QD + 2 * dc + 1 + Qh] = 0.0;
+    pe.u[QD + 2 * dc + 2 + Qh] = 0.0;
+  }
+  pe.u[QD + 2 * dc] = posf;
+  pe.u[QD + 2 * dc + 3 + Qh] = s;
+  @fmovs(fab.fout(pe.q_mc, AB), pe.uc(0, AB));
+  pe.stamp(1 + 6 * pe.cl + 1);
+  if (KVS == 1 and (pe.word & 2) != 0 and (l == LS or l == LG)) {
+    // KVS: [k | v | |k|^2 | |v|^2] (sliding first, then global + the sequence word)
+    // (the multicast has read u: a send returns once its words are in the output queue)
+    const ksv = pe.u[QD + 2 * dc + 1 + Qh];
+    const vsv = pe.u[QD + 2 * dc + 2 + Qh];
+    pe.u[QD + 2 * dc] = ksv;
+    pe.u[QD + 2 * dc + 1] = vsv;
+    pe.u[QD + 2 * dc + 2] = posf1;
+    @fmovs(fab.fout(pe.q_kv, 2 * dc + 2 + (if (l == LG) @as(u16, 1) else 0)), pe.uv(QD, 2 * dc + 2 + (if (l == LG) @as(u16, 1) else 0)));
+  }
+  var pass: u16 = 0;
+  while (pass < 8) : (pass += 1) {
+    pe.reduce(Qh * (dc + 1));
+    var bad: f32 = 0.0;
+    h = 0;
+    while (h < Qh) : (h += 1) {
+      const lsum = pe.t[h * (dc + 1) + dc];
+      if (lsum < 0.00390625 or lsum >= 32768.0) { bad = 1.0; }
+      ilh[h] = math.recip(lsum);
+      @fmuls(pe.uv(h * dc, dc), pe.tv(h * (dc + 1), dc), ilh[h]);
+    }
+    h = 0;
+    while (h < Qh) : (h += 1) {
+      const lh = pe.t[h * (dc + 1) + dc];
+      pe.u[QD + 1 + h] = if (bad == 0.0) 0.0 else math.ln1(lh);
+    }
+    pe.u[QD] = bad;
+    @fmovs(fab.fout(pe.q_mc, QD + 1 + Qh), pe.uc(0, QD + 1 + Qh));
+    pe.stamp(1 + 6 * pe.cl + 3);
+    if (bad == 0.0) {   // (ATTL 2) the logs off the path
+      h = 0;
+      while (h < Qh) : (h += 1) { pe.u[h] = math.ln1(pe.t[h * (dc + 1) + dc]); }
+      @fmovs(fab.fout(pe.q_mc, Qh), pe.uc(0, Qh));
+      pass = 8;
+    }
+  }
+}

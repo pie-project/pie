@@ -1,5 +1,5 @@
 //! Qwen3.5 (GDN layers + gated full attention), Qwen3 and Llama 3 (dense attention, no output gate):
-//! `weight.csl` (direct norms, own-cache attention / GDN mixers), `cx.csl`, `ctl_cy_dense.csl`, with the head's and the relay's
+//! `weight.csl` (direct norms, own-cache attention / GDN mixers), `cx.csl`, `cy.csl`, with the head's and the relay's
 //! ([`super::head`], [`super::common::RELAY`]). Their params from the plan ([`kernels`]) and
 //! their rcfg writers.
 
@@ -60,7 +60,7 @@ params! {
 }
 
 params! {
-    /// `ctl_cy_dense.csl`: the layer mask and shapes as the weight kernel's, the hidden size
+    /// `cy.csl` (MIXK 0, NRM 0, ACT 0): the layer mask and shapes as the weight kernel's, the hidden size
     /// (`HR`), the conv width, the RoPE pairs and table levels, the levers' defaults, the norms'
     /// eps.
     pub struct CtlCyDense {
@@ -88,7 +88,7 @@ pub const CTL_CX: Kernel = Kernel {
 };
 
 pub const CTL_CY_QWEN: Kernel = Kernel {
-    source: "ctl_cy_dense.csl",
+    source: "cy.csl",
     owns: &["cw", "gpar", "gnw", "qkw", "rot", "tab", "rcfg", "tdbg"],
     params: CtlCyDense::NAMES,
     route_slots: 12,

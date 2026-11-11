@@ -1,0 +1,128 @@
+// wafer/ops/cpe.csl: a column control PE's core (README.md: the unit snake), every layer phase's: the
+// column reduction's sum (t) and the column multicast's words (u), the queues, the reduction root,
+// the control row's segment all-reduce, the host words (rcfg, tab) and the phase stamps. cy.csl
+// drives a layer's phases over it; the CY phase modules (ops/cy_*.csl, ops/act.csl) take it as a
+// param.
+//
+// Queues: iq2 / iq3 the column reduction's two halves, oq2 their merge on the loop-back colour,
+// iq4 its return; oq3 the column multicast; iq5 / oq4 the control row's segment all-reduce, iq6 its
+// multicast (non-roots; KVS 1 units on a PLE bus: the bus), iq7 a two-half root's second half;
+// (KVQ) oq5 the KVS line.
+// rcfg: [0] routes n, [1..1+2n) (colour, low route byte); from RQ: [0..4) iq2..iq5, [4..7) oq2..oq4,
+// [7] the segment role, [8] iq6, [9] iq7, [10] the spare colour, [11] the phase modules' word; past it,
+// theirs.
+//
+// Params: fab (ops/fabric.csl), math (ops/math.csl), TN / UN (t's and u's words), RCW (rcfg's words past the routes), NTD
+// (tdbg's words), TSTAMP (1: phase stamps on the path), HR (the hidden size), EPS (the norms' eps),
+// KVQ (1: oq5 is the KVS line's), FIFOW (the reduction's FIFO depth).
+param fab: imported_module;
+param math: imported_module;
+param TN: u16;
+param UN: u16;
+param RCW: u16;
+param NTD: u16;
+param TSTAMP: u16 = 0;
+param HR: u16;
+param EPS: f32;
+param KVQ: u16 = 0;
+param FIFOW: u16 = 32;
+
+const timestamp = @import_module("<time>");
+var tdbg = @zeros([NTD]u32);   // TSC stamps of the last pass, by phase (host-read, diagnostics)
+var tsc = @zeros([3]u16);
+fn stamp(i: u16) void { if (TSTAMP == 0) { return; } timestamp.get_timestamp(&tsc); tdbg[i] = @as(u32, tsc[0]) | (@as(u32, tsc[1]) << 16); }
+var cl: u16 = 0;               // the layer the pass is in (the stamps' index)
+
+const HID: f32 = @as(f32, HR);
+const IHID: f32 = 1.0 / @as(f32, HR);   // (a reciprocal: no runtime f32 divide)
+
+// ---------------------------------------------------------------- the reduction's sum, the multicast's words
+var t: [TN]f32 align(16) = @zeros([TN]f32);
+var u: [UN]f32 align(16) = @zeros([UN]f32);
+const t_d = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{TN} -> t[i] });
+const u_d = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{UN} -> u[i] });
+inline fn tv(o: u16, n: u16) mem1d_dsd { return @set_dsd_length(@increment_dsd_offset(t_d, @as(i16, o), f32), n); }
+inline fn uv(o: u16, n: u16) mem1d_dsd { return @set_dsd_length(@increment_dsd_offset(u_d, @as(i16, o), f32), n); }
+// (comptime views: the vector views comptime DSDs where a phase's offsets and lengths are)
+fn tc(comptime o: u16, comptime n: u16) mem1d_dsd { return @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{n} -> t[@as(i16, o) + i] }); }
+fn ts(comptime o: u16, comptime n: u16, comptime st: u16) mem1d_dsd { return @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{n} -> t[@as(i16, o) + i * @as(i16, st)] }); }
+fn uc(comptime o: u16, comptime n: u16) mem1d_dsd { return @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{n} -> u[@as(i16, o) + i] }); }
+var tab = @zeros([4]u32);      // [position, ...] a pass
+
+// The deferred norm (NRM 1): t = [a (n) | b (n) | |r|^2, |x|^2, x.p, |p|^2] -> s = rsqrt(mean r^2 + eps),
+// the input's rms rr from |x + s p|^2, t[0..n) = rr (a + s b); returns s
+fn combinec(comptime n: u16) f32 {
+  const s = math.rsqrt(t[2 * n] * IHID + EPS);
+  const ss = t[2 * n + 1] + 2.0 * s * t[2 * n + 2] + s * s * t[2 * n + 3];
+  const rr = math.rsqrt(ss * IHID + EPS);
+  @fmacs(tc(0, n), tc(0, n), tc(n, n), s);
+  @fmuls(tc(0, n), tc(0, n), rr);
+  return s;
+}
+
+// ---------------------------------------------------------------- fabric
+const q_n = @get_input_queue(2);
+const q_s = @get_input_queue(3);
+const q_lb = @get_input_queue(4);
+const q_si = @get_input_queue(5);
+const q_sm = @get_input_queue(6);    // the segment's multicast (non-roots) / the PLE bus (async)
+const q_s2 = @get_input_queue(7);    // a two-half segment root's second half
+const q_lo = @get_output_queue(2);
+const q_mc = @get_output_queue(3);
+const q_so = @get_output_queue(4);
+const q_kv = @get_output_queue(5);   // (KVQ 1) KVS
+const C_PARK: color = @get_color(16);
+const ut_a = @get_ut_id(4);
+const ut_b = @get_ut_id(5);
+const ut_p = @get_ut_id(6);
+const red = @import_module("ops/red.csl", .{ .fab = fab, .IN1 = q_s, .IN2 = q_n, .OUT = q_lo, .LOOP = q_lb, .UT1 = ut_a, .UT2 = ut_b, .FIFOW = FIFOW });
+const NR: u16 = 12;
+const RQ: u16 = 1 + 2 * NR;
+var rcfg = @zeros([RQ + RCW]u32);
+var role_s: u16 = 0;     // the segment all-reduce: 0 start, 1 add-forward, 4 / 6 root, 5 alone
+var word: u16 = 0;       // (RCW > 11) rcfg[RQ + 11]: the phase modules' word (flags; the router output)
+
+// The routes, the queues' colours, the segment role, the modules' word. BUS: iq6 is the PLE bus where the
+// word's bit 0 says so (its colour rcfg[RQ + 12]).
+fn init(comptime BUS: bool) void {
+  fab.routes(&rcfg);
+  if (RCW > 11) { word = @as(u16, rcfg[RQ + 11]); }
+  const q6 = if (BUS and (word & 1) != 0) @as(u16, rcfg[RQ + 12]) else @as(u16, rcfg[RQ + 8]);
+  var fq = [6]u16 { @as(u16, rcfg[RQ]), @as(u16, rcfg[RQ + 1]), @as(u16, rcfg[RQ + 2]), @as(u16, rcfg[RQ + 3]), q6, @as(u16, rcfg[RQ + 9]) };
+  fab.bind_iqs(&fq, @as(u16, rcfg[RQ + 10]));
+  fab.oqc(2, rcfg[RQ + 4]); fab.oqc(3, rcfg[RQ + 5]); fab.oqc(4, rcfg[RQ + 6]);
+  role_s = @as(u16, rcfg[RQ + 7]);
+}
+
+// The column reduction's n words into t (both halves at once, back over the loop-back).
+inline fn reduce(n: u16) void {
+  red.root(tv(0, n), n);
+}
+inline fn mcast(n: u16) void { @fmovs(fab.fout(q_mc, n), uv(0, n)); }
+// A small all-reduce of d (n words) over the control row's segment: roles 0 chain start, 1
+// add-forward (q_si in), 4 root of two halves (q_si, q_s2), 6 root of one half (q_si), 5 alone; the
+// root multicasts on q_so, the others take it on q_sm.
+fn seg_ar(d: mem1d_dsd, n: u16) void {
+  if (role_s == 5) { return; }
+  if (role_s == 4 or role_s == 6) {
+    @fadds(d, d, fab.fin(q_si, n));
+    if (role_s == 4) { @fadds(d, d, fab.fin(q_s2, n)); }
+    @fmovs(fab.fout(q_so, n), d);
+    return;
+  }
+  if (role_s == 0) { @fmovs(fab.fout(q_so, n), d); } else { @fadds(fab.fout(q_so, n), fab.fin(q_si, n), d); }
+  @fmovs(d, fab.fin(q_sm, n));
+}
+
+comptime {
+  @initialize_queue(q_n, .{ .color = @get_color(13) });   // parked (distinct a queue)
+  @initialize_queue(q_s, .{ .color = @get_color(14) });
+  @initialize_queue(q_lb, .{ .color = @get_color(17) });
+  @initialize_queue(q_si, .{ .color = @get_color(18) });
+  @initialize_queue(q_sm, .{ .color = @get_color(19) });
+  @initialize_queue(q_s2, .{ .color = @get_color(20) });
+  @initialize_queue(q_lo, .{ .color = C_PARK });
+  @initialize_queue(q_mc, .{ .color = C_PARK });
+  @initialize_queue(q_so, .{ .color = C_PARK });
+  if (KVQ == 1) { @initialize_queue(q_kv, .{ .color = C_PARK }); }
+}
