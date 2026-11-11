@@ -209,7 +209,27 @@ impl Shell {
         let flipped = self
             .pools
             .weight_residency(self.device.stream(), residency)?;
-        if flipped {
+        if self.arm_deferred {
+            // The load streams its weights and armed nothing at load: the
+            // lattice arms here, over the slots this residency names.
+            if self.pools.by_refs() {
+                return Err(crate::error::Fault::Unbound {
+                    what: "the starting weight residency of a load that arms at it came after \
+                           lanes named slot refs: send it before the first fire"
+                        .to_string(),
+                });
+            }
+            self.arm_deferred = false;
+            self.device.synchronize()?;
+            // The atoms the residency leaves on the host copy are read
+            // through a slot the pool holds while the lattice arms: over the
+            // copy every prefill would read its experts across the bus.
+            self.pools.stand_in(true)?;
+            let armed = self.arm_bodies();
+            self.device.synchronize()?;
+            self.pools.stand_in(false)?;
+            armed?;
+        } else if flipped {
             if self.pools.by_refs() {
                 // The lattice fires lanes this shell seats itself, which a
                 // pool whose slots the runtime hands out no longer has.

@@ -577,6 +577,10 @@ pub struct Pools {
     /// The load seated every weight atom in slots of its own choosing
     /// ([`Pools::preseat_weights`]), until the runtime's first residency.
     preseated: bool,
+    /// Arming over a streamed set: an atom on the host copy is read
+    /// through a slot of its shape that the pool holds instead
+    /// ([`Pools::stand_in`]).
+    stand_in: bool,
     /// Each record a lane named by slot refs, by its first piece's ref: the
     /// refs of all its pieces.
     records: std::collections::HashMap<u32, Vec<u32>>,
@@ -980,6 +984,7 @@ impl Pools {
             weights_filed: false,
             miss_copy: None,
             preseated: false,
+            stand_in: false,
             file_spans: Vec::new(),
             records: std::collections::HashMap::new(),
             id_lanes: 1,
@@ -2226,10 +2231,15 @@ impl Pools {
                     continue;
                 }
                 let first = (held.layer * cache.shape.experts) as usize;
+                // Arming's stand-in: the shape's first slot the pool holds.
+                let stand_in = self
+                    .stand_in
+                    .then(|| cache.slots.iter().flatten().next().copied())
+                    .flatten();
                 let mut entries =
                     Vec::with_capacity(cache.shape.experts as usize * held.members.len() * 8);
                 for expert in 0..cache.shape.experts as usize {
-                    let slot = match cache.slots[first + expert] {
+                    let slot = match cache.slots[first + expert].or(stand_in) {
                         Some(slot) => Some(self.chunks.weight_slot(
                             cache.shape.per_chunk,
                             cache.shape.slot_bytes,
@@ -2331,8 +2341,12 @@ impl Pools {
             let cache = &self.row_caches[at];
             let block = u64::from(cache.shape.block_rows) * cache.shape.row_bytes;
             let mut entries = Vec::with_capacity(cache.slots.len() * 8);
+            let stand_in = self
+                .stand_in
+                .then(|| cache.slots.iter().flatten().next().copied())
+                .flatten();
             for (atom, slot) in cache.slots.iter().enumerate() {
-                let address = match slot {
+                let address = match slot.as_ref().or(stand_in.as_ref()) {
                     Some(slot) => self.chunks.row_slot(&cache.shape, *slot)?,
                     None => cache.host + atom as u64 * block,
                 };
@@ -2833,6 +2847,32 @@ impl Pools {
     /// The host copies are gone: nothing is filled from them again.
     pub fn drop_weight_hosts(&mut self) {
         self.hosts_dropped = true;
+    }
+
+    /// Arming over a streamed set reads every atom on the host copy through
+    /// a slot of its shape the pool holds (`on`), and the tables are staged
+    /// so at once; off, as they lie. A synthetic fire's rows are never read
+    /// back, so what the slot holds does not matter, and nothing it records
+    /// names an entry: a body reads the table as it stands when it replays.
+    /// The tables stay unlocated either way, so a body takes the select
+    /// that reads the host copy.
+    pub fn stand_in(&mut self, on: bool) -> Result<()> {
+        self.stand_in = on;
+        self.stage_row_tables(core::ptr::null_mut())?;
+        self.stage_expert_tables(core::ptr::null_mut())
+    }
+
+    /// Whether every atom of every weight shape lies in a pool slot (true
+    /// where the load states none).
+    #[must_use]
+    pub fn weights_seated_whole(&self) -> bool {
+        self.row_caches
+            .iter()
+            .all(|cache| cache.slots.iter().all(Option::is_some))
+            && self
+                .expert_caches
+                .iter()
+                .all(|cache| cache.slots.iter().all(Option::is_some))
     }
 
     /// Whether every streamed bank's table is located: each expert in a

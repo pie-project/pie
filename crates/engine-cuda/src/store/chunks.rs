@@ -138,9 +138,14 @@ impl Chunks {
     }
 
     /// The bytes of the activation's span not yet held backed: what a
-    /// fire's activation will still take beside the state's chunks.
+    /// fire's activation will still take beside the state's chunks. None on
+    /// a flat range once allocated: its one allocation backs the whole span,
+    /// held or not, so no byte of it is free for the cache rows.
     #[must_use]
     pub fn activation_unheld_bytes(&self) -> u64 {
+        if !crate::device::elastic::mapped_on_demand() && self.range.committed_bytes() > 0 {
+            return 0;
+        }
         let chunk = self.layout.chunk_bytes;
         (u64::from(self.act) * chunk).saturating_sub(self.range.held(u64::from(self.total) * chunk))
     }

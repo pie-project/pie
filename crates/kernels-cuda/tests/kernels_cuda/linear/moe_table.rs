@@ -97,3 +97,54 @@ fn a_bf16_select_lands_the_same_bits_through_any_table() {
         );
     }
 }
+
+/// A streamed bf16 bank (`ExpertTable::streams`: its table may name mapped
+/// host memory) through a table whose experts lie half on a mapped host
+/// copy lands the bits the same table over the pool alone lands, at a
+/// decode (the per-route GEMV) and at a prefill (the tiled mma.sync GEMM, a
+/// streamed bank's on every device); where no tcgen05 GEMM takes the held
+/// bank, the located table lands them too.
+#[test]
+fn a_streamed_bf16_select_reads_its_host_experts_through_the_table() {
+    use crate::common::expert_pool::half_on_host;
+    let mut g = Gpu::open();
+    let mut lcg = Lcg::seeded(0x5ea4);
+    for (experts, tokens, top, n, k) in [
+        (8usize, 3usize, 2usize, 64usize, 256usize),
+        (16, 256, 4, 128, 256),
+    ] {
+        let bank = bf16_bank(&mut g, &mut lcg, experts, n, k);
+        let (xr, _) = lcg.row(tokens * k);
+        let x = t(g.up(&xr), tokens, k, Bf16);
+        let r = t(g.up(&routes(tokens, top, experts)), tokens, top, I32);
+        let y_bytes = tokens * top * n * 2;
+        let y = g.zeros(y_bytes);
+        let ctx = ctx_of(&g);
+        let planes = [Plane::of(bank, (n * k * 2) as u64)];
+        let pool = scatter(&mut g, experts, &planes, 0x51ce ^ experts as u64);
+        let mixed = half_on_host(&mut g, &pool.entries, &planes);
+        let run = |g: &mut Gpu, table: ExpertTable| -> Vec<u8> {
+            g.fill(y, 0x7f, y_bytes);
+            let mut yt = t(y, tokens * top, n, Bf16);
+            moe::matmul_select(&ctx, x, t(bank, experts, n * k, Bf16), r, &mut yt, table)
+                .expect("the select fires");
+            g.sync();
+            g.down::<u8>(y, y_bytes)
+        };
+        let streamed = |table: u64| ExpertTable {
+            located: false,
+            ..ExpertTable::located(table, (0, 0))
+        };
+        let what = format!("streamed bf16 select {experts}x{tokens}x{top} {n}x{k}");
+        let pooled = run(&mut g, streamed(pool.table));
+        let host = run(&mut g, streamed(mixed));
+        assert!(host == pooled, "{what}: the host experts moved a bit");
+        if !kernels_cuda::linear::gemm_sm100::supported() {
+            let located = run(&mut g, ExpertTable::located(pool.table, pool.window()));
+            assert!(
+                located == pooled,
+                "{what}: the located table's select differs"
+            );
+        }
+    }
+}

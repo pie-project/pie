@@ -119,10 +119,12 @@ pub fn matmul_select(
         let tiled = fan.route_count >= BF16_GEMM_FROM
             && x.width.is_multiple_of(64)
             && fan.route_count.div_ceil(bank.rows.max(1)) > 12;
-        if !crate::linear::gemm_sm100::supported()
+        // A streamed bank's table may name mapped host memory, which the
+        // tcgen05 GEMM's TMA cannot read: it takes the tiled GEMM anywhere,
+        // whose loads go through the table as global addresses.
+        if (!crate::linear::gemm_sm100::supported() || experts.streams())
             && tiled
             && bank.dtype == Dtype::Bf16
-            && !experts.streams()
             && select_bf16_held(ctx, OP, x, bank.ptr, bank.rows, routes, y, None, experts)?
         {
             return Ok(());
@@ -134,18 +136,20 @@ pub fn matmul_select(
         // Blackwell's, cuBLAS is not graph-capturable); the per-route GEMV
         // re-reads each expert once a route. The grouped mma.sync kernel reads
         // it once a slice.
+        // Its staging is cp.async through the expert table, which reads a
+        // streamed bank's mapped host entries as any global address: a
+        // streamed prefill reads each expert once a slice, not once a route.
         if bf16_mma_spans(ctx, fan.route_count)
             && fan.route_count > fan.top_k.unsigned_abs()
             && x.dtype == Dtype::Bf16
             && bank.dtype == Dtype::Bf16
-            && !experts.streams()
             && x.width.is_multiple_of(64)
             && y.width.is_multiple_of(8)
             && bank.rows >= 1
             && u64::from(bank.width) == u64::from(x.width) * u64::from(y.width)
         {
             // On Hopper, wgmma over the same staging (sm_90a).
-            if hopper_wgmma() && y.width.is_multiple_of(128) {
+            if hopper_wgmma() && y.width.is_multiple_of(128) && !experts.streams() {
                 return select_bf16_wgmma(ctx, OP, x, bank, routes, y, &fan, bank.rows, experts);
             }
             return select_bf16_mma(ctx, OP, x, bank, routes, y, &fan, bank.rows, experts);

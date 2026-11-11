@@ -1224,6 +1224,7 @@ impl Shell {
             decoded_tiles: Vec::new(),
             arming: false,
             armed_body: None,
+            arm_deferred: false,
             segments: std::collections::HashMap::new(),
             windows_memo: Vec::new(),
             cache: {
@@ -1437,14 +1438,32 @@ impl Staged {
         {
             shell.preseat_weights()?;
         }
-        shell.arm_bodies()?;
+        // A load whose weights the pool does not hold whole streams them:
+        // armed now, its bodies would read every expert from the host copy,
+        // over the bus, fire after fire. It arms at the starting weight
+        // residency instead, over the slots the cache then holds, and the
+        // fit keeps the bodies' allowance out of the cache rows till then.
+        let deferred =
+            shell.ep.is_none() && shell.records_bodies() && !shell.pools.weights_seated_whole();
+        if deferred {
+            shell.arm_deferred = true;
+            eprintln!(
+                "engine-cuda: this load streams its weights; its bodies arm at the starting \
+                 weight residency, over the slots the cache holds then"
+            );
+        } else {
+            shell.arm_bodies()?;
+        }
         let resident = footprint(&shell, device_total, free_before);
         // Arming fired every composition, so the activation is at its high
-        // water; a load that records no bodies has fired none yet.
-        let settled = shell.records_bodies();
+        // water; a load that records no bodies, or arms at its starting
+        // weight residency, has fired none yet, and keeps the bodies'
+        // allowance out of the cache rows till it arms.
+        let settled = shell.records_bodies() && !deferred;
+        let bodies = if deferred { shell.bodies_mem as u64 } else { 0 };
         let fitted = shell
             .pools
-            .fit_the_card(0, held_for_fires, settled, &resident)?;
+            .fit_the_card(bodies, held_for_fires, settled, &resident)?;
         if arm_trace {
             eprintln!(
                 "[arm-trace] cache rows sized to {} pages ({} MiB, {} sequences at the declared \
