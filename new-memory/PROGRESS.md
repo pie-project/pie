@@ -1094,3 +1094,13 @@ The `new-memory/` directory is bookkeeping and is removed before anything lands 
   highest key (keep-handles head protects record / rs list / window). tests/handles/e2e.py --host-budget.
 - e2e sm_120: t_snapshot / t_long_snapshot pass, t_quota / t_close pass, t_keep head-key check passes (9 pages, was
   19). Runtime lib 279+; build matrix clean.
+
+### M85 — 2026-11-11: CUDA host tier is pageable memory behind a pinned staging ring
+- `sc/l40s-host-pageable` (36517dc0c): HostTier = one anonymous MAP_NORESERVE mapping (MADV_HUGEPAGE; RSS = data
+  written) + a 512 MiB pinned staging ring + landing threads (big batches split over 4). D2H into the ring on the swap
+  stream, landed into the tier after the event; H2D reads tier->ring in a stream host function, then ring->device.
+  Pin thread / lookahead / SHELF_AHEAD / TIER_PIN deleted. Contract 22 unchanged (fence_swaps).
+- Root cause it fixes: demoted cache grows the held host data monotonically (3,004 of 3,584 chunks first-touched in
+  order), so page-locking fresh memory could not keep pace -> Qwen3-8B prefill 2048 492 -> 151 ms (main 145).
+- Merge fix: rt4's read/write_tier_slots go through HostTier::slice (waits for landings); HostTier::chunk_bytes.
+- Verified: golden_offload + golden_logits (sm_120) = base; build matrix clean.
