@@ -556,7 +556,10 @@ fn prefill_share(page: u32, engine: usize) -> u32 {
     }
     crate::engine::get_spec(engine).map_or(u32::MAX, |spec| {
         crate::inferlet::host::model::prefill_share(
-            crate::inferlet::host::model::prefill_budget(spec.limits),
+            // Within the pool's activation rung (SPEC decision 6).
+            crate::inferlet::host::model::prefill_budget(spec.limits)
+                .min(crate::store::shared::fire_cap(engine) as usize)
+                .max(1),
             crate::inferlet::process::live_count(),
             page as usize,
         )

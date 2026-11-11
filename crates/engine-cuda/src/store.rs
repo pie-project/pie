@@ -593,6 +593,10 @@ pub struct Pools {
     budget: Option<u64>,
     /// The chunks the fit left the cache rows, of the range's.
     fitted: u32,
+    /// The range is reserved anew to the fit even where it maps on demand:
+    /// a smaller activation rung hands state the chunks under the
+    /// activation, which must be the fit's, not past it.
+    whole_fit: bool,
     airborne: Option<Airborne>,
     committed_kv_pages: u32,
     committed_state_slots: u32,
@@ -685,6 +689,11 @@ struct Shelf {
 /// have touched: what one large offload takes, so it locks no page itself.
 /// The rest of the shelf is locked as the copies reach it, not at seating.
 const SHELF_AHEAD: u64 = 512 << 20;
+
+/// The spare chunks under the activation a smaller activation rung may
+/// still hand state, backed beside the budget (the few the fit takes back
+/// once the bodies are armed); more, and no smaller rung is stated.
+const SPARE_UNDER_RUNGS: u32 = 4;
 
 impl Shelf {
     fn new(planes: Vec<u64>, slots: u32) -> Shelf {
@@ -1166,6 +1175,7 @@ impl Pools {
             ceiling: paging.pages(),
             budget,
             fitted: total,
+            whole_fit: false,
             airborne: None,
             committed_kv_pages: 0,
             committed_state_slots: 0,
@@ -1388,7 +1398,9 @@ impl Pools {
         self.paging.pages = fits;
         // A flat range is one allocation made on its first commit: of the
         // fitted chunks, not of every chunk the asked count reserved.
-        if !elastic::mapped_on_demand() && self.chunks.fresh() {
+        let reshape =
+            !elastic::mapped_on_demand() || (self.whole_fit && fitted < self.chunks.total());
+        if reshape && self.chunks.fresh() {
             self.chunks.reshape(&mut self.pool, fitted)?;
         }
         self.chunks.limit(fitted);
@@ -1423,6 +1435,29 @@ impl Pools {
     /// budget where `beside` and the budget refuses them.
     pub(crate) fn hold_activation(&mut self, bytes: u64, beside: bool) -> Result<()> {
         match self.chunks.hold_activation(&mut self.pool, bytes, beside)? {
+            Commit::Committed => Ok(()),
+            refusal => Err(refuse(&self.pool, refusal)),
+        }
+    }
+
+    /// Reserves the range anew to the fit even where it maps on demand, so
+    /// no chunk past the fit lies under the activation (smaller activation
+    /// rungs are stated only then).
+    pub fn fit_range_whole(&mut self) {
+        self.whole_fit = true;
+    }
+
+    /// Backs `bytes` of the activation's span from `offset` into it.
+    pub(crate) fn hold_activation_at(
+        &mut self,
+        offset: u64,
+        bytes: u64,
+        beside: bool,
+    ) -> Result<()> {
+        match self
+            .chunks
+            .hold_activation_at(&mut self.pool, offset, bytes, beside)?
+        {
             Commit::Committed => Ok(()),
             refusal => Err(refuse(&self.pool, refusal)),
         }
@@ -3035,7 +3070,16 @@ impl Pools {
     /// The state pool as the runtime counts it, for fires of up to
     /// `max_tokens`: the chunks the fit left the cache rows, the rest of the
     /// range stated with the activation's.
-    pub fn chunk_facts(&mut self, max_tokens: u32) -> Result<engine::chunk::ChunkFacts> {
+    ///
+    /// `rungs`, each smaller rung's tokens and the bytes at the bottom of
+    /// the activation's span state may take at it, are stated where no
+    /// spare chunk lies under the activation (a smaller rung hands state
+    /// the span's bottom, which a spare chunk would put past the fit).
+    pub fn chunk_facts(
+        &mut self,
+        max_tokens: u32,
+        rungs: &[(u32, u64)],
+    ) -> Result<engine::chunk::ChunkFacts> {
         let fitted = self.fitted_chunks();
         self.chunks.limit(fitted);
         let spare = self.chunks.total().saturating_sub(fitted);
@@ -3045,9 +3089,44 @@ impl Pools {
             Commit::Committed => {}
             refusal => return Err(refuse(&self.pool, refusal)),
         }
+        let chunk = self.chunks.layout().chunk_bytes.max(1);
+        let act = self.chunks.act_chunks();
+        // A smaller rung hands state the chunks under the activation, the
+        // spare ones first: stated only where none lies there, or so few
+        // (what the fit took back after the bodies were armed) that they are
+        // backed beside the budget.
+        let usable = spare == 0
+            || (spare <= SPARE_UNDER_RUNGS && !rungs.is_empty() && {
+                match self.chunks.hold_spare(&mut self.pool, spare)? {
+                    Commit::Committed => true,
+                    _ => false,
+                }
+            });
+        let rungs: Vec<(u32, u32)> = if usable {
+            rungs
+                .iter()
+                .map(|&(tokens, under)| {
+                    let under = u32::try_from(under / chunk).unwrap_or(u32::MAX);
+                    // `facts` states each rung with the spare chunks; at a
+                    // smaller rung they are state's too.
+                    (
+                        tokens,
+                        act.saturating_sub(under).saturating_sub(spare).max(1),
+                    )
+                })
+                .collect()
+        } else {
+            if !rungs.is_empty() {
+                eprintln!(
+                    "engine-cuda: no smaller activation rung is stated: {spare} chunk(s) under \
+                     the activation lie past the fit"
+                );
+            }
+            Vec::new()
+        };
         let mut facts = self
             .chunks
-            .facts(max_tokens, spare, !elastic::mapped_on_demand());
+            .facts(max_tokens, spare, !elastic::mapped_on_demand(), &rungs);
         // Where the load seated the weights itself, for a runtime to adopt.
         if self.preseated {
             for shape in &mut facts.weights {

@@ -466,6 +466,32 @@ pub fn arena_ladder(
     Ok(ladder)
 }
 
+/// The activation rungs a pool may drop to (SPEC decision 6): fires of at
+/// most these many tokens, beside the largest.
+pub const ACTIVATION_RUNGS: [u32; 3] = [256, 1024, 4096];
+
+/// The carve of `compiled`'s arena for fires of at most `tokens` tokens
+/// (and as many lanes), every other ceiling as `budgets` states it: what
+/// one activation rung lays out. As the arena for every fire was carved.
+pub fn arena_rung(
+    trace: &Trace,
+    budgets: &Budgets,
+    compiled: &CompiledModel,
+    tokens: u32,
+) -> Result<ArenaMap, Error> {
+    let serial = arena::Concurrency::sequential(&compiled.regions, trace.nodes.len());
+    let concurrency = if compiled.arena_forked.is_some() {
+        &serial
+    } else {
+        &compiled.concurrency
+    };
+    let mut narrow = budgets.clone();
+    narrow.tokens.max_tokens = narrow.tokens.max_tokens.min(tokens);
+    narrow.tokens.max_lanes = narrow.tokens.max_lanes.min(tokens);
+    narrow.tokens.buckets.retain(|&rows| rows <= tokens);
+    arena::carve(trace, &narrow, &compiled.classes, concurrency)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

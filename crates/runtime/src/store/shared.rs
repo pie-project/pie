@@ -63,6 +63,142 @@ pub type Shared = Arc<Mutex<SharedPool>>;
 /// What a pool keeps committed ahead of what it has handed out, in bytes.
 pub const COMMIT_AHEAD_BYTES: u64 = super::grow::COMMIT_AHEAD_BYTES;
 
+/// Engines a process drives at most, for the per-engine rung gates.
+const RUNG_ENGINES: usize = 64;
+
+/// Per engine, the tokens a fire is cut and stepped to (SPEC decision 6):
+/// the activation rung the pool is at or going to, `u32::MAX` at its
+/// largest. Set by the pool's walker, read by the pipeline's cuts and the
+/// scheduler's steps.
+static FIRE_CAP: [std::sync::atomic::AtomicU32; RUNG_ENGINES] =
+    [const { std::sync::atomic::AtomicU32::new(u32::MAX) }; RUNG_ENGINES];
+
+/// Per engine, the widest fire the scheduler may still have in flight:
+/// lowered to the cap once no step past it is (the scheduler holds back a
+/// launch past the cap), so the walker may lower the pool's rung behind it.
+static RUNG_GRANT: [std::sync::atomic::AtomicU32; RUNG_ENGINES] =
+    [const { std::sync::atomic::AtomicU32::new(u32::MAX) }; RUNG_ENGINES];
+
+/// The tokens a fire on `engine` is cut and stepped to now.
+#[must_use]
+pub fn fire_cap(engine: usize) -> u32 {
+    FIRE_CAP.get(engine).map_or(u32::MAX, |cap| {
+        cap.load(std::sync::atomic::Ordering::Acquire)
+    })
+}
+
+fn set_fire_cap(engine: usize, tokens: u32) {
+    if let Some(cap) = FIRE_CAP.get(engine) {
+        cap.store(tokens, std::sync::atomic::Ordering::Release);
+    }
+}
+
+/// The scheduler of `engine` has no step wider than `cap` in flight, and
+/// submits none from here.
+pub fn grant_rung(engine: usize, cap: u32) {
+    if let Some(grant) = RUNG_GRANT.get(engine) {
+        grant.store(cap, std::sync::atomic::Ordering::Release);
+    }
+}
+
+fn rung_granted(engine: usize) -> u32 {
+    RUNG_GRANT.get(engine).map_or(u32::MAX, |grant| {
+        grant.load(std::sync::atomic::Ordering::Acquire)
+    })
+}
+
+/// One step of moving the activation rung toward a goal ([`RungWalk`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RungStep {
+    /// Cut and step fires to this many tokens (`u32::MAX`: no cap).
+    Cap(u32),
+    /// Let state take the span above this rung's activation: no fire wider
+    /// is in flight.
+    Lower(u32),
+    /// Raise the activation to this rung, the engine first copying what
+    /// the evacuation moves out of its span.
+    Raise {
+        rung: u32,
+        evacuation: RungEvacuation,
+    },
+    /// Nothing more until a fire retires or the scheduler grants.
+    Wait,
+}
+
+/// The walk of the activation rung (SPEC decision 6). Down: cap fires
+/// first, then, once the scheduler has no wider step in flight and every
+/// fire handed out by then has retired, lower the pool's rung. Up: move
+/// state out of the larger rung's span (the engine copying it before the
+/// next fire), take the rung, then lift the cap.
+#[derive(Debug, Default)]
+pub struct RungWalk {
+    lowering: Option<(u32, u64)>,
+}
+
+impl RungWalk {
+    /// The next step toward `goal` (a rung's tokens) for `pool`, fires cut
+    /// to `cap` and the scheduler granting `granted`; `current` the last
+    /// fire epoch handed out, `retired` the last retired.
+    pub fn step(
+        &mut self,
+        pool: &SharedPool,
+        goal: u32,
+        cap: u32,
+        granted: u32,
+        current: u64,
+        retired: u64,
+    ) -> Result<RungStep, RungError> {
+        let rungs = pool.rungs();
+        let Some(&largest) = rungs.last() else {
+            return Ok(RungStep::Wait);
+        };
+        let goal = rungs
+            .iter()
+            .copied()
+            .filter(|&rung| rung <= goal)
+            .max()
+            .unwrap_or(rungs[0]);
+        let now = pool.rung();
+        if goal < now {
+            if cap > goal {
+                self.lowering = None;
+                return Ok(RungStep::Cap(goal));
+            }
+            if granted > goal {
+                return Ok(RungStep::Wait);
+            }
+            return Ok(match self.lowering {
+                Some((rung, epoch)) if rung == goal => {
+                    if retired >= epoch {
+                        self.lowering = None;
+                        RungStep::Lower(goal)
+                    } else {
+                        RungStep::Wait
+                    }
+                }
+                _ => {
+                    self.lowering = Some((goal, current));
+                    RungStep::Wait
+                }
+            });
+        }
+        self.lowering = None;
+        if goal > now {
+            let evacuation = pool.plan_raise(goal)?;
+            return Ok(RungStep::Raise {
+                rung: goal,
+                evacuation,
+            });
+        }
+        let lifted = if goal == largest { u32::MAX } else { goal };
+        Ok(if cap == lifted {
+            RungStep::Wait
+        } else {
+            RungStep::Cap(lifted)
+        })
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum SharedError {
     #[error("chunk facts: {0}")]
@@ -438,6 +574,7 @@ impl SharedPool {
             committed = facts.segments.committed,
             shapes = facts.shapes.len(),
             records = shared.records_capacity,
+            rungs = ?facts.act_chunks,
             "a shared pool"
         );
         Ok(shared)
@@ -905,10 +1042,37 @@ impl SharedPool {
         self.apply_rung(&evacuation, epoch)
     }
 
-    fn apply_rung(&mut self, evacuation: &RungEvacuation, epoch: u64) -> Result<(), RungError> {
+    /// Carries out `evacuation` (planned by [`Self::plan_raise`], copied by
+    /// the engine) and takes its rung; the chunks moved off stay closed
+    /// until the fire at `epoch` retires.
+    pub fn apply_rung(&mut self, evacuation: &RungEvacuation, epoch: u64) -> Result<(), RungError> {
         self.pool
             .apply_rung(evacuation, epoch)
             .map_err(RungError::Pool)
+    }
+
+    /// What raising the activation to `rung` moves: the state in its span,
+    /// each chunk to a free one below (empty when nothing is in the way).
+    pub fn plan_raise(&self, rung: u32) -> Result<RungEvacuation, RungError> {
+        self.pool.plan_rung(rung).map_err(RungError::Pool)
+    }
+
+    /// `evacuation`'s moves as the engine takes them (`Engine::evacuate`).
+    #[must_use]
+    pub fn rung_moves(evacuation: &RungEvacuation) -> EngineEvacuation {
+        engine_moves(&evacuation.moves)
+    }
+
+    /// Every activation rung's tokens, ascending.
+    #[must_use]
+    pub fn rungs(&self) -> Vec<u32> {
+        self.pool.rungs()
+    }
+
+    /// The rung the activation is set aside for now.
+    #[must_use]
+    pub fn rung(&self) -> u32 {
+        self.pool.rung()
     }
 
     /// Lets state take the span above `rung`'s activation again.

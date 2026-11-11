@@ -658,6 +658,11 @@ impl Engine for Cuda {
             )
             .map_err(fault)?;
 
+        // Expert parallelism seats its buffers in the arena laid at the
+        // span's start: no smaller rung.
+        if self.expert.size > 1 {
+            shell.drop_rungs();
+        }
         let mut chunk_facts = shell.chunk_facts().map_err(fault)?;
         chunk_facts.disk_persistent = residency.disk_kv_persistent && chunk_facts.disk_chunks > 0;
         let trace_name = shell.trace().name.clone();

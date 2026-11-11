@@ -513,9 +513,10 @@ impl FireCtx<'_> {
             Some(forked) if forks => (forked, true),
             _ => (&self.compiled.arena, false),
         };
-        let mut slots = self.arena.slots(
+        let mut slots = self.arena.fire_slots(
             self.pools,
             map,
+            forked,
             poem_compiler::FireRows {
                 tokens: carve_rows,
                 lanes: carve_lanes,
