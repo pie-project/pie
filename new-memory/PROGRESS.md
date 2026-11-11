@@ -1060,3 +1060,8 @@ The `new-memory/` directory is bookkeeping and is removed before anything lands 
   sequence() outright, which changed artifact plane order. L40S's fix adds engine_cuda::experts::serving_order (same
   order as before: dense planes by first read, then packed routed groups, then dense routed banks) and the import uses
   it again, so serving-file layout is unchanged vs main. Merge check matrix now includes `pie --features cuda / rocm`.
+
+### M81 — 2026-11-11: kernels-rocm drops the dead GroupSeat argument
+- `sc/amd-groupseat` (111c8dfe): HIP quantized selects / gathers / dequant lose GroupSeat (always RESIDENT since M78);
+  three shared engine-cuda call sites temporarily duplicated per backend (CUDA copy deleted with L40S's kernels-cuda
+  GroupSeat removal). ROCm goldens all 8 + buffered bitwise; build matrix incl. pie cuda / rocm clean.
