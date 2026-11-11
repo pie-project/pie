@@ -1127,24 +1127,34 @@ impl Pools {
     /// the room affords, and both yield before that one working set does,
     /// since a pool under it is no deployment. `resident` spells what is on
     /// the device already, for the refusal when not even that fits.
+    /// `settled` says the activation has reached its high water: every
+    /// composition fired while the bodies armed.
     pub fn fit_the_card(
         &mut self,
         bodies: u64,
         programs: u64,
+        settled: bool,
         resident: &dyn core::fmt::Display,
     ) -> Result<Fitted> {
         // A flat range allocated whole before the fit is the pool's to
         // reshape: its bytes count as room, less the activation it keeps.
-        // The activation's span a fire has not yet backed is the card's
-        // too: counted as room, the cache rows would take it, and the first
-        // fire's activation then the room held for the bodies (a flat range
-        // allocates its chunks and that span at once).
+        // Until the activation is settled, its span a fire has not yet
+        // backed is the card's too: counted as room, the cache rows would
+        // take it, and the first fire's activation then the room held for
+        // the bodies (a flat range allocates its chunks and that span at
+        // once). Once settled, what no fire backed is no fire's, and the
+        // cache rows take it.
+        let unheld = if settled {
+            0
+        } else {
+            self.chunks.activation_unheld_bytes()
+        };
         let live = self
             .pool
             .spare_bytes(0)?
             .saturating_add(self.committed_bytes())
             .saturating_add(self.chunks.reclaimable_bytes())
-            .saturating_sub(self.chunks.activation_unheld_bytes());
+            .saturating_sub(unheld);
         let layout = self.chunks.layout();
         let chunk = layout.chunk_bytes;
         // One working set at the declared context beside the null chunk:
