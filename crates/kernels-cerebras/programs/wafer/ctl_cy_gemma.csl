@@ -75,6 +75,7 @@ var rope_at = [2]u32 { 0xffffffff, 0xffffffff };
 var tab = @zeros([4]u32);
 var qkw_ptr: [*]f32 = &qkw;
 var rot_ptr: [*]f32 = &rot;
+const rp = @import_module("ops/rope.csl", .{ .rot = &rot, .rc = &rc, .rs = &rs, .NROT = 2, .LV = 4, .BITS = 3 });
 var tab_ptr: [*]u32 = &tab;
 var pl = @zeros([64]f32);            // the PLE words of this unit column (5 a unit) + the sequence word
 var pl_ptr: [*]f32 = &pl;
@@ -347,32 +348,10 @@ fn vgelu(dst: mem1d_dsd, src: mem1d_dsd, n: u16) void {
 fn rope_tables(kd: u16, p: u32) void {
   if (rope_at[kd] == p) { return; }
   rope_at[kd] = p;
-  var j: u16 = 0;
-  while (j < 2) : (j += 1) {
-    var c: f32 = 1.0;
-    var s: f32 = 0.0;
-    var lv: u16 = 0;
-    while (lv < 4) : (lv += 1) {
-      const d = @as(u16, (p >> @as(u16, 3 * (3 - lv))) & 7);
-      const o = kd * 128 + ((lv * 8 + d) * 2) * 2 + j;
-      const c2 = rot[o];
-      const s2 = rot[o + 2];
-      const cn = c * c2 - s * s2;
-      s = s * c2 + c * s2;
-      c = cn;
-    }
-    rc[kd * 2 + j] = c;
-    rs[kd * 2 + j] = s;
-  }
+  rp.tables(p, kd * rp.SET, kd * 2, 2);
 }
 fn rope(kd: u16, o: u16, np: u16) void {
-  var j: u16 = 0;
-  while (j < np) : (j += 1) {
-    const a = t[o + 2 * j];
-    const b = t[o + 2 * j + 1];
-    t[o + 2 * j] = a * rc[kd * 2 + j] - b * rs[kd * 2 + j];
-    t[o + 2 * j + 1] = b * rc[kd * 2 + j] + a * rs[kd * 2 + j];
-  }
+  rp.rotate(&t, o, kd * 2, np);
 }
 
 // ---------------------------------------------------------------- layers
@@ -390,13 +369,7 @@ fn combinec(comptime n: u16) f32 {
   return s;
 }
 fn ropec(comptime kd: u16, o: u16, comptime np: u16) void {
-  var j: u16 = 0;
-  while (j < np) : (j += 1) {
-    const a = t[o + 2 * j];
-    const b = t[o + 2 * j + 1];
-    t[o + 2 * j] = a * rc[kd * 2 + j] - b * rs[kd * 2 + j];
-    t[o + 2 * j + 1] = b * rc[kd * 2 + j] + a * rs[kd * 2 + j];
-  }
+  rp.rotate(&t, o, kd * 2, np);
 }
 var posf: f32 = 0.0;    // the step's position as f32 (and + 1), converted once a step
 var posf1: f32 = 0.0;

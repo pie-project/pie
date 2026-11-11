@@ -108,6 +108,7 @@ var rot = @zeros([if (NLA > 0) RLV * RB * 2 * NROT else 1]f32);
 var gate = @zeros([if (NLA > 0 and GATE == 1) Qh * Dc else 1]f32);
 var rc = @zeros([mx(NROT, 1)]f32);
 var rs = @zeros([mx(NROT, 1)]f32);
+const rp = @import_module("ops/rope.csl", .{ .rot = &rot, .rc = &rc, .rs = &rs, .NROT = NROT, .LV = RLV, .BITS = RBITS });
 var tab = @zeros([4]u32);                  // the host: [position, slot word, 0, 0] a pass
 var cw_ptr: [*]f32 = &cw;
 var gpar_ptr: [*]f32 = &gpar;
@@ -398,33 +399,11 @@ fn rope_tables_at(p: u32) void {
   // cos / sin of position p for each rotated pair: products of RLV table levels (its RBITS-bit digits)
   if (rope_at == p) { return; }
   rope_at = p;
-  var j: u16 = 0;
-  while (j < NROT) : (j += 1) {
-    var c: f32 = 1.0;
-    var s: f32 = 0.0;
-    var lv: u16 = 0;
-    while (lv < RLV) : (lv += 1) {
-      const d = @as(u16, (p >> @as(u16, RBITS * (RLV - 1 - lv))) & @as(u32, RB - 1));
-      const o = ((lv * RB + d) * 2) * NROT + j;
-      const c2 = rot[o];
-      const s2 = rot[o + NROT];
-      const cn = c * c2 - s * s2;
-      s = s * c2 + c * s2;
-      c = cn;
-    }
-    rc[j] = c;
-    rs[j] = s;
-  }
+  rp.tables(p, 0, 0, NROT);
 }
 fn rope(o: u16) void {
   // pairs (o + 2 j, o + 2 j + 1) of t: the host places each rotated pair's two halves adjacent
-  var j: u16 = 0;
-  while (j < NROT) : (j += 1) {
-    const a = t[o + 2 * j];
-    const b = t[o + 2 * j + 1];
-    t[o + 2 * j] = a * rc[j] - b * rs[j];
-    t[o + 2 * j + 1] = b * rc[j] + a * rs[j];
-  }
+  rp.rotate(&t, o, 0, NROT);
 }
 var ilh = @zeros([mx(Qh, 1)]f32);
 fn att(a: u16) void {

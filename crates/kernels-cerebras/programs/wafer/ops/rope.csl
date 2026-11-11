@@ -1,0 +1,49 @@
+// wafer/ops/rope.csl: RoPE at a CY root (README.md). The host's tables hold, for each table set,
+// LV levels of 2^BITS digits of [cos | sin][NROT] (a position is LV digits of BITS bits); the cos /
+// sin of a position is the product of its digits' rotations. A rotated pair's two halves sit
+// adjacent in the vector (the host places them).
+//
+// Params: rot, rc, rs (the kernel's tables and its cos / sin of the current position), NROT (a
+// table row's pairs), LV, BITS.
+param rot: [*]f32;
+param rc: [*]f32;
+param rs: [*]f32;
+param NROT: u16;
+param LV: u16;
+param BITS: u16;
+
+const RB: u16 = 1 << BITS;
+// The size of one table set.
+const SET: u16 = LV * RB * 2 * NROT;
+
+// cos / sin of position p for pairs j < n of the table set at base, into rc / rs from out.
+inline fn tables(p: u32, base: u16, out: u16, n: u16) void {
+  var j: u16 = 0;
+  while (j < n) : (j += 1) {
+    var c: f32 = 1.0;
+    var s: f32 = 0.0;
+    var lv: u16 = 0;
+    while (lv < LV) : (lv += 1) {
+      const d = @as(u16, (p >> @as(u16, BITS * (LV - 1 - lv))) & @as(u32, RB - 1));
+      const o = base + ((lv * RB + d) * 2) * NROT + j;
+      const c2 = rot[o];
+      const s2 = rot[o + NROT];
+      const cn = c * c2 - s * s2;
+      s = s * c2 + c * s2;
+      c = cn;
+    }
+    rc[out + j] = c;
+    rs[out + j] = s;
+  }
+}
+
+// The pairs (o + 2 j, o + 2 j + 1), j < n, of v rotated by rc / rs from c0.
+inline fn rotate(v: [*]f32, o: u16, c0: u16, n: u16) void {
+  var j: u16 = 0;
+  while (j < n) : (j += 1) {
+    const a = v[o + 2 * j];
+    const b = v[o + 2 * j + 1];
+    v[o + 2 * j] = a * rc[c0 + j] - b * rs[c0 + j];
+    v[o + 2 * j + 1] = b * rc[c0 + j] + a * rs[c0 + j];
+  }
+}

@@ -64,6 +64,7 @@ var snk_ptr: [*]f32 = &snk;
 var mref = @zeros([K * Qh]f32);
 var rot = @zeros([NLV * 8 * 2 * NROT]f32);
 var rot_ptr: [*]f32 = &rot;
+const rp = @import_module("ops/rope.csl", .{ .rot = &rot, .rc = &rc, .rs = &rs, .NROT = NROT, .LV = NLV, .BITS = 3 });
 var rc = @zeros([NROT]f32);
 var rs = @zeros([NROT]f32);
 const NRB: u16 = (Qh + 1) * NROT;          // rotated pairs a pass (q's heads, then k)
@@ -160,23 +161,7 @@ var rope_at: u32 = 0xffffffff;
 fn rope_tables_at(p: u32) void {
   if (rope_at == p) { return; }
   rope_at = p;
-  var j: u16 = 0;
-  while (j < NROT) : (j += 1) {
-    var c: f32 = 1.0;
-    var s: f32 = 0.0;
-    var lv: u16 = 0;
-    while (lv < NLV) : (lv += 1) {
-      const d = @as(u16, (p >> @as(u16, 3 * (NLV - 1 - lv))) & 7);
-      const o = ((lv * 8 + d) * 2) * NROT + j;
-      const c2 = rot[o];
-      const s2 = rot[o + NROT];
-      const cn = c * c2 - s * s2;
-      s = s * c2 + c * s2;
-      c = cn;
-    }
-    rc[j] = c;
-    rs[j] = s;
-  }
+  rp.tables(p, 0, 0, NROT);
   var b: u16 = 0;
   while (b <= Qh) : (b += 1) {
     @fmovs(@set_dsd_length(@increment_dsd_offset(rcv_d, @as(i16, b * NROT), f32), NROT), @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{NROT} -> rc[i] }));
