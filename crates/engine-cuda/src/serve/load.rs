@@ -1013,9 +1013,14 @@ impl Shell {
         let groups: Vec<(u32, Vec<Option<u32>>)> = pools
             .expert_params()
             .into_iter()
-            .filter_map(|param| {
+            .flat_map(|param| {
                 let planes = crate::store::layout::packed_planes(&boot.trace, param as usize);
-                (!planes.is_empty()).then_some((param, planes))
+                // A plane its slot carries unread has no table: an empty group.
+                let carried = crate::store::layout::carried_planes(&boot.trace, param as usize);
+                (!planes.is_empty())
+                    .then_some((param, planes))
+                    .into_iter()
+                    .chain(carried.into_iter().map(|plane| (plane, Vec::new())))
             })
             .collect();
         pools.seat_experts(&hosts, &groups)?;

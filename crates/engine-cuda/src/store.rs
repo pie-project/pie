@@ -2157,7 +2157,8 @@ impl Pools {
     /// of its planes in the order its select's table lists them (the codes
     /// first; `None` a plane the bank lacks): one table for the bank, an
     /// expert's entry a plane. A plane in no group is a dense bank, a table
-    /// of its own.
+    /// of its own; one named with no planes is carried in its slot unread,
+    /// with no table.
     pub fn seat_experts(
         &mut self,
         hosts: &[(u32, u64)],
@@ -2172,7 +2173,9 @@ impl Pools {
                 // A companion plane is read through its bank's table alone.
                 let companion = |param: u32| {
                     groups.iter().any(|(codes, members)| {
-                        *codes != param && members.iter().any(|member| *member == Some(param))
+                        (*codes != param && members.iter().any(|member| *member == Some(param)))
+                            // One its slot carries unread: no table at all.
+                            || (*codes == param && members.is_empty())
                     })
                 };
                 let mut counted = false;

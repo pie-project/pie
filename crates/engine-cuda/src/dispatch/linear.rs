@@ -2006,6 +2006,20 @@ impl Run<'_> {
                     table.hits,
                 )?;
             }
+            if codes.dtype == Dtype::Nvfp4 {
+                let tensor_scales = tensor_scales("linear.moe_select", biases)?;
+                return linear::moe::select_nvfp4(
+                    self.ctx(),
+                    x,
+                    codes,
+                    scales,
+                    tensor_scales,
+                    routes,
+                    &mut self.tensor(y),
+                    GroupSeat::RESIDENT,
+                    table,
+                );
+            }
             return linear::moe::matmul_select_quant(
                 self.ctx(),
                 x,

@@ -296,43 +296,104 @@ impl ExpertShape {
 
 /// The planes an expert's entry of a packed bank's table lists
 /// (`kernels_cuda::linear::moe::Planes`), by the bank's codes: an MXFP4
-/// bank's `[codes, scales, bias]`, `None` a plane the bank lacks. Empty for
-/// a param that is no packed bank this engine streams.
+/// bank's `[codes, scales, bias]`, an NVFP4 bank's `[codes, scales,
+/// tensor_scales]`, an mlx affine bank's (2, 4 or 8 bits) `[codes, scales,
+/// zeros]`; `None` a plane the bank lacks. Empty for a param that is no
+/// packed bank this engine streams.
 #[must_use]
 pub fn packed_planes(trace: &poem_ir::Trace, codes: usize) -> Vec<Option<u32>> {
     let Some(param) = trace.params.get(codes) else {
         return Vec::new();
     };
-    if param.dtype != poem_ir::Dtype::Mxfp4 {
+    use poem_ir::Dtype;
+    let leads = poem_ir::residency::leads(trace);
+    let named = |name: String| {
+        (0..trace.params.len())
+            .find(|at| *at != codes && leads[*at] == codes && trace.params[*at].name == name)
+            .map(|at| at as u32)
+    };
+    let scales = named(poem::declare::scales_name(&param.name));
+    let third = match param.dtype {
+        Dtype::Mxfp4 => None,
+        Dtype::Nvfp4 => match named(poem::declare::global_scales_name(&param.name)) {
+            Some(tensor_scales) => Some(tensor_scales),
+            None => return Vec::new(),
+        },
+        // mlx affine codes of 2, 4 or 8 bits (`matmul_select_mlxu4`).
+        Dtype::U2g32 | Dtype::U2g64 | Dtype::U2g128 | Dtype::U4g32 | Dtype::U4g64 | Dtype::U8g64 => {
+            match named(poem::declare::biases_name(&param.name)) {
+                Some(zeros) => Some(zeros),
+                None => return Vec::new(),
+            }
+        }
+        _ => return Vec::new(),
+    };
+    match scales {
+        Some(scales) => vec![Some(codes as u32), Some(scales), third],
+        None => Vec::new(),
+    }
+}
+
+/// The planes a packed bank's expert slot carries that no op reads (an
+/// NVFP4 bank's input scales, read by a W4A4 select alone): they stream with
+/// the bank, and its table lists none of them.
+#[must_use]
+pub fn carried_planes(trace: &poem_ir::Trace, codes: usize) -> Vec<u32> {
+    use poem_ir::residency::{Residency, residency};
+    let listed = packed_planes(trace, codes);
+    if listed.is_empty() {
         return Vec::new();
     }
+    let classes = residency(trace);
     let leads = poem_ir::residency::leads(trace);
-    let companions: Vec<usize> = (0..trace.params.len())
-        .filter(|at| *at != codes && leads[*at] == codes)
-        .collect();
-    let scales = poem::declare::scales_name(&param.name);
-    // Its scales and nothing else: a companion this table has no entry for
-    // leaves the bank dense.
-    match companions.as_slice() {
-        [at] if trace.params[*at].name == scales => {
-            vec![Some(codes as u32), Some(*at as u32), None]
+    let read = read_params(trace);
+    (0..trace.params.len())
+        .filter(|&plane| {
+            plane != codes
+                && leads[plane] == codes
+                && matches!(classes[plane], Residency::Expert(_))
+                && !listed.contains(&Some(plane as u32))
+                && !read[plane]
+        })
+        .map(|plane| plane as u32)
+        .collect()
+}
+
+/// Whether some op reads each param.
+fn read_params(trace: &poem_ir::Trace) -> Vec<bool> {
+    use poem_ir::{Def, Operands};
+    let mut readers = vec![false; trace.params.len()];
+    let mut inputs = Vec::new();
+    for node in &trace.nodes {
+        inputs.clear();
+        node.op.inputs(&mut inputs);
+        for v in &inputs {
+            if let Some(Def::Weight(w)) = trace.values.get(v.0 as usize).map(|d| &d.def)
+                && let Some(flag) = readers.get_mut(*w as usize)
+            {
+                *flag = true;
+            }
         }
-        _ => Vec::new(),
     }
+    readers
 }
 
 /// The routed banks of `trace` this engine streams an expert at a time:
 /// planes out of the checkpoint read only at the `bank` port of a plain
 /// routed select with no bias, the select whose kernels read an expert
 /// table: a dense bank, or (off tcgen05, whose grouped GEMM reads no table,
-/// and off the HIP build) an MXFP4 bank against bf16 activations, with its
-/// scales.
+/// and off the HIP build) an MXFP4, NVFP4 or affine u4 bank against bf16
+/// activations, with the planes its table lists.
 #[must_use]
 pub fn streamed_experts(trace: &poem_ir::Trace) -> Vec<usize> {
     use poem_ir::residency::{Residency, residency};
     use poem_ir::{Def, Linear, Operands, Operation};
     let classes = residency(trace);
+    let leads = poem_ir::residency::leads(trace);
     let packs = !cfg!(feature = "rocm") && !packed_unread();
+    // The params some op reads (an NVFP4 bank's input scales are read by
+    // its W4A4 select alone: a W4A16 one leaves them in the slot unread).
+    let readers = read_params(trace);
     let mut out = Vec::new();
     let mut inputs = Vec::new();
     'params: for (at, param) in trace.params.iter().enumerate() {
@@ -385,19 +446,31 @@ pub fn streamed_experts(trace: &poem_ir::Trace) -> Vec<usize> {
         if !read {
             continue;
         }
-        // A packed bank streams with every plane of it, each an expert's.
+        // A packed bank streams with every plane of it, each an expert's:
+        // the planes its table lists, and no other that lies an expert at a
+        // time (it would have no entry).
         let companions: Vec<usize> = planes
             .iter()
             .flatten()
             .map(|plane| *plane as usize)
             .filter(|plane| *plane != at)
             .collect();
-        if companions.iter().all(|plane| {
-            matches!(classes[*plane], Residency::Expert(_))
-                && trace.params[*plane].source == poem_ir::ParamSource::Checkpoint
-        }) {
+        let unlisted = (0..trace.params.len()).any(|plane| {
+            plane != at
+                && leads[plane] == at
+                && matches!(classes[plane], Residency::Expert(_))
+                && !companions.contains(&plane)
+                && readers[plane]
+        });
+        if !unlisted
+            && companions.iter().all(|plane| {
+                matches!(classes[*plane], Residency::Expert(_))
+                    && trace.params[*plane].source == poem_ir::ParamSource::Checkpoint
+            })
+        {
             out.push(at);
             out.extend(companions);
+            out.extend(carried_planes(trace, at).into_iter().map(|plane| plane as usize));
         }
     }
     // A layer's banks stream together or not at all, and so do the layers
