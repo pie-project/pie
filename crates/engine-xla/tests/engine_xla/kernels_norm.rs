@@ -75,6 +75,50 @@ fn rmsnorm_and_its_per_head_plus_one_form_answer_the_host() {
 }
 
 #[test]
+fn a_tall_fires_per_head_norm_answers_the_host() {
+    // 1024 rows: the heads' sums and roots go through the MXU.
+    let (rows, width, head) = (1024u32, 2048u32, 256u32);
+    let xs = data((rows * width) as usize, 6);
+    let hs = data(head as usize, 7);
+    let mut b = Bench::new();
+    let x = b.bf16(rows, width, &xs);
+    let h = b.bf16(1, head, &hs);
+    let y = b.zeros(dtype::Dtype::Bf16, rows, width);
+    let z = b.zeros(dtype::Dtype::Bf16, rows, width);
+    if !b
+        .run(|ctx| {
+            engine_xla::lower::lower(ctx, |l| {
+                let x_v = l.read(x)?;
+                let weight_v = l.read(h)?;
+                let v = norm::rmsnorm_per_head(l.f(), x_v, weight_v, head, 1e-6)?;
+                l.land(y, v)
+            })?;
+            engine_xla::lower::lower(ctx, |l| {
+                let x_v = l.read(x)?;
+                let v = norm::rmsnorm_no_scale(l.f(), x_v, head, 1e-6)?;
+                l.land(z, v)
+            })
+        })
+        .unwrap()
+    {
+        return;
+    }
+    let ones = vec![1.0; head as usize];
+    assert_close(
+        &b.read_f32(y),
+        &rms_ref(&xs, &hs, head as usize, 1e-6, false),
+        1e-2,
+        1e-2,
+    );
+    assert_close(
+        &b.read_f32(z),
+        &rms_ref(&xs, &ones, head as usize, 1e-6, false),
+        1e-2,
+        1e-2,
+    );
+}
+
+#[test]
 fn a_residual_add_lands_in_its_second_operand() {
     let xs = data(64, 4);
     let ys = data(64, 5);

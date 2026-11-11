@@ -562,7 +562,11 @@ fn turn_tall(f: &mut Func, x: Val, pos: Val, t: &Turn) -> Result<Option<Val>, Er
             block(u, Elem::F32),
         ],
         outs: vec![block(width, Elem::Bf16)],
-        vmem_limit: None,
+        // Two buffers of each block, with room: 32 heads of 256 (gemma-4-31B's
+        // `q`) hold 17.8 MB, past a v5e's 16 MB default.
+        vmem_limit: Some(
+            u64::try_from(8 * TALL_ROWS * width + 16 * TALL_ROWS * u + (4 << 20)).unwrap_or(0),
+        ),
         scratch: vec![],
     };
     let c_ = k
