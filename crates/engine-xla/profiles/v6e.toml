@@ -19,9 +19,10 @@ rope.flat_rows = 1024
 # a routed MLP's grouped matmul takes up to four of an expert's row tiles a step through one dot
 # (Gemma-4-26B-A4B's 32-expert cut, 1792-row fire: 1228 -> 1022 us a layer, bit for bit)
 moe.gmm_run = 4
-# a routed MLP's prompt sums each block of 128 tokens' runs of expert rows by its own dot, not one one-hot dot
-# over every row (Gemma-4-26B-A4B's 32-expert cut, 1792-row fire: the sum 288 us a layer)
-moe.segment_tokens = 128
+# a routed MLP's prompt sums each block of 256 tokens' runs of expert rows by its own dot, not one one-hot dot
+# over every row (Gemma-4-26B-A4B's 32-expert cut, 1792-row fire: the sum 288 us a layer; 128-token blocks copy
+# their runs' partial chunks twice as often: 2176 tokens 763 -> 753 us a layer at 256)
+moe.segment_tokens = 256
 # a routed MLP's gate-up kernel lands its rows' GLU, each times its weight, at 64-row tiles and more (Gemma-4-26B-
 # A4B's cut, 1792 rows: 833 -> 788 us; Qwen3.6-35B-A3B's 660 -> 618; its 256-lane decode 359 -> 337)
 moe.gmm_glu = 1
