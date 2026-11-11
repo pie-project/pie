@@ -159,8 +159,11 @@ symbols (`Family::symbols`, export order).
 
 ### Op modules (`programs/wafer/ops`)
 
-A role kernel runs its family's phase order; the ops it runs come from op modules it imports with
-comptime params (`@import_module("ops/<name>.csl", .{ .. })`). A module's code is emitted only where
+The weight PEs (`weight.csl`) and the row control PEs (`cx.csl`) are one kernel each for every
+layer program: the layer's phases (the input norm `NRM`, the mixer kind `MIXK`, the PLE round, head
+groups) are comptime params, and the mixers are op modules. The other roles still run their family's
+phase order. A kernel's ops come from op modules it imports with comptime params
+(`@import_module("ops/<name>.csl", .{ .. })`). A module's code is emitted only where
 a kernel calls it; the per-step ones are `inline fn`, so a kernel compiles to the code it had.
 `sources::OPS` embeds them, `ProgramKey` digests them with the kernels and `layout::write` writes
 them all to `layout/ops`.
@@ -174,10 +177,15 @@ them all to `layout/ops`.
 | `math` | rsqrt, exp, recip, ln, sigmoid, silu, softplus, tanh-GELU; exp over a vector | CY roots, attention weight PEs |
 | `rope` | a position's cos / sin from the per-level tables; a vector's pairs rotated | CY roots |
 | `argmax` | a head row's largest logit and first index (block maxima, halving tree or scan) | head control |
+| `wpe` | a weight PE's core: tiles, buffers, queues, the row / column reductions, segments, matvecs, the phases' I/O, handoff relays | `weight` |
+| `att` | attention over a layer's own cache (keys dim-major, the ones column, the log-sum-exp reference, redo passes) | `weight` (MIXK 0) |
+| `gdn` | the Gated DeltaNet state slice: the (k, q) exchange, the column partials, the update | `weight` (MIXK 0) |
+| `kv` | attention over sliding rings and global caches, shared-KV units (the KVS line), plain rows | `weight` (MIXK 1) |
+| `swa` | full and sliding-window attention with keys entry-major (sinks by CY) | `weight` (MIXK 2) |
+| `moe` | routed experts: the router's partial, E5M2 tiles decoded, the TK experts' gate / up and downs | `weight` (MIXK 3) |
 
-What is still in the role kernels is their family's own: the layer's phase order, the attention
-mixers (KV store, redo passes, LSE steps), GDN, the vector activations' fused forms, the PLE bus,
-the token loop's winner merge and the handoff relays.
+What is still in the CY, head and PLE kernels is their family's own: the layer's phase order, the
+vector activations' fused forms, the PLE bus, the token loop's winner merge and the handoff relays.
 
 ## Adding a model
 
