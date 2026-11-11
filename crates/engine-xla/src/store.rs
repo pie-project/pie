@@ -354,6 +354,17 @@ fn layout_rows<'a>(
     ))
 }
 
+/// Bytes the pool lays past the pages and state slots `pool_demand` counts:
+/// its null and sink chunks.
+pub fn reserved_bytes(
+    trace: &Trace,
+    paging: Paging,
+    rs: Option<&crate::rs::Layout>,
+    target: u64,
+) -> Result<u64> {
+    Ok(u64::from(RESERVED_CHUNKS) * layout_of(trace, paging, rs, target)?.chunk_bytes)
+}
+
 /// The layout `trace` lays at `paging`, its chunk near `target` bytes.
 pub fn layout_of(
     trace: &Trace,
@@ -382,8 +393,10 @@ impl Pools {
     ) -> Result<Pools> {
         let (rows, heads) = layout_rows(trace, paging, facts, rs)?;
         let layout = Layout::of(&rows, target)?;
+        // `bytes` buys pages and state slots; the null and sink chunks lie
+        // past them ([`reserved_bytes`]).
         let least = RESERVED_CHUNKS + narrow(layout.shapes.len() as u64);
-        let chunks = narrow(bytes / layout.chunk_bytes.max(1)).max(least);
+        let chunks = (RESERVED_CHUNKS + narrow(bytes / layout.chunk_bytes.max(1))).max(least);
         layout.check_reach(chunks)?;
         let pool_rows = u64::from(chunks) * layout.chunk_bytes / ROW_BYTES;
         let pool_rows = u32::try_from(pool_rows).map_err(|_| Fault::Ceiling {

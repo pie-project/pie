@@ -524,6 +524,28 @@ impl Shell {
                 .windowed(window, boot.budget.max_tokens)
                 .seated(boot.budget.max_lanes))
         };
+        let rs_layout = crate::rs::Layout::read(&boot.trace)?.map(std::sync::Arc::new);
+        // The chunk the compiler picks for this trace on a TPU, where it
+        // packs one; the store lays its own runs around it.
+        let target = poem_compiler::chunk::plan(
+            &boot.trace,
+            &budgets,
+            &poem_compiler::DeviceProfile {
+                chunk: poem_compiler::chunk::ChunkProfile::TPU.paged(boot.page_size, boot.context),
+                ..poem_compiler::DeviceProfile::default()
+            },
+        )
+        .map_or(crate::store::layout::TARGET_CHUNK, |recipe| {
+            recipe.chunk_bytes
+        });
+        // The null and sink chunks the pool lays past its pages, which a
+        // budget of kv pages and state slots does not pay for: off the room.
+        let reserved = crate::store::reserved_bytes(
+            &boot.trace,
+            paging_at(u64::from(boot.context.div_ceil(boot.page_size.max(1))), boot.slots)?,
+            rs_layout.as_deref(),
+            target,
+        )?;
         // The pool buffers are program parameters, so the pages are fixed
         // before anything traces: what the budget buys, or with none what
         // the share leaves past what others held at open, the weights (at
@@ -543,7 +565,10 @@ impl Shell {
         };
         let room_at = |floor: u64| {
             working.map_or(u64::MAX, |working| {
-                working.saturating_sub(floor).saturating_sub(headroom)
+                working
+                    .saturating_sub(floor)
+                    .saturating_sub(headroom)
+                    .saturating_sub(reserved)
             })
         };
         let room = room_at(weight_floor);
@@ -605,6 +630,7 @@ impl Shell {
         let device_cap = working.map_or(u64::MAX, |working| {
             working
                 .saturating_sub(demand(fit, slots))
+                .saturating_sub(reserved)
                 .saturating_sub(headroom)
         });
         let weights = if device.is_dry() {
@@ -628,20 +654,6 @@ impl Shell {
                 &engine,
             )?
         };
-        let rs_layout = crate::rs::Layout::read(&boot.trace)?.map(std::sync::Arc::new);
-        // The chunk the compiler picks for this trace on a TPU, where it
-        // packs one; the store lays its own runs around it.
-        let target = poem_compiler::chunk::plan(
-            &boot.trace,
-            &budgets,
-            &poem_compiler::DeviceProfile {
-                chunk: poem_compiler::chunk::ChunkProfile::TPU.paged(boot.page_size, boot.context),
-                ..poem_compiler::DeviceProfile::default()
-            },
-        )
-        .map_or(crate::store::layout::TARGET_CHUNK, |recipe| {
-            recipe.chunk_bytes
-        });
         let pools = Pools::reserve(
             &device,
             &handles,
@@ -2107,17 +2119,22 @@ impl Shell {
         let t1 = std::time::Instant::now();
         // Everything the program text depends on: the walk's windows and
         // descriptor, every input's shape, the page bound and the readout.
-        let key = *blake3::hash(
-            format!(
-                "{descriptor:?}|{windows:?}|{}|{max_pages}|{}|{}|{rs_active}|{dit_key}|{:?}",
-                inputs.shapes(),
-                readout_rows.len(),
-                self.gathers_readout,
-                self.probes
+        // Formatted only where the shape key misses: at 256 lanes the
+        // descriptor's text is a tenth of a decode's host time.
+        let gathers_readout = self.gathers_readout;
+        let full_key = |probes: &[ValueId]| -> [u8; 32] {
+            *blake3::hash(
+                format!(
+                    "{descriptor:?}|{windows:?}|{}|{max_pages}|{}|{}|{rs_active}|{dit_key}|{:?}",
+                    inputs.shapes(),
+                    readout_rows.len(),
+                    gathers_readout,
+                    probes
+                )
+                .as_bytes(),
             )
-            .as_bytes(),
-        )
-        .as_bytes();
+            .as_bytes()
+        };
         // A plain fire (no recurrent-state maps, media, clips or probes) is
         // also keyed by its shape alone, so lanes cut differently skip the
         // walk too.
@@ -2147,7 +2164,17 @@ impl Shell {
             .and_then(|k| self.shaped.get(&k))
             .map(std::sync::Arc::clone)
             .filter(|_| !shape_check());
-        let found = hit.or_else(|| self.traced.get(&key).map(std::sync::Arc::clone));
+        let mut key = None;
+        let found = match hit {
+            Some(program) => Some(program),
+            None => {
+                let k = full_key(&self.probes);
+                key = Some(k);
+                self.traced.get(&k).map(std::sync::Arc::clone)
+            }
+        };
+        // a miss, which every path below that reads it is, keyed it
+        let missed = |key: Option<[u8; 32]>| key.expect("a missed fire's key");
         if found.is_none() && self.deferred.is_some() {
             let (text, sig, probed) = self.trace_text(
                 &slots,
@@ -2165,7 +2192,7 @@ impl Shell {
             )?;
             if let Some(deferred) = self.deferred.as_mut() {
                 deferred.push(Deferred {
-                    key,
+                    key: missed(key),
                     shape_key,
                     text,
                     sig,
@@ -2195,6 +2222,7 @@ impl Shell {
                     pixels_seat.as_ref(),
                 )?;
                 let (program, probed) = program;
+                let key = missed(key);
                 self.probed.insert(key, probed);
                 self.traced.insert(key, std::sync::Arc::clone(&program));
                 program
@@ -2235,7 +2263,10 @@ impl Shell {
         // write, then a decoder's pixel plane and its grid, then the probes.
         let keep = self.keep_readout;
         let mut outs = outs;
-        let probed_ids = self.probed.get(&key).cloned().unwrap_or_default();
+        // A shape-key hit is a plain fire's, which probes nothing.
+        let probed_ids = key
+            .and_then(|key| self.probed.get(&key).cloned())
+            .unwrap_or_default();
         let mut probes = Vec::with_capacity(probed_ids.len());
         for value in probed_ids.iter().rev() {
             let Some(buffer) = outs.pop() else {
