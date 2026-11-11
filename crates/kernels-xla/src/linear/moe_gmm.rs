@@ -1335,7 +1335,7 @@ impl SegmentSum {
             self.chunk,
             self.depth,
         );
-        if tb != 128
+        if !matches!(tb, 128 | 256)
             || c % 16 != 0
             || r % c != 0
             || n % 128 != 0
@@ -1492,14 +1492,16 @@ impl SegmentSum {
             let held = b.ref_slice(tbuf, &[slot, z, z], &[1, r, 128])?;
             let held = b.ref_squeeze(held)?;
             let toks = b.vload_all(held)?;
+            // Each row's token across the block's `tb` lanes.
+            let toks = b.concat(&vec![toks; (tb / 128) as usize], 1)?;
             let tbb = b.i32(tb);
             let base = b.muli(s, tbb)?;
-            let base = b.broadcast_i(base, &[r, 128])?;
+            let base = b.broadcast_i(base, &[r, tb])?;
             let rel = b.subi(toks, base)?;
-            let lanes = b.iota(&[r, 128], 1);
+            let lanes = b.iota(&[r, tb], 1);
             let hit = b.cmpi(ICmp::Eq, rel, lanes)?;
-            let on = b.splat_f(&[r, 128], Elem::Bf16, 1.0)?;
-            let off = b.splat_f(&[r, 128], Elem::Bf16, 0.0)?;
+            let on = b.splat_f(&[r, tb], Elem::Bf16, 1.0)?;
+            let off = b.splat_f(&[r, tb], Elem::Bf16, 0.0)?;
             let hot = b.select(hit, on, off)?;
             let rows = b.ref_slice(ybuf, &[slot, z, z], &[1, r, n])?;
             let rows = b.ref_squeeze(rows)?;

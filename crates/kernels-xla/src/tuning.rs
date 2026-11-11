@@ -72,7 +72,7 @@ pub struct MoeGmmBlockMib(pub u32);
 /// row): each block copies the runs its tokens hold of each expert's rows
 /// and sums them by its own dot (`moe_gmm::SegmentSum`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Decision)]
-#[decision(id = "kernel.moe.segment_tokens", constant(set(0, 128)), default = 0, tune = search)]
+#[decision(id = "kernel.moe.segment_tokens", constant(set(0, 128, 256)), default = 0, tune = search)]
 pub struct MoeSegmentTokens(pub u32);
 
 /// The fewest tokens a fire holds for its routed MLP's sum to take the
