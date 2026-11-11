@@ -1263,6 +1263,43 @@ impl Pools {
         Ok(live.saturating_sub(reserve).max(live.min(room)))
     }
 
+    /// What a load's synthetic fires may name, inside the chunks the fit
+    /// left the pool: of `records` recurrent records and `pages` kv pages
+    /// wanted, the most records beside every page, or one record and the
+    /// most pages; and the windowed pages beside those pages, the null page
+    /// among them. A synthetic lane's rows are never read back, so lanes
+    /// may share what they name; the fit holds one working set, so one
+    /// record and its pages always fit.
+    #[must_use]
+    pub fn synthetic_room(&self, records: u32, pages: u64) -> (u32, u64, u64) {
+        let fitted = self.fitted_chunks();
+        let room = fitted.saturating_sub(self.chunks.weight_chunks_under(fitted));
+        let layout = self.chunks.layout();
+        let state = self.has_state();
+        let fits = |records: u32, pages: u64| {
+            chunks_at(layout, &self.paging, pages, if state { records } else { 0 }) <= room
+        };
+        let largest = |lo: u64, hi: u64, ok: &dyn Fn(u64) -> bool| {
+            let (mut lo, mut hi) = (lo, hi);
+            while lo < hi {
+                let mid = lo + (hi - lo).div_ceil(2);
+                if ok(mid) { lo = mid } else { hi = mid - 1 }
+            }
+            lo
+        };
+        let records = records.max(1);
+        let pages = pages.max(1);
+        let (records, pages) = if fits(records, pages) {
+            (records, pages)
+        } else if fits(1, pages) {
+            let most = largest(1, u64::from(records), &|r| fits(r as u32, pages));
+            (u32::try_from(most).unwrap_or(1), pages)
+        } else {
+            (1, largest(1, pages, &|p| fits(1, p)))
+        };
+        (records, pages, self.paging.window_pages_at(pages))
+    }
+
     /// Sizes the pool to the card: every whole chunk the card has room for,
     /// each any shape's to take, provided they seat one working set at the
     /// declared context ([`engine::chunk::fit`]). The room is the elastic
@@ -1282,11 +1319,16 @@ impl Pools {
     ) -> Result<Fitted> {
         // A flat range allocated whole before the fit is the pool's to
         // reshape: its bytes count as room, less the activation it keeps.
+        // The activation's span a fire has not yet backed is the card's
+        // too: counted as room, the cache rows would take it, and the first
+        // fire's activation then the room held for the bodies (a flat range
+        // allocates its chunks and that span at once).
         let live = self
             .pool
             .spare_bytes(0)?
             .saturating_add(self.committed_bytes())
-            .saturating_add(self.chunks.reclaimable_bytes());
+            .saturating_add(self.chunks.reclaimable_bytes())
+            .saturating_sub(self.chunks.activation_unheld_bytes());
         let layout = self.chunks.layout();
         let chunk = layout.chunk_bytes;
         // One working set at the declared context beside the null chunk:

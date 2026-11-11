@@ -2626,3 +2626,252 @@ fn golden_boot() {
         );
     }
 }
+
+/// A load of `lanes` seats and fires of up to `lanes` lanes, its pool
+/// `kv_budget` bytes where stated.
+fn load_lanes(
+    fixture: &Fixture,
+    cache: &Path,
+    knobs: engine_cuda::Knobs,
+    lanes: u32,
+    kv_budget: Option<u64>,
+) -> Shell {
+    Shell::load(Boot {
+        trace: fixture.trace.clone(),
+        contract: &fixture.contract,
+        checkpoint: &fixture.container,
+        budget: Budget::new(lanes, TOKENS),
+        patches: None,
+        voxels: None,
+        page_size: PAGE,
+        context: CONTEXT,
+        slots: lanes,
+        kv_budget,
+        memory_share: engine::load::DEFAULT_DEVICE_MEMORY_SHARE,
+        ordinal: 0,
+        knobs,
+        cache_dir: Some(cache),
+        runahead: engine::runahead::Runahead::F1,
+        residency: engine_cuda::experts::Plan::default(),
+        deferred_tier: false,
+        world: engine_cuda::World::default(),
+        expert: engine_cuda::World::default(),
+        comm: core::ptr::null_mut(),
+    })
+    .unwrap_or_else(|why| panic!("{} loads: {why}", fixture.model))
+}
+
+/// A stated kv budget is the pool's size, not a reason to arm nothing: a
+/// load of many seats whose pool holds one working set and a few chunks
+/// more, a recurrent record a chunk, arms every composition it fires.
+fn small_pool_arms(fixture: &Fixture, cache: &Path) {
+    use engine::chunk::SlotKind;
+    const LANES: u32 = 16;
+    // A chunk a record: the records the lattice's widest fire names do not
+    // fit the pool.
+    let record = {
+        let mut shell = load_lanes(fixture, cache, knobs(), 1, None);
+        let facts = shell.chunk_facts().expect("the pool states its chunks");
+        facts
+            .shapes
+            .iter()
+            .find(|shape| matches!(shape.kind, SlotKind::Fixed { .. }))
+            .expect("a hybrid's recurrent record")
+            .slot_bytes
+    };
+    let mut knobs = knobs();
+    knobs.diagnostics.chunk_bytes = Some(record);
+    let least = {
+        let mut shell = load_lanes(fixture, cache, knobs.clone(), LANES, None);
+        let facts = shell.chunk_facts().expect("the pool states its chunks");
+        let chunks = |kind: fn(&SlotKind) -> bool, slots: u64| {
+            facts
+                .shapes
+                .iter()
+                .find(|shape| kind(&shape.kind))
+                .map_or(0, |shape| {
+                    slots.div_ceil(u64::from(shape.slots_per_chunk.max(1)))
+                })
+        };
+        let pieces = facts
+            .shapes
+            .iter()
+            .find_map(|shape| match shape.kind {
+                SlotKind::Fixed { pieces } => Some(u64::from(pieces)),
+                _ => None,
+            })
+            .unwrap_or(1);
+        let one =
+            1 + chunks(
+                |kind| matches!(kind, SlotKind::List { window: None, .. }),
+                u64::from(CONTEXT / PAGE),
+            ) + chunks(|kind| matches!(kind, SlotKind::Fixed { .. }), pieces);
+        (one + 4) * facts.chunk_bytes
+    };
+    let unit = 2u64 << 20;
+    let budget = least.div_ceil(unit) * unit;
+    let shell = load_lanes(fixture, cache, knobs, LANES, Some(budget));
+    let armed = shell.armed().expect("the load armed its lattice");
+    println!(
+        "small pool {}: {} of {} compositions armed in a {} MiB pool",
+        fixture.model,
+        armed.armed,
+        armed.wanted,
+        budget >> 20
+    );
+    assert!(
+        armed.wanted > 0 && armed.armed == armed.wanted,
+        "{}: {} of {} compositions armed in a {} MiB pool ({:?})",
+        fixture.model,
+        armed.armed,
+        armed.wanted,
+        budget >> 20,
+        armed.last_refusal
+    );
+}
+
+/// How [`served_two_sets`] serves its fires.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Serving {
+    /// The lattice's bodies recorded at load, each fire replaying one.
+    Recorded,
+    /// No graph and no body: every fire walks its plan.
+    Eager,
+}
+
+/// Two working sets of one hybrid model served in turn by slot refs, as the
+/// runtime's shared pool serves them: the first a prompt and greedy decodes,
+/// then, the first still holding its record and pages, the second the same
+/// prompt from a record and pages of its own. Each set's steps' hashes and
+/// top tokens.
+fn served_two_sets(
+    fixture: &Fixture,
+    cache: &Path,
+    serving: Serving,
+) -> (Vec<(u64, u32)>, Vec<(u64, u32)>) {
+    use engine::chunk::SlotKind;
+    use engine::fire::RsReset;
+    let mut knobs = knobs();
+    knobs.chip = match serving {
+        Serving::Recorded => knobs.chip,
+        Serving::Eager => Some(engine_cuda::chip::pinned(
+            engine_cuda::Graphs::Off,
+            Some(engine_cuda::Recording::Off),
+        )),
+    };
+    let mut shell = load_with(fixture, cache, knobs);
+    // As a worker boots it: the fitted pool backed whole, its facts stated.
+    shell.back_whole().expect("the fitted pool is backed whole");
+    let facts = shell.chunk_facts().expect("the pool states its chunks");
+    facts.validate().expect("the engine's chunk facts hold");
+    shell.take_refs();
+    let mut refs = Refs::of(facts.clone(), 1);
+    let list = refs
+        .shape(|kind| matches!(kind, SlotKind::List { window: None, .. }))
+        .expect("a kv list");
+    let fixed = refs
+        .shape(|kind| matches!(kind, SlotKind::Fixed { .. }))
+        .expect("a hybrid's recurrent record");
+    let SlotKind::Fixed { pieces } = facts.shapes[fixed].kind else {
+        unreachable!("the fixed shape")
+    };
+    let prompt: Vec<u32> = (0..60u32).map(|t| (t * 7 + 11) % 1000).collect();
+    let serve = |shell: &mut Shell, refs: &mut Refs| -> Vec<(u64, u32)> {
+        let pieces: Vec<u32> = (0..pieces).map(|_| refs.take(fixed)).collect();
+        let record = shell.name_record(&pieces).expect("the record is named");
+        let mut pages: Vec<u32> = Vec::new();
+        let mut fed = 0u32;
+        let mut tokens = prompt.clone();
+        let mut steps = Vec::new();
+        for _ in 0..12 {
+            let after = fed + u32::try_from(tokens.len()).expect("a count");
+            while (pages.len() as u32) < after.div_ceil(PAGE) {
+                pages.push(refs.take(list));
+            }
+            let word = fixture.trace.facts.word(&Request::new(
+                u32::try_from(tokens.len()).expect("a count"),
+                false,
+            ));
+            let seated = Seated {
+                pages: &pages,
+                held: Some(fed),
+                rs_slot: Some(record),
+                rs_reset: if fed == 0 {
+                    RsReset::Fresh
+                } else {
+                    RsReset::Held
+                },
+                ..Seated::of(Lane {
+                    slot: 0,
+                    word,
+                    tokens: &tokens,
+                })
+            };
+            let mut rows = shell
+                .fire_media(&[seated], &[], &[])
+                .expect("the step fires");
+            let logits = rows.swap_remove(0);
+            fed = after;
+            let top = argmax(&logits);
+            steps.push((hash_logits(&logits), top));
+            tokens = vec![top];
+        }
+        steps
+    };
+    let first = serve(&mut shell, &mut refs);
+    let second = serve(&mut shell, &mut refs);
+    (first, second)
+}
+
+/// The resume probe (`PIE_GOLDEN_MODELS`, the gated delta net's miniature
+/// by default): a second working set served beside a first by slot refs
+/// ([`served_two_sets`]) draws the first's logits bit for bit, with the
+/// lattice's bodies recorded at load and with every fire walking its plan;
+/// a walk may take other kernels than a body, so the walked fires draw the
+/// recorded ones' top tokens. Then a load of many seats in a pool that
+/// holds one working set and a few chunks more arms every composition
+/// ([`small_pool_arms`]).
+#[test]
+#[ignore = "a probe run by hand: see the module's doc"]
+fn golden_eager_resume() {
+    if !engine_cuda::device::present() {
+        eprintln!("skipping: no CUDA device on this machine");
+        return;
+    }
+    let cache = cache_dir();
+    let models = std::env::var("PIE_GOLDEN_MODELS")
+        .map_or_else(|_| vec!["qwen35-tiny".to_string()], |_| models());
+    let tops = |steps: &[(u64, u32)]| steps.iter().map(|step| step.1).collect::<Vec<u32>>();
+    for model in models {
+        let fixture = fixture(&model, &cache);
+        // The warming serving: every product's algorithm picked and kept.
+        let _ = served_two_sets(&fixture, &cache, Serving::Recorded);
+        let (recorded, recorded_second) = served_two_sets(&fixture, &cache, Serving::Recorded);
+        let (eager, eager_second) = served_two_sets(&fixture, &cache, Serving::Eager);
+        for at in 0..recorded.len() {
+            println!(
+                "resume {model} {at} recorded {:016x}/{:016x} eager {:016x}/{:016x} \
+                 tops {} {} {} {}",
+                recorded[at].0,
+                recorded_second[at].0,
+                eager[at].0,
+                eager_second[at].0,
+                recorded[at].1,
+                recorded_second[at].1,
+                eager[at].1,
+                eager_second[at].1,
+            );
+        }
+        assert_eq!(
+            recorded_second, recorded,
+            "{model}: recorded, the second set"
+        );
+        assert_eq!(eager_second, eager, "{model}: eager, the second set");
+        assert_eq!(
+            tops(&eager),
+            tops(&recorded),
+            "{model}: eager against recorded"
+        );
+        small_pool_arms(&fixture, &cache);
+    }
+}
