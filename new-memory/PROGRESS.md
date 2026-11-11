@@ -1131,3 +1131,13 @@ The `new-memory/` directory is bookkeeping and is removed before anything lands 
 - Open: qwen3 prefill 2048 -5% (pooled append kernel's in-VMEM [16,1024]<->[128,128] relayout, inherent to packed
   rows for w > 128); MoE c1 -3% (device time equal or lower; host runs ahead less — donated-pool wait suspected).
 - Merge fix: kernels-xla test Shape initializers gain `pooled: None`.
+
+### M89 — 2026-11-11: held weights claim the pool before the bodies (A16)
+- `sc/eager-fix-2` (b774f872c, bf34a80e8): M82 subtracted unbacked activation and the bodies' allowance before
+  counting held weights, so the pool shrank under them (MI300X Qwen3-30B-A3B flipped to streaming and stalled). Now the
+  fit reserves one working set plus every held weight first when the card holds them beside programs and activation;
+  preseating stops at the fitted pool; arming margin capped at a quarter of the allowance. CUDA qwen3-30b-a3b-mini:
+  shares 0.90 / 0.14 / 0.13 hold weights and arm fully; 0.11 streams. CUDA goldens = base after merge.
+- Open: arming over the host copy after a flip to streaming is very slow (8-28 s per prefill body) -> arm after the
+  starting residency (EAGER, next); MoE mini t_resume diverges from token 5 (pre-existing) -> EAGER to investigate.
+  MI300X verification pending (AMD).
