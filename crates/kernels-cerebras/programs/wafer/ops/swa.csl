@@ -1,0 +1,195 @@
+// wafer/ops/swa.csl: a weight PE's attention mixer over full and sliding-window layers with keys
+// entry-major (README.md: gpt-oss). CY multicasts [q | k | v | position] (q biased, RoPE, scaled; k
+// biased, RoPE; v biased). The row's KV entries: full layers (KM bit 1) NE entries (position p on
+// row p % PYW as entry p / PYW), sliding layers one ring entry (live while pos - its position <
+// WIN); scores (q transposed: one matvec a live entry) against the carried log-sum-exp reference,
+// the scores' segment all-reduce over the kv head's columns, f16 probabilities, values with a ones
+// column (few live entries: scaled adds of the entry's widened value row) into the column
+// reduction (CY adds the sinks); CY returns o, a redo flag and (redo passes) the heads'
+// log-sum-exp steps; the last pass's come after o (`lse_late`, after the o_proj send).
+//
+// Params: pe (ops/wpe.csl), fab, math (ops/math.csl), ON (false: another mixer kind's unit), K,
+// KM, Qh (q heads a column), Dc (kv dims a column), NE (entries a row a full layer), QO (o dims a
+// column), PYW (the weight rows), WIN (the sliding window), PFTZ (1: f16 subnormal probabilities
+// and o values flushed to 0 before their matvecs).
+param pe: imported_module;
+param fab: imported_module;
+param math: imported_module;
+param ON: bool = true;
+param K: u16;
+param KM: u16;
+param Qh: u16;
+param Dc: u16;
+param NE: u16;
+param QO: u16;
+param PYW: u16;
+param WIN: u16;
+param PFTZ: u16;
+
+fn mx(a: u16, b: u16) u16 { return if (a > b) a else b; }
+fn nla() u16 { var n: u16 = 0; var l: u16 = 0; while (l < K) : (l += 1) { if (((KM >> l) & 1) == 1) { n += 1; } } return n; }
+const NLA: u16 = if (ON) nla() else 0;
+const NLS: u16 = if (ON) K - NLA else 0;
+const NS: u16 = Qh * NE;
+
+const KCW: u16 = Dc * NE;          // full layers' keys, entry-major [e][d]
+const VCW: u16 = NE * (Dc + 1);    // values, entry-major [e][d | 1]
+var kc = @zeros([NLA * KCW + NLS * Dc + 1]u16);
+var vc = @zeros([NLA * VCW + NLS * (Dc + 1) + 1]u16);
+var spos = @zeros([if (NLS > 0) NLS else 1]u16);   // sliding: 1 + the position its entry holds (0: none)
+var mref = @zeros([if (ON) K * Qh else 1]f32);
+const NVF: u16 = if (ON) Dc + 1 else 1;
+var vf = @zeros([NVF]f32);         // one entry's value row widened (the values' scaled adds)
+const vf_d = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{NVF} -> vf[i] });
+const NQT: u16 = if (ON) Dc * Qh else 1;
+var qt = @zeros([NQT]@fp16());     // q transposed [d][h] (the scores' matrix: one matvec a live entry)
+const NFZ: u16 = if (PFTZ == 1 and ON) pe.XN else 1;
+var fz = @zeros([NFZ]u16);
+const fz_d = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{NFZ} -> fz[i] });
+// xh[0..n) with an exponent field of 0 (zero or subnormal) set to +0: m = the exponent field + 0x7c00 (bit 15 set
+// iff normal), smeared over all 16 bits, then and-ed in
+fn ftz(n: u16) void {
+  if (PFTZ == 0) { return; }
+  const x = @set_dsd_length(@set_dsd_base_addr(fz_d, @ptrcast([*]u16, &pe.xh)), n);
+  const m = @set_dsd_length(fz_d, n);
+  @and16(m, x, @as(u16, 0x7c00));
+  @add16(m, m, @as(u16, 0x7c00));
+  @and16(m, m, @as(u16, 0x8000));
+  const t = @set_dsd_length(@set_dsd_base_addr(fz_d, @ptrcast([*]u16, &pe.y16)), n);
+  var sh: u16 = 1;
+  while (sh < 16) : (sh *= 2) {
+    @slr16(t, m, sh);
+    @or16(m, m, t);
+  }
+  @and16(x, x, m);
+}
+const qt_d = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{NQT} -> qt[i] });
+const QD: u16 = Qh * Dc;
+const AB: u16 = if (ON) QD + 2 * Dc + 1 else 1;
+var ab = @zeros([AB]f32);
+const NSX: u16 = if (ON) NS + 1 + Qh else 1;
+var sx = @zeros([NSX]f32);
+const sx_d = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{NSX} -> sx[i] });
+const ab_d = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{AB} -> ab[i] });
+fn yv(o: u16, n: u16) mem1d_dsd { return @set_dsd_length(@increment_dsd_offset(pe.y_d, @as(i16, o), f32), n); }
+// buf = exp(buf) in place (exp_fast's form; p in y, k's bits in y16)
+fn exp_v(buf: mem1d_dsd, n: u16) void {
+  const p = yv(0, n);
+  const kk = @set_dsd_length(@set_dsd_base_addr(pe.a_d, @ptrcast([*]u16, &pe.y16)), n);
+  const pl = @set_dsd_length(@set_dsd_stride(@set_dsd_base_addr(kk, @ptrcast([*]u16, &pe.y)), 2), n);
+  math.vexp(buf, p, kk, pl, 88.0, true);
+}
+// the scores' segment all-reduce over the kv head's columns (root: a weight PE in the middle)
+fn seg_ar(n: u16) void { pe.seg.all_reduce(@set_dsd_length(sx_d, n), n); }
+var lpa: u16 = 0;   // 1 + the layer whose log-sum-exp steps follow o (read after the o_proj send)
+// layer l's mixer (a its index among the full layers, s among the sliding ones): the column partials sent, o in xh
+fn mix(l: u16, full: bool, a: u16, s: u16) void {
+  const xh_d = pe.xh_d;
+  @fmovs(ab_d, fab.fin(pe.q_ym, AB));
+  const pos = @as(u16, ab[QD + 2 * Dc]);
+  const mine = (pos % PYW) == pe.myrow;
+  var kb: u16 = 0;
+  var vb: u16 = 0;
+  var e0: u16 = 0;
+  var nel: u16 = 0;
+  if (pos == 0) {   // a new sequence: no live entries, the log-sum-exp reference restarts
+    var hh: u16 = 0;
+    while (hh < Qh) : (hh += 1) { mref[l * Qh + hh] = 0.0; }
+    if (!full) { spos[s] = 0; }
+  }
+  if (full) {
+    kb = a * KCW; vb = a * VCW; e0 = pos / PYW;
+    nel = if (e0 + 1 < NE) e0 + 1 else NE;
+    if (pos == 0) { @mov16(@set_dsd_length(@set_dsd_base_addr(@get_dsd(mem1d_dsd, .{ .tensor_access = |i|{VCW} -> vc[i] }), @ptrcast([*]u16, &vc[1 + vb])), VCW), @as(u16, 0)); }
+  } else {
+    kb = NLA * KCW + s * Dc; vb = NLA * VCW + s * (Dc + 1);
+    if (mine) { spos[s] = pos + 1; }
+    nel = if (spos[s] != 0 and pos + 1 - spos[s] < WIN) 1 else 0;
+  }
+  if (mine) {
+    const ee = if (full) e0 else 0;
+    var d: u16 = 0;
+    while (d < Dc) : (d += 1) {
+      kc[1 + kb + ee * Dc + d] = @bitcast(u16, @as(@fp16(), ab[QD + d]));
+      vc[1 + vb + ee * (Dc + 1) + d] = @bitcast(u16, @as(@fp16(), ab[QD + Dc + d]));
+    }
+    vc[1 + vb + ee * (Dc + 1) + Dc] = 0x3c00;   // 1.0: the values matvec's last output is the softmax sum
+  }
+  const nsl: u16 = Qh * nel;
+  var apass: u16 = 0;
+  while (apass < 8) : (apass += 1) {
+    var h: u16 = 0;
+    if (nel > 0) {
+      // qt[d][h] = q[h][d] (f16), then the live entries' scores [e][h]: x = the entry's key, A = qt
+      while (h < Qh) : (h += 1) {
+        @fs2h(@set_dsd_stride(@set_dsd_length(@increment_dsd_offset(qt_d, @as(i16, h), @fp16()), Dc), Qh),
+              @set_dsd_length(@increment_dsd_offset(ab_d, @as(i16, h * Dc), f32), Dc));
+      }
+      var e: u16 = 0;
+      while (e < nel) : (e += 1) {
+        const xk = @set_dsd_length(@set_dsd_base_addr(xh_d, @ptrcast([*]@fp16(), &kc[1 + kb + e * Dc])), Dc);
+        pe.mvx(@ptrcast([*]u16, &qt), Dc, Qh, xk, e * Qh);
+      }
+      @fmovs(@set_dsd_length(sx_d, nsl), yv(0, nsl));
+      if (pe.seg.role != 5) { seg_ar(nsl); }
+      const mr = @set_dsd_length(@increment_dsd_offset(@get_dsd(mem1d_dsd, .{ .tensor_access = |i|{if (ON) K * Qh else 1} -> mref[i] }), @as(i16, l * Qh), f32), Qh);
+      e = 0;
+      while (e < nel) : (e += 1) {
+        const se = @set_dsd_length(@increment_dsd_offset(sx_d, @as(i16, e * Qh), f32), Qh);
+        @fsubs(se, se, mr);
+      }
+      const sp = @set_dsd_length(sx_d, nsl);
+      exp_v(sp, nsl);
+      @fnegs(sp, sp);               // probabilities clamped at the f16 max (-max(-p, -65504))
+      @fmaxs(sp, sp, -65504.0);
+      @fnegs(sp, sp);
+      @fs2h(@set_dsd_length(xh_d, nsl), sp);
+      ftz(nsl);
+      h = 0;
+      if (nel <= 4) {
+        // few live entries: a head's values as nel scaled adds of the entry's (f32-widened, exact) value row,
+        // in entry order: the matvec's products and sums, without its per-call cost
+        @fmovs(yv(0, Qh * (Dc + 1)), 0.0);
+        var e2: u16 = 0;
+        while (e2 < nel) : (e2 += 1) {
+          @fh2s(vf_d, @set_dsd_length(@set_dsd_base_addr(xh_d, @ptrcast([*]@fp16(), &vc[1 + vb + e2 * (Dc + 1)])), Dc + 1));
+          h = 0;
+          while (h < Qh) : (h += 1) {
+            const pv = @as(f32, pe.xh[e2 * Qh + h]);
+            @fmacs(yv(h * (Dc + 1), Dc + 1), yv(h * (Dc + 1), Dc + 1), vf_d, pv);
+          }
+        }
+      } else {
+        while (h < Qh) : (h += 1) {
+          const xp = @set_dsd_stride(@set_dsd_length(@increment_dsd_offset(xh_d, @as(i16, h), @fp16()), nel), Qh);
+          pe.mvx(@ptrcast([*]u16, &vc[1 + vb]), nel, Dc + 1, xp, h * (Dc + 1));
+        }
+      }
+    } else {
+      @fmovs(yv(0, Qh * (Dc + 1)), 0.0);
+    }
+    pe.send_y(Qh * (Dc + 1));
+    // o (the o_proj's x), then the redo word and (redo passes) the heads' log-sum-exp steps
+    @fs2h(@set_dsd_length(xh_d, QO), fab.fin(pe.q_ym, QO));
+    ftz(QO);
+    @fmovs(@set_dsd_length(sx_d, 1), fab.fin(pe.q_ym, 1));
+    if (sx[0] == 0.0) {
+      lpa = l + 1;
+      apass = 8;
+    } else {
+      @fmovs(@set_dsd_length(sx_d, Qh), fab.fin(pe.q_ym, Qh));
+      h = 0;
+      while (h < Qh) : (h += 1) { mref[l * Qh + h] += sx[h]; }
+    }
+  }
+}
+fn lse_late() void {
+  if (lpa == 0) { return; }
+  const l = lpa - 1;
+  @fmovs(@set_dsd_length(sx_d, Qh), fab.fin(pe.q_ym, Qh));
+  var h: u16 = 0;
+  while (h < Qh) : (h += 1) { mref[l * Qh + h] += sx[h]; }
+  lpa = 0;
+}
+// the MoE half's x2 passes this row's multicast: read and dropped (n words)
+fn drop(n: u16) void { @fmovs(@set_dsd_length(sx_d, n), fab.fin(pe.q_xm, n)); }

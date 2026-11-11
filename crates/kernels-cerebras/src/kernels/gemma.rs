@@ -1,4 +1,4 @@
-//! Gemma 4 E2B / E4B: `weight_gemma.csl` (18 route slots), `ctl_cx_gemma.csl`,
+//! Gemma 4 E2B / E4B: `weight.csl` (18 route slots), `ctl_cx_gemma.csl`,
 //! `ctl_cy_gemma.csl`, `head_ctl.csl` with the token bus, `ple_gemma.csl` (the PLE store), with the shared
 //! head PE ([`super::head::HEAD_PE`]). Their params from the plan ([`kernels`]) and their rcfg
 //! writers.
@@ -49,13 +49,15 @@ pub const SYMBOLS: &[(&str, &str)] = &[
 ];
 
 params! {
-    /// `weight_gemma.csl`: layers a unit and the global layers' mask, x's dims a row, the MLP
+    /// `weight.csl` (deferred norms, sliding / global caches, the PLE round; its 18 route
+    /// slots, bind_iqs's bookkeeping in memory, the scores clamped at ln(65504), kvlog): layers a unit and the global layers' mask, x's dims a row, the MLP
     /// width a column, the KV sharing, the sliding / global heads and KV entries, the KV rows,
     /// the window (0: the sliding entries are an exact ring), the levers' defaults.
     pub struct WeightGemma {
         K: u32, Hc: u32, Ic: u32, MV: u32, KM: u32, SH: u32, Qh: u32, DcS: u32, DcG: u32,
         NES: u32, NEG: u32, PYW: u32, HDS: u32, HDG: u32, WIN: u32, WSPEC: u32, PLOG: u32,
-        DIAG: u32, FIFOW: u32, ATTL: u32, TSTAMP: u32,
+        DIAG: u32, FIFOW: u32, ATTL: u32, TSTAMP: u32, NRM: u32, MIXK: u32, PLE: u32, NR: u32,
+        DONEG: u32, XHI: u32, KVX: u32,
     }
 }
 
@@ -79,7 +81,7 @@ params! {
 }
 
 pub const WEIGHT_GEMMA: Kernel = Kernel {
-    source: "weight_gemma.csl",
+    source: "weight.csl",
     owns: &["w", "rcfg", "tdbg", "kvlog"],
     params: WeightGemma::NAMES,
     route_slots: 18,
@@ -145,7 +147,7 @@ fn last_unit(pe: &Pe) -> u32 {
 /// of x | the pending term | its row's |h|^2 (2 Hc + 1 words).
 fn weight(pe: &Pe) -> R<Vec<u32>> {
     let Place::Weight { unit, row, col } = pe.role().place else {
-        return Err(format!("{:?}: weight_gemma off a weight PE", pe.at));
+        return Err(format!("{:?}: weight off a weight PE", pe.at));
     };
     let plan = &pe.prog.plan;
     let fl = if col == 0 { W_DEFER } else { 0 }
@@ -311,6 +313,13 @@ pub fn kernels(prog: &Program) -> R<Kernels> {
                 FIFOW: 32,
                 ATTL: 2,
                 TSTAMP: 0,
+                NRM: 1,
+                MIXK: 1,
+                PLE: 1,
+                NR: WEIGHT_GEMMA.route_slots as u32,
+                DONEG: 1,
+                XHI: 1,
+                KVX: 1,
             },
         )?,
     );

@@ -1,7 +1,7 @@
 //! Units whose weight rows come in runs of different dims and roles (the plan's `row_dims`:
 //! Gemma 4 12B's attention rows `0 .. RA` and plain rows past them). The units' floor and chains
 //! are the standard ones ([`super::units`]); the scores segments run along the attention runs'
-//! rows only; a weight / CX PE's `Hc` is its run's dims and a weight PE's `ATT` its run's role.
+//! rows only; a weight / CX PE's `Hc` is its run's dims and a weight PE's `AROW` its run's role.
 //! Copies each unit run by run.
 
 use crate::abi::{Overrides, Param};
@@ -20,8 +20,8 @@ type R<T> = Result<T, String>;
 
 /// A weight / CX PE's dims a row, a weight PE's row role.
 pub const HC: Param = Param("Hc");
-pub const ATT: Param = Param("ATT");
-/// [`ATT`]'s codes: an attention row, a plain row.
+pub const AROW: Param = Param("AROW");
+/// [`AROW`]'s codes: an attention row, a plain row.
 pub const ATT_ROW: u32 = 1;
 pub const PLAIN_ROW: u32 = 2;
 
@@ -96,7 +96,7 @@ impl Block for RowRuns {
                 Place::Weight { row, .. } => {
                     if let Some(run) = run_of(&prog.plan, row) {
                         o.set(at, HC, run.dims);
-                        o.set(at, ATT, if run.attention { ATT_ROW } else { PLAIN_ROW });
+                        o.set(at, AROW, if run.attention { ATT_ROW } else { PLAIN_ROW });
                     }
                 }
                 Place::Cx { row, .. } => {

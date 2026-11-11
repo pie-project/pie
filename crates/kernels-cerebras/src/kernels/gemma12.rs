@@ -1,4 +1,4 @@
-//! Gemma 4 12B: `weight_gemma12.csl`, `ctl_cx_gemma12.csl`, `ctl_cy_gemma12.csl`, `head_pe.csl` (GRP 1), with the
+//! Gemma 4 12B: `weight.csl` (deferred norms, sliding / global caches, plain rows), `ctl_cx_gemma12.csl`, `ctl_cy_gemma12.csl`, `head_pe.csl` (GRP 1), with the
 //! shared head control ([`super::head::HEAD_CTL`]). Their params from the plan ([`kernels`]) and
 //! their rcfg writers.
 
@@ -41,14 +41,14 @@ pub const SYMBOLS: &[(&str, &str)] = &[
 ];
 
 params! {
-    /// `weight_gemma12.csl`: layers a unit, x's dims a row (the plain rows'; the attention rows'
-    /// by override), the MLP width a column, the global layers' mask, the row role (`ATT`), q
+    /// `weight.csl`: layers a unit, x's dims a row (the plain rows'; the attention rows'
+    /// by override), the MLP width a column, the global layers' mask, the row role (`AROW`), q
     /// heads a KV head, a head dim's columns a segment PE (sliding / global), the KV entries, the
     /// KV rows, the head dims, the window (0: the ring is exact), the levers' defaults.
     pub struct WeightGemma12 {
-        K: u32, Hc: u32, Ic: u32, MV: u32, KM: u32, ATT: u32, Qh: u32, DcS: u32, DcG: u32,
+        K: u32, Hc: u32, Ic: u32, MV: u32, KM: u32, AROW: u32, Qh: u32, DcS: u32, DcG: u32,
         NES: u32, NEG: u32, PYW: u32, HDS: u32, HDG: u32, WIN: u32, WSPEC: u32, RING: u32,
-        DIAG: u32, FIFOW: u32, TSTAMP: u32,
+        DIAG: u32, FIFOW: u32, TSTAMP: u32, NRM: u32, MIXK: u32, KEV: u32, NR: u32, DONEG: u32,
     }
 }
 
@@ -66,7 +66,7 @@ params! {
 }
 
 pub const WEIGHT_GEMMA12: Kernel = Kernel {
-    source: "weight_gemma12.csl",
+    source: "weight.csl",
     owns: &["w", "rcfg", "tdbg"],
     params: WeightGemma12::NAMES,
     route_slots: 18,
@@ -116,7 +116,7 @@ fn last_unit(pe: &Pe, unit: u32) -> bool {
 /// A weight PE: the shared words, its flags, its handoff turns of `2 Hc(r) + 1` words.
 fn weight(pe: &Pe) -> R<Vec<u32>> {
     let Place::Weight { unit, row, col } = pe.role().place else {
-        return Err(format!("{:?}: weight_gemma12 off a weight PE", pe.at));
+        return Err(format!("{:?}: weight off a weight PE", pe.at));
     };
     let fl = if col == 0 { W_COL0 } else { 0 } | if last_unit(pe, unit) { W_LAST } else { 0 };
     let hn = 2 * dims_of(&pe.prog.plan, row) + 1;
@@ -310,7 +310,7 @@ pub fn kernels(prog: &Program) -> R<Kernels> {
                 Ic: d.ic,
                 MV: 1,
                 KM: d.km,
-                ATT: PLAIN_ROW,
+                AROW: PLAIN_ROW,
                 Qh: d.qh,
                 DcS: d.dcs,
                 DcG: d.dcg,
@@ -325,6 +325,11 @@ pub fn kernels(prog: &Program) -> R<Kernels> {
                 DIAG: 0,
                 FIFOW: 32,
                 TSTAMP: 0,
+                NRM: 1,
+                MIXK: 1,
+                KEV: 1,
+                NR: WEIGHT_GEMMA12.route_slots as u32,
+                DONEG: 1,
             },
         )?,
     );

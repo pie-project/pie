@@ -1,0 +1,373 @@
+// wafer/weight.csl: the wafer program weight PE of the unit snake (README.md). One image serves every
+// weight PE of every unit and every layer program: roles and colours are runtime words from the
+// host (rcfg), the layer's phases and its mixer comptime params from the plan.
+//
+// Role. A unit is PX x PY weight PEs plus a control column (CX: one PE a row, the root of the row
+// reductions) and a control row (CY: one PE a column, the root of the column reductions). Weight PE
+// (r, c) holds, for each of the unit's K layers, the tiles of its row's x chunk (Hc dims) and its
+// column's outputs, and runs a layer as phases over its core (ops/wpe.csl):
+//   in      x_r <- CX_r's row multicast; the projection's partial -> the column reduction into CY_c
+//   mix     the layer's mixer (below); o_c <- CY_c's column multicast
+//   out     the o-projection's partial (Hc) -> the row reduction into CX_r
+//   in, act, out: the MLP (gate | up partial, act_c <- CY_c, down partial)
+//   side    (PLE 1) the per-layer embedding round: its gate (in), z <- CY_c, its projection (out)
+// The input phase's norm (NRM): 0 direct (x_r, then the row's sum of squares: one partial of NQ + 1
+// words); 1 deferred (the row multicast is [a (Hc) | b (Hc) | 4 partial sums]: the matvec runs on a
+// and on b and sends [W a | W b | sums]; CY combines them; the deferred scalar comes back in CY's
+// multicast and column 0's PE adds it as the last word of its row partial, so CX gets it).
+// The mixers, by layer (KM bit l) and the unit's mixer kind (MIXK):
+// - MIXK 0: ops/att.csl (attention over the layer's own cache, KM bit 1) and ops/gdn.csl (Gated
+//   DeltaNet, KM bit 0);
+// - MIXK 1: ops/kv.csl (attention over sliding (KM bit 0) and global (KM bit 1) caches, shared
+//   caches, plain rows);
+// - MIXK 2: ops/swa.csl (full (KM bit 1) and sliding-window attention, keys entry-major), the layer's
+//   attention half only (NRM 2: x scaled by 2^-S_r, f16 safe, the partial scaled back; the MLP half's
+//   x passes the row multicast and is dropped);
+// - MIXK 3: ops/moe.csl (routed experts), the layer's MoE half only (the attention half's x dropped).
+//
+// Interface. Exports w (u16: per layer [in Hc x NQ][o QO x Hc][gate|up Hc x 2Ic][down Ic x Hc]
+// (+ PLE [gate Hc x 1][projection 1 x Hc]), row-major, f16 bits at MV 1), rcfg (u32, ops/wpe.csl),
+// tdbg (u32, phase stamps), (KVX 1) kvlog, init, compute(steps, start_pos); MIXK 3: w as wx (per layer, per
+// expert [gate|up Hc/2 x 2Ic][down Ic/2 x Hc], E5M2 pairs) and wr (f32: per layer the router tile Hc).
+// Hardware rules this kernel keeps (learned on the CS-3; the simulator accepts all of them):
+// - a live reduction queue is never rebound: the segments take iq6 / iq7 / oq4 only;
+// - a route or queue rebound for a send is restored only after that output queue has drained
+//   (a send returns when its wavelets enter the queue: qmode / relay wait for oq4 empty);
+// - input queues are never parked on the PE's own send colour, and two input queues never share
+//   a colour, even transiently (bind_iqs);
+// - >= 768 B between the image's used memory and 0xC000 (the stack, which the linker does not
+//   count; tools/wafer/chk_stack.py).
+//
+// Params. The layer program: K, KM, NRM, MIXK, PLE; shapes: Hc, Ic, QO, NQA, NQG, Qh, Dc / DcS /
+// DcG, DV, DK, NE / NES / NEG, PYW, HD / HDS / HDG, NEX, TK; the mixers' variants: GDN, ATT, QKN, SH,
+// AROW, KEV, WSPEC, RING, WIN, XHI, PFTZ; levers (default = the shipped 9B build): MV 1, GDEC 1, ATTL 2, SSQL
+// 1. Diagnostics (default off): TSTAMP (phase stamps), DIAG (bisection bits: 1 no layers, 2 one
+// layer, 4 no MLP (MIXK 2 / 3: no MoE phase), 8 the column reduction only, 16 the row reduction only),
+// PLOG. NR / RCW: rcfg's route slots and its words past them; DONEG: bind_iqs's bookkeeping in memory (a PE short of stack); FIFOW: the FIFO depth.
+param memcpy_params;
+param DIAG: u16 = 0;
+param K: u16;          // layers on the unit
+param KM: u16 = 0;     // bit l: layer l is attention (MIXK 0) / global (MIXK 1)
+param NRM: u16 = 0;    // the input phases' norm: 0 direct, 1 deferred
+param MIXK: u16 = 0;   // the mixer kind: 0 own-cache attention / GDN, 1 sliding / global caches, 2 entry-major
+                       // attention (an attention half), 3 routed experts (a MoE half)
+param PLE: u16 = 0;    // 1: a per-layer embedding round after the MLP
+param Hc: u16;         // x dims a row
+param Ic: u16 = 0;     // intermediate dims a column
+param MV: u16 = 1;     // 0 bf16/f32 acc, 1 f16/f16 acc
+param QO: u16 = 0;     // (MIXK 0) o dims a column (the o-proj's inputs)
+param NQA: u16 = 0;    // (MIXK 0) attention layers' outputs a column
+param NQG: u16 = 0;    // (MIXK 0) GDN layers' outputs a column
+param GDN: u16 = 0;    // (MIXK 0) 1: a unit with GDN layers
+param ATT: u16 = 0;    // (MIXK 0) 1: a unit with an attention layer
+param DV: u16 = 1;     // GDN v dims a column
+param DK: u16 = 8;     // GDN q / k dims a column
+param Qh: u16 = 1;     // attention q heads a column
+param Dc: u16 = 1;     // (MIXK 0) kv dims a column
+param DcS: u16 = 1;    // (MIXK 1) kv dims a column: sliding, global layers
+param DcG: u16 = 1;
+param NE: u16 = 1;     // (MIXK 0) KV entries a row a layer
+param NES: u16 = 4;    // (MIXK 1) entries a row: a sliding ring, a global cache
+param NEG: u16 = 1;
+param PYW: u16 = 208;  // the attention rows (position p lives on row p % PYW)
+param HD: u16 = 256;   // (MIXK 0) the head dim (the q/k RMSNorm's mean)
+param HDS: u16 = 256;  // (MIXK 1) head dims: sliding, global
+param HDG: u16 = 512;
+param QKN: u16 = 1;    // (MIXK 0) 1: the q / k heads are RMS-normed
+param SH: u16 = 0;     // (MIXK 1) 1: a shared-KV unit (q-only projections, the two shared caches)
+param AROW: u16 = 1;   // (MIXK 1) 1 an attention row, 2 a plain row
+param KEV: u16 = 0;    // (MIXK 1) 1: a global layer's projection is q | raw k
+param WSPEC: u16 = 0;  // (MIXK 1) 1: the mixer specialized a layer kind (larger code)
+param RING: u16 = 0;   // (MIXK 1) 1: a sliding layer's mixer over its whole ring every step
+param WIN: u16 = 0;    // (MIXK 1) > 0: the sliding window
+param XHI: u16 = 0;    // (MIXK 1) 1: the scores clamped at ln(65504) (ops/kv.csl)
+param PFTZ: u16 = 0;   // (MIXK 2) 1: f16 subnormal probabilities and o values flushed to 0
+param NEX: u16 = 32;   // (MIXK 3) experts, experts a token
+param TK: u16 = 4;
+param GDEC: u16 = 1;   // 1: S^T k / S^T q of the undecayed state (CY scales them)
+param ATTL: u16 = 2;   // 2: CY sends the heads' log-sum-exp steps after o, read after the o_proj send
+param SSQL: u16 = 1;   // (NRM 0) 1: x's sum of squares arrives after x: taken after the matvec
+param PLOG: u16 = 0;   // (SH 1) the full model logs each step's KVS words too
+param KVX: u16 = 0;    // 1: kvlog exported
+param TSTAMP: u16 = 0; // 1 (diagnostics): phase stamps into tdbg (on the critical path; 0: tdbg reads zeros)
+param NR: u16 = 16;    // rcfg's route slots, its words past them
+param RCW: u16 = 25;
+param DONEG: u16 = 0;  // 1: bind_iqs's bookkeeping in memory
+param FIFOW: u16 = 32; // the reductions' FIFO depth (words)
+
+const sys_mod = @import_module("<memcpy/memcpy>", memcpy_params);
+const fab = @import_module("ops/fabric.csl", .{ .NQ = 6, .DONE_GLOBAL = DONEG == 1 });
+const math = @import_module("ops/math.csl");
+const timestamp = @import_module("<time>");
+const NTD: u16 = if (MIXK == 2) 1 + 6 * K else if (MIXK == 3) 1 + 4 * K else 1 + 9 * K;
+var tdbg = @zeros([if (TSTAMP == 1) NTD else 1]u32);   // TSC stamps of the last pass, by phase (host-read, diagnostics)
+var tdbg_ptr: [*]u32 = &tdbg;
+var tsc = @zeros([3]u16);
+fn stamp(i: u16) void { if (TSTAMP == 0) { return; } timestamp.get_timestamp(&tsc); tdbg[i] = @as(u32, tsc[0]) | (@as(u32, tsc[1]) << 16); }
+fn mx(a: u16, b: u16) u16 { return if (a > b) a else b; }
+fn isk(l: u16) bool { return ((KM >> l) & 1) == 1; }
+
+// ---------------------------------------------------------------- the layer program's tiles and buffers
+// MIXK 0: per layer [in Hc x NQ][o QO x Hc][gate|up Hc x 2Ic][down Ic x Hc], NQ by the layer's kind
+fn nla() u16 { var n: u16 = 0; var l: u16 = 0; while (l < K) : (l += 1) { if (isk(l)) { n += 1; } } return n; }
+const NLA: u16 = nla();
+const NLG: u16 = K - NLA;
+const LWM: u32 = @as(u32, QO) * Hc + @as(u32, Hc) * 2 * Ic + @as(u32, Ic) * Hc;
+const LWA: u32 = @as(u32, Hc) * NQA + LWM;
+const LWG: u32 = @as(u32, Hc) * NQG + LWM;
+const NS0: u16 = Qh * NE + Qh + 1;
+// MIXK 1: per layer [in Hc x NQ][o QO x Hc][gate|up Hc x 2Ic][down Ic x Hc] (+ PLE [Hc x 1][1 x Hc]), Dc by kind
+fn dcl(l: u16) u16 { return if (isk(l)) DcG else DcS; }
+fn nql(l: u16) u16 { return Qh * dcl(l) + (if (SH == 1) 0 else if (isk(l) and KEV == 1) dcl(l) else 2 * dcl(l)); }
+fn lw(l: u16) u32 {
+  const H = @as(u32, Hc);
+  return H * nql(l) + @as(u32, Qh * dcl(l)) * H + H * 2 * Ic + @as(u32, Ic) * H + (if (PLE == 1) 2 * H else 0);
+}
+fn wtot() u32 { var n: u32 = 0; var l: u16 = 0; while (l < K) : (l += 1) { n += lw(l); } return n; }
+const NEM: u16 = if (AROW == 1) mx(NES, NEG) else 1;
+const QOM: u16 = Qh * DcG;
+const NQM: u16 = Qh * DcG + (if (SH == 1) 0 else 2 * DcG);
+const NS1: u16 = Qh * NEM + Qh + 2;
+
+// MIXK 2: per layer [qkv Hc x NQA][o QO x Hc]; MIXK 3: per layer, per expert [gate|up Hc/2 x 2Ic][down Ic/2 x Hc]
+const LW2: u16 = Hc * NQA + QO * Hc;
+const XE: u16 = (Hc / 2) * 2 * Ic + (Ic / 2) * Hc;
+
+const WN: u32 = if (MIXK == 0) @as(u32, NLA) * LWA + @as(u32, NLG) * LWG else if (MIXK == 1) wtot()
+                else if (MIXK == 2) @as(u32, K) * LW2 else @as(u32, K) * NEX * XE - 1;
+// (MIXK > 0: a unit's tiles index in u16: offsets as u16 products, no 64-bit multiply helper)
+comptime { @comptime_assert(MIXK == 0 or WN < 65536); }
+const XN: u16 = if (MIXK == 0) mx(mx(mx(Hc, QO), Ic), Qh * NE) else if (MIXK == 1) mx(mx(mx(Hc, QOM), Ic), Qh * NEM)
+                else if (MIXK == 2) mx(mx(Hc, QO), Qh * NE) else mx(Hc, TK * Ic);
+const YN: u16 = if (MIXK == 0) mx(mx(mx(mx(NQA + 1, NQG + 1), 2 * Ic + 1), Hc), mx(NS0, 2 * DV + 3))
+                else if (MIXK == 1) mx(mx(mx(2 * NQM + 4, 4 * Ic + 4), mx(Hc + 1, NS1)), Qh * (DcG + 1))
+                else if (MIXK == 2) mx(mx(NQA + 1, Hc), mx(Qh * NE, Qh * (Dc + 1))) else mx(2 * TK * Ic, Hc + 2 * TK);
+// the f16 accumulator (and exp's 2^k bits)
+const Y16N: u16 = if (MIXK == 0) (if (MV == 1 or ATT == 1) YN else 1) else if (MIXK == 1) mx(mx(2 * Ic, NQM), mx(Hc, Qh * NEM))
+                  else if (MIXK == 2) YN else mx(2 * Ic, Hc);
+const pe = @import_module("ops/wpe.csl", .{ .fab = fab, .XN = XN, .YN = YN, .Y16N = Y16N, .WN = WN, .MV = MV, .NR = NR, .RCW = RCW,
+  .FIFOW = FIFOW, .SGDN = GDN == 1 });
+var w_ptr: [*]u16 = &pe.w;
+var rcfg_ptr: [*]u32 = &pe.rcfg;
+
+// ---------------------------------------------------------------- the mixers
+const att = @import_module("ops/att.csl", .{ .pe = pe, .fab = fab, .math = math, .NL = if (MIXK == 0 and ATT == 1) NLA else 0,
+  .Qh = Qh, .Dc = Dc, .NE = NE, .QO = QO, .PYW = PYW, .HD = HD, .QKN = QKN, .ATTL = ATTL });
+const gdn = @import_module("ops/gdn.csl", .{ .pe = pe, .fab = fab, .NL = if (MIXK == 0 and GDN == 1) NLG else 0,
+  .DV = DV, .DK = DK, .GDEC = GDEC });
+const kv = @import_module("ops/kv.csl", .{ .pe = pe, .fab = fab, .math = math, .ON = MIXK == 1, .K = K, .KM = KM, .SH = SH,
+  .AROW = AROW, .KEV = KEV, .Qh = Qh, .DcS = DcS, .DcG = DcG, .NES = NES, .NEG = NEG, .PYW = PYW, .HDS = HDS, .HDG = HDG,
+  .WSPEC = WSPEC, .RING = RING, .WIN = WIN, .XHI = XHI, .PLOG = PLOG, .DIAG = DIAG });
+var kvlog_ptr: [*]f32 = &kv.kvlog;
+const swa = @import_module("ops/swa.csl", .{ .pe = pe, .fab = fab, .math = math, .ON = MIXK == 2, .K = K, .KM = KM, .Qh = Qh,
+  .Dc = Dc, .NE = NE, .QO = QO, .PYW = PYW, .WIN = WIN, .PFTZ = PFTZ });
+const moe = @import_module("ops/moe.csl", .{ .pe = pe, .fab = fab, .ON = MIXK == 3, .K = K, .Hc = Hc, .Ic = Ic, .NEX = NEX, .TK = TK });
+var wr_ptr: [*]f32 = &moe.wr;
+
+fn init() void {
+  pe.init();
+  timestamp.enable_tsc();
+  if (MIXK == 1) { kv.init(); }
+  sys_mod.unblock_cmd_stream();
+}
+
+// ---------------------------------------------------------------- NRM 0: direct norms (the GDN / attention snake)
+fn recv_x(nout: u16) void {
+  pe.recv_xh(Hc);
+  if (SSQL == 0) { recv_ss(nout); }
+}
+fn recv_ss(nout: u16) void {
+  @fmovs(@set_dsd_length(@increment_dsd_offset(pe.y_d, @as(i16, nout), f32), 1), fab.fin(pe.q_xm, 1));
+}
+var la: u16 = 0;
+var lg: u16 = 0;
+fn layer0(l: u16, b: u32) u32 {
+  const a = isk(l);
+  const NQ = if (a) NQA else NQG;
+  recv_x(NQ);
+  stamp(1 + 9 * l);
+  pe.mv32(b, Hc, NQ);
+  if (SSQL == 1) { recv_ss(NQ); }
+  stamp(2 + 9 * l);
+  if ((DIAG & 16) != 0) { pe.send_x(Hc); return b; }   // (diagnostics) the row multicast and the row reduction only
+  pe.send_y(NQ + 1);
+  stamp(3 + 9 * l);
+  if ((DIAG & 8) != 0) { return b; }                   // (diagnostics) the row multicast and the column reduction only
+  if (ATT == 1 and a) { att.mix(la); }
+  else if (GDN == 1 and !a) { gdn.mix(lg); }
+  else { pe.recv_col(QO); }
+  stamp(4 + 9 * l);
+  const bo = b + @as(u32, Hc) * NQ;
+  pe.mv32(bo, QO, Hc);
+  stamp(5 + 9 * l);
+  pe.send_x(Hc);
+  if (GDN == 1 and !a) { gdn.update(lg); lg += 1; } else { if (ATT == 1 and ATTL != 0) { att.lse_late(); } la += 1; }
+  if ((DIAG & 4) == 0) {
+  recv_x(2 * Ic);
+  stamp(6 + 9 * l);
+  pe.mv32(bo + @as(u32, QO) * Hc, Hc, 2 * Ic);
+  if (SSQL == 1) { recv_ss(2 * Ic); }
+  stamp(7 + 9 * l);
+  pe.send_y(2 * Ic + 1);
+  pe.recv_col(Ic);
+  stamp(8 + 9 * l);
+  pe.mv32(bo + @as(u32, QO) * Hc + @as(u32, Hc) * 2 * Ic, Ic, Hc);
+  stamp(9 + 9 * l);
+  pe.send_x(Hc);
+  }
+  return bo + LWM;
+}
+
+// ---------------------------------------------------------------- NRM 1: deferred norms (the sandwich-norm snake)
+// A deferred phase: [a | b | 4 sums] in, [W a | W b | sums] out (2 N + 4 words)
+fn mv2(off: u16, N: u16) void {
+  pe.recv_xh(Hc);
+  pe.mv16(off, Hc, N, 0);
+  pe.recv_xh(Hc);
+  pe.mv16(off, Hc, N, N);
+  @fmovs(@set_dsd_length(@increment_dsd_offset(pe.y_d, @as(i16, 2 * N), f32), 4), fab.fin(pe.q_xm, 4));
+  pe.send_y(2 * N + 4);
+}
+// the row partial with the deferred scalar as its last word (column 0's PE only: flags bit 0)
+fn send_row(sv: f32) void {
+  pe.y[Hc] = if ((pe.word & 1) != 0) sv else 0.0;
+  pe.send_x(Hc + 1);
+}
+var sv2 = @zeros([2]f32);
+const sv2_d = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{2} -> sv2[i] });
+fn layer1(l: u16, b: u16) u16 {
+  const dc = dcl(l);
+  const NQ = nql(l);
+  const QO1 = Qh * dc;
+  // (offsets as u16 products: no u32 multiply, whose helper __muldi3 costs 332 B)
+  // attention
+  mv2(b, NQ);
+  stamp(1 + 9 * l);
+  kv.mix(l);
+  stamp(2 + 9 * l);
+  const bo = b + Hc * NQ;
+  pe.mv16(bo, QO1, Hc, 0);
+  send_row(kv.s_att);
+  kv.lse_late();
+  stamp(3 + 9 * l);
+  // MLP: gate | up (deferred), act (Ic) | the post-attention scalar, down
+  const bg = bo + QO1 * Hc;
+  mv2(bg, 2 * Ic);
+  stamp(4 + 9 * l);
+  pe.recv_col(Ic);
+  @fmovs(@set_dsd_length(sv2_d, 1), fab.fin(pe.q_ym, 1));
+  stamp(5 + 9 * l);
+  const bd = bg + Hc * 2 * Ic;
+  pe.mv16(bd, Ic, Hc, 0);
+  send_row(sv2[0]);
+  stamp(6 + 9 * l);
+  if (PLE == 0) { return bd + Ic * Hc; }
+  // PLE: the gate (deferred), z | the post-FFN scalar, the projection
+  const bp = bd + Ic * Hc;
+  mv2(bp, 1);
+  @fmovs(sv2_d, fab.fin(pe.q_ym, 2));
+  pe.xh[0] = @as(@fp16(), sv2[0]);
+  stamp(7 + 9 * l);
+  pe.mv16(bp + Hc, 1, Hc, 0);
+  send_row(sv2[1]);
+  stamp(8 + 9 * l);
+  return bp + 2 * Hc;
+}
+// the last unit's flush (flags bit 2): the last layer's post-MLP scalar back to CX
+fn flush() void {
+  @fmovs(@set_dsd_length(pe.y_d, 4), fab.fin(pe.q_xm, 4));
+  pe.send_y(4);
+  @fmovs(@set_dsd_length(sv2_d, 1), fab.fin(pe.q_ym, 1));
+  pe.y[0] = if ((pe.word & 1) != 0) sv2[0] else 0.0;
+  pe.send_x(1);
+}
+
+// ---------------------------------------------------------------- MIXK 2 / 3: an attention half, a MoE half
+var xw = @zeros([2]f32);
+const xw_d = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{2} -> xw[i] });
+fn layer2(l: u16, a: u16, s: u16) void {
+  const full = isk(l);
+  const b = l * LW2;
+  pe.recv_xh(Hc);
+  @fmovs(xw_d, fab.fin(pe.q_xm, 2));      // 2^S_r, the row's sum of squares
+  stamp(1 + 4 * l);
+  pe.mv16(b, Hc, NQA, 0);
+  @fmuls(@set_dsd_length(pe.y_d, NQA), @set_dsd_length(pe.y_d, NQA), xw[0]);
+  pe.y[NQA] = xw[1];
+  pe.send_y(NQA + 1);
+  stamp(2 + 4 * l);
+  swa.mix(l, full, a, s);
+  stamp(3 + 4 * l);
+  pe.mv16(b + Hc * NQA, QO, Hc, 0);
+  pe.send_x(Hc);
+  stamp(1 + 4 * K + 2 * l);
+  swa.lse_late();
+  stamp(2 + 4 * K + 2 * l);
+  if ((DIAG & 4) == 0) { swa.drop(Hc + 2); }
+  stamp(4 + 4 * l);
+}
+fn layer3(l: u16) void {
+  moe.drop();
+  stamp(1 + 4 * l);
+  if ((DIAG & 4) != 0) { return; }
+  moe.route(l);
+  stamp(2 + 4 * l);
+  moe.up(l);
+  stamp(3 + 4 * l);
+  moe.down(l);
+  stamp(4 + 4 * l);
+}
+
+// ---------------------------------------------------------------- a pass
+var n_steps: u32 = 0;
+var pos0: u32 = 0;
+const pass_id: local_task_id = @get_local_task_id(8);
+task pass_task() void {
+  var i: u32 = 0;
+  while (i < n_steps) : (i += 1) {
+    var l: u16 = 0;
+    // (RCW 26, flags bit 0: the pass-start relay is the token loop's embedding: none before step 1)
+    if (RCW < 26 or i > 0 or (pe.rcfg[pe.RQ + 25] & 1) == 0) { pe.relay(18, if (MIXK == 1) 0 else 1); }
+    if (MIXK == 1 and SH == 1) { kv.pass_start(pos0 + i, i); }
+    stamp(0);
+    const nl: u16 = if ((DIAG & 2) != 0) 1 else K;
+    if (MIXK == 2) {
+      var a: u16 = 0;
+      var s: u16 = 0;
+      while ((DIAG & 1) == 0 and l < nl) : (l += 1) {
+        layer2(l, a, s);
+        if (isk(l)) { a += 1; } else { s += 1; }
+      }
+    } else if (MIXK == 3) {
+      while ((DIAG & 1) == 0 and l < nl) : (l += 1) { layer3(l); }
+    } else if (NRM == 0) {
+      var b: u32 = 0;
+      la = 0;
+      lg = 0;
+      while ((DIAG & 1) == 0 and l < nl) : (l += 1) { b = layer0(l, b); }
+    } else {
+      var b: u16 = 0;
+      while ((DIAG & 1) == 0 and l < nl) : (l += 1) { b = layer1(l, b); }
+      if ((DIAG & 1) == 0 and (pe.word & 4) != 0) { flush(); }
+    }
+    if (MIXK == 1 and SH == 1) { kv.pass_end(); }
+    pe.relay(21, if (MIXK == 1) 0 else 1);
+  }
+  sys_mod.unblock_cmd_stream();
+}
+fn compute(steps: u32, start_pos: u32) void {
+  n_steps = steps;
+  pos0 = start_pos;
+  @activate(pass_id);
+}
+
+comptime {
+  @bind_local_task(pass_task, pass_id);
+  if (MIXK == 3) { @export_symbol(w_ptr, "wx"); @export_symbol(wr_ptr, "wr"); } else { @export_symbol(w_ptr, "w"); }
+  @export_symbol(rcfg_ptr, "rcfg");
+  @export_symbol(tdbg_ptr, "tdbg");
+  if (KVX == 1) { @export_symbol(kvlog_ptr, "kvlog"); }
+  @export_symbol(init);
+  @export_symbol(compute);
+}
+//@@ dummies

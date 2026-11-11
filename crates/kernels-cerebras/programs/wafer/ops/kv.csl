@@ -1,0 +1,386 @@
+// wafer/ops/kv.csl: a weight PE's attention mixer over sliding and global caches (README.md: Gemma
+// 4, Gemma 4 12B). Every layer is attention (KM bit l: global, else sliding).
+// Caches: one a layer, or (SH 1, a shared-KV unit) cache 0 sliding and cache 1 global, both fed by
+// the source unit's CY row on the KVS colour (17 words a pass: k, v, |k|^2, |v|^2 partials of the
+// source's sliding then global layer, and a sequence word): taken by an async receive posted at
+// the end of every pass (and at init), so the source's sends never wait on a unit that has not
+// started. A sliding cache is a ring of NES entries a row (position p on row p % PYW, entry (p /
+// PYW) % NES; WIN > 0 masks entries older than the window); a global one has NEG entries (context
+// NEG PYW). PYW may be fewer than the unit's rows (E4B: 128 of 160): a row at or past PYW never
+// takes an entry, its empty caches score zeros into every pass's reductions. A plain row (AROW 2)
+// holds no cache: it takes CY's multicasts and sends zeros into each pass's values reduction.
+// v is stored normalised: |v|^2 rides the scores segment with |k|^2; the entry is finalised (1 /
+// |k|, v / |v|) by the first layer that uses it in the pass.
+//
+// The flags word (pe.word): bit 1 a KVS consumer; the KVS colour is rcfg[RQ + 12].
+//
+// Params: pe (ops/wpe.csl), fab, math (ops/math.csl), ON (false: another mixer kind's unit), K, KM, SH, AROW (1 an attention row, 2 a
+// plain row), KEV (1: a global layer's projection is q | raw k, v = v_norm(raw k) by CY), Qh, DcS /
+// DcG (kv dims a column by kind), NES / NEG (entries a row by kind), PYW (the attention rows), HDS
+// / HDG (head dims by kind), WSPEC (1: the mixer specialized a layer kind, larger code), RING (1:
+// a sliding layer's mixer over its whole ring every step, fixed-length views), WIN (> 0: the
+// sliding window), XHI (1: the scores clamped from above at ln(65504) so exp gives the f16 max;
+// 0: exp to 88 and the probabilities clamped at 65504), PLOG / DIAG (the KVS words' log).
+param pe: imported_module;
+param fab: imported_module;
+param math: imported_module;
+param ON: bool = true;   // false: a unit of another mixer kind, every buffer one word
+param K: u16;
+param KM: u16;
+param SH: u16;
+param AROW: u16;
+param KEV: u16;
+param Qh: u16;
+param DcS: u16;
+param DcG: u16;
+param NES: u16;
+param NEG: u16;
+param PYW: u16;
+param HDS: u16;
+param HDG: u16;
+param WSPEC: u16;
+param RING: u16;
+param WIN: u16;
+param XHI: u16;
+param PLOG: u16;
+param DIAG: u16;
+
+fn mx(a: u16, b: u16) u16 { return if (a > b) a else b; }
+fn isg(l: u16) bool { return ((KM >> l) & 1) == 1; }
+fn dcl(l: u16) u16 { return if (isg(l)) DcG else DcS; }
+// a layer's q | k | v outputs a column
+fn nql(l: u16) u16 { return Qh * dcl(l) + (if (SH == 1) 0 else if (isg(l) and KEV == 1) dcl(l) else 2 * dcl(l)); }
+
+// ---------------------------------------------------------------- caches
+const NC: u16 = if (!ON or AROW == 2) 0 else if (SH == 1) 2 else K;
+fn cg(c: u16) bool { return if (SH == 1) c == 1 else isg(c); }
+fn cne(c: u16) u16 { return if (cg(c)) NEG else NES; }
+fn cdc(c: u16) u16 { return if (cg(c)) DcG else DcS; }
+fn ckw(c: u16) u16 { return cdc(c) * cne(c); }
+fn cvw(c: u16) u16 { return cne(c) * (cdc(c) + 1); }
+fn sum_kw() u16 { var n: u16 = 0; var c: u16 = 0; while (c < NC) : (c += 1) { n += ckw(c); } return n; }
+fn sum_vw() u16 { var n: u16 = 0; var c: u16 = 0; while (c < NC) : (c += 1) { n += cvw(c); } return n; }
+fn sum_ne() u16 { var n: u16 = 0; var c: u16 = 0; while (c < NC) : (c += 1) { n += cne(c); } return n; }
+// a cache's offsets: tables built at comptime (the runtime loops over the caches cost ~40 cycles a call, several a layer)
+fn mkoff(comptime k: u16) [NC + 1]u16 {
+  var r = @zeros([NC + 1]u16);
+  var c: u16 = 0;
+  while (c < NC) : (c += 1) {
+    r[c + 1] = r[c] + (if (k == 0) ckw(c) else if (k == 1) cvw(c) else if (k == 2) cne(c) else if (cg(c)) 0 else cne(c));
+  }
+  return r;
+}
+const KOFF = mkoff(0);
+const VOFF = mkoff(1);
+const EOFF = mkoff(2);
+const SOFF = mkoff(3);
+fn koff(c: u16) u16 { return KOFF[c]; }
+fn voff(c: u16) u16 { return VOFF[c]; }
+fn eoff(c: u16) u16 { return EOFF[c]; }
+fn soff(c: u16) u16 { return SOFF[c]; }
+fn cache_of(l: u16) u16 { return if (SH == 1) (if (isg(l)) 1 else 0) else l; }
+const NC1: u16 = mx(NC, 1);
+var kc = @zeros([sum_kw() + 1]u16);
+var vc = @zeros([sum_vw() + 1]u16);
+var kinv = @zeros([if (NC == 0) 1 else sum_ne()]f32);
+var mref = @zeros([if (NC == 0) 1 else K * Qh]f32);
+var pv = @zeros([NC1 * DcG]f32);      // the pending entry's raw v a cache
+var pks = @zeros([NC1]f32);           // its |k|^2, |v|^2 partials (this column's)
+var pvs = @zeros([NC1]f32);
+var pend = @zeros([NC1]u16);
+var spos = @zeros([if (WIN > 0 and NC > 0) soff(NC) else 1]f32);   // (WIN > 0) a sliding entry's position + 1 (sliding caches only)
+
+// ---------------------------------------------------------------- buffers
+const NEM: u16 = if (NC > 0) mx(NES, NEG) else 1;
+const NS: u16 = if (ON) Qh * NEM + Qh + 2 else 1;
+const QOM: u16 = Qh * DcG;
+var sx = @zeros([NS]f32);
+const sx_d = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{NS} -> sx[i] });
+fn seg_ar(n: u16) void { pe.seg.all_reduce(@set_dsd_length(sx_d, n), n); }
+// the scores' clamp from above (XHI 1): ln(65504) less 7e-5, so exp(XH) rounds to the f16 max (65504) and a larger
+// score's probability is the f16 max as min(exp(s), 65504) gave (the probabilities only reach the PE as f16)
+const XH: f32 = if (XHI == 1) 11.0898 else 88.0;
+// y[0..n) = exp(buf[0..n)) (buf clamped to [-87, XH], then the exp's reduced argument; XHI 0: back into buf)
+fn exp_v(buf: mem1d_dsd, n: u16) void {
+  const p = @set_dsd_length(pe.y_d, n);
+  const kk = @set_dsd_length(@set_dsd_base_addr(pe.a_d, @ptrcast([*]u16, &pe.y16)), n);
+  const pl = @set_dsd_length(@set_dsd_stride(@set_dsd_base_addr(kk, @ptrcast([*]u16, &pe.y)), 2), n);
+  math.vexp(buf, p, kk, pl, XH, XHI == 0);
+}
+// (RING 1) exp_v on the whole sliding ring's scores (Qh NES): fixed-length views, the u16 ones built once at init
+const NFR: u16 = if (NC > 0) Qh * NES else 1;
+const fS = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{NFR} -> sx[i] });
+const fP = @set_dsd_length(pe.y_d, NFR);
+const fH = @set_dsd_length(pe.xh_d, NFR);
+var fK = pe.y16_d;
+var fPL = pe.y16_d;
+var fPH = pe.y16_d;
+fn init() void {
+  if (RING == 1 and NC > 0) {
+    fK = @set_dsd_length(@set_dsd_base_addr(pe.a_d, @ptrcast([*]u16, &pe.y16)), NFR);
+    fPL = @set_dsd_length(@set_dsd_stride(@set_dsd_base_addr(fK, @ptrcast([*]u16, &pe.y)), 2), NFR);
+    fPH = @increment_dsd_offset(fPL, 1, u16);
+  }
+  if (SH == 1 and (pe.word & 2) != 0 and (DIAG & 64) == 0) { kv_post(); }
+}
+// exp_v(fS) then the f16 copy into xh (the same ops as the runtime path)
+fn exp_fr() void {
+  @fmaxs(fS, fS, -87.0);
+  @fnegs(fS, fS);
+  @fmaxs(fS, fS, -XH);
+  @fnegs(fS, fS);
+  @fmuls(fP, fS, 1.4426950408889634);
+  @fadds(fP, fP, math.ex_a[0]);
+  @fadds(fP, fP, math.ex_a[1]);
+  @fmacs(fS, fS, fP, -0.6931471805599453);
+  @fadds(fP, fP, math.ex_a[2]);
+  @sll16(fK, fPL, 7);
+  @fmuls(fP, fS, 0.041458580642938614);
+  @fadds(fP, fP, math.ex_c[0]);
+  @fmuls(fP, fP, fS);
+  @fadds(fP, fP, math.ex_c[1]);
+  @fmuls(fP, fP, fS);
+  @fadds(fP, fP, math.ex_c[2]);
+  @fmuls(fP, fP, fS);
+  @fadds(fP, fP, math.ex_c[3]);
+  @add16(fPH, fPH, fK);
+  if (XHI == 1) { @fs2h(fH, fP); } else {
+    @fmovs(fS, fP);
+    @fnegs(fS, fS);
+    @fmaxs(fS, fS, -65504.0);
+    @fnegs(fS, fS);
+    @fs2h(fH, fS);
+  }
+}
+const IHDS: f32 = 1.0 / @as(f32, HDS);
+const IHDG: f32 = 1.0 / @as(f32, HDG);
+
+// the step's position: its row (pos % PYW), entry (pos / PYW) and pos + 1 as f32, worked out once a step and from the
+// last position when it is the next one (a u32 divide by a PYW that is not a power of two, E4B's 160, is a ~270-cycle
+// helper call, and u32 -> f32 ~60: a layer used to pay for several)
+var q_pos: u32 = 0xffffffff;
+var q_row: u16 = 0;
+var q_ent: u16 = 0;
+var q_pf: f32 = 0.0;
+fn posq(pos: u32) void {
+  if (pos == q_pos) { return; }
+  if (q_pos != 0xffffffff and pos == q_pos + 1) {
+    q_row += 1;
+    if (q_row == PYW) { q_row = 0; q_ent += 1; }
+  } else {
+    q_row = @as(u16, pos % @as(u32, PYW));
+    q_ent = @as(u16, pos / @as(u32, PYW));
+  }
+  q_pos = pos;
+  q_pf = @as(f32, pos + 1);
+}
+fn cslot(c: u16, pos: u32) u16 {
+  posq(pos);
+  return if (cg(c)) q_ent else q_ent % NES;
+}
+fn cache_reset(c: u16) void {
+  var i: u16 = 0;
+  while (i < ckw(c)) : (i += 1) { kc[1 + koff(c) + i] = 0; }
+  i = 0;
+  while (i < cvw(c)) : (i += 1) { vc[1 + voff(c) + i] = 0; }
+  i = 0;
+  while (i < cne(c)) : (i += 1) { kinv[eoff(c) + i] = 0.0; if (WIN > 0 and !cg(c)) { spos[soff(c) + i] = 0.0; } }
+  pend[c] = 0;
+}
+// the new entry of cache c (this row's): k into the keys (f16), v and the two partials pending
+fn cache_put(c: u16, pos: u32, k: [*]f32, v: [*]f32, ks: f32, vs: f32) void {
+  const e = cslot(c, pos);
+  const ne = cne(c);
+  const dc = cdc(c);
+  var d: u16 = 0;
+  while (d < dc) : (d += 1) {
+    kc[1 + koff(c) + d * ne + e] = @bitcast(u16, @as(@fp16(), k[d]));
+    pv[c * DcG + d] = v[d];
+  }
+  pks[c] = ks;
+  pvs[c] = vs;
+  pend[c] = 1;
+  if (WIN > 0 and !cg(c)) { spos[soff(c) + e] = q_pf; }
+}
+fn cache_fin(c: u16, pos: u32, kss: f32, vss: f32, ihd: f32) void {
+  const e = cslot(c, pos);
+  const dc = cdc(c);
+  kinv[eoff(c) + e] = math.rsqrt(kss * ihd + 1.0e-6);
+  const vi = math.rsqrt(vss * ihd + 1.0e-6);
+  var d: u16 = 0;
+  while (d < dc) : (d += 1) { vc[1 + voff(c) + e * (dc + 1) + d] = @bitcast(u16, @as(@fp16(), pv[c * DcG + d] * vi)); }
+  vc[1 + voff(c) + e * (dc + 1) + dc] = 0x3c00;
+  pend[c] = 0;
+}
+
+// ---------------------------------------------------------------- KVS (shared units): the async receive and the pass start's entries
+const ut_k = @get_ut_id(7);          // the KVS receive (iq7's microthread)
+var kvb = @zeros([if (SH == 1) 17 else 1]f32);
+const kvb_d = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{if (SH == 1) 17 else 1} -> kvb[i] });
+var kvlog = @zeros([if (SH == 1 and (DIAG != 0 or PLOG == 1)) 2 * 64 else 1]f32);   // (DIAG 1) a step's KVS words' sum and sequence word
+fn kv_post() void {
+  kvb[16] = -1.0;
+  fab.iqc(7, pe.rcfg[pe.RQ + 12]);
+  @fmovs(kvb_d, fab.fin(pe.q_ym, 17), .{ .async = true, .ut_id = ut_k });
+}
+var chk = @zeros([1]f32);
+fn kv_take(pos: u32, s: u32) void {
+  posq(pos);
+  const want = q_pf;
+  const cd = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{1} -> chk[i] });
+  const sd = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{1} -> kvb[@as(i16, 16) + i] });
+  @fmovs(cd, sd);
+  while (chk[0] != want) { @fmovs(cd, sd); }   // (a DSD read each turn: the async receive writes kvb)
+  fab.iqc(7, pe.rcfg[pe.RQ + 5]);
+  if (DIAG != 0 or PLOG == 1) {
+    var t: f32 = 0.0;
+    var i: u16 = 0;
+    while (i < 16) : (i += 1) { t += kvb[i]; }
+    if (s < 64) { kvlog[2 * @as(u16, s)] = t; kvlog[2 * @as(u16, s) + 1] = kvb[16]; }
+    if (DIAG != 0) { return; }
+  }
+  if (pos == 0) { cache_reset(0); cache_reset(1); }
+  if (q_row == pe.myrow) {
+    cache_put(0, pos, @ptrcast([*]f32, &kvb[0]), @ptrcast([*]f32, &kvb[DcS]), kvb[2 * DcS], kvb[2 * DcS + 1]);
+    const g0 = 2 * DcS + 2;
+    cache_put(1, pos, @ptrcast([*]f32, &kvb[g0]), @ptrcast([*]f32, &kvb[g0 + DcG]), kvb[g0 + 2 * DcG], kvb[g0 + 2 * DcG + 1]);
+  }
+}
+// a pass's start and end (a KVS consumer)
+fn pass_start(pos: u32, s: u32) void { if (SH == 1 and (pe.word & 2) != 0 and (DIAG & 64) == 0) { kv_take(pos, s); } }
+fn pass_end() void { if (SH == 1 and (pe.word & 2) != 0 and (DIAG & 64) == 0) { kv_post(); } }
+
+// ---------------------------------------------------------------- attention
+// CY's multicast: q (weights, RoPE) QD | k Dc | v Dc | position | q's partial |q_h|^2 (Qh) | |k|^2 | |v|^2 | the
+// deferred scalar (AB = QD + 2 Dc + Qh + 4); a shared layer's k / v / |k|^2 / |v|^2 are zeros
+const NAB: u16 = if (ON) QOM + 2 * DcG + Qh + 4 else 1;
+var ab = @zeros([NAB]f32);
+const ab_d = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{NAB} -> ab[i] });
+var s_att: f32 = 0.0;   // the layer's deferred scalar (CY's)
+// layer l's mixer: the column partials sent, o (the o_proj's x) in xh. WSPEC 1: one copy a layer kind (g 0
+// sliding, 1 global: the head width and the entry count constants); 0: one runtime copy (g 2; the smaller program)
+fn mix(l: u16) void {
+  if (AROW == 2) { if (isg(l)) { attw(l, 1); } else { attw(l, 0); } return; }
+  if (WSPEC != 0) { if (isg(l)) { attm(l, 1); } else { attm(l, 0); } } else { attm(l, 2); }
+}
+// a plain row: CY's multicasts taken, zeros into each pass's values reduction
+fn attw(l: u16, comptime g: u16) void {
+  const dc: u16 = if (g == 1) DcG else DcS;
+  const QD: u16 = Qh * dc;
+  const AB: u16 = QD + 2 * dc + Qh + 4;
+  @fmovs(@set_dsd_length(ab_d, AB), fab.fin(pe.q_ym, AB));
+  s_att = ab[QD + 2 * dc + Qh + 3];
+  var apass: u16 = 0;
+  while (apass < 8) : (apass += 1) {
+    @fmovs(@set_dsd_length(pe.y_d, Qh * (dc + 1)), 0.0);
+    pe.send_y(Qh * (dc + 1));
+    @fs2h(@set_dsd_length(pe.xh_d, QD), fab.fin(pe.q_ym, QD));
+    @fmovs(@set_dsd_length(sx_d, 1 + Qh), fab.fin(pe.q_ym, 1 + Qh));
+    if (sx[0] == 0.0) { lpa = l + 1; apass = 8; }
+  }
+}
+fn attm(l: u16, comptime g: u16) void {
+  const xh_d = pe.xh_d;
+  const y_d = pe.y_d;
+  const dc: u16 = if (g == 2) dcl(l) else if (g == 1) DcG else DcS;
+  const QD: u16 = Qh * dc;
+  const AB: u16 = QD + 2 * dc + Qh + 4;
+  const c = cache_of(l);
+  const ne: u16 = if (g == 2) cne(c) else if (g == 1) NEG else NES;
+  const ihd: f32 = if (isg(l)) IHDG else IHDS;   // (reciprocals: no runtime f32 divide)
+  @fmovs(@set_dsd_length(ab_d, AB), fab.fin(pe.q_ym, AB));
+  const pos = @as(u32, ab[QD + 2 * dc]);
+  s_att = ab[QD + 2 * dc + Qh + 3];
+  posq(pos);
+  const mine = q_row == pe.myrow;
+  if (pos == 0) {
+    if (SH == 0) { cache_reset(c); }
+    var hh: u16 = 0;
+    while (hh < Qh) : (hh += 1) { mref[l * Qh + hh] = 0.0; }
+  }
+  if (SH == 0 and mine) {
+    cache_put(c, pos, @ptrcast([*]f32, &ab[QD]), @ptrcast([*]f32, &ab[QD + dc]), ab[QD + 2 * dc + 1 + Qh], ab[QD + 2 * dc + 2 + Qh]);
+  }
+  @fs2h(@set_dsd_length(xh_d, QD), @set_dsd_length(ab_d, QD));
+  const eseen = @as(u32, q_ent) + 1;
+  // RING, a sliding layer: the whole ring every step (NEl a constant), the entries not yet written masked below
+  const FR: bool = (RING == 1 and WIN == 0 and (if (g == 2) !isg(l) else g == 0));
+  const nseen: u16 = if (eseen < @as(u32, ne)) @as(u16, eseen) else ne;
+  const NEl: u16 = if (FR) ne else nseen;
+  const nsl: u16 = Qh * NEl + Qh + 2;
+  const kb = koff(c);
+  const vb = voff(c);
+  const e0 = eoff(c);
+  var apass: u16 = 0;
+  while (apass < 8) : (apass += 1) {
+    var h: u16 = 0;
+    while (h < Qh) : (h += 1) {
+      pe.kvmv(@ptrcast([*]u16, &kc[1 + kb]), dc, ne, h * dc, h * ne);
+      if (!FR) {
+        @fmovs(@set_dsd_length(@increment_dsd_offset(sx_d, @as(i16, h * NEl), f32), NEl),
+               @set_dsd_length(@increment_dsd_offset(y_d, @as(i16, h * ne), f32), NEl));
+      }
+      sx[Qh * NEl + h] = ab[QD + 2 * dc + 1 + h];
+    }
+    if (FR) { @fmovs(fS, fP); }   // (the whole ring: y's layout is sx's)
+    const pm = mine and pend[c] != 0;
+    sx[Qh * NEl + Qh] = if (pm) pks[c] else 0.0;
+    sx[Qh * NEl + Qh + 1] = if (pm) pvs[c] else 0.0;
+    if (pe.seg.role != 5) { seg_ar(nsl); }
+    if (pm) { cache_fin(c, pos, sx[Qh * NEl + Qh], sx[Qh * NEl + Qh + 1], ihd); }
+    const ki = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{NEM} -> kinv[i] });
+    h = 0;
+    while (h < Qh) : (h += 1) {
+      const sh = @set_dsd_length(@increment_dsd_offset(sx_d, @as(i16, h * NEl), f32), NEl);
+      @fmuls(sh, sh, @set_dsd_length(@increment_dsd_offset(ki, @as(i16, e0), f32), NEl));
+      @fmuls(sh, sh, math.rsqrt(sx[Qh * NEl + h] * ihd + 1.0e-6));
+      @fsubs(sh, sh, mref[l * Qh + h]);
+      if (FR and nseen < ne) {   // (FR) entries not yet written score -1e30: exp -> 0, f16 0: they add exact zeros
+        @fmovs(@set_dsd_length(@increment_dsd_offset(sx_d, @as(i16, h * NEl + nseen), f32), ne - nseen), -1.0e30);
+      }
+    }
+    if (WIN > 0 and !cg(c)) {   // entries out of the window (or never written) score -1e30 in every head: exp -> 0
+      const so = soff(c);
+      var e: u16 = 0;
+      while (e < NEl) : (e += 1) {
+        const sp = spos[so + e];
+        if (sp == 0.0 or q_pf - sp >= @as(f32, WIN)) { h = 0; while (h < Qh) : (h += 1) { sx[h * NEl + e] = -1.0e30; } }
+      }
+    }
+    if (FR) { exp_fr(); } else {
+      exp_v(@set_dsd_length(sx_d, Qh * NEl), Qh * NEl);
+      if (XHI == 1) { @fs2h(@set_dsd_length(xh_d, Qh * NEl), @set_dsd_length(y_d, Qh * NEl)); } else {
+        // f16 probabilities clamped at the f16 max (-max(-p, -65504); SDK 2.10 has no @fmins)
+        const sp = @set_dsd_length(sx_d, Qh * NEl);
+        @fnegs(sp, sp);
+        @fmaxs(sp, sp, -65504.0);
+        @fnegs(sp, sp);
+        @fs2h(@set_dsd_length(xh_d, Qh * NEl), sp);
+      }
+    }
+    h = 0;
+    while (h < Qh) : (h += 1) { pe.kvmv(@ptrcast([*]u16, &vc[1 + vb]), NEl, dc + 1, h * NEl, h * (dc + 1)); }
+    pe.send_y(Qh * (dc + 1));
+    @fs2h(@set_dsd_length(xh_d, QD), fab.fin(pe.q_ym, QD));
+    @fmovs(@set_dsd_length(sx_d, 1 + Qh), fab.fin(pe.q_ym, 1 + Qh));
+    if (sx[0] == 0.0) {
+      lpa = l + 1;                 // (ATTL 2) the logs come in a Qh-word multicast after o: read after the o_proj send
+      apass = 8;
+    } else {
+      h = 0;
+      while (h < Qh) : (h += 1) { mref[l * Qh + h] += sx[1 + h]; }
+      @fs2h(@set_dsd_length(xh_d, QD), @set_dsd_length(ab_d, QD));
+    }
+  }
+}
+var lpa: u16 = 0;
+fn lse_late() void {
+  if (lpa == 0) { return; }
+  const l = lpa - 1;
+  @fmovs(@set_dsd_length(sx_d, Qh), fab.fin(pe.q_ym, Qh));
+  if (NC > 0) {
+    var h: u16 = 0;
+    while (h < Qh) : (h += 1) { mref[l * Qh + h] += sx[h]; }
+  }
+  lpa = 0;
+}

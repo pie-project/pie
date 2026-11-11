@@ -51,26 +51,7 @@ pub const KERNELS: &[(&str, &str)] = &[
         include_str!("../programs/wafer/ple_gemma.csl"),
     ),
     ("relay.csl", include_str!("../programs/wafer/relay.csl")),
-    (
-        "weight_dense.csl",
-        include_str!("../programs/wafer/weight_dense.csl"),
-    ),
-    (
-        "weight_gemma.csl",
-        include_str!("../programs/wafer/weight_gemma.csl"),
-    ),
-    (
-        "weight_gemma12.csl",
-        include_str!("../programs/wafer/weight_gemma12.csl"),
-    ),
-    (
-        "weight_gptoss_att.csl",
-        include_str!("../programs/wafer/weight_gptoss_att.csl"),
-    ),
-    (
-        "weight_gptoss_moe.csl",
-        include_str!("../programs/wafer/weight_gptoss_moe.csl"),
-    ),
+    ("weight.csl", include_str!("../programs/wafer/weight.csl")),
 ];
 
 /// Every op module of `programs/wafer/ops`, by file name: the ops a role kernel imports with
@@ -80,15 +61,21 @@ pub const OPS: &[(&str, &str)] = &[
         "argmax.csl",
         include_str!("../programs/wafer/ops/argmax.csl"),
     ),
+    ("att.csl", include_str!("../programs/wafer/ops/att.csl")),
     (
         "fabric.csl",
         include_str!("../programs/wafer/ops/fabric.csl"),
     ),
+    ("gdn.csl", include_str!("../programs/wafer/ops/gdn.csl")),
+    ("kv.csl", include_str!("../programs/wafer/ops/kv.csl")),
     ("math.csl", include_str!("../programs/wafer/ops/math.csl")),
+    ("moe.csl", include_str!("../programs/wafer/ops/moe.csl")),
     ("mv.csl", include_str!("../programs/wafer/ops/mv.csl")),
     ("red.csl", include_str!("../programs/wafer/ops/red.csl")),
     ("rope.csl", include_str!("../programs/wafer/ops/rope.csl")),
     ("seg.csl", include_str!("../programs/wafer/ops/seg.csl")),
+    ("swa.csl", include_str!("../programs/wafer/ops/swa.csl")),
+    ("wpe.csl", include_str!("../programs/wafer/ops/wpe.csl")),
 ];
 
 /// The source of the kernel file `name`.

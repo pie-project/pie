@@ -1,0 +1,143 @@
+// wafer/ops/att.csl: a weight PE's attention mixer over a layer's own cache (README.md: the KV
+// rows). NE entries a row a layer (position p on row p % PYW as entry p / PYW; keys f16
+// dim-major, values f16 entry-major with a ones column so the values matvec also gives the
+// softmax sums), scores as Qh matvecs over the live entries, the scores' segment all-reduce over
+// the kv head's columns (|q|^2 and the new |k|^2 ride in it: the q / k RMSNorms as scalars), exp
+// against a carried log-sum-exp reference, values as Qh matvecs, o / l into the column
+// reduction; CY returns o and a redo flag (a sum outside the f16 window: rescore, at most 8
+// passes). KV matvecs accumulate in f32 (an f16 accumulator overflows on a cold reference).
+//
+// Params: pe (ops/wpe.csl), fab, math (ops/math.csl), NL (attention layers on the unit), Qh (q
+// heads a column), Dc (kv dims a column), NE (entries a row a layer), QO (o dims a column), PYW
+// (weight rows a unit), HD (the head dim: the q / k RMSNorm's mean), QKN (1: the q / k heads are
+// RMS-normed, their rms scales the scores), ATTL (2: CY sends the heads' log-sum-exp steps in a
+// second multicast, read by `lse_late` after the o_proj send; 0: with o).
+param pe: imported_module;
+param fab: imported_module;
+param math: imported_module;
+param NL: u16;
+param Qh: u16;
+param Dc: u16;
+param NE: u16;
+param QO: u16;
+param PYW: u16;
+param HD: u16;
+param QKN: u16;
+param ATTL: u16;
+
+fn mx(a: u16, b: u16) u16 { return if (a > b) a else b; }
+const ON: bool = NL > 0;   // (NL 0: a unit with no such layer, every buffer one word)
+const NS: u16 = if (ON) Qh * NE + Qh + 1 else 1;
+const HDF: f32 = @as(f32, HD);
+const KCW: u16 = Dc * NE;               // keys, dim-major [d][e]
+const VCW: u16 = NE * (Dc + 1);         // values, entry-major [e][d | 1]
+var kc = @zeros([NL * KCW + 1]u16);
+var vc = @zeros([NL * VCW + 1]u16);
+var kinv = @zeros([mx(NL * NE, 1)]f32);
+var mref = @zeros([mx(NL * Qh, 1)]f32);
+var ab = @zeros([if (ON) Qh * Dc + 2 * Dc + 2 + Qh else 1]f32);
+var sx = @zeros([NS]f32);
+// (exp_v's 2^k bits live in y16, the f16 matvec accumulator, which is never live during the scores' exp:
+// the weight PE has no memory to spare)
+const sx_d = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{NS} -> sx[i] });
+// exp(buf) in place (exp_fast's form: 2^k by the exponent bits, a degree-4 polynomial on r)
+fn exp_v(buf: mem1d_dsd, n: u16) void {
+  const p = @set_dsd_length(pe.y_d, n);
+  const kk = @set_dsd_length(@set_dsd_base_addr(pe.a_d, @ptrcast([*]u16, &pe.y16)), n);
+  const pl = @set_dsd_length(@set_dsd_stride(@set_dsd_base_addr(kk, @ptrcast([*]u16, &pe.y)), 2), n);
+  math.vexp(buf, p, kk, pl, 88.0, true);
+}
+fn seg_ar(n: u16) void { pe.seg.all_reduce(@set_dsd_length(sx_d, n), n); }
+
+// CY's multicast: q (normed weights, RoPE, 1/sqrt(HD) applied) QD | k Dc | v Dc | position |
+// the column's partial sums of squares of the raw q a head (Qh) and of the raw k (1).
+const QD: u16 = Qh * Dc;
+const AB: u16 = QD + 2 * Dc + 2 + Qh;
+// attention layer a's mixer: the column partials sent, o (the o_proj's x) in xh
+fn mix(a: u16) void {
+  const kb: u16 = a * KCW;
+  const vb: u16 = a * VCW;
+  const xh_d = pe.xh_d;
+  const y_d = pe.y_d;
+  @fmovs(@get_dsd(mem1d_dsd, .{ .tensor_access = |i|{AB} -> ab[i] }), fab.fin(pe.q_ym, AB));
+  const pos = @as(u16, ab[QD + 2 * Dc]);
+  const mine = (pos % PYW) == pe.myrow;
+  const e0 = pos / PYW;
+  if (pos == 0) {   // a new sequence: no live entries, the log-sum-exp reference restarts
+    @mov16(@increment_dsd_offset(@get_dsd(mem1d_dsd, .{ .tensor_access = |i|{KCW} -> kc[1 + i] }), @as(i16, kb), u16), @as(u16, 0));
+    @mov16(@increment_dsd_offset(@get_dsd(mem1d_dsd, .{ .tensor_access = |i|{VCW} -> vc[1 + i] }), @as(i16, vb), u16), @as(u16, 0));
+    @fmovs(@set_dsd_length(@increment_dsd_offset(@get_dsd(mem1d_dsd, .{ .tensor_access = |i|{NE} -> kinv[i] }), @as(i16, a * NE), f32), NE), 0.0);
+    var hh: u16 = 0;
+    while (hh < Qh) : (hh += 1) { mref[a * Qh + hh] = 0.0; }
+  }
+  if (mine) {
+    var d: u16 = 0;
+    while (d < Dc) : (d += 1) {
+      kc[1 + kb + d * NE + e0] = @bitcast(u16, @as(@fp16(), ab[QD + d]));
+      vc[1 + vb + e0 * (Dc + 1) + d] = @bitcast(u16, @as(@fp16(), ab[QD + Dc + d]));
+    }
+    vc[1 + vb + e0 * (Dc + 1) + Dc] = 0x3c00;   // 1.0: the values matvec's last output is the softmax sum
+  }
+  @fs2h(@set_dsd_length(xh_d, QD), @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{QD} -> ab[i] }));
+  // live entries only: position p lives on row p % PYW as entry p / PYW, so every row's live
+  // entries are below p / PYW + 1 (a row's one unwritten entry scores 0 and adds 0: its ones column is 0)
+  const NEl: u16 = if (pos / PYW + 1 < NE) pos / PYW + 1 else NE;
+  const nsl: u16 = Qh * NEl + Qh + 1;
+  var apass: u16 = 0;
+  while (apass < 8) : (apass += 1) {
+    var h: u16 = 0;
+    while (h < Qh) : (h += 1) {
+      // keys are dim-major rows of NE: the matvec spans them all (cheap), only NEl are kept
+      pe.kvmv(@ptrcast([*]u16, &kc[1 + kb]), Dc, NE, h * Dc, h * NE);
+      @fmovs(@set_dsd_length(@increment_dsd_offset(sx_d, @as(i16, h * NEl), f32), NEl),
+             @set_dsd_length(@increment_dsd_offset(y_d, @as(i16, h * NE), f32), NEl));
+      sx[Qh * NEl + h] = ab[QD + 2 * Dc + 1 + h];
+    }
+    sx[Qh * NEl + Qh] = if (mine) ab[QD + 2 * Dc + 1 + Qh] else 0.0;
+    if (pe.seg.role != 5) { seg_ar(nsl); }
+    if (QKN == 1 and mine) { kinv[a * NE + e0] = math.rsqrt(sx[Qh * NEl + Qh] / HDF + 1.0e-6); }
+    const ki = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{NE} -> kinv[i] });
+    h = 0;
+    while (h < Qh) : (h += 1) {
+      const sh = @set_dsd_length(@increment_dsd_offset(sx_d, @as(i16, h * NEl), f32), NEl);
+      if (QKN == 1) {
+        @fmuls(sh, sh, @increment_dsd_offset(ki, @as(i16, a * NE), f32));
+        @fmuls(sh, sh, math.rsqrt(sx[Qh * NEl + h] / HDF + 1.0e-6));
+      }
+      @fsubs(sh, sh, mref[a * Qh + h]);
+    }
+    exp_v(@set_dsd_length(sx_d, Qh * NEl), Qh * NEl);
+    // f16 probabilities clamped at the f16 max (-max(-p, -65504); SDK 2.10 has no @fmins)
+    const sp = @set_dsd_length(sx_d, Qh * NEl);
+    @fnegs(sp, sp);
+    @fmaxs(sp, sp, -65504.0);
+    @fnegs(sp, sp);
+    @fs2h(@set_dsd_length(xh_d, Qh * NEl), sp);
+    h = 0;
+    while (h < Qh) : (h += 1) { pe.kvmv(@ptrcast([*]u16, &vc[1 + vb]), NEl, Dc + 1, h * NEl, h * (Dc + 1)); }
+    pe.send_y(Qh * (Dc + 1));
+    // o (the o_proj's x), then the redo word and the heads' log-sum-exp steps (every pass)
+    @fs2h(@set_dsd_length(xh_d, QO), fab.fin(pe.q_ym, QO));
+    @fmovs(@set_dsd_length(sx_d, 1 + Qh), fab.fin(pe.q_ym, 1 + Qh));
+    h = 0;
+    if (ATTL == 2 and sx[0] == 0.0) {   // CY sends the logs in a Qh-word multicast after o: read after the o_proj send
+      lpa = a + 1;
+    } else {
+      while (h < Qh) : (h += 1) { mref[a * Qh + h] += sx[1 + h]; }
+    }
+    if (sx[0] == 0.0) { apass = 8; } else {
+      @fs2h(@set_dsd_length(xh_d, QD), @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{QD} -> ab[i] }));
+    }
+  }
+}
+
+// ATTL 2: the last pass's log-sum-exp steps come in CY's second multicast, after the o_proj send
+var lpa: u16 = 0;   // 1 + the layer whose logs are pending
+fn lse_late() void {
+  if (lpa == 0) { return; }
+  const a = lpa - 1;
+  @fmovs(@set_dsd_length(sx_d, Qh), fab.fin(pe.q_ym, Qh));
+  var h: u16 = 0;
+  while (h < Qh) : (h += 1) { mref[a * Qh + h] += sx[h]; }
+  lpa = 0;
+}

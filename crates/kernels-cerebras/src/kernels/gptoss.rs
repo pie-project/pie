@@ -1,4 +1,4 @@
-//! gpt-oss: the attention / MoE weight halves (`weight_gptoss_att.csl`, `weight_gptoss_moe.csl`),
+//! gpt-oss: the attention / MoE weight halves (`weight.csl`, its entry-major attention and routed experts),
 //! CX (`ctl_cx_gptoss.csl`), the CY halves (`ctl_cy_gptoss_att.csl`, `ctl_cy_gptoss_moe.csl`), the
 //! band's head (`head_pe_gptoss.csl`) and control row ([`super::head::HEAD_CTL`]'s source). Their
 //! params from the plan ([`kernels`]) and their rcfg writers.
@@ -51,18 +51,20 @@ pub const SYMBOLS: &[(&str, &str)] = &[
 ];
 
 params! {
-    /// `weight_gptoss_att.csl`: layers a unit and the full-attention mask, x's dims a row, the
+    /// `weight.csl` (MIXK 2, rcfg's flags word): layers a unit and the full-attention mask, x's dims a row, the
     /// q / KV shapes a column, the KV entries and rows, the sliding window, the levers' defaults.
     pub struct WeightAtt {
         K: u32, KM: u32, Hc: u32, NQA: u32, QO: u32, Qh: u32, Dc: u32, NE: u32, PYW: u32,
-        WIN: u32, PFTZ: u32, DIAG: u32, TSTAMP: u32, FIFOW: u32,
+        WIN: u32, PFTZ: u32, DIAG: u32, TSTAMP: u32, FIFOW: u32, MIXK: u32, RCW: u32,
     }
 }
 
 params! {
-    /// `weight_gptoss_moe.csl`: layers a unit, x's dims a row, an expert's columns a PE, the
+    /// `weight.csl` (MIXK 3, rcfg's flags word): layers a unit, x's dims a row, an expert's columns a PE, the
     /// experts and top-k, the levers' defaults.
-    pub struct WeightMoe { K: u32, Hc: u32, Ic: u32, NEX: u32, TK: u32, DIAG: u32, TSTAMP: u32, FIFOW: u32 }
+    pub struct WeightMoe {
+        K: u32, Hc: u32, Ic: u32, NEX: u32, TK: u32, DIAG: u32, TSTAMP: u32, FIFOW: u32, MIXK: u32, RCW: u32,
+    }
 }
 
 params! {
@@ -93,7 +95,7 @@ params! {
 }
 
 pub const WEIGHT_ATT: Kernel = Kernel {
-    source: "weight_gptoss_att.csl",
+    source: "weight.csl",
     owns: &["w", "rcfg", "tdbg"],
     params: WeightAtt::NAMES,
     route_slots: 16,
@@ -101,7 +103,7 @@ pub const WEIGHT_ATT: Kernel = Kernel {
 };
 
 pub const WEIGHT_MOE: Kernel = Kernel {
-    source: "weight_gptoss_moe.csl",
+    source: "weight.csl",
     owns: &["wx", "wr", "rcfg", "tdbg"],
     params: WeightMoe::NAMES,
     route_slots: 16,
@@ -230,6 +232,8 @@ pub fn kernels(prog: &Program) -> R<Kernels> {
         DIAG: 0,
         TSTAMP: 0,
         FIFOW: 32,
+        MIXK: 2,
+        RCW: 26,
     };
     out.insert(WA, KernelBuild::of(&WEIGHT_ATT, att)?);
     let moe = WeightMoe {
@@ -241,6 +245,8 @@ pub fn kernels(prog: &Program) -> R<Kernels> {
         DIAG: 0,
         TSTAMP: 0,
         FIFOW: 32,
+        MIXK: 3,
+        RCW: 26,
     };
     out.insert(WM, KernelBuild::of(&WEIGHT_MOE, moe)?);
     let cx = CtlCx {

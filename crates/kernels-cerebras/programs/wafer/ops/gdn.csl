@@ -1,0 +1,74 @@
+// wafer/ops/gdn.csl: a weight PE's Gated DeltaNet mixer (README.md: GDN). The PE holds DV f32 of
+// each GDN layer's recurrent state (row r < 128 holds state row k = r of its column's v head). CY
+// multicasts the column's conv'd k | q and a reset flag; the PE owning k index r multicasts (k_r,
+// q_r) along its row inside the k head's columns (or keeps them when the k head is one column);
+// every PE sends S^T k | S^T q | k_r^2 | q_r^2 | k_r q_r into the column reduction; CY returns
+// o | delta / |k| | decay; the state update (`update`) runs after the out_proj send (off the
+// critical path).
+//
+// The source word (pe.word): bit 15 this PE owns k index r, bit 14 alone (the k head in one
+// column), bits 0-7 its q / k dim.
+//
+// Params: pe (ops/wpe.csl), fab, NL (GDN layers on the unit), DV (v dims a column), DK (q / k dims
+// a column), GDEC (1: S^T k / S^T q of the undecayed state, CY scales them; the state decays at
+// the update).
+param pe: imported_module;
+param fab: imported_module;
+param NL: u16;
+param DV: u16;
+param DK: u16;
+param GDEC: u16;
+
+const ON: bool = NL > 0;   // (NL 0: a unit with no GDN layer, every buffer one word)
+var st = @zeros([if (ON) NL * DV else 1]f32);
+var dl = @zeros([if (ON) DV else 1]f32);
+var gb = @zeros([if (ON) 2 * DK + 2 else 1]f32);   // CY's multicast: k DK, q DK, decay, pad
+var kq = @zeros([2]f32);
+const st_d = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{if (ON) DV else 1} -> st[i] });
+const dl_d = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{if (ON) DV else 1} -> dl[i] });
+const kq_d = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{2} -> kq[i] });
+var gdecw = @zeros([1]f32);
+const gdec_d = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{1} -> gdecw[i] });
+
+// GDN layer g's mixer: the column partial sent, o (the out_proj's x) in xh
+fn mix(g: u16) void {
+  const s = @increment_dsd_offset(st_d, @as(i16, g * DV), f32);
+  const gsrc = pe.word;
+  @fmovs(@get_dsd(mem1d_dsd, .{ .tensor_access = |i|{2 * DK + 2} -> gb[i] }), fab.fin(pe.q_ym, 2 * DK + 2));
+  if (gb[2 * DK + 1] != 0.0) { @fmovs(@set_dsd_length(s, DV), 0.0); }   // position 0: a new sequence
+  if ((gsrc & 0x4000) != 0) {
+    const j = gsrc & 0xff;
+    kq[0] = if ((gsrc & 0x8000) != 0) gb[j] else 0.0;
+    kq[1] = if ((gsrc & 0x8000) != 0) gb[DK + j] else 0.0;
+  } else {
+    pe.seg.qmode(1);
+    if ((gsrc & 0x8000) != 0) {
+      const j = gsrc & 0xff;
+      kq[0] = gb[j]; kq[1] = gb[DK + j];
+      @fmovs(fab.fout(pe.q_ao, 2), kq_d);
+    } else {
+      @fmovs(kq_d, fab.fin(pe.q_xm, 2));
+    }
+    pe.seg.qmode(0);
+  }
+  const kr = kq[0];
+  const qr = kq[1];
+  const y_d = pe.y_d;
+  if (GDEC == 0) { @fmuls(s, s, gb[2 * DK]); }   // (GDEC 1: CY scales the sums; the decay comes back with delta)
+  @fmuls(@set_dsd_length(y_d, DV), s, kr);
+  @fmuls(@set_dsd_length(@increment_dsd_offset(y_d, @as(i16, DV), f32), DV), s, qr);
+  pe.y[2 * DV] = kr * kr;
+  pe.y[2 * DV + 1] = qr * qr;
+  pe.y[2 * DV + 2] = kr * qr;
+  pe.send_y(2 * DV + 3);
+  // o (the out_proj's x) and delta / |k|
+  @fs2h(@set_dsd_length(pe.xh_d, DV), fab.fin(pe.q_ym, DV));
+  @fmovs(dl_d, fab.fin(pe.q_ym, DV));
+  if (GDEC == 1) { @fmovs(gdec_d, fab.fin(pe.q_ym, 1)); }
+}
+// GDN layer g's state update (after the out_proj send)
+fn update(g: u16) void {
+  const s = @increment_dsd_offset(st_d, @as(i16, g * DV), f32);
+  if (GDEC == 1) { @fmuls(s, s, gdecw[0]); }
+  @fmacs(s, s, dl_d, kq[0]);
+}

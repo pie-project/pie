@@ -17,7 +17,7 @@ pub const GDN: Slot = Slot::segment("gdn");
 
 pub const COLOURS: &[(Class, u8)] = &[(GDN_KQ, 10)];
 
-/// The source word's codes (`weight_dense.csl`'s `gsrc`): a one-PE segment's own key dim, the
+/// The source word's codes (`ops/gdn.csl`'s source word): a one-PE segment's own key dim, the
 /// multicast's source (its key dim in the low bits), a receiver, a PE with no GDN row.
 pub const SOURCE_OWN: u32 = 0xC000;
 pub const SOURCE_SEND: u32 = 0x8000;

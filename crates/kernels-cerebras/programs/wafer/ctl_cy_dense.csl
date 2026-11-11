@@ -2,7 +2,7 @@
 // README.md.
 //
 // Role. One a unit column, on the unit's middle row: the root of the column reductions of the
-// column's weight PEs (weight_dense.csl) and all of the layer's column-local element-wise work:
+// column's weight PEs (weight.csl) and all of the layer's column-local element-wise work:
 // - GDN: rms scale; conv1d (CONV taps, the window a ring) and SiLU on the column's q / k channels,
 //   multicast [k | q | reset]; then (off the path) v / z / beta and the decay
 //   -exp(A) softplus(a + dt); from the state reduction delta = (v - S^T k / |k|) beta and
@@ -24,12 +24,12 @@
 // Queues: iq2 / iq3 the column reduction's two halves, oq2 their merge on the loop-back colour,
 // iq4 its return; oq3 the column multicast; iq5 / oq4 the control row's segment all-reduce (the
 // o-norm sums), iq6 its multicast (non-roots), iq7 a two-half root's second half.
-// Hardware rules: as weight_dense.csl (own queue a flow, no transient duplicate colours, >= 768 B
+// Hardware rules: as weight.csl (own queue a flow, no transient duplicate colours, >= 768 B
 // stack room).
 //
 // Params. Shape: K, KM, NQA, NQG, Qh, Dc, DK, DV, Ic, HR (hidden), CONV, NROT, HK, HV. Levers
 // (default = the shipped 9B build): CONVQK 1, ATTV 1, GDEC 1, ROPEP 1, SILU16 1, SILUQ 1, ATTL 2
-// (0: the steps ride with o), SLW 0. Model: GATE (1: gated attention), EPS (the norms' eps). Diagnostics (default off): TSTAMP, DIAG (as weight_dense.csl).
+// (0: the steps ride with o), SLW 0. Model: GATE (1: gated attention), EPS (the norms' eps). Diagnostics (default off): TSTAMP, DIAG (as weight.csl).
 param memcpy_params;
 param DIAG: u16 = 0;   // 1 (diagnostics): no layers (handoffs, head and I/O only)
 param K: u16;

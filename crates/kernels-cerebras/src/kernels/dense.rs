@@ -1,5 +1,5 @@
 //! Qwen3.5 (GDN layers + gated full attention), Qwen3 and Llama 3 (dense attention, no output gate):
-//! `weight_dense.csl`, `ctl_cx.csl`, `ctl_cy_dense.csl`, with the head's and the relay's
+//! `weight.csl` (direct norms, own-cache attention / GDN mixers), `ctl_cx.csl`, `ctl_cy_dense.csl`, with the head's and the relay's
 //! ([`super::head`], [`super::common::RELAY`]). Their params from the plan ([`kernels`]) and
 //! their rcfg writers.
 
@@ -44,7 +44,7 @@ pub const SYMBOLS: &[(&str, &str)] = &[
 ];
 
 params! {
-    /// `weight_dense.csl`: layers a unit and the attention layers' mask, x's dims a row, the q /
+    /// `weight.csl` (NRM 0, MIXK 0): layers a unit and the attention layers' mask, x's dims a row, the q /
     /// MLP / GDN / KV shapes a column, the KV rows and entries, the levers' defaults, whether
     /// the q / k heads are normed (`QKN`).
     pub struct WeightDense {
@@ -72,7 +72,7 @@ params! {
 }
 
 pub const WEIGHT_QWEN: Kernel = Kernel {
-    source: "weight_dense.csl",
+    source: "weight.csl",
     owns: &["w", "rcfg", "tdbg"],
     params: WeightDense::NAMES,
     route_slots: 16,
@@ -100,7 +100,7 @@ pub const CTL_CY_QWEN: Kernel = Kernel {
 /// words.
 fn weight(pe: &Pe) -> R<Vec<u32>> {
     let Place::Weight { row, col, .. } = pe.role().place else {
-        return Err(format!("{:?}: weight_dense off a weight PE", pe.at));
+        return Err(format!("{:?}: weight off a weight PE", pe.at));
     };
     let plan = &pe.prog.plan;
     let source = Gdn::of(plan).map_or(SOURCE_NONE, |g| g.source(row, col));

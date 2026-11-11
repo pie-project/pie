@@ -1,0 +1,167 @@
+// wafer/ops/wpe.csl: a weight PE's core (README.md: the unit snake), every layer phase's: the tiles
+// (w), the matvec's x (xh, f16) and partial (y, f32; y16 its f16 accumulator), the queues, the row
+// (X) and column (Y) reductions, the segment collectives and the host words (rcfg). weight.csl
+// drives a layer's phases over it; the mixer modules (ops/att.csl, ops/gdn.csl, ops/kv.csl) take
+// it as a param.
+//
+// Queues (each flow its own queue; an async op runs on its queue id's microthread, shared by
+// iq N and oq N): iq2 / iq3 the row reduction's level-1 / level-2 inputs, iq4 / iq5 the column's,
+// iq6 the row multicast (x; segment and relay inputs), iq7 the column multicast (o, act; the
+// scores segment's level 1); oq5 the row reduction's send (not oq2: the add-forward takes iq2),
+// oq3 the column's, oq4 the segment / (k, q) exchange / handoff relay sends.
+//
+// Params: fab (ops/fabric.csl), the buffers' sizes (XN, YN, Y16N, WN), MV (0 bf16 / f32
+// accumulation, 1 f16 / f16), NR (rcfg's route slots), RCW (its words past them), FIFOW (the reductions' FIFO depth), SGDN
+// (the segments' GDN (k, q) mode).
+param fab: imported_module;
+param XN: u16;
+param YN: u16;
+param Y16N: u16;
+param WN: u32;
+param MV: u16;
+param NR: u16;
+param RCW: u16 = 25;
+param FIFOW: u16 = 32;
+param SGDN: bool = false;
+
+const matvec = @import_module("ops/mv.csl");
+const tile_config = @import_module("<tile_config>");
+
+// ---------------------------------------------------------------- tiles and buffers
+var w = @zeros([WN + 1]u16);
+var xh = @zeros([XN]@fp16());          // the matvec's x (16-bit)
+var y: [YN]f32 align(16) = @zeros([YN]f32);   // the partial sent
+var y16 = @zeros([Y16N]@fp16());       // the f16 accumulator (and exp's 2^k bits)
+const xh_d = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{XN} -> xh[i] });
+const y_d = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{YN} -> y[i] });
+const y16_d = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{Y16N} -> y16[i] });
+var a_d = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{YN} -> w[i] });
+
+// ---------------------------------------------------------------- fabric (colours bound at init from rcfg)
+const q_xa = @get_input_queue(2);
+const q_xb = @get_input_queue(3);
+const q_ya = @get_input_queue(4);
+const q_yb = @get_input_queue(5);
+const q_xm = @get_input_queue(6);
+const q_ym = @get_input_queue(7);
+const q_xo = @get_output_queue(5);   // (not 2: the row add-forward op takes iq2, and an op on iq N and oq N shares queue N's microthread)
+const q_yo = @get_output_queue(3);
+const q_ao = @get_output_queue(4);   // the segment / GDN exchange / relay sends: rebinding it never touches the reductions' queues
+const C_PARK: color = @get_color(16);   // nothing routes it to a ramp
+const ut_a = @get_ut_id(4);
+const ut_b = @get_ut_id(5);
+const ut_xa = @get_ut_id(2);
+const ut_xb = @get_ut_id(3);
+const rx = @import_module("ops/red.csl", .{ .fab = fab, .IN1 = q_xa, .IN2 = q_xb, .OUT = q_xo, .UT1 = ut_xa, .UT2 = ut_xb, .FIFOW = FIFOW });
+const ry = @import_module("ops/red.csl", .{ .fab = fab, .IN1 = q_ya, .IN2 = q_yb, .OUT = q_yo, .UT1 = ut_a, .UT2 = ut_b, .FIFOW = FIFOW });
+
+// rcfg: [0] routes n, [1..1+2n) (colour, low route byte); then from RQ:
+// [0..6) the colours of iq2..iq7, [6] oq5's, [7] oq3's, [8] the row role, [9] the column role,
+// [10] the scores segment role, [11] the mixer's word (GDN's (k, q) source bits; Gemma's flags),
+// [12..17) the segments' colours ((k, q) multicast, scores level 1, level 2, output, multicast;
+// Gemma's KVS colour at 12), [17] the PE's weight row, [18..21) the pass-start relay (words, in
+// colour, out colour), [21..24) the pass-end relay, [24] the spare colour bind_iqs cycles through,
+// (RCW 26) [25] flags (bit 0: the pass-start relay carries the token loop's embedding: none before step 1).
+// A reduction role: 0 chain start, 1 add-forward, 2 group end (FIFO merge of level 1 and level
+// 2), 3 the farthest group's end.
+const RQ: u16 = 1 + 2 * NR;
+var rcfg = @zeros([RQ + RCW]u32);
+const seg = @import_module("ops/seg.csl", .{ .fab = fab, .rcfg = &rcfg, .RQ = RQ, .XM = q_xm, .YM = q_ym, .AO = q_ao, .UT = ut_b, .GDN = SGDN });
+var myrow: u16 = 0;     // this PE's row in the unit's weight rows
+var word: u16 = 0;      // rcfg[RQ + 11]: the mixer's word
+
+var fq = @zeros([6]u16);
+fn init() void {
+  fab.routes(&rcfg);
+  var q: u16 = 0;
+  while (q < 6) : (q += 1) { fq[q] = @as(u16, rcfg[RQ + q]); }
+  fab.bind_iqs(&fq, @as(u16, rcfg[RQ + 24]));
+  fab.oqc(5, rcfg[RQ + 6]);
+  fab.oqc(3, rcfg[RQ + 7]);
+  rx.role = @as(u16, rcfg[RQ + 8]);
+  ry.role = @as(u16, rcfg[RQ + 9]);
+  seg.role = @as(u16, rcfg[RQ + 10]);
+  word = @as(u16, rcfg[RQ + 11]);
+  myrow = @as(u16, rcfg[RQ + 17]);
+}
+
+// The partial y[0..n) into the row (X) or column reduction.
+fn send_x(n: u16) void { rx.send(@set_dsd_length(y_d, n), n); }
+fn send_y(n: u16) void { ry.send(@set_dsd_length(y_d, n), n); }
+
+// ---------------------------------------------------------------- matvecs
+// y[yo..yo+N) = A x, A at p (R rows of N), x in xh[xo..xo+R): f16 accumulation at MV 1
+fn mvp(p: [*]u16, R: u16, N: u16, xo: u16, yo: u16) void {
+  const a = @set_dsd_length(@set_dsd_base_addr(a_d, p), N);
+  const xv = @set_dsd_length(@increment_dsd_offset(xh_d, @as(i16, xo), @fp16()), R);
+  const yv = @set_dsd_length(@increment_dsd_offset(y_d, @as(i16, yo), f32), N);
+  if (MV == 1) {
+    const yh = @set_dsd_length(y16_d, N);
+    matvec.tile16(yh, a, xv);
+    @fh2s(yv, yh);
+  } else {
+    matvec.tile32(yv, a, xv);
+  }
+}
+// The tiles at w[off] (u32 offsets: a unit's tiles past 64 Ki words), x at xh[0], y at y[0].
+fn mv32(off: u32, R: u16, N: u16) void { mvp(@ptrcast([*]u16, &w[off]), R, N, 0, 0); }
+// The tiles at w[off] (u16 offsets: no u32 multiply, whose helper __muldi3 costs 332 B), y at y[yo].
+fn mv16(off: u16, R: u16, N: u16, yo: u16) void {
+  const a = @set_dsd_length(@set_dsd_base_addr(a_d, @ptrcast([*]u16, &w[off])), N);
+  const xv = @set_dsd_length(xh_d, R);
+  const yv = @set_dsd_length(@increment_dsd_offset(y_d, @as(i16, yo), f32), N);
+  if (MV == 1) {
+    const yh = @set_dsd_length(y16_d, N);
+    matvec.tile16(yh, a, xv);
+    @fh2s(yv, yh);
+  } else {
+    matvec.tile32(yv, a, xv);
+  }
+}
+// KV matvecs (scores, values with the softmax sums): f16 operands, f32 accumulation (@fmachs):
+// an f16 accumulator overflows on a cold log-sum-exp pass (sums of probabilities up to 65504
+// each), and the reference step ln(l) must stay finite
+fn kvmv(p: [*]u16, R: u16, N: u16, xo: u16, yo: u16) void {
+  const a = @set_dsd_length(@set_dsd_base_addr(a_d, p), N);
+  const xv = @set_dsd_length(@increment_dsd_offset(xh_d, @as(i16, xo), @fp16()), R);
+  const yv = @set_dsd_length(@increment_dsd_offset(y_d, @as(i16, yo), f32), N);
+  matvec.tile32(yv, a, xv);
+}
+// y[yo..yo+N) = A x with f32 accumulation, A at p (R rows of N), x the DSD xv (R f16 words)
+fn mvx(p: [*]u16, R: u16, N: u16, xv: mem1d_dsd, yo: u16) void {
+  const a = @set_dsd_length(@set_dsd_base_addr(a_d, p), N);
+  matvec.tile32(@set_dsd_length(@increment_dsd_offset(y_d, @as(i16, yo), f32), N), a, xv);
+}
+
+// ---------------------------------------------------------------- phases' I/O
+// x's chunk (n words of the row multicast) into xh
+inline fn recv_xh(n: u16) void { @fs2h(@set_dsd_length(xh_d, n), fab.fin(q_xm, n)); }
+// the column multicast's n words into xh
+inline fn recv_col(n: u16) void { @fs2h(@set_dsd_length(xh_d, n), fab.fin(q_ym, n)); }
+
+// Unit handoffs: a weight PE on a handoff path's turn takes x's chunk from one colour and
+// sends it on another (rcfg's relays: o 18 at the pass start, the next unit's side; 21 at the
+// end, the unit's own), through iq6 and oq4, which are idle then. qm 1 restores both
+// multicasts' colours after it, 0 iq6's only (iq7 may hold Gemma's KVS receive posted for the
+// next pass: rebinding it here hung the KVS line).
+fn relay(o: u16, comptime qm: u16) void {
+  const n = @as(u16, rcfg[RQ + o]);
+  if (n == 0) { return; }
+  while ((tile_config.output_queue_status.get_raw() & 0x1000) == 0) {}
+  fab.iqc(6, rcfg[RQ + o + 1]);
+  fab.oqc(4, rcfg[RQ + o + 2]);
+  @fmovs(fab.fout(q_ao, n), fab.fin(q_xm, n));
+  if (qm == 1) { seg.qmode(0); } else { fab.iqc(6, rcfg[RQ + 4]); }
+}
+
+comptime {
+  @initialize_queue(q_xa, .{ .color = @get_color(13) });   // parked (distinct a queue)
+  @initialize_queue(q_xb, .{ .color = @get_color(14) });
+  @initialize_queue(q_ya, .{ .color = @get_color(17) });
+  @initialize_queue(q_yb, .{ .color = @get_color(18) });
+  @initialize_queue(q_xm, .{ .color = @get_color(19) });
+  @initialize_queue(q_ym, .{ .color = @get_color(20) });
+  @initialize_queue(q_xo, .{ .color = C_PARK });
+  @initialize_queue(q_yo, .{ .color = C_PARK });
+  @initialize_queue(q_ao, .{ .color = C_PARK });
+}

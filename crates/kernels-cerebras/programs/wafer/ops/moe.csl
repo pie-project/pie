@@ -1,0 +1,97 @@
+// wafer/ops/moe.csl: a weight PE's routed experts (README.md: gpt-oss, the unit's MoE half). The PE
+// holds, for each of the unit's K layers, a slice of all NEX experts (its row's x chunk, Hc dims, by
+// its column's Ic intermediate dims, in pe.w) and router output (c mod NEX) over its x chunk (wr):
+//   x2_r' (Hc), 2^S_r, ssq_r        <- CX_r
+//   router partial (f32: f32 x, f32 weights) x 2^S_r, ssq_r -> column reduction into CY_c
+//   [e_0..e_3 | w_0..w_3]           <- CY_c (the token's experts and route weights)
+//   gate|up of each expert (f16 x, the E5M2 tile decoded, f16 accumulation) x 2^S_r -> column reduction
+//   act' (TK x Ic: act x w_k x 2^Pd_k, f16)  <- CY_c
+//   down (the TK decoded tiles, one matvec of TK Ic rows: the experts summed in the f16 accumulator) |
+//   [e | w] (the route column only, pe.word 1: CX's down biases) -> row reduction into CX_r
+// Experts are FP8 E5M2 (the high byte of the f16), the exact MXFP4 values times 2^-P (one power of two a
+// layer / expert / matrix; CY applies it). A u16 holds two: gate|up rows i < Hc/2 in the high bytes, rows
+// Hc/2.. in the low (one 2 Ic row each, gate then up); down rows i < Ic/2 high, the rest low (Hc each).
+// A decode is two 16-bit ops a tile (and 0xff00, shift left 8).
+//
+// Params: pe (ops/wpe.csl: pe.w per layer, per expert [gate|up Hc/2 x 2Ic][down Ic/2 x Hc]), fab, ON
+// (false: another mixer kind's unit), K, Hc, Ic, NEX (experts), TK (experts a token).
+param pe: imported_module;
+param fab: imported_module;
+param ON: bool = true;
+param K: u16;
+param Hc: u16;
+param Ic: u16;
+param NEX: u16;
+param TK: u16;
+
+fn mx(a: u16, b: u16) u16 { return if (a > b) a else b; }
+const XG: u16 = (Hc / 2) * 2 * Ic;   // u16 words of an expert's gate|up
+const XD: u16 = (Ic / 2) * Hc;       // ... of its down
+const XE: u16 = XG + XD;
+var wr = @zeros([if (ON) K * Hc else 1]f32);
+const NXF: u16 = if (ON) Hc + 2 else 1;
+var xf = @zeros([NXF]f32);           // x' in f32 (the router), 2^S_r, ssq_r
+const DN: u16 = if (ON) mx(Hc * 2 * Ic, TK * Ic * Hc) else 1;
+var dec: [DN]@fp16() align(16) = @zeros([DN]@fp16());
+const xf_d = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{NXF} -> xf[i] });
+const dec_d = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{DN} -> dec[i] });
+const NRT: u16 = if (ON) 2 * TK else 1;
+var rt = @zeros([NRT]f32);
+const rt_d = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{NRT} -> rt[i] });
+fn yv(o: u16, n: u16) mem1d_dsd { return @set_dsd_length(@increment_dsd_offset(pe.y_d, @as(i16, o), f32), n); }
+
+// y16[0..N) = dec (R rows of N) x xh[xo..xo+R), f16 accumulation
+fn mvd(R: u16, N: u16, xo: u16) void {
+  const yh = @set_dsd_length(pe.y16_d, N);
+  pe.matvec.tile16(yh, @set_dsd_length(dec_d, N), @set_dsd_length(@increment_dsd_offset(pe.xh_d, @as(i16, xo), @fp16()), R));
+}
+// decode n u16 words at w[o] into dec[d0..d0 + 2n): high bytes, then low bytes
+fn dec2(o: u16, n: u16, d0: u16) void {
+  const src = @set_dsd_length(@set_dsd_base_addr(pe.a_d, @ptrcast([*]u16, &pe.w[o])), n);
+  const lo = @set_dsd_length(@increment_dsd_offset(dec_d, @as(i16, d0), @fp16()), n);
+  @and16(lo, src, @as(u16, 0xff00));
+  @sll16(@increment_dsd_offset(lo, @as(i16, n), @fp16()), src, 8);
+}
+// router: y[0] = x'_f32 . wr (f32)
+var racc = @zeros([1]f32);
+fn rstep(xv: f32, wv: f32) void { racc[0] += xv * wv; }
+// layer l's router: x2 in, the router's partial sent, the experts and weights back
+fn route(l: u16) void {
+  @fmovs(xf_d, fab.fin(pe.q_xm, Hc + 2));
+  @fs2h(@set_dsd_length(pe.xh_d, Hc), @set_dsd_length(xf_d, Hc));
+  racc[0] = 0.0;
+  @map(rstep, @set_dsd_length(xf_d, Hc), @set_dsd_length(@set_dsd_base_addr(xf_d, @ptrcast([*]f32, &wr[l * Hc])), Hc));
+  pe.y[0] = racc[0] * xf[Hc];
+  pe.y[1] = xf[Hc + 1];
+  pe.send_y(2);
+  @fmovs(rt_d, fab.fin(pe.q_ym, 2 * TK));
+}
+// layer l's experts' gate|up (the TK experts', into the column reduction)
+fn up(l: u16) void {
+  const xb = l * NEX * XE;
+  var k: u16 = 0;
+  while (k < TK) : (k += 1) {
+    const e = @as(u16, rt[k]);
+    dec2(xb + e * XE, XG, 0);
+    mvd(Hc, 2 * Ic, 0);
+    @fh2s(yv(k * 2 * Ic, 2 * Ic), @set_dsd_length(pe.y16_d, 2 * Ic));
+  }
+  @fmuls(yv(0, 2 * TK * Ic), yv(0, 2 * TK * Ic), xf[Hc]);
+  pe.send_y(2 * TK * Ic);
+}
+// act back, the TK experts' downs summed (into the row reduction)
+fn down(l: u16) void {
+  const xb = l * NEX * XE;
+  @fs2h(@set_dsd_length(pe.xh_d, TK * Ic), fab.fin(pe.q_ym, TK * Ic));
+  var k: u16 = 0;
+  while (k < TK) : (k += 1) {
+    const e = @as(u16, rt[k]);
+    dec2(xb + e * XE + XG, XD, k * Ic * Hc);
+  }
+  mvd(TK * Ic, Hc, 0);
+  @fh2s(yv(0, Hc), @set_dsd_length(pe.y16_d, Hc));
+  if (pe.word == 1) { @fmovs(yv(Hc, 2 * TK), rt_d); } else { @fmovs(yv(Hc, 2 * TK), 0.0); }
+  pe.send_x(Hc + 2 * TK);
+}
+// the attention half's x passes this row's multicast: read and dropped
+fn drop() void { @fmovs(@set_dsd_length(xf_d, Hc + 2), fab.fin(pe.q_xm, Hc + 2)); }

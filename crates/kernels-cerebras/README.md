@@ -24,7 +24,8 @@ argmax; ARCHITECTURE.md), imported with comptime params.
 (PX + 1) x (PY + 1) PEs. Each unit runs K layers. The units are visited as a snake: down unit
 column 0, then up column 1, and so on.
 
-- **Weight PE** (`programs/wafer/weight_dense.csl`). Holds its K layers' four tiles: the row's x chunk
+- **Weight PE** (`programs/wafer/weight.csl`, every family's: its core `ops/wpe.csl`, its mixers
+  `ops/att.csl`, `ops/gdn.csl`, `ops/kv.csl`, `ops/swa.csl`, `ops/moe.csl`). Holds its K layers' four tiles: the row's x chunk
   (Hc dims) by the column's outputs, as f16 bits. A layer runs as:
   1. x from CX's row multicast
   2. the qkv partial goes into the column reduction to CY
