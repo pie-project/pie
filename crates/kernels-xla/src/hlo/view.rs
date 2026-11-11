@@ -34,7 +34,7 @@ pub const LANES: i64 = 128;
 
 /// The most bytes a read of whole blocks takes by XLA's gather rather than
 /// a DMA kernel call.
-const SMALL_BY_XLA: i64 = 2 << 20;
+const SMALL_BY_XLA: i64 = 512 << 10;
 
 /// A view's pool and element.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -389,7 +389,8 @@ impl Func {
         // A small read of whole blocks goes by XLA's block gather: a kernel
         // call costs its launch on the host and the device (v6e MoE decode
         // of one lane: two 512 KiB page reads a layer by DMA, 29 us a step
-        // of the host's execute prologue).
+        // of the host's execute prologue). Larger reads stay on DMA: by
+        // XLA's gather they cost a wide decode (MoE 256 lanes) about 1%.
         let small = aligned
             && g % len == 0
             && self.blocked(rows_total, nr)
