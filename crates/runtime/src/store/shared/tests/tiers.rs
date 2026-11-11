@@ -801,3 +801,128 @@ fn host_cache_goes_on_down_to_disk_and_a_restart_brings_it_back_bitwise() {
     }
     kv.release_reader(pin);
 }
+
+/// Suspends `ws`: its pages' bytes go to the host; the host refs they land on.
+fn suspend_to_host(kv: &mut KvStore, bytes: &mut Bytes, ws: WorkingSetId) -> Vec<u32> {
+    let txn = kv
+        .prepare_suspend(&HashSet::from([ws]))
+        .unwrap()
+        .expect("pages to move");
+    let mut refs = Vec::new();
+    for (tier, copy) in kv_copies(&txn, true) {
+        assert_eq!(tier, MemoryDomain::HostPinned, "host first");
+        refs.extend(copy.slots.iter().map(|&(_, dst)| dst));
+        bytes.copy(&copy);
+    }
+    kv.commit_suspend(txn).unwrap();
+    kv.retire_idle();
+    refs
+}
+
+/// Restores `ws` from the host onto fresh device pages.
+fn restore_from_host(kv: &mut KvStore, bytes: &mut Bytes, ws: WorkingSetId) {
+    let set = HashSet::from([ws]);
+    let pages = kv.swapped_page_count(&set).unwrap();
+    let mut granted = kv.reserve_device_pages(pages as usize).unwrap();
+    let txn = kv.prepare_restore(&set, &mut granted).unwrap();
+    for (_, copy) in kv_copies(&txn, false) {
+        bytes.copy(&copy);
+    }
+    kv.commit_restore(txn).unwrap();
+}
+
+/// Host slots a suspend lets go come back to the next suspend before any
+/// new host chunk opens: the lowest free refs of the chunk already open.
+#[test]
+fn freed_host_slots_are_taken_again_before_a_new_host_chunk_opens() {
+    let (_, tiers, stores) = tiered(fixed_facts(), 0);
+    let mut kv = stores.kv.lock();
+    let spc = 16;
+    let sets: Vec<WorkingSetId> = (0..3)
+        .map(|_| {
+            let ws = kv.create_working_set();
+            commit_pages(&mut kv, ws, 5);
+            ws
+        })
+        .collect();
+    let mut bytes = Bytes::default();
+    for &ws in &sets {
+        for page in table(&mut kv, ws) {
+            bytes.set(LIST, page, u64::from(page));
+        }
+    }
+    let a = suspend_to_host(&mut kv, &mut bytes, sets[0]);
+    let b = suspend_to_host(&mut kv, &mut bytes, sets[1]);
+    assert_eq!(a, (0..5).collect::<Vec<_>>(), "the lowest refs first");
+    assert_eq!(b, (5..10).collect::<Vec<_>>());
+    restore_from_host(&mut kv, &mut bytes, sets[0]);
+    assert_eq!(host_live(&tiers, LIST_POOL), 5);
+    let mut c = suspend_to_host(&mut kv, &mut bytes, sets[2]);
+    c.sort_unstable();
+    assert_eq!(c, a, "the refs a restore let go, before any other");
+    assert!(
+        a.iter().chain(&b).chain(&c).all(|&r| r < spc),
+        "one host chunk"
+    );
+}
+
+/// Many suspend/restore cycles over a bounded working set touch only as
+/// many host chunks as the most host data ever held at once: freed slots
+/// are reused, the lowest chunks fill first, a chunk let go reopens before
+/// a higher one.
+#[test]
+fn host_chunks_touched_stay_the_held_working_set_over_many_cycles() {
+    let (_, tiers, stores) = tiered(fixed_facts(), 0);
+    let mut kv = stores.kv.lock();
+    let spc = 16u64;
+    let sizes = [3u64, 7, 5, 6, 4, 7];
+    let sets: Vec<WorkingSetId> = sizes
+        .iter()
+        .map(|&n| {
+            let ws = kv.create_working_set();
+            commit_pages(&mut kv, ws, n);
+            ws
+        })
+        .collect();
+    let mut bytes = Bytes::default();
+    for &ws in &sets {
+        for page in table(&mut kv, ws) {
+            bytes.set(LIST, page, u64::from(page));
+        }
+    }
+    let mut parked: std::collections::VecDeque<usize> = std::collections::VecDeque::new();
+    let mut touched: HashSet<u32> = HashSet::new();
+    let mut peak = 0u64;
+    let mut seed = 0x9e37_79b9_7f4a_7c15u64;
+    for _ in 0..400 {
+        seed ^= seed << 13;
+        seed ^= seed >> 7;
+        seed ^= seed << 17;
+        // Up to three sets parked at once, a random resident one parks next.
+        if parked.len() == 3 || (!parked.is_empty() && seed % 3 == 0) {
+            let at = (seed >> 8) as usize % parked.len();
+            let set = parked.remove(at).unwrap();
+            restore_from_host(&mut kv, &mut bytes, sets[set]);
+        } else {
+            let resident: Vec<usize> = (0..sets.len()).filter(|i| !parked.contains(i)).collect();
+            let set = resident[(seed >> 16) as usize % resident.len()];
+            for r in suspend_to_host(&mut kv, &mut bytes, sets[set]) {
+                touched.insert(r / spc as u32);
+            }
+            parked.push_back(set);
+            peak = peak.max(host_live(&tiers, LIST_POOL));
+        }
+    }
+    let bound = peak.div_ceil(spc);
+    assert!(peak > spc, "the working set spans chunks: {peak}");
+    assert!(
+        touched.len() as u64 <= bound,
+        "{} host chunks touched, the most held at once {peak} slots ({bound} chunks): {touched:?}",
+        touched.len()
+    );
+    assert_eq!(
+        touched,
+        (0..touched.len() as u32).collect(),
+        "the lowest chunks"
+    );
+}
