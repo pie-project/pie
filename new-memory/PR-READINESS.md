@@ -19,13 +19,13 @@ Branch today: 432 commits ahead of main, 782 files, +86k / -13k. Main merged in 
 | A13 | Record rs-buffered fires (MTP / spec decode on hybrids walk eagerly; same on main) — graph capture rule | L40S | after perf fixes |
 | A14 | Wire the rung shrink (SPEC 6) | RT | done M92 (CUDA) |
 | A21 | Activation rungs on Metal / Vulkan / wgpu / XLA (only CUDA states rungs; the walk is a no-op elsewhere) | backend owners | XLA: not applicable (activation is PJRT scratch outside the single fixed pool; no rungs stated, walk no-op — decided 2026-11-11). XLA A15 done on sc/xla-tier (TPU). Metal / Vulkan / wgpu open |
-| A15 | read_tier_slots / write_tier_slots (snapshots on shared pools) on Metal, Vulkan, wgpu, XLA (CUDA in sc/rt4; Cerebras out of scope) | Metal agent, VKP, TPU | Vulkan+wgpu done M94, XLA done M95; Metal in progress |
+| A15 | read_tier_slots / write_tier_slots (snapshots on shared pools) on Metal, Vulkan, wgpu, XLA (CUDA in sc/rt4; Cerebras out of scope) | Metal agent, VKP, TPU | done (Vulkan+wgpu M94, XLA M95, Metal M100) |
 | A16 | Held weights flip to streaming on ROCm 30B MoE (body reservation) | EAGER | done M89 + M93 flat-fit; MI300X verified 2026-11-11 (30B holds weights, 106728 cache pages, 89/89 bodies armed on 4 models, 9 ROCm goldens equal); arm-after-residency (eager-fix-3) next |
 | A17 | Guest panic under admission waits: bench barrier bug fixed (sc/sdk-wakeup) | SDK agent | done; A19 left |
 | A19 | A restartable process whose own demand exceeds the pool restarts forever (should fail with the starvation error); bind hangs waiting for state slots at 96 MiB | RT7 | done M91 + M93 (rt7b: churn closed) |
 | A18 | Idle cache demoted only when PLEX keys it above the floor | RT6 | done M90 |
 | A20 | Window-only models never reuse a prefix (no auto checkpoint; main reused full window pages) -> auto checkpoints at page-aligned fire ends holding window slot refs | RT8 | done M99 (gpt-oss p2048 parity with main) |
-| A22 | Metal perf vs main (M1 Max): Qwen3-0.6B p2048 -3.2%, c1 -0.5..0.9%; gemma / MoE unmeasured. (Metal serving encodes live on main too; ICB recording not required — user 2026-11-11) | Metal agent (sc/metal-gate) | in progress |
+| A22 | Metal perf vs main (M1 Max, M100): Qwen3-0.6B p2048 fixed (+2.8%); open: gemma c1 -2.4%, p512 -4%, p2048 -2%; Qwen c1 -0.8..0.9%. (Metal serving encodes live on main too; ICB recording not required — user 2026-11-11) | Metal agent (sc/metal-gate) | in progress |
 | A9 | dsv41 two-window mini cannot fire on sm_89/sm_120 (fused.lse_sink kernel gap) -> two-window CUDA unverified | L40S | queued |
 
 ## B. Decide before the PR (user)

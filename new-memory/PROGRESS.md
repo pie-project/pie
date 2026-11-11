@@ -1226,3 +1226,12 @@ The `new-memory/` directory is bookkeeping and is removed before anything lands 
   runtime store 126 / planner 51 / pipeline 16 pass.
 - Open: gpt-oss resumed tokens differ from cold in 3-4/6 seeds (likely split-prefill MoE near-ties; main reuse
   control pending).
+
+### M100 — 2026-11-11: Metal tier slot copies (A15) and first perf fixes; A21 n/a on Metal
+- `sc/metal-gate` (f6b70f094, e1b93e4da): read/write_tier_slots on Metal's host tier (one memcpy per slot, unwritten
+  chunks read as zeros); parked-lane bytes mode bitwise for dense / hybrid / windowed. Weight-use reads no longer
+  drain in-flight frames (counters report growth); tiled prefill attention does page lookup once per token
+  (641.6 -> 574.6 ms device, main 595.4). A21: activation is a sparse buffer outside the pool -> not applicable.
+- M1 Max vs main: Qwen3-0.6B p2048 +2.8% (was -2.4%), p512 +6%, c1 -0.8%; Qwen3.5-0.8B prefill +6..23%, c1 -0.9%;
+  gemma-4-e4b c1 -2.4%, p512 -4.2%, p2048 -2.0%; Qwen3.6-35B-A3B boots in 14 s (main: not within 600 s).
+  Greedy tokens identical to pre-change on 3 models x 3 prompts. Open: gemma decode/prefill, Qwen c1 small gap.
