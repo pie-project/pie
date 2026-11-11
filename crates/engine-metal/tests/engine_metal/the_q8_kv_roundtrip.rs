@@ -122,7 +122,6 @@ fn routes(q8: bool) {
             head_stride: d as u64,
             q8,
             page_stride: [0; 2],
-            plane_offset: [0; 2],
         }
         .paged_densely();
         let frame = dev.frame().unwrap();

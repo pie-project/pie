@@ -234,8 +234,8 @@ pub fn try_tables(
                 tile_base.arg(),
                 pool.page_stride[0].arg(),
                 pool.page_stride[1].arg(),
-                pool.plane_offset[0].arg(),
-                pool.plane_offset[1].arg(),
+                crate::tensor::PLANE_AT_BINDING.arg(),
+                crate::tensor::PLANE_AT_BINDING.arg(),
             ],
         )?;
         ctx.fire(

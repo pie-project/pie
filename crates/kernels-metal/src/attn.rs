@@ -573,8 +573,8 @@ fn selected(
             i32::from(per_head).arg(),
             pool.page_stride[0].arg(),
             pool.page_stride[1].arg(),
-            pool.plane_offset[0].arg(),
-            pool.plane_offset[1].arg(),
+            crate::tensor::PLANE_AT_BINDING.arg(),
+            crate::tensor::PLANE_AT_BINDING.arg(),
         ],
     )
 }
@@ -1069,8 +1069,8 @@ fn append_paged(
             0_i32.arg(),
             pool.page_stride[0].arg(),
             pool.page_stride[1].arg(),
-            pool.plane_offset[0].arg(),
-            pool.plane_offset[1].arg(),
+            crate::tensor::PLANE_AT_BINDING.arg(),
+            crate::tensor::PLANE_AT_BINDING.arg(),
         ],
     )
 }
@@ -1138,7 +1138,6 @@ mod tests {
             head_stride: u64::from(HEAD_DIM),
             q8: false,
             page_stride: [0; 2],
-            plane_offset: [0; 2],
         }
         .paged_densely()
     }
@@ -1580,8 +1579,8 @@ pub mod mla {
                 stated(OP, k_pe.width)?.arg(),
                 pool.page_stride[0].arg(),
                 pool.page_stride[1].arg(),
-                pool.plane_offset[0].arg(),
-                pool.plane_offset[1].arg(),
+                crate::tensor::PLANE_AT_BINDING.arg(),
+                crate::tensor::PLANE_AT_BINDING.arg(),
             ],
         )
     }
@@ -1865,7 +1864,6 @@ pub mod mla {
                 head_stride: u64::from(RANK),
                 q8: false,
                 page_stride: [0; 2],
-                plane_offset: [0; 2],
             }
             .paged_densely()
         }
@@ -2151,8 +2149,8 @@ pub mod index {
                 keys.page_size.arg(),
                 keys.page_stride[0].arg(),
                 keys.page_stride[1].arg(),
-                keys.plane_offset[0].arg(),
-                keys.plane_offset[1].arg(),
+                crate::tensor::PLANE_AT_BINDING.arg(),
+                crate::tensor::PLANE_AT_BINDING.arg(),
             ],
         )
     }
@@ -2341,8 +2339,8 @@ pub mod index {
                 stated(OP, block)?.arg(),
                 keys.page_stride[0].arg(),
                 keys.page_stride[1].arg(),
-                keys.plane_offset[0].arg(),
-                keys.plane_offset[1].arg(),
+                crate::tensor::PLANE_AT_BINDING.arg(),
+                crate::tensor::PLANE_AT_BINDING.arg(),
             ],
         )
     }
@@ -2439,8 +2437,8 @@ pub mod index {
                 pitch.arg(),
                 keys.page_stride[0].arg(),
                 keys.page_stride[1].arg(),
-                keys.plane_offset[0].arg(),
-                keys.plane_offset[1].arg(),
+                crate::tensor::PLANE_AT_BINDING.arg(),
+                crate::tensor::PLANE_AT_BINDING.arg(),
             ],
         )
     }
@@ -2534,7 +2532,6 @@ pub mod index {
                 head_stride: u64::from(DIM),
                 q8: false,
                 page_stride: [0; 2],
-                plane_offset: [0; 2],
             }
             .paged_densely()
         }
@@ -2794,14 +2791,13 @@ pub mod pool {
 
     /// A compressor's state for the kv row its gather keys by: a projection
     /// plane and a score plane, a token a cell, paged as that row is (its
-    /// page table, its page size), each plane `plane_offset` bytes from its
-    /// binding's origin and `page_stride` bytes a page.
+    /// page table, its page size), each plane bound at its rows of page 0
+    /// and `page_stride` bytes a page.
     #[derive(Clone, Copy, Debug, PartialEq, Eq)]
     pub struct PoolState {
         pub kv: Tensor,
         pub score: Tensor,
         pub page_stride: [u64; 2],
-        pub plane_offset: [u64; 2],
     }
 
     impl PoolState {
@@ -2815,7 +2811,6 @@ pub mod pool {
                     KvPool::dense_page_stride(kv, page_size, 0),
                     KvPool::dense_page_stride(score, page_size, 0),
                 ],
-                plane_offset: [0, 0],
             }
         }
     }
@@ -3074,8 +3069,8 @@ pub mod pool {
                 // The compressor's two planes page with the row they key by.
                 state.page_stride[0].arg(),
                 state.page_stride[1].arg(),
-                state.plane_offset[0].arg(),
-                state.plane_offset[1].arg(),
+                crate::tensor::PLANE_AT_BINDING.arg(),
+                crate::tensor::PLANE_AT_BINDING.arg(),
             ],
         )
     }
@@ -3198,8 +3193,8 @@ pub mod pool {
                 // The compressor's two planes page with the row they key by.
                 state.page_stride[0].arg(),
                 state.page_stride[1].arg(),
-                state.plane_offset[0].arg(),
-                state.plane_offset[1].arg(),
+                crate::tensor::PLANE_AT_BINDING.arg(),
+                crate::tensor::PLANE_AT_BINDING.arg(),
             ],
         )
     }
@@ -3245,8 +3240,8 @@ pub mod pool {
                 pitch(OP, pool, head_dim)?.arg(),
                 pool.page_stride[0].arg(),
                 pool.page_stride[1].arg(),
-                pool.plane_offset[0].arg(),
-                pool.plane_offset[1].arg(),
+                crate::tensor::PLANE_AT_BINDING.arg(),
+                crate::tensor::PLANE_AT_BINDING.arg(),
             ],
         )
     }
@@ -3314,8 +3309,8 @@ pub mod pool {
                 pitch(OP, entries, head_dim)?.arg(),
                 entries.page_stride[0].arg(),
                 entries.page_stride[1].arg(),
-                entries.plane_offset[0].arg(),
-                entries.plane_offset[1].arg(),
+                crate::tensor::PLANE_AT_BINDING.arg(),
+                crate::tensor::PLANE_AT_BINDING.arg(),
             ],
         )
     }
@@ -3411,8 +3406,8 @@ pub mod pool {
                 pitch(OP, entries, head_dim)?.arg(),
                 entries.page_stride[0].arg(),
                 entries.page_stride[1].arg(),
-                entries.plane_offset[0].arg(),
-                entries.plane_offset[1].arg(),
+                crate::tensor::PLANE_AT_BINDING.arg(),
+                crate::tensor::PLANE_AT_BINDING.arg(),
             ],
         )
     }

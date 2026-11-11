@@ -158,8 +158,8 @@ pub fn capture(
             stated(OP, kv_max)?.arg(),
             pool.page_stride[0].arg(),
             pool.page_stride[1].arg(),
-            pool.plane_offset[0].arg(),
-            pool.plane_offset[1].arg(),
+            crate::tensor::PLANE_AT_BINDING.arg(),
+            crate::tensor::PLANE_AT_BINDING.arg(),
         ],
     )
 }
@@ -199,7 +199,6 @@ mod tests {
             head_stride: u64::from(head_dim),
             q8: false,
             page_stride: [0; 2],
-            plane_offset: [0; 2],
         }
         .paged_densely()
     }

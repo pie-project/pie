@@ -1205,13 +1205,16 @@ impl Pools {
                     score,
                 } => {
                     // In the slots of the row it keys by: that row's page
-                    // ids and page stride.
-                    let plane = Tensor::new(
-                        handles.bind(view, 0, view.bytes())?,
-                        cells,
-                        u32::try_from(width).unwrap_or(u32::MAX),
-                        Dtype::Bf16,
-                    );
+                    // ids and page stride. Each plane is bound at its offset
+                    // into a page (`plane_at`), so kernels read it from 0.
+                    let plane = |offset: u64| -> Result<Tensor> {
+                        Ok(Tensor::new(
+                            handles.bind(view, offset, view.bytes() - offset)?,
+                            cells,
+                            u32::try_from(width).unwrap_or(u32::MAX),
+                            Dtype::Bf16,
+                        ))
+                    };
                     let stride = match paging {
                         TablePaging::List => list_bytes,
                         TablePaging::Window(k) => self.window_stride(usize::from(k)),
@@ -1219,10 +1222,9 @@ impl Pools {
                     compressed.push((
                         row,
                         PoolSlabs {
-                            kv: plane,
-                            score: plane,
+                            kv: plane(kv)?,
+                            score: plane(score)?,
                             page_stride: [stride, stride],
-                            plane_offset: [kv, score],
                         },
                     ));
                     continue;
@@ -1242,9 +1244,11 @@ impl Pools {
                         seats.page_tables.get(table).ok_or_else(|| Fault::Unbound {
                             what: format!("page table {table}, which this fire staged none of"),
                         })?;
-                    let plane = |width: u64| -> Result<Tensor> {
+                    // Each plane bound at its offset into a page, so the
+                    // paged kernels read it from 0 (`kernels/prim/kv_page.h`).
+                    let plane = |offset: u64, width: u64| -> Result<Tensor> {
                         Ok(Tensor::new(
-                            handles.bind(view, 0, view.bytes())?,
+                            handles.bind(view, offset, view.bytes() - offset)?,
                             cells,
                             u32::try_from(width).unwrap_or(u32::MAX),
                             dtype,
@@ -1261,8 +1265,8 @@ impl Pools {
                         ),
                     };
                     CachePool::Kv(KvPool {
-                        keys: plane(u64::from(kv_heads) * u64::from(head_dim))?,
-                        values: plane(values_width)?,
+                        keys: plane(keys, u64::from(kv_heads) * u64::from(head_dim))?,
+                        values: plane(values, values_width)?,
                         page_indices: seat.page_indices,
                         page_indptr: seat.page_indptr,
                         page_size: narrow(u64::from(page_size)),
@@ -1270,7 +1274,6 @@ impl Pools {
                         head_stride: u64::from(head_dim),
                         q8,
                         page_stride: [stride, stride],
-                        plane_offset: [keys, values],
                     })
                 }
                 Row::State {
