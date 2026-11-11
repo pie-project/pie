@@ -14,7 +14,7 @@ fn geom() -> RsGeometry {
 }
 
 fn store() -> RsStore {
-    RsStore::new(12, 12, 0, 0)
+    RsStore::new(12, 12)
 }
 
 fn settled(store: &mut RsStore, prepared: super::RsPreparedWrite) {
@@ -39,7 +39,6 @@ fn tests_every_case() {
     a_checkpoint_is_cache_and_goes_when_idle();
     idle_snapshots_go_in_retention_order();
     a_checkpoint_past_a_step_goes_first();
-    a_suspend_parks_private_slots_on_host_and_restore_brings_them_back();
     a_suspend_short_of_host_rows_moves_and_drops_nothing();
     a_window_is_a_list_of_slots_trimmed_behind_its_commit();
     a_checkpoint_resumes_a_fresh_working_set();
@@ -64,18 +63,15 @@ fn a_checkpoint_holds_its_rows_as_a_cache_entry() {
 // A windowed model's state is a window list: a fire takes the slots it
 // writes, the slots behind the committed position's window retire, a write
 // moves the head back without touching a slot, a fork shares the list and
-// copies only the slot it overwrites, a suspend parks the list on the host,
-// and what a snapshot keeps of it comes back where it stood.
+// copies only the slot it overwrites.
 fn a_window_is_a_list_of_slots_trimmed_behind_its_commit() {
     use super::{WindowAdvance, WindowGeometry};
-    use std::collections::HashSet;
     let mut s = RsStore::new_window(
         WindowGeometry {
             window: 32,
             tokens: 16,
         },
         8,
-        4,
     );
     let ws = s.create_working_set(geom());
     let win = |n| RsUnits::of_windows([n, 0, 0, 0]);
@@ -138,25 +134,6 @@ fn a_window_is_a_list_of_slots_trimmed_behind_its_commit() {
     s.retire_idle();
     assert_eq!(s.available().pages, 4);
 
-    let set: HashSet<_> = [ws].into();
-    let txn = s.prepare_suspend(&set).expect("three private pages");
-    assert!(txn.is_window() && txn.copy_plan().pages.len() == 3);
-    assert_eq!(s.commit_suspend(txn), win(3));
-    assert_eq!((s.held([ws]), s.swapped_units(&set)), (win(0), win(3)));
-    let kept = s.export(ws).unwrap();
-    assert_eq!(kept.windows[0].iter().flatten().count(), 3);
-    let back = s.import(geom(), kept);
-    assert_eq!(
-        s.window_positions(back),
-        s.window_positions(ws),
-        "a kept window comes back where it stood"
-    );
-    s.working_sets.remove(back);
-    assert_eq!(s.available().pages, 7);
-    let mut granted = s.reserve(win(3)).unwrap();
-    let txn = s.prepare_restore(&set, &mut granted).unwrap();
-    assert_eq!(s.commit_restore(txn), 3);
-    assert_eq!(s.swapped_units(&set), win(0));
     assert_eq!(
         s.window_demand(ws, rows(&[7])),
         Ok(win(1)),
@@ -214,87 +191,8 @@ fn a_window_is_a_list_of_slots_trimmed_behind_its_commit() {
     assert_ne!(s.window_tables(ws, 128).unwrap()[0][7], 0);
 }
 
-fn a_suspend_parks_private_slots_on_host_and_restore_brings_them_back() {
-    let mut s = RsStore::new(2, 2, 2, 2);
-    let ws = s.create_working_set(geom());
-    write_state(&mut s, ws);
-    let other = s.create_working_set(geom());
-    write_state(&mut s, other);
-    let shared = s.fork(other).unwrap();
-    let set = |ws| std::collections::HashSet::from([ws]);
-
-    let txn = s.prepare_suspend(&set(ws)).expect("a private slot moves");
-    assert_eq!(txn.copy_plan().slots, vec![(0, 0)]);
-    assert_eq!(s.commit_suspend(txn), slots(1));
-    assert_eq!(s.available().slots, 1);
-    assert!(
-        !s.checkpoint(ws, [1; 32], None).unwrap(),
-        "a suspended state is not checkpointed"
-    );
-    let child = s.fork(ws).unwrap();
-    assert!(
-        s.prepare_suspend(&set(shared)).is_none(),
-        "a slot a fork shares stays on device"
-    );
-
-    let both = std::collections::HashSet::from([ws, child]);
-    assert_eq!(
-        s.swapped_units(&both),
-        slots(1),
-        "the fork shares the parked slot"
-    );
-    let mut granted = s.reserve(slots(1)).unwrap();
-    let txn = s.prepare_restore(&both, &mut granted).unwrap();
-    assert_eq!(txn.copy_plan().slots, vec![(0, 0)]);
-    assert_eq!(s.commit_restore(txn), 1);
-    assert_eq!(
-        (s.swapped_units(&both), s.host_available()),
-        (
-            slots(0),
-            RsUnits {
-                slots: 2,
-                pages: 2,
-                ..RsUnits::default()
-            }
-        )
-    );
-    assert_eq!(s.folded_slot(ws), s.folded_slot(child));
-    s.release_working_set(child);
-    write_state(&mut s, ws);
-
-    assert!(s.checkpoint(ws, [1; 32], None).unwrap());
-    assert_eq!(
-        s.suspendable(&set(ws)),
-        slots(1),
-        "a checkpoint is no sharer"
-    );
-    let txn = s
-        .prepare_suspend(&set(ws))
-        .expect("the checkpoint goes along");
-    assert!(!s.has_checkpoint(&[1; 32]), "not read while it moves");
-    assert_eq!(s.commit_suspend(txn), slots(1));
-    assert!(
-        !s.has_checkpoint(&[1; 32]),
-        "parked with its set: kept, but not read from the host"
-    );
-    assert_eq!(s.reclaim_cache(|_| 0), 0, "it frees nothing on the device");
-    let mut granted = s.reserve(slots(1)).unwrap();
-    let txn = s.prepare_restore(&set(ws), &mut granted).unwrap();
-    assert_eq!(s.commit_restore(txn), 1);
-    assert!(s.has_checkpoint(&[1; 32]), "back with its set");
-    assert_eq!(
-        s.host_available(),
-        RsUnits {
-            slots: 2,
-            pages: 2,
-            ..RsUnits::default()
-        },
-        "one slot came back for both"
-    );
-}
-
 fn a_suspend_short_of_host_rows_moves_and_drops_nothing() {
-    let mut s = RsStore::new(10, 0, 0, 0);
+    let mut s = RsStore::new(10, 0);
     let set = |ws| HashSet::from([ws]);
     let ws = s.create_working_set(geom());
     write_state(&mut s, ws);
@@ -612,62 +510,9 @@ fn a_snapshot_resumes_at_its_row() {
     );
 }
 
-/// A set forked at rest shares a host slot with a parent that restores alone.
-#[test]
-fn a_fork_at_rest_keeps_its_slot_when_its_parent_restores() {
-    let mut s = RsStore::new(2, 2, 2, 2);
-    let parent = s.create_working_set(geom());
-    write_state(&mut s, parent);
-    let txn = s
-        .prepare_suspend(&HashSet::from([parent]))
-        .expect("a private slot moves");
-    s.commit_suspend(txn);
-    let child = s.fork(parent).unwrap();
-
-    let mut grant = s.reserve(slots(1)).unwrap();
-    let txn = s
-        .prepare_restore(&HashSet::from([parent]), &mut grant)
-        .unwrap();
-    s.commit_restore(txn);
-    assert_eq!(
-        s.swapped_units(&HashSet::from([child])),
-        slots(1),
-        "the child reads what the host holds"
-    );
-    assert_eq!(s.host_available().slots, 1, "its copy is still in use");
-
-    let mut grant = s.reserve(slots(1)).unwrap();
-    let txn = s
-        .prepare_restore(&HashSet::from([child]), &mut grant)
-        .unwrap();
-    s.commit_restore(txn);
-    s.release_working_set(parent);
-    s.release_working_set(child);
-    s.retire_idle();
-    assert_eq!(s.available().slots, 2, "each slot came back, once");
-    assert_eq!(s.host_available(), s.host_capacity());
-}
-
-#[test]
-fn a_set_is_in_a_move_from_prepare_to_commit() {
-    let mut s = RsStore::new(2, 2, 2, 2);
-    let ws = s.create_working_set(geom());
-    write_state(&mut s, ws);
-    assert!(!s.in_move(ws));
-    let txn = s.prepare_suspend(&HashSet::from([ws])).unwrap();
-    assert!(s.in_move(ws));
-    s.commit_suspend(txn);
-    assert!(!s.in_move(ws));
-    let mut grant = s.reserve(slots(1)).unwrap();
-    let txn = s.prepare_restore(&HashSet::from([ws]), &mut grant).unwrap();
-    assert!(s.in_move(ws));
-    s.abort_restore(txn);
-    assert!(!s.in_move(ws));
-}
-
 #[test]
 fn state_on_demand_hands_out_only_what_is_committed_and_plans_over_the_rest() {
-    let mut store = RsStore::new(32, 32, 0, 0);
+    let mut store = RsStore::new(32, 32);
     store.commit_on_demand();
     let one = slots(1);
     assert!(store.reserve(one).is_none());
@@ -685,7 +530,7 @@ fn state_on_demand_hands_out_only_what_is_committed_and_plans_over_the_rest() {
 
 #[test]
 fn a_fixed_store_stands_whole_and_asks_for_nothing() {
-    let mut store = RsStore::new(4, 4, 0, 0);
+    let mut store = RsStore::new(4, 4);
     let all = slots(4);
     assert!(!store.note_short(all));
     assert_eq!(store.next_extent(16), None);
@@ -694,7 +539,7 @@ fn a_fixed_store_stands_whole_and_asks_for_nothing() {
 
 #[test]
 fn a_target_past_the_highest_number_out_cuts_nothing_off() {
-    let mut store = RsStore::new(32, 32, 0, 0);
+    let mut store = RsStore::new(32, 32);
     store.commit_on_demand();
     store.set_committed(32);
     let low = store.reserve(slots(7)).expect("seven stand free");
@@ -706,7 +551,7 @@ fn a_target_past_the_highest_number_out_cuts_nothing_off() {
 
 #[test]
 fn a_waiter_on_a_full_target_is_told_no() {
-    let mut store = RsStore::new(32, 32, 0, 0);
+    let mut store = RsStore::new(32, 32);
     store.commit_on_demand();
     store.set_target(0);
     assert!(!store.note_short(slots(1)));
@@ -715,7 +560,7 @@ fn a_waiter_on_a_full_target_is_told_no() {
 
 #[test]
 fn a_state_commit_that_lands_after_a_cut_leaves_the_cut_standing() {
-    let mut store = RsStore::new(32, 32, 0, 0);
+    let mut store = RsStore::new(32, 32);
     store.commit_on_demand();
     store.set_target(4);
     store.set_committed(16);

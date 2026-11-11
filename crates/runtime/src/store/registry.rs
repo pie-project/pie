@@ -77,18 +77,11 @@ pub fn register_model(kv_page_size: u32, num_kv_pages: &[usize], num_slots: &[us
     )
 }
 
-/// For a model with a window: the window and its ring's device and host pages
-/// instead.
 #[cfg(test)]
 #[derive(Clone, Copy, Debug, Default)]
 pub struct StatePool {
     pub slots: u32,
-    pub host_slots: u32,
     pub pages: u32,
-    pub host_pages: u32,
-    pub window_tokens: u32,
-    pub window_pages: u32,
-    pub host_window_pages: u32,
 }
 
 /// Today's pool counts as the pinned shapes the degenerate mode states.
@@ -121,13 +114,9 @@ pub fn register_model_with_swap(
                             num_host_pages.get(d).copied().unwrap_or(0) as u32,
                         )
                     },
-                    window: ShapeRun {
-                        ids_from: 1,
-                        ..run(pool.window_pages.saturating_sub(1), pool.host_window_pages)
-                    },
-                    window_tokens: pool.window_tokens,
-                    state: run(pool.slots, pool.host_slots),
-                    buffer: run(pool.pages, pool.host_pages),
+                    window_tokens: 0,
+                    state: run(pool.slots, 0),
+                    buffer: run(pool.pages, 0),
                 },
                 max_context: max_context.get(d).copied().unwrap_or(0),
                 shared: None,
@@ -309,12 +298,7 @@ mod tests {
         )));
         stores[engine_idx] = Some(Stores {
             kv,
-            rs: Arc::new(Mutex::new(RsStore::new(
-                num_slots as u32,
-                num_slots as u32,
-                0,
-                0,
-            ))),
+            rs: Arc::new(Mutex::new(RsStore::new(num_slots as u32, num_slots as u32))),
             seats: Arc::new(Mutex::new(Seats::new(num_slots as u32))),
             kv_page_size,
             context_pages: context_pages(max_context, kv_page_size),

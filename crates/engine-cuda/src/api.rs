@@ -708,11 +708,6 @@ impl Engine for Cuda {
                 }),
                 window_tokens: paging.window.map_or(0, |window| window.tokens),
                 host_kv_pages,
-                // State parks in the host tier's chunks (CONTRACT-BC 22),
-                // stated in `chunks`, not in host rows of its own.
-                host_window_pages: 0,
-                host_state_slots: 0,
-                host_buffer_pages: 0,
                 disk_kv_pages,
                 disk_kv_persistent: residency.disk_kv_persistent && disk_kv_pages > 0,
                 disk_kv_kept: shell.disk_kv_kept(),
@@ -1170,42 +1165,9 @@ impl Engine for Cuda {
 
     fn copy_kv(&mut self, copy: &KvCopy) -> EngineResult<()> {
         copy.validate()?;
+        // The host and disk tiers move through `copy_slots` (CONTRACT-BC
+        // 22): a kv copy is within the device.
         let device = self.caps.as_ref().map(|caps| caps.device.domain);
-        // A tensor-parallel group names its device by its first rank's
-        // ordinal; to each rank, a move between "the device" and a host or
-        // disk tier is a move out of or into its own.
-        let tier = |domain| matches!(domain, MemoryDomain::HostPinned | MemoryDomain::LocalDisk);
-        let own = |domain| match (domain, device) {
-            (MemoryDomain::CudaDevice(_), Some(device)) => device,
-            _ => domain,
-        };
-        let copy = &match (copy.src, copy.dst) {
-            (src, dst) if tier(dst) && !tier(src) => KvCopy {
-                src: own(src),
-                ..copy.clone()
-            },
-            (src, dst) if tier(src) && !tier(dst) => KvCopy {
-                dst: own(dst),
-                ..copy.clone()
-            },
-            _ => copy.clone(),
-        };
-        if let Some((tier, out, pages, slots)) = device.and_then(|device| copy.tier_move(device)) {
-            // A window list's slots park by `copy_slots` (CONTRACT-BC 22).
-            if !copy.windowed.is_empty() {
-                return Err(Error::Unsupported {
-                    verb: "windowed kv pages to or from a tier by copy_kv: window list slots \
-                           move by copy_slots",
-                    engine: "cuda",
-                });
-            }
-            let shell = self.loaded_mut()?;
-            return match tier {
-                MemoryDomain::LocalDisk => shell.spill_kv(out, pages, slots),
-                _ => shell.swap_kv(out, pages, slots),
-            }
-            .map_err(fault);
-        }
         if device.is_none_or(|device| copy.src != device || copy.dst != device) {
             return Err(Error::Unsupported {
                 verb: kv_copy_direction(copy.src, copy.dst),

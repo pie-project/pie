@@ -22,8 +22,7 @@ use crate::policy::pressure::{Bytes, Meter, Tier};
 use crate::store::registry;
 
 use ::engine::chunk::{
-    ChunkFacts, DEGENERATE_BUFFER, DEGENERATE_KV, DEGENERATE_STATE, DEGENERATE_WINDOW, Pinned,
-    SlotKind,
+    ChunkFacts, DEGENERATE_BUFFER, DEGENERATE_KV, DEGENERATE_STATE, Pinned, SlotKind,
 };
 
 use super::kv::page_table::WorkingSetId;
@@ -707,10 +706,6 @@ pub struct StorePools {
     pub shared: bool,
     pub page_size: u32,
     pub kv: ShapeRun,
-    /// The window list's pages but the null page 0; its ids run from 1.
-    /// A shared pool's window lists are not counted here (the stores take
-    /// them from its shapes, each of its own window and slot).
-    pub window: ShapeRun,
     pub window_tokens: u32,
     pub state: ShapeRun,
     pub buffer: ShapeRun,
@@ -751,18 +746,6 @@ impl StorePools {
                     pools.page_size = tokens;
                     pools.kv = run;
                 }
-                (
-                    DEGENERATE_WINDOW,
-                    SlotKind::List {
-                        tokens,
-                        window: Some(window),
-                        ..
-                    },
-                ) => {
-                    pools.page_size = tokens;
-                    pools.window = run;
-                    pools.window_tokens = window;
-                }
                 (DEGENERATE_STATE | DEGENERATE_BUFFER, SlotKind::Fixed { pieces })
                     if pieces != 1 =>
                 {
@@ -777,8 +760,7 @@ impl StorePools {
     }
 
     /// A shared pool's geometry: the kv list's tokens a slot, the widest
-    /// window and the window lists' slot bytes together, and the rs list's
-    /// slot bytes as the buffer's.
+    /// window, and the rs list's slot bytes as the buffer's.
     fn shared(facts: &ChunkFacts) -> Self {
         let mut pools = Self {
             shared: true,
@@ -811,7 +793,6 @@ impl StorePools {
                     if pools.page_size == 0 {
                         pools.page_size = tokens;
                     }
-                    pools.window.slot_bytes += shape.slot_bytes;
                     pools.window_tokens = pools.window_tokens.max(window);
                 }
                 SlotKind::Fixed { pieces } => {
@@ -820,15 +801,6 @@ impl StorePools {
             }
         }
         pools
-    }
-
-    /// The engine's window pages, the null page 0 counted.
-    pub fn window_pages(&self) -> u32 {
-        if self.window.device == 0 && self.window.host == 0 {
-            0
-        } else {
-            self.window.device + self.window.ids_from
-        }
     }
 }
 
@@ -1089,17 +1061,13 @@ mod tests {
             state_slots: 4,
             state_slot_bytes: 4096,
             buffer_pages: 6,
-            window_pages: 5,
-            window_tokens: 64,
-            host_state_slots: 2,
-            host_window_pages: 3,
+            host_kv_pages: 3,
             ..Default::default()
         };
         let facts = ChunkFacts::degenerate(
             &pools,
             &::engine::chunk::DegenerateBytes {
                 kv_page: 100,
-                window_page: 50,
                 buffer_page: 25,
             },
         );
@@ -1107,13 +1075,10 @@ mod tests {
         assert_eq!(stores.page_size, 16);
         assert_eq!(stores.kv.device, 10);
         assert_eq!(stores.kv.slot_bytes, 100);
-        assert_eq!(stores.window.device, 4);
-        assert_eq!(stores.window.ids_from, 1);
-        assert_eq!(stores.window_pages(), 5);
-        assert_eq!(stores.window.host, 3);
-        assert_eq!(stores.window_tokens, 64);
+        assert_eq!(stores.kv.host, 3);
+        assert_eq!(stores.window_tokens, 0);
         assert_eq!(stores.state.device, 4);
-        assert_eq!(stores.state.host, 2);
+        assert_eq!(stores.state.host, 0);
         assert_eq!(stores.buffer.device, 6);
     }
 }

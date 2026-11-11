@@ -730,7 +730,6 @@ fn degenerate_facts_keep_their_own_pools() {
         &pools,
         &::engine::chunk::DegenerateBytes {
             kv_page: 100,
-            window_page: 50,
             buffer_page: 25,
         },
     );

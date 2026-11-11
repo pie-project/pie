@@ -14,8 +14,8 @@ fn dense() -> PoolFacts {
 }
 
 fn hybrid() -> PoolFacts {
-    // A GDN hybrid: kv pages for its attention rows, state slots and rs
-    // buffer pages beside them, each with a host tier.
+    // A GDN hybrid: kv pages for its attention rows (with a host tier),
+    // state slots and rs buffer pages beside them.
     PoolFacts {
         kv_pages: 4_096,
         kv_page_size: 16,
@@ -23,67 +23,24 @@ fn hybrid() -> PoolFacts {
         state_slot_bytes: 37 << 20,
         buffer_pages: 66,
         host_kv_pages: 8_192,
-        host_state_slots: 128,
-        host_buffer_pages: 128,
         elastic_state_slot_bytes: 38 << 20,
-        ..PoolFacts::default()
-    }
-}
-
-fn windowed() -> PoolFacts {
-    // Sliding-window rows in a pool of their own, page 0 null.
-    PoolFacts {
-        kv_pages: 2_048,
-        kv_page_size: 32,
-        window_pages: 513,
-        window_tokens: 4_096,
-        host_kv_pages: 1_024,
-        host_window_pages: 256,
-        ..PoolFacts::default()
-    }
-}
-
-fn ring_state() -> PoolFacts {
-    // A model whose state is a window and nothing else: no full kv pages.
-    PoolFacts {
-        kv_page_size: 16,
-        window_pages: 129,
-        window_tokens: 1_024,
-        host_window_pages: 64,
         ..PoolFacts::default()
     }
 }
 
 const BYTES: DegenerateBytes = DegenerateBytes {
     kv_page: 2 << 20,
-    window_page: 4 << 20,
     buffer_page: 1 << 20,
 };
 
 #[test]
 fn degenerate_facts_reproduce_every_pool_count() {
-    for pools in [
-        dense(),
-        hybrid(),
-        windowed(),
-        ring_state(),
-        PoolFacts::default(),
-    ] {
+    for pools in [dense(), hybrid(), PoolFacts::default()] {
         let facts = ChunkFacts::degenerate(&pools, &BYTES);
         facts.validate().unwrap();
-        let device = 1
-            + pools.kv_pages
-            + pools.window_pages.saturating_sub(1)
-            + pools.state_slots
-            + pools.buffer_pages;
+        let device = 1 + pools.kv_pages + pools.state_slots + pools.buffer_pages;
         assert_eq!(facts.total_chunks, device);
-        assert_eq!(
-            facts.host_chunks,
-            pools.host_kv_pages
-                + pools.host_window_pages
-                + pools.host_state_slots
-                + pools.host_buffer_pages
-        );
+        assert_eq!(facts.host_chunks, pools.host_kv_pages);
         assert_eq!(facts.disk_persistent, pools.disk_kv_persistent);
         assert_eq!(
             facts.state_chunks(),
@@ -96,26 +53,25 @@ fn degenerate_facts_reproduce_every_pool_count() {
 
 #[test]
 fn a_degenerate_slot_keeps_the_id_the_engine_knows_it_by() {
-    let facts = ChunkFacts::degenerate(&windowed(), &BYTES);
-    let kv = facts.shape(DEGENERATE_KV).unwrap();
-    let ring = facts.shape(DEGENERATE_WINDOW).unwrap();
-    assert_eq!(kv.legacy_id(1), Some(0));
-    assert_eq!(kv.legacy_id(2_048), Some(2_047));
-    assert_eq!(kv.legacy_id(2_049), None, "past the kv run is the ring's");
-    assert_eq!(ring.legacy_id(2_049), Some(1), "window page 0 is chunk 0");
-    assert_eq!(ring.legacy_id(2_049 + 511), Some(512));
-    assert_eq!(ring.legacy_id(0), None);
-    assert_eq!(kv.device_slots(&facts), 2_048);
-    assert_eq!(facts.chunk_bytes, 4 << 20, "a chunk is the largest slot");
-
     let facts = ChunkFacts::degenerate(&hybrid(), &BYTES);
+    let kv = facts.shape(DEGENERATE_KV).unwrap();
+    assert_eq!(kv.legacy_id(1), Some(0));
+    assert_eq!(kv.legacy_id(4_096), Some(4_095));
+    assert_eq!(kv.legacy_id(4_097), None, "past the kv run is the state's");
+    assert_eq!(kv.legacy_id(0), None);
+    assert_eq!(kv.device_slots(&facts), 4_096);
+    assert_eq!(facts.chunk_bytes, 37 << 20, "a chunk is the largest slot");
     let state = facts.shape(DEGENERATE_STATE).unwrap();
     let buffer = facts.shape(DEGENERATE_BUFFER).unwrap();
     assert_eq!(state.sets_per_working_set, 1);
     assert_eq!(state.legacy_id(4_097), Some(0));
     assert_eq!(buffer.legacy_id(4_097 + 66), Some(0));
-    assert_eq!(buffer.pinned.unwrap().host.first, 8_192 + 128);
-    assert!(facts.shape(DEGENERATE_WINDOW).is_none());
+    assert_eq!(kv.pinned.unwrap().host.chunks, 8_192);
+    assert_eq!(
+        state.pinned.unwrap().host.chunks,
+        0,
+        "state stays on the device"
+    );
 }
 
 #[test]
@@ -243,7 +199,7 @@ fn a_lane_names_its_slots_only_to_an_engine_that_states_chunks() {
         },
         // A shape the engine does not state.
         Lane {
-            tables: vec![(DEGENERATE_WINDOW, vec![0])],
+            tables: vec![(ShapeId(1), vec![0])],
             ..lane.clone()
         },
         // One piece more than the record has.
@@ -254,14 +210,6 @@ fn a_lane_names_its_slots_only_to_an_engine_that_states_chunks() {
     ] {
         assert!(bad.validate_chunks(&facts).is_err(), "{bad:?}");
     }
-
-    let facts = ChunkFacts::degenerate(&windowed(), &BYTES);
-    Lane {
-        tables: vec![(DEGENERATE_WINDOW, vec![0, 0, 2_049, 2_560])],
-        ..Lane::default()
-    }
-    .validate_chunks(&facts)
-    .unwrap();
 }
 
 #[test]

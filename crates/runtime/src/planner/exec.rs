@@ -310,25 +310,6 @@ impl Move {
                     source: None,
                 });
             }
-            let pages = if rs.is_window() {
-                TierKind::Window
-            } else {
-                TierKind::RsPages
-            };
-            for (kind, pairs) in [(TierKind::Rs, &plan.slots), (pages, &plan.pages)] {
-                if pairs.is_empty() {
-                    continue;
-                }
-                let (device, slots) = pairs.iter().copied().unzip();
-                copies.push(TierMove {
-                    kind,
-                    tier: MemoryDomain::HostPinned,
-                    out,
-                    device,
-                    slots,
-                    source: None,
-                });
-            }
         }
         copies
     }

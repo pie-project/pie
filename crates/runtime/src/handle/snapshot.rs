@@ -21,7 +21,7 @@ use super::HandleError;
 use super::held::{Held, Parts};
 use crate::inferlet::ProcessId;
 use crate::inferlet::host::working_set::Cursor;
-use crate::scheduler::{self, TierKind, TierMove};
+use crate::scheduler;
 use crate::store::kv::hash::Hash256;
 use crate::store::kv::page_table::{ExportedPage, ExportedSet, HostKvSlotId, KvPageBacking};
 use crate::store::kv::working_set::KvWorkingSet;
@@ -309,85 +309,26 @@ async fn read_state(
     // A window list's table rides as the buffer.
     let table = set.windows.first().unwrap_or(&set.buffer);
     let pages: Vec<RsSlotId> = table.iter().flatten().copied().collect();
-    let (ids, scratch) = {
-        let mut store = stores.rs.lock().unwrap();
-        let on_device = |ids: &[RsSlotId], store: &crate::store::rs::RsStore| {
-            ids.iter().filter(|&&id| !store.on_host(id)).count()
+    // Rows are read where they rest on the host: a read parks nothing, and
+    // only a shared pool has a host tier, whose slot refs the engine's byte
+    // reads do not name.
+    let (row_slots, row_pages) = {
+        let store = stores.rs.lock().unwrap();
+        if store.is_shared() || held.iter().chain(&pages).any(|&id| !store.on_host(id)) {
+            return Err(HandleError::quota(
+                "the host has no room to read this recurrent state out",
+            ));
+        }
+        let ids = |ids: &[RsSlotId]| {
+            ids.iter()
+                .map(|&id| store.engine_id(id))
+                .collect::<Vec<_>>()
         };
-        let (slots, buffer) = (on_device(&held, &store), on_device(&pages, &store));
-        let scratch = store.take_host(slots, buffer).ok_or_else(|| {
-            HandleError::quota("the host has no room to read this recurrent state out")
-        })?;
-        (
-            held.iter()
-                .chain(&pages)
-                .map(|&id| (id, store.on_host(id), store.engine_id(id)))
-                .collect::<Vec<_>>(),
-            scratch
-                .iter()
-                .map(|&id| (id, store.engine_id(id)))
-                .collect::<Vec<_>>(),
-        )
+        (ids(&held), ids(&pages))
     };
-    let read = async {
-        let (mut free, mut row_slots, mut row_pages) = (scratch.iter(), Vec::new(), Vec::new());
-        let (mut slot_moves, mut page_moves) = ((Vec::new(), Vec::new()), (Vec::new(), Vec::new()));
-        for (at, &(_, hosted, id)) in ids.iter().enumerate() {
-            let is_slot = at < held.len();
-            let row = if hosted {
-                id
-            } else {
-                let &(_, row) = free.next().expect("one row for each off the host");
-                let (device, slots) = if is_slot {
-                    (&mut slot_moves.0, &mut slot_moves.1)
-                } else {
-                    (&mut page_moves.0, &mut page_moves.1)
-                };
-                device.push(id);
-                slots.push(row);
-                row
-            };
-            if is_slot {
-                row_slots.push(row);
-            } else {
-                row_pages.push(row);
-            }
-        }
-        let pages_kind = if set.window.is_some() {
-            TierKind::Window
-        } else {
-            TierKind::RsPages
-        };
-        for (kind, (device, slots)) in [(TierKind::Rs, slot_moves), (pages_kind, page_moves)] {
-            if device.is_empty() {
-                continue;
-            }
-            let copy = TierMove {
-                kind,
-                tier: ::engine::MemoryDomain::HostPinned,
-                out: true,
-                device,
-                slots,
-                source: None,
-            };
-            let completion = scheduler::copy_tier_tracked(engine, &copy)
-                .map_err(|error| failed("copying state to the host", error))?;
-            completion
-                .wait()
-                .await
-                .map_err(|error| failed("copying state to the host", error))?;
-        }
-        scheduler::read_host_state(engine, row_slots, row_pages)
-            .await
-            .map_err(|error| failed("reading recurrent state", error))
-    }
-    .await;
-    stores
-        .rs
-        .lock()
-        .unwrap()
-        .give_host(scratch.into_iter().map(|(id, _)| id).collect());
-    let bytes = read?;
+    let bytes = scheduler::read_host_state(engine, row_slots, row_pages)
+        .await
+        .map_err(|error| failed("reading recurrent state", error))?;
     Ok((
         SavedState {
             state_size: rs.geom.state_size,

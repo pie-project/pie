@@ -38,8 +38,6 @@ impl Shell {
             seat_to_end: false,
             seat_spread: false,
             buffer_pages: self.buffer_pages(),
-            host_state_slots: self.parked_state_slots(),
-            host_buffer_pages: self.parked_buffer_pages(),
             // The sliding rows are paged in full here: the model's window
             // is a fact of the model, its pool is not.
             window_tokens: poem_exec::store::kv::declared_window(self.trace()).unwrap_or(0),

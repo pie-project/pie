@@ -931,20 +931,54 @@ async fn a_lane_holding_the_whole_state_pool_is_told_so() {
     );
 }
 
-/// A windowed model's store: a window of 32 tokens over 16-token slots,
-/// 8 window slot ids of which 0 is the null page.
+/// A windowed model's store: a shared pool whose one window list keeps 32
+/// tokens over 16-token slots, a slot a chunk, 7 slots beside the null
+/// chunk.
 fn window_model() -> usize {
-    crate::store::registry::register_model_with_swap(
-        16,
-        &[64],
-        &[0],
-        &[0],
-        &[crate::store::registry::StatePool {
-            window_tokens: 32,
-            window_pages: 8,
-            ..Default::default()
+    use ::engine::chunk::{
+        ChunkFacts, Growth, Reserved, ReservedRun, SegmentFacts, ShapeId, SlotKind, SlotRole,
+        SlotShape,
+    };
+    let kind = SlotKind::List {
+        tokens: 16,
+        rate: 1,
+        window: Some(32),
+    };
+    let facts = ChunkFacts {
+        chunk_bytes: 1 << 20,
+        total_chunks: 8,
+        segment_chunks: 8,
+        segments: SegmentFacts {
+            committed: 1,
+            max: 1,
+            growth: Growth::Fixed,
+        },
+        reserved: vec![ReservedRun {
+            what: Reserved::Null,
+            first: 0,
+            chunks: 1,
         }],
-        &[0],
+        shapes: vec![SlotShape {
+            id: ShapeId(1),
+            kind,
+            slot_bytes: 1 << 20,
+            slots_per_chunk: 1,
+            sets_per_working_set: kind.sets_per_working_set(),
+            rows: Vec::new(),
+            pinned: None,
+            role: SlotRole::State,
+        }],
+        ..ChunkFacts::default()
+    };
+    let pool = crate::store::shared::SharedPool::new(&facts, 1024).expect("the window pool");
+    crate::store::registry::register_model_with_chunks(
+        16,
+        &[crate::store::registry::EngineStores {
+            pools: crate::store::chunks::StorePools::of(&facts).expect("shared facts"),
+            max_context: 1024,
+            shared: Some(Arc::new(std::sync::Mutex::new(pool))),
+            tiers: crate::store::shared::Tiers::default(),
+        }],
     )
 }
 

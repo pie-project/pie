@@ -106,12 +106,8 @@ fn kv_copies(txn: &crate::store::kv::KvResidencyTxn, out: bool) -> Vec<(MemoryDo
 
 /// The engine copies an rs move states, shape by shape.
 fn rs_copies(txn: &RsResidencyTxn, out: bool) -> Vec<SlotCopy> {
-    let plan = txn.copy_plan();
-    assert!(
-        plan.slots.is_empty() && plan.pages.is_empty(),
-        "a shared pool's state moves by slot shape"
-    );
-    plan.shared
+    txn.copy_plan()
+        .shared
         .iter()
         .map(|(shape, pairs)| {
             let (device, slots) = pairs.iter().copied().unzip();
@@ -444,6 +440,34 @@ fn a_record_of_pieces_and_its_rs_list_slots_park_and_come_back() {
         (0, 0),
         "the host slots go back"
     );
+}
+
+/// A set is in a move from a suspend's or a restore's prepare to its
+/// commit or abort.
+#[test]
+fn a_set_is_in_a_move_from_prepare_to_commit() {
+    use crate::pipeline::fire::rs::{prepare, settle};
+    use crate::store::rs::RsGeometry;
+    let (_shared, _tiers, stores) = tiered(fixed_facts(), 0);
+    let mut rs = stores.rs.lock().unwrap();
+    let ws = rs.create_working_set(RsGeometry {
+        state_size: 1024,
+        buffer_page_tokens: 16,
+    });
+    let first = prepare(&mut rs, ws, 4).unwrap();
+    settle(&mut rs, first.txn);
+    let set = HashSet::from([ws]);
+    assert!(!rs.in_move(ws));
+    let txn = rs.prepare_suspend(&set).expect("rows to park");
+    assert!(rs.in_move(ws));
+    rs.commit_suspend(txn);
+    assert!(!rs.in_move(ws));
+    let need = rs.swapped_units(&set);
+    let mut grant = rs.reserve(need).expect("room on the device");
+    let txn = rs.prepare_restore(&set, &mut grant).unwrap();
+    assert!(rs.in_move(ws));
+    rs.abort_restore(txn);
+    assert!(!rs.in_move(ws));
 }
 
 /// (d) A fork shares its parent's record: parked with it, the record moves

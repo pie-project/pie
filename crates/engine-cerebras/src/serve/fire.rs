@@ -1242,9 +1242,7 @@ impl Shell {
         lands: &[crate::dit::Land],
         pixels: Option<&crate::dit::PixelsSeat>,
     ) -> Result<(String, crate::trace::Signature, Vec<ValueId>)> {
-        let tracer = Tracer::new(&self.handles)
-            .with_pack(pack_len)
-            .with_unified(self.unified.clone());
+        let tracer = Tracer::new(&self.handles).with_pack(pack_len);
         let place = At::new();
         crate::dit::land(lands)?;
         let probed = {

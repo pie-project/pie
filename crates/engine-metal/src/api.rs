@@ -844,14 +844,6 @@ impl Engine for Metal {
     fn copy_kv(&mut self, copy: &KvCopy) -> EngineResult<()> {
         copy.validate()?;
         let device = self.caps.as_ref().map(|caps| caps.device.domain);
-        if let Some((MemoryDomain::LocalDisk, out, pages, slots)) =
-            device.and_then(|device| copy.tier_move(device))
-        {
-            return self
-                .loaded_mut()?
-                .spill_kv(out, pages, slots)
-                .map_err(fault);
-        }
         if device.is_none_or(|device| copy.src != device || copy.dst != device) {
             return Err(Error::Unsupported {
                 verb: kv_copy_direction(copy.src, copy.dst),

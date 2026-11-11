@@ -24,40 +24,18 @@ pub(super) struct RowBuild {
     consts: Vec<(String, Vec<u32>)>,
     kernels: Vec<Kernel>,
     ops: Vec<TableOp>,
-    /// `ops_words` and `rows` once padded to a unified capacity.
-    capacity: Option<(u32, u32)>,
     move_rows: u32,
     collectives: bool,
     used: Vec<Export>,
     lanes: Vec<LanePlan>,
     /// Phases in the row.
     phases: usize,
-    /// Under a unified shape: the arena arrays are declared at the shape's
-    /// size, not at the slots' reach, so every class's text is one.
-    fixed: bool,
-}
-
-impl RowBuild {
-    /// Words arena array `c` declares.
-    fn declared(&self, table: &Table, c: u64) -> u64 {
-        // A kept chunk reaches as far as the kept layout (the same on every
-        // row and class); a work chunk under a unified shape reaches the
-        // shape's size.
-        if self.fixed && c >= u64::from(table.keep_chunks) {
-            table
-                .arena_words
-                .saturating_sub(c * ARENA_CHUNK)
-                .clamp(1, ARENA_CHUNK)
-        } else {
-            table.chunk_words(c)
-        }
-    }
 }
 
 impl RowBuild {
     fn table(&self) -> Table {
-        let own = self.ops.iter().map(|op| 1 + op_words(op)).sum::<u32>() + 1;
-        let (ops_words, rows) = self.capacity.unwrap_or((own, self.ops.len().max(1) as u32));
+        let ops_words = self.ops.iter().map(|op| 1 + op_words(op)).sum::<u32>() + 1;
+        let rows = self.ops.len().max(1) as u32;
         Table {
             kernels: self.kernels.clone(),
             ops_words,
@@ -205,15 +183,14 @@ impl Program {
         }
 
         // The kept slots (weights, pools, constant tables): one layout over
-        // the whole rectangle, the unified shape's when there is one.
-        let unified = self.unified.as_ref().filter(|u| !u.rows.is_empty());
+        // the whole rectangle.
         let consts: Vec<(String, Vec<u32>)> = self
             .globals
             .iter()
             .filter_map(|g| parse_global_table(g))
             .filter(|(n, _)| mentions(&all, n))
             .collect();
-        let kept = self.kept_of(&used_all, &consts, unified)?;
+        let kept = self.kept_of(&used_all, &consts);
         let kept_words: u64 = kept.0.iter().map(|(_, _, w)| *w).sum();
         let pools: Vec<&Export> = used_all
             .iter()
@@ -227,79 +204,45 @@ impl Program {
             } else {
                 MOVE_SCRATCH + u64::from(MOVE_ROWS) * u64::from(1 + MOVE_ROW_WORDS)
             };
-        // The rows: the fused groups, in phase order. A unified shape
-        // fixes the partition.
-        let mut groups: Vec<Vec<&Phase>> =
-            match self.unified.as_ref().and_then(|u| u.row_phases.clone()) {
-                Some(sizes) => {
-                    if sizes.iter().sum::<usize>() != all_phases.len() {
-                        trace_fusion(
-                            "whole fire refused: the unified partition does not match the phases",
-                        );
-                        return None;
-                    }
-                    let mut at = 0;
-                    sizes
-                        .iter()
-                        .map(|n| {
-                            let g = all_phases[at..at + n].to_vec();
-                            at += n;
-                            g
-                        })
-                        .collect()
-                }
-                None => {
-                    let mut groups: Vec<Vec<&Phase>> = self
-                        .fused_phases_with(extra)
-                        .into_iter()
-                        .map(|g| g.to_vec())
-                        .collect();
-                    // A kept pool is never handed off, so the phases naming one
-                    // sit on one row: a boundary between phases that share a
-                    // pool moves back past them.
-                    let names = |p: &Phase| {
-                        let mut t = String::new();
-                        p.func.render(&mut t);
-                        t
-                    };
-                    let mut g = 0;
-                    while g + 1 < groups.len() {
-                        let shared = |a: &Phase, next: &[&Phase]| {
-                            let ta = names(a);
-                            pools.iter().any(|e| {
-                                mentions(&ta, &e.name)
-                                    && next.iter().any(|b| mentions(&names(b), &e.name))
-                            })
-                        };
-                        while let Some(last) = groups[g].last().copied()
-                            && shared(last, &groups[g + 1])
-                        {
-                            groups[g].pop();
-                            groups[g + 1].insert(0, last);
-                        }
-                        if groups[g].is_empty() {
-                            groups.remove(g);
-                        } else {
-                            g += 1;
-                        }
-                    }
-                    groups
-                }
+        // The rows: the fused groups, in phase order.
+        let mut groups: Vec<Vec<&Phase>> = {
+            let mut groups: Vec<Vec<&Phase>> = self
+                .fused_phases_with(extra)
+                .into_iter()
+                .map(|g| g.to_vec())
+                .collect();
+            // A kept pool is never handed off, so the phases naming one
+            // sit on one row: a boundary between phases that share a
+            // pool moves back past them.
+            let names = |p: &Phase| {
+                let mut t = String::new();
+                p.func.render(&mut t);
+                t
             };
+            let mut g = 0;
+            while g + 1 < groups.len() {
+                let shared = |a: &Phase, next: &[&Phase]| {
+                    let ta = names(a);
+                    pools.iter().any(|e| {
+                        mentions(&ta, &e.name) && next.iter().any(|b| mentions(&names(b), &e.name))
+                    })
+                };
+                while let Some(last) = groups[g].last().copied()
+                    && shared(last, &groups[g + 1])
+                {
+                    groups[g].pop();
+                    groups[g + 1].insert(0, last);
+                }
+                if groups[g].is_empty() {
+                    groups.remove(g);
+                } else {
+                    g += 1;
+                }
+            }
+            groups
+        };
         groups.retain(|g| !g.is_empty());
         let h = groups.len() as u32;
-        // The rows' shapes under a unified fire (none while only the
-        // partition is fixed).
-        let shapes: Vec<Option<&RowShape>> = match unified {
-            Some(u) => {
-                if u.rows.len() != groups.len() {
-                    trace_fusion("whole fire refused: the unified shape has other rows");
-                    return None;
-                }
-                u.rows.iter().map(Some).collect()
-            }
-            None => vec![None; groups.len()],
-        };
         let group_texts: Vec<String> = groups.iter().map(|g| texts_of(g).concat()).collect();
         let on_row = |name: &str, g: usize| mentions(&group_texts[g], name);
 
@@ -378,7 +321,7 @@ impl Program {
                 Vec::new()
             };
             let Some(mut row) = self.build_row(
-                group, &used, &reduces, true, shapes[g], &kept, &consts, &pinned, &extra,
+                group, &used, &reduces, true, &kept, &consts, &pinned, &extra,
             ) else {
                 trace_fusion(&format!(
                     "whole fire refused: row {g} does not render as a table"
@@ -460,12 +403,6 @@ impl Program {
         reduces: &[&FabricReduce],
         whole: bool,
     ) -> Option<Rendered> {
-        let unified = if whole {
-            self.unified.as_ref().filter(|u| !u.rows.is_empty())
-        } else {
-            None
-        };
-        let shape = unified.and_then(|u| u.rows.first());
         let mut body = String::new();
         for p in group {
             p.func.render(&mut body);
@@ -476,22 +413,16 @@ impl Program {
             .filter_map(|g| parse_global_table(g))
             .filter(|(n, _)| mentions(&body, n))
             .collect();
-        let kept = self.kept_of(used, &consts, unified)?;
-        let row = self.build_row(group, used, reduces, whole, shape, &kept, &consts, &[], &[])?;
+        let kept = self.kept_of(used, &consts);
+        let row = self.build_row(group, used, reduces, whole, &kept, &consts, &[], &[])?;
         let pes = group[0].pes.max(1);
         let rect = reduces.first().map_or_else(|| rect_of(pes), |r| r.rect);
         self.emit_table(&[row], rect, false)
     }
 
-    /// The kept layout a program follows: the unified shape's (every kept
-    /// export and constant must have a slot there), else its own kept
-    /// exports and constant tables laid from the arena's start.
-    fn kept_of(
-        &self,
-        used: &[Export],
-        consts: &[(String, Vec<u32>)],
-        unified: Option<&Unified>,
-    ) -> Option<KeptLayout> {
+    /// The kept layout a program follows: its own kept exports and constant
+    /// tables laid from the arena's start.
+    fn kept_of(&self, used: &[Export], consts: &[(String, Vec<u32>)]) -> KeptLayout {
         let need: Vec<(String, u64)> = used
             .iter()
             .filter(|e| e.keep)
@@ -502,24 +433,7 @@ impl Program {
                     .map(|(n, w)| (n.clone(), w.len().max(1) as u64)),
             )
             .collect();
-        match unified {
-            Some(u) => {
-                for (name, words) in &need {
-                    let Some((_, _, have)) = u.keep.iter().find(|(n, ..)| n == name) else {
-                        trace_fusion(&format!(
-                            "table refused: kept {name} off the unified layout"
-                        ));
-                        return None;
-                    };
-                    if have < words {
-                        trace_fusion(&format!("table refused: kept {name} over its unified slot"));
-                        return None;
-                    }
-                }
-                Some((u.keep.clone(), u.keep_chunks))
-            }
-            None => Some(keep_layout(need)),
-        }
+        keep_layout(need)
     }
 
     /// The arena and the op table of one row (a fused group): the kept
@@ -534,7 +448,6 @@ impl Program {
         used: &[Export],
         reduces: &[&FabricReduce],
         liveness: bool,
-        unified: Option<&RowShape>,
         kept: &KeptLayout,
         consts: &[(String, Vec<u32>)],
         pinned: &[String],
@@ -572,9 +485,7 @@ impl Program {
         // fills every kept constant slot).
         let consts: Vec<(String, Vec<u32>)> = consts.to_vec();
         place("k_dummy", 2, &mut at, &mut arena);
-        // Page moves ride the rows that hold a kept pool (a kept in-out),
-        // under a unified shape or not, so the shapes a dry shell unites
-        // already hold the move rows and scratch.
+        // Page moves ride the rows that hold a kept pool (a kept in-out).
         let has_pool = used.iter().any(|e| e.keep && e.role == Symbol::InOut);
         let moving = liveness && keep_pools() && has_pool;
         if moving {
@@ -713,17 +624,7 @@ impl Program {
                 place(name, *words, &mut at, &mut arena);
             }
         }
-        let mut arena_words = at;
-        if let Some(u) = unified {
-            if at > u.arena_words {
-                trace_fusion(&format!(
-                    "table refused: the arena ({at} words) over the unified size ({})",
-                    u.arena_words
-                ));
-                return None;
-            }
-            arena_words = u.arena_words;
-        }
+        let arena_words = at;
         let slot = |name: &str| arena.iter().find(|(n, ..)| n == name).map(|(_, o, _)| *o);
         // Every argument the table carries must resolve on the host.
         let carried = |a: &Arg| match a {
@@ -740,17 +641,14 @@ impl Program {
             }
             _ => true,
         };
-        // The kernels: the model's list under a unified shape (a kernel off
-        // it fails the whole-fire form), else this group's in order of use.
-        let fixed = unified.is_some();
-        let mut kernels: Vec<Kernel> = unified.map(|u| u.kernels.clone()).unwrap_or_default();
-        let kernel_id = |kernel: Kernel, kernels: &mut Vec<Kernel>| -> Option<u32> {
+        // The kernels: this group's in order of use.
+        let mut kernels: Vec<Kernel> = Vec::new();
+        let kernel_id = |kernel: Kernel, kernels: &mut Vec<Kernel>| -> u32 {
             match kernels.iter().position(|k| *k == kernel) {
-                Some(i) => Some(i as u32),
-                None if fixed => None,
+                Some(i) => i as u32,
                 None => {
                     kernels.push(kernel);
-                    Some((kernels.len() - 1) as u32)
+                    (kernels.len() - 1) as u32
                 }
             }
         };
@@ -759,7 +657,7 @@ impl Program {
         for _ in 0..move_rows {
             ops.push(TableOp::Nop);
         }
-        if moving && !fixed && !kernels.contains(&Kernel::Copy) {
+        if moving && !kernels.contains(&Kernel::Copy) {
             kernels.push(Kernel::Copy);
         }
         let push_call =
@@ -771,13 +669,7 @@ impl Program {
                     ));
                     return None;
                 }
-                let Some(kernel) = kernel_id(g.call.kernel, kernels) else {
-                    trace_fusion(&format!(
-                        "table refused: kernel {} off the unified list",
-                        g.call.kernel.name()
-                    ));
-                    return None;
-                };
+                let kernel = kernel_id(g.call.kernel, kernels);
                 ops.push(TableOp::Call {
                     root: g.root,
                     on: None,
@@ -828,19 +720,6 @@ impl Program {
                 }
             }
         }
-        // The rows' words, and one zero word to end the table.
-        let own_words = ops.iter().map(|op| 1 + op_words(op)).sum::<u32>() + 1;
-        let own_rows = ops.len().max(1) as u32;
-        let capacity = match unified {
-            Some(u) => {
-                if own_words > u.ops_words || own_rows > u.rows {
-                    trace_fusion("table refused: the op table over the unified capacity");
-                    return None;
-                }
-                Some((u.ops_words, u.rows))
-            }
-            None => None,
-        };
         Some(RowBuild {
             body,
             arena,
@@ -849,14 +728,12 @@ impl Program {
             consts,
             kernels,
             ops,
-            capacity,
             move_rows,
             // The collectives module: for the reduces, and for the page moves.
             collectives: !reduces.is_empty() || moving,
             used: used.to_vec(),
             lanes: group.iter().filter_map(|p| p.lane.clone()).collect(),
             phases: group.len(),
-            fixed: unified.is_some(),
         })
     }
 
@@ -899,12 +776,7 @@ impl Program {
         // The arena and table arrays, at the largest row's size.
         let chunks = tables.iter().map(Table::chunks).max().unwrap_or(1);
         for c in 0..chunks {
-            let words = rows
-                .iter()
-                .zip(&tables)
-                .map(|(r, t)| r.declared(t, c))
-                .max()
-                .unwrap_or(1);
+            let words = tables.iter().map(|t| t.chunk_words(c)).max().unwrap_or(1);
             let _ = writeln!(pe, "var arena{c}: [{words}]u32;");
             let _ = writeln!(pe, "var arena{c}_ptr: [*]u32 = &arena{c};");
         }

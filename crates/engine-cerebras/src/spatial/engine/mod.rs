@@ -442,7 +442,6 @@ impl Engine for Spatial {
     /// A serve_q35 build's recurrent states, a row to a row (the wafer
     /// keeps each state's tokens: a copy's lane replays them).
     fn copy_state(&mut self, copy: &engine::transfer::StateCopy) -> EngineResult<()> {
-        copy.device_only("cerebras-spatial")?;
         if !copy.pages.is_empty() {
             return Err(Error::Unsupported {
                 verb: "`copy_state` of buffer pages on the wafer",

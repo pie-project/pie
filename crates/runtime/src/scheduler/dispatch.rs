@@ -1,12 +1,12 @@
 use std::sync::Arc;
 
-use ::engine::transfer::{MemoryDomain, StateDirection, StateMove};
+use ::engine::transfer::MemoryDomain;
 use anyhow::Result;
 use eta_ir::registry::GeometryClass;
 
 use ::engine::chunk::SlotCopy;
 use ::engine::program::BindExtents;
-use ::engine::{ChannelRegistration, KvCopy, ProgramRegistration, StateCopy};
+use ::engine::{ChannelRegistration, KvCopy, ProgramRegistration};
 
 use crate::engine::{BoundInstance, ChannelEndpoint, ChannelValue, EngineId, InstanceBindingPlan};
 
@@ -128,12 +128,6 @@ pub(crate) enum TierKind {
     /// A shared pool's recurrent slots of this shape: record pieces, rs
     /// list or window list slots, moved by `copy_slots`.
     RsSlots(::engine::chunk::ShapeId),
-    /// Recurrent state slots.
-    Rs,
-    /// Recurrent buffer pages.
-    RsPages,
-    /// A window list's pages, moved through the windowed kv planes.
-    Window,
 }
 
 impl TierKind {
@@ -148,9 +142,6 @@ impl TierMove {
         let kind = match self.kind {
             TierKind::Kv | TierKind::KvSlots(_) => "kv",
             TierKind::RsSlots(_) => "rs-slots",
-            TierKind::Rs => "rs",
-            TierKind::RsPages => "rs-pages",
-            TierKind::Window => "window",
         };
         let way = if self.out { "to" } else { "from" };
         match self.source {
@@ -215,56 +206,6 @@ pub(crate) fn copy_tier_tracked(
                 dst_page_ids: dst_page_ids.clone(),
                 moves: Vec::new(),
                 windowed: Vec::new(),
-            })
-        }
-        TierKind::Window => {
-            let device = super::device_domain(engine_idx);
-            let (src, dst, from, to) = if copy.out {
-                (device, copy.tier, &copy.device, &copy.slots)
-            } else {
-                (copy.tier, device, &copy.slots, &copy.device)
-            };
-            PreLaunchCopy::Kv(KvCopy {
-                src,
-                dst,
-                src_page_ids: Vec::new(),
-                dst_page_ids: Vec::new(),
-                moves: Vec::new(),
-                windowed: from.iter().copied().zip(to.iter().copied()).collect(),
-            })
-        }
-        TierKind::Rs | TierKind::RsPages => {
-            let (from, to) = if copy.out {
-                (&copy.device, &copy.slots)
-            } else {
-                (&copy.slots, &copy.device)
-            };
-            let moves: Vec<StateMove> = from
-                .iter()
-                .zip(to)
-                .map(|(&src_slot_id, &dst_slot_id)| StateMove {
-                    src_slot_id,
-                    dst_slot_id,
-                    ..StateMove::default()
-                })
-                .collect();
-            let direction = if copy.out {
-                StateDirection::DeviceToHost
-            } else {
-                StateDirection::HostToDevice
-            };
-            PreLaunchCopy::State(if copy.kind == TierKind::Rs {
-                StateCopy {
-                    moves,
-                    pages: Vec::new(),
-                    direction,
-                }
-            } else {
-                StateCopy {
-                    moves: Vec::new(),
-                    pages: moves,
-                    direction,
-                }
             })
         }
     };

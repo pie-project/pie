@@ -1380,31 +1380,10 @@ impl Shell {
         self.pools.seat_tier(budget);
     }
 
-    #[must_use]
-    pub fn parked_state_slots(&self) -> u32 {
-        self.pools.parked_slots()
-    }
-
-    /// No rs buffer pages: the buffer's rows live in the records.
-    #[must_use]
-    pub fn parked_buffer_pages(&self) -> u32 {
-        0
-    }
-
     /// No rs buffer pages: the buffer's rows live in the records.
     #[must_use]
     pub fn buffer_pages(&self) -> u32 {
         0
-    }
-
-    pub fn spill_kv(&mut self, to_disk: bool, pages: &[u32], slots: &[u32]) -> Result<()> {
-        self.drain()?;
-        self.pools.spill_kv(to_disk, pages, slots)
-    }
-
-    /// As [`Shell::park_pages`].
-    pub fn copy_pages(&mut self, moves: &[(u32, u32)]) -> Result<()> {
-        refuse_pages(moves)
     }
 
     pub fn copy_state(&mut self, moves: &[(u32, u32)]) -> Result<()> {
@@ -4343,14 +4322,3 @@ fn covers(ceiling: &FireRows, fire: &FireRows) -> bool {
         && fire.readouts <= ceiling.readouts
 }
 
-/// A shared pool keeps no rs buffer pages: refuses a move that names any.
-fn refuse_pages<T>(moves: &[T]) -> Result<()> {
-    if moves.is_empty() {
-        return Ok(());
-    }
-    Err(Fault::Unbound {
-        what: "rs buffer pages, which a shared pool keeps none of: the buffer's rows move \
-               with their record"
-            .to_string(),
-    })
-}

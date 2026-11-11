@@ -390,7 +390,7 @@ mod tests {
     }
 
     fn a_frame_folds_one_slot_fresh_then_held() {
-        let mut store = RsStore::new(4, 4, 0, 0);
+        let mut store = RsStore::new(4, 4);
         let ws = store.create_working_set(geom());
         let first = fire(&mut store, &[ws]);
         assert_eq!(first.slot_flags, vec![crate::engine::RS_FLAG_RESET]);
@@ -412,7 +412,7 @@ mod tests {
     }
 
     fn a_fork_decodes_on_from_a_copy_of_its_parents_state() {
-        let mut store = RsStore::new(4, 4, 0, 0);
+        let mut store = RsStore::new(4, 4);
         let parent = store.create_working_set(geom());
         fire(&mut store, &[parent]);
         fire(&mut store, &[parent]);

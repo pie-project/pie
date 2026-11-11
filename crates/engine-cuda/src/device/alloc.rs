@@ -763,49 +763,11 @@ impl Drop for Pinned {
 }
 
 #[cfg(unix)]
-fn map_anon(bytes: usize) -> Option<*mut u8> {
-    // SAFETY: a fresh private anonymous mapping of a stated length; no fd and
-    // no offset are involved, and the pages belong to nobody else.
-    let at = unsafe {
-        libc::mmap(
-            core::ptr::null_mut(),
-            bytes.max(1),
-            libc::PROT_READ | libc::PROT_WRITE,
-            libc::MAP_PRIVATE | libc::MAP_ANONYMOUS,
-            -1,
-            0,
-        )
-    };
-    if at == libc::MAP_FAILED {
-        None
-    } else {
-        Some(at.cast())
-    }
-}
-
-#[cfg(unix)]
 fn unmap_anon(at: *mut u8, bytes: usize) {
     // SAFETY: unmapping a mapping `map_anon` made, exactly once.
     unsafe {
         libc::munmap(at.cast(), bytes.max(1));
     }
-}
-
-#[cfg(windows)]
-fn map_anon(bytes: usize) -> Option<*mut u8> {
-    use windows_sys::Win32::System::Memory::{
-        MEM_COMMIT, MEM_RESERVE, PAGE_READWRITE, VirtualAlloc,
-    };
-    // SAFETY: a fresh committed reservation of a stated length, owned by nobody else.
-    let at = unsafe {
-        VirtualAlloc(
-            core::ptr::null_mut(),
-            bytes.max(1),
-            MEM_COMMIT | MEM_RESERVE,
-            PAGE_READWRITE,
-        )
-    };
-    if at.is_null() { None } else { Some(at.cast()) }
 }
 
 #[cfg(windows)]
@@ -853,27 +815,6 @@ impl Pinning {
             host: at.cast(),
             bytes,
         })
-    }
-
-    pub fn uninit(bytes: usize) -> Result<Pinning> {
-        let Some(at) = map_anon(bytes) else {
-            return Err(Fault::Device {
-                call: "mmap",
-                code: -1,
-            });
-        };
-        #[cfg(target_os = "linux")]
-        // SAFETY: `at` is the mapping `map_anon` just made of at least
-        // `bytes` bytes; MADV_HUGEPAGE is only a hint and changes no contents.
-        unsafe {
-            libc::madvise(at.cast(), bytes.max(1), libc::MADV_HUGEPAGE)
-        };
-        Ok(Pinning { host: at, bytes })
-    }
-
-    #[must_use]
-    pub fn host(&self) -> *mut u8 {
-        self.host
     }
 
     pub fn lock(self) -> Result<Pinned> {
