@@ -1,3 +1,4 @@
+pub mod analysis;
 pub mod arena;
 pub mod branch;
 pub mod budget;
@@ -14,7 +15,9 @@ mod pq;
 pub mod prefetch;
 mod region;
 pub mod shard;
+pub mod spatial;
 pub mod stream;
+pub mod temporal;
 pub mod tile;
 mod tree;
 pub mod unit;
@@ -22,7 +25,7 @@ pub mod unit;
 #[cfg(test)]
 mod fixture;
 
-use poem_ir::{ClassTable, Def, Operands, Operation, Trace, Ty, resolve_classes};
+use poem_ir::{Operation, Trace};
 
 pub use arena::{ArenaMap, Concurrency, Extent, FireRows, Placement, RowExpr, Span};
 pub use budget::{
@@ -38,7 +41,7 @@ pub use poem_ir::RowAxis;
 pub use pq::PqTree;
 pub use stream::StreamPlan;
 
-const MAX_FACTS: usize = 20;
+pub(crate) const MAX_FACTS: usize = 20;
 
 pub const MAX_CLASSES: usize = u8::MAX as usize + 1;
 
@@ -60,169 +63,9 @@ pub fn compile_axes(
     budgets: &Budgets,
     profile: &DeviceProfile,
 ) -> Result<CompiledModel, Error> {
-    let budget = &budgets.tokens;
     accept(trace, budgets, profile)?;
-
-    let classes = resolve_classes(trace).map_err(Error::Classes)?;
-    if classes.classes.len() > MAX_CLASSES {
-        return Err(Error::TooManyClasses {
-            classes: classes.classes.len(),
-        });
-    }
-    if classes.node_mask.len() != trace.nodes.len() {
-        return Err(Error::MaskLength {
-            masks: classes.node_mask.len(),
-            nodes: trace.nodes.len(),
-        });
-    }
-
-    struct_readers_share_one_window(trace, &classes)?;
-
-    // Scheduled by dependencies (`compiler.dag_streams`): each op's lane is
-    // found over one-op regions, then regions break only where lanes change.
-    let lanes = if profile.dag_streams {
-        let every: std::collections::BTreeSet<u32> = (0..trace.nodes.len() as u32).collect();
-        let mut fine = region::coalesce_breaking(trace, &classes, &every)?;
-        region::hoist(trace, &mut fine)?;
-        let (_, fine_units_of) = unit::partition(&fine)?;
-        lowering::lower(trace, &mut fine, &classes, budget, profile);
-        Some(stream::dag_lanes(trace, &mut fine, &fine_units_of, profile))
-    } else {
-        None
-    };
-    let breaks: std::collections::BTreeSet<u32> = match &lanes {
-        Some((_, breaks)) => breaks.clone(),
-        None => std::collections::BTreeSet::new(),
-    };
-    let mut regions = region::coalesce_breaking(trace, &classes, &breaks)?;
-
-    region::hoist(trace, &mut regions)?;
-
-    let (units, units_of) = unit::partition(&regions)?;
-
-    lowering::lower(trace, &mut regions, &classes, budget, profile);
-
-    let streams = if let Some((lanes, _)) = &lanes {
-        stream::fork_dag(trace, &mut regions, &units_of, profile, Some(lanes))
-    } else {
-        stream::fork_with(trace, &mut regions, &units_of, profile)
-    };
-    let concurrency =
-        Concurrency::with_pairs(&regions, trace.nodes.len(), streams.pairs.iter().copied());
-
-    let (order, fallback) = layout::seriate(
-        trace,
-        &regions_on(&regions, &units_of, &units, RowAxis::Tokens),
-        &classes,
-        &budget.buckets,
-        budget.max_tokens,
-        profile,
-    );
-    let patches = axis_plan(
-        RowAxis::Patches,
-        trace,
-        &regions,
-        &units_of,
-        &units,
-        &classes,
-        budgets,
-        profile,
-    );
-    let voxels = axis_plan(
-        RowAxis::Voxels,
-        trace,
-        &regions,
-        &units_of,
-        &units,
-        &classes,
-        budgets,
-        profile,
-    );
-
-    // Side streams only up to `forked_until` rows: the arena in order for
-    // every fire, and one under the streams' concurrency at those rows' budgets
-    // for the fires that fork.
-    let (arena, arena_forked) = if lanes.is_some() && streams.forked_until > 0 {
-        let until = streams.forked_until;
-        let serial = Concurrency::sequential(&regions, trace.nodes.len());
-        let main = arena::carve(trace, budgets, &classes, &serial)?;
-        let mut narrow = budgets.clone();
-        narrow.tokens.max_tokens = narrow.tokens.max_tokens.min(until);
-        narrow.tokens.max_lanes = narrow.tokens.max_lanes.min(until);
-        narrow.tokens.buckets.retain(|&b| b <= until);
-        let forked = arena::carve(trace, &narrow, &classes, &concurrency)?;
-        (main, Some(forked))
-    } else {
-        (arena::carve(trace, budgets, &classes, &concurrency)?, None)
-    };
-
-    let voxel_growth = arena::voxel_growth(trace, &classes);
-    Ok(CompiledModel {
-        voxel_growth,
-        classes,
-        regions,
-        order,
-        fallback,
-        arena,
-        arena_forked,
-        concurrency,
-        streams,
-        fold_refused: unit::fold_refused(&units),
-        expert: expert::held(trace),
-        units,
-        units_of,
-        patches,
-        voxels,
-    })
-}
-
-fn regions_on(
-    regions: &[Region],
-    units_of: &[u32],
-    units: &[RowAxis],
-    axis: RowAxis,
-) -> Vec<Region> {
-    let Some(unit) = units.iter().position(|held| *held == axis) else {
-        return Vec::new();
-    };
-    let unit = unit as u32;
-    regions
-        .iter()
-        .enumerate()
-        .filter(|(r, _)| units_of.get(*r).copied().unwrap_or(0) == unit)
-        .map(|(_, region)| region.clone())
-        .collect()
-}
-
-#[allow(clippy::too_many_arguments)]
-fn axis_plan(
-    axis: RowAxis,
-    trace: &Trace,
-    regions: &[Region],
-    units_of: &[u32],
-    units: &[RowAxis],
-    classes: &ClassTable,
-    budgets: &Budgets,
-    profile: &DeviceProfile,
-) -> Option<AxisPlan> {
-    let ladder = budgets.ladder(axis)?;
-    if !units.contains(&axis) {
-        return None;
-    }
-    let on_axis = regions_on(regions, units_of, units, axis);
-    let (order, fallback) = layout::seriate(
-        trace,
-        &on_axis,
-        classes,
-        ladder.buckets,
-        ladder.max_rows,
-        profile,
-    );
-    Some(AxisPlan {
-        axis,
-        order,
-        fallback,
-    })
+    let analysis = analysis::analyze(trace)?;
+    temporal::plan(trace, analysis, budgets, profile)
 }
 
 fn accept(trace: &Trace, budgets: &Budgets, profile: &DeviceProfile) -> Result<(), Error> {
@@ -345,39 +188,6 @@ const LADDER_WORDS: poem_ir::PerAxis<LadderWords> = poem_ir::PerAxis::new([
         past_ceiling: "list a voxel bucket past the voxel ceiling",
     },
 ]);
-
-fn struct_readers_share_one_window(trace: &Trace, classes: &ClassTable) -> Result<(), Error> {
-    let structs: Vec<bool> = trace
-        .values
-        .iter()
-        .map(|value| matches!(value.ty, Ty::Struct(_)))
-        .collect();
-
-    let mut inputs = Vec::new();
-    for (at, node) in trace.nodes.iter().enumerate() {
-        inputs.clear();
-        node.op.inputs(&mut inputs);
-        for &read in &inputs {
-            if !structs.get(read.0 as usize).copied().unwrap_or(false) {
-                continue;
-            }
-            let Some(Def::Op(built_by)) = trace.values.get(read.0 as usize).map(|v| &v.def) else {
-                continue;
-            };
-            let planned = &classes.node_mask[*built_by as usize];
-            let reader = &classes.node_mask[at];
-            if planned != reader {
-                return Err(Error::Straddled {
-                    value: read,
-                    node: at as u32,
-                    planned: planned.iter().collect(),
-                    consumed: reader.iter().collect(),
-                });
-            }
-        }
-    }
-    Ok(())
-}
 
 #[must_use]
 pub fn collectives(trace: &Trace) -> Vec<u32> {

@@ -1,0 +1,192 @@
+{
+ "attn": {
+  "global_head_dim": 16,
+  "head_dim": 8,
+  "kv_heads": 1,
+  "output_gate": false,
+  "q_heads": 4,
+  "qk_norm": true,
+  "sinks": false
+ },
+ "gdn": null,
+ "head": {
+  "final_softcap": 30.0,
+  "tied": true
+ },
+ "hidden": 24,
+ "layers": [
+  {
+   "Sliding": {
+    "window": 16
+   }
+  },
+  {
+   "Sliding": {
+    "window": 16
+   }
+  },
+  {
+   "Sliding": {
+    "window": 16
+   }
+  },
+  {
+   "Sliding": {
+    "window": 16
+   }
+  },
+  "Global",
+  {
+   "Sliding": {
+    "window": 16
+   }
+  },
+  {
+   "Sliding": {
+    "window": 16
+   }
+  },
+  {
+   "Sliding": {
+    "window": 16
+   }
+  },
+  {
+   "Sliding": {
+    "window": 16
+   }
+  },
+  "Global",
+  {
+   "Sliding": {
+    "window": 16
+   }
+  },
+  {
+   "Sliding": {
+    "window": 16
+   }
+  },
+  {
+   "Sliding": {
+    "window": 16
+   }
+  },
+  {
+   "Sliding": {
+    "window": 16
+   }
+  },
+  "Global",
+  {
+   "SharedKv": {
+    "from": 13,
+    "sliding": true
+   }
+  },
+  {
+   "SharedKv": {
+    "from": 13,
+    "sliding": true
+   }
+  },
+  {
+   "SharedKv": {
+    "from": 13,
+    "sliding": true
+   }
+  },
+  {
+   "SharedKv": {
+    "from": 13,
+    "sliding": true
+   }
+  },
+  {
+   "SharedKv": {
+    "from": 14,
+    "sliding": false
+   }
+  },
+  {
+   "SharedKv": {
+    "from": 13,
+    "sliding": true
+   }
+  },
+  {
+   "SharedKv": {
+    "from": 13,
+    "sliding": true
+   }
+  },
+  {
+   "SharedKv": {
+    "from": 13,
+    "sliding": true
+   }
+  },
+  {
+   "SharedKv": {
+    "from": 13,
+    "sliding": true
+   }
+  },
+  {
+   "SharedKv": {
+    "from": 14,
+    "sliding": false
+   }
+  }
+ ],
+ "mlp": {
+  "act": "GeluTanh",
+  "intermediate": 32,
+  "layer_widths": [
+   32,
+   32,
+   32,
+   32,
+   32,
+   32,
+   32,
+   32,
+   32,
+   32,
+   32,
+   32,
+   32,
+   32,
+   32,
+   64,
+   64,
+   64,
+   64,
+   64,
+   64,
+   64,
+   64,
+   64,
+   64
+  ]
+ },
+ "moe": null,
+ "norm": {
+  "eps": 1e-06,
+  "sandwich": true,
+  "unit_offset": false
+ },
+ "ple": {
+  "width": 8
+ },
+ "rope": {
+  "global": {
+   "rotary_dims": 4,
+   "span": 8,
+   "theta": 1000000.0
+  },
+  "rotary_dims": 8,
+  "theta": 10000.0
+ },
+ "vocab": 512
+}

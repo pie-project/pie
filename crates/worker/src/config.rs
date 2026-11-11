@@ -95,11 +95,21 @@ impl Config {
         }
     }
 
+    /// The most `[runtime] frame_dispatch_depth` an engine kind takes: a
+    /// staging ring's bound ([`Runahead::MAX_FRAMES`]), or for the cerebras
+    /// engine, which posts frames to a host queue, [`Runahead::UNSTAGED_MAX_FRAMES`].
+    fn max_frames(kind: EngineKind) -> u8 {
+        match kind {
+            EngineKind::Cerebras => Runahead::UNSTAGED_MAX_FRAMES,
+            _ => Runahead::MAX_FRAMES,
+        }
+    }
+
     pub fn validate(&self) -> Result<()> {
         self.model.validate()?;
         self.engine.validate()?;
         self.server.validate()?;
-        self.runtime.validate()?;
+        self.runtime.validate(Self::max_frames(self.engine.kind))?;
         self.sandbox.validate()?;
         self.cluster.validate()?;
         self.offload.validate()?;
@@ -912,7 +922,7 @@ impl Default for RuntimeConfig {
 }
 
 impl RuntimeConfig {
-    fn validate(&self) -> Result<()> {
+    fn validate(&self, max_frames: u8) -> Result<()> {
         ensure!(
             self.submit_deadline.as_micros() > 0,
             "runtime.submit_deadline must be > 0"
@@ -941,12 +951,13 @@ impl RuntimeConfig {
             self.frame_size
         );
         ensure!(
-            self.frame_dispatch_depth <= u32::from(Runahead::MAX_FRAMES),
-            "runtime.frame_dispatch_depth must be at most {} (got {}): the engine \
-             publishes its staging ring's free set as one 64-bit word, and \
-             `frames_in_flight * {} + 1` must fit in it \
-             (`engine::runahead::Runahead::MAX_FRAMES`)",
-            Runahead::MAX_FRAMES,
+            self.frame_dispatch_depth <= u32::from(max_frames),
+            "runtime.frame_dispatch_depth must be at most {} (got {}) on this engine: \
+             an engine with a staging ring publishes its free set as one 64-bit \
+             word, and `frames_in_flight * {} + 1` must fit in it \
+             (`engine::runahead::Runahead::MAX_FRAMES`; the cerebras engine, \
+             which has none, takes up to `Runahead::UNSTAGED_MAX_FRAMES`)",
+            max_frames,
             self.frame_dispatch_depth,
             Runahead::STEPS_MAX
         );
@@ -1191,6 +1202,30 @@ device = ["metal:0"]
         adapters_are_absent_by_default_and_that_is_zero_seats();
         the_seat_count_is_stated_once_or_derived_from_the_roster();
         an_adapter_past_its_seats_or_on_a_relative_path_is_refused_by_name();
+        the_dispatch_depth_is_bounded_by_the_engine_kind();
+    }
+
+    /// A staged engine keeps the 64-bit ring's 15 frames; only the cerebras
+    /// shell, which posts frames to a host queue, takes more.
+    fn the_dispatch_depth_is_bounded_by_the_engine_kind() {
+        for (depth, ok) in [(15, true), (16, false)] {
+            let toml = format!("{MINIMAL_METAL}\n[runtime]\nframe_dispatch_depth = {depth}\n");
+            let cfg: Config = toml::from_str(&toml).unwrap();
+            assert_eq!(cfg.validate().is_ok(), ok, "metal at depth {depth}");
+        }
+        assert_eq!(
+            Config::max_frames(EngineKind::Cerebras),
+            Runahead::UNSTAGED_MAX_FRAMES
+        );
+        for kind in [
+            EngineKind::Cuda,
+            EngineKind::Metal,
+            EngineKind::Vulkan,
+            EngineKind::Wgpu,
+            EngineKind::Xla,
+        ] {
+            assert_eq!(Config::max_frames(kind), Runahead::MAX_FRAMES, "{kind:?}");
+        }
     }
 
     fn an_unknown_key_is_refused() {

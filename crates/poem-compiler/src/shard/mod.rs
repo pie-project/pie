@@ -74,10 +74,76 @@ pub fn shard(trace: Trace, world: u32) -> Result<Trace, Unshardable> {
         return Ok(trace);
     }
     let name = trace.name.clone();
-    Pass::new(trace, world).run().map_err(|why| Unshardable {
+    let unshardable = |why| Unshardable {
+        trace: name.clone(),
+        world,
+        why,
+    };
+    let mut pass = Pass::new(trace, world);
+    pass.propagate().map_err(unshardable)?;
+    pass.finish().map_err(unshardable)
+}
+
+/// How a value is held across the ranks.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Held {
+    Whole,
+    /// Split along the last axis in blocks of (width, parts): each block cut
+    /// `parts` ways on its own.
+    Split(Vec<(u64, u64)>),
+    /// Each rank holds one term of a sum.
+    Partial,
+}
+
+/// What [`shard`] decides of a trace without rewriting it: how the ranks
+/// hold each of its values, and the collectives a split or partial value
+/// needs, each after the node that makes the value.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Distribution {
+    pub world: u32,
+    /// By value id of the input trace.
+    pub held: Vec<Held>,
+    /// (the node it follows, the collective), in node order.
+    pub collectives: Vec<(u32, Collective)>,
+}
+
+/// The distribution of `trace` across `world` ranks: [`shard`]'s inference,
+/// for a backend that places the split values itself instead of running one
+/// trace a rank.
+pub fn distribution(trace: Trace, world: u32) -> Result<Distribution, Unshardable> {
+    let name = trace.name.clone();
+    let values = trace.values.len();
+    let mut pass = Pass::new(trace, world);
+    pass.propagate().map_err(|why| Unshardable {
         trace: name,
         world,
         why,
+    })?;
+    let held = pass.dists[..values]
+        .iter()
+        .map(|d| match d {
+            None | Some(Dist::Whole) => Held::Whole,
+            Some(Dist::Partial) => Held::Partial,
+            Some(Dist::Split(blocks)) => {
+                Held::Split(blocks.iter().map(|b| (b.width, b.parts)).collect())
+            }
+        })
+        .collect();
+    let collectives = pass
+        .after
+        .iter()
+        .enumerate()
+        .flat_map(|(at, nodes)| {
+            nodes.iter().filter_map(move |node| match &node.op {
+                Operation::Collective(c) => Some((at as u32, c.clone())),
+                _ => None,
+            })
+        })
+        .collect();
+    Ok(Distribution {
+        world,
+        held,
+        collectives,
     })
 }
 
@@ -110,13 +176,15 @@ impl Pass {
         }
     }
 
-    fn run(mut self) -> Result<Trace, String> {
+    /// Each value's distribution, and the ops and collectives the rules land
+    /// around each node; the trace itself is not yet rewritten ([`Pass::finish`]).
+    fn propagate(&mut self) -> Result<(), String> {
         for at in 0..self.trace.nodes.len() {
             let node = self.trace.nodes[at].clone();
             if matches!(node.op, Operation::Collective(_)) {
                 return Err("the trace already states a collective".into());
             }
-            let (op, outs) = rules::apply(&mut self, &node.op)?;
+            let (op, outs) = rules::apply(self, &node.op)?;
             let mut ids = Vec::new();
             op.outputs(&mut ids);
             for (id, dist) in ids.into_iter().zip(outs) {
@@ -146,7 +214,12 @@ impl Pass {
                 *v = id;
             }
         }
-        self.finish()
+        for v in 0..self.trace.values.len() {
+            if matches!(self.trace.values[v].def, Def::Merge(_)) {
+                self.dists[v] = Some(self.dist(ValueId(v as u32))?);
+            }
+        }
+        Ok(())
     }
 
     fn dist(&self, v: ValueId) -> Result<Dist, String> {
@@ -343,12 +416,9 @@ impl Pass {
         Ok(out)
     }
 
+    /// The trace one rank runs: the rewritten nodes with the ops and
+    /// collectives [`Pass::propagate`] landed, the cut params at a rank's share.
     fn finish(mut self) -> Result<Trace, String> {
-        for v in 0..self.trace.values.len() {
-            if matches!(self.trace.values[v].def, Def::Merge(_)) {
-                self.dists[v] = Some(self.dist(ValueId(v as u32))?);
-            }
-        }
         let before = self.trace.nodes.len();
         let mut nodes = Vec::with_capacity(before);
         let mut landed = vec![0u32; before];
