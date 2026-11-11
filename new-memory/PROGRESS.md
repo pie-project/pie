@@ -1123,3 +1123,11 @@ The `new-memory/` directory is bookkeeping and is removed before anything lands 
   adds main's new Cerebras options. Build matrix clean; worker / engine-cerebras lib tests pass.
 - Cerebras north-star follow-up (A8 replaced): multi-sequence on-wafer kv as a real shared pool (segments, evacuate),
   host / disk tiers, record copies, weight streaming. Needs the backend's owner / hardware.
+
+### M88 — 2026-11-11: XLA decode at or above base (TPU session)
+- `sc/xla-tpu` (6822f26f5, 9c0a12282, d63a5cc97): main's decode page-copy kernel pool-native; the prefill's older
+  pages by one DMA call with PageMap / sink / clamp in the kernel; decode kv rows for both planes in one block
+  scatter. qwen3-0.6b c64 18.0k (base 16.5k), c256 22.6k (base 20.8k). New gate a_wide_decode_of_many_lanes bitwise.
+- Open: qwen3 prefill 2048 -5% (pooled append kernel's in-VMEM [16,1024]<->[128,128] relayout, inherent to packed
+  rows for w > 128); MoE c1 -3% (device time equal or lower; host runs ahead less — donated-pool wait suspected).
+- Merge fix: kernels-xla test Shape initializers gain `pooled: None`.
