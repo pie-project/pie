@@ -371,7 +371,12 @@ impl Engine for Metal {
                 &poem_compiler::Budgets::of(bake_budgets(&budgets, &trace)),
             )
             .map_err(fault)?;
-            crate::store::streamed::resident_demand(&trace, &recipe, &planes)
+            crate::store::streamed::resident_demand(
+                &trace,
+                &recipe,
+                &planes,
+                crate::experts::rows_streamed(residency.weights_held),
+            )
         } else {
             (
                 planes

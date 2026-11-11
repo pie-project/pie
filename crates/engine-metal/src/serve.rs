@@ -367,8 +367,9 @@ impl Shell {
         weights: &mut Weights,
         trace: &Trace,
         recipe: &poem_compiler::chunk::ChunkRecipe,
+        rows: bool,
     ) -> Result<Vec<crate::store::streamed::Cache>> {
-        let shapes = crate::store::streamed::Shape::of(trace, recipe);
+        let shapes = crate::store::streamed::Shape::of(trace, recipe, rows);
         if shapes.is_empty() || !device.hold_resident(std::iter::empty(), true)? {
             return Ok(Vec::new());
         }
@@ -750,7 +751,14 @@ impl PreparedLoad<'_> {
         let weight_caches = if boot.residency.whole_weights() {
             Vec::new()
         } else {
-            Shell::weight_caches(&device, &handles, &mut weights, &boot.trace, &recipe)?
+            Shell::weight_caches(
+                &device,
+                &handles,
+                &mut weights,
+                &boot.trace,
+                &recipe,
+                boot.residency.rows_streamed(),
+            )?
         };
         // A weight kept apart that no cache takes is read whole, in place.
         let claimed: std::collections::BTreeSet<usize> = weight_caches
