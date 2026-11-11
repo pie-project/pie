@@ -9,7 +9,7 @@
 //! `PIE_XLA_POOL_DMA=0` keeps blocks on the XLA path (off a TPU).
 
 use crate::hlo::{Built, Elem, Func, Val};
-use crate::mosaic::{Body, Grid, ICmp, Kernel, MTy, Operand, Sem, V, Window};
+use crate::mosaic::{Body, Grid, ICmp, Kernel, MTy, Operand, Sem, Space, V, Window};
 
 /// Whether pool blocks go by DMA.
 #[must_use]
@@ -99,6 +99,21 @@ fn gather_planes(
     // tiles of the element (a 2-row bf16 block hangs it)
     let whole_tiles = planes.iter().all(|&(nr, _)| (nr * k) % (8 * k) == 0);
     let np = planes.len() as i64;
+    // A sink page lands from a zeroed VMEM block: every absent page of a
+    // fire names the one sink page, and as many copies of one HBM page as
+    // there are absent pages serialize (v6e: a fresh prompt's 32 sink pages,
+    // 11.8 us a layer). A reader masks the sink's rows to weight 0, which
+    // any finite rows (the sink page's, or zeros) leave bit for bit alike.
+    let zero_rows = planes
+        .iter()
+        .filter(|(_, p)| p.is_some())
+        .map(|&(nr, _)| nr * k)
+        .max()
+        .filter(|_| elem.is_float());
+    let mut scratch = vec![MTy::Sem(vec![np])];
+    if let Some(r) = zero_rows {
+        scratch.push(MTy::Ref(vec![r, 128], elem, Space::Vmem));
+    }
     let kern = Kernel {
         name: "pool_gather".into(),
         grid: vec![1],
@@ -111,12 +126,20 @@ fn gather_planes(
             .collect(),
         // DMA only: no VMEM of its own, so none held from XLA's placement
         // (the compiler's default scope would be)
-        vmem_limit: Some(VMEM),
-        scratch: vec![MTy::Sem(vec![np])],
+        vmem_limit: Some(VMEM + zero_rows.map_or(0, |r| u64::try_from(r * 128 * 4).unwrap_or(0))),
+        scratch,
     };
     let c = kern.build(|bd, blk| {
         let ids = blk.grid.prefetch[0];
         let src = bd.ref_bitcast(blk.ins[0], elem)?;
+        let zeros = match zero_rows {
+            Some(r) => {
+                let z = bd.splat_f(&[r, 128], elem, 0.0)?;
+                bd.vstore_all(z, blk.scratch[1])?;
+                Some(blk.scratch[1])
+            }
+            None => None,
+        };
         let n = bd.i32(b);
         let one = bd.i32(1);
         let z = bd.i32(0);
@@ -162,10 +185,26 @@ fn gather_planes(
                 let s = bd.ref_slice(src, &[from, z], &[er, 128])?;
                 let d = bd.ref_slice(blk.outs[x], &[to, z], &[er, 128])?;
                 let sem = sem_of(bd, x as i64)?;
-                if wait {
-                    bd.dma_wait(sem, s, d)?;
-                } else {
-                    bd.dma_start(s, d, sem)?;
+                let go = |bd: &mut Body, s: V| -> Built<()> {
+                    if wait {
+                        bd.dma_wait(sem, s, d)
+                    } else {
+                        bd.dma_start(s, d, sem)
+                    }
+                };
+                match (paged, zeros) {
+                    (Some(_), Some(zr)) => {
+                        let sv = bd.i32(i64::from(SINK));
+                        let sunk = bd.cmpi(ICmp::Eq, raw, sv)?;
+                        let real = bd.cmpi(ICmp::Ne, raw, sv)?;
+                        bd.when(real, |bd| go(bd, s))?;
+                        bd.when(sunk, |bd| {
+                            let z = bd.i32(0);
+                            let zs = bd.ref_slice(zr, &[z, z], &[er, 128])?;
+                            go(bd, zs)
+                        })?;
+                    }
+                    _ => go(bd, s)?,
                 }
             }
             Ok(())
