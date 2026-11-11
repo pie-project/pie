@@ -112,23 +112,11 @@ impl Chunks {
         self.range.segment_bytes_committed()
     }
 
-    /// The bytes a flat range allocated before any segment was committed
-    /// (the activation's first hold allocates every chunk at once) that
-    /// [`Chunks::reshape`] gives back: all of them but the activation's
-    /// span, which it holds again. Nothing for a mapped range, whose
-    /// backing is its committed segments and held span alone.
+    /// Every byte the range has backed: its committed segments and held
+    /// spans, or, a flat range once allocated, all of it.
     #[must_use]
-    pub fn reclaimable_bytes(&self) -> u64 {
-        if crate::device::elastic::mapped_on_demand() || !self.fresh() {
-            return 0;
-        }
-        let unit = self.range.map_unit().max(1);
-        let held = self
-            .range
-            .held(u64::from(self.total) * self.layout.chunk_bytes)
-            .div_ceil(unit)
-            .saturating_mul(unit);
-        self.range.committed_bytes().saturating_sub(held)
+    pub fn backed_bytes(&self) -> u64 {
+        self.range.committed_bytes()
     }
 
     /// The unit the range is backed in.
@@ -141,6 +129,12 @@ impl Chunks {
     #[must_use]
     pub fn act_chunks(&self) -> u32 {
         self.act
+    }
+
+    /// The bytes of the activation's span under the range's end.
+    #[must_use]
+    pub fn activation_bytes(&self) -> u64 {
+        u64::from(self.act) * self.layout.chunk_bytes
     }
 
     /// The bytes of the activation's span not yet held backed: what a

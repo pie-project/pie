@@ -1146,25 +1146,28 @@ impl Pools {
         settled: bool,
         resident: &dyn core::fmt::Display,
     ) -> Result<Fitted> {
-        // A flat range allocated whole before the fit is the pool's to
-        // reshape: its bytes count as room, less the activation it keeps.
-        // Until the activation is settled, its span a fire has not yet
-        // backed is the card's too: counted as room, the cache rows would
-        // take it, and the first fire's activation then the room held for
-        // the bodies (a flat range allocates its chunks and that span at
-        // once). Once settled, what no fire backed is no fire's, and the
-        // cache rows take it.
-        let unheld = if settled {
-            0
+        // The room is what the card has free plus every byte the range has
+        // backed (its committed segments and held spans; a flat range, once
+        // allocated, the whole of it: the chunks the kv rows have not yet
+        // taken are backed too, and so not free), less the activation the
+        // cache rows never take. Until the activation is settled that is its
+        // whole span, held or still to be (the first fire's activation, and
+        // the room held for the bodies, must find it); once settled (every
+        // composition armed, the activation at its high water), only the
+        // span a fire backed: what no fire backed is no fire's, and the cache
+        // rows take it.
+        let activation = if settled {
+            self.chunks
+                .activation_bytes()
+                .saturating_sub(self.chunks.activation_unheld_bytes())
         } else {
-            self.chunks.activation_unheld_bytes()
+            self.chunks.activation_bytes()
         };
         let live = self
             .pool
             .spare_bytes(0)?
-            .saturating_add(self.committed_bytes())
-            .saturating_add(self.chunks.reclaimable_bytes())
-            .saturating_sub(unheld);
+            .saturating_add(self.chunks.backed_bytes())
+            .saturating_sub(activation);
         let layout = self.chunks.layout();
         let chunk = layout.chunk_bytes;
         // One working set at the declared context beside the null chunk:
