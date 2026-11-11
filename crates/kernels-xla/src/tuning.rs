@@ -61,6 +61,14 @@ pub struct MoeGmmTm(pub u32);
 #[decision(id = "kernel.moe.gmm_run", constant(set(1, 2, 4, 8)), default = 1, tune = search)]
 pub struct MoeGmmRun(pub u32);
 
+/// The fewest tokens a fire holds for its routed MLP's grouped matmuls to
+/// take `kernel.moe.gmm_run` tiles a step: below them a step takes one (v5e:
+/// Gemma-4-26B-A4B's 32-expert cut at 640 tokens 838 -> 862 us at two a
+/// step, at 1024 984 -> 965).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Decision)]
+#[decision(id = "kernel.moe.gmm_run_from", constant(range(0..=8192)), default = 0, tune = search)]
+pub struct MoeGmmRunFrom(pub u32);
+
 /// Weight bytes one block of the grouped-matmul kernel holds, in MiB (two
 /// are in flight, plus a bf16 copy): bigger blocks take fewer DMA steps and
 /// more VMEM.
@@ -218,6 +226,7 @@ pub fn register(registry: &mut Registry) {
         .add::<MoeLoopTileMax>()
         .add::<MoeGmmTm>()
         .add::<MoeGmmRun>()
+        .add::<MoeGmmRunFrom>()
         .add::<MoeGmmBlockMib>()
         .add::<MoeSegmentTokens>()
         .add::<MoeSegmentFrom>()
@@ -302,6 +311,7 @@ pub struct Tuning {
     pub moe_loop_tile_max: i64,
     pub moe_gmm_tm: i64,
     pub moe_gmm_run: i64,
+    pub moe_gmm_run_from: i64,
     pub moe_gmm_block_bytes: i64,
     pub moe_segment_tokens: i64,
     pub moe_segment_from: i64,
@@ -325,6 +335,7 @@ impl Tuning {
         moe_loop_tile_max: 128,
         moe_gmm_tm: 16,
         moe_gmm_run: 1,
+        moe_gmm_run_from: 0,
         moe_gmm_block_bytes: 12 << 20,
         moe_segment_tokens: 0,
         moe_segment_from: 1024,
@@ -372,6 +383,7 @@ impl Tuning {
             moe_loop_tile_max: n(profile.get::<MoeLoopTileMax>().0),
             moe_gmm_tm: n(profile.get::<MoeGmmTm>().0),
             moe_gmm_run: n(profile.get::<MoeGmmRun>().0),
+            moe_gmm_run_from: n(profile.get::<MoeGmmRunFrom>().0),
             moe_gmm_block_bytes: n(profile.get::<MoeGmmBlockMib>().0) << 20,
             moe_segment_tokens: n(profile.get::<MoeSegmentTokens>().0),
             moe_segment_from: n(profile.get::<MoeSegmentFrom>().0),
