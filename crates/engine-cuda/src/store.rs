@@ -3113,10 +3113,13 @@ impl Pools {
                 have: 0,
             });
         };
-        tier.back(
-            refs.iter().map(|&slot| slot / per_chunk),
-            "chunks of the host tier",
-        )?;
+        if let Some(&slot) = refs.iter().find(|&&slot| slot / per_chunk >= tier.chunks()) {
+            return Err(Fault::Ceiling {
+                what: "chunks of the host tier",
+                need: u64::from(slot / per_chunk) + 1,
+                have: u64::from(tier.chunks()),
+            });
+        }
         Ok((
             bytes,
             refs.iter()
@@ -3136,13 +3139,10 @@ impl Pools {
         for (shape, refs) in slots {
             let (bytes, places) = self.tier_places(*shape, refs)?;
             let tier = self.tier.as_ref().expect("backed above");
+            let chunk_bytes = tier.chunk_bytes();
             for (chunk, offset) in places {
-                let (pinned, at) = tier.place(chunk, 0).expect("backed above");
-                out.extend_from_slice(pinned.view(at + offset, bytes).ok_or(Fault::Ceiling {
-                    what: "bytes of a host tier chunk",
-                    need: at + offset + bytes,
-                    have: 0,
-                })?);
+                let len = usize::try_from(bytes).unwrap_or(usize::MAX);
+                out.extend_from_slice(tier.slice(u64::from(chunk) * chunk_bytes + offset, len)?);
             }
         }
         Ok(out)
@@ -3170,18 +3170,12 @@ impl Pools {
             });
         }
         let tier = self.tier.as_ref().expect("backed above");
+        let chunk_bytes = tier.chunk_bytes();
         let mut from = 0usize;
         for ((chunk, offset), len) in spans {
-            let (pinned, at) = tier.place(chunk, 0).expect("backed above");
             let len = usize::try_from(len).unwrap_or(usize::MAX);
-            let at = usize::try_from(at + offset).unwrap_or(usize::MAX);
-            if !pinned.write(at, &bytes[from..from + len]) {
-                return Err(Fault::Ceiling {
-                    what: "bytes of a host tier chunk",
-                    need: (at + len) as u64,
-                    have: 0,
-                });
-            }
+            tier.slice(u64::from(chunk) * chunk_bytes + offset, len)?
+                .copy_from_slice(&bytes[from..from + len]);
             from += len;
         }
         Ok(())

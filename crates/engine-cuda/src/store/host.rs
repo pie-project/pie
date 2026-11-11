@@ -165,6 +165,11 @@ impl HostTier {
         self.chunks
     }
 
+    #[must_use]
+    pub fn chunk_bytes(&self) -> u64 {
+        self.chunk_bytes
+    }
+
     /// Bytes of ring `len` bytes may take, waiting for earlier batches to
     /// land where it is full; `flush` sends what the caller has gathered
     /// first, since what it waits for may be that.
