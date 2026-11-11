@@ -2599,10 +2599,8 @@ fn append_pool_planes(
         || w % 256 != 0
         || f.elem(k.val) != Elem::Bf16
         || f.elem(v.val) != Elem::Bf16
-        || i64::from(n) < PAGE_WRITE_ROWS
         || ps < 8
         || slots % ps != 0
-        || i64::from(n) % ps != 0
         || maps.iter().any(|m| m.stride <= 0 || m.offset < 0)
     {
         return Ok(None);
@@ -2610,6 +2608,35 @@ fn append_pool_planes(
     let (n64, all) = (i64::from(n), slots / ps);
     let page = read_rows_i32(f, op, write_page, n)?;
     let off = read_rows_i32(f, op, write_offset, n)?;
+    let dims_owned = f.dims(keys.val).to_vec();
+    let dims: &[i64] = &dims_owned;
+    let srcs = [k.val, v.val];
+    let token_rows = w * 2 / 512;
+    let rows_into = move |f: &mut Func| -> Built<Vec<Val>> {
+        pool_rows(
+            f,
+            pool,
+            [maps[0], maps[1]],
+            srcs,
+            page,
+            off,
+            ps,
+            all,
+            slots,
+            w,
+            token_rows,
+            dims,
+        )
+    };
+    // A short fire (a decode's): every row by itself, both planes' rows in
+    // one block scatter (no runs, no case).
+    if n64 < PAGE_WRITE_ROWS || n64 % ps != 0 {
+        let done = rows_into(f)?[0];
+        return Ok(Some(vec![
+            rebase(f, keys.val, done)?,
+            rebase(f, values.val, done)?,
+        ]));
+    }
     // slot pages every plane holds whole
     let bound = maps
         .iter()
@@ -2623,10 +2650,6 @@ fn append_pool_planes(
     let which = with_i(f, skip, 1, Func::add)?;
     let which = f.mul(which, runs.ok)?;
     let (mk, mv) = (maps[0], maps[1]);
-    let dims_owned = f.dims(keys.val).to_vec();
-    let dims: &[i64] = &dims_owned;
-    let srcs = [k.val, v.val];
-    let token_rows = w * 2 / 512;
     let page_rows = ps * token_rows;
     // a plane's runs at its own pages
     let mapped = |f: &mut Func, m: PageMap| -> Built<Runs> {
@@ -2635,32 +2658,7 @@ fn append_pool_planes(
             ..runs
         })
     };
-    let rows: crate::hlo::Branch<'_> = Box::new(move |f: &mut Func| {
-        // every row by itself: both planes' rows in one block scatter
-        let mut ids = Vec::with_capacity(2);
-        for (x, m) in [mk, mv].into_iter().enumerate() {
-            let p = m.apply(f, page)?;
-            let a = cmp_i(f, Cmp::Ge, p, 0)?;
-            let b = cmp_i(f, Cmp::Lt, p, all)?;
-            let c = cmp_i(f, Cmp::Ge, off, 0)?;
-            let d = cmp_i(f, Cmp::Lt, off, ps)?;
-            let ok = f.and(a, b)?;
-            let ok = f.and(ok, c)?;
-            let ok = f.and(ok, d)?;
-            let r = with_i(f, p, ps, Func::mul)?;
-            let r = f.add(r, off)?;
-            // a dropped row past every block
-            let far = f.like_i(r, slots + n64 * x as i64);
-            let io = f.iota(Elem::I32, &[n64], 0);
-            let far = f.add(far, io)?;
-            ids.push(f.select(ok, r, far)?);
-        }
-        let ids = f.concat(&ids, 0)?;
-        let ups = f.concat(&srcs, 0)?;
-        let ups = f.reshape(ups, &[2 * n64 * w / 128, 128])?;
-        let laid = crate::blocks::scatter(f, pool, ids, ups, token_rows)?;
-        Ok(vec![f.pool_view(laid, Elem::Bf16, dims)?])
-    });
+    let rows: crate::hlo::Branch<'_> = Box::new(move |f: &mut Func| rows_into(f));
     let by_pages_owned = move |f: &mut Func, cap: Option<i64>| -> Built<Vec<Val>> {
         // whole pages: both planes' pages in one block scatter
         let mut ids = Vec::with_capacity(2);
@@ -2714,6 +2712,50 @@ fn append_pool_planes(
         rebase(f, keys.val, done)?,
         rebase(f, values.val, done)?,
     ]))
+}
+
+/// Both pool planes' rows, each by itself, as one block scatter: row `i` of
+/// plane `x` to page `maps[x](page[i])` at offset `off[i]` (a row whose
+/// page or offset is out of range dropped); the pool's new view.
+#[allow(clippy::too_many_arguments)]
+fn pool_rows(
+    f: &mut Func,
+    pool: Val,
+    maps: [PageMap; 2],
+    srcs: [Val; 2],
+    page: Val,
+    off: Val,
+    ps: i64,
+    all: i64,
+    slots: i64,
+    w: i64,
+    token_rows: i64,
+    dims: &[i64],
+) -> Built<Vec<Val>> {
+    let n64 = f.dims(page)[0];
+    let mut ids = Vec::with_capacity(2);
+    for (x, m) in maps.into_iter().enumerate() {
+        let p = m.apply(f, page)?;
+        let a = cmp_i(f, Cmp::Ge, p, 0)?;
+        let b = cmp_i(f, Cmp::Lt, p, all)?;
+        let c = cmp_i(f, Cmp::Ge, off, 0)?;
+        let d = cmp_i(f, Cmp::Lt, off, ps)?;
+        let ok = f.and(a, b)?;
+        let ok = f.and(ok, c)?;
+        let ok = f.and(ok, d)?;
+        let r = with_i(f, p, ps, Func::mul)?;
+        let r = f.add(r, off)?;
+        // a dropped row past every block
+        let far = f.like_i(r, slots + n64 * x as i64);
+        let io = f.iota(Elem::I32, &[n64], 0);
+        let far = f.add(far, io)?;
+        ids.push(f.select(ok, r, far)?);
+    }
+    let ids = f.concat(&ids, 0)?;
+    let ups = f.concat(&srcs, 0)?;
+    let ups = f.reshape(ups, &[2 * n64 * w / 128, 128])?;
+    let laid = crate::blocks::scatter(f, pool, ids, ups, token_rows)?;
+    Ok(vec![f.pool_view(laid, Elem::Bf16, dims)?])
 }
 
 /// `plane` (a view of the chunk pool) as a view of the pool `onto` (a view)
