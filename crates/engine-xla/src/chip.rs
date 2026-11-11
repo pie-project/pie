@@ -402,6 +402,7 @@ mod tests {
         want.moe_gmm_run = 4;
         want.moe_segment_tokens = 128;
         want.moe_gmm_glu = true;
+        want.moe_gmm_fuse_from = 1024;
         assert_eq!(
             kernels_xla::tuning::Tuning::on(&profile, Tpu::of("TPU v6 lite").vmem_bytes()),
             want

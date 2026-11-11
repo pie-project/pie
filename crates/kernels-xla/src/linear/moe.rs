@@ -2508,44 +2508,74 @@ pub fn experts(
         glu: Some(glu),
         ..up
     };
-    let hidden = if tuning.moe_gmm_glu
+    let glu_inside = tuning.moe_gmm_glu
         && up.tm >= 64
         && (intermediate % 128 == 0 || up.tm >= 128)
         && up.stepping()
         && up.orient == crate::linear::moe_gmm::Orient::NMajor
-        && inside.kernel().is_ok()
+        && inside.kernel().is_ok();
+    // Both legs in one kernel, the GLU rows staying in VMEM between them.
+    let fused = if glu_inside
+        && tuning.moe_gmm_fuse_from > 0
+        && t >= tuning.moe_gmm_fuse_from
+        && let Ok(kernel) = inside.mlp_kernel(&dn)
     {
         let wl = f.broadcast(ws, &[rows, 128], &[0])?;
         let st = steps(f, inside, &sorted)?;
-        let w = up_bank.codes.val();
-        inside.kernel()?.call(
-            f,
-            &[st[0], st[1], st[2], st[3], st[4], st[5], sorted.xs, w, wl],
-        )?[0]
+        let wu = up_bank.codes.val();
+        let wd = down_bank.codes.val();
+        let wd = match dn.orient {
+            crate::linear::moe_gmm::Orient::KMajor => f.transpose(wd, &[1, 0])?,
+            crate::linear::moe_gmm::Orient::NMajor => wd,
+        };
+        Some(
+            kernel.call(
+                f,
+                &[
+                    st[0], st[1], st[2], st[3], st[4], st[5], sorted.xs, wu, wl, wd,
+                ],
+            )?[0],
+        )
     } else {
-        let up_rows = tiles_of(f, up, &up_bank, &sorted, sorted.xs)?;
-        let held = Operand {
-            val: up_rows,
-            rows: rows as u32,
-            width: packed.width,
-            dtype: Dtype::Bf16,
-        };
-        let into = Landing {
-            rows: rows as u32,
-            width: intermediate,
-            dtype: Dtype::Bf16,
-        };
-        let hidden = match glu {
-            ExpertGlu::Swiglu => crate::linear::mlp::swiglu(f, held, intermediate, into)?,
-            ExpertGlu::GegluTanh => {
-                crate::linear::mlp::geglu_tanh_packed(f, held, intermediate, into)?
-            }
-        };
-        let wb = f.broadcast(ws, &[rows, i64::from(intermediate)], &[0])?;
-        let hidden = f.mul(hidden, wb)?;
-        f.convert(hidden, Elem::Bf16)
+        None
     };
-    let down_rows = tiles_of(f, dn, &down_bank, &sorted, hidden)?;
+    let down_rows = match fused {
+        Some(rows) => rows,
+        None => {
+            let hidden = if glu_inside {
+                let wl = f.broadcast(ws, &[rows, 128], &[0])?;
+                let st = steps(f, inside, &sorted)?;
+                let w = up_bank.codes.val();
+                inside.kernel()?.call(
+                    f,
+                    &[st[0], st[1], st[2], st[3], st[4], st[5], sorted.xs, w, wl],
+                )?[0]
+            } else {
+                let up_rows = tiles_of(f, up, &up_bank, &sorted, sorted.xs)?;
+                let held = Operand {
+                    val: up_rows,
+                    rows: rows as u32,
+                    width: packed.width,
+                    dtype: Dtype::Bf16,
+                };
+                let into = Landing {
+                    rows: rows as u32,
+                    width: intermediate,
+                    dtype: Dtype::Bf16,
+                };
+                let hidden = match glu {
+                    ExpertGlu::Swiglu => crate::linear::mlp::swiglu(f, held, intermediate, into)?,
+                    ExpertGlu::GegluTanh => {
+                        crate::linear::mlp::geglu_tanh_packed(f, held, intermediate, into)?
+                    }
+                };
+                let wb = f.broadcast(ws, &[rows, i64::from(intermediate)], &[0])?;
+                let hidden = f.mul(hidden, wb)?;
+                f.convert(hidden, Elem::Bf16)
+            };
+            tiles_of(f, dn, &down_bank, &sorted, hidden)?
+        }
+    };
     let n = i64::from(routed.width);
     // (A wide prompt's fire: a decode's lanes, and a fire of 640 rows, sum
     // by the one-hot dot, whose cells grow as the square of its tokens:
