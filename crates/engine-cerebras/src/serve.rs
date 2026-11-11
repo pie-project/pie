@@ -212,9 +212,6 @@ pub(crate) struct Deferred {
 pub struct Shell {
     handles: Handles,
     trace: Trace,
-    /// The shape every whole-fire program of this model follows, so they
-    /// are one program text (see `Shell::unified_of_texts`).
-    unified: Option<crate::fabric::Unified>,
     compiled: CompiledModel,
     budgets: Budgets,
     weights: Weights,
@@ -645,7 +642,6 @@ impl Shell {
             device,
             handles,
             trace: boot.trace,
-            unified: None,
             compiled,
             budgets,
             weights,

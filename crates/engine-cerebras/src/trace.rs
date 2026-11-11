@@ -259,13 +259,6 @@ impl<'h> Tracer<'h> {
         self
     }
 
-    /// The model-wide shape a whole-fire program follows (see
-    /// `crate::fabric::Unified`).
-    pub fn with_unified(self, unified: Option<crate::fabric::Unified>) -> Self {
-        self.state.borrow_mut().program.unified = unified;
-        self
-    }
-
     fn locate(&self, t: Tensor) -> Result<(u32, u32), kernels_cerebras::Error> {
         self.handles
             .locate(t.buf)

@@ -37,8 +37,8 @@ use render::reduce_mentions;
 
 pub use arena::{
     ARENA_CHUNK, MOVE_ROW_WORDS, MOVE_ROWS, MOVE_SCRATCH, OP_BROADCAST, OP_BROADCAST_FROM,
-    OP_GATHER, OP_HANDOFF, OP_NOP, OP_ON, OP_REDUCE, OP_ROOT, OPS_SLACK_WORDS, RowShape, Table,
-    TableOp, Unified, WORK_SLACK_WORDS, keep_layout, op_words, parse_global_table,
+    OP_GATHER, OP_HANDOFF, OP_NOP, OP_ON, OP_REDUCE, OP_ROOT, Table, TableOp, keep_layout,
+    op_words, parse_global_table,
 };
 
 pub use plan::Planner;
@@ -613,8 +613,6 @@ struct Device {
 /// A program under construction.
 #[derive(Debug, Default)]
 pub struct Program {
-    /// The model-wide shape a whole-fire program follows (see [`Unified`]).
-    pub unified: Option<Unified>,
     bufs: BTreeMap<String, Device>,
     scratch: Vec<(String, u64, &'static str)>,
     globals: Vec<String>,
@@ -1080,66 +1078,6 @@ mod tests {
         assert_eq!(r[0].manifest.rect, (2, 1));
     }
 
-    /// Two tables unite into one shape: every kernel, every kept export at
-    /// one slot, the larger work region, table and row.
-    #[test]
-    fn tables_unite_into_one_shape() {
-        let table = |kernels: &[Kernel], keep: &[(&str, u64)], work: u64, rows: u32, width: u32| {
-            let mut arena: Vec<(String, u64, u64)> = Vec::new();
-            let mut at = 0;
-            for (n, w) in keep {
-                arena.push((n.to_string(), at, *w));
-                at += w;
-            }
-            let keep_chunks = at.div_ceil(ARENA_CHUNK) as u32;
-            let base = u64::from(keep_chunks) * ARENA_CHUNK;
-            arena.push(("k_dummy".into(), base, 2));
-            Table {
-                kernels: kernels.to_vec(),
-                ops_words: width,
-                ops: Vec::new(),
-                arena,
-                arena_words: base + work,
-                keep_chunks,
-                rows,
-                move_rows: 0,
-                consts: Vec::new(),
-                phases: 1,
-            }
-        };
-        let a = table(
-            &[Kernel::Matmul, Kernel::Rmsnorm],
-            &[("b1", 4000), ("b2", 6000)],
-            3000,
-            20,
-            10,
-        );
-        let b = table(
-            &[Kernel::Rmsnorm, Kernel::Attend],
-            &[("b2", 6000), ("b3", 100)],
-            5000,
-            35,
-            12,
-        );
-        let u = Unified::union([&a, &b]);
-        assert_eq!(u.rows[0].kernels.len(), 3);
-        assert_eq!(
-            u.keep.iter().map(|(n, ..)| n.as_str()).collect::<Vec<_>>(),
-            ["b1", "b2", "b3"]
-        );
-        // b2 (6000) does not share b1's array (4000 + 6000 > 8192).
-        assert_eq!(u.keep[1].1, ARENA_CHUNK);
-        assert_eq!(u.keep_chunks, 2);
-        assert_eq!(
-            (u.rows[0].rows, u.rows[0].ops_words),
-            (35, 12 + OPS_SLACK_WORDS)
-        );
-        assert_eq!(
-            u.rows[0].arena_words,
-            2 * ARENA_CHUNK + 5000 + WORK_SLACK_WORDS
-        );
-    }
-
     #[test]
     fn a_rendered_program_exports_its_buffers_and_entry() {
         let mut p = Program::new();
@@ -1167,46 +1105,5 @@ mod tests {
         assert_eq!(words, vec![1, 1]);
         assert!(parse_global_table("const x = 3;").is_none());
         assert!(parse_global_table("var y = [2]i32 { 1 };").is_none());
-    }
-
-    #[test]
-    fn classes_split_alike_under_one_partition() {
-        let row = |phases: u32, kernels: &[Kernel]| Table {
-            kernels: kernels.to_vec(),
-            ops_words: 10,
-            ops: Vec::new(),
-            arena: vec![("k_dummy".into(), 0, 2)],
-            arena_words: 100,
-            keep_chunks: 0,
-            rows: 1,
-            move_rows: 0,
-            consts: Vec::new(),
-            phases,
-        };
-        let prefill = vec![
-            row(10, &[Kernel::Matmul]),
-            row(14, &[Kernel::Rmsnorm]),
-            row(13, &[Kernel::Attend]),
-        ];
-        let decode = vec![
-            row(20, &[Kernel::Matmul, Kernel::Delta]),
-            row(17, &[Kernel::Attend]),
-        ];
-        let p = Unified::partition(&[prefill.clone(), decode.clone()]).expect("same phase count");
-        assert_eq!(p.row_phases, Some(vec![10, 14, 13]));
-        assert!(p.rows.is_empty());
-        // Rows that do not match cannot unite; alike rows do, per row.
-        assert!(Unified::union_rows(&[prefill.clone(), decode]).is_none());
-        let decode = vec![
-            row(10, &[Kernel::Matmul, Kernel::Delta]),
-            row(14, &[Kernel::Rmsnorm]),
-            row(13, &[Kernel::Rope]),
-        ];
-        let u = Unified::union_rows(&[prefill, decode]).expect("alike");
-        assert_eq!(u.row_phases, Some(vec![10, 14, 13]));
-        assert_eq!(u.rows[0].kernels, vec![Kernel::Matmul, Kernel::Delta]);
-        assert_eq!(u.rows[2].kernels, vec![Kernel::Attend, Kernel::Rope]);
-        // A fire of another length has no shared partition.
-        assert!(Unified::partition(&[vec![row(5, &[])], vec![row(6, &[])]]).is_none());
     }
 }

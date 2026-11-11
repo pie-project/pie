@@ -1,6 +1,5 @@
 //! The table-driven form's data: a program's op rows and arena
-//! ([`Table`]), the opcodes, and the shape the classes of a model agree on
-//! so their whole-fire programs are one ([`Unified`]).
+//! ([`Table`]) and the opcodes.
 
 use super::*;
 
@@ -38,8 +37,7 @@ pub const MOVE_ROW_WORDS: u32 = 8;
 #[derive(Debug, Clone, PartialEq)]
 pub struct Table {
     pub kernels: Vec<Kernel>,
-    /// Words the op table holds (the rows, padded with zeros to a unified
-    /// capacity).
+    /// Words the op table holds.
     pub ops_words: u32,
     pub ops: Vec<TableOp>,
     /// Arena slots `(name, offset, words)` per PE: the exports (as laid
@@ -49,8 +47,7 @@ pub struct Table {
     /// The first `keep_chunks` arena arrays hold the kept exports alone:
     /// a resident server uploads them once and never reads them back.
     pub keep_chunks: u32,
-    /// Rows the table holds (`ops.len()` padded with no-ops to a unified
-    /// capacity).
+    /// Rows the table holds (`ops.len()`, at least one).
     pub rows: u32,
     /// The first `move_rows` rows are no-ops the host fills with the
     /// fire's page moves (kept pools).
@@ -131,43 +128,6 @@ impl Table {
     }
 }
 
-/// What every class of a model agrees on so their whole-fire programs are
-/// one program text (one compiled binary, one resident server whose kept
-/// arena outlives the fire classes): the partition of the fire into rows
-/// of PEs, the kept exports' slots (one layout over the whole rectangle,
-/// each slot an exported symbol the host uploads once), and per row the
-/// kernels dispatched, the arena's size, the table's capacity.
-#[derive(Debug, Clone, PartialEq, Default)]
-pub struct Unified {
-    /// Phases a row, when the classes' fires split alike (`None` leaves
-    /// each fire to its own fused groups: a single row, or a partition
-    /// still to be chosen).
-    pub row_phases: Option<Vec<usize>>,
-    /// Kept exports `(name, offset, words)`, in the arena's first arrays,
-    /// the same on every row.
-    pub keep: Vec<(String, u64, u64)>,
-    pub keep_chunks: u32,
-    /// Row by row (one for a single-row program); empty while only the
-    /// partition is fixed.
-    pub rows: Vec<RowShape>,
-}
-
-/// One row's shape under a unified whole fire.
-#[derive(Debug, Clone, PartialEq, Default)]
-pub struct RowShape {
-    pub kernels: Vec<Kernel>,
-    pub arena_words: u64,
-    pub rows: u32,
-    pub ops_words: u32,
-}
-
-/// Slack a unified shape adds over the probes' largest work region and op
-/// table, so a fire a little off the probes still renders under the shape
-/// (a fire the shape refuses falls back to its own programs and loses
-/// the kept pools).
-pub const WORK_SLACK_WORDS: u64 = 256;
-pub const OPS_SLACK_WORDS: u32 = 64;
-
 /// Lays kept slots `(name, words)` from the arena's start, each within one
 /// chunk: the slots and the chunks they take.
 #[must_use]
@@ -192,118 +152,6 @@ pub fn keep_layout(mut kept: Vec<(String, u64)>) -> (Vec<(String, u64, u64)>, u3
         at += words;
     }
     (placed, at.div_ceil(ARENA_CHUNK) as u32)
-}
-
-impl RowShape {
-    /// The union of several tables of one row: every kernel, the largest
-    /// work region, table and row.
-    pub fn union<'a>(tables: impl IntoIterator<Item = &'a Table>) -> RowShape {
-        let mut kernels: Vec<Kernel> = Vec::new();
-        let (mut work, mut rows, mut ops_words) = (0u64, 0u32, 0u32);
-        for t in tables {
-            for k in &t.kernels {
-                if !kernels.contains(k) {
-                    kernels.push(*k);
-                }
-            }
-            work = work.max(
-                t.arena_words
-                    .saturating_sub(u64::from(t.keep_chunks) * ARENA_CHUNK),
-            );
-            rows = rows.max(t.rows);
-            ops_words = ops_words.max(t.ops_words);
-        }
-        if keep_pools() && !kernels.contains(&Kernel::Copy) {
-            kernels.push(Kernel::Copy);
-        }
-        RowShape {
-            kernels,
-            // The work region's words, with slack: the first-fit liveness
-            // layout is not monotone in a fire's rows (a six-row prefill can
-            // need more words than an eight-row one), so a fire a little off
-            // the traced shapes still fits. The kept
-            // chunks are added once the shared kept layout is known.
-            arena_words: work + WORK_SLACK_WORDS,
-            rows,
-            ops_words: ops_words + OPS_SLACK_WORDS,
-        }
-    }
-}
-
-impl Unified {
-    /// The union of several single-row programs' tables.
-    pub fn union<'a>(tables: impl IntoIterator<Item = &'a Table>) -> Unified {
-        let tables: Vec<&Table> = tables.into_iter().collect();
-        let mut u = Unified {
-            row_phases: None,
-            keep: Vec::new(),
-            keep_chunks: 0,
-            rows: vec![RowShape::union(tables.iter().copied())],
-        };
-        u.unite_keep(tables.iter().copied());
-        u
-    }
-
-    /// The partition every class is to follow: that of the program with
-    /// the most rows, when every program runs the same number of phases
-    /// (`None` otherwise). A program is its rows' tables.
-    pub fn partition(programs: &[Vec<Table>]) -> Option<Unified> {
-        let phases = |p: &Vec<Table>| p.iter().map(|t| t.phases as usize).sum::<usize>();
-        let first = programs.first()?;
-        if programs.iter().any(|p| phases(p) != phases(first)) {
-            return None;
-        }
-        let widest = programs.iter().max_by_key(|p| p.len())?;
-        Some(Unified {
-            row_phases: Some(widest.iter().map(|t| t.phases as usize).collect()),
-            keep: Vec::new(),
-            keep_chunks: 0,
-            rows: Vec::new(),
-        })
-    }
-
-    /// The union of several programs that split alike (every program the
-    /// same rows of the same phase counts): a shape a row, one kept layout.
-    pub fn union_rows(programs: &[Vec<Table>]) -> Option<Unified> {
-        let first = programs.first()?;
-        let phases: Vec<usize> = first.iter().map(|t| t.phases as usize).collect();
-        if programs
-            .iter()
-            .any(|p| p.iter().map(|t| t.phases as usize).collect::<Vec<_>>() != phases)
-        {
-            return None;
-        }
-        let rows = (0..first.len())
-            .map(|g| RowShape::union(programs.iter().map(|p| &p[g])))
-            .collect();
-        let mut u = Unified {
-            row_phases: (first.len() > 1).then_some(phases),
-            keep: Vec::new(),
-            keep_chunks: 0,
-            rows,
-        };
-        u.unite_keep(programs.iter().flatten());
-        Some(u)
-    }
-
-    /// Lays every table's kept slots out once and puts the rows' work
-    /// regions after them.
-    fn unite_keep<'a>(&mut self, tables: impl IntoIterator<Item = &'a Table>) {
-        let mut kept: Vec<(String, u64)> = Vec::new();
-        for t in tables {
-            for (name, off, words) in &t.arena {
-                if t.keep_chunks > 0 && *off < u64::from(t.keep_chunks) * ARENA_CHUNK {
-                    kept.push((name.clone(), *words));
-                }
-            }
-        }
-        let (keep, keep_chunks) = keep_layout(kept);
-        self.keep = keep;
-        self.keep_chunks = keep_chunks;
-        for r in &mut self.rows {
-            r.arena_words += u64::from(keep_chunks) * ARENA_CHUNK;
-        }
-    }
 }
 
 /// One row of the op table.
