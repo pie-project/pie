@@ -2082,9 +2082,13 @@ pub fn attend_fresh(
                 && !matches!(planes, Planes::Paged { latent: true, .. })
                 && f.elem(keys) == Elem::Bf16
                 && f.elem(values) == Elem::Bf16
-                // the kernel copies pages out of whole planes, not pool views
-                && !f.is_view(keys)
-                && !f.is_view(values)
+                // planes of their own, or both planes of the pool (read by
+                // the kernel straight out of it)
+                && (!f.is_view(keys) && !f.is_view(values)
+                    || f.view_parts(keys).map(|v| v.0) == f.view_parts(values).map(|v| v.0)
+                        && (heads.kvh * heads.d) % 128 == 0
+                        && (heads.kvh * heads.dv) % 128 == 0
+                        && crate::blocks::on())
                 && super::pages::fits(geom.span, &heads, tuning.vmem_cap()) =>
         {
             // A decode's rows copy their own pages; a fire whose rows carry
