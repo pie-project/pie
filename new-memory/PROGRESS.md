@@ -1285,3 +1285,14 @@ The `new-memory/` directory is bookkeeping and is removed before anything lands 
   full program key only on a shape-key miss.
 - Open: gemma-4-E2B c64 -1.5..2.5% — not prefill packing (identical scheduler and fire mix); per-fire GPU time jumps
   ~165 us mid-run and disappears with a 3 GiB pool -> likely kv page placement (test against L40S's slot padding).
+
+### M105 — 2026-11-11: slot stride skew (DRAM channel aliasing); Metal c1 pass 3
+- `sc/l40s-slot-skew` (daea97605, 686a8a8fa, L40S): poem_compiler::chunk::plan makes every token-slot stride an odd
+  number of max(1 KiB, align) (3·2^k strides alias on L40S's 12-channel bus: up to 1.49x slower page reads past
+  L2). No config, kernels unchanged; XLA lays its own slots (unaffected). L40S c64 / c256 before -> after (main):
+  gemma-4-E2B 6325 / 6465 -> 6567 / 6829 (6580 / 6879); Qwen3-8B, Qwen3.5 unchanged; 0.08-0.8% fewer pages.
+  nemotron-super fixed waste 0.53% -> 1.91% (bound widened to 0.025, user decision (a)). CUDA goldens bitwise;
+  poem-compiler chunk 11 + every_deployment 13, runtime store 126 pass; all backends check clean.
+- `sc/metal-gate` (ab5e7172b, 693c5321a): state record lookups divide by multiply-high (exact for every u32);
+  decode attention page strides as Metal function constants. M1 Max c1 vs main: Qwen3-0.6B +0.3%, gemma -0.3%,
+  Qwen3.5 -0.5% (c8 +1.1%). Rest of Qwen3.5's ~45 us/fire is inside the state kernels (needs a GPU timeline).
