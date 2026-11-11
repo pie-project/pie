@@ -30,10 +30,6 @@ const CODE_DIR: &str = kernels_cuda::disk::CUBINS;
 #[cfg(feature = "rocm")]
 const CODE_DIR: &str = kernels_cuda::disk::CODE_OBJECTS;
 
-/// The recurrent-state slots a load holds when neither the config nor the
-/// chip's profile states them.
-const DEFAULT_STATE_SLOTS: u32 = 256;
-
 pub(super) fn bake(boot: &mut Boot<'_>) -> Result<Baked> {
     super::diag::publish(&boot.knobs.diagnostics);
     if let Some(guard) = super::diag::on().sync_guard {
@@ -121,7 +117,10 @@ pub(super) fn bake(boot: &mut Boot<'_>) -> Result<Baked> {
             }
         }
     }
-    boot.slots = poem_compiler::state_slots(boot.slots, &boot.trace, DEFAULT_STATE_SLOTS);
+    // Unstated, a seat a lane: every lane a fire batches has a slot to land
+    // in, so the lattice's widest decode is the fire limit's, not a fixed
+    // count's.
+    boot.slots = poem_compiler::state_slots(boot.slots, &boot.trace, boot.budget.max_lanes.max(1));
 
     kernels_cuda::disk::install(boot.cache_dir);
 
