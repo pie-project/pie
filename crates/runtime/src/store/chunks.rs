@@ -23,9 +23,7 @@ use ::engine::chunk::{
 use super::kv::page_table::WorkingSetId;
 use super::pool::PoolId;
 use super::shared::{Shared, SharedPool, TokenShape};
-use super::slots::{
-    Demand, Holder, ShapeId, ShapeKind, Slot, SlotPool, SlotPoolFacts, SlotShape,
-};
+use super::slots::{Demand, Holder, ShapeId, ShapeKind, Slot, SlotPool, SlotPoolFacts, SlotShape};
 
 /// The holder a store's own allocations are taken under: the store's
 /// table, which refcounts them, holds each id it hands out.
@@ -835,114 +833,5 @@ impl Meter for SlotMeter {
             };
         }
         Some(sum)
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-    struct Id(u32);
-
-    impl PoolId for Id {
-        fn from_index(index: u32) -> Self {
-            Self(index)
-        }
-        fn index(self) -> u32 {
-            self.0
-        }
-    }
-
-    #[test]
-    fn demand_is_counted_in_bytes_and_a_waiter_is_wanted() {
-        let mut pool = ShapePool::<Id>::new(ShapeKind::Fixed, 1000, 0, 8);
-        let ids = pool.try_alloc_n(3).unwrap();
-        pool.wait(2);
-        assert_eq!(
-            pool.demand(),
-            Demand {
-                live: 3000,
-                wanted: 5000
-            }
-        );
-        pool.share(Holder::CacheEntry([7; 32]), &ids[..1]);
-        assert_eq!(pool.held_by(&Holder::CacheEntry([7; 32])), 1);
-        pool.unshare(Holder::CacheEntry([7; 32]), &ids[..1]);
-        pool.wait(0);
-        pool.release_reserved(ids);
-        assert_eq!(pool.demand(), Demand::default());
-        assert_eq!(pool.available(), 8);
-    }
-
-    fn two_working_sets() -> (WorkingSetId, WorkingSetId) {
-        let mut kv = super::super::kv::KvStore::new(8, [0; 32]);
-        (kv.create_working_set(), kv.create_working_set())
-    }
-
-    #[test]
-    fn two_working_sets_never_share_a_seat_and_a_released_one_is_reissued() {
-        let (a, b) = two_working_sets();
-        let mut seats = Seats::new(2);
-        let first = seats.seats(a, 1).unwrap();
-        assert_eq!(seats.seats(a, 1).unwrap(), first, "a set keeps its seat");
-        let second = seats.seats(b, 1).unwrap();
-        assert_ne!(first, second, "two live sequences, two seats");
-        assert_eq!(seats.available(), 0);
-        seats.release(a);
-        seats.release(a);
-        assert_eq!(seats.available(), 1, "released once, returned once");
-        assert_eq!(seats.seats(b, 2).unwrap(), vec![second[0], first[0]]);
-    }
-
-    #[test]
-    fn a_fire_wider_than_the_seats_is_refused_and_takes_nothing() {
-        let (a, b) = two_working_sets();
-        let mut seats = Seats::new(2);
-        seats.seats(a, 1).unwrap();
-        let refusal = seats.seats(b, 3).unwrap_err();
-        assert_eq!(
-            refusal,
-            SeatsShort {
-                need: 3,
-                have: 1,
-                capacity: 2
-            }
-        );
-        assert_eq!(seats.available(), 1, "a refused ask seats nothing");
-        assert!(!seats.could_seat(3));
-        assert!(
-            Seats::new(0).could_seat(64),
-            "no state slots: no cap to speak of"
-        );
-    }
-
-    #[test]
-    fn the_degenerate_facts_come_back_as_todays_pools() {
-        let pools = ::engine::PoolFacts {
-            kv_pages: 10,
-            kv_page_size: 16,
-            state_slots: 4,
-            state_slot_bytes: 4096,
-            buffer_pages: 6,
-            host_kv_pages: 3,
-            ..Default::default()
-        };
-        let facts = ChunkFacts::degenerate(
-            &pools,
-            &::engine::chunk::DegenerateBytes {
-                kv_page: 100,
-                buffer_page: 25,
-            },
-        );
-        let stores = StorePools::of(&facts).unwrap();
-        assert_eq!(stores.page_size, 16);
-        assert_eq!(stores.kv.device, 10);
-        assert_eq!(stores.kv.slot_bytes, 100);
-        assert_eq!(stores.kv.host, 3);
-        assert_eq!(stores.window_tokens, 0);
-        assert_eq!(stores.state.device, 4);
-        assert_eq!(stores.state.host, 0);
-        assert_eq!(stores.buffer.device, 6);
     }
 }

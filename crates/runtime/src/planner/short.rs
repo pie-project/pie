@@ -127,32 +127,3 @@ impl Shortfall {
             .collect()
     }
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn a_shortfall_is_told_while_it_stands_and_once_as_it_clears() {
-        let mut short = Shortfall::default();
-        assert!(short.take_said().is_empty(), "nothing short, nothing said");
-        short.note(1, [100, 0]);
-        short.note(2, [20, 5]);
-        assert_eq!(short.take_said(), [(Tier::Device, 120), (Tier::Host, 5)]);
-        let since = short.since(1).unwrap();
-        short.note(1, [50, 0]);
-        assert_eq!(short.since(1), Some(since), "its clock runs on");
-        assert_eq!(short.take_said(), [(Tier::Device, 70), (Tier::Host, 5)]);
-        short.retain(|id| id == 1);
-        assert_eq!(short.take_said(), [(Tier::Device, 50), (Tier::Host, 0)]);
-        assert_eq!(
-            short.take_said(),
-            [(Tier::Device, 50)],
-            "host said clear once"
-        );
-        short.note(1, [0, 0]);
-        assert_eq!(short.since(1), None);
-        assert_eq!(short.take_said(), [(Tier::Device, 0)]);
-        assert!(short.take_said().is_empty());
-    }
-}

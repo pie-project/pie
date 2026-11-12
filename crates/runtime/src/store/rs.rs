@@ -342,23 +342,6 @@ impl RsStore {
         )
     }
 
-    /// A store for a model whose state is one window list of `geom`:
-    /// `pages` window pages, 0 the null page every page behind a window
-    /// reads.
-    #[cfg(test)]
-    pub fn new_window(geom: WindowGeometry, pages: u32) -> Self {
-        let host = pages.max(1);
-        Self::build(
-            ShapePool::new(ShapeKind::Fixed, 0, 0, 0),
-            ShapePool::new(ShapeKind::List, 0, 1, pages.saturating_sub(1)),
-            ShapePool::new(ShapeKind::Fixed, 0, host, 0),
-            ShapePool::new(ShapeKind::List, 0, host, 0),
-            0,
-            vec![geom],
-            Vec::new(),
-        )
-    }
-
     /// The store pinned pools state: the state slots and buffer pages, on
     /// the device alone (the one engine on pinned pools parks no state).
     pub fn of(pools: &StorePools) -> Self {

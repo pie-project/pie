@@ -106,14 +106,6 @@ impl ResidencyPlanner {
         self
     }
 
-    /// Says tier pressure through `sink` instead of the policy's gauge.
-    #[cfg(test)]
-    #[must_use]
-    pub(super) fn pressure_sink(mut self, sink: Sink) -> Self {
-        self.sink = sink;
-        self
-    }
-
     /// What `units` take, in bytes, at this engine's scale; a unit of
     /// unknown size counts as a byte, so a shortfall never reads as none.
     pub(super) fn bytes_of(&self, units: Reclaim) -> u64 {

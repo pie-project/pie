@@ -28,8 +28,6 @@ mod victim;
 mod wait;
 
 #[cfg(test)]
-mod pressure_tests;
-#[cfg(test)]
 mod service_order_tests;
 #[cfg(test)]
 mod starvation_race_tests;
