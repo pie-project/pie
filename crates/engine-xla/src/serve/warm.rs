@@ -305,14 +305,14 @@ impl Shell {
         // 35B-A3B's 9 MiB pf256 programs: 5 GB each; eight v6e ones 108 GB
         // at once): one is admitted while the host's free memory holds 0.75
         // GiB a MiB for it and for every compile still running (one that
-        // started may not have taken its memory yet). A v5e host's 47 GB
-        // stopped answering at four started together.
-        let longest = texts
-            .iter()
-            .map(|(t, _)| hold_bytes(t) >> 6)
-            .max()
-            .unwrap_or(0);
-        let need = (longest * 3) << 8;
+        // started may not have taken its memory yet), each at its own text,
+        // not the ladder's longest (at that a v5e host ran Qwen3.6-35B-A3B's
+        // 168-program ladder one compile at a time, 73 compile-minutes past
+        // the hour a round has). A v5e host's 47 GB stopped answering at four
+        // started together.
+        let need_of = |text: &str| ((hold_bytes(text) >> 6) * 3) << 8;
+        let need = texts.iter().map(|(t, _)| need_of(t)).max().unwrap_or(0);
+        let least = texts.iter().map(|(t, _)| need_of(t)).min().unwrap_or(0);
         // A compiled program held in host memory costs ~64 bytes a byte of its
         // text (0.5 GB a 9 MiB program; 65 of them 42 GB of a v5e host's 47),
         // and libtpu's allocator keeps what a dropped one freed for its own
@@ -324,9 +324,9 @@ impl Shell {
         let budget = available_memory().map_or(u64::MAX, |b| b.saturating_sub(2 * need));
         let held = std::sync::atomic::AtomicU64::new(0);
         let parked = std::sync::atomic::AtomicUsize::new(0);
-        let running = std::sync::atomic::AtomicUsize::new(0);
+        let running = std::sync::atomic::AtomicU64::new(0);
         let admit = std::sync::Mutex::new(());
-        let room = available_memory().map_or(8, |b| b / need.max(1)) as usize;
+        let room = available_memory().map_or(8, |b| b / least.max(1)) as usize;
         let threads = std::thread::available_parallelism()
             .map_or(1, |n| n.get())
             .min(8)
@@ -364,20 +364,19 @@ impl Shell {
                         // Admitted one at a time: a compile in flight may
                         // not have taken its memory yet, so each counts as
                         // still to come.
+                        let own = need_of(text);
                         loop {
                             let turn = admit.lock().expect("the warm admission lock poisoned");
-                            let busy = running.load(SeqCst) as u64;
-                            if busy == 0
-                                || available_memory().is_none_or(|b| b >= need * (busy + 1))
-                            {
-                                running.fetch_add(1, SeqCst);
+                            let busy = running.load(SeqCst);
+                            if busy == 0 || available_memory().is_none_or(|b| b >= busy + own) {
+                                running.fetch_add(own, SeqCst);
                                 break;
                             }
                             drop(turn);
                             std::thread::sleep(std::time::Duration::from_millis(200));
                         }
                         let program = device.program(text, (*sig).clone());
-                        running.fetch_sub(1, SeqCst);
+                        running.fetch_sub(own, SeqCst);
                         if kept {
                             if let Ok(mut slot) = slots[at].lock() {
                                 *slot = Some(program);
