@@ -2803,10 +2803,8 @@ fn append_pool_planes(
         )
     };
     // A short fire (a decode's): every row by itself, both planes' rows in
-    // one block scatter (no runs, no case). A plane in the row-pair order
-    // lands every fire so for now (its pages' kernels lay the packed rows
-    // order).
-    if n64 < PAGE_WRITE_ROWS || n64 % ps != 0 || order.is_some() {
+    // one block scatter (no runs, no case).
+    if n64 < PAGE_WRITE_ROWS || n64 % ps != 0 {
         let done = rows_into(f)?[0];
         return Ok(Some(vec![
             rebase(f, keys.val, done)?,
@@ -2851,9 +2849,17 @@ fn append_pool_planes(
         let ids = f.concat(&ids, 0)?;
         let ups = f.concat(&ups, 0)?;
         let cnt = f.dims(ups)[0];
+        let ups = match order {
+            // a page's pool rows pair-major (`crate::hlo::PoolOrder`)
+            Some(_) => {
+                let x = f.reshape(ups, &[cnt, ps, token_rows, 256])?;
+                f.transpose(x, &[0, 2, 1, 3])?
+            }
+            None => ups,
+        };
         let ups = f.reshape(ups, &[cnt * ps * w / 128, 128])?;
         let laid = crate::blocks::scatter(f, pool, ids, ups, page_rows)?;
-        Ok(vec![f.pool_view(laid, Elem::Bf16, dims)?])
+        Ok(vec![f.pool_view_ordered(laid, Elem::Bf16, dims, order)?])
     };
     let by_pages = &by_pages_owned;
     let pages_b: crate::hlo::Branch<'_> = Box::new(move |f: &mut Func| by_pages(f, None));
@@ -2872,12 +2878,18 @@ fn append_pool_planes(
                         pool,
                         maps: vec![mk, mv],
                         slots,
+                        ordered: order.is_some(),
                     },
                     [runs.start, runs.first, runs.len, page],
                     total,
                     cap,
                 )?;
-                Ok(vec![f.pool_view(laid[0], Elem::Bf16, dims)?])
+                Ok(vec![f.pool_view_ordered(
+                    laid[0],
+                    Elem::Bf16,
+                    dims,
+                    order,
+                )?])
             })
         }
         _ => Box::new(move |f: &mut Func| by_pages(f, Some(few))),
@@ -3185,6 +3197,7 @@ fn scatter_slots_one_map(
                     pool,
                     maps: vec![PageMap::IDENTITY],
                     slots,
+                    ordered: false,
                 },
                 [runs.start, runs.first, runs.len, page],
                 total,

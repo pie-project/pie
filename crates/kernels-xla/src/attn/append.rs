@@ -24,10 +24,14 @@ pub(crate) enum Planes {
         values: Val,
     },
     /// `maps`: one a plane written (one plane alone, or keys and values).
+    /// `ordered`: the planes' pages lie in the row-pair order
+    /// (`crate::hlo::PoolOrder`): u32 row `c · 16 + t` the pair `c` of
+    /// page row `t`, where the packed rows order lays it at `t · w / 256 + c`.
     Pool {
         pool: Val,
         maps: Vec<PageMap>,
         slots: i64,
+        ordered: bool,
     },
 }
 
@@ -82,8 +86,11 @@ pub(crate) fn write(
     let kk = w / 128;
     let (pooled, maps, slots) = match &planes {
         Planes::Two { keys, .. } => (None, vec![PageMap::IDENTITY; 2], f.dims(*keys)[0]),
-        Planes::Pool { pool, maps, slots } => (Some(f.dims(*pool)[0]), maps.clone(), *slots),
+        Planes::Pool {
+            pool, maps, slots, ..
+        } => (Some(f.dims(*pool)[0]), maps.clone(), *slots),
     };
+    let ordered = matches!(planes, Planes::Pool { ordered: true, .. });
     if maps.len() != np {
         return Err(crate::hlo::Malformed {
             op: "kv_append",
@@ -94,6 +101,12 @@ pub(crate) fn write(
     // of a page row's 128-lane blocks, low and high) and laid by sublane
     // strided stores, with no relayout of the page in VMEM.
     let direct = pooled.is_some() && kk % 2 == 0;
+    if ordered && !direct {
+        return Err(crate::hlo::Malformed {
+            op: "kv_append",
+            detail: format!("rows of {w} in the row-pair order"),
+        });
+    }
     let half = kk / 2;
     let (tile, laid_elem) = if direct {
         (vec![PS * half, 128], Elem::I32)
@@ -300,6 +313,16 @@ pub(crate) fn write(
                         let h = b.bitcast_v(h, Elem::I32)?;
                         let h = b.andi(h, high_v)?;
                         let mut u = b.ori(h, a)?;
+                        if ordered {
+                            // the pair's rows one run of the page
+                            let ci = b.index(c * PS);
+                            if merge {
+                                let o = b.vload(held, &[ci, i0], &[PS, 128])?;
+                                u = b.select(laid, u, o)?;
+                            }
+                            b.vstore(u, dst, &[ci, i0])?;
+                            continue;
+                        }
                         let ci = b.index(c);
                         if merge {
                             let o = b.strided_load(held, &[ci, i0], &[half, 1], &[PS, 128])?;
