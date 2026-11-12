@@ -31,3 +31,11 @@ vs bank 62.7). Serving cost: Qwen3.5 c64 gdn_step +7%, conv1d +6-12% per launch 
 XLA qwen35 d0.8b c64 -3.4% (gated_delta 61 -> 112 us, same cause per TPU). Fix: layer-major fixed shapes (each
 recurrent layer's pieces from a shape of their own so a layer's lane slots are contiguous) — a chunk / record
 structure change across poem_compiler, runtime and every backend.
+
+## F5 — Rename engine-wgpu -> engine-webgpu (and the `wgpu` feature)
+It serves both native (pie --features wgpu) and the browser (packages/javascript/server-web), so "web" alone would
+mislead; "webgpu" names the API. Separate PR after engine-gpu lands (touches CLI feature names, JS package, docs).
+
+## F6 — Shared pure-logic helpers across all engines
+Layout math, slot-table serialization, expert / row table placement are conceptually shared by CUDA, Metal, XLA and
+engine-gpu but implemented per backend (19-30% identical). Extract into `engine` as pure functions.
