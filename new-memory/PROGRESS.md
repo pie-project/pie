@@ -1406,3 +1406,17 @@ The `new-memory/` directory is bookkeeping and is removed before anything lands 
 - M114 XLA (608b9f329, TPU): every TPU compile sets xla_tpu_prefer_conditional_same_overlay (overlay waits on the
   ordered pool's larger conditional arms: 514 -> 11 us / prompt). vs main: qwen3-0.6b p2048 +0.6% (was -2.7%), d64
   +15.6%; MoE all +1.8..5.0%; d0.8b p2048 +7.8%, d64 -2.6% (layer-major), d256 ~-1.1% (being profiled). Gates bitwise.
+
+### M115 — 2026-11-12: activation rungs always stated; oversubscription policy
+- `sc/rungs-stated` (263940155, b98ea984a, 00de14760): chunks past the settled fit are numbered to no runtime, so
+  every CUDA load states its rungs (no "no smaller rung" case; hold_spare / SPARE_UNDER_RUNGS deleted); runtime
+  capacity is the room under the CURRENT rung (no overcommit: Qwen3-8B c256 now reports 4832, not 5016); the rung
+  walk wakes an idle scheduler (lower lands in ~130 ms, was ~60 s); a profile-derived bodies allowance stretches by
+  up to 1/20 of the cache room to arm the full lattice (operator-stated stays a hard cap); bodies' spare counts the
+  segments' high water. Merged with L40S's per-kind lattice pricing. golden_logits / by_refs / offload pass;
+  runtime 150; c64 / c256 / boot = base on 4 models; rung.py 5/5.
+- `sc/oversub-2` (6d85ff127, f85292936): commit_suspend frees a suspend's pages at once; a finished process's pages
+  free through the retired epoch; restores go back when room plus growth_reserve fits; a waiter short of device
+  room keeps its clock while the fleet progresses. Qwen3-8B c256 on 32 GB: 3034 / 3057 vs main 3088 / 3092 (M111
+  2691 / 2826); gpt-oss 24 x 31.4k 5/5 ok 61.2-61.6 s; e2e handles = M111. Open: t_evict lost-wakeup hang
+  (pre-existing), new-prompt seat wait 1.2 s vs main 6 ms.
