@@ -468,6 +468,28 @@ impl Wafer {
             }
             plan.contract.positions = n;
         }
+        // the head's rows (or its band's columns) hold every vocabulary row: the cut pads the
+        // tables to what they hold, so a token past it would have no logit and no embedding
+        let h = &plan.partition.head;
+        let held = u64::from(h.rows.max(h.cols)) * u64::from(h.vocab_rows);
+        if held < u64::from(self.shape.vocab) {
+            return Err(format!(
+                "preset {}: the head's {} rows of {} vocabulary rows hold {held} of {} tokens",
+                c.preset.name,
+                h.rows.max(h.cols),
+                h.vocab_rows,
+                self.shape.vocab
+            ));
+        }
+        // the images leave the stack its room, as the memory model measures them
+        let room = super::cost::memory::room(&plan, super::cost::memory::anchor(&self.shape));
+        if room < f64::from(super::build::STACK_ROOM) {
+            return Err(format!(
+                "preset {}: the images leave {room:.0} B of stack room, under {} B",
+                c.preset.name,
+                super::build::STACK_ROOM
+            ));
+        }
         Ok(plan)
     }
 
@@ -771,6 +793,29 @@ mod tests {
         );
         let e = plan(&t, &ask(Some(1 << 20))).unwrap_err();
         assert!(e.contains("of at most 16384"), "{e}");
+    }
+
+    /// Overrides that leave the head short of the vocabulary, or the images short of the stack's
+    /// room, are refused by name (the chip ran 9B VR=144 with 166,032 of its 248,320 tokens, and
+    /// 9B PY=224 failed at link); Llama's VR=144 holds its vocabulary and plans.
+    #[test]
+    fn overrides_that_do_not_hold_are_refused() {
+        let t = trace("qwen35-d9b-bf16-kv-bf16");
+        let set = |s: &str| Ask {
+            preset: Some("9b".into()),
+            set: s.into(),
+            ..Ask::default()
+        };
+        let e = plan(&t, &set("VR=144,HR=1153")).unwrap_err();
+        assert!(e.contains("hold 166032 of 248320 tokens"), "{e}");
+        let e = plan(&t, &set("PY=224")).unwrap_err();
+        assert!(e.contains("of stack room"), "{e}");
+        let l = Ask {
+            preset: Some("l3-8b".into()),
+            set: "VR=144".into(),
+            ..Ask::default()
+        };
+        plan(&trace("llama31-8b-bf16-kv-bf16"), &l).unwrap();
     }
 
     /// With no pinned plan made for the shape, the search plans it: Qwen3.5-0.8B with another
