@@ -1,6 +1,7 @@
 use kernels_slang::{Error, Tensor};
 use poem_ir::ValueId;
 
+use crate::backend::Backend;
 use crate::rs::Seat;
 use crate::run::Run;
 
@@ -18,7 +19,7 @@ fn extended_origin(
     (begin, replay)
 }
 
-impl Run<'_> {
+impl<B: Backend> Run<'_, B> {
     fn kernel(fault: crate::error::Fault, op: &'static str) -> Error {
         Error::Backend {
             op,

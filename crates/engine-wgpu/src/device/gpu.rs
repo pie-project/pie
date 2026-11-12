@@ -23,6 +23,8 @@ impl engine_gpu::Backend for Api {
 
     type Pending = Pending;
 
+    type Tuning = crate::tuning::Tuning;
+
     fn is_device(domain: engine::transfer::MemoryDomain) -> bool {
         matches!(domain, engine::transfer::MemoryDomain::WgpuDevice(_))
     }

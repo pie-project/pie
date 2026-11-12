@@ -53,6 +53,9 @@ pub trait Backend:
     /// A submitted frame, until it lands.
     type Pending: Pending;
 
+    /// The device's tuning profile, as the dispatch reads it.
+    type Tuning: Tactics;
+
     /// Whether `domain` names this API's device.
     fn is_device(domain: engine::transfer::MemoryDomain) -> bool;
 
@@ -143,6 +146,54 @@ pub trait Frame<B: Backend>: 'static {
 
     /// Submits; `on_done` runs once the frame lands.
     fn commit_async(self, on_done: Option<OnDone>) -> Result<B::Pending>;
+}
+
+/// How a backend runs kernels-slang's entries on its device: the tactics its
+/// tuning profile and device facts pick. `tier` is the highest tier the
+/// adapter runs, where a backend reads it.
+pub trait Tactics: std::fmt::Debug {
+    /// The `kernel.qmm` ladder at this shape.
+    fn qmm_ladder(
+        &self,
+        rows: u32,
+        columns: u32,
+        contraction: u32,
+        bank: kernels_slang::Bank,
+    ) -> Vec<kernels_slang::linear::qmm::Qmm>;
+
+    fn kquant(&self) -> kernels_slang::linear::kquant::Tactic;
+
+    fn gemm(&self, tier: kernels_slang::Tier) -> kernels_slang::linear::gemm::Tactic;
+
+    /// The tiles and sort a batched route of `pairs` over `experts` runs at.
+    fn batch(&self, pairs: u32, experts: u32) -> kernels_slang::linear::moe::select::Batch;
+
+    /// The tier a grouped or routed matmul runs at.
+    fn routed_tier(&self, tier: kernels_slang::Tier) -> kernels_slang::Tier;
+
+    /// The tier a LoRA correction runs at.
+    fn lora_tier(&self) -> kernels_slang::Tier;
+
+    /// Paged attention for `head_dim`-wide heads.
+    fn sdpa(&self, tier: kernels_slang::Tier, head_dim: u32) -> kernels_slang::attn::sdpa::Tactic;
+
+    /// Whether the device binds a split decode's planes (and its LSE's).
+    fn binds_split(&self, _lse: bool) -> bool {
+        true
+    }
+
+    /// The recurrences' fold and register-state threshold.
+    fn recurrent(&self) -> kernels_slang::ssm::gdn_recurrent::Tactic;
+
+    fn moe_tile_rows(&self, pairs: u32, experts: u32) -> u32;
+
+    fn moe_sorted_rows(&self, pairs: u32, experts: u32) -> u32;
+
+    fn sdpa_tile_rows_per_request(&self) -> u32;
+
+    fn sdpa_split_groups(&self) -> u32;
+
+    fn sdpa_split_min_keys(&self) -> u32;
 }
 
 /// A submitted frame.

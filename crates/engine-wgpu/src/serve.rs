@@ -2885,6 +2885,7 @@ impl Shell {
         let bindings = FireBindings {
             rs_snaps,
             // No lane is fed its token on the device here.
+            row_ring: None,
             tokens_host: Some(std::sync::Arc::from(tokens.as_slice())),
             tokens: bound.tokens,
             positions: bound.positions,
@@ -3693,7 +3694,7 @@ impl Shell {
                 let base = if voxel {
                     self.inputs[arm].voxel_payload().map(|(_, at)| at)
                 } else {
-                    self.inputs[arm].seat(seat.id)
+                    self.inputs[arm].seat(seat.id).map(|(_, at)| at)
                 };
                 let base = base.ok_or_else(|| {
                     program(
@@ -3773,7 +3774,7 @@ impl Shell {
                 frame.fill_zero(self.arena.store(), into_at, bytes)?;
                 continue;
             }
-            let at = self.inputs[p.arm]
+            let (_, at) = self.inputs[p.arm]
                 .seat(land.seat.id)
                 .ok_or_else(|| Fault::Unbound {
                     what: format!(

@@ -1,24 +1,16 @@
+use crate::backend::{Backend, Tactics as _};
 use crate::run::Run;
-use kernels_slang::Tier;
 use kernels_slang::ssm::{StatePool, conv1d, gdn_prep, gdn_recurrent, kda};
 use poem_exec::{DispatchSsm, KernelError};
 use poem_ir::{Operands, Ssm, ValueId};
 
-/// The recurrences fold their norms through subgroups, which every Vulkan
-/// device this engine runs on has, any width; a register-state recurrence
-/// runs at every row count.
-const RECURRENT: gdn_recurrent::Tactic = gdn_recurrent::Tactic {
-    tier: Tier::Subgroup,
-    register_min_rows: 0,
-};
-
-impl DispatchSsm for Run<'_> {
+impl<B: Backend> DispatchSsm for Run<'_, B> {
     fn dispatch(&mut self, op: &Ssm) -> Result<(), KernelError> {
         self.ssm(op).map_err(crate::error::kernel)
     }
 }
 
-impl Run<'_> {
+impl<B: Backend> Run<'_, B> {
     fn state_pool(&self, id: ValueId) -> StatePool {
         let pool = self.recurrent(id);
         StatePool {
@@ -155,7 +147,7 @@ impl Run<'_> {
                 let ext_y = self.rs_out(OP, &seat, *y)?;
                 gdn_recurrent::gated_delta_committed(
                     ctx,
-                    RECURRENT,
+                    self.tuning().recurrent(),
                     ext_qkv,
                     self.qo_indptr(),
                     &self.rs_committed(&seat),
@@ -214,7 +206,7 @@ impl Run<'_> {
                 );
                 kda::kda_committed(
                     ctx,
-                    RECURRENT.tier,
+                    self.tuning().recurrent().tier,
                     ext_mixed,
                     self.qo_indptr(),
                     &self.rs_committed(&seat),
@@ -283,7 +275,7 @@ impl Run<'_> {
                 ..
             } => gdn_recurrent::gated_delta(
                 ctx,
-                RECURRENT,
+                self.tuning().recurrent(),
                 self.slang_of(*qkv),
                 self.slang_of(*gates),
                 &self.state_pool(*state),
@@ -305,7 +297,7 @@ impl Run<'_> {
                 ..
             } => gdn_recurrent::gated_delta_chunked(
                 ctx,
-                RECURRENT,
+                self.tuning().recurrent(),
                 self.ragged(*qkv),
                 self.slang_of(*gates),
                 &self.state_pool(*state),
@@ -340,7 +332,7 @@ impl Run<'_> {
                 );
                 kda::kda(
                     ctx,
-                    RECURRENT.tier,
+                    self.tuning().recurrent().tier,
                     self.slang_of(*mixed),
                     &gates,
                     &self.state_pool(*state),
@@ -372,7 +364,7 @@ impl Run<'_> {
                 );
                 kda::kda_chunked(
                     ctx,
-                    RECURRENT.tier,
+                    self.tuning().recurrent().tier,
                     self.ragged(*mixed),
                     &gates,
                     &self.state_pool(*state),

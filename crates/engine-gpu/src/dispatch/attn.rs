@@ -2,40 +2,16 @@ use kernels_slang::attn::sdpa;
 use poem_exec::{DispatchAttn, KernelError};
 use poem_ir::{Attn, IndexScore, Operands, StructKind};
 
+use crate::backend::{Backend, Tactics as _};
 use crate::run::{Run, StructSlot};
 
-impl DispatchAttn for Run<'_> {
+impl<B: Backend> DispatchAttn for Run<'_, B> {
     fn dispatch(&mut self, op: &Attn) -> Result<(), KernelError> {
         self.attention(op).map_err(crate::error::kernel)
     }
 }
 
-impl Run<'_> {
-    /// How this device runs paged attention for `head_dim`-wide heads.
-    /// Prefill tiles 16 rows of 16 lanes folding by shuffles where every
-    /// subgroup holds a row and the workgroup its 256 invocations (3.5x the
-    /// 32-lane tile on an RTX 4090), else 32 lanes a row through workgroup
-    /// memory.
-    fn sdpa_tactic(&self, head_dim: u32) -> sdpa::Tactic {
-        let tuning = self.tuning();
-        let limits = tuning.limits();
-        let shuffles = limits.lanes >= 16 && limits.invocations >= 256;
-        sdpa::Tactic {
-            tier: kernels_slang::Tier::Subgroup,
-            narrow: limits.lanes < 32,
-            decode_threads: tuning.sdpa_decode_threads(head_dim),
-            tile_rows: if shuffles {
-                16
-            } else {
-                tuning.sdpa_tile_rows()
-            },
-            tile_lanes: if shuffles { 16 } else { 32 },
-            split_groups: tuning.sdpa_split_groups(),
-            split_min_keys: tuning.sdpa_split_min_keys(),
-            prefill_work: 0,
-        }
-    }
-
+impl<B: Backend> Run<'_, B> {
     fn prefill_tables(
         &self,
         plan: poem_ir::ValueId,
@@ -99,7 +75,7 @@ impl Run<'_> {
                 ),
             });
         }
-        let tactic = self.sdpa_tactic(head_dim);
+        let tactic = self.tuning().sdpa(self.tier(), head_dim);
         let tables = self.prefill_tables(plan, mask);
         let (q, pool, o) = (q, *pool, o);
         let tiles = q.rows / self.requests().max(1) >= self.tuning().sdpa_tile_rows_per_request();
@@ -129,7 +105,7 @@ impl Run<'_> {
     ) -> Result<(), kernels_slang::Error> {
         sdpa::decode(
             self.ctx,
-            self.sdpa_tactic(head_dim),
+            self.tuning().sdpa(self.tier(), head_dim),
             self.tensor(q),
             self.decode_plan(plan),
             self.pool(cache),
@@ -138,7 +114,8 @@ impl Run<'_> {
             sm_scale,
             self.tensor(o),
             lse.map(|l| self.tensor(l)),
-            self.split_scratch(),
+            self.split_scratch()
+                .filter(|_| self.tuning().binds_split(lse.is_some())),
         )
     }
 
@@ -167,7 +144,7 @@ impl Run<'_> {
         }
         sdpa::selected(
             self.ctx,
-            self.sdpa_tactic(head_dim),
+            self.tuning().sdpa(self.tier(), head_dim),
             q,
             tables,
             self.pool(cache),

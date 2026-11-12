@@ -1,21 +1,22 @@
 use poem_exec::{DispatchFused, KernelError};
 use poem_ir::{Fused, Operands};
 
+use crate::backend::Backend;
 use crate::run::Run;
 
-impl DispatchFused for Run<'_> {
+impl<B: Backend> DispatchFused for Run<'_, B> {
     fn dispatch(&mut self, op: &Fused) -> Result<(), KernelError> {
         Err(KernelError::Unsupported { op: op.name() })
     }
 }
 
-impl poem_exec::DispatchConv for Run<'_> {
+impl<B: Backend> poem_exec::DispatchConv for Run<'_, B> {
     fn dispatch(&mut self, op: &poem_ir::Conv) -> Result<(), KernelError> {
         self.conv(op).map_err(crate::error::kernel)
     }
 }
 
-impl Run<'_> {
+impl<B: Backend> Run<'_, B> {
     fn conv(&mut self, op: &poem_ir::Conv) -> Result<(), kernels_slang::Error> {
         use kernels_slang::conv::{conv3d, group_norm, resample, rule};
         use poem_ir::Conv;
@@ -250,14 +251,14 @@ impl Run<'_> {
     }
 }
 
-impl poem_exec::DispatchProbe for Run<'_> {
+impl<B: Backend> poem_exec::DispatchProbe for Run<'_, B> {
     fn probe(&mut self, node: &poem_ir::Node) {
         use std::io::Write;
         self.split_at(node);
         let Some(dir) = crate::probe::dir() else {
             return;
         };
-        if let Err(fault) = <crate::device::Api as engine_gpu::Backend>::flush_recording() {
+        if let Err(fault) = B::flush_recording() {
             eprintln!("probe: flush failed: {fault}");
             return;
         }

@@ -5,6 +5,7 @@ use poem_exec::KernelError;
 use poem_exec::fire::{Serve, fallback};
 use poem_ir::{Def, Dim, Ty, ValueId};
 
+use crate::backend::Backend;
 use crate::run::Run;
 
 #[derive(Debug, Clone, Copy)]
@@ -68,7 +69,7 @@ fn overflowed(bytes: u64) -> KernelError {
     }
 }
 
-impl Run<'_> {
+impl<B: Backend> Run<'_, B> {
     fn copy_plan(&self, region: &Region) -> CopyPlan {
         let mut plan = CopyPlan {
             region: self.at_region(),
@@ -105,7 +106,7 @@ impl Run<'_> {
                 key,
                 offset,
                 wide,
-                tight: Tensor::new(crate::device::handles::NIL, rows, wide.width, wide.dtype),
+                tight: Tensor::new(crate::handles::NIL, rows, wide.width, wide.dtype),
                 read: !written,
                 written,
             });
@@ -168,7 +169,7 @@ impl Run<'_> {
     }
 }
 
-impl Serve for Run<'_> {
+impl<B: Backend> Serve for Run<'_, B> {
     fn copies(&self, _region: &Region) -> bool {
         self.window().gathered.is_some()
     }

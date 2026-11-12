@@ -2,15 +2,16 @@ use poem_exec::{DispatchGather, KernelError};
 use poem_ir::Gather;
 use poem_ir::Operands;
 
+use crate::backend::Backend;
 use crate::run::Run;
 
-impl DispatchGather for Run<'_> {
+impl<B: Backend> DispatchGather for Run<'_, B> {
     fn dispatch(&mut self, op: &Gather) -> Result<(), KernelError> {
         self.gather(op).map_err(crate::error::kernel)
     }
 }
 
-impl Run<'_> {
+impl<B: Backend> Run<'_, B> {
     fn gather(&mut self, op: &Gather) -> Result<(), kernels_slang::Error> {
         match op {
             Gather::NgramIds {

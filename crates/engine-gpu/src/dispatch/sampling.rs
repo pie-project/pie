@@ -1,15 +1,16 @@
 use poem_exec::{DispatchSampling, KernelError};
 use poem_ir::{Operands, Sampling};
 
+use crate::backend::Backend;
 use crate::run::Run;
 
-impl DispatchSampling for Run<'_> {
+impl<B: Backend> DispatchSampling for Run<'_, B> {
     fn dispatch(&mut self, op: &Sampling) -> Result<(), KernelError> {
         self.sampling(op).map_err(crate::error::kernel)
     }
 }
 
-impl Run<'_> {
+impl<B: Backend> Run<'_, B> {
     fn sampling(&mut self, op: &Sampling) -> Result<(), kernels_slang::Error> {
         match op {
             Sampling::Argmax { xs, y } => {

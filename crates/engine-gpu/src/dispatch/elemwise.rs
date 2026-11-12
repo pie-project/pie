@@ -3,15 +3,16 @@ use poem_exec::{DispatchElemwise, KernelError};
 use poem_ir::{Elemwise, MropeForm, Operands};
 use poem_ir::{NormAxis, NormWeight, ResidualGate};
 
+use crate::backend::Backend;
 use crate::run::Run;
 
-impl DispatchElemwise for Run<'_> {
+impl<B: Backend> DispatchElemwise for Run<'_, B> {
     fn dispatch(&mut self, op: &Elemwise) -> Result<(), KernelError> {
         self.elemwise(op).map_err(crate::error::kernel)
     }
 }
 
-impl Run<'_> {
+impl<B: Backend> Run<'_, B> {
     fn elemwise(&mut self, op: &Elemwise) -> Result<(), kernels_slang::Error> {
         match op {
             Elemwise::Rmsnorm {
@@ -801,7 +802,7 @@ impl Run<'_> {
     }
 }
 
-impl Run<'_> {
+impl<B: Backend> Run<'_, B> {
     fn stacked_blocks(
         &self,
         blocks: &[poem_ir::ValueId],

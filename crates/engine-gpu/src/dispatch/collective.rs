@@ -2,15 +2,16 @@ use kernels_slang::collective::band;
 use poem_exec::{DispatchCollective, KernelError};
 use poem_ir::Collective;
 
+use crate::backend::Backend;
 use crate::run::Run;
 
-impl DispatchCollective for Run<'_> {
+impl<B: Backend> DispatchCollective for Run<'_, B> {
     fn dispatch(&mut self, op: &Collective) -> Result<(), KernelError> {
         self.collective(op).map_err(crate::error::kernel)
     }
 }
 
-impl Run<'_> {
+impl<B: Backend> Run<'_, B> {
     fn collective(&mut self, op: &Collective) -> Result<(), kernels_slang::Error> {
         let t = |id| self.tensor(id);
         match op {

@@ -10,7 +10,6 @@ pub mod chunks;
 pub mod comm;
 pub use engine_gpu::decoded;
 pub mod device;
-mod dispatch;
 pub mod encode;
 use engine_gpu::error;
 pub mod experts;

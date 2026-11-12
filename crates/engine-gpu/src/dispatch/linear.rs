@@ -1,21 +1,16 @@
 use poem_exec::{DispatchLinear, KernelError};
 use poem_ir::{Linear, Operands};
 
+use crate::backend::{Backend, Tactics as _};
 use crate::run::Run;
 
-/// WGSL has no subgroup tier; four strips a workgroup (kernels-slang.md §15).
-const KQUANT: kernels_slang::linear::kquant::Tactic = kernels_slang::linear::kquant::Tactic {
-    tier: kernels_slang::Tier::Baseline,
-    slices: 4,
-};
-
-impl DispatchLinear for Run<'_> {
+impl<B: Backend> DispatchLinear for Run<'_, B> {
     fn dispatch(&mut self, op: &Linear) -> Result<(), KernelError> {
         self.linear(op).map_err(crate::error::kernel)
     }
 }
 
-impl Run<'_> {
+impl<B: Backend> Run<'_, B> {
     fn linear(&mut self, op: &Linear) -> Result<(), kernels_slang::Error> {
         match op {
             Linear::Relu2 { .. } => Err(kernels_slang::Error::Unsupported { op: op.name() }),
@@ -46,14 +41,14 @@ impl Run<'_> {
                 Some(bank) => {
                     let capacity = self.capacity(*act).min(self.capacity(*y));
                     let (act, y) = (self.tensor(*act), self.tensor(*y));
-                    let ladder = qmm_ladder(self.tuning(), act.rows, y.width, act.width, bank);
+                    let ladder = self.tuning().qmm_ladder(act.rows, y.width, act.width, bank);
                     kernels_slang::linear::qmm::matmul(self.ctx, &ladder, act, bank, y, capacity)
                 }
 
                 None => match self.maybe_stored(*w) {
                     Some(block) => kernels_slang::linear::kquant::matmul(
                         self.ctx,
-                        KQUANT,
+                        self.tuning().kquant(),
                         self.tensor(*act),
                         block,
                         self.tensor(*y),
@@ -78,14 +73,14 @@ impl Run<'_> {
                 Some(bank) => {
                     let capacity = self.capacity(*act).min(self.capacity(*y));
                     let (act, y) = (self.tensor(*act), self.tensor(*y));
-                    let ladder = qmm_ladder(self.tuning(), act.rows, y.width, act.width, bank);
+                    let ladder = self.tuning().qmm_ladder(act.rows, y.width, act.width, bank);
                     kernels_slang::linear::qmm::lm_head(self.ctx, &ladder, act, bank, y, capacity)
                 }
 
                 None => match self.maybe_stored(*w) {
                     Some(block) => kernels_slang::linear::kquant::lm_head(
                         self.ctx,
-                        KQUANT,
+                        self.tuning().kquant(),
                         self.tensor(*act),
                         block,
                         self.tensor(*y),
@@ -463,7 +458,7 @@ impl Run<'_> {
                 y,
             } => kernels_slang::linear::moe::select::matmul_grouped(
                 self.ctx,
-                self.tier(),
+                self.tuning().routed_tier(self.tier()),
                 self.tensor(*x),
                 match self.banked(*w) {
                     Some(bank) => kernels_slang::linear::moe::select::GroupedPlane::Bank(bank),
@@ -490,7 +485,7 @@ impl Run<'_> {
                 match self.expert_table(OP, Some(*bank), None, routes)? {
                     Some(table) => kernels_slang::linear::moe::select::matmul_select_tabled(
                         self.ctx,
-                        self.tier(),
+                        self.tuning().routed_tier(self.tier()),
                         self.tensor(*x),
                         &table,
                         routes,
@@ -498,7 +493,7 @@ impl Run<'_> {
                     ),
                     None => kernels_slang::linear::moe::select::matmul_select(
                         self.ctx,
-                        self.tier(),
+                        self.tuning().routed_tier(self.tier()),
                         self.tensor(*x),
                         self.tensor(*bank),
                         routes,
@@ -538,7 +533,7 @@ impl Run<'_> {
                     }
                     return kernels_slang::linear::moe::select::matmul_select_quant_tabled(
                         self.ctx,
-                        self.tier(),
+                        self.tuning().routed_tier(self.tier()),
                         self.tensor(*x),
                         scheme,
                         bias.is_some(),
@@ -566,7 +561,7 @@ impl Run<'_> {
                 match bias_plane {
                     Some(bias_plane) => kernels_slang::linear::moe::select::matmul_select_bias(
                         self.ctx,
-                        self.tier(),
+                        self.tuning().routed_tier(self.tier()),
                         self.tensor(*x),
                         planes,
                         bias_plane,
@@ -575,7 +570,7 @@ impl Run<'_> {
                     ),
                     None => kernels_slang::linear::moe::select::matmul_select_quant(
                         self.ctx,
-                        self.tier(),
+                        self.tuning().routed_tier(self.tier()),
                         self.tensor(*x),
                         planes,
                         routed,
@@ -595,7 +590,7 @@ impl Run<'_> {
                 y_out,
             } => kernels_slang::linear::lora::correct(
                 self.ctx,
-                kernels_slang::Tier::Baseline,
+                self.tuning().lora_tier(),
                 self.tensor(*x),
                 self.tensor(*bank_a),
                 self.tensor(*bank_b),
@@ -660,47 +655,17 @@ impl Run<'_> {
     }
 }
 
-/// The device's `kernel.qmm` ladder at this shape, as kernels-slang's rungs:
-/// the vector rung reads two activation rows a workgroup, which on the 4090
-/// beat the old hand-written WGSL one-row kernel at every row count from 1 to 11 where
-/// four rows lost at two (kernels-slang.md §17).
-fn qmm_ladder(
-    tuning: &crate::tuning::Tuning,
-    rows: u32,
-    columns: u32,
-    contraction: u32,
-    bank: kernels_slang::Bank,
-) -> Vec<kernels_slang::linear::qmm::Qmm> {
-    use crate::tuning::Qmm;
-    use kernels_slang::linear::qmm::Qmm as Rung;
-    let at = tuning.qmm_at(rows, columns, contraction, bank.bits, bank.group);
-    tuning
-        .qmm(&at)
-        .iter()
-        .map(|q| match *q {
-            Qmm::Tiled { crossover_tg } => Rung::Tiled { crossover_tg },
-            Qmm::Qmv => Rung::Qmv { vecs: 2 },
-        })
-        .collect()
-}
-
-impl Run<'_> {
-    /// The vector kernel folds by shuffles where the adapter's subgroups
-    /// hold a 32-lane strip.
+impl<B: Backend> Run<'_, B> {
+    /// The device's gemm tactic.
     fn gemm_tactic(&self) -> kernels_slang::linear::gemm::Tactic {
-        kernels_slang::linear::gemm::Tactic { tier: self.tier() }
+        self.tuning().gemm(self.tier())
     }
 }
 
-impl Run<'_> {
+impl<B: Backend> Run<'_, B> {
     /// The tiles and sort a batched route runs at on this device.
     fn batch(&self, pairs: u32, experts: u32) -> kernels_slang::linear::moe::select::Batch {
-        kernels_slang::linear::moe::select::Batch {
-            tile: self.tuning().moe_tile_rows(pairs, experts),
-            padded: self.tuning().moe_sorted_rows(pairs, experts),
-            tier: kernels_slang::Tier::Baseline,
-            sort_lanes: 256,
-        }
+        self.tuning().batch(pairs, experts)
     }
 
     /// [`Run::batched`] over a bank read through `table`.

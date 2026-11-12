@@ -193,3 +193,129 @@ impl Tuning {
         self.profile.get::<DecodeSplitMinKeys>().0
     }
 }
+
+/// WGSL has no subgroup tier; four strips a workgroup (kernels-slang.md §15).
+const KQUANT: kernels_slang::linear::kquant::Tactic = kernels_slang::linear::kquant::Tactic {
+    tier: kernels_slang::Tier::Baseline,
+    slices: 4,
+};
+
+/// Storage buffers a split decode binds (its LSE form one more); a device
+/// offering fewer (SwiftShader: 10) walks each row whole.
+const SPLIT_STORAGE_BUFFERS: u32 = 12;
+
+/// A tab's prefill dispatches, in rows times keys. A GPU cannot leave a
+/// dispatch to draw the screen, and macOS ends a command buffer once that has
+/// gone on for about 20 seconds (`Impacting Interactivity`), which costs the
+/// tab its device. Smaller command buffers do not help: on an M2 Max,
+/// dispatches of 95 ms are ended and these, of 48 ms, are not. A browser hides
+/// its adapter from wgpu, so every tab pays for them, about 3% of a prefill.
+const TAB_PREFILL_WORK: u64 = 1 << 19;
+
+impl engine_gpu::backend::Tactics for Tuning {
+    /// The device's `kernel.qmm` ladder at this shape, as kernels-slang's
+    /// rungs: the vector rung reads two activation rows a workgroup, which
+    /// on the 4090 beat the old hand-written WGSL one-row kernel at every row
+    /// count from 1 to 11 where four rows lost at two (kernels-slang.md §17).
+    fn qmm_ladder(
+        &self,
+        rows: u32,
+        columns: u32,
+        contraction: u32,
+        bank: kernels_slang::Bank,
+    ) -> Vec<kernels_slang::linear::qmm::Qmm> {
+        use kernels_slang::linear::qmm::Qmm as Rung;
+        let at = self.qmm_at(rows, columns, contraction, bank.bits, bank.group);
+        self.qmm(&at)
+            .iter()
+            .map(|q| match *q {
+                Qmm::Tiled { crossover_tg } => Rung::Tiled { crossover_tg },
+                Qmm::Qmv => Rung::Qmv { vecs: 2 },
+            })
+            .collect()
+    }
+
+    fn kquant(&self) -> kernels_slang::linear::kquant::Tactic {
+        KQUANT
+    }
+
+    /// The vector kernel folds by shuffles where the adapter's subgroups
+    /// hold a 32-lane strip.
+    fn gemm(&self, tier: kernels_slang::Tier) -> kernels_slang::linear::gemm::Tactic {
+        kernels_slang::linear::gemm::Tactic { tier }
+    }
+
+    fn batch(&self, pairs: u32, experts: u32) -> kernels_slang::linear::moe::select::Batch {
+        kernels_slang::linear::moe::select::Batch {
+            tile: self.moe_tile_rows(pairs, experts),
+            padded: self.moe_sorted_rows(pairs, experts),
+            tier: kernels_slang::Tier::Baseline,
+            sort_lanes: 256,
+        }
+    }
+
+    fn routed_tier(&self, tier: kernels_slang::Tier) -> kernels_slang::Tier {
+        tier
+    }
+
+    fn lora_tier(&self) -> kernels_slang::Tier {
+        kernels_slang::Tier::Baseline
+    }
+
+    /// The adapter's tier (its subgroup prefill tile where every subgroup
+    /// is 32 lanes), a decode workgroup of 256 invocations (128 measured
+    /// 26-61% slower through wgpu on an RTX 4090) and prefill tiles of 16
+    /// rows of 16 lanes, the 256 invocations WebGPU's default workgroup
+    /// holds.
+    fn sdpa(&self, tier: kernels_slang::Tier, _head_dim: u32) -> kernels_slang::attn::sdpa::Tactic {
+        kernels_slang::attn::sdpa::Tactic {
+            tier,
+            narrow: false,
+            decode_threads: 256,
+            tile_rows: 16,
+            tile_lanes: 16,
+            split_groups: self.sdpa_split_groups(),
+            split_min_keys: self.sdpa_split_min_keys(),
+            prefill_work: if cfg!(target_arch = "wasm32") {
+                TAB_PREFILL_WORK
+            } else {
+                0
+            },
+        }
+    }
+
+    fn binds_split(&self, lse: bool) -> bool {
+        let buffers = self.storage_buffers();
+        buffers == 0 || buffers >= SPLIT_STORAGE_BUFFERS + u32::from(lse)
+    }
+
+    /// The recurrences fold their norms through workgroup memory, as WGSL
+    /// does everywhere; a chunked or committed recurrence holds its state in
+    /// registers from 64 rows, the threshold this engine has always run at.
+    fn recurrent(&self) -> kernels_slang::ssm::gdn_recurrent::Tactic {
+        kernels_slang::ssm::gdn_recurrent::Tactic {
+            tier: kernels_slang::Tier::Baseline,
+            register_min_rows: 64,
+        }
+    }
+
+    fn moe_tile_rows(&self, pairs: u32, experts: u32) -> u32 {
+        Tuning::moe_tile_rows(self, pairs, experts)
+    }
+
+    fn moe_sorted_rows(&self, pairs: u32, experts: u32) -> u32 {
+        Tuning::moe_sorted_rows(self, pairs, experts)
+    }
+
+    fn sdpa_tile_rows_per_request(&self) -> u32 {
+        Tuning::sdpa_tile_rows_per_request(self)
+    }
+
+    fn sdpa_split_groups(&self) -> u32 {
+        Tuning::sdpa_split_groups(self)
+    }
+
+    fn sdpa_split_min_keys(&self) -> u32 {
+        Tuning::sdpa_split_min_keys(self)
+    }
+}

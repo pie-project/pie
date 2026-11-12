@@ -3168,6 +3168,7 @@ impl Shell {
         let bindings = FireBindings {
             rs_snaps,
             row_ring,
+            tokens_host: None,
             group_masks,
             tokens: bound.tokens,
             positions: bound.positions,
@@ -3318,6 +3319,8 @@ impl Shell {
                 &place,
                 &self.scratch,
                 &self.tuning,
+                // Vulkan's tactics read their own tuning, not the tier.
+                kernels_slang::Tier::Subgroup,
                 self.weights.gathered(),
                 self.weights.host(),
             )
