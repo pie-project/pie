@@ -39,3 +39,11 @@ mislead; "webgpu" names the API. Separate PR after engine-gpu lands (touches CLI
 ## F6 — Shared pure-logic helpers across all engines
 Layout math, slot-table serialization, expert / row table placement are conceptually shared by CUDA, Metal, XLA and
 engine-gpu but implemented per backend (19-30% identical). Extract into `engine` as pure functions.
+
+## F7 — Browser build glue cleanups (wasmtime-web / web-std)
+Checked against wasmtime 51.0.0-rc.1 / 50.0.1 (2026-11): both crates are still needed (wasm32-unknown-unknown host
+unsupported upstream; fiber backend is embedder-supplied via `custom-fiber`; wasmtime-wasi needs multi-thread tokio /
+net / fs; tokio can't replace web-std on wasm32). Cleanups possible on 49 already: delete wasmtime-web NopCodeMemory
+(Pulley code is never made executable); optionally drop `custom-virtual-memory` and its ~60 lines of hooks (perf check
+first); align web-std's `wasmtime-internal-fiber = "=48.0.1"` pin with wasmtime's version (two fiber crate copies today).
+On a 51 upgrade: check the new default per-store active fiber limit (wasmtime #14971).
