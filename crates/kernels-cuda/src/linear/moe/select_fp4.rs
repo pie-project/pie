@@ -473,9 +473,11 @@ pub fn select_mxfp4_w4a8(
     let (op, glu, bias, (code, limit, alpha)) = (OP, false, None::<Tensor>, (0, 0.0f32, 0.0f32));
     let fan = &selected(OP, x, routes, y)?;
     // The staged kernels where the release tunes them, held or streamed (a
-    // streamed table's codes rows by cp.async into the same stages).
+    // streamed table's codes rows by cp.async into the same stages). A
+    // table's entries are 16-aligned (the pool's planes); `codes` is then
+    // the bank's host copy, which no kernel reads, wherever its file lays it.
     if ctx.tuning().mxfp4_w4a8_tma
-        && codes.ptr.is_multiple_of(16)
+        && (table.tabled() || codes.ptr.is_multiple_of(16))
         && ctx.smem_fits(W4A8_TMA_SMEM)
     {
         return select_mxfp4_w4a8_tma(ctx, x, codes, scales, routes, y, gran, fan, table);
@@ -770,8 +772,9 @@ fn select_mxfp4_w4a8_tma(
     })?;
     // The codes map spans a table's window (its entries whole code rows
     // past its base), or without one the bank, where any held table's
-    // entries lie; a streamed table's codes are read through its entries,
-    // the map (the bank's) unread.
+    // entries lie. A streamed table's codes are read through its entries:
+    // no map of them is read, and the routes' stands in.
+    let stream = table.streams();
     let (w_base, w_rows) = if table.located && table.window != (0, 0) {
         let rows = table.window.1 / u64::from(x.width / 2);
         let rows =
@@ -780,18 +783,21 @@ fn select_mxfp4_w4a8_tma(
     } else {
         (codes.ptr, experts * y.width)
     };
-    let map_w = encode(Map {
-        ptr: w_base,
-        ty: dr::CUtensorMapDataType::CU_TENSOR_MAP_DATA_TYPE_UINT8,
-        dims: [x.width / 2, w_rows, 0],
-        strides: [u64::from(x.width / 2), 0],
-        boxes: [64, 128, 1],
-        swizzle: dr::CUtensorMapSwizzle::CU_TENSOR_MAP_SWIZZLE_64B,
-    })?;
+    let map_w = if stream {
+        map_x
+    } else {
+        encode(Map {
+            ptr: w_base,
+            ty: dr::CUtensorMapDataType::CU_TENSOR_MAP_DATA_TYPE_UINT8,
+            dims: [x.width / 2, w_rows, 0],
+            strides: [u64::from(x.width / 2), 0],
+            boxes: [64, 128, 1],
+            swizzle: dr::CUtensorMapSwizzle::CU_TENSOR_MAP_SWIZZLE_64B,
+        })?
+    };
     let tiles = y.width.div_ceil(256);
     // Persistent: a CTA a multiprocessor over the (row tile, slice) jobs.
     let sms = ctx.multiprocessors().unwrap_or(1).max(1);
-    let stream = table.streams();
     let fire = if ws {
         Fire::at(kernel(
             SELECT_FP4_SM120,
