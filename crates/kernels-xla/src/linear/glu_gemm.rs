@@ -18,14 +18,29 @@ use crate::mosaic::{Body, Grid, Kernel, Operand as Block, Sem, Window};
 /// The scoped VMEM a kernel may take (a v6e holds 128 MiB).
 const VMEM_CAP: i64 = 100 << 20;
 
+/// The narrowest rows a kernel takes: measured on Gemma-4-12B and 31B
+/// (3840 and 5376 wide), not on the narrower Gemmas.
+const LEAST_K: i64 = 3840;
+
 /// `gelu(x · w_gate) · (x · w_up)` for the first `rows` bf16 rows of `x`
 /// `[_, k]` and the landed gate-up weight `w` `[k, 2·intermediate]`; `None`
 /// where no block fits.
-pub fn geglu(f: &mut Func, x: Val, w: Val, rows: u32, intermediate: i64) -> Result<Option<Val>, Error> {
+pub fn geglu(
+    f: &mut Func,
+    x: Val,
+    w: Val,
+    rows: u32,
+    intermediate: i64,
+) -> Result<Option<Val>, Error> {
     let x = super::gemm::head_rows(f, x, rows)?;
     let (m, k) = (f.dims(x)[0], f.dims(x)[1]);
     let i = intermediate;
-    if f.elem(x) != Elem::Bf16 || f.elem(w) != Elem::Bf16 || f.dims(w) != [k, 2 * i] || k % 128 != 0 {
+    if f.elem(x) != Elem::Bf16
+        || f.elem(w) != Elem::Bf16
+        || f.dims(w) != [k, 2 * i]
+        || k % 128 != 0
+        || k < LEAST_K
+    {
         return Ok(None);
     }
     let Some(bn) = [512, 256].into_iter().find(|bn| i % bn == 0) else {
@@ -84,13 +99,14 @@ pub fn geglu(f: &mut Func, x: Val, w: Val, rows: u32, intermediate: i64) -> Resu
     let c = kernel
         .build(|b, blk| {
             let x = b.vload_all(blk.ins[0])?;
-            let product = |b: &mut Body, w: crate::mosaic::V| -> crate::hlo::Built<crate::mosaic::V> {
-                let w = b.vload_all(w)?;
-                let acc = b.splat_f(&[bm, bn], Elem::F32, 0.0)?;
-                let y = b.matmul(x, w, acc, false)?;
-                let y = b.convert_f(y, Elem::Bf16)?;
-                b.convert_f(y, Elem::F32)
-            };
+            let product =
+                |b: &mut Body, w: crate::mosaic::V| -> crate::hlo::Built<crate::mosaic::V> {
+                    let w = b.vload_all(w)?;
+                    let acc = b.splat_f(&[bm, bn], Elem::F32, 0.0)?;
+                    let y = b.matmul(x, w, acc, false)?;
+                    let y = b.convert_f(y, Elem::Bf16)?;
+                    b.convert_f(y, Elem::F32)
+                };
             let g = product(b, blk.ins[1])?;
             let u = product(b, blk.ins[2])?;
             let a = super::moe_gmm::glu_of(b, ExpertGlu::GegluTanh, g, u, &[bm, bn])?;
