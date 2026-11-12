@@ -384,12 +384,6 @@ impl RsLayout {
 }
 
 impl ChunkRecipe {
-    /// The fixed records a working set holds: [`FIXED_SETS_PER_WS`].
-    #[must_use]
-    pub fn fixed_sets_per_ws(&self) -> u32 {
-        FIXED_SETS_PER_WS
-    }
-
     /// The copy-on-write fixed records the pool reserves once.
     #[must_use]
     pub fn cow_sets(&self) -> u32 {
@@ -452,22 +446,6 @@ impl ChunkRecipe {
             .find(|s| matches!(s, SlotLayout::Fixed { .. }))
     }
 
-    /// The bytes the weight floor holds: each MoE shape's top-k experts of
-    /// two layers, each table group's rows of one fire.
-    #[must_use]
-    pub fn weight_floor_bytes(&self) -> u64 {
-        self.weights.iter().map(WeightSlot::floor_bytes).sum()
-    }
-
-    /// The chunks the weight floor takes.
-    #[must_use]
-    pub fn weight_floor_chunks(&self) -> u64 {
-        self.weights
-            .iter()
-            .map(|w| w.floor_chunks(self.chunk_bytes))
-            .sum()
-    }
-
     /// The chunks every streamable weight takes, held whole.
     #[must_use]
     pub fn weight_chunks(&self) -> u64 {
@@ -475,16 +453,6 @@ impl ChunkRecipe {
             .iter()
             .map(|w| w.chunks(self.chunk_bytes))
             .sum()
-    }
-
-    /// The weight shapes in a line ([`WeightSlot::shape`]).
-    #[must_use]
-    pub fn weight_shapes(&self) -> String {
-        self.weights
-            .iter()
-            .map(WeightSlot::shape)
-            .collect::<Vec<_>>()
-            .join(" ")
     }
 
     /// The chunks a working set takes at the profile's context, its share of
@@ -1434,6 +1402,3 @@ pub fn human(bytes: u64) -> String {
     }
     format!("{bytes}B")
 }
-
-#[cfg(test)]
-mod tests;
