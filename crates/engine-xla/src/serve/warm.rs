@@ -406,20 +406,60 @@ impl Shell {
         // A parked program the host's free memory holds once the compiles are
         // done (two compiles' room kept) loads from the disk cache here, at
         // load, not in the first fire that takes its shape (v5e Qwen3-0.6B
-        // c256: 13 parked loads stalled a 43 s round 3-5 s).
+        // c256: 13 parked loads stalled a 43 s round 3-5 s), side by side in
+        // ladder order, each admitted while the free memory holds it beside
+        // those still loading (one at a time a v6e reloaded Qwen3.6-35B-A3B's
+        // freshly compiled ladder in 150 s).
         let mut parked = parked.load(SeqCst);
-        for (at, (text, sig)) in texts.iter().enumerate() {
-            if parked == 0 {
-                break;
+        if parked > 0 {
+            let next = std::sync::atomic::AtomicUsize::new(0);
+            let full = std::sync::atomic::AtomicBool::new(false);
+            let loading = std::sync::atomic::AtomicU64::new(0);
+            let loads: Vec<
+                std::sync::Mutex<Option<Result<std::sync::Arc<crate::device::Program>>>>,
+            > = (0..texts.len())
+                .map(|_| std::sync::Mutex::new(None))
+                .collect();
+            let held = &programs;
+            std::thread::scope(|scope| {
+                for _ in 0..threads {
+                    scope.spawn(|| {
+                        loop {
+                            let at = next.fetch_add(1, SeqCst);
+                            let Some((text, sig)) = texts.get(at) else {
+                                break;
+                            };
+                            if full.load(SeqCst) {
+                                break;
+                            }
+                            if held[at].is_some() || !device.on_disk(text) {
+                                continue;
+                            }
+                            let hold = hold_bytes(text);
+                            {
+                                let _turn = admit.lock().expect("the warm admission lock poisoned");
+                                let busy = loading.load(SeqCst);
+                                if available_memory().is_none_or(|b| b < hold + busy + 2 * need) {
+                                    full.store(true, SeqCst);
+                                    break;
+                                }
+                                loading.fetch_add(hold, SeqCst);
+                            }
+                            let program = device.program(text, (*sig).clone());
+                            loading.fetch_sub(hold, SeqCst);
+                            if let Ok(mut slot) = loads[at].lock() {
+                                *slot = Some(program);
+                            }
+                        }
+                    });
+                }
+            });
+            for (at, slot) in loads.into_iter().enumerate() {
+                if let Some(program) = slot.into_inner().ok().flatten() {
+                    programs[at] = Some(program);
+                    parked -= 1;
+                }
             }
-            if programs[at].is_some() || !device.on_disk(text) {
-                continue;
-            }
-            if available_memory().is_none_or(|b| b < hold_bytes(text) + 2 * need) {
-                break;
-            }
-            programs[at] = Some(device.program(text, (*sig).clone()));
-            parked -= 1;
         }
         if parked > 0 {
             tracing::warn!(
