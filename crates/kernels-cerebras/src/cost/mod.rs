@@ -23,9 +23,12 @@ pub struct Features {
     pub group_hops: f64,
     /// The reductions' hops between the group roots.
     pub root_hops: f64,
-    /// The fabric distance a step's collectives cross: each layer's multicasts and reductions
-    /// span the unit's rows and its columns.
-    pub span: f64,
+    /// The fabric distance a step's collectives cross down the columns: each layer's multicasts
+    /// and reductions span the unit's rows.
+    pub span_rows: f64,
+    /// The distance they cross along the rows: the unit's columns (the attention or the MLP
+    /// half's, the narrower).
+    pub span_cols: f64,
     /// KV elements one row PE reads a step (keys and values, the attention layers' entries times
     /// a column's KV dims).
     pub kv: f64,
@@ -80,7 +83,7 @@ impl Features {
             f64::from(p.reduce.row.max(1)).min(span_c),
         );
         let group_hops = layers * 2.0 * (gc + gr);
-        let span = layers * (rows + span_c);
+        let (span_rows, span_cols) = (layers * rows, layers * span_c);
         let root_hops = layers * 2.0 * ((rows / gc).ceil() + (span_c / gr).ceil());
         let head = f64::from(p.head.vocab_rows) * (h / f64::from(p.head.cols.max(1))).ceil();
         Features {
@@ -88,7 +91,8 @@ impl Features {
             matvec,
             group_hops,
             root_hops,
-            span,
+            span_rows,
+            span_cols,
             kv,
             head,
         }

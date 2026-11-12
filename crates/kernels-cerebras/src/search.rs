@@ -1,8 +1,9 @@
 //! The search: a model's partitions ranked by what they cost ([`crate::cost`]). From each of the
 //! serving family's presets (the one made for the model first), it moves the preset's keys one or
 //! two at a time over a ladder of values, keeps the moves that plan, serve the positions asked for
-//! and leave every image its stack room, and walks to the fastest predicted step. The best few are
-//! built ([`Program::build`]: the fabric and its colours) before one is returned.
+//! and leave every image its stack room, and walks to the fastest predicted step. A candidate
+//! ranks ahead of the made-for preset only where it beats it by the time model's resolution
+//! ([`RESOLUTION`]). The best few are built ([`Program::build`]: the fabric and its colours) before one is returned.
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -21,6 +22,11 @@ pub const MARGIN: f64 = 512.0;
 
 /// The refusals the repair follows a step.
 const BEAM: usize = 96;
+
+/// The least gain (a fraction of the made-for preset's step) a candidate must predict to rank
+/// ahead of that preset: the time model's largest error on the moves the chip measured (Gemma
+/// 12B's, 0.3%).
+pub const RESOLUTION: f64 = 0.003;
 
 /// Keys that are not the partition's (the contract's levels and loop, the head's scale).
 const FIXED: &[&str] = &["CTX", "LOOP", "NLV", "HSCALE", "RLV", "RBITS", "CAP", "WL"];
@@ -75,6 +81,12 @@ pub fn search(shape: &Shape, ask: &Asked, keep: usize) -> R<Vec<Scored>> {
         layer,
         anchor: memory::anchor(shape),
     };
+    // the made-for preset as it plans: what a candidate must beat by the resolution
+    let made = seeds
+        .first()
+        .filter(|p| p.made_for == Some(sig))
+        .and_then(|p| s.score(p))
+        .filter(|c| builds(&c.planned.plan));
     let mut found: BTreeMap<String, Scored> = BTreeMap::new();
     for seed in seeds {
         if let Some(best) = s.walk(seed) {
@@ -83,6 +95,13 @@ pub fn search(shape: &Shape, ask: &Asked, keep: usize) -> R<Vec<Scored>> {
     }
     let mut all: Vec<Scored> = found.into_values().collect();
     all.sort_by(|a, b| a.ms.total_cmp(&b.ms));
+    if let Some(mut m) = made {
+        all.retain(|c| key(&c.planned.preset) != key(&m.planned.preset));
+        let bar = m.ms * (1.0 - RESOLUTION);
+        let at = all.iter().position(|c| c.ms > bar).unwrap_or(all.len());
+        m.planned.preset.name = format!("search({})", m.planned.preset.name);
+        all.insert(at, m);
+    }
     let mut out = Vec::new();
     let mut why = Vec::new();
     for c in all {

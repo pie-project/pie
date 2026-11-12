@@ -258,11 +258,18 @@ presets stay as the shipping overrides until the search reproduces each one on t
 
 `cost::Features` reads what a decode step does off a plan: the weight elements the busiest PE of
 each phase multiplies, the reductions' hops within and between groups, the fabric distance the
-collectives cross, the KV elements a row reads, the head PE's elements. `cost::time` prices them:
-weight and KV elements at the PE's f16 FMAC rate (4 a cycle at 875 MHz), the rest at rates fitted
-to the chip (Qwen3.5 9B / 4B / 0.8B, the Qwen3-8B G2 and PY sweeps of requests 0954 / 0961: within
-2% of each), plus each layer's own cost, read off the measured step of the model's shipping plan
-(`time::MEASURED`; a model the chip has not run takes the median).
+collectives cross down the columns (the rows) and along the rows (the columns), the KV elements a
+row reads, the head PE's elements. `cost::time` prices them at the chip's rates. The weight and head
+elements' are read off the phase stamps of `TSTAMP:1` runs (requests 1179a/c/d: a weight PE's
+matvec phases, 0.46 cycles an element; the head PE's, 0.537, alike on Llama, E4B and Gemma 12B).
+The KV elements', the hops' and the spans' are fitted to what moving a preset's keys did to the bare
+step (requests 1151-1177c: Llama VR=112, 0.8B PX=128, Gemma 12B's pick, 4B PY=192, gpt-oss G2=8 /
+24): the fit predicts each move within 3 µs (`time::tests`); fitted with one move held out it
+misses the held-out one by up to 67 µs, so it ranks the moves it was fitted on and needs more sweeps
+before it ranks new ones. The columns cost nothing the chip resolves (`SPAN_COL` 0): halving the
+0.8B's cost what its doubled matvec and KV elements do. Each layer's own cost is read off the
+measured step of the model's shipping plan (`time::MEASURED`: the bare step where the chip ran it,
+else Pie decode; a model the chip has not run takes the median).
 
 `cost::memory` is the PE image model. The bytes a partition moves are the weight PE's (its K
 layers' tiles, its KV cache, its scores' buffers) and the head PE's (its vocabulary rows' tiles and
@@ -278,7 +285,8 @@ or two (a move another must follow: the positions, the units' grid) over a ladde
 seed that does not plan is repaired a key at a time, following each move that gets it past the
 check it failed. A candidate plans, serves the positions asked for (the made-for preset's, else
 4096), keeps its head over the vocabulary, leaves every image `STACK_ROOM` plus a 512 B margin
-and builds (`Program::build`). `wafer-compile search --model <m>` prints the ranking with the keys
+and builds (`Program::build`); it ranks ahead of the made-for preset only where it predicts a step
+0.3% faster (`search::RESOLUTION`, the time model's largest error on the chip's moves). `wafer-compile search --model <m>` prints the ranking with the keys
 each candidate moved from the made-for preset.
 
 ## Weights
