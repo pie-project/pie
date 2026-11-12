@@ -8,16 +8,16 @@ pub mod chip;
 pub mod chunks;
 
 pub mod comm;
-pub mod decoded;
+pub use engine_gpu::decoded;
 pub mod device;
 mod dispatch;
 pub mod encode;
-mod error;
+use engine_gpu::error;
 pub mod experts;
 pub mod feeds;
 pub mod guest;
 pub mod inputs;
-pub mod mask;
+pub use engine_gpu::mask;
 pub mod probe;
 pub mod program;
 
@@ -27,7 +27,7 @@ pub mod run;
 
 mod scratch;
 pub mod serve;
-pub mod settle;
+pub use engine_gpu::settle;
 pub mod store;
 pub mod tune;
 pub mod tuning;

@@ -1,0 +1,33 @@
+[package]
+name = "engine-gpu"
+version.workspace = true
+edition = "2024"
+authors = ["In Gim <in.gim@icloud.com>"]
+description = "What engine-vulkan and engine-wgpu share: the dispatch layer, the stores, the step pipeline and the guest programs, generic over a Backend that owns buffers, frames and kernel encoding."
+license = "Apache-2.0"
+repository = "https://github.com/pie-project/pie"
+
+[lib]
+name = "engine_gpu"
+path = "src/lib.rs"
+
+[dependencies]
+toml = "1.1"
+poem-ir = { package = "pie-poem-ir", path = "../poem-ir" }
+kernels-slang = { path = "../kernels-slang" }
+engine = { path = "../engine" }
+poem-exec = { package = "pie-poem-exec", path = "../poem-exec" }
+poem-compiler = { package = "pie-poem-compiler", path = "../poem-compiler" }
+profile = { package = "pie-profile", path = "../profile" }
+eta-ir = { package = "pie-eta-ir", path = "../eta-ir" }
+eta-exec = { path = "../eta-exec" }
+eta-compiler = { path = "../eta-compiler" }
+checkpoint = { path = "../checkpoint" }
+tracing = "0.1"
+
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+memmap2 = "0.9"
+libc = "0.2"
+
+[lints]
+workspace = true

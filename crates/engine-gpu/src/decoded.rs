@@ -2,7 +2,7 @@ use std::collections::BTreeSet;
 
 use poem_ir::{Attn, Def, Operation, Trace};
 
-pub(crate) fn absorbed_weights(trace: &Trace) -> BTreeSet<usize> {
+pub fn absorbed_weights(trace: &Trace) -> BTreeSet<usize> {
     let mut rows = BTreeSet::new();
     for node in &trace.nodes {
         let kv_b = match &node.op {
@@ -18,7 +18,7 @@ pub(crate) fn absorbed_weights(trace: &Trace) -> BTreeSet<usize> {
 }
 
 /// Weights an f32 activation multiplies: the quantized kernels take bf16 activations only.
-pub(crate) fn lane_axis_weights(trace: &Trace) -> BTreeSet<usize> {
+pub fn lane_axis_weights(trace: &Trace) -> BTreeSet<usize> {
     let f32_rows = |value: poem_ir::ValueId| {
         matches!(
             trace.values.get(value.0 as usize).map(|v| &v.ty),
@@ -59,11 +59,11 @@ pub(crate) fn lane_axis_weights(trace: &Trace) -> BTreeSet<usize> {
     rows
 }
 
-pub(crate) fn bf16_to_f32(bits: u16) -> f32 {
+pub fn bf16_to_f32(bits: u16) -> f32 {
     f32::from_bits(u32::from(bits) << 16)
 }
 
-pub(crate) fn f32_to_bf16(value: f32) -> u16 {
+pub fn f32_to_bf16(value: f32) -> u16 {
     let bits = value.to_bits();
     if value.is_nan() {
         return ((bits >> 16) | 0x40) as u16;
@@ -72,7 +72,7 @@ pub(crate) fn f32_to_bf16(value: f32) -> u16 {
     ((bits.wrapping_add(round)) >> 16) as u16
 }
 
-pub(crate) fn decode_affine(
+pub fn decode_affine(
     codes: &[u8],
     scales: &[u8],
     biases: Option<&[u8]>,

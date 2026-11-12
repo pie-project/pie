@@ -216,7 +216,10 @@ fn fault(fault: Fault) -> Error {
         Fault::Adapter { .. } => Error::Load(fault.to_string()),
         Fault::Blob { .. } => Error::Load(fault.to_string()),
         Fault::Program { .. } => Error::Program(fault.to_string()),
-        Fault::Wgpu { .. } | Fault::NoDevice { .. } | Fault::Blocking { .. } => {
+        Fault::Vulkan { .. }
+        | Fault::Wgpu { .. }
+        | Fault::NoDevice { .. }
+        | Fault::Blocking { .. } => {
             Error::Device(fault.to_string())
         }
         Fault::Fire(_) => Error::Invalid(fault.to_string()),

@@ -3,7 +3,7 @@
 //! hands out translated to the physical slots kernels address, and the
 //! copies, spills and evacuations that move slots.
 pub mod experts;
-pub mod kv;
+pub use engine_gpu::store::kv;
 pub mod layout;
 pub mod pool;
 pub mod rows;
@@ -45,28 +45,6 @@ pub struct RecurrentPool {
 
     /// The atoms one piece of this row holds (`u32::MAX`: whole).
     pub piece_atoms: u32,
-}
-
-impl From<poem_exec::store::Fault> for Fault {
-    fn from(fault: poem_exec::store::Fault) -> Fault {
-        match fault {
-            poem_exec::store::Fault::Ceiling { what, need, have } => {
-                Fault::Ceiling { what, need, have }
-            }
-            poem_exec::store::Fault::Unbound { what } => Fault::Unbound { what },
-            poem_exec::store::Fault::Straddled {
-                value,
-                node,
-                planned,
-                consumed,
-            } => Fault::Straddled {
-                value,
-                node,
-                planned,
-                consumed,
-            },
-        }
-    }
 }
 
 const STATE_DTYPE: Dtype = Dtype::F32;

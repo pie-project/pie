@@ -12,10 +12,20 @@ pub enum Fault {
         why: String,
     },
 
+    Blocking {
+        call: &'static str,
+    },
+
     Vulkan {
         what: &'static str,
 
         code: i32,
+    },
+
+    Wgpu {
+        what: &'static str,
+
+        why: String,
     },
 
     NoDevice {
@@ -194,13 +204,14 @@ impl fmt::Display for Fault {
         match self {
             Self::Deviceless => write!(
                 f,
-                "this build has no Vulkan in it: the `vulkan` feature is off, so the \
-                 device half is its refusing twin"
+                "this build has no GPU API in it: the backend's feature (`vulkan` or \
+                 `wgpu`) is off, so the device half is its refusing twin"
             ),
             Self::Vulkan { what, code } => {
                 write!(f, "`{what}` returned VkResult {code}")
             }
-            Self::NoDevice { detail } => write!(f, "no vulkan device to bind: {detail}"),
+            Self::Wgpu { what, why } => write!(f, "`{what}` refused: {why}"),
+            Self::NoDevice { detail } => write!(f, "no GPU device to bind: {detail}"),
             Self::Device { call, why } => write!(f, "`{call}` refused: {why}"),
             Self::Shader {
                 file,
@@ -360,6 +371,11 @@ impl fmt::Display for Fault {
                 "the plan names {what}, which this shell binds no seat for"
             ),
             Self::Residency(why) => write!(f, "{why}"),
+            Self::Blocking { call } => write!(
+                f,
+                "`{call}` would wait on the GPU, and this host never waits: a browser \
+                 answers by callback or not at all"
+            ),
         }
     }
 }
@@ -387,6 +403,28 @@ impl From<poem_exec::Error> for Fault {
 impl From<poem_exec::KernelError> for Fault {
     fn from(error: poem_exec::KernelError) -> Self {
         Self::Fire(poem_exec::Error::from(error))
+    }
+}
+
+impl From<poem_exec::store::Fault> for Fault {
+    fn from(fault: poem_exec::store::Fault) -> Fault {
+        match fault {
+            poem_exec::store::Fault::Ceiling { what, need, have } => {
+                Fault::Ceiling { what, need, have }
+            }
+            poem_exec::store::Fault::Unbound { what } => Fault::Unbound { what },
+            poem_exec::store::Fault::Straddled {
+                value,
+                node,
+                planned,
+                consumed,
+            } => Fault::Straddled {
+                value,
+                node,
+                planned,
+                consumed,
+            },
+        }
     }
 }
 

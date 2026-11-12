@@ -174,7 +174,10 @@ fn fault(fault: Fault) -> Error {
         Fault::Adapter { .. } => Error::Load(fault.to_string()),
         Fault::Blob { .. } => Error::Load(fault.to_string()),
         Fault::Program { .. } => Error::Program(fault.to_string()),
-        Fault::Vulkan { .. } | Fault::NoDevice { .. } => Error::Device(fault.to_string()),
+        Fault::Vulkan { .. }
+        | Fault::Wgpu { .. }
+        | Fault::NoDevice { .. }
+        | Fault::Blocking { .. } => Error::Device(fault.to_string()),
         Fault::Fire(_) => Error::Invalid(fault.to_string()),
 
         Fault::Residency(_) => Error::Impossible(fault.to_string()),
