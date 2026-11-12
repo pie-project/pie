@@ -324,8 +324,9 @@ enum Placement {
     /// Seat-addressed: each lane's seat runs.
     Seats,
     /// Slot refs the runtime would name: pages strided over chunks
-    /// `first .. first + 3` from the top down, piece `p` of lane `l`'s
-    /// record in chunk `first + 3 + l * pieces + p`.
+    /// `first .. first + 3` from the top down, the lanes' pages interleaved
+    /// in each and scattered over its slots (no two share one), piece `p`
+    /// of lane `l`'s record in chunk `first + 3 + l * pieces + p`.
     Refs {
         first: u32,
         per_list: u32,
@@ -342,7 +343,12 @@ impl Placement {
                 first, per_list, ..
             } => {
                 let chunk = first + 2 - (page % 3);
-                let index = (7 * page + 3 + 61 * lane) % per_list;
+                let nth = (page / 3) * 2 + lane;
+                let stride = (7..)
+                    .step_by(2)
+                    .find(|&s| gcd(s, per_list) == 1)
+                    .expect("an odd stride coprime to the slots");
+                let index = (stride * nth + 3) % per_list;
                 chunk * per_list + index
             }
         }
@@ -362,6 +368,14 @@ impl Placement {
         }
     }
 
+    /// Every slot ref of both lanes' `pages` pages is its own.
+    fn distinct(&self, pages: u32) -> bool {
+        let refs: std::collections::BTreeSet<u32> = (0..2)
+            .flat_map(|lane| (0..pages).map(move |p| self.page(lane, p)))
+            .collect();
+        refs.len() == 2 * pages as usize
+    }
+
     /// The chunks this placement holds: three of pages and the records.
     fn held(&self) -> u32 {
         match *self {
@@ -369,6 +383,10 @@ impl Placement {
             Placement::Refs { pieces, .. } => 3 + 2 * pieces,
         }
     }
+}
+
+fn gcd(a: u32, b: u32) -> u32 {
+    if b == 0 { a } else { gcd(b, a % b) }
 }
 
 /// Two prompts long enough to span pages of the recipe's tokens.
@@ -394,6 +412,10 @@ fn serve(
     let mut held = [0u32; 2];
     let mut fed: [Vec<u32>; 2] = prompts();
     let page = shell.paging().page_size;
+    assert!(
+        !refs || place.distinct(CONTEXT.div_ceil(page)),
+        "the lanes' pages share no slot"
+    );
     let records = [place.record(0), place.record(1)];
     let mut rows = Vec::new();
     let tables = |held: [u32; 2], rows: [u32; 2]| -> [Vec<u32>; 2] {

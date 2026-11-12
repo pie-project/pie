@@ -428,8 +428,10 @@ pub fn same(what: &str, got: &[Vec<f32>], want: &[Vec<f32>]) {
 }
 
 /// Slot refs the runtime would name: pages strided over chunks `first ..
-/// first + 3` from the top down, piece `p` of lane `l`'s record in chunk
-/// `first + 3 + l * pieces + p`.
+/// first + 3` from the top down, the lanes' pages interleaved in each and
+/// scattered over its slots, piece `p` of lane `l`'s record in chunk
+/// `first + 3 + l * pieces + p`. No two (lane, page) share a slot while a
+/// chunk holds every lane's pages in it ([`Refs::distinct`]).
 struct Refs {
     first: u32,
     per_list: u32,
@@ -440,8 +442,21 @@ struct Refs {
 impl Refs {
     fn page(&self, lane: u32, page: u32) -> u32 {
         let chunk = self.first + 2 - (page % 3);
-        let index = (7 * page + 3 + 61 * lane) % self.per_list;
+        let nth = (page / 3) * 2 + lane;
+        let stride = (7..)
+            .step_by(2)
+            .find(|&s| gcd(s, self.per_list) == 1)
+            .expect("an odd stride coprime to the slots");
+        let index = (stride * nth + 3) % self.per_list;
         chunk * self.per_list + index
+    }
+
+    /// Every slot ref of both lanes' `pages` pages is its own.
+    fn distinct(&self, pages: u32) -> bool {
+        let refs: std::collections::BTreeSet<u32> = (0..2)
+            .flat_map(|lane| (0..pages).map(move |p| self.page(lane, p)))
+            .collect();
+        refs.len() == 2 * pages as usize
     }
 
     fn record(&self, lane: u32) -> Vec<u32> {
@@ -459,6 +474,10 @@ impl Refs {
     }
 }
 
+fn gcd(a: u32, b: u32) -> u32 {
+    if b == 0 { a } else { gcd(b, a % b) }
+}
+
 /// As [`serve_seats`], every lane addressed by slot refs; after
 /// `evacuate_at` decodes, `between` runs (an evacuation).
 fn serve_refs(
@@ -472,6 +491,10 @@ fn serve_refs(
     let mut held = [0u32; 2];
     let mut fed: [Vec<u32>; 2] = prompts();
     let page = shell.paging().page_size;
+    assert!(
+        refs.distinct(CONTEXT.div_ceil(page)),
+        "the lanes' pages share no slot"
+    );
     let records = [refs.record(0), refs.record(1)];
     let mut rows = Vec::new();
     let table = |lane: usize, upto: u32| -> Vec<u32> {
