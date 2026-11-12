@@ -496,8 +496,15 @@ fn host_copy(boot: &Boot<'_>, params: &[usize]) -> Result<HostCopy> {
     if params.is_empty() {
         return Ok(HostCopy::Pinned);
     }
-    let bytes = crate::weights::plane_bytes(&boot.trace)?;
-    let in_file = crate::checkpoint_serving::Serving::open(boot.checkpoint, &boot.trace)
+    // A plane the load lays in another form (its codes requantized, its
+    // scales laid in atoms) is not in the file as a slot holds it, whatever
+    // its size: its copy is laid in place at load.
+    let bytes = crate::weights::laid_bytes(&boot.trace)?;
+    let laid = crate::weights::laid_planes(&boot.trace);
+    let in_file = !params.iter().any(|&param| {
+        laid.iter()
+            .any(|laid| laid.codes == param || laid.scales == param)
+    }) && crate::checkpoint_serving::Serving::open(boot.checkpoint, &boot.trace)
         .is_some_and(|serving| serving.holds(params, &bytes));
     let pinned: u64 = params.iter().map(|&param| bytes[param]).sum();
     if boot.knobs.weights_held {
@@ -1408,6 +1415,7 @@ impl Shell {
             held_for_fires,
             rank: boot.world.rank,
             arm_trace: boot.knobs.diagnostics.arm_trace,
+            weights_held: boot.knobs.weights_held,
             device_total,
             free_before,
         })
@@ -1420,6 +1428,8 @@ pub struct Staged {
     held_for_fires: u64,
     rank: u32,
     arm_trace: bool,
+    /// The load was told its weights are held (`Knobs::weights_held`).
+    weights_held: bool,
     device_total: u64,
     free_before: u64,
 }
@@ -1432,6 +1442,7 @@ impl Staged {
             held_for_fires,
             rank,
             arm_trace,
+            weights_held,
             device_total,
             free_before,
         } = self;
@@ -1443,12 +1454,19 @@ impl Staged {
         }
         // Weights left in the serving file are on no tier a fire can read:
         // they are seated in the pool before the lattice is armed over them.
-        if shell
+        // So are those a load told they are held keeps a pinned copy of
+        // (planes laid at load, which the file does not hold as served).
+        let filed = shell
             .weights
             .experts()
-            .is_some_and(|tier| tier.plan().files())
-        {
-            shell.preseat_weights()?;
+            .is_some_and(|tier| tier.plan().files());
+        let held_pinned = weights_held
+            && shell
+                .weights
+                .experts()
+                .is_some_and(|tier| !tier.plan().cached_experts().is_empty());
+        if filed || held_pinned {
+            shell.preseat_weights(filed)?;
         }
         // A load whose weights the pool does not hold whole streams them:
         // armed now, its bodies would read every expert from the host copy,

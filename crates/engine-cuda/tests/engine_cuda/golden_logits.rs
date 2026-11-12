@@ -1942,10 +1942,22 @@ fn served_experts_as(fixture: &Fixture, cache: &Path, rows: Rows, told: bool) ->
     // fire's routes only while the set may change, so a held set of packed
     // banks alone records none.
     let packed = fixture.trace.params.iter().any(|param| {
-        use poem_ir::Dtype::{Mxfp4, Nvfp4, U2g32, U2g64, U2g128, U4g32, U4g64, U8g64};
+        use poem_ir::Dtype::{
+            E4m3, E4m3g128, E4m3tile128, Mxfp4, Nvfp4, U2g32, U2g64, U2g128, U4g32, U4g64, U8g64,
+        };
         matches!(
             param.dtype,
-            Mxfp4 | Nvfp4 | U2g32 | U2g64 | U2g128 | U4g32 | U4g64 | U8g64
+            Mxfp4
+                | Nvfp4
+                | U2g32
+                | U2g64
+                | U2g128
+                | U4g32
+                | U4g64
+                | U8g64
+                | E4m3
+                | E4m3tile128
+                | E4m3g128
         )
     });
     assert!(

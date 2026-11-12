@@ -272,13 +272,18 @@ impl Plan {
     /// bytes it freed.
     pub fn host_rows(&mut self, trace: &Trace, params: &[usize]) -> Result<u64> {
         let bytes = crate::weights::plane_bytes(trace)?;
+        // A plane the load lays in another form (scales laid in atoms) is
+        // laid in place in its copy, sized for what it becomes.
+        let laid = crate::weights::laid_bytes(trace)?;
         let mut freed = 0u64;
         for &at in params {
             let param = &trace.params[at];
             if param.source != ParamSource::Checkpoint || self.streamed_whole(at) {
                 continue;
             }
-            let reserved = bytes[at].next_multiple_of(crate::weights::ALIGN);
+            let reserved = bytes[at]
+                .max(laid[at])
+                .next_multiple_of(crate::weights::ALIGN);
             self.groups.push(GroupPlan {
                 param: at,
                 name: param.name.clone(),

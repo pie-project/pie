@@ -161,19 +161,23 @@ impl Shell {
         self.pools.name_record(pieces)
     }
 
-    /// Seats the weights a held load left in the serving file, before it
-    /// arms: in pool slots of the load's own choosing, filled from the file,
-    /// where the pool holds them all; else on a pinned copy the fires read
-    /// in place. The runtime's first residency then says where each lies.
-    pub(crate) fn preseat_weights(&mut self) -> crate::Result<()> {
-        self.pools.file_weights();
+    /// Seats the weights of a held load, before it arms: in pool slots of
+    /// the load's own choosing, filled from the serving file (`filed`) or
+    /// the pinned copy it keeps, where the pool holds them all; else a filed
+    /// load's go on a pinned copy the fires read in place. The runtime's
+    /// first residency then says where each lies.
+    pub(crate) fn preseat_weights(&mut self, filed: bool) -> crate::Result<()> {
+        if filed {
+            self.pools.file_weights();
+        }
         match self.pools.preseat_plan() {
             Some(plan) => {
                 let chunks = self.pools.weight_chunks(&plan);
                 self.pools.keep_clear(chunks);
                 self.pools.preseat_weights(self.device.stream(), &plan)?;
             }
-            None => self.pools.pin_weight_hosts()?,
+            None if filed => self.pools.pin_weight_hosts()?,
+            None => {}
         }
         self.device.synchronize()?;
         self.pools.release_file_pages();

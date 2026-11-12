@@ -298,7 +298,8 @@ impl ExpertShape {
 }
 
 /// The planes an expert's entry of a packed bank's table lists
-/// (`kernels_cuda::linear::moe::Planes`), by the bank's codes: an MXFP4
+/// (`kernels_cuda::linear::moe::Planes`), by the bank's codes: a block-FP8
+/// bank's `[codes, atoms]` (its scales laid at load), an MXFP4
 /// bank's `[codes, scales, bias]`, an NVFP4 bank's `[codes, scales,
 /// tensor_scales]`, an mlx affine bank's (2, 4 or 8 bits) `[codes, scales,
 /// zeros]`; `None` a plane the bank lacks. Empty for a param that is no
@@ -316,6 +317,20 @@ pub fn packed_planes(trace: &poem_ir::Trace, codes: usize) -> Vec<Option<u32>> {
             .map(|at| at as u32)
     };
     let scales = named(poem::declare::scales_name(&param.name));
+    // A block-FP8 (or MXFP8) bank whose scales the load lays in atoms, an
+    // expert's whole 128-row blocks: `[codes, atoms]`.
+    if matches!(
+        param.dtype,
+        Dtype::E4m3 | Dtype::E4m3tile128 | Dtype::E4m3g128
+    ) {
+        let laid = crate::weights::laid_planes(trace).into_iter().any(|laid| {
+            laid.codes == codes && laid.leads > 1 && Some(laid.scales as u32) == scales
+        });
+        return match (laid, scales) {
+            (true, Some(scales)) => vec![Some(codes as u32), Some(scales)],
+            _ => Vec::new(),
+        };
+    }
     let third = match param.dtype {
         // Its expert bias where its select adds one (gpt-oss).
         Dtype::Mxfp4 => match select_bias(trace, codes) {
@@ -554,7 +569,8 @@ pub fn streamed_experts(trace: &poem_ir::Trace) -> Vec<usize> {
         ..poem_compiler::DeviceProfile::default()
     };
     let budgets = poem_compiler::Budgets::of(poem_compiler::Budget::default());
-    let Ok(recipe) = poem_compiler::chunk::plan(trace, &budgets, &profile) else {
+    let view = crate::weights::laid_view(trace);
+    let Ok(recipe) = poem_compiler::chunk::plan(&view, &budgets, &profile) else {
         return Vec::new();
     };
     // A plane held beside its bank stays out, and keeps no layer out.

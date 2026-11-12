@@ -2158,11 +2158,18 @@ impl Run<'_> {
             // An MXFP4 bank against e4m3 rows, as the release asks, on the
             // consumer Blackwells' block-scaled mma.sync (`kernel.moe.mxfp4_w4a8_from`).
             let (codes, scales, biases) = self.planes(bank);
-            // A bank the weight cache holds is read through its table (one
-            // that streams falls to the bf16-activation arm, which counts
-            // its routes); else the bank where it lies, on the device.
+            // A bank the weight cache takes is read through its table, held or
+            // streamed (a streamed one's routes counted once a kernel takes
+            // it); else the bank where it lies, on the device.
             let table = self.bank_table(bank);
             let takes = table.tabled() || !crate::device::alloc::is_host_pointer(codes.ptr);
+            let counted = |this: &mut Self| -> Result<(), kernels_cuda::Error> {
+                if table.streams() {
+                    let routes = this.tensor(routes);
+                    linear::moe::note_routes(this.ctx(), OP, routes, codes.rows, table.hits)?;
+                }
+                Ok(())
+            };
             if let ActQuant::E4m3 { gran } = quant
                 && matches!(codes.dtype, Dtype::Mxfp4 | Dtype::U8)
                 && biases.is_none()
@@ -2178,7 +2185,7 @@ impl Run<'_> {
                     table,
                 )?
             {
-                return Ok(());
+                return counted(self);
             }
             // An NVFP4 bank against NVFP4 rows (W4A4), as the release asks,
             // on the block-scaled mma.sync (`kernel.moe.nvfp4_w4a4_from`).
@@ -2198,7 +2205,7 @@ impl Run<'_> {
                     table,
                 )?
             {
-                return Ok(());
+                return counted(self);
             }
             return self.select_a16(OP, x, bank, routes, y);
         }
@@ -2521,7 +2528,10 @@ impl Run<'_> {
                 let Some(gran) = fp8_bank_gran(scales, self.tensor(x).width) else {
                     return Err(unlaid(op));
                 };
-                if crate::device::alloc::is_host_pointer(codes.ptr) {
+                // A bank the weight cache takes is read through its table
+                // (one that streams counts its routes here).
+                let table = self.bank_table(bank);
+                if !table.tabled() && crate::device::alloc::is_host_pointer(codes.ptr) {
                     return Err(kernels_cuda::Error::Backend {
                         op,
                         detail: "a W8A16 select reads a resident bank, and this one is seated \
@@ -2531,9 +2541,14 @@ impl Run<'_> {
                 }
                 let x = self.tensor(x);
                 let routes = self.tensor(routes);
+                if table.streams() {
+                    linear::moe::note_routes(self.ctx(), op, routes, codes.rows, table.hits)?;
+                }
                 // A batch's routes quantized as the deployment says, on the
-                // FP8 MMA where there is one (W8A8).
-                if linear::moe::fp8_w8a8_capable()
+                // FP8 MMA where there is one (W8A8), whose kernels read an
+                // exponent a 128 of K: an MXFP8 bank's (one a 32) stays W8A16.
+                if gran == 128
+                    && linear::moe::fp8_w8a8_capable()
                     && routes.rows * routes.width >= linear::moe::FP8_W8A8_FROM
                     && linear::moe::fp8_select_takes(x, self.tensor(y).width)
                 {
@@ -2545,7 +2560,7 @@ impl Run<'_> {
                         codes.rows,
                         routes,
                         &mut self.tensor(y),
-                        linear::moe::ExpertTable::RESIDENT,
+                        table,
                     );
                 }
                 linear::moe::select_fp8_w8a16(
@@ -2559,7 +2574,7 @@ impl Run<'_> {
                     routes,
                     &mut self.tensor(y),
                     None,
-                    linear::moe::ExpertTable::RESIDENT,
+                    table,
                 )
             }
             stored => Err(kernels_cuda::Error::Backend {

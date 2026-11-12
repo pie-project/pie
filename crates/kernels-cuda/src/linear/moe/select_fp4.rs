@@ -469,16 +469,18 @@ pub fn select_mxfp4_w4a8(
     table: ExpertTable,
 ) -> Result<bool, Error> {
     const OP: &str = "linear.moe_select_mxfp4_w4a8";
-    if !(matches!(gran, 32 | 128)
-        && y.dtype == Dtype::Bf16
-        && !table.streams()
-        && w4a8_takes(ctx, x, routes))
-    {
+    if !(matches!(gran, 32 | 128) && y.dtype == Dtype::Bf16 && w4a8_takes(ctx, x, routes)) {
         return Ok(false);
     }
     let (op, glu, bias, (code, limit, alpha)) = (OP, false, None::<Tensor>, (0, 0.0f32, 0.0f32));
     let fan = &selected(OP, x, routes, y)?;
-    if ctx.tuning().mxfp4_w4a8_tma && codes.ptr.is_multiple_of(16) && ctx.smem_fits(W4A8_TMA_SMEM) {
+    // The codes by TMA on a bank the device holds; a streamed table (it may
+    // name mapped host memory) takes the cp.async ring below.
+    if ctx.tuning().mxfp4_w4a8_tma
+        && !table.streams()
+        && codes.ptr.is_multiple_of(16)
+        && ctx.smem_fits(W4A8_TMA_SMEM)
+    {
         return select_mxfp4_w4a8_tma(ctx, x, codes, scales, routes, y, gran, fan, table);
     }
     let (rows, kw) = (x.rows as usize, x.width as usize);
@@ -596,7 +598,6 @@ pub fn select_nvfp4_w4a4(
     const OP: &str = "linear.moe_select_nvfp4_w4a4";
     let from = ctx.tuning().nvfp4_w4a4_from;
     if from == 0
-        || table.streams()
         || routes.rows * routes.width < from
         || x.dtype != Dtype::Bf16
         || y.dtype != Dtype::Bf16

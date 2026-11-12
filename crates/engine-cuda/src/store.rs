@@ -4098,14 +4098,16 @@ fn lay(
         chunk: if one_window { paged.merged() } else { paged },
         ..poem_compiler::DeviceProfile::default()
     };
+    // Each plane at the bytes its slot holds: laid scales as their atoms.
+    let view = crate::weights::laid_view(trace);
     let recipe =
-        poem_compiler::chunk::plan(trace, budgets, &profile).map_err(|why| Fault::Unbound {
+        poem_compiler::chunk::plan(&view, budgets, &profile).map_err(|why| Fault::Unbound {
             what: format!("a chunk recipe for this load's cache rows: {why}"),
         })?;
     let banks: Vec<(usize, u64)> = if experts.is_empty() {
         Vec::new()
     } else {
-        let bytes = crate::weights::plane_bytes(trace)?;
+        let bytes = crate::weights::laid_bytes(trace)?;
         // A plane held on the device beside its bank takes no slot bytes.
         let beside = experts
             .iter()
