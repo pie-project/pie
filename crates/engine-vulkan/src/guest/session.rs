@@ -11,7 +11,7 @@ use crate::device::ctx::{Core, Frame, Pending};
 use crate::error::{Fault, Result};
 
 use engine_gpu::guest::session::{
-    BINDINGS, CFG_BINDING, Cfg, DESC_WORDS, alias_reshapes, desc_words, groups_for, words_le,
+    BINDINGS, Cfg, DESC_WORDS, alias_reshapes, desc_words, groups_for, words_le,
 };
 
 /// A stage's pipelines, which follow from its SPIR-V alone: built once per
@@ -644,15 +644,13 @@ fn build_stage(
 
 fn build_pipelines(device: &Context, lowered: &crate::guest::Lowered) -> Result<Built> {
     let core = device.core();
-    let bindings: Vec<vk::DescriptorSetLayoutBinding> = (0..BINDINGS)
-        .map(|i| {
+    // The layout the stage's SPIR-V was checked against when it lowered.
+    let bindings: Vec<vk::DescriptorSetLayoutBinding> = crate::guest::stage_layout()
+        .into_iter()
+        .map(|(i, slot)| {
             vk::DescriptorSetLayoutBinding::default()
                 .binding(i)
-                .descriptor_type(if i == CFG_BINDING {
-                    vk::DescriptorType::UNIFORM_BUFFER
-                } else {
-                    vk::DescriptorType::STORAGE_BUFFER
-                })
+                .descriptor_type(crate::guest::descriptor_type(slot))
                 .descriptor_count(1)
                 .stage_flags(vk::ShaderStageFlags::COMPUTE)
         })

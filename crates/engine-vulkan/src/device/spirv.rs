@@ -24,6 +24,9 @@ const DECORATION_NON_WRITABLE: u32 = 24;
 const DECORATION_BINDING: u32 = 33;
 const DECORATION_OFFSET: u32 = 35;
 const STORAGE_PUSH_CONSTANT: u32 = 9;
+const STORAGE_UNIFORM: u32 = 2;
+const STORAGE_STORAGE_BUFFER: u32 = 12;
+const DECORATION_BUFFER_BLOCK: u32 = 3;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Declared {
@@ -43,6 +46,11 @@ pub enum Malformed {
     NotSpirv,
     ZeroLengthInstruction,
     NoLocalSize,
+    /// A binding the module declares as something other than a storage
+    /// buffer, which every layout here binds it as.
+    NotStorage {
+        binding: u32,
+    },
 }
 
 impl std::fmt::Display for Malformed {
@@ -52,6 +60,10 @@ impl std::fmt::Display for Malformed {
             Self::NotSpirv => f.write_str("the bytes are not SPIR-V"),
             Self::ZeroLengthInstruction => f.write_str("a zero-length SPIR-V instruction"),
             Self::NoLocalSize => f.write_str("the module states no LocalSize"),
+            Self::NotStorage { binding } => write!(
+                f,
+                "binding {binding} is not a storage buffer, and its pipeline layout binds one"
+            ),
         }
     }
 }
@@ -82,6 +94,10 @@ pub fn declared(words: &[u32]) -> Result<Declared, Malformed> {
     let mut constants: HashMap<u32, u32> = HashMap::new();
     let mut pointers: HashMap<u32, u32> = HashMap::new();
     let mut push_variables: Vec<u32> = Vec::new();
+    // Each variable's pointer type and storage class; types decorated
+    // BufferBlock (a storage buffer in the Uniform class, older SPIR-V).
+    let mut variables: HashMap<u32, (u32, u32)> = HashMap::new();
+    let mut buffer_blocks: Vec<u32> = Vec::new();
     let mut offsets: HashMap<u32, Vec<(u32, u32)>> = HashMap::new();
     let mut types: HashMap<u32, (u32, Vec<u32>)> = HashMap::new();
     let mut strides: HashMap<u32, (Option<u32>, Option<u32>)> = HashMap::new();
@@ -105,6 +121,9 @@ pub fn declared(words: &[u32]) -> Result<Declared, Malformed> {
             OP_DECORATE if count >= 3 && w[2] == DECORATION_NON_WRITABLE => {
                 non_writable.push(w[1]);
             }
+            OP_DECORATE if count >= 3 && w[2] == DECORATION_BUFFER_BLOCK => {
+                buffer_blocks.push(w[1]);
+            }
             OP_DECORATE if count >= 4 => match w[2] {
                 DECORATION_BINDING => {
                     highest = Some(highest.map_or(w[3], |h| h.max(w[3])));
@@ -122,6 +141,9 @@ pub fn declared(words: &[u32]) -> Result<Declared, Malformed> {
             }
             OP_VARIABLE if count >= 4 && w[3] == STORAGE_PUSH_CONSTANT => {
                 push_variables.push(w[1]);
+            }
+            OP_VARIABLE if count >= 4 => {
+                variables.insert(w[2], (w[1], w[3]));
             }
             OP_TYPE_INT
             | OP_TYPE_FLOAT
@@ -147,6 +169,16 @@ pub fn declared(words: &[u32]) -> Result<Declared, Malformed> {
     let mut used = vec![false; bindings as usize];
     let mut writable = vec![false; bindings as usize];
     for &(variable, binding) in &bound {
+        let storage = variables.get(&variable).is_none_or(|&(pointer, class)| {
+            class == STORAGE_STORAGE_BUFFER
+                || (class == STORAGE_UNIFORM
+                    && pointers
+                        .get(&pointer)
+                        .is_some_and(|block| buffer_blocks.contains(block)))
+        });
+        if !storage {
+            return Err(Malformed::NotStorage { binding });
+        }
         used[binding as usize] = true;
         if !non_writable.contains(&variable) {
             writable[binding as usize] = true;
@@ -254,5 +286,19 @@ fn size_of(ty: u32, graph: &Graph<'_>, depth: u32) -> Option<u32> {
             Some(total)
         }
         _ => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn every_shipped_module_binds_storage_buffers_only() {
+        assert!(!kernels_slang::SPIRV.is_empty());
+        for (key, _, code) in kernels_slang::SPIRV {
+            let words = words(code).unwrap_or_else(|why| panic!("{key}: {why}"));
+            declared(&words).unwrap_or_else(|why| panic!("{key}: {why}"));
+        }
     }
 }

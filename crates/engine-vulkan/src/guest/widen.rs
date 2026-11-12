@@ -13,6 +13,13 @@ use crate::error::Result;
 
 /// Config slots, one per widen still on the queue: a frame that runs ahead
 /// keeps its own offsets while the next frame records.
+/// What the widen's pipeline layout binds: source, destination, config.
+const LAYOUT: [(u32, super::Slot); 3] = [
+    (0, super::Slot::Storage),
+    (1, super::Slot::Storage),
+    (2, super::Slot::Storage),
+];
+
 const SLOTS: u64 = 16;
 
 /// Apart by any device's storage-buffer offset alignment.
@@ -37,19 +44,16 @@ impl std::fmt::Debug for Widen {
 
 impl Widen {
     pub fn new(device: &Context) -> Result<Widen> {
-        let words =
-            super::lower(usize::MAX, STORAGE_SOURCE).map_err(|why| crate::error::Fault::Program {
+        let words = super::lower(usize::MAX, STORAGE_SOURCE, &LAYOUT).map_err(|why| {
+            crate::error::Fault::Program {
                 at: "guest::widen",
                 why: format!("the readout widen does not lower: {why}"),
-            })?;
+            }
+        })?;
         let core = device.core().clone();
         let cfg = Buffer::with(device, SLOTS * SLOT_BYTES, Memory::Host)?;
 
-        let bindings = [
-            binding(0, vk::DescriptorType::STORAGE_BUFFER),
-            binding(1, vk::DescriptorType::STORAGE_BUFFER),
-            binding(2, vk::DescriptorType::STORAGE_BUFFER),
-        ];
+        let bindings = LAYOUT.map(|(at, slot)| binding(at, super::descriptor_type(slot)));
         let d = &core.device;
         // SAFETY: `d` is live; each create info and what it borrows are locals
         // that outlive the call, and `words` is the SPIR-V the guest compiler
