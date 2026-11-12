@@ -138,6 +138,66 @@ fn the_qwen_path_norms_answer_the_host() {
     assert_close(&b.read_f32(y4), &gated(true), 1e-2, 1e-2);
 }
 
+/// A tall fire's gated norm (an f32 accumulator, 128-wide value heads)
+/// goes through the gated norm kernel: 2304 rows of 16 heads (blocks of
+/// 128) and 2432 rows of 48 heads (half blocks), both gate forms.
+#[test]
+fn a_tall_fires_gated_norm_answers_the_host() {
+    let vd = 128usize;
+    for (rows, width) in [(2304usize, 2048usize), (2432, 6144)] {
+        let acc: Vec<f32> = data(rows * width, 7)
+            .iter()
+            .map(|v| v * 3.0 + 0.1)
+            .collect();
+        let zs = data(rows * width, 8);
+        let gw: Vec<f32> = data(vd, 9).iter().map(|v| v + 1.0).collect();
+        let mut b = Bench::new();
+        let (r, w) = (rows as u32, width as u32);
+        let a = b.f32(r, w, &acc);
+        let z = b.bf16(r, w, &zs);
+        let g = b.f32(1, vd as u32, &gw);
+        let ys = [b.zeros(Dtype::Bf16, r, w), b.zeros(Dtype::Bf16, r, w)];
+        if !b
+            .run(|ctx| {
+                for (y, sig) in [(ys[0], false), (ys[1], true)] {
+                    engine_xla::lower::lower(ctx, |l| {
+                        let x_v = l.read(a)?;
+                        let gate_v = l.read(z)?;
+                        let weight_v = l.read(g)?;
+                        let v = norm::rmsnorm_gated(
+                            l.f(),
+                            x_v,
+                            gate_v,
+                            weight_v,
+                            vd as u32,
+                            1e-6,
+                            sig,
+                            y.landing(),
+                        )?;
+                        l.land(y, v)
+                    })?;
+                }
+                Ok(())
+            })
+            .unwrap()
+        {
+            return;
+        }
+        for (y, sig) in [(ys[0], false), (ys[1], true)] {
+            let mut want = vec![0f32; acc.len()];
+            for (run, c) in acc.chunks(vd).enumerate() {
+                let inv = rms(c, 1e-6);
+                for (i, v) in c.iter().enumerate() {
+                    let zv = zs[run * vd + i];
+                    let gate = if sig { sigmoid(zv) } else { zv * sigmoid(zv) };
+                    want[run * vd + i] = round_bf16(v * inv * gw[i] * gate);
+                }
+            }
+            assert_close(&b.read_f32(y), &want, 1e-2, 1e-2);
+        }
+    }
+}
+
 #[test]
 fn layernorm_without_scale_answers_the_host() {
     let (rows, width) = (4usize, 200usize);
