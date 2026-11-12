@@ -714,7 +714,7 @@ impl Engine for Cuda {
             },
             chunks: chunk_facts,
             limits: FireLimits {
-                max_lanes: shell.budget().max_lanes,
+                max_lanes: shell.fire_lanes(),
                 max_tokens: shell.budget().max_tokens,
                 max_page_refs: paging
                     .pages_per_slot

@@ -447,7 +447,7 @@ impl Shell {
         // read back, so its lanes share them there. The pool seats what a
         // fire names for good, so every fire of the lattice folds into one
         // room: the widest fire's.
-        let lanes_most = self.budget.max_lanes.max(1);
+        let lanes_most = self.fire_lanes().max(1);
         let (slots, room, windowed) = self.pools.synthetic_room(
             (self.held.len().max(1) as u32).min(lanes_most),
             u64::from(self.budget.max_tokens).div_ceil(page_size) + u64::from(lanes_most),
@@ -1101,7 +1101,7 @@ impl Shell {
         } else {
             self.pools.paging().context()
         };
-        let max_lanes = self.budget.max_lanes;
+        let max_lanes = self.fire_lanes();
         let classes = self.compiled.classes.classes.len();
         let textual = |class: usize| !self.media.contains(class);
         let staged = self

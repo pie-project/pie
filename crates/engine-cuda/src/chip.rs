@@ -135,6 +135,16 @@ pub struct FireRows(pub u32);
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Decision)]
 #[decision(id = "engine.prefill_lanes", constant(range(0..=65536)), default = 0, tune = engine)]
 pub struct PrefillLanes(pub u32);
+
+/// The most lanes one fire carries, whatever the load seats: the runtime
+/// fires a wave of more as fires of this many, each a recorded body. Wider
+/// decode bodies armed beside the rest slowed every graph's launches (an
+/// L40S's Qwen3-30B-A3B-NVFP4 at c1: some 290 ns a node, 3.6% of its
+/// decode, with decode bodies past 256 lanes armed). 0: every lane the load
+/// seats.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Decision)]
+#[decision(id = "engine.fire_lanes", constant(range(0..=65536)), default = 256, tune = engine)]
+pub struct FireLanes(pub u32);
 /// Whether a plane declared `host` (read only by row gathers) lives in pinned,
 /// device-mapped host memory, leaving device bytes to KV pages and state slots.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Decision)]
@@ -176,7 +186,8 @@ static REGISTRY: LazyLock<Registry> = LazyLock::new(|| {
         .add::<PrefillLanes>()
         .add::<HostPlanes>()
         .add::<PrefillLatticeFrom>()
-        .add::<PrefillLatticeSteps>();
+        .add::<PrefillLatticeSteps>()
+        .add::<FireLanes>();
     poem_compiler::fuse::flags::register(&mut r, &crate::FUSIONS);
     // The residual norms run as generated row kernels (`FUSIONS` holds no
     // rule for them).
@@ -279,6 +290,7 @@ pub struct Engine {
     pub host_planes: bool,
     pub prefill_lattice_from: u32,
     pub prefill_lattice_steps: u32,
+    pub fire_lanes: u32,
 }
 
 impl Engine {
@@ -312,6 +324,7 @@ impl Engine {
             host_planes: profile.on::<HostPlanes>(&Anywhere),
             prefill_lattice_from: profile.get::<PrefillLatticeFrom>().0,
             prefill_lattice_steps: profile.get::<PrefillLatticeSteps>().0,
+            fire_lanes: profile.get::<FireLanes>().0,
         }
     }
 }
@@ -808,6 +821,7 @@ mod tests {
                 host_planes: false,
                 prefill_lattice_from: 256,
                 prefill_lattice_steps: 4,
+                fire_lanes: 256,
             }
         );
         // The compiler's prices, but that CUDA folds each chain
