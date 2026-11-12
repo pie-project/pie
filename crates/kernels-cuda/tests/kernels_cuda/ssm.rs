@@ -6,5 +6,4 @@ mod gdn_chunk_snapshot;
 mod gdn_recurrent;
 mod kda;
 mod mamba2;
-pub mod segments;
 mod short_conv;
