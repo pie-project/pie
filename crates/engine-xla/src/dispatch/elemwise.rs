@@ -50,6 +50,15 @@ impl Run<'_> {
                 let weight_v = l.read(self.tensor(*weight))?;
                 let o_y = self.tensor(*y);
                 let v = elemwise::norm::rmsnorm(l.f(), x_v, weight_v, *eps)?;
+                let v = rows_landed(
+                    l.f(),
+                    v,
+                    o_y.rows,
+                    o_y.width,
+                    !dot,
+                    t.norm_land_from,
+                    t.norm_land_below,
+                );
                 l.land(o_y, v)
             }),
             Elemwise::Rmsnorm {
@@ -79,6 +88,15 @@ impl Run<'_> {
                 let weight_v = l.read(self.tensor(*weight))?;
                 let o_y = self.tensor(*y);
                 let v = elemwise::norm::rmsnorm_plus_one(l.f(), x_v, weight_v, *eps)?;
+                let v = rows_landed(
+                    l.f(),
+                    v,
+                    o_y.rows,
+                    o_y.width,
+                    !dot,
+                    t.norm_land_from,
+                    t.norm_land_below,
+                );
                 l.land(o_y, v)
             }),
             Elemwise::Rmsnorm {
@@ -1204,9 +1222,19 @@ impl Run<'_> {
     }
 }
 
-/// A dense gemm's rows a row norm reads, `from` rows and more (below
-/// `below`, 0 none), behind a barrier (`kernel.norm.land_from`): XLA fuses the
-/// norm's sum of squares into no dot that produced them.
+/// Rows this wide and more land around a row norm (`kernel.norm.land_from`):
+/// narrower ones lost the pass a landing costs (Gemma-4-E2B's 1536-wide pf
+/// 0.3%).
+const LAND_WIDTH: u32 = 3072;
+
+/// Whether a row norm of `rows` rows `width` wide lands its rows around it.
+fn lands(rows: u32, width: u32, from: i64, below: i64) -> bool {
+    let rows = i64::from(rows);
+    width >= LAND_WIDTH && from > 0 && rows >= from && (below == 0 || rows < below)
+}
+
+/// A dense gemm's rows a row norm reads, behind a barrier where [`lands`]:
+/// XLA fuses the norm's sum of squares into no dot that produced them.
 fn norm_landed(
     f: &mut kernels_xla::hlo::Func,
     x: kernels_xla::Operand,
@@ -1214,12 +1242,30 @@ fn norm_landed(
     from: i64,
     below: i64,
 ) -> kernels_xla::Operand {
-    let rows = i64::from(x.rows);
-    if !dot || from == 0 || rows < from || (below > 0 && rows >= below) {
+    if !dot || !lands(x.rows, x.width, from, below) {
         return x;
     }
     kernels_xla::Operand {
         val: f.barrier(x.val),
         ..x
     }
+}
+
+/// A row norm's own rows (`when`: it read no gemm's), in bf16 behind a
+/// barrier where [`lands`]: XLA fuses the norm into no dot that reads them
+/// (Gemma-4-12B cut's 1664-row fire 56.9 -> 56.5 ms).
+fn rows_landed(
+    f: &mut kernels_xla::hlo::Func,
+    v: kernels_xla::hlo::Val,
+    rows: u32,
+    width: u32,
+    when: bool,
+    from: i64,
+    below: i64,
+) -> kernels_xla::hlo::Val {
+    if !when || !lands(rows, width, from, below) {
+        return v;
+    }
+    let v = f.convert(v, kernels_xla::hlo::Elem::Bf16);
+    f.barrier(v)
 }
