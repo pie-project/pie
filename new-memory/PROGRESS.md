@@ -1352,3 +1352,16 @@ The `new-memory/` directory is bookkeeping and is removed before anything lands 
 - sm_120: Nemotron mini buffered = eager bitwise, 0 warnings; Qwen buffered = M107; golden_logits / by_refs pass;
   boot / c64 / MTP unchanged vs M107. Known gap: mixed verify+prompt multi-class fires (2-4 per conc-64 run) still
   walk eagerly; Metal / Vulkan / wgpu don't buffer Mamba2.
+
+### M111 — 2026-11-12: host-tier ring, MTP class split, XLA kv row order
+- `sc/oversub` (439c01108, dc7993cd0): CUDA host tier's pinned staging ring sized to a quarter of the device kv pool
+  (512 MiB-4 GiB) so a suspend only enqueues (engine thread blocked in tier moves 7-8 s -> ~2 s per run); contention
+  trace times eviction phases / tier copies / restores. 24 x 31.4k: Qwen3-0.6B 32.3 s vs main 33.8; gpt-oss 61-62 s
+  vs 62-64; boot 40.7-45.6 s vs main 40.4-49.4. Open: Qwen3-8B c256 on 32 GB -8.5% (planner evicts in overshooting
+  bursts, restores trickle back ~20 / 2 s; quiesce up to 3.3 s per eviction).
+- `sc/rs-record-3` (0f025adc7): a verify (drafts-fact) lane fires only beside lanes of its own class -> no eager
+  mixed drafter fires; MTP / c64 unchanged.
+- `sc/xla-tier` (2d0071387..5a6e585cb, TPU): every XLA kv plane in (row-pair, token) order (identity for rows <= one
+  pool row), packed kernel branches deleted, non-fitting planes refused at load. vs main: MoE decode 256 x 80 steps
+  73.6k vs 73.3k (was -8%); qwen3-0.6b c256 +9.1%, c1 +7.3%; open: MoE decode 8 -3.1%, qwen3-0.6b prefill 2048 -2.7%,
+  d0.8b c64 -2.6% (layer-major state).
