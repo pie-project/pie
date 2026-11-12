@@ -1919,6 +1919,19 @@ impl Shell {
             .map(std::sync::Arc::clone)
             .filter(|_| !shape_check());
         let found = hit.or_else(|| self.traced.get(&key).map(std::sync::Arc::clone));
+        if self.deferred.is_none()
+            && true
+            && let Some(k) = shape_key
+        {
+            static SEEN: std::sync::Mutex<Option<std::collections::HashSet<[u8; 32]>>> = std::sync::Mutex::new(None);
+            if SEEN.lock().map(|mut g| g.get_or_insert_with(Default::default).insert(k)).unwrap_or(false) {
+                let mut words: std::collections::BTreeMap<u64, u32> = Default::default();
+                for l in &descriptor.lanes {
+                    *words.entry(l.word).or_default() += 1;
+                }
+                tracing::info!(key = %format!("{:02x}{:02x}{:02x}{:02x}", k[0], k[1], k[2], k[3]), rows = descriptor.rows, bucket = descriptor.bucket, lane_count, ?words, held = found.is_some(), "xla fire shape");
+            }
+        }
         if found.is_none() && self.deferred.is_some() {
             let (text, sig, probed) = self.trace_text(
                 &slots,
@@ -1966,6 +1979,13 @@ impl Shell {
                     pixels_seat.as_ref(),
                 )?;
                 let (program, probed) = program;
+                if true {
+                    let mut words: std::collections::BTreeMap<u64, u32> = Default::default();
+                    for l in &descriptor.lanes {
+                        *words.entry(l.word).or_default() += 1;
+                    }
+                    tracing::info!(rows = descriptor.rows, bucket = descriptor.bucket, lane_count, ?words, ?readout_spans, ms = t1.elapsed().as_millis() as u64, "xla fire outside the warm ladder");
+                }
                 self.probed.insert(key, probed);
                 self.traced.insert(key, std::sync::Arc::clone(&program));
                 program

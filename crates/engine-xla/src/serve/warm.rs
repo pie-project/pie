@@ -437,6 +437,11 @@ impl Shell {
         );
         let mut left_out = std::collections::HashSet::new();
         for (d, at) in deferred.into_iter().zip(index) {
+            if true
+                && let Some(k) = d.shape_key
+            {
+                tracing::info!(at, key = %format!("{:02x}{:02x}{:02x}{:02x}", k[0], k[1], k[2], k[3]), bytes = d.text.len(), "xla ladder shape");
+            }
             let program = match programs[at].as_ref() {
                 Some(Ok(program)) => std::sync::Arc::clone(program),
                 Some(Err(fault)) => {
