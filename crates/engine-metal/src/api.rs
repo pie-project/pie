@@ -593,10 +593,6 @@ impl Engine for Metal {
             .map_err(fault)
     }
 
-    fn release_scratch(&mut self) -> EngineResult<()> {
-        self.loaded_mut()?.release_scratch().map_err(fault)
-    }
-
     fn commit_segments(&mut self, segments: u32) -> EngineResult<()> {
         self.loaded_mut()?.commit_segments(segments).map_err(fault)
     }

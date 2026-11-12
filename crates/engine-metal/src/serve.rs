@@ -1608,23 +1608,6 @@ impl Shell {
         (self.pools.committed_bytes(), self.pools.high_water_bytes())
     }
 
-    /// See `Engine::release_scratch`.
-    #[allow(unsafe_code)]
-    pub fn release_scratch(&mut self) -> Result<()> {
-        self.drain()?;
-        #[cfg(target_vendor = "apple")]
-        let narrowest = self
-            .arena_ladder
-            .first()
-            .map_or(self.compiled.arena.bytes, |(_, map)| map.bytes);
-        #[cfg(target_vendor = "apple")]
-        // SAFETY: drained just above, on the one thread that submits.
-        unsafe {
-            self.arena.forget(narrowest)?;
-        }
-        Ok(())
-    }
-
     #[must_use]
     pub fn footprint(&self) -> (u64, u64, u64, u64) {
         (
