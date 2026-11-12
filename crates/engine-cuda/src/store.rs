@@ -1455,9 +1455,11 @@ impl Pools {
     /// Seats the kv pages `pages` (the windowed ones, a window list's) on slots of
     /// the state pool and backs the segments their chunks lie in.
     fn seat_pages(&mut self, kind: Kind, pages: impl IntoIterator<Item = u64>) -> Result<()> {
-        // The physical chunks the pages lie in.
+        // The physical chunks the pages lie in. A lane's pages run through
+        // a few chunks, so a chunk just checked is not checked again.
         let mut highest = None;
         let mut unbacked = None;
+        let mut checked = None;
         for page in pages {
             let page = u32::try_from(page).map_err(|_| Fault::Ceiling {
                 what: kind.name(),
@@ -1466,8 +1468,11 @@ impl Pools {
             })?;
             let chunk = self.chunks.seat(kind, page)?;
             highest = highest.max(Some(chunk));
-            if unbacked.is_none() && !self.chunks.backed(chunk) {
-                unbacked = Some(chunk);
+            if unbacked.is_none() && checked != Some(chunk) {
+                checked = Some(chunk);
+                if !self.chunks.backed(chunk) {
+                    unbacked = Some(chunk);
+                }
             }
         }
         let (Some(highest), Some(unbacked)) = (highest, unbacked) else {
@@ -1736,19 +1741,32 @@ impl Pools {
     /// refs a lane named it by, or, where lanes name state slots, the
     /// slot's own run.
     fn record(&self, key: u32) -> Result<Vec<u32>> {
+        let mut slots = Vec::new();
+        self.record_into(key, &mut slots)?;
+        Ok(slots)
+    }
+
+    /// [`Pools::record`] into `slots`, cleared first: a fire's lanes reuse
+    /// one buffer.
+    fn record_into(&self, key: u32, slots: &mut Vec<u32>) -> Result<()> {
+        slots.clear();
         let pieces = self.fixed()?.pieces;
         if !self.chunks.by_refs() {
-            return Ok((0..pieces).map(|piece| key * pieces + piece).collect());
+            slots.extend((0..pieces).map(|piece| key * pieces + piece));
+            return Ok(());
         }
         if pieces == 1 {
-            return Ok(vec![key]);
+            slots.push(key);
+            return Ok(());
         }
-        self.records.get(&key).cloned().ok_or_else(|| {
+        let held = self.records.get(&key).ok_or_else(|| {
             Fault::program(
                 "store::state",
                 format!("the record at slot ref {key} is read before a lane names its pieces"),
             )
-        })
+        })?;
+        slots.extend_from_slice(held);
+        Ok(())
     }
 
     /// The record `key` names, its slots seated and backed.
@@ -1785,9 +1803,8 @@ impl Pools {
         if !self.has_state() {
             return Ok(keys.to_vec());
         }
-        let fixed = self.fixed()?.clone();
         let lanes = self.id_lanes as usize;
-        self.expand(&fixed, keys, lanes)
+        self.expand(keys, lanes)
     }
 
     /// A fire's snapshot slots, as [`Pools::state_tables`] lays a fire's
@@ -1796,17 +1813,11 @@ impl Pools {
         if !self.has_state() || keys.is_empty() {
             return Ok(keys.to_vec());
         }
-        let fixed = self.fixed()?.clone();
         let entries = self.snap_entries as usize;
-        self.expand(&fixed, keys, entries)
+        self.expand(keys, entries)
     }
 
-    fn expand(
-        &mut self,
-        fixed: &layout::FixedShape,
-        keys: &[i32],
-        rows: usize,
-    ) -> Result<Vec<i32>> {
+    fn expand(&mut self, keys: &[i32], rows: usize) -> Result<Vec<i32>> {
         if keys.len() > rows {
             return Err(Fault::Ceiling {
                 what: "records a fire's id tables name",
@@ -1814,6 +1825,15 @@ impl Pools {
                 have: rows as u64,
             });
         }
+        // Each record seated and backed first; the ids are read after, the
+        // shape borrowed, a buffer of slots reused lane to lane.
+        let mut record = Vec::new();
+        for &key in keys.iter().filter(|&&key| key >= 0) {
+            self.state_row(key as u32)?;
+            self.record_into(key as u32, &mut record)?;
+            self.seat_pages(Kind::Fixed, record.iter().map(|&slot| u64::from(slot)))?;
+        }
+        let fixed = self.fixed()?;
         // One table of one piece: the ids as the keys lie, no padding.
         let single = fixed.tables.len() == 1 && fixed.tables[0].len() == 1;
         let mut out = if single {
@@ -1827,8 +1847,7 @@ impl Pools {
             if key < 0 {
                 continue;
             }
-            self.state_row(key as u32)?;
-            let record = self.ensure_record(key as u32)?;
+            self.record_into(key as u32, &mut record)?;
             let mut column = 0usize;
             for table in &fixed.tables {
                 for (piece, &slot) in table.iter().enumerate() {

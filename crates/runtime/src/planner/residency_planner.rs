@@ -541,6 +541,15 @@ impl ResidencyPlanner {
         result
     }
 
+    /// [`Self::with_inner`] for `f` that touches no process's residency,
+    /// rank or parking and no queue: what `with_inner` refreshes after it
+    /// (the waiters, the nonresident count, the admissions a preemption
+    /// held back) reads all the processes, and a fire's own count moves
+    /// twice a lane a step.
+    pub(super) fn with_counts<R>(&self, f: impl FnOnce(&mut Inner) -> R) -> R {
+        f(&mut self.lock_inner())
+    }
+
     pub fn register(&self, pid: ProcessId) {
         self.with_inner(|inner| {
             let seq = inner.next_seq;
