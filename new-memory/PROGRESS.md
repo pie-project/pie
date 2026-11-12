@@ -1403,3 +1403,6 @@ The `new-memory/` directory is bookkeeping and is removed before anything lands 
 - M114 follow-up (5949a7ad0, L40S): arming's time was warm forwards (capture 0.2 s, instantiate 0.45 s of 18 s);
   narrower buckets now capture cold on their first fire once the widest of their kind armed. L40S held boot: NVFP4
   72-74 s (main ~85), gpt-oss 39 s (main ~63), FP8 63 s (main 65-68). Serving unchanged; every key arms.
+- M114 XLA (608b9f329, TPU): every TPU compile sets xla_tpu_prefer_conditional_same_overlay (overlay waits on the
+  ordered pool's larger conditional arms: 514 -> 11 us / prompt). vs main: qwen3-0.6b p2048 +0.6% (was -2.7%), d64
+  +15.6%; MoE all +1.8..5.0%; d0.8b p2048 +7.8%, d64 -2.6% (layer-major), d256 ~-1.1% (being profiled). Gates bitwise.
