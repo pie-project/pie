@@ -2277,13 +2277,15 @@ impl BatchScheduler {
         if survivors.iter().all(Vec::is_empty) {
             return (progress, false);
         }
+        // Counted before the build moves the lanes into the fire.
+        let total_tokens = survivors
+            .iter()
+            .flatten()
+            .map(|req| req.request.tokens())
+            .sum::<usize>();
         let (submission, requests) =
             batch::build_frame_submission(survivors, limits, page_size, stats);
         let batch_size = requests.len() as u64;
-        let total_tokens = requests
-            .iter()
-            .map(|req| req.request.tokens())
-            .sum::<usize>();
         for request in &requests {
             if let Some(instance) = instances.get_mut(&request.instance_id) {
                 instance.in_flight += 1;

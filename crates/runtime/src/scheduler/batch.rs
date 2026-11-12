@@ -125,8 +125,12 @@ impl StepGroup {
     }
 }
 
+/// The step `requests` make, their lanes, media and voxels moved into it:
+/// a posted request is kept for its completion and its counts alone, so a
+/// lane's slot tables are neither copied for the fire nor freed as the frame
+/// retires, both on the path from one decode step to the next.
 pub(crate) fn build_batch_request(
-    requests: &[Box<PendingRequest>],
+    requests: &mut [Box<PendingRequest>],
     page_size: u32,
     stats: &SchedulerStats,
 ) -> StepBuild {
@@ -143,7 +147,7 @@ pub(crate) fn build_batch_request(
         let mut voxels: Vec<engine::fire::StepVoxels> = Vec::new();
         // Group ids renumber past earlier members', so two passes' groups never merge.
         let mut groups = 0u32;
-        for req in requests {
+        for req in requests.iter_mut() {
             let fires_after = req
                 .frame
                 .map(|stamp| stamp.fires.saturating_sub(stamp.slot + 1));
@@ -153,7 +157,7 @@ pub(crate) fn build_batch_request(
             completions.push(req.completion.clone());
             let base = u32::try_from(lanes.len()).unwrap_or(u32::MAX);
             let mut own: Vec<u32> = Vec::new();
-            lanes.extend(req.request.lanes.iter().cloned().map(|mut lane| {
+            lanes.extend(std::mem::take(&mut req.request.lanes).into_iter().map(|mut lane| {
                 lane.fires_after = fires_after;
                 lane.group = lane.group.map(|id| {
                     let local = own.iter().position(|&seen| seen == id).unwrap_or_else(|| {
@@ -166,11 +170,11 @@ pub(crate) fn build_batch_request(
             }));
             groups = groups.saturating_add(u32::try_from(own.len()).unwrap_or(u32::MAX));
             member_lane_indptr.push(u32::try_from(lanes.len()).unwrap_or(u32::MAX));
-            media.extend(req.request.media.iter().cloned().map(|mut row| {
+            media.extend(std::mem::take(&mut req.request.media).into_iter().map(|mut row| {
                 row.lane = row.lane.saturating_add(base);
                 row
             }));
-            voxels.extend(req.request.voxels.iter().cloned().map(|mut row| {
+            voxels.extend(std::mem::take(&mut req.request.voxels).into_iter().map(|mut row| {
                 row.lane = row.lane.saturating_add(base);
                 row
             }));
@@ -245,36 +249,33 @@ pub(crate) fn build_frame_submission(
             })
             .collect();
         let mut slots: Vec<Option<Box<PendingRequest>>> = group.into_iter().map(Some).collect();
-        let group: Vec<Box<PendingRequest>> = fire_plan::member_order(&facts)
+        let mut group: Vec<Box<PendingRequest>> = fire_plan::member_order(&facts)
             .iter()
             .map(|&index| slots[index].take().expect("member_order is a permutation"))
             .collect();
 
-        let build = build_batch_request(&group, page_size, stats);
-        if super::worker::wave_trace() {
+        // Counted before the build moves the lanes out.
+        let traced = super::worker::wave_trace().then(|| {
             let (mut tokens, mut page_refs) = (0usize, 0usize);
             for req in &group {
                 let usage = request_capacity_usage(req, page_size);
                 tokens += usage.forward_tokens;
                 page_refs += usage.page_refs;
             }
-            let prefill_lanes = build
-                .lanes
-                .iter()
-                .filter(|lane| lane.tokens.len() > 1)
-                .count();
+            let lanes = || group.iter().flat_map(|req| req.request.lanes.iter());
+            let prefill_lanes = lanes().filter(|lane| lane.tokens.len() > 1).count();
+            let kv_len_max = lanes().map(|lane| lane.kv.pages.len()).max().unwrap_or(0);
+            (tokens, page_refs, prefill_lanes, kv_len_max)
+        });
+        let build = build_batch_request(&mut group, page_size, stats);
+        if let Some((tokens, page_refs, prefill_lanes, kv_len_max)) = traced {
             super::worker::wave_trace_emit(format!(
-                "[step-lanes] t={}us members={} prefill_lanes={prefill_lanes} lanes={} tokens={tokens}/{} page_refs={page_refs}/{} kv_len_max={}",
+                "[step-lanes] t={}us members={} prefill_lanes={prefill_lanes} lanes={} tokens={tokens}/{} page_refs={page_refs}/{} kv_len_max={kv_len_max}",
                 super::worker::wave_trace_us(),
                 group.len(),
                 build.lanes.len(),
                 limits.max_forward_tokens,
                 limits.max_page_refs,
-                group
-                    .iter()
-                    .flat_map(|req| req.request.lanes.iter().map(|lane| lane.kv.pages.len()))
-                    .max()
-                    .unwrap_or(0)
             ));
         }
         let mut instances = Vec::with_capacity(build.lanes.len());
@@ -371,12 +372,12 @@ mod tests {
 
     fn every_member_owns_a_span_of_the_steps_lanes() {
         let placeholder = FireRequest::default();
-        let requests = vec![
+        let mut requests = vec![
             pending(decode(11, 3), InstanceId(1)),
             pending(placeholder, InstanceId(2)),
             pending(decode(22, 4), InstanceId(3)),
         ];
-        let step = build_batch_request(&requests, 16, &SchedulerStats::default());
+        let step = build_batch_request(&mut requests, 16, &SchedulerStats::default());
         assert_eq!(step.member_lane_indptr, vec![0, 1, 1, 2]);
         assert_eq!(
             step.instance_ids,
@@ -399,7 +400,7 @@ mod tests {
         let expected = two.lanes.clone();
 
         let step = build_batch_request(
-            &[pending(two, InstanceId(1))],
+            &mut [pending(two, InstanceId(1))],
             16,
             &SchedulerStats::default(),
         );
@@ -415,11 +416,11 @@ mod tests {
             ],
             ..FireRequest::default()
         };
-        let requests = [
+        let mut requests = [
             pending(two, InstanceId(9)),
             pending(decode(33, 5), InstanceId(10)),
         ];
-        let step = build_batch_request(&requests, 16, &SchedulerStats::default());
+        let step = build_batch_request(&mut requests, 16, &SchedulerStats::default());
 
         assert_eq!(step.member_lane_indptr, vec![0, 2, 3]);
         assert_eq!(
@@ -444,11 +445,11 @@ mod tests {
             }
             pass
         };
-        let requests = [
+        let mut requests = [
             pending(grouped(0), InstanceId(1)),
             pending(grouped(4), InstanceId(2)),
         ];
-        let step = build_batch_request(&requests, 16, &SchedulerStats::default());
+        let step = build_batch_request(&mut requests, 16, &SchedulerStats::default());
         let groups: Vec<Option<u32>> = step.lanes.iter().map(|lane| lane.group).collect();
         assert_eq!(
             groups,
@@ -466,11 +467,11 @@ mod tests {
             1,
         )));
 
-        let requests = [
+        let mut requests = [
             pending(masked, InstanceId(20)),
             pending(decode(22, 4), InstanceId(21)),
         ];
-        let step = build_batch_request(&requests, 16, &SchedulerStats::default());
+        let step = build_batch_request(&mut requests, 16, &SchedulerStats::default());
         assert_eq!(
             step.lanes[0].mask,
             Some(::engine::Masking::Extent(::engine::Mask::new(

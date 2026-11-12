@@ -41,7 +41,7 @@ impl ResidencyPlanner {
     /// `pid` binds a fire's slots: it counts as in flight until the token
     /// drops.
     pub fn fire_in_flight(self: &Arc<Self>, pid: ProcessId) -> FireInFlight {
-        let counted = self.with_inner(|inner| {
+        let counted = self.with_counts(|inner| {
             inner.procs.get_mut(&pid).is_some_and(|proc| {
                 proc.fires += 1;
                 proc.fired_at = crate::rt::Instant::now();
@@ -57,7 +57,7 @@ impl ResidencyPlanner {
     }
 
     fn fire_landed(self: &Arc<Self>, pid: ProcessId) {
-        self.with_inner(|inner| {
+        self.with_counts(|inner| {
             if let Some(proc) = inner.procs.get_mut(&pid) {
                 proc.fires = proc.fires.saturating_sub(1);
                 proc.fired_at = crate::rt::Instant::now();
