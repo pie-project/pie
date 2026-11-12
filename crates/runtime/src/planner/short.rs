@@ -82,6 +82,13 @@ impl Shortfall {
     }
 
     /// Since when waiter `id` has been short, if it is.
+    /// Waiter `id`'s clock runs again from now.
+    pub(super) fn restart(&mut self, id: u64) {
+        if let Some(short) = self.waiters.get_mut(&id) {
+            short.since = Instant::now();
+        }
+    }
+
     pub(super) fn since(&self, id: u64) -> Option<Instant> {
         self.waiters.get(&id).map(|short| short.since)
     }
