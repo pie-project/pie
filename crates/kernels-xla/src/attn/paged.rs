@@ -2255,8 +2255,11 @@ pub fn attend_fresh(
                 // the kernel straight out of it)
                 && (!f.is_view(keys) && !f.is_view(values)
                     || f.view_parts(keys).map(|v| v.0) == f.view_parts(values).map(|v| v.0)
-                        && f.view_order(keys).is_none()
-                        && f.view_order(values).is_none()
+                        && f.view_order(keys) == f.view_order(values)
+                        // a reordered page's pairs: whole 256-lane blocks
+                        && (f.view_order(keys).is_none()
+                            || (heads.kvh * heads.d) % 256 == 0
+                                && (heads.kvh * heads.dv) % 256 == 0)
                         && (heads.kvh * heads.d) % 128 == 0
                         && (heads.kvh * heads.dv) % 128 == 0
                         && crate::blocks::on())
@@ -3002,8 +3005,11 @@ fn pool_rows(
             }
             return Ok(vec![f.pool_view_ordered(pool, Elem::Bf16, dims, order)?]);
         }
-        let ups = f.reshape(ups, &[nt * token_rows * 2, 128])?;
-        let laid = crate::blocks::scatter(f, pool, rows, ups, 1)?;
+        // one DMA a token, its rows a block's tokens apart
+        let starts = f.slice(rows, &[0], &[nt * token_rows], &[token_rows])?;
+        let packed = f.pack_rows(ups, nt * token_rows)?;
+        let packed = f.reshape(packed, &[nt * token_rows, 1, 128])?;
+        let laid = crate::blocks::scatter_tokens(f, pool, starts, packed, o)?;
         return Ok(vec![f.pool_view_ordered(laid, Elem::Bf16, dims, order)?]);
     }
     if n64 <= ROWS_IN_PLACE {

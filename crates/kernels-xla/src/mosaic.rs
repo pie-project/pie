@@ -303,6 +303,10 @@ impl Body {
     pub fn shrui(&mut self, a: V, b: V) -> Built<V> {
         self.int_binary("arith.shrui", a, b, false)
     }
+    /// Left shift.
+    pub fn shli(&mut self, a: V, b: V) -> Built<V> {
+        self.int_binary("arith.shli", a, b, false)
+    }
 
     /// A vector's bits read as `elem` of the same width (`arith.bitcast`).
     pub fn bitcast_v(&mut self, v: V, elem: Elem) -> Built<V> {
@@ -697,6 +701,18 @@ impl Body {
             t => return bad(format!("a {} bitcast of {t}", elem.mlir())),
         };
         Ok(self.op1("tpu.memref_bitcast", &[r], "", out))
+    }
+
+    /// `r` as `dims` (`tpu.memref_reshape`): the same elements in order,
+    /// where the tiled layout lets the reshape move nothing.
+    pub fn ref_reshape(&mut self, r: V, dims: &[i64]) -> Built<V> {
+        let out = match self.ty(r).clone() {
+            MTy::Ref(rd, e, sp) if rd.iter().product::<i64>() == dims.iter().product::<i64>() => {
+                MTy::Ref(dims.to_vec(), e, sp)
+            }
+            t => return bad(format!("a reshape of {t} to {dims:?}")),
+        };
+        Ok(self.op1("tpu.memref_reshape", &[r], "", out))
     }
 
     pub fn ref_squeeze(&mut self, r: V) -> Built<V> {
