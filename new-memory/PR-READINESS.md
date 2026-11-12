@@ -26,7 +26,7 @@ Branch today: 432 commits ahead of main, 782 files, +86k / -13k. Main merged in 
 | A18 | Idle cache demoted only when PLEX keys it above the floor | RT6 | done M90 |
 | A20 | Window-only models never reuse a prefix (no auto checkpoint; main reused full window pages) -> auto checkpoints at page-aligned fire ends holding window slot refs | RT8 | done M99 (gpt-oss p2048 parity with main) |
 | A22 | Metal perf vs main (M1 Max): ACCEPTED by user 2026-11-11 — c1 Qwen3-0.6B +0.3%, gemma -0.3%, Qwen3.5 -0.5% (c8 +1.1%); prefill and boot faster on all. (Metal serving encodes live on main too; ICB recording not required — user 2026-11-11) | Metal agent (sc/metal-gate) | in progress |
-| A23 | Layer-major recurrent state (one fixed shape per recurrent layer; a layer's lanes contiguous) on every backend — user decision 2026-11-12 (see FOLLOWUPS F4 for numbers) | LM agent (core) + backend owners | in progress |
+| A23 | Layer-major recurrent state (one fixed shape per recurrent layer; a layer's lanes contiguous) — user 2026-11-12: prototype on CUDA, adopt on all backends ONLY if a net win (speed vs lane-major and main, fragmentation / cache pages under churn) | LM agent | prototyping |
 | A9 | dsv41 two-window mini cannot fire on sm_89/sm_120 (fused.lse_sink kernel gap) -> two-window CUDA unverified | L40S | queued |
 
 ## B. Decide before the PR (user)
