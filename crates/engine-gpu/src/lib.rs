@@ -16,6 +16,8 @@ pub mod guest;
 pub mod handles;
 pub mod inputs;
 pub mod mask;
+#[cfg(not(target_arch = "wasm32"))]
+pub mod pread;
 pub mod probe;
 pub mod program;
 pub mod rs;
