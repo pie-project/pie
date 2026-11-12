@@ -199,7 +199,7 @@ pub fn shared_stores(
 ) -> Stores {
     let (list, records) = {
         let pool = shared.lock().unwrap();
-        (pool.list(), pool.records_capacity())
+        (pool.list(), pool.records_most())
     };
     let pages = list.map_or_else(
         || ShapePool::new(ShapeKind::List, 0, 0, 0),

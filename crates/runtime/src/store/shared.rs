@@ -350,7 +350,9 @@ pub struct SharedPool {
     /// Record id -> its slots, each fixed shape's pieces in order.
     records: Vec<Option<Vec<Vec<Slot>>>>,
     free_records: BTreeSet<u32>,
-    records_capacity: u32,
+    /// The records the state chunks hold under the smallest rung: the most
+    /// record ids there may be.
+    records_most: u32,
     /// Chunks one working set takes at the longest context.
     least_chunks: u32,
 }
@@ -536,7 +538,7 @@ impl SharedPool {
             weights_first,
             records: Vec::new(),
             free_records: BTreeSet::new(),
-            records_capacity: 0,
+            records_most: 0,
             least_chunks: 0,
         };
         // Under the smallest rung state may take every chunk but the
@@ -545,7 +547,7 @@ impl SharedPool {
             .total_chunks
             .saturating_sub(reserved)
             .saturating_sub(facts.act_chunks.first().map_or(0, |&(_, chunks)| chunks));
-        shared.records_capacity = shared.records_fitting(state_chunks);
+        shared.records_most = shared.records_fitting(state_chunks);
         shared.least_chunks = shared.working_set_chunks(max_context);
         tracing::debug!(
             chunk_bytes = facts.chunk_bytes,
@@ -553,7 +555,7 @@ impl SharedPool {
             segment_chunks = facts.segment_chunks,
             committed = facts.segments.committed,
             shapes = facts.shapes.len(),
-            records = shared.records_capacity,
+            records = shared.records_most,
             rungs = ?facts.act_chunks,
             "a shared pool"
         );
@@ -780,10 +782,37 @@ impl SharedPool {
 
     // ---- records ----
 
-    /// Records the pool's state chunks hold at most.
+    /// Records the pool's state chunks hold under the current rung: a
+    /// smaller rung's room counts once the rung is lowered, not before.
     #[must_use]
     pub fn records_capacity(&self) -> u32 {
-        self.records_capacity
+        self.records_fitting(self.state_chunks_now())
+            .min(self.records_most)
+    }
+
+    /// The most record ids there may be: what the state chunks hold under
+    /// the smallest rung.
+    #[must_use]
+    pub fn records_most(&self) -> u32 {
+        self.records_most
+    }
+
+    /// The chunks state may take under the current rung: every chunk but
+    /// the reserved ones and the activation set aside now.
+    #[must_use]
+    pub fn state_chunks_now(&self) -> u32 {
+        self.pool
+            .total_chunks()
+            .saturating_sub(self.pool.reserved_chunks())
+            .saturating_sub(self.pool.act_reserved())
+    }
+
+    /// Slots of pool shape `shape` the state chunks hold under the current
+    /// rung, were every one that shape's.
+    #[must_use]
+    pub fn shape_capacity(&self, shape: ShapeId) -> u32 {
+        let spc = self.pool.shape(shape).map_or(0, |s| s.slots_per_chunk);
+        u32::try_from(u64::from(self.state_chunks_now()) * u64::from(spc)).unwrap_or(u32::MAX)
     }
 
     /// Records that fit now, each fixed shape's pieces from its partly
@@ -801,7 +830,8 @@ impl SharedPool {
                 .collect();
             self.pool.fits(&needs)
         };
-        let (mut low, mut high) = (0u64, u64::from(self.records_capacity));
+        let capacity = self.records_capacity();
+        let (mut low, mut high) = (0u64, u64::from(capacity));
         while low < high {
             let mid = low + (high - low).div_ceil(2);
             if fits(mid) {
@@ -810,7 +840,7 @@ impl SharedPool {
                 high = mid - 1;
             }
         }
-        let free = self.records_capacity as usize - self.live_records();
+        let free = (capacity as usize).saturating_sub(self.live_records());
         (low as u32).min(free as u32)
     }
 
@@ -823,7 +853,7 @@ impl SharedPool {
         if n == 0 {
             return Some(Vec::new());
         }
-        if self.live_records() + n > self.records_capacity as usize {
+        if self.live_records() + n > self.records_capacity() as usize {
             return None;
         }
         let needs: Vec<(ShapeId, u64)> = self
