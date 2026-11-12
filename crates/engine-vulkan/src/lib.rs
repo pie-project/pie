@@ -18,7 +18,7 @@ pub mod feeds;
 pub mod guest;
 pub mod inputs;
 pub use engine_gpu::mask;
-pub mod probe;
+pub use engine_gpu::probe;
 pub mod program;
 
 pub(crate) mod record;

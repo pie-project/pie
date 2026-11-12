@@ -162,7 +162,7 @@ impl Frame {
     }
 }
 
-pub type OnDone = Box<dyn FnOnce(Option<String>) + Send + 'static>;
+pub use engine_gpu::backend::OnDone;
 
 #[derive(Debug)]
 pub struct Pending {
@@ -280,6 +280,10 @@ impl engine_gpu::Buffer<super::Api> for Buffer {
     }
 
     fn is_host(&self) -> bool {
+        match self.never {}
+    }
+
+    fn mapped_ptr(&self) -> Option<usize> {
         match self.never {}
     }
 

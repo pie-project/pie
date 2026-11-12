@@ -1679,7 +1679,7 @@ impl Frame {
 
     pub fn commit_async(
         mut self,
-        on_done: Option<Box<dyn Fn(Option<String>) + Send + 'static>>,
+        on_done: Option<engine_gpu::backend::OnDone>,
     ) -> Result<Pending> {
         let at = crate::encode::profiling().then(std::time::Instant::now);
         self.submit()?;

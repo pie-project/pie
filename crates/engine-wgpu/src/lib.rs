@@ -17,7 +17,7 @@ pub mod guest;
 pub mod inputs;
 mod landing;
 pub use engine_gpu::mask;
-pub mod probe;
+pub use engine_gpu::probe;
 pub mod program;
 pub use engine_gpu::rs;
 pub mod run;

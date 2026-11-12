@@ -381,6 +381,10 @@ impl engine_gpu::Buffer<super::Api> for Buffer {
         Buffer::is_host(self)
     }
 
+    fn mapped_ptr(&self) -> Option<usize> {
+        None
+    }
+
     fn write(&mut self, offset: u64, bytes: &[u8]) -> Result<()> {
         Buffer::write(self, offset, bytes)
     }

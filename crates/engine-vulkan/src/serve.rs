@@ -3845,7 +3845,7 @@ impl engine::frame::Shell for Shell {
                 }
                 Ok(pending)
             }),
-            None => frame.commit_async(Some(on_done)),
+            None => frame.commit_async(Some(on_done as engine_gpu::backend::OnDone)),
         };
         let pending = match pending {
             Ok(pending) => pending,

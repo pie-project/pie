@@ -256,7 +256,7 @@ impl poem_exec::DispatchProbe for Run<'_> {
         let Some(dir) = crate::probe::dir() else {
             return;
         };
-        if let Err(fault) = crate::probe::flush() {
+        if let Err(fault) = <crate::device::Api as engine_gpu::Backend>::flush_recording() {
             eprintln!("probe: flush failed: {fault}");
             return;
         }

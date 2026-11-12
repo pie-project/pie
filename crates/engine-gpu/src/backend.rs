@@ -18,13 +18,129 @@ pub enum Memory {
     Readback,
 }
 
+/// What runs when a submitted frame lands: `Some(why)` if it faulted.
+pub type OnDone = Box<dyn FnOnce(Option<String>) + Send + 'static>;
+
 /// A GPU API: the types a backend crate binds the shared engine to.
 pub trait Backend: Sized + 'static {
+    /// The API's name in a message.
+    const NAME: &'static str;
+
+    /// Whether a host buffer is mapped into this process: the host lays and
+    /// reads it in place ([`Buffer::mapped_ptr`]) and frames copy between it
+    /// and the device. Else the host reaches device memory only through the
+    /// queue, and host-side copies live in process memory.
+    const MAPS_HOST: bool;
+
+    /// The bytes a buffer-to-buffer copy's offsets and length are a
+    /// multiple of.
+    const COPY_GRAIN: u64;
+
     /// The device one load binds.
-    type Context;
+    type Context: Context<Self>;
 
     /// One device reservation; clones share it.
     type Buffer: Buffer<Self>;
+
+    /// Device work recorded and not yet submitted.
+    type Frame: Frame<Self>;
+
+    /// A submitted frame, until it lands.
+    type Pending: Pending;
+
+    /// Whether `domain` names this API's device.
+    fn is_device(domain: engine::transfer::MemoryDomain) -> bool;
+
+    /// Runs `f` on the frame this thread records into, if one is.
+    fn with_frame<R>(f: impl FnOnce(&Self::Frame) -> R) -> Option<R> {
+        crate::probe::with_frame::<Self::Frame, R>(f)
+    }
+
+    /// Submits what this thread's recording frame holds, if one is.
+    fn flush_recording() -> Result<()> {
+        Self::with_frame(Frame::flush).unwrap_or(Ok(()))
+    }
+
+    /// Lays `len` bytes at `at` of `staging` by `fill`, handed the address
+    /// of the first, before work the frame records next reads them.
+    fn stage_rows(
+        staging: &Self::Buffer,
+        at: u64,
+        len: u64,
+        fill: impl FnOnce(usize) -> Result<()>,
+    ) -> Result<()>;
+
+    /// Records a copy into `frame` whose ends the frame does not keep alive:
+    /// their owner outlives every frame.
+    fn copy_unretained(
+        frame: &Self::Frame,
+        source: &Self::Buffer,
+        source_at: u64,
+        into: &Self::Buffer,
+        into_at: u64,
+        len: u64,
+    ) -> Result<()>;
+}
+
+/// The device a load binds, as the shared engine reaches it.
+pub trait Context<B: Backend> {
+    /// A frame to record into.
+    fn frame(&self) -> Result<B::Frame>;
+}
+
+/// Device work recorded on the host, submitted at commit.
+pub trait Frame<B: Backend>: 'static {
+    fn copy(
+        &mut self,
+        source: &B::Buffer,
+        source_at: u64,
+        into: &B::Buffer,
+        into_at: u64,
+        len: u64,
+    ) -> Result<()>;
+
+    /// Copies each `(source_at, into_at, len)` region of `source` into
+    /// `into`.
+    fn copy_regions(
+        &mut self,
+        source: &B::Buffer,
+        into: &B::Buffer,
+        regions: &[(u64, u64, u64)],
+    ) -> Result<()> {
+        for &(source_at, into_at, len) in regions {
+            self.copy(source, source_at, into, into_at, len)?;
+        }
+        Ok(())
+    }
+
+    fn fill_zero(&mut self, into: &B::Buffer, at: u64, len: u64) -> Result<()>;
+
+    /// Writes `bytes` at `at` of `into` in the frame's order: no work in
+    /// flight reads it changed, and no work of this frame reads it
+    /// unwritten.
+    fn update(&self, into: &B::Buffer, at: u64, bytes: &[u8]) -> Result<()> {
+        self.flush_settled()?;
+        into.write_shared(at, bytes)
+    }
+
+    /// Submits what the frame holds so far; it records on.
+    fn flush(&self) -> Result<()>;
+
+    /// [`Frame::flush`], then every frame submitted before has landed too:
+    /// the host may rewrite memory any of them reads.
+    fn flush_settled(&self) -> Result<()>;
+
+    /// Submits and waits.
+    fn commit(self) -> Result<()>;
+
+    /// Submits; `on_done` runs once the frame lands.
+    fn commit_async(self, on_done: Option<OnDone>) -> Result<B::Pending>;
+}
+
+/// A submitted frame.
+pub trait Pending {
+    /// Blocks until the frame lands.
+    fn wait(&self) -> Result<()>;
 }
 
 /// A device reservation as the shared engine moves bytes through it.
@@ -50,6 +166,9 @@ pub trait Buffer<B: Backend>: Clone + std::fmt::Debug {
 
     /// Whether the host maps the reservation.
     fn is_host(&self) -> bool;
+
+    /// The address the reservation is mapped at, where it is.
+    fn mapped_ptr(&self) -> Option<usize>;
 
     fn span(&self, offset: u64, len: u64) -> Result<()> {
         match offset.checked_add(len) {

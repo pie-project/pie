@@ -11,6 +11,7 @@ pub mod decoded;
 pub mod error;
 pub mod handles;
 pub mod mask;
+pub mod probe;
 pub mod rs;
 pub mod run;
 pub mod settle;

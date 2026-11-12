@@ -954,7 +954,7 @@ impl Frame {
     }
 }
 
-pub type OnDone = Box<dyn FnOnce(Option<String>) + Send + 'static>;
+pub use engine_gpu::backend::OnDone;
 
 impl Drop for Frame {
     fn drop(&mut self) {

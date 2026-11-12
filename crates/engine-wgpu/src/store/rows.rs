@@ -654,7 +654,7 @@ impl RowCaches {
             let image = &image[..last * row_bytes];
             if known.is_some_and(|known| known.len() == rows as usize) {
                 // In the frame's order: no fire in flight reads it changed.
-                crate::probe::with_frame(|frame| {
+                crate::probe::with_frame(|frame: &Frame| {
                     frame.update(stage, 0, image)?;
                     frame.update(staged, 0, &bytes)
                 })

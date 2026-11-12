@@ -245,14 +245,14 @@ impl<'c> Run<'c> {
             if matches!(
                 node.op,
                 poem_ir::Operation::Conv(poem_ir::Conv::Conv3d { .. })
-            ) && let Err(fault) = crate::probe::flush()
+            ) && let Err(fault) = <crate::device::Api as engine_gpu::Backend>::flush_recording()
             {
                 tracing::warn!(%fault, "submitting a convolution of a split step");
             }
             return;
         };
         if held.is_some_and(|held| held != layer)
-            && let Err(fault) = crate::probe::flush()
+            && let Err(fault) = <crate::device::Api as engine_gpu::Backend>::flush_recording()
         {
             tracing::warn!(%fault, "submitting a layer of a split step");
         }

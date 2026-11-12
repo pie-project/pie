@@ -40,11 +40,7 @@ pub use stub::{
 #[derive(Debug)]
 pub enum Api {}
 
-impl engine_gpu::Backend for Api {
-    type Context = Context;
-
-    type Buffer = Buffer;
-}
+mod gpu;
 
 pub type Handles = engine_gpu::Handles<Api>;
 pub type Binding = engine_gpu::Binding<Api>;

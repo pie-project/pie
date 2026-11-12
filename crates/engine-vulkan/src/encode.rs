@@ -159,6 +159,8 @@ pub struct Sink<'a> {
     scratch: std::cell::RefCell<Scratch>,
 
     comm: Option<&'a crate::comm::Comm>,
+
+    outer: engine_gpu::probe::Recording,
 }
 
 #[cfg(feature = "vulkan")]
@@ -170,7 +172,7 @@ impl<'a> Sink<'a> {
         pipelines: &'a Pipelines,
         handles: &'a Handles,
     ) -> Sink<'a> {
-        crate::probe::set_frame(frame);
+        let outer = engine_gpu::probe::set_frame(frame);
 
         LAST_FIRE.with(|cell| cell.set(None));
         Sink {
@@ -180,6 +182,7 @@ impl<'a> Sink<'a> {
             handles,
             scratch: std::cell::RefCell::new(Scratch::default()),
             comm: None,
+            outer,
         }
     }
 
@@ -207,7 +210,7 @@ impl<'a> Sink<'a> {
 #[cfg(feature = "vulkan")]
 impl Drop for Sink<'_> {
     fn drop(&mut self) {
-        crate::probe::clear_frame(self.frame);
+        engine_gpu::probe::restore(self.outer);
     }
 }
 

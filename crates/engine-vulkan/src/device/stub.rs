@@ -147,10 +147,7 @@ impl Frame {
         match self.never {}
     }
 
-    pub fn commit_async(
-        self,
-        _on_done: Option<Box<dyn Fn(Option<String>) + Send + 'static>>,
-    ) -> Result<Pending> {
+    pub fn commit_async(self, _on_done: Option<engine_gpu::backend::OnDone>) -> Result<Pending> {
         match self.never {}
     }
 
@@ -313,6 +310,10 @@ impl engine_gpu::Buffer<super::Api> for Buffer {
     }
 
     fn is_host(&self) -> bool {
+        match self.never {}
+    }
+
+    fn mapped_ptr(&self) -> Option<usize> {
         match self.never {}
     }
 

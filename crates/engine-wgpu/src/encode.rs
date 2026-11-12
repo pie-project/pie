@@ -222,13 +222,13 @@ pub struct Sink<'a> {
     frame: &'a Frame,
     pipelines: &'a Pipelines,
     handles: &'a Handles,
-    outer: *const Frame,
+    outer: engine_gpu::probe::Recording,
 }
 
 #[cfg(feature = "wgpu")]
 impl Drop for Sink<'_> {
     fn drop(&mut self) {
-        crate::probe::set_frame(self.outer);
+        engine_gpu::probe::restore(self.outer);
     }
 }
 
@@ -241,7 +241,7 @@ impl<'a> Sink<'a> {
         pipelines: &'a Pipelines,
         handles: &'a Handles,
     ) -> Sink<'a> {
-        let outer = crate::probe::set_frame(frame);
+        let outer = engine_gpu::probe::set_frame(frame);
         Sink {
             device,
             frame,
