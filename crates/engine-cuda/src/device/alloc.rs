@@ -817,6 +817,59 @@ impl Pinning {
         })
     }
 
+    /// `bytes` (rounded up to whole 2 MiB pages) of anonymous memory in
+    /// transparent huge pages where the kernel has them, every page already
+    /// faulted in by `threads` threads: locking it then only pins pages
+    /// that are there. 4 GiB this way takes ~0.4 s to fault, outside the
+    /// driver, and ~0.2 s to lock; `cudaHostAlloc` takes ~6 s for it,
+    /// holding the driver's lock throughout, and ~2.5 s to free.
+    #[cfg(target_os = "linux")]
+    #[must_use]
+    pub fn faulted(bytes: usize, threads: usize) -> Option<Pinning> {
+        const HUGE_PAGE: usize = 2 << 20;
+        const PAGE: usize = 4 << 10;
+        let bytes = bytes.max(1).next_multiple_of(HUGE_PAGE);
+        // SAFETY: a fresh private anonymous mapping of a stated length; no
+        // fd, no offset, owned by nobody else.
+        let at = unsafe {
+            libc::mmap(
+                core::ptr::null_mut(),
+                bytes,
+                libc::PROT_READ | libc::PROT_WRITE,
+                libc::MAP_PRIVATE | libc::MAP_ANONYMOUS,
+                -1,
+                0,
+            )
+        };
+        if at == libc::MAP_FAILED {
+            return None;
+        }
+        // SAFETY: advice on this mapping alone; a kernel without
+        // transparent huge pages ignores it.
+        unsafe {
+            libc::madvise(at, bytes, libc::MADV_HUGEPAGE);
+        }
+        let base = at as usize;
+        let share = (bytes / threads.max(1)).next_multiple_of(HUGE_PAGE);
+        let touch = |from: usize, to: usize| {
+            for page in (from..to).step_by(PAGE) {
+                // SAFETY: inside the mapping made above, which no one else
+                // reads or writes yet.
+                unsafe { core::ptr::write_volatile((base + page) as *mut u8, 0) };
+            }
+        };
+        std::thread::scope(|scope| {
+            for from in (share..bytes).step_by(share.max(HUGE_PAGE)) {
+                scope.spawn(move || touch(from, (from + share).min(bytes)));
+            }
+            touch(0, share.min(bytes));
+        });
+        Some(Pinning {
+            host: at.cast(),
+            bytes,
+        })
+    }
+
     pub fn lock(self) -> Result<Pinned> {
         #[cfg(feature = "device")]
         {
