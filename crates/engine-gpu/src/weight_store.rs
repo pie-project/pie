@@ -1,37 +1,55 @@
 use std::fs::File;
 
-use crate::device::alloc::Memory;
-use crate::device::{Buffer, Context, Handles};
+use crate::backend::{Backend, Buffer as _, Memory};
 use crate::error::{Fault, Result};
+use crate::handles::Handles;
 
 type Job = (u64, u64, u64);
 
 type ChunkJobs = (usize, Vec<Job>);
 
-#[derive(Clone, Debug)]
-struct Chunk {
+#[derive(Debug)]
+struct Chunk<B: Backend> {
     start: u64,
-    buffer: Buffer,
+    buffer: B::Buffer,
 }
 
-#[derive(Clone, Debug)]
-pub struct Store {
-    chunks: Vec<Chunk>,
+impl<B: Backend> Clone for Chunk<B> {
+    fn clone(&self) -> Self {
+        Chunk {
+            start: self.start,
+            buffer: self.buffer.clone(),
+        }
+    }
+}
+
+#[derive(Debug)]
+pub struct Store<B: Backend> {
+    chunks: Vec<Chunk<B>>,
     bytes: u64,
 }
 
-impl Store {
-    pub fn zeroed(device: &Context, spans: &[(u64, u64)], ceiling: u64) -> Result<Store> {
+impl<B: Backend> Clone for Store<B> {
+    fn clone(&self) -> Self {
+        Store {
+            chunks: self.chunks.clone(),
+            bytes: self.bytes,
+        }
+    }
+}
+
+impl<B: Backend> Store<B> {
+    pub fn zeroed(device: &B::Context, spans: &[(u64, u64)], ceiling: u64) -> Result<Store<B>> {
         Store::with(device, spans, ceiling, Memory::Device)
     }
 
     pub fn with(
-        device: &Context,
+        device: &B::Context,
         spans: &[(u64, u64)],
         ceiling: u64,
         kind: Memory,
-    ) -> Result<Store> {
-        let mut chunks: Vec<Chunk> = Vec::new();
+    ) -> Result<Store<B>> {
+        let mut chunks: Vec<Chunk<B>> = Vec::new();
         let mut start = 0u64;
         let mut held = 0u64;
         let total = spans
@@ -53,7 +71,7 @@ impl Store {
             if held > 0 && held + reserved > ceiling {
                 chunks.push(Chunk {
                     start,
-                    buffer: Buffer::with(device, held, kind)?,
+                    buffer: B::Buffer::with(device, held, kind)?,
                 });
                 start += held;
                 held = 0;
@@ -63,7 +81,7 @@ impl Store {
 
         chunks.push(Chunk {
             start,
-            buffer: Buffer::with(device, held, kind)?,
+            buffer: B::Buffer::with(device, held, kind)?,
         });
         Ok(Store {
             chunks,
@@ -92,7 +110,7 @@ impl Store {
         Ok((at, offset - chunk.start))
     }
 
-    pub fn bind(&self, handles: &Handles, offset: u64, len: u64) -> Result<u32> {
+    pub fn bind(&self, handles: &Handles<B>, offset: u64, len: u64) -> Result<u32> {
         let (at, local) = self.locate(offset, len)?;
         handles.bind(&self.chunks[at].buffer, local, len)
     }

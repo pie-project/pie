@@ -11,16 +11,7 @@ use super::host::Signal;
 #[cfg(not(target_arch = "wasm32"))]
 const PREAD_CHUNK: u64 = 256 << 20;
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Memory {
-    Device,
-
-    Host,
-
-    Staging,
-
-    Readback,
-}
+pub use engine_gpu::Memory;
 
 static IDS: AtomicU64 = AtomicU64::new(1);
 
@@ -366,6 +357,53 @@ impl Buffer {
         Ok(FileWriter {
             slab: Arc::clone(&self.slab),
         })
+    }
+}
+
+impl engine_gpu::Buffer<super::Api> for Buffer {
+    fn with(device: &Context, bytes: u64, kind: Memory) -> Result<Buffer> {
+        Buffer::with(device, bytes, kind)
+    }
+
+    fn bytes(&self) -> u64 {
+        self.bytes
+    }
+
+    fn slab_size(&self) -> u64 {
+        self.slab.size
+    }
+
+    fn slab_id(&self) -> u64 {
+        self.slab.id
+    }
+
+    fn is_host(&self) -> bool {
+        Buffer::is_host(self)
+    }
+
+    fn write(&mut self, offset: u64, bytes: &[u8]) -> Result<()> {
+        Buffer::write(self, offset, bytes)
+    }
+
+    fn write_shared(&self, offset: u64, bytes: &[u8]) -> Result<()> {
+        Buffer::write_shared(self, offset, bytes)
+    }
+
+    fn zero_span(&mut self, offset: u64, len: u64) -> Result<()> {
+        Buffer::zero_span(self, offset, len)
+    }
+
+    fn read(&self, offset: u64, into: &mut [u8]) -> Result<()> {
+        Buffer::read(self, offset, into)
+    }
+
+    fn write_from_file(
+        &mut self,
+        file: &std::fs::File,
+        jobs: &[(u64, u64, u64)],
+        threads: usize,
+    ) -> Result<()> {
+        Buffer::write_from_file(self, file, jobs, threads)
     }
 }
 

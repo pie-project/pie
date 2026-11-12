@@ -347,7 +347,7 @@ pub struct Shell {
 
     budgets: Budgets,
     weights: Weights,
-    arena: Arena,
+    arena: Arena<crate::device::Api>,
     pools: Pools,
     /// The weight cache's row tables (PLE), streamed through pool slots.
     row_caches: crate::store::rows::RowCaches,
@@ -1315,12 +1315,16 @@ impl Shell {
         let planes = self
             .weights
             .cached_planes(|at| self.row_caches.streams(at) || self.expert_caches.streams(at));
-        let filled = self
-            .row_caches
-            .residency(&self.device, &self.pools, host, &planes, residency)?
-            + self
-                .expert_caches
-                .residency(&self.device, &self.pools, host, &planes, residency)?;
+        let filled =
+            self.row_caches
+                .residency(&self.device, &self.pools, host, &planes, residency)?
+                + self.expert_caches.residency(
+                    &self.device,
+                    &self.pools,
+                    host,
+                    &planes,
+                    residency,
+                )?;
         // The fills have landed: the pages they read are let go.
         if filled > 0 {
             host.map().release();

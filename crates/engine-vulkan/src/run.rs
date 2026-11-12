@@ -22,8 +22,7 @@ pub enum WeightRow {
 #[derive(Clone, Debug, Default)]
 pub struct WeightTable(pub Vec<Option<WeightRow>>);
 
-#[derive(Clone, Debug, Default, Hash)]
-pub struct SlotTable(pub Vec<Option<Tensor>>);
+pub use engine_gpu::run::SlotTable;
 
 #[derive(Clone, Copy, Debug, Hash)]
 pub enum CachePool {

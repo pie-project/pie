@@ -5,9 +5,9 @@ use poem_exec::store::check::{self, rebase};
 use poem_exec::store::kv::Geometry;
 use poem_ir::{Dtype, Trace};
 
-use crate::device::Handles;
-use crate::device::handles::NIL;
+use crate::backend::Backend;
 use crate::error::{Fault, Result};
+use crate::handles::{Handles, NIL};
 
 #[derive(Debug, Clone)]
 pub struct Window {
@@ -360,7 +360,7 @@ impl Windows {
         out
     }
 
-    pub fn bind(&mut self, handles: &Handles, packed: u32) -> Result<()> {
+    pub fn bind<B: Backend>(&mut self, handles: &Handles<B>, packed: u32) -> Result<()> {
         let mut at = 0u64;
         let mut take = |vector: &[i32]| -> Result<Tensor> {
             let rows = vector.len() as u32;

@@ -1,6 +1,6 @@
 pub use engine_gpu::adapter;
 pub mod api;
-pub mod arena;
+pub use engine_gpu::arena;
 
 pub use engine_gpu::blob;
 pub mod boot;
@@ -19,7 +19,7 @@ mod landing;
 pub use engine_gpu::mask;
 pub mod probe;
 pub mod program;
-pub mod rs;
+pub use engine_gpu::rs;
 pub mod run;
 
 mod scratch;
@@ -27,9 +27,9 @@ pub mod serve;
 pub use engine_gpu::settle;
 pub mod store;
 pub mod tuning;
-pub mod weight_store;
+pub use engine_gpu::weight_store;
 pub mod weights;
-pub mod window;
+pub use engine_gpu::window;
 
 pub use adapter::{
     Binding as AdapterBinding, Key as AdapterKey, Role as AdapterRole, Site,

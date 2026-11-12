@@ -1171,11 +1171,14 @@ impl Pools {
         for (offset, len) in self.tier_spans(slots)? {
             let from = usize::try_from(offset).unwrap_or(usize::MAX);
             let len = usize::try_from(len).unwrap_or(usize::MAX);
-            let span = self.host.get(from..from.saturating_add(len)).ok_or(Fault::Ceiling {
-                what: "bytes of the host chunks",
-                need: offset + len as u64,
-                have: self.host.len() as u64,
-            })?;
+            let span = self
+                .host
+                .get(from..from.saturating_add(len))
+                .ok_or(Fault::Ceiling {
+                    what: "bytes of the host chunks",
+                    need: offset + len as u64,
+                    have: self.host.len() as u64,
+                })?;
             out.extend_from_slice(span);
         }
         Ok(out)

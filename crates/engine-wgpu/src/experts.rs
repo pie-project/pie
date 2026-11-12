@@ -111,7 +111,10 @@ impl Mapping {
     pub fn release(&self) {
         // SAFETY: a read-only private file mapping; dropping its pages makes
         // the next read fault them back in from the file, unchanged.
-        let _ = unsafe { self.map.unchecked_advise(memmap2::UncheckedAdvice::DontNeed) };
+        let _ = unsafe {
+            self.map
+                .unchecked_advise(memmap2::UncheckedAdvice::DontNeed)
+        };
     }
 
     #[must_use]

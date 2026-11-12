@@ -68,7 +68,7 @@ fn banks(trace: &Trace, places: &[Place]) -> BTreeMap<String, Bank> {
 
 #[derive(Debug)]
 pub struct Weights {
-    store: Store,
+    store: Store<crate::device::Api>,
 
     host: Option<HostTier>,
 
@@ -744,7 +744,7 @@ fn places(trace: &Trace, layout: &Layout) -> Result<Vec<Place>> {
 }
 
 struct Landing<'a> {
-    store: &'a mut Store,
+    store: &'a mut Store<crate::device::Api>,
 
     host: Option<(&'a Mapping, &'a BTreeMap<usize, HostPlane>)>,
     places: &'a [Place],

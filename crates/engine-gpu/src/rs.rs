@@ -6,8 +6,9 @@ use engine::rs::{LanePlan, Run};
 use kernels_slang::{Segments, Tensor};
 use poem_ir::{Def, Dim, Dtype, Gather, Operation, Ssm, Trace, Ty, ValueId};
 
-use crate::device::{Buffer, Handles};
+use crate::backend::{Backend, Buffer as _};
 use crate::error::{Fault, Result};
+use crate::handles::Handles;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum Role {
@@ -342,12 +343,12 @@ impl Seat {
     }
 
     #[allow(clippy::too_many_arguments)]
-    pub fn mint(
-        handles: &Handles,
+    pub fn mint<B: Backend>(
+        handles: &Handles<B>,
         layout: &Arc<Layout>,
         buffers: &Buffers,
         pool: Segments,
-        scratch: &Buffer,
+        scratch: &B::Buffer,
         lanes: Vec<LanePlan>,
         replay: Tensor,
         commit: Tensor,

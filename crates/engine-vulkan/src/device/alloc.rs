@@ -8,14 +8,7 @@ use crate::error::{Fault, Result};
 
 use super::ctx::{Context, Core, STAGING_BYTES, note_reservation};
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Memory {
-    Device,
-
-    Host,
-
-    Staging,
-}
+pub use engine_gpu::Memory;
 
 pub(crate) struct Raw {
     pub(crate) core: Arc<Core>,
@@ -52,7 +45,7 @@ impl Raw {
         use vk::MemoryPropertyFlags as F;
         match kind {
             Memory::Device => prefers(F::DEVICE_LOCAL).or_else(|| prefers(F::empty())),
-            Memory::Host | Memory::Staging => {
+            Memory::Host | Memory::Staging | Memory::Readback => {
                 prefers(F::HOST_VISIBLE | F::HOST_COHERENT | F::HOST_CACHED)
                     .or_else(|| prefers(F::HOST_VISIBLE | F::HOST_COHERENT))
                     .or_else(|| prefers(F::HOST_VISIBLE))
@@ -316,11 +309,6 @@ impl std::fmt::Debug for Buffer {
 }
 
 impl Buffer {
-    pub(crate) fn of_slab(slab: Slab) -> Buffer {
-        let bytes = slab.size;
-        Buffer { slab, bytes }
-    }
-
     pub fn zeroed(device: &Context, bytes: u64) -> Result<Buffer> {
         Buffer::with(device, bytes, Memory::Device)
     }
@@ -408,6 +396,56 @@ impl Buffer {
         Ok(FileWriter {
             slab: Arc::clone(&self.slab),
         })
+    }
+}
+
+impl engine_gpu::Buffer<super::Api> for Buffer {
+    fn with(device: &Context, bytes: u64, kind: Memory) -> Result<Buffer> {
+        Buffer::with(device, bytes, kind)
+    }
+
+    fn bytes(&self) -> u64 {
+        self.bytes
+    }
+
+    fn slab_size(&self) -> u64 {
+        self.slab.size
+    }
+
+    fn slab_id(&self) -> u64 {
+        {
+            use ash::vk::Handle;
+            self.slab.buffer.as_raw()
+        }
+    }
+
+    fn is_host(&self) -> bool {
+        Buffer::is_host(self)
+    }
+
+    fn write(&mut self, offset: u64, bytes: &[u8]) -> Result<()> {
+        Buffer::write(self, offset, bytes)
+    }
+
+    fn write_shared(&self, offset: u64, bytes: &[u8]) -> Result<()> {
+        Buffer::write_shared(self, offset, bytes)
+    }
+
+    fn zero_span(&mut self, offset: u64, len: u64) -> Result<()> {
+        Buffer::zero_span(self, offset, len)
+    }
+
+    fn read(&self, offset: u64, into: &mut [u8]) -> Result<()> {
+        Buffer::read(self, offset, into)
+    }
+
+    fn write_from_file(
+        &mut self,
+        file: &std::fs::File,
+        jobs: &[(u64, u64, u64)],
+        threads: usize,
+    ) -> Result<()> {
+        Buffer::write_from_file(self, file, jobs, threads)
     }
 }
 

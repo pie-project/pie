@@ -3,24 +3,25 @@ use poem_compiler::{ArenaMap, FireRows};
 use poem_exec::store::arena::rect;
 use poem_ir::ValueId;
 
-use crate::device::{Buffer, Context, Handles};
+use crate::backend::{Backend, Buffer as _};
 use crate::error::Result;
+use crate::handles::Handles;
 use crate::run::SlotTable;
 
 #[derive(Debug)]
-pub struct Arena {
-    store: Buffer,
+pub struct Arena<B: Backend> {
+    store: B::Buffer,
 }
 
-impl Arena {
-    pub fn reserve(device: &Context, map: &ArenaMap) -> Result<Arena> {
+impl<B: Backend> Arena<B> {
+    pub fn reserve(device: &B::Context, map: &ArenaMap) -> Result<Arena<B>> {
         Ok(Arena {
-            store: Buffer::zeroed(device, map.bytes)?,
+            store: B::Buffer::zeroed(device, map.bytes)?,
         })
     }
 
     #[must_use]
-    pub fn store(&self) -> &Buffer {
+    pub fn store(&self) -> &B::Buffer {
         &self.store
     }
 
@@ -29,7 +30,7 @@ impl Arena {
         self.store.bytes()
     }
 
-    pub fn slots(&self, handles: &Handles, map: &ArenaMap, rows: FireRows) -> Result<SlotTable> {
+    pub fn slots(&self, handles: &Handles<B>, map: &ArenaMap, rows: FireRows) -> Result<SlotTable> {
         carve(handles, &self.store, map, rows)
     }
 
@@ -38,9 +39,9 @@ impl Arena {
     }
 }
 
-pub fn carve(
-    handles: &Handles,
-    store: &Buffer,
+pub fn carve<B: Backend>(
+    handles: &Handles<B>,
+    store: &B::Buffer,
     map: &ArenaMap,
     fire: FireRows,
 ) -> Result<SlotTable> {

@@ -348,13 +348,13 @@ impl Sink<'_> {
                         .map_err(|detail| Sink::backend(fire, detail))?;
                     infos.push(
                         vk::DescriptorBufferInfo::default()
-                            .buffer(binding.slab().buffer)
+                            .buffer(binding.buffer().slab().buffer)
                             .offset(binding.offset())
                             .range(view),
                     );
                     writes_at.push(mutable);
                     extents.push(binding.extent());
-                    self.frame.retain(binding.slab());
+                    self.frame.retain(binding.buffer().slab());
                 }
                 ArgValue::I32(v) => push.extend_from_slice(&v.to_le_bytes()),
                 ArgValue::U32(v) => push.extend_from_slice(&v.to_le_bytes()),

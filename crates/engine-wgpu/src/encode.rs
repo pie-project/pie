@@ -329,7 +329,7 @@ impl Sink<'_> {
                             },
                         )
                     })?;
-                    let remaining = binding.remaining();
+                    let remaining = binding.extent().min(binding.remaining());
                     if remaining == 0 {
                         if mutable {
                             return Err(Sink::backend(
@@ -341,14 +341,18 @@ impl Sink<'_> {
                         views.push((dummy.buffer.clone(), 0, dummy.size, false));
                         continue;
                     }
-                    let view = remaining
-                        .next_multiple_of(4)
-                        .min(binding.slab().size.saturating_sub(binding.offset()));
+                    let view = remaining.next_multiple_of(4).min(
+                        binding
+                            .buffer()
+                            .slab()
+                            .size
+                            .saturating_sub(binding.offset()),
+                    );
                     storage_view_fits(views.len(), view, max_binding)
                         .map_err(|detail| Sink::backend(fire, detail))?;
                     if binding.offset().is_multiple_of(storage_align) {
                         views.push((
-                            binding.slab().buffer.clone(),
+                            binding.buffer().slab().buffer.clone(),
                             binding.offset(),
                             view,
                             mutable,
@@ -356,7 +360,7 @@ impl Sink<'_> {
                         continue;
                     }
 
-                    let source = binding.slab().buffer.clone();
+                    let source = binding.buffer().slab().buffer.clone();
                     let at = binding.offset();
                     if !at.is_multiple_of(4) {
                         if mutable {
@@ -370,9 +374,11 @@ impl Sink<'_> {
                             ));
                         }
                         {
-                            let len = remaining.min(binding.slab().size.saturating_sub(at));
+                            let len =
+                                remaining.min(binding.buffer().slab().size.saturating_sub(at));
                             let mut bytes = vec![0u8; len.next_multiple_of(4) as usize];
                             binding
+                                .buffer()
                                 .slab()
                                 .read(at, &mut bytes[..len as usize])
                                 .map_err(|fault| Sink::refuse(fire, fault))?;
@@ -387,7 +393,7 @@ impl Sink<'_> {
                     }
                     let len = remaining
                         .next_multiple_of(4)
-                        .min(binding.slab().size.saturating_sub(at) & !3);
+                        .min(binding.buffer().slab().size.saturating_sub(at) & !3);
                     let (chunk, slot) = self.frame.scratch_slot(len);
                     self.frame
                         .encode(|encoder| {

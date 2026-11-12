@@ -359,7 +359,7 @@ pub struct Shell {
 
     budgets: Budgets,
     weights: Weights,
-    arena: Arena,
+    arena: Arena<crate::device::Api>,
     pools: Pools,
     /// The weight cache's row tables (PLE), streamed through pool slots.
     row_caches: crate::store::rows::RowCaches,
@@ -1954,7 +1954,7 @@ impl Shell {
                     column.buf
                 ),
             })?;
-            let into = Buffer::of_slab(row.slab().clone());
+            let into = row.buffer().clone();
             let into_at = row.offset() + u64::from(land.first) * row_bytes;
             if !land.fed {
                 frame.fill_zero(&into, into_at, bytes)?;

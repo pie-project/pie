@@ -1,21 +1,39 @@
 use std::cell::{Ref, RefCell};
 
-use super::alloc::{Buffer, Slab};
+use crate::backend::{Backend, Buffer as _};
 use crate::error::{Fault, Result};
 
 pub const NIL: u32 = u32::MAX;
 
-#[derive(Clone)]
-pub struct Binding {
-    slab: Slab,
+pub struct Binding<B: Backend> {
+    buffer: B::Buffer,
     offset: u64,
 
-    len: u64,
+    extent: u64,
 }
 
-impl Binding {
-    pub(crate) fn slab(&self) -> &Slab {
-        &self.slab
+impl<B: Backend> Clone for Binding<B> {
+    fn clone(&self) -> Self {
+        Binding {
+            buffer: self.buffer.clone(),
+            offset: self.offset,
+            extent: self.extent,
+        }
+    }
+}
+
+impl<B: Backend> Binding<B> {
+    /// The reservation this binding lies in.
+    #[must_use]
+    pub fn buffer(&self) -> &B::Buffer {
+        &self.buffer
+    }
+
+    /// The first `len` bytes this binding names, read back.
+    pub fn read(&self, len: u64) -> Result<Vec<u8>> {
+        let mut out = vec![0u8; usize::try_from(len).unwrap_or(usize::MAX)];
+        self.buffer.read(self.offset, &mut out)?;
+        Ok(out)
     }
 
     #[must_use]
@@ -23,18 +41,29 @@ impl Binding {
         self.offset
     }
 
+    /// The bytes of the reservation from this binding's offset on.
     #[must_use]
     pub fn remaining(&self) -> u64 {
-        self.len.min(self.slab.size.saturating_sub(self.offset))
+        self.buffer.slab_size().saturating_sub(self.offset)
+    }
+
+    #[must_use]
+    pub fn extent(&self) -> u64 {
+        self.extent
+    }
+
+    #[must_use]
+    pub fn is_host(&self) -> bool {
+        self.buffer.is_host()
     }
 
     #[must_use]
     pub fn slab_id(&self) -> u64 {
-        self.slab.id
+        self.buffer.slab_id()
     }
 }
 
-impl std::fmt::Debug for Binding {
+impl<B: Backend> std::fmt::Debug for Binding<B> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Binding")
             .field("offset", &self.offset)
@@ -42,13 +71,21 @@ impl std::fmt::Debug for Binding {
     }
 }
 
-#[derive(Default)]
-pub struct Handles {
-    rows: RefCell<Vec<Binding>>,
+pub struct Handles<B: Backend> {
+    rows: RefCell<Vec<Binding<B>>>,
     sealed: std::cell::Cell<usize>,
 }
 
-impl std::fmt::Debug for Handles {
+impl<B: Backend> Default for Handles<B> {
+    fn default() -> Self {
+        Handles {
+            rows: RefCell::new(Vec::new()),
+            sealed: std::cell::Cell::new(0),
+        }
+    }
+}
+
+impl<B: Backend> std::fmt::Debug for Handles<B> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Handles")
             .field("rows", &self.rows.borrow().len())
@@ -57,13 +94,13 @@ impl std::fmt::Debug for Handles {
     }
 }
 
-impl Handles {
+impl<B: Backend> Handles<B> {
     #[must_use]
-    pub fn new() -> Handles {
+    pub fn new() -> Handles<B> {
         Handles::default()
     }
 
-    pub fn bind(&self, buffer: &Buffer, offset: u64, len: u64) -> Result<u32> {
+    pub fn bind(&self, buffer: &B::Buffer, offset: u64, len: u64) -> Result<u32> {
         buffer.span(offset, len)?;
         let mut rows = self.rows.borrow_mut();
         let at = rows.len();
@@ -75,9 +112,9 @@ impl Handles {
             });
         }
         rows.push(Binding {
-            slab: buffer.slab().clone(),
+            buffer: buffer.clone(),
             offset,
-            len,
+            extent: len,
         });
         Ok(at as u32)
     }
@@ -86,25 +123,33 @@ impl Handles {
         let binding = self.get(handle).ok_or_else(|| Fault::Unbound {
             what: format!("handle {handle}, which no row answers"),
         })?;
-        let mut out = vec![0u8; usize::try_from(len).unwrap_or(usize::MAX)];
-        binding.slab().read(binding.offset(), &mut out)?;
-        Ok(out)
+        binding.read(len)
     }
 
     pub fn cut(&self, handle: u32, skip: u64, len: u64) -> Result<u32> {
-        let (slab, offset) = {
+        let (buffer, offset) = {
             let rows = self.rows.borrow();
             let row = rows.get(handle as usize).ok_or_else(|| Fault::Unbound {
                 what: format!("handle {handle}, which this load minted no row for"),
             })?;
-            (row.slab.clone(), row.offset)
+            (row.buffer.clone(), row.offset)
         };
         let at_offset = offset.checked_add(skip).ok_or(Fault::Ceiling {
             what: "bytes of a device reservation",
             need: u64::MAX,
             have: offset,
         })?;
-        slab.span(at_offset, len)?;
+        let size = buffer.slab_size();
+        match at_offset.checked_add(len) {
+            Some(end) if end <= size => {}
+            _ => {
+                return Err(Fault::Ceiling {
+                    what: "bytes of a device reservation",
+                    need: at_offset.saturating_add(len),
+                    have: size,
+                });
+            }
+        }
         let mut rows = self.rows.borrow_mut();
         let at = rows.len();
         if at >= NIL as usize {
@@ -115,15 +160,15 @@ impl Handles {
             });
         }
         rows.push(Binding {
-            slab,
+            buffer,
             offset: at_offset,
-            len,
+            extent: len,
         });
         Ok(at as u32)
     }
 
     #[must_use]
-    pub fn get(&self, handle: u32) -> Option<Ref<'_, Binding>> {
+    pub fn get(&self, handle: u32) -> Option<Ref<'_, Binding<B>>> {
         if handle == NIL {
             return None;
         }

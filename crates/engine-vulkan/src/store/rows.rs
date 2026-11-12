@@ -523,7 +523,10 @@ impl RowCaches {
             .max()
             .unwrap_or(0);
         let capacity = UPLOAD.max(widest).max(4);
-        let uploads = [Buffer::host(device, capacity)?, Buffer::host(device, capacity)?];
+        let uploads = [
+            Buffer::host(device, capacity)?,
+            Buffer::host(device, capacity)?,
+        ];
         let mut pending: [Option<Pending>; 2] = [None, None];
         let mut turn = 0usize;
         let mut start = 0usize;
@@ -617,8 +620,7 @@ impl RowCaches {
                             // reads `upload` (its last one was waited on).
                             let image = unsafe {
                                 std::slice::from_raw_parts_mut(
-                                    (base + usize::try_from(at).unwrap_or(usize::MAX))
-                                        as *mut u8,
+                                    (base + usize::try_from(at).unwrap_or(usize::MAX)) as *mut u8,
                                     len,
                                 )
                             };
@@ -637,15 +639,14 @@ impl RowCaches {
                                     break;
                                 }
                                 for table in &shape.tables {
-                                    let plane = planes.get(&table.param).ok_or_else(|| {
-                                        Fault::Unbound {
+                                    let plane =
+                                        planes.get(&table.param).ok_or_else(|| Fault::Unbound {
                                             what: format!(
                                                 "row table param {}, which the host tier does \
                                                  not hold",
                                                 table.param
                                             ),
-                                        }
-                                    })?;
+                                        })?;
                                     let from = usize::try_from(k * shape.atom_bytes + table.origin)
                                         .unwrap_or(usize::MAX);
                                     let len = usize::try_from(table.row_bytes).unwrap_or(0);

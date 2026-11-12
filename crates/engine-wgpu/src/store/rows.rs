@@ -490,15 +490,14 @@ impl RowCaches {
                                     break;
                                 }
                                 for table in &shape.tables {
-                                    let plane = planes.get(&table.param).ok_or_else(|| {
-                                        Fault::Unbound {
+                                    let plane =
+                                        planes.get(&table.param).ok_or_else(|| Fault::Unbound {
                                             what: format!(
                                                 "row table param {}, which the host tier does \
                                                  not hold",
                                                 table.param
                                             ),
-                                        }
-                                    })?;
+                                        })?;
                                     let from = usize::try_from(k * shape.atom_bytes + table.origin)
                                         .unwrap_or(usize::MAX);
                                     let len = usize::try_from(table.row_bytes).unwrap_or(0);

@@ -1,9 +1,5 @@
-use std::cell::{Ref, RefCell};
-
 use crate::api::DeviceBoot;
 use crate::error::{Fault, Result};
-
-pub const NIL: u32 = u32::MAX;
 
 #[must_use]
 pub fn reservations() -> u64 {
@@ -184,13 +180,7 @@ impl Pending {
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Memory {
-    Device,
-    Host,
-    Staging,
-    Readback,
-}
+pub use engine_gpu::Memory;
 
 #[derive(Clone, Debug)]
 pub struct Buffer {
@@ -272,6 +262,53 @@ impl Buffer {
     }
 }
 
+impl engine_gpu::Buffer<super::Api> for Buffer {
+    fn with(device: &Context, bytes: u64, kind: Memory) -> Result<Buffer> {
+        Buffer::with(device, bytes, kind)
+    }
+
+    fn bytes(&self) -> u64 {
+        match self.never {}
+    }
+
+    fn slab_size(&self) -> u64 {
+        match self.never {}
+    }
+
+    fn slab_id(&self) -> u64 {
+        match self.never {}
+    }
+
+    fn is_host(&self) -> bool {
+        match self.never {}
+    }
+
+    fn write(&mut self, offset: u64, bytes: &[u8]) -> Result<()> {
+        Buffer::write(self, offset, bytes)
+    }
+
+    fn write_shared(&self, offset: u64, bytes: &[u8]) -> Result<()> {
+        Buffer::write_shared(self, offset, bytes)
+    }
+
+    fn zero_span(&mut self, offset: u64, len: u64) -> Result<()> {
+        Buffer::zero_span(self, offset, len)
+    }
+
+    fn read(&self, offset: u64, into: &mut [u8]) -> Result<()> {
+        Buffer::read(self, offset, into)
+    }
+
+    fn write_from_file(
+        &mut self,
+        file: &std::fs::File,
+        jobs: &[(u64, u64, u64)],
+        threads: usize,
+    ) -> Result<()> {
+        Buffer::write_from_file(self, file, jobs, threads)
+    }
+}
+
 pub struct FileWriter {
     never: std::convert::Infallible,
 }
@@ -284,94 +321,6 @@ impl FileWriter {
         _threads: usize,
     ) -> Result<()> {
         match self.never {}
-    }
-}
-
-#[derive(Clone, Debug)]
-pub struct Binding {
-    offset: u64,
-}
-
-impl Binding {
-    #[must_use]
-    pub fn offset(&self) -> u64 {
-        self.offset
-    }
-
-    #[must_use]
-    pub fn remaining(&self) -> u64 {
-        0
-    }
-
-    #[must_use]
-    pub fn slab_id(&self) -> u64 {
-        0
-    }
-}
-
-#[derive(Default, Debug)]
-pub struct Handles {
-    rows: RefCell<Vec<Binding>>,
-    sealed: std::cell::Cell<usize>,
-}
-
-impl Handles {
-    #[must_use]
-    pub fn new() -> Handles {
-        Handles::default()
-    }
-
-    pub fn bind(&self, buffer: &Buffer, _offset: u64, _len: u64) -> Result<u32> {
-        match buffer.never {}
-    }
-
-    pub fn read(&self, handle: u32, _len: u64) -> Result<Vec<u8>> {
-        Err(Fault::Unbound {
-            what: format!("handle {handle}, which no row answers"),
-        })
-    }
-
-    pub fn cut(&self, handle: u32, _skip: u64, _len: u64) -> Result<u32> {
-        Err(Fault::Unbound {
-            what: format!("handle {handle}, which this load minted no row for"),
-        })
-    }
-
-    #[must_use]
-    pub fn get(&self, handle: u32) -> Option<Ref<'_, Binding>> {
-        if handle == NIL {
-            return None;
-        }
-        let rows = self.rows.borrow();
-        if handle as usize >= rows.len() {
-            return None;
-        }
-        Some(Ref::map(rows, |rows| &rows[handle as usize]))
-    }
-
-    pub fn seal(&self) {
-        if self.sealed.get() == 0 {
-            self.sealed.set(self.rows.borrow().len());
-        }
-    }
-
-    pub fn rewind(&self) {
-        self.rows.borrow_mut().truncate(self.sealed.get());
-    }
-
-    #[must_use]
-    pub fn len(&self) -> usize {
-        self.rows.borrow().len()
-    }
-
-    #[must_use]
-    pub fn is_empty(&self) -> bool {
-        self.rows.borrow().is_empty()
-    }
-
-    #[must_use]
-    pub fn sealed(&self) -> usize {
-        self.sealed.get()
     }
 }
 
