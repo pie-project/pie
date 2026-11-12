@@ -66,7 +66,9 @@ pub fn step_kernel(on: Option<bool>) {
     STEP_KERNEL.store(v, std::sync::atomic::Ordering::Relaxed);
 }
 
-/// The pool conv step kernel (`PIE_XLA_CONV_KERNEL=0` turns it off).
+/// The pool conv step kernel. `PIE_XLA_CONV_KERNEL=0` turns it off: a
+/// diagnostic switch only, for the hybrid gates' parity with the base build
+/// (its output differs at the ulp), never a configuration knob.
 fn conv_step_on() -> bool {
     !std::env::var("PIE_XLA_CONV_KERNEL").is_ok_and(|v| v == "0")
 }
