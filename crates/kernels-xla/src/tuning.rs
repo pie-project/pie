@@ -177,6 +177,15 @@ pub struct RopeFlatRows(pub u32);
 #[decision(id = "kernel.glu.land_from", constant(set(0, 512, 1024, 2048)), default = 0, tune = search)]
 pub struct GluLandFrom(pub u32);
 
+/// From this many rows a row norm's input lands behind a barrier before the
+/// norm reads it, not left to XLA to fuse the norm's sum of squares into the
+/// dot that produced it: on a v5e that second output slows the dot
+/// (Gemma-4-31B's 1664-row `[21504, 5376]` down dot: 2.46 ms with the sum
+/// fused, 2.20 ms plain). 0 never does.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Decision)]
+#[decision(id = "kernel.norm.land_from", constant(set(0, 1024, 2048)), default = 0, tune = search)]
+pub struct NormLandFrom(pub u32);
+
 /// Up to this many rows per lane, an `auto` attention walk gathers each
 /// row's keys; past it, row blocks walk the key axis. 0 always blocks.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Decision)]
@@ -272,6 +281,7 @@ pub fn register(registry: &mut Registry) {
         .add::<AttnBlockRows>()
         .add::<RopeFlatRows>()
         .add::<GluLandFrom>()
+        .add::<NormLandFrom>()
         .add::<AttnBlockKeys>()
         .add::<AttnUnrolledBlocks>()
         .add::<AttnFlashNarrowRows>()
@@ -354,6 +364,9 @@ pub struct Tuning {
     /// Rows from which a dense GeGLU lands before its down dot (see
     /// [`GluLandFrom`]); 0 never.
     pub glu_land_from: i64,
+    /// Rows from which a row norm's input lands before the norm (see
+    /// [`NormLandFrom`]); 0 never.
+    pub norm_land_from: i64,
     pub chunks: Chunks,
     pub ssm: SsmChunks,
     pub vmem_bytes: i64,
@@ -393,6 +406,7 @@ impl Tuning {
         attn_per_row_max: 2,
         rope_flat_rows: 0,
         glu_land_from: 0,
+        norm_land_from: 0,
         chunks: Chunks {
             budget: 1 << 24,
             block_rows: 512,
@@ -453,6 +467,7 @@ impl Tuning {
             attn_per_row_max: n(profile.get::<AttnPerRowMax>().0),
             rope_flat_rows: n(profile.get::<RopeFlatRows>().0),
             glu_land_from: n(profile.get::<GluLandFrom>().0),
+            norm_land_from: n(profile.get::<NormLandFrom>().0),
             chunks: Chunks {
                 budget: n(profile.get::<AttnBudgetMi>().0) << 20,
                 block_rows: n(profile.get::<AttnBlockRows>().0),

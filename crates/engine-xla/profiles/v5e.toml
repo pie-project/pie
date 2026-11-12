@@ -51,6 +51,9 @@ moe.gmm_glu = 1
 # and runs both legs as one kernel there, the GLU rows staying in VMEM: Qwen3.6's 16-expert cut 1024 tokens
 # 497 -> 443 us, 1792 803 -> 762 (2176: 958 -> 1005); Gemma's 1792 1532 -> 1522, 2176 1888 -> 1868 (1024: 929 -> 960)
 moe.gmm_fuse_from = 1024
+# a row norm's input of 1024 rows and more lands before the norm reads it: its sum of squares fused into the
+# dot before it slowed that dot (Gemma-4-31B cut's 1664-row down dot 2.46 -> 2.20 ms, pf32-512 25.8k -> 26.4k)
+norm.land_from = 1024
 
 [provenance]
 measured = [
@@ -69,5 +72,6 @@ measured = [
   "kernel.moe.gmm_run_from",
   "kernel.moe.segment_from",
   "kernel.moe.segment_tokens",
+  "kernel.norm.land_from",
   "kernel.ssm.step_mxu",
 ]

@@ -44,6 +44,8 @@ impl Run<'_> {
                 axis: NormAxis::Row,
             } => crate::lower::lower(self.ctx(), |l| {
                 let x_v = l.read(self.tensor(*x))?;
+                let from = l.tuning().norm_land_from;
+                let x_v = norm_landed(l.f(), x_v, from);
                 let weight_v = l.read(self.tensor(*weight))?;
                 let o_y = self.tensor(*y);
                 let v = elemwise::norm::rmsnorm(l.f(), x_v, weight_v, *eps)?;
@@ -70,6 +72,8 @@ impl Run<'_> {
                 axis: NormAxis::Row,
             } => crate::lower::lower(self.ctx(), |l| {
                 let x_v = l.read(self.tensor(*x))?;
+                let from = l.tuning().norm_land_from;
+                let x_v = norm_landed(l.f(), x_v, from);
                 let weight_v = l.read(self.tensor(*weight))?;
                 let o_y = self.tensor(*y);
                 let v = elemwise::norm::rmsnorm_plus_one(l.f(), x_v, weight_v, *eps)?;
@@ -1195,5 +1199,22 @@ impl Run<'_> {
     ) -> Result<Vec<Tensor>, kernels_xla::Error> {
         let _ = y;
         Ok(blocks.iter().map(|b| self.tensor(*b)).collect())
+    }
+}
+
+/// A row norm's input of `from` rows and more behind a barrier
+/// (`kernel.norm.land_from`): XLA fuses its sum of squares into no dot that
+/// produced it.
+fn norm_landed(
+    f: &mut kernels_xla::hlo::Func,
+    x: kernels_xla::Operand,
+    from: i64,
+) -> kernels_xla::Operand {
+    if from == 0 || i64::from(x.rows) < from {
+        return x;
+    }
+    kernels_xla::Operand {
+        val: f.barrier(x.val),
+        ..x
     }
 }
