@@ -752,6 +752,9 @@ pub(crate) fn create_engine_backend(
             if let Some(tokens) = opts.seat_tokens {
                 boot_doc.push_str(&format!("seat_tokens = {tokens}\n"));
             }
+            if let Some(tokens) = opts.mixed_tokens {
+                boot_doc.push_str(&format!("mixed_tokens = {tokens}\n"));
+            }
             let backend = opened.map_or_else(
                 || runtime::engine::backend::open::xla(boot_doc.as_bytes()),
                 Ok,
