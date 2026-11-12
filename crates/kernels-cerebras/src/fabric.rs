@@ -600,7 +600,7 @@ impl Fabric {
 
     /// The hardware invariants, all PEs:
     /// - every colour < [`COLOURS`] (route slots a PE: [`Fabric::check_route_slots`], which
-    ///   needs the family's ABI);
+    ///   needs the layout's ABI);
     /// - every bound input queue's colour delivers to the PE's ramp, and every bound send
     ///   colour takes from it: no queue waits on a colour the PE only sends on (the 0704 hang;
     ///   [`Fabric::parks_avoiding`] keeps unbound queues off those too);

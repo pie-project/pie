@@ -1,4 +1,4 @@
-//! gpt-oss: the attention / MoE weight halves (`weight.csl`, its entry-major attention and routed experts),
+//! The attention / MoE halves' role kernels (gpt-oss, Qwen3 MoE): the attention / MoE weight halves (`weight.csl`, its entry-major attention and routed experts),
 //! CX (`cx.csl`, NRM 2), the CY halves (`cy.csl` (MIXK 2, MIXK 3)), the
 //! band's head (`head_pe_gptoss.csl`) and control row ([`super::head::HEAD_CTL`]'s source). Their
 //! params from the plan ([`kernels`]) and their rcfg writers.
@@ -176,10 +176,10 @@ pub struct Dims {
 impl Dims {
     pub fn of(plan: &Plan) -> R<Dims> {
         let (s, p) = (&plan.shape, &plan.partition);
-        let moe = s.moe.ok_or("gpt-oss plan: no MoE")?;
-        let ax = p.attn_cols.ok_or("gpt-oss plan: no attention columns")?;
+        let moe = s.moe.ok_or("split plan: no MoE")?;
+        let ax = p.attn_cols.ok_or("split plan: no attention columns")?;
         let k = p.layers_per_unit;
-        let hcc = p.row_dims.first().ok_or("gpt-oss plan: no row dims")?.dims;
+        let hcc = p.row_dims.first().ok_or("split plan: no row dims")?.dims;
         let qh = s.attn.q_heads / s.attn.kv_heads;
         let dc = s.attn.head_dim / p.segments.scores;
         let ic = moe.expert_intermediate / (p.cols - ax);
@@ -344,7 +344,7 @@ fn banded<'a>(pe: &Pe<'a>) -> Pe<'a> {
 
 fn hcc(pe: &Pe) -> R<u32> {
     let p = &pe.prog.plan.partition;
-    Ok(p.row_dims.first().ok_or("gpt-oss: no row dims")?.dims)
+    Ok(p.row_dims.first().ok_or("split: no row dims")?.dims)
 }
 
 /// A weight PE: the shared words, its own two the router column flag (the MoE half's first

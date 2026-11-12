@@ -1,38 +1,11 @@
 //! The logical plan: what the model is ([`Shape`]), how it is cut ([`Partition`]) and what the
-//! build promises at run time ([`Contract`]), with the family that builds it. No coordinates,
-//! colours or kernel names: the spatial pass reads the [`Shape`] off the model's trace
-//! ([`super::target`]) and a family turns it and a [`Preset`] into the plan
-//! ([`super::family::Family::plan`]).
+//! build promises at run time ([`Contract`]). No colours or kernel names: the spatial pass reads
+//! the [`Shape`] off the model's trace ([`super::target`]), and the partition of the layout its
+//! layers take turns it and a [`Preset`] into the plan ([`super::partition::plan`]).
 
 use std::collections::BTreeMap;
 
 use serde::{Deserialize, Serialize};
-
-/// Which program family a plan builds (each is one [`super::family::Family`]).
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
-pub enum FamilyId {
-    /// The unit snake: GDN and / or attention layers with one MLP each (Qwen3.5's GDN + gated
-    /// attention, Qwen3 and Llama 3's dense attention): `family/dense.rs`.
-    Dense,
-    /// gpt-oss (attention / MoE column split, banded head): `family/gptoss.rs`.
-    GptOss,
-    /// Gemma 4 E2B / E4B (PLE storage, shared KV, sliding / global layers): `family/gemma.rs`.
-    Gemma,
-    /// Gemma 4 12B (attention / plain row roles, head groups): `family/gemma12.rs`.
-    Gemma12,
-}
-
-impl FamilyId {
-    /// The family's name (the plan's record, error messages).
-    pub fn name(self) -> &'static str {
-        match self {
-            FamilyId::Dense => "dense",
-            FamilyId::GptOss => "gptoss",
-            FamilyId::Gemma => "gemma",
-            FamilyId::Gemma12 => "gemma12",
-        }
-    }
-}
 
 /// The model, as the wafer program needs it: the model's own facts, read off its trace, the same
 /// for every partition.
@@ -56,8 +29,8 @@ pub struct Shape {
 }
 
 impl Shape {
-    /// What tells one model's partition from another's within a family: the hidden size, the
-    /// layer count and the MLP's width.
+    /// What tells one model's partition from another's within a layout: the hidden size, the
+    /// layer count and the MLP's width (a pinned plan's made-for shape).
     #[must_use]
     pub fn signature(&self) -> [u32; 3] {
         [self.hidden, self.layers.len() as u32, self.mlp.intermediate]
@@ -266,8 +239,8 @@ pub struct Partition {
     pub units: u32,
     pub layers_per_unit: u32,
     /// The unit slots the units are visited over, (columns, rows) (`UNX`, `UNY`); a count of
-    /// units short of the slots leaves gap slots (the family's rule places them). `None`: the
-    /// family places its units otherwise (explicit origins).
+    /// units short of the slots leaves gap slots (the snake's rule places them). `None`: the
+    /// layout places its units otherwise (explicit origins).
     pub unit_grid: Option<(u32, u32)>,
     /// Weight PEs a unit row / column: the hidden dim's split (`PY`, rows) and the input dims'
     /// split (`PX`, columns; gpt-oss `AX + MX`).
@@ -381,7 +354,6 @@ pub struct Contract {
 /// The logical plan: the input of the physical build ([`super::program::Program::build`]).
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct Plan {
-    pub family: FamilyId,
     pub shape: Shape,
     pub partition: Partition,
     pub contract: Contract,
@@ -396,8 +368,8 @@ impl Plan {
     /// `layers_per_unit * units == layers.len()`, `kv_rows <= rows`, positions within the RoPE
     /// reach.
     ///
-    /// Only facts every family states the same way are checked; a family's own rules stay in its
-    /// `plan` / `floor`.
+    /// Only facts every layout states the same way are checked; a layout's own rules stay in its
+    /// partition ([`super::partition`]) and its blocks.
     pub fn validate(&self) -> Result<(), String> {
         let (sh, pa, co) = (&self.shape, &self.partition, &self.contract);
         let bad = |m: String| Err(format!("plan: {m}"));
@@ -503,9 +475,10 @@ impl Partition {
     }
 }
 
-/// A family's partition choices by name (its preset table), with any overrides set over them:
-/// the counts and split factors a family turns into a [`Partition`] and a [`Contract`] for a
-/// [`Shape`]. Keys are the family's (`PX`, `PY`, `K`, `G2`, ...); values are numbers.
+/// A partition's choices by name (a pinned plan's, [`super::pins`], or the search's), with any
+/// overrides set over them: the counts and split factors a layout's partition turns into a
+/// [`Partition`] and a [`Contract`] for a [`Shape`]. Keys are the layout's (`PX`, `PY`, `K`,
+/// `G2`, ...); values are numbers.
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct Preset {
     pub name: String,

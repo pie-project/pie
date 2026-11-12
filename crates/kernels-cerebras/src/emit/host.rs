@@ -1,7 +1,7 @@
 //! What the host driver needs to find on the wafer: the PEs it reads and writes, the shapes of
 //! what it moves and the host's share of the model's math (the logit softcap). Everything the
 //! engine's `ArtifactModel` does that depends on the program is read from here (through the
-//! [`super::super::artifact::Artifact`]): the host names no family.
+//! [`super::super::artifact::Artifact`]): the host names no layout.
 
 use serde::{Deserialize, Serialize};
 

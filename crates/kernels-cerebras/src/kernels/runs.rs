@@ -1,4 +1,4 @@
-//! Gemma 4 12B: `weight.csl` (deferred norms, sliding / global caches, plain rows), `cx.csl` (deferred norms, head groups), `cy.csl`, `head_pe.csl` (GRP 1), with the
+//! The row runs' role kernels (Gemma 4 12B): `weight.csl` (deferred norms, sliding / global caches, plain rows), `cx.csl` (deferred norms, head groups), `cy.csl`, `head_pe.csl` (GRP 1), with the
 //! shared head control ([`super::head::HEAD_CTL`]). Their params from the plan ([`kernels`]) and
 //! their rcfg writers.
 
@@ -194,7 +194,7 @@ fn dcf(hd: u32, swa: u32) -> u32 {
     2 * (hd / 2).div_ceil(swa)
 }
 
-/// The kernels' shape from the plan: what the meta records too (the family checks them).
+/// The kernels' shape from the plan: what the meta records too (the partition checks them).
 pub struct Dims {
     pub k: u32,
     pub km: u32,
@@ -218,7 +218,7 @@ impl Dims {
         let ra = match p.row_dims.as_slice() {
             [a, b] if a.attention && !b.attention && a.rows.0 == 0 => a.rows.1,
             _ => {
-                return Err("gemma12: row runs want attention rows 0..RA then plain rows".into());
+                return Err("runs: row runs want attention rows 0..RA then plain rows".into());
             }
         };
         let kinds = |u: u32| -> Vec<bool> {
@@ -229,13 +229,13 @@ impl Dims {
         };
         if s.layers.len() < (p.units * k) as usize {
             return Err(format!(
-                "gemma12: {} layers for {} units of {k}",
+                "runs: {} layers for {} units of {k}",
                 s.layers.len(),
                 p.units
             ));
         }
         if (1..p.units).any(|u| kinds(u) != kinds(0)) {
-            return Err("gemma12: the units' layer kinds differ".into());
+            return Err("runs: the units' layer kinds differ".into());
         }
         let km = kinds(0)
             .iter()
@@ -249,12 +249,12 @@ impl Dims {
                 LayerKind::Sliding { window } => Some(*window),
                 _ => None,
             })
-            .ok_or("gemma12: no sliding layer")?;
+            .ok_or("runs: no sliding layer")?;
         let swa = p.segments.scores;
         let nseg = p.cols / swa;
         if nseg == 0 || s.attn.kv_heads != nseg || !s.attn.q_heads.is_multiple_of(nseg) {
             return Err(format!(
-                "gemma12: {} q / {} kv heads over {nseg} segments",
+                "runs: {} q / {} kv heads over {nseg} segments",
                 s.attn.q_heads, s.attn.kv_heads
             ));
         }
@@ -265,11 +265,8 @@ impl Dims {
         let nes = p
             .kv_entries
             .sliding
-            .ok_or("gemma12: no sliding entries (NES)")?;
-        let neg = p
-            .kv_entries
-            .global
-            .ok_or("gemma12: no global entries (NEG)")?;
+            .ok_or("runs: no sliding entries (NES)")?;
+        let neg = p.kv_entries.global.ok_or("runs: no global entries (NEG)")?;
         let hdc = (0..p.head.cols as usize)
             .map(|c| group_dims(plan, c))
             .max()

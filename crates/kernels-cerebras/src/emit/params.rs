@@ -1,4 +1,4 @@
-//! Kernel comptime params: each kind's `K:V` list (its [`KernelBuild`] from the family, the
+//! Kernel comptime params: each kind's `K:V` list (its [`KernelBuild`] from the layout's kernels, the
 //! build's levers on top), and each PE's own list (its kind's, then the blocks'
 //! [`super::super::abi::Overrides`] at that PE).
 
@@ -11,7 +11,7 @@ use crate::floor::Coord;
 use crate::program::Program;
 use crate::role::Kind;
 
-/// The build's lever overrides on top of a family's defaults (`CYV`, `GELUT`, `WSPEC`, `SLW`,
+/// The build's lever overrides on top of the kernels' defaults (`CYV`, `GELUT`, `WSPEC`, `SLW`,
 /// `RING`, diagnostics ...): the cslc command line's extra `K:V`. A key `<kind>.K` (the kind's
 /// [`Kind::name`]: `w.FIFOW:16`) sets the param of that kind only.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize)]

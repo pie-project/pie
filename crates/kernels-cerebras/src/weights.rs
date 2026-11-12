@@ -195,7 +195,7 @@ pub struct Binding {
 /// The checkpoint tensors a binding's words come from, and how ([`Binding::from`]).
 pub type From = Vec<(String, Vec<Transform>)>;
 
-/// A family's bindings in placement order.
+/// A program's bindings in placement order.
 #[derive(Default)]
 pub struct Copies(pub Vec<Binding>);
 

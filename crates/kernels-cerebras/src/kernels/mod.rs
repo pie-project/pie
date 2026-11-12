@@ -1,14 +1,22 @@
 //! The wafer program kernels: one [`super::abi::Kernel`] descriptor a CSL source, its params
 //! struct and its rcfg writer. An rcfg writer sees one PE as a [`Pe`]: the queues the blocks'
-//! links bound there (by slot), the notes they left, the program's palette and fabric.
+//! links bound there (by slot), the notes they left, the program's palette and fabric. Each
+//! layout's role kernels take their params from the plan ([`of`]) and export their symbols in one
+//! order ([`symbols`]):
 //!
-//! - [`common`]: the word layouts every family's weight, CX, CY, head and head control kernels
+//! - [`common`]: the word layouts every layout's weight, CX, CY, head and head control kernels
 //!   share (their leading words), with the codes the kernels read named;
-//! - [`dense`]: the unit snake's kernels (Qwen3.5, Qwen3, Llama 3) (`weight.csl`, `cx.csl`, `cy.csl`,
-//!   `head_pe.csl`, `head_ctl.csl`, `relay.csl`);
-//! - [`gemma`]: Gemma 4 E2B / E4B's (`weight.csl`, `cx.csl`, `cy.csl`,
-//!   `head_ctl.csl` (TB 1), `ple_gemma.csl`; `head_pe.csl`).
+//! - [`snake`]: the unit snake's (`weight.csl`, `cx.csl`, `cy.csl`, `head_pe.csl`,
+//!   `head_ctl.csl`, `relay.csl`);
+//! - [`stacked`]: the stacked columns' (`weight.csl`, `cx.csl`, `cy.csl`, `head_ctl.csl` (TB 1),
+//!   `ple_gemma.csl`; `head_pe.csl`);
+//! - [`runs`]: the row runs' (`weight.csl` with row roles, `cx.csl`, `cy.csl`, `head_pe.csl`
+//!   with head groups, `head_ctl.csl`);
+//! - [`split`]: the attention / MoE halves' (`weight.csl`, `cx.csl`, `cy.csl`'s halves,
+//!   `head_pe_gptoss.csl` on the band, `head_ctl.csl`).
 
+use super::abi::Kernels;
+use super::compose::Layout;
 use super::fabric::{ChainMember, Colour, Endpoint, PeIo, RootQueues};
 use super::floor::Coord;
 use super::program::Program;
@@ -16,13 +24,36 @@ use super::role::PeRole;
 use super::wiring::{Class, NoteKey, Slot};
 
 pub mod common;
-pub mod dense;
-pub mod gemma;
-pub mod gemma12;
-pub mod gptoss;
 pub mod head;
+pub mod runs;
+pub mod snake;
+pub mod split;
+pub mod stacked;
 
 type R<T> = Result<T, String>;
+
+/// Each kind's kernel and its params for `prog`, by its layout (levers applied by
+/// [`super::emit::params::kernels`]).
+pub fn of(prog: &Program) -> R<Kernels> {
+    match prog.layout {
+        Layout::Snake => snake::kernels(prog),
+        Layout::Stacked => stacked::kernels(prog),
+        Layout::Runs => runs::kernels(prog),
+        Layout::Split => split::kernels(prog),
+    }
+}
+
+/// Every name the kernels of `layout` export, with its element type, in export order: the ABI
+/// between the kernels and the host's memcpy.
+#[must_use]
+pub fn symbols(layout: Layout) -> &'static [(&'static str, &'static str)] {
+    match layout {
+        Layout::Snake => snake::SYMBOLS,
+        Layout::Stacked => stacked::SYMBOLS,
+        Layout::Runs => runs::SYMBOLS,
+        Layout::Split => split::SYMBOLS,
+    }
+}
 
 /// A colour as an rcfg word.
 pub fn word(c: Colour) -> u32 {

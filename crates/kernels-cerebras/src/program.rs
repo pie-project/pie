@@ -4,9 +4,8 @@
 
 use super::abi::{Kernels, Overrides};
 use super::block::Block;
-use super::compose::{self, Needs, Schedule};
+use super::compose::{self, Layout, Needs, Schedule};
 use super::fabric::{Fabric, Palette};
-use super::family::{self, Family};
 use super::floor::{Floor, FloorBuilder};
 use super::layers;
 use super::plan::Plan;
@@ -23,37 +22,34 @@ pub struct Program {
     pub fabric: Fabric,
     pub kernels: Kernels,
     pub overrides: Overrides,
-    pub family: Box<dyn Family>,
+    /// How the plan's units lie: the blocks' and the role kernels' one choice.
+    pub layout: Layout,
     /// The role kernels' layer phases, from what the plan's layers need.
     pub schedule: Schedule,
 }
 
 impl Program {
-    /// The program of `plan`, by its family ([`Program::build`]).
+    /// The program of `plan` ([`Program::build`]).
     pub fn of(plan: Plan) -> Result<Program, String> {
-        Program::build(family::of(plan.family), plan)
+        Program::build(plan)
     }
 
     /// The physical build of a plan: validate it; each block places its PEs, then lays its
     /// links, then settles the floor on them; the palette is the blocks' colours; lay the fabric
-    /// and validate it (its invariants); the family's kernels, every PE's routes within its
+    /// and validate it (its invariants); the layout's kernels, every PE's routes within its
     /// kernel's route table; the blocks' param overrides. Pure (no device, no files).
     /// The blocks are the composer's ([`compose`]) from what the layers need, their copies the
     /// layout's kernels'.
-    pub fn build(family: Box<dyn Family>, plan: Plan) -> Result<Program, String> {
+    pub fn build(plan: Plan) -> Result<Program, String> {
         plan.validate()?;
         compose::refuse(&plan.shape)?;
         let needs = Needs::of(&layers::of(&plan.shape));
         let blocks = compose::blocks(&plan, &needs)?;
-        Program::build_with(blocks, family, plan)
+        Program::build_with(blocks, plan)
     }
 
     /// The physical build of a plan over `blocks` ([`Program::build`]).
-    pub fn build_with(
-        blocks: Vec<Box<dyn Block>>,
-        family: Box<dyn Family>,
-        plan: Plan,
-    ) -> Result<Program, String> {
+    pub fn build_with(blocks: Vec<Box<dyn Block>>, plan: Plan) -> Result<Program, String> {
         plan.validate()?;
         let mut fb = FloorBuilder::default();
         for b in &blocks {
@@ -79,7 +75,9 @@ impl Program {
         let palette = Palette::of(blocks.iter().flat_map(|b| b.colours()));
         let fabric = Fabric::lay(&floor, &wiring, &palette)?;
         fabric.validate(&floor)?;
-        let schedule = Schedule::of(&layers::of(&plan.shape));
+        let program = layers::of(&plan.shape);
+        let schedule = Schedule::of(&program);
+        let layout = Layout::of(&Needs::of(&program));
         let mut prog = Program {
             plan,
             blocks,
@@ -89,10 +87,10 @@ impl Program {
             fabric,
             kernels: Kernels::new(),
             overrides: Overrides::default(),
-            family,
+            layout,
             schedule,
         };
-        prog.kernels = prog.family.kernels(&prog)?;
+        prog.kernels = super::kernels::of(&prog)?;
         prog.fabric.check_route_slots(&prog.floor, &|k| {
             prog.kernels.get(&k).map(|kb| kb.route_slots)
         })?;

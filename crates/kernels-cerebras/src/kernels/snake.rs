@@ -1,5 +1,5 @@
-//! Qwen3.5 (GDN layers + gated full attention), Qwen3 and Llama 3 (dense attention, no output gate):
-//! `weight.csl` (direct norms, own-cache attention / GDN mixers), `cx.csl`, `cy.csl`, with the head's and the relay's
+//! The snake's role kernels (Qwen3.5's GDN layers + gated full attention, Qwen3 and Llama 3's dense
+//! attention): `weight.csl` (direct norms, own-cache attention / GDN mixers), `cx.csl`, `cy.csl`, with the head's and the relay's
 //! ([`super::head`], [`super::common::RELAY`]). Their params from the plan ([`kernels`]) and
 //! their rcfg writers.
 
@@ -112,7 +112,7 @@ fn weight(pe: &Pe) -> R<Vec<u32>> {
         .partition
         .row_dims
         .first()
-        .ok_or("dense: no row dims")?
+        .ok_or("snake: no row dims")?
         .dims;
     let relays = [pe.turn(RELAY_PRE), pe.turn(RELAY_POST)];
     common::weight(pe, 16, row, [source, gdn], hc, relays)
@@ -150,7 +150,7 @@ pub fn kernels(prog: &Program) -> R<Kernels> {
         .filter(|(_, l)| !matches!(l, LayerKind::Gdn))
         .map(|(i, _)| 1 << i)
         .sum();
-    let hcc = p.row_dims.first().ok_or("dense: no row dims")?.dims;
+    let hcc = p.row_dims.first().ok_or("snake: no row dims")?.dims;
     let gate = u32::from(s.attn.output_gate);
     let (hd, kvh) = (s.attn.head_dim, s.attn.kv_heads);
     let qh = s.attn.q_heads / kvh;

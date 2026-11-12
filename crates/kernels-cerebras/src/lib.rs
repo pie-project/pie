@@ -5,8 +5,9 @@
 //!
 //! The wafer program's compiler (`programs/wafer`: one sequence on the wafer, the layers in units
 //! of weight PEs, the head and the token loop beside them): poem's spatial pass over the model's
-//! trace ([`target`]) makes a [`plan`] (the model and how it is cut, no coordinates), which goes
-//! through the [`family`]'s [`block`]s to the [`floor`], [`wiring`] and laid [`fabric`], every
+//! trace ([`target`]) makes a [`plan`] (the model and how it is cut: [`partition`], [`pins`],
+//! [`search`]), which goes through the [`block`]s its layers need ([`compose`]) to the [`floor`],
+//! [`wiring`] and laid [`fabric`], every
 //! kernel's [`abi`] ([`kernels`]), the build's outputs ([`emit`]) and the weight [`weights`]
 //! bindings; `ARCHITECTURE.md` (the crate root) walks the layers.
 //!
@@ -22,11 +23,11 @@ pub mod compose;
 pub mod cost;
 pub mod emit;
 pub mod fabric;
-pub mod family;
 pub mod floor;
 pub mod kernels;
 pub mod layers;
 pub mod npy;
+pub mod partition;
 pub mod pins;
 pub mod plan;
 pub mod program;

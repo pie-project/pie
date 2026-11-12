@@ -3,7 +3,7 @@
 //! `build.py` and the family `build_*.py` (their `layout.csl` and `<kind>.csl` outputs).
 //!
 //! The per-kind sources are the `build*.py` ones byte for byte (the kernel source, then one-word
-//! dummies for every exported name the kind does not own, in the family's export order). The
+//! dummies for every exported name the kind does not own, in the layout's export order). The
 //! layout is written from the floor instead of re-deriving it in CSL: every PE's kernel and
 //! resolved params ([`super::params::tile`]) grouped into maximal rectangles, one loop nest a
 //! rectangle, every param a literal. The levers are applied before (`wafer-compile build --levers`),
@@ -21,7 +21,7 @@ use crate::sources;
 
 use super::params::{Levers, kernels, tile};
 
-/// The empty kernel of PEs with no role (and of kinds a family builds no kernel for).
+/// The empty kernel of PEs with no role (and of kinds a layout builds no kernel for).
 const FILLER: &str = "param memcpy_params;
 const sys_mod = @import_module(\"<memcpy/memcpy>\", memcpy_params);
 fn init() void { sys_mod.unblock_cmd_stream(); }
@@ -35,7 +35,7 @@ pub fn kind_source(body: &str, syms: &[(&str, &str)], owns: &[&str]) -> Result<S
     for o in owns {
         if !syms.iter().any(|(n, _)| n == o) {
             return Err(format!(
-                "kernel owns {o}, not an exported name of its family"
+                "kernel owns {o}, not an exported name of its layout"
             ));
         }
     }
@@ -161,7 +161,7 @@ pub fn layout_text(prog: &Program, kinds: &Kernels) -> Result<String, String> {
             r.y + r.h,
         );
     }
-    for (n, t) in prog.family.symbols() {
+    for (n, t) in crate::kernels::symbols(prog.layout) {
         let _ = writeln!(s, "  @export_name(\"{n}\", [*]{t}, true);");
     }
     s.push_str(
@@ -181,7 +181,7 @@ pub fn write(
 ) -> Result<(), String> {
     let kinds = kernels(prog, levers)?;
     std::fs::create_dir_all(out).map_err(|e| format!("{}: {e}", out.display()))?;
-    let syms = prog.family.symbols();
+    let syms = crate::kernels::symbols(prog.layout);
     let wr = |name: &str, text: &str| {
         let p = out.join(name);
         std::fs::write(&p, text).map_err(|e| format!("{}: {e}", p.display()))

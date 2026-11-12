@@ -1,4 +1,4 @@
-//! The composer: a program's blocks from what its layers need, not from a family. Each phase a
+//! The composer: a program's blocks from what its layers need, not from the model's name. Each phase a
 //! layer program has ([`poem_compiler::spatial::layer`]) asks for the blocks that run it, the
 //! partition says how big each is:
 //!
@@ -345,7 +345,7 @@ pub fn snake_gap(units: u32, (unx, uny): (u32, u32)) -> R<Option<(u32, u32)>> {
         Some(0) => Ok(None),
         Some(1) if unx % 2 == 0 && uny >= 3 => Ok(Some((unx - 1, 1))),
         _ => Err(format!(
-            "dense: {units} units on {unx} x {uny} slots (at most one gap slot, on an even number of unit columns, below the turn row)"
+            "snake: {units} units on {unx} x {uny} slots (at most one gap slot, on an even number of unit columns, below the turn row)"
         )),
     }
 }
@@ -384,7 +384,7 @@ fn snake(plan: &Plan) -> R<UnitGrid> {
     let p = &plan.partition;
     let ug = p
         .unit_grid
-        .ok_or("dense: the plan has no unit grid (UNX, UNY)")?;
+        .ok_or("snake: the plan has no unit grid (UNX, UNY)")?;
     // a segment within a half of the unit's columns (none spans the control column)
     for (n, sw) in [
         ("SWA", p.segments.scores),
@@ -393,13 +393,13 @@ fn snake(plan: &Plan) -> R<UnitGrid> {
     ] {
         if sw == 0 || !(p.cols / 2).is_multiple_of(sw) {
             return Err(format!(
-                "dense: {n} {sw} does not divide XC {} (a segment would span the control column)",
+                "snake: {n} {sw} does not divide XC {} (a segment would span the control column)",
                 p.cols / 2
             ));
         }
     }
     if p.head.cols * 2 != p.rows {
-        return Err("dense: head columns = CX rows / 2".into());
+        return Err("snake: head columns = CX rows / 2".into());
     }
     Ok(grid(
         plan,
@@ -419,7 +419,7 @@ fn u_columns(plan: &Plan) -> R<UnitGrid> {
     let n = p.units;
     if n == 0 || !n.is_multiple_of(2) {
         return Err(format!(
-            "gemma12: {n} units (two unit columns, unit 0 and the last on row 0)"
+            "runs: {n} units (two unit columns, unit 0 and the last on row 0)"
         ));
     }
     let (uw, uh, uny) = (p.cols + 1, p.rows + 1, n / 2);
@@ -439,12 +439,12 @@ fn u_columns(plan: &Plan) -> R<UnitGrid> {
 /// starts upward, so the first and the last unit sit on the band.
 fn split_snake(plan: &Plan) -> R<UnitGrid> {
     let p = &plan.partition;
-    let ax = p.attn_cols.ok_or("gpt-oss plan: no attention columns")?;
+    let ax = p.attn_cols.ok_or("split plan: no attention columns")?;
     if ax >= p.cols {
-        return Err("gpt-oss plan: no MoE columns".into());
+        return Err("split plan: no MoE columns".into());
     }
     if !p.units.is_multiple_of(2) {
-        return Err("gpt-oss: an even unit count (the last unit next to the band)".into());
+        return Err("split: an even unit count (the last unit next to the band)".into());
     }
     Ok(UnitGrid {
         cx: ax,
@@ -477,10 +477,7 @@ pub fn blocks(plan: &Plan, needs: &Needs) -> R<Vec<Box<dyn Block>>> {
             width: p.segments.scores,
         }));
         out.push(Box::new(Router {
-            width: p
-                .segments
-                .router
-                .ok_or("gpt-oss plan: no router segments")?,
+            width: p.segments.router.ok_or("split plan: no router segments")?,
         }));
         out.push(Box::new(Band {
             cols: p.head.cols,
@@ -586,10 +583,10 @@ mod tests {
         .unwrap()
     }
 
-    /// The role kernels' phases read off each shipping model's layer program: what its family's
+    /// The role kernels' phases read off each shipping model's layer program: what its layout's
     /// kernels were built with.
     #[test]
-    fn a_layer_program_schedules_its_family_kernels() {
+    fn a_layer_program_schedules_its_layout_kernels() {
         for (name, nrm, mixk, act, ple, kvs, hg) in [
             ("qwen35-d9b-bf16-kv-bf16", 0, 0, 0, 0, 0, 0),
             ("llama31-8b-bf16-kv-bf16", 0, 0, 0, 0, 0, 0),

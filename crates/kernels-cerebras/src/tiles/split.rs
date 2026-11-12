@@ -24,8 +24,8 @@ type R<T> = Result<T, String>;
 
 pub fn tiles(plan: &Plan, shapes: &dyn Fn(&str) -> Option<Vec<u64>>) -> R<Spec> {
     let (s, p) = (&plan.shape, &plan.partition);
-    let moe = s.moe.ok_or("gpt-oss: no experts")?;
-    let ax = p.attn_cols.ok_or("gpt-oss plan: no attention columns")? as usize;
+    let moe = s.moe.ok_or("split: no experts")?;
+    let ax = p.attn_cols.ok_or("split plan: no attention columns")? as usize;
     let (py, mx) = (p.rows as usize, p.cols as usize - ax);
     let hc = p.row_dims[0].dims as usize;
     let (h, v, nl) = (s.hidden as usize, s.vocab as usize, s.layers.len());
@@ -48,7 +48,7 @@ pub fn tiles(plan: &Plan, shapes: &dyn Fn(&str) -> Option<Vec<u64>>) -> R<Spec> 
         || !mx.is_multiple_of(nex)
     {
         return Err(format!(
-            "gpt-oss: {h} hidden on {py} rows of {hc}, {ax} attention columns, {inter} over {mx}"
+            "split: {h} hidden on {py} rows of {hc}, {ax} attention columns, {inter} over {mx}"
         ));
     }
     let (nqa, qo) = (qh * dc + 2 * dc, qh * dc);
@@ -83,7 +83,7 @@ pub fn tiles(plan: &Plan, shapes: &dyn Fn(&str) -> Option<Vec<u64>>) -> R<Spec> 
     let need = |n: String| -> R<String> {
         shapes(&n)
             .map(|_| n.clone())
-            .ok_or_else(|| format!("gpt-oss: no param {n}"))
+            .ok_or_else(|| format!("split: no param {n}"))
     };
     // a layer's param by its names (gpt-oss's import's, then the plain layout's)
     let one = |l: usize, names: &[&str]| -> R<String> {
@@ -91,7 +91,7 @@ pub fn tiles(plan: &Plan, shapes: &dyn Fn(&str) -> Option<Vec<u64>>) -> R<Spec> 
             .iter()
             .map(|n| ln(l, n))
             .find(|n| shapes(n).is_some())
-            .ok_or_else(|| format!("gpt-oss: no param layers.{l}.{}", names.join(" | ")))
+            .ok_or_else(|| format!("split: no param layers.{l}.{}", names.join(" | ")))
     };
     // q / k / v rows: one stacked param, or the three stacked here
     let qkv_src = |l: usize| -> R<Vec<String>> {

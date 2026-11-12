@@ -28,10 +28,10 @@ pub fn tiles(plan: &Plan, shapes: &dyn Fn(&str) -> Option<Vec<u64>>) -> R<Spec> 
     let hd_g = s.attn.global_head_dim.map_or(hd_s, |d| d as usize);
     let nu = p.units as usize;
     let k = nl / nu;
-    let ple_w = s.ple.ok_or("gemma: no per-layer inputs")?.width as usize;
+    let ple_w = s.ple.ok_or("stacked: no per-layer inputs")?.width as usize;
     if nl != k * nu || ple_w != px || !(1..=2).contains(&nkv) {
         return Err(format!(
-            "gemma: {nl} layers in {nu} units, PLE {ple_w} on {px} columns, {nkv} KV heads"
+            "stacked: {nl} layers in {nu} units, PLE {ple_w} on {px} columns, {nkv} KV heads"
         ));
     }
     let hc = h / py;
@@ -58,7 +58,7 @@ pub fn tiles(plan: &Plan, shapes: &dyn Fn(&str) -> Option<Vec<u64>>) -> R<Spec> 
         [pname(l, "scalar"), lname(l, "scalar")]
             .into_iter()
             .find(|n| has(n))
-            .ok_or_else(|| format!("gemma: no layer scalar of layer {l}"))
+            .ok_or_else(|| format!("stacked: no layer scalar of layer {l}"))
     };
 
     let gl = 5 * hc + 1;
@@ -160,10 +160,10 @@ pub fn tiles(plan: &Plan, shapes: &dyn Fn(&str) -> Option<Vec<u64>>) -> R<Spec> 
                 }
             }
             let gu = lname(l, "gate_up");
-            let ii = shapes(&gu).ok_or_else(|| format!("gemma: no param {gu}"))?[0] as usize / 2;
+            let ii = shapes(&gu).ok_or_else(|| format!("stacked: no param {gu}"))?[0] as usize / 2;
             let ic = ii / px;
             if ic * px != ii {
-                return Err(format!("gemma: layer {l}'s MLP {ii} over {px} columns"));
+                return Err(format!("stacked: layer {l}'s MLP {ii} over {px} columns"));
             }
             let gi = |c: usize| range(c * ic, ic);
             parts.push(Part::In {
@@ -248,7 +248,7 @@ pub fn tiles(plan: &Plan, shapes: &dyn Fn(&str) -> Option<Vec<u64>>) -> R<Spec> 
     );
     if hcols * hdc != h || hr * vr < v {
         return Err(format!(
-            "gemma: a head of {hcols} x {hdc} dims, {hr} x {vr} rows"
+            "stacked: a head of {hcols} x {hdc} dims, {hr} x {vr} rows"
         ));
     }
     let dims: Vec<Vec<i64>> = (0..hcols).map(|j| range(j * hdc, hdc)).collect();
@@ -295,7 +295,7 @@ pub fn tiles(plan: &Plan, shapes: &dyn Fn(&str) -> Option<Vec<u64>>) -> R<Spec> 
         let lv = layers.len();
         if nr * nt < v {
             return Err(format!(
-                "gemma: PLE column {ci} holds {} of {v} ids",
+                "stacked: PLE column {ci} holds {} of {v} ids",
                 nr * nt
             ));
         }

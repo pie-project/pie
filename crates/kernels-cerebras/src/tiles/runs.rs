@@ -31,7 +31,7 @@ pub fn tiles(plan: &Plan, shapes: &dyn Fn(&str) -> Option<Vec<u64>>) -> R<Spec> 
     let nseg = px / swa;
     if nl != k * nu || nseg * swa != px || nkv != nseg || !nq.is_multiple_of(nseg) {
         return Err(format!(
-            "gemma12: {nl} layers in {nu} units of {k}, {nkv} KV heads on {nseg} segments"
+            "runs: {nl} layers in {nu} units of {k}, {nkv} KV heads on {nseg} segments"
         ));
     }
     let qh = nq / nseg;
@@ -48,7 +48,7 @@ pub fn tiles(plan: &Plan, shapes: &dyn Fn(&str) -> Option<Vec<u64>>) -> R<Spec> 
         .collect();
     let hp = off[py];
     if hp < h {
-        return Err(format!("gemma12: {hp} hidden slots for {h}"));
+        return Err(format!("runs: {hp} hidden slots for {h}"));
     }
     let global = |l: usize| matches!(s.layers[l], LayerKind::Global);
     let pdims = |hd: usize, dc: usize, c: usize| -> Vec<i64> {
@@ -260,7 +260,7 @@ pub fn tiles(plan: &Plan, shapes: &dyn Fn(&str) -> Option<Vec<u64>>) -> R<Spec> 
         .max()
         .unwrap_or(0);
     if hr * vr < v {
-        return Err(format!("gemma12: a head of {hr} x {vr} rows"));
+        return Err(format!("runs: a head of {hr} x {vr} rows"));
     }
     let hdims: Vec<Vec<i64>> = groups
         .iter()

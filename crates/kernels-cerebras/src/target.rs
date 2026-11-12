@@ -13,10 +13,9 @@ use poem_ir::{
 };
 
 use super::compose::{BiasOn, Layout};
-use super::family;
 use super::plan::{
-    Act, AttnSpec, FamilyId, GdnSpec, HeadSpec, LayerKind, MlpSpec, MoeSpec, NormSpec, Plan,
-    PleSpec, Preset, RopeSpec, Shape, YarnSpec,
+    Act, AttnSpec, GdnSpec, HeadSpec, LayerKind, MlpSpec, MoeSpec, NormSpec, Plan, PleSpec, Preset,
+    RopeSpec, Shape, YarnSpec,
 };
 use super::program::Program;
 
@@ -409,15 +408,15 @@ pub struct Planned {
     pub preset: Preset,
 }
 
-/// A partition to try: a family's preset (the `order`-th tried), with the overrides set.
+/// A partition to try: a pinned plan's preset (the `order`-th tried), with the overrides set.
 #[derive(Clone, Debug)]
 pub struct Candidate {
-    pub family: FamilyId,
+    pub layout: Layout,
     pub preset: Preset,
     pub order: usize,
 }
 
-/// The wafer target for one shape: the preset asked for (else every one of the family's) and the
+/// The wafer target for one shape: the pinned plan asked for (else the one made for it) and the
 /// overrides set over it.
 pub struct Wafer {
     pub shape: Shape,
@@ -448,7 +447,7 @@ impl Wafer {
                     preset.keys.insert("CTX".into(), f64::from(n));
                 }
                 Some(Candidate {
-                    family: family::of_layout(layout),
+                    layout,
                     preset,
                     order,
                 })
@@ -458,7 +457,7 @@ impl Wafer {
 
     /// The plan `c` makes of the shape, serving exactly the positions asked for (if any).
     pub fn plan_of(&self, c: &Candidate) -> R<Plan> {
-        let mut plan = family::of(c.family).plan(&self.shape, &c.preset)?;
+        let mut plan = super::partition::plan(&self.shape, &c.preset)?;
         if let Some(n) = self.positions {
             let held = plan.contract.positions;
             if n > held {
@@ -483,7 +482,7 @@ impl Wafer {
     /// Whether `c`'s plan builds, or why not.
     pub fn fit(&self, c: &Candidate) -> R<()> {
         let plan = self.plan_of(c)?;
-        Program::build(family::of(c.family), plan)
+        Program::build(plan)
             .map(|_| ())
             .map_err(|e| format!("preset {}: {e}", c.preset.name))
     }
@@ -537,7 +536,7 @@ impl SpatialTarget for Wafer {
     type Partition = Candidate;
 
     /// Every node is the wafer's: the program lays out the whole model (its blocks are the
-    /// family's, chosen from the shape).
+    /// layout's, chosen from the shape).
     fn classify(&self, _trace: &Trace, _node: u32) -> Option<BlockKind> {
         Some(BlockKind("wafer"))
     }
@@ -555,9 +554,8 @@ impl SpatialTarget for Wafer {
     }
 }
 
-/// The plan of `trace` through poem's spatial pass: its shape, then the preset `ask` names (else
-/// the one made for its shape, else the first of the family's that builds, else the search's)
-/// with its overrides and positions.
+/// The plan of `trace` through poem's spatial pass: its shape, then the pinned plan `ask` names
+/// (else the one made for its shape, else the search's) with its overrides and positions.
 pub fn plan(trace: &Trace, ask: &Ask) -> R<Planned> {
     let wafer = ask.target(shape(trace)?)?;
     match poem_compiler::spatial::plan(trace, &wafer) {
@@ -591,8 +589,8 @@ pub fn plan_shape(shape: Shape, ask: &Ask) -> R<Planned> {
     ask.target(shape)?.choose()
 }
 
-/// What a plan is asked for beyond the model: a preset by name (else the first of the family's
-/// that builds), overrides of its keys (`K=V,...`), and the positions it must serve.
+/// What a plan is asked for beyond the model: a pinned plan by name (else the one made for the
+/// shape, else the search's), overrides of its keys (`K=V,...`), and the positions it must serve.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Ask {
     pub preset: Option<String>,
@@ -660,7 +658,7 @@ mod tests {
         );
     }
 
-    /// Every shipping model plans from its trace to the cut its staged prep holds: (family,
+    /// Every shipping model plans from its trace to the cut its staged prep holds: (layout,
     /// units, layers a unit, columns, rows, a row's dims, vocabulary rows a head PE).
     #[test]
     fn shipping_models_plan_from_their_traces() {
@@ -668,47 +666,47 @@ mod tests {
             (
                 "qwen35-d9b-bf16-kv-bf16",
                 "9b",
-                (FamilyId::Dense, 8, 4, 256, 256, 16, 216),
+                (Layout::Snake, 8, 4, 256, 256, 16, 216),
             ),
             (
                 "qwen35-d4b-bf16-kv-bf16",
                 "4b",
-                (FamilyId::Dense, 8, 4, 256, 256, 10, 216),
+                (Layout::Snake, 8, 4, 256, 256, 10, 216),
             ),
             (
                 "qwen35-d0.8b-bf16-kv-bf16",
                 "0.8b",
-                (FamilyId::Dense, 6, 4, 256, 128, 8, 216),
+                (Layout::Snake, 6, 4, 256, 128, 8, 216),
             ),
             (
                 "qwen3-8b-bf16-kv-bf16",
                 "q3-8b",
-                (FamilyId::Dense, 9, 4, 256, 228, 18, 132),
+                (Layout::Snake, 9, 4, 256, 228, 18, 132),
             ),
             (
                 "gemma4-e2b-bf16-kv-bf16",
                 "e2b",
-                (FamilyId::Gemma, 7, 5, 256, 128, 12, 232),
+                (Layout::Stacked, 7, 5, 256, 128, 12, 232),
             ),
             (
                 "gemma4-e4b-bf16-kv-bf16",
                 "e4b",
-                (FamilyId::Gemma, 7, 6, 256, 160, 16, 232),
+                (Layout::Stacked, 7, 6, 256, 160, 16, 232),
             ),
             (
                 "gemma4-12b-bf16-kv-bf16",
                 "g12",
-                (FamilyId::Gemma12, 8, 6, 344, 283, 12, 232),
+                (Layout::Runs, 8, 6, 344, 283, 12, 232),
             ),
             (
                 "gptoss-20b-bf16-mxfp4-kv-bf16",
                 "full",
-                (FamilyId::GptOss, 12, 2, 352, 160, 18, 272),
+                (Layout::Split, 12, 2, 352, 160, 18, 272),
             ),
             (
                 "llama31-8b-bf16-kv-bf16",
                 "l3-8b",
-                (FamilyId::Dense, 8, 4, 256, 256, 16, 216),
+                (Layout::Snake, 8, 4, 256, 256, 16, 216),
             ),
         ] {
             // with no preset named, each picks its shipping one
@@ -717,7 +715,7 @@ mod tests {
             let p = plan(&trace(name), &Ask::preset(preset)).unwrap().plan;
             let q = &p.partition;
             let got = (
-                p.family,
+                Layout::of_shape(&p.shape),
                 q.units,
                 q.layers_per_unit,
                 q.cols,
@@ -737,7 +735,7 @@ mod tests {
             .unwrap()
             .plan;
         let s = &p.shape;
-        assert_eq!(p.family, FamilyId::Dense);
+        assert_eq!(Layout::of_shape(&p.shape), Layout::Snake);
         assert!(!s.attn.qk_norm && !s.attn.output_gate && s.gdn.is_none());
         assert_eq!(
             (s.attn.q_heads, s.attn.kv_heads, s.attn.head_dim),
@@ -855,8 +853,7 @@ mod tests {
                 .find(|q| q.name == n)
                 .map(|q| q.shape.clone())
         };
-        family::of(p.plan.family)
-            .tiles(&p.plan, &shapes)
+        crate::tiles::spec_of(&p.plan, &shapes)
             .unwrap_or_else(|e| panic!("the search's plan cuts: {e}"));
         Program::of(p.plan).unwrap();
     }
@@ -874,8 +871,7 @@ mod tests {
                 .map(|q| q.shape.clone())
         };
         for found in crate::search::search(&s, &crate::search::Asked::default(), 3).unwrap() {
-            family::of(found.plan().family)
-                .tiles(found.plan(), &shapes)
+            crate::tiles::spec_of(found.plan(), &shapes)
                 .unwrap_or_else(|e| panic!("{}: {e}", found.planned.preset.name));
         }
     }

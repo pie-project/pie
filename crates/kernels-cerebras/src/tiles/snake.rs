@@ -56,7 +56,7 @@ pub fn tiles(plan: &Plan, shapes: &dyn Fn(&str) -> Option<Vec<u64>>) -> R<Spec> 
         .map(|l| matches!(l, LayerKind::Gdn))
         .collect();
     if nl != nu * k {
-        return Err(format!("dense: {nl} layers in {nu} units of {k}"));
+        return Err(format!("snake: {nl} layers in {nu} units of {k}"));
     }
     // a layer's param by its role: the first of the names the traces give it
     let name = |l: usize, names: &[&str]| -> Option<String> {
@@ -66,7 +66,7 @@ pub fn tiles(plan: &Plan, shapes: &dyn Fn(&str) -> Option<Vec<u64>>) -> R<Spec> 
             .find(|n| has(n))
     };
     let need = |l: usize, names: &[&str]| -> R<String> {
-        name(l, names).ok_or_else(|| format!("dense: no param layers.{l}.{}", names.join(" / ")))
+        name(l, names).ok_or_else(|| format!("snake: no param layers.{l}.{}", names.join(" / ")))
     };
     let pat = &kinds[..k];
     let nlg = pat.iter().filter(|g| **g).count();
@@ -77,7 +77,7 @@ pub fn tiles(plan: &Plan, shapes: &dyn Fn(&str) -> Option<Vec<u64>>) -> R<Spec> 
     };
     let inter = s.mlp.intermediate as usize;
     if !inter.is_multiple_of(px) {
-        return Err(format!("dense: the MLP's {inter} over {px} columns"));
+        return Err(format!("snake: the MLP's {inter} over {px} columns"));
     }
     let hc = h.div_ceil(py);
     let ic = inter / px;

@@ -4,10 +4,11 @@
 //! The images a partition moves are the weight PE's (its K layers' tiles and its KV cache) and the
 //! head PE's (its vocabulary rows' tiles and embeddings); code and the small buffers do not move
 //! with the partition. So an image's bytes are an anchor's, as the linker measured them for a
-//! program of the same family (`ANCHORS`), plus what the plan's tiles and caches add over the
+//! program of the same layout (`ANCHORS`), plus what the plan's tiles and caches add over the
 //! anchor plan's. The other images (the roots, the head control, the relays) are as the anchor's.
 
-use crate::plan::{FamilyId, LayerKind, Plan, Shape};
+use crate::compose::Layout;
+use crate::plan::{LayerKind, Plan, Shape};
 
 /// A PE's memory below the stack (`0xC000`).
 pub const PE_BYTES: f64 = 49152.0;
@@ -138,7 +139,7 @@ fn kv(plan: &Plan, kind: LayerKind) -> (u32, u32) {
 /// (`wafer-compile link`, `cs-readelf -m`: `scratch/genC/mem`); a kernel change that moves code
 /// or buffers re-measures them.
 pub struct Anchor {
-    pub family: FamilyId,
+    pub layout: Layout,
     /// The model's shape signature and the preset (with its levers) the program was built from.
     pub signature: [u32; 3],
     pub preset: &'static str,
@@ -152,16 +153,16 @@ pub struct Anchor {
 }
 
 /// The anchor a model's plans are measured off: the one linked from the model itself, else its
-/// family's widest (a model no program of was linked: its code and buffers as that one's).
+/// layout's widest (a model no program of was linked: its code and buffers as that one's).
 #[must_use]
 pub fn anchor(shape: &Shape) -> &'static Anchor {
-    let id = crate::family::serving(shape);
+    let id = Layout::of_shape(shape);
     let sig = shape.signature();
-    let of = ANCHORS.iter().filter(|a| a.family == id);
+    let of = ANCHORS.iter().filter(|a| a.layout == id);
     of.clone()
         .find(|a| a.signature == sig)
         .or_else(|| of.max_by(|a, b| a.weight_used.total_cmp(&b.weight_used)))
-        .expect("every family has an anchor")
+        .expect("every layout has an anchor")
 }
 
 /// The least stack room `plan`'s images leave, measured off `anchor`.

@@ -1,4 +1,4 @@
-//! Gemma 4 E2B / E4B: `weight.csl` (18 route slots), `cx.csl` (deferred norms, the PLE phase),
+//! The stacked columns' role kernels (Gemma 4 E2B / E4B): `weight.csl` (18 route slots), `cx.csl` (deferred norms, the PLE phase),
 //! `cy.csl`, `head_ctl.csl` with the token bus, `ple_gemma.csl` (the PLE store), with the shared
 //! head PE ([`super::head::HEAD_PE`]). Their params from the plan ([`kernels`]) and their rcfg
 //! writers.

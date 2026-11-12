@@ -16,10 +16,10 @@
 //! and head PEs; `search` ranks a deployment's partitions by their predicted step (`search`).
 //!
 //! `plan` writes `<dir>/plan.json` (the [`Plan`]) and names the preset it took.
-//! `--model` names a catalog deployment (`qwen35-d9b-bf16-kv-bf16`); `--preset` one of the
-//! serving family's presets (else the first that builds); `--set` overrides its keys;
-//! `--positions` the positions the program must serve (else as many as the preset holds). The
-//! preset carries the kernel levers its program ships with; `build --levers` sets more over them.
+//! `--model` names a catalog deployment (`qwen35-d9b-bf16-kv-bf16`); `--preset` a pinned plan
+//! (`plans/`; else the one made for the model's shape, else the search's); `--set` overrides its
+//! keys; `--positions` the positions the program must serve (else as many as the plan holds). The
+//! plan carries the kernel levers its program ships with; `build --levers` sets more over them.
 //!
 //! `build` writes everything the plan builds into `<dir>` (`build::emit`: the sources,
 //! the artifact), its kernels the embedded ones unless `--kernels`
@@ -120,8 +120,8 @@ fn plan(args: &[String]) -> Result<(), String> {
     let out = PathBuf::from(get(&f, "--out").ok_or(USAGE)?);
     mkdir(&out)?;
     eprintln!(
-        "wafer-compile plan: the {} family, preset {}",
-        planned.plan.family.name(),
+        "wafer-compile plan: the {} layout, preset {}",
+        kernels_cerebras::compose::Layout::of_shape(&planned.plan.shape).name(),
         planned.preset.name
     );
     json(&out, "plan.json", &planned.plan)

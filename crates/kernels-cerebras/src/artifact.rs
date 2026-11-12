@@ -1,6 +1,6 @@
 //! The built program as the engine runs it: what the host finds on the wafer
 //! ([`HostLayout`]), every copy onto it in placement order ([`Binding`]), every PE's rcfg words,
-//! and the model facts the host's math needs. Nothing here names a family: a program built from
+//! and the model facts the host's math needs. Nothing here names a layout: a program built from
 //! any plan is run the same way.
 //!
 //! On disk, a directory (what `wafer-compile` writes):

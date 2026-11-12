@@ -1,19 +1,24 @@
 //! The tiles a plan places: the model's params, as the trace names them, cut into the arrays the
-//! program's bindings copy onto the wafer (`<name>.npy`, what the engine's placer reads). A family
-//! states its layout as a [`spec::Spec`] ([`super::family::Family::tiles`]) and [`cut::cut`] makes
-//! it; the params come from the checkpoint through the engine's import contract, so no
+//! program's bindings copy onto the wafer (`<name>.npy`, what the engine's placer reads). Each
+//! layout states its cut as a [`spec::Spec`] ([`spec_of`]: [`snake`], [`stacked`], [`runs`],
+//! [`split`]) and [`cut::cut`] makes it; the params come from the checkpoint through the engine's import contract, so no
 //! checkpoint name appears here.
 //!
 //! Rounding is numpy's: f32 -> f16 to nearest even (`astype(float16)`), bf16 -> f32 a 16-bit
 //! shift, f32 -> bf16 a truncation.
 
 pub mod cut;
+pub mod runs;
+pub mod snake;
 pub mod spec;
+pub mod split;
+pub mod stacked;
 
 use std::path::{Path, PathBuf};
 
 use poem_ir::Dtype;
 
+use super::compose::Layout;
 use super::plan::Plan;
 
 type R<T> = Result<T, String>;
@@ -198,10 +203,20 @@ impl Out {
     }
 }
 
+/// The cut of the model's params into the tiles `plan`'s bindings place, as data ([`spec`]), by
+/// its layout; `shapes` gives a param's shape where the trace holds it.
+pub fn spec_of(plan: &Plan, shapes: &dyn Fn(&str) -> Option<Vec<u64>>) -> R<spec::Spec> {
+    match Layout::of_shape(&plan.shape) {
+        Layout::Snake => snake::tiles(plan, shapes),
+        Layout::Stacked => stacked::tiles(plan, shapes),
+        Layout::Runs => runs::tiles(plan, shapes),
+        Layout::Split => split::tiles(plan, shapes),
+    }
+}
+
 /// Cuts `params` for `plan` into `out`.
 pub fn stage(plan: &Plan, params: &dyn Params, out: &Path) -> R<()> {
-    let spec =
-        super::family::of(plan.family).tiles(plan, &|n| params.get(n).map(|p| p.shape.to_vec()))?;
+    let spec = spec_of(plan, &|n| params.get(n).map(|p| p.shape.to_vec()))?;
     cut::cut(&spec, params, &Out::new(out)?)
 }
 

@@ -8,7 +8,7 @@ use crate::block::head::{HeadCopies, Hemb};
 use crate::block::moe::MoeCopies;
 use crate::block::row_runs::RunCopies;
 use crate::block::units::UnitCopies;
-use crate::kernels::gptoss::Dims;
+use crate::kernels::split::Dims;
 use crate::plan::Plan;
 use crate::weights::{From, Slice, Transform, from};
 

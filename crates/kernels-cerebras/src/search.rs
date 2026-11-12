@@ -10,7 +10,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use crate::build::STACK_ROOM;
 use crate::cost::memory::{self, Anchor};
 use crate::cost::time;
-use crate::family::{self, Family};
+use crate::partition;
 use crate::plan::{Plan, Preset, Shape};
 use crate::program::Program;
 use crate::target::Planned;
@@ -50,7 +50,6 @@ pub struct Asked {
 /// The candidates `shape` searched to, fastest first (at most `keep`), each built.
 pub fn search(shape: &Shape, ask: &Asked, keep: usize) -> R<Vec<Scored>> {
     let layout = crate::compose::Layout::of_shape(shape);
-    let fam = family::of(family::of_layout(layout));
     crate::compose::refuse(shape)?;
     let sig = shape.signature();
     let mut seeds = crate::pins::of(layout);
@@ -63,7 +62,7 @@ pub fn search(shape: &Shape, ask: &Asked, keep: usize) -> R<Vec<Scored>> {
     let reference = seeds
         .first()
         .filter(|p| p.made_for == Some(sig))
-        .and_then(|p| fam.plan(shape, p).ok());
+        .and_then(|p| partition::plan(shape, p).ok());
     let positions = ask
         .positions
         .or(reference.as_ref().map(|p| p.contract.positions))
@@ -76,7 +75,6 @@ pub fn search(shape: &Shape, ask: &Asked, keep: usize) -> R<Vec<Scored>> {
         .collect();
     let s = Search {
         pinned,
-        fam: fam.as_ref(),
         shape,
         positions,
         layer,
@@ -106,7 +104,7 @@ pub fn search(shape: &Shape, ask: &Asked, keep: usize) -> R<Vec<Scored>> {
     let mut out = Vec::new();
     let mut why = Vec::new();
     for c in all {
-        match Program::build(family::of(c.planned.plan.family), c.planned.plan.clone()) {
+        match Program::build(c.planned.plan.clone()) {
             Ok(_) => out.push(c),
             Err(e) => why.push(format!("{}: {e}", c.planned.preset.name)),
         }
@@ -130,7 +128,6 @@ pub fn search(shape: &Shape, ask: &Asked, keep: usize) -> R<Vec<Scored>> {
 struct Search<'a> {
     /// The keys the ask set: not moved.
     pinned: Vec<String>,
-    fam: &'a dyn Family,
     shape: &'a Shape,
     positions: u32,
     layer: f64,
@@ -140,7 +137,7 @@ struct Search<'a> {
 impl Search<'_> {
     /// `p`'s plan, step and room, if it plans, serves the positions and fits.
     fn score(&self, p: &Preset) -> Option<Scored> {
-        let mut plan = self.fam.plan(self.shape, p).ok()?;
+        let mut plan = partition::plan(self.shape, p).ok()?;
         if plan.contract.positions < self.positions {
             return None;
         }
@@ -201,7 +198,7 @@ impl Search<'_> {
                     let pa = with(&at, a, va);
                     consider(pa.clone(), &mut next);
                     // a move another key must follow (the positions, the units' grid)
-                    if self.fam.plan(self.shape, &pa).is_err() || self.score(&pa).is_none() {
+                    if partition::plan(self.shape, &pa).is_err() || self.score(&pa).is_none() {
                         for b in keys.iter().filter(|b| *b > a) {
                             for vb in ladder(at.keys[b]) {
                                 consider(with(&pa, b, vb), &mut next);
@@ -246,7 +243,7 @@ impl Search<'_> {
     /// from the partitions that plan but do not fit, the moves that bring them nearest a fit
     /// ([`Search::short`]) are followed.
     fn repair(&self, seed: &Preset, keys: &[String]) -> Option<(Preset, Scored)> {
-        let why = |p: &Preset| match self.fam.plan(self.shape, p) {
+        let why = |p: &Preset| match partition::plan(self.shape, p) {
             Ok(_) => "fit".to_string(),
             Err(e) => e,
         };
@@ -295,7 +292,11 @@ impl Search<'_> {
     /// From partitions that plan but do not fit, the single key moves that keep them planning
     /// and bring them nearest a fit, a step at a time, until one fits and builds.
     fn climb(&self, mut from: Vec<Preset>, keys: &[String]) -> Option<(Preset, Scored)> {
-        let near = |p: &Preset| self.fam.plan(self.shape, p).ok().map(|pl| self.short(&pl));
+        let near = |p: &Preset| {
+            partition::plan(self.shape, p)
+                .ok()
+                .map(|pl| self.short(&pl))
+        };
         from.sort_by_key(|p| near(p));
         from.dedup_by_key(|p| key(p));
         let mut seen: BTreeSet<String> = BTreeSet::new();
@@ -330,7 +331,7 @@ impl Search<'_> {
 /// Whether `plan` builds (its blocks compose, its fabric fits the wafer, its routes and colours
 /// hold).
 fn builds(plan: &Plan) -> bool {
-    Program::build(family::of(plan.family), plan.clone()).is_ok()
+    Program::build(plan.clone()).is_ok()
 }
 
 /// `p` with `k` set to `v`.

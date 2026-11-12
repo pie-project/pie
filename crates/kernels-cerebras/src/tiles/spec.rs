@@ -1,7 +1,7 @@
 //! What a cut is, as data: every staged array (`<name>.npy`) the plan's bindings place, and how
-//! each element of it follows from the model's params (named as the trace names them). A family
-//! states its layout here ([`super::super::family::Family::tiles`]); [`super::cut`] alone turns
-//! the statement into arrays, so no family cuts anything itself.
+//! each element of it follows from the model's params (named as the trace names them). A layout
+//! states its cut here ([`super::spec_of`]); [`super::cut`] alone turns the statement into
+//! arrays, so no layout cuts anything itself.
 //!
 //! The forms are few: a weight PE grid's tiles (a matrix's rows or columns gathered a column, its
 //! hidden dims split a row), gathered vectors, constants, and the tables a block computes from
