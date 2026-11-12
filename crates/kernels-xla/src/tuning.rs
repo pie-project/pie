@@ -168,6 +168,15 @@ pub enum QuantDecode {
 #[decision(id = "kernel.rope.flat_rows", constant(set(0, 1024, 2048, 4096)), default = 0, tune = search)]
 pub struct RopeFlatRows(pub u32);
 
+/// From this many rows a dense GeGLU lands its rows (in bf16) before the
+/// down dot that reads them, not left to XLA to fuse into that dot's
+/// operand: on a v6e the fused GLU slows the MXU by more than the GLU's own
+/// pass costs (Gemma-4-31B's 2304-row `[21504, 5376]` down dot: 0.96 ms
+/// with the GLU fused, 0.66 ms plain). 0 never does.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Decision)]
+#[decision(id = "kernel.glu.land_from", constant(set(0, 512, 1024, 2048)), default = 0, tune = search)]
+pub struct GluLandFrom(pub u32);
+
 /// Up to this many rows per lane, an `auto` attention walk gathers each
 /// row's keys; past it, row blocks walk the key axis. 0 always blocks.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Decision)]
@@ -262,6 +271,7 @@ pub fn register(registry: &mut Registry) {
         .add::<AttnDecodePages>()
         .add::<AttnBlockRows>()
         .add::<RopeFlatRows>()
+        .add::<GluLandFrom>()
         .add::<AttnBlockKeys>()
         .add::<AttnUnrolledBlocks>()
         .add::<AttnFlashNarrowRows>()
@@ -341,6 +351,9 @@ pub struct Tuning {
     pub grouped: Grouped,
     pub attn_per_row_max: i64,
     pub rope_flat_rows: i64,
+    /// Rows from which a dense GeGLU lands before its down dot (see
+    /// [`GluLandFrom`]); 0 never.
+    pub glu_land_from: i64,
     pub chunks: Chunks,
     pub ssm: SsmChunks,
     pub vmem_bytes: i64,
@@ -379,6 +392,7 @@ impl Tuning {
         },
         attn_per_row_max: 2,
         rope_flat_rows: 0,
+        glu_land_from: 0,
         chunks: Chunks {
             budget: 1 << 24,
             block_rows: 512,
@@ -438,6 +452,7 @@ impl Tuning {
             },
             attn_per_row_max: n(profile.get::<AttnPerRowMax>().0),
             rope_flat_rows: n(profile.get::<RopeFlatRows>().0),
+            glu_land_from: n(profile.get::<GluLandFrom>().0),
             chunks: Chunks {
                 budget: n(profile.get::<AttnBudgetMi>().0) << 20,
                 block_rows: n(profile.get::<AttnBlockRows>().0),
