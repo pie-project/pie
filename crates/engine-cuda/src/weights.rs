@@ -676,6 +676,7 @@ impl Weights {
         stream: *mut core::ffi::c_void,
         target: StorageTarget,
         decode_dense: bool,
+        held: bool,
     ) -> Result<Weights> {
         let (metadata, snapshot) = if path.is_dir() {
             (parse_metadata(path)?, path)
@@ -713,7 +714,12 @@ impl Weights {
                     true => crate::experts::Fill::Restored,
                     false => crate::experts::Fill::Cold,
                 };
-                Some(crate::experts::Tier::open(plan.clone(), source, fill)?)
+                Some(crate::experts::Tier::open(
+                    plan.clone(),
+                    source,
+                    fill,
+                    held,
+                )?)
             }
             false => None,
         };

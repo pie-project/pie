@@ -480,7 +480,9 @@ enum HostCopy {
     Filed,
     /// In the serving file's mapping, a miss read where it lies.
     Mapped,
-    /// Pinned on the host tier, a miss read where it lies.
+    /// On the host tier: pinned, a miss read where it lies; or, for a load
+    /// told its weights are held, pageable, seated in the pool before any
+    /// fire and read by none (`Tier::open`).
     Pinned,
 }
 
@@ -514,9 +516,10 @@ fn host_copy(boot: &Boot<'_>, params: &[usize]) -> Result<HostCopy> {
             return Ok(HostCopy::Filed);
         }
         eprintln!(
-            "engine-cuda: {} MiB of weights the pool will hold are pinned on the host at \
-             load: {} does not hold their planes as this plan reads them (a plane decoded \
-             at load), so their slots cannot be filled from the file",
+            "engine-cuda: {} MiB of weights the pool will hold are copied to the host at \
+             load (pageable, freed once seated): {} does not hold their planes as this plan \
+             reads them (a plane decoded at load), so their slots cannot be filled from the \
+             file",
             pinned >> 20,
             boot.checkpoint.display()
         );
@@ -526,7 +529,7 @@ fn host_copy(boot: &Boot<'_>, params: &[usize]) -> Result<HostCopy> {
     let have = crate::weights::available_memory();
     if pinned > have {
         return Err(Fault::Residency(format!(
-            "this load keeps a pinned host copy of the weights its cache streams, {:.1} GiB, \
+            "this load keeps a host copy of the weights its cache takes, {:.1} GiB, \
              and this machine has {:.1} GiB of memory left for it. {}",
             pinned as f64 / f64::from(1u32 << 30),
             have as f64 / f64::from(1u32 << 30),
@@ -827,6 +830,9 @@ impl Shell {
                 )
             },
             decode_dense,
+            // A load told its weights are held seats every bank before a
+            // fire: its banks' host copy is pageable (`Tier::open`).
+            boot.knobs.weights_held,
         )?;
         // `kernel.gemm.fp8_o_down`: grouped projections on fp8b128, as vLLM
         // reads DeepSeek-V4's `wo_a` (the wide fires on tcgen05).
@@ -1479,19 +1485,19 @@ impl Staged {
         }
         // Weights left in the serving file are on no tier a fire can read:
         // they are seated in the pool before the lattice is armed over them.
-        // So are those a load told they are held keeps a pinned copy of
+        // So are those a load told they are held keeps a host copy of
         // (planes laid at load, which the file does not hold as served).
         let filed = shell
             .weights
             .experts()
             .is_some_and(|tier| tier.plan().files());
-        let held_pinned = weights_held
+        let held_copied = weights_held
             && shell
                 .weights
                 .experts()
                 .is_some_and(|tier| !tier.plan().cached_experts().is_empty());
-        if filed || held_pinned {
-            shell.preseat_weights(filed)?;
+        if filed || held_copied {
+            shell.preseat_weights(filed, held_copied)?;
         }
         // A load whose weights the pool does not hold whole streams them:
         // armed now, its bodies would read every expert from the host copy,

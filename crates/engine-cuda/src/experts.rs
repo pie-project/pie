@@ -670,10 +670,16 @@ pub struct Tier {
 }
 
 impl Tier {
-    pub fn open(plan: Plan, source: Option<Spill>, fill: Fill) -> Result<Tier> {
+    /// `held`: the load is told its weights are held, so every bank lands
+    /// in pool slots before any fire and no fire reads this copy in place;
+    /// it is pageable, the device copying out of it alone (page-locking a
+    /// copy of tens of gigabytes took longer than reading it: 14.7 s of a
+    /// held Qwen3-30B-A3B-FP8's boot on an L40S).
+    pub fn open(plan: Plan, source: Option<Spill>, fill: Fill, held: bool) -> Result<Tier> {
         let layout = plan.host_layout();
         let want = usize::try_from(plan.host_image()).unwrap_or(usize::MAX);
         let host = match fill {
+            _ if held => Pinned::pageable(want)?,
             Fill::Cold => Pinned::mapped(want)?,
             Fill::Restored => Pinned::mapped_uninit(want)?,
         };

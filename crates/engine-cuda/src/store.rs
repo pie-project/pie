@@ -2795,7 +2795,8 @@ impl Pools {
     }
 
     /// Gives the caches a copy a fire can read a miss from, out of the
-    /// serving file's mapping they were left in: the mapping itself where
+    /// serving file's mapping they were left in (or the pageable copy a load
+    /// told its weights are held made): the mapping itself where
     /// the device faults mapped pages in, else a pinned copy of every
     /// streamed table and bank, refused where the machine has not the
     /// memory for it.
