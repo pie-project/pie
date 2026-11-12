@@ -44,8 +44,9 @@ impl Run<'_> {
                 axis: NormAxis::Row,
             } => crate::lower::lower(self.ctx(), |l| {
                 let x_v = l.read(self.tensor(*x))?;
-                let from = l.tuning().norm_land_from;
-                let x_v = norm_landed(l.f(), x_v, from);
+                let t = l.tuning();
+                let dot = self.dot_out.get(x.0 as usize).copied().unwrap_or(false);
+                let x_v = norm_landed(l.f(), x_v, dot, t.norm_land_from, t.norm_land_below);
                 let weight_v = l.read(self.tensor(*weight))?;
                 let o_y = self.tensor(*y);
                 let v = elemwise::norm::rmsnorm(l.f(), x_v, weight_v, *eps)?;
@@ -72,8 +73,9 @@ impl Run<'_> {
                 axis: NormAxis::Row,
             } => crate::lower::lower(self.ctx(), |l| {
                 let x_v = l.read(self.tensor(*x))?;
-                let from = l.tuning().norm_land_from;
-                let x_v = norm_landed(l.f(), x_v, from);
+                let t = l.tuning();
+                let dot = self.dot_out.get(x.0 as usize).copied().unwrap_or(false);
+                let x_v = norm_landed(l.f(), x_v, dot, t.norm_land_from, t.norm_land_below);
                 let weight_v = l.read(self.tensor(*weight))?;
                 let o_y = self.tensor(*y);
                 let v = elemwise::norm::rmsnorm_plus_one(l.f(), x_v, weight_v, *eps)?;
@@ -1202,15 +1204,18 @@ impl Run<'_> {
     }
 }
 
-/// A row norm's input of `from` rows and more behind a barrier
-/// (`kernel.norm.land_from`): XLA fuses its sum of squares into no dot that
-/// produced it.
+/// A dense gemm's rows a row norm reads, `from` rows and more (below
+/// `below`, 0 none), behind a barrier (`kernel.norm.land_from`): XLA fuses the
+/// norm's sum of squares into no dot that produced them.
 fn norm_landed(
     f: &mut kernels_xla::hlo::Func,
     x: kernels_xla::Operand,
+    dot: bool,
     from: i64,
+    below: i64,
 ) -> kernels_xla::Operand {
-    if from == 0 || i64::from(x.rows) < from {
+    let rows = i64::from(x.rows);
+    if !dot || from == 0 || rows < from || (below > 0 && rows >= below) {
         return x;
     }
     kernels_xla::Operand {
