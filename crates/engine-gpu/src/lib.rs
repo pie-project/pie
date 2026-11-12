@@ -3,6 +3,7 @@
 //! in each backend crate, which instantiates these types with its own.
 
 pub mod adapter;
+pub mod api;
 pub mod arena;
 pub mod backend;
 pub mod blob;
@@ -16,6 +17,7 @@ pub mod handles;
 pub mod inputs;
 pub mod mask;
 pub mod probe;
+pub mod program;
 pub mod rs;
 pub mod run;
 pub mod scratch;

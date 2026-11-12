@@ -9,18 +9,7 @@ use eta_exec::StepOutcome;
 use eta_exec::{ChannelState, ExecPlan, HostOp, InterpInstance, PassInputs, Value};
 use eta_ir::registry::{GeometryClass, Port, Stage};
 
-#[derive(Debug)]
-pub enum Refusal {
-    Closed { what: &'static str, id: u64 },
-
-    Program(String),
-}
-
-impl From<String> for Refusal {
-    fn from(why: String) -> Refusal {
-        Refusal::Program(why)
-    }
-}
+pub use engine_gpu::program::Refusal;
 
 struct Instance {
     #[cfg_attr(not(feature = "vulkan"), allow(dead_code))]
@@ -791,4 +780,69 @@ fn decode(bytes: &[u8], dtype: eta_ir::container::ChanDType, shape: &[u32]) -> O
         Dtype::F32 => Value::F32(words().map(f32::from_le_bytes).collect()),
         _ => return None,
     })
+}
+
+impl engine_gpu::program::Programs<crate::device::Api> for Plane {
+    fn register(&mut self, registration: &ProgramRegistration) -> Result<ProgramId, Refusal> {
+        Plane::register(self, registration)
+    }
+
+    fn package(&self, program: ProgramId) -> Option<&eta_compiler::codegen::launch::LaunchPackage> {
+        Plane::package(self, program)
+    }
+
+    fn register_channel(
+        &mut self,
+        registration: &ChannelRegistration,
+    ) -> Result<RegisteredChannel, Refusal> {
+        Plane::register_channel(self, registration)
+    }
+
+    fn close_channel(&mut self, id: ChannelId) -> Result<(), Refusal> {
+        Plane::close_channel(self, id)
+    }
+
+    fn bind(
+        &mut self,
+        binding: &InstanceBinding,
+        device: Option<&crate::device::Context>,
+    ) -> Result<BoundInstance, Refusal> {
+        #[cfg(not(feature = "vulkan"))]
+        let _ = device;
+        Plane::bind(
+            self,
+            binding,
+            #[cfg(feature = "vulkan")]
+            device,
+        )
+    }
+
+    fn close_instance(&mut self, id: InstanceId) -> Result<(), Refusal> {
+        Plane::close_instance(self, id)
+    }
+
+    fn input_cell(&self, instance: InstanceId, id: ChannelId) -> Result<InputCell, Refusal> {
+        Plane::input_cell(self, instance, id)
+    }
+
+    fn envelope_fold(&self, instance: InstanceId) -> Result<Option<u32>, Refusal> {
+        Plane::envelope_fold(self, instance)
+    }
+
+    fn publish(
+        &mut self,
+        instance: InstanceId,
+        channel: u32,
+        cell: &[u8],
+    ) -> Result<bool, Refusal> {
+        Plane::publish(self, instance, channel, cell)
+    }
+
+    fn take(&mut self, instance: InstanceId, channel: u32) -> Result<Option<Vec<u8>>, Refusal> {
+        Plane::take(self, instance, channel)
+    }
+
+    fn reads(&self, instance: InstanceId) -> Vec<(String, u32)> {
+        Plane::reads(self, instance)
+    }
 }
