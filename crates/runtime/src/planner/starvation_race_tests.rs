@@ -569,6 +569,45 @@ fn a_departure_never_waits_on_its_pages_nor_outlives_its_holds() {
 }
 
 #[test]
+fn a_state_set_a_handle_takes_gives_its_owner_s_hold_back() {
+    let _schedule = crate::policy::schedule::TEST_LOCK.blocking_read();
+    // A process's sets go to a handle (`Held::park`): its kv set gives the
+    // departed owner's hold back, and so must its state set. Kept, the
+    // owner's pages and slot stood "on their way back" for as long as the
+    // handle lived, and a head short of a slot planned no eviction again
+    // (t_evict hung on Qwen3.5 at 176 MiB).
+    let model = crate::store::registry::register_model(16, &[64], &[2]);
+    let planner = Arc::new(ResidencyPlanner::new(departure_pool(model)));
+    let gone = leaving(&planner, model, true);
+    let geom = crate::store::rs::RsGeometry {
+        state_size: 64,
+        buffer_page_tokens: 4,
+    };
+    let id = crate::store::registry::get(model, 0)
+        .rs
+        .lock()
+        .unwrap()
+        .create_working_set(geom);
+    let rs = crate::store::rs::working_set::RsWorkingSet::new(model, 0, id, geom);
+    rs.hold_departure(gone.departure.clone());
+    let (pid, ws) = terminate(&planner, gone);
+    assert_eq!(on_its_way_back(&planner, pid), Some(2));
+    ws.leave_owner();
+    assert_eq!(
+        on_its_way_back(&planner, pid),
+        Some(2),
+        "the state set still holds the owner"
+    );
+    rs.leave_owner();
+    assert_eq!(
+        on_its_way_back(&planner, pid),
+        None,
+        "both sets gave it back"
+    );
+    drop((ws, rs));
+}
+
+#[test]
 fn pages_no_hold_watches_are_not_waited_for() {
     // A set its context never saw holds no departure: no release would
     // clear a mark for it, so none is made, and the stall is a wedge.
