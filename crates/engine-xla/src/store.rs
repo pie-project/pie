@@ -354,6 +354,31 @@ fn layout_rows<'a>(
     ))
 }
 
+/// The row order a kv plane's pages lie in (`kernels_xla::hlo::PoolOrder`):
+/// a page's kv heads each one run of whole tiles, with `PIE_XLA_KV_ORDER=1`;
+/// the packed rows order otherwise.
+fn kv_order(plane: &layout::Plane, pool_rows: u64) -> Option<kernels_xla::hlo::PoolOrder> {
+    if !std::env::var("PIE_XLA_KV_ORDER").is_ok_and(|v| v == "1") {
+        return None;
+    }
+    if !matches!(plane.what, What::Keys { .. } | What::Values { .. }) || plane.dtype != Dtype::Bf16
+    {
+        return None;
+    }
+    let row_bytes = u64::from(plane.width) * 2;
+    if !row_bytes.is_multiple_of(ROW_BYTES) || row_bytes / ROW_BYTES < 2 {
+        return None;
+    }
+    let rpt = row_bytes / ROW_BYTES;
+    let tokens = u64::from(plane.per);
+    (pool_rows.is_multiple_of(tokens * rpt) && plane.run == tokens * row_bytes).then_some(
+        kernels_xla::hlo::PoolOrder {
+            tokens: tokens as i64,
+            rpt: rpt as i64,
+        },
+    )
+}
+
 /// Bytes the pool lays past the pages and state slots `pool_demand` counts:
 /// its null and sink chunks.
 pub fn reserved_bytes(
@@ -418,12 +443,12 @@ impl Pools {
         let mut views: Vec<(What, Tensor, Map)> = Vec::new();
         for shape in &layout.shapes {
             for plane in &shape.planes {
-                let t =
-                    handles
-                        .view(root, plane.dtype, plane.width)
-                        .map_err(|e| Fault::Unbound {
-                            what: format!("a view of pool plane {:?}: {e}", plane.what),
-                        })?;
+                let order = kv_order(plane, u64::from(pool_rows));
+                let t = handles
+                    .view_ordered(root, plane.dtype, plane.width, order)
+                    .map_err(|e| Fault::Unbound {
+                        what: format!("a view of pool plane {:?}: {e}", plane.what),
+                    })?;
                 views.push((plane.what, t, map_of(&layout, shape, plane)));
             }
         }

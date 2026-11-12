@@ -7,9 +7,40 @@
 use std::sync::Arc;
 
 use engine_xla::pjrt::{Api, Arg, Client, ElementType};
-use kernels_xla::hlo::{Built, Elem, Func, GatherDims, Ty, Val};
+use kernels_xla::hlo::{Built, Elem, Func, GatherDims, PoolOrder, Ty, Val};
 
 const ROWS: i64 = 64;
+
+thread_local! {
+    /// Whether [`check`] lays its views in the kv row-pair order where their
+    /// shape allows one ([`order_for`]).
+    static ORDERED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// The row-pair order of 16-token blocks a view of `dims` takes under
+/// [`ORDERED`]: bf16 rows at least two pool rows wide.
+fn order_for(elem: Elem, dims: &[i64]) -> Option<PoolOrder> {
+    if !ORDERED.with(std::cell::Cell::get) || elem != Elem::Bf16 {
+        return None;
+    }
+    let w = *dims.last()?;
+    let rpt = w * 2 / 512;
+    (w * 2 % 512 == 0 && rpt >= 2 && ROWS % (16 * rpt) == 0)
+        .then_some(PoolOrder { tokens: 16, rpt })
+}
+
+/// Pool rows `[ROWS, 128]` of whole blocks in view order (`to_view`) or
+/// back, as plain ops.
+fn reorder(f: &mut Func, rows: Val, o: PoolOrder, to_view: bool) -> Built<Val> {
+    let (a, b) = if to_view {
+        (o.rpt, o.tokens)
+    } else {
+        (o.tokens, o.rpt)
+    };
+    let x = f.reshape(rows, &[ROWS / (o.tokens * o.rpt), a, b, 128])?;
+    let x = f.transpose(x, &[0, 2, 1, 3])?;
+    f.reshape(x, &[ROWS, 128])
+}
 
 /// A case: builds outputs from the view and the i32 inputs.
 type Case<'a> = &'a dyn Fn(&mut Func, Val, &[Val]) -> Built<Vec<Val>>;
@@ -32,6 +63,10 @@ fn per_word(elem: Elem) -> i64 {
 /// The whole view, as plain ops.
 fn whole(f: &mut Func, pool: Val, elem: Elem, dims: &[i64]) -> Built<Val> {
     let k = per_word(elem);
+    let pool = match order_for(elem, dims) {
+        Some(o) => reorder(f, pool, o, true)?,
+        None => pool,
+    };
     let x = f.bitcast(pool, elem)?;
     let x = if k == 1 {
         x
@@ -44,13 +79,18 @@ fn whole(f: &mut Func, pool: Val, elem: Elem, dims: &[i64]) -> Built<Val> {
 /// A whole view back as the pool, as plain ops.
 fn pack(f: &mut Func, x: Val, elem: Elem) -> Built<Val> {
     let k = per_word(elem);
+    let order = order_for(elem, f.dims(x));
     let x = if k == 1 {
         f.reshape(x, &[ROWS, 128])?
     } else {
         let x = f.reshape(x, &[ROWS, k, 128])?;
         f.transpose(x, &[0, 2, 1])?
     };
-    f.bitcast(x, Elem::U32)
+    let x = f.bitcast(x, Elem::U32)?;
+    match order {
+        Some(o) => reorder(f, x, o, false),
+        None => Ok(x),
+    }
 }
 
 /// Bits of a value as u32 words, so results compare exactly.
@@ -104,7 +144,8 @@ fn check(name: &str, elem: Elem, dims: &[i64], ints: &[Vec<i32>], case: Case<'_>
             .map(|v| f.param(Ty::new(Elem::I32, &[v.len() as i64]), None))
             .collect();
         let v = if lazy {
-            f.pool_view(p, elem, dims).unwrap()
+            f.pool_view_ordered(p, elem, dims, order_for(elem, dims))
+                .unwrap()
         } else {
             whole(&mut f, p, elem, dims).unwrap()
         };
@@ -114,7 +155,7 @@ fn check(name: &str, elem: Elem, dims: &[i64], ints: &[Vec<i32>], case: Case<'_>
             .map(|o| {
                 if f.ty(o).dims == dims && f.elem(o) == elem && (lazy || !f.is_view(o)) {
                     let pool = if lazy {
-                        f.pool_of(o, elem).unwrap()
+                        f.pool_of_ordered(o, elem, order_for(elem, dims)).unwrap()
                     } else {
                         pack(&mut f, o, elem).unwrap()
                     };
@@ -211,6 +252,8 @@ fn pages_read_by_ids() {
         (Elem::Bf16, 16, 128),
         (Elem::Bf16, 4, 64),
         (Elem::F32, 2, 64),
+        (Elem::Bf16, 16, 512),
+        (Elem::Bf16, 16, 1024),
     ] {
         let pages = ROWS * 128 * per_word(elem) / (t * w);
         let ids = vec![vec![0, 3, 1, (pages - 1) as i32, 99_999, -1]];
@@ -901,4 +944,93 @@ fn a_decode_conv_rolls_its_windows_in_the_pool() {
         "the conv touched the pool outside its lanes' windows"
     );
     assert!(worst < 1e-3, "output off by {worst}");
+}
+
+/// The view tests again with every view that can take it in the kv
+/// row-pair order (`kernels_xla::hlo::PoolOrder`): each op answers what it
+/// answers on the view materialized in that order.
+#[test]
+fn views_in_the_row_pair_order_answer_alike() {
+    ORDERED.with(|o| o.set(true));
+    rows_read_by_ids();
+    pages_read_by_ids();
+    row_ranges_at_any_start();
+    rows_written_by_ids();
+    row_ranges_written_at_any_start();
+    a_loop_and_a_case_carry_a_view();
+    rows_landed_as_the_lanes_land_them();
+    rows_landed_twice_keep_the_last();
+    pages_and_tokens_written();
+    ORDERED.with(|o| o.set(false));
+}
+
+/// Whole pages and single tokens of `[pages, 16, w]` landed by scatter, then
+/// read back by gather: a kv plane's writes and reads.
+#[test]
+fn pages_and_tokens_written() {
+    for w in [128, 512, 1024] {
+        let pages = ROWS * 256 / (16 * w);
+        let at = vec![
+            vec![(pages - 1) as i32, 0],
+            vec![0, 5, 15, 9],
+            vec![(pages - 1) as i32, 0, 0, (pages - 1) as i32],
+        ];
+        check(
+            &format!("pages and tokens written w{w}"),
+            Elem::Bf16,
+            &[pages, 16, w],
+            &at,
+            &|f, v, a| {
+                let page_dims = GatherDims {
+                    offset_dims: vec![1, 2],
+                    collapsed_slice_dims: vec![0],
+                    start_index_map: vec![0],
+                    index_vector_dim: 1,
+                    ..GatherDims::default()
+                };
+                // read page 0 and the last page whole, write them swapped
+                let idx = f.reshape(a[0], &[2, 1])?;
+                let got = f.gather(v, idx, &page_dims, &[1, 16, w])?;
+                let rev = f.reverse(a[0], &[0]);
+                let ridx = f.reshape(rev, &[2, 1])?;
+                let v2 = f.scatter(
+                    v,
+                    ridx,
+                    got,
+                    &kernels_xla::hlo::ScatterDims {
+                        update_window_dims: vec![1, 2],
+                        inserted_window_dims: vec![0],
+                        scatter_dims_to_operand_dims: vec![0],
+                        index_vector_dim: 1,
+                        ..Default::default()
+                    },
+                    kernels_xla::hlo::Combine::Set,
+                )?;
+                // tokens (page, slot): rows of the first page written over
+                let tok = f.gather(v2, idx, &page_dims, &[1, 16, w])?;
+                let rows = f.slice(tok, &[0, 0, 0], &[1, 4, w], &[1, 1, 1])?;
+                let rows = f.reshape(rows, &[4, w])?;
+                let pt = f.reshape(a[2], &[4, 1])?;
+                let st = f.reshape(a[1], &[4, 1])?;
+                let ix = f.concat(&[pt, st], 1)?;
+                let v3 = f.scatter(
+                    v2,
+                    ix,
+                    rows,
+                    &kernels_xla::hlo::ScatterDims {
+                        update_window_dims: vec![1],
+                        inserted_window_dims: vec![0, 1],
+                        scatter_dims_to_operand_dims: vec![0, 1],
+                        index_vector_dim: 1,
+                        ..Default::default()
+                    },
+                    kernels_xla::hlo::Combine::Set,
+                )?;
+                let back = f.gather(v3, idx, &page_dims, &[1, 16, w])?;
+                let got = f.reshape(got, &[32, w])?;
+                let back = f.reshape(back, &[32, w])?;
+                Ok(vec![got, back, v3])
+            },
+        );
+    }
 }

@@ -2086,6 +2086,8 @@ pub fn attend_fresh(
                 // the kernel straight out of it)
                 && (!f.is_view(keys) && !f.is_view(values)
                     || f.view_parts(keys).map(|v| v.0) == f.view_parts(values).map(|v| v.0)
+                        && f.view_order(keys).is_none()
+                        && f.view_order(values).is_none()
                         && (heads.kvh * heads.d) % 128 == 0
                         && (heads.kvh * heads.dv) % 128 == 0
                         && crate::blocks::on())
@@ -2592,6 +2594,10 @@ fn append_pool_planes(
     let slots = i64::from(keys.rows);
     if pool != pool_v
         || !crate::blocks::on()
+        // a reordered pool's rows land through the views (step one of the
+        // row-pair order: the kernels below lay the packed rows order)
+        || f.view_order(keys.val).is_some()
+        || f.view_order(values.val).is_some()
         || values.width != keys.width
         || k.width != keys.width
         || v.width != values.width
@@ -2796,7 +2802,8 @@ fn rebase(f: &mut Func, plane: Val, onto: Val) -> Built<Val> {
     match (f.view_parts(plane), f.view_parts(onto)) {
         (Some((_, elem)), Some((pool, _))) => {
             let dims = f.dims(plane).to_vec();
-            f.pool_view(pool, elem, &dims)
+            let order = f.view_order(plane);
+            f.pool_view_ordered(pool, elem, &dims, order)
         }
         _ => Ok(plane),
     }
@@ -2851,6 +2858,8 @@ fn scatter_slots_one_map(
     if let [(k, keys), (v, values)] = pairs
         && map.is_identity()
         && keys.val != values.val
+        && f.view_order(keys.val).is_none()
+        && f.view_order(values.val).is_none()
         && keys.width == values.width
         && k.width == keys.width
         && v.width == values.width
@@ -2928,6 +2937,7 @@ fn scatter_slots_one_map(
     // mapped), a page `[16, w]` as the pool lays it.
     if let [(src, plane)] = pairs
         && let Some((pool, Elem::Bf16)) = f.view_parts(plane.val)
+        && f.view_order(plane.val).is_none()
         && src.width == plane.width
         && f.elem(src.val) == Elem::Bf16
         && let Some(vmem_cap) = vmem_cap

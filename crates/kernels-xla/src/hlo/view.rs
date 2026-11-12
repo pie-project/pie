@@ -41,10 +41,36 @@ const SMALL_BY_XLA: i64 = 512 << 10;
 pub(super) struct View {
     pub pool: Val,
     pub elem: Elem,
+    pub order: Option<Order>,
 }
 
-/// What each carried value is: a view's element and shape, or not a view.
-pub(super) type Kinds = Vec<Option<(Elem, Vec<i64>)>>;
+/// A permuted row order of a view's pool rows: in each block of `tokens ·
+/// rpt` pool rows (`tokens` view rows of `rpt` pool rows each, a kv page),
+/// the pool row `j · tokens + t` holds part `j` of view row `t` (row-pair
+/// major), where the packed rows order lays it at `t · rpt + j`. A kv
+/// head's rows of a page are then one run of whole (8, 128) tiles, read
+/// without a relayout of the page.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct Order {
+    /// View rows (tokens) a block.
+    pub tokens: i64,
+    /// Pool rows a view row.
+    pub rpt: i64,
+}
+
+impl Order {
+    /// Pool rows a block.
+    #[must_use]
+    pub const fn block(&self) -> i64 {
+        self.tokens * self.rpt
+    }
+}
+
+/// A carried view's element, shape and row order.
+pub(super) type Kind = (Elem, Vec<i64>, Option<Order>);
+
+/// What each carried value is: a view ([`Kind`]), or not a view.
+pub(super) type Kinds = Vec<Option<Kind>>;
 
 /// Elements one u32 word holds.
 fn per_word(elem: Elem) -> Option<i64> {
@@ -93,6 +119,19 @@ impl Func {
     /// A view of the pool `u32 [R, 128]` as `elem` of `dims` (every element
     /// of the pool, in the packed rows order).
     pub fn pool_view(&mut self, pool: Val, elem: Elem, dims: &[i64]) -> Built<Val> {
+        let order = self.views.get(&pool.0).and_then(|v| v.order);
+        self.pool_view_ordered(pool, elem, dims, order)
+    }
+
+    /// [`Func::pool_view`] in row order `order` (`None`: the packed rows
+    /// order).
+    pub fn pool_view_ordered(
+        &mut self,
+        pool: Val,
+        elem: Elem,
+        dims: &[i64],
+        order: Option<Order>,
+    ) -> Built<Val> {
         let pool = match self.views.get(&pool.0) {
             Some(v) => v.pool,
             None => pool,
@@ -108,11 +147,65 @@ impl Func {
         if ty.elements() != pt.dims[0] * LANES * k {
             return malformed("pool_view", format!("{ty} over {pt}"));
         }
+        if let Some(o) = order
+            && (o.tokens <= 0 || o.rpt <= 0 || pt.dims[0] % o.block() != 0)
+        {
+            return malformed("pool_view", format!("{o:?} over {pt}"));
+        }
         let id = self.next;
         self.next += 1;
         let v = self.fresh(format!("%view{id}"), ty);
-        self.views.insert(v.0, View { pool, elem });
+        self.views.insert(v.0, View { pool, elem, order });
         Ok(v)
+    }
+
+    /// A view's row order (`None`: the packed rows order, or not a view).
+    #[must_use]
+    pub fn view_order(&self, v: Val) -> Option<Order> {
+        self.views.get(&v.0).and_then(|view| view.order)
+    }
+
+    /// The pool rows that hold view-order rows `r` (any i32 shape): the
+    /// identity in the packed rows order. A bijection on every block, so
+    /// rows past the pool stay past it and distinct rows stay distinct.
+    fn physical(&mut self, r: Val, order: Option<Order>) -> Built<Val> {
+        let Some(o) = order else {
+            return Ok(r);
+        };
+        let b = o.block();
+        let bv = self.like_i(r, b);
+        let base = self.div(r, bv)?;
+        let base = self.mul(base, bv)?;
+        let rpt = self.like_i(r, o.rpt);
+        let j = self.rem(r, rpt)?;
+        let tv = self.like_i(r, o.tokens);
+        let j = self.mul(j, tv)?;
+        let within = self.rem(r, bv)?;
+        let t = self.div(within, rpt)?;
+        let x = self.add(base, j)?;
+        self.add(x, t)
+    }
+
+    /// `[.., n, 128]` pool rows of whole blocks in pool order as view
+    /// order (`to_view`) or the other way.
+    fn reorder(&mut self, rows: Val, o: Order, to_view: bool) -> Built<Val> {
+        let d = self.dims(rows).to_vec();
+        let r = d.len();
+        let (n, lanes) = (d[r - 2], d[r - 1]);
+        let lead = &d[..r - 2];
+        let mut split = lead.to_vec();
+        let (a, b) = if to_view {
+            (o.rpt, o.tokens)
+        } else {
+            (o.tokens, o.rpt)
+        };
+        split.extend([n / o.block(), a, b, lanes]);
+        let x = self.reshape(rows, &split)?;
+        let k = lead.len() as i64;
+        let mut perm: Vec<i64> = (0..=k).collect();
+        perm.extend([k + 2, k + 1, k + 3]);
+        let x = self.transpose(x, &perm)?;
+        self.reshape(x, &d)
     }
 
     /// A view's pool and element (what a Mosaic kernel takes in its place,
@@ -140,9 +233,22 @@ impl Func {
     /// The pool a value of a view's type lands as: a view's own pool; any
     /// other value is packed (a copy of the pool, logged).
     pub fn pool_of(&mut self, v: Val, elem: Elem) -> Built<Val> {
+        self.pool_of_ordered(v, elem, None)
+    }
+
+    /// [`Func::pool_of`] for a view in row order `order`.
+    pub fn pool_of_ordered(&mut self, v: Val, elem: Elem, order: Option<Order>) -> Built<Val> {
         if let Some(view) = self.views.get(&v.0).copied() {
             return Ok(view.pool);
         }
+        let packed = self.pool_of_packed(v, elem)?;
+        match order {
+            Some(o) => self.reorder(packed, o, false),
+            None => Ok(packed),
+        }
+    }
+
+    fn pool_of_packed(&mut self, v: Val, elem: Elem) -> Built<Val> {
         let Some(k) = per_word(elem) else {
             return malformed("pool_of", format!("a {} plane", elem.mlir()));
         };
@@ -203,7 +309,11 @@ impl Func {
         let dims = self.ty(v).dims.clone();
         self.materialized
             .push(format!("{why}: {}", Ty::new(view.elem, &dims)));
-        let x = self.unpack(view.pool, view.elem)?;
+        let rows = match view.order {
+            Some(o) => self.reorder(view.pool, o, true)?,
+            None => view.pool,
+        };
+        let x = self.unpack(rows, view.elem)?;
         self.reshape(x, &dims)
     }
 
@@ -391,6 +501,21 @@ impl Func {
         // of one lane: two 512 KiB page reads a layer by DMA, 29 us a step
         // of the host's execute prologue). Larger reads stay on DMA: by
         // XLA's gather they cost a wide decode (MoE 256 lanes) about 1%.
+        // A view in another row order reads whole blocks as they lie and
+        // reorders them; any other read takes its rows one by one.
+        let blocks_whole = view
+            .order
+            .is_none_or(|o| aligned && nr % o.block() == 0 && g % (o.block() * e) == 0);
+        if let Some(o) = view.order
+            && !blocks_whole
+        {
+            let ids = self.rows_of(row, batch, nr)?;
+            let ids = self.physical(ids, Some(o))?;
+            let got = self.take_rows(view.pool, ids)?;
+            let got = self.reshape(got, &[batch, nr, LANES])?;
+            let flat = self.unpack(got, view.elem)?;
+            return self.pick(flat, off, batch, nr, e, len).map(Some);
+        }
         let small = aligned
             && g % len == 0
             && self.blocked(rows_total, nr)
@@ -400,7 +525,14 @@ impl Func {
             // reinterpreted (`crate::blocks`).
             let at = self.block_of(row, nr)?;
             let got = crate::blocks::gather(self, view.pool, at, nr, view.elem)?;
-            let got = self.reshape(got, &[batch, nr * e])?;
+            let got = match view.order {
+                Some(o) => {
+                    let x = self.reshape(got, &[batch, nr, k * LANES])?;
+                    let x = self.reorder(x, o, true)?;
+                    self.reshape(x, &[batch, nr * e])?
+                }
+                None => self.reshape(got, &[batch, nr * e])?,
+            };
             let check = std::env::var("PIE_XLA_POOL_DMA_CHECK").ok();
             if let Some(mode @ ("1" | "2")) = check.as_deref() {
                 // Debugging: the same rows by XLA's gather, bit for bit;
@@ -446,12 +578,30 @@ impl Func {
             let got = self.take_rows(view.pool, ids)?;
             self.reshape(got, &[batch, nr, LANES])?
         };
+        let got = match view.order {
+            Some(o) => self.reorder(got, o, true)?,
+            None => got,
+        };
         let flat = self.unpack(got, view.elem)?;
+        self.pick(flat, off, batch, nr, e, len).map(Some)
+    }
+
+    /// `len` elements at `off` of each of the `[batch, nr · e]` rows read
+    /// (all of them where `off` is `None`).
+    fn pick(
+        &mut self,
+        flat: Val,
+        off: Option<Val>,
+        batch: i64,
+        nr: i64,
+        e: i64,
+        len: i64,
+    ) -> Built<Val> {
         let Some(off) = off else {
-            return Ok(Some(flat));
+            return Ok(flat);
         };
         if nr * e == len {
-            return Ok(Some(flat));
+            return Ok(flat);
         }
         // Pick `len` elements at `off` from each batch row.
         let at = self.reshape(off, &[batch, 1])?;
@@ -468,7 +618,7 @@ impl Func {
             },
             &[1, len],
         )?;
-        Ok(Some(self.reshape(picked, &[batch, len])?))
+        self.reshape(picked, &[batch, len])
     }
 
     /// The `[B]` start of operand axis `axis` read from `indices` (component
@@ -680,44 +830,33 @@ impl Func {
                 };
                 self.bitcast(x, Elem::U32)?
             };
-            if g % len == 0 && k > 1 && crate::blocks::on() {
-                // whole blocks by DMA (`crate::blocks`), any number of rows:
-                // a row scatter pays for every pool row it is handed
-                let at = self.block_of(row, nr)?;
-                let ups = self.reshape(ups, &[batch * nr * k, LANES])?;
-                return Ok(Some(crate::blocks::scatter(self, view.pool, at, ups, nr)?));
+            if let Some(o) = view.order {
+                if nr % o.block() != 0 || g % (o.block() * e) != 0 {
+                    // part of a block: its rows one by one, where they lie
+                    let ids = self.rows_of(row, batch, nr)?;
+                    let ids = self.physical(ids, Some(o))?;
+                    let pool =
+                        self.put_rows_hinted(view.pool, ids, packed, Combine::Set, unique)?;
+                    return Ok(Some(pool));
+                }
+                // whole blocks: laid in the pool's order, then as below
+                let x = self.reshape(packed, &[batch, nr, LANES])?;
+                let x = self.reorder(x, o, false)?;
+                let packed = self.reshape(x, &[batch * nr, LANES])?;
+                let ups = self.reshape(ups, &[batch, nr, k * LANES])?;
+                let ups = self.reorder(ups, o, false)?;
+                return self.write_whole(
+                    view, row, ups, packed, batch, nr, k, g, len, rows_total, unique,
+                );
             }
-            if g % len == 0 && self.blocked(rows_total, nr) {
-                // whole blocks into the pool as `[R / nr, nr, 128]` (see
-                // `read_block`)
-                let per = self.like_i(row, nr);
-                let at = self.div(row, per)?;
-                let blocks = self.reshape(view.pool, &[rows_total / nr, nr, LANES])?;
-                let at = self.reshape(at, &[batch, 1])?;
-                let ups = self.reshape(packed, &[batch, nr, LANES])?;
-                let blocks = self.scatter_hinted(
-                    blocks,
-                    at,
-                    ups,
-                    &ScatterDims {
-                        update_window_dims: vec![1, 2],
-                        inserted_window_dims: vec![0],
-                        scatter_dims_to_operand_dims: vec![0],
-                        index_vector_dim: 1,
-                        ..ScatterDims::default()
-                    },
-                    Combine::Set,
-                    unique,
-                )?;
-                return Ok(Some(self.reshape(blocks, &[rows_total, LANES])?));
-            }
-            // one index a pool row (see `read_block`)
-            let ids = self.rows_of(row, batch, nr)?;
-            let pool = self.put_rows_hinted(view.pool, ids, packed, Combine::Set, unique)?;
-            return Ok(Some(pool));
+            let ups = self.reshape(ups, &[batch, nr, k * LANES])?;
+            return self.write_whole(
+                view, row, ups, packed, batch, nr, k, g, len, rows_total, unique,
+            );
         }
         // A block inside one row: the row's bits with the block in place
         // (zero elsewhere) and its mask, then and-not / or.
+        let row = self.physical(row, view.order)?;
         let slots = e / len;
         let slot = slot.unwrap_or_else(|| self.const_i(Elem::I32, 0, &[batch]));
         let pos = self.iota(Elem::I32, &[batch, slots, len], 1);
@@ -754,6 +893,61 @@ impl Func {
         };
         let pool = self.scatter(view.pool, idx, keep, &sd, Combine::And)?;
         let pool = self.scatter(pool, idx, vals, &sd, Combine::Or)?;
+        Ok(Some(pool))
+    }
+
+    /// Whole rows `[B, nr]` landing at pool row `row` (`[B]`), in pool
+    /// order: `ups` the elements (`[B, nr, k · 128]`), `packed` their pool
+    /// rows (`[B · nr, 128]`).
+    #[allow(clippy::too_many_arguments)]
+    fn write_whole(
+        &mut self,
+        view: View,
+        row: Val,
+        ups: Val,
+        packed: Val,
+        batch: i64,
+        nr: i64,
+        k: i64,
+        g: i64,
+        len: i64,
+        rows_total: i64,
+        unique: bool,
+    ) -> Built<Option<Val>> {
+        if g % len == 0 && k > 1 && crate::blocks::on() {
+            // whole blocks by DMA (`crate::blocks`), any number of rows:
+            // a row scatter pays for every pool row it is handed
+            let at = self.block_of(row, nr)?;
+            let ups = self.reshape(ups, &[batch * nr * k, LANES])?;
+            return Ok(Some(crate::blocks::scatter(self, view.pool, at, ups, nr)?));
+        }
+        if g % len == 0 && self.blocked(rows_total, nr) {
+            // whole blocks into the pool as `[R / nr, nr, 128]` (see
+            // `read_block`)
+            let per = self.like_i(row, nr);
+            let at = self.div(row, per)?;
+            let blocks = self.reshape(view.pool, &[rows_total / nr, nr, LANES])?;
+            let at = self.reshape(at, &[batch, 1])?;
+            let ups = self.reshape(packed, &[batch, nr, LANES])?;
+            let blocks = self.scatter_hinted(
+                blocks,
+                at,
+                ups,
+                &ScatterDims {
+                    update_window_dims: vec![1, 2],
+                    inserted_window_dims: vec![0],
+                    scatter_dims_to_operand_dims: vec![0],
+                    index_vector_dim: 1,
+                    ..ScatterDims::default()
+                },
+                Combine::Set,
+                unique,
+            )?;
+            return Ok(Some(self.reshape(blocks, &[rows_total, LANES])?));
+        }
+        // one index a pool row (see `read_block`)
+        let ids = self.rows_of(row, batch, nr)?;
+        let pool = self.put_rows_hinted(view.pool, ids, packed, Combine::Set, unique)?;
         Ok(Some(pool))
     }
 
@@ -869,7 +1063,9 @@ impl Func {
             return Ok(None);
         };
         let dims = od;
-        Ok(Some(self.pool_view(pool, view.elem, &dims)?))
+        Ok(Some(
+            self.pool_view_ordered(pool, view.elem, &dims, view.order)?,
+        ))
     }
 
     /// `dynamic_update_slice` onto a view. `None` where it has no rewrite.
@@ -900,7 +1096,12 @@ impl Func {
         }
         let ups = self.reshape(update, &[1, len])?;
         if let Some(pool) = self.write_block(view, &od, &at, None, ups, 1, len, true)? {
-            return Ok(Some(self.pool_view(pool, view.elem, &od)?));
+            return Ok(Some(
+                self.pool_view_ordered(pool, view.elem, &od, view.order)?,
+            ));
+        }
+        if view.order.is_some() {
+            return Ok(None);
         }
         // One block across rows at any start: read the rows it covers,
         // splice it in, write them back (one block, so no row is shared).
@@ -949,7 +1150,9 @@ impl Func {
         let flat = self.dynamic_update_slice(flat, up, &[off])?;
         let packed = self.pack(flat, nr, k)?;
         let pool = self.dynamic_update_slice(view.pool, packed, &[rc, zero])?;
-        Ok(Some(self.pool_view(pool, view.elem, &od)?))
+        Ok(Some(
+            self.pool_view_ordered(pool, view.elem, &od, view.order)?,
+        ))
     }
 
     /// Loop-carried views: the pools they ride on, and how to make them
@@ -960,7 +1163,7 @@ impl Func {
         for &v in inits {
             if let Some(view) = self.views.get(&v.0).copied() {
                 out.push(view.pool);
-                kinds.push(Some((view.elem, self.ty(v).dims.clone())));
+                kinds.push(Some((view.elem, self.ty(v).dims.clone(), view.order)));
             } else {
                 out.push(v);
                 kinds.push(None);
@@ -969,30 +1172,22 @@ impl Func {
         (out, kinds)
     }
 
-    pub(super) fn review(
-        &mut self,
-        vs: &[Val],
-        kinds: &[Option<(Elem, Vec<i64>)>],
-    ) -> Built<Vec<Val>> {
+    pub(super) fn review(&mut self, vs: &[Val], kinds: &[Option<Kind>]) -> Built<Vec<Val>> {
         let mut out = Vec::with_capacity(vs.len());
         for (&v, kind) in vs.iter().zip(kinds) {
             out.push(match kind {
-                Some((elem, dims)) => self.pool_view(v, *elem, dims)?,
+                Some((elem, dims, order)) => self.pool_view_ordered(v, *elem, dims, *order)?,
                 None => v,
             });
         }
         Ok(out)
     }
 
-    pub(super) fn pools_of(
-        &mut self,
-        vs: &[Val],
-        kinds: &[Option<(Elem, Vec<i64>)>],
-    ) -> Built<Vec<Val>> {
+    pub(super) fn pools_of(&mut self, vs: &[Val], kinds: &[Option<Kind>]) -> Built<Vec<Val>> {
         let mut out = Vec::with_capacity(vs.len());
         for (&v, kind) in vs.iter().zip(kinds) {
             out.push(match kind {
-                Some((elem, _)) => self.pool_of(v, *elem)?,
+                Some((elem, _, order)) => self.pool_of_ordered(v, *elem, *order)?,
                 None => v,
             });
         }
