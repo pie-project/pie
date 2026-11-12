@@ -455,6 +455,7 @@ pub(super) fn bake(boot: &mut Boot<'_>) -> Result<Baked> {
         regions,
         anchored,
         asked,
+        stated_buckets: !stated_buckets.is_empty(),
     })
 }
 
@@ -756,6 +757,7 @@ impl Shell {
             regions: folded,
             anchored,
             asked,
+            stated_buckets,
         } = bake(&mut boot)?;
         // Every generated kernel compiled and loaded now, before a fire can
         // ask for one.
@@ -1253,6 +1255,11 @@ impl Shell {
             seat_to_end: engine.seat_to_end,
             seat_spread: engine.seat_spread,
             prefill_lanes: engine.prefill_lanes,
+            lattice: (!stated_buckets && engine.prefill_lattice_from > 0).then_some((
+                engine.lattice_steps,
+                engine.prefill_lattice_from,
+                engine.prefill_lattice_steps,
+            )),
             pad: engine.recording.pad(),
             golden_arm: Golden::Off,
             bodies: engine.recording.bodies(),
@@ -1875,6 +1882,8 @@ pub(super) struct Baked {
     pub(super) anchored: std::collections::BTreeMap<u64, kernels_ir::Anchored>,
     /// The budget asked before the card cut its tokens at the asked lanes.
     pub(super) asked: Budget,
+    /// Whether the load stated its buckets (no default lattice to coarsen).
+    pub(super) stated_buckets: bool,
 }
 
 /// The widest fire whose lanes of `rows` prompt rows put no more (lane,

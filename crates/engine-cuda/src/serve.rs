@@ -118,6 +118,10 @@ pub struct Shell {
     seat_spread: bool,
     /// `engine.prefill_lanes`.
     prefill_lanes: u32,
+    /// The default lattice's `(steps, prefill_from, prefill_steps)` where no
+    /// buckets were stated: what arming coarsens to fit the bodies' allowance
+    /// (`Shell::fit_lattice`).
+    lattice: Option<(u32, u32, u32)>,
     pad: bool,
     bodies: bool,
     bodies_mem: usize,
