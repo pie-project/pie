@@ -594,8 +594,9 @@ impl Pinned {
         Pinned::alloc(bytes, true)
     }
 
-    /// `bytes` of pageable host memory, zero until written (a private
-    /// anonymous mapping, its pages made as they are first touched): a copy
+    /// `bytes` of pageable host memory, zeroed (a private anonymous mapping
+    /// whose pages are made up front across the machine's cores,
+    /// [`prefault`]): a copy
     /// no fire reads in place, the device copying out of it alone, whose
     /// address it takes as any host address (`device` is the host address).
     /// Nothing is pinned, so a span of gigabytes costs no page-locking.
@@ -621,13 +622,7 @@ impl Pinned {
                 "this machine would not map {bytes} bytes of host memory for the weights' copy"
             )));
         }
-        // Huge pages where the kernel gives them on asking: a copy of tens
-        // of gigabytes first touched a 4 KiB page at a time faults millions
-        // of times.
-        // SAFETY: advice on the mapping just made; it changes no contents.
-        unsafe {
-            libc::madvise(at, bytes, libc::MADV_HUGEPAGE);
-        }
+        prefault(at.cast(), bytes);
         pageable_spans().push((at as usize, bytes));
         Ok(Pinned {
             host: at.cast(),
@@ -1279,6 +1274,38 @@ pub fn free_bytes() -> Option<u64> {
     {
         None
     }
+}
+
+/// Makes every page of the fresh anonymous mapping `at` (`bytes`) at once,
+/// a stripe of pages a thread: a copy of tens of gigabytes first touched a
+/// page at a time by one writer faults millions of times in a row (20 s of
+/// a held Qwen3-30B-A3B-FP8's 27.9 GB on an L40S host), populated by the
+/// kernel alone it takes 10 s, and huge pages asked for instead stall on
+/// compaction where the page cache has fragmented memory, a boot slower
+/// each run.
+#[cfg(unix)]
+fn prefault(at: *mut u8, bytes: usize) {
+    const PAGE: usize = 4096;
+    let pages = bytes.div_ceil(PAGE);
+    let threads = std::thread::available_parallelism()
+        .map_or(1, std::num::NonZeroUsize::get)
+        .clamp(1, 32)
+        .min(pages.max(1));
+    let base = at as usize;
+    std::thread::scope(|scope| {
+        for t in 0..threads {
+            scope.spawn(move || {
+                let mut page = t;
+                while page < pages {
+                    // SAFETY: a page of the private mapping just made, which
+                    // nothing else holds yet; writing its first byte zero
+                    // leaves it as mapped (zero) and makes the page.
+                    unsafe { core::ptr::write_volatile((base + page * PAGE) as *mut u8, 0) };
+                    page += threads;
+                }
+            });
+        }
+    });
 }
 
 /// The spans [`Pinned::pageable`] mapped and holds: anonymous memory, which
