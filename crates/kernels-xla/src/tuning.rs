@@ -176,6 +176,11 @@ pub struct RopeFlatRows(pub u32);
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Decision)]
 #[decision(id = "kernel.glu.land_from", constant(set(0, 512, 1024, 2048)), default = 0, tune = search)]
 pub struct GluLandFrom(pub u32);
+/// From this many rows, a dot's activation 6144 wide or more is laid out
+/// whole before the dot (`linear::gemm`); 0 never is.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Decision)]
+#[decision(id = "kernel.linear.dot_barrier_rows", constant(set(0, 1024, 2048, 2304, 4096)), default = 0, tune = search)]
+pub struct DotBarrierRows(pub u32);
 
 /// From this many rows a dense gemm's rows a row norm reads land behind a
 /// barrier before the norm, not left to XLA to fuse the norm's sum of
@@ -290,6 +295,7 @@ pub fn register(registry: &mut Registry) {
         .add::<GluLandFrom>()
         .add::<NormLandFrom>()
         .add::<NormLandBelow>()
+        .add::<DotBarrierRows>()
         .add::<AttnBlockKeys>()
         .add::<AttnUnrolledBlocks>()
         .add::<AttnFlashNarrowRows>()
@@ -378,6 +384,7 @@ pub struct Tuning {
     /// Rows from which a gemm's rows no longer land before their norm; 0
     /// none.
     pub norm_land_below: i64,
+    pub dot_barrier_rows: i64,
     pub chunks: Chunks,
     pub ssm: SsmChunks,
     pub vmem_bytes: i64,
@@ -419,6 +426,7 @@ impl Tuning {
         glu_land_from: 0,
         norm_land_from: 0,
         norm_land_below: 0,
+        dot_barrier_rows: 0,
         chunks: Chunks {
             budget: 1 << 24,
             block_rows: 512,
@@ -481,6 +489,7 @@ impl Tuning {
             glu_land_from: n(profile.get::<GluLandFrom>().0),
             norm_land_from: n(profile.get::<NormLandFrom>().0),
             norm_land_below: n(profile.get::<NormLandBelow>().0),
+            dot_barrier_rows: n(profile.get::<DotBarrierRows>().0),
             chunks: Chunks {
                 budget: n(profile.get::<AttnBudgetMi>().0) << 20,
                 block_rows: n(profile.get::<AttnBlockRows>().0),
