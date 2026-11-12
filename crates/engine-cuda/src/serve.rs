@@ -91,6 +91,9 @@ pub struct Shell {
     corrected: poem_ir::ClassSet,
     decoding: poem_ir::ClassSet,
     tiers: record::Tiers,
+    /// The class words of a drafter's classes (`Shell::drafts_only`); none
+    /// on a model without a drafter.
+    drafting_words: std::collections::HashSet<u64>,
     landing: Vec<Vec<poem_ir::Request>>,
     armed: Option<Armed>,
     media: poem_ir::ClassSet,
@@ -822,13 +825,10 @@ impl Shell {
     /// fires (plain but for reading the drafts): it composes at
     /// [`Shell::rs_rungs`] too, a verify's lanes being narrow.
     fn drafts_only(&self, word: u64) -> bool {
-        self.compiled
-            .classes
-            .class_of(word & self.compiled.classes.mask)
-            .is_some_and(|class| {
-                self.tiers.plain.contains(class)
-                    && !self.landing[class].iter().any(poem_ir::Request::plain)
-            })
+        !self.drafting_words.is_empty()
+            && self
+                .drafting_words
+                .contains(&(word & self.compiled.classes.mask))
     }
 
     fn rs_rungs(&self) -> Vec<u32> {

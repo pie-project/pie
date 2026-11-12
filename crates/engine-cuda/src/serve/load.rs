@@ -937,6 +937,16 @@ impl Shell {
         let tiers = crate::record::Tiers {
             plain: plain_of(&landing, &Exports::of(&boot.trace, &compiled)?.outputs),
         };
+        let drafting_words: std::collections::HashSet<u64> = compiled
+            .classes
+            .classes
+            .iter()
+            .enumerate()
+            .filter(|(class, _)| {
+                tiers.plain.contains(*class) && !landing[*class].iter().any(poem_ir::Request::plain)
+            })
+            .flat_map(|(_, class)| class.words.iter().copied())
+            .collect();
         let media = media_classes(&boot.trace, &compiled);
         let shifted = regions_shifting(&boot.trace, &compiled);
         let lane_shifted = regions_lane_shifting(&boot.trace, &compiled);
@@ -1199,6 +1209,7 @@ impl Shell {
             adapter_fact,
             corrected,
             decoding,
+            drafting_words,
             tiers,
             landing,
             armed: None,
