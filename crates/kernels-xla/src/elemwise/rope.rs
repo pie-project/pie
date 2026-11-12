@@ -752,6 +752,10 @@ pub fn normed(
 /// The rows a block of `turn_normed` takes of `n`'s under `t`, where the
 /// norm's kernel (`norm::heads_kernel`) and the rope's (`turn_tall`) would
 /// each take them: the norm's blocks.
+/// The narrowest heads the fused kernel takes: Qwen3-0.6B's 128-wide heads
+/// lost 1.9% (v5e pf256-512) where Gemma-4's 256 and 512 gain.
+const LEAST_HEAD: i64 = 256;
+
 fn normed_rows(f: &Func, n: &Normed, t: &Turn) -> Option<i64> {
     use super::norm::{KERNEL_FROM, KERNEL_ROWS, KERNEL_WIDTH};
     let (rows, width, u) = (i64::from(n.x.rows), i64::from(n.x.width), t.unit as i64);
@@ -761,6 +765,7 @@ fn normed_rows(f: &Func, n: &Normed, t: &Turn) -> Option<i64> {
         || f.elem(n.x.val) != Elem::Bf16
         || i64::from(n.weight.rows) * i64::from(n.weight.width) != u
         || rows < KERNEL_FROM
+        || u < LEAST_HEAD
         || u % 128 != 0
         || width % u != 0
         || (width < KERNEL_WIDTH && width / u < 8)
