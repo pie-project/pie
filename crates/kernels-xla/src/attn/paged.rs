@@ -391,6 +391,129 @@ pub(crate) fn fetch_pages(
     }
 }
 
+/// Each kv head's keys and values `[r, c, 128]` (bf16) of whole pool pages
+/// `page` (`[m]` i32, `m · ps = r · c`) of planes in the row-pair order
+/// (`crate::hlo::PoolOrder`), read straight out of the chunk pool (`u32
+/// [R, 128]`) by an XLA block gather: head `h` of a page is its pool rows
+/// `(h / 2) · ps ..` (whole tiles), one half of their words. No kernel call
+/// sits in the walk (XLA keeps no value across one in fast memory: a wide
+/// decode's online-softmax state spilled, v6e MoE c256 at 470 keys 17 us
+/// against 3.6 a chunk) and no relayout of the gathered rows follows.
+/// `None` where the planes are not both bf16 views of one pool in that
+/// order with 128-wide heads.
+fn packed_heads(
+    f: &mut Func,
+    planes: &Planes,
+    h: &Heads,
+    page: Val,
+    r: i64,
+    c: i64,
+) -> Built<Option<(Vec<Val>, Vec<Val>)>> {
+    let Planes::Paged {
+        keys,
+        values,
+        geom,
+        latent: false,
+        keys_map,
+        values_map,
+    } = *planes
+    else {
+        return Ok(None);
+    };
+    let (Some((pool, Elem::Bf16)), Some((pool_v, Elem::Bf16))) =
+        (f.view_parts(keys), f.view_parts(values))
+    else {
+        return Ok(None);
+    };
+    let (Some(ok), Some(ov)) = (f.view_order(keys), f.view_order(values)) else {
+        return Ok(None);
+    };
+    let ps = geom.ps;
+    let (wk, wv) = (h.kvh * h.d, h.kvh * h.dv);
+    if pool != pool_v
+        || ok != ov
+        || h.d % 128 != 0
+        || h.dv != h.d
+        || wk % 256 != 0
+        || ok.tokens != ps
+        || ok.rpt != wk / 256
+        || f.dims(keys)[1] != wk
+        || f.dims(values)[1] != wv
+    {
+        return Ok(None);
+    }
+    // 128-wide pieces a head
+    let hp = h.d / 128;
+    let nr = ok.block();
+    let rows = f.dims(pool)[0];
+    let m = f.dims(page)[0];
+    if nr % 8 != 0 || ps % 8 != 0 || rows % nr != 0 || m * ps != r * c {
+        return Ok(None);
+    }
+    let blocks = f.reshape(pool, &[rows / nr, nr, 128])?;
+    let heads = |f: &mut Func, map: PageMap| -> Built<Vec<Val>> {
+        let at = map.apply(f, page)?;
+        let at = f.reshape(at, &[m, 1])?;
+        let g = f.gather(
+            blocks,
+            at,
+            &GatherDims {
+                offset_dims: vec![1, 2],
+                collapsed_slice_dims: vec![0],
+                start_index_map: vec![0],
+                index_vector_dim: 1,
+                ..GatherDims::default()
+            },
+            &[1, nr, 128],
+        )?;
+        let mut out = Vec::with_capacity(h.kvh as usize);
+        for hh in 0..h.kvh {
+            let mut pieces = Vec::with_capacity(hp as usize);
+            for piece in hh * hp..(hh + 1) * hp {
+                let j = piece / 2;
+                let x = f.slice(g, &[0, j * ps, 0], &[m, (j + 1) * ps, 128], &[1, 1, 1])?;
+                let x = f.reshape(x, &[r, c, 128])?;
+                // the low half of a word is the even element (the packed
+                // rows order), as a float's high bits
+                let x = if piece % 2 == 0 {
+                    let sixteen = f.like_i(x, 16);
+                    f.shl(x, sixteen)?
+                } else {
+                    let mask = f.like_i(x, 0xFFFF_0000);
+                    f.and(x, mask)?
+                };
+                let x = f.bitcast(x, Elem::F32)?;
+                pieces.push(f.convert(x, Elem::Bf16));
+            }
+            out.push(if hp == 1 {
+                pieces[0]
+            } else {
+                f.concat(&pieces, 2)?
+            });
+        }
+        Ok(out)
+    };
+    let k = heads(f, keys_map)?;
+    let v = heads(f, values_map)?;
+    Ok(Some((k, v)))
+}
+
+/// [`by_head`] over one `[r, c, w]` operand per kv head.
+fn by_parts(f: &mut Func, a: Val, parts: &[Val], contract: i64) -> Built<Val> {
+    let ad = f.dims(a).to_vec();
+    let (r, g, x) = (ad[0], ad[2], ad[3]);
+    let mut out = Vec::with_capacity(parts.len());
+    for (hh, &bh) in parts.iter().enumerate() {
+        let hh = hh as i64;
+        let ah = f.slice(a, &[0, hh, 0, 0], &[r, hh + 1, g, x], &[1, 1, 1, 1])?;
+        let ah = f.reshape(ah, &[r, g, x])?;
+        let o = f.dot_general_at(ah, bh, &[0], &[0], &[2], &[contract], Elem::F32, false)?;
+        let od = f.dims(o).to_vec();
+        out.push(f.reshape(o, &[r, 1, g, od[2]])?);
+    }
+    f.concat(&out, 1)
+}
+
 /// A walk's page table laid for chunks of whole pages: per row (`[r,
 /// pages + np]`, each row its lane's pages) or flat (`[lanes · pages +
 /// np]`), padded by one chunk so a chunk's window never clamps.
@@ -686,9 +809,12 @@ enum Layout {
 /// `p · v` in f32 from bf16 values, `p` in bf16: one MXU pass (a prefill's
 /// blocks took two, `p` split as `hi + lo`: v5e Qwen3-0.6B pf256-512 44.0k
 /// against 48.5k tok/s, Raw prefill 36.5k against 40.2k).
-fn pv(f: &mut Func, lay: Layout, p: Val, v: Val) -> Built<Val> {
+fn pv(f: &mut Func, lay: Layout, p: Val, v: Val, parts: Option<&[Val]>) -> Built<Val> {
     let split = f.ty(v).rank() == 3;
     let pb = f.convert(p, Elem::Bf16);
+    if let Some(parts) = parts {
+        return by_parts(f, pb, parts, 1);
+    }
     match lay {
         Layout::PerRow if split => by_head(f, pb, v, 1),
         Layout::PerRow => f.dot_general_at(pb, v, &[0, 1], &[0, 2], &[3], &[1], Elem::F32, false),
@@ -798,6 +924,22 @@ fn step(
     v: Val,
     st: &[Val],
 ) -> Built<Vec<Val>> {
+    step_parts(f, lay, h, s, lg, scale, v, None, st)
+}
+
+/// [`step`] with the values as one operand per kv head ([`packed_heads`]).
+#[allow(clippy::too_many_arguments)]
+fn step_parts(
+    f: &mut Func,
+    lay: Layout,
+    h: &Heads,
+    s: Val,
+    lg: &Logits,
+    scale: f64,
+    v: Val,
+    vparts: Option<&[Val]>,
+    st: &[Val],
+) -> Built<Vec<Val>> {
     let sd = f.dims(s).to_vec();
     let mut s = f.scale(s, scale)?;
     if let Some(b) = lg.bias {
@@ -841,7 +983,7 @@ fn step(
     let l = f.mul(l0, corr)?;
     let ps = f.reduce(p, &[3], Fold::Sum)?;
     let l = f.add(l, ps)?;
-    let o = pv(f, lay, p, v)?;
+    let o = pv(f, lay, p, v, vparts)?;
     let ad = f.dims(acc0).to_vec();
     let cb = f.broadcast(corr, &ad, &[0, 1, 2])?;
     let acc = f.mul(acc0, cb)?;
@@ -991,6 +1133,33 @@ pub(crate) fn per_row(
         let lb = f.broadcast(lane, &[r, c], &[0])?;
         let x = with_i(f, lb, span, Func::mul)?;
         let x = f.add(x, kc)?;
+        let packed = match walk {
+            Some(w) => {
+                let page = w.chunk(f, base)?;
+                packed_heads(f, planes, h, page, r, c)?
+            }
+            None => None,
+        };
+        if let Some((kparts, vparts)) = packed {
+            let s = by_parts(f, rows.q, &kparts, 2)?;
+            let lo = f.broadcast(rows.lo, &[r, c], &[0])?;
+            let hi = f.broadcast(rows.hi, &[r, c], &[0])?;
+            let ge = f.compare(Cmp::Ge, kp, lo)?;
+            let lt = f.compare(Cmp::Lt, kp, hi)?;
+            let range = f.and(ge, lt)?;
+            let lg = logits(f, rule, h, rows, x, kp, Some(base), range)?;
+            return step_parts(
+                f,
+                Layout::PerRow,
+                h,
+                s,
+                &lg,
+                scale,
+                vparts[0],
+                Some(&vparts),
+                st,
+            );
+        }
         let paged = match walk {
             Some(w) => {
                 let page = w.chunk(f, base)?;
@@ -2086,8 +2255,9 @@ pub fn attend_fresh(
                 // the kernel straight out of it)
                 && (!f.is_view(keys) && !f.is_view(values)
                     || f.view_parts(keys).map(|v| v.0) == f.view_parts(values).map(|v| v.0)
-                        && (heads.kvh * heads.d) % 128 == 0
-                        && (heads.kvh * heads.dv) % 128 == 0
+                        // pages in the row-pair order (rows of whole pairs)
+                        && f.view_order(keys).is_some()
+                        && f.view_order(keys) == f.view_order(values)
                         && crate::blocks::on())
                 && super::pages::fits(geom.span, &heads, tuning.vmem_cap()) =>
         {
@@ -2592,6 +2762,7 @@ fn append_pool_planes(
     let slots = i64::from(keys.rows);
     if pool != pool_v
         || !crate::blocks::on()
+        || f.view_order(keys.val) != f.view_order(values.val)
         || values.width != keys.width
         || k.width != keys.width
         || v.width != values.width
@@ -2612,10 +2783,22 @@ fn append_pool_planes(
     let dims: &[i64] = &dims_owned;
     let srcs = [k.val, v.val];
     let token_rows = w * 2 / 512;
+    // the planes' order (rows of one pool row lie as its identity)
+    let order = f.view_order(keys.val);
+    let o = match order {
+        Some(o) => o,
+        None if token_rows == 1 => crate::hlo::PoolOrder { tokens: ps, rpt: 1 },
+        None => return Ok(None),
+    };
+    if o.tokens != ps || o.rpt != token_rows {
+        return Ok(None);
+    }
     let rows_into = move |f: &mut Func| -> Built<Vec<Val>> {
         pool_rows(
             f,
             pool,
+            o,
+            order,
             [maps[0], maps[1]],
             srcs,
             page,
@@ -2623,8 +2806,6 @@ fn append_pool_planes(
             ps,
             all,
             slots,
-            w,
-            token_rows,
             dims,
         )
     };
@@ -2675,9 +2856,12 @@ fn append_pool_planes(
         let ids = f.concat(&ids, 0)?;
         let ups = f.concat(&ups, 0)?;
         let cnt = f.dims(ups)[0];
+        // a page's pool rows pair-major (`crate::hlo::PoolOrder`)
+        let ups = f.reshape(ups, &[cnt, ps, token_rows, 256])?;
+        let ups = f.transpose(ups, &[0, 2, 1, 3])?;
         let ups = f.reshape(ups, &[cnt * ps * w / 128, 128])?;
         let laid = crate::blocks::scatter(f, pool, ids, ups, page_rows)?;
-        Ok(vec![f.pool_view(laid, Elem::Bf16, dims)?])
+        Ok(vec![f.pool_view_ordered(laid, Elem::Bf16, dims, order)?])
     };
     let by_pages = &by_pages_owned;
     let pages_b: crate::hlo::Branch<'_> = Box::new(move |f: &mut Func| by_pages(f, None));
@@ -2701,7 +2885,12 @@ fn append_pool_planes(
                     total,
                     cap,
                 )?;
-                Ok(vec![f.pool_view(laid[0], Elem::Bf16, dims)?])
+                Ok(vec![f.pool_view_ordered(
+                    laid[0],
+                    Elem::Bf16,
+                    dims,
+                    order,
+                )?])
             })
         }
         _ => Box::new(move |f: &mut Func| by_pages(f, Some(few))),
@@ -2718,13 +2907,16 @@ fn append_pool_planes(
 /// by a DMA kernel call.
 const ROWS_IN_PLACE: i64 = 2;
 
-/// Both pool planes' rows, each by itself, as one block scatter: row `i` of
-/// plane `x` to page `maps[x](page[i])` at offset `off[i]` (a row whose
-/// page or offset is out of range dropped); the pool's new view.
+/// Both pool planes' rows, each by itself: row `i` of plane `x` to page
+/// `maps[x](page[i])` at offset `off[i]` (a row whose page or offset is out
+/// of range dropped), its pool rows where the order `o` lays them; the
+/// pool's new view (in the planes' `order`).
 #[allow(clippy::too_many_arguments)]
 fn pool_rows(
     f: &mut Func,
     pool: Val,
+    o: crate::hlo::PoolOrder,
+    order: Option<crate::hlo::PoolOrder>,
     maps: [PageMap; 2],
     srcs: [Val; 2],
     page: Val,
@@ -2732,11 +2924,10 @@ fn pool_rows(
     ps: i64,
     all: i64,
     slots: i64,
-    w: i64,
-    token_rows: i64,
     dims: &[i64],
 ) -> Built<Vec<Val>> {
     let n64 = f.dims(page)[0];
+    let token_rows = o.rpt;
     let mut ids = Vec::with_capacity(2);
     for (x, m) in maps.into_iter().enumerate() {
         let p = m.apply(f, page)?;
@@ -2757,37 +2948,73 @@ fn pool_rows(
     }
     let ids = f.concat(&ids, 0)?;
     let ups = f.concat(&srcs, 0)?;
+    // A token's pool rows lie a block's tokens apart: row j at
+    // page · B + j · T + t.
+    let nt = 2 * n64;
+    let packed = f.pack_rows(ups, nt * token_rows)?;
     if n64 <= ROWS_IN_PLACE {
-        // A lane or two (a decode's): each row read, kept where dropped,
-        // and written back in place: no kernel call, whose launch costs the
-        // host and the device more than these few rows (v6e MoE decode of
-        // one lane: a 2 KiB scatter call a layer).
-        let packed = f.pack_rows(ups, 2 * n64 * token_rows)?;
-        let blocks = f.dims(pool)[0] / token_rows;
+        // A lane or two (a decode's): no kernel call, whose launch costs
+        // the host and the device more than these few rows (v6e MoE decode
+        // of one lane: a 2 KiB scatter call a layer). A token of one pool
+        // row lands by a DUS of it; a wider one's page block is read, its
+        // rows put in place by a select and the block written back (a row
+        // a DUS would be `rpt` of them).
+        let packed = f.reshape(packed, &[nt, token_rows, 128])?;
+        let total = f.dims(pool)[0];
+        let b = if token_rows == 1 { 1 } else { o.block() };
         let mut pool = pool;
-        for i in 0..2 * n64 {
+        for i in 0..nt {
             let id = f.slice(ids, &[i], &[i + 1], &[1])?;
             let id = f.reshape(id, &[])?;
+            let tv = f.like_i(id, o.tokens);
+            let pg = f.div(id, tv)?;
+            let t = f.rem(id, tv)?;
+            let bv = f.like_i(id, o.block());
+            let start = f.mul(pg, bv)?;
+            let start = if token_rows == 1 {
+                f.add(start, t)?
+            } else {
+                start
+            };
             let lo = f.like_i(id, 0);
-            let hi = f.like_i(id, blocks);
-            let a = f.compare(Cmp::Ge, id, lo)?;
-            let b = f.compare(Cmp::Lt, id, hi)?;
-            let ok = f.and(a, b)?;
-            let tr = f.like_i(id, token_rows);
-            let row = f.mul(id, tr)?;
+            let hi = f.like_i(id, total);
+            let a = f.compare(Cmp::Ge, start, lo)?;
+            let c = f.compare(Cmp::Lt, start, hi)?;
+            let ok = f.and(a, c)?;
             let z = f.like_i(id, 0);
-            let cur = f.dynamic_slice(pool, &[row, z], &[token_rows, 128])?;
-            let r0 = i * token_rows;
-            let new = f.slice(packed, &[r0, 0], &[r0 + token_rows, 128], &[1, 1])?;
-            let ok = f.broadcast(ok, &[token_rows, 128], &[])?;
-            let put = f.select(ok, new, cur)?;
-            pool = f.dynamic_update_slice(pool, put, &[row, z])?;
+            let cur = f.dynamic_slice(pool, &[start, z], &[b, 128])?;
+            let tok = f.slice(packed, &[i, 0, 0], &[i + 1, token_rows, 128], &[1, 1, 1])?;
+            let put = if token_rows == 1 {
+                let tok = f.reshape(tok, &[1, 128])?;
+                let okb = f.broadcast(ok, &[1, 128], &[])?;
+                f.select(okb, tok, cur)?
+            } else {
+                // block row j · T + t takes the token's row j
+                let tok = f.reshape(tok, &[token_rows, 1, 128])?;
+                let tok = f.broadcast(tok, &[token_rows, o.tokens, 128], &[0, 1, 2])?;
+                let tok = f.reshape(tok, &[b, 128])?;
+                let row = f.iota(Elem::I32, &[o.rpt, o.tokens, 128], 1);
+                let row = f.reshape(row, &[b, 128])?;
+                let tb = f.broadcast(t, &[b, 128], &[])?;
+                let here = f.compare(Cmp::Eq, row, tb)?;
+                let okb = f.broadcast(ok, &[b, 128], &[])?;
+                let here = f.and(here, okb)?;
+                f.select(here, tok, cur)?
+            };
+            pool = f.dynamic_update_slice(pool, put, &[start, z])?;
         }
-        return Ok(vec![f.pool_view(pool, Elem::Bf16, dims)?]);
+        return Ok(vec![f.pool_view_ordered(pool, Elem::Bf16, dims, order)?]);
     }
-    let ups = f.reshape(ups, &[2 * n64 * w / 128, 128])?;
-    let laid = crate::blocks::scatter(f, pool, ids, ups, token_rows)?;
-    Ok(vec![f.pool_view(laid, Elem::Bf16, dims)?])
+    // one DMA a token, its rows a block's tokens apart
+    let tv = f.like_i(ids, o.tokens);
+    let pg = f.div(ids, tv)?;
+    let t = f.rem(ids, tv)?;
+    let bv = f.like_i(ids, o.block());
+    let starts = f.mul(pg, bv)?;
+    let starts = f.add(starts, t)?;
+    let packed = f.reshape(packed, &[nt * token_rows, 1, 128])?;
+    let laid = crate::blocks::scatter_tokens(f, pool, starts, packed, o)?;
+    Ok(vec![f.pool_view_ordered(laid, Elem::Bf16, dims, order)?])
 }
 
 /// `plane` (a view of the chunk pool) as a view of the pool `onto` (a view)
@@ -2796,7 +3023,8 @@ fn rebase(f: &mut Func, plane: Val, onto: Val) -> Built<Val> {
     match (f.view_parts(plane), f.view_parts(onto)) {
         (Some((_, elem)), Some((pool, _))) => {
             let dims = f.dims(plane).to_vec();
-            f.pool_view(pool, elem, &dims)
+            let order = f.view_order(plane);
+            f.pool_view_ordered(pool, elem, &dims, order)
         }
         _ => Ok(plane),
     }
@@ -2851,6 +3079,8 @@ fn scatter_slots_one_map(
     if let [(k, keys), (v, values)] = pairs
         && map.is_identity()
         && keys.val != values.val
+        && f.view_order(keys.val).is_none()
+        && f.view_order(values.val).is_none()
         && keys.width == values.width
         && k.width == keys.width
         && v.width == values.width
@@ -2928,6 +3158,9 @@ fn scatter_slots_one_map(
     // mapped), a page `[16, w]` as the pool lays it.
     if let [(src, plane)] = pairs
         && let Some((pool, Elem::Bf16)) = f.view_parts(plane.val)
+        // the kernel lays a page in the row-pair order (rows of one pool
+        // row or less as they lie)
+        && (f.view_order(plane.val).is_some_and(|o| o.tokens == ps) || w <= 256)
         && src.width == plane.width
         && f.elem(src.val) == Elem::Bf16
         && let Some(vmem_cap) = vmem_cap
@@ -2950,7 +3183,13 @@ fn scatter_slots_one_map(
                 vmem_cap,
             )?;
             let dims = f.dims(plane.val).to_vec();
-            Ok(vec![f.pool_view(laid[0], Elem::Bf16, &dims)?])
+            let order = f.view_order(plane.val);
+            Ok(vec![f.pool_view_ordered(
+                laid[0],
+                Elem::Bf16,
+                &dims,
+                order,
+            )?])
         });
         return Ok(f.case(which, &outs, vec![rows, pages, kernel])?);
     }

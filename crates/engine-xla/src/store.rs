@@ -354,6 +354,40 @@ fn layout_rows<'a>(
     ))
 }
 
+/// The row order a kv plane's pages lie in (`kernels_xla::hlo::PoolOrder`):
+/// part `j` (512 bytes) of a page's token `t` at row `j · T + t` of the
+/// page's block, so a page's kv heads each lie as one run of whole tiles.
+/// A token of one pool row or less lies as the rows lie (`None`: the order
+/// is the identity there). A kv row past one pool row that is not whole
+/// pool rows has no place in it: the load refuses it (no XLA kv kernel
+/// takes such rows: the catalog's are e4m3 latent rows of 576 bytes).
+fn kv_order(plane: &layout::Plane, pool_rows: u64) -> Result<Option<kernels_xla::hlo::PoolOrder>> {
+    if !matches!(plane.what, What::Keys { .. } | What::Values { .. }) {
+        return Ok(None);
+    }
+    let tokens = u64::from(plane.per);
+    let row_bytes = plane.run / tokens.max(1);
+    if row_bytes <= ROW_BYTES {
+        return Ok(None);
+    }
+    if !row_bytes.is_multiple_of(ROW_BYTES)
+        || plane.run != tokens * row_bytes
+        || !pool_rows.is_multiple_of(tokens * row_bytes / ROW_BYTES)
+    {
+        return Err(Fault::Unbound {
+            what: format!(
+                "kv plane {:?}: {row_bytes}-byte rows ({} of {:?}), which the pool's \
+                 row-pair order lays only as whole {ROW_BYTES}-byte rows",
+                plane.what, plane.width, plane.dtype
+            ),
+        });
+    }
+    Ok(Some(kernels_xla::hlo::PoolOrder {
+        tokens: tokens as i64,
+        rpt: (row_bytes / ROW_BYTES) as i64,
+    }))
+}
+
 /// Bytes the pool lays past the pages and state slots `pool_demand` counts:
 /// its null and sink chunks.
 pub fn reserved_bytes(
@@ -418,12 +452,12 @@ impl Pools {
         let mut views: Vec<(What, Tensor, Map)> = Vec::new();
         for shape in &layout.shapes {
             for plane in &shape.planes {
-                let t =
-                    handles
-                        .view(root, plane.dtype, plane.width)
-                        .map_err(|e| Fault::Unbound {
-                            what: format!("a view of pool plane {:?}: {e}", plane.what),
-                        })?;
+                let order = kv_order(plane, u64::from(pool_rows))?;
+                let t = handles
+                    .view_ordered(root, plane.dtype, plane.width, order)
+                    .map_err(|e| Fault::Unbound {
+                        what: format!("a view of pool plane {:?}: {e}", plane.what),
+                    })?;
                 views.push((plane.what, t, map_of(&layout, shape, plane)));
             }
         }

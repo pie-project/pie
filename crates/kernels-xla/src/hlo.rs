@@ -11,6 +11,7 @@ use std::fmt::{self, Write as _};
 
 mod view;
 pub use view::LANES as POOL_LANES;
+pub use view::Order as PoolOrder;
 
 /// Element types a StableHLO tensor holds.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -1130,7 +1131,7 @@ impl Func {
             return Ok(x);
         }
         if let Some(view) = self.views.get(&x.0).copied() {
-            return self.pool_view(view.pool, view.elem, dims);
+            return self.pool_view_ordered(view.pool, view.elem, dims, view.order);
         }
         Ok(self.op("reshape", &[x], "", to))
     }

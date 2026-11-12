@@ -337,3 +337,71 @@ pub fn scatter(f: &mut Func, pool: Val, at: Val, ups: Val, nr: i64) -> Built<Val
     })?;
     Ok(c.call_aliased(f, &[at, ups, pool], &[(0, 2)])?[0])
 }
+
+/// Tokens of a reordered pool (`crate::hlo::PoolOrder`) landed one DMA a
+/// token: token `i`'s `rpt` pool rows (`ups` `u32 [N · rpt, 1, 128]`, a row
+/// apiece) to pool rows `at[i] + j · tokens` (`at[i]`: its page block's
+/// start plus its slot; one past the pool, or negative, drops it).
+pub fn scatter_tokens(
+    f: &mut Func,
+    pool: Val,
+    at: Val,
+    ups: Val,
+    order: crate::hlo::PoolOrder,
+) -> Built<Val> {
+    let rows = f.dims(pool)[0];
+    let n = f.dims(at)[0];
+    let (t, rpt) = (order.tokens, order.rpt);
+    let kern = Kernel {
+        name: "pool_scatter_tokens".into(),
+        grid: vec![1],
+        semantics: vec![Sem::Arbitrary],
+        prefetch: vec![vec![n]],
+        ins: vec![
+            any(vec![n * rpt, 1, 128], Elem::U32),
+            any(vec![rows, 128], Elem::U32),
+        ],
+        outs: vec![any(vec![rows, 128], Elem::U32)],
+        vmem_limit: Some(VMEM),
+        scratch: vec![MTy::Sem(vec![1])],
+    };
+    let c = kern.build(|bd, blk| {
+        let ids = blk.grid.prefetch[0];
+        // the pool as [R / T, T, 128]: a token's rows one step of the
+        // leading axis apart
+        let dst = bd.ref_reshape(blk.outs[0], &[rows / t, t, 128])?;
+        let src = blk.ins[0];
+        let sem = blk.scratch[0];
+        let z = bd.i32(0);
+        let s = bd.ref_slice(sem, &[z], &[1])?;
+        let sem = bd.ref_squeeze(s)?;
+        let nv = bd.i32(n);
+        let one = bd.i32(1);
+        let copy = |bd: &mut Body, i: V, wait: bool| -> Built<()> {
+            let id = bd.load(ids, &[i])?;
+            let z = bd.i32(0);
+            let top = bd.i32(rows);
+            let ge = bd.cmpi(ICmp::Sge, id, z)?;
+            let lt = bd.cmpi(ICmp::Slt, id, top)?;
+            let ok = bd.andi(ge, lt)?;
+            bd.when(ok, |bd| {
+                let tv = bd.i32(t);
+                let blk_row = bd.divsi(id, tv)?;
+                let slot = bd.remsi(id, tv)?;
+                let rv = bd.i32(rpt);
+                let from = bd.muli(i, rv)?;
+                let z = bd.i32(0);
+                let s = bd.ref_slice(src, &[from, z, z], &[rpt, 1, 128])?;
+                let d = bd.ref_slice(dst, &[blk_row, slot, z], &[rpt, 1, 128])?;
+                if wait {
+                    bd.dma_wait(sem, s, d)
+                } else {
+                    bd.dma_start(s, d, sem)
+                }
+            })
+        };
+        bd.for_range(z, nv, one, |bd, i| copy(bd, i, false))?;
+        bd.for_range(z, nv, one, |bd, i| copy(bd, i, true))
+    })?;
+    Ok(c.call_aliased(f, &[at, ups, pool], &[(0, 2)])?[0])
+}

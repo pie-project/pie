@@ -16,8 +16,10 @@ use crate::tensor::PageMap;
 
 /// Where the kernel lands the rows: two planes of their own, or the keys
 /// and values planes of the chunk pool (`u32 [R, 128]`), each page `p` of
-/// the runs at its plane's page `map(p)`, in the pool's packed rows order
-/// (a page `[16, w]` as `[16 · w / 128, 128]`, reshaped in VMEM).
+/// the runs at its plane's page `map(p)`, as the pool lays a page: rows of
+/// whole 256-lane pairs in the row-pair order (`crate::hlo::PoolOrder`, u32
+/// row `c · 16 + t` the pair `c` of page row `t`), narrower rows packed (a
+/// page `[16, w]` as `[16 · w / 128, 128]` bf16, reshaped in VMEM).
 pub(crate) enum Planes {
     Two {
         keys: Val,
@@ -91,8 +93,8 @@ pub(crate) fn write(
         });
     }
     // `direct`: the pool's pages built as its own u32 rows (each row a pair
-    // of a page row's 128-lane blocks, low and high) and laid by sublane
-    // strided stores, with no relayout of the page in VMEM.
+    // of a page row's 128-lane blocks, low and high), a pair's 16 rows one
+    // run of the page, with no relayout of the page in VMEM.
     let direct = pooled.is_some() && kk % 2 == 0;
     let half = kk / 2;
     let (tile, laid_elem) = if direct {
@@ -290,7 +292,7 @@ pub(crate) fn write(
                     let held = slot_ref(b, old, x, j)?;
                     let dst = slot_ref(b, stage, x, j)?;
                     for c in 0..half {
-                        // u32 row 4p + c of the page: bf16 lane blocks 2c
+                        // u32 row c · 16 + p of the page: bf16 lane blocks 2c
                         // (low) and 2c + 1 (high) of page row p; a bf16's
                         // bits are its f32's top half
                         let a = b.slice(tile, &[0, 256 * c], &[PS, 128])?;
@@ -300,12 +302,13 @@ pub(crate) fn write(
                         let h = b.bitcast_v(h, Elem::I32)?;
                         let h = b.andi(h, high_v)?;
                         let mut u = b.ori(h, a)?;
-                        let ci = b.index(c);
+                        // the pair's rows one run of the page
+                        let ci = b.index(c * PS);
                         if merge {
-                            let o = b.strided_load(held, &[ci, i0], &[half, 1], &[PS, 128])?;
+                            let o = b.vload(held, &[ci, i0], &[PS, 128])?;
                             u = b.select(laid, u, o)?;
                         }
-                        b.strided_store(u, dst, &[ci, i0], &[half, 1])?;
+                        b.vstore(u, dst, &[ci, i0])?;
                     }
                     Ok(())
                 };

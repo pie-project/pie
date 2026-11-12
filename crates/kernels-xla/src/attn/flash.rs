@@ -688,6 +688,7 @@ impl Older {
         if let (Some((pool, Elem::Bf16)), Some((pool_v, Elem::Bf16))) =
             (f.view_parts(self.planes.0), f.view_parts(self.planes.1))
             && pool == pool_v
+            && f.view_order(self.planes.0).is_none()
             && crate::blocks::on()
             && std::env::var("PIE_XLA_OLDER_DMA").is_ok_and(|v| v == "1")
         {

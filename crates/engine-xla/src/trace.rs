@@ -120,6 +120,8 @@ pub fn packed_row_bytes(dtype: Dtype, width: u64) -> Option<u64> {
 struct Binding {
     root: u32,
     row_offset: u32,
+    /// A pool plane's row order (`kernels_xla::hlo::PoolOrder`).
+    order: Option<kernels_xla::hlo::PoolOrder>,
 }
 
 /// The root and handle tables. Roots and handles minted before [`seal`](Self::seal)
@@ -147,6 +149,7 @@ impl Handles {
         bindings.push(Binding {
             root: at,
             row_offset: 0,
+            order: None,
         });
         Tensor::new(bindings.len() as u32 - 1, root.rows, root.width, root.dtype)
     }
@@ -154,6 +157,18 @@ impl Handles {
     /// A handle over the whole of `t`'s root read as `width`-wide rows of
     /// `dtype`: a plane of the pool, as many rows as the root's bits hold.
     pub fn view(&self, t: Tensor, dtype: Dtype, width: u32) -> Result<Tensor, kernels_xla::Error> {
+        self.view_ordered(t, dtype, width, None)
+    }
+
+    /// [`Handles::view`] whose reads and writes lay the pool's rows in
+    /// `order`.
+    pub fn view_ordered(
+        &self,
+        t: Tensor,
+        dtype: Dtype,
+        width: u32,
+        order: Option<kernels_xla::hlo::PoolOrder>,
+    ) -> Result<Tensor, kernels_xla::Error> {
         let b = self.bindings.borrow()[t.buf as usize];
         let root = self.root_of(b.root);
         let probe = Tensor::new(t.buf, 0, width, dtype);
@@ -162,6 +177,7 @@ impl Handles {
         bindings.push(Binding {
             root: b.root,
             row_offset: 0,
+            order,
         });
         Ok(Tensor::new(bindings.len() as u32 - 1, rows, width, dtype))
     }
@@ -178,6 +194,7 @@ impl Handles {
         bindings.push(Binding {
             root: b.root,
             row_offset: b.row_offset + skip,
+            order: b.order,
         });
         Tensor::new(bindings.len() as u32 - 1, rows, t.width, t.dtype)
     }
@@ -187,6 +204,15 @@ impl Handles {
     pub fn locate(&self, buf: u32) -> Option<(u32, u32)> {
         let b = *self.bindings.borrow().get(buf as usize)?;
         Some((b.root, b.row_offset))
+    }
+
+    /// The row order a handle reads and writes its pool plane in.
+    #[must_use]
+    pub fn order_of(&self, buf: u32) -> Option<kernels_xla::hlo::PoolOrder> {
+        self.bindings
+            .borrow()
+            .get(buf as usize)
+            .and_then(|b| b.order)
     }
 
     #[must_use]
@@ -247,7 +273,7 @@ struct State {
     /// Each pool value read at another element and width, once: two planes
     /// of one view read the same value, so a kernel that scatters into both
     /// chains the second onto the first.
-    views: Vec<((Val, Dtype, u32), Val)>,
+    views: Vec<(ViewKey, Val)>,
 }
 
 impl<'h> Tracer<'h> {
@@ -447,7 +473,7 @@ struct Lens<'a> {
     written: &'a mut BTreeMap<u32, ()>,
     sums: &'a mut BTreeMap<u32, Val>,
     view_reads: &'a mut BTreeMap<u32, Val>,
-    views: &'a mut Vec<((Val, Dtype, u32), Val)>,
+    views: &'a mut Vec<(ViewKey, Val)>,
 }
 
 impl Lens<'_> {
@@ -480,11 +506,12 @@ impl Env for Lens<'_> {
             self.view_reads.insert(t.buf, whole);
         }
         let rows = view_rows(r, t)?;
-        let key = (whole, t.dtype, t.width);
+        let order = self.handles.order_of(t.buf);
+        let key = (whole, t.dtype, t.width, order);
         let whole = match self.views.iter().find(|(held, _)| *held == key) {
             Some(&(_, v)) if r.source.persistent() => v,
             _ => {
-                let v = reinterpret(f, whole, r, t)?;
+                let v = reinterpret(f, whole, r, t, order)?;
                 if r.source.persistent() && (t.width != r.width || t.dtype != r.dtype) {
                     self.views.push((key, v));
                 }
@@ -529,7 +556,7 @@ impl Env for Lens<'_> {
                 return Ok(());
             }
             self.stale(root, t)?;
-            let next = unview(f, v, r)?;
+            let next = unview(f, v, r, self.handles.order_of(t.buf))?;
             self.current.insert(root, next);
             self.sums.remove(&root);
             self.view_reads.insert(t.buf, next);
@@ -631,9 +658,14 @@ fn is_pool(root: Root) -> bool {
 }
 
 /// A view's whole value back as its root's: the inverse of [`reinterpret`].
-fn unview(f: &mut Func, v: Val, root: Root) -> Result<Val, kernels_xla::Error> {
+fn unview(
+    f: &mut Func,
+    v: Val,
+    root: Root,
+    order: Option<kernels_xla::hlo::PoolOrder>,
+) -> Result<Val, kernels_xla::Error> {
     if is_pool(root) {
-        return Ok(f.pool_of(v, f.elem(v))?);
+        return Ok(f.pool_of_ordered(v, f.elem(v), order)?);
     }
     let want =
         storage(root.dtype, root.rows, root.width).ok_or_else(|| kernels_xla::Error::Backend {
@@ -653,7 +685,17 @@ fn unview(f: &mut Func, v: Val, root: Root) -> Result<Val, kernels_xla::Error> {
 
 /// A handle may view its root under another width or element: a packed
 /// weight read as raw bytes, a pool plane read out of the one pool.
-fn reinterpret(f: &mut Func, v: Val, root: Root, t: Tensor) -> Result<Val, kernels_xla::Error> {
+/// A cached view: the root value, the element and width it is read at,
+/// and its row order.
+type ViewKey = (Val, Dtype, u32, Option<kernels_xla::hlo::PoolOrder>);
+
+fn reinterpret(
+    f: &mut Func,
+    v: Val,
+    root: Root,
+    t: Tensor,
+    order: Option<kernels_xla::hlo::PoolOrder>,
+) -> Result<Val, kernels_xla::Error> {
     if t.width == root.width && t.dtype == root.dtype {
         return Ok(v);
     }
@@ -663,7 +705,7 @@ fn reinterpret(f: &mut Func, v: Val, root: Root, t: Tensor) -> Result<Val, kerne
     {
         // Never the whole pool at another element: a lazy view whose reads
         // and writes go by pool rows (`kernels_xla::hlo` view).
-        return Ok(f.pool_view(v, ty.elem, &ty.dims)?);
+        return Ok(f.pool_view_ordered(v, ty.elem, &ty.dims, order)?);
     }
     match want {
         Some(ty)
