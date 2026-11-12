@@ -304,7 +304,9 @@ impl Run<'_> {
                 let gate_v = l.read(self.tensor(*gate))?;
                 let up_v = l.read(self.tensor(*up))?;
                 let o_y = self.tensor(*y);
+                let from = l.tuning().glu_land_from;
                 let v = linear::mlp::geglu_tanh(l.f(), gate_v, up_v, o_y.landing())?;
+                let v = glu_landed(l.f(), v, o_y, from);
                 l.land(o_y, v)
             }),
             Linear::GeluTanh { x, y } => crate::lower::lower(self.ctx(), |l| {
@@ -379,8 +381,10 @@ impl Run<'_> {
             } => crate::lower::lower(self.ctx(), |l| {
                 let packed_v = l.read(self.tensor(*packed))?;
                 let o_y = self.tensor(*y);
+                let from = l.tuning().glu_land_from;
                 let v =
                     linear::mlp::geglu_tanh_packed(l.f(), packed_v, *intermediate, o_y.landing())?;
+                let v = glu_landed(l.f(), v, o_y, from);
                 l.land(o_y, v)
             }),
             Linear::Glu {
@@ -834,4 +838,19 @@ impl Run<'_> {
             }),
         }
     }
+}
+
+/// A GeGLU of `from` rows and more lands in bf16 behind a barrier
+/// (`kernel.glu.land_from`): XLA fuses it into no dot that reads it.
+fn glu_landed(
+    f: &mut kernels_xla::hlo::Func,
+    v: kernels_xla::hlo::Val,
+    y: crate::handle::Tensor,
+    from: i64,
+) -> kernels_xla::hlo::Val {
+    if from == 0 || i64::from(y.rows) < from || y.dtype != dtype::Dtype::Bf16 {
+        return v;
+    }
+    let v = f.convert(v, kernels_xla::hlo::Elem::Bf16);
+    f.barrier(v)
 }

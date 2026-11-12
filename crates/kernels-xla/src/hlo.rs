@@ -1075,6 +1075,13 @@ impl Func {
         self.op("convert", &[x], "", ty)
     }
 
+    /// `x` through `stablehlo.optimization_barrier`: XLA fuses nothing
+    /// across it, so `x` lands as a buffer of its own.
+    pub fn barrier(&mut self, x: Val) -> Val {
+        let ty = self.ty(x).clone();
+        self.op("optimization_barrier", &[x], "", ty)
+    }
+
     /// Reinterprets bits. Same width keeps the shape; a narrower target grows
     /// a trailing axis, a wider one consumes it.
     pub fn bitcast(&mut self, x: Val, elem: Elem) -> Built<Val> {

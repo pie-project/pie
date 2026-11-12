@@ -32,6 +32,9 @@ moe.gmm_glu = 1
 moe.gmm_fuse_from = 1024
 # a decode of 64 rows and more reads each row's own pages through the page-copy kernel
 attn.decode_pages = 64
+# a prompt's GeGLU rows land before the down dot reads them, not fused into its operand (Gemma-4-31B cut's
+# 2304-row fire 74.8 -> 72.2 ms, pf256-512 28.3k -> 29.3k tok/s)
+glu.land_from = 1024
 
 [provenance]
 measured = [
@@ -41,6 +44,7 @@ measured = [
   "kernel.attn.budget_mi",
   "kernel.attn.decode_pages",
   "kernel.attn.per_row_max",
+  "kernel.glu.land_from",
   "kernel.moe.cost.dense_all_mi",
   "kernel.moe.cost.loop_row_ns",
   "kernel.moe.cost.loop_tile_ns",
