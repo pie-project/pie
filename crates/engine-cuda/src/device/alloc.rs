@@ -569,6 +569,8 @@ enum Origin {
     /// A cell of the pinned heap, of this class (`device::held::heap`).
     #[cfg_attr(not(feature = "device"), allow(dead_code))]
     Carved(usize),
+    /// Pageable memory no fire reads ([`Pinned::pageable`]).
+    Pageable,
 }
 
 // SAFETY: concurrent-access soundness comes from the channel's SPSC discipline above this type (guest and engine each own one control word), not from anything here; moving the allocation is as sound as a `Box<[u8]>`.
@@ -590,6 +592,49 @@ impl Pinned {
 
     pub fn mapped(bytes: usize) -> Result<Pinned> {
         Pinned::alloc(bytes, true)
+    }
+
+    /// `bytes` of pageable host memory, zero until written (a private
+    /// anonymous mapping, its pages made as they are first touched): a copy
+    /// no fire reads in place, the device copying out of it alone, whose
+    /// address it takes as any host address (`device` is the host address).
+    /// Nothing is pinned, so a span of gigabytes costs no page-locking.
+    #[cfg(unix)]
+    pub fn pageable(bytes: usize) -> Result<Pinned> {
+        if bytes == 0 {
+            return Ok(Pinned::empty());
+        }
+        // SAFETY: a fresh private anonymous mapping of a stated length; no
+        // fd, no offset, owned by this structure and unmapped once in `Drop`.
+        let at = unsafe {
+            libc::mmap(
+                core::ptr::null_mut(),
+                bytes,
+                libc::PROT_READ | libc::PROT_WRITE,
+                libc::MAP_PRIVATE | libc::MAP_ANONYMOUS | libc::MAP_NORESERVE,
+                -1,
+                0,
+            )
+        };
+        if at == libc::MAP_FAILED {
+            return Err(Fault::Residency(format!(
+                "this machine would not map {bytes} bytes of host memory for the weights' copy"
+            )));
+        }
+        // Huge pages where the kernel gives them on asking: a copy of tens
+        // of gigabytes first touched a 4 KiB page at a time faults millions
+        // of times.
+        // SAFETY: advice on the mapping just made; it changes no contents.
+        unsafe {
+            libc::madvise(at, bytes, libc::MADV_HUGEPAGE);
+        }
+        pageable_spans().push((at as usize, bytes));
+        Ok(Pinned {
+            host: at.cast(),
+            device: at as u64,
+            bytes,
+            origin: Origin::Pageable,
+        })
     }
 
     pub fn mapped_uninit(bytes: usize) -> Result<Pinned> {
@@ -758,6 +803,10 @@ impl Drop for Pinned {
             }
             #[cfg(not(feature = "device"))]
             Origin::Allocated => {}
+            Origin::Pageable => {
+                pageable_spans().retain(|&(at, _)| at != self.host as usize);
+                unmap_anon(self.host, self.bytes);
+            }
         }
     }
 }
@@ -1232,6 +1281,24 @@ pub fn free_bytes() -> Option<u64> {
     }
 }
 
+/// The spans [`Pinned::pageable`] mapped and holds: anonymous memory, which
+/// advice that lets a file's pages go would zero.
+fn pageable_spans() -> std::sync::MutexGuard<'static, Vec<(usize, usize)>> {
+    static SPANS: std::sync::Mutex<Vec<(usize, usize)>> = std::sync::Mutex::new(Vec::new());
+    SPANS
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+/// Whether `at` lies in a pageable copy [`Pinned::pageable`] made.
+#[must_use]
+pub fn in_pageable_copy(at: u64) -> bool {
+    let at = at as usize;
+    pageable_spans()
+        .iter()
+        .any(|&(start, bytes)| at >= start && at < start + bytes)
+}
+
 #[must_use]
 pub fn is_host_pointer(at: u64) -> bool {
     #[cfg(feature = "device")]
@@ -1243,7 +1310,16 @@ pub fn is_host_pointer(at: u64) -> bool {
         // looked up, never dereferenced, so any value is a valid query.
         let asked =
             unsafe { rt::cudaPointerGetAttributes(&raw mut attrs, at as *const core::ffi::c_void) };
-        asked == rt::cudaError::cudaSuccess && attrs.type_ == rt::cudaMemoryType::cudaMemoryTypeHost
+        // Pinned host memory, or pageable memory CUDA never registered (a
+        // pageable weights copy, `Pinned::pageable`), which it reports as
+        // unregistered: host memory either way.
+        at != 0
+            && asked == rt::cudaError::cudaSuccess
+            && matches!(
+                attrs.type_,
+                rt::cudaMemoryType::cudaMemoryTypeHost
+                    | rt::cudaMemoryType::cudaMemoryTypeUnregistered
+            )
     }
     #[cfg(not(feature = "device"))]
     {

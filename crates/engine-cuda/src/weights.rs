@@ -676,6 +676,7 @@ impl Weights {
         stream: *mut core::ffi::c_void,
         target: StorageTarget,
         decode_dense: bool,
+        held: bool,
     ) -> Result<Weights> {
         let (metadata, snapshot) = if path.is_dir() {
             (parse_metadata(path)?, path)
@@ -713,7 +714,12 @@ impl Weights {
                     true => crate::experts::Fill::Restored,
                     false => crate::experts::Fill::Cold,
                 };
-                Some(crate::experts::Tier::open(plan.clone(), source, fill)?)
+                Some(crate::experts::Tier::open(
+                    plan.clone(),
+                    source,
+                    fill,
+                    held,
+                )?)
             }
             false => None,
         };
@@ -1204,7 +1210,35 @@ impl Weights {
         Ok(done)
     }
 
-    /// `kernel.moe.mxfp4_fp8_from`: each resident MXFP4 bank a W4A8 select
+    /// A bank's codes and scales on the device: `None` where both lie there
+    /// already, else one buffer holding them staged from the host copy the
+    /// weight cache or a tier keeps (codes, then scales).
+    #[cfg(feature = "cuda")]
+    fn staged_planes(
+        &self,
+        at: usize,
+        codes: u64,
+        code_bytes: usize,
+        scales: u64,
+        scale_bytes: usize,
+        stream: *mut core::ffi::c_void,
+    ) -> Result<Option<Buffer>> {
+        let off = self
+            .experts
+            .as_ref()
+            .is_some_and(|tier| tier.offloaded_at(at).is_some())
+            || crate::device::alloc::is_host_pointer(codes)
+            || crate::device::alloc::is_host_pointer(scales);
+        if !off {
+            return Ok(None);
+        }
+        let held = Buffer::zeroed_on(stream, code_bytes + scale_bytes)?;
+        crate::device::copy_any(stream, held.ptr(), codes, code_bytes)?;
+        crate::device::copy_any(stream, held.ptr() + code_bytes as u64, scales, scale_bytes)?;
+        Ok(Some(held))
+    }
+
+    /// `kernel.moe.mxfp4_fp8_from`: each MXFP4 bank a W4A8 select
     /// reads keeps an fp8b128 copy, widened once here, that wide selects
     /// read on the FP8 MMA. Returns the banks it widened.
     #[cfg(feature = "cuda")]
@@ -1266,29 +1300,27 @@ impl Weights {
             }
             let rows: u64 = shape[..shape.len() - 2].iter().product();
             let k = shape[shape.len() - 2] * 32;
-            // A bank off the device (the weight cache's, or a tier's) has
-            // no copy: its mapped planes are no device pointer.
-            if self
-                .experts
-                .as_ref()
-                .is_some_and(|tier| tier.offloaded_at(at).is_some())
-                || crate::device::alloc::is_host_pointer(codes.ptr)
-                || crate::device::alloc::is_host_pointer(scales.ptr)
-                || rows == 0
-                || !rows.is_multiple_of(128)
-                || !k.is_multiple_of(128)
-            {
+            if rows == 0 || !rows.is_multiple_of(128) || !k.is_multiple_of(128) {
                 continue;
             }
             let (r, kk) = (rows as usize, k as usize);
+            // A bank the weight cache takes (or a tier holds) keeps the copy
+            // all the same, widened from its host copy staged on the device:
+            // its wide fires read the copy whether its experts are held or
+            // streamed.
+            let staged =
+                self.staged_planes(at, codes.ptr, r * kk / 2, scales.ptr, r * kk / 32, stream)?;
+            let (codes_at, scales_at) = staged.as_ref().map_or((codes.ptr, scales.ptr), |held| {
+                (held.ptr(), held.ptr() + (r * kk / 2) as u64)
+            });
             let to32 = |v: u64| u32::try_from(v).unwrap_or(u32::MAX);
             let atom_bytes = kernels_cuda::linear::gemm_sm100::atom_bytes(r, kk, 128);
             let buffer = Buffer::zeroed_on(stream, r * kk + atom_bytes)?;
             let wide = Buffer::zeroed_on(stream, r * kk * 2)?;
             kernels_cuda::linear::moe::mxfp4_to_fp8b128(
                 &ctx,
-                codes.ptr,
-                scales.ptr,
+                codes_at,
+                scales_at,
                 to32(rows),
                 to32(k),
                 wide.ptr(),
@@ -1297,6 +1329,7 @@ impl Weights {
             )?;
             crate::device::ctx::sync(stream)?;
             drop(wide);
+            drop(staged);
             self.table.3.insert(
                 at,
                 (
@@ -1395,17 +1428,7 @@ impl Weights {
             }
             let rows: u64 = shape[..shape.len() - 2].iter().product();
             let k = shape[shape.len() - 2] * 32;
-            // A bank off the device (the weight cache's, or a tier's) has
-            // no copy: its mapped planes are no device pointer.
-            if self
-                .experts
-                .as_ref()
-                .is_some_and(|tier| tier.offloaded_at(at).is_some())
-                || crate::device::alloc::is_host_pointer(codes.ptr)
-                || crate::device::alloc::is_host_pointer(scales.ptr)
-                || rows == 0
-                || !k.is_multiple_of(64)
-            {
+            if rows == 0 || !k.is_multiple_of(64) {
                 return None;
             }
             Some((at, codes, scales, rows, k))
@@ -1427,16 +1450,24 @@ impl Weights {
         let mut done = 0;
         for (at, codes, scales, rows, k) in picked {
             let to32 = |v: u64| u32::try_from(v).unwrap_or(u32::MAX);
+            // A bank off the device widens from its host copy staged there.
+            let (r, kk) = (rows as usize, k as usize);
+            let staged =
+                self.staged_planes(at, codes.ptr, r * kk / 2, scales.ptr, r * kk / 32, stream)?;
+            let (codes_at, scales_at) = staged.as_ref().map_or((codes.ptr, scales.ptr), |held| {
+                (held.ptr(), held.ptr() + (r * kk / 2) as u64)
+            });
             let buffer = Buffer::zeroed_on(stream, (rows * k * 2) as usize)?;
             kernels_cuda::linear::moe::mxfp4_to_bf16(
                 &ctx,
-                codes.ptr,
-                scales.ptr,
+                codes_at,
+                scales_at,
                 to32(rows),
                 to32(k),
                 buffer.ptr(),
             )?;
             crate::device::ctx::sync(stream)?;
+            drop(staged);
             self.table.3.insert(
                 at,
                 (
@@ -1928,10 +1959,171 @@ fn lay_atoms(
     Ok(())
 }
 
-/// Each released 128x128-block FP8 expert bank's f32 factors requantized in place
-/// to ue8m0 exponents (as vLLM's DeepGEMM path on Blackwell), spread into tcgen05
-/// atoms a weight row an atom row, in a buffer bound in the factors' place; an
-/// MXFP8 bank's e8m0 exponents (one a 1x32 block of each row) spread as they are.
+/// A plane whose scales the load lays in atoms (`lay_tile_banks`): a
+/// released block-FP8 plane's f32 factors (one a 128x128 block, or a 128
+/// along each row) requantized to ue8m0 exponents with its codes, or an
+/// MXFP8 plane's e8m0 exponents (one a 1x32 block of each row) as they are,
+/// spread a weight row an atom row.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct Laid {
+    /// The codes' param.
+    pub codes: usize,
+    /// The scales' param, whose laid bytes are its atoms.
+    pub scales: usize,
+    /// The weight rows a factor covers (128 or 1); 0, exponents laid as
+    /// they are (MXFP8).
+    pub per: u64,
+    /// The K a scale covers (128 or 32).
+    pub gran: u64,
+    /// Rows a lead index holds (an expert's, for a routed bank), and K.
+    pub rows: u64,
+    pub k: u64,
+    /// Lead indices (a routed bank's experts; 1 for a projection).
+    pub leads: u64,
+}
+
+impl Laid {
+    /// The atoms of `rows` weight rows (`gemm_sm100::atom_bytes`: a 128-row
+    /// block's four scale columns 512 bytes).
+    #[must_use]
+    pub fn atom_bytes(&self, rows: u64) -> u64 {
+        rows.div_ceil(128) * self.k.div_ceil(self.gran).div_ceil(4) * 512
+    }
+}
+
+/// Every plane of `trace` whose scales the load lays in atoms.
+#[cfg(feature = "cuda")]
+pub(crate) fn laid_planes(trace: &Trace) -> Vec<Laid> {
+    let mut out = Vec::new();
+    for (at, gran) in act_quant_banks(trace) {
+        let param = &trace.params[at];
+        let per: u64 = match param.dtype {
+            Dtype::E4m3 | Dtype::E4m3tile128 if gran == 32 => 0,
+            Dtype::E4m3 | Dtype::E4m3tile128 => 128,
+            Dtype::E4m3g128 => 1,
+            _ => continue,
+        };
+        let (rows, k, leads) = match param.shape.as_slice() {
+            &[n, k] => (n, k, 1),
+            &[e, n, k] => (n, k, e),
+            _ => continue,
+        };
+        if rows == 0 || k == 0 || !rows.is_multiple_of(128) || !k.is_multiple_of(128) {
+            continue;
+        }
+        let name = poem::scales_name(&param.name);
+        let Some(scales) = trace.params.iter().position(|p| p.name == name) else {
+            continue;
+        };
+        out.push(Laid {
+            codes: at,
+            scales,
+            per,
+            gran: u64::from(gran),
+            rows,
+            k,
+            leads,
+        });
+    }
+    out
+}
+
+#[cfg(not(feature = "cuda"))]
+pub(crate) fn laid_planes(_: &Trace) -> Vec<Laid> {
+    Vec::new()
+}
+
+/// [`plane_bytes`], each laid plane's scales at their atoms' bytes: what a
+/// host copy and a slot of it hold.
+pub(crate) fn laid_bytes(trace: &Trace) -> Result<Vec<u64>> {
+    let mut bytes = plane_bytes(trace)?;
+    for laid in laid_planes(trace) {
+        bytes[laid.scales] = laid.leads * laid.atom_bytes(laid.rows);
+    }
+    Ok(bytes)
+}
+
+/// `trace` with each laid plane's scales restated as their atoms' bytes
+/// (`u8`, `[leads, bytes a lead]`): the trace a cache's recipe lays slots by.
+pub(crate) fn laid_view(trace: &Trace) -> std::borrow::Cow<'_, Trace> {
+    let laid = laid_planes(trace);
+    if laid.is_empty() {
+        return std::borrow::Cow::Borrowed(trace);
+    }
+    let mut view = trace.clone();
+    for laid in laid {
+        let param = &mut view.params[laid.scales];
+        param.dtype = Dtype::U8;
+        // A lead's atoms as its 128-row blocks, each a block's atoms: the
+        // rows a TMA map of them indexes (`poem_compiler::chunk::tma_rows`).
+        param.shape = if laid.leads > 1 || trace.params[laid.scales].shape.len() > 2 {
+            let blocks = laid.rows.div_ceil(128).max(1);
+            vec![laid.leads, blocks, laid.atom_bytes(laid.rows) / blocks]
+        } else {
+            vec![laid.atom_bytes(laid.rows)]
+        };
+    }
+    std::borrow::Cow::Owned(view)
+}
+
+/// Lays `rows` weight rows of `laid` in place on the device: `codes`
+/// requantized under `factors` (a block-FP8 plane) and the exponents spread
+/// into `atoms`, or (MXFP8) `factors`' exponents spread as they are.
+#[cfg(feature = "cuda")]
+fn lay_rows(
+    ctx: &kernels_cuda::Ctx,
+    stream: *mut core::ffi::c_void,
+    laid: &Laid,
+    codes: u64,
+    factors: u64,
+    atoms: u64,
+    rows: u64,
+) -> Result<()> {
+    let to32 = |v: u64| u32::try_from(v).unwrap_or(u32::MAX);
+    if laid.per == 0 {
+        kernels_cuda::linear::act_quant::scales_to_atoms(
+            ctx,
+            "linear.act_quant",
+            factors,
+            atoms,
+            to32(rows),
+            to32(laid.k / 32),
+            1,
+        )?;
+        return Ok(());
+    }
+    let blocks_k = laid.k / 128;
+    let exps = Buffer::zeroed(usize::try_from(rows / laid.per * blocks_k).unwrap_or(usize::MAX))?;
+    kernels_cuda::linear::act_quant::fp8_tile_requant(
+        ctx,
+        "linear.act_quant",
+        codes,
+        factors,
+        exps.ptr(),
+        to32(rows),
+        to32(laid.k),
+        to32(laid.per),
+    )?;
+    kernels_cuda::linear::act_quant::scales_to_atoms(
+        ctx,
+        "linear.act_quant",
+        exps.ptr(),
+        atoms,
+        to32(rows),
+        to32(blocks_k),
+        to32(laid.per),
+    )?;
+    // The exponents are freed past here.
+    crate::device::ctx::sync(stream)?;
+    Ok(())
+}
+
+/// Each laid plane's scales in atoms (as vLLM's DeepGEMM path on Blackwell
+/// requantizes a released 128x128-block FP8 bank), bound in the scales'
+/// place as raw `u8` scales. A plane on the device lays into a buffer of
+/// its own; one a host copy holds (a bank the weight cache takes) lays in
+/// place, a few leads at a time staged on the device, its atoms where its
+/// scales lay (the copy is sized for them, [`laid_bytes`]).
 #[cfg(feature = "cuda")]
 fn lay_tile_banks(
     trace: &Trace,
@@ -1939,87 +2131,90 @@ fn lay_tile_banks(
     held: &mut Vec<Buffer>,
     stream: *mut core::ffi::c_void,
 ) -> Result<()> {
-    for (at, gran) in act_quant_banks(trace) {
-        // A factor a 128x128 block, or (`e4m3g128`, a per-channel release) a
-        // factor a 128 along each row; an MXFP8 bank's exponents (`gran` 32)
-        // one a 1x32 block of each row.
-        let per: u64 = match trace.params[at].dtype {
-            Dtype::E4m3 | Dtype::E4m3tile128 => 128,
-            Dtype::E4m3g128 => 1,
-            _ => continue,
-        };
+    // The codes a staged pass lays at most.
+    const STAGED: u64 = 256 << 20;
+    // SAFETY: `stream` is the load's stream, live for the load.
+    let ctx = unsafe { kernels_cuda::Ctx::on(stream.cast()) };
+    let to32 = |v: u64| u32::try_from(v).unwrap_or(u32::MAX);
+    for laid in laid_planes(trace) {
         let Some(Some(WeightRow::Planes {
             codes,
             scales,
             atoms,
             ..
-        })) = table.get_mut(at)
+        })) = table.get_mut(laid.codes)
         else {
             continue;
         };
-        let shape = &trace.params[at].shape;
-        let (&k, lead) = shape.split_last().unwrap_or((&0, &[]));
-        let rows: u64 = lead.iter().product();
-        let gran = u64::from(gran);
-        if rows == 0 || k == 0 || !rows.is_multiple_of(128) || !k.is_multiple_of(128) {
+        if *atoms {
             continue;
         }
-        // The factors plane is bound as bytes; its param states it f32.
-        if *atoms
-            || crate::device::alloc::is_host_pointer(codes.ptr)
-            || crate::device::alloc::is_host_pointer(scales.ptr)
-        {
-            continue;
-        }
-        let to32 = |v: u64| u32::try_from(v).unwrap_or(u32::MAX);
-        let bytes =
-            kernels_cuda::linear::gemm_sm100::atom_bytes(rows as usize, k as usize, gran as usize);
-        let laid = Buffer::zeroed(bytes)?;
-        // SAFETY: `stream` is the load's stream, live for the load.
-        let ctx = unsafe { kernels_cuda::Ctx::on(stream.cast()) };
-        if gran == 32 {
-            kernels_cuda::linear::act_quant::scales_to_atoms(
+        let rows = laid.leads * laid.rows;
+        let width = to32(if laid.per == 0 {
+            laid.k / 32
+        } else {
+            laid.k / 128
+        });
+        let host = crate::device::alloc::is_host_pointer(codes.ptr)
+            || crate::device::alloc::is_host_pointer(scales.ptr);
+        if !host {
+            let buffer =
+                Buffer::zeroed(usize::try_from(laid.atom_bytes(rows)).unwrap_or(usize::MAX))?;
+            lay_rows(
                 &ctx,
-                "linear.act_quant",
+                stream,
+                &laid,
+                codes.ptr,
                 scales.ptr,
-                laid.ptr(),
-                to32(rows),
-                to32(k / 32),
-                1,
+                buffer.ptr(),
+                rows,
             )?;
-            *scales = Tensor::new(laid.ptr(), to32(rows), to32(k / 32), Dtype::U8);
-            *codes = Tensor::new(codes.ptr, codes.rows, codes.width, Dtype::E4m3);
-            *atoms = true;
             crate::device::ctx::sync(stream)?;
-            held.push(laid);
-            continue;
+            *scales = Tensor::new(buffer.ptr(), to32(rows), width, Dtype::U8);
+            held.push(buffer);
+        } else {
+            // The whole bank's factors first: its atoms overwrite them.
+            let factor_bytes = plane_bytes(trace)?[laid.scales];
+            let factors = Buffer::zeroed(usize::try_from(factor_bytes).unwrap_or(usize::MAX))?;
+            crate::device::copy_any(stream, factors.ptr(), scales.ptr, factors.bytes())?;
+            let lead_codes = laid.rows * laid.k;
+            let lead_factors = factor_bytes / laid.leads;
+            let lead_atoms = laid.atom_bytes(laid.rows);
+            let step = (STAGED / lead_codes.max(1)).clamp(1, laid.leads);
+            let staged_codes =
+                Buffer::zeroed(usize::try_from(step * lead_codes).unwrap_or(usize::MAX))?;
+            let staged_atoms =
+                Buffer::zeroed(usize::try_from(step * lead_atoms).unwrap_or(usize::MAX))?;
+            let mut first = 0;
+            while first < laid.leads {
+                let count = step.min(laid.leads - first);
+                let code_bytes = usize::try_from(count * lead_codes).unwrap_or(usize::MAX);
+                let atom_bytes = usize::try_from(count * lead_atoms).unwrap_or(usize::MAX);
+                let codes_at = codes.ptr + first * lead_codes;
+                crate::device::copy_any(stream, staged_codes.ptr(), codes_at, code_bytes)?;
+                lay_rows(
+                    &ctx,
+                    stream,
+                    &laid,
+                    staged_codes.ptr(),
+                    factors.ptr() + first * lead_factors,
+                    staged_atoms.ptr(),
+                    count * laid.rows,
+                )?;
+                crate::device::copy_any(stream, codes_at, staged_codes.ptr(), code_bytes)?;
+                crate::device::copy_any(
+                    stream,
+                    scales.ptr + first * lead_atoms,
+                    staged_atoms.ptr(),
+                    atom_bytes,
+                )?;
+                crate::device::ctx::sync(stream)?;
+                first += count;
+            }
+            *scales = Tensor::new(scales.ptr, to32(rows), width, Dtype::U8);
         }
-        let blocks_k = k / 128;
-        let exps = Buffer::zeroed(usize::try_from(rows / per * blocks_k).unwrap_or(usize::MAX))?;
-        kernels_cuda::linear::act_quant::fp8_tile_requant(
-            &ctx,
-            "linear.act_quant",
-            codes.ptr,
-            scales.ptr,
-            exps.ptr(),
-            to32(rows),
-            to32(k),
-            to32(per),
-        )?;
-        kernels_cuda::linear::act_quant::scales_to_atoms(
-            &ctx,
-            "linear.act_quant",
-            exps.ptr(),
-            laid.ptr(),
-            to32(rows),
-            to32(blocks_k),
-            to32(per),
-        )?;
-        *scales = Tensor::new(laid.ptr(), to32(rows), to32(blocks_k), Dtype::U8);
         *codes = Tensor::new(codes.ptr, codes.rows, codes.width, Dtype::E4m3);
         *atoms = true;
-        crate::device::ctx::sync(stream)?;
-        held.push(laid);
     }
     Ok(())
 }

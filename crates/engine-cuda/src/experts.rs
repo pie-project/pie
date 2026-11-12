@@ -272,13 +272,18 @@ impl Plan {
     /// bytes it freed.
     pub fn host_rows(&mut self, trace: &Trace, params: &[usize]) -> Result<u64> {
         let bytes = crate::weights::plane_bytes(trace)?;
+        // A plane the load lays in another form (scales laid in atoms) is
+        // laid in place in its copy, sized for what it becomes.
+        let laid = crate::weights::laid_bytes(trace)?;
         let mut freed = 0u64;
         for &at in params {
             let param = &trace.params[at];
             if param.source != ParamSource::Checkpoint || self.streamed_whole(at) {
                 continue;
             }
-            let reserved = bytes[at].next_multiple_of(crate::weights::ALIGN);
+            let reserved = bytes[at]
+                .max(laid[at])
+                .next_multiple_of(crate::weights::ALIGN);
             self.groups.push(GroupPlan {
                 param: at,
                 name: param.name.clone(),
@@ -665,10 +670,16 @@ pub struct Tier {
 }
 
 impl Tier {
-    pub fn open(plan: Plan, source: Option<Spill>, fill: Fill) -> Result<Tier> {
+    /// `held`: the load is told its weights are held, so every bank lands
+    /// in pool slots before any fire and no fire reads this copy in place;
+    /// it is pageable, the device copying out of it alone (page-locking a
+    /// copy of tens of gigabytes took longer than reading it: 14.7 s of a
+    /// held Qwen3-30B-A3B-FP8's boot on an L40S).
+    pub fn open(plan: Plan, source: Option<Spill>, fill: Fill, held: bool) -> Result<Tier> {
         let layout = plan.host_layout();
         let want = usize::try_from(plan.host_image()).unwrap_or(usize::MAX);
         let host = match fill {
+            _ if held => Pinned::pageable(want)?,
             Fill::Cold => Pinned::mapped(want)?,
             Fill::Restored => Pinned::mapped_uninit(want)?,
         };

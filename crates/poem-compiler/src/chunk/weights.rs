@@ -147,12 +147,21 @@ pub(super) struct Group {
     /// Experts: the most a token's route picks.
     top_k: u64,
     banks: Vec<WeightBank>,
+    /// What a slot's bytes are a whole number of: the lcm of its planes'
+    /// boundaries where the profile lays them on their TMA rows, else 1.
+    boundary: u64,
 }
 
 impl Group {
     /// The bytes of an atom whole, aligned.
     pub(super) fn whole(&self, align: u64) -> u64 {
-        align_up(self.atom_bytes, align)
+        align_up(self.atom_bytes, lcm(align.max(1), self.boundary.max(1)))
+    }
+
+    /// What a chunk holding this group's slots is a whole number of, so every
+    /// slot's planes lie on their boundaries past the pool's base (1: none).
+    pub(super) fn boundary(&self) -> u64 {
+        self.boundary
     }
 
     pub(super) fn is_expert(&self) -> bool {
@@ -187,6 +196,52 @@ pub fn plane_bytes(param: &Param) -> u64 {
     }
 }
 
+fn gcd(a: u64, b: u64) -> u64 {
+    if b == 0 { a } else { gcd(b, a % b) }
+}
+
+pub(super) fn lcm(a: u64, b: u64) -> u64 {
+    if a == 0 || b == 0 {
+        a.max(b)
+    } else {
+        a / gcd(a, b) * b
+    }
+}
+
+/// The rows a TMA map of an expert plane, `param` of a bank whose planes
+/// are `bank`, indexes it by (an entry's row past its table's window is its
+/// offset over the plane's bytes an expert over these): its rows (axis 1),
+/// or for the scales of a bank's codes, rows alike, its 128-row blocks,
+/// which the tcgen05 kernels read in atoms (a block-FP8 bank's laid scales
+/// state their blocks as their rows already). 0: none.
+#[must_use]
+pub fn tma_rows(trace: &Trace, param: usize, bank: &[usize]) -> u64 {
+    let plane = &trace.params[param];
+    let rows = plane.shape.get(1).copied().unwrap_or(0);
+    let scales = bank.iter().any(|&codes| {
+        poem::declare::scales_name(&trace.params[codes].name) == plane.name
+            && trace.params[codes].shape.get(1).copied() == Some(rows)
+    });
+    if scales && rows.is_multiple_of(128) {
+        rows / 128
+    } else {
+        rows
+    }
+}
+
+/// The boundary an expert plane of `bytes` an expert lies on in its slot
+/// where the profile lays planes on their TMA rows: its row (`bytes` over
+/// [`tma_rows`]) and 16 bytes (a vector load) both, or 16 where it states no
+/// row.
+#[must_use]
+pub fn plane_boundary(bytes: u64, rows: u64) -> u64 {
+    if rows > 0 && bytes.is_multiple_of(rows) && bytes > 0 {
+        lcm(bytes / rows, 16)
+    } else {
+        16
+    }
+}
+
 /// A MoE layer's banks: the routes its selects share, and its experts.
 type LayerKey = (ValueId, u32);
 
@@ -195,7 +250,7 @@ type TableKey = (u64, u32, bool);
 
 /// The weight slot groups of `trace`, a fire reading at most `max_tokens`
 /// tokens.
-pub(super) fn census(trace: &Trace, max_tokens: u32) -> Vec<Group> {
+pub(super) fn census(trace: &Trace, max_tokens: u32, tma: bool) -> Vec<Group> {
     let classes = residency(trace);
     let lead = leads(trace);
     // Each streamable weight's planes that stream with it.
@@ -256,7 +311,20 @@ pub(super) fn census(trace: &Trace, max_tokens: u32) -> Vec<Group> {
             })
             .collect();
         shape.sort_unstable();
-        let atom_bytes = shape.iter().map(|p| p.bytes).sum();
+        // In the bank's order, as an engine lays a slot: back to back, or
+        // each plane on its boundary where the profile maps windows.
+        let (atom_bytes, boundary) = if tma {
+            let params: Vec<usize> = qs.iter().copied().collect();
+            qs.iter().fold((0u64, 1u64), |(at, every), &q| {
+                let param = &trace.params[q];
+                let held = param.shape.first().copied().unwrap_or(1).max(1);
+                let bytes = plane_bytes(param) / held;
+                let edge = plane_boundary(bytes, tma_rows(trace, q, &params));
+                (align_up(at, edge) + bytes, lcm(every, edge))
+            })
+        } else {
+            (shape.iter().map(|p| p.bytes).sum(), 1)
+        };
         let grain = if qs.iter().any(|q| packed(trace.params[*q].dtype)) {
             PIECE_ROW_GRAIN
         } else {
@@ -283,6 +351,7 @@ pub(super) fn census(trace: &Trace, max_tokens: u32) -> Vec<Group> {
                 fire_ids: 0,
                 top_k,
                 banks: vec![bank],
+                boundary,
             });
         }
     }
@@ -298,6 +367,7 @@ pub(super) fn census(trace: &Trace, max_tokens: u32) -> Vec<Group> {
             grain: 1,
             fire_ids: u64::from(max_tokens.max(1)) * u64::from(ids_per_token.max(1)),
             top_k: 0,
+            boundary: 1,
             banks: vec![WeightBank {
                 layer,
                 atoms: rows,

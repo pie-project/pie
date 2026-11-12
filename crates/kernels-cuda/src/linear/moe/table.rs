@@ -26,7 +26,8 @@ pub enum Planes {
     /// laid in atoms).
     Scaled,
     /// `[codes, atoms, tensor_scales, input_scales]`: NVFP4 against NVFP4
-    /// activations.
+    /// activations on the tcgen05 GEMM (sm_120's block-scaled mma.sync reads
+    /// the [`Planes::Nvfp4`] table, its input scales where they lie).
     Nvfp4A4,
 }
 
@@ -60,6 +61,20 @@ pub struct ExpertTable {
     /// kernel maps (an entry's offset past `base` a whole number of the
     /// plane's rows); `(0, 0)` maps the bank's own extent.
     pub window: (u64, u64),
+}
+
+/// Whether this device runs a kernel that maps a located table's window by
+/// TMA, an entry's row taken as its offset past the window over the plane's
+/// row: the tcgen05 GEMMs (`gemm_sm100`), Hopper's TMA selects (the FP8
+/// W8A8 slice, the bf16 and FP4 wgmma) and the consumer Blackwells' staged
+/// W4A8 selects (`moe_select_mxfp4_w4a8_tma`, `_ws`). Elsewhere every select
+/// reads a table's entries as addresses, wherever in the pool they lie.
+#[cfg(feature = "cuda")]
+#[must_use]
+pub fn windows_mapped() -> bool {
+    crate::linear::gemm_sm100::supported()
+        || super::hopper_wgmma()
+        || crate::jit::cache::features().warp_block_scale
 }
 
 impl ExpertTable {

@@ -133,6 +133,7 @@ fn seeded_planes(trace: &Trace) -> Vec<Seeded> {
         .collect();
     // A packed plane's scales, biases and tensor scales are made with it
     // when the load quantizes it: the container holds none of their own.
+    // (Its input scales are its activations' calibration, seeded below.)
     let made: std::collections::BTreeSet<String> = planes
         .iter()
         .filter(|param| {
@@ -155,7 +156,6 @@ fn seeded_planes(trace: &Trace) -> Vec<Seeded> {
                 poem::scales_name(&param.name),
                 poem::biases_name(&param.name),
                 poem::global_scales_name(&param.name),
-                poem::input_scales_name(&param.name),
             ]
         })
         .collect();
@@ -167,6 +167,9 @@ fn seeded_planes(trace: &Trace) -> Vec<Seeded> {
         let shape = poem::Weight::of_plane(param).shape;
         let count: usize = shape.iter().product::<u64>() as usize;
         let norm = param.name.ends_with("norm");
+        // An NVFP4 bank's input scales: each expert's activation amax over
+        // the largest NVFP4 value, positive.
+        let calibration = param.name.ends_with(&poem::input_scales_name(""));
         let mut seed = fnv(&param.name);
         let mut next = || {
             seed = seed.wrapping_mul(6_364_136_223_846_793_005).wrapping_add(1);
@@ -176,6 +179,8 @@ fn seeded_planes(trace: &Trace) -> Vec<Seeded> {
         let value = |bits: u64| {
             if norm {
                 1.0 + 0.05 * unit(bits)
+            } else if calibration {
+                0.002 + 0.001 * unit(bits)
             } else {
                 0.08 * unit(bits)
             }
@@ -1936,11 +1941,25 @@ fn served_experts_as(fixture: &Fixture, cache: &Path, rows: Rows, told: bool) ->
     // A packed bank's selects count no read themselves: the engine counts a
     // fire's routes only while the set may change, so a held set of packed
     // banks alone records none.
-    let packed = fixture
-        .trace
-        .params
-        .iter()
-        .any(|param| param.dtype == poem_ir::Dtype::Mxfp4);
+    let packed = fixture.trace.params.iter().any(|param| {
+        use poem_ir::Dtype::{
+            E4m3, E4m3g128, E4m3tile128, Mxfp4, Nvfp4, U2g32, U2g64, U2g128, U4g32, U4g64, U8g64,
+        };
+        matches!(
+            param.dtype,
+            Mxfp4
+                | Nvfp4
+                | U2g32
+                | U2g64
+                | U2g128
+                | U4g32
+                | U4g64
+                | U8g64
+                | E4m3
+                | E4m3tile128
+                | E4m3g128
+        )
+    });
     assert!(
         (packed && rows == Rows::Cached)
             || uses

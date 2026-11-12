@@ -1792,9 +1792,23 @@ impl Walk<'_, '_> {
         let Some(scheme) = transform.to else {
             return Err(invalid("host Encode names no target scheme"));
         };
-        let &[payload, scales] = outputs else {
-            return Err(invalid("host Encode expects weight and scale outputs"));
+        // A weight and its scales, and (NVFP4) the f32 tensor scale of each row.
+        let (payload, scales, tensor) = match *outputs {
+            [payload, scales] => (payload, scales, None),
+            [payload, scales, tensor] => (payload, scales, Some(tensor)),
+            _ => return Err(invalid("host Encode expects weight and scale outputs")),
         };
+        if tensor.is_some() != (scheme == QuantScheme::Nvfp4E2M1E4M3) {
+            return Err(invalid(format!(
+                "host Encode to {scheme:?} writes {} outputs, and this instruction has {}",
+                if scheme == QuantScheme::Nvfp4E2M1E4M3 {
+                    3
+                } else {
+                    2
+                },
+                outputs.len()
+            )));
+        }
         let shape = self.buffer_shape(payload)?.to_vec();
         let Some((rows, cols)) = crate::types::rectangle(&shape) else {
             return Err(invalid(format!(
@@ -1836,7 +1850,50 @@ impl Walk<'_, '_> {
             )));
         }
 
+        let mut tensor_out = Vec::new();
         let (packed, scale_out) = match scheme {
+            QuantScheme::Nvfp4E2M1E4M3 => {
+                use crate::codec::nvfp4::{GROUP, encode};
+                if cols == 0 || !cols.is_multiple_of(GROUP) {
+                    return Err(invalid(format!(
+                        "host NVFP4 Encode cols must be a multiple of {GROUP}, got {cols}"
+                    )));
+                }
+                let groups = cols / GROUP;
+                let want = crate::types::grouped_shape(lead, groups as i64);
+                if scale_shape != want {
+                    return Err(invalid(format!(
+                        "host NVFP4 Encode scale must be {want:?}, got {scale_shape:?}"
+                    )));
+                }
+                // Each row's scale bytes are its e4m3 scales, then its f32
+                // tensor scale, split apart below.
+                let laid = groups + 4;
+                let mut packed = vec![0u8; rows * cols / 2];
+                let mut both = vec![0u8; rows * laid];
+                let failed = std::sync::atomic::AtomicBool::new(false);
+                let job = |row: usize, buf: &mut [f32], out: &mut [u8], scale: &mut [u8]| {
+                    operand.row_bf16(row, cols, buf);
+                    let Ok(planes) = encode(buf, 1, cols) else {
+                        failed.store(true, std::sync::atomic::Ordering::Relaxed);
+                        return;
+                    };
+                    out.copy_from_slice(&planes.codes);
+                    scale[..groups].copy_from_slice(&planes.scales);
+                    scale[groups..].copy_from_slice(&planes.tensor[0].to_le_bytes());
+                };
+                encode_rows(rows, cols, cols / 2, laid, &mut packed, &mut both, &job);
+                if failed.into_inner() {
+                    return Err(invalid("host NVFP4 Encode could not encode a row"));
+                }
+                let mut scale_out = Vec::with_capacity(rows * groups);
+                tensor_out.reserve(rows * 4);
+                for row in both.chunks_exact(laid) {
+                    scale_out.extend_from_slice(&row[..groups]);
+                    tensor_out.extend_from_slice(&row[groups..]);
+                }
+                (packed, scale_out)
+            }
             QuantScheme::Mxfp4E2M1E8M0 => {
                 if cols == 0 || !cols.is_multiple_of(32) {
                     return Err(invalid(format!(
@@ -1933,6 +1990,12 @@ impl Walk<'_, '_> {
             self.write_buffer(payload, offset * tile, chunk)?;
         }
         self.write_buffer(scales, 0, &scale_out)?;
+        if let Some(tensor) = tensor {
+            if self.buffer_bytes(tensor)?.len() != tensor_out.len() {
+                return Err(invalid("host Encode tensor scale buffer size mismatch"));
+            }
+            self.write_buffer(tensor, 0, &tensor_out)?;
+        }
         Ok(())
     }
 

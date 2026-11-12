@@ -1,4 +1,5 @@
 #include "linear/act_quant.cuh"
+#include "linear/moe/table.cuh"
 #include "prim/device.cuh"
 #ifdef __CUDACC_RTC__
 
@@ -359,7 +360,8 @@ __global__ void moe_bias_sum(
     const i32* __restrict__ topk_idx,
     const float* __restrict__ weights,
     int top_k, int hidden,
-    const u32* __restrict__ win)
+    const u32* __restrict__ win,
+    const u64* __restrict__ expert_table)
 {
     const int n = blockIdx.x;
 
@@ -377,8 +379,9 @@ __global__ void moe_bias_sum(
         const int e = topk_idx[r];
 
         if (e < 0) continue;
+        // Expert `e`'s bias row where the weight cache's table says.
         const float b = Elem<T>::to_f32(
-            bias[static_cast<long long>(e) * hidden + h]);
+            expert_plane(bias, hidden, expert_table, 1, 0, e)[h]);
         acc += weights[r] * b;
     }
     out[i] = Elem<T>::from_f32(acc);

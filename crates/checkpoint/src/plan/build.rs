@@ -921,11 +921,23 @@ impl Builder<'_> {
                 "quant_metadata_outputs on a non-quantized declaration".to_string(),
             ));
         };
-        let layout = ScaleLayout::for_encode(spec, &decl.shape)
-            .map_err(|err| annotate(err, &decl.name))?;
-        let scales = self.generated_metadata_decl(decl, &layout, layout.suffix)?;
-        let zero_point = match layout.zero_point_suffix {
-            Some(suffix) => Some(self.generated_metadata_decl(decl, &layout, suffix)?),
+        let layout =
+            ScaleLayout::for_encode(spec, &decl.shape).map_err(|err| annotate(err, &decl.name))?;
+        let scales = self.generated_metadata_decl(
+            decl,
+            &layout,
+            layout.suffix,
+            &layout.shape,
+            &layout.encoding,
+        )?;
+        let zero_point = match &layout.zero_point {
+            Some(second) => Some(self.generated_metadata_decl(
+                decl,
+                &layout,
+                second.suffix,
+                &second.shape,
+                &second.encoding,
+            )?),
             None => None,
         };
         self.program.attachments.push(QuantAttachment {
@@ -947,6 +959,8 @@ impl Builder<'_> {
         weight: &TensorDecl,
         layout: &ScaleLayout,
         suffix: &str,
+        shape: &[i64],
+        encoding: &Encoding,
     ) -> Result<TensorDecl> {
         let name = layout
             .naming
@@ -957,8 +971,8 @@ impl Builder<'_> {
         Ok(TensorDecl {
             id,
             name,
-            shape: layout.shape.clone(),
-            encoding: layout.encoding.clone(),
+            shape: shape.to_vec(),
+            encoding: encoding.clone(),
             alignment: self.alignment,
             visibility: weight.visibility,
         })
@@ -1207,7 +1221,9 @@ fn source_scheme(encoding: &Encoding) -> Option<QuantScheme> {
 
 struct ScaleLayout {
     suffix: &'static str,
-    zero_point_suffix: Option<&'static str>,
+    /// The second companion (`QuantAttachment::zero_point_tensor`): an
+    /// affine bank's zero points, an NVFP4 bank's f32 tensor scales.
+    zero_point: Option<Companion>,
     naming: MetaNaming,
     shape: Vec<i64>,
     encoding: Encoding,
@@ -1215,6 +1231,12 @@ struct ScaleLayout {
     group_size: u32,
     channel_axis: u32,
     scale_form: ScaleForm,
+}
+
+struct Companion {
+    suffix: &'static str,
+    shape: Vec<i64>,
+    encoding: Encoding,
 }
 
 fn axis(at: usize) -> u32 {
@@ -1254,7 +1276,7 @@ impl ScaleLayout {
         match scheme {
             QuantScheme::Fp8E4M3 | QuantScheme::Int8Symmetric => Ok(Self {
                 suffix: "_scale_inv",
-                zero_point_suffix: None,
+                zero_point: None,
                 naming: MetaNaming::Extend,
                 shape: lead.to_vec(),
                 encoding: Encoding::Raw(DType::F32),
@@ -1272,7 +1294,7 @@ impl ScaleLayout {
                 }
                 Ok(Self {
                     suffix: ".scales",
-                    zero_point_suffix: None,
+                    zero_point: None,
                     naming: MetaNaming::Extend,
                     shape: crate::types::grouped_shape(lead, cols / 32),
                     encoding: Encoding::Raw(DType::E8m0),
@@ -1280,6 +1302,32 @@ impl ScaleLayout {
                     group_size: 32,
                     channel_axis: axis(lead.len()),
                     scale_form: ScaleForm::RawE8M0,
+                })
+            }
+            QuantScheme::Nvfp4E2M1E4M3 => {
+                let group = crate::codec::nvfp4::GROUP as i64;
+                if cols % group != 0 {
+                    return Err(Error::Contract(format!(
+                        "encoding to NVFP4 blocks {group} columns under one scale, \
+                         but the output has {cols}"
+                    )));
+                }
+                // An e4m3 scale per 16 codes, under an f32 tensor scale per row
+                // (`term::plane_name`'s `.scales` and `.global_scales`).
+                Ok(Self {
+                    suffix: dtype::SCALES,
+                    zero_point: Some(Companion {
+                        suffix: dtype::GLOBAL_SCALES,
+                        shape: lead.to_vec(),
+                        encoding: Encoding::Raw(DType::F32),
+                    }),
+                    naming: MetaNaming::Extend,
+                    shape: crate::types::grouped_shape(lead, cols / group),
+                    encoding: Encoding::Raw(DType::E4m3),
+                    granularity: QuantGranularity::PerGroup,
+                    group_size: 16,
+                    channel_axis: axis(lead.len()),
+                    scale_form: ScaleForm::E4m3TensorScaled,
                 })
             }
             QuantScheme::MlxAffineU4 => {
@@ -1292,11 +1340,16 @@ impl ScaleLayout {
                          scale, but the output has {cols}"
                     )));
                 }
+                let shape = crate::types::grouped_shape(lead, cols / i64::from(group));
                 Ok(Self {
                     suffix: ".scales",
-                    zero_point_suffix: Some(".biases"),
+                    zero_point: Some(Companion {
+                        suffix: ".biases",
+                        shape: shape.clone(),
+                        encoding: Encoding::Raw(DType::Bf16),
+                    }),
                     naming: MetaNaming::ReplaceWeight,
-                    shape: crate::types::grouped_shape(lead, cols / i64::from(group)),
+                    shape,
                     encoding: Encoding::Raw(DType::Bf16),
                     granularity: QuantGranularity::PerGroup,
                     group_size: group,

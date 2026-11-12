@@ -236,6 +236,7 @@ pub(super) fn bake(boot: &mut Boot<'_>) -> Result<Baked> {
         crate::device::elastic::budget_bytes(free, total, boot.memory_share).saturating_sub(
             crate::store::weight_tier_bytes(&boot.trace, boot.residency.device_demand(), 0)?,
         );
+    let after_weights = held_beside(boot, after_weights)?;
     let facts = kv::probe(&boot.trace)?;
     let derive_voxels = boot
         .voxels
@@ -454,6 +455,7 @@ pub(super) fn bake(boot: &mut Boot<'_>) -> Result<Baked> {
         regions,
         anchored,
         asked,
+        stated_buckets: !stated_buckets.is_empty(),
     })
 }
 
@@ -478,7 +480,9 @@ enum HostCopy {
     Filed,
     /// In the serving file's mapping, a miss read where it lies.
     Mapped,
-    /// Pinned on the host tier, a miss read where it lies.
+    /// On the host tier: pinned, a miss read where it lies; or, for a load
+    /// told its weights are held, pageable, seated in the pool before any
+    /// fire and read by none (`Tier::open`).
     Pinned,
 }
 
@@ -496,8 +500,15 @@ fn host_copy(boot: &Boot<'_>, params: &[usize]) -> Result<HostCopy> {
     if params.is_empty() {
         return Ok(HostCopy::Pinned);
     }
-    let bytes = crate::weights::plane_bytes(&boot.trace)?;
-    let in_file = crate::checkpoint_serving::Serving::open(boot.checkpoint, &boot.trace)
+    // A plane the load lays in another form (its codes requantized, its
+    // scales laid in atoms) is not in the file as a slot holds it, whatever
+    // its size: its copy is laid in place at load.
+    let bytes = crate::weights::laid_bytes(&boot.trace)?;
+    let laid = crate::weights::laid_planes(&boot.trace);
+    let in_file = !params.iter().any(|&param| {
+        laid.iter()
+            .any(|laid| laid.codes == param || laid.scales == param)
+    }) && crate::checkpoint_serving::Serving::open(boot.checkpoint, &boot.trace)
         .is_some_and(|serving| serving.holds(params, &bytes));
     let pinned: u64 = params.iter().map(|&param| bytes[param]).sum();
     if boot.knobs.weights_held {
@@ -505,9 +516,10 @@ fn host_copy(boot: &Boot<'_>, params: &[usize]) -> Result<HostCopy> {
             return Ok(HostCopy::Filed);
         }
         eprintln!(
-            "engine-cuda: {} MiB of weights the pool will hold are pinned on the host at \
-             load: {} does not hold their planes as this plan reads them (a plane decoded \
-             at load), so their slots cannot be filled from the file",
+            "engine-cuda: {} MiB of weights the pool will hold are copied to the host at \
+             load (pageable, freed once seated): {} does not hold their planes as this plan \
+             reads them (a plane decoded at load), so their slots cannot be filled from the \
+             file",
             pinned >> 20,
             boot.checkpoint.display()
         );
@@ -517,7 +529,7 @@ fn host_copy(boot: &Boot<'_>, params: &[usize]) -> Result<HostCopy> {
     let have = crate::weights::available_memory();
     if pinned > have {
         return Err(Fault::Residency(format!(
-            "this load keeps a pinned host copy of the weights its cache streams, {:.1} GiB, \
+            "this load keeps a host copy of the weights its cache takes, {:.1} GiB, \
              and this machine has {:.1} GiB of memory left for it. {}",
             pinned as f64 / f64::from(1u32 << 30),
             have as f64 / f64::from(1u32 << 30),
@@ -534,6 +546,22 @@ fn host_copy(boot: &Boot<'_>, params: &[usize]) -> Result<HostCopy> {
     Ok(HostCopy::Pinned)
 }
 
+/// `room` less the banks the weight cache takes, where the card holds them
+/// beside it: they are not on the device yet, and once seated they are the
+/// pool's for the load's life, as a resident bank's bytes are, so no fire's
+/// working set is sized into them. A deployment whose banks exceed the room
+/// streams them, and its fires are sized in the room as it is.
+fn held_beside(boot: &Boot<'_>, room: u64) -> Result<u64> {
+    let bytes = crate::weights::laid_bytes(&boot.trace)?;
+    let cached: u64 = boot
+        .residency
+        .cached_experts()
+        .iter()
+        .map(|&param| bytes[param].next_multiple_of(crate::weights::ALIGN))
+        .sum();
+    Ok(if cached < room { room - cached } else { room })
+}
+
 fn refit(
     boot: &mut Boot<'_>,
     device: &Context,
@@ -547,6 +575,7 @@ fn refit(
 ) -> Result<(CompiledModel, Budgets, Vec<u64>)> {
     let (free, total) = crate::store::device_memory()?;
     let live = crate::device::elastic::budget_bytes(free, total, boot.memory_share);
+    let live = held_beside(boot, live)?;
     let facts = kv::probe(&boot.trace)?;
     let window = crate::store::window_of(&boot.trace)?;
     let out_row = Exports::of(&boot.trace, &compiled)?.readout_row_bytes();
@@ -731,6 +760,7 @@ impl Shell {
             regions: folded,
             anchored,
             asked,
+            stated_buckets,
         } = bake(&mut boot)?;
         // Every generated kernel compiled and loaded now, before a fire can
         // ask for one.
@@ -800,6 +830,9 @@ impl Shell {
                 )
             },
             decode_dense,
+            // A load told its weights are held seats every bank before a
+            // fire: its banks' host copy is pageable (`Tier::open`).
+            boot.knobs.weights_held,
         )?;
         // `kernel.gemm.fp8_o_down`: grouped projections on fp8b128, as vLLM
         // reads DeepSeek-V4's `wo_a` (the wide fires on tcgen05).
@@ -1228,6 +1261,11 @@ impl Shell {
             seat_to_end: engine.seat_to_end,
             seat_spread: engine.seat_spread,
             prefill_lanes: engine.prefill_lanes,
+            lattice: (!stated_buckets && engine.prefill_lattice_from > 0).then_some((
+                engine.lattice_steps,
+                engine.prefill_lattice_from,
+                engine.prefill_lattice_steps,
+            )),
             pad: engine.recording.pad(),
             golden_arm: Golden::Off,
             bodies: engine.recording.bodies(),
@@ -1408,6 +1446,7 @@ impl Shell {
             held_for_fires,
             rank: boot.world.rank,
             arm_trace: boot.knobs.diagnostics.arm_trace,
+            weights_held: boot.knobs.weights_held,
             device_total,
             free_before,
         })
@@ -1420,6 +1459,8 @@ pub struct Staged {
     held_for_fires: u64,
     rank: u32,
     arm_trace: bool,
+    /// The load was told its weights are held (`Knobs::weights_held`).
+    weights_held: bool,
     device_total: u64,
     free_before: u64,
 }
@@ -1432,6 +1473,7 @@ impl Staged {
             held_for_fires,
             rank,
             arm_trace,
+            weights_held,
             device_total,
             free_before,
         } = self;
@@ -1443,12 +1485,19 @@ impl Staged {
         }
         // Weights left in the serving file are on no tier a fire can read:
         // they are seated in the pool before the lattice is armed over them.
-        if shell
+        // So are those a load told they are held keeps a host copy of
+        // (planes laid at load, which the file does not hold as served).
+        let filed = shell
             .weights
             .experts()
-            .is_some_and(|tier| tier.plan().files())
-        {
-            shell.preseat_weights()?;
+            .is_some_and(|tier| tier.plan().files());
+        let held_copied = weights_held
+            && shell
+                .weights
+                .experts()
+                .is_some_and(|tier| !tier.plan().cached_experts().is_empty());
+        if filed || held_copied {
+            shell.preseat_weights(filed, held_copied)?;
         }
         // A load whose weights the pool does not hold whole streams them:
         // armed now, its bodies would read every expert from the host copy,
@@ -1839,6 +1888,8 @@ pub(super) struct Baked {
     pub(super) anchored: std::collections::BTreeMap<u64, kernels_ir::Anchored>,
     /// The budget asked before the card cut its tokens at the asked lanes.
     pub(super) asked: Budget,
+    /// Whether the load stated its buckets (no default lattice to coarsen).
+    pub(super) stated_buckets: bool,
 }
 
 /// The widest fire whose lanes of `rows` prompt rows put no more (lane,

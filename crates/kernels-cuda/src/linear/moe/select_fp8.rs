@@ -163,8 +163,13 @@ pub fn select_fp8_w8a8(
     // (`kernel.moe.fp8a8_ws_from`): 128 routes by 128 weight rows a CTA.
     let ws_from = ctx.tuning().fp8a8_ws_from;
     if hopper_wgmma() && ws_from > 0 && per >= ws_from {
-        // The weight rows by TMA, persistent (`kernel.moe.fp8a8_tma`).
-        if ctx.tuning().fp8a8_tma && y.width.is_multiple_of(256) && !ctx.tuning().fp8a8_ws_narrow {
+        // The weight rows by TMA, persistent (`kernel.moe.fp8a8_tma`), on a
+        // bank the device holds (a streamed table may name host memory).
+        if ctx.tuning().fp8a8_tma
+            && !table.streams()
+            && y.width.is_multiple_of(256)
+            && !ctx.tuning().fp8a8_ws_narrow
+        {
             use crate::linear::gemm_sm100::{Map, encode};
             use cudarc::driver::sys as dr;
             let stages: u32 = 4;

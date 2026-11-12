@@ -49,7 +49,7 @@ pub(crate) fn nvfp4_mma_worth(
     fan: &Selected,
 ) -> bool {
     nvfp4_mma_spans(ctx, fan.route_count)
-        && !experts.streams()
+        && (!experts.streams() || mma_streams_here())
         && x.dtype == Dtype::Bf16
         && y.dtype == Dtype::Bf16
         && x.width > 0
@@ -108,11 +108,23 @@ pub(crate) fn mxfp4_mma_worth(
 ) -> bool {
     mxfp4_mma_spans(ctx, fan.route_count, experts)
         && !seat.streams()
-        && !table.streams()
+        && (!table.streams() || mma_streams_here())
         && x.dtype == Dtype::Bf16
         && y.dtype == Dtype::Bf16
         && x.width > 0
         && x.width.is_multiple_of(32)
+}
+
+/// Whether this device's register-dequant MMA selects take a streamed
+/// table (one that may name mapped host memory): the kernels of
+/// `select_fp4_sm80.cu` (every arm on Ampere, Ada and the consumer
+/// Blackwells, the pipe included) read their experts through it with plain
+/// and cp.async loads, which take a mapped host address as any global one;
+/// Hopper's wgmma slice reads by TMA, and tcgen05's by its own path, so a
+/// streamed table stays off them there.
+#[cfg(feature = "cuda")]
+pub(crate) fn mma_streams_here() -> bool {
+    !hopper_wgmma() && !crate::linear::gemm_sm100::supported()
 }
 
 /// The fewest routes an expert averages that Hopper's staged wgmma select
@@ -455,16 +467,20 @@ pub fn select_mxfp4_w4a8(
     table: ExpertTable,
 ) -> Result<bool, Error> {
     const OP: &str = "linear.moe_select_mxfp4_w4a8";
-    if !(matches!(gran, 32 | 128)
-        && y.dtype == Dtype::Bf16
-        && !table.streams()
-        && w4a8_takes(ctx, x, routes))
-    {
+    if !(matches!(gran, 32 | 128) && y.dtype == Dtype::Bf16 && w4a8_takes(ctx, x, routes)) {
         return Ok(false);
     }
     let (op, glu, bias, (code, limit, alpha)) = (OP, false, None::<Tensor>, (0, 0.0f32, 0.0f32));
     let fan = &selected(OP, x, routes, y)?;
-    if ctx.tuning().mxfp4_w4a8_tma && codes.ptr.is_multiple_of(16) && ctx.smem_fits(W4A8_TMA_SMEM) {
+    // The staged kernels where the release tunes them, a contiguous bank's
+    // codes by TMA, a table's by cp.async from its entries into the same
+    // stages. A table's entries are 16-aligned (the pool's planes); `codes`
+    // is then the bank's host copy, which no kernel reads, wherever its file
+    // lays it.
+    if ctx.tuning().mxfp4_w4a8_tma
+        && (table.tabled() || codes.ptr.is_multiple_of(16))
+        && ctx.smem_fits(W4A8_TMA_SMEM)
+    {
         return select_mxfp4_w4a8_tma(ctx, x, codes, scales, routes, y, gran, fan, table);
     }
     let (rows, kw) = (x.rows as usize, x.width as usize);
@@ -582,7 +598,6 @@ pub fn select_nvfp4_w4a4(
     const OP: &str = "linear.moe_select_nvfp4_w4a4";
     let from = ctx.tuning().nvfp4_w4a4_from;
     if from == 0
-        || table.streams()
         || routes.rows * routes.width < from
         || x.dtype != Dtype::Bf16
         || y.dtype != Dtype::Bf16
@@ -756,9 +771,13 @@ fn select_mxfp4_w4a8_tma(
         boxes: [128, 128, 1],
         swizzle: dr::CUtensorMapSwizzle::CU_TENSOR_MAP_SWIZZLE_128B,
     })?;
-    // The codes map spans a table's window (its entries whole code rows
-    // past its base), or without one the bank, where any table's entries lie.
-    let (w_base, w_rows) = if table.tabled() && table.window != (0, 0) {
+    // The codes map spans the contiguous bank, or a located table's window
+    // (the engine states one only where every entry is whole code rows past
+    // it). Any other table's codes are read through its entries, held or
+    // streamed: no map of them is read, and the routes' stands in.
+    let windowed = table.located && table.window != (0, 0);
+    let tabled = table.tabled() && !windowed;
+    let (w_base, w_rows) = if windowed {
         let rows = table.window.1 / u64::from(x.width / 2);
         let rows =
             u32::try_from(rows).map_err(|_| refuse(OP, format!("a window of {rows} code rows")))?;
@@ -766,27 +785,31 @@ fn select_mxfp4_w4a8_tma(
     } else {
         (codes.ptr, experts * y.width)
     };
-    let map_w = encode(Map {
-        ptr: w_base,
-        ty: dr::CUtensorMapDataType::CU_TENSOR_MAP_DATA_TYPE_UINT8,
-        dims: [x.width / 2, w_rows, 0],
-        strides: [u64::from(x.width / 2), 0],
-        boxes: [64, 128, 1],
-        swizzle: dr::CUtensorMapSwizzle::CU_TENSOR_MAP_SWIZZLE_64B,
-    })?;
+    let map_w = if tabled {
+        map_x
+    } else {
+        encode(Map {
+            ptr: w_base,
+            ty: dr::CUtensorMapDataType::CU_TENSOR_MAP_DATA_TYPE_UINT8,
+            dims: [x.width / 2, w_rows, 0],
+            strides: [u64::from(x.width / 2), 0],
+            boxes: [64, 128, 1],
+            swizzle: dr::CUtensorMapSwizzle::CU_TENSOR_MAP_SWIZZLE_64B,
+        })?
+    };
     let tiles = y.width.div_ceil(256);
     // Persistent: a CTA a multiprocessor over the (row tile, slice) jobs.
     let sms = ctx.multiprocessors().unwrap_or(1).max(1);
     let fire = if ws {
         Fire::at(kernel(
             SELECT_FP4_SM120,
-            "::pie::linear::moe_select_mxfp4_w4a8_ws<3>",
+            &format!("::pie::linear::moe_select_mxfp4_w4a8_ws<3, {tabled}>"),
         ))
         .apply(Launch::grid([sms.min(tiles * work_cap), 1, 1], [384, 1, 1]).smem(W4A8_TMA_SMEM))
     } else {
         Fire::at(kernel(
             SELECT_FP4_SM120,
-            "::pie::linear::moe_select_mxfp4_w4a8_tma<0, 3>",
+            &format!("::pie::linear::moe_select_mxfp4_w4a8_tma<0, 3, {tabled}>"),
         ))
         .apply(Launch::grid([tiles, work_cap, 1], [512, 1, 1]).smem(W4A8_TMA_SMEM))
     };
@@ -810,6 +833,7 @@ fn select_mxfp4_w4a8_tma(
         0.0f32.arg(),
         ArgValue::Ptr(table.at()),
         w_base.arg(),
+        codes.arg(),
     ];
     ctx.fire(OP, fire, &args)?;
     Ok(true)
@@ -1138,7 +1162,10 @@ pub(super) fn matmul_select_mlxu4(
             work,
             work_cap,
         } = route_order(ctx, op, routes, &fan, experts)?;
-        let wmma = x.dtype == Dtype::Bf16 && tuning.affine_wmma;
+        // The WMMA kernel widens a quad of code words (four u32s) under one
+        // factor: a group of fewer codes (2-bit codes in groups of 32) takes
+        // the CUDA-core kernel.
+        let wmma = x.dtype == Dtype::Bf16 && tuning.affine_wmma && group.is_multiple_of(128 / bits);
         let entry = if wmma {
             format!(
                 "::pie::linear::moe_matmul_select_mlxu4_wmma<::pie::i32({bits}), ::pie::i32({group})>"

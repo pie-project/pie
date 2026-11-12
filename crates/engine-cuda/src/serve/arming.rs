@@ -900,6 +900,65 @@ impl Shell {
     /// record forgets them, so the runtime's first window orders the cache
     /// by served tokens alone (a load arming at its starting residency arms
     /// after the runtime last read the record).
+    /// The lattice's buckets a doubling past `engine.prefill_lattice_from`,
+    /// halved until the bodies of `rest` (the narrower prefill, mixed and
+    /// wide targets' buckets, still to arm) fit what the allowance has left
+    /// at the price the bodies armed so far weigh a body: a load whose
+    /// allowance arms every key keeps the profile's lattice, and one that
+    /// would leave keys to walk eagerly pads its fires to fewer buckets
+    /// instead. A coarser default lattice's buckets are the finer one's
+    /// every other past the fine rows, so nothing compiled changes. Returns
+    /// the buckets dropped; says so, and loudly where even the coarsest
+    /// lattice does not fit.
+    fn fit_lattice(&mut self, rest: &[u32]) -> std::collections::BTreeSet<u32> {
+        let Some((steps, from, mut fine)) = self.lattice else {
+            return std::collections::BTreeSet::new();
+        };
+        let spent = self.cache.body_stats().census;
+        if spent.bodies == 0 {
+            return std::collections::BTreeSet::new();
+        }
+        let price = spent.bytes / spent.bodies;
+        let room = self.bodies_mem.saturating_sub(spent.bytes);
+        let was = self.budget.buckets.clone();
+        let mut buckets = was.clone();
+        let need = |buckets: &[u32]| price * rest.iter().filter(|b| buckets.contains(b)).count();
+        while need(&buckets) > room {
+            if fine <= steps.max(1) {
+                eprintln!(
+                    "engine-cuda: WARNING: [engine] bodies_mem {} MiB arms no lattice's every \
+                     key: at {fine} bucket(s) a doubling past {from} rows the {} narrower \
+                     bodies still to arm weigh some {} MiB of the {} MiB left. Raise bodies_mem.",
+                    self.bodies_mem >> 20,
+                    rest.iter().filter(|b| buckets.contains(b)).count(),
+                    need(&buckets) >> 20,
+                    room >> 20,
+                );
+                break;
+            }
+            fine /= 2;
+            buckets = crate::api::default_lattice(self.budget.max_tokens, steps, from, fine);
+            buckets.retain(|bucket| was.contains(bucket));
+        }
+        if buckets.len() < was.len() {
+            eprintln!(
+                "engine-cuda: [engine] bodies_mem {} MiB arms every key at {fine} bucket(s) a \
+                 doubling past {from} rows, not the profile's {}: {} bucket(s), not {}.",
+                self.bodies_mem >> 20,
+                self.lattice.map_or(0, |(_, _, fine)| fine),
+                buckets.len(),
+                was.len(),
+            );
+        }
+        let dropped = was
+            .iter()
+            .filter(|b| !buckets.contains(b))
+            .copied()
+            .collect();
+        self.budget.buckets = buckets;
+        dropped
+    }
+
     pub(super) fn arm_bodies(&mut self) -> Result<()> {
         let armed = self.arm_lattice(false);
         self.pools.forget_weight_uses(self.device.stream())?;
@@ -1103,6 +1162,18 @@ impl Shell {
                     .collect::<Vec<_>>()
             })
             .collect();
+        // The top bucket's bodies and every decode body arm first; the
+        // narrower prefill, mixed and wide ones after them are what the
+        // lattice coarsens to fit the allowance, once those price a body.
+        let narrower =
+            |bucket: u32, target: &BodySynth| Some(bucket) != top && target.kind() != Kind::Decode;
+        let rest: Vec<u32> = targets
+            .iter()
+            .filter(|(bucket, target, _)| narrower(*bucket, target))
+            .map(|(bucket, ..)| *bucket)
+            .collect();
+        let mut priced = verify || group || self.lattice.is_none();
+        let mut dropped = std::collections::BTreeSet::new();
 
         let mut armed = 0usize;
         let mut wanted = 0usize;
@@ -1118,6 +1189,13 @@ impl Shell {
         let unit_margin = self.pools.map_unit_bytes().saturating_mul(16);
         let mut ballot = Ballot::open(&self.device);
         for (bucket, target, rs) in targets {
+            if !priced && narrower(bucket, &target) {
+                priced = true;
+                dropped = self.fit_lattice(&rest);
+            }
+            if dropped.contains(&bucket) {
+                continue;
+            }
             self.arm_rs = rs;
             let spent = self.cache.body_stats();
             let room = (self.bodies_mem as u64).saturating_sub(spent.census.bytes as u64);

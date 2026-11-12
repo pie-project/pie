@@ -1226,20 +1226,38 @@ impl Pools {
         };
         self.fitted = fitted;
         // The kv pages the shell's own seats may name: what the chunks hold
-        // were every one the kv rows', but those a held load's weights take.
-        // The fit claimed every weight the pool holds (the card holds them
-        // with one working set and the programs), so the runtime holds them
-        // for the load's life and no kv row ever takes their chunks; counted
-        // as the rows', they are pages admission hands out that no chunk
-        // backs, and a load filling them starves with nothing to discard.
-        let weight_chunks = if self.budget.is_none() && claim == whole {
-            u32::try_from(self.weight_pool_bytes() / chunk).unwrap_or(u32::MAX)
+        // were every one the kv rows', but those the weights take. Weights
+        // the fitted chunks seat whole the runtime holds for the load's life
+        // (`store::weights::boot_cache`), whatever the claim was, a stated
+        // budget's too, so no kv row ever takes their chunks; counted as the
+        // rows', they are pages admission hands out that no chunk backs, and
+        // a load filling them starves with nothing to discard. Where they
+        // leave less than one working set at the declared context, the
+        // pages are what they leave.
+        let weight_chunks = u32::try_from(self.weight_pool_bytes() / chunk).unwrap_or(u32::MAX);
+        let weights_held = if weight_chunks <= fitted {
+            weight_chunks
         } else {
             0
         };
-        let kv_chunks = fitted.saturating_sub(weight_chunks).max(least);
+        let kv_chunks = fitted.saturating_sub(weights_held);
         let layout = self.chunks.layout();
-        let (mut fits, mut over) = (one_slot, self.ceiling.saturating_add(1));
+        let floor = if kv_chunks >= least {
+            one_slot
+        } else {
+            if settled {
+                eprintln!(
+                    "engine-cuda: the weights this card holds whole leave the cache rows {} MiB, \
+                     under one sequence at the declared context ({} MiB): the kv pool states \
+                     what they leave. Lower `[engine] max_model_len`, raise `[model] \
+                     device_memory_share`, or set `weight_streaming = \"on\"` to stream them.",
+                    (u64::from(kv_chunks) * chunk) >> 20,
+                    need >> 20,
+                );
+            }
+            1
+        };
+        let (mut fits, mut over) = (floor, self.ceiling.saturating_add(1));
         while over - fits > 1 {
             let mid = fits + (over - fits) / 2;
             if chunks_at(layout, &self.paging, mid, 0) <= kv_chunks {
@@ -1262,11 +1280,7 @@ impl Pools {
             let reserved = if flat || settled {
                 fitted
             } else {
-                let more = self
-                    .chunks
-                    .activation_unheld_bytes()
-                    .saturating_add(bodies)
-                    / chunk;
+                let more = self.chunks.activation_unheld_bytes().saturating_add(bodies) / chunk;
                 fitted
                     .saturating_add(u32::try_from(more).unwrap_or(u32::MAX))
                     .min(self.chunks.total())
@@ -2210,6 +2224,7 @@ impl Pools {
                         } else {
                             None
                         },
+                        whole_rows: false,
                     });
                 }
                 // Each member's param to its place among the cache's planes.
@@ -2266,6 +2281,8 @@ impl Pools {
                     .flatten();
                 let mut entries =
                     Vec::with_capacity(cache.shape.experts as usize * held.members.len() * 8);
+                let base = self.chunks.base();
+                let mut whole_rows = true;
                 for expert in 0..cache.shape.experts as usize {
                     let slot = match cache.slots[first + expert].or(stand_in) {
                         Some(slot) => Some(self.chunks.weight_slot(
@@ -2281,7 +2298,12 @@ impl Pools {
                         let address = match member.map(|place| &cache.planes[place]) {
                             None => 0,
                             Some(plane) => match slot {
-                                Some(slot) => slot + plane.plane.offset,
+                                Some(slot) => {
+                                    let row = plane.plane.row;
+                                    whole_rows &= row > 0
+                                        && (slot + plane.plane.offset - base).is_multiple_of(row);
+                                    slot + plane.plane.offset
+                                }
                                 None => plane.host + expert as u64 * plane.plane.bytes,
                             },
                         };
@@ -2289,6 +2311,7 @@ impl Pools {
                     }
                 }
                 let held = &mut self.expert_caches[at].planes[bank];
+                held.whole_rows = whole_rows;
                 if stream.is_null() {
                     held.table.write(0, &entries)?;
                 } else {
@@ -2302,8 +2325,12 @@ impl Pools {
     /// The expert table of each streamed bank, by its param: what its
     /// select reads its experts through. A bank whose experts all lie in
     /// pool slots the runtime holds for the load's life is located, any
-    /// select's; any other may name the host copy by the next fire, and is
-    /// the plain-load selects' (a recorded body keeps the select it chose).
+    /// select's, where each entry is a whole number of its plane's rows past
+    /// the pool's base or no kernel of this device maps the window (a TMA
+    /// map indexes an entry by that row, `windows_mapped`); any other may
+    /// name the host copy by the next fire, or lies where no map row indexes
+    /// it, and is the plain-load selects' (a recorded body keeps the select
+    /// it chose).
     #[must_use]
     pub fn expert_tables(&self) -> Vec<(u32, kernels_cuda::linear::moe::ExpertTable)> {
         let window = (self.chunks.base(), self.chunks.bytes());
@@ -2317,6 +2344,7 @@ impl Pools {
                     .map(move |bank| {
                         let first = (bank.layer * cache.shape.experts) as usize;
                         let located = (self.weights_held || self.preseated)
+                            && (bank.whole_rows || !windows_mapped())
                             && cache.slots[first..first + cache.shape.experts as usize]
                                 .iter()
                                 .all(Option::is_some);
@@ -2641,10 +2669,15 @@ impl Pools {
             });
         }
         if self.weights_filed {
-            // Pageable memory: a copy a span, staged by the runtime.
+            // Pageable memory: a copy a span, staged by the runtime. A span
+            // of the serving file's mapping is let go once copied; one of a
+            // held load's pageable copy (its laid planes, beside planes left
+            // in the file) is no file's pages, and letting it go would zero it.
             for &(slot, file, bytes) in fills {
                 crate::device::copy_any(stream, slot, file, bytes)?;
-                self.file_spans.push((file, bytes));
+                if !crate::device::alloc::in_pageable_copy(file) {
+                    self.file_spans.push((file, bytes));
+                }
             }
             return Ok(());
         }
@@ -2767,7 +2800,8 @@ impl Pools {
     }
 
     /// Gives the caches a copy a fire can read a miss from, out of the
-    /// serving file's mapping they were left in: the mapping itself where
+    /// serving file's mapping they were left in (or the pageable copy a load
+    /// told its weights are held made): the mapping itself where
     /// the device faults mapped pages in, else a pinned copy of every
     /// streamed table and bank, refused where the machine has not the
     /// memory for it.
@@ -2931,7 +2965,11 @@ impl Pools {
         }
         for cache in &mut self.expert_caches {
             let experts = cache.shape.experts as usize;
-            for hits in cache.planes.iter_mut().filter_map(|bank| bank.hits.as_mut()) {
+            for hits in cache
+                .planes
+                .iter_mut()
+                .filter_map(|bank| bank.hits.as_mut())
+            {
                 hits.zero_span_on(stream, 0, experts * 4)?;
             }
         }
@@ -4093,20 +4131,44 @@ fn lay(
     if let Some(bytes) = chunk_bytes {
         server.target_chunk_bytes = bytes;
     }
+    // Where this device's kernels map a table's window, slots lay their
+    // planes on the rows those maps index.
+    let tma = windows_mapped();
+    server.tma_rows = tma;
     let paged = server.paged(paging.page_size, context);
     let profile = poem_compiler::DeviceProfile {
         chunk: if one_window { paged.merged() } else { paged },
         ..poem_compiler::DeviceProfile::default()
     };
+    // Each plane at the bytes its slot holds: laid scales as their atoms.
+    let view = crate::weights::laid_view(trace);
     let recipe =
-        poem_compiler::chunk::plan(trace, budgets, &profile).map_err(|why| Fault::Unbound {
+        poem_compiler::chunk::plan(&view, budgets, &profile).map_err(|why| Fault::Unbound {
             what: format!("a chunk recipe for this load's cache rows: {why}"),
         })?;
-    let banks: Vec<(usize, u64)> = if experts.is_empty() {
+    let banks: Vec<(usize, u64, u64)> = if experts.is_empty() {
         Vec::new()
     } else {
-        let bytes = crate::weights::plane_bytes(trace)?;
-        experts.iter().map(|&param| (param, bytes[param])).collect()
+        let bytes = crate::weights::laid_bytes(trace)?;
+        // A plane held on the device beside its bank takes no slot bytes.
+        let beside = experts
+            .iter()
+            .flat_map(|&param| layout::beside_planes(trace, param))
+            .map(|plane| (plane as usize, 0, 0));
+        // Each plane's TMA rows where windows are mapped (the recipe laid
+        // the slot by them), else none.
+        let rows = |param: usize| {
+            if tma {
+                poem_compiler::chunk::weights::tma_rows(trace, param, experts)
+            } else {
+                0
+            }
+        };
+        experts
+            .iter()
+            .map(|&param| (param, bytes[param], rows(param)))
+            .chain(beside)
+            .collect()
     };
     let streamed = if rows {
         layout::streamed_rows(trace)
@@ -4172,6 +4234,10 @@ struct ExpertBank {
     table: crate::device::Buffer,
     /// A u32 counter an expert.
     hits: Option<crate::device::Buffer>,
+    /// Whether, as the table was last written, every entry lay in the pool a
+    /// whole number of its plane's rows past the pool's base: what a TMA map
+    /// of the window indexes it by.
+    whole_rows: bool,
 }
 
 /// An expert shape's cache: where each expert of each layer lies (a pool
@@ -4212,6 +4278,19 @@ impl PoolRow {
     /// The bytes one of its planes holds a page.
     fn plane_bytes(&self, page_size: u32) -> u64 {
         u64::from(page_size) * self.width * u64::from(elem_size(POOL_STATE))
+    }
+}
+
+/// Whether this device's kernels map a located table's window by TMA
+/// (`kernels_cuda::linear::moe::windows_mapped`); none does off CUDA.
+fn windows_mapped() -> bool {
+    #[cfg(feature = "cuda")]
+    {
+        kernels_cuda::linear::moe::windows_mapped()
+    }
+    #[cfg(not(feature = "cuda"))]
+    {
+        false
     }
 }
 

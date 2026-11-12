@@ -647,7 +647,7 @@ pub fn plan(
     let (lo, hi) = device.range();
     let census = census::census(trace, device.state_f32, device.rs_mamba2)?;
     let cow = cow_sets(budgets);
-    let weight_groups = weights::census(trace, budgets.tokens.max_tokens);
+    let weight_groups = weights::census(trace, budgets.tokens.max_tokens, device.tma_rows);
     // Where experts are not cut, no chunk is smaller than one.
     let expert = weight_groups
         .iter()
@@ -837,11 +837,52 @@ pub fn plan(
     let hi = hi.max(RS_SHARES * rs_token.unwrap_or(0)).min(device.most());
     let last = (hi.max(least) / unit).max(first);
     let step = (last - first + 1).div_ceil(MOST_CANDIDATES).max(1);
-    let candidates: Vec<u64> = (first..=last)
-        .step_by(usize::try_from(step).unwrap_or(1))
-        .chain(core::iter::once(last))
-        .map(|m| m * unit)
+    // And the whole multiples of each uncut expert slot in that range: an
+    // expert's planes are whole pages of the list plus their scales, so no
+    // multiple of the list slot holds whole experts without leaving most of
+    // a slot a chunk (4.5% of Qwen3-30B-A3B-FP8's 29 GB on CUDA's range),
+    // where a chunk of whole experts leaves the list the scales' share of a
+    // page.
+    let slot_sizes: std::collections::BTreeSet<u64> = if device.cut_experts {
+        std::collections::BTreeSet::new()
+    } else {
+        weight_groups
+            .iter()
+            .filter(|g| g.is_expert())
+            .map(|g| g.whole(align))
+            .filter(|&bytes| bytes > 0)
+            .collect()
+    };
+    let candidates: Vec<u64> =
+        (first..=last)
+            .step_by(usize::try_from(step).unwrap_or(1))
+            .chain(core::iter::once(last))
+            .map(|m| m * unit)
+            .chain(slot_sizes.iter().flat_map(|&slot| {
+                (least.div_ceil(slot)..=hi.max(least) / slot).map(move |n| n * slot)
+            }))
+            .collect::<std::collections::BTreeSet<u64>>()
+            .into_iter()
+            .collect();
+    // Where slots lay their planes on TMA rows, a chunk a whole number of
+    // every expert slot's boundary, so a slot of any chunk lies on them past
+    // the pool's base; none such, the sizes as they are (the engine then
+    // finds its entries off those rows and maps no window).
+    let edge = weight_groups
+        .iter()
+        .filter(|g| g.is_expert())
+        .map(weights::Group::boundary)
+        .fold(1, weights::lcm);
+    let on_edge: Vec<u64> = candidates
+        .iter()
+        .copied()
+        .filter(|c| c % edge == 0)
         .collect();
+    let candidates = if on_edge.is_empty() {
+        candidates
+    } else {
+        on_edge
+    };
 
     // Weight slots first: of the sizes whose chunks the weights fill within
     // a point of the best, the one the states (kv list, window lists, rs

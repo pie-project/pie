@@ -178,4 +178,7 @@ fn the_grouped_affine_select_lands_its_walk_off_the_wmma_arm() {
         }
         grouped(no_wmma, case);
     }
+    // Bf16 rows of 2-bit codes in groups of 32, the WMMA arm on: a group
+    // holds no whole quad of code words, so the CUDA-core kernel takes it.
+    grouped(grouped_from_one, ([8, 12, 2, 128, 256], 2, 32, true, Bf16));
 }

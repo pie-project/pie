@@ -161,19 +161,27 @@ impl Shell {
         self.pools.name_record(pieces)
     }
 
-    /// Seats the weights a held load left in the serving file, before it
-    /// arms: in pool slots of the load's own choosing, filled from the file,
-    /// where the pool holds them all; else on a pinned copy the fires read
-    /// in place. The runtime's first residency then says where each lies.
-    pub(crate) fn preseat_weights(&mut self) -> crate::Result<()> {
-        self.pools.file_weights();
+    /// Seats the weights of a held load, before it arms: in pool slots of
+    /// the load's own choosing, filled from the serving file (`filed`) or
+    /// the pinned copy it keeps, where the pool holds them all; else a filed
+    /// load's go on a pinned copy the fires read in place. The runtime's
+    /// first residency then says where each lies.
+    /// `copied`: the weights are on a pageable host copy no fire may read
+    /// (`Tier::open`'s held copy); where the pool seats none of them (it
+    /// cannot hold them), the runtime streams them from a pinned copy made
+    /// of it, as from the file's.
+    pub(crate) fn preseat_weights(&mut self, filed: bool, copied: bool) -> crate::Result<()> {
+        if filed {
+            self.pools.file_weights();
+        }
         match self.pools.preseat_plan() {
             Some(plan) => {
                 let chunks = self.pools.weight_chunks(&plan);
                 self.pools.keep_clear(chunks);
                 self.pools.preseat_weights(self.device.stream(), &plan)?;
             }
-            None => self.pools.pin_weight_hosts()?,
+            None if filed || copied => self.pools.pin_weight_hosts()?,
+            None => {}
         }
         self.device.synchronize()?;
         self.pools.release_file_pages();
@@ -260,7 +268,7 @@ impl Shell {
             self.pools.release_file_pages();
         }
         // A set held whole for the load's life is read from the pool alone:
-        // its pinned host copy goes.
+        // its host copy goes.
         let held = self.pools.held_weights();
         if !held.is_empty()
             && let Some(tier) = self.weights.experts_mut()
@@ -271,7 +279,7 @@ impl Shell {
                 self.pools.drop_weight_hosts();
                 eprintln!(
                     "engine-cuda: the weights the pool holds whole are read from it alone; \
-                     {} MiB of their pinned host copy freed",
+                     {} MiB of their host copy freed",
                     freed >> 20
                 );
             }

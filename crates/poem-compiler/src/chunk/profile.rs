@@ -35,6 +35,12 @@ pub struct ChunkProfile {
     /// along its banks' output axis ([`super::weights`]); otherwise the
     /// chunk is never smaller than an expert.
     pub cut_experts: bool,
+    /// Whether an expert slot lays each plane on a whole number of the rows
+    /// a TMA map of its table's window indexes it by ([`super::weights::tma_rows`]),
+    /// the slot and the chunk on a whole number of those boundaries, so every
+    /// entry is whole rows past the pool's base: a backend whose kernels map
+    /// windows (CUDA's tcgen05 and Hopper TMA selects).
+    pub tma_rows: bool,
     /// Whether the backend keeps every state row in f32 whatever the trace
     /// declares (integer rows apart): Metal's recurrent kernels do.
     pub state_f32: bool,
@@ -91,6 +97,7 @@ impl ChunkProfile {
         concurrency: 128,
         context: 32 * 1024,
         cut_experts: false,
+        tma_rows: false,
         state_f32: false,
         rs_mamba2: true,
         token_slot: None,
@@ -110,6 +117,7 @@ impl ChunkProfile {
         concurrency: 4,
         context: 8 * 1024,
         cut_experts: true,
+        tma_rows: false,
         state_f32: true,
         rs_mamba2: false,
         token_slot: None,
@@ -128,6 +136,7 @@ impl ChunkProfile {
         concurrency: 128,
         context: 32 * 1024,
         cut_experts: false,
+        tma_rows: false,
         state_f32: false,
         rs_mamba2: false,
         token_slot: None,

@@ -261,13 +261,20 @@ pub struct RowsShape {
     pub floor: u32,
 }
 
+/// The boundary each plane of an expert's slot lies on.
+pub const PLANE_ALIGN: u64 = 16;
+
 /// One plane of a routed expert: the bank `param`, an expert's `bytes` of
-/// it `offset` into the expert's slot.
+/// it `offset` into the expert's slot, and the row a TMA map of it indexes
+/// (`row`, 0 where none is known): a code, bias or zeros row, or a 128-row
+/// block of scales (`poem_compiler::chunk::weights::tma_rows`), stated where
+/// this device's kernels map windows.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ExpertPlane {
     pub param: u32,
     pub offset: u64,
     pub bytes: u64,
+    pub row: u64,
 }
 
 /// The routed experts of the MoE layers of one size: a slot holds one
@@ -295,43 +302,145 @@ impl ExpertShape {
 }
 
 /// The planes an expert's entry of a packed bank's table lists
-/// (`kernels_cuda::linear::moe::Planes`), by the bank's codes: an MXFP4
-/// bank's `[codes, scales, bias]`, `None` a plane the bank lacks. Empty for
-/// a param that is no packed bank this engine streams.
+/// (`kernels_cuda::linear::moe::Planes`), by the bank's codes: a block-FP8
+/// bank's `[codes, atoms]` (its scales laid at load), an MXFP4
+/// bank's `[codes, scales, bias]`, an NVFP4 bank's `[codes, scales,
+/// tensor_scales]`, an mlx affine bank's (2, 4 or 8 bits) `[codes, scales,
+/// zeros]`; `None` a plane the bank lacks. Empty for a param that is no
+/// packed bank this engine streams.
 #[must_use]
 pub fn packed_planes(trace: &poem_ir::Trace, codes: usize) -> Vec<Option<u32>> {
     let Some(param) = trace.params.get(codes) else {
         return Vec::new();
     };
-    if param.dtype != poem_ir::Dtype::Mxfp4 {
+    use poem_ir::Dtype;
+    let leads = poem_ir::residency::leads(trace);
+    let named = |name: String| {
+        (0..trace.params.len())
+            .find(|at| *at != codes && leads[*at] == codes && trace.params[*at].name == name)
+            .map(|at| at as u32)
+    };
+    let scales = named(poem::declare::scales_name(&param.name));
+    // A block-FP8 (or MXFP8) bank whose scales the load lays in atoms, an
+    // expert's whole 128-row blocks: `[codes, atoms]`.
+    if matches!(
+        param.dtype,
+        Dtype::E4m3 | Dtype::E4m3tile128 | Dtype::E4m3g128
+    ) {
+        let laid = crate::weights::laid_planes(trace).into_iter().any(|laid| {
+            laid.codes == codes && laid.leads > 1 && Some(laid.scales as u32) == scales
+        });
+        return match (laid, scales) {
+            (true, Some(scales)) => vec![Some(codes as u32), Some(scales)],
+            _ => Vec::new(),
+        };
+    }
+    let third = match param.dtype {
+        // Its expert bias where its select adds one (gpt-oss).
+        Dtype::Mxfp4 => match select_bias(trace, codes) {
+            Some(bias) => bias,
+            None => return Vec::new(),
+        },
+        Dtype::Nvfp4 => match named(poem::declare::global_scales_name(&param.name)) {
+            Some(tensor_scales) => Some(tensor_scales),
+            None => return Vec::new(),
+        },
+        // mlx affine codes of 2, 4 or 8 bits (`matmul_select_mlxu4`).
+        Dtype::U2g32
+        | Dtype::U2g64
+        | Dtype::U2g128
+        | Dtype::U4g32
+        | Dtype::U4g64
+        | Dtype::U8g64 => match named(poem::declare::biases_name(&param.name)) {
+            Some(zeros) => Some(zeros),
+            None => return Vec::new(),
+        },
+        _ => return Vec::new(),
+    };
+    match scales {
+        Some(scales) => vec![Some(codes as u32), Some(scales), third],
+        None => Vec::new(),
+    }
+}
+
+/// The expert bias the routed selects of bank `codes` add: `Some(None)`
+/// where none adds one, `None` where they add different ones (no one table
+/// lists them all).
+fn select_bias(trace: &poem_ir::Trace, codes: usize) -> Option<Option<u32>> {
+    use poem_ir::{Def, Fused, Linear, Operation};
+    let weight = |v: poem_ir::ValueId| match trace.values.get(v.0 as usize).map(|d| &d.def) {
+        Some(Def::Weight(w)) => Some(*w),
+        _ => None,
+    };
+    // Every routed select, plain or inside the fused op a load folds it
+    // into (the trace a load seats its banks by is the fused one).
+    let selects = trace.nodes.iter().flat_map(|node| match &node.op {
+        Operation::Linear(select) => vec![select],
+        Operation::Fused(Fused::MoeSelectGlu { select, .. }) => vec![&**select],
+        Operation::Fused(
+            Fused::MoeExperts { select, down, .. } | Fused::MoeMega { select, down, .. },
+        ) => vec![&**select, &**down],
+        _ => Vec::new(),
+    });
+    let mut found: Option<Option<u32>> = None;
+    for select in selects {
+        let Linear::MoeSelect { bank, bias, .. } = select else {
+            continue;
+        };
+        let (bank, bias) = (*bank, *bias);
+        if weight(bank) != Some(codes as u32) {
+            continue;
+        }
+        let this = match bias {
+            Some(bias) => Some(weight(bias)?),
+            None => None,
+        };
+        match found {
+            Some(was) if was != this => return None,
+            _ => found = Some(this),
+        }
+    }
+    Some(found.flatten())
+}
+
+/// The planes of a packed bank that hold one value an expert (an NVFP4
+/// bank's input scales, its activations' calibration): no expert slot
+/// carries them and its table lists none of them; they stay on the device
+/// beside the bank, read where they lie.
+#[must_use]
+pub fn beside_planes(trace: &poem_ir::Trace, codes: usize) -> Vec<u32> {
+    use poem_ir::residency::{Residency, residency};
+    let listed = packed_planes(trace, codes);
+    if listed.is_empty() {
         return Vec::new();
     }
+    let classes = residency(trace);
     let leads = poem_ir::residency::leads(trace);
-    let companions: Vec<usize> = (0..trace.params.len())
-        .filter(|at| *at != codes && leads[*at] == codes)
-        .collect();
-    let scales = poem::declare::scales_name(&param.name);
-    // Its scales and nothing else: a companion this table has no entry for
-    // leaves the bank dense.
-    match companions.as_slice() {
-        [at] if trace.params[*at].name == scales => {
-            vec![Some(codes as u32), Some(*at as u32), None]
-        }
-        _ => Vec::new(),
-    }
+    (0..trace.params.len())
+        .filter(|&plane| {
+            plane != codes
+                && leads[plane] == codes
+                && matches!(classes[plane], Residency::Expert(_))
+                && !listed.contains(&Some(plane as u32))
+                && trace.params[plane].shape.len() == 1
+        })
+        .map(|plane| plane as u32)
+        .collect()
 }
 
 /// The routed banks of `trace` this engine streams an expert at a time:
 /// planes out of the checkpoint read only at the `bank` port of a plain
 /// routed select with no bias, the select whose kernels read an expert
 /// table: a dense bank, or (off tcgen05, whose grouped GEMM reads no table,
-/// and off the HIP build) an MXFP4 bank against bf16 activations, with its
-/// scales.
+/// and off the HIP build) an MXFP4, NVFP4 or affine u4 bank against bf16
+/// activations or (W4A8, W4A4) against the rows its select quantizes, with
+/// the planes its table lists.
 #[must_use]
 pub fn streamed_experts(trace: &poem_ir::Trace) -> Vec<usize> {
     use poem_ir::residency::{Residency, residency};
     use poem_ir::{Def, Linear, Operands, Operation};
     let classes = residency(trace);
+    let leads = poem_ir::residency::leads(trace);
     let packs = !cfg!(feature = "rocm") && !packed_unread();
     let mut out = Vec::new();
     let mut inputs = Vec::new();
@@ -366,11 +475,55 @@ pub fn streamed_experts(trace: &poem_ir::Trace) -> Vec<usize> {
                 {
                     read = true;
                 }
+                // An expert bias summed into the routed rows (gpt-oss's
+                // down leg): a one-plane bank the sum reads through its
+                // table.
+                Operation::Linear(Linear::MoeBiasSum { bias, .. })
+                    if packs
+                        && planes.is_empty()
+                        && matches!(trace.values.get(bias.0 as usize).map(|d| &d.def),
+                            Some(Def::Weight(w)) if *w as usize == at) =>
+                {
+                    read = true;
+                }
+                // An MXFP4 bank's biased select: its bias is the third plane
+                // its table lists.
+                Operation::Linear(Linear::MoeSelect {
+                    bank,
+                    bias: Some(_),
+                    quantized: false,
+                    quant: None,
+                    ..
+                }) if packs
+                    && param.dtype == poem_ir::Dtype::Mxfp4
+                    && planes.get(2).is_some_and(Option::is_some)
+                    && matches!(trace.values.get(bank.0 as usize).map(|d| &d.def),
+                        Some(Def::Weight(w)) if *w as usize == at) =>
+                {
+                    read = true;
+                }
                 Operation::Linear(Linear::MoeSelect {
                     bank,
                     bias: None,
                     quantized: true,
                     quant: None,
+                    ..
+                }) if packs
+                    && !planes.is_empty()
+                    && matches!(trace.values.get(bank.0 as usize).map(|d| &d.def),
+                        Some(Def::Weight(w)) if *w as usize == at) =>
+                {
+                    read = true;
+                }
+                // A select quantizing its rows (W4A8, W4A4): where there are no
+                // tcgen05 GEMMs its block-scaled mma.sync reads a held table and
+                // its bf16-activation arm a streamed one, both in the bank's
+                // row-major planes.
+                Operation::Linear(Linear::MoeSelect {
+                    bank,
+                    bias: None,
+                    quantized: true,
+                    quant: Some(_),
                     ..
                 }) if packs
                     && !planes.is_empty()
@@ -385,17 +538,29 @@ pub fn streamed_experts(trace: &poem_ir::Trace) -> Vec<usize> {
         if !read {
             continue;
         }
-        // A packed bank streams with every plane of it, each an expert's.
+        // A packed bank streams with every plane of it, each an expert's:
+        // the planes its table lists, and no other that lies an expert at a
+        // time (it would have no entry).
         let companions: Vec<usize> = planes
             .iter()
             .flatten()
             .map(|plane| *plane as usize)
             .filter(|plane| *plane != at)
             .collect();
-        if companions.iter().all(|plane| {
-            matches!(classes[*plane], Residency::Expert(_))
-                && trace.params[*plane].source == poem_ir::ParamSource::Checkpoint
-        }) {
+        let beside = beside_planes(trace, at);
+        let unlisted = (0..trace.params.len()).any(|plane| {
+            plane != at
+                && leads[plane] == at
+                && matches!(classes[plane], Residency::Expert(_))
+                && !companions.contains(&plane)
+                && !beside.contains(&(plane as u32))
+        });
+        if !unlisted
+            && companions.iter().all(|plane| {
+                matches!(classes[*plane], Residency::Expert(_))
+                    && trace.params[*plane].source == poem_ir::ParamSource::Checkpoint
+            })
+        {
             out.push(at);
             out.extend(companions);
         }
@@ -408,17 +573,30 @@ pub fn streamed_experts(trace: &poem_ir::Trace) -> Vec<usize> {
         ..poem_compiler::DeviceProfile::default()
     };
     let budgets = poem_compiler::Budgets::of(poem_compiler::Budget::default());
-    let Ok(recipe) = poem_compiler::chunk::plan(trace, &budgets, &profile) else {
+    let view = crate::weights::laid_view(trace);
+    let Ok(recipe) = poem_compiler::chunk::plan(&view, &budgets, &profile) else {
         return Vec::new();
     };
+    // A plane held beside its bank stays out, and keeps no layer out.
+    let beside: Vec<usize> = out
+        .iter()
+        .flat_map(|&bank| beside_planes(trace, bank))
+        .map(|plane| plane as usize)
+        .collect();
     let mut whole = Vec::new();
     for slot in &recipe.weights {
         if slot.kind != poem_compiler::chunk::WeightKind::Expert {
             continue;
         }
-        let params = || slot.banks.iter().flat_map(|bank| bank.params.iter());
-        if params().all(|param| out.contains(&(*param as usize))) {
-            whole.extend(params().map(|param| *param as usize));
+        let params = || {
+            slot.banks
+                .iter()
+                .flat_map(|bank| bank.params.iter())
+                .map(|param| *param as usize)
+                .filter(|param| !beside.contains(param))
+        };
+        if params().all(|param| out.contains(&param)) {
+            whole.extend(params());
         }
     }
     whole.sort_unstable();
@@ -631,7 +809,11 @@ impl Layout {
     /// routed banks streamed an expert at a time, each with its plane's
     /// bytes; a weight slot the recipe lays with a plane outside them stays
     /// as the load seats it, no atom of it cached.
-    pub fn of(recipe: &ChunkRecipe, streamed: &[usize], banks: &[(usize, u64)]) -> Result<Layout> {
+    pub fn of(
+        recipe: &ChunkRecipe,
+        streamed: &[usize],
+        banks: &[(usize, u64, u64)],
+    ) -> Result<Layout> {
         let chunk_bytes = recipe.chunk_bytes;
         let list = recipe
             .list()
@@ -727,22 +909,48 @@ impl Layout {
             for bank in &slot.banks {
                 let mut at = 0u64;
                 let mut planes = Vec::with_capacity(bank.params.len());
+                let mut laid = 0;
                 for &param in &bank.params {
-                    let Some(&(_, bytes)) = banks.iter().find(|(held, _)| *held == param as usize)
+                    let Some(&(_, bytes, rows)) =
+                        banks.iter().find(|(held, ..)| *held == param as usize)
                     else {
                         break;
                     };
                     if bank.atoms != count || count == 0 || !bytes.is_multiple_of(count) {
                         break;
                     }
+                    // A plane with TMA rows on its boundary, as the recipe
+                    // laid the slot; every plane on a 16-byte boundary of
+                    // the slot, as its kernels' vector loads read it.
+                    if rows > 0 && bytes > 0 {
+                        at = at.next_multiple_of(poem_compiler::chunk::weights::plane_boundary(
+                            bytes / count,
+                            rows,
+                        ));
+                    }
+                    if !at.is_multiple_of(PLANE_ALIGN) {
+                        break;
+                    }
+                    laid += 1;
+                    // A plane held beside the bank (no bytes): no part of the
+                    // slot.
+                    if bytes == 0 {
+                        continue;
+                    }
+                    let per = bytes / count;
                     planes.push(ExpertPlane {
                         param,
                         offset: at,
-                        bytes: bytes / count,
+                        bytes: per,
+                        row: if rows > 0 && per.is_multiple_of(rows) {
+                            per / rows
+                        } else {
+                            0
+                        },
                     });
                     at += bytes / count;
                 }
-                if planes.len() == bank.params.len() && at <= slot.bytes {
+                if laid == bank.params.len() && at <= slot.bytes {
                     layers.push(planes);
                 }
             }
