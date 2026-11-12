@@ -315,6 +315,13 @@ impl Chunks {
         self.range.high_water_bytes()
     }
 
+    /// The most the committed segments have backed, the activation's held
+    /// spans apart.
+    #[must_use]
+    pub fn segment_high_water_bytes(&self) -> u64 {
+        self.range.segment_high_water_bytes()
+    }
+
     #[must_use]
     pub fn committed_segments(&self) -> u32 {
         self.range.committed_segments()

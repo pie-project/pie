@@ -842,6 +842,9 @@ pub struct Range {
     /// The bytes from the range's start a committed segment backs at most:
     /// past them a segment backs nothing ([`Range::limit`]).
     limit: u64,
+    /// The most bytes the committed segments have backed, the held spans
+    /// apart.
+    segment_high: u64,
 }
 
 impl Range {
@@ -859,6 +862,7 @@ impl Range {
             committed: 0,
             held: Vec::new(),
             limit: u64::MAX,
+            segment_high: 0,
         })
     }
 
@@ -922,6 +926,13 @@ impl Range {
     #[must_use]
     pub const fn high_water_bytes(&self) -> u64 {
         self.arena.high_water
+    }
+
+    /// The most bytes the committed segments have backed: the high water
+    /// of what the segments' prefix ever held, the held spans apart.
+    #[must_use]
+    pub const fn segment_high_water_bytes(&self) -> u64 {
+        self.segment_high
     }
 
     /// The address of `offset`, where `len` bytes from it are backed.
@@ -994,6 +1005,7 @@ impl Range {
         let outcome = commit_atomically(pool, &mut targets)?;
         if outcome == Commit::Committed {
             self.committed = segments;
+            self.segment_high = self.segment_high.max(self.segment_bytes_committed());
         }
         Ok(outcome)
     }

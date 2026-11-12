@@ -919,10 +919,32 @@ impl Shell {
             return std::collections::BTreeSet::new();
         }
         let price = spent.bytes / spent.bodies;
-        let room = self.bodies_mem.saturating_sub(spent.bytes);
+        let mut room = self.bodies_mem.saturating_sub(spent.bytes);
         let was = self.budget.buckets.clone();
         let mut buckets = was.clone();
         let need = |buckets: &[u32]| price * rest.iter().filter(|b| buckets.contains(b)).count();
+        // A profile's allowance stretches to the profile's lattice, as far
+        // as the fit before arming held the bodies and the device has free;
+        // an operator's stays as stated.
+        let short = need(&buckets).saturating_sub(room);
+        if short > 0 && !self.bodies_stated {
+            let spare = self.pools.spare_bytes_for_bodies(0).unwrap_or(0);
+            let spare = usize::try_from(spare).unwrap_or(usize::MAX);
+            let more = short
+                .min(self.bodies_ceiling.saturating_sub(self.bodies_mem))
+                .min(spare.saturating_sub(room));
+            if more > 0 {
+                eprintln!(
+                    "engine-cuda: the bodies' allowance stretches {} -> {} MiB to arm the \
+                     profile's lattice ({} MiB of the cache rows' room held for it)",
+                    self.bodies_mem >> 20,
+                    (self.bodies_mem + more) >> 20,
+                    self.bodies_ceiling.saturating_sub(self.bodies_mem) >> 20,
+                );
+                self.bodies_mem += more;
+                room += more;
+            }
+        }
         while need(&buckets) > room {
             if fine <= steps.max(1) {
                 eprintln!(
