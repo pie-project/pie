@@ -286,6 +286,36 @@ pub struct Partition {
     /// gpt-oss: attention columns of a unit row (`AX`); the rest are MoE columns.
     pub attn_cols: Option<u32>,
     pub head: HeadPartition,
+    /// Stacked unit columns' placement (a side input's storage above them), where the layers
+    /// take that layout ([`super::compose::Layout::Stacked`]).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub arrangement: Option<Arrangement>,
+}
+
+/// Stacked unit columns, as a plan places them: unit column A at x 0 holds `a_units` top to
+/// bottom, stacked from row `a_top`; unit column B, east of it, holds each of `b_units` level with
+/// a column-A unit; above each column's top unit its side input's storage block. Unit index
+/// order is the handoff order (unit 0 takes the embedding); the head sits east of column B. An
+/// arrangement is made for one unit shape (`unit`: weight columns, rows, units) and refused for
+/// any other ([`super::compose::stacked`]).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Arrangement {
+    pub unit: (u32, u32, u32),
+    pub a_top: u32,
+    pub a_units: Vec<u32>,
+    /// (unit, the column-A unit it sits level with), top to bottom.
+    pub b_units: Vec<(u32, u32)>,
+    /// Column A's storage, column B's.
+    pub stores: [StoreSpec; 2],
+}
+
+/// A side input's storage block: rows above its column's top unit, tokens a storage PE, the
+/// bus's colour.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StoreSpec {
+    pub rows: u32,
+    pub tokens: u32,
+    pub bus: u8,
 }
 
 /// A run of rows with the same dims and role (Gemma 12B: attention rows `r < RA`, plain rows).
@@ -487,6 +517,10 @@ pub struct Preset {
     /// preset's; [`Shape::signature`]): a plan with no preset named prefers it for that shape.
     #[serde(default)]
     pub made_for: Option<[u32; 3]>,
+    /// The stacked unit columns' placement the preset's program was measured with (its unit
+    /// shape's; [`Partition::arrangement`]).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub arrangement: Option<Arrangement>,
 }
 
 impl Preset {
@@ -496,6 +530,7 @@ impl Preset {
             keys: keys.iter().map(|(k, v)| (k.to_string(), *v)).collect(),
             levers: String::new(),
             made_for: None,
+            arrangement: None,
         }
     }
 

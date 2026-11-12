@@ -8,17 +8,13 @@
 use crate::tiles::spec::Spec;
 
 use crate::abi::Kernels;
-use crate::block::head::{HeadCopies, Hemb};
-use crate::block::units::UnitCopies;
-use crate::compose::KernelCopies;
 use crate::family::{Family, MadeFor, Row, ceil_to, table};
 use crate::kernels::gemma;
 use crate::plan::{
-    Contract, FamilyId, HeadPartition, KvEntries, LayerKind, Partition, Plan, Preset, ReduceGroups,
-    RowRun, Segments, Shape,
+    Arrangement, Contract, FamilyId, HeadPartition, KvEntries, LayerKind, Partition, Plan, Preset,
+    ReduceGroups, RowRun, Segments, Shape, StoreSpec,
 };
 use crate::program::Program;
-use crate::weights::{Slice, Transform, from};
 
 mod cut;
 
@@ -52,14 +48,59 @@ const PRESETS: &[Row<7>] = &[
 /// The model each shipping preset was measured on.
 const MADE_FOR: &[MadeFor] = &[("e2b", [1536, 35, 6144]), ("e4b", [2560, 42, 10240])];
 
+/// The stacked arrangement of each preset's unit shape (weight columns, rows, units): its
+/// floorplan. A new size adds one.
+fn arrangement(unit: (u32, u32, u32)) -> Option<Arrangement> {
+    let store = |rows, tokens, bus| StoreSpec { rows, tokens, bus };
+    let (a_top, a_units, b_units, stores) = match unit {
+        // the tiny simulation: E2B's arrangement in small (unit 0 shares the last unit's rows, as
+        // the head's turns need)
+        (8, 8, 5) => (
+            4,
+            vec![4, 3, 2],
+            vec![(0, 4), (1, 2)],
+            [store(4, 128, 17), store(2, 256, 10)],
+        ),
+        // E2B: column A units 6 .. 2 down to the wafer's last row (1153), column B units 0 (level
+        // with 6) and 1 (level with 2)
+        (256, 128, 7) => (
+            1153 - 129 * 5,
+            vec![6, 5, 4, 3, 2],
+            vec![(0, 6), (1, 2)],
+            [store(345, 760, 17), store(138, 1900, 10)],
+        ),
+        // E4B: column A units 6 .. 3, column B units 0, 1, 2 level with 6, 5, 3
+        (256, 160, 7) => (
+            1153 - 161 * 4,
+            vec![6, 5, 4, 3],
+            vec![(0, 6), (1, 5), (2, 3)],
+            [store(332, 791, 17), store(249, 1055, 10)],
+        ),
+        _ => return None,
+    };
+    Some(Arrangement {
+        unit,
+        a_top,
+        a_units,
+        b_units,
+        stores,
+    })
+}
+
 impl Family for Gemma {
     fn presets(&self) -> Vec<Preset> {
-        table(
+        let mut out = table(
             ["PX", "PY", "NU", "HR", "NEG", "G2", "G2W"],
             PRESETS,
             &[("LOOP", 64.0)],
             MADE_FOR,
-        )
+        );
+        for p in &mut out {
+            if let (Some(px), Some(py), Some(nu)) = (p.int("PX"), p.int("PY"), p.int("NU")) {
+                p.arrangement = arrangement((px, py, nu));
+            }
+        }
+        out
     }
 
     /// Units of K = layers / NU (S .. S G); a row's dims the hidden over PY; the sliding window
@@ -131,6 +172,7 @@ impl Family for Gemma {
                 vocab_rows: ceil_to(s.vocab, hr, 8),
                 ..Default::default()
             },
+            arrangement: pr.arrangement.clone().filter(|a| a.unit == (px, py, nu)),
         };
         let contract = Contract {
             positions: neg * pyw,
@@ -147,39 +189,6 @@ impl Family for Gemma {
             partition,
             contract,
             levers: pr.levers.clone(),
-        })
-    }
-
-    /// The arrangement's units, the scores segments a half row, the PLE storage of each unit
-    /// column, the shared-KV line, the head east of the units (fed the embedding inline), the
-    /// token loop.
-    fn copies(&self, plan: &Plan) -> R<KernelCopies> {
-        let p = &plan.partition;
-        let hr = p.head.rows;
-        Ok(KernelCopies {
-            units: Some(UnitCopies {
-                cols: p.cols,
-                rows: p.rows,
-                w_from: Vec::new(),
-                gam_b16: false,
-                gam_from: Vec::new(),
-                cy: &[("qkw", true), ("rot", false)],
-                cy_optional: false,
-            }),
-            head: Some(HeadCopies {
-                cols: p.head.cols,
-                rows: hr,
-                hw: |_, rows, cols| Slice::of("hw", None, vec![rows, cols]),
-                hw_from: vec![(
-                    "embed_tokens".into(),
-                    vec![Transform::PadLastRow {
-                        to: hr * p.head.vocab_rows,
-                    }],
-                )],
-                hg_from: from("norm"),
-                hemb: Hemb::Inline(Vec::new()),
-            }),
-            ..Default::default()
         })
     }
 

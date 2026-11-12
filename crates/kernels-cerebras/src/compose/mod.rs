@@ -13,9 +13,10 @@
 //! - the head (east of the units, by row groups of the runs, or a band below a MoE snake) and the
 //!   token loop close the program.
 //!
-//! What the family's kernels read off each block's PEs (their ABI with the host) is the
-//! family's still: [`KernelCopies`].
+//! What the role kernels read off each block's PEs (their ABI with the host) follows the layout
+//! ([`copies`]); what the kernels do not run is refused by name ([`refuse`]).
 
+pub mod copies;
 pub mod stacked;
 
 use poem_compiler::spatial::layer::{LayerProgram, Mixer, Phase};
@@ -34,7 +35,7 @@ use crate::block::shared_kv::SharedKv;
 use crate::block::token_loop::TokenLoop;
 use crate::block::units::{UnitCopies, Units};
 use crate::floor::{UnitGrid, UnitLayout};
-use crate::plan::Plan;
+use crate::plan::{Act, Plan, Shape};
 
 type R<T> = Result<T, String>;
 
@@ -183,6 +184,17 @@ pub enum Layout {
 }
 
 impl Layout {
+    /// The layout's name (the plan's record, error messages).
+    #[must_use]
+    pub fn name(self) -> &'static str {
+        match self {
+            Layout::Snake => "snake",
+            Layout::Stacked => "stacked",
+            Layout::Runs => "runs",
+            Layout::Split => "split",
+        }
+    }
+
     /// The layout layers that need `needs` take.
     #[must_use]
     pub fn of(needs: &Needs) -> Layout {
@@ -195,6 +207,49 @@ impl Layout {
         } else {
             Layout::Snake
         }
+    }
+}
+
+/// Refuses, by name, what `shape` needs that the role kernels of its layout do not run (else the
+/// program would run the model without it). The snake, the stacked columns and the row runs run
+/// no projection biases or sinks; the attention / MoE halves run full and sliding-window attention
+/// with or without q / k / v and output biases, sinks or q / k head norms (not head norms and
+/// biases at once: the biases' words hold the norms' weights), a router with or without its bias,
+/// MXFP4 or 16-bit experts with or without biases, and the clamped SwiGLU or SiLU's GLU.
+pub fn refuse(shape: &Shape) -> R<()> {
+    let layout = Layout::of(&Needs::of(&crate::layers::of(shape)));
+    let a = &shape.attn;
+    let (unmet, kernels): (Vec<(bool, &str)>, &str) = if layout == Layout::Split {
+        (
+            vec![
+                (
+                    a.bias && a.qk_norm,
+                    "q / k / v biases together with q / k head norms",
+                ),
+                (a.output_gate, "an attention output gate"),
+                (
+                    !matches!(shape.mlp.act, Act::SwigluOai | Act::Silu),
+                    "an expert activation other than the clamped SwiGLU or SiLU's",
+                ),
+                (shape.ple.is_some(), "per-layer inputs"),
+                (shape.norm.sandwich, "sandwich norms"),
+                (shape.head.final_softcap.is_some(), "a final logit softcap"),
+            ],
+            "MoE",
+        )
+    } else {
+        (
+            vec![
+                (a.bias, "q / k / v projection biases"),
+                (a.o_bias, "an output projection bias"),
+                (a.sinks, "attention sinks"),
+            ],
+            layout.name(),
+        )
+    };
+    match unmet.iter().find(|(on, _)| *on) {
+        Some((_, what)) => Err(format!("the {kernels} kernels run no {what}")),
+        None => Ok(()),
     }
 }
 
@@ -227,6 +282,10 @@ pub struct Schedule {
     pub xb: u32,
     /// (MoE halves) the experts' GLU: 0 the clamped SwiGLU, 1 SiLU's.
     pub glu: u32,
+    /// (row runs) 1: a global layer projects q | raw k and takes v as k's unscaled norm (the
+    /// row runs' cut leaves a global layer's v rows out: Gemma 4's k = v checkpoints, which the
+    /// trace's packed bank does not tell apart).
+    pub kev: u32,
 }
 
 impl Schedule {
@@ -260,6 +319,7 @@ impl Schedule {
             rb: u32::from(needs.router_bias),
             xb: u32::from(needs.expert_bias),
             glu: u32::from(program.bodies.iter().any(|b| b.glu == Some(GluAct::Swiglu))),
+            kev: u32::from(Layout::of(needs) == Layout::Runs),
         }
     }
 
@@ -283,9 +343,9 @@ pub fn snake_gap(units: u32, (unx, uny): (u32, u32)) -> R<Option<(u32, u32)>> {
     }
 }
 
-/// What a family's kernels read off the PEs of the blocks the composer places: the copies onto
-/// each kind (the kernels' ABI with the host, a family's until one kernel set serves every layer
-/// program). A kind the kernels have no copies for is a kind they do not run.
+/// What the role kernels read off the PEs of the blocks the composer places: the copies onto
+/// each kind (the kernels' ABI with the host, by layout: [`copies::of`]). A kind the kernels have
+/// no copies for is a kind they do not run.
 #[derive(Default)]
 pub struct KernelCopies {
     pub units: Option<UnitCopies>,
@@ -394,11 +454,12 @@ fn split_snake(plan: &Plan) -> R<UnitGrid> {
 }
 
 /// The blocks of `plan` for layers that need `needs`, in order (the units first, then what is
-/// placed against them), each block's copies the kernels' (`copies`).
-pub fn blocks(plan: &Plan, needs: &Needs, copies: KernelCopies) -> R<Vec<Box<dyn Block>>> {
+/// placed against them), each block's copies the layout's kernels' ([`copies::of`]).
+pub fn blocks(plan: &Plan, needs: &Needs) -> R<Vec<Box<dyn Block>>> {
     let p = &plan.partition;
     let token_loop = plan.contract.token_loop;
     let layout = Layout::of(needs);
+    let copies = copies::of(plan, layout)?;
     let mut out: Vec<Box<dyn Block>> = Vec::new();
     if layout == Layout::Split {
         out.push(Box::new(MoeUnits {
@@ -425,7 +486,7 @@ pub fn blocks(plan: &Plan, needs: &Needs, copies: KernelCopies) -> R<Vec<Box<dyn
         return Ok(out);
     }
     if layout == Layout::Stacked {
-        let arr = stacked::Arrangement::of(plan)?;
+        let arr = crate::plan::Arrangement::of(plan)?;
         out.push(Box::new(Units {
             grid: grid(
                 plan,

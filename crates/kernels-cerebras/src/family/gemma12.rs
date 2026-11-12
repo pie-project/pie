@@ -6,9 +6,6 @@
 //! way. Blocks (by [`crate::compose`]): `RowRuns`, `HeadGroups`. Kernels: [`gemma12`].
 
 use crate::abi::Kernels;
-use crate::block::head::{HeadCopies, Hemb};
-use crate::block::row_runs::RunCopies;
-use crate::compose::KernelCopies;
 use crate::family::{Family, MadeFor, Row, ceil_to, table};
 use crate::kernels::gemma12::{self, Dims};
 use crate::plan::{
@@ -17,7 +14,6 @@ use crate::plan::{
 };
 use crate::program::Program;
 use crate::tiles::spec::Spec;
-use crate::weights::{Slice, Transform, from};
 
 pub struct Gemma12;
 
@@ -37,9 +33,14 @@ const PRESETS: &[Row<13>] = &[
         "g12",
         [344, 283, 1153, 12, 15, 128, 43, 6, 5, 8, 32, 16, 24],
         "",
-        "DIAG:0",
+        "DIAG:0,GELUT:1",
     ),
-    ("tiny", [8, 8, 18, 2, 3, 3, 4, 3, 2, 4, 12, 2, 2], "", ""),
+    (
+        "tiny",
+        [8, 8, 18, 2, 3, 3, 4, 3, 2, 4, 12, 2, 2],
+        "",
+        "GELUT:1",
+    ),
 ];
 
 /// The model each shipping preset was measured on.
@@ -134,6 +135,7 @@ impl Family for Gemma12 {
                     vocab_rows: ceil_to(s.vocab, hr, 8),
                     groups: Some(groups),
                 },
+                arrangement: None,
             },
             contract: Contract {
                 positions: neg * ra,
@@ -149,46 +151,6 @@ impl Family for Gemma12 {
         // the kernels' shape of it (q heads a segment, the MLP's columns) must hold
         Dims::of(&plan)?;
         Ok(plan)
-    }
-
-    /// The units with their row runs, the grouped head. Copies: per unit and run block its
-    /// weights (bf16 -> f16) and gammas, its CY row's q / k norms and RoPE tables; the head in
-    /// its two halves' files (one is over the 2 GiB a staged file may take), its rows padded with
-    /// the embedding's last.
-    fn copies(&self, plan: &Plan) -> R<KernelCopies> {
-        let p = &plan.partition;
-        let f16 = vec![
-            "self_attn.{q,k,v,o}_proj.weight",
-            "mlp.{gate,up,down}_proj.weight",
-        ]
-        .into_iter()
-        .map(|n| (n.to_string(), vec![Transform::Bf16ToF16]))
-        .collect();
-        Ok(KernelCopies {
-            runs: Some(RunCopies {
-                w_from: f16,
-                cy: &[("qkw", true), ("rot", false)],
-            }),
-            head: Some(HeadCopies {
-                cols: p.head.cols,
-                rows: p.head.rows,
-                hw: |i, rows, (c0, c1)| {
-                    Slice::of(&format!("hw{i}"), None, vec![rows, (0, c1 - c0)])
-                },
-                hw_from: vec![(
-                    "embed_tokens.weight".into(),
-                    vec![
-                        Transform::PadLastRow {
-                            to: p.head.rows * p.head.vocab_rows,
-                        },
-                        Transform::Bf16ToF16,
-                    ],
-                )],
-                hg_from: from("norm.weight"),
-                hemb: Hemb::None,
-            }),
-            ..Default::default()
-        })
     }
 
     fn kernels(&self, prog: &Program) -> R<Kernels> {

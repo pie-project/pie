@@ -6,17 +6,14 @@
 //! [`gptoss`].
 
 use crate::abi::Kernels;
-use crate::block::moe::MoeCopies;
-use crate::compose::KernelCopies;
 use crate::family::{Family, MadeFor, Row, ceil_to, table};
-use crate::kernels::gptoss::{self, Dims};
+use crate::kernels::gptoss;
 use crate::plan::{
-    Act, Contract, FamilyId, HeadPartition, KvEntries, Partition, Plan, Preset, ReduceGroups,
-    RowRun, Segments, Shape,
+    Contract, FamilyId, HeadPartition, KvEntries, Partition, Plan, Preset, ReduceGroups, RowRun,
+    Segments, Shape,
 };
 use crate::program::Program;
 use crate::tiles::spec::Spec;
-use crate::weights::Transform;
 
 mod cut;
 
@@ -158,6 +155,7 @@ impl Family for GptOss {
                 vocab_rows: ceil_to(s.vocab, hvc, 8),
                 ..Default::default()
             },
+            arrangement: None,
         };
         let contract = Contract {
             positions: ne * py,
@@ -177,34 +175,6 @@ impl Family for GptOss {
         })
     }
 
-    fn copies(&self, plan: &Plan) -> R<KernelCopies> {
-        let d = Dims::of(plan)?;
-        let k = d.k;
-        let lwa = d.hcc * d.nqa + d.qo * d.hcc;
-        Ok(KernelCopies {
-            moe: Some(MoeCopies {
-                w: k * lwa,
-                wx: k * d.nex * d.xe,
-                wr: k * d.hcc,
-                cx: [2 * k * d.hcc, k * d.hcc, k * d.nex * d.hcc],
-                cya: [k * d.nqa, k * d.qh, d.nlv * 8 * 2 * d.nrot],
-                cym: [k, k * d.nex * 2 * d.ic, k * d.nex * 2],
-                wx_from: if plan.shape.moe.is_some_and(|m| m.quantized) {
-                    vec![(
-                        "model.layers.*.mlp.experts.{gate_up,down}_proj_blocks".to_string(),
-                        vec![Transform::Mxfp4ToE5m2],
-                    )]
-                } else {
-                    vec![(
-                        "model.layers.*.mlp.experts.*.{gate_proj,up_proj,down_proj}".to_string(),
-                        vec![Transform::Bf16ToF16],
-                    )]
-                },
-            }),
-            ..Default::default()
-        })
-    }
-
     fn kernels(&self, prog: &Program) -> R<Kernels> {
         gptoss::kernels(prog)
     }
@@ -215,31 +185,5 @@ impl Family for GptOss {
 
     fn symbols(&self) -> &'static [(&'static str, &'static str)] {
         gptoss::SYMBOLS
-    }
-
-    /// The attention and MoE halves run full and sliding-window attention with or without q / k
-    /// / v and output biases, sinks or q / k head norms (not head norms and biases at once: the
-    /// biases' words hold the norms' weights), a router with or without its bias, MXFP4 or
-    /// 16-bit experts with or without biases, and the clamped SwiGLU or SiLU's GLU.
-    fn runs(&self, s: &Shape) -> R<()> {
-        let a = &s.attn;
-        let unmet = [
-            (
-                a.bias && a.qk_norm,
-                "q / k / v biases together with q / k head norms",
-            ),
-            (a.output_gate, "an attention output gate"),
-            (
-                !matches!(s.mlp.act, Act::SwigluOai | Act::Silu),
-                "an expert activation other than the clamped SwiGLU or SiLU's",
-            ),
-            (s.ple.is_some(), "per-layer inputs"),
-            (s.norm.sandwich, "sandwich norms"),
-            (s.head.final_softcap.is_some(), "a final logit softcap"),
-        ];
-        match unmet.iter().find(|(on, _)| *on) {
-            Some((_, what)) => Err(format!("the MoE kernels run no {what}")),
-            None => Ok(()),
-        }
     }
 }

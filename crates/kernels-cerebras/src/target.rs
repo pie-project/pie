@@ -596,7 +596,7 @@ pub struct Ask {
 impl Ask {
     fn target(&self, shape: Shape) -> R<Wafer> {
         Preset::default().set(&self.set)?;
-        family::of(family::serving(&shape)).runs(&shape)?;
+        super::compose::refuse(&shape)?;
         Ok(Wafer {
             shape,
             preset: self.preset.clone(),

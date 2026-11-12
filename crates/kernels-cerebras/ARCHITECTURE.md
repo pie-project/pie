@@ -40,8 +40,8 @@ Modules are under `src/`.
 | ABI | `abi.rs` | `Kernel` (source, owned symbols, params' names, route slots, rcfg writer), `params!` (a kernel's typed params struct), `words!` (an rcfg word layout), `KernelBuild`, `Kernels`, `Overrides` | the build's view of a kernel |
 | Kernels | `kernels/` | `Pe` (one PE as an rcfg writer sees it); `common` (the word layouts every family's weight / CX / CY / head / head control kernel shares, its codes named, the relay); `head` (`head_pe.csl`, `head_ctl.csl`); one module a family's own kernels: `dense`, `gptoss`, `gemma`, `gemma12` | the CSL kernels' ABI |
 | Layers | `layers.rs` | the plan's layer program (`poem_compiler::spatial::layer::LayerProgram`), stated from its shape; pinned to the trace's lowering | the shape |
-| Composer | `compose/` | `Needs` and `Schedule` (read off the layer program), `blocks` (the blocks a program's needs take), `KernelCopies` (what a family's kernels read off each block), `stacked` (the stacked unit columns' arrangements) | the blocks |
-| Families | `family/` | `serving` (the family a shape needs); `dense`, `gptoss`, `gemma`, `gemma12`: presets, the plan of a shape under a preset, the kernels and their copies, the cut's statement | the model's shape |
+| Composer | `compose/` | `Needs` and `Schedule` (read off the layer program), `blocks` (the blocks a program's needs take), `KernelCopies` (what the role kernels read off each block, by layout: `copies`), `refuse` (what the layout's kernels do not run, by name), `stacked` (the plan's stacked arrangement laid out) | the blocks |
+| Families | `family/` | `serving` (the family a shape needs); `dense`, `gptoss`, `gemma`, `gemma12`: presets (the stacked ones with their arrangement), the plan of a shape under a preset, the kernels, the cut's statement | the model's shape |
 | Emit | `emit/` | rcfg, kernel params (levers, overrides) and `layout.csl`, `HostLayout` (everything the host driver reads and writes on the wafer) | kernel builds |
 | Weights | `weights.rs` | `Binding`s (symbol, rect, source, transforms), `Copies`, the placer | the device |
 | Program | `program.rs` | `Program { plan, blocks, floor, wiring, palette, fabric, kernels, overrides, family }`, `build`, `bindings` | all of the above |
@@ -113,23 +113,23 @@ The hardware lessons of the bring-up, made checks:
 | `row_runs::RowRuns { grid, copies }` | units as `Units` | `unit_chains`; scores segments on the attention runs' rows only | `HC`, `ATT` (`ATT_ROW`, `PLAIN_ROW`) overrides: a weight / CX PE's run's dims, a weight PE's run's role | `RunCopies` per unit and run block (`w{u}a` / `w{u}w`, `gama` / `gamw`, the CY tables) |
 | `head_groups::HeadGroups { cols, rows, copies }` | the head east of the units (token loop on) | `head_rows`; per group the x chain north on the last unit (`HEAD_GROUP`), its root east, the column multicast; the embedding back up, down, west into unit 0 and down the chain; the max-reduce | `HEAD_GROUP`; slots `CHAIN_IN`, `CHAIN_OUT`, `CAST`; notes `FORWARD`, `head::ROLE`, `token_loop::TURN` | `HeadCopies` |
 
-The role kernels' layer phases come from the plan's layer program (`compose::Schedule`: `NRM` from a deferred norm or the expert halves, `MIXK` from the mixers, `ACT` from the MLP's gate activation, `PLE` from a side input, `KVS` from a shared cache, `HG` from the row-run layout: `compose::Layout`, the one choice the blocks follow too), on `Program::schedule`; every family's kernels read them there. Row roles (`AROW`) are the row runs' per-PE overrides; k = v layers (`KEV`, a checkpoint with no global `v_proj`: not a trace fact) and the GELU form (`GELUT`, a lever) are still their family's.
+The role kernels' layer phases come from the plan's layer program (`compose::Schedule`: `NRM` from a deferred norm or the expert halves, `MIXK` from the mixers, `ACT` from the MLP's gate activation, `PLE` from a side input, `KVS` from a shared cache, `HG` from the row-run layout: `compose::Layout`, the one choice the blocks follow too), on `Program::schedule`; every family's kernels read them there. Row roles (`AROW`) are the row runs' per-PE overrides; k = v layers (`KEV`) are the row-run layout's (`Schedule::kev`: its cut leaves a global layer's v rows out, for a checkpoint with no global `v_proj`, which the trace's packed bank does not tell apart); the GELU form (`GELUT`) is a lever the plan carries (Gemma 4 12B's: `GELUT:1`).
 
 Compositions: the composer (`compose/`) picks the blocks from what the layers need (`compose::Needs`, read off the plan's layer program, `layers.rs`):
 
 - routed experts: `MoeUnits` (attention | MoE halves, a snake of two unit columns starting upward), `AttnScores`, `Router`, `Band`, `BandLoop` under the token loop;
-- a side input or a cache read across layers: `Units` at the explicit origins of the stacked arrangement its unit shape names (`compose::stacked`), `Scores`, `Ple` for a side input, `SharedKv` for a shared cache, `HeadEast`, `TokenLoop`;
+- a side input or a cache read across layers: `Units` at the explicit origins of the plan's stacked arrangement (`Partition::arrangement`, made for its unit shape: `compose::stacked`), `Scores`, `Ple` for a side input, `SharedKv` for a shared cache, `HeadEast`, `TokenLoop`;
 - sliding windows (else): `RowRuns` (attention / plain row runs, a U of two unit columns), `HeadGroups`;
 - otherwise: `Units` (snake, at most one gap slot), `Scores` when any layer attends over its own cache, `Gdn` + `Onorm` when any is GDN, `HeadEast`, `TokenLoop` under the token loop.
 
-What each block's PEs hold is the family kernels' (`Family::copies`). The families' kernels:
+What each block's PEs hold is the layout kernels' (`compose::copies`). The families' kernels:
 
 | Family | Composed as | Kernels |
 |---|---|---|
 | Dense (Qwen3.5, Qwen3, Llama 3) | the snake | `kernels::dense` (`weight` (NRM 0, MIXK 0), `cx` (NRM 0), `cy` (MIXK 0, NRM 0)) + `head` + `common::RELAY` |
 | gpt-oss (and any MoE model: Qwen3 MoE) | routed experts | `kernels::gptoss` (`wa`, `wm`: `weight` (MIXK 2, 3), `cx`, `cya`, `cym`, the band head; `head_ctl.csl` with the bus reserved) |
 | Gemma 4 E2B / E4B | a side input and shared caches | `kernels::gemma` (`weight` (NRM 1, MIXK 1, PLE 1), `cx` (NRM 1, PLE 1), `cy` (NRM 1, MIXK 1, PLE 1, KVS 1), `head_ctl` (token bus on), `ple_gemma`) + `head::HEAD_PE` |
-| Gemma 4 12B | sliding windows | `kernels::gemma12` (`weight` (NRM 1, MIXK 1, row roles by `AROW`), `cx` (NRM 1, HG 1), `cy` (NRM 1, MIXK 1, KEV 1), `head_pe` with head groups) + `head::HEAD_CTL` |
+| Gemma 4 12B | sliding windows | `kernels::gemma12` (`weight` (NRM 1, MIXK 1, row roles by `AROW`), `cx` (NRM 1, HG 1), `cy` (NRM 1, MIXK 1, KEV 1 from `Schedule::kev`), `head_pe` with head groups) + `head::HEAD_CTL` |
 
 ## Kernels and their ABI
 

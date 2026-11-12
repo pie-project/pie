@@ -58,8 +58,8 @@ params! {
 }
 
 params! {
-    /// `cy.csl` (NRM 1, MIXK 1, ACT 1, KEV 1): the weight kernel's shapes, the hidden size
-    /// (`HR`), the levers' (`GELUT` 1).
+    /// `cy.csl` (NRM 1, MIXK 1, ACT 1, KEV the schedule's): the weight kernel's shapes, the
+    /// hidden size (`HR`), the levers' (`GELUT`: the CSL's form, a plan's levers set another).
     pub struct CtlCyGemma12 {
         K: u32, KM: u32, Qh: u32, DcS: u32, DcG: u32, Ic: u32, HR: u32, DIAG: u32, FIFOW: u32,
         ATTL: u32, TSTAMP: u32, HDS: u32, HDG: u32, NRM: u32, MIXK: u32, ACT: u32, KEV: u32,
@@ -330,7 +330,7 @@ pub fn kernels(prog: &Program) -> R<Kernels> {
                 TSTAMP: 0,
                 NRM: sc.nrm,
                 MIXK: sc.mixk,
-                KEV: 1,
+                KEV: sc.kev,
                 NR: WEIGHT_GEMMA12.route_slots as u32,
                 DONEG: 1,
             },
@@ -372,8 +372,8 @@ pub fn kernels(prog: &Program) -> R<Kernels> {
                 NRM: sc.nrm,
                 MIXK: sc.mixk,
                 ACT: sc.act,
-                KEV: 1,
-                GELUT: 1,
+                KEV: sc.kev,
+                GELUT: 2,
             },
         )?,
     );
