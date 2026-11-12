@@ -265,12 +265,15 @@ pub struct RowsShape {
 pub const PLANE_ALIGN: u64 = 16;
 
 /// One plane of a routed expert: the bank `param`, an expert's `bytes` of
-/// it `offset` into the expert's slot.
+/// it `offset` into the expert's slot, and the row a TMA map of it indexes
+/// (`row`, 0 where none is known): a code, bias or zeros row, or a 128-row
+/// block of scales, as [`Layout::tma_rows`] reads the trace.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ExpertPlane {
     pub param: u32,
     pub offset: u64,
     pub bytes: u64,
+    pub row: u64,
 }
 
 /// The routed experts of the MoE layers of one size: a slot holds one
@@ -805,6 +808,40 @@ impl Layout {
     /// routed banks streamed an expert at a time, each with its plane's
     /// bytes; a weight slot the recipe lays with a plane outside them stays
     /// as the load seats it, no atom of it cached.
+    /// Each expert plane's row as the TMA maps of a table's window index it
+    /// (an entry's row past the window is its offset over this): an expert's
+    /// bytes of the plane over its rows (`shape[1]`), or for a bank's scales
+    /// over its 128-row blocks, where its scales may lie in tcgen05 atoms (a
+    /// block-FP8 bank's raw scales are a block a row already). 0 where the
+    /// rows do not divide the bytes: no map indexes that plane's entries.
+    pub fn tma_rows(&mut self, trace: &poem_ir::Trace) {
+        for shape in &mut self.experts {
+            for bank in &mut shape.banks {
+                let names: Vec<String> = bank
+                    .iter()
+                    .map(|plane| trace.params[plane.param as usize].name.clone())
+                    .collect();
+                for plane in bank.iter_mut() {
+                    let param = &trace.params[plane.param as usize];
+                    let rows = param.shape.get(1).copied().unwrap_or(0);
+                    let scales = names
+                        .iter()
+                        .any(|name| poem::declare::scales_name(name) == param.name);
+                    let rows = if scales && rows.is_multiple_of(128) {
+                        rows / 128
+                    } else {
+                        rows
+                    };
+                    plane.row = if rows > 0 && plane.bytes.is_multiple_of(rows) {
+                        plane.bytes / rows
+                    } else {
+                        0
+                    };
+                }
+            }
+        }
+    }
+
     pub fn of(recipe: &ChunkRecipe, streamed: &[usize], banks: &[(usize, u64)]) -> Result<Layout> {
         let chunk_bytes = recipe.chunk_bytes;
         let list = recipe
@@ -926,6 +963,7 @@ impl Layout {
                         param,
                         offset: at,
                         bytes: bytes / count,
+                        row: 0,
                     });
                     at += bytes / count;
                 }

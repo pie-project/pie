@@ -63,6 +63,17 @@ pub struct ExpertTable {
     pub window: (u64, u64),
 }
 
+/// Whether this device runs a kernel that maps a located table's window by
+/// TMA, an entry's row taken as its offset past the window over the plane's
+/// row: the tcgen05 GEMMs (`gemm_sm100`) and Hopper's TMA selects (the FP8
+/// W8A8 slice, the bf16 and FP4 wgmma). Elsewhere every select reads a
+/// table's entries as addresses, wherever in the pool they lie.
+#[cfg(feature = "cuda")]
+#[must_use]
+pub fn windows_mapped() -> bool {
+    crate::linear::gemm_sm100::supported() || super::hopper_wgmma()
+}
+
 impl ExpertTable {
     pub const RESIDENT: ExpertTable = ExpertTable {
         table: 0,

@@ -1235,7 +1235,11 @@ impl Pools {
         // leave less than one working set at the declared context, the
         // pages are what they leave.
         let weight_chunks = u32::try_from(self.weight_pool_bytes() / chunk).unwrap_or(u32::MAX);
-        let weights_held = if weight_chunks <= fitted { weight_chunks } else { 0 };
+        let weights_held = if weight_chunks <= fitted {
+            weight_chunks
+        } else {
+            0
+        };
         let kv_chunks = fitted.saturating_sub(weights_held);
         let layout = self.chunks.layout();
         let floor = if kv_chunks >= least {
@@ -2220,6 +2224,7 @@ impl Pools {
                         } else {
                             None
                         },
+                        whole_rows: false,
                     });
                 }
                 // Each member's param to its place among the cache's planes.
@@ -2276,6 +2281,8 @@ impl Pools {
                     .flatten();
                 let mut entries =
                     Vec::with_capacity(cache.shape.experts as usize * held.members.len() * 8);
+                let base = self.chunks.base();
+                let mut whole_rows = true;
                 for expert in 0..cache.shape.experts as usize {
                     let slot = match cache.slots[first + expert].or(stand_in) {
                         Some(slot) => Some(self.chunks.weight_slot(
@@ -2291,7 +2298,12 @@ impl Pools {
                         let address = match member.map(|place| &cache.planes[place]) {
                             None => 0,
                             Some(plane) => match slot {
-                                Some(slot) => slot + plane.plane.offset,
+                                Some(slot) => {
+                                    let row = plane.plane.row;
+                                    whole_rows &= row > 0
+                                        && (slot + plane.plane.offset - base).is_multiple_of(row);
+                                    slot + plane.plane.offset
+                                }
                                 None => plane.host + expert as u64 * plane.plane.bytes,
                             },
                         };
@@ -2299,6 +2311,7 @@ impl Pools {
                     }
                 }
                 let held = &mut self.expert_caches[at].planes[bank];
+                held.whole_rows = whole_rows;
                 if stream.is_null() {
                     held.table.write(0, &entries)?;
                 } else {
@@ -2312,8 +2325,12 @@ impl Pools {
     /// The expert table of each streamed bank, by its param: what its
     /// select reads its experts through. A bank whose experts all lie in
     /// pool slots the runtime holds for the load's life is located, any
-    /// select's; any other may name the host copy by the next fire, and is
-    /// the plain-load selects' (a recorded body keeps the select it chose).
+    /// select's, where each entry is a whole number of its plane's rows past
+    /// the pool's base or no kernel of this device maps the window (a TMA
+    /// map indexes an entry by that row, `windows_mapped`); any other may
+    /// name the host copy by the next fire, or lies where no map row indexes
+    /// it, and is the plain-load selects' (a recorded body keeps the select
+    /// it chose).
     #[must_use]
     pub fn expert_tables(&self) -> Vec<(u32, kernels_cuda::linear::moe::ExpertTable)> {
         let window = (self.chunks.base(), self.chunks.bytes());
@@ -2327,6 +2344,7 @@ impl Pools {
                     .map(move |bank| {
                         let first = (bank.layer * cache.shape.experts) as usize;
                         let located = (self.weights_held || self.preseated)
+                            && (bank.whole_rows || !windows_mapped())
                             && cache.slots[first..first + cache.shape.experts as usize]
                                 .iter()
                                 .all(Option::is_some);
@@ -4138,7 +4156,9 @@ fn lay(
     } else {
         Vec::new()
     };
-    layout::Layout::of(&recipe, &streamed, &banks)
+    let mut layout = layout::Layout::of(&recipe, &streamed, &banks)?;
+    layout.tma_rows(trace);
+    Ok(layout)
 }
 
 /// The chunks a pool of `pages` kv pages takes: the null chunk, the pages'
@@ -4197,6 +4217,10 @@ struct ExpertBank {
     table: crate::device::Buffer,
     /// A u32 counter an expert.
     hits: Option<crate::device::Buffer>,
+    /// Whether, as the table was last written, every entry lay in the pool a
+    /// whole number of its plane's rows past the pool's base: what a TMA map
+    /// of the window indexes it by.
+    whole_rows: bool,
 }
 
 /// An expert shape's cache: where each expert of each layer lies (a pool
@@ -4237,6 +4261,19 @@ impl PoolRow {
     /// The bytes one of its planes holds a page.
     fn plane_bytes(&self, page_size: u32) -> u64 {
         u64::from(page_size) * self.width * u64::from(elem_size(POOL_STATE))
+    }
+}
+
+/// Whether this device's kernels map a located table's window by TMA
+/// (`kernels_cuda::linear::moe::windows_mapped`); none does off CUDA.
+fn windows_mapped() -> bool {
+    #[cfg(feature = "cuda")]
+    {
+        kernels_cuda::linear::moe::windows_mapped()
+    }
+    #[cfg(not(feature = "cuda"))]
+    {
+        false
     }
 }
 
