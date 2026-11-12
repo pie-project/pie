@@ -222,11 +222,24 @@ impl ResidencyPlanner {
     /// The error waiter `key` fails with when it has stood short of what
     /// only the policy can free past the seat deadline, rather than wait on.
     pub(super) fn short_expired(&self, key: EntryKey) -> Option<super::PlannerError> {
-        let short = self.short.lock();
-        let waited = short.since(key.1)?.elapsed();
+        let (waited, host) = {
+            let short = self.short.lock();
+            (short.since(key.1)?.elapsed(), short.host_short(key.1))
+        };
         if waited < crate::pipeline::fire::SEAT_WAIT {
             return None;
         }
+        // Short of device room while processes still run, it is behind
+        // them, not starved: their completions give the room back, so its
+        // deadline runs again from now, and only a fleet standing still (or
+        // a host short of room) fails it. Failed so, a gpt-oss prompt behind
+        // 24 running 31k-token passes was refused room their completions
+        // would have given it.
+        if !host && !self.is_wedged() {
+            self.short.lock().restart(key.1);
+            return None;
+        }
+        let short = self.short.lock();
         let (tier, bytes) = short.worst(key.1)?;
         Some(super::PlannerError::Short {
             tier,

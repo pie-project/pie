@@ -61,6 +61,9 @@ impl ResidencyPlanner {
         loop {
             let (rs_free, rs_total) = self.port.rs_stats();
             let rs_growth = self.rs_growth();
+            // What the device has free past the pages the head gathered:
+            // room a restore may take.
+            let spare = self.port.device_stats().0;
             let step = self.with_inner(|inner| {
                 let Some((key, waiter)) = inner.unmet_head() else {
                     if inner.accum.len() > 0 && inner.queue.is_empty() {
@@ -99,10 +102,17 @@ impl ResidencyPlanner {
                         extra: inner.burst_shortfall(),
                     },
                     None => {
-                        if inner.completion_credit == 0 && !inner.fleet_stalled() {
+                        // A restore goes back once a resident process has
+                        // finished (its credit), or the fleet can do nothing
+                        // else, or the device has room for it and still a
+                        // page for each resident lane's next one: suspended
+                        // processes come back as soon as room appears, every
+                        // one it holds at once, not one a completion.
+                        if inner.completion_credit > 0 {
+                            inner.completion_credit -= 1;
+                        } else if spare < inner.growth_reserve() && !inner.fleet_stalled() {
                             return Step::Done;
                         }
-                        inner.completion_credit = inner.completion_credit.saturating_sub(1);
                         Step::ServeRestore { key, pid }
                     }
                 }

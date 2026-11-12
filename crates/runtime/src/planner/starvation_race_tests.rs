@@ -297,6 +297,28 @@ fn a_wedged_head_short_of_state_alone_still_reclaims_by_restart() {
     stores.rs.lock().unwrap().release_reservation(held);
 }
 
+#[test]
+fn a_restore_leaves_a_page_for_each_running_resident_process() {
+    let _schedule = crate::policy::schedule::TEST_LOCK.blocking_read();
+    let pool = RacePool::new(64);
+    pool.refill_after_stall(10, 0);
+    let planner = Arc::new(ResidencyPlanner::new(Arc::new(pool) as Arc<dyn PoolPort>));
+    let running: Vec<ProcessId> = (0..4).map(|_| ProcessId::new_v4()).collect();
+    for &pid in &running {
+        planner.register(pid);
+        planner.note_admitted(pid);
+    }
+    // Four lanes resident and running: four pages held back for their next
+    // steps, whatever the restore takes.
+    planner.with_inner(|inner| {
+        assert_eq!(inner.growth_reserve(), 4);
+        inner.procs.get_mut(&running[0]).unwrap().idle = true;
+        assert_eq!(inner.growth_reserve(), 3, "an idle process grows nothing");
+        inner.procs.get_mut(&running[1]).unwrap().state = Residency::Evicted;
+        assert_eq!(inner.growth_reserve(), 2, "nor one off the device");
+    });
+}
+
 /// A dry pool of eight pages, an older lane's growth and a younger prompt
 /// waiting on it, neither holding a page a kill could free: the off run's
 /// moment, when a third process had just finished.

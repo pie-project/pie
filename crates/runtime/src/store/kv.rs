@@ -2796,10 +2796,16 @@ impl KvStore {
             self.keep_demoted(landed, records);
         }
         let count = txn.pages.len();
-        self.pool.recycle_after_epoch(
-            txn.pages.into_iter().map(|page| page.gpu_id).collect(),
-            self.current_epoch(),
-        );
+        // No fire still in flight can read these pages: the suspend waited
+        // for every fire of the process to settle (its fence is up and its
+        // leases quiesced), the pages are its own (a shared page does not
+        // move), and the copy out of them, ordered behind every fire
+        // submitted before it, has landed. They go back now, not behind the
+        // newest fire's epoch: held there, they stood as deficit while
+        // unrelated fires ran, and each suspend that landed so was followed
+        // by as many more (Qwen3-8B c256: 841 suspends where main moves 338).
+        self.pool
+            .release_reserved(txn.pages.into_iter().map(|page| page.gpu_id).collect());
         self.end_move(freed);
         Ok(count)
     }

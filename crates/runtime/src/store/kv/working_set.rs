@@ -50,7 +50,14 @@ impl KvLifecycle {
         }
         let stores = crate::store::registry::get(self.model, self.engine);
         crate::store::registry::with_kv_lock(&stores.kv, "host-working-set", |kv| {
-            let epoch = kv.current_epoch();
+            // Every fire of the set has settled (its leases drop only once
+            // the engine has run it), and a page another set still reads is
+            // not freed with it: no fire in flight reads what this lets go,
+            // so it waits on no epoch. Held behind the newest fire's, the
+            // pages of each process that finished stood off the pool while
+            // unrelated fires ran, and the prompt that took its place waited
+            // that long to be seated (Qwen3-8B c256: 0.8 to 2 s, main 6 ms).
+            let epoch = kv.retired_through();
             kv.release_working_set(self.id, epoch);
             kv.retire_idle();
         });
