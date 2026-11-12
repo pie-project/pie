@@ -95,9 +95,10 @@ const KERNEL_ROWS: i64 = 256;
 /// gemma-4-31B c32: 1.98k -> 1.95k tok/s through the kernel).
 const KERNEL_FROM: i64 = 640;
 
-/// The narrowest rows the kernel takes (8 heads of 256): narrower ones cost
-/// XLA little (v6e gemma-4-26B-A4B's 8 kv heads of 256 through the kernel:
-/// pf256-512 42.6k -> 45.0k tok/s; v5e Qwen3.5-0.8B c256 equal).
+/// The narrowest rows the kernel takes (8 heads of 256), or 8 heads of any
+/// width (128-wide ones from 1024): narrower ones cost XLA little (v6e
+/// gemma-4-26B-A4B's 8 kv heads of 256 through the kernel: pf256-512 42.6k
+/// -> 45.0k tok/s; v5e Qwen3.5-0.8B c256 equal).
 const KERNEL_WIDTH: i64 = 2048;
 
 /// `x`'s bf16 `[rows, width]` rows normed per `axis`-wide head by one Mosaic
@@ -106,9 +107,10 @@ const KERNEL_WIDTH: i64 = 2048;
 /// products in f32, the rows read and written once in bf16. XLA lays a
 /// `[rows, heads, axis]` f32 view of them out and back (v5e gemma-4-31B's
 /// 1792-row fires: q, k and v ~0.9 ms a sliding layer of copies, broadcasts
-/// and sums). `None` where it does not apply: heads narrower than 256,
-/// rows narrower than `KERNEL_WIDTH`, fires under `KERNEL_FROM` rows
-/// (`PIE_XLA_NORM_KERNEL=0` turns it off).
+/// and sums; Qwen3-0.6B's 16 q and 8 k heads of 128, pf256-512: v6e 236k ->
+/// 272k tok/s, v5e 106k -> 113k). `None` where it does not apply: heads
+/// narrower than 128, rows narrower than `KERNEL_WIDTH` and 8 heads, fires
+/// under `KERNEL_FROM` rows (`PIE_XLA_NORM_KERNEL=0` turns it off).
 fn heads_kernel(
     f: &mut Func,
     x: Val,
@@ -122,10 +124,10 @@ fn heads_kernel(
     if std::env::var("PIE_XLA_NORM_KERNEL").is_ok_and(|v| v == "0")
         || f.elem(x) != Elem::Bf16
         || rows < KERNEL_FROM
-        || axis < 256
+        || axis < 128
         || axis % 128 != 0
         || width % axis != 0
-        || width < KERNEL_WIDTH
+        || (width < KERNEL_WIDTH && width / axis < 8)
     {
         return Ok(None);
     }
