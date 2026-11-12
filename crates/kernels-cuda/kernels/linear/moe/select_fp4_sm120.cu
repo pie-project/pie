@@ -371,11 +371,11 @@ __device__ __forceinline__ void arrive_async(unsigned long long* bar) {
 /// GLU's 128 gate and 128 up) as two 128-row boxes of `map_w` (the bank's
 /// codes, 64B-swizzled), one thread issuing them a stage ahead onto that
 /// stage's mbarrier; the reads are `moe_select_mxfp4_w4a8`'s. `kTabled`: a
-/// table's bank (an entry may name mapped host memory, which no map spans,
-/// and lies wherever its slot does, no whole number of code rows past any
-/// base a map could index), the codes rows by every thread's cp.async into
-/// the stage as the boxes lay them (`w4a8::rows_async`), the routes' still
-/// by TMA: the same stages, so the same reads and bits.
+/// table no map indexes (an entry may name mapped host memory, which no map
+/// spans, or lie off whole code rows past the window), the codes rows by
+/// every thread's cp.async into the stage as the boxes lay them
+/// (`w4a8::rows_async`), the routes' still by TMA: the same stages, so the
+/// same reads and bits.
 template <int kGlu, int kStages, bool kTabled>
 __global__ void __launch_bounds__(512, 1) moe_select_mxfp4_w4a8_tma(
     const __grid_constant__ w4a8::TmaMap map_x,
@@ -395,6 +395,7 @@ __global__ void __launch_bounds__(512, 1) moe_select_mxfp4_w4a8_tma(
     float limit,
     float galpha,
     const u64* __restrict__ expert_table,
+    u64 expert_window,
     const u8* __restrict__ codes)
 {
     constexpr int kNb = 8;
@@ -433,8 +434,8 @@ __global__ void __launch_bounds__(512, 1) moe_select_mxfp4_w4a8_tma(
     const int sf_row = k >> 5;
     const u8* s_e = expert_plane(scales, 1LL * n * sf_row, expert_table, 3, 1, expert);
     // The bank rows of the two boxes: 256 in order, or the GLU's gate and up.
-    // `map_w` spans the contiguous bank (a table's codes are read through it).
-    const int w_e = static_cast<int>(expert_row(expert_table, 3, 0, expert, n, 0, k >> 1));
+    // `map_w` spans the bank, or a located table's window: the expert's first row in it.
+    const int w_e = static_cast<int>(expert_row(expert_table, 3, 0, expert, n, expert_window, k >> 1));
     const int w_y0 = w_e + cta_row;
     const int w_y1 = kGlu != 0 ? w_e + inter + cta_row : w_y0 + 128;
     const u8* w_codes = kTabled ? expert_plane(codes, 1LL * n * (k >> 1), expert_table, 3, 0, expert) : nullptr;
@@ -610,7 +611,7 @@ struct Const {
 /// codes as `quantize_rows_mxfp8_routed<kGran, true>` lays them (a 32's
 /// codes 8c..8c+3 at 4c, 8c+4..8c+7 at 16 + 4c), each 8-route block's B
 /// words one matrix row; the scales a byte of a chunk's word to each MMA.
-/// `kTabled`: a table's bank, warpgroup 2's 128 threads landing each
+/// `kTabled`: a table no map indexes, warpgroup 2's 128 threads landing each
 /// stage's codes rows by cp.async (`moe_select_mxfp4_w4a8_tma`'s).
 template <int kStages, bool kTabled>
 __global__ void __launch_bounds__(384, 1) moe_select_mxfp4_w4a8_ws(
@@ -631,6 +632,7 @@ __global__ void __launch_bounds__(384, 1) moe_select_mxfp4_w4a8_ws(
     float limit,
     float galpha,
     const u64* __restrict__ expert_table,
+    u64 expert_window,
     const u8* __restrict__ codes)
 {
     constexpr int kNb = 8;
@@ -674,7 +676,7 @@ __global__ void __launch_bounds__(384, 1) moe_select_mxfp4_w4a8_ws(
             const int begin = offsets[expert] + (item & 0xFFFF) * 128;
             if (offsets[expert + 1] - begin <= 0) continue;
             const int row0 = (job % tiles) * 256;
-            const int w_y = kTabled ? 0 : static_cast<int>(expert_row(expert_table, 3, 0, expert, n, 0, k >> 1)) + row0;
+            const int w_y = kTabled ? 0 : static_cast<int>(expert_row(expert_table, 3, 0, expert, n, expert_window, k >> 1)) + row0;
             const u8* w_e = kTabled ? expert_plane(codes, 1LL * n * (k >> 1), expert_table, 3, 0, expert) : nullptr;
             for (int ch = 0; ch < chunks; ++ch) {
                 w4a8::bar_wait(empty + s, ph ^ 1);

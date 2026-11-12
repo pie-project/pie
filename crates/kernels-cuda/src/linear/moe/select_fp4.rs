@@ -771,18 +771,27 @@ fn select_mxfp4_w4a8_tma(
         boxes: [128, 128, 1],
         swizzle: dr::CUtensorMapSwizzle::CU_TENSOR_MAP_SWIZZLE_128B,
     })?;
-    // The codes map spans the contiguous bank. A table's codes are read
-    // through its entries, held or streamed: an entry lies where its slot
-    // does, no whole number of code rows past the pool's base, so no map row
-    // indexes it; no map of them is read, and the routes' stands in.
-    let tabled = table.tabled();
+    // The codes map spans the contiguous bank, or a located table's window
+    // (the engine states one only where every entry is whole code rows past
+    // it). Any other table's codes are read through its entries, held or
+    // streamed: no map of them is read, and the routes' stands in.
+    let windowed = table.located && table.window != (0, 0);
+    let tabled = table.tabled() && !windowed;
+    let (w_base, w_rows) = if windowed {
+        let rows = table.window.1 / u64::from(x.width / 2);
+        let rows =
+            u32::try_from(rows).map_err(|_| refuse(OP, format!("a window of {rows} code rows")))?;
+        (table.window.0, rows)
+    } else {
+        (codes.ptr, experts * y.width)
+    };
     let map_w = if tabled {
         map_x
     } else {
         encode(Map {
-            ptr: codes.ptr,
+            ptr: w_base,
             ty: dr::CUtensorMapDataType::CU_TENSOR_MAP_DATA_TYPE_UINT8,
-            dims: [x.width / 2, experts * y.width, 0],
+            dims: [x.width / 2, w_rows, 0],
             strides: [u64::from(x.width / 2), 0],
             boxes: [64, 128, 1],
             swizzle: dr::CUtensorMapSwizzle::CU_TENSOR_MAP_SWIZZLE_64B,
@@ -823,6 +832,7 @@ fn select_mxfp4_w4a8_tma(
         0.0f32.arg(),
         0.0f32.arg(),
         ArgValue::Ptr(table.at()),
+        w_base.arg(),
         codes.arg(),
     ];
     ctx.fire(OP, fire, &args)?;

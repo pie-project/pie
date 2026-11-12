@@ -65,13 +65,16 @@ pub struct ExpertTable {
 
 /// Whether this device runs a kernel that maps a located table's window by
 /// TMA, an entry's row taken as its offset past the window over the plane's
-/// row: the tcgen05 GEMMs (`gemm_sm100`) and Hopper's TMA selects (the FP8
-/// W8A8 slice, the bf16 and FP4 wgmma). Elsewhere every select reads a
-/// table's entries as addresses, wherever in the pool they lie.
+/// row: the tcgen05 GEMMs (`gemm_sm100`), Hopper's TMA selects (the FP8
+/// W8A8 slice, the bf16 and FP4 wgmma) and the consumer Blackwells' staged
+/// W4A8 selects (`moe_select_mxfp4_w4a8_tma`, `_ws`). Elsewhere every select
+/// reads a table's entries as addresses, wherever in the pool they lie.
 #[cfg(feature = "cuda")]
 #[must_use]
 pub fn windows_mapped() -> bool {
-    crate::linear::gemm_sm100::supported() || super::hopper_wgmma()
+    crate::linear::gemm_sm100::supported()
+        || super::hopper_wgmma()
+        || crate::jit::cache::features().warp_block_scale
 }
 
 impl ExpertTable {
