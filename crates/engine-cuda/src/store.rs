@@ -2669,10 +2669,15 @@ impl Pools {
             });
         }
         if self.weights_filed {
-            // Pageable memory: a copy a span, staged by the runtime.
+            // Pageable memory: a copy a span, staged by the runtime. A span
+            // of the serving file's mapping is let go once copied; one of a
+            // held load's pageable copy (its laid planes, beside planes left
+            // in the file) is no file's pages, and letting it go would zero it.
             for &(slot, file, bytes) in fills {
                 crate::device::copy_any(stream, slot, file, bytes)?;
-                self.file_spans.push((file, bytes));
+                if !crate::device::alloc::in_pageable_copy(file) {
+                    self.file_spans.push((file, bytes));
+                }
             }
             return Ok(());
         }

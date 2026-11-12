@@ -628,6 +628,7 @@ impl Pinned {
         unsafe {
             libc::madvise(at, bytes, libc::MADV_HUGEPAGE);
         }
+        pageable_spans().push((at as usize, bytes));
         Ok(Pinned {
             host: at.cast(),
             device: at as u64,
@@ -802,7 +803,10 @@ impl Drop for Pinned {
             }
             #[cfg(not(feature = "device"))]
             Origin::Allocated => {}
-            Origin::Pageable => unmap_anon(self.host, self.bytes),
+            Origin::Pageable => {
+                pageable_spans().retain(|&(at, _)| at != self.host as usize);
+                unmap_anon(self.host, self.bytes);
+            }
         }
     }
 }
@@ -1275,6 +1279,24 @@ pub fn free_bytes() -> Option<u64> {
     {
         None
     }
+}
+
+/// The spans [`Pinned::pageable`] mapped and holds: anonymous memory, which
+/// advice that lets a file's pages go would zero.
+fn pageable_spans() -> std::sync::MutexGuard<'static, Vec<(usize, usize)>> {
+    static SPANS: std::sync::Mutex<Vec<(usize, usize)>> = std::sync::Mutex::new(Vec::new());
+    SPANS
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+/// Whether `at` lies in a pageable copy [`Pinned::pageable`] made.
+#[must_use]
+pub fn in_pageable_copy(at: u64) -> bool {
+    let at = at as usize;
+    pageable_spans()
+        .iter()
+        .any(|&(start, bytes)| at >= start && at < start + bytes)
 }
 
 #[must_use]
