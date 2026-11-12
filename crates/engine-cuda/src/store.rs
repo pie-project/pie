@@ -4045,7 +4045,6 @@ impl Pools {
             self.ensure_windowed(window_pages.iter().flatten().copied())
         }
     }
-
 }
 
 /// How `trace`'s kv rows sit in the state pool's chunks: the compiler's
