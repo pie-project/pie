@@ -35,6 +35,9 @@ attn.decode_pages = 64
 # a prompt's GeGLU rows land before the down dot reads them, not fused into its operand (Gemma-4-31B cut's
 # 2304-row fire 74.8 -> 72.2 ms, pf256-512 28.3k -> 29.3k tok/s)
 glu.land_from = 1024
+# and from 1024 rows its gate-up and GLU run as one Mosaic kernel, the fire's rows whole against 512-wide
+# blocks of each half (Gemma-4-31B's 2304-row gate-up: 1.62 ms dot and GLU pass -> 1.24 ms)
+glu.gemm_from = 1024
 
 [provenance]
 measured = [
@@ -44,6 +47,7 @@ measured = [
   "kernel.attn.budget_mi",
   "kernel.attn.decode_pages",
   "kernel.attn.per_row_max",
+  "kernel.glu.gemm_from",
   "kernel.glu.land_from",
   "kernel.moe.cost.dense_all_mi",
   "kernel.moe.cost.loop_row_ns",

@@ -1,5 +1,6 @@
 pub mod decode;
 pub mod gemm;
+pub mod glu_gemm;
 pub mod kquant;
 pub mod lora;
 pub mod mlp;

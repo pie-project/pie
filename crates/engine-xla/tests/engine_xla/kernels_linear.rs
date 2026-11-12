@@ -3,7 +3,7 @@
 
 use dtype::Dtype;
 use engine_xla::bench::{Bench, assert_close, round_bf16};
-use kernels_xla::linear::{gemm, lora, mlp};
+use kernels_xla::linear::{gemm, glu_gemm, lora, mlp};
 
 fn data(n: usize, seed: u32) -> Vec<f32> {
     (0..n)
@@ -451,4 +451,50 @@ fn a_lora_correction_adds_each_rows_own_adapter() {
         );
     }
     assert_close(&got, &want, 2e-2, 1e-2);
+}
+
+#[test]
+fn the_glu_gemm_kernel_answers_the_host() {
+    // A GeGLU's gate-up over its `[K, 2·I]` landing and the GLU in one
+    // Mosaic kernel: two 512-wide column blocks of each half; 48 rows as one
+    // block.
+    for (m, k, i) in [(64usize, 256usize, 1024usize), (48, 128, 512)] {
+        let xs = data(m * k, 11);
+        // `w` row-major `[2i, k]` (gate rows, then up rows), landed `[k, 2i]`.
+        let ws: Vec<f32> = data(2 * i * k, 12).iter().map(|v| v * 0.125).collect();
+        let mut landed = vec![0.0; k * 2 * i];
+        for n in 0..2 * i {
+            for c in 0..k {
+                landed[c * 2 * i + n] = ws[n * k + c];
+            }
+        }
+        let mut b = Bench::new();
+        let x = b.bf16(m as u32, k as u32, &xs);
+        let w = b.bf16(k as u32, 2 * i as u32, &landed);
+        let y = b.zeros(Dtype::Bf16, m as u32, i as u32);
+        if !b
+            .run(|ctx| {
+                engine_xla::lower::lower(ctx, |l| {
+                    let x_v = l.read(x)?.val;
+                    let w_v = l.read(w)?.val;
+                    let v = glu_gemm::geglu(l.f(), x_v, w_v, m as u32, i as i64)?
+                        .expect("the kernel takes these shapes");
+                    l.land(y, v)
+                })
+            })
+            .unwrap()
+        {
+            return;
+        }
+        let packed = gemm_ref(&xs, &ws, m, 2 * i, k);
+        let want: Vec<f32> = (0..m * i)
+            .map(|at| {
+                let (r, c) = (at / i, at % i);
+                let g = round_bf16(packed[r * 2 * i + c]);
+                let u = round_bf16(packed[r * 2 * i + i + c]);
+                gelu_tanh(g) * u
+            })
+            .collect();
+        assert_close(&b.read_f32(y), &want, 2e-2, 2e-2);
+    }
 }
