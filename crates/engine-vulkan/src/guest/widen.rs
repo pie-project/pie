@@ -7,7 +7,7 @@ use ash::vk;
 use crate::device::Context;
 use crate::device::alloc::{Buffer, Memory};
 use crate::device::ctx::{Core, Frame};
-use engine_gpu::guest::widen::{Cfg, SOURCE, WG, config_bytes};
+use engine_gpu::guest::widen::{Cfg, STORAGE_SOURCE, WG, config_bytes};
 
 use crate::error::Result;
 
@@ -38,7 +38,7 @@ impl std::fmt::Debug for Widen {
 impl Widen {
     pub fn new(device: &Context) -> Result<Widen> {
         let words =
-            super::lower(usize::MAX, SOURCE).map_err(|why| crate::error::Fault::Program {
+            super::lower(usize::MAX, STORAGE_SOURCE).map_err(|why| crate::error::Fault::Program {
                 at: "guest::widen",
                 why: format!("the readout widen does not lower: {why}"),
             })?;
@@ -53,7 +53,7 @@ impl Widen {
         let d = &core.device;
         // SAFETY: `d` is live; each create info and what it borrows are locals
         // that outlive the call, and `words` is the SPIR-V the guest compiler
-        // lowered from `SOURCE`, whose three storage bindings the layout
+        // lowered from `STORAGE_SOURCE`, whose three storage bindings the layout
         // declares. The module is destroyed only after the pipeline is built.
         unsafe {
             let set_layout = d

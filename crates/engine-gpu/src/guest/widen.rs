@@ -3,7 +3,11 @@
 
 pub const WG: u32 = 256;
 
-pub const SOURCE: &str = r#"
+/// The widen's WGSL with binding 2 (its config) in address space `$cfg`.
+macro_rules! widen_source {
+    ($cfg:literal) => {
+        concat!(
+            r#"
 @group(0) @binding(0) var<storage, read>       src : array<u32>;
 @group(0) @binding(1) var<storage, read_write> dst : array<u32>;
 
@@ -13,7 +17,9 @@ struct Cfg {
   lanes    : u32,
   pad      : u32,
 };
-@group(0) @binding(2) var<uniform> cfg : Cfg;
+@group(0) @binding(2) "#,
+            $cfg,
+            r#" cfg : Cfg;
 
 @compute @workgroup_size(256)
 fn main(@builtin(global_invocation_id) gid : vec3<u32>) {
@@ -24,7 +30,18 @@ fn main(@builtin(global_invocation_id) gid : vec3<u32>) {
   if ((i & 1u) == 1u) { half = w >> 16u; }
   dst[cfg.dst_word + i] = half << 16u;
 }
-"#;
+"#
+        )
+    };
+}
+
+/// The widen with its config in a storage buffer: Vulkan binds binding 2
+/// as one.
+pub const STORAGE_SOURCE: &str = widen_source!("var<storage, read>");
+
+/// The widen with its config in a uniform buffer: WebGPU binds binding 2
+/// as one.
+pub const UNIFORM_SOURCE: &str = widen_source!("var<uniform>");
 
 #[repr(C)]
 #[derive(Clone, Copy, Default)]

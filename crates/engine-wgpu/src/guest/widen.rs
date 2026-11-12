@@ -3,7 +3,7 @@ use std::sync::Arc;
 use crate::device::Context;
 use crate::device::alloc::Buffer;
 use crate::device::ctx::{Core, Frame};
-use engine_gpu::guest::widen::{Cfg, SOURCE, WG, config_bytes};
+use engine_gpu::guest::widen::{Cfg, UNIFORM_SOURCE, WG, config_bytes};
 
 use crate::error::{Fault, Result};
 
@@ -67,7 +67,7 @@ impl Widen {
                 .device
                 .create_shader_module(wgpu::ShaderModuleDescriptor {
                     label: Some("pie widen"),
-                    source: wgpu::ShaderSource::Wgsl(std::borrow::Cow::Borrowed(SOURCE)),
+                    source: wgpu::ShaderSource::Wgsl(std::borrow::Cow::Borrowed(UNIFORM_SOURCE)),
                 });
             core.device
                 .create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
