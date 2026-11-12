@@ -450,7 +450,10 @@ impl Client {
 
     /// Compiles a StableHLO (MLIR text or bytecode) module for one device.
     pub fn compile(&self, mlir: &str) -> Result<Executable> {
-        let options = options::single_device();
+        let tpu = self
+            .platform_name()
+            .is_ok_and(|p| p.eq_ignore_ascii_case("tpu"));
+        let options = options::single_device(tpu);
         let format = "mlir";
         let program = args!(PJRT_Program {
             code: mlir.as_ptr().cast_mut().cast(),
