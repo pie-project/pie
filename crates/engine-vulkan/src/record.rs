@@ -33,7 +33,7 @@ impl Recording {
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
-pub(crate) struct Key(u64);
+pub struct Key(u64);
 
 pub(crate) struct KeyBuilder(std::collections::hash_map::DefaultHasher);
 

@@ -7,44 +7,19 @@ use ash::vk;
 use crate::device::Context;
 use crate::device::alloc::{Buffer, Memory};
 use crate::device::ctx::{Core, Frame};
+use engine_gpu::guest::widen::{Cfg, STORAGE_SOURCE, WG, config_bytes};
+
 use crate::error::Result;
-
-const WG: u32 = 256;
-
-const SOURCE: &str = r#"
-@group(0) @binding(0) var<storage, read>       src : array<u32>;
-@group(0) @binding(1) var<storage, read_write> dst : array<u32>;
-
-struct Cfg {
-  src_word : u32,
-  dst_word : u32,
-  lanes    : u32,
-  pad      : u32,
-};
-@group(0) @binding(2) var<storage, read> cfg : Cfg;
-
-@compute @workgroup_size(256)
-fn main(@builtin(global_invocation_id) gid : vec3<u32>) {
-  let i = gid.x;
-  if (i >= cfg.lanes) { return; }
-  let w = src[cfg.src_word + (i >> 1u)];
-  var half : u32 = w & 0xffffu;
-  if ((i & 1u) == 1u) { half = w >> 16u; }
-  dst[cfg.dst_word + i] = half << 16u;
-}
-"#;
-
-#[repr(C)]
-#[derive(Clone, Copy, Default)]
-struct Cfg {
-    src_word: u32,
-    dst_word: u32,
-    lanes: u32,
-    pad: u32,
-}
 
 /// Config slots, one per widen still on the queue: a frame that runs ahead
 /// keeps its own offsets while the next frame records.
+/// What the widen's pipeline layout binds: source, destination, config.
+const LAYOUT: [(u32, super::Slot); 3] = [
+    (0, super::Slot::Storage),
+    (1, super::Slot::Storage),
+    (2, super::Slot::Storage),
+];
+
 const SLOTS: u64 = 16;
 
 /// Apart by any device's storage-buffer offset alignment.
@@ -69,23 +44,20 @@ impl std::fmt::Debug for Widen {
 
 impl Widen {
     pub fn new(device: &Context) -> Result<Widen> {
-        let words =
-            super::lower(usize::MAX, SOURCE).map_err(|why| crate::error::Fault::Program {
+        let words = super::lower(usize::MAX, STORAGE_SOURCE, &LAYOUT).map_err(|why| {
+            crate::error::Fault::Program {
                 at: "guest::widen",
                 why: format!("the readout widen does not lower: {why}"),
-            })?;
+            }
+        })?;
         let core = device.core().clone();
         let cfg = Buffer::with(device, SLOTS * SLOT_BYTES, Memory::Host)?;
 
-        let bindings = [
-            binding(0, vk::DescriptorType::STORAGE_BUFFER),
-            binding(1, vk::DescriptorType::STORAGE_BUFFER),
-            binding(2, vk::DescriptorType::STORAGE_BUFFER),
-        ];
+        let bindings = LAYOUT.map(|(at, slot)| binding(at, super::descriptor_type(slot)));
         let d = &core.device;
         // SAFETY: `d` is live; each create info and what it borrows are locals
         // that outlive the call, and `words` is the SPIR-V the guest compiler
-        // lowered from `SOURCE`, whose three storage bindings the layout
+        // lowered from `STORAGE_SOURCE`, whose three storage bindings the layout
         // declares. The module is destroyed only after the pipeline is built.
         unsafe {
             let set_layout = d
@@ -278,13 +250,4 @@ fn buffer_info(buffer: &Buffer) -> vk::DescriptorBufferInfo {
         .buffer(buffer.slab().buffer)
         .offset(0)
         .range(buffer.bytes())
-}
-
-fn config_bytes(cfg: Cfg) -> [u8; size_of::<Cfg>()] {
-    let mut out = [0u8; size_of::<Cfg>()];
-    out[0..4].copy_from_slice(&cfg.src_word.to_le_bytes());
-    out[4..8].copy_from_slice(&cfg.dst_word.to_le_bytes());
-    out[8..12].copy_from_slice(&cfg.lanes.to_le_bytes());
-    out[12..16].copy_from_slice(&cfg.pad.to_le_bytes());
-    out
 }

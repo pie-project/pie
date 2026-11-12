@@ -3,19 +3,13 @@ use std::ptr::NonNull;
 use std::sync::Arc;
 
 use ash::vk;
+use engine_gpu::pread::pread_jobs;
 
 use crate::error::{Fault, Result};
 
 use super::ctx::{Context, Core, STAGING_BYTES, note_reservation};
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Memory {
-    Device,
-
-    Host,
-
-    Staging,
-}
+pub use engine_gpu::Memory;
 
 pub(crate) struct Raw {
     pub(crate) core: Arc<Core>,
@@ -52,7 +46,7 @@ impl Raw {
         use vk::MemoryPropertyFlags as F;
         match kind {
             Memory::Device => prefers(F::DEVICE_LOCAL).or_else(|| prefers(F::empty())),
-            Memory::Host | Memory::Staging => {
+            Memory::Host | Memory::Staging | Memory::Readback => {
                 prefers(F::HOST_VISIBLE | F::HOST_COHERENT | F::HOST_CACHED)
                     .or_else(|| prefers(F::HOST_VISIBLE | F::HOST_COHERENT))
                     .or_else(|| prefers(F::HOST_VISIBLE))
@@ -316,11 +310,6 @@ impl std::fmt::Debug for Buffer {
 }
 
 impl Buffer {
-    pub(crate) fn of_slab(slab: Slab) -> Buffer {
-        let bytes = slab.size;
-        Buffer { slab, bytes }
-    }
-
     pub fn zeroed(device: &Context, bytes: u64) -> Result<Buffer> {
         Buffer::with(device, bytes, Memory::Device)
     }
@@ -411,6 +400,60 @@ impl Buffer {
     }
 }
 
+impl engine_gpu::Buffer<super::Api> for Buffer {
+    fn with(device: &Context, bytes: u64, kind: Memory) -> Result<Buffer> {
+        Buffer::with(device, bytes, kind)
+    }
+
+    fn bytes(&self) -> u64 {
+        self.bytes
+    }
+
+    fn slab_size(&self) -> u64 {
+        self.slab.size
+    }
+
+    fn slab_id(&self) -> u64 {
+        {
+            use ash::vk::Handle;
+            self.slab.buffer.as_raw()
+        }
+    }
+
+    fn is_host(&self) -> bool {
+        Buffer::is_host(self)
+    }
+
+    fn mapped_ptr(&self) -> Option<usize> {
+        Buffer::mapped_ptr(self)
+    }
+
+    fn write(&mut self, offset: u64, bytes: &[u8]) -> Result<()> {
+        Buffer::write(self, offset, bytes)
+    }
+
+    fn write_shared(&self, offset: u64, bytes: &[u8]) -> Result<()> {
+        Buffer::write_shared(self, offset, bytes)
+    }
+
+    fn zero_span(&mut self, offset: u64, len: u64) -> Result<()> {
+        Buffer::zero_span(self, offset, len)
+    }
+
+    fn read(&self, offset: u64, into: &mut [u8]) -> Result<()> {
+        Buffer::read(self, offset, into)
+    }
+
+    fn write_from_file(
+        &mut self,
+        file: &std::fs::File,
+        jobs: &[(u64, u64, u64)],
+        threads: usize,
+    ) -> Result<()> {
+        Buffer::write_from_file(self, file, jobs, threads)
+    }
+}
+
 pub struct FileWriter {
     slab: Slab,
 }
@@ -435,7 +478,10 @@ impl FileWriter {
                 .iter()
                 .map(|&(into, from, len)| (base + into as usize, from, len))
                 .collect();
-            return pread_jobs(file, &jobs, threads);
+            // SAFETY: each job's `dst..dst + len` lies inside this slab's
+            // mapping (`span` checked every job above), held for the call;
+            // the jobs are the caller's and are not checked for overlap.
+            return unsafe { pread_jobs(file, &jobs, threads) };
         }
         let core = &self.slab.core;
         let mut transfer = core.transfer.lock().expect("transfer lock poisoned");
@@ -472,7 +518,10 @@ impl FileWriter {
                 used = slot + len;
                 i += 1;
             }
-            pread_jobs(file, &window, threads)?;
+            // SAFETY: each window slot lies inside the staging slab
+            // (`slot + len <= STAGING_BYTES`), held under the transfer lock,
+            // and the slots are disjoint.
+            unsafe { pread_jobs(file, &window, threads)? };
             // SAFETY: `cmd` is the transfer command buffer in recording state;
             // each region's source sits inside the staging slab (`slot + len
             // <= STAGING_BYTES`) and its destination inside this slab (`span`
@@ -483,98 +532,4 @@ impl FileWriter {
         }
         Ok(())
     }
-}
-
-fn pread_jobs(file: &std::fs::File, jobs: &[(usize, u64, u64)], threads: usize) -> Result<()> {
-    let threads = threads.clamp(1, jobs.len().max(1));
-    let per = jobs.len().div_ceil(threads).max(1);
-    let failed: std::sync::Mutex<Option<Fault>> = std::sync::Mutex::new(None);
-    std::thread::scope(|scope| {
-        for chunk in jobs.chunks(per) {
-            let failed = &failed;
-            scope.spawn(move || {
-                for &(dst, from, len) in chunk {
-                    // SAFETY: both callers build `dst..dst + len` inside a
-                    // mapping they hold: the slab's own (bounded by `span`) or
-                    // the staging slab (bounded by `STAGING_BYTES`) under the
-                    // transfer lock. Staging windows are disjoint; slab jobs
-                    // are the caller's and are not checked for overlap.
-                    if let Err(why) = unsafe { pread_all(file, dst as *mut u8, from, len) } {
-                        *failed.lock().expect("failed lock poisoned") = Some(why);
-                        return;
-                    }
-                }
-            });
-        }
-    });
-    match failed.into_inner().expect("failed lock poisoned") {
-        Some(why) => Err(why),
-        None => Ok(()),
-    }
-}
-
-unsafe fn pread_all(file: &std::fs::File, dst: *mut u8, from: u64, len: u64) -> Result<()> {
-    let mut done = 0u64;
-    while done < len {
-        let want = usize::try_from(len - done)
-            .unwrap_or(usize::MAX)
-            .min(1 << 30);
-        // SAFETY: `dst + done` is `want` writable bytes inside the span.
-        let got = match unsafe { pread_chunk(file, dst.add(done as usize), from + done, want) } {
-            Ok(got) => got,
-            Err(err) if err.kind() == std::io::ErrorKind::Interrupted => continue,
-            Err(err) => {
-                return Err(Fault::Device {
-                    call: "pread",
-                    why: err.to_string(),
-                });
-            }
-        };
-        if got == 0 {
-            return Err(Fault::Device {
-                call: "pread",
-                why: format!("short read at {}: {} of {len} bytes", from + done, done),
-            });
-        }
-        done += got as u64;
-    }
-    Ok(())
-}
-/// Reads one positional chunk. Both arms are positional and leave the file
-/// cursor alone, so the worker threads may share one `&File`.
-#[cfg(unix)]
-unsafe fn pread_chunk(
-    file: &std::fs::File,
-    dst: *mut u8,
-    at: u64,
-    want: usize,
-) -> std::io::Result<usize> {
-    use std::os::fd::AsRawFd;
-    // SAFETY: `dst` is `want` writable bytes the caller vouches for.
-    let got = unsafe {
-        libc::pread(
-            file.as_raw_fd(),
-            dst.cast::<libc::c_void>(),
-            want,
-            libc::off_t::try_from(at).unwrap_or(libc::off_t::MAX),
-        )
-    };
-    if got < 0 {
-        Err(std::io::Error::last_os_error())
-    } else {
-        Ok(got as usize)
-    }
-}
-
-#[cfg(windows)]
-unsafe fn pread_chunk(
-    file: &std::fs::File,
-    dst: *mut u8,
-    at: u64,
-    want: usize,
-) -> std::io::Result<usize> {
-    use std::os::windows::fs::FileExt;
-    // SAFETY: `dst` is `want` writable bytes the caller vouches for.
-    let buf = unsafe { std::slice::from_raw_parts_mut(dst, want) };
-    file.seek_read(buf, at)
 }

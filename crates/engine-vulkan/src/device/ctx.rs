@@ -119,10 +119,9 @@ fn shared_instance(
         .enabled_extension_names(&enabled_exts);
     // SAFETY: `info` names only layers and extensions found above, its
     // borrowed names and `app` outlive the call, and the gate is held.
-    let instance =
-        unsafe { entry.create_instance(&info, None) }.map_err(|e| Fault::NoDevice {
-            detail: format!("vkCreateInstance: {e}"),
-        })?;
+    let instance = unsafe { entry.create_instance(&info, None) }.map_err(|e| Fault::NoDevice {
+        detail: format!("vkCreateInstance: {e}"),
+    })?;
     if validated {
         let debug = ash::ext::debug_utils::Instance::new(entry, &instance);
         let create = vk::DebugUtilsMessengerCreateInfoEXT::default()
@@ -929,10 +928,7 @@ impl Context {
         // other processes'.
         let working_set = ((device_local as f64 * share) as u64).saturating_sub(core.held());
         let dummy = Raw::new(&core, DUMMY_BYTES, Memory::Device)?;
-        let pipeline_cache = Arc::new(
-            PipelineCache::open(&core, boot.pipeline_cache.clone())
-                ?,
-        );
+        let pipeline_cache = Arc::new(PipelineCache::open(&core, boot.pipeline_cache.clone())?);
         Ok(Context {
             core,
             working_set,
@@ -1683,7 +1679,7 @@ impl Frame {
 
     pub fn commit_async(
         mut self,
-        on_done: Option<Box<dyn Fn(Option<String>) + Send + 'static>>,
+        on_done: Option<engine_gpu::backend::OnDone>,
     ) -> Result<Pending> {
         let at = crate::encode::profiling().then(std::time::Instant::now);
         self.submit()?;
@@ -1907,5 +1903,4 @@ impl Inner {
 }
 
 #[cfg(test)]
-mod tests {
-}
+mod tests {}

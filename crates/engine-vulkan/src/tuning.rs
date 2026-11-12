@@ -344,6 +344,117 @@ impl Tuning {
     }
 }
 
+impl engine_gpu::backend::Tactics for Tuning {
+    fn profile(&self) -> &profile::Profile {
+        Tuning::profile(self)
+    }
+
+    fn qmm_ladder(
+        &self,
+        rows: u32,
+        columns: u32,
+        contraction: u32,
+        bank: kernels_slang::Bank,
+    ) -> Vec<kernels_slang::linear::qmm::Qmm> {
+        crate::encode::qmm_ladder(self, rows, columns, contraction, bank)
+    }
+
+    /// The subgroup tier where every subgroup holds a 32-lane strip; four
+    /// strips a workgroup, the 4090's best at every scheme and row count
+    /// measured (kernels-slang.md §15).
+    fn kquant(&self) -> kernels_slang::linear::kquant::Tactic {
+        kernels_slang::linear::kquant::Tactic {
+            tier: if self.limits.lanes >= 32 {
+                kernels_slang::Tier::Subgroup
+            } else {
+                kernels_slang::Tier::Baseline
+            },
+            slices: 4,
+        }
+    }
+
+    /// Cooperative-matrix tiles where the profile takes them.
+    fn gemm(&self, _tier: kernels_slang::Tier) -> kernels_slang::linear::gemm::Tactic {
+        kernels_slang::linear::gemm::Tactic {
+            tier: if self.gemm_coopmat() {
+                kernels_slang::Tier::Coopmat
+            } else {
+                kernels_slang::Tier::Baseline
+            },
+        }
+    }
+
+    fn batch(&self, pairs: u32, experts: u32) -> kernels_slang::linear::moe::select::Batch {
+        kernels_slang::linear::moe::select::Batch {
+            tile: self.moe_tile_rows(pairs, experts),
+            padded: self.moe_sorted_rows(pairs, experts),
+            tier: if self.moe_coopmat() {
+                kernels_slang::Tier::Coopmat
+            } else {
+                kernels_slang::Tier::Baseline
+            },
+            sort_lanes: self.sort_lanes(),
+        }
+    }
+
+    fn routed_tier(&self, _tier: kernels_slang::Tier) -> kernels_slang::Tier {
+        kernels_slang::Tier::Baseline
+    }
+
+    fn lora_tier(&self) -> kernels_slang::Tier {
+        kernels_slang::Tier::Subgroup
+    }
+
+    /// Prefill tiles 16 rows of 16 lanes folding by shuffles where every
+    /// subgroup holds a row and the workgroup its 256 invocations (3.5x the
+    /// 32-lane tile on an RTX 4090), else 32 lanes a row through workgroup
+    /// memory.
+    fn sdpa(&self, _tier: kernels_slang::Tier, head_dim: u32) -> kernels_slang::attn::sdpa::Tactic {
+        let limits = self.limits;
+        let shuffles = limits.lanes >= 16 && limits.invocations >= 256;
+        kernels_slang::attn::sdpa::Tactic {
+            tier: kernels_slang::Tier::Subgroup,
+            narrow: limits.lanes < 32,
+            decode_threads: self.sdpa_decode_threads(head_dim),
+            tile_rows: if shuffles { 16 } else { self.sdpa_tile_rows() },
+            tile_lanes: if shuffles { 16 } else { 32 },
+            split_groups: self.sdpa_split_groups(),
+            split_min_keys: self.sdpa_split_min_keys(),
+            prefill_work: 0,
+        }
+    }
+
+    /// The recurrences fold their norms through subgroups, which every
+    /// Vulkan device this engine runs on has, any width; a register-state
+    /// recurrence runs at every row count.
+    fn recurrent(&self) -> kernels_slang::ssm::gdn_recurrent::Tactic {
+        kernels_slang::ssm::gdn_recurrent::Tactic {
+            tier: kernels_slang::Tier::Subgroup,
+            register_min_rows: 0,
+        }
+    }
+
+    fn moe_tile_rows(&self, pairs: u32, experts: u32) -> u32 {
+        Tuning::moe_tile_rows(self, pairs, experts)
+    }
+
+    fn moe_sorted_rows(&self, pairs: u32, experts: u32) -> u32 {
+        Tuning::moe_sorted_rows(self, pairs, experts)
+    }
+
+    fn sdpa_tile_rows_per_request(&self) -> u32 {
+        Tuning::sdpa_tile_rows_per_request(self)
+    }
+
+    fn sdpa_split_groups(&self) -> u32 {
+        Tuning::sdpa_split_groups(self)
+    }
+
+    fn sdpa_split_min_keys(&self) -> u32 {
+        Tuning::sdpa_split_min_keys(self)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

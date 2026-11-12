@@ -207,8 +207,10 @@ pub fn fixture_deployed(
         if encoded {
             let floats = dir.join(format!("{stem}.floats.zt"));
             if !floats.exists() {
-                let seeded =
-                    dir.join(format!("{stem}.floats.{:?}.part", std::thread::current().id()));
+                let seeded = dir.join(format!(
+                    "{stem}.floats.{:?}.part",
+                    std::thread::current().id()
+                ));
                 write_checkpoint(&seeded, &trace);
                 std::fs::rename(&seeded, &floats).expect("the floats land");
             }
@@ -304,6 +306,7 @@ pub fn load_with(
             runahead: engine::runahead::Runahead::F1,
             device: &device,
             residency,
+            handed: None,
         })
         .unwrap_or_else(|why| panic!("the shell loads: {why}")),
     )

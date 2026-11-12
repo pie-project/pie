@@ -1,39 +1,37 @@
-pub mod adapter;
+pub use engine_gpu::adapter;
 pub mod api;
-pub mod arena;
+pub use engine_gpu::arena;
 
-pub mod blob;
+pub use engine_gpu::blob;
 pub mod boot;
 pub mod chip;
-pub mod chunks;
+pub use engine_gpu::chunks;
 
 pub mod comm;
-pub mod decoded;
+pub use engine_gpu::decoded;
 pub mod device;
-mod dispatch;
 pub mod encode;
-mod error;
+use engine_gpu::error;
 pub mod experts;
-pub mod feeds;
 pub mod guest;
 pub mod inputs;
-pub mod mask;
-pub mod probe;
+pub use engine_gpu::mask;
+pub use engine_gpu::probe;
 pub mod program;
 
 pub(crate) mod record;
-pub mod rs;
+pub use engine_gpu::rs;
 pub mod run;
 
 mod scratch;
 pub mod serve;
-pub mod settle;
+pub use engine_gpu::settle;
 pub mod store;
 pub mod tune;
 pub mod tuning;
-pub mod weight_store;
+pub use engine_gpu::weight_store;
 pub mod weights;
-pub mod window;
+pub use engine_gpu::window;
 
 pub use adapter::{
     Binding as AdapterBinding, Key as AdapterKey, Role as AdapterRole, Site,

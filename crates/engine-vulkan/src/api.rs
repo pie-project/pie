@@ -1,28 +1,27 @@
-#![allow(unsafe_code)]
-use std::collections::BTreeMap;
-use std::path::{Path, PathBuf};
+//! The runtime's engine ([`engine_gpu::api`]) bound to Vulkan: a guest pass
+//! reads its lane's outputs on the device, behind the forward on the queue,
+//! and a sampler may land on its own while the next forward reads its token
+//! there.
 
-use checkpoint::contract::ModelContract;
+use std::path::PathBuf;
+
+#[cfg(feature = "vulkan")]
 use engine::Engine;
-use engine::adapter::AdapterRegistration;
-use engine::caps::{Capabilities, DeviceFacts, FireLimits};
-use engine::channel::{ChannelId, ChannelRegistration, RegisteredChannel};
 use engine::error::{Error, Result as EngineResult};
-use engine::fire::{
-    FireId, FireTicket, FrameId, FrameSubmission, FrameTicket, LaneReadout, Readout, Step,
-};
-use engine::load::{Budgets as LoadBudgets, Checkpoint, LoadFacts, LoadRequest, Loaded};
-use engine::program::{BoundInstance, InstanceBinding, InstanceId, ProgramId, ProgramRegistration};
-use engine::transfer::{KvCopy, MemoryDomain};
-use eta_ir::registry::{GeometryClass, PortMask, Stage};
-use poem_compiler::{Budget, DeviceProfile, PATCH_LATTICE_FLOOR, PatchLadder};
-use poem_ir::Trace;
+use engine::fire::{FireTicket, Step};
+use engine::transfer::MemoryDomain;
+use eta_ir::registry::{PortMask, Stage};
 
-use crate::error::Fault;
-use crate::serve::{Boot, Landed, Lane, Seated, Shell, StepView};
+use engine_gpu::api::{Envelope, Host, PendingStep, fault, program_attachments, refusal};
+
+use crate::device::Api;
+#[cfg(feature = "vulkan")]
+use crate::serve::Shell;
+use crate::serve::{Landed, Seats};
+#[cfg(feature = "vulkan")]
 use crate::settle::Done;
 
-pub type ContractFor = fn(&Trace, &Path) -> std::result::Result<ModelContract, String>;
+pub use engine_gpu::api::{ContractFor, patch_ladder};
 
 #[derive(Debug, Clone, PartialEq, Default)]
 pub struct DeviceBoot {
@@ -40,775 +39,95 @@ pub struct DeviceBoot {
     pub chunk_bytes: Option<u64>,
 }
 
-struct PendingStep {
-    readout: Vec<Readout>,
+pub type Vulkan = engine_gpu::api::Gpu<Api>;
 
-    landed: Landed,
+impl Host for Api {
+    const KIND: &'static str = "vulkan";
 
-    rows: Option<Vec<Vec<f32>>>,
-}
+    const DEVICE_CHANNEL_COMMIT: bool = false;
 
-pub struct Vulkan {
-    boot: DeviceBoot,
-    contract_for: ContractFor,
-    shell: Option<Shell>,
-    caps: Option<Capabilities>,
-    next_fire: u64,
-    next_frame: u64,
+    type Programs = crate::program::Plane;
 
-    sink: Option<engine::CompletionSink>,
-
-    pending: Option<(FrameId, Vec<PendingStep>)>,
-
-    programs: crate::program::Plane,
-
-    adapters: BTreeMap<InstanceId, crate::adapter::Binding>,
-}
-
-impl Vulkan {
-    #[must_use]
-    pub fn new(boot: DeviceBoot, contract_for: ContractFor) -> Vulkan {
-        let programs = crate::program::Plane::default();
-        Vulkan {
-            boot,
-            contract_for,
-            shell: None,
-            caps: None,
-            next_fire: 1,
-            next_frame: 1,
-            sink: None,
-            pending: None,
-            programs,
-            adapters: BTreeMap::new(),
-        }
+    fn domain(boot: &DeviceBoot) -> MemoryDomain {
+        MemoryDomain::VulkanDevice(boot.device_index)
     }
 
-    pub fn shell_mut(&mut self) -> Option<&mut Shell> {
-        self.shell.as_mut()
+    fn ports() -> PortMask {
+        PortMask::DECODE_ENVELOPE.with(eta_ir::registry::Port::Fold)
     }
 
-    #[must_use]
-    pub fn capabilities(&self) -> Option<&Capabilities> {
-        self.caps.as_ref()
-    }
-
-    pub fn open(&mut self, slot: u32) -> EngineResult<()> {
-        self.loaded_mut()?.open(slot).map_err(fault)
-    }
-
-    #[allow(dead_code)]
-    fn loaded(&self) -> EngineResult<&Shell> {
-        self.shell
-            .as_ref()
-            .ok_or_else(|| Error::Load("the vulkan engine has no model loaded".into()))
-    }
-
-    fn loaded_mut(&mut self) -> EngineResult<&mut Shell> {
-        self.shell
-            .as_mut()
-            .ok_or_else(|| Error::Load("the vulkan engine has no model loaded".into()))
-    }
-}
-
-fn kv_copy_direction(src: MemoryDomain, dst: MemoryDomain) -> &'static str {
-    match (src, dst) {
-        (MemoryDomain::HostPinned, MemoryDomain::HostPinned) => {
-            "`copy_kv` host-pinned to host-pinned, which is the caller's own memmove"
-        }
-        (MemoryDomain::HostPinned, _) => {
-            "`copy_kv` out of host-pinned memory, which needs a swap pool this load does not \
-             reserve"
-        }
-        (_, MemoryDomain::HostPinned) => {
-            "`copy_kv` into host-pinned memory, which needs a swap pool this load does not \
-             reserve"
-        }
-        _ => "`copy_kv` between the domains named, neither of which is this load's own device",
-    }
-}
-
-fn refusal(refusal: crate::program::Refusal) -> Error {
-    match refusal {
-        crate::program::Refusal::Closed { what, id } => Error::Closed { what, id },
-        crate::program::Refusal::Program(why) => Error::Program(why),
-    }
-}
-
-fn fault(fault: Fault) -> Error {
-    match fault {
-        Fault::Deviceless | Fault::Device { .. } => Error::Device(fault.to_string()),
-
-        Fault::PatchPayload { .. } => Error::Invalid(fault.to_string()),
-
-        Fault::Bake(_)
-        | Fault::Load(_)
-        | Fault::Backing { .. }
-        | Fault::Mapped { .. }
-        | Fault::Param { .. }
-        | Fault::Recipe(_)
-        | Fault::Shader { .. }
-        | Fault::Unbound { .. } => Error::Load(fault.to_string()),
-        Fault::Ceiling { what, need, have } => Error::Impossible(format!(
-            "this fire wants {need} {what} and the load reserved {have}"
-        )),
-
-        Fault::Fragmented { .. } => Error::Device(fault.to_string()),
-
-        Fault::Unaffine { .. } | Fault::Unstructured { .. } => Error::Load(fault.to_string()),
-        Fault::Straddled { .. } => Error::Load(fault.to_string()),
-
-        Fault::Mask { .. }
-        | Fault::MaskRows { .. }
-        | Fault::Maskless { .. }
-        | Fault::MaskWord { .. }
-        | Fault::Positions { .. } => Error::Invalid(fault.to_string()),
-
-        Fault::Adapterless { .. } | Fault::AdapterWord { .. } => Error::Invalid(fault.to_string()),
-
-        Fault::AdapterSlots { .. } => Error::Exhausted {
-            resource: "adapter slots",
-            wanted: 1,
-            available: 0,
-        },
-
-        Fault::Adapter { .. } => Error::Load(fault.to_string()),
-        Fault::Blob { .. } => Error::Load(fault.to_string()),
-        Fault::Program { .. } => Error::Program(fault.to_string()),
-        Fault::Vulkan { .. } | Fault::NoDevice { .. } => Error::Device(fault.to_string()),
-        Fault::Fire(_) => Error::Invalid(fault.to_string()),
-
-        Fault::Residency(_) => Error::Impossible(fault.to_string()),
-    }
-}
-
-const DEFAULT_STATE_SLOTS: u32 = 256;
-
-/// The load's budgets: its logit readouts sized to what `trace` reads, not a
-/// general figure, so a vocab-wide head carves only the rows a fire can read.
-fn bake_budgets(budgets: &LoadBudgets, trace: &Trace) -> Budget {
-    Budget {
-        max_lanes: budgets.max_lanes,
-        max_tokens: budgets.max_tokens,
-        buckets: budgets.buckets.clone(),
-        max_adapters: budgets.max_adapters,
-        readouts_per_lane: poem_compiler::arena::readouts_per_lane(trace),
-    }
-}
-
-#[must_use]
-pub fn patch_ladder(trace: &Trace, budgets: &LoadBudgets) -> Option<PatchLadder> {
-    const DERIVED_PATCH_CEILING: u32 = 4096;
-
-    let declares_patches = trace.values.iter().any(|decl| {
-        matches!(&decl.ty, poem_ir::Ty::Tensor { shape, .. }
-            if shape.first().and_then(|dim| dim.axis()) == Some(poem_ir::RowAxis::Patches))
-    });
-    if !declares_patches {
-        return None;
-    }
-
-    let max_patches = budgets
-        .max_patches
-        .unwrap_or_else(|| budgets.max_tokens.min(DERIVED_PATCH_CEILING))
-        .max(PATCH_LATTICE_FLOOR);
-    let mut buckets = Vec::new();
-    let mut rung = PATCH_LATTICE_FLOOR;
-    while rung < max_patches {
-        buckets.push(rung);
-        rung = rung.saturating_mul(2);
-    }
-    buckets.push(max_patches);
-    Some(PatchLadder {
-        max_images: budgets
-            .max_images
-            .unwrap_or(max_patches / PATCH_LATTICE_FLOOR)
-            .max(1),
-        max_patches,
-        buckets,
-    })
-}
-
-fn patch_bytes(
-    patches: &[u8],
-    element: poem_ir::Dtype,
-) -> std::result::Result<Vec<u8>, &'static str> {
-    match element {
-        poem_ir::Dtype::U8 => Ok(patches.to_vec()),
-        _ => Err("a media submission against a plan whose pixel rows are not u8 bytes"),
-    }
-}
-
-fn voxel_bytes(
-    payload: &[f32],
-    element: poem_ir::Dtype,
-) -> std::result::Result<Vec<u8>, &'static str> {
-    match element {
-        poem_ir::Dtype::Bf16 => Ok(payload
-            .iter()
-            .flat_map(|&v| {
-                let bits = v.to_bits();
-                (((bits + 0x7fff + ((bits >> 16) & 1)) >> 16) as u16).to_le_bytes()
-            })
-            .collect()),
-        poem_ir::Dtype::F32 => Ok(payload.iter().flat_map(|&v| v.to_le_bytes()).collect()),
-        _ => Err("a voxel payload against a plan whose voxel element is neither bf16 nor f32"),
-    }
-}
-
-fn adapter_of(
-    shell: &mut Shell,
-    package: &eta_compiler::codegen::launch::LaunchPackage,
-    instance: InstanceId,
-    seeds: &[(u32, Vec<u8>)],
-) -> EngineResult<Option<crate::adapter::Binding>> {
-    let Some(sink) = crate::adapter::sink_of(package).map_err(fault)? else {
-        return Ok(None);
-    };
-    let seats = shell.bank_seats();
-    let site = sink.site().map_err(fault)?;
-    let mut built: Vec<(String, Vec<u8>)> = Vec::new();
-    for (role, channel) in &sink.planes {
-        let wire = seeds
-            .iter()
-            .find(|(seeded, _)| seeded == channel)
-            .map(|(_, bytes)| bytes.as_slice())
-            .ok_or_else(|| {
-                Error::Load(format!(
-                    "this program's `lora` sink reads its `{}` plane out of channel \
-                     {channel} and this bind seeded nothing into it; an adapter's \
-                     weights are the seed, because the fire path never reads the cell, \
-                     so an unseeded plane is a correction of zero \
-                     that nobody asked for",
-                    role.bank()
-                ))
-            })?;
-        built.extend(crate::adapter::planes_of(*role, site, wire, &seats).map_err(fault)?);
-    }
-    let planes: Vec<crate::AdapterPlane<'_>> = built
-        .iter()
-        .map(|(bank, bytes)| crate::AdapterPlane {
-            bank: bank.as_str(),
-            bytes,
-        })
-        .collect();
-    shell
-        .bind_adapter(crate::adapter::Source::Own {
-            instance,
-            planes: &planes,
-        })
-        .map(Some)
-        .map_err(fault)
-}
-
-impl Engine for Vulkan {
-    fn kind(&self) -> &'static str {
-        "vulkan"
-    }
-
-    fn device_facts(&self) -> Option<&DeviceFacts> {
-        self.caps.as_ref().map(|caps| &caps.device)
-    }
-
-    fn bind_thread(&mut self) -> EngineResult<()> {
-        match self.shell.as_ref() {
-            Some(shell) => shell.bind_thread().map_err(fault),
-            None => Ok(()),
-        }
-    }
-
-    fn load(&mut self, request: LoadRequest) -> EngineResult<Loaded> {
-        if self.shell.is_some() {
-            return Err(Error::Load(
-                "this vulkan engine already has a model loaded; one shell per engine".into(),
-            ));
-        }
-        let LoadRequest {
-            trace,
-            checkpoint,
-            budgets,
-            residency,
-            ordinal,
-            frames_in_flight,
-        } = request;
-
-        if ordinal > 0 {
-            return Err(Error::unsupported("vulkan", "device ordinal selection"));
-        }
-
-        let Checkpoint::Path(path) = checkpoint else {
-            return Err(Error::Load(
-                "the vulkan shell lands a checkpoint or nothing runs; \
-                 `Checkpoint::None` has no weightless path here"
-                    .into(),
-            ));
-        };
-        let contract = (self.contract_for)(&trace, &path).map_err(Error::Load)?;
-
-        let patches = patch_ladder(&trace, &budgets);
-        let voxels = poem_compiler::VoxelLadder::of(
-            &trace,
-            budgets.max_voxels,
-            budgets.max_clips,
-            budgets.max_lanes,
-        );
-        let slots = poem_compiler::state_slots(budgets.slots, &trace, DEFAULT_STATE_SLOTS);
-        let (disk_kv_budget, disk_kv_dir, seats) = (
-            residency.disk_kv_budget,
-            residency.disk_kv_dir.clone(),
-            residency.kv_seats.unwrap_or(budgets.max_lanes),
-        );
-        let budget = bake_budgets(&budgets, &trace);
-        let max_readouts =
-            u32::try_from(poem_compiler::arena::readouts_ceiling(&budget)).unwrap_or(u32::MAX);
-        let mut shell = Shell::load(Boot {
-            trace,
-            contract: &contract,
-            checkpoint: &path,
-            budget,
-            patches,
-
-            profile: None::<DeviceProfile>,
-            page_size: budgets.page_size,
-            context: budgets.max_context,
-            slots,
-
-            runahead: engine::runahead::Runahead::of(frames_in_flight),
-            voxels,
-            residency,
-            device: &self.boot,
-        })
-        .map_err(fault)?;
-        let disk_kv_pages = shell
-            .seat_disk_kv(
-                disk_kv_budget,
-                disk_kv_dir.as_deref(),
-                seats,
-                budgets.max_context,
-            )
-            .map_err(fault)?;
-
-        let trace_name = shell.trace().name.clone();
-        let (weight_bytes, arena_bytes, pool_bytes, input_bytes) = shell.footprint();
-        let weights_resident = !shell.weights_stream();
-
-        let paging = shell.paging();
-
-        let pools = shell.pool_facts(disk_kv_pages);
-        let chunks = shell.chunk_facts().map_err(fault)?;
-
-        let caps = Capabilities {
-            device: DeviceFacts {
-                backend: "vulkan".to_string(),
-                domain: MemoryDomain::VulkanDevice(self.boot.device_index),
-                sms: shell.cores(),
-                unified_memory: false,
-
-                fp8_native: false,
-                native_mxfp4_moe: false,
-
-                storage_alignment: 256,
-
-                storage_max_tile_bytes: shell.max_buffer(),
-
-                codegen_backend: None,
-            },
-            pools,
-            chunks,
-            limits: FireLimits {
-                max_lanes: budgets.max_lanes,
-                max_tokens: budgets.max_tokens,
-                max_page_refs: paging.pages_per_slot.saturating_mul(budgets.max_lanes),
-                max_context: paging.context(),
-                prefill_rows: 0,
-                max_readouts,
-            },
-            has_lora: true,
-            has_attn_page_mask: false,
-            draft_block: shell.trace().drafter.map_or(0, |d| d.rows),
-            draft_mask_token: shell.trace().drafter.map_or(0, |d| d.mask_token),
-            draft_proposals_from: shell.trace().drafter.map_or(1, |d| d.proposals_from),
-
-            ports: PortMask::DECODE_ENVELOPE.with(eta_ir::registry::Port::Fold),
-            geometry: GeometryClass::DecodeEnvelope,
-
-            kv_handle: None,
-            media_encode: false,
-            device_channel_commit: false,
-            rs_verbs: shell.serves_rs_verbs(),
-            // The prompt scans land the state as of rows inside a lane, a
-            // record a snapshot in pieces (CONTRACT-BC 16).
-            rs_snapshots: crate::rs::snapshots(shell.trace()),
-            bidirectional_attention: false,
-            adapter_attachments: false,
-            facts: shell.trace().facts.clone(),
-            inputs: shell.inputs(),
-            classes: shell.classes(),
-        };
-
-        self.shell = Some(shell);
-        self.caps = Some(caps.clone());
-        Ok(Loaded {
-            facts: LoadFacts {
-                trace_name,
-                weight_bytes,
-
-                weights_resident,
-                weights_from_cache: false,
-                arena_bytes,
-                pool_bytes,
-                input_bytes,
-
-                pool_committed_bytes: pool_bytes,
-                pool_high_water_bytes: pool_bytes,
-            },
-            caps,
-        })
-    }
-
-    fn commit_segments(&mut self, segments: u32) -> EngineResult<()> {
-        self.loaded_mut()?.commit_segments(segments).map_err(fault)
-    }
-
-    fn release_segments(&mut self, segments: u32) -> EngineResult<()> {
-        self.loaded_mut()?.release_segments(segments).map_err(fault)
-    }
-
-    fn evacuate(&mut self, evacuation: &engine::chunk::Evacuation) -> EngineResult<()> {
-        self.loaded_mut()?.evacuate(evacuation).map_err(fault)
-    }
-
-    fn copy_slots(&mut self, copy: &engine::chunk::SlotCopy) -> EngineResult<()> {
-        self.loaded_mut()?.copy_slots(copy).map_err(fault)
-    }
-
-    fn read_tier_slots(
-        &mut self,
-        slots: &[(engine::chunk::ShapeId, Vec<u32>)],
-    ) -> EngineResult<Vec<u8>> {
-        self.loaded_mut()?.read_tier_slots(slots).map_err(fault)
-    }
-
-    fn write_tier_slots(
-        &mut self,
-        slots: &[(engine::chunk::ShapeId, Vec<u32>)],
-        bytes: &[u8],
-    ) -> EngineResult<()> {
-        self.loaded_mut()?
-            .write_tier_slots(slots, bytes)
-            .map_err(fault)
-    }
-
-    fn weight_residency(&mut self, residency: &engine::chunk::WeightResidency) -> EngineResult<()> {
-        self.loaded_mut()?
-            .weight_residency(residency)
-            .map_err(fault)
-    }
-
-    fn weight_uses(&mut self) -> EngineResult<engine::chunk::WeightUses> {
-        self.loaded_mut()?.weight_uses().map_err(fault)
-    }
-
-    fn submit(&mut self, frame: &FrameSubmission) -> EngineResult<FrameTicket> {
-        frame.validate_for(
-            self.caps
-                .as_ref()
-                .map_or(engine::fire::Serves::NONE, engine::fire::Serves::of),
-        )?;
-        let id = FrameId(self.next_frame);
-        self.next_frame = self.next_frame.wrapping_add(1);
-
-        self.pending = None;
-
-        let mut steps = Vec::with_capacity(frame.steps.len());
-        let mut pending = Vec::with_capacity(frame.steps.len());
-        for (index, step) in frame.steps.iter().enumerate() {
-            if let Some(next) = frame.steps.get(index + 1) {
-                self.expect_fire(next);
-            }
-
-            let at = engine::StepDone {
-                frame: id,
-                step: index as u32,
-            };
-            let defers = self.defers(step);
-            let fired = self
-                .fire_step(step, at, defers)
-                .and_then(|(ticket, mut step_pending)| {
-                    let landed = step_pending.landed;
-                    if defers && self.reads_on_device(step, &landed) {
-                        // The sampler lands on its own and reports the step;
-                        // the next frame's forward reads its token on the
-                        // device, so nothing here waits.
-                        self.defer_attachment(step, at, &landed)?;
-                        let shell = self.loaded_mut()?;
-                        shell.leave_unread(&landed);
-                        shell.forget_seat(&landed);
-                        step_pending.rows = Some(Vec::new());
-                        return Ok((ticket, step_pending));
-                    }
-                    if program_attachments(step).next().is_some()
-                        && self.reads_on_device(step, &step_pending.landed)
-                    {
-                        // Every attachment reads its logits on the device:
-                        // it queues behind the forward without waiting for
-                        // it, so the GPU runs on into the sampler and the
-                        // step waits once.
-                        let landed = step_pending.landed;
-                        self.run_attachments(step, &landed)?;
-                        let shell = self.loaded_mut()?;
-                        step_pending.rows = Some(shell.rows_of(&landed).map_err(fault)?);
-                        shell.forget_seat(&landed);
-                    } else if program_attachments(step).next().is_some() {
-                        let shell = self.loaded_mut()?;
-                        let rows = shell.rows_of(&step_pending.landed).map_err(fault)?;
-                        step_pending.rows = Some(rows);
-                        let landed = step_pending.landed;
-                        self.run_attachments(step, &landed)?;
-                    }
-                    if defers && let Some(sink) = self.sink.as_ref() {
-                        // The forward's own report was held for the sampler.
-                        (sink)(at, engine::StepOutcome::Committed);
-                    }
-                    Ok((ticket, step_pending))
-                });
-            match fired {
-                Ok((ticket, step_pending)) => {
-                    steps.push(ticket);
-                    pending.push(step_pending);
-                }
-                Err(error) => {
-                    self.pending = None;
-                    return Err(error);
-                }
-            }
-        }
-        #[cfg(feature = "vulkan")]
-        if let Some(shell) = self.shell.as_ref() {
-            shell.device().pipeline_cache().settle();
-        }
-        let mut ticket = FrameTicket { id, steps };
-        self.pending = Some((id, pending));
-
-        if !self.settles_asynchronously() {
-            self.settle_frame(&mut ticket)?;
-        }
-        Ok(ticket)
-    }
-
-    fn register_program(&mut self, registration: &ProgramRegistration) -> EngineResult<ProgramId> {
-        self.programs.register(registration).map_err(refusal)
-    }
-
-    fn register_channel(
-        &mut self,
-        registration: &ChannelRegistration,
-    ) -> EngineResult<RegisteredChannel> {
-        self.programs
-            .register_channel(registration)
-            .map_err(refusal)
-    }
-
-    fn bind_instance(&mut self, binding: &InstanceBinding) -> EngineResult<BoundInstance> {
-        let caps = self
-            .caps
-            .as_ref()
-            .ok_or_else(|| Error::Program("bind_instance before load".to_string()))?;
-        if !caps.admits(binding.geometry) {
-            return Err(Error::Program(format!(
-                "this load resolves {:?} on the device, so it binds at most {:?} and not {:?}",
-                caps.ports, caps.geometry, binding.geometry
-            )));
-        }
-
-        #[cfg(feature = "vulkan")]
-        let device = self.shell.as_ref().map(crate::serve::Shell::device);
-        let bound = self
-            .programs
-            .bind(
-                binding,
-                #[cfg(feature = "vulkan")]
-                device,
-            )
-            .map_err(refusal)?;
-
-        let seeds: Vec<(u32, Vec<u8>)> = binding
-            .seeds
-            .iter()
-            .map(|seed| (seed.channel, seed.bytes.clone()))
-            .collect();
-        let landed = match self.programs.package(binding.program) {
-            Some(package) => {
-                let package = package.clone();
-                match self.shell.as_mut() {
-                    Some(shell) => adapter_of(shell, &package, bound.id, &seeds),
-                    None => Ok(None),
-                }
-            }
-            None => Ok(None),
-        };
-        match landed {
-            Ok(Some(binding)) => {
-                self.adapters.insert(bound.id, binding);
-            }
-            Ok(None) => {}
-            Err(why) => {
-                let _ = self.programs.close_instance(bound.id);
-                return Err(why);
-            }
-        }
-        Ok(bound)
-    }
-
-    fn close_instance(&mut self, id: InstanceId) -> EngineResult<()> {
-        if let (Some(held), Some(shell)) = (self.adapters.remove(&id), self.shell.as_mut()) {
-            shell.release_adapter(&held);
-        }
-        self.programs.close_instance(id).map_err(refusal)
-    }
-
-    fn register_adapter(&mut self, registration: &AdapterRegistration) -> EngineResult<()> {
-        let planes: Vec<crate::AdapterPlane<'_>> = registration
-            .planes
-            .iter()
-            .map(|plane| crate::AdapterPlane {
-                bank: plane.bank.as_str(),
-                bytes: &plane.bytes,
-            })
-            .collect();
-        self.loaded_mut()?
-            .register_adapter(registration.id, &planes)
-            .map_err(fault)
-    }
-
-    fn close_channel(&mut self, id: ChannelId) -> EngineResult<()> {
-        self.programs.close_channel(id).map_err(refusal)
-    }
-
-    fn publish_channel(
-        &mut self,
-        instance: InstanceId,
-        channel: u32,
-        cell: &[u8],
-    ) -> EngineResult<bool> {
-        self.programs
-            .publish(instance, channel, cell)
-            .map_err(refusal)
-    }
-
-    fn take_channel(
-        &mut self,
-        instance: InstanceId,
-        channel: u32,
-    ) -> EngineResult<Option<Vec<u8>>> {
-        self.programs.take(instance, channel).map_err(refusal)
-    }
-
-    fn settles_asynchronously(&self) -> bool {
-        self.shell
+    fn settles_asynchronously(gpu: &Vulkan) -> bool {
+        gpu.shell
             .as_ref()
             .is_some_and(|shell| shell.frames_in_flight() > 1)
     }
 
-    fn on_complete(&mut self, sink: engine::CompletionSink) {
-        self.sink = Some(sink);
+    fn step(
+        gpu: &mut Vulkan,
+        step: &Step,
+        at: engine::StepDone,
+    ) -> EngineResult<(FireTicket, PendingStep)> {
+        let defers = defers(gpu, step);
+        let (ticket, mut step_pending) = gpu.fire_step(step, at, defers)?;
+        let landed = step_pending.landed;
+        if defers && reads_on_device(gpu, step, &landed) {
+            // The sampler lands on its own and reports the step;
+            // the next frame's forward reads its token on the
+            // device, so nothing here waits.
+            defer_attachment(gpu, step, at, &landed)?;
+            let shell = gpu.loaded_mut()?;
+            shell.leave_unread(&landed);
+            shell.forget_seat(&landed);
+            step_pending.rows = Some(Vec::new());
+            return Ok((ticket, step_pending));
+        }
+        if program_attachments(step).next().is_some()
+            && reads_on_device(gpu, step, &step_pending.landed)
+        {
+            // Every attachment reads its logits on the device:
+            // it queues behind the forward without waiting for
+            // it, so the GPU runs on into the sampler and the
+            // step waits once.
+            let landed = step_pending.landed;
+            run_attachments(gpu, step, &landed)?;
+            let shell = gpu.loaded_mut()?;
+            step_pending.rows = Some(shell.rows_of(&landed).map_err(fault)?);
+            shell.forget_seat(&landed);
+        } else if program_attachments(step).next().is_some() {
+            let shell = gpu.loaded_mut()?;
+            let rows = shell.rows_of(&step_pending.landed).map_err(fault)?;
+            step_pending.rows = Some(rows);
+            let landed = step_pending.landed;
+            run_attachments(gpu, step, &landed)?;
+        }
+        if defers && let Some(sink) = gpu.sink.as_ref() {
+            // The forward's own report was held for the sampler.
+            (sink)(at, engine::StepOutcome::Committed);
+        }
+        Ok((ticket, step_pending))
     }
 
-    fn settle_frame(&mut self, ticket: &mut FrameTicket) -> EngineResult<()> {
-        let Some((id, _)) = self.pending.as_ref() else {
-            return Err(Error::Invalid(format!(
-                "frame {}'s numbers are gone: nothing is pending, so either it was \
-                 never submitted to this engine or a later frame has already taken \
-                 its readout seats",
-                ticket.id
-            )));
-        };
-        if *id != ticket.id {
-            return Err(Error::Invalid(format!(
-                "frame {}'s numbers are gone: frame {id} has been submitted since, and \
-                 a step's rows live in the readout seat its arm owns. Ask for a \
-                 frame's readouts before submitting the next one",
-                ticket.id
-            )));
+    fn submitted(gpu: &Vulkan) {
+        #[cfg(feature = "vulkan")]
+        if let Some(shell) = gpu.shell.as_ref() {
+            shell.device().pipeline_cache().settle();
         }
-        let (_, mut pending) = self.pending.take().expect("checked just above");
-        let mut refused = None;
-        match self.shell.as_mut() {
-            None => {
-                refused = Some(Error::Load("the vulkan engine has no model loaded".into()));
-            }
-            Some(shell) => {
-                for step in &mut pending {
-                    if step.rows.is_some() {
-                        continue;
-                    }
-                    match shell.rows_of(&step.landed) {
-                        Ok(rows) => step.rows = Some(rows),
-                        Err(why) => {
-                            refused = Some(fault(why));
-                            break;
-                        }
-                    }
-                }
-            }
-        }
-
-        self.pending = Some((ticket.id, pending));
-        if let Some(error) = refused {
-            return Err(error);
-        }
-        let (_, pending) = self.pending.as_ref().expect("just put back");
-        for (receipt, step) in ticket.steps.iter_mut().zip(pending) {
-            receipt.readouts = readouts_of(step);
-        }
-        Ok(())
-    }
-
-    fn expect_fire(&mut self, submission: &Step) {
-        let _ = submission;
-        if let Some(shell) = self.shell.as_mut() {
-            let _ = shell.reap();
-        }
-    }
-
-    fn copy_kv(&mut self, copy: &KvCopy) -> EngineResult<()> {
-        copy.validate()?;
-        let device = self.caps.as_ref().map(|caps| caps.device.domain);
-        if device.is_none_or(|device| copy.src != device || copy.dst != device) {
-            return Err(Error::Unsupported {
-                verb: kv_copy_direction(copy.src, copy.dst),
-                engine: "vulkan",
-            });
-        }
-        let page_size = self.loaded_mut()?.paging().page_size;
-        let moves = copy.runs(page_size)?;
-        self.loaded_mut()?.copy_kv(&moves).map_err(fault)
-    }
-}
-
-impl Vulkan {
-    /// Whether every attachment of `step` can read its lane's outputs on
-    /// the device before the step lands.
-    fn reads_on_device(&self, step: &Step, landed: &crate::serve::Landed) -> bool {
-        let Some(shell) = self.shell.as_ref() else {
-            return false;
-        };
-        cfg!(feature = "vulkan")
-            && program_attachments(step)
-                .all(|attachment| shell.readout_seats(landed, attachment.lane).is_some())
+        #[cfg(not(feature = "vulkan"))]
+        let _ = gpu;
     }
 
     /// Before the step resolves its inputs: the forward reads the cells a prologue put.
-    fn run_prologues(&mut self, step: &Step) -> EngineResult<()> {
+    fn run_prologues(gpu: &mut Vulkan, step: &Step) -> EngineResult<()> {
         for attachment in program_attachments(step) {
-            if !self.programs.prologue_runs(attachment.instance) {
+            if !gpu.programs.prologue_runs(attachment.instance) {
                 continue;
             }
-            self.programs
+            gpu.programs
                 .fire(
                     attachment.instance,
                     Stage::Prologue,
                     #[cfg(feature = "vulkan")]
-                    self.shell.as_ref().map(Shell::device),
+                    gpu.shell.as_ref().map(Shell::device),
                     #[cfg(feature = "vulkan")]
                     Vec::new(),
                 )
@@ -817,435 +136,128 @@ impl Vulkan {
         Ok(())
     }
 
-    fn run_attachments(&mut self, step: &Step, landed: &crate::serve::Landed) -> EngineResult<()> {
-        let Vulkan {
-            shell, programs, ..
-        } = self;
-        for attachment in program_attachments(step) {
-            #[cfg(feature = "vulkan")]
-            let (device, seats) = match shell.as_ref() {
-                Some(shell) => (Some(shell.device()), lane_seats(shell, landed, attachment)),
-                None => (None, Vec::new()),
-            };
-            programs
-                .fire(
-                    attachment.instance,
-                    Stage::Epilogue,
-                    #[cfg(feature = "vulkan")]
-                    device,
-                    #[cfg(feature = "vulkan")]
-                    seats,
-                )
-                .map_err(refusal)?;
-        }
-        if let Some(shell) = shell.as_mut() {
-            shell.forget_seat(landed);
-        }
-        Ok(())
-    }
-
-    /// Whether `step`'s one attachment can run behind its forward without
-    /// the host waiting for either.
-    fn defers(&self, step: &Step) -> bool {
-        #[cfg(feature = "vulkan")]
-        {
-            self.sink.is_some()
-                && self.settles_asynchronously()
-                && step.attachments.len() == 1
-                && !step.attachments[0].adapter_only
-                && self.programs.defers(step.attachments[0].instance)
-        }
-        #[cfg(not(feature = "vulkan"))]
-        {
-            let _ = step;
-            false
-        }
-    }
-
-    fn defer_attachment(
-        &mut self,
-        step: &Step,
-        at: engine::StepDone,
-        landed: &crate::serve::Landed,
-    ) -> EngineResult<()> {
-        #[cfg(feature = "vulkan")]
-        {
-            let Vulkan {
-                shell,
-                programs,
-                sink,
-                ..
-            } = self;
-            let shell = shell
-                .as_ref()
-                .ok_or_else(|| Error::Load("the vulkan engine has no model loaded".into()))?;
-            let attachment = &step.attachments[0];
-            let seats = lane_seats(shell, landed, attachment);
-            let done = sink.clone().map(|sink| Done { at, sink });
-            programs
-                .fire_deferred(attachment.instance, shell.device(), seats, done)
-                .map_err(refusal)
-        }
-        #[cfg(not(feature = "vulkan"))]
-        {
-            let _ = (step, at, landed);
-            Err(Error::unsupported("vulkan", "a deferred guest pass"))
-        }
-    }
-
-    fn fire_step(
-        &mut self,
-        submission: &Step,
-        at: engine::StepDone,
-        defers: bool,
-    ) -> EngineResult<(FireTicket, PendingStep)> {
-        self.run_prologues(submission)?;
-        let mut staged: Vec<Vec<u8>> = Vec::new();
-        if !submission.media.is_empty() {
-            let Some(element) = self.loaded()?.patch_element() else {
-                return Err(fault(crate::error::Fault::from(poem_exec::Error::Fire(
-                    poem_exec::fire::Fault::Towerless {
-                        lane: submission.media[0].lane,
-                    },
-                ))));
-            };
-            staged.reserve(submission.media.len());
-            for row in &submission.media {
-                staged.push(patch_bytes(&row.patches, element).map_err(|why| {
-                    Error::Unsupported {
-                        verb: why,
-                        engine: "vulkan",
-                    }
-                })?);
-            }
-        }
-        let voxel_element = self.loaded()?.voxel_element();
-        if !submission.voxels.is_empty() && voxel_element.is_none() {
-            return Err(Error::Invalid(
-                "this step submits VAE clips and the loaded plan states no voxel row".into(),
-            ));
-        }
-        let voxel_payloads = submission
-            .voxels
-            .iter()
-            .map(|row| {
-                voxel_bytes(&row.payload, voxel_element.unwrap_or(poem_ir::Dtype::Bf16)).map_err(
-                    |why| Error::Unsupported {
-                        verb: why,
-                        engine: "vulkan",
-                    },
-                )
-            })
-            .collect::<EngineResult<Vec<_>>>()?;
-        let clips: Vec<crate::serve::Clips<'_>> = submission
-            .voxels
-            .iter()
-            .zip(&voxel_payloads)
-            .map(|(row, payload)| crate::serve::Clips {
-                lane: row.lane,
-                boxes: &row.clips,
-                payload,
-            })
-            .collect();
-
-        let media: Vec<crate::serve::Media<'_>> = submission
-            .media
-            .iter()
-            .zip(&staged)
-            .map(|(row, patches)| crate::serve::Media {
-                lane: row.lane,
-                rows: &row.rows,
-                patches,
-                routes: &row.routes,
-                positions: &row.positions,
-                grids: &row.grids,
-                token_positions: &row.token_positions,
-            })
-            .collect();
-
-        let id = FireId(self.next_fire);
-        self.next_fire = self.next_fire.wrapping_add(1);
-
-        let mut resolved: Vec<Option<Vec<u32>>> = vec![None; submission.lanes.len()];
-        #[cfg(feature = "vulkan")]
-        let mut feeds: Vec<Option<crate::device::Buffer>> = vec![None; submission.lanes.len()];
-        for attachment in &submission.attachments {
-            let Some(lane) = submission.lanes.get(attachment.lane as usize) else {
+    fn envelope(gpu: &mut Vulkan, step: &Step, envelope: &mut Envelope<Api>) -> EngineResult<()> {
+        for attachment in &step.attachments {
+            let Some(lane) = step.lanes.get(attachment.lane as usize) else {
                 return Err(Error::Invalid(format!(
                     "attachment names lane {} of a {}-lane step",
                     attachment.lane,
-                    submission.lanes.len()
+                    step.lanes.len()
                 )));
             };
             #[cfg(feature = "vulkan")]
-            if let Some(cell) = self.programs.token_feed(attachment.instance) {
+            if let Some(cell) = gpu.programs.token_feed(attachment.instance) {
                 // A pass still on the queue wrote this lane's token; the
                 // forward copies it in behind that pass.
-                resolved[attachment.lane as usize] = Some(vec![0; lane.tokens.len()]);
-                feeds[attachment.lane as usize] = Some(cell);
+                envelope.tokens[attachment.lane as usize] = Some(vec![0; lane.tokens.len()]);
+                envelope.feeds[attachment.lane as usize] = Some(cell);
                 continue;
             }
-            resolved[attachment.lane as usize] = self
+            envelope.tokens[attachment.lane as usize] = gpu
                 .programs
                 .envelope_tokens(attachment.instance, lane.tokens.len())
                 .map_err(refusal)?;
         }
+        Ok(())
+    }
 
-        let mut verbs: Vec<engine::fire::RsVerb> = submission
-            .lanes
-            .iter()
-            .map(|lane| lane.rs.clone())
-            .collect();
-        for attachment in &submission.attachments {
-            if let engine::fire::RsVerb::Buffer { fold, .. } = &mut verbs[attachment.lane as usize]
-                && *fold == engine::fire::FoldLen::Device
-                && let Some(n) = self
-                    .programs
-                    .envelope_fold(attachment.instance)
-                    .map_err(refusal)?
-            {
-                *fold = engine::fire::FoldLen::Host(n);
-            }
-        }
-
-        let mut input_cells: Vec<Vec<(engine::fire::InputFeed, crate::program::InputCell)>> =
-            vec![Vec::new(); submission.lanes.len()];
-        for (at, lane) in submission.lanes.iter().enumerate() {
-            if lane.inputs.is_empty() {
-                continue;
-            }
-            let instance = submission
-                .attachments
-                .iter()
-                .find(|attachment| {
-                    (attachment.lane..attachment.lane + attachment.lanes.max(1))
-                        .contains(&(at as u32))
-                })
-                .map(|attachment| attachment.instance)
-                .ok_or_else(|| {
-                    Error::Invalid(format!(
-                        "lane {at} feeds guest inputs and has no attachment; an input is read \
-                         through the instance the lane is attached to"
-                    ))
-                })?;
-            for feed in &lane.inputs {
-                let cell = self
-                    .programs
-                    .input_cell(instance, feed.channel)
-                    .map_err(refusal)?;
-                input_cells[at].push((*feed, cell));
-            }
-        }
-
-        let mut reads: Vec<Vec<String>> = vec![Vec::new(); submission.lanes.len()];
-        for attachment in program_attachments(submission) {
-            for (name, k) in self.programs.reads(attachment.instance) {
-                if let Some(lane) = reads.get_mut((attachment.lane + k) as usize) {
-                    lane.push(name);
-                }
-            }
-        }
-
-        let sink = self.sink.clone();
-
-        let mut lane_adapters: Vec<Option<u32>> = vec![None; submission.lanes.len()];
-        if !self.adapters.is_empty() {
-            for attachment in &submission.attachments {
-                let Some(bound) = self.adapters.get(&attachment.instance) else {
-                    continue;
-                };
-                if let Some(slot) = lane_adapters.get_mut(attachment.lane as usize) {
-                    *slot = Some(bound.slot);
-                }
-            }
-        }
-        let shell = self.loaded_mut()?;
-
-        let mut words: Vec<u64> = submission.lanes.iter().map(|lane| lane.word).collect();
-        for (at, slot) in lane_adapters.iter().enumerate() {
-            if slot.is_none() {
-                continue;
-            }
-            words[at] = shell.adapted_word(words[at]).ok_or_else(|| {
-                Error::Invalid(format!(
-                    "lane {at} is attached to an instance that bound an adapter, and \
-                     this load's model text has no corrected class for its fact word \
-                     {:#x}: the text declares no `linear.lora_correct` arm, or the arm's \
-                     window is not decided by one fact. A lane that asked for a \
-                     correction and got the base model is the one wrong answer this \
-                     axis refuses to give",
-                    words[at]
-                ))
-            })?;
-        }
-        // A lane stating its slot tables names its kv pages and its record
-        // there (CONTRACT-BC 4); until the runtime states them, the legacy
-        // fields carry the same slot refs.
-        let mut pages_of: Vec<Option<Vec<u32>>> = Vec::with_capacity(submission.lanes.len());
-        let mut record_of: Vec<Option<Vec<u32>>> = Vec::with_capacity(submission.lanes.len());
-        let mut run_of: Vec<Option<Vec<u32>>> = Vec::with_capacity(submission.lanes.len());
-        let mut forks: Vec<(u32, u32)> = Vec::new();
-        for lane in &submission.lanes {
-            pages_of.push(
-                lane.tables
-                    .iter()
-                    .find(|(shape, _)| *shape == crate::store::layout::LIST)
-                    .map(|(_, refs)| refs.clone()),
-            );
-            let fixed = lane
-                .fixed
-                .iter()
-                .find(|(shape, _)| *shape == crate::store::layout::FIXED);
-            run_of.push(fixed.and_then(|(_, pieces)| {
-                pieces
-                    .iter()
-                    .any(|&[run, cow]| run != cow)
-                    .then(|| pieces.iter().map(|&[run, _]| run).collect())
-            }));
-            record_of.push(fixed.map(|(_, pieces)| {
-                // `cow != run`: the record is copied before the fire, once
-                // for every lane of a group naming the same pair.
-                for &[run, cow] in pieces {
-                    if run != cow && !forks.contains(&(run, cow)) {
-                        forks.push((run, cow));
-                    }
-                }
-                pieces.iter().map(|&[_, cow]| cow).collect()
-            }));
-        }
-        shell.copy_state(&forks).map_err(fault)?;
-        // Tail copies (an rs-list or kv slot a fork shares) land before any
-        // lane of the fire reads or writes (CONTRACT-BC 20).
-        let slot_copies: Vec<_> = submission
-            .lanes
-            .iter()
-            .flat_map(|lane| lane.slot_copies.iter().cloned())
-            .collect();
-        shell.copy_slot_pairs(&slot_copies).map_err(fault)?;
-        let seated: Vec<Seated<'_>> = submission
-            .lanes
-            .iter()
-            .enumerate()
-            .map(|(at, lane)| Seated {
-                lane: Lane {
-                    slot: lane.slot,
-
-                    word: words[at],
-                    tokens: resolved[at].as_deref().unwrap_or(&lane.tokens),
-                },
-                pages: pages_of[at].as_deref().unwrap_or(&lane.kv.pages),
-                held: (!lane.kv.pages.is_empty() || pages_of[at].is_some()).then_some(lane.kv.held),
-                kv_less: lane.kv_less,
-
-                mask: lane.mask.as_ref(),
-
-                adapter: lane_adapters[at].or(lane.adapter),
-                positions: &lane.positions,
-
-                readout: match &lane.readout {
-                    Readout::Rows(rows) => Some(rows.as_slice()),
-                    Readout::Last | Readout::None => None,
-                },
-                reads: &reads[at],
-
-                translation: &lane.kv.translation,
-
-                rs: &verbs[at],
-                rs_reset: lane.rs_reset,
-                rs_slot: lane.rs_slot,
-                rs_snapshots: &lane.rs_snapshots,
-                refs: true,
-                windows: &lane.tables,
-                record: record_of[at].as_deref(),
-                record_run: run_of[at].as_deref(),
-
-                #[cfg(feature = "vulkan")]
-                feed: feeds[at].as_ref(),
-                #[cfg(not(feature = "vulkan"))]
-                feed: None,
-
-                group: lane.group,
-                inputs: &input_cells[at],
-            })
-            .collect();
-
-        let landed = {
-            use engine::frame::Shell as FrameShell;
-            let done = sink.filter(|_| !defers).map(|sink| Done { at, sink });
-            let prepared = FrameShell::prepare(
-                shell,
-                StepView {
-                    lanes: &seated,
-                    attachments: &[],
-                    media: &media,
-                    clips: &clips,
-                    done,
-                },
-                None,
-            )
-            .map_err(fault)?;
-            let enqueued = FrameShell::enqueue(shell, prepared).map_err(fault)?;
-            FrameShell::settle(shell, enqueued).map_err(fault)?
-        };
-
-        Ok((
-            FireTicket {
-                id,
-                readouts: Vec::new(),
-            },
-            PendingStep {
-                readout: submission
-                    .lanes
-                    .iter()
-                    .map(|lane| lane.readout.clone())
-                    .collect(),
-                landed,
-                rows: None,
-            },
-        ))
+    fn guests(_gpu: &mut Vulkan, _step: &Step) -> EngineResult<Option<std::convert::Infallible>> {
+        Ok(None)
     }
 }
 
-fn readouts_of(step: &PendingStep) -> Vec<LaneReadout> {
-    let rows: &[Vec<f32>] = step.rows.as_deref().unwrap_or(&[]);
-    step.readout
-        .iter()
-        .enumerate()
-        .map(|(lane, policy)| {
-            let count = match policy {
-                Readout::None => return LaneReadout::default(),
-                Readout::Last => 1,
-                Readout::Rows(list) => list.len().max(1),
-            };
-            let values = rows.get(lane).cloned().unwrap_or_default();
-            LaneReadout {
-                rows: u32::try_from(count).unwrap_or(u32::MAX),
-                width: u32::try_from(values.len() / count).unwrap_or(u32::MAX),
-                values,
-                ..LaneReadout::default()
-            }
-        })
-        .collect()
+/// Whether every attachment of `step` can read its lane's outputs on
+/// the device before the step lands.
+fn reads_on_device(gpu: &Vulkan, step: &Step, landed: &Landed) -> bool {
+    let Some(shell) = gpu.shell.as_ref() else {
+        return false;
+    };
+    cfg!(feature = "vulkan")
+        && program_attachments(step)
+            .all(|attachment| shell.readout_seats(landed, attachment.lane).is_some())
 }
 
-// SAFETY: the loaded `Shell` owns its `ash` device, pools and buffers
-// outright and its `Cell`/`RefCell` scratch is not shared with anything else,
-// so moving the whole engine to another thread moves every handle with it;
-// Vulkan handles are not tied to the thread that made them.
-unsafe impl Send for Vulkan {}
+fn run_attachments(gpu: &mut Vulkan, step: &Step, landed: &Landed) -> EngineResult<()> {
+    let Vulkan {
+        shell, programs, ..
+    } = gpu;
+    for attachment in program_attachments(step) {
+        #[cfg(feature = "vulkan")]
+        let (device, seats) = match shell.as_ref() {
+            Some(shell) => (Some(shell.device()), lane_seats(shell, landed, attachment)),
+            None => (None, Vec::new()),
+        };
+        programs
+            .fire(
+                attachment.instance,
+                Stage::Epilogue,
+                #[cfg(feature = "vulkan")]
+                device,
+                #[cfg(feature = "vulkan")]
+                seats,
+            )
+            .map_err(refusal)?;
+    }
+    if let Some(shell) = shell.as_mut() {
+        shell.forget_seat(landed);
+    }
+    Ok(())
+}
 
-/// The attachments whose program runs on this fire.
-fn program_attachments(step: &Step) -> impl Iterator<Item = &engine::fire::Attachment> {
-    step.attachments
-        .iter()
-        .filter(|attachment| !attachment.adapter_only)
+/// Whether `step`'s one attachment can run behind its forward without
+/// the host waiting for either.
+fn defers(gpu: &Vulkan, step: &Step) -> bool {
+    #[cfg(feature = "vulkan")]
+    {
+        gpu.sink.is_some()
+            && gpu.settles_asynchronously()
+            && step.attachments.len() == 1
+            && !step.attachments[0].adapter_only
+            && gpu.programs.defers(step.attachments[0].instance)
+    }
+    #[cfg(not(feature = "vulkan"))]
+    {
+        let _ = (gpu, step);
+        false
+    }
+}
+
+fn defer_attachment(
+    gpu: &mut Vulkan,
+    step: &Step,
+    at: engine::StepDone,
+    landed: &Landed,
+) -> EngineResult<()> {
+    #[cfg(feature = "vulkan")]
+    {
+        let Vulkan {
+            shell,
+            programs,
+            sink,
+            ..
+        } = gpu;
+        let shell = shell
+            .as_ref()
+            .ok_or_else(|| Error::Load("the vulkan engine has no model loaded".into()))?;
+        let attachment = &step.attachments[0];
+        let seats = lane_seats(shell, landed, attachment);
+        let done = sink.clone().map(|sink| Done { at, sink });
+        programs
+            .fire_deferred(attachment.instance, shell.device(), seats, done)
+            .map_err(refusal)
+    }
+    #[cfg(not(feature = "vulkan"))]
+    {
+        let _ = (gpu, step, at, landed);
+        Err(Error::unsupported("vulkan", "a deferred guest pass"))
+    }
 }
 
 /// What step `landed` read out for each lane of `attachment`, its pixels among them.
 #[cfg(feature = "vulkan")]
 fn lane_seats<'a>(
     shell: &'a Shell,
-    landed: &crate::serve::Landed,
+    landed: &Landed,
     attachment: &engine::fire::Attachment,
 ) -> Vec<Vec<crate::guest::run::Readout<'a>>> {
     (attachment.lane..attachment.lane + attachment.lanes.max(1))

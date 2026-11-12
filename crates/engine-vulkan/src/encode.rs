@@ -159,6 +159,8 @@ pub struct Sink<'a> {
     scratch: std::cell::RefCell<Scratch>,
 
     comm: Option<&'a crate::comm::Comm>,
+
+    outer: engine_gpu::probe::Recording,
 }
 
 #[cfg(feature = "vulkan")]
@@ -170,7 +172,7 @@ impl<'a> Sink<'a> {
         pipelines: &'a Pipelines,
         handles: &'a Handles,
     ) -> Sink<'a> {
-        crate::probe::set_frame(frame);
+        let outer = engine_gpu::probe::set_frame(frame);
 
         LAST_FIRE.with(|cell| cell.set(None));
         Sink {
@@ -180,6 +182,7 @@ impl<'a> Sink<'a> {
             handles,
             scratch: std::cell::RefCell::new(Scratch::default()),
             comm: None,
+            outer,
         }
     }
 
@@ -207,7 +210,7 @@ impl<'a> Sink<'a> {
 #[cfg(feature = "vulkan")]
 impl Drop for Sink<'_> {
     fn drop(&mut self) {
-        crate::probe::clear_frame(self.frame);
+        engine_gpu::probe::restore(self.outer);
     }
 }
 
@@ -348,13 +351,13 @@ impl Sink<'_> {
                         .map_err(|detail| Sink::backend(fire, detail))?;
                     infos.push(
                         vk::DescriptorBufferInfo::default()
-                            .buffer(binding.slab().buffer)
+                            .buffer(binding.buffer().slab().buffer)
                             .offset(binding.offset())
                             .range(view),
                     );
                     writes_at.push(mutable);
                     extents.push(binding.extent());
-                    self.frame.retain(binding.slab());
+                    self.frame.retain(binding.buffer().slab());
                 }
                 ArgValue::I32(v) => push.extend_from_slice(&v.to_le_bytes()),
                 ArgValue::U32(v) => push.extend_from_slice(&v.to_le_bytes()),

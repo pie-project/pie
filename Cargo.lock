@@ -1806,6 +1806,26 @@ dependencies = [
 ]
 
 [[package]]
+name = "engine-gpu"
+version = "0.6.0"
+dependencies = [
+ "checkpoint",
+ "engine",
+ "eta-compiler",
+ "eta-exec",
+ "kernels-slang",
+ "libc",
+ "memmap2",
+ "pie-eta-ir",
+ "pie-poem-compiler",
+ "pie-poem-exec",
+ "pie-poem-ir",
+ "pie-profile",
+ "toml",
+ "tracing",
+]
+
+[[package]]
 name = "engine-metal"
 version = "0.6.0"
 dependencies = [
@@ -1841,6 +1861,7 @@ dependencies = [
  "ash",
  "checkpoint",
  "engine",
+ "engine-gpu",
  "eta-compiler",
  "eta-exec",
  "kernels-slang",
@@ -1866,6 +1887,7 @@ dependencies = [
  "ash",
  "checkpoint",
  "engine",
+ "engine-gpu",
  "eta-compiler",
  "eta-exec",
  "kernels-slang",
