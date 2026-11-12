@@ -1387,3 +1387,7 @@ The `new-memory/` directory is bookkeeping and is removed before anything lands 
   kimik3 / minimax / glm53; ws kernel A/B no regression (520.4 vs 523.9 us, noise). gpt-oss held = new-memory
   (c64 1290 vs main 1030). Open: affine 4-bit real-model bench; H100/B200 confirmation (A25); FP8 30B pages 3204 vs
   main 3968 (activation rungs); arming cost.
+- M113 follow-up (0de00a58c, 99d2e25b7): the held pageable copy is populated up front across up to 32 threads with no
+  THP advice (MADV_HUGEPAGE stalled on direct compaction: FP8 boot 70 -> 152 s over repeated runs); a capturing
+  arming fire no longer walks its body eagerly first (one forward per body). L40S boot held: FP8 64.6-65.3 s (main
+  64.7-68.4), NVFP4 85.8-86.8 (main 85.1-86.0), gpt-oss 50.7 (main 62.3-64.5).
