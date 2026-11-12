@@ -203,6 +203,14 @@ pub struct AttnBlockKeys(pub u32);
 #[decision(id = "kernel.attn.unrolled_blocks", constant(range(1..=16)), default = 16, tune = search)]
 pub struct AttnUnrolledBlocks(pub u32);
 
+/// Query rows a block of the prefill flash kernel takes for heads 128 wide
+/// and narrower. A smaller block reads fewer key blocks past a row block's
+/// own prompt where a fire's prompts meet; where the softmax holds the VPU
+/// (a v5e) that wins, where the MXU's 256 rows want filling (a v6e) it loses.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Decision)]
+#[decision(id = "kernel.attn.flash_narrow_rows", constant(set(128, 256)), default = 256, tune = search)]
+pub struct AttnFlashNarrowRows(pub u32);
+
 /// Tokens per chunk of the scalar-decay (GDN) chunked scan.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Decision)]
 #[decision(id = "kernel.ssm.chunk", constant(set(16, 32, 64, 128, 256)), default = 64, tune = search)]
@@ -256,6 +264,7 @@ pub fn register(registry: &mut Registry) {
         .add::<RopeFlatRows>()
         .add::<AttnBlockKeys>()
         .add::<AttnUnrolledBlocks>()
+        .add::<AttnFlashNarrowRows>()
         .add::<SsmChunk>()
         .add::<SsmLongChunk>()
         .add::<SsmKdaChunk>()
@@ -299,6 +308,9 @@ pub struct Chunks {
     /// Rows from which a decode takes the page-copy kernel (see
     /// [`AttnDecodePages`]).
     pub decode_pages: i64,
+    /// A flash prefill block's query rows for narrow heads (see
+    /// [`AttnFlashNarrowRows`]).
+    pub flash_narrow_rows: i64,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -374,6 +386,7 @@ impl Tuning {
             unrolled: 16,
             window_reach: true,
             decode_pages: 0,
+            flash_narrow_rows: 256,
         },
         ssm: SsmChunks {
             chunk: 64,
@@ -432,6 +445,7 @@ impl Tuning {
                 unrolled: n(profile.get::<AttnUnrolledBlocks>().0),
                 window_reach: true,
                 decode_pages: n(profile.get::<AttnDecodePages>().0),
+                flash_narrow_rows: n(profile.get::<AttnFlashNarrowRows>().0),
             },
             ssm: SsmChunks {
                 chunk: n(profile.get::<SsmChunk>().0),

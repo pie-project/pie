@@ -153,13 +153,19 @@ impl Shape {
 /// The shape the kernel takes for `r` rows of these heads within
 /// `vmem_cap`, if any: heads a whole number of lane tiles wide, the
 /// rectangle at least a key block tall and tile-aligned at its end.
-fn shape(r: i64, h: &Heads, scale: f64, vmem_cap: i64) -> Option<Shape> {
+fn shape(r: i64, h: &Heads, scale: f64, vmem_cap: i64, narrow_rows: i64) -> Option<Shape> {
     if h.d % 128 != 0 || h.dv % 128 != 0 || r < BK || r % 16 != 0 || h.g < 1 {
         return None;
     }
+    // Narrow heads take the chip's rows first (`kernel.attn.flash_narrow_rows`).
+    let first = if h.d <= 128 && h.dv <= 128 {
+        narrow_rows
+    } else {
+        BQ
+    };
     // Whole row blocks only: a partial last block's copies reach past the
     // fire's rows (gemma-4-31B's 640-row fires faulted the chip).
-    [BQ, BQ / 2]
+    [first, BQ / 2]
         .into_iter()
         .filter(|&bq| r % bq == 0)
         .map(|bq| Shape::of(r, h, scale, bq))
@@ -168,7 +174,14 @@ fn shape(r: i64, h: &Heads, scale: f64, vmem_cap: i64) -> Option<Shape> {
 
 /// Whether the kernel takes this fire: the static side of the decision
 /// (`PIE_XLA_FLASH_PREFILL=0` turns it off).
-pub(crate) fn fits(f: &Func, ap: &Appended, r: i64, h: &Heads, vmem_cap: i64) -> bool {
+pub(crate) fn fits(
+    f: &Func,
+    ap: &Appended,
+    r: i64,
+    h: &Heads,
+    vmem_cap: i64,
+    narrow_rows: i64,
+) -> bool {
     if std::env::var("PIE_XLA_FLASH_PREFILL").is_ok_and(|v| v == "0") {
         return false;
     }
@@ -182,7 +195,7 @@ pub(crate) fn fits(f: &Func, ap: &Appended, r: i64, h: &Heads, vmem_cap: i64) ->
         && f.elem(ap.v) == Elem::Bf16
         && f.dims(ap.page) == [r]
         && f.dims(ap.off) == [r]
-        && shape(r, h, 1.0, vmem_cap).is_some()
+        && shape(r, h, 1.0, vmem_cap, narrow_rows).is_some()
 }
 
 /// The kernel over a fire's own key rows and an older-keys rectangle of
@@ -572,10 +585,11 @@ pub(crate) fn attend(
     enabled: Option<Val>,
     scale: f64,
     vmem_cap: i64,
+    narrow_rows: i64,
     walk: Walk<'_>,
 ) -> Built<Flashed> {
     let r = f.dims(q4)[0];
-    let Some(s) = shape(r, h, scale, vmem_cap) else {
+    let Some(s) = shape(r, h, scale, vmem_cap, narrow_rows) else {
         return bad(format!("{r} rows of {h:?} do not fit"));
     };
     let (start, p0) = segments(f, lane, qpos)?;

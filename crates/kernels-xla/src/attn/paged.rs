@@ -2019,7 +2019,8 @@ pub fn attend_fresh(
                 && rule.rel.is_none()
                 && call.o.dtype == Dtype::Bf16
                 && r >= 4 * geom.lanes;
-            match fresh.filter(|a| plain && super::flash::fits(f, a, r, &heads, cap_v)) {
+            let narrow = tuning.chunks.flash_narrow_rows;
+            match fresh.filter(|a| plain && super::flash::fits(f, a, r, &heads, cap_v, narrow)) {
                 Some(a) => super::flash::attend(
                     f,
                     &a,
@@ -2037,6 +2038,7 @@ pub fn attend_fresh(
                     enabled,
                     scale,
                     cap_v,
+                    narrow,
                     Box::new(walk),
                 )?,
                 None => walk(f)?,
