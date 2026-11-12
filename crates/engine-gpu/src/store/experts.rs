@@ -25,7 +25,7 @@
 //! staging is the one road on both engines. A fire with every expert
 //! resident flushes and stages nothing, and the stage is given back.
 //!
-//! A staged fire records like any other (Vulkan): each flush of a kept frame
+//! A staged fire records like any other (where the API records): each flush of a kept frame
 //! ends a segment of the recording, and the stage's host step ([`Cut`]: the
 //! routes it read, the layer it staged) is kept beside it, so a replay
 //! submits a segment, waits, stages that layer's misses again and goes on.
@@ -43,10 +43,10 @@ use kernels_slang::linear::moe::select::ExpertTable;
 use poem_compiler::chunk::{ChunkRecipe, WeightKind as RecipeKind};
 use poem_ir::{Def, Dtype, Linear, Operands, Operation, ParamSource, Trace};
 
-use crate::device::ctx::Frame;
-use crate::device::{Buffer, Context, Handles};
+use crate::backend::{Backend, Buffer as _, Context as _, Frame as _};
 use crate::error::{Fault, Result};
 use crate::experts::{HostPlane, HostTier};
+use crate::handles::{Binding, Handles};
 use crate::store::Pools;
 use crate::store::rows::{NOT_HELD, Uses};
 
@@ -256,26 +256,26 @@ impl ExpertShape {
 /// One expert shape's cache: which slot each atom lies in, the device's
 /// view of that, the uses counted and the experts staged a fire.
 #[derive(Debug)]
-struct Cache {
+struct Cache<B: Backend> {
     shape: ExpertShape,
     /// Each atom's slot ref, [`NOT_HELD`] where none.
     slots: Vec<u32>,
     /// Each atom's pool unit as kernels read it.
-    units: Buffer,
+    units: B::Buffer,
     /// A use a route read, an atom each.
-    hits: Buffer,
+    hits: B::Buffer,
     /// Each atom's seat of the stage this fire, where staged.
-    staged: Buffer,
+    staged: B::Buffer,
     /// The experts staged for the layer a fire reads now; none while every
     /// atom is resident.
-    stage: Option<Buffer>,
+    stage: Option<B::Buffer>,
     /// The set is the load's for life.
     held: bool,
     /// The bytes a pool unit of this shape counts: `gcd(chunk, slot)`.
     unit: u64,
 }
 
-impl Cache {
+impl<B: Backend> Cache<B> {
     fn resident(&self) -> u32 {
         u32::try_from(self.slots.iter().filter(|&&s| s != NOT_HELD).count()).unwrap_or(u32::MAX)
     }
@@ -293,34 +293,34 @@ pub type StageKey = (u32, u32, u32, usize, usize, u32, u32);
 /// and, in order, each stage's host step, which a recorded fire's replay
 /// repeats between the segments its flushes cut.
 #[derive(Default)]
-pub struct Staged {
+pub struct Staged<B: Backend> {
     pub last: Option<StageKey>,
-    pub cuts: Vec<Cut>,
+    pub cuts: Vec<Cut<B>>,
 }
 
 /// One stage's host step: the routes of layer `layer` of cache `cache`,
 /// `bytes` of them where `routes` lies.
 #[derive(Clone)]
-pub struct Cut {
+pub struct Cut<B: Backend> {
     cache: usize,
     layer: usize,
-    routes: crate::device::Binding,
+    routes: Binding<B>,
     bytes: u64,
 }
 
 /// The load's routed experts.
 #[derive(Debug)]
-pub struct ExpertCaches {
-    caches: Vec<Cache>,
+pub struct ExpertCaches<B: Backend> {
+    caches: Vec<Cache<B>>,
     /// Each streamed plane's cache, layer and place among the layer's.
     by_param: BTreeMap<usize, (usize, usize, usize)>,
     /// What a binding with nothing to read binds.
-    spare: Buffer,
+    spare: B::Buffer,
 }
 
-impl ExpertCaches {
+impl<B: Backend> ExpertCaches<B> {
     /// The caches of `shapes`, nothing resident.
-    pub fn new(device: &Context, shapes: Vec<ExpertShape>, chunk_bytes: u64) -> Result<Self> {
+    pub fn new(device: &B::Context, shapes: Vec<ExpertShape>, chunk_bytes: u64) -> Result<Self> {
         let mut caches = Vec::with_capacity(shapes.len());
         let mut by_param = BTreeMap::new();
         for shape in shapes {
@@ -330,27 +330,27 @@ impl ExpertCaches {
                     by_param.insert(plane.param, (caches.len(), l, k));
                 }
             }
-            let mut units = Buffer::host(device, u64::from(atoms) * 4)?;
+            let mut units = B::Buffer::host(device, u64::from(atoms) * 4)?;
             units.write(0, &vec![0xffu8; atoms as usize * 4])?;
-            let mut staged = Buffer::host(device, u64::from(atoms) * 4)?;
+            let mut staged = B::Buffer::host(device, u64::from(atoms) * 4)?;
             staged.write(0, &vec![0xffu8; atoms as usize * 4])?;
             let mut cache = Cache {
                 slots: vec![NOT_HELD; shape.count as usize],
                 units,
-                hits: Buffer::host(device, u64::from(atoms) * 4)?,
+                hits: B::Buffer::host(device, u64::from(atoms) * 4)?,
                 staged,
                 stage: None,
                 held: false,
                 unit: crate::store::layout::gcd(chunk_bytes, shape.slot_bytes),
                 shape,
             };
-            cache.stage = Some(Buffer::host(device, cache.stage_bytes().max(4))?);
+            cache.stage = Some(B::Buffer::host(device, cache.stage_bytes().max(4))?);
             caches.push(cache);
         }
         Ok(ExpertCaches {
             caches,
             by_param,
-            spare: Buffer::host(device, 16)?,
+            spare: B::Buffer::host(device, 16)?,
         })
     }
 
@@ -434,7 +434,7 @@ impl ExpertCaches {
         self.caches
             .iter()
             .filter_map(|c| c.stage.as_ref())
-            .map(Buffer::bytes)
+            .map(B::Buffer::bytes)
             .sum()
     }
 
@@ -445,9 +445,9 @@ impl ExpertCaches {
     /// it filled.
     pub fn residency(
         &mut self,
-        device: &Context,
-        pools: &Pools,
-        host: &HostTier,
+        device: &B::Context,
+        pools: &Pools<B>,
+        host: &HostTier<B>,
         planes: &BTreeMap<usize, &HostPlane>,
         residency: &WeightResidency,
     ) -> Result<usize> {
@@ -509,7 +509,7 @@ impl ExpertCaches {
             if !cache.slots.contains(&NOT_HELD) {
                 cache.stage = None;
             } else if cache.stage.is_none() {
-                cache.stage = Some(Buffer::host(device, cache.stage_bytes().max(4))?);
+                cache.stage = Some(B::Buffer::host(device, cache.stage_bytes().max(4))?);
             }
         }
         self.restage(pools)?;
@@ -521,7 +521,7 @@ impl ExpertCaches {
     fn image(
         shape: &ExpertShape,
         atom: u32,
-        host: &HostTier,
+        host: &HostTier<B>,
         planes: &BTreeMap<usize, &HostPlane>,
         into: &mut [u8],
     ) -> Result<()> {
@@ -553,9 +553,9 @@ impl ExpertCaches {
     /// experts from the host, in uploads of [`UPLOAD`] bytes at most.
     fn fill(
         &self,
-        device: &Context,
-        pools: &Pools,
-        host: &HostTier,
+        device: &B::Context,
+        pools: &Pools<B>,
+        host: &HostTier<B>,
         planes: &BTreeMap<usize, &HostPlane>,
         fills: &mut [(u64, usize, u32)],
     ) -> Result<()> {
@@ -572,7 +572,7 @@ impl ExpertCaches {
                 bytes += slot;
                 end += 1;
             }
-            let mut upload = Buffer::host(device, bytes.max(4))?;
+            let mut upload = B::Buffer::host(device, bytes.max(4))?;
             let mut at = 0u64;
             let mut image = Vec::new();
             for &(_, cache, atom) in &fills[start..end] {
@@ -587,7 +587,7 @@ impl ExpertCaches {
             let mut frame = device.frame()?;
             let mut at = 0u64;
             let mut regions: Vec<(u64, u64, u64)> = Vec::new();
-            let mut into: Option<(&Buffer, u64)> = None;
+            let mut into: Option<(&B::Buffer, u64)> = None;
             for &(to, cache, _) in &fills[start..end] {
                 let slot = self.caches[cache].shape.slot_bytes;
                 let (buffer, local) = pools.locate(to)?;
@@ -618,7 +618,7 @@ impl ExpertCaches {
     /// Rewrites every atom's entry from its slot ref through the pool's
     /// chunk table: after a residency, and after an evacuation moves a
     /// chunk. The caller has drained every fire that reads the entries.
-    pub fn restage(&mut self, pools: &Pools) -> Result<()> {
+    pub fn restage(&mut self, pools: &Pools<B>) -> Result<()> {
         for cache in &mut self.caches {
             let mut units = Vec::with_capacity(cache.slots.len() * 4);
             for &slot in &cache.slots {
@@ -682,13 +682,13 @@ impl ExpertCaches {
     #[allow(clippy::too_many_arguments)]
     pub fn table(
         &self,
-        handles: &Handles,
-        host: &HostTier,
+        handles: &Handles<B>,
+        host: &HostTier<B>,
         host_planes: &BTreeMap<usize, &HostPlane>,
         planes: [Option<usize>; 4],
         routes: Tensor,
         at: (u32, u32),
-        read: &std::cell::RefCell<Staged>,
+        read: &std::cell::RefCell<Staged<B>>,
         pool: kernels_slang::Segments,
     ) -> Result<Option<ExpertTable>> {
         let Some(lead) = planes.iter().flatten().next() else {
@@ -731,7 +731,7 @@ impl ExpertCaches {
                 read.cuts.push(cut);
             }
         }
-        let bind = |buffer: &Buffer, len: u64| -> Result<Tensor> {
+        let bind = |buffer: &B::Buffer, len: u64| -> Result<Tensor> {
             let handle = handles.bind(buffer, 0, len.max(4))?;
             Ok(Tensor::new(
                 handle,
@@ -764,13 +764,13 @@ impl ExpertCaches {
     /// each. The step's [`Cut`], for a replay to repeat.
     fn stage(
         &self,
-        handles: &Handles,
-        host: &HostTier,
+        handles: &Handles<B>,
+        host: &HostTier<B>,
         host_planes: &BTreeMap<usize, &HostPlane>,
         at: (usize, usize),
         routes: Tensor,
-    ) -> Result<Cut> {
-        crate::probe::with_frame(Frame::flush_settled)
+    ) -> Result<Cut<B>> {
+        B::with_frame(B::Frame::flush_settled)
             .ok_or_else(|| Fault::Residency("no frame is recording on this thread".into()))??;
         let binding = handles.get(routes.buf).ok_or_else(|| Fault::Unbound {
             what: format!("handle {}, the routes of a staged layer", routes.buf),
@@ -792,9 +792,9 @@ impl ExpertCaches {
     /// before).
     pub fn stage_cut(
         &self,
-        host: &HostTier,
+        host: &HostTier<B>,
         host_planes: &BTreeMap<usize, &HostPlane>,
-        cut: &Cut,
+        cut: &Cut<B>,
     ) -> Result<()> {
         let cache = self.caches.get(cut.cache).ok_or_else(|| Fault::Unbound {
             what: format!("expert shape {} of a recorded stage", cut.cache),

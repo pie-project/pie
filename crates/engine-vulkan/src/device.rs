@@ -37,8 +37,8 @@ pub use stub::{
 };
 
 /// The shared engine's view of this API.
-#[derive(Debug)]
-pub enum Api {}
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+pub struct Api;
 
 mod gpu;
 

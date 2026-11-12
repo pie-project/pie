@@ -16,13 +16,13 @@
 use engine::chunk::{ChunkTable, Evacuation, Growth};
 use kernels_slang::{SEGMENTS, Segments};
 
-use crate::device::ctx::Frame;
-use crate::device::{Buffer, Context, Handles};
+use crate::backend::{Backend, Buffer as _, Frame as _};
 use crate::error::{Fault, Result};
+use crate::handles::Handles;
 
 #[derive(Debug)]
-pub struct Pool {
-    segments: Vec<Option<Buffer>>,
+pub struct Pool<B: Backend> {
+    segments: Vec<Option<B::Buffer>>,
     chunk_bytes: u64,
     total_chunks: u32,
     segment_chunks: u32,
@@ -40,10 +40,10 @@ pub fn segment_chunks(chunk_bytes: u64, total_chunks: u32, binding: u64) -> u32 
     quarter.min(fits).max(1)
 }
 
-impl Pool {
+impl<B: Backend> Pool<B> {
     /// A pool of `total_chunks` chunks of `chunk_bytes`, segments of
     /// `segment_chunks`, nothing committed.
-    pub fn reserve(chunk_bytes: u64, total_chunks: u32, segment_chunks: u32) -> Result<Pool> {
+    pub fn reserve(chunk_bytes: u64, total_chunks: u32, segment_chunks: u32) -> Result<Pool<B>> {
         if chunk_bytes == 0 || total_chunks == 0 || segment_chunks == 0 {
             return Err(Fault::Ceiling {
                 what: "chunks of the state pool",
@@ -135,7 +135,7 @@ impl Pool {
     /// The bytes with memory behind them now.
     #[must_use]
     pub fn committed_bytes(&self) -> u64 {
-        self.segments.iter().flatten().map(Buffer::bytes).sum()
+        self.segments.iter().flatten().map(B::Buffer::bytes).sum()
     }
 
     /// The physical chunk logical chunk `logical` sits on.
@@ -162,7 +162,7 @@ impl Pool {
 
     /// The segment buffer virtual byte `at` lies in and its offset there;
     /// refuses an uncommitted one.
-    pub fn locate(&self, at: u64) -> Result<(&Buffer, u64)> {
+    pub fn locate(&self, at: u64) -> Result<(&B::Buffer, u64)> {
         let span = u64::from(self.segment_chunks) * self.chunk_bytes;
         let segment = at / span;
         let buffer = self
@@ -179,7 +179,7 @@ impl Pool {
 
     /// The pool as kernels bind it: every committed segment, the rest
     /// absent.
-    pub fn bind(&self, handles: &Handles) -> Result<Segments> {
+    pub fn bind(&self, handles: &Handles<B>) -> Result<Segments> {
         let mut bufs = [kernels_slang::ABSENT; SEGMENTS];
         for (at, segment) in self.segments.iter().enumerate() {
             if let Some(buffer) = segment {
@@ -195,7 +195,7 @@ impl Pool {
 
     /// Backs the first `segments` segments, each zeroed; what is backed
     /// already stands, and fewer than are backed is no change.
-    pub fn commit_segments(&mut self, device: &Context, segments: u32) -> Result<()> {
+    pub fn commit_segments(&mut self, device: &B::Context, segments: u32) -> Result<()> {
         let max = self.segments();
         if segments > max {
             return Err(Fault::Ceiling {
@@ -205,7 +205,7 @@ impl Pool {
             });
         }
         for segment in self.committed..segments {
-            let buffer = Buffer::zeroed(device, self.segment_bytes(segment))?;
+            let buffer = B::Buffer::zeroed(device, self.segment_bytes(segment))?;
             self.segments[segment as usize] = Some(buffer);
             self.committed = segment + 1;
         }
@@ -228,7 +228,7 @@ impl Pool {
     /// beside the pool indexed by physical chunk.
     pub fn evacuate(
         &mut self,
-        frame: &mut Frame,
+        frame: &mut B::Frame,
         evacuation: &Evacuation,
     ) -> Result<Vec<(u32, u32)>> {
         let mut moved = Vec::with_capacity(evacuation.moves.len());
@@ -256,20 +256,6 @@ impl Pool {
         Ok(moved)
     }
 
-    /// Copies `bytes` from virtual byte `from` to `to` in `frame`; neither
-    /// run crosses a chunk.
-    pub fn copy(&self, frame: &mut Frame, from: u64, to: u64, bytes: u64) -> Result<()> {
-        let (src, src_at) = self.locate(from)?;
-        let (dst, dst_at) = self.locate(to)?;
-        frame.copy(src, src_at, dst, dst_at, bytes)
-    }
-
-    /// `into.len()` bytes from virtual byte `at`, read on the host.
-    pub fn read(&self, at: u64, into: &mut [u8]) -> Result<()> {
-        let (buffer, local) = self.locate(at)?;
-        buffer.read(local, into)
-    }
-
     /// Writes `from` at virtual byte `at` through the queue, after every
     /// submitted frame.
     pub fn write(&mut self, at: u64, from: &[u8]) -> Result<()> {
@@ -285,6 +271,20 @@ impl Pool {
                 have: u64::from(self.committed),
             })?;
         buffer.write(at % span, from)
+    }
+
+    /// Copies `bytes` from virtual byte `from` to `to` in `frame`; neither
+    /// run crosses a chunk.
+    pub fn copy(&self, frame: &mut B::Frame, from: u64, to: u64, bytes: u64) -> Result<()> {
+        let (src, src_at) = self.locate(from)?;
+        let (dst, dst_at) = self.locate(to)?;
+        frame.copy(src, src_at, dst, dst_at, bytes)
+    }
+
+    /// `into.len()` bytes from virtual byte `at`, read on the host.
+    pub fn read(&self, at: u64, into: &mut [u8]) -> Result<()> {
+        let (buffer, local) = self.locate(at)?;
+        buffer.read(local, into)
     }
 
     /// Zeroes `len` bytes at virtual byte `at`. The caller has drained every

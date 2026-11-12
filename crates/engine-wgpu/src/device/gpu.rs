@@ -13,6 +13,8 @@ impl engine_gpu::Backend for Api {
 
     const COPY_GRAIN: u64 = 4;
 
+    const STORAGE: checkpoint::types::BackendKind = checkpoint::types::BackendKind::Wgpu;
+
     type Context = Context;
 
     type Buffer = Buffer;
@@ -49,6 +51,10 @@ impl engine_gpu::Backend for Api {
 impl engine_gpu::backend::Context<Api> for Context {
     fn frame(&self) -> Result<Frame> {
         Context::frame(self)
+    }
+
+    fn max_buffer(&self) -> u64 {
+        Context::max_buffer(self)
     }
 }
 

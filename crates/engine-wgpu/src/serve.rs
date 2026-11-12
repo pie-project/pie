@@ -984,8 +984,14 @@ impl Shell {
             host_kv_budget.map_or(0, |bytes| u32::try_from(bytes / chunk).unwrap_or(u32::MAX));
         let rs_at = rows.rs.clone();
         let mut pools = Pools::reserve(&device, rows, layout, paging, host_chunks)?;
-        let row_caches =
-            crate::store::rows::RowCaches::new(&device, row_shapes, boot.budget.max_tokens, chunk)?;
+        let row_caches = crate::store::rows::RowCaches::new(
+            &device,
+            &boot.trace,
+            row_shapes,
+            boot.budget.max_tokens,
+            chunk,
+            0,
+        )?;
         let expert_caches =
             crate::store::experts::ExpertCaches::new(&device, expert_shapes, chunk)?;
         // The null chunk's segment stands from the load on.

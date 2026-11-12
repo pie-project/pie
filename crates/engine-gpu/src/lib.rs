@@ -9,6 +9,7 @@ pub mod blob;
 pub mod chunks;
 pub mod decoded;
 pub mod error;
+pub mod experts;
 pub mod handles;
 pub mod mask;
 pub mod probe;

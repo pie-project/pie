@@ -22,7 +22,9 @@ pub enum Memory {
 pub type OnDone = Box<dyn FnOnce(Option<String>) + Send + 'static>;
 
 /// A GPU API: the types a backend crate binds the shared engine to.
-pub trait Backend: Sized + 'static {
+pub trait Backend:
+    Sized + Copy + Default + std::fmt::Debug + Eq + std::hash::Hash + Send + Sync + 'static
+{
     /// The API's name in a message.
     const NAME: &'static str;
 
@@ -35,6 +37,9 @@ pub trait Backend: Sized + 'static {
     /// The bytes a buffer-to-buffer copy's offsets and length are a
     /// multiple of.
     const COPY_GRAIN: u64;
+
+    /// The storage target a checkpoint lands for.
+    const STORAGE: checkpoint::types::BackendKind;
 
     /// The device one load binds.
     type Context: Context<Self>;
@@ -86,6 +91,9 @@ pub trait Backend: Sized + 'static {
 pub trait Context<B: Backend> {
     /// A frame to record into.
     fn frame(&self) -> Result<B::Frame>;
+
+    /// The bytes one buffer may span.
+    fn max_buffer(&self) -> u64;
 }
 
 /// Device work recorded on the host, submitted at commit.
@@ -138,13 +146,13 @@ pub trait Frame<B: Backend>: 'static {
 }
 
 /// A submitted frame.
-pub trait Pending {
+pub trait Pending: std::fmt::Debug {
     /// Blocks until the frame lands.
     fn wait(&self) -> Result<()>;
 }
 
 /// A device reservation as the shared engine moves bytes through it.
-pub trait Buffer<B: Backend>: Clone + std::fmt::Debug {
+pub trait Buffer<B: Backend>: Clone + std::fmt::Debug + Send + Sync {
     fn with(device: &B::Context, bytes: u64, kind: Memory) -> Result<Self>;
 
     fn zeroed(device: &B::Context, bytes: u64) -> Result<Self> {
