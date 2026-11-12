@@ -1365,3 +1365,9 @@ The `new-memory/` directory is bookkeeping and is removed before anything lands 
   pool row), packed kernel branches deleted, non-fitting planes refused at load. vs main: MoE decode 256 x 80 steps
   73.6k vs 73.3k (was -8%); qwen3-0.6b c256 +9.1%, c1 +7.3%; open: MoE decode 8 -3.1%, qwen3-0.6b prefill 2048 -2.7%,
   d0.8b c64 -2.6% (layer-major state).
+
+### M112 — 2026-11-12: XLA in-place pool writers stay in HBM
+- `sc/xla-tier` (7ea2aeff3, TPU): Compiled::call_aliased colors in-place outputs and their aliased operands HBM
+  (XLA had parked the whole MoE-mini pool in VMEM between Mosaic calls, ~52 us / step). vs main: MoE d8 +2.6% (was
+  -3.1%), d1 / d256 / p2048 +0.8 / +0.9 / +3.9%; qwen3-0.6b d1 / d64 / d256 +7.2 / +4.2 / +9.4%, p2048 -1.8%;
+  d0.8b d64 -2.6% (layer-major). Gates bitwise.
