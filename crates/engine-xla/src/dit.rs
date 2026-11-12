@@ -5,7 +5,7 @@ use crate::handle::Tensor;
 use poem_compiler::CompiledModel;
 use poem_exec::feeds::{Feeds, Seat};
 use poem_exec::fire::{Composition, LaneFacts, LaneRow};
-use poem_ir::{ClassSet, Def, Dtype, RuntimeInput, Trace, Ty, ValueId};
+use poem_ir::{ClassSet, Def, Dtype, RuntimeInput, Trace, ValueId};
 
 use crate::error::{Fault, Result};
 use crate::inputs::Inputs;
@@ -51,7 +51,6 @@ struct PixelsExport {
     plane: ValueId,
     grid: ValueId,
     classes: ClassSet,
-    width: u32,
 }
 
 /// What a load reads off its plan for these families.
@@ -106,22 +105,6 @@ fn program(why: String) -> Fault {
     Fault::Program {
         at: "serve::dit",
         why,
-    }
-}
-
-fn width_of(trace: &Trace, value: ValueId) -> u32 {
-    match &trace.values[value.0 as usize].ty {
-        Ty::Tensor { shape, .. } => shape
-            .iter()
-            .skip(1)
-            .map(|dim| match dim {
-                poem_ir::Dim::Const(n) => *n,
-                _ => 1,
-            })
-            .product::<u64>()
-            .try_into()
-            .unwrap_or(u32::MAX),
-        Ty::Struct(_) => 0,
     }
 }
 
@@ -226,20 +209,10 @@ impl Dit {
                     plane: output.value,
                     grid: output.grid?,
                     classes: poem_exec::feeds::writer_classes(trace, compiled, output.value),
-                    width: width_of(trace, output.value),
                 })
             })
             .collect();
         Ok(dit)
-    }
-
-    /// Whether the plan exports pixels, and the widest pixel row.
-    #[must_use]
-    pub fn pixels_facts(&self) -> (bool, u32) {
-        (
-            !self.pixels.is_empty(),
-            self.pixels.iter().map(|p| p.width).max().unwrap_or(0),
-        )
     }
 
     #[must_use]

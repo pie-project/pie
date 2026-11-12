@@ -1191,12 +1191,6 @@ impl Plane {
         }
     }
 
-    /// Guest stage executions on the device and the lanes they carried.
-    #[must_use]
-    pub fn stage_runs(&self) -> (u64, u64) {
-        (self.stages.runs, self.stages.lanes)
-    }
-
     #[must_use]
     pub fn prologue_runs(&self, instance: InstanceId) -> bool {
         self.instances
