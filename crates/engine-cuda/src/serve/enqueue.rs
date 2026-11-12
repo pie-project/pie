@@ -823,6 +823,7 @@ impl FireCtx<'_> {
             } else if p.bodied {
                 let fire = record::Fire {
                     eager_twin: self.golden_arm == Golden::Eager,
+                    arming: self.arming && self.golden_arm == Golden::Off,
                     trace: self.trace,
                     compiled: self.compiled,
                     descriptor: &p.descriptor,

@@ -15,6 +15,9 @@ pub const WARM_FIRES: u32 = 2;
 
 pub struct Fire<'a> {
     pub eager_twin: bool,
+    /// A synthetic fire of arming whose rows no one reads (no golden arm
+    /// beside it): the fire that captures its body need not walk it first.
+    pub arming: bool,
     pub trace: &'a Trace,
     pub compiled: &'a CompiledModel,
     pub descriptor: &'a FireDescriptor,
@@ -987,8 +990,16 @@ impl Bodies {
         // The warm fires walk the streams the capture will: a side stream's
         // regions take their own slabs (`scratch_stream` scopes by stream),
         // which a capture cannot grow. Nothing is capturing, so no region
-        // opens a conditional node.
-        walk_capture(at, run, place, Streams::Warm)?;
+        // opens a conditional node. An arming fire about to be captured
+        // skips its walk: nothing reads a synthetic fire's rows, and the warm
+        // fire before it made what the walk would (modules, tunes, slabs).
+        let captures = at.arming
+            && !self.map.sealed()
+            && run.capturable()
+            && self.map.warmed(&key) + 1 >= WARM_FIRES;
+        if !captures {
+            walk_capture(at, run, place, Streams::Warm)?;
+        }
 
         if self.sealed_decline() {
             let declines = self.recorder.bstats.sealed_declines;
@@ -1244,6 +1255,11 @@ impl BodyMap {
             let key = self.body_order.remove(at);
             self.body_order.push(key);
         }
+    }
+
+    /// The fires `key` has warmed so far.
+    fn warmed(&self, key: &BodyKey) -> u32 {
+        self.body_warm.get(key).copied().unwrap_or(0)
     }
 
     fn warm(&mut self, key: &BodyKey) -> u32 {
