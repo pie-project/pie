@@ -1329,6 +1329,7 @@ The `new-memory/` directory is bookkeeping and is removed before anything lands 
   planner lock, ~131k process visits per frame at c256); state_tables / seat_pages without per-lane copies. Decode
   frame host phases at c64 now at or below main's. golden_logits / by_refs = base; runtime scheduler / planner /
   pipeline / store pass. sm_120 is GPU/power-bound, so throughput there is unchanged (c64 12221 vs main 12301).
-- Found: Qwen3.5 gdn_step / conv1d +7% per launch in serving from codegen (StateRows arg: 178 regs vs main's 205);
-  compile-time single-segment specialization next. A/B tip: share gemm-algos picks across builds (each binary
+- Found: Qwen3.5 gdn_step / conv1d +7% per launch in serving: not codegen (same speed cold) but L2 placement --
+  a layer's 64 lane states sit one record (~10.37 MB) apart at the same offset (likely L2 set/slice aliasing);
+  +16% in the partly-L2-resident regime vs main's contiguous bank. Stride/offset sweep next. A/B tip: share gemm-algos picks across builds (each binary
   times and caches its own; ~13% of picks differ -> +/-0.3-1% bias).
