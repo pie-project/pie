@@ -706,7 +706,7 @@ mod tests {
             (
                 "llama31-8b-bf16-kv-bf16",
                 "l3-8b",
-                (Layout::Snake, 8, 4, 256, 256, 16, 216),
+                (Layout::Snake, 8, 4, 256, 256, 16, 112),
             ),
         ] {
             // with no preset named, each picks its shipping one
@@ -829,7 +829,7 @@ mod tests {
         let shipped = plan(&t, &Ask::default()).unwrap().plan;
         let layer = crate::cost::time::layer(&s, Some(&shipped));
         let ms = crate::cost::time::step(&shipped, layer);
-        assert!((ms - 0.5238).abs() < 1e-9, "{ms}");
+        assert!((ms - 0.5100).abs() < 1e-9, "{ms}");
         let ask = crate::search::Asked {
             positions: Some(shipped.contract.positions),
             ..Default::default()

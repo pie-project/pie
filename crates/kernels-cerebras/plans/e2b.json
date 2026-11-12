@@ -2,7 +2,7 @@
   "name": "e2b",
   "layout": "stacked",
   "made_for": [1536, 35, 6144],
-  "keys": {"G2": 16, "G2W": 24, "HR": 1130, "LOOP": 64, "NEG": 32, "NU": 7, "PX": 256, "PY": 128},
+  "keys": {"G2": 8, "G2W": 24, "HR": 1130, "LOOP": 64, "NEG": 32, "NU": 7, "PX": 256, "PY": 128},
   "levers": "WSPEC:2",
   "arrangement": {
     "unit": [256, 128, 7],

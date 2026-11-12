@@ -267,13 +267,17 @@ collectives cross down the columns (the rows) and along the rows (the columns), 
 row reads, the head PE's elements. `cost::time` prices them at the chip's rates. The weight and head
 elements' are read off the phase stamps of `TSTAMP:1` runs (requests 1179a/c/d: a weight PE's
 matvec phases, 0.46 cycles an element; the head PE's, 0.537, alike on Llama, E4B and Gemma 12B).
-The KV elements', the hops' and the spans' are fitted to what moving a preset's keys did to the bare
-step (requests 1151-1177c: Llama VR=112, 0.8B PX=128, Gemma 12B's pick, 4B PY=192, gpt-oss G2=8 /
-24): the fit predicts each move within 3 µs (`time::tests`); fitted with one move held out it
-misses the held-out one by up to 67 µs, so it ranks the moves it was fitted on and needs more sweeps
-before it ranks new ones. The columns cost nothing the chip resolves (`SPAN_COL` 0): halving the
-0.8B's cost what its doubled matvec and KV elements do. Each layer's own cost is read off the
-measured step of the model's shipping plan (`time::MEASURED`: the bare step where the chip ran it,
+The KV elements', the group hops' and the rows' spans are fitted to what moving a pinned plan's
+keys did to the bare step (requests 1151-1195, 16 moves: Llama VR=112 / 144 / 180, 0.8B PX=128,
+Gemma 12B's pick, 4B PY=192, G2=8 / 12 / 24 on the 9B, E4B, E2B and gpt-oss). The fit predicts
+each move within 6 µs and the same way the chip moved (`time::tests`) but one: G2=12 gains 2.3% on
+E4B and 1.6% on the 9B where the hops' count gives 0.4%, so G2=12's gain is past what the hops
+explain and the model ranks G2=8 level with it. Fitted with one move held out it misses the
+held-out one by 10 µs RMS, 26 µs at most (the 4B's). The root hops' rate is held at the six-move
+fit's: the G2 sweeps fit any from 0 to 4e-6 ms alike, and 0 would send the search below the
+smallest group the chip ran. The columns cost nothing the chip resolves (`SPAN_COL` 0): halving
+the 0.8B's cost what its doubled matvec and KV elements do. Each layer's own cost is read off the
+measured step of the model's pinned plan (`time::MEASURED`: the bare step where the chip ran it,
 else Pie decode; a model the chip has not run takes the median).
 
 `cost::memory` is the PE image model. The bytes a partition moves are the weight PE's (its K
@@ -291,7 +295,7 @@ seed that does not plan is repaired a key at a time, following each move that ge
 check it failed. A candidate plans, serves the positions asked for (the made-for plan's, else
 4096), keeps its head over the vocabulary, leaves every image `STACK_ROOM` plus a 512 B margin
 and builds (`Program::build`); it ranks ahead of the made-for plan only where it predicts a step
-0.3% faster (`search::RESOLUTION`, the time model's largest error on the chip's moves). `wafer-compile search --model <m>` prints the ranking with the keys
+0.3% faster (`search::RESOLUTION`: the G2 tweaks under it are within the time model's error). `wafer-compile search --model <m>` prints the ranking with the keys
 each candidate moved from the made-for plan.
 
 ## Weights
