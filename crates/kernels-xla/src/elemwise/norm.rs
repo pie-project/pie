@@ -88,18 +88,18 @@ fn inv_rms_tall(
 }
 
 /// Rows a per-head norm kernel takes a step (`heads_kernel`).
-const KERNEL_ROWS: i64 = 256;
+pub(super) const KERNEL_ROWS: i64 = 256;
 
 /// The least rows a fire's per-head norm takes the kernel from: a prompt's
 /// fire; a batch's mixed fires (a few hundred rows) keep XLA's norm (v5e
 /// gemma-4-31B c32: 1.98k -> 1.95k tok/s through the kernel).
-const KERNEL_FROM: i64 = 640;
+pub(super) const KERNEL_FROM: i64 = 640;
 
 /// The narrowest rows the kernel takes (8 heads of 256), or 8 heads of any
 /// width (128-wide ones from 1024): narrower ones cost XLA little (v6e
 /// gemma-4-26B-A4B's 8 kv heads of 256 through the kernel: pf256-512 42.6k
 /// -> 45.0k tok/s; v5e Qwen3.5-0.8B c256 equal).
-const KERNEL_WIDTH: i64 = 2048;
+pub(super) const KERNEL_WIDTH: i64 = 2048;
 
 /// `x`'s bf16 `[rows, width]` rows normed per `axis`-wide head by one Mosaic
 /// kernel, a block of rows a step and each head in place, times `gain` (an

@@ -401,6 +401,7 @@ mod tests {
         want.rope_flat_rows = 1024;
         want.glu_land_from = 1024;
         want.glu_gemm_from = 1024;
+        want.norm_rope_from = 1024;
         want.moe_gmm_run = 4;
         want.moe_segment_tokens = 256;
         want.moe_gmm_glu = true;

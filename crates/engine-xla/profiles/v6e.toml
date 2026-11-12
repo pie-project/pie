@@ -38,6 +38,9 @@ glu.land_from = 1024
 # and from 1024 rows its gate-up and GLU run as one Mosaic kernel, the fire's rows whole against 512-wide
 # blocks of each half (Gemma-4-31B's 2304-row gate-up: 1.62 ms dot and GLU pass -> 1.24 ms)
 glu.gemm_from = 1024
+# and a prompt's q and k per-head norms and their rope run as one Mosaic kernel (Gemma-4-31B cut pf256-512
+# 32.4k -> 33.7k tok/s)
+norm.rope_from = 1024
 
 [provenance]
 measured = [
@@ -49,6 +52,7 @@ measured = [
   "kernel.attn.per_row_max",
   "kernel.glu.gemm_from",
   "kernel.glu.land_from",
+  "kernel.norm.rope_from",
   "kernel.moe.cost.dense_all_mi",
   "kernel.moe.cost.loop_row_ns",
   "kernel.moe.cost.loop_tile_ns",

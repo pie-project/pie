@@ -66,6 +66,8 @@ moe.gmm_fuse_from = 1024
 # norm fused into the dots after (pf32-512: 31B cut 25.8k -> 26.6k, 12B cut 28.6k -> 29.4k)
 norm.land_from = 1152
 norm.land_below = 2048
+# a prompt's q and k head norms and their rope run as one kernel (Gemma-4-31B cut's 1664-row fire 62.2 -> 60.9 ms, pf32-512 26.6k -> 27.2k)
+norm.rope_from = 640
 
 [provenance]
 measured = [
@@ -87,6 +89,7 @@ measured = [
   "kernel.moe.segment_tokens",
   "kernel.norm.land_below",
   "kernel.norm.land_from",
+  "kernel.norm.rope_from",
   "kernel.ssm.row_blocks",
   "kernel.ssm.step_mxu",
 ]
