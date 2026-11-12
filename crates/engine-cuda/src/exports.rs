@@ -166,11 +166,17 @@ pub(crate) fn plain_of(
     outputs: &[poem_exec::feeds::ClassOutput],
 ) -> poem_ir::ClassSet {
     let plain = |class: usize| landing[class].iter().any(poem_ir::Request::plain);
+    // An output's name no plain class writes: the drafter's (a name written
+    // by several value sets is one output a set).
+    let plain_names: std::collections::HashSet<&str> = outputs
+        .iter()
+        .filter(|out| (0..landing.len()).any(|c| plain(c) && out.classes.contains(c)))
+        .map(|out| out.decl.name.as_str())
+        .collect();
     let drafter = |class: usize| {
-        outputs.iter().any(|out| {
-            out.classes.contains(class)
-                && !(0..landing.len()).any(|c| plain(c) && out.classes.contains(c))
-        })
+        outputs
+            .iter()
+            .any(|out| out.classes.contains(class) && !plain_names.contains(out.decl.name.as_str()))
     };
     poem_ir::ClassSet::of((0..landing.len()).filter(|&class| {
         plain(class) || (landing[class].iter().any(drafts_only) && drafter(class))
