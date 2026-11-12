@@ -36,6 +36,11 @@ pub struct FireLimits {
     /// this many rows.
     #[serde(default)]
     pub prefill_rows: u32,
+    /// The most rows a fire holding a decode takes, when fewer than
+    /// `max_tokens` (0: `max_tokens`): a fire of prompts alone takes up to
+    /// `max_tokens`.
+    #[serde(default)]
+    pub mixed_tokens: u32,
     /// 0: as many as `max_tokens`.
     #[serde(default)]
     pub max_readouts: u32,

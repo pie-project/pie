@@ -219,6 +219,7 @@ mod tests {
             max_page_refs: 64,
             max_context: 0,
             prefill_rows,
+            mixed_forward_tokens: 0,
         };
         assert_eq!(super::prefill_budget(limits(10240, 0)), 10240);
         assert_eq!(super::prefill_budget(limits(10240, 2048)), 2048);

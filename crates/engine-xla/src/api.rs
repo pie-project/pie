@@ -69,6 +69,10 @@ pub struct DeviceBoot {
     /// The tokens a hybrid's state slot is balanced against the kv pages
     /// for (a sequence's expected prompt and output); `None`: the context.
     pub seat_tokens: Option<u32>,
+
+    /// The most rows a fire holding a decode takes, when fewer than the
+    /// fire's `max_forward_tokens`; `None`: those.
+    pub mixed_tokens: Option<u32>,
 }
 
 impl Default for DeviceBoot {
@@ -81,6 +85,7 @@ impl Default for DeviceBoot {
             window_pool: true,
             headroom: None,
             seat_tokens: None,
+            mixed_tokens: None,
         }
     }
 }
@@ -422,6 +427,7 @@ impl Engine for Xla {
                 max_page_refs: paging.pages_per_slot.saturating_mul(budgets.max_lanes),
                 max_context: paging.context(),
                 prefill_rows: 0,
+                mixed_tokens: shell.mixed(),
                 max_readouts: u32::try_from(poem_compiler::arena::readouts_ceiling(&bake_budgets(
                     &budgets,
                 )))
