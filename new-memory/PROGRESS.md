@@ -1420,3 +1420,15 @@ The `new-memory/` directory is bookkeeping and is removed before anything lands 
   room keeps its clock while the fleet progresses. Qwen3-8B c256 on 32 GB: 3034 / 3057 vs main 3088 / 3092 (M111
   2691 / 2826); gpt-oss 24 x 31.4k 5/5 ok 61.2-61.6 s; e2e handles = M111. Open: t_evict lost-wakeup hang
   (pre-existing), new-prompt seat wait 1.2 s vs main 6 ms.
+
+### M116 — 2026-11-12: engine-gpu shared crate (A24, user decision)
+- `sc/engine-gpu` (c20e5ad79): crates/engine-gpu holds the stores, chunk recipe, weights / experts / rows caches,
+  arena, rs seats, windows, run + dispatch, inputs, scratch, shell (load / stage / enqueue / settle), the Engine impl
+  and shared guest parts, generic over a statically dispatched Backend trait (Context / Buffer / Frame / Pending /
+  Tactics; Serve / Host for record-replay vs browser landing). engine-vulkan 40.5k -> 9.7k, engine-wgpu 37.7k -> 7.0k,
+  engine-gpu 22.7k (two backends 78.2k -> 39.4k). Compiles for wasm32 (pie-browser builds). Load-time check that guest
+  stages / widen match the layout they bind (the uniform-vs-storage mismatch that cost Vulkan decode 2-4x in an
+  intermediate commit).
+- Gates vs a7aae7764: 3 logit dumps byte-identical on both backends; engine_vulkan 64 / engine_wgpu 63 tests pass;
+  Vulkan c1 315.1 vs 313.9. Measured one commit earlier: c64 -2% (noise +-10%), prefill 2048 -0.9% (all 3 rounds),
+  boot within noise — re-measure on the tip pending. Workspace --all-targets + pie vulkan,wgpu check clean.
