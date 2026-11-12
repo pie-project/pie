@@ -305,6 +305,7 @@ impl Run<'_> {
                 let up_v = l.read(self.tensor(*up))?;
                 let o_y = self.tensor(*y);
                 let v = linear::mlp::geglu_tanh(l.f(), gate_v, up_v, o_y.landing())?;
+                let v = glu_landed(l.f(), v, o_y);
                 l.land(o_y, v)
             }),
             Linear::GeluTanh { x, y } => crate::lower::lower(self.ctx(), |l| {
@@ -381,6 +382,7 @@ impl Run<'_> {
                 let o_y = self.tensor(*y);
                 let v =
                     linear::mlp::geglu_tanh_packed(l.f(), packed_v, *intermediate, o_y.landing())?;
+                let v = glu_landed(l.f(), v, o_y);
                 l.land(o_y, v)
             }),
             Linear::Glu {
@@ -834,4 +836,19 @@ impl Run<'_> {
             }),
         }
     }
+}
+
+/// Experiment (`PIE_XLA_GLU_LAND=<rows>`): a GLU of that many rows and more
+/// lands in bf16 behind a barrier, so XLA cannot fuse it into the dot that
+/// reads it next.
+fn glu_landed(f: &mut kernels_xla::hlo::Func, v: kernels_xla::hlo::Val, y: crate::handle::Tensor) -> kernels_xla::hlo::Val {
+    let from = std::env::var("PIE_XLA_GLU_LAND")
+        .ok()
+        .and_then(|s| s.parse::<u32>().ok())
+        .unwrap_or(0);
+    if from == 0 || y.rows < from || y.dtype != dtype::Dtype::Bf16 {
+        return v;
+    }
+    let v = f.convert(v, kernels_xla::hlo::Elem::Bf16);
+    f.barrier(v)
 }
