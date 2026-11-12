@@ -1,6 +1,5 @@
 pub mod chunks;
 pub(crate) mod genmap;
-pub mod grow;
 pub(crate) mod kv;
 pub(crate) mod pool;
 pub(crate) mod registry;

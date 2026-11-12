@@ -137,13 +137,7 @@ impl Steer {
 
 async fn watch(mut pool: Shared<Steered>, tolerance: Tolerance) {
     let mut steer = Steer::new(&pool, tolerance, GROWTH_STEP);
-    let (grow, shared, engine) = pool.with(|pool| {
-        (
-            pool.inner().grow().cloned(),
-            pool.inner().is_shared(),
-            pool.inner().locus().1,
-        )
-    });
+    let (shared, engine) = pool.with(|pool| (pool.inner().is_shared(), pool.inner().locus().1));
     let mut interval = crate::rt::time::interval(TICK);
     // A shared pool moves its own segments off the fire path; the loop reads
     // the system each tick and hands it the target.
@@ -166,31 +160,11 @@ async fn watch(mut pool: Shared<Steered>, tolerance: Tolerance) {
         let all = pool.hard_limit().div_ceil(segment);
         let _ = pool.retarget(all);
     }
-    // A dedicated pool's size stands: the loop only ticks, reading nothing
-    // and answering no waiter.
-    let Some(grow) = grow.filter(|_| steer.governor().tolerance() != Tolerance::Dedicated) else {
-        loop {
-            interval.tick().await;
-            steer.turn(&mut pool, Some(Pressure::Calm), &mut |_| {});
-        }
-    };
-    let mut system: Box<dyn System> = super::system();
+    // A dedicated pool's size stands, and a pool that is not shared never
+    // moves: the loop only ticks, reading nothing and answering no waiter.
     loop {
-        let waiter = tokio::select! {
-            _ = interval.tick() => false,
-            () = grow.waiter() => true,
-        };
-        let read = (!waiter).then(|| system.read());
-        let turn = steer.turn(&mut pool, read, &mut |signal| {
-            steered::signal(engine, signal);
-        });
-        grow.set_can_rise(steer.governor().can_rise());
-        if let Some(yielding) = turn.yielding {
-            grow.yield_scratch(yielding).await;
-        }
-        if turn.idled {
-            grow.release_scratch().await;
-        }
+        interval.tick().await;
+        steer.turn(&mut pool, Some(Pressure::Calm), &mut |_| {});
     }
 }
 

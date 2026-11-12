@@ -1483,38 +1483,6 @@ impl KvPageTable {
         Ok(staying)
     }
 
-    /// Whether the anchor at `terminal` keeps a resident page at or past
-    /// `limit`.
-    pub fn holds_past(&self, terminal: NodeId, limit: u32) -> bool {
-        let mut past = false;
-        self.visit_anchor_locations(terminal, |location| {
-            past |= self.resident_past(&location, limit);
-        });
-        past
-    }
-
-    /// The working sets that read a resident page at or past `limit`.
-    pub fn working_sets_past(&self, limit: u32) -> HashSet<WorkingSetId> {
-        let mut sets = HashSet::new();
-        for (ws, _) in self.working_sets.iter() {
-            let mut past = false;
-            let _ = self.visit_working_set_locations(ws, |location| {
-                past |= self.resident_past(&location, limit);
-            });
-            if past {
-                sets.insert(ws);
-            }
-        }
-        sets
-    }
-
-    fn resident_past(&self, location: &TriePageLocation, limit: u32) -> bool {
-        matches!(
-            self.backing_at(location),
-            Ok(KvPageBacking::Resident(id)) if id.index() >= limit
-        )
-    }
-
     /// A running reader kept them on the device and has gone since: readers
     /// in `order`, then the rest, until `wanted` pages are found. The pages
     /// `order` keeps, the first of a reader's, go only once nothing else will

@@ -1,12 +1,11 @@
-//! One engine's pool as its governor steers it: today's pools (a [`Grow`]
-//! where they can change size, nothing to move where they cannot), with
-//! the weight cache in front ([`WeightFirst`]), shared with the engine's
+//! One engine's pool as its governor steers it: its shared pool's segments
+//! (nothing to move where the pools are pinned), with the weight cache in
+//! front ([`WeightFirst`]), shared with the engine's
 //! planner, which sheds the cache before it raises tier pressure.
 
 use std::sync::Arc;
 
 use crate::policy::pressure::{self, Tier};
-use crate::store::grow::Grow;
 use crate::store::registry;
 use crate::store::shared::SharedGrow;
 use crate::store::slots::SlotPool;
@@ -21,19 +20,16 @@ use super::{Demand, Growth, PoolTarget, Retarget, Signal};
 pub struct EnginePool {
     model: usize,
     engine: usize,
-    /// `None`: the pools are whole from the load and never move.
-    grow: Option<Grow>,
     weights: SlotPool,
     shared: Option<SharedGrow>,
 }
 
 impl EnginePool {
     #[must_use]
-    pub const fn new(model: usize, engine: usize, grow: Option<Grow>, weights: SlotPool) -> Self {
+    pub const fn new(model: usize, engine: usize, weights: SlotPool) -> Self {
         Self {
             model,
             engine,
-            grow,
             weights,
             shared: None,
         }
@@ -45,7 +41,6 @@ impl EnginePool {
         Self {
             model,
             engine,
-            grow: None,
             weights: crate::store::weights::slot_pool(&::engine::chunk::ChunkFacts::default()),
             shared: Some(grow),
         }
@@ -60,11 +55,6 @@ impl EnginePool {
     #[must_use]
     pub const fn is_shared(&self) -> bool {
         self.shared.is_some()
-    }
-
-    #[must_use]
-    pub const fn grow(&self) -> Option<&Grow> {
-        self.grow.as_ref()
     }
 
     #[must_use]
@@ -96,21 +86,13 @@ impl SlotAccess for EnginePool {
 }
 
 impl EnginePool {
-    /// The target that moves: the shared pool's, else today's pools'.
+    /// The target that moves: the shared pool's; pinned pools never move.
     fn target(&self) -> Option<&dyn PoolTarget> {
-        match (&self.shared, &self.grow) {
-            (Some(shared), _) => Some(shared),
-            (None, Some(grow)) => Some(grow),
-            (None, None) => None,
-        }
+        self.shared.as_ref().map(|shared| shared as &dyn PoolTarget)
     }
 
     fn target_mut(&mut self) -> Option<&mut dyn PoolTarget> {
-        match (&mut self.shared, &mut self.grow) {
-            (Some(shared), _) => Some(shared),
-            (None, Some(grow)) => Some(grow),
-            (None, None) => None,
-        }
+        self.shared.as_mut().map(|shared| shared as &mut dyn PoolTarget)
     }
 }
 
@@ -384,7 +366,7 @@ mod tests {
 
     #[test]
     fn a_fixed_engine_pool_is_fixed_and_never_moves() {
-        let mut pool = EnginePool::new(usize::MAX, 0, None, slot_pool_of_none());
+        let mut pool = EnginePool::new(usize::MAX, 0, slot_pool_of_none());
         assert_eq!(pool.growth(), Growth::Fixed);
         assert_eq!(pool.retarget(0), Retarget::Reached);
         let mut seen = None;
@@ -419,7 +401,7 @@ mod tests {
             let mut slots = slot_pool_of_none();
             let cache = WeightCache::new(&[], 0, true, &mut slots).unwrap();
             let port = Counting::default();
-            let pool = EnginePool::new(usize::MAX, 0, None, slots);
+            let pool = EnginePool::new(usize::MAX, 0, slots);
             let mut pool = Shared::new(WeightFirst::new(pool, cache, port.clone()));
             let mut steer = Steer::new(&pool, tolerance, 1);
             assert_eq!(steer.governor().tolerance(), Tolerance::Dedicated);

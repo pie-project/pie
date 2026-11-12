@@ -798,11 +798,6 @@ impl Lane {
             QueuedItem::Pool { op, response } => {
                 let result = backend(engine).and_then(|engine| {
                     match op {
-                        PoolOp::Commit(pages) => engine.commit_pool(pages),
-                        PoolOp::Release(pages) => engine.release_pool(pages),
-                        PoolOp::CommitState(slots) => engine.commit_state(slots),
-                        PoolOp::ReleaseState(slots) => engine.release_state(slots),
-                        PoolOp::ReleaseScratch => engine.release_scratch(),
                         PoolOp::CommitSegments(segments) => engine.commit_segments(segments),
                         PoolOp::ReleaseSegments(segments) => engine.release_segments(segments),
                         PoolOp::Evacuate(evacuation) => engine.evacuate(&evacuation),

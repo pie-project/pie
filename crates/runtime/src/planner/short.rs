@@ -42,9 +42,6 @@ struct Short {
 pub(super) struct Shortfall {
     /// By waiter id (the second half of its entry key).
     waiters: HashMap<u64, Short>,
-    /// What idle cache past a falling limit keeps that only the policy may
-    /// let go, on the device.
-    tail: u64,
     /// What was last said per tier, so a planner with nothing short stays
     /// quiet.
     said: [u64; 2],
@@ -74,13 +71,9 @@ impl Shortfall {
         self.note(id, [device, bytes]);
     }
 
-    pub(super) fn note_tail(&mut self, bytes: u64) {
-        self.tail = bytes;
-    }
-
     /// Nothing is short and nothing was said: there is nothing to tell.
     pub(super) fn quiet(&self) -> bool {
-        self.waiters.is_empty() && self.tail == 0 && self.said == [0, 0]
+        self.waiters.is_empty() && self.said == [0, 0]
     }
 
     /// Forgets the waiters that are no longer waiting.
@@ -111,7 +104,7 @@ impl Shortfall {
 
     /// What each tier is short of in all.
     pub(super) fn sums(&self) -> [u64; 2] {
-        let mut sums = [self.tail, 0];
+        let mut sums = [0u64; 2];
         for short in self.waiters.values() {
             for (sum, bytes) in sums.iter_mut().zip(short.bytes) {
                 *sum = sum.saturating_add(bytes);
@@ -161,7 +154,5 @@ mod tests {
         assert_eq!(short.since(1), None);
         assert_eq!(short.take_said(), [(Tier::Device, 0)]);
         assert!(short.take_said().is_empty());
-        short.note_tail(8);
-        assert_eq!(short.take_said(), [(Tier::Device, 8)]);
     }
 }
