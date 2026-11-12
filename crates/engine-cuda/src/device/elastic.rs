@@ -78,7 +78,6 @@ pub struct PhysicalPool {
     pledged_pages: u64,
     held_pages: u64,
     committed_pages: u64,
-    high_water_pages: u64,
     #[cfg_attr(not(feature = "device"), allow(dead_code))]
     utilization: f64,
 }
@@ -106,7 +105,6 @@ impl PhysicalPool {
                 pledged_pages: 0,
                 held_pages: 0,
                 committed_pages: 0,
-                high_water_pages: 0,
                 utilization,
             })
         }
@@ -129,7 +127,6 @@ impl PhysicalPool {
             pledged_pages: 0,
             held_pages: 0,
             committed_pages: 0,
-            high_water_pages: 0,
             utilization: 1.0,
         }
     }
@@ -182,11 +179,6 @@ impl PhysicalPool {
         self.committed_pages
     }
 
-    #[must_use]
-    pub const fn high_water_pages(&self) -> u64 {
-        self.high_water_pages
-    }
-
     /// What the pool can still take: the budget past what is committed and
     /// what is promised.
     #[must_use]
@@ -211,7 +203,6 @@ impl PhysicalPool {
         let promised = self.held_pages.min(pages);
         self.held_pages -= promised;
         self.committed_pages += pages;
-        self.high_water_pages = self.high_water_pages.max(self.committed_pages);
     }
 
     /// `pages` committed earlier went back to the device.
@@ -1193,7 +1184,6 @@ mod tests {
         assert!(pool.try_reserve(4));
         pool.mark_committed(10);
         assert_eq!(pool.committed_pages(), 10);
-        assert_eq!(pool.high_water_pages(), 10);
         assert!(!pool.try_reserve(1));
     }
 

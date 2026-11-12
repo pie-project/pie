@@ -68,19 +68,6 @@ impl Serving {
         self.names.get(id as usize).map(String::as_str)
     }
 
-    #[must_use]
-    pub fn plane_reserved(&self, id: u32, reserved: u64) -> Option<&[u8]> {
-        let name = self.names.get(id as usize)?;
-        let located = self.artifact.locate(name).ok()?;
-        let start = located.at + located.plane.offset;
-        if located.plane.len > reserved || start.checked_add(reserved)? > self.artifact.mapped_len()
-        {
-            return None;
-        }
-        let blob = self.artifact.object(&located.object).ok()?;
-        blob.get(located.plane.range())
-    }
-
     pub fn verify_planes(&self, params: &[u32]) -> Result<(), String> {
         let mut objects = BTreeSet::new();
         for id in params {
@@ -433,7 +420,6 @@ mod tests {
     #[test]
     fn checkpoint_serving_every_case() {
         a_plane_is_found_by_its_name_and_not_by_where_it_sits();
-        a_reservation_wider_than_the_plane_is_answered_inside_the_mapping();
         the_fill_rebuilds_the_image_from_one_object_and_sees_a_changed_byte();
         an_ordinary_checkpoint_is_not_a_serving_artifact();
     }
@@ -462,34 +448,6 @@ mod tests {
         assert_eq!(serving.plane(1), Some(&planes[1].1[..]));
         assert_eq!(serving.plane(2), Some(&planes[0].1[..]));
         assert_eq!(serving.plane(3), None);
-        std::fs::remove_dir_all(&dir).ok();
-    }
-
-    fn a_reservation_wider_than_the_plane_is_answered_inside_the_mapping() {
-        let dir = tmp("reserved");
-        let path = dir.join("m.zt");
-        let planes = vec![("short", vec![5u8; 100]), ("long", vec![6u8; 4096])];
-        emit::write(
-            &path,
-            &Stamp::of("cuda", "qwen_3"),
-            &BTreeMap::new(),
-            4096,
-            &leaves(&planes),
-            |o, p, _| panic!("{o}/{p} is not streamed"),
-        )
-        .unwrap();
-        let serving = Serving::open(&path, &trace(&["short", "long"])).expect("it opens");
-        assert_eq!(serving.plane_reserved(0, 256), Some(&planes[0].1[..]));
-        assert_eq!(
-            serving.plane_reserved(0, 64),
-            None,
-            "a plane longer than its seat"
-        );
-        assert_eq!(
-            serving.plane_reserved(1, 1 << 40),
-            None,
-            "a reservation past the file"
-        );
         std::fs::remove_dir_all(&dir).ok();
     }
 
