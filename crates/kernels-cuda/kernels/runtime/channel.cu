@@ -539,13 +539,14 @@ __global__ void rs_ext_csr(
 
 // Lane r's extended rows (a block a lane): its replayed buffer rows (when
 // the value is a buffered plane, `pages` non-null) then its own rows of
-// `own`.
+// `own`, which land at its buffer tokens as `rs_scatter` lands them.
 __global__ void rs_ext_gather(
     const u8* __restrict__ own,
     u8* __restrict__ ext,
     u32 row_bytes,
     const u32* __restrict__ qo_indptr,
-    const u32* __restrict__ csr,
+    u32* __restrict__ csr,
+    u32* __restrict__ ext_win,
     const u32* __restrict__ win,
     u32 lanes_stated,
     const RsLane* __restrict__ lanes_tab,
@@ -556,12 +557,37 @@ __global__ void rs_ext_gather(
     u64 plane_stride)
 {
     const u32 lanes = win != nullptr ? win[2] : lanes_stated;
+    const u32 lane0 = win != nullptr ? win[3] : 0u;
     const u32 r = blockIdx.x;
+    // Lane r's extended rows start past every earlier lane's replayed and
+    // own rows; the first gather of an op (`ext_win` non-null) lays the
+    // window's layout from block 0, padded lanes empty.
+    __shared__ u32 begin;
+    if (threadIdx.x == 0) {
+        const u32 upto = r < lanes ? r : lanes;
+        u32 acc = 0;
+        for (u32 i = 0; i < upto; ++i) {
+            acc += lanes_tab[lane0 + i].replay + (qo_indptr[i + 1] - qo_indptr[i]);
+        }
+        begin = acc;
+        if (ext_win != nullptr && r == 0) {
+            u32 total = 0;
+            for (u32 i = 0; i < lanes; ++i) {
+                csr[i] = total;
+                total += lanes_tab[lane0 + i].replay + (qo_indptr[i + 1] - qo_indptr[i]);
+            }
+            for (u32 i = lanes; i <= lanes_stated; ++i) csr[i] = total;
+            ext_win[0] = total;
+            ext_win[1] = 0u;
+            ext_win[2] = lanes;
+            ext_win[3] = lane0;
+        }
+    }
+    __syncthreads();
     if (r >= lanes) return;
     const u32 row0 = win != nullptr ? win[1] : 0u;
-    const u32 rl = win != nullptr ? r + win[3] : r;
-    const RsLane lane = lanes_tab[rl];
-    const u32 e0 = csr[r];
+    const RsLane lane = lanes_tab[lane0 + r];
+    const u32 e0 = begin;
     if (pages != nullptr) {
         for (u32 k = 0; k < lane.replay; ++k) {
             const u32 tok = replay_tok[lane.replay_off + k];
@@ -572,8 +598,13 @@ __global__ void rs_ext_gather(
     const u32 t0 = qo_indptr[r];
     const u32 n = qo_indptr[r + 1] - t0;
     for (u32 e = 0; e < n; ++e) {
-        rs_copy_row(ext + static_cast<u64>(e0 + lane.replay + e) * row_bytes,
-                    own + static_cast<u64>(row0 + t0 + e) * row_bytes, row_bytes);
+        const u8* src = own + static_cast<u64>(row0 + t0 + e) * row_bytes;
+        rs_copy_row(ext + static_cast<u64>(e0 + lane.replay + e) * row_bytes, src, row_bytes);
+        // A buffered plane's own rows land in the lane's buffer too.
+        if (pages != nullptr && lane.at != RS_NONE) {
+            rs_copy_row(rs_page_row(pages, lane, lane.at + e, page_tokens, plane_off, plane_stride),
+                        src, row_bytes);
+        }
     }
 }
 

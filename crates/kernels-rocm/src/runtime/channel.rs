@@ -495,7 +495,9 @@ pub fn rs_ext_csr(
 }
 
 /// Each lane's extended rows into `ext`: its replayed buffer rows (of
-/// `plane`, when the value is one) then its own rows of `own`.
+/// `plane`, when the value is one) then its own rows of `own`, which land in
+/// its buffer too. With `layout` (`csr`, `ext_win`), it lays the window's
+/// extended layout as `rs_ext_csr` does, for the op's later launches.
 #[allow(clippy::too_many_arguments)]
 pub fn rs_ext_gather(
     ctx: &Ctx,
@@ -503,7 +505,7 @@ pub fn rs_ext_gather(
     ext: DevicePtr,
     row_bytes: u32,
     qo_indptr: DevicePtr,
-    csr: DevicePtr,
+    layout: Option<(DevicePtr, DevicePtr)>,
     lanes_stated: u32,
     tables: RsTables,
     plane: Option<RsPlane>,
@@ -516,6 +518,7 @@ pub fn rs_ext_gather(
         Some(plane) => (tables.pages, plane),
         None => (0, RsPlane { off: 0, stride: 0 }),
     };
+    let (csr, ext_win) = layout.unwrap_or((0, 0));
     ctx.fire(
         OP,
         Fire::at(kernel(FILE, "::pie::channel::rs_ext_gather"))
@@ -526,6 +529,7 @@ pub fn rs_ext_gather(
             ArgValue::U32(row_bytes),
             ArgValue::Ptr(qo_indptr),
             ArgValue::Ptr(csr),
+            ArgValue::Ptr(ext_win),
             ctx.stage(),
             ArgValue::U32(lanes_stated),
             ArgValue::Ptr(tables.lanes),

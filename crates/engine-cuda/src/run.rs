@@ -191,6 +191,9 @@ pub(crate) struct RsLayout {
     csr: Tensor,
     ext_win: u64,
     rows: u32,
+    /// Whether a launch of the op has laid it on the device yet: its first
+    /// gather does (`channel.rs_ext_gather`), else `channel.rs_ext_csr`.
+    laid: bool,
 }
 
 impl RsScratch {
@@ -1029,7 +1032,7 @@ impl<'c> Run<'c> {
         if let Some(layout) = scratch.layouts.borrow().get(&span.lane_offset) {
             return Ok(*layout);
         }
-        let (indptr, lanes) = self.rs_indptr();
+        let (_, lanes) = self.rs_indptr();
         // A bodied fire replays no more rows in a window than the window's
         // own or `REPLAYED` (`serve::prepare`), so the ceiling is the key's.
         let replayed: u32 = seat
@@ -1050,7 +1053,24 @@ impl<'c> Run<'c> {
             csr: Tensor::new(at + 16, lanes + 1, 1, poem_ir::Dtype::I32),
             ext_win: at,
             rows,
+            laid: false,
         };
+        scratch
+            .layouts
+            .borrow_mut()
+            .insert(span.lane_offset, layout);
+        Ok(layout)
+    }
+
+    /// The window's layout, laid on the device: by `channel.rs_ext_csr` where
+    /// no gather of the op has laid it.
+    fn rs_laid(&self, op: &'static str) -> Result<RsLayout, kernels_cuda::Error> {
+        let layout = self.rs_layout(op)?;
+        if layout.laid {
+            return Ok(layout);
+        }
+        let (seat, scratch) = self.rs_seat_and_scratch(op)?;
+        let (indptr, lanes) = self.rs_indptr();
         let tables = self.rs_tables(seat);
         kernels_cuda::runtime::channel::rs_ext_csr(
             self.ctx(),
@@ -1061,22 +1081,32 @@ impl<'c> Run<'c> {
             layout.csr.ptr,
             layout.ext_win,
         )?;
-        scratch
+        self.rs_mark_laid(scratch);
+        Ok(RsLayout {
+            laid: true,
+            ..layout
+        })
+    }
+
+    fn rs_mark_laid(&self, scratch: &RsScratch) {
+        if let Some(layout) = scratch
             .layouts
             .borrow_mut()
-            .insert(span.lane_offset, layout);
-        Ok(layout)
+            .get_mut(&self.window().span().lane_offset)
+        {
+            layout.laid = true;
+        }
     }
 
     /// The extended rows' boundaries: what an extended op reads its lanes by.
     pub(crate) fn rs_ext_csr(&self, op: &'static str) -> Result<Tensor, kernels_cuda::Error> {
-        Ok(self.rs_layout(op)?.csr)
+        Ok(self.rs_laid(op)?.csr)
     }
 
     /// The stream context an extended op launches on: armed with the
     /// extended rows' live words where the window is armed.
     pub(crate) fn rs_ext_ctx(&self, op: &'static str) -> Result<&'c Ctx, kernels_cuda::Error> {
-        let layout = self.rs_layout(op)?;
+        let layout = self.rs_laid(op)?;
         let ctx = self.ctx();
         if self.live_at() != 0 {
             ctx.arm_stage(layout.ext_win);
@@ -1094,7 +1124,6 @@ impl<'c> Run<'c> {
     ) -> Result<Tensor, kernels_cuda::Error> {
         let (seat, scratch) = self.rs_seat_and_scratch(op)?;
         let own = self.tensor(id);
-        self.rs_move(op, id, own)?;
         let plane = seat.buffers.planes().of(id);
         if buffered && plane.is_none() {
             return Err(kernels_cuda::Error::Backend {
@@ -1127,11 +1156,12 @@ impl<'c> Run<'c> {
             ext.ptr,
             row_bytes,
             indptr.ptr,
-            layout.csr.ptr,
+            (!layout.laid).then_some((layout.csr.ptr, layout.ext_win)),
             lanes,
             tables,
             place,
         )?;
+        self.rs_mark_laid(scratch);
         Ok(ext)
     }
 
@@ -1194,7 +1224,7 @@ impl<'c> Run<'c> {
         let (seat, _) = self.rs_seat_and_scratch(op)?;
         let target = self.tensor(id);
         let row_bytes = Self::rs_row_bytes(op, ext, None)?;
-        let layout = self.rs_layout(op)?;
+        let layout = self.rs_laid(op)?;
         let (indptr, lanes) = self.rs_indptr();
         let tables = self.rs_tables(seat);
         kernels_cuda::runtime::channel::rs_ext_land(

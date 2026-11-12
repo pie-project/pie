@@ -157,21 +157,24 @@ pub(crate) fn landing_requests(
 }
 
 /// The classes the lattice keys and arms: those a plain request lands in,
-/// and those a request lands in that is plain but for reading its pass's
-/// drafts (a speculative decoder's verify and its prompt).
+/// and, on a model with a drafter (an output only drafting classes write,
+/// MTP's `mtp.drafts`), those writing it that a request plain but for
+/// reading its pass's drafts lands in (the drafter's verify).
 #[must_use]
-pub(crate) fn plain_of(landing: &[Vec<poem_ir::Request>]) -> poem_ir::ClassSet {
-    poem_ir::ClassSet::of(
-        landing
-            .iter()
-            .enumerate()
-            .filter(|(_, requests)| {
-                requests
-                    .iter()
-                    .any(|request| request.plain() || drafts_only(request))
-            })
-            .map(|(class, _)| class),
-    )
+pub(crate) fn plain_of(
+    landing: &[Vec<poem_ir::Request>],
+    outputs: &[poem_exec::feeds::ClassOutput],
+) -> poem_ir::ClassSet {
+    let plain = |class: usize| landing[class].iter().any(poem_ir::Request::plain);
+    let drafter = |class: usize| {
+        outputs.iter().any(|out| {
+            out.classes.contains(class)
+                && !(0..landing.len()).any(|c| plain(c) && out.classes.contains(c))
+        })
+    };
+    poem_ir::ClassSet::of((0..landing.len()).filter(|&class| {
+        plain(class) || (landing[class].iter().any(drafts_only) && drafter(class))
+    }))
 }
 
 /// Whether only its query length and its reading the pass's drafts set
