@@ -794,6 +794,61 @@ fn the_chunked_conv_walks_each_lane_from_its_window() {
     }
 }
 
+/// A prompt's fire (lanes few beside its rows) convolves its rows in one
+/// pass and takes each lane's first rows again from its kept rows: lanes of
+/// 100, 2 and 130 rows, then padded rows, over a bf16 bank.
+#[test]
+fn a_tall_fires_conv_walks_each_lane_from_its_window() {
+    let (c, k, dil, slots) = (24usize, 4usize, 1usize, 5usize);
+    let hist = (k - 1) * dil + 1;
+    let indptr = [0i32, 100, 102, 232];
+    let rows = 256usize;
+    let lane_slot = [3i32, 1, 4];
+    let mut slot_of_row = vec![DROP; rows];
+    for l in 0..3 {
+        for t in indptr[l]..indptr[l + 1] {
+            slot_of_row[t as usize] = lane_slot[l];
+        }
+    }
+    let mut rng = Rng(17);
+    let xs = rng.bf16s(rows * c, 1.0);
+    let ws = rng.bf16s(c * k, 0.5);
+    let bank0: Vec<f32> = rng
+        .f32s(slots * hist * c, -1.0, 1.0)
+        .into_iter()
+        .map(round_bf16)
+        .collect();
+    let mut b = Bench::new();
+    let x = b.bf16(rows as u32, c as u32, &xs);
+    let ip = b.i32(indptr.len() as u32, 1, &indptr);
+    let w = b.bf16(c as u32, k as u32, &ws);
+    let bank = b.bf16(slots as u32, (hist * c) as u32, &bank0);
+    let sl = b.i32(rows as u32, 1, &slot_of_row);
+    let y = b.zeros(Dtype::Bf16, rows as u32, c as u32);
+    let p = pool(bank, sl);
+    let rt = RaggedTensor {
+        data: x,
+        indptr: ip,
+    };
+    let ran = b
+        .run(|ctx| ssm::causal_conv1d_chunked(ctx, rt, w, &p, k as u32, dil as u32, y))
+        .unwrap();
+    if !ran {
+        return;
+    }
+    let mut want_bank = bank0.clone();
+    let got_y = b.read_f32(y);
+    for l in 0..3 {
+        let (lo, hi) = (indptr[l] as usize, indptr[l + 1] as usize);
+        let s = lane_slot[l] as usize;
+        let past = &bank0[s * hist * c..(s + 1) * hist * c];
+        let (yr, next) = conv_ref(&xs[lo * c..hi * c], c, &ws, k, dil, past, hi - lo, false);
+        want_bank[s * hist * c..(s + 1) * hist * c].copy_from_slice(&next);
+        assert_close(&got_y[lo * c..hi * c], &yr, 2e-2, 1e-2);
+    }
+    assert_close(&b.read_f32(bank), &want_bank, 0.0, 0.0);
+}
+
 /// At Qwen3.5's conv width (rows of 6144 channels) a lane walked one decode
 /// fire at a time reads what its prefill read. (A TPU scatter into a
 /// one-row operand of rows this wide lands out-of-range updates on the row

@@ -86,7 +86,10 @@ enum ConvOut {
 /// `[L, hist * C]` (each lane's kept rows, oldest first) in one element, bf16
 /// or f32 (the taps move in it and are weighed in f32), `w` `[C, W]` f32. Returns
 /// `y` `[T, C]` and each lane's next kept rows `[L, hist * C]`: the last
-/// `hist` of `past ++ x[begin .. begin + keep]`.
+/// `hist` of `past ++ x[begin .. begin + keep]`. `narrow` (a bf16 landing)
+/// with few lanes beside the rows takes [`conv_fixed`]: the taps patched
+/// here lay a shifted copy of `x` out each (Qwen3.5-0.8B pf256-512 through
+/// it: v5e 70.9k -> 73.4k tok/s, v6e 170k -> 184k).
 fn conv_lanes(
     f: &mut Func,
     x: Val,
@@ -96,6 +99,7 @@ fn conv_lanes(
     dil: i64,
     out: ConvOut,
     bias: Option<Val>,
+    narrow: bool,
 ) -> Built<(Val, Val)> {
     let (t, c) = (f.dims(x)[0], f.dims(x)[1]);
     let taps = f.dims(w)[1];
@@ -106,6 +110,14 @@ fn conv_lanes(
     let table = f.concat(&[p, x], 0)?;
     let base = l * hist;
     let e = f.elem(x);
+    // A prompt's fire (lanes few beside its rows) takes the one pass; a
+    // batch's (a decode lane a row) patches nearly every row either way.
+    let reach = (taps - 1) * dil;
+    if narrow && 8 * l * reach <= t {
+        let y = conv_fixed(f, x, w, p, lanes, dil, out, bias, Elem::Bf16)?;
+        let next = kept_rows(f, table, lanes, hist, base)?;
+        return Ok((y, next));
+    }
 
     // Tap k reads x shifted down by its offset; the first rows of each lane
     // (which would read the previous lane) are patched from its kept rows.
@@ -176,6 +188,15 @@ fn conv_lanes(
         }
     };
 
+    let next = kept_rows(f, table, lanes, hist, base)?;
+    Ok((y, next))
+}
+
+/// The kept rows of each lane after its `keep` tokens, from `table` (the
+/// lanes' kept rows, then x's from `base`), `[l, hist · C]`.
+fn kept_rows(f: &mut Func, table: Val, lanes: &Lanes, hist: i64, base: i64) -> Built<Val> {
+    let l = lanes.count(f);
+    let c = f.dims(table)[1];
     // The kept rows after `keep` tokens.
     let s = f.iota(Elem::I32, &[l, hist], 1);
     let keep = f.broadcast(lanes.keep, &[l, hist], &[0])?;
@@ -194,8 +215,120 @@ fn conv_lanes(
     let at = f.select(fresh, at_x, at_p)?;
     let at = f.reshape(at, &[l * hist])?;
     let next = f.take_rows(table, at)?;
-    let next = f.reshape(next, &[l, hist * c])?;
-    Ok((y, next))
+    f.reshape(next, &[l, hist * c])
+}
+
+/// [`conv_lanes`]' output landed in `x`'s element type: every row's taps
+/// read `x` shifted down, in one pass over it; the first rows of each lane,
+/// whose windows reach above the lane, are taken again from its kept rows
+/// (`p`, `[l · hist, C]`) and put back over them.
+fn conv_fixed(
+    f: &mut Func,
+    x: Val,
+    w: Val,
+    p: Val,
+    lanes: &Lanes,
+    dil: i64,
+    out: ConvOut,
+    bias: Option<Val>,
+    land: Elem,
+) -> Built<Val> {
+    let (t, c) = (f.dims(x)[0], f.dims(x)[1]);
+    let taps = f.dims(w)[1];
+    let l = lanes.count(f);
+    let hist = f.dims(p)[0] / l.max(1);
+    let e = f.elem(x);
+    let zero = f.const_f(e, 0.0, &[]);
+    let zero_land = f.const_f(land, 0.0, &[]);
+    // `act(Σ_k w_k · tap_k + bias)` over taps of `n` rows.
+    let weigh = |f: &mut Func, taps_v: &[Val], xs: Option<Val>| -> Built<Val> {
+        let n = f.dims(taps_v[0])[0];
+        let mut acc: Option<Val> = None;
+        for (k, &tap) in taps_v.iter().enumerate() {
+            let k = k as i64;
+            let tap = f.convert(tap, Elem::F32);
+            let wk = f.slice_axis(w, 1, k, k + 1)?;
+            let wk = f.reshape(wk, &[c])?;
+            let wk = f.broadcast(wk, &[n, c], &[1])?;
+            let term = f.mul(tap, wk)?;
+            acc = Some(match acc {
+                None => term,
+                Some(a) => f.add(a, term)?,
+            });
+        }
+        let acc = acc.unwrap_or_else(|| f.const_f(Elem::F32, 0.0, &[n, c]));
+        let acc = match bias {
+            Some(b) => {
+                let b = f.broadcast(b, &[n, c], &[1])?;
+                f.add(acc, b)?
+            }
+            None => acc,
+        };
+        let y = match out {
+            ConvOut::Silu => f.silu(acc)?,
+            ConvOut::Residual => {
+                let xr = f.convert(xs.unwrap_or(taps_v[taps_v.len() - 1]), Elem::F32);
+                f.add(acc, xr)?
+            }
+        };
+        Ok(f.convert(y, land))
+    };
+    let mut shifted = Vec::with_capacity(taps as usize);
+    for k in 0..taps {
+        let off = (taps - 1 - k) * dil;
+        shifted.push(if off == 0 {
+            x
+        } else if off >= t {
+            f.const_f(e, 0.0, &[t, c])
+        } else {
+            let xs = f.pad(x, zero, &[off, 0], &[0, 0], &[0, 0])?;
+            f.slice_axis(xs, 0, 0, t)?
+        });
+    }
+    let full = weigh(f, &shifted, Some(x))?;
+    // A lane's first `reach` rows, each tap read from x within the lane or
+    // from its kept rows above it.
+    let reach = ((taps - 1) * dil).min(t);
+    if reach == 0 || l == 0 {
+        return Ok(full);
+    }
+    let s = f.iota(Elem::I32, &[l, reach], 1);
+    let b = f.broadcast(lanes.begin, &[l, reach], &[0])?;
+    let r = f.iota(Elem::I32, &[l, reach], 0);
+    let hv = f.like_i(r, hist);
+    let lane_p = f.mul(r, hv)?;
+    let mut fix_taps = Vec::with_capacity(taps as usize);
+    for k in 0..taps {
+        let off = (taps - 1 - k) * dil;
+        let ov = f.like_i(s, off);
+        let src = f.sub(s, ov)?;
+        let in_x = cmp_i(f, Cmp::Ge, src, 0)?;
+        let at_x = f.add(b, src)?;
+        let at_x = clamp_i(f, at_x, 0, t - 1)?;
+        let at_x = f.reshape(at_x, &[l * reach])?;
+        let at_p = f.add(lane_p, hv)?;
+        let at_p = f.add(at_p, src)?;
+        let at_p = clamp_i(f, at_p, 0, l * hist - 1)?;
+        let at_p = f.reshape(at_p, &[l * reach])?;
+        let xr = f.take_rows(x, at_x)?;
+        let pr = f.take_rows(p, at_p)?;
+        let pr = f.convert(pr, e);
+        let in_x = f.reshape(in_x, &[l * reach])?;
+        let in_x = f.broadcast(in_x, &[l * reach, c], &[0])?;
+        fix_taps.push(f.select(in_x, xr, pr)?);
+    }
+    let fixed = weigh(f, &fix_taps, None)?;
+    // Rows past a lane's span land on a spare row, sliced off after (a
+    // TPU's scatter does not drop out-of-range rows; see `conv_lanes`).
+    let row = f.add(b, s)?;
+    let sp = f.broadcast(lanes.span, &[l, reach], &[0])?;
+    let inside = f.compare(Cmp::Lt, s, sp)?;
+    let spare = f.like_i(row, t);
+    let row = f.select(inside, row, spare)?;
+    let row = f.reshape(row, &[l * reach])?;
+    let padded = f.pad(full, zero_land, &[0, 0], &[1, 0], &[0, 0])?;
+    let patched = f.put_rows(padded, row, fixed, crate::hlo::Combine::Set)?;
+    f.slice_axis(patched, 0, 0, t)
 }
 
 /// One row per lane: rolls `past` (`[T, per, width]` when `per >= hist`, else
@@ -346,7 +479,17 @@ fn conv(
         };
         let past = f.convert(past, e);
         let xs = f.convert(x.val, e);
-        conv_lanes(f, xs, w, past, &lanes, i64::from(dil), out, bias)?
+        conv_lanes(
+            f,
+            xs,
+            w,
+            past,
+            &lanes,
+            i64::from(dil),
+            out,
+            bias,
+            y.dtype == Dtype::Bf16,
+        )?
     };
     let slab = land_slots(f, slab, lanes.slot, lanes.write, next, per)?;
     Ok((yv, slab))
