@@ -1400,3 +1400,6 @@ The `new-memory/` directory is bookkeeping and is removed before anything lands 
 - `sc/l40s-quant-experts` (d4346c84a): adaptive lattice prices each body by its kind and counts the card's spare.
   Affine Qwen3.6-35B-A3B-4bit held on L40S: boot 29.7 s vs main 65; c256 +21.8%; c1 -5.6% (mostly M104 slot cost),
   prefill +4-10% (lattice coarsened; bodies-allowance policy (b) in progress).
+- M114 follow-up (5949a7ad0, L40S): arming's time was warm forwards (capture 0.2 s, instantiate 0.45 s of 18 s);
+  narrower buckets now capture cold on their first fire once the widest of their kind armed. L40S held boot: NVFP4
+  72-74 s (main ~85), gpt-oss 39 s (main ~63), FP8 63 s (main 65-68). Serving unchanged; every key arms.
