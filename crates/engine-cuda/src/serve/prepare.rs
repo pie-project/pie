@@ -1560,23 +1560,28 @@ impl FrameShell for Shell {
         // ends on the stream.
         let bodied = records_bodies
             && !tapped
-            // A body's extended rows hold its own rows twice and at least
+            // A body's window holds its own rows twice and at least
             // `REPLAYED` replayed (`Run::rs_layout`): a fire whose lanes
-            // replay more walks.
-            && (rs_replays.iter().sum::<u32>() <= crate::store::rs::REPLAYED
-                || composition
-                    .lanes()
+            // replay more in a window than its rows or `REPLAYED` walks.
+            && windows.spans().all(|span| {
+                rs_replays
                     .iter()
-                    .all(|row| rs_replays[rs_order[row.source as usize] as usize] <= row.rows))
+                    .skip(span.lane_offset as usize)
+                    .take(span.lanes as usize)
+                    .sum::<u32>()
+                    <= span.rows.max(crate::store::rs::REPLAYED)
+            })
             && snapshots.rows.len() <= crate::store::rs::SNAPSHOTS as usize
             && Self::keyable_units(&self.compiled)
             && world
             && !self.cache.body_refused(&key)
             && self.cuttable(&key, admits.as_ref());
         super::btrace::mark("cuttable");
-        // A class reading out readout rows reads its lanes' last rows; one
-        // reading a row output reads every row of its rung, as the eager
-        // ceiling above lets it. Every readout names one of the fire's rows,
+        // A class reading out readout rows reads its lanes' last rows; a
+        // drafter's verify (a class no plain request lands) reads one out a
+        // row it checks, up to the readouts a lane takes; one reading a row
+        // output reads every row of its rung, as the eager ceiling above
+        // lets it. Every readout names one of the fire's rows,
         // so the rows read out never pass its bucket: the rungs summed over
         // the classes do (a mixed bucket-256 fire's two classes rung 256
         // each), and the carve a fire of the bucket takes (the forked arena,
@@ -1589,6 +1594,16 @@ impl FrameShell for Shell {
                     match self.exports.readback(class as usize) {
                         Some(out) if !out.decl.readout => (last, every + rung),
                         None if !self.exports.reads_readout_rows() => (last, every + rung),
+                        _ if !self.landing[class as usize]
+                            .iter()
+                            .any(poem_ir::Request::plain) =>
+                        {
+                            let per_lane = self.budget.readouts_per_lane.max(1);
+                            (
+                                last,
+                                every + rung.min(lane_ceiling.saturating_mul(per_lane)),
+                            )
+                        }
                         _ => (last + rung.min(lane_ceiling), every),
                     }
                 });

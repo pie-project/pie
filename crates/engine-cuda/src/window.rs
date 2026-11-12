@@ -422,6 +422,11 @@ impl Windows {
         self.windows.is_empty()
     }
 
+    /// Every window's span on the primary axis, whatever region runs it.
+    pub fn spans(&self) -> impl Iterator<Item = MaskSpan> + '_ {
+        self.windows.iter().map(Window::span)
+    }
+
     #[must_use]
     pub fn packed(&self) -> Vec<i32> {
         let mut out: Vec<i32> = Vec::new();
