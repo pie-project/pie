@@ -110,10 +110,12 @@ fn conv_lanes(
     let table = f.concat(&[p, x], 0)?;
     let base = l * hist;
     let e = f.elem(x);
-    // A prompt's fire (lanes few beside its rows) takes the one pass; a
-    // batch's (a decode lane a row) patches nearly every row either way.
+    // A prompt's fire (a few lanes, many rows each) takes the one pass; a
+    // batch's mixed fire (a decode lane a row) keeps the patched taps: its
+    // lanes' first rows are nearly all its rows (v5e Kimi-K3 c256 with its
+    // mixed fires through the one pass: 456 -> 432 tok/s).
     let reach = (taps - 1) * dil;
-    if narrow && 8 * l * reach <= t {
+    if narrow && l <= 8 && 8 * l * reach <= t {
         let y = conv_fixed(f, x, w, p, lanes, dil, out, bias, Elem::Bf16)?;
         let next = kept_rows(f, table, lanes, hist, base)?;
         return Ok((y, next));
