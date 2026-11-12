@@ -1,0 +1,14 @@
+{
+  "name": "e2b",
+  "layout": "stacked",
+  "made_for": [1536, 35, 6144],
+  "keys": {"G2": 16, "G2W": 24, "HR": 1130, "LOOP": 64, "NEG": 32, "NU": 7, "PX": 256, "PY": 128},
+  "levers": "WSPEC:2",
+  "arrangement": {
+    "unit": [256, 128, 7],
+    "a_top": 508,
+    "a_units": [6, 5, 4, 3, 2],
+    "b_units": [[0, 6], [1, 2]],
+    "stores": [{"rows": 345, "tokens": 760, "bus": 17}, {"rows": 138, "tokens": 1900, "bus": 10}]
+  }
+}

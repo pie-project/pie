@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """mk_tiny_qwen3moe.py <dir> [seed]: a random tiny Qwen3 MoE checkpoint in the release's format (bf16, the real
 config's mechanisms: per-head q / k RMSNorms, full attention every layer, top-8 of 16 experts, SiLU's GLU, no
-biases or sinks) for the tiny MoE geometry (`wafer-compile plan` preset `tiny` with MX=16,SWR=16,HVC=40): hidden 32
+biases or sinks) for the tiny MoE geometry (`wafer-compile plan` pinned plan `tiny-gptoss` with MX=16,SWR=16,HVC=40): hidden 32
 (4 rows x Hc 8), 4 q / 2 kv heads of 8 (Dc 4), expert intermediate 32 (16 MoE columns x Ic 2), 4 layers (2 units
 x K 2), vocab 100. Then its golden: HF transformers greedy, f32 compute over the bf16 weights."""
 import json, os, sys

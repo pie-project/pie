@@ -1,5 +1,5 @@
 {
- "_doc": "Every shipping wafer program config and each family's tiny. full: a catalog deployment (model), planned through the trace, over a staged prep's tiles ($BENCH_JOB/<prep>, <prefix>); tiny: a shape fixture (shapes/), its frozen tiny checkpoint ($TINY_CKPTS/<ckpt>) cut fresh by the capture (landed.py's params, wafer-stage's cut). preset: the family's preset (its overrides and kernel levers are the shipping program's); positions: the positions served (4096 where the staged tiles hold 4 RoPE levels); set / levers: overrides past the preset's (none ship).",
+ "_doc": "Every shipping wafer program config and each family's tiny. full: a catalog deployment (model), planned through the trace, over a staged prep's tiles ($BENCH_JOB/<prep>, <prefix>); tiny: a shape fixture (shapes/), its frozen tiny checkpoint ($TINY_CKPTS/<ckpt>) cut fresh by the capture (landed.py's params, wafer-stage's cut). preset: the pinned plan (plans/: its keys and kernel levers are the shipping program's); positions: the positions served (4096 where the staged tiles hold 4 RoPE levels); set / levers: overrides past the preset's (none ship).",
  "configs": [
   {
    "name": "q35_9b",
@@ -188,7 +188,7 @@
    "name": "tiny_gemma",
    "kind": "tiny",
    "shape": "shapes/tiny_gemma.json",
-   "preset": "tiny",
+   "preset": "tiny-gemma",
    "set": "",
    "ckpt": "gemma/tiny/hf",
    "prefix": "",
@@ -200,7 +200,7 @@
    "name": "tiny_g12",
    "kind": "tiny",
    "shape": "shapes/tiny_g12.json",
-   "preset": "tiny",
+   "preset": "tiny-g12",
    "set": "",
    "ckpt": "gemma12/tiny/s2w9",
    "prefix": "",
@@ -212,7 +212,7 @@
    "name": "tiny_gptoss",
    "kind": "tiny",
    "shape": "shapes/tiny_gptoss.json",
-   "preset": "tiny",
+   "preset": "tiny-gptoss",
    "set": "",
    "ckpt": "gptoss/tiny/ck1",
    "prefix": "",
@@ -224,7 +224,7 @@
    "name": "tiny_qwen3moe",
    "kind": "tiny",
    "shape": "shapes/tiny_qwen3moe.json",
-   "preset": "tiny",
+   "preset": "tiny-gptoss",
    "set": "MX=16,SWR=16,HVC=40",
    "ckpt": "qwen3moe/tiny/s2",
    "prefix": "",

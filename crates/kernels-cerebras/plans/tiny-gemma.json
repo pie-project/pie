@@ -1,0 +1,13 @@
+{
+  "name": "tiny-gemma",
+  "layout": "stacked",
+  "keys": {"G2": 2, "G2W": 2, "HR": 32, "LOOP": 64, "NEG": 4, "NU": 5, "PX": 8, "PY": 8},
+  "levers": "",
+  "arrangement": {
+    "unit": [8, 8, 5],
+    "a_top": 4,
+    "a_units": [4, 3, 2],
+    "b_units": [[0, 4], [1, 2]],
+    "stores": [{"rows": 4, "tokens": 128, "bus": 17}, {"rows": 2, "tokens": 256, "bus": 10}]
+  }
+}

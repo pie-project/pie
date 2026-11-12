@@ -169,7 +169,8 @@ impl Needs {
 
 /// How a program's units lie, from what its layers need: the one choice the blocks and the role
 /// kernels' phases both follow.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
 pub enum Layout {
     /// A snake of units.
     Snake,
@@ -195,6 +196,12 @@ impl Layout {
         }
     }
 
+    /// The layout `shape`'s layers take.
+    #[must_use]
+    pub fn of_shape(shape: &Shape) -> Layout {
+        Layout::of(&Needs::of(&crate::layers::of(shape)))
+    }
+
     /// The layout layers that need `needs` take.
     #[must_use]
     pub fn of(needs: &Needs) -> Layout {
@@ -217,7 +224,7 @@ impl Layout {
 /// biases at once: the biases' words hold the norms' weights), a router with or without its bias,
 /// MXFP4 or 16-bit experts with or without biases, and the clamped SwiGLU or SiLU's GLU.
 pub fn refuse(shape: &Shape) -> R<()> {
-    let layout = Layout::of(&Needs::of(&crate::layers::of(shape)));
+    let layout = Layout::of_shape(shape);
     let a = &shape.attn;
     let (unmet, kernels): (Vec<(bool, &str)>, &str) = if layout == Layout::Split {
         (
@@ -639,9 +646,9 @@ mod tests {
             ("tiny_q3", "tiny-q3"),
             ("tiny_q3_gap", "tiny-q3-gap"),
             ("tiny_llama", "tiny-q3"),
-            ("tiny_gemma", "tiny"),
-            ("tiny_g12", "tiny"),
-            ("tiny_gptoss", "tiny"),
+            ("tiny_gemma", "tiny-gemma"),
+            ("tiny_g12", "tiny-g12"),
+            ("tiny_gptoss", "tiny-gptoss"),
         ] {
             let path = format!(
                 "{}/tools/wafer/baseline/shapes/{file}.json",

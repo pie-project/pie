@@ -6,7 +6,7 @@
 //! way. Blocks (by [`crate::compose`]): `RowRuns`, `HeadGroups`. Kernels: [`gemma12`].
 
 use crate::abi::Kernels;
-use crate::family::{Family, MadeFor, Row, ceil_to, table};
+use crate::family::{Family, ceil_to};
 use crate::kernels::gemma12::{self, Dims};
 use crate::plan::{
     Contract, FamilyId, HeadPartition, KvEntries, LayerKind, Partition, Plan, Preset, ReduceGroups,
@@ -20,31 +20,6 @@ pub struct Gemma12;
 mod cut;
 
 type R<T> = Result<T, String>;
-
-/// The presets: weight columns and rows a unit (PX, PY), the head's rows (HR), the attention rows'
-/// and the plain rows' dims (HcA, HcW), the attention rows (RA: the KV rows; 128 make the 1024
-/// window an exact ring of 8 x 128), the scores segment width (SWA), the head groups' sizes
-/// (attention rows in groups of GA, plain rows in groups of GW, never across the CY row), the
-/// units (NU), the global KV entries a KV row (NEG), the reduction groups (G2, G2W).
-const PRESETS: &[Row<13>] = &[
-    // name, [PX, PY, HR, HcA, HcW, RA, SWA, GA, GW, NU, NEG, G2, G2W], overrides, levers
-    // (requests 0920 / 0921: the exact ring, 54 head columns)
-    (
-        "g12",
-        [344, 283, 1153, 12, 15, 128, 43, 6, 5, 8, 32, 16, 24],
-        "",
-        "DIAG:0,GELUT:1",
-    ),
-    (
-        "tiny",
-        [8, 8, 18, 2, 3, 3, 4, 3, 2, 4, 12, 2, 2],
-        "",
-        "GELUT:1",
-    ),
-];
-
-/// The model each shipping preset was measured on.
-const MADE_FOR: &[MadeFor] = &[("g12", [3840, 48, 15360])];
 
 /// Head groups: the attention rows in groups of `ga`, the plain rows above the CY row and those
 /// below it in groups of `gw`.
@@ -60,14 +35,12 @@ pub fn groups_split(py: u32, yc: u32, ra: u32, ga: u32, gw: u32) -> Vec<Vec<u32>
     out
 }
 
+/// The keys a plan's preset gives: weight columns and rows a unit (PX, PY), the head's rows (HR),
+/// the attention rows' and the plain rows' dims (HcA, HcW), the attention rows (RA: the KV rows;
+/// 128 make the 1024 window an exact ring of 8 x 128), the scores segment width (SWA), the head
+/// groups' sizes (attention rows in groups of GA, plain rows in groups of GW, never across the CY
+/// row), the units (NU), the global KV entries a KV row (NEG), the reduction groups (G2, G2W).
 impl Family for Gemma12 {
-    fn presets(&self) -> Vec<Preset> {
-        let keys = [
-            "PX", "PY", "HR", "HcA", "HcW", "RA", "SWA", "GA", "GW", "NU", "NEG", "G2", "G2W",
-        ];
-        table(keys, PRESETS, &[("LOOP", 64.0)], MADE_FOR)
-    }
-
     /// Units of K = layers / NU (S .. S G) in two unit columns; rows in two runs (the attention
     /// rows `r < RA` with HcA dims and the scores segments, the plain rows with HcW); the sliding
     /// window over the RA KV rows (NES entries a row: exact where RA divides it); the head one

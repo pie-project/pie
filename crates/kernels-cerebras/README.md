@@ -125,13 +125,13 @@ Notes on the table:
 kind = "cerebras"
 target = "wse3"
 cmaddr = "10.x.y.z:9000"   # omit for the fabric simulator
-max_model_len = 4096       # the positions the program is built for; omit for as many as the preset holds
+max_model_len = 4096       # the positions the program is built for; omit for as many as the plan holds
 lookahead = 254
 async = true
 # posted_loop = 32         # default: the plan's LOOP
 
 [engine.wafer]             # all optional
-# preset = "9b"            # else the preset made for the model's shape, else the first that builds
+# preset = "9b"            # a pinned plan (plans/); else the one made for the model's shape, else the search
 # build = "never"          # refuse a program the cache does not hold (a chip session)
 # tiles = "memory"         # cut the checkpoint for each load instead of caching the cut
 
@@ -140,8 +140,8 @@ async = true
 [engine.debug]             # bench settings only; a load logs them
 # program = "<linked dir>"           # open this program instead of building one
 # weights = "<dir>[:<prefix>]"       # place these staged tiles instead of cutting the checkpoint
-# set = "G2=12"                      # overrides of the preset's keys
-# levers = "DIAG:1,TSTAMP:1"         # kernel levers past the preset's
+# set = "G2=12"                      # overrides of the plan's keys
+# levers = "DIAG:1,TSTAMP:1"         # kernel levers past the plan's
 # force_prompt = true                # the prompt through the token loop
 # posted = false                     # one loop at a time
 # loop_room = false                  # loops not bounded by the lane's pages
@@ -157,10 +157,11 @@ layout, one tiler makes it); `[engine.debug] weights` serves tiles staged elsewh
 **Build by hand** (no SDK needed until the link):
 
 1. **Plan**: `wafer-compile plan --model <deployment> [--preset <name>] [--set K=V,..] [--positions N] --out
-   <plan dir>` (`ARCHITECTURE.md`): the model's shape from its trace, the family it needs, the preset's partition.
-   Presets: Dense `9b`, `4b`, `0.8b`, `q3-8b`; Gemma `e2b`, `e4b`, `e4b-meta`; Gemma 12B `g12`; gpt-oss `full`;
-   and `tiny*` for the simulator. A preset carries the overrides and kernel levers its program shipped with. A
-   checkpoint with no catalog deployment takes `--shape <shape.json>`.
+   <plan dir>` (`ARCHITECTURE.md`): the model's shape from its trace, the family it needs, the pinned plan's
+   partition (else the search's). Pinned plans (`plans/`): `9b`, `4b`, `0.8b`, `q3-8b`, `l3-8b`; `e2b`, `e4b`,
+   `e4b-meta`; `g12`; `full` (gpt-oss); and `tiny*` for the simulator. A pinned plan carries the keys, kernel
+   levers and arrangement its program shipped with. A checkpoint with no catalog deployment takes
+   `--shape <shape.json>`.
 2. **Sources**: `wafer-compile build --plan <plan.json> --out <build dir> [--levers K:V,..]` writes `layout/`
    (`layout.csl`, every PE's kernel and params resolved, and one source a PE kind, from the embedded kernels or
    `--kernels <dir>`) and the artifact (rcfg, host, bindings, `program.json`). Levers set kernel params past the

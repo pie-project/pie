@@ -27,6 +27,7 @@ pub mod floor;
 pub mod kernels;
 pub mod layers;
 pub mod npy;
+pub mod pins;
 pub mod plan;
 pub mod program;
 pub mod role;

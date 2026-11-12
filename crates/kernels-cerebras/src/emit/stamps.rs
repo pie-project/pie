@@ -198,7 +198,7 @@ mod tests {
     /// the loop's root and unit 0's weight and CY PEs, each at its source's `tdbg` length.
     #[test]
     fn a_stamping_build_probes_every_unit_and_its_phases() {
-        for (file, preset) in [("tiny_llama", "tiny-q3"), ("tiny_gptoss", "tiny")] {
+        for (file, preset) in [("tiny_llama", "tiny-q3"), ("tiny_gptoss", "tiny-gptoss")] {
             let prog = tiny(file, preset);
             let plain = kernels(&prog, &Levers::of(&prog.plan.levers, "").unwrap()).unwrap();
             assert!(!on(&plain), "{file}");

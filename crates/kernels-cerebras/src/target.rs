@@ -1,9 +1,10 @@
 //! The wafer as a target of poem's spatial pass ([`poem_compiler::spatial`]): the model's
-//! [`Shape`] read off its trace ([`shape`]), the family the shape needs
-//! ([`super::family::serving`]), that family's presets as the partitions to try (a named one, or
-//! all of them in table order), a plan that builds ([`Program::build`]) as the fit, and the table's
-//! order as the cost. [`plan`] runs the pass over a trace; [`plan_shape`] does the same for a shape
-//! stated outright (a checkpoint with no catalog deployment, such as the tiny test checkpoints).
+//! [`Shape`] read off its trace ([`shape`]), the layout its layers take
+//! ([`super::compose::Layout`]), the pinned plan named or made for the shape ([`super::pins`]) as
+//! the partition to try, a plan that builds ([`Program::build`]) as the fit; a model with no
+//! pinned plan that builds plans by the search ([`super::search`]). [`plan`] runs the pass over a
+//! trace; [`plan_shape`] does the same for a shape stated outright (a checkpoint with no catalog
+//! deployment, such as the tiny test checkpoints).
 
 use poem_compiler::spatial::{BlockKind, SpatialGraph, SpatialTarget};
 use poem_ir::{
@@ -11,7 +12,7 @@ use poem_ir::{
     RouteScore, Ssm, Trace, Turn, ValueId,
 };
 
-use super::compose::BiasOn;
+use super::compose::{BiasOn, Layout};
 use super::family;
 use super::plan::{
     Act, AttnSpec, FamilyId, GdnSpec, HeadSpec, LayerKind, MlpSpec, MoeSpec, NormSpec, Plan,
@@ -428,24 +429,26 @@ pub struct Wafer {
 }
 
 impl Wafer {
-    /// The partitions to try: the preset made for this shape first (its shipping program), then
-    /// the family's table order.
+    /// The partitions to try: the pinned plan named (it must be of the shape's layout), else the
+    /// one made for this shape ([`crate::pins`]); none for a model with no pinned plan (the
+    /// search plans it).
     pub fn candidates(&self) -> Vec<Candidate> {
-        let id = family::serving(&self.shape);
-        let mut presets = family::of(id).presets();
+        let layout = Layout::of_shape(&self.shape);
         let sig = self.shape.signature();
-        presets.sort_by_key(|p| p.made_for != Some(sig));
-        presets
+        crate::pins::of(layout)
             .into_iter()
+            .filter(|p| match &self.preset {
+                Some(n) => *n == p.name,
+                None => p.made_for == Some(sig),
+            })
             .enumerate()
-            .filter(|(_, p)| self.preset.as_ref().is_none_or(|n| *n == p.name))
             .filter_map(|(order, p)| {
                 let mut preset = p.set(&self.set).ok()?;
                 if let Some(n) = self.positions {
                     preset.keys.insert("CTX".into(), f64::from(n));
                 }
                 Some(Candidate {
-                    family: id,
+                    family: family::of_layout(layout),
                     preset,
                     order,
                 })
@@ -485,8 +488,8 @@ impl Wafer {
             .map_err(|e| format!("preset {}: {e}", c.preset.name))
     }
 
-    /// The first candidate in table order that builds; with no preset named and none that
-    /// builds, the search's fastest partition ([`crate::search`]).
+    /// The pinned plan that builds; with no preset named and none that builds (or none made for
+    /// the shape), the search's fastest partition ([`crate::search`]).
     pub fn choose(&self) -> R<Planned> {
         let mut why = Vec::new();
         for c in self.candidates() {
@@ -516,12 +519,16 @@ impl Wafer {
 
     fn refused(&self, why: Vec<String>) -> String {
         match (&self.preset, why.is_empty()) {
-            (Some(p), true) => format!(
-                "the {} family has no preset {p}",
-                family::serving(&self.shape).name()
-            ),
-            (_, true) => "no preset to try".into(),
-            _ => format!("no preset builds: {}", why.join("; ")),
+            (Some(p), true) => match crate::pins::named(p) {
+                Some((l, _)) => format!(
+                    "the pinned plan {p} is a {} plan; this model's layers take the {} layout",
+                    l.name(),
+                    Layout::of_shape(&self.shape).name()
+                ),
+                None => format!("no pinned plan {p}"),
+            },
+            (_, true) => "no pinned plan to try".into(),
+            _ => format!("no pinned plan builds: {}", why.join("; ")),
         }
     }
 }
@@ -768,31 +775,32 @@ mod tests {
         assert!(e.contains("of at most 16384"), "{e}");
     }
 
-    /// With no preset named and none made for the shape, the pass keeps the first of the
-    /// family's that builds: Qwen3.5-0.8B's 24 layers with another MLP width leave the 9B's eight
-    /// unit slots two short, so it takes the 0.8B's.
+    /// With no pinned plan made for the shape, the search plans it: Qwen3.5-0.8B with another
+    /// MLP width (no shipping model's shape) plans from its layout's pinned plans and builds. A
+    /// pinned plan of another layout is refused by name.
     #[test]
-    fn the_first_preset_that_builds_is_kept() {
+    fn a_shape_with_no_pinned_plan_is_searched() {
         let mut s = shape(&trace("qwen35-d0.8b-bf16-kv-bf16")).unwrap();
         s.mlp.intermediate += 256;
         let p = plan_shape(s, &Ask::default()).unwrap();
-        assert_eq!(p.preset.name, "0.8b");
-        assert!(plan(&trace("qwen35-d0.8b-bf16-kv-bf16"), &Ask::preset("e2b")).is_err());
+        Program::of(p.plan).unwrap();
+        let e = plan(&trace("qwen35-d0.8b-bf16-kv-bf16"), &Ask::preset("e2b")).unwrap_err();
+        assert!(e.contains("is a stacked plan"), "{e}");
     }
 
-    /// The plans a load may fall back on start with the one `plan` chooses.
+    /// The plans a load may fall back on start with the one `plan` chooses: a shipping model's
+    /// pinned plan.
     #[test]
     fn the_fallback_plans_start_with_the_choice() {
         let t = trace("llama31-8b-bf16-kv-bf16");
         let all = plans(&t, &Ask::default()).unwrap();
         assert_eq!(all[0].preset.name, "l3-8b");
         assert_eq!(all[0].plan, plan(&t, &Ask::default()).unwrap().plan);
-        assert!(all.len() > 1);
     }
 
     /// A partition is refused where it cannot link or serve: wider than the wafer, a head's dims
-    /// not even over its columns, the MLP not even over the unit's (and the search, moving the
-    /// keys not set, finds none for the wider MLP either).
+    /// not even over its columns; the search, moving the keys, finds none for an MLP no column
+    /// count of the snake divides.
     #[test]
     fn fit_refuses_what_cannot_serve() {
         let t = trace("llama31-8b-bf16-kv-bf16");
@@ -810,7 +818,7 @@ mod tests {
         let mut odd = shape(&t).unwrap();
         odd.mlp.intermediate += 64;
         let e = plan_shape(odd, &Ask::default()).unwrap_err();
-        assert!(e.contains("the MLP's 14400 over 256 columns"), "{e}");
+        assert!(e.contains("the search found no partition"), "{e}");
     }
 
     /// The cost model reads the chip's step of each measured model off its shipping plan, and

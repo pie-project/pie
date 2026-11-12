@@ -1,10 +1,11 @@
 //! Program families: the kernels a model's program runs. A family turns the model's shape and a
-//! preset of its own into the plan, states what its kernels read off each block the composer
+//! preset (a pinned plan's keys, or the search's: [`super::pins`]) into the plan, states what its kernels read off each block the composer
 //! places ([`super::compose`]), and builds each kind's kernel from the plan. Everything else (the floor, the wiring, the fabric, the emitters, the
 //! placer, the host) is generic over the blocks. Which family serves a model follows from what
 //! its shape needs ([`serving`]), never from its name.
 
 use super::abi::Kernels;
+use super::compose::Layout;
 use super::plan::{FamilyId, LayerKind, Plan, Preset, Shape};
 use super::program::Program;
 use super::tiles::spec::Spec;
@@ -18,9 +19,6 @@ type R<T> = Result<T, String>;
 
 /// A program family. Every method is pure: same inputs, same outputs.
 pub trait Family: Send + Sync {
-    /// The family's presets, in the order the spatial pass tries them.
-    fn presets(&self) -> Vec<Preset>;
-
     /// The plan of `shape` under `preset`: the partition and contract the preset's choices make
     /// for the model. Nothing physical is decided here.
     fn plan(&self, shape: &Shape, preset: &Preset) -> R<Plan>;
@@ -47,6 +45,16 @@ pub fn of(id: FamilyId) -> Box<dyn Family> {
     }
 }
 
+/// The family of a layout's kernels.
+pub fn of_layout(layout: Layout) -> FamilyId {
+    match layout {
+        Layout::Snake => FamilyId::Dense,
+        Layout::Stacked => FamilyId::Gemma,
+        Layout::Runs => FamilyId::Gemma12,
+        Layout::Split => FamilyId::GptOss,
+    }
+}
+
 /// The family whose blocks `shape` needs: routed experts take the MoE columns and the band head
 /// (gpt-oss); per-layer inputs or layers over another's KV take the PLE storage and the shared-KV
 /// line (Gemma 4 E2B / E4B); sliding layers otherwise take the attention / plain row runs and the
@@ -63,37 +71,6 @@ pub fn serving(shape: &Shape) -> FamilyId {
     } else {
         FamilyId::Dense
     }
-}
-
-/// A row of a family's preset table: its name, the values of the family's keys, and the
-/// overrides (`K=V,...`) and kernel levers (`K:V,...`) its shipping program was measured with.
-pub type Row<const N: usize> = (&'static str, [u32; N], &'static str, &'static str);
-
-/// A shipping preset and the shape signature of the model it was measured on
-/// ([`Shape::signature`]: hidden, layers, MLP width).
-pub type MadeFor = (&'static str, [u32; 3]);
-
-/// A family's presets from its table: each row's keys, then `extra` (keys every preset of the
-/// family states the same), then the row's overrides, its levers and the model it was made for.
-pub fn table<const N: usize>(
-    keys: [&str; N],
-    rows: &[Row<N>],
-    extra: &[(&str, f64)],
-    made: &[MadeFor],
-) -> Vec<Preset> {
-    rows.iter()
-        .map(|&(name, values, set, levers)| {
-            let mut kv: Vec<(&str, f64)> =
-                keys.iter().copied().zip(values.map(f64::from)).collect();
-            kv.extend_from_slice(extra);
-            let mut p = Preset::new(name, &kv)
-                .set(set)
-                .expect("a preset table's overrides are K=V");
-            p.levers = levers.to_string();
-            p.made_for = made.iter().find(|m| m.0 == name).map(|m| m.1);
-            p
-        })
-        .collect()
 }
 
 /// Layers `layers` in units of `k`, every unit the same kinds; the unit count.

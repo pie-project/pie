@@ -1,0 +1,6 @@
+{
+  "name": "tiny-t4",
+  "layout": "snake",
+  "keys": {"G2": 2, "G2W": 2, "HR": 18, "K": 4, "NE": 4, "PX": 16, "PY": 16, "UNX": 2, "UNY": 2, "VR": 8, "WL": 1},
+  "levers": ""
+}

@@ -199,9 +199,7 @@ fn search(args: &[String]) -> Result<(), String> {
     let keep = get(&f, "--keep")
         .map_or(Ok(5), str::parse)
         .map_err(|e| format!("--keep: {e}"))?;
-    let fam = kernels_cerebras::family::of(kernels_cerebras::family::serving(&shape));
-    let made = fam
-        .presets()
+    let made = kernels_cerebras::pins::of(kernels_cerebras::compose::Layout::of_shape(&shape))
         .into_iter()
         .find(|p| p.made_for == Some(shape.signature()));
     for (i, c) in kernels_cerebras::search::search(&shape, &ask, keep)?

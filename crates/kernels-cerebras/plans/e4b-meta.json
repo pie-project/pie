@@ -1,0 +1,13 @@
+{
+  "name": "e4b-meta",
+  "layout": "stacked",
+  "keys": {"G2": 16, "G2W": 24, "HR": 1130, "LOOP": 64, "NEG": 16, "NU": 7, "PX": 256, "PY": 160, "PYW": 160},
+  "levers": "w.FIFOW:16",
+  "arrangement": {
+    "unit": [256, 160, 7],
+    "a_top": 509,
+    "a_units": [6, 5, 4, 3],
+    "b_units": [[0, 6], [1, 5], [2, 3]],
+    "stores": [{"rows": 332, "tokens": 791, "bus": 17}, {"rows": 249, "tokens": 1055, "bus": 10}]
+  }
+}

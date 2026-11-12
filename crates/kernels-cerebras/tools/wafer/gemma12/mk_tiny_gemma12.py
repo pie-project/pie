@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """mk_tiny_gemma12.py <out dir> [seed] [ntok]: a random tiny Gemma 4 (text, HF Gemma4ForCausalLM) in the 12B mapping's
-shape for the tiny wafer program simulation (the `tiny` preset of `wafer-compile plan`: units 8 x 8, A rows 0-2 Hc 2, W rows 3-7 Hc 3, K 3,
+shape for the tiny wafer program simulation (the `tiny-g12` pinned plan of `wafer-compile plan`: units 8 x 8, A rows 0-2 Hc 2, W rows 3-7 Hc 3, K 3,
 4 units): hidden 20 (21 slots: one padded dim), 12 layers (every 3rd global), 4 q heads, 2 kv heads sliding (head 14:
 16 slots), one global kv head (head 28: 32 slots, k = v, proportional RoPE 25%), MLP 30 (32 slots), no PLE, vocab
 512, window 8 (a ring of 9 masked), tied, softcap 30.

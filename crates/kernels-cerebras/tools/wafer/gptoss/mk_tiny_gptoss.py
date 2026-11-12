@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """mk_tiny_gptoss.py <dir> [seed] [wsc]: a random tiny gpt-oss checkpoint in the release's format (MXFP4 experts:
 blocks + E8M0 scales, bf16 elsewhere, the real config's mechanisms: sinks, alternating sliding / full layers,
-YaRN, biases, clamped SwiGLU, top-4 of 8 experts) for the tiny gpt-oss geometry (the `tiny` preset of `wafer-compile plan`): hidden 32 (4 rows x
+YaRN, biases, clamped SwiGLU, top-4 of 8 experts) for the tiny gpt-oss geometry (the `tiny-gptoss` pinned plan of `wafer-compile plan`): hidden 32 (4 rows x
 Hc 8), 4 q / 2 kv heads of 8 (Dc 4), intermediate 32 (8 MoE columns x Ic 4), 4 layers (2 units x K 2), vocab
 100, window 4. Then its golden: HF transformers greedy, bf16 compute on HF's MXFP4 dequant (hf_gptoss_golden.py)."""
 import json, os, sys

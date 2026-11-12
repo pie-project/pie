@@ -8,7 +8,7 @@ engine (`engine-cerebras`) runs its **artifact** and knows none of it (below).
 
 ```
 .poem trace ─target::shape─▶ Shape ─family::serving─▶ Family
- (or a shape file)               │                       │ presets (a named one, or the one made for the shape first)
+ (or a shape file)               │                       │ pins (a named one, or the one made for the shape; else the search)
                                  └──────────┬────────────┘
                                             ▼ Family::plan            (poem_compiler::spatial::plan:
                                           Plan ─compose::blocks─▶ [Block]  the first of them that builds)
@@ -30,8 +30,8 @@ Modules are under `src/`.
 
 | Layer | Module | Holds | Knows |
 |---|---|---|---|
-| Plan | `plan.rs` | `Shape` (the model's facts), `Partition` (counts, split factors), `Contract` (positions, CAP, LOOP, WL, the logits' prescale), the family; `Preset` (a family's named choices with overrides); serde, so a plan is a file | nothing physical: the seam to poem's spatial pass (below) |
-| Target | `target.rs` | the wafer as poem's `SpatialTarget`: `shape` (a trace's `Shape`), `Wafer` (candidates: the serving family's presets; fit: the plan builds; cost: table order), `plan` / `plan_shape` | the trace's ops, the families |
+| Plan | `plan.rs` | `Shape` (the model's facts), `Partition` (counts, split factors, the stacked arrangement), `Contract` (positions, CAP, LOOP, WL, the logits' prescale), the family; `Preset` (a partition's named keys, levers and arrangement: a pinned plan's or the search's); serde, so a plan is a file | nothing physical: the seam to poem's spatial pass (below) |
+| Target | `target.rs` | the wafer as poem's `SpatialTarget`: `shape` (a trace's `Shape`), `Wafer` (candidates: the pinned plan named or made for the shape; fit: the plan builds; else the search), `plan` / `plan_shape` | the trace's ops, the families |
 | Roles | `role.rs` | `PeRole { kind: Kind, place: Place }`. `Kind` is open (name + build stem; the architecture's kinds are consts, a block declares more). `Place` is the wafer program architecture's positions: weight / CX / CY of a unit, head / head control, a storage column's PE, none | coordinates |
 | Floor | `floor.rs` | `FloorBuilder` (blocks place onto it in order), units, gap / relay slots, the head block, store blocks, a `PeRole` a PE in a dense `Grid` | coordinates |
 | Wiring | `wiring.rs` | `Chain`, `Multicast`, `Path`, `Turn`, `Note`; open `Class { name, index }`, `Slot { name, kind: SlotKind }`, `NoteKey`; the core's only own vocabulary is `LOOPBACK` and `PASS` | coordinates, logical colours |
@@ -41,7 +41,7 @@ Modules are under `src/`.
 | Kernels | `kernels/` | `Pe` (one PE as an rcfg writer sees it); `common` (the word layouts every family's weight / CX / CY / head / head control kernel shares, its codes named, the relay); `head` (`head_pe.csl`, `head_ctl.csl`); one module a family's own kernels: `dense`, `gptoss`, `gemma`, `gemma12` | the CSL kernels' ABI |
 | Layers | `layers.rs` | the plan's layer program (`poem_compiler::spatial::layer::LayerProgram`), stated from its shape; pinned to the trace's lowering | the shape |
 | Composer | `compose/` | `Needs` and `Schedule` (read off the layer program), `blocks` (the blocks a program's needs take), `KernelCopies` (what the role kernels read off each block, by layout: `copies`), `refuse` (what the layout's kernels do not run, by name), `stacked` (the plan's stacked arrangement laid out) | the blocks |
-| Families | `family/` | `serving` (the family a shape needs); `dense`, `gptoss`, `gemma`, `gemma12`: presets (the stacked ones with their arrangement), the plan of a shape under a preset, the kernels, the cut's statement | the model's shape |
+| Families | `family/` | `serving` (the family a shape needs); `dense`, `gptoss`, `gemma`, `gemma12`: the plan of a shape under a preset's keys, the kernels, the cut's statement | the model's shape |
 | Emit | `emit/` | rcfg, kernel params (levers, overrides) and `layout.csl`, `HostLayout` (everything the host driver reads and writes on the wafer) | kernel builds |
 | Weights | `weights.rs` | `Binding`s (symbol, rect, source, transforms), `Copies`, the placer | the device |
 | Program | `program.rs` | `Program { plan, blocks, floor, wiring, palette, fabric, kernels, overrides, family }`, `build`, `bindings` | all of the above |
@@ -214,10 +214,10 @@ a family's own is in the head and PLE kernels: the token loop's winner merge and
    (`LAYER_OPS`, `OUTER_OPS`); teach `target.rs` the op and give the plan's `Shape` the field the
    blocks need.
 2. **Family.** `family::serving` picks the family from what the shape needs. A model of an existing
-   family is a new preset in the family's table (`family/dense.rs::PRESETS`, Gemma's presets and
-   arrangements, gpt-oss's and 12B's): the counts and split factors the plan cannot derive from the
-   shape. A new family implements `Family` (`presets`, `plan`, `tiling`, `blocks`, `kernels`,
-   `symbols`) and a rule in `serving`.
+   family plans by the search from its layout's pinned plans; once its program is validated on the
+   chip, its plan is pinned (`plans/<name>.json`: the keys, levers and, for stacked columns, the
+   arrangement; one `include_str!` in `pins.rs`). A new family implements `Family` (`plan`,
+   `tiling`, `blocks`, `kernels`, `symbols`) and a rule in `serving`.
 3. **List the blocks.** Units first, then what places against them, then wiring-only blocks.
    Reuse a block where its doc fits exactly; otherwise write a new module under `block/` (a new
    block, not a flag on a shared one).
@@ -245,13 +245,14 @@ a family's own is in the head and PLE kernels: the token loop's winner merge and
 `Program::build(family, plan)` is the whole physical compiler; its only input is a `Plan`. The plan
 comes from poem's spatial pass (`poem_compiler::spatial::plan` over `target::Wafer`): the trace
 gives the `Shape` (layer kinds, attention / MLP / MoE / GDN / PLE specs, head, RoPE, norms), the
-shape picks the family, and the family's presets are the partitions tried, in table order, the
-first that builds kept (a named preset tries only itself; `--set` overrides its keys). A checkpoint
-with no catalog deployment states its shape in a file (`target::plan_shape`; the tiny test
-checkpoints' are `tools/wafer/baseline/shapes/`).
+shape picks the layout, and the pinned plan made for the shape (`pins`: `plans/*.json`, the keys,
+levers and arrangement of each shipping model's chip-validated program) is the partition tried (a
+named one, `--preset <name>`, tries only itself; `--set` overrides its keys). A checkpoint with no
+catalog deployment states its shape in a file (`target::plan_shape`; the tiny test checkpoints'
+are `tools/wafer/baseline/shapes/`, their pinned plans the `tiny*` ones).
 
-When no preset fits (and none is named), the search plans the model (`search`, below); the
-presets stay as the shipping overrides until the search reproduces each one on the chip.
+A model with no pinned plan made for its shape (or whose pinned plan does not build, and none is
+named) plans by the search (`search`, below): there is no table of presets to try.
 `poem-compiler/SPATIAL.md` has the target-neutral half.
 
 ## Cost and search (`cost`, `search`)
@@ -280,14 +281,14 @@ model is within 380 B (Qwen3.5 4B from 0.8B); across kernel flags it is off by u
 is why a model anchors on its own link. `anchors.rs` is regenerated from links when the kernels
 change.
 
-`search::search` walks from each of the family's presets (the made-for one first), moving one key
+`search::search` walks from each of the layout's pinned plans (the made-for one first), moving one key
 or two (a move another must follow: the positions, the units' grid) over a ladder of values; a
 seed that does not plan is repaired a key at a time, following each move that gets it past the
-check it failed. A candidate plans, serves the positions asked for (the made-for preset's, else
+check it failed. A candidate plans, serves the positions asked for (the made-for plan's, else
 4096), keeps its head over the vocabulary, leaves every image `STACK_ROOM` plus a 512 B margin
-and builds (`Program::build`); it ranks ahead of the made-for preset only where it predicts a step
+and builds (`Program::build`); it ranks ahead of the made-for plan only where it predicts a step
 0.3% faster (`search::RESOLUTION`, the time model's largest error on the chip's moves). `wafer-compile search --model <m>` prints the ranking with the keys
-each candidate moved from the made-for preset.
+each candidate moved from the made-for plan.
 
 ## Weights
 
@@ -337,7 +338,8 @@ shape, partition and contract and the checkpoint; each model keeps one of each.
 ## Tools
 
 - `wafer-compile plan (--model <deployment> | --shape <shape.json>) [--preset <name>] [--set
-  K=V,..] [--positions N] --out <dir>` writes `plan.json` and names the preset it took. `wafer-compile build --plan <plan.json> --out <dir> [--emit ..]
+  K=V,..] [--positions N] --out <dir>` writes `plan.json` and names the pinned plan it took (or the
+  search's). `wafer-compile build --plan <plan.json> --out <dir> [--emit ..]
   [--levers ..] [--kernels <dir>]` writes `floor.json`, `rcfg.npy` / `rcfg_n.npy` / `rcfg.txt`,
   `kernels.json`, `layout/`, `host.json`, `plan.json`, `bindings.json` and `program.json`. `wafer-compile
   link --build <dir>` links it where the SDK toolchain is, checks the stack room and puts the artifact in

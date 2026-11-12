@@ -6,7 +6,7 @@
 //! [`gptoss`].
 
 use crate::abi::Kernels;
-use crate::family::{Family, MadeFor, Row, ceil_to, table};
+use crate::family::{Family, ceil_to};
 use crate::kernels::gptoss;
 use crate::plan::{
     Contract, FamilyId, HeadPartition, KvEntries, Partition, Plan, Preset, ReduceGroups, RowRun,
@@ -21,38 +21,11 @@ type R<T> = Result<T, String>;
 
 pub struct GptOss;
 
-/// The presets: attention and MoE columns a unit (AX, MX), rows (PY), the unit slots (UNX x UNY,
-/// every slot a unit), the scores and router segments (SWA, SWR), the band's vocabulary columns
-/// (HVC), KV entries a row (NE), the RoPE tables' levels (NLV), the reduction groups (G2, G2W);
-/// the logits' prescale (HSCALE: the band head's 2^15) and the posted loop (LOOP).
-const PRESETS: &[Row<11>] = &[
-    // name, [AX, MX, PY, UNX, UNY, SWA, SWR, HVC, NE, G2, G2W], overrides, levers
-    // (request 0887: CYV 2, GLUV 1)
-    (
-        "full",
-        [64, 288, 160, 2, 6, 8, 32, 748, 128, 16, 24],
-        "",
-        "DIAG:0,GLUV:1,CYV:2",
-    ),
-    ("tiny", [4, 8, 4, 2, 1, 2, 8, 26, 8, 2, 2], "", ""),
-];
-
-/// The model each shipping preset was measured on.
-const MADE_FOR: &[MadeFor] = &[("full", [2880, 24, 2880])];
-
+/// The keys a plan's preset gives: attention and MoE columns a unit (AX, MX), rows (PY), the unit
+/// slots (UNX x UNY, every slot a unit), the scores and router segments (SWA, SWR), the band's
+/// vocabulary columns (HVC), KV entries a row (NE), the RoPE tables' levels (NLV), the reduction
+/// groups (G2, G2W); the logits' prescale (HSCALE: the band head's 2^15) and the posted loop (LOOP).
 impl Family for GptOss {
-    fn presets(&self) -> Vec<Preset> {
-        let keys = [
-            "AX", "MX", "PY", "UNX", "UNY", "SWA", "SWR", "HVC", "NE", "G2", "G2W",
-        ];
-        table(
-            keys,
-            PRESETS,
-            &[("NLV", 5.0), ("HSCALE", 32768.0), ("LOOP", 64.0)],
-            MADE_FOR,
-        )
-    }
-
     /// Units of K = layers / units, a row's dims the hidden over PY; a scores segment a KV head's
     /// attention columns; the band head HVC columns of VR vocabulary rows (a multiple of 8, the
     /// head control's argmax). Overrides: `NE`, `G2`, `G2W`, `CAP`, `LOOP`, `WL` (the token loop;

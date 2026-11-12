@@ -1,0 +1,7 @@
+{
+  "name": "g12",
+  "layout": "runs",
+  "made_for": [3840, 48, 15360],
+  "keys": {"G2": 16, "G2W": 24, "GA": 6, "GW": 5, "HR": 1153, "HcA": 12, "HcW": 15, "LOOP": 64, "NEG": 32, "NU": 8, "PX": 344, "PY": 283, "RA": 128, "SWA": 43},
+  "levers": "DIAG:0,GELUT:1"
+}
