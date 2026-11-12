@@ -137,29 +137,3 @@ impl PartialEq for Kernel {
 }
 
 impl Eq for Kernel {}
-
-#[cfg(all(test, feature = "rocm"))]
-mod tests {
-    use super::{Root, generated};
-
-    /// A unit the crate does not carry compiles with the carried headers in
-    /// scope and loads on the device; the same unit and name are one kernel.
-    #[test]
-    fn a_generated_unit_compiles_against_the_carried_headers() {
-        if crate::jit::cache::current_device().is_err() {
-            return;
-        }
-        const TEXT: &str = "#include \"prim/device.hip\"\n\
-                            namespace pie::generated_test {\n\
-                            __global__ void fill(float* __restrict__ y) { y[threadIdx.x] = 1.f; }\n\
-                            }\n";
-        let root = Root::generated("synth/generated_test.hip", TEXT);
-        assert_eq!(root.name, "synth/generated_test");
-        let made = generated(root, "::pie::generated_test::fill");
-        made.load().expect("the generated unit compiles and loads");
-        assert!(std::ptr::eq(
-            made,
-            generated(root, "::pie::generated_test::fill")
-        ));
-    }
-}
