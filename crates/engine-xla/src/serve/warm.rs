@@ -321,8 +321,8 @@ impl Shell {
         // ladder order. The rest are parked: compiled onto the disk cache (not
         // held) where they are not there yet, loaded (~1 s, never compiled) by
         // the first fire that takes their shape. With a disk cache the ladder
-        // holds none while it compiles: a held program's memory is a
-        // compile's room (Qwen3.6-35B-A3B's v5e ladder held 25 GB of a 47 GB
+        // holds none it compiles while it compiles: a held program's memory is
+        // a compile's room (Qwen3.6-35B-A3B's v5e ladder held 25 GB of a 47 GB
         // host by its end, its last compiles one at a time); those the free
         // memory holds load once the compiles are done.
         let parks = self.device.parks();
@@ -355,7 +355,7 @@ impl Shell {
                             break;
                         };
                         let hold = hold_bytes(text);
-                        let kept = !parks
+                        let kept = (!parks || device.on_disk(text))
                             && held
                                 .fetch_update(SeqCst, SeqCst, |h| {
                                     (h + hold <= budget).then_some(h + hold)
