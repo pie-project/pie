@@ -2291,11 +2291,18 @@ fn the_fused_chunk_kernel_matches_the_xla_form() {
             37u64,
         ),
     ] {
-        fused_against_xla(&g, &indptr, rows, &lane_slot, seed);
+        fused_against_xla(&g, &indptr, rows, &lane_slot, seed, 0);
     }
 }
 
-fn fused_against_xla(g: &Gdn, indptr: &[i32], rows: usize, lane_slot: &[i32], seed: u64) {
+fn fused_against_xla(
+    g: &Gdn,
+    indptr: &[i32],
+    rows: usize,
+    lane_slot: &[i32],
+    seed: u64,
+    row_blocks: i64,
+) {
     let lanes = indptr.len() - 1;
     let slots = lane_slot.iter().max().map_or(1, |&m| m as usize + 2);
     let mut slot_of_row = vec![DROP; rows];
@@ -2313,7 +2320,14 @@ fn fused_against_xla(g: &Gdn, indptr: &[i32], rows: usize, lane_slot: &[i32], se
         .collect();
     let run = |kernel: bool| -> Option<(Vec<f32>, Vec<f32>)> {
         kernels_xla::ssm::fused_chunks(Some(kernel));
-        let mut b = Bench::new();
+        let d = kernels_xla::tuning::Tuning::DEFAULT;
+        let mut b = Bench::new().with_tuning(kernels_xla::tuning::Tuning {
+            ssm: kernels_xla::tuning::SsmChunks {
+                row_blocks,
+                ..d.ssm
+            },
+            ..d
+        });
         let x = b.bf16(rows as u32, g.width() as u32, &qkv);
         let ip = b.i32(indptr.len() as u32, 1, indptr);
         let z = b.zeros(Dtype::Bf16, rows as u32, (g.hv * g.dv) as u32);
@@ -2489,4 +2503,33 @@ fn step_against_xla(g: &Gdn, rows: usize, seed: u64, mxu: i64) {
     );
     assert_close(&yk, &yx, 2e-3, 1e-2);
     assert_close(&bank_k[..n], &bank_xla[..n], 4e-3, 1e-2);
+}
+
+/// A fire of whole 64-row blocks through the row-block kernel, its lanes
+/// meeting inside blocks (and three in one), against the XLA form: 48 value
+/// heads, the padding rows past the last lane, and 16.
+#[test]
+fn the_row_block_kernel_matches_the_xla_form() {
+    let g = Gdn {
+        hk: 16,
+        hv: 48,
+        dk: 128,
+        dv: 128,
+    };
+    fused_against_xla(&g, &[0, 150, 290, 555], 640, &[2, 1, 3], 37, 64);
+    fused_against_xla(
+        &g,
+        &[0, 20, 40, 300, 301, 600],
+        640,
+        &[2, 1, 3, 4, 5],
+        38,
+        64,
+    );
+    let g = Gdn {
+        hk: 16,
+        hv: 16,
+        dk: 128,
+        dv: 128,
+    };
+    fused_against_xla(&g, &[0, 555, 1110], 1152, &[1, 2], 39, 64);
 }

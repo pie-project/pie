@@ -33,6 +33,11 @@ attn.decode_pages = 64
 # heads took 896 us a layer (482 now), Qwen3.6-27B's 48 heads 2464 (1285); under 16 lanes the VPU's is
 # as fast
 ssm.step_mxu = 16
+# a prompt fire of up to 64 lanes takes its GDN rows where they lie, a step a 64-row block, each lane's piece
+# of it in turn: no chunk of q|k|v rows gathered and no output gathered back (Qwen3.6-27B's 2816-row fire of
+# five prompts: a GDN layer 1148 -> 723 us, pf256-512 at 2816 rows 24.7k -> 25.3k tok/s; 1792 rows of three
+# 668 -> 446; Qwen3.5-0.8B 2048 rows 326 -> 212)
+ssm.row_blocks = 64
 # a prefill's flash kernel takes 128 query rows a block for 128-wide heads, not 256: fewer key blocks
 # past a row block's own prompt where a fire's prompts meet, and the v5e's softmax holds its VPU
 # (Qwen3-0.6B pf256-512 1792-row fires: 106.1k -> 108.2k tok/s; a v6e loses 10%, so it stays at 256)
@@ -85,5 +90,6 @@ measured = [
   "kernel.norm.land_below",
   "kernel.norm.land_from",
   "kernel.norm.rope_from",
+  "kernel.ssm.row_blocks",
   "kernel.ssm.step_mxu",
 ]
