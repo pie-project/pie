@@ -236,6 +236,7 @@ pub(super) fn bake(boot: &mut Boot<'_>) -> Result<Baked> {
         crate::device::elastic::budget_bytes(free, total, boot.memory_share).saturating_sub(
             crate::store::weight_tier_bytes(&boot.trace, boot.residency.device_demand(), 0)?,
         );
+    let after_weights = held_beside(boot, after_weights)?;
     let facts = kv::probe(&boot.trace)?;
     let derive_voxels = boot
         .voxels
@@ -541,6 +542,22 @@ fn host_copy(boot: &Boot<'_>, params: &[usize]) -> Result<HostCopy> {
     Ok(HostCopy::Pinned)
 }
 
+/// `room` less the banks the weight cache takes, where the card holds them
+/// beside it: they are not on the device yet, and once seated they are the
+/// pool's for the load's life, as a resident bank's bytes are, so no fire's
+/// working set is sized into them. A deployment whose banks exceed the room
+/// streams them, and its fires are sized in the room as it is.
+fn held_beside(boot: &Boot<'_>, room: u64) -> Result<u64> {
+    let bytes = crate::weights::laid_bytes(&boot.trace)?;
+    let cached: u64 = boot
+        .residency
+        .cached_experts()
+        .iter()
+        .map(|&param| bytes[param].next_multiple_of(crate::weights::ALIGN))
+        .sum();
+    Ok(if cached < room { room - cached } else { room })
+}
+
 fn refit(
     boot: &mut Boot<'_>,
     device: &Context,
@@ -554,6 +571,7 @@ fn refit(
 ) -> Result<(CompiledModel, Budgets, Vec<u64>)> {
     let (free, total) = crate::store::device_memory()?;
     let live = crate::device::elastic::budget_bytes(free, total, boot.memory_share);
+    let live = held_beside(boot, live)?;
     let facts = kv::probe(&boot.trace)?;
     let window = crate::store::window_of(&boot.trace)?;
     let out_row = Exports::of(&boot.trace, &compiled)?.readout_row_bytes();
