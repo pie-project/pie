@@ -1069,6 +1069,7 @@ impl Shell {
         let buffering = self.buffers.is_some();
         let every_class = super::diag::on().rs_bodies;
         let drafting = deployment.drafting.clone();
+        let rungs = self.rs_rungs();
         let targets: Vec<(u32, BodySynth, record::RsBody)> = targets
             .into_iter()
             .flat_map(|(bucket, target)| {
@@ -1079,6 +1080,7 @@ impl Shell {
                     _ => None,
                 };
                 let buffers = buffering
+                    && rungs.contains(&bucket)
                     && class.is_some_and(|class| every_class || drafting.contains(&class));
                 let treatments: &[record::RsBody] = if buffers {
                     &[

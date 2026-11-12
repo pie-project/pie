@@ -814,6 +814,21 @@ impl Shell {
             .is_some_and(|class| self.wide.contains(class))
     }
 
+    /// The token buckets a fire whose lanes buffer recurrent rows composes
+    /// at: each one up to the lane ceiling (every decode width), past it the
+    /// powers of two and the widest. The lattice records the buffering
+    /// treatments at these alone.
+    fn rs_rungs(&self) -> Vec<u32> {
+        let ceiling = self.lane_ceiling();
+        let top = self.budget.buckets.last().copied();
+        self.budget
+            .buckets
+            .iter()
+            .copied()
+            .filter(|&bucket| bucket <= ceiling || bucket.is_power_of_two() || Some(bucket) == top)
+            .collect()
+    }
+
     fn lane_ceiling(&self) -> u32 {
         (self.held.len() as u32)
             .min(self.budget.max_lanes)

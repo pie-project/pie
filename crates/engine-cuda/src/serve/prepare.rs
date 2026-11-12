@@ -463,7 +463,17 @@ impl FrameShell for Shell {
                 ),
             })
             .collect();
-        let at = self.forced_bucket.take();
+        // A buffering fire pads to a bucket the lattice records its
+        // treatments at (`Shell::rs_rungs`).
+        let buffering = lanes
+            .iter()
+            .any(|seated| matches!(seated.rs, RsVerb::Buffer { .. }));
+        let at = self.forced_bucket.take().or_else(|| {
+            let rows: u32 = lane_rows.iter().sum();
+            buffering
+                .then(|| self.rs_rungs().into_iter().find(|&bucket| bucket >= rows))
+                .flatten()
+        });
         let composition = compose_axes_at(&self.compiled, &self.budgets, &submitted, at)?;
         let mut readout_rows: Vec<i32> = Vec::with_capacity(lanes.len());
         let mut readout_first = vec![0u32; lanes.len()];
