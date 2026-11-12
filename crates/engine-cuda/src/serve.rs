@@ -91,6 +91,9 @@ pub struct Shell {
     corrected: poem_ir::ClassSet,
     decoding: poem_ir::ClassSet,
     tiers: record::Tiers,
+    /// The class words of a drafter's classes (`Shell::drafts_only`); none
+    /// on a model without a drafter.
+    drafting_words: std::collections::HashSet<u64>,
     landing: Vec<Vec<poem_ir::Request>>,
     armed: Option<Armed>,
     media: poem_ir::ClassSet,
@@ -122,6 +125,9 @@ pub struct Shell {
     arming: bool,
     golden_arm: Golden,
     armed_body: Option<record::BodyKey>,
+    /// How the arming fire's lanes treat their recurrent rows: a buffering
+    /// treatment is recorded with lanes that land and replay nothing.
+    arm_rs: record::RsBody,
     /// The lattice waits for the starting weight residency: the load
     /// streams its weights, and bodies armed over the host copy would read
     /// every expert over the bus (`Staged::finish`).
@@ -811,6 +817,31 @@ impl Shell {
             .is_some_and(|class| self.wide.contains(class))
     }
 
+    /// The token buckets a fire whose lanes buffer recurrent rows, or land
+    /// in a drafter's class, composes at: each one up to the lane ceiling
+    /// (every decode width), past it the powers of two and the widest. The
+    /// lattice records those at these alone.
+    /// Whether a lane of `word` lands in a class keyed only for a drafter's
+    /// fires (plain but for reading the drafts): it composes at
+    /// [`Shell::rs_rungs`] too, a verify's lanes being narrow.
+    fn drafts_only(&self, word: u64) -> bool {
+        !self.drafting_words.is_empty()
+            && self
+                .drafting_words
+                .contains(&(word & self.compiled.classes.mask))
+    }
+
+    fn rs_rungs(&self) -> Vec<u32> {
+        let ceiling = self.lane_ceiling();
+        let top = self.budget.buckets.last().copied();
+        self.budget
+            .buckets
+            .iter()
+            .copied()
+            .filter(|&bucket| bucket <= ceiling || bucket.is_power_of_two() || Some(bucket) == top)
+            .collect()
+    }
+
     fn lane_ceiling(&self) -> u32 {
         (self.held.len() as u32)
             .min(self.budget.max_lanes)
@@ -974,8 +1005,10 @@ struct RsFire<'a> {
     write_state: bool,
     predicated: bool,
     truncates: bool,
-    buffered: bool,
-    reads: Vec<Vec<std::ops::Range<u32>>>,
+    /// How its lanes treat their recurrent rows.
+    body: record::RsBody,
+    /// Each lane's replayed buffer rows.
+    replays: Vec<u32>,
     rows_ext: u32,
     snapshots: crate::store::rs::SnapTable,
 }

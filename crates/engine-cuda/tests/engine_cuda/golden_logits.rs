@@ -467,6 +467,14 @@ fn knobs() -> engine_cuda::Knobs {
     knobs
 }
 
+/// The buffered probes' knobs: every class's compositions armed for lanes
+/// that buffer recurrent rows (`rs-bodies`), as a deployment whose
+/// inferlets draft for themselves states, so their fires replay bodies.
+fn buffering(mut knobs: engine_cuda::Knobs) -> engine_cuda::Knobs {
+    knobs.diagnostics.rs_bodies = true;
+    knobs
+}
+
 fn argmax(logits: &[f32]) -> u32 {
     let (at, _) = logits
         .iter()
@@ -1124,7 +1132,7 @@ fn served_buffered(fixture: &Fixture, cache: &Path) -> Vec<(u64, u32)> {
         kv_budget: None,
         memory_share: engine::load::DEFAULT_DEVICE_MEMORY_SHARE,
         ordinal: 0,
-        knobs: knobs(),
+        knobs: buffering(knobs()),
         cache_dir: Some(cache),
         runahead: engine::runahead::Runahead::F1,
         residency: engine_cuda::experts::Plan::default(),
@@ -1374,7 +1382,7 @@ fn served_pair_buffered(fixture: &Fixture, cache: &Path) -> Vec<(u64, u32)> {
         kv_budget: None,
         memory_share: engine::load::DEFAULT_DEVICE_MEMORY_SHARE,
         ordinal: 0,
-        knobs: engine_cuda::Knobs::default(),
+        knobs: buffering(engine_cuda::Knobs::default()),
         cache_dir: Some(cache),
         runahead: engine::runahead::Runahead::F1,
         residency: engine_cuda::experts::Plan::default(),
@@ -1704,6 +1712,7 @@ fn submitted_buffered(fixture: &Fixture, cache: &Path) -> Vec<(u64, u32)> {
     use engine::{Engine, load};
     let boot = engine_cuda::DeviceBoot {
         cache_dir: Some(cache.to_path_buf()),
+        knobs: buffering(engine_cuda::Knobs::default()),
         ..engine_cuda::DeviceBoot::default()
     };
     let mut engine = engine_cuda::open(boot, contract_of).expect("the engine opens");

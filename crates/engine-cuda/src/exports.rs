@@ -156,15 +156,38 @@ pub(crate) fn landing_requests(
     landing
 }
 
+/// The classes the lattice keys and arms: those a plain request lands in,
+/// and, on a model with a drafter (an output only drafting classes write,
+/// MTP's `mtp.drafts`), those writing it that a request plain but for
+/// reading its pass's drafts lands in (the drafter's verify).
 #[must_use]
-pub(crate) fn plain_of(landing: &[Vec<poem_ir::Request>]) -> poem_ir::ClassSet {
-    poem_ir::ClassSet::of(
-        landing
+pub(crate) fn plain_of(
+    landing: &[Vec<poem_ir::Request>],
+    outputs: &[poem_exec::feeds::ClassOutput],
+) -> poem_ir::ClassSet {
+    let plain = |class: usize| landing[class].iter().any(poem_ir::Request::plain);
+    // An output's name no plain class writes: the drafter's (a name written
+    // by several value sets is one output a set).
+    let plain_names: std::collections::HashSet<&str> = outputs
+        .iter()
+        .filter(|out| (0..landing.len()).any(|c| plain(c) && out.classes.contains(c)))
+        .map(|out| out.decl.name.as_str())
+        .collect();
+    let drafter = |class: usize| {
+        outputs
             .iter()
-            .enumerate()
-            .filter(|(_, requests)| requests.iter().any(poem_ir::Request::plain))
-            .map(|(class, _)| class),
-    )
+            .any(|out| out.classes.contains(class) && !plain_names.contains(out.decl.name.as_str()))
+    };
+    poem_ir::ClassSet::of((0..landing.len()).filter(|&class| {
+        plain(class) || (landing[class].iter().any(drafts_only) && drafter(class))
+    }))
+}
+
+/// Whether only its query length and its reading the pass's drafts set
+/// this request apart.
+#[must_use]
+pub(crate) fn drafts_only(request: &poem_ir::Request) -> bool {
+    request.drafts() && request.departures() == usize::from(request.query_len() != 1) + 1
 }
 
 #[must_use]

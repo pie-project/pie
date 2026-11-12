@@ -44,7 +44,7 @@ impl Planes {
 
 /// The buffered rows a seated lane replays in one fire that the scratch's
 /// range is reserved for; past them it is reserved anew.
-const REPLAYED: u32 = 16;
+pub const REPLAYED: u32 = 16;
 
 /// The rs buffer: the rows a lane lands past its state before they fold. Its
 /// pages are slots of the state pool's rs list ([`Pools::rs_span`]): a page
@@ -58,6 +58,9 @@ pub struct Buffers {
     /// slab is, and mapped under the base the fires in flight hold, so a
     /// growth waits for none of them.
     scratch: Arena,
+    /// Scratches it outgrew, kept mapped: a recorded body launches into the
+    /// scratch it was captured over (what it holds lives only a fire).
+    outgrown: Vec<Arena>,
     planes: Planes,
     /// The rows a page holds.
     tokens: u32,
@@ -112,6 +115,7 @@ impl Buffers {
         };
         Ok(Some(Buffers {
             scratch: pools.reserve_arena(reach, SCRATCH)?,
+            outgrown: Vec::new(),
             planes,
             tokens,
             rows,
@@ -145,13 +149,21 @@ fn ext_row_bytes(trace: &Trace) -> Result<u64> {
     let mut widest = 0u64;
     for node in &trace.nodes {
         let total = match &node.op {
-            Operation::Ssm(Ssm::GatedDeltaChunked {
-                qkv, z, gates, y, ..
-            }) => {
+            // A one-token class's recurrences run extended too, when a lane
+            // of its fire replays (`dispatch::ssm`).
+            Operation::Ssm(
+                Ssm::GatedDeltaChunked {
+                    qkv, z, gates, y, ..
+                }
+                | Ssm::GatedDelta {
+                    qkv, z, gates, y, ..
+                },
+            ) => {
                 let mut total =
                     row_bytes(*qkv)? + row_bytes(*z)? + row_bytes(*gates)? + row_bytes(*y)?;
-                if let Some(Operation::Ssm(Ssm::CausalConv1dChunked { x, .. })) =
-                    defined.get(&qkv.0).map(|n| &trace.nodes[*n].op)
+                if let Some(Operation::Ssm(
+                    Ssm::CausalConv1dChunked { x, .. } | Ssm::CausalConv1d { x, .. },
+                )) = defined.get(&qkv.0).map(|n| &trace.nodes[*n].op)
                 {
                     total += row_bytes(*x)?;
                 }
@@ -162,11 +174,14 @@ fn ext_row_bytes(trace: &Trace) -> Result<u64> {
                 }
                 total
             }
-            Operation::Ssm(Ssm::KdaChunked { mixed, f, b, y, .. }) => {
+            Operation::Ssm(
+                Ssm::KdaChunked { mixed, f, b, y, .. } | Ssm::Kda { mixed, f, b, y, .. },
+            ) => {
                 let mut total =
                     row_bytes(*mixed)? + row_bytes(*f)? + row_bytes(*b)? + row_bytes(*y)?;
-                if let Some(Operation::Ssm(Ssm::CausalConv1dChunked { x, .. })) =
-                    defined.get(&mixed.0).map(|n| &trace.nodes[*n].op)
+                if let Some(Operation::Ssm(
+                    Ssm::CausalConv1dChunked { x, .. } | Ssm::CausalConv1d { x, .. },
+                )) = defined.get(&mixed.0).map(|n| &trace.nodes[*n].op)
                 {
                     total += row_bytes(*x)?;
                 }
@@ -410,7 +425,9 @@ impl Buffers {
             return Ok(());
         }
         if !self.scratch_reaches(rows_ext) {
-            self.scratch = pools.reserve_arena(bytes, SCRATCH)?;
+            let grown = pools.reserve_arena(bytes, SCRATCH)?;
+            self.outgrown
+                .push(core::mem::replace(&mut self.scratch, grown));
         }
         pools.commit_beside(&mut self.scratch, bytes)
     }
@@ -421,10 +438,39 @@ impl Buffers {
         (self.scratch.base(), self.scratch.committed_bytes())
     }
 
+    /// A row of every extended operand of one recurrent layer, in bytes.
+    #[must_use]
+    pub fn ext_row_bytes(&self) -> u64 {
+        self.ext_row_bytes
+    }
+
     /// The rows an rs buffer page holds.
     #[must_use]
     pub fn page_tokens(&self) -> u32 {
         self.tokens
+    }
+
+    /// Where `plane`'s rows lie in an rs buffer page's slot.
+    pub fn place(&self, plane: Plane) -> Result<kernels_cuda::runtime::channel::RsPlane> {
+        let run = self
+            .rows
+            .get(plane.layer as usize)
+            .copied()
+            .ok_or(Fault::Ceiling {
+                what: "recurrent layers the rs buffer holds rows of",
+                need: u64::from(plane.layer) + 1,
+                have: self.rows.len() as u64,
+            })?;
+        Ok(kernels_cuda::runtime::channel::RsPlane {
+            off: run + plane.at * ELEMENT,
+            stride: plane.width * ELEMENT,
+        })
+    }
+
+    /// The address of rs buffer page `page`'s slot: a page's rows of a
+    /// plane lie at [`Buffers::place`] within it.
+    pub fn slot(&self, pools: &Pools, page: u32) -> Result<u64> {
+        pools.rs_span(page, 0, 0)
     }
 
     /// The address of `plane`'s row `row` of rs buffer page `page`.

@@ -434,4 +434,204 @@ __global__ void gather_words(
     }
 }
 
+// The buffered recurrent rows of a fire, laid as the staged rs tables state
+// them (engine-cuda `inputs`, the rs section): a lane each, where its rows
+// land in its rs buffer pages and which of those pages' rows it replays
+// ahead of its own. Every address a kernel below writes or reads through
+// the tables is data, so one recorded body serves any slot assignment.
+struct RsLane {
+    // The buffer token the lane's first row lands at, RS_NONE: it lands none.
+    u32 at;
+    // The buffered rows it replays ahead of its own.
+    u32 replay;
+    // Where its replayed tokens start in the replay table.
+    u32 replay_off;
+    // Where its pages' slot addresses start in the page table.
+    u32 page_off;
+};
+
+static_assert(sizeof(RsLane) == 16, "RsLane: the Rust `channel::RsLane` mirrors this layout");
+
+constexpr u32 RS_NONE = 0xffffffffu;
+
+// One row of `row_bytes` (a multiple of 2) from `src` to `dst`, the block's
+// threads striding it in words where both ends allow.
+__device__ __forceinline__ void rs_copy_row(u8* dst, const u8* src, u32 row_bytes)
+{
+    if ((row_bytes & 3u) == 0u &&
+        (reinterpret_cast<usize>(src) & 3u) == 0u &&
+        (reinterpret_cast<usize>(dst) & 3u) == 0u) {
+        const u32* s = reinterpret_cast<const u32*>(src);
+        u32* d = reinterpret_cast<u32*>(dst);
+        for (u32 w = threadIdx.x; w < (row_bytes >> 2); w += blockDim.x) d[w] = s[w];
+        return;
+    }
+    const unsigned short* s = reinterpret_cast<const unsigned short*>(src);
+    unsigned short* d = reinterpret_cast<unsigned short*>(dst);
+    for (u32 h = threadIdx.x; h < (row_bytes >> 1); h += blockDim.x) d[h] = s[h];
+}
+
+// The page row token `tok` of plane (`plane_off`, `plane_stride`) lies at.
+__device__ __forceinline__ u8* rs_page_row(
+    const u64* pages, RsLane lane, u32 tok, u32 page_tokens, u64 plane_off, u64 plane_stride)
+{
+    const u64 slot = pages[lane.page_off + tok / page_tokens];
+    return reinterpret_cast<u8*>(slot + plane_off + static_cast<u64>(tok % page_tokens) * plane_stride);
+}
+
+// Lands each lane's rows of `src` (a block a lane) at its buffer tokens:
+// row e of lane r at token `at + e` of its pages. `win` (the window's live
+// words, or null) offsets rows and lanes as the recurrent kernels do.
+__global__ void rs_scatter(
+    const u8* __restrict__ src,
+    u32 row_bytes,
+    const u32* __restrict__ qo_indptr,
+    const u32* __restrict__ win,
+    u32 lanes_stated,
+    const RsLane* __restrict__ lanes_tab,
+    const u64* __restrict__ pages,
+    u32 page_tokens,
+    u64 plane_off,
+    u64 plane_stride)
+{
+    const u32 lanes = win != nullptr ? win[2] : lanes_stated;
+    const u32 r = blockIdx.x;
+    if (r >= lanes) return;
+    const u32 row0 = win != nullptr ? win[1] : 0u;
+    const u32 rl = win != nullptr ? r + win[3] : r;
+    const RsLane lane = lanes_tab[rl];
+    if (lane.at == RS_NONE) return;
+    const u32 t0 = qo_indptr[r];
+    const u32 n = qo_indptr[r + 1] - t0;
+    for (u32 e = 0; e < n; ++e) {
+        u8* dst = rs_page_row(pages, lane, lane.at + e, page_tokens, plane_off, plane_stride);
+        rs_copy_row(dst, src + static_cast<u64>(row0 + t0 + e) * row_bytes, row_bytes);
+    }
+}
+
+// The window's extended layout: lane r's replayed rows then its own from
+// `csr[r]`, padded lanes (to `lanes_cap`) empty; `ext_win` the live words
+// the recurrent kernels read the extended rows by (no row offset: the
+// extended rows are the window's own).
+__global__ void rs_ext_csr(
+    const u32* __restrict__ qo_indptr,
+    const u32* __restrict__ win,
+    u32 lanes_stated,
+    u32 lanes_cap,
+    const RsLane* __restrict__ lanes_tab,
+    u32* __restrict__ csr,
+    u32* __restrict__ ext_win)
+{
+    if (blockIdx.x != 0 || threadIdx.x != 0) return;
+    const u32 lanes = win != nullptr ? win[2] : lanes_stated;
+    const u32 lane0 = win != nullptr ? win[3] : 0u;
+    u32 acc = 0;
+    for (u32 r = 0; r < lanes; ++r) {
+        csr[r] = acc;
+        acc += lanes_tab[lane0 + r].replay + (qo_indptr[r + 1] - qo_indptr[r]);
+    }
+    for (u32 r = lanes; r <= lanes_cap; ++r) csr[r] = acc;
+    ext_win[0] = acc;
+    ext_win[1] = 0u;
+    ext_win[2] = lanes;
+    ext_win[3] = lane0;
+}
+
+// Lane r's extended rows (a block a lane): its replayed buffer rows (when
+// the value is a buffered plane, `pages` non-null) then its own rows of
+// `own`, which land at its buffer tokens as `rs_scatter` lands them.
+__global__ void rs_ext_gather(
+    const u8* __restrict__ own,
+    u8* __restrict__ ext,
+    u32 row_bytes,
+    const u32* __restrict__ qo_indptr,
+    u32* __restrict__ csr,
+    u32* __restrict__ ext_win,
+    const u32* __restrict__ win,
+    u32 lanes_stated,
+    const RsLane* __restrict__ lanes_tab,
+    const u64* __restrict__ pages,
+    const u32* __restrict__ replay_tok,
+    u32 page_tokens,
+    u64 plane_off,
+    u64 plane_stride)
+{
+    const u32 lanes = win != nullptr ? win[2] : lanes_stated;
+    const u32 lane0 = win != nullptr ? win[3] : 0u;
+    const u32 r = blockIdx.x;
+    // Lane r's extended rows start past every earlier lane's replayed and
+    // own rows; the first gather of an op (`ext_win` non-null) lays the
+    // window's layout from block 0, padded lanes empty.
+    __shared__ u32 begin;
+    if (threadIdx.x == 0) {
+        const u32 upto = r < lanes ? r : lanes;
+        u32 acc = 0;
+        for (u32 i = 0; i < upto; ++i) {
+            acc += lanes_tab[lane0 + i].replay + (qo_indptr[i + 1] - qo_indptr[i]);
+        }
+        begin = acc;
+        if (ext_win != nullptr && r == 0) {
+            u32 total = 0;
+            for (u32 i = 0; i < lanes; ++i) {
+                csr[i] = total;
+                total += lanes_tab[lane0 + i].replay + (qo_indptr[i + 1] - qo_indptr[i]);
+            }
+            for (u32 i = lanes; i <= lanes_stated; ++i) csr[i] = total;
+            ext_win[0] = total;
+            ext_win[1] = 0u;
+            ext_win[2] = lanes;
+            ext_win[3] = lane0;
+        }
+    }
+    __syncthreads();
+    if (r >= lanes) return;
+    const u32 row0 = win != nullptr ? win[1] : 0u;
+    const RsLane lane = lanes_tab[lane0 + r];
+    const u32 e0 = begin;
+    if (pages != nullptr) {
+        for (u32 k = 0; k < lane.replay; ++k) {
+            const u32 tok = replay_tok[lane.replay_off + k];
+            const u8* src = rs_page_row(pages, lane, tok, page_tokens, plane_off, plane_stride);
+            rs_copy_row(ext + static_cast<u64>(e0 + k) * row_bytes, src, row_bytes);
+        }
+    }
+    const u32 t0 = qo_indptr[r];
+    const u32 n = qo_indptr[r + 1] - t0;
+    for (u32 e = 0; e < n; ++e) {
+        const u8* src = own + static_cast<u64>(row0 + t0 + e) * row_bytes;
+        rs_copy_row(ext + static_cast<u64>(e0 + lane.replay + e) * row_bytes, src, row_bytes);
+        // A buffered plane's own rows land in the lane's buffer too.
+        if (pages != nullptr && lane.at != RS_NONE) {
+            rs_copy_row(rs_page_row(pages, lane, lane.at + e, page_tokens, plane_off, plane_stride),
+                        src, row_bytes);
+        }
+    }
+}
+
+// Lane r's own rows of the extended `ext` back onto `target` (a block a
+// lane), past the rows it replayed.
+__global__ void rs_ext_land(
+    const u8* __restrict__ ext,
+    u8* __restrict__ target,
+    u32 row_bytes,
+    const u32* __restrict__ qo_indptr,
+    const u32* __restrict__ csr,
+    const u32* __restrict__ win,
+    u32 lanes_stated,
+    const RsLane* __restrict__ lanes_tab)
+{
+    const u32 lanes = win != nullptr ? win[2] : lanes_stated;
+    const u32 r = blockIdx.x;
+    if (r >= lanes) return;
+    const u32 row0 = win != nullptr ? win[1] : 0u;
+    const u32 rl = win != nullptr ? r + win[3] : r;
+    const u32 skip = csr[r] + lanes_tab[rl].replay;
+    const u32 t0 = qo_indptr[r];
+    const u32 n = qo_indptr[r + 1] - t0;
+    for (u32 e = 0; e < n; ++e) {
+        rs_copy_row(target + static_cast<u64>(row0 + t0 + e) * row_bytes,
+                    ext + static_cast<u64>(skip + e) * row_bytes, row_bytes);
+    }
+}
+
 }

@@ -935,8 +935,18 @@ impl Shell {
         facts.mark_rows_a_lane(&read_only_by_decoders(&boot.trace, &compiled, &decoding));
         let feeds = Feeds::of(&boot.trace, &compiled);
         let tiers = crate::record::Tiers {
-            plain: plain_of(&landing),
+            plain: plain_of(&landing, &Exports::of(&boot.trace, &compiled)?.outputs),
         };
+        let drafting_words: std::collections::HashSet<u64> = compiled
+            .classes
+            .classes
+            .iter()
+            .enumerate()
+            .filter(|(class, _)| {
+                tiers.plain.contains(*class) && !landing[*class].iter().any(poem_ir::Request::plain)
+            })
+            .flat_map(|(_, class)| class.words.iter().copied())
+            .collect();
         let media = media_classes(&boot.trace, &compiled);
         let shifted = regions_shifting(&boot.trace, &compiled);
         let lane_shifted = regions_lane_shifting(&boot.trace, &compiled);
@@ -1141,6 +1151,7 @@ impl Shell {
             !masked.is_empty() || !wide.is_empty(),
             &schedule_streams(&boot.trace, &compiled),
             pools.ids_a_lane(),
+            buffers.as_ref().map(crate::store::rs::Buffers::page_tokens),
         )?;
 
         let exports = Exports::of(&boot.trace, &compiled)?;
@@ -1198,6 +1209,7 @@ impl Shell {
             adapter_fact,
             corrected,
             decoding,
+            drafting_words,
             tiers,
             landing,
             armed: None,
@@ -1223,6 +1235,7 @@ impl Shell {
             decoded_tiles: Vec::new(),
             arming: false,
             armed_body: None,
+            arm_rs: crate::record::RsBody::Folds,
             arm_deferred: false,
             segments: std::collections::HashMap::new(),
             windows_memo: Vec::new(),

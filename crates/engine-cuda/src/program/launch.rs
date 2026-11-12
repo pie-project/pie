@@ -506,6 +506,10 @@ pub struct Prepared {
     intrinsic_offsets_host: Vec<u32>,
     /// The side-table slots a lane binds ([`eta_ir::op::output_pitch`]).
     pitch: usize,
+    /// The outputs this stage reads, an output's slot its index among them
+    /// plus `output_slots` a lane.
+    names: Vec<String>,
+    output_slots: u32,
     channel_count: u32,
     value_count: u32,
     scratch_stride: u32,
@@ -966,6 +970,8 @@ impl Prepared {
             intrinsic_strides_host: Vec::new(),
             intrinsic_offsets_host: Vec::new(),
             pitch: plan.output_pitch as usize,
+            names: plan.names.clone(),
+            output_slots: plan.output_slots,
             channel_count,
             value_count,
             scratch_stride,
@@ -1236,6 +1242,16 @@ impl Prepared {
     }
 
     #[allow(clippy::too_many_arguments)]
+    /// Where output `name` of lane `lane` sits in this stage's table; none
+    /// when the stage reads no such output.
+    #[must_use]
+    pub fn slot_of(&self, name: &str, lane: u32) -> Option<u32> {
+        let index = self.names.iter().position(|named| named == name)?;
+        u32::try_from(index)
+            .ok()?
+            .checked_add(self.output_slots.checked_mul(lane)?)
+    }
+
     pub fn bind_intrinsic(
         &mut self,
         lane: u32,
