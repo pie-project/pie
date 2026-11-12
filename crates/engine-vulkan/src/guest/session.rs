@@ -10,49 +10,9 @@ use crate::device::alloc::{Buffer, Memory};
 use crate::device::ctx::{Core, Frame, Pending};
 use crate::error::{Fault, Result};
 
-const DESC_WORDS: usize = 9;
-
-const BINDINGS: u32 = 6;
-
-const CFG_BINDING: u32 = 5;
-
-const WORKGROUP: u32 = eta_compiler::codegen::wgsl::WORKGROUP;
-
-const GROUPS_PER_CORE: u32 = 4;
-
-#[repr(C)]
-#[derive(Clone, Copy, Debug, Default)]
-struct Cfg {
-    value_count: u32,
-    temporary: u32,
-    op_count: u32,
-    lane: u32,
-}
-
-const _: () = assert!(size_of::<Cfg>() == 16);
-
-fn desc_words(d: &ValueDesc) -> [u32; DESC_WORDS] {
-    let mut out = [0u32; DESC_WORDS];
-    out[0] = d.len;
-    out[1] = d.rows;
-    out[2] = d.last;
-    out[3] = d.rank;
-    out[4] = d.dtype;
-    for (at, &dim) in d.dims.iter().enumerate() {
-        out[5 + at] = dim;
-    }
-    out
-}
-
-fn words_le(words: &[u32]) -> Vec<u8> {
-    words.iter().flat_map(|word| word.to_le_bytes()).collect()
-}
-
-impl Cfg {
-    fn to_le_bytes(self) -> Vec<u8> {
-        words_le(&[self.value_count, self.temporary, self.op_count, self.lane])
-    }
-}
+use engine_gpu::guest::session::{
+    BINDINGS, CFG_BINDING, Cfg, DESC_WORDS, alias_reshapes, desc_words, groups_for, words_le,
+};
 
 /// A stage's pipelines, which follow from its SPIR-V alone: built once per
 /// distinct stage and shared by every session that runs it, since a mobile
@@ -86,7 +46,7 @@ pub type BuiltStages = std::collections::HashMap<u64, Arc<Built>>;
 fn stage_key(lowered: &crate::guest::Lowered) -> u64 {
     use std::hash::{Hash, Hasher};
     let mut hasher = std::collections::hash_map::DefaultHasher::new();
-    lowered.words.hash(&mut hasher);
+    lowered.code.hash(&mut hasher);
     lowered.entries.hash(&mut hasher);
     hasher.finish()
 }
@@ -595,24 +555,6 @@ impl Drop for Session {
     }
 }
 
-fn groups_for(descriptors: &[ValueDesc], device: &Context) -> u32 {
-    let widest = descriptors.iter().map(|d| d.len).max().unwrap_or(1).max(1);
-    let wanted = widest.div_ceil(WORKGROUP);
-    let cap = device.cores().max(1).saturating_mul(GROUPS_PER_CORE);
-    wanted.clamp(1, cap)
-}
-
-fn alias_reshapes(plan: &LaunchStagePlan, values: &mut [u64]) {
-    for (result, source) in eta_compiler::codegen::wgsl_analysis::analyze_stage(plan).aliases {
-        let Some(&at) = values.get(source as usize) else {
-            continue;
-        };
-        if let Some(slot) = values.get_mut(result as usize) {
-            *slot = at;
-        }
-    }
-}
-
 fn build_stage(
     device: &Context,
     plan: &LaunchStagePlan,
@@ -682,7 +624,7 @@ fn build_stage(
     Ok(Stage {
         built,
         groups: if lowered.strides_the_grid {
-            groups_for(&descriptors, device)
+            groups_for(&descriptors, device.cores())
         } else {
             1
         },
@@ -717,7 +659,7 @@ fn build_pipelines(device: &Context, lowered: &crate::guest::Lowered) -> Result<
         .collect();
     let d = &core.device;
     // SAFETY: `d` is live; every create info and the arrays and names it
-    // borrows are locals that outlive their call. `lowered.words` is SPIR-V
+    // borrows are locals that outlive their call. `lowered.code` is SPIR-V
     // the guest compiler emitted for these entry points and bindings. Each
     // failure path destroys exactly what was made before it, and the module
     // is destroyed only after the pipelines are built from it.
@@ -740,7 +682,7 @@ fn build_pipelines(device: &Context, lowered: &crate::guest::Lowered) -> Result<
             }
         };
         let module = match d.create_shader_module(
-            &vk::ShaderModuleCreateInfo::default().code(&lowered.words),
+            &vk::ShaderModuleCreateInfo::default().code(&lowered.code),
             None,
         ) {
             Ok(m) => m,

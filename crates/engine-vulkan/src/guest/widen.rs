@@ -7,41 +7,9 @@ use ash::vk;
 use crate::device::Context;
 use crate::device::alloc::{Buffer, Memory};
 use crate::device::ctx::{Core, Frame};
+use engine_gpu::guest::widen::{Cfg, SOURCE, WG, config_bytes};
+
 use crate::error::Result;
-
-const WG: u32 = 256;
-
-const SOURCE: &str = r#"
-@group(0) @binding(0) var<storage, read>       src : array<u32>;
-@group(0) @binding(1) var<storage, read_write> dst : array<u32>;
-
-struct Cfg {
-  src_word : u32,
-  dst_word : u32,
-  lanes    : u32,
-  pad      : u32,
-};
-@group(0) @binding(2) var<storage, read> cfg : Cfg;
-
-@compute @workgroup_size(256)
-fn main(@builtin(global_invocation_id) gid : vec3<u32>) {
-  let i = gid.x;
-  if (i >= cfg.lanes) { return; }
-  let w = src[cfg.src_word + (i >> 1u)];
-  var half : u32 = w & 0xffffu;
-  if ((i & 1u) == 1u) { half = w >> 16u; }
-  dst[cfg.dst_word + i] = half << 16u;
-}
-"#;
-
-#[repr(C)]
-#[derive(Clone, Copy, Default)]
-struct Cfg {
-    src_word: u32,
-    dst_word: u32,
-    lanes: u32,
-    pad: u32,
-}
 
 /// Config slots, one per widen still on the queue: a frame that runs ahead
 /// keeps its own offsets while the next frame records.
@@ -278,13 +246,4 @@ fn buffer_info(buffer: &Buffer) -> vk::DescriptorBufferInfo {
         .buffer(buffer.slab().buffer)
         .offset(0)
         .range(buffer.bytes())
-}
-
-fn config_bytes(cfg: Cfg) -> [u8; size_of::<Cfg>()] {
-    let mut out = [0u8; size_of::<Cfg>()];
-    out[0..4].copy_from_slice(&cfg.src_word.to_le_bytes());
-    out[4..8].copy_from_slice(&cfg.dst_word.to_le_bytes());
-    out[8..12].copy_from_slice(&cfg.lanes.to_le_bytes());
-    out[12..16].copy_from_slice(&cfg.pad.to_le_bytes());
-    out
 }

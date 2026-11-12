@@ -11,6 +11,7 @@ pub mod decoded;
 mod dispatch;
 pub mod error;
 pub mod experts;
+pub mod guest;
 pub mod handles;
 pub mod inputs;
 pub mod mask;
