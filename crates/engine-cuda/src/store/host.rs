@@ -19,10 +19,20 @@ use crate::device::Pinned;
 use crate::device::graph::Event;
 use crate::error::{Fault, Result};
 
-/// The page-locked staging ring's bytes, at least two chunks: a burst of
-/// moves larger than it waits for the earliest to land (one 512 MiB move
-/// does not).
-const RING: u64 = 512 << 20;
+/// The page-locked staging ring's bytes for a device pool of `device` bytes
+/// and a tier of `budget`: a quarter of the pool, within 512 MiB and 4 GiB
+/// and a quarter of the tier. A move larger than the ring has free waits on
+/// the engine thread for earlier batches to land, and landing commits fresh
+/// pageable pages, slow under memory pressure (0.1 to 2 GB/s): a suspend of
+/// one process, up to a quarter of the pool, then enqueues and returns
+/// rather than holding every fire behind it. The ring is page-locked from
+/// seating, so it costs that much host memory and pinning time at boot.
+#[must_use]
+pub fn staging_ring(device: u64, budget: u64) -> u64 {
+    const LEAST: u64 = 512 << 20;
+    const MOST: u64 = 4 << 30;
+    (device / 4).clamp(LEAST, MOST).min(budget / 4).max(LEAST)
+}
 
 /// An event a landing thread waits on: the runtime's events are safe to
 /// wait on from any thread, and only the landing thread touches this one.
@@ -95,8 +105,9 @@ impl std::fmt::Debug for HostTier {
 unsafe impl Send for HostTier {}
 
 impl HostTier {
-    /// A tier of `chunks` chunks of `chunk_bytes`, mapped, not committed.
-    pub fn new(chunk_bytes: u64, chunks: u32) -> Result<HostTier> {
+    /// A tier of `chunks` chunks of `chunk_bytes`, mapped, not committed,
+    /// behind a staging ring of `ring` bytes ([`staging_ring`]).
+    pub fn new(chunk_bytes: u64, chunks: u32, ring: u64) -> Result<HostTier> {
         let len =
             usize::try_from(chunk_bytes.saturating_mul(u64::from(chunks))).unwrap_or(usize::MAX);
         // SAFETY: an anonymous private mapping no other code knows of; the
@@ -125,7 +136,7 @@ impl HostTier {
         unsafe {
             libc::madvise(base, len.max(1), libc::MADV_HUGEPAGE);
         }
-        let ring_bytes = RING.max(2 * chunk_bytes);
+        let ring_bytes = ring.max(2 * chunk_bytes);
         let ring = Pinned::mapped_uninit(usize::try_from(ring_bytes).unwrap_or(usize::MAX))?;
         let shared = Arc::new(Shared {
             landed: Mutex::new(Landed::default()),
@@ -463,4 +474,24 @@ fn land_moves(moves: &[(usize, usize, usize)], ring: usize, base: usize) {
         }
         copy(parts[0]);
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::staging_ring;
+
+    const GIB: u64 = 1 << 30;
+
+    #[test]
+    fn the_ring_holds_a_quarter_of_the_pool_within_its_bounds() {
+        // A 20 GiB pool with a 28 GiB tier: 4 GiB at most.
+        assert_eq!(staging_ring(20 * GIB, 28 * GIB), 4 * GIB);
+        // A 13 GiB pool: a quarter of it.
+        assert_eq!(staging_ring(13 * GIB, 28 * GIB), 13 * GIB / 4);
+        // A small pool keeps the 512 MiB the ring always had.
+        assert_eq!(staging_ring(GIB, 28 * GIB), 512 << 20);
+        // No more than a quarter of the tier, never under 512 MiB.
+        assert_eq!(staging_ring(20 * GIB, 8 * GIB), 2 * GIB);
+        assert_eq!(staging_ring(20 * GIB, GIB), 512 << 20);
+    }
 }

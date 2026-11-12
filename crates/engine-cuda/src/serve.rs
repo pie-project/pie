@@ -519,7 +519,7 @@ impl Shell {
         // shelf a load does not move through costs nothing.
         self.pools
             .seat_host(u32::try_from(budget.checked_div(page).unwrap_or(0)).unwrap_or(u32::MAX));
-        self.pools.seat_tier(budget)?;
+        self.pools.seat_tier(budget, whole)?;
         Ok(self.pools.host_pages())
     }
     /// Opens this rank's share of `budget` disk kv bytes under `dir`.
