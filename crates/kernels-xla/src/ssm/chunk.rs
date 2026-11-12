@@ -115,7 +115,7 @@ pub(super) fn gdn_chunks(
     // `q` scaled), so no head-major plane is laid out for it (v5e: six
     // layout copies a layer, 1.1 ms of a 640-row fire beside the kernel's
     // 2.2), and the decay and `β` per value head, blank rows zero.
-    let qkv = f.take_rows(raw.rows[0], row)?;
+    let qkv = take_rows_wide(f, raw.rows[0], row)?;
     let gates = f.take_rows(raw.rows[1], row)?;
     let gates = f.convert(gates, Elem::F32);
     let blank = |f: &mut Func, x: Val| -> Built<Val> {
@@ -164,6 +164,30 @@ pub(super) fn gdn_chunks(
     let y = f.take_rows(o, pos)?;
     let y = f.reshape(y, &[t, hv, dv])?;
     Ok(Some((y, out[1])))
+}
+
+/// The most bytes of `q | k | v` rows one gather takes whole: past it, XLA's
+/// gather reads them at a fraction of the bandwidth, so the columns go in
+/// pieces and are put back side by side (v5e Qwen3.8-27B's 2816-row fire,
+/// 58 MB: its GDN layer 1375 -> 1147 us; at 1792 rows, 37 MB, whole is
+/// faster).
+const GATHER_WHOLE_BYTES: i64 = 48 << 20;
+
+/// `f.take_rows(table, ids)`, a wide table's columns a piece at a time.
+fn take_rows_wide(f: &mut Func, table: Val, ids: Val) -> Built<Val> {
+    let d = f.dims(table).to_vec();
+    let bytes = d[0] * d[1] * i64::from(f.elem(table).bits()) / 8;
+    let pieces = (bytes + GATHER_WHOLE_BYTES - 1) / GATHER_WHOLE_BYTES;
+    if pieces <= 1 || d[1] % (128 * pieces) != 0 {
+        return f.take_rows(table, ids);
+    }
+    let w = d[1] / pieces;
+    let mut parts = Vec::with_capacity(pieces as usize);
+    for p in 0..pieces {
+        let part = f.slice_axis(table, 1, p * w, (p + 1) * w)?;
+        parts.push(f.take_rows(part, ids)?);
+    }
+    f.concat(&parts, 1)
 }
 
 /// The kernel: grid over the `nc` chunks, the state carried in VMEM.
