@@ -14,7 +14,9 @@
 //
 // Params: fab (ops/fabric.csl), math (ops/math.csl), TN / UN (t's and u's words), RCW (rcfg's words past the routes), NTD
 // (tdbg's words), TSTAMP (1: phase stamps on the path), HR (the hidden size), EPS (the norms' eps),
-// KVQ (1: oq5 is the KVS line's), FIFOW (the reduction's FIFO depth).
+// KVQ (1: oq5 is the KVS line's), FIFOW (the reduction's FIFO depth), TA (t's and u's alignment in bytes: 16
+// for the unit snake's phases; 4, the natural one, for the halves' columns (MIXK 2 / 3), where 16 costs gpt-oss
+// about 0.3% a step: the stream ops over t and u run slower).
 param fab: imported_module;
 param math: imported_module;
 param TN: u16;
@@ -26,6 +28,7 @@ param HR: u16;
 param EPS: f32;
 param KVQ: u16 = 0;
 param FIFOW: u16 = 32;
+param TA: u16 = 16;
 
 const timestamp = @import_module("<time>");
 var tdbg = @zeros([NTD]u32);   // TSC stamps of the last pass, by phase (host-read, diagnostics)
@@ -37,8 +40,8 @@ const HID: f32 = @as(f32, HR);
 const IHID: f32 = 1.0 / @as(f32, HR);   // (a reciprocal: no runtime f32 divide)
 
 // ---------------------------------------------------------------- the reduction's sum, the multicast's words
-var t: [TN]f32 align(16) = @zeros([TN]f32);
-var u: [UN]f32 align(16) = @zeros([UN]f32);
+var t: [TN]f32 align(TA) = @zeros([TN]f32);
+var u: [UN]f32 align(TA) = @zeros([UN]f32);
 const t_d = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{TN} -> t[i] });
 const u_d = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{UN} -> u[i] });
 inline fn tv(o: u16, n: u16) mem1d_dsd { return @set_dsd_length(@increment_dsd_offset(t_d, @as(i16, o), f32), n); }

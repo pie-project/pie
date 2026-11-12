@@ -115,7 +115,8 @@ const UN: u16 = if (MIXK <= 1) TN else if (MIXK == 2) mx(Qh * Dc + 2 * Dc + 1 + 
 const NTD: u16 = if (MIXK <= 1) 1 + 6 * K else 1 + 4 * K;
 const RCW: u16 = if (MIXK == 0) 11 else if (MIXK == 1) 16 else 12;
 const pe = @import_module("ops/cpe.csl", .{ .fab = fab, .math = math, .TN = TN, .UN = UN, .RCW = RCW, .NTD = NTD,
-  .TSTAMP = TSTAMP, .HR = HR, .EPS = EPS, .KVQ = if (MIXK == 1) KVS else 0, .FIFOW = FIFOW });
+  .TSTAMP = TSTAMP, .HR = HR, .EPS = EPS, .KVQ = if (MIXK == 1) KVS else 0, .FIFOW = FIFOW,
+  .TA = if (MIXK <= 1) 16 else 4 });
 var rcfg_ptr: [*]u32 = &pe.rcfg;
 var tdbg_ptr: [*]u32 = &pe.tdbg;
 var tab_ptr: [*]u32 = &pe.tab;
