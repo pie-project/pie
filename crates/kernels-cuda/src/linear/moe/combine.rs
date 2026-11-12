@@ -1,6 +1,8 @@
 use super::*;
 use crate::error::Error;
-use crate::jit::{Arg, ArgValue, Ctx, Fire, Launch, dtype_dispatch, kernel, nonzero, refuse, stated};
+use crate::jit::{
+    Arg, ArgValue, Ctx, Fire, Launch, dtype_dispatch, kernel, nonzero, refuse, stated,
+};
 use crate::tensor::Tensor;
 use dtype::Dtype;
 

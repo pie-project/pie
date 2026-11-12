@@ -1262,11 +1262,7 @@ impl Pools {
             let reserved = if flat || settled {
                 fitted
             } else {
-                let more = self
-                    .chunks
-                    .activation_unheld_bytes()
-                    .saturating_add(bodies)
-                    / chunk;
+                let more = self.chunks.activation_unheld_bytes().saturating_add(bodies) / chunk;
                 fitted
                     .saturating_add(u32::try_from(more).unwrap_or(u32::MAX))
                     .min(self.chunks.total())
@@ -2157,8 +2153,7 @@ impl Pools {
     /// of its planes in the order its select's table lists them (the codes
     /// first; `None` a plane the bank lacks): one table for the bank, an
     /// expert's entry a plane. A plane in no group is a dense bank, a table
-    /// of its own; one named with no planes is carried in its slot unread,
-    /// with no table.
+    /// of its own.
     pub fn seat_experts(
         &mut self,
         hosts: &[(u32, u64)],
@@ -2173,9 +2168,7 @@ impl Pools {
                 // A companion plane is read through its bank's table alone.
                 let companion = |param: u32| {
                     groups.iter().any(|(codes, members)| {
-                        (*codes != param && members.iter().any(|member| *member == Some(param)))
-                            // One its slot carries unread: no table at all.
-                            || (*codes == param && members.is_empty())
+                        *codes != param && members.iter().any(|member| *member == Some(param))
                     })
                 };
                 let mut counted = false;
@@ -2934,7 +2927,11 @@ impl Pools {
         }
         for cache in &mut self.expert_caches {
             let experts = cache.shape.experts as usize;
-            for hits in cache.planes.iter_mut().filter_map(|bank| bank.hits.as_mut()) {
+            for hits in cache
+                .planes
+                .iter_mut()
+                .filter_map(|bank| bank.hits.as_mut())
+            {
                 hits.zero_span_on(stream, 0, experts * 4)?;
             }
         }
@@ -4109,7 +4106,16 @@ fn lay(
         Vec::new()
     } else {
         let bytes = crate::weights::plane_bytes(trace)?;
-        experts.iter().map(|&param| (param, bytes[param])).collect()
+        // A plane held on the device beside its bank takes no slot bytes.
+        let beside = experts
+            .iter()
+            .flat_map(|&param| layout::beside_planes(trace, param))
+            .map(|plane| (plane as usize, 0));
+        experts
+            .iter()
+            .map(|&param| (param, bytes[param]))
+            .chain(beside)
+            .collect()
     };
     let streamed = if rows {
         layout::streamed_rows(trace)

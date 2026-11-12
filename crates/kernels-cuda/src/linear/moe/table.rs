@@ -26,7 +26,8 @@ pub enum Planes {
     /// laid in atoms).
     Scaled,
     /// `[codes, atoms, tensor_scales, input_scales]`: NVFP4 against NVFP4
-    /// activations.
+    /// activations on the tcgen05 GEMM (sm_120's block-scaled mma.sync reads
+    /// the [`Planes::Nvfp4`] table, its input scales where they lie).
     Nvfp4A4,
 }
 

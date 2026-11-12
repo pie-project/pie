@@ -98,18 +98,14 @@ fn case(g: &mut Gpu, kind: K, tuning: Tuning, [ex, tokens, top, n, k]: [usize; 5
         ),
         _ => (0, 0),
     };
-    let mut planes = vec![
+    // W4A4 reads the NVFP4 table its W4A16 arm reads; its input scales (one
+    // an expert, `[0]` the rows' global) stay on the device beside it.
+    let planes = vec![
         Plane::of(codes, code_row as u64).aligned(code_row as u64),
         Plane::of(scales, scale_row as u64),
         Plane::of(third, third_row as u64),
     ];
-    // W4A4's input scale an expert: the table's copy apart from the one its
-    // rows quantize under (`[0]`, the experts' global), which stays put.
-    let inputs = f32s(&mut lcg, ex, 0.004, 0.003);
-    let (input_q, input_t) = (g.up(&inputs), g.up(&inputs));
-    if kind == K::W4a4 {
-        planes.push(Plane::of(input_t, 4));
-    }
+    let input_q = g.up(&f32s(&mut lcg, ex, 0.004, 0.003));
     let y_bytes = count * n * 2;
     let mut took = true;
     same_bits(g, &what, ex, &planes, (y, y_bytes), |table: ExpertTable| {

@@ -56,7 +56,10 @@ pub fn same_bits(
     let mixed = crate::common::expert_pool::half_on_host(g, &pool.entries, planes);
     let pooled = run(g, streamed(pool.table));
     let host = run(g, streamed(mixed));
-    assert!(host == pooled, "{what}: the streamed host experts moved a bit");
+    assert!(
+        host == pooled,
+        "{what}: the streamed host experts moved a bit"
+    );
     if !kernels_cuda::linear::gemm_sm100::supported() {
         assert!(
             pooled == want,
@@ -192,8 +195,16 @@ fn a_bias_sum_lands_the_same_bits_through_any_table() {
             (y, tokens * width * 2),
             |table| {
                 let mut yt = t(y, tokens, width, Bf16);
-                moe::bias_sum(&ctx, x, t(bias, experts, width, Bf16), r, wt, &mut yt, table)
-                    .expect("the sum fires");
+                moe::bias_sum(
+                    &ctx,
+                    x,
+                    t(bias, experts, width, Bf16),
+                    r,
+                    wt,
+                    &mut yt,
+                    table,
+                )
+                .expect("the sum fires");
             },
         );
     }

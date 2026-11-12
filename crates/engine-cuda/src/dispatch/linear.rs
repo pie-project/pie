@@ -2158,10 +2158,15 @@ impl Run<'_> {
             // An MXFP4 bank against e4m3 rows, as the release asks, on the
             // consumer Blackwells' block-scaled mma.sync (`kernel.moe.mxfp4_w4a8_from`).
             let (codes, scales, biases) = self.planes(bank);
+            // A bank the weight cache holds is read through its table (one
+            // that streams falls to the bf16-activation arm, which counts
+            // its routes); else the bank where it lies, on the device.
+            let table = self.bank_table(bank);
+            let takes = table.tabled() || !crate::device::alloc::is_host_pointer(codes.ptr);
             if let ActQuant::E4m3 { gran } = quant
                 && matches!(codes.dtype, Dtype::Mxfp4 | Dtype::U8)
                 && biases.is_none()
-                && !crate::device::alloc::is_host_pointer(codes.ptr)
+                && takes
                 && linear::moe::select_mxfp4_w4a8(
                     self.ctx(),
                     self.tensor(x),
@@ -2170,7 +2175,7 @@ impl Run<'_> {
                     self.tensor(routes),
                     &mut self.tensor(y),
                     gran,
-                    linear::moe::ExpertTable::RESIDENT,
+                    table,
                 )?
             {
                 return Ok(());
@@ -2180,7 +2185,7 @@ impl Run<'_> {
             if let ActQuant::Nvfp4 = quant
                 && codes.dtype == Dtype::Nvfp4
                 && let (Some(tensor_scales), Some(input_scales)) = (biases, input_scales)
-                && !crate::device::alloc::is_host_pointer(codes.ptr)
+                && takes
                 && linear::moe::select_nvfp4_w4a4(
                     self.ctx(),
                     self.tensor(x),
@@ -2190,7 +2195,7 @@ impl Run<'_> {
                     self.tensor(input_scales),
                     self.tensor(routes),
                     &mut self.tensor(y),
-                    linear::moe::ExpertTable::RESIDENT,
+                    table,
                 )?
             {
                 return Ok(());

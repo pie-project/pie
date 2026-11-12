@@ -1204,7 +1204,35 @@ impl Weights {
         Ok(done)
     }
 
-    /// `kernel.moe.mxfp4_fp8_from`: each resident MXFP4 bank a W4A8 select
+    /// A bank's codes and scales on the device: `None` where both lie there
+    /// already, else one buffer holding them staged from the host copy the
+    /// weight cache or a tier keeps (codes, then scales).
+    #[cfg(feature = "cuda")]
+    fn staged_planes(
+        &self,
+        at: usize,
+        codes: u64,
+        code_bytes: usize,
+        scales: u64,
+        scale_bytes: usize,
+        stream: *mut core::ffi::c_void,
+    ) -> Result<Option<Buffer>> {
+        let off = self
+            .experts
+            .as_ref()
+            .is_some_and(|tier| tier.offloaded_at(at).is_some())
+            || crate::device::alloc::is_host_pointer(codes)
+            || crate::device::alloc::is_host_pointer(scales);
+        if !off {
+            return Ok(None);
+        }
+        let held = Buffer::zeroed_on(stream, code_bytes + scale_bytes)?;
+        crate::device::copy_any(stream, held.ptr(), codes, code_bytes)?;
+        crate::device::copy_any(stream, held.ptr() + code_bytes as u64, scales, scale_bytes)?;
+        Ok(Some(held))
+    }
+
+    /// `kernel.moe.mxfp4_fp8_from`: each MXFP4 bank a W4A8 select
     /// reads keeps an fp8b128 copy, widened once here, that wide selects
     /// read on the FP8 MMA. Returns the banks it widened.
     #[cfg(feature = "cuda")]
@@ -1266,29 +1294,27 @@ impl Weights {
             }
             let rows: u64 = shape[..shape.len() - 2].iter().product();
             let k = shape[shape.len() - 2] * 32;
-            // A bank off the device (the weight cache's, or a tier's) has
-            // no copy: its mapped planes are no device pointer.
-            if self
-                .experts
-                .as_ref()
-                .is_some_and(|tier| tier.offloaded_at(at).is_some())
-                || crate::device::alloc::is_host_pointer(codes.ptr)
-                || crate::device::alloc::is_host_pointer(scales.ptr)
-                || rows == 0
-                || !rows.is_multiple_of(128)
-                || !k.is_multiple_of(128)
-            {
+            if rows == 0 || !rows.is_multiple_of(128) || !k.is_multiple_of(128) {
                 continue;
             }
             let (r, kk) = (rows as usize, k as usize);
+            // A bank the weight cache takes (or a tier holds) keeps the copy
+            // all the same, widened from its host copy staged on the device:
+            // its wide fires read the copy whether its experts are held or
+            // streamed.
+            let staged =
+                self.staged_planes(at, codes.ptr, r * kk / 2, scales.ptr, r * kk / 32, stream)?;
+            let (codes_at, scales_at) = staged.as_ref().map_or((codes.ptr, scales.ptr), |held| {
+                (held.ptr(), held.ptr() + (r * kk / 2) as u64)
+            });
             let to32 = |v: u64| u32::try_from(v).unwrap_or(u32::MAX);
             let atom_bytes = kernels_cuda::linear::gemm_sm100::atom_bytes(r, kk, 128);
             let buffer = Buffer::zeroed_on(stream, r * kk + atom_bytes)?;
             let wide = Buffer::zeroed_on(stream, r * kk * 2)?;
             kernels_cuda::linear::moe::mxfp4_to_fp8b128(
                 &ctx,
-                codes.ptr,
-                scales.ptr,
+                codes_at,
+                scales_at,
                 to32(rows),
                 to32(k),
                 wide.ptr(),
@@ -1297,6 +1323,7 @@ impl Weights {
             )?;
             crate::device::ctx::sync(stream)?;
             drop(wide);
+            drop(staged);
             self.table.3.insert(
                 at,
                 (
@@ -1395,17 +1422,7 @@ impl Weights {
             }
             let rows: u64 = shape[..shape.len() - 2].iter().product();
             let k = shape[shape.len() - 2] * 32;
-            // A bank off the device (the weight cache's, or a tier's) has
-            // no copy: its mapped planes are no device pointer.
-            if self
-                .experts
-                .as_ref()
-                .is_some_and(|tier| tier.offloaded_at(at).is_some())
-                || crate::device::alloc::is_host_pointer(codes.ptr)
-                || crate::device::alloc::is_host_pointer(scales.ptr)
-                || rows == 0
-                || !k.is_multiple_of(64)
-            {
+            if rows == 0 || !k.is_multiple_of(64) {
                 return None;
             }
             Some((at, codes, scales, rows, k))
@@ -1427,16 +1444,24 @@ impl Weights {
         let mut done = 0;
         for (at, codes, scales, rows, k) in picked {
             let to32 = |v: u64| u32::try_from(v).unwrap_or(u32::MAX);
+            // A bank off the device widens from its host copy staged there.
+            let (r, kk) = (rows as usize, k as usize);
+            let staged =
+                self.staged_planes(at, codes.ptr, r * kk / 2, scales.ptr, r * kk / 32, stream)?;
+            let (codes_at, scales_at) = staged.as_ref().map_or((codes.ptr, scales.ptr), |held| {
+                (held.ptr(), held.ptr() + (r * kk / 2) as u64)
+            });
             let buffer = Buffer::zeroed_on(stream, (rows * k * 2) as usize)?;
             kernels_cuda::linear::moe::mxfp4_to_bf16(
                 &ctx,
-                codes.ptr,
-                scales.ptr,
+                codes_at,
+                scales_at,
                 to32(rows),
                 to32(k),
                 buffer.ptr(),
             )?;
             crate::device::ctx::sync(stream)?;
+            drop(staged);
             self.table.3.insert(
                 at,
                 (

@@ -261,6 +261,9 @@ pub struct RowsShape {
     pub floor: u32,
 }
 
+/// The boundary each plane of an expert's slot lies on.
+pub const PLANE_ALIGN: u64 = 16;
+
 /// One plane of a routed expert: the bank `param`, an expert's `bytes` of
 /// it `offset` into the expert's slot.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -324,12 +327,15 @@ pub fn packed_planes(trace: &poem_ir::Trace, codes: usize) -> Vec<Option<u32>> {
             None => return Vec::new(),
         },
         // mlx affine codes of 2, 4 or 8 bits (`matmul_select_mlxu4`).
-        Dtype::U2g32 | Dtype::U2g64 | Dtype::U2g128 | Dtype::U4g32 | Dtype::U4g64 | Dtype::U8g64 => {
-            match named(poem::declare::biases_name(&param.name)) {
-                Some(zeros) => Some(zeros),
-                None => return Vec::new(),
-            }
-        }
+        Dtype::U2g32
+        | Dtype::U2g64
+        | Dtype::U2g128
+        | Dtype::U4g32
+        | Dtype::U4g64
+        | Dtype::U8g64 => match named(poem::declare::biases_name(&param.name)) {
+            Some(zeros) => Some(zeros),
+            None => return Vec::new(),
+        },
         _ => return Vec::new(),
     };
     match scales {
@@ -378,11 +384,12 @@ fn select_bias(trace: &poem_ir::Trace, codes: usize) -> Option<Option<u32>> {
     Some(found.flatten())
 }
 
-/// The planes a packed bank's expert slot carries that no op reads (an
-/// NVFP4 bank's input scales, read by a W4A4 select alone): they stream with
-/// the bank, and its table lists none of them.
+/// The planes of a packed bank that hold one value an expert (an NVFP4
+/// bank's input scales, its activations' calibration): no expert slot
+/// carries them and its table lists none of them; they stay on the device
+/// beside the bank, read where they lie.
 #[must_use]
-pub fn carried_planes(trace: &poem_ir::Trace, codes: usize) -> Vec<u32> {
+pub fn beside_planes(trace: &poem_ir::Trace, codes: usize) -> Vec<u32> {
     use poem_ir::residency::{Residency, residency};
     let listed = packed_planes(trace, codes);
     if listed.is_empty() {
@@ -390,36 +397,16 @@ pub fn carried_planes(trace: &poem_ir::Trace, codes: usize) -> Vec<u32> {
     }
     let classes = residency(trace);
     let leads = poem_ir::residency::leads(trace);
-    let read = read_params(trace);
     (0..trace.params.len())
         .filter(|&plane| {
             plane != codes
                 && leads[plane] == codes
                 && matches!(classes[plane], Residency::Expert(_))
                 && !listed.contains(&Some(plane as u32))
-                && !read[plane]
+                && trace.params[plane].shape.len() == 1
         })
         .map(|plane| plane as u32)
         .collect()
-}
-
-/// Whether some op reads each param.
-fn read_params(trace: &poem_ir::Trace) -> Vec<bool> {
-    use poem_ir::{Def, Operands};
-    let mut readers = vec![false; trace.params.len()];
-    let mut inputs = Vec::new();
-    for node in &trace.nodes {
-        inputs.clear();
-        node.op.inputs(&mut inputs);
-        for v in &inputs {
-            if let Some(Def::Weight(w)) = trace.values.get(v.0 as usize).map(|d| &d.def)
-                && let Some(flag) = readers.get_mut(*w as usize)
-            {
-                *flag = true;
-            }
-        }
-    }
-    readers
 }
 
 /// The routed banks of `trace` this engine streams an expert at a time:
@@ -427,7 +414,8 @@ fn read_params(trace: &poem_ir::Trace) -> Vec<bool> {
 /// routed select with no bias, the select whose kernels read an expert
 /// table: a dense bank, or (off tcgen05, whose grouped GEMM reads no table,
 /// and off the HIP build) an MXFP4, NVFP4 or affine u4 bank against bf16
-/// activations, with the planes its table lists.
+/// activations or (W4A8, W4A4) against the rows its select quantizes, with
+/// the planes its table lists.
 #[must_use]
 pub fn streamed_experts(trace: &poem_ir::Trace) -> Vec<usize> {
     use poem_ir::residency::{Residency, residency};
@@ -435,9 +423,6 @@ pub fn streamed_experts(trace: &poem_ir::Trace) -> Vec<usize> {
     let classes = residency(trace);
     let leads = poem_ir::residency::leads(trace);
     let packs = !cfg!(feature = "rocm") && !packed_unread();
-    // The params some op reads (an NVFP4 bank's input scales are read by
-    // its W4A4 select alone: a W4A16 one leaves them in the slot unread).
-    let readers = read_params(trace);
     let mut out = Vec::new();
     let mut inputs = Vec::new();
     'params: for (at, param) in trace.params.iter().enumerate() {
@@ -511,6 +496,23 @@ pub fn streamed_experts(trace: &poem_ir::Trace) -> Vec<usize> {
                 {
                     read = true;
                 }
+                // A select quantizing its rows (W4A8, W4A4): where there are no
+                // tcgen05 GEMMs its block-scaled mma.sync reads a held table and
+                // its bf16-activation arm a streamed one, both in the bank's
+                // row-major planes.
+                Operation::Linear(Linear::MoeSelect {
+                    bank,
+                    bias: None,
+                    quantized: true,
+                    quant: Some(_),
+                    ..
+                }) if packs
+                    && !planes.is_empty()
+                    && matches!(trace.values.get(bank.0 as usize).map(|d| &d.def),
+                        Some(Def::Weight(w)) if *w as usize == at) =>
+                {
+                    read = true;
+                }
                 _ => continue 'params,
             }
         }
@@ -526,12 +528,13 @@ pub fn streamed_experts(trace: &poem_ir::Trace) -> Vec<usize> {
             .map(|plane| *plane as usize)
             .filter(|plane| *plane != at)
             .collect();
+        let beside = beside_planes(trace, at);
         let unlisted = (0..trace.params.len()).any(|plane| {
             plane != at
                 && leads[plane] == at
                 && matches!(classes[plane], Residency::Expert(_))
                 && !companions.contains(&plane)
-                && readers[plane]
+                && !beside.contains(&(plane as u32))
         });
         if !unlisted
             && companions.iter().all(|plane| {
@@ -541,7 +544,6 @@ pub fn streamed_experts(trace: &poem_ir::Trace) -> Vec<usize> {
         {
             out.push(at);
             out.extend(companions);
-            out.extend(carried_planes(trace, at).into_iter().map(|plane| plane as usize));
         }
     }
     // A layer's banks stream together or not at all, and so do the layers
@@ -555,14 +557,26 @@ pub fn streamed_experts(trace: &poem_ir::Trace) -> Vec<usize> {
     let Ok(recipe) = poem_compiler::chunk::plan(trace, &budgets, &profile) else {
         return Vec::new();
     };
+    // A plane held beside its bank stays out, and keeps no layer out.
+    let beside: Vec<usize> = out
+        .iter()
+        .flat_map(|&bank| beside_planes(trace, bank))
+        .map(|plane| plane as usize)
+        .collect();
     let mut whole = Vec::new();
     for slot in &recipe.weights {
         if slot.kind != poem_compiler::chunk::WeightKind::Expert {
             continue;
         }
-        let params = || slot.banks.iter().flat_map(|bank| bank.params.iter());
-        if params().all(|param| out.contains(&(*param as usize))) {
-            whole.extend(params().map(|param| *param as usize));
+        let params = || {
+            slot.banks
+                .iter()
+                .flat_map(|bank| bank.params.iter())
+                .map(|param| *param as usize)
+                .filter(|param| !beside.contains(param))
+        };
+        if params().all(|param| out.contains(&param)) {
+            whole.extend(params());
         }
     }
     whole.sort_unstable();
@@ -871,13 +885,26 @@ impl Layout {
             for bank in &slot.banks {
                 let mut at = 0u64;
                 let mut planes = Vec::with_capacity(bank.params.len());
+                let mut laid = 0;
                 for &param in &bank.params {
                     let Some(&(_, bytes)) = banks.iter().find(|(held, _)| *held == param as usize)
                     else {
                         break;
                     };
-                    if bank.atoms != count || count == 0 || !bytes.is_multiple_of(count) {
+                    // Every plane on a 16-byte boundary of the slot, as its
+                    // kernels' vector loads read it.
+                    if bank.atoms != count
+                        || count == 0
+                        || !bytes.is_multiple_of(count)
+                        || !at.is_multiple_of(PLANE_ALIGN)
+                    {
                         break;
+                    }
+                    laid += 1;
+                    // A plane held beside the bank (no bytes): no part of the
+                    // slot.
+                    if bytes == 0 {
+                        continue;
                     }
                     planes.push(ExpertPlane {
                         param,
@@ -886,7 +913,7 @@ impl Layout {
                     });
                     at += bytes / count;
                 }
-                if planes.len() == bank.params.len() && at <= slot.bytes {
+                if laid == bank.params.len() && at <= slot.bytes {
                     layers.push(planes);
                 }
             }

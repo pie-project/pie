@@ -941,8 +941,8 @@ __global__ void __launch_bounds__(256 * kGroups, 1) moe_select_nvfp4_w4a4(
     const int chunks = k >> 7;
     const long long row_bytes = k >> 1;
     const int sf_row = k >> 4;
-    const u8* w_e = expert_plane(codes, 1LL * n * row_bytes, expert_table, 4, 0, expert);
-    const u8* s_e = expert_plane(scales, 1LL * n * sf_row, expert_table, 4, 1, expert);
+    const u8* w_e = expert_plane(codes, 1LL * n * row_bytes, expert_table, 3, 0, expert);
+    const u8* s_e = expert_plane(scales, 1LL * n * sf_row, expert_table, 3, 1, expert);
 
     const int own = tid % 256;
     const int own_half = tid / 256;
@@ -1044,8 +1044,10 @@ __global__ void __launch_bounds__(256 * kGroups, 1) moe_select_nvfp4_w4a4(
     asm volatile("cp.async.wait_group 0;\n" ::);
     if (!rows_live || count <= 64 * group) return;
 
-    const float* ts_e = expert_plane(tensor_scales, 1LL * n, expert_table, 4, 2, expert);
-    const float in_scale = *expert_plane(input_scales, 1LL, expert_table, 4, 3, expert);
+    // The bank's NVFP4 table (`[codes, scales, tensor_scales]`, its W4A16
+    // arm's); the input scales lie on the device beside it, one an expert.
+    const float* ts_e = expert_plane(tensor_scales, 1LL * n, expert_table, 3, 2, expert);
+    const float in_scale = input_scales[expert];
     auto factor = [&](int row) { return ts_e[row] * in_scale; };
     w4mma::w4_land<0, kTiles, kNb>(acc, factor, nullptr, order, begin + 64 * group, count - 64 * group, out, n, n,
                                    row_base, g, c, 0.f, 0.f);
