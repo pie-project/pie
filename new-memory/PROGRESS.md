@@ -1371,3 +1371,19 @@ The `new-memory/` directory is bookkeeping and is removed before anything lands 
   (XLA had parked the whole MoE-mini pool in VMEM between Mosaic calls, ~52 us / step). vs main: MoE d8 +2.6% (was
   -3.1%), d1 / d256 / p2048 +0.8 / +0.9 / +3.9%; qwen3-0.6b d1 / d64 / d256 +7.2 / +4.2 / +9.4%, p2048 -1.8%;
   d0.8b d64 -2.6% (layer-major). Gates bitwise.
+
+### M113 — 2026-11-12: CUDA quantized expert banks through the weight cache (A1)
+- `sc/l40s-quant-experts` (b0502f8fa, L40S, 21 commits): every quantized expert format main serves now lives in
+  pool slots as an ExpertTable, held or streamed: NVFP4 W4A16, mlx affine u2/u4/u8, biased MXFP4, W4A8 (MXFP4)
+  / W4A4 (NVFP4), block FP8 / MXFP8 (laid planes named once; pinned-or-pageable host copy laid at load). Streamed
+  tables take the cp.async / register-dequant arms (tcgen05 / wgmma stay device-resident); held tables on TMA
+  devices keep TMA via TMA-row-aligned slot planes (b7003ab5a) and a whole-rows window guard (9941a24cf).
+- Fit / boot: held banks' chunks are never kv pages (fixes an FP8 overcommit that looked like 2.5x); fire budget
+  leaves room for cached banks; chunk recipe weighs whole expert-slot multiples; arming coarsens the default
+  lattice to what the bodies allowance holds (no unattempted keys); a held load's host copy is pageable (boot FP8
+  94 -> 67 s vs main 65; NVFP4 = new-memory base).
+- Fixes of main bugs: W8A8 FP8 select no longer reads MXFP8 banks' 1x32 scales at 1x128 indices.
+- Verified: L40S strict golden_experts on 9 miniatures + golden_held_small; sm_120 moe_table 8/8 and strict
+  kimik3 / minimax / glm53; ws kernel A/B no regression (520.4 vs 523.9 us, noise). gpt-oss held = new-memory
+  (c64 1290 vs main 1030). Open: affine 4-bit real-model bench; H100/B200 confirmation (A25); FP8 30B pages 3204 vs
+  main 3968 (activation rungs); arming cost.

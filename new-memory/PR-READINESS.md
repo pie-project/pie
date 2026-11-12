@@ -5,7 +5,7 @@ Branch today: 432 commits ahead of main, 782 files, +86k / -13k. Main merged in 
 ## A. North star items still open (must land before the PR)
 | # | Item | Owner | State |
 |---|---|---|---|
-| A1 | CUDA quantized expert banks: NVFP4, affine u4/u2, block FP8, W4A8/W4A4, biased selects (MXFP4 done M67) | L40S | in progress |
+| A1 | CUDA quantized expert banks: NVFP4, affine u4/u2, block FP8, W4A8/W4A4, biased selects (MXFP4 done M67) | L40S | done M113 (affine real-model bench, H100/B200 A25 open) |
 | A2 | CUDA held load with a pool too small: illegal address at boot (IT r9) | L40S | done M75 |
 | A3 | Runtime boot fit counts only committed segments (Metal) | RT3 | done M73 (Metal device run pending) |
 | A4 | ROCm quantized expert banks (after A1) | AMD | queued |
