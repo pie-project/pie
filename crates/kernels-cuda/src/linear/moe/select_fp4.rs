@@ -472,10 +472,11 @@ pub fn select_mxfp4_w4a8(
     }
     let (op, glu, bias, (code, limit, alpha)) = (OP, false, None::<Tensor>, (0, 0.0f32, 0.0f32));
     let fan = &selected(OP, x, routes, y)?;
-    // The staged kernels where the release tunes them, held or streamed (a
-    // streamed table's codes rows by cp.async into the same stages). A
-    // table's entries are 16-aligned (the pool's planes); `codes` is then
-    // the bank's host copy, which no kernel reads, wherever its file lays it.
+    // The staged kernels where the release tunes them, a contiguous bank's
+    // codes by TMA, a table's by cp.async from its entries into the same
+    // stages. A table's entries are 16-aligned (the pool's planes); `codes`
+    // is then the bank's host copy, which no kernel reads, wherever its file
+    // lays it.
     if ctx.tuning().mxfp4_w4a8_tma
         && (table.tabled() || codes.ptr.is_multiple_of(16))
         && ctx.smem_fits(W4A8_TMA_SMEM)
@@ -770,26 +771,18 @@ fn select_mxfp4_w4a8_tma(
         boxes: [128, 128, 1],
         swizzle: dr::CUtensorMapSwizzle::CU_TENSOR_MAP_SWIZZLE_128B,
     })?;
-    // The codes map spans a table's window (its entries whole code rows
-    // past its base), or without one the bank, where any held table's
-    // entries lie. A streamed table's codes are read through its entries:
-    // no map of them is read, and the routes' stands in.
-    let stream = table.streams();
-    let (w_base, w_rows) = if table.located && table.window != (0, 0) {
-        let rows = table.window.1 / u64::from(x.width / 2);
-        let rows =
-            u32::try_from(rows).map_err(|_| refuse(OP, format!("a window of {rows} code rows")))?;
-        (table.window.0, rows)
-    } else {
-        (codes.ptr, experts * y.width)
-    };
-    let map_w = if stream {
+    // The codes map spans the contiguous bank. A table's codes are read
+    // through its entries, held or streamed: an entry lies where its slot
+    // does, no whole number of code rows past the pool's base, so no map row
+    // indexes it; no map of them is read, and the routes' stands in.
+    let tabled = table.tabled();
+    let map_w = if tabled {
         map_x
     } else {
         encode(Map {
-            ptr: w_base,
+            ptr: codes.ptr,
             ty: dr::CUtensorMapDataType::CU_TENSOR_MAP_DATA_TYPE_UINT8,
-            dims: [x.width / 2, w_rows, 0],
+            dims: [x.width / 2, experts * y.width, 0],
             strides: [u64::from(x.width / 2), 0],
             boxes: [64, 128, 1],
             swizzle: dr::CUtensorMapSwizzle::CU_TENSOR_MAP_SWIZZLE_64B,
@@ -801,13 +794,13 @@ fn select_mxfp4_w4a8_tma(
     let fire = if ws {
         Fire::at(kernel(
             SELECT_FP4_SM120,
-            &format!("::pie::linear::moe_select_mxfp4_w4a8_ws<3, {stream}>"),
+            &format!("::pie::linear::moe_select_mxfp4_w4a8_ws<3, {tabled}>"),
         ))
         .apply(Launch::grid([sms.min(tiles * work_cap), 1, 1], [384, 1, 1]).smem(W4A8_TMA_SMEM))
     } else {
         Fire::at(kernel(
             SELECT_FP4_SM120,
-            &format!("::pie::linear::moe_select_mxfp4_w4a8_tma<0, 3, {stream}>"),
+            &format!("::pie::linear::moe_select_mxfp4_w4a8_tma<0, 3, {tabled}>"),
         ))
         .apply(Launch::grid([tiles, work_cap, 1], [512, 1, 1]).smem(W4A8_TMA_SMEM))
     };
@@ -830,7 +823,6 @@ fn select_mxfp4_w4a8_tma(
         0.0f32.arg(),
         0.0f32.arg(),
         ArgValue::Ptr(table.at()),
-        w_base.arg(),
         codes.arg(),
     ];
     ctx.fire(OP, fire, &args)?;

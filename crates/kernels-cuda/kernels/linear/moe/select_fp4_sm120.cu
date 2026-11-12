@@ -342,7 +342,7 @@ __device__ __forceinline__ void tma_2d(void* dst, unsigned long long* bar, const
 
 // A stage's 256 code rows as `map_w`'s two 128-row boxes land them (64B
 // rows, 16B chunk q of row r at `q ^ ((r >> 1) & 3)`), by cp.async from an
-// expert's codes `w_e` (`row_bytes` a row) where a streamed table names them,
+// expert's codes `w_e` (`row_bytes` a row) where a table names them,
 // mapped host memory included: box rows from `y0` and `y1`, each past the
 // expert's `last` row read as its last (a row past the bank is no output's),
 // the K bytes from `col`; thread `t` of `threads`. `arrive_async` then
@@ -370,12 +370,13 @@ __device__ __forceinline__ void arrive_async(unsigned long long* bar) {
 /// `quantize_rows_mxfp8_routed`, 128B-swizzled), the CTA's 256 rows (or a
 /// GLU's 128 gate and 128 up) as two 128-row boxes of `map_w` (the bank's
 /// codes, 64B-swizzled), one thread issuing them a stage ahead onto that
-/// stage's mbarrier; the reads are `moe_select_mxfp4_w4a8`'s. `kStream`: a
-/// streamed table's (its entries may name mapped host memory, which no map
-/// spans), the codes rows by every thread's cp.async into the stage as the
-/// boxes lay them (`w4a8::rows_async`), the routes' still by TMA: the same
-/// stages, so the same reads and bits.
-template <int kGlu, int kStages, bool kStream>
+/// stage's mbarrier; the reads are `moe_select_mxfp4_w4a8`'s. `kTabled`: a
+/// table's bank (an entry may name mapped host memory, which no map spans,
+/// and lies wherever its slot does, no whole number of code rows past any
+/// base a map could index), the codes rows by every thread's cp.async into
+/// the stage as the boxes lay them (`w4a8::rows_async`), the routes' still
+/// by TMA: the same stages, so the same reads and bits.
+template <int kGlu, int kStages, bool kTabled>
 __global__ void __launch_bounds__(512, 1) moe_select_mxfp4_w4a8_tma(
     const __grid_constant__ w4a8::TmaMap map_x,
     const __grid_constant__ w4a8::TmaMap map_w,
@@ -394,7 +395,6 @@ __global__ void __launch_bounds__(512, 1) moe_select_mxfp4_w4a8_tma(
     float limit,
     float galpha,
     const u64* __restrict__ expert_table,
-    u64 expert_window,
     const u8* __restrict__ codes)
 {
     constexpr int kNb = 8;
@@ -433,12 +433,11 @@ __global__ void __launch_bounds__(512, 1) moe_select_mxfp4_w4a8_tma(
     const int sf_row = k >> 5;
     const u8* s_e = expert_plane(scales, 1LL * n * sf_row, expert_table, 3, 1, expert);
     // The bank rows of the two boxes: 256 in order, or the GLU's gate and up.
-    // `map_w` spans the bank, or the table's window: the expert's first row in it.
-    const int w_e = static_cast<int>(
-        expert_row(expert_table, 3, 0, expert, n, expert_window, k >> 1));
+    // `map_w` spans the contiguous bank (a table's codes are read through it).
+    const int w_e = static_cast<int>(expert_row(expert_table, 3, 0, expert, n, 0, k >> 1));
     const int w_y0 = w_e + cta_row;
     const int w_y1 = kGlu != 0 ? w_e + inter + cta_row : w_y0 + 128;
-    const u8* w_codes = kStream ? expert_plane(codes, 1LL * n * (k >> 1), expert_table, 3, 0, expert) : nullptr;
+    const u8* w_codes = kTabled ? expert_plane(codes, 1LL * n * (k >> 1), expert_table, 3, 0, expert) : nullptr;
 
     // Stages 1024-aligned for the 128B swizzle; the barriers past them.
     extern __shared__ __align__(1024) unsigned char w4a8_tma_smem[];
@@ -449,7 +448,7 @@ __global__ void __launch_bounds__(512, 1) moe_select_mxfp4_w4a8_tma(
     if (tid == 0) {
 #pragma unroll
         for (int s = 0; s < kStages; ++s) {
-            w4a8::bar_init(full + s, kStream ? 1 + 512 : 1);
+            w4a8::bar_init(full + s, kTabled ? 1 + 512 : 1);
             w4a8::bar_init(empty + s, kWarps * kGroups);
         }
         asm volatile("fence.mbarrier_init.release.cluster;\n" ::: "memory");
@@ -461,14 +460,14 @@ __global__ void __launch_bounds__(512, 1) moe_select_mxfp4_w4a8_tma(
         unsigned char* st = ring + s * kStage;
         if (tid == 0) {
             asm volatile("fence.proxy.async.shared::cta;\n" ::: "memory");
-            w4a8::bar_expect(full + s, kStream ? kX : kStage);
+            w4a8::bar_expect(full + s, kTabled ? kX : kStage);
             w4a8::tma_2d(st, full + s, &map_x, ch * 128, begin);
-            if (!kStream) {
+            if (!kTabled) {
                 w4a8::tma_2d(st + kX, full + s, &map_w, ch * 64, w_y0);
                 w4a8::tma_2d(st + kX + kW / 2, full + s, &map_w, ch * 64, w_y1);
             }
         }
-        if (kStream) {
+        if (kTabled) {
             w4a8::rows_async(st + kX, w_codes, k >> 1, ch * 64, cta_row, kGlu != 0 ? inter + cta_row : cta_row + 128,
                              n - 1, tid, 512);
             w4a8::arrive_async(full + s);
@@ -515,7 +514,7 @@ __global__ void __launch_bounds__(512, 1) moe_select_mxfp4_w4a8_tma(
     for (int ch = 0; ch < chunks; ++ch) {
         if (ch + 1 < chunks) load_s(ch + 1, na, nb);
         // Every warp past the chunk before: its stage takes the next fill.
-        if ((kStream || tid == 0) && ch > 0 && ch + kStages - 1 < chunks)
+        if ((kTabled || tid == 0) && ch > 0 && ch + kStages - 1 < chunks)
             w4a8::bar_wait(empty + (ch - 1) % kStages, ((ch - 1) / kStages) & 1);
         stage(ch + kStages - 1);
         w4a8::bar_wait(full + ch % kStages, (ch / kStages) & 1);
@@ -611,9 +610,9 @@ struct Const {
 /// codes as `quantize_rows_mxfp8_routed<kGran, true>` lays them (a 32's
 /// codes 8c..8c+3 at 4c, 8c+4..8c+7 at 16 + 4c), each 8-route block's B
 /// words one matrix row; the scales a byte of a chunk's word to each MMA.
-/// `kStream`: a streamed table's, warpgroup 2's 128 threads landing each
+/// `kTabled`: a table's bank, warpgroup 2's 128 threads landing each
 /// stage's codes rows by cp.async (`moe_select_mxfp4_w4a8_tma`'s).
-template <int kStages, bool kStream>
+template <int kStages, bool kTabled>
 __global__ void __launch_bounds__(384, 1) moe_select_mxfp4_w4a8_ws(
     const __grid_constant__ w4a8::TmaMap map_x,
     const __grid_constant__ w4a8::TmaMap map_w,
@@ -632,7 +631,6 @@ __global__ void __launch_bounds__(384, 1) moe_select_mxfp4_w4a8_ws(
     float limit,
     float galpha,
     const u64* __restrict__ expert_table,
-    u64 expert_window,
     const u8* __restrict__ codes)
 {
     constexpr int kNb = 8;
@@ -656,7 +654,7 @@ __global__ void __launch_bounds__(384, 1) moe_select_mxfp4_w4a8_ws(
     if (tid == 0) {
 #pragma unroll
         for (int s = 0; s < kStages; ++s) {
-            w4a8::bar_init(full + s, kStream ? 1 + 128 : 1);
+            w4a8::bar_init(full + s, kTabled ? 1 + 128 : 1);
             w4a8::bar_init(empty + s, 8);
         }
         asm volatile("fence.mbarrier_init.release.cluster;\n" ::: "memory");
@@ -667,7 +665,7 @@ __global__ void __launch_bounds__(384, 1) moe_select_mxfp4_w4a8_ws(
     if (warp >= 8) {
         asm volatile("setmaxnreg.dec.sync.aligned.u32 40;\n" ::: "memory");
         const int pt = tid - 256;
-        if (!kStream && pt != 0) return;
+        if (!kTabled && pt != 0) return;
         int s = 0;
         unsigned ph = 0;
         for (int job = static_cast<int>(blockIdx.x); job < jobs; job += static_cast<int>(gridDim.x)) {
@@ -676,23 +674,20 @@ __global__ void __launch_bounds__(384, 1) moe_select_mxfp4_w4a8_ws(
             const int begin = offsets[expert] + (item & 0xFFFF) * 128;
             if (offsets[expert + 1] - begin <= 0) continue;
             const int row0 = (job % tiles) * 256;
-            const int w_y = kStream ? 0
-                                    : static_cast<int>(
-                                          expert_row(expert_table, 3, 0, expert, n, expert_window, k >> 1))
-                    + row0;
-            const u8* w_e = kStream ? expert_plane(codes, 1LL * n * (k >> 1), expert_table, 3, 0, expert) : nullptr;
+            const int w_y = kTabled ? 0 : static_cast<int>(expert_row(expert_table, 3, 0, expert, n, 0, k >> 1)) + row0;
+            const u8* w_e = kTabled ? expert_plane(codes, 1LL * n * (k >> 1), expert_table, 3, 0, expert) : nullptr;
             for (int ch = 0; ch < chunks; ++ch) {
                 w4a8::bar_wait(empty + s, ph ^ 1);
                 unsigned char* st = ring + s * kStage;
                 if (pt == 0) {
-                    w4a8::bar_expect(full + s, kStream ? kX : kStage);
+                    w4a8::bar_expect(full + s, kTabled ? kX : kStage);
                     w4a8::tma_2d_cta(st, full + s, &map_x, ch * 128, begin);
-                    if (!kStream) {
+                    if (!kTabled) {
                         w4a8::tma_2d_cta(st + kX, full + s, &map_w, ch * 64, w_y);
                         w4a8::tma_2d_cta(st + kX + kW / 2, full + s, &map_w, ch * 64, w_y + 128);
                     }
                 }
-                if (kStream) {
+                if (kTabled) {
                     w4a8::rows_async(st + kX, w_e, k >> 1, ch * 64, row0, row0 + 128, n - 1, pt, 128);
                     w4a8::arrive_async(full + s);
                 }
