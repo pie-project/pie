@@ -1310,3 +1310,15 @@ The `new-memory/` directory is bookkeeping and is removed before anything lands 
   0.998, same launches); ~1% mean gap (main ~6283 / 7 runs, new ~6215 / 5 runs; single runs overlap) comes from the
   per-round prefill bucket mix (same armed key set as main) and per-run clock level under the 200 W cap. Closed as
   noise-level; no kernel fix.
+
+### M107 — 2026-11-12: rs-buffered fires recorded (A13, a main bug); MTP fixes
+- `sc/rs-record` (466da2ba7): per-lane rs destinations / replay counts / rs page addresses as per-fire input data
+  at load-fixed addresses (one body serves any slot assignment); table-driven rs copy kernels (CUDA + ROCm); three
+  body variants (fold / buffer / replay; folding buffer into replay changes bits). Buffering variants armed only for
+  a drafter's classes (an output name no plain class writes, e.g. mtp.drafts) on loads that buffer recurrent rows,
+  at 14 buckets (`rs-bodies` diagnostic arms all). Fixes: each guest stage places the outputs it reads at its own
+  slots (MTP past ~64 tokens failed on main too); planes over readout / lane rows fan out by one (panic at 16+
+  concurrent MTP).
+- sm_120: 0 eager fires with MTP; buffered goldens bitwise vs the eager walk; golden_logits / by_refs = base.
+  Boot Qwen3.5-0.8B 20.1 s (main 22.1-22.5), Qwen3-0.6B 7.9 s (main 10.1); c64 / c256 unchanged vs base; MTP
+  64 concurrent 5357 tok/s (main fails a second MTP process).

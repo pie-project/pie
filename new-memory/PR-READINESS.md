@@ -16,7 +16,7 @@ Branch today: 432 commits ahead of main, 782 files, +86k / -13k. Main merged in 
 | A10 | Delete device/host weight budgets, dense rotor, dense host tier; max_state_slots | L40S, Metal, VK5 | done M76 (dead legacy tier cleanup left) |
 | A11 | Eager path wrong tokens; nothing arms at small budgets | EAGER | done M82 (ROCm verify pending) |
 | A12 | Shared-pool snapshots; host-full hang + miscount; keep-handles key covers the record | RT | done M84 (other engines: A15) |
-| A13 | Record rs-buffered fires (MTP / spec decode on hybrids walk eagerly; same on main) — main bug, fix in this PR (user 2026-11-11) | RSREC agent (sc/rs-record) | in progress |
+| A13 | Record rs-buffered fires (MTP / spec decode on hybrids walk eagerly; same on main) — main bug, fix in this PR (user 2026-11-11) | RSREC agent | done M107 (Mamba2 extended path still eager: Nemotron) |
 | A14 | Wire the rung shrink (SPEC 6) | RT | done M92 (CUDA) |
 | A21 | Activation rungs on Metal / Vulkan / wgpu / XLA (only CUDA states rungs; the walk is a no-op elsewhere) | backend owners | not applicable on XLA, Metal, Vulkan, wgpu (activation is a buffer of its own outside the pool; no rungs stated, walk no-op); CUDA done M92 |
 | A15 | read_tier_slots / write_tier_slots (snapshots on shared pools) on Metal, Vulkan, wgpu, XLA (CUDA in sc/rt4; Cerebras out of scope) | Metal agent, VKP, TPU | done (Vulkan+wgpu M94, XLA M95, Metal M100) |
