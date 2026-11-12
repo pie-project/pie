@@ -1343,3 +1343,12 @@ The `new-memory/` directory is bookkeeping and is removed before anything lands 
   Metal / Vulkan / wgpu / XLA logits gates, one runtime test per store mechanism, kernels moe_table(_fp8/_fp4) /
   ROCm linear_moe_table, poem-compiler every_deployment_packs_into_chunks. Main's tests untouched.
 - Merge: +72 / -25,947. Workspace --all-targets, engine-cuda cuda/rocm --tests, pie cuda check clean; runtime 150 pass.
+
+### M110 — 2026-11-12: Mamba2 rs-buffered fires recorded (A13 remainder)
+- `sc/rs-record-2` (830db112c): ChunkProfile::rs_mamba2 (CUDA) buffers each Mamba2 layer's conv input and dt;
+  mamba2_extended replays them through recorded bodies; mamba2_chunked's tail pass normalises once (it re-normed
+  first-pass rows: 28-41% of logit spread vs fold before the fix). Drafter classes read out up to lane_ceiling x
+  readouts_per_lane (conc-64 MTP eager fires 9-11 -> 0); replay ceiling checked per window.
+- sm_120: Nemotron mini buffered = eager bitwise, 0 warnings; Qwen buffered = M107; golden_logits / by_refs pass;
+  boot / c64 / MTP unchanged vs M107. Known gap: mixed verify+prompt multi-class fires (2-4 per conc-64 run) still
+  walk eagerly; Metal / Vulkan / wgpu don't buffer Mamba2.
