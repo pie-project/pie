@@ -1,8 +1,8 @@
-pub mod adapter;
+pub use engine_gpu::adapter;
 pub mod api;
 pub mod arena;
 
-pub mod blob;
+pub use engine_gpu::blob;
 pub mod boot;
 pub mod chip;
 pub mod chunks;

@@ -1,5 +1,5 @@
 //! The pool's slot shapes and extent, and the chunk facts the runtime counts
-//! them by. The compiler's Vulkan recipe (`poem_compiler::chunk`, see
+//! them by. The compiler's GPU recipe (`poem_compiler::chunk`, see
 //! [`crate::chunks::recipe`]) is the one source of the chunk size and of
 //! what a slot holds where ([`crate::store::Rows`] reads it); this module
 //! only places the shapes:
@@ -56,7 +56,7 @@ pub fn window_of(id: ShapeId) -> Option<usize> {
     (0..WINDOWS).find(|&k| window_shape(k) == id)
 }
 
-/// The chunk a Vulkan recipe aims at.
+/// The chunk a GPU recipe aims at.
 pub const TARGET_CHUNK: u64 = 4 << 20;
 
 #[must_use]

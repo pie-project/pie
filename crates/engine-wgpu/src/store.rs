@@ -4,7 +4,7 @@
 //! copies, spills and evacuations that move slots.
 pub mod experts;
 pub use engine_gpu::store::kv;
-pub mod layout;
+pub use engine_gpu::store::layout;
 pub mod pool;
 pub mod rows;
 

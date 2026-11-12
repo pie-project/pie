@@ -1,3 +1,4 @@
+pub use engine_gpu::weights::{AdapterPlane, BankSeat};
 use std::collections::BTreeMap;
 use std::path::Path;
 
@@ -24,13 +25,6 @@ use crate::weight_store::Store;
 pub(crate) const ALIGN: u64 = 256;
 
 #[derive(Debug, Clone, Copy)]
-pub struct AdapterPlane<'a> {
-    pub bank: &'a str,
-
-    pub bytes: &'a [u8],
-}
-
-#[derive(Debug, Clone, Copy)]
 struct Bank {
     offset: u64,
 
@@ -40,18 +34,6 @@ struct Bank {
     rows: u64,
     cols: u64,
     elem: u64,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct BankSeat {
-    pub name: String,
-    pub adapters: u32,
-    pub slot: u64,
-
-    pub rows: u64,
-
-    pub cols: u64,
-    pub elem: u64,
 }
 
 fn banks(trace: &Trace, places: &[Place]) -> BTreeMap<String, Bank> {
