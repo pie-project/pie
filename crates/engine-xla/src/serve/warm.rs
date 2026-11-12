@@ -320,7 +320,12 @@ impl Shell {
         // budgeted up front, the free memory less two compiles' room, in
         // ladder order. The rest are parked: compiled onto the disk cache (not
         // held) where they are not there yet, loaded (~1 s, never compiled) by
-        // the first fire that takes their shape.
+        // the first fire that takes their shape. With a disk cache the ladder
+        // holds none while it compiles: a held program's memory is a
+        // compile's room (Qwen3.6-35B-A3B's v5e ladder held 25 GB of a 47 GB
+        // host by its end, its last compiles one at a time); those the free
+        // memory holds load once the compiles are done.
+        let parks = self.device.parks();
         let budget = available_memory().map_or(u64::MAX, |b| b.saturating_sub(2 * need));
         let held = std::sync::atomic::AtomicU64::new(0);
         let parked = std::sync::atomic::AtomicUsize::new(0);
@@ -350,11 +355,12 @@ impl Shell {
                             break;
                         };
                         let hold = hold_bytes(text);
-                        let kept = held
-                            .fetch_update(SeqCst, SeqCst, |h| {
-                                (h + hold <= budget).then_some(h + hold)
-                            })
-                            .is_ok();
+                        let kept = !parks
+                            && held
+                                .fetch_update(SeqCst, SeqCst, |h| {
+                                    (h + hold <= budget).then_some(h + hold)
+                                })
+                                .is_ok();
                         if !kept {
                             parked.fetch_add(1, SeqCst);
                             if device.on_disk(text) {
@@ -377,7 +383,7 @@ impl Shell {
                         }
                         let program = device.program(text, (*sig).clone());
                         running.fetch_sub(own, SeqCst);
-                        if kept {
+                        if kept || program.is_err() {
                             if let Ok(mut slot) = slots[at].lock() {
                                 *slot = Some(program);
                             }
