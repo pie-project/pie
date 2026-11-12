@@ -1437,10 +1437,43 @@ impl Compiled {
                 ));
             }
         }
+        // An output written in place over its operand (a pool) stays in
+        // HBM: XLA's memory-space assignment otherwise may move a pool that
+        // fits into VMEM between kernels and copy it back at the program's
+        // end (v6e MoE mini decode of 8 lanes: its 48 MB pool, 52 us a step).
+        let config = if aliases.is_empty() {
+            self.config.clone()
+        } else {
+            let tuple = self.results.len() > 1;
+            let colors: Vec<String> = aliases
+                .iter()
+                .map(|&(out, _)| {
+                    if tuple {
+                        format!("{{\"color\":0,\"shape_index\":[{out}]}}")
+                    } else {
+                        "{\"color\":0}".to_string()
+                    }
+                })
+                .collect();
+            let ins: Vec<String> = aliases
+                .iter()
+                .map(|&(_, operand)| format!("{{\"operand_index\":{operand},\"color\":0}}"))
+                .collect();
+            self.config.replacen(
+                "\"needs_layout_passes\": true",
+                &format!(
+                    "\"needs_layout_passes\": true, \"output_memory_space_colors\": [{}], \
+                     \"input_memory_space_colors\": [{}]",
+                    colors.join(","),
+                    ins.join(",")
+                ),
+                1,
+            )
+        };
         Ok(f.custom_call_aliased(
             "tpu_custom_call",
             operands,
-            &self.config,
+            &config,
             self.results.clone(),
             aliases,
         ))
