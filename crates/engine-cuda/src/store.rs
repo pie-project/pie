@@ -1226,20 +1226,34 @@ impl Pools {
         };
         self.fitted = fitted;
         // The kv pages the shell's own seats may name: what the chunks hold
-        // were every one the kv rows', but those a held load's weights take.
-        // The fit claimed every weight the pool holds (the card holds them
-        // with one working set and the programs), so the runtime holds them
-        // for the load's life and no kv row ever takes their chunks; counted
-        // as the rows', they are pages admission hands out that no chunk
-        // backs, and a load filling them starves with nothing to discard.
-        let weight_chunks = if self.budget.is_none() && claim == whole {
-            u32::try_from(self.weight_pool_bytes() / chunk).unwrap_or(u32::MAX)
-        } else {
-            0
-        };
-        let kv_chunks = fitted.saturating_sub(weight_chunks).max(least);
+        // were every one the kv rows', but those the weights take. Weights
+        // the fitted chunks seat whole the runtime holds for the load's life
+        // (`store::weights::boot_cache`), whatever the claim was, a stated
+        // budget's too, so no kv row ever takes their chunks; counted as the
+        // rows', they are pages admission hands out that no chunk backs, and
+        // a load filling them starves with nothing to discard. Where they
+        // leave less than one working set at the declared context, the
+        // pages are what they leave.
+        let weight_chunks = u32::try_from(self.weight_pool_bytes() / chunk).unwrap_or(u32::MAX);
+        let weights_held = if weight_chunks <= fitted { weight_chunks } else { 0 };
+        let kv_chunks = fitted.saturating_sub(weights_held);
         let layout = self.chunks.layout();
-        let (mut fits, mut over) = (one_slot, self.ceiling.saturating_add(1));
+        let floor = if kv_chunks >= least {
+            one_slot
+        } else {
+            if settled {
+                eprintln!(
+                    "engine-cuda: the weights this card holds whole leave the cache rows {} MiB, \
+                     under one sequence at the declared context ({} MiB): the kv pool states \
+                     what they leave. Lower `[engine] max_model_len`, raise `[model] \
+                     device_memory_share`, or set `weight_streaming = \"on\"` to stream them.",
+                    (u64::from(kv_chunks) * chunk) >> 20,
+                    need >> 20,
+                );
+            }
+            1
+        };
+        let (mut fits, mut over) = (floor, self.ceiling.saturating_add(1));
         while over - fits > 1 {
             let mid = fits + (over - fits) / 2;
             if chunks_at(layout, &self.paging, mid, 0) <= kv_chunks {
