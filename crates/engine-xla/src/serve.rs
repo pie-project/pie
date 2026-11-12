@@ -219,6 +219,9 @@ pub struct Shell {
     pad: crate::chip::Pad,
     /// `chip::Engine::seats`.
     seats: [bool; 3],
+    /// The most rows a fire holding a decode takes (`DeviceBoot::
+    /// mixed_tokens`), 0 where it is the fire's.
+    mixed: u32,
     tpu: crate::chip::Tpu,
     handles: Handles,
     trace: Trace,
@@ -328,6 +331,12 @@ impl Shell {
         self.readouts.iter().copied().collect()
     }
 
+    /// The most rows a fire holding a decode takes, 0 where it is the fire's.
+    #[must_use]
+    pub fn mixed(&self) -> u32 {
+        self.mixed
+    }
+
     /// `engine.seated_first`, `engine.seat_to_end`, `engine.seat_spread`.
     #[must_use]
     pub fn seats(&self) -> [bool; 3] {
@@ -393,6 +402,11 @@ impl Shell {
         // `max_tokens`, as the CUDA shell arms its graphs), and lane room
         // for the padding lanes that fill a decode up to its rung.
         let mut budget = boot.budget.clone();
+        let mixed = boot
+            .device
+            .mixed_tokens
+            .filter(|&m| m > 0 && m < budget.max_tokens)
+            .unwrap_or(0);
         if budget.buckets.is_empty() {
             budget.buckets = pad.ladder(budget.max_tokens);
             // One rung past the fire limit, for the padding lanes that
@@ -401,6 +415,15 @@ impl Shell {
             if pad.room > 0 && budget.max_tokens >= 4 * pad.room {
                 budget.max_tokens += pad.room;
                 budget.buckets.push(budget.max_tokens);
+            }
+            // A fire beside decodes stops at `mixed` rows: they and their
+            // padding rung are rungs too, as at a `max_tokens` of `mixed`.
+            if mixed > 0 {
+                for rung in [mixed, mixed + pad.room] {
+                    if let Err(at) = budget.buckets.binary_search(&rung) {
+                        budget.buckets.insert(at, rung);
+                    }
+                }
             }
         }
         // Lane room for the padding lanes: a decode's up to its rung, and a
@@ -716,6 +739,7 @@ impl Shell {
             tuning,
             pad,
             seats: engine.seats,
+            mixed,
             tpu,
             device,
             handles,

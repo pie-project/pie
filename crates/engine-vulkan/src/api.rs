@@ -441,6 +441,7 @@ impl Engine for Vulkan {
                 max_page_refs: paging.pages_per_slot.saturating_mul(budgets.max_lanes),
                 max_context: paging.context(),
                 prefill_rows: 0,
+                mixed_tokens: 0,
                 max_readouts,
             },
             has_lora: true,

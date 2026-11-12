@@ -79,6 +79,26 @@ pub(crate) struct StepGroup {
     forward_requests: usize,
     forward_tokens: usize,
     page_refs: usize,
+    decodes: bool,
+}
+
+/// Whether a request holds a decode: a lane of one row.
+fn decodes(request: &PendingRequest) -> bool {
+    request
+        .request
+        .lanes
+        .iter()
+        .any(|lane| lane.tokens.len() <= 1)
+}
+
+/// The tokens a step takes: `mixed_forward_tokens` once it holds a decode,
+/// else `max_forward_tokens`.
+fn step_tokens(limits: SchedulerLimits, decodes: bool) -> usize {
+    match limits.mixed_forward_tokens {
+        0 => limits.max_forward_tokens,
+        mixed if decodes => mixed.min(limits.max_forward_tokens),
+        _ => limits.max_forward_tokens,
+    }
 }
 
 impl StepGroup {
@@ -101,8 +121,9 @@ impl StepGroup {
             return true;
         }
         let usage = request_capacity_usage(request, page_size);
+        let tokens = step_tokens(limits, self.decodes || decodes(request));
         self.forward_requests.saturating_add(usage.forward_requests) <= limits.max_forward_requests
-            && self.forward_tokens.saturating_add(usage.forward_tokens) <= limits.max_forward_tokens
+            && self.forward_tokens.saturating_add(usage.forward_tokens) <= tokens
             && self.page_refs.saturating_add(usage.page_refs) <= limits.max_page_refs
     }
 
@@ -120,8 +141,9 @@ impl StepGroup {
         self.forward_requests = self.forward_requests.saturating_add(usage.forward_requests);
         self.forward_tokens = self.forward_tokens.saturating_add(usage.forward_tokens);
         self.page_refs = self.page_refs.saturating_add(usage.page_refs);
+        self.decodes |= decodes(request);
         self.forward_requests >= limits.max_forward_requests
-            || self.forward_tokens >= limits.max_forward_tokens
+            || self.forward_tokens >= step_tokens(limits, self.decodes)
             || self.page_refs >= limits.max_page_refs
     }
 }
@@ -357,6 +379,7 @@ mod tests {
             max_page_refs: 64,
             max_context: 0,
             prefill_rows: 0,
+            mixed_forward_tokens: 0,
             max_readouts: 0,
         }
     }
@@ -372,6 +395,7 @@ mod tests {
         a_device_geometry_member_seriates_into_the_suffix();
         a_frames_cells_are_one_per_member_and_never_shared();
         a_device_resolved_lane_counts_against_the_token_cap();
+        a_step_beside_a_decode_stops_at_the_mixed_cap();
     }
 
     fn every_member_owns_a_span_of_the_steps_lanes() {
@@ -551,6 +575,59 @@ mod tests {
             "host first, device-resolved as the suffix run"
         );
         assert_eq!(step.instances, vec![InstanceId(12), InstanceId(13)]);
+    }
+
+    fn a_step_beside_a_decode_stops_at_the_mixed_cap() {
+        let limits = SchedulerLimits {
+            mixed_forward_tokens: 32,
+            ..limits()
+        };
+        let prompt = |slot: u32| {
+            FireRequest::one(crate::engine::fire::lane_of(
+                slot,
+                vec![7; 24],
+                0,
+                vec![2 * slot, 2 * slot + 1],
+            ))
+        };
+        let rows = |frame: &FrameFire| -> Vec<usize> {
+            frame
+                .steps
+                .iter()
+                .map(|step| {
+                    step.submission
+                        .lanes
+                        .iter()
+                        .map(|l| l.tokens.len().max(1))
+                        .sum()
+                })
+                .collect()
+        };
+        // Prompts alone fill the step to `max_forward_tokens`; the decode
+        // takes the next.
+        let (frame, _) = build_frame_submission(
+            vec![vec![
+                pending(prompt(1), InstanceId(1)),
+                pending(prompt(2), InstanceId(2)),
+                pending(decode(11, 9), InstanceId(3)),
+            ]],
+            limits,
+            16,
+            &SchedulerStats::default(),
+        );
+        assert_eq!(rows(&frame), vec![48, 1]);
+        // Beside a decode a step holds 32 rows at most.
+        let (frame, _) = build_frame_submission(
+            vec![vec![
+                pending(decode(11, 9), InstanceId(3)),
+                pending(prompt(1), InstanceId(1)),
+                pending(prompt(2), InstanceId(2)),
+            ]],
+            limits,
+            16,
+            &SchedulerStats::default(),
+        );
+        assert_eq!(rows(&frame), vec![25, 24]);
     }
 
     fn a_device_resolved_lane_counts_against_the_token_cap() {
