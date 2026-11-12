@@ -289,6 +289,7 @@ impl Device {
                 tracing::info!(
                     bytes = text.len(),
                     ms = started.elapsed().as_millis() as u64,
+                    text = %blake3::hash(text.as_bytes()).to_hex()[..12].to_string(),
                     "xla compiled a program"
                 );
                 if let (Some(file), Ok(bytes)) = (&file, exe.serialize()) {

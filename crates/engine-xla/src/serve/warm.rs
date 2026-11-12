@@ -250,12 +250,22 @@ impl Shell {
         self.deferred = Some(Vec::new());
         let mut fired = 0;
         let mut failed = None;
-        for shape in &shapes {
+        for (i, shape) in shapes.iter().enumerate() {
+            let before = self.deferred.as_ref().map_or(0, Vec::len);
             match self.warm_fire(shape) {
                 Ok(()) => fired += 1,
                 Err(fault) => {
                     failed = Some(fault);
                     break;
+                }
+            }
+            let rows: u32 = shape.iter().map(|w| w.rows).sum();
+            let decodes = shape.iter().filter(|w| w.word == decode).count();
+            let pages = shape.iter().map(|w| w.held_pages).max().unwrap_or(0);
+            if let Some(d) = self.deferred.as_ref() {
+                for x in &d[before.min(d.len())..] {
+                    let h = blake3::hash(x.text.as_bytes());
+                    tracing::info!(i, lanes = shape.len(), rows, decodes, pages, bytes = x.text.len(), text = %h.to_hex()[..12].to_string(), "xla ladder trace");
                 }
             }
         }
