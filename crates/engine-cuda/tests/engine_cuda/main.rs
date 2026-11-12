@@ -58,7 +58,6 @@ mod a_padded_row_writes_nothing;
 mod a_prefill_past_the_gemvs_grid_is_served;
 mod a_prologue_put_input_is_the_cell_the_forward_reads;
 mod a_prologue_put_port_is_the_cell_the_fire_resolves;
-mod a_range_backs_its_segments_and_holds_its_top;
 mod a_regions_own_values_outlive_its_last_pass;
 mod a_repacked_projection_serves_what_the_row_major_one_serves;
 mod a_schedule_is_carved_where_it_is_launched;

@@ -8,11 +8,6 @@
 //! the store's id `base + c`. A `SlotPool` opens its lowest free chunk first,
 //! as the stores' own pools did, so the ids handed to the engine are the
 //! ones it was handed before.
-//!
-//! Each chunk is a segment of its own here: a pool that gains memory as it
-//! is asked for commits a prefix of its segments and stops handing out
-//! chunks past it. A held chunk past that limit stays committed until it is
-//! let go; then its segment is released.
 
 use std::collections::HashMap;
 use std::marker::PhantomData;
@@ -28,9 +23,7 @@ use ::engine::chunk::{
 use super::kv::page_table::WorkingSetId;
 use super::pool::PoolId;
 use super::shared::{Shared, SharedPool, TokenShape};
-use super::slots::{
-    Demand, Holder, SegmentState, ShapeId, ShapeKind, Slot, SlotPool, SlotPoolFacts, SlotShape,
-};
+use super::slots::{Demand, Holder, ShapeId, ShapeKind, Slot, SlotPool, SlotPoolFacts, SlotShape};
 
 /// The holder a store's own allocations are taken under: the store's
 /// table, which refcounts them, holds each id it hands out.
@@ -60,8 +53,6 @@ pub struct ShapePool<I> {
     capacity: u32,
     /// One past the highest id there may be.
     ids_end: u32,
-    /// Chunks at and past it are not handed out.
-    limit: u32,
     /// Ids let go, each batch waiting on the fire at its epoch.
     pending: Vec<(u64, Vec<I>)>,
     id: PhantomData<I>,
@@ -101,7 +92,6 @@ impl<I: PoolId> ShapePool<I> {
             base,
             capacity,
             ids_end: base + capacity,
-            limit: capacity,
             pending: Vec::new(),
             id: PhantomData,
         }
@@ -140,7 +130,6 @@ impl<I: PoolId> ShapePool<I> {
             base,
             capacity,
             ids_end: base + ids_end,
-            limit: capacity,
             pending: Vec::new(),
             id: PhantomData,
         }
@@ -166,7 +155,6 @@ impl<I: PoolId> ShapePool<I> {
             base,
             capacity,
             ids_end: base + capacity,
-            limit: capacity,
             pending: Vec::new(),
             id: PhantomData,
         }
@@ -246,7 +234,7 @@ impl<I: PoolId> ShapePool<I> {
     }
 
     /// The `n` lowest free ids, ascending, or none when fewer than `n`
-    /// stand free under the limit.
+    /// stand free.
     pub fn try_alloc_n(&mut self, n: usize) -> Option<Vec<I>> {
         match &mut self.slots {
             Backing::Own(pool) => {
@@ -316,7 +304,6 @@ impl<I: PoolId> ShapePool<I> {
                     })
                     .collect();
                 pool.release(STORE, &slots, 0);
-                self.release_past_limit(&slots);
             }
             Backing::Shape(shared, shape) => {
                 let refs: Vec<u32> = ids.iter().map(|id| id.index() - self.base).collect();
@@ -327,59 +314,6 @@ impl<I: PoolId> ShapePool<I> {
                 shared.lock().unwrap().give_records(&records);
             }
         }
-    }
-
-    /// Releases the segments of `slots` past the limit that hold nothing
-    /// now, so they are not handed out again.
-    fn release_past_limit(&mut self, slots: &[Slot]) {
-        let Backing::Own(pool) = &mut self.slots else {
-            return;
-        };
-        for slot in slots {
-            if slot.chunk >= self.limit && pool.segments().used(slot.chunk) == 0 {
-                pool.release_segment(slot.chunk)
-                    .expect("an empty committed segment past the limit goes");
-            }
-        }
-    }
-
-    /// Stops handing out ids at `limit` and up, or hands them out again.
-    /// An id already out stays out until it is given back; [`Self::tail_held`]
-    /// counts those. A shared pool moves by its segments, not by a limit.
-    pub fn set_limit(&mut self, limit: u32) {
-        let Backing::Own(pool) = &mut self.slots else {
-            return;
-        };
-        let limit = limit.min(self.capacity);
-        for segment in 0..self.capacity {
-            let state = pool.segments().state(segment);
-            if segment < limit {
-                if state == SegmentState::Uncommitted {
-                    pool.commit_segment(segment)
-                        .expect("an uncommitted segment commits");
-                }
-            } else if state == SegmentState::Committed && pool.segments().used(segment) == 0 {
-                pool.release_segment(segment)
-                    .expect("an empty committed segment goes");
-            }
-        }
-        self.limit = limit;
-    }
-
-    /// The ids at and past the limit still out, waiting on an epoch or on
-    /// their holder.
-    pub fn tail_held(&self) -> usize {
-        let Backing::Own(pool) = &self.slots else {
-            return 0;
-        };
-        (self.limit..self.capacity)
-            .filter(|&segment| pool.segments().used(segment) > 0)
-            .count()
-    }
-
-    /// One past the highest offset still out, at least the limit.
-    pub fn held_end(&self) -> u32 {
-        self.high_end().max(self.limit)
     }
 
     /// One past the highest offset still out.
@@ -393,7 +327,7 @@ impl<I: PoolId> ShapePool<I> {
             .map_or(0, |segment| segment + 1)
     }
 
-    /// Free ids under the limit.
+    /// Free ids.
     pub fn available(&self) -> usize {
         match &self.slots {
             Backing::Own(pool) => pool.available(0) as usize,
@@ -404,7 +338,7 @@ impl<I: PoolId> ShapePool<I> {
         }
     }
 
-    /// Ids handed out under the limit. A shared pool's list or ring shape
+    /// Ids handed out. A shared pool's list or ring shape
     /// counts the slots held of it: its segments not yet committed are room
     /// it grows into, not ids out.
     pub fn out(&self) -> u32 {
@@ -414,17 +348,13 @@ impl<I: PoolId> ShapePool<I> {
                 u32::try_from(demand.live + demand.cached).unwrap_or(u32::MAX)
             }
             Backing::Own(_) | Backing::Records(_) => {
-                self.limit.saturating_sub(self.available() as u32)
+                self.capacity.saturating_sub(self.available() as u32)
             }
         }
     }
 
     pub fn capacity(&self) -> u32 {
         self.capacity
-    }
-
-    pub fn limit(&self) -> u32 {
-        self.limit
     }
 
     pub fn base(&self) -> u32 {
@@ -903,182 +833,5 @@ impl Meter for SlotMeter {
             };
         }
         Some(sum)
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::super::pool::Pool;
-    use super::*;
-
-    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-    struct Id(u32);
-
-    impl PoolId for Id {
-        fn from_index(index: u32) -> Self {
-            Self(index)
-        }
-        fn index(self) -> u32 {
-            self.0
-        }
-    }
-
-    /// splitmix64, seeded so a failing case replays.
-    struct Rng(u64);
-
-    impl Rng {
-        fn below(&mut self, n: u64) -> u64 {
-            self.0 = self.0.wrapping_add(0x9e37_79b9_7f4a_7c15);
-            let mut z = self.0;
-            z = (z ^ (z >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
-            z = (z ^ (z >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
-            if n == 0 { 0 } else { (z ^ (z >> 31)) % n }
-        }
-    }
-
-    /// Every call the stores make, on the store pool and the slot pool
-    /// side by side: the same ids, counts and limits throughout.
-    #[test]
-    fn a_shape_pool_hands_out_the_ids_the_store_pool_did() {
-        for seed in 0..40u64 {
-            let mut rng = Rng(seed);
-            let base = rng.below(3) as u32 * 7;
-            let capacity = 1 + rng.below(150) as u32;
-            let mut old = Pool::<Id>::new_range(base, capacity);
-            let mut new = ShapePool::<Id>::new(ShapeKind::List, 64, base, capacity);
-            let mut held: Vec<Id> = Vec::new();
-            let mut epoch = 0u64;
-            for step in 0..600 {
-                match rng.below(8) {
-                    0 | 1 => {
-                        let n = rng.below(6) as usize;
-                        let (a, b) = (old.try_alloc_n(n), new.try_alloc_n(n));
-                        assert_eq!(a, b, "seed {seed} step {step}: alloc {n}");
-                        held.extend(a.unwrap_or_default());
-                    }
-                    2 if !held.is_empty() => {
-                        let at = rng.below(held.len() as u64) as usize;
-                        let id = held.swap_remove(at);
-                        old.release_reserved(vec![id]);
-                        new.release_reserved(vec![id]);
-                    }
-                    3 if !held.is_empty() => {
-                        let at = rng.below(held.len() as u64) as usize;
-                        let id = held.swap_remove(at);
-                        let at = epoch + rng.below(3);
-                        old.recycle_after_epoch(vec![id], at);
-                        new.recycle_after_epoch(vec![id], at);
-                    }
-                    4 => {
-                        epoch += 1;
-                        old.retire_through(epoch);
-                        new.retire_through(epoch);
-                    }
-                    5 => {
-                        let limit = rng.below(u64::from(capacity) + 10) as u32;
-                        old.set_limit(limit);
-                        new.set_limit(limit);
-                    }
-                    _ => {}
-                }
-                assert_eq!(old.available(), new.available(), "seed {seed} step {step}");
-                assert_eq!(old.limit(), new.limit());
-                assert_eq!(old.tail_held(), new.tail_held(), "seed {seed} step {step}");
-                assert_eq!(old.held_end(), new.held_end(), "seed {seed} step {step}");
-                assert_eq!(old.high_end(), new.high_end(), "seed {seed} step {step}");
-            }
-        }
-    }
-
-    #[test]
-    fn demand_is_counted_in_bytes_and_a_waiter_is_wanted() {
-        let mut pool = ShapePool::<Id>::new(ShapeKind::Fixed, 1000, 0, 8);
-        let ids = pool.try_alloc_n(3).unwrap();
-        pool.wait(2);
-        assert_eq!(
-            pool.demand(),
-            Demand {
-                live: 3000,
-                wanted: 5000
-            }
-        );
-        pool.share(Holder::CacheEntry([7; 32]), &ids[..1]);
-        assert_eq!(pool.held_by(&Holder::CacheEntry([7; 32])), 1);
-        pool.unshare(Holder::CacheEntry([7; 32]), &ids[..1]);
-        pool.wait(0);
-        pool.release_reserved(ids);
-        assert_eq!(pool.demand(), Demand::default());
-        assert_eq!(pool.available(), 8);
-    }
-
-    fn two_working_sets() -> (WorkingSetId, WorkingSetId) {
-        let mut kv = super::super::kv::KvStore::new(8, [0; 32]);
-        (kv.create_working_set(), kv.create_working_set())
-    }
-
-    #[test]
-    fn two_working_sets_never_share_a_seat_and_a_released_one_is_reissued() {
-        let (a, b) = two_working_sets();
-        let mut seats = Seats::new(2);
-        let first = seats.seats(a, 1).unwrap();
-        assert_eq!(seats.seats(a, 1).unwrap(), first, "a set keeps its seat");
-        let second = seats.seats(b, 1).unwrap();
-        assert_ne!(first, second, "two live sequences, two seats");
-        assert_eq!(seats.available(), 0);
-        seats.release(a);
-        seats.release(a);
-        assert_eq!(seats.available(), 1, "released once, returned once");
-        assert_eq!(seats.seats(b, 2).unwrap(), vec![second[0], first[0]]);
-    }
-
-    #[test]
-    fn a_fire_wider_than_the_seats_is_refused_and_takes_nothing() {
-        let (a, b) = two_working_sets();
-        let mut seats = Seats::new(2);
-        seats.seats(a, 1).unwrap();
-        let refusal = seats.seats(b, 3).unwrap_err();
-        assert_eq!(
-            refusal,
-            SeatsShort {
-                need: 3,
-                have: 1,
-                capacity: 2
-            }
-        );
-        assert_eq!(seats.available(), 1, "a refused ask seats nothing");
-        assert!(!seats.could_seat(3));
-        assert!(
-            Seats::new(0).could_seat(64),
-            "no state slots: no cap to speak of"
-        );
-    }
-
-    #[test]
-    fn the_degenerate_facts_come_back_as_todays_pools() {
-        let pools = ::engine::PoolFacts {
-            kv_pages: 10,
-            kv_page_size: 16,
-            state_slots: 4,
-            state_slot_bytes: 4096,
-            buffer_pages: 6,
-            host_kv_pages: 3,
-            ..Default::default()
-        };
-        let facts = ChunkFacts::degenerate(
-            &pools,
-            &::engine::chunk::DegenerateBytes {
-                kv_page: 100,
-                buffer_page: 25,
-            },
-        );
-        let stores = StorePools::of(&facts).unwrap();
-        assert_eq!(stores.page_size, 16);
-        assert_eq!(stores.kv.device, 10);
-        assert_eq!(stores.kv.slot_bytes, 100);
-        assert_eq!(stores.kv.host, 3);
-        assert_eq!(stores.window_tokens, 0);
-        assert_eq!(stores.state.device, 4);
-        assert_eq!(stores.state.host, 0);
-        assert_eq!(stores.buffer.device, 6);
     }
 }

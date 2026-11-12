@@ -1,12 +1,11 @@
-//! One engine's pool as its governor steers it: today's pools (a [`Grow`]
-//! where they can change size, nothing to move where they cannot), with
-//! the weight cache in front ([`WeightFirst`]), shared with the engine's
+//! One engine's pool as its governor steers it: its shared pool's segments
+//! (nothing to move where the pools are pinned), with the weight cache in
+//! front ([`WeightFirst`]), shared with the engine's
 //! planner, which sheds the cache before it raises tier pressure.
 
 use std::sync::Arc;
 
 use crate::policy::pressure::{self, Tier};
-use crate::store::grow::Grow;
 use crate::store::registry;
 use crate::store::shared::SharedGrow;
 use crate::store::slots::SlotPool;
@@ -21,19 +20,16 @@ use super::{Demand, Growth, PoolTarget, Retarget, Signal};
 pub struct EnginePool {
     model: usize,
     engine: usize,
-    /// `None`: the pools are whole from the load and never move.
-    grow: Option<Grow>,
     weights: SlotPool,
     shared: Option<SharedGrow>,
 }
 
 impl EnginePool {
     #[must_use]
-    pub const fn new(model: usize, engine: usize, grow: Option<Grow>, weights: SlotPool) -> Self {
+    pub const fn new(model: usize, engine: usize, weights: SlotPool) -> Self {
         Self {
             model,
             engine,
-            grow,
             weights,
             shared: None,
         }
@@ -45,7 +41,6 @@ impl EnginePool {
         Self {
             model,
             engine,
-            grow: None,
             weights: crate::store::weights::slot_pool(&::engine::chunk::ChunkFacts::default()),
             shared: Some(grow),
         }
@@ -60,11 +55,6 @@ impl EnginePool {
     #[must_use]
     pub const fn is_shared(&self) -> bool {
         self.shared.is_some()
-    }
-
-    #[must_use]
-    pub const fn grow(&self) -> Option<&Grow> {
-        self.grow.as_ref()
     }
 
     #[must_use]
@@ -96,21 +86,15 @@ impl SlotAccess for EnginePool {
 }
 
 impl EnginePool {
-    /// The target that moves: the shared pool's, else today's pools'.
+    /// The target that moves: the shared pool's; pinned pools never move.
     fn target(&self) -> Option<&dyn PoolTarget> {
-        match (&self.shared, &self.grow) {
-            (Some(shared), _) => Some(shared),
-            (None, Some(grow)) => Some(grow),
-            (None, None) => None,
-        }
+        self.shared.as_ref().map(|shared| shared as &dyn PoolTarget)
     }
 
     fn target_mut(&mut self) -> Option<&mut dyn PoolTarget> {
-        match (&mut self.shared, &mut self.grow) {
-            (Some(shared), _) => Some(shared),
-            (None, Some(grow)) => Some(grow),
-            (None, None) => None,
-        }
+        self.shared
+            .as_mut()
+            .map(|shared| shared as &mut dyn PoolTarget)
     }
 }
 
@@ -343,103 +327,4 @@ pub fn signal(engine: usize, signal: Signal) {
             pressure::raise(tier, from, bytes);
         }
     });
-}
-
-#[cfg(test)]
-mod tests {
-    use super::super::Tolerance;
-    use super::*;
-
-    fn said(signal: Signal) -> Vec<(Tier, usize, u64)> {
-        let mut said = Vec::new();
-        tell(3, signal, &mut |tier, from, bytes| {
-            said.push((tier, from, bytes));
-        });
-        said
-    }
-
-    #[test]
-    fn tier_pressure_raises_the_device_short_by_what_the_pool_keeps_past_its_target() {
-        let signal = Signal::TierPressure {
-            held_bytes: 10 << 20,
-            target_bytes: 4 << 20,
-        };
-        assert_eq!(said(signal), [(Tier::Device, source(3), 6 << 20)]);
-        assert_ne!(source(3), 3, "apart from the planner's entry");
-    }
-
-    #[test]
-    fn eased_relieves_the_device() {
-        assert_eq!(said(Signal::Eased), [(Tier::Device, source(3), 0)]);
-    }
-
-    #[test]
-    fn a_shortfall_of_no_bytes_still_reads_as_short() {
-        let signal = Signal::TierPressure {
-            held_bytes: 4,
-            target_bytes: 4,
-        };
-        assert_eq!(said(signal), [(Tier::Device, source(3), 1)]);
-    }
-
-    #[test]
-    fn a_fixed_engine_pool_is_fixed_and_never_moves() {
-        let mut pool = EnginePool::new(usize::MAX, 0, None, slot_pool_of_none());
-        assert_eq!(pool.growth(), Growth::Fixed);
-        assert_eq!(pool.retarget(0), Retarget::Reached);
-        let mut seen = None;
-        pool.with_slots(&mut |slots, epoch| seen = Some((slots.total_chunks(), epoch)));
-        assert_eq!(seen, Some((0, 0)));
-    }
-
-    /// A port that counts the use records asked of it: one a tick.
-    #[derive(Clone, Default)]
-    struct Counting(Arc<std::sync::atomic::AtomicU32>);
-
-    impl crate::store::weights::WeightPort for Counting {
-        fn uses(&mut self) -> ::engine::Result<::engine::chunk::WeightUses> {
-            self.0.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            Ok(::engine::chunk::WeightUses::default())
-        }
-
-        fn set_residency(
-            &mut self,
-            _residency: &::engine::chunk::WeightResidency,
-        ) -> ::engine::Result<()> {
-            Ok(())
-        }
-    }
-
-    #[test]
-    fn a_fixed_pool_under_any_tolerance_still_ticks_its_weight_cache() {
-        use super::super::Pressure;
-        use super::super::run::Steer;
-        use crate::store::weights::WeightCache;
-        for tolerance in [Tolerance::Dedicated, Tolerance::Polite] {
-            let mut slots = slot_pool_of_none();
-            let cache = WeightCache::new(&[], 0, true, &mut slots).unwrap();
-            let port = Counting::default();
-            let pool = EnginePool::new(usize::MAX, 0, None, slots);
-            let mut pool = Shared::new(WeightFirst::new(pool, cache, port.clone()));
-            let mut steer = Steer::new(&pool, tolerance, 1);
-            assert_eq!(steer.governor().tolerance(), Tolerance::Dedicated);
-            let mut signals = Vec::new();
-            for _ in 0..5 {
-                steer.turn(&mut pool, Some(Pressure::Critical), &mut |s| {
-                    signals.push(s)
-                });
-            }
-            steer.turn(&mut pool, None, &mut |s| signals.push(s));
-            assert_eq!(
-                port.0.load(std::sync::atomic::Ordering::Relaxed),
-                5,
-                "each tick reads the use record, a waiter's turn does not"
-            );
-            assert!(signals.is_empty(), "a fixed pool never says it is short");
-        }
-    }
-
-    pub(crate) fn slot_pool_of_none() -> SlotPool {
-        crate::store::weights::slot_pool(&::engine::chunk::ChunkFacts::default())
-    }
 }

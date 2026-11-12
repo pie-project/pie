@@ -279,27 +279,6 @@ impl Event {
         }
     }
 
-    pub fn timing() -> Result<Event> {
-        #[cfg(feature = "device")]
-        {
-            use crate::device::rt;
-            let mut raw: rt::cudaEvent_t = core::ptr::null_mut();
-            // SAFETY: `raw` is a live out-parameter; this thread bound the
-            // device. Flag 0 is `cudaEventDefault` (timing enabled).
-            unsafe {
-                crate::device::ctx::check(
-                    "cudaEventCreateWithFlags",
-                    rt::cudaEventCreateWithFlags(&raw mut raw, 0),
-                )?;
-            }
-            Ok(Event { raw: raw.cast() })
-        }
-        #[cfg(not(feature = "device"))]
-        {
-            Err(Fault::Runtimeless)
-        }
-    }
-
     pub fn done(&self) -> Result<bool> {
         #[cfg(feature = "device")]
         {

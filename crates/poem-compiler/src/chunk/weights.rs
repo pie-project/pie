@@ -89,38 +89,10 @@ impl WeightSlot {
         self.slots * self.bytes
     }
 
-    /// The bytes the floor takes.
-    #[must_use]
-    pub fn floor_bytes(&self) -> u64 {
-        self.floor * self.bytes
-    }
-
-    /// The chunks the floor takes.
-    #[must_use]
-    pub fn floor_chunks(&self, chunk: u64) -> u64 {
-        self.floor.div_ceil(self.per_chunk(chunk).max(1))
-    }
-
     /// The chunks every atom takes.
     #[must_use]
     pub fn chunks(&self, chunk: u64) -> u64 {
         self.slots.div_ceil(self.per_chunk(chunk).max(1))
-    }
-
-    /// `E8x9.4M/2` (expert: floor slots x slot / pieces) or `W12x256B`
-    /// (rows: floor slots x slot).
-    #[must_use]
-    pub fn shape(&self) -> String {
-        match self.kind {
-            WeightKind::Expert if self.pieces > 1 => format!(
-                "E{}x{}/{}",
-                self.floor,
-                super::human(self.bytes),
-                self.pieces
-            ),
-            WeightKind::Expert => format!("E{}x{}", self.floor, super::human(self.bytes)),
-            WeightKind::Rows => format!("W{}x{}", self.floor, super::human(self.bytes)),
-        }
     }
 }
 

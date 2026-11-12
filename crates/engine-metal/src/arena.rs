@@ -66,25 +66,6 @@ impl Arena {
         Ok(())
     }
 
-    /// Lets go of the store past `bytes`; the next wider fire maps it again.
-    ///
-    /// # Safety
-    ///
-    /// No frame may be in flight.
-    #[cfg(target_vendor = "apple")]
-    pub unsafe fn forget(&mut self, bytes: u64) -> Result<()> {
-        let Some((store, _)) = self.sparse.as_mut() else {
-            return Ok(());
-        };
-        // SAFETY: the caller's contract.
-        unsafe {
-            crate::device::elastic::shrink_all(&mut [crate::device::elastic::Target {
-                bytes,
-                buffer: store,
-            }])
-        }
-    }
-
     #[must_use]
     pub fn store(&self) -> &Buffer {
         &self.store

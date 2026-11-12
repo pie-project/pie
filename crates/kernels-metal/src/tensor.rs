@@ -166,16 +166,6 @@ pub fn divisor_word(d: u32) -> u64 {
     (m & 0xffff_ffff) | (u64::from(sh1) << 32) | (u64::from(sh2) << 40)
 }
 
-/// `n / d` as a kernel finds it from [`divisor_word`]`(d)`.
-#[must_use]
-pub fn divide_by_word(n: u32, word: u64) -> u32 {
-    let m = word as u32;
-    let sh1 = ((word >> 32) & 0xff) as u32;
-    let sh2 = ((word >> 40) & 0xff) as u32;
-    let t = ((u64::from(n) * u64::from(m)) >> 32) as u32;
-    (t + ((n - t) >> sh1)) >> sh2
-}
-
 impl StateMap {
     /// Ulongs before the segment bases.
     pub const HEAD: usize = 9;
@@ -269,67 +259,5 @@ impl Bank {
     #[must_use]
     pub const fn affine(&self) -> bool {
         self.biases.is_some()
-    }
-}
-
-#[cfg(test)]
-mod divisor_tests {
-    use super::{divide_by_word, divisor_word};
-
-    #[test]
-    fn a_divisor_word_divides_every_dividend_as_division_does() {
-        let divisors = [
-            1u32,
-            2,
-            3,
-            5,
-            7,
-            8,
-            13,
-            63,
-            64,
-            65,
-            100,
-            127,
-            128,
-            255,
-            256,
-            1000,
-            4097,
-            65_535,
-            65_536,
-            1 << 20,
-            (1 << 20) + 3,
-            0x7fff_ffff,
-            0x8000_0000,
-            0x8000_0001,
-            u32::MAX - 1,
-            u32::MAX,
-        ];
-        let mut x: u64 = 0x9E37_79B9_7F4A_7C15;
-        for &d in &divisors {
-            let word = divisor_word(d);
-            let mut check = |n: u32| assert_eq!(divide_by_word(n, word), n / d, "{n} / {d}");
-            for n in [
-                0,
-                1,
-                d.wrapping_sub(1),
-                d,
-                d.wrapping_add(1),
-                u32::MAX - 1,
-                u32::MAX,
-            ] {
-                check(n);
-            }
-            for k in 0..4096u32 {
-                check(k);
-                check(d.wrapping_mul(k));
-                check(d.wrapping_mul(k).wrapping_sub(1));
-                x ^= x << 13;
-                x ^= x >> 7;
-                x ^= x << 17;
-                check(x as u32);
-            }
-        }
     }
 }

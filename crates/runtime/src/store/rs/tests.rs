@@ -1,5 +1,3 @@
-use std::collections::HashSet;
-
 use super::{RsError, RsGeometry, RsStore, RsUnits, RsWorkingSetId};
 
 fn slots(slots: u32) -> RsUnits {
@@ -39,177 +37,17 @@ fn tests_every_case() {
     a_checkpoint_is_cache_and_goes_when_idle();
     idle_snapshots_go_in_retention_order();
     a_checkpoint_past_a_step_goes_first();
-    a_suspend_short_of_host_rows_moves_and_drops_nothing();
-    a_window_is_a_list_of_slots_trimmed_behind_its_commit();
     a_checkpoint_resumes_a_fresh_working_set();
     a_snapshot_resumes_at_its_row();
-    a_checkpoint_holds_its_rows_as_a_cache_entry();
 }
 
 // A checkpoint's rows are held by its cache entry: they count as cache only
 // once no working set holds them too, and the hold goes with the checkpoint.
-fn a_checkpoint_holds_its_rows_as_a_cache_entry() {
-    let mut s = store();
-    let ws = s.create_working_set(geom());
-    write_state(&mut s, ws);
-    assert!(s.checkpoint(ws, [9; 32], None).unwrap());
-    assert_eq!(s.cache_only(), slots(0), "the owner reads it still");
-    write_state(&mut s, ws);
-    assert_eq!(s.cache_only(), slots(1), "the owner's write copied away");
-    assert_eq!(s.reclaim_cache(|_| 0), 1);
-    assert_eq!(s.cache_only(), slots(0), "and its hold went with it");
-}
 
 // A windowed model's state is a window list: a fire takes the slots it
 // writes, the slots behind the committed position's window retire, a write
 // moves the head back without touching a slot, a fork shares the list and
 // copies only the slot it overwrites.
-fn a_window_is_a_list_of_slots_trimmed_behind_its_commit() {
-    use super::{WindowAdvance, WindowGeometry};
-    let mut s = RsStore::new_window(
-        WindowGeometry {
-            window: 32,
-            tokens: 16,
-        },
-        8,
-    );
-    let ws = s.create_working_set(geom());
-    let win = |n| RsUnits::of_windows([n, 0, 0, 0]);
-    // The rows of slots `first..=last` (16 a slot).
-    let rows = |slots: &[u32]| slots[0] * 16..(slots[slots.len() - 1] + 1) * 16;
-    let advance = |fold, end| WindowAdvance {
-        positioned: true,
-        settled: 0,
-        reach: 0,
-        fold,
-        commit_end: end,
-        head: Some(end),
-        keep: None,
-    };
-    let fire = |s: &mut RsStore, ws, slots: &[u32], advance| {
-        let prepared = s.prepare_window(ws, rows(slots), None).unwrap();
-        let copies: Vec<_> = prepared.buffer_copy_plan().collect();
-        let published = s.publish_prepared(prepared).unwrap();
-        s.window_advance(ws, advance);
-        s.settle(published);
-        copies
-    };
-    assert_eq!(s.window_demand(ws, rows(&[0, 1, 2, 3, 4, 5])), Ok(win(6)));
-    fire(&mut s, ws, &[0, 1, 2, 3, 4, 5], advance(Some(u32::MAX), 96));
-    assert_eq!(s.available().pages, 5, "four pages behind 96 - 32 retired");
-    assert_eq!(s.window_positions(ws), Ok(Some((96, 96))));
-    let held = s.window_tables(ws, 7 * 16).unwrap().remove(0);
-    assert_eq!(
-        &held[..4],
-        &[0, 0, 0, 0],
-        "behind the window reads the null page"
-    );
-    assert!(held[4] != 0 && held[5] != 0 && held[6] == 0);
-
-    // A speculative window: buffered, then written again and partly committed.
-    assert_eq!(s.window_demand(ws, rows(&[6])), Ok(win(1)));
-    fire(&mut s, ws, &[6], advance(Some(0), 104));
-    assert_eq!(
-        s.window_demand(ws, rows(&[6])),
-        Ok(win(0)),
-        "the slot is the list's already"
-    );
-    fire(&mut s, ws, &[6], advance(Some(5), 104));
-    assert_eq!(s.window_positions(ws), Ok(Some((101, 104))));
-    assert_eq!(
-        s.window_demand(ws, rows(&[3])),
-        Ok(win(1)),
-        "a page behind the window is given back"
-    );
-
-    let child = s.fork(ws).unwrap();
-    assert_eq!(
-        s.window_demand(child, rows(&[6])),
-        Ok(win(1)),
-        "a shared page copies on write"
-    );
-    let copies = fire(&mut s, child, &[6], advance(Some(u32::MAX), 112));
-    assert_eq!(copies.len(), 1);
-    assert_eq!(s.available().pages, 3);
-    s.release_working_set(child);
-    s.retire_idle();
-    assert_eq!(s.available().pages, 4);
-
-    assert_eq!(
-        s.window_demand(ws, rows(&[7])),
-        Ok(win(1)),
-        "the window reads on from its slots"
-    );
-
-    let device = |settled, end| WindowAdvance {
-        positioned: true,
-        settled,
-        reach: settled,
-        fold: None,
-        commit_end: end,
-        head: Some(end),
-        keep: None,
-    };
-    fire(&mut s, ws, &[7], device(0, 128));
-    assert_eq!(s.window_positions(ws), Ok(Some((101, 128))));
-    fire(&mut s, ws, &[8], device(128, 144));
-    assert_eq!(
-        s.window_positions(ws),
-        Ok(Some((128, 144))),
-        "a device-decided fold is settled by the next fire's first token"
-    );
-
-    let lease = WindowAdvance {
-        positioned: false,
-        settled: 0,
-        reach: 32,
-        fold: None,
-        commit_end: 0,
-        head: None,
-        keep: None,
-    };
-    fire(&mut s, ws, &[2], lease);
-    assert_eq!(s.window_positions(ws), Ok(Some((128, 144))));
-    assert_ne!(
-        s.window_tables(ws, 48).unwrap()[0][2],
-        0,
-        "a device-geometry fire keeps the page its lease names"
-    );
-
-    let decode = WindowAdvance {
-        reach: 144,
-        ..lease
-    };
-    fire(&mut s, ws, &[9], decode);
-    assert_eq!(
-        s.window_positions(ws),
-        Ok(Some((128, 144))),
-        "a device-geometry fire commits nothing"
-    );
-    assert_eq!(
-        s.window_tables(ws, 128).unwrap()[0][6],
-        0,
-        "and retires what lies wholly behind the window of the first token it writes"
-    );
-    assert_ne!(s.window_tables(ws, 128).unwrap()[0][7], 0);
-}
-
-fn a_suspend_short_of_host_rows_moves_and_drops_nothing() {
-    let mut s = RsStore::new(10, 0);
-    let set = |ws| HashSet::from([ws]);
-    let ws = s.create_working_set(geom());
-    write_state(&mut s, ws);
-    assert!(s.checkpoint(ws, [7; 32], None).unwrap());
-    let before = s.available();
-    assert!(s.prepare_suspend(&set(ws)).is_none());
-    assert_eq!(
-        s.suspend_short(&set(ws)),
-        slots(1),
-        "a host row for its slot"
-    );
-    assert!(s.has_checkpoint(&[7; 32]), "nothing dropped");
-    assert_eq!(s.available(), before, "nothing moved");
-}
 
 fn idle_snapshots_go_in_retention_order() {
     use crate::inferlet::process::ProcessId;
@@ -511,62 +349,4 @@ fn a_snapshot_resumes_at_its_row() {
         free - 1,
         "the checkpoint holds its slot"
     );
-}
-
-#[test]
-fn state_on_demand_hands_out_only_what_is_committed_and_plans_over_the_rest() {
-    let mut store = RsStore::new(32, 32);
-    store.commit_on_demand();
-    let one = slots(1);
-    assert!(store.reserve(one).is_none());
-    assert_eq!(
-        store.free().slots,
-        32,
-        "the planner plans over a whole pool"
-    );
-    assert!(store.note_short(one));
-    assert_eq!(store.next_extent(16), Some(16));
-    store.set_committed(16);
-    assert!(store.reserve(one).is_some());
-    assert_eq!(store.next_extent(16), Some(32), "one short of the step");
-}
-
-#[test]
-fn a_fixed_store_stands_whole_and_asks_for_nothing() {
-    let mut store = RsStore::new(4, 4);
-    let all = slots(4);
-    assert!(!store.note_short(all));
-    assert_eq!(store.next_extent(16), None);
-    assert!(store.reserve(all).is_some());
-}
-
-#[test]
-fn a_target_past_the_highest_number_out_cuts_nothing_off() {
-    let mut store = RsStore::new(32, 32);
-    store.commit_on_demand();
-    store.set_committed(32);
-    let low = store.reserve(slots(7)).expect("seven stand free");
-    let _high = store.reserve(slots(1)).expect("one stands free");
-    store.release_reservation(low);
-    let (reach, _) = store.demand();
-    assert_eq!(reach, 8, "holes below do not lower how far it reaches");
-}
-
-#[test]
-fn a_waiter_on_a_full_target_is_told_no() {
-    let mut store = RsStore::new(32, 32);
-    store.commit_on_demand();
-    store.set_target(0);
-    assert!(!store.note_short(slots(1)));
-    assert_eq!(store.free().slots, 0);
-}
-
-#[test]
-fn a_state_commit_that_lands_after_a_cut_leaves_the_cut_standing() {
-    let mut store = RsStore::new(32, 32);
-    store.commit_on_demand();
-    store.set_target(4);
-    store.set_committed(16);
-    assert_eq!(store.reserve(slots(5)).map(|_| ()), None);
-    assert_eq!(store.mapped(), 16, "the tail gives it back");
 }

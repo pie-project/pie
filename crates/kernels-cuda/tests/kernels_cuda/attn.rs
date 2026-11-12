@@ -10,6 +10,5 @@ mod mla_sparse;
 mod ragged;
 mod score;
 mod selected;
-mod strided;
 mod voxel;
 mod voxel_segments;

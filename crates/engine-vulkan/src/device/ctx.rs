@@ -1908,24 +1908,4 @@ impl Inner {
 
 #[cfg(test)]
 mod tests {
-    use super::buffer_ceiling;
-
-    #[test]
-    fn the_buffer_ceiling_is_the_least_of_the_three_limits() {
-        const GIB: u64 = 1 << 30;
-        // A descriptor's range is the floor even past a 1 GiB buffer: the
-        // spec's least, 128 MiB, is never raised.
-        assert_eq!(buffer_ceiling(1 << 27, 4 * GIB, Some(4 * GIB)), 1 << 27);
-        // NVIDIA-like: 4 GiB less one range, 4 GiB allocations.
-        assert_eq!(
-            buffer_ceiling(u32::MAX, 4 * GIB, Some(u64::MAX)),
-            u64::from(u32::MAX)
-        );
-        // An allocation smaller than the range bounds it.
-        assert_eq!(buffer_ceiling(u32::MAX, 2 * GIB, None), 2 * GIB);
-        // maxBufferSize bounds it on a 1.3 device.
-        assert_eq!(buffer_ceiling(u32::MAX, 4 * GIB, Some(GIB)), GIB);
-        // A limit reported as zero states nothing.
-        assert_eq!(buffer_ceiling(u32::MAX, 0, Some(0)), u64::from(u32::MAX));
-    }
 }

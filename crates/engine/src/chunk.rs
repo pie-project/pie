@@ -295,17 +295,6 @@ impl SlotShape {
             .map_or(facts.state_chunks(), |p| p.device.chunks);
         u64::from(chunks) * u64::from(self.slots_per_chunk)
     }
-
-    /// The engine's own id for a device slot of a pinned shape (what the
-    /// degenerate mode hands kernels); `None` outside its run.
-    #[must_use]
-    pub fn legacy_id(&self, slot: u32) -> Option<u32> {
-        let pinned = self.pinned?;
-        pinned
-            .device
-            .contains(self.chunk_of(slot))
-            .then(|| pinned.ids_from + slot - pinned.device.first * self.slots_per_chunk)
-    }
 }
 
 impl ChunkFacts {
@@ -335,17 +324,6 @@ impl ChunkFacts {
             }
             .contains(chunk)
         })
-    }
-
-    /// The chunks a fire of `tokens` takes: the smallest rung that holds
-    /// it, the largest when none does, none where activation lives apart.
-    #[must_use]
-    pub fn act_chunks_at(&self, tokens: u32) -> u32 {
-        self.act_chunks
-            .iter()
-            .find(|&&(rung, _)| rung >= tokens)
-            .or(self.act_chunks.last())
-            .map_or(0, |&(_, chunks)| chunks)
     }
 
     #[must_use]
@@ -808,6 +786,3 @@ pub fn fit(
     }
     Ok(u32::try_from(chunks).unwrap_or(u32::MAX))
 }
-
-#[cfg(test)]
-mod tests;

@@ -292,11 +292,6 @@ enum SchedulerItem {
 /// A change to how much of the pool has memory under it.
 #[derive(Debug, Clone)]
 pub(crate) enum PoolOp {
-    Commit(u32),
-    Release(u32),
-    CommitState(u32),
-    ReleaseState(u32),
-    ReleaseScratch,
     /// A shared pool backs segments `0..n` (`Engine::commit_segments`).
     CommitSegments(u32),
     /// A shared pool gives back segments `n..` (`Engine::release_segments`).
@@ -915,11 +910,6 @@ impl SchedulerHandle {
         let (response, receiver) = tokio::sync::oneshot::channel();
         self.send(SchedulerItem::HostKv { op, response })?;
         Ok(receiver)
-    }
-
-    /// Keeps waves to [`::engine::frame::NARROW_WAVE`], or stops.
-    pub(crate) fn narrow(&self, on: bool) {
-        self.inner.stats.narrow_waves.store(on, Ordering::Relaxed);
     }
 
     /// Between frames, on the lane that owns the engine.

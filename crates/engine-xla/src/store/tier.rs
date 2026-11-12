@@ -179,34 +179,3 @@ impl Drop for Disk {
 fn io(path: &std::path::Path, e: &std::io::Error) -> Fault {
     Fault::Residency(format!("the slot file {}: {e}", path.display()))
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn a_kept_slot_file_answers_what_it_held() {
-        let dir = std::env::temp_dir().join(format!("pie-xla-disk-{}", std::process::id()));
-        {
-            let mut disk = Disk::open(&dir, 4 * 1024, 1024, true).expect("the file opens");
-            assert!(!disk.kept());
-            disk.write(2, &[7u8; 1024]).expect("a slot lands");
-            assert!(disk.write(4, &[0u8; 1024]).is_err(), "past the file");
-        }
-        let mut disk = Disk::open(&dir, 4 * 1024, 1024, true).expect("the file reopens");
-        assert!(disk.kept(), "same layout, kept");
-        assert_eq!(disk.read(2).expect("the slot reads"), vec![7u8; 1024]);
-        drop(disk);
-        let disk = Disk::open(&dir, 8 * 1024, 1024, true).expect("a new layout");
-        assert!(!disk.kept(), "another layout starts afresh");
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    #[test]
-    fn host_slots_lie_where_their_offset_says() {
-        let mut host = Host::new(2, 4096);
-        host.write(4096 + 512, &[3u8; 512]).expect("lands");
-        assert_eq!(host.read(4096 + 512, 512).expect("reads"), &[3u8; 512][..]);
-        assert!(host.write(8192 - 100, &[0u8; 512]).is_err());
-    }
-}

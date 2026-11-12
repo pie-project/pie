@@ -700,29 +700,6 @@ mod tests {
     }
 
     #[test]
-    #[should_panic(expected = "smaller than a segment")]
-    fn a_cut_smaller_than_a_segment_is_refused_at_construction() {
-        let limits = Limits {
-            segment_bytes: 64 * MIB,
-            ..LIMITS
-        };
-        let _ = Governor::new(limits, Tolerance::Balanced, 0);
-    }
-
-    #[test]
-    fn a_target_comes_to_whole_segments_and_never_under_the_floor() {
-        let limits = Limits {
-            segment_bytes: 64 * MIB,
-            shrink_step: 64 * MIB,
-            ..LIMITS
-        };
-        assert_eq!(limits.segments(0), 2, "the floor's 100 MiB takes two");
-        assert_eq!(limits.segments(128 * MIB), 2);
-        assert_eq!(limits.segments(128 * MIB + 1), 3);
-        assert_eq!(limits.segments(LIMITS.hard_limit), 16);
-    }
-
-    #[test]
     fn refault_needs_real_eviction_and_real_return() {
         assert!(!refaulting(0, 0));
         assert!(!refaulting(100, 100), "too few pages to mean anything");

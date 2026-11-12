@@ -667,8 +667,7 @@ impl Engine for Cuda {
         chunk_facts.disk_persistent = residency.disk_kv_persistent && chunk_facts.disk_chunks > 0;
         let trace_name = shell.trace().name.clone();
         let (weight_bytes, arena_bytes, pool_bytes, input_bytes) = shell.footprint();
-        let (pool_committed_bytes, pool_high_water_bytes, elastic_page_bytes, elastic_budget_pages) =
-            shell.elastic();
+        let (pool_committed_bytes, pool_high_water_bytes) = shell.elastic();
         let weights_from_cache = shell.weights_from_cache();
         let weights_resident = shell.weights_resident();
         let paging = shell.paging();
@@ -704,13 +703,6 @@ impl Engine for Cuda {
                     .map(|&(_, adapters, _)| adapters)
                     .min()
                     .unwrap_or(0),
-                elastic_page_bytes,
-                elastic_budget_pages,
-                slab_kv_page_bytes: 0,
-                elastic_state_slot_bytes: 0,
-                window_pages: paging.window.map_or(0, |_| {
-                    u32::try_from(paging.window_pages()).unwrap_or(u32::MAX)
-                }),
                 window_tokens: paging.window.map_or(0, |window| window.tokens),
                 host_kv_pages,
                 disk_kv_pages,
@@ -800,10 +792,6 @@ impl Engine for Cuda {
         self.loaded_mut()?
             .register_adapter(registration.id, &planes)
             .map_err(fault)
-    }
-
-    fn commit_pool(&mut self, kv_pages: u32) -> EngineResult<()> {
-        self.loaded_mut()?.commit_pool(kv_pages).map_err(fault)
     }
 
     fn commit_segments(&mut self, segments: u32) -> EngineResult<()> {

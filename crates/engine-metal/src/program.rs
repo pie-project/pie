@@ -20,7 +20,7 @@ use crate::error::{Fault, Result};
 
 pub use compile::{Cache, Compiled, Module, Region, Stage, Target};
 pub use launch::{ChannelShape, Cursor, Prepared, Rings};
-pub use session::{Blocked, Fired, Launched, Session, seeds_of};
+pub use session::{Blocked, Fired, Launched, Session};
 pub use shared::{MAX_ATTACHMENTS, SharedRing};
 
 #[derive(Debug)]

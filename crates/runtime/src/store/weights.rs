@@ -741,10 +741,6 @@ impl<P: PoolTarget + SlotAccess, W: WeightPort> WeightFirst<P, W> {
         &self.inner
     }
 
-    pub const fn inner_mut(&mut self) -> &mut P {
-        &mut self.inner
-    }
-
     pub const fn cache(&self) -> &WeightCache {
         &self.cache
     }

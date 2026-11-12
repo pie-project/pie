@@ -147,15 +147,10 @@ impl KvSpillTxn {
 
 pub struct KvStore {
     table: KvPageTable,
-    /// The list shape's slots, one a page. Its limit is what is committed:
-    /// no id past it has memory yet.
+    /// The list shape's slots, one a page.
     pool: ShapePool<PhysicalKvPageId>,
-    /// How far the limit may rise; see [`crate::store::grow`].
-    target_pages: u32,
     /// Pages a waiter found short, past what is committed.
     short_pages: u32,
-    /// What the engine has memory under; past the limit while a tail empties.
-    mapped_pages: u32,
     /// Host slots: a pinned run's, or the slot refs of the list shape of
     /// an engine's host tier (CONTRACT-BC 22).
     host_pool: ShapePool<HostKvSlotId>,
@@ -396,14 +391,11 @@ impl KvStore {
         disk_capacity: u32,
         seed: Hash256,
     ) -> Self {
-        let capacity = pool.capacity();
         let slot_bytes = pool.slot_bytes();
         Self {
             table: KvPageTable::new(),
             pool,
-            target_pages: capacity,
             short_pages: 0,
-            mapped_pages: capacity,
             host_pool: ShapePool::new(ShapeKind::List, slot_bytes, 0, host_capacity),
             disk_pool: Pool::new(disk_capacity),
             shape: None,
@@ -2916,21 +2908,13 @@ impl KvStore {
         Ok(self.table.page_len(ws)?)
     }
 
-    /// What is free now and what committing up to the target would add:
-    /// memory not yet mapped reads as room everywhere but the reservation.
+    /// What is free now.
     pub fn available_pages(&self) -> usize {
-        self.free_committed() + self.target_pages.saturating_sub(self.pool.limit()) as usize
+        self.free_committed()
     }
 
     pub fn free_committed(&self) -> usize {
         self.pool.available()
-    }
-
-    /// Starts with nothing committed: the pool's memory comes as pages are
-    /// asked of it.
-    pub fn commit_on_demand(&mut self) {
-        self.pool.set_limit(0);
-        self.mapped_pages = 0;
     }
 
     pub fn note_short(&mut self, pages: u32) {
@@ -2946,118 +2930,16 @@ impl KvStore {
         }
     }
 
-    /// Whether committing further would add a page.
-    pub fn can_commit(&self) -> bool {
-        self.pool.limit() < self.target_pages
-    }
-
-    /// The extent to commit next, keeping `step` pages free and covering
-    /// what a waiter is short of; `None` while enough stand free.
-    pub fn next_extent(&self, step: u32) -> Option<u32> {
-        let wanted = step.max(self.short_pages);
-        let lacking = wanted.saturating_sub(self.free_committed() as u32);
-        if lacking == 0 || !self.can_commit() {
-            return None;
-        }
-        let limit = self.pool.limit();
-        let raised = limit
-            .saturating_add(lacking.next_multiple_of(step.max(1)))
-            .min(self.target_pages);
-        // A target creeping up is not worth a commit until a step has gathered
-        // or a waiter needs it: to a slab, every commit is a copy of the pool.
-        (raised - limit >= step || self.short_pages > 0).then_some(raised)
-    }
-
-    /// Whether what stands free has run low enough to commit ahead.
-    pub fn commit_due(&self, step: u32) -> bool {
-        self.can_commit() && (self.free_committed() as u32) < step / 2
-    }
-
-    pub fn set_committed(&mut self, pages: u32) {
-        // A target that fell while the commit ran stands: the memory is
-        // mapped and the tail gives it back.
-        let limit = pages.min(self.target_pages);
-        let gained = limit.saturating_sub(self.pool.limit());
-        self.pool.set_limit(limit);
-        self.mapped_pages = self.mapped_pages.max(pages);
-        self.short_pages = self.short_pages.saturating_sub(gained);
-        self.pool.wait(u64::from(self.short_pages));
-    }
-
-    /// Moves the target; past it, nothing further is handed out and what
-    /// is out comes back as its holders move.
-    pub fn set_target(&mut self, pages: u32) {
-        self.target_pages = pages.min(self.pool.capacity());
-        if self.pool.limit() > self.target_pages {
-            self.pool.set_limit(self.target_pages);
-        }
-    }
-
-    pub fn committed_pages(&self) -> u32 {
-        self.pool.limit()
-    }
-
-    pub fn mapped_pages(&self) -> u32 {
-        self.mapped_pages
-    }
-
-    /// Pages handed out, the tail's included, whatever the target stands at.
-    /// A target below the pool is room it can rise into: what is said of the
-    /// pool to anyone deciding on its fullness comes from here.
+    /// Pages handed out: what is said of the pool to anyone deciding on its
+    /// fullness comes from here.
     pub fn pages_out(&self) -> u32 {
-        self.pool.out() + self.pool.tail_held() as u32
+        self.pool.out()
     }
 
     /// Pages out below the limit, and pages a waiter is short of on top. The
     /// tail is on its way out and asks for nothing.
     pub fn pages_wanted(&self) -> u32 {
         self.pool.out().saturating_add(self.short_pages)
-    }
-
-    /// What of the tail past the limit is still out.
-    pub fn tail_held(&mut self) -> usize {
-        self.retire_idle();
-        self.pool.tail_held()
-    }
-
-    /// Where memory can stop now: past the highest page still out.
-    pub fn held_end(&self) -> u32 {
-        self.pool.held_end()
-    }
-
-    /// Drops what the idle cache keeps past the limit, where its key lets
-    /// the runtime drop it unasked (`pressure::may_drop`). Answers pages
-    /// freed, and how many entries past the limit stay: room for those is
-    /// the policy's to make.
-    pub fn reclaim_tail(&mut self, epoch: u64, keys: impl Keys) -> (usize, usize) {
-        let limit = self.pool.limit();
-        let (drop, kept): (Vec<u64>, Vec<u64>) = self
-            .cache
-            .iter()
-            .filter(|(_, entry)| self.table.holds_past(entry.path.terminal, limit))
-            .map(|(&id, _)| id)
-            .partition(|id| {
-                let entry = &self.cache[id];
-                let key = keys.key_at(entry.owner, self.key_token(entry.path.pages));
-                crate::policy::pressure::may_drop(key)
-            });
-        (self.drop_entries(drop, By::Host, epoch), kept.len())
-    }
-
-    /// The working sets that read a page past the limit.
-    pub fn working_sets_past_limit(&self) -> HashSet<WorkingSetId> {
-        self.table.working_sets_past(self.pool.limit())
-    }
-
-    pub fn note_released(&mut self, pages: u32) {
-        self.mapped_pages = pages;
-    }
-
-    /// Stops committing where it stands; a refused commit lands here.
-    pub fn hold_extent(&mut self) {
-        self.target_pages = self.pool.limit();
-        self.short_pages = 0;
-        self.pool.wait(0);
     }
 
     pub fn capacity_pages(&self) -> u32 {

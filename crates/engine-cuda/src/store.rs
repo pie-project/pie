@@ -603,8 +603,6 @@ pub struct Pools {
     /// activation, which must be the fit's, not past it.
     whole_fit: bool,
     airborne: Option<Airborne>,
-    committed_kv_pages: u32,
-    committed_state_slots: u32,
     host: Option<HostKv>,
     disk: Option<DiskKv>,
     /// The shared pool's host tier (CONTRACT-BC 22): chunks of the state
@@ -998,8 +996,6 @@ impl Pools {
             fitted: total,
             whole_fit: false,
             airborne: None,
-            committed_kv_pages: 0,
-            committed_state_slots: 0,
             host: None,
             disk: None,
             tier: None,
@@ -1358,16 +1354,6 @@ impl Pools {
     }
 
     #[must_use]
-    pub fn elastic_page_bytes(&self) -> u64 {
-        self.pool.page_bytes()
-    }
-
-    #[must_use]
-    pub fn elastic_budget_pages(&self) -> u64 {
-        self.pool.hard_pages()
-    }
-
-    #[must_use]
     pub fn state_slot_bytes(&self) -> u64 {
         self.shapes
             .iter()
@@ -1525,11 +1511,6 @@ impl Pools {
             self.seat_pages(Kind::Window(window as u8), fresh.iter().copied())?;
         }
         Ok(())
-    }
-
-    #[must_use]
-    pub fn bases(&self) -> Vec<u64> {
-        vec![self.chunks.base()]
     }
 
     pub fn table(&self, seats: &Seats) -> Result<CacheTable> {
@@ -4060,10 +4041,6 @@ impl Pools {
         self.seat_pages(Kind::List, pages.iter().map(|&page| u64::from(page)))
     }
 
-    fn commit_to(&mut self, kv_pages: u32, state_slots: u32) -> Result<Commit> {
-        self.commit_ranges(kv_pages, state_slots, None)
-    }
-
     pub fn commit_frame(
         &mut self,
         demand: engine::frame::Demand,
@@ -4086,37 +4063,6 @@ impl Pools {
         } else {
             self.ensure_windowed(window_pages.iter().flatten().copied())
         }
-    }
-
-    fn commit_ranges(
-        &mut self,
-        kv_pages: u32,
-        state_slots: u32,
-        kv_ranges: Option<&[(u64, u64)]>,
-    ) -> Result<Commit> {
-        let kv_pages = kv_pages.max(self.committed_kv_pages);
-        let state_slots = state_slots.max(self.committed_state_slots);
-        let _ = kv_ranges;
-        // The pool's chunks these counts reach, backed a segment at a time.
-        let layout = self.chunks.layout();
-        let chunks = (u64::from(chunks_at(
-            layout,
-            &self.paging,
-            u64::from(kv_pages),
-            state_slots,
-        )))
-        .max(u64::from(self.chunks.opened()))
-        .min(u64::from(self.chunks.total()));
-        let segments = self.chunks.segments_for(chunks);
-        if (kv_pages > 0 || state_slots > 0) && segments > self.chunks.committed_segments() {
-            match self.chunks.commit_segments(&mut self.pool, segments)? {
-                Commit::Committed => {}
-                refusal => return Ok(refusal),
-            }
-        }
-        self.committed_kv_pages = kv_pages;
-        self.committed_state_slots = state_slots;
-        Ok(Commit::Committed)
     }
 }
 
@@ -4353,27 +4299,6 @@ fn narrow(n: u64) -> i32 {
 
 fn wide(n: u64) -> i64 {
     i64::try_from(n).unwrap_or(i64::MAX)
-}
-
-impl Pools {
-    /// See `Engine::commit_pool`.
-    pub fn commit(&mut self, demand: engine::frame::Demand) -> Result<()> {
-        if let Some(highest) = demand.state_slots.checked_sub(1) {
-            self.state_row(highest)?;
-        }
-        let capacity = self.paging.pages();
-        if u64::from(demand.kv_pages) > capacity {
-            return Err(Fault::Ceiling {
-                what: "kv pages",
-                need: u64::from(demand.kv_pages),
-                have: capacity,
-            });
-        }
-        match self.commit_to(demand.kv_pages, demand.state_slots)? {
-            Commit::Committed => Ok(()),
-            refusal => Err(refuse(&self.pool, refusal)),
-        }
-    }
 }
 
 #[cfg(test)]

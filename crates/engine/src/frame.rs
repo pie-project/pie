@@ -1,7 +1,3 @@
-/// The lanes and tokens of a wave while memory is short: wide enough to keep
-/// a prompt moving, narrow enough to keep to a small carve of the scratch.
-pub const NARROW_WAVE: (usize, usize) = (16, 4096);
-
 pub trait Prepared {
     fn demand(&self) -> Demand;
 }

@@ -95,11 +95,6 @@ impl Shell {
     }
 
     #[must_use]
-    pub fn copying(&self) -> bool {
-        self.copies
-    }
-
-    #[must_use]
     pub fn body_stats(&self) -> record::BodyStats {
         self.cache.body_stats()
     }
@@ -348,28 +343,11 @@ impl Shell {
         self.pools.copy_kv(self.device.stream(), list, windowed)
     }
 
-    /// See `Engine::commit_pool`.
-    pub fn commit_pool(&mut self, kv_pages: u32) -> crate::Result<()> {
-        let state_slots = if self.pools.has_state() {
-            self.pools.paging().slots
-        } else {
-            0
-        };
-        self.pools.commit(engine::frame::Demand {
-            kv_pages,
-            state_slots,
-            workspace: 0,
-        })
-    }
-
+    /// The pool's bytes with memory behind them now, and the most that ever
+    /// had at once.
     #[must_use]
-    pub fn elastic(&self) -> (u64, u64, u64, u64) {
-        (
-            self.pools.committed_bytes(),
-            self.pools.high_water_bytes(),
-            self.pools.elastic_page_bytes(),
-            self.pools.elastic_budget_pages(),
-        )
+    pub fn elastic(&self) -> (u64, u64) {
+        (self.pools.committed_bytes(), self.pools.high_water_bytes())
     }
 
     #[must_use]

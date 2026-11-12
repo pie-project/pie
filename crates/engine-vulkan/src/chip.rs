@@ -186,22 +186,6 @@ mod tests {
         }
     }
 
-    #[test]
-    fn a_desktop_gpu_submits_whole_steps_and_a_mobile_one_splits() {
-        let split = |d: &Device| resolve(d, None).0.get::<SubmitSplitRows>().0;
-        for vendor in ["nvidia", "amd", "intel"] {
-            assert_eq!(split(&device(vendor, 32, None, false)), 0, "{vendor}");
-        }
-        for (vendor, coopmat) in [("qualcomm", false), ("qualcomm", true), ("imagination", false), ("other", false)] {
-            assert_eq!(split(&device(vendor, 32, None, coopmat)), 32, "{vendor}");
-        }
-        let discrete = Device {
-            discrete: true,
-            ..device("other", 32, None, false)
-        };
-        assert_eq!(split(&discrete), 0);
-    }
-
     /// The dense matmul the per-vendor cascade before `kernel.qmm` picked:
     /// coopmat, register tiles on Adreno and PowerVR, then tiled, from 12 rows over whole
     /// 32-code tiles; for one row, the one-row kernel on Adreno (32 lanes a

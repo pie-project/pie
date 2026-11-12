@@ -12,7 +12,6 @@ mod a_package_runs_each_file_in_its_own_stage;
 mod a_precision_traces_the_product_it_quantizes_for;
 mod a_ragged_attention_joins_two_arms;
 mod a_row_permutation_keeps_the_row_space;
-mod a_state_is_named_by_its_path_and_laid_out_by_its_readers;
 mod an_in_place_fold_is_the_last_read_of_its_operand;
 mod every_row_permutation_runs_in_every_class_its_guard_admits;
 mod the_axis_rope_states_its_axes_once;

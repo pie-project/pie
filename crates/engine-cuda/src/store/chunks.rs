@@ -459,12 +459,6 @@ impl Chunks {
         Ok(self.table.physical(chunk).unwrap_or(chunk))
     }
 
-    /// The chunks opened so far, the null chunk among them.
-    #[must_use]
-    pub fn opened(&self) -> u32 {
-        self.next
-    }
-
     /// The slot ref page `id` is seated on.
     pub fn slot_ref(&self, kind: Kind, id: u32) -> Result<u32> {
         if (matches!(kind, Kind::Window(_)) && id == 0) || self.refs {

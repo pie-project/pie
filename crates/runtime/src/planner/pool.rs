@@ -1,6 +1,5 @@
 use std::collections::HashSet;
 
-use crate::store::grow::Grow;
 use crate::store::rs::RsUnits;
 
 /// The slots of each window list a seated lane past its window holds beyond
@@ -83,10 +82,6 @@ pub trait PoolPort: Send + Sync + 'static {
     fn room(&self) -> Option<crate::store::shared::PoolRoom> {
         None
     }
-    /// The working sets reading pages past the pool's limit.
-    fn working_sets_past_limit(&self) -> HashSet<crate::store::kv::page_table::WorkingSetId> {
-        HashSet::new()
-    }
     fn reserve_device(
         &self,
         count: u32,
@@ -136,7 +131,6 @@ pub struct RegistryPool {
     suspend_capable: bool,
     /// The last count of reclaimable idle pages and when it was taken.
     reclaimable: parking_lot::Mutex<Option<(crate::rt::Instant, u32)>>,
-    grow: Option<Grow>,
     /// A shared pool's segment walker: what waiters are short reaches its
     /// demand, so it commits segments ahead of them.
     shared: Option<crate::store::shared::SharedGrow>,
@@ -154,7 +148,6 @@ impl RegistryPool {
             engine,
             suspend_capable,
             reclaimable: parking_lot::Mutex::new(None),
-            grow: None,
             shared: None,
         }
     }
@@ -162,12 +155,6 @@ impl RegistryPool {
     /// Grows a shared pool's segments for the pages waiters are short.
     pub fn with_shared_grow(mut self, grow: crate::store::shared::SharedGrow) -> Self {
         self.shared = Some(grow);
-        self
-    }
-
-    /// Commits the pool's pages on demand rather than holding them whole.
-    pub fn with_grow(mut self, grow: Grow) -> Self {
-        self.grow = Some(grow);
         self
     }
 
@@ -297,7 +284,7 @@ impl PoolPort for RegistryPool {
         &self,
         count: u32,
     ) -> Option<Vec<crate::store::kv::page_table::PhysicalKvPageId>> {
-        let (pages, due) = self.with_kv_tagged("planner-reserve", |kv| {
+        let pages = self.with_kv_tagged("planner-reserve", |kv| {
             let pages = kv.reserve_device_pages(count as usize);
             if self.shared.is_some() {
                 if pages.is_none() {
@@ -306,27 +293,14 @@ impl PoolPort for RegistryPool {
                     kv.clear_short();
                 }
             }
-            let due = self.grow.as_ref().is_some_and(|grow| {
-                if pages.is_none() {
-                    kv.note_short(count);
-                }
-                pages.is_none() || kv.commit_due(grow.step())
-            });
-            (pages, due)
+            pages
         });
-        if due && let Some(grow) = &self.grow {
-            grow.wake();
-        }
         if pages.is_none()
             && let Some(shared) = &self.shared
         {
             shared.wake();
         }
         pages
-    }
-
-    fn working_sets_past_limit(&self) -> HashSet<crate::store::kv::page_table::WorkingSetId> {
-        self.with_kv_tagged("planner-tail", |kv| kv.working_sets_past_limit())
     }
 
     fn grow(&self, need: super::Demand) -> bool {
@@ -344,24 +318,7 @@ impl PoolPort for RegistryPool {
                 true
             };
         }
-        let Some(grow) = &self.grow else {
-            return false;
-        };
-        let mut growing = false;
-        if need.kv_pages > 0 {
-            growing |= self.with_kv_tagged("planner-grow", |kv| {
-                kv.note_short(need.kv_pages);
-                kv.can_commit()
-            });
-        }
-        if !need.rs.is_zero() {
-            growing |= self.with_rs(|rs| rs.note_short(need.rs));
-        }
-        if growing {
-            grow.wake();
-            return true;
-        }
-        (need.rs.is_zero() || grow.state_on_demand()) && grow.ask()
+        false
     }
 
     fn reserve_device_up_to(
@@ -384,23 +341,15 @@ impl PoolPort for RegistryPool {
     }
 
     fn reserve_rs(&self, need: RsUnits) -> Option<crate::store::rs::RsGrant> {
-        let (grant, due) = self.with_rs(|rs| {
+        self.with_rs(|rs| {
             let grant = rs.reserve(need);
             // A shared pool's waiter got what it was short: its shortfall
             // no longer asks the segment walker for more.
             if grant.is_some() && self.shared.is_some() {
                 rs.note_short_shared(RsUnits::default());
             }
-            let due = self
-                .grow
-                .as_ref()
-                .is_some_and(|grow| rs.next_extent(grow.state_step()).is_some());
-            (grant, due)
-        });
-        if due && let Some(grow) = &self.grow {
-            grow.wake();
-        }
-        grant
+            grant
+        })
     }
 
     fn release_rs(&self, grant: crate::store::rs::RsGrant) {

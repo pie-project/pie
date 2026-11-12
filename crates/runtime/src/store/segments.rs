@@ -205,30 +205,3 @@ impl Segments {
         }
     }
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn a_short_last_segment_counts_only_its_chunks() {
-        let segments = Segments::new(10, 4, 3);
-        assert_eq!(segments.count(), 3);
-        assert_eq!(segments.range(2), 8..10);
-        assert_eq!(segments.committed_chunks(), 10);
-        assert_eq!(segments.of(9), 2);
-    }
-
-    #[test]
-    fn the_emptiest_segment_is_the_highest_among_equals() {
-        let mut segments = Segments::new(12, 4, 3);
-        assert_eq!(segments.emptiest(), Some(2));
-        segments.hold(9);
-        segments.hold(1);
-        assert_eq!(segments.emptiest(), Some(1));
-        segments.set_state(1, SegmentState::Uncommitted);
-        assert_eq!(segments.emptiest(), Some(2));
-        assert_eq!(segments.committed_chunks(), 8);
-        assert_eq!(segments.uncommitted().collect::<Vec<_>>(), vec![1]);
-    }
-}

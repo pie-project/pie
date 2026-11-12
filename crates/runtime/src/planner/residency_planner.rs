@@ -106,14 +106,6 @@ impl ResidencyPlanner {
         self
     }
 
-    /// Says tier pressure through `sink` instead of the policy's gauge.
-    #[cfg(test)]
-    #[must_use]
-    pub(super) fn pressure_sink(mut self, sink: Sink) -> Self {
-        self.sink = sink;
-        self
-    }
-
     /// What `units` take, in bytes, at this engine's scale; a unit of
     /// unknown size counts as a byte, so a shortfall never reads as none.
     pub(super) fn bytes_of(&self, units: Reclaim) -> u64 {
@@ -241,38 +233,6 @@ impl ResidencyPlanner {
             bytes,
             waited,
         })
-    }
-
-    /// What idle cache keeps past the pools' limits goes only as its keys
-    /// let the runtime drop it; for the rest, the device is short and the
-    /// policy is asked. A falling limit waits on that, as on the processes
-    /// it moves out ([`Self::vacate_tail`]).
-    pub fn reclaim_tail(&self) {
-        use crate::policy::retention::Installed;
-        let (model, engine) = self.port.locus();
-        let Some(stores) = crate::store::registry::try_get(model, engine) else {
-            return;
-        };
-        let kv = crate::store::registry::with_kv_lock(&stores.kv, "planner-tail", |kv| {
-            if kv.mapped_pages() <= kv.committed_pages() {
-                return 0;
-            }
-            let epoch = kv.current_epoch();
-            let (_, kept) = kv.reclaim_tail(epoch, Installed);
-            if kept == 0 { 0 } else { kv.tail_held() as u32 }
-        });
-        let (_, slots) = stores.rs.lock().unwrap().reclaim_tail(Installed);
-        let bytes = self.bytes_of(Reclaim {
-            pages: kv,
-            rs: RsUnits {
-                slots,
-                pages: 0,
-                ..RsUnits::default()
-            },
-        });
-        let tail = if kv == 0 && slots == 0 { 0 } else { bytes };
-        self.short.lock().note_tail(tail);
-        self.report_short();
     }
 
     /// With `PoolFacts::seat_to_end`, a process starts only while the pools
@@ -936,31 +896,6 @@ impl ResidencyPlanner {
                 .collect()
         });
         self.pause(held, |proc| proc.held);
-    }
-
-    /// Suspends the processes reading pages past the pool's limit: they come
-    /// back below it. A process moves whole, never a page at a time, so a
-    /// shrink does not turn into a fault per decode.
-    pub fn vacate_tail(self: &Arc<Self>) {
-        // What a waiter has gathered may lie in the tail: it gathers again.
-        let gathered = self.with_inner(|inner| std::mem::take(&mut inner.accum));
-        drop(gathered);
-        self.poke();
-        let (model, engine) = self.port.locus();
-        let tail = self.port.working_sets_past_limit();
-        if tail.is_empty() {
-            return;
-        }
-        let pids: Vec<ProcessId> = self.with_inner(|inner| inner.procs.keys().copied().collect());
-        let readers = pids
-            .into_iter()
-            .filter(|&pid| {
-                crate::inferlet::process::residency::kv_working_set_ids(pid, model, engine)
-                    .iter()
-                    .any(|ws| tail.contains(ws))
-            })
-            .collect();
-        self.pause(readers, |_| true);
     }
 
     /// Suspends those of `pids` that are running and a lower tier can hold.

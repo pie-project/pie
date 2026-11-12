@@ -61,8 +61,9 @@ use crate::governor::{Demand as Asked, Growth};
 /// lock.
 pub type Shared = Arc<Mutex<SharedPool>>;
 
-/// What a pool keeps committed ahead of what it has handed out, in bytes.
-pub const COMMIT_AHEAD_BYTES: u64 = super::grow::COMMIT_AHEAD_BYTES;
+/// What a pool keeps committed ahead of what it has handed out, in bytes:
+/// a mapping's cost on the lane against how often the lane pays it.
+pub const COMMIT_AHEAD_BYTES: u64 = 64 * 1024 * 1024;
 
 /// Engines a process drives at most, for the per-engine rung gates.
 const RUNG_ENGINES: usize = 64;

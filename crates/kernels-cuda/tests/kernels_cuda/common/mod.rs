@@ -460,15 +460,6 @@ impl Lcg {
         from_bf16(to_bf16(raw))
     }
 
-    /// The generator's next raw state.
-    pub fn bits(&mut self) -> u64 {
-        self.0 = self
-            .0
-            .wrapping_mul(6_364_136_223_846_793_005)
-            .wrapping_add(1_442_695_040_888_963_407);
-        self.0
-    }
-
     pub fn row(&mut self, count: usize) -> (Vec<u16>, Vec<f32>) {
         let mut raw = Vec::with_capacity(count);
         let mut exact = Vec::with_capacity(count);
@@ -700,7 +691,6 @@ pub mod attn_ref;
 pub mod expert_pool;
 pub mod host;
 pub mod linear_ref;
-pub mod segments;
 pub mod spatial;
 pub mod spread;
 pub mod tc5;

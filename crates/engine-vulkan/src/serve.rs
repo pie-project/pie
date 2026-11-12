@@ -1350,13 +1350,6 @@ impl Shell {
         Ok(engine::chunk::WeightUses { uses, held })
     }
 
-    /// The fires recorded and the fires replayed by the current recorder
-    /// (a weight residency that stops or starts recording begins another).
-    #[must_use]
-    pub fn recordings(&self) -> (u64, u64) {
-        self.recorder.counts()
-    }
-
     #[must_use]
     pub fn pool_layout(&self) -> crate::store::layout::Layout {
         *self.pools.layout()
