@@ -2255,13 +2255,9 @@ pub fn attend_fresh(
                 // the kernel straight out of it)
                 && (!f.is_view(keys) && !f.is_view(values)
                     || f.view_parts(keys).map(|v| v.0) == f.view_parts(values).map(|v| v.0)
+                        // pages in the row-pair order (rows of whole pairs)
+                        && f.view_order(keys).is_some()
                         && f.view_order(keys) == f.view_order(values)
-                        // a reordered page's pairs: whole 256-lane blocks
-                        && (f.view_order(keys).is_none()
-                            || (heads.kvh * heads.d) % 256 == 0
-                                && (heads.kvh * heads.dv) % 256 == 0)
-                        && (heads.kvh * heads.d) % 128 == 0
-                        && (heads.kvh * heads.dv) % 128 == 0
                         && crate::blocks::on())
                 && super::pages::fits(geom.span, &heads, tuning.vmem_cap()) =>
         {
@@ -2787,11 +2783,21 @@ fn append_pool_planes(
     let dims: &[i64] = &dims_owned;
     let srcs = [k.val, v.val];
     let token_rows = w * 2 / 512;
+    // the planes' order (rows of one pool row lie as its identity)
     let order = f.view_order(keys.val);
+    let o = match order {
+        Some(o) => o,
+        None if token_rows == 1 => crate::hlo::PoolOrder { tokens: ps, rpt: 1 },
+        None => return Ok(None),
+    };
+    if o.tokens != ps || o.rpt != token_rows {
+        return Ok(None);
+    }
     let rows_into = move |f: &mut Func| -> Built<Vec<Val>> {
         pool_rows(
             f,
             pool,
+            o,
             order,
             [maps[0], maps[1]],
             srcs,
@@ -2800,8 +2806,6 @@ fn append_pool_planes(
             ps,
             all,
             slots,
-            w,
-            token_rows,
             dims,
         )
     };
@@ -2852,14 +2856,9 @@ fn append_pool_planes(
         let ids = f.concat(&ids, 0)?;
         let ups = f.concat(&ups, 0)?;
         let cnt = f.dims(ups)[0];
-        let ups = match order {
-            // a page's pool rows pair-major (`crate::hlo::PoolOrder`)
-            Some(_) => {
-                let x = f.reshape(ups, &[cnt, ps, token_rows, 256])?;
-                f.transpose(x, &[0, 2, 1, 3])?
-            }
-            None => ups,
-        };
+        // a page's pool rows pair-major (`crate::hlo::PoolOrder`)
+        let ups = f.reshape(ups, &[cnt, ps, token_rows, 256])?;
+        let ups = f.transpose(ups, &[0, 2, 1, 3])?;
         let ups = f.reshape(ups, &[cnt * ps * w / 128, 128])?;
         let laid = crate::blocks::scatter(f, pool, ids, ups, page_rows)?;
         Ok(vec![f.pool_view_ordered(laid, Elem::Bf16, dims, order)?])
@@ -2881,7 +2880,6 @@ fn append_pool_planes(
                         pool,
                         maps: vec![mk, mv],
                         slots,
-                        ordered: order.is_some(),
                     },
                     [runs.start, runs.first, runs.len, page],
                     total,
@@ -2909,13 +2907,15 @@ fn append_pool_planes(
 /// by a DMA kernel call.
 const ROWS_IN_PLACE: i64 = 2;
 
-/// Both pool planes' rows, each by itself, as one block scatter: row `i` of
-/// plane `x` to page `maps[x](page[i])` at offset `off[i]` (a row whose
-/// page or offset is out of range dropped); the pool's new view.
+/// Both pool planes' rows, each by itself: row `i` of plane `x` to page
+/// `maps[x](page[i])` at offset `off[i]` (a row whose page or offset is out
+/// of range dropped), its pool rows where the order `o` lays them; the
+/// pool's new view (in the planes' `order`).
 #[allow(clippy::too_many_arguments)]
 fn pool_rows(
     f: &mut Func,
     pool: Val,
+    o: crate::hlo::PoolOrder,
     order: Option<crate::hlo::PoolOrder>,
     maps: [PageMap; 2],
     srcs: [Val; 2],
@@ -2924,11 +2924,10 @@ fn pool_rows(
     ps: i64,
     all: i64,
     slots: i64,
-    w: i64,
-    token_rows: i64,
     dims: &[i64],
 ) -> Built<Vec<Val>> {
     let n64 = f.dims(page)[0];
+    let token_rows = o.rpt;
     let mut ids = Vec::with_capacity(2);
     for (x, m) in maps.into_iter().enumerate() {
         let p = m.apply(f, page)?;
@@ -2949,48 +2948,48 @@ fn pool_rows(
     }
     let ids = f.concat(&ids, 0)?;
     let ups = f.concat(&srcs, 0)?;
-    if let Some(o) = order {
-        // In the row-pair order a token's pool rows lie a block's tokens
-        // apart: each lands by itself, at page · B + j · T + t.
-        let nt = 2 * n64;
-        let tv = f.like_i(ids, o.tokens);
-        let pg = f.div(ids, tv)?;
-        let t = f.rem(ids, tv)?;
-        let bv = f.like_i(ids, o.block());
-        let base = f.mul(pg, bv)?;
-        let base = f.add(base, t)?;
-        let base = f.broadcast(base, &[nt, token_rows], &[0])?;
-        let j = f.iota(Elem::I32, &[nt, token_rows], 1);
-        let jt = f.like_i(j, o.tokens);
-        let j = f.mul(j, jt)?;
-        let rows = f.add(base, j)?;
-        let rows = f.reshape(rows, &[nt * token_rows])?;
-        if n64 <= ROWS_IN_PLACE {
-            // A lane or two: each token's page block read, its rows put in
-            // place by a select, the block written back (a token's rows lie
-            // in one block, a row a DUS would be `rpt` of them).
-            let packed = f.pack_rows(ups, nt * token_rows)?;
-            let packed = f.reshape(packed, &[nt, token_rows, 128])?;
-            let total = f.dims(pool)[0];
-            let b = o.block();
-            let mut pool = pool;
-            for i in 0..nt {
-                let id = f.slice(ids, &[i], &[i + 1], &[1])?;
-                let id = f.reshape(id, &[])?;
-                let tv = f.like_i(id, o.tokens);
-                let pg = f.div(id, tv)?;
-                let t = f.rem(id, tv)?;
-                let bv = f.like_i(id, b);
-                let start = f.mul(pg, bv)?;
-                let lo = f.like_i(id, 0);
-                let hi = f.like_i(id, total);
-                let a = f.compare(Cmp::Ge, start, lo)?;
-                let c = f.compare(Cmp::Lt, start, hi)?;
-                let ok = f.and(a, c)?;
-                let z = f.like_i(id, 0);
-                let cur = f.dynamic_slice(pool, &[start, z], &[b, 128])?;
+    // A token's pool rows lie a block's tokens apart: row j at
+    // page · B + j · T + t.
+    let nt = 2 * n64;
+    let packed = f.pack_rows(ups, nt * token_rows)?;
+    if n64 <= ROWS_IN_PLACE {
+        // A lane or two (a decode's): no kernel call, whose launch costs
+        // the host and the device more than these few rows (v6e MoE decode
+        // of one lane: a 2 KiB scatter call a layer). A token of one pool
+        // row lands by a DUS of it; a wider one's page block is read, its
+        // rows put in place by a select and the block written back (a row
+        // a DUS would be `rpt` of them).
+        let packed = f.reshape(packed, &[nt, token_rows, 128])?;
+        let total = f.dims(pool)[0];
+        let b = if token_rows == 1 { 1 } else { o.block() };
+        let mut pool = pool;
+        for i in 0..nt {
+            let id = f.slice(ids, &[i], &[i + 1], &[1])?;
+            let id = f.reshape(id, &[])?;
+            let tv = f.like_i(id, o.tokens);
+            let pg = f.div(id, tv)?;
+            let t = f.rem(id, tv)?;
+            let bv = f.like_i(id, o.block());
+            let start = f.mul(pg, bv)?;
+            let start = if token_rows == 1 {
+                f.add(start, t)?
+            } else {
+                start
+            };
+            let lo = f.like_i(id, 0);
+            let hi = f.like_i(id, total);
+            let a = f.compare(Cmp::Ge, start, lo)?;
+            let c = f.compare(Cmp::Lt, start, hi)?;
+            let ok = f.and(a, c)?;
+            let z = f.like_i(id, 0);
+            let cur = f.dynamic_slice(pool, &[start, z], &[b, 128])?;
+            let tok = f.slice(packed, &[i, 0, 0], &[i + 1, token_rows, 128], &[1, 1, 1])?;
+            let put = if token_rows == 1 {
+                let tok = f.reshape(tok, &[1, 128])?;
+                let okb = f.broadcast(ok, &[1, 128], &[])?;
+                f.select(okb, tok, cur)?
+            } else {
                 // block row j · T + t takes the token's row j
-                let tok = f.slice(packed, &[i, 0, 0], &[i + 1, token_rows, 128], &[1, 1, 1])?;
                 let tok = f.reshape(tok, &[token_rows, 1, 128])?;
                 let tok = f.broadcast(tok, &[token_rows, o.tokens, 128], &[0, 1, 2])?;
                 let tok = f.reshape(tok, &[b, 128])?;
@@ -3000,49 +2999,22 @@ fn pool_rows(
                 let here = f.compare(Cmp::Eq, row, tb)?;
                 let okb = f.broadcast(ok, &[b, 128], &[])?;
                 let here = f.and(here, okb)?;
-                let put = f.select(here, tok, cur)?;
-                pool = f.dynamic_update_slice(pool, put, &[start, z])?;
-            }
-            return Ok(vec![f.pool_view_ordered(pool, Elem::Bf16, dims, order)?]);
+                f.select(here, tok, cur)?
+            };
+            pool = f.dynamic_update_slice(pool, put, &[start, z])?;
         }
-        // one DMA a token, its rows a block's tokens apart
-        let starts = f.slice(rows, &[0], &[nt * token_rows], &[token_rows])?;
-        let packed = f.pack_rows(ups, nt * token_rows)?;
-        let packed = f.reshape(packed, &[nt * token_rows, 1, 128])?;
-        let laid = crate::blocks::scatter_tokens(f, pool, starts, packed, o)?;
-        return Ok(vec![f.pool_view_ordered(laid, Elem::Bf16, dims, order)?]);
+        return Ok(vec![f.pool_view_ordered(pool, Elem::Bf16, dims, order)?]);
     }
-    if n64 <= ROWS_IN_PLACE {
-        // A lane or two (a decode's): each row read, kept where dropped,
-        // and written back in place: no kernel call, whose launch costs the
-        // host and the device more than these few rows (v6e MoE decode of
-        // one lane: a 2 KiB scatter call a layer).
-        let packed = f.pack_rows(ups, 2 * n64 * token_rows)?;
-        let blocks = f.dims(pool)[0] / token_rows;
-        let mut pool = pool;
-        for i in 0..2 * n64 {
-            let id = f.slice(ids, &[i], &[i + 1], &[1])?;
-            let id = f.reshape(id, &[])?;
-            let lo = f.like_i(id, 0);
-            let hi = f.like_i(id, blocks);
-            let a = f.compare(Cmp::Ge, id, lo)?;
-            let b = f.compare(Cmp::Lt, id, hi)?;
-            let ok = f.and(a, b)?;
-            let tr = f.like_i(id, token_rows);
-            let row = f.mul(id, tr)?;
-            let z = f.like_i(id, 0);
-            let cur = f.dynamic_slice(pool, &[row, z], &[token_rows, 128])?;
-            let r0 = i * token_rows;
-            let new = f.slice(packed, &[r0, 0], &[r0 + token_rows, 128], &[1, 1])?;
-            let ok = f.broadcast(ok, &[token_rows, 128], &[])?;
-            let put = f.select(ok, new, cur)?;
-            pool = f.dynamic_update_slice(pool, put, &[row, z])?;
-        }
-        return Ok(vec![f.pool_view(pool, Elem::Bf16, dims)?]);
-    }
-    let ups = f.reshape(ups, &[2 * n64 * w / 128, 128])?;
-    let laid = crate::blocks::scatter(f, pool, ids, ups, token_rows)?;
-    Ok(vec![f.pool_view(laid, Elem::Bf16, dims)?])
+    // one DMA a token, its rows a block's tokens apart
+    let tv = f.like_i(ids, o.tokens);
+    let pg = f.div(ids, tv)?;
+    let t = f.rem(ids, tv)?;
+    let bv = f.like_i(ids, o.block());
+    let starts = f.mul(pg, bv)?;
+    let starts = f.add(starts, t)?;
+    let packed = f.reshape(packed, &[nt * token_rows, 1, 128])?;
+    let laid = crate::blocks::scatter_tokens(f, pool, starts, packed, o)?;
+    Ok(vec![f.pool_view_ordered(laid, Elem::Bf16, dims, order)?])
 }
 
 /// `plane` (a view of the chunk pool) as a view of the pool `onto` (a view)
@@ -3186,7 +3158,9 @@ fn scatter_slots_one_map(
     // mapped), a page `[16, w]` as the pool lays it.
     if let [(src, plane)] = pairs
         && let Some((pool, Elem::Bf16)) = f.view_parts(plane.val)
-        && f.view_order(plane.val).is_none()
+        // the kernel lays a page in the row-pair order (rows of one pool
+        // row or less as they lie)
+        && (f.view_order(plane.val).is_some_and(|o| o.tokens == ps) || w <= 256)
         && src.width == plane.width
         && f.elem(src.val) == Elem::Bf16
         && let Some(vmem_cap) = vmem_cap
@@ -3203,14 +3177,19 @@ fn scatter_slots_one_map(
                     pool,
                     maps: vec![PageMap::IDENTITY],
                     slots,
-                    ordered: false,
                 },
                 [runs.start, runs.first, runs.len, page],
                 total,
                 vmem_cap,
             )?;
             let dims = f.dims(plane.val).to_vec();
-            Ok(vec![f.pool_view(laid[0], Elem::Bf16, &dims)?])
+            let order = f.view_order(plane.val);
+            Ok(vec![f.pool_view_ordered(
+                laid[0],
+                Elem::Bf16,
+                &dims,
+                order,
+            )?])
         });
         return Ok(f.case(which, &outs, vec![rows, pages, kernel])?);
     }

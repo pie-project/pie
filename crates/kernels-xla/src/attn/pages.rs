@@ -54,16 +54,13 @@ struct Shape {
     h: Heads,
     scale: f64,
     /// The chunk pool's rows where both planes are views of it (`u32 [R,
-    /// 128]`, read as bf16 rows of 128 in the kernel: a page of `ps` rows
-    /// of `w` is `ps · w / 128` of them, reshaped in VMEM).
+    /// 128]`), their pages in the row-pair order (`crate::hlo::PoolOrder`):
+    /// a page's bf16 rows run pair by pair, a pair's 16 rows of two 128-lane
+    /// blocks each, read by the kernel as the pool's own u32 rows.
     pooled: Option<i64>,
     /// Where the keys and values planes' pages lie (`PageMap`): table page
     /// `p` is plane page `p · stride + offset` of each.
     maps: [PageMap; 2],
-    /// Pooled planes whose pages lie in the row-pair order
-    /// (`crate::hlo::PoolOrder`): a page's bf16 rows run pair by pair, a
-    /// pair's 16 rows of two 128-lane blocks each.
-    ordered: bool,
 }
 
 impl Shape {
@@ -100,11 +97,12 @@ fn kernel(s: &Shape, vmem_cap: i64) -> Built<Compiled> {
         scale,
         pooled,
         maps,
-        ordered,
     } = *s;
+    let ordered = pooled.is_some();
     let (qh, gq, d, dv, kvh) = (h.qh(), h.g, h.d, h.dv, h.kvh);
     let (w, wv) = (kvh * d, kvh * dv);
-    // a buffer's row: a key row, or (pooled) a bf16 row of 128 of it
+    // a buffer's row: a key row, or (pooled) a bf16 row of 128 of it (two
+    // to a pool row)
     let (kk, kv_) = if pooled.is_some() {
         (w / 128, wv / 128)
     } else {
@@ -195,9 +193,6 @@ fn kernel(s: &Shape, vmem_cap: i64) -> Built<Compiled> {
         let q_ref = blk.ins[0];
         let (kp, vp) = if ordered {
             (blk.ins[1], blk.ins[1])
-        } else if pooled.is_some() {
-            let p = b.ref_bitcast(blk.ins[1], Elem::Bf16)?;
-            (p, p)
         } else {
             (blk.ins[1], blk.ins[2])
         };
@@ -515,11 +510,17 @@ pub(crate) fn attend(
         h: *h,
         scale,
         pooled: match (f.view_parts(keys), f.view_parts(values)) {
-            (Some((pk, Elem::Bf16)), Some((pv, Elem::Bf16))) if pk == pv => Some(f.dims(pk)[0]),
-            _ => None,
+            (Some((pk, Elem::Bf16)), Some((pv, Elem::Bf16)))
+                if pk == pv
+                    && f.view_order(keys).is_some_and(|o| o.tokens == ps)
+                    && f.view_order(keys) == f.view_order(values) =>
+            {
+                Some(f.dims(pk)[0])
+            }
+            (None, None) => None,
+            _ => return bad("pool planes not both in the pool's row-pair order"),
         },
         maps,
-        ordered: f.view_order(keys).is_some(),
     };
     let qh = h.qh();
     let pad_i = |f: &mut Func, x: Val| -> Built<Val> {
@@ -593,7 +594,6 @@ mod tests {
             scale: 0.1,
             maps: [PageMap::IDENTITY; 2],
             pooled: None,
-            ordered: false,
         };
         let c = kernel(&s, 100 << 20).unwrap();
         assert!(c.module.contains("tpu.enqueue_dma"));
@@ -628,7 +628,6 @@ mod tests {
             scale: 0.1,
             maps,
             pooled: None,
-            ordered: false,
         };
         let plain = kernel(&shape([PageMap::IDENTITY; 2]), 100 << 20).unwrap();
         let mapped = [
