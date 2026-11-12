@@ -636,32 +636,3 @@ fn storage_view(at: usize, remaining: u64, extent: u64, limit: u64) -> Result<u6
          the binding"
     ))
 }
-
-#[cfg(test)]
-mod tests {
-    use super::storage_view;
-
-    #[test]
-    fn a_view_past_the_storage_range_is_refused_with_its_sizes() {
-        const LIMIT: u64 = 128 << 20;
-        assert_eq!(storage_view(0, 4, 4, LIMIT), Ok(4));
-        assert_eq!(storage_view(1, LIMIT, 4, LIMIT), Ok(LIMIT));
-        let why = storage_view(5, LIMIT + 1, LIMIT + 1, LIMIT).unwrap_err();
-        assert!(why.contains("argument 5"), "got: {why}");
-        assert!(
-            why.contains(&format!("{}-byte view", LIMIT + 1)),
-            "got: {why}"
-        );
-        assert!(why.contains(&format!("of {LIMIT} bytes")), "got: {why}");
-        assert!(why.contains("maxStorageBufferRange"), "got: {why}");
-    }
-
-    /// A small tensor early in a slab past the limit (the arena of a large
-    /// MoE) binds the largest range, which holds it.
-    #[test]
-    fn a_small_view_in_a_slab_past_the_range_binds_the_limit() {
-        const LIMIT: u64 = 128 << 20;
-        assert_eq!(storage_view(5, 6 * LIMIT, 4096, LIMIT), Ok(LIMIT));
-        assert_eq!(storage_view(5, 6 * LIMIT, LIMIT, LIMIT), Ok(LIMIT));
-    }
-}

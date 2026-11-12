@@ -166,21 +166,6 @@ pub fn fixture_in(
     fixture_deployed(package, model, &deploy, variant)
 }
 
-/// `model` deployed with `weights` (a dtype a component, as a deployment
-/// states them; a packed one quantized by the import).
-pub fn fixture_weighed(model: &str, weights: &[Dtype]) -> Fixture {
-    let package = poem_compiler::catalog::package_of(model).expect("the model is listed");
-    let deploy = poem::star::Deploy {
-        weights: weights.iter().map(|&dtype| dtype.into()).collect(),
-        ..poem_compiler::catalog::one_rank(Dtype::Bf16, Dtype::Bf16)
-    };
-    let variant: String = weights
-        .iter()
-        .map(|dtype| format!("-{dtype:?}").to_lowercase())
-        .collect();
-    fixture_deployed(package, model, &deploy, &variant)
-}
-
 /// [`fixture_in`] under `deploy`. A deployment serving a plane in another
 /// form than the floats it is stored as (packed codes, fp8) loads from a
 /// serving artifact only (a load converts nothing): the seeded floats are
