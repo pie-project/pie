@@ -5,7 +5,7 @@ pub use engine_gpu::arena;
 pub use engine_gpu::blob;
 pub mod boot;
 pub mod chip;
-pub mod chunks;
+pub use engine_gpu::chunks;
 
 pub mod comm;
 pub use engine_gpu::decoded;
@@ -13,7 +13,6 @@ pub mod device;
 pub mod encode;
 use engine_gpu::error;
 pub mod experts;
-pub mod feeds;
 pub mod guest;
 pub mod inputs;
 pub use engine_gpu::mask;

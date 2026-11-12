@@ -63,11 +63,7 @@ pub(crate) struct Tally {
     device: AtomicU64,
 }
 
-#[derive(Debug, Clone)]
-pub struct InputCell {
-    pub bytes: Vec<u8>,
-    pub dtype: eta_ir::types::Dtype,
-}
+pub use crate::serve::InputCell;
 
 #[cfg(feature = "wgpu")]
 pub(crate) struct Half {
@@ -596,7 +592,7 @@ impl Plane {
         let value = ring.front();
         let mut bytes = vec![0u8; eta_exec::wire_cell_bytes(value.dtype(), value.len())];
         eta_exec::encode_wire(&value, &mut bytes);
-        Ok(InputCell {
+        Ok(InputCell::Host {
             bytes,
             dtype: eta_exec::concrete_dtype(seat.plan.package.channels[dense].dtype),
         })

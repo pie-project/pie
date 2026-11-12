@@ -39,18 +39,7 @@ struct Instance {
     faulted: Arc<AtomicBool>,
 }
 
-#[derive(Debug, Clone)]
-pub enum InputCell {
-    Host {
-        bytes: Vec<u8>,
-        dtype: eta_ir::types::Dtype,
-    },
-    #[cfg(feature = "vulkan")]
-    Device {
-        cell: crate::device::Buffer,
-        dtype: eta_ir::types::Dtype,
-    },
-}
+pub use crate::serve::InputCell;
 
 #[derive(Default)]
 pub struct Plane {

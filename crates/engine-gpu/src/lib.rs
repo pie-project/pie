@@ -18,6 +18,7 @@ pub mod probe;
 pub mod rs;
 pub mod run;
 pub mod scratch;
+pub mod serve;
 pub mod settle;
 pub mod store;
 pub mod weight_store;

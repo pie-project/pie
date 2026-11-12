@@ -19,7 +19,7 @@ use poem_compiler::{Budget, DeviceProfile, PATCH_LATTICE_FLOOR, PatchLadder};
 use poem_ir::Trace;
 
 use crate::error::Fault;
-use crate::serve::{Boot, Landed, Lane, Seated, Shell, StepView};
+use crate::serve::{Boot, Landed, Lane, Seated, Seats, Shell, StepView};
 use crate::settle::Done;
 
 pub type ContractFor = fn(&Trace, &Path) -> std::result::Result<ModelContract, String>;
@@ -379,6 +379,7 @@ impl Engine for Vulkan {
             voxels,
             residency,
             device: &self.boot,
+            handed: None,
         })
         .map_err(fault)?;
         let disk_kv_pages = shell
@@ -1183,6 +1184,7 @@ impl Vulkan {
                     media: &media,
                     clips: &clips,
                     done,
+                    guests: None,
                 },
                 None,
             )

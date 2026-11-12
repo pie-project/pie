@@ -97,6 +97,19 @@ pub trait Context<B: Backend> {
 
     /// The bytes one buffer may span.
     fn max_buffer(&self) -> u64;
+
+    fn name(&self) -> &str;
+
+    fn cores(&self) -> u32;
+
+    /// The bytes the device lends this load.
+    fn working_set(&self) -> u64;
+
+    /// The bytes of the working set no reservation holds.
+    fn left(&self) -> u64;
+
+    /// Makes the device current on this thread.
+    fn bind_thread(&self) -> Result<()>;
 }
 
 /// Device work recorded on the host, submitted at commit.
@@ -152,6 +165,9 @@ pub trait Frame<B: Backend>: 'static {
 /// tuning profile and device facts pick. `tier` is the highest tier the
 /// adapter runs, where a backend reads it.
 pub trait Tactics: std::fmt::Debug {
+    /// The profile the device resolved to.
+    fn profile(&self) -> &profile::Profile;
+
     /// The `kernel.qmm` ladder at this shape.
     fn qmm_ladder(
         &self,

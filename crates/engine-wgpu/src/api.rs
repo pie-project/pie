@@ -1139,7 +1139,7 @@ impl Wgpu {
                 windows: &lane.tables,
                 record: record_of[at].as_deref(),
                 record_run: run_of[at].as_deref(),
-
+                feed: None,
                 group: lane.group,
                 inputs: &input_cells[at],
             })

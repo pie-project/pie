@@ -58,6 +58,26 @@ impl engine_gpu::backend::Context<Api> for Context {
     fn max_buffer(&self) -> u64 {
         Context::max_buffer(self)
     }
+
+    fn name(&self) -> &str {
+        Context::name(self)
+    }
+
+    fn cores(&self) -> u32 {
+        Context::cores(self)
+    }
+
+    fn working_set(&self) -> u64 {
+        Context::working_set(self)
+    }
+
+    fn left(&self) -> u64 {
+        Context::left(self)
+    }
+
+    fn bind_thread(&self) -> Result<()> {
+        Context::bind_thread(self)
+    }
 }
 
 impl engine_gpu::backend::Frame<Api> for Frame {

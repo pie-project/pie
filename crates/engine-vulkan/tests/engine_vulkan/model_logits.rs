@@ -306,6 +306,7 @@ pub fn load_with(
             runahead: engine::runahead::Runahead::F1,
             device: &device,
             residency,
+            handed: None,
         })
         .unwrap_or_else(|why| panic!("the shell loads: {why}")),
     )

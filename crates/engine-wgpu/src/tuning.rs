@@ -213,6 +213,10 @@ const SPLIT_STORAGE_BUFFERS: u32 = 12;
 const TAB_PREFILL_WORK: u64 = 1 << 19;
 
 impl engine_gpu::backend::Tactics for Tuning {
+    fn profile(&self) -> &profile::Profile {
+        Tuning::profile(self)
+    }
+
     /// The device's `kernel.qmm` ladder at this shape, as kernels-slang's
     /// rungs: the vector rung reads two activation rows a workgroup, which
     /// on the 4090 beat the old hand-written WGSL one-row kernel at every row
