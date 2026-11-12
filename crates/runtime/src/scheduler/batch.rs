@@ -71,9 +71,28 @@ impl AdmissionLimits {
     }
 }
 
+/// The verify classes of `request`'s lanes ([`crate::model::Model::verify_class`]),
+/// sorted: a step holds requests of one such set, the empty one for every
+/// request that verifies nothing.
+fn verifies(request: &PendingRequest) -> Vec<usize> {
+    let Some(model) = crate::model::registered() else {
+        return Vec::new();
+    };
+    let mut classes: Vec<usize> = request
+        .request
+        .lanes
+        .iter()
+        .filter_map(|lane| model.verify_class(lane.word))
+        .collect();
+    classes.sort_unstable();
+    classes.dedup();
+    classes
+}
+
 #[derive(Default)]
 pub(crate) struct StepGroup {
     instances: HashSet<::engine::InstanceId>,
+    verifies: Vec<usize>,
     pipelines: HashSet<ProcessId>,
     forward_requests: usize,
     forward_tokens: usize,
@@ -99,6 +118,9 @@ impl StepGroup {
         if self.forward_requests == 0 {
             return true;
         }
+        if verifies(request) != self.verifies {
+            return false;
+        }
         let usage = request_capacity_usage(request, page_size);
         self.forward_requests.saturating_add(usage.forward_requests) <= limits.max_forward_requests
             && self.forward_tokens.saturating_add(usage.forward_tokens) <= limits.max_forward_tokens
@@ -112,6 +134,9 @@ impl StepGroup {
         page_size: u32,
     ) -> bool {
         let usage = request_capacity_usage(request, page_size);
+        if self.forward_requests == 0 {
+            self.verifies = verifies(request);
+        }
         self.instances.insert(request.instance_id);
         if let Some(pid) = request.pipeline_id {
             self.pipelines.insert(pid);

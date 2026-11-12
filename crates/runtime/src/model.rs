@@ -199,6 +199,11 @@ pub fn model() -> &'static Arc<Model> {
     MODEL.get().expect("model accessed before registration")
 }
 
+/// The model where one is registered (a scheduler built in a test has none).
+pub fn registered() -> Option<&'static Arc<Model>> {
+    MODEL.get()
+}
+
 /// So a key means the same state across restarts and every worker serving
 /// the model, whatever its engine, variant or page size.
 pub fn identity() -> Option<&'static state::ModelIdentity> {
@@ -381,6 +386,21 @@ impl Model {
     #[must_use]
     pub fn wide(&self, word: u64) -> bool {
         self.classes.of(word).is_some_and(|class| class.wide)
+    }
+
+    /// The class of a lane reading its pass's drafts (a verify), which fires
+    /// beside lanes of its own class alone: an engine records a drafter's
+    /// class by itself, so a step mixing it with another class walks.
+    #[must_use]
+    pub fn verify_class(&self, word: u64) -> Option<usize> {
+        if !self.facts.holds(word, poem_ir::Builtin::Drafts) {
+            return None;
+        }
+        let word = word & self.classes.mask;
+        self.classes
+            .classes
+            .iter()
+            .position(|class| class.words.contains(&word))
     }
 
     /// An input's id is its index here.
