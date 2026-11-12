@@ -1063,11 +1063,23 @@ impl Shell {
         // prompts beside them) is recorded once more for lanes that buffer
         // rows, and once more for lanes that replay them (`record::RsBody`),
         // right after its folding body.
+        // Only a load that buffers recurrent rows and serves a drafter's
+        // fires (classes that read the drafts) takes them, for the drafter's
+        // classes; `rs-bodies` takes them for every class.
         let buffering = self.buffers.is_some();
+        let every_class = super::diag::on().rs_bodies;
+        let drafting = deployment.drafting.clone();
         let targets: Vec<(u32, BodySynth, record::RsBody)> = targets
             .into_iter()
             .flat_map(|(bucket, target)| {
-                let buffers = buffering && matches!(target.kind(), Kind::Decode | Kind::Prefill);
+                let class = match &target {
+                    BodySynth::Decode { class, .. } | BodySynth::Prefill { class, .. } => {
+                        Some(*class)
+                    }
+                    _ => None,
+                };
+                let buffers = buffering
+                    && class.is_some_and(|class| every_class || drafting.contains(&class));
                 let treatments: &[record::RsBody] = if buffers {
                     &[
                         record::RsBody::Folds,
