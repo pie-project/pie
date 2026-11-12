@@ -693,7 +693,7 @@ mod tests {
             (
                 "qwen35-d4b-bf16-kv-bf16",
                 "4b",
-                (Layout::Snake, 8, 4, 256, 256, 10, 216),
+                (Layout::Snake, 8, 4, 256, 192, 14, 216),
             ),
             (
                 "qwen35-d0.8b-bf16-kv-bf16",
@@ -937,9 +937,13 @@ mod tests {
     fn memory_follows_the_partition_within_the_margin() {
         use crate::cost::memory::{self, ANCHORS};
         let small = ANCHORS.iter().find(|a| a.preset == "0.8b").unwrap();
-        let p = plan(&trace("qwen35-d4b-bf16-kv-bf16"), &Ask::default())
-            .unwrap()
-            .plan;
+        // the 4B's program as linked then: its pin before the A4 move (PY=192, NE=86, G2=12, G2Y=12)
+        let ask = Ask {
+            preset: Some("4b".into()),
+            set: "PY=256,NE=64,G2=16,G2Y=16".into(),
+            ..Ask::default()
+        };
+        let p = plan(&trace("qwen35-d4b-bf16-kv-bf16"), &ask).unwrap().plan;
         // the 4B as linked: weight 34,848 B, head 27,968 B, every other image's room 21,568 B
         let want = (memory::PE_BYTES - 34848.0)
             .min(memory::PE_BYTES - 27968.0)
