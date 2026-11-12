@@ -458,7 +458,7 @@ fn mamba2_reads_its_state_through_the_segment_table() {
                     data: x,
                     indptr: ind,
                 };
-                ssm::mamba2_chunked(&gpu.ctx(), x, dt, z, m, &pool, N as u32, &mut y)
+                ssm::mamba2_chunked(&gpu.ctx(), x, dt, z, m, &pool, None, N as u32, &mut y)
             }
             .expect("Mamba-2 fires");
             bits::<u16>(gpu, &y)

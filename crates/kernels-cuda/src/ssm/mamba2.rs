@@ -111,8 +111,30 @@ pub fn mamba2(
 
 /// A prompt's Mamba-2 walk in sixteen-token chunks: a block a (request,
 /// head) lands `(C S + D x) * silu(z)` for each row, then the group norm.
+/// A `tail` pass (rows past a lane's commit, from the state its first pass
+/// folded) walks before the norm, which every row then takes once.
 #[allow(clippy::too_many_arguments)]
 pub fn mamba2_chunked(
+    ctx: &Ctx,
+    xbc: RaggedTensor,
+    dt: Tensor,
+    z: Tensor,
+    m: Mamba2,
+    state: &RecurrentPool,
+    tail: Option<&RecurrentPool>,
+    state_dim: u32,
+    y: &mut Tensor,
+) -> Result<(), Error> {
+    const OP: &str = "ssm.mamba2_chunked";
+    for pass in core::iter::once(state).chain(tail) {
+        mamba2_scan(ctx, xbc, dt, z, m, pass, state_dim, y)?;
+    }
+    m.norm(ctx, OP, y)
+}
+
+/// One pass of [`mamba2_chunked`]'s walk, the norm not taken.
+#[allow(clippy::too_many_arguments)]
+fn mamba2_scan(
     ctx: &Ctx,
     xbc: RaggedTensor,
     dt: Tensor,
@@ -157,6 +179,5 @@ pub fn mamba2_chunked(
             stated(OP, m.groups)?.arg(),
             ctx.stage(),
         ],
-    )?;
-    m.norm(ctx, OP, y)
+    )
 }

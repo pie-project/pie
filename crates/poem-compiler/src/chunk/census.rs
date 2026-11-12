@@ -135,8 +135,10 @@ pub struct Census {
 }
 
 /// Reads every row `trace` remembers; with `state_f32`, a state row takes
-/// four bytes an element but an integer one (the backend widens it).
-pub fn census(trace: &Trace, state_f32: bool) -> Result<Census, ChunkError> {
+/// four bytes an element but an integer one (the backend widens it). With
+/// `rs_mamba2`, a Mamba-2 layer buffers its rows as a gated-delta one does
+/// ([`super::ChunkProfile::rs_mamba2`]).
+pub fn census(trace: &Trace, state_f32: bool, rs_mamba2: bool) -> Result<Census, ChunkError> {
     let readers = readers(trace);
     let mut out = Census::default();
     for (at, row) in trace.caches.iter().enumerate() {
@@ -189,7 +191,7 @@ pub fn census(trace: &Trace, state_f32: bool) -> Result<Census, ChunkError> {
             }
         }
     }
-    for (row, rs) in rs_rows(trace, &readers)? {
+    for (row, rs) in rs_rows(trace, &readers, rs_mamba2)? {
         out.rs.insert(row.id, rs);
         out.rs_rows.push(row);
     }
@@ -435,7 +437,11 @@ fn atom(slab: &[u64], bytes: u64, read: &Read, shard: &Shard) -> Atom {
 /// row an n-gram id window, its unfolded token ids (as Metal's rs layout
 /// buffers them, in their own dtype). `RowId::Rs(n)`: the recurrences in
 /// node order, then the windows in the order their first reader stands.
-fn rs_rows(trace: &Trace, readers: &[Read]) -> Result<Vec<(TokenRow, RsRow)>, ChunkError> {
+fn rs_rows(
+    trace: &Trace,
+    readers: &[Read],
+    rs_mamba2: bool,
+) -> Result<Vec<(TokenRow, RsRow)>, ChunkError> {
     let mut defined: HashMap<u32, usize> = HashMap::new();
     let mut outs = Vec::new();
     for (at, node) in trace.nodes.iter().enumerate() {
@@ -474,6 +480,13 @@ fn rs_rows(trace: &Trace, readers: &[Read]) -> Result<Vec<(TokenRow, RsRow)>, Ch
             }) => {
                 if let Some(x) = conv_x(*mixed) {
                     recurrences.push((vec![x, *f, *b], *state, node.layer));
+                }
+            }
+            // A Mamba-2 layer replays its conv's input and its step sizes;
+            // its gate `z` reads only the rows a fire lands.
+            Operation::Ssm(Ssm::Mamba2Chunked { xbc, dt, state, .. }) if rs_mamba2 => {
+                if let Some(x) = conv_x(*xbc) {
+                    recurrences.push((vec![x, *dt], *state, node.layer));
                 }
             }
             Operation::Gather(

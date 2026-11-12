@@ -66,6 +66,7 @@ pub fn profile(page_size: u32, context: u32, binding: u64, target: Option<u64>) 
         // expert): the chunk is never smaller than an expert.
         cut_experts: false,
         state_f32: true,
+        rs_mamba2: false,
         token_slot: Some(page_size),
         one_window: false,
         // A window as wide as the context keeps every token: a list row.

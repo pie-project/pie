@@ -141,7 +141,7 @@ fn attn_mamba2_scan() {
         indptr: gpu.column(&indptr),
     };
     let mut y = gpu.zeros(rows as u32, INNER as u32, Dtype::Bf16);
-    ssm::mamba2_chunked(&ctx, xbc, dt, z, m, &pool, N as u32, &mut y).unwrap();
+    ssm::mamba2_chunked(&ctx, xbc, dt, z, m, &pool, None, N as u32, &mut y).unwrap();
     let got = gpu.read(&y);
     let mut state = case.state.clone();
     for (r, &slot) in slots.iter().enumerate() {

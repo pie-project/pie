@@ -411,7 +411,7 @@ fn a_packed_kv_row_takes_its_stored_bytes_a_token() {
         rows: Some(poem_ir::KvRows::V4),
     };
     for (row, want) in [(u4(128), 2 * 8 * 66), (u4(0), 2 * 4 * 130), (rows, 584)] {
-        let census = census::census(&trace(vec![row]), false).unwrap();
+        let census = census::census(&trace(vec![row]), false, false).unwrap();
         assert_eq!(census.tokens[0].per_token(), want);
     }
 }
