@@ -568,7 +568,17 @@ impl Shell {
         // (`seat_tokens`), else at the context. The pool holds one sequence
         // at the context either way: seats it would not hold fall back to
         // seats at the context.
+        // The tokens a seat is balanced at are the power of two nearest those
+        // asked (448 and 592 both seat 512): a load's shapes that differ a
+        // little share one pool, so one compiled ladder (Qwen3.6-35B-A3B's v5e
+        // c256 and pf256 loads each compiled their own, 23 minutes apiece).
         let seat = boot.device.seat_tokens.map_or(least, |tokens| {
+            let below = 1u32 << (31 - tokens.max(1).leading_zeros());
+            let tokens = if (tokens - below) * 2 < below {
+                below
+            } else {
+                below.saturating_mul(2)
+            };
             u64::from(tokens.div_ceil(boot.page_size.max(1))).clamp(1, least)
         });
         let fitted = |one_slot: u64| {
