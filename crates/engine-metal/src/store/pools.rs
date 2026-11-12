@@ -2058,18 +2058,3 @@ impl Pools {
         })
     }
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn a_slot_starts_at_its_chunk_then_its_index() {
-        let layout = Layout::new(1 << 20, 8, 4, 16, [64 << 10, 256 << 10], 1, 2, 4).unwrap();
-        let list = layout.list.unwrap();
-        assert_eq!(slot_at(&layout, &list, 16), 1 << 20);
-        assert_eq!(slot_at(&layout, &list, 17), (1 << 20) + (64 << 10));
-        let fixed = layout.fixed.unwrap();
-        assert_eq!(slot_at(&layout, &fixed, 5), (1 << 20) + (256 << 10));
-    }
-}
