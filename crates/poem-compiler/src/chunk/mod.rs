@@ -647,7 +647,7 @@ pub fn plan(
     let (lo, hi) = device.range();
     let census = census::census(trace, device.state_f32, device.rs_mamba2)?;
     let cow = cow_sets(budgets);
-    let weight_groups = weights::census(trace, budgets.tokens.max_tokens);
+    let weight_groups = weights::census(trace, budgets.tokens.max_tokens, device.tma_rows);
     // Where experts are not cut, no chunk is smaller than one.
     let expert = weight_groups
         .iter()
@@ -853,16 +853,36 @@ pub fn plan(
             .filter(|&bytes| bytes > 0)
             .collect()
     };
-    let candidates: Vec<u64> = (first..=last)
-        .step_by(usize::try_from(step).unwrap_or(1))
-        .chain(core::iter::once(last))
-        .map(|m| m * unit)
-        .chain(slot_sizes.iter().flat_map(|&slot| {
-            (least.div_ceil(slot)..=hi.max(least) / slot).map(move |n| n * slot)
-        }))
-        .collect::<std::collections::BTreeSet<u64>>()
-        .into_iter()
+    let candidates: Vec<u64> =
+        (first..=last)
+            .step_by(usize::try_from(step).unwrap_or(1))
+            .chain(core::iter::once(last))
+            .map(|m| m * unit)
+            .chain(slot_sizes.iter().flat_map(|&slot| {
+                (least.div_ceil(slot)..=hi.max(least) / slot).map(move |n| n * slot)
+            }))
+            .collect::<std::collections::BTreeSet<u64>>()
+            .into_iter()
+            .collect();
+    // Where slots lay their planes on TMA rows, a chunk a whole number of
+    // every expert slot's boundary, so a slot of any chunk lies on them past
+    // the pool's base; none such, the sizes as they are (the engine then
+    // finds its entries off those rows and maps no window).
+    let edge = weight_groups
+        .iter()
+        .filter(|g| g.is_expert())
+        .map(weights::Group::boundary)
+        .fold(1, weights::lcm);
+    let on_edge: Vec<u64> = candidates
+        .iter()
+        .copied()
+        .filter(|c| c % edge == 0)
         .collect();
+    let candidates = if on_edge.is_empty() {
+        candidates
+    } else {
+        on_edge
+    };
 
     // Weight slots first: of the sizes whose chunks the weights fill within
     // a point of the best, the one the states (kv list, window lists, rs

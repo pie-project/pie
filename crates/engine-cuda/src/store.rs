@@ -4125,6 +4125,10 @@ fn lay(
     if let Some(bytes) = chunk_bytes {
         server.target_chunk_bytes = bytes;
     }
+    // Where this device's kernels map a table's window, slots lay their
+    // planes on the rows those maps index.
+    let tma = windows_mapped();
+    server.tma_rows = tma;
     let paged = server.paged(paging.page_size, context);
     let profile = poem_compiler::DeviceProfile {
         chunk: if one_window { paged.merged() } else { paged },
@@ -4136,7 +4140,7 @@ fn lay(
         poem_compiler::chunk::plan(&view, budgets, &profile).map_err(|why| Fault::Unbound {
             what: format!("a chunk recipe for this load's cache rows: {why}"),
         })?;
-    let banks: Vec<(usize, u64)> = if experts.is_empty() {
+    let banks: Vec<(usize, u64, u64)> = if experts.is_empty() {
         Vec::new()
     } else {
         let bytes = crate::weights::laid_bytes(trace)?;
@@ -4144,10 +4148,19 @@ fn lay(
         let beside = experts
             .iter()
             .flat_map(|&param| layout::beside_planes(trace, param))
-            .map(|plane| (plane as usize, 0));
+            .map(|plane| (plane as usize, 0, 0));
+        // Each plane's TMA rows where windows are mapped (the recipe laid
+        // the slot by them), else none.
+        let rows = |param: usize| {
+            if tma {
+                poem_compiler::chunk::weights::tma_rows(trace, param, experts)
+            } else {
+                0
+            }
+        };
         experts
             .iter()
-            .map(|&param| (param, bytes[param]))
+            .map(|&param| (param, bytes[param], rows(param)))
             .chain(beside)
             .collect()
     };
@@ -4156,9 +4169,7 @@ fn lay(
     } else {
         Vec::new()
     };
-    let mut layout = layout::Layout::of(&recipe, &streamed, &banks)?;
-    layout.tma_rows(trace);
-    Ok(layout)
+    layout::Layout::of(&recipe, &streamed, &banks)
 }
 
 /// The chunks a pool of `pages` kv pages takes: the null chunk, the pages'

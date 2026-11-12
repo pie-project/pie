@@ -2048,8 +2048,11 @@ pub(crate) fn laid_view(trace: &Trace) -> std::borrow::Cow<'_, Trace> {
     for laid in laid {
         let param = &mut view.params[laid.scales];
         param.dtype = Dtype::U8;
+        // A lead's atoms as its 128-row blocks, each a block's atoms: the
+        // rows a TMA map of them indexes (`poem_compiler::chunk::tma_rows`).
         param.shape = if laid.leads > 1 || trace.params[laid.scales].shape.len() > 2 {
-            vec![laid.leads, laid.atom_bytes(laid.rows)]
+            let blocks = laid.rows.div_ceil(128).max(1);
+            vec![laid.leads, blocks, laid.atom_bytes(laid.rows) / blocks]
         } else {
             vec![laid.atom_bytes(laid.rows)]
         };
