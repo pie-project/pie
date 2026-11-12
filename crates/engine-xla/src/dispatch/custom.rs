@@ -12,6 +12,44 @@ use crate::run::Run;
 impl DispatchFused for Run<'_> {
     fn dispatch(&mut self, op: &Fused) -> Result<(), KernelError> {
         self.ctx().scope(op.name());
+        if let Fused::MatmulGlu {
+            act,
+            w,
+            intermediate,
+            glu,
+            packed,
+            y,
+        } = op
+        {
+            if self.glu_gemm(*act, *w, *intermediate, *glu, *y)? {
+                return Ok(());
+            }
+            DispatchLinear::dispatch(
+                self,
+                &Linear::Matmul {
+                    act: *act,
+                    w: *w,
+                    input_scales: None,
+                    scales: None,
+                    quant: None,
+                    logits: false,
+                    y: *packed,
+                },
+            )?;
+            return DispatchLinear::dispatch(
+                self,
+                &Linear::Glu {
+                    packed: Some(*packed),
+                    gate: None,
+                    up: None,
+                    weights: None,
+                    intermediate: *intermediate,
+                    act: *glu,
+                    limit: None,
+                    y: *y,
+                },
+            );
+        }
         let Fused::MoeExperts {
             select,
             glu,
@@ -43,6 +81,44 @@ impl DispatchFused for Run<'_> {
 }
 
 impl Run<'_> {
+    /// `kernels_xla::linear::glu_gemm` over a dense bf16 gate-up weight and
+    /// its GeGLU, from `kernel.glu.gemm_from` rows; `false` (nothing lowered)
+    /// for any other form, or where the kernel declines the fire.
+    fn glu_gemm(
+        &mut self,
+        act: poem_ir::ValueId,
+        w: poem_ir::ValueId,
+        intermediate: u32,
+        glu: GluAct,
+        y: poem_ir::ValueId,
+    ) -> Result<bool, KernelError> {
+        if glu != GluAct::GegluTanh || self.banked(w).is_some() || self.maybe_stored(w).is_some() {
+            return Ok(false);
+        }
+        let (a, wt, o_y) = (self.tensor(act), self.gemm_tensor(w), self.tensor(y));
+        let mut fused = false;
+        crate::lower::lower(self.ctx(), |l| {
+            let from = l.tuning().glu_gemm_from;
+            if from == 0 || i64::from(o_y.rows) < from || o_y.dtype != dtype::Dtype::Bf16 {
+                return Ok(());
+            }
+            let x = l.read(a)?.val;
+            // The weight reads `[N, K]` off its `[K, N]` landing: the kernel
+            // takes the landing.
+            let wv = l.read(wt)?.val;
+            let wv = l.f().transpose(wv, &[1, 0])?;
+            match kernels_xla::linear::glu_gemm::geglu(l.f(), x, wv, o_y.rows, i64::from(intermediate))? {
+                Some(v) => {
+                    fused = true;
+                    l.land(o_y, v)
+                }
+                None => Ok(()),
+            }
+        })
+        .map_err(crate::error::kernel)?;
+        Ok(fused)
+    }
+
     /// `kernels_xla::linear::moe::experts` over a plain gate-up select, its
     /// packed SwiGLU or GeGLU, a plain down select on the same routes and
     /// their weighted sum; `false` (nothing lowered) for any other form, or

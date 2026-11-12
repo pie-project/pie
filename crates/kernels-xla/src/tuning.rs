@@ -177,6 +177,15 @@ pub struct RopeFlatRows(pub u32);
 #[decision(id = "kernel.glu.land_from", constant(set(0, 512, 1024, 2048)), default = 0, tune = search)]
 pub struct GluLandFrom(pub u32);
 
+/// From this many rows a dense GeGLU's packed gate-up projection and its GLU
+/// run as one Mosaic kernel (`linear::glu_gemm`), not XLA's dot and a GLU
+/// pass: on a v6e XLA's dot runs Gemma-4-31B's 2304-row `[5376, 43008]`
+/// gate-up at ~82% of the MXU, the kernel at 94%, and no product lands. 0
+/// never does.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Decision)]
+#[decision(id = "kernel.glu.gemm_from", constant(set(0, 1024, 2048)), default = 0, tune = search)]
+pub struct GluGemmFrom(pub u32);
+
 /// Up to this many rows per lane, an `auto` attention walk gathers each
 /// row's keys; past it, row blocks walk the key axis. 0 always blocks.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Decision)]
@@ -272,6 +281,7 @@ pub fn register(registry: &mut Registry) {
         .add::<AttnBlockRows>()
         .add::<RopeFlatRows>()
         .add::<GluLandFrom>()
+        .add::<GluGemmFrom>()
         .add::<AttnBlockKeys>()
         .add::<AttnUnrolledBlocks>()
         .add::<AttnFlashNarrowRows>()
@@ -354,6 +364,9 @@ pub struct Tuning {
     /// Rows from which a dense GeGLU lands before its down dot (see
     /// [`GluLandFrom`]); 0 never.
     pub glu_land_from: i64,
+    /// Rows from which a dense GeGLU's gate-up and GLU run as one kernel
+    /// (see [`GluGemmFrom`]); 0 never.
+    pub glu_gemm_from: i64,
     pub chunks: Chunks,
     pub ssm: SsmChunks,
     pub vmem_bytes: i64,
@@ -393,6 +406,7 @@ impl Tuning {
         attn_per_row_max: 2,
         rope_flat_rows: 0,
         glu_land_from: 0,
+        glu_gemm_from: 0,
         chunks: Chunks {
             budget: 1 << 24,
             block_rows: 512,
@@ -453,6 +467,7 @@ impl Tuning {
             attn_per_row_max: n(profile.get::<AttnPerRowMax>().0),
             rope_flat_rows: n(profile.get::<RopeFlatRows>().0),
             glu_land_from: n(profile.get::<GluLandFrom>().0),
+            glu_gemm_from: n(profile.get::<GluGemmFrom>().0),
             chunks: Chunks {
                 budget: n(profile.get::<AttnBudgetMi>().0) << 20,
                 block_rows: n(profile.get::<AttnBlockRows>().0),
