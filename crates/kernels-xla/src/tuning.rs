@@ -206,6 +206,15 @@ pub struct NormLandBelow(pub u32);
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Decision)]
 #[decision(id = "kernel.glu.gemm_from", constant(set(0, 1024, 2048)), default = 0, tune = search)]
 pub struct GluGemmFrom(pub u32);
+/// From this many rows a rope over the heads a per-head rms norm landed
+/// turns the rows that norm read, norming each head in the same Mosaic
+/// kernel (`elemwise::rope::normed`), not the norm's kernel landing them for
+/// the rope to read again (Gemma-4-31B's rope alone: 1.1 ms a 1664-row fire
+/// of a 6-layer cut on a v5e, 2.7 ms a 2304-row fire of 18 layers on a
+/// v6e). 0 never does.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Decision)]
+#[decision(id = "kernel.norm.rope_from", constant(set(0, 640, 1024)), default = 0, tune = search)]
+pub struct NormRopeFrom(pub u32);
 
 /// Up to this many rows per lane, an `auto` attention walk gathers each
 /// row's keys; past it, row blocks walk the key axis. 0 always blocks.
@@ -304,6 +313,7 @@ pub fn register(registry: &mut Registry) {
         .add::<GluLandFrom>()
         .add::<NormLandFrom>()
         .add::<NormLandBelow>()
+        .add::<NormRopeFrom>()
         .add::<DotBarrierRows>()
         .add::<GluGemmFrom>()
         .add::<AttnBlockKeys>()
@@ -394,6 +404,9 @@ pub struct Tuning {
     /// Rows from which a gemm's rows no longer land before their norm; 0
     /// none.
     pub norm_land_below: i64,
+    /// Rows from which a per-head norm's rope norms the rows it turns (see
+    /// [`NormRopeFrom`]); 0 never.
+    pub norm_rope_from: i64,
     pub dot_barrier_rows: i64,
     /// Rows from which a dense GeGLU's gate-up and GLU run as one kernel
     /// (see [`GluGemmFrom`]); 0 never.
@@ -439,6 +452,7 @@ impl Tuning {
         glu_land_from: 0,
         norm_land_from: 0,
         norm_land_below: 0,
+        norm_rope_from: 0,
         dot_barrier_rows: 0,
         glu_gemm_from: 0,
         chunks: Chunks {
@@ -503,6 +517,7 @@ impl Tuning {
             glu_land_from: n(profile.get::<GluLandFrom>().0),
             norm_land_from: n(profile.get::<NormLandFrom>().0),
             norm_land_below: n(profile.get::<NormLandBelow>().0),
+            norm_rope_from: n(profile.get::<NormRopeFrom>().0),
             dot_barrier_rows: n(profile.get::<DotBarrierRows>().0),
             glu_gemm_from: n(profile.get::<GluGemmFrom>().0),
             chunks: Chunks {

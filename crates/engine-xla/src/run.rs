@@ -161,6 +161,10 @@ pub struct Run<'c> {
     /// The values a dense gemm of this program wrote (`kernel.norm.land_from`).
     pub(crate) dot_out: Vec<bool>,
 
+    /// The rows, gain, epsilon and head width of each per-head rms norm this
+    /// program lowered, by its result (`kernel.norm.rope_from`).
+    pub(crate) norm_src: Vec<Option<(ValueId, poem_ir::NormWeight, f32, u32)>>,
+
     fire: FireBindings,
 
     windows: &'c Windows,
@@ -238,6 +242,7 @@ impl<'c> Run<'c> {
             structs: vec![None; values.len() * windows.max_runs() as usize],
             values_wide: values.len(),
             dot_out: vec![false; values.len()],
+            norm_src: vec![None; values.len()],
             fire,
             windows,
             place,

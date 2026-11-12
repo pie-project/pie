@@ -11,7 +11,106 @@ use crate::run::Run;
 impl DispatchElemwise for Run<'_> {
     fn dispatch(&mut self, op: &Elemwise) -> Result<(), KernelError> {
         self.ctx().scope(op.name());
+        if let Elemwise::Rmsnorm {
+            x,
+            weight: weight @ (NormWeight::Scale(_) | NormWeight::PlusOne(_)),
+            axis: NormAxis::Head(head_dim),
+            eps,
+            y,
+        } = op
+            && let Some(n) = self.norm_src.get_mut(y.0 as usize)
+        {
+            *n = Some((*x, *weight, *eps, *head_dim));
+        }
+        if self.norm_rope(op)? {
+            return Ok(());
+        }
         self.elemwise(op).map_err(crate::error::kernel)
+    }
+}
+
+impl Run<'_> {
+    /// `kernels_xla::elemwise::rope::normed`: a rope over q and k (where
+    /// given) that per-head rms norms landed, turned from the rows those
+    /// norms read, from `kernel.norm.rope_from` rows; the norms' results go
+    /// unread. `false` (nothing lowered) where the chip or the kernel
+    /// declines.
+    fn norm_rope(&mut self, op: &Elemwise) -> Result<bool, KernelError> {
+        let (q, k, positions, head_dim, theta, rotary_dim, span) = match *op {
+            Elemwise::Rope {
+                q,
+                k: k @ Some(_),
+                positions,
+                head_dim,
+                theta,
+                freqs: None,
+                turn:
+                    poem_ir::Turn::Full {
+                        interleaved: false, ..
+                    },
+                ..
+            } => (q, k, positions, head_dim, theta, head_dim, head_dim / 2),
+            Elemwise::Rope {
+                q,
+                k,
+                positions,
+                head_dim,
+                theta,
+                freqs: None,
+                turn:
+                    poem_ir::Turn::Partial {
+                        rotary_dim, span, ..
+                    },
+                ..
+            } => (q, k, positions, head_dim, theta, rotary_dim, span),
+            _ => return Ok(false),
+        };
+        let mut planes = Vec::with_capacity(2);
+        for v in std::iter::once(q).chain(k) {
+            let Some(Some((x, weight, eps, width))) = self.norm_src.get(v.0 as usize).copied()
+            else {
+                return Ok(false);
+            };
+            let (NormWeight::Scale(w) | NormWeight::PlusOne(w)) = weight else {
+                return Ok(false);
+            };
+            let (o, x) = (self.tensor(v), self.tensor(x));
+            if width != head_dim || o.dtype != dtype::Dtype::Bf16 || o.rows != x.rows {
+                return Ok(false);
+            }
+            let plus_one = matches!(weight, NormWeight::PlusOne(_));
+            planes.push((o, x, self.tensor(w), plus_one, eps));
+        }
+        let p = self.tensor(positions);
+        let mut fused = false;
+        crate::lower::lower(self.ctx(), |l| {
+            let from = l.tuning().norm_rope_from;
+            if from == 0 || i64::from(planes[0].0.rows) < from {
+                return Ok(());
+            }
+            let mut xs = Vec::with_capacity(planes.len());
+            for &(_, x, w, plus_one, eps) in &planes {
+                xs.push(elemwise::rope::Normed {
+                    x: l.read(x)?,
+                    weight: l.read(w)?,
+                    plus_one,
+                    eps,
+                });
+            }
+            let positions_v = l.read(p)?;
+            let Some(vs) =
+                elemwise::rope::normed(l.f(), &xs, positions_v, rotary_dim, head_dim, theta, span)?
+            else {
+                return Ok(());
+            };
+            fused = true;
+            for (&(o, ..), v) in planes.iter().zip(vs) {
+                l.land(o, v)?;
+            }
+            Ok(())
+        })
+        .map_err(crate::error::kernel)?;
+        Ok(fused)
     }
 }
 
