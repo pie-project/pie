@@ -372,6 +372,12 @@ impl MoveGuard {
         }
         for (copy, started, completion) in waits {
             let copied = completion.wait().await;
+            ptrace!(
+                "tier-copy {} slots={} ms={}",
+                copy.label(),
+                copy.device.len(),
+                started.elapsed().as_millis()
+            );
             planner.record_tier_copy(&copy, started.elapsed());
             copied.map_err(|error| format!("{} copy: {error}", copy.label()))?;
         }
@@ -455,12 +461,15 @@ async fn evict(planner: Arc<ResidencyPlanner>, pid: ProcessId) {
         planner.eviction_failed(pid);
         return;
     }
+    let began = Instant::now();
     let mut fence = FenceGuard::raise(handles);
     crate::scheduler::worker::notify_process_suspend(pid);
     drain_detachable(pid).await;
+    let drained = began.elapsed();
     for handle in fence.handles.iter() {
         handle.quiesce().await;
     }
+    let quiesced = began.elapsed();
     let stores = crate::store::registry::get(model, engine);
     // Host room is for what is paused before what is cached: idle cache on
     // a host short of room goes on down to disk first, not dropped.
@@ -511,12 +520,14 @@ async fn evict(planner: Arc<ResidencyPlanner>, pid: ProcessId) {
         planner.eviction_found_nothing(pid);
         return;
     }
+    let prepared_at = began.elapsed();
     let mut guard = MoveGuard::new(model, engine, Move::Suspend { kv, rs });
     if let Err(error) = guard.copy(&planner, pid).await {
         tracing::warn!(pid = %pid, %error, "planner: eviction copy failed");
         planner.eviction_failed(pid);
         return;
     }
+    let copied = began.elapsed();
     let Move::Suspend { kv, rs } = guard.take() else {
         unreachable!("an eviction carries a suspend")
     };
@@ -546,6 +557,16 @@ async fn evict(planner: Arc<ResidencyPlanner>, pid: ProcessId) {
         stores.rs.lock().unwrap().commit_suspend(txn)
     });
     fence.keep_raised();
+    ptrace!(
+        "evict-phases pid={} drained_ms={} quiesced_ms={} prepared_ms={} copied_ms={} done_ms={} freed={}",
+        pid,
+        drained.as_millis(),
+        quiesced.as_millis(),
+        prepared_at.as_millis(),
+        copied.as_millis(),
+        began.elapsed().as_millis(),
+        freed
+    );
     planner.report_evicted(pid, freed as u32, rs_freed);
 }
 
@@ -589,6 +610,7 @@ async fn restore(
     let rs_working_sets =
         crate::inferlet::process::residency::rs_working_set_ids(pid, model, engine);
     let stores = crate::store::registry::get(model, engine);
+    let began = Instant::now();
     let mut kv = None;
     if !working_sets.is_empty() {
         // Another move may hold pages this process shares: it lands soon,
@@ -666,6 +688,7 @@ async fn restore(
     if let Some(txn) = rs {
         stores.rs.lock().unwrap().commit_restore(txn);
     }
+    ptrace!("restore-done pid={} ms={}", pid, began.elapsed().as_millis());
     planner.report_restored(pid);
     crate::scheduler::nudge(engine);
 }

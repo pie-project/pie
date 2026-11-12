@@ -3209,8 +3209,9 @@ impl Pools {
 
     /// Seats the host tier of `budget` bytes: as many whole chunks of the
     /// state pool's size, in pageable memory the tier commits as moves
-    /// first write it, behind a page-locked staging ring ([`host`]).
-    pub fn seat_tier(&mut self, budget: u64) -> Result<()> {
+    /// first write it, behind a page-locked staging ring sized for a device
+    /// pool of `device` bytes ([`host::staging_ring`]).
+    pub fn seat_tier(&mut self, budget: u64, device: u64) -> Result<()> {
         // No more than the machine has free, known now: a tier stated larger
         // would fail mid-serve, at the first move past what the host holds.
         let free = crate::weights::available_memory();
@@ -3230,7 +3231,11 @@ impl Pools {
         let chunks = u32::try_from(budget.checked_div(chunk).unwrap_or(0)).unwrap_or(u32::MAX);
         self.tier = match chunks {
             0 => None,
-            chunks => Some(host::HostTier::new(chunk, chunks)?),
+            chunks => Some(host::HostTier::new(
+                chunk,
+                chunks,
+                host::staging_ring(device, budget),
+            )?),
         };
         Ok(())
     }
