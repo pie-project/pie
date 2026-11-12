@@ -32,7 +32,6 @@ pub enum Launched {
 
 #[derive(Clone, Copy, Debug)]
 struct Output {
-    slot: u32,
     base: u64,
     storage: u32,
     width: u32,
@@ -46,12 +45,10 @@ pub struct Session {
     shapes: Vec<ChannelShape>,
     cursors: Vec<Cursor>,
     extents: Extents,
-    /// Indexed by [`eta_ir::op::output_slot`] in the stage reading outputs.
-    outputs: Vec<Option<Output>>,
-    /// That stage's names, an output's index among them, and the slots one
-    /// lane takes.
-    output_names: Vec<String>,
-    output_slots: u32,
+    /// The outputs bound for the next fire, by name and lane: each stage
+    /// reading outputs seats them in its own table (`Prepared::slot_of`),
+    /// whose names are that stage's, not another's.
+    outputs: Vec<((String, u32), Output)>,
     poisoned: bool,
     fires: u64,
     /// A commit slot (two words the device writes) for each fire airborne
@@ -114,20 +111,12 @@ impl Session {
 
         let commit_key = crate::device::held::pool::commit_key(2 * size_of::<u32>());
 
-        let reading = plan.package.plans.iter().find(|stage| {
-            stage
-                .ops
-                .iter()
-                .any(|op| op.tag == eta_ir::op::tags::OUTPUT)
-        });
         let mut session = Session {
             rings,
             shapes,
             cursors,
             extents,
-            outputs: vec![None; reading.map_or(0, |stage| stage.output_pitch as usize)],
-            output_names: reading.map_or_else(Vec::new, |stage| stage.names.clone()),
-            output_slots: reading.map_or(0, |stage| stage.output_slots),
+            outputs: Vec::new(),
             poisoned: false,
             fires: 0,
             commits: Vec::new(),
@@ -460,31 +449,28 @@ impl Session {
         row_stride: u32,
         row_offset: u32,
     ) -> Result<()> {
-        let Some(slot) = self.slot_of(name, lane) else {
-            return Ok(());
+        let output = Output {
+            base,
+            storage,
+            width,
+            row_stride,
+            row_offset,
         };
-        if let Some(seat) = self.outputs.get_mut(slot as usize) {
-            *seat = Some(Output {
-                slot,
-                base,
-                storage,
-                width,
-                row_stride,
-                row_offset,
-            });
+        match self
+            .outputs
+            .iter_mut()
+            .find(|((named, at), _)| named == name && *at == lane)
+        {
+            Some((_, seat)) => *seat = output,
+            None => self.outputs.push(((name.to_string(), lane), output)),
         }
         Ok(())
     }
 
-    fn slot_of(&self, name: &str, lane: u32) -> Option<u32> {
-        let index = self.output_names.iter().position(|named| named == name)?;
-        Some(u32::try_from(index).ok()? + self.output_slots * lane)
-    }
-
     fn bound(&self, name: &str, lane: u32) -> bool {
-        self.slot_of(name, lane)
-            .and_then(|slot| self.outputs.get(slot as usize))
-            .is_some_and(Option::is_some)
+        self.outputs
+            .iter()
+            .any(|((named, at), _)| named == name && *at == lane)
     }
 
     #[must_use]
@@ -549,10 +535,13 @@ impl Session {
         let commit = self.commits[minted.slot].device();
         for prepared in stages {
             let lane = prepared.stage_lane(&self.rings, &minted.before, commit)?;
-            for output in self.outputs.iter().flatten() {
+            for ((name, at), output) in &self.outputs {
+                let Some(slot) = prepared.slot_of(name, *at) else {
+                    continue;
+                };
                 prepared.bind_intrinsic(
                     lane,
-                    output.slot,
+                    slot,
                     output.base,
                     output.storage,
                     output.width,
