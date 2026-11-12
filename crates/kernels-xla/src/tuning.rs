@@ -258,6 +258,13 @@ pub struct SsmLongChunk(pub u32);
 #[decision(id = "kernel.ssm.step_mxu", constant(set(0, 8, 16, 32, 64)), default = 0, tune = search)]
 pub struct SsmStepMxu(pub u32);
 
+/// Up to this many segments a prefill fire's GDN chunk kernel takes the
+/// fire's rows where they lie, a step a block of them (`ssm::chunk`), not
+/// each segment's chunks gathered and their outputs gathered back. 0 never.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Decision)]
+#[decision(id = "kernel.ssm.row_blocks", constant(set(0, 16, 64)), default = 0, tune = search)]
+pub struct SsmRowBlocks(pub u32);
+
 /// Tokens per chunk of the per-channel-decay (KDA) chunked scan, whose
 /// intra-chunk decay is a `[C, C, d]` product.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Decision)]
@@ -302,7 +309,8 @@ pub fn register(registry: &mut Registry) {
         .add::<SsmChunk>()
         .add::<SsmLongChunk>()
         .add::<SsmKdaChunk>()
-        .add::<SsmStepMxu>();
+        .add::<SsmStepMxu>()
+        .add::<SsmRowBlocks>();
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -355,6 +363,9 @@ pub struct SsmChunks {
     /// The lanes from which a GDN decode step runs through the MXU
     /// ([`SsmStepMxu`]).
     pub step_mxu: i64,
+    /// The most segments a fire's GDN takes in row blocks
+    /// ([`SsmRowBlocks`]); 0 never.
+    pub row_blocks: i64,
 }
 
 /// The kernel decisions one load runs under, and the device's VMEM.
@@ -441,6 +452,7 @@ impl Tuning {
             long_chunk: 128,
             kda_chunk: 16,
             step_mxu: 0,
+            row_blocks: 0,
         },
         vmem_bytes: Self::V6E_VMEM,
     };
@@ -504,6 +516,7 @@ impl Tuning {
                 long_chunk: n(profile.get::<SsmLongChunk>().0),
                 kda_chunk: n(profile.get::<SsmKdaChunk>().0),
                 step_mxu: n(profile.get::<SsmStepMxu>().0),
+                row_blocks: n(profile.get::<SsmRowBlocks>().0),
             },
             vmem_bytes,
         }

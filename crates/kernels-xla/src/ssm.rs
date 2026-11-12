@@ -1752,7 +1752,17 @@ fn delta(
             let l = lanes.count(fq);
             let kernel = ragged && t > chunk && fused_chunks_on();
             let fused = if kernel {
-                chunk::gdn_chunks(fq, &input, &raw, &segs, &lanes, slab, per, chunk)?
+                chunk::gdn_chunks(
+                    fq,
+                    &input,
+                    &raw,
+                    &segs,
+                    &lanes,
+                    slab,
+                    per,
+                    chunk,
+                    tuning.ssm.row_blocks,
+                )?
             } else {
                 None
             };
