@@ -357,9 +357,14 @@ impl Shell {
                         let Some((text, sig)) = texts.get(at) else {
                             break;
                         };
-                        if deadline.is_some_and(|d| std::time::Instant::now() >= d)
+                        // A shape an earlier load left late stays so (a round
+                        // of a job boots its own server) until a fire compiles
+                        // it onto the disk cache.
+                        if let Some(d) = deadline
                             && !device.on_disk(text)
+                            && (device.is_late(text) || std::time::Instant::now() >= d)
                         {
+                            device.mark_late(text);
                             late.fetch_add(1, SeqCst);
                             continue;
                         }

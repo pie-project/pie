@@ -337,6 +337,24 @@ impl Device {
             .is_some_and(|file| file.exists())
     }
 
+    /// Marks `text`'s program as one a warm ladder past its compile budget
+    /// left to its first fire (a file beside its cache entry), so a later
+    /// load's ladder leaves it there too until a fire has compiled it.
+    pub fn mark_late(&self, text: &str) {
+        if let Some(file) = self.client().ok().and_then(|c| self.cache_file(c, text)) {
+            let _ = std::fs::write(file.with_extension("late"), b"");
+        }
+    }
+
+    /// Whether a warm ladder left `text`'s program to its first fire.
+    #[must_use]
+    pub fn is_late(&self, text: &str) -> bool {
+        self.client()
+            .ok()
+            .and_then(|client| self.cache_file(client, text))
+            .is_some_and(|file| file.with_extension("late").exists())
+    }
+
     /// Drops the program compiled from `text` from the cache: held nowhere
     /// else, it frees its host memory, and the next `program` of the text
     /// loads it from the disk cache.
