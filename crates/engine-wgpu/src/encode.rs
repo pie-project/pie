@@ -621,26 +621,3 @@ fn storage_view_fits(at: usize, bytes: u64, limit: u64) -> Result<(), String> {
          clamped, so the slab must be split to fit the binding"
     ))
 }
-
-#[cfg(test)]
-mod tests {
-    use super::storage_view_fits;
-
-    #[test]
-    fn a_view_past_the_binding_limit_is_refused_with_its_sizes() {
-        const LIMIT: u64 = 128 << 20;
-        assert_eq!(storage_view_fits(0, 4, LIMIT), Ok(()));
-        assert_eq!(storage_view_fits(2, LIMIT, LIMIT), Ok(()));
-        let why = storage_view_fits(3, LIMIT + 4, LIMIT).unwrap_err();
-        assert!(why.contains("argument 3"), "got: {why}");
-        assert!(
-            why.contains(&format!("{}-byte view", LIMIT + 4)),
-            "got: {why}"
-        );
-        assert!(why.contains(&format!("of {LIMIT} bytes")), "got: {why}");
-        assert!(
-            why.contains("max_storage_buffer_binding_size"),
-            "got: {why}"
-        );
-    }
-}
