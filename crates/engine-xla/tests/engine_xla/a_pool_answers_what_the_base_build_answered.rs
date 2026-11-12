@@ -53,6 +53,13 @@ fn a_dense_model_answers_bit_for_bit() {
     run("qwen3-micro-text", None, 256, None);
 }
 
+/// The hybrids' decode conv runs as the pool's Mosaic kernel, whose output
+/// differs from the base build's at the ulp (the base build's XLA folds the
+/// in-projection matmul into the conv's fusion; the state lands bit for bit,
+/// the top tokens agree), so these two gates compare against a dump of this
+/// build. Their parity with the base build's golden is checked with
+/// `PIE_XLA_CONV_KERNEL=0`, a diagnostic switch for this check only (an
+/// environment variable, never a configuration knob).
 #[test]
 fn a_gated_delta_hybrid_answers_bit_for_bit() {
     run("qwen35-tiny", None, 256, None);
