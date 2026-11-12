@@ -805,7 +805,30 @@ fn resolve(src: &ztensor::Source, claim: Claim) -> Result<Vec<TensorContract>, E
         (Encoding::Quant(_), Some(pairing)) => {
             tensors.extend(interned(src, &name, &shape, bands, pairing)?);
         }
-        (Encoding::Raw(_), Some(_)) => {}
+        // An NVFP4 encode writes the codes and both weight scales; the input
+        // scales are its activations' calibration, not of the weight, so they
+        // are carried as the source holds them (one f32 a bank's expert).
+        (Encoding::Raw(_), Some(_)) => {
+            let input = crate::input_scales_name(&name);
+            if let Encoding::Quant(spec) = &encoding
+                && spec.scheme == QuantScheme::Nvfp4E2M1E4M3
+                && src.get(&input).is_some()
+            {
+                let lead = &shape[..shape.len().saturating_sub(2)];
+                let expr = match &bands {
+                    Some((axis, _)) if (*axis as usize) < lead.len() => {
+                        banded(&input, bands.as_ref())
+                    }
+                    _ => Expr::src(input.clone()),
+                };
+                tensors.push(TensorContract::new(
+                    input,
+                    expr,
+                    lead.to_vec(),
+                    Encoding::Raw(DType::F32),
+                ));
+            }
+        }
         (Encoding::Quant(_), None) | (Encoding::Raw(_), None) => {}
     }
     Ok(tensors)
