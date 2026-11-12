@@ -18,6 +18,11 @@ pub struct Fire<'a> {
     /// A synthetic fire of arming whose rows no one reads (no golden arm
     /// beside it): the fire that captures its body need not walk it first.
     pub arming: bool,
+    /// An arming fire past its kind's widest bucket: the fires before it
+    /// made what a warm fire would (modules, tunes, the streams' slabs at
+    /// their widest), so it captures on its first fire, warming only where
+    /// that capture is refused.
+    pub cold: bool,
     pub trace: &'a Trace,
     pub compiled: &'a CompiledModel,
     pub descriptor: &'a FireDescriptor,
@@ -45,6 +50,8 @@ pub struct BodyMap {
     bodies: HashMap<BodyKey, Body>,
     body_order: Vec<BodyKey>,
     body_warm: HashMap<BodyKey, u32>,
+    /// Keys whose cold capture was refused: they warm before capturing.
+    cold_refused: HashSet<BodyKey>,
     bodies_refused: HashSet<BodyKey>,
     sealed: bool,
 }
@@ -993,10 +1000,11 @@ impl Bodies {
         // opens a conditional node. An arming fire about to be captured
         // skips its walk: nothing reads a synthetic fire's rows, and the warm
         // fire before it made what the walk would (modules, tunes, slabs).
+        let cold = at.arming && at.cold && !self.map.cold_refused.contains(&key);
         let captures = at.arming
             && !self.map.sealed()
             && run.capturable()
-            && self.map.warmed(&key) + 1 >= WARM_FIRES;
+            && (cold || self.map.warmed(&key) + 1 >= WARM_FIRES);
         if !captures {
             walk_capture(at, run, place, Streams::Warm)?;
         }
@@ -1025,7 +1033,7 @@ impl Bodies {
         self.recorder.bstats.misses += 1;
 
         let warmed = self.map.warm(&key);
-        if warmed < WARM_FIRES {
+        if warmed < WARM_FIRES && !cold {
             return Ok(());
         }
         if !run.capturable() {
@@ -1075,7 +1083,15 @@ impl Bodies {
                     walk_capture_cut(at, run, place, Streams::Forked, cut)
                 });
                 PTR_TAG.store(0, std::sync::atomic::Ordering::Relaxed);
-                captured?
+                // A cold capture refused (something it walks wants making
+                // first): the key warms on its next fire and captures after.
+                match captured {
+                    Err(_) if cold && warmed < WARM_FIRES => {
+                        self.map.cold_refused.insert(key);
+                        return Ok(());
+                    }
+                    captured => captured?,
+                }
             };
             if let Some(dir) = crate::serve::diag::on().graph_dot.as_deref()
                 && ptr_traced(&key)

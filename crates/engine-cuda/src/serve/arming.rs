@@ -1233,6 +1233,9 @@ impl Shell {
                 continue;
             }
             self.arm_rs = rs;
+            // Past its kind's widest bucket a target captures cold: the top
+            // bucket's fires made what its warm fire would.
+            self.arm_cold = narrower(bucket, &target) && !verify;
             let spent = self.cache.body_stats();
             let room = (self.bodies_mem as u64).saturating_sub(spent.census.bytes as u64);
             let spare = self.pools.spare_bytes_for_bodies(room).unwrap_or(u64::MAX);
@@ -1293,7 +1296,17 @@ impl Shell {
                     refused = Some(format!("bucket {bucket}, {target}: {why}"));
                     break;
                 }
+                // Armed on its first fire (a cold capture): a second would
+                // only replay it.
+                if self
+                    .armed_body
+                    .as_ref()
+                    .is_some_and(|key| self.cache.holds_body(key))
+                {
+                    break;
+                }
             }
+            self.arm_cold = false;
             let key = self.armed_body.take();
             let warmed_ms = began.elapsed().as_secs_f64() * 1000.0;
             let mut golden_ms = (0f64, 0f64);
