@@ -1404,6 +1404,18 @@ impl<'c> Run<'c> {
     /// them per token) one token takes. An expert region's value is laid
     /// over every rank's tokens at the bucket.
     pub(crate) fn plane_fan(&self, plane: ValueId) -> u32 {
+        // A plane over selected rows (a readout's, a lane's) is no packing of
+        // the token rows, however many rows its carve gives it: a readout
+        // ceiling may pass a narrow fire's tokens.
+        if let Some(Ty::Tensor { shape, .. }) =
+            self.values.get(plane.0 as usize).map(|decl| &decl.ty)
+            && matches!(
+                shape.first(),
+                Some(Dim::Readouts | Dim::Lanes | Dim::LanesPlus(_))
+            )
+        {
+            return 1;
+        }
         let plane_rows = self.tensor(plane).rows;
         let tokens = if self.expert.get(plane.0 as usize).copied().unwrap_or(false) {
             self.bucket() * self.ep_rank().map_or(1, |ep| ep.wires.len() as u32)
@@ -1418,7 +1430,10 @@ impl<'c> Run<'c> {
         assert_eq!(
             plane_rows % tokens,
             0,
-            "a {plane_rows}-row packed plane does not divide into {tokens} token rows, so              no fan-out scales the staged seat onto its row axis",
+            "a {plane_rows}-row packed plane (value {}, {:?}) does not divide into {tokens} \
+             token rows, so no fan-out scales the staged seat onto its row axis",
+            plane.0,
+            self.values.get(plane.0 as usize).map(|decl| &decl.ty),
         );
         (plane_rows / tokens).max(1)
     }
