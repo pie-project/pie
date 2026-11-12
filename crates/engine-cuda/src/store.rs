@@ -127,7 +127,11 @@ pub struct Fitted {
     pub fit: u64,
     pub room: u64,
     pub held: u64,
+    /// What the bodies are held, a stretch included.
     pub bodies: u64,
+    /// Of `bodies`, what a profile's allowance may stretch into while
+    /// arming, past the allowance the card affords.
+    pub stretch: u64,
     pub spare: u64,
     pub chunks: u32,
 }
@@ -136,6 +140,10 @@ pub struct Fitted {
 /// room: enough for the decode bodies, which are what a serve replays every
 /// step and cost tens of megabytes each.
 pub const BODIES_FLOOR_BYTES: u64 = 512 << 20;
+
+/// The share of the cache rows' room a profile's default bodies allowance
+/// may stretch into while the lattice arms: a twentieth.
+pub const BODIES_STRETCH: u64 = 20;
 
 /// What the graph bodies may take on this card: the configured allowance,
 /// or a quarter of `room` — what is left for them and the cache rows once
@@ -599,8 +607,9 @@ pub struct Pools {
     /// The chunks the fit left the cache rows, of the range's.
     fitted: u32,
     /// The range is reserved anew to the fit even where it maps on demand:
-    /// a smaller activation rung hands state the chunks under the
-    /// activation, which must be the fit's, not past it.
+    /// the pool's planes then span about what the fit holds, not the asked
+    /// count (reserved for the asked count, Qwen3.5-0.8B's c64 ran ~1%
+    /// slower on sm_120).
     whole_fit: bool,
     airborne: Option<Airborne>,
     host: Option<HostKv>,
@@ -671,11 +680,6 @@ struct Shelf {
     per_chunk: u32,
     chunks: Vec<Option<crate::device::Pinned>>,
 }
-
-/// The spare chunks under the activation a smaller activation rung may
-/// still hand state, backed beside the budget (the few the fit takes back
-/// once the bodies are armed); more, and no smaller rung is stated.
-const SPARE_UNDER_RUNGS: u32 = 4;
 
 impl Shelf {
     fn new(planes: Vec<u64>, slots: u32) -> Shelf {
@@ -1073,21 +1077,30 @@ impl Pools {
         self.pool.map_unit_bytes()
     }
 
-    pub fn spare_bytes(&self) -> Result<u64> {
-        let reserve = self
-            .declared_bytes()
-            .max(self.high_water_bytes())
-            .saturating_sub(self.committed_bytes());
-        self.pool.spare_bytes(reserve)
+    /// What the cache rows may still take of the device: the bytes the fit
+    /// declared them, or the most their segments ever backed, past what
+    /// they back now. The activation's held spans are no part of it: they
+    /// are backed already, out of what the device has free.
+    fn segment_reserve(&self) -> u64 {
+        self.declared_bytes()
+            .max(self.chunks.segment_high_water_bytes())
+            .saturating_sub(self.committed_bytes())
     }
 
+    pub fn spare_bytes(&self) -> Result<u64> {
+        self.pool.spare_bytes(self.segment_reserve())
+    }
+
+    /// What the bodies may still take while the lattice arms: the device's
+    /// free bytes past the cache rows' reserve, or `room` where the device
+    /// has that free. A fit before arming that held the bodies more (a
+    /// profile's allowance stretched) declared the cache rows less, so its
+    /// hold shows here.
     pub fn spare_bytes_for_bodies(&self, room: u64) -> Result<u64> {
         let live = self.pool.spare_bytes(0)?;
-        let reserve = self
-            .declared_bytes()
-            .max(self.high_water_bytes())
-            .saturating_sub(self.committed_bytes());
-        Ok(live.saturating_sub(reserve).max(live.min(room)))
+        Ok(live
+            .saturating_sub(self.segment_reserve())
+            .max(live.min(room)))
     }
 
     /// What a load's synthetic fires may name, inside the chunks the fit
@@ -1139,12 +1152,17 @@ impl Pools {
     /// since a pool under it is no deployment. `resident` spells what is on
     /// the device already, for the refusal when not even that fits.
     /// `settled` says the activation has reached its high water: every
-    /// composition fired while the bodies armed.
+    /// composition fired while the bodies armed. `stretch`: the allowance is
+    /// a profile's default, not the operator's, and the fit before arming
+    /// holds the bodies a twentieth of the cache rows' room past it, so a
+    /// lattice the default does not arm whole may take it
+    /// (`Shell::fit_lattice`); the settled fit gives back what they left.
     pub fn fit_the_card(
         &mut self,
         bodies: u64,
         programs: u64,
         settled: bool,
+        stretch: bool,
         resident: &dyn core::fmt::Display,
     ) -> Result<Fitted> {
         // The room is what the card has free plus every byte the range has
@@ -1193,6 +1211,15 @@ impl Pools {
                 need
             });
         let (bodies, programs) = holds_within(bodies, programs, live.saturating_sub(claim));
+        let stretch = if stretch && !settled && self.budget.is_none() {
+            live.saturating_sub(claim)
+                .saturating_sub(bodies)
+                .saturating_sub(programs)
+                / BODIES_STRETCH
+        } else {
+            0
+        };
+        let bodies = bodies.saturating_add(stretch);
         let held = programs.saturating_add(bodies);
         let room = live.saturating_sub(held);
         if let Some(budget) = self.budget.filter(|&budget| budget > room) {
@@ -1304,6 +1331,7 @@ impl Pools {
             room,
             held,
             bodies,
+            stretch,
             spare: live.saturating_sub(need).saturating_sub(programs),
             chunks: fitted,
         })
@@ -1324,9 +1352,9 @@ impl Pools {
         }
     }
 
-    /// Reserves the range anew to the fit even where it maps on demand, so
-    /// no chunk past the fit lies under the activation (smaller activation
-    /// rungs are stated only then).
+    /// Reserves the range anew to the fit even where it maps on demand. The
+    /// chunks it keeps past the settled fit, under the activation, are
+    /// stated to no runtime ([`chunks::Chunks::skip_past`]).
     pub fn fit_range_whole(&mut self) {
         self.whole_fit = true;
     }
@@ -3046,13 +3074,13 @@ impl Pools {
     }
 
     /// The state pool as the runtime counts it, for fires of up to
-    /// `max_tokens`: the chunks the fit left the cache rows, the rest of the
-    /// range stated with the activation's.
+    /// `max_tokens`: the chunks the fit left the cache rows, and the
+    /// activation's right above them, the chunks past the fit skipped
+    /// ([`chunks::Chunks::skip_past`]).
     ///
     /// `rungs`, each smaller rung's tokens and the bytes at the bottom of
-    /// the activation's span state may take at it, are stated where no
-    /// spare chunk lies under the activation (a smaller rung hands state
-    /// the span's bottom, which a spare chunk would put past the fit).
+    /// the activation's span state may take at it (backed already), each
+    /// stated as the activation's chunks less those.
     pub fn chunk_facts(
         &mut self,
         max_tokens: u32,
@@ -3060,51 +3088,25 @@ impl Pools {
     ) -> Result<engine::chunk::ChunkFacts> {
         let fitted = self.fitted_chunks();
         self.chunks.limit(fitted);
-        let spare = self.chunks.total().saturating_sub(fitted);
+        self.chunks.skip_past(fitted);
         // The state's chunks of the segment the stated activation starts in
         // are backed from here on, as the runtime counts them.
-        match self.chunks.hold_boundary(&mut self.pool, spare)? {
+        match self.chunks.hold_boundary(&mut self.pool)? {
             Commit::Committed => {}
             refusal => return Err(refuse(&self.pool, refusal)),
         }
         let chunk = self.chunks.layout().chunk_bytes.max(1);
         let act = self.chunks.act_chunks();
-        // A smaller rung hands state the chunks under the activation, the
-        // spare ones first: stated only where none lies there, or so few
-        // (what the fit took back after the bodies were armed) that they are
-        // backed beside the budget.
-        let usable = spare == 0
-            || (spare <= SPARE_UNDER_RUNGS && !rungs.is_empty() && {
-                match self.chunks.hold_spare(&mut self.pool, spare)? {
-                    Commit::Committed => true,
-                    _ => false,
-                }
-            });
-        let rungs: Vec<(u32, u32)> = if usable {
-            rungs
-                .iter()
-                .map(|&(tokens, under)| {
-                    let under = u32::try_from(under / chunk).unwrap_or(u32::MAX);
-                    // `facts` states each rung with the spare chunks; at a
-                    // smaller rung they are state's too.
-                    (
-                        tokens,
-                        act.saturating_sub(under).saturating_sub(spare).max(1),
-                    )
-                })
-                .collect()
-        } else {
-            if !rungs.is_empty() {
-                eprintln!(
-                    "engine-cuda: no smaller activation rung is stated: {spare} chunk(s) under \
-                     the activation lie past the fit"
-                );
-            }
-            Vec::new()
-        };
+        let rungs: Vec<(u32, u32)> = rungs
+            .iter()
+            .map(|&(tokens, under)| {
+                let under = u32::try_from(under / chunk).unwrap_or(u32::MAX);
+                (tokens, act.saturating_sub(under).max(1))
+            })
+            .collect();
         let mut facts = self
             .chunks
-            .facts(max_tokens, spare, !elastic::mapped_on_demand(), &rungs);
+            .facts(max_tokens, !elastic::mapped_on_demand(), &rungs);
         // Where the load seated the weights itself, for a runtime to adopt.
         if self.preseated {
             for shape in &mut facts.weights {

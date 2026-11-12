@@ -50,6 +50,8 @@ pub struct ShapePool<I> {
     kind: ShapeKind,
     slot_bytes: u64,
     base: u32,
+    /// The most ids that may be out: a shared pool's under its smallest
+    /// rung ([`Self::capacity`] is what may be out now).
     capacity: u32,
     /// One past the highest id there may be.
     ids_end: u32,
@@ -144,7 +146,7 @@ impl<I: PoolId> ShapePool<I> {
                 .iter()
                 .map(|shape| shape.slot_bytes * u64::from(shape.pieces))
                 .sum();
-            (pool.records_capacity(), bytes)
+            (pool.records_most(), bytes)
         };
         base.checked_add(capacity)
             .expect("pool id range overflows u32");
@@ -348,13 +350,21 @@ impl<I: PoolId> ShapePool<I> {
                 u32::try_from(demand.live + demand.cached).unwrap_or(u32::MAX)
             }
             Backing::Own(_) | Backing::Records(_) => {
-                self.capacity.saturating_sub(self.available() as u32)
+                self.capacity().saturating_sub(self.available() as u32)
             }
         }
     }
 
+    /// Ids that may be out at once: a shared pool's under its current
+    /// rung (a smaller rung's room counts once the rung is lowered).
     pub fn capacity(&self) -> u32 {
-        self.capacity
+        match &self.slots {
+            Backing::Own(_) => self.capacity,
+            Backing::Shape(shared, shape) => {
+                shared.lock().unwrap().shape_capacity(*shape).min(self.capacity)
+            }
+            Backing::Records(shared) => shared.lock().unwrap().records_capacity(),
+        }
     }
 
     pub fn base(&self) -> u32 {

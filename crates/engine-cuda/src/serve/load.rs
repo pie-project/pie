@@ -58,6 +58,8 @@ pub(super) fn bake(boot: &mut Boot<'_>) -> Result<Baked> {
     };
     device.set_tuning(kernels_cuda::tuning::Tuning::of(&chip));
     let engine = crate::chip::Engine::of(&chip);
+    let bodies_stated = boot.knobs.chip.is_some()
+        || crate::chip::states_recording(device.name(), boot.knobs.profiles.as_deref());
     if boot.budget.max_tokens == 0 {
         let params: u64 = boot
             .trace
@@ -449,6 +451,7 @@ pub(super) fn bake(boot: &mut Boot<'_>) -> Result<Baked> {
     Ok(Baked {
         device,
         engine,
+        bodies_stated,
         compiled,
         budgets,
         profile,
@@ -754,6 +757,7 @@ impl Shell {
         let Baked {
             mut device,
             engine,
+            bodies_stated,
             compiled,
             budgets,
             profile,
@@ -1270,6 +1274,10 @@ impl Shell {
             golden_arm: Golden::Off,
             bodies: engine.recording.bodies(),
             bodies_mem: (engine.recording.bodies_mem() as usize).saturating_mul(1 << 20),
+            // An operator's allowance (the user's profile, or a pinned one)
+            // is a hard cap; a profile's default may stretch while arming.
+            bodies_stated,
+            bodies_ceiling: 0,
             decoded_tiles: Vec::new(),
             arming: false,
             armed_body: None,
@@ -1424,12 +1432,16 @@ impl Shell {
             bodies,
             held_for_fires.saturating_add(scratch_growth),
             false,
+            !shell.bodies_stated,
             &resident,
         )?;
+        // The most a profile's allowance may stretch to while arming.
+        shell.bodies_ceiling = usize::try_from(fitted.bodies).unwrap_or(usize::MAX);
         // The carves laid at the activation's end, backed where the range
         // now lies (the fit may have reserved it anew).
         shell.arena.ensure_rungs(&mut shell.pools)?;
-        if fitted.bodies < bodies {
+        let afforded = fitted.bodies - fitted.stretch;
+        if afforded < bodies {
             eprintln!(
                 "engine-cuda: [engine] bodies_mem {} MiB is held down to {} MiB on this card: \
                  with the weights, activations and inputs resident, one sequence at the declared \
@@ -1437,10 +1449,10 @@ impl Shell {
                  and the cache rows together, and the bodies take at most a quarter of it. \
                  State a smaller bodies_mem to choose it.",
                 bodies >> 20,
-                fitted.bodies >> 20,
+                afforded >> 20,
                 fitted.spare >> 20,
             );
-            shell.bodies_mem = usize::try_from(fitted.bodies).unwrap_or(usize::MAX);
+            shell.bodies_mem = usize::try_from(afforded).unwrap_or(usize::MAX);
         }
         Ok(Staged {
             shell,
@@ -1525,7 +1537,7 @@ impl Staged {
         let bodies = if deferred { shell.bodies_mem as u64 } else { 0 };
         let fitted = shell
             .pools
-            .fit_the_card(bodies, held_for_fires, settled, &resident)?;
+            .fit_the_card(bodies, held_for_fires, settled, false, &resident)?;
         if arm_trace {
             eprintln!(
                 "[arm-trace] cache rows sized to {} pages ({} MiB, {} sequences at the declared \
@@ -1880,6 +1892,9 @@ fn adapter_fact(classes: &poem_ir::ClassTable, corrected: &poem_ir::ClassSet) ->
 pub(super) struct Baked {
     pub(super) device: Context,
     pub(super) engine: crate::chip::Engine,
+    /// The bodies' allowance is the operator's (a user or pinned profile
+    /// states `[engine] recording`): a hard cap.
+    pub(super) bodies_stated: bool,
     pub(super) compiled: CompiledModel,
     pub(super) budgets: Budgets,
     pub(super) profile: DeviceProfile,

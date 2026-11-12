@@ -103,7 +103,15 @@ impl SharedGrow {
                 }
             };
             match step {
-                RungStep::Wait => return,
+                RungStep::Wait => {
+                    // A lower waits on the scheduler's grant, which it
+                    // publishes each turn: an idle scheduler takes none
+                    // until woken.
+                    if super::rung_granted(self.engine) > super::fire_cap(self.engine) {
+                        crate::scheduler::nudge(self.engine);
+                    }
+                    return;
+                }
                 RungStep::Cap(tokens) => {
                     tracing::info!(
                         engine = self.engine,
@@ -111,6 +119,7 @@ impl SharedGrow {
                         "fires cut to the activation rung"
                     );
                     super::set_fire_cap(self.engine, tokens);
+                    crate::scheduler::nudge(self.engine);
                 }
                 RungStep::Lower(rung) => {
                     let lowered = self.shared.lock().unwrap().lower_rung(rung);

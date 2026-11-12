@@ -601,6 +601,14 @@ fn the_rung_walk_caps_fires_then_lowers_and_raises_back_with_an_evacuation() {
     let mut walk = RungWalk::default();
     assert_eq!(pool.rungs(), [16, 256, 2048]);
     assert_eq!(pool.rung(), 2048);
+    // What may be out counts the room under the rung the pool is at: a
+    // smaller rung's only once it is lowered.
+    let at_largest = (pool.state_chunks_now(), pool.records_capacity());
+    assert_eq!(
+        at_largest.0,
+        TOTAL - pool.pool().reserved_chunks() - pool.pool().act_reserved()
+    );
+    assert!(at_largest.1 < pool.records_most());
     // Down to 256: the cap comes first.
     assert_eq!(
         walk.step(&pool, 256, u32::MAX, u32::MAX, 5, 5).unwrap(),
@@ -626,6 +634,8 @@ fn the_rung_walk_caps_fires_then_lowers_and_raises_back_with_an_evacuation() {
     );
     pool.lower_rung(256).unwrap();
     assert_eq!(pool.rung(), 256);
+    assert!(pool.state_chunks_now() > at_largest.0, "lowered: more room");
+    assert!(pool.records_capacity() > at_largest.1);
     assert_eq!(
         pool.pool().state_limit(),
         TOTAL - 4,
@@ -660,6 +670,11 @@ fn the_rung_walk_caps_fires_then_lowers_and_raises_back_with_an_evacuation() {
         .unwrap();
     pool.apply_rung(&evacuation, 10).unwrap();
     assert_eq!(pool.rung(), 2048);
+    assert_eq!(
+        (pool.state_chunks_now(), pool.records_capacity()),
+        at_largest,
+        "raised: the room it had"
+    );
     assert_eq!(in_way(&pool), 0);
     assert_eq!(engine.table.as_slice(), pool.pool().chunk_table());
     for &record in &kept {

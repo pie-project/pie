@@ -509,7 +509,7 @@ impl RsStore {
     /// nothing off, and a waiter's on top.
     pub fn demand(&self) -> (u32, u32) {
         let reach = self.slots.high_end().max(self.pages.high_end());
-        let out = |pool: &ShapePool<RsSlotId>| pool.capacity() - pool.available() as u32;
+        let out = |pool: &ShapePool<RsSlotId>| pool.capacity().saturating_sub(pool.available() as u32);
         let wanted = out(&self.slots).max(out(&self.pages));
         let kept: HashSet<RsSlotId> = self
             .checkpoints
