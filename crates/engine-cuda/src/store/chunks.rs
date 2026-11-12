@@ -42,6 +42,9 @@ pub struct Chunks {
     /// The chunks the runtime named weight slots in: no page is seated in
     /// one ([`Chunks::keep_clear`]).
     weights: std::collections::BTreeSet<u32>,
+    /// The chunks past the fit, under the activation's span, the runtime
+    /// never names ([`Chunks::skip_past`]): from `skip.0`, `skip.1` of them.
+    skip: (u32, u32),
 }
 
 impl Chunks {
@@ -83,6 +86,7 @@ impl Chunks {
             null_zeroed: false,
             refs: false,
             weights: std::collections::BTreeSet::new(),
+            skip: (total, 0),
         })
     }
 
@@ -176,14 +180,6 @@ impl Chunks {
         self.range.hold(pool, from, bytes, beside)
     }
 
-    /// Backs the `spare` chunks just under the activation, beside the
-    /// pool's budget: what a smaller activation rung hands state first.
-    pub fn hold_spare(&mut self, pool: &mut PhysicalPool, spare: u32) -> Result<Commit> {
-        let chunk = self.layout.chunk_bytes;
-        let from = u64::from(self.total.saturating_sub(spare)) * chunk;
-        self.range.hold(pool, from, u64::from(spare) * chunk, true)
-    }
-
     /// Backs `bytes` of the activation's span from `offset` into it, and
     /// keeps them backed: where a carve laid at the span's top starts.
     pub fn hold_activation_at(
@@ -208,11 +204,11 @@ impl Chunks {
     /// Backs the state's chunks of the segment the runtime's activation
     /// span starts in, and keeps them backed: the runtime counts that
     /// segment committed from the load and opens state below the activation
-    /// inside it. The span starts `spare` chunks under the activation's own
-    /// ([`Chunks::facts`]).
-    pub fn hold_boundary(&mut self, pool: &mut PhysicalPool, spare: u32) -> Result<Commit> {
+    /// inside it. The runtime's span starts where its state chunks end
+    /// ([`Chunks::stated`]).
+    pub fn hold_boundary(&mut self, pool: &mut PhysicalPool) -> Result<Commit> {
         let chunk = self.layout.chunk_bytes;
-        let start = self.total.saturating_sub(spare);
+        let start = self.stated();
         let segment = self.layout.segment_chunks.max(1);
         let first = start / segment * segment;
         if first >= start {
@@ -241,8 +237,38 @@ impl Chunks {
             .limit(u64::from(chunks) * self.layout.chunk_bytes);
     }
 
-    /// Whether physical chunk `chunk` is backed: in a committed segment, or
-    /// in a span held backed.
+    /// States the pool to the runtime as its first `fitted` chunks and the
+    /// activation's right above them: the chunks past the fit (what the
+    /// range was reserved for beyond the settled fit) lie under no chunk id
+    /// the runtime names. Its chunk `fitted + i` is the activation's chunk
+    /// `i`, so a smaller rung hands state the bottom of the activation's
+    /// span, backed already, and never a chunk past the fit. The
+    /// activation keeps its addresses: the armed bodies stay good.
+    pub fn skip_past(&mut self, fitted: u32) {
+        let fitted = fitted.min(self.total);
+        self.skip = (fitted, self.total - fitted);
+    }
+
+    /// The state chunks the runtime counts: the range's but those past the
+    /// fit ([`Chunks::skip_past`]).
+    #[must_use]
+    pub fn stated(&self) -> u32 {
+        self.total - self.skip.1
+    }
+
+    /// Where the runtime's physical chunk `physical` lies in the range: the
+    /// same chunk under the fit, past the skipped chunks from there.
+    #[must_use]
+    fn at(&self, physical: u32) -> u32 {
+        if physical >= self.skip.0 {
+            physical.saturating_add(self.skip.1)
+        } else {
+            physical
+        }
+    }
+
+    /// Whether the range's chunk `chunk` is backed: in a committed segment,
+    /// or in a span held backed.
     #[must_use]
     pub fn backed(&self, chunk: u32) -> bool {
         self.range
@@ -409,30 +435,32 @@ impl Chunks {
             // A slot ref: its chunk is one the runtime opened, in a segment
             // it had backed ahead of this fire.
             let chunk = id / per_chunk;
-            if chunk == 0 || chunk >= self.total {
+            let named = self.stated().saturating_add(self.act);
+            if chunk == 0 || chunk >= named {
                 return Err(Fault::Ceiling {
                     what: "chunks of the state pool a slot ref may name",
                     need: u64::from(chunk) + 1,
-                    have: u64::from(self.total),
+                    have: u64::from(named),
                 });
             }
-            return Ok(self.table.physical(chunk).unwrap_or(chunk));
+            return Ok(self.at(self.table.physical(chunk).unwrap_or(chunk)));
         }
+        let stated = self.stated();
         let seating = &mut self.seated[kind.index()];
         if let Some(&slot) = seating.refs.get(id as usize)
             && slot != UNSEATED
         {
             let chunk = slot / per_chunk;
-            return Ok(self.table.physical(chunk).unwrap_or(chunk));
+            return Ok(self.at(self.table.physical(chunk).unwrap_or(chunk)));
         }
         let (chunk, index) = match seating.open {
             Some((chunk, index)) if index < per_chunk => (chunk, index),
             _ => {
-                if self.next >= self.total {
+                if self.next >= stated {
                     return Err(Fault::Ceiling {
                         what: "chunks of the state pool",
                         need: u64::from(self.next) + 1,
-                        have: u64::from(self.total),
+                        have: u64::from(stated),
                     });
                 }
                 // A chunk the runtime laid weights in is not this pool's
@@ -440,11 +468,11 @@ impl Chunks {
                 while self.weights.contains(&self.next) {
                     self.next += 1;
                 }
-                if self.next >= self.total {
+                if self.next >= stated {
                     return Err(Fault::Ceiling {
                         what: "chunks of the state pool clear of the weights' slots",
                         need: u64::from(self.next) + 1,
-                        have: u64::from(self.total),
+                        have: u64::from(stated),
                     });
                 }
                 self.next += 1;
@@ -456,7 +484,7 @@ impl Chunks {
             seating.refs.resize(id as usize + 1, UNSEATED);
         }
         seating.refs[id as usize] = chunk * per_chunk + index;
-        Ok(self.table.physical(chunk).unwrap_or(chunk))
+        Ok(self.at(self.table.physical(chunk).unwrap_or(chunk)))
     }
 
     /// The slot ref page `id` is seated on.
@@ -477,7 +505,7 @@ impl Chunks {
             })
     }
 
-    /// The physical chunk and the index in it of page `id`'s slot.
+    /// The range's chunk and the index in it of page `id`'s slot.
     fn place(&self, kind: Kind, id: u32) -> Result<(u32, u32)> {
         let shape = self.shape(kind)?;
         let slot = self.slot_ref(kind, id)?;
@@ -487,7 +515,7 @@ impl Chunks {
             need: u64::from(logical) + 1,
             have: u64::from(self.total),
         })?;
-        Ok((physical, slot % shape.per_chunk))
+        Ok((self.at(physical), slot % shape.per_chunk))
     }
 
     /// Bytes from the pool's base to page `id`'s slot.
@@ -519,7 +547,7 @@ impl Chunks {
             have: u64::from(self.total),
         })?;
         self.range.span(
-            u64::from(physical) * self.layout.chunk_bytes
+            u64::from(self.at(physical)) * self.layout.chunk_bytes
                 + u64::from(slot % per_chunk) * slot_bytes,
             slot_bytes,
         )
@@ -570,8 +598,8 @@ impl Chunks {
                 continue;
             }
             spans.push((
-                self.range.span(u64::from(to) * chunk, chunk)?,
-                self.range.span(u64::from(from) * chunk, chunk)?,
+                self.range.span(u64::from(self.at(to)) * chunk, chunk)?,
+                self.range.span(u64::from(self.at(from)) * chunk, chunk)?,
                 usize::try_from(chunk).unwrap_or(0),
             ));
         }
@@ -592,17 +620,15 @@ impl Chunks {
 }
 
 impl Chunks {
-    /// The pool as the runtime counts it: every chunk of the range, the
-    /// null chunk reserved, each shape free to take any chunk, and the
-    /// activation's chunks under the range's end. `spare` chunks under the
-    /// activation's hold nothing the device can back (what the load's own
-    /// allocations took after the range was reserved): they are stated with
-    /// the activation's, so state stays below them.
+    /// The pool as the runtime counts it: the range's chunks but those
+    /// past the fit ([`Chunks::skip_past`]), the null chunk reserved, each
+    /// shape free to take any chunk, and the activation's chunks right
+    /// above the state's; `rungs`, each smaller rung's tokens and its
+    /// activation's chunks.
     #[must_use]
     pub fn facts(
         &self,
         max_tokens: u32,
-        spare: u32,
         flat: bool,
         rungs: &[(u32, u32)],
     ) -> engine::chunk::ChunkFacts {
@@ -661,7 +687,7 @@ impl Chunks {
                 },
             ));
         }
-        let total = self.total.saturating_add(self.act);
+        let total = self.stated().saturating_add(self.act);
         let max = u32::try_from(u64::from(total).div_ceil(u64::from(layout.segment_chunks.max(1))))
             .unwrap_or(u32::MAX);
         ChunkFacts {
@@ -686,11 +712,8 @@ impl Chunks {
             act_chunks: rungs
                 .iter()
                 .filter(|&&(tokens, chunks)| tokens < max_tokens && chunks < self.act)
-                .map(|&(tokens, chunks)| (tokens, chunks.saturating_add(spare)))
-                .chain(std::iter::once((
-                    max_tokens,
-                    self.act.saturating_add(spare),
-                )))
+                .copied()
+                .chain(std::iter::once((max_tokens, self.act)))
                 .collect(),
             host_chunks: 0,
             disk_chunks: 0,
