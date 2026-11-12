@@ -16,6 +16,10 @@ seat_spread = true
 # gemma-4-E4B's pool seats 17-18 lanes, which a powers-of-two ladder ran as 32-lane decodes: a 24-lane
 # rung runs them at 24 (c256 928 -> 1027 tok/s)
 pad.half_rungs = 32
+# a load's warm ladder compiles for 35 minutes at most, the rest of its shapes at their first fire: a v5e host
+# compiles Qwen3.6-35B-A3B's 40-layer programs ~25 s each three at a time, and its 1280- and 2048-row ladders ran
+# past the hour a round has (161 programs in 54 min at 1280 rows; 129 in two hours at 2048), so the cell never ran
+warm_budget_s = 2100
 
 # a blocked attention's row blocks as a loop: in line, DeepSeek-V4's 1792-row prompt programs ran a v5e
 # host's 47 GiB out compiling them
@@ -59,6 +63,7 @@ measured = [
   "engine.seat_spread",
   "engine.seat_to_end",
   "engine.seated_first",
+  "engine.warm_budget_s",
   "kernel.attn.decode_pages",
   "kernel.attn.flash_narrow_rows",
   "kernel.attn.unrolled_blocks",

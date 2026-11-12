@@ -333,6 +333,14 @@ impl Shell {
             .min(room)
             .clamp(1, texts.len().max(1));
         let next = std::sync::atomic::AtomicUsize::new(0);
+        // Past the profile's budget the shapes not reached yet compile at
+        // their first fire (a v5e host compiles Qwen3.6-35B-A3B's 2048-row
+        // ladder ~25 s a program, three at a time: past two hours cold).
+        let deadline = (self.warm_budget_s > 0).then(|| {
+            std::time::Instant::now()
+                + std::time::Duration::from_secs(u64::from(self.warm_budget_s))
+        });
+        let late = std::sync::atomic::AtomicUsize::new(0);
         let device = &self.device;
         let mut programs: Vec<Option<Result<std::sync::Arc<crate::device::Program>>>> =
             (0..texts.len()).map(|_| None).collect();
@@ -349,6 +357,12 @@ impl Shell {
                         let Some((text, sig)) = texts.get(at) else {
                             break;
                         };
+                        if deadline.is_some_and(|d| std::time::Instant::now() >= d)
+                            && !device.on_disk(text)
+                        {
+                            late.fetch_add(1, SeqCst);
+                            continue;
+                        }
                         let hold = hold_bytes(text);
                         let kept = held
                             .fetch_update(SeqCst, SeqCst, |h| {
@@ -415,6 +429,14 @@ impl Shell {
             }
             programs[at] = Some(device.program(text, (*sig).clone()));
             parked -= 1;
+        }
+        let late = late.load(SeqCst);
+        if late > 0 {
+            tracing::warn!(
+                late,
+                budget_s = self.warm_budget_s,
+                "xla warm ladder past its compile budget: the rest compile at their first fire"
+            );
         }
         if parked > 0 {
             tracing::warn!(

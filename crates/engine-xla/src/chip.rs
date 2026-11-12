@@ -192,6 +192,13 @@ pub struct PadRowSteps(pub u32);
 #[decision(id = "engine.pad.half_rungs", constant(set(0, 32, 64, 128, 256, 512)), default = 0, tune = search)]
 pub struct PadHalfRungs(pub u32);
 
+/// Seconds a load's warm ladder may spend compiling: the shapes it has not
+/// reached by then compile at their first fire, as every shape did before
+/// the ladder (0: no limit).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Decision)]
+#[decision(id = "engine.warm_budget_s", constant(range(0..=86400)), default = 0, tune = search)]
+pub struct WarmBudget(pub u32);
+
 /// Whether a decoding lane's next pages come before seating a waiting
 /// prompt, and a prompt waits rather than suspending a lane
 /// (`PoolFacts::seated_first`). Off keeps arrival order.
@@ -226,6 +233,7 @@ static REGISTRY: LazyLock<Registry> = LazyLock::new(|| {
         .add::<PrefillFloor>()
         .add::<PadRowSteps>()
         .add::<PadHalfRungs>()
+        .add::<WarmBudget>()
         .add::<SeatedFirst>()
         .add::<SeatToEnd>()
         .add::<SeatSpread>();
@@ -254,6 +262,8 @@ pub struct Engine {
     pub pad: Pad,
     /// `engine.seated_first`, `engine.seat_to_end`, `engine.seat_spread`.
     pub seats: [bool; 3],
+    /// `engine.warm_budget_s`.
+    pub warm_budget_s: u32,
 }
 
 /// How fires are padded to canonical shapes.
@@ -344,6 +354,7 @@ impl Engine {
                 profile.on::<SeatToEnd>(any),
                 profile.on::<SeatSpread>(any),
             ],
+            warm_budget_s: profile.get::<WarmBudget>().0,
         }
     }
 }

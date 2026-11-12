@@ -219,6 +219,8 @@ pub struct Shell {
     pad: crate::chip::Pad,
     /// `chip::Engine::seats`.
     seats: [bool; 3],
+    /// `chip::Engine::warm_budget_s`.
+    warm_budget_s: u32,
     tpu: crate::chip::Tpu,
     handles: Handles,
     trace: Trace,
@@ -716,6 +718,7 @@ impl Shell {
             tuning,
             pad,
             seats: engine.seats,
+            warm_budget_s: engine.warm_budget_s,
             tpu,
             device,
             handles,
