@@ -116,38 +116,6 @@ pub trait Engine: Send {
 
     fn submit(&mut self, frame: &FrameSubmission) -> Result<FrameTicket>;
 
-    /// Puts memory under every kv page below `kv_pages` and every state
-    /// slot, ahead of the runtime handing any of them out, so no frame finds
-    /// its pages unbacked. A refusal leaves what was committed standing. A
-    /// pool that is whole from its load has nothing to do.
-    fn commit_pool(&mut self, kv_pages: u32) -> Result<()> {
-        let _ = kv_pages;
-        Ok(())
-    }
-
-    /// Gives back the memory under every kv page at and past `kv_pages`. No
-    /// frame reads those pages: the runtime has moved what they held and
-    /// waited out every frame that named them, so nothing here drains.
-    fn release_pool(&mut self, kv_pages: u32) -> Result<()> {
-        let _ = kv_pages;
-        Ok(())
-    }
-
-    /// Puts memory under every state slot and buffer page below `slots`,
-    /// where `PoolFacts::elastic_state_slot_bytes` says it does not stand
-    /// from the load.
-    fn commit_state(&mut self, slots: u32) -> Result<()> {
-        let _ = slots;
-        Ok(())
-    }
-
-    /// Gives back the memory under every state slot and buffer page at and
-    /// past `slots`; as [`Engine::release_pool`], no frame reads them.
-    fn release_state(&mut self, slots: u32) -> Result<()> {
-        let _ = slots;
-        Ok(())
-    }
-
     /// Backs the pool's first `segments` segments
     /// ([`crate::chunk::ChunkFacts::segments`]), ahead of the runtime
     /// handing out any of their chunks; never on a fire's path. A refusal
@@ -211,12 +179,6 @@ pub trait Engine: Send {
     /// resident or not: the record the runtime orders the weight cache by.
     fn weight_uses(&mut self) -> Result<WeightUses> {
         Err(self.unsupported("weight_uses"))
-    }
-
-    /// Gives back what fires have touched of the scratch, waiting out the
-    /// frames in flight; the next fires pay for what they touch again.
-    fn release_scratch(&mut self) -> Result<()> {
-        Ok(())
     }
 
     fn settles_asynchronously(&self) -> bool {

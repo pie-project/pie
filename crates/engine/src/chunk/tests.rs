@@ -23,7 +23,6 @@ fn hybrid() -> PoolFacts {
         state_slot_bytes: 37 << 20,
         buffer_pages: 66,
         host_kv_pages: 8_192,
-        elastic_state_slot_bytes: 38 << 20,
         ..PoolFacts::default()
     }
 }
