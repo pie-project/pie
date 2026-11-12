@@ -60,14 +60,7 @@ pub(super) fn gdn_step(
     Ok(Some((out[0], out[1])))
 }
 
-fn kernel(
-    t: i64,
-    g: i64,
-    hv: i64,
-    rows: i64,
-    per: i64,
-    mxu: bool,
-) -> Built<crate::mosaic::Compiled> {
+fn kernel(t: i64, g: i64, hv: i64, rows: i64, per: i64, mxu: bool) -> Built<crate::mosaic::Compiled> {
     let (dk, dv) = (128, 128);
     let lane = |w: i64| Operand {
         array: vec![t, hv, w],
