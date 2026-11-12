@@ -1322,3 +1322,13 @@ The `new-memory/` directory is bookkeeping and is removed before anything lands 
 - sm_120: 0 eager fires with MTP; buffered goldens bitwise vs the eager walk; golden_logits / by_refs = base.
   Boot Qwen3.5-0.8B 20.1 s (main 22.1-22.5), Qwen3-0.6B 7.9 s (main 10.1); c64 / c256 unchanged vs base; MTP
   64 concurrent 5357 tok/s (main fails a second MTP process).
+
+### M108 — 2026-11-12: per-fire host work at high lane counts
+- `sc/cuda-residual` (95d24bd79): the scheduler moves lanes (with their tables / fixed / slot_copies) into the frame
+  instead of cloning; FireInFlight counts skip the planner's O(P) with_inner walk (was O(P^2) per step under the
+  planner lock, ~131k process visits per frame at c256); state_tables / seat_pages without per-lane copies. Decode
+  frame host phases at c64 now at or below main's. golden_logits / by_refs = base; runtime scheduler / planner /
+  pipeline / store pass. sm_120 is GPU/power-bound, so throughput there is unchanged (c64 12221 vs main 12301).
+- Found: Qwen3.5 gdn_step / conv1d +7% per launch in serving from codegen (StateRows arg: 178 regs vs main's 205);
+  compile-time single-segment specialization next. A/B tip: share gemm-algos picks across builds (each binary
+  times and caches its own; ~13% of picks differ -> +/-0.3-1% bias).
