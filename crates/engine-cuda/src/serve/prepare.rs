@@ -463,11 +463,11 @@ impl FrameShell for Shell {
                 ),
             })
             .collect();
-        // A buffering fire pads to a bucket the lattice records its
-        // treatments at (`Shell::rs_rungs`).
-        let buffering = lanes
-            .iter()
-            .any(|seated| matches!(seated.rs, RsVerb::Buffer { .. }));
+        // A buffering fire, or one of a drafter's class, pads to a bucket the
+        // lattice records it at (`Shell::rs_rungs`).
+        let buffering = lanes.iter().any(|seated| {
+            matches!(seated.rs, RsVerb::Buffer { .. }) || self.drafts_only(seated.lane.word)
+        });
         let at = self.forced_bucket.take().or_else(|| {
             let rows: u32 = lane_rows.iter().sum();
             buffering

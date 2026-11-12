@@ -198,6 +198,8 @@ struct Deployment {
     /// The classes keyed only for a speculative decoder's fires (plain but
     /// for reading the drafts): armed alone, never beside another class.
     drafting: Vec<usize>,
+    /// The buckets a drafter's class is armed at (`Shell::rs_rungs`).
+    rs_rungs: Vec<u32>,
     media: Vec<usize>,
     wide: Vec<usize>,
     decoding: poem_ir::ClassSet,
@@ -241,6 +243,9 @@ fn decode_keys(deployment: &Deployment, into: &mut Targets) {
 fn prefill_keys(deployment: &Deployment, into: &mut Targets) {
     for point in deployment.buckets.iter().copied() {
         for class in deployment.prefilling.iter().copied() {
+            if deployment.drafting.contains(&class) && !deployment.rs_rungs.contains(&point) {
+                continue;
+            }
             match Shell::spread(
                 point,
                 deployment.seats.min(match deployment.prefill_lanes {
@@ -1028,6 +1033,7 @@ impl Shell {
             drafting: (0..classes)
                 .filter(|class| !self.landing[*class].iter().any(poem_ir::Request::plain))
                 .collect(),
+            rs_rungs: self.rs_rungs(),
             decoding: self.decoding.clone(),
             seats,
             context,

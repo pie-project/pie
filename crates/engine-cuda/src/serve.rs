@@ -814,10 +814,23 @@ impl Shell {
             .is_some_and(|class| self.wide.contains(class))
     }
 
-    /// The token buckets a fire whose lanes buffer recurrent rows composes
-    /// at: each one up to the lane ceiling (every decode width), past it the
-    /// powers of two and the widest. The lattice records the buffering
-    /// treatments at these alone.
+    /// The token buckets a fire whose lanes buffer recurrent rows, or land
+    /// in a drafter's class, composes at: each one up to the lane ceiling
+    /// (every decode width), past it the powers of two and the widest. The
+    /// lattice records those at these alone.
+    /// Whether a lane of `word` lands in a class keyed only for a drafter's
+    /// fires (plain but for reading the drafts): it composes at
+    /// [`Shell::rs_rungs`] too, a verify's lanes being narrow.
+    fn drafts_only(&self, word: u64) -> bool {
+        self.compiled
+            .classes
+            .class_of(word & self.compiled.classes.mask)
+            .is_some_and(|class| {
+                self.tiers.plain.contains(class)
+                    && !self.landing[class].iter().any(poem_ir::Request::plain)
+            })
+    }
+
     fn rs_rungs(&self) -> Vec<u32> {
         let ceiling = self.lane_ceiling();
         let top = self.budget.buckets.last().copied();
