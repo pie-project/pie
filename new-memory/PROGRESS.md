@@ -1333,3 +1333,13 @@ The `new-memory/` directory is bookkeeping and is removed before anything lands 
   a layer's 64 lane states sit one record (~10.37 MB) apart at the same offset (likely L2 set/slice aliasing);
   +16% in the partly-L2-resident regime vs main's contiguous bank. Stride/offset sweep next. A/B tip: share gemm-algos picks across builds (each binary
   times and caches its own; ~13% of picks differ -> +/-0.3-1% bias).
+
+### M109 — 2026-11-12: dead code and non-essential tests removed (user instruction)
+- `sc/dead-code-4` (53850520c): phase 2 deletes the unreachable pre-shared-pool elastic path (runtime store::grow,
+  PoolOp commit/release verbs, KvStore/RsStore extent methods, the tail-past-limit machinery, Engine commit/release
+  verbs, PoolFacts elastic fields, engine-cuda commit_pool & co, Metal release_scratch & co, poem-compiler prefetch
+  slotting) ~2,100 lines. Phase 3 deletes tests new-memory added except the essential gates (~23,850 lines): CUDA /
+  ROCm golden probes (fixtures, logits, by_refs, offload, buffered x3, rows, held_small, experts, eager_resume),
+  Metal / Vulkan / wgpu / XLA logits gates, one runtime test per store mechanism, kernels moe_table(_fp8/_fp4) /
+  ROCm linear_moe_table, poem-compiler every_deployment_packs_into_chunks. Main's tests untouched.
+- Merge: +72 / -25,947. Workspace --all-targets, engine-cuda cuda/rocm --tests, pie cuda check clean; runtime 150 pass.
