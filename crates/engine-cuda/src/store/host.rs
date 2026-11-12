@@ -10,7 +10,9 @@
 //! into their slots, so the copy costs the engine thread what enqueueing it
 //! does. A move to the device first waits for any landing into its slots,
 //! copies them into the ring, and copies the ring to the device on the swap
-//! stream. Nothing is page-locked on a move's path: the ring was at seating.
+//! stream. Nothing is page-locked on a move's path: the landing thread pins
+//! the ring as it starts, beside the rest of the boot, and the first move
+//! waits for it.
 
 use std::sync::mpsc::{Receiver, Sender};
 use std::sync::{Arc, Condvar, Mutex};
@@ -26,7 +28,8 @@ use crate::error::{Fault, Result};
 /// pageable pages, slow under memory pressure (0.1 to 2 GB/s): a suspend of
 /// one process, up to a quarter of the pool, then enqueues and returns
 /// rather than holding every fire behind it. The ring is page-locked from
-/// seating, so it costs that much host memory and pinning time at boot.
+/// seating, so it costs that much host memory; the pinning runs on the
+/// landing thread, off the load's path ([`pin_ring`]).
 #[must_use]
 pub fn staging_ring(device: u64, budget: u64) -> u64 {
     const LEAST: u64 = 512 << 20;
@@ -52,6 +55,8 @@ struct Job {
     moves: Vec<(usize, usize, usize)>,
     /// The ring's allocation counter past this batch: its space comes back.
     end: u64,
+    /// The ring's host address.
+    ring: usize,
 }
 
 /// What the landing thread reports back.
@@ -62,6 +67,9 @@ struct Landed {
     /// The last batch landed.
     done: u64,
     fault: Option<String>,
+    /// The ring's host and device addresses, once the landing thread has
+    /// pinned it.
+    ring: Option<(usize, u64)>,
 }
 
 struct Shared {
@@ -76,7 +84,10 @@ pub struct HostTier {
     chunks: u32,
     base: *mut u8,
     len: usize,
-    ring: Pinned,
+    /// The staging ring's bytes.
+    ring_bytes: usize,
+    /// Its host and device addresses, once read from the landing thread.
+    ring: Option<(usize, u64)>,
     /// Ring bytes handed out (a counter; the offset is it modulo the ring).
     head: u64,
     /// The landing thread's `freed` as last read: it only grows.
@@ -94,7 +105,7 @@ impl std::fmt::Debug for HostTier {
         f.debug_struct("HostTier")
             .field("chunk_bytes", &self.chunk_bytes)
             .field("chunks", &self.chunks)
-            .field("ring", &self.ring.bytes())
+            .field("ring", &self.ring_bytes)
             .finish_non_exhaustive()
     }
 }
@@ -136,8 +147,7 @@ impl HostTier {
         unsafe {
             libc::madvise(base, len.max(1), libc::MADV_HUGEPAGE);
         }
-        let ring_bytes = ring.max(2 * chunk_bytes);
-        let ring = Pinned::mapped_uninit(usize::try_from(ring_bytes).unwrap_or(usize::MAX))?;
+        let ring_bytes = usize::try_from(ring.max(2 * chunk_bytes)).unwrap_or(usize::MAX);
         let shared = Arc::new(Shared {
             landed: Mutex::new(Landed::default()),
             moved: Condvar::new(),
@@ -146,11 +156,10 @@ impl HostTier {
         let thread = {
             let shared = shared.clone();
             let ordinal = crate::device::ctx::current()?;
-            let ring_at = ring.host() as usize;
             let base_at = base as usize;
             std::thread::Builder::new()
                 .name("pie-host-tier-land".to_string())
-                .spawn(move || land(&jobs, &shared, ordinal, ring_at, base_at))
+                .spawn(move || land(&jobs, &shared, ordinal, ring_bytes, base_at))
                 .map_err(|why| Fault::Unbound {
                     what: format!("the host tier's landing thread: {why}"),
                 })?
@@ -160,7 +169,8 @@ impl HostTier {
             chunks,
             base: base.cast(),
             len,
-            ring,
+            ring_bytes,
+            ring: None,
             head: 0,
             freed: 0,
             next: 0,
@@ -181,6 +191,25 @@ impl HostTier {
         self.chunk_bytes
     }
 
+    /// The ring's host and device addresses: waits for the landing thread
+    /// to have pinned it.
+    fn ring(&mut self) -> Result<(usize, u64)> {
+        if let Some(ring) = self.ring {
+            return Ok(ring);
+        }
+        let mut landed = self.shared.landed.lock().expect("the landing state");
+        loop {
+            if let Some(ring) = landed.ring {
+                self.ring = Some(ring);
+                return Ok(ring);
+            }
+            if let Some(fault) = landed.fault.clone() {
+                return Err(Fault::Unbound { what: fault });
+            }
+            landed = self.shared.moved.wait(landed).expect("the landing state");
+        }
+    }
+
     /// Bytes of ring `len` bytes may take, waiting for earlier batches to
     /// land where it is full; `flush` sends what the caller has gathered
     /// first, since what it waits for may be that.
@@ -189,7 +218,7 @@ impl HostTier {
         len: usize,
         flush: &mut impl FnMut(&mut Self) -> Result<()>,
     ) -> Result<usize> {
-        let size = self.ring.bytes() as u64;
+        let size = self.ring_bytes as u64;
         let len = len as u64;
         if len > size {
             return Err(Fault::Ceiling {
@@ -269,8 +298,9 @@ impl HostTier {
         }
         // A move to the device reads its slots into the ring on the swap
         // stream's own host thread, ahead of the copy: not on this one.
+        let (ring, _) = self.ring()?;
         if !to_host {
-            let (ring, base) = (self.ring.host() as usize, self.base as usize);
+            let base = self.base as usize;
             let reads = moves.clone();
             crate::device::ctx::host_fn_on(
                 swap,
@@ -312,6 +342,7 @@ impl HostTier {
             landed: Landing(ours),
             moves: if to_host { moves } else { Vec::new() },
             end: self.head,
+            ring,
         };
         spans.clear();
         self.send
@@ -333,6 +364,7 @@ impl HostTier {
         swap: *mut core::ffi::c_void,
         slots: &[(u64, u64, usize)],
     ) -> Result<Option<Event>> {
+        let (_, ring) = self.ring()?;
         let (mut spans, mut moves, mut landed) = (Vec::new(), Vec::new(), None);
         for &(device, offset, len) in slots {
             let offset = self.check(offset, len)?;
@@ -342,7 +374,7 @@ impl HostTier {
                     tier.send_batch(swap, true, spans, moves, landed)
                 })?
             };
-            spans.push((self.ring.device() + at as u64, device, len));
+            spans.push((ring + at as u64, device, len));
             moves.push((at, offset, len));
         }
         self.send_batch(swap, true, &mut spans, &mut moves, &mut landed)?;
@@ -363,6 +395,7 @@ impl HostTier {
                 .iter()
                 .map(|&(offset, ..)| (offset / chunk_bytes) as u32),
         )?;
+        let (_, ring) = self.ring()?;
         let (mut spans, mut moves, mut landed) = (Vec::new(), Vec::new(), None);
         for &(offset, device, len) in slots {
             let offset = self.check(offset, len)?;
@@ -372,7 +405,7 @@ impl HostTier {
                     tier.send_batch(swap, false, spans, moves, landed)
                 })?
             };
-            spans.push((device, self.ring.device() + at as u64, len));
+            spans.push((device, ring + at as u64, len));
             moves.push((at, offset, len));
         }
         self.send_batch(swap, false, &mut spans, &mut moves, &mut landed)?;
@@ -401,16 +434,35 @@ impl Drop for HostTier {
     }
 }
 
-/// The landing thread: each batch, once its copies landed, moved from the
-/// ring into the tier, and its ring space handed back.
-fn land(jobs: &Receiver<Job>, shared: &Shared, ordinal: i32, ring: usize, base: usize) {
-    if let Err(why) = crate::device::ctx::bind_thread(ordinal) {
+/// The landing thread: first the staging ring of `ring_bytes`, pinned, its
+/// addresses handed to the tier; then each batch, once its copies landed,
+/// moved from the ring into the tier, and its ring space handed back. The
+/// ring lives as long as the thread: the tier drops after joining it.
+fn land(jobs: &Receiver<Job>, shared: &Shared, ordinal: i32, ring_bytes: usize, base: usize) {
+    let refuse = |what: String| {
+        eprintln!("engine-cuda: {what}");
         let mut landed = shared.landed.lock().expect("the landing state");
-        landed.fault = Some(format!(
-            "the host tier's landing thread bound no device: {why}"
-        ));
+        landed.fault = Some(what);
         shared.moved.notify_all();
+    };
+    if let Err(why) = crate::device::ctx::bind_thread(ordinal) {
+        refuse(format!("the host tier's landing thread bound no device: {why}"));
         return;
+    }
+    let ring = match pin_ring(ring_bytes) {
+        Ok(ring) => ring,
+        Err(why) => {
+            refuse(format!(
+                "the host tier's staging ring of {} MiB was not pinned: {why}",
+                ring_bytes >> 20
+            ));
+            return;
+        }
+    };
+    {
+        let mut landed = shared.landed.lock().expect("the landing state");
+        landed.ring = Some((ring.host() as usize, ring.device()));
+        shared.moved.notify_all();
     }
     while let Ok(job) = jobs.recv() {
         let settled = job.landed.0.settle();
@@ -418,7 +470,7 @@ fn land(jobs: &Receiver<Job>, shared: &Shared, ordinal: i32, ring: usize, base: 
             let mut landed = shared.landed.lock().expect("the landing state");
             landed.fault = Some(format!("a host tier move did not land: {why}"));
         } else {
-            land_moves(&job.moves, ring, base);
+            land_moves(&job.moves, job.ring, base);
         }
         drop(job.landed);
         let mut landed = shared.landed.lock().expect("the landing state");
@@ -426,6 +478,22 @@ fn land(jobs: &Receiver<Job>, shared: &Shared, ordinal: i32, ring: usize, base: 
         landed.done = job.id;
         shared.moved.notify_all();
     }
+}
+
+/// The threads that fault the ring's pages in before it is locked.
+const RING_FAULTERS: usize = 8;
+
+/// The staging ring, page-locked: faulted in first, in huge pages where the
+/// kernel has them, so the driver only pins what is there (a fraction of
+/// `cudaHostAlloc`'s time under its lock, and of its unpinning at exit).
+fn pin_ring(bytes: usize) -> Result<Pinned> {
+    #[cfg(target_os = "linux")]
+    if let Some(faulted) = crate::device::Pinning::faulted(bytes, RING_FAULTERS)
+        && let Ok(ring) = faulted.lock()
+    {
+        return Ok(ring);
+    }
+    Pinned::mapped_uninit(bytes)
 }
 
 /// The threads one batch's moves are split over: copying into fresh pages
