@@ -2664,6 +2664,7 @@ mod tests {
                 max_page_refs: 64,
                 max_context: 0,
                 prefill_rows: 0,
+                mixed_forward_tokens: 0,
                 max_readouts: 0,
             },
             &stats,

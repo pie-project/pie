@@ -15,6 +15,9 @@ pub struct SchedulerLimits {
     pub max_context: usize,
     /// The rows one prefill fire takes best (0: up to `max_forward_tokens`).
     pub prefill_rows: usize,
+    /// The most tokens a step holding a decode takes (0: up to
+    /// `max_forward_tokens`).
+    pub mixed_forward_tokens: usize,
     /// 0: up to `max_forward_tokens`.
     pub max_readouts: usize,
 }

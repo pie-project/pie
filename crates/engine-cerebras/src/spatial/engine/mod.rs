@@ -202,6 +202,7 @@ impl Engine for Spatial {
                 max_page_refs: paging.pages_per_slot,
                 max_context: paging.context().min(model_context),
                 prefill_rows: 0,
+                mixed_tokens: 0,
                 max_readouts: budgets.max_tokens,
             },
             has_lora: false,

@@ -168,6 +168,10 @@ pub struct XlaEngineOptions {
     /// outgrows its seat meets kv pressure as any other. Omit for
     /// `max_model_len`.
     pub seat_tokens: Option<u32>,
+    /// The most tokens a fire holding a decode takes, under
+    /// `max_forward_tokens`: a fire of prompts alone still takes those. Omit
+    /// for `max_forward_tokens`.
+    pub mixed_tokens: Option<u32>,
 }
 
 impl XlaEngineOptions {
