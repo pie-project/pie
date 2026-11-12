@@ -27,7 +27,6 @@ impl Shell {
             state_slots: if state_rows { paging.slots } else { 0 },
             state_slot_bytes: self.state_slot_bytes(),
             adapter_banks: u32::try_from(self.banks().len()).unwrap_or(u32::MAX),
-            slab_kv_page_bytes: self.kv_page_bytes(),
             disk_kv_pages,
             // The model's window; its rows lie in window lists.
             window_tokens: poem_exec::store::kv::declared_window(self.trace()).unwrap_or(0),
