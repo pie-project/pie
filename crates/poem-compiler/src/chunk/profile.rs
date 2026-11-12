@@ -38,6 +38,11 @@ pub struct ChunkProfile {
     /// Whether the backend keeps every state row in f32 whatever the trace
     /// declares (integer rows apart): Metal's recurrent kernels do.
     pub state_f32: bool,
+    /// Whether the backend replays a Mamba-2 layer's buffered rows (its
+    /// conv's input and its step sizes) as it does a gated-delta or KDA
+    /// layer's: the rs list then holds them too. Else a Mamba-2 layer
+    /// buffers nothing.
+    pub rs_mamba2: bool,
     /// The tokens a slot of the kv list holds, where the backend's kernels
     /// page their rows by a count of their own (and a slot of each window
     /// list too where `one_window` holds; else a window list still picks
@@ -87,6 +92,7 @@ impl ChunkProfile {
         context: 32 * 1024,
         cut_experts: false,
         state_f32: false,
+        rs_mamba2: true,
         token_slot: None,
         one_window: false,
         full_from: None,
@@ -105,6 +111,7 @@ impl ChunkProfile {
         context: 8 * 1024,
         cut_experts: true,
         state_f32: true,
+        rs_mamba2: false,
         token_slot: None,
         one_window: false,
         full_from: None,
@@ -122,6 +129,7 @@ impl ChunkProfile {
         context: 32 * 1024,
         cut_experts: false,
         state_f32: false,
+        rs_mamba2: false,
         token_slot: None,
         one_window: false,
         full_from: None,

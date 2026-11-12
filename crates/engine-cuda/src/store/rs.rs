@@ -187,6 +187,19 @@ fn ext_row_bytes(trace: &Trace) -> Result<u64> {
                 }
                 total
             }
+            Operation::Ssm(
+                Ssm::Mamba2Chunked { xbc, dt, z, y, .. } | Ssm::Mamba2 { xbc, dt, z, y, .. },
+            ) => {
+                let mut total =
+                    row_bytes(*xbc)? + row_bytes(*dt)? + row_bytes(*z)? + row_bytes(*y)?;
+                if let Some(Operation::Ssm(
+                    Ssm::CausalConv1dChunked { x, .. } | Ssm::CausalConv1d { x, .. },
+                )) = defined.get(&xbc.0).map(|n| &trace.nodes[*n].op)
+                {
+                    total += row_bytes(*x)?;
+                }
+                total
+            }
             _ => continue,
         };
         widest = widest.max(total);
@@ -196,9 +209,14 @@ fn ext_row_bytes(trace: &Trace) -> Result<u64> {
 
 /// The planes a recurrence reads besides the conv's rows: the gated-delta
 /// pair's `[b | a]` stands behind an `SsmGdnPrep`, the KDA pair's forget and
-/// beta projections are read by the scan itself.
+/// beta projections are read by the scan itself, as a Mamba-2 scan reads its
+/// step sizes.
 #[derive(Clone, Copy)]
 enum Reads {
+    Mamba2 {
+        xbc: ValueId,
+        dt: ValueId,
+    },
     GatedDelta {
         qkv: ValueId,
         gates: ValueId,
@@ -295,11 +313,19 @@ pub fn read(trace: &Trace, page_tokens: u32) -> Result<Option<(Planes, u64, u32)
                     },
                     false,
                 ),
+                Operation::Ssm(Ssm::Mamba2Chunked { xbc, dt, .. }) => {
+                    (Reads::Mamba2 { xbc: *xbc, dt: *dt }, true)
+                }
+                Operation::Ssm(Ssm::Mamba2 { xbc, dt, .. }) => {
+                    (Reads::Mamba2 { xbc: *xbc, dt: *dt }, false)
+                }
                 _ => continue,
             };
             let written = |id: ValueId| defined.get(&id.0).map(|n| (*n, &trace.nodes[*n].op));
             let conv = match reads {
-                Reads::GatedDelta { qkv, .. } | Reads::Kda { mixed: qkv, .. } => written(qkv),
+                Reads::GatedDelta { qkv, .. }
+                | Reads::Kda { mixed: qkv, .. }
+                | Reads::Mamba2 { xbc: qkv, .. } => written(qkv),
             }
             .and_then(|(n, op)| match op {
                 Operation::Ssm(Ssm::CausalConv1dChunked { x, .. }) if chunked => Some((n, *x)),
@@ -320,6 +346,9 @@ pub fn read(trace: &Trace, page_tokens: u32) -> Result<Option<(Planes, u64, u32)
                     ("the forget projection's rows", f, None),
                     ("the beta projection's rows", b, None),
                 ]),
+                Reads::Mamba2 { dt, .. } => {
+                    Some(vec![("the step sizes", dt, written(dt).map(|(n, _)| n))])
+                }
             };
             let (Some((conv_at, x)), Some(others)) = (conv, others) else {
                 if !chunked {
@@ -337,6 +366,11 @@ pub fn read(trace: &Trace, page_tokens: u32) -> Result<Option<(Planes, u64, u32)
                             "the chunked KDA recurrence at node {at}, whose `mixed` is not \
                              written by a chunked conv — this shell buffers the conv's rows \
                              beside the forget and beta projections and knows no other shape"
+                        ),
+                        Reads::Mamba2 { .. } => format!(
+                            "the chunked Mamba-2 recurrence at node {at}, whose `xbc` is not \
+                             written by a chunked conv — this shell buffers the conv's rows \
+                             beside the step sizes and knows no other shape"
                         ),
                     },
                 });

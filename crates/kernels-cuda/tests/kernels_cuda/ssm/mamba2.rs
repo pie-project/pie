@@ -160,6 +160,7 @@ fn the_mamba2_scan_and_step_answer_the_serial_recurrence() {
         Tensor::new(z_at, n, INNER as u32, Dtype::Bf16),
         m,
         &pool,
+        None,
         N as u32,
         &mut Tensor::new(y_at, n, INNER as u32, Dtype::Bf16),
     )
@@ -199,4 +200,109 @@ fn the_mamba2_scan_and_step_answer_the_serial_recurrence() {
         off <= 2e-2 * scale,
         "the folded slots: off by {off} of {scale}"
     );
+}
+
+/// A lane's rows walked as a buffering fire walks them: the scan folds the
+/// first `commit` rows into the slot, then a pass from `commit` on (the
+/// segment origin, the state left unwritten) lands the rest. Every row
+/// answers the serial recurrence whatever the split, and the slot holds the
+/// state after `commit` rows.
+#[test]
+fn a_mamba2_scan_split_at_its_commit_answers_the_serial_recurrence() {
+    const ROWS: usize = 5;
+    for commit in [0usize, 2, ROWS] {
+        let mut gpu = Gpu::open();
+        let mut lcg = Lcg::seeded(0x5e9 + commit as u64);
+        let (xbc_raw, xbc) = lcg.row(ROWS * WIDTH);
+        let (_, dt) = lcg.row(ROWS * HEADS);
+        let (z_raw, z) = lcg.row(ROWS * INNER);
+        let (norm_raw, norm) = lcg.row(INNER);
+        let rows = Rows {
+            xbc,
+            dt: dt.iter().map(|v| from_bf16(to_bf16(v - 2.0))).collect(),
+            z,
+            a_log: (0..HEADS).map(|_| 0.5 * lcg.unit()).collect(),
+            dt_bias: (0..HEADS).map(|_| 0.5 * lcg.unit()).collect(),
+            d: (0..HEADS).map(|_| lcg.unit()).collect(),
+            norm,
+        };
+        let dt_raw: Vec<u16> = rows.dt.iter().map(|v| to_bf16(*v)).collect();
+        let seed: Vec<f32> = (0..STRIDE).map(|_| 0.1 * lcg.unit()).collect();
+        let mut want_slab = seed.clone();
+        let mut committed = seed.clone();
+        let mut want = Vec::new();
+        for row in 0..ROWS {
+            want.extend(reference(&rows, row, &mut want_slab, 0));
+            if row + 1 == commit {
+                committed.clone_from(&want_slab);
+            }
+        }
+        let m = ssm::Mamba2 {
+            a_log: Tensor::new(gpu.up(&rows.a_log), 1, HEADS as u32, Dtype::F32),
+            dt_bias: Tensor::new(gpu.up(&rows.dt_bias), 1, HEADS as u32, Dtype::F32),
+            d: Tensor::new(gpu.up(&rows.d), 1, HEADS as u32, Dtype::F32),
+            norm: Tensor::new(gpu.up(&norm_raw), 1, INNER as u32, Dtype::Bf16),
+            eps: EPS,
+            heads: HEADS as u32,
+            groups: GROUPS as u32,
+        };
+        let slab_at = gpu.up(&seed);
+        let commit_at = gpu.up(&[commit as i32]);
+        let pool = RecurrentPool {
+            slab: Tensor::new(slab_at, 1, STRIDE as u32, Dtype::F32),
+            slot_ids: Tensor::new(gpu.up(&[0i32]), 1, 1, Dtype::I32),
+            slot_stride_elems: STRIDE as i64,
+            conv_slab: Tensor::ABSENT,
+            conv_stride: 0,
+            write_state: true,
+            write_state_mask: Tensor::ABSENT,
+            commit_len: Tensor::new(commit_at, 1, 1, Dtype::I32),
+            begin_at: Tensor::ABSENT,
+            fused_decay: false,
+            segments: kernels_cuda::Segments::ONE,
+            snapshots: kernels_cuda::Snapshots::NONE,
+        };
+        let tail = RecurrentPool {
+            write_state: false,
+            commit_len: Tensor::ABSENT,
+            begin_at: Tensor::new(commit_at, 1, 1, Dtype::I32),
+            ..pool
+        };
+        let n = ROWS as u32;
+        let xbc = RaggedTensor {
+            data: Tensor::new(gpu.up(&xbc_raw), n, WIDTH as u32, Dtype::Bf16),
+            indptr: Tensor::new(gpu.up(&[0i32, ROWS as i32]), 2, 1, Dtype::I32),
+        };
+        let dt = Tensor::new(gpu.up(&dt_raw), n, HEADS as u32, Dtype::Bf16);
+        let z = Tensor::new(gpu.up(&z_raw), n, INNER as u32, Dtype::Bf16);
+        let mut y = Tensor::new(gpu.zeros(ROWS * INNER * 2), n, INNER as u32, Dtype::Bf16);
+        ssm::mamba2_chunked(
+            &gpu.ctx(),
+            xbc,
+            dt,
+            z,
+            m,
+            &pool,
+            Some(&tail),
+            N as u32,
+            &mut y,
+        )
+        .expect("the Mamba-2 scan fires");
+        gpu.sync();
+        worst(
+            &format!("the rows split at {commit}"),
+            &gpu.down::<u16>(y.ptr, ROWS * INNER),
+            &want,
+        );
+        let slab: Vec<f32> = gpu.down(slab_at, STRIDE);
+        let scale = committed.iter().fold(0f32, |m, v| m.max(v.abs()));
+        let off = slab
+            .iter()
+            .zip(&committed)
+            .fold(0f32, |m, (g, w)| m.max((g - w).abs()));
+        assert!(
+            off <= 2e-2 * scale,
+            "the slot after {commit} committed rows: off by {off} of {scale}"
+        );
+    }
 }

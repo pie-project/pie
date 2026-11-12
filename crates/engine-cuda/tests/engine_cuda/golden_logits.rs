@@ -470,8 +470,10 @@ fn knobs() -> engine_cuda::Knobs {
 /// The buffered probes' knobs: every class's compositions armed for lanes
 /// that buffer recurrent rows (`rs-bodies`), as a deployment whose
 /// inferlets draft for themselves states, so their fires replay bodies.
+/// `PIE_GOLDEN_RS_EAGER` leaves them unarmed: the buffering fires walk
+/// eagerly, the reference a body's logits match bit for bit.
 fn buffering(mut knobs: engine_cuda::Knobs) -> engine_cuda::Knobs {
-    knobs.diagnostics.rs_bodies = true;
+    knobs.diagnostics.rs_bodies = std::env::var_os("PIE_GOLDEN_RS_EAGER").is_none();
     knobs
 }
 
@@ -1109,9 +1111,12 @@ fn rs_page(shell: &mut Shell) -> u32 {
         })
 }
 
-/// The model the buffered probe serves: gated delta net state with a
-/// chunked recurrence, whose rows a lane may buffer unfolded.
-const BUFFERED: &str = "qwen35-tiny";
+/// The model the buffered probes serve: a chunked recurrence whose rows a
+/// lane may buffer unfolded, gated delta net state by default, another
+/// (`nemotron3-nano-mini`'s Mamba-2) by `PIE_GOLDEN_BUFFERED`.
+fn buffered_model() -> String {
+    std::env::var("PIE_GOLDEN_BUFFERED").unwrap_or_else(|_| "qwen35-tiny".to_string())
+}
 
 /// A prefill folded as it lands, then decodes that buffer their rows past
 /// the state and fold them late (none, two, or all of them a step, never
@@ -1241,16 +1246,17 @@ fn golden_buffered() {
         return;
     }
     let cache = cache_dir();
-    let fixture = fixture(BUFFERED, &cache);
+    let model = buffered_model();
+    let fixture = fixture(&model, &cache);
     let _ = served_buffered(&fixture, &cache);
     let steps = served_buffered(&fixture, &cache);
     let mut lines = Vec::new();
     let mut all = FNV;
     for (at, (hash, top)) in steps.iter().enumerate() {
         all = fnv_bytes(all, &hash.to_le_bytes());
-        lines.push(format!("golden {BUFFERED}-buffered {at} {hash:016x} {top}"));
+        lines.push(format!("golden {model}-buffered {at} {hash:016x} {top}"));
     }
-    lines.push(format!("golden {BUFFERED}-buffered all {all:016x}"));
+    lines.push(format!("golden {model}-buffered all {all:016x}"));
     for line in &lines {
         println!("{line}");
     }
@@ -1264,7 +1270,7 @@ fn golden_buffered() {
             .unwrap_or_else(|why| panic!("{}: {why}", Path::new(&want).display()));
         let held: Vec<&str> = want
             .lines()
-            .filter(|line| line.contains("-buffered "))
+            .filter(|line| line.contains(&format!(" {model}-buffered ")))
             .collect();
         assert_eq!(
             held,
@@ -1375,13 +1381,14 @@ fn golden_pair_buffered() {
         return;
     }
     let cache = cache_dir();
-    let fixture = fixture(BUFFERED, &cache);
+    let model = buffered_model();
+    let fixture = fixture(&model, &cache);
     let _ = served_pair_buffered(&fixture, &cache);
     let steps = served_pair_buffered(&fixture, &cache);
     let lines: Vec<String> = steps
         .iter()
         .enumerate()
-        .map(|(at, (hash, top))| format!("golden {BUFFERED}-pair-buffered {at} {hash:016x} {top}"))
+        .map(|(at, (hash, top))| format!("golden {model}-pair-buffered {at} {hash:016x} {top}"))
         .collect();
     for line in &lines {
         println!("{line}");
@@ -1606,16 +1613,17 @@ fn golden_submit_buffered() {
         return;
     }
     let cache = cache_dir();
-    let fixture = fixture(BUFFERED, &cache);
+    let model = buffered_model();
+    let fixture = fixture(&model, &cache);
     let _ = submitted_buffered(&fixture, &cache);
     let steps = submitted_buffered(&fixture, &cache);
     let mut lines = Vec::new();
     let mut all = FNV;
     for (at, (hash, top)) in steps.iter().enumerate() {
         all = fnv_bytes(all, &hash.to_le_bytes());
-        lines.push(format!("golden {BUFFERED}-buffered {at} {hash:016x} {top}"));
+        lines.push(format!("golden {model}-buffered {at} {hash:016x} {top}"));
     }
-    lines.push(format!("golden {BUFFERED}-buffered all {all:016x}"));
+    lines.push(format!("golden {model}-buffered all {all:016x}"));
     for line in &lines {
         println!("{line}");
     }
@@ -1624,7 +1632,7 @@ fn golden_submit_buffered() {
             .unwrap_or_else(|why| panic!("{}: {why}", Path::new(&want).display()));
         let held: Vec<&str> = want
             .lines()
-            .filter(|line| line.contains("-buffered ") && !line.contains("-pair-"))
+            .filter(|line| line.contains(&format!(" {model}-buffered ")))
             .collect();
         assert_eq!(
             held,
