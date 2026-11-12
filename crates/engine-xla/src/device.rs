@@ -356,6 +356,7 @@ impl Device {
             h.update(b"|");
             h.update(std::env::var_os(var).unwrap_or_default().as_encoded_bytes());
         }
+        h.update(format!("|{:?}", crate::pjrt::options::TPU_FLAGS).as_bytes());
         Some(dir.join(format!("{}.pjrt", h.finalize().to_hex())))
     }
 
