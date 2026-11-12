@@ -1391,3 +1391,12 @@ The `new-memory/` directory is bookkeeping and is removed before anything lands 
   THP advice (MADV_HUGEPAGE stalled on direct compaction: FP8 boot 70 -> 152 s over repeated runs); a capturing
   arming fire no longer walks its body eagerly first (one forward per body). L40S boot held: FP8 64.6-65.3 s (main
   64.7-68.4), NVFP4 85.8-86.8 (main 85.1-86.0), gpt-oss 50.7 (main 62.3-64.5).
+
+### M114 — 2026-11-12: boot — staging ring off the load path; affine lattice pricing
+- `sc/boot-runtime` (43a1e5e8f): M111's up-to-4 GiB pinned staging ring was cudaHostAlloc'd on the load thread
+  (~6 s under the driver lock); now huge pages pre-touched by 8 threads then registered, pinned by the landing thread
+  when it starts. Boot vs main (sm_120, warm): Qwen3.5-0.8B 18.1 vs 20.3-21.4 s, Qwen3-8B 17.7 vs 19.1, gpt-oss
+  26.7-36.3 vs 35.5-40.1. golden_logits / golden_offload pass; runtime 150.
+- `sc/l40s-quant-experts` (d4346c84a): adaptive lattice prices each body by its kind and counts the card's spare.
+  Affine Qwen3.6-35B-A3B-4bit held on L40S: boot 29.7 s vs main 65; c256 +21.8%; c1 -5.6% (mostly M104 slot cost),
+  prefill +4-10% (lattice coarsened; bodies-allowance policy (b) in progress).
