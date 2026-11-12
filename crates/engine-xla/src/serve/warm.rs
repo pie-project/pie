@@ -78,7 +78,10 @@ impl Shell {
         while pages <= cap {
             // A lane at this bound holds more than half of it.
             let seats = u32::try_from(pool / u64::from(pages / 2).max(1)).unwrap_or(u32::MAX);
-            let most = lanes_cap.min(pad.rung(seats.max(1)));
+            // and the rung the most lanes it seats pad to (Qwen3.6-35B-A3B's
+            // v5e pool seats 126: its c256 decodes ran 128 lanes, compiled
+            // mid-run)
+            let most = poem_exec::fire::rung_of(&buckets, lanes_cap.min(seats.max(1)));
             for &n in buckets.iter().filter(|&&n| n <= most) {
                 let lane = Want {
                     word: decode,
@@ -178,7 +181,7 @@ impl Shell {
         // the ladder is a decode-only fire's.)
         for &d in buckets
             .iter()
-            .filter(|&&d| d <= lanes_cap && pad.rung(d) == d)
+            .filter(|&&d| d <= pad.rung(lanes_cap) && pad.rung(d) == d)
         {
             for &b in buckets.iter().filter(|&&b| b >= least && b >= 2 * d) {
                 let rows = if b == top {
