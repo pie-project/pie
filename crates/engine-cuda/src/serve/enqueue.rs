@@ -136,6 +136,7 @@ impl Shell {
             graphs: self.graphs,
             pad: self.pad,
             arming: self.arming,
+            arm_cold: self.arm_cold,
             golden_arm: self.golden_arm,
             cache: &mut self.cache,
             programs: &mut self.programs,
@@ -198,6 +199,7 @@ struct FireCtx<'a> {
     graphs: Graphs,
     pad: bool,
     arming: bool,
+    arm_cold: bool,
     golden_arm: Golden,
     cache: &'a mut GraphCache,
     programs: &'a mut ProgramPlane,
@@ -824,6 +826,7 @@ impl FireCtx<'_> {
                 let fire = record::Fire {
                     eager_twin: self.golden_arm == Golden::Eager,
                     arming: self.arming && self.golden_arm == Golden::Off,
+                    cold: self.arm_cold,
                     trace: self.trace,
                     compiled: self.compiled,
                     descriptor: &p.descriptor,

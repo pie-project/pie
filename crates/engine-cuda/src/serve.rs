@@ -129,6 +129,9 @@ pub struct Shell {
     arming: bool,
     golden_arm: Golden,
     armed_body: Option<record::BodyKey>,
+    /// The target arming fires is past its kind's widest bucket
+    /// (`record::Fire::cold`).
+    arm_cold: bool,
     /// How the arming fire's lanes treat their recurrent rows: a buffering
     /// treatment is recorded with lanes that land and replay nothing.
     arm_rs: record::RsBody,

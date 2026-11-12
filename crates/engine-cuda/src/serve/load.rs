@@ -1273,6 +1273,7 @@ impl Shell {
             decoded_tiles: Vec::new(),
             arming: false,
             armed_body: None,
+            arm_cold: false,
             arm_rs: crate::record::RsBody::Folds,
             arm_deferred: false,
             segments: std::collections::HashMap::new(),
