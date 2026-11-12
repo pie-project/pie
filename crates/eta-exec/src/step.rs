@@ -470,17 +470,40 @@ fn run_kind(
 }
 
 fn commit(inst: &mut InterpInstance, overlay: &Overlay) -> StepOutcome {
+    match stage_commit(inst, overlay) {
+        Ok(words) => apply_commit(inst, overlay, &words),
+        Err(outcome) => outcome,
+    }
+}
+
+/// Each channel's head and tail as the step read them, and as it leaves them.
+struct CommitWords {
+    old_heads: Vec<u64>,
+    old_tails: Vec<u64>,
+    new_heads: Vec<u64>,
+    new_tails: Vec<u64>,
+}
+
+fn stage_commit(
+    inst: &mut InterpInstance,
+    overlay: &Overlay,
+) -> std::result::Result<CommitWords, StepOutcome> {
     let n = inst.channels.len();
-    let mut old_tails = vec![0u64; n];
-    let mut new_heads = vec![0u64; n];
-    let mut new_tails = vec![0u64; n];
+    let mut words = CommitWords {
+        old_heads: vec![0u64; n],
+        old_tails: vec![0u64; n],
+        new_heads: vec![0u64; n],
+        new_tails: vec![0u64; n],
+    };
 
     for (ci, ring) in inst.channels.iter().enumerate() {
         let head = ring.head();
         let tail = ring.tail();
         if tail < head {
             inst.poisoned = true;
-            return StepOutcome::Faulted(format!("channel {ci}: tail precedes head at commit"));
+            return Err(StepOutcome::Faulted(format!(
+                "channel {ci}: tail precedes head at commit"
+            )));
         }
         let mut next_head = head;
         let mut next_tail = tail;
@@ -492,31 +515,97 @@ fn commit(inst: &mut InterpInstance, overlay: &Overlay) -> StepOutcome {
         if overlay.put[ci] {
             if used >= ring.capacity() as u64 {
                 inst.poisoned = true;
-                return StepOutcome::Faulted(format!(
+                return Err(StepOutcome::Faulted(format!(
                     "channel {ci}: put overflows capacity {} at commit",
                     ring.capacity()
-                ));
+                )));
             }
             next_tail += 1;
         }
-        old_tails[ci] = tail;
-        new_heads[ci] = next_head;
-        new_tails[ci] = next_tail;
+        words.old_heads[ci] = head;
+        words.old_tails[ci] = tail;
+        words.new_heads[ci] = next_head;
+        words.new_tails[ci] = next_tail;
     }
+    Ok(words)
+}
 
+/// Writes only the words this step moved: the host takes a reader ring's
+/// head and puts a writer ring's tail while a step runs, so storing a word
+/// the step merely read would undo the host's move (a reader ring whose
+/// lost takes leave it looking fuller and fuller until a frame is refused).
+fn apply_commit(inst: &InterpInstance, overlay: &Overlay, words: &CommitWords) -> StepOutcome {
     for (ci, ring) in inst.channels.iter().enumerate() {
         if overlay.put[ci] {
-            ring.encode_sequence(old_tails[ci], &overlay.pending[&(ci as u32)]);
+            ring.encode_sequence(words.old_tails[ci], &overlay.pending[&(ci as u32)]);
         }
     }
     for (ci, ring) in inst.channels.iter().enumerate() {
-        if new_heads[ci] != ring.head() {
-            ring.store_head(new_heads[ci]);
+        if words.new_heads[ci] != words.old_heads[ci] {
+            ring.store_head(words.new_heads[ci]);
         }
-        if new_tails[ci] != ring.tail() {
-            ring.store_tail(new_tails[ci]);
+        if words.new_tails[ci] != words.old_tails[ci] {
+            ring.store_tail(words.new_tails[ci]);
         }
     }
 
     StepOutcome::Committed
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+
+    use super::*;
+    use crate::channel::ChannelState;
+
+    #[test]
+    fn a_host_take_during_a_step_survives_its_commit() {
+        // The epilogue puts a token on a reader ring while the host takes the
+        // one before it: the commit must not write back the head it read.
+        let ring = Arc::new(ChannelState::host(eta_ir::Dtype::I32, 1, 4));
+        assert!(ring.push(&Value::zeros(eta_ir::Dtype::I32, 1)));
+        let mut inst = InterpInstance {
+            channels: vec![Arc::clone(&ring)],
+            poisoned: false,
+        };
+        let mut overlay = Overlay::new(1);
+        overlay.put[0] = true;
+        overlay
+            .pending
+            .insert(0, Value::zeros(eta_ir::Dtype::I32, 1));
+
+        let Ok(words) = stage_commit(&mut inst, &overlay) else {
+            panic!("the commit stages");
+        };
+        assert!(ring.pop().is_some(), "the host takes mid-step");
+        assert!(matches!(
+            apply_commit(&inst, &overlay, &words),
+            StepOutcome::Committed
+        ));
+        assert_eq!((ring.head(), ring.tail()), (1, 2));
+    }
+
+    #[test]
+    fn a_host_put_during_a_step_survives_its_commit() {
+        // The step takes from a writer ring while the host puts the next cell.
+        let ring = Arc::new(ChannelState::host(eta_ir::Dtype::I32, 1, 4));
+        assert!(ring.push(&Value::zeros(eta_ir::Dtype::I32, 1)));
+        let mut inst = InterpInstance {
+            channels: vec![Arc::clone(&ring)],
+            poisoned: false,
+        };
+        let mut overlay = Overlay::new(1);
+        overlay.taken[0] = true;
+
+        let Ok(words) = stage_commit(&mut inst, &overlay) else {
+            panic!("the commit stages");
+        };
+        assert!(ring.push(&Value::zeros(eta_ir::Dtype::I32, 1)));
+        assert!(matches!(
+            apply_commit(&inst, &overlay, &words),
+            StepOutcome::Committed
+        ));
+        assert_eq!((ring.head(), ring.tail()), (1, 2));
+    }
 }
