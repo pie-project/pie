@@ -158,6 +158,9 @@ pub struct Run<'c> {
 
     values_wide: usize,
 
+    /// The values a dense gemm of this program wrote (`kernel.norm.land_from`).
+    pub(crate) dot_out: Vec<bool>,
+
     fire: FireBindings,
 
     windows: &'c Windows,
@@ -234,6 +237,7 @@ impl<'c> Run<'c> {
             caches,
             structs: vec![None; values.len() * windows.max_runs() as usize],
             values_wide: values.len(),
+            dot_out: vec![false; values.len()],
             fire,
             windows,
             place,

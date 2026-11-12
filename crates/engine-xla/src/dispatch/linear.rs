@@ -7,6 +7,13 @@ use crate::run::Run;
 impl DispatchLinear for Run<'_> {
     fn dispatch(&mut self, op: &Linear) -> Result<(), KernelError> {
         self.ctx().scope(op.name());
+        if let Linear::Matmul {
+            y, logits: false, ..
+        } = op
+            && let Some(d) = self.dot_out.get_mut(y.0 as usize)
+        {
+            *d = true;
+        }
         self.linear(op).map_err(crate::error::kernel)
     }
 }
