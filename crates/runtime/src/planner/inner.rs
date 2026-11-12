@@ -339,6 +339,17 @@ impl Inner {
         wake
     }
 
+    /// The pages the resident lanes' next steps take: one each process
+    /// running (admitted, resident, not idle). A restore leaves this much of
+    /// the device free, so bringing one back does not suspend another at
+    /// the next page boundary.
+    pub(super) fn growth_reserve(&self) -> u32 {
+        self.procs
+            .values()
+            .filter(|proc| proc.admitted && !proc.idle && proc.state == Residency::Resident)
+            .count() as u32
+    }
+
     pub(super) fn fleet_stalled(&self) -> bool {
         if !self.evicting.is_empty() {
             return false;
