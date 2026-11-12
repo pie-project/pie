@@ -903,14 +903,22 @@ impl Shell {
     /// The lattice's buckets a doubling past `engine.prefill_lattice_from`,
     /// halved until the bodies of `rest` (the narrower prefill, mixed and
     /// wide targets' buckets, still to arm) fit what the allowance has left
-    /// at the price the bodies armed so far weigh a body: a load whose
+    /// each at what the bodies of its kind armed so far weigh (`weighed`,
+    /// bytes and bodies a kind; the top bucket arms one of each first, and a
+    /// kind's bodies hold about as many nodes at any bucket, where kinds
+    /// differ: Qwen3.6-35B-A3B's mixed bodies 8.9 MiB, its lattice's 5.5 MiB
+    /// on average): a load whose
     /// allowance arms every key keeps the profile's lattice, and one that
     /// would leave keys to walk eagerly pads its fires to fewer buckets
     /// instead. A coarser default lattice's buckets are the finer one's
     /// every other past the fine rows, so nothing compiled changes. Returns
     /// the buckets dropped; says so, and loudly where even the coarsest
     /// lattice does not fit.
-    fn fit_lattice(&mut self, rest: &[u32]) -> std::collections::BTreeSet<u32> {
+    fn fit_lattice(
+        &mut self,
+        rest: &[(u32, Kind)],
+        weighed: &[(usize, usize); Kind::COUNT],
+    ) -> std::collections::BTreeSet<u32> {
         let Some((steps, from, mut fine)) = self.lattice else {
             return std::collections::BTreeSet::new();
         };
@@ -918,19 +926,38 @@ impl Shell {
         if spent.bodies == 0 {
             return std::collections::BTreeSet::new();
         }
-        let price = spent.bytes / spent.bodies;
-        let room = self.bodies_mem.saturating_sub(spent.bytes);
+        let average = spent.bytes / spent.bodies;
+        let price = |kind: Kind| match weighed[kind.at()] {
+            (bytes, bodies) if bodies > 0 => bytes / bodies,
+            _ => average,
+        };
+        // What the allowance has left, or the card where it has less: the
+        // ceiling's spare stops arming as the allowance does.
+        let allowance = self.bodies_mem.saturating_sub(spent.bytes);
+        let spare = self
+            .pools
+            .spare_bytes_for_bodies(allowance as u64)
+            .map_or(allowance, |spare| {
+                usize::try_from(spare).unwrap_or(usize::MAX)
+            });
+        let room = allowance.min(spare);
         let was = self.budget.buckets.clone();
         let mut buckets = was.clone();
-        let need = |buckets: &[u32]| price * rest.iter().filter(|b| buckets.contains(b)).count();
+        let need = |buckets: &[u32]| {
+            rest.iter()
+                .filter(|(b, _)| buckets.contains(b))
+                .map(|&(_, kind)| price(kind))
+                .sum::<usize>()
+        };
         while need(&buckets) > room {
             if fine <= steps.max(1) {
                 eprintln!(
-                    "engine-cuda: WARNING: [engine] bodies_mem {} MiB arms no lattice's every \
-                     key: at {fine} bucket(s) a doubling past {from} rows the {} narrower \
-                     bodies still to arm weigh some {} MiB of the {} MiB left. Raise bodies_mem.",
+                    "engine-cuda: WARNING: [engine] bodies_mem {} MiB (or the card) arms no \
+                     lattice's every key: at {fine} bucket(s) a doubling past {from} rows the {} \
+                     narrower bodies still to arm weigh some {} MiB of the {} MiB left. Raise \
+                     bodies_mem or free the card.",
                     self.bodies_mem >> 20,
-                    rest.iter().filter(|b| buckets.contains(b)).count(),
+                    rest.iter().filter(|(b, _)| buckets.contains(b)).count(),
                     need(&buckets) >> 20,
                     room >> 20,
                 );
@@ -942,12 +969,18 @@ impl Shell {
         }
         if buckets.len() < was.len() {
             eprintln!(
-                "engine-cuda: [engine] bodies_mem {} MiB arms every key at {fine} bucket(s) a \
-                 doubling past {from} rows, not the profile's {}: {} bucket(s), not {}.",
+                "engine-cuda: [engine] bodies_mem {} MiB (or the card) arms every key at {fine} \
+                 bucket(s) a doubling past {from} rows, not the profile's {}: {} bucket(s), not \
+                 {} ({} bodies armed at {} KiB on average, {} still to arm at the profile's \
+                 lattice, {} MiB left).",
                 self.bodies_mem >> 20,
                 self.lattice.map_or(0, |(_, _, fine)| fine),
                 buckets.len(),
                 was.len(),
+                spent.bodies,
+                average >> 10,
+                rest.iter().filter(|(b, _)| was.contains(b)).count(),
+                room >> 20,
             );
         }
         let dropped = was
@@ -1164,16 +1197,18 @@ impl Shell {
             .collect();
         // The top bucket's bodies and every decode body arm first; the
         // narrower prefill, mixed and wide ones after them are what the
-        // lattice coarsens to fit the allowance, once those price a body.
+        // lattice coarsens to fit the allowance, each priced at what its
+        // kind's bodies armed so far weigh.
         let narrower =
             |bucket: u32, target: &BodySynth| Some(bucket) != top && target.kind() != Kind::Decode;
-        let rest: Vec<u32> = targets
+        let rest: Vec<(u32, Kind)> = targets
             .iter()
             .filter(|(bucket, target, _)| narrower(*bucket, target))
-            .map(|(bucket, ..)| *bucket)
+            .map(|(bucket, target, _)| (*bucket, target.kind()))
             .collect();
         let mut priced = verify || group || self.lattice.is_none();
         let mut dropped = std::collections::BTreeSet::new();
+        let mut weighed = [(0usize, 0usize); Kind::COUNT];
 
         let mut armed = 0usize;
         let mut wanted = 0usize;
@@ -1191,8 +1226,9 @@ impl Shell {
         for (bucket, target, rs) in targets {
             if !priced && narrower(bucket, &target) {
                 priced = true;
-                dropped = self.fit_lattice(&rest);
+                dropped = self.fit_lattice(&rest, &weighed);
             }
+            let weighed_before = self.cache.body_stats().census;
             if dropped.contains(&bucket) {
                 continue;
             }
@@ -1276,6 +1312,11 @@ impl Shell {
             if key.as_ref().is_some_and(|key| self.cache.body_armed(key)) {
                 armed += 1;
                 tally[at].0 += 1;
+                let now = self.cache.body_stats().census;
+                if now.bodies > weighed_before.bodies {
+                    weighed[at].0 += now.bytes.saturating_sub(weighed_before.bytes);
+                    weighed[at].1 += now.bodies - weighed_before.bodies;
+                }
                 if let Some(wanted) = super::diag::on().arm_bench.as_deref()
                     && let Some(key) = key.as_ref()
                     && key.to_string().contains(wanted)
