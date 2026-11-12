@@ -22,3 +22,12 @@ name.
 The KV admission wait sits inside the synchronous `submit` WIT call, so a waiting lane blocks every lane of its guest
 and admitted lanes can't drain. Make `submit` async (or add an admission future) across every SDK. Until then,
 inferlets that batch should cap their in-flight lanes (text-completion-bench: batch_concurrency).
+
+## F4 — Layer-major recurrent state (pending user decision: this PR or follow-up)
+Per-lane state records put a layer's lane states one record apart, interleaved with other layers / conv rows. In
+the partly-L2-resident regime (sm_120, 64 lanes, ~64 MB working set) any interleaving loses 12-16% on the GDN step
+vs main's gapless per-layer bank; no stride / offset skew recovers it (sweep: 528 KiB..11 MiB strides all 69-75 us
+vs bank 62.7). Serving cost: Qwen3.5 c64 gdn_step +7%, conv1d +6-12% per launch (~1.6% of fire GPU time) on CUDA;
+XLA qwen35 d0.8b c64 -3.4% (gated_delta 61 -> 112 us, same cause per TPU). Fix: layer-major fixed shapes (each
+recurrent layer's pieces from a shape of their own so a layer's lane slots are contiguous) — a chunk / record
+structure change across poem_compiler, runtime and every backend.
