@@ -1972,6 +1972,7 @@ impl Shell {
                 ..Fired::default()
             });
         }
+        let from_ladder = found.is_some();
         let program = match found {
             Some(program) => program,
             None => {
@@ -2007,6 +2008,13 @@ impl Shell {
             }
             self.shaped
                 .insert(shape_key, std::sync::Arc::clone(&program));
+        }
+        if self.deferred.is_none() {
+            static SEEN: std::sync::Mutex<Option<std::collections::HashSet<usize>>> = std::sync::Mutex::new(None);
+            let at = std::sync::Arc::as_ptr(&program) as usize;
+            if SEEN.lock().map(|mut g| g.get_or_insert_with(Default::default).insert(at)).unwrap_or(false) {
+                tracing::info!(rows = descriptor.rows, bucket = descriptor.bucket, lane_count, bytes = program.text_bytes, from_ladder, "xla fire program");
+            }
         }
         let t2 = std::time::Instant::now();
         if self.device.is_dry() {
