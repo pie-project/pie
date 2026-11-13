@@ -1,7 +1,8 @@
 //! The fabric: physical colours, every PE's route table and queue bindings, and the hardware
 //! invariants checked on them. [`Palette::allocate`] colours the wiring's classes (an
 //! interference colouring of their footprints, each class its block's preferred colour where it
-//! is free); [`Fabric::lay`] turns a [`Wiring`] into routes through that [`Palette`];
+//! is free: [`Fabric::lay_coloured`] takes the preferences outright where they lay with no
+//! clash); [`Fabric::lay`] turns a [`Wiring`] into routes through that [`Palette`];
 //! [`Fabric::validate`] refuses a program the CS-3 would hang or miscompute on.
 
 use std::collections::{BTreeMap, BTreeSet};
@@ -761,6 +762,33 @@ impl Fabric {
         })
     }
 
+    /// The palette of `w` and the fabric laid through it, validated ([`Fabric::validate`]): the
+    /// blocks' preferred colours (`prefs`, later replacing earlier) where they colour every class
+    /// the links lay and lay and validate with no clash (the common case: the wiring is laid
+    /// once), else [`Palette::allocate`]'s colouring.
+    pub fn lay_coloured(
+        floor: &Floor,
+        w: &Wiring,
+        prefs: Vec<(Class, u8)>,
+    ) -> Result<(Palette, Fabric), String> {
+        let declared = Palette::of(prefs.iter().copied());
+        let covers = w
+            .links
+            .iter()
+            .flat_map(Link::classes)
+            .all(|c| declared.map.contains_key(&c));
+        if covers
+            && let Ok(f) = Fabric::lay(floor, w, &declared)
+            && f.validate(floor).is_ok()
+        {
+            return Ok((declared, f));
+        }
+        let palette = Palette::allocate(prefs, floor, w)?;
+        let f = Fabric::lay(floor, w, &palette)?;
+        f.validate(floor)?;
+        Ok((palette, f))
+    }
+
     pub fn routes(&self, at: Coord) -> &[Route] {
         self.routes.get(at)
     }
@@ -1013,8 +1041,15 @@ mod tests {
         assert_eq!(p.get(c).unwrap(), Colour(0));
         assert_eq!(p.get(d).unwrap(), Colour(5));
         Fabric::lay(&fl, &w, &p).unwrap();
-        // the declared palette clashes
-        assert!(Fabric::lay(&fl, &w, &Palette::of([(a, 5), (b, 5), (c, 0), (d, 5)])).is_err());
+        // the declared palette clashes; laid coloured, the colouring's is taken
+        let prefs = vec![(a, 5), (b, 5), (c, 0), (d, 5)];
+        assert!(Fabric::lay(&fl, &w, &Palette::of(prefs.iter().copied())).is_err());
+        let (q, _) = Fabric::lay_coloured(&fl, &w, prefs).unwrap();
+        assert_eq!(q.get(b).unwrap(), Colour(0));
+        // preferences that lay as they are, are the palette
+        let ok = vec![(a, 5), (b, 6), (c, 0), (d, 5)];
+        let (q, _) = Fabric::lay_coloured(&fl, &w, ok.clone()).unwrap();
+        assert_eq!(q.map, Palette::of(ok).map);
     }
 
     /// A class that meets more classes than there are colours is refused by name.
