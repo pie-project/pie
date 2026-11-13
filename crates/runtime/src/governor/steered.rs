@@ -61,6 +61,15 @@ impl EnginePool {
     pub const fn locus(&self) -> (usize, usize) {
         (self.model, self.engine)
     }
+
+    /// Keeps the shared pool's state chunks out of what the engine holds
+    /// back now ([`crate::store::shared::SharedPool::hold_back`]).
+    pub fn hold_back(&self) {
+        if let Some(shared) = &self.shared {
+            let held = crate::engine::live(self.engine).held();
+            shared.shared().lock().unwrap().hold_back(held);
+        }
+    }
 }
 
 impl SlotAccess for EnginePool {

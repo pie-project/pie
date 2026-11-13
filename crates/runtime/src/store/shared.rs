@@ -1226,6 +1226,24 @@ impl SharedPool {
         (chunks, u32::try_from(pages).unwrap_or(u32::MAX))
     }
 
+    /// The engine holds `bytes` of the range it stated back
+    /// ([`::engine::live::Live::held`]): no state chunk is opened in the
+    /// top `bytes` of the span below the activation, which the engine binds
+    /// none of yet; all of it again once it holds none.
+    pub fn hold_back(&mut self, bytes: u64) {
+        let ceiling = if bytes == 0 {
+            self.pool.total_chunks()
+        } else {
+            let top = self.pool.top_segment() * self.pool.segments().segment_chunks();
+            let held =
+                u32::try_from(bytes.div_ceil(self.pool.chunk_bytes().max(1))).unwrap_or(u32::MAX);
+            top.saturating_sub(held).max(self.pool.reserved_chunks())
+        };
+        if ceiling != self.pool.ceiling() {
+            self.pool.set_ceiling(ceiling);
+        }
+    }
+
     /// [`Self::rung_for`], no wider than `armed` (a rung's tokens): the
     /// widest rung armed at or under it, else the smallest.
     #[must_use]

@@ -142,6 +142,7 @@ struct Arms {
     /// The pages and records sequences hold, never to be lent.
     held: Arc<Mutex<(HashSet<u32>, HashSet<u32>)>>,
     fire_sleep: Duration,
+    step_sleep: Duration,
     fail: bool,
 }
 
@@ -155,6 +156,7 @@ impl Arms {
             slots: slots.clone(),
             held: Arc::default(),
             fire_sleep: Duration::ZERO,
+            step_sleep: Duration::ZERO,
             fail: false,
         }
     }
@@ -183,6 +185,7 @@ impl ::engine::Engine for Arms {
             return Err(::engine::Error::Load("capture refused".into()));
         }
         self.seen.steps.fetch_add(1, Ordering::SeqCst);
+        std::thread::sleep(self.step_sleep);
         {
             let held = self.held.lock().unwrap();
             let whole = lent.pages.len() == ROOM.pages as usize
@@ -424,8 +427,9 @@ fn a_raise_under_continuous_fires_is_armed_between_them() {
     );
     assert_eq!(seen.steps.load(Ordering::SeqCst), 0);
 
-    // A pass asks 2048 rows: its rung is armed in the next gap between
-    // fires, one step after another, and the pass then fires at it.
+    // A pass asks 2048 rows: steps run between fires, as many as a gap's
+    // budget holds (all of them, steps here costing nothing), and the pass
+    // then fires at its rung.
     let want = crate::store::shared::want_rows(ENGINE, 2048);
     let mut fires = 0;
     let mut widths = Vec::new();
@@ -444,7 +448,7 @@ fn a_raise_under_continuous_fires_is_armed_between_them() {
     drop(want);
     assert!(
         fires <= 2,
-        "the raise's rung arms within one gap, not a step a gap: {widths:?}"
+        "steps this cheap arm the raise's rung within one gap: {widths:?}"
     );
     let steps = seen.steps.load(Ordering::SeqCst);
     let rungs = (RUNGS.len() - 1) * COMPOSITIONS as usize;
@@ -477,5 +481,54 @@ fn a_failed_step_faults_every_fire_after_it() {
     assert!(error.contains("arming"), "{error}");
     assert_eq!(seen.after_over.load(Ordering::SeqCst), 0);
     assert_eq!(slots.free(), (16, 4), "the failed step's lease is back");
+    lane.shutdown();
+}
+
+/// Steps longer than a gap's budget: one a gap, the raise's pass firing at
+/// each rung as it arms, so no request waits on the whole of its arming.
+#[test]
+fn a_raise_whose_steps_outlast_a_gap_fires_at_each_rung_as_it_arms() {
+    const ENGINE: usize = 9105;
+    let slots = Slots::new(16, 4);
+    let planner = planner(&slots);
+    let blocker = planner
+        .try_free(Demand {
+            kv_pages: 16,
+            rs: RsUnits::of(4, 0),
+        })
+        .expect("all of it");
+    let seen = Arc::new(Seen::default());
+    let mut engine = Arms::new(&seen, &slots);
+    engine.fire_sleep = Duration::from_millis(1);
+    engine.step_sleep = super::GAP_BUDGET + Duration::from_millis(5);
+    let live = engine.live.clone();
+    let mut lane = spawn(ENGINE, engine, &planner);
+    let mut in_flight = std::collections::VecDeque::new();
+    for _ in 0..8 {
+        in_flight.push_back(fire(&lane, 256));
+    }
+    let want = crate::store::shared::want_rows(ENGINE, 2048);
+    drop(blocker);
+    let mut widths = Vec::new();
+    while armed_rung(&live, 2048) < 2048 {
+        answer(in_flight.pop_front().unwrap()).expect("served");
+        let width = armed_rung(&live, 2048);
+        widths.push(width);
+        in_flight.push_back(fire(&lane, width));
+        assert!(widths.len() < 1000, "the raise starved under load");
+    }
+    for reply in in_flight {
+        answer(reply).expect("served");
+    }
+    drop(want);
+    assert!(
+        widths.contains(&512) && widths.contains(&1024),
+        "the pass fires at each rung as it arms: {widths:?}"
+    );
+    assert!(
+        widths.windows(2).all(|w| w[0] <= w[1]),
+        "and only ever wider: {widths:?}"
+    );
+    assert_eq!(seen.unarmed_fires.load(Ordering::SeqCst), 0);
     lane.shutdown();
 }

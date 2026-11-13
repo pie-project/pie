@@ -422,6 +422,9 @@ pub struct SlotPool {
     /// the fire that carries the copy retires, by that fire's epoch.
     fences: BTreeMap<u64, Vec<u32>>,
     fenced: Bits,
+    /// No chunk at or past this physical id is opened: the engine binds
+    /// none there yet ([`Self::set_ceiling`]).
+    ceiling: u32,
     segments: Segments,
     /// Chunks opened for a shape.
     held: u32,
@@ -476,6 +479,7 @@ impl SlotPool {
             open: Bits::new(total, false),
             fences: BTreeMap::new(),
             fenced: Bits::new(total, false),
+            ceiling: total,
             segments,
             held: 0,
             pending: BTreeMap::new(),
@@ -500,7 +504,26 @@ impl SlotPool {
         self.free.get(chunk)
             && !self.fenced.get(chunk)
             && chunk < self.state_limit()
+            && chunk < self.ceiling
             && self.segments.state(self.segments.of(chunk)) == SegmentState::Committed
+    }
+
+    /// No chunk at or past physical id `ceiling` is opened from now on, the
+    /// engine binding none there yet (while it holds back part of the range
+    /// it stated, [`::engine::live::Live::held`]); chunks below it open as
+    /// before. A chunk already open past it stays its holder's.
+    pub fn set_ceiling(&mut self, ceiling: u32) {
+        let ceiling = ceiling.min(self.total);
+        let (from, to) = (ceiling.min(self.ceiling), ceiling.max(self.ceiling));
+        self.ceiling = ceiling;
+        for chunk in from..to {
+            self.reopen(chunk);
+        }
+    }
+
+    /// See [`Self::set_ceiling`].
+    pub fn ceiling(&self) -> u32 {
+        self.ceiling
     }
 
     /// Brings `chunk`'s place in [`Self::open`] up to date.

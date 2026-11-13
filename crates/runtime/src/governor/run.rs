@@ -160,6 +160,7 @@ async fn watch(mut pool: Shared<Steered>, tolerance: Tolerance) {
         loop {
             interval.tick().await;
             let read = Some(system.read());
+            pool.with(|pool| pool.inner().hold_back());
             steer.turn(&mut pool, read, &mut |signal| {
                 steered::signal(engine, signal);
             });
@@ -178,6 +179,7 @@ async fn watch(mut pool: Shared<Steered>, tolerance: Tolerance) {
     let mut warned = false;
     loop {
         interval.tick().await;
+        pool.with(|pool| pool.inner().hold_back());
         steer.turn(&mut pool, Some(Pressure::Calm), &mut |_| {});
         read_ledger(&pool, engine);
         // Chunks are handed out of mapped segments only: a pool mapped
@@ -189,7 +191,11 @@ async fn watch(mut pool: Shared<Steered>, tolerance: Tolerance) {
             tracing::warn!(held, hard_limit, "the pool is mapped past its hard limit");
         }
         if !past && warned {
-            tracing::info!(held, hard_limit, "the pool is mapped within its hard limit again");
+            tracing::info!(
+                held,
+                hard_limit,
+                "the pool is mapped within its hard limit again"
+            );
         }
         warned = past;
     }
