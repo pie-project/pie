@@ -5,7 +5,8 @@
 //! (even experts at the bank, odd ones in the pool) all land the same bits,
 //! and the table's counter counts each expert's routes; a table with two
 //! experts swapped lands other bits. A table that may name mapped host
-//! memory (not located) takes the per-route stream, landing its bits, or is
+//! memory (not located) takes the per-route stream, landing its bits, or the
+//! arm a located one takes (an affine bank's), landing the same bits, or is
 //! refused where a codec has no stream.
 
 #![cfg(feature = "rocm")]
@@ -72,17 +73,34 @@ struct Case<'a> {
     y: Tensor,
 }
 
+/// What a table that may name mapped host memory takes.
+#[derive(Clone, Copy)]
+enum Host<'a> {
+    /// The per-route stream: the bits a context whose fire takes the
+    /// stream lands.
+    Stream(&'a Ctx),
+    /// The arm a located table takes: the same bits.
+    Same,
+    /// No arm: the fire declines it.
+    Refused,
+}
+
+impl<'a> Host<'a> {
+    fn of(stream: Option<&'a Ctx>) -> Host<'a> {
+        stream.map_or(Host::Refused, Host::Stream)
+    }
+}
+
 /// `fire` (whether the arm took the fire) under each table: no table, the
 /// banks' own, a mixed one and the scattered pool's land one result bit for
 /// bit, and each counter the routes its experts serve; a table with bank
-/// 0's experts 0 and 1 swapped lands another. Given `stream` (a context
-/// whose fire takes the per-route stream), a table that may name host
-/// memory lands the stream's bits; without, the fire declines it.
+/// 0's experts 0 and 1 swapped lands another. A table that may name host
+/// memory lands what `host` says.
 fn same_bits(
     g: &Gpu,
     c: &Case,
     ctx: &Ctx,
-    stream: Option<&Ctx>,
+    host: Host<'_>,
     fire: impl Fn(&Ctx, &[ExpertTable]) -> Result<bool, Error>,
 ) {
     let what = &c.what;
@@ -114,7 +132,10 @@ fn same_bits(
         want.iter().any(|&v| v != 0x7f7f),
         "{what}: the fire landed nothing"
     );
-    let stream_want = stream.map(|s| run(s, &resident));
+    let stream_want = match host {
+        Host::Stream(s) => Some(run(s, &resident)),
+        Host::Same | Host::Refused => None,
+    };
 
     let own: Vec<ExpertTable> = c
         .banks
@@ -171,7 +192,7 @@ fn same_bits(
     counted(&hits, "the scattered table");
 
     let hits = counters();
-    let host: Vec<ExpertTable> = scattered
+    let host_t: Vec<ExpertTable> = scattered
         .iter()
         .zip(&hits)
         .map(|(t, h)| ExpertTable {
@@ -179,16 +200,23 @@ fn same_bits(
             ..t.counting(h.ptr)
         })
         .collect();
-    match (stream, stream_want) {
-        (Some(_), Some(stream_want)) => {
+    match (host, stream_want) {
+        (Host::Stream(_), Some(stream_want)) => {
             assert!(
-                run(ctx, &host) == stream_want,
+                run(ctx, &host_t) == stream_want,
                 "{what}: a table that may name host memory moved off the stream's bits"
             );
             counted(&hits, "the stream");
         }
+        (Host::Same, _) => {
+            assert!(
+                run(ctx, &host_t) == want,
+                "{what}: a table that may name host memory moved a bit"
+            );
+            counted(&hits, "the host table");
+        }
         _ => assert!(
-            !matches!(fire(ctx, &host), Ok(true)),
+            !matches!(fire(ctx, &host_t), Ok(true)),
             "{what}: an arm with no stream took a table that may name host memory"
         ),
     }
@@ -270,7 +298,7 @@ fn a_dense_select_lands_the_same_bits_through_any_table() {
             // rocBLAS reads no table that may name host memory, and a K
             // off 16-byte loads has no stream to leave it to.
             let stream = (arm != "blas").then_some(&stream);
-            same_bits(&g, &case, &ctx, stream, |at, tables| {
+            same_bits(&g, &case, &ctx, Host::of(stream), |at, tables| {
                 let mut y = y;
                 moe::matmul_select(at, x, bank, rt, &mut y, tables[0]).map(|()| true)
             });
@@ -394,7 +422,14 @@ fn an_fp4_or_affine_select_lands_the_same_bits_through_any_table() {
                 routes: &r,
                 y,
             };
-            same_bits(&g, &case, &ctx, Some(&stream), |at, tables| {
+            // An affine bank's arms read a host table as a located one;
+            // MXFP4's batch and matrix-core arms leave it to the stream.
+            let host = if bits == 4 {
+                Host::Same
+            } else {
+                Host::Stream(&stream)
+            };
+            same_bits(&g, &case, &ctx, host, |at, tables| {
                 let mut y = y;
                 if bits == 0 && biased {
                     moe::matmul_select_bias(at, x, codes, scales, third, rt, &mut y, tables[0])
@@ -450,7 +485,7 @@ fn a_lane_order_or_fp8_select_lands_the_same_bits_through_any_table() {
             routes: &r,
             y,
         };
-        same_bits(&g, &case, &ctx, None, |at, tables| {
+        same_bits(&g, &case, &ctx, Host::Refused, |at, tables| {
             let mut y = y;
             moe::matmul_select_mxfp4_lanes(at, x, lc, ls, rt, &mut y, tables[0]).map(|()| true)
         });
@@ -495,7 +530,7 @@ fn a_lane_order_or_fp8_select_lands_the_same_bits_through_any_table() {
             routes: &r,
             y,
         };
-        same_bits(&g, &case, &ctx, None, |at, tables| {
+        same_bits(&g, &case, &ctx, Host::Refused, |at, tables| {
             let mut y = y;
             moe::matmul_select_fp8_mfma(at, x, codes, factors, rt, &mut y, tables[0]).map(|()| true)
         });
@@ -579,7 +614,7 @@ fn a_routed_mlp_lands_the_same_bits_through_any_table() {
             &g,
             &case,
             &ctx,
-            (!decode).then_some(&stream),
+            Host::of((!decode).then_some(&stream)),
             |at, tables| {
                 let p = moe::RoutedMlp {
                     gate_up_experts: tables[0],

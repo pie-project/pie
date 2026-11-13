@@ -411,7 +411,7 @@ fn moe_folds() {
     let bt = gpu.tensor(&bias, experts, hidden, Dtype::Bf16);
     let routes_t = gpu.upload(&routes, tokens, k, Dtype::I32);
     let mut y = gpu.zeros(tokens, hidden, Dtype::Bf16);
-    moe::bias_sum(&ctx, xt, bt, routes_t, wt, &mut y).unwrap();
+    moe::bias_sum(&ctx, xt, bt, routes_t, wt, &mut y, moe::ExpertTable::RESIDENT).unwrap();
     let want: Vec<f32> = (0..t * h)
         .map(|i| {
             let (n, c) = (i / h, i % h);

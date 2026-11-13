@@ -1502,3 +1502,19 @@ The `new-memory/` directory is bookkeeping and is removed before anything lands 
   HIP biased / quantized selects read the table). MXFP4 (lane-ordered banks, bias_sum) and block FP8 stay resident
   as main serves them. MI300X glm53-mini u4g64: cached / told held / moved = resident bitwise; host / mixed differ
   at 6.25e-2 (per-route vs batch u4 arm, 0/12 top tokens) — strict host equality queued with step (b).
+- XLA after the main merge (TPU, v6e): XLA gates pass on memory-followups; speed vs pre-merge prefill +12.8 / +7.3 /
+  +25.6 %, decode at parity.
+- Metal `a_scattered_windowed_pool_serves_the_same_logits` (Mac, 85ed0b0f2 on memory-redesign): the windowed
+  miniature has no kv list, so the test's Refs fell back to one slot per chunk and left window rows seat-addressed
+  (passed vacuously before the guard). Refs now scatter the window list; negative check fails as it should. The same
+  fallback in engine-gpu's suite is being ported (sc/gpu-windowed-refs).
+- XLA snapshots (sc/xla-a7 726f42180, TPU; merged a42fbe925): passes fired in pieces, RsSnapshot.fixed in contract
+  16, copy programs warmed at prewarm. v6e qwen35-tiny bitwise vs the cut pass. MoE chunk-count dependence is
+  CUDA-PJRT-plugin only (TPU bitwise at pool +16 / +144 / +1040 / +3072 MiB).
+- A7 design (user's integrator call, TPU): no cut fires; streamed expert banks are pinned-host PJRT buffers, hot
+  atoms in u32 pool slots as K/128 panels, a pooled gmm arm reads them through a scalar-prefetched table; misses
+  staged host->pool slots inside the fire (0 misses = no transfer). Gates: held vs all-resident bitwise, speed
+  parity, then miss cost c1/c64. Pooled arm kernel-tested bitwise (sc/xla-stream 61e3d06e3), not wired yet.
+- A4 (b) piece (AMD; merged 8f17ef344, 53b9faf43): streamed affine banks take the held batch/grouped arms -> strict
+  host equality (glm53-mini u4g64 all five modes a4cac630); batch arm on host-mapped banks 7.8 ms vs 66.6 ms per-route
+  (c64 gate_up). bias_sum reads through an expert table. Next: MXFP4 lane order via tables.

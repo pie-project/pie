@@ -95,6 +95,14 @@ branch, same profile file. Watch especially:
 - One window list (widest window, T_w = kv page), as CUDA's interim.
 - Fixed rows larger than a chunk are never cut (the chunk stretches to the largest block); a record spans pieces only
   between blocks.
-- rs snapshots: not served on XLA (as before).
-- Weight streaming (PLE rows, experts): not implemented; all weights stay resident.
+- rs snapshots: served by firing the pass in pieces (`snapshot.rs`, contract 16 with `RsSnapshot.fixed`), up to 4 a
+  lane; the record copies are warmed at load. v6e: qwen35-tiny's 3 snapshots, record, readouts and decodes equal the
+  cut pass bit for bit (GDN Mosaic kernels on). A kernel-level form (the scan writing state as it walks) is a speed
+  item.
+- Pool chunk-count dependence (MoE readouts changing with pool size alone): CUDA PJRT plugin only. v6e at
+  memory-followups 9113919c2: qwen3-30b-a3b-mini and the dense gate are bit for bit vs base at pool +16, +144, +1040
+  and +3072 MiB (`PIE_XLA_TEST_EXTRA_MIB`; +3072 takes the pool past 2 GiB, where the plugin changed every readout).
+- Weight streaming (PLE rows, experts): not implemented; all weights stay resident. Agreed design (A7): streamed banks
+  in pinned-host PJRT buffers (`mhlo.memory_kind = "pinned_host"`), read inside the fire by an expert -> slot table
+  (pool slot, or host); hot atoms in pool slots, filled by a warmed copy program; no cut fires.
 - Frame caches (DiT conv3d) read the record's first piece only.
