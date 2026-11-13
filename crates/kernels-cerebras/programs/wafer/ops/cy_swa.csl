@@ -35,6 +35,7 @@ param CYV: u16 = 0;
 param QB: u16 = 1;
 param SNK: u16 = 1;
 param QKN: u16 = 0;
+param SKW: u16 = 0;
 
 const QD: u16 = Qh * Dc;
 const NV: u16 = Qh * (Dc + 1);
@@ -63,12 +64,14 @@ const rc3_d = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{NRB} -> rc3[i] });
 var ilh = @zeros([QN]f32);
 var lh = @zeros([QN]f32);
 var ve: [QN]f32 align(16) = @zeros([QN]f32);
+var lw = @zeros([QN]f32);   // (SKW 1) the window's sum a head: l + exp(sink - mref)
 var vs: [QN]f32 align(16) = @zeros([QN]f32);
 var vp: [QN]f32 align(16) = @zeros([QN]f32);
 var vk = @zeros([QN]u16);
 const ilh_d = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{QN} -> ilh[i] });
 const lh_d = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{QN} -> lh[i] });
 const ve_d = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{QN} -> ve[i] });
+const lw_d = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{QN} -> lw[i] });
 const vs_d = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{QN} -> vs[i] });
 const vp_d = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{QN} -> vp[i] });
 const vk_d = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{QN} -> vk[i] });
@@ -182,14 +185,15 @@ fn layer(l: u16, pos: u32) void {
         @fsubs(ve_d, @increment_dsd_offset(snk_d, @as(i16, l * Qh), f32), @increment_dsd_offset(mref_d, @as(i16, l * Qh), f32));
         if (CYV == 3) { h = 0; while (h < Qh) : (h += 1) { ve[h] = math.exp1(ve[h]); } } else { vexpq(); }
         @fadds(ve_d, lh_d, ve_d);
+        if (SKW == 1) { @fmovs(lw_d, ve_d); }
       } else {
         @fmovs(ve_d, lh_d);
       }
       if (CYV == 2) { h = 0; while (h < Qh) : (h += 1) { ilh[h] = math.recip(ve[h]); } } else { vrecipq(); }
       h = 0;
       while (h < Qh) : (h += 1) {
-        const lv = lh[h];
-        if (lv < 0.00390625 or lv >= 32768.0) { bad = 1.0; }   // the f16 probabilities' window
+        const lv = if (SKW == 1 and SNK == 1) lw[h] else lh[h];
+        if (lv < 0.00390625 or lh[h] >= 32768.0) { bad = 1.0; }   // the f16 probabilities' window
         @fmuls(pe.uv(h * Dc, Dc), pe.tv(h * (Dc + 1), Dc), ilh[h]);
       }
     } else {
@@ -197,9 +201,12 @@ fn layer(l: u16, pos: u32) void {
       while (h < Qh) : (h += 1) {
         const lv = pe.t[h * (Dc + 1) + Dc];
         lh[h] = lv;
-        if (lv < 0.00390625 or lv >= 32768.0) { bad = 1.0; }   // the f16 probabilities' window
         const sk = snk[l * Qh + h] - mref[l * Qh + h];
-        ilh[h] = math.recip(if (SNK == 1) lv + math.exp1(sk) else lv);
+        const lt = if (SNK == 1) lv + math.exp1(sk) else lv;
+        lw[h] = lt;
+        const lb = if (SKW == 1) lt else lv;
+        if (lb < 0.00390625 or lv >= 32768.0) { bad = 1.0; }   // the f16 probabilities' window
+        ilh[h] = math.recip(lt);
         @fmuls(pe.uv(h * Dc, Dc), pe.tv(h * (Dc + 1), Dc), ilh[h]);
       }
     }
@@ -207,7 +214,8 @@ fn layer(l: u16, pos: u32) void {
     pe.mcast(QD + 1);
     h = 0;
     while (h < Qh) : (h += 1) {
-      const st = math.ln1(if (lh[h] > 1.0e-30) lh[h] else 1.0e-30);
+      const lr = if (SKW == 1 and SNK == 1) lw[h] else lh[h];
+      const st = math.ln1(if (lr > 1.0e-30) lr else 1.0e-30);
       pe.u[h] = st;
       mref[l * Qh + h] += st;
     }

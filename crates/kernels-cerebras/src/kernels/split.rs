@@ -82,7 +82,7 @@ params! {
     /// table levels, the scores' scale, the levers' defaults.
     pub struct CyAtt {
         K: u32, NQA: u32, Qh: u32, Dc: u32, NROT: u32, HR: u32, NLV: u32, QSC: Lit, CYV: u32,
-        DIAG: u32, TSTAMP: u32, FIFOW: u32, NRM: u32, MIXK: u32, EPS: Lit, QB: u32, SNK: u32, QKN: u32,
+        DIAG: u32, TSTAMP: u32, FIFOW: u32, NRM: u32, MIXK: u32, EPS: Lit, QB: u32, SNK: u32, QKN: u32, SKW: u32,
     }
 }
 
@@ -296,6 +296,7 @@ pub fn kernels(prog: &Program) -> R<Kernels> {
         QB: sc.qb,
         SNK: sc.snk,
         QKN: sc.qkn,
+        SKW: 0,
     };
     out.insert(CYA, KernelBuild::of(&CY_ATT, cya)?);
     let cym = CyMoe {

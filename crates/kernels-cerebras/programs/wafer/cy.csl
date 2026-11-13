@@ -85,6 +85,7 @@ param GLUV: u16 = 0;   // (MIXK 3) the GLU's form (ops/cy_moe.csl)
 param QB: u16 = 1;     // (MIXK 2) 1: the q / k / v biases
 param SNK: u16 = 1;    // (MIXK 2) 1: the sinks
 param QKN: u16 = 0;    // (MIXK 2) 1: the q / k heads RMS-normed
+param SKW: u16 = 0;    // (MIXK 2) 1: the f16 window's low bound and the log-sum-exp steps over l + the sink's term
 param RB: u16 = 1;     // (MIXK 3) 1: the router's bias
 param GB: u16 = 1;     // (MIXK 3) 1: the gate / up biases
 param PSC: u16 = 1;    // (MIXK 3) 1: the experts' powers of two (MXFP4's scales); 0: 16-bit experts
@@ -138,7 +139,7 @@ const ple = @import_module("ops/cy_ple.csl", .{ .pe = pe, .fab = fab, .math = ma
 var pl_ptr: [*]f32 = &ple.pl;
 var plog_ptr: [*]f32 = &ple.plog;
 const swa = @import_module("ops/cy_swa.csl", .{ .pe = pe, .math = math, .ON = MIXK == 2, .K = K, .NQA = NQA, .Qh = Qh,
-  .Dc = Dc, .NROT = NROT, .NLV = NLV, .QSC = QSC, .CYV = CYV, .QB = QB, .SNK = SNK, .QKN = QKN });
+  .Dc = Dc, .NROT = NROT, .NLV = NLV, .QSC = QSC, .CYV = CYV, .QB = QB, .SNK = SNK, .QKN = QKN, .SKW = SKW });
 var qb_ptr: [*]f32 = &swa.qb;
 var snk_ptr: [*]f32 = &swa.snk;
 const moe = @import_module("ops/cy_moe.csl", .{ .pe = pe, .fab = fab, .math = math, .ON = MIXK == 3, .K = K, .Ic = Ic,

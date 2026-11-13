@@ -227,6 +227,12 @@ fn stamped(
                 let last = rows.last().ok_or("no launch read")?;
                 let s = (last_extra + 1).min(64);
                 lp = json!(diffs(&last[2..2 + s]));
+                let every: Vec<_> = rows[..rows.len() - 1]
+                    .iter()
+                    .map(|b| diffs(&b[2..2 + steps.min(64)]))
+                    .chain(std::iter::once(diffs(&last[2..2 + s])))
+                    .collect();
+                phases.insert("loop_every".into(), json!(every));
             }
         }
     }
@@ -346,7 +352,11 @@ fn run() -> Result<bool, String> {
         );
     }
     if let Some(probes) = stamps::read(&Path::new(&program).join("artifact"))? {
-        let times = stamped(&mut m, &probes, &prompt, n, steps)?;
+        let mut times = stamped(&mut m, &probes, &prompt, n, steps)?;
+        if get.contains_key("again") {
+            let again = stamped(&mut m, &probes, &prompt, n, steps)?;
+            times["again"] = again["phases_mean"]["loop_every"].clone();
+        }
         println!("TIMES {times}");
         if let Some(path) = get.get("times") {
             std::fs::write(path, times.to_string()).map_err(|e| format!("{path}: {e}"))?;
