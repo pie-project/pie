@@ -82,13 +82,9 @@ pub trait Engine: Send {
         crate::live::ArmingRoom::default()
     }
 
-    /// Captures the graph bodies of at most one composition not armed
-    /// (REDESIGN 2.5), on the lane's own thread, and says whether any
-    /// remain. Which one follows demand: `want` is the most rows any pass
-    /// asks a fire to carry now (0 when none does); the rungs up to the one
-    /// that holds them arm first, smallest first, then the rest, smallest
-    /// first. A rung is stated armed only once it and every narrower rung
-    /// are. Bounded: the runtime calls it while its lane is
+    /// Captures the graph bodies of at most one composition of the next
+    /// rung not armed (REDESIGN 2.5), on the lane's own thread, and says
+    /// whether any remain. Bounded: the runtime calls it while its lane is
     /// idle, and between fires while a raise waits on a rung not armed, so
     /// one call holds the lane for one composition's capture at most. When
     /// a rung's last composition is captured the engine states it
@@ -105,8 +101,8 @@ pub trait Engine: Send {
     /// between an [`Engine::expect_fire`] and the fire it announced. The
     /// default arms nothing: every rung is armed at load, or by the engine
     /// on its own.
-    fn arm_step(&mut self, lent: &crate::live::ArmingLease, want: u32) -> Result<bool> {
-        let _ = (lent, want);
+    fn arm_step(&mut self, lent: &crate::live::ArmingLease) -> Result<bool> {
+        let _ = lent;
         Ok(false)
     }
 

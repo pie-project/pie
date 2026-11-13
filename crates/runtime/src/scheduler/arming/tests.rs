@@ -175,7 +175,7 @@ impl ::engine::Engine for Arms {
         ROOM
     }
 
-    fn arm_step(&mut self, lent: &ArmingLease, _want: u32) -> ::engine::Result<bool> {
+    fn arm_step(&mut self, lent: &ArmingLease) -> ::engine::Result<bool> {
         if self.seen.over.load(Ordering::SeqCst) {
             self.seen.after_over.fetch_add(1, Ordering::SeqCst);
         }
