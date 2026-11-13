@@ -360,9 +360,11 @@ impl<I: PoolId> ShapePool<I> {
     pub fn capacity(&self) -> u32 {
         match &self.slots {
             Backing::Own(_) => self.capacity,
-            Backing::Shape(shared, shape) => {
-                shared.lock().unwrap().shape_capacity(*shape).min(self.capacity)
-            }
+            Backing::Shape(shared, shape) => shared
+                .lock()
+                .unwrap()
+                .shape_capacity(*shape)
+                .min(self.capacity),
             Backing::Records(shared) => shared.lock().unwrap().records_capacity(),
         }
     }
@@ -735,6 +737,9 @@ impl StorePools {
                     }
                     pools.window_tokens = pools.window_tokens.max(window);
                 }
+                // An instance's tables and a ring are taken on demand, no
+                // part of a record (`super::roles`).
+                SlotKind::Fixed { .. } if !shape.role.replayable() => {}
                 SlotKind::Fixed { pieces } => {
                     pools.state.slot_bytes += shape.slot_bytes * u64::from(pieces);
                 }
@@ -800,12 +805,19 @@ impl SlotMeter {
                 let state = rs.device_demand();
                 let total = kv_page_bytes * capacity + rows(rs.capacity());
                 let kv_cached = cached * kv_page_bytes;
+                // Instance tables and rings on the device: state, none of
+                // it cache (no token rebuilds them).
+                let roles = stores
+                    .roles
+                    .as_ref()
+                    .map_or(0, |roles| roles.lock().unwrap().device_bytes());
                 Bytes {
                     total,
-                    state: kv.live + state.live,
+                    state: kv.live + state.live + roles,
                     live: kv.live.saturating_sub(kv_cached)
-                        + state.live.saturating_sub(rows(rs.cache_only())),
-                    wanted: kv.wanted + state.wanted,
+                        + state.live.saturating_sub(rows(rs.cache_only()))
+                        + roles,
+                    wanted: kv.wanted + state.wanted + roles,
                     act: 0,
                 }
             }

@@ -190,7 +190,7 @@ impl ResidencyPlanner {
 
     /// Counts one engine copy of a residency move and, for kv, its time.
     pub(crate) fn record_tier_copy(&self, copy: &crate::scheduler::TierMove, elapsed: Duration) {
-        use crate::scheduler::TierKind::{Kv, KvSlots, RsSlots};
+        use crate::scheduler::TierKind::{Kv, KvSlots, RoleSlots, RsSlots};
         use ::engine::transfer::MemoryDomain::LocalDisk;
         let stats = &self.stats;
         let (count, us) = match (copy.kind, copy.tier, copy.out) {
@@ -202,8 +202,8 @@ impl ResidencyPlanner {
             }
             (Kv | KvSlots(_), _, true) => (&stats.d2h_pages, Some(&stats.d2h_copy_us)),
             (Kv | KvSlots(_), _, false) => (&stats.h2d_pages, Some(&stats.h2d_copy_us)),
-            (RsSlots(_), _, true) => (&stats.d2h_rs_slots, None),
-            (RsSlots(_), _, false) => (&stats.h2d_rs_slots, None),
+            (RsSlots(_) | RoleSlots(_), _, true) => (&stats.d2h_rs_slots, None),
+            (RsSlots(_) | RoleSlots(_), _, false) => (&stats.h2d_rs_slots, None),
         };
         count.fetch_add(copy.device.len() as u64, Ordering::Relaxed);
         if copy.source.is_some() {

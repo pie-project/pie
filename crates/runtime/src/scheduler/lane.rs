@@ -113,6 +113,12 @@ impl LaneCommit {
     }
 }
 
+/// The instance and channel slots of engine `engine_idx`'s pool, where it
+/// states their shapes (the serving model's stores, model 0).
+fn roles_of(engine_idx: usize) -> Option<crate::store::roles::RolesHandle> {
+    crate::store::registry::try_get(0, engine_idx).and_then(|stores| stores.roles)
+}
+
 fn backend(engine: &mut Option<EngineBox>) -> Result<&mut EngineBox> {
     engine.as_mut().ok_or_else(|| anyhow!(NO_BACKEND))
 }
@@ -683,16 +689,22 @@ impl Lane {
                         return LaneCommit::BindFinished { pipeline_id };
                     }
                 };
-                let registered =
-                    match Self::register_channel_set(engine, engine_idx, channels, &plans) {
-                        Ok(registered) => registered,
-                        Err(error) => {
-                            if response.send(Err(error)).is_err() {
-                                Self::release_wait_slots([bind.pacing_wait_id]);
-                            }
-                            return LaneCommit::BindFinished { pipeline_id };
+                let roles = roles_of(engine_idx);
+                let registered = match Self::register_channel_set(
+                    engine,
+                    engine_idx,
+                    channels,
+                    &plans,
+                    pipeline_id,
+                ) {
+                    Ok(registered) => registered,
+                    Err(error) => {
+                        if response.send(Err(error)).is_err() {
+                            Self::release_wait_slots([bind.pacing_wait_id]);
                         }
-                    };
+                        return LaneCommit::BindFinished { pipeline_id };
+                    }
+                };
                 if response.is_closed() {
                     Self::rollback_channel_set(
                         engine,
@@ -709,7 +721,18 @@ impl Lane {
                 if let Some(plan) = &program {
                     let backend = crate::engine::verbs::codegen_backend(engine);
                     let plan = &crate::pipeline::program::with_host_codegen(plan, backend);
-                    match engine.register_program(plan).map_err(anyhow::Error::from) {
+                    let registered_program = engine
+                        .register_program(plan)
+                        .and_then(|program_id| {
+                            // What an instance of it holds in the pool,
+                            // asked once at registration.
+                            if let Some(roles) = &roles {
+                                crate::store::roles::learn_program(roles, &**engine, program_id)?;
+                            }
+                            Ok(program_id)
+                        })
+                        .map_err(anyhow::Error::from);
+                    match registered_program {
                         Ok(program_id) => bind.binding.program = program_id,
                         Err(error) => {
                             tracing::error!(
@@ -750,7 +773,7 @@ impl Lane {
                     }
                     return LaneCommit::BindFinished { pipeline_id };
                 }
-                match Self::bind(engine, channels, &bind) {
+                match Self::bind(engine, channels, &bind, roles.as_ref(), pipeline_id) {
                     Ok(bound) => LaneCommit::BindInstance {
                         pipeline_id,
                         bound,
@@ -801,6 +824,7 @@ impl Lane {
                         PoolOp::CommitSegments(segments) => engine.commit_segments(segments),
                         PoolOp::ReleaseSegments(segments) => engine.release_segments(segments),
                         PoolOp::Evacuate(evacuation) => engine.evacuate(&evacuation),
+                        PoolOp::Rebind(rebind) => engine.rebind_slots(rebind),
                     }
                     .map_err(anyhow::Error::from)
                 });
@@ -855,6 +879,9 @@ impl Lane {
                 {
                     Ok(()) => {
                         channels.unbind(id);
+                        if let Some(roles) = roles_of(engine_idx) {
+                            roles.lock().unwrap().close_instance(id);
+                        }
                         LaneCommit::CloseInstance { id }
                     }
                     Err(err) => {
@@ -871,6 +898,9 @@ impl Lane {
                         backend(engine).and_then(|engine| {
                             Self::close_channel(engine, id).map(|()| {
                                 channels.remove(id);
+                                if let Some(roles) = roles_of(engine_idx) {
+                                    roles.lock().unwrap().close_channel(id);
+                                }
                             })
                         })
                     };
@@ -887,8 +917,16 @@ impl Lane {
         engine: &mut EngineBox,
         channels: &mut ChannelJoin,
         plan: &crate::engine::InstanceBindingPlan,
+        roles: Option<&crate::store::roles::RolesHandle>,
+        holder: Option<ProcessId>,
     ) -> Result<BoundInstance> {
-        let bound = engine.bind_instance(&plan.binding)?;
+        let bound = crate::store::roles::bind_instance(
+            roles,
+            &mut **engine,
+            &plan.binding,
+            holder,
+            |id| channels.contains(id),
+        )?;
         let bound = BoundInstance::new(&bound, plan.pacing_wait_id);
         channels.bind(bound.instance_id, plan.binding.channels.clone());
         Ok(bound)
@@ -906,28 +944,40 @@ impl Lane {
         engine_idx: usize,
         channels: &mut ChannelJoin,
         plans: &[ChannelRegistration],
+        holder: Option<ProcessId>,
     ) -> Result<Vec<RegisteredChannel>> {
+        let roles = roles_of(engine_idx);
         let mut registered = Vec::with_capacity(plans.len());
         let mut registered_ids = Vec::with_capacity(plans.len());
+        let undo =
+            |engine: &mut EngineBox, channels: &mut ChannelJoin, ids: &[::engine::ChannelId]| {
+                for &channel_id in ids.iter().rev() {
+                    let _ = engine.close_channel(channel_id);
+                    channels.remove(channel_id);
+                    if let Some(roles) = &roles {
+                        roles.lock().unwrap().close_channel(channel_id);
+                    }
+                }
+            };
         for plan in plans {
             if channels.contains(plan.id) {
-                for channel_id in registered_ids.iter().rev() {
-                    let _ = engine.close_channel(*channel_id);
-                    channels.remove(*channel_id);
-                }
+                undo(engine, channels, &registered_ids);
                 return Err(anyhow!("channel {} is already registered", plan.id));
             }
-            match crate::engine::verbs::register_channel(engine, engine_idx, plan) {
+            match crate::store::roles::register_channel(
+                roles.as_ref(),
+                &mut **engine,
+                plan,
+                holder,
+                |engine, plan| crate::engine::verbs::register_channel(engine, engine_idx, plan),
+            ) {
                 Ok(channel) => {
                     channels.insert(channel.clone(), plan.host_role);
                     registered_ids.push(plan.id);
                     registered.push(channel);
                 }
                 Err(cause) => {
-                    for channel_id in registered_ids.iter().rev() {
-                        let _ = engine.close_channel(*channel_id);
-                        channels.remove(*channel_id);
-                    }
+                    undo(engine, channels, &registered_ids);
                     return Err(cause);
                 }
             }
@@ -947,6 +997,9 @@ impl Lane {
             match Self::close_channel(engine, channel_id) {
                 Ok(()) => {
                     channels.remove(channel_id);
+                    if let Some(roles) = roles_of(channel.engine_id) {
+                        roles.lock().unwrap().close_channel(channel_id);
+                    }
                 }
                 Err(error) => {
                     tracing::error!(

@@ -215,6 +215,12 @@ pub(crate) async fn pool(engine_id: usize, op: worker::PoolOp) -> Result<()> {
     scheduler_handle(engine_id)?.pool(op).await
 }
 
+/// Tells engine `engine_id` where moved pool slots lie now, on its lane
+/// ahead of every fire queued after it.
+pub(crate) async fn rebind_slots(engine_id: usize, rebind: ::engine::Rebind) -> Result<()> {
+    pool(engine_id, worker::PoolOp::Rebind(rebind)).await
+}
+
 /// The engine's host-tier layout, once asked.
 pub(crate) async fn host_kv_layout(engine_id: usize) -> Option<state::PageLayout> {
     static LAYOUTS: std::sync::Mutex<Vec<Option<Option<state::PageLayout>>>> =

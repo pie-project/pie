@@ -9,7 +9,7 @@ use crate::fire::{FrameId, FrameSubmission, FrameTicket, MediaEncode, Step};
 use crate::load::{LoadRequest, Loaded};
 use crate::program::{
     BoundInstance, InstanceBinding, InstanceId, ProgramFacts, ProgramId, ProgramRegistration,
-    RingFacts,
+    Rebind, RingFacts,
 };
 use crate::transfer::{KvCopy, KvHandle, StateCopy};
 
@@ -102,6 +102,17 @@ pub trait Engine: Send {
     fn ring_facts(&self, registration: &ChannelRegistration) -> Result<Option<RingFacts>> {
         let _ = registration;
         Ok(None)
+    }
+
+    /// An instance's or a channel's pool slots moved: the runtime parked
+    /// them on another tier and copied them back into the fresh refs
+    /// `rebind` names, each shape apart. Called before the next fire that
+    /// reads them, which must address the new slots. The default does
+    /// nothing: an engine that states no `Instance` or `Channel` shape is
+    /// never asked.
+    fn rebind_slots(&mut self, rebind: Rebind) -> Result<()> {
+        let _ = rebind;
+        Ok(())
     }
 
     fn register_channel(

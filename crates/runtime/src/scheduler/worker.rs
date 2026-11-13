@@ -299,6 +299,9 @@ pub(crate) enum PoolOp {
     /// A shared pool's chunks move, ahead of every fire queued after it
     /// (`Engine::evacuate`).
     Evacuate(::engine::chunk::Evacuation),
+    /// An instance's tables or a ring were unparked into these slots
+    /// (`Engine::rebind_slots`), ahead of every fire queued after it.
+    Rebind(::engine::Rebind),
 }
 
 /// A read or write of host kv slots' bytes, behind every copy queued before

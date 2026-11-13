@@ -15,7 +15,13 @@
 //!   list is in its own token order, ref 0 (the null chunk, never handed
 //!   out) where it holds none;
 //! - the rs store's state slots are **records**: one working set's fixed
-//!   state, a slot of every fixed shape for each of its pieces;
+//!   state, a slot of every fixed shape of role [`SlotRole::State`] for each
+//!   of its pieces;
+//! - the fixed shapes of roles [`SlotRole::Instance`] and
+//!   [`SlotRole::Channel`] (`new-memory/STATE-ROLES.md`) are no part of a
+//!   record nor of a working set: their slots are taken on demand as
+//!   instances bind and channels register ([`super::roles`]), and are left
+//!   out of every record and working-set count here;
 //! - the rs store's buffer pages are slot refs of the **rs list** (a list
 //!   shape of role [`SlotRole::RsBuffer`], CONTRACT-BC 18): taken as
 //!   unfolded rows accumulate, refcounted by the store so forks share their
@@ -354,7 +360,7 @@ pub enum SharedError {
     #[error("the reserved chunks are not one run from chunk 0")]
     Reserved,
     #[error(
-        "{kind} shapes {shapes:?}: the stores hold one kv list, one rs list and one window list a distinct window"
+        "{kind} shapes {shapes:?}: the stores hold one kv list, one rs list, one window list a distinct window, and one one-piece instance and channel shape"
     )]
     Shapes {
         kind: &'static str,
@@ -431,6 +437,36 @@ pub struct FixedShape {
     pub slot_bytes: u64,
 }
 
+/// The fixed shapes of an instance's tables and a channel's ring, where the
+/// engine states them: one slot a piece, taken on demand
+/// ([`super::roles::Roles`]).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct RoleShapes {
+    pub instance: Option<FixedShape>,
+    pub channel: Option<FixedShape>,
+}
+
+impl RoleShapes {
+    /// The shape of role `role`, where the pool has it.
+    #[must_use]
+    pub fn of(&self, role: SlotRole) -> Option<FixedShape> {
+        match role {
+            SlotRole::Instance => self.instance,
+            SlotRole::Channel => self.channel,
+            SlotRole::State | SlotRole::RsBuffer => None,
+        }
+    }
+
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.instance.is_none() && self.channel.is_none()
+    }
+
+    fn iter(&self) -> impl Iterator<Item = &FixedShape> {
+        self.instance.iter().chain(&self.channel)
+    }
+}
+
 /// The tiers below an engine's shared pool (CONTRACT-BC 22): its host
 /// chunks, a pool of every state shape of their own
 /// ([`SharedPool::tier`]), and the kv list's slots in the engine's slot
@@ -488,7 +524,10 @@ pub struct SharedPool {
     rs_list: Option<TokenShape>,
     /// The window lists, narrowest window first (CONTRACT-BC 19).
     windows: Vec<TokenShape>,
+    /// The fixed shapes of role [`SlotRole::State`]: a record's.
     fixed: Vec<FixedShape>,
+    /// The fixed shapes taken on demand, outside every record.
+    roles: RoleShapes,
     /// The first weight shape's pool id; the weight shapes follow.
     weights_first: ShapeId,
     /// Record id -> its slots, each fixed shape's pieces in order.
@@ -536,6 +575,7 @@ impl SharedPool {
         let state_slot_bytes = facts
             .shapes
             .iter()
+            .filter(|shape| shape.role.replayable())
             .filter_map(|shape| match shape.kind {
                 SlotKind::Fixed { pieces } => Some(u64::from(pieces) * shape.slot_bytes),
                 SlotKind::List { .. } => None,
@@ -601,6 +641,7 @@ impl SharedPool {
         let mut shapes = Vec::with_capacity(facts.shapes.len() + facts.weights.len());
         let (mut lists, mut rs_lists, mut windows, mut fixed) =
             (Vec::new(), Vec::new(), Vec::new(), Vec::new());
+        let (mut instances, mut channels) = (Vec::new(), Vec::new());
         for shape in &facts.shapes {
             let pool = ShapeId::try_from(shapes.len()).expect("shapes fit a shape id");
             let kind = match shape.kind {
@@ -621,7 +662,12 @@ impl SharedPool {
                     ShapeKind::List
                 }
                 SlotKind::Fixed { pieces } => {
-                    fixed.push(FixedShape {
+                    let found = match shape.role {
+                        SlotRole::Instance => &mut instances,
+                        SlotRole::Channel => &mut channels,
+                        SlotRole::State | SlotRole::RsBuffer => &mut fixed,
+                    };
+                    found.push(FixedShape {
                         id: shape.id,
                         pool,
                         pieces,
@@ -638,6 +684,14 @@ impl SharedPool {
         }
         for (kind, found) in [("kv list", &lists), ("rs list", &rs_lists)] {
             if found.len() > 1 {
+                return Err(SharedError::Shapes {
+                    kind,
+                    shapes: found.iter().map(|shape| shape.id.0).collect(),
+                });
+            }
+        }
+        for (kind, found) in [("instance", &instances), ("channel", &channels)] {
+            if found.len() > 1 || found.iter().any(|shape| shape.pieces != 1) {
                 return Err(SharedError::Shapes {
                     kind,
                     shapes: found.iter().map(|shape| shape.id.0).collect(),
@@ -679,6 +733,10 @@ impl SharedPool {
             rs_list: rs_lists.first().copied(),
             windows,
             fixed,
+            roles: RoleShapes {
+                instance: instances.first().copied(),
+                channel: channels.first().copied(),
+            },
             weights_first,
             records: Vec::new(),
             free_records: BTreeSet::new(),
@@ -732,9 +790,16 @@ impl SharedPool {
         &self.windows
     }
 
+    /// The fixed shapes of a record: role [`SlotRole::State`].
     #[must_use]
     pub fn fixed(&self) -> &[FixedShape] {
         &self.fixed
+    }
+
+    /// The fixed shapes taken on demand: an instance's tables, a ring.
+    #[must_use]
+    pub fn roles(&self) -> RoleShapes {
+        self.roles
     }
 
     /// The kv list slots whose chunks, let go whole, hold `rs` of the state
@@ -780,6 +845,7 @@ impl SharedPool {
             .or_else(|| {
                 self.fixed
                     .iter()
+                    .chain(self.roles.iter())
                     .find(|shape| shape.pool == pool)
                     .map(|shape| shape.id)
             })

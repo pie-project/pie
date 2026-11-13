@@ -9,6 +9,7 @@ use crate::scheduler::{TierKind, TierMove};
 use crate::store::kv::page_table::WorkingSetId;
 use crate::store::kv::working_set::KvSuspendHandle;
 use crate::store::kv::{KvResidencyTxn, KvSpillTxn, KvStoreError};
+use crate::store::roles::{Owner, RoleMove, RolesHandle};
 use crate::store::rs::RsResidencyTxn;
 use ::engine::transfer::MemoryDomain;
 
@@ -58,6 +59,7 @@ pub(super) fn spawn_move_out(
         Move::Suspend {
             kv: Some(txn),
             rs: None,
+            roles: None,
         },
     );
     let task = move_out(planner.clone(), guard, label, done);
@@ -258,17 +260,20 @@ impl Drop for FenceGuard {
     }
 }
 
-/// A process's residency move: its kv and rs transactions, prepared in the
-/// stores and committed once the engine copies land, either of which may
-/// be absent when that store holds nothing to move.
+/// A process's residency move: its kv and rs transactions and its instance
+/// and channel slots (`roles`), prepared in the stores and committed once
+/// the engine copies land, any of which may be absent when that store holds
+/// nothing to move.
 enum Move {
     Suspend {
         kv: Option<KvResidencyTxn>,
         rs: Option<RsResidencyTxn>,
+        roles: Option<RoleMove>,
     },
     Restore {
         kv: Option<KvResidencyTxn>,
         rs: Option<RsResidencyTxn>,
+        roles: Option<RoleMove>,
     },
 }
 
@@ -276,9 +281,9 @@ impl Move {
     /// The engine copies the move takes: kv pages by the tier they are
     /// backed in, then the rs slots.
     fn copies(&self) -> Vec<TierMove> {
-        let (out, kv, rs) = match self {
-            Move::Suspend { kv, rs } => (true, kv, rs),
-            Move::Restore { kv, rs } => (false, kv, rs),
+        let (out, kv, rs, roles) = match self {
+            Move::Suspend { kv, rs, roles } => (true, kv, rs, roles),
+            Move::Restore { kv, rs, roles } => (false, kv, rs, roles),
         };
         let mut copies: Vec<TierMove> = kv
             .iter()
@@ -311,14 +316,26 @@ impl Move {
                 });
             }
         }
+        // Instance tables and rings park with their process (never
+        // dropped: no token rebuilds them).
+        for copy in roles.iter().flat_map(RoleMove::copies) {
+            copies.push(TierMove {
+                kind: TierKind::RoleSlots(copy.shape),
+                tier: MemoryDomain::HostPinned,
+                out,
+                device: copy.device.clone(),
+                slots: copy.host.clone(),
+                source: None,
+            });
+        }
         copies
     }
 }
 
 fn abort(model: usize, engine: usize, txn: Move) {
     let stores = crate::store::registry::get(model, engine);
-    match txn {
-        Move::Suspend { kv, rs } => {
+    let roles = match txn {
+        Move::Suspend { kv, rs, roles } => {
             if let Some(txn) = kv {
                 crate::store::registry::with_kv_lock(&stores.kv, "planner-evict", |kv| {
                     kv.abort_suspend(txn)
@@ -327,8 +344,9 @@ fn abort(model: usize, engine: usize, txn: Move) {
             if let Some(txn) = rs {
                 stores.rs.lock().unwrap().abort_suspend(txn);
             }
+            roles
         }
-        Move::Restore { kv, rs } => {
+        Move::Restore { kv, rs, roles } => {
             if let Some(txn) = kv {
                 crate::store::registry::with_kv_lock(&stores.kv, "planner-restore", |kv| {
                     kv.abort_restore(txn)
@@ -337,7 +355,11 @@ fn abort(model: usize, engine: usize, txn: Move) {
             if let Some(txn) = rs {
                 stores.rs.lock().unwrap().abort_restore(txn);
             }
+            roles
         }
+    };
+    if let (Some(txn), Some(store)) = (roles, &stores.roles) {
+        store.lock().unwrap().abort(txn);
     }
 }
 
@@ -520,15 +542,21 @@ async fn evict(planner: Arc<ResidencyPlanner>, pid: ProcessId) {
         planner.eviction_found_nothing(pid);
         return;
     }
+    // The process's instance tables and rings park with its state where the
+    // host has room; what it lacks stays on the device, never dropped.
+    let roles = stores
+        .roles
+        .as_ref()
+        .and_then(|roles| roles.lock().unwrap().prepare_park(pid));
     let prepared_at = began.elapsed();
-    let mut guard = MoveGuard::new(model, engine, Move::Suspend { kv, rs });
+    let mut guard = MoveGuard::new(model, engine, Move::Suspend { kv, rs, roles });
     if let Err(error) = guard.copy(&planner, pid).await {
         tracing::warn!(pid = %pid, %error, "planner: eviction copy failed");
         planner.eviction_failed(pid);
         return;
     }
     let copied = began.elapsed();
-    let Move::Suspend { kv, rs } = guard.take() else {
+    let Move::Suspend { kv, rs, roles } = guard.take() else {
         unreachable!("an eviction carries a suspend")
     };
     let freed = match kv {
@@ -539,7 +567,15 @@ async fn evict(planner: Arc<ResidencyPlanner>, pid: ProcessId) {
             match freed {
                 Ok(freed) => freed,
                 Err(error) => {
-                    abort(model, engine, Move::Suspend { kv: None, rs });
+                    abort(
+                        model,
+                        engine,
+                        Move::Suspend {
+                            kv: None,
+                            rs,
+                            roles,
+                        },
+                    );
                     tracing::warn!(pid = %pid, %error, "planner: suspend commit failed");
                     planner.eviction_failed(pid);
                     return;
@@ -556,6 +592,9 @@ async fn evict(planner: Arc<ResidencyPlanner>, pid: ProcessId) {
     let rs_freed = rs.map_or(Default::default(), |txn| {
         stores.rs.lock().unwrap().commit_suspend(txn)
     });
+    if let (Some(txn), Some(store)) = (roles, &stores.roles) {
+        store.lock().unwrap().commit(txn);
+    }
     fence.keep_raised();
     ptrace!(
         "evict-phases pid={} drained_ms={} quiesced_ms={} prepared_ms={} copied_ms={} done_ms={} freed={}",
@@ -571,6 +610,22 @@ async fn evict(planner: Arc<ResidencyPlanner>, pid: ProcessId) {
 }
 
 const MOVE_WAIT: Duration = Duration::from_secs(10);
+
+/// Tells the engine where `pid`'s unparked instance tables and rings lie
+/// now, on its lane ahead of any fire of theirs: each item's slots
+/// (`Engine::rebind_slots`). An item it refuses stays stale, to be told
+/// again on the next restore.
+async fn rebind(engine: usize, roles: &RolesHandle, pid: ProcessId) -> Result<(), String> {
+    let stale = roles.lock().unwrap().stale(pid);
+    for rebind in stale {
+        let owner = Owner::of(&rebind);
+        crate::scheduler::rebind_slots(engine, rebind)
+            .await
+            .map_err(|error| format!("rebind {owner:?}: {error:#}"))?;
+        roles.lock().unwrap().rebound(owner);
+    }
+    Ok(())
+}
 
 async fn move_out(
     planner: Arc<ResidencyPlanner>,
@@ -660,19 +715,50 @@ async fn restore(
         match prepared {
             Ok(txn) => rs = Some(txn),
             Err(error) => {
-                abort(model, engine, Move::Restore { kv, rs: None });
+                abort(
+                    model,
+                    engine,
+                    Move::Restore {
+                        kv,
+                        rs: None,
+                        roles: None,
+                    },
+                );
                 planner.requeue_restore(pid, Some(&error.to_string()));
                 return;
             }
         }
     }
     drop(slots);
-    let mut guard = MoveGuard::new(model, engine, Move::Restore { kv, rs });
+    // The instance tables and rings parked with it come back into fresh
+    // device slots, which the engine is told before the process fires.
+    let roles = match stores
+        .roles
+        .as_ref()
+        .map(|roles| roles.lock().unwrap().prepare_unpark(pid))
+        .transpose()
+    {
+        Ok(roles) => roles.flatten(),
+        Err(error) => {
+            abort(
+                model,
+                engine,
+                Move::Restore {
+                    kv,
+                    rs,
+                    roles: None,
+                },
+            );
+            planner.requeue_restore(pid, Some(&error.to_string()));
+            return;
+        }
+    };
+    let mut guard = MoveGuard::new(model, engine, Move::Restore { kv, rs, roles });
     if let Err(error) = guard.copy(&planner, pid).await {
         planner.requeue_restore(pid, Some(&error));
         return;
     }
-    let Move::Restore { kv, rs } = guard.take() else {
+    let Move::Restore { kv, rs, roles } = guard.take() else {
         unreachable!("a restore carries a restore")
     };
     if let Some(txn) = kv {
@@ -680,7 +766,15 @@ async fn restore(
             kv.commit_restore(txn)
         });
         if let Err(error) = restored {
-            abort(model, engine, Move::Restore { kv: None, rs });
+            abort(
+                model,
+                engine,
+                Move::Restore {
+                    kv: None,
+                    rs,
+                    roles,
+                },
+            );
             planner.restore_failed(pid, &error.to_string());
             return;
         }
@@ -688,7 +782,20 @@ async fn restore(
     if let Some(txn) = rs {
         stores.rs.lock().unwrap().commit_restore(txn);
     }
-    ptrace!("restore-done pid={} ms={}", pid, began.elapsed().as_millis());
+    if let Some(store) = &stores.roles {
+        if let Some(txn) = roles {
+            store.lock().unwrap().commit(txn);
+        }
+        if let Err(error) = rebind(engine, store, pid).await {
+            planner.restore_failed(pid, &error);
+            return;
+        }
+    }
+    ptrace!(
+        "restore-done pid={} ms={}",
+        pid,
+        began.elapsed().as_millis()
+    );
     planner.report_restored(pid);
     crate::scheduler::nudge(engine);
 }
