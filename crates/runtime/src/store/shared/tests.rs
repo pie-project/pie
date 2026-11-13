@@ -881,3 +881,67 @@ fn a_lent_record_and_lent_pages_name_no_slot_in_the_null_chunk() {
     }
     rs.release_reservation(grant);
 }
+
+/// While the engine holds back part of the range it stated, no slot it
+/// binds none of is handed out, to a sequence or an arming lease alike:
+/// every ref lies in a committed segment, past the null chunk and below
+/// the span held back; once it holds none, the rest opens.
+#[test]
+fn no_slot_is_handed_out_past_what_the_engine_binds() {
+    let facts = facts();
+    let shared: Shared = Arc::new(Mutex::new(pool()));
+    let list = shared.lock().unwrap().list().expect("a kv list");
+    let spc = facts.shapes[0].slots_per_chunk;
+    let chunk_of = |pool: &SharedPool, r: u32| pool.pool().physical(r / spc).unwrap();
+    // Two segments committed: refs stay in them.
+    {
+        let mut pool = shared.lock().unwrap();
+        let refs = pool.take_refs(list.pool, 64).expect("refs");
+        for &r in &refs {
+            let chunk = chunk_of(&pool, r);
+            assert!(
+                chunk >= 1 && chunk < 2 * SEGMENT,
+                "ref {r} in chunk {chunk}"
+            );
+        }
+        pool.give_refs(list.pool, &refs);
+    }
+    // Every segment committed, the engine holding back all but 8 chunks
+    // below the activation: refs stay under chunk 8.
+    let mut engine = FakeEngine::new();
+    {
+        let mut pool = shared.lock().unwrap();
+        assert_eq!(
+            walk_segments(&mut pool, 8, 0, &mut engine),
+            Retarget::Reached
+        );
+        let top = pool.pool().top_segment() * SEGMENT;
+        pool.hold_back(u64::from(top - 8) * CHUNK);
+        assert_eq!(pool.pool().ceiling(), 8);
+    }
+    let mut pages =
+        crate::store::chunks::ShapePool::<crate::store::kv::page_table::PhysicalKvPageId>::shared(
+            &shared, list,
+        );
+    let mut taken = Vec::new();
+    while let Some(ids) = pages.try_alloc_n(1) {
+        taken.extend(ids);
+    }
+    {
+        let pool = shared.lock().unwrap();
+        assert!(!taken.is_empty());
+        for page in &taken {
+            let chunk = chunk_of(&pool, page.0);
+            assert!(
+                (1..8).contains(&chunk),
+                "page {} lies in chunk {chunk}, past what the engine binds",
+                page.0
+            );
+        }
+    }
+    // It holds none back: the rest of the span opens.
+    shared.lock().unwrap().hold_back(0);
+    let more = pages.try_alloc_n(1).expect("the span held back opens");
+    let pool = shared.lock().unwrap();
+    assert!(chunk_of(&pool, more[0].0) >= 8);
+}

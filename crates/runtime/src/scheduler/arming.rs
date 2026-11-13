@@ -147,6 +147,11 @@ impl Lender for PlannerLender {
         if let Some(grant) = take_funded(engine) {
             return Some(Lent::on_engine(grant, engine));
         }
+        // What the engine holds back now is no lease's either.
+        if let Some(shared) = crate::store::registry::try_get(0, engine).and_then(|s| s.shared) {
+            let held = crate::engine::live(engine).held();
+            shared.lock().unwrap().hold_back(held);
+        }
         let planner = crate::planner::planner_for(0, engine)?;
         planner
             .try_free(demand(room))
@@ -178,6 +183,11 @@ pub(crate) enum Step {
     /// Arming is over: armed, faulted, or no engine.
     Over,
 }
+
+/// The lane time a gap between two requests gives a waiting raise's steps
+/// past the first: the requests behind it wait no longer than this for
+/// steps of a few milliseconds, and one step for longer ones.
+pub(crate) const GAP_BUDGET: std::time::Duration = std::time::Duration::from_millis(20);
 
 /// How long a step short of room waits before its room is looked for
 /// again, so an idle lane does not take the planner's lock each spin.
