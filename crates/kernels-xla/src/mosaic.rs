@@ -1018,6 +1018,23 @@ impl Body {
         self.reduce_cols(v, false)
     }
 
+    /// The sum of a 2-d f32 vector over its columns (the lanes), kept as
+    /// `[rows, 1]` (`vector.multi_reduction` over axis 1).
+    pub fn sum_lanes(&mut self, v: V) -> Built<V> {
+        let (d, e) = self.vec_of(v)?;
+        if d.len() != 2 || e != Elem::F32 {
+            return bad(format!("a lane sum of {}", self.ty(v)));
+        }
+        let init = self.splat_f(&[d[0]], e, 0.0)?;
+        let r = self.op1(
+            "vector.multi_reduction",
+            &[v, init],
+            "kind = #vector.kind<add>, reduction_dims = array<i64: 1>",
+            MTy::Vector(vec![d[0]], e),
+        );
+        self.shape_cast(r, &[d[0], 1])
+    }
+
     /// The maximum (`max`) or sum of a 2-d f32 vector over its rows, kept
     /// as `[1, cols]` (`vector.multi_reduction` over axis 0).
     pub fn reduce_cols(&mut self, v: V, max: bool) -> Built<V> {

@@ -360,6 +360,12 @@ impl Device {
         Some(dir.join(format!("{}.pjrt", h.finalize().to_hex())))
     }
 
+    /// Whether compiled programs go to a disk cache.
+    #[must_use]
+    pub fn parks(&self) -> bool {
+        self.disk.is_some()
+    }
+
     /// Whether the disk cache holds the program compiled from `text`.
     #[must_use]
     pub fn on_disk(&self, text: &str) -> bool {

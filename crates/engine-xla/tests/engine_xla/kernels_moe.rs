@@ -1068,11 +1068,14 @@ fn the_grouped_matmul_kernel_answers_the_host() {
 /// to bf16 rounding (it weighs each row before the down leg, not after).
 #[test]
 fn the_routed_mlp_on_one_sort_answers_its_parts() {
-    let (e, h, i) = (8usize, 256usize, 128usize);
-    for (t, tk, glu) in [
-        (40usize, 4usize, moe::ExpertGlu::Swiglu),
-        (9, 2, moe::ExpertGlu::GegluTanh),
-        (1100, 4, moe::ExpertGlu::Swiglu),
+    let (e, h) = (8usize, 256usize);
+    for (t, tk, glu, i) in [
+        (40usize, 4usize, moe::ExpertGlu::Swiglu, 128usize),
+        (9, 2, moe::ExpertGlu::GegluTanh, 128),
+        (1100, 4, moe::ExpertGlu::Swiglu, 128),
+        // Halves of whole bf16 row tiles but not lane tiles (Gemma-4-26B-A4B's
+        // 704 in small), at a prompt's 128-row tiles.
+        (1100, 4, moe::ExpertGlu::GegluTanh, 176),
     ] {
         let x = data(t * h, 61);
         let wu: Vec<f32> = data(e * 2 * i * h, 62)
@@ -1087,11 +1090,12 @@ fn the_routed_mlp_on_one_sort_answers_its_parts() {
             .map(|p| ((hash(p / tk, 64) as usize + p % tk) % e) as i32)
             .collect();
         let weights: Vec<f32> = data(t * tk, 65).iter().map(|v| v.abs()).collect();
-        let run = |fused: bool, steps: i64, segment: i64, in_kernel: bool| {
+        let run = |fused: bool, steps: i64, segment: i64, in_kernel: bool, one: i64| {
             let mut b = Bench::new().with_tuning(kernels_xla::tuning::Tuning {
                 moe_gmm_run: steps,
                 moe_segment_tokens: segment,
                 moe_gmm_glu: in_kernel,
+                moe_gmm_fuse_from: one,
                 ..kernels_xla::tuning::Tuning::DEFAULT
             });
             let xt = b.bf16(t as u32, h as u32, &x);
@@ -1170,12 +1174,13 @@ fn the_routed_mlp_on_one_sort_answers_its_parts() {
             }
             Some(b.read_f32(y))
         };
-        let (Some(fused), Some(parts), Some(stepped), Some(segmented), Some(inside)) = (
-            run(true, 1, 0, false),
-            run(false, 1, 0, false),
-            run(true, 4, 0, false),
-            run(true, 4, 128, false),
-            run(true, 4, 0, true),
+        let (Some(fused), Some(parts), Some(stepped), Some(segmented), Some(inside), Some(one)) = (
+            run(true, 1, 0, false, 0),
+            run(false, 1, 0, false, 0),
+            run(true, 4, 0, false, 0),
+            run(true, 4, 128, false, 0),
+            run(true, 4, 0, true, 0),
+            run(true, 4, 0, true, 1),
         ) else {
             return;
         };
@@ -1189,5 +1194,7 @@ fn the_routed_mlp_on_one_sort_answers_its_parts() {
         // The GLU and each row's weight in the gate-up kernel: its parts', to
         // a bf16 rounding of the rows between the legs.
         assert_close(&inside, &parts, 0.01 * scale.max(1.0), 1e-2);
+        // Both legs in one kernel: the two kernels' rows, bit for bit.
+        assert_eq!(one, inside);
     }
 }

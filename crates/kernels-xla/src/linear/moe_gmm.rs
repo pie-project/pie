@@ -543,6 +543,282 @@ impl Gmm {
         })
     }
 
+    /// The gate-up kernel (`self`, landing its rows' GLU) and the down
+    /// kernel (`dn`) on the same schedule as one: each step's GLU rows go
+    /// straight into the down product in VMEM, never landing between the
+    /// legs, and each expert's two blocks stream in beside each other. Takes
+    /// what `kernel` (stepping) takes and the down bank last; the result is
+    /// the down kernel's.
+    pub fn mlp_kernel(&self, dn: &Gmm) -> Built<Compiled> {
+        let (k, n, tm, j) = (self.k, self.n, self.tm, self.run);
+        let half = n / 2;
+        let (dk, dnn) = (dn.k, dn.n);
+        if !self.stepping()
+            || !dn.stepping()
+            || self.glu.is_none()
+            || dn.glu.is_some()
+            || self.orient != Orient::NMajor
+            || self.out != Elem::Bf16
+            || dn.out != Elem::Bf16
+            || self.w != Elem::Bf16
+            || dn.w != Elem::Bf16
+            || n % 32 != 0
+            || dn.tiles != self.tiles
+            || dn.tm != tm
+            || dn.run != j
+            || dn.experts != self.experts
+            || dk != half
+            || dn.out_width()? != dnn
+        {
+            return bad(format!("one kernel over {self:?} and {dn:?}"));
+        }
+        let glu = self.glu.expect("checked");
+        let rows = self.tiles * tm;
+        let (drb, dcb) = match dn.orient {
+            Orient::NMajor => (dnn, dk),
+            Orient::KMajor => (dk, dnn),
+        };
+        fn last(b: &mut Body, g: &Grid) -> Built<V> {
+            let zero = b.index(0);
+            let nt = b.load(g.prefetch[1], &[zero])?;
+            let one = b.i32(1);
+            let top = b.subi(nt, one)?;
+            let z = b.i32(0);
+            let top = b.maxsi(top, z)?;
+            b.minsi(g.ids[1], top)
+        }
+        // A step's rows and their weights: `run` tiles from its first.
+        let rows_of = |width: i64, elem: Elem| Operand {
+            array: vec![rows, width],
+            elem,
+            block: vec![j * tm, width],
+            window: Window::Element,
+            index: Box::new(move |b: &mut Body, g: &Grid| {
+                let s = last(b, g)?;
+                let si = b.as_index(s)?;
+                let t = b.load(g.prefetch[4], &[si])?;
+                let tt = b.i32(tm);
+                let at = b.muli(t, tt)?;
+                let at = b.assume_multiple(at, tm)?;
+                Ok(vec![at, b.i32(0)])
+            }),
+        };
+        let whole = |dims: [i64; 2], elem: Elem| Operand {
+            array: dims.to_vec(),
+            elem,
+            block: dims.to_vec(),
+            window: Window::Any,
+            index: Box::new(|b: &mut Body, _: &Grid| Ok(vec![b.i32(0), b.i32(0)])),
+        };
+        let vmem = 2 * j * tm * k * 2
+            + 2 * n * k * 2
+            + 2 * drb * dcb * 2
+            + j * tm * n * 4
+            + j * tm * dnn * 4
+            + 2 * j * tm * dnn * 2
+            + 2 * j * tm * 128 * 4;
+        let floor = (32 << 20).min(self.vmem_cap);
+        let limit = (vmem * 2 + (8 << 20)).clamp(floor, self.vmem_cap);
+        let steps = self.steps();
+        let kernel = Kernel {
+            name: "gmm_mlp".into(),
+            grid: vec![1, steps],
+            semantics: vec![Sem::Arbitrary, Sem::Arbitrary],
+            prefetch: vec![
+                vec![steps],
+                vec![1],
+                vec![steps],
+                vec![steps],
+                vec![steps],
+                vec![steps],
+            ],
+            ins: vec![
+                rows_of(k, Elem::Bf16),
+                whole(self.bank_dims(), Elem::Bf16),
+                rows_of(128, Elem::F32),
+                whole(dn.bank_dims(), Elem::Bf16),
+            ],
+            outs: vec![whole([rows, dnn], Elem::Bf16)],
+            vmem_limit: Some(limit as u64),
+            scratch: vec![
+                MTy::Ref(vec![2, n, k], Elem::Bf16, Space::Vmem),
+                MTy::Sem(vec![2]),
+                MTy::Ref(vec![2, drb, dcb], Elem::Bf16, Space::Vmem),
+                MTy::Sem(vec![2]),
+                MTy::Ref(vec![2, j * tm, dnn], Elem::Bf16, Space::Vmem),
+                MTy::Sem(vec![2]),
+            ],
+        };
+        let dorient = dn.orient;
+        kernel.build(|b, blk| {
+            let (ubuf, usems, dbuf, dsems, obuf, osems) = (
+                blk.scratch[0],
+                blk.scratch[1],
+                blk.scratch[2],
+                blk.scratch[3],
+                blk.scratch[4],
+                blk.scratch[5],
+            );
+            let (ubank, dbank) = (blk.ins[1], blk.ins[3]);
+            let outr = blk.outs[0];
+            let pre = &blk.grid.prefetch;
+            let s = blk.grid.ids[1];
+            // The copies of expert `ex`'s two blocks into slot `slot`.
+            let wcopy = |b: &mut Body, ex: V, slot: V| -> Built<[(V, V, V); 2]> {
+                let z = b.i32(0);
+                let nn = b.i32(n);
+                let at = b.muli(ex, nn)?;
+                let src = b.ref_slice(ubank, &[at, z], &[n, k])?;
+                let dst = b.ref_slice(ubuf, &[slot, z, z], &[1, n, k])?;
+                let dst = b.ref_squeeze(dst)?;
+                let sem = b.ref_slice(usems, &[slot], &[1])?;
+                let sem = b.ref_squeeze(sem)?;
+                let dd = b.i32(dnn);
+                let dat = b.muli(ex, dd)?;
+                let dsrc = match dorient {
+                    Orient::NMajor => b.ref_slice(dbank, &[dat, z], &[dnn, dk])?,
+                    Orient::KMajor => b.ref_slice(dbank, &[z, dat], &[dk, dnn])?,
+                };
+                let ddst = b.ref_slice(dbuf, &[slot, z, z], &[1, drb, dcb])?;
+                let ddst = b.ref_squeeze(ddst)?;
+                let dsem = b.ref_slice(dsems, &[slot], &[1])?;
+                let dsem = b.ref_squeeze(dsem)?;
+                Ok([(src, dst, sem), (dsrc, ddst, dsem)])
+            };
+            let ocopy = |b: &mut Body, st: V, slot: V, c: i64| -> Built<(V, V, V)> {
+                let z = b.i32(0);
+                let si = b.as_index(st)?;
+                let t = b.load(pre[4], &[si])?;
+                let tt = b.i32(tm);
+                let at = b.muli(t, tt)?;
+                let at = b.assume_multiple(at, tm)?;
+                let src = b.ref_slice(obuf, &[slot, z, z], &[1, c * tm, dnn])?;
+                let src = b.ref_squeeze(src)?;
+                let dst = b.ref_slice(outr, &[at, z], &[c * tm, dnn])?;
+                let sem = b.ref_slice(osems, &[slot], &[1])?;
+                let sem = b.ref_squeeze(sem)?;
+                Ok((src, dst, sem))
+            };
+            let owait = |b: &mut Body, st: V| -> Built<()> {
+                let two = b.i32(2);
+                let slot = b.remsi(st, two)?;
+                let si = b.as_index(st)?;
+                let cnt = b.load(pre[5], &[si])?;
+                for c in 1..=j {
+                    let cc = b.i32(c);
+                    let is = b.cmpi(ICmp::Eq, cnt, cc)?;
+                    b.when(is, |b| {
+                        let (src, dst, sem) = ocopy(b, st, slot, c)?;
+                        b.dma_wait(sem, src, dst)
+                    })?;
+                }
+                Ok(())
+            };
+            let zero = b.index(0);
+            let ns = b.load(pre[1], &[zero])?;
+            let live = b.cmpi(ICmp::Slt, s, ns)?;
+            b.when(live, |b| {
+                let si = b.as_index(s)?;
+                let r = b.load(pre[2], &[si])?;
+                let two = b.i32(2);
+                let wslot = b.remsi(r, two)?;
+                let z = b.i32(0);
+                let one = b.i32(1);
+                let before = b.subi(s, one)?;
+                let before = b.maxsi(before, z)?;
+                let bi = b.as_index(before)?;
+                let rp = b.load(pre[2], &[bi])?;
+                let at0 = b.cmpi(ICmp::Eq, s, z)?;
+                let moved = b.cmpi(ICmp::Ne, rp, r)?;
+                let first = b.select(at0, at0, moved)?;
+                b.when(at0, |b| {
+                    let ex = b.load(pre[0], &[si])?;
+                    for (src, dst, sem) in wcopy(b, ex, wslot)? {
+                        b.dma_start(src, dst, sem)?;
+                    }
+                    Ok(())
+                })?;
+                b.when(first, |b| {
+                    let z = b.i32(0);
+                    for (src, dst, sem) in wcopy(b, z, wslot)? {
+                        b.dma_wait(sem, src, dst)?;
+                    }
+                    let nx = b.load(pre[3], &[si])?;
+                    let has = b.cmpi(ICmp::Sge, nx, z)?;
+                    b.when(has, |b| {
+                        let one = b.i32(1);
+                        let other = b.subi(one, wslot)?;
+                        for (src, dst, sem) in wcopy(b, nx, other)? {
+                            b.dma_start(src, dst, sem)?;
+                        }
+                        Ok(())
+                    })
+                })?;
+                let two = b.i32(2);
+                let oslot = b.remsi(s, two)?;
+                let back = b.subi(s, two)?;
+                let had = b.cmpi(ICmp::Sge, back, z)?;
+                b.when(had, |b| owait(b, back))?;
+                let z = b.i32(0);
+                let uheld = b.ref_slice(ubuf, &[wslot, z, z], &[1, n, k])?;
+                let uheld = b.ref_squeeze(uheld)?;
+                let dheld = b.ref_slice(dbuf, &[wslot, z, z], &[1, drb, dcb])?;
+                let dheld = b.ref_squeeze(dheld)?;
+                let cnt = b.load(pre[5], &[si])?;
+                for c in 1..=j {
+                    let cc = b.i32(c);
+                    let is = b.cmpi(ICmp::Eq, cnt, cc)?;
+                    b.when(is, |b| {
+                        let zi = b.index(0);
+                        let x = b.vload(blk.ins[0], &[zi, zi], &[c * tm, k])?;
+                        // Each half's dot rounded to bf16 as the select's rows
+                        // land, the GLU and the weight in f32, rounded once:
+                        // the rows the gate-up kernel lands.
+                        let halfdot = |b: &mut Body, at: i64| -> Built<V> {
+                            let zi = b.index(0);
+                            let ri = b.index(at);
+                            let w = b.vload(uheld, &[ri, zi], &[half, k])?;
+                            let acc = b.splat_f(&[c * tm, half], Elem::F32, 0.0)?;
+                            let y = b.matmul(x, w, acc, true)?;
+                            let y = b.convert_f(y, Elem::Bf16)?;
+                            b.convert_f(y, Elem::F32)
+                        };
+                        let g = halfdot(b, 0)?;
+                        let u = halfdot(b, half)?;
+                        let a = glu_of(b, glu, g, u, &[c * tm, half])?;
+                        let wv = b.vload(blk.ins[2], &[zi, zi], &[c * tm, 128])?;
+                        let wv = b.slice(wv, &[0, 0], &[c * tm, 1])?;
+                        let wv = b.broadcast(wv, &[c * tm, half])?;
+                        let a = b.mulf(a, wv)?;
+                        let hrows = b.convert_f(a, Elem::Bf16)?;
+                        // The down product of those rows, as the down kernel's.
+                        let wd = b.vload_all(dheld)?;
+                        let acc = b.splat_f(&[c * tm, dnn], Elem::F32, 0.0)?;
+                        let y = b.matmul(hrows, wd, acc, dorient == Orient::NMajor)?;
+                        let y = b.convert_f(y, Elem::Bf16)?;
+                        let z = b.i32(0);
+                        let dst = b.ref_slice(obuf, &[oslot, z, z], &[1, c * tm, dnn])?;
+                        let dst = b.ref_squeeze(dst)?;
+                        b.vstore_all(y, dst)?;
+                        let (src, dst, sem) = ocopy(b, s, oslot, c)?;
+                        b.dma_start(src, dst, sem)
+                    })?;
+                }
+                let one = b.i32(1);
+                let end = b.subi(ns, one)?;
+                let at_end = b.cmpi(ICmp::Eq, s, end)?;
+                b.when(at_end, |b| {
+                    let z = b.i32(0);
+                    let one = b.i32(1);
+                    let prev = b.subi(s, one)?;
+                    let had = b.cmpi(ICmp::Sge, prev, z)?;
+                    b.when(had, |b| owait(b, prev))?;
+                    owait(b, s)
+                })
+            })
+        })
+    }
+
     fn kernel_prefetching(&self) -> Built<Compiled> {
         let (k, n, tm, e) = (self.k, self.n, self.tm, self.experts);
         let rows = self.tiles * tm;
@@ -1045,7 +1321,7 @@ impl Gmm {
 
 /// `act(g) · u` over f32 `dims` vectors, as `linear::mlp`'s GLUs take it:
 /// SwiGLU `g · σ(g) · u`, GeGLU `0.5 g (1 + tanh(√(2/π) (g + 0.044715 g³))) u`.
-fn glu_of(b: &mut Body, act: crate::linear::moe::ExpertGlu, g: V, u: V, dims: &[i64]) -> Built<V> {
+pub(crate) fn glu_of(b: &mut Body, act: crate::linear::moe::ExpertGlu, g: V, u: V, dims: &[i64]) -> Built<V> {
     let k = |b: &mut Body, x: f64| b.splat_f(dims, Elem::F32, x);
     let a = match act {
         crate::linear::moe::ExpertGlu::Swiglu => {
@@ -1270,11 +1546,17 @@ fn scale_codes(b: &mut Body, w: V, s: V, groups: i64, cols: i64) -> Built<V> {
 /// every row reads `rows · tokens` cells: at a 1792-token fire of
 /// Gemma-4-26B's 32-expert cut, 288 us a layer (v6e).
 ///
+/// The rows' tokens land in VMEM once, at the first step, and each chunk's
+/// are copied beside its rows by the vector unit: a step's copies are
+/// issued one by one, and at two copies a chunk issuing them cost more than
+/// moving their bytes (v6e, Qwen3.6-35B-A3B's cut, 1792 tokens: 127 of the
+/// sum's 148 us). A step waits its copies out on one descriptor.
+///
 /// Operands: `start`, `count`, `off` i32 `[blocks · experts]` (SMEM): the
 /// first row a block copies of each expert's run (a chunk boundary), the
 /// chunks it copies, and its first buffer row; `tok` i32 `[rows, 128]`,
 /// each row's token in all 128 lanes (-1 for a row no pair holds); `ys`
-/// `[rows, n]` bf16. The result is `[blocks · tb, n]` f32.
+/// `[rows, n]` bf16. The result is `[blocks · tb, n]` in `out`.
 #[derive(Clone, Copy, Debug)]
 pub struct SegmentSum {
     pub rows: i64,
@@ -1288,6 +1570,8 @@ pub struct SegmentSum {
     /// Buffer rows a block copies at most.
     pub depth: i64,
     pub vmem_cap: i64,
+    /// The result's element: f32, or the f32 sum rounded to bf16 once.
+    pub out: Elem,
 }
 
 impl SegmentSum {
@@ -1301,7 +1585,14 @@ impl SegmentSum {
 
     fn vmem(&self) -> i64 {
         let (r, n, tb) = (self.depth, self.n, self.tb);
-        2 * r * n * 2 + 2 * r * 128 * 4 + r * tb * 2 + r * n * 2 + 3 * tb * n * 4
+        let ob = i64::from(self.out.bits()) / 8;
+        self.rows * 128 * 4
+            + 2 * r * n * 2
+            + 2 * r * 128 * 4
+            + r * tb * 2
+            + r * n * 2
+            + tb * n * 4
+            + 2 * tb * n * ob
     }
 
     /// Whether the kernel's buffers fit VMEM.
@@ -1320,7 +1611,14 @@ impl SegmentSum {
             self.chunk,
             self.depth,
         );
-        if tb != 128 || c % 16 != 0 || r % c != 0 || n % 128 != 0 || rows % c != 0 || !self.fits() {
+        if !matches!(tb, 128 | 256)
+            || c % 16 != 0
+            || r % c != 0
+            || n % 128 != 0
+            || rows % c != 0
+            || !matches!(self.out, Elem::F32 | Elem::Bf16)
+            || !self.fits()
+        {
             return bad(format!("{self:?}"));
         }
         let any = |array: Vec<i64>, elem: Elem| Operand {
@@ -1330,9 +1628,10 @@ impl SegmentSum {
             window: Window::Any,
             index: Box::new(|b: &mut Body, _: &Grid| Ok(vec![b.i32(0), b.i32(0)])),
         };
+        let out_elem = self.out;
         let out = Operand {
             array: vec![nb * tb, n],
-            elem: Elem::F32,
+            elem: out_elem,
             block: vec![tb, n],
             window: Window::Blocked,
             index: Box::new(|b: &mut Body, g: &Grid| Ok(vec![g.ids[0], b.i32(0)])),
@@ -1353,21 +1652,24 @@ impl SegmentSum {
                 MTy::Ref(vec![2, r, n], Elem::Bf16, Space::Vmem),
                 MTy::Ref(vec![2, r, 128], Elem::I32, Space::Vmem),
                 MTy::Sem(vec![2]),
-                MTy::Sem(vec![2]),
+                MTy::Ref(vec![rows, 128], Elem::I32, Space::Vmem),
+                MTy::Sem(vec![1]),
             ],
         };
         kernel.build(|b, blk| {
-            let (ybuf, tbuf, ysems, tsems) = (
+            let (ybuf, tbuf, ysems, tokv, tsem) = (
                 blk.scratch[0],
                 blk.scratch[1],
                 blk.scratch[2],
                 blk.scratch[3],
+                blk.scratch[4],
             );
             let (tok, ys) = (blk.ins[0], blk.ins[1]);
             let pre = &blk.grid.prefetch;
             let s = blk.grid.ids[0];
-            // Block `at`'s copies into slot `slot`, started or waited for.
-            let copies = |b: &mut Body, at: V, slot: V, wait: bool| -> Built<()> {
+            // Block `at`'s copies into slot `slot`: its rows' chunks started,
+            // and their tokens copied from VMEM.
+            let copies = |b: &mut Body, at: V, slot: V| -> Built<()> {
                 let z = b.i32(0);
                 let ee = b.i32(e);
                 let one = b.i32(1);
@@ -1394,19 +1696,40 @@ impl SegmentSum {
                         let ydst = b.ref_squeeze(ydst)?;
                         let ysem = b.ref_slice(ysems, &[slot], &[1])?;
                         let ysem = b.ref_squeeze(ysem)?;
-                        let tsrc = b.ref_slice(tok, &[from, z], &[c, 128])?;
-                        let tdst = b.ref_slice(tbuf, &[slot, to, z], &[1, c, 128])?;
-                        let tdst = b.ref_squeeze(tdst)?;
-                        let tsem = b.ref_slice(tsems, &[slot], &[1])?;
-                        let tsem = b.ref_squeeze(tsem)?;
-                        if wait {
-                            b.dma_wait(ysem, ysrc, ydst)?;
-                            b.dma_wait(tsem, tsrc, tdst)
-                        } else {
-                            b.dma_start(ysrc, ydst, ysem)?;
-                            b.dma_start(tsrc, tdst, tsem)
-                        }
+                        b.dma_start(ysrc, ydst, ysem)?;
+                        let fi = b.as_index(from)?;
+                        let zi = b.index(0);
+                        let t = b.vload(tokv, &[fi, zi], &[c, 128])?;
+                        let t = b.shape_cast(t, &[1, c, 128])?;
+                        let si = b.as_index(slot)?;
+                        let ti = b.as_index(to)?;
+                        b.vstore(t, tbuf, &[si, ti, zi])
                     })
+                })
+            };
+            // Block `at`'s copies into slot `slot` waited for: as many chunks
+            // as it started, on one chunk's descriptor.
+            let waits = |b: &mut Body, at: V, slot: V| -> Built<()> {
+                let ne = b.i32(e);
+                let one = b.i32(1);
+                let last = b.addi(at, one)?;
+                let last = b.muli(last, ne)?;
+                let last = b.subi(last, one)?;
+                let li = b.as_index(last)?;
+                let cnt = b.load(pre[1], &[li])?;
+                let off = b.load(pre[2], &[li])?;
+                let cc = b.i32(c);
+                let total = b.divsi(off, cc)?;
+                let total = b.addi(total, cnt)?;
+                let z = b.i32(0);
+                b.for_range(z, total, one, |b, _| {
+                    let z = b.i32(0);
+                    let ysrc = b.ref_slice(ys, &[z, z], &[c, n])?;
+                    let ydst = b.ref_slice(ybuf, &[slot, z, z], &[1, c, n])?;
+                    let ydst = b.ref_squeeze(ydst)?;
+                    let ysem = b.ref_slice(ysems, &[slot], &[1])?;
+                    let ysem = b.ref_squeeze(ysem)?;
+                    b.dma_wait(ysem, ysrc, ydst)
                 })
             };
             let z = b.i32(0);
@@ -1414,8 +1737,11 @@ impl SegmentSum {
             let slot = b.remsi(s, two)?;
             let at0 = b.cmpi(ICmp::Eq, s, z)?;
             // The buffers start zeroed: a row no block copied yet holds no
-            // NaN for the one-hot's zeros to meet.
+            // NaN for the one-hot's zeros to meet. The rows' tokens land
+            // whole.
             b.when(at0, |b| {
+                let sem = b.ref_squeeze(tsem)?;
+                b.dma_start(tok, tokv, sem)?;
                 let zy = b.splat_f(&[1, r, n], Elem::Bf16, 0.0)?;
                 let zt = b.splat_i(&[1, r, 128], -1)?;
                 for slot in 0..2 {
@@ -1424,10 +1750,11 @@ impl SegmentSum {
                     b.vstore(zy, ybuf, &[at, zi, zi])?;
                     b.vstore(zt, tbuf, &[at, zi, zi])?;
                 }
+                b.dma_wait(sem, tok, tokv)?;
                 let z = b.i32(0);
-                copies(b, z, z, false)
+                copies(b, z, z)
             })?;
-            copies(b, s, slot, true)?;
+            waits(b, s, slot)?;
             let one = b.i32(1);
             let next = b.addi(s, one)?;
             let last = b.i32(nb);
@@ -1435,26 +1762,29 @@ impl SegmentSum {
             b.when(more, |b| {
                 let one = b.i32(1);
                 let other = b.subi(one, slot)?;
-                copies(b, next, other, false)
+                copies(b, next, other)
             })?;
             let z = b.i32(0);
             let held = b.ref_slice(tbuf, &[slot, z, z], &[1, r, 128])?;
             let held = b.ref_squeeze(held)?;
             let toks = b.vload_all(held)?;
+            // Each row's token across the block's `tb` lanes.
+            let toks = b.concat(&vec![toks; (tb / 128) as usize], 1)?;
             let tbb = b.i32(tb);
             let base = b.muli(s, tbb)?;
-            let base = b.broadcast_i(base, &[r, 128])?;
+            let base = b.broadcast_i(base, &[r, tb])?;
             let rel = b.subi(toks, base)?;
-            let lanes = b.iota(&[r, 128], 1);
+            let lanes = b.iota(&[r, tb], 1);
             let hit = b.cmpi(ICmp::Eq, rel, lanes)?;
-            let on = b.splat_f(&[r, 128], Elem::Bf16, 1.0)?;
-            let off = b.splat_f(&[r, 128], Elem::Bf16, 0.0)?;
+            let on = b.splat_f(&[r, tb], Elem::Bf16, 1.0)?;
+            let off = b.splat_f(&[r, tb], Elem::Bf16, 0.0)?;
             let hot = b.select(hit, on, off)?;
             let rows = b.ref_slice(ybuf, &[slot, z, z], &[1, r, n])?;
             let rows = b.ref_squeeze(rows)?;
             let rows = b.vload_all(rows)?;
             let acc = b.splat_f(&[tb, n], Elem::F32, 0.0)?;
             let y = b.matmul_tl(hot, rows, acc)?;
+            let y = b.convert_f(y, out_elem)?;
             b.vstore_all(y, blk.outs[0])
         })
     }

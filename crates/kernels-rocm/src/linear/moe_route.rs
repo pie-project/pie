@@ -1,7 +1,7 @@
 use crate::error::Error;
 use dtype::Dtype;
 
-use crate::jit::{Arg, Ctx, Fire, Launch, kernel, nonzero, refuse, stated};
+use crate::jit::{Arg, Ctx, Fire, Launch, dtype_dispatch, kernel, nonzero, refuse, stated};
 use crate::tensor::Tensor;
 
 const FILE: &str = "linear/moe_route.hip";
@@ -70,6 +70,42 @@ pub fn hash_route(
             stated(OP, top_k)?.arg(),
             i32::from(renormalize).arg(),
             scaling.arg(),
+            ctx.stage(),
+        ],
+    )
+}
+
+/// `y`'s routed rows (one a route of `routes`) whose route names no expert
+/// below `experts` zeroed: the selects skip such a route (a hash table's
+/// pick past a miniature's experts) and leave its row as the plane held it.
+pub fn zero_dropped(ctx: &Ctx, routes: Tensor, experts: u32, y: &mut Tensor) -> Result<(), Error> {
+    const OP: &str = "linear.moe_select";
+    let t = dtype_dispatch!(OP, y.dtype, { Bf16 => "::pie::bf16", F16 => "::pie::f16" });
+    debug_assert_eq!(routes.dtype, Dtype::I32, "`{OP}` reads i32 routes");
+    let top_k = nonzero(OP, "the routed fan-out", routes.width)?;
+    if u64::from(y.rows) != u64::from(routes.rows) * u64::from(top_k) {
+        return Err(refuse(
+            OP,
+            format!(
+                "{} routed rows are not {} tokens' {top_k} routes",
+                y.rows, routes.rows
+            ),
+        ));
+    }
+    let rows = nonzero(OP, "the routed rows", y.rows)?;
+    ctx.fire(
+        OP,
+        Fire::at(kernel(
+            FILE,
+            &format!("::pie::linear::zero_dropped_routes<{t}>"),
+        ))
+        .apply(Launch::grid([rows, 1, 1], [BLOCK, 1, 1])),
+        &[
+            routes.arg(),
+            y.arg(),
+            stated(OP, y.width)?.arg(),
+            stated(OP, experts)?.arg(),
+            stated(OP, top_k)?.arg(),
             ctx.stage(),
         ],
     )

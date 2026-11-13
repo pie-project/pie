@@ -233,8 +233,12 @@ fn full_rope_turns_halves_and_interleaved_pairs() {
 /// halves in one kernel, 128- and 256-wide heads alike.
 #[test]
 fn a_prompt_tall_rope_turns_by_halves_in_one_kernel() {
-    for (qh, kvh, hd) in [(16usize, 8usize, 128usize), (8, 1, 256)] {
-        let rows = 600usize;
+    // 640 rows: five blocks of 128; 272 (a shared tail's readouts): of 16.
+    for (qh, kvh, hd, rows) in [
+        (16usize, 8usize, 128usize, 640usize),
+        (8, 1, 256, 640),
+        (8, 1, 256, 272),
+    ] {
         let theta = 1e6f32;
         let qs = data(rows * qh * hd, 5);
         let ks = data(rows * kvh * hd, 6);
@@ -274,6 +278,163 @@ fn a_prompt_tall_rope_turns_by_halves_in_one_kernel() {
         assert_close(
             &b.read_f32(k),
             &turn_ref(&ks, kvh * hd, hd, &n, &pf, 1, 1.0),
+            1e-2,
+            1e-2,
+        );
+    }
+}
+
+#[test]
+fn a_prompt_tall_partial_rope_turns_in_one_kernel() {
+    // gemma-4's global layers: 512-wide heads, the first 64 lanes turned
+    // with the ones half a head on, the rest passed through.
+    let (rows, hd, rot, span, theta) = (640usize, 512usize, 128usize, 256usize, 1e6f32);
+    let (qh, kh) = (4usize, 1usize);
+    let qs = data(rows * qh * hd, 7);
+    let ks = data(rows * kh * hd, 8);
+    let pos: Vec<i32> = (0..rows as i32).map(|r| (r * 7) % 2000).collect();
+    let mut b = Bench::new();
+    let q = b.bf16(rows as u32, (qh * hd) as u32, &qs);
+    let k = b.bf16(rows as u32, (kh * hd) as u32, &ks);
+    let p = b.i32(rows as u32, 1, &pos);
+    if !b
+        .run(|ctx| {
+            engine_xla::lower::lower(ctx, |l| {
+                let q_v = l.read(q)?;
+                let k_v = l.read(k)?;
+                let positions_v = l.read(p)?;
+                let vs = rope::partial(
+                    l.f(),
+                    q_v,
+                    k_v,
+                    positions_v,
+                    rot as u32,
+                    hd as u32,
+                    theta,
+                    span as u32,
+                )?;
+                if let Some(v) = vs[0] {
+                    l.land(q, v)?;
+                }
+                if let Some(v) = vs[1] {
+                    l.land(k, v)?;
+                }
+                Ok(())
+            })
+        })
+        .unwrap()
+    {
+        return;
+    }
+    let pf: Vec<f32> = pos.iter().map(|&v| v as f32).collect();
+    let pairs: Vec<Pair> = (0..rot / 2)
+        .map(|i| (i, i + span, 0, inv_freq(theta, i, 2 * span as u32)))
+        .collect();
+    assert_close(
+        &b.read_f32(q),
+        &turn_ref(&qs, qh * hd, hd, &pairs, &pf, 1, 1.0),
+        1e-2,
+        1e-2,
+    );
+    assert_close(
+        &b.read_f32(k),
+        &turn_ref(&ks, kh * hd, hd, &pairs, &pf, 1, 1.0),
+        1e-2,
+        1e-2,
+    );
+    // The lanes no pair turns pass through bit for bit.
+    let got = b.read_f32(q);
+    for (i, (&g, &x)) in got.iter().zip(&qs).enumerate() {
+        let lane = i % hd;
+        if !(lane < rot / 2 || (span..span + rot / 2).contains(&lane)) {
+            assert_eq!(g.to_bits(), x.to_bits(), "still lane element {i}");
+        }
+    }
+}
+
+/// The heads per-head norms land, normed and turned by one kernel
+/// (`rope::normed`): gemma-4-31B's sliding heads (256 wide, every pair by
+/// halves; 1024 rows: blocks of 256) and global ones (512 wide, the first 64
+/// lanes turned with the ones half a head on; q 16384 wide: half blocks),
+/// and a `1 + w` gain.
+#[test]
+fn a_tall_norm_and_its_rope_turn_in_one_kernel() {
+    for (rows, qh, kh, hd, rot, plus_one) in [
+        (640usize, 8usize, 8usize, 256usize, 256usize, true),
+        (1024, 32, 16, 256, 256, false),
+        (640, 32, 4, 512, 128, false),
+    ] {
+        norm_rope(rows, qh, kh, hd, rot, plus_one);
+    }
+}
+
+fn norm_rope(rows: usize, qh: usize, kh: usize, hd: usize, rot: usize, plus_one: bool) {
+    let (theta, eps, span) = (1e6f32, 1e-6f32, hd / 2);
+    let qs = data(rows * qh * hd, 11);
+    let ks = data(rows * kh * hd, 12);
+    let qw = data(hd, 13);
+    let kw = data(hd, 14);
+    let pos: Vec<i32> = (0..rows as i32).map(|r| (r * 7) % 2000).collect();
+    let mut b = Bench::new();
+    let q = b.bf16(rows as u32, (qh * hd) as u32, &qs);
+    let k = b.bf16(rows as u32, (kh * hd) as u32, &ks);
+    let gq = b.bf16(1, hd as u32, &qw);
+    let gk = b.bf16(1, hd as u32, &kw);
+    let p = b.i32(rows as u32, 1, &pos);
+    if !b
+        .run(|ctx| {
+            engine_xla::lower::lower(ctx, |l| {
+                let xs = [
+                    rope::Normed {
+                        x: l.read(q)?,
+                        weight: l.read(gq)?,
+                        plus_one,
+                        eps,
+                    },
+                    rope::Normed {
+                        x: l.read(k)?,
+                        weight: l.read(gk)?,
+                        plus_one,
+                        eps,
+                    },
+                ];
+                let positions_v = l.read(p)?;
+                let vs = rope::normed(
+                    l.f(),
+                    &xs,
+                    positions_v,
+                    rot as u32,
+                    hd as u32,
+                    theta,
+                    span as u32,
+                )?
+                .expect("the kernel takes these shapes");
+                l.land(q, vs[0])?;
+                l.land(k, vs[1])
+            })
+        })
+        .unwrap()
+    {
+        return;
+    }
+    let pf: Vec<f32> = pos.iter().map(|&v| v as f32).collect();
+    let pairs: Vec<Pair> = (0..rot / 2)
+        .map(|i| (i, i + span, 0, inv_freq(theta, i, 2 * span as u32)))
+        .collect();
+    for (o, xs, ws, heads) in [(q, &qs, &qw, qh), (k, &ks, &kw, kh)] {
+        // The norm lands its rows in bf16 before the turn reads them.
+        let mut normed = vec![0.0; xs.len()];
+        for (head, out) in xs.chunks(hd).zip(normed.chunks_mut(hd)) {
+            let ms = head.iter().map(|v| v * v).sum::<f32>() / hd as f32;
+            let inv = 1.0 / (ms + eps).sqrt();
+            for ((o, v), w) in out.iter_mut().zip(head).zip(ws.iter()) {
+                let g = if plus_one { 1.0 + w } else { *w };
+                *o = round_bf16(v * inv * g);
+            }
+        }
+        assert_close(
+            &b.read_f32(o),
+            &turn_ref(&normed, heads * hd, hd, &pairs, &pf, 1, 1.0),
             1e-2,
             1e-2,
         );
