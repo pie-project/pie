@@ -1617,6 +1617,9 @@ impl Staged {
         let fitted = shell
             .pools
             .fit_the_card(bodies, held_for_fires, settled, false, &resident)?;
+        // A load that arms later may have had its range reserved anew by
+        // this fit: the workspaces are laid where it now lies.
+        shell.lay_workspace()?;
         if arm_trace {
             eprintln!(
                 "[arm-trace] cache rows sized to {} pages ({} MiB, {} sequences at the declared \

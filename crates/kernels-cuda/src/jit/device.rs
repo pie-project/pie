@@ -226,8 +226,18 @@ pub(crate) fn take(
     {
         return Ok(slab.ptr);
     }
+    // An arena whose slabs are laid grows none: every fire it serves was
+    // walked, so a take past what is laid is a fire the walk did not see.
     if !held.placed.is_empty() {
         UNPLACED.fetch_add(bytes, core::sync::atomic::Ordering::Relaxed);
+        return Err(Fault::Unwarmed {
+            name,
+            have: held
+                .placed
+                .get(&(name, region, scope))
+                .map_or(0, |slab| slab.bytes),
+            need: bytes,
+        });
     }
     if capture_status(stream)
         .is_some_and(|s| s != rt::cudaStreamCaptureStatus::cudaStreamCaptureStatusNone)
